@@ -229,11 +229,25 @@ export default function Dashboard() {
                       {new Date(checkin.checkInDate).toLocaleDateString('th-TH', {
                         day: 'numeric',
                         month: 'short',
+                        timeZone: 'UTC',
+                      })}
+                      {' '}
+                      {new Date(checkin.checkInDate).toLocaleTimeString('th-TH', {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        timeZone: 'UTC',
                       })}
                       {' - '}
                       {new Date(checkin.checkOutDate).toLocaleDateString('th-TH', {
                         day: 'numeric',
                         month: 'short',
+                        timeZone: 'UTC',
+                      })}
+                      {' '}
+                      {new Date(checkin.checkOutDate).toLocaleTimeString('th-TH', {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        timeZone: 'UTC',
                       })}
                     </p>
                     <span className="text-xs text-green-600 bg-green-100 px-2 py-1 rounded-full">

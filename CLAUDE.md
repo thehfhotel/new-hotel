@@ -38,6 +38,20 @@
 - SQL Server at 192.168.100.222
 - Tables: HT_Rooms, View_Booking_Ds, View_CheckIn_Ds, View_Customers
 
+### Timezone Handling
+- SQL Server stores datetime values in **local Thai time (GMT+7)** without timezone information
+- The `mssql` library returns datetime fields as ISO strings with `Z` suffix (e.g., `2026-01-22T11:59:00.000Z`)
+- JavaScript interprets `Z` as UTC, but the actual values are already in Thai time
+- **When formatting dates for display**: Use `timeZone: 'UTC'` to show the stored value as-is
+  ```typescript
+  new Date(dateValue).toLocaleTimeString('th-TH', {
+    hour: '2-digit',
+    minute: '2-digit',
+    timeZone: 'UTC',  // Shows stored value without conversion
+  })
+  ```
+- **Do NOT use** `timeZone: 'Asia/Bangkok'` - this would add 7 hours to the already-local time
+
 ## Testing
 
 Run tests before committing: `npm test`
