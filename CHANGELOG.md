@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.3] - 2026-01-24
+
+### Security
+- Added pnpm override to force glob >=10.5.0 to resolve CVE-2025-64756 (command injection in CLI)
+  - Vulnerability is in `@next/eslint-plugin-next` dependency chain
+  - Note: Only affects CLI usage; ESLint uses glob as a library, so actual risk is minimal
+
 ## [1.3.2] - 2026-01-24
 
 ### Security
