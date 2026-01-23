@@ -17,17 +17,25 @@ export async function GET(request: NextRequest) {
 
     let baseQuery = `FROM View_CheckIn_Ds`;
     const conditions: string[] = [];
+    const dbRequest = pool.request();
+    const countRequest = pool.request();
 
     if (status) {
-      conditions.push(`Cin_status = '${status.replace(/'/g, "''")}'`);
+      dbRequest.input('status', sql.VarChar, status);
+      countRequest.input('status', sql.VarChar, status);
+      conditions.push(`Cin_status = @status`);
     }
 
     if (startDate) {
-      conditions.push(`Cin_Room_In >= '${startDate}'`);
+      dbRequest.input('startDate', sql.Date, new Date(startDate));
+      countRequest.input('startDate', sql.Date, new Date(startDate));
+      conditions.push(`Cin_Room_In >= @startDate`);
     }
 
     if (endDate) {
-      conditions.push(`Cin_Room_Out <= '${endDate}'`);
+      dbRequest.input('endDate', sql.Date, new Date(endDate));
+      countRequest.input('endDate', sql.Date, new Date(endDate));
+      conditions.push(`Cin_Room_Out <= @endDate`);
     }
 
     if (conditions.length > 0) {
@@ -35,13 +43,12 @@ export async function GET(request: NextRequest) {
     }
 
     // Get total count
-    const countResult = await pool.request().query(`SELECT COUNT(*) as total ${baseQuery}`);
+    const countResult = await countRequest.query(`SELECT COUNT(*) as total ${baseQuery}`);
     const total = countResult.recordset[0].total;
 
     // Get paginated data
-    const dataRequest = pool.request();
-    dataRequest.input('offset', sql.Int, offset);
-    dataRequest.input('limit', sql.Int, limit);
+    dbRequest.input('offset', sql.Int, offset);
+    dbRequest.input('limit', sql.Int, limit);
 
     const dataQuery = `
       SELECT
@@ -56,7 +63,7 @@ export async function GET(request: NextRequest) {
       OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY
     `;
 
-    const result = await dataRequest.query(dataQuery);
+    const result = await dbRequest.query(dataQuery);
 
     return NextResponse.json({
       success: true,

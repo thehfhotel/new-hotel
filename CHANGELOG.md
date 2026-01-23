@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-01-24
+
+### Security
+- Fixed SQL injection vulnerability in `/api/checkins/route.ts` - now uses parameterized queries for startDate and endDate filters
+
+### Added
+- Component tests for RoomGrid (rendering, status colors, modal interaction)
+- Component tests for DataTable (sorting, pagination, empty/loading states)
+- Component tests for Calendar (month navigation, date selection, booking/checkin indicators)
+- CI/CD pipeline now runs component tests before building Docker image
+- Pre-push git hook to run component tests before pushing (via husky)
+
+### Fixed
+- Removed hardcoded database values from API tests to prevent false failures when data changes
+
 ## [1.3.0] - 2026-01-24
 
 ### Changed
