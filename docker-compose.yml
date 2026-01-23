@@ -1,0 +1,11 @@
+services:
+  web:
+    image: ghcr.io/jwinut/new-hotel:latest
+    ports:
+      - "3003:3003"
+    environment:
+      - DB_SERVER=192.168.100.222
+      - DB_NAME=db
+      - DB_USER=sa
+      - DB_PASSWORD=***REMOVED***
+    restart: unless-stopped
