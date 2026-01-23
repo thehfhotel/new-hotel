@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { X } from 'lucide-react'
 
-export type RoomStatus = 'available' | 'occupied' | 'maintenance' | 'cleaning'
+export type RoomStatus = 'available' | 'occupied' | 'maintenance' | 'cleaning' | 'checkout'
 
 export interface Room {
   id: number
@@ -25,27 +25,33 @@ interface RoomGridProps {
 const statusConfig = {
   available: {
     dot: 'bg-green-500',
-    border: 'border-l-green-500',
+    border: 'border-b-green-500',
     bg: 'bg-white hover:bg-green-50',
     label: 'ว่าง',
   },
   occupied: {
     dot: 'bg-red-500',
-    border: 'border-l-red-500',
+    border: 'border-b-red-500',
     bg: 'bg-red-50 hover:bg-red-100',
     label: 'มีผู้เข้าพัก',
   },
   maintenance: {
     dot: 'bg-gray-400',
-    border: 'border-l-gray-400',
+    border: 'border-b-gray-400',
     bg: 'bg-gray-100 hover:bg-gray-200',
     label: 'ซ่อมบำรุง',
   },
   cleaning: {
     dot: 'bg-orange-500',
-    border: 'border-l-orange-500',
+    border: 'border-b-orange-500',
     bg: 'bg-orange-50 hover:bg-orange-100',
     label: 'ทำความสะอาด',
+  },
+  checkout: {
+    dot: 'bg-blue-400',
+    border: 'border-b-blue-400',
+    bg: 'bg-blue-50 hover:bg-blue-100',
+    label: 'รอเช็คเอาท์',
   },
 }
 
@@ -82,16 +88,6 @@ export default function RoomGrid({ rooms, onRoomClick }: RoomGridProps) {
 
   return (
     <div className="relative">
-      {/* Legend */}
-      <div className="flex flex-wrap gap-4 mb-4">
-        {Object.entries(statusConfig).map(([status, config]) => (
-          <div key={status} className="flex items-center gap-2">
-            <div className={`w-3 h-3 rounded-full ${config.dot}`} />
-            <span className="text-sm text-gray-600">{config.label}</span>
-          </div>
-        ))}
-      </div>
-
       {/* Room Grid */}
       <div className="grid gap-2" style={{ gridTemplateColumns: `repeat(${maxColumns}, minmax(0, 1fr))` }}>
         {roomLayout.map((row, rowIndex) => (
@@ -127,7 +123,7 @@ export default function RoomGrid({ rooms, onRoomClick }: RoomGridProps) {
                 <button
                   key={room.id}
                   onClick={() => handleRoomClick(room)}
-                  className={`${config.bg} border border-gray-200 border-l-4 ${config.border} rounded-lg p-1
+                  className={`${config.bg} border border-gray-200 border-b-4 ${config.border} rounded-lg p-1
                     transition-all duration-200 hover:shadow-md
                     flex flex-col items-center justify-center h-[70px] overflow-hidden`}
                   title={`${room.roomNumber} - ${room.type} - ${room.details || ''}`}
@@ -143,6 +139,16 @@ export default function RoomGrid({ rooms, onRoomClick }: RoomGridProps) {
               <div key={`filler-${rowIndex}-${i}`} className="h-[70px]" />
             ))}
           </>
+        ))}
+      </div>
+
+      {/* Legend */}
+      <div className="flex flex-wrap gap-4 mt-4">
+        {Object.entries(statusConfig).map(([status, config]) => (
+          <div key={status} className="flex items-center gap-2">
+            <div className={`w-3 h-3 rounded-full ${config.dot}`} />
+            <span className="text-sm text-gray-600">{config.label}</span>
+          </div>
         ))}
       </div>
 

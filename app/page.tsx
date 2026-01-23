@@ -42,9 +42,19 @@ interface ApiCheckIn {
   Cin_status: string
 }
 
+interface RoomStatusData {
+  room_no: string
+  room_status: string
+}
+
 
 // Function to determine room status from API data
-function getRoomStatus(room: ApiRoom): RoomStatus {
+function getRoomStatus(room: ApiRoom, isCheckoutToday: boolean): RoomStatus {
+  // Check if it's past 6 AM and room has checkout today
+  const now = new Date()
+  const hour = now.getHours()
+  if (isCheckoutToday && hour >= 6) return 'checkout'
+
   if (room.Room_Manternace === 'yes') return 'maintenance'
   if (room.Room_Use === 'yes') return 'occupied'
   if (room.Room_Book && room.Room_Book !== '') return 'occupied' // Has a booking number
@@ -84,8 +94,26 @@ export default function Dashboard() {
       }
 
       try {
-        // Fetch rooms
-        const roomsRes = await fetch('/api/rooms')
+        // Fetch rooms and checkout status in parallel
+        const today = new Date().toISOString().split('T')[0]
+        const [roomsRes, roomStatusRes] = await Promise.all([
+          fetch('/api/rooms'),
+          fetch(`/api/rooms/status?startDate=${today}&endDate=${today}`)
+        ])
+
+        // Build checkout rooms set
+        let checkoutRooms = new Set<string>()
+        if (roomStatusRes.ok) {
+          const roomStatusData = await roomStatusRes.json()
+          if (roomStatusData.success && roomStatusData.data) {
+            checkoutRooms = new Set<string>(
+              roomStatusData.data
+                .filter((r: RoomStatusData) => r.room_status === 'Check Out')
+                .map((r: RoomStatusData) => r.room_no)
+            )
+          }
+        }
+
         if (roomsRes.ok) {
           const roomsData = await roomsRes.json()
           if (roomsData.success && roomsData.data) {
@@ -95,7 +123,7 @@ export default function Dashboard() {
               roomNumber: room.Room_no,
               type: room.Room_Type?.trim() || 'ไม่ระบุ',
               details: room.Room_Details?.trim() || '',
-              status: getRoomStatus(room),
+              status: getRoomStatus(room, checkoutRooms.has(room.Room_no)),
             }))
             setRooms(mappedRooms)
           }
