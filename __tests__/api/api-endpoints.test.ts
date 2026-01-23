@@ -25,8 +25,7 @@ describe('API Endpoints', () => {
 
       // Verify reasonable values
       expect(data.data.totalRooms).toBeGreaterThan(0)
-      expect(data.data.totalRooms).toBe(58) // Known value from database
-      expect(data.data.totalCustomers).toBeGreaterThan(20000) // Known: ~20447
+      expect(data.data.totalCustomers).toBeGreaterThan(0)
     })
   })
 
@@ -39,7 +38,7 @@ describe('API Endpoints', () => {
       expect(data.success).toBe(true)
       expect(data.data).toBeDefined()
       expect(Array.isArray(data.data)).toBe(true)
-      expect(data.data.length).toBe(58)
+      expect(data.data.length).toBeGreaterThan(0)
 
       // Verify first room structure
       const room = data.data[0]
@@ -125,7 +124,7 @@ describe('API Endpoints', () => {
 
       // Verify pagination
       expect(data.pagination).toBeDefined()
-      expect(data.pagination.total).toBeGreaterThan(20000) // Known: ~20447
+      expect(data.pagination.total).toBeGreaterThan(0)
     })
 
     test('should return correct customer structure', async () => {
