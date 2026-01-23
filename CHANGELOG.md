@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-01-24
+
+### Added
+- Docker containerization with multi-stage Dockerfile for optimized image size
+- GitHub Actions CI/CD workflow for automated builds to ghcr.io
+- docker-compose.yml for easy local deployment from container registry
+- Environment variable support for database configuration (DB_SERVER, DB_NAME, DB_USER, DB_PASSWORD)
+
+### Changed
+- Next.js output mode set to 'standalone' for container deployment
+- Database credentials now configurable via environment variables with backward-compatible defaults
+
+## [1.1.1] - 2026-01-24
+
+### Changed
+- Migrated package manager from npm to pnpm for faster installs and better disk efficiency
+
+## [1.1.0] - 2026-01-23
+
+### Added
+- "Waiting for Checkout" room status with light blue color
+- Rooms with checkout date = today display as "รอเช็คเอาท์" after 6 AM
+
 ## [1.0.2] - 2026-01-23
 
 ### Fixed
