@@ -12,11 +12,18 @@ export async function GET() {
       SELECT COUNT(*) as count FROM HT_Rooms
     `);
 
-    // Occupied rooms count - rooms that are in use or have a booking
+    // Occupied rooms count - rooms with guests checked in
     const occupiedRoomsResult = await pool.request().query(`
       SELECT COUNT(*) as count
       FROM HT_Rooms
-      WHERE Room_Use = 'yes' OR (Room_Book IS NOT NULL AND Room_Book <> '')
+      WHERE Room_Use = 'yes'
+    `);
+
+    // Booked rooms count - rooms with booking but not checked in
+    const bookedRoomsResult = await pool.request().query(`
+      SELECT COUNT(*) as count
+      FROM HT_Rooms
+      WHERE Room_Use <> 'yes' AND Room_Book IS NOT NULL AND Room_Book <> ''
     `);
 
     // Today's check-ins count
@@ -50,6 +57,7 @@ export async function GET() {
       data: {
         totalRooms: totalRoomsResult.recordset[0].count,
         occupiedRooms: occupiedRoomsResult.recordset[0].count,
+        bookedRooms: bookedRoomsResult.recordset[0].count,
         todayCheckIns: todayCheckInsResult.recordset[0].count,
         todayCheckOuts: todayCheckOutsResult.recordset[0].count,
         activeBookings: activeBookingsResult.recordset[0].count,
