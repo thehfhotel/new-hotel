@@ -5,3 +5,9 @@ node_modules
 __tests__
 coverage
 .env*
+.husky
+.swc
+.claude
+.github
+.vscode
+*.log
