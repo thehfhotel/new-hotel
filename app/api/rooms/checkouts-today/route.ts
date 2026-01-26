@@ -8,11 +8,14 @@ export async function GET() {
     const pool = await getPool();
 
     // Get room numbers that have checkout today using View_CheckIn_Ds
-    // This matches the logic used in stats API for todayCheckOuts
+    // Only include rooms where guest is still checked in (Room_Use = 'yes')
+    // This excludes old records from guests who already checked out today
     const result = await pool.request().query(`
-      SELECT DISTINCT Cin_Room_no as room_no
-      FROM View_CheckIn_Ds
-      WHERE CAST(Cin_Room_Out AS DATE) = CAST(GETDATE() AS DATE)
+      SELECT DISTINCT c.Cin_Room_no as room_no
+      FROM View_CheckIn_Ds c
+      INNER JOIN HT_Rooms r ON c.Cin_Room_No = r.Room_no
+      WHERE CAST(c.Cin_Room_Out AS DATE) = CAST(GETDATE() AS DATE)
+        AND r.Room_Use = 'yes'
     `);
 
     return NextResponse.json({
