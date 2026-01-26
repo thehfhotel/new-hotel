@@ -9,6 +9,7 @@ import { OccupancyChart, OccupancyData } from '@/components/Charts'
 interface Stats {
   totalRooms: number
   occupiedRooms: number
+  bookedRooms: number
   todayCheckIns: number
   activeBookings: number
 }
@@ -57,7 +58,7 @@ function getRoomStatus(room: ApiRoom, isCheckoutToday: boolean): RoomStatus {
 
   if (room.Room_Manternace === 'yes') return 'maintenance'
   if (room.Room_Use === 'yes') return 'occupied'
-  if (room.Room_Book && room.Room_Book !== '') return 'occupied' // Has a booking number
+  if (room.Room_Book && room.Room_Book !== '') return 'booked' // Has a booking but not checked in
   return 'available'
 }
 
@@ -65,6 +66,7 @@ export default function Dashboard() {
   const [stats, setStats] = useState<Stats>({
     totalRooms: 0,
     occupiedRooms: 0,
+    bookedRooms: 0,
     todayCheckIns: 0,
     activeBookings: 0,
   })
@@ -84,6 +86,7 @@ export default function Dashboard() {
             setStats({
               totalRooms: statsData.data.totalRooms || 0,
               occupiedRooms: statsData.data.occupiedRooms || 0,
+              bookedRooms: statsData.data.bookedRooms || 0,
               todayCheckIns: statsData.data.todayCheckIns || 0,
               activeBookings: statsData.data.activeBookings || 0,
             })
@@ -205,14 +208,24 @@ export default function Dashboard() {
         </p>
       </div>
 
-      {/* Stats Card */}
-      <div className="max-w-xs">
-        <StatsCard
-          title="ห้องที่มีผู้เข้าพัก"
-          value={stats.occupiedRooms}
-          icon={Users}
-          color="red"
-        />
+      {/* Stats Cards */}
+      <div className="flex gap-4">
+        <div className="max-w-xs">
+          <StatsCard
+            title="ห้องที่มีผู้เข้าพัก"
+            value={stats.occupiedRooms}
+            icon={Users}
+            color="red"
+          />
+        </div>
+        <div className="max-w-xs">
+          <StatsCard
+            title="ห้องที่จองแล้ว"
+            value={stats.bookedRooms}
+            icon={BookOpen}
+            color="yellow"
+          />
+        </div>
       </div>
 
       {/* Room Grid */}

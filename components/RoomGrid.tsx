@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { X } from 'lucide-react'
 
-export type RoomStatus = 'available' | 'occupied' | 'maintenance' | 'cleaning' | 'checkout'
+export type RoomStatus = 'available' | 'occupied' | 'booked' | 'maintenance' | 'cleaning' | 'checkout'
 
 export interface Room {
   id: number
@@ -34,6 +34,12 @@ const statusConfig = {
     border: 'border-b-red-500',
     bg: 'bg-red-50 hover:bg-red-100',
     label: 'มีผู้เข้าพัก',
+  },
+  booked: {
+    dot: 'bg-yellow-500',
+    border: 'border-b-yellow-500',
+    bg: 'bg-yellow-50 hover:bg-yellow-100',
+    label: 'จองแล้ว',
   },
   maintenance: {
     dot: 'bg-gray-400',

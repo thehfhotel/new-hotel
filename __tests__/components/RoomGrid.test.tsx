@@ -51,6 +51,13 @@ const mockRooms: Room[] = [
     status: 'checkout',
     floor: 3,
   },
+  {
+    id: 6,
+    roomNumber: '306',
+    type: 'Standard',
+    status: 'booked',
+    floor: 3,
+  },
 ]
 
 describe('RoomGrid Component', () => {
@@ -78,6 +85,7 @@ describe('RoomGrid Component', () => {
       // Check all legend items are present
       expect(screen.getByText('ว่าง')).toBeInTheDocument()
       expect(screen.getByText('มีผู้เข้าพัก')).toBeInTheDocument()
+      expect(screen.getByText('จองแล้ว')).toBeInTheDocument()
       expect(screen.getByText('ซ่อมบำรุง')).toBeInTheDocument()
       expect(screen.getByText('ทำความสะอาด')).toBeInTheDocument()
       expect(screen.getByText('รอเช็คเอาท์')).toBeInTheDocument()
@@ -107,6 +115,14 @@ describe('RoomGrid Component', () => {
       const room303 = screen.getByText('303').closest('button')
       expect(room303).toHaveClass('bg-gray-100')
       expect(room303).toHaveClass('border-b-gray-400')
+    })
+
+    test('applies correct styling for booked rooms', () => {
+      render(<RoomGrid rooms={mockRooms} />)
+
+      const room306 = screen.getByText('306').closest('button')
+      expect(room306).toHaveClass('bg-yellow-50')
+      expect(room306).toHaveClass('border-b-yellow-500')
     })
   })
 
