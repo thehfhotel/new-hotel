@@ -12,11 +12,11 @@ export async function GET() {
       SELECT COUNT(*) as count FROM HT_Rooms
     `);
 
-    // Occupied rooms count - rooms that are in use
+    // Occupied rooms count - rooms that are in use or have a booking
     const occupiedRoomsResult = await pool.request().query(`
       SELECT COUNT(*) as count
       FROM HT_Rooms
-      WHERE Room_Use = 'yes' OR Room_Book = 'yes'
+      WHERE Room_Use = 'yes' OR (Room_Book IS NOT NULL AND Room_Book <> '')
     `);
 
     // Today's check-ins count
