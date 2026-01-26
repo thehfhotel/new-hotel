@@ -9,6 +9,7 @@ import { OccupancyChart, OccupancyData } from '@/components/Charts'
 interface Stats {
   totalRooms: number
   occupiedRooms: number
+  checkoutRooms: number
   bookedRooms: number
   todayCheckIns: number
   activeBookings: number
@@ -43,12 +44,6 @@ interface ApiCheckIn {
   Cin_status: string
 }
 
-interface RoomStatusData {
-  room_no: string
-  room_status: string
-}
-
-
 // Function to determine room status from API data
 function getRoomStatus(room: ApiRoom, isCheckoutToday: boolean): RoomStatus {
   // Check if it's past 6 AM and room has checkout today
@@ -66,6 +61,7 @@ export default function Dashboard() {
   const [stats, setStats] = useState<Stats>({
     totalRooms: 0,
     occupiedRooms: 0,
+    checkoutRooms: 0,
     bookedRooms: 0,
     todayCheckIns: 0,
     activeBookings: 0,
@@ -86,6 +82,7 @@ export default function Dashboard() {
             setStats({
               totalRooms: statsData.data.totalRooms || 0,
               occupiedRooms: statsData.data.occupiedRooms || 0,
+              checkoutRooms: statsData.data.checkoutRooms || 0,
               bookedRooms: statsData.data.bookedRooms || 0,
               todayCheckIns: statsData.data.todayCheckIns || 0,
               activeBookings: statsData.data.activeBookings || 0,
@@ -98,22 +95,17 @@ export default function Dashboard() {
 
       try {
         // Fetch rooms and checkout status in parallel
-        const today = new Date().toISOString().split('T')[0]
-        const [roomsRes, roomStatusRes] = await Promise.all([
+        const [roomsRes, checkoutsRes] = await Promise.all([
           fetch('/api/rooms'),
-          fetch(`/api/rooms/status?startDate=${today}&endDate=${today}`)
+          fetch('/api/rooms/checkouts-today')
         ])
 
-        // Build checkout rooms set
+        // Build checkout rooms set from dedicated API
         let checkoutRooms = new Set<string>()
-        if (roomStatusRes.ok) {
-          const roomStatusData = await roomStatusRes.json()
-          if (roomStatusData.success && roomStatusData.data) {
-            checkoutRooms = new Set<string>(
-              roomStatusData.data
-                .filter((r: RoomStatusData) => r.room_status === 'Check Out')
-                .map((r: RoomStatusData) => r.room_no)
-            )
+        if (checkoutsRes.ok) {
+          const checkoutsData = await checkoutsRes.json()
+          if (checkoutsData.success && checkoutsData.data) {
+            checkoutRooms = new Set<string>(checkoutsData.data)
           }
         }
 
@@ -224,6 +216,14 @@ export default function Dashboard() {
             value={stats.bookedRooms}
             icon={BookOpen}
             color="yellow"
+          />
+        </div>
+        <div className="max-w-xs">
+          <StatsCard
+            title="ห้องรอเช็คเอาท์"
+            value={stats.checkoutRooms}
+            icon={LogIn}
+            color="blue"
           />
         </div>
       </div>

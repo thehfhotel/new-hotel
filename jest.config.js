@@ -14,6 +14,8 @@ const customJestConfig = {
   transformIgnorePatterns: [
     '/node_modules/(?!(@azure|tedious)/)',
   ],
+  // Longer timeout for integration tests that spin up servers
+  testTimeout: 30000,
 }
 
 module.exports = createJestConfig(customJestConfig)
