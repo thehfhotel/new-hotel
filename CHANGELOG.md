@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.2] - 2026-01-26
+
+### Fixed
+- Fixed occupied room count mismatch between stats card and room grid - stats now excludes checkout rooms (after 6 AM) from occupied count
+- Occupied rooms count now matches the number of red squares on the grid
+
+### Added
+- New "ห้องรอเช็คเอาท์" stat card (blue) showing rooms waiting for checkout today
+
+### Changed
+- API integration tests now spin up their own Next.js dev server on port 30031, making tests self-contained and independent of manually running dev server
+
+## [1.5.1] - 2026-01-26
+
+### Fixed
+- Fixed "รอเช็คเอาท์" (waiting for checkout) rooms not showing on grid - now uses `View_CheckIn_Ds.Cin_Room_Out` date matching (same method as stats API) instead of unreliable `View_Room_status.room_status` filtering
+- Added new `/api/rooms/checkouts-today` endpoint for reliable checkout room detection
+
 ## [1.5.0] - 2026-01-26
 
 ### Added

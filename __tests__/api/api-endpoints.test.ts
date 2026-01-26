@@ -1,9 +1,79 @@
 /**
  * API Endpoint Tests
  * These tests verify the API endpoints return correct data structures.
+ * The test suite spins up its own Next.js dev server on port 3099.
  */
 
-const API_BASE = 'http://localhost:3003'
+import { spawn, ChildProcess } from 'child_process'
+
+const TEST_PORT = 30031
+const API_BASE = `http://localhost:${TEST_PORT}`
+
+let serverProcess: ChildProcess | null = null
+
+// Wait for server to be ready by polling
+async function waitForServer(url: string, timeout = 60000): Promise<void> {
+  const start = Date.now()
+  while (Date.now() - start < timeout) {
+    try {
+      const response = await fetch(`${url}/api/stats`)
+      if (response.ok) return
+    } catch {
+      // Server not ready yet
+    }
+    await new Promise(resolve => setTimeout(resolve, 500))
+  }
+  throw new Error(`Server did not start within ${timeout}ms`)
+}
+
+beforeAll(async () => {
+  // Start the Next.js dev server on test port
+  serverProcess = spawn('npm', ['run', 'dev', '--', '-p', String(TEST_PORT)], {
+    cwd: process.cwd(),
+    stdio: 'pipe',
+    detached: true,
+  })
+
+  // Unref to allow Jest to exit even if server is still running
+  serverProcess.unref()
+
+  // Log server output for debugging
+  serverProcess.stdout?.on('data', (data) => {
+    if (process.env.DEBUG) {
+      console.log(`[server] ${data}`)
+    }
+  })
+
+  serverProcess.stderr?.on('data', (data) => {
+    if (process.env.DEBUG) {
+      console.error(`[server] ${data}`)
+    }
+  })
+
+  // Wait for server to be ready
+  await waitForServer(API_BASE)
+}, 90000) // 90 second timeout for server startup
+
+afterAll(async () => {
+  if (serverProcess && serverProcess.pid) {
+    // Kill the entire process group
+    try {
+      process.kill(-serverProcess.pid, 'SIGTERM')
+    } catch {
+      // Process may already be dead
+    }
+
+    // Wait a bit for cleanup
+    await new Promise(resolve => setTimeout(resolve, 500))
+
+    // Force kill if needed
+    try {
+      process.kill(-serverProcess.pid, 'SIGKILL')
+    } catch {
+      // Process may already be dead
+    }
+  }
+})
 
 describe('API Endpoints', () => {
   describe('GET /api/stats', () => {
@@ -18,6 +88,7 @@ describe('API Endpoints', () => {
       // Verify stats fields exist and are numbers
       expect(typeof data.data.totalRooms).toBe('number')
       expect(typeof data.data.occupiedRooms).toBe('number')
+      expect(typeof data.data.checkoutRooms).toBe('number')
       expect(typeof data.data.todayCheckIns).toBe('number')
       expect(typeof data.data.todayCheckOuts).toBe('number')
       expect(typeof data.data.activeBookings).toBe('number')
