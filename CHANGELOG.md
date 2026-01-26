@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.2] - 2026-01-26
+
+### Fixed
+- Fixed occupied room count mismatch in stats API - now correctly counts rooms with any non-empty `Room_Book` value, matching the RoomGrid display logic (was only counting `Room_Book = 'yes'`)
+
+## [1.4.1] - 2026-01-26
+
+### Added
+- Slack integration test (`__tests__/integration/slack.test.ts`) that sends actual test messages to verify webhook connectivity
+- Added `dotenv` dev dependency for loading environment variables in tests
+
+## [1.4.0] - 2026-01-24
+
+### Added
+- Slack notifications for hotel operations
+  - Hourly report: Occupied rooms count and today's new bookings (sent every hour at minute 0)
+  - Check-in alerts: Real-time notifications when guests check in (polled every 2 minutes)
+- New files: `lib/slack.ts`, `lib/scheduler.ts`, `instrumentation.ts`
+- Environment variables: `SLACK_WEBHOOK_URL`, `SLACK_NOTIFICATIONS_ENABLED`
+- `.env.example` file with all available configuration options
+
+### Technical
+- Uses `node-cron` for scheduling background tasks
+- Leverages Next.js instrumentation hook for server-side startup
+- Includes retry logic (3 attempts with exponential backoff) for Slack API calls
+- Thai language message formatting with Buddhist Era dates
+
+## [1.3.4] - 2026-01-24
+
+### Changed
+- Pinned pnpm version to 9.x in Dockerfile (was `pnpm@latest`) to prevent cache invalidation on pnpm updates
+- Expanded .dockerignore to exclude .husky, .swc, .claude, .github, .vscode, and *.log files from build context
+
 ## [1.3.3] - 2026-01-24
 
 ### Security
