@@ -89,7 +89,7 @@ jobs:
             User ${{ secrets.DEPLOY_USER }}
             IdentityFile ~/.ssh/deploy_key
             StrictHostKeyChecking no
-            ProxyCommand cloudflared access ssh --hostname %h
+            ProxyCommand cloudflared access ssh --hostname %h --id ${{ secrets.CF_ACCESS_CLIENT_ID }} --secret ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           EOF
 
       - name: Ensure deploy directory exists
