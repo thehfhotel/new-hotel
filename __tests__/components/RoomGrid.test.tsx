@@ -65,18 +65,18 @@ describe('RoomGrid Component', () => {
     test('renders rooms correctly', () => {
       render(<RoomGrid rooms={mockRooms} />)
 
-      // Check that room numbers are displayed
-      expect(screen.getByText('301')).toBeInTheDocument()
-      expect(screen.getByText('302')).toBeInTheDocument()
-      expect(screen.getByText('303')).toBeInTheDocument()
+      // Check that room numbers are displayed (both mobile + desktop views)
+      expect(screen.getAllByText('301').length).toBeGreaterThan(0)
+      expect(screen.getAllByText('302').length).toBeGreaterThan(0)
+      expect(screen.getAllByText('303').length).toBeGreaterThan(0)
     })
 
     test('renders room types', () => {
       render(<RoomGrid rooms={mockRooms} />)
 
       expect(screen.getAllByText('Standard').length).toBeGreaterThan(0)
-      expect(screen.getByText('Deluxe')).toBeInTheDocument()
-      expect(screen.getByText('Suite')).toBeInTheDocument()
+      expect(screen.getAllByText('Deluxe').length).toBeGreaterThan(0)
+      expect(screen.getAllByText('Suite').length).toBeGreaterThan(0)
     })
 
     test('renders legend items', () => {
@@ -96,7 +96,7 @@ describe('RoomGrid Component', () => {
     test('applies correct styling for available rooms', () => {
       render(<RoomGrid rooms={mockRooms} />)
 
-      const room301 = screen.getByText('301').closest('button')
+      const room301 = screen.getAllByText('301')[0].closest('button')
       expect(room301).toHaveClass('bg-white')
       expect(room301).toHaveClass('border-b-green-500')
     })
@@ -104,7 +104,7 @@ describe('RoomGrid Component', () => {
     test('applies correct styling for occupied rooms', () => {
       render(<RoomGrid rooms={mockRooms} />)
 
-      const room302 = screen.getByText('302').closest('button')
+      const room302 = screen.getAllByText('302')[0].closest('button')
       expect(room302).toHaveClass('bg-red-50')
       expect(room302).toHaveClass('border-b-red-500')
     })
@@ -112,7 +112,7 @@ describe('RoomGrid Component', () => {
     test('applies correct styling for maintenance rooms', () => {
       render(<RoomGrid rooms={mockRooms} />)
 
-      const room303 = screen.getByText('303').closest('button')
+      const room303 = screen.getAllByText('303')[0].closest('button')
       expect(room303).toHaveClass('bg-gray-100')
       expect(room303).toHaveClass('border-b-gray-400')
     })
@@ -120,7 +120,7 @@ describe('RoomGrid Component', () => {
     test('applies correct styling for booked rooms', () => {
       render(<RoomGrid rooms={mockRooms} />)
 
-      const room306 = screen.getByText('306').closest('button')
+      const room306 = screen.getAllByText('306')[0].closest('button')
       expect(room306).toHaveClass('bg-yellow-50')
       expect(room306).toHaveClass('border-b-yellow-500')
     })
@@ -130,8 +130,8 @@ describe('RoomGrid Component', () => {
     test('opens modal when room is clicked', () => {
       render(<RoomGrid rooms={mockRooms} />)
 
-      // Click on room 302 (occupied room)
-      const room302 = screen.getByText('302').closest('button')
+      // Click on room 302 (occupied room) - use first match (mobile list view)
+      const room302 = screen.getAllByText('302')[0].closest('button')
       fireEvent.click(room302!)
 
       // Modal should display room details
@@ -142,7 +142,7 @@ describe('RoomGrid Component', () => {
     test('displays guest information in modal for occupied room', () => {
       render(<RoomGrid rooms={mockRooms} />)
 
-      const room302 = screen.getByText('302').closest('button')
+      const room302 = screen.getAllByText('302')[0].closest('button')
       fireEvent.click(room302!)
 
       expect(screen.getByText('ผู้เข้าพัก:')).toBeInTheDocument()
@@ -153,7 +153,7 @@ describe('RoomGrid Component', () => {
       render(<RoomGrid rooms={mockRooms} />)
 
       // Open modal
-      const room301 = screen.getByText('301').closest('button')
+      const room301 = screen.getAllByText('301')[0].closest('button')
       fireEvent.click(room301!)
       expect(screen.getByText('ห้อง 301')).toBeInTheDocument()
 
@@ -169,7 +169,7 @@ describe('RoomGrid Component', () => {
       const mockCallback = jest.fn()
       render(<RoomGrid rooms={mockRooms} onRoomClick={mockCallback} />)
 
-      const room301 = screen.getByText('301').closest('button')
+      const room301 = screen.getAllByText('301')[0].closest('button')
       fireEvent.click(room301!)
 
       expect(mockCallback).toHaveBeenCalledWith(

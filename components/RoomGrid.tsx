@@ -92,63 +92,85 @@ export default function RoomGrid({ rooms, onRoomClick }: RoomGridProps) {
   // Find max columns for grid
   const maxColumns = Math.max(...roomLayout.map(row => row.length))
 
+  // Sort rooms by room number for mobile list view
+  const sortedRooms = [...rooms].sort((a, b) =>
+    a.roomNumber.localeCompare(b.roomNumber, undefined, { numeric: true })
+  )
+
   return (
     <div className="relative">
-      {/* Room Grid - Scrollable on mobile */}
-      <div className="overflow-x-auto -mx-4 px-4 md:mx-0 md:px-0">
-        <div className="min-w-[600px] md:min-w-0">
-          <div className="grid gap-1 md:gap-2" style={{ gridTemplateColumns: `repeat(${maxColumns}, minmax(0, 1fr))` }}>
-            {roomLayout.map((row, rowIndex) => (
-              <div key={`row-${rowIndex}`} className="contents">
-                {row.map((roomNumber, colIndex) => {
-                  if (roomNumber === null) {
-                    // Blank space
-                    return (
-                      <div
-                        key={`blank-${rowIndex}-${colIndex}`}
-                        className="h-[60px] md:h-[70px] min-w-[42px] md:min-w-0"
-                      />
-                    )
-                  }
+      {/* Mobile List View */}
+      <div className="md:hidden space-y-2">
+        {sortedRooms.map(room => {
+          const config = statusConfig[room.status]
+          return (
+            <button
+              key={room.id}
+              onClick={() => handleRoomClick(room)}
+              className={`${config.bg} w-full flex items-center gap-3 p-3 rounded-lg border border-gray-200 border-l-4 ${config.border}`}
+            >
+              <div className={`w-3 h-3 rounded-full ${config.dot}`} />
+              <span className="font-bold">{room.roomNumber}</span>
+              <span className="text-gray-600">{room.type}</span>
+              <span className="text-gray-500 text-sm">{room.details}</span>
+            </button>
+          )
+        })}
+      </div>
 
-                  const room = roomMap.get(roomNumber.toUpperCase())
-                  if (!room) {
-                    // Room not found in data - show as gray placeholder
-                    return (
-                      <div
-                        key={`missing-${roomNumber}`}
-                        className="h-[60px] md:h-[70px] min-w-[42px] md:min-w-0 bg-gray-200 rounded-lg p-1 flex flex-col items-center justify-center"
-                      >
-                        <span className="font-bold text-[10px] md:text-xs text-gray-400">{roomNumber}</span>
-                        <span className="text-[8px] md:text-[9px] text-gray-400">ไม่พบ</span>
-                      </div>
-                    )
-                  }
-
-                  const config = statusConfig[room.status]
-
+      {/* Desktop Room Grid */}
+      <div className="hidden md:block">
+        <div className="grid gap-2" style={{ gridTemplateColumns: `repeat(${maxColumns}, minmax(0, 1fr))` }}>
+          {roomLayout.map((row, rowIndex) => (
+            <div key={`row-${rowIndex}`} className="contents">
+              {row.map((roomNumber, colIndex) => {
+                if (roomNumber === null) {
+                  // Blank space
                   return (
-                    <button
-                      key={room.id}
-                      onClick={() => handleRoomClick(room)}
-                      className={`${config.bg} border border-gray-200 border-b-4 ${config.border} rounded-lg p-1
-                        transition-all duration-200 hover:shadow-md
-                        flex flex-col items-center justify-center h-[60px] md:h-[70px] min-w-[42px] md:min-w-0 overflow-hidden`}
-                      title={`${room.roomNumber} - ${room.type} - ${room.details || ''}`}
-                    >
-                      <span className="font-bold text-[10px] md:text-xs leading-tight text-gray-800">{room.roomNumber}</span>
-                      <span className="text-[7px] md:text-[8px] leading-tight text-gray-600">{room.type}</span>
-                      <span className="text-[7px] md:text-[8px] leading-tight text-gray-500">{room.details}</span>
-                    </button>
+                    <div
+                      key={`blank-${rowIndex}-${colIndex}`}
+                      className="h-[70px]"
+                    />
                   )
-                })}
-                {/* Fill remaining columns with empty cells */}
-                {Array.from({ length: maxColumns - row.length }).map((_, i) => (
-                  <div key={`filler-${rowIndex}-${i}`} className="h-[60px] md:h-[70px] min-w-[42px] md:min-w-0" />
-                ))}
-              </div>
-            ))}
-          </div>
+                }
+
+                const room = roomMap.get(roomNumber.toUpperCase())
+                if (!room) {
+                  // Room not found in data - show as gray placeholder
+                  return (
+                    <div
+                      key={`missing-${roomNumber}`}
+                      className="h-[70px] bg-gray-200 rounded-lg p-1 flex flex-col items-center justify-center"
+                    >
+                      <span className="font-bold text-xs text-gray-400">{roomNumber}</span>
+                      <span className="text-[9px] text-gray-400">ไม่พบ</span>
+                    </div>
+                  )
+                }
+
+                const config = statusConfig[room.status]
+
+                return (
+                  <button
+                    key={room.id}
+                    onClick={() => handleRoomClick(room)}
+                    className={`${config.bg} border border-gray-200 border-b-4 ${config.border} rounded-lg p-1
+                      transition-all duration-200 hover:shadow-md
+                      flex flex-col items-center justify-center h-[70px] overflow-hidden`}
+                    title={`${room.roomNumber} - ${room.type} - ${room.details || ''}`}
+                  >
+                    <span className="font-bold text-xs leading-tight text-gray-800">{room.roomNumber}</span>
+                    <span className="text-[8px] leading-tight text-gray-600">{room.type}</span>
+                    <span className="text-[8px] leading-tight text-gray-500">{room.details}</span>
+                  </button>
+                )
+              })}
+              {/* Fill remaining columns with empty cells */}
+              {Array.from({ length: maxColumns - row.length }).map((_, i) => (
+                <div key={`filler-${rowIndex}-${i}`} className="h-[70px]" />
+              ))}
+            </div>
+          ))}
         </div>
       </div>
 
