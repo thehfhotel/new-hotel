@@ -4,10 +4,18 @@ import {
   sendSlackMessage,
   buildHourlyReportMessage,
   buildCheckInAlertMessage,
+  buildCheckOutAlertMessage,
+  buildNewBookingAlertMessage,
 } from './slack';
 
 // Track last checked timestamp for check-in polling
 let lastCheckedTimestamp: Date | null = null;
+
+// Track last checked timestamp for checkout polling
+let lastCheckoutTimestamp: Date | null = null;
+
+// Track last checked timestamp for booking polling
+let lastBookingTimestamp: Date | null = null;
 
 // Track if scheduler is initialized
 let isInitialized = false;
@@ -109,6 +117,122 @@ async function pollCheckIns(): Promise<void> {
 }
 
 /**
+ * Poll for new checkouts and send alerts to Slack
+ */
+async function pollCheckouts(): Promise<void> {
+  console.log('[Scheduler] Polling for new checkouts...');
+
+  try {
+    const pool = await getPool();
+
+    // Initialize lastCheckoutTimestamp to current time on first run
+    if (!lastCheckoutTimestamp) {
+      lastCheckoutTimestamp = new Date();
+      console.log('[Scheduler] Initialized checkout polling from:', lastCheckoutTimestamp.toISOString());
+      return;
+    }
+
+    // Query for new checkouts since last poll
+    const result = await pool.request()
+      .input('lastChecked', lastCheckoutTimestamp)
+      .query(`
+        SELECT Cin_no, Cin_Room_No, Cin_Room_Out, Cin_cust_name
+        FROM View_CheckIn_Ds
+        WHERE Cin_Room_Out > @lastChecked
+        ORDER BY Cin_Room_Out ASC
+      `);
+
+    const newCheckouts = result.recordset;
+
+    if (newCheckouts.length > 0) {
+      console.log(`[Scheduler] Found ${newCheckouts.length} new checkout(s)`);
+
+      for (const checkout of newCheckouts) {
+        // Parse checkout time - database stores local Thai time
+        const checkoutTimeStr = checkout.Cin_Room_Out;
+        const checkoutTime = new Date(checkoutTimeStr);
+
+        const message = buildCheckOutAlertMessage(
+          checkout.Cin_cust_name || 'Unknown',
+          checkout.Cin_Room_No || 'Unknown',
+          checkoutTime
+        );
+
+        await sendSlackMessage(message);
+
+        // Update lastCheckoutTimestamp to the latest checkout time
+        if (!lastCheckoutTimestamp || checkoutTime > lastCheckoutTimestamp) {
+          lastCheckoutTimestamp = checkoutTime;
+        }
+      }
+    } else {
+      console.log('[Scheduler] No new checkouts found');
+    }
+  } catch (error) {
+    console.error('[Scheduler] Error polling checkouts:', error);
+  }
+}
+
+/**
+ * Poll for new bookings and send alerts to Slack
+ */
+async function pollNewBookings(): Promise<void> {
+  console.log('[Scheduler] Polling for new bookings...');
+
+  try {
+    const pool = await getPool();
+
+    // Initialize lastBookingTimestamp to current time on first run
+    if (!lastBookingTimestamp) {
+      lastBookingTimestamp = new Date();
+      console.log('[Scheduler] Initialized booking polling from:', lastBookingTimestamp.toISOString());
+      return;
+    }
+
+    // Query for new bookings since last poll
+    const result = await pool.request()
+      .input('lastChecked', lastBookingTimestamp)
+      .query(`
+        SELECT Book_no, Book_Cust_Name, Book_Room_Type, Book_Date_in, Book_Date_out, Book_Date
+        FROM View_Booking_Ds
+        WHERE Book_Date > @lastChecked
+        ORDER BY Book_Date ASC
+      `);
+
+    const newBookings = result.recordset;
+
+    if (newBookings.length > 0) {
+      console.log(`[Scheduler] Found ${newBookings.length} new booking(s)`);
+
+      for (const booking of newBookings) {
+        // Parse dates - database stores local Thai time
+        const bookingTime = new Date(booking.Book_Date);
+        const checkInDate = new Date(booking.Book_Date_in);
+        const checkOutDate = new Date(booking.Book_Date_out);
+
+        const message = buildNewBookingAlertMessage(
+          booking.Book_Cust_Name || 'Unknown',
+          booking.Book_Room_Type || 'Unknown',
+          checkInDate,
+          checkOutDate
+        );
+
+        await sendSlackMessage(message);
+
+        // Update lastBookingTimestamp to the latest booking time
+        if (!lastBookingTimestamp || bookingTime > lastBookingTimestamp) {
+          lastBookingTimestamp = bookingTime;
+        }
+      }
+    } else {
+      console.log('[Scheduler] No new bookings found');
+    }
+  } catch (error) {
+    console.error('[Scheduler] Error polling bookings:', error);
+  }
+}
+
+/**
  * Initialize the cron job scheduler
  * Should be called once on app startup
  */
@@ -147,8 +271,24 @@ export function initScheduler(): void {
     });
   });
 
+  // Poll for checkouts every 2 minutes
+  cron.schedule('*/2 * * * *', () => {
+    pollCheckouts().catch((error) => {
+      console.error('[Scheduler] Unhandled error in checkout polling:', error);
+    });
+  });
+
+  // Poll for new bookings every 2 minutes
+  cron.schedule('*/2 * * * *', () => {
+    pollNewBookings().catch((error) => {
+      console.error('[Scheduler] Unhandled error in booking polling:', error);
+    });
+  });
+
   isInitialized = true;
   console.log('[Scheduler] Cron jobs started');
   console.log('[Scheduler] - Hourly report: minute 0 of every hour');
   console.log('[Scheduler] - Check-in polling: every 2 minutes');
+  console.log('[Scheduler] - Checkout polling: every 2 minutes');
+  console.log('[Scheduler] - Booking polling: every 2 minutes');
 }

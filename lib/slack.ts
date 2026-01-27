@@ -172,3 +172,79 @@ export function buildCheckInAlertMessage(
     ],
   };
 }
+
+/**
+ * Build check-out alert message for Slack
+ */
+export function buildCheckOutAlertMessage(
+  guestName: string,
+  roomNumber: string,
+  checkOutTime: Date
+): SlackMessage {
+  const text = `เช็คเอาท์ - ${guestName} ห้อง ${roomNumber}`;
+
+  return {
+    text,
+    blocks: [
+      {
+        type: 'header',
+        text: {
+          type: 'plain_text',
+          text: ':wave: เช็คเอาท์!',
+          emoji: true,
+        },
+      },
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: [
+            '─────────────────────────',
+            `:bust_in_silhouette: *ชื่อผู้เข้าพัก:* ${guestName}`,
+            `:door: *ห้อง:* ${roomNumber}`,
+            `:clock3: *เวลา:* ${formatTime(checkOutTime)}`,
+          ].join('\n'),
+        },
+      },
+    ],
+  };
+}
+
+/**
+ * Build new booking alert message for Slack
+ */
+export function buildNewBookingAlertMessage(
+  guestName: string,
+  roomType: string,
+  checkInDate: Date,
+  checkOutDate: Date
+): SlackMessage {
+  const text = `การจองใหม่ - ${guestName} ประเภทห้อง ${roomType}`;
+
+  return {
+    text,
+    blocks: [
+      {
+        type: 'header',
+        text: {
+          type: 'plain_text',
+          text: ':calendar: การจองใหม่!',
+          emoji: true,
+        },
+      },
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: [
+            '─────────────────────────',
+            `:bust_in_silhouette: *ชื่อผู้จอง:* ${guestName}`,
+            `:bed: *ประเภทห้อง:* ${roomType}`,
+            `:airplane_arriving: *วันเข้าพัก:* ${formatThaiDate(checkInDate)}`,
+            `:airplane_departure: *วันออก:* ${formatThaiDate(checkOutDate)}`,
+          ].join('\n'),
+        },
+      },
+    ],
+  };
+}
