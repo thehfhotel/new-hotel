@@ -18,10 +18,15 @@ export async function GET() {
       FROM HT_Rooms
       WHERE Room_Use = 'yes'
         AND Room_no NOT IN (
-          SELECT DISTINCT Cin_Room_No
-          FROM View_CheckIn_Ds
-          WHERE CAST(Cin_Room_Out AS DATE) = CAST(GETDATE() AS DATE)
+          SELECT DISTINCT c.Cin_Room_No
+          FROM View_CheckIn_Ds c
+          WHERE CAST(c.Cin_Room_Out AS DATE) = CAST(GETDATE() AS DATE)
             AND DATEPART(HOUR, GETDATE()) >= 6
+            AND c.Cin_Room_In = (
+              SELECT MAX(c2.Cin_Room_In)
+              FROM View_CheckIn_Ds c2
+              WHERE c2.Cin_Room_No = c.Cin_Room_No
+            )
         )
     `);
 
@@ -33,6 +38,11 @@ export async function GET() {
       WHERE r.Room_Use = 'yes'
         AND CAST(c.Cin_Room_Out AS DATE) = CAST(GETDATE() AS DATE)
         AND DATEPART(HOUR, GETDATE()) >= 6
+        AND c.Cin_Room_In = (
+          SELECT MAX(c2.Cin_Room_In)
+          FROM View_CheckIn_Ds c2
+          WHERE c2.Cin_Room_No = c.Cin_Room_No
+        )
     `);
 
     // Booked rooms count - rooms with booking but not checked in

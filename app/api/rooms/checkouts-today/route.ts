@@ -16,6 +16,11 @@ export async function GET() {
       INNER JOIN HT_Rooms r ON c.Cin_Room_No = r.Room_no
       WHERE CAST(c.Cin_Room_Out AS DATE) = CAST(GETDATE() AS DATE)
         AND r.Room_Use = 'yes'
+        AND c.Cin_Room_In = (
+          SELECT MAX(c2.Cin_Room_In)
+          FROM View_CheckIn_Ds c2
+          WHERE c2.Cin_Room_No = c.Cin_Room_No
+        )
     `);
 
     return NextResponse.json({
