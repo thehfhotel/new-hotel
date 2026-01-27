@@ -100,7 +100,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
 
   deploy:
-    runs-on: [self-hosted, linux, new-hotel]
+    runs-on: [self-hosted, linux, deploy]
     needs: [changes, build-and-push]
     if: always() && (needs.build-and-push.result == 'success' || (needs.changes.outputs.deploy == 'true' && needs.changes.outputs.code != 'true'))
     steps:
