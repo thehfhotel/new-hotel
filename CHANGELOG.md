@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.1] - 2026-01-28
+
+### Changed
+- RoomGrid now mobile responsive with horizontal scroll, preserving floor plan layout
+- Responsive cell sizes (60px mobile, 70px desktop), text sizes, and legend
+- Fixed React key warning in RoomGrid row fragments
+
+## [1.6.0] - 2026-01-28
+
+### Added
+- Checkout notifications: Real-time Slack alerts when guests check out (polled every 2 minutes via `Cin_Room_Out` field)
+- New booking notifications: Real-time Slack alerts when new bookings are created (polled every 2 minutes via `Book_Date` field)
+- New functions in `lib/slack.ts`: `buildCheckOutAlertMessage`, `buildNewBookingAlertMessage`
+- New polling functions in `lib/scheduler.ts`: `pollCheckouts`, `pollNewBookings`
+
 ## [1.5.7] - 2026-01-28
 
 ### Fixed
