@@ -48,15 +48,23 @@ export async function GET(request: NextRequest) {
 
     const result = await dataRequest.query(dataQuery);
 
+    // Map the data to frontend-expected format
+    const customers = result.recordset.map(row => ({
+      id: row.Cust_no,
+      name: row.Cust_name,
+      type: row.Cust_Type,
+      phone: row.Cust_Add_tel,
+      idCard: row.Cust_IDcard,
+      address: row.C_Address,
+    }));
+
     return NextResponse.json({
       success: true,
-      data: result.recordset,
-      pagination: {
-        page,
-        limit,
-        total,
-        totalPages: Math.ceil(total / limit),
-      },
+      customers,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
     });
   } catch (error) {
     console.error('Error fetching customers:', error);

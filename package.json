@@ -1,6 +1,6 @@
 {
   "name": "new-hotel",
-  "version": "1.6.3",
+  "version": "1.6.5",
   "private": true,
   "scripts": {
     "dev": "next dev -p 3003",
@@ -12,6 +12,7 @@
     "test:db": "jest __tests__/api/database.test.ts",
     "test:api": "jest __tests__/api/api-endpoints.test.ts",
     "test:components": "jest __tests__/components/",
+    "test:slack": "jest __tests__/integration/slack.test.ts --verbose",
     "prepare": "husky"
   },
   "dependencies": {
