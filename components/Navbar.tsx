@@ -8,7 +8,8 @@ import {
   Users,
   BookOpen,
   BedDouble,
-  Hotel
+  Hotel,
+  ScrollText
 } from 'lucide-react'
 
 interface NavLink {
@@ -23,6 +24,7 @@ const navLinks: NavLink[] = [
   { href: '/customers', label: 'ลูกค้า', icon: <Users size={20} /> },
   { href: '/bookings', label: 'การจอง', icon: <BookOpen size={20} /> },
   { href: '/rooms', label: 'ห้องพัก', icon: <BedDouble size={20} /> },
+  { href: '/changelog', label: 'ประวัติ', icon: <ScrollText size={20} /> },
 ]
 
 export default function Navbar() {
