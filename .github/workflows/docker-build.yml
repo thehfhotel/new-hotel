@@ -108,6 +108,8 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Deploy
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
         run: |
           mkdir -p /home/nut/new-hotel-production
           cp docker-compose.yml /home/nut/new-hotel-production/

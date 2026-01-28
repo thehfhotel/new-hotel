@@ -8,4 +8,6 @@ services:
       - DB_NAME=db
       - DB_USER=sa
       - DB_PASSWORD=12345678
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+      - SLACK_NOTIFICATIONS_ENABLED=true
     restart: unless-stopped
