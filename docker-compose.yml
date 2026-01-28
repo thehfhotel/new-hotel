@@ -1,6 +1,6 @@
 services:
   web:
-    image: ghcr.io/jwinut/new-hotel:latest
+    image: ghcr.io/thehfhotel/new-hotel:latest
     ports:
       - "3003:3003"
     environment:
