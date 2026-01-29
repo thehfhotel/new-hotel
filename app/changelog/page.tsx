@@ -63,7 +63,7 @@ export default function ChangelogPage() {
     if (!text) return null
 
     const lines = text.split('\n')
-    const elements: JSX.Element[] = []
+    const elements: React.JSX.Element[] = []
     let currentList: string[] = []
     let listKey = 0
 
