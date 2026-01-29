@@ -27,3 +27,4 @@ base64 = "0.22"
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+

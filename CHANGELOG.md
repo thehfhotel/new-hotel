@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.1] - 2026-01-29
+
+### Changed
+- **Middleware build pipeline migrated from Electron to Tauri** - `middleware-build.yml` now builds the Tauri-based Thai ID Middleware instead of the Electron version
+  - Triggers on changes to `thai-id-middleware-tauri/` instead of `thai-id-middleware/`
+  - Uses Rust toolchain with `dtolnay/rust-action` for cross-platform builds
+  - Builds macOS Universal binary (Apple Silicon + Intel) and Windows x64
+  - Produces smaller artifacts (~10MB vs ~150MB Electron)
+
+### Removed
+- `tauri-build.yml` workflow - consolidated into `middleware-build.yml`
+
+## [1.14.0] - 2026-01-29
+
+### Security
+- **Upgraded Next.js from 14.2.35 to 15.5.11** - Resolves 4 Dependabot security alerts:
+  - HIGH: HTTP request deserialization DoS via React Server Components (GHSA-qpjv-v59x-3qc4) - fixed in >= 15.0.8
+  - HIGH: HTTP request deserialization DoS via React Server Components (duplicate alert) - fixed in >= 15.0.8
+  - MEDIUM: Image Optimizer remotePatterns DoS (GHSA-qfcj-68r8-w26x) - fixed in >= 15.5.10
+  - MEDIUM: Image Optimizer remotePatterns DoS (duplicate alert) - fixed in >= 15.5.10
+- **Upgraded React from 18.3.1 to 19.1.0** - Required by Next.js 15
+- Upgraded eslint-config-next from 14.2.35 to 15.5.11
+
+### Changed
+- **Breaking Change Migration (Next.js 15)**:
+  - API route params are now async (Promise-based) - updated all dynamic routes
+  - JSX namespace changed from `JSX.Element` to `React.JSX.Element`
+  - Removed deprecated `experimental.instrumentationHook` from next.config.js (now enabled by default)
+
+### Note
+- **glib vulnerability (RUSTSEC-2024-0429)** - Unsoundness in `VariantStrIter` iterator
+  - Status: **Cannot be fixed** - glib 0.18.5 is constrained by Tauri's GTK3 stack (gtk 0.18.x)
+  - Impact: **Low** - Linux builds only, vulnerable API not used by application
+  - The gtk-rs GTK3 bindings are unmaintained and pinned to glib 0.18.x
+  - Fix will come when Tauri migrates to GTK4 or updates dependencies
+  - Tracked upstream: waiting for Tauri ecosystem update
+
 ## [1.13.3] - 2026-01-29
 
 ### Added

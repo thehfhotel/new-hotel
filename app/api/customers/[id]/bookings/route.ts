@@ -5,11 +5,11 @@ export const dynamic = 'force-dynamic';
 
 export async function GET(
   request: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
   try {
     // Customer ID comes as "C0001" format - use as-is for Book_Cust_ID match
-    const custId = params.id;
+    const { id: custId } = await params;
 
     const pool = await getPool();
     const dbRequest = pool.request();
