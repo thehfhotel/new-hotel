@@ -1,0 +1,13 @@
+# Dependencies
+node_modules/
+
+# Rust build artifacts
+src-tauri/target/
+
+# Build output
+dist/
+
+# Editor files
+.DS_Store
+*.swp
+*.swo
