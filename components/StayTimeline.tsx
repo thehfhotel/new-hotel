@@ -23,8 +23,6 @@ export interface Stay {
   nights: number
 }
 
-type ViewMode = 'week' | 'month'
-
 interface DayData {
   date: Date
   continuing: number  // Guests staying from previous day
@@ -33,10 +31,14 @@ interface DayData {
   total: number
 }
 
+type ViewMode = 'week' | 'month'
+
 interface StayTimelineProps {
   stays: Stay[]
   selectedDate: Date
   onDateChange: (date: Date) => void
+  viewMode: ViewMode
+  onViewModeChange: (mode: ViewMode) => void
 }
 
 const THAI_MONTHS = [
@@ -50,8 +52,9 @@ export default function StayTimeline({
   stays,
   selectedDate,
   onDateChange,
+  viewMode,
+  onViewModeChange,
 }: StayTimelineProps) {
-  const [viewMode, setViewMode] = useState<ViewMode>('week')
   const [hoveredDay, setHoveredDay] = useState<string | null>(null)
 
   // Calculate date range based on view mode
@@ -164,10 +167,10 @@ export default function StayTimeline({
 
       {/* View Mode Tabs */}
       <div className="flex items-center justify-center gap-1 p-2 border-b bg-gray-50">
-        {(['week', 'month'] as ViewMode[]).map(mode => (
+        {(['week', 'month'] as const).map(mode => (
           <button
             key={mode}
-            onClick={() => setViewMode(mode)}
+            onClick={() => onViewModeChange(mode)}
             className={`px-4 py-1.5 text-sm rounded-lg transition-colors ${
               viewMode === mode
                 ? 'bg-blue-600 text-white'

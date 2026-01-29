@@ -21,6 +21,7 @@ interface ApiCheckIn {
 
 export default function CalendarPage() {
   const [selectedDate, setSelectedDate] = useState(new Date())
+  const [viewMode, setViewMode] = useState<'week' | 'month'>('week')
   const [bookings, setBookings] = useState<ApiBooking[]>([])
   const [checkins, setCheckins] = useState<ApiCheckIn[]>([])
   const [loading, setLoading] = useState(true)
@@ -132,6 +133,8 @@ export default function CalendarPage() {
           stays={stays}
           selectedDate={selectedDate}
           onDateChange={setSelectedDate}
+          viewMode={viewMode}
+          onViewModeChange={setViewMode}
         />
       )}
     </div>
