@@ -135,6 +135,31 @@ function transmit(protocol, command) {
   })
 }
 
+// GET RESPONSE command for retrieving pending data (ISO 7816-4)
+async function getResponse(protocol, length) {
+  const cmd = Buffer.from([0x00, 0xC0, 0x00, 0x00, length])
+  return await transmit(protocol, cmd)
+}
+
+// Smart transmit wrapper that handles SW1=61 (more data available)
+// SW1=61 means command succeeded and SW2 bytes of response data are available
+async function transmitWithGetResponse(protocol, command) {
+  let response = await transmit(protocol, command)
+  let sw1 = response[response.length - 2]
+  let sw2 = response[response.length - 1]
+
+  // Handle SW1=61 (more data available) by sending GET RESPONSE
+  while (sw1 === 0x61) {
+    const moreData = await getResponse(protocol, sw2)
+    // Combine data (excluding old SW) with new response
+    response = Buffer.concat([response.slice(0, -2), moreData])
+    sw1 = response[response.length - 2]
+    sw2 = response[response.length - 1]
+  }
+
+  return response
+}
+
 function parseThaiString(buffer) {
   // Remove status bytes (last 2 bytes) and trailing spaces/nulls
   const data = buffer.slice(0, -2)
@@ -180,8 +205,8 @@ async function readCard() {
       currentProtocol = protocol
 
       try {
-        // Select Thai ID applet
-        const selectResponse = await transmit(protocol, APDU.SELECT_APPLET)
+        // Select Thai ID applet (use transmitWithGetResponse to handle SW 61XX)
+        const selectResponse = await transmitWithGetResponse(protocol, APDU.SELECT_APPLET)
         const sw = selectResponse.slice(-2)
         if (sw[0] !== 0x90 || sw[1] !== 0x00) {
           throw new Error('Failed to select Thai ID applet. Is this a Thai National ID card?')
@@ -293,12 +318,13 @@ async function debugCard() {
             ...aidInfo.aid
           ])
 
-          const response = await transmit(protocol, selectCmd)
+          const response = await transmitWithGetResponse(protocol, selectCmd)
           const sw1 = response[response.length - 2]
           const sw2 = response[response.length - 1]
           const statusWord = ((sw1 << 8) | sw2).toString(16).toUpperCase().padStart(4, '0')
 
-          const success = sw1 === 0x90 && sw2 === 0x00
+          // SW1=90 (success) OR SW1=61 (success with more data available)
+          const success = sw1 === 0x90 || sw1 === 0x61
           const responseHex = response.toString('hex').toUpperCase()
 
           aidResults.push({
@@ -325,7 +351,7 @@ async function debugCard() {
       if (successfulAid) {
         try {
           // Try reading CID as a test
-          const cidResponse = await transmit(protocol, APDU.READ_CID)
+          const cidResponse = await transmitWithGetResponse(protocol, APDU.READ_CID)
           rawReadResult = {
             command: 'READ_CID',
             commandHex: APDU.READ_CID.toString('hex').toUpperCase(),

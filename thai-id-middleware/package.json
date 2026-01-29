@@ -1,6 +1,6 @@
 {
   "name": "thai-id-middleware",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Cross-platform desktop app with GUI that runs an HTTP middleware for Thai ID card reading",
   "main": "main.js",
   "scripts": {

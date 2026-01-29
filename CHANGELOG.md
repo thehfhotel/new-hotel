@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.1] - 2026-01-29
+
+### Fixed
+- Thai ID card reader failing with "Failed to select Thai ID applet" on real Thai National ID cards
+  - Root cause: Cards return SW 61XX (more data available) instead of 9000 for SELECT commands
+  - SW1=61 is valid ISO 7816-4 success response meaning XX bytes of data are pending
+  - Added `transmitWithGetResponse()` to automatically send GET RESPONSE (00 C0 00 00 XX) when needed
+  - Updated `debugCard()` to recognize SW1=61 as success indicator
+- Middleware version bumped to 1.1.1
+
 ## [1.12.0] - 2026-01-29
 
 ### Added
