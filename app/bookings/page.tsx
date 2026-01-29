@@ -44,14 +44,6 @@ interface BookingsResponse {
   }
 }
 
-// Status configuration
-const statusConfig: Record<string, { label: string; bgColor: string; textColor: string }> = {
-  'จอง': { label: 'จอง', bgColor: 'bg-yellow-100', textColor: 'text-yellow-800' },
-  'เข้าพัก': { label: 'เข้าพัก', bgColor: 'bg-green-100', textColor: 'text-green-800' },
-  'ยกเลิก': { label: 'ยกเลิก', bgColor: 'bg-red-100', textColor: 'text-red-800' },
-  'เสร็จสิ้น': { label: 'เสร็จสิ้น', bgColor: 'bg-gray-100', textColor: 'text-gray-800' },
-}
-
 const statusOptions = [
   { value: '', label: 'สถานะทั้งหมด' },
   { value: 'จอง', label: 'จอง' },
@@ -134,20 +126,6 @@ export default function BookingsPage() {
   useEffect(() => {
     fetchBookings()
   }, [fetchBookings])
-
-  // Get status badge
-  const getStatusBadge = (status: string) => {
-    const config = statusConfig[status] || {
-      label: status,
-      bgColor: 'bg-gray-100',
-      textColor: 'text-gray-800'
-    }
-    return (
-      <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${config.bgColor} ${config.textColor}`}>
-        {config.label}
-      </span>
-    )
-  }
 
   // Handle filter reset
   const handleResetFilters = () => {
@@ -306,6 +284,9 @@ export default function BookingsPage() {
                       เลขที่จอง
                     </th>
                     <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      สถานะ
+                    </th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                       ลูกค้า
                     </th>
                     <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
@@ -327,12 +308,12 @@ export default function BookingsPage() {
                       className="hover:bg-blue-50 cursor-pointer transition-colors"
                     >
                       <td className="px-4 py-4 whitespace-nowrap">
-                        <div className="flex flex-col">
-                          <span className="text-sm font-medium text-blue-600">
-                            {booking.bookNo}
-                          </span>
-                          {getStatusBadge(booking.status)}
-                        </div>
+                        <span className="text-sm font-medium text-blue-600">
+                          {booking.bookNo}
+                        </span>
+                      </td>
+                      <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-900">
+                        {booking.status}
                       </td>
                       <td className="px-4 py-4 whitespace-nowrap">
                         <span className="text-sm text-gray-900">

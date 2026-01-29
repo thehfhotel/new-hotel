@@ -199,9 +199,9 @@ export default function BookingDetailDrawer({ bookNo, onClose }: BookingDetailDr
 
   return (
     <>
-      {/* Backdrop */}
+      {/* Backdrop - click to dismiss */}
       <div
-        className="fixed inset-0 bg-black bg-opacity-30 z-40 lg:hidden"
+        className="fixed inset-0 bg-black bg-opacity-30 z-40"
         onClick={onClose}
       />
 
