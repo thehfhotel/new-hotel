@@ -189,36 +189,44 @@ describe('API Endpoints', () => {
 
       expect(response.ok).toBe(true)
       expect(data.success).toBe(true)
-      expect(data.data).toBeDefined()
-      expect(Array.isArray(data.data)).toBe(true)
-      expect(data.data.length).toBeLessThanOrEqual(10)
+      expect(data.customers).toBeDefined()
+      expect(Array.isArray(data.customers)).toBe(true)
+      expect(data.customers.length).toBeLessThanOrEqual(10)
 
       // Verify pagination
-      expect(data.pagination).toBeDefined()
-      expect(data.pagination.total).toBeGreaterThan(0)
+      expect(data.total).toBeGreaterThan(0)
+      expect(data.page).toBeDefined()
+      expect(data.totalPages).toBeDefined()
     })
 
     test('should return correct customer structure', async () => {
       const response = await fetch(`${API_BASE}/api/customers?limit=1`)
       const data = await response.json()
 
-      const customer = data.data[0]
-      expect(customer).toHaveProperty('Cust_no')
-      expect(customer).toHaveProperty('Cust_name')
-      expect(customer).toHaveProperty('Cust_Type')
-      expect(customer).toHaveProperty('Cust_Add_tel')
-      expect(customer).toHaveProperty('Cust_IDcard')
-      expect(customer).toHaveProperty('C_Address')
+      const customer = data.customers[0]
+      expect(customer).toHaveProperty('id')
+      expect(customer).toHaveProperty('name')
+      expect(customer).toHaveProperty('type')
+      expect(customer).toHaveProperty('phone')
+      expect(customer).toHaveProperty('idCard')
+      expect(customer).toHaveProperty('address')
     })
 
-    test('search should filter by name', async () => {
-      const response = await fetch(`${API_BASE}/api/customers?search=สมชาย&limit=100`)
+    test('search should filter results', async () => {
+      const response = await fetch(`${API_BASE}/api/customers?search=081&limit=100`)
       const data = await response.json()
 
       expect(data.success).toBe(true)
-      // All results should contain the search term
-      for (const customer of data.data) {
-        expect(customer.Cust_name.toLowerCase()).toContain('สมชาย'.toLowerCase())
+      expect(data.customers).toBeDefined()
+      // Search term should appear in at least one field (name, phone, idCard, or id)
+      for (const customer of data.customers) {
+        const searchTerm = '081'
+        const matchesAnyField =
+          (customer.name && customer.name.includes(searchTerm)) ||
+          (customer.phone && customer.phone.includes(searchTerm)) ||
+          (customer.idCard && customer.idCard.includes(searchTerm)) ||
+          String(customer.id).includes(searchTerm)
+        expect(matchesAnyField).toBe(true)
       }
     })
   })

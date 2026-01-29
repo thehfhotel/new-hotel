@@ -25,6 +25,10 @@ interface DataTableProps<T> {
   pagination?: PaginationInfo
   onPageChange?: (page: number) => void
   loading?: boolean
+  // Server-side sorting support
+  onSort?: (column: string, direction: 'asc' | 'desc' | null) => void
+  sortColumn?: string | null
+  sortDirection?: 'asc' | 'desc' | null
 }
 
 type SortDirection = 'asc' | 'desc' | null
@@ -36,49 +40,74 @@ export default function DataTable<T extends object>({
   pagination,
   onPageChange,
   loading = false,
+  onSort,
+  sortColumn: controlledSortColumn,
+  sortDirection: controlledSortDirection,
 }: DataTableProps<T>) {
-  const [sortColumn, setSortColumn] = useState<string | null>(null)
-  const [sortDirection, setSortDirection] = useState<SortDirection>(null)
+  // Local state for client-side sorting (used when onSort is not provided)
+  const [localSortColumn, setLocalSortColumn] = useState<string | null>(null)
+  const [localSortDirection, setLocalSortDirection] = useState<SortDirection>(null)
+
+  // Use controlled values if server-side sorting is enabled, otherwise use local state
+  const isServerSide = !!onSort
+  const sortColumn = isServerSide ? controlledSortColumn : localSortColumn
+  const sortDirection = isServerSide ? controlledSortDirection : localSortDirection
 
   const handleSort = (columnKey: string, sortable?: boolean) => {
     if (!sortable) return
 
+    let newDirection: SortDirection
     if (sortColumn === columnKey) {
       if (sortDirection === 'asc') {
-        setSortDirection('desc')
+        newDirection = 'desc'
       } else if (sortDirection === 'desc') {
-        setSortColumn(null)
-        setSortDirection(null)
+        newDirection = null
       } else {
-        setSortDirection('asc')
+        newDirection = 'asc'
       }
     } else {
-      setSortColumn(columnKey)
-      setSortDirection('asc')
+      newDirection = 'asc'
+    }
+
+    if (isServerSide) {
+      // Server-side sorting: call the onSort callback
+      onSort(columnKey, newDirection)
+    } else {
+      // Client-side sorting: update local state
+      if (newDirection === null) {
+        setLocalSortColumn(null)
+        setLocalSortDirection(null)
+      } else {
+        setLocalSortColumn(columnKey)
+        setLocalSortDirection(newDirection)
+      }
     }
   }
 
-  const sortedData = [...data].sort((a, b) => {
-    if (!sortColumn || !sortDirection) return 0
+  // Only apply client-side sorting when server-side sorting is not enabled
+  const sortedData = isServerSide
+    ? data
+    : [...data].sort((a, b) => {
+        if (!sortColumn || !sortDirection) return 0
 
-    const aValue = (a as Record<string, unknown>)[sortColumn]
-    const bValue = (b as Record<string, unknown>)[sortColumn]
+        const aValue = (a as Record<string, unknown>)[sortColumn]
+        const bValue = (b as Record<string, unknown>)[sortColumn]
 
-    if (aValue === null || aValue === undefined) return 1
-    if (bValue === null || bValue === undefined) return -1
+        if (aValue === null || aValue === undefined) return 1
+        if (bValue === null || bValue === undefined) return -1
 
-    if (typeof aValue === 'string' && typeof bValue === 'string') {
-      return sortDirection === 'asc'
-        ? aValue.localeCompare(bValue, 'th')
-        : bValue.localeCompare(aValue, 'th')
-    }
+        if (typeof aValue === 'string' && typeof bValue === 'string') {
+          return sortDirection === 'asc'
+            ? aValue.localeCompare(bValue, 'th')
+            : bValue.localeCompare(aValue, 'th')
+        }
 
-    if (typeof aValue === 'number' && typeof bValue === 'number') {
-      return sortDirection === 'asc' ? aValue - bValue : bValue - aValue
-    }
+        if (typeof aValue === 'number' && typeof bValue === 'number') {
+          return sortDirection === 'asc' ? aValue - bValue : bValue - aValue
+        }
 
-    return 0
-  })
+        return 0
+      })
 
   const renderPagination = () => {
     if (!pagination || !onPageChange) return null

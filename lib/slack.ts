@@ -68,29 +68,68 @@ export async function sendSlackMessage(message: SlackMessage): Promise<boolean> 
 }
 
 /**
- * Format Thai date string
+ * Format Thai date string for database dates
+ * Uses UTC because database stores local Thai time but mssql marks it as UTC
  */
-function formatThaiDate(date: Date): string {
+function formatThaiDateFromDb(date: Date): string {
   const thaiMonths = [
     'มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน',
     'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม'
   ];
 
-  const day = date.getDate();
-  const month = thaiMonths[date.getMonth()];
-  const year = date.getFullYear() + 543; // Buddhist Era
+  const day = date.getUTCDate();
+  const month = thaiMonths[date.getUTCMonth()];
+  const year = date.getUTCFullYear() + 543; // Buddhist Era
 
   return `${day} ${month} ${year}`;
 }
 
 /**
- * Format time string (HH:MM)
+ * Format Thai date string for current time (uses Asia/Bangkok timezone)
  */
-function formatTime(date: Date): string {
+function formatThaiDateNow(date: Date): string {
+  const thaiMonths = [
+    'มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน',
+    'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม'
+  ];
+
+  // Get Thai time components
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Bangkok',
+    day: 'numeric',
+    month: 'numeric',
+    year: 'numeric',
+  });
+  const parts = formatter.formatToParts(date);
+  const day = parseInt(parts.find(p => p.type === 'day')?.value || '1');
+  const monthIndex = parseInt(parts.find(p => p.type === 'month')?.value || '1') - 1;
+  const year = parseInt(parts.find(p => p.type === 'year')?.value || '2024') + 543;
+
+  return `${day} ${thaiMonths[monthIndex]} ${year}`;
+}
+
+/**
+ * Format time string (HH:MM) for database dates
+ * Uses UTC because database stores local Thai time but mssql marks it as UTC
+ */
+function formatTimeFromDb(date: Date): string {
   return date.toLocaleTimeString('th-TH', {
     hour: '2-digit',
     minute: '2-digit',
     hour12: false,
+    timeZone: 'UTC',
+  });
+}
+
+/**
+ * Format time string (HH:MM) for current time (uses Asia/Bangkok timezone)
+ */
+function formatTimeNow(date: Date): string {
+  return date.toLocaleTimeString('th-TH', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+    timeZone: 'Asia/Bangkok',
   });
 }
 
@@ -124,8 +163,8 @@ export function buildHourlyReportMessage(
           type: 'mrkdwn',
           text: [
             '─────────────────────────',
-            `*วันที่:* ${formatThaiDate(now)}`,
-            `*เวลา:* ${formatTime(now)}`,
+            `*วันที่:* ${formatThaiDateNow(now)}`,
+            `*เวลา:* ${formatTimeNow(now)}`,
             '',
             `:bed: *ห้องที่มีผู้เข้าพัก:* ${occupiedRooms}/${totalRooms} (${occupancyPercent}%)`,
             `:calendar: *การจองวันนี้:* ${todayBookings} รายการ`,
@@ -165,7 +204,7 @@ export function buildCheckInAlertMessage(
             '',
             `:bust_in_silhouette: *ชื่อผู้เข้าพัก:* ${guestName}`,
             `:door: *ห้อง:* ${roomNumber}`,
-            `:clock3: *เวลา:* ${formatTime(checkInTime)}`,
+            `:clock3: *เวลา:* ${formatTimeFromDb(checkInTime)}`,
           ].join('\n'),
         },
       },
@@ -202,7 +241,7 @@ export function buildCheckOutAlertMessage(
             '─────────────────────────',
             `:bust_in_silhouette: *ชื่อผู้เข้าพัก:* ${guestName}`,
             `:door: *ห้อง:* ${roomNumber}`,
-            `:clock3: *เวลา:* ${formatTime(checkOutTime)}`,
+            `:clock3: *เวลา:* ${formatTimeFromDb(checkOutTime)}`,
           ].join('\n'),
         },
       },
@@ -240,8 +279,8 @@ export function buildNewBookingAlertMessage(
             '─────────────────────────',
             `:bust_in_silhouette: *ชื่อผู้จอง:* ${guestName}`,
             `:bed: *ประเภทห้อง:* ${roomType}`,
-            `:airplane_arriving: *วันเข้าพัก:* ${formatThaiDate(checkInDate)}`,
-            `:airplane_departure: *วันออก:* ${formatThaiDate(checkOutDate)}`,
+            `:airplane_arriving: *วันเข้าพัก:* ${formatThaiDateFromDb(checkInDate)}`,
+            `:airplane_departure: *วันออก:* ${formatThaiDateFromDb(checkOutDate)}`,
           ].join('\n'),
         },
       },
