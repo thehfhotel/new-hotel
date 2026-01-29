@@ -49,6 +49,13 @@
 - `View_CheckIn_Ds` - Check-in records
 - `View_Customers` - Customer information
 
+**PROHIBITED on legacy tables/views:**
+- `ALTER TABLE` / `ALTER VIEW` - Do not modify columns or definitions
+- `DROP TABLE` / `DROP VIEW` - Do not delete
+- `CREATE INDEX` on legacy tables - May affect legacy app
+
+**Instead:** Create new tables/views owned by this app (prefix with `HT_`)
+
 ### Database Migrations
 
 **MANDATORY**: When making ANY database schema changes:
