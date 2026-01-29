@@ -1,0 +1,16 @@
+{
+  "name": "thai-id-middleware-tauri",
+  "version": "1.0.0",
+  "description": "Thai ID Card Reader Middleware (Tauri)",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2"
+  }
+}

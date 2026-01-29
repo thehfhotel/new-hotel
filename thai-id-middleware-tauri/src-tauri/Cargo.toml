@@ -1,0 +1,29 @@
+[package]
+name = "thai-id-middleware"
+version = "1.1.0"
+description = "Thai ID Card Reader Middleware"
+authors = [""]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-shell = "2"
+pcsc = "2"
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tower-http = { version = "0.5", features = ["cors"] }
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+lazy_static = "1"
+log = "0.4"
+base64 = "0.22"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

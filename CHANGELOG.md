@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.3] - 2026-01-29
+
+### Added
+- **Photo display in Tauri GUI** - Cardholder's photo now displays in the Tauri frontend when reading cards
+  - Photo appears at the top of the debug output when clicking "Test Read"
+  - Styled with rounded corners and blue border to match the app theme
+- **Debug mode toggle** (🔧 button) in Tauri GUI header
+  - When debug=off: Only shows status indicators (HTTP Server, Card Reader, Card) - 400×340px
+  - When debug=on: Shows full UI with endpoints, debug tools, and footer - 400×760px
+  - Fixed window sizes (non-resizable) that adjust when toggling debug mode
+  - Starts in compact mode (debug=off) by default
+- **System tray icon** restored - click to show/focus the main window
+- **Photo reading support** in Thai ID Middleware Tauri - Read cardholder's photo from Thai ID card
+  - New `?photo=true` query parameter for `GET /read` endpoint
+  - Photo returned as base64-encoded JPEG in `data.photo` field
+  - Photo reading adds ~2 seconds (20 APDU commands for 5KB JPEG data)
+  - Example: `curl "http://localhost:9898/read?photo=true" | jq '.data.photo'`
+- **Enhanced debug endpoint** (`GET /debug`) now returns comprehensive card information:
+  - ATR (Answer To Reset) - card identification bytes
+  - Protocol (T=0 or T=1) - smart card communication protocol
+  - Reader name
+  - AID test results - tests 4 known Thai ID card application IDs with status words
+  - Raw read result - shows actual APDU response for CID read command
+  - Human-readable status word descriptions (6A82 = File not found, etc.)
+
+### Changed
+- Thai ID Middleware Tauri version bumped to 1.1.0
+- `read_card` Tauri command now accepts optional `include_photo` parameter
+- CardData struct now includes optional `photo` field (base64 string)
+
+## [1.13.2] - 2026-01-29
+
+### Fixed
+- **Tauri app crash on macOS** - Fixed SIGABRT crash during app launch
+  - Root cause: PNG icon files had 16-bit color depth instead of 8-bit RGBA
+  - Converted all icons (32x32.png, 128x128.png, 128x128@2x.png, icon.png) to 8-bit RGBA format
+  - Simplified HTTP server lifecycle management to prevent premature shutdown
+- **Card reader connection issues** - Fixed "smart card not responding to reset" error
+  - Changed from `Protocols::ANY` to explicit `Protocols::T0` for Thai ID cards
+  - Added fallback to T1 and ANY protocols if T0 fails
+  - Thai ID cards use T=0 protocol which is now tried first for better compatibility
+
+### Added
+- **Debug mode for card reader** - Verbose logging can be enabled for troubleshooting
+  - HTTP endpoints: `GET /debug`, `GET /debug/enable`, `GET /debug/disable`
+  - Tauri commands: `set_debug(enabled)`, `get_debug()`
+  - When enabled, logs APDU commands, responses, and connection details to stderr
+
+### Removed
+- System tray functionality (temporarily) - Removed to simplify debugging; will be re-added in future version
+
 ## [1.13.1] - 2026-01-29
 
 ### Fixed
@@ -27,8 +78,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - CORS enabled for localhost web apps
   - **Tauri IPC commands** (`commands.rs`) - Frontend integration
     - `get_status`, `get_version`, `read_card`, `debug_card` commands
-  - **System tray** - Show/hide window, status check, quit menu
-  - **Minimize to tray** - Window hides on close instead of quitting
   - Frontend ported from Electron with Tauri API integration
 - Benefits over Electron:
   - Smaller binary size (~10MB vs ~150MB)
