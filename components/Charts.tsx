@@ -24,30 +24,30 @@ interface OccupancyChartProps {
   title?: string
 }
 
+function CustomTooltip({ active, payload, label }: {
+  active?: boolean
+  payload?: { value: number }[]
+  label?: string
+}) {
+  if (active && payload && payload.length) {
+    return (
+      <div className="bg-white border border-gray-200 rounded-lg shadow-lg p-3">
+        <p className="text-gray-600 text-sm">{label}</p>
+        <p className="text-blue-600 font-bold">
+          ห้องที่มีผู้เข้าพัก: {payload[0].value} ห้อง
+        </p>
+      </div>
+    )
+  }
+  return null
+}
+
 export function OccupancyChart({
   data,
   chartType = 'bar',
   title = 'จำนวนห้องที่มีผู้เข้าพัก',
 }: OccupancyChartProps) {
   const maxRooms = Math.max(...data.map(d => d.occupiedRooms), 10)
-
-  const CustomTooltip = ({ active, payload, label }: {
-    active?: boolean
-    payload?: { value: number }[]
-    label?: string
-  }) => {
-    if (active && payload && payload.length) {
-      return (
-        <div className="bg-white border border-gray-200 rounded-lg shadow-lg p-3">
-          <p className="text-gray-600 text-sm">{label}</p>
-          <p className="text-blue-600 font-bold">
-            ห้องที่มีผู้เข้าพัก: {payload[0].value} ห้อง
-          </p>
-        </div>
-      )
-    }
-    return null
-  }
 
   return (
     <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
