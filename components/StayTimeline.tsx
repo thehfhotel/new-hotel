@@ -20,14 +20,12 @@ export interface Stay {
   nights: number
 }
 
-interface AggregatedStay {
+interface StayBar {
   id: string
   checkIn: Date
   checkOut: Date
   nights: number
   count: number
-  checkinCount: number
-  bookingCount: number
 }
 
 interface StayTimelineProps {
@@ -41,13 +39,19 @@ const THAI_MONTHS = [
   'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม',
 ]
 
-// Color based on stay length
-function getStayColor(nights: number): { bg: string; text: string } {
-  if (nights === 1) return { bg: 'bg-sky-400', text: 'text-white' }
-  if (nights === 2) return { bg: 'bg-blue-500', text: 'text-white' }
-  if (nights <= 4) return { bg: 'bg-indigo-500', text: 'text-white' }
-  if (nights <= 7) return { bg: 'bg-violet-500', text: 'text-white' }
-  return { bg: 'bg-purple-600', text: 'text-white' }
+const NIGHT_COLORS: Record<number, string> = {
+  1: 'bg-sky-400',
+  2: 'bg-blue-500',
+  3: 'bg-indigo-500',
+  4: 'bg-violet-500',
+  5: 'bg-purple-500',
+  6: 'bg-purple-600',
+  7: 'bg-fuchsia-600',
+}
+
+function getNightColor(nights: number): string {
+  if (nights >= 7) return 'bg-fuchsia-600'
+  return NIGHT_COLORS[nights] || 'bg-gray-400'
 }
 
 export default function StayTimeline({
@@ -55,49 +59,60 @@ export default function StayTimeline({
   selectedMonth,
   onMonthChange,
 }: StayTimelineProps) {
-  const [hoveredStay, setHoveredStay] = useState<string | null>(null)
+  const [hoveredBar, setHoveredBar] = useState<string | null>(null)
 
   const monthStart = startOfMonth(selectedMonth)
   const monthEnd = endOfMonth(selectedMonth)
   const daysInMonth = eachDayOfInterval({ start: monthStart, end: monthEnd })
+  const totalDays = daysInMonth.length
 
-  // Aggregate stays by check-in and check-out dates
-  const aggregatedStays: AggregatedStay[] = useMemo(() => {
-    const groups = new Map<string, AggregatedStay>()
+  // Group stays by night count, then aggregate by check-in date
+  const staysByNight = useMemo(() => {
+    const groups: Record<number, StayBar[]> = {}
+
+    // First, aggregate stays by (nights, checkIn date)
+    const aggregated = new Map<string, StayBar>()
 
     stays.forEach(stay => {
-      const key = `${format(stay.checkIn, 'yyyy-MM-dd')}_${format(stay.checkOut, 'yyyy-MM-dd')}`
+      // Only include stays that overlap with current month
+      if (stay.checkOut < monthStart || stay.checkIn > monthEnd) return
 
-      if (!groups.has(key)) {
-        groups.set(key, {
+      const key = `${stay.nights}_${format(stay.checkIn, 'yyyy-MM-dd')}`
+
+      if (!aggregated.has(key)) {
+        aggregated.set(key, {
           id: key,
           checkIn: stay.checkIn,
           checkOut: stay.checkOut,
           nights: stay.nights,
           count: 0,
-          checkinCount: 0,
-          bookingCount: 0,
         })
       }
+      aggregated.get(key)!.count++
+    })
 
-      const group = groups.get(key)!
-      group.count++
-      if (stay.type === 'checkin') {
-        group.checkinCount++
-      } else {
-        group.bookingCount++
+    // Group by night count
+    aggregated.forEach(bar => {
+      if (!groups[bar.nights]) {
+        groups[bar.nights] = []
       }
+      groups[bar.nights].push(bar)
     })
 
-    // Sort by check-in date, then by duration (longer first)
-    return Array.from(groups.values()).sort((a, b) => {
-      const dateCompare = a.checkIn.getTime() - b.checkIn.getTime()
-      if (dateCompare !== 0) return dateCompare
-      return b.nights - a.nights
+    // Sort bars within each group by check-in date
+    Object.values(groups).forEach(bars => {
+      bars.sort((a, b) => a.checkIn.getTime() - b.checkIn.getTime())
     })
-  }, [stays])
 
-  // Calculate daily occupancy
+    return groups
+  }, [stays, monthStart, monthEnd])
+
+  // Get sorted night counts (1, 2, 3, etc.)
+  const nightCounts = Object.keys(staysByNight)
+    .map(Number)
+    .sort((a, b) => a - b)
+
+  // Calculate daily occupancy for heat bar
   const dailyOccupancy = useMemo(() => {
     const occupancy: Record<string, number> = {}
     daysInMonth.forEach(day => {
@@ -112,11 +127,10 @@ export default function StayTimeline({
 
   const maxOccupancy = Math.max(...Object.values(dailyOccupancy), 1)
 
-  // Calculate stay bar position and width
-  const getStayStyle = (stay: AggregatedStay) => {
-    const totalDays = daysInMonth.length
-    const stayStart = Math.max(stay.checkIn.getTime(), monthStart.getTime())
-    const stayEnd = Math.min(stay.checkOut.getTime(), monthEnd.getTime())
+  // Calculate bar position
+  const getBarStyle = (bar: StayBar) => {
+    const stayStart = Math.max(bar.checkIn.getTime(), monthStart.getTime())
+    const stayEnd = Math.min(bar.checkOut.getTime(), monthEnd.getTime())
 
     const startOffset = differenceInDays(new Date(stayStart), monthStart)
     const duration = differenceInDays(new Date(stayEnd), new Date(stayStart)) + 1
@@ -126,33 +140,16 @@ export default function StayTimeline({
 
     return {
       left: `${leftPercent}%`,
-      width: `${Math.max(widthPercent, 3)}%`,
+      width: `${Math.max(widthPercent, 2.5)}%`,
     }
   }
 
-  // Check if stay overlaps with the current month
-  const stayOverlapsMonth = (stay: AggregatedStay) => {
-    return stay.checkOut >= monthStart && stay.checkIn <= monthEnd
-  }
-
-  const visibleStays = aggregatedStays.filter(stayOverlapsMonth)
-
-  // Calculate stats
+  // Stats
   const stats = useMemo(() => {
-    const totalStays = stays.length
-    const checkins = stays.filter(s => s.type === 'checkin').length
-    const bookings = stays.filter(s => s.type === 'booking').length
+    const total = stays.length
     const totalNights = stays.reduce((sum, s) => sum + s.nights, 0)
-    const avgStay = totalStays > 0 ? (totalNights / totalStays).toFixed(1) : '0'
-
-    // Stay length distribution
-    const lengthDist: Record<string, number> = {}
-    stays.forEach(s => {
-      const key = s.nights === 1 ? '1 คืน' : s.nights <= 3 ? '2-3 คืน' : s.nights <= 7 ? '4-7 คืน' : '7+ คืน'
-      lengthDist[key] = (lengthDist[key] || 0) + 1
-    })
-
-    return { totalStays, checkins, bookings, totalNights, avgStay, lengthDist }
+    const avgStay = total > 0 ? (totalNights / total).toFixed(1) : '0'
+    return { total, totalNights, avgStay }
   }, [stays])
 
   const prevMonth = () => {
@@ -170,76 +167,42 @@ export default function StayTimeline({
         <button onClick={prevMonth} className="p-2 hover:bg-gray-200 rounded-full">
           <ChevronLeft className="w-5 h-5" />
         </button>
-        <h2 className="text-xl font-semibold text-gray-800">
-          {THAI_MONTHS[selectedMonth.getMonth()]} {selectedMonth.getFullYear() + 543}
-        </h2>
+        <div className="text-center">
+          <h2 className="text-xl font-semibold text-gray-800">
+            {THAI_MONTHS[selectedMonth.getMonth()]} {selectedMonth.getFullYear() + 543}
+          </h2>
+          <p className="text-sm text-gray-500">
+            {stats.total} รายการ · {stats.totalNights} คืน · เฉลี่ย {stats.avgStay} คืน/ครั้ง
+          </p>
+        </div>
         <button onClick={nextMonth} className="p-2 hover:bg-gray-200 rounded-full">
           <ChevronRight className="w-5 h-5" />
         </button>
       </div>
 
-      {/* Stats */}
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-4 p-4 bg-gray-50 border-b">
-        <div className="text-center">
-          <p className="text-2xl font-bold text-gray-900">{stats.totalStays}</p>
-          <p className="text-xs text-gray-500">รวมทั้งหมด</p>
-        </div>
-        <div className="text-center">
-          <p className="text-2xl font-bold text-blue-600">{stats.checkins}</p>
-          <p className="text-xs text-gray-500">เช็คอิน</p>
-        </div>
-        <div className="text-center">
-          <p className="text-2xl font-bold text-amber-600">{stats.bookings}</p>
-          <p className="text-xs text-gray-500">การจอง</p>
-        </div>
-        <div className="text-center">
-          <p className="text-2xl font-bold text-gray-900">{stats.totalNights}</p>
-          <p className="text-xs text-gray-500">คืนรวม</p>
-        </div>
-        <div className="text-center">
-          <p className="text-2xl font-bold text-gray-900">{stats.avgStay}</p>
-          <p className="text-xs text-gray-500">คืน/ครั้ง</p>
-        </div>
-      </div>
-
-      {/* Stay Length Distribution */}
-      <div className="px-4 py-3 border-b flex items-center gap-4 text-sm">
-        <span className="text-gray-500">การกระจายตัว:</span>
-        {Object.entries(stats.lengthDist).map(([label, count]) => (
-          <span key={label} className="px-2 py-1 bg-gray-100 rounded text-gray-700">
-            {label}: <strong>{count}</strong>
-          </span>
-        ))}
-      </div>
-
       {/* Occupancy Heat Bar */}
-      <div className="px-4 py-3 border-b">
-        <p className="text-xs text-gray-500 mb-2">ความหนาแน่นรายวัน</p>
-        <div className="flex h-10 rounded overflow-hidden">
+      <div className="px-4 py-2 border-b bg-gray-50">
+        <div className="flex h-8 rounded overflow-hidden">
           {daysInMonth.map(day => {
             const dateKey = format(day, 'yyyy-MM-dd')
             const count = dailyOccupancy[dateKey] || 0
             const intensity = count / maxOccupancy
             const isToday = isSameDay(day, new Date())
-            const isWeekend = day.getDay() === 0 || day.getDay() === 6
 
             return (
               <div
                 key={dateKey}
-                className={`flex-1 flex flex-col items-center justify-end relative group
-                  ${isToday ? 'ring-2 ring-blue-500 ring-inset z-10' : ''}
-                  ${isWeekend ? 'bg-gray-50' : ''}`}
+                className={`flex-1 flex items-end justify-center relative group
+                  ${isToday ? 'ring-2 ring-blue-500 ring-inset z-10' : ''}`}
                 style={{
                   backgroundColor: count > 0
-                    ? `rgba(59, 130, 246, ${0.15 + intensity * 0.7})`
-                    : isWeekend ? '#f9fafb' : '#f3f4f6'
+                    ? `rgba(59, 130, 246, ${0.15 + intensity * 0.6})`
+                    : '#f9fafb'
                 }}
               >
-                <span className="text-[10px] text-gray-500 mb-0.5">{count || ''}</span>
-                <span className={`text-[10px] ${isToday ? 'font-bold text-blue-600' : 'text-gray-600'}`}>
+                <span className={`text-[9px] ${isToday ? 'font-bold text-blue-600' : 'text-gray-500'}`}>
                   {day.getDate()}
                 </span>
-                {/* Tooltip */}
                 <div className="absolute bottom-full mb-1 hidden group-hover:block bg-gray-800 text-white text-xs px-2 py-1 rounded whitespace-nowrap z-20">
                   {format(day, 'd MMM')}: {count} ห้อง
                 </div>
@@ -249,94 +212,66 @@ export default function StayTimeline({
         </div>
       </div>
 
-      {/* Timeline */}
+      {/* Timeline by Night Count */}
       <div className="p-4">
-        {/* Day headers */}
-        <div className="flex mb-2 text-xs text-gray-400">
-          <div className="w-28 flex-shrink-0 text-right pr-3">ระยะเวลา</div>
-          <div className="flex-1 flex">
-            {daysInMonth.map(day => (
-              <div
-                key={day.toISOString()}
-                className={`flex-1 text-center ${isSameDay(day, new Date()) ? 'font-bold text-blue-600' : ''}`}
-              >
-                {day.getDate()}
-              </div>
-            ))}
+        {nightCounts.length === 0 ? (
+          <div className="text-center py-8 text-gray-500">
+            <Calendar className="w-10 h-10 mx-auto mb-2 text-gray-300" />
+            <p>ไม่มีข้อมูลในเดือนนี้</p>
           </div>
-        </div>
-
-        {/* Stay bars */}
-        <div className="space-y-1">
-          {visibleStays.length === 0 ? (
-            <div className="text-center py-12 text-gray-500">
-              <Calendar className="w-12 h-12 mx-auto mb-3 text-gray-300" />
-              <p>ไม่มีข้อมูลการเข้าพักในเดือนนี้</p>
-            </div>
-          ) : (
-            visibleStays.map(stay => {
-              const style = getStayStyle(stay)
-              const color = getStayColor(stay.nights)
-              const isHovered = hoveredStay === stay.id
+        ) : (
+          <div className="space-y-1">
+            {nightCounts.map(nights => {
+              const bars = staysByNight[nights]
+              const totalCount = bars.reduce((sum, b) => sum + b.count, 0)
 
               return (
-                <div
-                  key={stay.id}
-                  className="flex items-center"
-                  onMouseEnter={() => setHoveredStay(stay.id)}
-                  onMouseLeave={() => setHoveredStay(null)}
-                >
-                  {/* Stay info */}
-                  <div className="w-28 flex-shrink-0 text-right pr-3">
-                    <span className="text-sm font-medium text-gray-700">
-                      {stay.nights} คืน
+                <div key={nights} className="flex items-center">
+                  {/* Y-axis label */}
+                  <div className="w-16 flex-shrink-0 text-right pr-3">
+                    <span className="text-sm font-medium text-gray-600">
+                      {nights} คืน
                     </span>
-                    <span className="text-xs text-gray-400 ml-1">
-                      x{stay.count}
-                    </span>
+                    <span className="text-xs text-gray-400 ml-1">({totalCount})</span>
                   </div>
 
-                  {/* Timeline bar */}
-                  <div className="flex-1 relative h-7">
-                    <div
-                      className={`absolute top-0.5 h-6 rounded flex items-center justify-center px-2 text-xs font-medium cursor-default
-                        ${color.bg} ${color.text} ${isHovered ? 'ring-2 ring-offset-1 ring-gray-400 z-10' : ''}`}
-                      style={style}
-                      title={`${format(stay.checkIn, 'd MMM')} - ${format(stay.checkOut, 'd MMM')} | ${stay.nights} คืน | ${stay.count} ครั้ง`}
-                    >
-                      {stay.count > 1 && <span>{stay.count}</span>}
-                    </div>
+                  {/* Timeline row */}
+                  <div className="flex-1 relative h-6 bg-gray-50 rounded">
+                    {bars.map(bar => {
+                      const style = getBarStyle(bar)
+                      const isHovered = hoveredBar === bar.id
+
+                      return (
+                        <div
+                          key={bar.id}
+                          className={`absolute top-0.5 h-5 rounded flex items-center justify-center text-white text-[10px] font-medium
+                            ${getNightColor(nights)} ${isHovered ? 'ring-2 ring-gray-400 z-10' : ''}`}
+                          style={style}
+                          onMouseEnter={() => setHoveredBar(bar.id)}
+                          onMouseLeave={() => setHoveredBar(null)}
+                          title={`${format(bar.checkIn, 'd MMM')} - ${format(bar.checkOut, 'd MMM')} (${bar.count} ครั้ง)`}
+                        >
+                          {bar.count > 1 ? bar.count : ''}
+                        </div>
+                      )
+                    })}
                   </div>
                 </div>
               )
-            })
-          )}
-        </div>
+            })}
+          </div>
+        )}
       </div>
 
       {/* Legend */}
-      <div className="flex flex-wrap items-center gap-4 p-4 bg-gray-50 border-t text-xs">
-        <span className="text-gray-500">ระยะเวลาเข้าพัก:</span>
-        <div className="flex items-center gap-1">
-          <div className="w-4 h-4 bg-sky-400 rounded" />
-          <span>1 คืน</span>
-        </div>
-        <div className="flex items-center gap-1">
-          <div className="w-4 h-4 bg-blue-500 rounded" />
-          <span>2 คืน</span>
-        </div>
-        <div className="flex items-center gap-1">
-          <div className="w-4 h-4 bg-indigo-500 rounded" />
-          <span>3-4 คืน</span>
-        </div>
-        <div className="flex items-center gap-1">
-          <div className="w-4 h-4 bg-violet-500 rounded" />
-          <span>5-7 คืน</span>
-        </div>
-        <div className="flex items-center gap-1">
-          <div className="w-4 h-4 bg-purple-600 rounded" />
-          <span>7+ คืน</span>
-        </div>
+      <div className="flex items-center gap-3 px-4 py-3 bg-gray-50 border-t text-xs text-gray-500">
+        <span>ระยะเวลา:</span>
+        {[1, 2, 3, 4, 5, 6, 7].map(n => (
+          <div key={n} className="flex items-center gap-1">
+            <div className={`w-3 h-3 rounded ${getNightColor(n)}`} />
+            <span>{n}{n === 7 ? '+' : ''}</span>
+          </div>
+        ))}
       </div>
     </div>
   )
