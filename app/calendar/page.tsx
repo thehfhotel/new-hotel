@@ -19,8 +19,11 @@ interface ApiBooking {
 
 interface ApiCheckIn {
   Cin_no: string
+  Cin_Room_No: string
   Cin_Room_In: string
   Cin_Room_Out: string
+  Cin_cust_name: string
+  Cin_status: string
 }
 
 interface CachedData {
@@ -150,6 +153,10 @@ export default function CalendarPage() {
         checkOut,
         type: 'checkin',
         nights,
+        checkinNo: checkin.Cin_no,
+        roomNo: checkin.Cin_Room_No,
+        customerName: checkin.Cin_cust_name,
+        status: checkin.Cin_status,
       })
     })
 

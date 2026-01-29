@@ -21,12 +21,16 @@ export interface Stay {
   checkOut: Date
   type: 'booking' | 'checkin'
   nights: number
-  // Booking details
-  bookNo?: string
-  bookDate?: Date
+  // Common details
   customerName?: string
   status?: string
+  // Booking-specific
+  bookNo?: string
+  bookDate?: Date
   roomCount?: number
+  // Check-in specific
+  checkinNo?: string
+  roomNo?: string
 }
 
 interface DayData {
@@ -365,19 +369,25 @@ export default function StayTimeline({
               <table className="w-full text-sm">
                 <thead>
                   <tr className="bg-gray-50">
-                    {selectedSegment.type === 'booking' && (
+                    {selectedSegment.type === 'booking' ? (
                       <>
                         <th className="px-3 py-2 text-left font-medium text-gray-600">เลขที่จอง</th>
                         <th className="px-3 py-2 text-left font-medium text-gray-600">ลูกค้า</th>
                         <th className="px-3 py-2 text-left font-medium text-gray-600">วันจอง</th>
-                      </>
-                    )}
-                    <th className="px-3 py-2 text-left font-medium text-gray-600">เช็คอิน</th>
-                    <th className="px-3 py-2 text-left font-medium text-gray-600">เช็คเอาท์</th>
-                    <th className="px-3 py-2 text-left font-medium text-gray-600">คืน</th>
-                    {selectedSegment.type === 'booking' && (
-                      <>
+                        <th className="px-3 py-2 text-left font-medium text-gray-600">เช็คอิน</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-600">เช็คเอาท์</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-600">คืน</th>
                         <th className="px-3 py-2 text-left font-medium text-gray-600">ห้อง</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-600">สถานะ</th>
+                      </>
+                    ) : (
+                      <>
+                        <th className="px-3 py-2 text-left font-medium text-gray-600">เลขที่</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-600">ห้อง</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-600">ลูกค้า</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-600">เช็คอิน</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-600">เช็คเอาท์</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-600">คืน</th>
                         <th className="px-3 py-2 text-left font-medium text-gray-600">สถานะ</th>
                       </>
                     )}
@@ -386,7 +396,7 @@ export default function StayTimeline({
                 <tbody>
                   {selectedSegment.stays.map((stay, idx) => (
                     <tr key={stay.id} className={idx % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
-                      {selectedSegment.type === 'booking' && (
+                      {selectedSegment.type === 'booking' ? (
                         <>
                           <td className="px-3 py-2 text-gray-700 font-mono text-xs">
                             {stay.bookNo || '-'}
@@ -397,17 +407,13 @@ export default function StayTimeline({
                           <td className="px-3 py-2 text-gray-700">
                             {stay.bookDate ? format(stay.bookDate, 'd MMM yyyy') : '-'}
                           </td>
-                        </>
-                      )}
-                      <td className="px-3 py-2 text-gray-700">
-                        {format(stay.checkIn, 'd MMM yyyy')}
-                      </td>
-                      <td className="px-3 py-2 text-gray-700">
-                        {format(stay.checkOut, 'd MMM yyyy')}
-                      </td>
-                      <td className="px-3 py-2 text-gray-700">{stay.nights}</td>
-                      {selectedSegment.type === 'booking' && (
-                        <>
+                          <td className="px-3 py-2 text-gray-700">
+                            {format(stay.checkIn, 'd MMM yyyy')}
+                          </td>
+                          <td className="px-3 py-2 text-gray-700">
+                            {format(stay.checkOut, 'd MMM yyyy')}
+                          </td>
+                          <td className="px-3 py-2 text-gray-700">{stay.nights}</td>
                           <td className="px-3 py-2 text-gray-700">{stay.roomCount || 1}</td>
                           <td className="px-3 py-2">
                             <span className={`px-2 py-0.5 rounded-full text-xs ${
@@ -416,6 +422,34 @@ export default function StayTimeline({
                               stay.status === 'เสร็จสิ้น' ? 'bg-gray-100 text-gray-700' :
                               stay.status === 'ยกเลิก' ? 'bg-red-100 text-red-700' :
                               'bg-gray-100 text-gray-700'
+                            }`}>
+                              {stay.status || '-'}
+                            </span>
+                          </td>
+                        </>
+                      ) : (
+                        <>
+                          <td className="px-3 py-2 text-gray-700 font-mono text-xs">
+                            {stay.checkinNo || '-'}
+                          </td>
+                          <td className="px-3 py-2 text-gray-700 font-medium">
+                            {stay.roomNo || '-'}
+                          </td>
+                          <td className="px-3 py-2 text-gray-700">
+                            {stay.customerName || '-'}
+                          </td>
+                          <td className="px-3 py-2 text-gray-700">
+                            {format(stay.checkIn, 'd MMM yyyy')}
+                          </td>
+                          <td className="px-3 py-2 text-gray-700">
+                            {format(stay.checkOut, 'd MMM yyyy')}
+                          </td>
+                          <td className="px-3 py-2 text-gray-700">{stay.nights}</td>
+                          <td className="px-3 py-2">
+                            <span className={`px-2 py-0.5 rounded-full text-xs ${
+                              stay.status === 'เข้าพัก' ? 'bg-green-100 text-green-700' :
+                              stay.status === 'เสร็จสิ้น' ? 'bg-gray-100 text-gray-700' :
+                              'bg-blue-100 text-blue-700'
                             }`}>
                               {stay.status || '-'}
                             </span>
