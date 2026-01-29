@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { BedDouble, Users, LogIn, BookOpen, Clock } from 'lucide-react'
+import { Clock, LogIn } from 'lucide-react'
 import StatsCard from '@/components/StatsCard'
 import RoomGrid, { Room, RoomStatus } from '@/components/RoomGrid'
 import { OccupancyChart, OccupancyData } from '@/components/Charts'
@@ -201,31 +201,19 @@ export default function Dashboard() {
       </div>
 
       {/* Stats Cards */}
-      <div className="flex gap-4">
-        <div className="max-w-xs">
-          <StatsCard
-            title="ห้องที่มีผู้เข้าพัก"
-            value={stats.occupiedRooms}
-            icon={Users}
-            color="red"
-          />
-        </div>
-        <div className="max-w-xs">
-          <StatsCard
-            title="ห้องที่จองแล้ว"
-            value={stats.bookedRooms}
-            icon={BookOpen}
-            color="yellow"
-          />
-        </div>
-        <div className="max-w-xs">
-          <StatsCard
-            title="ห้องรอเช็คเอาท์"
-            value={stats.checkoutRooms}
-            icon={LogIn}
-            color="blue"
-          />
-        </div>
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+        <StatsCard
+          title="ห้องที่มีผู้เข้าพัก"
+          value={stats.occupiedRooms}
+        />
+        <StatsCard
+          title="ห้องที่จองแล้ว"
+          value={stats.bookedRooms}
+        />
+        <StatsCard
+          title="ห้องรอเช็คเอาท์"
+          value={stats.checkoutRooms}
+        />
       </div>
 
       {/* Room Grid */}
