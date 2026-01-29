@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.3] - 2026-01-29
+
+### Changed
+- **Added caching to middleware CI workflow** - Significantly speeds up Windows and macOS builds
+  - Added Rust dependency caching using `Swatinem/rust-cache@v2` (~55% faster builds after initial run)
+  - Added npm caching via `actions/setup-node@v4` cache option
+  - Expected improvement: ~13 min → ~5-6 min (Windows), ~11 min → ~4-5 min (macOS)
+
 ## [1.15.2] - 2026-01-29
 
 ### Fixed
