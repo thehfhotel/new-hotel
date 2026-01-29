@@ -47,11 +47,41 @@ sqlcmd -S 192.168.100.222 -d HotelDB -U username -P password -i migrations/001_c
 
 ## Tables Used (Read-Only or Shared)
 
-These tables are owned by the legacy application. **DO NOT modify their schema.**
+These tables and views are owned by the legacy application.
 
-| Table | Usage |
-|-------|-------|
+| Table/View | Usage |
+|------------|-------|
 | `HT_Rooms` | Room information |
 | `View_Booking_Ds` | Booking records |
 | `View_CheckIn_Ds` | Check-in records |
 | `View_Customers` | Customer information |
+
+### PROHIBITED Actions on Legacy Tables/Views
+
+**DO NOT** perform any of the following on tables/views not owned by this app:
+
+- `ALTER TABLE` - Do not add, modify, or drop columns
+- `ALTER VIEW` - Do not modify view definitions
+- `DROP TABLE` / `DROP VIEW` - Do not delete
+- `CREATE INDEX` on legacy tables - May affect legacy app performance
+- `ADD CONSTRAINT` - Do not add foreign keys or other constraints
+
+### What To Do Instead
+
+If you need additional data or relationships:
+
+1. **Create a new table** - Store additional data in a new table owned by this app
+   ```sql
+   -- Example: Need to add notes to bookings
+   -- DON'T: ALTER TABLE View_Booking_Ds ADD Note_Text NVARCHAR(MAX)
+   -- DO: CREATE TABLE HT_Booking_Notes (Book_No, Note_Text, ...)
+   ```
+
+2. **Create a new view** - If you need a different data shape, create your own view
+   ```sql
+   -- Example: Need a combined view
+   -- DON'T: ALTER VIEW View_Booking_Ds AS ...
+   -- DO: CREATE VIEW HT_Booking_Summary AS SELECT ... FROM View_Booking_Ds JOIN ...
+   ```
+
+3. **Use application-level joins** - Join data in your API code instead of modifying the database
