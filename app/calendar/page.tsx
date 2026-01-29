@@ -27,16 +27,16 @@ export default function CalendarPage() {
   const [selectedDate, setSelectedDate] = useState(new Date())
   const [viewMode, setViewMode] = useState<'week' | 'month'>('week')
   const [loading, setLoading] = useState(true)
+  const [dataVersion, setDataVersion] = useState(0)
 
   // Cache data by month key (yyyy-MM)
   const cacheRef = useRef<Map<string, CachedData>>(new Map())
-  const [, forceUpdate] = useState(0)
 
   // Get cache key for a date (by month)
   const getCacheKey = (date: Date) => format(date, 'yyyy-MM')
 
   // Fetch data for a specific month
-  const fetchMonth = useCallback(async (date: Date): Promise<CachedData | null> => {
+  const fetchMonth = useCallback(async (date: Date, isBackground = false): Promise<CachedData | null> => {
     const key = getCacheKey(date)
 
     // Return cached data if available
@@ -60,24 +60,18 @@ export default function CalendarPage() {
 
       const data = { bookings, checkins }
       cacheRef.current.set(key, data)
+
+      // Trigger re-render for non-background fetches
+      if (!isBackground) {
+        setDataVersion(v => v + 1)
+      }
+
       return data
     } catch (error) {
       console.error('Error fetching data:', error)
       return null
     }
   }, [])
-
-  // Preload adjacent months
-  const preloadAdjacent = useCallback(async (date: Date) => {
-    const prevMonth = subMonths(date, 1)
-    const nextMonth = addMonths(date, 1)
-
-    // Preload in background without blocking
-    Promise.all([
-      fetchMonth(prevMonth),
-      fetchMonth(nextMonth),
-    ])
-  }, [fetchMonth])
 
   // Initial load and when date changes
   useEffect(() => {
@@ -87,30 +81,32 @@ export default function CalendarPage() {
       // If already cached, no loading needed
       if (cacheRef.current.has(key)) {
         setLoading(false)
-        preloadAdjacent(selectedDate)
+        // Preload adjacent months in background
+        fetchMonth(subMonths(selectedDate, 1), true)
+        fetchMonth(addMonths(selectedDate, 1), true)
         return
       }
 
       setLoading(true)
-      await fetchMonth(selectedDate)
-      setLoading(false)
-      forceUpdate(n => n + 1)
 
-      // Preload adjacent months
-      preloadAdjacent(selectedDate)
+      // Fetch current and adjacent months
+      await Promise.all([
+        fetchMonth(selectedDate),
+        fetchMonth(subMonths(selectedDate, 1), true),
+        fetchMonth(addMonths(selectedDate, 1), true),
+      ])
+
+      setLoading(false)
     }
 
     loadData()
-  }, [selectedDate, fetchMonth, preloadAdjacent])
+  }, [selectedDate, fetchMonth])
 
-  // Get current month's data from cache
-  const currentData = useMemo(() => {
-    const key = getCacheKey(selectedDate)
-    return cacheRef.current.get(key) || { bookings: [], checkins: [] }
-  }, [selectedDate])
-
-  // Also get adjacent months for week view that spans months
+  // Get combined data from current and adjacent months
   const allData = useMemo(() => {
+    // Include dataVersion in deps to trigger recalc when cache updates
+    void dataVersion
+
     const prevKey = getCacheKey(subMonths(selectedDate, 1))
     const currKey = getCacheKey(selectedDate)
     const nextKey = getCacheKey(addMonths(selectedDate, 1))
@@ -123,23 +119,28 @@ export default function CalendarPage() {
       bookings: [...prev.bookings, ...curr.bookings, ...next.bookings],
       checkins: [...prev.checkins, ...curr.checkins, ...next.checkins],
     }
-  }, [selectedDate])
+  }, [selectedDate, dataVersion])
 
   // Transform API data to Stay format
   const stays: Stay[] = useMemo(() => {
     const { bookings, checkins } = allData
     const result: Stay[] = []
+    const seenIds = new Set<string>()
 
     // Process check-ins (actual stays)
     checkins.forEach((checkin, index) => {
       if (!checkin.Cin_Room_In || !checkin.Cin_Room_Out) return
+
+      const id = `checkin-${checkin.Cin_no || index}`
+      if (seenIds.has(id)) return
+      seenIds.add(id)
 
       const checkIn = parseISO(checkin.Cin_Room_In)
       const checkOut = parseISO(checkin.Cin_Room_Out)
       const nights = Math.max(differenceInDays(checkOut, checkIn), 1)
 
       result.push({
-        id: `checkin-${checkin.Cin_no || index}`,
+        id,
         checkIn,
         checkOut,
         type: 'checkin',
@@ -155,6 +156,10 @@ export default function CalendarPage() {
     bookings.forEach((booking, index) => {
       if (!booking.checkIn || !booking.checkOut) return
 
+      const id = `booking-${booking.bookNo || index}`
+      if (seenIds.has(id)) return
+      seenIds.add(id)
+
       const bookingKey = `${booking.checkIn.split('T')[0]}_${booking.checkOut.split('T')[0]}`
       if (checkinKeys.has(bookingKey)) return
 
@@ -163,7 +168,7 @@ export default function CalendarPage() {
       const nights = Math.max(differenceInDays(checkOut, checkIn), 1)
 
       result.push({
-        id: `booking-${booking.bookNo || index}`,
+        id,
         checkIn,
         checkOut,
         type: 'booking',
