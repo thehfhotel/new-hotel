@@ -212,7 +212,7 @@ export default function BookingsPage() {
           <span className="font-medium text-gray-700">ตัวกรอง</span>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
           {/* Search */}
           <div className="relative">
             <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-gray-400" />
@@ -246,9 +246,11 @@ export default function BookingsPage() {
             </select>
           </div>
 
-          {/* Start Date */}
-          <div className="relative">
-            <Calendar className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-gray-400" />
+          {/* Date Range Selector */}
+          <div className="flex items-center border border-gray-300 rounded-lg overflow-hidden focus-within:ring-2 focus-within:ring-blue-500 focus-within:border-blue-500">
+            <div className="flex items-center px-3 bg-gray-50 border-r border-gray-300 h-full">
+              <Calendar className="h-4 w-4 text-gray-400" />
+            </div>
             <input
               type="date"
               value={startDate}
@@ -256,14 +258,10 @@ export default function BookingsPage() {
                 setStartDate(e.target.value)
                 setCurrentPage(1)
               }}
-              className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-              title="วันเช็คอินเริ่มต้น"
+              className="flex-1 px-2 py-2 border-0 focus:ring-0 text-sm"
+              title="เช็คอิน"
             />
-          </div>
-
-          {/* End Date */}
-          <div className="relative">
-            <Calendar className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-gray-400" />
+            <span className="text-gray-400 px-1">→</span>
             <input
               type="date"
               value={endDate}
@@ -271,8 +269,8 @@ export default function BookingsPage() {
                 setEndDate(e.target.value)
                 setCurrentPage(1)
               }}
-              className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-              title="วันเช็คเอาท์สิ้นสุด"
+              className="flex-1 px-2 py-2 border-0 focus:ring-0 text-sm"
+              title="เช็คเอาท์"
             />
           </div>
 
