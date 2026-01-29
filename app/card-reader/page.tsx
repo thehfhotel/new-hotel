@@ -7,14 +7,14 @@ type ConnectionStatus = 'disconnected' | 'connecting' | 'connected'
 type ReadStatus = 'idle' | 'reading' | 'success' | 'error'
 
 interface ThaiIdCardData {
-  citizenId: string
-  titleTh: string
-  firstNameTh: string
-  lastNameTh: string
-  titleEn: string
-  firstNameEn: string
-  lastNameEn: string
-  birthDate: string
+  cid: string
+  thaiTitle: string
+  thaiFirstName: string
+  thaiLastName: string
+  englishTitle: string
+  englishFirstName: string
+  englishLastName: string
+  dateOfBirth: string
   gender: string
   address: string
   issueDate: string
@@ -24,8 +24,8 @@ interface ThaiIdCardData {
 
 const MIDDLEWARE_URL = process.env.NEXT_PUBLIC_CARD_READER_URL || 'http://localhost:9898'
 
-function formatCitizenId(id: string): string {
-  if (id.length !== 13) return id
+function formatCitizenId(id: string | undefined): string {
+  if (!id || id.length !== 13) return id || ''
   return `${id[0]}-${id.slice(1, 5)}-${id.slice(5, 10)}-${id.slice(10, 12)}-${id[12]}`
 }
 
@@ -105,8 +105,9 @@ export default function CardReaderPage() {
         throw new Error(errorData.error || `HTTP ${response.status}`)
       }
 
-      const data = await response.json()
-      setCardData(data)
+      const result = await response.json()
+      // Middleware returns { success: true, data: CardData }
+      setCardData(result.data || result)
       setReadStatus('success')
     } catch (error) {
       if (error instanceof Error) {
@@ -124,7 +125,7 @@ export default function CardReaderPage() {
 
   const handleUseData = () => {
     if (cardData) {
-      alert(`ข้อมูลบัตรประชาชน:\n\nเลขบัตร: ${cardData.citizenId}\nชื่อ: ${cardData.titleTh}${cardData.firstNameTh} ${cardData.lastNameTh}\n\n(ฟังก์ชันนี้จะเชื่อมต่อกับระบบ check-in ในอนาคต)`)
+      alert(`ข้อมูลบัตรประชาชน:\n\nเลขบัตร: ${cardData.cid}\nชื่อ: ${cardData.thaiTitle}${cardData.thaiFirstName} ${cardData.thaiLastName}\n\n(ฟังก์ชันนี้จะเชื่อมต่อกับระบบ check-in ในอนาคต)`)
     }
   }
 
@@ -294,22 +295,22 @@ export default function CardReaderPage() {
                   <div className="space-y-3">
                     <div className="grid grid-cols-3 gap-2">
                       <span className="text-gray-500">เลขบัตร:</span>
-                      <span className="col-span-2 font-mono">{formatCitizenId(cardData.citizenId)}</span>
+                      <span className="col-span-2 font-mono">{formatCitizenId(cardData.cid)}</span>
                     </div>
 
                     <div className="grid grid-cols-3 gap-2">
                       <span className="text-gray-500">ชื่อ-สกุล:</span>
-                      <span className="col-span-2">{cardData.titleTh}{cardData.firstNameTh} {cardData.lastNameTh}</span>
+                      <span className="col-span-2">{cardData.thaiTitle}{cardData.thaiFirstName} {cardData.thaiLastName}</span>
                     </div>
 
                     <div className="grid grid-cols-3 gap-2">
                       <span className="text-gray-500">Name:</span>
-                      <span className="col-span-2">{cardData.titleEn}{cardData.firstNameEn} {cardData.lastNameEn}</span>
+                      <span className="col-span-2">{cardData.englishTitle}{cardData.englishFirstName} {cardData.englishLastName}</span>
                     </div>
 
                     <div className="grid grid-cols-3 gap-2">
                       <span className="text-gray-500">วันเกิด:</span>
-                      <span className="col-span-2">{formatThaiDate(cardData.birthDate)}</span>
+                      <span className="col-span-2">{formatThaiDate(cardData.dateOfBirth)}</span>
                     </div>
 
                     <div className="grid grid-cols-3 gap-2">
