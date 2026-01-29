@@ -148,7 +148,7 @@ export async function GET(request: NextRequest) {
     bookNoRequest.input('limit', sql.Int, limit);
 
     const bookNoResult = await bookNoRequest.query(`
-      SELECT DISTINCT Book_No, MIN(${safeSortBy}) as sort_value
+      SELECT Book_No, MIN(Book_Date) as sort_value
       FROM View_Booking_Ds
       ${whereClause}
       GROUP BY Book_No
