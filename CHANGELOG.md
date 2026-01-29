@@ -5,20 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.17.0] - 2026-01-29
+## [1.17.0] - 2026-01-30
 
 ### Added
-- **Stay Timeline Calendar** - New Gantt-style visualization for guest stays at `/calendar`
-  - Horizontal bars showing continuous stay duration (check-in to check-out)
+- **Stay Timeline Calendar** - New Gantt-style visualization for stays at `/calendar`
+  - Horizontal bars showing stay duration (check-in to check-out)
   - Shows both check-ins (actual guests) AND bookings (reservations)
+  - **Aggregates stays with same dates** - Groups identical check-in/check-out patterns with count
   - Daily occupancy heat bar showing room density per day
-  - Color-coded stays with hover tooltips
-  - Stats summary: total check-ins, bookings, nights, and average stay length
-  - Click on any stay bar to view detailed guest information
+  - Color-coded by stay length (1 night = light blue, 7+ nights = purple)
+  - Stats summary: total stays, check-ins, bookings, nights, and average stay
+  - Stay length distribution breakdown (1 night, 2-3 nights, 4-7 nights, 7+ nights)
   - Month navigation with Thai Buddhist Era dates
 
 ### Changed
-- **Calendar page completely redesigned** - Replaced grid calendar with timeline view for better stay visualization
+- **Calendar page completely redesigned** - Replaced grid calendar with timeline view
+- **Simplified stay display** - Focus on stay patterns, not individual customer details
 
 ## [1.16.2] - 2026-01-29
 
