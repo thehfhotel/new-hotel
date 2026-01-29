@@ -21,7 +21,12 @@ export interface Stay {
   checkOut: Date
   type: 'booking' | 'checkin'
   nights: number
-  bookDate?: Date  // Only for bookings
+  // Booking details
+  bookNo?: string
+  bookDate?: Date
+  customerName?: string
+  status?: string
+  roomCount?: number
 }
 
 interface DayData {
@@ -361,20 +366,38 @@ export default function StayTimeline({
                 <thead>
                   <tr className="bg-gray-50">
                     {selectedSegment.type === 'booking' && (
-                      <th className="px-3 py-2 text-left font-medium text-gray-600">วันจอง</th>
+                      <>
+                        <th className="px-3 py-2 text-left font-medium text-gray-600">เลขที่จอง</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-600">ลูกค้า</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-600">วันจอง</th>
+                      </>
                     )}
                     <th className="px-3 py-2 text-left font-medium text-gray-600">เช็คอิน</th>
                     <th className="px-3 py-2 text-left font-medium text-gray-600">เช็คเอาท์</th>
-                    <th className="px-3 py-2 text-left font-medium text-gray-600">จำนวนคืน</th>
+                    <th className="px-3 py-2 text-left font-medium text-gray-600">คืน</th>
+                    {selectedSegment.type === 'booking' && (
+                      <>
+                        <th className="px-3 py-2 text-left font-medium text-gray-600">ห้อง</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-600">สถานะ</th>
+                      </>
+                    )}
                   </tr>
                 </thead>
                 <tbody>
                   {selectedSegment.stays.map((stay, idx) => (
                     <tr key={stay.id} className={idx % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
                       {selectedSegment.type === 'booking' && (
-                        <td className="px-3 py-2 text-gray-700">
-                          {stay.bookDate ? format(stay.bookDate, 'd MMM yyyy') : '-'}
-                        </td>
+                        <>
+                          <td className="px-3 py-2 text-gray-700 font-mono text-xs">
+                            {stay.bookNo || '-'}
+                          </td>
+                          <td className="px-3 py-2 text-gray-700">
+                            {stay.customerName || '-'}
+                          </td>
+                          <td className="px-3 py-2 text-gray-700">
+                            {stay.bookDate ? format(stay.bookDate, 'd MMM yyyy') : '-'}
+                          </td>
+                        </>
                       )}
                       <td className="px-3 py-2 text-gray-700">
                         {format(stay.checkIn, 'd MMM yyyy')}
@@ -383,6 +406,22 @@ export default function StayTimeline({
                         {format(stay.checkOut, 'd MMM yyyy')}
                       </td>
                       <td className="px-3 py-2 text-gray-700">{stay.nights}</td>
+                      {selectedSegment.type === 'booking' && (
+                        <>
+                          <td className="px-3 py-2 text-gray-700">{stay.roomCount || 1}</td>
+                          <td className="px-3 py-2">
+                            <span className={`px-2 py-0.5 rounded-full text-xs ${
+                              stay.status === 'จอง' ? 'bg-amber-100 text-amber-700' :
+                              stay.status === 'เข้าพัก' ? 'bg-green-100 text-green-700' :
+                              stay.status === 'เสร็จสิ้น' ? 'bg-gray-100 text-gray-700' :
+                              stay.status === 'ยกเลิก' ? 'bg-red-100 text-red-700' :
+                              'bg-gray-100 text-gray-700'
+                            }`}>
+                              {stay.status || '-'}
+                            </span>
+                          </td>
+                        </>
+                      )}
                     </tr>
                   ))}
                 </tbody>
