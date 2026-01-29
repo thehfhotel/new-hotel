@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.0] - 2026-01-29
+
+### Added
+- **Bookings Admin Console Overhaul** - Complete rewrite of the bookings page with improved UX:
+  - Bookings now grouped by booking number (multi-room bookings show as single row)
+  - Click any booking row to open detail drawer with full info
+  - New booking notes feature - add, view, and delete notes per booking
+  - Shows all rooms in a booking with individual prices and room types
+  - Customer details section with link to customer page
+  - Enhanced search: search by booking number OR customer name
+  - Status filtering now functional
+  - Total amount calculated from all rooms in booking
+
+### Changed
+- **API: /api/bookings** - Now returns grouped bookings instead of individual room records
+- **New API: /api/bookings/[id]** - Get single booking detail with customer info and notes
+- **New API: /api/bookings/[id]/notes** - CRUD operations for booking notes
+- **New Component: BookingDetailDrawer** - Side drawer for comprehensive booking view
+- **Database: HT_Booking_Notes table** - Auto-created on first note addition
+
 ## [1.15.9] - 2026-01-29
 
 ### Changed
