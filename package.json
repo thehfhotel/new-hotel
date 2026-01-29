@@ -22,6 +22,7 @@
     "next": "16.1.6",
     "node-cron": "^4.2.1",
     "react": "^19.1.0",
+    "react-datepicker": "^9.1.0",
     "react-dom": "^19.1.0",
     "recharts": "^2.15.0"
   },
