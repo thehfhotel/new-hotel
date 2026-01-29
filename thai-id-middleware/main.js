@@ -1,15 +1,15 @@
 const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage } = require('electron')
 const path = require('path')
 const { startServer, stopServer } = require('./server')
-const { initCardReader, getStatus } = require('./card-reader')
+const { initCardReader, getStatus, readCard, debugCard } = require('./card-reader')
 
 let mainWindow, tray
 
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 400,
-    height: 500,
-    resizable: false,
+    height: 700,
+    resizable: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -132,4 +132,22 @@ ipcMain.handle('get-status', () => {
 
 ipcMain.handle('get-version', () => {
   return app.getVersion()
+})
+
+ipcMain.handle('read-card', async () => {
+  try {
+    const data = await readCard()
+    return { success: true, data }
+  } catch (err) {
+    return { success: false, error: err.message }
+  }
+})
+
+ipcMain.handle('debug-card', async () => {
+  try {
+    const result = await debugCard()
+    return result
+  } catch (err) {
+    return { error: err.message }
+  }
 })

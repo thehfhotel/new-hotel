@@ -186,3 +186,124 @@ footer p {
   background: #667eea;
   color: white;
 }
+
+/* Debug Section */
+.debug-section {
+  margin-top: 20px;
+  padding: 16px;
+  background: rgba(255, 255, 255, 0.95);
+  border-radius: 12px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+}
+
+.debug-section h3 {
+  font-size: 0.95em;
+  color: #555;
+  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.button-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.debug-btn {
+  flex: 1;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 6px;
+  font-size: 0.85em;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  background: #667eea;
+  color: white;
+}
+
+.debug-btn:hover {
+  background: #5a6fd6;
+  transform: translateY(-1px);
+}
+
+.debug-btn:active {
+  transform: translateY(0);
+}
+
+.debug-btn:disabled {
+  background: #ccc;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.debug-btn.secondary {
+  background: #6c757d;
+}
+
+.debug-btn.secondary:hover {
+  background: #5a6268;
+}
+
+.output-box {
+  background: #1e1e1e;
+  border-radius: 8px;
+  padding: 12px;
+  font-family: 'Monaco', 'Menlo', 'Consolas', monospace;
+  font-size: 0.75em;
+  line-height: 1.5;
+  color: #d4d4d4;
+  max-height: 200px;
+  overflow-y: auto;
+  min-height: 60px;
+}
+
+.output-box:empty::before {
+  content: 'Click a button to see output...';
+  color: #666;
+  font-style: italic;
+}
+
+.output-line {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.output-line.header {
+  color: #569cd6;
+  font-weight: bold;
+  margin-top: 4px;
+}
+
+.output-line.success {
+  color: #4ec9b0;
+}
+
+.output-line.error {
+  color: #f48771;
+}
+
+.output-line.info {
+  color: #9cdcfe;
+}
+
+/* Scrollbar for output box */
+.output-box::-webkit-scrollbar {
+  width: 6px;
+}
+
+.output-box::-webkit-scrollbar-track {
+  background: #2d2d2d;
+  border-radius: 3px;
+}
+
+.output-box::-webkit-scrollbar-thumb {
+  background: #555;
+  border-radius: 3px;
+}
+
+.output-box::-webkit-scrollbar-thumb:hover {
+  background: #666;
+}

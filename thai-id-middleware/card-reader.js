@@ -5,6 +5,7 @@ let readerConnected = false
 let statusCallback = () => {}
 let currentProtocol = null
 let pcscliteAvailable = false
+let cardATR = null // Store ATR when card is inserted
 
 // Try to load pcsclite - it may not be available on all systems
 let pcsclite = null
@@ -70,12 +71,18 @@ function initCardReader(callback) {
           if ((changes & r.SCARD_STATE_EMPTY) && (status.state & r.SCARD_STATE_EMPTY)) {
             // Card removed
             cardInserted = false
+            cardATR = null
             console.log('Card removed')
             statusCallback(getStatus())
           } else if ((changes & r.SCARD_STATE_PRESENT) && (status.state & r.SCARD_STATE_PRESENT)) {
-            // Card inserted
+            // Card inserted - capture ATR
             cardInserted = true
-            console.log('Card inserted')
+            if (status.atr && status.atr.length > 0) {
+              cardATR = status.atr.toString('hex').toUpperCase()
+              console.log('Card inserted, ATR:', cardATR)
+            } else {
+              console.log('Card inserted')
+            }
             statusCallback(getStatus())
           }
         }
@@ -243,4 +250,121 @@ async function readCard() {
   })
 }
 
-module.exports = { initCardReader, getStatus, readCard }
+// Known Thai ID Card Application IDs to try
+const KNOWN_AIDS = [
+  { name: 'TH-NID Standard', aid: [0xA0, 0x00, 0x00, 0x00, 0x54, 0x48, 0x00, 0x01] },
+  { name: 'TH-NID Alternate', aid: [0xA0, 0x00, 0x00, 0x00, 0x54, 0x48, 0x00, 0x02] },
+  { name: 'TH-MOI', aid: [0xA0, 0x00, 0x00, 0x00, 0x84, 0x54, 0x48, 0x00, 0x01] },
+  { name: 'EMV Payment', aid: [0xA0, 0x00, 0x00, 0x00, 0x04, 0x10, 0x10] },
+]
+
+async function debugCard() {
+  if (!reader) {
+    return { error: 'No card reader connected', atr: null, aidResults: [] }
+  }
+
+  if (!cardInserted) {
+    return { error: 'No card inserted', atr: cardATR, aidResults: [] }
+  }
+
+  return new Promise((resolve) => {
+    reader.connect({ share_mode: reader.SCARD_SHARE_SHARED }, async (err, protocol) => {
+      if (err) {
+        return resolve({
+          error: `Connection failed: ${err.message}`,
+          atr: cardATR,
+          aidResults: [],
+          protocol: null
+        })
+      }
+
+      const protocolName = protocol === reader.SCARD_PROTOCOL_T0 ? 'T=0' :
+                          protocol === reader.SCARD_PROTOCOL_T1 ? 'T=1' : `Unknown(${protocol})`
+
+      const aidResults = []
+
+      // Try each known AID
+      for (const aidInfo of KNOWN_AIDS) {
+        try {
+          // Build SELECT APDU: 00 A4 04 00 [length] [AID bytes]
+          const selectCmd = Buffer.from([
+            0x00, 0xA4, 0x04, 0x00,
+            aidInfo.aid.length,
+            ...aidInfo.aid
+          ])
+
+          const response = await transmit(protocol, selectCmd)
+          const sw1 = response[response.length - 2]
+          const sw2 = response[response.length - 1]
+          const statusWord = ((sw1 << 8) | sw2).toString(16).toUpperCase().padStart(4, '0')
+
+          const success = sw1 === 0x90 && sw2 === 0x00
+          const responseHex = response.toString('hex').toUpperCase()
+
+          aidResults.push({
+            name: aidInfo.name,
+            aid: Buffer.from(aidInfo.aid).toString('hex').toUpperCase(),
+            success,
+            statusWord,
+            response: responseHex,
+            description: getStatusDescription(sw1, sw2)
+          })
+        } catch (aidErr) {
+          aidResults.push({
+            name: aidInfo.name,
+            aid: Buffer.from(aidInfo.aid).toString('hex').toUpperCase(),
+            success: false,
+            error: aidErr.message
+          })
+        }
+      }
+
+      // Try to read raw data from the first successful AID
+      let rawReadResult = null
+      const successfulAid = aidResults.find(r => r.success)
+      if (successfulAid) {
+        try {
+          // Try reading CID as a test
+          const cidResponse = await transmit(protocol, APDU.READ_CID)
+          rawReadResult = {
+            command: 'READ_CID',
+            commandHex: APDU.READ_CID.toString('hex').toUpperCase(),
+            response: cidResponse.toString('hex').toUpperCase(),
+            sw1: cidResponse[cidResponse.length - 2],
+            sw2: cidResponse[cidResponse.length - 1]
+          }
+        } catch (readErr) {
+          rawReadResult = { error: readErr.message }
+        }
+      }
+
+      // Disconnect
+      reader.disconnect(reader.SCARD_LEAVE_CARD, () => {})
+
+      resolve({
+        atr: cardATR,
+        protocol: protocolName,
+        readerName: reader.name,
+        aidResults,
+        rawReadResult,
+        timestamp: new Date().toISOString()
+      })
+    })
+  })
+}
+
+function getStatusDescription(sw1, sw2) {
+  if (sw1 === 0x90 && sw2 === 0x00) return 'Success'
+  if (sw1 === 0x6A && sw2 === 0x82) return 'File/Application not found'
+  if (sw1 === 0x6A && sw2 === 0x86) return 'Incorrect P1/P2 parameters'
+  if (sw1 === 0x6A && sw2 === 0x81) return 'Function not supported'
+  if (sw1 === 0x69 && sw2 === 0x85) return 'Conditions not satisfied'
+  if (sw1 === 0x6E && sw2 === 0x00) return 'Class not supported'
+  if (sw1 === 0x6D && sw2 === 0x00) return 'Instruction not supported'
+  if (sw1 === 0x67 && sw2 === 0x00) return 'Wrong length'
+  if (sw1 === 0x6C) return `Wrong Le, expected ${sw2} bytes`
+  if (sw1 === 0x61) return `${sw2} bytes available`
+  return 'Unknown status'
+}
+
+module.exports = { initCardReader, getStatus, readCard, debugCard }
