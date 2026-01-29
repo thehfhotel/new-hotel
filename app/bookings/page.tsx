@@ -318,6 +318,15 @@ export default function BookingsPage() {
                       </div>
                     </th>
                     <th
+                      onClick={() => handleSort('bookDate')}
+                      className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
+                    >
+                      <div className="flex items-center gap-1">
+                        วันที่จอง
+                        {getSortIcon('bookDate')}
+                      </div>
+                    </th>
+                    <th
                       onClick={() => handleSort('status')}
                       className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
                     >
@@ -375,6 +384,9 @@ export default function BookingsPage() {
                         <span className="text-sm font-medium text-blue-600">
                           {booking.bookNo}
                         </span>
+                      </td>
+                      <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-900">
+                        {formatDate(booking.bookDate)}
                       </td>
                       <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-900">
                         {booking.status}
