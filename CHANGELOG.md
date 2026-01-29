@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.1] - 2026-01-29
+
+### Fixed
+- **Performance: Removed sluggish animations** - Eliminated `transition-all` and unnecessary `transition-colors` classes that caused layout thrashing and janky interactions:
+  - `/app/bookings/page.tsx`: Removed `transition-all duration-300` from main content container, removed `transition-colors` from table rows
+  - `/components/RoomGrid.tsx`: Removed `transition-all duration-200` from room cards (kept `hover:shadow-md`)
+  - `/app/rooms/page.tsx`: Removed `transition-all` from filter cards and `transition-colors` from list rows
+  - `/app/page.tsx`: Removed `transition-colors` from activity list items
+
+### Changed
+- **Moved react-datepicker CSS to root layout** - CSS now loads once in `/app/layout.tsx` instead of per-component in `/app/bookings/page.tsx`, reducing redundant CSS parsing
+
 ## [1.16.0] - 2026-01-29
 
 ### Added

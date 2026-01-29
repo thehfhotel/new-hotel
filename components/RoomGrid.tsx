@@ -155,7 +155,7 @@ export default function RoomGrid({ rooms, onRoomClick }: RoomGridProps) {
                     key={room.id}
                     onClick={() => handleRoomClick(room)}
                     className={`${config.bg} border border-gray-200 border-b-4 ${config.border} rounded-lg p-1
-                      transition-all duration-200 hover:shadow-md
+                      hover:shadow-md
                       flex flex-col items-center justify-center h-[70px] overflow-hidden`}
                     title={`${room.roomNumber} - ${room.type} - ${room.details || ''}`}
                   >
