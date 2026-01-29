@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **Performance: Removed sluggish animations** - Eliminated `transition-all` and unnecessary `transition-colors` classes that caused layout thrashing and janky interactions:
 
+### Added
+- **Database migrations folder** (`/migrations/`) - SQL migration files for tracking database schema changes
+  - `001_create_booking_notes_table.sql` - Documents the HT_Booking_Notes table created in v1.16.0
+  - `README.md` - Migration guidelines, shared database warnings, and table ownership documentation
+- **CLAUDE.md database migration instructions** - Mandatory process for creating migration files when modifying database schema
+
 ### Changed
 - **Upgraded pnpm to version 10 in Dockerfile** - Matches CI workflow pnpm version, eliminates version mismatch warnings
   - `/app/bookings/page.tsx`: Removed `transition-all duration-300` from main content container, removed `transition-colors` from table rows
