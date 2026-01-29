@@ -305,30 +305,32 @@ export default function BookingsPage() {
         ) : (
           <>
             <div className="overflow-x-auto">
-              <table className="min-w-full divide-y divide-gray-200">
+              <table className="w-full table-fixed divide-y divide-gray-200">
                 <thead className="bg-gray-50">
                   <tr>
                     <th
                       onClick={() => handleSort('bookNo')}
-                      className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
+                      className="w-28 px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
                     >
                       <div className="flex items-center gap-1">
-                        เลขที่จอง
+                        <span className="hidden sm:inline">เลขที่จอง</span>
+                        <span className="sm:hidden">เลขจอง</span>
                         {getSortIcon('bookNo')}
                       </div>
                     </th>
                     <th
                       onClick={() => handleSort('bookDate')}
-                      className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
+                      className="w-24 px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
                     >
                       <div className="flex items-center gap-1">
-                        วันที่จอง
+                        <span className="hidden sm:inline">วันที่จอง</span>
+                        <span className="sm:hidden">จอง</span>
                         {getSortIcon('bookDate')}
                       </div>
                     </th>
                     <th
                       onClick={() => handleSort('status')}
-                      className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
+                      className="w-20 px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
                     >
                       <div className="flex items-center gap-1">
                         สถานะ
@@ -337,7 +339,7 @@ export default function BookingsPage() {
                     </th>
                     <th
                       onClick={() => handleSort('customer')}
-                      className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
+                      className="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
                     >
                       <div className="flex items-center gap-1">
                         ลูกค้า
@@ -346,25 +348,27 @@ export default function BookingsPage() {
                     </th>
                     <th
                       onClick={() => handleSort('checkIn')}
-                      className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
+                      className="w-24 px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
                     >
                       <div className="flex items-center gap-1">
-                        เช็คอิน
+                        <span className="hidden sm:inline">เช็คอิน</span>
+                        <span className="sm:hidden">เข้า</span>
                         {getSortIcon('checkIn')}
                       </div>
                     </th>
                     <th
                       onClick={() => handleSort('checkOut')}
-                      className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
+                      className="w-24 px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
                     >
                       <div className="flex items-center gap-1">
-                        เช็คเอาท์
+                        <span className="hidden sm:inline">เช็คเอาท์</span>
+                        <span className="sm:hidden">ออก</span>
                         {getSortIcon('checkOut')}
                       </div>
                     </th>
                     <th
                       onClick={() => handleSort('roomCount')}
-                      className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
+                      className="w-28 px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
                     >
                       <div className="flex items-center gap-1">
                         ห้องพัก
@@ -380,33 +384,33 @@ export default function BookingsPage() {
                       onClick={() => setSelectedBookNo(booking.bookNo)}
                       className="hover:bg-blue-50 cursor-pointer transition-colors"
                     >
-                      <td className="px-4 py-4 whitespace-nowrap">
+                      <td className="px-3 py-3 truncate">
                         <span className="text-sm font-medium text-blue-600">
                           {booking.bookNo}
                         </span>
                       </td>
-                      <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-900">
+                      <td className="px-3 py-3 text-sm text-gray-900">
                         {formatDate(booking.bookDate)}
                       </td>
-                      <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-900">
+                      <td className="px-3 py-3 text-sm text-gray-900">
                         {booking.status}
                       </td>
-                      <td className="px-4 py-4 whitespace-nowrap">
+                      <td className="px-3 py-3 truncate">
                         <span className="text-sm text-gray-900">
                           {booking.customer.name || '-'}
                         </span>
                       </td>
-                      <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-900">
+                      <td className="px-3 py-3 text-sm text-gray-900">
                         {formatDate(booking.checkIn)}
                       </td>
-                      <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-900">
+                      <td className="px-3 py-3 text-sm text-gray-900">
                         {formatDate(booking.checkOut)}
                       </td>
-                      <td className="px-4 py-4 whitespace-nowrap">
-                        <div className="flex items-center gap-2">
-                          <BedDouble size={16} className="text-gray-400" />
+                      <td className="px-3 py-3">
+                        <div className="flex items-center gap-1">
+                          <BedDouble size={14} className="text-gray-400 hidden sm:block" />
                           <div className="flex flex-col">
-                            <span className="text-sm text-gray-900">
+                            <span className="text-sm text-gray-900 truncate">
                               {getRoomsDisplay(booking.rooms)}
                             </span>
                             <span className="text-xs text-gray-500">
