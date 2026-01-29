@@ -34,34 +34,32 @@ export default function Navbar() {
 
   return (
     <nav className="bg-blue-800 text-white shadow-lg">
-      <div className="container mx-auto px-4">
-        <div className="flex items-center justify-between h-16">
-          {/* Logo and Hotel Name */}
-          <Link href="/" className="flex items-center space-x-3 whitespace-nowrap">
-            <Hotel size={32} className="text-blue-200" />
-            <span className="hidden md:inline text-xl font-bold">ระบบจัดการโรงแรม</span>
-          </Link>
+      <div className="flex items-center justify-between h-16 px-2 lg:px-6">
+        {/* Logo and Hotel Name */}
+        <Link href="/" className="flex items-center gap-2 shrink-0">
+          <Hotel size={28} className="text-blue-200 lg:w-8 lg:h-8" />
+          <span className="hidden lg:block text-xl font-bold whitespace-nowrap">ระบบจัดการโรงแรม</span>
+        </Link>
 
-          {/* Navigation Links */}
-          <div className="flex items-center space-x-1 whitespace-nowrap">
-            {navLinks.map((link) => {
-              const isActive = pathname === link.href
-              return (
-                <Link
-                  key={link.href}
-                  href={link.href}
-                  className={`flex items-center space-x-2 px-4 py-2 rounded-lg transition-colors duration-200
-                    ${isActive
-                      ? 'bg-blue-600 text-white'
-                      : 'text-blue-100 hover:bg-blue-700 hover:text-white'
-                    }`}
-                >
-                  {link.icon}
-                  <span className="hidden md:inline">{link.label}</span>
-                </Link>
-              )
-            })}
-          </div>
+        {/* Navigation Links */}
+        <div className="flex items-center">
+          {navLinks.map((link) => {
+            const isActive = pathname === link.href
+            return (
+              <Link
+                key={link.href}
+                href={link.href}
+                className={`flex items-center gap-2 px-2 lg:px-4 py-2 rounded-lg transition-colors duration-200
+                  ${isActive
+                    ? 'bg-blue-600 text-white'
+                    : 'text-blue-100 hover:bg-blue-700 hover:text-white'
+                  }`}
+              >
+                {link.icon}
+                <span className="hidden lg:block whitespace-nowrap">{link.label}</span>
+              </Link>
+            )
+          })}
         </div>
       </div>
     </nav>
