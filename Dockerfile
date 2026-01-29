@@ -20,6 +20,7 @@ ENV NODE_ENV=production
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
 COPY --from=builder /app/public ./public
+COPY --from=builder /app/CHANGELOG.md ./
 EXPOSE 3003
 ENV PORT=3003
 CMD ["node", "server.js"]
