@@ -16,7 +16,6 @@ import {
   ArrowDown,
 } from 'lucide-react'
 import DatePicker from 'react-datepicker'
-import 'react-datepicker/dist/react-datepicker.css'
 import BookingDetailDrawer from '@/components/BookingDetailDrawer'
 
 // Types
@@ -177,7 +176,7 @@ export default function BookingsPage() {
   return (
     <div className="flex gap-6">
       {/* Main Content */}
-      <div className={`flex-1 min-w-0 space-y-6 transition-all duration-300 ${selectedBookNo ? 'lg:mr-0' : ''}`}>
+      <div className={`flex-1 min-w-0 space-y-6 ${selectedBookNo ? 'lg:mr-0' : ''}`}>
         {/* Header */}
         <div className="flex items-center justify-between">
         <div>
@@ -367,7 +366,7 @@ export default function BookingsPage() {
                     <tr
                       key={booking.bookNo}
                       onClick={() => setSelectedBookNo(booking.bookNo)}
-                      className="hover:bg-blue-50 cursor-pointer transition-colors"
+                      className="hover:bg-blue-50 cursor-pointer"
                     >
                       <td className="px-3 py-3 truncate">
                         <span className="text-sm font-medium text-blue-600">

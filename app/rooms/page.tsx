@@ -211,7 +211,7 @@ export default function RoomsPage() {
     return (
       <div
         onClick={() => fetchRoomDetail(room)}
-        className={`p-4 rounded-lg border-2 cursor-pointer transition-all hover:shadow-md ${config.bgColor} ${config.borderColor} ${
+        className={`p-4 rounded-lg border-2 cursor-pointer hover:shadow-md ${config.bgColor} ${config.borderColor} ${
           selectedRoom?.Room_No === room.Room_No ? 'ring-2 ring-blue-500' : ''
         }`}
       >
@@ -258,7 +258,7 @@ export default function RoomsPage() {
     return (
       <tr
         onClick={() => fetchRoomDetail(room)}
-        className={`cursor-pointer hover:bg-gray-50 transition-colors ${
+        className={`cursor-pointer hover:bg-gray-50 ${
           selectedRoom?.Room_No === room.Room_No ? 'bg-blue-50' : ''
         }`}
       >
