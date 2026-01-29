@@ -15,6 +15,8 @@ import {
   ArrowUp,
   ArrowDown,
 } from 'lucide-react'
+import DatePicker from 'react-datepicker'
+import 'react-datepicker/dist/react-datepicker.css'
 import BookingDetailDrawer from '@/components/BookingDetailDrawer'
 
 // Types
@@ -81,8 +83,8 @@ export default function BookingsPage() {
 
   // Filters
   const [statusFilter, setStatusFilter] = useState('')
-  const [startDate, setStartDate] = useState('')
-  const [endDate, setEndDate] = useState('')
+  const [dateRange, setDateRange] = useState<[Date | null, Date | null]>([null, null])
+  const [startDate, endDate] = dateRange
   const [searchTerm, setSearchTerm] = useState('')
 
   // Drawer
@@ -106,8 +108,8 @@ export default function BookingsPage() {
       })
 
       if (statusFilter) params.append('status', statusFilter)
-      if (startDate) params.append('startDate', startDate)
-      if (endDate) params.append('endDate', endDate)
+      if (startDate) params.append('startDate', startDate.toISOString().split('T')[0])
+      if (endDate) params.append('endDate', endDate.toISOString().split('T')[0])
       if (searchTerm) params.append('search', searchTerm)
 
       const response = await fetch(`/api/bookings?${params.toString()}`)
@@ -139,8 +141,7 @@ export default function BookingsPage() {
   // Handle filter reset
   const handleResetFilters = () => {
     setStatusFilter('')
-    setStartDate('')
-    setEndDate('')
+    setDateRange([null, null])
     setSearchTerm('')
     setCurrentPage(1)
   }
@@ -247,31 +248,25 @@ export default function BookingsPage() {
           </div>
 
           {/* Date Range Selector */}
-          <div className="flex items-center border border-gray-300 rounded-lg overflow-hidden focus-within:ring-2 focus-within:ring-blue-500 focus-within:border-blue-500">
-            <div className="flex items-center px-3 bg-gray-50 border-r border-gray-300 h-full">
-              <Calendar className="h-4 w-4 text-gray-400" />
+          <div className="relative">
+            <div className="flex items-center border border-gray-300 rounded-lg overflow-hidden focus-within:ring-2 focus-within:ring-blue-500 focus-within:border-blue-500">
+              <div className="flex items-center px-3 bg-gray-50 border-r border-gray-300 py-2">
+                <Calendar className="h-4 w-4 text-gray-400" />
+              </div>
+              <DatePicker
+                selectsRange
+                startDate={startDate}
+                endDate={endDate}
+                onChange={(update) => {
+                  setDateRange(update)
+                  setCurrentPage(1)
+                }}
+                placeholderText="เลือกช่วงวันที่"
+                className="w-full px-3 py-2 border-0 focus:ring-0 text-sm focus:outline-none"
+                dateFormat="dd/MM/yy"
+                isClearable
+              />
             </div>
-            <input
-              type="date"
-              value={startDate}
-              onChange={(e) => {
-                setStartDate(e.target.value)
-                setCurrentPage(1)
-              }}
-              className="flex-1 px-2 py-2 border-0 focus:ring-0 text-sm"
-              title="เช็คอิน"
-            />
-            <span className="text-gray-400 px-1">→</span>
-            <input
-              type="date"
-              value={endDate}
-              onChange={(e) => {
-                setEndDate(e.target.value)
-                setCurrentPage(1)
-              }}
-              className="flex-1 px-2 py-2 border-0 focus:ring-0 text-sm"
-              title="เช็คเอาท์"
-            />
           </div>
 
           {/* Reset Button */}
