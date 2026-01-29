@@ -45,6 +45,17 @@ function mapStatus(status: string | number): string {
   return String(status || 'ไม่ทราบ');
 }
 
+// Map Thai status text back to status code
+function getStatusCode(statusText: string): number | null {
+  switch (statusText) {
+    case 'จอง': return 1;
+    case 'เข้าพัก': return 2;
+    case 'เสร็จสิ้น': return 3;
+    case 'ยกเลิก': return 4;
+    default: return null;
+  }
+}
+
 // Group room records by Book_No
 function groupByBookNo(records: RoomRecord[]): GroupedBooking[] {
   const grouped = new Map<string, GroupedBooking>();
@@ -82,6 +93,7 @@ export async function GET(request: NextRequest) {
   try {
     const searchParams = request.nextUrl.searchParams;
     const search = searchParams.get('search');
+    const status = searchParams.get('status');
     const startDate = searchParams.get('startDate');
     const endDate = searchParams.get('endDate');
     const page = parseInt(searchParams.get('page') || '1', 10);
@@ -93,11 +105,19 @@ export async function GET(request: NextRequest) {
 
     // Build conditions
     const conditions: string[] = [];
-    const params: { name: string; type: typeof sql.NVarChar | typeof sql.Date; value: unknown }[] = [];
+    const params: { name: string; type: typeof sql.NVarChar | typeof sql.Date | typeof sql.Int; value: unknown }[] = [];
 
     if (search) {
       conditions.push('(Book_No LIKE @search OR Book_Cust_Name LIKE @search)');
       params.push({ name: 'search', type: sql.NVarChar, value: `%${search}%` });
+    }
+
+    if (status) {
+      const statusCode = getStatusCode(status);
+      if (statusCode !== null) {
+        conditions.push('Book_Status = @status');
+        params.push({ name: 'status', type: sql.Int, value: statusCode });
+      }
     }
 
     if (startDate) {
