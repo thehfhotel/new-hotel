@@ -165,12 +165,16 @@ export default function BookingsPage() {
     }
   }
 
-  // Get rooms display
+  // Get rooms display - show room types
   const getRoomsDisplay = (rooms: Room[]) => {
-    const roomNos = rooms.map(r => r.roomNo).filter(r => r !== '-')
-    if (roomNos.length === 0) return '-'
-    if (roomNos.length <= 3) return roomNos.join(', ')
-    return `${roomNos.slice(0, 2).join(', ')}...`
+    const types = rooms.map(r => r.roomType).filter(r => r !== '-')
+    if (types.length === 0) return '-'
+    // Count unique types
+    const typeCounts = types.reduce((acc, t) => {
+      acc[t] = (acc[t] || 0) + 1
+      return acc
+    }, {} as Record<string, number>)
+    return Object.entries(typeCounts).map(([t, c]) => c > 1 ? `${t} x${c}` : t).join(', ')
   }
 
   return (

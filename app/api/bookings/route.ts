@@ -10,7 +10,6 @@ interface RoomRecord {
   Book_Date_out: Date;
   Book_Cust_Name: string;
   Book_Status: string | number;
-  Book_Room_No: string;
   Book_Room_Type: string;
 }
 
@@ -70,7 +69,7 @@ function groupByBookNo(records: RoomRecord[]): GroupedBooking[] {
 
     const booking = grouped.get(bookNo)!;
     booking.rooms.push({
-      roomNo: record.Book_Room_No || '-',
+      roomNo: '-',
       roomType: record.Book_Room_Type || '-',
     });
     booking.roomCount = booking.rooms.length;
@@ -134,7 +133,6 @@ export async function GET(request: NextRequest) {
         Book_Date_out,
         Book_Cust_Name,
         Book_Status,
-        Book_Room_No,
         Book_Room_Type
       FROM View_Booking_Ds
       ${whereClause}
