@@ -11,12 +11,8 @@ import {
   differenceInDays,
   isSameDay,
   isWithinInterval,
-  addDays,
   addWeeks,
   addMonths,
-  subDays,
-  subWeeks,
-  subMonths,
 } from 'date-fns'
 import { ChevronLeft, ChevronRight, Calendar } from 'lucide-react'
 
@@ -36,7 +32,7 @@ interface StayBar {
   count: number
 }
 
-type ViewMode = 'day' | 'week' | 'month'
+type ViewMode = 'week' | 'month'
 
 interface StayTimelineProps {
   stays: Stay[]
@@ -71,27 +67,19 @@ export default function StayTimeline({
   selectedDate,
   onDateChange,
 }: StayTimelineProps) {
-  const [viewMode, setViewMode] = useState<ViewMode>('month')
+  const [viewMode, setViewMode] = useState<ViewMode>('week')
   const [hoveredBar, setHoveredBar] = useState<string | null>(null)
 
   // Calculate date range based on view mode
   const { rangeStart, rangeEnd, days } = useMemo(() => {
     let start: Date, end: Date
 
-    switch (viewMode) {
-      case 'day':
-        start = selectedDate
-        end = selectedDate
-        break
-      case 'week':
-        start = startOfWeek(selectedDate, { weekStartsOn: 0 })
-        end = endOfWeek(selectedDate, { weekStartsOn: 0 })
-        break
-      case 'month':
-      default:
-        start = startOfMonth(selectedDate)
-        end = endOfMonth(selectedDate)
-        break
+    if (viewMode === 'week') {
+      start = startOfWeek(selectedDate, { weekStartsOn: 0 })
+      end = endOfWeek(selectedDate, { weekStartsOn: 0 })
+    } else {
+      start = startOfMonth(selectedDate)
+      end = endOfMonth(selectedDate)
     }
 
     return {
@@ -189,30 +177,19 @@ export default function StayTimeline({
   // Navigation
   const navigate = (direction: 'prev' | 'next') => {
     const mult = direction === 'prev' ? -1 : 1
-    switch (viewMode) {
-      case 'day':
-        onDateChange(addDays(selectedDate, mult))
-        break
-      case 'week':
-        onDateChange(addWeeks(selectedDate, mult))
-        break
-      case 'month':
-        onDateChange(addMonths(selectedDate, mult))
-        break
+    if (viewMode === 'week') {
+      onDateChange(addWeeks(selectedDate, mult))
+    } else {
+      onDateChange(addMonths(selectedDate, mult))
     }
   }
 
   // Format header title based on view mode
   const getHeaderTitle = () => {
-    switch (viewMode) {
-      case 'day':
-        return `${selectedDate.getDate()} ${THAI_MONTHS[selectedDate.getMonth()]} ${selectedDate.getFullYear() + 543}`
-      case 'week':
-        return `${format(rangeStart, 'd')} - ${format(rangeEnd, 'd')} ${THAI_MONTHS[rangeEnd.getMonth()]} ${rangeEnd.getFullYear() + 543}`
-      case 'month':
-      default:
-        return `${THAI_MONTHS[selectedDate.getMonth()]} ${selectedDate.getFullYear() + 543}`
+    if (viewMode === 'week') {
+      return `${format(rangeStart, 'd')} - ${format(rangeEnd, 'd')} ${THAI_MONTHS[rangeEnd.getMonth()]} ${rangeEnd.getFullYear() + 543}`
     }
+    return `${THAI_MONTHS[selectedDate.getMonth()]} ${selectedDate.getFullYear() + 543}`
   }
 
   return (
@@ -235,7 +212,7 @@ export default function StayTimeline({
 
       {/* View Mode Tabs */}
       <div className="flex items-center justify-center gap-1 p-2 border-b bg-gray-50">
-        {(['day', 'week', 'month'] as ViewMode[]).map(mode => (
+        {(['week', 'month'] as ViewMode[]).map(mode => (
           <button
             key={mode}
             onClick={() => setViewMode(mode)}
@@ -245,7 +222,7 @@ export default function StayTimeline({
                 : 'text-gray-600 hover:bg-gray-200'
             }`}
           >
-            {mode === 'day' ? 'วัน' : mode === 'week' ? 'สัปดาห์' : 'เดือน'}
+            {mode === 'week' ? 'สัปดาห์' : 'เดือน'}
           </button>
         ))}
       </div>
