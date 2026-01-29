@@ -7,6 +7,7 @@ import StayTimeline, { Stay } from '@/components/StayTimeline'
 
 interface ApiBooking {
   bookNo: string
+  bookDate: string
   checkIn: string
   checkOut: string
   status: string
@@ -173,6 +174,7 @@ export default function CalendarPage() {
         checkOut,
         type: 'booking',
         nights,
+        bookDate: booking.bookDate ? parseISO(booking.bookDate) : undefined,
       })
     })
 

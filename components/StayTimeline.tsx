@@ -13,7 +13,7 @@ import {
   addWeeks,
   addMonths,
 } from 'date-fns'
-import { ChevronLeft, ChevronRight, Calendar } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Calendar, X } from 'lucide-react'
 
 export interface Stay {
   id: string
@@ -21,6 +21,7 @@ export interface Stay {
   checkOut: Date
   type: 'booking' | 'checkin'
   nights: number
+  bookDate?: Date  // Only for bookings
 }
 
 interface DayData {
@@ -29,6 +30,9 @@ interface DayData {
   newCheckin: number  // New check-ins today
   booking: number     // Bookings (not checked in yet)
   total: number
+  continuingStays: Stay[]  // List of continuing stays
+  newCheckinStays: Stay[]  // List of new check-ins
+  bookingStays: Stay[]     // List of bookings
 }
 
 type ViewMode = 'week' | 'month'
@@ -56,6 +60,11 @@ export default function StayTimeline({
   onViewModeChange,
 }: StayTimelineProps) {
   const [hoveredDay, setHoveredDay] = useState<string | null>(null)
+  const [selectedSegment, setSelectedSegment] = useState<{
+    date: Date
+    type: 'continuing' | 'newCheckin' | 'booking'
+    stays: Stay[]
+  } | null>(null)
 
   // Calculate date range based on view mode
   const { rangeStart, rangeEnd, days } = useMemo(() => {
@@ -79,9 +88,9 @@ export default function StayTimeline({
   // Calculate data for each day
   const dayData: DayData[] = useMemo(() => {
     return days.map(day => {
-      let continuing = 0
-      let newCheckin = 0
-      let booking = 0
+      const continuingStays: Stay[] = []
+      const newCheckinStays: Stay[] = []
+      const bookingStays: Stay[] = []
 
       stays.forEach(stay => {
         const isCheckInDay = isSameDay(stay.checkIn, day)
@@ -91,24 +100,27 @@ export default function StayTimeline({
 
         if (stay.type === 'checkin') {
           if (isCheckInDay) {
-            newCheckin++
+            newCheckinStays.push(stay)
           } else if (isStayingToday || isCheckOutDay) {
-            continuing++
+            continuingStays.push(stay)
           }
         } else {
           // booking
           if (isCheckInDay || isStayingToday || isCheckOutDay) {
-            booking++
+            bookingStays.push(stay)
           }
         }
       })
 
       return {
         date: day,
-        continuing,
-        newCheckin,
-        booking,
-        total: continuing + newCheckin + booking,
+        continuing: continuingStays.length,
+        newCheckin: newCheckinStays.length,
+        booking: bookingStays.length,
+        total: continuingStays.length + newCheckinStays.length + bookingStays.length,
+        continuingStays,
+        newCheckinStays,
+        bookingStays,
       }
     })
   }, [days, stays])
@@ -239,8 +251,9 @@ export default function StayTimeline({
                     {/* Continuing stays (blue) */}
                     {d.continuing > 0 && (
                       <div
-                        className="w-full bg-blue-500 flex items-center justify-center"
+                        className="w-full bg-blue-500 flex items-center justify-center cursor-pointer hover:bg-blue-600"
                         style={{ height: continuingHeight }}
+                        onClick={() => setSelectedSegment({ date: d.date, type: 'continuing', stays: d.continuingStays })}
                       >
                         {viewMode === 'week' && continuingHeight > 16 && (
                           <span className="text-white text-xs font-medium">{d.continuing}</span>
@@ -250,8 +263,9 @@ export default function StayTimeline({
                     {/* New check-ins (green) */}
                     {d.newCheckin > 0 && (
                       <div
-                        className="w-full bg-emerald-500 flex items-center justify-center"
+                        className="w-full bg-emerald-500 flex items-center justify-center cursor-pointer hover:bg-emerald-600"
                         style={{ height: newCheckinHeight }}
+                        onClick={() => setSelectedSegment({ date: d.date, type: 'newCheckin', stays: d.newCheckinStays })}
                       >
                         {viewMode === 'week' && newCheckinHeight > 16 && (
                           <span className="text-white text-xs font-medium">{d.newCheckin}</span>
@@ -261,8 +275,9 @@ export default function StayTimeline({
                     {/* Bookings (amber) */}
                     {d.booking > 0 && (
                       <div
-                        className="w-full bg-amber-400 flex items-center justify-center"
+                        className="w-full bg-amber-400 flex items-center justify-center cursor-pointer hover:bg-amber-500"
                         style={{ height: bookingHeight }}
+                        onClick={() => setSelectedSegment({ date: d.date, type: 'booking', stays: d.bookingStays })}
                       >
                         {viewMode === 'week' && bookingHeight > 16 && (
                           <span className="text-white text-xs font-medium">{d.booking}</span>
@@ -311,6 +326,71 @@ export default function StayTimeline({
           <span className="text-gray-600">การจอง</span>
         </div>
       </div>
+
+      {/* Detail Panel */}
+      {selectedSegment && (
+        <div className="border-t bg-white p-4">
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-2">
+              <div className={`w-3 h-3 rounded ${
+                selectedSegment.type === 'continuing' ? 'bg-blue-500' :
+                selectedSegment.type === 'newCheckin' ? 'bg-emerald-500' : 'bg-amber-400'
+              }`} />
+              <h3 className="font-medium text-gray-800">
+                {selectedSegment.type === 'continuing' && 'พักต่อเนื่อง'}
+                {selectedSegment.type === 'newCheckin' && 'เช็คอินใหม่'}
+                {selectedSegment.type === 'booking' && 'การจอง'}
+                <span className="text-gray-500 font-normal ml-2">
+                  {format(selectedSegment.date, 'd MMM yyyy')} ({selectedSegment.stays.length} รายการ)
+                </span>
+              </h3>
+            </div>
+            <button
+              onClick={() => setSelectedSegment(null)}
+              className="p-1 hover:bg-gray-100 rounded"
+            >
+              <X className="w-5 h-5 text-gray-500" />
+            </button>
+          </div>
+
+          {selectedSegment.stays.length === 0 ? (
+            <p className="text-gray-500 text-sm">ไม่มีข้อมูล</p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="bg-gray-50">
+                    {selectedSegment.type === 'booking' && (
+                      <th className="px-3 py-2 text-left font-medium text-gray-600">วันจอง</th>
+                    )}
+                    <th className="px-3 py-2 text-left font-medium text-gray-600">เช็คอิน</th>
+                    <th className="px-3 py-2 text-left font-medium text-gray-600">เช็คเอาท์</th>
+                    <th className="px-3 py-2 text-left font-medium text-gray-600">จำนวนคืน</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {selectedSegment.stays.map((stay, idx) => (
+                    <tr key={stay.id} className={idx % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
+                      {selectedSegment.type === 'booking' && (
+                        <td className="px-3 py-2 text-gray-700">
+                          {stay.bookDate ? format(stay.bookDate, 'd MMM yyyy') : '-'}
+                        </td>
+                      )}
+                      <td className="px-3 py-2 text-gray-700">
+                        {format(stay.checkIn, 'd MMM yyyy')}
+                      </td>
+                      <td className="px-3 py-2 text-gray-700">
+                        {format(stay.checkOut, 'd MMM yyyy')}
+                      </td>
+                      <td className="px-3 py-2 text-gray-700">{stay.nights}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }

@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.18.0] - 2026-01-30
+
+### Added
+- **Clickable bar chart segments** - Calendar stacked bar chart segments are now clickable
+  - Click on any colored segment (continuing stays, new check-ins, or bookings) to view details
+  - Detail panel shows list of stays with check-in date, check-out date, and number of nights
+  - Bookings also display booking date in the detail view
+  - Visual hover feedback on bar segments
+
 ## [1.17.0] - 2026-01-30
 
 ### Added
