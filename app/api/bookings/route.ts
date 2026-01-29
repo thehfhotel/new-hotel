@@ -82,13 +82,9 @@ function groupByBookNo(records: RoomRecord[]): GroupedBooking[] {
 export async function GET(request: NextRequest) {
   try {
     const searchParams = request.nextUrl.searchParams;
-    const status = searchParams.get('status');
+    const search = searchParams.get('search');
     const startDate = searchParams.get('startDate');
     const endDate = searchParams.get('endDate');
-    const search = searchParams.get('search');
-    const roomType = searchParams.get('roomType');
-    const sortBy = searchParams.get('sortBy') || 'Book_Date';
-    const sortOrder = searchParams.get('sortOrder') || 'DESC';
     const page = parseInt(searchParams.get('page') || '1', 10);
     const limit = parseInt(searchParams.get('limit') || '20', 10);
 
@@ -96,16 +92,11 @@ export async function GET(request: NextRequest) {
 
     // Build conditions
     const conditions: string[] = [];
-    const params: { name: string; type: typeof sql.NVarChar | typeof sql.Date | typeof sql.Int; value: unknown }[] = [];
+    const params: { name: string; type: typeof sql.NVarChar | typeof sql.Date; value: unknown }[] = [];
 
     if (search) {
       conditions.push('(Book_No LIKE @search OR Book_Cust_Name LIKE @search)');
       params.push({ name: 'search', type: sql.NVarChar, value: `%${search}%` });
-    }
-
-    if (status) {
-      conditions.push('Book_Status = @status');
-      params.push({ name: 'status', type: sql.NVarChar, value: status });
     }
 
     if (startDate) {
@@ -118,19 +109,9 @@ export async function GET(request: NextRequest) {
       params.push({ name: 'endDate', type: sql.Date, value: new Date(endDate) });
     }
 
-    if (roomType) {
-      conditions.push('Book_Room_Type = @roomType');
-      params.push({ name: 'roomType', type: sql.NVarChar, value: roomType });
-    }
-
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
-    // Validate sort column to prevent SQL injection
-    const validSortColumns = ['Book_No', 'Book_Date', 'Book_Date_in', 'Book_Date_out', 'Book_Cust_Name', 'Book_Status'];
-    const safeSortBy = validSortColumns.includes(sortBy) ? sortBy : 'Book_Date';
-    const safeSortOrder = sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
-
-    // First, get distinct Book_No count for pagination
+    // Count distinct bookings
     const countRequest = pool.request();
     params.forEach(p => countRequest.input(p.name, p.type, p.value));
 
@@ -141,40 +122,9 @@ export async function GET(request: NextRequest) {
     `);
     const total = countResult.recordset[0].total;
 
-    // Get paginated distinct Book_No values
-    const bookNoRequest = pool.request();
-    params.forEach(p => bookNoRequest.input(p.name, p.type, p.value));
-    bookNoRequest.input('offset', sql.Int, (page - 1) * limit);
-    bookNoRequest.input('limit', sql.Int, limit);
-
-    const bookNoResult = await bookNoRequest.query(`
-      SELECT Book_No, MIN(Book_Date) as sort_value
-      FROM View_Booking_Ds
-      ${whereClause}
-      GROUP BY Book_No
-      ORDER BY sort_value ${safeSortOrder}
-      OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY
-    `);
-
-    const bookNos = bookNoResult.recordset.map(r => r.Book_No);
-
-    if (bookNos.length === 0) {
-      return NextResponse.json({
-        success: true,
-        data: [],
-        pagination: {
-          page,
-          limit,
-          total,
-          totalPages: Math.ceil(total / limit),
-        },
-      });
-    }
-
-    // Fetch all room records for these bookings
+    // Get all data (we'll group and paginate in JS for simplicity)
     const dataRequest = pool.request();
-    const bookNoParams = bookNos.map((bn, i) => `@bn${i}`).join(',');
-    bookNos.forEach((bn, i) => dataRequest.input(`bn${i}`, sql.NVarChar, bn));
+    params.forEach(p => dataRequest.input(p.name, p.type, p.value));
 
     const dataResult = await dataRequest.query(`
       SELECT
@@ -187,20 +137,23 @@ export async function GET(request: NextRequest) {
         Book_Room_No,
         Book_Room_Type
       FROM View_Booking_Ds
-      WHERE Book_No IN (${bookNoParams})
-      ORDER BY ${safeSortBy} ${safeSortOrder}, Book_Room_No
+      ${whereClause}
+      ORDER BY Book_Date DESC
     `);
 
     // Group records by Book_No
-    const groupedBookings = groupByBookNo(dataResult.recordset);
+    const allGrouped = groupByBookNo(dataResult.recordset);
 
-    // Sort grouped results to match pagination order
-    const bookNoOrder = new Map(bookNos.map((bn, i) => [bn, i]));
-    groupedBookings.sort((a, b) => (bookNoOrder.get(a.bookNo) || 0) - (bookNoOrder.get(b.bookNo) || 0));
+    // Sort by bookDate descending
+    allGrouped.sort((a, b) => new Date(b.bookDate).getTime() - new Date(a.bookDate).getTime());
+
+    // Paginate
+    const startIdx = (page - 1) * limit;
+    const paginatedData = allGrouped.slice(startIdx, startIdx + limit);
 
     return NextResponse.json({
       success: true,
-      data: groupedBookings,
+      data: paginatedData,
       pagination: {
         page,
         limit,
@@ -214,6 +167,7 @@ export async function GET(request: NextRequest) {
       {
         success: false,
         error: 'Failed to fetch bookings',
+        details: error instanceof Error ? error.message : 'Unknown error',
       },
       { status: 500 }
     );
