@@ -17,5 +17,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Remove status update listener
   removeStatusUpdateListener: () => {
     ipcRenderer.removeAllListeners('status-update')
-  }
+  },
+
+  // Read card data (for debug/test)
+  readCard: () => ipcRenderer.invoke('read-card'),
+
+  // Get debug info about the card
+  debugCard: () => ipcRenderer.invoke('debug-card')
 })

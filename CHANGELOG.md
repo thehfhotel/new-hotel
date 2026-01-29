@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.0] - 2026-01-29
+
+### Added
+- Thai ID Middleware debug mode for diagnosing card reading issues
+  - "Test Read" button to attempt card read and display results in the app
+  - "Debug Info" button to show card ATR and test multiple Application IDs (AIDs)
+  - Dark-themed output panel displaying diagnostic information
+  - Tests multiple known Thai ID card AIDs (Standard, Alternate, MOI, EMV)
+  - Shows APDU status words with human-readable descriptions
+- ATR (Answer To Reset) capture when card is inserted for identification
+- Window is now resizable to accommodate debug panel
+
 ## [1.11.1] - 2026-01-29
 
 ### Fixed
