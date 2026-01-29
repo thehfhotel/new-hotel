@@ -1,8 +1,6 @@
 'use client'
 
 import { useState, useEffect, useCallback } from 'react'
-import { format, parseISO } from 'date-fns'
-import { th } from 'date-fns/locale'
 import {
   Search,
   Filter,
@@ -12,21 +10,35 @@ import {
   AlertCircle,
   Calendar,
   RefreshCw,
+  BedDouble,
 } from 'lucide-react'
+import BookingDetailDrawer from '@/components/BookingDetailDrawer'
 
 // Types
-interface Booking {
-  Book_No: string
-  Book_Date: string
-  Book_Date_in: string
-  Book_Date_out: string
-  Book_Cust_Name: string
-  Book_Status: string
-  Book_Room_Type: string
+interface Room {
+  roomNo: string
+  roomType: string
+  total: number
+}
+
+interface GroupedBooking {
+  bookNo: string
+  bookDate: string
+  checkIn: string
+  checkOut: string
+  customer: {
+    id: string
+    name: string
+  }
+  status: string
+  rooms: Room[]
+  totalAmount: number
+  roomCount: number
 }
 
 interface BookingsResponse {
-  data: Booking[]
+  success: boolean
+  data: GroupedBooking[]
   pagination: {
     page: number
     limit: number
@@ -44,15 +56,36 @@ const statusConfig: Record<string, { label: string; bgColor: string; textColor: 
 }
 
 const statusOptions = [
-  { value: '', label: 'ทั้งหมด' },
+  { value: '', label: 'สถานะทั้งหมด' },
   { value: 'จอง', label: 'จอง' },
   { value: 'เข้าพัก', label: 'เข้าพัก' },
+  { value: 'เสร็จสิ้น', label: 'เสร็จสิ้น' },
   { value: 'ยกเลิก', label: 'ยกเลิก' },
 ]
 
+// Format date helper
+function formatDate(dateString: string): string {
+  if (!dateString) return '-'
+  const date = new Date(dateString)
+  return date.toLocaleDateString('th-TH', {
+    day: '2-digit',
+    month: '2-digit',
+    year: '2-digit',
+    timeZone: 'UTC',
+  })
+}
+
+// Format currency helper
+function formatCurrency(amount: number): string {
+  if (amount >= 1000) {
+    return `${(amount / 1000).toFixed(amount % 1000 === 0 ? 0 : 1)}K`
+  }
+  return amount.toString()
+}
+
 export default function BookingsPage() {
   // State
-  const [bookings, setBookings] = useState<Booking[]>([])
+  const [bookings, setBookings] = useState<GroupedBooking[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
@@ -60,13 +93,16 @@ export default function BookingsPage() {
   const [currentPage, setCurrentPage] = useState(1)
   const [totalPages, setTotalPages] = useState(1)
   const [totalItems, setTotalItems] = useState(0)
-  const itemsPerPage = 10
+  const itemsPerPage = 15
 
   // Filters
   const [statusFilter, setStatusFilter] = useState('')
   const [startDate, setStartDate] = useState('')
   const [endDate, setEndDate] = useState('')
   const [searchTerm, setSearchTerm] = useState('')
+
+  // Drawer
+  const [selectedBookNo, setSelectedBookNo] = useState<string | null>(null)
 
   // Fetch bookings
   const fetchBookings = useCallback(async () => {
@@ -91,6 +127,11 @@ export default function BookingsPage() {
       }
 
       const data: BookingsResponse = await response.json()
+
+      if (!data.success) {
+        throw new Error('ไม่สามารถดึงข้อมูลการจองได้')
+      }
+
       setBookings(data.data)
       setTotalPages(data.pagination.totalPages)
       setTotalItems(data.pagination.total)
@@ -104,16 +145,6 @@ export default function BookingsPage() {
   useEffect(() => {
     fetchBookings()
   }, [fetchBookings])
-
-  // Format date helper
-  const formatDate = (dateString: string) => {
-    try {
-      const date = parseISO(dateString)
-      return format(date, 'd MMM yyyy', { locale: th })
-    } catch {
-      return dateString
-    }
-  }
 
   // Get status badge
   const getStatusBadge = (status: string) => {
@@ -145,16 +176,30 @@ export default function BookingsPage() {
     }
   }
 
+  // Get rooms display
+  const getRoomsDisplay = (rooms: Room[]) => {
+    const roomNos = rooms.map(r => r.roomNo).filter(r => r !== '-')
+    if (roomNos.length === 0) return '-'
+    if (roomNos.length <= 3) return roomNos.join(', ')
+    return `${roomNos.slice(0, 2).join(', ')}...`
+  }
+
   return (
     <div className="space-y-6">
       {/* Header */}
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold text-gray-900">รายการจอง</h1>
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900">การจองทั้งหมด</h1>
+          <p className="text-sm text-gray-500 mt-1">
+            {totalItems} รายการ (จัดกลุ่มตามเลขที่จอง)
+          </p>
+        </div>
         <button
           onClick={fetchBookings}
-          className="flex items-center space-x-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+          disabled={loading}
+          className="flex items-center space-x-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-50"
         >
-          <RefreshCw className="h-4 w-4" />
+          <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
           <span>รีเฟรช</span>
         </button>
       </div>
@@ -172,7 +217,7 @@ export default function BookingsPage() {
             <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-gray-400" />
             <input
               type="text"
-              placeholder="ค้นหาชื่อลูกค้า..."
+              placeholder="ค้นหาเลขจอง/ชื่อลูกค้า..."
               value={searchTerm}
               onChange={(e) => {
                 setSearchTerm(e.target.value)
@@ -211,7 +256,7 @@ export default function BookingsPage() {
                 setCurrentPage(1)
               }}
               className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-              placeholder="วันเริ่มต้น"
+              title="วันเช็คอินเริ่มต้น"
             />
           </div>
 
@@ -226,7 +271,7 @@ export default function BookingsPage() {
                 setCurrentPage(1)
               }}
               className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-              placeholder="วันสิ้นสุด"
+              title="วันเช็คเอาท์สิ้นสุด"
             />
           </div>
 
@@ -264,52 +309,69 @@ export default function BookingsPage() {
               <table className="min-w-full divide-y divide-gray-200">
                 <thead className="bg-gray-50">
                   <tr>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                       เลขที่จอง
                     </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      วันที่จอง
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      ลูกค้า
                     </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      วันเข้าพัก
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      เช็คอิน
                     </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      วันออก
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      เช็คเอาท์
                     </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      ชื่อลูกค้า
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      ห้องพัก
                     </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      สถานะ
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      ประเภทห้อง
+                    <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      ยอดรวม
                     </th>
                   </tr>
                 </thead>
                 <tbody className="bg-white divide-y divide-gray-200">
                   {bookings.map((booking) => (
-                    <tr key={booking.Book_No} className="hover:bg-gray-50 transition-colors">
-                      <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-blue-600">
-                        {booking.Book_No}
+                    <tr
+                      key={booking.bookNo}
+                      onClick={() => setSelectedBookNo(booking.bookNo)}
+                      className="hover:bg-blue-50 cursor-pointer transition-colors"
+                    >
+                      <td className="px-4 py-4 whitespace-nowrap">
+                        <div className="flex flex-col">
+                          <span className="text-sm font-medium text-blue-600">
+                            {booking.bookNo}
+                          </span>
+                          {getStatusBadge(booking.status)}
+                        </div>
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                        {formatDate(booking.Book_Date)}
+                      <td className="px-4 py-4 whitespace-nowrap">
+                        <span className="text-sm text-gray-900">
+                          {booking.customer.name || '-'}
+                        </span>
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                        {formatDate(booking.Book_Date_in)}
+                      <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-900">
+                        {formatDate(booking.checkIn)}
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                        {formatDate(booking.Book_Date_out)}
+                      <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-900">
+                        {formatDate(booking.checkOut)}
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                        {booking.Book_Cust_Name}
+                      <td className="px-4 py-4 whitespace-nowrap">
+                        <div className="flex items-center gap-2">
+                          <BedDouble size={16} className="text-gray-400" />
+                          <div className="flex flex-col">
+                            <span className="text-sm text-gray-900">
+                              {getRoomsDisplay(booking.rooms)}
+                            </span>
+                            <span className="text-xs text-gray-500">
+                              {booking.roomCount} ห้อง
+                            </span>
+                          </div>
+                        </div>
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        {getStatusBadge(booking.Book_Status)}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                        {booking.Book_Room_Type}
+                      <td className="px-4 py-4 whitespace-nowrap text-right">
+                        <span className="text-sm font-medium text-blue-600">
+                          ฿{formatCurrency(booking.totalAmount)}
+                        </span>
                       </td>
                     </tr>
                   ))}
@@ -403,6 +465,12 @@ export default function BookingsPage() {
           </>
         )}
       </div>
+
+      {/* Detail Drawer */}
+      <BookingDetailDrawer
+        bookNo={selectedBookNo}
+        onClose={() => setSelectedBookNo(null)}
+      />
     </div>
   )
 }
