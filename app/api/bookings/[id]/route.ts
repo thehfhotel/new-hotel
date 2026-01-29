@@ -35,15 +35,12 @@ export async function GET(
         Book_Date,
         Book_Date_in,
         Book_Date_out,
-        Book_Cust_ID,
         Book_Cust_Name,
         Book_Status,
-        Book_Room_No,
-        Book_Room_Type,
-        Book_Total
+        Book_Room_Type
       FROM View_Booking_Ds
       WHERE Book_No = @bookNo
-      ORDER BY Book_Room_No
+      ORDER BY Book_Room_Type
     `);
 
     if (bookingResult.recordset.length === 0) {
@@ -56,39 +53,10 @@ export async function GET(
     const records = bookingResult.recordset;
     const firstRecord = records[0];
 
-    // Fetch customer details if we have a customer ID
-    let customerDetails = null;
-    if (firstRecord.Book_Cust_ID) {
-      const customerRequest = pool.request();
-      customerRequest.input('custId', sql.NVarChar, firstRecord.Book_Cust_ID);
-
-      const customerResult = await customerRequest.query(`
-        SELECT
-          Cust_no,
-          Cust_Fname,
-          Cust_Lname,
-          Cust_Phone,
-          Cust_IDcard,
-          Cust_Addr,
-          Cust_Type
-        FROM View_Customers
-        WHERE Cust_no = @custId
-      `);
-
-      if (customerResult.recordset.length > 0) {
-        const c = customerResult.recordset[0];
-        customerDetails = {
-          id: c.Cust_no,
-          firstName: c.Cust_Fname || '',
-          lastName: c.Cust_Lname || '',
-          fullName: `${c.Cust_Fname || ''} ${c.Cust_Lname || ''}`.trim(),
-          phone: c.Cust_Phone || '',
-          idCard: c.Cust_IDcard || '',
-          address: c.Cust_Addr || '',
-          type: c.Cust_Type || 'Regular',
-        };
-      }
-    }
+    // Customer info from booking (no separate lookup since Book_Cust_ID not available)
+    const customerDetails = {
+      fullName: firstRecord.Book_Cust_Name || '',
+    };
 
     // Try to fetch notes (table may not exist yet)
     let notes: { id: number; text: string; createdAt: Date; updatedAt: Date }[] = [];
@@ -116,12 +84,10 @@ export async function GET(
 
     // Build rooms array
     const rooms = records.map(r => ({
-      roomNo: r.Book_Room_No || '-',
+      roomNo: '-',
       roomType: r.Book_Room_Type || '-',
-      total: r.Book_Total || 0,
+      total: 0,
     }));
-
-    const totalAmount = rooms.reduce((sum, r) => sum + r.total, 0);
 
     const booking = {
       bookNo: firstRecord.Book_No,
@@ -130,13 +96,10 @@ export async function GET(
       checkOut: firstRecord.Book_Date_out,
       status: mapStatus(firstRecord.Book_Status),
       statusCode: firstRecord.Book_Status,
-      customer: customerDetails || {
-        id: firstRecord.Book_Cust_ID || '',
-        fullName: firstRecord.Book_Cust_Name || '',
-      },
+      customer: customerDetails,
       rooms,
       roomCount: rooms.length,
-      totalAmount,
+      totalAmount: 0,
       notes,
     };
 
