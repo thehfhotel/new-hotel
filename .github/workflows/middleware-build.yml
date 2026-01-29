@@ -1,0 +1,106 @@
+name: Build Thai ID Middleware
+
+on:
+  push:
+    paths:
+      - 'thai-id-middleware/**'
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: 'Release version (e.g., v1.0.0) - leave empty to skip release'
+        required: false
+        type: string
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        working-directory: thai-id-middleware
+        run: npm install
+
+      - name: Build Windows executable
+        working-directory: thai-id-middleware
+        run: npm run build:win
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: thai-id-middleware/dist/*.exe
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        working-directory: thai-id-middleware
+        run: npm install
+
+      - name: Build macOS executable
+        working-directory: thai-id-middleware
+        run: npm run build:mac
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-build
+          path: thai-id-middleware/dist/*.dmg
+
+  release:
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    if: github.event.inputs.release_version != ''
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-build
+          path: dist
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-build
+          path: dist
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: middleware-${{ github.event.inputs.release_version }}
+          name: Thai ID Middleware ${{ github.event.inputs.release_version }}
+          body: |
+            ## Thai ID Middleware ${{ github.event.inputs.release_version }}
+
+            ### Downloads
+            - **Windows**: `thai-id-middleware-*-win.exe` - Portable executable, no installation required
+            - **macOS**: `thai-id-middleware-*-mac.dmg` - Disk image, drag to Applications
+
+            ### Usage
+            1. Download the file for your operating system
+            2. Run the application
+            3. The middleware will start on port 9898
+            4. Open the card reader page in your browser
+          files: dist/*
+          draft: false
+          prerelease: false
