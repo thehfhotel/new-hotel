@@ -18,7 +18,6 @@ import BookingDetailDrawer from '@/components/BookingDetailDrawer'
 interface Room {
   roomNo: string
   roomType: string
-  total: number
 }
 
 interface GroupedBooking {
@@ -27,12 +26,10 @@ interface GroupedBooking {
   checkIn: string
   checkOut: string
   customer: {
-    id: string
     name: string
   }
   status: string
   rooms: Room[]
-  totalAmount: number
   roomCount: number
 }
 
@@ -73,14 +70,6 @@ function formatDate(dateString: string): string {
     year: '2-digit',
     timeZone: 'UTC',
   })
-}
-
-// Format currency helper
-function formatCurrency(amount: number): string {
-  if (amount >= 1000) {
-    return `${(amount / 1000).toFixed(amount % 1000 === 0 ? 0 : 1)}K`
-  }
-  return amount.toString()
 }
 
 export default function BookingsPage() {
@@ -324,9 +313,6 @@ export default function BookingsPage() {
                     <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                       ห้องพัก
                     </th>
-                    <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      ยอดรวม
-                    </th>
                   </tr>
                 </thead>
                 <tbody className="bg-white divide-y divide-gray-200">
@@ -367,11 +353,6 @@ export default function BookingsPage() {
                             </span>
                           </div>
                         </div>
-                      </td>
-                      <td className="px-4 py-4 whitespace-nowrap text-right">
-                        <span className="text-sm font-medium text-blue-600">
-                          ฿{formatCurrency(booking.totalAmount)}
-                        </span>
                       </td>
                     </tr>
                   ))}

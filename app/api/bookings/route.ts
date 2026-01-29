@@ -8,18 +8,15 @@ interface RoomRecord {
   Book_Date: Date;
   Book_Date_in: Date;
   Book_Date_out: Date;
-  Book_Cust_ID: string;
   Book_Cust_Name: string;
   Book_Status: string | number;
   Book_Room_No: string;
   Book_Room_Type: string;
-  Book_Total: number;
 }
 
 interface Room {
   roomNo: string;
   roomType: string;
-  total: number;
 }
 
 interface GroupedBooking {
@@ -28,12 +25,10 @@ interface GroupedBooking {
   checkIn: Date;
   checkOut: Date;
   customer: {
-    id: string;
     name: string;
   };
   status: string;
   rooms: Room[];
-  totalAmount: number;
   roomCount: number;
 }
 
@@ -65,12 +60,10 @@ function groupByBookNo(records: RoomRecord[]): GroupedBooking[] {
         checkIn: record.Book_Date_in,
         checkOut: record.Book_Date_out,
         customer: {
-          id: record.Book_Cust_ID || '',
           name: record.Book_Cust_Name || '',
         },
         status: mapStatus(record.Book_Status),
         rooms: [],
-        totalAmount: 0,
         roomCount: 0,
       });
     }
@@ -79,9 +72,7 @@ function groupByBookNo(records: RoomRecord[]): GroupedBooking[] {
     booking.rooms.push({
       roomNo: record.Book_Room_No || '-',
       roomType: record.Book_Room_Type || '-',
-      total: record.Book_Total || 0,
     });
-    booking.totalAmount += record.Book_Total || 0;
     booking.roomCount = booking.rooms.length;
   }
 
@@ -191,12 +182,10 @@ export async function GET(request: NextRequest) {
         Book_Date,
         Book_Date_in,
         Book_Date_out,
-        Book_Cust_ID,
         Book_Cust_Name,
         Book_Status,
         Book_Room_No,
-        Book_Room_Type,
-        Book_Total
+        Book_Room_Type
       FROM View_Booking_Ds
       WHERE Book_No IN (${bookNoParams})
       ORDER BY ${safeSortBy} ${safeSortOrder}, Book_Room_No
