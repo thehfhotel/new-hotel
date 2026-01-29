@@ -11,6 +11,10 @@ interface ApiBooking {
   checkIn: string
   checkOut: string
   status: string
+  customer: {
+    name: string
+  }
+  roomCount: number
 }
 
 interface ApiCheckIn {
@@ -174,7 +178,11 @@ export default function CalendarPage() {
         checkOut,
         type: 'booking',
         nights,
+        bookNo: booking.bookNo,
         bookDate: booking.bookDate ? parseISO(booking.bookDate) : undefined,
+        customerName: booking.customer?.name,
+        status: booking.status,
+        roomCount: booking.roomCount,
       })
     })
 
