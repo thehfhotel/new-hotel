@@ -174,18 +174,6 @@ export default function BookingsPage() {
       : <ArrowDown size={14} className="text-blue-600" />
   }
 
-  // Get rooms display - show room types
-  const getRoomsDisplay = (rooms: Room[]) => {
-    const types = rooms.map(r => r.roomType).filter(r => r !== '-')
-    if (types.length === 0) return '-'
-    // Count unique types
-    const typeCounts = types.reduce((acc, t) => {
-      acc[t] = (acc[t] || 0) + 1
-      return acc
-    }, {} as Record<string, number>)
-    return Object.entries(typeCounts).map(([t, c]) => c > 1 ? `${t} x${c}` : t).join(', ')
-  }
-
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -403,15 +391,10 @@ export default function BookingsPage() {
                       </td>
                       <td className="px-3 py-3">
                         <div className="flex items-center gap-1">
-                          <BedDouble size={14} className="text-gray-400 hidden sm:block" />
-                          <div className="flex flex-col">
-                            <span className="text-sm text-gray-900 truncate">
-                              {getRoomsDisplay(booking.rooms)}
-                            </span>
-                            <span className="text-xs text-gray-500">
-                              {booking.roomCount} ห้อง
-                            </span>
-                          </div>
+                          <BedDouble size={14} className="text-gray-400" />
+                          <span className="text-sm text-gray-900">
+                            {booking.roomCount}
+                          </span>
                         </div>
                       </td>
                     </tr>
