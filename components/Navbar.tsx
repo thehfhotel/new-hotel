@@ -37,13 +37,13 @@ export default function Navbar() {
       <div className="container mx-auto px-4">
         <div className="flex items-center justify-between h-16">
           {/* Logo and Hotel Name */}
-          <Link href="/" className="flex items-center space-x-3">
+          <Link href="/" className="flex items-center space-x-3 whitespace-nowrap">
             <Hotel size={32} className="text-blue-200" />
-            <span className="text-xl font-bold">ระบบจัดการโรงแรม</span>
+            <span className="hidden md:inline text-xl font-bold">ระบบจัดการโรงแรม</span>
           </Link>
 
           {/* Navigation Links */}
-          <div className="flex items-center space-x-1">
+          <div className="flex items-center space-x-1 whitespace-nowrap">
             {navLinks.map((link) => {
               const isActive = pathname === link.href
               return (
