@@ -157,7 +157,7 @@ export default function Dashboard() {
           if (occupancyResult.success && occupancyResult.data) {
             // Format dates for display
             const formattedData: OccupancyData[] = occupancyResult.data.map((item: { date: string; occupiedRooms: number }) => ({
-              date: new Date(item.date).toLocaleDateString('th-TH', { day: 'numeric', month: 'short' }),
+              date: new Date(item.date).toLocaleDateString('th-TH', { day: 'numeric', month: 'short', timeZone: 'UTC' }),
               occupiedRooms: item.occupiedRooms || 0,
             }))
             setOccupancyData(formattedData)
