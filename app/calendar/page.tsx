@@ -4,6 +4,7 @@ import { useState, useEffect, useMemo } from 'react'
 import { parseISO, differenceInDays } from 'date-fns'
 import { Calendar as CalendarIcon } from 'lucide-react'
 import StayTimeline, { Stay } from '@/components/StayTimeline'
+import { startOfMonth, endOfMonth } from 'date-fns'
 
 interface ApiBooking {
   bookNo: string
@@ -19,7 +20,7 @@ interface ApiCheckIn {
 }
 
 export default function CalendarPage() {
-  const [selectedMonth, setSelectedMonth] = useState(new Date())
+  const [selectedDate, setSelectedDate] = useState(new Date())
   const [bookings, setBookings] = useState<ApiBooking[]>([])
   const [checkins, setCheckins] = useState<ApiCheckIn[]>([])
   const [loading, setLoading] = useState(true)
@@ -29,12 +30,10 @@ export default function CalendarPage() {
     const fetchData = async () => {
       setLoading(true)
       try {
-        const year = selectedMonth.getFullYear()
-        const month = selectedMonth.getMonth()
-
-        // Get first day of previous month and last day of next month for overlap
-        const startDate = new Date(year, month - 1, 1).toISOString().split('T')[0]
-        const endDate = new Date(year, month + 2, 0).toISOString().split('T')[0]
+        // Get 3 months of data centered on selected date for smooth navigation
+        const monthStart = startOfMonth(selectedDate)
+        const startDate = new Date(monthStart.getFullYear(), monthStart.getMonth() - 1, 1).toISOString().split('T')[0]
+        const endDate = new Date(monthStart.getFullYear(), monthStart.getMonth() + 2, 0).toISOString().split('T')[0]
 
         const [bookingsRes, checkinsRes] = await Promise.all([
           fetch(`/api/bookings?startDate=${startDate}&endDate=${endDate}&limit=1000`),
@@ -58,7 +57,7 @@ export default function CalendarPage() {
     }
 
     fetchData()
-  }, [selectedMonth])
+  }, [selectedDate])
 
   // Transform API data to Stay format
   const stays: Stay[] = useMemo(() => {
@@ -131,8 +130,8 @@ export default function CalendarPage() {
       ) : (
         <StayTimeline
           stays={stays}
-          selectedMonth={selectedMonth}
-          onMonthChange={setSelectedMonth}
+          selectedDate={selectedDate}
+          onDateChange={setSelectedDate}
         />
       )}
     </div>

@@ -5,10 +5,18 @@ import {
   format,
   startOfMonth,
   endOfMonth,
+  startOfWeek,
+  endOfWeek,
   eachDayOfInterval,
   differenceInDays,
   isSameDay,
   isWithinInterval,
+  addDays,
+  addWeeks,
+  addMonths,
+  subDays,
+  subWeeks,
+  subMonths,
 } from 'date-fns'
 import { ChevronLeft, ChevronRight, Calendar } from 'lucide-react'
 
@@ -28,16 +36,20 @@ interface StayBar {
   count: number
 }
 
+type ViewMode = 'day' | 'week' | 'month'
+
 interface StayTimelineProps {
   stays: Stay[]
-  selectedMonth: Date
-  onMonthChange: (date: Date) => void
+  selectedDate: Date
+  onDateChange: (date: Date) => void
 }
 
 const THAI_MONTHS = [
   'มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน',
   'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม',
 ]
+
+const THAI_DAYS_SHORT = ['อา', 'จ', 'อ', 'พ', 'พฤ', 'ศ', 'ส']
 
 const NIGHT_COLORS: Record<number, string> = {
   1: 'bg-sky-400',
@@ -56,27 +68,54 @@ function getNightColor(nights: number): string {
 
 export default function StayTimeline({
   stays,
-  selectedMonth,
-  onMonthChange,
+  selectedDate,
+  onDateChange,
 }: StayTimelineProps) {
+  const [viewMode, setViewMode] = useState<ViewMode>('month')
   const [hoveredBar, setHoveredBar] = useState<string | null>(null)
 
-  const monthStart = startOfMonth(selectedMonth)
-  const monthEnd = endOfMonth(selectedMonth)
-  const daysInMonth = eachDayOfInterval({ start: monthStart, end: monthEnd })
-  const totalDays = daysInMonth.length
+  // Calculate date range based on view mode
+  const { rangeStart, rangeEnd, days } = useMemo(() => {
+    let start: Date, end: Date
+
+    switch (viewMode) {
+      case 'day':
+        start = selectedDate
+        end = selectedDate
+        break
+      case 'week':
+        start = startOfWeek(selectedDate, { weekStartsOn: 0 })
+        end = endOfWeek(selectedDate, { weekStartsOn: 0 })
+        break
+      case 'month':
+      default:
+        start = startOfMonth(selectedDate)
+        end = endOfMonth(selectedDate)
+        break
+    }
+
+    return {
+      rangeStart: start,
+      rangeEnd: end,
+      days: eachDayOfInterval({ start, end }),
+    }
+  }, [selectedDate, viewMode])
+
+  const totalDays = days.length
+
+  // Filter stays that overlap with current range
+  const visibleStays = useMemo(() => {
+    return stays.filter(stay =>
+      stay.checkOut >= rangeStart && stay.checkIn <= rangeEnd
+    )
+  }, [stays, rangeStart, rangeEnd])
 
   // Group stays by night count, then aggregate by check-in date
   const staysByNight = useMemo(() => {
     const groups: Record<number, StayBar[]> = {}
-
-    // First, aggregate stays by (nights, checkIn date)
     const aggregated = new Map<string, StayBar>()
 
-    stays.forEach(stay => {
-      // Only include stays that overlap with current month
-      if (stay.checkOut < monthStart || stay.checkIn > monthEnd) return
-
+    visibleStays.forEach(stay => {
       const key = `${stay.nights}_${format(stay.checkIn, 'yyyy-MM-dd')}`
 
       if (!aggregated.has(key)) {
@@ -91,7 +130,6 @@ export default function StayTimeline({
       aggregated.get(key)!.count++
     })
 
-    // Group by night count
     aggregated.forEach(bar => {
       if (!groups[bar.nights]) {
         groups[bar.nights] = []
@@ -99,23 +137,19 @@ export default function StayTimeline({
       groups[bar.nights].push(bar)
     })
 
-    // Sort bars within each group by check-in date
     Object.values(groups).forEach(bars => {
       bars.sort((a, b) => a.checkIn.getTime() - b.checkIn.getTime())
     })
 
     return groups
-  }, [stays, monthStart, monthEnd])
+  }, [visibleStays])
 
-  // Get sorted night counts (1, 2, 3, etc.)
-  const nightCounts = Object.keys(staysByNight)
-    .map(Number)
-    .sort((a, b) => a - b)
+  const nightCounts = Object.keys(staysByNight).map(Number).sort((a, b) => a - b)
 
-  // Calculate daily occupancy for heat bar
+  // Calculate daily occupancy
   const dailyOccupancy = useMemo(() => {
     const occupancy: Record<string, number> = {}
-    daysInMonth.forEach(day => {
+    days.forEach(day => {
       const dateKey = format(day, 'yyyy-MM-dd')
       occupancy[dateKey] = stays.filter(stay => {
         return isWithinInterval(day, { start: stay.checkIn, end: stay.checkOut }) ||
@@ -123,16 +157,16 @@ export default function StayTimeline({
       }).length
     })
     return occupancy
-  }, [stays, daysInMonth])
+  }, [stays, days])
 
   const maxOccupancy = Math.max(...Object.values(dailyOccupancy), 1)
 
   // Calculate bar position
   const getBarStyle = (bar: StayBar) => {
-    const stayStart = Math.max(bar.checkIn.getTime(), monthStart.getTime())
-    const stayEnd = Math.min(bar.checkOut.getTime(), monthEnd.getTime())
+    const stayStart = Math.max(bar.checkIn.getTime(), rangeStart.getTime())
+    const stayEnd = Math.min(bar.checkOut.getTime(), rangeEnd.getTime())
 
-    const startOffset = differenceInDays(new Date(stayStart), monthStart)
+    const startOffset = differenceInDays(new Date(stayStart), rangeStart)
     const duration = differenceInDays(new Date(stayEnd), new Date(stayStart)) + 1
 
     const leftPercent = (startOffset / totalDays) * 100
@@ -140,75 +174,138 @@ export default function StayTimeline({
 
     return {
       left: `${leftPercent}%`,
-      width: `${Math.max(widthPercent, 2.5)}%`,
+      width: `${Math.max(widthPercent, viewMode === 'month' ? 2.5 : 8)}%`,
     }
   }
 
   // Stats
   const stats = useMemo(() => {
-    const total = stays.length
-    const totalNights = stays.reduce((sum, s) => sum + s.nights, 0)
+    const total = visibleStays.length
+    const totalNights = visibleStays.reduce((sum, s) => sum + s.nights, 0)
     const avgStay = total > 0 ? (totalNights / total).toFixed(1) : '0'
     return { total, totalNights, avgStay }
-  }, [stays])
+  }, [visibleStays])
 
-  const prevMonth = () => {
-    onMonthChange(new Date(selectedMonth.getFullYear(), selectedMonth.getMonth() - 1, 1))
+  // Navigation
+  const navigate = (direction: 'prev' | 'next') => {
+    const mult = direction === 'prev' ? -1 : 1
+    switch (viewMode) {
+      case 'day':
+        onDateChange(addDays(selectedDate, mult))
+        break
+      case 'week':
+        onDateChange(addWeeks(selectedDate, mult))
+        break
+      case 'month':
+        onDateChange(addMonths(selectedDate, mult))
+        break
+    }
   }
 
-  const nextMonth = () => {
-    onMonthChange(new Date(selectedMonth.getFullYear(), selectedMonth.getMonth() + 1, 1))
+  // Format header title based on view mode
+  const getHeaderTitle = () => {
+    switch (viewMode) {
+      case 'day':
+        return `${selectedDate.getDate()} ${THAI_MONTHS[selectedDate.getMonth()]} ${selectedDate.getFullYear() + 543}`
+      case 'week':
+        return `${format(rangeStart, 'd')} - ${format(rangeEnd, 'd')} ${THAI_MONTHS[rangeEnd.getMonth()]} ${rangeEnd.getFullYear() + 543}`
+      case 'month':
+      default:
+        return `${THAI_MONTHS[selectedDate.getMonth()]} ${selectedDate.getFullYear() + 543}`
+    }
   }
 
   return (
     <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
       {/* Header */}
       <div className="flex items-center justify-between p-4 border-b bg-gray-50">
-        <button onClick={prevMonth} className="p-2 hover:bg-gray-200 rounded-full">
+        <button onClick={() => navigate('prev')} className="p-2 hover:bg-gray-200 rounded-full">
           <ChevronLeft className="w-5 h-5" />
         </button>
         <div className="text-center">
-          <h2 className="text-xl font-semibold text-gray-800">
-            {THAI_MONTHS[selectedMonth.getMonth()]} {selectedMonth.getFullYear() + 543}
-          </h2>
+          <h2 className="text-xl font-semibold text-gray-800">{getHeaderTitle()}</h2>
           <p className="text-sm text-gray-500">
             {stats.total} รายการ · {stats.totalNights} คืน · เฉลี่ย {stats.avgStay} คืน/ครั้ง
           </p>
         </div>
-        <button onClick={nextMonth} className="p-2 hover:bg-gray-200 rounded-full">
+        <button onClick={() => navigate('next')} className="p-2 hover:bg-gray-200 rounded-full">
           <ChevronRight className="w-5 h-5" />
         </button>
       </div>
 
-      {/* Occupancy Heat Bar */}
-      <div className="px-4 py-2 border-b bg-gray-50">
-        <div className="flex h-8 rounded overflow-hidden">
-          {daysInMonth.map(day => {
-            const dateKey = format(day, 'yyyy-MM-dd')
-            const count = dailyOccupancy[dateKey] || 0
-            const intensity = count / maxOccupancy
-            const isToday = isSameDay(day, new Date())
+      {/* View Mode Tabs */}
+      <div className="flex items-center justify-center gap-1 p-2 border-b bg-gray-50">
+        {(['day', 'week', 'month'] as ViewMode[]).map(mode => (
+          <button
+            key={mode}
+            onClick={() => setViewMode(mode)}
+            className={`px-4 py-1.5 text-sm rounded-lg transition-colors ${
+              viewMode === mode
+                ? 'bg-blue-600 text-white'
+                : 'text-gray-600 hover:bg-gray-200'
+            }`}
+          >
+            {mode === 'day' ? 'วัน' : mode === 'week' ? 'สัปดาห์' : 'เดือน'}
+          </button>
+        ))}
+      </div>
 
-            return (
-              <div
-                key={dateKey}
-                className={`flex-1 flex items-end justify-center relative group
-                  ${isToday ? 'ring-2 ring-blue-500 ring-inset z-10' : ''}`}
-                style={{
-                  backgroundColor: count > 0
-                    ? `rgba(59, 130, 246, ${0.15 + intensity * 0.6})`
-                    : '#f9fafb'
-                }}
-              >
-                <span className={`text-[9px] ${isToday ? 'font-bold text-blue-600' : 'text-gray-500'}`}>
-                  {day.getDate()}
-                </span>
-                <div className="absolute bottom-full mb-1 hidden group-hover:block bg-gray-800 text-white text-xs px-2 py-1 rounded whitespace-nowrap z-20">
-                  {format(day, 'd MMM')}: {count} ห้อง
+      {/* Day of Week Headers */}
+      <div className="px-4 pt-3">
+        <div className="flex">
+          <div className="w-16 flex-shrink-0" />
+          <div className="flex-1 flex">
+            {days.map(day => {
+              const isToday = isSameDay(day, new Date())
+              const isWeekend = day.getDay() === 0 || day.getDay() === 6
+              return (
+                <div
+                  key={day.toISOString()}
+                  className={`flex-1 text-center text-[10px] font-medium ${
+                    isToday ? 'text-blue-600' : isWeekend ? 'text-red-400' : 'text-gray-400'
+                  }`}
+                >
+                  {THAI_DAYS_SHORT[day.getDay()]}
                 </div>
-              </div>
-            )
-          })}
+              )
+            })}
+          </div>
+        </div>
+      </div>
+
+      {/* Occupancy Heat Bar with Date Numbers */}
+      <div className="px-4 py-1 border-b">
+        <div className="flex">
+          <div className="w-16 flex-shrink-0" />
+          <div className="flex-1 flex h-8 rounded overflow-hidden">
+            {days.map(day => {
+              const dateKey = format(day, 'yyyy-MM-dd')
+              const count = dailyOccupancy[dateKey] || 0
+              const intensity = count / maxOccupancy
+              const isToday = isSameDay(day, new Date())
+              const isWeekend = day.getDay() === 0 || day.getDay() === 6
+
+              return (
+                <div
+                  key={dateKey}
+                  className={`flex-1 flex items-end justify-center relative group
+                    ${isToday ? 'ring-2 ring-blue-500 ring-inset z-10' : ''}`}
+                  style={{
+                    backgroundColor: count > 0
+                      ? `rgba(59, 130, 246, ${0.15 + intensity * 0.6})`
+                      : isWeekend ? '#fef2f2' : '#f9fafb'
+                  }}
+                >
+                  <span className={`text-[10px] ${isToday ? 'font-bold text-blue-600' : 'text-gray-600'}`}>
+                    {day.getDate()}
+                  </span>
+                  <div className="absolute bottom-full mb-1 hidden group-hover:block bg-gray-800 text-white text-xs px-2 py-1 rounded whitespace-nowrap z-20">
+                    {format(day, 'd MMM')}: {count} ห้อง
+                  </div>
+                </div>
+              )
+            })}
+          </div>
         </div>
       </div>
 
@@ -217,7 +314,7 @@ export default function StayTimeline({
         {nightCounts.length === 0 ? (
           <div className="text-center py-8 text-gray-500">
             <Calendar className="w-10 h-10 mx-auto mb-2 text-gray-300" />
-            <p>ไม่มีข้อมูลในเดือนนี้</p>
+            <p>ไม่มีข้อมูลในช่วงนี้</p>
           </div>
         ) : (
           <div className="space-y-1">
@@ -227,15 +324,10 @@ export default function StayTimeline({
 
               return (
                 <div key={nights} className="flex items-center">
-                  {/* Y-axis label */}
                   <div className="w-16 flex-shrink-0 text-right pr-3">
-                    <span className="text-sm font-medium text-gray-600">
-                      {nights} คืน
-                    </span>
+                    <span className="text-sm font-medium text-gray-600">{nights} คืน</span>
                     <span className="text-xs text-gray-400 ml-1">({totalCount})</span>
                   </div>
-
-                  {/* Timeline row */}
                   <div className="flex-1 relative h-6 bg-gray-50 rounded">
                     {bars.map(bar => {
                       const style = getBarStyle(bar)
