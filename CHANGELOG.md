@@ -12,15 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Bookings now grouped by booking number (multi-room bookings show as single row)
   - Click any booking row to open detail drawer with full info
   - New booking notes feature - add, view, and delete notes per booking
-  - Shows all rooms in a booking with individual prices and room types
-  - Customer details section with link to customer page
+  - Shows all rooms in a booking with room types
+  - Customer details section
   - Enhanced search: search by booking number OR customer name
-  - Status filtering now functional
-  - Total amount calculated from all rooms in booking
 
 ### Changed
 - **API: /api/bookings** - Now returns grouped bookings instead of individual room records
-- **New API: /api/bookings/[id]** - Get single booking detail with customer info and notes
+- **New API: /api/bookings/[id]** - Get single booking detail with notes
 - **New API: /api/bookings/[id]/notes** - CRUD operations for booking notes
 - **New Component: BookingDetailDrawer** - Side drawer for comprehensive booking view
 - **Database: HT_Booking_Notes table** - Auto-created on first note addition
