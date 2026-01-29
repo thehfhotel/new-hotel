@@ -27,6 +27,25 @@ jobs:
         working-directory: thai-id-middleware
         run: npm install
 
+      - name: Generate icon from SVG
+        working-directory: thai-id-middleware
+        shell: pwsh
+        run: |
+          # Install Inkscape (has command-line SVG to PNG conversion)
+          choco install inkscape -y --no-progress
+          # Add Inkscape to PATH
+          $env:PATH = "C:\Program Files\Inkscape\bin;$env:PATH"
+          # Convert SVG to 512x512 PNG
+          inkscape --export-type=png --export-filename=icon.png --export-width=512 --export-height=512 icon.svg
+          # Verify icon was created
+          if (Test-Path icon.png) {
+            Write-Host "Icon generated successfully"
+            (Get-Item icon.png).Length
+          } else {
+            Write-Error "Failed to generate icon"
+            exit 1
+          }
+
       - name: Build Windows executable
         working-directory: thai-id-middleware
         run: npm run build:win
@@ -51,6 +70,22 @@ jobs:
       - name: Install dependencies
         working-directory: thai-id-middleware
         run: npm install
+
+      - name: Generate icon from SVG
+        working-directory: thai-id-middleware
+        run: |
+          # Install librsvg for SVG to PNG conversion
+          brew install librsvg
+          # Convert SVG to 512x512 PNG
+          rsvg-convert -w 512 -h 512 icon.svg -o icon.png
+          # Verify icon was created
+          if [ -f icon.png ]; then
+            echo "Icon generated successfully"
+            ls -la icon.png
+          else
+            echo "Failed to generate icon"
+            exit 1
+          fi
 
       - name: Build macOS executable
         working-directory: thai-id-middleware

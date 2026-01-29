@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.11.1] - 2026-01-29
+
+### Fixed
+- Middleware build workflow failing with "flate: corrupt input before offset 79" on both Windows and macOS
+- Root cause: icon.png was only 64x64 pixels, but electron-builder requires at least 512x512 for macOS and 256x256 for Windows
+- Solution: Updated icon.svg to 512x512 dimensions and added SVG-to-PNG conversion step in workflow
+  - macOS: Uses `librsvg` (`rsvg-convert`)
+  - Windows: Uses `Inkscape` CLI
+
+### Changed
+- Icon is now generated from SVG during CI/CD build instead of being committed as PNG
+- Updated `generate-icon.js` script with new 512x512 SVG design
+
 ## [1.11.0] - 2026-01-29
 
 ### Changed
