@@ -5,6 +5,112 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.11.0] - 2026-01-29
+
+### Changed
+- Thai ID Middleware distribution changed from source code (zip) to pre-built executables
+- Card reader download page now offers platform-specific downloads (Windows .exe, macOS .dmg)
+- Simplified installation: download and run, no npm required
+- Added macOS Gatekeeper bypass instructions for unsigned app (right-click → Open or System Settings → Privacy & Security)
+
+### Added
+- GitHub Actions workflow (`middleware-build.yml`) for automated cross-platform builds
+  - Builds Windows portable executable on `windows-latest`
+  - Builds macOS disk image on `macos-latest`
+  - Creates GitHub Release when manually triggered with version
+
+### Removed
+- `public/downloads/thai-id-middleware.zip` - replaced by GitHub Releases
+
+## [1.10.0] - 2026-01-29
+
+### Security
+- Fixed npm vulnerabilities in thai-id-middleware: updated electron (^40.0.0) and electron-builder (^26.6.0)
+
+### Added
+- Middleware download available from card reader page (`/card-reader`) - users can download the zip file directly from the web app
+- Thai ID Middleware Electron desktop app (`thai-id-middleware/`) for cross-platform Thai ID card reading
+  - GUI status display: HTTP server, reader connection, card insertion status
+  - HTTP server on localhost:9898 with `/health` and `/read` endpoints
+  - System tray support for background operation
+  - Cross-platform builds: Windows portable .exe, macOS .dmg, Linux .AppImage
+  - PC/SC smart card communication using @pcsclite/client
+  - Full Thai National ID card data reading: CID, names (Thai/English), DOB, gender, address, issue/expiry dates
+
+## [1.9.0] - 2026-01-29
+
+### Changed
+- Reverted card reader from WebUSB to middleware approach (WebUSB blocked for CCID devices)
+
+### Removed
+- WebUSB card reader module (browser security prevents access to smart card readers)
+
+## [1.8.0] - 2026-01-29
+
+### Changed
+- Card reader middleware URL is now configurable via `NEXT_PUBLIC_CARD_READER_URL` environment variable (build-time)
+
+### Added
+- Thai ID Card Reader POC page (`/card-reader`) for reading guest information from Thai national ID cards
+- Connects to local middleware service on `localhost:9898` for PC/SC card reader communication
+- Displays all card data: citizen ID, Thai/English names, birth date, gender, address, issue/expiry dates, and photo
+- Connection status indicator with automatic health checks
+- Setup instructions displayed when middleware is not running
+- "ใช้ข้อมูลนี้" button for future check-in integration
+- New "อ่านบัตร" navigation link in navbar
+
+## [1.7.3] - 2026-01-29
+
+### Changed
+- Rooms page detail panel now displays Room_Group, Room_Book_Name (ผู้จอง), and all price tiers (A, B, C)
+- Updated GuestInfo interface to match API response (`checkIn`/`checkOut` instead of `checkInDate`/`checkOutDate`)
+- fetchRoomDetail now correctly handles new `/api/rooms/[id]` response structure
+
+## [1.7.2] - 2026-01-29
+
+### Added
+- Room detail endpoint `/api/rooms/[id]` returning room details with current guest information from check-in records
+- Additional room fields in `/api/rooms` API: `Room_PriceA`, `Room_PriceB`, `Room_PriceC`, `Room_Group`, `Room_Book_Name`
+
+### Changed
+- Room interface updated to use actual database column names (`Room_PriceA` instead of `Room_Price`, `Room_Group` instead of `Room_Floor`)
+
+## [1.7.1] - 2026-01-28
+
+### Fixed
+- Customer API failing with "Invalid column name 'Book_Cust_No'" when `includeLastVisit=true` - changed to correct column name `Book_Cust_ID`
+- Customer bookings API (`/api/customers/[id]/bookings`) using wrong column `Book_Cust_No` - changed to `Book_Cust_ID`
+- Customer stats API (`/api/customers/[id]/stats`) using wrong columns - changed `Book_Cust_No` to `Book_Cust_ID` and `Cin_Cust_No` to `Cin_cust_no` (case-sensitive)
+- Parameter types changed from `sql.Int` to `sql.NVarChar` since customer IDs are strings like "C0001"
+
+## [1.7.0] - 2026-01-28
+
+### Added
+- Server-side sorting for customers table - sorts the entire dataset, not just the visible page
+- "Last Visit" column in customers table showing each customer's most recent checkout date
+- DataTable component now supports controlled server-side sorting via `onSort`, `sortColumn`, and `sortDirection` props
+
+### Changed
+- Customers API now accepts `sortBy` and `sortOrder` query parameters for server-side sorting
+- Customers API supports optional `includeLastVisit=true` parameter to include last visit dates
+
+## [1.6.9] - 2026-01-28
+
+### Fixed
+- Slack notification times displaying 7 hours ahead - now uses UTC for database dates (which store local Thai time) and Asia/Bangkok for current timestamps
+
+## [1.6.8] - 2026-01-28
+
+### Added
+- Customer statistics cards in detail modal showing: total bookings, total stays, first/last visit dates, favorite room type, and average stay duration
+- New API endpoint `/api/customers/[id]/stats` for customer statistics
+- New API endpoint `/api/customers/[id]/bookings` for customer booking history
+
+## [1.6.7] - 2026-01-28
+
+### Changed
+- Customer search now supports multiple fields: name, phone number, ID card (13-digit), and customer ID
+
 ## [1.6.6] - 2026-01-28
 
 ### Added

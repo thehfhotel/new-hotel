@@ -29,15 +29,17 @@ interface Room {
   Room_Clean: boolean
   Room_Use: boolean
   Room_Manternace: boolean
-  Room_Price?: number
-  Room_Floor?: string
+  Room_PriceA?: number
+  Room_PriceB?: number
+  Room_PriceC?: number
+  Room_Group?: string
+  Room_Book_Name?: string
 }
 
 interface GuestInfo {
   name: string
-  checkInDate: string
-  checkOutDate: string
-  bookingNo: string
+  checkIn: string
+  checkOut: string
 }
 
 interface RoomHistory {
@@ -47,9 +49,10 @@ interface RoomHistory {
 }
 
 interface RoomDetail {
-  room: Room
+  success?: boolean
+  room?: Room & { currentGuest?: GuestInfo }
   currentGuest?: GuestInfo
-  recentHistory: RoomHistory[]
+  recentHistory?: RoomHistory[]
 }
 
 // Status configuration
@@ -135,25 +138,21 @@ export default function RoomsPage() {
 
       if (response.ok) {
         const data = await response.json()
-        setRoomDetail(data)
+        // Map API response to RoomDetail structure
+        if (data.success && data.room) {
+          setRoomDetail({
+            room: data.room,
+            currentGuest: data.room.currentGuest,
+            recentHistory: [],
+          })
+        } else {
+          setRoomDetail({ room, recentHistory: [] })
+        }
       } else {
-        // If detail API doesn't exist, create mock detail
-        setRoomDetail({
-          room,
-          currentGuest: room.Room_Status === 'Occupied' || room.Room_Status === 'มีผู้เข้าพัก' ? {
-            name: 'ข้อมูลไม่พร้อมใช้งาน',
-            checkInDate: new Date().toISOString(),
-            checkOutDate: new Date().toISOString(),
-            bookingNo: '-',
-          } : undefined,
-          recentHistory: [],
-        })
+        setRoomDetail({ room, recentHistory: [] })
       }
     } catch {
-      setRoomDetail({
-        room,
-        recentHistory: [],
-      })
+      setRoomDetail({ room, recentHistory: [] })
     } finally {
       setLoadingDetail(false)
     }
@@ -504,10 +503,41 @@ export default function RoomsPage() {
                         {getStatusConfig(selectedRoom.Room_Status).label}
                       </span>
                     </div>
-                    {selectedRoom.Room_Price && (
+                    {selectedRoom.Room_Group && (
                       <div className="flex justify-between">
-                        <span className="text-sm text-gray-600">ราคา:</span>
-                        <span className="text-sm font-medium">{selectedRoom.Room_Price.toLocaleString()} บาท</span>
+                        <span className="text-sm text-gray-600">กลุ่ม:</span>
+                        <span className="text-sm font-medium">{selectedRoom.Room_Group}</span>
+                      </div>
+                    )}
+                    {selectedRoom.Room_Book_Name && (
+                      <div className="flex justify-between">
+                        <span className="text-sm text-gray-600">ผู้จอง:</span>
+                        <span className="text-sm font-medium">{selectedRoom.Room_Book_Name}</span>
+                      </div>
+                    )}
+                    {(selectedRoom.Room_PriceA || selectedRoom.Room_PriceB || selectedRoom.Room_PriceC) && (
+                      <div className="mt-2 pt-2 border-t border-gray-200">
+                        <span className="text-sm text-gray-600 font-medium">ราคาห้อง:</span>
+                        <div className="mt-1 space-y-1">
+                          {selectedRoom.Room_PriceA && (
+                            <div className="flex justify-between">
+                              <span className="text-xs text-gray-500">ราคา A:</span>
+                              <span className="text-sm font-medium">{selectedRoom.Room_PriceA.toLocaleString()} บาท</span>
+                            </div>
+                          )}
+                          {selectedRoom.Room_PriceB && (
+                            <div className="flex justify-between">
+                              <span className="text-xs text-gray-500">ราคา B:</span>
+                              <span className="text-sm font-medium">{selectedRoom.Room_PriceB.toLocaleString()} บาท</span>
+                            </div>
+                          )}
+                          {selectedRoom.Room_PriceC && (
+                            <div className="flex justify-between">
+                              <span className="text-xs text-gray-500">ราคา C:</span>
+                              <span className="text-sm font-medium">{selectedRoom.Room_PriceC.toLocaleString()} บาท</span>
+                            </div>
+                          )}
+                        </div>
                       </div>
                     )}
                   </div>
@@ -568,16 +598,12 @@ export default function RoomsPage() {
                         <span className="text-sm font-medium">{roomDetail.currentGuest.name}</span>
                       </div>
                       <div className="flex justify-between">
-                        <span className="text-sm text-gray-600">เลขที่จอง:</span>
-                        <span className="text-sm font-medium text-blue-600">{roomDetail.currentGuest.bookingNo}</span>
-                      </div>
-                      <div className="flex justify-between">
                         <span className="text-sm text-gray-600">วันเข้าพัก:</span>
-                        <span className="text-sm font-medium">{formatDate(roomDetail.currentGuest.checkInDate)}</span>
+                        <span className="text-sm font-medium">{formatDate(roomDetail.currentGuest.checkIn)}</span>
                       </div>
                       <div className="flex justify-between">
                         <span className="text-sm text-gray-600">วันออก:</span>
-                        <span className="text-sm font-medium">{formatDate(roomDetail.currentGuest.checkOutDate)}</span>
+                        <span className="text-sm font-medium">{formatDate(roomDetail.currentGuest.checkOut)}</span>
                       </div>
                     </div>
                   </div>

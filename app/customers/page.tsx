@@ -2,16 +2,17 @@
 
 import { useState, useEffect, useCallback } from 'react'
 import { format } from 'date-fns'
-import { X, Users, Search, User, Phone, CreditCard, MapPin, Calendar, Home } from 'lucide-react'
+import { X, Users, Search, User, Phone, CreditCard, MapPin, Calendar, Home, CalendarDays, TrendingUp, Clock, Star } from 'lucide-react'
 import DataTable, { Column, PaginationInfo } from '@/components/DataTable'
 
 interface Customer {
-  id: number
+  id: string
   name: string
   type: string
   phone: string
   idCard: string
   address: string
+  lastVisit: string | null
 }
 
 interface BookingHistory {
@@ -22,6 +23,15 @@ interface BookingHistory {
   checkOutDate: string
   status: string
   totalAmount: number
+}
+
+interface CustomerStats {
+  totalBookings: number
+  totalStays: number
+  firstVisit: string | null
+  lastVisit: string | null
+  favoriteRoomType: string | null
+  avgStayDays: number | null
 }
 
 const ITEMS_PER_PAGE = 20
@@ -37,11 +47,15 @@ export default function CustomersPage() {
     totalItems: 0,
     itemsPerPage: ITEMS_PER_PAGE,
   })
+  const [sortBy, setSortBy] = useState<string | null>(null)
+  const [sortOrder, setSortOrder] = useState<'asc' | 'desc' | null>(null)
 
   // Selected customer for modal
   const [selectedCustomer, setSelectedCustomer] = useState<Customer | null>(null)
   const [bookingHistory, setBookingHistory] = useState<BookingHistory[]>([])
   const [loadingHistory, setLoadingHistory] = useState(false)
+  const [customerStats, setCustomerStats] = useState<CustomerStats | null>(null)
+  const [loadingStats, setLoadingStats] = useState(false)
   const [showModal, setShowModal] = useState(false)
 
   // Debounce search input
@@ -61,10 +75,16 @@ export default function CustomersPage() {
       const params = new URLSearchParams({
         page: pagination.currentPage.toString(),
         limit: ITEMS_PER_PAGE.toString(),
+        includeLastVisit: 'true',
       })
 
       if (debouncedSearch) {
         params.append('search', debouncedSearch)
+      }
+
+      if (sortBy && sortOrder) {
+        params.append('sortBy', sortBy)
+        params.append('sortOrder', sortOrder)
       }
 
       const response = await fetch(`/api/customers?${params}`)
@@ -82,14 +102,14 @@ export default function CustomersPage() {
     } finally {
       setLoading(false)
     }
-  }, [pagination.currentPage, debouncedSearch])
+  }, [pagination.currentPage, debouncedSearch, sortBy, sortOrder])
 
   useEffect(() => {
     fetchCustomers()
   }, [fetchCustomers])
 
   // Fetch booking history for selected customer
-  const fetchBookingHistory = async (customerId: number) => {
+  const fetchBookingHistory = async (customerId: string) => {
     setLoadingHistory(true)
     try {
       const response = await fetch(`/api/customers/${customerId}/bookings`)
@@ -105,20 +125,46 @@ export default function CustomersPage() {
     }
   }
 
+  // Fetch customer stats
+  const fetchCustomerStats = async (customerId: string) => {
+    setLoadingStats(true)
+    try {
+      const response = await fetch(`/api/customers/${customerId}/stats`)
+      if (response.ok) {
+        const data = await response.json()
+        setCustomerStats(data.stats || null)
+      }
+    } catch (error) {
+      console.error('Error fetching customer stats:', error)
+      setCustomerStats(null)
+    } finally {
+      setLoadingStats(false)
+    }
+  }
+
   const handleRowClick = (customer: Customer) => {
     setSelectedCustomer(customer)
     setShowModal(true)
     fetchBookingHistory(customer.id)
+    fetchCustomerStats(customer.id)
   }
 
   const closeModal = () => {
     setShowModal(false)
     setSelectedCustomer(null)
     setBookingHistory([])
+    setCustomerStats(null)
   }
 
   const handlePageChange = (page: number) => {
     setPagination((prev) => ({ ...prev, currentPage: page }))
+  }
+
+  const handleSort = (column: string, direction: 'asc' | 'desc' | null) => {
+    setSortBy(direction ? column : null)
+    setSortOrder(direction)
+    // Reset to first page when sorting changes
+    setPagination((prev) => ({ ...prev, currentPage: 1 }))
   }
 
   const columns: Column<Customer>[] = [
@@ -180,6 +226,17 @@ export default function CustomersPage() {
       ),
     },
     {
+      key: 'lastVisit',
+      header: 'เข้าพักล่าสุด',
+      sortable: true,
+      render: (item) => (
+        <div className="flex items-center gap-2">
+          <Calendar className="w-4 h-4 text-gray-400" />
+          <span>{item.lastVisit ? format(new Date(item.lastVisit), 'dd/MM/yyyy') : '-'}</span>
+        </div>
+      ),
+    },
+    {
       key: 'address',
       header: 'ที่อยู่',
       sortable: false,
@@ -214,7 +271,7 @@ export default function CustomersPage() {
             type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="ค้นหาด้วยชื่อลูกค้า..."
+            placeholder="ค้นหาด้วยชื่อ, เบอร์โทร, เลขบัตรประชาชน หรือ ID..."
             className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-colors"
           />
           {searchQuery && (
@@ -242,6 +299,9 @@ export default function CustomersPage() {
         pagination={pagination}
         onPageChange={handlePageChange}
         loading={loading}
+        onSort={handleSort}
+        sortColumn={sortBy}
+        sortDirection={sortOrder}
       />
 
       {/* Customer Detail Modal */}
@@ -311,6 +371,94 @@ export default function CustomersPage() {
                     </p>
                   </div>
                 </div>
+              </div>
+
+              {/* Customer Stats */}
+              <div className="mb-6">
+                <h3 className="flex items-center gap-2 text-lg font-semibold text-gray-800 mb-3">
+                  <TrendingUp className="w-5 h-5" />
+                  สถิติลูกค้า
+                </h3>
+                {loadingStats ? (
+                  <div className="flex items-center justify-center py-4">
+                    <div className="w-5 h-5 border-2 border-blue-600 border-t-transparent rounded-full animate-spin"></div>
+                    <span className="ml-2 text-gray-600">กำลังโหลดสถิติ...</span>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                    {/* Total Bookings */}
+                    <div className="p-3 bg-blue-50 rounded-lg border border-blue-100">
+                      <div className="flex items-center gap-2 mb-1">
+                        <CalendarDays className="w-4 h-4 text-blue-600" />
+                        <span className="text-sm text-blue-700">จำนวนการจอง</span>
+                      </div>
+                      <p className="text-2xl font-bold text-blue-800">
+                        {customerStats?.totalBookings ?? 0}
+                      </p>
+                    </div>
+
+                    {/* Total Stays */}
+                    <div className="p-3 bg-green-50 rounded-lg border border-green-100">
+                      <div className="flex items-center gap-2 mb-1">
+                        <TrendingUp className="w-4 h-4 text-green-600" />
+                        <span className="text-sm text-green-700">จำนวนครั้งที่เข้าพัก</span>
+                      </div>
+                      <p className="text-2xl font-bold text-green-800">
+                        {customerStats?.totalStays ?? 0}
+                      </p>
+                    </div>
+
+                    {/* First Visit */}
+                    <div className="p-3 bg-purple-50 rounded-lg border border-purple-100">
+                      <div className="flex items-center gap-2 mb-1">
+                        <Clock className="w-4 h-4 text-purple-600" />
+                        <span className="text-sm text-purple-700">ลูกค้าตั้งแต่</span>
+                      </div>
+                      <p className="text-lg font-bold text-purple-800">
+                        {customerStats?.firstVisit
+                          ? format(new Date(customerStats.firstVisit), 'dd/MM/yyyy')
+                          : '-'}
+                      </p>
+                    </div>
+
+                    {/* Last Visit */}
+                    <div className="p-3 bg-indigo-50 rounded-lg border border-indigo-100">
+                      <div className="flex items-center gap-2 mb-1">
+                        <Calendar className="w-4 h-4 text-indigo-600" />
+                        <span className="text-sm text-indigo-700">เข้าพักล่าสุด</span>
+                      </div>
+                      <p className="text-lg font-bold text-indigo-800">
+                        {customerStats?.lastVisit
+                          ? format(new Date(customerStats.lastVisit), 'dd/MM/yyyy')
+                          : '-'}
+                      </p>
+                    </div>
+
+                    {/* Favorite Room Type */}
+                    <div className="p-3 bg-yellow-50 rounded-lg border border-yellow-100">
+                      <div className="flex items-center gap-2 mb-1">
+                        <Home className="w-4 h-4 text-yellow-600" />
+                        <span className="text-sm text-yellow-700">ห้องที่ชอบ</span>
+                      </div>
+                      <p className="text-lg font-bold text-yellow-800">
+                        {customerStats?.favoriteRoomType || '-'}
+                      </p>
+                    </div>
+
+                    {/* Average Stay Days */}
+                    <div className="p-3 bg-orange-50 rounded-lg border border-orange-100">
+                      <div className="flex items-center gap-2 mb-1">
+                        <Star className="w-4 h-4 text-orange-600" />
+                        <span className="text-sm text-orange-700">เฉลี่ย/ครั้ง</span>
+                      </div>
+                      <p className="text-lg font-bold text-orange-800">
+                        {customerStats?.avgStayDays != null
+                          ? `${customerStats.avgStayDays} วัน`
+                          : '-'}
+                      </p>
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* Booking History */}

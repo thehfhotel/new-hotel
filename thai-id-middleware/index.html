@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'">
+  <title>Thai ID Middleware</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🪪 Thai ID Middleware</h1>
+      <span id="version" class="version"></span>
+    </header>
+
+    <div class="status-card">
+      <div class="status-row">
+        <span class="status-label">
+          <span class="icon">🌐</span>
+          HTTP Server
+        </span>
+        <span id="server-status" class="badge green">Running :9898</span>
+      </div>
+      <div class="status-row">
+        <span class="status-label">
+          <span class="icon">📟</span>
+          Card Reader
+        </span>
+        <span id="reader-status" class="badge gray">Not Connected</span>
+      </div>
+      <div class="status-row">
+        <span class="status-label">
+          <span class="icon">💳</span>
+          Card
+        </span>
+        <span id="card-status" class="badge gray">Not Inserted</span>
+      </div>
+    </div>
+
+    <div class="info-box">
+      <p>Web applications can connect to:</p>
+      <code id="server-url">http://localhost:9898</code>
+      <div class="endpoints">
+        <div class="endpoint">
+          <span class="method">GET</span>
+          <span class="path">/health</span>
+          <span class="desc">Check status</span>
+        </div>
+        <div class="endpoint">
+          <span class="method">GET</span>
+          <span class="path">/read</span>
+          <span class="desc">Read card</span>
+        </div>
+      </div>
+    </div>
+
+    <div id="reader-name" class="reader-name"></div>
+
+    <footer>
+      <p>Minimize to system tray for background operation</p>
+    </footer>
+  </div>
+  <script src="renderer.js"></script>
+</body>
+</html>

@@ -14,7 +14,12 @@ export async function GET() {
         Room_Clean,
         Room_Use,
         Room_Book,
-        Room_Manternace
+        Room_Manternace,
+        Room_PriceA,
+        Room_PriceB,
+        Room_PriceC,
+        Room_Group,
+        Room_Book_Name
       FROM HT_Rooms
       ORDER BY Room_no
     `);
