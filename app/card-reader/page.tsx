@@ -95,7 +95,7 @@ export default function CardReaderPage() {
     setCardData(null)
 
     try {
-      const response = await fetch(`${MIDDLEWARE_URL}/read`, {
+      const response = await fetch(`${MIDDLEWARE_URL}/read?photo=true`, {
         method: 'GET',
         signal: AbortSignal.timeout(30000), // 30 second timeout for card reading
       })
