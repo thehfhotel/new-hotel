@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.1] - 2026-01-29
+
+### Changed
+- **Migrated package manager to pnpm** - Full migration from npm to pnpm for consistent tooling
+  - Dockerfile now uses `corepack enable && corepack prepare pnpm@9` with `pnpm install --frozen-lockfile`
+  - CI/CD workflow updated to use pnpm version 9 (was 8)
+  - Removed `package-lock.json`, now using `pnpm-lock.yaml`
+  - Benefits: faster installs, better disk efficiency, consistent with CI environment
+
+## [1.15.0] - 2026-01-29
+
+### Security
+- **Upgraded Next.js from 15.5.11 to 16.1.6** - Resolves 1 Dependabot security alert:
+  - MODERATE: Unbounded Memory Consumption via PPR Resume Endpoint (GHSA-5f7q-jpqc-wp7h) - fixed in >= 15.6.0
+- **Upgraded ESLint from 8.57.1 to 9.39.2** - Required by eslint-config-next 16.x
+- Upgraded eslint-config-next from 15.5.11 to 16.1.6
+
+### Changed
+- **ESLint configuration migrated to flat config format** (ESLint 9 requirement)
+  - Added `eslint.config.mjs` with Next.js flat config
+  - Added `@eslint/eslintrc` dependency for flat config support
+  - Updated lint script to use `eslint .` (Next.js 16 removed `next lint` command)
+
+### Fixed
+- Moved `CustomTooltip` component outside of render function in `Charts.tsx` to fix React Hooks lint error
+
 ## [1.14.1] - 2026-01-29
 
 ### Changed
