@@ -59,6 +59,7 @@ interface BookingDetail {
 interface BookingDetailDrawerProps {
   bookNo: string | null
   onClose: () => void
+  inline?: boolean
 }
 
 const statusColors: Record<string, string> = {
@@ -100,7 +101,7 @@ function formatCurrency(amount: number): string {
   }).format(amount)
 }
 
-export default function BookingDetailDrawer({ bookNo, onClose }: BookingDetailDrawerProps) {
+export default function BookingDetailDrawer({ bookNo, onClose, inline = false }: BookingDetailDrawerProps) {
   const [booking, setBooking] = useState<BookingDetail | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -197,6 +198,209 @@ export default function BookingDetailDrawer({ bookNo, onClose }: BookingDetailDr
 
   if (!bookNo) return null
 
+  // Inline mode - rendered as a static sidebar
+  if (inline) {
+    return (
+      <div className="bg-white rounded-lg shadow-lg border border-gray-200 overflow-hidden">
+        <div className="p-4 max-h-[calc(100vh-2rem)] overflow-y-auto">
+          {/* Header */}
+          <div className="flex items-center justify-between mb-4 pb-4 border-b">
+            <h2 className="text-lg font-bold text-gray-900">
+              #{bookNo}
+            </h2>
+            <button
+              onClick={onClose}
+              className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
+              title="ปิด"
+            >
+              <X size={20} />
+            </button>
+          </div>
+
+          {/* Loading */}
+          {loading && (
+            <div className="flex items-center justify-center py-12">
+              <Loader2 className="h-8 w-8 animate-spin text-blue-600" />
+            </div>
+          )}
+
+          {/* Error */}
+          {error && (
+            <div className="flex items-center justify-center py-12 text-red-600">
+              <AlertCircle className="h-6 w-6 mr-2" />
+              <span>{error}</span>
+            </div>
+          )}
+
+          {/* Content */}
+          {booking && !loading && (
+            <div className="space-y-6">
+              {/* Booking Info */}
+              <section>
+                <h3 className="flex items-center gap-2 text-sm font-semibold text-gray-500 uppercase mb-3">
+                  <Calendar size={16} />
+                  ข้อมูลการจอง
+                </h3>
+                <div className="bg-gray-50 rounded-lg p-4 space-y-3">
+                  <div className="flex justify-between items-center">
+                    <span className="text-gray-600">สถานะ</span>
+                    <span className={`px-2.5 py-0.5 rounded-full text-xs font-medium ${statusColors[booking.status] || 'bg-gray-100 text-gray-800'}`}>
+                      {booking.status}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-gray-600">วันที่จอง</span>
+                    <span className="font-medium">{formatDate(booking.bookDate)}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-gray-600">เช็คอิน</span>
+                    <span className="font-medium">{formatDate(booking.checkIn)}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-gray-600">เช็คเอาท์</span>
+                    <span className="font-medium">{formatDate(booking.checkOut)}</span>
+                  </div>
+                </div>
+              </section>
+
+              {/* Rooms */}
+              <section>
+                <h3 className="flex items-center gap-2 text-sm font-semibold text-gray-500 uppercase mb-3">
+                  <BedDouble size={16} />
+                  ห้องพัก ({booking.roomCount})
+                </h3>
+                <div className="space-y-2">
+                  {booking.rooms.map((room, idx) => (
+                    <div key={idx} className="bg-gray-50 rounded-lg p-3 flex justify-between items-center">
+                      <div>
+                        <span className="font-medium">ห้อง {room.roomNo}</span>
+                        <span className="text-gray-500 ml-2">- {room.roomType}</span>
+                      </div>
+                      <span className="font-medium text-blue-600">
+                        {formatCurrency(room.total)}
+                      </span>
+                    </div>
+                  ))}
+                  <div className="flex justify-between items-center pt-2 border-t mt-2">
+                    <span className="font-semibold">รวมทั้งหมด</span>
+                    <span className="font-bold text-lg text-blue-600">
+                      {formatCurrency(booking.totalAmount)}
+                    </span>
+                  </div>
+                </div>
+              </section>
+
+              {/* Customer */}
+              <section>
+                <h3 className="flex items-center gap-2 text-sm font-semibold text-gray-500 uppercase mb-3">
+                  <User size={16} />
+                  ข้อมูลลูกค้า
+                </h3>
+                <div className="bg-gray-50 rounded-lg p-4 space-y-3">
+                  <div className="font-medium text-lg">
+                    {booking.customer.fullName || `${booking.customer.firstName || ''} ${booking.customer.lastName || ''}`.trim() || '-'}
+                  </div>
+                  {booking.customer.phone && (
+                    <div className="flex items-center gap-2 text-gray-600">
+                      <Phone size={16} />
+                      <span>{booking.customer.phone}</span>
+                    </div>
+                  )}
+                  {booking.customer.idCard && (
+                    <div className="flex items-center gap-2 text-gray-600">
+                      <CreditCard size={16} />
+                      <span>{booking.customer.idCard}</span>
+                    </div>
+                  )}
+                  {booking.customer.address && (
+                    <div className="flex items-center gap-2 text-gray-600">
+                      <MapPin size={16} />
+                      <span className="text-sm">{booking.customer.address}</span>
+                    </div>
+                  )}
+                  {booking.customer.id && (
+                    <Link
+                      href={`/customers?search=${encodeURIComponent(booking.customer.id)}`}
+                      className="inline-flex items-center gap-1 text-blue-600 hover:text-blue-800 text-sm mt-2"
+                    >
+                      ดูข้อมูลลูกค้าเพิ่มเติม
+                      <ExternalLink size={14} />
+                    </Link>
+                  )}
+                </div>
+              </section>
+
+              {/* Notes */}
+              <section>
+                <h3 className="flex items-center gap-2 text-sm font-semibold text-gray-500 uppercase mb-3">
+                  <FileText size={16} />
+                  บันทึก ({booking.notes.length})
+                </h3>
+
+                {/* Add Note Form */}
+                <div className="mb-4">
+                  <textarea
+                    value={newNote}
+                    onChange={(e) => setNewNote(e.target.value)}
+                    placeholder="เพิ่มบันทึก..."
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-sm resize-none"
+                    rows={2}
+                  />
+                  <button
+                    onClick={handleAddNote}
+                    disabled={!newNote.trim() || addingNote}
+                    className="mt-2 w-full flex items-center justify-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  >
+                    {addingNote ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Plus size={16} />
+                    )}
+                    เพิ่มบันทึก
+                  </button>
+                </div>
+
+                {/* Notes List */}
+                <div className="space-y-2">
+                  {booking.notes.length === 0 ? (
+                    <p className="text-gray-500 text-sm text-center py-4">
+                      ยังไม่มีบันทึก
+                    </p>
+                  ) : (
+                    booking.notes.map((note) => (
+                      <div key={note.id} className="bg-gray-50 rounded-lg p-3">
+                        <div className="flex justify-between items-start gap-2">
+                          <p className="text-sm text-gray-700 flex-1 whitespace-pre-wrap">
+                            {note.text}
+                          </p>
+                          <button
+                            onClick={() => handleDeleteNote(note.id)}
+                            disabled={deletingNoteId === note.id}
+                            className="p-1 text-gray-400 hover:text-red-600 transition-colors"
+                          >
+                            {deletingNoteId === note.id ? (
+                              <Loader2 className="h-4 w-4 animate-spin" />
+                            ) : (
+                              <Trash2 size={16} />
+                            )}
+                          </button>
+                        </div>
+                        <p className="text-xs text-gray-400 mt-2">
+                          {formatDateTime(note.createdAt)}
+                        </p>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </section>
+            </div>
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  // Modal mode - rendered as overlay drawer
   return (
     <>
       {/* Backdrop - click to dismiss */}

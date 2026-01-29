@@ -175,9 +175,11 @@ export default function BookingsPage() {
   }
 
   return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
+    <div className="flex gap-6">
+      {/* Main Content */}
+      <div className={`flex-1 min-w-0 space-y-6 transition-all duration-300 ${selectedBookNo ? 'lg:mr-0' : ''}`}>
+        {/* Header */}
+        <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">การจองทั้งหมด</h1>
           <p className="text-sm text-gray-500 mt-1">
@@ -490,11 +492,28 @@ export default function BookingsPage() {
         )}
       </div>
 
-      {/* Detail Drawer */}
-      <BookingDetailDrawer
-        bookNo={selectedBookNo}
-        onClose={() => setSelectedBookNo(null)}
-      />
+      </div>
+
+      {/* Detail Sidebar */}
+      {selectedBookNo && (
+        <div className="hidden lg:block w-96 flex-shrink-0">
+          <div className="sticky top-4">
+            <BookingDetailDrawer
+              bookNo={selectedBookNo}
+              onClose={() => setSelectedBookNo(null)}
+              inline
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Mobile Drawer */}
+      <div className="lg:hidden">
+        <BookingDetailDrawer
+          bookNo={selectedBookNo}
+          onClose={() => setSelectedBookNo(null)}
+        />
+      </div>
     </div>
   )
 }
