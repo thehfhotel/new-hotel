@@ -11,6 +11,9 @@ import {
   Calendar,
   RefreshCw,
   BedDouble,
+  ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
 } from 'lucide-react'
 import BookingDetailDrawer from '@/components/BookingDetailDrawer'
 
@@ -85,6 +88,10 @@ export default function BookingsPage() {
   // Drawer
   const [selectedBookNo, setSelectedBookNo] = useState<string | null>(null)
 
+  // Sorting
+  const [sortBy, setSortBy] = useState('bookDate')
+  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc')
+
   // Fetch bookings
   const fetchBookings = useCallback(async () => {
     setLoading(true)
@@ -94,6 +101,8 @@ export default function BookingsPage() {
       const params = new URLSearchParams({
         page: currentPage.toString(),
         limit: itemsPerPage.toString(),
+        sortBy,
+        sortOrder,
       })
 
       if (statusFilter) params.append('status', statusFilter)
@@ -121,7 +130,7 @@ export default function BookingsPage() {
     } finally {
       setLoading(false)
     }
-  }, [currentPage, statusFilter, startDate, endDate, searchTerm])
+  }, [currentPage, statusFilter, startDate, endDate, searchTerm, sortBy, sortOrder])
 
   useEffect(() => {
     fetchBookings()
@@ -141,6 +150,27 @@ export default function BookingsPage() {
     if (page >= 1 && page <= totalPages) {
       setCurrentPage(page)
     }
+  }
+
+  // Handle column sort
+  const handleSort = (column: string) => {
+    if (sortBy === column) {
+      setSortOrder(sortOrder === 'asc' ? 'desc' : 'asc')
+    } else {
+      setSortBy(column)
+      setSortOrder('asc')
+    }
+    setCurrentPage(1)
+  }
+
+  // Get sort icon for column
+  const getSortIcon = (column: string) => {
+    if (sortBy !== column) {
+      return <ArrowUpDown size={14} className="text-gray-400" />
+    }
+    return sortOrder === 'asc'
+      ? <ArrowUp size={14} className="text-blue-600" />
+      : <ArrowDown size={14} className="text-blue-600" />
   }
 
   // Get rooms display - show room types
@@ -280,23 +310,59 @@ export default function BookingsPage() {
               <table className="min-w-full divide-y divide-gray-200">
                 <thead className="bg-gray-50">
                   <tr>
-                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      เลขที่จอง
+                    <th
+                      onClick={() => handleSort('bookNo')}
+                      className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
+                    >
+                      <div className="flex items-center gap-1">
+                        เลขที่จอง
+                        {getSortIcon('bookNo')}
+                      </div>
                     </th>
-                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      สถานะ
+                    <th
+                      onClick={() => handleSort('status')}
+                      className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
+                    >
+                      <div className="flex items-center gap-1">
+                        สถานะ
+                        {getSortIcon('status')}
+                      </div>
                     </th>
-                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      ลูกค้า
+                    <th
+                      onClick={() => handleSort('customer')}
+                      className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
+                    >
+                      <div className="flex items-center gap-1">
+                        ลูกค้า
+                        {getSortIcon('customer')}
+                      </div>
                     </th>
-                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      เช็คอิน
+                    <th
+                      onClick={() => handleSort('checkIn')}
+                      className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
+                    >
+                      <div className="flex items-center gap-1">
+                        เช็คอิน
+                        {getSortIcon('checkIn')}
+                      </div>
                     </th>
-                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      เช็คเอาท์
+                    <th
+                      onClick={() => handleSort('checkOut')}
+                      className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
+                    >
+                      <div className="flex items-center gap-1">
+                        เช็คเอาท์
+                        {getSortIcon('checkOut')}
+                      </div>
                     </th>
-                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      ห้องพัก
+                    <th
+                      onClick={() => handleSort('roomCount')}
+                      className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none"
+                    >
+                      <div className="flex items-center gap-1">
+                        ห้องพัก
+                        {getSortIcon('roomCount')}
+                      </div>
                     </th>
                   </tr>
                 </thead>

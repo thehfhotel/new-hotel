@@ -86,6 +86,8 @@ export async function GET(request: NextRequest) {
     const endDate = searchParams.get('endDate');
     const page = parseInt(searchParams.get('page') || '1', 10);
     const limit = parseInt(searchParams.get('limit') || '20', 10);
+    const sortBy = searchParams.get('sortBy') || 'bookDate';
+    const sortOrder = searchParams.get('sortOrder') || 'desc';
 
     const pool = await getPool();
 
@@ -142,8 +144,47 @@ export async function GET(request: NextRequest) {
     // Group records by Book_No
     const allGrouped = groupByBookNo(dataResult.recordset);
 
-    // Sort by bookDate descending
-    allGrouped.sort((a, b) => new Date(b.bookDate).getTime() - new Date(a.bookDate).getTime());
+    // Sort by requested field
+    allGrouped.sort((a, b) => {
+      let aVal: string | number | Date;
+      let bVal: string | number | Date;
+
+      switch (sortBy) {
+        case 'bookNo':
+          aVal = a.bookNo;
+          bVal = b.bookNo;
+          break;
+        case 'status':
+          aVal = a.status;
+          bVal = b.status;
+          break;
+        case 'customer':
+          aVal = a.customer.name.toLowerCase();
+          bVal = b.customer.name.toLowerCase();
+          break;
+        case 'checkIn':
+          aVal = new Date(a.checkIn).getTime();
+          bVal = new Date(b.checkIn).getTime();
+          break;
+        case 'checkOut':
+          aVal = new Date(a.checkOut).getTime();
+          bVal = new Date(b.checkOut).getTime();
+          break;
+        case 'roomCount':
+          aVal = a.roomCount;
+          bVal = b.roomCount;
+          break;
+        case 'bookDate':
+        default:
+          aVal = new Date(a.bookDate).getTime();
+          bVal = new Date(b.bookDate).getTime();
+          break;
+      }
+
+      if (aVal < bVal) return sortOrder === 'asc' ? -1 : 1;
+      if (aVal > bVal) return sortOrder === 'asc' ? 1 : -1;
+      return 0;
+    });
 
     // Paginate
     const startIdx = (page - 1) * limit;
