@@ -5,6 +5,82 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.1] - 2026-01-29
+
+### Fixed
+- Memory leak in card reader page causing PC freezing - health check useEffect was using `[checkHealth]` dependency which could cause interval accumulation during re-renders or React Strict Mode double-mounting; changed to `[]` to ensure interval is created exactly once on mount
+
+## [1.13.0] - 2026-01-29
+
+### Added
+- **Thai ID Middleware Tauri application** - Complete migration from Electron to Tauri for better macOS Gatekeeper support
+  - New `thai-id-middleware-tauri/` directory with full Tauri 2.0 implementation
+  - **Rust PC/SC card reader** (`card_reader.rs`) - Native implementation using `pcsc` crate
+    - All APDU commands for Thai National ID cards (CID, names, DOB, gender, address, dates)
+    - TIS-620 to UTF-8 Thai text encoding conversion
+    - Retry logic for cold-inserted cards (5 retries, 1000ms delay)
+    - Proper SW1=0x61 response handling with GET RESPONSE
+  - **Axum HTTP server** (`server.rs`) - Rust HTTP API on port 9898
+    - `GET /health` - Server and reader status
+    - `GET /status` - Alias for /health
+    - `GET /read` - Read Thai ID card data
+    - CORS enabled for localhost web apps
+  - **Tauri IPC commands** (`commands.rs`) - Frontend integration
+    - `get_status`, `get_version`, `read_card`, `debug_card` commands
+  - **System tray** - Show/hide window, status check, quit menu
+  - **Minimize to tray** - Window hides on close instead of quitting
+  - Frontend ported from Electron with Tauri API integration
+- Benefits over Electron:
+  - Smaller binary size (~10MB vs ~150MB)
+  - Better macOS code signing and Gatekeeper compatibility
+  - Lower memory usage
+  - Native Rust performance for card operations
+
+## [1.12.5] - 2026-01-29
+
+### Added
+- Comprehensive diagnostic logging for Thai ID card reader to help diagnose connection issues
+  - Operation counter (`[op:N]`) to correlate connect/disconnect pairs across functions
+  - Detailed logging in `resetCard()` showing connect success/failure and disconnect results
+  - Detailed logging in `connectWithRetry()` showing each attempt, errors, and retry decisions
+  - Entry/exit logging in `readCard()` and `debugCard()` with success/failure status
+  - Protocol name logging (T=0/T=1) for successful connections
+  - Now logs exact PC/SC error messages to help diagnose silent failures
+
+### Changed
+- `connectWithRetry()` now retries on any error, not just "unresponsive" errors
+- Middleware version bumped to 1.1.5
+
+## [1.12.4] - 2026-01-29
+
+### Fixed
+- Thai ID card reader reliability issues: cards becoming unreadable after ~30 seconds and cold-inserted cards failing
+  - Root cause 1: `SCARD_LEAVE_CARD` disconnect mode leaves card in corrupted state after repeated use
+  - Root cause 2: Insufficient retry time (1.5s) for cold-inserted cards needing full power cycle
+  - Changed all `SCARD_LEAVE_CARD` to `SCARD_RESET_CARD` - performs warm reset clearing card state
+  - Added `resetCard()` function to reset cards in unknown state before connecting
+  - Increased retry parameters from 3×500ms to 5×1000ms (5 seconds total)
+  - On first connection failure, attempts card reset before retrying
+- Middleware version bumped to 1.1.4
+
+## [1.12.3] - 2026-01-29
+
+### Fixed
+- Thai ID card reader failing with "Card is unresponsive" error when app starts with card already inserted
+  - Root cause: Race condition between card detection and card readiness during power-up sequence
+  - Added `connectWithRetry()` helper that retries connection up to 3 times with 500ms delay
+  - Both `readCard()` and `debugCard()` now use retry logic to handle cards still initializing
+- Middleware version bumped to 1.1.3
+
+## [1.12.2] - 2026-01-29
+
+### Fixed
+- Thai ID card reader returning empty data for all fields (CID, names, dates, etc.) despite successful card communication
+  - Root cause: `readCard()` used plain `transmit()` instead of `transmitWithGetResponse()` for READ commands
+  - When card returns SW1=61 (more data available), `transmitWithGetResponse()` sends GET RESPONSE to retrieve data
+  - Also changed from parallel `Promise.all()` to sequential reads (smart cards are sequential devices)
+- Middleware version bumped to 1.1.2
+
 ## [1.12.1] - 2026-01-29
 
 ### Fixed

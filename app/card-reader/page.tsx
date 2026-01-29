@@ -82,7 +82,7 @@ export default function CardReaderPage() {
         clearInterval(healthCheckRef.current)
       }
     }
-  }, [checkHealth])
+  }, []) // Run once on mount, clean up on unmount
 
   const readCard = async () => {
     if (connectionStatus !== 'connected') {
