@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.19.0] - 2026-02-05
+
+### Added
+- **Rust Backend Implementation** - Complete Rust/Axum backend in `hotel-backend/` directory
+  - All 15 API endpoints ported from Next.js API routes to Rust
+  - tiberius for SQL Server connection with bb8 connection pooling
+  - tokio-cron-scheduler for background jobs (hourly reports, polling)
+  - Slack notification integration with retry logic
+  - Thai Buddhist date formatting utilities
+  - Docker support with multi-stage build
+  - Full API compatibility with existing React frontend
+
 ## [1.18.0] - 2026-01-30
 
 ### Added

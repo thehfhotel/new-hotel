@@ -11,3 +11,18 @@ services:
       - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
       - SLACK_NOTIFICATIONS_ENABLED=true
     restart: unless-stopped
+
+  backend:
+    image: ghcr.io/thehfhotel/new-hotel-backend:latest
+    ports:
+      - "3004:3003"
+    environment:
+      - DB_SERVER=192.168.100.222
+      - DB_NAME=db
+      - DB_USER=sa
+      - DB_PASSWORD=12345678
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+      - SLACK_NOTIFICATIONS_ENABLED=true
+      - HOST=0.0.0.0
+      - PORT=3003
+    restart: unless-stopped
