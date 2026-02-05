@@ -47,12 +47,13 @@ pub async fn list_checkins(
 
     // Date range filter: find check-ins that OVERLAP the given range
     // A check-in overlaps if it starts before the end AND ends after the start
+    // Use CAST to compare dates without time component
     if let Some(ref start_date) = params.start_date {
-        conditions.push(format!("Cin_Room_Out >= '{}'", start_date.replace('\'', "''")));
+        conditions.push(format!("CAST(Cin_Room_Out AS DATE) >= '{}'", start_date.replace('\'', "''")));
     }
 
     if let Some(ref end_date) = params.end_date {
-        conditions.push(format!("Cin_Room_In <= '{}'", end_date.replace('\'', "''")));
+        conditions.push(format!("CAST(Cin_Room_In AS DATE) <= '{}'", end_date.replace('\'', "''")));
     }
 
     let where_clause = if conditions.is_empty() {
