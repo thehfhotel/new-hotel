@@ -6,7 +6,7 @@ use axum::{
     extract::{Query, State},
     Json,
 };
-use chrono::NaiveDateTime;
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
 use crate::db::DbPool;
@@ -25,7 +25,7 @@ fn default_days() -> i32 { 7 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OccupancyData {
-    pub date: NaiveDateTime,
+    pub date: NaiveDate,
     pub occupied_rooms: i32,
 }
 
@@ -79,7 +79,7 @@ pub async fn get_occupancy(
     let data: Vec<OccupancyData> = rows
         .iter()
         .filter_map(|row| {
-            row.get::<NaiveDateTime, _>("date").map(|date| OccupancyData {
+            row.get::<NaiveDate, _>("date").map(|date| OccupancyData {
                 date,
                 occupied_rooms: row.get::<i32, _>("occupiedRooms").unwrap_or(0),
             })
