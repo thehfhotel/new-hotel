@@ -101,6 +101,9 @@ export default function StayTimeline({
       const newCheckinStays: Stay[] = []
       const bookingStays: Stay[] = []
 
+      const today = new Date()
+      today.setHours(0, 0, 0, 0)
+
       stays.forEach(stay => {
         const isCheckInDay = isSameDay(stay.checkIn, day)
         const isStayingToday = isBefore(stay.checkIn, day) &&
@@ -114,8 +117,10 @@ export default function StayTimeline({
             continuingStays.push(stay)
           }
         } else {
-          // booking
-          if (isCheckInDay || isStayingToday || isCheckOutDay) {
+          // booking - only show if the booking's check-in date is today or future
+          // Past bookings (checkIn < today) should have been converted to check-ins already
+          const bookingCheckInIsNotPast = !isBefore(stay.checkIn, today)
+          if (bookingCheckInIsNotPast && (isCheckInDay || isStayingToday || isCheckOutDay)) {
             bookingStays.push(stay)
           }
         }
