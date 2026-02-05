@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.1] - 2026-02-05
+
+### Added
+- **Comprehensive Test Suite** - 509 new tests for New Mode components (555 total)
+  - **Test Utilities** (`/__tests__/utils/`)
+    - `mockFactories.ts` - Mock data factories for customers, rooms, bookings, check-ins, inventory, invoices
+    - `commonMocks.ts` - Lucide icon mocks, fetch mocks, date mocks, browser mocks
+    - `testUtils.tsx` - Custom render functions, Thai language assertions
+    - `asyncUtils.ts` - Async testing helpers for loading, modals, debounce
+  - **Tier 1 Critical Tests**
+    - `QuickCheckInModal.test.tsx` - 29 tests for walk-in check-in
+    - `CheckOutModal.test.tsx` - 39 tests for checkout process
+    - `InvoiceTemplate.test.tsx` - 49 tests for invoice rendering
+  - **Picker Component Tests**
+    - `CustomerPicker.test.tsx` - 43 tests including keyboard navigation
+    - `RoomPicker.test.tsx` - 43 tests for multi-select room selection
+  - **Form Component Tests**
+    - `CustomerForm.test.tsx` - 35 tests for customer CRUD
+    - `RoomTypeForm.test.tsx` - 34 tests for room type configuration
+    - `InventoryItemForm.test.tsx` - 37 tests for inventory items
+    - `RateForm.test.tsx` - 46 tests for special rates
+  - **Operations Component Tests**
+    - `HousekeepingStats.test.tsx` - 13 tests for stats display
+    - `RoomCleaningCard.test.tsx` - 33 tests for cleaning workflow
+    - `StockAdjustmentModal.test.tsx` - 36 tests for stock management
+    - `RoomInventoryChecklist.test.tsx` - 34 tests for room inventory
+
 ## [2.7.0] - 2026-02-05
 
 ### Added
