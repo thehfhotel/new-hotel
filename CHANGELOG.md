@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-02-05
+
+### Changed
+- **BREAKING: Backend Migration Complete** - All API endpoints now served by Rust/Axum backend
+  - Frontend proxies API requests via Next.js rewrites to `http://backend:3003`
+  - Removed all Next.js API routes (except `/api/changelog` which reads local CHANGELOG.md)
+  - Removed `lib/db.ts`, `lib/scheduler.ts`, `lib/slack.ts`, and `instrumentation.ts`
+  - Removed `mssql` and `node-cron` dependencies
+  - Frontend is now purely a React UI layer
+
+### Removed
+- Next.js API routes: `/api/rooms/*`, `/api/bookings/*`, `/api/checkins`, `/api/customers/*`, `/api/stats`, `/api/occupancy`
+- Database-related tests (`__tests__/api/`, `__tests__/integration/`)
+- Test scripts: `test:db`, `test:api`, `test:slack`
+
 ## [1.19.1] - 2026-02-05
 
 ### Fixed

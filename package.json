@@ -1,6 +1,6 @@
 {
   "name": "new-hotel",
-  "version": "1.19.1",
+  "version": "2.0.0",
   "private": true,
   "scripts": {
     "dev": "next dev -p 3003",
@@ -9,18 +9,13 @@
     "lint": "eslint .",
     "test": "jest",
     "test:watch": "jest --watch",
-    "test:db": "jest __tests__/api/database.test.ts",
-    "test:api": "jest __tests__/api/api-endpoints.test.ts",
     "test:components": "jest __tests__/components/",
-    "test:slack": "jest __tests__/integration/slack.test.ts --verbose",
     "prepare": "husky"
   },
   "dependencies": {
     "date-fns": "^3.6.0",
     "lucide-react": "^0.469.0",
-    "mssql": "^12.2.0",
     "next": "16.1.6",
-    "node-cron": "^4.2.1",
     "react": "^19.1.0",
     "react-datepicker": "^9.1.0",
     "react-dom": "^19.1.0",
@@ -30,9 +25,7 @@
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@types/jest": "^30.0.0",
-    "@types/mssql": "^9.1.9",
     "@types/node": "^20.17.12",
-    "@types/node-cron": "^3.0.11",
     "@types/react": "^19.1.6",
     "@types/react-dom": "^19.1.6",
     "autoprefixer": "^10.4.20",
