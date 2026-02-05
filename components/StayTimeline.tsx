@@ -106,8 +106,13 @@ export default function StayTimeline({
 
       stays.forEach(stay => {
         const isCheckInDay = isSameDay(stay.checkIn, day)
-        // Guest is staying tonight = checkout is AFTER today (not same day)
-        const isStayingTonight = isBefore(day, stay.checkOut)
+        // Guest is staying tonight = checkout DATE is AFTER today (compare dates only, ignore time)
+        // This excludes guests checking out today regardless of checkout time
+        const checkOutDate = new Date(stay.checkOut)
+        checkOutDate.setHours(0, 0, 0, 0)
+        const dayDate = new Date(day)
+        dayDate.setHours(0, 0, 0, 0)
+        const isStayingTonight = checkOutDate > dayDate
         // Continuing stay = checked in before today AND staying tonight
         const isContinuingStay = isBefore(stay.checkIn, day) && isStayingTonight
 
@@ -119,7 +124,7 @@ export default function StayTimeline({
             // Continuing: checked in before today, staying tonight
             continuingStays.push(stay)
           }
-          // Note: guests checking out today (checkOut == day) are NOT counted
+          // Note: guests checking out today (checkOut date == day) are NOT counted
         } else {
           // booking - only show if the booking's check-in date is today or future
           // Past bookings (checkIn < today) should have been converted to check-ins already
