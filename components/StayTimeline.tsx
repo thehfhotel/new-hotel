@@ -106,21 +106,27 @@ export default function StayTimeline({
 
       stays.forEach(stay => {
         const isCheckInDay = isSameDay(stay.checkIn, day)
-        const isStayingToday = isBefore(stay.checkIn, day) &&
-                               (isSameDay(stay.checkOut, day) || isBefore(day, stay.checkOut))
-        const isCheckOutDay = isSameDay(stay.checkOut, day)
+        // Guest is staying tonight = checkout is AFTER today (not same day)
+        const isStayingTonight = isBefore(day, stay.checkOut)
+        // Continuing stay = checked in before today AND staying tonight
+        const isContinuingStay = isBefore(stay.checkIn, day) && isStayingTonight
 
         if (stay.type === 'checkin') {
-          if (isCheckInDay) {
+          // New check-in: arrives today AND staying tonight
+          if (isCheckInDay && isStayingTonight) {
             newCheckinStays.push(stay)
-          } else if (isStayingToday || isCheckOutDay) {
+          } else if (isContinuingStay) {
+            // Continuing: checked in before today, staying tonight
             continuingStays.push(stay)
           }
+          // Note: guests checking out today (checkOut == day) are NOT counted
         } else {
           // booking - only show if the booking's check-in date is today or future
           // Past bookings (checkIn < today) should have been converted to check-ins already
           const bookingCheckInIsNotPast = !isBefore(stay.checkIn, today)
-          if (bookingCheckInIsNotPast && (isCheckInDay || isStayingToday || isCheckOutDay)) {
+          // Show booking if it overlaps this day and checkIn is not in the past
+          const overlapsDay = (isCheckInDay || isBefore(stay.checkIn, day)) && isStayingTonight
+          if (bookingCheckInIsNotPast && overlapsDay) {
             bookingStays.push(stay)
           }
         }
