@@ -70,12 +70,14 @@ pub async fn list_bookings(
         }
     }
 
+    // Date range filter: find bookings that OVERLAP the given range
+    // A booking overlaps if it starts before the end AND ends after the start
     if let Some(ref start_date) = params.start_date {
-        conditions.push(format!("Book_Date_in >= '{}'", start_date.replace('\'', "''")));
+        conditions.push(format!("Book_Date_out >= '{}'", start_date.replace('\'', "''")));
     }
 
     if let Some(ref end_date) = params.end_date {
-        conditions.push(format!("Book_Date_out <= '{}'", end_date.replace('\'', "''")));
+        conditions.push(format!("Book_Date_in <= '{}'", end_date.replace('\'', "''")));
     }
 
     let where_clause = if conditions.is_empty() {

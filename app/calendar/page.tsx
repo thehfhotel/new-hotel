@@ -160,20 +160,42 @@ export default function CalendarPage() {
       })
     })
 
-    // Process bookings - exclude those that have matching check-ins
-    const checkinKeys = new Set(
-      checkins.map(c => `${c.Cin_Room_In?.split('T')[0]}_${c.Cin_Room_Out?.split('T')[0]}`)
-    )
+    // Build a map of check-in customer names (normalized) with their date ranges
+    const checkinCustomers = new Map<string, { start: string; end: string }[]>()
+    checkins.forEach(c => {
+      if (!c.Cin_cust_name || !c.Cin_Room_In || !c.Cin_Room_Out) return
+      const name = c.Cin_cust_name.trim().toLowerCase()
+      const range = { start: c.Cin_Room_In.split('T')[0], end: c.Cin_Room_Out.split('T')[0] }
+      if (!checkinCustomers.has(name)) {
+        checkinCustomers.set(name, [])
+      }
+      checkinCustomers.get(name)!.push(range)
+    })
 
+    // Helper to check if a booking has a matching check-in (same customer, overlapping dates)
+    const hasMatchingCheckin = (customerName: string | undefined, bookingStart: string, bookingEnd: string): boolean => {
+      if (!customerName) return false
+      const name = customerName.trim().toLowerCase()
+      const ranges = checkinCustomers.get(name)
+      if (!ranges) return false
+      // Check if any check-in date range overlaps with the booking
+      return ranges.some(r => r.start <= bookingEnd && r.end >= bookingStart)
+    }
+
+    // Process bookings - exclude those with matching check-ins (same customer + overlapping dates)
     bookings.forEach((booking, index) => {
       if (!booking.checkIn || !booking.checkOut) return
+      // Only show bookings with status "จอง" (pending, not yet checked in)
+      if (booking.status !== 'จอง') return
 
       const id = `booking-${booking.bookNo || index}`
       if (seenIds.has(id)) return
       seenIds.add(id)
 
-      const bookingKey = `${booking.checkIn.split('T')[0]}_${booking.checkOut.split('T')[0]}`
-      if (checkinKeys.has(bookingKey)) return
+      // Skip if this booking has a matching check-in (customer already checked in)
+      const bookingStart = booking.checkIn.split('T')[0]
+      const bookingEnd = booking.checkOut.split('T')[0]
+      if (hasMatchingCheckin(booking.customer?.name, bookingStart, bookingEnd)) return
 
       const checkIn = parseISO(booking.checkIn)
       const checkOut = parseISO(booking.checkOut)
