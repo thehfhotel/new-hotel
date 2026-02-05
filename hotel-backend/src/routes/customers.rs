@@ -197,7 +197,6 @@ pub async fn get_customer_bookings(
             r#"
             SELECT
                 Book_No,
-                Book_Room_No,
                 Book_Room_Type,
                 Book_Date_in,
                 Book_Date_out,
@@ -225,16 +224,13 @@ pub async fn get_customer_bookings(
 
             CustomerBooking {
                 id: row.get::<&str, _>("Book_No").unwrap_or_default().to_string(),
-                room_number: row
-                    .get::<&str, _>("Book_Room_No")
-                    .unwrap_or("-")
-                    .to_string(),
+                room_number: "-".to_string(),
                 room_type: row
                     .get::<&str, _>("Book_Room_Type")
                     .unwrap_or("-")
                     .to_string(),
-                check_in_date: row.get::<NaiveDateTime, _>("Book_Date_in"),
-                check_out_date: row.get::<NaiveDateTime, _>("Book_Date_out"),
+                check_in_date: row.try_get::<NaiveDateTime, _>("Book_Date_in").ok().flatten(),
+                check_out_date: row.try_get::<NaiveDateTime, _>("Book_Date_out").ok().flatten(),
                 status: status.to_string(),
                 total_amount: row.get::<f64, _>("Book_Total").unwrap_or(0.0),
             }
