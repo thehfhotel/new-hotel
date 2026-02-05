@@ -5,14 +5,20 @@ use serde::Serialize;
 
 /// Room data from HT_Rooms table
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "PascalCase")]
 pub struct Room {
+    #[serde(rename = "Room_no")]
     pub room_no: String,
+    #[serde(rename = "Room_Type")]
     pub room_type: Option<String>,
+    #[serde(rename = "Room_Details")]
     pub room_details: Option<String>,
+    #[serde(rename = "Room_Clean")]
     pub room_clean: Option<String>,
+    #[serde(rename = "Room_Use")]
     pub room_use: Option<String>,
+    #[serde(rename = "Room_Book")]
     pub room_book: Option<String>,
+    #[serde(rename = "Room_Manternace")]
     pub room_manternace: Option<String>,
     #[serde(rename = "Room_PriceA")]
     pub room_price_a: Option<f64>,
@@ -20,7 +26,9 @@ pub struct Room {
     pub room_price_b: Option<f64>,
     #[serde(rename = "Room_PriceC")]
     pub room_price_c: Option<f64>,
+    #[serde(rename = "Room_Group")]
     pub room_group: Option<String>,
+    #[serde(rename = "Room_Book_Name")]
     pub room_book_name: Option<String>,
 }
 
@@ -43,14 +51,20 @@ pub struct CurrentGuest {
 
 /// Detailed room information with current guest
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "PascalCase")]
 pub struct RoomDetail {
+    #[serde(rename = "Room_no")]
     pub room_no: String,
+    #[serde(rename = "Room_Type")]
     pub room_type: Option<String>,
+    #[serde(rename = "Room_Details")]
     pub room_details: Option<String>,
+    #[serde(rename = "Room_Clean")]
     pub room_clean: Option<String>,
+    #[serde(rename = "Room_Use")]
     pub room_use: Option<String>,
+    #[serde(rename = "Room_Book")]
     pub room_book: Option<String>,
+    #[serde(rename = "Room_Manternace")]
     pub room_manternace: Option<String>,
     #[serde(rename = "Room_PriceA")]
     pub room_price_a: Option<f64>,
@@ -58,8 +72,11 @@ pub struct RoomDetail {
     pub room_price_b: Option<f64>,
     #[serde(rename = "Room_PriceC")]
     pub room_price_c: Option<f64>,
+    #[serde(rename = "Room_Group")]
     pub room_group: Option<String>,
+    #[serde(rename = "Room_Book_Name")]
     pub room_book_name: Option<String>,
+    #[serde(rename = "Room_Book_Time")]
     pub room_book_time: Option<NaiveDateTime>,
     #[serde(rename = "currentGuest")]
     pub current_guest: Option<CurrentGuest>,
