@@ -5,6 +5,66 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] - 2026-02-05
+
+### Added
+- **Phase 3 Financial Backend APIs** - Rust/Axum backend endpoints for rate management and financial reports
+  - **Rate Management API** (`/api/new/rates`) - Full CRUD for room rates
+    - `GET /api/new/rates` - List all rates with optional `room_type_id` and `active` filters
+    - `POST /api/new/rates` - Create a new rate (multiplier or fixed type)
+    - `GET /api/new/rates/:id` - Get single rate details
+    - `PUT /api/new/rates/:id` - Update rate configuration
+    - `DELETE /api/new/rates/:id` - Delete a rate
+    - Supports rate fields: name, room type, rate type (multiplier/fixed), value, valid date range, days of week, active status
+  - **Financial Reports API** (`/api/new/reports`) - Revenue and occupancy analytics
+    - `GET /api/new/reports/revenue?from=&to=&group_by=day|week|month` - Revenue report with period grouping
+      - Returns: `{ data: [{ period, revenue, bookings }] }`
+      - Revenue calculated from completed check-ins (rate per night x nights stayed)
+    - `GET /api/new/reports/occupancy?from=&to=` - Occupancy statistics
+      - Returns: occupancy_rate, total_rooms, occupied_nights, available_nights, ADR, RevPAR, avg_stay_length
+      - Occupancy = (Occupied room-nights / Total available room-nights) x 100
+    - `GET /api/new/reports/revenue-by-room-type?from=&to=` - Revenue breakdown by room type
+      - Returns: `[{ room_type, revenue, percentage }]`
+  - **Invoice Data API** (`/api/new/checkins/:id/invoice`) - Complete invoice data retrieval
+    - Returns guest details, room assignment, rate calculations, totals
+    - Includes all data needed for invoice/receipt generation
+
+- **Database Migration** (`migrations/003_alter_ht_rates_table.sql`)
+  - Alters HT_Rates table to support multiplier/fixed rate types
+  - Adds Rate_Type (varchar), Rate_Value (decimal) columns
+  - Renames date columns for API consistency
+  - Adds Rate_Updated timestamp column
+
+## [2.4.0] - 2026-02-05
+
+### Added
+- **Invoice and Receipt Generation** - Phase 3 financial features for hotel billing
+  - `InvoiceTemplate` component (`/components/documents/InvoiceTemplate.tsx`) - Printable invoice layout
+    - Hotel information header with logo, name, address, tax ID
+    - Guest details section (name, ID card, contact)
+    - Room charges table (room number, type, dates, nights, rate, subtotal)
+    - Summary section: subtotal, discount, VAT (optional), grand total
+    - Thai Buddhist Era dates (Gregorian + 543)
+    - Thai/English bilingual labels
+    - Print-optimized CSS with @media print rules for A4 paper
+  - `ReceiptTemplate` component (`/components/documents/ReceiptTemplate.tsx`) - Payment confirmation document
+    - Similar layout to invoice with payment details
+    - Payment method and amount display
+    - Receipt number field
+    - "Paid in Full" indicator (ชำระเงินครบถ้วน / PAID IN FULL)
+    - Signature lines for cashier and guest
+  - `PrintButton` component (`/components/ui/PrintButton.tsx`) - Print/PDF action button
+    - Triggers window.print() for browser printing
+    - Dropdown option for "Save as PDF" via browser print dialog
+    - Thai labels: "พิมพ์" (Print), "บันทึก PDF" (Save PDF)
+    - Size variants (sm, md, lg)
+    - Loading state during print operation
+  - Type definitions (`/types/invoice.ts`)
+    - `InvoiceData` - Invoice data structure
+    - `InvoiceRoom` - Room charge line item
+    - `HotelInfo` - Hotel information
+    - `ReceiptData` - Receipt data extending InvoiceData
+
 ## [2.3.0] - 2026-02-05
 
 ### Added
