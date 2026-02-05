@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.0] - 2026-02-05
+
+### Added
+- **Self-Hosted Database for HotelNew** - Dedicated SQL Server Docker container for the new hotel management system
+  - **Docker Infrastructure**
+    - New `newdb` service in `docker-compose.yml` running `mcr.microsoft.com/mssql/server:2022-latest`
+    - SQL Server Express edition (free, suitable for hotel workloads)
+    - Data persistence via Docker volume `newdb_data`
+    - Health check with automatic service dependency management
+    - Internal Docker network (`hotel-network`) - database not exposed to host
+  - **Database Initialization**
+    - `init-db/init-hotelnew.sql` - Complete database bootstrap script
+    - Combines all migrations (002, 003, 004) into single idempotent script
+    - Creates HotelNew database with all tables, indexes, sequences, and stored procedures
+  - **Environment Configuration**
+    - `NEW_DB_SERVER=newdb` - Backend connects to Docker container via service name
+    - `NEW_DB_PASSWORD=NewHotel@2026!` - Strong password for SA account
+    - `SYSTEM_MODE=new` - Default to New Mode for fresh deployments
+  - **Documentation**
+    - Updated `CLAUDE.md` with dual-database architecture diagram
+    - Updated `.env.example` with new database configuration pattern
+    - First-time setup instructions for database initialization
+  - **CI/CD Pipeline Updates** (`.github/workflows/docker-build.yml`)
+    - Pipeline now copies `init-db/` folder to production server
+    - Automatic database health check with 2-minute timeout
+    - Automatic database initialization after container is healthy
+    - Idempotent deployment - safe to run from scratch or on existing setup
+    - Detailed logging for deployment troubleshooting
+
+### Changed
+- **Backend database connection** - `NEW_DB_SERVER` now points to Docker container (`newdb`) instead of external server (192.168.100.222)
+- **System mode default** - Changed from `legacy` to `new` in docker-compose.yml for new deployments
+
+### Security
+- SQL Server container only accessible within Docker network (not exposed to host)
+- Strong SA password enforced (was using weak `12345678` for legacy connection)
+
 ## [2.7.1] - 2026-02-05
 
 ### Added

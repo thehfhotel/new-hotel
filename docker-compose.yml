@@ -1,4 +1,25 @@
 services:
+  # SQL Server container for HotelNew database (self-hosted)
+  newdb:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: new-hotel-db
+    environment:
+      - ACCEPT_EULA=Y
+      - MSSQL_SA_PASSWORD=NewHotel@2026!
+      - MSSQL_PID=Express
+    volumes:
+      - newdb_data:/var/opt/mssql
+      - ./init-db:/docker-entrypoint-initdb.d:ro
+    networks:
+      - hotel-network
+    healthcheck:
+      test: /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "NewHotel@2026!" -C -Q "SELECT 1" || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
   web:
     image: ghcr.io/thehfhotel/new-hotel:latest
     ports:
@@ -13,25 +34,39 @@ services:
       - BACKEND_URL=http://backend:3003
     depends_on:
       - backend
+    networks:
+      - hotel-network
     restart: unless-stopped
 
   backend:
     image: ghcr.io/thehfhotel/new-hotel-backend:latest
     environment:
-      # Legacy database (shared with legacy application)
+      # Legacy database (external server - shared with legacy application)
       - DB_SERVER=192.168.100.222
       - DB_NAME=db
       - DB_USER=sa
       - DB_PASSWORD=12345678
-      # New database (owned by this application)
-      - NEW_DB_SERVER=192.168.100.222
+      # New database (Docker container - owned by this application)
+      - NEW_DB_SERVER=newdb
       - NEW_DB_NAME=HotelNew
       - NEW_DB_USER=sa
-      - NEW_DB_PASSWORD=12345678
+      - NEW_DB_PASSWORD=NewHotel@2026!
       # System mode: 'legacy' or 'new' (controls which database is primary)
-      - SYSTEM_MODE=legacy
+      - SYSTEM_MODE=new
       - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
       - SLACK_NOTIFICATIONS_ENABLED=true
       - HOST=0.0.0.0
       - PORT=3003
+    depends_on:
+      newdb:
+        condition: service_healthy
+    networks:
+      - hotel-network
     restart: unless-stopped
+
+volumes:
+  newdb_data:
+
+networks:
+  hotel-network:
+    driver: bridge

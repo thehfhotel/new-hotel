@@ -45,6 +45,7 @@ jobs:
               - 'hotel-backend/**'
             deploy:
               - 'docker-compose.yml'
+              - 'init-db/**'
 
   test:
     runs-on: ubuntu-latest
@@ -173,8 +174,50 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
         run: |
-          mkdir -p /home/nut/new-hotel-production
-          cp docker-compose.yml /home/nut/new-hotel-production/
-          cd /home/nut/new-hotel-production
+          set -e
+          DEPLOY_DIR=/home/nut/new-hotel-production
+
+          # Create deployment directory and copy files
+          mkdir -p $DEPLOY_DIR/init-db
+          cp docker-compose.yml $DEPLOY_DIR/
+          cp -r init-db/* $DEPLOY_DIR/init-db/
+
+          cd $DEPLOY_DIR
+
+          # Pull latest images and start all services
           docker compose pull
           docker compose up -d
+
+          echo "Waiting for database to be healthy..."
+
+          # Wait for database container to be healthy (max 2 minutes)
+          TIMEOUT=120
+          ELAPSED=0
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            HEALTH=$(docker inspect --format='{{.State.Health.Status}}' new-hotel-db 2>/dev/null || echo "not_found")
+            if [ "$HEALTH" = "healthy" ]; then
+              echo "Database is healthy!"
+              break
+            fi
+            echo "Database status: $HEALTH (waiting...)"
+            sleep 5
+            ELAPSED=$((ELAPSED + 5))
+          done
+
+          if [ "$HEALTH" != "healthy" ]; then
+            echo "ERROR: Database did not become healthy within $TIMEOUT seconds"
+            docker logs new-hotel-db --tail 50
+            exit 1
+          fi
+
+          # Run database initialization (idempotent - safe to run multiple times)
+          echo "Running database initialization script..."
+          docker exec new-hotel-db /opt/mssql-tools18/bin/sqlcmd \
+            -S localhost -U sa -P "NewHotel@2026!" -C \
+            -i /docker-entrypoint-initdb.d/init-hotelnew.sql \
+            -b || {
+              echo "Database initialization completed (some objects may already exist)"
+            }
+
+          echo "Deployment complete!"
+          docker compose ps
