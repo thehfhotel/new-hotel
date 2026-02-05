@@ -9,13 +9,14 @@ services:
       - DB_USER=sa
       - DB_PASSWORD=***REMOVED***
       - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
-      - SLACK_NOTIFICATIONS_ENABLED=true
+      - SLACK_NOTIFICATIONS_ENABLED=false
+      - BACKEND_URL=http://backend:3003
+    depends_on:
+      - backend
     restart: unless-stopped
 
   backend:
     image: ghcr.io/thehfhotel/new-hotel-backend:latest
-    ports:
-      - "3004:3003"
     environment:
       - DB_SERVER=192.168.100.222
       - DB_NAME=db

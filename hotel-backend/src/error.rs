@@ -32,8 +32,8 @@ impl From<tiberius::error::Error> for ApiError {
     }
 }
 
-impl From<bb8::RunError<tiberius::error::Error>> for ApiError {
-    fn from(err: bb8::RunError<tiberius::error::Error>) -> Self {
+impl From<bb8::RunError<bb8_tiberius::Error>> for ApiError {
+    fn from(err: bb8::RunError<bb8_tiberius::Error>) -> Self {
         ApiError::Database(err.to_string())
     }
 }
