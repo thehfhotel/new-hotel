@@ -200,8 +200,7 @@ pub async fn get_customer_bookings(
                 Book_Room_Type,
                 Book_Date_in,
                 Book_Date_out,
-                Book_Status,
-                Book_Total
+                Book_Status
             FROM View_Booking_Ds
             WHERE Book_Cust_ID = @P1
             ORDER BY Book_Date_in DESC
@@ -232,7 +231,7 @@ pub async fn get_customer_bookings(
                 check_in_date: row.try_get::<NaiveDateTime, _>("Book_Date_in").ok().flatten(),
                 check_out_date: row.try_get::<NaiveDateTime, _>("Book_Date_out").ok().flatten(),
                 status: status.to_string(),
-                total_amount: row.get::<f64, _>("Book_Total").unwrap_or(0.0),
+                total_amount: 0.0,
             }
         })
         .collect();
