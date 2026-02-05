@@ -40,6 +40,7 @@ sqlcmd -S 192.168.100.222 -d HotelDB -U username -P password -i migrations/001_c
 | 001 | `001_create_booking_notes_table.sql` | Creates HT_Booking_Notes table for booking annotations | v1.16.0 |
 | 002 | `002_create_new_hotel_database.sql` | Creates new HotelNew database with all application-owned tables | Pending |
 | 003 | `003_alter_ht_rates_table.sql` | Alters HT_Rates table to support multiplier/fixed rate types for Phase 3 Financial features | Pending |
+| 004 | `004_create_inventory_tables.sql` | Creates inventory management tables (categories, items, room inventory, transactions) | Pending |
 
 ## Tables Owned by This Application
 
@@ -64,6 +65,10 @@ These tables are created by migration 002 in the new HotelNew database:
 | `HT_Guest_Registry` | Guest registry for TM30 compliance | v2.0.0 |
 | `HT_Rates` | Room rates by type and date range | v2.0.0 |
 | `HT_Settings` | Application settings key-value store | v2.0.0 |
+| `HT_Inventory_Categories` | Inventory categories (Minibar, Amenities, Linens, Equipment) | v2.1.0 |
+| `HT_Inventory_Items` | Inventory items with stock tracking | v2.1.0 |
+| `HT_Room_Inventory` | Items assigned to each room | v2.1.0 |
+| `HT_Inventory_Transactions` | Stock movement transactions (IN, OUT, ADJUST, MOVE) | v2.1.0 |
 
 ## Tables Used (Read-Only or Shared)
 

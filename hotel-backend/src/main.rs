@@ -156,6 +156,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/new/reports/revenue-by-room-type", get(routes::new_reports::get_revenue_by_room_type))
         // Invoice
         .route("/api/new/checkins/:id/invoice", get(routes::new_invoice::get_invoice))
+        // Inventory Management
+        .route("/api/new/inventory/categories", get(routes::new_inventory::list_categories).post(routes::new_inventory::create_category))
+        .route("/api/new/inventory/items", get(routes::new_inventory::list_items).post(routes::new_inventory::create_item))
+        .route("/api/new/inventory/items/:id", get(routes::new_inventory::get_item).put(routes::new_inventory::update_item).delete(routes::new_inventory::delete_item))
+        .route("/api/new/inventory/rooms/:room_id", get(routes::new_inventory::get_room_inventory).put(routes::new_inventory::update_room_inventory))
+        .route("/api/new/inventory/transactions", get(routes::new_inventory::list_transactions).post(routes::new_inventory::create_transaction))
+        .route("/api/new/inventory/stats", get(routes::new_inventory::get_stats))
+        .route("/api/new/inventory/low-stock", get(routes::new_inventory::get_low_stock))
         .with_state(app_state);
 
     // Merge all routes
