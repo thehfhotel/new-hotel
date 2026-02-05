@@ -133,8 +133,8 @@ pub async fn get_room(
 
     let current_guest = checkin_rows.first().map(|row| CurrentGuest {
         name: row.get::<&str, _>("Cin_Cust_Name").map(String::from),
-        check_in: row.get::<NaiveDateTime, _>("Cin_Room_In"),
-        check_out: row.get::<NaiveDateTime, _>("Cin_Room_Out"),
+        check_in: row.try_get::<NaiveDateTime, _>("Cin_Room_In").ok().flatten(),
+        check_out: row.try_get::<NaiveDateTime, _>("Cin_Room_Out").ok().flatten(),
     });
 
     let room = RoomDetail {
@@ -153,7 +153,7 @@ pub async fn get_room(
         room_price_c: room_row.get::<f64, _>("Room_PriceC"),
         room_group: room_row.get::<&str, _>("Room_Group").map(String::from),
         room_book_name: room_row.get::<&str, _>("Room_Book_Name").map(String::from),
-        room_book_time: room_row.get::<NaiveDateTime, _>("Room_Book_Time"),
+        room_book_time: room_row.try_get::<NaiveDateTime, _>("Room_Book_Time").ok().flatten(),
         current_guest,
     };
 
