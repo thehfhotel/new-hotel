@@ -68,12 +68,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/rooms/checkouts-today",
             get(routes::rooms::get_checkouts_today),
         )
-        .route("/api/rooms/{id}", get(routes::rooms::get_room))
+        .route("/api/rooms/:id", get(routes::rooms::get_room))
         // Bookings routes
         .route("/api/bookings", get(routes::bookings::list_bookings))
-        .route("/api/bookings/{id}", get(routes::bookings::get_booking))
+        .route("/api/bookings/:id", get(routes::bookings::get_booking))
         .route(
-            "/api/bookings/{id}/notes",
+            "/api/bookings/:id/notes",
             get(routes::bookings::get_notes)
                 .post(routes::bookings::create_note)
                 .delete(routes::bookings::delete_note),
@@ -83,11 +83,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Customers routes
         .route("/api/customers", get(routes::customers::list_customers))
         .route(
-            "/api/customers/{id}/bookings",
+            "/api/customers/:id/bookings",
             get(routes::customers::get_customer_bookings),
         )
         .route(
-            "/api/customers/{id}/stats",
+            "/api/customers/:id/stats",
             get(routes::customers::get_customer_stats),
         )
         // Stats and occupancy routes
