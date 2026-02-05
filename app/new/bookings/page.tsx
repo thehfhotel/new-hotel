@@ -1,0 +1,641 @@
+'use client'
+
+import { useState, useEffect, useCallback } from 'react'
+import {
+  Search,
+  Filter,
+  ChevronLeft,
+  ChevronRight,
+  Loader2,
+  AlertCircle,
+  Calendar,
+  RefreshCw,
+  Plus,
+  X,
+  BedDouble,
+  Edit3,
+} from 'lucide-react'
+import DatePicker from 'react-datepicker'
+import 'react-datepicker/dist/react-datepicker.css'
+import BookingForm, { BookingFormData } from '@/components/forms/BookingForm'
+import { RoomOption } from '@/components/pickers/RoomPicker'
+
+// Types
+interface BookingRoom {
+  id: number
+  roomId: number
+  roomNo: string | null
+  roomTypeName: string | null
+  pricePerNight: number | null
+}
+
+interface Booking {
+  id: number
+  bookNo: string
+  customerId: number
+  customerName: string | null
+  checkIn: string | null
+  checkOut: string | null
+  nights: number | null
+  adults: number | null
+  children: number | null
+  status: string
+  source: string | null
+  totalAmount: number | null
+  depositAmount: number | null
+  notes: string | null
+  roomCount: number
+  createdAt: string | null
+}
+
+interface BookingDetail extends Booking {
+  rooms: BookingRoom[]
+}
+
+interface BookingsResponse {
+  success: boolean
+  data: Booking[]
+  pagination: {
+    page: number
+    limit: number
+    total: number
+    totalPages: number
+  }
+}
+
+const statusOptions = [
+  { value: '', label: 'สถานะทั้งหมด' },
+  { value: 'pending', label: 'รอยืนยัน' },
+  { value: 'confirmed', label: 'ยืนยันแล้ว' },
+  { value: 'checkedin', label: 'เช็คอินแล้ว' },
+  { value: 'completed', label: 'เสร็จสิ้น' },
+  { value: 'cancelled', label: 'ยกเลิก' },
+  { value: 'noshow', label: 'ไม่มาตามนัด' },
+]
+
+const statusColors: Record<string, string> = {
+  pending: 'bg-yellow-100 text-yellow-700',
+  confirmed: 'bg-blue-100 text-blue-700',
+  checkedin: 'bg-green-100 text-green-700',
+  completed: 'bg-gray-100 text-gray-700',
+  cancelled: 'bg-red-100 text-red-700',
+  noshow: 'bg-purple-100 text-purple-700',
+}
+
+const statusLabels: Record<string, string> = {
+  pending: 'รอยืนยัน',
+  confirmed: 'ยืนยันแล้ว',
+  checkedin: 'เช็คอินแล้ว',
+  completed: 'เสร็จสิ้น',
+  cancelled: 'ยกเลิก',
+  noshow: 'ไม่มาตามนัด',
+}
+
+// Convert Gregorian year to Buddhist Era display
+function formatDateBE(dateString: string | null): string {
+  if (!dateString) return '-'
+  const date = new Date(dateString)
+  const year = date.getFullYear() + 543
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${day}/${month}/${year.toString().slice(-2)}`
+}
+
+// Format date for API (YYYY-MM-DD)
+function formatDateForApi(date: Date): string {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+export default function NewBookingsPage() {
+  // State
+  const [bookings, setBookings] = useState<Booking[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  // Pagination
+  const [currentPage, setCurrentPage] = useState(1)
+  const [totalPages, setTotalPages] = useState(1)
+  const [totalItems, setTotalItems] = useState(0)
+  const itemsPerPage = 20
+
+  // Filters
+  const [statusFilter, setStatusFilter] = useState('')
+  const [dateRange, setDateRange] = useState<[Date | null, Date | null]>([null, null])
+  const [startDate, endDate] = dateRange
+  const [searchTerm, setSearchTerm] = useState('')
+  const [debouncedSearch, setDebouncedSearch] = useState('')
+
+  // Form modal
+  const [showForm, setShowForm] = useState(false)
+  const [formMode, setFormMode] = useState<'create' | 'edit'>('create')
+  const [editingBooking, setEditingBooking] = useState<BookingFormData | null>(null)
+  const [loadingDetail, setLoadingDetail] = useState(false)
+
+  // Debounce search
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearch(searchTerm)
+      setCurrentPage(1)
+    }, 300)
+    return () => clearTimeout(timer)
+  }, [searchTerm])
+
+  // Fetch bookings
+  const fetchBookings = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+
+    try {
+      const params = new URLSearchParams({
+        page: currentPage.toString(),
+        limit: itemsPerPage.toString(),
+        sortBy: 'createdAt',
+        sortOrder: 'desc',
+      })
+
+      if (statusFilter) params.append('status', statusFilter)
+      if (startDate) params.append('startDate', formatDateForApi(startDate))
+      if (endDate) params.append('endDate', formatDateForApi(endDate))
+      if (debouncedSearch) params.append('search', debouncedSearch)
+
+      const response = await fetch(`/api/new/bookings?${params.toString()}`)
+
+      if (!response.ok) {
+        throw new Error('ไม่สามารถดึงข้อมูลการจองได้')
+      }
+
+      const data: BookingsResponse = await response.json()
+
+      if (!data.success) {
+        throw new Error('ไม่สามารถดึงข้อมูลการจองได้')
+      }
+
+      setBookings(data.data)
+      setTotalPages(data.pagination.totalPages)
+      setTotalItems(data.pagination.total)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'เกิดข้อผิดพลาด')
+    } finally {
+      setLoading(false)
+    }
+  }, [currentPage, statusFilter, startDate, endDate, debouncedSearch])
+
+  useEffect(() => {
+    fetchBookings()
+  }, [fetchBookings])
+
+  // Handle filter reset
+  const handleResetFilters = () => {
+    setStatusFilter('')
+    setDateRange([null, null])
+    setSearchTerm('')
+    setCurrentPage(1)
+  }
+
+  // Pagination handlers
+  const goToPage = (page: number) => {
+    if (page >= 1 && page <= totalPages) {
+      setCurrentPage(page)
+    }
+  }
+
+  // Handle add new booking
+  const handleAddBooking = () => {
+    setEditingBooking(null)
+    setFormMode('create')
+    setShowForm(true)
+  }
+
+  // Handle edit booking
+  const handleEditBooking = async (booking: Booking) => {
+    setLoadingDetail(true)
+    try {
+      const response = await fetch(`/api/new/bookings/${booking.id}`)
+      if (!response.ok) {
+        throw new Error('ไม่สามารถดึงข้อมูลการจองได้')
+      }
+      const data = await response.json()
+      if (!data.success) {
+        throw new Error('ไม่สามารถดึงข้อมูลการจองได้')
+      }
+
+      const detail: BookingDetail = data.booking
+
+      setEditingBooking({
+        id: detail.id,
+        bookNo: detail.bookNo,
+        customerId: detail.customerId,
+        customerName: detail.customerName || undefined,
+        checkIn: detail.checkIn ? detail.checkIn.split('T')[0] : '',
+        checkOut: detail.checkOut ? detail.checkOut.split('T')[0] : '',
+        adults: detail.adults || 1,
+        children: detail.children || 0,
+        status: detail.status,
+        source: detail.source,
+        depositAmount: detail.depositAmount,
+        notes: detail.notes,
+        rooms: detail.rooms.map((r) => ({
+          roomId: r.roomId,
+          pricePerNight: r.pricePerNight,
+        })),
+      })
+      setFormMode('edit')
+      setShowForm(true)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'เกิดข้อผิดพลาด')
+    } finally {
+      setLoadingDetail(false)
+    }
+  }
+
+  // Handle save booking
+  const handleSaveBooking = async (data: BookingFormData) => {
+    const endpoint = data.id
+      ? `/api/new/bookings/${data.id}`
+      : '/api/new/bookings'
+    const method = data.id ? 'PUT' : 'POST'
+
+    const response = await fetch(endpoint, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        customerId: data.customerId,
+        checkIn: data.checkIn,
+        checkOut: data.checkOut,
+        adults: data.adults,
+        children: data.children,
+        status: data.status,
+        source: data.source,
+        totalAmount: null, // Calculate on backend or later
+        depositAmount: data.depositAmount,
+        notes: data.notes,
+        rooms: data.rooms,
+      }),
+    })
+
+    const result = await response.json()
+
+    if (!response.ok || !result.success) {
+      throw new Error(result.message || 'Failed to save booking')
+    }
+
+    // Refresh the list
+    fetchBookings()
+  }
+
+  // Handle cancel booking
+  const handleCancelBooking = async (id: number) => {
+    const response = await fetch(`/api/new/bookings/${id}/cancel`, {
+      method: 'PUT',
+    })
+
+    const result = await response.json()
+
+    if (!response.ok || !result.success) {
+      throw new Error(result.message || 'Failed to cancel booking')
+    }
+
+    // Refresh the list
+    fetchBookings()
+  }
+
+  // Close form
+  const handleCloseForm = () => {
+    setShowForm(false)
+    setEditingBooking(null)
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900">การจอง (New Mode)</h1>
+          <p className="text-sm text-gray-500 mt-1">
+            {totalItems.toLocaleString()} รายการ
+          </p>
+        </div>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={fetchBookings}
+            disabled={loading}
+            className="flex items-center space-x-2 px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 disabled:opacity-50"
+          >
+            <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
+            <span className="hidden sm:inline">รีเฟรช</span>
+          </button>
+          <button
+            onClick={handleAddBooking}
+            className="flex items-center space-x-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+          >
+            <Plus className="h-4 w-4" />
+            <span>เพิ่มการจอง</span>
+          </button>
+        </div>
+      </div>
+
+      {/* Filters */}
+      <div className="bg-white rounded-lg shadow p-4">
+        <div className="flex items-center space-x-2 mb-4">
+          <Filter className="h-5 w-5 text-gray-500" />
+          <span className="font-medium text-gray-700">ตัวกรอง</span>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+          {/* Search */}
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-gray-400" />
+            <input
+              type="text"
+              placeholder="ค้นหาเลขจอง/ชื่อลูกค้า..."
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+            />
+            {searchTerm && (
+              <button
+                onClick={() => setSearchTerm('')}
+                className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-400 hover:text-gray-600"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            )}
+          </div>
+
+          {/* Status Filter */}
+          <div>
+            <select
+              value={statusFilter}
+              onChange={(e) => {
+                setStatusFilter(e.target.value)
+                setCurrentPage(1)
+              }}
+              className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+            >
+              {statusOptions.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Date Range Selector */}
+          <div className="relative">
+            <div className="flex items-center border border-gray-300 rounded-lg overflow-hidden focus-within:ring-2 focus-within:ring-blue-500 focus-within:border-blue-500">
+              <div className="flex items-center px-3 bg-gray-50 border-r border-gray-300 py-2">
+                <Calendar className="h-4 w-4 text-gray-400" />
+              </div>
+              <DatePicker
+                selectsRange
+                startDate={startDate}
+                endDate={endDate}
+                onChange={(update) => {
+                  setDateRange(update)
+                  setCurrentPage(1)
+                }}
+                placeholderText="เลือกช่วงวันที่"
+                className="w-full px-3 py-2 border-0 focus:ring-0 text-sm focus:outline-none"
+                dateFormat="dd/MM/yy"
+                isClearable
+              />
+            </div>
+          </div>
+
+          {/* Reset Button */}
+          <div>
+            <button
+              onClick={handleResetFilters}
+              className="w-full px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50"
+            >
+              ล้างตัวกรอง
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Table */}
+      <div className="bg-white rounded-lg shadow overflow-hidden">
+        {loading ? (
+          <div className="flex items-center justify-center py-12">
+            <Loader2 className="h-8 w-8 animate-spin text-blue-600" />
+            <span className="ml-2 text-gray-600">กำลังโหลด...</span>
+          </div>
+        ) : error ? (
+          <div className="flex items-center justify-center py-12 text-red-600">
+            <AlertCircle className="h-6 w-6 mr-2" />
+            <span>{error}</span>
+          </div>
+        ) : bookings.length === 0 ? (
+          <div className="text-center py-12 text-gray-500">
+            <Calendar className="h-12 w-12 mx-auto text-gray-300 mb-3" />
+            <p>ไม่พบข้อมูลการจอง</p>
+          </div>
+        ) : (
+          <>
+            <div className="overflow-x-auto">
+              <table className="w-full table-fixed divide-y divide-gray-200">
+                <thead className="bg-gray-50">
+                  <tr>
+                    <th className="w-28 px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      เลขที่จอง
+                    </th>
+                    <th className="w-24 px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      วันที่จอง
+                    </th>
+                    <th className="w-24 px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      สถานะ
+                    </th>
+                    <th className="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      ลูกค้า
+                    </th>
+                    <th className="w-24 px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      เช็คอิน
+                    </th>
+                    <th className="w-24 px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      เช็คเอาท์
+                    </th>
+                    <th className="w-20 px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      ห้อง
+                    </th>
+                    <th className="w-16 px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="bg-white divide-y divide-gray-200">
+                  {bookings.map((booking) => (
+                    <tr
+                      key={booking.id}
+                      onClick={() => handleEditBooking(booking)}
+                      className="hover:bg-blue-50 cursor-pointer"
+                    >
+                      <td className="px-3 py-3 truncate">
+                        <span className="text-sm font-medium text-blue-600">
+                          {booking.bookNo}
+                        </span>
+                      </td>
+                      <td className="px-3 py-3 text-sm text-gray-900">
+                        {formatDateBE(booking.createdAt)}
+                      </td>
+                      <td className="px-3 py-3">
+                        <span
+                          className={`inline-block px-2 py-1 text-xs rounded-full ${
+                            statusColors[booking.status] || 'bg-gray-100 text-gray-700'
+                          }`}
+                        >
+                          {statusLabels[booking.status] || booking.status}
+                        </span>
+                      </td>
+                      <td className="px-3 py-3 truncate">
+                        <span className="text-sm text-gray-900">
+                          {booking.customerName || '-'}
+                        </span>
+                      </td>
+                      <td className="px-3 py-3 text-sm text-gray-900">
+                        {formatDateBE(booking.checkIn)}
+                      </td>
+                      <td className="px-3 py-3 text-sm text-gray-900">
+                        {formatDateBE(booking.checkOut)}
+                      </td>
+                      <td className="px-3 py-3">
+                        <div className="flex items-center gap-1">
+                          <BedDouble size={14} className="text-gray-400" />
+                          <span className="text-sm text-gray-900">
+                            {booking.roomCount}
+                          </span>
+                        </div>
+                      </td>
+                      <td className="px-3 py-3">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            handleEditBooking(booking)
+                          }}
+                          className="p-1.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg"
+                          title="แก้ไข"
+                        >
+                          <Edit3 className="w-4 h-4" />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Pagination */}
+            <div className="bg-white px-4 py-3 flex items-center justify-between border-t border-gray-200 sm:px-6">
+              <div className="flex-1 flex justify-between sm:hidden">
+                <button
+                  onClick={() => goToPage(currentPage - 1)}
+                  disabled={currentPage === 1}
+                  className="relative inline-flex items-center px-4 py-2 border border-gray-300 text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  ก่อนหน้า
+                </button>
+                <button
+                  onClick={() => goToPage(currentPage + 1)}
+                  disabled={currentPage === totalPages}
+                  className="ml-3 relative inline-flex items-center px-4 py-2 border border-gray-300 text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  ถัดไป
+                </button>
+              </div>
+              <div className="hidden sm:flex-1 sm:flex sm:items-center sm:justify-between">
+                <div>
+                  <p className="text-sm text-gray-700">
+                    แสดง{' '}
+                    <span className="font-medium">
+                      {(currentPage - 1) * itemsPerPage + 1}
+                    </span>{' '}
+                    ถึง{' '}
+                    <span className="font-medium">
+                      {Math.min(currentPage * itemsPerPage, totalItems)}
+                    </span>{' '}
+                    จาก{' '}
+                    <span className="font-medium">{totalItems}</span>{' '}
+                    รายการ
+                  </p>
+                </div>
+                <div>
+                  <nav
+                    className="relative z-0 inline-flex rounded-md shadow-sm -space-x-px"
+                    aria-label="Pagination"
+                  >
+                    <button
+                      onClick={() => goToPage(currentPage - 1)}
+                      disabled={currentPage === 1}
+                      className="relative inline-flex items-center px-2 py-2 rounded-l-md border border-gray-300 bg-white text-sm font-medium text-gray-500 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <ChevronLeft className="h-5 w-5" />
+                    </button>
+
+                    {/* Page numbers */}
+                    {Array.from({ length: Math.min(5, totalPages) }, (_, i) => {
+                      let pageNum: number
+                      if (totalPages <= 5) {
+                        pageNum = i + 1
+                      } else if (currentPage <= 3) {
+                        pageNum = i + 1
+                      } else if (currentPage >= totalPages - 2) {
+                        pageNum = totalPages - 4 + i
+                      } else {
+                        pageNum = currentPage - 2 + i
+                      }
+
+                      return (
+                        <button
+                          key={pageNum}
+                          onClick={() => goToPage(pageNum)}
+                          className={`relative inline-flex items-center px-4 py-2 border text-sm font-medium ${
+                            currentPage === pageNum
+                              ? 'z-10 bg-blue-50 border-blue-500 text-blue-600'
+                              : 'bg-white border-gray-300 text-gray-500 hover:bg-gray-50'
+                          }`}
+                        >
+                          {pageNum}
+                        </button>
+                      )
+                    })}
+
+                    <button
+                      onClick={() => goToPage(currentPage + 1)}
+                      disabled={currentPage === totalPages}
+                      className="relative inline-flex items-center px-2 py-2 rounded-r-md border border-gray-300 bg-white text-sm font-medium text-gray-500 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <ChevronRight className="h-5 w-5" />
+                    </button>
+                  </nav>
+                </div>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* Loading overlay for detail fetch */}
+      {loadingDetail && (
+        <div className="fixed inset-0 bg-black bg-opacity-30 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg p-6 flex items-center gap-3">
+            <Loader2 className="w-6 h-6 animate-spin text-blue-600" />
+            <span className="text-gray-700">กำลังโหลดข้อมูล...</span>
+          </div>
+        </div>
+      )}
+
+      {/* Booking Form Modal */}
+      <BookingForm
+        isOpen={showForm}
+        onClose={handleCloseForm}
+        onSave={handleSaveBooking}
+        onCancel={handleCancelBooking}
+        initialData={editingBooking}
+        mode={formMode}
+      />
+    </div>
+  )
+}
