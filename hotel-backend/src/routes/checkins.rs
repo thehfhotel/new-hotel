@@ -38,19 +38,19 @@ pub async fn list_checkins(
 
     let offset = (params.page - 1) * params.limit;
 
-    // Build WHERE conditions
+    // Build WHERE conditions with direct value interpolation
     let mut conditions: Vec<String> = Vec::new();
 
-    if params.status.is_some() {
-        conditions.push(format!("Cin_status = @P{}", conditions.len() + 1));
+    if let Some(ref status) = params.status {
+        conditions.push(format!("Cin_status = '{}'", status.replace('\'', "''")));
     }
 
-    if params.start_date.is_some() {
-        conditions.push(format!("Cin_Room_In >= @P{}", conditions.len() + 1));
+    if let Some(ref start_date) = params.start_date {
+        conditions.push(format!("Cin_Room_In >= '{}'", start_date.replace('\'', "''")));
     }
 
-    if params.end_date.is_some() {
-        conditions.push(format!("Cin_Room_Out <= @P{}", conditions.len() + 1));
+    if let Some(ref end_date) = params.end_date {
+        conditions.push(format!("Cin_Room_Out <= '{}'", end_date.replace('\'', "''")));
     }
 
     let where_clause = if conditions.is_empty() {
