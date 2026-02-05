@@ -121,12 +121,15 @@ export default function StayTimeline({
         }
       })
 
+      // Sum roomCount for bookings (each booking can have multiple rooms)
+      const bookingRoomCount = bookingStays.reduce((sum, s) => sum + (s.roomCount || 1), 0)
+
       return {
         date: day,
         continuing: continuingStays.length,
         newCheckin: newCheckinStays.length,
-        booking: bookingStays.length,
-        total: continuingStays.length + newCheckinStays.length + bookingStays.length,
+        booking: bookingRoomCount,
+        total: continuingStays.length + newCheckinStays.length + bookingRoomCount,
         continuingStays,
         newCheckinStays,
         bookingStays,
@@ -140,7 +143,8 @@ export default function StayTimeline({
   // Stats
   const stats = useMemo(() => {
     const totalCheckins = stays.filter(s => s.type === 'checkin').length
-    const totalBookings = stays.filter(s => s.type === 'booking').length
+    // Sum roomCount for bookings (each booking can have multiple rooms)
+    const totalBookings = stays.filter(s => s.type === 'booking').reduce((sum, s) => sum + (s.roomCount || 1), 0)
     const avgOccupancy = dayData.length > 0
       ? (dayData.reduce((sum, d) => sum + d.total, 0) / dayData.length).toFixed(1)
       : '0'
