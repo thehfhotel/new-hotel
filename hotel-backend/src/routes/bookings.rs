@@ -53,34 +53,29 @@ pub async fn list_bookings(
 ) -> ApiResult<Json<BookingsResponse>> {
     let mut conn = pool.get().await?;
 
-    // Build WHERE conditions
+    // Build WHERE conditions with direct value interpolation
     let mut conditions: Vec<String> = Vec::new();
-    let mut param_values: Vec<String> = Vec::new();
 
     if let Some(ref search) = params.search {
+        let escaped = search.replace('\'', "''");
         conditions.push(format!(
-            "(Book_No LIKE @P{} OR Book_Cust_Name LIKE @P{})",
-            param_values.len() + 1,
-            param_values.len() + 1
+            "(Book_No LIKE '%{}%' OR Book_Cust_Name LIKE '%{}%')",
+            escaped, escaped
         ));
-        param_values.push(format!("%{}%", search));
     }
 
     if let Some(ref status) = params.status {
         if let Some(code) = get_status_code(status) {
-            conditions.push(format!("Book_Status = @P{}", param_values.len() + 1));
-            param_values.push(code.to_string());
+            conditions.push(format!("Book_Status = {}", code));
         }
     }
 
     if let Some(ref start_date) = params.start_date {
-        conditions.push(format!("Book_Date_in >= @P{}", param_values.len() + 1));
-        param_values.push(start_date.clone());
+        conditions.push(format!("Book_Date_in >= '{}'", start_date.replace('\'', "''")));
     }
 
     if let Some(ref end_date) = params.end_date {
-        conditions.push(format!("Book_Date_out <= @P{}", param_values.len() + 1));
-        param_values.push(end_date.clone());
+        conditions.push(format!("Book_Date_out <= '{}'", end_date.replace('\'', "''")));
     }
 
     let where_clause = if conditions.is_empty() {
