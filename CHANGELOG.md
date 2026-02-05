@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-02-05
+
+### Added
+- **Quick Check-In/Check-Out Modals for New Mode** - Dashboard room cards now support quick actions
+  - `QuickCheckInModal` - Walk-in guest check-in form with customer search, expected checkout date picker, rate per night input
+  - `CheckOutModal` - Checkout confirmation with stay summary, total calculation (nights x rate), payment method selection
+  - Thai Buddhist Era (B.E.) date display support
+  - Payment methods: Cash, Credit Card, Transfer
+- **RoomGrid Enhanced for New Mode** - Room cards show action buttons when in New Mode
+  - Available rooms: "Quick Check-In" button
+  - Occupied/Checkout rooms: "Check-Out" button
+  - Visual indicator for New Mode active
+
+### Changed
+- Dashboard page now detects system mode via `useMode()` hook
+- Room grid displays appropriate actions based on room status and system mode
+
+## [2.1.0] - 2026-02-05
+
+### Added
+- **Dual-Database Architecture** - Support for both legacy and new HotelNew database
+  - New database `HotelNew` with application-owned tables (HT_Customers, HT_Rooms_New, HT_Bookings, HT_CheckIns, etc.)
+  - Migration file `migrations/002_create_new_hotel_database.sql` with complete schema
+  - Backend supports dual connection pools (legacy + new_hotel)
+  - System mode toggle: Legacy (view-only) vs New (full CRUD)
+- **Mode Toggle UI** - Navbar button to switch between Legacy and New modes
+  - Mode persisted in localStorage
+  - Visual indicators: amber for Legacy, green for New
+  - Calendar page shows data source indicator
+- **Hybrid Calendar Endpoint** - `/api/calendar` fetches from both databases in New mode
+  - Color-coded entries by data source (legacy vs new)
+  - Combined view of bookings and check-ins from both systems
+- **New Database CRUD Routes** (Rust backend)
+  - `/api/new/customers` - Full CRUD for HT_Customers
+  - `/api/new/rooms` - Full CRUD for HT_Rooms_New
+  - `/api/new/bookings` - Full CRUD for HT_Bookings with room assignments
+  - `/api/new/checkins` - Check-in/check-out management
+  - `/api/mode` - Get current system mode
+
+### Changed
+- Calendar page now uses mode context to fetch from appropriate endpoint
+- Frontend wrapped with ModeProvider for global mode state
+
 ## [2.0.0] - 2026-02-05
 
 ### Changed

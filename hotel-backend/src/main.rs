@@ -2,6 +2,10 @@
 //!
 //! A Rust/Axum backend server for the hotel management system.
 //! Replaces the Next.js API routes with a high-performance Rust implementation.
+//!
+//! Supports dual-database architecture:
+//! - Legacy database (shared with legacy application)
+//! - New HotelNew database (owned by this application)
 
 mod config;
 mod db;
@@ -13,7 +17,7 @@ mod scheduler;
 mod utils;
 
 use axum::{
-    routing::{delete, get, post},
+    routing::{get, patch, post, put, delete},
     Router,
 };
 use tower_http::cors::{Any, CorsLayer};
@@ -21,7 +25,8 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::AppConfig;
-use crate::db::create_pool;
+use crate::db::{create_pool, create_dual_pool};
+use crate::routes::mode::{AppState, SystemMode};
 use crate::scheduler::init_scheduler;
 
 #[tokio::main]
@@ -41,15 +46,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load configuration
     let config = AppConfig::from_env();
     tracing::info!("Configuration loaded");
-    tracing::info!("Database: {}", config.db.server);
+    tracing::info!("Legacy Database: {} / {}", config.db.server, config.db.database);
+    tracing::info!("New Database: {} / {}", config.new_db.server, config.new_db.database);
+    tracing::info!("System Mode: {:?}", config.mode);
     tracing::info!("Server: {}", config.server.addr());
 
-    // Create database connection pool
-    let pool = create_pool(&config.db).await?;
-    tracing::info!("Database pool created");
+    // Create legacy database connection pool (for backward compatibility)
+    let legacy_pool = create_pool(&config.db).await?;
+    tracing::info!("Legacy database pool created");
+
+    // Try to create dual database pools
+    let (app_state, dual_pool_available) = match create_dual_pool(&config).await {
+        Ok(dual_pool) => {
+            tracing::info!("Dual database pools created successfully");
+            let mode = match config.mode {
+                config::SystemMode::Legacy => SystemMode::Legacy,
+                config::SystemMode::New => SystemMode::New,
+            };
+            (AppState::with_mode(dual_pool.legacy.clone(), dual_pool.new_hotel, mode), true)
+        }
+        Err(e) => {
+            tracing::warn!("Failed to create new_hotel pool (will use legacy only): {}", e);
+            // Create AppState with legacy pool for both (new features will be disabled)
+            (AppState::with_mode(legacy_pool.clone(), legacy_pool.clone(), SystemMode::Legacy), false)
+        }
+    };
 
     // Initialize scheduler for background jobs
-    if let Err(e) = init_scheduler(pool.clone(), config.slack.clone()).await {
+    if let Err(e) = init_scheduler(legacy_pool.clone(), config.slack.clone()).await {
         tracing::warn!("Failed to initialize scheduler: {}", e);
     }
 
@@ -59,8 +83,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    // Build the router
-    let app = Router::new()
+    // Build legacy routes (use legacy_pool as state)
+    let legacy_routes = Router::new()
         // Rooms routes
         .route("/api/rooms", get(routes::rooms::list_rooms))
         .route("/api/rooms/status", get(routes::rooms::get_room_status))
@@ -93,10 +117,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Stats and occupancy routes
         .route("/api/stats", get(routes::stats::get_stats))
         .route("/api/occupancy", get(routes::occupancy::get_occupancy))
-        // Middleware
+        .with_state(legacy_pool);
+
+    // Build new routes (use AppState for dual-database access)
+    let new_routes = Router::new()
+        // Mode and calendar routes
+        .route("/api/mode", get(routes::mode::get_mode))
+        .route("/api/calendar", get(routes::calendar::get_calendar))
+        // New stats
+        .route("/api/new/stats", get(routes::new_stats::get_stats))
+        // New customers CRUD
+        .route("/api/new/customers", get(routes::new_customers::list_customers).post(routes::new_customers::create_customer))
+        .route("/api/new/customers/:id", get(routes::new_customers::get_customer).put(routes::new_customers::update_customer).delete(routes::new_customers::delete_customer))
+        // New rooms CRUD
+        .route("/api/new/rooms", get(routes::new_rooms::list_rooms).post(routes::new_rooms::create_room))
+        .route("/api/new/rooms/:id", get(routes::new_rooms::get_room).put(routes::new_rooms::update_room))
+        .route("/api/new/rooms/:id/status", patch(routes::new_rooms::update_room_status))
+        // New bookings CRUD
+        .route("/api/new/bookings", get(routes::new_bookings::list_bookings).post(routes::new_bookings::create_booking))
+        .route("/api/new/bookings/:id", get(routes::new_bookings::get_booking).put(routes::new_bookings::update_booking))
+        .route("/api/new/bookings/:id/cancel", put(routes::new_bookings::cancel_booking))
+        // New check-ins CRUD
+        .route("/api/new/checkins", get(routes::new_checkins::list_checkins).post(routes::new_checkins::create_checkin))
+        .route("/api/new/checkins/:id", get(routes::new_checkins::get_checkin))
+        .route("/api/new/checkins/:id/checkout", put(routes::new_checkins::checkout))
+        .with_state(app_state);
+
+    // Merge all routes
+    let app = Router::new()
+        .merge(legacy_routes)
+        .merge(new_routes)
         .layer(cors)
-        .layer(TraceLayer::new_for_http())
-        .with_state(pool);
+        .layer(TraceLayer::new_for_http());
+
+    // Log dual pool status
+    if dual_pool_available {
+        tracing::info!("New database features enabled");
+    } else {
+        tracing::warn!("New database features disabled (legacy mode only)");
+    }
 
     // Start the server
     let listener = tokio::net::TcpListener::bind(&config.server.addr()).await?;

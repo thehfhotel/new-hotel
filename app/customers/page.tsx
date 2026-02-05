@@ -2,8 +2,26 @@
 
 import { useState, useEffect, useCallback } from 'react'
 import { format } from 'date-fns'
-import { X, Users, Search, User, Phone, CreditCard, MapPin, Calendar, Home, CalendarDays, TrendingUp, Clock, Star } from 'lucide-react'
+import {
+  X,
+  Users,
+  Search,
+  User,
+  Phone,
+  CreditCard,
+  MapPin,
+  Calendar,
+  Home,
+  CalendarDays,
+  TrendingUp,
+  Clock,
+  Star,
+  Plus,
+  Edit3,
+} from 'lucide-react'
 import DataTable, { Column, PaginationInfo } from '@/components/DataTable'
+import CustomerForm, { CustomerFormData } from '@/components/forms/CustomerForm'
+import { useMode } from '@/contexts/ModeContext'
 
 interface Customer {
   id: string
@@ -13,6 +31,21 @@ interface Customer {
   idCard: string
   address: string
   lastVisit: string | null
+}
+
+interface NewCustomer {
+  id: number
+  firstName: string
+  lastName: string
+  phone: string
+  email: string
+  idCard: string
+  address: string
+  notes: string
+  customerType: string
+  active: boolean
+  createdAt: string | null
+  updatedAt: string | null
 }
 
 interface BookingHistory {
@@ -37,7 +70,10 @@ interface CustomerStats {
 const ITEMS_PER_PAGE = 20
 
 export default function CustomersPage() {
+  const { isNew } = useMode()
+
   const [customers, setCustomers] = useState<Customer[]>([])
+  const [newCustomers, setNewCustomers] = useState<NewCustomer[]>([])
   const [loading, setLoading] = useState(true)
   const [searchQuery, setSearchQuery] = useState('')
   const [debouncedSearch, setDebouncedSearch] = useState('')
@@ -52,11 +88,17 @@ export default function CustomersPage() {
 
   // Selected customer for modal
   const [selectedCustomer, setSelectedCustomer] = useState<Customer | null>(null)
+  const [selectedNewCustomer, setSelectedNewCustomer] = useState<NewCustomer | null>(null)
   const [bookingHistory, setBookingHistory] = useState<BookingHistory[]>([])
   const [loadingHistory, setLoadingHistory] = useState(false)
   const [customerStats, setCustomerStats] = useState<CustomerStats | null>(null)
   const [loadingStats, setLoadingStats] = useState(false)
   const [showModal, setShowModal] = useState(false)
+
+  // Customer form modal state (for New mode)
+  const [showCustomerForm, setShowCustomerForm] = useState(false)
+  const [customerFormMode, setCustomerFormMode] = useState<'create' | 'edit'>('create')
+  const [customerToEdit, setCustomerToEdit] = useState<CustomerFormData | null>(null)
 
   // Debounce search input
   useEffect(() => {
@@ -68,8 +110,8 @@ export default function CustomersPage() {
     return () => clearTimeout(timer)
   }, [searchQuery])
 
-  // Fetch customers
-  const fetchCustomers = useCallback(async () => {
+  // Fetch customers for legacy mode
+  const fetchLegacyCustomers = useCallback(async () => {
     setLoading(true)
     try {
       const params = new URLSearchParams({
@@ -104,11 +146,52 @@ export default function CustomersPage() {
     }
   }, [pagination.currentPage, debouncedSearch, sortBy, sortOrder])
 
-  useEffect(() => {
-    fetchCustomers()
-  }, [fetchCustomers])
+  // Fetch customers for new mode
+  const fetchNewCustomers = useCallback(async () => {
+    setLoading(true)
+    try {
+      const params = new URLSearchParams({
+        page: pagination.currentPage.toString(),
+        limit: ITEMS_PER_PAGE.toString(),
+        activeOnly: 'true',
+      })
 
-  // Fetch booking history for selected customer
+      if (debouncedSearch) {
+        params.append('search', debouncedSearch)
+      }
+
+      if (sortBy && sortOrder) {
+        params.append('sortBy', sortBy)
+        params.append('sortOrder', sortOrder)
+      }
+
+      const response = await fetch(`/api/new/customers?${params}`)
+      if (response.ok) {
+        const data = await response.json()
+        setNewCustomers(data.data || [])
+        setPagination((prev) => ({
+          ...prev,
+          totalItems: data.pagination?.total || 0,
+          totalPages: data.pagination?.totalPages || 1,
+        }))
+      }
+    } catch (error) {
+      console.error('Error fetching new customers:', error)
+    } finally {
+      setLoading(false)
+    }
+  }, [pagination.currentPage, debouncedSearch, sortBy, sortOrder])
+
+  // Fetch customers based on mode
+  useEffect(() => {
+    if (isNew) {
+      fetchNewCustomers()
+    } else {
+      fetchLegacyCustomers()
+    }
+  }, [isNew, fetchLegacyCustomers, fetchNewCustomers])
+
+  // Fetch booking history for selected customer (legacy mode)
   const fetchBookingHistory = async (customerId: string) => {
     setLoadingHistory(true)
     try {
@@ -125,7 +208,7 @@ export default function CustomersPage() {
     }
   }
 
-  // Fetch customer stats
+  // Fetch customer stats (legacy mode)
   const fetchCustomerStats = async (customerId: string) => {
     setLoadingStats(true)
     try {
@@ -142,11 +225,27 @@ export default function CustomersPage() {
     }
   }
 
-  const handleRowClick = (customer: Customer) => {
+  const handleLegacyRowClick = (customer: Customer) => {
     setSelectedCustomer(customer)
     setShowModal(true)
     fetchBookingHistory(customer.id)
     fetchCustomerStats(customer.id)
+  }
+
+  const handleNewRowClick = (customer: NewCustomer) => {
+    setSelectedNewCustomer(customer)
+    setCustomerToEdit({
+      id: customer.id,
+      firstName: customer.firstName || '',
+      lastName: customer.lastName || '',
+      phone: customer.phone || '',
+      email: customer.email || '',
+      idCard: customer.idCard || '',
+      address: customer.address || '',
+      notes: customer.notes || '',
+    })
+    setCustomerFormMode('edit')
+    setShowCustomerForm(true)
   }
 
   const closeModal = () => {
@@ -167,7 +266,69 @@ export default function CustomersPage() {
     setPagination((prev) => ({ ...prev, currentPage: 1 }))
   }
 
-  const columns: Column<Customer>[] = [
+  // Handle add new customer (New mode)
+  const handleAddCustomer = () => {
+    setCustomerToEdit(null)
+    setCustomerFormMode('create')
+    setShowCustomerForm(true)
+  }
+
+  // Handle save customer
+  const handleSaveCustomer = async (data: CustomerFormData) => {
+    const endpoint = data.id
+      ? `/api/new/customers/${data.id}`
+      : '/api/new/customers'
+    const method = data.id ? 'PUT' : 'POST'
+
+    const response = await fetch(endpoint, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        firstName: data.firstName,
+        lastName: data.lastName || null,
+        phone: data.phone || null,
+        email: data.email || null,
+        idCard: data.idCard || null,
+        address: data.address || null,
+        notes: data.notes || null,
+      }),
+    })
+
+    const result = await response.json()
+
+    if (!response.ok || !result.success) {
+      throw new Error(result.message || 'Failed to save customer')
+    }
+
+    // Refresh the list
+    fetchNewCustomers()
+  }
+
+  // Handle delete customer
+  const handleDeleteCustomer = async (id: number) => {
+    const response = await fetch(`/api/new/customers/${id}`, {
+      method: 'DELETE',
+    })
+
+    const result = await response.json()
+
+    if (!response.ok || !result.success) {
+      throw new Error(result.message || 'Failed to delete customer')
+    }
+
+    // Refresh the list
+    fetchNewCustomers()
+  }
+
+  // Close customer form
+  const handleCloseCustomerForm = () => {
+    setShowCustomerForm(false)
+    setCustomerToEdit(null)
+    setSelectedNewCustomer(null)
+  }
+
+  // Legacy mode columns
+  const legacyColumns: Column<Customer>[] = [
     {
       key: 'id',
       header: 'ID',
@@ -248,6 +409,85 @@ export default function CustomersPage() {
     },
   ]
 
+  // New mode columns
+  const newColumns: Column<NewCustomer>[] = [
+    {
+      key: 'id',
+      header: 'ID',
+      sortable: true,
+      width: 'w-20',
+    },
+    {
+      key: 'firstName',
+      header: 'ชื่อ',
+      sortable: true,
+      render: (item) => (
+        <div className="flex items-center gap-2">
+          <User className="w-4 h-4 text-gray-400" />
+          <span className="font-medium">
+            {`${item.firstName || ''} ${item.lastName || ''}`.trim() || '-'}
+          </span>
+        </div>
+      ),
+    },
+    {
+      key: 'phone',
+      header: 'โทรศัพท์',
+      sortable: true,
+      render: (item) => (
+        <div className="flex items-center gap-2">
+          <Phone className="w-4 h-4 text-gray-400" />
+          <span>{item.phone || '-'}</span>
+        </div>
+      ),
+    },
+    {
+      key: 'email',
+      header: 'อีเมล',
+      sortable: true,
+      render: (item) => <span>{item.email || '-'}</span>,
+    },
+    {
+      key: 'idCard',
+      header: 'บัตรประชาชน',
+      sortable: false,
+      render: (item) => (
+        <div className="flex items-center gap-2">
+          <CreditCard className="w-4 h-4 text-gray-400" />
+          <span className="font-mono text-sm">{item.idCard || '-'}</span>
+        </div>
+      ),
+    },
+    {
+      key: 'address',
+      header: 'ที่อยู่',
+      sortable: false,
+      render: (item) => (
+        <div className="max-w-xs truncate" title={item.address}>
+          {item.address || '-'}
+        </div>
+      ),
+    },
+    {
+      key: 'actions',
+      header: '',
+      sortable: false,
+      width: 'w-16',
+      render: (item) => (
+        <button
+          onClick={(e) => {
+            e.stopPropagation()
+            handleNewRowClick(item)
+          }}
+          className="p-1.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
+          title="แก้ไข"
+        >
+          <Edit3 className="w-4 h-4" />
+        </button>
+      ),
+    },
+  ]
+
   return (
     <div className="space-y-6">
       {/* Page Header */}
@@ -261,6 +501,17 @@ export default function CustomersPage() {
             </p>
           </div>
         </div>
+
+        {/* Add Customer Button (only in New mode) */}
+        {isNew && (
+          <button
+            onClick={handleAddCustomer}
+            className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+          >
+            <Plus className="w-5 h-5" />
+            เพิ่มลูกค้า
+          </button>
+        )}
       </div>
 
       {/* Search Bar */}
@@ -292,19 +543,33 @@ export default function CustomersPage() {
       </div>
 
       {/* Data Table */}
-      <DataTable
-        columns={columns}
-        data={customers}
-        onRowClick={handleRowClick}
-        pagination={pagination}
-        onPageChange={handlePageChange}
-        loading={loading}
-        onSort={handleSort}
-        sortColumn={sortBy}
-        sortDirection={sortOrder}
-      />
+      {isNew ? (
+        <DataTable
+          columns={newColumns}
+          data={newCustomers}
+          onRowClick={handleNewRowClick}
+          pagination={pagination}
+          onPageChange={handlePageChange}
+          loading={loading}
+          onSort={handleSort}
+          sortColumn={sortBy}
+          sortDirection={sortOrder}
+        />
+      ) : (
+        <DataTable
+          columns={legacyColumns}
+          data={customers}
+          onRowClick={handleLegacyRowClick}
+          pagination={pagination}
+          onPageChange={handlePageChange}
+          loading={loading}
+          onSort={handleSort}
+          sortColumn={sortBy}
+          sortDirection={sortOrder}
+        />
+      )}
 
-      {/* Customer Detail Modal */}
+      {/* Customer Detail Modal (Legacy mode) */}
       {showModal && selectedCustomer && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
           <div className="bg-white rounded-lg shadow-xl w-full max-w-3xl max-h-[90vh] overflow-hidden">
@@ -545,6 +810,18 @@ export default function CustomersPage() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Customer Form Modal (New mode) */}
+      {isNew && (
+        <CustomerForm
+          isOpen={showCustomerForm}
+          onClose={handleCloseCustomerForm}
+          onSave={handleSaveCustomer}
+          onDelete={handleDeleteCustomer}
+          initialData={customerToEdit}
+          mode={customerFormMode}
+        />
       )}
     </div>
   )

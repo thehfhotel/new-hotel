@@ -38,12 +38,31 @@ sqlcmd -S 192.168.100.222 -d HotelDB -U username -P password -i migrations/001_c
 | # | File | Description | Applied |
 |---|------|-------------|---------|
 | 001 | `001_create_booking_notes_table.sql` | Creates HT_Booking_Notes table for booking annotations | v1.16.0 |
+| 002 | `002_create_new_hotel_database.sql` | Creates new HotelNew database with all application-owned tables | Pending |
 
 ## Tables Owned by This Application
+
+### Legacy Database (db)
 
 | Table | Description | Since |
 |-------|-------------|-------|
 | `HT_Booking_Notes` | Stores notes/annotations for bookings | v1.16.0 |
+
+### New Database (HotelNew)
+
+These tables are created by migration 002 in the new HotelNew database:
+
+| Table | Description | Since |
+|-------|-------------|-------|
+| `HT_Customers` | Customer information (replaces View_Customers) | v2.0.0 |
+| `HT_Room_Types` | Room type definitions (Standard, Deluxe, Suite, etc.) | v2.0.0 |
+| `HT_Rooms_New` | Room information (replaces HT_Rooms) | v2.0.0 |
+| `HT_Bookings` | Booking records (replaces View_Booking_Ds) | v2.0.0 |
+| `HT_Booking_Rooms` | Junction table linking bookings to rooms | v2.0.0 |
+| `HT_CheckIns` | Check-in records (replaces View_CheckIn_Ds) | v2.0.0 |
+| `HT_Guest_Registry` | Guest registry for TM30 compliance | v2.0.0 |
+| `HT_Rates` | Room rates by type and date range | v2.0.0 |
+| `HT_Settings` | Application settings key-value store | v2.0.0 |
 
 ## Tables Used (Read-Only or Shared)
 

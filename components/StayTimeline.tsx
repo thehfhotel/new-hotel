@@ -31,6 +31,8 @@ export interface Stay {
   // Check-in specific
   checkinNo?: string
   roomNo?: string
+  // Data source (for hybrid mode)
+  source?: 'legacy' | 'new'
 }
 
 interface DayData {
@@ -415,11 +417,14 @@ export default function StayTimeline({
                 </thead>
                 <tbody>
                   {selectedSegment.stays.map((stay, idx) => (
-                    <tr key={stay.id} className={idx % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
+                    <tr key={stay.id} className={`${idx % 2 === 0 ? 'bg-white' : 'bg-gray-50'} ${stay.source === 'new' ? 'border-l-2 border-l-emerald-400' : ''}`}>
                       {selectedSegment.type === 'booking' ? (
                         <>
                           <td className="px-3 py-2 text-gray-700 font-mono text-xs">
-                            {stay.bookNo || '-'}
+                            <span className="flex items-center gap-1">
+                              {stay.source === 'new' && <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full" title="New system" />}
+                              {stay.bookNo || '-'}
+                            </span>
                           </td>
                           <td className="px-3 py-2 text-gray-700">
                             {stay.customerName || '-'}
@@ -450,7 +455,10 @@ export default function StayTimeline({
                       ) : (
                         <>
                           <td className="px-3 py-2 text-gray-700 font-mono text-xs">
-                            {stay.checkinNo || '-'}
+                            <span className="flex items-center gap-1">
+                              {stay.source === 'new' && <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full" title="New system" />}
+                              {stay.checkinNo || '-'}
+                            </span>
                           </td>
                           <td className="px-3 py-2 text-gray-700 font-medium">
                             {stay.roomNo || '-'}
