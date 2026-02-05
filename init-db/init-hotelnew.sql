@@ -22,6 +22,11 @@ GO
 USE HotelNew;
 GO
 
+-- Required for tables with computed columns and indexes
+SET QUOTED_IDENTIFIER ON;
+SET ANSI_NULLS ON;
+GO
+
 -- =============================================================================
 -- Migration 002: Core Tables
 -- =============================================================================
