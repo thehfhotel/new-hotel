@@ -5,6 +5,131 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.0] - 2026-02-05
+
+### Added
+- **Inventory Management System** - Phase 4 inventory tracking module at `/new/inventory`
+  - **Inventory Dashboard** (`/app/new/inventory/page.tsx`) - Main inventory overview
+    - Summary cards: Total items count, Low stock alerts count, Categories count
+    - Quick action buttons: Add Item, Stock Adjustment, View Transactions
+    - Low stock alerts section showing items below minimum threshold
+    - Recent transactions list with type indicators (IN/OUT/ADJUST/MOVE)
+    - Click-through navigation to detailed pages
+  - **Item Management** (`/app/new/inventory/items/page.tsx`) - Full CRUD for inventory items
+    - Table view with columns: Code, Name, Category, Unit, Min Stock, Current Stock, Status, Actions
+    - Search by item name or code
+    - Filter by category (Minibar, Amenities, Linens, Equipment)
+    - Low stock filter toggle
+    - Sortable columns (Code, Name, Stock level)
+    - Stock level indicators with color coding (green=good, yellow=low, orange=critical, red=out)
+    - Inline stock adjustment and edit actions
+  - **Room Inventory** (`/app/new/inventory/rooms/page.tsx`) - Per-room inventory view
+    - Grid of room cards showing assigned inventory items
+    - Room status indicators (checked today, has missing items, not checked)
+    - Click room to open checklist modal
+    - Filter by status (all, missing items, checked today)
+    - Search by room number
+    - Legend explaining status colors
+  - **Transaction History** (`/app/new/inventory/transactions/page.tsx`) - Audit trail
+    - Full transaction log with Date, Type, Item, Quantity, Room, Notes, By columns
+    - Filter by transaction type (IN, OUT, ADJUST, MOVE)
+    - Date range filter (from/to)
+    - Search by item name/code
+    - Print view functionality for reports
+    - Stock change display (previous -> new)
+
+- **Inventory Components**
+  - `InventoryItemForm` (`/components/forms/InventoryItemForm.tsx`) - Modal for add/edit items
+    - Fields: Item Code, Name, Category, Unit, Min Stock, Current Stock, Cost per Unit
+    - Category dropdown with Thai labels
+    - Unit dropdown with common units (pieces, bottles, boxes, sets, etc.)
+    - Validation: unique code, non-negative stock values
+    - Delete functionality with confirmation
+  - `StockAdjustmentModal` (`/components/modals/StockAdjustmentModal.tsx`) - Quick stock changes
+    - Item search with autocomplete
+    - Three adjustment types: Add stock, Remove stock, Set stock (absolute)
+    - Real-time preview of new stock level
+    - Notes field for audit trail
+    - Color-coded adjustment type buttons
+  - `RoomInventoryChecklist` (`/components/inventory/RoomInventoryChecklist.tsx`) - Room verification
+    - Checklist of items assigned to room
+    - Checkbox and quantity input for each item
+    - Items grouped by category
+    - Missing items highlighted in orange
+    - "Replenish" button to auto-create transactions for missing items
+    - Notes field for housekeeper comments
+
+- **Type Definitions** (`/types/inventory.ts`)
+  - `InventoryItem` - Item data structure
+  - `InventoryTransaction` - Transaction record structure
+  - `RoomInventory` - Room inventory assignment
+  - `InventoryCategory` - Enum: Minibar, Amenities, Linens, Equipment
+  - `TransactionType` - Enum: IN, OUT, ADJUST, MOVE
+  - Stock status helpers: `getStockStatus()`, `getStockStatusColor()`, `getStockStatusLabel()`
+
+- **Thai Labels**:
+  - "สินค้าคงคลัง" (Inventory)
+  - "หมวดหมู่" (Category)
+  - "จำนวนคงเหลือ" (Current Stock)
+  - "ขั้นต่ำ" (Minimum)
+  - "ปรับสต็อก" (Adjust Stock)
+  - "รับเข้า" (Stock In)
+  - "เบิกออก" (Stock Out)
+  - "โอนย้าย" (Transfer)
+  - "ปกติ/ใกล้หมด/วิกฤต/หมด" (Good/Low/Critical/Out stock status)
+
+- **Categories**:
+  - "Minibar" - เครื่องดื่ม/ของว่าง
+  - "Amenities" - อุปกรณ์อำนวยความสะดวก
+  - "Linens" - ผ้าและเครื่องนอน
+  - "Equipment" - อุปกรณ์ในห้อง
+
+- **Inventory Backend APIs** (Rust/Axum)
+  - `GET/POST /api/new/inventory/categories` - Category management
+  - `GET/POST /api/new/inventory/items` - Item CRUD with filters (category, low_stock, search)
+  - `GET/PUT/DELETE /api/new/inventory/items/:id` - Item management
+  - `GET/PUT /api/new/inventory/rooms/:room_id` - Room inventory assignment
+  - `GET/POST /api/new/inventory/transactions` - Transaction log with stock updates
+  - `GET /api/new/inventory/stats` - Dashboard statistics
+  - `GET /api/new/inventory/low-stock` - Low stock alert items
+
+- **Database Migration** (`migrations/004_create_inventory_tables.sql`)
+  - `HT_Inventory_Categories` - Category definitions
+  - `HT_Inventory_Items` - Item master with stock tracking
+  - `HT_Room_Inventory` - Room-item assignments
+  - `HT_Inventory_Transactions` - Stock movement audit log
+
+## [2.6.0] - 2026-02-05
+
+### Added
+- **Housekeeping Module** - Kanban-style housekeeping board for room cleaning management at `/new/housekeeping`
+  - **Housekeeping Page** (`/app/new/housekeeping/page.tsx`) - Main housekeeping dashboard
+    - Three-column Kanban board: "Dirty" (red), "Cleaning" (yellow), "Ready" (green)
+    - Room cards display room number, type, floor, and time in current status
+    - Priority indicator for rooms that have been dirty > 2 hours
+    - Floor filter dropdown to focus on specific floors
+    - Auto-refresh every 30 seconds for real-time updates
+    - Thai language labels throughout
+  - **HousekeepingStats Component** (`/components/housekeeping/HousekeepingStats.tsx`) - Summary statistics
+    - Total rooms needing cleaning count
+    - Rooms currently being cleaned count
+    - Rooms cleaned today count
+    - Average cleaning time display (when available)
+    - Color-coded stat cards matching Kanban columns
+  - **RoomCleaningCard Component** (`/components/housekeeping/RoomCleaningCard.tsx`) - Individual room cards
+    - Large room number display with room type and floor
+    - Priority badge for urgent rooms (> 2 hours since checkout)
+    - Time tracking: checkout time, time in current status
+    - Housekeeper assignment display (when available)
+    - Expandable notes field for housekeeper comments
+    - Action buttons: "Start Cleaning", "Done", "Mark as Dirty"
+    - Visual status indicators with color coding
+- **Thai Labels**:
+  - "Dirty Room" - "Waiting for Cleaning"
+  - "Cleaning" - "In Progress"
+  - "Ready" - "Clean Room"
+  - "Start Cleaning" / "Done" action buttons
+
 ## [2.5.0] - 2026-02-05
 
 ### Added

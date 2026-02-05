@@ -8,6 +8,7 @@ pub mod mode;
 pub mod new_bookings;
 pub mod new_checkins;
 pub mod new_customers;
+pub mod new_inventory;
 pub mod new_invoice;
 pub mod new_rates;
 pub mod new_reports;
