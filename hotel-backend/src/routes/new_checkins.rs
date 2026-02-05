@@ -4,6 +4,11 @@
 //! - GET /api/new/checkins/:id - Get single check-in
 //! - POST /api/new/checkins - Create check-in (walk-in or from booking)
 //! - PUT /api/new/checkins/:id/checkout - Process check-out
+//!
+//! Guest Registry endpoints:
+//! - GET /api/new/checkins/:id/guests - List guests for check-in
+//! - POST /api/new/checkins/:id/guests - Add guest to check-in
+//! - DELETE /api/new/checkins/:id/guests/:guestId - Remove guest from check-in
 
 use axum::{
     extract::{Path, Query, State},
@@ -657,5 +662,285 @@ pub async fn checkout(
         message: "Check-out completed successfully".to_string(),
         id: Some(cin_id),
         cin_no: Some(cin_no),
+    }))
+}
+
+// =============================================================================
+// Guest Registry Types and Endpoints
+// =============================================================================
+
+/// Guest from HT_Guest_Registry table
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Guest {
+    pub id: i32,
+    pub cin_id: i32,
+    pub cust_id: Option<i32>,
+    pub first_name: String,
+    pub last_name: Option<String>,
+    pub id_card: Option<String>,
+    pub passport: Option<String>,
+    pub nationality: Option<String>,
+    pub is_primary: bool,
+    pub created_at: Option<NaiveDateTime>,
+}
+
+/// Response for guests list
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestsResponse {
+    pub success: bool,
+    pub data: Vec<Guest>,
+    pub total: i32,
+}
+
+/// Response for single guest
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestResponse {
+    pub success: bool,
+    pub guest: Guest,
+}
+
+/// Request body for creating a guest
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateGuestRequest {
+    /// Customer ID if linking to existing customer (optional)
+    pub cust_id: Option<i32>,
+    pub first_name: String,
+    pub last_name: Option<String>,
+    pub id_card: Option<String>,
+    pub passport: Option<String>,
+    pub nationality: Option<String>,
+    pub is_primary: Option<bool>,
+}
+
+/// Response for guest mutation operations
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestMutationResponse {
+    pub success: bool,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<i32>,
+}
+
+/// GET /api/new/checkins/:id/guests - List guests for check-in
+pub async fn list_guests(
+    State(state): State<AppState>,
+    Path(cin_id): Path<i32>,
+) -> ApiResult<Json<GuestsResponse>> {
+    let mut conn = state.new_pool.get().await?;
+
+    // Verify check-in exists
+    let checkin_rows = conn
+        .query(
+            "SELECT Cin_ID FROM HT_CheckIns WHERE Cin_ID = @P1",
+            &[&cin_id],
+        )
+        .await?
+        .into_first_result()
+        .await?;
+
+    if checkin_rows.is_empty() {
+        return Err(ApiError::NotFound("Check-in not found".to_string()));
+    }
+
+    // Get guests
+    let rows = conn
+        .query(
+            r#"
+            SELECT
+                Guest_ID,
+                Guest_Cin_ID,
+                Guest_Cust_ID,
+                Guest_FirstName,
+                Guest_LastName,
+                Guest_IDCard,
+                Guest_Passport,
+                Guest_Nationality,
+                Guest_Is_Primary,
+                Guest_Created_At
+            FROM HT_Guest_Registry
+            WHERE Guest_Cin_ID = @P1
+            ORDER BY Guest_Is_Primary DESC, Guest_ID ASC
+            "#,
+            &[&cin_id],
+        )
+        .await?
+        .into_first_result()
+        .await?;
+
+    let guests: Vec<Guest> = rows
+        .iter()
+        .map(|row| Guest {
+            id: row.get::<i32, _>("Guest_ID").unwrap_or(0),
+            cin_id: row.get::<i32, _>("Guest_Cin_ID").unwrap_or(0),
+            cust_id: row.get::<i32, _>("Guest_Cust_ID"),
+            first_name: row.get::<&str, _>("Guest_FirstName").unwrap_or_default().to_string(),
+            last_name: row.get::<&str, _>("Guest_LastName").map(String::from),
+            id_card: row.get::<&str, _>("Guest_IDCard").map(String::from),
+            passport: row.get::<&str, _>("Guest_Passport").map(String::from),
+            nationality: row.get::<&str, _>("Guest_Nationality").map(String::from),
+            is_primary: row.get::<bool, _>("Guest_Is_Primary").unwrap_or(false),
+            created_at: row.get::<NaiveDateTime, _>("Guest_Created_At"),
+        })
+        .collect();
+
+    let total = guests.len() as i32;
+
+    Ok(Json(GuestsResponse {
+        success: true,
+        data: guests,
+        total,
+    }))
+}
+
+/// POST /api/new/checkins/:id/guests - Add guest to check-in
+pub async fn create_guest(
+    State(state): State<AppState>,
+    Path(cin_id): Path<i32>,
+    Json(body): Json<CreateGuestRequest>,
+) -> ApiResult<Json<GuestMutationResponse>> {
+    let first_name = body.first_name.trim();
+    if first_name.is_empty() {
+        return Err(ApiError::BadRequest("Guest first name is required".to_string()));
+    }
+
+    let mut conn = state.new_pool.get().await?;
+
+    // Verify check-in exists and is active
+    let checkin_rows = conn
+        .query(
+            "SELECT Cin_ID, Cin_Status FROM HT_CheckIns WHERE Cin_ID = @P1",
+            &[&cin_id],
+        )
+        .await?
+        .into_first_result()
+        .await?;
+
+    let checkin_row = checkin_rows
+        .first()
+        .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
+
+    let status = checkin_row.get::<&str, _>("Cin_Status").unwrap_or_default();
+    if status != "active" {
+        return Err(ApiError::BadRequest("Cannot add guests to a non-active check-in".to_string()));
+    }
+
+    let is_primary = body.is_primary.unwrap_or(false);
+
+    // If this guest is marked as primary, unset any existing primary guest
+    if is_primary {
+        conn.execute(
+            "UPDATE HT_Guest_Registry SET Guest_Is_Primary = 0 WHERE Guest_Cin_ID = @P1",
+            &[&cin_id],
+        )
+        .await?;
+    }
+
+    // Insert guest
+    let rows = conn
+        .query(
+            r#"
+            INSERT INTO HT_Guest_Registry (
+                Guest_Cin_ID,
+                Guest_Cust_ID,
+                Guest_FirstName,
+                Guest_LastName,
+                Guest_IDCard,
+                Guest_Passport,
+                Guest_Nationality,
+                Guest_Is_Primary
+            )
+            OUTPUT INSERTED.Guest_ID
+            VALUES (@P1, @P2, @P3, @P4, @P5, @P6, @P7, @P8)
+            "#,
+            &[
+                &cin_id,
+                &body.cust_id,
+                &first_name,
+                &body.last_name.as_deref(),
+                &body.id_card.as_deref(),
+                &body.passport.as_deref(),
+                &body.nationality.as_deref(),
+                &is_primary,
+            ],
+        )
+        .await?
+        .into_first_result()
+        .await?;
+
+    let guest_id = rows
+        .first()
+        .and_then(|r| r.get::<i32, _>("Guest_ID"))
+        .ok_or_else(|| ApiError::Internal("Failed to create guest".to_string()))?;
+
+    Ok(Json(GuestMutationResponse {
+        success: true,
+        message: "Guest added successfully".to_string(),
+        id: Some(guest_id),
+    }))
+}
+
+/// Path parameters for guest operations
+#[derive(Debug, Deserialize)]
+pub struct GuestPath {
+    pub id: i32,
+    pub guest_id: i32,
+}
+
+/// DELETE /api/new/checkins/:id/guests/:guestId - Remove guest from check-in
+pub async fn delete_guest(
+    State(state): State<AppState>,
+    Path(path): Path<GuestPath>,
+) -> ApiResult<Json<GuestMutationResponse>> {
+    let mut conn = state.new_pool.get().await?;
+
+    // Verify check-in exists
+    let checkin_rows = conn
+        .query(
+            "SELECT Cin_ID, Cin_Status FROM HT_CheckIns WHERE Cin_ID = @P1",
+            &[&path.id],
+        )
+        .await?
+        .into_first_result()
+        .await?;
+
+    let checkin_row = checkin_rows
+        .first()
+        .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
+
+    let status = checkin_row.get::<&str, _>("Cin_Status").unwrap_or_default();
+    if status != "active" {
+        return Err(ApiError::BadRequest("Cannot remove guests from a non-active check-in".to_string()));
+    }
+
+    // Verify guest belongs to this check-in
+    let guest_rows = conn
+        .query(
+            "SELECT Guest_ID FROM HT_Guest_Registry WHERE Guest_ID = @P1 AND Guest_Cin_ID = @P2",
+            &[&path.guest_id, &path.id],
+        )
+        .await?
+        .into_first_result()
+        .await?;
+
+    if guest_rows.is_empty() {
+        return Err(ApiError::NotFound("Guest not found for this check-in".to_string()));
+    }
+
+    // Delete guest
+    conn.execute(
+        "DELETE FROM HT_Guest_Registry WHERE Guest_ID = @P1 AND Guest_Cin_ID = @P2",
+        &[&path.guest_id, &path.id],
+    )
+    .await?;
+
+    Ok(Json(GuestMutationResponse {
+        success: true,
+        message: "Guest removed successfully".to_string(),
+        id: Some(path.guest_id),
     }))
 }

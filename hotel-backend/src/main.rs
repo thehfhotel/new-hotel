@@ -141,6 +141,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/new/checkins", get(routes::new_checkins::list_checkins).post(routes::new_checkins::create_checkin))
         .route("/api/new/checkins/:id", get(routes::new_checkins::get_checkin))
         .route("/api/new/checkins/:id/checkout", put(routes::new_checkins::checkout))
+        // Guest registry
+        .route("/api/new/checkins/:id/guests", get(routes::new_checkins::list_guests).post(routes::new_checkins::create_guest))
+        .route("/api/new/checkins/:id/guests/:guest_id", delete(routes::new_checkins::delete_guest))
+        // Room types CRUD
+        .route("/api/new/room-types", get(routes::new_room_types::list_room_types).post(routes::new_room_types::create_room_type))
+        .route("/api/new/room-types/:id", get(routes::new_room_types::get_room_type).put(routes::new_room_types::update_room_type).delete(routes::new_room_types::delete_room_type))
         .with_state(app_state);
 
     // Merge all routes

@@ -5,6 +5,59 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-02-05
+
+### Added
+- **Room Type Management for New Mode** - Full CRUD room type management at `/new/room-types`
+  - `RoomTypeForm` component (`/components/forms/RoomTypeForm.tsx`) - Modal form for create/edit room types
+    - Fields: Type Code, Type Name, Base Price, Max Guests, Bed Type, Room Size
+    - Thai language labels
+    - Validation for required fields
+  - New Mode Room Types Page (`/app/new/room-types/page.tsx`)
+    - Grid view of room types with cards
+    - Each card shows type info, price, and amenities
+    - Add/Edit/Delete functionality
+  - Backend API: `/api/new/room-types` - Full CRUD with validation
+    - Unique type code enforcement
+    - Protection against deleting types in use
+
+- **Guest Registry for New Mode** - TM.30 compliance guest tracking
+  - `GuestRegistryModal` component (`/components/modals/GuestRegistryModal.tsx`)
+    - Add additional guests to a check-in record
+    - Guest fields: Name, ID Number, Nationality, Contact
+    - Nationality dropdown with common countries
+    - View and remove registered guests
+  - Backend API: `/api/new/checkins/:id/guests` - Guest registry endpoints
+    - GET - List all guests for a check-in
+    - POST - Add a guest to a check-in
+    - DELETE - Remove a guest from a check-in
+    - Validates check-in is active before allowing changes
+
+- **Booking Management UI for New Mode** - Full CRUD booking management at `/new/bookings`
+  - `BookingForm` component (`/components/forms/BookingForm.tsx`) - Modal form for create/edit bookings
+    - Thai language labels throughout
+    - Buddhist Era (B.E.) date display with automatic night calculation
+    - Customer picker integration with "Add New Customer" option
+    - Multi-room selection via RoomPicker
+    - Booking source dropdown (Walk-in, Phone, Online, OTA)
+    - Deposit amount field
+    - Combined notes field for special requests and internal notes
+    - Cancel booking functionality with confirmation
+  - `RoomPicker` component (`/components/pickers/RoomPicker.tsx`) - Visual room selector
+    - Card-based room display with number, type, and price
+    - Multi-select capability with selected room badges
+    - Filter by room type
+    - Rooms grouped by floor
+    - Visual status indicators (available, occupied, maintenance, cleaning)
+  - New Mode Bookings Page (`/app/new/bookings/page.tsx`)
+    - Table with columns: booking number, date, status, customer, check-in, check-out, rooms
+    - Search by booking number or customer name
+    - Filter by status and date range
+    - Add booking button
+    - Click row to edit
+    - Pagination with page navigation
+    - Status badges with color coding
+
 ## [2.2.0] - 2026-02-05
 
 ### Added
