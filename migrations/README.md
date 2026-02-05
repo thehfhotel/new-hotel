@@ -39,6 +39,7 @@ sqlcmd -S 192.168.100.222 -d HotelDB -U username -P password -i migrations/001_c
 |---|------|-------------|---------|
 | 001 | `001_create_booking_notes_table.sql` | Creates HT_Booking_Notes table for booking annotations | v1.16.0 |
 | 002 | `002_create_new_hotel_database.sql` | Creates new HotelNew database with all application-owned tables | Pending |
+| 003 | `003_alter_ht_rates_table.sql` | Alters HT_Rates table to support multiplier/fixed rate types for Phase 3 Financial features | Pending |
 
 ## Tables Owned by This Application
 

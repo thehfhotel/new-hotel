@@ -147,6 +147,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Room types CRUD
         .route("/api/new/room-types", get(routes::new_room_types::list_room_types).post(routes::new_room_types::create_room_type))
         .route("/api/new/room-types/:id", get(routes::new_room_types::get_room_type).put(routes::new_room_types::update_room_type).delete(routes::new_room_types::delete_room_type))
+        // Rates CRUD
+        .route("/api/new/rates", get(routes::new_rates::list_rates).post(routes::new_rates::create_rate))
+        .route("/api/new/rates/:id", get(routes::new_rates::get_rate).put(routes::new_rates::update_rate).delete(routes::new_rates::delete_rate))
+        // Reports
+        .route("/api/new/reports/revenue", get(routes::new_reports::get_revenue))
+        .route("/api/new/reports/occupancy", get(routes::new_reports::get_occupancy))
+        .route("/api/new/reports/revenue-by-room-type", get(routes::new_reports::get_revenue_by_room_type))
+        // Invoice
+        .route("/api/new/checkins/:id/invoice", get(routes::new_invoice::get_invoice))
         .with_state(app_state);
 
     // Merge all routes
