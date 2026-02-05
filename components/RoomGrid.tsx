@@ -1,7 +1,7 @@
 'use client'
 
 import { useState } from 'react'
-import { X } from 'lucide-react'
+import { X, LogIn, LogOut } from 'lucide-react'
 
 export type RoomStatus = 'available' | 'occupied' | 'booked' | 'maintenance' | 'cleaning' | 'checkout'
 
@@ -15,11 +15,18 @@ export interface Room {
   guestName?: string
   checkIn?: string
   checkOut?: string
+  // New mode specific fields
+  newRoomId?: number
+  checkInId?: number
 }
 
 interface RoomGridProps {
   rooms: Room[]
   onRoomClick?: (room: Room) => void
+  // New mode specific props
+  isNewMode?: boolean
+  onQuickCheckIn?: (room: Room) => void
+  onCheckOut?: (room: Room) => void
 }
 
 const statusConfig = {
@@ -71,7 +78,13 @@ const roomLayout: (string | null)[][] = [
   ['306', '305', null, '304', '303', '302', '301'],
 ]
 
-export default function RoomGrid({ rooms, onRoomClick }: RoomGridProps) {
+export default function RoomGrid({
+  rooms,
+  onRoomClick,
+  isNewMode = false,
+  onQuickCheckIn,
+  onCheckOut,
+}: RoomGridProps) {
   const [selectedRoom, setSelectedRoom] = useState<Room | null>(null)
 
   // Create a map for quick room lookup by room number (case-insensitive)
@@ -247,12 +260,55 @@ export default function RoomGrid({ rooms, onRoomClick }: RoomGridProps) {
               )}
             </div>
 
-            <button
-              onClick={closeModal}
-              className="mt-6 w-full bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-lg transition-colors"
-            >
-              ปิด
-            </button>
+            {/* Action buttons for New Mode */}
+            {isNewMode && (
+              <div className="mt-6 space-y-2">
+                {/* Check-in button - only for available rooms */}
+                {selectedRoom.status === 'available' && onQuickCheckIn && (
+                  <button
+                    onClick={() => {
+                      onQuickCheckIn(selectedRoom)
+                      closeModal()
+                    }}
+                    className="w-full flex items-center justify-center gap-2 bg-green-600 hover:bg-green-700 text-white py-2 rounded-lg"
+                  >
+                    <LogIn size={18} />
+                    เช็คอินด่วน
+                  </button>
+                )}
+
+                {/* Check-out button - for occupied or checkout rooms */}
+                {(selectedRoom.status === 'occupied' || selectedRoom.status === 'checkout') && onCheckOut && (
+                  <button
+                    onClick={() => {
+                      onCheckOut(selectedRoom)
+                      closeModal()
+                    }}
+                    className="w-full flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-lg"
+                  >
+                    <LogOut size={18} />
+                    เช็คเอาท์
+                  </button>
+                )}
+
+                <button
+                  onClick={closeModal}
+                  className="w-full border border-gray-300 text-gray-700 py-2 rounded-lg hover:bg-gray-50"
+                >
+                  ปิด
+                </button>
+              </div>
+            )}
+
+            {/* Close button for Legacy Mode */}
+            {!isNewMode && (
+              <button
+                onClick={closeModal}
+                className="mt-6 w-full bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-lg"
+              >
+                ปิด
+              </button>
+            )}
           </div>
         </div>
       )}

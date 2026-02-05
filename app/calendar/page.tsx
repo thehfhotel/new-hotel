@@ -2,8 +2,9 @@
 
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
 import { parseISO, differenceInDays, startOfMonth, endOfMonth, addMonths, subMonths, format } from 'date-fns'
-import { Calendar as CalendarIcon } from 'lucide-react'
+import { Calendar as CalendarIcon, Database } from 'lucide-react'
 import StayTimeline, { Stay } from '@/components/StayTimeline'
+import { useMode } from '@/contexts/ModeContext'
 
 interface ApiBooking {
   bookNo: string
@@ -15,6 +16,7 @@ interface ApiBooking {
     name: string
   }
   roomCount: number
+  source?: 'legacy' | 'new'
 }
 
 interface ApiCheckIn {
@@ -24,6 +26,29 @@ interface ApiCheckIn {
   Cin_Room_Out: string
   Cin_cust_name: string
   Cin_status: string
+  source?: 'legacy' | 'new'
+}
+
+// Calendar API response (hybrid endpoint)
+interface CalendarApiBooking {
+  id: string
+  bookingNo: string
+  customerName: string | null
+  roomNo: string | null
+  checkIn: string | null
+  checkOut: string | null
+  status: string | null
+  source: 'legacy' | 'new'
+}
+
+interface CalendarApiCheckin {
+  id: string
+  checkinNo: string
+  customerName: string | null
+  roomNo: string | null
+  checkIn: string | null
+  checkOut: string | null
+  source: 'legacy' | 'new'
 }
 
 interface CachedData {
@@ -36,12 +61,13 @@ export default function CalendarPage() {
   const [viewMode, setViewMode] = useState<'week' | 'month'>('week')
   const [loading, setLoading] = useState(true)
   const [dataVersion, setDataVersion] = useState(0)
+  const { mode, isNew } = useMode()
 
-  // Cache data by month key (yyyy-MM)
+  // Cache data by month key (yyyy-MM) and mode
   const cacheRef = useRef<Map<string, CachedData>>(new Map())
 
-  // Get cache key for a date (by month)
-  const getCacheKey = (date: Date) => format(date, 'yyyy-MM')
+  // Get cache key for a date (by month) - include mode to invalidate cache on mode change
+  const getCacheKey = (date: Date) => `${format(date, 'yyyy-MM')}-${mode}`
 
   // Fetch data for a specific month
   const fetchMonth = useCallback(async (date: Date, isBackground = false): Promise<CachedData | null> => {
@@ -58,13 +84,45 @@ export default function CalendarPage() {
       const startDate = format(monthStart, 'yyyy-MM-dd')
       const endDate = format(monthEnd, 'yyyy-MM-dd')
 
-      const [bookingsRes, checkinsRes] = await Promise.all([
-        fetch(`/api/bookings?startDate=${startDate}&endDate=${endDate}&limit=1000`),
-        fetch(`/api/checkins?startDate=${startDate}&endDate=${endDate}&limit=1000`),
-      ])
+      let bookings: ApiBooking[] = []
+      let checkins: ApiCheckIn[] = []
 
-      const bookings = bookingsRes.ok ? (await bookingsRes.json()).data || [] : []
-      const checkins = checkinsRes.ok ? (await checkinsRes.json()).data || [] : []
+      if (isNew) {
+        // Use hybrid calendar endpoint when in new mode
+        const calendarRes = await fetch(`/api/calendar?startDate=${startDate}&endDate=${endDate}`)
+        if (calendarRes.ok) {
+          const calendarData = await calendarRes.json()
+          // Transform calendar API response to match our internal format
+          bookings = (calendarData.data?.bookings || []).map((b: CalendarApiBooking) => ({
+            bookNo: b.bookingNo,
+            bookDate: b.checkIn, // Use checkIn as fallback for bookDate
+            checkIn: b.checkIn,
+            checkOut: b.checkOut,
+            status: b.status === 'confirmed' ? 'จอง' : b.status,
+            customer: { name: b.customerName || '' },
+            roomCount: 1,
+            source: b.source,
+          }))
+          checkins = (calendarData.data?.checkins || []).map((c: CalendarApiCheckin) => ({
+            Cin_no: c.checkinNo,
+            Cin_Room_No: c.roomNo || '',
+            Cin_Room_In: c.checkIn || '',
+            Cin_Room_Out: c.checkOut || '',
+            Cin_cust_name: c.customerName || '',
+            Cin_status: 'เข้าพัก',
+            source: c.source,
+          }))
+        }
+      } else {
+        // Use legacy endpoints when in legacy mode
+        const [bookingsRes, checkinsRes] = await Promise.all([
+          fetch(`/api/bookings?startDate=${startDate}&endDate=${endDate}&limit=1000`),
+          fetch(`/api/checkins?startDate=${startDate}&endDate=${endDate}&limit=1000`),
+        ])
+
+        bookings = bookingsRes.ok ? ((await bookingsRes.json()).data || []).map((b: ApiBooking) => ({ ...b, source: 'legacy' as const })) : []
+        checkins = checkinsRes.ok ? ((await checkinsRes.json()).data || []).map((c: ApiCheckIn) => ({ ...c, source: 'legacy' as const })) : []
+      }
 
       const data = { bookings, checkins }
       cacheRef.current.set(key, data)
@@ -79,7 +137,13 @@ export default function CalendarPage() {
       console.error('Error fetching data:', error)
       return null
     }
-  }, [])
+  }, [mode, isNew])
+
+  // Clear cache when mode changes
+  useEffect(() => {
+    cacheRef.current.clear()
+    setDataVersion(v => v + 1)
+  }, [mode])
 
   // Initial load and when date changes
   useEffect(() => {
@@ -108,7 +172,7 @@ export default function CalendarPage() {
     }
 
     loadData()
-  }, [selectedDate, fetchMonth])
+  }, [selectedDate, fetchMonth, mode])
 
   // Get combined data from current and adjacent months
   const allData = useMemo(() => {
@@ -157,6 +221,7 @@ export default function CalendarPage() {
         roomNo: checkin.Cin_Room_No,
         customerName: checkin.Cin_cust_name,
         status: checkin.Cin_status,
+        source: checkin.source,
       })
     })
 
@@ -212,6 +277,7 @@ export default function CalendarPage() {
         customerName: booking.customer?.name,
         status: booking.status,
         roomCount: booking.roomCount,
+        source: booking.source,
       })
     })
 
@@ -221,11 +287,22 @@ export default function CalendarPage() {
   return (
     <div className="space-y-6">
       {/* Page Header */}
-      <div className="flex items-center gap-3">
-        <CalendarIcon className="w-8 h-8 text-blue-600" />
-        <div>
-          <h1 className="text-2xl font-bold text-gray-800">ไทม์ไลน์การเข้าพัก</h1>
-          <p className="text-gray-600">ดูรูปแบบการเข้าพักและระยะเวลา</p>
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <CalendarIcon className="w-8 h-8 text-blue-600" />
+          <div>
+            <h1 className="text-2xl font-bold text-gray-800">ไทม์ไลน์การเข้าพัก</h1>
+            <p className="text-gray-600">ดูรูปแบบการเข้าพักและระยะเวลา</p>
+          </div>
+        </div>
+        {/* Data Source Indicator */}
+        <div className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm ${
+          isNew
+            ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+            : 'bg-amber-50 text-amber-700 border border-amber-200'
+        }`}>
+          <Database className="w-4 h-4" />
+          <span>{isNew ? 'Hybrid Mode (Legacy + New)' : 'Legacy Mode'}</span>
         </div>
       </div>
 

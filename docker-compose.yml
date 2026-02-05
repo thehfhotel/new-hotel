@@ -18,10 +18,18 @@ services:
   backend:
     image: ghcr.io/thehfhotel/new-hotel-backend:latest
     environment:
+      # Legacy database (shared with legacy application)
       - DB_SERVER=192.168.100.222
       - DB_NAME=db
       - DB_USER=sa
       - DB_PASSWORD=12345678
+      # New database (owned by this application)
+      - NEW_DB_SERVER=192.168.100.222
+      - NEW_DB_NAME=HotelNew
+      - NEW_DB_USER=sa
+      - NEW_DB_PASSWORD=12345678
+      # System mode: 'legacy' or 'new' (controls which database is primary)
+      - SYSTEM_MODE=legacy
       - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
       - SLACK_NOTIFICATIONS_ENABLED=true
       - HOST=0.0.0.0

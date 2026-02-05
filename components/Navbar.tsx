@@ -12,6 +12,7 @@ import {
   ScrollText,
   CreditCard
 } from 'lucide-react'
+import ModeToggle from './ModeToggle'
 
 interface NavLink {
   href: string
@@ -60,6 +61,11 @@ export default function Navbar() {
               </Link>
             )
           })}
+        </div>
+
+        {/* Mode Toggle */}
+        <div className="flex items-center shrink-0">
+          <ModeToggle />
         </div>
       </div>
     </nav>
