@@ -26,12 +26,26 @@
    - `test:` for adding tests
    - `chore:` for maintenance tasks
 
+## Deployment Policy
+
+**MANDATORY**: All deployments to production MUST go through the CI/CD pipeline.
+
+1. **Never deploy manually** - Do not run `docker compose up` or `docker pull` manually on production
+2. **Pipeline is the only way** - All changes must be committed, pushed, and deployed via GitHub Actions
+3. **Workflow**: `.github/workflows/docker-build.yml` handles:
+   - Running tests
+   - Building Docker images (frontend + backend)
+   - Pushing to GitHub Container Registry (ghcr.io/thehfhotel/*)
+   - Deploying to production server via self-hosted runner
+
+4. **To deploy**: Simply `git push` to master - the pipeline handles everything automatically
+
 ## Project Structure
 
-- `/app` - Next.js App Router pages and API routes
+- `/app` - Next.js App Router pages (frontend only, no API routes except /api/changelog)
 - `/components` - React components
-- `/lib` - Database and utility functions
-- `/__tests__` - Jest test files
+- `/hotel-backend` - Rust/Axum backend API server
+- `/__tests__` - Jest test files (component tests only)
 
 ## Database
 
@@ -103,7 +117,28 @@
 
 Run tests before committing: `npm test`
 
+## Architecture
+
+This application uses a **split architecture**:
+
+| Component | Technology | Description |
+|-----------|------------|-------------|
+| Frontend | Next.js 16 + React 19 | UI layer, proxies API requests to backend |
+| Backend | Rust/Axum | API server, database queries, background jobs |
+| Database | SQL Server | Shared with legacy application |
+
+**API Routing**:
+- Frontend runs on port 3003 (exposed)
+- Backend runs on port 3003 (internal, container network)
+- Next.js rewrites `/api/*` requests to `http://backend:3003/api/*`
+- Exception: `/api/changelog` is handled by Next.js (reads local CHANGELOG.md)
+
+**Docker Services** (defined in `docker-compose.yml`):
+- `web` - Next.js frontend (ghcr.io/thehfhotel/new-hotel)
+- `backend` - Rust backend (ghcr.io/thehfhotel/new-hotel-backend)
+
 ## Development
 
-- Dev server: `npm run dev` (runs on port 3003)
-- Build: `npm run build`
+- Frontend dev server: `pnpm dev` (runs on port 3003)
+- Frontend build: `pnpm build`
+- Backend: See `/hotel-backend/README.md` for Rust development
