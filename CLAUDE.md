@@ -47,15 +47,58 @@
 - `/hotel-backend` - Rust/Axum backend API server
 - `/__tests__` - Jest test files (component tests only)
 
-## Database
+## Database Architecture
 
-- SQL Server at 192.168.100.222
-- **SHARED DATABASE**: This database is used by another legacy application. Exercise caution with schema changes.
+This application uses a **dual-database architecture**:
 
-### Tables
+| Database | Location | Purpose |
+|----------|----------|---------|
+| Legacy DB | 192.168.100.222 | Shared with legacy app, READ-ONLY |
+| HotelNew DB | Docker container (`newdb`) | Self-hosted, full CRUD |
 
-**Owned by this app** (safe to modify):
-- `HT_Booking_Notes` - Booking annotations
+### Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    DOCKER COMPOSE                            │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
+│  │  Frontend   │  │   Backend   │  │   SQL Server        │  │
+│  │  (web)      │  │  (backend)  │  │   (newdb)           │  │
+│  │  Port 3003  │  │  Port 3003  │  │   Port 1433         │  │
+│  │             │  │             │  │                     │  │
+│  │             │──│─────────────│──│──▶ HotelNew DB      │  │
+│  └─────────────┘  │             │  │                     │  │
+│                   │─────────────│──│──▶ (internal only)  │  │
+│                   └─────────────┘  └─────────────────────┘  │
+│                          │                                   │
+└──────────────────────────│───────────────────────────────────┘
+                           │
+                           ▼
+              ┌─────────────────────────┐
+              │  Legacy DB              │
+              │  192.168.100.222:1433   │
+              │  (external, read-only)  │
+              └─────────────────────────┘
+```
+
+### Self-Hosted Database (HotelNew)
+
+The HotelNew database runs in a Docker container (`newdb` service):
+- **Image**: `mcr.microsoft.com/mssql/server:2022-latest`
+- **Data persistence**: Docker volume `newdb_data`
+- **Access**: Internal only (not exposed to host network)
+- **Initialization**: Run `init-db/init-hotelnew.sql` on first deploy
+
+**First-time setup** (after `docker compose up`):
+```bash
+docker exec -it new-hotel-db /opt/mssql-tools18/bin/sqlcmd \
+  -S localhost -U sa -P "***REMOVED***" -C \
+  -i /docker-entrypoint-initdb.d/init-hotelnew.sql
+```
+
+### Legacy Database (192.168.100.222)
+
+- **SHARED DATABASE**: Used by another legacy application. Exercise caution.
 
 **Legacy tables** (READ-ONLY - do not modify schema):
 - `HT_Rooms` - Room information
@@ -68,7 +111,19 @@
 - `DROP TABLE` / `DROP VIEW` - Do not delete
 - `CREATE INDEX` on legacy tables - May affect legacy app
 
-**Instead:** Create new tables/views owned by this app (prefix with `HT_`)
+### HotelNew Tables (owned by this app)
+
+All tables in the HotelNew database are owned by this application:
+- `HT_Customers` - Customer master data
+- `HT_Room_Types` - Room type definitions
+- `HT_Rooms_New` - Room inventory
+- `HT_Bookings` - Booking records
+- `HT_Booking_Rooms` - Booking-room assignments
+- `HT_CheckIns` - Check-in records
+- `HT_Guest_Registry` - Guest registration (TM.30)
+- `HT_Rates` - Room rate configurations
+- `HT_Settings` - System settings
+- `HT_Inventory_*` - Inventory management tables
 
 ### Database Migrations
 
