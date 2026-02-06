@@ -108,8 +108,8 @@ pub async fn list_checkins(
         .map(|row| CheckIn {
             cin_no: row.get::<&str, _>("Cin_no").map(String::from),
             cin_room_no: row.get::<&str, _>("Cin_Room_No").map(String::from),
-            cin_room_in: row.get::<NaiveDateTime, _>("Cin_Room_In"),
-            cin_room_out: row.get::<NaiveDateTime, _>("Cin_Room_Out"),
+            cin_room_in: row.get::<NaiveDateTime, _>("Cin_Room_In").map(|dt| dt.and_utc()),
+            cin_room_out: row.get::<NaiveDateTime, _>("Cin_Room_Out").map(|dt| dt.and_utc()),
             cin_cust_name: row.get::<&str, _>("Cin_cust_name").map(String::from),
             cin_status: row.get::<&str, _>("Cin_status").map(String::from),
         })

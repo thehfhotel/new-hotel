@@ -6,7 +6,7 @@ use axum::{
     extract::{Query, State},
     Json,
 };
-use chrono::NaiveDateTime;
+use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
@@ -37,8 +37,8 @@ pub struct CalendarBooking {
     pub booking_no: String,
     pub customer_name: Option<String>,
     pub room_no: Option<String>,
-    pub check_in: Option<NaiveDateTime>,
-    pub check_out: Option<NaiveDateTime>,
+    pub check_in: Option<DateTime<Utc>>,
+    pub check_out: Option<DateTime<Utc>>,
     pub status: Option<String>,
     pub source: DataSource,
 }
@@ -51,8 +51,8 @@ pub struct CalendarCheckin {
     pub checkin_no: String,
     pub customer_name: Option<String>,
     pub room_no: Option<String>,
-    pub check_in: Option<NaiveDateTime>,
-    pub check_out: Option<NaiveDateTime>,
+    pub check_in: Option<DateTime<Utc>>,
+    pub check_out: Option<DateTime<Utc>>,
     pub source: DataSource,
 }
 
@@ -165,8 +165,8 @@ async fn fetch_legacy_calendar_data(
                 booking_no: book_no,
                 customer_name: row.get::<&str, _>("Book_Cust_Name").map(String::from),
                 room_no: row.get::<&str, _>("Book_Room_No").map(String::from),
-                check_in: row.get::<NaiveDateTime, _>("Book_Date_in"),
-                check_out: row.get::<NaiveDateTime, _>("Book_Date_out"),
+                check_in: row.get::<NaiveDateTime, _>("Book_Date_in").map(|dt| dt.and_utc()),
+                check_out: row.get::<NaiveDateTime, _>("Book_Date_out").map(|dt| dt.and_utc()),
                 status: row.get::<i32, _>("Book_Status").map(|s| map_legacy_status(s)),
                 source: DataSource::Legacy,
             }
@@ -206,8 +206,8 @@ async fn fetch_legacy_calendar_data(
                 checkin_no: cin_no,
                 customer_name: row.get::<&str, _>("Cin_Cust_Name").map(String::from),
                 room_no: row.get::<&str, _>("Cin_Room_No").map(String::from),
-                check_in: row.get::<NaiveDateTime, _>("Cin_Room_In"),
-                check_out: row.get::<NaiveDateTime, _>("Cin_Room_Out"),
+                check_in: row.get::<NaiveDateTime, _>("Cin_Room_In").map(|dt| dt.and_utc()),
+                check_out: row.get::<NaiveDateTime, _>("Cin_Room_Out").map(|dt| dt.and_utc()),
                 source: DataSource::Legacy,
             }
         })
@@ -262,8 +262,8 @@ async fn fetch_new_calendar_data(
                 booking_no,
                 customer_name: row.try_get::<String, _>("cust_name").ok(),
                 room_no: row.try_get::<String, _>("room_no").ok(),
-                check_in: row.try_get::<NaiveDateTime, _>("book_checkin").ok(),
-                check_out: row.try_get::<NaiveDateTime, _>("book_checkout").ok(),
+                check_in: row.try_get::<NaiveDateTime, _>("book_checkin").ok().map(|dt| dt.and_utc()),
+                check_out: row.try_get::<NaiveDateTime, _>("book_checkout").ok().map(|dt| dt.and_utc()),
                 status: row.try_get::<String, _>("book_status").ok(),
                 source: DataSource::New,
             }
@@ -305,8 +305,8 @@ async fn fetch_new_calendar_data(
                 checkin_no: cin_no,
                 customer_name: row.try_get::<String, _>("cust_name").ok(),
                 room_no: row.try_get::<String, _>("room_no").ok(),
-                check_in: row.try_get::<NaiveDateTime, _>("cin_checkin_time").ok(),
-                check_out: row.try_get::<NaiveDateTime, _>("cin_checkout").ok(),
+                check_in: row.try_get::<NaiveDateTime, _>("cin_checkin_time").ok().map(|dt| dt.and_utc()),
+                check_out: row.try_get::<NaiveDateTime, _>("cin_checkout").ok().map(|dt| dt.and_utc()),
                 source: DataSource::New,
             }
         })

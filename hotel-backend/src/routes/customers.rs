@@ -166,7 +166,7 @@ pub async fn list_customers(
             id_card: row.get::<&str, _>("Cust_IDcard").map(String::from),
             address: row.get::<&str, _>("C_Address").map(String::from),
             last_visit: if params.include_last_visit {
-                row.get::<NaiveDateTime, _>("lastVisit")
+                row.get::<NaiveDateTime, _>("lastVisit").map(|dt| dt.and_utc())
             } else {
                 None
             },
@@ -228,8 +228,8 @@ pub async fn get_customer_bookings(
                     .get::<&str, _>("Book_Room_Type")
                     .unwrap_or("-")
                     .to_string(),
-                check_in_date: row.try_get::<NaiveDateTime, _>("Book_Date_in").ok().flatten(),
-                check_out_date: row.try_get::<NaiveDateTime, _>("Book_Date_out").ok().flatten(),
+                check_in_date: row.try_get::<NaiveDateTime, _>("Book_Date_in").ok().flatten().map(|dt| dt.and_utc()),
+                check_out_date: row.try_get::<NaiveDateTime, _>("Book_Date_out").ok().flatten().map(|dt| dt.and_utc()),
                 status: status.to_string(),
                 total_amount: 0.0,
             }
@@ -312,8 +312,8 @@ pub async fn get_customer_stats(
         total_stays: stays_stats
             .and_then(|r| r.get::<i32, _>("totalStays"))
             .unwrap_or(0),
-        first_visit: booking_stats.and_then(|r| r.get::<NaiveDateTime, _>("firstVisit")),
-        last_visit: booking_stats.and_then(|r| r.get::<NaiveDateTime, _>("lastVisit")),
+        first_visit: booking_stats.and_then(|r| r.get::<NaiveDateTime, _>("firstVisit")).map(|dt| dt.and_utc()),
+        last_visit: booking_stats.and_then(|r| r.get::<NaiveDateTime, _>("lastVisit")).map(|dt| dt.and_utc()),
         favorite_room_type: favorite_room
             .and_then(|r| r.get::<&str, _>("Book_Room_Type").map(String::from)),
         avg_stay_days,
