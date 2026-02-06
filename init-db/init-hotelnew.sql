@@ -652,5 +652,92 @@ BEGIN
 END
 GO
 
+-- =============================================================================
+-- Migration 006: Payment Tracking
+-- =============================================================================
+
+-- HT_Payments - Payment records (multiple payments per check-in)
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'HT_Payments') AND type = N'U')
+BEGIN
+    CREATE TABLE HT_Payments (
+        Pay_ID INT IDENTITY(1,1) PRIMARY KEY,
+        Pay_Cin_ID INT NOT NULL,
+        Pay_Amount DECIMAL(12,2) NOT NULL,
+        Pay_Method NVARCHAR(50) NOT NULL,
+        Pay_Reference NVARCHAR(100) NULL,
+        Pay_Notes NVARCHAR(500) NULL,
+        Pay_Date DATETIME DEFAULT GETDATE(),
+        Pay_Created_By NVARCHAR(50) NULL,
+        Pay_Voided BIT DEFAULT 0,
+        Pay_Voided_At DATETIME NULL,
+        Pay_Voided_By NVARCHAR(50) NULL,
+        Created_At DATETIME DEFAULT GETDATE(),
+        CONSTRAINT FK_HT_Payments_CheckIn FOREIGN KEY (Pay_Cin_ID) REFERENCES HT_CheckIns(Cin_ID)
+    );
+
+    CREATE INDEX IX_HT_Payments_CheckIn ON HT_Payments(Pay_Cin_ID);
+    CREATE INDEX IX_HT_Payments_Date ON HT_Payments(Pay_Date);
+END
+GO
+
+-- =============================================================================
+-- Migration 007: Maintenance System
+-- =============================================================================
+
+-- HT_Maintenance_Categories - Maintenance categories
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'HT_Maintenance_Categories') AND type = N'U')
+BEGIN
+    CREATE TABLE HT_Maintenance_Categories (
+        MCat_ID INT IDENTITY(1,1) PRIMARY KEY,
+        MCat_Name NVARCHAR(100) NOT NULL,
+        MCat_Name_En NVARCHAR(100) NULL,
+        MCat_Priority INT DEFAULT 2,
+        MCat_Active BIT DEFAULT 1
+    );
+
+    INSERT INTO HT_Maintenance_Categories (MCat_Name, MCat_Name_En, MCat_Priority) VALUES
+    (N'ไฟฟ้า', 'Electrical', 3),
+    (N'ประปา', 'Plumbing', 3),
+    (N'เครื่องปรับอากาศ', 'Air Conditioning', 3),
+    (N'เฟอร์นิเจอร์', 'Furniture', 2),
+    (N'ทั่วไป', 'General', 2);
+END
+GO
+
+-- HT_Maintenance_Requests - Maintenance request records
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'HT_Maintenance_Requests') AND type = N'U')
+BEGIN
+    CREATE TABLE HT_Maintenance_Requests (
+        MReq_ID INT IDENTITY(1,1) PRIMARY KEY,
+        MReq_No NVARCHAR(20) NOT NULL UNIQUE,
+        MReq_Room_ID INT NOT NULL,
+        MReq_Category_ID INT NOT NULL,
+        MReq_Title NVARCHAR(200) NOT NULL,
+        MReq_Description NVARCHAR(MAX) NULL,
+        MReq_Priority INT DEFAULT 2,
+        MReq_Status NVARCHAR(20) DEFAULT 'open',
+        MReq_Assigned_To NVARCHAR(100) NULL,
+        MReq_Started_At DATETIME NULL,
+        MReq_Completed_At DATETIME NULL,
+        MReq_Resolution NVARCHAR(MAX) NULL,
+        MReq_Cost DECIMAL(10,2) NULL,
+        MReq_Created_At DATETIME DEFAULT GETDATE(),
+        MReq_Updated_At DATETIME DEFAULT GETDATE(),
+        CONSTRAINT FK_MReq_Room FOREIGN KEY (MReq_Room_ID) REFERENCES HT_Rooms_New(Room_ID),
+        CONSTRAINT FK_MReq_Category FOREIGN KEY (MReq_Category_ID) REFERENCES HT_Maintenance_Categories(MCat_ID)
+    );
+
+    CREATE INDEX IX_MReq_Room ON HT_Maintenance_Requests(MReq_Room_ID);
+    CREATE INDEX IX_MReq_Status ON HT_Maintenance_Requests(MReq_Status);
+END
+GO
+
+-- Sequence for maintenance request numbers
+IF NOT EXISTS (SELECT * FROM sys.sequences WHERE name = 'SQ_Maintenance_No')
+BEGIN
+    CREATE SEQUENCE SQ_Maintenance_No AS INT START WITH 1 INCREMENT BY 1;
+END
+GO
+
 PRINT 'HotelNew database initialization complete.'
 GO

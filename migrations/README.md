@@ -42,6 +42,8 @@ sqlcmd -S 192.168.100.222 -d HotelDB -U username -P password -i migrations/001_c
 | 003 | `003_alter_ht_rates_table.sql` | Alters HT_Rates table to support multiplier/fixed rate types for Phase 3 Financial features | Pending |
 | 004 | `004_create_inventory_tables.sql` | Creates inventory management tables (categories, items, room inventory, transactions) | Pending |
 | 005 | `005_move_booking_notes_to_hotelnew.sql` | Moves HT_Booking_Notes to HotelNew database (enforces legacy DB read-only) | v2.2.0 |
+| 006 | `006_payment_tracking.sql` | Adds HT_Payments table for multiple payments per check-in | v2.10.0 |
+| 007 | `007_maintenance_system.sql` | Creates maintenance request system tables (categories, requests, sequence) | Pending |
 
 ## Tables Owned by This Application
 
@@ -71,6 +73,9 @@ These tables are created by migration 002 in the new HotelNew database:
 | `HT_Room_Inventory` | Items assigned to each room | v2.1.0 |
 | `HT_Inventory_Transactions` | Stock movement transactions (IN, OUT, ADJUST, MOVE) | v2.1.0 |
 | `HT_Booking_Notes` | Booking notes (moved from legacy DB in v2.2.0) | v2.2.0 |
+| `HT_Payments` | Payment records for check-ins (multiple payments per stay) | v2.10.0 |
+| `HT_Maintenance_Categories` | Maintenance categories (Electrical, Plumbing, AC, Furniture, General) | v2.11.0 |
+| `HT_Maintenance_Requests` | Maintenance request records with status tracking | v2.11.0 |
 
 ## Tables Used (Read-Only or Shared)
 
