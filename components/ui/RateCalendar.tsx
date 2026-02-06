@@ -172,28 +172,28 @@ export default function RateCalendar({
   // Get color class based on rate
   const getRateColorClass = (dayInfo: DayRateInfo, isCurrentMonth: boolean) => {
     if (!isCurrentMonth) {
-      return 'bg-gray-50 text-gray-400'
+      return 'bg-zinc-800 text-zinc-600'
     }
 
     if (!dayInfo.isSpecialRate) {
-      return 'bg-white hover:bg-gray-50'
+      return 'bg-zinc-900 hover:bg-zinc-800'
     }
 
     if (dayInfo.discount > 0) {
       // Discount rate - green shades
       if (dayInfo.discountPercent >= 20) {
-        return 'bg-green-100 hover:bg-green-200 border-green-300'
+        return 'bg-green-500/20 hover:bg-green-500/30 border-green-500'
       }
-      return 'bg-green-50 hover:bg-green-100 border-green-200'
+      return 'bg-green-500/10 hover:bg-green-500/20 border-green-500'
     } else if (dayInfo.discount < 0) {
-      // Premium rate - amber shades
+      // Premium rate - red shades
       if (Math.abs(dayInfo.discountPercent) >= 20) {
-        return 'bg-amber-100 hover:bg-amber-200 border-amber-300'
+        return 'bg-red-500/20 hover:bg-red-500/30 border-red-500'
       }
-      return 'bg-amber-50 hover:bg-amber-100 border-amber-200'
+      return 'bg-red-500/10 hover:bg-red-500/20 border-red-500'
     }
 
-    return 'bg-blue-50 hover:bg-blue-100 border-blue-200'
+    return 'bg-red-500/10 hover:bg-red-500/20 border-red-500'
   }
 
   const formatPrice = (price: number) => {
@@ -205,37 +205,37 @@ export default function RateCalendar({
 
   if (!roomTypeId) {
     return (
-      <div className="bg-white rounded-lg shadow-lg p-8 text-center">
-        <Calendar className="w-12 h-12 text-gray-300 mx-auto mb-3" />
-        <p className="text-gray-500">กรุณาเลือกประเภทห้องเพื่อดูปฏิทินอัตรา</p>
+      <div className="bg-zinc-900 rounded-lg shadow-lg border border-zinc-800 p-8 text-center">
+        <Calendar className="w-12 h-12 text-zinc-600 mx-auto mb-3" />
+        <p className="text-zinc-500">กรุณาเลือกประเภทห้องเพื่อดูปฏิทินอัตรา</p>
       </div>
     )
   }
 
   return (
-    <div className="bg-white rounded-lg shadow-lg overflow-hidden">
+    <div className="bg-zinc-900 rounded-lg shadow-lg border border-zinc-800 overflow-hidden">
       {/* Header */}
-      <div className="flex items-center justify-between p-4 bg-gray-50 border-b">
+      <div className="flex items-center justify-between p-4 bg-zinc-800 border-b border-zinc-800">
         <button
           onClick={handlePrevMonth}
-          className="p-2 hover:bg-gray-200 rounded-full transition-colors"
+          className="p-2 hover:bg-zinc-800 rounded-full transition-colors"
           aria-label="เดือนก่อนหน้า"
         >
           <ChevronLeft className="w-5 h-5" />
         </button>
         <div className="text-center">
-          <h2 className="text-xl font-semibold text-gray-800">
+          <h2 className="text-xl font-semibold text-zinc-200">
             {THAI_MONTHS[month]} {year + 543}
           </h2>
           {roomType && (
-            <p className="text-sm text-gray-500">
+            <p className="text-sm text-zinc-500">
               {roomType.typeName} - ราคาปกติ {formatPrice(basePrice)} บาท
             </p>
           )}
         </div>
         <button
           onClick={handleNextMonth}
-          className="p-2 hover:bg-gray-200 rounded-full transition-colors"
+          className="p-2 hover:bg-zinc-800 rounded-full transition-colors"
           aria-label="เดือนถัดไป"
         >
           <ChevronRight className="w-5 h-5" />
@@ -243,12 +243,12 @@ export default function RateCalendar({
       </div>
 
       {/* Day Headers */}
-      <div className="grid grid-cols-7 bg-gray-100">
+      <div className="grid grid-cols-7 bg-zinc-800">
         {THAI_DAYS.map((day, index) => (
           <div
             key={day}
             className={`p-3 text-center text-sm font-medium ${
-              index === 0 ? 'text-red-600' : index === 6 ? 'text-blue-600' : 'text-gray-700'
+              index === 0 ? 'text-red-400' : index === 6 ? 'text-red-400' : 'text-zinc-300'
             }`}
           >
             {day}
@@ -268,15 +268,15 @@ export default function RateCalendar({
               key={index}
               onClick={() => isCurrentMonth && handleDayClick(dayInfo)}
               className={`
-                min-h-[80px] p-2 border border-gray-200 transition-colors
+                min-h-[80px] p-2 border border-zinc-800 transition-colors
                 ${colorClass}
                 ${isCurrentMonth ? 'cursor-pointer' : 'cursor-default'}
-                ${isTodayDate ? 'ring-2 ring-blue-500 ring-inset' : ''}
+                ${isTodayDate ? 'ring-2 ring-red-500 ring-inset' : ''}
               `}
             >
               <div
                 className={`text-sm font-medium mb-1 ${
-                  isTodayDate ? 'text-blue-600' : isCurrentMonth ? '' : 'text-gray-400'
+                  isTodayDate ? 'text-red-400' : isCurrentMonth ? '' : 'text-zinc-600'
                 }`}
               >
                 {format(dayInfo.date, 'd')}
@@ -287,11 +287,11 @@ export default function RateCalendar({
                     className={`text-xs font-semibold ${
                       dayInfo.isSpecialRate
                         ? dayInfo.discount > 0
-                          ? 'text-green-700'
+                          ? 'text-green-400'
                           : dayInfo.discount < 0
-                          ? 'text-amber-700'
-                          : 'text-blue-700'
-                        : 'text-gray-700'
+                          ? 'text-red-400'
+                          : 'text-red-400'
+                        : 'text-zinc-300'
                     }`}
                   >
                     {formatPrice(dayInfo.effectivePrice)}
@@ -299,7 +299,7 @@ export default function RateCalendar({
                   {dayInfo.isSpecialRate && dayInfo.discount !== 0 && (
                     <div
                       className={`text-[10px] ${
-                        dayInfo.discount > 0 ? 'text-green-600' : 'text-amber-600'
+                        dayInfo.discount > 0 ? 'text-green-400' : 'text-red-400'
                       }`}
                     >
                       {dayInfo.discount > 0 ? '-' : '+'}
@@ -314,22 +314,22 @@ export default function RateCalendar({
       </div>
 
       {/* Legend */}
-      <div className="flex flex-wrap items-center gap-4 p-4 bg-gray-50 border-t">
+      <div className="flex flex-wrap items-center gap-4 p-4 bg-zinc-800 border-t border-zinc-800">
         <div className="flex items-center gap-2">
-          <span className="w-4 h-4 bg-white border border-gray-300 rounded"></span>
-          <span className="text-sm text-gray-600">ราคาปกติ</span>
+          <span className="w-4 h-4 bg-zinc-900 border border-zinc-800 rounded"></span>
+          <span className="text-sm text-zinc-400">ราคาปกติ</span>
         </div>
         <div className="flex items-center gap-2">
-          <span className="w-4 h-4 bg-green-100 border border-green-300 rounded"></span>
-          <span className="text-sm text-gray-600">ลดราคา</span>
+          <span className="w-4 h-4 bg-green-500/20 border border-green-500 rounded"></span>
+          <span className="text-sm text-zinc-400">ลดราคา</span>
         </div>
         <div className="flex items-center gap-2">
-          <span className="w-4 h-4 bg-amber-100 border border-amber-300 rounded"></span>
-          <span className="text-sm text-gray-600">ราคาพิเศษ (เพิ่ม)</span>
+          <span className="w-4 h-4 bg-red-500/20 border border-red-500 rounded"></span>
+          <span className="text-sm text-zinc-400">ราคาพิเศษ (เพิ่ม)</span>
         </div>
         <div className="flex items-center gap-2">
-          <span className="w-4 h-4 border-2 border-blue-500 rounded"></span>
-          <span className="text-sm text-gray-600">วันนี้</span>
+          <span className="w-4 h-4 border-2 border-red-500 rounded"></span>
+          <span className="text-sm text-zinc-400">วันนี้</span>
         </div>
       </div>
 
@@ -338,25 +338,25 @@ export default function RateCalendar({
         <>
           {/* Backdrop */}
           <div
-            className="fixed inset-0 bg-black bg-opacity-30 z-40"
+            className="fixed inset-0 bg-black/60 z-40"
             onClick={closeDetail}
           />
 
           {/* Detail Card */}
           <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-            <div className="bg-white rounded-lg shadow-xl w-full max-w-sm overflow-hidden">
+            <div className="bg-zinc-900 border border-zinc-800 rounded-lg shadow-xl w-full max-w-sm overflow-hidden">
               {/* Header */}
-              <div className="flex items-center justify-between p-4 bg-gray-50 border-b">
+              <div className="flex items-center justify-between p-4 bg-zinc-800 border-b border-zinc-800">
                 <div className="flex items-center gap-2">
-                  <Calendar className="w-5 h-5 text-gray-600" />
-                  <span className="font-semibold text-gray-800">
+                  <Calendar className="w-5 h-5 text-zinc-400" />
+                  <span className="font-semibold text-zinc-200">
                     {format(selectedDay.date, 'd')} {THAI_MONTHS[selectedDay.date.getMonth()]}{' '}
                     {selectedDay.date.getFullYear() + 543}
                   </span>
                 </div>
                 <button
                   onClick={closeDetail}
-                  className="p-1 hover:bg-gray-200 rounded-full transition-colors"
+                  className="p-1 hover:bg-zinc-800 rounded-full transition-colors"
                   aria-label="ปิด"
                 >
                   <X className="w-5 h-5" />
@@ -367,27 +367,27 @@ export default function RateCalendar({
               <div className="p-4 space-y-4">
                 {/* Room Type */}
                 <div>
-                  <p className="text-sm text-gray-500">ประเภทห้อง</p>
-                  <p className="font-medium text-gray-800">{roomType?.typeName}</p>
+                  <p className="text-sm text-zinc-500">ประเภทห้อง</p>
+                  <p className="font-medium text-zinc-200">{roomType?.typeName}</p>
                 </div>
 
                 {/* Prices */}
                 <div className="grid grid-cols-2 gap-4">
                   <div>
-                    <p className="text-sm text-gray-500">ราคาปกติ</p>
-                    <p className="font-medium text-gray-800">
+                    <p className="text-sm text-zinc-500">ราคาปกติ</p>
+                    <p className="font-medium text-zinc-200">
                       {formatPrice(selectedDay.basePrice)} บาท
                     </p>
                   </div>
                   <div>
-                    <p className="text-sm text-gray-500">ราคาวันนี้</p>
+                    <p className="text-sm text-zinc-500">ราคาวันนี้</p>
                     <p
                       className={`font-bold text-lg ${
                         selectedDay.discount > 0
-                          ? 'text-green-600'
+                          ? 'text-green-400'
                           : selectedDay.discount < 0
-                          ? 'text-amber-600'
-                          : 'text-gray-800'
+                          ? 'text-red-400'
+                          : 'text-zinc-200'
                       }`}
                     >
                       {formatPrice(selectedDay.effectivePrice)} บาท
@@ -400,19 +400,19 @@ export default function RateCalendar({
                   <div
                     className={`p-3 rounded-lg ${
                       selectedDay.discount > 0
-                        ? 'bg-green-50 border border-green-200'
-                        : 'bg-amber-50 border border-amber-200'
+                        ? 'bg-green-500/10 border border-green-500'
+                        : 'bg-red-500/10 border border-red-500'
                     }`}
                   >
                     <div className="flex items-center gap-2">
                       <Percent
                         className={`w-4 h-4 ${
-                          selectedDay.discount > 0 ? 'text-green-600' : 'text-amber-600'
+                          selectedDay.discount > 0 ? 'text-green-400' : 'text-red-400'
                         }`}
                       />
                       <span
                         className={`font-medium ${
-                          selectedDay.discount > 0 ? 'text-green-700' : 'text-amber-700'
+                          selectedDay.discount > 0 ? 'text-green-400' : 'text-red-400'
                         }`}
                       >
                         {selectedDay.discount > 0 ? 'ลด' : 'เพิ่ม'}{' '}
@@ -421,7 +421,7 @@ export default function RateCalendar({
                     </div>
                     <p
                       className={`text-sm mt-1 ${
-                        selectedDay.discount > 0 ? 'text-green-600' : 'text-amber-600'
+                        selectedDay.discount > 0 ? 'text-green-400' : 'text-red-400'
                       }`}
                     >
                       {selectedDay.discount > 0 ? 'ประหยัด' : 'เพิ่มขึ้น'}{' '}
@@ -432,13 +432,13 @@ export default function RateCalendar({
 
                 {/* Applied Rate */}
                 {selectedDay.appliedRate && (
-                  <div className="p-3 bg-gray-50 rounded-lg">
+                  <div className="p-3 bg-zinc-800 rounded-lg">
                     <div className="flex items-center gap-2 mb-2">
-                      <Tag className="w-4 h-4 text-gray-600" />
-                      <span className="font-medium text-gray-700">อัตราที่ใช้</span>
+                      <Tag className="w-4 h-4 text-zinc-400" />
+                      <span className="font-medium text-zinc-300">อัตราที่ใช้</span>
                     </div>
-                    <p className="text-sm text-gray-600">{selectedDay.appliedRate.rateName}</p>
-                    <p className="text-xs text-gray-500 mt-1">
+                    <p className="text-sm text-zinc-400">{selectedDay.appliedRate.rateName}</p>
+                    <p className="text-xs text-zinc-500 mt-1">
                       {selectedDay.appliedRate.rateType === 'multiplier'
                         ? `ตัวคูณ: ${selectedDay.appliedRate.rateValue}`
                         : `ราคาคงที่: ${formatPrice(selectedDay.appliedRate.rateValue)} บาท`}
@@ -447,8 +447,8 @@ export default function RateCalendar({
                 )}
 
                 {!selectedDay.appliedRate && (
-                  <div className="p-3 bg-gray-50 rounded-lg">
-                    <p className="text-sm text-gray-500">ไม่มีอัตราพิเศษสำหรับวันนี้</p>
+                  <div className="p-3 bg-zinc-800 rounded-lg">
+                    <p className="text-sm text-zinc-500">ไม่มีอัตราพิเศษสำหรับวันนี้</p>
                   </div>
                 )}
               </div>

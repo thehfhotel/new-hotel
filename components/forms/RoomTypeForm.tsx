@@ -167,26 +167,26 @@ export default function RoomTypeForm({
     <>
       {/* Backdrop */}
       <div
-        className="fixed inset-0 bg-black bg-opacity-50 z-40"
+        className="fixed inset-0 bg-black/60 z-40"
         onClick={onClose}
       />
 
       {/* Modal */}
       <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-        <div className="bg-white rounded-lg shadow-xl w-full max-w-lg max-h-[90vh] overflow-hidden">
+        <div className="bg-zinc-900 rounded-lg shadow-xl border border-zinc-800 w-full max-w-lg max-h-[90vh] overflow-hidden">
           {/* Header */}
-          <div className="flex items-center justify-between p-4 border-b bg-gray-50">
+          <div className="flex items-center justify-between p-4 border-b border-zinc-800 bg-zinc-800">
             <div className="flex items-center gap-3">
-              <div className="w-10 h-10 bg-purple-100 rounded-full flex items-center justify-center">
-                <Home className="w-5 h-5 text-purple-600" />
+              <div className="w-10 h-10 bg-red-500/10 rounded-full flex items-center justify-center">
+                <Home className="w-5 h-5 text-red-400" />
               </div>
-              <h2 className="text-xl font-bold text-gray-800">
+              <h2 className="text-xl font-bold text-zinc-100">
                 {mode === 'create' ? 'เพิ่มประเภทห้องใหม่' : 'แก้ไขประเภทห้อง'}
               </h2>
             </div>
             <button
               onClick={onClose}
-              className="p-2 hover:bg-gray-200 rounded-full transition-colors"
+              className="p-2 hover:bg-zinc-800 rounded-full transition-colors"
               aria-label="ปิด"
             >
               <X className="w-5 h-5" />
@@ -198,7 +198,7 @@ export default function RoomTypeForm({
             <div className="p-4 space-y-4 overflow-y-auto max-h-[60vh]">
               {/* Error Message */}
               {error && (
-                <div className="flex items-center gap-2 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700">
+                <div className="flex items-center gap-2 p-3 bg-red-950/50 border border-red-900/50 rounded-lg text-red-400">
                   <AlertCircle className="w-5 h-5 flex-shrink-0" />
                   <span className="text-sm">{error}</span>
                 </div>
@@ -206,7 +206,7 @@ export default function RoomTypeForm({
 
               {/* Type Code (Required) */}
               <div>
-                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-1">
                   <Hash className="w-4 h-4" />
                   รหัส <span className="text-red-500">*</span>
                 </label>
@@ -217,15 +217,15 @@ export default function RoomTypeForm({
                   onChange={handleInputChange}
                   placeholder="เช่น STD, DLX, SUI"
                   maxLength={20}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-purple-500 outline-none transition-colors uppercase"
+                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors uppercase"
                   required
                 />
-                <p className="mt-1 text-xs text-gray-500">รหัสประเภทห้อง (ไม่เกิน 20 ตัวอักษร)</p>
+                <p className="mt-1 text-xs text-zinc-500">รหัสประเภทห้อง (ไม่เกิน 20 ตัวอักษร)</p>
               </div>
 
               {/* Type Name Thai (Required) */}
               <div>
-                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-1">
                   <Home className="w-4 h-4" />
                   ชื่อ <span className="text-red-500">*</span>
                 </label>
@@ -235,14 +235,14 @@ export default function RoomTypeForm({
                   value={formData.typeName}
                   onChange={handleInputChange}
                   placeholder="กรอกชื่อประเภทห้อง"
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-purple-500 outline-none transition-colors"
+                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
                   required
                 />
               </div>
 
               {/* Type Name English */}
               <div>
-                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-1">
                   <Globe className="w-4 h-4" />
                   ชื่อภาษาอังกฤษ
                 </label>
@@ -252,13 +252,13 @@ export default function RoomTypeForm({
                   value={formData.typeNameEn}
                   onChange={handleInputChange}
                   placeholder="Enter English name"
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-purple-500 outline-none transition-colors"
+                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
                 />
               </div>
 
               {/* Description */}
               <div>
-                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-1">
                   <FileText className="w-4 h-4" />
                   รายละเอียด
                 </label>
@@ -268,13 +268,13 @@ export default function RoomTypeForm({
                   onChange={handleInputChange}
                   placeholder="กรอกรายละเอียดประเภทห้อง"
                   rows={3}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-purple-500 outline-none transition-colors resize-none"
+                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors resize-none"
                 />
               </div>
 
               {/* Base Price */}
               <div>
-                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-1">
                   <DollarSign className="w-4 h-4" />
                   ราคาพื้นฐาน (บาท)
                 </label>
@@ -286,13 +286,13 @@ export default function RoomTypeForm({
                   placeholder="0"
                   min="0"
                   step="0.01"
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-purple-500 outline-none transition-colors"
+                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
                 />
               </div>
 
               {/* Max Guests */}
               <div>
-                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-1">
                   <Users className="w-4 h-4" />
                   จำนวนผู้เข้าพักสูงสุด
                 </label>
@@ -304,13 +304,13 @@ export default function RoomTypeForm({
                   placeholder="2"
                   min="1"
                   max="20"
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-purple-500 outline-none transition-colors"
+                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
                 />
               </div>
 
               {/* Bed Type */}
               <div>
-                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-1">
                   <Bed className="w-4 h-4" />
                   ประเภทเตียง
                 </label>
@@ -318,7 +318,7 @@ export default function RoomTypeForm({
                   name="bedType"
                   value={formData.bedType}
                   onChange={handleInputChange}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-purple-500 outline-none transition-colors bg-white"
+                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
                 >
                   <option value="">-- เลือกประเภทเตียง --</option>
                   {bedTypes.map((bed) => (
@@ -331,7 +331,7 @@ export default function RoomTypeForm({
 
               {/* Size SQM */}
               <div>
-                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-1">
                   <Maximize className="w-4 h-4" />
                   ขนาดห้อง (ตร.ม.)
                 </label>
@@ -343,13 +343,13 @@ export default function RoomTypeForm({
                   placeholder="0"
                   min="0"
                   step="0.01"
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-purple-500 outline-none transition-colors"
+                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
                 />
               </div>
 
               {/* Active Toggle */}
-              <div className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
-                <label className="text-sm font-medium text-gray-700">
+              <div className="flex items-center justify-between p-3 bg-zinc-800 rounded-lg">
+                <label className="text-sm font-medium text-zinc-300">
                   เปิดใช้งาน
                 </label>
                 <label className="relative inline-flex items-center cursor-pointer">
@@ -360,13 +360,13 @@ export default function RoomTypeForm({
                     onChange={handleInputChange}
                     className="sr-only peer"
                   />
-                  <div className="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-purple-300 rounded-full peer peer-checked:after:translate-x-full rtl:peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-purple-600"></div>
+                  <div className="w-11 h-6 bg-zinc-700 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-red-500/30 rounded-full peer peer-checked:after:translate-x-full rtl:peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-zinc-600 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-red-600"></div>
                 </label>
               </div>
             </div>
 
             {/* Footer */}
-            <div className="p-4 border-t bg-gray-50 flex items-center justify-between gap-3">
+            <div className="p-4 border-t border-zinc-800 bg-zinc-800 flex items-center justify-between gap-3">
               {/* Delete Button (only in edit mode) */}
               {mode === 'edit' && onDelete && initialData?.id && (
                 <div>
@@ -388,7 +388,7 @@ export default function RoomTypeForm({
                       <button
                         type="button"
                         onClick={() => setShowDeleteConfirm(false)}
-                        className="px-3 py-1.5 bg-gray-200 text-gray-700 text-sm rounded-lg hover:bg-gray-300 transition-colors"
+                        className="px-3 py-1.5 bg-zinc-800 text-zinc-200 text-sm rounded-lg hover:bg-zinc-800 transition-colors"
                       >
                         ไม่
                       </button>
@@ -397,7 +397,7 @@ export default function RoomTypeForm({
                     <button
                       type="button"
                       onClick={() => setShowDeleteConfirm(true)}
-                      className="flex items-center gap-2 px-4 py-2 text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                      className="flex items-center gap-2 px-4 py-2 text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
                     >
                       <Trash2 className="w-4 h-4" />
                       ลบ
@@ -414,14 +414,14 @@ export default function RoomTypeForm({
                 <button
                   type="button"
                   onClick={onClose}
-                  className="px-4 py-2 bg-gray-200 hover:bg-gray-300 text-gray-800 rounded-lg transition-colors"
+                  className="px-4 py-2 bg-zinc-800 hover:bg-zinc-800 text-zinc-200 rounded-lg transition-colors"
                 >
                   ยกเลิก
                 </button>
                 <button
                   type="submit"
                   disabled={saving}
-                  className="flex items-center gap-2 px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50 transition-colors"
+                  className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 transition-colors"
                 >
                   {saving ? (
                     <Loader2 className="w-4 h-4 animate-spin" />

@@ -287,26 +287,26 @@ export default function RateForm({
     <>
       {/* Backdrop */}
       <div
-        className="fixed inset-0 bg-black bg-opacity-50 z-40"
+        className="fixed inset-0 bg-black/60 z-40"
         onClick={onClose}
       />
 
       {/* Modal */}
       <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-        <div className="bg-white rounded-lg shadow-xl w-full max-w-lg max-h-[90vh] overflow-hidden">
+        <div className="bg-zinc-900 rounded-lg shadow-xl border border-zinc-800 w-full max-w-lg max-h-[90vh] overflow-hidden">
           {/* Header */}
-          <div className="flex items-center justify-between p-4 border-b bg-gray-50">
+          <div className="flex items-center justify-between p-4 border-b border-zinc-800 bg-zinc-800">
             <div className="flex items-center gap-3">
-              <div className="w-10 h-10 bg-amber-100 rounded-full flex items-center justify-center">
-                <Percent className="w-5 h-5 text-amber-600" />
+              <div className="w-10 h-10 bg-red-500/10 rounded-full flex items-center justify-center">
+                <Percent className="w-5 h-5 text-red-400" />
               </div>
-              <h2 className="text-xl font-bold text-gray-800">
+              <h2 className="text-xl font-bold text-zinc-100">
                 {mode === 'create' ? 'เพิ่มอัตราพิเศษ' : 'แก้ไขอัตราพิเศษ'}
               </h2>
             </div>
             <button
               onClick={onClose}
-              className="p-2 hover:bg-gray-200 rounded-full transition-colors"
+              className="p-2 hover:bg-zinc-800 rounded-full transition-colors"
               aria-label="ปิด"
             >
               <X className="w-5 h-5" />
@@ -318,7 +318,7 @@ export default function RateForm({
             <div className="p-4 space-y-4 overflow-y-auto max-h-[60vh]">
               {/* Error Message */}
               {error && (
-                <div className="flex items-center gap-2 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700">
+                <div className="flex items-center gap-2 p-3 bg-red-950/50 border border-red-900/50 rounded-lg text-red-400">
                   <AlertCircle className="w-5 h-5 flex-shrink-0" />
                   <span className="text-sm">{error}</span>
                 </div>
@@ -326,7 +326,7 @@ export default function RateForm({
 
               {/* Rate Name */}
               <div>
-                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-1">
                   <Tag className="w-4 h-4" />
                   ชื่ออัตรา <span className="text-red-500">*</span>
                 </label>
@@ -336,14 +336,14 @@ export default function RateForm({
                   value={formData.rateName}
                   onChange={handleInputChange}
                   placeholder="เช่น Weekend Special, Low Season"
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-amber-500 outline-none transition-colors"
+                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
                   required
                 />
               </div>
 
               {/* Room Type */}
               <div>
-                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-1">
                   <Home className="w-4 h-4" />
                   ประเภทห้อง <span className="text-red-500">*</span>
                 </label>
@@ -351,7 +351,7 @@ export default function RateForm({
                   name="roomTypeId"
                   value={formData.roomTypeId ?? ''}
                   onChange={handleInputChange}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-amber-500 outline-none transition-colors bg-white"
+                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
                   required
                 >
                   <option value="">-- เลือกประเภทห้อง --</option>
@@ -365,7 +365,7 @@ export default function RateForm({
 
               {/* Rate Type */}
               <div>
-                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-1">
                   <Percent className="w-4 h-4" />
                   ประเภทอัตรา <span className="text-red-500">*</span>
                 </label>
@@ -377,9 +377,9 @@ export default function RateForm({
                       value="multiplier"
                       checked={formData.rateType === 'multiplier'}
                       onChange={handleInputChange}
-                      className="w-4 h-4 text-amber-600 focus:ring-amber-500"
+                      className="w-4 h-4 text-red-600 focus:ring-red-500"
                     />
-                    <span className="text-sm">ตัวคูณ (Multiplier)</span>
+                    <span className="text-sm text-zinc-200">ตัวคูณ (Multiplier)</span>
                   </label>
                   <label className="flex items-center gap-2 cursor-pointer">
                     <input
@@ -388,16 +388,16 @@ export default function RateForm({
                       value="fixed"
                       checked={formData.rateType === 'fixed'}
                       onChange={handleInputChange}
-                      className="w-4 h-4 text-amber-600 focus:ring-amber-500"
+                      className="w-4 h-4 text-red-600 focus:ring-red-500"
                     />
-                    <span className="text-sm">ราคาคงที่ (Fixed Price)</span>
+                    <span className="text-sm text-zinc-200">ราคาคงที่ (Fixed Price)</span>
                   </label>
                 </div>
               </div>
 
               {/* Rate Value */}
               <div>
-                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-1">
                   <DollarSign className="w-4 h-4" />
                   {formData.rateType === 'multiplier' ? 'ตัวคูณ' : 'ราคา (บาท)'}{' '}
                   <span className="text-red-500">*</span>
@@ -411,11 +411,11 @@ export default function RateForm({
                   min={formData.rateType === 'multiplier' ? '0.1' : '1'}
                   max={formData.rateType === 'multiplier' ? '2.0' : undefined}
                   step={formData.rateType === 'multiplier' ? '0.01' : '1'}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-amber-500 outline-none transition-colors"
+                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
                   required
                 />
                 {formData.rateType === 'multiplier' && (
-                  <p className="mt-1 text-xs text-gray-500">
+                  <p className="mt-1 text-xs text-zinc-500">
                     เช่น 0.8 = ลด 20%, 1.2 = เพิ่ม 20% (ค่าอยู่ระหว่าง 0.1 - 2.0)
                   </p>
                 )}
@@ -426,16 +426,16 @@ export default function RateForm({
                 <div
                   className={`p-3 rounded-lg border ${
                     pricePreview.isDiscount
-                      ? 'bg-green-50 border-green-200'
-                      : 'bg-amber-50 border-amber-200'
+                      ? 'bg-green-950/30 border-green-900/50'
+                      : 'bg-red-950/30 border-red-900/50'
                   }`}
                 >
-                  <p className="text-sm font-medium text-gray-700 mb-1">ตัวอย่างราคา:</p>
+                  <p className="text-sm font-medium text-zinc-300 mb-1">ตัวอย่างราคา:</p>
                   <div className="flex items-center gap-2">
-                    <span className="text-gray-500 line-through">
+                    <span className="text-zinc-500 line-through">
                       {pricePreview.basePrice.toLocaleString()} บาท
                     </span>
-                    <span className="text-lg font-bold text-gray-800">
+                    <span className="text-lg font-bold text-zinc-100">
                       {pricePreview.effectivePrice.toLocaleString()} บาท
                     </span>
                     {pricePreview.isDiscount && (
@@ -444,7 +444,7 @@ export default function RateForm({
                       </span>
                     )}
                     {!pricePreview.isDiscount && pricePreview.discount !== 0 && (
-                      <span className="px-2 py-0.5 bg-amber-500 text-white text-xs rounded-full">
+                      <span className="px-2 py-0.5 bg-red-500 text-white text-xs rounded-full">
                         +{Math.abs(parseInt(pricePreview.discountPercent))}%
                       </span>
                     )}
@@ -455,7 +455,7 @@ export default function RateForm({
               {/* Valid Period */}
               <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                  <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-1">
                     <Calendar className="w-4 h-4" />
                     วันที่เริ่มต้น <span className="text-red-500">*</span>
                   </label>
@@ -464,17 +464,17 @@ export default function RateForm({
                     name="validFrom"
                     value={formData.validFrom}
                     onChange={handleInputChange}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-amber-500 outline-none transition-colors"
+                    className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
                     required
                   />
                   {formData.validFrom && (
-                    <p className="mt-1 text-xs text-gray-500">
+                    <p className="mt-1 text-xs text-zinc-500">
                       พ.ศ. {toBuddhistYear(formData.validFrom)}
                     </p>
                   )}
                 </div>
                 <div>
-                  <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                  <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-1">
                     <Calendar className="w-4 h-4" />
                     วันที่สิ้นสุด <span className="text-red-500">*</span>
                   </label>
@@ -484,11 +484,11 @@ export default function RateForm({
                     value={formData.validTo}
                     onChange={handleInputChange}
                     min={formData.validFrom || undefined}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-amber-500 outline-none transition-colors"
+                    className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
                     required
                   />
                   {formData.validTo && (
-                    <p className="mt-1 text-xs text-gray-500">
+                    <p className="mt-1 text-xs text-zinc-500">
                       พ.ศ. {toBuddhistYear(formData.validTo)}
                     </p>
                   )}
@@ -497,7 +497,7 @@ export default function RateForm({
 
               {/* Days of Week */}
               <div>
-                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-2">
+                <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-2">
                   <ToggleLeft className="w-4 h-4" />
                   วันที่มีผล <span className="text-red-500">*</span>
                 </label>
@@ -505,21 +505,21 @@ export default function RateForm({
                   <button
                     type="button"
                     onClick={handleSelectAllDays}
-                    className="px-2 py-1 text-xs bg-gray-100 hover:bg-gray-200 rounded transition-colors"
+                    className="px-2 py-1 text-xs bg-zinc-800 text-zinc-200 hover:bg-zinc-800 rounded transition-colors"
                   >
                     ทุกวัน
                   </button>
                   <button
                     type="button"
                     onClick={handleSelectWeekdays}
-                    className="px-2 py-1 text-xs bg-gray-100 hover:bg-gray-200 rounded transition-colors"
+                    className="px-2 py-1 text-xs bg-zinc-800 text-zinc-200 hover:bg-zinc-800 rounded transition-colors"
                   >
                     วันธรรมดา
                   </button>
                   <button
                     type="button"
                     onClick={handleSelectWeekends}
-                    className="px-2 py-1 text-xs bg-gray-100 hover:bg-gray-200 rounded transition-colors"
+                    className="px-2 py-1 text-xs bg-zinc-800 text-zinc-200 hover:bg-zinc-800 rounded transition-colors"
                   >
                     วันหยุด
                   </button>
@@ -532,8 +532,8 @@ export default function RateForm({
                       onClick={() => handleDayToggle(day.value)}
                       className={`w-10 h-10 rounded-full text-sm font-medium transition-colors ${
                         formData.daysOfWeek.includes(day.value)
-                          ? 'bg-amber-500 text-white'
-                          : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                          ? 'bg-red-600 text-white'
+                          : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-800'
                       } ${
                         day.value === 0
                           ? 'ring-1 ring-red-300'
@@ -550,8 +550,8 @@ export default function RateForm({
               </div>
 
               {/* Active Toggle */}
-              <div className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
-                <label className="text-sm font-medium text-gray-700">เปิดใช้งาน</label>
+              <div className="flex items-center justify-between p-3 bg-zinc-800 rounded-lg">
+                <label className="text-sm font-medium text-zinc-300">เปิดใช้งาน</label>
                 <label className="relative inline-flex items-center cursor-pointer">
                   <input
                     type="checkbox"
@@ -560,13 +560,13 @@ export default function RateForm({
                     onChange={handleInputChange}
                     className="sr-only peer"
                   />
-                  <div className="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-amber-300 rounded-full peer peer-checked:after:translate-x-full rtl:peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-amber-600"></div>
+                  <div className="w-11 h-6 bg-zinc-700 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-red-500/30 rounded-full peer peer-checked:after:translate-x-full rtl:peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-zinc-600 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-red-600"></div>
                 </label>
               </div>
             </div>
 
             {/* Footer */}
-            <div className="p-4 border-t bg-gray-50 flex items-center justify-between gap-3">
+            <div className="p-4 border-t border-zinc-800 bg-zinc-800 flex items-center justify-between gap-3">
               {/* Delete Button (only in edit mode) */}
               {mode === 'edit' && onDelete && rate?.id && (
                 <div>
@@ -584,7 +584,7 @@ export default function RateForm({
                       <button
                         type="button"
                         onClick={() => setShowDeleteConfirm(false)}
-                        className="px-3 py-1.5 bg-gray-200 text-gray-700 text-sm rounded-lg hover:bg-gray-300 transition-colors"
+                        className="px-3 py-1.5 bg-zinc-800 text-zinc-200 text-sm rounded-lg hover:bg-zinc-800 transition-colors"
                       >
                         ไม่
                       </button>
@@ -593,7 +593,7 @@ export default function RateForm({
                     <button
                       type="button"
                       onClick={() => setShowDeleteConfirm(true)}
-                      className="flex items-center gap-2 px-4 py-2 text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                      className="flex items-center gap-2 px-4 py-2 text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
                     >
                       <Trash2 className="w-4 h-4" />
                       ลบ
@@ -610,14 +610,14 @@ export default function RateForm({
                 <button
                   type="button"
                   onClick={onClose}
-                  className="px-4 py-2 bg-gray-200 hover:bg-gray-300 text-gray-800 rounded-lg transition-colors"
+                  className="px-4 py-2 bg-zinc-800 hover:bg-zinc-800 text-zinc-200 rounded-lg transition-colors"
                 >
                   ยกเลิก
                 </button>
                 <button
                   type="submit"
                   disabled={saving}
-                  className="flex items-center gap-2 px-4 py-2 bg-amber-600 text-white rounded-lg hover:bg-amber-700 disabled:opacity-50 transition-colors"
+                  className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 transition-colors"
                 >
                   {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
                   {mode === 'create' ? 'เพิ่มอัตรา' : 'บันทึก'}

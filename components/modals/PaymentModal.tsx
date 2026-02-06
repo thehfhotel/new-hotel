@@ -108,41 +108,41 @@ export default function PaymentModal({
 
   return (
     <div
-      className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50"
+      className="fixed inset-0 bg-black/60 flex items-center justify-center z-50"
       onClick={handleClose}
     >
       <div
-        className="bg-white rounded-xl shadow-2xl w-full max-w-md mx-4 max-h-[90vh] overflow-y-auto"
+        className="bg-zinc-900 border border-zinc-800 rounded-xl shadow-2xl w-full max-w-md mx-4 max-h-[90vh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="flex items-center justify-between p-4 border-b bg-green-50">
+        <div className="flex items-center justify-between p-4 border-b border-zinc-800 bg-red-500/10">
           <div>
-            <h2 className="text-xl font-bold text-gray-800">บันทึกการชำระเงิน</h2>
-            <p className="text-sm text-gray-500">Record Payment</p>
+            <h2 className="text-xl font-bold text-zinc-100">บันทึกการชำระเงิน</h2>
+            <p className="text-sm text-zinc-500">Record Payment</p>
           </div>
           <button
             onClick={handleClose}
-            className="p-2 hover:bg-green-100 rounded-lg"
+            className="p-2 hover:bg-zinc-800 rounded-lg"
           >
             <X size={20} />
           </button>
         </div>
 
         {/* Summary */}
-        <div className="p-4 bg-gray-50 border-b">
+        <div className="p-4 bg-zinc-800 border-b border-zinc-800">
           <div className="grid grid-cols-3 gap-4 text-center">
             <div>
-              <p className="text-sm text-gray-500">ยอดรวม</p>
-              <p className="font-semibold text-gray-800">{formatCurrency(totalAmount)}</p>
+              <p className="text-sm text-zinc-500">ยอดรวม</p>
+              <p className="font-semibold text-zinc-200">{formatCurrency(totalAmount)}</p>
             </div>
             <div>
-              <p className="text-sm text-gray-500">ชำระแล้ว</p>
-              <p className="font-semibold text-green-600">{formatCurrency(totalPaid)}</p>
+              <p className="text-sm text-zinc-500">ชำระแล้ว</p>
+              <p className="font-semibold text-red-400">{formatCurrency(totalPaid)}</p>
             </div>
             <div>
-              <p className="text-sm text-gray-500">คงเหลือ</p>
-              <p className={`font-semibold ${balance > 0 ? 'text-orange-600' : 'text-green-600'}`}>
+              <p className="text-sm text-zinc-500">คงเหลือ</p>
+              <p className={`font-semibold ${balance > 0 ? 'text-amber-400' : 'text-red-400'}`}>
                 {formatCurrency(balance)}
               </p>
             </div>
@@ -153,14 +153,14 @@ export default function PaymentModal({
         <form onSubmit={handleSubmit} className="p-4 space-y-4">
           {/* Error Message */}
           {error && (
-            <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
+            <div className="p-3 bg-red-950/50 border border-red-900/50 rounded-lg text-red-400 text-sm">
               {error}
             </div>
           )}
 
           {/* Amount */}
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
+            <label className="block text-sm font-medium text-zinc-300 mb-1">
               <DollarSign size={16} className="inline mr-1" />
               จำนวนเงิน (บาท) <span className="text-red-500">*</span>
             </label>
@@ -172,13 +172,13 @@ export default function PaymentModal({
               min="0"
               step="0.01"
               required
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500 text-lg font-medium"
+              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 text-lg font-medium"
             />
             {balance > 0 && (
               <button
                 type="button"
                 onClick={() => setAmount(balance.toString())}
-                className="mt-1 text-sm text-green-600 hover:text-green-700"
+                className="mt-1 text-sm text-red-400 hover:text-red-300"
               >
                 ใช้ยอดคงเหลือ ({formatCurrency(balance)})
               </button>
@@ -187,7 +187,7 @@ export default function PaymentModal({
 
           {/* Payment Method */}
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-2">
+            <label className="block text-sm font-medium text-zinc-300 mb-2">
               <CreditCard size={16} className="inline mr-1" />
               วิธีการชำระเงิน
             </label>
@@ -199,8 +199,8 @@ export default function PaymentModal({
                   onClick={() => setPaymentMethod(method.value)}
                   className={`flex items-center gap-2 px-3 py-2 border rounded-lg text-sm ${
                     paymentMethod === method.value
-                      ? 'border-green-500 bg-green-50 text-green-700'
-                      : 'border-gray-300 hover:bg-gray-50'
+                      ? 'border-red-500 bg-red-500/10 text-red-400'
+                      : 'border-zinc-700 hover:bg-zinc-800'
                   }`}
                 >
                   {method.icon}
@@ -213,7 +213,7 @@ export default function PaymentModal({
           {/* Reference (for card/transfer) */}
           {showReferenceField && (
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
+              <label className="block text-sm font-medium text-zinc-300 mb-1">
                 {paymentMethod === 'credit' ? 'เลขบัตร 4 หลักสุดท้าย' : 'เลขอ้างอิง'}
               </label>
               <input
@@ -222,14 +222,14 @@ export default function PaymentModal({
                 onChange={(e) => setReference(e.target.value)}
                 placeholder={paymentMethod === 'credit' ? '1234' : 'เลขอ้างอิงการโอน'}
                 maxLength={100}
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500"
+                className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500"
               />
             </div>
           )}
 
           {/* Notes */}
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
+            <label className="block text-sm font-medium text-zinc-300 mb-1">
               <FileText size={16} className="inline mr-1" />
               หมายเหตุ
             </label>
@@ -238,7 +238,7 @@ export default function PaymentModal({
               onChange={(e) => setNotes(e.target.value)}
               placeholder="หมายเหตุเพิ่มเติม..."
               rows={2}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500 resize-none"
+              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 resize-none"
             />
           </div>
 
@@ -247,7 +247,7 @@ export default function PaymentModal({
             <button
               type="button"
               onClick={handleClose}
-              className="flex-1 px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50"
+              className="flex-1 px-4 py-2 border border-zinc-700 text-zinc-300 rounded-lg hover:bg-zinc-800"
               disabled={isSubmitting}
             >
               ยกเลิก
@@ -255,7 +255,7 @@ export default function PaymentModal({
             <button
               type="submit"
               disabled={isSubmitting}
-              className="flex-1 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+              className="flex-1 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
             >
               {isSubmitting ? (
                 <>

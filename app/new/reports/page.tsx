@@ -56,10 +56,10 @@ function formatPercent(value: number): string {
 
 // Colors for pie chart
 const CHART_COLORS = [
-  '#3B82F6', // blue-500
+  '#EF4444', // red-500 (accent)
   '#10B981', // emerald-500
   '#F59E0B', // amber-500
-  '#EF4444', // red-500
+  '#3B82F6', // blue-500
   '#8B5CF6', // violet-500
   '#EC4899', // pink-500
   '#06B6D4', // cyan-500
@@ -141,10 +141,10 @@ export default function ReportsPage() {
   const RevenueTooltip = ({ active, payload, label }: { active?: boolean; payload?: { value: number; dataKey: string }[]; label?: string }) => {
     if (active && payload && payload.length) {
       return (
-        <div className="bg-white p-3 rounded-lg shadow-lg border border-gray-200">
-          <p className="text-sm font-medium text-gray-900">{label}</p>
+        <div className="bg-zinc-900 p-3 rounded-lg border border-zinc-700">
+          <p className="text-sm font-medium text-zinc-100">{label}</p>
           {payload.map((entry, index) => (
-            <p key={index} className="text-sm text-gray-600">
+            <p key={index} className="text-sm text-zinc-400">
               {entry.dataKey === 'revenue' ? 'รายได้: ' : 'จำนวนจอง: '}
               <span className="font-medium">
                 {entry.dataKey === 'revenue' ? formatCurrency(entry.value) : entry.value}
@@ -162,12 +162,12 @@ export default function ReportsPage() {
     if (active && payload && payload.length) {
       const data = payload[0].payload
       return (
-        <div className="bg-white p-3 rounded-lg shadow-lg border border-gray-200">
-          <p className="text-sm font-medium text-gray-900">{data.roomType}</p>
-          <p className="text-sm text-gray-600">
+        <div className="bg-zinc-900 p-3 rounded-lg border border-zinc-700">
+          <p className="text-sm font-medium text-zinc-100">{data.roomType}</p>
+          <p className="text-sm text-zinc-400">
             รายได้: <span className="font-medium">{formatCurrency(data.revenue)}</span>
           </p>
-          <p className="text-sm text-gray-600">
+          <p className="text-sm text-zinc-400">
             สัดส่วน: <span className="font-medium">{formatPercent(data.percentage)}</span>
           </p>
         </div>
@@ -181,32 +181,32 @@ export default function ReportsPage() {
       {/* Page Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <BarChart3 className="w-8 h-8 text-blue-600" />
+          <BarChart3 className="w-8 h-8 text-red-400" />
           <div>
-            <h1 className="text-2xl font-bold text-gray-800">รายงาน</h1>
-            <p className="text-gray-600">Reports Dashboard</p>
+            <h1 className="text-2xl font-bold text-zinc-100">รายงาน</h1>
+            <p className="text-zinc-400">Reports Dashboard</p>
           </div>
         </div>
         <button
           onClick={fetchReportData}
           disabled={loading}
-          className="flex items-center space-x-2 px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 disabled:opacity-50"
+          className="flex items-center space-x-2 px-4 py-2 border border-zinc-700 text-zinc-300 rounded-lg hover:bg-zinc-800 disabled:opacity-50"
         >
-          <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
+          <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin text-red-500' : ''}`} />
           <span className="hidden sm:inline">รีเฟรช</span>
         </button>
       </div>
 
       {/* Filters */}
-      <div className="bg-white rounded-lg shadow p-4">
+      <div className="bg-zinc-900 rounded-lg p-4">
         <div className="flex flex-wrap items-center gap-4">
           {/* Date Range Picker */}
           <div className="flex items-center gap-2">
-            <span className="text-sm font-medium text-gray-700">ช่วงวันที่:</span>
+            <span className="text-sm font-medium text-zinc-300">ช่วงวันที่:</span>
             <div className="relative">
-              <div className="flex items-center border border-gray-300 rounded-lg overflow-hidden focus-within:ring-2 focus-within:ring-blue-500 focus-within:border-blue-500">
-                <div className="flex items-center px-3 bg-gray-50 border-r border-gray-300 py-2">
-                  <Calendar className="h-4 w-4 text-gray-400" />
+              <div className="flex items-center border border-zinc-700 rounded-lg overflow-hidden focus-within:ring-2 focus-within:ring-red-500 focus-within:border-red-500">
+                <div className="flex items-center px-3 bg-zinc-800 border-r border-zinc-700 py-2">
+                  <Calendar className="h-4 w-4 text-zinc-500" />
                 </div>
                 <DatePicker
                   selectsRange
@@ -214,7 +214,7 @@ export default function ReportsPage() {
                   endDate={endDate}
                   onChange={(update) => setDateRange(update)}
                   placeholderText="เลือกช่วงวันที่"
-                  className="w-48 px-3 py-2 border-0 focus:ring-0 text-sm focus:outline-none"
+                  className="w-48 px-3 py-2 border-0 focus:ring-0 text-sm focus:outline-none bg-zinc-900 text-zinc-200"
                   dateFormat="dd/MM/yyyy"
                   isClearable
                 />
@@ -224,34 +224,34 @@ export default function ReportsPage() {
 
           {/* Period Grouping Buttons */}
           <div className="flex items-center gap-2">
-            <span className="text-sm font-medium text-gray-700">แบ่งตาม:</span>
-            <div className="flex rounded-lg border border-gray-300 overflow-hidden">
+            <span className="text-sm font-medium text-zinc-300">แบ่งตาม:</span>
+            <div className="flex rounded-lg border border-zinc-700 overflow-hidden">
               <button
                 onClick={() => setGroupBy('day')}
                 className={`px-4 py-2 text-sm font-medium transition-colors ${
                   groupBy === 'day'
-                    ? 'bg-blue-600 text-white'
-                    : 'bg-white text-gray-700 hover:bg-gray-50'
+                    ? 'bg-red-600 text-white'
+                    : 'bg-zinc-900 text-zinc-300 hover:bg-zinc-800'
                 }`}
               >
                 วัน
               </button>
               <button
                 onClick={() => setGroupBy('week')}
-                className={`px-4 py-2 text-sm font-medium border-l border-gray-300 transition-colors ${
+                className={`px-4 py-2 text-sm font-medium border-l border-zinc-700 transition-colors ${
                   groupBy === 'week'
-                    ? 'bg-blue-600 text-white'
-                    : 'bg-white text-gray-700 hover:bg-gray-50'
+                    ? 'bg-red-600 text-white'
+                    : 'bg-zinc-900 text-zinc-300 hover:bg-zinc-800'
                 }`}
               >
                 สัปดาห์
               </button>
               <button
                 onClick={() => setGroupBy('month')}
-                className={`px-4 py-2 text-sm font-medium border-l border-gray-300 transition-colors ${
+                className={`px-4 py-2 text-sm font-medium border-l border-zinc-700 transition-colors ${
                   groupBy === 'month'
-                    ? 'bg-blue-600 text-white'
-                    : 'bg-white text-gray-700 hover:bg-gray-50'
+                    ? 'bg-red-600 text-white'
+                    : 'bg-zinc-900 text-zinc-300 hover:bg-zinc-800'
                 }`}
               >
                 เดือน
@@ -263,7 +263,7 @@ export default function ReportsPage() {
 
       {/* Error Message */}
       {error && (
-        <div className="flex items-center gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">
+        <div className="flex items-center gap-2 p-4 bg-red-950/50 border border-red-900/50 rounded-lg text-red-400">
           <AlertCircle className="w-5 h-5 flex-shrink-0" />
           <span>{error}</span>
         </div>
@@ -272,65 +272,65 @@ export default function ReportsPage() {
       {/* Stats Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
         {/* Occupancy Rate */}
-        <div className="bg-white rounded-lg shadow p-6">
+        <div className="bg-zinc-900 rounded-lg p-6">
           <div className="flex items-center justify-between">
             <div>
-              <p className="text-sm text-gray-600">อัตราการเข้าพัก</p>
-              <p className="text-3xl font-bold text-gray-800">
+              <p className="text-sm text-zinc-400">อัตราการเข้าพัก</p>
+              <p className="text-3xl font-bold text-zinc-100">
                 {loading ? '-' : occupancyData ? formatPercent(occupancyData.occupancyRate) : '-'}
               </p>
-              <p className="text-xs text-gray-500 mt-1">Occupancy Rate</p>
+              <p className="text-xs text-zinc-500 mt-1">Occupancy Rate</p>
             </div>
-            <div className="w-12 h-12 bg-blue-100 rounded-full flex items-center justify-center">
-              <Percent className="w-6 h-6 text-blue-600" />
+            <div className="w-12 h-12 bg-red-500/10 rounded-full flex items-center justify-center">
+              <Percent className="w-6 h-6 text-red-400" />
             </div>
           </div>
         </div>
 
         {/* ADR */}
-        <div className="bg-white rounded-lg shadow p-6">
+        <div className="bg-zinc-900 rounded-lg p-6">
           <div className="flex items-center justify-between">
             <div>
-              <p className="text-sm text-gray-600">ราคาเฉลี่ยต่อคืน</p>
-              <p className="text-3xl font-bold text-gray-800">
+              <p className="text-sm text-zinc-400">ราคาเฉลี่ยต่อคืน</p>
+              <p className="text-3xl font-bold text-zinc-100">
                 {loading ? '-' : occupancyData ? formatCurrency(occupancyData.adr) : '-'}
               </p>
-              <p className="text-xs text-gray-500 mt-1">ADR (Average Daily Rate)</p>
+              <p className="text-xs text-zinc-500 mt-1">ADR (Average Daily Rate)</p>
             </div>
-            <div className="w-12 h-12 bg-green-100 rounded-full flex items-center justify-center">
-              <DollarSign className="w-6 h-6 text-green-600" />
+            <div className="w-12 h-12 bg-emerald-500/10 rounded-full flex items-center justify-center">
+              <DollarSign className="w-6 h-6 text-emerald-400" />
             </div>
           </div>
         </div>
 
         {/* RevPAR */}
-        <div className="bg-white rounded-lg shadow p-6">
+        <div className="bg-zinc-900 rounded-lg p-6">
           <div className="flex items-center justify-between">
             <div>
-              <p className="text-sm text-gray-600">รายได้ต่อห้องว่าง</p>
-              <p className="text-3xl font-bold text-gray-800">
+              <p className="text-sm text-zinc-400">รายได้ต่อห้องว่าง</p>
+              <p className="text-3xl font-bold text-zinc-100">
                 {loading ? '-' : occupancyData ? formatCurrency(occupancyData.revpar) : '-'}
               </p>
-              <p className="text-xs text-gray-500 mt-1">RevPAR</p>
+              <p className="text-xs text-zinc-500 mt-1">RevPAR</p>
             </div>
-            <div className="w-12 h-12 bg-purple-100 rounded-full flex items-center justify-center">
-              <TrendingUp className="w-6 h-6 text-purple-600" />
+            <div className="w-12 h-12 bg-violet-500/10 rounded-full flex items-center justify-center">
+              <TrendingUp className="w-6 h-6 text-violet-400" />
             </div>
           </div>
         </div>
 
         {/* Average Stay Length */}
-        <div className="bg-white rounded-lg shadow p-6">
+        <div className="bg-zinc-900 rounded-lg p-6">
           <div className="flex items-center justify-between">
             <div>
-              <p className="text-sm text-gray-600">ระยะเวลาเข้าพักเฉลี่ย</p>
-              <p className="text-3xl font-bold text-gray-800">
+              <p className="text-sm text-zinc-400">ระยะเวลาเข้าพักเฉลี่ย</p>
+              <p className="text-3xl font-bold text-zinc-100">
                 {loading ? '-' : occupancyData ? `${occupancyData.avgStayLength.toFixed(1)} คืน` : '-'}
               </p>
-              <p className="text-xs text-gray-500 mt-1">Avg Stay Length</p>
+              <p className="text-xs text-zinc-500 mt-1">Avg Stay Length</p>
             </div>
-            <div className="w-12 h-12 bg-orange-100 rounded-full flex items-center justify-center">
-              <Clock className="w-6 h-6 text-orange-600" />
+            <div className="w-12 h-12 bg-amber-500/10 rounded-full flex items-center justify-center">
+              <Clock className="w-6 h-6 text-amber-400" />
             </div>
           </div>
         </div>
@@ -339,48 +339,48 @@ export default function ReportsPage() {
       {/* Charts Section */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Revenue Chart - Takes 2 columns */}
-        <div className="lg:col-span-2 bg-white rounded-lg shadow p-6">
-          <h2 className="text-lg font-semibold text-gray-800 mb-4">รายได้</h2>
+        <div className="lg:col-span-2 bg-zinc-900 rounded-lg p-6">
+          <h2 className="text-lg font-semibold text-zinc-100 mb-4">รายได้</h2>
           {loading ? (
             <div className="flex items-center justify-center h-80">
-              <Loader2 className="w-8 h-8 animate-spin text-blue-600" />
+              <Loader2 className="w-8 h-8 animate-spin text-red-500" />
             </div>
           ) : revenueData.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-80 text-gray-500">
-              <BarChart3 className="w-12 h-12 text-gray-300 mb-2" />
+            <div className="flex flex-col items-center justify-center h-80 text-zinc-500">
+              <BarChart3 className="w-12 h-12 text-zinc-600 mb-2" />
               <p>ไม่มีข้อมูลในช่วงเวลาที่เลือก</p>
             </div>
           ) : (
             <ResponsiveContainer width="100%" height={320}>
               <BarChart data={revenueData} margin={{ top: 5, right: 30, left: 20, bottom: 5 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#E5E7EB" />
+                <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
                 <XAxis
                   dataKey="period"
                   tick={{ fontSize: 12 }}
-                  stroke="#6B7280"
+                  stroke="#71717a"
                 />
                 <YAxis
                   tick={{ fontSize: 12 }}
-                  stroke="#6B7280"
+                  stroke="#71717a"
                   tickFormatter={(value) => `${(value / 1000).toFixed(0)}k`}
                 />
                 <Tooltip content={<RevenueTooltip />} />
-                <Bar dataKey="revenue" fill="#3B82F6" radius={[4, 4, 0, 0]} name="รายได้" />
+                <Bar dataKey="revenue" fill="#EF4444" radius={[4, 4, 0, 0]} name="รายได้" />
               </BarChart>
             </ResponsiveContainer>
           )}
         </div>
 
         {/* Room Type Revenue Pie Chart */}
-        <div className="bg-white rounded-lg shadow p-6">
-          <h2 className="text-lg font-semibold text-gray-800 mb-4">รายได้แยกตามประเภทห้อง</h2>
+        <div className="bg-zinc-900 rounded-lg p-6">
+          <h2 className="text-lg font-semibold text-zinc-100 mb-4">รายได้แยกตามประเภทห้อง</h2>
           {loading ? (
             <div className="flex items-center justify-center h-80">
-              <Loader2 className="w-8 h-8 animate-spin text-blue-600" />
+              <Loader2 className="w-8 h-8 animate-spin text-red-500" />
             </div>
           ) : roomTypeRevenue.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-80 text-gray-500">
-              <BarChart3 className="w-12 h-12 text-gray-300 mb-2" />
+            <div className="flex flex-col items-center justify-center h-80 text-zinc-500">
+              <BarChart3 className="w-12 h-12 text-zinc-600 mb-2" />
               <p>ไม่มีข้อมูล</p>
             </div>
           ) : (
@@ -410,7 +410,7 @@ export default function ReportsPage() {
                   verticalAlign="bottom"
                   height={36}
                   formatter={(value: string) => (
-                    <span className="text-sm text-gray-700">{value}</span>
+                    <span className="text-sm text-zinc-300">{value}</span>
                   )}
                 />
               </PieChart>
@@ -420,34 +420,34 @@ export default function ReportsPage() {
       </div>
 
       {/* Booking Trend Line Chart */}
-      <div className="bg-white rounded-lg shadow p-6">
-        <h2 className="text-lg font-semibold text-gray-800 mb-4">แนวโน้มการจอง</h2>
+      <div className="bg-zinc-900 rounded-lg p-6">
+        <h2 className="text-lg font-semibold text-zinc-100 mb-4">แนวโน้มการจอง</h2>
         {loading ? (
           <div className="flex items-center justify-center h-64">
-            <Loader2 className="w-8 h-8 animate-spin text-blue-600" />
+            <Loader2 className="w-8 h-8 animate-spin text-red-500" />
           </div>
         ) : revenueData.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-64 text-gray-500">
-            <TrendingUp className="w-12 h-12 text-gray-300 mb-2" />
+          <div className="flex flex-col items-center justify-center h-64 text-zinc-500">
+            <TrendingUp className="w-12 h-12 text-zinc-600 mb-2" />
             <p>ไม่มีข้อมูลในช่วงเวลาที่เลือก</p>
           </div>
         ) : (
           <ResponsiveContainer width="100%" height={256}>
             <LineChart data={revenueData} margin={{ top: 5, right: 30, left: 20, bottom: 5 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#E5E7EB" />
+              <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
               <XAxis
                 dataKey="period"
                 tick={{ fontSize: 12 }}
-                stroke="#6B7280"
+                stroke="#71717a"
               />
               <YAxis
                 tick={{ fontSize: 12 }}
-                stroke="#6B7280"
+                stroke="#71717a"
               />
               <Tooltip
                 contentStyle={{
-                  backgroundColor: 'white',
-                  border: '1px solid #E5E7EB',
+                  backgroundColor: '#18181b',
+                  border: '1px solid #27272a',
                   borderRadius: '8px',
                 }}
                 formatter={(value: number) => [`${value} รายการ`, 'จำนวนการจอง']}
@@ -455,9 +455,9 @@ export default function ReportsPage() {
               <Line
                 type="monotone"
                 dataKey="bookings"
-                stroke="#10B981"
+                stroke="#EF4444"
                 strokeWidth={2}
-                dot={{ fill: '#10B981', strokeWidth: 2, r: 4 }}
+                dot={{ fill: '#EF4444', strokeWidth: 2, r: 4 }}
                 activeDot={{ r: 6 }}
                 name="จำนวนการจอง"
               />

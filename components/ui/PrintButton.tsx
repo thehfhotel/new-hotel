@@ -81,8 +81,8 @@ export default function PrintButton({
         disabled={isPrinting}
         className={`
           inline-flex items-center justify-center
-          bg-blue-600 text-white rounded-lg
-          hover:bg-blue-700
+          bg-red-600 text-white rounded-lg
+          hover:bg-red-700
           disabled:opacity-50 disabled:cursor-not-allowed
           no-print
           ${sizeClasses[size]}
@@ -109,10 +109,10 @@ export default function PrintButton({
           disabled={isPrinting}
           className={`
             inline-flex items-center justify-center
-            bg-blue-600 text-white
-            hover:bg-blue-700
+            bg-red-600 text-white
+            hover:bg-red-700
             disabled:opacity-50 disabled:cursor-not-allowed
-            rounded-l-lg border-r border-blue-500
+            rounded-l-lg border-r border-red-500
             ${sizeClasses[size]}
             ${className}
           `}
@@ -131,8 +131,8 @@ export default function PrintButton({
           disabled={isPrinting}
           className={`
             inline-flex items-center justify-center
-            bg-blue-600 text-white
-            hover:bg-blue-700
+            bg-red-600 text-white
+            hover:bg-red-700
             disabled:opacity-50 disabled:cursor-not-allowed
             rounded-r-lg px-2
           `}
@@ -151,22 +151,22 @@ export default function PrintButton({
           />
 
           {/* Dropdown Content */}
-          <div className="absolute right-0 mt-1 w-48 bg-white rounded-lg shadow-lg border border-gray-200 z-20">
+          <div className="absolute right-0 mt-1 w-48 bg-zinc-900 rounded-lg shadow-lg border border-zinc-800 z-20">
             <button
               onClick={handlePrint}
-              className="w-full flex items-center gap-2 px-4 py-2.5 text-sm text-gray-700 hover:bg-gray-50 rounded-t-lg"
+              className="w-full flex items-center gap-2 px-4 py-2.5 text-sm text-zinc-300 hover:bg-zinc-800 rounded-t-lg"
             >
               <Printer size={16} />
               <span>พิมพ์</span>
-              <span className="text-gray-400 text-xs ml-auto">Print</span>
+              <span className="text-zinc-500 text-xs ml-auto">Print</span>
             </button>
             <button
               onClick={handleSavePdf}
-              className="w-full flex items-center gap-2 px-4 py-2.5 text-sm text-gray-700 hover:bg-gray-50 rounded-b-lg border-t border-gray-100"
+              className="w-full flex items-center gap-2 px-4 py-2.5 text-sm text-zinc-300 hover:bg-zinc-800 rounded-b-lg border-t border-zinc-800"
             >
               <FileDown size={16} />
               <span>บันทึก PDF</span>
-              <span className="text-gray-400 text-xs ml-auto">Save PDF</span>
+              <span className="text-zinc-500 text-xs ml-auto">Save PDF</span>
             </button>
           </div>
         </>

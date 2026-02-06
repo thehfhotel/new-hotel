@@ -120,8 +120,8 @@ export default function InvoiceDetailPage({
   if (loading) {
     return (
       <div className="flex flex-col items-center justify-center min-h-[400px]">
-        <Loader2 className="w-12 h-12 animate-spin text-blue-600" />
-        <p className="mt-4 text-gray-600">กำลังโหลดข้อมูลใบแจ้งหนี้...</p>
+        <Loader2 className="w-12 h-12 animate-spin text-red-500" />
+        <p className="mt-4 text-zinc-400">กำลังโหลดข้อมูลใบแจ้งหนี้...</p>
       </div>
     )
   }
@@ -132,7 +132,7 @@ export default function InvoiceDetailPage({
         {/* Back Button */}
         <Link
           href="/new/billing"
-          className="inline-flex items-center gap-2 text-gray-600 hover:text-gray-800"
+          className="inline-flex items-center gap-2 text-zinc-400 hover:text-zinc-200"
         >
           <ArrowLeft className="w-5 h-5" />
           กลับไปหน้ารายการ
@@ -140,7 +140,7 @@ export default function InvoiceDetailPage({
 
         {/* Error Message */}
         <div className="flex flex-col items-center justify-center min-h-[300px]">
-          <div className="flex items-center gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700 max-w-md">
+          <div className="flex items-center gap-2 p-4 bg-red-950/50 border border-red-900/50 rounded-lg text-red-400 max-w-md">
             <AlertCircle className="w-6 h-6 flex-shrink-0" />
             <div>
               <p className="font-medium">เกิดข้อผิดพลาด</p>
@@ -158,15 +158,15 @@ export default function InvoiceDetailPage({
         {/* Back Button */}
         <Link
           href="/new/billing"
-          className="inline-flex items-center gap-2 text-gray-600 hover:text-gray-800"
+          className="inline-flex items-center gap-2 text-zinc-400 hover:text-zinc-200"
         >
           <ArrowLeft className="w-5 h-5" />
           กลับไปหน้ารายการ
         </Link>
 
         {/* Not Found */}
-        <div className="flex flex-col items-center justify-center min-h-[300px] text-gray-500">
-          <Receipt className="w-16 h-16 text-gray-300 mb-4" />
+        <div className="flex flex-col items-center justify-center min-h-[300px] text-zinc-500">
+          <Receipt className="w-16 h-16 text-zinc-500 mb-4" />
           <p className="text-lg">ไม่พบข้อมูลใบแจ้งหนี้</p>
         </div>
       </div>
@@ -179,7 +179,7 @@ export default function InvoiceDetailPage({
       <div className="flex items-center justify-between no-print">
         <Link
           href="/new/billing"
-          className="inline-flex items-center gap-2 text-gray-600 hover:text-gray-800"
+          className="inline-flex items-center gap-2 text-zinc-400 hover:text-zinc-200"
         >
           <ArrowLeft className="w-5 h-5" />
           กลับไปหน้ารายการ

@@ -20,25 +20,25 @@ export default function HousekeepingStats({ stats, loading }: HousekeepingStatsP
       title: 'รอทำความสะอาด',
       value: stats.dirtyCount,
       icon: Clock,
-      bgColor: 'bg-red-50',
-      iconColor: 'text-red-500',
-      valueColor: 'text-red-600',
+      bgColor: 'bg-red-500/5',
+      iconColor: 'text-red-400',
+      valueColor: 'text-red-400',
     },
     {
       title: 'กำลังทำความสะอาด',
       value: stats.cleaningCount,
       icon: Sparkles,
-      bgColor: 'bg-yellow-50',
-      iconColor: 'text-yellow-500',
-      valueColor: 'text-yellow-600',
+      bgColor: 'bg-amber-500/5',
+      iconColor: 'text-amber-400',
+      valueColor: 'text-amber-400',
     },
     {
       title: 'ทำความสะอาดแล้ววันนี้',
       value: stats.cleanedTodayCount,
       icon: CheckCircle,
-      bgColor: 'bg-green-50',
-      iconColor: 'text-green-500',
-      valueColor: 'text-green-600',
+      bgColor: 'bg-emerald-500/5',
+      iconColor: 'text-emerald-400',
+      valueColor: 'text-emerald-400',
     },
     {
       title: 'เวลาเฉลี่ยต่อห้อง',
@@ -46,9 +46,9 @@ export default function HousekeepingStats({ stats, loading }: HousekeepingStatsP
         ? `${stats.avgCleaningTimeMinutes} นาที`
         : '-',
       icon: Timer,
-      bgColor: 'bg-blue-50',
-      iconColor: 'text-blue-500',
-      valueColor: 'text-blue-600',
+      bgColor: 'bg-sky-500/5',
+      iconColor: 'text-sky-400',
+      valueColor: 'text-sky-400',
     },
   ]
 
@@ -57,16 +57,16 @@ export default function HousekeepingStats({ stats, loading }: HousekeepingStatsP
       {statCards.map((card) => (
         <div
           key={card.title}
-          className={`${card.bgColor} rounded-xl p-4 border border-gray-100`}
+          className={`${card.bgColor} rounded-xl p-4 border border-zinc-800`}
         >
           <div className="flex items-center gap-3">
-            <div className={`p-2 rounded-lg bg-white shadow-sm`}>
+            <div className="p-2 rounded-lg bg-zinc-900 border border-zinc-800">
               <card.icon className={`w-5 h-5 ${card.iconColor}`} />
             </div>
             <div>
-              <p className="text-xs font-medium text-gray-500">{card.title}</p>
+              <p className="text-xs font-medium text-zinc-500">{card.title}</p>
               {loading ? (
-                <div className="h-7 w-12 bg-gray-200 animate-pulse rounded mt-1" />
+                <div className="h-7 w-12 bg-zinc-800 animate-pulse rounded mt-1" />
               ) : (
                 <p className={`text-xl font-bold ${card.valueColor}`}>
                   {card.value}
