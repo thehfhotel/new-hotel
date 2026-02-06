@@ -16,7 +16,7 @@ export default function ModeToggle() {
       className={`flex items-center gap-2 px-3 py-1.5 rounded-lg transition-all duration-200 text-sm font-medium border ${
         isLegacy
           ? 'bg-amber-500/20 text-amber-200 border-amber-500/40 hover:bg-amber-500/30'
-          : 'bg-emerald-500/20 text-emerald-200 border-emerald-500/40 hover:bg-emerald-500/30'
+          : 'bg-red-500/20 text-red-200 border-red-500/40 hover:bg-red-500/30'
       }`}
       title={isLegacy ? 'Currently using Legacy mode' : 'Currently using New mode'}
     >

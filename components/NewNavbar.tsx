@@ -40,21 +40,20 @@ export default function NewNavbar() {
   const pathname = usePathname()
 
   return (
-    <nav className="bg-emerald-700 text-white shadow-lg">
+    <nav className="bg-zinc-900 text-zinc-300 border-b border-zinc-800">
       <div className="flex items-center justify-between h-16 px-2 lg:px-6">
         {/* Logo and Hotel Name */}
         <Link href="/new" className="flex items-center gap-2 shrink-0">
-          <Hotel size={28} className="text-emerald-200 lg:w-8 lg:h-8" />
+          <Hotel size={28} className="text-red-500 lg:w-8 lg:h-8" />
           <div className="hidden lg:block">
-            <span className="text-xl font-bold whitespace-nowrap">ระบบจัดการโรงแรม</span>
-            <span className="ml-2 text-xs bg-emerald-500 px-2 py-0.5 rounded-full">NEW</span>
+            <span className="text-xl font-bold text-white whitespace-nowrap tracking-tight">ระบบจัดการโรงแรม</span>
+            <span className="ml-2 text-[10px] font-semibold bg-red-600 text-white px-2 py-0.5 rounded tracking-wider uppercase">New</span>
           </div>
         </Link>
 
         {/* Navigation Links */}
         <div className="flex items-center overflow-x-auto">
           {navLinks.map((link) => {
-            // Check if active: exact match or starts with for subpaths
             const isActive = pathname === link.href ||
               (link.href !== '/new' && pathname.startsWith(link.href))
             return (
@@ -63,8 +62,8 @@ export default function NewNavbar() {
                 href={link.href}
                 className={`flex items-center gap-1.5 px-2 lg:px-3 py-2 rounded-lg transition-colors duration-200 shrink-0
                   ${isActive
-                    ? 'bg-emerald-600 text-white'
-                    : 'text-emerald-100 hover:bg-emerald-600 hover:text-white'
+                    ? 'bg-red-600/15 text-red-400 border border-red-600/30'
+                    : 'text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 border border-transparent'
                   }`}
               >
                 {link.icon}
@@ -78,7 +77,7 @@ export default function NewNavbar() {
         <div className="flex items-center shrink-0">
           <Link
             href="/"
-            className="flex items-center gap-2 px-3 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-lg transition-colors text-sm"
+            className="flex items-center gap-2 px-3 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-white rounded-lg transition-colors text-sm border border-zinc-700"
             title="สลับไปโหมดเดิม"
           >
             <ArrowLeftRight size={18} />

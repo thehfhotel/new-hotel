@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.12.0] - 2026-02-07
+
+### Changed
+- **New system dark theme redesign** - Complete visual overhaul of the new system (`/new/*`) with a professional dark black/red color scheme
+  - Dark backgrounds (zinc-950/900/800) replacing white/gray
+  - Red accent color (red-600/500/400) replacing emerald/blue/purple
+  - DM Sans font replacing Inter for a more professional look
+  - Updated all pages: dashboard, bookings, calendar, room-types, rates, housekeeping, maintenance, reports, inventory, billing
+  - Updated all shared components: DataTable, StatsCard, NewNavbar, ModeToggle
+  - Updated all form components: BookingForm, RoomTypeForm, RateForm, CustomerForm, InventoryItemForm
+  - Updated all modal components: QuickCheckInModal, CheckOutModal, GuestRegistryModal, StockAdjustmentModal, PaymentModal, MaintenanceRequestModal
+  - Updated picker/misc components: CustomerPicker, RoomPicker, MaintenanceCard, RoomInventoryChecklist, RateCalendar, StayTimeline, BookingDetailDrawer, PrintButton
+  - Dark scrollbar and date picker CSS overrides via `.new-system-layout` class
+  - Legacy system appearance unchanged (only "New System" switch button color updated)
+
 ## [2.11.2] - 2026-02-06
 
 ### Fixed

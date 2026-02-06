@@ -210,10 +210,10 @@ export default function InventoryItemsPage() {
       {/* Page Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <Package className="w-8 h-8 text-blue-600" />
+          <Package className="w-8 h-8 text-red-400" />
           <div>
-            <h1 className="text-2xl font-bold text-gray-800">จัดการสินค้า</h1>
-            <p className="text-gray-600">
+            <h1 className="text-2xl font-bold text-zinc-200">จัดการสินค้า</h1>
+            <p className="text-zinc-400">
               จำนวนสินค้าทั้งหมด {items.length} รายการ
             </p>
           </div>
@@ -222,7 +222,7 @@ export default function InventoryItemsPage() {
         {/* Add Button */}
         <button
           onClick={handleAddItem}
-          className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+          className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors"
         >
           <Plus className="w-5 h-5" />
           เพิ่มสินค้า
@@ -230,22 +230,22 @@ export default function InventoryItemsPage() {
       </div>
 
       {/* Search and Filter Bar */}
-      <div className="bg-white rounded-lg shadow p-4">
+      <div className="bg-zinc-900 rounded-lg border border-zinc-800 p-4">
         <div className="flex flex-col lg:flex-row gap-4">
           {/* Search */}
           <div className="relative flex-1">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-zinc-500" />
             <input
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="ค้นหาด้วยรหัส หรือ ชื่อสินค้า..."
-              className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-colors"
+              className="w-full pl-10 pr-4 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
             />
             {searchQuery && (
               <button
                 onClick={() => setSearchQuery('')}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-400"
                 aria-label="ล้างการค้นหา"
               >
                 <X className="w-4 h-4" />
@@ -255,11 +255,11 @@ export default function InventoryItemsPage() {
 
           {/* Category Filter */}
           <div className="flex items-center gap-2">
-            <Filter className="w-5 h-5 text-gray-400" />
+            <Filter className="w-5 h-5 text-zinc-500" />
             <select
               value={categoryFilter}
               onChange={(e) => setCategoryFilter(e.target.value as InventoryCategory | '')}
-              className="px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none bg-white"
+              className="px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none"
             >
               <option value="">ทุกหมวดหมู่</option>
               {INVENTORY_CATEGORIES.map((cat) => (
@@ -276,21 +276,21 @@ export default function InventoryItemsPage() {
               type="checkbox"
               checked={showLowStockOnly}
               onChange={(e) => setShowLowStockOnly(e.target.checked)}
-              className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
+              className="w-4 h-4 text-red-600 border-zinc-700 rounded focus:ring-red-500"
             />
-            <span className="text-sm text-gray-600">แสดงเฉพาะสินค้าใกล้หมด</span>
+            <span className="text-sm text-zinc-400">แสดงเฉพาะสินค้าใกล้หมด</span>
           </label>
         </div>
 
         {/* Sort Buttons */}
         <div className="flex items-center gap-2 mt-4">
-          <span className="text-sm text-gray-600">เรียงตาม:</span>
+          <span className="text-sm text-zinc-400">เรียงตาม:</span>
           <button
             onClick={() => handleSortChange('itemCode')}
             className={`px-3 py-1.5 text-sm rounded-lg border transition-colors ${
               sortField === 'itemCode'
-                ? 'border-blue-500 bg-blue-50 text-blue-700'
-                : 'border-gray-300 text-gray-600 hover:bg-gray-50'
+                ? 'border-red-500 bg-red-500/10 text-red-400'
+                : 'border-zinc-700 text-zinc-400 hover:bg-zinc-800'
             }`}
           >
             รหัส {sortField === 'itemCode' && (sortOrder === 'asc' ? '(A-Z)' : '(Z-A)')}
@@ -299,8 +299,8 @@ export default function InventoryItemsPage() {
             onClick={() => handleSortChange('itemName')}
             className={`px-3 py-1.5 text-sm rounded-lg border transition-colors ${
               sortField === 'itemName'
-                ? 'border-blue-500 bg-blue-50 text-blue-700'
-                : 'border-gray-300 text-gray-600 hover:bg-gray-50'
+                ? 'border-red-500 bg-red-500/10 text-red-400'
+                : 'border-zinc-700 text-zinc-400 hover:bg-zinc-800'
             }`}
           >
             ชื่อ {sortField === 'itemName' && (sortOrder === 'asc' ? '(A-Z)' : '(Z-A)')}
@@ -309,8 +309,8 @@ export default function InventoryItemsPage() {
             onClick={() => handleSortChange('currentStock')}
             className={`px-3 py-1.5 text-sm rounded-lg border transition-colors ${
               sortField === 'currentStock'
-                ? 'border-blue-500 bg-blue-50 text-blue-700'
-                : 'border-gray-300 text-gray-600 hover:bg-gray-50'
+                ? 'border-red-500 bg-red-500/10 text-red-400'
+                : 'border-zinc-700 text-zinc-400 hover:bg-zinc-800'
             }`}
           >
             จำนวน {sortField === 'currentStock' && (sortOrder === 'asc' ? '(น้อย-มาก)' : '(มาก-น้อย)')}
@@ -318,7 +318,7 @@ export default function InventoryItemsPage() {
         </div>
 
         {debouncedSearch && (
-          <p className="mt-2 text-sm text-gray-600">
+          <p className="mt-2 text-sm text-zinc-400">
             ผลการค้นหา &quot;{debouncedSearch}&quot;: พบ {items.length} รายการ
           </p>
         )}
@@ -326,26 +326,26 @@ export default function InventoryItemsPage() {
 
       {/* Error Message */}
       {error && (
-        <div className="flex items-center gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">
+        <div className="flex items-center gap-2 p-4 bg-red-950/50 border border-red-900/50 rounded-lg text-red-400">
           <AlertCircle className="w-5 h-5 flex-shrink-0" />
           <span>{error}</span>
         </div>
       )}
 
       {/* Items Table */}
-      <div className="bg-white rounded-lg shadow overflow-hidden">
+      <div className="bg-zinc-900 rounded-lg border border-zinc-800 overflow-hidden">
         {loading ? (
           <div className="flex items-center justify-center py-12">
-            <Loader2 className="w-6 h-6 animate-spin text-blue-600" />
-            <span className="ml-2 text-gray-600">กำลังโหลดข้อมูล...</span>
+            <Loader2 className="w-6 h-6 animate-spin text-red-500" />
+            <span className="ml-2 text-zinc-400">กำลังโหลดข้อมูล...</span>
           </div>
         ) : items.length === 0 ? (
-          <div className="text-center py-12 text-gray-500">
-            <Package className="w-12 h-12 text-gray-300 mx-auto mb-3" />
+          <div className="text-center py-12 text-zinc-500">
+            <Package className="w-12 h-12 text-zinc-600 mx-auto mb-3" />
             <p>ไม่พบสินค้า</p>
             <button
               onClick={handleAddItem}
-              className="mt-4 text-blue-600 hover:text-blue-700 font-medium"
+              className="mt-4 text-red-400 hover:text-red-300 font-medium"
             >
               + เพิ่มสินค้าใหม่
             </button>
@@ -353,48 +353,48 @@ export default function InventoryItemsPage() {
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full">
-              <thead className="bg-gray-50 border-b">
+              <thead className="bg-zinc-800 border-b border-zinc-800">
                 <tr>
-                  <th className="px-4 py-3 text-left text-sm font-medium text-gray-600">รหัส</th>
-                  <th className="px-4 py-3 text-left text-sm font-medium text-gray-600">ชื่อสินค้า</th>
-                  <th className="px-4 py-3 text-left text-sm font-medium text-gray-600">หมวดหมู่</th>
-                  <th className="px-4 py-3 text-left text-sm font-medium text-gray-600">หน่วย</th>
-                  <th className="px-4 py-3 text-right text-sm font-medium text-gray-600">ขั้นต่ำ</th>
-                  <th className="px-4 py-3 text-right text-sm font-medium text-gray-600">คงเหลือ</th>
-                  <th className="px-4 py-3 text-center text-sm font-medium text-gray-600">สถานะ</th>
-                  <th className="px-4 py-3 text-center text-sm font-medium text-gray-600">การดำเนินการ</th>
+                  <th className="px-4 py-3 text-left text-sm font-medium text-zinc-400">รหัส</th>
+                  <th className="px-4 py-3 text-left text-sm font-medium text-zinc-400">ชื่อสินค้า</th>
+                  <th className="px-4 py-3 text-left text-sm font-medium text-zinc-400">หมวดหมู่</th>
+                  <th className="px-4 py-3 text-left text-sm font-medium text-zinc-400">หน่วย</th>
+                  <th className="px-4 py-3 text-right text-sm font-medium text-zinc-400">ขั้นต่ำ</th>
+                  <th className="px-4 py-3 text-right text-sm font-medium text-zinc-400">คงเหลือ</th>
+                  <th className="px-4 py-3 text-center text-sm font-medium text-zinc-400">สถานะ</th>
+                  <th className="px-4 py-3 text-center text-sm font-medium text-zinc-400">การดำเนินการ</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-gray-200">
+              <tbody className="divide-y divide-zinc-800">
                 {items.map((item) => {
                   const status = getStockStatus(item.currentStock, item.minStock)
                   return (
                     <tr
                       key={item.id}
-                      className={`hover:bg-gray-50 ${!item.active ? 'opacity-50' : ''}`}
+                      className={`hover:bg-zinc-800 ${!item.active ? 'opacity-50' : ''}`}
                     >
                       <td className="px-4 py-3">
-                        <span className="font-mono text-sm bg-gray-100 px-2 py-1 rounded">
+                        <span className="font-mono text-sm bg-zinc-800 px-2 py-1 rounded">
                           {item.itemCode}
                         </span>
                       </td>
                       <td className="px-4 py-3">
-                        <div className="font-medium text-gray-800">{item.itemName}</div>
+                        <div className="font-medium text-zinc-200">{item.itemName}</div>
                         {!item.active && (
-                          <span className="text-xs text-red-600">ปิดใช้งาน</span>
+                          <span className="text-xs text-red-400">ปิดใช้งาน</span>
                         )}
                       </td>
-                      <td className="px-4 py-3 text-gray-600">
+                      <td className="px-4 py-3 text-zinc-400">
                         {getCategoryLabel(item.category)}
                       </td>
-                      <td className="px-4 py-3 text-gray-600">{item.unit}</td>
-                      <td className="px-4 py-3 text-right text-gray-600">{item.minStock}</td>
+                      <td className="px-4 py-3 text-zinc-400">{item.unit}</td>
+                      <td className="px-4 py-3 text-right text-zinc-400">{item.minStock}</td>
                       <td className="px-4 py-3 text-right">
                         <span className={`font-bold text-lg ${
-                          status === 'good' ? 'text-green-600' :
-                          status === 'low' ? 'text-yellow-600' :
-                          status === 'critical' ? 'text-orange-600' :
-                          'text-red-600'
+                          status === 'good' ? 'text-emerald-400' :
+                          status === 'low' ? 'text-amber-400' :
+                          status === 'critical' ? 'text-amber-400' :
+                          'text-red-400'
                         }`}>
                           {item.currentStock}
                         </span>
@@ -408,14 +408,14 @@ export default function InventoryItemsPage() {
                         <div className="flex items-center justify-center gap-1">
                           <button
                             onClick={() => handleAdjustStock(item)}
-                            className="p-2 text-green-600 hover:bg-green-50 rounded-lg transition-colors"
+                            className="p-2 text-emerald-400 hover:bg-emerald-500/10 rounded-lg transition-colors"
                             title="ปรับสต็อก"
                           >
                             <RefreshCw className="w-4 h-4" />
                           </button>
                           <button
                             onClick={() => handleEditItem(item)}
-                            className="p-2 text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
+                            className="p-2 text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
                             title="แก้ไข"
                           >
                             <Edit3 className="w-4 h-4" />

@@ -163,15 +163,15 @@ export default function RoomPicker({
   if (loading) {
     return (
       <div className={`flex items-center justify-center py-8 ${className}`}>
-        <Loader2 className="w-6 h-6 animate-spin text-blue-600 mr-2" />
-        <span className="text-gray-600">กำลังโหลดห้องพัก...</span>
+        <Loader2 className="w-6 h-6 animate-spin text-red-600 mr-2" />
+        <span className="text-zinc-400">กำลังโหลดห้องพัก...</span>
       </div>
     )
   }
 
   if (error) {
     return (
-      <div className={`flex items-center justify-center py-8 text-red-600 ${className}`}>
+      <div className={`flex items-center justify-center py-8 text-red-400 ${className}`}>
         <AlertCircle className="w-5 h-5 mr-2" />
         <span>{error}</span>
       </div>
@@ -182,7 +182,7 @@ export default function RoomPicker({
     <div className={className}>
       {/* Filter by room type */}
       <div className="flex items-center gap-2 mb-4 flex-wrap">
-        <div className="flex items-center gap-1 text-sm text-gray-600">
+        <div className="flex items-center gap-1 text-sm text-zinc-400">
           <Filter className="w-4 h-4" />
           <span>กรองประเภท:</span>
         </div>
@@ -191,8 +191,8 @@ export default function RoomPicker({
           onClick={() => setSelectedTypeFilter(null)}
           className={`px-3 py-1 text-sm rounded-full transition-colors ${
             selectedTypeFilter === null
-              ? 'bg-blue-600 text-white'
-              : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+              ? 'bg-red-600 text-white'
+              : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-800'
           }`}
         >
           ทั้งหมด
@@ -204,8 +204,8 @@ export default function RoomPicker({
             onClick={() => setSelectedTypeFilter(type.id)}
             className={`px-3 py-1 text-sm rounded-full transition-colors ${
               selectedTypeFilter === type.id
-                ? 'bg-blue-600 text-white'
-                : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                ? 'bg-red-600 text-white'
+                : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-800'
             }`}
           >
             {type.name}
@@ -215,15 +215,15 @@ export default function RoomPicker({
 
       {/* Selected count */}
       {value.length > 0 && (
-        <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg">
+        <div className="mb-4 p-3 bg-red-500/10 border border-red-500 rounded-lg">
           <div className="flex items-center justify-between">
-            <span className="text-sm text-blue-700">
+            <span className="text-sm text-red-400">
               เลือกแล้ว {value.length} ห้อง
             </span>
             <button
               type="button"
               onClick={() => onChange([])}
-              className="text-sm text-blue-600 hover:text-blue-800 font-medium"
+              className="text-sm text-red-400 hover:text-red-300 font-medium"
             >
               ล้างทั้งหมด
             </button>
@@ -232,14 +232,14 @@ export default function RoomPicker({
             {value.map((room) => (
               <span
                 key={room.id}
-                className="inline-flex items-center gap-1 px-2 py-1 bg-blue-100 text-blue-800 rounded text-sm"
+                className="inline-flex items-center gap-1 px-2 py-1 bg-red-500/10 text-red-400 rounded text-sm"
               >
                 <Bed className="w-3 h-3" />
                 {room.roomNo}
                 <button
                   type="button"
                   onClick={() => toggleRoom(room)}
-                  className="ml-1 hover:text-blue-900"
+                  className="ml-1 hover:text-red-300"
                 >
                   &times;
                 </button>
@@ -253,7 +253,7 @@ export default function RoomPicker({
       <div className="space-y-4 max-h-80 overflow-y-auto">
         {sortedFloors.map((floor) => (
           <div key={floor}>
-            <h4 className="text-sm font-medium text-gray-500 mb-2">
+            <h4 className="text-sm font-medium text-zinc-500 mb-2">
               {floor === 0 ? 'ไม่ระบุชั้น' : `ชั้น ${floor}`}
             </h4>
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
@@ -272,34 +272,34 @@ export default function RoomPicker({
                       className={`
                         relative p-3 rounded-lg border-2 text-left transition-all
                         ${selected
-                          ? 'border-blue-500 bg-blue-50 ring-2 ring-blue-200'
+                          ? 'border-red-500 bg-red-500/10 ring-2 ring-red-500/20'
                           : isAvailable
-                            ? 'border-gray-200 bg-white hover:border-blue-300 hover:bg-blue-50'
-                            : 'border-gray-100 bg-gray-50 opacity-60 cursor-not-allowed'
+                            ? 'border-zinc-800 bg-zinc-900 hover:border-red-500 hover:bg-red-500/10'
+                            : 'border-zinc-800 bg-zinc-800 opacity-60 cursor-not-allowed'
                         }
                         ${disabled ? 'cursor-not-allowed opacity-60' : ''}
                       `}
                     >
                       {/* Selected checkmark */}
                       {selected && (
-                        <div className="absolute top-1 right-1 w-5 h-5 bg-blue-500 rounded-full flex items-center justify-center">
+                        <div className="absolute top-1 right-1 w-5 h-5 bg-red-500 rounded-full flex items-center justify-center">
                           <Check className="w-3 h-3 text-white" />
                         </div>
                       )}
 
                       {/* Room number */}
                       <div className="flex items-center gap-1 mb-1">
-                        <Bed className="w-4 h-4 text-gray-500" />
-                        <span className="font-bold text-gray-800">{room.roomNo}</span>
+                        <Bed className="w-4 h-4 text-zinc-500" />
+                        <span className="font-bold text-zinc-200">{room.roomNo}</span>
                       </div>
 
                       {/* Room type */}
-                      <div className="text-xs text-gray-500 truncate mb-1">
+                      <div className="text-xs text-zinc-500 truncate mb-1">
                         {room.roomTypeName || '-'}
                       </div>
 
                       {/* Price */}
-                      <div className="text-sm font-medium text-blue-600">
+                      <div className="text-sm font-medium text-red-400">
                         {formatPrice(room.priceWeekday)} บ./คืน
                       </div>
 
@@ -308,9 +308,9 @@ export default function RoomPicker({
                         <div className="mt-1">
                           <span className={`
                             inline-block px-1.5 py-0.5 text-xs rounded
-                            ${room.status === 'occupied' ? 'bg-red-100 text-red-700' : ''}
-                            ${room.status === 'maintenance' ? 'bg-yellow-100 text-yellow-700' : ''}
-                            ${room.status === 'cleaning' ? 'bg-orange-100 text-orange-700' : ''}
+                            ${room.status === 'occupied' ? 'bg-red-500/10 text-red-400' : ''}
+                            ${room.status === 'maintenance' ? 'bg-yellow-500/10 text-yellow-400' : ''}
+                            ${room.status === 'cleaning' ? 'bg-amber-500/10 text-amber-400' : ''}
                           `}>
                             {room.status === 'occupied' && 'มีผู้เข้าพัก'}
                             {room.status === 'maintenance' && 'ซ่อมบำรุง'}
@@ -327,8 +327,8 @@ export default function RoomPicker({
       </div>
 
       {filteredRooms.length === 0 && (
-        <div className="text-center py-8 text-gray-500">
-          <Bed className="w-12 h-12 text-gray-300 mx-auto mb-2" />
+        <div className="text-center py-8 text-zinc-500">
+          <Bed className="w-12 h-12 text-zinc-600 mx-auto mb-2" />
           <p>ไม่พบห้องพัก</p>
         </div>
       )}

@@ -300,31 +300,31 @@ export default function BookingForm({
     <>
       {/* Backdrop */}
       <div
-        className="fixed inset-0 bg-black bg-opacity-50 z-40"
+        className="fixed inset-0 bg-black/60 z-40"
         onClick={onClose}
       />
 
       {/* Modal */}
       <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-        <div className="bg-white rounded-lg shadow-xl w-full max-w-2xl max-h-[90vh] overflow-hidden">
+        <div className="bg-zinc-900 rounded-lg shadow-xl border border-zinc-800 w-full max-w-2xl max-h-[90vh] overflow-hidden">
           {/* Header */}
-          <div className="flex items-center justify-between p-4 border-b bg-gray-50">
+          <div className="flex items-center justify-between p-4 border-b border-zinc-800 bg-zinc-800">
             <div className="flex items-center gap-3">
-              <div className="w-10 h-10 bg-blue-100 rounded-full flex items-center justify-center">
-                <Calendar className="w-5 h-5 text-blue-600" />
+              <div className="w-10 h-10 bg-red-500/10 rounded-full flex items-center justify-center">
+                <Calendar className="w-5 h-5 text-red-400" />
               </div>
               <div>
-                <h2 className="text-xl font-bold text-gray-800">
+                <h2 className="text-xl font-bold text-zinc-100">
                   {mode === 'create' ? 'สร้างการจองใหม่' : 'แก้ไขการจอง'}
                 </h2>
                 {initialData?.bookNo && (
-                  <p className="text-sm text-gray-500">เลขที่จอง: {initialData.bookNo}</p>
+                  <p className="text-sm text-zinc-500">เลขที่จอง: {initialData.bookNo}</p>
                 )}
               </div>
             </div>
             <button
               onClick={onClose}
-              className="p-2 hover:bg-gray-200 rounded-full transition-colors"
+              className="p-2 hover:bg-zinc-800 rounded-full transition-colors"
               aria-label="ปิด"
             >
               <X className="w-5 h-5" />
@@ -336,7 +336,7 @@ export default function BookingForm({
             <div className="p-4 space-y-4 overflow-y-auto max-h-[60vh]">
               {/* Error Message */}
               {error && (
-                <div className="flex items-center gap-2 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700">
+                <div className="flex items-center gap-2 p-3 bg-red-950/50 border border-red-900/50 rounded-lg text-red-400">
                   <AlertCircle className="w-5 h-5 flex-shrink-0" />
                   <span className="text-sm">{error}</span>
                 </div>
@@ -344,7 +344,7 @@ export default function BookingForm({
 
               {/* Customer Picker */}
               <div>
-                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-1">
                   <Users className="w-4 h-4" />
                   ลูกค้า <span className="text-red-500">*</span>
                 </label>
@@ -360,7 +360,7 @@ export default function BookingForm({
               {/* Check-in / Check-out Dates */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                  <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                  <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-1">
                     <Calendar className="w-4 h-4" />
                     วันเช็คอิน <span className="text-red-500">*</span>
                   </label>
@@ -369,19 +369,19 @@ export default function BookingForm({
                     name="checkIn"
                     value={formData.checkIn}
                     onChange={handleInputChange}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-colors"
+                    className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
                     required
                     disabled={saving}
                   />
                   {formData.checkIn && (
-                    <p className="mt-1 text-xs text-gray-500">
+                    <p className="mt-1 text-xs text-zinc-500">
                       พ.ศ. {toBuddhistYear(new Date(formData.checkIn))}
                     </p>
                   )}
                 </div>
 
                 <div>
-                  <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                  <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-1">
                     <Calendar className="w-4 h-4" />
                     วันเช็คเอาท์ <span className="text-red-500">*</span>
                   </label>
@@ -391,12 +391,12 @@ export default function BookingForm({
                     value={formData.checkOut}
                     onChange={handleInputChange}
                     min={formData.checkIn || undefined}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-colors"
+                    className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
                     required
                     disabled={saving}
                   />
                   {formData.checkOut && (
-                    <p className="mt-1 text-xs text-gray-500">
+                    <p className="mt-1 text-xs text-zinc-500">
                       พ.ศ. {toBuddhistYear(new Date(formData.checkOut))}
                     </p>
                   )}
@@ -405,9 +405,9 @@ export default function BookingForm({
 
               {/* Nights Display */}
               {nights > 0 && (
-                <div className="flex items-center gap-2 p-3 bg-blue-50 border border-blue-200 rounded-lg">
-                  <Moon className="w-5 h-5 text-blue-600" />
-                  <span className="text-blue-700 font-medium">
+                <div className="flex items-center gap-2 p-3 bg-red-500/10 border border-red-900/50 rounded-lg">
+                  <Moon className="w-5 h-5 text-red-400" />
+                  <span className="text-red-400 font-medium">
                     จำนวน {nights} คืน
                   </span>
                 </div>
@@ -416,7 +416,7 @@ export default function BookingForm({
               {/* Adults / Children */}
               <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                  <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-1">
                     ผู้ใหญ่
                   </label>
                   <input
@@ -425,12 +425,12 @@ export default function BookingForm({
                     value={formData.adults}
                     onChange={handleInputChange}
                     min="1"
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-colors"
+                    className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
                     disabled={saving}
                   />
                 </div>
                 <div>
-                  <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                  <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-1">
                     เด็ก
                   </label>
                   <input
@@ -439,7 +439,7 @@ export default function BookingForm({
                     value={formData.children}
                     onChange={handleInputChange}
                     min="0"
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-colors"
+                    className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
                     disabled={saving}
                   />
                 </div>
@@ -447,7 +447,7 @@ export default function BookingForm({
 
               {/* Room Selection */}
               <div>
-                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-2">
+                <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-2">
                   <Bed className="w-4 h-4" />
                   เลือกห้องพัก <span className="text-red-500">*</span>
                 </label>
@@ -464,14 +464,14 @@ export default function BookingForm({
               {/* Source / Status */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                  <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                  <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-1">
                     ช่องทางการจอง
                   </label>
                   <select
                     name="source"
                     value={formData.source || ''}
                     onChange={handleInputChange}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-colors"
+                    className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
                     disabled={saving}
                   >
                     <option value="">-- เลือก --</option>
@@ -485,14 +485,14 @@ export default function BookingForm({
 
                 {mode === 'edit' && (
                   <div>
-                    <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                    <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-1">
                       สถานะ
                     </label>
                     <select
                       name="status"
                       value={formData.status}
                       onChange={handleInputChange}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-colors"
+                      className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
                       disabled={saving}
                     >
                       {statusOptions.map((opt) => (
@@ -507,7 +507,7 @@ export default function BookingForm({
 
               {/* Deposit Amount */}
               <div>
-                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-1">
                   <CreditCard className="w-4 h-4" />
                   เงินมัดจำ (บาท)
                 </label>
@@ -519,14 +519,14 @@ export default function BookingForm({
                   min="0"
                   step="0.01"
                   placeholder="ระบุจำนวนเงินมัดจำ"
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-colors"
+                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
                   disabled={saving}
                 />
               </div>
 
               {/* Notes (special requests + internal notes combined) */}
               <div>
-                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                <label className="flex items-center gap-2 text-sm font-medium text-zinc-300 mb-1">
                   <FileText className="w-4 h-4" />
                   ความต้องการพิเศษ / หมายเหตุภายใน
                 </label>
@@ -536,14 +536,14 @@ export default function BookingForm({
                   onChange={handleInputChange}
                   placeholder="ระบุความต้องการพิเศษหรือหมายเหตุ..."
                   rows={3}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-colors resize-none"
+                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors resize-none"
                   disabled={saving}
                 />
               </div>
             </div>
 
             {/* Footer */}
-            <div className="p-4 border-t bg-gray-50 flex items-center justify-between gap-3">
+            <div className="p-4 border-t border-zinc-800 bg-zinc-800 flex items-center justify-between gap-3">
               {/* Cancel Booking Button (only in edit mode for active bookings) */}
               {canCancel && (
                 <div>
@@ -565,7 +565,7 @@ export default function BookingForm({
                       <button
                         type="button"
                         onClick={() => setShowCancelConfirm(false)}
-                        className="px-3 py-1.5 bg-gray-200 text-gray-700 text-sm rounded-lg hover:bg-gray-300 transition-colors"
+                        className="px-3 py-1.5 bg-zinc-800 text-zinc-200 text-sm rounded-lg hover:bg-zinc-800 transition-colors"
                       >
                         ไม่
                       </button>
@@ -574,7 +574,7 @@ export default function BookingForm({
                     <button
                       type="button"
                       onClick={() => setShowCancelConfirm(true)}
-                      className="flex items-center gap-2 px-4 py-2 text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                      className="flex items-center gap-2 px-4 py-2 text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
                     >
                       <Trash2 className="w-4 h-4" />
                       ยกเลิกการจอง
@@ -591,7 +591,7 @@ export default function BookingForm({
                 <button
                   type="button"
                   onClick={onClose}
-                  className="px-4 py-2 bg-gray-200 hover:bg-gray-300 text-gray-800 rounded-lg transition-colors"
+                  className="px-4 py-2 bg-zinc-800 hover:bg-zinc-800 text-zinc-200 rounded-lg transition-colors"
                   disabled={saving}
                 >
                   ปิด
@@ -599,7 +599,7 @@ export default function BookingForm({
                 <button
                   type="submit"
                   disabled={saving}
-                  className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 transition-colors"
+                  className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 transition-colors"
                 >
                   {saving ? (
                     <Loader2 className="w-4 h-4 animate-spin" />

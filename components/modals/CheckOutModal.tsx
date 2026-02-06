@@ -140,39 +140,39 @@ export default function CheckOutModal({
 
   return (
     <div
-      className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50"
+      className="fixed inset-0 bg-black/60 flex items-center justify-center z-50"
       onClick={handleClose}
     >
       <div
-        className="bg-white rounded-xl shadow-2xl w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto"
+        className="bg-zinc-900 border border-zinc-800 rounded-xl shadow-2xl w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="flex items-center justify-between p-4 border-b bg-blue-50">
+        <div className="flex items-center justify-between p-4 border-b border-zinc-800 bg-red-500/10">
           <div>
-            <h2 className="text-xl font-bold text-gray-800">เช็คเอาท์</h2>
-            <p className="text-sm text-gray-500">
+            <h2 className="text-xl font-bold text-zinc-100">เช็คเอาท์</h2>
+            <p className="text-sm text-zinc-500">
               ห้อง {checkIn.roomNo} - {checkIn.cinNo}
             </p>
           </div>
           <button
             onClick={handleClose}
-            className="p-2 hover:bg-blue-100 rounded-lg transition-colors"
+            className="p-2 hover:bg-zinc-800 rounded-lg transition-colors"
           >
             <X size={20} />
           </button>
         </div>
 
         {/* Summary */}
-        <div className="p-4 bg-gray-50 border-b space-y-3">
+        <div className="p-4 bg-zinc-800 border-b border-zinc-800 space-y-3">
           {/* Guest Name */}
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-blue-100 rounded-full flex items-center justify-center">
-              <User size={20} className="text-blue-600" />
+            <div className="w-10 h-10 bg-red-500/10 rounded-full flex items-center justify-center">
+              <User size={20} className="text-red-400" />
             </div>
             <div>
-              <p className="text-sm text-gray-500">ชื่อผู้เข้าพัก</p>
-              <p className="font-medium text-gray-800">
+              <p className="text-sm text-zinc-500">ชื่อผู้เข้าพัก</p>
+              <p className="font-medium text-zinc-200">
                 {checkIn.customerName || 'ไม่ระบุ'}
               </p>
             </div>
@@ -180,12 +180,12 @@ export default function CheckOutModal({
 
           {/* Check-in Date */}
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-green-100 rounded-full flex items-center justify-center">
-              <Calendar size={20} className="text-green-600" />
+            <div className="w-10 h-10 bg-red-500/10 rounded-full flex items-center justify-center">
+              <Calendar size={20} className="text-red-400" />
             </div>
             <div>
-              <p className="text-sm text-gray-500">วันที่เช็คอิน</p>
-              <p className="font-medium text-gray-800">
+              <p className="text-sm text-zinc-500">วันที่เช็คอิน</p>
+              <p className="font-medium text-zinc-200">
                 {formatThaiDate(checkIn.checkInTime)}
               </p>
             </div>
@@ -193,32 +193,32 @@ export default function CheckOutModal({
 
           {/* Checkout Date (Today) */}
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-orange-100 rounded-full flex items-center justify-center">
-              <Calendar size={20} className="text-orange-600" />
+            <div className="w-10 h-10 bg-red-500/10 rounded-full flex items-center justify-center">
+              <Calendar size={20} className="text-red-400" />
             </div>
             <div>
-              <p className="text-sm text-gray-500">วันที่เช็คเอาท์ (วันนี้)</p>
-              <p className="font-medium text-gray-800">
+              <p className="text-sm text-zinc-500">วันที่เช็คเอาท์ (วันนี้)</p>
+              <p className="font-medium text-zinc-200">
                 {toBuddhistYear(new Date())}
               </p>
             </div>
           </div>
 
           {/* Summary Box */}
-          <div className="bg-white rounded-lg border border-gray-200 p-4 mt-4">
+          <div className="bg-zinc-900 rounded-lg border border-zinc-700 p-4 mt-4">
             <div className="flex justify-between items-center mb-2">
-              <span className="text-gray-600">จำนวนคืน</span>
+              <span className="text-zinc-400">จำนวนคืน</span>
               <span className="font-medium">{nights} คืน</span>
             </div>
             <div className="flex justify-between items-center mb-2">
-              <span className="text-gray-600">ราคาต่อคืน</span>
+              <span className="text-zinc-400">ราคาต่อคืน</span>
               <span className="font-medium">
                 {ratePerNight > 0 ? formatCurrency(ratePerNight) : 'ไม่ระบุ'}
               </span>
             </div>
-            <div className="flex justify-between items-center pt-2 border-t border-gray-200">
-              <span className="text-lg font-semibold text-gray-800">รวมทั้งหมด</span>
-              <span className="text-lg font-bold text-blue-600">
+            <div className="flex justify-between items-center pt-2 border-t border-zinc-700">
+              <span className="text-lg font-semibold text-zinc-200">รวมทั้งหมด</span>
+              <span className="text-lg font-bold text-red-400">
                 {totalAmount > 0 ? formatCurrency(totalAmount) : 'ไม่ระบุ'}
               </span>
             </div>
@@ -229,21 +229,21 @@ export default function CheckOutModal({
         <form onSubmit={handleSubmit} className="p-4 space-y-4">
           {/* Error Message */}
           {error && (
-            <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
+            <div className="p-3 bg-red-950/50 border border-red-900/50 rounded-lg text-red-400 text-sm">
               {error}
             </div>
           )}
 
           {/* Payment Method */}
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
+            <label className="block text-sm font-medium text-zinc-300 mb-1">
               <CreditCard size={16} className="inline mr-1" />
               วิธีการชำระเงิน
             </label>
             <select
               value={paymentMethod}
               onChange={(e) => setPaymentMethod(e.target.value as PaymentMethod)}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500"
             >
               {paymentMethods.map((method) => (
                 <option key={method.value} value={method.value}>
@@ -255,7 +255,7 @@ export default function CheckOutModal({
 
           {/* Notes */}
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
+            <label className="block text-sm font-medium text-zinc-300 mb-1">
               <FileText size={16} className="inline mr-1" />
               หมายเหตุ
             </label>
@@ -264,7 +264,7 @@ export default function CheckOutModal({
               onChange={(e) => setNotes(e.target.value)}
               placeholder="หมายเหตุเพิ่มเติม..."
               rows={3}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 resize-none"
+              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 resize-none"
             />
           </div>
 
@@ -273,7 +273,7 @@ export default function CheckOutModal({
             <button
               type="button"
               onClick={handleClose}
-              className="flex-1 px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50"
+              className="flex-1 px-4 py-2 border border-zinc-700 text-zinc-300 rounded-lg hover:bg-zinc-800"
               disabled={isSubmitting}
             >
               ยกเลิก
@@ -281,7 +281,7 @@ export default function CheckOutModal({
             <button
               type="submit"
               disabled={isSubmitting}
-              className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+              className="flex-1 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
             >
               {isSubmitting ? (
                 <>

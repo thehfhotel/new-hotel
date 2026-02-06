@@ -149,17 +149,17 @@ export default function DataTable<T extends object>({
     }
 
     return (
-      <div className="flex items-center justify-between px-4 py-3 bg-white border-t border-gray-200">
-        <div className="text-sm text-gray-700">
-          แสดง <span className="font-medium">{startItem}</span> -{' '}
-          <span className="font-medium">{endItem}</span> จาก{' '}
-          <span className="font-medium">{totalItems.toLocaleString()}</span> รายการ
+      <div className="flex items-center justify-between px-4 py-3 bg-zinc-900 border-t border-zinc-800">
+        <div className="text-sm text-zinc-400">
+          แสดง <span className="font-medium text-zinc-200">{startItem}</span> -{' '}
+          <span className="font-medium text-zinc-200">{endItem}</span> จาก{' '}
+          <span className="font-medium text-zinc-200">{totalItems.toLocaleString()}</span> รายการ
         </div>
         <div className="flex items-center gap-1">
           <button
             onClick={() => onPageChange(currentPage - 1)}
             disabled={currentPage === 1}
-            className="p-2 rounded-md hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            className="p-2 rounded-md hover:bg-zinc-800 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-zinc-400"
             aria-label="หน้าก่อนหน้า"
           >
             <ChevronLeft className="w-5 h-5" />
@@ -167,7 +167,7 @@ export default function DataTable<T extends object>({
 
           {pageNumbers.map((page, index) =>
             typeof page === 'string' ? (
-              <span key={`ellipsis-${index}`} className="px-3 py-1 text-gray-500">
+              <span key={`ellipsis-${index}`} className="px-3 py-1 text-zinc-500">
                 {page}
               </span>
             ) : (
@@ -176,8 +176,8 @@ export default function DataTable<T extends object>({
                 onClick={() => onPageChange(page)}
                 className={`px-3 py-1 rounded-md transition-colors ${
                   currentPage === page
-                    ? 'bg-blue-600 text-white'
-                    : 'hover:bg-gray-100 text-gray-700'
+                    ? 'bg-red-600 text-white'
+                    : 'hover:bg-zinc-800 text-zinc-400'
                 }`}
               >
                 {page}
@@ -188,7 +188,7 @@ export default function DataTable<T extends object>({
           <button
             onClick={() => onPageChange(currentPage + 1)}
             disabled={currentPage === totalPages}
-            className="p-2 rounded-md hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            className="p-2 rounded-md hover:bg-zinc-800 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-zinc-400"
             aria-label="หน้าถัดไป"
           >
             <ChevronRight className="w-5 h-5" />
@@ -199,18 +199,18 @@ export default function DataTable<T extends object>({
   }
 
   return (
-    <div className="bg-white rounded-lg shadow-lg overflow-hidden">
+    <div className="bg-zinc-900 rounded-lg border border-zinc-800 overflow-hidden">
       <div className="overflow-x-auto">
         <table className="w-full">
-          <thead className="bg-gray-50 border-b border-gray-200">
+          <thead className="bg-zinc-800 border-b border-zinc-700">
             <tr>
               {columns.map((column) => (
                 <th
                   key={String(column.key)}
                   onClick={() => handleSort(String(column.key), column.sortable)}
                   className={`
-                    px-4 py-3 text-left text-sm font-semibold text-gray-700
-                    ${column.sortable ? 'cursor-pointer hover:bg-gray-100' : ''}
+                    px-4 py-3 text-left text-sm font-semibold text-zinc-300
+                    ${column.sortable ? 'cursor-pointer hover:bg-zinc-700' : ''}
                     ${column.width || ''}
                   `}
                 >
@@ -221,15 +221,15 @@ export default function DataTable<T extends object>({
                         <ChevronUp
                           className={`w-3 h-3 -mb-1 ${
                             sortColumn === column.key && sortDirection === 'asc'
-                              ? 'text-blue-600'
-                              : 'text-gray-400'
+                              ? 'text-red-400'
+                              : 'text-zinc-600'
                           }`}
                         />
                         <ChevronDown
                           className={`w-3 h-3 ${
                             sortColumn === column.key && sortDirection === 'desc'
-                              ? 'text-blue-600'
-                              : 'text-gray-400'
+                              ? 'text-red-400'
+                              : 'text-zinc-600'
                           }`}
                         />
                       </span>
@@ -239,19 +239,19 @@ export default function DataTable<T extends object>({
               ))}
             </tr>
           </thead>
-          <tbody className="divide-y divide-gray-200">
+          <tbody className="divide-y divide-zinc-800">
             {loading ? (
               <tr>
                 <td colSpan={columns.length} className="px-4 py-12 text-center">
                   <div className="flex items-center justify-center gap-2">
-                    <div className="w-5 h-5 border-2 border-blue-600 border-t-transparent rounded-full animate-spin"></div>
-                    <span className="text-gray-600">กำลังโหลดข้อมูล...</span>
+                    <div className="w-5 h-5 border-2 border-red-500 border-t-transparent rounded-full animate-spin"></div>
+                    <span className="text-zinc-400">กำลังโหลดข้อมูล...</span>
                   </div>
                 </td>
               </tr>
             ) : sortedData.length === 0 ? (
               <tr>
-                <td colSpan={columns.length} className="px-4 py-12 text-center text-gray-500">
+                <td colSpan={columns.length} className="px-4 py-12 text-center text-zinc-500">
                   ไม่พบข้อมูล
                 </td>
               </tr>
@@ -262,13 +262,13 @@ export default function DataTable<T extends object>({
                   onClick={() => onRowClick?.(item)}
                   className={`
                     transition-colors
-                    ${onRowClick ? 'cursor-pointer hover:bg-blue-50' : 'hover:bg-gray-50'}
+                    ${onRowClick ? 'cursor-pointer hover:bg-zinc-800' : 'hover:bg-zinc-800/50'}
                   `}
                 >
                   {columns.map((column) => (
                     <td
                       key={String(column.key)}
-                      className={`px-4 py-3 text-sm text-gray-700 ${column.width || ''}`}
+                      className={`px-4 py-3 text-sm text-zinc-300 ${column.width || ''}`}
                     >
                       {column.render
                         ? column.render(item)

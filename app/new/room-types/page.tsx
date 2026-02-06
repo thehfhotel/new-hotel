@@ -209,10 +209,10 @@ export default function RoomTypesPage() {
       {/* Page Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <Home className="w-8 h-8 text-purple-600" />
+          <Home className="w-8 h-8 text-red-400" />
           <div>
-            <h1 className="text-2xl font-bold text-gray-800">จัดการประเภทห้อง</h1>
-            <p className="text-gray-600">
+            <h1 className="text-2xl font-bold text-zinc-100">จัดการประเภทห้อง</h1>
+            <p className="text-zinc-400">
               จำนวนประเภทห้องทั้งหมด {roomTypes.length} รายการ
             </p>
           </div>
@@ -221,7 +221,7 @@ export default function RoomTypesPage() {
         {/* Add Button */}
         <button
           onClick={handleAddRoomType}
-          className="flex items-center gap-2 px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors"
+          className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors"
         >
           <Plus className="w-5 h-5" />
           เพิ่มประเภทห้อง
@@ -229,22 +229,22 @@ export default function RoomTypesPage() {
       </div>
 
       {/* Search and Sort Bar */}
-      <div className="bg-white rounded-lg shadow p-4">
+      <div className="bg-zinc-900 rounded-lg p-4">
         <div className="flex flex-col md:flex-row gap-4">
           {/* Search */}
           <div className="relative flex-1">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-zinc-500" />
             <input
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="ค้นหาด้วยรหัส หรือ ชื่อประเภทห้อง..."
-              className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-purple-500 outline-none transition-colors"
+              className="w-full pl-10 pr-4 py-2 bg-zinc-900 border border-zinc-700 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors text-zinc-200"
             />
             {searchQuery && (
               <button
                 onClick={() => setSearchQuery('')}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-400"
                 aria-label="ล้างการค้นหา"
               >
                 <X className="w-4 h-4" />
@@ -254,13 +254,13 @@ export default function RoomTypesPage() {
 
           {/* Sort */}
           <div className="flex items-center gap-2">
-            <span className="text-sm text-gray-600">เรียงตาม:</span>
+            <span className="text-sm text-zinc-400">เรียงตาม:</span>
             <button
               onClick={() => handleSortChange('typeCode')}
               className={`px-3 py-1.5 text-sm rounded-lg border transition-colors ${
                 sortField === 'typeCode'
-                  ? 'border-purple-500 bg-purple-50 text-purple-700'
-                  : 'border-gray-300 text-gray-600 hover:bg-gray-50'
+                  ? 'border-red-500 bg-red-500/10 text-red-400'
+                  : 'border-zinc-700 text-zinc-400 hover:bg-zinc-800'
               }`}
             >
               รหัส {sortField === 'typeCode' && (sortOrder === 'asc' ? '(A-Z)' : '(Z-A)')}
@@ -269,8 +269,8 @@ export default function RoomTypesPage() {
               onClick={() => handleSortChange('typeName')}
               className={`px-3 py-1.5 text-sm rounded-lg border transition-colors ${
                 sortField === 'typeName'
-                  ? 'border-purple-500 bg-purple-50 text-purple-700'
-                  : 'border-gray-300 text-gray-600 hover:bg-gray-50'
+                  ? 'border-red-500 bg-red-500/10 text-red-400'
+                  : 'border-zinc-700 text-zinc-400 hover:bg-zinc-800'
               }`}
             >
               ชื่อ {sortField === 'typeName' && (sortOrder === 'asc' ? '(A-Z)' : '(Z-A)')}
@@ -278,7 +278,7 @@ export default function RoomTypesPage() {
           </div>
         </div>
         {debouncedSearch && (
-          <p className="mt-2 text-sm text-gray-600">
+          <p className="mt-2 text-sm text-zinc-400">
             ผลการค้นหา &quot;{debouncedSearch}&quot;: พบ {roomTypes.length} รายการ
           </p>
         )}
@@ -293,19 +293,19 @@ export default function RoomTypesPage() {
       )}
 
       {/* Room Types Grid */}
-      <div className="bg-white rounded-lg shadow overflow-hidden">
+      <div className="bg-zinc-900 rounded-lg overflow-hidden">
         {loading ? (
           <div className="flex items-center justify-center py-12">
-            <Loader2 className="w-6 h-6 animate-spin text-purple-600" />
-            <span className="ml-2 text-gray-600">กำลังโหลดข้อมูล...</span>
+            <Loader2 className="w-6 h-6 animate-spin text-red-400" />
+            <span className="ml-2 text-zinc-400">กำลังโหลดข้อมูล...</span>
           </div>
         ) : roomTypes.length === 0 ? (
-          <div className="text-center py-12 text-gray-500">
-            <Home className="w-12 h-12 text-gray-300 mx-auto mb-3" />
+          <div className="text-center py-12 text-zinc-500">
+            <Home className="w-12 h-12 text-zinc-600 mx-auto mb-3" />
             <p>ไม่พบประเภทห้อง</p>
             <button
               onClick={handleAddRoomType}
-              className="mt-4 text-purple-600 hover:text-purple-700 font-medium"
+              className="mt-4 text-red-400 hover:text-red-400 font-medium"
             >
               + เพิ่มประเภทห้องใหม่
             </button>
@@ -315,17 +315,17 @@ export default function RoomTypesPage() {
             {roomTypes.map((roomType) => (
               <div
                 key={roomType.id}
-                className={`border rounded-lg p-4 transition-all hover:shadow-md ${
+                className={`border rounded-lg p-4 transition-all ${
                   roomType.active
-                    ? 'border-gray-200 bg-white'
-                    : 'border-gray-200 bg-gray-50 opacity-60'
+                    ? 'border-zinc-800 bg-zinc-900'
+                    : 'border-zinc-800 bg-zinc-900/50 opacity-60'
                 }`}
               >
                 {/* Header */}
                 <div className="flex items-start justify-between mb-3">
                   <div>
                     <div className="flex items-center gap-2">
-                      <span className="px-2 py-0.5 bg-purple-100 text-purple-700 text-xs font-bold rounded">
+                      <span className="px-2 py-0.5 bg-red-500/10 text-red-400 text-xs font-bold rounded">
                         {roomType.typeCode}
                       </span>
                       {roomType.active ? (
@@ -340,17 +340,17 @@ export default function RoomTypesPage() {
                         </span>
                       )}
                     </div>
-                    <h3 className="text-lg font-semibold text-gray-800 mt-1">
+                    <h3 className="text-lg font-semibold text-zinc-100 mt-1">
                       {roomType.typeName}
                     </h3>
                     {roomType.typeNameEn && (
-                      <p className="text-sm text-gray-500">{roomType.typeNameEn}</p>
+                      <p className="text-sm text-zinc-500">{roomType.typeNameEn}</p>
                     )}
                   </div>
                   <div className="flex gap-1">
                     <button
                       onClick={() => handleEditRoomType(roomType)}
-                      className="p-2 text-gray-400 hover:text-purple-600 hover:bg-purple-50 rounded-lg transition-colors"
+                      className="p-2 text-zinc-500 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
                       title="แก้ไข"
                     >
                       <Edit3 className="w-4 h-4" />
@@ -360,28 +360,28 @@ export default function RoomTypesPage() {
 
                 {/* Description */}
                 {roomType.description && (
-                  <p className="text-sm text-gray-600 mb-3 line-clamp-2">
+                  <p className="text-sm text-zinc-400 mb-3 line-clamp-2">
                     {roomType.description}
                   </p>
                 )}
 
                 {/* Details */}
                 <div className="grid grid-cols-2 gap-2 text-sm">
-                  <div className="flex items-center gap-2 text-gray-600">
-                    <DollarSign className="w-4 h-4 text-gray-400" />
+                  <div className="flex items-center gap-2 text-zinc-400">
+                    <DollarSign className="w-4 h-4 text-zinc-500" />
                     <span>{formatPrice(roomType.basePrice)} บาท</span>
                   </div>
-                  <div className="flex items-center gap-2 text-gray-600">
-                    <Users className="w-4 h-4 text-gray-400" />
+                  <div className="flex items-center gap-2 text-zinc-400">
+                    <Users className="w-4 h-4 text-zinc-500" />
                     <span>{roomType.maxGuests} คน</span>
                   </div>
-                  <div className="flex items-center gap-2 text-gray-600">
-                    <Bed className="w-4 h-4 text-gray-400" />
+                  <div className="flex items-center gap-2 text-zinc-400">
+                    <Bed className="w-4 h-4 text-zinc-500" />
                     <span>{getBedTypeLabel(roomType.bedType)}</span>
                   </div>
                   {roomType.sizeSqm && (
-                    <div className="flex items-center gap-2 text-gray-600">
-                      <Home className="w-4 h-4 text-gray-400" />
+                    <div className="flex items-center gap-2 text-zinc-400">
+                      <Home className="w-4 h-4 text-zinc-500" />
                       <span>{roomType.sizeSqm} ตร.ม.</span>
                     </div>
                   )}

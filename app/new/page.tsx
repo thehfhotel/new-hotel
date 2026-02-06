@@ -28,7 +28,7 @@ interface QuickLink {
   label: string
   description: string
   icon: React.ReactNode
-  color: string
+  accent: string
 }
 
 const quickLinks: QuickLink[] = [
@@ -37,42 +37,42 @@ const quickLinks: QuickLink[] = [
     label: 'การจอง',
     description: 'จัดการการจองห้องพัก',
     icon: <Calendar size={24} />,
-    color: 'bg-blue-500',
+    accent: 'text-red-400 bg-red-500/10 border-red-500/20',
   },
   {
     href: '/new/housekeeping',
     label: 'แม่บ้าน',
     description: 'สถานะความสะอาดห้อง',
     icon: <Sparkles size={24} />,
-    color: 'bg-pink-500',
+    accent: 'text-amber-400 bg-amber-500/10 border-amber-500/20',
   },
   {
     href: '/new/inventory',
     label: 'คลังสินค้า',
     description: 'จัดการสต็อกและอุปกรณ์',
     icon: <Package size={24} />,
-    color: 'bg-purple-500',
+    accent: 'text-sky-400 bg-sky-500/10 border-sky-500/20',
   },
   {
     href: '/new/maintenance',
     label: 'แจ้งซ่อม',
     description: 'ติดตามงานซ่อมบำรุง',
     icon: <Wrench size={24} />,
-    color: 'bg-orange-500',
+    accent: 'text-orange-400 bg-orange-500/10 border-orange-500/20',
   },
   {
     href: '/new/billing',
     label: 'ใบแจ้งหนี้',
     description: 'ดูและพิมพ์ใบแจ้งหนี้',
     icon: <Receipt size={24} />,
-    color: 'bg-green-500',
+    accent: 'text-emerald-400 bg-emerald-500/10 border-emerald-500/20',
   },
   {
     href: '/new/reports',
     label: 'รายงาน',
     description: 'วิเคราะห์รายได้และอัตราเข้าพัก',
     icon: <BarChart3 size={24} />,
-    color: 'bg-indigo-500',
+    accent: 'text-violet-400 bg-violet-500/10 border-violet-500/20',
   },
 ]
 
@@ -113,8 +113,8 @@ export default function NewDashboard() {
     return (
       <div className="flex items-center justify-center min-h-[50vh]">
         <div className="text-center">
-          <Loader2 className="animate-spin h-12 w-12 text-emerald-600 mx-auto mb-4" />
-          <p className="text-gray-600">กำลังโหลดข้อมูล...</p>
+          <Loader2 className="animate-spin h-12 w-12 text-red-500 mx-auto mb-4" />
+          <p className="text-zinc-500">กำลังโหลดข้อมูล...</p>
         </div>
       </div>
     )
@@ -125,10 +125,10 @@ export default function NewDashboard() {
       {/* Page Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-gray-800">ระบบจัดการโรงแรม (ใหม่)</h1>
-          <p className="text-gray-500">New Hotel Management System</p>
+          <h1 className="text-2xl font-bold text-zinc-100 tracking-tight">ระบบจัดการโรงแรม (ใหม่)</h1>
+          <p className="text-zinc-500">New Hotel Management System</p>
         </div>
-        <p className="text-gray-500 text-sm">
+        <p className="text-zinc-600 text-sm">
           อัปเดตล่าสุด: {new Date().toLocaleDateString('th-TH', {
             year: 'numeric',
             month: 'long',
@@ -141,7 +141,7 @@ export default function NewDashboard() {
 
       {/* Error Message */}
       {error && (
-        <div className="flex items-center gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">
+        <div className="flex items-center gap-2 p-4 bg-red-950/50 border border-red-900/50 rounded-lg text-red-400">
           <AlertCircle className="w-5 h-5 flex-shrink-0" />
           <span>{error}</span>
         </div>
@@ -149,50 +149,50 @@ export default function NewDashboard() {
 
       {/* Stats Cards */}
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
-        <div className="bg-white rounded-xl px-6 py-5 shadow-sm border border-gray-100">
-          <p className="text-sm font-medium text-gray-500 mb-1">ห้องทั้งหมด</p>
-          <p className="text-3xl font-bold text-gray-900">{stats.totalRooms}</p>
+        <div className="bg-zinc-900 rounded-xl px-6 py-5 border border-zinc-800">
+          <p className="text-sm font-medium text-zinc-500 mb-1">ห้องทั้งหมด</p>
+          <p className="text-3xl font-bold text-zinc-100">{stats.totalRooms}</p>
         </div>
-        <div className="bg-white rounded-xl px-6 py-5 shadow-sm border border-gray-100">
-          <p className="text-sm font-medium text-gray-500 mb-1">ห้องว่าง</p>
-          <p className="text-3xl font-bold text-green-600">{stats.availableRooms}</p>
+        <div className="bg-zinc-900 rounded-xl px-6 py-5 border border-zinc-800">
+          <p className="text-sm font-medium text-zinc-500 mb-1">ห้องว่าง</p>
+          <p className="text-3xl font-bold text-emerald-400">{stats.availableRooms}</p>
         </div>
-        <div className="bg-white rounded-xl px-6 py-5 shadow-sm border border-gray-100">
-          <p className="text-sm font-medium text-gray-500 mb-1">มีผู้เข้าพัก</p>
-          <p className="text-3xl font-bold text-orange-600">{stats.occupiedRooms}</p>
+        <div className="bg-zinc-900 rounded-xl px-6 py-5 border border-zinc-800">
+          <p className="text-sm font-medium text-zinc-500 mb-1">มีผู้เข้าพัก</p>
+          <p className="text-3xl font-bold text-amber-400">{stats.occupiedRooms}</p>
         </div>
-        <div className="bg-white rounded-xl px-6 py-5 shadow-sm border border-gray-100">
-          <p className="text-sm font-medium text-gray-500 mb-1">ลูกค้าทั้งหมด</p>
-          <p className="text-3xl font-bold text-gray-900">{stats.totalCustomers}</p>
+        <div className="bg-zinc-900 rounded-xl px-6 py-5 border border-zinc-800">
+          <p className="text-sm font-medium text-zinc-500 mb-1">ลูกค้าทั้งหมด</p>
+          <p className="text-3xl font-bold text-zinc-100">{stats.totalCustomers}</p>
         </div>
-        <div className="bg-white rounded-xl px-6 py-5 shadow-sm border border-gray-100">
-          <p className="text-sm font-medium text-gray-500 mb-1">การจองที่ใช้งาน</p>
-          <p className="text-3xl font-bold text-blue-600">{stats.activeBookings}</p>
+        <div className="bg-zinc-900 rounded-xl px-6 py-5 border border-zinc-800">
+          <p className="text-sm font-medium text-zinc-500 mb-1">การจองที่ใช้งาน</p>
+          <p className="text-3xl font-bold text-sky-400">{stats.activeBookings}</p>
         </div>
-        <div className="bg-white rounded-xl px-6 py-5 shadow-sm border border-gray-100">
-          <p className="text-sm font-medium text-gray-500 mb-1">เช็คเอาท์วันนี้</p>
-          <p className="text-3xl font-bold text-red-600">{stats.todayCheckouts}</p>
+        <div className="bg-zinc-900 rounded-xl px-6 py-5 border border-zinc-800">
+          <p className="text-sm font-medium text-zinc-500 mb-1">เช็คเอาท์วันนี้</p>
+          <p className="text-3xl font-bold text-red-400">{stats.todayCheckouts}</p>
         </div>
       </div>
 
       {/* Quick Links */}
       <div>
-        <h2 className="text-lg font-semibold text-gray-800 mb-4">เมนูหลัก</h2>
+        <h2 className="text-lg font-semibold text-zinc-200 mb-4">เมนูหลัก</h2>
         <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
           {quickLinks.map((link) => (
             <Link
               key={link.href}
               href={link.href}
-              className="bg-white rounded-xl shadow-sm border border-gray-100 p-4 hover:shadow-md transition-shadow group"
+              className="bg-zinc-900 rounded-xl border border-zinc-800 p-4 hover:border-zinc-700 transition-all group"
             >
-              <div className={`${link.color} w-12 h-12 rounded-lg flex items-center justify-center text-white mb-3`}>
+              <div className={`w-12 h-12 rounded-lg flex items-center justify-center mb-3 border ${link.accent}`}>
                 {link.icon}
               </div>
-              <h3 className="font-semibold text-gray-800 group-hover:text-emerald-600 transition-colors">
+              <h3 className="font-semibold text-zinc-200 group-hover:text-red-400 transition-colors">
                 {link.label}
               </h3>
-              <p className="text-sm text-gray-500 mt-1">{link.description}</p>
-              <div className="flex items-center gap-1 text-emerald-600 text-sm mt-2 opacity-0 group-hover:opacity-100 transition-opacity">
+              <p className="text-sm text-zinc-500 mt-1">{link.description}</p>
+              <div className="flex items-center gap-1 text-red-500 text-sm mt-2 opacity-0 group-hover:opacity-100 transition-opacity">
                 <span>เปิด</span>
                 <ArrowRight size={14} />
               </div>
@@ -202,18 +202,18 @@ export default function NewDashboard() {
       </div>
 
       {/* System Info */}
-      <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-6">
-        <h2 className="text-lg font-semibold text-emerald-800 mb-2">เกี่ยวกับระบบใหม่</h2>
-        <p className="text-emerald-700">
+      <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-6">
+        <h2 className="text-lg font-semibold text-zinc-200 mb-2">เกี่ยวกับระบบใหม่</h2>
+        <p className="text-zinc-400">
           ระบบใหม่นี้ใช้ฐานข้อมูลแยกต่างหาก (HotelNew) ซึ่งเป็นอิสระจากระบบเดิม
           คุณสามารถใช้งานทั้งสองระบบพร้อมกันได้ โดยข้อมูลจะไม่ส่งผลกระทบต่อกัน
         </p>
-        <ul className="mt-3 space-y-1 text-emerald-700 text-sm">
-          <li>• รองรับการจัดการห้องพัก ประเภทห้อง และราคา</li>
-          <li>• ระบบแม่บ้านและติดตามความสะอาด</li>
-          <li>• ระบบคลังสินค้าและอุปกรณ์</li>
-          <li>• ระบบแจ้งซ่อมบำรุง</li>
-          <li>• รายงานรายได้และวิเคราะห์ข้อมูล</li>
+        <ul className="mt-3 space-y-1 text-zinc-500 text-sm">
+          <li className="flex items-center gap-2"><span className="w-1 h-1 rounded-full bg-red-500"></span>รองรับการจัดการห้องพัก ประเภทห้อง และราคา</li>
+          <li className="flex items-center gap-2"><span className="w-1 h-1 rounded-full bg-red-500"></span>ระบบแม่บ้านและติดตามความสะอาด</li>
+          <li className="flex items-center gap-2"><span className="w-1 h-1 rounded-full bg-red-500"></span>ระบบคลังสินค้าและอุปกรณ์</li>
+          <li className="flex items-center gap-2"><span className="w-1 h-1 rounded-full bg-red-500"></span>ระบบแจ้งซ่อมบำรุง</li>
+          <li className="flex items-center gap-2"><span className="w-1 h-1 rounded-full bg-red-500"></span>รายงานรายได้และวิเคราะห์ข้อมูล</li>
         </ul>
       </div>
     </div>

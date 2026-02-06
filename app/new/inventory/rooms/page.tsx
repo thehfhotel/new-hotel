@@ -113,16 +113,16 @@ export default function RoomInventoryPage() {
   // Get room status color
   const getRoomStatusColor = (room: Room) => {
     if (room.missingItems > 0) {
-      return 'border-orange-300 bg-orange-50'
+      return 'border-amber-500/50 bg-amber-500/10'
     }
     if (room.lastChecked) {
       const lastCheckedDate = new Date(room.lastChecked)
       const daysSinceCheck = Math.floor((Date.now() - lastCheckedDate.getTime()) / (1000 * 60 * 60 * 24))
       if (daysSinceCheck < 1) {
-        return 'border-green-300 bg-green-50'
+        return 'border-emerald-500/50 bg-emerald-500/10'
       }
     }
-    return 'border-gray-200 bg-white'
+    return 'border-zinc-800 bg-zinc-900'
   }
 
   return (
@@ -130,10 +130,10 @@ export default function RoomInventoryPage() {
       {/* Page Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <DoorOpen className="w-8 h-8 text-blue-600" />
+          <DoorOpen className="w-8 h-8 text-red-400" />
           <div>
-            <h1 className="text-2xl font-bold text-gray-800">สินค้าคงคลังตามห้อง</h1>
-            <p className="text-gray-600">
+            <h1 className="text-2xl font-bold text-zinc-200">สินค้าคงคลังตามห้อง</h1>
+            <p className="text-zinc-400">
               ตรวจสอบและจัดการสินค้าในแต่ละห้อง
             </p>
           </div>
@@ -141,22 +141,22 @@ export default function RoomInventoryPage() {
       </div>
 
       {/* Search and Filter Bar */}
-      <div className="bg-white rounded-lg shadow p-4">
+      <div className="bg-zinc-900 rounded-lg border border-zinc-800 p-4">
         <div className="flex flex-col md:flex-row gap-4">
           {/* Search */}
           <div className="relative flex-1">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-zinc-500" />
             <input
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="ค้นหาเลขห้อง..."
-              className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-colors"
+              className="w-full pl-10 pr-4 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
             />
             {searchQuery && (
               <button
                 onClick={() => setSearchQuery('')}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-400"
                 aria-label="ล้างการค้นหา"
               >
                 <X className="w-4 h-4" />
@@ -166,13 +166,13 @@ export default function RoomInventoryPage() {
 
           {/* Filter Buttons */}
           <div className="flex items-center gap-2">
-            <Filter className="w-5 h-5 text-gray-400" />
+            <Filter className="w-5 h-5 text-zinc-500" />
             <button
               onClick={() => setFilterStatus('all')}
               className={`px-3 py-2 text-sm rounded-lg border transition-colors ${
                 filterStatus === 'all'
-                  ? 'border-blue-500 bg-blue-50 text-blue-700'
-                  : 'border-gray-300 text-gray-600 hover:bg-gray-50'
+                  ? 'border-red-500 bg-red-500/10 text-red-400'
+                  : 'border-zinc-700 text-zinc-400 hover:bg-zinc-800'
               }`}
             >
               ทั้งหมด
@@ -181,8 +181,8 @@ export default function RoomInventoryPage() {
               onClick={() => setFilterStatus('missing')}
               className={`px-3 py-2 text-sm rounded-lg border transition-colors ${
                 filterStatus === 'missing'
-                  ? 'border-orange-500 bg-orange-50 text-orange-700'
-                  : 'border-gray-300 text-gray-600 hover:bg-gray-50'
+                  ? 'border-amber-500 bg-amber-500/10 text-amber-400'
+                  : 'border-zinc-700 text-zinc-400 hover:bg-zinc-800'
               }`}
             >
               มีสินค้าขาด
@@ -191,8 +191,8 @@ export default function RoomInventoryPage() {
               onClick={() => setFilterStatus('checked')}
               className={`px-3 py-2 text-sm rounded-lg border transition-colors ${
                 filterStatus === 'checked'
-                  ? 'border-green-500 bg-green-50 text-green-700'
-                  : 'border-gray-300 text-gray-600 hover:bg-gray-50'
+                  ? 'border-emerald-500 bg-emerald-500/10 text-emerald-400'
+                  : 'border-zinc-700 text-zinc-400 hover:bg-zinc-800'
               }`}
             >
               ตรวจแล้ววันนี้
@@ -203,7 +203,7 @@ export default function RoomInventoryPage() {
 
       {/* Error Message */}
       {error && (
-        <div className="flex items-center gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">
+        <div className="flex items-center gap-2 p-4 bg-red-950/50 border border-red-900/50 rounded-lg text-red-400">
           <AlertCircle className="w-5 h-5 flex-shrink-0" />
           <span>{error}</span>
         </div>
@@ -212,12 +212,12 @@ export default function RoomInventoryPage() {
       {/* Room Grid */}
       {loading ? (
         <div className="flex items-center justify-center py-12">
-          <Loader2 className="w-6 h-6 animate-spin text-blue-600" />
-          <span className="ml-2 text-gray-600">กำลังโหลดข้อมูล...</span>
+          <Loader2 className="w-6 h-6 animate-spin text-red-500" />
+          <span className="ml-2 text-zinc-400">กำลังโหลดข้อมูล...</span>
         </div>
       ) : rooms.length === 0 ? (
-        <div className="text-center py-12 text-gray-500 bg-white rounded-lg shadow">
-          <DoorOpen className="w-12 h-12 text-gray-300 mx-auto mb-3" />
+        <div className="text-center py-12 text-zinc-500 bg-zinc-900 rounded-lg border border-zinc-800">
+          <DoorOpen className="w-12 h-12 text-zinc-600 mx-auto mb-3" />
           <p>ไม่พบห้องที่ตรงกับเงื่อนไข</p>
         </div>
       ) : (
@@ -225,32 +225,32 @@ export default function RoomInventoryPage() {
           {rooms.map((room) => (
             <div
               key={room.id}
-              className={`rounded-lg border-2 p-4 transition-all hover:shadow-md cursor-pointer ${getRoomStatusColor(room)}`}
+              className={`rounded-lg border-2 p-4 transition-all hover:border-zinc-700 cursor-pointer ${getRoomStatusColor(room)}`}
               onClick={() => handleOpenChecklist(room)}
             >
               {/* Room Number */}
               <div className="flex items-center justify-between mb-3">
-                <h3 className="text-xl font-bold text-gray-800">{room.roomNumber}</h3>
+                <h3 className="text-xl font-bold text-zinc-200">{room.roomNumber}</h3>
                 {room.missingItems > 0 ? (
-                  <AlertTriangle className="w-5 h-5 text-orange-500" />
+                  <AlertTriangle className="w-5 h-5 text-amber-400" />
                 ) : room.lastChecked ? (
-                  <CheckCircle className="w-5 h-5 text-green-500" />
+                  <CheckCircle className="w-5 h-5 text-emerald-400" />
                 ) : (
-                  <ClipboardCheck className="w-5 h-5 text-gray-400" />
+                  <ClipboardCheck className="w-5 h-5 text-zinc-500" />
                 )}
               </div>
 
               {/* Room Type */}
-              <p className="text-sm text-gray-600 mb-2">{room.roomType}</p>
+              <p className="text-sm text-zinc-400 mb-2">{room.roomType}</p>
 
               {/* Inventory Info */}
               <div className="space-y-1 text-sm">
                 <div className="flex items-center justify-between">
-                  <span className="text-gray-500">สินค้า:</span>
-                  <span className="font-medium">{room.inventoryCount} รายการ</span>
+                  <span className="text-zinc-500">สินค้า:</span>
+                  <span className="font-medium text-zinc-200">{room.inventoryCount} รายการ</span>
                 </div>
                 {room.missingItems > 0 && (
-                  <div className="flex items-center justify-between text-orange-600">
+                  <div className="flex items-center justify-between text-amber-400">
                     <span>ขาด:</span>
                     <span className="font-medium">{room.missingItems} รายการ</span>
                   </div>
@@ -258,8 +258,8 @@ export default function RoomInventoryPage() {
               </div>
 
               {/* Last Checked */}
-              <div className="mt-3 pt-3 border-t border-gray-200">
-                <p className="text-xs text-gray-500">
+              <div className="mt-3 pt-3 border-t border-zinc-800">
+                <p className="text-xs text-zinc-500">
                   ตรวจล่าสุด: {formatDate(room.lastChecked)}
                 </p>
               </div>
@@ -271,7 +271,7 @@ export default function RoomInventoryPage() {
                     e.stopPropagation()
                     handleOpenChecklist(room)
                   }}
-                  className="flex-1 flex items-center justify-center gap-1 px-3 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700 transition-colors"
+                  className="flex-1 flex items-center justify-center gap-1 px-3 py-2 bg-red-600 text-white text-sm rounded-lg hover:bg-red-700 transition-colors"
                 >
                   <ClipboardCheck className="w-4 h-4" />
                   ตรวจสอบ
@@ -283,20 +283,20 @@ export default function RoomInventoryPage() {
       )}
 
       {/* Legend */}
-      <div className="bg-white rounded-lg shadow p-4">
-        <h3 className="font-medium text-gray-800 mb-3">คำอธิบายสัญลักษณ์</h3>
+      <div className="bg-zinc-900 rounded-lg border border-zinc-800 p-4">
+        <h3 className="font-medium text-zinc-200 mb-3">คำอธิบายสัญลักษณ์</h3>
         <div className="flex flex-wrap gap-4">
           <div className="flex items-center gap-2">
-            <div className="w-4 h-4 rounded border-2 border-green-300 bg-green-50" />
-            <span className="text-sm text-gray-600">ตรวจแล้ววันนี้</span>
+            <div className="w-4 h-4 rounded border-2 border-emerald-500/50 bg-emerald-500/10" />
+            <span className="text-sm text-zinc-400">ตรวจแล้ววันนี้</span>
           </div>
           <div className="flex items-center gap-2">
-            <div className="w-4 h-4 rounded border-2 border-orange-300 bg-orange-50" />
-            <span className="text-sm text-gray-600">มีสินค้าขาด</span>
+            <div className="w-4 h-4 rounded border-2 border-amber-500/50 bg-amber-500/10" />
+            <span className="text-sm text-zinc-400">มีสินค้าขาด</span>
           </div>
           <div className="flex items-center gap-2">
-            <div className="w-4 h-4 rounded border-2 border-gray-200 bg-white" />
-            <span className="text-sm text-gray-600">ยังไม่ได้ตรวจ</span>
+            <div className="w-4 h-4 rounded border-2 border-zinc-800 bg-zinc-900" />
+            <span className="text-sm text-zinc-400">ยังไม่ได้ตรวจ</span>
           </div>
         </div>
       </div>

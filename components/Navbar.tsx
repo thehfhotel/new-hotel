@@ -70,7 +70,7 @@ export default function Navbar() {
         <div className="flex items-center shrink-0">
           <Link
             href="/new"
-            className="flex items-center gap-2 px-3 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-lg transition-colors text-sm"
+            className="flex items-center gap-2 px-3 py-2 bg-red-600 hover:bg-red-500 rounded-lg transition-colors text-sm"
             title="สลับไปโหมดใหม่"
           >
             <ArrowLeftRight size={18} />
