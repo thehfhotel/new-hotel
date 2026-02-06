@@ -53,8 +53,8 @@ BEGIN
         [Cust_Type] NVARCHAR(50) NULL,                   -- Customer type (Individual, Corporate, etc.)
         [Cust_VIP] BIT DEFAULT 0,
         [Cust_Blacklist] BIT DEFAULT 0,
-        [Cust_Created_At] DATETIME DEFAULT GETDATE(),
-        [Cust_Updated_At] DATETIME DEFAULT GETDATE(),
+        [Created_At] DATETIME DEFAULT GETDATE(),
+        [Updated_At] DATETIME DEFAULT GETDATE(),
         [Cust_Created_By] NVARCHAR(50) NULL,
         [Cust_Updated_By] NVARCHAR(50) NULL,
         [Cust_Active] BIT DEFAULT 1
@@ -101,11 +101,12 @@ BEGIN
         [Room_View] NVARCHAR(50) NULL,
         [Room_Status] NVARCHAR(20) DEFAULT 'available',
         [Room_Clean] BIT DEFAULT 1,                      -- Room cleanliness status
+        [Room_Maintenance] BIT DEFAULT 0,                -- Room maintenance status
         [Room_Notes] NVARCHAR(500) NULL,
         [Room_Features] NVARCHAR(MAX) NULL,
         [Room_Active] BIT DEFAULT 1,
-        [Room_Created_At] DATETIME DEFAULT GETDATE(),
-        [Room_Updated_At] DATETIME DEFAULT GETDATE(),
+        [Created_At] DATETIME DEFAULT GETDATE(),
+        [Updated_At] DATETIME DEFAULT GETDATE(),
 
         CONSTRAINT FK_HT_Rooms_Type FOREIGN KEY ([Room_Type_ID])
             REFERENCES [dbo].[HT_Room_Types]([Type_ID])
@@ -132,7 +133,7 @@ BEGIN
         [Book_Status] NVARCHAR(20) DEFAULT 'confirmed',
         [Book_Source] NVARCHAR(50) NULL,
         [Book_Channel] NVARCHAR(50) NULL,
-        [Book_Total_Price] DECIMAL(12,2) DEFAULT 0,
+        [Book_Total_Amount] DECIMAL(12,2) DEFAULT 0,
         [Book_Deposit] DECIMAL(12,2) DEFAULT 0,
         [Book_Deposit_Date] DATETIME NULL,
         [Book_Special_Requests] NVARCHAR(MAX) NULL,
@@ -505,6 +506,134 @@ GO
 IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Rooms_New]') AND name = 'Room_Clean')
 BEGIN
     ALTER TABLE [dbo].[HT_Rooms_New] ADD [Room_Clean] BIT DEFAULT 1;
+END
+GO
+
+-- =============================================================================
+-- Column Renames (backend expects Created_At/Updated_At without table prefix)
+-- =============================================================================
+
+-- HT_Customers: Rename Cust_Created_At -> Created_At, Cust_Updated_At -> Updated_At
+IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Customers]') AND name = 'Cust_Created_At')
+    AND NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Customers]') AND name = 'Created_At')
+BEGIN
+    EXEC sp_rename 'HT_Customers.Cust_Created_At', 'Created_At', 'COLUMN';
+END
+GO
+
+IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Customers]') AND name = 'Cust_Updated_At')
+    AND NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Customers]') AND name = 'Updated_At')
+BEGIN
+    EXEC sp_rename 'HT_Customers.Cust_Updated_At', 'Updated_At', 'COLUMN';
+END
+GO
+
+-- HT_Rooms_New: Rename Room_Created_At -> Created_At, Room_Updated_At -> Updated_At
+IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Rooms_New]') AND name = 'Room_Created_At')
+    AND NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Rooms_New]') AND name = 'Created_At')
+BEGIN
+    EXEC sp_rename 'HT_Rooms_New.Room_Created_At', 'Created_At', 'COLUMN';
+END
+GO
+
+IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Rooms_New]') AND name = 'Room_Updated_At')
+    AND NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Rooms_New]') AND name = 'Updated_At')
+BEGIN
+    EXEC sp_rename 'HT_Rooms_New.Room_Updated_At', 'Updated_At', 'COLUMN';
+END
+GO
+
+-- Add Room_Maintenance column if it doesn't exist
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Rooms_New]') AND name = 'Room_Maintenance')
+BEGIN
+    ALTER TABLE [dbo].[HT_Rooms_New] ADD [Room_Maintenance] BIT DEFAULT 0;
+END
+GO
+
+-- HT_Bookings: Rename Book_Total_Price -> Book_Total_Amount
+IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Bookings]') AND name = 'Book_Total_Price')
+    AND NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Bookings]') AND name = 'Book_Total_Amount')
+BEGIN
+    EXEC sp_rename 'HT_Bookings.Book_Total_Price', 'Book_Total_Amount', 'COLUMN';
+END
+GO
+
+-- HT_Bookings: Rename Book_Deposit -> Book_Deposit_Amount
+IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Bookings]') AND name = 'Book_Deposit')
+    AND NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Bookings]') AND name = 'Book_Deposit_Amount')
+BEGIN
+    EXEC sp_rename 'HT_Bookings.Book_Deposit', 'Book_Deposit_Amount', 'COLUMN';
+END
+GO
+
+-- HT_Bookings: Add Book_Notes if it doesn't exist
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Bookings]') AND name = 'Book_Notes')
+BEGIN
+    ALTER TABLE [dbo].[HT_Bookings] ADD [Book_Notes] NVARCHAR(MAX) NULL;
+END
+GO
+
+-- HT_Bookings: Rename timestamp columns
+IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Bookings]') AND name = 'Book_Created_At')
+    AND NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Bookings]') AND name = 'Created_At')
+BEGIN
+    EXEC sp_rename 'HT_Bookings.Book_Created_At', 'Created_At', 'COLUMN';
+END
+GO
+
+IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Bookings]') AND name = 'Book_Updated_At')
+    AND NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Bookings]') AND name = 'Updated_At')
+BEGIN
+    EXEC sp_rename 'HT_Bookings.Book_Updated_At', 'Updated_At', 'COLUMN';
+END
+GO
+
+-- HT_Rooms_New: Add pricing columns
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Rooms_New]') AND name = 'Room_Price_Weekday')
+BEGIN
+    ALTER TABLE [dbo].[HT_Rooms_New] ADD [Room_Price_Weekday] DECIMAL(10,2) NULL;
+END
+GO
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Rooms_New]') AND name = 'Room_Price_Weekend')
+BEGIN
+    ALTER TABLE [dbo].[HT_Rooms_New] ADD [Room_Price_Weekend] DECIMAL(10,2) NULL;
+END
+GO
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Rooms_New]') AND name = 'Room_Price_Special')
+BEGIN
+    ALTER TABLE [dbo].[HT_Rooms_New] ADD [Room_Price_Special] DECIMAL(10,2) NULL;
+END
+GO
+
+-- HT_CheckIns: Rename Cin_Expected_Out -> Cin_Expected_Checkout
+IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_CheckIns]') AND name = 'Cin_Expected_Out')
+    AND NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_CheckIns]') AND name = 'Cin_Expected_Checkout')
+BEGIN
+    EXEC sp_rename 'HT_CheckIns.Cin_Expected_Out', 'Cin_Expected_Checkout', 'COLUMN';
+END
+GO
+
+-- HT_CheckIns: Rename timestamp columns
+IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_CheckIns]') AND name = 'Cin_Created_At')
+    AND NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_CheckIns]') AND name = 'Created_At')
+BEGIN
+    EXEC sp_rename 'HT_CheckIns.Cin_Created_At', 'Created_At', 'COLUMN';
+END
+GO
+
+IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_CheckIns]') AND name = 'Cin_Updated_At')
+    AND NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_CheckIns]') AND name = 'Updated_At')
+BEGIN
+    EXEC sp_rename 'HT_CheckIns.Cin_Updated_At', 'Updated_At', 'COLUMN';
+END
+GO
+
+-- HT_CheckIns: Add Cin_Payment_Status if it doesn't exist
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_CheckIns]') AND name = 'Cin_Payment_Status')
+BEGIN
+    ALTER TABLE [dbo].[HT_CheckIns] ADD [Cin_Payment_Status] NVARCHAR(50) NULL;
 END
 GO
 
