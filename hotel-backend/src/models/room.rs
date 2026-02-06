@@ -1,6 +1,6 @@
 //! Room models
 
-use chrono::NaiveDateTime;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 /// Room data from HT_Rooms table
@@ -45,8 +45,8 @@ pub struct RoomsResponse {
 #[serde(rename_all = "camelCase")]
 pub struct CurrentGuest {
     pub name: Option<String>,
-    pub check_in: Option<NaiveDateTime>,
-    pub check_out: Option<NaiveDateTime>,
+    pub check_in: Option<DateTime<Utc>>,
+    pub check_out: Option<DateTime<Utc>>,
 }
 
 /// Detailed room information with current guest
@@ -77,7 +77,7 @@ pub struct RoomDetail {
     #[serde(rename = "Room_Book_Name")]
     pub room_book_name: Option<String>,
     #[serde(rename = "Room_Book_Time")]
-    pub room_book_time: Option<NaiveDateTime>,
+    pub room_book_time: Option<DateTime<Utc>>,
     #[serde(rename = "currentGuest")]
     pub current_guest: Option<CurrentGuest>,
 }
@@ -93,7 +93,7 @@ pub struct RoomDetailResponse {
 #[derive(Debug, Serialize)]
 pub struct RoomStatus {
     pub room_no: String,
-    pub room_date: Option<NaiveDateTime>,
+    pub room_date: Option<DateTime<Utc>>,
     pub room_status: Option<String>,
     pub room_details: Option<String>,
     pub room_checkin_no: Option<String>,
