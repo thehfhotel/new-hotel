@@ -5,9 +5,6 @@ import { Clock, LogIn } from 'lucide-react'
 import StatsCard from '@/components/StatsCard'
 import RoomGrid, { Room, RoomStatus } from '@/components/RoomGrid'
 import { OccupancyChart, OccupancyData } from '@/components/Charts'
-import { useMode } from '@/contexts/ModeContext'
-import QuickCheckInModal from '@/components/modals/QuickCheckInModal'
-import CheckOutModal from '@/components/modals/CheckOutModal'
 
 interface Stats {
   totalRooms: number
@@ -47,51 +44,6 @@ interface ApiCheckIn {
   Cin_status: string
 }
 
-// New mode API types
-interface NewRoom {
-  id: number
-  roomNo: string
-  roomTypeName: string | null
-  floor: number | null
-  status: string
-  isClean: boolean
-  isMaintenance: boolean
-}
-
-interface NewCheckIn {
-  id: number
-  cinNo: string
-  customerId: number
-  customerName: string | null
-  roomId: number
-  roomNo: string | null
-  checkInTime: string | null
-  expectedCheckout: string | null
-  ratePerNight: number | null
-  status: string
-}
-
-// Room info for modals
-interface ModalRoom {
-  id: number
-  roomNumber: string
-  type: string
-  details?: string
-}
-
-interface CheckInDetails {
-  id: number
-  cinNo: string
-  customerId: number
-  customerName: string | null
-  roomId: number
-  roomNo: string | null
-  checkInTime: string | null
-  expectedCheckout: string | null
-  ratePerNight: number | null
-  status: string
-}
-
 // Function to determine room status from API data
 function getRoomStatus(room: ApiRoom, isCheckoutToday: boolean): RoomStatus {
   // Check if it's past 6 AM and room has checkout today
@@ -106,8 +58,6 @@ function getRoomStatus(room: ApiRoom, isCheckoutToday: boolean): RoomStatus {
 }
 
 export default function Dashboard() {
-  const { isNew } = useMode()
-
   const [stats, setStats] = useState<Stats>({
     totalRooms: 0,
     occupiedRooms: 0,
@@ -120,102 +70,6 @@ export default function Dashboard() {
   const [checkIns, setCheckIns] = useState<CheckIn[]>([])
   const [occupancyData, setOccupancyData] = useState<OccupancyData[]>([])
   const [loading, setLoading] = useState(true)
-
-  // New mode specific state
-  const [newRooms, setNewRooms] = useState<NewRoom[]>([])
-  const [activeCheckIns, setActiveCheckIns] = useState<Map<number, NewCheckIn>>(new Map())
-
-  // Modal state
-  const [showCheckInModal, setShowCheckInModal] = useState(false)
-  const [showCheckOutModal, setShowCheckOutModal] = useState(false)
-  const [selectedRoomForModal, setSelectedRoomForModal] = useState<ModalRoom | null>(null)
-  const [selectedCheckIn, setSelectedCheckIn] = useState<CheckInDetails | null>(null)
-
-  // Fetch new mode data (rooms and active check-ins)
-  const fetchNewModeData = useCallback(async () => {
-    try {
-      // Fetch new rooms
-      const roomsRes = await fetch('/api/new/rooms?limit=100')
-      if (roomsRes.ok) {
-        const data = await roomsRes.json()
-        if (data.success) {
-          setNewRooms(data.data)
-        }
-      }
-
-      // Fetch active check-ins to map rooms to check-ins
-      const checkInsRes = await fetch('/api/new/checkins?status=active&limit=100')
-      if (checkInsRes.ok) {
-        const data = await checkInsRes.json()
-        if (data.success) {
-          // Create a map of roomId -> checkIn
-          const checkInMap = new Map<number, NewCheckIn>()
-          data.data.forEach((checkIn: NewCheckIn) => {
-            checkInMap.set(checkIn.roomId, checkIn)
-          })
-          setActiveCheckIns(checkInMap)
-        }
-      }
-    } catch (error) {
-      console.error('Error fetching new mode data:', error)
-    }
-  }, [])
-
-  // Get room status for new mode
-  const getNewRoomStatus = (room: NewRoom): RoomStatus => {
-    if (room.isMaintenance) return 'maintenance'
-    if (room.status === 'occupied') return 'occupied'
-    if (room.status === 'booked') return 'booked'
-    if (!room.isClean) return 'cleaning'
-    return 'available'
-  }
-
-  // Handle quick check-in for new mode
-  const handleQuickCheckIn = (room: Room) => {
-    // Find the new room by room number
-    const newRoom = newRooms.find(r => r.roomNo === room.roomNumber)
-    if (newRoom) {
-      setSelectedRoomForModal({
-        id: newRoom.id,
-        roomNumber: newRoom.roomNo,
-        type: newRoom.roomTypeName || 'ไม่ระบุ',
-      })
-      setShowCheckInModal(true)
-    }
-  }
-
-  // Handle check-out for new mode
-  const handleCheckOut = (room: Room) => {
-    // Find the new room by room number
-    const newRoom = newRooms.find(r => r.roomNo === room.roomNumber)
-    if (newRoom) {
-      // Find the active check-in for this room
-      const checkIn = activeCheckIns.get(newRoom.id)
-      if (checkIn) {
-        setSelectedCheckIn({
-          id: checkIn.id,
-          cinNo: checkIn.cinNo,
-          customerId: checkIn.customerId,
-          customerName: checkIn.customerName,
-          roomId: checkIn.roomId,
-          roomNo: checkIn.roomNo,
-          checkInTime: checkIn.checkInTime,
-          expectedCheckout: checkIn.expectedCheckout,
-          ratePerNight: checkIn.ratePerNight,
-          status: checkIn.status,
-        })
-        setShowCheckOutModal(true)
-      }
-    }
-  }
-
-  // Handle modal success (refresh data)
-  const handleModalSuccess = () => {
-    fetchNewModeData()
-    // Also refresh legacy data
-    setLoading(true)
-    fetchData()
-  }
 
   const fetchData = useCallback(async () => {
     try {
@@ -319,25 +173,6 @@ export default function Dashboard() {
     fetchData()
   }, [fetchData])
 
-  // Fetch new mode data when mode changes
-  useEffect(() => {
-    if (isNew) {
-      fetchNewModeData()
-    }
-  }, [isNew, fetchNewModeData])
-
-  // Combine rooms for new mode display
-  const displayRooms: Room[] = isNew && newRooms.length > 0
-    ? newRooms.map((room) => ({
-        id: room.id,
-        roomNumber: room.roomNo,
-        type: room.roomTypeName || 'ไม่ระบุ',
-        status: getNewRoomStatus(room),
-        newRoomId: room.id,
-        checkInId: activeCheckIns.get(room.id)?.id,
-      }))
-    : rooms
-
   if (loading) {
     return (
       <div className="flex items-center justify-center min-h-[50vh]">
@@ -383,20 +218,8 @@ export default function Dashboard() {
 
       {/* Room Grid */}
       <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-lg font-semibold text-gray-800">สถานะห้องพัก</h2>
-          {isNew && (
-            <span className="text-xs bg-green-100 text-green-700 px-2 py-1 rounded-full">
-              โหมดใหม่ - คลิกห้องเพื่อเช็คอิน/เช็คเอาท์
-            </span>
-          )}
-        </div>
-        <RoomGrid
-          rooms={displayRooms}
-          isNewMode={isNew}
-          onQuickCheckIn={handleQuickCheckIn}
-          onCheckOut={handleCheckOut}
-        />
+        <h2 className="text-lg font-semibold text-gray-800 mb-4">สถานะห้องพัก</h2>
+        <RoomGrid rooms={rooms} />
       </div>
 
       {/* Charts and Recent Activity */}
@@ -468,30 +291,6 @@ export default function Dashboard() {
           </div>
         </div>
       </div>
-
-      {/* Quick Check-In Modal */}
-      {selectedRoomForModal && (
-        <QuickCheckInModal
-          isOpen={showCheckInModal}
-          onClose={() => {
-            setShowCheckInModal(false)
-            setSelectedRoomForModal(null)
-          }}
-          room={selectedRoomForModal}
-          onSuccess={handleModalSuccess}
-        />
-      )}
-
-      {/* Check-Out Modal */}
-      <CheckOutModal
-        isOpen={showCheckOutModal}
-        onClose={() => {
-          setShowCheckOutModal(false)
-          setSelectedCheckIn(null)
-        }}
-        checkIn={selectedCheckIn}
-        onSuccess={handleModalSuccess}
-      />
     </div>
   )
 }
