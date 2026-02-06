@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - PostgreSQL auto-initializes from `/docker-entrypoint-initdb.d/` (no manual init needed)
 - **Updated CI/CD pipeline for PostgreSQL** - Removed `sqlcmd` database initialization step (PostgreSQL auto-initializes)
 - **Updated documentation for PostgreSQL migration** - `.env.example`, `hotel-backend/README.md`, `migrations/README.md`
+- **Bumped Rust Docker image from 1.83 to 1.85** - Required by `base64ct` crate needing Rust edition 2024
 
 ## [2.12.0] - 2026-02-07
 
