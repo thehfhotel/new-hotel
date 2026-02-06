@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.13.1] - 2026-02-07
+
+### Fixed
+- **Backend crash-loop due to PostgreSQL port mismatch** - PostgreSQL container was listening on default port 5432 while backend expected port 5439 (`NEW_DB_PORT=5439`). Added `PGPORT=5439` environment variable to `newdb` service and updated healthcheck to use `-p 5439`. This caused ALL APIs (legacy + new) to fail since the backend couldn't start.
+- **StatsCard dark theme on legacy page** - Reverted `StatsCard.tsx` from dark theme colors (`bg-zinc-900`, `text-zinc-100`) back to light theme (`bg-white`, `text-gray-900`). The component is only used by the legacy light-themed dashboard and was accidentally changed during v2.12.0 dark theme redesign.
+
+### Added
+- **StatsCard regression test** (`__tests__/components/StatsCard.test.tsx`) - 8 tests verifying rendering, light theme colors, and subtitle behavior
+- **Legacy Dashboard regression test** (`__tests__/components/LegacyDashboard.test.tsx`) - 9 tests covering loading state, stats cards, room grid, occupancy chart, recent activity, empty states, and API error handling
+- **Playwright E2E test setup** - End-to-end testing framework for the legacy dashboard
+  - `playwright.config.ts` - Chromium-only config targeting localhost:3003
+  - `e2e/legacy-dashboard.spec.ts` - 4 E2E tests: page load, stats cards, room grid, navigation
+  - `test:e2e` script in package.json
+
 ## [2.13.0] - 2026-02-07
 
 ### Changed
