@@ -1,743 +1,478 @@
 -- =============================================================================
--- HotelNew Database Initialization Script
+-- HotelNew Database Initialization Script (PostgreSQL)
 -- =============================================================================
--- This script creates the HotelNew database and all required tables.
--- It combines migrations 002, 003, and 004 into a single bootstrap script.
+-- This script creates all required tables for the HotelNew database.
+-- It runs automatically when the PostgreSQL container starts for the first time
+-- via docker-entrypoint-initdb.d volume mount.
 --
--- Usage: This script runs automatically when the SQL Server container starts
--- for the first time (via docker-entrypoint-initdb.d volume mount).
---
--- Note: SQL Server's Docker image doesn't auto-run scripts from initdb.d.
--- You need to run this manually on first deploy:
---   docker exec -it new-hotel-db /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "NewHotel@2026!" -C -i /docker-entrypoint-initdb.d/init-hotelnew.sql
+-- PostgreSQL auto-runs .sql files from /docker-entrypoint-initdb.d/ on first startup.
+-- The POSTGRES_DB env var creates the database; this script just creates tables.
 -- =============================================================================
 
--- Create database if not exists
-IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = N'HotelNew')
-BEGIN
-    CREATE DATABASE HotelNew;
-END
-GO
-
-USE HotelNew;
-GO
-
--- Required for tables with computed columns and indexes
-SET QUOTED_IDENTIFIER ON;
-SET ANSI_NULLS ON;
-GO
-
 -- =============================================================================
--- Migration 002: Core Tables
+-- Core Tables
 -- =============================================================================
 
--- HT_Booking_Notes - Booking annotations (stored in HotelNew to keep legacy DB read-only)
--- Notes are linked to legacy booking numbers (Book_No) but stored here
-IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[HT_Booking_Notes]') AND type = 'U')
-BEGIN
-    CREATE TABLE [dbo].[HT_Booking_Notes] (
-        [Note_ID] INT IDENTITY(1,1) PRIMARY KEY,
-        [Book_No] NVARCHAR(50) NOT NULL,
-        [Note_Text] NVARCHAR(MAX) NOT NULL,
-        [Created_At] DATETIME DEFAULT GETDATE(),
-        [Updated_At] DATETIME DEFAULT GETDATE()
-    )
-    CREATE INDEX IX_Booking_Notes_BookNo ON [dbo].[HT_Booking_Notes]([Book_No])
-END
-GO
+-- ht_booking_notes - Booking annotations (stored in HotelNew to keep legacy DB read-only)
+-- Notes are linked to legacy booking numbers (book_no) but stored here
+CREATE TABLE IF NOT EXISTS ht_booking_notes (
+    note_id SERIAL PRIMARY KEY,
+    book_no VARCHAR(50) NOT NULL,
+    note_text TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS ix_booking_notes_bookno ON ht_booking_notes(book_no);
 
--- HT_Customers - Customer master data
-IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[HT_Customers]') AND type = 'U')
-BEGIN
-    CREATE TABLE [dbo].[HT_Customers] (
-        [Cust_ID] INT IDENTITY(1,1) PRIMARY KEY,
-        [Cust_Code] NVARCHAR(20) NULL,
-        [Cust_Title] NVARCHAR(20) NULL,
-        [Cust_FirstName] NVARCHAR(100) NOT NULL,
-        [Cust_LastName] NVARCHAR(100) NULL,
-        [Cust_NickName] NVARCHAR(50) NULL,
-        [Cust_IDCard] NVARCHAR(20) NULL,
-        [Cust_Passport] NVARCHAR(50) NULL,
-        [Cust_Nationality] NVARCHAR(50) NULL,
-        [Cust_Phone] NVARCHAR(20) NULL,
-        [Cust_Email] NVARCHAR(100) NULL,
-        [Cust_Address] NVARCHAR(500) NULL,
-        [Cust_Company] NVARCHAR(200) NULL,
-        [Cust_TaxID] NVARCHAR(20) NULL,
-        [Cust_Notes] NVARCHAR(MAX) NULL,
-        [Cust_Type] NVARCHAR(50) NULL,                   -- Customer type (Individual, Corporate, etc.)
-        [Cust_VIP] BIT DEFAULT 0,
-        [Cust_Blacklist] BIT DEFAULT 0,
-        [Created_At] DATETIME DEFAULT GETDATE(),
-        [Updated_At] DATETIME DEFAULT GETDATE(),
-        [Cust_Created_By] NVARCHAR(50) NULL,
-        [Cust_Updated_By] NVARCHAR(50) NULL,
-        [Cust_Active] BIT DEFAULT 1
-    )
+-- ht_customers - Customer master data
+CREATE TABLE IF NOT EXISTS ht_customers (
+    cust_id SERIAL PRIMARY KEY,
+    cust_code VARCHAR(20),
+    cust_title VARCHAR(20),
+    cust_firstname VARCHAR(100) NOT NULL,
+    cust_lastname VARCHAR(100),
+    cust_nickname VARCHAR(50),
+    cust_idcard VARCHAR(20),
+    cust_passport VARCHAR(50),
+    cust_nationality VARCHAR(50),
+    cust_phone VARCHAR(20),
+    cust_email VARCHAR(100),
+    cust_address VARCHAR(500),
+    cust_company VARCHAR(200),
+    cust_taxid VARCHAR(20),
+    cust_notes TEXT,
+    cust_type VARCHAR(50),
+    cust_vip BOOLEAN DEFAULT false,
+    cust_blacklist BOOLEAN DEFAULT false,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW(),
+    cust_created_by VARCHAR(50),
+    cust_updated_by VARCHAR(50),
+    cust_active BOOLEAN DEFAULT true
+);
+CREATE INDEX IF NOT EXISTS ix_ht_customers_name ON ht_customers(cust_firstname, cust_lastname);
+CREATE INDEX IF NOT EXISTS ix_ht_customers_phone ON ht_customers(cust_phone);
+CREATE INDEX IF NOT EXISTS ix_ht_customers_idcard ON ht_customers(cust_idcard);
+CREATE INDEX IF NOT EXISTS ix_ht_customers_passport ON ht_customers(cust_passport);
 
-    CREATE INDEX IX_HT_Customers_Name ON [dbo].[HT_Customers] ([Cust_FirstName], [Cust_LastName])
-    CREATE INDEX IX_HT_Customers_Phone ON [dbo].[HT_Customers] ([Cust_Phone])
-    CREATE INDEX IX_HT_Customers_IDCard ON [dbo].[HT_Customers] ([Cust_IDCard])
-    CREATE INDEX IX_HT_Customers_Passport ON [dbo].[HT_Customers] ([Cust_Passport])
-END
-GO
+-- ht_room_types - Room type definitions
+CREATE TABLE IF NOT EXISTS ht_room_types (
+    type_id SERIAL PRIMARY KEY,
+    type_code VARCHAR(20) NOT NULL UNIQUE,
+    type_name VARCHAR(100) NOT NULL,
+    type_name_en VARCHAR(100),
+    type_description VARCHAR(500),
+    type_base_price DECIMAL(10,2) DEFAULT 0,
+    type_max_guests INTEGER DEFAULT 2,
+    type_bed_type VARCHAR(50),
+    type_size_sqm DECIMAL(6,2),
+    type_amenities TEXT,
+    type_sort_order INTEGER DEFAULT 0,
+    type_active BOOLEAN DEFAULT true,
+    type_created_at TIMESTAMP DEFAULT NOW(),
+    type_updated_at TIMESTAMP DEFAULT NOW()
+);
 
--- HT_Room_Types - Room type definitions
-IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[HT_Room_Types]') AND type = 'U')
-BEGIN
-    CREATE TABLE [dbo].[HT_Room_Types] (
-        [Type_ID] INT IDENTITY(1,1) PRIMARY KEY,
-        [Type_Code] NVARCHAR(20) NOT NULL UNIQUE,
-        [Type_Name] NVARCHAR(100) NOT NULL,
-        [Type_Name_En] NVARCHAR(100) NULL,
-        [Type_Description] NVARCHAR(500) NULL,
-        [Type_Base_Price] DECIMAL(10,2) DEFAULT 0,
-        [Type_Max_Guests] INT DEFAULT 2,
-        [Type_Bed_Type] NVARCHAR(50) NULL,
-        [Type_Size_SQM] DECIMAL(6,2) NULL,
-        [Type_Amenities] NVARCHAR(MAX) NULL,
-        [Type_Sort_Order] INT DEFAULT 0,
-        [Type_Active] BIT DEFAULT 1,
-        [Type_Created_At] DATETIME DEFAULT GETDATE(),
-        [Type_Updated_At] DATETIME DEFAULT GETDATE()
-    )
-END
-GO
+-- ht_rooms_new - Room inventory
+CREATE TABLE IF NOT EXISTS ht_rooms_new (
+    room_id SERIAL PRIMARY KEY,
+    room_no VARCHAR(10) NOT NULL UNIQUE,
+    room_type_id INTEGER,
+    room_floor INTEGER,
+    room_building VARCHAR(50),
+    room_view VARCHAR(50),
+    room_status VARCHAR(20) DEFAULT 'available',
+    room_clean BOOLEAN DEFAULT true,
+    room_maintenance BOOLEAN DEFAULT false,
+    room_notes VARCHAR(500),
+    room_features TEXT,
+    room_active BOOLEAN DEFAULT true,
+    room_price_weekday DECIMAL(10,2),
+    room_price_weekend DECIMAL(10,2),
+    room_price_special DECIMAL(10,2),
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW(),
 
--- HT_Rooms_New - Room inventory
-IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[HT_Rooms_New]') AND type = 'U')
-BEGIN
-    CREATE TABLE [dbo].[HT_Rooms_New] (
-        [Room_ID] INT IDENTITY(1,1) PRIMARY KEY,
-        [Room_No] NVARCHAR(10) NOT NULL UNIQUE,
-        [Room_Type_ID] INT NULL,
-        [Room_Floor] NVARCHAR(10) NULL,
-        [Room_Building] NVARCHAR(50) NULL,
-        [Room_View] NVARCHAR(50) NULL,
-        [Room_Status] NVARCHAR(20) DEFAULT 'available',
-        [Room_Clean] BIT DEFAULT 1,                      -- Room cleanliness status
-        [Room_Maintenance] BIT DEFAULT 0,                -- Room maintenance status
-        [Room_Notes] NVARCHAR(500) NULL,
-        [Room_Features] NVARCHAR(MAX) NULL,
-        [Room_Active] BIT DEFAULT 1,
-        [Created_At] DATETIME DEFAULT GETDATE(),
-        [Updated_At] DATETIME DEFAULT GETDATE(),
+    CONSTRAINT fk_ht_rooms_type FOREIGN KEY (room_type_id)
+        REFERENCES ht_room_types(type_id)
+);
+CREATE INDEX IF NOT EXISTS ix_ht_rooms_status ON ht_rooms_new(room_status);
+CREATE INDEX IF NOT EXISTS ix_ht_rooms_type ON ht_rooms_new(room_type_id);
 
-        CONSTRAINT FK_HT_Rooms_Type FOREIGN KEY ([Room_Type_ID])
-            REFERENCES [dbo].[HT_Room_Types]([Type_ID])
-    )
+-- ht_bookings - Booking records
+CREATE TABLE IF NOT EXISTS ht_bookings (
+    book_id SERIAL PRIMARY KEY,
+    book_no VARCHAR(20) NOT NULL UNIQUE,
+    book_date TIMESTAMP DEFAULT NOW(),
+    book_cust_id INTEGER NOT NULL,
+    book_checkin DATE NOT NULL,
+    book_checkout DATE NOT NULL,
+    book_adults INTEGER DEFAULT 1,
+    book_children INTEGER DEFAULT 0,
+    book_nights INTEGER GENERATED ALWAYS AS (book_checkout - book_checkin) STORED,
+    book_status VARCHAR(20) DEFAULT 'confirmed',
+    book_source VARCHAR(50),
+    book_channel VARCHAR(50),
+    book_total_amount DECIMAL(12,2) DEFAULT 0,
+    book_deposit_amount DECIMAL(12,2) DEFAULT 0,
+    book_deposit_date TIMESTAMP,
+    book_special_requests TEXT,
+    book_internal_notes TEXT,
+    book_notes TEXT,
+    book_cancelled_at TIMESTAMP,
+    book_cancel_reason VARCHAR(500),
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW(),
+    book_created_by VARCHAR(50),
+    book_updated_by VARCHAR(50),
 
-    CREATE INDEX IX_HT_Rooms_Status ON [dbo].[HT_Rooms_New] ([Room_Status])
-    CREATE INDEX IX_HT_Rooms_Type ON [dbo].[HT_Rooms_New] ([Room_Type_ID])
-END
-GO
+    CONSTRAINT fk_ht_bookings_customer FOREIGN KEY (book_cust_id)
+        REFERENCES ht_customers(cust_id),
+    CONSTRAINT ck_ht_bookings_dates CHECK (book_checkout > book_checkin)
+);
+CREATE INDEX IF NOT EXISTS ix_ht_bookings_customer ON ht_bookings(book_cust_id);
+CREATE INDEX IF NOT EXISTS ix_ht_bookings_checkin ON ht_bookings(book_checkin);
+CREATE INDEX IF NOT EXISTS ix_ht_bookings_checkout ON ht_bookings(book_checkout);
+CREATE INDEX IF NOT EXISTS ix_ht_bookings_status ON ht_bookings(book_status);
+CREATE INDEX IF NOT EXISTS ix_ht_bookings_daterange ON ht_bookings(book_checkin, book_checkout);
 
--- HT_Bookings - Booking records
-IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[HT_Bookings]') AND type = 'U')
-BEGIN
-    CREATE TABLE [dbo].[HT_Bookings] (
-        [Book_ID] INT IDENTITY(1,1) PRIMARY KEY,
-        [Book_No] NVARCHAR(20) NOT NULL UNIQUE,
-        [Book_Date] DATETIME DEFAULT GETDATE(),
-        [Book_Cust_ID] INT NOT NULL,
-        [Book_CheckIn] DATE NOT NULL,
-        [Book_CheckOut] DATE NOT NULL,
-        [Book_Adults] INT DEFAULT 1,
-        [Book_Children] INT DEFAULT 0,
-        [Book_Nights] AS DATEDIFF(DAY, [Book_CheckIn], [Book_CheckOut]) PERSISTED,
-        [Book_Status] NVARCHAR(20) DEFAULT 'confirmed',
-        [Book_Source] NVARCHAR(50) NULL,
-        [Book_Channel] NVARCHAR(50) NULL,
-        [Book_Total_Amount] DECIMAL(12,2) DEFAULT 0,
-        [Book_Deposit] DECIMAL(12,2) DEFAULT 0,
-        [Book_Deposit_Date] DATETIME NULL,
-        [Book_Special_Requests] NVARCHAR(MAX) NULL,
-        [Book_Internal_Notes] NVARCHAR(MAX) NULL,
-        [Book_Cancelled_At] DATETIME NULL,
-        [Book_Cancel_Reason] NVARCHAR(500) NULL,
-        [Book_Created_At] DATETIME DEFAULT GETDATE(),
-        [Book_Updated_At] DATETIME DEFAULT GETDATE(),
-        [Book_Created_By] NVARCHAR(50) NULL,
-        [Book_Updated_By] NVARCHAR(50) NULL,
+-- ht_booking_rooms - Junction table for booking-room assignments
+CREATE TABLE IF NOT EXISTS ht_booking_rooms (
+    br_id SERIAL PRIMARY KEY,
+    br_book_id INTEGER NOT NULL,
+    br_room_id INTEGER NOT NULL,
+    br_room_type_id INTEGER,
+    br_price_per_night DECIMAL(10,2) DEFAULT 0,
+    br_assigned_at TIMESTAMP,
+    br_notes VARCHAR(500),
 
-        CONSTRAINT FK_HT_Bookings_Customer FOREIGN KEY ([Book_Cust_ID])
-            REFERENCES [dbo].[HT_Customers]([Cust_ID]),
-        CONSTRAINT CK_HT_Bookings_Dates CHECK ([Book_CheckOut] > [Book_CheckIn])
-    )
+    CONSTRAINT fk_ht_br_booking FOREIGN KEY (br_book_id)
+        REFERENCES ht_bookings(book_id) ON DELETE CASCADE,
+    CONSTRAINT fk_ht_br_room FOREIGN KEY (br_room_id)
+        REFERENCES ht_rooms_new(room_id),
+    CONSTRAINT fk_ht_br_roomtype FOREIGN KEY (br_room_type_id)
+        REFERENCES ht_room_types(type_id),
+    CONSTRAINT uq_ht_br_bookroom UNIQUE (br_book_id, br_room_id)
+);
+CREATE INDEX IF NOT EXISTS ix_ht_br_room ON ht_booking_rooms(br_room_id);
 
-    CREATE INDEX IX_HT_Bookings_Customer ON [dbo].[HT_Bookings] ([Book_Cust_ID])
-    CREATE INDEX IX_HT_Bookings_CheckIn ON [dbo].[HT_Bookings] ([Book_CheckIn])
-    CREATE INDEX IX_HT_Bookings_CheckOut ON [dbo].[HT_Bookings] ([Book_CheckOut])
-    CREATE INDEX IX_HT_Bookings_Status ON [dbo].[HT_Bookings] ([Book_Status])
-    CREATE INDEX IX_HT_Bookings_DateRange ON [dbo].[HT_Bookings] ([Book_CheckIn], [Book_CheckOut])
-END
-GO
+-- ht_checkins - Check-in records
+CREATE TABLE IF NOT EXISTS ht_checkins (
+    cin_id SERIAL PRIMARY KEY,
+    cin_no VARCHAR(20) NOT NULL UNIQUE,
+    cin_book_id INTEGER,
+    cin_cust_id INTEGER NOT NULL,
+    cin_room_id INTEGER NOT NULL,
+    cin_checkin_time TIMESTAMP NOT NULL,
+    cin_checkout_time TIMESTAMP,
+    cin_expected_checkout DATE NOT NULL,
+    cin_adults INTEGER DEFAULT 1,
+    cin_children INTEGER DEFAULT 0,
+    cin_status VARCHAR(20) DEFAULT 'active',
+    cin_rate_per_night DECIMAL(10,2) DEFAULT 0,
+    cin_total_amount DECIMAL(12,2) DEFAULT 0,
+    cin_paid_amount DECIMAL(12,2) DEFAULT 0,
+    cin_payment_method VARCHAR(50),
+    cin_payment_status VARCHAR(50),
+    cin_key_card_no VARCHAR(20),
+    cin_vehicle_plate VARCHAR(20),
+    cin_notes TEXT,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW(),
+    cin_created_by VARCHAR(50),
+    cin_updated_by VARCHAR(50),
 
--- HT_Booking_Rooms - Junction table for booking-room assignments
-IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[HT_Booking_Rooms]') AND type = 'U')
-BEGIN
-    CREATE TABLE [dbo].[HT_Booking_Rooms] (
-        [BR_ID] INT IDENTITY(1,1) PRIMARY KEY,
-        [BR_Book_ID] INT NOT NULL,
-        [BR_Room_ID] INT NOT NULL,
-        [BR_Room_Type_ID] INT NULL,
-        [BR_Rate_Per_Night] DECIMAL(10,2) DEFAULT 0,
-        [BR_Assigned_At] DATETIME NULL,
-        [BR_Notes] NVARCHAR(500) NULL,
+    CONSTRAINT fk_ht_checkins_booking FOREIGN KEY (cin_book_id)
+        REFERENCES ht_bookings(book_id),
+    CONSTRAINT fk_ht_checkins_customer FOREIGN KEY (cin_cust_id)
+        REFERENCES ht_customers(cust_id),
+    CONSTRAINT fk_ht_checkins_room FOREIGN KEY (cin_room_id)
+        REFERENCES ht_rooms_new(room_id)
+);
+CREATE INDEX IF NOT EXISTS ix_ht_checkins_booking ON ht_checkins(cin_book_id);
+CREATE INDEX IF NOT EXISTS ix_ht_checkins_customer ON ht_checkins(cin_cust_id);
+CREATE INDEX IF NOT EXISTS ix_ht_checkins_room ON ht_checkins(cin_room_id);
+CREATE INDEX IF NOT EXISTS ix_ht_checkins_status ON ht_checkins(cin_status);
+CREATE INDEX IF NOT EXISTS ix_ht_checkins_checkin ON ht_checkins(cin_checkin_time);
+CREATE INDEX IF NOT EXISTS ix_ht_checkins_expectedout ON ht_checkins(cin_expected_checkout);
 
-        CONSTRAINT FK_HT_BR_Booking FOREIGN KEY ([BR_Book_ID])
-            REFERENCES [dbo].[HT_Bookings]([Book_ID]) ON DELETE CASCADE,
-        CONSTRAINT FK_HT_BR_Room FOREIGN KEY ([BR_Room_ID])
-            REFERENCES [dbo].[HT_Rooms_New]([Room_ID]),
-        CONSTRAINT FK_HT_BR_RoomType FOREIGN KEY ([BR_Room_Type_ID])
-            REFERENCES [dbo].[HT_Room_Types]([Type_ID]),
-        CONSTRAINT UQ_HT_BR_BookRoom UNIQUE ([BR_Book_ID], [BR_Room_ID])
-    )
+-- ht_guest_registry - Guest registration (multiple guests per check-in)
+CREATE TABLE IF NOT EXISTS ht_guest_registry (
+    guest_id SERIAL PRIMARY KEY,
+    guest_cin_id INTEGER NOT NULL,
+    guest_cust_id INTEGER,
+    guest_firstname VARCHAR(100) NOT NULL,
+    guest_lastname VARCHAR(100),
+    guest_idcard VARCHAR(20),
+    guest_passport VARCHAR(50),
+    guest_nationality VARCHAR(50),
+    guest_is_primary BOOLEAN DEFAULT false,
+    guest_created_at TIMESTAMP DEFAULT NOW(),
 
-    CREATE INDEX IX_HT_BR_Room ON [dbo].[HT_Booking_Rooms] ([BR_Room_ID])
-END
-GO
+    CONSTRAINT fk_ht_guestreg_checkin FOREIGN KEY (guest_cin_id)
+        REFERENCES ht_checkins(cin_id) ON DELETE CASCADE,
+    CONSTRAINT fk_ht_guestreg_customer FOREIGN KEY (guest_cust_id)
+        REFERENCES ht_customers(cust_id)
+);
+CREATE INDEX IF NOT EXISTS ix_ht_guestreg_checkin ON ht_guest_registry(guest_cin_id);
 
--- HT_CheckIns - Check-in records
-IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[HT_CheckIns]') AND type = 'U')
-BEGIN
-    CREATE TABLE [dbo].[HT_CheckIns] (
-        [Cin_ID] INT IDENTITY(1,1) PRIMARY KEY,
-        [Cin_No] NVARCHAR(20) NOT NULL UNIQUE,
-        [Cin_Book_ID] INT NULL,
-        [Cin_Cust_ID] INT NOT NULL,
-        [Cin_Room_ID] INT NOT NULL,
-        [Cin_CheckIn_Time] DATETIME NOT NULL,
-        [Cin_CheckOut_Time] DATETIME NULL,
-        [Cin_Expected_Out] DATE NOT NULL,
-        [Cin_Adults] INT DEFAULT 1,
-        [Cin_Children] INT DEFAULT 0,
-        [Cin_Status] NVARCHAR(20) DEFAULT 'active',
-        [Cin_Rate_Per_Night] DECIMAL(10,2) DEFAULT 0,
-        [Cin_Total_Amount] DECIMAL(12,2) DEFAULT 0,
-        [Cin_Paid_Amount] DECIMAL(12,2) DEFAULT 0,
-        [Cin_Payment_Method] NVARCHAR(50) NULL,
-        [Cin_Key_Card_No] NVARCHAR(20) NULL,
-        [Cin_Vehicle_Plate] NVARCHAR(20) NULL,
-        [Cin_Notes] NVARCHAR(MAX) NULL,
-        [Cin_Created_At] DATETIME DEFAULT GETDATE(),
-        [Cin_Updated_At] DATETIME DEFAULT GETDATE(),
-        [Cin_Created_By] NVARCHAR(50) NULL,
-        [Cin_Updated_By] NVARCHAR(50) NULL,
+-- ht_rates - Room rate configurations
+CREATE TABLE IF NOT EXISTS ht_rates (
+    rate_id SERIAL PRIMARY KEY,
+    rate_room_type_id INTEGER,
+    rate_name VARCHAR(100) NOT NULL,
+    rate_code VARCHAR(20),
+    rate_price DECIMAL(10,2) NOT NULL DEFAULT 0,
+    rate_type VARCHAR(20) NOT NULL DEFAULT 'fixed',
+    rate_value DECIMAL(10,2),
+    rate_valid_from DATE,
+    rate_valid_to DATE,
+    rate_days_of_week VARCHAR(50),
+    rate_min_nights INTEGER DEFAULT 1,
+    rate_active BOOLEAN DEFAULT true,
+    rate_created TIMESTAMP DEFAULT NOW(),
+    rate_updated TIMESTAMP DEFAULT NOW(),
 
-        CONSTRAINT FK_HT_CheckIns_Booking FOREIGN KEY ([Cin_Book_ID])
-            REFERENCES [dbo].[HT_Bookings]([Book_ID]),
-        CONSTRAINT FK_HT_CheckIns_Customer FOREIGN KEY ([Cin_Cust_ID])
-            REFERENCES [dbo].[HT_Customers]([Cust_ID]),
-        CONSTRAINT FK_HT_CheckIns_Room FOREIGN KEY ([Cin_Room_ID])
-            REFERENCES [dbo].[HT_Rooms_New]([Room_ID])
-    )
+    CONSTRAINT fk_ht_rates_roomtype FOREIGN KEY (rate_room_type_id)
+        REFERENCES ht_room_types(type_id)
+);
+CREATE INDEX IF NOT EXISTS ix_ht_rates_roomtype ON ht_rates(rate_room_type_id);
+CREATE INDEX IF NOT EXISTS ix_ht_rates_validdates ON ht_rates(rate_valid_from, rate_valid_to);
 
-    CREATE INDEX IX_HT_CheckIns_Booking ON [dbo].[HT_CheckIns] ([Cin_Book_ID])
-    CREATE INDEX IX_HT_CheckIns_Customer ON [dbo].[HT_CheckIns] ([Cin_Cust_ID])
-    CREATE INDEX IX_HT_CheckIns_Room ON [dbo].[HT_CheckIns] ([Cin_Room_ID])
-    CREATE INDEX IX_HT_CheckIns_Status ON [dbo].[HT_CheckIns] ([Cin_Status])
-    CREATE INDEX IX_HT_CheckIns_CheckIn ON [dbo].[HT_CheckIns] ([Cin_CheckIn_Time])
-    CREATE INDEX IX_HT_CheckIns_ExpectedOut ON [dbo].[HT_CheckIns] ([Cin_Expected_Out])
-END
-GO
+-- ht_settings - System settings
+CREATE TABLE IF NOT EXISTS ht_settings (
+    setting_id SERIAL PRIMARY KEY,
+    setting_key VARCHAR(100) NOT NULL UNIQUE,
+    setting_value TEXT,
+    setting_type VARCHAR(20) DEFAULT 'string',
+    setting_description VARCHAR(500),
+    setting_updated_at TIMESTAMP DEFAULT NOW(),
+    setting_updated_by VARCHAR(50)
+);
 
--- HT_Guest_Registry - Guest registration (multiple guests per check-in)
-IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[HT_Guest_Registry]') AND type = 'U')
-BEGIN
-    CREATE TABLE [dbo].[HT_Guest_Registry] (
-        [Guest_ID] INT IDENTITY(1,1) PRIMARY KEY,
-        [Guest_Cin_ID] INT NOT NULL,
-        [Guest_Cust_ID] INT NULL,
-        [Guest_FirstName] NVARCHAR(100) NOT NULL,
-        [Guest_LastName] NVARCHAR(100) NULL,
-        [Guest_IDCard] NVARCHAR(20) NULL,
-        [Guest_Passport] NVARCHAR(50) NULL,
-        [Guest_Nationality] NVARCHAR(50) NULL,
-        [Guest_Is_Primary] BIT DEFAULT 0,
-        [Guest_Created_At] DATETIME DEFAULT GETDATE(),
-
-        CONSTRAINT FK_HT_GuestReg_CheckIn FOREIGN KEY ([Guest_Cin_ID])
-            REFERENCES [dbo].[HT_CheckIns]([Cin_ID]) ON DELETE CASCADE,
-        CONSTRAINT FK_HT_GuestReg_Customer FOREIGN KEY ([Guest_Cust_ID])
-            REFERENCES [dbo].[HT_Customers]([Cust_ID])
-    )
-
-    CREATE INDEX IX_HT_GuestReg_CheckIn ON [dbo].[HT_Guest_Registry] ([Guest_Cin_ID])
-END
-GO
-
--- HT_Rates - Room rate configurations
-IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[HT_Rates]') AND type = 'U')
-BEGIN
-    CREATE TABLE [dbo].[HT_Rates] (
-        [Rate_ID] INT IDENTITY(1,1) PRIMARY KEY,
-        [Rate_Room_Type_ID] INT NULL,
-        [Rate_Name] NVARCHAR(100) NOT NULL,
-        [Rate_Code] NVARCHAR(20) NULL,
-        [Rate_Price] DECIMAL(10,2) NOT NULL,
-        [Rate_Type] VARCHAR(20) DEFAULT 'fixed' NOT NULL,
-        [Rate_Value] DECIMAL(10,2) NULL,
-        [Rate_Valid_From] DATE NULL,
-        [Rate_Valid_To] DATE NULL,
-        [Rate_Days_Of_Week] NVARCHAR(50) NULL,
-        [Rate_Min_Nights] INT DEFAULT 1,
-        [Rate_Active] BIT DEFAULT 1,
-        [Rate_Created] DATETIME DEFAULT GETDATE(),
-        [Rate_Updated] DATETIME DEFAULT GETDATE(),
-
-        CONSTRAINT FK_HT_Rates_RoomType FOREIGN KEY ([Rate_Room_Type_ID])
-            REFERENCES [dbo].[HT_Room_Types]([Type_ID])
-    )
-
-    CREATE INDEX IX_HT_Rates_RoomType ON [dbo].[HT_Rates] ([Rate_Room_Type_ID])
-    CREATE INDEX IX_HT_Rates_ValidDates ON [dbo].[HT_Rates] ([Rate_Valid_From], [Rate_Valid_To])
-END
-GO
-
--- HT_Settings - System settings
-IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[HT_Settings]') AND type = 'U')
-BEGIN
-    CREATE TABLE [dbo].[HT_Settings] (
-        [Setting_ID] INT IDENTITY(1,1) PRIMARY KEY,
-        [Setting_Key] NVARCHAR(100) NOT NULL UNIQUE,
-        [Setting_Value] NVARCHAR(MAX) NULL,
-        [Setting_Type] NVARCHAR(20) DEFAULT 'string',
-        [Setting_Description] NVARCHAR(500) NULL,
-        [Setting_Updated_At] DATETIME DEFAULT GETDATE(),
-        [Setting_Updated_By] NVARCHAR(50) NULL
-    )
-
-    -- Insert default settings
-    INSERT INTO [dbo].[HT_Settings] ([Setting_Key], [Setting_Value], [Setting_Type], [Setting_Description])
-    VALUES
-        ('hotel.name', 'The HF Hotel', 'string', 'Hotel name'),
-        ('hotel.check_in_time', '14:00', 'string', 'Default check-in time'),
-        ('hotel.check_out_time', '12:00', 'string', 'Default check-out time'),
-        ('booking.prefix', 'BK', 'string', 'Booking number prefix'),
-        ('checkin.prefix', 'CI', 'string', 'Check-in number prefix'),
-        ('customer.prefix', 'CU', 'string', 'Customer code prefix')
-END
-GO
+-- Insert default settings
+INSERT INTO ht_settings (setting_key, setting_value, setting_type, setting_description)
+VALUES
+    ('hotel.name', 'The HF Hotel', 'string', 'Hotel name'),
+    ('hotel.check_in_time', '14:00', 'string', 'Default check-in time'),
+    ('hotel.check_out_time', '12:00', 'string', 'Default check-out time'),
+    ('booking.prefix', 'BK', 'string', 'Booking number prefix'),
+    ('checkin.prefix', 'CI', 'string', 'Check-in number prefix'),
+    ('customer.prefix', 'CU', 'string', 'Customer code prefix')
+ON CONFLICT (setting_key) DO NOTHING;
 
 -- =============================================================================
 -- Sequences for generating reference numbers
 -- =============================================================================
 
-IF NOT EXISTS (SELECT * FROM sys.sequences WHERE name = 'SQ_Booking_No')
-BEGIN
-    CREATE SEQUENCE [dbo].[SQ_Booking_No]
-        AS INT
-        START WITH 1
-        INCREMENT BY 1
-        MINVALUE 1
-        NO MAXVALUE
-        NO CYCLE
-        CACHE 10
-END
-GO
+CREATE SEQUENCE IF NOT EXISTS sq_booking_no
+    AS INTEGER
+    START WITH 1
+    INCREMENT BY 1
+    MINVALUE 1
+    NO MAXVALUE
+    NO CYCLE
+    CACHE 10;
 
-IF NOT EXISTS (SELECT * FROM sys.sequences WHERE name = 'SQ_CheckIn_No')
-BEGIN
-    CREATE SEQUENCE [dbo].[SQ_CheckIn_No]
-        AS INT
-        START WITH 1
-        INCREMENT BY 1
-        MINVALUE 1
-        NO MAXVALUE
-        NO CYCLE
-        CACHE 10
-END
-GO
+CREATE SEQUENCE IF NOT EXISTS sq_checkin_no
+    AS INTEGER
+    START WITH 1
+    INCREMENT BY 1
+    MINVALUE 1
+    NO MAXVALUE
+    NO CYCLE
+    CACHE 10;
 
-IF NOT EXISTS (SELECT * FROM sys.sequences WHERE name = 'SQ_Customer_Code')
-BEGIN
-    CREATE SEQUENCE [dbo].[SQ_Customer_Code]
-        AS INT
-        START WITH 1
-        INCREMENT BY 1
-        MINVALUE 1
-        NO MAXVALUE
-        NO CYCLE
-        CACHE 10
-END
-GO
+CREATE SEQUENCE IF NOT EXISTS sq_customer_code
+    AS INTEGER
+    START WITH 1
+    INCREMENT BY 1
+    MINVALUE 1
+    NO MAXVALUE
+    NO CYCLE
+    CACHE 10;
 
 -- =============================================================================
--- Stored Procedures
+-- Functions (replacing SQL Server stored procedures)
 -- =============================================================================
 
--- Generate next booking number
-IF EXISTS (SELECT * FROM sys.objects WHERE type = 'P' AND name = 'SP_Generate_Booking_No')
-    DROP PROCEDURE [dbo].[SP_Generate_Booking_No]
-GO
-CREATE PROCEDURE [dbo].[SP_Generate_Booking_No]
-    @BookingNo NVARCHAR(20) OUTPUT
-AS
+-- Generate next booking number: prefix + YYMM + 4-digit sequence
+CREATE OR REPLACE FUNCTION generate_booking_no()
+RETURNS VARCHAR(20) AS $$
+DECLARE
+    v_next_val INTEGER;
+    v_prefix VARCHAR(10);
+    v_year_month VARCHAR(6);
 BEGIN
-    DECLARE @NextVal INT
-    DECLARE @Prefix NVARCHAR(10)
-    DECLARE @YearMonth NVARCHAR(6)
+    SELECT setting_value INTO v_prefix
+    FROM ht_settings
+    WHERE setting_key = 'booking.prefix';
 
-    SELECT @Prefix = [Setting_Value] FROM [dbo].[HT_Settings] WHERE [Setting_Key] = 'booking.prefix'
-    SET @Prefix = ISNULL(@Prefix, 'BK')
-    SET @YearMonth = FORMAT(GETDATE(), 'yyMM')
+    v_prefix := COALESCE(v_prefix, 'BK');
+    v_year_month := TO_CHAR(NOW(), 'YYMM');
+    v_next_val := nextval('sq_booking_no');
 
-    SET @NextVal = NEXT VALUE FOR [dbo].[SQ_Booking_No]
-    SET @BookingNo = @Prefix + @YearMonth + RIGHT('0000' + CAST(@NextVal AS NVARCHAR), 4)
-END
-GO
+    RETURN v_prefix || v_year_month || LPAD(v_next_val::TEXT, 4, '0');
+END;
+$$ LANGUAGE plpgsql;
 
--- Generate next check-in number
-IF EXISTS (SELECT * FROM sys.objects WHERE type = 'P' AND name = 'SP_Generate_CheckIn_No')
-    DROP PROCEDURE [dbo].[SP_Generate_CheckIn_No]
-GO
-CREATE PROCEDURE [dbo].[SP_Generate_CheckIn_No]
-    @CheckInNo NVARCHAR(20) OUTPUT
-AS
+-- Generate next check-in number: prefix + YYMM + 4-digit sequence
+CREATE OR REPLACE FUNCTION generate_checkin_no()
+RETURNS VARCHAR(20) AS $$
+DECLARE
+    v_next_val INTEGER;
+    v_prefix VARCHAR(10);
+    v_year_month VARCHAR(6);
 BEGIN
-    DECLARE @NextVal INT
-    DECLARE @Prefix NVARCHAR(10)
-    DECLARE @YearMonth NVARCHAR(6)
+    SELECT setting_value INTO v_prefix
+    FROM ht_settings
+    WHERE setting_key = 'checkin.prefix';
 
-    SELECT @Prefix = [Setting_Value] FROM [dbo].[HT_Settings] WHERE [Setting_Key] = 'checkin.prefix'
-    SET @Prefix = ISNULL(@Prefix, 'CI')
-    SET @YearMonth = FORMAT(GETDATE(), 'yyMM')
+    v_prefix := COALESCE(v_prefix, 'CI');
+    v_year_month := TO_CHAR(NOW(), 'YYMM');
+    v_next_val := nextval('sq_checkin_no');
 
-    SET @NextVal = NEXT VALUE FOR [dbo].[SQ_CheckIn_No]
-    SET @CheckInNo = @Prefix + @YearMonth + RIGHT('0000' + CAST(@NextVal AS NVARCHAR), 4)
-END
-GO
+    RETURN v_prefix || v_year_month || LPAD(v_next_val::TEXT, 4, '0');
+END;
+$$ LANGUAGE plpgsql;
 
 -- =============================================================================
--- Migration 004: Inventory Tables
+-- Inventory Tables
 -- =============================================================================
 
--- Inventory Categories
-IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'HT_Inventory_Categories')
-BEGIN
-    CREATE TABLE HT_Inventory_Categories (
-        Cat_ID INT IDENTITY(1,1) PRIMARY KEY,
-        Cat_Name NVARCHAR(100) NOT NULL,
-        Cat_Description NVARCHAR(255),
-        Cat_Active BIT DEFAULT 1,
-        Cat_Created DATETIME DEFAULT GETDATE()
-    );
+-- ht_inventory_categories
+CREATE TABLE IF NOT EXISTS ht_inventory_categories (
+    cat_id SERIAL PRIMARY KEY,
+    cat_name VARCHAR(100) NOT NULL,
+    cat_description VARCHAR(255),
+    cat_active BOOLEAN DEFAULT true,
+    cat_created TIMESTAMP DEFAULT NOW()
+);
 
-    -- Insert default categories
-    INSERT INTO HT_Inventory_Categories (Cat_Name, Cat_Description) VALUES
-    ('Minibar', N'เครื่องดื่มและของว่างในมินิบาร์'),
-    ('Amenities', N'อุปกรณ์อำนวยความสะดวก'),
-    ('Linens', N'ผ้าและเครื่องนอน'),
-    ('Equipment', N'อุปกรณ์ในห้องพัก');
-END
-GO
+-- Insert default categories
+INSERT INTO ht_inventory_categories (cat_name, cat_description) VALUES
+    ('Minibar', 'เครื่องดื่มและของว่างในมินิบาร์'),
+    ('Amenities', 'อุปกรณ์อำนวยความสะดวก'),
+    ('Linens', 'ผ้าและเครื่องนอน'),
+    ('Equipment', 'อุปกรณ์ในห้องพัก')
+ON CONFLICT DO NOTHING;
 
--- Inventory Items
-IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'HT_Inventory_Items')
-BEGIN
-    CREATE TABLE HT_Inventory_Items (
-        Item_ID INT IDENTITY(1,1) PRIMARY KEY,
-        Item_Code NVARCHAR(50) NOT NULL UNIQUE,
-        Item_Name NVARCHAR(200) NOT NULL,
-        Item_Category_ID INT FOREIGN KEY REFERENCES HT_Inventory_Categories(Cat_ID),
-        Item_Unit NVARCHAR(50) NOT NULL,
-        Item_Min_Stock INT DEFAULT 0,
-        Item_Current_Stock INT DEFAULT 0,
-        Item_Cost DECIMAL(10,2),
-        Item_Active BIT DEFAULT 1,
-        Item_Created DATETIME DEFAULT GETDATE(),
-        Item_Updated DATETIME
-    );
-END
-GO
+-- ht_inventory_items
+CREATE TABLE IF NOT EXISTS ht_inventory_items (
+    item_id SERIAL PRIMARY KEY,
+    item_code VARCHAR(50) NOT NULL UNIQUE,
+    item_name VARCHAR(200) NOT NULL,
+    item_category_id INTEGER REFERENCES ht_inventory_categories(cat_id),
+    item_unit VARCHAR(50) NOT NULL,
+    item_min_stock INTEGER DEFAULT 0,
+    item_current_stock INTEGER DEFAULT 0,
+    item_cost DECIMAL(10,2),
+    item_active BOOLEAN DEFAULT true,
+    item_created TIMESTAMP DEFAULT NOW(),
+    item_updated TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS ix_ht_inventory_items_category ON ht_inventory_items(item_category_id);
+CREATE INDEX IF NOT EXISTS ix_ht_inventory_items_code ON ht_inventory_items(item_code);
 
--- Room Inventory
-IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'HT_Room_Inventory')
-BEGIN
-    CREATE TABLE HT_Room_Inventory (
-        RI_ID INT IDENTITY(1,1) PRIMARY KEY,
-        RI_Room_ID INT NOT NULL,
-        RI_Item_ID INT FOREIGN KEY REFERENCES HT_Inventory_Items(Item_ID),
-        RI_Quantity INT DEFAULT 1,
-        RI_Last_Checked DATETIME
-    );
-END
-GO
+-- ht_room_inventory
+CREATE TABLE IF NOT EXISTS ht_room_inventory (
+    ri_id SERIAL PRIMARY KEY,
+    ri_room_id INTEGER NOT NULL,
+    ri_item_id INTEGER REFERENCES ht_inventory_items(item_id),
+    ri_quantity INTEGER DEFAULT 1,
+    ri_last_checked TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS ix_ht_room_inventory_room ON ht_room_inventory(ri_room_id);
+CREATE INDEX IF NOT EXISTS ix_ht_room_inventory_item ON ht_room_inventory(ri_item_id);
 
--- Inventory Transactions
-IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'HT_Inventory_Transactions')
-BEGIN
-    CREATE TABLE HT_Inventory_Transactions (
-        Trans_ID INT IDENTITY(1,1) PRIMARY KEY,
-        Trans_Item_ID INT FOREIGN KEY REFERENCES HT_Inventory_Items(Item_ID),
-        Trans_Type VARCHAR(20) NOT NULL,
-        Trans_Quantity INT NOT NULL,
-        Trans_Room_ID INT,
-        Trans_Notes NVARCHAR(500),
-        Trans_Date DATETIME DEFAULT GETDATE(),
-        Trans_By NVARCHAR(100)
-    );
-END
-GO
-
--- Create indexes for inventory tables
-IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'IX_HT_Inventory_Items_Category')
-    CREATE INDEX IX_HT_Inventory_Items_Category ON HT_Inventory_Items(Item_Category_ID);
-GO
-
-IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'IX_HT_Inventory_Items_Code')
-    CREATE INDEX IX_HT_Inventory_Items_Code ON HT_Inventory_Items(Item_Code);
-GO
-
-IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'IX_HT_Room_Inventory_Room')
-    CREATE INDEX IX_HT_Room_Inventory_Room ON HT_Room_Inventory(RI_Room_ID);
-GO
-
-IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'IX_HT_Room_Inventory_Item')
-    CREATE INDEX IX_HT_Room_Inventory_Item ON HT_Room_Inventory(RI_Item_ID);
-GO
-
-IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'IX_HT_Inventory_Transactions_Item')
-    CREATE INDEX IX_HT_Inventory_Transactions_Item ON HT_Inventory_Transactions(Trans_Item_ID);
-GO
-
-IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'IX_HT_Inventory_Transactions_Date')
-    CREATE INDEX IX_HT_Inventory_Transactions_Date ON HT_Inventory_Transactions(Trans_Date);
-GO
+-- ht_inventory_transactions
+CREATE TABLE IF NOT EXISTS ht_inventory_transactions (
+    trans_id SERIAL PRIMARY KEY,
+    trans_item_id INTEGER REFERENCES ht_inventory_items(item_id),
+    trans_type VARCHAR(20) NOT NULL,
+    trans_quantity INTEGER NOT NULL,
+    trans_room_id INTEGER,
+    trans_notes VARCHAR(500),
+    trans_date TIMESTAMP DEFAULT NOW(),
+    trans_by VARCHAR(100)
+);
+CREATE INDEX IF NOT EXISTS ix_ht_inventory_transactions_item ON ht_inventory_transactions(trans_item_id);
+CREATE INDEX IF NOT EXISTS ix_ht_inventory_transactions_date ON ht_inventory_transactions(trans_date);
 
 -- =============================================================================
--- Schema Updates (for existing databases)
+-- Payment Tracking
 -- =============================================================================
 
--- Add Cust_Type column if it doesn't exist
-IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Customers]') AND name = 'Cust_Type')
-BEGIN
-    ALTER TABLE [dbo].[HT_Customers] ADD [Cust_Type] NVARCHAR(50) NULL;
-END
-GO
-
--- Add Room_Clean column if it doesn't exist
-IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Rooms_New]') AND name = 'Room_Clean')
-BEGIN
-    ALTER TABLE [dbo].[HT_Rooms_New] ADD [Room_Clean] BIT DEFAULT 1;
-END
-GO
-
--- =============================================================================
--- Column Renames (backend expects Created_At/Updated_At without table prefix)
--- =============================================================================
-
--- HT_Customers: Rename Cust_Created_At -> Created_At, Cust_Updated_At -> Updated_At
-IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Customers]') AND name = 'Cust_Created_At')
-    AND NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Customers]') AND name = 'Created_At')
-BEGIN
-    EXEC sp_rename 'HT_Customers.Cust_Created_At', 'Created_At', 'COLUMN';
-END
-GO
-
-IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Customers]') AND name = 'Cust_Updated_At')
-    AND NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Customers]') AND name = 'Updated_At')
-BEGIN
-    EXEC sp_rename 'HT_Customers.Cust_Updated_At', 'Updated_At', 'COLUMN';
-END
-GO
-
--- HT_Rooms_New: Rename Room_Created_At -> Created_At, Room_Updated_At -> Updated_At
-IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Rooms_New]') AND name = 'Room_Created_At')
-    AND NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Rooms_New]') AND name = 'Created_At')
-BEGIN
-    EXEC sp_rename 'HT_Rooms_New.Room_Created_At', 'Created_At', 'COLUMN';
-END
-GO
-
-IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Rooms_New]') AND name = 'Room_Updated_At')
-    AND NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Rooms_New]') AND name = 'Updated_At')
-BEGIN
-    EXEC sp_rename 'HT_Rooms_New.Room_Updated_At', 'Updated_At', 'COLUMN';
-END
-GO
-
--- Add Room_Maintenance column if it doesn't exist
-IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Rooms_New]') AND name = 'Room_Maintenance')
-BEGIN
-    ALTER TABLE [dbo].[HT_Rooms_New] ADD [Room_Maintenance] BIT DEFAULT 0;
-END
-GO
-
--- HT_Bookings: Rename Book_Total_Price -> Book_Total_Amount
-IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Bookings]') AND name = 'Book_Total_Price')
-    AND NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Bookings]') AND name = 'Book_Total_Amount')
-BEGIN
-    EXEC sp_rename 'HT_Bookings.Book_Total_Price', 'Book_Total_Amount', 'COLUMN';
-END
-GO
-
--- HT_Bookings: Rename Book_Deposit -> Book_Deposit_Amount
-IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Bookings]') AND name = 'Book_Deposit')
-    AND NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Bookings]') AND name = 'Book_Deposit_Amount')
-BEGIN
-    EXEC sp_rename 'HT_Bookings.Book_Deposit', 'Book_Deposit_Amount', 'COLUMN';
-END
-GO
-
--- HT_Bookings: Add Book_Notes if it doesn't exist
-IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Bookings]') AND name = 'Book_Notes')
-BEGIN
-    ALTER TABLE [dbo].[HT_Bookings] ADD [Book_Notes] NVARCHAR(MAX) NULL;
-END
-GO
-
--- HT_Bookings: Rename timestamp columns
-IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Bookings]') AND name = 'Book_Created_At')
-    AND NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Bookings]') AND name = 'Created_At')
-BEGIN
-    EXEC sp_rename 'HT_Bookings.Book_Created_At', 'Created_At', 'COLUMN';
-END
-GO
-
-IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Bookings]') AND name = 'Book_Updated_At')
-    AND NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Bookings]') AND name = 'Updated_At')
-BEGIN
-    EXEC sp_rename 'HT_Bookings.Book_Updated_At', 'Updated_At', 'COLUMN';
-END
-GO
-
--- HT_Rooms_New: Add pricing columns
-IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Rooms_New]') AND name = 'Room_Price_Weekday')
-BEGIN
-    ALTER TABLE [dbo].[HT_Rooms_New] ADD [Room_Price_Weekday] DECIMAL(10,2) NULL;
-END
-GO
-
-IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Rooms_New]') AND name = 'Room_Price_Weekend')
-BEGIN
-    ALTER TABLE [dbo].[HT_Rooms_New] ADD [Room_Price_Weekend] DECIMAL(10,2) NULL;
-END
-GO
-
-IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Rooms_New]') AND name = 'Room_Price_Special')
-BEGIN
-    ALTER TABLE [dbo].[HT_Rooms_New] ADD [Room_Price_Special] DECIMAL(10,2) NULL;
-END
-GO
-
--- HT_CheckIns: Rename Cin_Expected_Out -> Cin_Expected_Checkout
-IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_CheckIns]') AND name = 'Cin_Expected_Out')
-    AND NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_CheckIns]') AND name = 'Cin_Expected_Checkout')
-BEGIN
-    EXEC sp_rename 'HT_CheckIns.Cin_Expected_Out', 'Cin_Expected_Checkout', 'COLUMN';
-END
-GO
-
--- HT_CheckIns: Rename timestamp columns
-IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_CheckIns]') AND name = 'Cin_Created_At')
-    AND NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_CheckIns]') AND name = 'Created_At')
-BEGIN
-    EXEC sp_rename 'HT_CheckIns.Cin_Created_At', 'Created_At', 'COLUMN';
-END
-GO
-
-IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_CheckIns]') AND name = 'Cin_Updated_At')
-    AND NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_CheckIns]') AND name = 'Updated_At')
-BEGIN
-    EXEC sp_rename 'HT_CheckIns.Cin_Updated_At', 'Updated_At', 'COLUMN';
-END
-GO
-
--- HT_CheckIns: Add Cin_Payment_Status if it doesn't exist
-IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_CheckIns]') AND name = 'Cin_Payment_Status')
-BEGIN
-    ALTER TABLE [dbo].[HT_CheckIns] ADD [Cin_Payment_Status] NVARCHAR(50) NULL;
-END
-GO
+-- ht_payments - Payment records (multiple payments per check-in)
+CREATE TABLE IF NOT EXISTS ht_payments (
+    pay_id SERIAL PRIMARY KEY,
+    pay_cin_id INTEGER NOT NULL,
+    pay_amount DECIMAL(12,2) NOT NULL,
+    pay_method VARCHAR(50) NOT NULL,
+    pay_reference VARCHAR(100),
+    pay_notes VARCHAR(500),
+    pay_date TIMESTAMP DEFAULT NOW(),
+    pay_created_by VARCHAR(50),
+    pay_voided BOOLEAN DEFAULT false,
+    pay_voided_at TIMESTAMP,
+    pay_voided_by VARCHAR(50),
+    created_at TIMESTAMP DEFAULT NOW(),
+    CONSTRAINT fk_ht_payments_checkin FOREIGN KEY (pay_cin_id) REFERENCES ht_checkins(cin_id)
+);
+CREATE INDEX IF NOT EXISTS ix_ht_payments_checkin ON ht_payments(pay_cin_id);
+CREATE INDEX IF NOT EXISTS ix_ht_payments_date ON ht_payments(pay_date);
 
 -- =============================================================================
--- Migration 006: Payment Tracking
+-- Maintenance System
 -- =============================================================================
 
--- HT_Payments - Payment records (multiple payments per check-in)
-IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'HT_Payments') AND type = N'U')
-BEGIN
-    CREATE TABLE HT_Payments (
-        Pay_ID INT IDENTITY(1,1) PRIMARY KEY,
-        Pay_Cin_ID INT NOT NULL,
-        Pay_Amount DECIMAL(12,2) NOT NULL,
-        Pay_Method NVARCHAR(50) NOT NULL,
-        Pay_Reference NVARCHAR(100) NULL,
-        Pay_Notes NVARCHAR(500) NULL,
-        Pay_Date DATETIME DEFAULT GETDATE(),
-        Pay_Created_By NVARCHAR(50) NULL,
-        Pay_Voided BIT DEFAULT 0,
-        Pay_Voided_At DATETIME NULL,
-        Pay_Voided_By NVARCHAR(50) NULL,
-        Created_At DATETIME DEFAULT GETDATE(),
-        CONSTRAINT FK_HT_Payments_CheckIn FOREIGN KEY (Pay_Cin_ID) REFERENCES HT_CheckIns(Cin_ID)
-    );
+-- ht_maintenance_categories
+CREATE TABLE IF NOT EXISTS ht_maintenance_categories (
+    mcat_id SERIAL PRIMARY KEY,
+    mcat_name VARCHAR(100) NOT NULL,
+    mcat_name_en VARCHAR(100),
+    mcat_priority INTEGER DEFAULT 2,
+    mcat_active BOOLEAN DEFAULT true
+);
 
-    CREATE INDEX IX_HT_Payments_CheckIn ON HT_Payments(Pay_Cin_ID);
-    CREATE INDEX IX_HT_Payments_Date ON HT_Payments(Pay_Date);
-END
-GO
+-- Insert default maintenance categories
+INSERT INTO ht_maintenance_categories (mcat_name, mcat_name_en, mcat_priority) VALUES
+    ('ไฟฟ้า', 'Electrical', 3),
+    ('ประปา', 'Plumbing', 3),
+    ('เครื่องปรับอากาศ', 'Air Conditioning', 3),
+    ('เฟอร์นิเจอร์', 'Furniture', 2),
+    ('ทั่วไป', 'General', 2)
+ON CONFLICT DO NOTHING;
 
--- =============================================================================
--- Migration 007: Maintenance System
--- =============================================================================
-
--- HT_Maintenance_Categories - Maintenance categories
-IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'HT_Maintenance_Categories') AND type = N'U')
-BEGIN
-    CREATE TABLE HT_Maintenance_Categories (
-        MCat_ID INT IDENTITY(1,1) PRIMARY KEY,
-        MCat_Name NVARCHAR(100) NOT NULL,
-        MCat_Name_En NVARCHAR(100) NULL,
-        MCat_Priority INT DEFAULT 2,
-        MCat_Active BIT DEFAULT 1
-    );
-
-    INSERT INTO HT_Maintenance_Categories (MCat_Name, MCat_Name_En, MCat_Priority) VALUES
-    (N'ไฟฟ้า', 'Electrical', 3),
-    (N'ประปา', 'Plumbing', 3),
-    (N'เครื่องปรับอากาศ', 'Air Conditioning', 3),
-    (N'เฟอร์นิเจอร์', 'Furniture', 2),
-    (N'ทั่วไป', 'General', 2);
-END
-GO
-
--- HT_Maintenance_Requests - Maintenance request records
-IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'HT_Maintenance_Requests') AND type = N'U')
-BEGIN
-    CREATE TABLE HT_Maintenance_Requests (
-        MReq_ID INT IDENTITY(1,1) PRIMARY KEY,
-        MReq_No NVARCHAR(20) NOT NULL UNIQUE,
-        MReq_Room_ID INT NOT NULL,
-        MReq_Category_ID INT NOT NULL,
-        MReq_Title NVARCHAR(200) NOT NULL,
-        MReq_Description NVARCHAR(MAX) NULL,
-        MReq_Priority INT DEFAULT 2,
-        MReq_Status NVARCHAR(20) DEFAULT 'open',
-        MReq_Assigned_To NVARCHAR(100) NULL,
-        MReq_Started_At DATETIME NULL,
-        MReq_Completed_At DATETIME NULL,
-        MReq_Resolution NVARCHAR(MAX) NULL,
-        MReq_Cost DECIMAL(10,2) NULL,
-        MReq_Created_At DATETIME DEFAULT GETDATE(),
-        MReq_Updated_At DATETIME DEFAULT GETDATE(),
-        CONSTRAINT FK_MReq_Room FOREIGN KEY (MReq_Room_ID) REFERENCES HT_Rooms_New(Room_ID),
-        CONSTRAINT FK_MReq_Category FOREIGN KEY (MReq_Category_ID) REFERENCES HT_Maintenance_Categories(MCat_ID)
-    );
-
-    CREATE INDEX IX_MReq_Room ON HT_Maintenance_Requests(MReq_Room_ID);
-    CREATE INDEX IX_MReq_Status ON HT_Maintenance_Requests(MReq_Status);
-END
-GO
+-- ht_maintenance_requests
+CREATE TABLE IF NOT EXISTS ht_maintenance_requests (
+    mreq_id SERIAL PRIMARY KEY,
+    mreq_no VARCHAR(20) NOT NULL UNIQUE,
+    mreq_room_id INTEGER NOT NULL,
+    mreq_category_id INTEGER NOT NULL,
+    mreq_title VARCHAR(200) NOT NULL,
+    mreq_description TEXT,
+    mreq_priority INTEGER DEFAULT 2,
+    mreq_status VARCHAR(20) DEFAULT 'open',
+    mreq_assigned_to VARCHAR(100),
+    mreq_started_at TIMESTAMP,
+    mreq_completed_at TIMESTAMP,
+    mreq_resolution TEXT,
+    mreq_cost DECIMAL(10,2),
+    mreq_created_at TIMESTAMP DEFAULT NOW(),
+    mreq_updated_at TIMESTAMP DEFAULT NOW(),
+    CONSTRAINT fk_mreq_room FOREIGN KEY (mreq_room_id) REFERENCES ht_rooms_new(room_id),
+    CONSTRAINT fk_mreq_category FOREIGN KEY (mreq_category_id) REFERENCES ht_maintenance_categories(mcat_id)
+);
+CREATE INDEX IF NOT EXISTS ix_mreq_room ON ht_maintenance_requests(mreq_room_id);
+CREATE INDEX IF NOT EXISTS ix_mreq_status ON ht_maintenance_requests(mreq_status);
 
 -- Sequence for maintenance request numbers
-IF NOT EXISTS (SELECT * FROM sys.sequences WHERE name = 'SQ_Maintenance_No')
-BEGIN
-    CREATE SEQUENCE SQ_Maintenance_No AS INT START WITH 1 INCREMENT BY 1;
-END
-GO
+CREATE SEQUENCE IF NOT EXISTS sq_maintenance_no
+    AS INTEGER
+    START WITH 1
+    INCREMENT BY 1;
 
-PRINT 'HotelNew database initialization complete.'
-GO
+-- =============================================================================
+-- Initialization complete
+-- =============================================================================

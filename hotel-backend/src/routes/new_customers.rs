@@ -12,6 +12,7 @@ use axum::{
 };
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 
 use super::mode::AppState;
 use crate::error::{ApiError, ApiResult};
@@ -100,7 +101,7 @@ pub async fn list_customers(
     State(state): State<AppState>,
     Query(params): Query<NewCustomersQuery>,
 ) -> ApiResult<Json<NewCustomersResponse>> {
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
     let offset = (params.page - 1) * params.limit;
     let sort_order = params
@@ -111,25 +112,25 @@ pub async fn list_customers(
 
     // Map frontend column names to SQL columns
     let order_by_column = match params.sort_by.as_deref() {
-        Some("firstName") => "Cust_FirstName",
-        Some("lastName") => "Cust_LastName",
-        Some("phone") => "Cust_Phone",
-        Some("email") => "Cust_Email",
-        Some("createdAt") => "Created_At",
-        _ => "Cust_ID",
+        Some("firstName") => "cust_firstname",
+        Some("lastName") => "cust_lastname",
+        Some("phone") => "cust_phone",
+        Some("email") => "cust_email",
+        Some("createdAt") => "created_at",
+        _ => "cust_id",
     };
 
     // Build WHERE conditions
     let mut conditions: Vec<String> = Vec::new();
 
     if params.active_only {
-        conditions.push("Cust_Active = 1".to_string());
+        conditions.push("cust_active = true".to_string());
     }
 
     if let Some(ref search) = params.search {
         let escaped = search.replace('\'', "''");
         conditions.push(format!(
-            "(Cust_FirstName LIKE '%{}%' OR Cust_LastName LIKE '%{}%' OR Cust_Phone LIKE '%{}%' OR Cust_Email LIKE '%{}%' OR Cust_IDCard LIKE '%{}%')",
+            "(cust_firstname LIKE '%{}%' OR cust_lastname LIKE '%{}%' OR cust_phone LIKE '%{}%' OR cust_email LIKE '%{}%' OR cust_idcard LIKE '%{}%')",
             escaped, escaped, escaped, escaped, escaped
         ));
     }
@@ -142,66 +143,62 @@ pub async fn list_customers(
 
     // Count query
     let count_query = format!(
-        "SELECT COUNT(*) as total FROM HT_Customers {}",
+        "SELECT COUNT(*)::int as total FROM ht_customers {}",
         where_clause
     );
 
-    let count_rows = conn
-        .simple_query(&count_query)
-        .await?
-        .into_first_result()
+    let count_rows = sqlx::query(&count_query)
+        .fetch_all(pool)
         .await?;
 
     let total: i32 = count_rows
         .first()
-        .and_then(|r| r.get::<i32, _>("total"))
+        .map(|r| r.try_get::<i32, _>("total").unwrap_or(0))
         .unwrap_or(0);
 
     // Data query
     let data_query = format!(
         r#"
         SELECT
-            Cust_ID,
-            Cust_FirstName,
-            Cust_LastName,
-            Cust_Phone,
-            Cust_Email,
-            Cust_IDCard,
-            Cust_Address,
-            Cust_Type,
-            Cust_Notes,
-            Cust_Active,
-            Created_At,
-            Updated_At
-        FROM HT_Customers
+            cust_id,
+            cust_firstname,
+            cust_lastname,
+            cust_phone,
+            cust_email,
+            cust_idcard,
+            cust_address,
+            cust_type,
+            cust_notes,
+            cust_active,
+            created_at,
+            updated_at
+        FROM ht_customers
         {}
         ORDER BY {} {}
-        OFFSET {} ROWS FETCH NEXT {} ROWS ONLY
+        LIMIT {} OFFSET {}
         "#,
-        where_clause, order_by_column, sort_order, offset, params.limit
+        where_clause, order_by_column, sort_order, params.limit, offset
     );
 
-    let rows = conn
-        .simple_query(&data_query)
-        .await?
-        .into_first_result()
+    let rows = sqlx::query(&data_query)
+        .fetch_all(pool)
         .await?;
 
     let customers: Vec<NewCustomer> = rows
         .iter()
         .map(|row| NewCustomer {
-            id: row.get::<i32, _>("Cust_ID").unwrap_or(0),
-            first_name: row.get::<&str, _>("Cust_FirstName").map(String::from),
-            last_name: row.get::<&str, _>("Cust_LastName").map(String::from),
-            phone: row.get::<&str, _>("Cust_Phone").map(String::from),
-            email: row.get::<&str, _>("Cust_Email").map(String::from),
-            id_card: row.get::<&str, _>("Cust_IDCard").map(String::from),
-            address: row.get::<&str, _>("Cust_Address").map(String::from),
-            customer_type: row.get::<&str, _>("Cust_Type").map(String::from),
-            notes: row.get::<&str, _>("Cust_Notes").map(String::from),
-            active: row.get::<bool, _>("Cust_Active").unwrap_or(true),
-            created_at: row.get::<NaiveDateTime, _>("Created_At"),
-            updated_at: row.get::<NaiveDateTime, _>("Updated_At"),
+            id: row.try_get::<i32, _>("cust_id").unwrap_or(0),
+            first_name: row.try_get::<String, _>("cust_firstname").ok(),
+            last_name: row.try_get::<String, _>("cust_lastname").ok(),
+            phone: row.try_get::<String, _>("cust_phone").ok(),
+            email: row.try_get::<String, _>("cust_email").ok(),
+            id_card: row.try_get::<String, _>("cust_idcard").ok(),
+            address: row.try_get::<String, _>("cust_address").ok(),
+            customer_type: row.try_get::<String, _>("cust_type").ok(),
+            notes: row.try_get::<String, _>("cust_notes").ok(),
+            active: row.try_get::<bool, _>("cust_active").unwrap_or(true),
+            created_at: row.try_get::<NaiveDateTime, _>("created_at").ok(),
+            updated_at: row.try_get::<NaiveDateTime, _>("updated_at").ok(),
         })
         .collect();
 
@@ -217,31 +214,29 @@ pub async fn get_customer(
     State(state): State<AppState>,
     Path(cust_id): Path<i32>,
 ) -> ApiResult<Json<NewCustomerResponse>> {
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
-    let rows = conn
-        .query(
+    let rows = sqlx::query(
             r#"
             SELECT
-                Cust_ID,
-                Cust_FirstName,
-                Cust_LastName,
-                Cust_Phone,
-                Cust_Email,
-                Cust_IDCard,
-                Cust_Address,
-                Cust_Type,
-                Cust_Notes,
-                Cust_Active,
-                Created_At,
-                Updated_At
-            FROM HT_Customers
-            WHERE Cust_ID = @P1
+                cust_id,
+                cust_firstname,
+                cust_lastname,
+                cust_phone,
+                cust_email,
+                cust_idcard,
+                cust_address,
+                cust_type,
+                cust_notes,
+                cust_active,
+                created_at,
+                updated_at
+            FROM ht_customers
+            WHERE cust_id = $1
             "#,
-            &[&cust_id],
         )
-        .await?
-        .into_first_result()
+        .bind(&cust_id)
+        .fetch_all(pool)
         .await?;
 
     let row = rows
@@ -249,18 +244,18 @@ pub async fn get_customer(
         .ok_or_else(|| ApiError::NotFound("Customer not found".to_string()))?;
 
     let customer = NewCustomer {
-        id: row.get::<i32, _>("Cust_ID").unwrap_or(0),
-        first_name: row.get::<&str, _>("Cust_FirstName").map(String::from),
-        last_name: row.get::<&str, _>("Cust_LastName").map(String::from),
-        phone: row.get::<&str, _>("Cust_Phone").map(String::from),
-        email: row.get::<&str, _>("Cust_Email").map(String::from),
-        id_card: row.get::<&str, _>("Cust_IDCard").map(String::from),
-        address: row.get::<&str, _>("Cust_Address").map(String::from),
-        customer_type: row.get::<&str, _>("Cust_Type").map(String::from),
-        notes: row.get::<&str, _>("Cust_Notes").map(String::from),
-        active: row.get::<bool, _>("Cust_Active").unwrap_or(true),
-        created_at: row.get::<NaiveDateTime, _>("Created_At"),
-        updated_at: row.get::<NaiveDateTime, _>("Updated_At"),
+        id: row.try_get::<i32, _>("cust_id").unwrap_or(0),
+        first_name: row.try_get::<String, _>("cust_firstname").ok(),
+        last_name: row.try_get::<String, _>("cust_lastname").ok(),
+        phone: row.try_get::<String, _>("cust_phone").ok(),
+        email: row.try_get::<String, _>("cust_email").ok(),
+        id_card: row.try_get::<String, _>("cust_idcard").ok(),
+        address: row.try_get::<String, _>("cust_address").ok(),
+        customer_type: row.try_get::<String, _>("cust_type").ok(),
+        notes: row.try_get::<String, _>("cust_notes").ok(),
+        active: row.try_get::<bool, _>("cust_active").unwrap_or(true),
+        created_at: row.try_get::<NaiveDateTime, _>("created_at").ok(),
+        updated_at: row.try_get::<NaiveDateTime, _>("updated_at").ok(),
     };
 
     Ok(Json(NewCustomerResponse {
@@ -279,42 +274,39 @@ pub async fn create_customer(
         return Err(ApiError::BadRequest("First name is required".to_string()));
     }
 
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
-    let rows = conn
-        .query(
+    let rows = sqlx::query(
             r#"
-            INSERT INTO HT_Customers (
-                Cust_FirstName,
-                Cust_LastName,
-                Cust_Phone,
-                Cust_Email,
-                Cust_IDCard,
-                Cust_Address,
-                Cust_Type,
-                Cust_Notes
+            INSERT INTO ht_customers (
+                cust_firstname,
+                cust_lastname,
+                cust_phone,
+                cust_email,
+                cust_idcard,
+                cust_address,
+                cust_type,
+                cust_notes
             )
-            OUTPUT INSERTED.Cust_ID
-            VALUES (@P1, @P2, @P3, @P4, @P5, @P6, @P7, @P8)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING cust_id
             "#,
-            &[
-                &first_name,
-                &body.last_name.as_deref(),
-                &body.phone.as_deref(),
-                &body.email.as_deref(),
-                &body.id_card.as_deref(),
-                &body.address.as_deref(),
-                &body.customer_type.as_deref(),
-                &body.notes.as_deref(),
-            ],
         )
-        .await?
-        .into_first_result()
+        .bind(&first_name)
+        .bind(&body.last_name.as_deref())
+        .bind(&body.phone.as_deref())
+        .bind(&body.email.as_deref())
+        .bind(&body.id_card.as_deref())
+        .bind(&body.address.as_deref())
+        .bind(&body.customer_type.as_deref())
+        .bind(&body.notes.as_deref())
+        .fetch_all(pool)
         .await?;
 
     let id = rows
         .first()
-        .and_then(|r| r.get::<i32, _>("Cust_ID"))
+        .map(|r| r.try_get::<i32, _>("cust_id").ok())
+        .flatten()
         .ok_or_else(|| ApiError::Internal("Failed to create customer".to_string()))?;
 
     Ok(Json(MutationResponse {
@@ -335,38 +327,36 @@ pub async fn update_customer(
         return Err(ApiError::BadRequest("First name is required".to_string()));
     }
 
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
-    let result = conn
-        .execute(
+    let result = sqlx::query(
             r#"
-            UPDATE HT_Customers
-            SET Cust_FirstName = @P1,
-                Cust_LastName = @P2,
-                Cust_Phone = @P3,
-                Cust_Email = @P4,
-                Cust_IDCard = @P5,
-                Cust_Address = @P6,
-                Cust_Type = @P7,
-                Cust_Notes = @P8,
-                Updated_At = GETDATE()
-            WHERE Cust_ID = @P9
+            UPDATE ht_customers
+            SET cust_firstname = $1,
+                cust_lastname = $2,
+                cust_phone = $3,
+                cust_email = $4,
+                cust_idcard = $5,
+                cust_address = $6,
+                cust_type = $7,
+                cust_notes = $8,
+                updated_at = NOW()
+            WHERE cust_id = $9
             "#,
-            &[
-                &first_name,
-                &body.last_name.as_deref(),
-                &body.phone.as_deref(),
-                &body.email.as_deref(),
-                &body.id_card.as_deref(),
-                &body.address.as_deref(),
-                &body.customer_type.as_deref(),
-                &body.notes.as_deref(),
-                &cust_id,
-            ],
         )
+        .bind(&first_name)
+        .bind(&body.last_name.as_deref())
+        .bind(&body.phone.as_deref())
+        .bind(&body.email.as_deref())
+        .bind(&body.id_card.as_deref())
+        .bind(&body.address.as_deref())
+        .bind(&body.customer_type.as_deref())
+        .bind(&body.notes.as_deref())
+        .bind(&cust_id)
+        .execute(pool)
         .await?;
 
-    if result.total() == 0 {
+    if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("Customer not found".to_string()));
     }
 
@@ -382,21 +372,21 @@ pub async fn delete_customer(
     State(state): State<AppState>,
     Path(cust_id): Path<i32>,
 ) -> ApiResult<Json<MutationResponse>> {
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
-    let result = conn
-        .execute(
+    let result = sqlx::query(
             r#"
-            UPDATE HT_Customers
-            SET Cust_Active = 0,
-                Updated_At = GETDATE()
-            WHERE Cust_ID = @P1
+            UPDATE ht_customers
+            SET cust_active = false,
+                updated_at = NOW()
+            WHERE cust_id = $1
             "#,
-            &[&cust_id],
         )
+        .bind(&cust_id)
+        .execute(pool)
         .await?;
 
-    if result.total() == 0 {
+    if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("Customer not found".to_string()));
     }
 

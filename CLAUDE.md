@@ -62,9 +62,9 @@ This application uses a **dual-database architecture**:
 ┌─────────────────────────────────────────────────────────────┐
 │                    DOCKER COMPOSE                            │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
-│  │  Frontend   │  │   Backend   │  │   SQL Server        │  │
+│  │  Frontend   │  │   Backend   │  │   PostgreSQL        │  │
 │  │  (web)      │  │  (backend)  │  │   (newdb)           │  │
-│  │  Port 3003  │  │  Port 3003  │  │   Port 1433         │  │
+│  │  Port 3003  │  │  Port 3003  │  │   Port 5439         │  │
 │  │             │  │             │  │                     │  │
 │  │             │──│─────────────│──│──▶ HotelNew DB      │  │
 │  └─────────────┘  │             │  │                     │  │
@@ -84,17 +84,13 @@ This application uses a **dual-database architecture**:
 ### Self-Hosted Database (HotelNew)
 
 The HotelNew database runs in a Docker container (`newdb` service):
-- **Image**: `mcr.microsoft.com/mssql/server:2022-latest`
+- **Image**: `postgres:17-alpine` (~100MB image, ~50-100MB RAM idle)
+- **Rust driver**: `sqlx` crate (runtime queries, not compile-time macros)
 - **Data persistence**: Docker volume `newdb_data`
 - **Access**: Internal only (not exposed to host network)
-- **Initialization**: Run `init-db/init-hotelnew.sql` on first deploy
+- **Initialization**: Automatic on first startup (PostgreSQL runs `.sql` files from `/docker-entrypoint-initdb.d/`)
 
-**First-time setup** (after `docker compose up`):
-```bash
-docker exec -it new-hotel-db /opt/mssql-tools18/bin/sqlcmd \
-  -S localhost -U sa -P "NewHotel@2026!" -C \
-  -i /docker-entrypoint-initdb.d/init-hotelnew.sql
-```
+**First-time setup**: Fully automatic. Just run `docker compose up` - PostgreSQL auto-creates the database and runs `init-db/init-hotelnew.sql`.
 
 ### Legacy Database (192.168.100.222)
 
@@ -111,19 +107,26 @@ docker exec -it new-hotel-db /opt/mssql-tools18/bin/sqlcmd \
 - `DROP TABLE` / `DROP VIEW` - Do not delete
 - `CREATE INDEX` on legacy tables - May affect legacy app
 
-### HotelNew Tables (owned by this app)
+### HotelNew Tables (owned by this app, PostgreSQL - all lowercase)
 
 All tables in the HotelNew database are owned by this application:
-- `HT_Customers` - Customer master data
-- `HT_Room_Types` - Room type definitions
-- `HT_Rooms_New` - Room inventory
-- `HT_Bookings` - Booking records
-- `HT_Booking_Rooms` - Booking-room assignments
-- `HT_CheckIns` - Check-in records
-- `HT_Guest_Registry` - Guest registration (TM.30)
-- `HT_Rates` - Room rate configurations
-- `HT_Settings` - System settings
-- `HT_Inventory_*` - Inventory management tables
+- `ht_customers` - Customer master data
+- `ht_room_types` - Room type definitions
+- `ht_rooms_new` - Room inventory
+- `ht_bookings` - Booking records
+- `ht_booking_rooms` - Booking-room assignments
+- `ht_checkins` - Check-in records
+- `ht_guest_registry` - Guest registration (TM.30)
+- `ht_rates` - Room rate configurations
+- `ht_settings` - System settings
+- `ht_booking_notes` - Booking annotations
+- `ht_inventory_categories` - Inventory categories
+- `ht_inventory_items` - Inventory items
+- `ht_inventory_transactions` - Inventory transactions
+- `ht_room_inventory` - Room inventory assignments
+- `ht_payments` - Payment records
+- `ht_maintenance_categories` - Maintenance categories
+- `ht_maintenance_requests` - Maintenance requests
 
 ### Database Migrations
 
@@ -140,15 +143,14 @@ All tables in the HotelNew database are owned by this application:
 
 3. **Never auto-create tables in code** without a corresponding migration file
 
-4. **Example migration structure**:
+4. **Example migration structure** (PostgreSQL):
    ```sql
    -- Migration: 002_description
    -- Version: x.x.x
    -- Date: YYYY-MM-DD
 
    -- UP MIGRATION
-   IF NOT EXISTS (...)
-   CREATE TABLE ...
+   CREATE TABLE IF NOT EXISTS ...
 
    -- DOWN MIGRATION (commented)
    -- DROP TABLE IF EXISTS ...
@@ -180,7 +182,8 @@ This application uses a **split architecture**:
 |-----------|------------|-------------|
 | Frontend | Next.js 16 + React 19 | UI layer, proxies API requests to backend |
 | Backend | Rust/Axum | API server, database queries, background jobs |
-| Database | SQL Server | Shared with legacy application |
+| Legacy DB | SQL Server (tiberius) | Shared with legacy application, read-only |
+| HotelNew DB | PostgreSQL (sqlx) | Self-hosted, full CRUD |
 
 **API Routing**:
 - Frontend runs on port 3003 (exposed)
@@ -191,6 +194,7 @@ This application uses a **split architecture**:
 **Docker Services** (defined in `docker-compose.yml`):
 - `web` - Next.js frontend (ghcr.io/thehfhotel/new-hotel)
 - `backend` - Rust backend (ghcr.io/thehfhotel/new-hotel-backend)
+- `newdb` - PostgreSQL 17 (postgres:17-alpine) for HotelNew database
 
 ## Development
 

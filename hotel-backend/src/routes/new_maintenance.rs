@@ -16,6 +16,7 @@ use axum::{
 };
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 
 use super::mode::AppState;
 use crate::error::{ApiError, ApiResult};
@@ -158,34 +159,32 @@ pub struct MutationResponse {
 pub async fn list_categories(
     State(state): State<AppState>,
 ) -> ApiResult<Json<CategoriesResponse>> {
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
-    let rows = conn
-        .simple_query(
+    let rows = sqlx::query(
             r#"
             SELECT
-                MCat_ID,
-                MCat_Name,
-                MCat_Name_En,
-                MCat_Priority,
-                MCat_Active
-            FROM HT_Maintenance_Categories
-            WHERE MCat_Active = 1
-            ORDER BY MCat_Priority DESC, MCat_Name ASC
+                mcat_id,
+                mcat_name,
+                mcat_name_en,
+                mcat_priority,
+                mcat_active
+            FROM ht_maintenance_categories
+            WHERE mcat_active = true
+            ORDER BY mcat_priority DESC, mcat_name ASC
             "#,
         )
-        .await?
-        .into_first_result()
+        .fetch_all(pool)
         .await?;
 
     let categories: Vec<MaintenanceCategory> = rows
         .iter()
         .map(|row| MaintenanceCategory {
-            id: row.get::<i32, _>("MCat_ID").unwrap_or(0),
-            name: row.get::<&str, _>("MCat_Name").unwrap_or_default().to_string(),
-            name_en: row.get::<&str, _>("MCat_Name_En").map(String::from),
-            priority: row.get::<i32, _>("MCat_Priority").unwrap_or(2),
-            active: row.get::<bool, _>("MCat_Active").unwrap_or(true),
+            id: row.try_get::<i32, _>("mcat_id").unwrap_or(0),
+            name: row.try_get::<String, _>("mcat_name").unwrap_or_default(),
+            name_en: row.try_get::<String, _>("mcat_name_en").ok(),
+            priority: row.try_get::<i32, _>("mcat_priority").unwrap_or(2),
+            active: row.try_get::<bool, _>("mcat_active").unwrap_or(true),
         })
         .collect();
 
@@ -207,7 +206,7 @@ pub async fn list_requests(
     State(state): State<AppState>,
     Query(params): Query<RequestsQuery>,
 ) -> ApiResult<Json<RequestsResponse>> {
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
     let offset = (params.page - 1) * params.limit;
 
@@ -216,19 +215,19 @@ pub async fn list_requests(
 
     if let Some(ref status) = params.status {
         let escaped = status.replace('\'', "''");
-        conditions.push(format!("r.MReq_Status = '{}'", escaped));
+        conditions.push(format!("r.mreq_status = '{}'", escaped));
     }
 
     if let Some(room_id) = params.room_id {
-        conditions.push(format!("r.MReq_Room_ID = {}", room_id));
+        conditions.push(format!("r.mreq_room_id = {}", room_id));
     }
 
     if let Some(category_id) = params.category_id {
-        conditions.push(format!("r.MReq_Category_ID = {}", category_id));
+        conditions.push(format!("r.mreq_category_id = {}", category_id));
     }
 
     if let Some(priority) = params.priority {
-        conditions.push(format!("r.MReq_Priority = {}", priority));
+        conditions.push(format!("r.mreq_priority = {}", priority));
     }
 
     let where_clause = if conditions.is_empty() {
@@ -239,86 +238,82 @@ pub async fn list_requests(
 
     // Count query
     let count_query = format!(
-        "SELECT COUNT(*) as total FROM HT_Maintenance_Requests r {}",
+        "SELECT COUNT(*)::int as total FROM ht_maintenance_requests r {}",
         where_clause
     );
 
-    let count_rows = conn
-        .simple_query(&count_query)
-        .await?
-        .into_first_result()
+    let count_rows = sqlx::query(&count_query)
+        .fetch_all(pool)
         .await?;
 
     let total: i32 = count_rows
         .first()
-        .and_then(|r| r.get::<i32, _>("total"))
+        .and_then(|r| r.try_get::<i32, _>("total").ok())
         .unwrap_or(0);
 
     // Data query
     let data_query = format!(
         r#"
         SELECT
-            r.MReq_ID,
-            r.MReq_No,
-            r.MReq_Room_ID,
-            rm.Room_No,
-            r.MReq_Category_ID,
-            c.MCat_Name,
-            r.MReq_Title,
-            r.MReq_Description,
-            r.MReq_Priority,
-            r.MReq_Status,
-            r.MReq_Assigned_To,
-            r.MReq_Started_At,
-            r.MReq_Completed_At,
-            r.MReq_Resolution,
-            r.MReq_Cost,
-            r.MReq_Created_At,
-            r.MReq_Updated_At
-        FROM HT_Maintenance_Requests r
-        LEFT JOIN HT_Rooms_New rm ON r.MReq_Room_ID = rm.Room_ID
-        LEFT JOIN HT_Maintenance_Categories c ON r.MReq_Category_ID = c.MCat_ID
+            r.mreq_id,
+            r.mreq_no,
+            r.mreq_room_id,
+            rm.room_no,
+            r.mreq_category_id,
+            c.mcat_name,
+            r.mreq_title,
+            r.mreq_description,
+            r.mreq_priority,
+            r.mreq_status,
+            r.mreq_assigned_to,
+            r.mreq_started_at,
+            r.mreq_completed_at,
+            r.mreq_resolution,
+            r.mreq_cost,
+            r.mreq_created_at,
+            r.mreq_updated_at
+        FROM ht_maintenance_requests r
+        LEFT JOIN ht_rooms_new rm ON r.mreq_room_id = rm.room_id
+        LEFT JOIN ht_maintenance_categories c ON r.mreq_category_id = c.mcat_id
         {}
         ORDER BY
-            CASE r.MReq_Status
+            CASE r.mreq_status
                 WHEN 'open' THEN 1
                 WHEN 'in_progress' THEN 2
                 WHEN 'completed' THEN 3
                 WHEN 'cancelled' THEN 4
             END,
-            r.MReq_Priority DESC,
-            r.MReq_Created_At DESC
-        OFFSET {} ROWS FETCH NEXT {} ROWS ONLY
+            r.mreq_priority DESC,
+            r.mreq_created_at DESC
+        LIMIT {} OFFSET {}
         "#,
-        where_clause, offset, params.limit
+        where_clause, params.limit, offset
     );
 
-    let rows = conn
-        .simple_query(&data_query)
-        .await?
-        .into_first_result()
+    let rows = sqlx::query(&data_query)
+        .fetch_all(pool)
         .await?;
 
     let requests: Vec<MaintenanceRequest> = rows
         .iter()
         .map(|row| MaintenanceRequest {
-            id: row.get::<i32, _>("MReq_ID").unwrap_or(0),
-            request_no: row.get::<&str, _>("MReq_No").unwrap_or_default().to_string(),
-            room_id: row.get::<i32, _>("MReq_Room_ID").unwrap_or(0),
-            room_no: row.get::<&str, _>("Room_No").map(String::from),
-            category_id: row.get::<i32, _>("MReq_Category_ID").unwrap_or(0),
-            category_name: row.get::<&str, _>("MCat_Name").map(String::from),
-            title: row.get::<&str, _>("MReq_Title").unwrap_or_default().to_string(),
-            description: row.get::<&str, _>("MReq_Description").map(String::from),
-            priority: row.get::<i32, _>("MReq_Priority").unwrap_or(2),
-            status: row.get::<&str, _>("MReq_Status").unwrap_or("open").to_string(),
-            assigned_to: row.get::<&str, _>("MReq_Assigned_To").map(String::from),
-            started_at: row.get::<NaiveDateTime, _>("MReq_Started_At"),
-            completed_at: row.get::<NaiveDateTime, _>("MReq_Completed_At"),
-            resolution: row.get::<&str, _>("MReq_Resolution").map(String::from),
-            cost: row.get::<f64, _>("MReq_Cost"),
-            created_at: row.get::<NaiveDateTime, _>("MReq_Created_At"),
-            updated_at: row.get::<NaiveDateTime, _>("MReq_Updated_At"),
+            id: row.try_get::<i32, _>("mreq_id").unwrap_or(0),
+            request_no: row.try_get::<String, _>("mreq_no").unwrap_or_default(),
+            room_id: row.try_get::<i32, _>("mreq_room_id").unwrap_or(0),
+            room_no: row.try_get::<String, _>("room_no").ok(),
+            category_id: row.try_get::<i32, _>("mreq_category_id").unwrap_or(0),
+            category_name: row.try_get::<String, _>("mcat_name").ok(),
+            title: row.try_get::<String, _>("mreq_title").unwrap_or_default(),
+            description: row.try_get::<String, _>("mreq_description").ok(),
+            priority: row.try_get::<i32, _>("mreq_priority").unwrap_or(2),
+            status: row.try_get::<String, _>("mreq_status").unwrap_or_else(|_| "open".to_string()),
+            assigned_to: row.try_get::<String, _>("mreq_assigned_to").ok(),
+            started_at: row.try_get::<NaiveDateTime, _>("mreq_started_at").ok(),
+            completed_at: row.try_get::<NaiveDateTime, _>("mreq_completed_at").ok(),
+            resolution: row.try_get::<String, _>("mreq_resolution").ok(),
+            cost: row.try_get::<f64, _>("mreq_cost").ok(),
+            created_at: row.try_get::<NaiveDateTime, _>("mreq_created_at").ok(),
+            updated_at: row.try_get::<NaiveDateTime, _>("mreq_updated_at").ok(),
         })
         .collect();
 
@@ -339,18 +334,16 @@ pub async fn create_request(
         return Err(ApiError::BadRequest("Title is required".to_string()));
     }
 
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
     // Generate request number: MR-YYMM-NNNN
-    let seq_rows = conn
-        .simple_query("SELECT NEXT VALUE FOR SQ_Maintenance_No AS seq_num")
-        .await?
-        .into_first_result()
+    let seq_rows = sqlx::query("SELECT nextval('sq_maintenance_no')::int AS seq_num")
+        .fetch_all(pool)
         .await?;
 
     let seq_num: i32 = seq_rows
         .first()
-        .and_then(|r| r.get::<i32, _>("seq_num"))
+        .and_then(|r| r.try_get::<i32, _>("seq_num").ok())
         .unwrap_or(1);
 
     let now = chrono::Local::now();
@@ -363,33 +356,29 @@ pub async fn create_request(
 
     let priority = body.priority.unwrap_or(2);
 
-    let rows = conn
-        .query(
+    let rows = sqlx::query(
             r#"
-            INSERT INTO HT_Maintenance_Requests (
-                MReq_No, MReq_Room_ID, MReq_Category_ID, MReq_Title,
-                MReq_Description, MReq_Priority, MReq_Assigned_To
+            INSERT INTO ht_maintenance_requests (
+                mreq_no, mreq_room_id, mreq_category_id, mreq_title,
+                mreq_description, mreq_priority, mreq_assigned_to
             )
-            OUTPUT INSERTED.MReq_ID
-            VALUES (@P1, @P2, @P3, @P4, @P5, @P6, @P7)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING mreq_id
             "#,
-            &[
-                &request_no.as_str(),
-                &body.room_id,
-                &body.category_id,
-                &title,
-                &body.description.as_deref(),
-                &priority,
-                &body.assigned_to.as_deref(),
-            ],
         )
-        .await?
-        .into_first_result()
+        .bind(&request_no.as_str())
+        .bind(&body.room_id)
+        .bind(&body.category_id)
+        .bind(&title)
+        .bind(&body.description.as_deref())
+        .bind(&priority)
+        .bind(&body.assigned_to.as_deref())
+        .fetch_all(pool)
         .await?;
 
     let id = rows
         .first()
-        .and_then(|r| r.get::<i32, _>("MReq_ID"))
+        .and_then(|r| r.try_get::<i32, _>("mreq_id").ok())
         .ok_or_else(|| ApiError::Internal("Failed to create maintenance request".to_string()))?;
 
     Ok(Json(MutationResponse {
@@ -405,38 +394,36 @@ pub async fn get_request(
     State(state): State<AppState>,
     Path(request_id): Path<i32>,
 ) -> ApiResult<Json<RequestResponse>> {
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
-    let rows = conn
-        .query(
+    let rows = sqlx::query(
             r#"
             SELECT
-                r.MReq_ID,
-                r.MReq_No,
-                r.MReq_Room_ID,
-                rm.Room_No,
-                r.MReq_Category_ID,
-                c.MCat_Name,
-                r.MReq_Title,
-                r.MReq_Description,
-                r.MReq_Priority,
-                r.MReq_Status,
-                r.MReq_Assigned_To,
-                r.MReq_Started_At,
-                r.MReq_Completed_At,
-                r.MReq_Resolution,
-                r.MReq_Cost,
-                r.MReq_Created_At,
-                r.MReq_Updated_At
-            FROM HT_Maintenance_Requests r
-            LEFT JOIN HT_Rooms_New rm ON r.MReq_Room_ID = rm.Room_ID
-            LEFT JOIN HT_Maintenance_Categories c ON r.MReq_Category_ID = c.MCat_ID
-            WHERE r.MReq_ID = @P1
+                r.mreq_id,
+                r.mreq_no,
+                r.mreq_room_id,
+                rm.room_no,
+                r.mreq_category_id,
+                c.mcat_name,
+                r.mreq_title,
+                r.mreq_description,
+                r.mreq_priority,
+                r.mreq_status,
+                r.mreq_assigned_to,
+                r.mreq_started_at,
+                r.mreq_completed_at,
+                r.mreq_resolution,
+                r.mreq_cost,
+                r.mreq_created_at,
+                r.mreq_updated_at
+            FROM ht_maintenance_requests r
+            LEFT JOIN ht_rooms_new rm ON r.mreq_room_id = rm.room_id
+            LEFT JOIN ht_maintenance_categories c ON r.mreq_category_id = c.mcat_id
+            WHERE r.mreq_id = $1
             "#,
-            &[&request_id],
         )
-        .await?
-        .into_first_result()
+        .bind(&request_id)
+        .fetch_all(pool)
         .await?;
 
     let row = rows
@@ -444,23 +431,23 @@ pub async fn get_request(
         .ok_or_else(|| ApiError::NotFound("Maintenance request not found".to_string()))?;
 
     let request = MaintenanceRequest {
-        id: row.get::<i32, _>("MReq_ID").unwrap_or(0),
-        request_no: row.get::<&str, _>("MReq_No").unwrap_or_default().to_string(),
-        room_id: row.get::<i32, _>("MReq_Room_ID").unwrap_or(0),
-        room_no: row.get::<&str, _>("Room_No").map(String::from),
-        category_id: row.get::<i32, _>("MReq_Category_ID").unwrap_or(0),
-        category_name: row.get::<&str, _>("MCat_Name").map(String::from),
-        title: row.get::<&str, _>("MReq_Title").unwrap_or_default().to_string(),
-        description: row.get::<&str, _>("MReq_Description").map(String::from),
-        priority: row.get::<i32, _>("MReq_Priority").unwrap_or(2),
-        status: row.get::<&str, _>("MReq_Status").unwrap_or("open").to_string(),
-        assigned_to: row.get::<&str, _>("MReq_Assigned_To").map(String::from),
-        started_at: row.get::<NaiveDateTime, _>("MReq_Started_At"),
-        completed_at: row.get::<NaiveDateTime, _>("MReq_Completed_At"),
-        resolution: row.get::<&str, _>("MReq_Resolution").map(String::from),
-        cost: row.get::<f64, _>("MReq_Cost"),
-        created_at: row.get::<NaiveDateTime, _>("MReq_Created_At"),
-        updated_at: row.get::<NaiveDateTime, _>("MReq_Updated_At"),
+        id: row.try_get::<i32, _>("mreq_id").unwrap_or(0),
+        request_no: row.try_get::<String, _>("mreq_no").unwrap_or_default(),
+        room_id: row.try_get::<i32, _>("mreq_room_id").unwrap_or(0),
+        room_no: row.try_get::<String, _>("room_no").ok(),
+        category_id: row.try_get::<i32, _>("mreq_category_id").unwrap_or(0),
+        category_name: row.try_get::<String, _>("mcat_name").ok(),
+        title: row.try_get::<String, _>("mreq_title").unwrap_or_default(),
+        description: row.try_get::<String, _>("mreq_description").ok(),
+        priority: row.try_get::<i32, _>("mreq_priority").unwrap_or(2),
+        status: row.try_get::<String, _>("mreq_status").unwrap_or_else(|_| "open".to_string()),
+        assigned_to: row.try_get::<String, _>("mreq_assigned_to").ok(),
+        started_at: row.try_get::<NaiveDateTime, _>("mreq_started_at").ok(),
+        completed_at: row.try_get::<NaiveDateTime, _>("mreq_completed_at").ok(),
+        resolution: row.try_get::<String, _>("mreq_resolution").ok(),
+        cost: row.try_get::<f64, _>("mreq_cost").ok(),
+        created_at: row.try_get::<NaiveDateTime, _>("mreq_created_at").ok(),
+        updated_at: row.try_get::<NaiveDateTime, _>("mreq_updated_at").ok(),
     };
 
     Ok(Json(RequestResponse {
@@ -475,66 +462,66 @@ pub async fn update_request(
     Path(request_id): Path<i32>,
     Json(body): Json<UpdateRequestInput>,
 ) -> ApiResult<Json<MutationResponse>> {
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
     // Build dynamic UPDATE query
     let mut set_parts: Vec<String> = Vec::new();
 
     if let Some(ref title) = body.title {
         let escaped = title.replace('\'', "''");
-        set_parts.push(format!("MReq_Title = N'{}'", escaped));
+        set_parts.push(format!("mreq_title = '{}'", escaped));
     }
 
     if let Some(ref description) = body.description {
         let escaped = description.replace('\'', "''");
-        set_parts.push(format!("MReq_Description = N'{}'", escaped));
+        set_parts.push(format!("mreq_description = '{}'", escaped));
     }
 
     if let Some(priority) = body.priority {
-        set_parts.push(format!("MReq_Priority = {}", priority));
+        set_parts.push(format!("mreq_priority = {}", priority));
     }
 
     if let Some(ref status) = body.status {
         let escaped = status.replace('\'', "''");
-        set_parts.push(format!("MReq_Status = '{}'", escaped));
+        set_parts.push(format!("mreq_status = '{}'", escaped));
 
         // Automatically set timestamps based on status
         if status == "in_progress" {
-            set_parts.push("MReq_Started_At = GETDATE()".to_string());
+            set_parts.push("mreq_started_at = NOW()".to_string());
         } else if status == "completed" {
-            set_parts.push("MReq_Completed_At = GETDATE()".to_string());
+            set_parts.push("mreq_completed_at = NOW()".to_string());
         }
     }
 
     if let Some(ref assigned_to) = body.assigned_to {
         let escaped = assigned_to.replace('\'', "''");
-        set_parts.push(format!("MReq_Assigned_To = N'{}'", escaped));
+        set_parts.push(format!("mreq_assigned_to = '{}'", escaped));
     }
 
     if let Some(ref resolution) = body.resolution {
         let escaped = resolution.replace('\'', "''");
-        set_parts.push(format!("MReq_Resolution = N'{}'", escaped));
+        set_parts.push(format!("mreq_resolution = '{}'", escaped));
     }
 
     if let Some(cost) = body.cost {
-        set_parts.push(format!("MReq_Cost = {}", cost));
+        set_parts.push(format!("mreq_cost = {}", cost));
     }
 
     if set_parts.is_empty() {
         return Err(ApiError::BadRequest("No fields to update".to_string()));
     }
 
-    set_parts.push("MReq_Updated_At = GETDATE()".to_string());
+    set_parts.push("mreq_updated_at = NOW()".to_string());
 
     let update_query = format!(
-        "UPDATE HT_Maintenance_Requests SET {} WHERE MReq_ID = {}",
+        "UPDATE ht_maintenance_requests SET {} WHERE mreq_id = {}",
         set_parts.join(", "),
         request_id
     );
 
-    let result = conn.execute(&update_query, &[]).await?;
+    let result = sqlx::query(&update_query).execute(pool).await?;
 
-    if result.total() == 0 {
+    if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("Maintenance request not found".to_string()));
     }
 
@@ -564,27 +551,27 @@ pub async fn update_request_status(
         )));
     }
 
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
     // Build update query with automatic timestamp handling
     let update_query = match status.as_str() {
         "in_progress" => format!(
-            "UPDATE HT_Maintenance_Requests SET MReq_Status = '{}', MReq_Started_At = GETDATE(), MReq_Updated_At = GETDATE() WHERE MReq_ID = {}",
+            "UPDATE ht_maintenance_requests SET mreq_status = '{}', mreq_started_at = NOW(), mreq_updated_at = NOW() WHERE mreq_id = {}",
             status, request_id
         ),
         "completed" => format!(
-            "UPDATE HT_Maintenance_Requests SET MReq_Status = '{}', MReq_Completed_At = GETDATE(), MReq_Updated_At = GETDATE() WHERE MReq_ID = {}",
+            "UPDATE ht_maintenance_requests SET mreq_status = '{}', mreq_completed_at = NOW(), mreq_updated_at = NOW() WHERE mreq_id = {}",
             status, request_id
         ),
         _ => format!(
-            "UPDATE HT_Maintenance_Requests SET MReq_Status = '{}', MReq_Updated_At = GETDATE() WHERE MReq_ID = {}",
+            "UPDATE ht_maintenance_requests SET mreq_status = '{}', mreq_updated_at = NOW() WHERE mreq_id = {}",
             status, request_id
         ),
     };
 
-    let result = conn.execute(&update_query, &[]).await?;
+    let result = sqlx::query(&update_query).execute(pool).await?;
 
-    if result.total() == 0 {
+    if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("Maintenance request not found".to_string()));
     }
 

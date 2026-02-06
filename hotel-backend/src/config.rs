@@ -27,10 +27,11 @@ impl DbConfig {
     }
 }
 
-/// Database configuration for new HotelNew database
+/// Database configuration for new HotelNew database (PostgreSQL)
 #[derive(Debug, Clone)]
 pub struct NewDbConfig {
     pub server: String,
+    pub port: u16,
     pub database: String,
     pub user: String,
     pub password: String,
@@ -40,15 +41,27 @@ pub struct NewDbConfig {
 impl NewDbConfig {
     pub fn from_env() -> Self {
         Self {
-            server: env::var("NEW_DB_SERVER").unwrap_or_else(|_| "192.168.100.222".to_string()),
-            database: env::var("NEW_DB_NAME").unwrap_or_else(|_| "HotelNew".to_string()),
-            user: env::var("NEW_DB_USER").unwrap_or_else(|_| "sa".to_string()),
+            server: env::var("NEW_DB_SERVER").unwrap_or_else(|_| "localhost".to_string()),
+            port: env::var("NEW_DB_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5439),
+            database: env::var("NEW_DB_NAME").unwrap_or_else(|_| "hotelnew".to_string()),
+            user: env::var("NEW_DB_USER").unwrap_or_else(|_| "postgres".to_string()),
             password: env::var("NEW_DB_PASSWORD").unwrap_or_else(|_| "12345678".to_string()),
             pool_max: env::var("NEW_DB_POOL_MAX")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10),
         }
+    }
+
+    /// Build PostgreSQL connection string
+    pub fn connection_string(&self) -> String {
+        format!(
+            "postgres://{}:{}@{}:{}/{}",
+            self.user, self.password, self.server, self.port, self.database
+        )
     }
 }
 

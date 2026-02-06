@@ -2,9 +2,11 @@
 
 This directory contains SQL migration scripts for the hotel management database.
 
-## IMPORTANT: Shared Database
+## IMPORTANT: Database Architecture Change (v2.13.0)
 
-This database is shared with another application. **All schema changes must be documented here** to prevent breaking changes.
+As of v2.13.0, the HotelNew database has been **migrated from SQL Server to PostgreSQL**. The migration files 002-007 in this directory are **historical T-SQL scripts** that were used with the original SQL Server setup. They are kept for reference but are no longer applied directly.
+
+The canonical schema source for HotelNew is now **`init-db/init-hotelnew.sql`** (PostgreSQL syntax), which is auto-run by Docker on first startup.
 
 ## Migration Naming Convention
 
@@ -17,6 +19,8 @@ NNN_description.sql
 
 ## How to Apply Migrations
 
+### Legacy Database (SQL Server)
+
 1. **Review the migration** - Check if the changes are compatible with other applications
 2. **Backup the database** - Always backup before applying migrations
 3. **Run manually** - Execute the SQL file against the database using SSMS or sqlcmd:
@@ -25,6 +29,24 @@ NNN_description.sql
 # Using sqlcmd
 sqlcmd -S 192.168.100.222 -d HotelDB -U username -P password -i migrations/001_create_booking_notes_table.sql
 ```
+
+### HotelNew Database (PostgreSQL)
+
+For new schema changes to HotelNew:
+
+1. **Update `init-db/init-hotelnew.sql`** - Add new tables/changes with `IF NOT EXISTS`
+2. **Create a migration file** in this directory for documentation
+3. **Apply to running database** using psql:
+
+```bash
+# Connect to PostgreSQL container
+docker exec -it new-hotel-db psql -U postgres -d hotelnew
+
+# Or run a migration file
+docker exec -i new-hotel-db psql -U postgres -d hotelnew < migrations/NNN_description.sql
+```
+
+Note: PostgreSQL auto-runs `init-db/init-hotelnew.sql` on first startup (when the data volume is empty). For existing deployments, apply changes manually via psql.
 
 ## Migration Guidelines
 
@@ -38,12 +60,12 @@ sqlcmd -S 192.168.100.222 -d HotelDB -U username -P password -i migrations/001_c
 | # | File | Description | Applied |
 |---|------|-------------|---------|
 | 001 | `001_create_booking_notes_table.sql` | Creates HT_Booking_Notes table for booking annotations | v1.16.0 (deprecated) |
-| 002 | `002_create_new_hotel_database.sql` | Creates new HotelNew database with all application-owned tables | Pending |
-| 003 | `003_alter_ht_rates_table.sql` | Alters HT_Rates table to support multiplier/fixed rate types for Phase 3 Financial features | Pending |
-| 004 | `004_create_inventory_tables.sql` | Creates inventory management tables (categories, items, room inventory, transactions) | Pending |
-| 005 | `005_move_booking_notes_to_hotelnew.sql` | Moves HT_Booking_Notes to HotelNew database (enforces legacy DB read-only) | v2.2.0 |
-| 006 | `006_payment_tracking.sql` | Adds HT_Payments table for multiple payments per check-in | v2.10.0 |
-| 007 | `007_maintenance_system.sql` | Creates maintenance request system tables (categories, requests, sequence) | Pending |
+| 002 | `002_create_new_hotel_database.sql` | Creates new HotelNew database with all application-owned tables (T-SQL, historical) | Superseded by PG init |
+| 003 | `003_alter_ht_rates_table.sql` | Alters HT_Rates table to support multiplier/fixed rate types (T-SQL, historical) | Superseded by PG init |
+| 004 | `004_create_inventory_tables.sql` | Creates inventory management tables (T-SQL, historical) | Superseded by PG init |
+| 005 | `005_move_booking_notes_to_hotelnew.sql` | Moves HT_Booking_Notes to HotelNew database (T-SQL, historical) | Superseded by PG init |
+| 006 | `006_payment_tracking.sql` | Adds HT_Payments table for multiple payments per check-in (T-SQL, historical) | Superseded by PG init |
+| 007 | `007_maintenance_system.sql` | Creates maintenance request system tables (T-SQL, historical) | Superseded by PG init |
 
 ## Tables Owned by This Application
 
@@ -53,29 +75,29 @@ sqlcmd -S 192.168.100.222 -d HotelDB -U username -P password -i migrations/001_c
 
 Previously, `HT_Booking_Notes` was created in the legacy database. As of v2.2.0, it has been moved to HotelNew to enforce the read-only principle.
 
-### New Database (HotelNew)
+### New Database (HotelNew - PostgreSQL)
 
-These tables are created by migration 002 in the new HotelNew database:
+All table and column names are **lowercase** (PostgreSQL convention). The canonical schema is defined in `init-db/init-hotelnew.sql`.
 
 | Table | Description | Since |
 |-------|-------------|-------|
-| `HT_Customers` | Customer information (replaces View_Customers) | v2.0.0 |
-| `HT_Room_Types` | Room type definitions (Standard, Deluxe, Suite, etc.) | v2.0.0 |
-| `HT_Rooms_New` | Room information (replaces HT_Rooms) | v2.0.0 |
-| `HT_Bookings` | Booking records (replaces View_Booking_Ds) | v2.0.0 |
-| `HT_Booking_Rooms` | Junction table linking bookings to rooms | v2.0.0 |
-| `HT_CheckIns` | Check-in records (replaces View_CheckIn_Ds) | v2.0.0 |
-| `HT_Guest_Registry` | Guest registry for TM30 compliance | v2.0.0 |
-| `HT_Rates` | Room rates by type and date range | v2.0.0 |
-| `HT_Settings` | Application settings key-value store | v2.0.0 |
-| `HT_Inventory_Categories` | Inventory categories (Minibar, Amenities, Linens, Equipment) | v2.1.0 |
-| `HT_Inventory_Items` | Inventory items with stock tracking | v2.1.0 |
-| `HT_Room_Inventory` | Items assigned to each room | v2.1.0 |
-| `HT_Inventory_Transactions` | Stock movement transactions (IN, OUT, ADJUST, MOVE) | v2.1.0 |
-| `HT_Booking_Notes` | Booking notes (moved from legacy DB in v2.2.0) | v2.2.0 |
-| `HT_Payments` | Payment records for check-ins (multiple payments per stay) | v2.10.0 |
-| `HT_Maintenance_Categories` | Maintenance categories (Electrical, Plumbing, AC, Furniture, General) | v2.11.0 |
-| `HT_Maintenance_Requests` | Maintenance request records with status tracking | v2.11.0 |
+| `ht_customers` | Customer information (replaces View_Customers) | v2.0.0 |
+| `ht_room_types` | Room type definitions (Standard, Deluxe, Suite, etc.) | v2.0.0 |
+| `ht_rooms_new` | Room information (replaces HT_Rooms) | v2.0.0 |
+| `ht_bookings` | Booking records (replaces View_Booking_Ds) | v2.0.0 |
+| `ht_booking_rooms` | Junction table linking bookings to rooms | v2.0.0 |
+| `ht_checkins` | Check-in records (replaces View_CheckIn_Ds) | v2.0.0 |
+| `ht_guest_registry` | Guest registry for TM30 compliance | v2.0.0 |
+| `ht_rates` | Room rates by type and date range | v2.0.0 |
+| `ht_settings` | Application settings key-value store | v2.0.0 |
+| `ht_inventory_categories` | Inventory categories (Minibar, Amenities, Linens, Equipment) | v2.1.0 |
+| `ht_inventory_items` | Inventory items with stock tracking | v2.1.0 |
+| `ht_room_inventory` | Items assigned to each room | v2.1.0 |
+| `ht_inventory_transactions` | Stock movement transactions (IN, OUT, ADJUST, MOVE) | v2.1.0 |
+| `ht_booking_notes` | Booking notes (moved from legacy DB in v2.2.0) | v2.2.0 |
+| `ht_payments` | Payment records for check-ins (multiple payments per stay) | v2.10.0 |
+| `ht_maintenance_categories` | Maintenance categories (Electrical, Plumbing, AC, Furniture, General) | v2.11.0 |
+| `ht_maintenance_requests` | Maintenance request records with status tracking | v2.11.0 |
 
 ## Tables Used (Read-Only or Shared)
 
@@ -106,14 +128,14 @@ If you need additional data or relationships:
    ```sql
    -- Example: Need to add notes to bookings
    -- DON'T: ALTER TABLE View_Booking_Ds ADD Note_Text NVARCHAR(MAX)
-   -- DO: CREATE TABLE HT_Booking_Notes (Book_No, Note_Text, ...)
+   -- DO: CREATE TABLE ht_booking_notes (book_no, note_text, ...)
    ```
 
 2. **Create a new view** - If you need a different data shape, create your own view
    ```sql
    -- Example: Need a combined view
    -- DON'T: ALTER VIEW View_Booking_Ds AS ...
-   -- DO: CREATE VIEW HT_Booking_Summary AS SELECT ... FROM View_Booking_Ds JOIN ...
+   -- DO: CREATE VIEW ht_booking_summary AS SELECT ... FROM ht_bookings JOIN ...
    ```
 
 3. **Use application-level joins** - Join data in your API code instead of modifying the database

@@ -4,6 +4,7 @@
 
 use axum::{extract::State, Json};
 use serde::Serialize;
+use sqlx::Row;
 
 use super::mode::AppState;
 use crate::error::ApiResult;
@@ -32,59 +33,53 @@ pub struct StatsResponse {
 
 /// GET /api/new/stats - Dashboard statistics
 pub async fn get_stats(State(state): State<AppState>) -> ApiResult<Json<StatsResponse>> {
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
     // Query room counts by status
-    let room_stats_rows = conn
-        .simple_query(
-            r#"
+    let room_stats_sql =
+        r#"
             SELECT
-                COUNT(*) as total_rooms,
-                SUM(CASE WHEN Room_Status = 'available' THEN 1 ELSE 0 END) as available_rooms,
-                SUM(CASE WHEN Room_Status = 'occupied' THEN 1 ELSE 0 END) as occupied_rooms,
-                SUM(CASE WHEN Room_Status = 'maintenance' THEN 1 ELSE 0 END) as maintenance_rooms,
-                SUM(CASE WHEN Room_Status = 'cleaning' THEN 1 ELSE 0 END) as cleaning_rooms
-            FROM HT_Rooms_New
-            "#,
-        )
-        .await?
-        .into_first_result()
-        .await?;
+                COUNT(*)::int as total_rooms,
+                SUM(CASE WHEN room_status = 'available' THEN 1 ELSE 0 END)::int as available_rooms,
+                SUM(CASE WHEN room_status = 'occupied' THEN 1 ELSE 0 END)::int as occupied_rooms,
+                SUM(CASE WHEN room_status = 'maintenance' THEN 1 ELSE 0 END)::int as maintenance_rooms,
+                SUM(CASE WHEN room_status = 'cleaning' THEN 1 ELSE 0 END)::int as cleaning_rooms
+            FROM ht_rooms_new
+            "#;
+
+    let room_stats_rows = sqlx::query(room_stats_sql).fetch_all(pool).await?;
 
     let (total_rooms, available_rooms, occupied_rooms, maintenance_rooms, cleaning_rooms) =
         room_stats_rows
             .first()
             .map(|row| {
                 (
-                    row.get::<i32, _>("total_rooms").unwrap_or(0),
-                    row.get::<i32, _>("available_rooms").unwrap_or(0),
-                    row.get::<i32, _>("occupied_rooms").unwrap_or(0),
-                    row.get::<i32, _>("maintenance_rooms").unwrap_or(0),
-                    row.get::<i32, _>("cleaning_rooms").unwrap_or(0),
+                    row.try_get::<i32, _>("total_rooms").unwrap_or(0),
+                    row.try_get::<i32, _>("available_rooms").unwrap_or(0),
+                    row.try_get::<i32, _>("occupied_rooms").unwrap_or(0),
+                    row.try_get::<i32, _>("maintenance_rooms").unwrap_or(0),
+                    row.try_get::<i32, _>("cleaning_rooms").unwrap_or(0),
                 )
             })
             .unwrap_or((0, 0, 0, 0, 0));
 
     // Query today's check-ins (active check-ins that started today)
-    let checkin_stats_rows = conn
-        .simple_query(
-            r#"
+    let checkin_stats_sql =
+        r#"
             SELECT
-                SUM(CASE WHEN CAST(Cin_CheckIn_Time AS DATE) = CAST(GETDATE() AS DATE) THEN 1 ELSE 0 END) as today_check_ins,
-                SUM(CASE WHEN CAST(Cin_CheckOut_Time AS DATE) = CAST(GETDATE() AS DATE) THEN 1 ELSE 0 END) as today_check_outs
-            FROM HT_CheckIns
-            "#,
-        )
-        .await?
-        .into_first_result()
-        .await?;
+                SUM(CASE WHEN cin_checkin_time::date = NOW()::date THEN 1 ELSE 0 END)::int as today_check_ins,
+                SUM(CASE WHEN cin_checkout_time::date = NOW()::date THEN 1 ELSE 0 END)::int as today_check_outs
+            FROM ht_checkins
+            "#;
+
+    let checkin_stats_rows = sqlx::query(checkin_stats_sql).fetch_all(pool).await?;
 
     let (today_check_ins, today_check_outs) = checkin_stats_rows
         .first()
         .map(|row| {
             (
-                row.get::<i32, _>("today_check_ins").unwrap_or(0),
-                row.get::<i32, _>("today_check_outs").unwrap_or(0),
+                row.try_get::<i32, _>("today_check_ins").unwrap_or(0),
+                row.try_get::<i32, _>("today_check_outs").unwrap_or(0),
             )
         })
         .unwrap_or((0, 0));
