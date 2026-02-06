@@ -90,34 +90,34 @@ describe('RoomCleaningCard Component', () => {
   })
 
   describe('Status-based Styling', () => {
-    test('dirty room has red styling', () => {
+    test('dirty room has red border styling', () => {
       const { container } = render(
         <RoomCleaningCard room={createMockRoom({ status: 'dirty' })} onStatusChange={mockOnStatusChange} />
       )
 
       const card = container.firstChild as HTMLElement
-      expect(card).toHaveClass('bg-red-50')
-      expect(card).toHaveClass('border-red-200')
+      expect(card.className).toContain('bg-zinc-900')
+      expect(card.className).toContain('border-red-900')
     })
 
-    test('cleaning room has yellow styling', () => {
+    test('cleaning room has amber border styling', () => {
       const { container } = render(
         <RoomCleaningCard room={createMockRoom({ status: 'cleaning' })} onStatusChange={mockOnStatusChange} />
       )
 
       const card = container.firstChild as HTMLElement
-      expect(card).toHaveClass('bg-yellow-50')
-      expect(card).toHaveClass('border-yellow-200')
+      expect(card.className).toContain('bg-zinc-900')
+      expect(card.className).toContain('border-amber-900')
     })
 
-    test('available room has green styling', () => {
+    test('available room has emerald border styling', () => {
       const { container } = render(
         <RoomCleaningCard room={createMockRoom({ status: 'available' })} onStatusChange={mockOnStatusChange} />
       )
 
       const card = container.firstChild as HTMLElement
-      expect(card).toHaveClass('bg-green-50')
-      expect(card).toHaveClass('border-green-200')
+      expect(card.className).toContain('bg-zinc-900')
+      expect(card.className).toContain('border-emerald-900')
     })
   })
 

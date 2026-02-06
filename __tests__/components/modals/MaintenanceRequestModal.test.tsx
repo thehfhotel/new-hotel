@@ -174,7 +174,7 @@ describe('MaintenanceRequestModal Component', () => {
       render(<MaintenanceRequestModal {...defaultProps} />)
 
       const mediumBtn = screen.getByText('ปานกลาง').closest('button')
-      expect(mediumBtn).toHaveClass('border-yellow-500')
+      expect(mediumBtn).toHaveClass('border-amber-500')
     })
 
     test('clicking priority changes selection', () => {
