@@ -37,18 +37,19 @@ sqlcmd -S 192.168.100.222 -d HotelDB -U username -P password -i migrations/001_c
 
 | # | File | Description | Applied |
 |---|------|-------------|---------|
-| 001 | `001_create_booking_notes_table.sql` | Creates HT_Booking_Notes table for booking annotations | v1.16.0 |
+| 001 | `001_create_booking_notes_table.sql` | Creates HT_Booking_Notes table for booking annotations | v1.16.0 (deprecated) |
 | 002 | `002_create_new_hotel_database.sql` | Creates new HotelNew database with all application-owned tables | Pending |
 | 003 | `003_alter_ht_rates_table.sql` | Alters HT_Rates table to support multiplier/fixed rate types for Phase 3 Financial features | Pending |
 | 004 | `004_create_inventory_tables.sql` | Creates inventory management tables (categories, items, room inventory, transactions) | Pending |
+| 005 | `005_move_booking_notes_to_hotelnew.sql` | Moves HT_Booking_Notes to HotelNew database (enforces legacy DB read-only) | v2.2.0 |
 
 ## Tables Owned by This Application
 
 ### Legacy Database (db)
 
-| Table | Description | Since |
-|-------|-------------|-------|
-| `HT_Booking_Notes` | Stores notes/annotations for bookings | v1.16.0 |
+**IMPORTANT**: The legacy database should be treated as READ-ONLY. Do not create or modify any tables in the legacy database.
+
+Previously, `HT_Booking_Notes` was created in the legacy database. As of v2.2.0, it has been moved to HotelNew to enforce the read-only principle.
 
 ### New Database (HotelNew)
 
@@ -69,6 +70,7 @@ These tables are created by migration 002 in the new HotelNew database:
 | `HT_Inventory_Items` | Inventory items with stock tracking | v2.1.0 |
 | `HT_Room_Inventory` | Items assigned to each room | v2.1.0 |
 | `HT_Inventory_Transactions` | Stock movement transactions (IN, OUT, ADJUST, MOVE) | v2.1.0 |
+| `HT_Booking_Notes` | Booking notes (moved from legacy DB in v2.2.0) | v2.2.0 |
 
 ## Tables Used (Read-Only or Shared)
 

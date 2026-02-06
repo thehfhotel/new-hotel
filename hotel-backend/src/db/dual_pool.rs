@@ -24,8 +24,8 @@ impl DualDbPool {
     }
 }
 
-/// Create a pool from NewDbConfig
-async fn create_new_db_pool(config: &NewDbConfig) -> Result<DbPool, Box<dyn std::error::Error>> {
+/// Create a pool from NewDbConfig (public for standalone HotelNew usage)
+pub async fn create_new_pool(config: &NewDbConfig) -> Result<DbPool, Box<dyn std::error::Error>> {
     let mut tib_config = Config::new();
 
     tib_config.host(&config.server);
@@ -66,7 +66,7 @@ pub async fn create_dual_pool(config: &AppConfig) -> Result<DualDbPool, Box<dyn 
     tracing::info!("Legacy database pool created for {}", config.db.database);
 
     // Create new_hotel pool using the new_db config
-    let new_hotel = create_new_db_pool(&config.new_db).await?;
+    let new_hotel = create_new_pool(&config.new_db).await?;
     tracing::info!("New hotel database pool created for {}", config.new_db.database);
 
     Ok(DualDbPool::new(legacy, new_hotel))

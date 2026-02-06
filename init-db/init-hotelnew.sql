@@ -31,6 +31,21 @@ GO
 -- Migration 002: Core Tables
 -- =============================================================================
 
+-- HT_Booking_Notes - Booking annotations (stored in HotelNew to keep legacy DB read-only)
+-- Notes are linked to legacy booking numbers (Book_No) but stored here
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[HT_Booking_Notes]') AND type = 'U')
+BEGIN
+    CREATE TABLE [dbo].[HT_Booking_Notes] (
+        [Note_ID] INT IDENTITY(1,1) PRIMARY KEY,
+        [Book_No] NVARCHAR(50) NOT NULL,
+        [Note_Text] NVARCHAR(MAX) NOT NULL,
+        [Created_At] DATETIME DEFAULT GETDATE(),
+        [Updated_At] DATETIME DEFAULT GETDATE()
+    )
+    CREATE INDEX IX_Booking_Notes_BookNo ON [dbo].[HT_Booking_Notes]([Book_No])
+END
+GO
+
 -- HT_Customers - Customer master data
 IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[HT_Customers]') AND type = 'U')
 BEGIN

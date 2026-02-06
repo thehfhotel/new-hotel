@@ -1,10 +1,13 @@
 //! Booking API routes
 //!
-//! - GET /api/bookings - List bookings (paginated)
-//! - GET /api/bookings/:id - Get booking details
-//! - GET /api/bookings/:id/notes - Get booking notes
-//! - POST /api/bookings/:id/notes - Add booking note
-//! - DELETE /api/bookings/:id/notes - Delete booking note
+//! - GET /api/bookings - List bookings (paginated) - uses legacy DB
+//! - GET /api/bookings/:id - Get booking details - uses legacy DB for booking, HotelNew for notes
+//! - GET /api/bookings/:id/notes - Get booking notes - uses HotelNew DB
+//! - POST /api/bookings/:id/notes - Add booking note - uses HotelNew DB
+//! - DELETE /api/bookings/:id/notes - Delete booking note - uses HotelNew DB
+//!
+//! Note: HT_Booking_Notes table is stored in HotelNew database to ensure
+//! the legacy database remains read-only.
 
 use std::collections::HashMap;
 
@@ -22,6 +25,7 @@ use crate::models::{
     BookingDetailResponse, BookingRoom, BookingRoomDetail, BookingsResponse,
     CreateNoteRequest, CreateNoteResponse, DeleteNoteResponse, Note, NotesResponse, Pagination,
 };
+use crate::routes::mode::AppState;
 
 /// Query parameters for bookings list
 #[derive(Debug, Deserialize)]
@@ -195,15 +199,22 @@ pub async fn list_bookings(
     }))
 }
 
-/// GET /api/bookings/:id - Get booking details
+/// GET /api/bookings/:id - Get booking details (uses legacy DB for booking, HotelNew for notes)
+///
+/// In New-only mode (when legacy DB is unavailable), this will try to fetch
+/// from the new_pool which may not have View_Booking_Ds. The route will return
+/// a 404 in that case.
 pub async fn get_booking(
-    State(pool): State<DbPool>,
+    State(state): State<AppState>,
     Path(book_no): Path<String>,
 ) -> ApiResult<Json<BookingDetailResponse>> {
-    let mut conn = pool.get().await?;
+    // Use legacy pool for booking data (read-only)
+    // Note: In new-only mode, legacy_pool == new_pool, so this query will fail
+    // gracefully since View_Booking_Ds doesn't exist in HotelNew
+    let mut legacy_conn = state.legacy_pool.get().await?;
 
-    // Fetch booking with all rooms
-    let booking_rows = conn
+    // Fetch booking with all rooms from legacy database
+    let booking_rows = match legacy_conn
         .query(
             r#"
             SELECT
@@ -220,9 +231,17 @@ pub async fn get_booking(
             "#,
             &[&book_no],
         )
-        .await?
-        .into_first_result()
-        .await?;
+        .await
+    {
+        Ok(result) => result.into_first_result().await?,
+        Err(_) => {
+            // View_Booking_Ds doesn't exist (likely running in new-only mode)
+            // Return 404 since legacy bookings are not available
+            return Err(ApiError::NotFound(
+                "Legacy booking not available (running in new-only mode)".to_string()
+            ));
+        }
+    };
 
     if booking_rows.is_empty() {
         return Err(ApiError::NotFound("Booking not found".to_string()));
@@ -230,8 +249,14 @@ pub async fn get_booking(
 
     let first_record = &booking_rows[0];
 
-    // Try to fetch notes (table may not exist yet)
-    let notes = match conn
+    // Use new_pool for notes (HotelNew database)
+    let mut new_conn = state.new_pool.get().await?;
+
+    // Ensure notes table exists in HotelNew
+    ensure_notes_table(&mut new_conn).await?;
+
+    // Try to fetch notes from HotelNew database
+    let notes = match new_conn
         .query(
             r#"
             SELECT Note_ID, Note_Text, Created_At, Updated_At
@@ -299,12 +324,13 @@ pub async fn get_booking(
     }))
 }
 
-/// GET /api/bookings/:id/notes - Get booking notes
+/// GET /api/bookings/:id/notes - Get booking notes (uses HotelNew DB)
 pub async fn get_notes(
-    State(pool): State<DbPool>,
+    State(state): State<AppState>,
     Path(book_no): Path<String>,
 ) -> ApiResult<Json<NotesResponse>> {
-    let mut conn = pool.get().await?;
+    // Use new_pool for notes (HotelNew database - writable)
+    let mut conn = state.new_pool.get().await?;
 
     // Ensure notes table exists
     ensure_notes_table(&mut conn).await?;
@@ -342,9 +368,9 @@ pub async fn get_notes(
     }))
 }
 
-/// POST /api/bookings/:id/notes - Add booking note
+/// POST /api/bookings/:id/notes - Add booking note (uses HotelNew DB)
 pub async fn create_note(
-    State(pool): State<DbPool>,
+    State(state): State<AppState>,
     Path(book_no): Path<String>,
     Json(body): Json<CreateNoteRequest>,
 ) -> ApiResult<Json<CreateNoteResponse>> {
@@ -353,7 +379,8 @@ pub async fn create_note(
         return Err(ApiError::BadRequest("Note text is required".to_string()));
     }
 
-    let mut conn = pool.get().await?;
+    // Use new_pool for notes (HotelNew database - writable)
+    let mut conn = state.new_pool.get().await?;
 
     // Ensure notes table exists
     ensure_notes_table(&mut conn).await?;
@@ -398,13 +425,14 @@ pub struct DeleteNoteQuery {
     pub note_id: i32,
 }
 
-/// DELETE /api/bookings/:id/notes - Delete booking note
+/// DELETE /api/bookings/:id/notes - Delete booking note (uses HotelNew DB)
 pub async fn delete_note(
-    State(pool): State<DbPool>,
+    State(state): State<AppState>,
     Path(book_no): Path<String>,
     Query(params): Query<DeleteNoteQuery>,
 ) -> ApiResult<Json<DeleteNoteResponse>> {
-    let mut conn = pool.get().await?;
+    // Use new_pool for notes (HotelNew database - writable)
+    let mut conn = state.new_pool.get().await?;
 
     let result = conn
         .execute(
