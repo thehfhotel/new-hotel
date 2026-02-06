@@ -1,6 +1,6 @@
 //! Booking models
 
-use chrono::NaiveDateTime;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use super::note::Note;
@@ -25,9 +25,9 @@ pub struct BookingCustomer {
 #[serde(rename_all = "camelCase")]
 pub struct Booking {
     pub book_no: String,
-    pub book_date: Option<NaiveDateTime>,
-    pub check_in: Option<NaiveDateTime>,
-    pub check_out: Option<NaiveDateTime>,
+    pub book_date: Option<DateTime<Utc>>,
+    pub check_in: Option<DateTime<Utc>>,
+    pub check_out: Option<DateTime<Utc>>,
     pub customer: BookingCustomer,
     pub status: String,
     pub rooms: Vec<BookingRoom>,
@@ -63,9 +63,9 @@ pub struct BookingRoomDetail {
 #[serde(rename_all = "camelCase")]
 pub struct BookingDetail {
     pub book_no: String,
-    pub book_date: Option<NaiveDateTime>,
-    pub check_in: Option<NaiveDateTime>,
-    pub check_out: Option<NaiveDateTime>,
+    pub book_date: Option<DateTime<Utc>>,
+    pub check_in: Option<DateTime<Utc>>,
+    pub check_out: Option<DateTime<Utc>>,
     pub status: String,
     pub status_code: Option<i32>,
     pub customer: BookingCustomerDetail,

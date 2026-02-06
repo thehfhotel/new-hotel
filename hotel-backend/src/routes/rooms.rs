@@ -133,8 +133,8 @@ pub async fn get_room(
 
     let current_guest = checkin_rows.first().map(|row| CurrentGuest {
         name: row.get::<&str, _>("Cin_Cust_Name").map(String::from),
-        check_in: row.try_get::<NaiveDateTime, _>("Cin_Room_In").ok().flatten(),
-        check_out: row.try_get::<NaiveDateTime, _>("Cin_Room_Out").ok().flatten(),
+        check_in: row.try_get::<NaiveDateTime, _>("Cin_Room_In").ok().flatten().map(|dt| dt.and_utc()),
+        check_out: row.try_get::<NaiveDateTime, _>("Cin_Room_Out").ok().flatten().map(|dt| dt.and_utc()),
     });
 
     let room = RoomDetail {
@@ -153,7 +153,7 @@ pub async fn get_room(
         room_price_c: room_row.get::<f64, _>("Room_PriceC"),
         room_group: room_row.get::<&str, _>("Room_Group").map(String::from),
         room_book_name: room_row.get::<&str, _>("Room_Book_Name").map(String::from),
-        room_book_time: room_row.try_get::<NaiveDateTime, _>("Room_Book_Time").ok().flatten(),
+        room_book_time: room_row.try_get::<NaiveDateTime, _>("Room_Book_Time").ok().flatten().map(|dt| dt.and_utc()),
         current_guest,
     };
 
@@ -239,7 +239,7 @@ pub async fn get_room_status(
         .iter()
         .map(|row| RoomStatus {
             room_no: row.get::<&str, _>("room_no").unwrap_or_default().to_string(),
-            room_date: row.get::<NaiveDateTime, _>("room_date"),
+            room_date: row.get::<NaiveDateTime, _>("room_date").map(|dt| dt.and_utc()),
             room_status: row.get::<&str, _>("room_status").map(String::from),
             room_details: row.get::<&str, _>("room_Details").map(String::from),
             room_checkin_no: row.get::<&str, _>("room_CheckIn_No").map(String::from),

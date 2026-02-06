@@ -1,6 +1,6 @@
 //! Customer models
 
-use chrono::NaiveDateTime;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 /// Customer data from View_Customers
@@ -15,7 +15,7 @@ pub struct Customer {
     pub id_card: Option<String>,
     pub address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_visit: Option<NaiveDateTime>,
+    pub last_visit: Option<DateTime<Utc>>,
 }
 
 /// Customers list response
@@ -37,8 +37,8 @@ pub struct CustomerBooking {
     pub id: String,
     pub room_number: String,
     pub room_type: String,
-    pub check_in_date: Option<NaiveDateTime>,
-    pub check_out_date: Option<NaiveDateTime>,
+    pub check_in_date: Option<DateTime<Utc>>,
+    pub check_out_date: Option<DateTime<Utc>>,
     pub status: String,
     pub total_amount: f64,
 }
@@ -56,8 +56,8 @@ pub struct CustomerBookingsResponse {
 pub struct CustomerStats {
     pub total_bookings: i32,
     pub total_stays: i32,
-    pub first_visit: Option<NaiveDateTime>,
-    pub last_visit: Option<NaiveDateTime>,
+    pub first_visit: Option<DateTime<Utc>>,
+    pub last_visit: Option<DateTime<Utc>>,
     pub favorite_room_type: Option<String>,
     pub avg_stay_days: Option<f64>,
 }

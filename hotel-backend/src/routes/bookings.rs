@@ -143,9 +143,9 @@ pub async fn list_bookings(
 
         let entry = grouped.entry(book_no.clone()).or_insert_with(|| Booking {
             book_no: book_no.clone(),
-            book_date: row.get::<NaiveDateTime, _>("Book_Date"),
-            check_in: row.get::<NaiveDateTime, _>("Book_Date_in"),
-            check_out: row.get::<NaiveDateTime, _>("Book_Date_out"),
+            book_date: row.get::<NaiveDateTime, _>("Book_Date").map(|dt| dt.and_utc()),
+            check_in: row.get::<NaiveDateTime, _>("Book_Date_in").map(|dt| dt.and_utc()),
+            check_out: row.get::<NaiveDateTime, _>("Book_Date_out").map(|dt| dt.and_utc()),
             customer: BookingCustomer {
                 name: row
                     .get::<&str, _>("Book_Cust_Name")
@@ -297,9 +297,9 @@ pub async fn get_booking(
             .get::<&str, _>("Book_No")
             .unwrap_or_default()
             .to_string(),
-        book_date: first_record.get::<NaiveDateTime, _>("Book_Date"),
-        check_in: first_record.get::<NaiveDateTime, _>("Book_Date_in"),
-        check_out: first_record.get::<NaiveDateTime, _>("Book_Date_out"),
+        book_date: first_record.get::<NaiveDateTime, _>("Book_Date").map(|dt| dt.and_utc()),
+        check_in: first_record.get::<NaiveDateTime, _>("Book_Date_in").map(|dt| dt.and_utc()),
+        check_out: first_record.get::<NaiveDateTime, _>("Book_Date_out").map(|dt| dt.and_utc()),
         status: map_status(first_record.get::<i32, _>("Book_Status")),
         status_code: first_record.get::<i32, _>("Book_Status"),
         customer: BookingCustomerDetail {
