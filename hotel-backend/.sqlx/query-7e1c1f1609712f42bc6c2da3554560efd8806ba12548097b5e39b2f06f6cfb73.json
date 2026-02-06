@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO ht_room_inventory (ri_room_id, ri_item_id, ri_quantity, ri_last_checked) VALUES ($1, $2, $3, NOW())",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Int4",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7e1c1f1609712f42bc6c2da3554560efd8806ba12548097b5e39b2f06f6cfb73"
+}

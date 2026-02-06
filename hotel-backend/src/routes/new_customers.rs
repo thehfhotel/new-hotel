@@ -12,7 +12,7 @@ use axum::{
 };
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
+use sqlx::Row; // Still needed for dynamic queries in list_customers
 
 use super::mode::AppState;
 use crate::error::{ApiError, ApiResult};
@@ -216,7 +216,7 @@ pub async fn get_customer(
 ) -> ApiResult<Json<NewCustomerResponse>> {
     let pool = &state.new_pool;
 
-    let rows = sqlx::query(
+    let rec = sqlx::query!(
             r#"
             SELECT
                 cust_id,
@@ -234,28 +234,25 @@ pub async fn get_customer(
             FROM ht_customers
             WHERE cust_id = $1
             "#,
+            cust_id
         )
-        .bind(&cust_id)
-        .fetch_all(pool)
-        .await?;
-
-    let row = rows
-        .first()
+        .fetch_optional(pool)
+        .await?
         .ok_or_else(|| ApiError::NotFound("Customer not found".to_string()))?;
 
     let customer = NewCustomer {
-        id: row.try_get::<i32, _>("cust_id").unwrap_or(0),
-        first_name: row.try_get::<String, _>("cust_firstname").ok(),
-        last_name: row.try_get::<String, _>("cust_lastname").ok(),
-        phone: row.try_get::<String, _>("cust_phone").ok(),
-        email: row.try_get::<String, _>("cust_email").ok(),
-        id_card: row.try_get::<String, _>("cust_idcard").ok(),
-        address: row.try_get::<String, _>("cust_address").ok(),
-        customer_type: row.try_get::<String, _>("cust_type").ok(),
-        notes: row.try_get::<String, _>("cust_notes").ok(),
-        active: row.try_get::<bool, _>("cust_active").unwrap_or(true),
-        created_at: row.try_get::<NaiveDateTime, _>("created_at").ok(),
-        updated_at: row.try_get::<NaiveDateTime, _>("updated_at").ok(),
+        id: rec.cust_id,
+        first_name: Some(rec.cust_firstname),
+        last_name: rec.cust_lastname,
+        phone: rec.cust_phone,
+        email: rec.cust_email,
+        id_card: rec.cust_idcard,
+        address: rec.cust_address,
+        customer_type: rec.cust_type,
+        notes: rec.cust_notes,
+        active: rec.cust_active.unwrap_or(true),
+        created_at: rec.created_at,
+        updated_at: rec.updated_at,
     };
 
     Ok(Json(NewCustomerResponse {
@@ -276,7 +273,7 @@ pub async fn create_customer(
 
     let pool = &state.new_pool;
 
-    let rows = sqlx::query(
+    let rec = sqlx::query!(
             r#"
             INSERT INTO ht_customers (
                 cust_firstname,
@@ -291,23 +288,19 @@ pub async fn create_customer(
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             RETURNING cust_id
             "#,
+            first_name,
+            body.last_name.as_deref(),
+            body.phone.as_deref(),
+            body.email.as_deref(),
+            body.id_card.as_deref(),
+            body.address.as_deref(),
+            body.customer_type.as_deref(),
+            body.notes.as_deref()
         )
-        .bind(&first_name)
-        .bind(&body.last_name.as_deref())
-        .bind(&body.phone.as_deref())
-        .bind(&body.email.as_deref())
-        .bind(&body.id_card.as_deref())
-        .bind(&body.address.as_deref())
-        .bind(&body.customer_type.as_deref())
-        .bind(&body.notes.as_deref())
-        .fetch_all(pool)
+        .fetch_one(pool)
         .await?;
 
-    let id = rows
-        .first()
-        .map(|r| r.try_get::<i32, _>("cust_id").ok())
-        .flatten()
-        .ok_or_else(|| ApiError::Internal("Failed to create customer".to_string()))?;
+    let id = rec.cust_id;
 
     Ok(Json(MutationResponse {
         success: true,
@@ -329,7 +322,7 @@ pub async fn update_customer(
 
     let pool = &state.new_pool;
 
-    let result = sqlx::query(
+    let result = sqlx::query!(
             r#"
             UPDATE ht_customers
             SET cust_firstname = $1,
@@ -343,16 +336,16 @@ pub async fn update_customer(
                 updated_at = NOW()
             WHERE cust_id = $9
             "#,
+            first_name,
+            body.last_name.as_deref(),
+            body.phone.as_deref(),
+            body.email.as_deref(),
+            body.id_card.as_deref(),
+            body.address.as_deref(),
+            body.customer_type.as_deref(),
+            body.notes.as_deref(),
+            cust_id
         )
-        .bind(&first_name)
-        .bind(&body.last_name.as_deref())
-        .bind(&body.phone.as_deref())
-        .bind(&body.email.as_deref())
-        .bind(&body.id_card.as_deref())
-        .bind(&body.address.as_deref())
-        .bind(&body.customer_type.as_deref())
-        .bind(&body.notes.as_deref())
-        .bind(&cust_id)
         .execute(pool)
         .await?;
 
@@ -374,15 +367,15 @@ pub async fn delete_customer(
 ) -> ApiResult<Json<MutationResponse>> {
     let pool = &state.new_pool;
 
-    let result = sqlx::query(
+    let result = sqlx::query!(
             r#"
             UPDATE ht_customers
             SET cust_active = false,
                 updated_at = NOW()
             WHERE cust_id = $1
             "#,
+            cust_id
         )
-        .bind(&cust_id)
         .execute(pool)
         .await?;
 

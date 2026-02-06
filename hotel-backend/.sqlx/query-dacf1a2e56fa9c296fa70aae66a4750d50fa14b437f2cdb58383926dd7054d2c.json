@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE ht_room_types SET type_code = $1, type_name = $2, type_name_en = $3, type_description = $4, type_base_price = $5::float8, type_max_guests = $6, type_bed_type = $7, type_size_sqm = $8::float8, type_amenities = $9, type_sort_order = $10, type_active = $11, type_updated_at = NOW()\n        WHERE type_id = $12",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Float8",
+        "Int4",
+        "Varchar",
+        "Float8",
+        "Text",
+        "Int4",
+        "Bool",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "dacf1a2e56fa9c296fa70aae66a4750d50fa14b437f2cdb58383926dd7054d2c"
+}

@@ -1,0 +1,88 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT r.rate_id, r.rate_name, r.rate_room_type_id, rt.type_name,\n            r.rate_type, r.rate_value::float8 as rate_value,\n            r.rate_valid_from, r.rate_valid_to, r.rate_days_of_week,\n            r.rate_active, r.rate_created, r.rate_updated\n        FROM ht_rates r\n        LEFT JOIN ht_room_types rt ON r.rate_room_type_id = rt.type_id\n        WHERE r.rate_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "rate_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "rate_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "rate_room_type_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "type_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "rate_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "rate_value",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 6,
+        "name": "rate_valid_from",
+        "type_info": "Date"
+      },
+      {
+        "ordinal": 7,
+        "name": "rate_valid_to",
+        "type_info": "Date"
+      },
+      {
+        "ordinal": 8,
+        "name": "rate_days_of_week",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 9,
+        "name": "rate_active",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 10,
+        "name": "rate_created",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 11,
+        "name": "rate_updated",
+        "type_info": "Timestamp"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      null,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "80a04c857da703d45e1862c0f840db1e0b84d4129a0f0525369317bc98f66bf2"
+}

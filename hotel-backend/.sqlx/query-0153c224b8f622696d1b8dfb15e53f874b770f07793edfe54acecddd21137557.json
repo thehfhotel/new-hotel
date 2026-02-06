@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM ht_guest_registry WHERE guest_id = $1 AND guest_cin_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0153c224b8f622696d1b8dfb15e53f874b770f07793edfe54acecddd21137557"
+}

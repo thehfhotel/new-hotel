@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE ht_customers\n            SET cust_firstname = $1,\n                cust_lastname = $2,\n                cust_phone = $3,\n                cust_email = $4,\n                cust_idcard = $5,\n                cust_address = $6,\n                cust_type = $7,\n                cust_notes = $8,\n                updated_at = NOW()\n            WHERE cust_id = $9\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "81b48e92c1941baa2e8fb75f311c4d4d1c8ed505b8f9d8bdb0be9333fd025b30"
+}

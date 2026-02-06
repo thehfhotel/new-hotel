@@ -7,6 +7,5 @@ mod dual_pool;
 mod pg_pool;
 mod pool;
 
-pub use dual_pool::DualDbPool;
 pub use pg_pool::{create_pg_pool, PgPool};
 pub use pool::{create_pool, DbPool};

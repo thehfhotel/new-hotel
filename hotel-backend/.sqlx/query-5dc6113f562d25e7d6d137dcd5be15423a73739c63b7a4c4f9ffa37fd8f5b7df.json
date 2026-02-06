@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE ht_rates SET rate_name = $1, rate_room_type_id = $2, rate_type = $3, rate_value = $4::float8,\n        rate_valid_from = $5, rate_valid_to = $6, rate_days_of_week = $7, rate_active = $8, rate_updated = NOW()\n        WHERE rate_id = $9",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Int4",
+        "Varchar",
+        "Float8",
+        "Date",
+        "Date",
+        "Varchar",
+        "Bool",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5dc6113f562d25e7d6d137dcd5be15423a73739c63b7a4c4f9ffa37fd8f5b7df"
+}

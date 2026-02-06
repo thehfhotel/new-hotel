@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE ht_rooms_new SET room_no = $1, room_type_id = $2, room_floor = $3, room_status = $4, room_clean = $5, room_maintenance = $6, room_price_weekday = $7::float8, room_price_weekend = $8::float8, room_price_special = $9::float8, room_notes = $10, updated_at = NOW()\n        WHERE room_id = $11",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Int4",
+        "Int4",
+        "Varchar",
+        "Bool",
+        "Bool",
+        "Float8",
+        "Float8",
+        "Float8",
+        "Varchar",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "443df793f114576fba253d07db6d2bd8884622eb898f857457ed2adfa4aec487"
+}

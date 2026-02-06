@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE ht_inventory_items SET item_code = $1, item_name = $2, item_category_id = $3, item_unit = $4,\n        item_min_stock = $5, item_current_stock = $6, item_cost = $7::float8, item_active = $8, item_updated = NOW()\n        WHERE item_id = $9",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "Int4",
+        "Varchar",
+        "Int4",
+        "Int4",
+        "Float8",
+        "Bool",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "566b9c53c55e70a0b3f217e4e10703ff3970a3e732f8b33bc43ec876758ead83"
+}

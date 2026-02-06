@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE ht_bookings SET book_cust_id = $1, book_checkin = $2, book_checkout = $3, book_adults = $4, book_children = $5, book_status = $6, book_source = $7, book_total_amount = $8::float8, book_deposit_amount = $9::float8, book_notes = $10, updated_at = NOW()\n        WHERE book_id = $11",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Date",
+        "Date",
+        "Int4",
+        "Int4",
+        "Varchar",
+        "Varchar",
+        "Float8",
+        "Float8",
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "17858525f066c1dc79fdbb6b9fa14a91b24ffec94a4c42a3c87bec13193bee69"
+}

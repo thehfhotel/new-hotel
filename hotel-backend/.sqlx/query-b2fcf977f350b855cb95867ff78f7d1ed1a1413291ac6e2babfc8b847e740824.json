@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO ht_customers (\n                cust_firstname,\n                cust_lastname,\n                cust_phone,\n                cust_email,\n                cust_idcard,\n                cust_address,\n                cust_type,\n                cust_notes\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)\n            RETURNING cust_id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cust_id",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b2fcf977f350b855cb95867ff78f7d1ed1a1413291ac6e2babfc8b847e740824"
+}

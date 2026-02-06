@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COUNT(*)::int as active_count FROM ht_checkins\n        WHERE cin_room_id = $1 AND cin_status = 'active'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "active_count",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "41132274a0f41febd9fad6f0dcbd1c4d204cc9debe92e5c4749c3fa1761ef13f"
+}

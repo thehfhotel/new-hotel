@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO ht_room_types (type_code, type_name, type_name_en, type_description, type_base_price, type_max_guests, type_bed_type, type_size_sqm, type_amenities, type_sort_order, type_active)\n        VALUES ($1, $2, $3, $4, $5::float8, $6, $7, $8::float8, $9, $10, $11)\n        RETURNING type_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "type_id",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Float8",
+        "Int4",
+        "Varchar",
+        "Float8",
+        "Text",
+        "Int4",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a44a99044c54f844b8ff43a847c137002732519db765a9f6709a35aa3d4d653c"
+}
