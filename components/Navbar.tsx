@@ -10,7 +10,12 @@ import {
   BedDouble,
   Hotel,
   ScrollText,
-  CreditCard
+  CreditCard,
+  BarChart3,
+  Receipt,
+  Wrench,
+  Sparkles,
+  Package,
 } from 'lucide-react'
 import ModeToggle from './ModeToggle'
 
@@ -26,6 +31,11 @@ const navLinks: NavLink[] = [
   { href: '/customers', label: 'ลูกค้า', icon: <Users size={20} /> },
   { href: '/bookings', label: 'การจอง', icon: <BookOpen size={20} /> },
   { href: '/rooms', label: 'ห้องพัก', icon: <BedDouble size={20} /> },
+  { href: '/new/housekeeping', label: 'แม่บ้าน', icon: <Sparkles size={20} /> },
+  { href: '/new/inventory', label: 'คลังสินค้า', icon: <Package size={20} /> },
+  { href: '/new/maintenance', label: 'แจ้งซ่อม', icon: <Wrench size={20} /> },
+  { href: '/new/billing', label: 'ใบแจ้งหนี้', icon: <Receipt size={20} /> },
+  { href: '/new/reports', label: 'รายงาน', icon: <BarChart3 size={20} /> },
   { href: '/card-reader', label: 'อ่านบัตร', icon: <CreditCard size={20} /> },
   { href: '/changelog', label: 'ประวัติ', icon: <ScrollText size={20} /> },
 ]
@@ -43,21 +53,23 @@ export default function Navbar() {
         </Link>
 
         {/* Navigation Links */}
-        <div className="flex items-center">
+        <div className="flex items-center overflow-x-auto">
           {navLinks.map((link) => {
-            const isActive = pathname === link.href
+            // Check if active: exact match or starts with for /new/* routes
+            const isActive = pathname === link.href ||
+              (link.href.startsWith('/new/') && pathname.startsWith(link.href))
             return (
               <Link
                 key={link.href}
                 href={link.href}
-                className={`flex items-center gap-2 px-2 lg:px-4 py-2 rounded-lg transition-colors duration-200
+                className={`flex items-center gap-1.5 px-2 lg:px-3 py-2 rounded-lg transition-colors duration-200 shrink-0
                   ${isActive
                     ? 'bg-blue-600 text-white'
                     : 'text-blue-100 hover:bg-blue-700 hover:text-white'
                   }`}
               >
                 {link.icon}
-                <span className="hidden lg:block whitespace-nowrap">{link.label}</span>
+                <span className="hidden lg:block whitespace-nowrap text-sm">{link.label}</span>
               </Link>
             )
           })}
