@@ -12,6 +12,7 @@ use axum::{
 };
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 
 use super::mode::AppState;
 use crate::error::{ApiError, ApiResult};
@@ -102,7 +103,7 @@ pub async fn list_room_types(
     State(state): State<AppState>,
     Query(params): Query<RoomTypesQuery>,
 ) -> ApiResult<Json<RoomTypesResponse>> {
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
     let offset = (params.page - 1) * params.limit;
     let sort_order = params
@@ -113,86 +114,78 @@ pub async fn list_room_types(
 
     // Map frontend column names to SQL columns
     let order_by_column = match params.sort_by.as_deref() {
-        Some("typeCode") => "Type_Code",
-        Some("typeName") => "Type_Name",
-        Some("typeBasePrice") => "Type_Base_Price",
-        Some("typeSortOrder") => "Type_Sort_Order",
-        _ => "Type_Sort_Order",
+        Some("typeCode") => "type_code",
+        Some("typeName") => "type_name",
+        Some("typeBasePrice") => "type_base_price",
+        Some("typeSortOrder") => "type_sort_order",
+        _ => "type_sort_order",
     };
 
     // Build WHERE conditions
     let where_clause = if params.active_only.unwrap_or(false) {
-        "WHERE Type_Active = 1"
+        "WHERE type_active = true"
     } else {
         ""
     };
 
     // Count query
     let count_query = format!(
-        "SELECT COUNT(*) as total FROM HT_Room_Types {}",
+        "SELECT COUNT(*)::int as total FROM ht_room_types {}",
         where_clause
     );
 
-    let count_rows = conn
-        .simple_query(&count_query)
-        .await?
-        .into_first_result()
-        .await?;
+    let count_rows = sqlx::query(&count_query).fetch_all(pool).await?;
 
     let total: i32 = count_rows
         .first()
-        .and_then(|r| r.get::<i32, _>("total"))
+        .map(|r| r.try_get::<i32, _>("total").unwrap_or(0))
         .unwrap_or(0);
 
     // Data query
     let data_query = format!(
         r#"
         SELECT
-            Type_ID,
-            Type_Code,
-            Type_Name,
-            Type_Name_En,
-            Type_Description,
-            Type_Base_Price,
-            Type_Max_Guests,
-            Type_Bed_Type,
-            Type_Size_SQM,
-            Type_Amenities,
-            Type_Sort_Order,
-            Type_Active,
-            Type_Created_At,
-            Type_Updated_At
-        FROM HT_Room_Types
+            type_id,
+            type_code,
+            type_name,
+            type_name_en,
+            type_description,
+            type_base_price,
+            type_max_guests,
+            type_bed_type,
+            type_size_sqm,
+            type_amenities,
+            type_sort_order,
+            type_active,
+            type_created_at,
+            type_updated_at
+        FROM ht_room_types
         {}
         ORDER BY {} {}
-        OFFSET {} ROWS FETCH NEXT {} ROWS ONLY
+        LIMIT {} OFFSET {}
         "#,
-        where_clause, order_by_column, sort_order, offset, params.limit
+        where_clause, order_by_column, sort_order, params.limit, offset
     );
 
-    let rows = conn
-        .simple_query(&data_query)
-        .await?
-        .into_first_result()
-        .await?;
+    let rows = sqlx::query(&data_query).fetch_all(pool).await?;
 
     let room_types: Vec<RoomType> = rows
         .iter()
         .map(|row| RoomType {
-            id: row.get::<i32, _>("Type_ID").unwrap_or(0),
-            type_code: row.get::<&str, _>("Type_Code").unwrap_or_default().to_string(),
-            type_name: row.get::<&str, _>("Type_Name").unwrap_or_default().to_string(),
-            type_name_en: row.get::<&str, _>("Type_Name_En").map(String::from),
-            type_description: row.get::<&str, _>("Type_Description").map(String::from),
-            type_base_price: row.get::<f64, _>("Type_Base_Price"),
-            type_max_guests: row.get::<i32, _>("Type_Max_Guests"),
-            type_bed_type: row.get::<&str, _>("Type_Bed_Type").map(String::from),
-            type_size_sqm: row.get::<f64, _>("Type_Size_SQM"),
-            type_amenities: row.get::<&str, _>("Type_Amenities").map(String::from),
-            type_sort_order: row.get::<i32, _>("Type_Sort_Order"),
-            type_active: row.get::<bool, _>("Type_Active").unwrap_or(true),
-            created_at: row.get::<NaiveDateTime, _>("Type_Created_At"),
-            updated_at: row.get::<NaiveDateTime, _>("Type_Updated_At"),
+            id: row.try_get::<i32, _>("type_id").unwrap_or(0),
+            type_code: row.try_get::<String, _>("type_code").unwrap_or_default(),
+            type_name: row.try_get::<String, _>("type_name").unwrap_or_default(),
+            type_name_en: row.try_get::<String, _>("type_name_en").ok(),
+            type_description: row.try_get::<String, _>("type_description").ok(),
+            type_base_price: row.try_get::<f64, _>("type_base_price").ok(),
+            type_max_guests: row.try_get::<i32, _>("type_max_guests").ok(),
+            type_bed_type: row.try_get::<String, _>("type_bed_type").ok(),
+            type_size_sqm: row.try_get::<f64, _>("type_size_sqm").ok(),
+            type_amenities: row.try_get::<String, _>("type_amenities").ok(),
+            type_sort_order: row.try_get::<i32, _>("type_sort_order").ok(),
+            type_active: row.try_get::<bool, _>("type_active").unwrap_or(true),
+            created_at: row.try_get::<NaiveDateTime, _>("type_created_at").ok(),
+            updated_at: row.try_get::<NaiveDateTime, _>("type_updated_at").ok(),
         })
         .collect();
 
@@ -208,33 +201,31 @@ pub async fn get_room_type(
     State(state): State<AppState>,
     Path(type_id): Path<i32>,
 ) -> ApiResult<Json<RoomTypeResponse>> {
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
-    let rows = conn
-        .query(
+    let rows = sqlx::query(
             r#"
             SELECT
-                Type_ID,
-                Type_Code,
-                Type_Name,
-                Type_Name_En,
-                Type_Description,
-                Type_Base_Price,
-                Type_Max_Guests,
-                Type_Bed_Type,
-                Type_Size_SQM,
-                Type_Amenities,
-                Type_Sort_Order,
-                Type_Active,
-                Type_Created_At,
-                Type_Updated_At
-            FROM HT_Room_Types
-            WHERE Type_ID = @P1
+                type_id,
+                type_code,
+                type_name,
+                type_name_en,
+                type_description,
+                type_base_price,
+                type_max_guests,
+                type_bed_type,
+                type_size_sqm,
+                type_amenities,
+                type_sort_order,
+                type_active,
+                type_created_at,
+                type_updated_at
+            FROM ht_room_types
+            WHERE type_id = $1
             "#,
-            &[&type_id],
         )
-        .await?
-        .into_first_result()
+        .bind(&type_id)
+        .fetch_all(pool)
         .await?;
 
     let row = rows
@@ -242,20 +233,20 @@ pub async fn get_room_type(
         .ok_or_else(|| ApiError::NotFound("Room type not found".to_string()))?;
 
     let room_type = RoomType {
-        id: row.get::<i32, _>("Type_ID").unwrap_or(0),
-        type_code: row.get::<&str, _>("Type_Code").unwrap_or_default().to_string(),
-        type_name: row.get::<&str, _>("Type_Name").unwrap_or_default().to_string(),
-        type_name_en: row.get::<&str, _>("Type_Name_En").map(String::from),
-        type_description: row.get::<&str, _>("Type_Description").map(String::from),
-        type_base_price: row.get::<f64, _>("Type_Base_Price"),
-        type_max_guests: row.get::<i32, _>("Type_Max_Guests"),
-        type_bed_type: row.get::<&str, _>("Type_Bed_Type").map(String::from),
-        type_size_sqm: row.get::<f64, _>("Type_Size_SQM"),
-        type_amenities: row.get::<&str, _>("Type_Amenities").map(String::from),
-        type_sort_order: row.get::<i32, _>("Type_Sort_Order"),
-        type_active: row.get::<bool, _>("Type_Active").unwrap_or(true),
-        created_at: row.get::<NaiveDateTime, _>("Type_Created_At"),
-        updated_at: row.get::<NaiveDateTime, _>("Type_Updated_At"),
+        id: row.try_get::<i32, _>("type_id").unwrap_or(0),
+        type_code: row.try_get::<String, _>("type_code").unwrap_or_default(),
+        type_name: row.try_get::<String, _>("type_name").unwrap_or_default(),
+        type_name_en: row.try_get::<String, _>("type_name_en").ok(),
+        type_description: row.try_get::<String, _>("type_description").ok(),
+        type_base_price: row.try_get::<f64, _>("type_base_price").ok(),
+        type_max_guests: row.try_get::<i32, _>("type_max_guests").ok(),
+        type_bed_type: row.try_get::<String, _>("type_bed_type").ok(),
+        type_size_sqm: row.try_get::<f64, _>("type_size_sqm").ok(),
+        type_amenities: row.try_get::<String, _>("type_amenities").ok(),
+        type_sort_order: row.try_get::<i32, _>("type_sort_order").ok(),
+        type_active: row.try_get::<bool, _>("type_active").unwrap_or(true),
+        created_at: row.try_get::<NaiveDateTime, _>("type_created_at").ok(),
+        updated_at: row.try_get::<NaiveDateTime, _>("type_updated_at").ok(),
     };
 
     Ok(Json(RoomTypeResponse {
@@ -279,16 +270,14 @@ pub async fn create_room_type(
         return Err(ApiError::BadRequest("Type name is required".to_string()));
     }
 
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
     // Check for duplicate type code
-    let check_rows = conn
-        .query(
-            "SELECT Type_ID FROM HT_Room_Types WHERE Type_Code = @P1",
-            &[&type_code],
+    let check_rows = sqlx::query(
+            "SELECT type_id FROM ht_room_types WHERE type_code = $1",
         )
-        .await?
-        .into_first_result()
+        .bind(&type_code)
+        .fetch_all(pool)
         .await?;
 
     if !check_rows.is_empty() {
@@ -299,46 +288,43 @@ pub async fn create_room_type(
     let type_sort_order = body.type_sort_order.unwrap_or(0);
     let type_max_guests = body.type_max_guests.unwrap_or(2);
 
-    let rows = conn
-        .query(
+    let rows = sqlx::query(
             r#"
-            INSERT INTO HT_Room_Types (
-                Type_Code,
-                Type_Name,
-                Type_Name_En,
-                Type_Description,
-                Type_Base_Price,
-                Type_Max_Guests,
-                Type_Bed_Type,
-                Type_Size_SQM,
-                Type_Amenities,
-                Type_Sort_Order,
-                Type_Active
+            INSERT INTO ht_room_types (
+                type_code,
+                type_name,
+                type_name_en,
+                type_description,
+                type_base_price,
+                type_max_guests,
+                type_bed_type,
+                type_size_sqm,
+                type_amenities,
+                type_sort_order,
+                type_active
             )
-            OUTPUT INSERTED.Type_ID
-            VALUES (@P1, @P2, @P3, @P4, @P5, @P6, @P7, @P8, @P9, @P10, @P11)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            RETURNING type_id
             "#,
-            &[
-                &type_code,
-                &type_name,
-                &body.type_name_en.as_deref(),
-                &body.type_description.as_deref(),
-                &body.type_base_price,
-                &type_max_guests,
-                &body.type_bed_type.as_deref(),
-                &body.type_size_sqm,
-                &body.type_amenities.as_deref(),
-                &type_sort_order,
-                &type_active,
-            ],
         )
-        .await?
-        .into_first_result()
+        .bind(&type_code)
+        .bind(&type_name)
+        .bind(&body.type_name_en.as_deref())
+        .bind(&body.type_description.as_deref())
+        .bind(&body.type_base_price)
+        .bind(&type_max_guests)
+        .bind(&body.type_bed_type.as_deref())
+        .bind(&body.type_size_sqm)
+        .bind(&body.type_amenities.as_deref())
+        .bind(&type_sort_order)
+        .bind(&type_active)
+        .fetch_all(pool)
         .await?;
 
     let id = rows
         .first()
-        .and_then(|r| r.get::<i32, _>("Type_ID"))
+        .map(|r| r.try_get::<i32, _>("type_id").ok())
+        .flatten()
         .ok_or_else(|| ApiError::Internal("Failed to create room type".to_string()))?;
 
     Ok(Json(MutationResponse {
@@ -364,16 +350,15 @@ pub async fn update_room_type(
         return Err(ApiError::BadRequest("Type name is required".to_string()));
     }
 
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
     // Check for duplicate type code (excluding current type)
-    let check_rows = conn
-        .query(
-            "SELECT Type_ID FROM HT_Room_Types WHERE Type_Code = @P1 AND Type_ID != @P2",
-            &[&type_code, &type_id],
+    let check_rows = sqlx::query(
+            "SELECT type_id FROM ht_room_types WHERE type_code = $1 AND type_id != $2",
         )
-        .await?
-        .into_first_result()
+        .bind(&type_code)
+        .bind(&type_id)
+        .fetch_all(pool)
         .await?;
 
     if !check_rows.is_empty() {
@@ -384,42 +369,40 @@ pub async fn update_room_type(
     let type_sort_order = body.type_sort_order.unwrap_or(0);
     let type_max_guests = body.type_max_guests.unwrap_or(2);
 
-    let result = conn
-        .execute(
+    let result = sqlx::query(
             r#"
-            UPDATE HT_Room_Types
-            SET Type_Code = @P1,
-                Type_Name = @P2,
-                Type_Name_En = @P3,
-                Type_Description = @P4,
-                Type_Base_Price = @P5,
-                Type_Max_Guests = @P6,
-                Type_Bed_Type = @P7,
-                Type_Size_SQM = @P8,
-                Type_Amenities = @P9,
-                Type_Sort_Order = @P10,
-                Type_Active = @P11,
-                Type_Updated_At = GETDATE()
-            WHERE Type_ID = @P12
+            UPDATE ht_room_types
+            SET type_code = $1,
+                type_name = $2,
+                type_name_en = $3,
+                type_description = $4,
+                type_base_price = $5,
+                type_max_guests = $6,
+                type_bed_type = $7,
+                type_size_sqm = $8,
+                type_amenities = $9,
+                type_sort_order = $10,
+                type_active = $11,
+                type_updated_at = NOW()
+            WHERE type_id = $12
             "#,
-            &[
-                &type_code,
-                &type_name,
-                &body.type_name_en.as_deref(),
-                &body.type_description.as_deref(),
-                &body.type_base_price,
-                &type_max_guests,
-                &body.type_bed_type.as_deref(),
-                &body.type_size_sqm,
-                &body.type_amenities.as_deref(),
-                &type_sort_order,
-                &type_active,
-                &type_id,
-            ],
         )
+        .bind(&type_code)
+        .bind(&type_name)
+        .bind(&body.type_name_en.as_deref())
+        .bind(&body.type_description.as_deref())
+        .bind(&body.type_base_price)
+        .bind(&type_max_guests)
+        .bind(&body.type_bed_type.as_deref())
+        .bind(&body.type_size_sqm)
+        .bind(&body.type_amenities.as_deref())
+        .bind(&type_sort_order)
+        .bind(&type_active)
+        .bind(&type_id)
+        .execute(pool)
         .await?;
 
-    if result.total() == 0 {
+    if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("Room type not found".to_string()));
     }
 
@@ -435,21 +418,19 @@ pub async fn delete_room_type(
     State(state): State<AppState>,
     Path(type_id): Path<i32>,
 ) -> ApiResult<Json<MutationResponse>> {
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
     // Check if room type is in use by any rooms
-    let usage_rows = conn
-        .query(
-            "SELECT COUNT(*) as count FROM HT_Rooms_New WHERE Room_Type_ID = @P1",
-            &[&type_id],
+    let usage_rows = sqlx::query(
+            "SELECT COUNT(*)::int as count FROM ht_rooms_new WHERE room_type_id = $1",
         )
-        .await?
-        .into_first_result()
+        .bind(&type_id)
+        .fetch_all(pool)
         .await?;
 
     let usage_count: i32 = usage_rows
         .first()
-        .and_then(|r| r.get::<i32, _>("count"))
+        .map(|r| r.try_get::<i32, _>("count").unwrap_or(0))
         .unwrap_or(0);
 
     if usage_count > 0 {
@@ -459,14 +440,14 @@ pub async fn delete_room_type(
         )));
     }
 
-    let result = conn
-        .execute(
-            "DELETE FROM HT_Room_Types WHERE Type_ID = @P1",
-            &[&type_id],
+    let result = sqlx::query(
+            "DELETE FROM ht_room_types WHERE type_id = $1",
         )
+        .bind(&type_id)
+        .execute(pool)
         .await?;
 
-    if result.total() == 0 {
+    if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("Room type not found".to_string()));
     }
 

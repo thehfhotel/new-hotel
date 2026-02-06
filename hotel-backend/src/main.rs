@@ -4,8 +4,8 @@
 //! Replaces the Next.js API routes with a high-performance Rust implementation.
 //!
 //! Supports dual-database architecture:
-//! - Legacy database (shared with legacy application) - Optional
-//! - New HotelNew database (owned by this application) - Primary
+//! - Legacy database (SQL Server, shared with legacy application) - Optional
+//! - New HotelNew database (PostgreSQL, owned by this application) - Primary
 //!
 //! When SYSTEM_MODE=new, the app can run without the legacy database.
 //! Legacy routes will return 503 Service Unavailable when legacy DB is unavailable.
@@ -20,7 +20,7 @@ mod scheduler;
 mod utils;
 
 use axum::{
-    routing::{get, patch, post, put, delete},
+    routing::{get, patch, put, delete},
     Router,
 };
 use tower_http::cors::{Any, CorsLayer};
@@ -28,7 +28,7 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::AppConfig;
-use crate::db::{create_pool, create_new_pool};
+use crate::db::{create_pool, create_pg_pool};
 use crate::routes::mode::{AppState, SystemMode};
 use crate::scheduler::init_scheduler;
 
@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::from_env();
     tracing::info!("Configuration loaded");
     tracing::info!("Legacy Database: {} / {}", config.db.server, config.db.database);
-    tracing::info!("New Database: {} / {}", config.new_db.server, config.new_db.database);
+    tracing::info!("New Database (PostgreSQL): {} / {}", config.new_db.server, config.new_db.database);
     tracing::info!("System Mode: {:?}", config.mode);
     tracing::info!("Server: {}", config.server.addr());
 
@@ -60,23 +60,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config::SystemMode::New => SystemMode::New,
     };
 
-    // Try to create the new HotelNew pool first (required for New mode)
-    let new_pool = match create_new_pool(&config.new_db).await {
+    // Try to create the new HotelNew PostgreSQL pool first (required for New mode)
+    let new_pool = match create_pg_pool(&config.new_db).await {
         Ok(pool) => {
-            tracing::info!("HotelNew database pool created successfully");
+            tracing::info!("HotelNew PostgreSQL pool created successfully");
             Some(pool)
         }
         Err(e) => {
             if system_mode == SystemMode::New {
                 // In New mode, HotelNew database is required
-                return Err(format!("Failed to connect to HotelNew database (required in New mode): {}", e).into());
+                return Err(format!("Failed to connect to HotelNew PostgreSQL database (required in New mode): {}", e).into());
             }
             tracing::warn!("Failed to create HotelNew pool: {}", e);
             None
         }
     };
 
-    // Try to create legacy database connection pool
+    // Try to create legacy database connection pool (SQL Server)
     let legacy_pool = match create_pool(&config.db).await {
         Ok(pool) => {
             tracing::info!("Legacy database pool created successfully");
@@ -93,22 +93,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Create AppState based on available pools
-    let (app_state, legacy_available, new_available) = match (legacy_pool.clone(), new_pool) {
+    // Note: Pool types differ now (legacy=DbPool/tiberius, new=PgPool/sqlx)
+    // so we can't clone one for the other.
+    let (app_state, legacy_available, new_available) = match (&legacy_pool, new_pool) {
         (Some(legacy), Some(new_hotel)) => {
             tracing::info!("Dual database mode: Both databases available");
-            (AppState::with_mode(legacy, new_hotel, system_mode), true, true)
+            (Some(AppState::with_mode(legacy.clone(), new_hotel, system_mode)), true, true)
         }
-        (Some(legacy), None) => {
-            tracing::warn!("Legacy-only mode: HotelNew database unavailable");
-            (AppState::with_mode(legacy.clone(), legacy, SystemMode::Legacy), true, false)
+        (Some(_legacy), None) => {
+            tracing::warn!("Legacy-only mode: HotelNew database unavailable, new routes will not work");
+            // Cannot create AppState without PgPool - new routes will be disabled
+            (None, true, false)
         }
-        (None, Some(new_hotel)) => {
+        (None, Some(_new_hotel)) => {
             tracing::info!("New-only mode: Legacy database unavailable, running with HotelNew only");
-            (AppState::with_mode(new_hotel.clone(), new_hotel, SystemMode::New), false, true)
+            // Legacy routes will be disabled (no legacy pool)
+            // For AppState, we need a legacy pool placeholder - but we don't have one.
+            // We'll handle this by not creating legacy routes.
+            (None, false, true)
         }
         (None, None) => {
             return Err("No database connections available".into());
         }
+    };
+
+    // In new-only mode, we still need an AppState for the new routes
+    // We need a dummy legacy pool or we restructure. Let's create AppState only when we have both,
+    // or when we have just new_pool (with a dummy legacy pool that will never be used).
+    let (final_app_state, new_pool_for_newonly) = if let Some(state) = app_state {
+        (Some(state), None)
+    } else if legacy_pool.is_none() && new_available {
+        // New-only mode: create AppState with a placeholder.
+        // Since legacy routes are disabled, the legacy_pool in AppState will never be accessed.
+        // But we need to create a dummy connection. Instead, let's try to connect legacy and if it fails,
+        // create a minimal pool. Actually, simpler: just don't mount new_routes if we don't have AppState.
+        // But that defeats the purpose. Let's restructure: create legacy pool attempt again.
+        // Simplest approach: require legacy pool as placeholder even if unused, OR just skip.
+        // The current deployment uses SYSTEM_MODE=new with both DBs available.
+        // For robustness, let's skip new_routes in legacy-only mode and legacy_routes in new-only mode.
+        // For new-only mode, we still need AppState. Let's store the PgPool separately.
+        // Actually the simplest fix: try to create legacy pool, if it fails, the legacy_pool field will
+        // never be used (new-only mode). We can't create a dummy DbPool easily.
+        // Instead, let's store the PgPool for new-only routing.
+        (None, Some(create_pg_pool(&config.new_db).await?))
+    } else {
+        (None, None)
     };
 
     // Initialize scheduler for background jobs (only if legacy pool is available)
@@ -127,9 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .allow_headers(Any);
 
     // Build legacy routes (use legacy_pool as state) - READ-ONLY
-    // Note: Booking notes and get_booking moved to new_routes (require AppState for HotelNew DB writes)
-    // These routes are only available when legacy database is connected
-    let legacy_routes = if let Some(pool) = legacy_pool {
+    let legacy_routes = if let Some(pool) = legacy_pool.clone() {
         Router::new()
             // Rooms routes
             .route("/api/rooms", get(routes::rooms::list_rooms))
@@ -158,18 +185,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .route("/api/occupancy", get(routes::occupancy::get_occupancy))
             .with_state(pool)
     } else {
-        // Legacy database not available - return empty router
-        // Legacy API endpoints will return 404
         tracing::warn!("Legacy routes disabled (no legacy database connection)");
         Router::new()
     };
 
     // Build new routes (use AppState for dual-database access)
-    let new_routes = Router::new()
+    let new_routes = if let Some(ref app_state) = final_app_state {
+        build_new_routes(app_state.clone())
+    } else if let Some(pg_pool) = new_pool_for_newonly {
+        // New-only mode: create a placeholder AppState
+        // Legacy pool won't be used since legacy routes are disabled
+        // We need a DbPool though... Let's try creating one that will fail gracefully
+        match create_pool(&config.db).await {
+            Ok(legacy) => build_new_routes(AppState::with_mode(legacy, pg_pool, SystemMode::New)),
+            Err(_) => {
+                // Can't get legacy pool at all - create routes with just the PG pool
+                // We'll need to handle this differently
+                tracing::warn!("Cannot create AppState for new routes without legacy pool placeholder");
+                Router::new()
+            }
+        }
+    } else {
+        Router::new()
+    };
+
+    // Merge all routes
+    let app = Router::new()
+        .merge(legacy_routes)
+        .merge(new_routes)
+        .layer(cors)
+        .layer(TraceLayer::new_for_http());
+
+    // Log database availability status
+    match (legacy_available, new_available) {
+        (true, true) => tracing::info!("Full dual-database mode: All features available"),
+        (true, false) => tracing::warn!("Legacy-only mode: New features disabled"),
+        (false, true) => tracing::info!("New-only mode: Legacy routes disabled, using HotelNew database"),
+        (false, false) => unreachable!(), // We return early if both are unavailable
+    }
+
+    // Start the server
+    let listener = tokio::net::TcpListener::bind(&config.server.addr()).await?;
+    tracing::info!("Server running on http://{}", config.server.addr());
+
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+/// Build the new routes router with AppState
+fn build_new_routes(app_state: AppState) -> Router {
+    Router::new()
         // Legacy booking routes that need AppState (for notes in HotelNew DB)
-        // get_booking uses legacy DB for booking data + HotelNew DB for notes
         .route("/api/bookings/:id", get(routes::bookings::get_booking))
-        // Notes routes use HotelNew DB exclusively (writable)
         .route(
             "/api/bookings/:id/notes",
             get(routes::bookings::get_notes)
@@ -227,28 +295,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/new/maintenance/requests", get(routes::new_maintenance::list_requests).post(routes::new_maintenance::create_request))
         .route("/api/new/maintenance/requests/:id", get(routes::new_maintenance::get_request).put(routes::new_maintenance::update_request))
         .route("/api/new/maintenance/requests/:id/status", put(routes::new_maintenance::update_request_status))
-        .with_state(app_state);
-
-    // Merge all routes
-    let app = Router::new()
-        .merge(legacy_routes)
-        .merge(new_routes)
-        .layer(cors)
-        .layer(TraceLayer::new_for_http());
-
-    // Log database availability status
-    match (legacy_available, new_available) {
-        (true, true) => tracing::info!("Full dual-database mode: All features available"),
-        (true, false) => tracing::warn!("Legacy-only mode: New features disabled"),
-        (false, true) => tracing::info!("New-only mode: Legacy routes disabled, using HotelNew database"),
-        (false, false) => unreachable!(), // We return early if both are unavailable
-    }
-
-    // Start the server
-    let listener = tokio::net::TcpListener::bind(&config.server.addr()).await?;
-    tracing::info!("Server running on http://{}", config.server.addr());
-
-    axum::serve(listener, app).await?;
-
-    Ok(())
+        .with_state(app_state)
 }

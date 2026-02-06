@@ -8,6 +8,7 @@ use axum::{
 };
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 
 use crate::error::{ApiError, ApiResult};
 use super::mode::{AppState, SystemMode};
@@ -219,99 +220,93 @@ async fn fetch_legacy_calendar_data(
 ///
 /// Uses the schema defined in migrations/002_create_new_hotel_database.sql
 async fn fetch_new_calendar_data(
-    pool: &crate::db::DbPool,
+    pool: &crate::db::PgPool,
     start_date: &str,
     end_date: &str,
 ) -> ApiResult<(Vec<CalendarBooking>, Vec<CalendarCheckin>)> {
-    let mut conn = pool.get().await?;
-
-    // Fetch bookings from HotelNew database (HT_Bookings + HT_Customers + HT_Booking_Rooms + HT_Rooms_New)
+    // Fetch bookings from HotelNew database (ht_bookings + ht_customers + ht_booking_rooms + ht_rooms_new)
     let booking_query = format!(
         r#"
         SELECT
-            b.Book_ID,
-            b.Book_No,
-            CONCAT(c.Cust_FirstName, ' ', ISNULL(c.Cust_LastName, '')) AS Cust_Name,
-            r.Room_No,
-            b.Book_CheckIn,
-            b.Book_CheckOut,
-            b.Book_Status
-        FROM HT_Bookings b
-        INNER JOIN HT_Customers c ON b.Book_Cust_ID = c.Cust_ID
-        LEFT JOIN HT_Booking_Rooms br ON b.Book_ID = br.BR_Book_ID
-        LEFT JOIN HT_Rooms_New r ON br.BR_Room_ID = r.Room_ID
-        WHERE b.Book_CheckOut >= '{}'
-          AND b.Book_CheckIn <= '{}'
-          AND b.Book_Status != 'cancelled'
-        ORDER BY b.Book_CheckIn
+            b.book_id,
+            b.book_no,
+            CONCAT(c.cust_firstname, ' ', COALESCE(c.cust_lastname, '')) AS cust_name,
+            r.room_no,
+            b.book_checkin,
+            b.book_checkout,
+            b.book_status
+        FROM ht_bookings b
+        INNER JOIN ht_customers c ON b.book_cust_id = c.cust_id
+        LEFT JOIN ht_booking_rooms br ON b.book_id = br.br_book_id
+        LEFT JOIN ht_rooms_new r ON br.br_room_id = r.room_id
+        WHERE b.book_checkout >= '{}'
+          AND b.book_checkin <= '{}'
+          AND b.book_status != 'cancelled'
+        ORDER BY b.book_checkin
         "#,
         start_date.replace('\'', "''"),
         end_date.replace('\'', "''")
     );
 
-    let booking_rows = conn
-        .simple_query(&booking_query)
-        .await?
-        .into_first_result()
+    let booking_rows = sqlx::query(&booking_query)
+        .fetch_all(pool)
         .await?;
 
     let bookings: Vec<CalendarBooking> = booking_rows
         .iter()
         .map(|row| {
-            let id = row.get::<i32, _>("Book_ID").unwrap_or_default();
-            let booking_no = row.get::<&str, _>("Book_No").unwrap_or_default().to_string();
+            let id = row.try_get::<i32, _>("book_id").unwrap_or_default();
+            let booking_no = row.try_get::<String, _>("book_no").unwrap_or_default();
             CalendarBooking {
                 id: format!("new-booking-{}", id),
                 booking_no,
-                customer_name: row.get::<&str, _>("Cust_Name").map(String::from),
-                room_no: row.get::<&str, _>("Room_No").map(String::from),
-                check_in: row.get::<NaiveDateTime, _>("Book_CheckIn"),
-                check_out: row.get::<NaiveDateTime, _>("Book_CheckOut"),
-                status: row.get::<&str, _>("Book_Status").map(String::from),
+                customer_name: row.try_get::<String, _>("cust_name").ok(),
+                room_no: row.try_get::<String, _>("room_no").ok(),
+                check_in: row.try_get::<NaiveDateTime, _>("book_checkin").ok(),
+                check_out: row.try_get::<NaiveDateTime, _>("book_checkout").ok(),
+                status: row.try_get::<String, _>("book_status").ok(),
                 source: DataSource::New,
             }
         })
         .collect();
 
-    // Fetch check-ins from HotelNew database (HT_CheckIns + HT_Customers + HT_Rooms_New)
+    // Fetch check-ins from HotelNew database (ht_checkins + ht_customers + ht_rooms_new)
     let checkin_query = format!(
         r#"
         SELECT
-            ci.Cin_ID,
-            ci.Cin_No,
-            CONCAT(c.Cust_FirstName, ' ', ISNULL(c.Cust_LastName, '')) AS Cust_Name,
-            r.Room_No,
-            ci.Cin_CheckIn_Time,
-            ISNULL(ci.Cin_CheckOut_Time, CAST(ci.Cin_Expected_Out AS DATETIME)) AS Cin_CheckOut
-        FROM HT_CheckIns ci
-        INNER JOIN HT_Customers c ON ci.Cin_Cust_ID = c.Cust_ID
-        INNER JOIN HT_Rooms_New r ON ci.Cin_Room_ID = r.Room_ID
-        WHERE ISNULL(ci.Cin_CheckOut_Time, ci.Cin_Expected_Out) >= '{}'
-          AND ci.Cin_CheckIn_Time <= '{}'
-        ORDER BY ci.Cin_CheckIn_Time
+            ci.cin_id,
+            ci.cin_no,
+            CONCAT(c.cust_firstname, ' ', COALESCE(c.cust_lastname, '')) AS cust_name,
+            r.room_no,
+            ci.cin_checkin_time,
+            COALESCE(ci.cin_checkout_time, ci.cin_expected_checkout) AS cin_checkout
+        FROM ht_checkins ci
+        INNER JOIN ht_customers c ON ci.cin_cust_id = c.cust_id
+        INNER JOIN ht_rooms_new r ON ci.cin_room_id = r.room_id
+        WHERE COALESCE(ci.cin_checkout_time, ci.cin_expected_checkout) >= '{}'
+          AND ci.cin_checkin_time <= '{}'
+        ORDER BY ci.cin_checkin_time
         "#,
         start_date.replace('\'', "''"),
         end_date.replace('\'', "''")
     );
 
-    let checkin_rows = conn
-        .simple_query(&checkin_query)
-        .await?
-        .into_first_result()
+    let checkin_rows = sqlx::query(&checkin_query)
+        .fetch_all(pool)
         .await?;
 
     let checkins: Vec<CalendarCheckin> = checkin_rows
         .iter()
         .map(|row| {
-            let id = row.get::<i32, _>("Cin_ID").unwrap_or_default();
-            let cin_no = row.get::<&str, _>("Cin_No").unwrap_or_default().to_string();
+            let id = row.try_get::<i32, _>("cin_id").unwrap_or_default();
+            let cin_no = row.try_get::<String, _>("cin_no").unwrap_or_default();
             CalendarCheckin {
                 id: format!("new-checkin-{}", id),
                 checkin_no: cin_no,
-                customer_name: row.get::<&str, _>("Cust_Name").map(String::from),
-                room_no: row.get::<&str, _>("Room_No").map(String::from),
-                check_in: row.get::<NaiveDateTime, _>("Cin_CheckIn_Time"),
-                check_out: row.get::<NaiveDateTime, _>("Cin_CheckOut"),
+                customer_name: row.try_get::<String, _>("cust_name").ok(),
+                room_no: row.try_get::<String, _>("room_no").ok(),
+                check_in: row.try_get::<NaiveDateTime, _>("cin_checkin_time").ok(),
+                check_out: row.try_get::<NaiveDateTime, _>("cin_checkout").ok(),
                 source: DataSource::New,
             }
         })

@@ -11,6 +11,7 @@ use axum::{
 };
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 
 use super::mode::AppState;
 use crate::error::{ApiError, ApiResult};
@@ -102,7 +103,7 @@ pub async fn list_rooms(
     State(state): State<AppState>,
     Query(params): Query<NewRoomsQuery>,
 ) -> ApiResult<Json<NewRoomsResponse>> {
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
     let offset = (params.page - 1) * params.limit;
     let sort_order = params
@@ -113,11 +114,11 @@ pub async fn list_rooms(
 
     // Map frontend column names to SQL columns
     let order_by_column = match params.sort_by.as_deref() {
-        Some("roomNo") => "r.Room_No",
-        Some("floor") => "r.Room_Floor",
-        Some("status") => "r.Room_Status",
-        Some("roomType") => "rt.Type_Name",
-        _ => "r.Room_No",
+        Some("roomNo") => "r.room_no",
+        Some("floor") => "r.room_floor",
+        Some("status") => "r.room_status",
+        Some("roomType") => "rt.type_name",
+        _ => "r.room_no",
     };
 
     // Build WHERE conditions
@@ -125,15 +126,15 @@ pub async fn list_rooms(
 
     if let Some(ref status) = params.status {
         let escaped = status.replace('\'', "''");
-        conditions.push(format!("r.Room_Status = '{}'", escaped));
+        conditions.push(format!("r.room_status = '{}'", escaped));
     }
 
     if let Some(type_id) = params.room_type_id {
-        conditions.push(format!("r.Room_Type_ID = {}", type_id));
+        conditions.push(format!("r.room_type_id = {}", type_id));
     }
 
     if let Some(floor) = params.floor {
-        conditions.push(format!("r.Room_Floor = {}", floor));
+        conditions.push(format!("r.room_floor = {}", floor));
     }
 
     let where_clause = if conditions.is_empty() {
@@ -144,71 +145,67 @@ pub async fn list_rooms(
 
     // Count query
     let count_query = format!(
-        "SELECT COUNT(*) as total FROM HT_Rooms_New r {}",
+        "SELECT COUNT(*)::int as total FROM ht_rooms_new r {}",
         where_clause
     );
 
-    let count_rows = conn
-        .simple_query(&count_query)
-        .await?
-        .into_first_result()
+    let count_rows = sqlx::query(&count_query)
+        .fetch_all(pool)
         .await?;
 
     let total: i32 = count_rows
         .first()
-        .and_then(|r| r.get::<i32, _>("total"))
+        .map(|r| r.try_get::<i32, _>("total").unwrap_or(0))
         .unwrap_or(0);
 
     // Data query with LEFT JOIN to room types
     let data_query = format!(
         r#"
         SELECT
-            r.Room_ID,
-            r.Room_No,
-            r.Room_Type_ID,
-            rt.Type_Name,
-            r.Room_Floor,
-            r.Room_Status,
-            r.Room_Clean,
-            r.Room_Maintenance,
-            r.Room_Price_Weekday,
-            r.Room_Price_Weekend,
-            r.Room_Price_Special,
-            r.Room_Notes,
-            r.Created_At,
-            r.Updated_At
-        FROM HT_Rooms_New r
-        LEFT JOIN HT_Room_Types rt ON r.Room_Type_ID = rt.Type_ID
+            r.room_id,
+            r.room_no,
+            r.room_type_id,
+            rt.type_name,
+            r.room_floor,
+            r.room_status,
+            r.room_clean,
+            r.room_maintenance,
+            r.room_price_weekday,
+            r.room_price_weekend,
+            r.room_price_special,
+            r.room_notes,
+            r.created_at,
+            r.updated_at
+        FROM ht_rooms_new r
+        LEFT JOIN ht_room_types rt ON r.room_type_id = rt.type_id
         {}
         ORDER BY {} {}
-        OFFSET {} ROWS FETCH NEXT {} ROWS ONLY
+        LIMIT {} OFFSET {}
         "#,
-        where_clause, order_by_column, sort_order, offset, params.limit
+        where_clause, order_by_column, sort_order, params.limit, offset
     );
 
-    let rows = conn
-        .simple_query(&data_query)
-        .await?
-        .into_first_result()
+    let rows = sqlx::query(&data_query)
+        .fetch_all(pool)
         .await?;
 
     let rooms: Vec<NewRoom> = rows
         .iter()
         .map(|row| NewRoom {
-            id: row.get::<i32, _>("Room_ID").unwrap_or(0),
-            room_no: row.get::<&str, _>("Room_No").unwrap_or_default().to_string(),
-            room_type_id: row.get::<i32, _>("Room_Type_ID"),
-            room_type_name: row.get::<&str, _>("Type_Name").map(String::from),
-            floor: row.get::<i32, _>("Room_Floor"),
-            status: row.get::<&str, _>("Room_Status").unwrap_or("available").to_string(),
-            is_clean: row.get::<bool, _>("Room_Clean").unwrap_or(true),
-            is_maintenance: row.get::<bool, _>("Room_Maintenance").unwrap_or(false),
-            price_weekday: row.get::<f64, _>("Room_Price_Weekday"),
-            price_weekend: row.get::<f64, _>("Room_Price_Weekend"),
-            price_special: row.get::<f64, _>("Room_Price_Special"),
-            notes: row.get::<&str, _>("Room_Notes").map(String::from),
-            created_at: row.get::<NaiveDateTime, _>("Created_At"),
-            updated_at: row.get::<NaiveDateTime, _>("Updated_At"),
+            id: row.try_get::<i32, _>("room_id").unwrap_or(0),
+            room_no: row.try_get::<String, _>("room_no").unwrap_or_default(),
+            room_type_id: row.try_get::<i32, _>("room_type_id").ok(),
+            room_type_name: row.try_get::<String, _>("type_name").ok(),
+            floor: row.try_get::<i32, _>("room_floor").ok(),
+            status: row.try_get::<String, _>("room_status").unwrap_or_else(|_| "available".to_string()),
+            is_clean: row.try_get::<bool, _>("room_clean").unwrap_or(true),
+            is_maintenance: row.try_get::<bool, _>("room_maintenance").unwrap_or(false),
+            price_weekday: row.try_get::<f64, _>("room_price_weekday").ok(),
+            price_weekend: row.try_get::<f64, _>("room_price_weekend").ok(),
+            price_special: row.try_get::<f64, _>("room_price_special").ok(),
+            notes: row.try_get::<String, _>("room_notes").ok(),
+            created_at: row.try_get::<NaiveDateTime, _>("created_at").ok(),
+            updated_at: row.try_get::<NaiveDateTime, _>("updated_at").ok(),
         })
         .collect();
 
@@ -224,34 +221,32 @@ pub async fn get_room(
     State(state): State<AppState>,
     Path(room_id): Path<i32>,
 ) -> ApiResult<Json<NewRoomResponse>> {
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
-    let rows = conn
-        .query(
+    let rows = sqlx::query(
             r#"
             SELECT
-                r.Room_ID,
-                r.Room_No,
-                r.Room_Type_ID,
-                rt.Type_Name,
-                r.Room_Floor,
-                r.Room_Status,
-                r.Room_Clean,
-                r.Room_Maintenance,
-                r.Room_Price_Weekday,
-                r.Room_Price_Weekend,
-                r.Room_Price_Special,
-                r.Room_Notes,
-                r.Created_At,
-                r.Updated_At
-            FROM HT_Rooms_New r
-            LEFT JOIN HT_Room_Types rt ON r.Room_Type_ID = rt.Type_ID
-            WHERE r.Room_ID = @P1
+                r.room_id,
+                r.room_no,
+                r.room_type_id,
+                rt.type_name,
+                r.room_floor,
+                r.room_status,
+                r.room_clean,
+                r.room_maintenance,
+                r.room_price_weekday,
+                r.room_price_weekend,
+                r.room_price_special,
+                r.room_notes,
+                r.created_at,
+                r.updated_at
+            FROM ht_rooms_new r
+            LEFT JOIN ht_room_types rt ON r.room_type_id = rt.type_id
+            WHERE r.room_id = $1
             "#,
-            &[&room_id],
         )
-        .await?
-        .into_first_result()
+        .bind(&room_id)
+        .fetch_all(pool)
         .await?;
 
     let row = rows
@@ -259,20 +254,20 @@ pub async fn get_room(
         .ok_or_else(|| ApiError::NotFound("Room not found".to_string()))?;
 
     let room = NewRoom {
-        id: row.get::<i32, _>("Room_ID").unwrap_or(0),
-        room_no: row.get::<&str, _>("Room_No").unwrap_or_default().to_string(),
-        room_type_id: row.get::<i32, _>("Room_Type_ID"),
-        room_type_name: row.get::<&str, _>("Type_Name").map(String::from),
-        floor: row.get::<i32, _>("Room_Floor"),
-        status: row.get::<&str, _>("Room_Status").unwrap_or("available").to_string(),
-        is_clean: row.get::<bool, _>("Room_Clean").unwrap_or(true),
-        is_maintenance: row.get::<bool, _>("Room_Maintenance").unwrap_or(false),
-        price_weekday: row.get::<f64, _>("Room_Price_Weekday"),
-        price_weekend: row.get::<f64, _>("Room_Price_Weekend"),
-        price_special: row.get::<f64, _>("Room_Price_Special"),
-        notes: row.get::<&str, _>("Room_Notes").map(String::from),
-        created_at: row.get::<NaiveDateTime, _>("Created_At"),
-        updated_at: row.get::<NaiveDateTime, _>("Updated_At"),
+        id: row.try_get::<i32, _>("room_id").unwrap_or(0),
+        room_no: row.try_get::<String, _>("room_no").unwrap_or_default(),
+        room_type_id: row.try_get::<i32, _>("room_type_id").ok(),
+        room_type_name: row.try_get::<String, _>("type_name").ok(),
+        floor: row.try_get::<i32, _>("room_floor").ok(),
+        status: row.try_get::<String, _>("room_status").unwrap_or_else(|_| "available".to_string()),
+        is_clean: row.try_get::<bool, _>("room_clean").unwrap_or(true),
+        is_maintenance: row.try_get::<bool, _>("room_maintenance").unwrap_or(false),
+        price_weekday: row.try_get::<f64, _>("room_price_weekday").ok(),
+        price_weekend: row.try_get::<f64, _>("room_price_weekend").ok(),
+        price_special: row.try_get::<f64, _>("room_price_special").ok(),
+        notes: row.try_get::<String, _>("room_notes").ok(),
+        created_at: row.try_get::<NaiveDateTime, _>("created_at").ok(),
+        updated_at: row.try_get::<NaiveDateTime, _>("updated_at").ok(),
     };
 
     Ok(Json(NewRoomResponse {
@@ -291,16 +286,14 @@ pub async fn create_room(
         return Err(ApiError::BadRequest("Room number is required".to_string()));
     }
 
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
     // Check for duplicate room number
-    let check_rows = conn
-        .query(
-            "SELECT Room_ID FROM HT_Rooms_New WHERE Room_No = @P1",
-            &[&room_no],
+    let check_rows = sqlx::query(
+            "SELECT room_id FROM ht_rooms_new WHERE room_no = $1",
         )
-        .await?
-        .into_first_result()
+        .bind(&room_no)
+        .fetch_all(pool)
         .await?;
 
     if !check_rows.is_empty() {
@@ -311,44 +304,41 @@ pub async fn create_room(
     let is_clean = body.is_clean.unwrap_or(true);
     let is_maintenance = body.is_maintenance.unwrap_or(false);
 
-    let rows = conn
-        .query(
+    let rows = sqlx::query(
             r#"
-            INSERT INTO HT_Rooms_New (
-                Room_No,
-                Room_Type_ID,
-                Room_Floor,
-                Room_Status,
-                Room_Clean,
-                Room_Maintenance,
-                Room_Price_Weekday,
-                Room_Price_Weekend,
-                Room_Price_Special,
-                Room_Notes
+            INSERT INTO ht_rooms_new (
+                room_no,
+                room_type_id,
+                room_floor,
+                room_status,
+                room_clean,
+                room_maintenance,
+                room_price_weekday,
+                room_price_weekend,
+                room_price_special,
+                room_notes
             )
-            OUTPUT INSERTED.Room_ID
-            VALUES (@P1, @P2, @P3, @P4, @P5, @P6, @P7, @P8, @P9, @P10)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            RETURNING room_id
             "#,
-            &[
-                &room_no,
-                &body.room_type_id,
-                &body.floor,
-                &status,
-                &is_clean,
-                &is_maintenance,
-                &body.price_weekday,
-                &body.price_weekend,
-                &body.price_special,
-                &body.notes.as_deref(),
-            ],
         )
-        .await?
-        .into_first_result()
+        .bind(&room_no)
+        .bind(&body.room_type_id)
+        .bind(&body.floor)
+        .bind(&status)
+        .bind(&is_clean)
+        .bind(&is_maintenance)
+        .bind(&body.price_weekday)
+        .bind(&body.price_weekend)
+        .bind(&body.price_special)
+        .bind(&body.notes.as_deref())
+        .fetch_all(pool)
         .await?;
 
     let id = rows
         .first()
-        .and_then(|r| r.get::<i32, _>("Room_ID"))
+        .map(|r| r.try_get::<i32, _>("room_id").ok())
+        .flatten()
         .ok_or_else(|| ApiError::Internal("Failed to create room".to_string()))?;
 
     Ok(Json(MutationResponse {
@@ -369,16 +359,15 @@ pub async fn update_room(
         return Err(ApiError::BadRequest("Room number is required".to_string()));
     }
 
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
     // Check for duplicate room number (excluding current room)
-    let check_rows = conn
-        .query(
-            "SELECT Room_ID FROM HT_Rooms_New WHERE Room_No = @P1 AND Room_ID != @P2",
-            &[&room_no, &room_id],
+    let check_rows = sqlx::query(
+            "SELECT room_id FROM ht_rooms_new WHERE room_no = $1 AND room_id != $2",
         )
-        .await?
-        .into_first_result()
+        .bind(&room_no)
+        .bind(&room_id)
+        .fetch_all(pool)
         .await?;
 
     if !check_rows.is_empty() {
@@ -389,40 +378,38 @@ pub async fn update_room(
     let is_clean = body.is_clean.unwrap_or(true);
     let is_maintenance = body.is_maintenance.unwrap_or(false);
 
-    let result = conn
-        .execute(
+    let result = sqlx::query(
             r#"
-            UPDATE HT_Rooms_New
-            SET Room_No = @P1,
-                Room_Type_ID = @P2,
-                Room_Floor = @P3,
-                Room_Status = @P4,
-                Room_Clean = @P5,
-                Room_Maintenance = @P6,
-                Room_Price_Weekday = @P7,
-                Room_Price_Weekend = @P8,
-                Room_Price_Special = @P9,
-                Room_Notes = @P10,
-                Updated_At = GETDATE()
-            WHERE Room_ID = @P11
+            UPDATE ht_rooms_new
+            SET room_no = $1,
+                room_type_id = $2,
+                room_floor = $3,
+                room_status = $4,
+                room_clean = $5,
+                room_maintenance = $6,
+                room_price_weekday = $7,
+                room_price_weekend = $8,
+                room_price_special = $9,
+                room_notes = $10,
+                updated_at = NOW()
+            WHERE room_id = $11
             "#,
-            &[
-                &room_no,
-                &body.room_type_id,
-                &body.floor,
-                &status,
-                &is_clean,
-                &is_maintenance,
-                &body.price_weekday,
-                &body.price_weekend,
-                &body.price_special,
-                &body.notes.as_deref(),
-                &room_id,
-            ],
         )
+        .bind(&room_no)
+        .bind(&body.room_type_id)
+        .bind(&body.floor)
+        .bind(&status)
+        .bind(&is_clean)
+        .bind(&is_maintenance)
+        .bind(&body.price_weekday)
+        .bind(&body.price_weekend)
+        .bind(&body.price_special)
+        .bind(&body.notes.as_deref())
+        .bind(&room_id)
+        .execute(pool)
         .await?;
 
-    if result.total() == 0 {
+    if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("Room not found".to_string()));
     }
 
@@ -458,21 +445,22 @@ pub async fn update_room_status(
         )));
     }
 
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
-    let result = conn
-        .execute(
+    let result = sqlx::query(
             r#"
-            UPDATE HT_Rooms_New
-            SET Room_Status = @P1,
-                Updated_At = GETDATE()
-            WHERE Room_ID = @P2
+            UPDATE ht_rooms_new
+            SET room_status = $1,
+                updated_at = NOW()
+            WHERE room_id = $2
             "#,
-            &[&status.as_str(), &room_id],
         )
+        .bind(&status.as_str())
+        .bind(&room_id)
+        .execute(pool)
         .await?;
 
-    if result.total() == 0 {
+    if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("Room not found".to_string()));
     }
 

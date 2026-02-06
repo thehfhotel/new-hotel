@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.13.0] - 2026-02-07
+
+### Changed
+- **Migrate HotelNew database from SQL Server to PostgreSQL** - Major infrastructure change
+  - Replaced SQL Server 2022 container (~2GB RAM, 1.6GB image) with PostgreSQL 17 Alpine (~50-100MB RAM, ~100MB image)
+  - Backend now uses `sqlx` crate for PostgreSQL queries (replacing tiberius/bb8 for HotelNew DB)
+  - Legacy database (192.168.100.222) unchanged - still uses tiberius/bb8 for read-only access
+  - Converted all 14 route files from T-SQL to PostgreSQL syntax
+  - Converted DDL init script (`init-db/init-hotelnew.sql`) to PostgreSQL
+  - Stored procedures replaced with PL/pgSQL functions
+  - Updated `docker-compose.yml` for PostgreSQL service
+  - PostgreSQL auto-initializes from `/docker-entrypoint-initdb.d/` (no manual init needed)
+- **Updated CI/CD pipeline for PostgreSQL** - Removed `sqlcmd` database initialization step (PostgreSQL auto-initializes)
+- **Updated documentation for PostgreSQL migration** - `.env.example`, `hotel-backend/README.md`, `migrations/README.md`
+
 ## [2.12.0] - 2026-02-07
 
 ### Changed

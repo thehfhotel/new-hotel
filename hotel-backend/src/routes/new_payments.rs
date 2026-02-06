@@ -10,6 +10,7 @@ use axum::{
 };
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 
 use super::mode::AppState;
 use crate::error::{ApiError, ApiResult};
@@ -77,22 +78,19 @@ pub async fn list_payments(
     State(state): State<AppState>,
     Path(cin_id): Path<i32>,
 ) -> ApiResult<Json<PaymentsResponse>> {
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
     // Verify check-in exists and get total amount
-    let checkin_rows = conn
-        .query(
+    let checkin_rows = sqlx::query(
             r#"
-            SELECT Cin_ID, Cin_Total_Amount, Cin_Rate_Per_Night,
-                   DATEDIFF(day, Cin_CheckIn_Time,
-                       COALESCE(Cin_CheckOut_Time, Cin_Expected_Checkout)) as Nights
-            FROM HT_CheckIns
-            WHERE Cin_ID = @P1
+            SELECT cin_id, cin_total_amount, cin_rate_per_night,
+                   (COALESCE(cin_checkout_time, cin_expected_checkout)::date - cin_checkin_time::date) as nights
+            FROM ht_checkins
+            WHERE cin_id = $1
             "#,
-            &[&cin_id],
         )
-        .await?
-        .into_first_result()
+        .bind(&cin_id)
+        .fetch_all(pool)
         .await?;
 
     let checkin_row = checkin_rows
@@ -100,54 +98,52 @@ pub async fn list_payments(
         .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
 
     // Calculate total amount
-    let stored_total = checkin_row.get::<f64, _>("Cin_Total_Amount");
-    let rate_per_night = checkin_row.get::<f64, _>("Cin_Rate_Per_Night").unwrap_or(0.0);
-    let nights = checkin_row.get::<i32, _>("Nights").unwrap_or(1).max(1);
+    let stored_total = checkin_row.try_get::<f64, _>("cin_total_amount").ok();
+    let rate_per_night = checkin_row.try_get::<f64, _>("cin_rate_per_night").unwrap_or(0.0);
+    let nights = checkin_row.try_get::<i32, _>("nights").unwrap_or(1).max(1);
     let calculated_total = rate_per_night * nights as f64;
     let total_amount = stored_total.unwrap_or(calculated_total);
 
     // Get all non-voided payments
-    let rows = conn
-        .query(
+    let rows = sqlx::query(
             r#"
             SELECT
-                Pay_ID,
-                Pay_Cin_ID,
-                Pay_Amount,
-                Pay_Method,
-                Pay_Reference,
-                Pay_Notes,
-                Pay_Date,
-                Pay_Created_By,
-                Pay_Voided,
-                Pay_Voided_At,
-                Pay_Voided_By,
-                Created_At
-            FROM HT_Payments
-            WHERE Pay_Cin_ID = @P1
-            ORDER BY Pay_Date DESC, Pay_ID DESC
+                pay_id,
+                pay_cin_id,
+                pay_amount,
+                pay_method,
+                pay_reference,
+                pay_notes,
+                pay_date,
+                pay_created_by,
+                pay_voided,
+                pay_voided_at,
+                pay_voided_by,
+                created_at
+            FROM ht_payments
+            WHERE pay_cin_id = $1
+            ORDER BY pay_date DESC, pay_id DESC
             "#,
-            &[&cin_id],
         )
-        .await?
-        .into_first_result()
+        .bind(&cin_id)
+        .fetch_all(pool)
         .await?;
 
     let payments: Vec<Payment> = rows
         .iter()
         .map(|row| Payment {
-            id: row.get::<i32, _>("Pay_ID").unwrap_or(0),
-            cin_id: row.get::<i32, _>("Pay_Cin_ID").unwrap_or(0),
-            amount: row.get::<f64, _>("Pay_Amount").unwrap_or(0.0),
-            method: row.get::<&str, _>("Pay_Method").unwrap_or_default().to_string(),
-            reference: row.get::<&str, _>("Pay_Reference").map(String::from),
-            notes: row.get::<&str, _>("Pay_Notes").map(String::from),
-            pay_date: row.get::<NaiveDateTime, _>("Pay_Date"),
-            created_by: row.get::<&str, _>("Pay_Created_By").map(String::from),
-            voided: row.get::<bool, _>("Pay_Voided").unwrap_or(false),
-            voided_at: row.get::<NaiveDateTime, _>("Pay_Voided_At"),
-            voided_by: row.get::<&str, _>("Pay_Voided_By").map(String::from),
-            created_at: row.get::<NaiveDateTime, _>("Created_At"),
+            id: row.try_get::<i32, _>("pay_id").unwrap_or(0),
+            cin_id: row.try_get::<i32, _>("pay_cin_id").unwrap_or(0),
+            amount: row.try_get::<f64, _>("pay_amount").unwrap_or(0.0),
+            method: row.try_get::<String, _>("pay_method").unwrap_or_default(),
+            reference: row.try_get::<String, _>("pay_reference").ok(),
+            notes: row.try_get::<String, _>("pay_notes").ok(),
+            pay_date: row.try_get::<NaiveDateTime, _>("pay_date").ok(),
+            created_by: row.try_get::<String, _>("pay_created_by").ok(),
+            voided: row.try_get::<bool, _>("pay_voided").unwrap_or(false),
+            voided_at: row.try_get::<NaiveDateTime, _>("pay_voided_at").ok(),
+            voided_by: row.try_get::<String, _>("pay_voided_by").ok(),
+            created_at: row.try_get::<NaiveDateTime, _>("created_at").ok(),
         })
         .collect();
 
@@ -190,16 +186,14 @@ pub async fn create_payment(
         )));
     }
 
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
     // Verify check-in exists
-    let checkin_rows = conn
-        .query(
-            "SELECT Cin_ID, Cin_Status FROM HT_CheckIns WHERE Cin_ID = @P1",
-            &[&cin_id],
+    let checkin_rows = sqlx::query(
+            "SELECT cin_id, cin_status FROM ht_checkins WHERE cin_id = $1",
         )
-        .await?
-        .into_first_result()
+        .bind(&cin_id)
+        .fetch_all(pool)
         .await?;
 
     if checkin_rows.is_empty() {
@@ -207,36 +201,33 @@ pub async fn create_payment(
     }
 
     // Insert payment
-    let rows = conn
-        .query(
+    let rows = sqlx::query(
             r#"
-            INSERT INTO HT_Payments (
-                Pay_Cin_ID,
-                Pay_Amount,
-                Pay_Method,
-                Pay_Reference,
-                Pay_Notes,
-                Pay_Created_By
+            INSERT INTO ht_payments (
+                pay_cin_id,
+                pay_amount,
+                pay_method,
+                pay_reference,
+                pay_notes,
+                pay_created_by
             )
-            OUTPUT INSERTED.Pay_ID
-            VALUES (@P1, @P2, @P3, @P4, @P5, @P6)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING pay_id
             "#,
-            &[
-                &cin_id,
-                &body.amount,
-                &method.as_str(),
-                &body.reference.as_deref(),
-                &body.notes.as_deref(),
-                &body.created_by.as_deref(),
-            ],
         )
-        .await?
-        .into_first_result()
+        .bind(&cin_id)
+        .bind(&body.amount)
+        .bind(&method.as_str())
+        .bind(&body.reference.as_deref())
+        .bind(&body.notes.as_deref())
+        .bind(&body.created_by.as_deref())
+        .fetch_all(pool)
         .await?;
 
     let pay_id = rows
         .first()
-        .and_then(|r| r.get::<i32, _>("Pay_ID"))
+        .map(|r| r.try_get::<i32, _>("pay_id").ok())
+        .flatten()
         .ok_or_else(|| ApiError::Internal("Failed to create payment".to_string()))?;
 
     Ok(Json(PaymentMutationResponse {
@@ -251,37 +242,36 @@ pub async fn void_payment(
     State(state): State<AppState>,
     Path(pay_id): Path<i32>,
 ) -> ApiResult<Json<PaymentMutationResponse>> {
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
     // Verify payment exists and is not already voided
-    let payment_rows = conn
-        .query(
-            "SELECT Pay_ID, Pay_Voided FROM HT_Payments WHERE Pay_ID = @P1",
-            &[&pay_id],
+    let payment_rows = sqlx::query(
+            "SELECT pay_id, pay_voided FROM ht_payments WHERE pay_id = $1",
         )
-        .await?
-        .into_first_result()
+        .bind(&pay_id)
+        .fetch_all(pool)
         .await?;
 
     let payment_row = payment_rows
         .first()
         .ok_or_else(|| ApiError::NotFound("Payment not found".to_string()))?;
 
-    let already_voided = payment_row.get::<bool, _>("Pay_Voided").unwrap_or(false);
+    let already_voided = payment_row.try_get::<bool, _>("pay_voided").unwrap_or(false);
     if already_voided {
         return Err(ApiError::BadRequest("Payment is already voided".to_string()));
     }
 
     // Void the payment (soft delete)
-    conn.execute(
+    sqlx::query(
         r#"
-        UPDATE HT_Payments
-        SET Pay_Voided = 1,
-            Pay_Voided_At = GETDATE()
-        WHERE Pay_ID = @P1
+        UPDATE ht_payments
+        SET pay_voided = true,
+            pay_voided_at = NOW()
+        WHERE pay_id = $1
         "#,
-        &[&pay_id],
     )
+    .bind(&pay_id)
+    .execute(pool)
     .await?;
 
     Ok(Json(PaymentMutationResponse {

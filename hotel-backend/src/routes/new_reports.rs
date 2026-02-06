@@ -9,6 +9,7 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 
 use super::mode::AppState;
 use crate::error::{ApiError, ApiResult};
@@ -25,9 +26,9 @@ pub enum GroupBy {
 impl GroupBy {
     pub fn as_sql_format(&self) -> &'static str {
         match self {
-            GroupBy::Day => "yyyy-MM-dd",
-            GroupBy::Week => "yyyy-'W'ww", // ISO week format
-            GroupBy::Month => "yyyy-MM",
+            GroupBy::Day => "YYYY-MM-DD",
+            GroupBy::Week => r#"IYYY-"W"IW"#,
+            GroupBy::Month => "YYYY-MM",
         }
     }
 }
@@ -109,7 +110,7 @@ pub async fn get_revenue(
     State(state): State<AppState>,
     Query(params): Query<RevenueQuery>,
 ) -> ApiResult<Json<RevenueResponse>> {
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
     // Validate date parameters
     if params.from.is_empty() || params.to.is_empty() {
@@ -121,25 +122,24 @@ pub async fn get_revenue(
     let to_escaped = params.to.replace('\'', "''");
 
     // For grouping, we use the check-in date as the revenue attribution date
-    // Revenue = Rate_Per_Night * DATEDIFF(day, CheckIn, CheckOut)
+    // Revenue = Rate_Per_Night * (checkout_date - checkin_date)
     let query = format!(
         r#"
         WITH DateRange AS (
             SELECT
-                FORMAT(ci.Cin_CheckIn_Time, '{}') as period,
-                COALESCE(ci.Cin_Total_Amount,
-                    ci.Cin_Rate_Per_Night * DATEDIFF(day, ci.Cin_CheckIn_Time,
-                        COALESCE(ci.Cin_CheckOut_Time, ci.Cin_Expected_Checkout))) as revenue,
-                ci.Cin_ID
-            FROM HT_CheckIns ci
-            WHERE ci.Cin_Status = 'checkedout'
-              AND CAST(ci.Cin_CheckIn_Time AS DATE) >= '{}'
-              AND CAST(ci.Cin_CheckIn_Time AS DATE) <= '{}'
+                TO_CHAR(ci.cin_checkin_time, '{}') as period,
+                COALESCE(ci.cin_total_amount,
+                    ci.cin_rate_per_night * (COALESCE(ci.cin_checkout_time, ci.cin_expected_checkout)::date - ci.cin_checkin_time::date)) as revenue,
+                ci.cin_id
+            FROM ht_checkins ci
+            WHERE ci.cin_status = 'checkedout'
+              AND ci.cin_checkin_time::date >= '{}'
+              AND ci.cin_checkin_time::date <= '{}'
         )
         SELECT
             period,
             COALESCE(SUM(revenue), 0) as total_revenue,
-            COUNT(*) as booking_count
+            COUNT(*)::int as booking_count
         FROM DateRange
         GROUP BY period
         ORDER BY period ASC
@@ -147,18 +147,16 @@ pub async fn get_revenue(
         date_format, from_escaped, to_escaped
     );
 
-    let rows = conn
-        .simple_query(&query)
-        .await?
-        .into_first_result()
+    let rows = sqlx::query(&query)
+        .fetch_all(pool)
         .await?;
 
     let data: Vec<RevenueDataPoint> = rows
         .iter()
         .map(|row| RevenueDataPoint {
-            period: row.get::<&str, _>("period").unwrap_or_default().to_string(),
-            revenue: row.get::<f64, _>("total_revenue").unwrap_or(0.0),
-            bookings: row.get::<i32, _>("booking_count").unwrap_or(0),
+            period: row.try_get::<String, _>("period").unwrap_or_default(),
+            revenue: row.try_get::<f64, _>("total_revenue").unwrap_or(0.0),
+            bookings: row.try_get::<i32, _>("booking_count").unwrap_or(0),
         })
         .collect();
 
@@ -175,7 +173,7 @@ pub async fn get_occupancy(
     State(state): State<AppState>,
     Query(params): Query<OccupancyQuery>,
 ) -> ApiResult<Json<OccupancyResponse>> {
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
     // Validate date parameters
     if params.from.is_empty() || params.to.is_empty() {
@@ -186,16 +184,14 @@ pub async fn get_occupancy(
     let to_escaped = params.to.replace('\'', "''");
 
     // Get total number of rooms
-    let rooms_query = "SELECT COUNT(*) as total_rooms FROM HT_Rooms_New WHERE Room_Active = 1";
-    let rooms_rows = conn
-        .simple_query(rooms_query)
-        .await?
-        .into_first_result()
+    let rooms_query = "SELECT COUNT(*)::int as total_rooms FROM ht_rooms_new WHERE room_active = true";
+    let rooms_rows = sqlx::query(rooms_query)
+        .fetch_all(pool)
         .await?;
 
     let total_rooms: i32 = rooms_rows
         .first()
-        .and_then(|r| r.get::<i32, _>("total_rooms"))
+        .map(|r| r.try_get::<i32, _>("total_rooms").unwrap_or(0))
         .unwrap_or(0);
 
     if total_rooms == 0 {
@@ -213,18 +209,16 @@ pub async fn get_occupancy(
 
     // Calculate the number of days in the period
     let days_query = format!(
-        "SELECT DATEDIFF(day, '{}', '{}') + 1 as total_days",
-        from_escaped, to_escaped
+        "SELECT ('{}'::date - '{}'::date) + 1 as total_days",
+        to_escaped, from_escaped
     );
-    let days_rows = conn
-        .simple_query(&days_query)
-        .await?
-        .into_first_result()
+    let days_rows = sqlx::query(&days_query)
+        .fetch_all(pool)
         .await?;
 
     let total_days: i32 = days_rows
         .first()
-        .and_then(|r| r.get::<i32, _>("total_days"))
+        .map(|r| r.try_get::<i32, _>("total_days").unwrap_or(1))
         .unwrap_or(1);
 
     // Total available room-nights
@@ -236,43 +230,38 @@ pub async fn get_occupancy(
         r#"
         SELECT
             COALESCE(SUM(
-                DATEDIFF(day,
-                    CASE WHEN CAST(ci.Cin_CheckIn_Time AS DATE) < '{}'
-                         THEN '{}'
-                         ELSE CAST(ci.Cin_CheckIn_Time AS DATE) END,
-                    CASE WHEN CAST(COALESCE(ci.Cin_CheckOut_Time, ci.Cin_Expected_Checkout) AS DATE) > '{}'
-                         THEN DATEADD(day, 1, '{}')
-                         ELSE CAST(COALESCE(ci.Cin_CheckOut_Time, ci.Cin_Expected_Checkout) AS DATE) END
-                )
+                (CASE WHEN COALESCE(ci.cin_checkout_time, ci.cin_expected_checkout)::date > '{}'
+                     THEN ('{}'::date + 1)
+                     ELSE COALESCE(ci.cin_checkout_time, ci.cin_expected_checkout)::date END)
+                -
+                (CASE WHEN ci.cin_checkin_time::date < '{}'
+                     THEN '{}'::date
+                     ELSE ci.cin_checkin_time::date END)
             ), 0) as occupied_nights,
-            COALESCE(SUM(COALESCE(ci.Cin_Total_Amount,
-                ci.Cin_Rate_Per_Night * DATEDIFF(day, ci.Cin_CheckIn_Time,
-                    COALESCE(ci.Cin_CheckOut_Time, ci.Cin_Expected_Checkout)))), 0) as total_revenue,
-            COUNT(*) as checkin_count,
-            COALESCE(AVG(CAST(DATEDIFF(day, ci.Cin_CheckIn_Time,
-                COALESCE(ci.Cin_CheckOut_Time, ci.Cin_Expected_Checkout)) AS FLOAT)), 0) as avg_stay
-        FROM HT_CheckIns ci
-        WHERE ci.Cin_Status IN ('active', 'checkedout')
-          AND CAST(ci.Cin_CheckIn_Time AS DATE) <= '{}'
-          AND CAST(COALESCE(ci.Cin_CheckOut_Time, ci.Cin_Expected_Checkout) AS DATE) >= '{}'
+            COALESCE(SUM(COALESCE(ci.cin_total_amount,
+                ci.cin_rate_per_night * (COALESCE(ci.cin_checkout_time, ci.cin_expected_checkout)::date - ci.cin_checkin_time::date))), 0) as total_revenue,
+            COUNT(*)::int as checkin_count,
+            COALESCE(AVG((COALESCE(ci.cin_checkout_time, ci.cin_expected_checkout)::date - ci.cin_checkin_time::date)::float8), 0) as avg_stay
+        FROM ht_checkins ci
+        WHERE ci.cin_status IN ('active', 'checkedout')
+          AND ci.cin_checkin_time::date <= '{}'
+          AND COALESCE(ci.cin_checkout_time, ci.cin_expected_checkout)::date >= '{}'
         "#,
-        from_escaped, from_escaped, to_escaped, to_escaped, to_escaped, from_escaped
+        to_escaped, to_escaped, from_escaped, from_escaped, to_escaped, from_escaped
     );
 
-    let occupancy_rows = conn
-        .simple_query(&occupancy_query)
-        .await?
-        .into_first_result()
+    let occupancy_rows = sqlx::query(&occupancy_query)
+        .fetch_all(pool)
         .await?;
 
-    let (occupied_nights, total_revenue, checkin_count, avg_stay) = occupancy_rows
+    let (occupied_nights, total_revenue, _checkin_count, avg_stay) = occupancy_rows
         .first()
         .map(|r| {
             (
-                r.get::<i32, _>("occupied_nights").unwrap_or(0),
-                r.get::<f64, _>("total_revenue").unwrap_or(0.0),
-                r.get::<i32, _>("checkin_count").unwrap_or(0),
-                r.get::<f64, _>("avg_stay").unwrap_or(0.0),
+                r.try_get::<i32, _>("occupied_nights").unwrap_or(0),
+                r.try_get::<f64, _>("total_revenue").unwrap_or(0.0),
+                r.try_get::<i32, _>("checkin_count").unwrap_or(0),
+                r.try_get::<f64, _>("avg_stay").unwrap_or(0.0),
             )
         })
         .unwrap_or((0, 0.0, 0, 0.0));
@@ -316,7 +305,7 @@ pub async fn get_revenue_by_room_type(
     State(state): State<AppState>,
     Query(params): Query<OccupancyQuery>,
 ) -> ApiResult<Json<RevenueByRoomTypeResponse>> {
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
     // Validate date parameters
     if params.from.is_empty() || params.to.is_empty() {
@@ -330,33 +319,30 @@ pub async fn get_revenue_by_room_type(
     let query = format!(
         r#"
         SELECT
-            COALESCE(rt.Type_Name, 'Unknown') as room_type,
-            COALESCE(SUM(COALESCE(ci.Cin_Total_Amount,
-                ci.Cin_Rate_Per_Night * DATEDIFF(day, ci.Cin_CheckIn_Time,
-                    COALESCE(ci.Cin_CheckOut_Time, ci.Cin_Expected_Checkout)))), 0) as revenue
-        FROM HT_CheckIns ci
-        LEFT JOIN HT_Rooms_New r ON ci.Cin_Room_ID = r.Room_ID
-        LEFT JOIN HT_Room_Types rt ON r.Room_Type_ID = rt.Type_ID
-        WHERE ci.Cin_Status = 'checkedout'
-          AND CAST(ci.Cin_CheckIn_Time AS DATE) >= '{}'
-          AND CAST(ci.Cin_CheckIn_Time AS DATE) <= '{}'
-        GROUP BY rt.Type_Name
+            COALESCE(rt.type_name, 'Unknown') as room_type,
+            COALESCE(SUM(COALESCE(ci.cin_total_amount,
+                ci.cin_rate_per_night * (COALESCE(ci.cin_checkout_time, ci.cin_expected_checkout)::date - ci.cin_checkin_time::date))), 0) as revenue
+        FROM ht_checkins ci
+        LEFT JOIN ht_rooms_new r ON ci.cin_room_id = r.room_id
+        LEFT JOIN ht_room_types rt ON r.room_type_id = rt.type_id
+        WHERE ci.cin_status = 'checkedout'
+          AND ci.cin_checkin_time::date >= '{}'
+          AND ci.cin_checkin_time::date <= '{}'
+        GROUP BY rt.type_name
         ORDER BY revenue DESC
         "#,
         from_escaped, to_escaped
     );
 
-    let rows = conn
-        .simple_query(&query)
-        .await?
-        .into_first_result()
+    let rows = sqlx::query(&query)
+        .fetch_all(pool)
         .await?;
 
     let mut data: Vec<RoomTypeRevenue> = rows
         .iter()
         .map(|row| RoomTypeRevenue {
-            room_type: row.get::<&str, _>("room_type").unwrap_or("Unknown").to_string(),
-            revenue: row.get::<f64, _>("revenue").unwrap_or(0.0),
+            room_type: row.try_get::<String, _>("room_type").unwrap_or_else(|_| "Unknown".to_string()),
+            revenue: row.try_get::<f64, _>("revenue").unwrap_or(0.0),
             percentage: 0.0, // Will calculate after
         })
         .collect();

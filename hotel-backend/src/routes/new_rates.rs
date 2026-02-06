@@ -12,6 +12,7 @@ use axum::{
 };
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 
 use super::mode::AppState;
 use crate::error::{ApiError, ApiResult};
@@ -112,17 +113,17 @@ pub async fn list_rates(
     State(state): State<AppState>,
     Query(params): Query<RatesQuery>,
 ) -> ApiResult<Json<RatesResponse>> {
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
     // Build WHERE conditions
     let mut conditions: Vec<String> = Vec::new();
 
     if let Some(room_type_id) = params.room_type_id {
-        conditions.push(format!("r.Rate_Room_Type_ID = {}", room_type_id));
+        conditions.push(format!("r.rate_room_type_id = {}", room_type_id));
     }
 
     if let Some(active) = params.active {
-        conditions.push(format!("r.Rate_Active = {}", if active { 1 } else { 0 }));
+        conditions.push(format!("r.rate_active = {}", if active { "true" } else { "false" }));
     }
 
     let where_clause = if conditions.is_empty() {
@@ -134,47 +135,43 @@ pub async fn list_rates(
     let query = format!(
         r#"
         SELECT
-            r.Rate_ID,
-            r.Rate_Name,
-            r.Rate_Room_Type_ID,
-            rt.Type_Name,
-            r.Rate_Type,
-            r.Rate_Value,
-            r.Rate_Valid_From,
-            r.Rate_Valid_To,
-            r.Rate_Days_Of_Week,
-            r.Rate_Active,
-            r.Rate_Created,
-            r.Rate_Updated
-        FROM HT_Rates r
-        LEFT JOIN HT_Room_Types rt ON r.Rate_Room_Type_ID = rt.Type_ID
+            r.rate_id,
+            r.rate_name,
+            r.rate_room_type_id,
+            rt.type_name,
+            r.rate_type,
+            r.rate_value,
+            r.rate_valid_from,
+            r.rate_valid_to,
+            r.rate_days_of_week,
+            r.rate_active,
+            r.rate_created,
+            r.rate_updated
+        FROM ht_rates r
+        LEFT JOIN ht_room_types rt ON r.rate_room_type_id = rt.type_id
         {}
-        ORDER BY r.Rate_Name ASC
+        ORDER BY r.rate_name ASC
         "#,
         where_clause
     );
 
-    let rows = conn
-        .simple_query(&query)
-        .await?
-        .into_first_result()
-        .await?;
+    let rows = sqlx::query(&query).fetch_all(pool).await?;
 
     let rates: Vec<Rate> = rows
         .iter()
         .map(|row| Rate {
-            id: row.get::<i32, _>("Rate_ID").unwrap_or(0),
-            name: row.get::<&str, _>("Rate_Name").unwrap_or_default().to_string(),
-            room_type_id: row.get::<i32, _>("Rate_Room_Type_ID"),
-            room_type_name: row.get::<&str, _>("Type_Name").map(String::from),
-            rate_type: row.get::<&str, _>("Rate_Type").unwrap_or("multiplier").to_string(),
-            value: row.get::<f64, _>("Rate_Value").unwrap_or(1.0),
-            valid_from: row.get::<NaiveDate, _>("Rate_Valid_From"),
-            valid_to: row.get::<NaiveDate, _>("Rate_Valid_To"),
-            days_of_week: row.get::<&str, _>("Rate_Days_Of_Week").map(String::from),
-            active: row.get::<bool, _>("Rate_Active").unwrap_or(true),
-            created_at: row.get::<chrono::NaiveDateTime, _>("Rate_Created"),
-            updated_at: row.get::<chrono::NaiveDateTime, _>("Rate_Updated"),
+            id: row.try_get::<i32, _>("rate_id").unwrap_or(0),
+            name: row.try_get::<String, _>("rate_name").unwrap_or_default(),
+            room_type_id: row.try_get::<i32, _>("rate_room_type_id").ok(),
+            room_type_name: row.try_get::<String, _>("type_name").ok(),
+            rate_type: row.try_get::<String, _>("rate_type").unwrap_or_else(|_| "multiplier".to_string()),
+            value: row.try_get::<f64, _>("rate_value").unwrap_or(1.0),
+            valid_from: row.try_get::<NaiveDate, _>("rate_valid_from").ok(),
+            valid_to: row.try_get::<NaiveDate, _>("rate_valid_to").ok(),
+            days_of_week: row.try_get::<String, _>("rate_days_of_week").ok(),
+            active: row.try_get::<bool, _>("rate_active").unwrap_or(true),
+            created_at: row.try_get::<chrono::NaiveDateTime, _>("rate_created").ok(),
+            updated_at: row.try_get::<chrono::NaiveDateTime, _>("rate_updated").ok(),
         })
         .collect();
 
@@ -192,32 +189,30 @@ pub async fn get_rate(
     State(state): State<AppState>,
     Path(rate_id): Path<i32>,
 ) -> ApiResult<Json<RateResponse>> {
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
-    let rows = conn
-        .query(
+    let rows = sqlx::query(
             r#"
             SELECT
-                r.Rate_ID,
-                r.Rate_Name,
-                r.Rate_Room_Type_ID,
-                rt.Type_Name,
-                r.Rate_Type,
-                r.Rate_Value,
-                r.Rate_Valid_From,
-                r.Rate_Valid_To,
-                r.Rate_Days_Of_Week,
-                r.Rate_Active,
-                r.Rate_Created,
-                r.Rate_Updated
-            FROM HT_Rates r
-            LEFT JOIN HT_Room_Types rt ON r.Rate_Room_Type_ID = rt.Type_ID
-            WHERE r.Rate_ID = @P1
+                r.rate_id,
+                r.rate_name,
+                r.rate_room_type_id,
+                rt.type_name,
+                r.rate_type,
+                r.rate_value,
+                r.rate_valid_from,
+                r.rate_valid_to,
+                r.rate_days_of_week,
+                r.rate_active,
+                r.rate_created,
+                r.rate_updated
+            FROM ht_rates r
+            LEFT JOIN ht_room_types rt ON r.rate_room_type_id = rt.type_id
+            WHERE r.rate_id = $1
             "#,
-            &[&rate_id],
         )
-        .await?
-        .into_first_result()
+        .bind(&rate_id)
+        .fetch_all(pool)
         .await?;
 
     let row = rows
@@ -225,18 +220,18 @@ pub async fn get_rate(
         .ok_or_else(|| ApiError::NotFound("Rate not found".to_string()))?;
 
     let rate = Rate {
-        id: row.get::<i32, _>("Rate_ID").unwrap_or(0),
-        name: row.get::<&str, _>("Rate_Name").unwrap_or_default().to_string(),
-        room_type_id: row.get::<i32, _>("Rate_Room_Type_ID"),
-        room_type_name: row.get::<&str, _>("Type_Name").map(String::from),
-        rate_type: row.get::<&str, _>("Rate_Type").unwrap_or("multiplier").to_string(),
-        value: row.get::<f64, _>("Rate_Value").unwrap_or(1.0),
-        valid_from: row.get::<NaiveDate, _>("Rate_Valid_From"),
-        valid_to: row.get::<NaiveDate, _>("Rate_Valid_To"),
-        days_of_week: row.get::<&str, _>("Rate_Days_Of_Week").map(String::from),
-        active: row.get::<bool, _>("Rate_Active").unwrap_or(true),
-        created_at: row.get::<chrono::NaiveDateTime, _>("Rate_Created"),
-        updated_at: row.get::<chrono::NaiveDateTime, _>("Rate_Updated"),
+        id: row.try_get::<i32, _>("rate_id").unwrap_or(0),
+        name: row.try_get::<String, _>("rate_name").unwrap_or_default(),
+        room_type_id: row.try_get::<i32, _>("rate_room_type_id").ok(),
+        room_type_name: row.try_get::<String, _>("type_name").ok(),
+        rate_type: row.try_get::<String, _>("rate_type").unwrap_or_else(|_| "multiplier".to_string()),
+        value: row.try_get::<f64, _>("rate_value").unwrap_or(1.0),
+        valid_from: row.try_get::<NaiveDate, _>("rate_valid_from").ok(),
+        valid_to: row.try_get::<NaiveDate, _>("rate_valid_to").ok(),
+        days_of_week: row.try_get::<String, _>("rate_days_of_week").ok(),
+        active: row.try_get::<bool, _>("rate_active").unwrap_or(true),
+        created_at: row.try_get::<chrono::NaiveDateTime, _>("rate_created").ok(),
+        updated_at: row.try_get::<chrono::NaiveDateTime, _>("rate_updated").ok(),
     };
 
     Ok(Json(RateResponse {
@@ -261,44 +256,41 @@ pub async fn create_rate(
         return Err(ApiError::BadRequest("Rate type must be 'multiplier' or 'fixed'".to_string()));
     }
 
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
     let active = body.active.unwrap_or(true);
 
-    let rows = conn
-        .query(
+    let rows = sqlx::query(
             r#"
-            INSERT INTO HT_Rates (
-                Rate_Name,
-                Rate_Room_Type_ID,
-                Rate_Type,
-                Rate_Value,
-                Rate_Valid_From,
-                Rate_Valid_To,
-                Rate_Days_Of_Week,
-                Rate_Active
+            INSERT INTO ht_rates (
+                rate_name,
+                rate_room_type_id,
+                rate_type,
+                rate_value,
+                rate_valid_from,
+                rate_valid_to,
+                rate_days_of_week,
+                rate_active
             )
-            OUTPUT INSERTED.Rate_ID
-            VALUES (@P1, @P2, @P3, @P4, @P5, @P6, @P7, @P8)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING rate_id
             "#,
-            &[
-                &name,
-                &body.room_type_id,
-                &rate_type.as_str(),
-                &body.value,
-                &body.valid_from.as_deref(),
-                &body.valid_to.as_deref(),
-                &body.days_of_week.as_deref(),
-                &active,
-            ],
         )
-        .await?
-        .into_first_result()
+        .bind(&name)
+        .bind(&body.room_type_id)
+        .bind(&rate_type.as_str())
+        .bind(&body.value)
+        .bind(&body.valid_from.as_deref())
+        .bind(&body.valid_to.as_deref())
+        .bind(&body.days_of_week.as_deref())
+        .bind(&active)
+        .fetch_all(pool)
         .await?;
 
     let rate_id = rows
         .first()
-        .and_then(|r| r.get::<i32, _>("Rate_ID"))
+        .map(|r| r.try_get::<i32, _>("rate_id").ok())
+        .flatten()
         .ok_or_else(|| ApiError::Internal("Failed to create rate".to_string()))?;
 
     Ok(Json(MutationResponse {
@@ -325,16 +317,14 @@ pub async fn update_rate(
         return Err(ApiError::BadRequest("Rate type must be 'multiplier' or 'fixed'".to_string()));
     }
 
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
     // Check if rate exists
-    let check_rows = conn
-        .query(
-            "SELECT Rate_ID FROM HT_Rates WHERE Rate_ID = @P1",
-            &[&rate_id],
+    let check_rows = sqlx::query(
+            "SELECT rate_id FROM ht_rates WHERE rate_id = $1",
         )
-        .await?
-        .into_first_result()
+        .bind(&rate_id)
+        .fetch_all(pool)
         .await?;
 
     if check_rows.is_empty() {
@@ -343,32 +333,31 @@ pub async fn update_rate(
 
     let active = body.active.unwrap_or(true);
 
-    conn.execute(
+    sqlx::query(
         r#"
-        UPDATE HT_Rates
-        SET Rate_Name = @P1,
-            Rate_Room_Type_ID = @P2,
-            Rate_Type = @P3,
-            Rate_Value = @P4,
-            Rate_Valid_From = @P5,
-            Rate_Valid_To = @P6,
-            Rate_Days_Of_Week = @P7,
-            Rate_Active = @P8,
-            Rate_Updated = GETDATE()
-        WHERE Rate_ID = @P9
+        UPDATE ht_rates
+        SET rate_name = $1,
+            rate_room_type_id = $2,
+            rate_type = $3,
+            rate_value = $4,
+            rate_valid_from = $5,
+            rate_valid_to = $6,
+            rate_days_of_week = $7,
+            rate_active = $8,
+            rate_updated = NOW()
+        WHERE rate_id = $9
         "#,
-        &[
-            &name,
-            &body.room_type_id,
-            &rate_type.as_str(),
-            &body.value,
-            &body.valid_from.as_deref(),
-            &body.valid_to.as_deref(),
-            &body.days_of_week.as_deref(),
-            &active,
-            &rate_id,
-        ],
     )
+    .bind(&name)
+    .bind(&body.room_type_id)
+    .bind(&rate_type.as_str())
+    .bind(&body.value)
+    .bind(&body.valid_from.as_deref())
+    .bind(&body.valid_to.as_deref())
+    .bind(&body.days_of_week.as_deref())
+    .bind(&active)
+    .bind(&rate_id)
+    .execute(pool)
     .await?;
 
     Ok(Json(MutationResponse {
@@ -383,16 +372,16 @@ pub async fn delete_rate(
     State(state): State<AppState>,
     Path(rate_id): Path<i32>,
 ) -> ApiResult<Json<MutationResponse>> {
-    let mut conn = state.new_pool.get().await?;
+    let pool = &state.new_pool;
 
-    let result = conn
-        .execute(
-            "DELETE FROM HT_Rates WHERE Rate_ID = @P1",
-            &[&rate_id],
+    let result = sqlx::query(
+            "DELETE FROM ht_rates WHERE rate_id = $1",
         )
+        .bind(&rate_id)
+        .execute(pool)
         .await?;
 
-    if result.total() == 0 {
+    if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("Rate not found".to_string()));
     }
 

@@ -17,6 +17,7 @@ use axum::{
 };
 use chrono::NaiveDateTime;
 use serde::Deserialize;
+use sqlx::Row;
 
 use crate::db::DbPool;
 use crate::error::{ApiError, ApiResult};
@@ -249,37 +250,35 @@ pub async fn get_booking(
 
     let first_record = &booking_rows[0];
 
-    // Use new_pool for notes (HotelNew database)
-    let mut new_conn = state.new_pool.get().await?;
+    // Use new_pool for notes (HotelNew database via sqlx/PostgreSQL)
+    let new_pool = &state.new_pool;
 
     // Ensure notes table exists in HotelNew
-    ensure_notes_table(&mut new_conn).await?;
+    ensure_notes_table(&state.new_pool).await?;
 
     // Try to fetch notes from HotelNew database
-    let notes = match new_conn
-        .query(
+    let notes = match sqlx::query(
             r#"
-            SELECT Note_ID, Note_Text, Created_At, Updated_At
-            FROM HT_Booking_Notes
-            WHERE Book_No = @P1
-            ORDER BY Created_At DESC
+            SELECT note_id, note_text, created_at, updated_at
+            FROM ht_booking_notes
+            WHERE book_no = $1
+            ORDER BY created_at DESC
             "#,
-            &[&book_no],
         )
+        .bind(&book_no)
+        .fetch_all(new_pool)
         .await
     {
-        Ok(result) => {
-            let note_rows = result.into_first_result().await.unwrap_or_default();
+        Ok(note_rows) => {
             note_rows
                 .iter()
                 .map(|row| Note {
-                    id: row.get::<i32, _>("Note_ID").unwrap_or(0),
+                    id: row.try_get::<i32, _>("note_id").unwrap_or(0),
                     text: row
-                        .get::<&str, _>("Note_Text")
-                        .unwrap_or_default()
-                        .to_string(),
-                    created_at: row.get::<NaiveDateTime, _>("Created_At"),
-                    updated_at: row.get::<NaiveDateTime, _>("Updated_At"),
+                        .try_get::<String, _>("note_text")
+                        .unwrap_or_default(),
+                    created_at: row.try_get::<NaiveDateTime, _>("created_at").ok(),
+                    updated_at: row.try_get::<NaiveDateTime, _>("updated_at").ok(),
                 })
                 .collect()
         }
@@ -329,36 +328,33 @@ pub async fn get_notes(
     State(state): State<AppState>,
     Path(book_no): Path<String>,
 ) -> ApiResult<Json<NotesResponse>> {
-    // Use new_pool for notes (HotelNew database - writable)
-    let mut conn = state.new_pool.get().await?;
+    // Use new_pool for notes (HotelNew database - writable via sqlx/PostgreSQL)
+    let pool = &state.new_pool;
 
     // Ensure notes table exists
-    ensure_notes_table(&mut conn).await?;
+    ensure_notes_table(pool).await?;
 
-    let rows = conn
-        .query(
+    let rows = sqlx::query(
             r#"
-            SELECT Note_ID, Note_Text, Created_At, Updated_At
-            FROM HT_Booking_Notes
-            WHERE Book_No = @P1
-            ORDER BY Created_At DESC
+            SELECT note_id, note_text, created_at, updated_at
+            FROM ht_booking_notes
+            WHERE book_no = $1
+            ORDER BY created_at DESC
             "#,
-            &[&book_no],
         )
-        .await?
-        .into_first_result()
+        .bind(&book_no)
+        .fetch_all(pool)
         .await?;
 
     let notes: Vec<Note> = rows
         .iter()
         .map(|row| Note {
-            id: row.get::<i32, _>("Note_ID").unwrap_or(0),
+            id: row.try_get::<i32, _>("note_id").unwrap_or(0),
             text: row
-                .get::<&str, _>("Note_Text")
-                .unwrap_or_default()
-                .to_string(),
-            created_at: row.get::<NaiveDateTime, _>("Created_At"),
-            updated_at: row.get::<NaiveDateTime, _>("Updated_At"),
+                .try_get::<String, _>("note_text")
+                .unwrap_or_default(),
+            created_at: row.try_get::<NaiveDateTime, _>("created_at").ok(),
+            updated_at: row.try_get::<NaiveDateTime, _>("updated_at").ok(),
         })
         .collect();
 
@@ -379,23 +375,22 @@ pub async fn create_note(
         return Err(ApiError::BadRequest("Note text is required".to_string()));
     }
 
-    // Use new_pool for notes (HotelNew database - writable)
-    let mut conn = state.new_pool.get().await?;
+    // Use new_pool for notes (HotelNew database - writable via sqlx/PostgreSQL)
+    let pool = &state.new_pool;
 
     // Ensure notes table exists
-    ensure_notes_table(&mut conn).await?;
+    ensure_notes_table(pool).await?;
 
-    let rows = conn
-        .query(
+    let rows = sqlx::query(
             r#"
-            INSERT INTO HT_Booking_Notes (Book_No, Note_Text)
-            OUTPUT INSERTED.Note_ID, INSERTED.Note_Text, INSERTED.Created_At, INSERTED.Updated_At
-            VALUES (@P1, @P2)
+            INSERT INTO ht_booking_notes (book_no, note_text)
+            VALUES ($1, $2)
+            RETURNING note_id, note_text, created_at, updated_at
             "#,
-            &[&book_no, &text],
         )
-        .await?
-        .into_first_result()
+        .bind(&book_no)
+        .bind(&text)
+        .fetch_all(pool)
         .await?;
 
     let row = rows
@@ -403,13 +398,12 @@ pub async fn create_note(
         .ok_or_else(|| ApiError::Internal("Failed to create note".to_string()))?;
 
     let note = Note {
-        id: row.get::<i32, _>("Note_ID").unwrap_or(0),
+        id: row.try_get::<i32, _>("note_id").unwrap_or(0),
         text: row
-            .get::<&str, _>("Note_Text")
-            .unwrap_or_default()
-            .to_string(),
-        created_at: row.get::<NaiveDateTime, _>("Created_At"),
-        updated_at: row.get::<NaiveDateTime, _>("Updated_At"),
+            .try_get::<String, _>("note_text")
+            .unwrap_or_default(),
+        created_at: row.try_get::<NaiveDateTime, _>("created_at").ok(),
+        updated_at: row.try_get::<NaiveDateTime, _>("updated_at").ok(),
     };
 
     Ok(Json(CreateNoteResponse {
@@ -431,20 +425,21 @@ pub async fn delete_note(
     Path(book_no): Path<String>,
     Query(params): Query<DeleteNoteQuery>,
 ) -> ApiResult<Json<DeleteNoteResponse>> {
-    // Use new_pool for notes (HotelNew database - writable)
-    let mut conn = state.new_pool.get().await?;
+    // Use new_pool for notes (HotelNew database - writable via sqlx/PostgreSQL)
+    let pool = &state.new_pool;
 
-    let result = conn
-        .execute(
+    let result = sqlx::query(
             r#"
-            DELETE FROM HT_Booking_Notes
-            WHERE Note_ID = @P1 AND Book_No = @P2
+            DELETE FROM ht_booking_notes
+            WHERE note_id = $1 AND book_no = $2
             "#,
-            &[&params.note_id, &book_no],
         )
+        .bind(&params.note_id)
+        .bind(&book_no)
+        .execute(pool)
         .await?;
 
-    if result.total() == 0 {
+    if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("Note not found".to_string()));
     }
 
@@ -455,33 +450,25 @@ pub async fn delete_note(
 }
 
 /// Ensure the notes table exists (idempotent)
-async fn ensure_notes_table(
-    conn: &mut bb8::PooledConnection<'_, bb8_tiberius::ConnectionManager>,
-) -> ApiResult<()> {
-    conn.simple_query(
+async fn ensure_notes_table(pool: &crate::db::PgPool) -> ApiResult<()> {
+    sqlx::query(
         r#"
-        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='HT_Booking_Notes' AND xtype='U')
-        CREATE TABLE HT_Booking_Notes (
-            Note_ID INT IDENTITY(1,1) PRIMARY KEY,
-            Book_No NVARCHAR(50) NOT NULL,
-            Note_Text NVARCHAR(MAX) NOT NULL,
-            Created_At DATETIME DEFAULT GETDATE(),
-            Updated_At DATETIME DEFAULT GETDATE()
+        CREATE TABLE IF NOT EXISTS ht_booking_notes (
+            note_id SERIAL PRIMARY KEY,
+            book_no VARCHAR(50) NOT NULL,
+            note_text TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
         )
         "#,
     )
-    .await?
-    .into_results()
+    .execute(pool)
     .await?;
 
-    conn.simple_query(
-        r#"
-        IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='IX_Booking_Notes_BookNo')
-        CREATE INDEX IX_Booking_Notes_BookNo ON HT_Booking_Notes(Book_No)
-        "#,
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS ix_booking_notes_bookno ON ht_booking_notes(book_no)"
     )
-    .await?
-    .into_results()
+    .execute(pool)
     .await?;
 
     Ok(())
