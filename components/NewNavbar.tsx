@@ -4,6 +4,7 @@ import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import {
   Home,
+  Calendar,
   BookOpen,
   BedDouble,
   Hotel,
@@ -12,7 +13,6 @@ import {
   Wrench,
   Sparkles,
   Package,
-  Settings,
   DollarSign,
   ArrowLeftRight,
 } from 'lucide-react'
@@ -25,6 +25,7 @@ interface NavLink {
 
 const navLinks: NavLink[] = [
   { href: '/new', label: 'หน้าหลัก', icon: <Home size={20} /> },
+  { href: '/new/calendar', label: 'ปฏิทิน', icon: <Calendar size={20} /> },
   { href: '/new/bookings', label: 'การจอง', icon: <BookOpen size={20} /> },
   { href: '/new/room-types', label: 'ประเภทห้อง', icon: <BedDouble size={20} /> },
   { href: '/new/rates', label: 'ราคา', icon: <DollarSign size={20} /> },

@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.11.1] - 2026-02-06
+
+### Fixed
+- **Legacy customers page not displaying customers** - Removed ModeContext dependency that caused page to use wrong API endpoint when localStorage had 'new' mode saved from previous session
+
+### Added
+- **Calendar page for new system** (`/app/new/calendar/page.tsx`) - Moved calendar functionality to new system
+  - Uses hybrid calendar endpoint to show both legacy and new bookings/check-ins
+  - Added calendar link to NewNavbar navigation
+
+### Changed
+- **Separated legacy and new mode dependencies** - Legacy pages now always use legacy APIs, new pages always use new APIs (no more mode context interference)
+
 ## [2.11.0] - 2026-02-06
 
 ### Added
