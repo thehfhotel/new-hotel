@@ -1,6 +1,6 @@
 {
   "name": "new-hotel",
-  "version": "2.13.0",
+  "version": "2.13.1",
   "private": true,
   "scripts": {
     "dev": "next dev -p 3003",
@@ -10,6 +10,7 @@
     "test": "jest",
     "test:watch": "jest --watch",
     "test:components": "jest __tests__/components/",
+    "test:e2e": "playwright test",
     "prepare": "husky"
   },
   "dependencies": {
@@ -22,6 +23,7 @@
     "recharts": "^2.15.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.58.2",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@types/jest": "^30.0.0",
