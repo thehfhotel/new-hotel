@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO ht_booking_notes (book_no, note_text)\n            VALUES ($1, $2)\n            RETURNING note_id, note_text, created_at, updated_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "note_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "note_text",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "created_at",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 3,
+        "name": "updated_at",
+        "type_info": "Timestamp"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "9639a161f673bdf75967149c94215f94353e6658971772d8761b8fa3c1999b4c"
+}

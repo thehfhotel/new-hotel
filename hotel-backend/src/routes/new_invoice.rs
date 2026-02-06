@@ -8,7 +8,6 @@ use axum::{
 };
 use chrono::NaiveDateTime;
 use serde::Serialize;
-use sqlx::Row;
 
 use super::mode::AppState;
 use crate::error::{ApiError, ApiResult};
@@ -100,7 +99,7 @@ pub async fn get_invoice(
     let pool = &state.new_pool;
 
     // Get check-in with all related data
-    let rows = sqlx::query(
+    let rec = sqlx::query!(
             r#"
             SELECT
                 -- Check-in info
@@ -133,11 +132,11 @@ pub async fn get_invoice(
                 ci.cin_children,
 
                 -- Rate info
-                ci.cin_rate_per_night,
+                ci.cin_rate_per_night::float8 as cin_rate_per_night,
                 (COALESCE(ci.cin_checkout_time, ci.cin_expected_checkout)::date - ci.cin_checkin_time::date) as nights,
 
                 -- Totals
-                ci.cin_total_amount,
+                ci.cin_total_amount::float8 as cin_total_amount,
                 ci.cin_payment_status,
 
                 -- Notes and timestamps
@@ -150,46 +149,43 @@ pub async fn get_invoice(
             LEFT JOIN ht_bookings b ON ci.cin_book_id = b.book_id
             WHERE ci.cin_id = $1
             "#,
+            cin_id
         )
-        .bind(&cin_id)
-        .fetch_all(pool)
-        .await?;
-
-    let row = rows
-        .first()
+        .fetch_optional(pool)
+        .await?
         .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
 
     // Extract customer info
-    let first_name = row.try_get::<String, _>("cust_firstname").unwrap_or_default();
-    let last_name = row.try_get::<String, _>("cust_lastname").ok();
+    let first_name = rec.cust_firstname;
+    let last_name = rec.cust_lastname.clone();
     let full_name = match &last_name {
         Some(ln) => format!("{} {}", first_name, ln),
         None => first_name.clone(),
     };
 
     let guest = InvoiceGuest {
-        id: row.try_get::<i32, _>("cust_id").unwrap_or(0),
+        id: rec.cust_id,
         first_name,
         last_name,
         full_name,
-        email: row.try_get::<String, _>("cust_email").ok(),
-        phone: row.try_get::<String, _>("cust_phone").ok(),
-        address: row.try_get::<String, _>("cust_address").ok(),
-        id_card: row.try_get::<String, _>("cust_idcard").ok(),
-        passport: row.try_get::<String, _>("cust_passport").ok(),
+        email: rec.cust_email,
+        phone: rec.cust_phone,
+        address: rec.cust_address,
+        id_card: rec.cust_idcard,
+        passport: rec.cust_passport,
     };
 
     // Extract room info
     let room = InvoiceRoom {
-        room_id: row.try_get::<i32, _>("room_id").unwrap_or(0),
-        room_no: row.try_get::<String, _>("room_no").unwrap_or_default(),
-        room_type: row.try_get::<String, _>("room_type").ok(),
-        floor: row.try_get::<i32, _>("room_floor").ok(),
+        room_id: rec.room_id,
+        room_no: rec.room_no,
+        room_type: Some(rec.room_type),
+        floor: rec.room_floor,
     };
 
     // Extract rate info
-    let rate_per_night = row.try_get::<f64, _>("cin_rate_per_night").unwrap_or(0.0);
-    let nights = row.try_get::<i32, _>("nights").unwrap_or(1).max(1);
+    let rate_per_night = rec.cin_rate_per_night.unwrap_or(0.0);
+    let nights = rec.nights.unwrap_or(1).max(1);
     let subtotal = rate_per_night * nights as f64;
 
     let rates = InvoiceRates {
@@ -199,25 +195,25 @@ pub async fn get_invoice(
     };
 
     // Get total amount (use calculated if not stored)
-    let total_amount = row.try_get::<f64, _>("cin_total_amount").unwrap_or(subtotal);
+    let total_amount = rec.cin_total_amount.unwrap_or(subtotal);
 
     let invoice = Invoice {
-        checkin_id: row.try_get::<i32, _>("cin_id").unwrap_or(0),
-        cin_no: row.try_get::<String, _>("cin_no").unwrap_or_default(),
-        booking_id: row.try_get::<i32, _>("cin_book_id").ok(),
-        booking_no: row.try_get::<String, _>("book_no").ok(),
+        checkin_id: rec.cin_id,
+        cin_no: rec.cin_no,
+        booking_id: rec.cin_book_id,
+        booking_no: Some(rec.book_no),
         guest,
         room,
-        check_in_time: row.try_get::<NaiveDateTime, _>("cin_checkin_time").ok(),
-        check_out_time: row.try_get::<NaiveDateTime, _>("cin_checkout_time").ok(),
-        expected_checkout: row.try_get::<NaiveDateTime, _>("cin_expected_checkout").ok(),
-        adults: row.try_get::<i32, _>("cin_adults").unwrap_or(1),
-        children: row.try_get::<i32, _>("cin_children").unwrap_or(0),
+        check_in_time: Some(rec.cin_checkin_time),
+        check_out_time: rec.cin_checkout_time,
+        expected_checkout: Some(rec.cin_expected_checkout.and_hms_opt(0, 0, 0).unwrap()),
+        adults: rec.cin_adults.unwrap_or(1),
+        children: rec.cin_children.unwrap_or(0),
         rates,
         total_amount,
-        payment_status: row.try_get::<String, _>("cin_payment_status").ok(),
-        notes: row.try_get::<String, _>("cin_notes").ok(),
-        created_at: row.try_get::<NaiveDateTime, _>("created_at").ok(),
+        payment_status: rec.cin_payment_status,
+        notes: rec.cin_notes,
+        created_at: rec.created_at,
     };
 
     Ok(Json(InvoiceResponse {

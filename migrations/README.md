@@ -30,23 +30,53 @@ NNN_description.sql
 sqlcmd -S 192.168.100.222 -d HotelDB -U username -P password -i migrations/001_create_booking_notes_table.sql
 ```
 
-### HotelNew Database (PostgreSQL)
+### HotelNew Database (PostgreSQL) — Automated Migrations
 
-For new schema changes to HotelNew:
+As of v2.14.0, HotelNew schema changes are **automatically applied** by the CI/CD pipeline via `scripts/migrate.sh`. Migration files live in `migrations/pg/`.
 
-1. **Update `init-db/init-hotelnew.sql`** - Add new tables/changes with `IF NOT EXISTS`
-2. **Create a migration file** in this directory for documentation
-3. **Apply to running database** using psql:
+#### Creating a New Migration
+
+1. **Create a migration file** in `migrations/pg/`:
+   - Name format: `NNN_description.sql` (e.g., `001_add_customer_notes.sql`)
+   - Use `IF NOT EXISTS` to make it idempotent
+   - Include commented rollback SQL at the bottom
+
+2. **Update `init-db/init-hotelnew.sql`** with the same changes (for fresh deployments)
+
+3. **Update this README** — add entry to the migrations table below
+
+4. **Push to master** — the pipeline will:
+   - Create a `pg_dump` backup before applying
+   - Run each pending migration in a transaction
+   - Record it in the `schema_migrations` tracking table
+   - Restart the backend to pick up schema changes
+
+#### Manual Migration (development)
 
 ```bash
-# Connect to PostgreSQL container
-docker exec -it new-hotel-db psql -U postgres -d hotelnew
+# Run all pending migrations locally
+./scripts/migrate.sh
 
-# Or run a migration file
-docker exec -i new-hotel-db psql -U postgres -d hotelnew < migrations/NNN_description.sql
+# Or apply a single file manually
+docker exec -i new-hotel-db psql -U postgres -p 5439 -d hotelnew < migrations/pg/001_description.sql
 ```
 
-Note: PostgreSQL auto-runs `init-db/init-hotelnew.sql` on first startup (when the data volume is empty). For existing deployments, apply changes manually via psql.
+#### Schema Migration Tracking
+
+Applied migrations are tracked in the `schema_migrations` table:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `version` | VARCHAR(10) UNIQUE | Migration version (e.g., `000`, `001`) |
+| `filename` | VARCHAR(255) | Migration file name |
+| `checksum` | VARCHAR(64) | SHA-256 of the migration file |
+| `applied_at` | TIMESTAMP | When it was applied |
+| `applied_by` | VARCHAR(100) | `init-script` or `migrate-script` |
+
+Check applied migrations:
+```bash
+docker exec new-hotel-db psql -U postgres -p 5439 -d hotelnew -c "SELECT * FROM schema_migrations ORDER BY version;"
+```
 
 ## Migration Guidelines
 
@@ -57,6 +87,8 @@ Note: PostgreSQL auto-runs `init-db/init-hotelnew.sql` on first startup (when th
 
 ## Current Migrations
 
+### Legacy Migrations (T-SQL, historical)
+
 | # | File | Description | Applied |
 |---|------|-------------|---------|
 | 001 | `001_create_booking_notes_table.sql` | Creates HT_Booking_Notes table for booking annotations | v1.16.0 (deprecated) |
@@ -66,6 +98,14 @@ Note: PostgreSQL auto-runs `init-db/init-hotelnew.sql` on first startup (when th
 | 005 | `005_move_booking_notes_to_hotelnew.sql` | Moves HT_Booking_Notes to HotelNew database (T-SQL, historical) | Superseded by PG init |
 | 006 | `006_payment_tracking.sql` | Adds HT_Payments table for multiple payments per check-in (T-SQL, historical) | Superseded by PG init |
 | 007 | `007_maintenance_system.sql` | Creates maintenance request system tables (T-SQL, historical) | Superseded by PG init |
+
+### PostgreSQL Migrations (`migrations/pg/`)
+
+These are automatically applied by `scripts/migrate.sh` during deployment.
+
+| Version | File | Description | Since |
+|---------|------|-------------|-------|
+| 000 | `000_baseline.sql` | Baseline marker for initial schema from `init-hotelnew.sql` | v2.14.0 |
 
 ## Tables Owned by This Application
 
@@ -98,6 +138,7 @@ All table and column names are **lowercase** (PostgreSQL convention). The canoni
 | `ht_payments` | Payment records for check-ins (multiple payments per stay) | v2.10.0 |
 | `ht_maintenance_categories` | Maintenance categories (Electrical, Plumbing, AC, Furniture, General) | v2.11.0 |
 | `ht_maintenance_requests` | Maintenance request records with status tracking | v2.11.0 |
+| `schema_migrations` | Migration version tracking (applied by migrate.sh) | v2.14.0 |
 
 ## Tables Used (Read-Only or Shared)
 

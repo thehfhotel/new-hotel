@@ -12,7 +12,7 @@ use axum::{
 };
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
+use sqlx::Row; // Still needed for dynamic queries in list_rates
 
 use super::mode::AppState;
 use crate::error::{ApiError, ApiResult};
@@ -191,47 +191,33 @@ pub async fn get_rate(
 ) -> ApiResult<Json<RateResponse>> {
     let pool = &state.new_pool;
 
-    let rows = sqlx::query(
-            r#"
-            SELECT
-                r.rate_id,
-                r.rate_name,
-                r.rate_room_type_id,
-                rt.type_name,
-                r.rate_type,
-                r.rate_value,
-                r.rate_valid_from,
-                r.rate_valid_to,
-                r.rate_days_of_week,
-                r.rate_active,
-                r.rate_created,
-                r.rate_updated
-            FROM ht_rates r
-            LEFT JOIN ht_room_types rt ON r.rate_room_type_id = rt.type_id
-            WHERE r.rate_id = $1
-            "#,
-        )
-        .bind(&rate_id)
-        .fetch_all(pool)
-        .await?;
-
-    let row = rows
-        .first()
-        .ok_or_else(|| ApiError::NotFound("Rate not found".to_string()))?;
+    let rec = sqlx::query!(
+        r#"SELECT r.rate_id, r.rate_name, r.rate_room_type_id, rt.type_name,
+            r.rate_type, r.rate_value::float8 as rate_value,
+            r.rate_valid_from, r.rate_valid_to, r.rate_days_of_week,
+            r.rate_active, r.rate_created, r.rate_updated
+        FROM ht_rates r
+        LEFT JOIN ht_room_types rt ON r.rate_room_type_id = rt.type_id
+        WHERE r.rate_id = $1"#,
+        rate_id
+    )
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Rate not found".to_string()))?;
 
     let rate = Rate {
-        id: row.try_get::<i32, _>("rate_id").unwrap_or(0),
-        name: row.try_get::<String, _>("rate_name").unwrap_or_default(),
-        room_type_id: row.try_get::<i32, _>("rate_room_type_id").ok(),
-        room_type_name: row.try_get::<String, _>("type_name").ok(),
-        rate_type: row.try_get::<String, _>("rate_type").unwrap_or_else(|_| "multiplier".to_string()),
-        value: row.try_get::<f64, _>("rate_value").unwrap_or(1.0),
-        valid_from: row.try_get::<NaiveDate, _>("rate_valid_from").ok(),
-        valid_to: row.try_get::<NaiveDate, _>("rate_valid_to").ok(),
-        days_of_week: row.try_get::<String, _>("rate_days_of_week").ok(),
-        active: row.try_get::<bool, _>("rate_active").unwrap_or(true),
-        created_at: row.try_get::<chrono::NaiveDateTime, _>("rate_created").ok(),
-        updated_at: row.try_get::<chrono::NaiveDateTime, _>("rate_updated").ok(),
+        id: rec.rate_id,
+        name: rec.rate_name,
+        room_type_id: rec.rate_room_type_id,
+        room_type_name: Some(rec.type_name),
+        rate_type: rec.rate_type,
+        value: rec.rate_value.unwrap_or(1.0),
+        valid_from: rec.rate_valid_from,
+        valid_to: rec.rate_valid_to,
+        days_of_week: rec.rate_days_of_week,
+        active: rec.rate_active.unwrap_or(true),
+        created_at: rec.rate_created,
+        updated_at: rec.rate_updated,
     };
 
     Ok(Json(RateResponse {
@@ -260,38 +246,30 @@ pub async fn create_rate(
 
     let active = body.active.unwrap_or(true);
 
-    let rows = sqlx::query(
-            r#"
-            INSERT INTO ht_rates (
-                rate_name,
-                rate_room_type_id,
-                rate_type,
-                rate_value,
-                rate_valid_from,
-                rate_valid_to,
-                rate_days_of_week,
-                rate_active
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            RETURNING rate_id
-            "#,
-        )
-        .bind(&name)
-        .bind(&body.room_type_id)
-        .bind(&rate_type.as_str())
-        .bind(&body.value)
-        .bind(&body.valid_from.as_deref())
-        .bind(&body.valid_to.as_deref())
-        .bind(&body.days_of_week.as_deref())
-        .bind(&active)
-        .fetch_all(pool)
-        .await?;
+    // Parse optional date fields
+    let valid_from: Option<NaiveDate> = match &body.valid_from {
+        Some(s) => Some(NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .map_err(|_| ApiError::BadRequest("Invalid valid_from date format (expected YYYY-MM-DD)".to_string()))?),
+        None => None,
+    };
+    let valid_to: Option<NaiveDate> = match &body.valid_to {
+        Some(s) => Some(NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .map_err(|_| ApiError::BadRequest("Invalid valid_to date format (expected YYYY-MM-DD)".to_string()))?),
+        None => None,
+    };
 
-    let rate_id = rows
-        .first()
-        .map(|r| r.try_get::<i32, _>("rate_id").ok())
-        .flatten()
-        .ok_or_else(|| ApiError::Internal("Failed to create rate".to_string()))?;
+    let rec = sqlx::query!(
+        r#"INSERT INTO ht_rates (rate_name, rate_room_type_id, rate_type, rate_value, rate_valid_from, rate_valid_to, rate_days_of_week, rate_active)
+        VALUES ($1, $2, $3, $4::float8, $5, $6, $7, $8)
+        RETURNING rate_id"#,
+        name, body.room_type_id, rate_type.as_str(), body.value,
+        valid_from, valid_to,
+        body.days_of_week.as_deref(), active
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let rate_id = rec.rate_id;
 
     Ok(Json(MutationResponse {
         success: true,
@@ -320,43 +298,36 @@ pub async fn update_rate(
     let pool = &state.new_pool;
 
     // Check if rate exists
-    let check_rows = sqlx::query(
-            "SELECT rate_id FROM ht_rates WHERE rate_id = $1",
-        )
-        .bind(&rate_id)
-        .fetch_all(pool)
+    let exists = sqlx::query!("SELECT rate_id FROM ht_rates WHERE rate_id = $1", rate_id)
+        .fetch_optional(pool)
         .await?;
 
-    if check_rows.is_empty() {
+    if exists.is_none() {
         return Err(ApiError::NotFound("Rate not found".to_string()));
     }
 
     let active = body.active.unwrap_or(true);
 
-    sqlx::query(
-        r#"
-        UPDATE ht_rates
-        SET rate_name = $1,
-            rate_room_type_id = $2,
-            rate_type = $3,
-            rate_value = $4,
-            rate_valid_from = $5,
-            rate_valid_to = $6,
-            rate_days_of_week = $7,
-            rate_active = $8,
-            rate_updated = NOW()
-        WHERE rate_id = $9
-        "#,
+    // Parse optional date fields
+    let valid_from: Option<NaiveDate> = match &body.valid_from {
+        Some(s) => Some(NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .map_err(|_| ApiError::BadRequest("Invalid valid_from date format (expected YYYY-MM-DD)".to_string()))?),
+        None => None,
+    };
+    let valid_to: Option<NaiveDate> = match &body.valid_to {
+        Some(s) => Some(NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .map_err(|_| ApiError::BadRequest("Invalid valid_to date format (expected YYYY-MM-DD)".to_string()))?),
+        None => None,
+    };
+
+    sqlx::query!(
+        r#"UPDATE ht_rates SET rate_name = $1, rate_room_type_id = $2, rate_type = $3, rate_value = $4::float8,
+        rate_valid_from = $5, rate_valid_to = $6, rate_days_of_week = $7, rate_active = $8, rate_updated = NOW()
+        WHERE rate_id = $9"#,
+        name, body.room_type_id, rate_type.as_str(), body.value,
+        valid_from, valid_to,
+        body.days_of_week.as_deref(), active, rate_id
     )
-    .bind(&name)
-    .bind(&body.room_type_id)
-    .bind(&rate_type.as_str())
-    .bind(&body.value)
-    .bind(&body.valid_from.as_deref())
-    .bind(&body.valid_to.as_deref())
-    .bind(&body.days_of_week.as_deref())
-    .bind(&active)
-    .bind(&rate_id)
     .execute(pool)
     .await?;
 
@@ -374,10 +345,7 @@ pub async fn delete_rate(
 ) -> ApiResult<Json<MutationResponse>> {
     let pool = &state.new_pool;
 
-    let result = sqlx::query(
-            "DELETE FROM ht_rates WHERE rate_id = $1",
-        )
-        .bind(&rate_id)
+    let result = sqlx::query!("DELETE FROM ht_rates WHERE rate_id = $1", rate_id)
         .execute(pool)
         .await?;
 

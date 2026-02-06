@@ -14,9 +14,9 @@ use axum::{
     extract::{Path, Query, State},
     Json,
 };
-use chrono::NaiveDateTime;
+use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
+use sqlx::Row; // Still needed for dynamic queries (list_checkins)
 
 use super::mode::AppState;
 use crate::error::{ApiError, ApiResult};
@@ -318,68 +318,65 @@ pub async fn get_checkin(
 ) -> ApiResult<Json<NewCheckInResponse>> {
     let pool = &state.new_pool;
 
-    let rows = sqlx::query(
-            r#"
-            SELECT
-                ci.cin_id,
-                ci.cin_no,
-                ci.cin_book_id,
-                b.book_no,
-                ci.cin_cust_id,
-                CONCAT(c.cust_firstname, ' ', COALESCE(c.cust_lastname, '')) as customer_name,
-                ci.cin_room_id,
-                r.room_no,
-                rt.type_name,
-                ci.cin_checkin_time,
-                ci.cin_checkout_time,
-                ci.cin_expected_checkout,
-                ci.cin_adults,
-                ci.cin_children,
-                ci.cin_status,
-                ci.cin_rate_per_night,
-                ci.cin_total_amount,
-                ci.cin_payment_status,
-                ci.cin_notes,
-                ci.created_at,
-                ci.updated_at
-            FROM ht_checkins ci
-            LEFT JOIN ht_customers c ON ci.cin_cust_id = c.cust_id
-            LEFT JOIN ht_rooms_new r ON ci.cin_room_id = r.room_id
-            LEFT JOIN ht_room_types rt ON r.room_type_id = rt.type_id
-            LEFT JOIN ht_bookings b ON ci.cin_book_id = b.book_id
-            WHERE ci.cin_id = $1
-            "#,
-        )
-        .bind(&cin_id)
-        .fetch_all(pool)
-        .await?;
-
-    let row = rows
-        .first()
-        .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
+    let rec = sqlx::query!(
+        r#"
+        SELECT
+            ci.cin_id,
+            ci.cin_no,
+            ci.cin_book_id,
+            b.book_no,
+            ci.cin_cust_id,
+            CONCAT(c.cust_firstname, ' ', COALESCE(c.cust_lastname, '')) as customer_name,
+            ci.cin_room_id,
+            r.room_no,
+            rt.type_name,
+            ci.cin_checkin_time,
+            ci.cin_checkout_time,
+            ci.cin_expected_checkout,
+            ci.cin_adults,
+            ci.cin_children,
+            ci.cin_status,
+            ci.cin_rate_per_night::float8 as cin_rate_per_night,
+            ci.cin_total_amount::float8 as cin_total_amount,
+            ci.cin_payment_status,
+            ci.cin_notes,
+            ci.created_at,
+            ci.updated_at
+        FROM ht_checkins ci
+        LEFT JOIN ht_customers c ON ci.cin_cust_id = c.cust_id
+        LEFT JOIN ht_rooms_new r ON ci.cin_room_id = r.room_id
+        LEFT JOIN ht_room_types rt ON r.room_type_id = rt.type_id
+        LEFT JOIN ht_bookings b ON ci.cin_book_id = b.book_id
+        WHERE ci.cin_id = $1
+        "#,
+        cin_id
+    )
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
 
     let checkin = NewCheckIn {
-        id: row.try_get::<i32, _>("cin_id").unwrap_or(0),
-        cin_no: row.try_get::<String, _>("cin_no").unwrap_or_default(),
-        booking_id: row.try_get::<i32, _>("cin_book_id").ok(),
-        booking_no: row.try_get::<String, _>("book_no").ok(),
-        customer_id: row.try_get::<i32, _>("cin_cust_id").unwrap_or(0),
-        customer_name: row.try_get::<String, _>("customer_name").ok(),
-        room_id: row.try_get::<i32, _>("cin_room_id").unwrap_or(0),
-        room_no: row.try_get::<String, _>("room_no").ok(),
-        room_type_name: row.try_get::<String, _>("type_name").ok(),
-        check_in_time: row.try_get::<NaiveDateTime, _>("cin_checkin_time").ok(),
-        check_out_time: row.try_get::<NaiveDateTime, _>("cin_checkout_time").ok(),
-        expected_checkout: row.try_get::<NaiveDateTime, _>("cin_expected_checkout").ok(),
-        adults: row.try_get::<i32, _>("cin_adults").ok(),
-        children: row.try_get::<i32, _>("cin_children").ok(),
-        status: row.try_get::<String, _>("cin_status").unwrap_or_else(|_| "active".to_string()),
-        rate_per_night: row.try_get::<f64, _>("cin_rate_per_night").ok(),
-        total_amount: row.try_get::<f64, _>("cin_total_amount").ok(),
-        payment_status: row.try_get::<String, _>("cin_payment_status").ok(),
-        notes: row.try_get::<String, _>("cin_notes").ok(),
-        created_at: row.try_get::<NaiveDateTime, _>("created_at").ok(),
-        updated_at: row.try_get::<NaiveDateTime, _>("updated_at").ok(),
+        id: rec.cin_id,
+        cin_no: rec.cin_no,
+        booking_id: rec.cin_book_id,
+        booking_no: Some(rec.book_no),
+        customer_id: rec.cin_cust_id,
+        customer_name: rec.customer_name,
+        room_id: rec.cin_room_id,
+        room_no: Some(rec.room_no),
+        room_type_name: Some(rec.type_name),
+        check_in_time: Some(rec.cin_checkin_time),
+        check_out_time: rec.cin_checkout_time,
+        expected_checkout: Some(rec.cin_expected_checkout.and_hms_opt(0, 0, 0).unwrap()),
+        adults: rec.cin_adults,
+        children: rec.cin_children,
+        status: rec.cin_status.unwrap_or_else(|| "active".to_string()),
+        rate_per_night: rec.cin_rate_per_night,
+        total_amount: rec.cin_total_amount,
+        payment_status: rec.cin_payment_status,
+        notes: rec.cin_notes,
+        created_at: rec.created_at,
+        updated_at: rec.updated_at,
     };
 
     Ok(Json(NewCheckInResponse {
@@ -398,65 +395,50 @@ pub async fn create_checkin(
     // Determine customer ID
     let customer_id = if let Some(booking_id) = body.booking_id {
         // Get customer from booking
-        let booking_rows = sqlx::query(
-                "SELECT book_cust_id FROM ht_bookings WHERE book_id = $1",
-            )
-            .bind(&booking_id)
-            .fetch_all(pool)
-            .await?;
+        let booking_rec = sqlx::query!(
+            "SELECT book_cust_id FROM ht_bookings WHERE book_id = $1",
+            booking_id
+        )
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Booking not found".to_string()))?;
 
-        booking_rows
-            .first()
-            .and_then(|r| r.try_get::<i32, _>("book_cust_id").ok())
-            .ok_or_else(|| ApiError::NotFound("Booking not found".to_string()))?
+        booking_rec.book_cust_id
     } else {
         body.customer_id
             .ok_or_else(|| ApiError::BadRequest("Customer ID is required for walk-ins".to_string()))?
     };
 
     // Check if room is available
-    let room_check_rows = sqlx::query(
-            r#"
-            SELECT COUNT(*)::int as active_count
-            FROM ht_checkins
-            WHERE cin_room_id = $1 AND cin_status = 'active'
-            "#,
-        )
-        .bind(&body.room_id)
-        .fetch_all(pool)
-        .await?;
+    let room_check = sqlx::query!(
+        r#"SELECT COUNT(*)::int as active_count FROM ht_checkins
+        WHERE cin_room_id = $1 AND cin_status = 'active'"#,
+        body.room_id
+    )
+    .fetch_one(pool)
+    .await?;
 
-    let active_count: i32 = room_check_rows
-        .first()
-        .map(|r| r.try_get::<i32, _>("active_count").unwrap_or(0))
-        .unwrap_or(0);
+    let active_count = room_check.active_count.unwrap_or(0);
 
     if active_count > 0 {
         return Err(ApiError::BadRequest("Room is currently occupied".to_string()));
     }
 
     // Generate check-in number (CIN-YYYYMMDD-NNNN format)
-    let cin_no_rows = sqlx::query(
-            r#"
-            SELECT cin_no
-            FROM ht_checkins
-            WHERE cin_no LIKE 'CIN-' || TO_CHAR(NOW(), 'YYYYMMDD') || '-%'
-            ORDER BY cin_no DESC
-            LIMIT 1
-            "#,
-        )
-        .fetch_all(pool)
-        .await?;
+    let last_rec = sqlx::query!(
+        r#"SELECT cin_no FROM ht_checkins
+        WHERE cin_no LIKE 'CIN-' || TO_CHAR(NOW(), 'YYYYMMDD') || '-%'
+        ORDER BY cin_no DESC LIMIT 1"#
+    )
+    .fetch_optional(pool)
+    .await?;
 
-    let next_seq = if let Some(row) = cin_no_rows.first() {
-        if let Some(last_no) = row.try_get::<String, _>("cin_no").ok() {
-            // Extract sequence number and increment
-            let parts: Vec<&str> = last_no.split('-').collect();
-            if parts.len() == 3 {
-                parts[2].parse::<i32>().unwrap_or(0) + 1
-            } else {
-                1
-            }
+    let next_seq = if let Some(rec) = last_rec {
+        // cin_no is NOT NULL, use directly
+        let last_no = rec.cin_no;
+        let parts: Vec<&str> = last_no.split('-').collect();
+        if parts.len() == 3 {
+            parts[2].parse::<i32>().unwrap_or(0) + 1
         } else {
             1
         }
@@ -465,86 +447,67 @@ pub async fn create_checkin(
     };
 
     // Get current date in YYYYMMDD format
-    let date_rows = sqlx::query("SELECT TO_CHAR(NOW(), 'YYYYMMDD') as today")
-        .fetch_all(pool)
+    let date_rec = sqlx::query!("SELECT TO_CHAR(NOW(), 'YYYYMMDD') as today")
+        .fetch_one(pool)
         .await?;
 
-    let today = date_rows
-        .first()
-        .map(|r| r.try_get::<String, _>("today").unwrap_or_else(|_| "00000000".to_string()))
-        .unwrap_or_else(|| "00000000".to_string());
+    let today = date_rec.today.unwrap_or_else(|| "00000000".to_string());
 
     let cin_no = format!("CIN-{}-{:04}", today, next_seq);
 
     let adults = body.adults.unwrap_or(1);
     let children = body.children.unwrap_or(0);
 
-    // Insert check-in
-    let checkin_rows = sqlx::query(
-            r#"
-            INSERT INTO ht_checkins (
-                cin_no,
-                cin_book_id,
-                cin_cust_id,
-                cin_room_id,
-                cin_checkin_time,
-                cin_expected_checkout,
-                cin_adults,
-                cin_children,
-                cin_status,
-                cin_rate_per_night,
-                cin_notes
-            )
-            VALUES (
-                $1, $2, $3, $4,
-                COALESCE($5, NOW()),
-                $6, $7, $8, 'active', $9, $10
-            )
-            RETURNING cin_id
-            "#,
-        )
-        .bind(&cin_no.as_str())
-        .bind(&body.booking_id)
-        .bind(&customer_id)
-        .bind(&body.room_id)
-        .bind(&body.check_in_time.as_deref())
-        .bind(&body.expected_checkout.as_str())
-        .bind(&adults)
-        .bind(&children)
-        .bind(&body.rate_per_night)
-        .bind(&body.notes.as_deref())
-        .fetch_all(pool)
-        .await?;
+    // Parse expected checkout date
+    let expected_checkout_date = NaiveDate::parse_from_str(&body.expected_checkout, "%Y-%m-%d")
+        .map_err(|_| ApiError::BadRequest("Invalid expected checkout date format (expected YYYY-MM-DD)".to_string()))?;
 
-    let cin_id = checkin_rows
-        .first()
-        .and_then(|r| r.try_get::<i32, _>("cin_id").ok())
-        .ok_or_else(|| ApiError::Internal("Failed to create check-in".to_string()))?;
+    // Parse optional check-in time
+    let check_in_time: Option<NaiveDateTime> = match &body.check_in_time {
+        Some(s) => Some(
+            NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
+                .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
+                .or_else(|_| NaiveDate::parse_from_str(s, "%Y-%m-%d").map(|d| d.and_hms_opt(14, 0, 0).unwrap()))
+                .map_err(|_| ApiError::BadRequest("Invalid check-in time format".to_string()))?
+        ),
+        None => None,
+    };
+
+    // Insert check-in
+    let rec = sqlx::query!(
+        r#"INSERT INTO ht_checkins (cin_no, cin_book_id, cin_cust_id, cin_room_id, cin_checkin_time, cin_expected_checkout, cin_adults, cin_children, cin_status, cin_rate_per_night, cin_notes)
+        VALUES ($1, $2, $3, $4, COALESCE($5, NOW()::timestamp), $6, $7, $8, 'active', $9::float8, $10)
+        RETURNING cin_id"#,
+        cin_no.as_str(),
+        body.booking_id,
+        customer_id,
+        body.room_id,
+        check_in_time,
+        expected_checkout_date,
+        adults,
+        children,
+        body.rate_per_night,
+        body.notes.as_deref()
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let cin_id = rec.cin_id;
 
     // Update room status to occupied
-    sqlx::query(
-        r#"
-        UPDATE ht_rooms_new
-        SET room_status = 'occupied',
-            updated_at = NOW()
-        WHERE room_id = $1
-        "#,
+    sqlx::query!(
+        r#"UPDATE ht_rooms_new SET room_status = 'occupied', updated_at = NOW() WHERE room_id = $1"#,
+        body.room_id
     )
-    .bind(&body.room_id)
     .execute(pool)
     .await?;
 
     // If from booking, update booking status to checkedin
     if let Some(booking_id) = body.booking_id {
-        sqlx::query(
-            r#"
-            UPDATE ht_bookings
-            SET book_status = 'checkedin',
-                updated_at = NOW()
-            WHERE book_id = $1
-            "#,
+        sqlx::query!(
+            r#"UPDATE ht_bookings SET book_status = 'checkedin', updated_at = NOW() WHERE book_id = $1"#,
+            booking_id
         )
-        .bind(&booking_id)
         .execute(pool)
         .await?;
     }
@@ -566,78 +529,64 @@ pub async fn checkout(
     let pool = &state.new_pool;
 
     // Get check-in and verify it's active
-    let checkin_rows = sqlx::query(
-            r#"
-            SELECT cin_no, cin_room_id, cin_book_id, cin_status
-            FROM ht_checkins
-            WHERE cin_id = $1
-            "#,
-        )
-        .bind(&cin_id)
-        .fetch_all(pool)
-        .await?;
+    let checkin_rec = sqlx::query!(
+        r#"SELECT cin_no, cin_room_id, cin_book_id, cin_status FROM ht_checkins WHERE cin_id = $1"#,
+        cin_id
+    )
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
 
-    let checkin_row = checkin_rows
-        .first()
-        .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
-
-    let status = checkin_row.try_get::<String, _>("cin_status").unwrap_or_default();
+    let status = checkin_rec.cin_status.unwrap_or_default();
     if status != "active" {
         return Err(ApiError::BadRequest("Check-in is not active".to_string()));
     }
 
-    let cin_no = checkin_row.try_get::<String, _>("cin_no").unwrap_or_default();
-    let room_id: i32 = checkin_row.try_get::<i32, _>("cin_room_id").unwrap_or(0);
-    let booking_id: Option<i32> = checkin_row.try_get::<i32, _>("cin_book_id").ok();
+    let cin_no = checkin_rec.cin_no;
+    let room_id = checkin_rec.cin_room_id;
+    let booking_id = checkin_rec.cin_book_id;
 
     let payment_status = body.payment_status.as_deref().unwrap_or("paid");
 
+    // Parse optional check-out time
+    let check_out_time: Option<NaiveDateTime> = match &body.check_out_time {
+        Some(s) => Some(
+            NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
+                .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
+                .or_else(|_| NaiveDate::parse_from_str(s, "%Y-%m-%d").map(|d| d.and_hms_opt(12, 0, 0).unwrap()))
+                .map_err(|_| ApiError::BadRequest("Invalid check-out time format".to_string()))?
+        ),
+        None => None,
+    };
+
     // Update check-in to checked out
-    sqlx::query(
-        r#"
-        UPDATE ht_checkins
-        SET cin_checkout_time = COALESCE($1, NOW()),
-            cin_status = 'checkedout',
-            cin_total_amount = COALESCE($2, cin_total_amount),
-            cin_payment_status = $3,
-            cin_notes = COALESCE($4, cin_notes),
-            updated_at = NOW()
-        WHERE cin_id = $5
-        "#,
+    sqlx::query!(
+        r#"UPDATE ht_checkins SET cin_checkout_time = COALESCE($1, NOW()::timestamp), cin_status = 'checkedout',
+        cin_total_amount = COALESCE($2::float8, cin_total_amount), cin_payment_status = $3,
+        cin_notes = COALESCE($4, cin_notes), updated_at = NOW() WHERE cin_id = $5"#,
+        check_out_time,
+        body.total_amount,
+        payment_status,
+        body.notes.as_deref(),
+        cin_id
     )
-    .bind(&body.check_out_time.as_deref())
-    .bind(&body.total_amount)
-    .bind(&payment_status)
-    .bind(&body.notes.as_deref())
-    .bind(&cin_id)
     .execute(pool)
     .await?;
 
     // Update room status to available and mark as dirty
-    sqlx::query(
-        r#"
-        UPDATE ht_rooms_new
-        SET room_status = 'available',
-            room_clean = false,
-            updated_at = NOW()
-        WHERE room_id = $1
-        "#,
+    sqlx::query!(
+        r#"UPDATE ht_rooms_new SET room_status = 'available', room_clean = false, updated_at = NOW() WHERE room_id = $1"#,
+        room_id
     )
-    .bind(&room_id)
     .execute(pool)
     .await?;
 
     // If from booking, update booking status to completed
     if let Some(book_id) = booking_id {
-        sqlx::query(
-            r#"
-            UPDATE ht_bookings
-            SET book_status = 'completed',
-                updated_at = NOW()
-            WHERE book_id = $1
-            "#,
+        sqlx::query!(
+            r#"UPDATE ht_bookings SET book_status = 'completed', updated_at = NOW() WHERE book_id = $1"#,
+            book_id
         )
-        .bind(&book_id)
         .execute(pool)
         .await?;
     }
@@ -719,53 +668,38 @@ pub async fn list_guests(
     let pool = &state.new_pool;
 
     // Verify check-in exists
-    let checkin_rows = sqlx::query(
-            "SELECT cin_id FROM ht_checkins WHERE cin_id = $1",
-        )
-        .bind(&cin_id)
-        .fetch_all(pool)
+    let exists = sqlx::query!("SELECT cin_id FROM ht_checkins WHERE cin_id = $1", cin_id)
+        .fetch_optional(pool)
         .await?;
 
-    if checkin_rows.is_empty() {
+    if exists.is_none() {
         return Err(ApiError::NotFound("Check-in not found".to_string()));
     }
 
     // Get guests
-    let rows = sqlx::query(
-            r#"
-            SELECT
-                guest_id,
-                guest_cin_id,
-                guest_cust_id,
-                guest_firstname,
-                guest_lastname,
-                guest_idcard,
-                guest_passport,
-                guest_nationality,
-                guest_is_primary,
-                guest_created_at
-            FROM ht_guest_registry
-            WHERE guest_cin_id = $1
-            ORDER BY guest_is_primary DESC, guest_id ASC
-            "#,
-        )
-        .bind(&cin_id)
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query!(
+        r#"SELECT guest_id, guest_cin_id, guest_cust_id, guest_firstname, guest_lastname,
+            guest_idcard, guest_passport, guest_nationality, guest_is_primary, guest_created_at
+        FROM ht_guest_registry WHERE guest_cin_id = $1
+        ORDER BY guest_is_primary DESC, guest_id ASC"#,
+        cin_id
+    )
+    .fetch_all(pool)
+    .await?;
 
     let guests: Vec<Guest> = rows
         .iter()
-        .map(|row| Guest {
-            id: row.try_get::<i32, _>("guest_id").unwrap_or(0),
-            cin_id: row.try_get::<i32, _>("guest_cin_id").unwrap_or(0),
-            cust_id: row.try_get::<i32, _>("guest_cust_id").ok(),
-            first_name: row.try_get::<String, _>("guest_firstname").unwrap_or_default(),
-            last_name: row.try_get::<String, _>("guest_lastname").ok(),
-            id_card: row.try_get::<String, _>("guest_idcard").ok(),
-            passport: row.try_get::<String, _>("guest_passport").ok(),
-            nationality: row.try_get::<String, _>("guest_nationality").ok(),
-            is_primary: row.try_get::<bool, _>("guest_is_primary").unwrap_or(false),
-            created_at: row.try_get::<NaiveDateTime, _>("guest_created_at").ok(),
+        .map(|r| Guest {
+            id: r.guest_id,
+            cin_id: r.guest_cin_id,
+            cust_id: r.guest_cust_id,
+            first_name: r.guest_firstname.clone(),
+            last_name: r.guest_lastname.clone(),
+            id_card: r.guest_idcard.clone(),
+            passport: r.guest_passport.clone(),
+            nationality: r.guest_nationality.clone(),
+            is_primary: r.guest_is_primary.unwrap_or(false),
+            created_at: r.guest_created_at,
         })
         .collect();
 
@@ -792,18 +726,15 @@ pub async fn create_guest(
     let pool = &state.new_pool;
 
     // Verify check-in exists and is active
-    let checkin_rows = sqlx::query(
-            "SELECT cin_id, cin_status FROM ht_checkins WHERE cin_id = $1",
-        )
-        .bind(&cin_id)
-        .fetch_all(pool)
-        .await?;
+    let checkin_rec = sqlx::query!(
+        "SELECT cin_id, cin_status FROM ht_checkins WHERE cin_id = $1",
+        cin_id
+    )
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
 
-    let checkin_row = checkin_rows
-        .first()
-        .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
-
-    let status = checkin_row.try_get::<String, _>("cin_status").unwrap_or_default();
+    let status = checkin_rec.cin_status.unwrap_or_default();
     if status != "active" {
         return Err(ApiError::BadRequest("Cannot add guests to a non-active check-in".to_string()));
     }
@@ -812,46 +743,31 @@ pub async fn create_guest(
 
     // If this guest is marked as primary, unset any existing primary guest
     if is_primary {
-        sqlx::query(
+        sqlx::query!(
             "UPDATE ht_guest_registry SET guest_is_primary = false WHERE guest_cin_id = $1",
+            cin_id
         )
-        .bind(&cin_id)
         .execute(pool)
         .await?;
     }
 
     // Insert guest
-    let rows = sqlx::query(
-            r#"
-            INSERT INTO ht_guest_registry (
-                guest_cin_id,
-                guest_cust_id,
-                guest_firstname,
-                guest_lastname,
-                guest_idcard,
-                guest_passport,
-                guest_nationality,
-                guest_is_primary
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            RETURNING guest_id
-            "#,
-        )
-        .bind(&cin_id)
-        .bind(&body.cust_id)
-        .bind(&first_name)
-        .bind(&body.last_name.as_deref())
-        .bind(&body.id_card.as_deref())
-        .bind(&body.passport.as_deref())
-        .bind(&body.nationality.as_deref())
-        .bind(&is_primary)
-        .fetch_all(pool)
-        .await?;
+    let rec = sqlx::query!(
+        r#"INSERT INTO ht_guest_registry (guest_cin_id, guest_cust_id, guest_firstname, guest_lastname, guest_idcard, guest_passport, guest_nationality, guest_is_primary)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING guest_id"#,
+        cin_id,
+        body.cust_id,
+        first_name,
+        body.last_name.as_deref(),
+        body.id_card.as_deref(),
+        body.passport.as_deref(),
+        body.nationality.as_deref(),
+        is_primary
+    )
+    .fetch_one(pool)
+    .await?;
 
-    let guest_id = rows
-        .first()
-        .and_then(|r| r.try_get::<i32, _>("guest_id").ok())
-        .ok_or_else(|| ApiError::Internal("Failed to create guest".to_string()))?;
+    let guest_id = rec.guest_id;
 
     Ok(Json(GuestMutationResponse {
         success: true,
@@ -875,41 +791,38 @@ pub async fn delete_guest(
     let pool = &state.new_pool;
 
     // Verify check-in exists
-    let checkin_rows = sqlx::query(
-            "SELECT cin_id, cin_status FROM ht_checkins WHERE cin_id = $1",
-        )
-        .bind(&path.id)
-        .fetch_all(pool)
-        .await?;
+    let checkin_rec = sqlx::query!(
+        "SELECT cin_id, cin_status FROM ht_checkins WHERE cin_id = $1",
+        path.id
+    )
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
 
-    let checkin_row = checkin_rows
-        .first()
-        .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
-
-    let status = checkin_row.try_get::<String, _>("cin_status").unwrap_or_default();
+    let status = checkin_rec.cin_status.unwrap_or_default();
     if status != "active" {
         return Err(ApiError::BadRequest("Cannot remove guests from a non-active check-in".to_string()));
     }
 
     // Verify guest belongs to this check-in
-    let guest_rows = sqlx::query(
-            "SELECT guest_id FROM ht_guest_registry WHERE guest_id = $1 AND guest_cin_id = $2",
-        )
-        .bind(&path.guest_id)
-        .bind(&path.id)
-        .fetch_all(pool)
-        .await?;
+    let guest_exists = sqlx::query!(
+        "SELECT guest_id FROM ht_guest_registry WHERE guest_id = $1 AND guest_cin_id = $2",
+        path.guest_id,
+        path.id
+    )
+    .fetch_optional(pool)
+    .await?;
 
-    if guest_rows.is_empty() {
+    if guest_exists.is_none() {
         return Err(ApiError::NotFound("Guest not found for this check-in".to_string()));
     }
 
     // Delete guest
-    sqlx::query(
+    sqlx::query!(
         "DELETE FROM ht_guest_registry WHERE guest_id = $1 AND guest_cin_id = $2",
+        path.guest_id,
+        path.id
     )
-    .bind(&path.guest_id)
-    .bind(&path.id)
     .execute(pool)
     .await?;
 

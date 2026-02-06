@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM ht_room_inventory WHERE ri_room_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ae5cbdd5aed9258acaebb4f6b1f43d26df0f27f9d958fffd54fff5f642372d60"
+}

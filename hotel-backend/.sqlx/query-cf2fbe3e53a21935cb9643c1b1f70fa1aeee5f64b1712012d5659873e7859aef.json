@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE ht_payments SET pay_voided = true, pay_voided_at = NOW() WHERE pay_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cf2fbe3e53a21935cb9643c1b1f70fa1aeee5f64b1712012d5659873e7859aef"
+}

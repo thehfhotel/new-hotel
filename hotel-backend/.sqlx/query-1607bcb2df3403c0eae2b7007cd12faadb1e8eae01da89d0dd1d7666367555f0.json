@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT room_id FROM ht_rooms_new WHERE room_no = $1 AND room_id != $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "room_id",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "1607bcb2df3403c0eae2b7007cd12faadb1e8eae01da89d0dd1d7666367555f0"
+}

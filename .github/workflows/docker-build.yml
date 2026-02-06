@@ -54,6 +54,8 @@ jobs:
             deploy:
               - 'docker-compose.yml'
               - 'init-db/**'
+              - 'migrations/pg/**'
+              - 'scripts/migrate.sh'
 
   test:
     runs-on: ubuntu-latest
@@ -78,6 +80,51 @@ jobs:
 
       - name: Run component tests
         run: pnpm test:components
+
+  test-backend:
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: hotelnew
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ***REMOVED***
+          PGPORT: "5439"
+        ports:
+          - 5439:5439
+        options: >-
+          --health-cmd "pg_isready -U postgres -p 5439"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize database
+        env:
+          PGPASSWORD: ***REMOVED***
+        run: psql -h localhost -p 5439 -U postgres -d hotelnew -f init-db/init-hotelnew.sql
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hotel-backend
+
+      - name: Run backend tests
+        working-directory: hotel-backend
+        env:
+          DATABASE_URL: postgres://postgres:***REMOVED***@localhost:5439/hotelnew
+          SQLX_OFFLINE: "true"
+        run: cargo test --release
 
   build-and-push:
     runs-on: ubuntu-latest
@@ -124,8 +171,8 @@ jobs:
 
   build-backend:
     runs-on: ubuntu-latest
-    needs: changes
-    if: needs.changes.outputs.backend == 'true'
+    needs: [changes, test-backend]
+    if: always() && needs.changes.outputs.backend == 'true' && (needs.test-backend.result == 'success' || needs.test-backend.result == 'skipped')
     permissions:
       contents: read
       packages: write
@@ -165,7 +212,7 @@ jobs:
 
   deploy:
     runs-on: [self-hosted, linux, deploy]
-    needs: [changes, build-and-push, build-backend]
+    needs: [changes, build-and-push, build-backend, test-backend]
     if: always() && (needs.build-and-push.result == 'success' || needs.build-backend.result == 'success' || (needs.changes.outputs.deploy == 'true' && needs.changes.outputs.code != 'true' && needs.changes.outputs.backend != 'true'))
     steps:
       - name: Checkout
@@ -187,8 +234,14 @@ jobs:
 
           # Create deployment directory and copy files
           mkdir -p $DEPLOY_DIR/init-db
+          mkdir -p $DEPLOY_DIR/migrations/pg
+          mkdir -p $DEPLOY_DIR/scripts
+          mkdir -p $DEPLOY_DIR/backups
           cp docker-compose.yml $DEPLOY_DIR/
           cp -r init-db/* $DEPLOY_DIR/init-db/
+          cp -r migrations/pg/* $DEPLOY_DIR/migrations/pg/ 2>/dev/null || true
+          cp scripts/migrate.sh $DEPLOY_DIR/scripts/
+          chmod +x $DEPLOY_DIR/scripts/migrate.sh
 
           cd $DEPLOY_DIR
 
@@ -217,6 +270,14 @@ jobs:
             docker logs new-hotel-db --tail 50
             exit 1
           fi
+
+          # Run database migrations
+          echo "Running database migrations..."
+          ./scripts/migrate.sh
+
+          # Restart backend to pick up schema changes
+          docker compose restart backend
+          sleep 5
 
           echo "Deployment complete!"
           docker compose ps

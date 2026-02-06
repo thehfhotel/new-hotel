@@ -1,0 +1,142 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            ci.cin_id,\n            ci.cin_no,\n            ci.cin_book_id,\n            b.book_no,\n            ci.cin_cust_id,\n            CONCAT(c.cust_firstname, ' ', COALESCE(c.cust_lastname, '')) as customer_name,\n            ci.cin_room_id,\n            r.room_no,\n            rt.type_name,\n            ci.cin_checkin_time,\n            ci.cin_checkout_time,\n            ci.cin_expected_checkout,\n            ci.cin_adults,\n            ci.cin_children,\n            ci.cin_status,\n            ci.cin_rate_per_night::float8 as cin_rate_per_night,\n            ci.cin_total_amount::float8 as cin_total_amount,\n            ci.cin_payment_status,\n            ci.cin_notes,\n            ci.created_at,\n            ci.updated_at\n        FROM ht_checkins ci\n        LEFT JOIN ht_customers c ON ci.cin_cust_id = c.cust_id\n        LEFT JOIN ht_rooms_new r ON ci.cin_room_id = r.room_id\n        LEFT JOIN ht_room_types rt ON r.room_type_id = rt.type_id\n        LEFT JOIN ht_bookings b ON ci.cin_book_id = b.book_id\n        WHERE ci.cin_id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cin_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "cin_no",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "cin_book_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "book_no",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "cin_cust_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "customer_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "cin_room_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "room_no",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 8,
+        "name": "type_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 9,
+        "name": "cin_checkin_time",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 10,
+        "name": "cin_checkout_time",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 11,
+        "name": "cin_expected_checkout",
+        "type_info": "Date"
+      },
+      {
+        "ordinal": 12,
+        "name": "cin_adults",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 13,
+        "name": "cin_children",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 14,
+        "name": "cin_status",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 15,
+        "name": "cin_rate_per_night",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 16,
+        "name": "cin_total_amount",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 17,
+        "name": "cin_payment_status",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 18,
+        "name": "cin_notes",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 19,
+        "name": "created_at",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 20,
+        "name": "updated_at",
+        "type_info": "Timestamp"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      null,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true,
+      null,
+      null,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "7c8d2cd049ed34754026ead4f1ba6c9b1ba8ab86f797a97fef8e58b026c0e232"
+}

@@ -275,29 +275,21 @@ pub async fn list_categories(
 ) -> ApiResult<Json<CategoriesResponse>> {
     let pool = &state.new_pool;
 
-    let rows = sqlx::query(
-            r#"
-            SELECT
-                cat_id,
-                cat_name,
-                cat_description,
-                cat_active,
-                cat_created
-            FROM ht_inventory_categories
-            ORDER BY cat_name ASC
-            "#,
-        )
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query!(
+        r#"SELECT cat_id, cat_name, cat_description, cat_active, cat_created
+        FROM ht_inventory_categories ORDER BY cat_name ASC"#
+    )
+    .fetch_all(pool)
+    .await?;
 
     let categories: Vec<Category> = rows
         .iter()
-        .map(|row| Category {
-            id: row.try_get::<i32, _>("cat_id").unwrap_or(0),
-            name: row.try_get::<String, _>("cat_name").unwrap_or_default(),
-            description: row.try_get::<String, _>("cat_description").ok(),
-            active: row.try_get::<bool, _>("cat_active").unwrap_or(true),
-            created_at: row.try_get::<NaiveDateTime, _>("cat_created").ok(),
+        .map(|r| Category {
+            id: r.cat_id,
+            name: r.cat_name.clone(),
+            description: r.cat_description.clone(),
+            active: r.cat_active.unwrap_or(true),
+            created_at: r.cat_created,
         })
         .collect();
 
@@ -324,23 +316,15 @@ pub async fn create_category(
 
     let active = body.active.unwrap_or(true);
 
-    let rows = sqlx::query(
-            r#"
-            INSERT INTO ht_inventory_categories (cat_name, cat_description, cat_active)
-            VALUES ($1, $2, $3)
-            RETURNING cat_id
-            "#,
-        )
-        .bind(&name)
-        .bind(&body.description.as_deref())
-        .bind(&active)
-        .fetch_all(pool)
-        .await?;
+    let rec = sqlx::query!(
+        r#"INSERT INTO ht_inventory_categories (cat_name, cat_description, cat_active)
+        VALUES ($1, $2, $3) RETURNING cat_id"#,
+        name, body.description.as_deref(), active
+    )
+    .fetch_one(pool)
+    .await?;
 
-    let id = rows
-        .first()
-        .and_then(|r| r.try_get::<i32, _>("cat_id").ok())
-        .ok_or_else(|| ApiError::Internal("Failed to create category".to_string()))?;
+    let id = rec.cat_id;
 
     Ok(Json(MutationResponse {
         success: true,
@@ -482,14 +466,14 @@ pub async fn create_item(
     let pool = &state.new_pool;
 
     // Check for duplicate code
-    let check_rows = sqlx::query(
-            "SELECT item_id FROM ht_inventory_items WHERE item_code = $1",
-        )
-        .bind(&code)
-        .fetch_all(pool)
-        .await?;
+    let existing = sqlx::query!(
+        "SELECT item_id FROM ht_inventory_items WHERE item_code = $1",
+        code
+    )
+    .fetch_optional(pool)
+    .await?;
 
-    if !check_rows.is_empty() {
+    if existing.is_some() {
         return Err(ApiError::BadRequest("Item code already exists".to_string()));
     }
 
@@ -497,31 +481,15 @@ pub async fn create_item(
     let current_stock = body.current_stock.unwrap_or(0);
     let active = body.active.unwrap_or(true);
 
-    let rows = sqlx::query(
-            r#"
-            INSERT INTO ht_inventory_items (
-                item_code, item_name, item_category_id, item_unit,
-                item_min_stock, item_current_stock, item_cost, item_active
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            RETURNING item_id
-            "#,
-        )
-        .bind(&code)
-        .bind(&name)
-        .bind(&body.category_id)
-        .bind(&unit)
-        .bind(&min_stock)
-        .bind(&current_stock)
-        .bind(&body.cost)
-        .bind(&active)
-        .fetch_all(pool)
-        .await?;
+    let rec = sqlx::query!(
+        r#"INSERT INTO ht_inventory_items (item_code, item_name, item_category_id, item_unit, item_min_stock, item_current_stock, item_cost, item_active)
+        VALUES ($1, $2, $3, $4, $5, $6, $7::float8, $8) RETURNING item_id"#,
+        code, name, body.category_id, unit, min_stock, current_stock, body.cost, active
+    )
+    .fetch_one(pool)
+    .await?;
 
-    let id = rows
-        .first()
-        .and_then(|r| r.try_get::<i32, _>("item_id").ok())
-        .ok_or_else(|| ApiError::Internal("Failed to create item".to_string()))?;
+    let id = rec.item_id;
 
     Ok(Json(MutationResponse {
         success: true,
@@ -537,47 +505,32 @@ pub async fn get_item(
 ) -> ApiResult<Json<ItemResponse>> {
     let pool = &state.new_pool;
 
-    let rows = sqlx::query(
-            r#"
-            SELECT
-                i.item_id,
-                i.item_code,
-                i.item_name,
-                i.item_category_id,
-                c.cat_name,
-                i.item_unit,
-                i.item_min_stock,
-                i.item_current_stock,
-                i.item_cost,
-                i.item_active,
-                i.item_created,
-                i.item_updated
-            FROM ht_inventory_items i
-            LEFT JOIN ht_inventory_categories c ON i.item_category_id = c.cat_id
-            WHERE i.item_id = $1
-            "#,
-        )
-        .bind(&item_id)
-        .fetch_all(pool)
-        .await?;
-
-    let row = rows
-        .first()
-        .ok_or_else(|| ApiError::NotFound("Item not found".to_string()))?;
+    let rec = sqlx::query!(
+        r#"SELECT i.item_id, i.item_code, i.item_name, i.item_category_id, c.cat_name,
+            i.item_unit, i.item_min_stock, i.item_current_stock,
+            i.item_cost::float8 as item_cost, i.item_active, i.item_created, i.item_updated
+        FROM ht_inventory_items i
+        LEFT JOIN ht_inventory_categories c ON i.item_category_id = c.cat_id
+        WHERE i.item_id = $1"#,
+        item_id
+    )
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Item not found".to_string()))?;
 
     let item = Item {
-        id: row.try_get::<i32, _>("item_id").unwrap_or(0),
-        code: row.try_get::<String, _>("item_code").unwrap_or_default(),
-        name: row.try_get::<String, _>("item_name").unwrap_or_default(),
-        category_id: row.try_get::<i32, _>("item_category_id").ok(),
-        category_name: row.try_get::<String, _>("cat_name").ok(),
-        unit: row.try_get::<String, _>("item_unit").unwrap_or_default(),
-        min_stock: row.try_get::<i32, _>("item_min_stock").unwrap_or(0),
-        current_stock: row.try_get::<i32, _>("item_current_stock").unwrap_or(0),
-        cost: row.try_get::<f64, _>("item_cost").ok(),
-        active: row.try_get::<bool, _>("item_active").unwrap_or(true),
-        created_at: row.try_get::<NaiveDateTime, _>("item_created").ok(),
-        updated_at: row.try_get::<NaiveDateTime, _>("item_updated").ok(),
+        id: rec.item_id,
+        code: rec.item_code,
+        name: rec.item_name,
+        category_id: rec.item_category_id,
+        category_name: Some(rec.cat_name),
+        unit: rec.item_unit,
+        min_stock: rec.item_min_stock.unwrap_or(0),
+        current_stock: rec.item_current_stock.unwrap_or(0),
+        cost: rec.item_cost,
+        active: rec.item_active.unwrap_or(true),
+        created_at: rec.item_created,
+        updated_at: rec.item_updated,
     };
 
     Ok(Json(ItemResponse { success: true, item }))
@@ -606,15 +559,14 @@ pub async fn update_item(
     let pool = &state.new_pool;
 
     // Check for duplicate code (excluding current item)
-    let check_rows = sqlx::query(
-            "SELECT item_id FROM ht_inventory_items WHERE item_code = $1 AND item_id != $2",
-        )
-        .bind(&code)
-        .bind(&item_id)
-        .fetch_all(pool)
-        .await?;
+    let existing = sqlx::query!(
+        "SELECT item_id FROM ht_inventory_items WHERE item_code = $1 AND item_id != $2",
+        code, item_id
+    )
+    .fetch_optional(pool)
+    .await?;
 
-    if !check_rows.is_empty() {
+    if existing.is_some() {
         return Err(ApiError::BadRequest("Item code already exists".to_string()));
     }
 
@@ -622,32 +574,14 @@ pub async fn update_item(
     let current_stock = body.current_stock.unwrap_or(0);
     let active = body.active.unwrap_or(true);
 
-    let result = sqlx::query(
-            r#"
-            UPDATE ht_inventory_items
-            SET item_code = $1,
-                item_name = $2,
-                item_category_id = $3,
-                item_unit = $4,
-                item_min_stock = $5,
-                item_current_stock = $6,
-                item_cost = $7,
-                item_active = $8,
-                item_updated = NOW()
-            WHERE item_id = $9
-            "#,
-        )
-        .bind(&code)
-        .bind(&name)
-        .bind(&body.category_id)
-        .bind(&unit)
-        .bind(&min_stock)
-        .bind(&current_stock)
-        .bind(&body.cost)
-        .bind(&active)
-        .bind(&item_id)
-        .execute(pool)
-        .await?;
+    let result = sqlx::query!(
+        r#"UPDATE ht_inventory_items SET item_code = $1, item_name = $2, item_category_id = $3, item_unit = $4,
+        item_min_stock = $5, item_current_stock = $6, item_cost = $7::float8, item_active = $8, item_updated = NOW()
+        WHERE item_id = $9"#,
+        code, name, body.category_id, unit, min_stock, current_stock, body.cost, active, item_id
+    )
+    .execute(pool)
+    .await?;
 
     if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("Item not found".to_string()));
@@ -667,12 +601,12 @@ pub async fn delete_item(
 ) -> ApiResult<Json<MutationResponse>> {
     let pool = &state.new_pool;
 
-    let result = sqlx::query(
-            "UPDATE ht_inventory_items SET item_active = false, item_updated = NOW() WHERE item_id = $1",
-        )
-        .bind(&item_id)
-        .execute(pool)
-        .await?;
+    let result = sqlx::query!(
+        "UPDATE ht_inventory_items SET item_active = false, item_updated = NOW() WHERE item_id = $1",
+        item_id
+    )
+    .execute(pool)
+    .await?;
 
     if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("Item not found".to_string()));
@@ -696,36 +630,27 @@ pub async fn get_room_inventory(
 ) -> ApiResult<Json<RoomInventoryResponse>> {
     let pool = &state.new_pool;
 
-    let rows = sqlx::query(
-            r#"
-            SELECT
-                ri.ri_id,
-                ri.ri_room_id,
-                ri.ri_item_id,
-                i.item_code,
-                i.item_name,
-                ri.ri_quantity,
-                ri.ri_last_checked
-            FROM ht_room_inventory ri
-            LEFT JOIN ht_inventory_items i ON ri.ri_item_id = i.item_id
-            WHERE ri.ri_room_id = $1
-            ORDER BY i.item_name ASC
-            "#,
-        )
-        .bind(&room_id)
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query!(
+        r#"SELECT ri.ri_id, ri.ri_room_id, ri.ri_item_id, i.item_code, i.item_name, ri.ri_quantity, ri.ri_last_checked
+        FROM ht_room_inventory ri
+        LEFT JOIN ht_inventory_items i ON ri.ri_item_id = i.item_id
+        WHERE ri.ri_room_id = $1
+        ORDER BY i.item_name ASC"#,
+        room_id
+    )
+    .fetch_all(pool)
+    .await?;
 
     let items: Vec<RoomInventoryItem> = rows
         .iter()
-        .map(|row| RoomInventoryItem {
-            id: row.try_get::<i32, _>("ri_id").unwrap_or(0),
-            room_id: row.try_get::<i32, _>("ri_room_id").unwrap_or(0),
-            item_id: row.try_get::<i32, _>("ri_item_id").unwrap_or(0),
-            item_code: row.try_get::<String, _>("item_code").ok(),
-            item_name: row.try_get::<String, _>("item_name").ok(),
-            quantity: row.try_get::<i32, _>("ri_quantity").unwrap_or(0),
-            last_checked: row.try_get::<NaiveDateTime, _>("ri_last_checked").ok(),
+        .map(|r| RoomInventoryItem {
+            id: r.ri_id,
+            room_id: r.ri_room_id,
+            item_id: r.ri_item_id.unwrap_or(0),
+            item_code: Some(r.item_code.clone()),
+            item_name: Some(r.item_name.clone()),
+            quantity: r.ri_quantity.unwrap_or(0),
+            last_checked: r.ri_last_checked,
         })
         .collect();
 
@@ -745,25 +670,20 @@ pub async fn update_room_inventory(
     let pool = &state.new_pool;
 
     // Delete existing room inventory entries
-    sqlx::query(
+    sqlx::query!(
         "DELETE FROM ht_room_inventory WHERE ri_room_id = $1",
+        room_id
     )
-    .bind(&room_id)
     .execute(pool)
     .await?;
 
     // Insert new entries
     for item in &body.items {
         if item.quantity > 0 {
-            sqlx::query(
-                r#"
-                INSERT INTO ht_room_inventory (ri_room_id, ri_item_id, ri_quantity, ri_last_checked)
-                VALUES ($1, $2, $3, NOW())
-                "#,
+            sqlx::query!(
+                r#"INSERT INTO ht_room_inventory (ri_room_id, ri_item_id, ri_quantity, ri_last_checked) VALUES ($1, $2, $3, NOW())"#,
+                room_id, item.item_id, item.quantity
             )
-            .bind(&room_id)
-            .bind(&item.item_id)
-            .bind(&item.quantity)
             .execute(pool)
             .await?;
         }
@@ -911,21 +831,18 @@ pub async fn create_transaction(
     let pool = &state.new_pool;
 
     // Check if item exists
-    let item_rows = sqlx::query(
-            "SELECT item_id, item_current_stock FROM ht_inventory_items WHERE item_id = $1",
-        )
-        .bind(&body.item_id)
-        .fetch_all(pool)
-        .await?;
+    let item_rec = sqlx::query!(
+        "SELECT item_id, item_current_stock FROM ht_inventory_items WHERE item_id = $1",
+        body.item_id
+    )
+    .fetch_optional(pool)
+    .await?;
 
-    if item_rows.is_empty() {
+    if item_rec.is_none() {
         return Err(ApiError::NotFound("Item not found".to_string()));
     }
 
-    let current_stock: i32 = item_rows
-        .first()
-        .and_then(|r| r.try_get::<i32, _>("item_current_stock").ok())
-        .unwrap_or(0);
+    let current_stock = item_rec.unwrap().item_current_stock.unwrap_or(0);
 
     // Calculate new stock based on transaction type
     let new_stock = match trans_type.as_str() {
@@ -946,36 +863,23 @@ pub async fn create_transaction(
     };
 
     // Insert transaction record
-    let rows = sqlx::query(
-            r#"
-            INSERT INTO ht_inventory_transactions (
-                trans_item_id, trans_type, trans_quantity, trans_room_id, trans_notes, trans_by
-            )
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING trans_id
-            "#,
-        )
-        .bind(&body.item_id)
-        .bind(&trans_type.as_str())
-        .bind(&body.quantity)
-        .bind(&body.room_id)
-        .bind(&body.notes.as_deref())
-        .bind(&body.created_by.as_deref())
-        .fetch_all(pool)
-        .await?;
+    let rec = sqlx::query!(
+        r#"INSERT INTO ht_inventory_transactions (trans_item_id, trans_type, trans_quantity, trans_room_id, trans_notes, trans_by)
+        VALUES ($1, $2, $3, $4, $5, $6) RETURNING trans_id"#,
+        body.item_id, trans_type.as_str(), body.quantity, body.room_id,
+        body.notes.as_deref(), body.created_by.as_deref()
+    )
+    .fetch_one(pool)
+    .await?;
 
-    let trans_id = rows
-        .first()
-        .and_then(|r| r.try_get::<i32, _>("trans_id").ok())
-        .ok_or_else(|| ApiError::Internal("Failed to create transaction".to_string()))?;
+    let trans_id = rec.trans_id;
 
     // Update item stock (except for MOVE type)
     if trans_type != "MOVE" {
-        sqlx::query(
+        sqlx::query!(
             "UPDATE ht_inventory_items SET item_current_stock = $1, item_updated = NOW() WHERE item_id = $2",
+            new_stock, body.item_id
         )
-        .bind(&new_stock)
-        .bind(&body.item_id)
         .execute(pool)
         .await?;
     }
@@ -1006,27 +910,23 @@ pub async fn get_stats(
 ) -> ApiResult<Json<StatsResponse>> {
     let pool = &state.new_pool;
 
-    let rows = sqlx::query(
-            r#"
-            SELECT
-                (SELECT COUNT(*)::int FROM ht_inventory_items WHERE item_active = true) as total_items,
-                (SELECT COUNT(*)::int FROM ht_inventory_categories WHERE cat_active = true) as total_categories,
-                (SELECT COUNT(*)::int FROM ht_inventory_items WHERE item_active = true AND item_current_stock <= item_min_stock AND item_current_stock > 0) as low_stock_count,
-                (SELECT COUNT(*)::int FROM ht_inventory_items WHERE item_active = true AND item_current_stock = 0) as out_of_stock_count,
-                (SELECT COALESCE(SUM(item_current_stock * COALESCE(item_cost, 0)), 0) FROM ht_inventory_items WHERE item_active = true) as total_stock_value
-            "#,
-        )
-        .fetch_all(pool)
-        .await?;
-
-    let row = rows.first();
+    let rec = sqlx::query!(
+        r#"SELECT
+            (SELECT COUNT(*)::int FROM ht_inventory_items WHERE item_active = true) as total_items,
+            (SELECT COUNT(*)::int FROM ht_inventory_categories WHERE cat_active = true) as total_categories,
+            (SELECT COUNT(*)::int FROM ht_inventory_items WHERE item_active = true AND item_current_stock <= item_min_stock AND item_current_stock > 0) as low_stock_count,
+            (SELECT COUNT(*)::int FROM ht_inventory_items WHERE item_active = true AND item_current_stock = 0) as out_of_stock_count,
+            (SELECT COALESCE(SUM(item_current_stock * COALESCE(item_cost, 0)), 0)::float8 FROM ht_inventory_items WHERE item_active = true) as total_stock_value"#
+    )
+    .fetch_one(pool)
+    .await?;
 
     let stats = InventoryStats {
-        total_items: row.and_then(|r| r.try_get::<i32, _>("total_items").ok()).unwrap_or(0),
-        total_categories: row.and_then(|r| r.try_get::<i32, _>("total_categories").ok()).unwrap_or(0),
-        low_stock_count: row.and_then(|r| r.try_get::<i32, _>("low_stock_count").ok()).unwrap_or(0),
-        out_of_stock_count: row.and_then(|r| r.try_get::<i32, _>("out_of_stock_count").ok()).unwrap_or(0),
-        total_stock_value: row.and_then(|r| r.try_get::<f64, _>("total_stock_value").ok()).unwrap_or(0.0),
+        total_items: rec.total_items.unwrap_or(0),
+        total_categories: rec.total_categories.unwrap_or(0),
+        low_stock_count: rec.low_stock_count.unwrap_or(0),
+        out_of_stock_count: rec.out_of_stock_count.unwrap_or(0),
+        total_stock_value: rec.total_stock_value.unwrap_or(0.0),
     };
 
     Ok(Json(StatsResponse { success: true, stats }))
@@ -1038,45 +938,33 @@ pub async fn get_low_stock(
 ) -> ApiResult<Json<LowStockResponse>> {
     let pool = &state.new_pool;
 
-    let rows = sqlx::query(
-            r#"
-            SELECT
-                i.item_id,
-                i.item_code,
-                i.item_name,
-                i.item_category_id,
-                c.cat_name,
-                i.item_unit,
-                i.item_min_stock,
-                i.item_current_stock,
-                i.item_cost,
-                i.item_active,
-                i.item_created,
-                i.item_updated
-            FROM ht_inventory_items i
-            LEFT JOIN ht_inventory_categories c ON i.item_category_id = c.cat_id
-            WHERE i.item_active = true AND i.item_current_stock <= i.item_min_stock
-            ORDER BY (i.item_current_stock - i.item_min_stock) ASC, i.item_name ASC
-            "#,
-        )
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query!(
+        r#"SELECT i.item_id, i.item_code, i.item_name, i.item_category_id, c.cat_name,
+            i.item_unit, i.item_min_stock, i.item_current_stock,
+            i.item_cost::float8 as item_cost, i.item_active, i.item_created, i.item_updated
+        FROM ht_inventory_items i
+        LEFT JOIN ht_inventory_categories c ON i.item_category_id = c.cat_id
+        WHERE i.item_active = true AND i.item_current_stock <= i.item_min_stock
+        ORDER BY (i.item_current_stock - i.item_min_stock) ASC, i.item_name ASC"#
+    )
+    .fetch_all(pool)
+    .await?;
 
     let items: Vec<Item> = rows
         .iter()
-        .map(|row| Item {
-            id: row.try_get::<i32, _>("item_id").unwrap_or(0),
-            code: row.try_get::<String, _>("item_code").unwrap_or_default(),
-            name: row.try_get::<String, _>("item_name").unwrap_or_default(),
-            category_id: row.try_get::<i32, _>("item_category_id").ok(),
-            category_name: row.try_get::<String, _>("cat_name").ok(),
-            unit: row.try_get::<String, _>("item_unit").unwrap_or_default(),
-            min_stock: row.try_get::<i32, _>("item_min_stock").unwrap_or(0),
-            current_stock: row.try_get::<i32, _>("item_current_stock").unwrap_or(0),
-            cost: row.try_get::<f64, _>("item_cost").ok(),
-            active: row.try_get::<bool, _>("item_active").unwrap_or(true),
-            created_at: row.try_get::<NaiveDateTime, _>("item_created").ok(),
-            updated_at: row.try_get::<NaiveDateTime, _>("item_updated").ok(),
+        .map(|r| Item {
+            id: r.item_id,
+            code: r.item_code.clone(),
+            name: r.item_name.clone(),
+            category_id: r.item_category_id,
+            category_name: Some(r.cat_name.clone()),
+            unit: r.item_unit.clone(),
+            min_stock: r.item_min_stock.unwrap_or(0),
+            current_stock: r.item_current_stock.unwrap_or(0),
+            cost: r.item_cost,
+            active: r.item_active.unwrap_or(true),
+            created_at: r.item_created,
+            updated_at: r.item_updated,
         })
         .collect();
 

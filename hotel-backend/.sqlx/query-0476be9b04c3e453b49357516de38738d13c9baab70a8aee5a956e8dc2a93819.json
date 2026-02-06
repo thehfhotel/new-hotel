@@ -1,0 +1,44 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            (SELECT COUNT(*)::int FROM ht_inventory_items WHERE item_active = true) as total_items,\n            (SELECT COUNT(*)::int FROM ht_inventory_categories WHERE cat_active = true) as total_categories,\n            (SELECT COUNT(*)::int FROM ht_inventory_items WHERE item_active = true AND item_current_stock <= item_min_stock AND item_current_stock > 0) as low_stock_count,\n            (SELECT COUNT(*)::int FROM ht_inventory_items WHERE item_active = true AND item_current_stock = 0) as out_of_stock_count,\n            (SELECT COALESCE(SUM(item_current_stock * COALESCE(item_cost, 0)), 0)::float8 FROM ht_inventory_items WHERE item_active = true) as total_stock_value",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "total_items",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "total_categories",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "low_stock_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "out_of_stock_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "total_stock_value",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "0476be9b04c3e453b49357516de38738d13c9baab70a8aee5a956e8dc2a93819"
+}

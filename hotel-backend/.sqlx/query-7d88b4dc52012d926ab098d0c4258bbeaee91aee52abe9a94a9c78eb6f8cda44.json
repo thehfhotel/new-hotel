@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO ht_rates (rate_name, rate_room_type_id, rate_type, rate_value, rate_valid_from, rate_valid_to, rate_days_of_week, rate_active)\n        VALUES ($1, $2, $3, $4::float8, $5, $6, $7, $8)\n        RETURNING rate_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "rate_id",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Int4",
+        "Varchar",
+        "Float8",
+        "Date",
+        "Date",
+        "Varchar",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "7d88b4dc52012d926ab098d0c4258bbeaee91aee52abe9a94a9c78eb6f8cda44"
+}

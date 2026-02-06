@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT item_id FROM ht_inventory_items WHERE item_code = $1 AND item_id != $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "item_id",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "6bf7efbe23aac331b919f25391b05a732f4453c3d4d3fe6df802c76aa300efc4"
+}

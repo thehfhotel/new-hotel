@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT note_id, note_text, created_at, updated_at\n            FROM ht_booking_notes\n            WHERE book_no = $1\n            ORDER BY created_at DESC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "note_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "note_text",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "created_at",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 3,
+        "name": "updated_at",
+        "type_info": "Timestamp"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "44928bc9aa4f393a3944863bf9ed92d32b431b26023fe6e91fba18ef40327ef1"
+}

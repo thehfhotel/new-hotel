@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE ht_bookings SET book_status = 'cancelled', updated_at = NOW()\n        WHERE book_id = $1 AND book_status NOT IN ('completed', 'cancelled')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6556016824982fc8adcfda6e7984f12448ec108bf528ec4e6744cb4e9f476290"
+}

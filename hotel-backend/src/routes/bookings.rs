@@ -17,7 +17,6 @@ use axum::{
 };
 use chrono::NaiveDateTime;
 use serde::Deserialize;
-use sqlx::Row;
 
 use crate::db::DbPool;
 use crate::error::{ApiError, ApiResult};
@@ -257,28 +256,26 @@ pub async fn get_booking(
     ensure_notes_table(&state.new_pool).await?;
 
     // Try to fetch notes from HotelNew database
-    let notes = match sqlx::query(
+    let notes = match sqlx::query!(
             r#"
             SELECT note_id, note_text, created_at, updated_at
             FROM ht_booking_notes
             WHERE book_no = $1
             ORDER BY created_at DESC
             "#,
+            book_no
         )
-        .bind(&book_no)
         .fetch_all(new_pool)
         .await
     {
         Ok(note_rows) => {
             note_rows
                 .iter()
-                .map(|row| Note {
-                    id: row.try_get::<i32, _>("note_id").unwrap_or(0),
-                    text: row
-                        .try_get::<String, _>("note_text")
-                        .unwrap_or_default(),
-                    created_at: row.try_get::<NaiveDateTime, _>("created_at").ok(),
-                    updated_at: row.try_get::<NaiveDateTime, _>("updated_at").ok(),
+                .map(|r| Note {
+                    id: r.note_id,
+                    text: r.note_text.clone(),
+                    created_at: r.created_at,
+                    updated_at: r.updated_at,
                 })
                 .collect()
         }
@@ -334,27 +331,25 @@ pub async fn get_notes(
     // Ensure notes table exists
     ensure_notes_table(pool).await?;
 
-    let rows = sqlx::query(
+    let rows = sqlx::query!(
             r#"
             SELECT note_id, note_text, created_at, updated_at
             FROM ht_booking_notes
             WHERE book_no = $1
             ORDER BY created_at DESC
             "#,
+            book_no
         )
-        .bind(&book_no)
         .fetch_all(pool)
         .await?;
 
     let notes: Vec<Note> = rows
         .iter()
-        .map(|row| Note {
-            id: row.try_get::<i32, _>("note_id").unwrap_or(0),
-            text: row
-                .try_get::<String, _>("note_text")
-                .unwrap_or_default(),
-            created_at: row.try_get::<NaiveDateTime, _>("created_at").ok(),
-            updated_at: row.try_get::<NaiveDateTime, _>("updated_at").ok(),
+        .map(|r| Note {
+            id: r.note_id,
+            text: r.note_text.clone(),
+            created_at: r.created_at,
+            updated_at: r.updated_at,
         })
         .collect();
 
@@ -381,29 +376,24 @@ pub async fn create_note(
     // Ensure notes table exists
     ensure_notes_table(pool).await?;
 
-    let rows = sqlx::query(
+    let rec = sqlx::query!(
             r#"
             INSERT INTO ht_booking_notes (book_no, note_text)
             VALUES ($1, $2)
             RETURNING note_id, note_text, created_at, updated_at
             "#,
+            book_no,
+            text
         )
-        .bind(&book_no)
-        .bind(&text)
-        .fetch_all(pool)
-        .await?;
-
-    let row = rows
-        .first()
-        .ok_or_else(|| ApiError::Internal("Failed to create note".to_string()))?;
+        .fetch_one(pool)
+        .await
+        .map_err(|_| ApiError::Internal("Failed to create note".to_string()))?;
 
     let note = Note {
-        id: row.try_get::<i32, _>("note_id").unwrap_or(0),
-        text: row
-            .try_get::<String, _>("note_text")
-            .unwrap_or_default(),
-        created_at: row.try_get::<NaiveDateTime, _>("created_at").ok(),
-        updated_at: row.try_get::<NaiveDateTime, _>("updated_at").ok(),
+        id: rec.note_id,
+        text: rec.note_text,
+        created_at: rec.created_at,
+        updated_at: rec.updated_at,
     };
 
     Ok(Json(CreateNoteResponse {
@@ -428,14 +418,14 @@ pub async fn delete_note(
     // Use new_pool for notes (HotelNew database - writable via sqlx/PostgreSQL)
     let pool = &state.new_pool;
 
-    let result = sqlx::query(
+    let result = sqlx::query!(
             r#"
             DELETE FROM ht_booking_notes
             WHERE note_id = $1 AND book_no = $2
             "#,
+            params.note_id,
+            book_no
         )
-        .bind(&params.note_id)
-        .bind(&book_no)
         .execute(pool)
         .await?;
 

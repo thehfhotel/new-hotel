@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            DELETE FROM ht_booking_notes\n            WHERE note_id = $1 AND book_no = $2\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d55d69b2fcb1561a1885b5d150dc87fdb8b5cc0c1e10c3fb2477c69bc94ecc69"
+}

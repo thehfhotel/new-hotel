@@ -1,0 +1,27 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO ht_payments (pay_cin_id, pay_amount, pay_method, pay_reference, pay_notes, pay_created_by)\n        VALUES ($1, $2::float8, $3, $4, $5, $6) RETURNING pay_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "pay_id",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Float8",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "8468b798bbdb40a3e835f0310141b63d2ccd77d22fefa2a08ed1babb8a5a999b"
+}

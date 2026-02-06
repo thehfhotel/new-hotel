@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT ri.ri_id, ri.ri_room_id, ri.ri_item_id, i.item_code, i.item_name, ri.ri_quantity, ri.ri_last_checked\n        FROM ht_room_inventory ri\n        LEFT JOIN ht_inventory_items i ON ri.ri_item_id = i.item_id\n        WHERE ri.ri_room_id = $1\n        ORDER BY i.item_name ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "ri_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "ri_room_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "ri_item_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "item_code",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "item_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "ri_quantity",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "ri_last_checked",
+        "type_info": "Timestamp"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "5bfc52becc19adb1deea679c1456171f90e4073d64fcffafb5f001415de89e58"
+}

@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO ht_inventory_categories (cat_name, cat_description, cat_active)\n        VALUES ($1, $2, $3) RETURNING cat_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cat_id",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "19dd7f5129cfdf20c9162df0583ee8dfa05501fdcc85d30b24aa9e2ecaac3cbc"
+}

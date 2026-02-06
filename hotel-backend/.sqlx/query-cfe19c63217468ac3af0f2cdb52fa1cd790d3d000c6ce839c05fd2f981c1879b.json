@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE ht_guest_registry SET guest_is_primary = false WHERE guest_cin_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cfe19c63217468ac3af0f2cdb52fa1cd790d3d000c6ce839c05fd2f981c1879b"
+}

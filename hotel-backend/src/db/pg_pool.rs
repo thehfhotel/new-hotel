@@ -15,7 +15,7 @@ pub async fn create_pg_pool(config: &NewDbConfig) -> Result<PgPool, Box<dyn std:
         .await?;
 
     // Test the connection
-    sqlx::query("SELECT 1").execute(&pool).await?;
+    sqlx::query_scalar!("SELECT 1 as test").fetch_one(&pool).await?;
     tracing::info!(
         "PostgreSQL connection established to {}:{}",
         config.server,

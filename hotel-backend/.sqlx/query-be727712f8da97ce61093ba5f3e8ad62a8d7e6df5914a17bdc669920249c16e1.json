@@ -1,0 +1,88 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT pay_id, pay_cin_id, pay_amount::float8 as pay_amount, pay_method, pay_reference,\n            pay_notes, pay_date, pay_created_by, pay_voided, pay_voided_at, pay_voided_by, created_at\n        FROM ht_payments WHERE pay_cin_id = $1\n        ORDER BY pay_date DESC, pay_id DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "pay_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "pay_cin_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "pay_amount",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 3,
+        "name": "pay_method",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "pay_reference",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "pay_notes",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "pay_date",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 7,
+        "name": "pay_created_by",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 8,
+        "name": "pay_voided",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 9,
+        "name": "pay_voided_at",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 10,
+        "name": "pay_voided_by",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 11,
+        "name": "created_at",
+        "type_info": "Timestamp"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      null,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "be727712f8da97ce61093ba5f3e8ad62a8d7e6df5914a17bdc669920249c16e1"
+}

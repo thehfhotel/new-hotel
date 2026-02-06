@@ -1,0 +1,86 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT i.item_id, i.item_code, i.item_name, i.item_category_id, c.cat_name,\n            i.item_unit, i.item_min_stock, i.item_current_stock,\n            i.item_cost::float8 as item_cost, i.item_active, i.item_created, i.item_updated\n        FROM ht_inventory_items i\n        LEFT JOIN ht_inventory_categories c ON i.item_category_id = c.cat_id\n        WHERE i.item_active = true AND i.item_current_stock <= i.item_min_stock\n        ORDER BY (i.item_current_stock - i.item_min_stock) ASC, i.item_name ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "item_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "item_code",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "item_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "item_category_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "cat_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "item_unit",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "item_min_stock",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "item_current_stock",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "item_cost",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 9,
+        "name": "item_active",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 10,
+        "name": "item_created",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 11,
+        "name": "item_updated",
+        "type_info": "Timestamp"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true,
+      null,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "910a38e79f9dbbf087fff40b48824ca0755830a7cc47a140137f02141f3772e1"
+}

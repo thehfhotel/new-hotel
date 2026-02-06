@@ -1,0 +1,100 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT type_id, type_code, type_name, type_name_en, type_description,\n            type_base_price::float8 as type_base_price, type_max_guests, type_bed_type,\n            type_size_sqm::float8 as type_size_sqm, type_amenities, type_sort_order,\n            type_active, type_created_at, type_updated_at\n        FROM ht_room_types WHERE type_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "type_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "type_code",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "type_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "type_name_en",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "type_description",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "type_base_price",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 6,
+        "name": "type_max_guests",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "type_bed_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 8,
+        "name": "type_size_sqm",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 9,
+        "name": "type_amenities",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "type_sort_order",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 11,
+        "name": "type_active",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 12,
+        "name": "type_created_at",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 13,
+        "name": "type_updated_at",
+        "type_info": "Timestamp"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      null,
+      true,
+      true,
+      null,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "c0fd33711ad7473674ce2b06a39fdd036a3213fdeb901f9f01acf389cc0d3139"
+}
