@@ -4,8 +4,11 @@
 //! Replaces the Next.js API routes with a high-performance Rust implementation.
 //!
 //! Supports dual-database architecture:
-//! - Legacy database (shared with legacy application)
-//! - New HotelNew database (owned by this application)
+//! - Legacy database (shared with legacy application) - Optional
+//! - New HotelNew database (owned by this application) - Primary
+//!
+//! When SYSTEM_MODE=new, the app can run without the legacy database.
+//! Legacy routes will return 503 Service Unavailable when legacy DB is unavailable.
 
 mod config;
 mod db;
@@ -25,7 +28,7 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::AppConfig;
-use crate::db::{create_pool, create_dual_pool};
+use crate::db::{create_pool, create_new_pool};
 use crate::routes::mode::{AppState, SystemMode};
 use crate::scheduler::init_scheduler;
 
@@ -51,30 +54,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("System Mode: {:?}", config.mode);
     tracing::info!("Server: {}", config.server.addr());
 
-    // Create legacy database connection pool (for backward compatibility)
-    let legacy_pool = create_pool(&config.db).await?;
-    tracing::info!("Legacy database pool created");
+    // Determine system mode
+    let system_mode = match config.mode {
+        config::SystemMode::Legacy => SystemMode::Legacy,
+        config::SystemMode::New => SystemMode::New,
+    };
 
-    // Try to create dual database pools
-    let (app_state, dual_pool_available) = match create_dual_pool(&config).await {
-        Ok(dual_pool) => {
-            tracing::info!("Dual database pools created successfully");
-            let mode = match config.mode {
-                config::SystemMode::Legacy => SystemMode::Legacy,
-                config::SystemMode::New => SystemMode::New,
-            };
-            (AppState::with_mode(dual_pool.legacy.clone(), dual_pool.new_hotel, mode), true)
+    // Try to create the new HotelNew pool first (required for New mode)
+    let new_pool = match create_new_pool(&config.new_db).await {
+        Ok(pool) => {
+            tracing::info!("HotelNew database pool created successfully");
+            Some(pool)
         }
         Err(e) => {
-            tracing::warn!("Failed to create new_hotel pool (will use legacy only): {}", e);
-            // Create AppState with legacy pool for both (new features will be disabled)
-            (AppState::with_mode(legacy_pool.clone(), legacy_pool.clone(), SystemMode::Legacy), false)
+            if system_mode == SystemMode::New {
+                // In New mode, HotelNew database is required
+                return Err(format!("Failed to connect to HotelNew database (required in New mode): {}", e).into());
+            }
+            tracing::warn!("Failed to create HotelNew pool: {}", e);
+            None
         }
     };
 
-    // Initialize scheduler for background jobs
-    if let Err(e) = init_scheduler(legacy_pool.clone(), config.slack.clone()).await {
-        tracing::warn!("Failed to initialize scheduler: {}", e);
+    // Try to create legacy database connection pool
+    let legacy_pool = match create_pool(&config.db).await {
+        Ok(pool) => {
+            tracing::info!("Legacy database pool created successfully");
+            Some(pool)
+        }
+        Err(e) => {
+            if system_mode == SystemMode::Legacy {
+                // In Legacy mode, legacy database is required
+                return Err(format!("Failed to connect to legacy database (required in Legacy mode): {}", e).into());
+            }
+            tracing::warn!("Failed to create legacy pool (legacy routes will be unavailable): {}", e);
+            None
+        }
+    };
+
+    // Create AppState based on available pools
+    let (app_state, legacy_available, new_available) = match (legacy_pool.clone(), new_pool) {
+        (Some(legacy), Some(new_hotel)) => {
+            tracing::info!("Dual database mode: Both databases available");
+            (AppState::with_mode(legacy, new_hotel, system_mode), true, true)
+        }
+        (Some(legacy), None) => {
+            tracing::warn!("Legacy-only mode: HotelNew database unavailable");
+            (AppState::with_mode(legacy.clone(), legacy, SystemMode::Legacy), true, false)
+        }
+        (None, Some(new_hotel)) => {
+            tracing::info!("New-only mode: Legacy database unavailable, running with HotelNew only");
+            (AppState::with_mode(new_hotel.clone(), new_hotel, SystemMode::New), false, true)
+        }
+        (None, None) => {
+            return Err("No database connections available".into());
+        }
+    };
+
+    // Initialize scheduler for background jobs (only if legacy pool is available)
+    if let Some(ref pool) = legacy_pool {
+        if let Err(e) = init_scheduler(pool.clone(), config.slack.clone()).await {
+            tracing::warn!("Failed to initialize scheduler: {}", e);
+        }
+    } else {
+        tracing::info!("Scheduler disabled (legacy database unavailable)");
     }
 
     // Configure CORS
@@ -83,44 +126,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    // Build legacy routes (use legacy_pool as state)
-    let legacy_routes = Router::new()
-        // Rooms routes
-        .route("/api/rooms", get(routes::rooms::list_rooms))
-        .route("/api/rooms/status", get(routes::rooms::get_room_status))
-        .route(
-            "/api/rooms/checkouts-today",
-            get(routes::rooms::get_checkouts_today),
-        )
-        .route("/api/rooms/:id", get(routes::rooms::get_room))
-        // Bookings routes
-        .route("/api/bookings", get(routes::bookings::list_bookings))
+    // Build legacy routes (use legacy_pool as state) - READ-ONLY
+    // Note: Booking notes and get_booking moved to new_routes (require AppState for HotelNew DB writes)
+    // These routes are only available when legacy database is connected
+    let legacy_routes = if let Some(pool) = legacy_pool {
+        Router::new()
+            // Rooms routes
+            .route("/api/rooms", get(routes::rooms::list_rooms))
+            .route("/api/rooms/status", get(routes::rooms::get_room_status))
+            .route(
+                "/api/rooms/checkouts-today",
+                get(routes::rooms::get_checkouts_today),
+            )
+            .route("/api/rooms/:id", get(routes::rooms::get_room))
+            // Bookings list route (read-only from legacy)
+            .route("/api/bookings", get(routes::bookings::list_bookings))
+            // Check-ins routes
+            .route("/api/checkins", get(routes::checkins::list_checkins))
+            // Customers routes
+            .route("/api/customers", get(routes::customers::list_customers))
+            .route(
+                "/api/customers/:id/bookings",
+                get(routes::customers::get_customer_bookings),
+            )
+            .route(
+                "/api/customers/:id/stats",
+                get(routes::customers::get_customer_stats),
+            )
+            // Stats and occupancy routes
+            .route("/api/stats", get(routes::stats::get_stats))
+            .route("/api/occupancy", get(routes::occupancy::get_occupancy))
+            .with_state(pool)
+    } else {
+        // Legacy database not available - return empty router
+        // Legacy API endpoints will return 404
+        tracing::warn!("Legacy routes disabled (no legacy database connection)");
+        Router::new()
+    };
+
+    // Build new routes (use AppState for dual-database access)
+    let new_routes = Router::new()
+        // Legacy booking routes that need AppState (for notes in HotelNew DB)
+        // get_booking uses legacy DB for booking data + HotelNew DB for notes
         .route("/api/bookings/:id", get(routes::bookings::get_booking))
+        // Notes routes use HotelNew DB exclusively (writable)
         .route(
             "/api/bookings/:id/notes",
             get(routes::bookings::get_notes)
                 .post(routes::bookings::create_note)
                 .delete(routes::bookings::delete_note),
         )
-        // Check-ins routes
-        .route("/api/checkins", get(routes::checkins::list_checkins))
-        // Customers routes
-        .route("/api/customers", get(routes::customers::list_customers))
-        .route(
-            "/api/customers/:id/bookings",
-            get(routes::customers::get_customer_bookings),
-        )
-        .route(
-            "/api/customers/:id/stats",
-            get(routes::customers::get_customer_stats),
-        )
-        // Stats and occupancy routes
-        .route("/api/stats", get(routes::stats::get_stats))
-        .route("/api/occupancy", get(routes::occupancy::get_occupancy))
-        .with_state(legacy_pool);
-
-    // Build new routes (use AppState for dual-database access)
-    let new_routes = Router::new()
         // Mode and calendar routes
         .route("/api/mode", get(routes::mode::get_mode))
         .route("/api/calendar", get(routes::calendar::get_calendar))
@@ -173,11 +228,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(cors)
         .layer(TraceLayer::new_for_http());
 
-    // Log dual pool status
-    if dual_pool_available {
-        tracing::info!("New database features enabled");
-    } else {
-        tracing::warn!("New database features disabled (legacy mode only)");
+    // Log database availability status
+    match (legacy_available, new_available) {
+        (true, true) => tracing::info!("Full dual-database mode: All features available"),
+        (true, false) => tracing::warn!("Legacy-only mode: New features disabled"),
+        (false, true) => tracing::info!("New-only mode: Legacy routes disabled, using HotelNew database"),
+        (false, false) => unreachable!(), // We return early if both are unavailable
     }
 
     // Start the server

@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.0] - 2026-02-06
+
+### Fixed
+- **Legacy Database Read-Only Enforcement** - Fixed booking notes writing to legacy database
+  - Moved `HT_Booking_Notes` table from legacy database to HotelNew database
+  - Updated booking routes to use dual-pool architecture:
+    - `GET /api/bookings/:id` - Uses legacy DB for booking data, HotelNew for notes
+    - `GET /api/bookings/:id/notes` - Uses HotelNew DB (read)
+    - `POST /api/bookings/:id/notes` - Uses HotelNew DB (write)
+    - `DELETE /api/bookings/:id/notes` - Uses HotelNew DB (write)
+  - Legacy database (192.168.100.222) is now truly read-only
+
+### Changed
+- **Backend Architecture** - `bookings.rs` now uses `AppState` instead of `DbPool` for booking detail and notes routes
+- **Route Configuration** - Booking notes routes moved from `legacy_routes` to `new_routes` in main.rs
+- **Optional Legacy Database** - The app can now run without a legacy database connection
+  - When `SYSTEM_MODE=new`, the app starts even if legacy database is unavailable
+  - Legacy routes (`/api/rooms`, `/api/bookings`, `/api/checkins`, etc.) return 404 when legacy DB is unavailable
+  - HotelNew database is required in New mode
+  - Scheduler (checkout reminders) only runs when legacy database is available
+
+### Added
+- Migration `005_move_booking_notes_to_hotelnew.sql` - Creates HT_Booking_Notes table in HotelNew database
+- `HT_Booking_Notes` table definition added to `init-db/init-hotelnew.sql`
+- `create_new_pool` function exported from db module for standalone HotelNew connections
+
 ## [2.8.0] - 2026-02-05
 
 ### Added
