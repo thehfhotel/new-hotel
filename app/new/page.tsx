@@ -1,0 +1,221 @@
+'use client'
+
+import { useState, useEffect, useCallback } from 'react'
+import Link from 'next/link'
+import {
+  Sparkles,
+  Package,
+  Wrench,
+  Receipt,
+  BarChart3,
+  ArrowRight,
+  Loader2,
+  AlertCircle,
+  Calendar,
+} from 'lucide-react'
+
+interface Stats {
+  totalRooms: number
+  occupiedRooms: number
+  availableRooms: number
+  totalCustomers: number
+  activeBookings: number
+  todayCheckouts: number
+}
+
+interface QuickLink {
+  href: string
+  label: string
+  description: string
+  icon: React.ReactNode
+  color: string
+}
+
+const quickLinks: QuickLink[] = [
+  {
+    href: '/new/bookings',
+    label: 'การจอง',
+    description: 'จัดการการจองห้องพัก',
+    icon: <Calendar size={24} />,
+    color: 'bg-blue-500',
+  },
+  {
+    href: '/new/housekeeping',
+    label: 'แม่บ้าน',
+    description: 'สถานะความสะอาดห้อง',
+    icon: <Sparkles size={24} />,
+    color: 'bg-pink-500',
+  },
+  {
+    href: '/new/inventory',
+    label: 'คลังสินค้า',
+    description: 'จัดการสต็อกและอุปกรณ์',
+    icon: <Package size={24} />,
+    color: 'bg-purple-500',
+  },
+  {
+    href: '/new/maintenance',
+    label: 'แจ้งซ่อม',
+    description: 'ติดตามงานซ่อมบำรุง',
+    icon: <Wrench size={24} />,
+    color: 'bg-orange-500',
+  },
+  {
+    href: '/new/billing',
+    label: 'ใบแจ้งหนี้',
+    description: 'ดูและพิมพ์ใบแจ้งหนี้',
+    icon: <Receipt size={24} />,
+    color: 'bg-green-500',
+  },
+  {
+    href: '/new/reports',
+    label: 'รายงาน',
+    description: 'วิเคราะห์รายได้และอัตราเข้าพัก',
+    icon: <BarChart3 size={24} />,
+    color: 'bg-indigo-500',
+  },
+]
+
+export default function NewDashboard() {
+  const [stats, setStats] = useState<Stats>({
+    totalRooms: 0,
+    occupiedRooms: 0,
+    availableRooms: 0,
+    totalCustomers: 0,
+    activeBookings: 0,
+    todayCheckouts: 0,
+  })
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  const fetchStats = useCallback(async () => {
+    try {
+      const res = await fetch('/api/new/stats')
+      if (res.ok) {
+        const data = await res.json()
+        if (data.success) {
+          setStats(data.data)
+        }
+      }
+    } catch (err) {
+      setError('ไม่สามารถโหลดข้อมูลได้')
+      console.error('Error fetching stats:', err)
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    fetchStats()
+  }, [fetchStats])
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-[50vh]">
+        <div className="text-center">
+          <Loader2 className="animate-spin h-12 w-12 text-emerald-600 mx-auto mb-4" />
+          <p className="text-gray-600">กำลังโหลดข้อมูล...</p>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* Page Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-800">ระบบจัดการโรงแรม (ใหม่)</h1>
+          <p className="text-gray-500">New Hotel Management System</p>
+        </div>
+        <p className="text-gray-500 text-sm">
+          อัปเดตล่าสุด: {new Date().toLocaleDateString('th-TH', {
+            year: 'numeric',
+            month: 'long',
+            day: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit',
+          })}
+        </p>
+      </div>
+
+      {/* Error Message */}
+      {error && (
+        <div className="flex items-center gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">
+          <AlertCircle className="w-5 h-5 flex-shrink-0" />
+          <span>{error}</span>
+        </div>
+      )}
+
+      {/* Stats Cards */}
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+        <div className="bg-white rounded-xl px-6 py-5 shadow-sm border border-gray-100">
+          <p className="text-sm font-medium text-gray-500 mb-1">ห้องทั้งหมด</p>
+          <p className="text-3xl font-bold text-gray-900">{stats.totalRooms}</p>
+        </div>
+        <div className="bg-white rounded-xl px-6 py-5 shadow-sm border border-gray-100">
+          <p className="text-sm font-medium text-gray-500 mb-1">ห้องว่าง</p>
+          <p className="text-3xl font-bold text-green-600">{stats.availableRooms}</p>
+        </div>
+        <div className="bg-white rounded-xl px-6 py-5 shadow-sm border border-gray-100">
+          <p className="text-sm font-medium text-gray-500 mb-1">มีผู้เข้าพัก</p>
+          <p className="text-3xl font-bold text-orange-600">{stats.occupiedRooms}</p>
+        </div>
+        <div className="bg-white rounded-xl px-6 py-5 shadow-sm border border-gray-100">
+          <p className="text-sm font-medium text-gray-500 mb-1">ลูกค้าทั้งหมด</p>
+          <p className="text-3xl font-bold text-gray-900">{stats.totalCustomers}</p>
+        </div>
+        <div className="bg-white rounded-xl px-6 py-5 shadow-sm border border-gray-100">
+          <p className="text-sm font-medium text-gray-500 mb-1">การจองที่ใช้งาน</p>
+          <p className="text-3xl font-bold text-blue-600">{stats.activeBookings}</p>
+        </div>
+        <div className="bg-white rounded-xl px-6 py-5 shadow-sm border border-gray-100">
+          <p className="text-sm font-medium text-gray-500 mb-1">เช็คเอาท์วันนี้</p>
+          <p className="text-3xl font-bold text-red-600">{stats.todayCheckouts}</p>
+        </div>
+      </div>
+
+      {/* Quick Links */}
+      <div>
+        <h2 className="text-lg font-semibold text-gray-800 mb-4">เมนูหลัก</h2>
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+          {quickLinks.map((link) => (
+            <Link
+              key={link.href}
+              href={link.href}
+              className="bg-white rounded-xl shadow-sm border border-gray-100 p-4 hover:shadow-md transition-shadow group"
+            >
+              <div className={`${link.color} w-12 h-12 rounded-lg flex items-center justify-center text-white mb-3`}>
+                {link.icon}
+              </div>
+              <h3 className="font-semibold text-gray-800 group-hover:text-emerald-600 transition-colors">
+                {link.label}
+              </h3>
+              <p className="text-sm text-gray-500 mt-1">{link.description}</p>
+              <div className="flex items-center gap-1 text-emerald-600 text-sm mt-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                <span>เปิด</span>
+                <ArrowRight size={14} />
+              </div>
+            </Link>
+          ))}
+        </div>
+      </div>
+
+      {/* System Info */}
+      <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-6">
+        <h2 className="text-lg font-semibold text-emerald-800 mb-2">เกี่ยวกับระบบใหม่</h2>
+        <p className="text-emerald-700">
+          ระบบใหม่นี้ใช้ฐานข้อมูลแยกต่างหาก (HotelNew) ซึ่งเป็นอิสระจากระบบเดิม
+          คุณสามารถใช้งานทั้งสองระบบพร้อมกันได้ โดยข้อมูลจะไม่ส่งผลกระทบต่อกัน
+        </p>
+        <ul className="mt-3 space-y-1 text-emerald-700 text-sm">
+          <li>• รองรับการจัดการห้องพัก ประเภทห้อง และราคา</li>
+          <li>• ระบบแม่บ้านและติดตามความสะอาด</li>
+          <li>• ระบบคลังสินค้าและอุปกรณ์</li>
+          <li>• ระบบแจ้งซ่อมบำรุง</li>
+          <li>• รายงานรายได้และวิเคราะห์ข้อมูล</li>
+        </ul>
+      </div>
+    </div>
+  )
+}

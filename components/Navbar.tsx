@@ -11,13 +11,8 @@ import {
   Hotel,
   ScrollText,
   CreditCard,
-  BarChart3,
-  Receipt,
-  Wrench,
-  Sparkles,
-  Package,
+  ArrowLeftRight,
 } from 'lucide-react'
-import ModeToggle from './ModeToggle'
 
 interface NavLink {
   href: string
@@ -31,11 +26,6 @@ const navLinks: NavLink[] = [
   { href: '/customers', label: 'ลูกค้า', icon: <Users size={20} /> },
   { href: '/bookings', label: 'การจอง', icon: <BookOpen size={20} /> },
   { href: '/rooms', label: 'ห้องพัก', icon: <BedDouble size={20} /> },
-  { href: '/new/housekeeping', label: 'แม่บ้าน', icon: <Sparkles size={20} /> },
-  { href: '/new/inventory', label: 'คลังสินค้า', icon: <Package size={20} /> },
-  { href: '/new/maintenance', label: 'แจ้งซ่อม', icon: <Wrench size={20} /> },
-  { href: '/new/billing', label: 'ใบแจ้งหนี้', icon: <Receipt size={20} /> },
-  { href: '/new/reports', label: 'รายงาน', icon: <BarChart3 size={20} /> },
   { href: '/card-reader', label: 'อ่านบัตร', icon: <CreditCard size={20} /> },
   { href: '/changelog', label: 'ประวัติ', icon: <ScrollText size={20} /> },
 ]
@@ -49,15 +39,16 @@ export default function Navbar() {
         {/* Logo and Hotel Name */}
         <Link href="/" className="flex items-center gap-2 shrink-0">
           <Hotel size={28} className="text-blue-200 lg:w-8 lg:h-8" />
-          <span className="hidden lg:block text-xl font-bold whitespace-nowrap">ระบบจัดการโรงแรม</span>
+          <div className="hidden lg:block">
+            <span className="text-xl font-bold whitespace-nowrap">ระบบจัดการโรงแรม</span>
+            <span className="ml-2 text-xs bg-blue-600 px-2 py-0.5 rounded-full">LEGACY</span>
+          </div>
         </Link>
 
         {/* Navigation Links */}
         <div className="flex items-center overflow-x-auto">
           {navLinks.map((link) => {
-            // Check if active: exact match or starts with for /new/* routes
-            const isActive = pathname === link.href ||
-              (link.href.startsWith('/new/') && pathname.startsWith(link.href))
+            const isActive = pathname === link.href
             return (
               <Link
                 key={link.href}
@@ -75,9 +66,16 @@ export default function Navbar() {
           })}
         </div>
 
-        {/* Mode Toggle */}
+        {/* Switch to New Mode */}
         <div className="flex items-center shrink-0">
-          <ModeToggle />
+          <Link
+            href="/new"
+            className="flex items-center gap-2 px-3 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-lg transition-colors text-sm"
+            title="สลับไปโหมดใหม่"
+          >
+            <ArrowLeftRight size={18} />
+            <span className="hidden lg:block">New System</span>
+          </Link>
         </div>
       </div>
     </nav>
