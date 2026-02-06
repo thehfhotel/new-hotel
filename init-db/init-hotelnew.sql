@@ -50,6 +50,7 @@ BEGIN
         [Cust_Company] NVARCHAR(200) NULL,
         [Cust_TaxID] NVARCHAR(20) NULL,
         [Cust_Notes] NVARCHAR(MAX) NULL,
+        [Cust_Type] NVARCHAR(50) NULL,                   -- Customer type (Individual, Corporate, etc.)
         [Cust_VIP] BIT DEFAULT 0,
         [Cust_Blacklist] BIT DEFAULT 0,
         [Cust_Created_At] DATETIME DEFAULT GETDATE(),
@@ -99,6 +100,7 @@ BEGIN
         [Room_Building] NVARCHAR(50) NULL,
         [Room_View] NVARCHAR(50) NULL,
         [Room_Status] NVARCHAR(20) DEFAULT 'available',
+        [Room_Clean] BIT DEFAULT 1,                      -- Room cleanliness status
         [Room_Notes] NVARCHAR(500) NULL,
         [Room_Features] NVARCHAR(MAX) NULL,
         [Room_Active] BIT DEFAULT 1,
@@ -486,6 +488,24 @@ GO
 
 IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'IX_HT_Inventory_Transactions_Date')
     CREATE INDEX IX_HT_Inventory_Transactions_Date ON HT_Inventory_Transactions(Trans_Date);
+GO
+
+-- =============================================================================
+-- Schema Updates (for existing databases)
+-- =============================================================================
+
+-- Add Cust_Type column if it doesn't exist
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Customers]') AND name = 'Cust_Type')
+BEGIN
+    ALTER TABLE [dbo].[HT_Customers] ADD [Cust_Type] NVARCHAR(50) NULL;
+END
+GO
+
+-- Add Room_Clean column if it doesn't exist
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[HT_Rooms_New]') AND name = 'Room_Clean')
+BEGIN
+    ALTER TABLE [dbo].[HT_Rooms_New] ADD [Room_Clean] BIT DEFAULT 1;
+END
 GO
 
 PRINT 'HotelNew database initialization complete.'
