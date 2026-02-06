@@ -211,6 +211,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/new/reports/revenue-by-room-type", get(routes::new_reports::get_revenue_by_room_type))
         // Invoice
         .route("/api/new/checkins/:id/invoice", get(routes::new_invoice::get_invoice))
+        // Payments
+        .route("/api/new/checkins/:id/payments", get(routes::new_payments::list_payments).post(routes::new_payments::create_payment))
+        .route("/api/new/payments/:id", delete(routes::new_payments::void_payment))
         // Inventory Management
         .route("/api/new/inventory/categories", get(routes::new_inventory::list_categories).post(routes::new_inventory::create_category))
         .route("/api/new/inventory/items", get(routes::new_inventory::list_items).post(routes::new_inventory::create_item))
@@ -219,6 +222,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/new/inventory/transactions", get(routes::new_inventory::list_transactions).post(routes::new_inventory::create_transaction))
         .route("/api/new/inventory/stats", get(routes::new_inventory::get_stats))
         .route("/api/new/inventory/low-stock", get(routes::new_inventory::get_low_stock))
+        // Maintenance Management
+        .route("/api/new/maintenance/categories", get(routes::new_maintenance::list_categories))
+        .route("/api/new/maintenance/requests", get(routes::new_maintenance::list_requests).post(routes::new_maintenance::create_request))
+        .route("/api/new/maintenance/requests/:id", get(routes::new_maintenance::get_request).put(routes::new_maintenance::update_request))
+        .route("/api/new/maintenance/requests/:id/status", put(routes::new_maintenance::update_request_status))
         .with_state(app_state);
 
     // Merge all routes

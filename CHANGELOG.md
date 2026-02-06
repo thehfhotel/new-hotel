@@ -5,6 +5,110 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.11.0] - 2026-02-06
+
+### Added
+- **Reports Dashboard (Phase 1)** - Analytics and reporting at `/new/reports`
+  - **Reports Page** (`/app/new/reports/page.tsx`) - Revenue and occupancy analytics
+    - Date range picker with preset options (last 7, 14, 30 days, last month)
+    - Period grouping selector (Day/Week/Month)
+    - Stats cards: Total Revenue, Occupancy Rate, ADR, RevPAR, Avg Stay Length
+    - Revenue trend chart (bar/line toggle)
+    - Room type revenue pie chart breakdown
+    - Thai language labels throughout
+  - **Chart Components** (`/components/Charts.tsx`)
+    - `RevenueChart` - Bar/line chart for revenue trends using Recharts
+    - `PieChart` - Room type revenue breakdown with color-coded segments
+    - Formatted tooltips showing revenue in Thai Baht and booking counts
+  - **Report Types** (`/types/reports.ts`)
+    - `RevenueDataPoint`, `RevenueResponse` - Revenue report data structures
+    - `OccupancyResponse` - Occupancy metrics with ADR/RevPAR
+    - `RoomTypeRevenue`, `RevenueByRoomTypeResponse` - Room type breakdown
+    - `MaintenanceRequest`, `MaintenanceCategory` - Maintenance types
+    - `Payment`, `PaymentsResponse` - Payment tracking types
+- **Maintenance Request System (Phase 3)** - Kanban-style maintenance tracking at `/new/maintenance`
+  - **Maintenance Page** (`/app/new/maintenance/page.tsx`) - Main maintenance dashboard
+    - Three-column Kanban board: "Open" (red), "In Progress" (yellow), "Completed" (green)
+    - Request cards showing title, room, category, priority badge, and time elapsed
+    - Priority indicators with color coding (High=red, Medium=yellow, Low=gray)
+    - Overdue badge for requests waiting > 2 hours
+    - Filters: room, category, priority
+    - Add request button opens modal form
+    - Auto-refresh every 30 seconds
+    - Thai language labels throughout
+  - **MaintenanceCard Component** (`/components/maintenance/MaintenanceCard.tsx`)
+    - Displays request number, title, room, category, priority
+    - Time elapsed since created or since started
+    - Assigned technician display
+    - Quick action buttons: "Start Repair" (open -> in_progress), "Done" (in_progress -> completed)
+    - Edit button to modify request details
+    - Resolution and cost display for completed requests
+  - **MaintenanceRequestModal Component** (`/components/modals/MaintenanceRequestModal.tsx`)
+    - Create mode: room picker, category dropdown, title, description, priority, assignedTo
+    - Edit mode: adds resolution, cost fields
+    - Priority selection with color-coded buttons
+    - Validation for required fields
+  - **Backend API** (`/api/new/maintenance/*`)
+    - `GET /api/new/maintenance/categories` - List maintenance categories
+    - `GET /api/new/maintenance/requests` - List requests with filters (status, room, category, priority)
+    - `POST /api/new/maintenance/requests` - Create request (generates MR-YYMM-NNNN format)
+    - `GET /api/new/maintenance/requests/:id` - Get single request
+    - `PUT /api/new/maintenance/requests/:id` - Update request
+    - `PUT /api/new/maintenance/requests/:id/status` - Quick status update
+  - **Database Migration** (`migrations/007_maintenance_system.sql`)
+    - `HT_Maintenance_Categories` table with default categories (Electrical, Plumbing, AC, Furniture, General)
+    - `HT_Maintenance_Requests` table with status, priority, cost, resolution tracking
+    - `SQ_Maintenance_No` sequence for request number generation
+- **Thai Labels**:
+  - "แจ้งซ่อม" (Maintenance Request)
+  - "รอดำเนินการ" (Pending) / "กำลังดำเนินการ" (In Progress) / "เสร็จสิ้น" (Completed)
+  - "ความเร่งด่วน" (Priority): "สูง" (High), "ปานกลาง" (Medium), "ต่ำ" (Low)
+  - "เริ่มซ่อม" (Start Repair) / "ซ่อมเสร็จ" (Done)
+  - "ผลการซ่อม" (Resolution) / "ค่าใช้จ่าย" (Cost)
+- **Test Coverage**
+  - `PaymentModal.test.tsx` - Payment modal component tests (form inputs, API submission, validation)
+  - `MaintenanceRequestModal.test.tsx` - Maintenance modal component tests (create/edit modes)
+  - `MaintenanceCard.test.tsx` - Maintenance card component tests (status changes, priority display)
+  - `Charts.test.tsx` - Chart components tests (OccupancyChart, RevenueChart, PieChart)
+
+## [2.10.0] - 2026-02-06
+
+### Added
+- **Billing Module** - Invoice viewing and printing functionality at `/new/billing`
+  - **Billing List Page** (`/app/new/billing/page.tsx`) - Check-in list with invoice actions
+    - Search by guest name or check-in number
+    - Filter by status (all, active, checked out)
+    - Date range filter for check-in/check-out dates
+    - Table showing: Check-in number, Room, Guest Name, Check-in Date, Checkout Date, Total Amount, Status
+    - "View Invoice" button linking to invoice detail page
+    - Pagination with page navigation
+    - Thai language labels throughout
+  - **Invoice Detail Page** (`/app/new/billing/[id]/page.tsx`) - Individual invoice view with print
+    - Fetches invoice data from `/api/new/checkins/:id/invoice`
+    - Displays InvoiceTemplate component with hotel and guest information
+    - Print button with PDF save option
+    - Back button to return to billing list
+    - Loading and error state handling
+    - Hotel info: The HF Hotel with Thai address and tax ID
+- **Payment Tracking System (Phase 2)** - Multiple payments per check-in support
+  - **Database Schema** (`migrations/006_payment_tracking.sql`)
+    - `HT_Payments` table for tracking multiple payments per check-in
+    - Supports payment methods: cash, credit, transfer, QR code
+    - Soft delete (void) capability for payment corrections
+    - Reference field for card/transfer numbers
+    - Automatic balance calculation (total - paid)
+  - **Backend API** (`/api/new/checkins/:id/payments`)
+    - `GET /api/new/checkins/:id/payments` - List payments with balance summary
+    - `POST /api/new/checkins/:id/payments` - Record a new payment
+    - `DELETE /api/new/payments/:id` - Void a payment (soft delete)
+  - **PaymentModal Component** (`/components/modals/PaymentModal.tsx`)
+    - Amount input with auto-fill remaining balance option
+    - Payment method selection buttons (Cash, Credit Card, Transfer, QR)
+    - Optional reference field for card/transfer numbers
+    - Notes field for additional information
+    - Balance summary display (total, paid, remaining)
+    - Thai language labels throughout
+
 ## [2.9.0] - 2026-02-06
 
 ### Fixed

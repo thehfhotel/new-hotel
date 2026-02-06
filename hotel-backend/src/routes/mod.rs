@@ -10,6 +10,8 @@ pub mod new_checkins;
 pub mod new_customers;
 pub mod new_inventory;
 pub mod new_invoice;
+pub mod new_maintenance;
+pub mod new_payments;
 pub mod new_rates;
 pub mod new_reports;
 pub mod new_room_types;
