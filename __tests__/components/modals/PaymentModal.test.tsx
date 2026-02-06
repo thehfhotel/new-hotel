@@ -81,7 +81,7 @@ describe('PaymentModal Component', () => {
       render(<PaymentModal {...defaultProps} />)
 
       const cashButton = screen.getByText('เงินสด').closest('button')
-      expect(cashButton).toHaveClass('border-green-500')
+      expect(cashButton).toHaveClass('border-red-500')
     })
 
     test('clicking credit card changes selection and shows reference field', () => {
@@ -90,7 +90,7 @@ describe('PaymentModal Component', () => {
       fireEvent.click(screen.getByText('บัตรเครดิต'))
 
       const creditButton = screen.getByText('บัตรเครดิต').closest('button')
-      expect(creditButton).toHaveClass('border-green-500')
+      expect(creditButton).toHaveClass('border-red-500')
       expect(screen.getByPlaceholderText('1234')).toBeInTheDocument()
     })
 

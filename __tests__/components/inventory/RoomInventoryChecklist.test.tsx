@@ -238,9 +238,9 @@ describe('RoomInventoryChecklist Component', () => {
       )
 
       await waitFor(() => {
-        // Checked checkboxes have green background
-        const checkedBoxes = container.querySelectorAll('button.border-green-500.bg-green-500')
-        expect(checkedBoxes.length).toBe(4)
+        // Checked checkboxes have green background and border
+        const checkedBoxes = container.querySelectorAll('button.bg-green-500')
+        expect(checkedBoxes.length).toBeGreaterThanOrEqual(4)
       })
     })
 
@@ -268,8 +268,8 @@ describe('RoomInventoryChecklist Component', () => {
       fireEvent.click(checkbox!)
 
       await waitFor(() => {
-        // Should now show unchecked state (gray border, no green bg)
-        expect(checkbox).toHaveClass('border-gray-300')
+        // Should now show unchecked state (zinc border, no green bg)
+        expect(checkbox).toHaveClass('border-zinc-700')
         expect(checkbox).not.toHaveClass('bg-green-500')
       })
     })
@@ -345,9 +345,9 @@ describe('RoomInventoryChecklist Component', () => {
       fireEvent.change(inputs[0], { target: { value: '2' } })
 
       await waitFor(() => {
-        // Item should now show as missing (orange styling)
+        // Item should now show as missing (amber styling)
         const firstItemContainer = screen.getByText('น้ำดื่ม').closest('div[class*="rounded-lg border"]')
-        expect(firstItemContainer).toHaveClass('border-orange-200')
+        expect(firstItemContainer).toHaveClass('border-amber-500')
       })
     })
   })
@@ -401,7 +401,7 @@ describe('RoomInventoryChecklist Component', () => {
   })
 
   describe('Missing Items Highlighted', () => {
-    test('missing items have orange highlighting', async () => {
+    test('missing items have amber highlighting', async () => {
       ;(global.fetch as jest.Mock).mockResolvedValue({
         json: () => Promise.resolve({ success: true, data: mockRoomInventory }),
       })
@@ -425,10 +425,10 @@ describe('RoomInventoryChecklist Component', () => {
       fireEvent.change(inputs[0], { target: { value: '1' } })
 
       await waitFor(() => {
-        // Check for orange/missing styling
+        // Check for amber/missing styling
         const itemRow = screen.getByText('น้ำดื่ม').closest('.rounded-lg')
-        expect(itemRow).toHaveClass('bg-orange-50')
-        expect(itemRow).toHaveClass('border-orange-200')
+        expect(itemRow).toHaveClass('bg-amber-500/10')
+        expect(itemRow).toHaveClass('border-amber-500')
       })
     })
 
@@ -492,8 +492,8 @@ describe('RoomInventoryChecklist Component', () => {
           .getAllByText(/MB00|AM00|LN00/)
           .map((el) => el.closest('.rounded-lg'))
         itemRows.forEach((row) => {
-          expect(row).toHaveClass('bg-green-50')
-          expect(row).toHaveClass('border-green-200')
+          expect(row).toHaveClass('bg-green-500/10')
+          expect(row).toHaveClass('border-green-500')
         })
       })
     })

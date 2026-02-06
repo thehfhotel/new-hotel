@@ -437,7 +437,7 @@ describe('CustomerPicker Component', () => {
 
       // First item should be highlighted
       const listItems = screen.getAllByRole('option')
-      expect(listItems[0]).toHaveClass('bg-blue-50')
+      expect(listItems[0]).toHaveClass('bg-red-500/10')
     })
 
     test('navigates up with ArrowUp key', async () => {
@@ -455,7 +455,7 @@ describe('CustomerPicker Component', () => {
 
       // First item should be highlighted
       const listItems = screen.getAllByRole('option')
-      expect(listItems[0]).toHaveClass('bg-blue-50')
+      expect(listItems[0]).toHaveClass('bg-red-500/10')
     })
 
     test('selects highlighted item on Enter key', async () => {
@@ -512,7 +512,7 @@ describe('CustomerPicker Component', () => {
       })
 
       const listItems = screen.getAllByRole('option')
-      expect(listItems[0]).toHaveClass('bg-blue-50')
+      expect(listItems[0]).toHaveClass('bg-red-500/10')
     })
 
     test('does not navigate past last item with ArrowDown', async () => {
@@ -530,7 +530,7 @@ describe('CustomerPicker Component', () => {
       })
 
       const listItems = screen.getAllByRole('option')
-      expect(listItems[2]).toHaveClass('bg-blue-50')
+      expect(listItems[2]).toHaveClass('bg-red-500/10')
     })
   })
 
@@ -568,7 +568,7 @@ describe('CustomerPicker Component', () => {
       )
 
       const container = screen.getByPlaceholderText('ค้นหาลูกค้า...').closest('div')
-      expect(container).toHaveClass('bg-gray-100')
+      expect(container).toHaveClass('bg-zinc-800')
       expect(container).toHaveClass('cursor-not-allowed')
     })
 
@@ -699,7 +699,7 @@ describe('CustomerPicker Component', () => {
         fireEvent.mouseEnter(listItems[1])
       })
 
-      expect(listItems[1]).toHaveClass('bg-blue-50')
+      expect(listItems[1]).toHaveClass('bg-red-500/10')
     })
 
     test('shows current selection with different style', async () => {
@@ -721,7 +721,7 @@ describe('CustomerPicker Component', () => {
 
       const listItems = screen.getAllByRole('option')
       expect(listItems[0]).toHaveAttribute('aria-selected', 'true')
-      expect(listItems[0]).toHaveClass('bg-blue-100')
+      expect(listItems[0]).toHaveClass('bg-red-500/10')
     })
   })
 })

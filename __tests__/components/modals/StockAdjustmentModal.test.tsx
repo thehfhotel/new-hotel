@@ -232,7 +232,7 @@ describe('StockAdjustmentModal Component', () => {
       render(<StockAdjustmentModal isOpen={true} onClose={mockOnClose} onSuccess={mockOnSuccess} />)
 
       const addButton = screen.getByText('รับเข้า').closest('button')
-      expect(addButton).toHaveClass('border-green-500')
+      expect(addButton).toHaveClass('border-red-500')
     })
 
     test('clicking remove changes adjustment type', () => {
@@ -250,7 +250,7 @@ describe('StockAdjustmentModal Component', () => {
       const setButton = screen.getByText('ตั้งค่าใหม่')
       fireEvent.click(setButton)
 
-      expect(setButton.closest('button')).toHaveClass('border-blue-500')
+      expect(setButton.closest('button')).toHaveClass('border-red-500')
     })
   })
 

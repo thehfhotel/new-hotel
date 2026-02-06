@@ -281,7 +281,7 @@ describe('RoomPicker Component', () => {
       await waitForRoomsToLoad()
 
       const allButton = screen.getByText('ทั้งหมด')
-      expect(allButton).toHaveClass('bg-blue-600')
+      expect(allButton).toHaveClass('bg-red-600')
       expect(allButton).toHaveClass('text-white')
     })
 
@@ -336,9 +336,9 @@ describe('RoomPicker Component', () => {
       )
       fireEvent.click(standardFilter!)
 
-      expect(standardFilter).toHaveClass('bg-blue-600')
+      expect(standardFilter).toHaveClass('bg-red-600')
       expect(standardFilter).toHaveClass('text-white')
-      expect(screen.getByText('ทั้งหมด')).toHaveClass('bg-gray-100')
+      expect(screen.getByText('ทั้งหมด')).toHaveClass('bg-zinc-800')
     })
   })
 
@@ -574,8 +574,8 @@ describe('RoomPicker Component', () => {
       // Find in the grid area (not the badge area)
       const gridArea = screen.getByText('ชั้น 1').parentElement
       const room101Button = gridArea?.querySelector('button')
-      expect(room101Button).toHaveClass('border-blue-500')
-      expect(room101Button).toHaveClass('bg-blue-50')
+      expect(room101Button).toHaveClass('border-red-500')
+      expect(room101Button).toHaveClass('bg-red-500/10')
     })
 
     test('shows checkmark on selected rooms', async () => {

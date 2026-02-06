@@ -109,8 +109,8 @@ describe('CustomerForm Component', () => {
         />
       )
 
-      // Find the backdrop (first fixed div with bg-black)
-      const backdrop = document.querySelector('.bg-black.bg-opacity-50')
+      // Find the backdrop (fixed div with bg-black and z-40)
+      const backdrop = document.querySelector('.fixed.inset-0.z-40')
       if (backdrop) {
         fireEvent.click(backdrop)
       }

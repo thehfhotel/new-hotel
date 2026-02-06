@@ -91,33 +91,33 @@ describe('HousekeepingStats Component', () => {
     test('dirty count card has red background', () => {
       const { container } = render(<HousekeepingStats stats={mockStats} />)
 
-      const redCard = container.querySelector('.bg-red-50')
+      const redCard = container.querySelector('[class*="bg-red-500"]')
       expect(redCard).toBeInTheDocument()
       expect(redCard).toHaveTextContent('รอทำความสะอาด')
     })
 
-    test('cleaning count card has yellow background', () => {
+    test('cleaning count card has amber background', () => {
       const { container } = render(<HousekeepingStats stats={mockStats} />)
 
-      const yellowCard = container.querySelector('.bg-yellow-50')
-      expect(yellowCard).toBeInTheDocument()
-      expect(yellowCard).toHaveTextContent('กำลังทำความสะอาด')
+      const amberCard = container.querySelector('[class*="bg-amber-500"]')
+      expect(amberCard).toBeInTheDocument()
+      expect(amberCard).toHaveTextContent('กำลังทำความสะอาด')
     })
 
-    test('cleaned today count card has green background', () => {
+    test('cleaned today count card has emerald background', () => {
       const { container } = render(<HousekeepingStats stats={mockStats} />)
 
-      const greenCard = container.querySelector('.bg-green-50')
+      const greenCard = container.querySelector('[class*="bg-emerald-500"]')
       expect(greenCard).toBeInTheDocument()
       expect(greenCard).toHaveTextContent('ทำความสะอาดแล้ววันนี้')
     })
 
-    test('average time card has blue background', () => {
+    test('average time card has sky blue background', () => {
       const { container } = render(<HousekeepingStats stats={mockStats} />)
 
-      const blueCard = container.querySelector('.bg-blue-50')
-      expect(blueCard).toBeInTheDocument()
-      expect(blueCard).toHaveTextContent('เวลาเฉลี่ยต่อห้อง')
+      const skyCard = container.querySelector('[class*="bg-sky-500"]')
+      expect(skyCard).toBeInTheDocument()
+      expect(skyCard).toHaveTextContent('เวลาเฉลี่ยต่อห้อง')
     })
   })
 

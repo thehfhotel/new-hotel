@@ -396,15 +396,15 @@ describe('RateForm Component', () => {
 
       // By default all days are selected
       const sundayButton = screen.getByTitle('อาทิตย์')
-      expect(sundayButton).toHaveClass('bg-amber-500')
+      expect(sundayButton).toHaveClass('bg-red-600')
 
       // Click to deselect
       fireEvent.click(sundayButton)
-      expect(sundayButton).not.toHaveClass('bg-amber-500')
+      expect(sundayButton).not.toHaveClass('bg-red-600')
 
       // Click to reselect
       fireEvent.click(sundayButton)
-      expect(sundayButton).toHaveClass('bg-amber-500')
+      expect(sundayButton).toHaveClass('bg-red-600')
     })
 
     test('selects weekdays only when button clicked', () => {
@@ -423,14 +423,14 @@ describe('RateForm Component', () => {
       // Check weekdays are selected (Mon-Fri)
       const mondayButton = screen.getByTitle('จันทร์')
       const fridayButton = screen.getByTitle('ศุกร์')
-      expect(mondayButton).toHaveClass('bg-amber-500')
-      expect(fridayButton).toHaveClass('bg-amber-500')
+      expect(mondayButton).toHaveClass('bg-red-600')
+      expect(fridayButton).toHaveClass('bg-red-600')
 
       // Check weekends are not selected
       const sundayButton = screen.getByTitle('อาทิตย์')
       const saturdayButton = screen.getByTitle('เสาร์')
-      expect(sundayButton).not.toHaveClass('bg-amber-500')
-      expect(saturdayButton).not.toHaveClass('bg-amber-500')
+      expect(sundayButton).not.toHaveClass('bg-red-600')
+      expect(saturdayButton).not.toHaveClass('bg-red-600')
     })
 
     test('selects weekends only when button clicked', () => {
@@ -449,12 +449,12 @@ describe('RateForm Component', () => {
       // Check weekends are selected
       const sundayButton = screen.getByTitle('อาทิตย์')
       const saturdayButton = screen.getByTitle('เสาร์')
-      expect(sundayButton).toHaveClass('bg-amber-500')
-      expect(saturdayButton).toHaveClass('bg-amber-500')
+      expect(sundayButton).toHaveClass('bg-red-600')
+      expect(saturdayButton).toHaveClass('bg-red-600')
 
       // Check weekdays are not selected
       const mondayButton = screen.getByTitle('จันทร์')
-      expect(mondayButton).not.toHaveClass('bg-amber-500')
+      expect(mondayButton).not.toHaveClass('bg-red-600')
     })
 
     test('selects all days when button clicked', () => {
@@ -479,9 +479,9 @@ describe('RateForm Component', () => {
       const sundayButton = screen.getByTitle('อาทิตย์')
       const mondayButton = screen.getByTitle('จันทร์')
       const saturdayButton = screen.getByTitle('เสาร์')
-      expect(sundayButton).toHaveClass('bg-amber-500')
-      expect(mondayButton).toHaveClass('bg-amber-500')
-      expect(saturdayButton).toHaveClass('bg-amber-500')
+      expect(sundayButton).toHaveClass('bg-red-600')
+      expect(mondayButton).toHaveClass('bg-red-600')
+      expect(saturdayButton).toHaveClass('bg-red-600')
     })
   })
 
