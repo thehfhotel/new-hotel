@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO ht_bookings (book_no, book_cust_id, book_checkin, book_checkout, book_adults, book_children, book_status, book_source, book_total_amount, book_deposit_amount, book_notes)\n        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::float8, $10::float8, $11)\n        RETURNING book_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "book_id",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Int4",
+        "Date",
+        "Date",
+        "Int4",
+        "Int4",
+        "Varchar",
+        "Varchar",
+        "Float8",
+        "Float8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "19c1e3f8162ac1090e9745139eff6c78699dce8a54591b45966b29696c725062"
+}

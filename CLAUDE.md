@@ -85,12 +85,36 @@ This application uses a **dual-database architecture**:
 
 The HotelNew database runs in a Docker container (`newdb` service):
 - **Image**: `postgres:17-alpine` (~100MB image, ~50-100MB RAM idle)
-- **Rust driver**: `sqlx` crate (runtime queries, not compile-time macros)
+- **Rust driver**: `sqlx` crate with `query!()` compile-time macros (offline mode via `.sqlx/` cache)
 - **Data persistence**: Docker volume `newdb_data`
 - **Access**: Internal only (not exposed to host network)
 - **Initialization**: Automatic on first startup (PostgreSQL runs `.sql` files from `/docker-entrypoint-initdb.d/`)
 
 **First-time setup**: Fully automatic. Just run `docker compose up` - PostgreSQL auto-creates the database and runs `init-db/init-hotelnew.sql`.
+
+### SQLx Offline Mode (`.sqlx/` Cache)
+
+The backend uses `sqlx::query!()` compile-time macros for ~76 static SQL queries. These macros verify queries against the PostgreSQL schema at compile time, catching typos and type mismatches before runtime.
+
+**How it works**:
+- `hotel-backend/.sqlx/` contains JSON cache files for each `query!()` call
+- When `SQLX_OFFLINE=true` is set (Docker builds, CI), sqlx reads from this cache instead of connecting to a live database
+- Dynamic queries using `sqlx::query()` (string concatenation) don't need the cache
+
+**MANDATORY**: When modifying any `sqlx::query!()` SQL in the backend:
+1. Ensure a PostgreSQL database is running with the current schema
+2. Set `DATABASE_URL` environment variable (e.g., `postgresql://postgres:REDACTED-pg-2026@localhost:5439/hotelnew`)
+3. Run `scripts/sqlx-prepare.sh` (or manually: `cd hotel-backend && cargo sqlx prepare`)
+4. Commit the updated `.sqlx/` directory
+
+**When to regenerate**:
+- After changing any SQL string inside `query!()`, `query_scalar!()`, or `query_as!()`
+- After schema changes (new columns, renamed tables, type changes)
+- After adding new `query!()` calls
+
+**DECIMAL column handling**:
+- SELECT: Cast to `::float8` for `f64` return (e.g., `r.room_price_weekday::float8`)
+- INSERT/UPDATE parameters: Cast with `$N::float8` so sqlx accepts `f64` and PostgreSQL converts to NUMERIC
 
 ### Legacy Database (192.168.100.222)
 
@@ -127,25 +151,30 @@ All tables in the HotelNew database are owned by this application:
 - `ht_payments` - Payment records
 - `ht_maintenance_categories` - Maintenance categories
 - `ht_maintenance_requests` - Maintenance requests
+- `schema_migrations` - Migration version tracking
 
 ### Database Migrations
 
-**MANDATORY**: When making ANY database schema changes:
+Migrations are **automated** via `scripts/migrate.sh`, which runs during CI/CD deployment.
 
-1. **Create a migration file** in `/migrations/` folder:
-   - Name format: `NNN_description.sql` (e.g., `002_add_customer_notes.sql`)
+**MANDATORY**: When making ANY HotelNew schema changes:
+
+1. **Create a migration file** in `migrations/pg/`:
+   - Name format: `NNN_description.sql` (e.g., `001_add_customer_notes.sql`)
    - Include both UP and DOWN (rollback) migrations
    - Use `IF NOT EXISTS` to make migrations idempotent
 
-2. **Update the migrations README** (`/migrations/README.md`):
-   - Add entry to the migrations table
+2. **Update `init-db/init-hotelnew.sql`** with the same changes (for fresh deployments)
+
+3. **Update the migrations README** (`/migrations/README.md`):
+   - Add entry to the PostgreSQL migrations table
    - Document any new tables in "Tables Owned by This Application"
 
-3. **Never auto-create tables in code** without a corresponding migration file
+4. **Never auto-create tables in code** without a corresponding migration file
 
-4. **Example migration structure** (PostgreSQL):
+5. **Example migration structure** (PostgreSQL):
    ```sql
-   -- Migration: 002_description
+   -- Migration: 001_description
    -- Version: x.x.x
    -- Date: YYYY-MM-DD
 
@@ -155,6 +184,8 @@ All tables in the HotelNew database are owned by this application:
    -- DOWN MIGRATION (commented)
    -- DROP TABLE IF EXISTS ...
    ```
+
+The pipeline will automatically: create a backup, apply pending migrations in transactions, and track them in the `schema_migrations` table. See `migrations/README.md` for details.
 
 ### Timezone Handling
 - SQL Server stores datetime values in **local Thai time (GMT+7)** without timezone information

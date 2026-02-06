@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT guest_id, guest_cin_id, guest_cust_id, guest_firstname, guest_lastname,\n            guest_idcard, guest_passport, guest_nationality, guest_is_primary, guest_created_at\n        FROM ht_guest_registry WHERE guest_cin_id = $1\n        ORDER BY guest_is_primary DESC, guest_id ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "guest_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "guest_cin_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "guest_cust_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "guest_firstname",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "guest_lastname",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "guest_idcard",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "guest_passport",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 7,
+        "name": "guest_nationality",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 8,
+        "name": "guest_is_primary",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 9,
+        "name": "guest_created_at",
+        "type_info": "Timestamp"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "a512298839d597e15bdb5726c4ff702ad9b4e642527e3095f2f97997b81fe406"
+}

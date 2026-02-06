@@ -1,0 +1,44 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT cat_id, cat_name, cat_description, cat_active, cat_created\n        FROM ht_inventory_categories ORDER BY cat_name ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cat_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "cat_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "cat_description",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "cat_active",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 4,
+        "name": "cat_created",
+        "type_info": "Timestamp"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "7a649507625d2db3b7024e405fe0aeb2ee43e912da286e2535d30b636b2cbc48"
+}

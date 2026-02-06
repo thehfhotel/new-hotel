@@ -1,0 +1,88 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                cust_id,\n                cust_firstname,\n                cust_lastname,\n                cust_phone,\n                cust_email,\n                cust_idcard,\n                cust_address,\n                cust_type,\n                cust_notes,\n                cust_active,\n                created_at,\n                updated_at\n            FROM ht_customers\n            WHERE cust_id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cust_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "cust_firstname",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "cust_lastname",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "cust_phone",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "cust_email",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "cust_idcard",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "cust_address",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 7,
+        "name": "cust_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 8,
+        "name": "cust_notes",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "cust_active",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 11,
+        "name": "updated_at",
+        "type_info": "Timestamp"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "e2ad8576844cb6e30f60fe686925b295e7adfedf981557eb0f2b17a00c1ef77a"
+}

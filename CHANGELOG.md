@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.15.0] - 2026-02-07
+
+### Added
+- **Compile-time SQL verification with `sqlx::query!()` macros** — ~76 static SQL queries now verified at compile time against the PostgreSQL schema, catching column name typos, type mismatches, and schema drift before runtime
+  - Dynamic queries (~30) that build SQL with string concatenation remain as `sqlx::query()` runtime queries
+  - `DECIMAL` columns use `::float8` casts for ergonomic `f64` return types
+  - Added `bigdecimal` feature to sqlx for `NUMERIC` parameter binding
+- **`.sqlx/` offline compilation cache** — 76 query cache files enable compilation without a live database connection
+  - `SQLX_OFFLINE=true` environment variable enables offline mode in Docker builds and CI
+  - `scripts/sqlx-prepare.sh` helper script to regenerate the cache after query changes
+- **Backend integration tests** — New `hotel-backend/tests/` directory with database integration tests
+  - `test_schema.rs` — Validates all 18 expected tables exist and `schema_migrations` has baseline row
+  - `test_customers.rs` — Customer CRUD lifecycle and search tests
+  - `test_rooms.rs` — Room CRUD, status updates, and room type association tests
+  - `test_bookings.rs` — Booking creation with room assignments and cancellation
+  - `test_payments.rs` — Payment recording and void (soft delete) tests
+  - `test_stats.rs` — Dashboard statistics query validation
+  - Shared test infrastructure (`tests/common/mod.rs`) with `TEST_` prefix cleanup
+- **CI/CD backend test job** — `test-backend` job runs integration tests against PostgreSQL 17 service before Docker build
+
+### Changed
+- Backend sqlx features updated: added `macros` and `bigdecimal` (was runtime queries only)
+- Dockerfile updated with `SQLX_OFFLINE=true` and `.sqlx/` directory copy for offline compilation
+- Backend version bumped to 2.7.0
+
+### Fixed
+- **Latent SQL bugs caught by compile-time verification**:
+  - `new_bookings.rs` — `br_total_price` column reference that doesn't exist in `ht_booking_rooms`
+  - Various type mismatches between `Option<T>` struct fields and NOT NULL database columns
+
+## [2.14.0] - 2026-02-07
+
+### Added
+- **Automated PostgreSQL migration system** — Schema changes are now automatically applied during CI/CD deployment
+  - `scripts/migrate.sh` — Migration runner that applies pending `migrations/pg/*.sql` files
+  - `scripts/backup-db.sh` — Manual database backup utility
+  - `schema_migrations` table tracks applied migrations with version, filename, checksum, and timestamp
+  - Pre-migration `pg_dump` backups created automatically (keeps last 10)
+  - Each migration runs in a transaction — rolls back on failure
+  - Backup pruning to prevent disk bloat
+  - `migrations/pg/000_baseline.sql` — Baseline marker for initial schema
+- **CI/CD pipeline integration** — Deploy job now copies migration files, runs `migrate.sh` after DB health check, and restarts backend
+- **Path filter expansion** — Pipeline triggers on changes to `migrations/pg/**` and `scripts/migrate.sh`
+
 ## [2.13.1] - 2026-02-07
 
 ### Fixed

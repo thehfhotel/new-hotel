@@ -474,5 +474,22 @@ CREATE SEQUENCE IF NOT EXISTS sq_maintenance_no
     INCREMENT BY 1;
 
 -- =============================================================================
+-- Schema Migration Tracking
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    id SERIAL PRIMARY KEY,
+    version VARCHAR(10) NOT NULL UNIQUE,
+    filename VARCHAR(255) NOT NULL,
+    checksum VARCHAR(64),
+    applied_at TIMESTAMP DEFAULT NOW(),
+    applied_by VARCHAR(100) DEFAULT 'init-script'
+);
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('000', '000_baseline.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
 -- Initialization complete
 -- =============================================================================

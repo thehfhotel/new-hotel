@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE ht_bookings SET book_status = 'checkedin', updated_at = NOW() WHERE book_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "058f0c8fb858a88b7fc08dccc493c55f912aa9a552102bdb2d3b462e844e1b28"
+}

@@ -1,0 +1,100 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            r.room_id, r.room_no, r.room_type_id, rt.type_name as \"type_name?\",\n            r.room_floor, r.room_status, r.room_clean, r.room_maintenance,\n            r.room_price_weekday::float8 as \"room_price_weekday?\",\n            r.room_price_weekend::float8 as \"room_price_weekend?\",\n            r.room_price_special::float8 as \"room_price_special?\",\n            r.room_notes, r.created_at, r.updated_at\n        FROM ht_rooms_new r\n        LEFT JOIN ht_room_types rt ON r.room_type_id = rt.type_id\n        WHERE r.room_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "room_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "room_no",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "room_type_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "type_name?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "room_floor",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "room_status",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "room_clean",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 7,
+        "name": "room_maintenance",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 8,
+        "name": "room_price_weekday?",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 9,
+        "name": "room_price_weekend?",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 10,
+        "name": "room_price_special?",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 11,
+        "name": "room_notes",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 12,
+        "name": "created_at",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 13,
+        "name": "updated_at",
+        "type_info": "Timestamp"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      null,
+      null,
+      null,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "c7f680bbb7884dbd3cd8ca311336ff82959442670f64aa4548608f95925d81bd"
+}

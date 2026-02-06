@@ -10,9 +10,9 @@ use axum::{
     extract::{Path, Query, State},
     Json,
 };
-use chrono::NaiveDateTime;
+use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
+use sqlx::Row; // Needed for dynamic queries in list_bookings
 
 use super::mode::AppState;
 use crate::error::{ApiError, ApiResult};
@@ -324,88 +324,80 @@ pub async fn get_booking(
     let pool = &state.new_pool;
 
     // Get booking
-    let booking_rows = sqlx::query(
-            r#"
-            SELECT
-                b.book_id,
-                b.book_no,
-                b.book_cust_id,
-                CONCAT(c.cust_firstname, ' ', COALESCE(c.cust_lastname, '')) as customer_name,
-                b.book_checkin,
-                b.book_checkout,
-                b.book_nights,
-                b.book_adults,
-                b.book_children,
-                b.book_status,
-                b.book_source,
-                b.book_total_amount,
-                b.book_deposit_amount,
-                b.book_notes,
-                b.created_at,
-                b.updated_at
-            FROM ht_bookings b
-            LEFT JOIN ht_customers c ON b.book_cust_id = c.cust_id
-            WHERE b.book_id = $1
-            "#,
-        )
-        .bind(&book_id)
-        .fetch_all(pool)
-        .await?;
-
-    let booking_row = booking_rows
-        .first()
-        .ok_or_else(|| ApiError::NotFound("Booking not found".to_string()))?;
+    let rec = sqlx::query!(
+        r#"SELECT
+            b.book_id,
+            b.book_no,
+            b.book_cust_id,
+            CONCAT(c.cust_firstname, ' ', COALESCE(c.cust_lastname, '')) as customer_name,
+            b.book_checkin,
+            b.book_checkout,
+            b.book_nights,
+            b.book_adults,
+            b.book_children,
+            b.book_status,
+            b.book_source,
+            b.book_total_amount::float8 as book_total_amount,
+            b.book_deposit_amount::float8 as book_deposit_amount,
+            b.book_notes,
+            b.created_at,
+            b.updated_at
+        FROM ht_bookings b
+        LEFT JOIN ht_customers c ON b.book_cust_id = c.cust_id
+        WHERE b.book_id = $1"#,
+        book_id
+    )
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Booking not found".to_string()))?;
 
     // Get booking rooms
-    let room_rows = sqlx::query(
-            r#"
-            SELECT
-                br.br_id,
-                br.br_room_id,
-                r.room_no,
-                rt.type_name,
-                br.br_price_per_night,
-                br.br_total_price
-            FROM ht_booking_rooms br
-            LEFT JOIN ht_rooms_new r ON br.br_room_id = r.room_id
-            LEFT JOIN ht_room_types rt ON r.room_type_id = rt.type_id
-            WHERE br.br_book_id = $1
-            "#,
-        )
-        .bind(&book_id)
-        .fetch_all(pool)
-        .await?;
+    let room_rows = sqlx::query!(
+        r#"SELECT
+            br.br_id,
+            br.br_room_id,
+            r.room_no,
+            rt.type_name,
+            br.br_price_per_night::float8 as br_price_per_night
+        FROM ht_booking_rooms br
+        LEFT JOIN ht_rooms_new r ON br.br_room_id = r.room_id
+        LEFT JOIN ht_room_types rt ON r.room_type_id = rt.type_id
+        WHERE br.br_book_id = $1"#,
+        book_id
+    )
+    .fetch_all(pool)
+    .await?;
 
     let rooms: Vec<NewBookingRoom> = room_rows
         .iter()
-        .map(|row| NewBookingRoom {
-            id: row.try_get::<i32, _>("br_id").unwrap_or(0),
-            room_id: row.try_get::<i32, _>("br_room_id").unwrap_or(0),
-            room_no: row.try_get::<String, _>("room_no").ok(),
-            room_type_name: row.try_get::<String, _>("type_name").ok(),
-            price_per_night: row.try_get::<f64, _>("br_price_per_night").ok(),
-            total_price: row.try_get::<f64, _>("br_total_price").ok(),
+        .map(|r| NewBookingRoom {
+            id: r.br_id,
+            room_id: r.br_room_id,
+            room_no: Some(r.room_no.clone()),
+            room_type_name: Some(r.type_name.clone()),
+            price_per_night: r.br_price_per_night,
+            total_price: None,
         })
         .collect();
 
     let booking = NewBooking {
-        id: booking_row.try_get::<i32, _>("book_id").unwrap_or(0),
-        book_no: booking_row.try_get::<String, _>("book_no").unwrap_or_default(),
-        customer_id: booking_row.try_get::<i32, _>("book_cust_id").unwrap_or(0),
-        customer_name: booking_row.try_get::<String, _>("customer_name").ok(),
-        check_in: booking_row.try_get::<NaiveDateTime, _>("book_checkin").ok(),
-        check_out: booking_row.try_get::<NaiveDateTime, _>("book_checkout").ok(),
-        nights: booking_row.try_get::<i32, _>("book_nights").ok(),
-        adults: booking_row.try_get::<i32, _>("book_adults").ok(),
-        children: booking_row.try_get::<i32, _>("book_children").ok(),
-        status: booking_row.try_get::<String, _>("book_status").unwrap_or_else(|_| "pending".to_string()),
-        source: booking_row.try_get::<String, _>("book_source").ok(),
-        total_amount: booking_row.try_get::<f64, _>("book_total_amount").ok(),
-        deposit_amount: booking_row.try_get::<f64, _>("book_deposit_amount").ok(),
-        notes: booking_row.try_get::<String, _>("book_notes").ok(),
+        id: rec.book_id,
+        book_no: rec.book_no,
+        customer_id: rec.book_cust_id,
+        customer_name: rec.customer_name,
+        check_in: Some(rec.book_checkin.and_hms_opt(0, 0, 0).unwrap()),
+        check_out: Some(rec.book_checkout.and_hms_opt(0, 0, 0).unwrap()),
+        nights: rec.book_nights,
+        adults: rec.book_adults,
+        children: rec.book_children,
+        status: rec.book_status.unwrap_or_else(|| "pending".to_string()),
+        source: rec.book_source,
+        total_amount: rec.book_total_amount,
+        deposit_amount: rec.book_deposit_amount,
+        notes: rec.book_notes,
         room_count: rooms.len(),
-        created_at: booking_row.try_get::<NaiveDateTime, _>("created_at").ok(),
-        updated_at: booking_row.try_get::<NaiveDateTime, _>("updated_at").ok(),
+        created_at: rec.created_at,
+        updated_at: rec.updated_at,
     };
 
     Ok(Json(NewBookingResponse {
@@ -426,27 +418,18 @@ pub async fn create_booking(
     let pool = &state.new_pool;
 
     // Generate booking number (YYYYMMDD-NNNN format)
-    let book_no_rows = sqlx::query(
-            r#"
-            SELECT book_no
-            FROM ht_bookings
-            WHERE book_no LIKE TO_CHAR(NOW(), 'YYYYMMDD') || '-%'
-            ORDER BY book_no DESC
-            LIMIT 1
-            "#,
-        )
-        .fetch_all(pool)
-        .await?;
+    let last_rec = sqlx::query!(
+        r#"SELECT book_no FROM ht_bookings
+        WHERE book_no LIKE TO_CHAR(NOW(), 'YYYYMMDD') || '-%'
+        ORDER BY book_no DESC LIMIT 1"#
+    )
+    .fetch_optional(pool)
+    .await?;
 
-    let next_seq = if let Some(row) = book_no_rows.first() {
-        if let Some(last_no) = row.try_get::<String, _>("book_no").ok() {
-            // Extract sequence number and increment
-            let parts: Vec<&str> = last_no.split('-').collect();
-            if parts.len() == 2 {
-                parts[1].parse::<i32>().unwrap_or(0) + 1
-            } else {
-                1
-            }
+    let next_seq = if let Some(rec) = last_rec {
+        let parts: Vec<&str> = rec.book_no.split('-').collect();
+        if parts.len() == 2 {
+            parts[1].parse::<i32>().unwrap_or(0) + 1
         } else {
             1
         }
@@ -455,14 +438,13 @@ pub async fn create_booking(
     };
 
     // Get current date in YYYYMMDD format
-    let date_rows = sqlx::query("SELECT TO_CHAR(NOW(), 'YYYYMMDD') as today")
-        .fetch_all(pool)
-        .await?;
+    let date_rec = sqlx::query!(
+        "SELECT TO_CHAR(NOW(), 'YYYYMMDD') as today"
+    )
+    .fetch_one(pool)
+    .await?;
 
-    let today = date_rows
-        .first()
-        .map(|r| r.try_get::<String, _>("today").unwrap_or_else(|_| "00000000".to_string()))
-        .unwrap_or_else(|| "00000000".to_string());
+    let today = date_rec.today.unwrap_or_else(|| "00000000".to_string());
 
     let book_no = format!("{}-{:04}", today, next_seq);
 
@@ -470,56 +452,42 @@ pub async fn create_booking(
     let adults = body.adults.unwrap_or(1);
     let children = body.children.unwrap_or(0);
 
-    // Insert booking
-    let booking_rows = sqlx::query(
-            r#"
-            INSERT INTO ht_bookings (
-                book_no,
-                book_cust_id,
-                book_checkin,
-                book_checkout,
-                book_adults,
-                book_children,
-                book_status,
-                book_source,
-                book_total_amount,
-                book_deposit_amount,
-                book_notes
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            RETURNING book_id
-            "#,
-        )
-        .bind(&book_no.as_str())
-        .bind(&body.customer_id)
-        .bind(&body.check_in.as_str())
-        .bind(&body.check_out.as_str())
-        .bind(&adults)
-        .bind(&children)
-        .bind(&status)
-        .bind(&body.source.as_deref())
-        .bind(&body.total_amount)
-        .bind(&body.deposit_amount)
-        .bind(&body.notes.as_deref())
-        .fetch_all(pool)
-        .await?;
+    // Parse date strings to NaiveDate
+    let check_in_date = NaiveDate::parse_from_str(&body.check_in, "%Y-%m-%d")
+        .map_err(|_| ApiError::BadRequest("Invalid check-in date format (expected YYYY-MM-DD)".to_string()))?;
+    let check_out_date = NaiveDate::parse_from_str(&body.check_out, "%Y-%m-%d")
+        .map_err(|_| ApiError::BadRequest("Invalid check-out date format (expected YYYY-MM-DD)".to_string()))?;
 
-    let book_id = booking_rows
-        .first()
-        .and_then(|r| r.try_get::<i32, _>("book_id").ok())
-        .ok_or_else(|| ApiError::Internal("Failed to create booking".to_string()))?;
+    // Insert booking
+    let rec = sqlx::query!(
+        r#"INSERT INTO ht_bookings (book_no, book_cust_id, book_checkin, book_checkout, book_adults, book_children, book_status, book_source, book_total_amount, book_deposit_amount, book_notes)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::float8, $10::float8, $11)
+        RETURNING book_id"#,
+        book_no.as_str(),
+        body.customer_id,
+        check_in_date,
+        check_out_date,
+        adults,
+        children,
+        status,
+        body.source.as_deref(),
+        body.total_amount,
+        body.deposit_amount,
+        body.notes.as_deref()
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let book_id = rec.book_id;
 
     // Insert booking rooms
     for room in &body.rooms {
-        sqlx::query(
-            r#"
-            INSERT INTO ht_booking_rooms (br_book_id, br_room_id, br_price_per_night)
-            VALUES ($1, $2, $3)
-            "#,
+        sqlx::query!(
+            r#"INSERT INTO ht_booking_rooms (br_book_id, br_room_id, br_price_per_night) VALUES ($1, $2, $3::float8)"#,
+            book_id,
+            room.room_id,
+            room.price_per_night
         )
-        .bind(&book_id)
-        .bind(&room.room_id)
-        .bind(&room.price_per_night)
         .execute(pool)
         .await?;
     }
@@ -545,72 +513,60 @@ pub async fn update_booking(
     let pool = &state.new_pool;
 
     // Check if booking exists
-    let check_rows = sqlx::query(
-            "SELECT book_no FROM ht_bookings WHERE book_id = $1",
-        )
-        .bind(&book_id)
-        .fetch_all(pool)
-        .await?;
+    let rec = sqlx::query!(
+        "SELECT book_no FROM ht_bookings WHERE book_id = $1",
+        book_id
+    )
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Booking not found".to_string()))?;
 
-    let book_no = check_rows
-        .first()
-        .and_then(|r| r.try_get::<String, _>("book_no").ok())
-        .ok_or_else(|| ApiError::NotFound("Booking not found".to_string()))?;
+    let book_no = rec.book_no;
 
     let status = body.status.as_deref().unwrap_or("pending");
     let adults = body.adults.unwrap_or(1);
     let children = body.children.unwrap_or(0);
 
+    // Parse date strings to NaiveDate
+    let check_in_date = NaiveDate::parse_from_str(&body.check_in, "%Y-%m-%d")
+        .map_err(|_| ApiError::BadRequest("Invalid check-in date format (expected YYYY-MM-DD)".to_string()))?;
+    let check_out_date = NaiveDate::parse_from_str(&body.check_out, "%Y-%m-%d")
+        .map_err(|_| ApiError::BadRequest("Invalid check-out date format (expected YYYY-MM-DD)".to_string()))?;
+
     // Update booking
-    sqlx::query(
-        r#"
-        UPDATE ht_bookings
-        SET book_cust_id = $1,
-            book_checkin = $2,
-            book_checkout = $3,
-            book_adults = $4,
-            book_children = $5,
-            book_status = $6,
-            book_source = $7,
-            book_total_amount = $8,
-            book_deposit_amount = $9,
-            book_notes = $10,
-            updated_at = NOW()
-        WHERE book_id = $11
-        "#,
+    sqlx::query!(
+        r#"UPDATE ht_bookings SET book_cust_id = $1, book_checkin = $2, book_checkout = $3, book_adults = $4, book_children = $5, book_status = $6, book_source = $7, book_total_amount = $8::float8, book_deposit_amount = $9::float8, book_notes = $10, updated_at = NOW()
+        WHERE book_id = $11"#,
+        body.customer_id,
+        check_in_date,
+        check_out_date,
+        adults,
+        children,
+        status,
+        body.source.as_deref(),
+        body.total_amount,
+        body.deposit_amount,
+        body.notes.as_deref(),
+        book_id
     )
-    .bind(&body.customer_id)
-    .bind(&body.check_in.as_str())
-    .bind(&body.check_out.as_str())
-    .bind(&adults)
-    .bind(&children)
-    .bind(&status)
-    .bind(&body.source.as_deref())
-    .bind(&body.total_amount)
-    .bind(&body.deposit_amount)
-    .bind(&body.notes.as_deref())
-    .bind(&book_id)
     .execute(pool)
     .await?;
 
     // Delete existing booking rooms and insert new ones
-    sqlx::query(
+    sqlx::query!(
         "DELETE FROM ht_booking_rooms WHERE br_book_id = $1",
+        book_id
     )
-    .bind(&book_id)
     .execute(pool)
     .await?;
 
     for room in &body.rooms {
-        sqlx::query(
-            r#"
-            INSERT INTO ht_booking_rooms (br_book_id, br_room_id, br_price_per_night)
-            VALUES ($1, $2, $3)
-            "#,
+        sqlx::query!(
+            r#"INSERT INTO ht_booking_rooms (br_book_id, br_room_id, br_price_per_night) VALUES ($1, $2, $3::float8)"#,
+            book_id,
+            room.room_id,
+            room.price_per_night
         )
-        .bind(&book_id)
-        .bind(&room.room_id)
-        .bind(&room.price_per_night)
         .execute(pool)
         .await?;
     }
@@ -630,17 +586,13 @@ pub async fn cancel_booking(
 ) -> ApiResult<Json<MutationResponse>> {
     let pool = &state.new_pool;
 
-    let result = sqlx::query(
-            r#"
-            UPDATE ht_bookings
-            SET book_status = 'cancelled',
-                updated_at = NOW()
-            WHERE book_id = $1 AND book_status NOT IN ('completed', 'cancelled')
-            "#,
-        )
-        .bind(&book_id)
-        .execute(pool)
-        .await?;
+    let result = sqlx::query!(
+        r#"UPDATE ht_bookings SET book_status = 'cancelled', updated_at = NOW()
+        WHERE book_id = $1 AND book_status NOT IN ('completed', 'cancelled')"#,
+        book_id
+    )
+    .execute(pool)
+    .await?;
 
     if result.rows_affected() == 0 {
         return Err(ApiError::BadRequest("Booking not found or cannot be cancelled".to_string()));

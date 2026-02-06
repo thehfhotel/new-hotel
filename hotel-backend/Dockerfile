@@ -3,6 +3,9 @@ FROM rust:1.85-bookworm AS builder
 
 WORKDIR /usr/src/app
 
+# Enable sqlx offline mode (uses .sqlx/ cache instead of live DB)
+ENV SQLX_OFFLINE=true
+
 # Copy the Cargo files first to cache dependencies
 COPY Cargo.toml Cargo.lock* ./
 
@@ -11,7 +14,8 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs
 RUN cargo build --release
 RUN rm -rf src
 
-# Copy the actual source code
+# Copy the sqlx offline cache and actual source code
+COPY .sqlx .sqlx
 COPY src ./src
 
 # Build the application

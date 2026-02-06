@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT pay_id, pay_voided FROM ht_payments WHERE pay_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "pay_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "pay_voided",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "ec97d5fc044e92dd8b6fc4b1be6a69d7d6af75315976ddf438e9ccc302890d18"
+}

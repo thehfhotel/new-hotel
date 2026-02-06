@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            br.br_id,\n            br.br_room_id,\n            r.room_no,\n            rt.type_name,\n            br.br_price_per_night::float8 as br_price_per_night\n        FROM ht_booking_rooms br\n        LEFT JOIN ht_rooms_new r ON br.br_room_id = r.room_id\n        LEFT JOIN ht_room_types rt ON r.room_type_id = rt.type_id\n        WHERE br.br_book_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "br_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "br_room_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "room_no",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "type_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "br_price_per_night",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "c54635bd535dea5c7da709f714c0ed311bbe7c28cf4deef954fa82faa302e65d"
+}

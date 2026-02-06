@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE ht_rooms_new SET room_status = 'occupied', updated_at = NOW() WHERE room_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0b1ab842a27d5aa01bf8c577bf3940c295f8249be546fa4f3cebe486934507ca"
+}

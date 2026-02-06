@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE ht_inventory_items SET item_active = false, item_updated = NOW() WHERE item_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "575fd0e427b83dc4d997cab03a84497a3e0fde4b0077a2418d35a58a8dcf5394"
+}

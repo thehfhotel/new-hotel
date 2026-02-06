@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT cin_id, cin_total_amount::float8 as cin_total_amount, cin_rate_per_night::float8 as cin_rate_per_night,\n            (COALESCE(cin_checkout_time, cin_expected_checkout)::date - cin_checkin_time::date) as nights\n        FROM ht_checkins WHERE cin_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cin_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "cin_total_amount",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 2,
+        "name": "cin_rate_per_night",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 3,
+        "name": "nights",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "7d5bd80595de55d41e02e82bbc2819b4b82aa7234ee93017320b0140232c7cef"
+}

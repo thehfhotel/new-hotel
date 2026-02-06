@@ -1,0 +1,88 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT i.item_id, i.item_code, i.item_name, i.item_category_id, c.cat_name,\n            i.item_unit, i.item_min_stock, i.item_current_stock,\n            i.item_cost::float8 as item_cost, i.item_active, i.item_created, i.item_updated\n        FROM ht_inventory_items i\n        LEFT JOIN ht_inventory_categories c ON i.item_category_id = c.cat_id\n        WHERE i.item_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "item_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "item_code",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "item_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "item_category_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "cat_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "item_unit",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "item_min_stock",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "item_current_stock",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "item_cost",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 9,
+        "name": "item_active",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 10,
+        "name": "item_created",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 11,
+        "name": "item_updated",
+        "type_info": "Timestamp"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true,
+      null,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "15b4c2ef62fb221ce4fe400fcd1216db789bfceff305252b9b744301a2ac575d"
+}

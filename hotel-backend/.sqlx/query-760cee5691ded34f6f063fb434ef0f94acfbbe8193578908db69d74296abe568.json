@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE ht_inventory_items SET item_current_stock = $1, item_updated = NOW() WHERE item_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "760cee5691ded34f6f063fb434ef0f94acfbbe8193578908db69d74296abe568"
+}

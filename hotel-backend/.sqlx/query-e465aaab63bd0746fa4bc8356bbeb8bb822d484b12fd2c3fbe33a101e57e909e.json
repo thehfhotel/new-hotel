@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT TO_CHAR(NOW(), 'YYYYMMDD') as today",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "today",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "e465aaab63bd0746fa4bc8356bbeb8bb822d484b12fd2c3fbe33a101e57e909e"
+}
