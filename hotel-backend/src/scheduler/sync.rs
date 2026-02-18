@@ -274,7 +274,7 @@ async fn sync_rooms(
         let room_price_c = row.get::<f64, _>("Room_PriceC");
         let room_group = row.get::<&str, _>("Room_Group").map(String::from);
         let room_book_name = row.get::<&str, _>("Room_Book_Name").map(String::from);
-        let room_book_time = row.get::<NaiveDateTime, _>("Room_Book_Time");
+        let room_book_time: Option<NaiveDateTime> = row.try_get("Room_Book_Time").unwrap_or(None);
 
         let hash_input = format!(
             "{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{}|{}|{:?}",
