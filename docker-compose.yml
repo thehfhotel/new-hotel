@@ -55,6 +55,7 @@ services:
       - NEW_DB_PASSWORD=***REMOVED***
       # System mode: 'legacy' or 'new' (controls which database is primary)
       - SYSTEM_MODE=new
+      - LEGACY_READ_SOURCE=sqlserver
       - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
       - SLACK_NOTIFICATIONS_ENABLED=true
       - HOST=0.0.0.0
