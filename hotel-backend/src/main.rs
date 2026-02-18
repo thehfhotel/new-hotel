@@ -141,8 +141,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Initialize scheduler for background jobs (only if legacy pool is available)
+    // Pass PgPool if available for legacy-to-PG sync job
     if let Some(ref pool) = legacy_pool {
-        if let Err(e) = init_scheduler(pool.clone(), config.slack.clone()).await {
+        let pg_for_scheduler = match &final_app_state {
+            Some(state) => Some(state.new_pool.clone()),
+            None => new_pool_for_newonly.as_ref().map(|p| p.clone()),
+        };
+        if let Err(e) = init_scheduler(pool.clone(), pg_for_scheduler, config.slack.clone()).await {
             tracing::warn!("Failed to initialize scheduler: {}", e);
         }
     } else {
@@ -155,41 +160,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    // Build legacy routes (use legacy_pool as state) - READ-ONLY
-    let legacy_routes = if let Some(pool) = legacy_pool.clone() {
-        Router::new()
-            // Rooms routes
-            .route("/api/rooms", get(routes::rooms::list_rooms))
-            .route("/api/rooms/status", get(routes::rooms::get_room_status))
-            .route(
-                "/api/rooms/checkouts-today",
-                get(routes::rooms::get_checkouts_today),
-            )
-            .route("/api/rooms/:id", get(routes::rooms::get_room))
-            // Bookings list route (read-only from legacy)
-            .route("/api/bookings", get(routes::bookings::list_bookings))
-            // Check-ins routes
-            .route("/api/checkins", get(routes::checkins::list_checkins))
-            // Customers routes
-            .route("/api/customers", get(routes::customers::list_customers))
-            .route(
-                "/api/customers/:id/bookings",
-                get(routes::customers::get_customer_bookings),
-            )
-            .route(
-                "/api/customers/:id/stats",
-                get(routes::customers::get_customer_stats),
-            )
-            // Stats and occupancy routes
-            .route("/api/stats", get(routes::stats::get_stats))
-            .route("/api/occupancy", get(routes::occupancy::get_occupancy))
-            .with_state(pool)
-    } else {
-        tracing::warn!("Legacy routes disabled (no legacy database connection)");
-        Router::new()
-    };
-
-    // Build new routes (use AppState for dual-database access)
+    // Build all routes (use AppState for dual-database access)
+    // Legacy-read routes (rooms, bookings, customers, stats) use LEGACY_READ_SOURCE feature flag
     let new_routes = if let Some(ref app_state) = final_app_state {
         build_new_routes(app_state.clone())
     } else if let Some(pg_pool) = new_pool_for_newonly {
@@ -211,7 +183,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Merge all routes
     let app = Router::new()
-        .merge(legacy_routes)
         .merge(new_routes)
         .layer(cors)
         .layer(TraceLayer::new_for_http());
@@ -236,7 +207,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Build the new routes router with AppState
 fn build_new_routes(app_state: AppState) -> Router {
     Router::new()
-        // Legacy booking routes that need AppState (for notes in HotelNew DB)
+        // Rooms routes (reads from PG by default, SQL Server if LEGACY_READ_SOURCE=sqlserver)
+        .route("/api/rooms", get(routes::rooms::list_rooms))
+        .route("/api/rooms/status", get(routes::rooms::get_room_status))
+        .route("/api/rooms/checkouts-today", get(routes::rooms::get_checkouts_today))
+        .route("/api/rooms/:id", get(routes::rooms::get_room))
+        // Legacy booking routes (reads from PG by default, SQL Server if LEGACY_READ_SOURCE=sqlserver)
+        .route("/api/bookings", get(routes::bookings::list_bookings))
         .route("/api/bookings/:id", get(routes::bookings::get_booking))
         .route(
             "/api/bookings/:id/notes",
@@ -244,6 +221,16 @@ fn build_new_routes(app_state: AppState) -> Router {
                 .post(routes::bookings::create_note)
                 .delete(routes::bookings::delete_note),
         )
+        // Check-ins route (reads from PG by default, SQL Server if LEGACY_READ_SOURCE=sqlserver)
+        .route("/api/checkins", get(routes::checkins::list_checkins))
+        // Legacy customers routes (reads from PG by default, SQL Server if LEGACY_READ_SOURCE=sqlserver)
+        .route("/api/customers", get(routes::customers::list_customers))
+        .route("/api/customers/:id/bookings", get(routes::customers::get_customer_bookings))
+        .route("/api/customers/:id/stats", get(routes::customers::get_customer_stats))
+        // Stats route (reads from PG by default, SQL Server if LEGACY_READ_SOURCE=sqlserver)
+        .route("/api/stats", get(routes::stats::get_stats))
+        // Occupancy route (reads from PG by default, SQL Server if LEGACY_READ_SOURCE=sqlserver)
+        .route("/api/occupancy", get(routes::occupancy::get_occupancy))
         // Mode and calendar routes
         .route("/api/mode", get(routes::mode::get_mode))
         .route("/api/calendar", get(routes::calendar::get_calendar))
@@ -295,5 +282,7 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route("/api/new/maintenance/requests", get(routes::new_maintenance::list_requests).post(routes::new_maintenance::create_request))
         .route("/api/new/maintenance/requests/:id", get(routes::new_maintenance::get_request).put(routes::new_maintenance::update_request))
         .route("/api/new/maintenance/requests/:id/status", put(routes::new_maintenance::update_request_status))
+        // Sync status
+        .route("/api/new/sync/status", get(routes::new_sync::get_sync_status))
         .with_state(app_state)
 }

@@ -106,6 +106,7 @@ These are automatically applied by `scripts/migrate.sh` during deployment.
 | Version | File | Description | Since |
 |---------|------|-------------|-------|
 | 000 | `000_baseline.sql` | Baseline marker for initial schema from `init-hotelnew.sql` | v2.14.0 |
+| 008 | `008_legacy_sync_tables.sql` | Legacy sync staging tables + sync_status + source columns | v2.16.0 |
 
 ## Tables Owned by This Application
 
@@ -139,6 +140,11 @@ All table and column names are **lowercase** (PostgreSQL convention). The canoni
 | `ht_maintenance_categories` | Maintenance categories (Electrical, Plumbing, AC, Furniture, General) | v2.11.0 |
 | `ht_maintenance_requests` | Maintenance request records with status tracking | v2.11.0 |
 | `schema_migrations` | Migration version tracking (applied by migrate.sh) | v2.14.0 |
+| `ht_rooms_legacy` | Legacy rooms mirror (synced from HT_Rooms) | v2.16.0 |
+| `ht_bookings_legacy` | Legacy bookings mirror (synced from View_Booking_Ds) | v2.16.0 |
+| `ht_checkins_legacy` | Legacy check-ins mirror (synced from View_CheckIn_Ds) | v2.16.0 |
+| `ht_customers_legacy` | Legacy customers mirror (synced from View_Customers) | v2.16.0 |
+| `sync_status` | Background sync health tracking per entity type | v2.16.0 |
 
 ## Tables Used (Read-Only or Shared)
 

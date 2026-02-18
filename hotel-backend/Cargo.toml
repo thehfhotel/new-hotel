@@ -5,6 +5,14 @@ edition = "2021"
 description = "Hotel Management System Backend API"
 authors = [""]
 
+[[bin]]
+name = "hotel-backend"
+path = "src/main.rs"
+
+[[bin]]
+name = "migrate_legacy"
+path = "src/bin/migrate_legacy.rs"
+
 [dependencies]
 # Web framework (matches Tauri middleware)
 axum = "0.7"
@@ -39,6 +47,9 @@ thiserror = "1"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# Hashing (SHA256 for sync change detection)
+sha2 = "0.10"
 
 # Config
 dotenvy = "0.15"
