@@ -100,17 +100,17 @@ export default function Sidebar() {
 
   return (
     <aside
-      className={`fixed top-0 left-0 h-screen bg-zinc-900 border-r border-zinc-800 z-40 flex flex-col transition-all duration-300 ${
+      className={`fixed top-0 left-0 h-screen bg-white border-r border-gray-200 z-40 flex flex-col transition-all duration-300 ${
         !mounted ? 'opacity-0' : 'opacity-100'
       }`}
       style={{ width }}
     >
       {/* Logo */}
-      <div className="flex items-center gap-2 px-3 h-16 border-b border-zinc-800 shrink-0">
+      <div className="flex items-center gap-2 px-3 h-16 border-b border-gray-200 shrink-0">
         <Hotel size={28} className="text-red-500 shrink-0" />
         {!collapsed && (
           <div className="overflow-hidden whitespace-nowrap">
-            <span className="text-lg font-bold text-white tracking-tight">ระบบจัดการโรงแรม</span>
+            <span className="text-lg font-bold text-gray-900 tracking-tight">ระบบจัดการโรงแรม</span>
             <span className="ml-2 text-[10px] font-semibold bg-red-600 text-white px-1.5 py-0.5 rounded tracking-wider uppercase">
               New
             </span>
@@ -123,7 +123,7 @@ export default function Sidebar() {
         {sections.map((section, idx) => (
           <div key={section.title} className={idx > 0 ? 'mt-6' : ''}>
             {!collapsed && (
-              <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold px-3 mb-1">
+              <div className="text-[10px] uppercase tracking-wider text-gray-500 font-semibold px-3 mb-1">
                 {section.title}
               </div>
             )}
@@ -135,8 +135,8 @@ export default function Sidebar() {
                   title={collapsed ? item.label : undefined}
                   className={`flex items-center gap-3 px-3 py-2 rounded-lg transition-colors text-sm ${
                     isActive(item.href)
-                      ? 'bg-red-600/15 text-red-400 border-l-2 border-red-500'
-                      : 'text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200'
+                      ? 'bg-red-600/15 text-red-600 border-l-2 border-red-500'
+                      : 'text-gray-500 hover:bg-gray-100 hover:text-gray-900'
                   } ${collapsed ? 'justify-center' : ''}`}
                 >
                   <span className="shrink-0">{item.icon}</span>
@@ -149,11 +149,11 @@ export default function Sidebar() {
       </nav>
 
       {/* Bottom */}
-      <div className="border-t border-zinc-800 p-2 shrink-0 space-y-1">
+      <div className="border-t border-gray-200 p-2 shrink-0 space-y-1">
         <Link
           href="/"
           title={collapsed ? 'Legacy' : undefined}
-          className={`flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 transition-colors ${
+          className={`flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-gray-500 hover:bg-gray-100 hover:text-gray-900 transition-colors ${
             collapsed ? 'justify-center' : ''
           }`}
         >
@@ -162,7 +162,7 @@ export default function Sidebar() {
         </Link>
         <button
           onClick={toggleCollapse}
-          className={`flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 transition-colors w-full ${
+          className={`flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-gray-500 hover:bg-gray-100 hover:text-gray-900 transition-colors w-full ${
             collapsed ? 'justify-center' : ''
           }`}
         >

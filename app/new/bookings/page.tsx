@@ -77,8 +77,8 @@ const statusColors: Record<string, string> = {
   pending: 'bg-yellow-500/10 text-yellow-400',
   confirmed: 'bg-sky-500/10 text-sky-400',
   checkedin: 'bg-emerald-500/10 text-emerald-400',
-  completed: 'bg-zinc-700 text-zinc-300',
-  cancelled: 'bg-red-500/10 text-red-400',
+  completed: 'bg-gray-200 text-gray-700',
+  cancelled: 'bg-red-500/10 text-red-600',
   noshow: 'bg-violet-500/10 text-violet-400',
 }
 
@@ -313,8 +313,8 @@ export default function NewBookingsPage() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-zinc-100">การจอง (New Mode)</h1>
-          <p className="text-sm text-zinc-500 mt-1">
+          <h1 className="text-2xl font-bold text-gray-900">การจอง (New Mode)</h1>
+          <p className="text-sm text-gray-500 mt-1">
             {totalItems.toLocaleString()} รายการ
           </p>
         </div>
@@ -322,7 +322,7 @@ export default function NewBookingsPage() {
           <button
             onClick={fetchBookings}
             disabled={loading}
-            className="flex items-center space-x-2 px-4 py-2 border border-zinc-700 text-zinc-300 rounded-lg hover:bg-zinc-800 disabled:opacity-50"
+            className="flex items-center space-x-2 px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-100 disabled:opacity-50"
           >
             <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
             <span className="hidden sm:inline">รีเฟรช</span>
@@ -338,27 +338,27 @@ export default function NewBookingsPage() {
       </div>
 
       {/* Filters */}
-      <div className="bg-zinc-900 rounded-lg border border-zinc-800 p-4">
+      <div className="bg-white rounded-lg border border-gray-200 p-4">
         <div className="flex items-center space-x-2 mb-4">
-          <Filter className="h-5 w-5 text-zinc-500" />
-          <span className="font-medium text-zinc-300">ตัวกรอง</span>
+          <Filter className="h-5 w-5 text-gray-500" />
+          <span className="font-medium text-gray-700">ตัวกรอง</span>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
           {/* Search */}
           <div className="relative">
-            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-zinc-500" />
+            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-gray-500" />
             <input
               type="text"
               placeholder="ค้นหาเลขจอง/ชื่อลูกค้า..."
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
-              className="w-full pl-10 pr-4 py-2 bg-zinc-900 text-zinc-200 border border-zinc-700 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500"
+              className="w-full pl-10 pr-4 py-2 bg-white text-gray-800 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500"
             />
             {searchTerm && (
               <button
                 onClick={() => setSearchTerm('')}
-                className="absolute right-3 top-1/2 transform -translate-y-1/2 text-zinc-500 hover:text-zinc-400"
+                className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-500 hover:text-gray-500"
               >
                 <X className="h-4 w-4" />
               </button>
@@ -373,7 +373,7 @@ export default function NewBookingsPage() {
                 setStatusFilter(e.target.value)
                 setCurrentPage(1)
               }}
-              className="w-full px-4 py-2 bg-zinc-900 text-zinc-200 border border-zinc-700 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500"
+              className="w-full px-4 py-2 bg-white text-gray-800 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500"
             >
               {statusOptions.map((option) => (
                 <option key={option.value} value={option.value}>
@@ -385,9 +385,9 @@ export default function NewBookingsPage() {
 
           {/* Date Range Selector */}
           <div className="relative">
-            <div className="flex items-center border border-zinc-700 rounded-lg overflow-hidden focus-within:ring-2 focus-within:ring-red-500 focus-within:border-red-500">
-              <div className="flex items-center px-3 bg-zinc-800 border-r border-zinc-700 py-2">
-                <Calendar className="h-4 w-4 text-zinc-500" />
+            <div className="flex items-center border border-gray-300 rounded-lg overflow-hidden focus-within:ring-2 focus-within:ring-red-500 focus-within:border-red-500">
+              <div className="flex items-center px-3 bg-gray-100 border-r border-gray-300 py-2">
+                <Calendar className="h-4 w-4 text-gray-500" />
               </div>
               <DatePicker
                 selectsRange
@@ -398,7 +398,7 @@ export default function NewBookingsPage() {
                   setCurrentPage(1)
                 }}
                 placeholderText="เลือกช่วงวันที่"
-                className="w-full px-3 py-2 bg-zinc-900 text-zinc-200 border-0 focus:ring-0 text-sm focus:outline-none"
+                className="w-full px-3 py-2 bg-white text-gray-800 border-0 focus:ring-0 text-sm focus:outline-none"
                 dateFormat="dd/MM/yy"
                 isClearable
               />
@@ -409,7 +409,7 @@ export default function NewBookingsPage() {
           <div>
             <button
               onClick={handleResetFilters}
-              className="w-full px-4 py-2 border border-zinc-700 rounded-lg text-zinc-300 hover:bg-zinc-800"
+              className="w-full px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-100"
             >
               ล้างตัวกรอง
             </button>
@@ -418,11 +418,11 @@ export default function NewBookingsPage() {
       </div>
 
       {/* Table */}
-      <div className="bg-zinc-900 rounded-lg border border-zinc-800 overflow-hidden">
+      <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
         {loading ? (
           <div className="flex items-center justify-center py-12">
             <Loader2 className="h-8 w-8 animate-spin text-red-600" />
-            <span className="ml-2 text-zinc-400">กำลังโหลด...</span>
+            <span className="ml-2 text-gray-500">กำลังโหลด...</span>
           </div>
         ) : error ? (
           <div className="flex items-center justify-center py-12 text-red-600">
@@ -430,43 +430,43 @@ export default function NewBookingsPage() {
             <span>{error}</span>
           </div>
         ) : bookings.length === 0 ? (
-          <div className="text-center py-12 text-zinc-500">
-            <Calendar className="h-12 w-12 mx-auto text-zinc-600 mb-3" />
+          <div className="text-center py-12 text-gray-500">
+            <Calendar className="h-12 w-12 mx-auto text-gray-400 mb-3" />
             <p>ไม่พบข้อมูลการจอง</p>
           </div>
         ) : (
           <>
             <div className="overflow-x-auto">
-              <table className="w-full table-fixed divide-y divide-zinc-800">
-                <thead className="bg-zinc-800">
+              <table className="w-full table-fixed divide-y divide-gray-200">
+                <thead className="bg-gray-100">
                   <tr>
-                    <th className="w-28 px-3 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">
+                    <th className="w-28 px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                       เลขที่จอง
                     </th>
-                    <th className="w-24 px-3 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">
+                    <th className="w-24 px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                       วันที่จอง
                     </th>
-                    <th className="w-24 px-3 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">
+                    <th className="w-24 px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                       สถานะ
                     </th>
-                    <th className="px-3 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">
+                    <th className="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                       ลูกค้า
                     </th>
-                    <th className="w-24 px-3 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">
+                    <th className="w-24 px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                       เช็คอิน
                     </th>
-                    <th className="w-24 px-3 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">
+                    <th className="w-24 px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                       เช็คเอาท์
                     </th>
-                    <th className="w-20 px-3 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">
+                    <th className="w-20 px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                       ห้อง
                     </th>
-                    <th className="w-16 px-3 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">
+                    <th className="w-16 px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
 
                     </th>
                   </tr>
                 </thead>
-                <tbody className="bg-zinc-900 divide-y divide-zinc-800">
+                <tbody className="bg-white divide-y divide-gray-200">
                   {bookings.map((booking) => (
                     <tr
                       key={booking.id}
@@ -474,37 +474,37 @@ export default function NewBookingsPage() {
                       className="hover:bg-red-500/10 cursor-pointer"
                     >
                       <td className="px-3 py-3 truncate">
-                        <span className="text-sm font-medium text-red-400">
+                        <span className="text-sm font-medium text-red-600">
                           {booking.bookNo}
                         </span>
                       </td>
-                      <td className="px-3 py-3 text-sm text-zinc-100">
+                      <td className="px-3 py-3 text-sm text-gray-900">
                         {formatDateBE(booking.createdAt)}
                       </td>
                       <td className="px-3 py-3">
                         <span
                           className={`inline-block px-2 py-1 text-xs rounded-full ${
-                            statusColors[booking.status] || 'bg-zinc-700 text-zinc-300'
+                            statusColors[booking.status] || 'bg-gray-200 text-gray-700'
                           }`}
                         >
                           {statusLabels[booking.status] || booking.status}
                         </span>
                       </td>
                       <td className="px-3 py-3 truncate">
-                        <span className="text-sm text-zinc-100">
+                        <span className="text-sm text-gray-900">
                           {booking.customerName || '-'}
                         </span>
                       </td>
-                      <td className="px-3 py-3 text-sm text-zinc-100">
+                      <td className="px-3 py-3 text-sm text-gray-900">
                         {formatDateBE(booking.checkIn)}
                       </td>
-                      <td className="px-3 py-3 text-sm text-zinc-100">
+                      <td className="px-3 py-3 text-sm text-gray-900">
                         {formatDateBE(booking.checkOut)}
                       </td>
                       <td className="px-3 py-3">
                         <div className="flex items-center gap-1">
-                          <BedDouble size={14} className="text-zinc-500" />
-                          <span className="text-sm text-zinc-100">
+                          <BedDouble size={14} className="text-gray-500" />
+                          <span className="text-sm text-gray-900">
                             {booking.roomCount}
                           </span>
                         </div>
@@ -515,7 +515,7 @@ export default function NewBookingsPage() {
                             e.stopPropagation()
                             handleEditBooking(booking)
                           }}
-                          className="p-1.5 text-zinc-500 hover:text-red-400 hover:bg-red-500/10 rounded-lg"
+                          className="p-1.5 text-gray-500 hover:text-red-600 hover:bg-red-500/10 rounded-lg"
                           title="แก้ไข"
                         >
                           <Edit3 className="w-4 h-4" />
@@ -528,26 +528,26 @@ export default function NewBookingsPage() {
             </div>
 
             {/* Pagination */}
-            <div className="bg-zinc-900 px-4 py-3 flex items-center justify-between border-t border-zinc-800 sm:px-6">
+            <div className="bg-white px-4 py-3 flex items-center justify-between border-t border-gray-200 sm:px-6">
               <div className="flex-1 flex justify-between sm:hidden">
                 <button
                   onClick={() => goToPage(currentPage - 1)}
                   disabled={currentPage === 1}
-                  className="relative inline-flex items-center px-4 py-2 border border-zinc-700 text-sm font-medium rounded-md text-zinc-300 bg-zinc-900 hover:bg-zinc-800 disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="relative inline-flex items-center px-4 py-2 border border-gray-300 text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   ก่อนหน้า
                 </button>
                 <button
                   onClick={() => goToPage(currentPage + 1)}
                   disabled={currentPage === totalPages}
-                  className="ml-3 relative inline-flex items-center px-4 py-2 border border-zinc-700 text-sm font-medium rounded-md text-zinc-300 bg-zinc-900 hover:bg-zinc-800 disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="ml-3 relative inline-flex items-center px-4 py-2 border border-gray-300 text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   ถัดไป
                 </button>
               </div>
               <div className="hidden sm:flex-1 sm:flex sm:items-center sm:justify-between">
                 <div>
-                  <p className="text-sm text-zinc-300">
+                  <p className="text-sm text-gray-700">
                     แสดง{' '}
                     <span className="font-medium">
                       {(currentPage - 1) * itemsPerPage + 1}
@@ -569,7 +569,7 @@ export default function NewBookingsPage() {
                     <button
                       onClick={() => goToPage(currentPage - 1)}
                       disabled={currentPage === 1}
-                      className="relative inline-flex items-center px-2 py-2 rounded-l-md border border-zinc-700 bg-zinc-900 text-sm font-medium text-zinc-500 hover:bg-zinc-800 disabled:opacity-50 disabled:cursor-not-allowed"
+                      className="relative inline-flex items-center px-2 py-2 rounded-l-md border border-gray-300 bg-white text-sm font-medium text-gray-500 hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       <ChevronLeft className="h-5 w-5" />
                     </button>
@@ -593,8 +593,8 @@ export default function NewBookingsPage() {
                           onClick={() => goToPage(pageNum)}
                           className={`relative inline-flex items-center px-4 py-2 border text-sm font-medium ${
                             currentPage === pageNum
-                              ? 'z-10 bg-red-500/10 border-red-500 text-red-400'
-                              : 'bg-zinc-900 border-zinc-700 text-zinc-500 hover:bg-zinc-800'
+                              ? 'z-10 bg-red-500/10 border-red-500 text-red-600'
+                              : 'bg-white border-gray-300 text-gray-500 hover:bg-gray-100'
                           }`}
                         >
                           {pageNum}
@@ -605,7 +605,7 @@ export default function NewBookingsPage() {
                     <button
                       onClick={() => goToPage(currentPage + 1)}
                       disabled={currentPage === totalPages}
-                      className="relative inline-flex items-center px-2 py-2 rounded-r-md border border-zinc-700 bg-zinc-900 text-sm font-medium text-zinc-500 hover:bg-zinc-800 disabled:opacity-50 disabled:cursor-not-allowed"
+                      className="relative inline-flex items-center px-2 py-2 rounded-r-md border border-gray-300 bg-white text-sm font-medium text-gray-500 hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       <ChevronRight className="h-5 w-5" />
                     </button>
@@ -620,9 +620,9 @@ export default function NewBookingsPage() {
       {/* Loading overlay for detail fetch */}
       {loadingDetail && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-          <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-6 flex items-center gap-3">
+          <div className="bg-white border border-gray-200 rounded-lg p-6 flex items-center gap-3">
             <Loader2 className="w-6 h-6 animate-spin text-red-600" />
-            <span className="text-zinc-300">กำลังโหลดข้อมูล...</span>
+            <span className="text-gray-700">กำลังโหลดข้อมูล...</span>
           </div>
         </div>
       )}

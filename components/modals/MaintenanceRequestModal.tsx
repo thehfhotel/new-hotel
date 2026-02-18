@@ -178,29 +178,29 @@ export default function MaintenanceRequestModal({
 
   return (
     <div
-      className="fixed inset-0 bg-black/60 flex items-center justify-center z-50"
+      className="fixed inset-0 bg-black/30 flex items-center justify-center z-50"
       onClick={handleClose}
     >
       <div
-        className="bg-zinc-900 border border-zinc-800 rounded-xl shadow-2xl w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto"
+        className="bg-white border border-gray-200 rounded-xl shadow-2xl w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="flex items-center justify-between p-4 border-b border-zinc-800">
+        <div className="flex items-center justify-between p-4 border-b border-gray-200">
           <div className="flex items-center gap-2">
-            <Wrench className="w-6 h-6 text-red-400" />
+            <Wrench className="w-6 h-6 text-red-600" />
             <div>
-              <h2 className="text-xl font-bold text-zinc-100">
+              <h2 className="text-xl font-bold text-gray-900">
                 {isEditing ? 'แก้ไขคำขอซ่อม' : 'แจ้งซ่อมใหม่'}
               </h2>
               {isEditing && editRequest && (
-                <p className="text-sm text-zinc-500">{editRequest.requestNo}</p>
+                <p className="text-sm text-gray-500">{editRequest.requestNo}</p>
               )}
             </div>
           </div>
           <button
             onClick={handleClose}
-            className="p-2 hover:bg-zinc-800 rounded-lg"
+            className="p-2 hover:bg-gray-100 rounded-lg"
           >
             <X size={20} />
           </button>
@@ -210,7 +210,7 @@ export default function MaintenanceRequestModal({
         <form onSubmit={handleSubmit} className="p-4 space-y-4">
           {/* Error Message */}
           {error && (
-            <div className="flex items-center gap-2 p-3 bg-red-950/50 border border-red-900/50 rounded-lg text-red-400 text-sm">
+            <div className="flex items-center gap-2 p-3 bg-red-50 border border-red-200 rounded-lg text-red-600 text-sm">
               <AlertCircle className="w-4 h-4 flex-shrink-0" />
               {error}
             </div>
@@ -218,14 +218,14 @@ export default function MaintenanceRequestModal({
 
           {/* Room Selection */}
           <div>
-            <label className="block text-sm font-medium text-zinc-300 mb-1">
+            <label className="block text-sm font-medium text-gray-700 mb-1">
               <DoorOpen size={16} className="inline mr-1" />
               ห้อง *
             </label>
             <select
               value={roomId}
               onChange={(e) => setRoomId(e.target.value ? parseInt(e.target.value) : '')}
-              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500"
+              className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500"
               disabled={isEditing}
               required
             >
@@ -240,14 +240,14 @@ export default function MaintenanceRequestModal({
 
           {/* Category Selection */}
           <div>
-            <label className="block text-sm font-medium text-zinc-300 mb-1">
+            <label className="block text-sm font-medium text-gray-700 mb-1">
               <Tag size={16} className="inline mr-1" />
               หมวดหมู่ *
             </label>
             <select
               value={categoryId}
               onChange={(e) => setCategoryId(e.target.value ? parseInt(e.target.value) : '')}
-              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500"
+              className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500"
               disabled={isEditing}
               required
             >
@@ -262,7 +262,7 @@ export default function MaintenanceRequestModal({
 
           {/* Title */}
           <div>
-            <label className="block text-sm font-medium text-zinc-300 mb-1">
+            <label className="block text-sm font-medium text-gray-700 mb-1">
               <FileText size={16} className="inline mr-1" />
               หัวข้อ *
             </label>
@@ -271,14 +271,14 @@ export default function MaintenanceRequestModal({
               value={title}
               onChange={(e) => setTitle(e.target.value)}
               placeholder="เช่น แอร์ไม่เย็น, ก๊อกน้ำรั่ว..."
-              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500"
+              className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500"
               required
             />
           </div>
 
           {/* Description */}
           <div>
-            <label className="block text-sm font-medium text-zinc-300 mb-1">
+            <label className="block text-sm font-medium text-gray-700 mb-1">
               รายละเอียด
             </label>
             <textarea
@@ -286,13 +286,13 @@ export default function MaintenanceRequestModal({
               onChange={(e) => setDescription(e.target.value)}
               placeholder="รายละเอียดเพิ่มเติม..."
               rows={3}
-              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 resize-none"
+              className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 resize-none"
             />
           </div>
 
           {/* Priority */}
           <div>
-            <label className="block text-sm font-medium text-zinc-300 mb-2">
+            <label className="block text-sm font-medium text-gray-700 mb-2">
               ความเร่งด่วน
             </label>
             <div className="grid grid-cols-3 gap-2">
@@ -304,11 +304,11 @@ export default function MaintenanceRequestModal({
                   className={`px-3 py-2 rounded-lg border text-sm font-medium ${
                     priority === opt.value
                       ? opt.value === 3
-                        ? 'border-red-500 bg-red-500/10 text-red-400'
+                        ? 'border-red-500 bg-red-500/10 text-red-600'
                         : opt.value === 2
                         ? 'border-amber-500 bg-amber-500/10 text-amber-400'
-                        : 'border-zinc-500 bg-zinc-800 text-zinc-300'
-                      : 'border-zinc-700 text-zinc-400 hover:bg-zinc-800'
+                        : 'border-gray-500 bg-gray-100 text-gray-700'
+                      : 'border-gray-300 text-gray-500 hover:bg-gray-100'
                   }`}
                 >
                   {opt.label}
@@ -319,7 +319,7 @@ export default function MaintenanceRequestModal({
 
           {/* Assigned To */}
           <div>
-            <label className="block text-sm font-medium text-zinc-300 mb-1">
+            <label className="block text-sm font-medium text-gray-700 mb-1">
               <User size={16} className="inline mr-1" />
               ผู้รับผิดชอบ
             </label>
@@ -328,7 +328,7 @@ export default function MaintenanceRequestModal({
               value={assignedTo}
               onChange={(e) => setAssignedTo(e.target.value)}
               placeholder="ชื่อช่างหรือผู้รับผิดชอบ"
-              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500"
+              className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500"
             />
           </div>
 
@@ -337,7 +337,7 @@ export default function MaintenanceRequestModal({
             <>
               {/* Resolution */}
               <div>
-                <label className="block text-sm font-medium text-zinc-300 mb-1">
+                <label className="block text-sm font-medium text-gray-700 mb-1">
                   ผลการซ่อม
                 </label>
                 <textarea
@@ -345,13 +345,13 @@ export default function MaintenanceRequestModal({
                   onChange={(e) => setResolution(e.target.value)}
                   placeholder="รายละเอียดผลการซ่อม..."
                   rows={2}
-                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 resize-none"
+                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 resize-none"
                 />
               </div>
 
               {/* Cost */}
               <div>
-                <label className="block text-sm font-medium text-zinc-300 mb-1">
+                <label className="block text-sm font-medium text-gray-700 mb-1">
                   <DollarSign size={16} className="inline mr-1" />
                   ค่าใช้จ่าย (บาท)
                 </label>
@@ -362,7 +362,7 @@ export default function MaintenanceRequestModal({
                   placeholder="0.00"
                   min="0"
                   step="0.01"
-                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500"
+                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500"
                 />
               </div>
             </>
@@ -373,7 +373,7 @@ export default function MaintenanceRequestModal({
             <button
               type="button"
               onClick={handleClose}
-              className="flex-1 px-4 py-2 border border-zinc-700 text-zinc-300 rounded-lg hover:bg-zinc-800"
+              className="flex-1 px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-100"
               disabled={isSubmitting}
             >
               ยกเลิก

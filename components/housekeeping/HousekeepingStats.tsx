@@ -21,8 +21,8 @@ export default function HousekeepingStats({ stats, loading }: HousekeepingStatsP
       value: stats.dirtyCount,
       icon: Clock,
       bgColor: 'bg-red-500/5',
-      iconColor: 'text-red-400',
-      valueColor: 'text-red-400',
+      iconColor: 'text-red-600',
+      valueColor: 'text-red-600',
     },
     {
       title: 'กำลังทำความสะอาด',
@@ -57,16 +57,16 @@ export default function HousekeepingStats({ stats, loading }: HousekeepingStatsP
       {statCards.map((card) => (
         <div
           key={card.title}
-          className={`${card.bgColor} rounded-xl p-4 border border-zinc-800`}
+          className={`${card.bgColor} rounded-xl p-4 border border-gray-200`}
         >
           <div className="flex items-center gap-3">
-            <div className="p-2 rounded-lg bg-zinc-900 border border-zinc-800">
+            <div className="p-2 rounded-lg bg-white border border-gray-200">
               <card.icon className={`w-5 h-5 ${card.iconColor}`} />
             </div>
             <div>
-              <p className="text-xs font-medium text-zinc-500">{card.title}</p>
+              <p className="text-xs font-medium text-gray-500">{card.title}</p>
               {loading ? (
-                <div className="h-7 w-12 bg-zinc-800 animate-pulse rounded mt-1" />
+                <div className="h-7 w-12 bg-gray-100 animate-pulse rounded mt-1" />
               ) : (
                 <p className={`text-xl font-bold ${card.valueColor}`}>
                   {card.value}

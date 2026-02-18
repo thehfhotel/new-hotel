@@ -65,8 +65,8 @@ interface BookingDetailDrawerProps {
 const statusColors: Record<string, string> = {
   'จอง': 'bg-yellow-500/10 text-yellow-400',
   'เข้าพัก': 'bg-green-500/10 text-green-400',
-  'เสร็จสิ้น': 'bg-zinc-800 text-zinc-400',
-  'ยกเลิก': 'bg-red-500/10 text-red-400',
+  'เสร็จสิ้น': 'bg-gray-100 text-gray-500',
+  'ยกเลิก': 'bg-red-500/10 text-red-600',
 }
 
 function formatDate(dateStr: string): string {
@@ -201,16 +201,16 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
   // Inline mode - rendered as a static sidebar
   if (inline) {
     return (
-      <div className="bg-zinc-900 rounded-lg shadow-lg border border-zinc-800 overflow-hidden">
+      <div className="bg-white rounded-lg shadow-lg border border-gray-200 overflow-hidden">
         <div className="p-4 max-h-[calc(100vh-2rem)] overflow-y-auto">
           {/* Header */}
-          <div className="flex items-center justify-between mb-4 pb-4 border-b border-zinc-800">
-            <h2 className="text-lg font-bold text-zinc-100">
+          <div className="flex items-center justify-between mb-4 pb-4 border-b border-gray-200">
+            <h2 className="text-lg font-bold text-gray-900">
               #{bookNo}
             </h2>
             <button
               onClick={onClose}
-              className="p-2 hover:bg-zinc-800 rounded-lg transition-colors"
+              className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
               title="ปิด"
             >
               <X size={20} />
@@ -226,7 +226,7 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
 
           {/* Error */}
           {error && (
-            <div className="flex items-center justify-center py-12 text-red-400">
+            <div className="flex items-center justify-center py-12 text-red-600">
               <AlertCircle className="h-6 w-6 mr-2" />
               <span>{error}</span>
             </div>
@@ -237,53 +237,53 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
             <div className="space-y-6">
               {/* Booking Info */}
               <section>
-                <h3 className="flex items-center gap-2 text-sm font-semibold text-zinc-500 uppercase mb-3">
+                <h3 className="flex items-center gap-2 text-sm font-semibold text-gray-500 uppercase mb-3">
                   <Calendar size={16} />
                   ข้อมูลการจอง
                 </h3>
-                <div className="bg-zinc-800 rounded-lg p-4 space-y-3">
+                <div className="bg-gray-100 rounded-lg p-4 space-y-3">
                   <div className="flex justify-between items-center">
-                    <span className="text-zinc-400">สถานะ</span>
-                    <span className={`px-2.5 py-0.5 rounded-full text-xs font-medium ${statusColors[booking.status] || 'bg-zinc-800 text-zinc-400'}`}>
+                    <span className="text-gray-500">สถานะ</span>
+                    <span className={`px-2.5 py-0.5 rounded-full text-xs font-medium ${statusColors[booking.status] || 'bg-gray-100 text-gray-500'}`}>
                       {booking.status}
                     </span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-zinc-400">วันที่จอง</span>
-                    <span className="font-medium text-zinc-200">{formatDate(booking.bookDate)}</span>
+                    <span className="text-gray-500">วันที่จอง</span>
+                    <span className="font-medium text-gray-800">{formatDate(booking.bookDate)}</span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-zinc-400">เช็คอิน</span>
-                    <span className="font-medium text-zinc-200">{formatDate(booking.checkIn)}</span>
+                    <span className="text-gray-500">เช็คอิน</span>
+                    <span className="font-medium text-gray-800">{formatDate(booking.checkIn)}</span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-zinc-400">เช็คเอาท์</span>
-                    <span className="font-medium text-zinc-200">{formatDate(booking.checkOut)}</span>
+                    <span className="text-gray-500">เช็คเอาท์</span>
+                    <span className="font-medium text-gray-800">{formatDate(booking.checkOut)}</span>
                   </div>
                 </div>
               </section>
 
               {/* Rooms */}
               <section>
-                <h3 className="flex items-center gap-2 text-sm font-semibold text-zinc-500 uppercase mb-3">
+                <h3 className="flex items-center gap-2 text-sm font-semibold text-gray-500 uppercase mb-3">
                   <BedDouble size={16} />
                   ห้องพัก ({booking.roomCount})
                 </h3>
                 <div className="space-y-2">
                   {booking.rooms.map((room, idx) => (
-                    <div key={idx} className="bg-zinc-800 rounded-lg p-3 flex justify-between items-center">
+                    <div key={idx} className="bg-gray-100 rounded-lg p-3 flex justify-between items-center">
                       <div>
-                        <span className="font-medium text-zinc-200">ห้อง {room.roomNo}</span>
-                        <span className="text-zinc-500 ml-2">- {room.roomType}</span>
+                        <span className="font-medium text-gray-800">ห้อง {room.roomNo}</span>
+                        <span className="text-gray-500 ml-2">- {room.roomType}</span>
                       </div>
-                      <span className="font-medium text-red-400">
+                      <span className="font-medium text-red-600">
                         {formatCurrency(room.total)}
                       </span>
                     </div>
                   ))}
-                  <div className="flex justify-between items-center pt-2 border-t border-zinc-800 mt-2">
-                    <span className="font-semibold text-zinc-200">รวมทั้งหมด</span>
-                    <span className="font-bold text-lg text-red-400">
+                  <div className="flex justify-between items-center pt-2 border-t border-gray-200 mt-2">
+                    <span className="font-semibold text-gray-800">รวมทั้งหมด</span>
+                    <span className="font-bold text-lg text-red-600">
                       {formatCurrency(booking.totalAmount)}
                     </span>
                   </div>
@@ -292,28 +292,28 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
 
               {/* Customer */}
               <section>
-                <h3 className="flex items-center gap-2 text-sm font-semibold text-zinc-500 uppercase mb-3">
+                <h3 className="flex items-center gap-2 text-sm font-semibold text-gray-500 uppercase mb-3">
                   <User size={16} />
                   ข้อมูลลูกค้า
                 </h3>
-                <div className="bg-zinc-800 rounded-lg p-4 space-y-3">
-                  <div className="font-medium text-lg text-zinc-200">
+                <div className="bg-gray-100 rounded-lg p-4 space-y-3">
+                  <div className="font-medium text-lg text-gray-800">
                     {booking.customer.fullName || `${booking.customer.firstName || ''} ${booking.customer.lastName || ''}`.trim() || '-'}
                   </div>
                   {booking.customer.phone && (
-                    <div className="flex items-center gap-2 text-zinc-400">
+                    <div className="flex items-center gap-2 text-gray-500">
                       <Phone size={16} />
                       <span>{booking.customer.phone}</span>
                     </div>
                   )}
                   {booking.customer.idCard && (
-                    <div className="flex items-center gap-2 text-zinc-400">
+                    <div className="flex items-center gap-2 text-gray-500">
                       <CreditCard size={16} />
                       <span>{booking.customer.idCard}</span>
                     </div>
                   )}
                   {booking.customer.address && (
-                    <div className="flex items-center gap-2 text-zinc-400">
+                    <div className="flex items-center gap-2 text-gray-500">
                       <MapPin size={16} />
                       <span className="text-sm">{booking.customer.address}</span>
                     </div>
@@ -321,7 +321,7 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
                   {booking.customer.id && (
                     <Link
                       href={`/customers?search=${encodeURIComponent(booking.customer.id)}`}
-                      className="inline-flex items-center gap-1 text-red-400 hover:text-red-300 text-sm mt-2"
+                      className="inline-flex items-center gap-1 text-red-600 hover:text-red-300 text-sm mt-2"
                     >
                       ดูข้อมูลลูกค้าเพิ่มเติม
                       <ExternalLink size={14} />
@@ -332,7 +332,7 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
 
               {/* Notes */}
               <section>
-                <h3 className="flex items-center gap-2 text-sm font-semibold text-zinc-500 uppercase mb-3">
+                <h3 className="flex items-center gap-2 text-sm font-semibold text-gray-500 uppercase mb-3">
                   <FileText size={16} />
                   บันทึก ({booking.notes.length})
                 </h3>
@@ -343,7 +343,7 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
                     value={newNote}
                     onChange={(e) => setNewNote(e.target.value)}
                     placeholder="เพิ่มบันทึก..."
-                    className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 text-sm resize-none"
+                    className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 text-sm resize-none"
                     rows={2}
                   />
                   <button
@@ -363,20 +363,20 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
                 {/* Notes List */}
                 <div className="space-y-2">
                   {booking.notes.length === 0 ? (
-                    <p className="text-zinc-500 text-sm text-center py-4">
+                    <p className="text-gray-500 text-sm text-center py-4">
                       ยังไม่มีบันทึก
                     </p>
                   ) : (
                     booking.notes.map((note) => (
-                      <div key={note.id} className="bg-zinc-800 rounded-lg p-3">
+                      <div key={note.id} className="bg-gray-100 rounded-lg p-3">
                         <div className="flex justify-between items-start gap-2">
-                          <p className="text-sm text-zinc-300 flex-1 whitespace-pre-wrap">
+                          <p className="text-sm text-gray-700 flex-1 whitespace-pre-wrap">
                             {note.text}
                           </p>
                           <button
                             onClick={() => handleDeleteNote(note.id)}
                             disabled={deletingNoteId === note.id}
-                            className="p-1 text-zinc-500 hover:text-red-400 transition-colors"
+                            className="p-1 text-gray-500 hover:text-red-600 transition-colors"
                           >
                             {deletingNoteId === note.id ? (
                               <Loader2 className="h-4 w-4 animate-spin" />
@@ -385,7 +385,7 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
                             )}
                           </button>
                         </div>
-                        <p className="text-xs text-zinc-500 mt-2">
+                        <p className="text-xs text-gray-500 mt-2">
                           {formatDateTime(note.createdAt)}
                         </p>
                       </div>
@@ -405,21 +405,21 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
     <>
       {/* Backdrop - click to dismiss */}
       <div
-        className="fixed inset-0 bg-black bg-opacity-30 z-40"
+        className="fixed inset-0 bg-black/20 z-40"
         onClick={onClose}
       />
 
       {/* Drawer */}
-      <div className="fixed right-0 top-0 h-full w-full sm:w-96 bg-zinc-900 shadow-xl border-l border-zinc-800 overflow-y-auto z-50">
+      <div className="fixed right-0 top-0 h-full w-full sm:w-96 bg-white shadow-xl border-l border-gray-200 overflow-y-auto z-50">
         <div className="p-4">
           {/* Header */}
-          <div className="flex items-center justify-between mb-4 pb-4 border-b border-zinc-800">
-            <h2 className="text-lg font-bold text-zinc-100">
+          <div className="flex items-center justify-between mb-4 pb-4 border-b border-gray-200">
+            <h2 className="text-lg font-bold text-gray-900">
               Booking #{bookNo}
             </h2>
             <button
               onClick={onClose}
-              className="p-2 hover:bg-zinc-800 rounded-lg transition-colors"
+              className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
             >
               <X size={20} />
             </button>
@@ -445,53 +445,53 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
             <div className="space-y-6">
               {/* Booking Info */}
               <section>
-                <h3 className="flex items-center gap-2 text-sm font-semibold text-zinc-500 uppercase mb-3">
+                <h3 className="flex items-center gap-2 text-sm font-semibold text-gray-500 uppercase mb-3">
                   <Calendar size={16} />
                   ข้อมูลการจอง
                 </h3>
-                <div className="bg-zinc-800 rounded-lg p-4 space-y-3">
+                <div className="bg-gray-100 rounded-lg p-4 space-y-3">
                   <div className="flex justify-between items-center">
-                    <span className="text-zinc-400">สถานะ</span>
-                    <span className={`px-2.5 py-0.5 rounded-full text-xs font-medium ${statusColors[booking.status] || 'bg-zinc-800 text-zinc-400'}`}>
+                    <span className="text-gray-500">สถานะ</span>
+                    <span className={`px-2.5 py-0.5 rounded-full text-xs font-medium ${statusColors[booking.status] || 'bg-gray-100 text-gray-500'}`}>
                       {booking.status}
                     </span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-zinc-400">วันที่จอง</span>
-                    <span className="font-medium text-zinc-200">{formatDate(booking.bookDate)}</span>
+                    <span className="text-gray-500">วันที่จอง</span>
+                    <span className="font-medium text-gray-800">{formatDate(booking.bookDate)}</span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-zinc-400">เช็คอิน</span>
-                    <span className="font-medium text-zinc-200">{formatDate(booking.checkIn)}</span>
+                    <span className="text-gray-500">เช็คอิน</span>
+                    <span className="font-medium text-gray-800">{formatDate(booking.checkIn)}</span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-zinc-400">เช็คเอาท์</span>
-                    <span className="font-medium text-zinc-200">{formatDate(booking.checkOut)}</span>
+                    <span className="text-gray-500">เช็คเอาท์</span>
+                    <span className="font-medium text-gray-800">{formatDate(booking.checkOut)}</span>
                   </div>
                 </div>
               </section>
 
               {/* Rooms */}
               <section>
-                <h3 className="flex items-center gap-2 text-sm font-semibold text-zinc-500 uppercase mb-3">
+                <h3 className="flex items-center gap-2 text-sm font-semibold text-gray-500 uppercase mb-3">
                   <BedDouble size={16} />
                   ห้องพัก ({booking.roomCount})
                 </h3>
                 <div className="space-y-2">
                   {booking.rooms.map((room, idx) => (
-                    <div key={idx} className="bg-zinc-800 rounded-lg p-3 flex justify-between items-center">
+                    <div key={idx} className="bg-gray-100 rounded-lg p-3 flex justify-between items-center">
                       <div>
-                        <span className="font-medium text-zinc-200">ห้อง {room.roomNo}</span>
-                        <span className="text-zinc-500 ml-2">- {room.roomType}</span>
+                        <span className="font-medium text-gray-800">ห้อง {room.roomNo}</span>
+                        <span className="text-gray-500 ml-2">- {room.roomType}</span>
                       </div>
-                      <span className="font-medium text-red-400">
+                      <span className="font-medium text-red-600">
                         {formatCurrency(room.total)}
                       </span>
                     </div>
                   ))}
-                  <div className="flex justify-between items-center pt-2 border-t border-zinc-800 mt-2">
-                    <span className="font-semibold text-zinc-200">รวมทั้งหมด</span>
-                    <span className="font-bold text-lg text-red-400">
+                  <div className="flex justify-between items-center pt-2 border-t border-gray-200 mt-2">
+                    <span className="font-semibold text-gray-800">รวมทั้งหมด</span>
+                    <span className="font-bold text-lg text-red-600">
                       {formatCurrency(booking.totalAmount)}
                     </span>
                   </div>
@@ -500,28 +500,28 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
 
               {/* Customer */}
               <section>
-                <h3 className="flex items-center gap-2 text-sm font-semibold text-zinc-500 uppercase mb-3">
+                <h3 className="flex items-center gap-2 text-sm font-semibold text-gray-500 uppercase mb-3">
                   <User size={16} />
                   ข้อมูลลูกค้า
                 </h3>
-                <div className="bg-zinc-800 rounded-lg p-4 space-y-3">
-                  <div className="font-medium text-lg text-zinc-200">
+                <div className="bg-gray-100 rounded-lg p-4 space-y-3">
+                  <div className="font-medium text-lg text-gray-800">
                     {booking.customer.fullName || `${booking.customer.firstName || ''} ${booking.customer.lastName || ''}`.trim() || '-'}
                   </div>
                   {booking.customer.phone && (
-                    <div className="flex items-center gap-2 text-zinc-400">
+                    <div className="flex items-center gap-2 text-gray-500">
                       <Phone size={16} />
                       <span>{booking.customer.phone}</span>
                     </div>
                   )}
                   {booking.customer.idCard && (
-                    <div className="flex items-center gap-2 text-zinc-400">
+                    <div className="flex items-center gap-2 text-gray-500">
                       <CreditCard size={16} />
                       <span>{booking.customer.idCard}</span>
                     </div>
                   )}
                   {booking.customer.address && (
-                    <div className="flex items-center gap-2 text-zinc-400">
+                    <div className="flex items-center gap-2 text-gray-500">
                       <MapPin size={16} />
                       <span className="text-sm">{booking.customer.address}</span>
                     </div>
@@ -529,7 +529,7 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
                   {booking.customer.id && (
                     <Link
                       href={`/customers?search=${encodeURIComponent(booking.customer.id)}`}
-                      className="inline-flex items-center gap-1 text-red-400 hover:text-red-300 text-sm mt-2"
+                      className="inline-flex items-center gap-1 text-red-600 hover:text-red-300 text-sm mt-2"
                     >
                       ดูข้อมูลลูกค้าเพิ่มเติม
                       <ExternalLink size={14} />
@@ -540,7 +540,7 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
 
               {/* Notes */}
               <section>
-                <h3 className="flex items-center gap-2 text-sm font-semibold text-zinc-500 uppercase mb-3">
+                <h3 className="flex items-center gap-2 text-sm font-semibold text-gray-500 uppercase mb-3">
                   <FileText size={16} />
                   บันทึก ({booking.notes.length})
                 </h3>
@@ -551,7 +551,7 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
                     value={newNote}
                     onChange={(e) => setNewNote(e.target.value)}
                     placeholder="เพิ่มบันทึก..."
-                    className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 text-sm resize-none"
+                    className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 text-sm resize-none"
                     rows={2}
                   />
                   <button
@@ -571,20 +571,20 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
                 {/* Notes List */}
                 <div className="space-y-2">
                   {booking.notes.length === 0 ? (
-                    <p className="text-zinc-500 text-sm text-center py-4">
+                    <p className="text-gray-500 text-sm text-center py-4">
                       ยังไม่มีบันทึก
                     </p>
                   ) : (
                     booking.notes.map((note) => (
-                      <div key={note.id} className="bg-zinc-800 rounded-lg p-3">
+                      <div key={note.id} className="bg-gray-100 rounded-lg p-3">
                         <div className="flex justify-between items-start gap-2">
-                          <p className="text-sm text-zinc-300 flex-1 whitespace-pre-wrap">
+                          <p className="text-sm text-gray-700 flex-1 whitespace-pre-wrap">
                             {note.text}
                           </p>
                           <button
                             onClick={() => handleDeleteNote(note.id)}
                             disabled={deletingNoteId === note.id}
-                            className="p-1 text-zinc-500 hover:text-red-400 transition-colors"
+                            className="p-1 text-gray-500 hover:text-red-600 transition-colors"
                           >
                             {deletingNoteId === note.id ? (
                               <Loader2 className="h-4 w-4 animate-spin" />
@@ -593,7 +593,7 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
                             )}
                           </button>
                         </div>
-                        <p className="text-xs text-zinc-500 mt-2">
+                        <p className="text-xs text-gray-500 mt-2">
                           {formatDateTime(note.createdAt)}
                         </p>
                       </div>
