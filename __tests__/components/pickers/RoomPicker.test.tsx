@@ -338,7 +338,7 @@ describe('RoomPicker Component', () => {
 
       expect(standardFilter).toHaveClass('bg-red-600')
       expect(standardFilter).toHaveClass('text-white')
-      expect(screen.getByText('ทั้งหมด')).toHaveClass('bg-zinc-800')
+      expect(screen.getByText('ทั้งหมด')).toHaveClass('bg-gray-100')
     })
   })
 

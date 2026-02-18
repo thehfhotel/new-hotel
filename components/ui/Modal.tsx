@@ -43,16 +43,16 @@ export default function Modal({ isOpen, onClose, title, children, size = 'md', f
 
   return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="fixed inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
-      <div className={`relative bg-zinc-900 border border-zinc-800 rounded-xl shadow-xl w-full mx-4 ${sizeStyles[size]}`}>
-        <div className="flex items-center justify-between p-5 border-b border-zinc-800">
-          <h2 className="text-lg font-semibold text-zinc-100">{title}</h2>
-          <button onClick={onClose} className="p-1 rounded-lg hover:bg-zinc-800 text-zinc-400 hover:text-zinc-200 transition-colors">
+      <div className="fixed inset-0 bg-black/30 backdrop-blur-sm" onClick={onClose} />
+      <div className={`relative bg-white border border-gray-200 rounded-xl shadow-xl w-full mx-4 ${sizeStyles[size]}`}>
+        <div className="flex items-center justify-between p-5 border-b border-gray-200">
+          <h2 className="text-lg font-semibold text-gray-900">{title}</h2>
+          <button onClick={onClose} className="p-1 rounded-lg hover:bg-gray-100 text-gray-500 hover:text-gray-900 transition-colors">
             <X className="w-5 h-5" />
           </button>
         </div>
         <div className="p-5 max-h-[70vh] overflow-y-auto">{children}</div>
-        {footer && <div className="p-4 border-t border-zinc-800 flex justify-end gap-3">{footer}</div>}
+        {footer && <div className="p-4 border-t border-gray-200 flex justify-end gap-3">{footer}</div>}
       </div>
     </div>,
     document.body

@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.19.0] - 2026-02-19
+
+### Changed
+- **Light theme for new system** — converted entire `app/new/` from dark zinc theme to light gray theme
+  - Foundation: `globals.css` (removed `.new-system-layout` dark overrides, light datepicker/scrollbar styles), `app/new/layout.tsx` (bg-gray-50), `Sidebar.tsx` (white bg, gray borders, red accent)
+  - 13 UI primitives: Card, Modal, Drawer, Input, Select, Textarea, Button, Badge, PageHeader, StatCard, Skeleton, EmptyState, PrintButton
+  - 10 pages: dashboard, bookings, calendar, room-types, housekeeping, maintenance, inventory, reports, billing, rates
+  - 5 additional pages: inventory/items, inventory/rooms, inventory/transactions, billing/[id], admin/sync
+  - 22 shared components: forms, modals, pickers, housekeeping, maintenance, inventory, DataTable, BookingDetailDrawer, StayTimeline, RateCalendar
+  - Color mapping: zinc-950→gray-50, zinc-900→white, zinc-800→gray-100, text-zinc-100→text-gray-900, etc.
+  - Preserved: red-600 accent buttons, status colors (emerald/amber/sky/orange), print templates (light)
+
 ## [2.18.0] - 2026-02-18
 
 ### Added
@@ -12,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `lib/format.ts` — consolidated formatting utilities (`formatCurrency`, `toBuddhistYear`, `formatBuddhistDate`, `formatDateForApi`, `formatThaiDate`, `calculateNights`) from 8+ duplicate implementations
   - `lib/status.ts` — centralized status color/label maps for bookings, rooms, housekeeping, maintenance, payments with `getStatusColor()`/`getStatusLabel()` helpers
   - `types/common.ts`, `types/booking.ts`, `types/customer.ts`, `types/room.ts`, `types/checkin.ts` — shared TypeScript type definitions extracted from scattered page-level types
-  - 12 UI primitives in `components/ui/`: Badge, Button, Card, Modal, Drawer, Input, Select, Textarea, PageHeader, StatCard, Skeleton, EmptyState — all dark-themed
+  - 12 UI primitives in `components/ui/`: Badge, Button, Card, Modal, Drawer, Input, Select, Textarea, PageHeader, StatCard, Skeleton, EmptyState
   - `components/Sidebar.tsx` — collapsible left sidebar navigation (240px/64px) with localStorage persistence, responsive defaults, and smooth transitions
   - `app/(unified)/layout.tsx` — unified layout using Sidebar with synchronized collapse state
 

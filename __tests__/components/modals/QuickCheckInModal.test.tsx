@@ -553,7 +553,7 @@ describe('QuickCheckInModal Component', () => {
       render(<QuickCheckInModal {...defaultProps} />)
 
       // Click inside the modal content
-      const modalContent = screen.getByText('เช็คอินด่วน').closest('.bg-zinc-900')
+      const modalContent = screen.getByText('เช็คอินด่วน').closest('.bg-white')
       fireEvent.click(modalContent!)
 
       expect(defaultProps.onClose).not.toHaveBeenCalled()

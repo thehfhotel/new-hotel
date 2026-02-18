@@ -96,7 +96,7 @@ describe('RoomCleaningCard Component', () => {
       )
 
       const card = container.firstChild as HTMLElement
-      expect(card.className).toContain('bg-zinc-900')
+      expect(card.className).toContain('bg-white')
       expect(card.className).toContain('border-red-900')
     })
 
@@ -106,7 +106,7 @@ describe('RoomCleaningCard Component', () => {
       )
 
       const card = container.firstChild as HTMLElement
-      expect(card.className).toContain('bg-zinc-900')
+      expect(card.className).toContain('bg-white')
       expect(card.className).toContain('border-amber-900')
     })
 
@@ -116,7 +116,7 @@ describe('RoomCleaningCard Component', () => {
       )
 
       const card = container.firstChild as HTMLElement
-      expect(card.className).toContain('bg-zinc-900')
+      expect(card.className).toContain('bg-white')
       expect(card.className).toContain('border-emerald-900')
     })
   })

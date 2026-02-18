@@ -151,22 +151,22 @@ export default function PrintButton({
           />
 
           {/* Dropdown Content */}
-          <div className="absolute right-0 mt-1 w-48 bg-zinc-900 rounded-lg shadow-lg border border-zinc-800 z-20">
+          <div className="absolute right-0 mt-1 w-48 bg-white rounded-lg shadow-lg border border-gray-200 z-20">
             <button
               onClick={handlePrint}
-              className="w-full flex items-center gap-2 px-4 py-2.5 text-sm text-zinc-300 hover:bg-zinc-800 rounded-t-lg"
+              className="w-full flex items-center gap-2 px-4 py-2.5 text-sm text-gray-700 hover:bg-gray-100 rounded-t-lg"
             >
               <Printer size={16} />
               <span>พิมพ์</span>
-              <span className="text-zinc-500 text-xs ml-auto">Print</span>
+              <span className="text-gray-500 text-xs ml-auto">Print</span>
             </button>
             <button
               onClick={handleSavePdf}
-              className="w-full flex items-center gap-2 px-4 py-2.5 text-sm text-zinc-300 hover:bg-zinc-800 rounded-b-lg border-t border-zinc-800"
+              className="w-full flex items-center gap-2 px-4 py-2.5 text-sm text-gray-700 hover:bg-gray-100 rounded-b-lg border-t border-gray-200"
             >
               <FileDown size={16} />
               <span>บันทึก PDF</span>
-              <span className="text-zinc-500 text-xs ml-auto">Save PDF</span>
+              <span className="text-gray-500 text-xs ml-auto">Save PDF</span>
             </button>
           </div>
         </>

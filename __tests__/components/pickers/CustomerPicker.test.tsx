@@ -568,7 +568,7 @@ describe('CustomerPicker Component', () => {
       )
 
       const container = screen.getByPlaceholderText('ค้นหาลูกค้า...').closest('div')
-      expect(container).toHaveClass('bg-zinc-800')
+      expect(container).toHaveClass('bg-gray-100')
       expect(container).toHaveClass('cursor-not-allowed')
     })
 

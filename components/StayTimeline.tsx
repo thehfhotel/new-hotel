@@ -191,25 +191,25 @@ export default function StayTimeline({
   const barHeight = viewMode === 'week' ? 160 : 100
 
   return (
-    <div className="bg-zinc-900 rounded-xl shadow-sm border border-zinc-800 overflow-hidden">
+    <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
       {/* Header */}
-      <div className="flex items-center justify-between p-4 border-b border-zinc-800 bg-zinc-800">
-        <button onClick={() => navigate('prev')} className="p-2 hover:bg-zinc-800 rounded-full">
+      <div className="flex items-center justify-between p-4 border-b border-gray-200 bg-gray-100">
+        <button onClick={() => navigate('prev')} className="p-2 hover:bg-gray-100 rounded-full">
           <ChevronLeft className="w-5 h-5" />
         </button>
         <div className="text-center">
-          <h2 className="text-xl font-semibold text-zinc-200">{getHeaderTitle()}</h2>
-          <p className="text-sm text-zinc-500">
+          <h2 className="text-xl font-semibold text-gray-800">{getHeaderTitle()}</h2>
+          <p className="text-sm text-gray-500">
             เช็คอิน {stats.totalCheckins} · จอง {stats.totalBookings} · เฉลี่ย {stats.avgOccupancy} ห้อง/วัน
           </p>
         </div>
-        <button onClick={() => navigate('next')} className="p-2 hover:bg-zinc-800 rounded-full">
+        <button onClick={() => navigate('next')} className="p-2 hover:bg-gray-100 rounded-full">
           <ChevronRight className="w-5 h-5" />
         </button>
       </div>
 
       {/* View Mode Tabs */}
-      <div className="flex items-center justify-center gap-1 p-2 border-b border-zinc-800 bg-zinc-800">
+      <div className="flex items-center justify-center gap-1 p-2 border-b border-gray-200 bg-gray-100">
         {(['week', 'month'] as const).map(mode => (
           <button
             key={mode}
@@ -217,7 +217,7 @@ export default function StayTimeline({
             className={`px-4 py-1.5 text-sm rounded-lg transition-colors ${
               viewMode === mode
                 ? 'bg-red-600 text-white'
-                : 'text-zinc-400 hover:bg-zinc-800'
+                : 'text-gray-500 hover:bg-gray-100'
             }`}
           >
             {mode === 'week' ? 'สัปดาห์' : 'เดือน'}
@@ -228,8 +228,8 @@ export default function StayTimeline({
       {/* Bar Chart */}
       <div className="p-4">
         {dayData.length === 0 ? (
-          <div className="text-center py-8 text-zinc-500">
-            <Calendar className="w-10 h-10 mx-auto mb-2 text-zinc-600" />
+          <div className="text-center py-8 text-gray-500">
+            <Calendar className="w-10 h-10 mx-auto mb-2 text-gray-400" />
             <p>ไม่มีข้อมูลในช่วงนี้</p>
           </div>
         ) : (
@@ -252,7 +252,7 @@ export default function StayTimeline({
                 >
                   {/* Tooltip */}
                   {isHovered && (
-                    <div className="absolute -mt-20 bg-zinc-800 text-white text-xs px-3 py-2 rounded shadow-lg whitespace-nowrap z-20">
+                    <div className="absolute -mt-20 bg-gray-100 text-white text-xs px-3 py-2 rounded shadow-lg whitespace-nowrap z-20">
                       <div className="font-medium mb-1">{format(d.date, 'd MMM yyyy')}</div>
                       <div className="flex items-center gap-2">
                         <span className="w-2 h-2 bg-red-500 rounded-sm"></span>
@@ -266,7 +266,7 @@ export default function StayTimeline({
                         <span className="w-2 h-2 bg-amber-400 rounded-sm"></span>
                         <span>จอง: {d.booking}</span>
                       </div>
-                      <div className="border-t border-zinc-600 mt-1 pt-1 font-medium">
+                      <div className="border-t border-gray-400 mt-1 pt-1 font-medium">
                         รวม: {d.total} ห้อง
                       </div>
                     </div>
@@ -275,7 +275,7 @@ export default function StayTimeline({
                   {/* Stacked Bar */}
                   <div
                     className={`w-full flex flex-col-reverse rounded-t overflow-hidden ${
-                      isHovered ? 'ring-2 ring-zinc-600' : ''
+                      isHovered ? 'ring-2 ring-gray-400' : ''
                     } ${isToday ? 'ring-2 ring-red-500' : ''}`}
                     style={{ height: barHeight }}
                   >
@@ -317,22 +317,22 @@ export default function StayTimeline({
                     )}
                     {/* Empty state */}
                     {d.total === 0 && (
-                      <div className="w-full h-1 bg-zinc-800"></div>
+                      <div className="w-full h-1 bg-gray-100"></div>
                     )}
                   </div>
 
                   {/* Total label */}
-                  <div className={`text-xs font-medium mt-1 ${d.total > 0 ? 'text-zinc-300' : 'text-zinc-600'}`}>
+                  <div className={`text-xs font-medium mt-1 ${d.total > 0 ? 'text-gray-700' : 'text-gray-400'}`}>
                     {d.total > 0 ? d.total : ''}
                   </div>
 
                   {/* Day of week */}
-                  <div className={`text-[10px] ${isWeekend ? 'text-red-400' : 'text-zinc-500'}`}>
+                  <div className={`text-[10px] ${isWeekend ? 'text-red-600' : 'text-gray-500'}`}>
                     {THAI_DAYS_SHORT[d.date.getDay()]}
                   </div>
 
                   {/* Date */}
-                  <div className={`text-xs ${isToday ? 'font-bold text-red-400' : 'text-zinc-400'}`}>
+                  <div className={`text-xs ${isToday ? 'font-bold text-red-600' : 'text-gray-500'}`}>
                     {d.date.getDate()}
                   </div>
                 </div>
@@ -343,110 +343,110 @@ export default function StayTimeline({
       </div>
 
       {/* Legend */}
-      <div className="flex items-center justify-center gap-6 px-4 py-3 bg-zinc-800 border-t border-zinc-800 text-sm">
+      <div className="flex items-center justify-center gap-6 px-4 py-3 bg-gray-100 border-t border-gray-200 text-sm">
         <div className="flex items-center gap-2">
           <div className="w-4 h-4 bg-red-500 rounded" />
-          <span className="text-zinc-400">พักต่อเนื่อง</span>
+          <span className="text-gray-500">พักต่อเนื่อง</span>
         </div>
         <div className="flex items-center gap-2">
           <div className="w-4 h-4 bg-red-500 rounded" />
-          <span className="text-zinc-400">เช็คอินใหม่</span>
+          <span className="text-gray-500">เช็คอินใหม่</span>
         </div>
         <div className="flex items-center gap-2">
           <div className="w-4 h-4 bg-amber-400 rounded" />
-          <span className="text-zinc-400">การจอง</span>
+          <span className="text-gray-500">การจอง</span>
         </div>
       </div>
 
       {/* Detail Panel */}
       {selectedSegment && (
-        <div className="border-t border-zinc-800 bg-zinc-900 p-4">
+        <div className="border-t border-gray-200 bg-white p-4">
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-2">
               <div className={`w-3 h-3 rounded ${
                 selectedSegment.type === 'continuing' ? 'bg-red-500' :
                 selectedSegment.type === 'newCheckin' ? 'bg-red-500' : 'bg-amber-400'
               }`} />
-              <h3 className="font-medium text-zinc-200">
+              <h3 className="font-medium text-gray-800">
                 {selectedSegment.type === 'continuing' && 'พักต่อเนื่อง'}
                 {selectedSegment.type === 'newCheckin' && 'เช็คอินใหม่'}
                 {selectedSegment.type === 'booking' && 'การจอง'}
-                <span className="text-zinc-500 font-normal ml-2">
+                <span className="text-gray-500 font-normal ml-2">
                   {format(selectedSegment.date, 'd MMM yyyy')} ({selectedSegment.stays.length} รายการ)
                 </span>
               </h3>
             </div>
             <button
               onClick={() => setSelectedSegment(null)}
-              className="p-1 hover:bg-zinc-800 rounded"
+              className="p-1 hover:bg-gray-100 rounded"
             >
-              <X className="w-5 h-5 text-zinc-500" />
+              <X className="w-5 h-5 text-gray-500" />
             </button>
           </div>
 
           {selectedSegment.stays.length === 0 ? (
-            <p className="text-zinc-500 text-sm">ไม่มีข้อมูล</p>
+            <p className="text-gray-500 text-sm">ไม่มีข้อมูล</p>
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
-                  <tr className="bg-zinc-800">
+                  <tr className="bg-gray-100">
                     {selectedSegment.type === 'booking' ? (
                       <>
-                        <th className="px-3 py-2 text-left font-medium text-zinc-400">เลขที่จอง</th>
-                        <th className="px-3 py-2 text-left font-medium text-zinc-400">ลูกค้า</th>
-                        <th className="px-3 py-2 text-left font-medium text-zinc-400">วันจอง</th>
-                        <th className="px-3 py-2 text-left font-medium text-zinc-400">เช็คอิน</th>
-                        <th className="px-3 py-2 text-left font-medium text-zinc-400">เช็คเอาท์</th>
-                        <th className="px-3 py-2 text-left font-medium text-zinc-400">คืน</th>
-                        <th className="px-3 py-2 text-left font-medium text-zinc-400">ห้อง</th>
-                        <th className="px-3 py-2 text-left font-medium text-zinc-400">สถานะ</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-500">เลขที่จอง</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-500">ลูกค้า</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-500">วันจอง</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-500">เช็คอิน</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-500">เช็คเอาท์</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-500">คืน</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-500">ห้อง</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-500">สถานะ</th>
                       </>
                     ) : (
                       <>
-                        <th className="px-3 py-2 text-left font-medium text-zinc-400">เลขที่</th>
-                        <th className="px-3 py-2 text-left font-medium text-zinc-400">ห้อง</th>
-                        <th className="px-3 py-2 text-left font-medium text-zinc-400">ลูกค้า</th>
-                        <th className="px-3 py-2 text-left font-medium text-zinc-400">เช็คอิน</th>
-                        <th className="px-3 py-2 text-left font-medium text-zinc-400">เช็คเอาท์</th>
-                        <th className="px-3 py-2 text-left font-medium text-zinc-400">คืน</th>
-                        <th className="px-3 py-2 text-left font-medium text-zinc-400">สถานะ</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-500">เลขที่</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-500">ห้อง</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-500">ลูกค้า</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-500">เช็คอิน</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-500">เช็คเอาท์</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-500">คืน</th>
+                        <th className="px-3 py-2 text-left font-medium text-gray-500">สถานะ</th>
                       </>
                     )}
                   </tr>
                 </thead>
                 <tbody>
                   {selectedSegment.stays.map((stay, idx) => (
-                    <tr key={stay.id} className={`${idx % 2 === 0 ? 'bg-zinc-900' : 'bg-zinc-800'} ${stay.source === 'new' ? 'border-l-2 border-l-red-400' : ''}`}>
+                    <tr key={stay.id} className={`${idx % 2 === 0 ? 'bg-white' : 'bg-gray-100'} ${stay.source === 'new' ? 'border-l-2 border-l-red-400' : ''}`}>
                       {selectedSegment.type === 'booking' ? (
                         <>
-                          <td className="px-3 py-2 text-zinc-300 font-mono text-xs">
+                          <td className="px-3 py-2 text-gray-700 font-mono text-xs">
                             <span className="flex items-center gap-1">
                               {stay.source === 'new' && <span className="w-1.5 h-1.5 bg-red-500 rounded-full" title="New system" />}
                               {stay.bookNo || '-'}
                             </span>
                           </td>
-                          <td className="px-3 py-2 text-zinc-300">
+                          <td className="px-3 py-2 text-gray-700">
                             {stay.customerName || '-'}
                           </td>
-                          <td className="px-3 py-2 text-zinc-300">
+                          <td className="px-3 py-2 text-gray-700">
                             {stay.bookDate ? format(stay.bookDate, 'd MMM yyyy') : '-'}
                           </td>
-                          <td className="px-3 py-2 text-zinc-300">
+                          <td className="px-3 py-2 text-gray-700">
                             {format(stay.checkIn, 'd MMM yyyy HH:mm')}
                           </td>
-                          <td className="px-3 py-2 text-zinc-300">
+                          <td className="px-3 py-2 text-gray-700">
                             {format(stay.checkOut, 'd MMM yyyy HH:mm')}
                           </td>
-                          <td className="px-3 py-2 text-zinc-300">{stay.nights}</td>
-                          <td className="px-3 py-2 text-zinc-300">{stay.roomCount || 1}</td>
+                          <td className="px-3 py-2 text-gray-700">{stay.nights}</td>
+                          <td className="px-3 py-2 text-gray-700">{stay.roomCount || 1}</td>
                           <td className="px-3 py-2">
                             <span className={`px-2 py-0.5 rounded-full text-xs ${
                               stay.status === 'จอง' ? 'bg-amber-500/10 text-amber-400' :
                               stay.status === 'เข้าพัก' ? 'bg-green-500/10 text-green-400' :
-                              stay.status === 'เสร็จสิ้น' ? 'bg-zinc-800 text-zinc-400' :
-                              stay.status === 'ยกเลิก' ? 'bg-red-500/10 text-red-400' :
-                              'bg-zinc-800 text-zinc-400'
+                              stay.status === 'เสร็จสิ้น' ? 'bg-gray-100 text-gray-500' :
+                              stay.status === 'ยกเลิก' ? 'bg-red-500/10 text-red-600' :
+                              'bg-gray-100 text-gray-500'
                             }`}>
                               {stay.status || '-'}
                             </span>
@@ -454,30 +454,30 @@ export default function StayTimeline({
                         </>
                       ) : (
                         <>
-                          <td className="px-3 py-2 text-zinc-300 font-mono text-xs">
+                          <td className="px-3 py-2 text-gray-700 font-mono text-xs">
                             <span className="flex items-center gap-1">
                               {stay.source === 'new' && <span className="w-1.5 h-1.5 bg-red-500 rounded-full" title="New system" />}
                               {stay.checkinNo || '-'}
                             </span>
                           </td>
-                          <td className="px-3 py-2 text-zinc-300 font-medium">
+                          <td className="px-3 py-2 text-gray-700 font-medium">
                             {stay.roomNo || '-'}
                           </td>
-                          <td className="px-3 py-2 text-zinc-300">
+                          <td className="px-3 py-2 text-gray-700">
                             {stay.customerName || '-'}
                           </td>
-                          <td className="px-3 py-2 text-zinc-300">
+                          <td className="px-3 py-2 text-gray-700">
                             {format(stay.checkIn, 'd MMM yyyy HH:mm')}
                           </td>
-                          <td className="px-3 py-2 text-zinc-300">
+                          <td className="px-3 py-2 text-gray-700">
                             {format(stay.checkOut, 'd MMM yyyy HH:mm')}
                           </td>
-                          <td className="px-3 py-2 text-zinc-300">{stay.nights}</td>
+                          <td className="px-3 py-2 text-gray-700">{stay.nights}</td>
                           <td className="px-3 py-2">
                             <span className={`px-2 py-0.5 rounded-full text-xs ${
                               stay.status === 'เข้าพัก' ? 'bg-green-500/10 text-green-400' :
-                              stay.status === 'เสร็จสิ้น' ? 'bg-zinc-800 text-zinc-400' :
-                              'bg-red-500/10 text-red-400'
+                              stay.status === 'เสร็จสิ้น' ? 'bg-gray-100 text-gray-500' :
+                              'bg-red-500/10 text-red-600'
                             }`}>
                               {stay.status || '-'}
                             </span>

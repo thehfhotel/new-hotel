@@ -200,22 +200,22 @@ export default function RoomInventoryChecklist({
 
   return (
     <div
-      className="fixed inset-0 bg-black/60 flex items-center justify-center z-50"
+      className="fixed inset-0 bg-black/30 flex items-center justify-center z-50"
       onClick={onClose}
     >
       <div
-        className="bg-zinc-900 rounded-xl shadow-2xl border border-zinc-800 w-full max-w-2xl mx-4 max-h-[90vh] flex flex-col"
+        className="bg-white rounded-xl shadow-2xl border border-gray-200 w-full max-w-2xl mx-4 max-h-[90vh] flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="flex items-center justify-between p-4 border-b border-zinc-800">
+        <div className="flex items-center justify-between p-4 border-b border-gray-200">
           <div>
-            <h2 className="text-xl font-bold text-zinc-100">ตรวจสอบสินค้าในห้อง</h2>
-            <p className="text-sm text-zinc-500">ห้อง {roomNumber}</p>
+            <h2 className="text-xl font-bold text-gray-900">ตรวจสอบสินค้าในห้อง</h2>
+            <p className="text-sm text-gray-500">ห้อง {roomNumber}</p>
           </div>
           <button
             onClick={onClose}
-            className="p-2 hover:bg-zinc-800 rounded-lg transition-colors"
+            className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
           >
             <X size={20} />
           </button>
@@ -226,39 +226,39 @@ export default function RoomInventoryChecklist({
           {loading ? (
             <div className="flex items-center justify-center py-12">
               <Loader2 className="w-6 h-6 animate-spin text-red-600" />
-              <span className="ml-2 text-zinc-400">กำลังโหลด...</span>
+              <span className="ml-2 text-gray-500">กำลังโหลด...</span>
             </div>
           ) : error && items.length === 0 ? (
             <div className="text-center py-12">
               <AlertTriangle className="w-12 h-12 text-amber-400 mx-auto mb-3" />
-              <p className="text-zinc-400">{error}</p>
+              <p className="text-gray-500">{error}</p>
               <button
                 onClick={fetchRoomInventory}
-                className="mt-4 text-red-400 hover:text-red-300 font-medium"
+                className="mt-4 text-red-600 hover:text-red-300 font-medium"
               >
                 ลองใหม่
               </button>
             </div>
           ) : items.length === 0 ? (
             <div className="text-center py-12">
-              <Package className="w-12 h-12 text-zinc-600 mx-auto mb-3" />
-              <p className="text-zinc-500">ไม่มีสินค้าที่กำหนดให้ห้องนี้</p>
+              <Package className="w-12 h-12 text-gray-400 mx-auto mb-3" />
+              <p className="text-gray-500">ไม่มีสินค้าที่กำหนดให้ห้องนี้</p>
             </div>
           ) : (
             <div className="space-y-6">
               {/* Error Message */}
               {error && (
-                <div className="flex items-center gap-2 p-3 bg-red-500/10 border border-red-500 rounded-lg text-red-400 text-sm">
+                <div className="flex items-center gap-2 p-3 bg-red-500/10 border border-red-500 rounded-lg text-red-600 text-sm">
                   <AlertTriangle className="w-4 h-4 flex-shrink-0" />
                   {error}
                 </div>
               )}
 
               {/* Summary */}
-              <div className="flex items-center gap-4 p-3 bg-zinc-800 rounded-lg">
+              <div className="flex items-center gap-4 p-3 bg-gray-100 rounded-lg">
                 <div className="flex items-center gap-2">
-                  <Package className="w-5 h-5 text-zinc-500" />
-                  <span className="text-zinc-400">สินค้าทั้งหมด: {items.length} รายการ</span>
+                  <Package className="w-5 h-5 text-gray-500" />
+                  <span className="text-gray-500">สินค้าทั้งหมด: {items.length} รายการ</span>
                 </div>
                 {missingCount > 0 && (
                   <div className="flex items-center gap-2 text-amber-400">
@@ -271,9 +271,9 @@ export default function RoomInventoryChecklist({
               {/* Items grouped by category */}
               {Object.entries(groupedItems).map(([category, categoryItems]) => (
                 <div key={category} className="space-y-2">
-                  <h3 className="font-medium text-zinc-300 flex items-center gap-2">
+                  <h3 className="font-medium text-gray-700 flex items-center gap-2">
                     {getCategoryLabel(category)}
-                    <span className="text-sm text-zinc-500">({categoryItems.length})</span>
+                    <span className="text-sm text-gray-500">({categoryItems.length})</span>
                   </h3>
                   <div className="space-y-2">
                     {categoryItems.map((item) => {
@@ -294,14 +294,14 @@ export default function RoomInventoryChecklist({
                               className={`w-6 h-6 rounded border-2 flex items-center justify-center transition-colors ${
                                 item.verified
                                   ? 'border-green-500 bg-green-500 text-white'
-                                  : 'border-zinc-700 bg-zinc-900'
+                                  : 'border-gray-300 bg-white'
                               }`}
                             >
                               {item.verified && <Check className="w-4 h-4" />}
                             </button>
                             <div>
-                              <div className="font-medium text-zinc-200">{item.itemName}</div>
-                              <div className="text-xs text-zinc-500">
+                              <div className="font-medium text-gray-800">{item.itemName}</div>
+                              <div className="text-xs text-gray-500">
                                 {item.itemCode} - กำหนด: {item.assignedQuantity} {item.unit}
                               </div>
                             </div>
@@ -315,9 +315,9 @@ export default function RoomInventoryChecklist({
                               }
                               min="0"
                               max={item.assignedQuantity * 2}
-                              className="w-16 px-2 py-1 text-center bg-zinc-800 border border-zinc-700 text-zinc-200 rounded focus:ring-2 focus:ring-red-500 focus:border-red-500"
+                              className="w-16 px-2 py-1 text-center bg-gray-100 border border-gray-300 text-gray-800 rounded focus:ring-2 focus:ring-red-500 focus:border-red-500"
                             />
-                            <span className="text-sm text-zinc-500">{item.unit}</span>
+                            <span className="text-sm text-gray-500">{item.unit}</span>
                             {isMissing ? (
                               <XCircle className="w-5 h-5 text-amber-400" />
                             ) : (
@@ -333,7 +333,7 @@ export default function RoomInventoryChecklist({
 
               {/* Notes */}
               <div>
-                <label className="block text-sm font-medium text-zinc-300 mb-1">
+                <label className="block text-sm font-medium text-gray-700 mb-1">
                   <FileText size={16} className="inline mr-1" />
                   หมายเหตุ
                 </label>
@@ -342,7 +342,7 @@ export default function RoomInventoryChecklist({
                   onChange={(e) => setNotes(e.target.value)}
                   placeholder="หมายเหตุเพิ่มเติม..."
                   rows={2}
-                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 resize-none"
+                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 resize-none"
                 />
               </div>
             </div>
@@ -351,11 +351,11 @@ export default function RoomInventoryChecklist({
 
         {/* Footer */}
         {items.length > 0 && (
-          <div className="p-4 border-t border-zinc-800 bg-zinc-800 flex items-center justify-between gap-3">
+          <div className="p-4 border-t border-gray-200 bg-gray-100 flex items-center justify-between gap-3">
             <button
               type="button"
               onClick={onClose}
-              className="px-4 py-2 border border-zinc-700 text-zinc-300 rounded-lg hover:bg-zinc-800"
+              className="px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-100"
               disabled={submitting}
             >
               ยกเลิก

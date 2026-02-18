@@ -202,21 +202,21 @@ export default function CustomerPicker({
       <div
         className={`
           flex items-center gap-2 px-3 py-2 border rounded-lg transition-colors
-          ${disabled ? 'bg-zinc-800 cursor-not-allowed' : 'bg-zinc-900 cursor-pointer'}
-          ${isOpen ? 'border-red-500 ring-2 ring-red-500/20' : 'border-zinc-700 hover:border-zinc-600'}
+          ${disabled ? 'bg-gray-100 cursor-not-allowed' : 'bg-white cursor-pointer'}
+          ${isOpen ? 'border-red-500 ring-2 ring-red-500/20' : 'border-gray-300 hover:border-gray-400'}
         `}
         onClick={() => !disabled && setIsOpen(true)}
       >
         {value && !isOpen ? (
           // Show selected customer
           <>
-            <User className="w-4 h-4 text-zinc-500 flex-shrink-0" />
+            <User className="w-4 h-4 text-gray-500 flex-shrink-0" />
             <div className="flex-1 min-w-0">
-              <span className="font-medium text-zinc-200 truncate">
+              <span className="font-medium text-gray-800 truncate">
                 {getDisplayName(value)}
               </span>
               {value.phone && (
-                <span className="text-zinc-500 text-sm ml-2">
+                <span className="text-gray-500 text-sm ml-2">
                   ({value.phone})
                 </span>
               )}
@@ -228,17 +228,17 @@ export default function CustomerPicker({
                   e.stopPropagation()
                   handleClear()
                 }}
-                className="p-1 hover:bg-zinc-800 rounded-full transition-colors"
+                className="p-1 hover:bg-gray-100 rounded-full transition-colors"
                 aria-label="ล้าง"
               >
-                <X className="w-4 h-4 text-zinc-500" />
+                <X className="w-4 h-4 text-gray-500" />
               </button>
             )}
           </>
         ) : (
           // Show search input
           <>
-            <Search className="w-4 h-4 text-zinc-500 flex-shrink-0" />
+            <Search className="w-4 h-4 text-gray-500 flex-shrink-0" />
             <input
               ref={inputRef}
               type="text"
@@ -248,7 +248,7 @@ export default function CustomerPicker({
               onFocus={() => setIsOpen(true)}
               placeholder={placeholder}
               disabled={disabled}
-              className="flex-1 min-w-0 bg-transparent outline-none text-zinc-200 placeholder-zinc-500"
+              className="flex-1 min-w-0 bg-transparent outline-none text-gray-800 placeholder-gray-400"
             />
             {searchQuery && (
               <button
@@ -257,14 +257,14 @@ export default function CustomerPicker({
                   e.stopPropagation()
                   setSearchQuery('')
                 }}
-                className="p-1 hover:bg-zinc-800 rounded-full transition-colors"
+                className="p-1 hover:bg-gray-100 rounded-full transition-colors"
                 aria-label="ล้าง"
               >
-                <X className="w-4 h-4 text-zinc-500" />
+                <X className="w-4 h-4 text-gray-500" />
               </button>
             )}
             <ChevronDown
-              className={`w-4 h-4 text-zinc-500 transition-transform ${
+              className={`w-4 h-4 text-gray-500 transition-transform ${
                 isOpen ? 'rotate-180' : ''
               }`}
             />
@@ -274,10 +274,10 @@ export default function CustomerPicker({
 
       {/* Dropdown */}
       {isOpen && !disabled && (
-        <div className="absolute z-50 w-full mt-1 bg-zinc-900 border border-zinc-800 rounded-lg shadow-lg overflow-hidden">
+        <div className="absolute z-50 w-full mt-1 bg-white border border-gray-200 rounded-lg shadow-lg overflow-hidden">
           {/* Loading */}
           {loading && (
-            <div className="flex items-center justify-center py-4 text-zinc-500">
+            <div className="flex items-center justify-center py-4 text-gray-500">
               <Loader2 className="w-5 h-5 animate-spin mr-2" />
               <span className="text-sm">กำลังค้นหา...</span>
             </div>
@@ -297,21 +297,21 @@ export default function CustomerPicker({
                   onMouseEnter={() => setHighlightedIndex(index)}
                   className={`
                     px-3 py-2 cursor-pointer transition-colors
-                    ${index === highlightedIndex ? 'bg-red-500/10' : 'hover:bg-zinc-800'}
+                    ${index === highlightedIndex ? 'bg-red-500/10' : 'hover:bg-gray-100'}
                     ${value?.id === customer.id ? 'bg-red-500/10' : ''}
                   `}
                   role="option"
                   aria-selected={value?.id === customer.id}
                 >
                   <div className="flex items-start gap-3">
-                    <div className="w-8 h-8 bg-zinc-800 rounded-full flex items-center justify-center flex-shrink-0 mt-0.5">
-                      <User className="w-4 h-4 text-zinc-500" />
+                    <div className="w-8 h-8 bg-gray-100 rounded-full flex items-center justify-center flex-shrink-0 mt-0.5">
+                      <User className="w-4 h-4 text-gray-500" />
                     </div>
                     <div className="flex-1 min-w-0">
-                      <div className="font-medium text-zinc-200">
+                      <div className="font-medium text-gray-800">
                         {getDisplayName(customer)}
                       </div>
-                      <div className="flex items-center gap-3 text-sm text-zinc-500 mt-0.5">
+                      <div className="flex items-center gap-3 text-sm text-gray-500 mt-0.5">
                         {customer.phone && (
                           <span className="flex items-center gap-1">
                             <Phone className="w-3 h-3" />
@@ -334,30 +334,30 @@ export default function CustomerPicker({
 
           {/* No Results */}
           {!loading && options.length === 0 && debouncedSearch && (
-            <div className="py-4 text-center text-zinc-500">
-              <User className="w-8 h-8 text-zinc-600 mx-auto mb-2" />
+            <div className="py-4 text-center text-gray-500">
+              <User className="w-8 h-8 text-gray-400 mx-auto mb-2" />
               <p className="text-sm">ไม่พบลูกค้าที่ตรงกับ &quot;{debouncedSearch}&quot;</p>
             </div>
           )}
 
           {/* Empty State (no search) */}
           {!loading && options.length === 0 && !debouncedSearch && (
-            <div className="py-4 text-center text-zinc-500">
-              <Search className="w-8 h-8 text-zinc-600 mx-auto mb-2" />
+            <div className="py-4 text-center text-gray-500">
+              <Search className="w-8 h-8 text-gray-400 mx-auto mb-2" />
               <p className="text-sm">พิมพ์เพื่อค้นหาลูกค้า</p>
             </div>
           )}
 
           {/* Add New Button */}
           {onAddNew && (
-            <div className="border-t border-zinc-800">
+            <div className="border-t border-gray-200">
               <button
                 type="button"
                 onClick={() => {
                   setIsOpen(false)
                   onAddNew()
                 }}
-                className="w-full flex items-center justify-center gap-2 px-3 py-2 text-red-400 hover:bg-red-500/10 transition-colors"
+                className="w-full flex items-center justify-center gap-2 px-3 py-2 text-red-600 hover:bg-red-500/10 transition-colors"
               >
                 <UserPlus className="w-4 h-4" />
                 <span className="text-sm font-medium">เพิ่มลูกค้าใหม่</span>

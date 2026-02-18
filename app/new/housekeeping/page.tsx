@@ -204,11 +204,11 @@ export default function HousekeepingPage() {
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold text-zinc-100 flex items-center gap-2">
-            <Sparkles className="w-7 h-7 text-red-400" />
+          <h1 className="text-2xl font-bold text-gray-900 flex items-center gap-2">
+            <Sparkles className="w-7 h-7 text-red-600" />
             แผนกแม่บ้าน
           </h1>
-          <p className="text-sm text-zinc-500 mt-1">
+          <p className="text-sm text-gray-500 mt-1">
             จัดการสถานะความสะอาดห้องพัก | รีเฟรชล่าสุด: {formatLastRefresh()}
           </p>
         </div>
@@ -216,13 +216,13 @@ export default function HousekeepingPage() {
         <div className="flex items-center gap-3">
           {/* Floor Filter */}
           <div className="flex items-center gap-2">
-            <Filter className="w-4 h-4 text-zinc-500" />
+            <Filter className="w-4 h-4 text-gray-500" />
             <select
               value={floorFilter ?? ''}
               onChange={(e) =>
                 setFloorFilter(e.target.value ? parseInt(e.target.value) : null)
               }
-              className="px-3 py-2 border border-zinc-700 rounded-lg text-sm bg-zinc-900 text-zinc-200 focus:ring-2 focus:ring-red-500 focus:border-red-500"
+              className="px-3 py-2 border border-gray-300 rounded-lg text-sm bg-white text-gray-800 focus:ring-2 focus:ring-red-500 focus:border-red-500"
             >
               <option value="">ทุกชั้น</option>
               {floors.map((floor) => (
@@ -237,7 +237,7 @@ export default function HousekeepingPage() {
           <button
             onClick={fetchRooms}
             disabled={loading}
-            className="flex items-center gap-2 px-4 py-2 border border-zinc-700 text-zinc-400 rounded-lg hover:bg-zinc-800 disabled:opacity-50"
+            className="flex items-center gap-2 px-4 py-2 border border-gray-300 text-gray-500 rounded-lg hover:bg-gray-100 disabled:opacity-50"
           >
             <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
             <span className="hidden sm:inline">รีเฟรช</span>
@@ -250,7 +250,7 @@ export default function HousekeepingPage() {
 
       {/* Error Message */}
       {error && (
-        <div className="flex items-center gap-2 p-4 bg-red-950/50 border border-red-900/50 rounded-lg text-red-400">
+        <div className="flex items-center gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-600">
           <AlertCircle className="w-5 h-5" />
           <span>{error}</span>
         </div>
@@ -260,7 +260,7 @@ export default function HousekeepingPage() {
       {loading && rooms.length === 0 ? (
         <div className="flex items-center justify-center py-12">
           <Loader2 className="w-8 h-8 animate-spin text-red-500" />
-          <span className="ml-2 text-zinc-400">กำลังโหลด...</span>
+          <span className="ml-2 text-gray-500">กำลังโหลด...</span>
         </div>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -291,7 +291,7 @@ export default function HousekeepingPage() {
               {/* Column Content */}
               <div className="p-4 space-y-3 max-h-[600px] overflow-y-auto">
                 {roomsByStatus[column.id].length === 0 ? (
-                  <div className="text-center py-8 text-zinc-500">
+                  <div className="text-center py-8 text-gray-500">
                     <p>ไม่มีห้องในหมวดนี้</p>
                   </div>
                 ) : (
@@ -313,7 +313,7 @@ export default function HousekeepingPage() {
       )}
 
       {/* Auto-refresh indicator */}
-      <div className="text-center text-sm text-zinc-600">
+      <div className="text-center text-sm text-gray-400">
         ระบบจะรีเฟรชอัตโนมัติทุก 30 วินาที
       </div>
     </div>

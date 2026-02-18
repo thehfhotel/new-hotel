@@ -113,7 +113,7 @@ export default function TransactionHistoryPage() {
         break
       default:
         icon = <FileText className="w-4 h-4" />
-        color = 'text-zinc-400 bg-zinc-800'
+        color = 'text-gray-500 bg-gray-100'
     }
 
     return {
@@ -221,10 +221,10 @@ export default function TransactionHistoryPage() {
       {/* Page Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <FileText className="w-8 h-8 text-red-400" />
+          <FileText className="w-8 h-8 text-red-600" />
           <div>
-            <h1 className="text-2xl font-bold text-zinc-200">ประวัติการเคลื่อนไหว</h1>
-            <p className="text-zinc-400">
+            <h1 className="text-2xl font-bold text-gray-900">ประวัติการเคลื่อนไหว</h1>
+            <p className="text-gray-500">
               รายการทั้งหมด {transactions.length} รายการ
             </p>
           </div>
@@ -234,7 +234,7 @@ export default function TransactionHistoryPage() {
         <button
           onClick={handlePrint}
           disabled={transactions.length === 0}
-          className="flex items-center gap-2 px-4 py-2 bg-zinc-700 text-white rounded-lg hover:bg-zinc-600 transition-colors disabled:opacity-50"
+          className="flex items-center gap-2 px-4 py-2 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300 transition-colors disabled:opacity-50"
         >
           <Printer className="w-5 h-5" />
           พิมพ์
@@ -242,22 +242,22 @@ export default function TransactionHistoryPage() {
       </div>
 
       {/* Search and Filter Bar */}
-      <div className="bg-zinc-900 rounded-lg border border-zinc-800 p-4">
+      <div className="bg-white rounded-lg border border-gray-200 p-4">
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
           {/* Search */}
           <div className="relative lg:col-span-2">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-zinc-500" />
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-500" />
             <input
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="ค้นหาด้วยรหัส หรือ ชื่อสินค้า..."
-              className="w-full pl-10 pr-4 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+              className="w-full pl-10 pr-4 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
             />
             {searchQuery && (
               <button
                 onClick={() => setSearchQuery('')}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-400"
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-500"
                 aria-label="ล้างการค้นหา"
               >
                 <X className="w-4 h-4" />
@@ -270,7 +270,7 @@ export default function TransactionHistoryPage() {
             <select
               value={typeFilter}
               onChange={(e) => setTypeFilter(e.target.value as TransactionType | '')}
-              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none"
+              className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none"
             >
               <option value="">ทุกประเภท</option>
               {TRANSACTION_TYPES.map((type) => (
@@ -283,24 +283,24 @@ export default function TransactionHistoryPage() {
 
           {/* Date From */}
           <div className="relative">
-            <Calendar className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-zinc-500" />
+            <Calendar className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-500" />
             <input
               type="date"
               value={dateFrom}
               onChange={(e) => setDateFrom(e.target.value)}
-              className="w-full pl-10 pr-4 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none"
+              className="w-full pl-10 pr-4 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none"
               placeholder="จากวันที่"
             />
           </div>
 
           {/* Date To */}
           <div className="relative">
-            <Calendar className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-zinc-500" />
+            <Calendar className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-500" />
             <input
               type="date"
               value={dateTo}
               onChange={(e) => setDateTo(e.target.value)}
-              className="w-full pl-10 pr-4 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none"
+              className="w-full pl-10 pr-4 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none"
               placeholder="ถึงวันที่"
             />
           </div>
@@ -309,12 +309,12 @@ export default function TransactionHistoryPage() {
         {/* Clear Filters */}
         {hasFilters && (
           <div className="mt-4 flex items-center justify-between">
-            <p className="text-sm text-zinc-400">
+            <p className="text-sm text-gray-500">
               กำลังแสดงผลตามตัวกรอง
             </p>
             <button
               onClick={clearFilters}
-              className="text-sm text-red-400 hover:text-red-300"
+              className="text-sm text-red-600 hover:text-red-500"
             >
               ล้างตัวกรองทั้งหมด
             </button>
@@ -324,45 +324,45 @@ export default function TransactionHistoryPage() {
 
       {/* Error Message */}
       {error && (
-        <div className="flex items-center gap-2 p-4 bg-red-950/50 border border-red-900/50 rounded-lg text-red-400">
+        <div className="flex items-center gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-600">
           <AlertCircle className="w-5 h-5 flex-shrink-0" />
           <span>{error}</span>
         </div>
       )}
 
       {/* Transactions Table */}
-      <div className="bg-zinc-900 rounded-lg border border-zinc-800 overflow-hidden" ref={printRef}>
+      <div className="bg-white rounded-lg border border-gray-200 overflow-hidden" ref={printRef}>
         {loading ? (
           <div className="flex items-center justify-center py-12">
             <Loader2 className="w-6 h-6 animate-spin text-red-500" />
-            <span className="ml-2 text-zinc-400">กำลังโหลดข้อมูล...</span>
+            <span className="ml-2 text-gray-500">กำลังโหลดข้อมูล...</span>
           </div>
         ) : transactions.length === 0 ? (
-          <div className="text-center py-12 text-zinc-500">
-            <FileText className="w-12 h-12 text-zinc-600 mx-auto mb-3" />
+          <div className="text-center py-12 text-gray-500">
+            <FileText className="w-12 h-12 text-gray-400 mx-auto mb-3" />
             <p>ไม่พบรายการเคลื่อนไหว</p>
           </div>
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full">
-              <thead className="bg-zinc-800 border-b border-zinc-800">
+              <thead className="bg-gray-100 border-b border-gray-200">
                 <tr>
-                  <th className="px-4 py-3 text-left text-sm font-medium text-zinc-400">วันที่</th>
-                  <th className="px-4 py-3 text-left text-sm font-medium text-zinc-400">ประเภท</th>
-                  <th className="px-4 py-3 text-left text-sm font-medium text-zinc-400">สินค้า</th>
-                  <th className="px-4 py-3 text-right text-sm font-medium text-zinc-400">จำนวน</th>
-                  <th className="px-4 py-3 text-center text-sm font-medium text-zinc-400">สต็อก</th>
-                  <th className="px-4 py-3 text-left text-sm font-medium text-zinc-400">ห้อง</th>
-                  <th className="px-4 py-3 text-left text-sm font-medium text-zinc-400">หมายเหตุ</th>
-                  <th className="px-4 py-3 text-left text-sm font-medium text-zinc-400">ผู้ดำเนินการ</th>
+                  <th className="px-4 py-3 text-left text-sm font-medium text-gray-500">วันที่</th>
+                  <th className="px-4 py-3 text-left text-sm font-medium text-gray-500">ประเภท</th>
+                  <th className="px-4 py-3 text-left text-sm font-medium text-gray-500">สินค้า</th>
+                  <th className="px-4 py-3 text-right text-sm font-medium text-gray-500">จำนวน</th>
+                  <th className="px-4 py-3 text-center text-sm font-medium text-gray-500">สต็อก</th>
+                  <th className="px-4 py-3 text-left text-sm font-medium text-gray-500">ห้อง</th>
+                  <th className="px-4 py-3 text-left text-sm font-medium text-gray-500">หมายเหตุ</th>
+                  <th className="px-4 py-3 text-left text-sm font-medium text-gray-500">ผู้ดำเนินการ</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-zinc-800">
+              <tbody className="divide-y divide-gray-200">
                 {transactions.map((tx) => {
                   const typeInfo = getTransactionTypeInfo(tx.transactionType)
                   return (
-                    <tr key={tx.id} className="hover:bg-zinc-800">
-                      <td className="px-4 py-3 text-sm text-zinc-400">
+                    <tr key={tx.id} className="hover:bg-gray-100">
+                      <td className="px-4 py-3 text-sm text-gray-500">
                         {formatDate(tx.createdAt)}
                       </td>
                       <td className="px-4 py-3">
@@ -372,31 +372,31 @@ export default function TransactionHistoryPage() {
                         </span>
                       </td>
                       <td className="px-4 py-3">
-                        <div className="font-medium text-zinc-200">{tx.itemName}</div>
-                        <div className="text-xs text-zinc-500">{tx.itemCode}</div>
+                        <div className="font-medium text-gray-900">{tx.itemName}</div>
+                        <div className="text-xs text-gray-500">{tx.itemCode}</div>
                       </td>
                       <td className="px-4 py-3 text-right">
                         <span className={`font-bold text-lg ${
-                          tx.transactionType === 'IN' ? 'text-emerald-400' :
-                          tx.transactionType === 'OUT' ? 'text-red-400' :
-                          'text-red-400'
+                          tx.transactionType === 'IN' ? 'text-emerald-600' :
+                          tx.transactionType === 'OUT' ? 'text-red-600' :
+                          'text-red-600'
                         }`}>
                           {tx.transactionType === 'IN' ? '+' : tx.transactionType === 'OUT' ? '-' : ''}
                           {tx.quantity}
                         </span>
                       </td>
                       <td className="px-4 py-3 text-center text-sm">
-                        <span className="text-zinc-500">{tx.previousStock}</span>
-                        <span className="mx-1 text-zinc-600">→</span>
-                        <span className="font-medium text-zinc-200">{tx.newStock}</span>
+                        <span className="text-gray-500">{tx.previousStock}</span>
+                        <span className="mx-1 text-gray-400">→</span>
+                        <span className="font-medium text-gray-900">{tx.newStock}</span>
                       </td>
-                      <td className="px-4 py-3 text-sm text-zinc-400">
+                      <td className="px-4 py-3 text-sm text-gray-500">
                         {tx.roomNumber ? `ห้อง ${tx.roomNumber}` : '-'}
                       </td>
-                      <td className="px-4 py-3 text-sm text-zinc-400 max-w-xs truncate">
+                      <td className="px-4 py-3 text-sm text-gray-500 max-w-xs truncate">
                         {tx.notes || '-'}
                       </td>
-                      <td className="px-4 py-3 text-sm text-zinc-400">
+                      <td className="px-4 py-3 text-sm text-gray-500">
                         {tx.createdBy || '-'}
                       </td>
                     </tr>

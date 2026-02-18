@@ -139,13 +139,13 @@ export default function BillingPage() {
         )
       case 'cancelled':
         return (
-          <span className="px-2 py-1 text-xs font-medium rounded-full bg-red-500/10 text-red-400">
+          <span className="px-2 py-1 text-xs font-medium rounded-full bg-red-500/10 text-red-600">
             ยกเลิก
           </span>
         )
       default:
         return (
-          <span className="px-2 py-1 text-xs font-medium rounded-full bg-zinc-700 text-zinc-300">
+          <span className="px-2 py-1 text-xs font-medium rounded-full bg-gray-200 text-gray-700">
             {status}
           </span>
         )
@@ -169,27 +169,27 @@ export default function BillingPage() {
       {/* Page Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <Receipt className="w-8 h-8 text-red-400" />
+          <Receipt className="w-8 h-8 text-red-600" />
           <div>
-            <h1 className="text-2xl font-bold text-zinc-100">ใบแจ้งหนี้</h1>
-            <p className="text-zinc-400">Billing / Invoice</p>
+            <h1 className="text-2xl font-bold text-gray-900">ใบแจ้งหนี้</h1>
+            <p className="text-gray-500">Billing / Invoice</p>
           </div>
         </div>
       </div>
 
       {/* Search and Filters */}
-      <div className="bg-zinc-900 rounded-lg border border-zinc-800 p-4">
+      <div className="bg-white rounded-lg border border-gray-200 p-4">
         <div className="flex flex-col md:flex-row gap-4">
           {/* Search Input */}
           <div className="flex-1">
             <div className="relative">
-              <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5 text-zinc-500" />
+              <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5 text-gray-500" />
               <input
                 type="text"
                 placeholder="ค้นหาชื่อผู้เข้าพักหรือเลขที่เช็คอิน..."
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
-                className="w-full pl-10 pr-4 py-2 bg-zinc-900 text-zinc-200 border border-zinc-700 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-transparent"
+                className="w-full pl-10 pr-4 py-2 bg-white text-gray-800 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-transparent"
               />
             </div>
           </div>
@@ -202,7 +202,7 @@ export default function BillingPage() {
                 setStatusFilter(e.target.value)
                 setPagination((prev) => ({ ...prev, page: 1 }))
               }}
-              className="px-4 py-2 bg-zinc-900 text-zinc-200 border border-zinc-700 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-transparent"
+              className="px-4 py-2 bg-white text-gray-800 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-transparent"
             >
               <option value="all">ทุกสถานะ</option>
               <option value="active">เข้าพักอยู่</option>
@@ -213,8 +213,8 @@ export default function BillingPage() {
               onClick={() => setShowFilters(!showFilters)}
               className={`flex items-center gap-2 px-4 py-2 rounded-lg border ${
                 showFilters
-                  ? 'bg-red-500/10 border-red-500/30 text-red-400'
-                  : 'border-zinc-700 text-zinc-300 hover:bg-zinc-800'
+                  ? 'bg-red-500/10 border-red-500/30 text-red-600'
+                  : 'border-gray-300 text-gray-700 hover:bg-gray-100'
               }`}
             >
               <Filter className="w-4 h-4" />
@@ -225,10 +225,10 @@ export default function BillingPage() {
 
         {/* Advanced Filters */}
         {showFilters && (
-          <div className="mt-4 pt-4 border-t border-zinc-800">
+          <div className="mt-4 pt-4 border-t border-gray-200">
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <div>
-                <label className="block text-sm font-medium text-zinc-300 mb-1">
+                <label className="block text-sm font-medium text-gray-700 mb-1">
                   <Calendar className="w-4 h-4 inline mr-1" />
                   จากวันที่
                 </label>
@@ -239,11 +239,11 @@ export default function BillingPage() {
                     setStartDate(e.target.value)
                     setPagination((prev) => ({ ...prev, page: 1 }))
                   }}
-                  className="w-full px-3 py-2 bg-zinc-900 text-zinc-200 border border-zinc-700 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-transparent"
+                  className="w-full px-3 py-2 bg-white text-gray-800 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-transparent"
                 />
               </div>
               <div>
-                <label className="block text-sm font-medium text-zinc-300 mb-1">
+                <label className="block text-sm font-medium text-gray-700 mb-1">
                   <Calendar className="w-4 h-4 inline mr-1" />
                   ถึงวันที่
                 </label>
@@ -254,13 +254,13 @@ export default function BillingPage() {
                     setEndDate(e.target.value)
                     setPagination((prev) => ({ ...prev, page: 1 }))
                   }}
-                  className="w-full px-3 py-2 bg-zinc-900 text-zinc-200 border border-zinc-700 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-transparent"
+                  className="w-full px-3 py-2 bg-white text-gray-800 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-transparent"
                 />
               </div>
               <div className="flex items-end">
                 <button
                   onClick={clearFilters}
-                  className="px-4 py-2 text-sm text-zinc-400 hover:text-zinc-300 hover:bg-zinc-800 rounded-lg"
+                  className="px-4 py-2 text-sm text-gray-500 hover:text-gray-900 hover:bg-gray-100 rounded-lg"
                 >
                   ล้างตัวกรอง
                 </button>
@@ -272,87 +272,87 @@ export default function BillingPage() {
 
       {/* Error Message */}
       {error && (
-        <div className="flex items-center gap-2 p-4 bg-red-950/50 border border-red-900/50 rounded-lg text-red-400">
+        <div className="flex items-center gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-600">
           <AlertCircle className="w-5 h-5 flex-shrink-0" />
           <span>{error}</span>
         </div>
       )}
 
       {/* Table */}
-      <div className="bg-zinc-900 rounded-lg border border-zinc-800 overflow-hidden">
+      <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
         {loading ? (
           <div className="flex items-center justify-center py-12">
             <Loader2 className="w-8 h-8 animate-spin text-red-500" />
-            <span className="ml-2 text-zinc-400">กำลังโหลดข้อมูล...</span>
+            <span className="ml-2 text-gray-500">กำลังโหลดข้อมูล...</span>
           </div>
         ) : checkIns.length === 0 ? (
-          <div className="text-center py-12 text-zinc-500">
-            <Receipt className="w-16 h-16 text-zinc-600 mx-auto mb-4" />
+          <div className="text-center py-12 text-gray-500">
+            <Receipt className="w-16 h-16 text-gray-400 mx-auto mb-4" />
             <p className="text-lg">ไม่พบข้อมูลการเข้าพัก</p>
             <p className="text-sm mt-1">ลองเปลี่ยนเงื่อนไขการค้นหา</p>
           </div>
         ) : (
           <div className="overflow-x-auto">
-            <table className="min-w-full divide-y divide-zinc-800">
-              <thead className="bg-zinc-800">
+            <table className="min-w-full divide-y divide-gray-200">
+              <thead className="bg-gray-100">
                 <tr>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                     เลขที่เช็คอิน
                   </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                     <DoorOpen className="w-4 h-4 inline mr-1" />
                     ห้อง
                   </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                     <User className="w-4 h-4 inline mr-1" />
                     ชื่อผู้เข้าพัก
                   </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                     วันที่เช็คอิน
                   </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-zinc-500 uppercase tracking-wider">
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                     วันที่เช็คเอาท์
                   </th>
-                  <th className="px-6 py-3 text-right text-xs font-medium text-zinc-500 uppercase tracking-wider">
+                  <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
                     ยอดรวม (บาท)
                   </th>
-                  <th className="px-6 py-3 text-center text-xs font-medium text-zinc-500 uppercase tracking-wider">
+                  <th className="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">
                     สถานะ
                   </th>
-                  <th className="px-6 py-3 text-center text-xs font-medium text-zinc-500 uppercase tracking-wider">
+                  <th className="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">
                     ดำเนินการ
                   </th>
                 </tr>
               </thead>
-              <tbody className="bg-zinc-900 divide-y divide-zinc-800">
+              <tbody className="bg-white divide-y divide-gray-200">
                 {checkIns.map((checkIn) => (
-                  <tr key={checkIn.id} className="hover:bg-zinc-800">
+                  <tr key={checkIn.id} className="hover:bg-gray-100">
                     <td className="px-6 py-4 whitespace-nowrap">
-                      <span className="text-sm font-medium text-zinc-100">{checkIn.cinNo}</span>
+                      <span className="text-sm font-medium text-gray-900">{checkIn.cinNo}</span>
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
                       <div>
-                        <span className="text-sm font-medium text-zinc-100">
+                        <span className="text-sm font-medium text-gray-900">
                           {checkIn.roomNo || '-'}
                         </span>
                         {checkIn.roomTypeName && (
-                          <span className="block text-xs text-zinc-500">{checkIn.roomTypeName}</span>
+                          <span className="block text-xs text-gray-500">{checkIn.roomTypeName}</span>
                         )}
                       </div>
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
-                      <span className="text-sm text-zinc-100">{checkIn.customerName || '-'}</span>
+                      <span className="text-sm text-gray-900">{checkIn.customerName || '-'}</span>
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
-                      <span className="text-sm text-zinc-400">{formatDate(checkIn.checkInTime)}</span>
+                      <span className="text-sm text-gray-500">{formatDate(checkIn.checkInTime)}</span>
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
-                      <span className="text-sm text-zinc-400">
+                      <span className="text-sm text-gray-500">
                         {formatDate(checkIn.checkOutTime || checkIn.expectedCheckout)}
                       </span>
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-right">
-                      <span className="text-sm font-medium text-zinc-100">
+                      <span className="text-sm font-medium text-gray-900">
                         {formatCurrency(checkIn.totalAmount)}
                       </span>
                     </td>
@@ -362,7 +362,7 @@ export default function BillingPage() {
                     <td className="px-6 py-4 whitespace-nowrap text-center">
                       <Link
                         href={`/new/billing/${checkIn.id}`}
-                        className="inline-flex items-center gap-1 px-3 py-1.5 text-sm font-medium text-red-400 hover:text-red-300 hover:bg-red-500/10 rounded-lg"
+                        className="inline-flex items-center gap-1 px-3 py-1.5 text-sm font-medium text-red-600 hover:text-red-500 hover:bg-red-500/10 rounded-lg"
                       >
                         <Eye className="w-4 h-4" />
                         ดูใบแจ้งหนี้
@@ -377,8 +377,8 @@ export default function BillingPage() {
 
         {/* Pagination */}
         {!loading && checkIns.length > 0 && pagination.totalPages > 1 && (
-          <div className="px-6 py-4 border-t border-zinc-800 flex items-center justify-between">
-            <div className="text-sm text-zinc-400">
+          <div className="px-6 py-4 border-t border-gray-200 flex items-center justify-between">
+            <div className="text-sm text-gray-500">
               แสดง {(pagination.page - 1) * pagination.limit + 1} -{' '}
               {Math.min(pagination.page * pagination.limit, pagination.total)} จาก {pagination.total}{' '}
               รายการ
@@ -387,7 +387,7 @@ export default function BillingPage() {
               <button
                 onClick={() => handlePageChange(pagination.page - 1)}
                 disabled={pagination.page === 1}
-                className="px-3 py-1 text-sm border border-zinc-700 rounded-lg hover:bg-zinc-800 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="px-3 py-1 text-sm border border-gray-300 rounded-lg hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 ก่อนหน้า
               </button>
@@ -397,7 +397,7 @@ export default function BillingPage() {
               <button
                 onClick={() => handlePageChange(pagination.page + 1)}
                 disabled={pagination.page === pagination.totalPages}
-                className="px-3 py-1 text-sm border border-zinc-700 rounded-lg hover:bg-zinc-800 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="px-3 py-1 text-sm border border-gray-300 rounded-lg hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 ถัดไป
               </button>

@@ -50,7 +50,7 @@ const statusConfig: Record<RoomStatus, { dot: string; bg: string; border: string
   available: { dot: 'bg-emerald-500', bg: 'bg-emerald-500/10 hover:bg-emerald-500/20', border: 'border-emerald-500/30', label: 'ว่าง' },
   occupied: { dot: 'bg-red-500', bg: 'bg-red-500/10 hover:bg-red-500/20', border: 'border-red-500/30', label: 'มีผู้เข้าพัก' },
   booked: { dot: 'bg-amber-500', bg: 'bg-amber-500/10 hover:bg-amber-500/20', border: 'border-amber-500/30', label: 'จองแล้ว' },
-  maintenance: { dot: 'bg-zinc-500', bg: 'bg-zinc-800 hover:bg-zinc-700', border: 'border-zinc-600', label: 'ซ่อมบำรุง' },
+  maintenance: { dot: 'bg-zinc-500', bg: 'bg-gray-100 hover:bg-gray-200', border: 'border-gray-400', label: 'ซ่อมบำรุง' },
   cleaning: { dot: 'bg-orange-500', bg: 'bg-orange-500/10 hover:bg-orange-500/20', border: 'border-orange-500/30', label: 'ทำความสะอาด' },
   checkout: { dot: 'bg-sky-500', bg: 'bg-sky-500/10 hover:bg-sky-500/20', border: 'border-sky-500/30', label: 'รอเช็คเอาท์' },
 }
@@ -156,7 +156,7 @@ export default function NewDashboard() {
       <div className="flex items-center justify-center min-h-[50vh]">
         <div className="text-center">
           <Loader2 className="animate-spin h-12 w-12 text-red-500 mx-auto mb-4" />
-          <p className="text-zinc-500">กำลังโหลดข้อมูล...</p>
+          <p className="text-gray-500">กำลังโหลดข้อมูล...</p>
         </div>
       </div>
     )
@@ -166,8 +166,8 @@ export default function NewDashboard() {
     <div className="space-y-6">
       {/* Page Header */}
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold text-zinc-100 tracking-tight">หน้าหลัก</h1>
-        <p className="text-zinc-600 text-sm">
+        <h1 className="text-2xl font-bold text-gray-900 tracking-tight">หน้าหลัก</h1>
+        <p className="text-gray-400 text-sm">
           อัปเดตล่าสุด: {new Date().toLocaleDateString('th-TH', {
             year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit',
           })}
@@ -175,7 +175,7 @@ export default function NewDashboard() {
       </div>
 
       {error && (
-        <div className="flex items-center gap-2 p-4 bg-red-950/50 border border-red-900/50 rounded-lg text-red-400">
+        <div className="flex items-center gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-600">
           <AlertCircle className="w-5 h-5 flex-shrink-0" />
           <span>{error}</span>
         </div>
@@ -183,35 +183,35 @@ export default function NewDashboard() {
 
       {/* Stats Cards */}
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
-        <div className="bg-zinc-900 rounded-xl px-6 py-5 border border-zinc-800">
-          <p className="text-sm font-medium text-zinc-500 mb-1">ห้องทั้งหมด</p>
-          <p className="text-3xl font-bold text-zinc-100">{stats.totalRooms}</p>
+        <div className="bg-white rounded-xl px-6 py-5 border border-gray-200">
+          <p className="text-sm font-medium text-gray-500 mb-1">ห้องทั้งหมด</p>
+          <p className="text-3xl font-bold text-gray-900">{stats.totalRooms}</p>
         </div>
-        <div className="bg-zinc-900 rounded-xl px-6 py-5 border border-zinc-800">
-          <p className="text-sm font-medium text-zinc-500 mb-1">ห้องว่าง</p>
+        <div className="bg-white rounded-xl px-6 py-5 border border-gray-200">
+          <p className="text-sm font-medium text-gray-500 mb-1">ห้องว่าง</p>
           <p className="text-3xl font-bold text-emerald-400">{stats.availableRooms}</p>
         </div>
-        <div className="bg-zinc-900 rounded-xl px-6 py-5 border border-zinc-800">
-          <p className="text-sm font-medium text-zinc-500 mb-1">มีผู้เข้าพัก</p>
-          <p className="text-3xl font-bold text-red-400">{stats.occupiedRooms}</p>
+        <div className="bg-white rounded-xl px-6 py-5 border border-gray-200">
+          <p className="text-sm font-medium text-gray-500 mb-1">มีผู้เข้าพัก</p>
+          <p className="text-3xl font-bold text-red-600">{stats.occupiedRooms}</p>
         </div>
-        <div className="bg-zinc-900 rounded-xl px-6 py-5 border border-zinc-800">
-          <p className="text-sm font-medium text-zinc-500 mb-1">จองแล้ว</p>
+        <div className="bg-white rounded-xl px-6 py-5 border border-gray-200">
+          <p className="text-sm font-medium text-gray-500 mb-1">จองแล้ว</p>
           <p className="text-3xl font-bold text-amber-400">{stats.bookedRooms}</p>
         </div>
-        <div className="bg-zinc-900 rounded-xl px-6 py-5 border border-zinc-800">
-          <p className="text-sm font-medium text-zinc-500 mb-1">เช็คอินวันนี้</p>
-          <p className="text-3xl font-bold text-zinc-100">{stats.todayCheckIns}</p>
+        <div className="bg-white rounded-xl px-6 py-5 border border-gray-200">
+          <p className="text-sm font-medium text-gray-500 mb-1">เช็คอินวันนี้</p>
+          <p className="text-3xl font-bold text-gray-900">{stats.todayCheckIns}</p>
         </div>
-        <div className="bg-zinc-900 rounded-xl px-6 py-5 border border-zinc-800">
-          <p className="text-sm font-medium text-zinc-500 mb-1">เช็คเอาท์วันนี้</p>
+        <div className="bg-white rounded-xl px-6 py-5 border border-gray-200">
+          <p className="text-sm font-medium text-gray-500 mb-1">เช็คเอาท์วันนี้</p>
           <p className="text-3xl font-bold text-sky-400">{stats.todayCheckOuts}</p>
         </div>
       </div>
 
       {/* Room Grid */}
-      <div className="bg-zinc-900 rounded-xl border border-zinc-800 p-6">
-        <h2 className="text-lg font-semibold text-zinc-200 mb-4">สถานะห้องพัก</h2>
+      <div className="bg-white rounded-xl border border-gray-200 p-6">
+        <h2 className="text-lg font-semibold text-gray-800 mb-4">สถานะห้องพัก</h2>
 
         {/* Desktop Grid */}
         <div className="hidden md:block">
@@ -225,8 +225,8 @@ export default function NewDashboard() {
                   const room = roomMap.get(roomNumber.toUpperCase())
                   if (!room) {
                     return (
-                      <div key={`missing-${roomNumber}`} className="h-[60px] bg-zinc-800/50 rounded-lg flex flex-col items-center justify-center">
-                        <span className="font-bold text-[10px] text-zinc-600">{roomNumber}</span>
+                      <div key={`missing-${roomNumber}`} className="h-[60px] bg-gray-50 rounded-lg flex flex-col items-center justify-center">
+                        <span className="font-bold text-[10px] text-gray-400">{roomNumber}</span>
                       </div>
                     )
                   }
@@ -238,8 +238,8 @@ export default function NewDashboard() {
                       className={`${config.bg} border ${config.border} rounded-lg p-1 flex flex-col items-center justify-center h-[60px] transition-colors`}
                       title={`${room.roomNumber} - ${room.type} ${room.details}`}
                     >
-                      <span className="font-bold text-[11px] text-zinc-100">{room.roomNumber}</span>
-                      <span className="text-[8px] text-zinc-400">{room.type}</span>
+                      <span className="font-bold text-[11px] text-gray-900">{room.roomNumber}</span>
+                      <span className="text-[8px] text-gray-500">{room.type}</span>
                     </button>
                   )
                 })}
@@ -262,45 +262,45 @@ export default function NewDashboard() {
                 className={`${config.bg} w-full flex items-center gap-3 p-3 rounded-lg border ${config.border}`}
               >
                 <div className={`w-2.5 h-2.5 rounded-full ${config.dot}`} />
-                <span className="font-bold text-sm text-zinc-100">{room.roomNumber}</span>
-                <span className="text-zinc-400 text-sm">{room.type}</span>
+                <span className="font-bold text-sm text-gray-900">{room.roomNumber}</span>
+                <span className="text-gray-500 text-sm">{room.type}</span>
               </button>
             )
           })}
         </div>
 
         {/* Legend */}
-        <div className="flex flex-wrap gap-4 mt-4 pt-4 border-t border-zinc-800">
+        <div className="flex flex-wrap gap-4 mt-4 pt-4 border-t border-gray-200">
           {Object.entries(statusConfig).map(([status, config]) => (
             <div key={status} className="flex items-center gap-2">
               <div className={`w-2.5 h-2.5 rounded-full ${config.dot}`} />
-              <span className="text-xs text-zinc-400">{config.label}</span>
+              <span className="text-xs text-gray-500">{config.label}</span>
             </div>
           ))}
         </div>
       </div>
 
       {/* Recent Activity */}
-      <div className="bg-zinc-900 rounded-xl border border-zinc-800 p-6">
-        <h3 className="text-lg font-semibold text-zinc-200 mb-4 flex items-center gap-2">
+      <div className="bg-white rounded-xl border border-gray-200 p-6">
+        <h3 className="text-lg font-semibold text-gray-800 mb-4 flex items-center gap-2">
           <Clock size={20} className="text-red-500" />
           กิจกรรมล่าสุด
         </h3>
         <div className="space-y-2">
           {checkIns.length > 0 ? (
             checkIns.slice(0, 5).map((checkin, i) => (
-              <div key={i} className="flex items-center justify-between p-3 bg-zinc-800/50 rounded-lg">
+              <div key={i} className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
                 <div className="flex items-center gap-3">
                   <div className="w-9 h-9 bg-red-500/10 rounded-full flex items-center justify-center">
-                    <LogIn size={16} className="text-red-400" />
+                    <LogIn size={16} className="text-red-600" />
                   </div>
                   <div>
-                    <p className="font-medium text-zinc-200 text-sm">{checkin.guestName}</p>
-                    <p className="text-xs text-zinc-500">ห้อง {checkin.roomNumber}</p>
+                    <p className="font-medium text-gray-800 text-sm">{checkin.guestName}</p>
+                    <p className="text-xs text-gray-500">ห้อง {checkin.roomNumber}</p>
                   </div>
                 </div>
                 <div className="text-right">
-                  <p className="text-xs text-zinc-400">
+                  <p className="text-xs text-gray-500">
                     {new Date(checkin.checkInDate).toLocaleDateString('th-TH', { day: 'numeric', month: 'short', timeZone: 'UTC' })}
                     {' - '}
                     {new Date(checkin.checkOutDate).toLocaleDateString('th-TH', { day: 'numeric', month: 'short', timeZone: 'UTC' })}
@@ -309,7 +309,7 @@ export default function NewDashboard() {
               </div>
             ))
           ) : (
-            <p className="text-zinc-500 text-center py-4">ไม่มีกิจกรรมล่าสุด</p>
+            <p className="text-gray-500 text-center py-4">ไม่มีกิจกรรมล่าสุด</p>
           )}
         </div>
       </div>
@@ -317,11 +317,11 @@ export default function NewDashboard() {
       {/* Room Detail Modal */}
       {selectedRoom && (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={() => setSelectedRoom(null)}>
-          <div className="bg-zinc-900 border border-zinc-800 rounded-xl shadow-2xl p-6 max-w-sm w-full mx-4" onClick={e => e.stopPropagation()}>
+          <div className="bg-white border border-gray-200 rounded-xl shadow-2xl p-6 max-w-sm w-full mx-4" onClick={e => e.stopPropagation()}>
             <div className="flex justify-between items-start mb-4">
               <div>
-                <h3 className="text-2xl font-bold text-zinc-100">ห้อง {selectedRoom.roomNumber}</h3>
-                <p className="text-zinc-400">{selectedRoom.type} {selectedRoom.details}</p>
+                <h3 className="text-2xl font-bold text-gray-900">ห้อง {selectedRoom.roomNumber}</h3>
+                <p className="text-gray-500">{selectedRoom.type} {selectedRoom.details}</p>
               </div>
               <span className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs ${statusConfig[selectedRoom.status].bg} border ${statusConfig[selectedRoom.status].border}`}>
                 <span className={`w-2 h-2 rounded-full ${statusConfig[selectedRoom.status].dot}`} />
@@ -330,7 +330,7 @@ export default function NewDashboard() {
             </div>
             <button
               onClick={() => setSelectedRoom(null)}
-              className="w-full mt-4 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 py-2 rounded-lg transition-colors"
+              className="w-full mt-4 bg-gray-100 hover:bg-gray-200 text-gray-900 py-2 rounded-lg transition-colors"
             >
               ปิด
             </button>

@@ -209,10 +209,10 @@ export default function RoomTypesPage() {
       {/* Page Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <Home className="w-8 h-8 text-red-400" />
+          <Home className="w-8 h-8 text-red-600" />
           <div>
-            <h1 className="text-2xl font-bold text-zinc-100">จัดการประเภทห้อง</h1>
-            <p className="text-zinc-400">
+            <h1 className="text-2xl font-bold text-gray-900">จัดการประเภทห้อง</h1>
+            <p className="text-gray-500">
               จำนวนประเภทห้องทั้งหมด {roomTypes.length} รายการ
             </p>
           </div>
@@ -229,22 +229,22 @@ export default function RoomTypesPage() {
       </div>
 
       {/* Search and Sort Bar */}
-      <div className="bg-zinc-900 rounded-lg p-4">
+      <div className="bg-white rounded-lg p-4">
         <div className="flex flex-col md:flex-row gap-4">
           {/* Search */}
           <div className="relative flex-1">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-zinc-500" />
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-500" />
             <input
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="ค้นหาด้วยรหัส หรือ ชื่อประเภทห้อง..."
-              className="w-full pl-10 pr-4 py-2 bg-zinc-900 border border-zinc-700 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors text-zinc-200"
+              className="w-full pl-10 pr-4 py-2 bg-white border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors text-gray-800"
             />
             {searchQuery && (
               <button
                 onClick={() => setSearchQuery('')}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-400"
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-500"
                 aria-label="ล้างการค้นหา"
               >
                 <X className="w-4 h-4" />
@@ -254,13 +254,13 @@ export default function RoomTypesPage() {
 
           {/* Sort */}
           <div className="flex items-center gap-2">
-            <span className="text-sm text-zinc-400">เรียงตาม:</span>
+            <span className="text-sm text-gray-500">เรียงตาม:</span>
             <button
               onClick={() => handleSortChange('typeCode')}
               className={`px-3 py-1.5 text-sm rounded-lg border transition-colors ${
                 sortField === 'typeCode'
-                  ? 'border-red-500 bg-red-500/10 text-red-400'
-                  : 'border-zinc-700 text-zinc-400 hover:bg-zinc-800'
+                  ? 'border-red-500 bg-red-500/10 text-red-600'
+                  : 'border-gray-300 text-gray-500 hover:bg-gray-100'
               }`}
             >
               รหัส {sortField === 'typeCode' && (sortOrder === 'asc' ? '(A-Z)' : '(Z-A)')}
@@ -269,8 +269,8 @@ export default function RoomTypesPage() {
               onClick={() => handleSortChange('typeName')}
               className={`px-3 py-1.5 text-sm rounded-lg border transition-colors ${
                 sortField === 'typeName'
-                  ? 'border-red-500 bg-red-500/10 text-red-400'
-                  : 'border-zinc-700 text-zinc-400 hover:bg-zinc-800'
+                  ? 'border-red-500 bg-red-500/10 text-red-600'
+                  : 'border-gray-300 text-gray-500 hover:bg-gray-100'
               }`}
             >
               ชื่อ {sortField === 'typeName' && (sortOrder === 'asc' ? '(A-Z)' : '(Z-A)')}
@@ -278,7 +278,7 @@ export default function RoomTypesPage() {
           </div>
         </div>
         {debouncedSearch && (
-          <p className="mt-2 text-sm text-zinc-400">
+          <p className="mt-2 text-sm text-gray-500">
             ผลการค้นหา &quot;{debouncedSearch}&quot;: พบ {roomTypes.length} รายการ
           </p>
         )}
@@ -293,19 +293,19 @@ export default function RoomTypesPage() {
       )}
 
       {/* Room Types Grid */}
-      <div className="bg-zinc-900 rounded-lg overflow-hidden">
+      <div className="bg-white rounded-lg overflow-hidden">
         {loading ? (
           <div className="flex items-center justify-center py-12">
-            <Loader2 className="w-6 h-6 animate-spin text-red-400" />
-            <span className="ml-2 text-zinc-400">กำลังโหลดข้อมูล...</span>
+            <Loader2 className="w-6 h-6 animate-spin text-red-600" />
+            <span className="ml-2 text-gray-500">กำลังโหลดข้อมูล...</span>
           </div>
         ) : roomTypes.length === 0 ? (
-          <div className="text-center py-12 text-zinc-500">
-            <Home className="w-12 h-12 text-zinc-600 mx-auto mb-3" />
+          <div className="text-center py-12 text-gray-500">
+            <Home className="w-12 h-12 text-gray-400 mx-auto mb-3" />
             <p>ไม่พบประเภทห้อง</p>
             <button
               onClick={handleAddRoomType}
-              className="mt-4 text-red-400 hover:text-red-400 font-medium"
+              className="mt-4 text-red-600 hover:text-red-600 font-medium"
             >
               + เพิ่มประเภทห้องใหม่
             </button>
@@ -317,15 +317,15 @@ export default function RoomTypesPage() {
                 key={roomType.id}
                 className={`border rounded-lg p-4 transition-all ${
                   roomType.active
-                    ? 'border-zinc-800 bg-zinc-900'
-                    : 'border-zinc-800 bg-zinc-900/50 opacity-60'
+                    ? 'border-gray-200 bg-white'
+                    : 'border-gray-200 bg-white/50 opacity-60'
                 }`}
               >
                 {/* Header */}
                 <div className="flex items-start justify-between mb-3">
                   <div>
                     <div className="flex items-center gap-2">
-                      <span className="px-2 py-0.5 bg-red-500/10 text-red-400 text-xs font-bold rounded">
+                      <span className="px-2 py-0.5 bg-red-500/10 text-red-600 text-xs font-bold rounded">
                         {roomType.typeCode}
                       </span>
                       {roomType.active ? (
@@ -340,17 +340,17 @@ export default function RoomTypesPage() {
                         </span>
                       )}
                     </div>
-                    <h3 className="text-lg font-semibold text-zinc-100 mt-1">
+                    <h3 className="text-lg font-semibold text-gray-900 mt-1">
                       {roomType.typeName}
                     </h3>
                     {roomType.typeNameEn && (
-                      <p className="text-sm text-zinc-500">{roomType.typeNameEn}</p>
+                      <p className="text-sm text-gray-500">{roomType.typeNameEn}</p>
                     )}
                   </div>
                   <div className="flex gap-1">
                     <button
                       onClick={() => handleEditRoomType(roomType)}
-                      className="p-2 text-zinc-500 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
+                      className="p-2 text-gray-500 hover:text-red-600 hover:bg-red-500/10 rounded-lg transition-colors"
                       title="แก้ไข"
                     >
                       <Edit3 className="w-4 h-4" />
@@ -360,28 +360,28 @@ export default function RoomTypesPage() {
 
                 {/* Description */}
                 {roomType.description && (
-                  <p className="text-sm text-zinc-400 mb-3 line-clamp-2">
+                  <p className="text-sm text-gray-500 mb-3 line-clamp-2">
                     {roomType.description}
                   </p>
                 )}
 
                 {/* Details */}
                 <div className="grid grid-cols-2 gap-2 text-sm">
-                  <div className="flex items-center gap-2 text-zinc-400">
-                    <DollarSign className="w-4 h-4 text-zinc-500" />
+                  <div className="flex items-center gap-2 text-gray-500">
+                    <DollarSign className="w-4 h-4 text-gray-500" />
                     <span>{formatPrice(roomType.basePrice)} บาท</span>
                   </div>
-                  <div className="flex items-center gap-2 text-zinc-400">
-                    <Users className="w-4 h-4 text-zinc-500" />
+                  <div className="flex items-center gap-2 text-gray-500">
+                    <Users className="w-4 h-4 text-gray-500" />
                     <span>{roomType.maxGuests} คน</span>
                   </div>
-                  <div className="flex items-center gap-2 text-zinc-400">
-                    <Bed className="w-4 h-4 text-zinc-500" />
+                  <div className="flex items-center gap-2 text-gray-500">
+                    <Bed className="w-4 h-4 text-gray-500" />
                     <span>{getBedTypeLabel(roomType.bedType)}</span>
                   </div>
                   {roomType.sizeSqm && (
-                    <div className="flex items-center gap-2 text-zinc-400">
-                      <Home className="w-4 h-4 text-zinc-500" />
+                    <div className="flex items-center gap-2 text-gray-500">
+                      <Home className="w-4 h-4 text-gray-500" />
                       <span>{roomType.sizeSqm} ตร.ม.</span>
                     </div>
                   )}
