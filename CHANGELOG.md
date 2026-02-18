@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.18.0] - 2026-02-18
+
+### Added
+- **Unified architecture foundation** — new shared utilities, types, UI primitives, sidebar navigation, and unified layout for the single-system redesign
+  - `lib/format.ts` — consolidated formatting utilities (`formatCurrency`, `toBuddhistYear`, `formatBuddhistDate`, `formatDateForApi`, `formatThaiDate`, `calculateNights`) from 8+ duplicate implementations
+  - `lib/status.ts` — centralized status color/label maps for bookings, rooms, housekeeping, maintenance, payments with `getStatusColor()`/`getStatusLabel()` helpers
+  - `types/common.ts`, `types/booking.ts`, `types/customer.ts`, `types/room.ts`, `types/checkin.ts` — shared TypeScript type definitions extracted from scattered page-level types
+  - 12 UI primitives in `components/ui/`: Badge, Button, Card, Modal, Drawer, Input, Select, Textarea, PageHeader, StatCard, Skeleton, EmptyState — all dark-themed
+  - `components/Sidebar.tsx` — collapsible left sidebar navigation (240px/64px) with localStorage persistence, responsive defaults, and smooth transitions
+  - `app/(unified)/layout.tsx` — unified layout using Sidebar with synchronized collapse state
+
+- **PostgreSQL paths for remaining SQL Server endpoints** (Phase A — SQL Server independence)
+  - `GET /api/rooms/status` — new `get_room_status_pg()` using `generate_series()` + joins on `ht_rooms_legacy`, `ht_checkins_legacy`, `ht_bookings_legacy` to replicate `View_Room_status` behavior
+  - `GET /api/bookings/:id` — new `get_booking_pg()` querying `ht_bookings_legacy` with `book_total` support, dispatched via `use_pg_source()` feature flag
+  - `GET /api/calendar` — new `fetch_legacy_calendar_data_pg()` querying PG mirror tables for bookings and check-ins, dispatched via `use_pg_source()` feature flag
+
 ## [2.17.1] - 2026-02-18
 
 ### Fixed

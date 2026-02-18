@@ -1,7 +1,7 @@
 //! Booking API routes
 //!
 //! - GET /api/bookings - List bookings (paginated) - uses PG by default, legacy DB if LEGACY_READ_SOURCE=sqlserver
-//! - GET /api/bookings/:id - Get booking details - uses legacy DB for booking, HotelNew for notes
+//! - GET /api/bookings/:id - Get booking details - uses PG by default, legacy DB if LEGACY_READ_SOURCE=sqlserver
 //! - GET /api/bookings/:id/notes - Get booking notes - uses HotelNew DB
 //! - POST /api/bookings/:id/notes - Add booking note - uses HotelNew DB
 //! - DELETE /api/bookings/:id/notes - Delete booking note - uses HotelNew DB
@@ -410,63 +410,21 @@ async fn list_bookings_sqlserver(
     }))
 }
 
-/// GET /api/bookings/:id - Get booking details (uses legacy DB for booking, HotelNew for notes)
+/// GET /api/bookings/:id - Get booking details
 ///
-/// In New-only mode (when legacy DB is unavailable), this will try to fetch
-/// from the new_pool which may not have View_Booking_Ds. The route will return
-/// a 404 in that case.
+/// Reads from `ht_bookings_legacy` (PostgreSQL) by default.
+/// Set `LEGACY_READ_SOURCE=sqlserver` to read from legacy SQL Server instead.
+/// Notes are always fetched from HotelNew PostgreSQL.
 pub async fn get_booking(
     State(state): State<AppState>,
     Path(book_no): Path<String>,
 ) -> ApiResult<Json<BookingDetailResponse>> {
-    // Use legacy pool for booking data (read-only)
-    // Note: In new-only mode, legacy_pool == new_pool, so this query will fail
-    // gracefully since View_Booking_Ds doesn't exist in HotelNew
-    let mut legacy_conn = state.legacy_pool.get().await?;
-
-    // Fetch booking with all rooms from legacy database
-    let booking_rows = match legacy_conn
-        .query(
-            r#"
-            SELECT
-                Book_No,
-                Book_Date,
-                Book_Date_in,
-                Book_Date_out,
-                Book_Cust_Name,
-                Book_Status,
-                Book_Room_Type
-            FROM View_Booking_Ds
-            WHERE Book_No = @P1
-            ORDER BY Book_Room_Type
-            "#,
-            &[&book_no],
-        )
-        .await
-    {
-        Ok(result) => result.into_first_result().await?,
-        Err(_) => {
-            // View_Booking_Ds doesn't exist (likely running in new-only mode)
-            // Return 404 since legacy bookings are not available
-            return Err(ApiError::NotFound(
-                "Legacy booking not available (running in new-only mode)".to_string()
-            ));
-        }
-    };
-
-    if booking_rows.is_empty() {
-        return Err(ApiError::NotFound("Booking not found".to_string()));
-    }
-
-    let first_record = &booking_rows[0];
-
-    // Use new_pool for notes (HotelNew database via sqlx/PostgreSQL)
     let new_pool = &state.new_pool;
 
-    // Ensure notes table exists in HotelNew
-    ensure_notes_table(&state.new_pool).await?;
+    // Ensure notes table exists
+    ensure_notes_table(new_pool).await?;
 
-    // Try to fetch notes from HotelNew database
+    // Fetch notes from HotelNew (always PG)
     let notes = match sqlx::query!(
             r#"
             SELECT note_id, note_text, created_at, updated_at
@@ -479,56 +437,139 @@ pub async fn get_booking(
         .fetch_all(new_pool)
         .await
     {
-        Ok(note_rows) => {
-            note_rows
-                .iter()
-                .map(|r| Note {
-                    id: r.note_id,
-                    text: r.note_text.clone(),
-                    created_at: r.created_at,
-                    updated_at: r.updated_at,
-                })
-                .collect()
+        Ok(note_rows) => note_rows
+            .iter()
+            .map(|r| Note {
+                id: r.note_id,
+                text: r.note_text.clone(),
+                created_at: r.created_at,
+                updated_at: r.updated_at,
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+
+    // Fetch booking data from PG or SQL Server
+    let mut booking = if use_sqlserver() {
+        // Existing SQL Server path
+        let mut legacy_conn = state.legacy_pool.get().await?;
+
+        let booking_rows = match legacy_conn
+            .query(
+                r#"
+                SELECT Book_No, Book_Date, Book_Date_in, Book_Date_out,
+                       Book_Cust_Name, Book_Status, Book_Room_Type
+                FROM View_Booking_Ds
+                WHERE Book_No = @P1
+                ORDER BY Book_Room_Type
+                "#,
+                &[&book_no],
+            )
+            .await
+        {
+            Ok(result) => result.into_first_result().await?,
+            Err(_) => {
+                return Err(ApiError::NotFound(
+                    "Legacy booking not available (running in new-only mode)".to_string()
+                ));
+            }
+        };
+
+        if booking_rows.is_empty() {
+            return Err(ApiError::NotFound("Booking not found".to_string()));
         }
-        Err(_) => Vec::new(), // Table doesn't exist yet
+
+        let first_record = &booking_rows[0];
+
+        let rooms: Vec<BookingRoomDetail> = booking_rows
+            .iter()
+            .map(|r| BookingRoomDetail {
+                room_no: "-".to_string(),
+                room_type: r.get::<&str, _>("Book_Room_Type").unwrap_or("-").to_string(),
+                total: 0.0,
+            })
+            .collect();
+
+        BookingDetail {
+            book_no: first_record.get::<&str, _>("Book_No").unwrap_or_default().to_string(),
+            book_date: first_record.get::<NaiveDateTime, _>("Book_Date").map(|dt| dt.and_utc()),
+            check_in: first_record.get::<NaiveDateTime, _>("Book_Date_in").map(|dt| dt.and_utc()),
+            check_out: first_record.get::<NaiveDateTime, _>("Book_Date_out").map(|dt| dt.and_utc()),
+            status: map_status(first_record.get::<i32, _>("Book_Status")),
+            status_code: first_record.get::<i32, _>("Book_Status"),
+            customer: BookingCustomerDetail {
+                full_name: first_record.get::<&str, _>("Book_Cust_Name").unwrap_or_default().to_string(),
+            },
+            room_count: rooms.len(),
+            rooms,
+            total_amount: 0.0,
+            notes: Vec::new(),
+        }
+    } else {
+        get_booking_pg(new_pool, &book_no).await?
     };
 
-    // Build rooms array
-    let rooms: Vec<BookingRoomDetail> = booking_rows
-        .iter()
-        .map(|r| BookingRoomDetail {
-            room_no: "-".to_string(),
-            room_type: r.get::<&str, _>("Book_Room_Type").unwrap_or("-").to_string(),
-            total: 0.0,
-        })
-        .collect();
-
-    let booking = BookingDetail {
-        book_no: first_record
-            .get::<&str, _>("Book_No")
-            .unwrap_or_default()
-            .to_string(),
-        book_date: first_record.get::<NaiveDateTime, _>("Book_Date").map(|dt| dt.and_utc()),
-        check_in: first_record.get::<NaiveDateTime, _>("Book_Date_in").map(|dt| dt.and_utc()),
-        check_out: first_record.get::<NaiveDateTime, _>("Book_Date_out").map(|dt| dt.and_utc()),
-        status: map_status(first_record.get::<i32, _>("Book_Status")),
-        status_code: first_record.get::<i32, _>("Book_Status"),
-        customer: BookingCustomerDetail {
-            full_name: first_record
-                .get::<&str, _>("Book_Cust_Name")
-                .unwrap_or_default()
-                .to_string(),
-        },
-        room_count: rooms.len(),
-        rooms,
-        total_amount: 0.0,
-        notes,
-    };
+    // Attach notes
+    booking.notes = notes;
 
     Ok(Json(BookingDetailResponse {
         success: true,
         booking,
     }))
+}
+
+/// Get booking details from PostgreSQL mirror tables
+async fn get_booking_pg(
+    pool: &crate::db::PgPool,
+    book_no: &str,
+) -> ApiResult<BookingDetail> {
+    let rows = sqlx::query(
+        r#"
+        SELECT book_no, book_date, book_date_in, book_date_out,
+               book_cust_name, book_status, book_room_type,
+               COALESCE(book_total, 0)::float8 AS book_total
+        FROM ht_bookings_legacy
+        WHERE book_no = $1
+        ORDER BY book_room_type
+        "#,
+    )
+    .bind(book_no)
+    .fetch_all(pool)
+    .await?;
+
+    if rows.is_empty() {
+        return Err(ApiError::NotFound("Booking not found".to_string()));
+    }
+
+    let first = &rows[0];
+
+    let rooms: Vec<BookingRoomDetail> = rows
+        .iter()
+        .map(|r| BookingRoomDetail {
+            room_no: "-".to_string(),
+            room_type: r.try_get::<String, _>("book_room_type").unwrap_or_else(|_| "-".to_string()),
+            total: r.try_get::<f64, _>("book_total").unwrap_or(0.0),
+        })
+        .collect();
+
+    let status_code = first.try_get::<i32, _>("book_status").ok();
+    let total_amount: f64 = rooms.iter().map(|r| r.total).sum();
+
+    Ok(BookingDetail {
+        book_no: first.try_get::<String, _>("book_no").unwrap_or_default(),
+        book_date: first.try_get::<NaiveDateTime, _>("book_date").ok().map(|dt| dt.and_utc()),
+        check_in: first.try_get::<NaiveDateTime, _>("book_date_in").ok().map(|dt| dt.and_utc()),
+        check_out: first.try_get::<NaiveDateTime, _>("book_date_out").ok().map(|dt| dt.and_utc()),
+        status: map_status(status_code),
+        status_code,
+        customer: BookingCustomerDetail {
+            full_name: first.try_get::<String, _>("book_cust_name").unwrap_or_default(),
+        },
+        room_count: rooms.len(),
+        rooms,
+        total_amount,
+        notes: Vec::new(),
+    })
 }
 
 /// GET /api/bookings/:id/notes - Get booking notes (uses HotelNew DB)

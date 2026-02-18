@@ -489,6 +489,66 @@ async fn get_room_status_sqlserver(
     Ok(statuses)
 }
 
+/// Get room status from PostgreSQL (PG mirror tables)
+async fn get_room_status_pg(
+    pool: &crate::db::PgPool,
+    params: &RoomStatusQuery,
+) -> ApiResult<Vec<RoomStatus>> {
+    // Default date range: today to +30 days if not specified
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let thirty_days = (chrono::Local::now() + chrono::Duration::days(30)).format("%Y-%m-%d").to_string();
+
+    let start = params.start_date.as_deref().unwrap_or(&today);
+    let end = params.end_date.as_deref().unwrap_or(&thirty_days);
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            r.room_no,
+            d.dt::timestamp AS room_date,
+            CASE
+                WHEN ci.cin_no IS NOT NULL THEN 'เข้าพัก'
+                WHEN bl.book_no IS NOT NULL THEN 'จอง'
+                ELSE 'ว่าง'
+            END AS room_status,
+            COALESCE(r.room_details, '') AS room_details,
+            ci.cin_checkin_no AS room_checkin_no,
+            r.room_type
+        FROM ht_rooms_legacy r
+        CROSS JOIN generate_series($1::date, $2::date, '1 day'::interval) AS d(dt)
+        LEFT JOIN ht_checkins_legacy ci
+            ON ci.cin_room_no = r.room_no
+            AND d.dt::date >= ci.cin_room_in::date
+            AND d.dt::date < ci.cin_room_out::date
+        LEFT JOIN ht_bookings_legacy bl
+            ON bl.book_room_no = r.room_no
+            AND d.dt::date >= bl.book_date_in::date
+            AND d.dt::date < bl.book_date_out::date
+            AND bl.book_status = 1
+            AND ci.cin_no IS NULL
+        ORDER BY r.room_no, d.dt
+        "#,
+    )
+    .bind(start)
+    .bind(end)
+    .fetch_all(pool)
+    .await?;
+
+    let statuses: Vec<RoomStatus> = rows
+        .iter()
+        .map(|row| RoomStatus {
+            room_no: row.try_get::<String, _>("room_no").unwrap_or_default(),
+            room_date: row.try_get::<NaiveDateTime, _>("room_date").ok().map(|dt| dt.and_utc()),
+            room_status: row.try_get::<String, _>("room_status").ok(),
+            room_details: row.try_get::<String, _>("room_details").ok(),
+            room_checkin_no: row.try_get::<String, _>("room_checkin_no").ok(),
+            room_type: row.try_get::<String, _>("room_type").ok(),
+        })
+        .collect();
+
+    Ok(statuses)
+}
+
 /// Get rooms checking out today from SQL Server
 async fn get_checkouts_today_sqlserver(pool: &crate::db::DbPool) -> ApiResult<Vec<String>> {
     let mut conn = pool.get().await?;
@@ -567,16 +627,15 @@ pub struct RoomStatusQuery {
 }
 
 /// GET /api/rooms/status - Get room status history
-///
-/// Note: View_Room_status does not exist in PostgreSQL, so this endpoint
-/// always falls back to the SQL Server path regardless of LEGACY_READ_SOURCE.
 pub async fn get_room_status(
     State(state): State<AppState>,
     Query(params): Query<RoomStatusQuery>,
 ) -> ApiResult<Json<RoomStatusResponse>> {
-    // View_Room_status is a complex SQL Server view with no PG equivalent.
-    // Always use the SQL Server path for this endpoint.
-    let statuses = get_room_status_sqlserver(&state.legacy_pool, &params).await?;
+    let statuses = if use_pg_source() {
+        get_room_status_pg(&state.new_pool, &params).await?
+    } else {
+        get_room_status_sqlserver(&state.legacy_pool, &params).await?
+    };
     let total = statuses.len();
 
     Ok(Json(RoomStatusResponse {
