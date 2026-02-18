@@ -51,6 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Configuration loaded");
     tracing::info!("Legacy Database: {} / {}", config.db.server, config.db.database);
     tracing::info!("New Database (PostgreSQL): {} / {}", config.new_db.server, config.new_db.database);
+    tracing::info!("HF Ville Database: {} / {} (enabled: {})", config.ville_db.server, config.ville_db.database, config.ville_db.enabled);
     tracing::info!("System Mode: {:?}", config.mode);
     tracing::info!("Server: {}", config.server.addr());
 
@@ -92,13 +93,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Try to create HF Ville PostgreSQL pool (optional, graceful degradation)
+    let ville_pool = if config.ville_db.enabled {
+        match create_pg_pool(&crate::config::NewDbConfig {
+            server: config.ville_db.server.clone(),
+            port: config.ville_db.port,
+            database: config.ville_db.database.clone(),
+            user: config.ville_db.user.clone(),
+            password: config.ville_db.password.clone(),
+            pool_max: config.ville_db.pool_max,
+        }).await {
+            Ok(pool) => {
+                tracing::info!("HF Ville PostgreSQL pool created successfully");
+                Some(pool)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to create HF Ville pool (ville routes will be unavailable): {}", e);
+                None
+            }
+        }
+    } else {
+        tracing::info!("HF Ville database disabled (VILLE_DB_ENABLED not set)");
+        None
+    };
+
     // Create AppState based on available pools
     // Note: Pool types differ now (legacy=DbPool/tiberius, new=PgPool/sqlx)
     // so we can't clone one for the other.
     let (app_state, legacy_available, new_available) = match (&legacy_pool, new_pool) {
         (Some(legacy), Some(new_hotel)) => {
             tracing::info!("Dual database mode: Both databases available");
-            (Some(AppState::with_mode(legacy.clone(), new_hotel, system_mode)), true, true)
+            let mut state = AppState::with_mode(legacy.clone(), new_hotel, system_mode);
+            if let Some(vp) = ville_pool {
+                state = state.with_ville(vp);
+            }
+            (Some(state), true, true)
         }
         (Some(_legacy), None) => {
             tracing::warn!("Legacy-only mode: HotelNew database unavailable, new routes will not work");

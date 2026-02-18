@@ -7,6 +7,7 @@ import {
   Clock,
   LogIn,
 } from 'lucide-react'
+import { useBranch, BRANCH_LABELS } from '@/contexts/BranchContext'
 
 interface Stats {
   totalRooms: number
@@ -55,14 +56,22 @@ const statusConfig: Record<RoomStatus, { dot: string; bg: string; border: string
   checkout: { dot: 'bg-sky-500', bg: 'bg-sky-500/10 hover:bg-sky-500/20', border: 'border-sky-500/30', label: 'รอเช็คเอาท์' },
 }
 
-// Custom room layout matching actual hotel floor plan
-const roomLayout: (string | null)[][] = [
+// HF Hotel room layout matching actual hotel floor plan
+const hfHotelRoomLayout: (string | null)[][] = [
   ['509', '510', '511', '512', '513', '514', '515', '516', '517', '518'],
   ['508', '507', null, '506', '505', '504', '503', '502', '501', null, null, 'A4-1', 'A4-2', 'A4-3'],
   ['409', '410', '411', '412', '413', '414', '415', '416', '417', '418', null, 'A3-1', 'A3-2', 'A3-3'],
   ['408', '407', null, '406', '405', '404', '403', '402', '401', null, null, 'V.201', 'A2-1', 'A2-3'],
   ['307', '308', '309', '310', '311', '312', '313'],
   ['306', '305', null, '304', '303', '302', '301'],
+]
+
+// HF Ville room layout - 34 rooms, 2 floors (สุราษฎร์ธานี)
+const hfVilleRoomLayout: (string | null)[][] = [
+  ['201', '202', '203', '204', '205', '206', '207', '208', '209', '210'],
+  ['218', '217', '216', '215', '214', '213', '212', '211', null, null],
+  ['101', '102', '103', '104', '105', '106', '107', '108', '109', '110'],
+  ['118', '117', '116', '115', '114', '113', '112', '111', null, null],
 ]
 
 function getRoomStatus(room: ApiRoom, isCheckoutToday: boolean): RoomStatus {
@@ -75,6 +84,7 @@ function getRoomStatus(room: ApiRoom, isCheckoutToday: boolean): RoomStatus {
 }
 
 export default function NewDashboard() {
+  const { branch } = useBranch()
   const [stats, setStats] = useState<Stats>({
     totalRooms: 0, occupiedRooms: 0, availableRooms: 0, bookedRooms: 0,
     checkoutRooms: 0, totalCustomers: 0, activeBookings: 0, todayCheckIns: 0, todayCheckOuts: 0,
@@ -87,11 +97,12 @@ export default function NewDashboard() {
 
   const fetchData = useCallback(async () => {
     try {
+      const bp = `branch=${branch}`
       const [statsRes, roomsRes, checkoutsRes, checkInsRes] = await Promise.all([
-        fetch('/api/stats'),
-        fetch('/api/rooms'),
-        fetch('/api/rooms/checkouts-today'),
-        fetch('/api/checkins?limit=10'),
+        fetch(`/api/stats?${bp}`),
+        fetch(`/api/rooms?${bp}`),
+        fetch(`/api/rooms/checkouts-today?${bp}`),
+        fetch(`/api/checkins?limit=10&${bp}`),
       ])
 
       if (statsRes.ok) {
@@ -140,16 +151,22 @@ export default function NewDashboard() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [branch])
 
   useEffect(() => {
+    setLoading(true)
     fetchData()
   }, [fetchData])
 
   const roomMap = new Map<string, Room>()
   rooms.forEach(r => roomMap.set(r.roomNumber.toUpperCase(), r))
 
-  const maxColumns = Math.max(...roomLayout.map(row => row.length))
+  // Select room layout based on branch
+  const roomLayouts = branch === 'all'
+    ? [{ label: 'HF Hotel', layout: hfHotelRoomLayout }, { label: 'HF Ville', layout: hfVilleRoomLayout }]
+    : [{ label: '', layout: branch === 'hfville' ? hfVilleRoomLayout : hfHotelRoomLayout }]
+  const roomLayout = roomLayouts[0].layout
+  const maxColumns = Math.max(...roomLayouts.flatMap(l => l.layout.map(row => row.length)))
 
   if (loading) {
     return (
@@ -166,7 +183,14 @@ export default function NewDashboard() {
     <div className="space-y-6">
       {/* Page Header */}
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold text-gray-900 tracking-tight">หน้าหลัก</h1>
+        <div className="flex items-center gap-3">
+          <h1 className="text-2xl font-bold text-gray-900 tracking-tight">หน้าหลัก</h1>
+          {branch !== 'hfhotel' && (
+            <span className="text-sm font-medium px-2 py-0.5 rounded-md bg-gray-100 text-gray-600">
+              {BRANCH_LABELS[branch]}
+            </span>
+          )}
+        </div>
         <p className="text-gray-400 text-sm">
           อัปเดตล่าสุด: {new Date().toLocaleDateString('th-TH', {
             year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit',
@@ -214,41 +238,48 @@ export default function NewDashboard() {
         <h2 className="text-lg font-semibold text-gray-800 mb-4">สถานะห้องพัก</h2>
 
         {/* Desktop Grid */}
-        <div className="hidden md:block">
-          <div className="grid gap-1.5" style={{ gridTemplateColumns: `repeat(${maxColumns}, minmax(0, 1fr))` }}>
-            {roomLayout.map((row, rowIndex) => (
-              <div key={`row-${rowIndex}`} className="contents">
-                {row.map((roomNumber, colIndex) => {
-                  if (roomNumber === null) {
-                    return <div key={`blank-${rowIndex}-${colIndex}`} className="h-[60px]" />
-                  }
-                  const room = roomMap.get(roomNumber.toUpperCase())
-                  if (!room) {
-                    return (
-                      <div key={`missing-${roomNumber}`} className="h-[60px] bg-gray-50 rounded-lg flex flex-col items-center justify-center">
-                        <span className="font-bold text-[10px] text-gray-400">{roomNumber}</span>
-                      </div>
-                    )
-                  }
-                  const config = statusConfig[room.status]
-                  return (
-                    <button
-                      key={roomNumber}
-                      onClick={() => setSelectedRoom(room)}
-                      className={`${config.bg} border ${config.border} rounded-lg p-1 flex flex-col items-center justify-center h-[60px] transition-colors`}
-                      title={`${room.roomNumber} - ${room.type} ${room.details}`}
-                    >
-                      <span className="font-bold text-[11px] text-gray-900">{room.roomNumber}</span>
-                      <span className="text-[8px] text-gray-500">{room.type}</span>
-                    </button>
-                  )
-                })}
-                {Array.from({ length: maxColumns - row.length }).map((_, i) => (
-                  <div key={`filler-${rowIndex}-${i}`} className="h-[60px]" />
+        <div className="hidden md:block space-y-6">
+          {roomLayouts.map((section, sectionIdx) => (
+            <div key={sectionIdx}>
+              {section.label && (
+                <p className="text-sm font-medium text-gray-500 mb-2">{section.label}</p>
+              )}
+              <div className="grid gap-1.5" style={{ gridTemplateColumns: `repeat(${Math.max(...section.layout.map(r => r.length))}, minmax(0, 1fr))` }}>
+                {section.layout.map((row, rowIndex) => (
+                  <div key={`row-${sectionIdx}-${rowIndex}`} className="contents">
+                    {row.map((roomNumber, colIndex) => {
+                      if (roomNumber === null) {
+                        return <div key={`blank-${sectionIdx}-${rowIndex}-${colIndex}`} className="h-[60px]" />
+                      }
+                      const room = roomMap.get(roomNumber.toUpperCase())
+                      if (!room) {
+                        return (
+                          <div key={`missing-${sectionIdx}-${roomNumber}`} className="h-[60px] bg-gray-50 rounded-lg flex flex-col items-center justify-center">
+                            <span className="font-bold text-[10px] text-gray-400">{roomNumber}</span>
+                          </div>
+                        )
+                      }
+                      const config = statusConfig[room.status]
+                      return (
+                        <button
+                          key={`${sectionIdx}-${roomNumber}`}
+                          onClick={() => setSelectedRoom(room)}
+                          className={`${config.bg} border ${config.border} rounded-lg p-1 flex flex-col items-center justify-center h-[60px] transition-colors`}
+                          title={`${room.roomNumber} - ${room.type} ${room.details}`}
+                        >
+                          <span className="font-bold text-[11px] text-gray-900">{room.roomNumber}</span>
+                          <span className="text-[8px] text-gray-500">{room.type}</span>
+                        </button>
+                      )
+                    })}
+                    {Array.from({ length: Math.max(...section.layout.map(r => r.length)) - row.length }).map((_, i) => (
+                      <div key={`filler-${sectionIdx}-${rowIndex}-${i}`} className="h-[60px]" />
+                    ))}
+                  </div>
                 ))}
               </div>
-            ))}
-          </div>
+            </div>
+          ))}
         </div>
 
         {/* Mobile List */}

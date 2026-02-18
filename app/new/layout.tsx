@@ -1,6 +1,7 @@
 'use client'
 
 import Sidebar, { SIDEBAR_WIDTH, SIDEBAR_COLLAPSED_WIDTH } from '@/components/Sidebar'
+import { BranchProvider } from '@/contexts/BranchContext'
 import { useState, useEffect } from 'react'
 
 export default function NewLayout({
@@ -29,14 +30,16 @@ export default function NewLayout({
   }, [])
 
   return (
-    <div className="min-h-screen bg-gray-50">
-      <Sidebar />
-      <main
-        className={`min-h-screen px-6 py-6 ${mounted ? 'transition-all duration-300' : ''}`}
-        style={{ marginLeft: mounted ? (collapsed ? SIDEBAR_COLLAPSED_WIDTH : SIDEBAR_WIDTH) : SIDEBAR_WIDTH }}
-      >
-        {children}
-      </main>
-    </div>
+    <BranchProvider>
+      <div className="min-h-screen bg-gray-50">
+        <Sidebar />
+        <main
+          className={`min-h-screen px-6 py-6 ${mounted ? 'transition-all duration-300' : ''}`}
+          style={{ marginLeft: mounted ? (collapsed ? SIDEBAR_COLLAPSED_WIDTH : SIDEBAR_WIDTH) : SIDEBAR_WIDTH }}
+        >
+          {children}
+        </main>
+      </div>
+    </BranchProvider>
   )
 }

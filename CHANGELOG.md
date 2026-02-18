@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.21.0] - 2026-02-19
+
+### Added
+- **Multi-branch support: HF Ville integration** — second hotel branch (สุราษฎร์ธานี, 34 rooms) integrated into the system
+  - Branch selector in Sidebar (new system) and Navbar (legacy system): HF Hotel | HF Ville | ทั้งหมด
+  - `BranchContext` + `useBranchFetch` hook — all API calls automatically include `?branch=X`
+  - Backend `Branch` enum (`hfhotel`, `hfville`, `all`) with `ville_pool: Option<PgPool>` in AppState
+  - Branch parameter added to 7 route handlers: rooms, bookings, checkins, customers, stats, occupancy, calendar
+  - HF Ville room layout (2 floors, rooms 101-218) with stacked "All" view showing both hotels
+  - `VilleDbConfig` in backend config with `VILLE_DB_ENABLED` env var for graceful degradation
+  - `ville-tunnel` cloudflared sidecar in production docker-compose for remote PG access
+  - `ville_sync` binary: syncs HF Ville SQL Server 2005 → PostgreSQL mirror (SHA256 delta sync, 90s interval)
+  - Jump box deployment: `deploy/hfville/docker-compose.yml` with postgres:17-alpine + sync binary
+  - HF Ville PG mirror schema: `deploy/hfville/init-db/init-hfville.sql` (rooms, bookings, checkins, customers + sync_status)
+  - 8 frontend pages updated with branch-aware fetching (legacy: dashboard, calendar, bookings, rooms, customers; new: dashboard, calendar, bookings)
+
 ## [2.20.0] - 2026-02-19
 
 ### Changed

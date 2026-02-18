@@ -19,6 +19,7 @@ import DatePicker from 'react-datepicker'
 import 'react-datepicker/dist/react-datepicker.css'
 import BookingForm, { BookingFormData } from '@/components/forms/BookingForm'
 import { RoomOption } from '@/components/pickers/RoomPicker'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 
 // Types
 interface BookingRoom {
@@ -110,6 +111,8 @@ function formatDateForApi(date: Date): string {
 }
 
 export default function NewBookingsPage() {
+  const branchFetch = useBranchFetch()
+
   // State
   const [bookings, setBookings] = useState<Booking[]>([])
   const [loading, setLoading] = useState(true)
@@ -161,7 +164,7 @@ export default function NewBookingsPage() {
       if (endDate) params.append('endDate', formatDateForApi(endDate))
       if (debouncedSearch) params.append('search', debouncedSearch)
 
-      const response = await fetch(`/api/new/bookings?${params.toString()}`)
+      const response = await branchFetch(`/api/new/bookings?${params.toString()}`)
 
       if (!response.ok) {
         throw new Error('ไม่สามารถดึงข้อมูลการจองได้')
@@ -181,7 +184,7 @@ export default function NewBookingsPage() {
     } finally {
       setLoading(false)
     }
-  }, [currentPage, statusFilter, startDate, endDate, debouncedSearch])
+  }, [currentPage, statusFilter, startDate, endDate, debouncedSearch, branchFetch])
 
   useEffect(() => {
     fetchBookings()
@@ -213,7 +216,7 @@ export default function NewBookingsPage() {
   const handleEditBooking = async (booking: Booking) => {
     setLoadingDetail(true)
     try {
-      const response = await fetch(`/api/new/bookings/${booking.id}`)
+      const response = await branchFetch(`/api/new/bookings/${booking.id}`)
       if (!response.ok) {
         throw new Error('ไม่สามารถดึงข้อมูลการจองได้')
       }
@@ -258,7 +261,7 @@ export default function NewBookingsPage() {
       : '/api/new/bookings'
     const method = data.id ? 'PUT' : 'POST'
 
-    const response = await fetch(endpoint, {
+    const response = await branchFetch(endpoint, {
       method,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -288,7 +291,7 @@ export default function NewBookingsPage() {
 
   // Handle cancel booking
   const handleCancelBooking = async (id: number) => {
-    const response = await fetch(`/api/new/bookings/${id}/cancel`, {
+    const response = await branchFetch(`/api/new/bookings/${id}/cancel`, {
       method: 'PUT',
     })
 

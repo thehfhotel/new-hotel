@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
 use crate::error::{ApiError, ApiResult};
-use super::mode::{AppState, SystemMode};
+use super::mode::{AppState, Branch, SystemMode};
 
 /// Check if we should read from PostgreSQL (default) or SQL Server
 fn use_pg_source() -> bool {
@@ -27,6 +27,7 @@ fn use_pg_source() -> bool {
 pub struct CalendarQuery {
     pub start_date: String,
     pub end_date: String,
+    pub branch: Option<Branch>,
 }
 
 /// Source database for a calendar entry
@@ -90,6 +91,7 @@ pub async fn get_calendar(
     Query(params): Query<CalendarQuery>,
 ) -> ApiResult<Json<CalendarResponse>> {
     let mode = state.current_mode();
+    let branch = params.branch.unwrap_or_default();
 
     // Validate date parameters
     if params.start_date.is_empty() || params.end_date.is_empty() {
@@ -99,34 +101,63 @@ pub async fn get_calendar(
     let mut all_bookings: Vec<CalendarBooking> = Vec::new();
     let mut all_checkins: Vec<CalendarCheckin> = Vec::new();
 
-    // Fetch legacy data from PG mirror or SQL Server based on feature flag
-    let (legacy_bookings, legacy_checkins) = if use_pg_source() {
-        fetch_legacy_calendar_data_pg(
-            &state.new_pool,
-            &params.start_date,
-            &params.end_date,
-        ).await?
-    } else {
-        fetch_legacy_calendar_data(
-            &state.legacy_pool,
-            &params.start_date,
-            &params.end_date,
-        ).await?
-    };
+    // Fetch data based on branch selection
+    let fetch_hfhotel = branch == Branch::Hfhotel || branch == Branch::All;
+    let fetch_hfville = branch == Branch::Hfville || branch == Branch::All;
 
-    all_bookings.extend(legacy_bookings);
-    all_checkins.extend(legacy_checkins);
+    if fetch_hfhotel {
+        // Fetch legacy data from PG mirror or SQL Server based on feature flag
+        let (legacy_bookings, legacy_checkins) = if use_pg_source() {
+            fetch_legacy_calendar_data_pg(
+                &state.new_pool,
+                &params.start_date,
+                &params.end_date,
+            ).await?
+        } else {
+            fetch_legacy_calendar_data(
+                &state.legacy_pool,
+                &params.start_date,
+                &params.end_date,
+            ).await?
+        };
 
-    // In new mode, also fetch from new_hotel database
-    if mode == SystemMode::New {
-        let (new_bookings, new_checkins) = fetch_new_calendar_data(
-            &state.new_pool,
-            &params.start_date,
-            &params.end_date,
-        ).await?;
+        all_bookings.extend(legacy_bookings);
+        all_checkins.extend(legacy_checkins);
 
-        all_bookings.extend(new_bookings);
-        all_checkins.extend(new_checkins);
+        // In new mode, also fetch from new_hotel database
+        if mode == SystemMode::New {
+            let (new_bookings, new_checkins) = fetch_new_calendar_data(
+                &state.new_pool,
+                &params.start_date,
+                &params.end_date,
+            ).await?;
+
+            all_bookings.extend(new_bookings);
+            all_checkins.extend(new_checkins);
+        }
+    }
+
+    if fetch_hfville {
+        if let Ok(vp) = state.ville_pool() {
+            let (ville_bookings, ville_checkins) = fetch_legacy_calendar_data_pg(
+                vp,
+                &params.start_date,
+                &params.end_date,
+            ).await?;
+
+            // Remap IDs to avoid collisions with HF Hotel
+            let ville_bookings: Vec<CalendarBooking> = ville_bookings.into_iter().map(|mut b| {
+                b.id = b.id.replace("legacy-booking-", "ville-booking-");
+                b
+            }).collect();
+            let ville_checkins: Vec<CalendarCheckin> = ville_checkins.into_iter().map(|mut c| {
+                c.id = c.id.replace("legacy-checkin-", "ville-checkin-");
+                c
+            }).collect();
+
+            all_bookings.extend(ville_bookings);
+            all_checkins.extend(ville_checkins);
+        }
     }
 
     Ok(Json(CalendarResponse {

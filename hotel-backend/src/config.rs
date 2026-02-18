@@ -139,11 +139,54 @@ impl ServerConfig {
     }
 }
 
+/// Database configuration for HF Ville mirror (PostgreSQL via cloudflared tunnel)
+#[derive(Debug, Clone)]
+pub struct VilleDbConfig {
+    pub server: String,
+    pub port: u16,
+    pub database: String,
+    pub user: String,
+    pub password: String,
+    pub pool_max: u32,
+    pub enabled: bool,
+}
+
+impl VilleDbConfig {
+    pub fn from_env() -> Self {
+        Self {
+            server: env::var("VILLE_DB_SERVER").unwrap_or_else(|_| "ville-tunnel".to_string()),
+            port: env::var("VILLE_DB_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5440),
+            database: env::var("VILLE_DB_NAME").unwrap_or_else(|_| "hfville".to_string()),
+            user: env::var("VILLE_DB_USER").unwrap_or_else(|_| "postgres".to_string()),
+            password: env::var("VILLE_DB_PASSWORD").unwrap_or_else(|_| "HfVille@2026!".to_string()),
+            pool_max: env::var("VILLE_DB_POOL_MAX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5),
+            enabled: env::var("VILLE_DB_ENABLED")
+                .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+                .unwrap_or(false),
+        }
+    }
+
+    /// Build PostgreSQL connection string
+    pub fn connection_string(&self) -> String {
+        format!(
+            "postgres://{}:{}@{}:{}/{}",
+            self.user, self.password, self.server, self.port, self.database
+        )
+    }
+}
+
 /// Complete application configuration
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub db: DbConfig,
     pub new_db: NewDbConfig,
+    pub ville_db: VilleDbConfig,
     pub mode: SystemMode,
     pub slack: SlackConfig,
     pub server: ServerConfig,
@@ -154,6 +197,7 @@ impl AppConfig {
         Self {
             db: DbConfig::from_env(),
             new_db: NewDbConfig::from_env(),
+            ville_db: VilleDbConfig::from_env(),
             mode: SystemMode::from_env(),
             slack: SlackConfig::from_env(),
             server: ServerConfig::from_env(),

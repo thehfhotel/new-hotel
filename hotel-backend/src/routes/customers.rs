@@ -22,7 +22,7 @@ use crate::models::{
     Customer, CustomerBooking, CustomerBookingsResponse, CustomerStats, CustomerStatsResponse,
     CustomersResponse,
 };
-use crate::routes::mode::AppState;
+use crate::routes::mode::{AppState, Branch};
 
 /// Query parameters for customers list
 #[derive(Debug, Deserialize)]
@@ -37,6 +37,7 @@ pub struct CustomersQuery {
     pub sort_order: Option<String>,
     #[serde(default)]
     pub include_last_visit: bool,
+    pub branch: Option<Branch>,
 }
 
 fn default_page() -> i32 { 1 }
@@ -59,10 +60,26 @@ pub async fn list_customers(
     State(state): State<AppState>,
     Query(params): Query<CustomersQuery>,
 ) -> ApiResult<Json<CustomersResponse>> {
-    if use_sqlserver() {
-        list_customers_sqlserver(&state.legacy_pool, &params).await
-    } else {
-        list_customers_pg(&state.new_pool, &params).await
+    let branch = params.branch.unwrap_or_default();
+
+    match branch {
+        Branch::Hfhotel => {
+            if use_sqlserver() {
+                list_customers_sqlserver(&state.legacy_pool, &params).await
+            } else {
+                list_customers_pg(&state.new_pool, &params).await
+            }
+        }
+        Branch::Hfville => {
+            list_customers_pg(state.ville_pool()?, &params).await
+        }
+        Branch::All => {
+            if use_sqlserver() {
+                list_customers_sqlserver(&state.legacy_pool, &params).await
+            } else {
+                list_customers_pg(&state.new_pool, &params).await
+            }
+        }
     }
 }
 

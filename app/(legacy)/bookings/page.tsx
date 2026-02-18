@@ -17,6 +17,7 @@ import {
 } from 'lucide-react'
 import DatePicker from 'react-datepicker'
 import BookingDetailDrawer from '@/components/BookingDetailDrawer'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 
 // Types
 interface Room {
@@ -69,6 +70,8 @@ function formatDate(dateString: string): string {
 }
 
 export default function BookingsPage() {
+  const branchFetch = useBranchFetch()
+
   // State
   const [bookings, setBookings] = useState<GroupedBooking[]>([])
   const [loading, setLoading] = useState(true)
@@ -111,7 +114,7 @@ export default function BookingsPage() {
       if (endDate) params.append('endDate', endDate.toISOString().split('T')[0])
       if (searchTerm) params.append('search', searchTerm)
 
-      const response = await fetch(`/api/bookings?${params.toString()}`)
+      const response = await branchFetch(`/api/bookings?${params.toString()}`)
 
       if (!response.ok) {
         throw new Error('ไม่สามารถดึงข้อมูลการจองได้')
@@ -131,7 +134,7 @@ export default function BookingsPage() {
     } finally {
       setLoading(false)
     }
-  }, [currentPage, statusFilter, startDate, endDate, searchTerm, sortBy, sortOrder])
+  }, [currentPage, statusFilter, startDate, endDate, searchTerm, sortBy, sortOrder, branchFetch])
 
   useEffect(() => {
     fetchBookings()
