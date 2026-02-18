@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.17.1] - 2026-02-18
+
+### Fixed
+- **Sync: invalid column names** — removed `Book_Room_No` from booking sync and `Cin_CheckIn_No` from check-in sync (columns don't exist in SQL Server views)
+- **Sync: customer truncation** — widened `cust_no`, `cust_type`, `cust_phone`, `cust_idcard` columns in `ht_customers_legacy` to prevent "value too long" errors
+- **Sync: datetime panics** — use `try_get()` for all datetime fields in booking/check-in sync to handle empty/invalid values gracefully
+
 ## [2.17.0] - 2026-02-18
 
 ### Added

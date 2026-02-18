@@ -402,8 +402,7 @@ async fn sync_bookings(
                 Book_Cust_Name,
                 Book_Cust_ID,
                 Book_Status,
-                Book_Room_Type,
-                Book_Room_No
+                Book_Room_Type
             FROM View_Booking_Ds
             "#,
         )
@@ -417,17 +416,16 @@ async fn sync_bookings(
 
     for row in &rows {
         let book_no = row.get::<&str, _>("Book_No").unwrap_or_default().to_string();
-        let book_date = row.get::<NaiveDateTime, _>("Book_Date");
-        let book_date_in = row.get::<NaiveDateTime, _>("Book_Date_in");
-        let book_date_out = row.get::<NaiveDateTime, _>("Book_Date_out");
+        let book_date: Option<NaiveDateTime> = row.try_get("Book_Date").unwrap_or(None);
+        let book_date_in: Option<NaiveDateTime> = row.try_get("Book_Date_in").unwrap_or(None);
+        let book_date_out: Option<NaiveDateTime> = row.try_get("Book_Date_out").unwrap_or(None);
         let book_cust_name = row.get::<&str, _>("Book_Cust_Name").map(String::from);
         let book_cust_id = row.get::<&str, _>("Book_Cust_ID").map(String::from);
         let book_status = row.get::<i32, _>("Book_Status");
         let book_room_type = row.get::<&str, _>("Book_Room_Type").map(String::from);
-        let book_room_no = row.get::<&str, _>("Book_Room_No").map(String::from);
 
         let hash_input = format!(
-            "{}|{:?}|{:?}|{:?}|{}|{}|{:?}|{}|{}",
+            "{}|{:?}|{:?}|{:?}|{}|{}|{:?}|{}",
             book_no,
             book_date,
             book_date_in,
@@ -436,7 +434,6 @@ async fn sync_bookings(
             book_cust_id.as_deref().unwrap_or(""),
             book_status,
             book_room_type.as_deref().unwrap_or(""),
-            book_room_no.as_deref().unwrap_or(""),
         );
         let hash = sha256(&hash_input);
 
@@ -461,9 +458,8 @@ async fn sync_bookings(
                     UPDATE ht_bookings_legacy
                     SET book_date = $1, book_date_in = $2, book_date_out = $3,
                         book_cust_name = $4, book_cust_id = $5, book_status = $6,
-                        book_room_no = $7,
-                        sync_hash = $8, synced_at = NOW()
-                    WHERE book_no = $9 AND COALESCE(book_room_type, '') = $10
+                        sync_hash = $7, synced_at = NOW()
+                    WHERE book_no = $8 AND COALESCE(book_room_type, '') = $9
                     "#,
                 )
                 .bind(&book_date)
@@ -472,7 +468,6 @@ async fn sync_bookings(
                 .bind(&book_cust_name)
                 .bind(&book_cust_id)
                 .bind(&book_status)
-                .bind(&book_room_no)
                 .bind(&hash)
                 .bind(&book_no)
                 .bind(room_type_key)
@@ -486,8 +481,8 @@ async fn sync_bookings(
                     INSERT INTO ht_bookings_legacy
                         (book_no, book_date, book_date_in, book_date_out,
                          book_cust_name, book_cust_id, book_status,
-                         book_room_type, book_room_no, sync_hash)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                         book_room_type, sync_hash)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                     "#,
                 )
                 .bind(&book_no)
@@ -498,7 +493,6 @@ async fn sync_bookings(
                 .bind(&book_cust_id)
                 .bind(&book_status)
                 .bind(&book_room_type)
-                .bind(&book_room_no)
                 .bind(&hash)
                 .execute(pg_pool)
                 .await?;
@@ -540,8 +534,7 @@ async fn sync_checkins(
                 Cin_Room_Out,
                 Cin_cust_name,
                 Cin_cust_no,
-                Cin_status,
-                Cin_CheckIn_No
+                Cin_status
             FROM View_CheckIn_Ds
             "#,
         )
@@ -556,15 +549,14 @@ async fn sync_checkins(
     for row in &rows {
         let cin_no = row.get::<&str, _>("Cin_no").unwrap_or_default().to_string();
         let cin_room_no = row.get::<&str, _>("Cin_Room_No").map(String::from);
-        let cin_room_in = row.get::<NaiveDateTime, _>("Cin_Room_In");
-        let cin_room_out = row.get::<NaiveDateTime, _>("Cin_Room_Out");
+        let cin_room_in: Option<NaiveDateTime> = row.try_get("Cin_Room_In").unwrap_or(None);
+        let cin_room_out: Option<NaiveDateTime> = row.try_get("Cin_Room_Out").unwrap_or(None);
         let cin_cust_name = row.get::<&str, _>("Cin_cust_name").map(String::from);
         let cin_cust_no = row.get::<&str, _>("Cin_cust_no").map(String::from);
         let cin_status = row.get::<&str, _>("Cin_status").map(String::from);
-        let cin_checkin_no = row.get::<&str, _>("Cin_CheckIn_No").map(String::from);
 
         let hash_input = format!(
-            "{}|{}|{:?}|{:?}|{}|{}|{}|{}",
+            "{}|{}|{:?}|{:?}|{}|{}|{}",
             cin_no,
             cin_room_no.as_deref().unwrap_or(""),
             cin_room_in,
@@ -572,7 +564,6 @@ async fn sync_checkins(
             cin_cust_name.as_deref().unwrap_or(""),
             cin_cust_no.as_deref().unwrap_or(""),
             cin_status.as_deref().unwrap_or(""),
-            cin_checkin_no.as_deref().unwrap_or(""),
         );
         let hash = sha256(&hash_input);
 
@@ -593,9 +584,8 @@ async fn sync_checkins(
                     UPDATE ht_checkins_legacy
                     SET cin_room_no = $1, cin_room_in = $2, cin_room_out = $3,
                         cin_cust_name = $4, cin_cust_no = $5, cin_status = $6,
-                        cin_checkin_no = $7,
-                        sync_hash = $8, synced_at = NOW()
-                    WHERE cin_no = $9
+                        sync_hash = $7, synced_at = NOW()
+                    WHERE cin_no = $8
                     "#,
                 )
                 .bind(&cin_room_no)
@@ -604,7 +594,6 @@ async fn sync_checkins(
                 .bind(&cin_cust_name)
                 .bind(&cin_cust_no)
                 .bind(&cin_status)
-                .bind(&cin_checkin_no)
                 .bind(&hash)
                 .bind(&cin_no)
                 .execute(pg_pool)
@@ -616,8 +605,8 @@ async fn sync_checkins(
                     r#"
                     INSERT INTO ht_checkins_legacy
                         (cin_no, cin_room_no, cin_room_in, cin_room_out,
-                         cin_cust_name, cin_cust_no, cin_status, cin_checkin_no, sync_hash)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                         cin_cust_name, cin_cust_no, cin_status, sync_hash)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                     "#,
                 )
                 .bind(&cin_no)
@@ -627,7 +616,6 @@ async fn sync_checkins(
                 .bind(&cin_cust_name)
                 .bind(&cin_cust_no)
                 .bind(&cin_status)
-                .bind(&cin_checkin_no)
                 .bind(&hash)
                 .execute(pg_pool)
                 .await?;
