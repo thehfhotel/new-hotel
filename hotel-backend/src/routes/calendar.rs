@@ -13,6 +13,14 @@ use sqlx::Row;
 use crate::error::{ApiError, ApiResult};
 use super::mode::{AppState, SystemMode};
 
+/// Check if we should read from PostgreSQL (default) or SQL Server
+fn use_pg_source() -> bool {
+    std::env::var("LEGACY_READ_SOURCE")
+        .unwrap_or_else(|_| "pg".to_string())
+        .to_lowercase()
+        != "sqlserver"
+}
+
 /// Query parameters for calendar endpoint
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -91,12 +99,20 @@ pub async fn get_calendar(
     let mut all_bookings: Vec<CalendarBooking> = Vec::new();
     let mut all_checkins: Vec<CalendarCheckin> = Vec::new();
 
-    // Always fetch from legacy database
-    let (legacy_bookings, legacy_checkins) = fetch_legacy_calendar_data(
-        &state.legacy_pool,
-        &params.start_date,
-        &params.end_date,
-    ).await?;
+    // Fetch legacy data from PG mirror or SQL Server based on feature flag
+    let (legacy_bookings, legacy_checkins) = if use_pg_source() {
+        fetch_legacy_calendar_data_pg(
+            &state.new_pool,
+            &params.start_date,
+            &params.end_date,
+        ).await?
+    } else {
+        fetch_legacy_calendar_data(
+            &state.legacy_pool,
+            &params.start_date,
+            &params.end_date,
+        ).await?
+    };
 
     all_bookings.extend(legacy_bookings);
     all_checkins.extend(legacy_checkins);
@@ -208,6 +224,78 @@ async fn fetch_legacy_calendar_data(
                 room_no: row.get::<&str, _>("Cin_Room_No").map(String::from),
                 check_in: row.get::<NaiveDateTime, _>("Cin_Room_In").map(|dt| dt.and_utc()),
                 check_out: row.get::<NaiveDateTime, _>("Cin_Room_Out").map(|dt| dt.and_utc()),
+                source: DataSource::Legacy,
+            }
+        })
+        .collect();
+
+    Ok((bookings, checkins))
+}
+
+/// Fetch legacy calendar data from PostgreSQL mirror tables
+async fn fetch_legacy_calendar_data_pg(
+    pool: &crate::db::PgPool,
+    start_date: &str,
+    end_date: &str,
+) -> ApiResult<(Vec<CalendarBooking>, Vec<CalendarCheckin>)> {
+    // Fetch bookings from PG mirror
+    let booking_rows = sqlx::query(
+        r#"
+        SELECT book_no, book_cust_name, book_room_no, book_date_in, book_date_out, book_status
+        FROM ht_bookings_legacy
+        WHERE book_date_out::date >= $1::date
+          AND book_date_in::date <= $2::date
+        ORDER BY book_date_in
+        "#,
+    )
+    .bind(start_date)
+    .bind(end_date)
+    .fetch_all(pool)
+    .await?;
+
+    let bookings: Vec<CalendarBooking> = booking_rows
+        .iter()
+        .map(|row| {
+            let book_no: String = row.try_get("book_no").unwrap_or_default();
+            CalendarBooking {
+                id: format!("legacy-booking-{}", book_no),
+                booking_no: book_no,
+                customer_name: row.try_get("book_cust_name").ok(),
+                room_no: row.try_get("book_room_no").ok(),
+                check_in: row.try_get::<NaiveDateTime, _>("book_date_in").ok().map(|dt| dt.and_utc()),
+                check_out: row.try_get::<NaiveDateTime, _>("book_date_out").ok().map(|dt| dt.and_utc()),
+                status: row.try_get::<i32, _>("book_status").ok().map(|s| map_legacy_status(s)),
+                source: DataSource::Legacy,
+            }
+        })
+        .collect();
+
+    // Fetch check-ins from PG mirror
+    let checkin_rows = sqlx::query(
+        r#"
+        SELECT cin_no, cin_cust_name, cin_room_no, cin_room_in, cin_room_out
+        FROM ht_checkins_legacy
+        WHERE cin_room_out::date >= $1::date
+          AND cin_room_in::date <= $2::date
+        ORDER BY cin_room_in
+        "#,
+    )
+    .bind(start_date)
+    .bind(end_date)
+    .fetch_all(pool)
+    .await?;
+
+    let checkins: Vec<CalendarCheckin> = checkin_rows
+        .iter()
+        .map(|row| {
+            let cin_no: String = row.try_get("cin_no").unwrap_or_default();
+            CalendarCheckin {
+                id: format!("legacy-checkin-{}", cin_no),
+                checkin_no: cin_no,
+                customer_name: row.try_get("cin_cust_name").ok(),
+                room_no: row.try_get("cin_room_no").ok(),
+                check_in: row.try_get::<NaiveDateTime, _>("cin_room_in").ok().map(|dt| dt.and_utc()),
+                check_out: row.try_get::<NaiveDateTime, _>("cin_room_out").ok().map(|dt| dt.and_utc()),
                 source: DataSource::Legacy,
             }
         })
