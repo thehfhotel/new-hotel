@@ -1,6 +1,6 @@
 //! Booking API routes
 //!
-//! - GET /api/bookings - List bookings (paginated) - uses legacy DB
+//! - GET /api/bookings - List bookings (paginated) - uses PG by default, legacy DB if LEGACY_READ_SOURCE=sqlserver
 //! - GET /api/bookings/:id - Get booking details - uses legacy DB for booking, HotelNew for notes
 //! - GET /api/bookings/:id/notes - Get booking notes - uses HotelNew DB
 //! - POST /api/bookings/:id/notes - Add booking note - uses HotelNew DB
@@ -17,8 +17,9 @@ use axum::{
 };
 use chrono::NaiveDateTime;
 use serde::Deserialize;
+use sqlx::Row;
 
-use crate::db::DbPool;
+use crate::db::{DbPool, PgPool};
 use crate::error::{ApiError, ApiResult};
 use crate::models::{
     get_status_code, map_status, Booking, BookingCustomer, BookingCustomerDetail, BookingDetail,
@@ -50,10 +51,220 @@ fn default_limit() -> i32 { 20 }
 fn default_sort_by() -> String { "bookDate".to_string() }
 fn default_sort_order() -> String { "desc".to_string() }
 
+/// Check if legacy read source is SQL Server (feature flag)
+fn use_sqlserver() -> bool {
+    std::env::var("LEGACY_READ_SOURCE")
+        .map(|v| v.eq_ignore_ascii_case("sqlserver"))
+        .unwrap_or(false)
+}
+
 /// GET /api/bookings - List bookings (paginated)
+///
+/// Reads from `ht_bookings_legacy` (PostgreSQL) by default.
+/// Set `LEGACY_READ_SOURCE=sqlserver` to read from legacy SQL Server instead.
 pub async fn list_bookings(
-    State(pool): State<DbPool>,
+    State(state): State<AppState>,
     Query(params): Query<BookingsQuery>,
+) -> ApiResult<Json<BookingsResponse>> {
+    if use_sqlserver() {
+        list_bookings_sqlserver(&state.legacy_pool, &params).await
+    } else {
+        list_bookings_pg(&state.new_pool, &params).await
+    }
+}
+
+/// List bookings from PostgreSQL `ht_bookings_legacy` table
+async fn list_bookings_pg(
+    pool: &PgPool,
+    params: &BookingsQuery,
+) -> ApiResult<Json<BookingsResponse>> {
+    // Build WHERE conditions with parameterized queries
+    let mut conditions: Vec<String> = Vec::new();
+    let mut bind_idx: usize = 0;
+    // We'll collect bind values and apply them later
+    // Since we're using dynamic SQL, track parameter indices
+    let mut search_pattern: Option<String> = None;
+    let mut status_code: Option<i32> = None;
+    let mut start_date_val: Option<String> = None;
+    let mut end_date_val: Option<String> = None;
+
+    if let Some(ref search) = params.search {
+        if !search.is_empty() {
+            bind_idx += 1;
+            let search_idx = bind_idx;
+            conditions.push(format!(
+                "(book_no LIKE ${} OR book_cust_name LIKE ${})",
+                search_idx, search_idx
+            ));
+            search_pattern = Some(format!("%{}%", search));
+        }
+    }
+
+    if let Some(ref status) = params.status {
+        if let Some(code) = get_status_code(status) {
+            bind_idx += 1;
+            conditions.push(format!("book_status = ${}", bind_idx));
+            status_code = Some(code);
+        }
+    }
+
+    if let Some(ref start_date) = params.start_date {
+        if !start_date.is_empty() {
+            bind_idx += 1;
+            conditions.push(format!("book_date_out::date >= ${}", bind_idx));
+            start_date_val = Some(start_date.clone());
+        }
+    }
+
+    if let Some(ref end_date) = params.end_date {
+        if !end_date.is_empty() {
+            bind_idx += 1;
+            conditions.push(format!("book_date_in::date <= ${}", bind_idx));
+            end_date_val = Some(end_date.clone());
+        }
+    }
+
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conditions.join(" AND "))
+    };
+
+    // Count distinct bookings
+    let count_query = format!(
+        "SELECT COUNT(DISTINCT book_no)::int as total FROM ht_bookings_legacy {}",
+        where_clause
+    );
+
+    // Build count query with binds
+    let mut count_q = sqlx::query(&count_query);
+    if let Some(ref pat) = search_pattern {
+        count_q = count_q.bind(pat);
+    }
+    if let Some(code) = status_code {
+        count_q = count_q.bind(code);
+    }
+    if let Some(ref sd) = start_date_val {
+        count_q = count_q.bind(sd);
+    }
+    if let Some(ref ed) = end_date_val {
+        count_q = count_q.bind(ed);
+    }
+
+    let count_rows = count_q.fetch_all(pool).await?;
+    let total: i32 = count_rows
+        .first()
+        .map(|r| r.try_get::<i32, _>("total").unwrap_or(0))
+        .unwrap_or(0);
+
+    // Get all data (group and paginate in Rust like the Node.js version)
+    let data_query = format!(
+        r#"
+        SELECT
+            book_no,
+            book_date,
+            book_date_in,
+            book_date_out,
+            book_cust_name,
+            book_status,
+            book_room_type
+        FROM ht_bookings_legacy
+        {}
+        ORDER BY book_date DESC
+        "#,
+        where_clause
+    );
+
+    let mut data_q = sqlx::query(&data_query);
+    if let Some(ref pat) = search_pattern {
+        data_q = data_q.bind(pat);
+    }
+    if let Some(code) = status_code {
+        data_q = data_q.bind(code);
+    }
+    if let Some(ref sd) = start_date_val {
+        data_q = data_q.bind(sd);
+    }
+    if let Some(ref ed) = end_date_val {
+        data_q = data_q.bind(ed);
+    }
+
+    let rows = data_q.fetch_all(pool).await?;
+
+    // Group records by book_no
+    let mut grouped: HashMap<String, Booking> = HashMap::new();
+
+    for row in &rows {
+        let book_no: String = row.try_get("book_no").unwrap_or_default();
+
+        let entry = grouped.entry(book_no.clone()).or_insert_with(|| {
+            let book_date: Option<NaiveDateTime> = row.try_get("book_date").ok();
+            let check_in: Option<NaiveDateTime> = row.try_get("book_date_in").ok();
+            let check_out: Option<NaiveDateTime> = row.try_get("book_date_out").ok();
+            let cust_name: String = row.try_get("book_cust_name").unwrap_or_default();
+            let status: Option<i32> = row.try_get("book_status").ok();
+
+            Booking {
+                book_no: book_no.clone(),
+                book_date: book_date.map(|dt| dt.and_utc()),
+                check_in: check_in.map(|dt| dt.and_utc()),
+                check_out: check_out.map(|dt| dt.and_utc()),
+                customer: BookingCustomer {
+                    name: cust_name,
+                },
+                status: map_status(status),
+                rooms: Vec::new(),
+                room_count: 0,
+            }
+        });
+
+        let room_type: String = row
+            .try_get("book_room_type")
+            .unwrap_or_else(|_| "-".to_string());
+
+        entry.rooms.push(BookingRoom {
+            room_no: "-".to_string(),
+            room_type,
+        });
+        entry.room_count = entry.rooms.len();
+    }
+
+    let mut all_grouped: Vec<Booking> = grouped.into_values().collect();
+
+    // Sort by requested field
+    let sort_asc = params.sort_order.to_lowercase() == "asc";
+    all_grouped.sort_by(|a, b| {
+        let cmp = match params.sort_by.as_str() {
+            "bookNo" => a.book_no.cmp(&b.book_no),
+            "status" => a.status.cmp(&b.status),
+            "customer" => a.customer.name.to_lowercase().cmp(&b.customer.name.to_lowercase()),
+            "checkIn" => a.check_in.cmp(&b.check_in),
+            "checkOut" => a.check_out.cmp(&b.check_out),
+            "roomCount" => a.room_count.cmp(&b.room_count),
+            _ => a.book_date.cmp(&b.book_date), // bookDate default
+        };
+        if sort_asc { cmp } else { cmp.reverse() }
+    });
+
+    // Paginate
+    let start_idx = ((params.page - 1) * params.limit) as usize;
+    let paginated_data: Vec<Booking> = all_grouped
+        .into_iter()
+        .skip(start_idx)
+        .take(params.limit as usize)
+        .collect();
+
+    Ok(Json(BookingsResponse {
+        success: true,
+        data: paginated_data,
+        pagination: Pagination::new(params.page, params.limit, total),
+    }))
+}
+
+/// List bookings from legacy SQL Server `View_Booking_Ds` view
+async fn list_bookings_sqlserver(
+    pool: &DbPool,
+    params: &BookingsQuery,
 ) -> ApiResult<Json<BookingsResponse>> {
     let mut conn = pool.get().await?;
 

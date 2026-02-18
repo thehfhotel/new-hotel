@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.17.0] - 2026-02-18
+
+### Added
+- **One-time legacy data migration CLI** (`cargo run --bin migrate_legacy`) — imports all historical data from SQL Server into PostgreSQL in a single transaction
+  - Extracts distinct room types from legacy rooms into `ht_room_types`
+  - Imports rooms (`HT_Rooms` -> `ht_rooms_new`) with floor parsing and type linking
+  - Imports customers (`View_Customers` -> `ht_customers`) with name splitting (first/last)
+  - Imports bookings (`View_Booking_Ds` -> `ht_bookings` + `ht_booking_rooms`) grouped by Book_No
+  - Imports check-ins (`View_CheckIn_Ds` -> `ht_checkins`) with customer/room linking
+  - Bumps PostgreSQL sequences past max imported IDs to avoid conflicts
+  - All imported records tagged with `source = 'legacy'`
+- **Status code mapping**: Legacy `Book_Status` integers mapped to string statuses (1=confirmed, 2=checkedin, 3=completed, 4=cancelled, 0/other=pending)
+- **Safety features**: Full transaction rollback on error, `--dry-run` flag, idempotent (skips existing records)
+
+## [2.16.0] - 2026-02-18
+
+### Added
+- **Legacy-to-PostgreSQL background sync** — new scheduler job replicates data from SQL Server every 5 minutes using SHA256 change detection, enabling gradual migration away from the legacy database
+  - `ht_rooms_legacy` mirrors `HT_Rooms`
+  - `ht_bookings_legacy` mirrors `View_Booking_Ds` (composite key: book_no + room_type)
+  - `ht_checkins_legacy` mirrors `View_CheckIn_Ds` (unique key: cin_no)
+  - `ht_customers_legacy` mirrors `View_Customers` (unique key: cust_no)
+  - `sync_status` table tracks per-entity sync health, timing, and error counts
+- **Sync status API** — `GET /api/new/sync/status` returns last sync time, record counts, and health indicator per entity type
+- **Sync admin dashboard** — `app/new/admin/sync/page.tsx` displays real-time sync health with auto-refresh every 30 seconds
+- **Data source tracking** — `source` column added to `ht_bookings`, `ht_checkins`, `ht_customers` to distinguish between 'new' (app-created) and 'legacy' (synced) records
+- **SYNC_ENABLED environment variable** — set to `false` to disable the background sync job without code changes
+
+- **`LEGACY_READ_SOURCE` feature flag** — all legacy read routes now default to PostgreSQL mirror tables; set `LEGACY_READ_SOURCE=sqlserver` to fall back to direct SQL Server queries
+  - `GET /api/rooms` — reads from `ht_rooms_legacy` (with `ht_rooms_new` price overrides)
+  - `GET /api/rooms/:id` — room detail + current guest from `ht_checkins_legacy`
+  - `GET /api/rooms/checkouts-today` — checkout detection from PG
+  - `GET /api/bookings` — paginated bookings from `ht_bookings_legacy`
+  - `GET /api/checkins` — paginated check-ins from `ht_checkins_legacy`
+  - `GET /api/customers` — search/sort/pagination from `ht_customers_legacy`
+  - `GET /api/customers/:id/bookings` — booking history from `ht_bookings_legacy`
+  - `GET /api/customers/:id/stats` — customer stats from PG mirror tables
+  - `GET /api/stats` — dashboard statistics from PG mirror tables
+  - `GET /api/occupancy` — occupancy trends from `ht_checkins_legacy`
+  - Exceptions: `GET /api/rooms/status` and `GET /api/bookings/:id` still use SQL Server (no PG equivalent)
+
+### Changed
+- Scheduler `init_scheduler()` now accepts an optional `PgPool` for the sync job (backwards compatible — Slack notification jobs unchanged)
+- All legacy read routes refactored with dual-source pattern: PG implementation + SQL Server fallback per endpoint
+
 ## [2.15.2] - 2026-02-07
 
 ### Fixed

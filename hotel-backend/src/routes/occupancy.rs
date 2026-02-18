@@ -1,6 +1,9 @@
 //! Occupancy trends API route
 //!
 //! - GET /api/occupancy - Get occupancy trends for the last N days
+//!
+//! Reads from PostgreSQL (ht_checkins_legacy) by default.
+//! Set LEGACY_READ_SOURCE=sqlserver to read from SQL Server (View_CheckIn_Ds).
 
 use axum::{
     extract::{Query, State},
@@ -8,9 +11,11 @@ use axum::{
 };
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 
-use crate::db::DbPool;
+use crate::db::{DbPool, PgPool};
 use crate::error::ApiResult;
+use crate::routes::mode::AppState;
 
 /// Query parameters for occupancy
 #[derive(Debug, Deserialize)]
@@ -38,13 +43,62 @@ pub struct OccupancyResponse {
 
 /// GET /api/occupancy - Get occupancy trends
 pub async fn get_occupancy(
-    State(pool): State<DbPool>,
+    State(state): State<AppState>,
     Query(params): Query<OccupancyQuery>,
 ) -> ApiResult<Json<OccupancyResponse>> {
+    let source = std::env::var("LEGACY_READ_SOURCE")
+        .unwrap_or_else(|_| "pg".to_string());
+
+    let data = if source == "sqlserver" {
+        get_occupancy_sqlserver(&state.legacy_pool, params.days).await?
+    } else {
+        get_occupancy_pg(&state.new_pool, params.days).await?
+    };
+
+    Ok(Json(OccupancyResponse {
+        success: true,
+        data,
+    }))
+}
+
+/// Read occupancy data from PostgreSQL (ht_checkins_legacy)
+async fn get_occupancy_pg(pool: &PgPool, days: i32) -> ApiResult<Vec<OccupancyData>> {
+    let rows = sqlx::query(
+        r#"
+        WITH DateRange AS (
+            SELECT (CURRENT_DATE - n)::date as date_val
+            FROM generate_series(0, $1 - 1) AS n
+        )
+        SELECT
+            dr.date_val as date,
+            COUNT(DISTINCT c.cin_room_no)::int as occupied_rooms
+        FROM DateRange dr
+        LEFT JOIN ht_checkins_legacy c ON
+            c.cin_room_in::date <= dr.date_val
+            AND c.cin_room_out::date > dr.date_val
+        GROUP BY dr.date_val
+        ORDER BY dr.date_val ASC
+        "#,
+    )
+    .bind(days)
+    .fetch_all(pool)
+    .await?;
+
+    let data: Vec<OccupancyData> = rows
+        .iter()
+        .map(|row| OccupancyData {
+            date: row.get("date"),
+            occupied_rooms: row.get::<Option<i32>, _>("occupied_rooms").unwrap_or(0),
+        })
+        .collect();
+
+    Ok(data)
+}
+
+/// Read occupancy data from SQL Server (View_CheckIn_Ds) - legacy fallback
+async fn get_occupancy_sqlserver(pool: &DbPool, days: i32) -> ApiResult<Vec<OccupancyData>> {
     let mut conn = pool.get().await?;
 
-    // Get occupancy for the last N days
-    // Count rooms where check-in date <= day AND check-out date > day
     let query = format!(
         r#"
         WITH DateRange AS (
@@ -67,7 +121,7 @@ pub async fn get_occupancy(
         GROUP BY dr.date_val
         ORDER BY dr.date_val ASC
         "#,
-        params.days
+        days
     );
 
     let rows = conn
@@ -86,8 +140,5 @@ pub async fn get_occupancy(
         })
         .collect();
 
-    Ok(Json(OccupancyResponse {
-        success: true,
-        data,
-    }))
+    Ok(data)
 }
