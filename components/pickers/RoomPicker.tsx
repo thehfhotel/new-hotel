@@ -164,14 +164,14 @@ export default function RoomPicker({
     return (
       <div className={`flex items-center justify-center py-8 ${className}`}>
         <Loader2 className="w-6 h-6 animate-spin text-red-600 mr-2" />
-        <span className="text-zinc-400">กำลังโหลดห้องพัก...</span>
+        <span className="text-gray-500">กำลังโหลดห้องพัก...</span>
       </div>
     )
   }
 
   if (error) {
     return (
-      <div className={`flex items-center justify-center py-8 text-red-400 ${className}`}>
+      <div className={`flex items-center justify-center py-8 text-red-600 ${className}`}>
         <AlertCircle className="w-5 h-5 mr-2" />
         <span>{error}</span>
       </div>
@@ -182,7 +182,7 @@ export default function RoomPicker({
     <div className={className}>
       {/* Filter by room type */}
       <div className="flex items-center gap-2 mb-4 flex-wrap">
-        <div className="flex items-center gap-1 text-sm text-zinc-400">
+        <div className="flex items-center gap-1 text-sm text-gray-500">
           <Filter className="w-4 h-4" />
           <span>กรองประเภท:</span>
         </div>
@@ -192,7 +192,7 @@ export default function RoomPicker({
           className={`px-3 py-1 text-sm rounded-full transition-colors ${
             selectedTypeFilter === null
               ? 'bg-red-600 text-white'
-              : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-800'
+              : 'bg-gray-100 text-gray-700 hover:bg-gray-100'
           }`}
         >
           ทั้งหมด
@@ -205,7 +205,7 @@ export default function RoomPicker({
             className={`px-3 py-1 text-sm rounded-full transition-colors ${
               selectedTypeFilter === type.id
                 ? 'bg-red-600 text-white'
-                : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-800'
+                : 'bg-gray-100 text-gray-700 hover:bg-gray-100'
             }`}
           >
             {type.name}
@@ -217,13 +217,13 @@ export default function RoomPicker({
       {value.length > 0 && (
         <div className="mb-4 p-3 bg-red-500/10 border border-red-500 rounded-lg">
           <div className="flex items-center justify-between">
-            <span className="text-sm text-red-400">
+            <span className="text-sm text-red-600">
               เลือกแล้ว {value.length} ห้อง
             </span>
             <button
               type="button"
               onClick={() => onChange([])}
-              className="text-sm text-red-400 hover:text-red-300 font-medium"
+              className="text-sm text-red-600 hover:text-red-300 font-medium"
             >
               ล้างทั้งหมด
             </button>
@@ -232,7 +232,7 @@ export default function RoomPicker({
             {value.map((room) => (
               <span
                 key={room.id}
-                className="inline-flex items-center gap-1 px-2 py-1 bg-red-500/10 text-red-400 rounded text-sm"
+                className="inline-flex items-center gap-1 px-2 py-1 bg-red-500/10 text-red-600 rounded text-sm"
               >
                 <Bed className="w-3 h-3" />
                 {room.roomNo}
@@ -253,7 +253,7 @@ export default function RoomPicker({
       <div className="space-y-4 max-h-80 overflow-y-auto">
         {sortedFloors.map((floor) => (
           <div key={floor}>
-            <h4 className="text-sm font-medium text-zinc-500 mb-2">
+            <h4 className="text-sm font-medium text-gray-500 mb-2">
               {floor === 0 ? 'ไม่ระบุชั้น' : `ชั้น ${floor}`}
             </h4>
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
@@ -274,8 +274,8 @@ export default function RoomPicker({
                         ${selected
                           ? 'border-red-500 bg-red-500/10 ring-2 ring-red-500/20'
                           : isAvailable
-                            ? 'border-zinc-800 bg-zinc-900 hover:border-red-500 hover:bg-red-500/10'
-                            : 'border-zinc-800 bg-zinc-800 opacity-60 cursor-not-allowed'
+                            ? 'border-gray-200 bg-white hover:border-red-500 hover:bg-red-500/10'
+                            : 'border-gray-200 bg-gray-100 opacity-60 cursor-not-allowed'
                         }
                         ${disabled ? 'cursor-not-allowed opacity-60' : ''}
                       `}
@@ -289,17 +289,17 @@ export default function RoomPicker({
 
                       {/* Room number */}
                       <div className="flex items-center gap-1 mb-1">
-                        <Bed className="w-4 h-4 text-zinc-500" />
-                        <span className="font-bold text-zinc-200">{room.roomNo}</span>
+                        <Bed className="w-4 h-4 text-gray-500" />
+                        <span className="font-bold text-gray-800">{room.roomNo}</span>
                       </div>
 
                       {/* Room type */}
-                      <div className="text-xs text-zinc-500 truncate mb-1">
+                      <div className="text-xs text-gray-500 truncate mb-1">
                         {room.roomTypeName || '-'}
                       </div>
 
                       {/* Price */}
-                      <div className="text-sm font-medium text-red-400">
+                      <div className="text-sm font-medium text-red-600">
                         {formatPrice(room.priceWeekday)} บ./คืน
                       </div>
 
@@ -308,7 +308,7 @@ export default function RoomPicker({
                         <div className="mt-1">
                           <span className={`
                             inline-block px-1.5 py-0.5 text-xs rounded
-                            ${room.status === 'occupied' ? 'bg-red-500/10 text-red-400' : ''}
+                            ${room.status === 'occupied' ? 'bg-red-500/10 text-red-600' : ''}
                             ${room.status === 'maintenance' ? 'bg-yellow-500/10 text-yellow-400' : ''}
                             ${room.status === 'cleaning' ? 'bg-amber-500/10 text-amber-400' : ''}
                           `}>
@@ -327,8 +327,8 @@ export default function RoomPicker({
       </div>
 
       {filteredRooms.length === 0 && (
-        <div className="text-center py-8 text-zinc-500">
-          <Bed className="w-12 h-12 text-zinc-600 mx-auto mb-2" />
+        <div className="text-center py-8 text-gray-500">
+          <Bed className="w-12 h-12 text-gray-400 mx-auto mb-2" />
           <p>ไม่พบห้องพัก</p>
         </div>
       )}

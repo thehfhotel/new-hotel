@@ -271,17 +271,17 @@ export default function CalendarPage() {
       <div className="flex items-center gap-3">
         <CalendarIcon className="w-8 h-8 text-red-500" />
         <div>
-          <h1 className="text-2xl font-bold text-zinc-100">ไทม์ไลน์การเข้าพัก</h1>
-          <p className="text-zinc-400">ดูรูปแบบการเข้าพักและระยะเวลา (รวมข้อมูลจากทั้ง Legacy และ New)</p>
+          <h1 className="text-2xl font-bold text-gray-900">ไทม์ไลน์การเข้าพัก</h1>
+          <p className="text-gray-500">ดูรูปแบบการเข้าพักและระยะเวลา (รวมข้อมูลจากทั้ง Legacy และ New)</p>
         </div>
       </div>
 
       {/* Timeline */}
       {loading ? (
-        <div className="bg-zinc-900 rounded-xl border border-zinc-800 p-12 flex items-center justify-center">
+        <div className="bg-white rounded-xl border border-gray-200 p-12 flex items-center justify-center">
           <div className="flex items-center gap-3">
             <div className="w-6 h-6 border-2 border-red-500 border-t-transparent rounded-full animate-spin"></div>
-            <span className="text-zinc-400">กำลังโหลดข้อมูล...</span>
+            <span className="text-gray-500">กำลังโหลดข้อมูล...</span>
           </div>
         </div>
       ) : (

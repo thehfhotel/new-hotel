@@ -14,7 +14,7 @@ const variantStyles: Record<string, string> = {
   warning: 'bg-amber-500/10 text-amber-400',
   error: 'bg-red-500/10 text-red-400',
   info: 'bg-sky-500/10 text-sky-400',
-  neutral: 'bg-zinc-700 text-zinc-300',
+  neutral: 'bg-gray-200 text-gray-700',
 }
 
 const sizeStyles: Record<string, string> = {

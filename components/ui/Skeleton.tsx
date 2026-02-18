@@ -12,5 +12,5 @@ const variantStyles: Record<string, string> = {
 }
 
 export default function Skeleton({ className, variant = 'text' }: SkeletonProps) {
-  return <div className={`bg-zinc-800 animate-pulse ${variantStyles[variant]} ${className || ''}`} />
+  return <div className={`bg-gray-200 animate-pulse ${variantStyles[variant]} ${className || ''}`} />
 }

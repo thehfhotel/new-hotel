@@ -66,12 +66,12 @@ function HealthBadge({ health }: { health: string }) {
     pending: {
       icon: <Clock size={14} />,
       label: 'Pending',
-      className: 'bg-zinc-500/10 text-zinc-400 border-zinc-500/20',
+      className: 'bg-gray-500/10 text-gray-500 border-gray-500/20',
     },
     disabled: {
       icon: <Pause size={14} />,
       label: 'Disabled',
-      className: 'bg-zinc-500/10 text-zinc-500 border-zinc-500/20',
+      className: 'bg-gray-500/10 text-gray-500 border-gray-500/20',
     },
   }
 
@@ -132,7 +132,7 @@ export default function SyncStatusPage() {
   if (loading) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
-        <Loader2 className="animate-spin text-zinc-400" size={32} />
+        <Loader2 className="animate-spin text-gray-500" size={32} />
       </div>
     )
   }
@@ -140,11 +140,11 @@ export default function SyncStatusPage() {
   if (error) {
     return (
       <div className="flex flex-col items-center justify-center min-h-[400px] gap-3">
-        <AlertCircle className="text-red-400" size={32} />
-        <p className="text-red-400">{error}</p>
+        <AlertCircle className="text-red-600" size={32} />
+        <p className="text-red-600">{error}</p>
         <button
           onClick={() => { setLoading(true); fetchStatus() }}
-          className="px-4 py-2 bg-zinc-800 text-zinc-300 rounded-lg hover:bg-zinc-700 transition-colors"
+          className="px-4 py-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 transition-colors"
         >
           ลองใหม่
         </button>
@@ -159,11 +159,11 @@ export default function SyncStatusPage() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-white flex items-center gap-3">
-            <Database size={28} className="text-red-400" />
+          <h1 className="text-2xl font-bold text-gray-900 flex items-center gap-3">
+            <Database size={28} className="text-red-600" />
             Legacy Sync Status
           </h1>
-          <p className="text-zinc-400 mt-1">
+          <p className="text-gray-500 mt-1">
             สถานะการซิงค์ข้อมูลจาก SQL Server ไปยัง PostgreSQL
           </p>
         </div>
@@ -171,7 +171,7 @@ export default function SyncStatusPage() {
           <HealthBadge health={data.overallHealth} />
           <button
             onClick={() => { setLoading(true); fetchStatus() }}
-            className="p-2 bg-zinc-800 text-zinc-400 rounded-lg hover:bg-zinc-700 hover:text-white transition-colors"
+            className="p-2 bg-gray-100 text-gray-500 rounded-lg hover:bg-gray-200 hover:text-gray-900 transition-colors"
             title="Refresh"
           >
             <RefreshCw size={18} />
@@ -181,9 +181,9 @@ export default function SyncStatusPage() {
 
       {/* Sync enabled banner */}
       {!data.syncEnabled && (
-        <div className="bg-zinc-800/50 border border-zinc-700 rounded-xl p-4 flex items-center gap-3">
-          <Pause className="text-zinc-500" size={20} />
-          <span className="text-zinc-400">
+        <div className="bg-gray-100 border border-gray-300 rounded-xl p-4 flex items-center gap-3">
+          <Pause className="text-gray-500" size={20} />
+          <span className="text-gray-500">
             Sync ถูกปิดใช้งาน (SYNC_ENABLED=false)
           </span>
         </div>
@@ -194,11 +194,11 @@ export default function SyncStatusPage() {
         {data.entities.map((entity) => (
           <div
             key={entity.entityType}
-            className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-4"
+            className="bg-white border border-gray-200 rounded-xl p-5 space-y-4"
           >
             {/* Entity header */}
             <div className="flex items-center justify-between">
-              <h3 className="text-lg font-semibold text-white">
+              <h3 className="text-lg font-semibold text-gray-900">
                 {entityLabels[entity.entityType] || entity.entityType}
               </h3>
               <HealthBadge health={entity.health} />
@@ -207,38 +207,38 @@ export default function SyncStatusPage() {
             {/* Stats grid */}
             <div className="grid grid-cols-2 gap-3">
               <div>
-                <p className="text-xs text-zinc-500 uppercase tracking-wide">Total Synced</p>
-                <p className="text-xl font-bold text-white">{entity.recordsSynced.toLocaleString()}</p>
+                <p className="text-xs text-gray-500 uppercase tracking-wide">Total Synced</p>
+                <p className="text-xl font-bold text-gray-900">{entity.recordsSynced.toLocaleString()}</p>
               </div>
               <div>
-                <p className="text-xs text-zinc-500 uppercase tracking-wide">Duration</p>
-                <p className="text-xl font-bold text-white">{formatDuration(entity.syncDurationMs)}</p>
+                <p className="text-xs text-gray-500 uppercase tracking-wide">Duration</p>
+                <p className="text-xl font-bold text-gray-900">{formatDuration(entity.syncDurationMs)}</p>
               </div>
               <div>
-                <p className="text-xs text-zinc-500 uppercase tracking-wide">Added / Updated</p>
-                <p className="text-sm text-zinc-300">
+                <p className="text-xs text-gray-500 uppercase tracking-wide">Added / Updated</p>
+                <p className="text-sm text-gray-700">
                   <span className="text-emerald-400">{entity.recordsAdded}</span>
                   {' / '}
                   <span className="text-amber-400">{entity.recordsUpdated}</span>
                 </p>
               </div>
               <div>
-                <p className="text-xs text-zinc-500 uppercase tracking-wide">Unchanged</p>
-                <p className="text-sm text-zinc-300">{entity.recordsUnchanged.toLocaleString()}</p>
+                <p className="text-xs text-gray-500 uppercase tracking-wide">Unchanged</p>
+                <p className="text-sm text-gray-700">{entity.recordsUnchanged.toLocaleString()}</p>
               </div>
             </div>
 
             {/* Last sync time */}
-            <div className="pt-3 border-t border-zinc-800">
-              <p className="text-xs text-zinc-500">
+            <div className="pt-3 border-t border-gray-200">
+              <p className="text-xs text-gray-500">
                 Last sync: {formatDateTime(entity.lastSyncAt)}
               </p>
 
               {/* Error info */}
               {entity.lastError && (
                 <div className="mt-2 p-2 bg-red-500/5 border border-red-500/10 rounded-lg">
-                  <p className="text-xs text-red-400 font-mono break-all">{entity.lastError}</p>
-                  <p className="text-xs text-zinc-500 mt-1">
+                  <p className="text-xs text-red-600 font-mono break-all">{entity.lastError}</p>
+                  <p className="text-xs text-gray-500 mt-1">
                     at {formatDateTime(entity.lastErrorAt)} ({entity.consecutiveFailures} consecutive failures)
                   </p>
                 </div>

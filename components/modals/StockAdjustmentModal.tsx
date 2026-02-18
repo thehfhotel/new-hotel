@@ -195,22 +195,22 @@ export default function StockAdjustmentModal({
 
   return (
     <div
-      className="fixed inset-0 bg-black/60 flex items-center justify-center z-50"
+      className="fixed inset-0 bg-black/30 flex items-center justify-center z-50"
       onClick={handleClose}
     >
       <div
-        className="bg-zinc-900 border border-zinc-800 rounded-xl shadow-2xl w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto"
+        className="bg-white border border-gray-200 rounded-xl shadow-2xl w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="flex items-center justify-between p-4 border-b border-zinc-800">
+        <div className="flex items-center justify-between p-4 border-b border-gray-200">
           <div>
-            <h2 className="text-xl font-bold text-zinc-100">ปรับสต็อก</h2>
-            <p className="text-sm text-zinc-500">เพิ่ม, ลด หรือตั้งค่าจำนวนสต็อกใหม่</p>
+            <h2 className="text-xl font-bold text-gray-900">ปรับสต็อก</h2>
+            <p className="text-sm text-gray-500">เพิ่ม, ลด หรือตั้งค่าจำนวนสต็อกใหม่</p>
           </div>
           <button
             onClick={handleClose}
-            className="p-2 hover:bg-zinc-800 rounded-lg transition-colors"
+            className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
           >
             <X size={20} />
           </button>
@@ -220,7 +220,7 @@ export default function StockAdjustmentModal({
         <form onSubmit={handleSubmit} className="p-4 space-y-4">
           {/* Error Message */}
           {error && (
-            <div className="flex items-center gap-2 p-3 bg-red-950/50 border border-red-900/50 rounded-lg text-red-400 text-sm">
+            <div className="flex items-center gap-2 p-3 bg-red-50 border border-red-200 rounded-lg text-red-600 text-sm">
               <AlertCircle className="w-4 h-4 flex-shrink-0" />
               {error}
             </div>
@@ -228,7 +228,7 @@ export default function StockAdjustmentModal({
 
           {/* Item Search */}
           <div className="relative">
-            <label className="block text-sm font-medium text-zinc-300 mb-1">
+            <label className="block text-sm font-medium text-gray-700 mb-1">
               <Package size={16} className="inline mr-1" />
               สินค้า *
             </label>
@@ -242,17 +242,17 @@ export default function StockAdjustmentModal({
                 }}
                 onFocus={() => items.length > 0 && setShowDropdown(true)}
                 placeholder="ค้นหาด้วยชื่อหรือรหัสสินค้า..."
-                className="w-full px-3 py-2 pr-10 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500"
+                className="w-full px-3 py-2 pr-10 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500"
               />
               {isSearching && (
                 <Loader2
-                  className="absolute right-3 top-1/2 -translate-y-1/2 animate-spin text-zinc-500"
+                  className="absolute right-3 top-1/2 -translate-y-1/2 animate-spin text-gray-500"
                   size={18}
                 />
               )}
               {!isSearching && (
                 <Search
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-500"
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500"
                   size={18}
                 />
               )}
@@ -260,7 +260,7 @@ export default function StockAdjustmentModal({
 
             {/* Item Dropdown */}
             {showDropdown && items.length > 0 && (
-              <div className="absolute z-10 w-full mt-1 bg-zinc-900 border border-zinc-700 rounded-lg shadow-lg max-h-48 overflow-y-auto">
+              <div className="absolute z-10 w-full mt-1 bg-white border border-gray-300 rounded-lg shadow-lg max-h-48 overflow-y-auto">
                 {items.map((item) => {
                   const status = getStockStatus(item.currentStock, item.minStock)
                   return (
@@ -268,15 +268,15 @@ export default function StockAdjustmentModal({
                       key={item.id}
                       type="button"
                       onClick={() => handleSelectItem(item)}
-                      className="w-full px-3 py-2 text-left hover:bg-zinc-800 flex items-center justify-between"
+                      className="w-full px-3 py-2 text-left hover:bg-gray-100 flex items-center justify-between"
                     >
                       <div className="flex items-center gap-2">
                         <div className="w-8 h-8 bg-red-500/10 rounded-full flex items-center justify-center">
-                          <Package size={14} className="text-red-400" />
+                          <Package size={14} className="text-red-600" />
                         </div>
                         <div>
-                          <div className="font-medium text-zinc-200">{item.itemName}</div>
-                          <div className="text-xs text-zinc-500">{item.itemCode}</div>
+                          <div className="font-medium text-gray-800">{item.itemName}</div>
+                          <div className="text-xs text-gray-500">{item.itemCode}</div>
                         </div>
                       </div>
                       <div className="text-right">
@@ -292,21 +292,21 @@ export default function StockAdjustmentModal({
             )}
 
             {showDropdown && items.length === 0 && searchQuery.length >= 1 && !isSearching && (
-              <div className="absolute z-10 w-full mt-1 bg-zinc-900 border border-zinc-700 rounded-lg shadow-lg p-3 text-center text-zinc-500 text-sm">
+              <div className="absolute z-10 w-full mt-1 bg-white border border-gray-300 rounded-lg shadow-lg p-3 text-center text-gray-500 text-sm">
                 ไม่พบสินค้า
               </div>
             )}
 
             {/* Selected Item Display */}
             {selectedItem && (
-              <div className="mt-2 p-3 bg-red-500/10 border border-zinc-700 rounded-lg">
+              <div className="mt-2 p-3 bg-red-500/10 border border-gray-300 rounded-lg">
                 <div className="flex items-center justify-between">
                   <div>
-                    <div className="font-medium text-red-400">{selectedItem.itemName}</div>
-                    <div className="text-sm text-red-400">{selectedItem.itemCode}</div>
+                    <div className="font-medium text-red-600">{selectedItem.itemName}</div>
+                    <div className="text-sm text-red-600">{selectedItem.itemCode}</div>
                   </div>
                   <div className="text-right">
-                    <div className="text-sm text-zinc-400">คงเหลือปัจจุบัน</div>
+                    <div className="text-sm text-gray-500">คงเหลือปัจจุบัน</div>
                     <div className="font-bold text-lg">{selectedItem.currentStock} {selectedItem.unit}</div>
                   </div>
                 </div>
@@ -316,7 +316,7 @@ export default function StockAdjustmentModal({
 
           {/* Adjustment Type */}
           <div>
-            <label className="block text-sm font-medium text-zinc-300 mb-2">
+            <label className="block text-sm font-medium text-gray-700 mb-2">
               ประเภทการปรับ *
             </label>
             <div className="grid grid-cols-3 gap-2">
@@ -328,11 +328,11 @@ export default function StockAdjustmentModal({
                   className={`flex items-center justify-center gap-2 px-3 py-2 rounded-lg border transition-colors ${
                     adjustmentType === type.value
                       ? type.value === 'add'
-                        ? 'border-red-500 bg-red-500/10 text-red-400'
+                        ? 'border-red-500 bg-red-500/10 text-red-600'
                         : type.value === 'remove'
-                        ? 'border-red-500 bg-red-500/10 text-red-400'
-                        : 'border-red-500 bg-red-500/10 text-red-400'
-                      : 'border-zinc-700 text-zinc-400 hover:bg-zinc-800'
+                        ? 'border-red-500 bg-red-500/10 text-red-600'
+                        : 'border-red-500 bg-red-500/10 text-red-600'
+                      : 'border-gray-300 text-gray-500 hover:bg-gray-100'
                   }`}
                 >
                   {type.icon}
@@ -344,7 +344,7 @@ export default function StockAdjustmentModal({
 
           {/* Quantity */}
           <div>
-            <label className="block text-sm font-medium text-zinc-300 mb-1">
+            <label className="block text-sm font-medium text-gray-700 mb-1">
               จำนวน *
             </label>
             <input
@@ -354,12 +354,12 @@ export default function StockAdjustmentModal({
               placeholder={adjustmentType === 'set' ? 'จำนวนใหม่' : 'จำนวนที่ต้องการ'}
               min="0"
               step="1"
-              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500"
+              className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500"
               required
             />
             {selectedItem && quantity && (
               <div className="mt-2 flex items-center gap-2 text-sm">
-                <span className="text-zinc-400">สต็อกใหม่:</span>
+                <span className="text-gray-500">สต็อกใหม่:</span>
                 <span className={`font-bold px-2 py-0.5 rounded ${getStockStatusColor(newStockStatus)}`}>
                   {newStock} {selectedItem.unit}
                 </span>
@@ -369,7 +369,7 @@ export default function StockAdjustmentModal({
 
           {/* Notes */}
           <div>
-            <label className="block text-sm font-medium text-zinc-300 mb-1">
+            <label className="block text-sm font-medium text-gray-700 mb-1">
               <FileText size={16} className="inline mr-1" />
               หมายเหตุ
             </label>
@@ -378,7 +378,7 @@ export default function StockAdjustmentModal({
               onChange={(e) => setNotes(e.target.value)}
               placeholder="เหตุผลในการปรับสต็อก..."
               rows={2}
-              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 resize-none"
+              className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 resize-none"
             />
           </div>
 
@@ -387,7 +387,7 @@ export default function StockAdjustmentModal({
             <button
               type="button"
               onClick={handleClose}
-              className="flex-1 px-4 py-2 border border-zinc-700 text-zinc-300 rounded-lg hover:bg-zinc-800"
+              className="flex-1 px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-100"
               disabled={isSubmitting}
             >
               ยกเลิก

@@ -427,7 +427,7 @@ describe('CheckOutModal Component', () => {
     test('does not close when clicking inside modal content', () => {
       render(<CheckOutModal {...defaultProps} />)
 
-      const modalContent = screen.getByText('เช็คเอาท์').closest('.bg-zinc-900')
+      const modalContent = screen.getByText('เช็คเอาท์').closest('.bg-white')
       fireEvent.click(modalContent!)
 
       expect(defaultProps.onClose).not.toHaveBeenCalled()

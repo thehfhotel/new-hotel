@@ -268,8 +268,8 @@ describe('RoomInventoryChecklist Component', () => {
       fireEvent.click(checkbox!)
 
       await waitFor(() => {
-        // Should now show unchecked state (zinc border, no green bg)
-        expect(checkbox).toHaveClass('border-zinc-700')
+        // Should now show unchecked state (gray border, no green bg)
+        expect(checkbox).toHaveClass('border-gray-300')
         expect(checkbox).not.toHaveClass('bg-green-500')
       })
     })

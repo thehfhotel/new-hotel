@@ -17,7 +17,7 @@ const paddingStyles: Record<string, string> = {
 
 export default function Card({ children, className = '', padding = 'md' }: CardProps) {
   return (
-    <div className={`bg-zinc-900 rounded-lg border border-zinc-800 ${paddingStyles[padding]} ${className}`}>
+    <div className={`bg-white rounded-lg border border-gray-200 ${paddingStyles[padding]} ${className}`}>
       {children}
     </div>
   )
@@ -25,7 +25,7 @@ export default function Card({ children, className = '', padding = 'md' }: CardP
 
 export function CardHeader({ children, className = '' }: { children: ReactNode; className?: string }) {
   return (
-    <div className={`flex items-center justify-between p-4 border-b border-zinc-800 ${className}`}>
+    <div className={`flex items-center justify-between p-4 border-b border-gray-200 ${className}`}>
       {children}
     </div>
   )

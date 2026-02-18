@@ -29,7 +29,7 @@ export default function NewLayout({
   }, [])
 
   return (
-    <div className="new-system-layout min-h-screen bg-zinc-950">
+    <div className="min-h-screen bg-gray-50">
       <Sidebar />
       <main
         className={`min-h-screen px-6 py-6 ${mounted ? 'transition-all duration-300' : ''}`}
