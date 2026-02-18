@@ -561,11 +561,11 @@ CREATE INDEX IF NOT EXISTS ix_checkins_legacy_roomin ON ht_checkins_legacy(cin_r
 -- ht_customers_legacy - mirrors View_Customers from SQL Server
 CREATE TABLE IF NOT EXISTS ht_customers_legacy (
     id SERIAL PRIMARY KEY,
-    cust_no VARCHAR(50) NOT NULL UNIQUE,
+    cust_no VARCHAR(100) NOT NULL UNIQUE,
     cust_name VARCHAR(200),
-    cust_type VARCHAR(50),
-    cust_phone VARCHAR(50),
-    cust_idcard VARCHAR(50),
+    cust_type VARCHAR(100),
+    cust_phone VARCHAR(200),
+    cust_idcard VARCHAR(100),
     cust_address VARCHAR(500),
     sync_hash VARCHAR(64),
     synced_at TIMESTAMP DEFAULT NOW(),
