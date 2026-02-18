@@ -6,13 +6,13 @@
 //! - "pg" (default): Read from PostgreSQL legacy mirror tables
 //! - "sqlserver": Read from SQL Server legacy database
 
-use axum::{extract::State, Json};
-use serde::Serialize;
+use axum::{extract::{Query, State}, Json};
+use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
 use crate::db::{DbPool, PgPool};
 use crate::error::ApiResult;
-use crate::routes::mode::AppState;
+use crate::routes::mode::{AppState, Branch};
 
 /// Dashboard statistics
 #[derive(Debug, Serialize)]
@@ -42,12 +42,52 @@ fn use_sqlserver() -> bool {
         .unwrap_or(false)
 }
 
+/// Query parameters for stats (branch support)
+#[derive(Debug, Deserialize)]
+pub struct StatsQuery {
+    pub branch: Option<Branch>,
+}
+
 /// GET /api/stats - Get dashboard statistics
-pub async fn get_stats(State(state): State<AppState>) -> ApiResult<Json<StatsResponse>> {
-    let stats = if use_sqlserver() {
-        get_stats_sqlserver(&state.legacy_pool).await?
-    } else {
-        get_stats_pg(&state.new_pool).await?
+pub async fn get_stats(
+    State(state): State<AppState>,
+    Query(params): Query<StatsQuery>,
+) -> ApiResult<Json<StatsResponse>> {
+    let branch = params.branch.unwrap_or_default();
+
+    let stats = match branch {
+        Branch::Hfhotel => {
+            if use_sqlserver() {
+                get_stats_sqlserver(&state.legacy_pool).await?
+            } else {
+                get_stats_pg(&state.new_pool).await?
+            }
+        }
+        Branch::Hfville => {
+            get_stats_pg(state.ville_pool()?).await?
+        }
+        Branch::All => {
+            let hf = if use_sqlserver() {
+                get_stats_sqlserver(&state.legacy_pool).await?
+            } else {
+                get_stats_pg(&state.new_pool).await?
+            };
+            if let Ok(vp) = state.ville_pool() {
+                let ville = get_stats_pg(vp).await?;
+                DashboardStats {
+                    total_rooms: hf.total_rooms + ville.total_rooms,
+                    occupied_rooms: hf.occupied_rooms + ville.occupied_rooms,
+                    checkout_rooms: hf.checkout_rooms + ville.checkout_rooms,
+                    booked_rooms: hf.booked_rooms + ville.booked_rooms,
+                    today_check_ins: hf.today_check_ins + ville.today_check_ins,
+                    today_check_outs: hf.today_check_outs + ville.today_check_outs,
+                    active_bookings: hf.active_bookings + ville.active_bookings,
+                    total_customers: hf.total_customers + ville.total_customers,
+                }
+            } else {
+                hf
+            }
+        }
     };
 
     Ok(Json(StatsResponse {

@@ -16,7 +16,7 @@ use sqlx::Row;
 use crate::db::{DbPool, PgPool};
 use crate::error::ApiResult;
 use crate::models::{CheckIn, CheckInsResponse, Pagination};
-use crate::routes::mode::AppState;
+use crate::routes::mode::{AppState, Branch};
 
 /// Query parameters for check-ins list
 #[derive(Debug, Deserialize)]
@@ -29,6 +29,7 @@ pub struct CheckInsQuery {
     pub page: i32,
     #[serde(default = "default_limit")]
     pub limit: i32,
+    pub branch: Option<Branch>,
 }
 
 fn default_page() -> i32 { 1 }
@@ -47,10 +48,29 @@ pub async fn list_checkins(
     State(state): State<AppState>,
     Query(params): Query<CheckInsQuery>,
 ) -> ApiResult<Json<CheckInsResponse>> {
-    if use_pg_source() {
-        list_checkins_pg(&state.new_pool, params).await
-    } else {
-        list_checkins_sqlserver(&state.legacy_pool, params).await
+    let branch = params.branch.unwrap_or_default();
+
+    match branch {
+        Branch::Hfhotel => {
+            if use_pg_source() {
+                list_checkins_pg(&state.new_pool, params).await
+            } else {
+                list_checkins_sqlserver(&state.legacy_pool, params).await
+            }
+        }
+        Branch::Hfville => {
+            list_checkins_pg(state.ville_pool()?, params).await
+        }
+        Branch::All => {
+            let hf_result = if use_pg_source() {
+                list_checkins_pg(&state.new_pool, params).await?
+            } else {
+                list_checkins_sqlserver(&state.legacy_pool, params).await?
+            };
+            // Note: for All branch with pagination, we just return the primary branch
+            // as merging paginated results is complex. Frontend handles by switching branches.
+            Ok(hf_result)
+        }
     }
 }
 

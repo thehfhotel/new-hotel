@@ -13,6 +13,7 @@ import {
   CreditCard,
   ArrowLeftRight,
 } from 'lucide-react'
+import { useBranch, BRANCH_LABELS, type Branch } from '@/contexts/BranchContext'
 
 interface NavLink {
   href: string
@@ -32,6 +33,7 @@ const navLinks: NavLink[] = [
 
 export default function Navbar() {
   const pathname = usePathname()
+  const { branch, setBranch, villeAvailable } = useBranch()
 
   return (
     <nav className="bg-blue-800 text-white shadow-lg">
@@ -65,6 +67,25 @@ export default function Navbar() {
             )
           })}
         </div>
+
+        {/* Branch Selector */}
+        {villeAvailable && (
+          <div className="flex items-center gap-1 shrink-0">
+            {(['hfhotel', 'hfville', 'all'] as Branch[]).map((b) => (
+              <button
+                key={b}
+                onClick={() => setBranch(b)}
+                className={`text-xs font-medium px-2 py-1 rounded-md transition-colors ${
+                  branch === b
+                    ? 'bg-white text-blue-800'
+                    : 'text-blue-200 hover:bg-blue-700'
+                }`}
+              >
+                {BRANCH_LABELS[b]}
+              </button>
+            ))}
+          </div>
+        )}
 
         {/* Switch to New Mode */}
         <div className="flex items-center shrink-0">

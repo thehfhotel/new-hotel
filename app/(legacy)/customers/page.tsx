@@ -18,6 +18,7 @@ import {
   Star,
 } from 'lucide-react'
 import DataTable, { Column, PaginationInfo } from '@/components/DataTable'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 
 interface Customer {
   id: string
@@ -51,6 +52,7 @@ interface CustomerStats {
 const ITEMS_PER_PAGE = 20
 
 export default function CustomersPage() {
+  const branchFetch = useBranchFetch()
   const [customers, setCustomers] = useState<Customer[]>([])
   const [loading, setLoading] = useState(true)
   const [searchQuery, setSearchQuery] = useState('')
@@ -101,7 +103,7 @@ export default function CustomersPage() {
         params.append('sortOrder', sortOrder)
       }
 
-      const response = await fetch(`/api/customers?${params}`)
+      const response = await branchFetch(`/api/customers?${params}`)
       if (response.ok) {
         const data = await response.json()
         setCustomers(data.customers || data.data || [])
@@ -116,7 +118,7 @@ export default function CustomersPage() {
     } finally {
       setLoading(false)
     }
-  }, [pagination.currentPage, debouncedSearch, sortBy, sortOrder])
+  }, [pagination.currentPage, debouncedSearch, sortBy, sortOrder, branchFetch])
 
   // Fetch customers on mount and when dependencies change
   useEffect(() => {
@@ -127,7 +129,7 @@ export default function CustomersPage() {
   const fetchBookingHistory = async (customerId: string) => {
     setLoadingHistory(true)
     try {
-      const response = await fetch(`/api/customers/${customerId}/bookings`)
+      const response = await branchFetch(`/api/customers/${customerId}/bookings`)
       if (response.ok) {
         const data = await response.json()
         setBookingHistory(data.bookings || data || [])
@@ -144,7 +146,7 @@ export default function CustomersPage() {
   const fetchCustomerStats = async (customerId: string) => {
     setLoadingStats(true)
     try {
-      const response = await fetch(`/api/customers/${customerId}/stats`)
+      const response = await branchFetch(`/api/customers/${customerId}/stats`)
       if (response.ok) {
         const data = await response.json()
         setCustomerStats(data.stats || null)

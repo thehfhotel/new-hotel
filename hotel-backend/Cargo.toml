@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "migrate_legacy"
 path = "src/bin/migrate_legacy.rs"
 
+[[bin]]
+name = "ville_sync"
+path = "src/bin/ville_sync.rs"
+
 [dependencies]
 # Web framework (matches Tauri middleware)
 axum = "0.7"

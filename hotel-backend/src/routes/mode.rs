@@ -6,7 +6,7 @@ use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::error::ApiResult;
+use crate::error::{ApiError, ApiResult};
 
 /// System operating mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -29,6 +29,19 @@ impl SystemMode {
     }
 }
 
+/// Hotel branch selector for multi-branch support
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Branch {
+    /// HF Hotel (default) - main branch
+    #[default]
+    Hfhotel,
+    /// HF Ville - สุราษฎร์ธานี branch
+    Hfville,
+    /// All branches combined
+    All,
+}
+
 /// Application state for dual-database routes
 #[derive(Clone)]
 pub struct AppState {
@@ -36,6 +49,8 @@ pub struct AppState {
     pub legacy_pool: crate::db::DbPool,
     /// Connection pool for new_hotel database (PostgreSQL via sqlx)
     pub new_pool: crate::db::PgPool,
+    /// Connection pool for HF Ville mirror database (PostgreSQL via sqlx, optional)
+    pub ville_pool: Option<crate::db::PgPool>,
     /// Current system operating mode
     pub mode: Arc<std::sync::RwLock<SystemMode>>,
 }
@@ -46,6 +61,7 @@ impl AppState {
         Self {
             legacy_pool,
             new_pool,
+            ville_pool: None,
             mode: Arc::new(std::sync::RwLock::new(SystemMode::Legacy)),
         }
     }
@@ -55,8 +71,15 @@ impl AppState {
         Self {
             legacy_pool,
             new_pool,
+            ville_pool: None,
             mode: Arc::new(std::sync::RwLock::new(mode)),
         }
+    }
+
+    /// Create new AppState with ville pool
+    pub fn with_ville(mut self, ville_pool: crate::db::PgPool) -> Self {
+        self.ville_pool = Some(ville_pool);
+        self
     }
 
     /// Get current mode
@@ -68,13 +91,22 @@ impl AppState {
     pub fn set_mode(&self, mode: SystemMode) {
         *self.mode.write().unwrap() = mode;
     }
+
+    /// Get ville pool or return error
+    pub fn ville_pool(&self) -> ApiResult<&crate::db::PgPool> {
+        self.ville_pool
+            .as_ref()
+            .ok_or_else(|| ApiError::Internal("HF Ville database is not available".to_string()))
+    }
 }
 
 /// Mode response
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ModeResponse {
     pub success: bool,
     pub mode: SystemMode,
+    pub ville_available: bool,
 }
 
 /// GET /api/mode - Returns current system mode
@@ -84,5 +116,6 @@ pub async fn get_mode(State(state): State<AppState>) -> ApiResult<Json<ModeRespo
     Ok(Json(ModeResponse {
         success: true,
         mode,
+        ville_available: state.ville_pool.is_some(),
     }))
 }

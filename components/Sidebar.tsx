@@ -19,7 +19,9 @@ import {
   ArrowLeftRight,
   ChevronLeft,
   ChevronRight,
+  MapPin,
 } from 'lucide-react'
+import { useBranch, BRANCH_LABELS, type Branch } from '@/contexts/BranchContext'
 
 export const SIDEBAR_WIDTH = 240
 export const SIDEBAR_COLLAPSED_WIDTH = 64
@@ -73,6 +75,7 @@ export default function Sidebar() {
   const pathname = usePathname()
   const [collapsed, setCollapsed] = useState(false)
   const [mounted, setMounted] = useState(false)
+  const { branch, setBranch, villeAvailable } = useBranch()
 
   useEffect(() => {
     const stored = localStorage.getItem('sidebar-collapsed')
@@ -117,6 +120,41 @@ export default function Sidebar() {
           </div>
         )}
       </div>
+
+      {/* Branch Selector */}
+      {villeAvailable && (
+        <div className="px-2 py-2 border-b border-gray-200 shrink-0">
+          {collapsed ? (
+            <button
+              onClick={() => {
+                const branches: Branch[] = ['hfhotel', 'hfville', 'all']
+                const idx = branches.indexOf(branch)
+                setBranch(branches[(idx + 1) % branches.length])
+              }}
+              className="w-full flex items-center justify-center p-2 rounded-lg text-gray-500 hover:bg-gray-100"
+              title={BRANCH_LABELS[branch]}
+            >
+              <MapPin size={18} className={branch === 'hfhotel' ? 'text-red-500' : branch === 'hfville' ? 'text-blue-500' : 'text-purple-500'} />
+            </button>
+          ) : (
+            <div className="flex gap-1">
+              {(['hfhotel', 'hfville', 'all'] as Branch[]).map((b) => (
+                <button
+                  key={b}
+                  onClick={() => setBranch(b)}
+                  className={`flex-1 text-[11px] font-medium py-1.5 rounded-md transition-colors ${
+                    branch === b
+                      ? 'bg-red-600 text-white'
+                      : 'text-gray-500 hover:bg-gray-100'
+                  }`}
+                >
+                  {BRANCH_LABELS[b]}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Navigation */}
       <nav className="flex-1 overflow-y-auto py-4 px-2">

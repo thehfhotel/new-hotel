@@ -23,7 +23,7 @@ use crate::models::{
     CheckoutsTodayResponse, CurrentGuest, Room, RoomDetail, RoomDetailResponse, RoomStatus,
     RoomStatusResponse, RoomsResponse,
 };
-use crate::routes::mode::AppState;
+use crate::routes::mode::{AppState, Branch};
 
 /// Check if we should read from PostgreSQL (default) or SQL Server
 fn use_pg_source() -> bool {
@@ -584,12 +584,41 @@ async fn get_checkouts_today_sqlserver(pool: &crate::db::DbPool) -> ApiResult<Ve
 // Public route handlers (feature-flagged)
 // ─────────────────────────────────────────────────────────────
 
+/// Query parameters for rooms list (branch support)
+#[derive(Debug, Deserialize)]
+pub struct RoomsQuery {
+    pub branch: Option<Branch>,
+}
+
 /// GET /api/rooms - List all rooms
-pub async fn list_rooms(State(state): State<AppState>) -> ApiResult<Json<RoomsResponse>> {
-    let rooms = if use_pg_source() {
-        list_rooms_pg(&state.new_pool).await?
-    } else {
-        list_rooms_sqlserver(&state.legacy_pool).await?
+pub async fn list_rooms(
+    State(state): State<AppState>,
+    Query(params): Query<RoomsQuery>,
+) -> ApiResult<Json<RoomsResponse>> {
+    let branch = params.branch.unwrap_or_default();
+
+    let rooms = match branch {
+        Branch::Hfhotel => {
+            if use_pg_source() {
+                list_rooms_pg(&state.new_pool).await?
+            } else {
+                list_rooms_sqlserver(&state.legacy_pool).await?
+            }
+        }
+        Branch::Hfville => {
+            list_rooms_pg(state.ville_pool()?).await?
+        }
+        Branch::All => {
+            let mut all = if use_pg_source() {
+                list_rooms_pg(&state.new_pool).await?
+            } else {
+                list_rooms_sqlserver(&state.legacy_pool).await?
+            };
+            if let Ok(vp) = state.ville_pool() {
+                all.extend(list_rooms_pg(vp).await?);
+            }
+            all
+        }
     };
 
     let total = rooms.len();
@@ -601,13 +630,27 @@ pub async fn list_rooms(State(state): State<AppState>) -> ApiResult<Json<RoomsRe
     }))
 }
 
+/// Query parameters for get room (branch support)
+#[derive(Debug, Deserialize)]
+pub struct GetRoomQuery {
+    pub branch: Option<Branch>,
+}
+
 /// GET /api/rooms/:id - Get room details with current guest
 pub async fn get_room(
     State(state): State<AppState>,
     Path(room_no): Path<String>,
+    Query(params): Query<GetRoomQuery>,
 ) -> ApiResult<Json<RoomDetailResponse>> {
-    let room = if use_pg_source() {
-        get_room_pg(&state.new_pool, &room_no).await?
+    let branch = params.branch.unwrap_or_default();
+
+    let pool = match branch {
+        Branch::Hfhotel | Branch::All => &state.new_pool,
+        Branch::Hfville => state.ville_pool()?,
+    };
+
+    let room = if use_pg_source() || branch == Branch::Hfville {
+        get_room_pg(pool, &room_no).await?
     } else {
         get_room_sqlserver(&state.legacy_pool, &room_no).await?
     };
@@ -624,6 +667,7 @@ pub async fn get_room(
 pub struct RoomStatusQuery {
     pub start_date: Option<String>,
     pub end_date: Option<String>,
+    pub branch: Option<Branch>,
 }
 
 /// GET /api/rooms/status - Get room status history
@@ -631,10 +675,30 @@ pub async fn get_room_status(
     State(state): State<AppState>,
     Query(params): Query<RoomStatusQuery>,
 ) -> ApiResult<Json<RoomStatusResponse>> {
-    let statuses = if use_pg_source() {
-        get_room_status_pg(&state.new_pool, &params).await?
-    } else {
-        get_room_status_sqlserver(&state.legacy_pool, &params).await?
+    let branch = params.branch.unwrap_or_default();
+
+    let statuses = match branch {
+        Branch::Hfhotel => {
+            if use_pg_source() {
+                get_room_status_pg(&state.new_pool, &params).await?
+            } else {
+                get_room_status_sqlserver(&state.legacy_pool, &params).await?
+            }
+        }
+        Branch::Hfville => {
+            get_room_status_pg(state.ville_pool()?, &params).await?
+        }
+        Branch::All => {
+            let mut all = if use_pg_source() {
+                get_room_status_pg(&state.new_pool, &params).await?
+            } else {
+                get_room_status_sqlserver(&state.legacy_pool, &params).await?
+            };
+            if let Ok(vp) = state.ville_pool() {
+                all.extend(get_room_status_pg(vp, &params).await?);
+            }
+            all
+        }
     };
     let total = statuses.len();
 
@@ -645,14 +709,41 @@ pub async fn get_room_status(
     }))
 }
 
+/// Query parameters for checkouts-today (branch support)
+#[derive(Debug, Deserialize)]
+pub struct CheckoutsTodayQuery {
+    pub branch: Option<Branch>,
+}
+
 /// GET /api/rooms/checkouts-today - Get rooms with checkout today
 pub async fn get_checkouts_today(
     State(state): State<AppState>,
+    Query(params): Query<CheckoutsTodayQuery>,
 ) -> ApiResult<Json<CheckoutsTodayResponse>> {
-    let room_numbers = if use_pg_source() {
-        get_checkouts_today_pg(&state.new_pool).await?
-    } else {
-        get_checkouts_today_sqlserver(&state.legacy_pool).await?
+    let branch = params.branch.unwrap_or_default();
+
+    let room_numbers = match branch {
+        Branch::Hfhotel => {
+            if use_pg_source() {
+                get_checkouts_today_pg(&state.new_pool).await?
+            } else {
+                get_checkouts_today_sqlserver(&state.legacy_pool).await?
+            }
+        }
+        Branch::Hfville => {
+            get_checkouts_today_pg(state.ville_pool()?).await?
+        }
+        Branch::All => {
+            let mut all = if use_pg_source() {
+                get_checkouts_today_pg(&state.new_pool).await?
+            } else {
+                get_checkouts_today_sqlserver(&state.legacy_pool).await?
+            };
+            if let Ok(vp) = state.ville_pool() {
+                all.extend(get_checkouts_today_pg(vp).await?);
+            }
+            all
+        }
     };
 
     Ok(Json(CheckoutsTodayResponse {

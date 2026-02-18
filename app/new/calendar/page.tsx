@@ -4,6 +4,7 @@ import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
 import { parseISO, differenceInDays, startOfMonth, endOfMonth, addMonths, subMonths, format } from 'date-fns'
 import { Calendar as CalendarIcon } from 'lucide-react'
 import StayTimeline, { Stay } from '@/components/StayTimeline'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 
 // Calendar API response (hybrid endpoint)
 interface CalendarApiBooking {
@@ -56,6 +57,7 @@ interface CachedData {
 }
 
 export default function CalendarPage() {
+  const branchFetch = useBranchFetch()
   const [selectedDate, setSelectedDate] = useState(new Date())
   const [viewMode, setViewMode] = useState<'week' | 'month'>('week')
   const [loading, setLoading] = useState(true)
@@ -86,7 +88,7 @@ export default function CalendarPage() {
       let checkins: ApiCheckIn[] = []
 
       // Use hybrid calendar endpoint for new system
-      const calendarRes = await fetch(`/api/calendar?startDate=${startDate}&endDate=${endDate}`)
+      const calendarRes = await branchFetch(`/api/calendar?startDate=${startDate}&endDate=${endDate}`)
       if (calendarRes.ok) {
         const calendarData = await calendarRes.json()
         // Transform calendar API response to match our internal format
@@ -124,7 +126,7 @@ export default function CalendarPage() {
       console.error('Error fetching data:', error)
       return null
     }
-  }, [])
+  }, [branchFetch])
 
   // Initial load and when date changes
   useEffect(() => {

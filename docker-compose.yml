@@ -59,9 +59,28 @@ services:
       - SLACK_NOTIFICATIONS_ENABLED=true
       - HOST=0.0.0.0
       - PORT=3003
+      # HF Ville database (PostgreSQL mirror via cloudflared tunnel)
+      - VILLE_DB_SERVER=ville-tunnel
+      - VILLE_DB_PORT=5440
+      - VILLE_DB_NAME=hfville
+      - VILLE_DB_USER=postgres
+      - VILLE_DB_PASSWORD=***REMOVED***
+      - VILLE_DB_ENABLED=${VILLE_DB_ENABLED:-false}
     depends_on:
       newdb:
         condition: service_healthy
+    networks:
+      - hotel-network
+    restart: unless-stopped
+
+  # Cloudflared tunnel to HF Ville PostgreSQL mirror (on jump box)
+  ville-tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: ville-tunnel
+    command: access tcp --hostname hfville-pg.thehfhotel.org --listener 0.0.0.0:5440
+    environment:
+      - CF_ACCESS_CLIENT_ID=${CF_ACCESS_CLIENT_ID}
+      - CF_ACCESS_CLIENT_SECRET=${CF_ACCESS_CLIENT_SECRET}
     networks:
       - hotel-network
     restart: unless-stopped
