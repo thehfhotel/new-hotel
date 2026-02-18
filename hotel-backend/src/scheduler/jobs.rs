@@ -12,11 +12,12 @@ use tokio::sync::Mutex;
 use tokio_cron_scheduler::{Job, JobScheduler};
 
 use crate::config::SlackConfig;
-use crate::db::DbPool;
+use crate::db::{DbPool, PgPool};
 use crate::notifications::slack::{
     build_check_in_alert_message, build_check_out_alert_message, build_hourly_report_message,
     build_new_booking_alert_message, SlackClient,
 };
+use super::sync;
 
 /// Scheduler state for tracking last polled timestamps
 struct SchedulerState {
@@ -38,17 +39,44 @@ impl Default for SchedulerState {
 /// Initialize the cron job scheduler
 pub async fn init_scheduler(
     pool: DbPool,
+    pg_pool: Option<PgPool>,
     slack_config: SlackConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if !slack_config.is_configured() {
-        tracing::info!("[Scheduler] Slack not configured, scheduler not started");
-        return Ok(());
-    }
-
     tracing::info!("[Scheduler] Starting cron jobs...");
 
     let scheduler = JobScheduler::new().await?;
     let state = Arc::new(Mutex::new(SchedulerState::default()));
+
+    // Legacy sync job: runs every 5 minutes if PgPool is available
+    if let Some(ref pg) = pg_pool {
+        let sync_legacy = pool.clone();
+        let sync_pg = pg.clone();
+
+        let sync_enabled = std::env::var("SYNC_ENABLED")
+            .map(|v| v != "false")
+            .unwrap_or(true);
+
+        if sync_enabled {
+            let sync_job = Job::new_async("0 */5 * * * *", move |_uuid, _l| {
+                let legacy = sync_legacy.clone();
+                let pg = sync_pg.clone();
+                Box::pin(async move {
+                    sync::run_sync(&legacy, &pg).await;
+                })
+            })?;
+            scheduler.add(sync_job).await?;
+            tracing::info!("[Scheduler] - Legacy sync: every 5 minutes");
+        } else {
+            tracing::info!("[Scheduler] - Legacy sync: DISABLED (SYNC_ENABLED=false)");
+        }
+    }
+
+    // Slack notification jobs only run if Slack is configured
+    if !slack_config.is_configured() {
+        tracing::info!("[Scheduler] Slack not configured, notification jobs not started");
+        scheduler.start().await?;
+        return Ok(());
+    }
 
     // Clone resources for each job
     let pool_hourly = pool.clone();
