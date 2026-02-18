@@ -15,13 +15,14 @@ use sqlx::Row;
 
 use crate::db::{DbPool, PgPool};
 use crate::error::ApiResult;
-use crate::routes::mode::AppState;
+use crate::routes::mode::{AppState, Branch};
 
 /// Query parameters for occupancy
 #[derive(Debug, Deserialize)]
 pub struct OccupancyQuery {
     #[serde(default = "default_days")]
     pub days: i32,
+    pub branch: Option<Branch>,
 }
 
 fn default_days() -> i32 { 7 }
@@ -48,11 +49,26 @@ pub async fn get_occupancy(
 ) -> ApiResult<Json<OccupancyResponse>> {
     let source = std::env::var("LEGACY_READ_SOURCE")
         .unwrap_or_else(|_| "pg".to_string());
+    let branch = params.branch.unwrap_or_default();
 
-    let data = if source == "sqlserver" {
-        get_occupancy_sqlserver(&state.legacy_pool, params.days).await?
-    } else {
-        get_occupancy_pg(&state.new_pool, params.days).await?
+    let data = match branch {
+        Branch::Hfhotel => {
+            if source == "sqlserver" {
+                get_occupancy_sqlserver(&state.legacy_pool, params.days).await?
+            } else {
+                get_occupancy_pg(&state.new_pool, params.days).await?
+            }
+        }
+        Branch::Hfville => {
+            get_occupancy_pg(state.ville_pool()?, params.days).await?
+        }
+        Branch::All => {
+            if source == "sqlserver" {
+                get_occupancy_sqlserver(&state.legacy_pool, params.days).await?
+            } else {
+                get_occupancy_pg(&state.new_pool, params.days).await?
+            }
+        }
     };
 
     Ok(Json(OccupancyResponse {

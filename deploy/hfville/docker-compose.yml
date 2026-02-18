@@ -1,0 +1,48 @@
+services:
+  # PostgreSQL mirror database for HF Ville
+  # Receives synced data from SQL Server 2005 at 192.168.11.51
+  hfville-db:
+    image: postgres:17-alpine
+    container_name: hfville-db
+    environment:
+      - POSTGRES_DB=hfville
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=***REMOVED***
+      - PGPORT=5440
+    ports:
+      - "5440:5440"
+    volumes:
+      - hfville_data:/var/lib/postgresql/data
+      - ./init-db:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -p 5440"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # Sync binary: SQL Server 2005 -> PostgreSQL mirror
+  # Runs every 90 seconds, uses SHA256 hash-based change detection
+  ville-sync:
+    image: ghcr.io/thehfhotel/ville-sync:latest
+    container_name: ville-sync
+    environment:
+      - MSSQL_SERVER=192.168.11.51
+      - MSSQL_DATABASE=hotel
+      - MSSQL_USER=sa
+      - MSSQL_PASSWORD=***REMOVED***
+      - PG_SERVER=hfville-db
+      - PG_PORT=5440
+      - PG_DATABASE=hfville
+      - PG_USER=postgres
+      - PG_PASSWORD=***REMOVED***
+      - SYNC_INTERVAL_SECS=90
+      - RUST_LOG=ville_sync=info
+    depends_on:
+      hfville-db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  hfville_data:

@@ -26,7 +26,7 @@ use crate::models::{
     BookingDetailResponse, BookingRoom, BookingRoomDetail, BookingsResponse,
     CreateNoteRequest, CreateNoteResponse, DeleteNoteResponse, Note, NotesResponse, Pagination,
 };
-use crate::routes::mode::AppState;
+use crate::routes::mode::{AppState, Branch};
 
 /// Query parameters for bookings list
 #[derive(Debug, Deserialize)]
@@ -44,6 +44,7 @@ pub struct BookingsQuery {
     pub sort_by: String,
     #[serde(default = "default_sort_order")]
     pub sort_order: String,
+    pub branch: Option<Branch>,
 }
 
 fn default_page() -> i32 { 1 }
@@ -66,10 +67,39 @@ pub async fn list_bookings(
     State(state): State<AppState>,
     Query(params): Query<BookingsQuery>,
 ) -> ApiResult<Json<BookingsResponse>> {
-    if use_sqlserver() {
-        list_bookings_sqlserver(&state.legacy_pool, &params).await
-    } else {
-        list_bookings_pg(&state.new_pool, &params).await
+    let branch = params.branch.unwrap_or_default();
+
+    match branch {
+        Branch::Hfhotel => {
+            if use_sqlserver() {
+                list_bookings_sqlserver(&state.legacy_pool, &params).await
+            } else {
+                list_bookings_pg(&state.new_pool, &params).await
+            }
+        }
+        Branch::Hfville => {
+            list_bookings_pg(state.ville_pool()?, &params).await
+        }
+        Branch::All => {
+            // For "All", we merge results from both branches
+            // Get HF Hotel data
+            let hf_result = if use_sqlserver() {
+                list_bookings_sqlserver(&state.legacy_pool, &params).await?
+            } else {
+                list_bookings_pg(&state.new_pool, &params).await?
+            };
+            // Try to get HF Ville data
+            if let Ok(vp) = state.ville_pool() {
+                if let Ok(ville_result) = list_bookings_pg(vp, &params).await {
+                    let Json(mut hf) = hf_result;
+                    let Json(ville) = ville_result;
+                    hf.data.extend(ville.data);
+                    hf.pagination.total += ville.pagination.total;
+                    return Ok(Json(hf));
+                }
+            }
+            Ok(hf_result)
+        }
     }
 }
 

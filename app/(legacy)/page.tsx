@@ -5,6 +5,7 @@ import { Clock, LogIn } from 'lucide-react'
 import StatsCard from '@/components/StatsCard'
 import RoomGrid, { Room, RoomStatus } from '@/components/RoomGrid'
 import { OccupancyChart, OccupancyData } from '@/components/Charts'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 
 interface Stats {
   totalRooms: number
@@ -58,6 +59,7 @@ function getRoomStatus(room: ApiRoom, isCheckoutToday: boolean): RoomStatus {
 }
 
 export default function Dashboard() {
+  const branchFetch = useBranchFetch()
   const [stats, setStats] = useState<Stats>({
     totalRooms: 0,
     occupiedRooms: 0,
@@ -74,7 +76,7 @@ export default function Dashboard() {
   const fetchData = useCallback(async () => {
     try {
       // Fetch stats
-      const statsRes = await fetch('/api/stats')
+      const statsRes = await branchFetch('/api/stats')
       if (statsRes.ok) {
         const statsData = await statsRes.json()
         if (statsData.success && statsData.data) {
@@ -95,8 +97,8 @@ export default function Dashboard() {
     try {
       // Fetch rooms and checkout status in parallel
       const [roomsRes, checkoutsRes] = await Promise.all([
-        fetch('/api/rooms'),
-        fetch('/api/rooms/checkouts-today')
+        branchFetch('/api/rooms'),
+        branchFetch('/api/rooms/checkouts-today')
       ])
 
       // Build checkout rooms set from dedicated API
@@ -128,7 +130,7 @@ export default function Dashboard() {
 
     try {
       // Fetch check-ins (limited to recent)
-      const checkInsRes = await fetch('/api/checkins?limit=10')
+      const checkInsRes = await branchFetch('/api/checkins?limit=10')
       if (checkInsRes.ok) {
         const checkInsData = await checkInsRes.json()
         if (checkInsData.success && checkInsData.data) {
@@ -150,7 +152,7 @@ export default function Dashboard() {
 
     try {
       // Fetch occupancy data for chart
-      const occupancyRes = await fetch('/api/occupancy?days=7')
+      const occupancyRes = await branchFetch('/api/occupancy?days=7')
       if (occupancyRes.ok) {
         const occupancyResult = await occupancyRes.json()
         if (occupancyResult.success && occupancyResult.data) {
@@ -167,7 +169,7 @@ export default function Dashboard() {
     }
 
     setLoading(false)
-  }, [])
+  }, [branchFetch])
 
   useEffect(() => {
     fetchData()

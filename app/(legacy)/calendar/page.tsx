@@ -5,6 +5,7 @@ import { parseISO, differenceInDays, startOfMonth, endOfMonth, addMonths, subMon
 import { Calendar as CalendarIcon, Database } from 'lucide-react'
 import StayTimeline, { Stay } from '@/components/StayTimeline'
 import { useMode } from '@/contexts/ModeContext'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 
 interface ApiBooking {
   bookNo: string
@@ -62,6 +63,7 @@ export default function CalendarPage() {
   const [loading, setLoading] = useState(true)
   const [dataVersion, setDataVersion] = useState(0)
   const { mode, isNew } = useMode()
+  const branchFetch = useBranchFetch()
 
   // Cache data by month key (yyyy-MM) and mode
   const cacheRef = useRef<Map<string, CachedData>>(new Map())
@@ -89,7 +91,7 @@ export default function CalendarPage() {
 
       if (isNew) {
         // Use hybrid calendar endpoint when in new mode
-        const calendarRes = await fetch(`/api/calendar?startDate=${startDate}&endDate=${endDate}`)
+        const calendarRes = await branchFetch(`/api/calendar?startDate=${startDate}&endDate=${endDate}`)
         if (calendarRes.ok) {
           const calendarData = await calendarRes.json()
           // Transform calendar API response to match our internal format
@@ -116,8 +118,8 @@ export default function CalendarPage() {
       } else {
         // Use legacy endpoints when in legacy mode
         const [bookingsRes, checkinsRes] = await Promise.all([
-          fetch(`/api/bookings?startDate=${startDate}&endDate=${endDate}&limit=1000`),
-          fetch(`/api/checkins?startDate=${startDate}&endDate=${endDate}&limit=1000`),
+          branchFetch(`/api/bookings?startDate=${startDate}&endDate=${endDate}&limit=1000`),
+          branchFetch(`/api/checkins?startDate=${startDate}&endDate=${endDate}&limit=1000`),
         ])
 
         bookings = bookingsRes.ok ? ((await bookingsRes.json()).data || []).map((b: ApiBooking) => ({ ...b, source: 'legacy' as const })) : []
@@ -137,7 +139,7 @@ export default function CalendarPage() {
       console.error('Error fetching data:', error)
       return null
     }
-  }, [mode, isNew])
+  }, [mode, isNew, branchFetch])
 
   // Clear cache when mode changes
   useEffect(() => {

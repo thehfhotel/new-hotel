@@ -20,6 +20,7 @@ import {
   XCircle,
   History,
 } from 'lucide-react'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 
 // Types
 interface Room {
@@ -76,6 +77,9 @@ const statusFilterOptions = [
 ]
 
 export default function RoomsPage() {
+  // Branch-aware fetch
+  const branchFetch = useBranchFetch()
+
   // State
   const [rooms, setRooms] = useState<Room[]>([])
   const [loading, setLoading] = useState(true)
@@ -104,7 +108,7 @@ export default function RoomsPage() {
       if (statusFilter) params.append('status', statusFilter)
       if (typeFilter) params.append('type', typeFilter)
 
-      const response = await fetch(`/api/rooms?${params.toString()}`)
+      const response = await branchFetch(`/api/rooms?${params.toString()}`)
 
       if (!response.ok) {
         throw new Error('ไม่สามารถดึงข้อมูลห้องพักได้')
@@ -122,19 +126,19 @@ export default function RoomsPage() {
     } finally {
       setLoading(false)
     }
-  }, [statusFilter, typeFilter])
+  }, [statusFilter, typeFilter, branchFetch])
 
   useEffect(() => {
     fetchRooms()
   }, [fetchRooms])
 
   // Fetch room detail
-  const fetchRoomDetail = async (room: Room) => {
+  const fetchRoomDetail = useCallback(async (room: Room) => {
     setSelectedRoom(room)
     setLoadingDetail(true)
 
     try {
-      const response = await fetch(`/api/rooms/${room.Room_No}`)
+      const response = await branchFetch(`/api/rooms/${room.Room_No}`)
 
       if (response.ok) {
         const data = await response.json()
@@ -156,7 +160,7 @@ export default function RoomsPage() {
     } finally {
       setLoadingDetail(false)
     }
-  }
+  }, [branchFetch])
 
   // Format date helper
   const formatDate = (dateString: string) => {
