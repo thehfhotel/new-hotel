@@ -9,8 +9,8 @@ ENV SQLX_OFFLINE=true
 # Copy the Cargo files first to cache dependencies
 COPY Cargo.toml Cargo.lock* ./
 
-# Create a dummy main.rs to build dependencies
-RUN mkdir src && echo "fn main() {}" > src/main.rs
+# Create dummy sources matching Cargo.toml bin targets to cache dependencies
+RUN mkdir -p src/bin && echo "fn main() {}" > src/main.rs && echo "fn main() {}" > src/bin/migrate_legacy.rs
 RUN cargo build --release
 RUN rm -rf src
 
