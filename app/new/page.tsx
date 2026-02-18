@@ -18,9 +18,12 @@ interface Stats {
   totalRooms: number
   occupiedRooms: number
   availableRooms: number
+  bookedRooms: number
+  checkoutRooms: number
   totalCustomers: number
   activeBookings: number
-  todayCheckouts: number
+  todayCheckIns: number
+  todayCheckOuts: number
 }
 
 interface QuickLink {
@@ -81,20 +84,27 @@ export default function NewDashboard() {
     totalRooms: 0,
     occupiedRooms: 0,
     availableRooms: 0,
+    bookedRooms: 0,
+    checkoutRooms: 0,
     totalCustomers: 0,
     activeBookings: 0,
-    todayCheckouts: 0,
+    todayCheckIns: 0,
+    todayCheckOuts: 0,
   })
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
   const fetchStats = useCallback(async () => {
     try {
-      const res = await fetch('/api/new/stats')
+      const res = await fetch('/api/stats')
       if (res.ok) {
         const data = await res.json()
         if (data.success) {
-          setStats(data.data)
+          const d = data.data
+          setStats({
+            ...d,
+            availableRooms: d.totalRooms - d.occupiedRooms - d.checkoutRooms - d.bookedRooms,
+          })
         }
       }
     } catch (err) {
@@ -125,8 +135,8 @@ export default function NewDashboard() {
       {/* Page Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-zinc-100 tracking-tight">ระบบจัดการโรงแรม (ใหม่)</h1>
-          <p className="text-zinc-500">New Hotel Management System</p>
+          <h1 className="text-2xl font-bold text-zinc-100 tracking-tight">ระบบจัดการโรงแรม</h1>
+          <p className="text-zinc-500">Hotel Management System</p>
         </div>
         <p className="text-zinc-600 text-sm">
           อัปเดตล่าสุด: {new Date().toLocaleDateString('th-TH', {
@@ -162,16 +172,16 @@ export default function NewDashboard() {
           <p className="text-3xl font-bold text-amber-400">{stats.occupiedRooms}</p>
         </div>
         <div className="bg-zinc-900 rounded-xl px-6 py-5 border border-zinc-800">
-          <p className="text-sm font-medium text-zinc-500 mb-1">ลูกค้าทั้งหมด</p>
-          <p className="text-3xl font-bold text-zinc-100">{stats.totalCustomers}</p>
+          <p className="text-sm font-medium text-zinc-500 mb-1">จองแล้ว</p>
+          <p className="text-3xl font-bold text-sky-400">{stats.bookedRooms}</p>
         </div>
         <div className="bg-zinc-900 rounded-xl px-6 py-5 border border-zinc-800">
-          <p className="text-sm font-medium text-zinc-500 mb-1">การจองที่ใช้งาน</p>
-          <p className="text-3xl font-bold text-sky-400">{stats.activeBookings}</p>
+          <p className="text-sm font-medium text-zinc-500 mb-1">เช็คอินวันนี้</p>
+          <p className="text-3xl font-bold text-zinc-100">{stats.todayCheckIns}</p>
         </div>
         <div className="bg-zinc-900 rounded-xl px-6 py-5 border border-zinc-800">
           <p className="text-sm font-medium text-zinc-500 mb-1">เช็คเอาท์วันนี้</p>
-          <p className="text-3xl font-bold text-red-400">{stats.todayCheckouts}</p>
+          <p className="text-3xl font-bold text-red-400">{stats.todayCheckOuts}</p>
         </div>
       </div>
 
@@ -201,21 +211,6 @@ export default function NewDashboard() {
         </div>
       </div>
 
-      {/* System Info */}
-      <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-6">
-        <h2 className="text-lg font-semibold text-zinc-200 mb-2">เกี่ยวกับระบบใหม่</h2>
-        <p className="text-zinc-400">
-          ระบบใหม่นี้ใช้ฐานข้อมูลแยกต่างหาก (HotelNew) ซึ่งเป็นอิสระจากระบบเดิม
-          คุณสามารถใช้งานทั้งสองระบบพร้อมกันได้ โดยข้อมูลจะไม่ส่งผลกระทบต่อกัน
-        </p>
-        <ul className="mt-3 space-y-1 text-zinc-500 text-sm">
-          <li className="flex items-center gap-2"><span className="w-1 h-1 rounded-full bg-red-500"></span>รองรับการจัดการห้องพัก ประเภทห้อง และราคา</li>
-          <li className="flex items-center gap-2"><span className="w-1 h-1 rounded-full bg-red-500"></span>ระบบแม่บ้านและติดตามความสะอาด</li>
-          <li className="flex items-center gap-2"><span className="w-1 h-1 rounded-full bg-red-500"></span>ระบบคลังสินค้าและอุปกรณ์</li>
-          <li className="flex items-center gap-2"><span className="w-1 h-1 rounded-full bg-red-500"></span>ระบบแจ้งซ่อมบำรุง</li>
-          <li className="flex items-center gap-2"><span className="w-1 h-1 rounded-full bg-red-500"></span>รายงานรายได้และวิเคราะห์ข้อมูล</li>
-        </ul>
-      </div>
     </div>
   )
 }
