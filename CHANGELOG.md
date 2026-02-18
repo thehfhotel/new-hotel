@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.20.0] - 2026-02-19
+
+### Changed
+- **Calendar revamp** — simplified `StayTimeline` from 3 confusing stacked segments to a clean 2-color model
+  - Past dates: single sky-500 bar showing rooms checked-in (occupied) that day
+  - Future dates: single amber-400 bar showing rooms booked for that day
+  - Today: two bars side-by-side — checked-in (sky) + booked (amber) with red ring highlight
+  - Simplified `DayData` interface: `checkedIn`/`booked`/`checkinStays`/`bookingStays` (was 6 fields)
+  - Simplified detail panel: `'checkin' | 'booking'` segment types (was 3 types including `'continuing'`)
+  - Legend reduced from 3 items to 2: เข้าพัก (sky-500) + การจอง (amber-400)
+  - Tooltip now context-aware: shows only relevant data for past/today/future
+  - Bars scaled independently against `maxCount` (max of all checkedIn/booked) instead of stacked totals
+
 ## [2.19.0] - 2026-02-19
 
 ### Changed

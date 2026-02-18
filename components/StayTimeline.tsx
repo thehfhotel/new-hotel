@@ -37,13 +37,10 @@ export interface Stay {
 
 interface DayData {
   date: Date
-  continuing: number  // Guests staying from previous day
-  newCheckin: number  // New check-ins today
-  booking: number     // Bookings (not checked in yet)
-  total: number
-  continuingStays: Stay[]  // List of continuing stays
-  newCheckinStays: Stay[]  // List of new check-ins
-  bookingStays: Stay[]     // List of bookings
+  checkedIn: number    // Rooms occupied (check-ins active this day)
+  booked: number       // Rooms booked for this day
+  checkinStays: Stay[] // Check-in stays active this day
+  bookingStays: Stay[] // Booking stays for this day
 }
 
 type ViewMode = 'week' | 'month'
@@ -73,7 +70,7 @@ export default function StayTimeline({
   const [hoveredDay, setHoveredDay] = useState<string | null>(null)
   const [selectedSegment, setSelectedSegment] = useState<{
     date: Date
-    type: 'continuing' | 'newCheckin' | 'booking'
+    type: 'checkin' | 'booking'
     stays: Stay[]
   } | null>(null)
 
@@ -96,77 +93,74 @@ export default function StayTimeline({
     }
   }, [selectedDate, viewMode])
 
+  const today = useMemo(() => {
+    const t = new Date()
+    t.setHours(0, 0, 0, 0)
+    return t
+  }, [])
+
   // Calculate data for each day
   const dayData: DayData[] = useMemo(() => {
     return days.map(day => {
-      const continuingStays: Stay[] = []
-      const newCheckinStays: Stay[] = []
+      const checkinStays: Stay[] = []
       const bookingStays: Stay[] = []
 
-      const today = new Date()
-      today.setHours(0, 0, 0, 0)
+      const dayDate = new Date(day)
+      dayDate.setHours(0, 0, 0, 0)
 
       stays.forEach(stay => {
-        const isCheckInDay = isSameDay(stay.checkIn, day)
-        // Guest is staying tonight = checkout DATE is AFTER today (compare dates only, ignore time)
-        // This excludes guests checking out today regardless of checkout time
         const checkOutDate = new Date(stay.checkOut)
         checkOutDate.setHours(0, 0, 0, 0)
-        const dayDate = new Date(day)
-        dayDate.setHours(0, 0, 0, 0)
-        const isStayingTonight = checkOutDate > dayDate
-        // Continuing stay = checked in before today AND staying tonight
-        const isContinuingStay = isBefore(stay.checkIn, day) && isStayingTonight
+        const checkInDate = new Date(stay.checkIn)
+        checkInDate.setHours(0, 0, 0, 0)
+
+        // Stay overlaps this day if checkIn <= day AND checkOut > day
+        const overlaps = checkInDate <= dayDate && checkOutDate > dayDate
+
+        if (!overlaps) return
 
         if (stay.type === 'checkin') {
-          // New check-in: arrives today AND staying tonight
-          if (isCheckInDay && isStayingTonight) {
-            newCheckinStays.push(stay)
-          } else if (isContinuingStay) {
-            // Continuing: checked in before today, staying tonight
-            continuingStays.push(stay)
-          }
-          // Note: guests checking out today (checkOut date == day) are NOT counted
+          checkinStays.push(stay)
         } else {
-          // booking - only show if the booking's check-in date is today or future
-          // Past bookings (checkIn < today) should have been converted to check-ins already
-          const bookingCheckInIsNotPast = !isBefore(stay.checkIn, today)
-          // Show booking if it overlaps this day and checkIn is not in the past
-          const overlapsDay = (isCheckInDay || isBefore(stay.checkIn, day)) && isStayingTonight
-          if (bookingCheckInIsNotPast && overlapsDay) {
-            bookingStays.push(stay)
-          }
+          bookingStays.push(stay)
         }
       })
 
-      // Sum roomCount for bookings (each booking can have multiple rooms)
       const bookingRoomCount = bookingStays.reduce((sum, s) => sum + (s.roomCount || 1), 0)
 
       return {
         date: day,
-        continuing: continuingStays.length,
-        newCheckin: newCheckinStays.length,
-        booking: bookingRoomCount,
-        total: continuingStays.length + newCheckinStays.length + bookingRoomCount,
-        continuingStays,
-        newCheckinStays,
+        checkedIn: checkinStays.length,
+        booked: bookingRoomCount,
+        checkinStays,
         bookingStays,
       }
     })
   }, [days, stays])
 
-  // Find max for scaling
-  const maxTotal = Math.max(...dayData.map(d => d.total), 1)
+  // Find max for scaling — max across all checkedIn and booked values
+  const maxCount = useMemo(() => {
+    let max = 1
+    for (const d of dayData) {
+      if (d.checkedIn > max) max = d.checkedIn
+      if (d.booked > max) max = d.booked
+    }
+    return max
+  }, [dayData])
 
   // Stats
   const stats = useMemo(() => {
     const totalCheckins = stays.filter(s => s.type === 'checkin').length
-    // Sum roomCount for bookings (each booking can have multiple rooms)
     const totalBookings = stays.filter(s => s.type === 'booking').reduce((sum, s) => sum + (s.roomCount || 1), 0)
+    const totalRooms = dayData.reduce((sum, d) => sum + d.checkedIn + d.booked, 0)
     const avgOccupancy = dayData.length > 0
-      ? (dayData.reduce((sum, d) => sum + d.total, 0) / dayData.length).toFixed(1)
+      ? (totalRooms / dayData.length).toFixed(1)
       : '0'
-    const peakDay = dayData.reduce((max, d) => d.total > max.total ? d : max, dayData[0])
+    const peakDay = dayData.reduce((max, d) => {
+      const dTotal = d.checkedIn + d.booked
+      const maxTotal = max.checkedIn + max.booked
+      return dTotal > maxTotal ? d : max
+    }, dayData[0])
     return { totalCheckins, totalBookings, avgOccupancy, peakDay }
   }, [stays, dayData])
 
@@ -235,13 +229,19 @@ export default function StayTimeline({
         ) : (
           <div className="flex items-end gap-1" style={{ height: barHeight + 60 }}>
             {dayData.map((d, idx) => {
-              const isToday = isSameDay(d.date, new Date())
+              const isDayToday = isSameDay(d.date, today)
+              const dayDate = new Date(d.date)
+              dayDate.setHours(0, 0, 0, 0)
+              const isPast = isBefore(dayDate, today) && !isDayToday
+              const isFuture = !isPast && !isDayToday
               const isWeekend = d.date.getDay() === 0 || d.date.getDay() === 6
               const isHovered = hoveredDay === format(d.date, 'yyyy-MM-dd')
 
-              const continuingHeight = (d.continuing / maxTotal) * barHeight
-              const newCheckinHeight = (d.newCheckin / maxTotal) * barHeight
-              const bookingHeight = (d.booking / maxTotal) * barHeight
+              const checkedInHeight = (d.checkedIn / maxCount) * barHeight
+              const bookedHeight = (d.booked / maxCount) * barHeight
+
+              // Determine what to display
+              const displayCount = isPast ? d.checkedIn : isFuture ? d.booked : (d.checkedIn + d.booked)
 
               return (
                 <div
@@ -252,78 +252,109 @@ export default function StayTimeline({
                 >
                   {/* Tooltip */}
                   {isHovered && (
-                    <div className="absolute -mt-20 bg-gray-100 text-white text-xs px-3 py-2 rounded shadow-lg whitespace-nowrap z-20">
+                    <div className="absolute -mt-16 bg-gray-800 text-white text-xs px-3 py-2 rounded shadow-lg whitespace-nowrap z-20">
                       <div className="font-medium mb-1">{format(d.date, 'd MMM yyyy')}</div>
-                      <div className="flex items-center gap-2">
-                        <span className="w-2 h-2 bg-red-500 rounded-sm"></span>
-                        <span>พักต่อ: {d.continuing}</span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className="w-2 h-2 bg-red-500 rounded-sm"></span>
-                        <span>เช็คอินใหม่: {d.newCheckin}</span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className="w-2 h-2 bg-amber-400 rounded-sm"></span>
-                        <span>จอง: {d.booking}</span>
-                      </div>
-                      <div className="border-t border-gray-400 mt-1 pt-1 font-medium">
-                        รวม: {d.total} ห้อง
-                      </div>
+                      {(isPast || isDayToday) && d.checkedIn > 0 && (
+                        <div className="flex items-center gap-2">
+                          <span className="w-2 h-2 bg-sky-500 rounded-sm"></span>
+                          <span>เข้าพัก: {d.checkedIn} ห้อง</span>
+                        </div>
+                      )}
+                      {(isFuture || isDayToday) && d.booked > 0 && (
+                        <div className="flex items-center gap-2">
+                          <span className="w-2 h-2 bg-amber-400 rounded-sm"></span>
+                          <span>จอง: {d.booked} ห้อง</span>
+                        </div>
+                      )}
+                      {displayCount === 0 && (
+                        <div className="text-gray-400">ไม่มีข้อมูล</div>
+                      )}
                     </div>
                   )}
 
-                  {/* Stacked Bar */}
+                  {/* Bar area */}
                   <div
-                    className={`w-full flex flex-col-reverse rounded-t overflow-hidden ${
+                    className={`w-full rounded-t overflow-hidden ${
                       isHovered ? 'ring-2 ring-gray-400' : ''
-                    } ${isToday ? 'ring-2 ring-red-500' : ''}`}
+                    } ${isDayToday ? 'ring-2 ring-red-500' : ''}`}
                     style={{ height: barHeight }}
                   >
-                    {/* Continuing stays (red) */}
-                    {d.continuing > 0 && (
-                      <div
-                        className="w-full bg-red-500 flex items-center justify-center cursor-pointer hover:bg-red-600"
-                        style={{ height: continuingHeight }}
-                        onClick={() => setSelectedSegment({ date: d.date, type: 'continuing', stays: d.continuingStays })}
-                      >
-                        {viewMode === 'week' && continuingHeight > 16 && (
-                          <span className="text-white text-xs font-medium">{d.continuing}</span>
+                    {isDayToday ? (
+                      /* Today: two bars side by side */
+                      <div className="w-full h-full flex items-end gap-px">
+                        {/* Checked-in bar (left) */}
+                        <div className="flex-1 flex flex-col justify-end h-full">
+                          {d.checkedIn > 0 ? (
+                            <div
+                              className="w-full bg-sky-500 flex items-center justify-center cursor-pointer hover:bg-sky-600 rounded-tl"
+                              style={{ height: checkedInHeight }}
+                              onClick={() => setSelectedSegment({ date: d.date, type: 'checkin', stays: d.checkinStays })}
+                            >
+                              {viewMode === 'week' && checkedInHeight > 16 && (
+                                <span className="text-white text-xs font-medium">{d.checkedIn}</span>
+                              )}
+                            </div>
+                          ) : (
+                            <div className="w-full h-1 bg-gray-100"></div>
+                          )}
+                        </div>
+                        {/* Booked bar (right) */}
+                        <div className="flex-1 flex flex-col justify-end h-full">
+                          {d.booked > 0 ? (
+                            <div
+                              className="w-full bg-amber-400 flex items-center justify-center cursor-pointer hover:bg-amber-500 rounded-tr"
+                              style={{ height: bookedHeight }}
+                              onClick={() => setSelectedSegment({ date: d.date, type: 'booking', stays: d.bookingStays })}
+                            >
+                              {viewMode === 'week' && bookedHeight > 16 && (
+                                <span className="text-white text-xs font-medium">{d.booked}</span>
+                              )}
+                            </div>
+                          ) : (
+                            <div className="w-full h-1 bg-gray-100"></div>
+                          )}
+                        </div>
+                      </div>
+                    ) : isPast ? (
+                      /* Past: single sky bar for checked-in */
+                      <div className="w-full h-full flex flex-col justify-end">
+                        {d.checkedIn > 0 ? (
+                          <div
+                            className="w-full bg-sky-500 flex items-center justify-center cursor-pointer hover:bg-sky-600 rounded-t"
+                            style={{ height: checkedInHeight }}
+                            onClick={() => setSelectedSegment({ date: d.date, type: 'checkin', stays: d.checkinStays })}
+                          >
+                            {viewMode === 'week' && checkedInHeight > 16 && (
+                              <span className="text-white text-xs font-medium">{d.checkedIn}</span>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="w-full h-1 bg-gray-100"></div>
                         )}
                       </div>
-                    )}
-                    {/* New check-ins (red) */}
-                    {d.newCheckin > 0 && (
-                      <div
-                        className="w-full bg-red-500 flex items-center justify-center cursor-pointer hover:bg-red-600"
-                        style={{ height: newCheckinHeight }}
-                        onClick={() => setSelectedSegment({ date: d.date, type: 'newCheckin', stays: d.newCheckinStays })}
-                      >
-                        {viewMode === 'week' && newCheckinHeight > 16 && (
-                          <span className="text-white text-xs font-medium">{d.newCheckin}</span>
+                    ) : (
+                      /* Future: single amber bar for booked */
+                      <div className="w-full h-full flex flex-col justify-end">
+                        {d.booked > 0 ? (
+                          <div
+                            className="w-full bg-amber-400 flex items-center justify-center cursor-pointer hover:bg-amber-500 rounded-t"
+                            style={{ height: bookedHeight }}
+                            onClick={() => setSelectedSegment({ date: d.date, type: 'booking', stays: d.bookingStays })}
+                          >
+                            {viewMode === 'week' && bookedHeight > 16 && (
+                              <span className="text-white text-xs font-medium">{d.booked}</span>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="w-full h-1 bg-gray-100"></div>
                         )}
                       </div>
-                    )}
-                    {/* Bookings (amber) */}
-                    {d.booking > 0 && (
-                      <div
-                        className="w-full bg-amber-400 flex items-center justify-center cursor-pointer hover:bg-amber-500"
-                        style={{ height: bookingHeight }}
-                        onClick={() => setSelectedSegment({ date: d.date, type: 'booking', stays: d.bookingStays })}
-                      >
-                        {viewMode === 'week' && bookingHeight > 16 && (
-                          <span className="text-white text-xs font-medium">{d.booking}</span>
-                        )}
-                      </div>
-                    )}
-                    {/* Empty state */}
-                    {d.total === 0 && (
-                      <div className="w-full h-1 bg-gray-100"></div>
                     )}
                   </div>
 
                   {/* Total label */}
-                  <div className={`text-xs font-medium mt-1 ${d.total > 0 ? 'text-gray-700' : 'text-gray-400'}`}>
-                    {d.total > 0 ? d.total : ''}
+                  <div className={`text-xs font-medium mt-1 ${displayCount > 0 ? 'text-gray-700' : 'text-gray-400'}`}>
+                    {displayCount > 0 ? displayCount : ''}
                   </div>
 
                   {/* Day of week */}
@@ -332,7 +363,7 @@ export default function StayTimeline({
                   </div>
 
                   {/* Date */}
-                  <div className={`text-xs ${isToday ? 'font-bold text-red-600' : 'text-gray-500'}`}>
+                  <div className={`text-xs ${isDayToday ? 'font-bold text-red-600' : 'text-gray-500'}`}>
                     {d.date.getDate()}
                   </div>
                 </div>
@@ -345,12 +376,8 @@ export default function StayTimeline({
       {/* Legend */}
       <div className="flex items-center justify-center gap-6 px-4 py-3 bg-gray-100 border-t border-gray-200 text-sm">
         <div className="flex items-center gap-2">
-          <div className="w-4 h-4 bg-red-500 rounded" />
-          <span className="text-gray-500">พักต่อเนื่อง</span>
-        </div>
-        <div className="flex items-center gap-2">
-          <div className="w-4 h-4 bg-red-500 rounded" />
-          <span className="text-gray-500">เช็คอินใหม่</span>
+          <div className="w-4 h-4 bg-sky-500 rounded" />
+          <span className="text-gray-500">เข้าพัก</span>
         </div>
         <div className="flex items-center gap-2">
           <div className="w-4 h-4 bg-amber-400 rounded" />
@@ -364,12 +391,10 @@ export default function StayTimeline({
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-2">
               <div className={`w-3 h-3 rounded ${
-                selectedSegment.type === 'continuing' ? 'bg-red-500' :
-                selectedSegment.type === 'newCheckin' ? 'bg-red-500' : 'bg-amber-400'
+                selectedSegment.type === 'checkin' ? 'bg-sky-500' : 'bg-amber-400'
               }`} />
               <h3 className="font-medium text-gray-800">
-                {selectedSegment.type === 'continuing' && 'พักต่อเนื่อง'}
-                {selectedSegment.type === 'newCheckin' && 'เช็คอินใหม่'}
+                {selectedSegment.type === 'checkin' && 'เข้าพัก'}
                 {selectedSegment.type === 'booking' && 'การจอง'}
                 <span className="text-gray-500 font-normal ml-2">
                   {format(selectedSegment.date, 'd MMM yyyy')} ({selectedSegment.stays.length} รายการ)
