@@ -1,8 +1,11 @@
 //! HF Ville Sync Binary
 //!
-//! Syncs data from HF Ville SQL Server 2005 (192.168.11.51) to a local
+//! Syncs data from HF Ville SQL Server (192.168.11.51) to a local
 //! PostgreSQL mirror database. Runs continuously with configurable interval
 //! (default 90 seconds).
+//!
+//! Uses FreeTDS `tsql` subprocess for MSSQL queries (TDS 7.0 required
+//! by the legacy SQL Server — tiberius only supports TDS 7.2+).
 //!
 //! Syncs 4 entity types in order:
 //! 1. Customers (View_Customers -> ht_customers_legacy)
@@ -12,16 +15,140 @@
 //!
 //! Uses SHA256 hash-based change detection (identical to scheduler/sync.rs).
 
-use bb8::Pool;
-use bb8_tiberius::ConnectionManager;
 use chrono::NaiveDateTime;
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use std::env;
+use std::process::Command;
 use std::time::Instant;
 
-type DbPool = Pool<ConnectionManager>;
 type PgPool = sqlx::PgPool;
+
+/// MSSQL connection config for FreeTDS
+struct MssqlConfig {
+    server: String,
+    port: u16,
+    database: String,
+    user: String,
+    password: String,
+}
+
+/// Run a SQL query against MSSQL via FreeTDS tsql subprocess.
+/// Returns rows as Vec<Vec<String>> (tab-separated columns).
+fn run_mssql_query(
+    config: &MssqlConfig,
+    sql: &str,
+) -> Result<Vec<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+    let input = format!("{}\nGO\nQUIT\n", sql);
+
+    let output = Command::new("tsql")
+        .args([
+            "-H", &config.server,
+            "-p", &config.port.to_string(),
+            "-U", &config.user,
+            "-P", &config.password,
+            "-D", &config.database,
+        ])
+        .env("TDSVER", "7.0")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(ref mut stdin) = child.stdin {
+                stdin.write_all(input.as_bytes())?;
+            }
+            child.wait_with_output()
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // tsql prints connection info to stderr; check for actual errors
+        if stderr.contains("There was a problem connecting")
+            || stderr.contains("Error ")
+        {
+            return Err(format!("tsql failed: {}", stderr.trim()).into());
+        }
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut rows = Vec::new();
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        // Skip empty lines and "affected" summary lines
+        if trimmed.is_empty() || trimmed.starts_with('(') || trimmed.starts_with("return status") {
+            continue;
+        }
+        let cols: Vec<String> = line.split('\t').map(|s| s.trim().to_string()).collect();
+        rows.push(cols);
+    }
+
+    Ok(rows)
+}
+
+/// Parse a date string from MSSQL (format varies: "Jan 22 2026 11:59AM", "2026-01-22 11:59:00.000")
+fn parse_datetime(s: &str) -> Option<NaiveDateTime> {
+    let s = s.trim();
+    if s.is_empty() || s == "NULL" {
+        return None;
+    }
+    // Try ISO format first
+    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+        return Some(dt);
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Some(dt);
+    }
+    // Try MSSQL US format: "Jan 22 2026 11:59AM"
+    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%b %d %Y %I:%M%p") {
+        return Some(dt);
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%b %e %Y %I:%M%p") {
+        return Some(dt);
+    }
+    // Try "Jan 22 2026 11:59:00:000AM"
+    if let Some(base) = s.split(':').take(2).collect::<Vec<_>>().join(":").chars().take(20).collect::<String>().strip_suffix("M").and_then(|_| None::<NaiveDateTime>) {
+        let _ = base;
+    }
+    tracing::warn!("Failed to parse datetime: '{}'", s);
+    None
+}
+
+fn get_col(row: &[String], idx: usize) -> String {
+    row.get(idx)
+        .map(|s| {
+            let s = s.trim();
+            if s == "NULL" { String::new() } else { s.to_string() }
+        })
+        .unwrap_or_default()
+}
+
+fn get_col_opt(row: &[String], idx: usize) -> Option<String> {
+    row.get(idx).and_then(|s| {
+        let s = s.trim();
+        if s.is_empty() || s == "NULL" { None } else { Some(s.to_string()) }
+    })
+}
+
+fn get_col_f64(row: &[String], idx: usize) -> Option<f64> {
+    row.get(idx).and_then(|s| {
+        let s = s.trim();
+        if s.is_empty() || s == "NULL" { None } else { s.parse().ok() }
+    })
+}
+
+fn get_col_i32(row: &[String], idx: usize) -> Option<i32> {
+    row.get(idx).and_then(|s| {
+        let s = s.trim();
+        if s.is_empty() || s == "NULL" { None } else { s.parse().ok() }
+    })
+}
+
+fn get_col_datetime(row: &[String], idx: usize) -> Option<NaiveDateTime> {
+    row.get(idx).and_then(|s| parse_datetime(s))
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -36,10 +163,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("HF Ville Sync starting...");
 
     // Load config from env
-    let mssql_server = env::var("MSSQL_SERVER").unwrap_or_else(|_| "192.168.11.51".to_string());
-    let mssql_database = env::var("MSSQL_DATABASE").unwrap_or_else(|_| "hotel".to_string());
-    let mssql_user = env::var("MSSQL_USER").unwrap_or_else(|_| "sa".to_string());
-    let mssql_password = env::var("MSSQL_PASSWORD").unwrap_or_else(|_| "***REMOVED***".to_string());
+    let mssql_config = MssqlConfig {
+        server: env::var("MSSQL_SERVER").unwrap_or_else(|_| "192.168.11.51".to_string()),
+        port: env::var("MSSQL_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(1433),
+        database: env::var("MSSQL_DATABASE").unwrap_or_else(|_| "hotel".to_string()),
+        user: env::var("MSSQL_USER").unwrap_or_else(|_| "sa".to_string()),
+        password: env::var("MSSQL_PASSWORD").unwrap_or_else(|_| "***REMOVED***".to_string()),
+    };
 
     let pg_server = env::var("PG_SERVER").unwrap_or_else(|_| "localhost".to_string());
     let pg_port = env::var("PG_PORT").unwrap_or_else(|_| "5440".to_string());
@@ -52,37 +182,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(90);
 
-    tracing::info!("MSSQL: {}@{}/{}", mssql_user, mssql_server, mssql_database);
+    tracing::info!("MSSQL: {}@{}:{}/{} (via tsql TDS 7.0)", mssql_config.user, mssql_config.server, mssql_config.port, mssql_config.database);
     tracing::info!("PG: {}@{}:{}/{}", pg_user, pg_server, pg_port, pg_database);
     tracing::info!("Sync interval: {}s", sync_interval);
 
-    // Create SQL Server pool
-    // SQL Server 2005 at HF Ville may not support TLS — disable encryption
-    let mut tib_config = tiberius::Config::new();
-    tib_config.host(&mssql_server);
-    tib_config.port(1433);
-    tib_config.database(&mssql_database);
-    tib_config.authentication(tiberius::AuthMethod::sql_server(&mssql_user, &mssql_password));
-    tib_config.trust_cert();
-    tib_config.encryption(tiberius::EncryptionLevel::Off);
-
-    let manager = ConnectionManager::new(tib_config);
-    tracing::info!("Connecting to MSSQL...");
-    let mssql_pool = Pool::builder()
-        .max_size(3)
-        .connection_timeout(std::time::Duration::from_secs(30))
-        .build(manager)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to create MSSQL pool: {}", e);
-            e
-        })?;
-
-    // Test MSSQL connection
-    {
-        let mut conn = mssql_pool.get().await?;
-        let _ = conn.simple_query("SELECT 1").await?;
-        tracing::info!("MSSQL connection established to {}", mssql_server);
+    // Test MSSQL connection via tsql
+    tracing::info!("Testing MSSQL connection...");
+    match run_mssql_query(&mssql_config, "SELECT 1") {
+        Ok(_) => tracing::info!("MSSQL connection OK"),
+        Err(e) => {
+            tracing::error!("MSSQL connection failed: {}", e);
+            return Err(format!("MSSQL connection failed: {}", e).into());
+        }
     }
 
     // Create PostgreSQL pool
@@ -103,22 +214,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         tracing::info!("[Sync] Starting sync cycle...");
 
-        if let Err(e) = sync_customers(&mssql_pool, &pg_pool).await {
+        if let Err(e) = sync_customers(&mssql_config, &pg_pool).await {
             tracing::error!("[Sync] Customer sync failed: {}", e);
             record_error(&pg_pool, "customers", &e.to_string()).await;
         }
 
-        if let Err(e) = sync_rooms(&mssql_pool, &pg_pool).await {
+        if let Err(e) = sync_rooms(&mssql_config, &pg_pool).await {
             tracing::error!("[Sync] Room sync failed: {}", e);
             record_error(&pg_pool, "rooms", &e.to_string()).await;
         }
 
-        if let Err(e) = sync_bookings(&mssql_pool, &pg_pool).await {
+        if let Err(e) = sync_bookings(&mssql_config, &pg_pool).await {
             tracing::error!("[Sync] Booking sync failed: {}", e);
             record_error(&pg_pool, "bookings", &e.to_string()).await;
         }
 
-        if let Err(e) = sync_checkins(&mssql_pool, &pg_pool).await {
+        if let Err(e) = sync_checkins(&mssql_config, &pg_pool).await {
             tracing::error!("[Sync] Check-in sync failed: {}", e);
             record_error(&pg_pool, "checkins", &e.to_string()).await;
         }
@@ -128,7 +239,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn sha256(input: &str) -> String {
+fn sha256_hash(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     format!("{:x}", hasher.finalize())
@@ -187,32 +298,29 @@ async fn record_success(
 // =============================================================================
 
 async fn sync_customers(
-    mssql_pool: &DbPool,
+    mssql: &MssqlConfig,
     pg_pool: &PgPool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let start = Instant::now();
     tracing::info!("[Sync] Syncing customers...");
 
-    let mut conn = mssql_pool.get().await?;
-    let rows = conn
-        .simple_query(
-            "SELECT Cust_no, Cust_name, Cust_Type, Cust_Add_tel, Cust_IDcard, C_Address FROM View_Customers",
-        )
-        .await?
-        .into_first_result()
-        .await?;
+    let rows = run_mssql_query(
+        mssql,
+        "SELECT Cust_no, Cust_name, Cust_Type, Cust_Add_tel, Cust_IDcard, C_Address FROM View_Customers",
+    )?;
 
     let mut added = 0i32;
     let mut updated = 0i32;
     let mut unchanged = 0i32;
 
     for row in &rows {
-        let cust_no = row.get::<&str, _>("Cust_no").unwrap_or_default().to_string();
-        let cust_name = row.get::<&str, _>("Cust_name").map(String::from);
-        let cust_type = row.get::<&str, _>("Cust_Type").map(String::from);
-        let cust_phone = row.get::<&str, _>("Cust_Add_tel").map(String::from);
-        let cust_idcard = row.get::<&str, _>("Cust_IDcard").map(String::from);
-        let cust_address = row.get::<&str, _>("C_Address").map(String::from);
+        let cust_no = get_col(row, 0);
+        if cust_no.is_empty() { continue; }
+        let cust_name = get_col_opt(row, 1);
+        let cust_type = get_col_opt(row, 2);
+        let cust_phone = get_col_opt(row, 3);
+        let cust_idcard = get_col_opt(row, 4);
+        let cust_address = get_col_opt(row, 5);
 
         let hash_input = format!(
             "{}|{}|{}|{}|{}|{}",
@@ -223,7 +331,7 @@ async fn sync_customers(
             cust_idcard.as_deref().unwrap_or(""),
             cust_address.as_deref().unwrap_or(""),
         );
-        let hash = sha256(&hash_input);
+        let hash = sha256_hash(&hash_input);
 
         let existing: Option<Option<String>> = sqlx::query_scalar(
             "SELECT sync_hash FROM ht_customers_legacy WHERE cust_no = $1"
@@ -293,44 +401,36 @@ async fn sync_customers(
 // =============================================================================
 
 async fn sync_rooms(
-    mssql_pool: &DbPool,
+    mssql: &MssqlConfig,
     pg_pool: &PgPool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let start = Instant::now();
     tracing::info!("[Sync] Syncing rooms...");
 
-    let mut conn = mssql_pool.get().await?;
-    let rows = conn
-        .simple_query(
-            r#"
-            SELECT Room_no, Room_Type, Room_Details, Room_Clean, Room_Use, Room_Book,
-                   Room_Manternace, Room_PriceA, Room_PriceB, Room_PriceC,
-                   Room_Group, Room_Book_Name, Room_Book_Time
-            FROM HT_Rooms ORDER BY Room_no
-            "#,
-        )
-        .await?
-        .into_first_result()
-        .await?;
+    let rows = run_mssql_query(
+        mssql,
+        "SELECT Room_no, Room_Type, Room_Details, Room_Clean, Room_Use, Room_Book, Room_Manternace, Room_PriceA, Room_PriceB, Room_PriceC, Room_Group, Room_Book_Name, Room_Book_Time FROM HT_Rooms ORDER BY Room_no",
+    )?;
 
     let mut added = 0i32;
     let mut updated = 0i32;
     let mut unchanged = 0i32;
 
     for row in &rows {
-        let room_no = row.get::<&str, _>("Room_no").unwrap_or_default().to_string();
-        let room_type = row.get::<&str, _>("Room_Type").map(String::from);
-        let room_details = row.get::<&str, _>("Room_Details").map(String::from);
-        let room_clean = row.get::<&str, _>("Room_Clean").map(String::from);
-        let room_use = row.get::<&str, _>("Room_Use").map(String::from);
-        let room_book = row.get::<&str, _>("Room_Book").map(String::from);
-        let room_manternace = row.get::<&str, _>("Room_Manternace").map(String::from);
-        let room_price_a = row.get::<f64, _>("Room_PriceA");
-        let room_price_b = row.get::<f64, _>("Room_PriceB");
-        let room_price_c = row.get::<f64, _>("Room_PriceC");
-        let room_group = row.get::<&str, _>("Room_Group").map(String::from);
-        let room_book_name = row.get::<&str, _>("Room_Book_Name").map(String::from);
-        let room_book_time: Option<NaiveDateTime> = row.try_get("Room_Book_Time").unwrap_or(None);
+        let room_no = get_col(row, 0);
+        if room_no.is_empty() { continue; }
+        let room_type = get_col_opt(row, 1);
+        let room_details = get_col_opt(row, 2);
+        let room_clean = get_col_opt(row, 3);
+        let room_use = get_col_opt(row, 4);
+        let room_book = get_col_opt(row, 5);
+        let room_manternace = get_col_opt(row, 6);
+        let room_price_a = get_col_f64(row, 7);
+        let room_price_b = get_col_f64(row, 8);
+        let room_price_c = get_col_f64(row, 9);
+        let room_group = get_col_opt(row, 10);
+        let room_book_name = get_col_opt(row, 11);
+        let room_book_time = get_col_datetime(row, 12);
 
         let hash_input = format!(
             "{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{}|{}|{:?}",
@@ -348,7 +448,7 @@ async fn sync_rooms(
             room_book_name.as_deref().unwrap_or(""),
             room_book_time,
         );
-        let hash = sha256(&hash_input);
+        let hash = sha256_hash(&hash_input);
 
         let existing: Option<Option<String>> = sqlx::query_scalar(
             "SELECT sync_hash FROM ht_rooms_legacy WHERE room_no = $1"
@@ -438,34 +538,31 @@ async fn sync_rooms(
 // =============================================================================
 
 async fn sync_bookings(
-    mssql_pool: &DbPool,
+    mssql: &MssqlConfig,
     pg_pool: &PgPool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let start = Instant::now();
     tracing::info!("[Sync] Syncing bookings...");
 
-    let mut conn = mssql_pool.get().await?;
-    let rows = conn
-        .simple_query(
-            "SELECT Book_No, Book_Date, Book_Date_in, Book_Date_out, Book_Cust_Name, Book_Cust_ID, Book_Status, Book_Room_Type FROM View_Booking_Ds",
-        )
-        .await?
-        .into_first_result()
-        .await?;
+    let rows = run_mssql_query(
+        mssql,
+        "SELECT Book_No, Book_Date, Book_Date_in, Book_Date_out, Book_Cust_Name, Book_Cust_ID, Book_Status, Book_Room_Type FROM View_Booking_Ds",
+    )?;
 
     let mut added = 0i32;
     let mut updated = 0i32;
     let mut unchanged = 0i32;
 
     for row in &rows {
-        let book_no = row.get::<&str, _>("Book_No").unwrap_or_default().to_string();
-        let book_date: Option<NaiveDateTime> = row.try_get("Book_Date").unwrap_or(None);
-        let book_date_in: Option<NaiveDateTime> = row.try_get("Book_Date_in").unwrap_or(None);
-        let book_date_out: Option<NaiveDateTime> = row.try_get("Book_Date_out").unwrap_or(None);
-        let book_cust_name = row.get::<&str, _>("Book_Cust_Name").map(String::from);
-        let book_cust_id = row.get::<&str, _>("Book_Cust_ID").map(String::from);
-        let book_status = row.get::<i32, _>("Book_Status");
-        let book_room_type = row.get::<&str, _>("Book_Room_Type").map(String::from);
+        let book_no = get_col(row, 0);
+        if book_no.is_empty() { continue; }
+        let book_date = get_col_datetime(row, 1);
+        let book_date_in = get_col_datetime(row, 2);
+        let book_date_out = get_col_datetime(row, 3);
+        let book_cust_name = get_col_opt(row, 4);
+        let book_cust_id = get_col_opt(row, 5);
+        let book_status = get_col_i32(row, 6);
+        let book_room_type = get_col_opt(row, 7);
 
         let hash_input = format!(
             "{}|{:?}|{:?}|{:?}|{}|{}|{:?}|{}",
@@ -478,7 +575,7 @@ async fn sync_bookings(
             book_status,
             book_room_type.as_deref().unwrap_or(""),
         );
-        let hash = sha256(&hash_input);
+        let hash = sha256_hash(&hash_input);
 
         let room_type_key = book_room_type.as_deref().unwrap_or("");
 
@@ -557,33 +654,30 @@ async fn sync_bookings(
 // =============================================================================
 
 async fn sync_checkins(
-    mssql_pool: &DbPool,
+    mssql: &MssqlConfig,
     pg_pool: &PgPool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let start = Instant::now();
     tracing::info!("[Sync] Syncing check-ins...");
 
-    let mut conn = mssql_pool.get().await?;
-    let rows = conn
-        .simple_query(
-            "SELECT Cin_no, Cin_Room_No, Cin_Room_In, Cin_Room_Out, Cin_cust_name, Cin_cust_no, Cin_status FROM View_CheckIn_Ds",
-        )
-        .await?
-        .into_first_result()
-        .await?;
+    let rows = run_mssql_query(
+        mssql,
+        "SELECT Cin_no, Cin_Room_No, Cin_Room_In, Cin_Room_Out, Cin_cust_name, Cin_cust_no, Cin_status FROM View_CheckIn_Ds",
+    )?;
 
     let mut added = 0i32;
     let mut updated = 0i32;
     let mut unchanged = 0i32;
 
     for row in &rows {
-        let cin_no = row.get::<&str, _>("Cin_no").unwrap_or_default().to_string();
-        let cin_room_no = row.get::<&str, _>("Cin_Room_No").map(String::from);
-        let cin_room_in: Option<NaiveDateTime> = row.try_get("Cin_Room_In").unwrap_or(None);
-        let cin_room_out: Option<NaiveDateTime> = row.try_get("Cin_Room_Out").unwrap_or(None);
-        let cin_cust_name = row.get::<&str, _>("Cin_cust_name").map(String::from);
-        let cin_cust_no = row.get::<&str, _>("Cin_cust_no").map(String::from);
-        let cin_status = row.get::<&str, _>("Cin_status").map(String::from);
+        let cin_no = get_col(row, 0);
+        if cin_no.is_empty() { continue; }
+        let cin_room_no = get_col_opt(row, 1);
+        let cin_room_in = get_col_datetime(row, 2);
+        let cin_room_out = get_col_datetime(row, 3);
+        let cin_cust_name = get_col_opt(row, 4);
+        let cin_cust_no = get_col_opt(row, 5);
+        let cin_status = get_col_opt(row, 6);
 
         let hash_input = format!(
             "{}|{}|{:?}|{:?}|{}|{}|{}",
@@ -595,7 +689,7 @@ async fn sync_checkins(
             cin_cust_no.as_deref().unwrap_or(""),
             cin_status.as_deref().unwrap_or(""),
         );
-        let hash = sha256(&hash_input);
+        let hash = sha256_hash(&hash_input);
 
         let existing: Option<Option<String>> = sqlx::query_scalar(
             "SELECT sync_hash FROM ht_checkins_legacy WHERE cin_no = $1"
