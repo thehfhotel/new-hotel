@@ -105,17 +105,19 @@ export default function StayTimeline({
       const checkinStays: Stay[] = []
       const bookingStays: Stay[] = []
 
+      // Use UTC dates to avoid timezone shifts — legacy DB stores Thai local
+      // time with Z suffix, so UTC values are the correct local dates
       const dayDate = new Date(day)
-      dayDate.setHours(0, 0, 0, 0)
+      const dayUTC = Date.UTC(dayDate.getUTCFullYear(), dayDate.getUTCMonth(), dayDate.getUTCDate())
 
       stays.forEach(stay => {
         const checkOutDate = new Date(stay.checkOut)
-        checkOutDate.setHours(0, 0, 0, 0)
+        const checkOutUTC = Date.UTC(checkOutDate.getUTCFullYear(), checkOutDate.getUTCMonth(), checkOutDate.getUTCDate())
         const checkInDate = new Date(stay.checkIn)
-        checkInDate.setHours(0, 0, 0, 0)
+        const checkInUTC = Date.UTC(checkInDate.getUTCFullYear(), checkInDate.getUTCMonth(), checkInDate.getUTCDate())
 
         // Stay overlaps this day if checkIn <= day AND checkOut > day
-        const overlaps = checkInDate <= dayDate && checkOutDate > dayDate
+        const overlaps = checkInUTC <= dayUTC && checkOutUTC > dayUTC
 
         if (!overlaps) return
 
