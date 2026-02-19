@@ -80,6 +80,7 @@ function getRoomStatus(room: ApiRoom, isCheckoutToday: boolean): RoomStatus {
   if (room.Room_Manternace === 'yes') return 'maintenance'
   if (room.Room_Use === 'yes') return 'occupied'
   if (room.Room_Book && room.Room_Book !== '') return 'booked'
+  if (room.Room_Clean === 'no') return 'cleaning'
   return 'available'
 }
 
