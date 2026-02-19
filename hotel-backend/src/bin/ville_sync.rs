@@ -74,17 +74,33 @@ fn run_mssql_query(
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut rows = Vec::new();
-    let mut is_first_data_row = true;
+    let mut header_skipped = false;
 
     for line in stdout.lines() {
         let trimmed = line.trim();
-        // Skip empty lines and "affected" summary lines
+        // Skip empty lines and summary lines
         if trimmed.is_empty() || trimmed.starts_with('(') || trimmed.starts_with("return status") {
             continue;
         }
-        // Skip column header row (first non-empty line from tsql)
-        if is_first_data_row {
-            is_first_data_row = false;
+        // Skip tsql initialization messages
+        if trimmed.starts_with("locale") || trimmed.starts_with("using default charset") {
+            continue;
+        }
+        // Skip tsql prompt lines (e.g., "1>", "2>", "1> 2>")
+        if trimmed.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+            && trimmed.contains('>')
+            && !trimmed.contains('\t')
+        {
+            continue;
+        }
+        // Strip leading tsql prompt markers from data lines (e.g., "1> 2> data...")
+        let cleaned = trimmed.trim_start_matches(|c: char| c.is_ascii_digit() || c == '>' || c == ' ');
+        if cleaned.is_empty() {
+            continue;
+        }
+        // Skip column header row (first tab-separated line is always column names)
+        if !header_skipped {
+            header_skipped = true;
             continue;
         }
         let cols: Vec<String> = line.split('\t').map(|s| s.trim().to_string()).collect();
@@ -251,6 +267,23 @@ fn sha256_hash(input: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Clean up rows inserted from tsql output artifacts (locale messages, prompt markers, headers)
+async fn cleanup_tsql_artifacts(pg_pool: &PgPool, table: &str, key_col: &str) {
+    let sql = format!(
+        "DELETE FROM {} WHERE {} LIKE 'locale%' OR {} LIKE 'using %' OR {} LIKE '%>%' OR {} LIKE '%charset%'",
+        table, key_col, key_col, key_col, key_col
+    );
+    match sqlx::query(&sql).execute(pg_pool).await {
+        Ok(result) if result.rows_affected() > 0 => {
+            tracing::info!("[Sync] Cleaned {} artifact rows from {}", result.rows_affected(), table);
+        }
+        Err(e) => {
+            tracing::warn!("[Sync] Failed to clean artifacts from {}: {}", table, e);
+        }
+        _ => {}
+    }
+}
+
 async fn record_error(pg_pool: &PgPool, entity: &str, error: &str) {
     let _ = sqlx::query(
         r#"
@@ -393,6 +426,9 @@ async fn sync_customers(
         }
     }
 
+    // Clean up tsql artifact rows
+    cleanup_tsql_artifacts(pg_pool, "ht_customers_legacy", "cust_no").await;
+
     let duration_ms = start.elapsed().as_millis() as i32;
     tracing::info!(
         "[Sync] Customers: {} added, {} updated, {} unchanged in {}ms",
@@ -530,6 +566,9 @@ async fn sync_rooms(
         }
     }
 
+    // Clean up tsql artifact rows
+    cleanup_tsql_artifacts(pg_pool, "ht_rooms_legacy", "room_no").await;
+
     let duration_ms = start.elapsed().as_millis() as i32;
     tracing::info!(
         "[Sync] Rooms: {} added, {} updated, {} unchanged in {}ms",
@@ -646,6 +685,9 @@ async fn sync_bookings(
         }
     }
 
+    // Clean up tsql artifact rows
+    cleanup_tsql_artifacts(pg_pool, "ht_bookings_legacy", "book_no").await;
+
     let duration_ms = start.elapsed().as_millis() as i32;
     tracing::info!(
         "[Sync] Bookings: {} added, {} updated, {} unchanged in {}ms",
@@ -753,6 +795,9 @@ async fn sync_checkins(
             }
         }
     }
+
+    // Clean up tsql artifact rows
+    cleanup_tsql_artifacts(pg_pool, "ht_checkins_legacy", "cin_no").await;
 
     let duration_ms = start.elapsed().as_millis() as i32;
     tracing::info!(
