@@ -74,11 +74,17 @@ fn run_mssql_query(
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut rows = Vec::new();
+    let mut is_first_data_row = true;
 
     for line in stdout.lines() {
         let trimmed = line.trim();
         // Skip empty lines and "affected" summary lines
         if trimmed.is_empty() || trimmed.starts_with('(') || trimmed.starts_with("return status") {
+            continue;
+        }
+        // Skip column header row (first non-empty line from tsql)
+        if is_first_data_row {
+            is_first_data_row = false;
             continue;
         }
         let cols: Vec<String> = line.split('\t').map(|s| s.trim().to_string()).collect();
