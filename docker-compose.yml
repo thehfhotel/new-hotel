@@ -59,38 +59,18 @@ services:
       - SLACK_NOTIFICATIONS_ENABLED=true
       - HOST=0.0.0.0
       - PORT=3003
-      # HF Ville database (PostgreSQL mirror via cloudflared tunnel)
-      - VILLE_DB_SERVER=ville-tunnel
+      # HF Ville database (PostgreSQL mirror via SSH tunnel on host port 5440)
+      - VILLE_DB_SERVER=host.docker.internal
       - VILLE_DB_PORT=5440
       - VILLE_DB_NAME=hfville
       - VILLE_DB_USER=postgres
       - VILLE_DB_PASSWORD=***REMOVED***
-      - VILLE_DB_ENABLED=${VILLE_DB_ENABLED:-false}
+      - VILLE_DB_ENABLED=${VILLE_DB_ENABLED:-true}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       newdb:
         condition: service_healthy
-    networks:
-      - hotel-network
-    restart: unless-stopped
-
-  # SSH tunnel to HF Ville PostgreSQL mirror (on jump box 192.168.11.147)
-  ville-tunnel:
-    image: alpine:3.21
-    container_name: ville-tunnel
-    entrypoint: /bin/sh
-    command:
-      - -c
-      - |
-        apk add --no-cache openssh-client autossh &&
-        chmod 600 /root/.ssh/id_rsa &&
-        exec autossh -M 0 -N \
-          -o StrictHostKeyChecking=no \
-          -o ServerAliveInterval=30 \
-          -o ServerAliveCountMax=3 \
-          -L 0.0.0.0:5440:localhost:5440 \
-          nut@192.168.11.147
-    volumes:
-      - ${SSH_KEY_PATH:-~/.ssh/id_rsa}:/root/.ssh/id_rsa:ro
     networks:
       - hotel-network
     restart: unless-stopped
