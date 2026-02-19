@@ -73,14 +73,24 @@ services:
       - hotel-network
     restart: unless-stopped
 
-  # Cloudflared tunnel to HF Ville PostgreSQL mirror (on jump box)
+  # SSH tunnel to HF Ville PostgreSQL mirror (on jump box 192.168.11.147)
   ville-tunnel:
-    image: cloudflare/cloudflared:latest
+    image: alpine:3.21
     container_name: ville-tunnel
-    command: access tcp --hostname hfville-pg.thehfhotel.org --listener 0.0.0.0:5440
-    environment:
-      - CF_ACCESS_CLIENT_ID=${CF_ACCESS_CLIENT_ID}
-      - CF_ACCESS_CLIENT_SECRET=${CF_ACCESS_CLIENT_SECRET}
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        apk add --no-cache openssh-client autossh &&
+        chmod 600 /root/.ssh/id_rsa &&
+        exec autossh -M 0 -N \
+          -o StrictHostKeyChecking=no \
+          -o ServerAliveInterval=30 \
+          -o ServerAliveCountMax=3 \
+          -L 0.0.0.0:5440:localhost:5440 \
+          nut@192.168.11.147
+    volumes:
+      - ${SSH_KEY_PATH:-~/.ssh/id_rsa}:/root/.ssh/id_rsa:ro
     networks:
       - hotel-network
     restart: unless-stopped
