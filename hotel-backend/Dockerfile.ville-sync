@@ -15,7 +15,7 @@ RUN rm -rf src
 COPY .sqlx .sqlx
 COPY src ./src
 
-RUN touch src/main.rs && cargo build --release
+RUN find src -name "*.rs" -exec touch {} + && cargo build --release --bin ville_sync
 
 # Runtime stage
 FROM debian:bookworm-slim

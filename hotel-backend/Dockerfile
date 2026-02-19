@@ -19,7 +19,7 @@ COPY .sqlx .sqlx
 COPY src ./src
 
 # Build the application
-RUN touch src/main.rs && cargo build --release
+RUN find src -name "*.rs" -exec touch {} + && cargo build --release
 
 # Runtime stage
 FROM debian:bookworm-slim
