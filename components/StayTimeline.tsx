@@ -105,19 +105,20 @@ export default function StayTimeline({
       const checkinStays: Stay[] = []
       const bookingStays: Stay[] = []
 
-      // Use UTC dates to avoid timezone shifts — legacy DB stores Thai local
-      // time with Z suffix, so UTC values are the correct local dates
-      const dayDate = new Date(day)
-      const dayUTC = Date.UTC(dayDate.getUTCFullYear(), dayDate.getUTCMonth(), dayDate.getUTCDate())
+      // day comes from eachDayOfInterval — local time (e.g. Feb 19 00:00 GMT+7)
+      // Use local time methods to extract the date part
+      const dayMidnight = Date.UTC(day.getFullYear(), day.getMonth(), day.getDate())
 
       stays.forEach(stay => {
-        const checkOutDate = new Date(stay.checkOut)
-        const checkOutUTC = Date.UTC(checkOutDate.getUTCFullYear(), checkOutDate.getUTCMonth(), checkOutDate.getUTCDate())
+        // Checkin/checkout from API have Z suffix but are actually Thai local time
+        // Use UTC methods to extract the stored date part correctly
         const checkInDate = new Date(stay.checkIn)
-        const checkInUTC = Date.UTC(checkInDate.getUTCFullYear(), checkInDate.getUTCMonth(), checkInDate.getUTCDate())
+        const checkInMidnight = Date.UTC(checkInDate.getUTCFullYear(), checkInDate.getUTCMonth(), checkInDate.getUTCDate())
+        const checkOutDate = new Date(stay.checkOut)
+        const checkOutMidnight = Date.UTC(checkOutDate.getUTCFullYear(), checkOutDate.getUTCMonth(), checkOutDate.getUTCDate())
 
         // Stay overlaps this day if checkIn <= day AND checkOut > day
-        const overlaps = checkInUTC <= dayUTC && checkOutUTC > dayUTC
+        const overlaps = checkInMidnight <= dayMidnight && checkOutMidnight > dayMidnight
 
         if (!overlaps) return
 
