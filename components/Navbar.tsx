@@ -69,7 +69,7 @@ export default function Navbar() {
         </div>
 
         {/* Branch Selector */}
-        {villeAvailable && (
+        {(
           <div className="flex items-center gap-1 shrink-0">
             {(['hfhotel', 'hfville', 'all'] as Branch[]).map((b) => (
               <button
