@@ -122,7 +122,7 @@ export default function Sidebar() {
       </div>
 
       {/* Branch Selector */}
-      {villeAvailable && (
+      {(
         <div className="px-2 py-2 border-b border-gray-200 shrink-0">
           {collapsed ? (
             <button
