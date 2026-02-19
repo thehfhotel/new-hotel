@@ -219,6 +219,129 @@ async fn get_room_pg(pool: &crate::db::PgPool, room_no: &str) -> ApiResult<RoomD
     Ok(room)
 }
 
+/// List all rooms from PostgreSQL legacy mirror only (no ht_rooms_new join)
+/// Used for HF Ville which only has ht_rooms_legacy tables.
+async fn list_rooms_legacy_only(pool: &crate::db::PgPool) -> ApiResult<Vec<Room>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            room_no,
+            room_type,
+            room_details,
+            room_clean,
+            room_use,
+            room_book,
+            room_manternace,
+            room_price_a::float8 AS room_price_a,
+            room_price_b::float8 AS room_price_b,
+            room_price_c::float8 AS room_price_c,
+            room_group,
+            room_book_name
+        FROM ht_rooms_legacy
+        ORDER BY room_no
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let rooms: Vec<Room> = rows
+        .iter()
+        .map(|row| Room {
+            room_no: row.get::<String, _>("room_no"),
+            room_type: row.get::<Option<String>, _>("room_type"),
+            room_details: row.get::<Option<String>, _>("room_details"),
+            room_clean: row.get::<Option<String>, _>("room_clean"),
+            room_use: row.get::<Option<String>, _>("room_use"),
+            room_book: row.get::<Option<String>, _>("room_book"),
+            room_manternace: row.get::<Option<String>, _>("room_manternace"),
+            room_price_a: row.get::<Option<f64>, _>("room_price_a"),
+            room_price_b: row.get::<Option<f64>, _>("room_price_b"),
+            room_price_c: row.get::<Option<f64>, _>("room_price_c"),
+            room_group: row.get::<Option<String>, _>("room_group"),
+            room_book_name: row.get::<Option<String>, _>("room_book_name"),
+        })
+        .collect();
+
+    Ok(rooms)
+}
+
+/// Get a single room detail from legacy mirror only (no ht_rooms_new)
+/// Used for HF Ville.
+async fn get_room_legacy_only(pool: &crate::db::PgPool, room_no: &str) -> ApiResult<RoomDetail> {
+    let room_row = sqlx::query(
+        r#"
+        SELECT
+            room_no,
+            room_type,
+            room_details,
+            room_clean,
+            room_use,
+            room_book,
+            room_manternace,
+            room_price_a::float8 AS room_price_a,
+            room_price_b::float8 AS room_price_b,
+            room_price_c::float8 AS room_price_c,
+            room_group,
+            room_book_name,
+            room_book_time
+        FROM ht_rooms_legacy
+        WHERE room_no = $1
+        "#,
+    )
+    .bind(room_no)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Room not found".to_string()))?;
+
+    // Get current/recent check-in from ht_checkins_legacy
+    let checkin_row = sqlx::query(
+        r#"
+        SELECT
+            cin_cust_name,
+            cin_room_in,
+            cin_room_out
+        FROM ht_checkins_legacy
+        WHERE cin_room_no = $1
+        ORDER BY cin_room_in DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(room_no)
+    .fetch_optional(pool)
+    .await?;
+
+    let current_guest = checkin_row.map(|row| CurrentGuest {
+        name: row.get::<Option<String>, _>("cin_cust_name"),
+        check_in: row
+            .get::<Option<NaiveDateTime>, _>("cin_room_in")
+            .map(|dt| dt.and_utc()),
+        check_out: row
+            .get::<Option<NaiveDateTime>, _>("cin_room_out")
+            .map(|dt| dt.and_utc()),
+    });
+
+    let room = RoomDetail {
+        room_no: room_row.get::<String, _>("room_no"),
+        room_type: room_row.get::<Option<String>, _>("room_type"),
+        room_details: room_row.get::<Option<String>, _>("room_details"),
+        room_clean: room_row.get::<Option<String>, _>("room_clean"),
+        room_use: room_row.get::<Option<String>, _>("room_use"),
+        room_book: room_row.get::<Option<String>, _>("room_book"),
+        room_manternace: room_row.get::<Option<String>, _>("room_manternace"),
+        room_price_a: room_row.get::<Option<f64>, _>("room_price_a"),
+        room_price_b: room_row.get::<Option<f64>, _>("room_price_b"),
+        room_price_c: room_row.get::<Option<f64>, _>("room_price_c"),
+        room_group: room_row.get::<Option<String>, _>("room_group"),
+        room_book_name: room_row.get::<Option<String>, _>("room_book_name"),
+        room_book_time: room_row
+            .get::<Option<NaiveDateTime>, _>("room_book_time")
+            .map(|dt| dt.and_utc()),
+        current_guest,
+    };
+
+    Ok(room)
+}
+
 /// Get rooms checking out today from PostgreSQL
 async fn get_checkouts_today_pg(pool: &crate::db::PgPool) -> ApiResult<Vec<String>> {
     let rows = sqlx::query(
@@ -606,7 +729,7 @@ pub async fn list_rooms(
             }
         }
         Branch::Hfville => {
-            list_rooms_pg(state.ville_pool()?).await?
+            list_rooms_legacy_only(state.ville_pool()?).await?
         }
         Branch::All => {
             let mut all = if use_pg_source() {
@@ -615,7 +738,7 @@ pub async fn list_rooms(
                 list_rooms_sqlserver(&state.legacy_pool).await?
             };
             if let Ok(vp) = state.ville_pool() {
-                all.extend(list_rooms_pg(vp).await?);
+                all.extend(list_rooms_legacy_only(vp).await?);
             }
             all
         }
@@ -644,15 +767,17 @@ pub async fn get_room(
 ) -> ApiResult<Json<RoomDetailResponse>> {
     let branch = params.branch.unwrap_or_default();
 
-    let pool = match branch {
-        Branch::Hfhotel | Branch::All => &state.new_pool,
-        Branch::Hfville => state.ville_pool()?,
-    };
-
-    let room = if use_pg_source() || branch == Branch::Hfville {
-        get_room_pg(pool, &room_no).await?
-    } else {
-        get_room_sqlserver(&state.legacy_pool, &room_no).await?
+    let room = match branch {
+        Branch::Hfhotel | Branch::All => {
+            if use_pg_source() {
+                get_room_pg(&state.new_pool, &room_no).await?
+            } else {
+                get_room_sqlserver(&state.legacy_pool, &room_no).await?
+            }
+        }
+        Branch::Hfville => {
+            get_room_legacy_only(state.ville_pool()?, &room_no).await?
+        }
     };
 
     Ok(Json(RoomDetailResponse {
