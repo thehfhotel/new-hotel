@@ -28,6 +28,7 @@ jobs:
       code: ${{ steps.filter.outputs.code }}
       backend: ${{ steps.filter.outputs.backend }}
       deploy: ${{ steps.filter.outputs.deploy }}
+      hfville: ${{ steps.filter.outputs.hfville }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -56,6 +57,9 @@ jobs:
               - 'init-db/**'
               - 'migrations/pg/**'
               - 'scripts/migrate.sh'
+            hfville:
+              - 'hotel-backend/**'
+              - 'deploy/hfville/**'
 
   test-frontend:
     runs-on: ubuntu-latest
@@ -210,6 +214,48 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  build-ville-sync:
+    runs-on: ubuntu-latest
+    needs: [changes, test-backend]
+    if: needs.changes.outputs.hfville == 'true'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/thehfhotel/ville-sync
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest
+
+      - name: Build and push ville-sync
+        uses: docker/build-push-action@v6
+        with:
+          context: ./hotel-backend
+          file: ./hotel-backend/Dockerfile.ville-sync
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   deploy:
     runs-on: [self-hosted, linux, deploy]
     needs: [changes, build-frontend, build-backend]
@@ -281,3 +327,38 @@ jobs:
 
           echo "Deployment complete!"
           docker compose ps
+
+  deploy-hfville:
+    runs-on: [self-hosted, linux, deploy]
+    needs: [changes, build-ville-sync]
+    if: needs.build-ville-sync.result == 'success'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy to HF Ville jump box
+        env:
+          HFVILLE_CF_SERVICE_TOKEN_ID: ${{ secrets.HFVILLE_CF_SERVICE_TOKEN_ID }}
+          HFVILLE_CF_SERVICE_TOKEN_SECRET: ${{ secrets.HFVILLE_CF_SERVICE_TOKEN_SECRET }}
+        run: |
+          set -e
+          PROXY_CMD="cloudflared access ssh --hostname hfville.thehfhotel.org --service-token-id $HFVILLE_CF_SERVICE_TOKEN_ID --service-token-secret $HFVILLE_CF_SERVICE_TOKEN_SECRET"
+
+          # Copy deployment files to jump box
+          sshpass -p banana scp -o ProxyCommand="$PROXY_CMD" -o StrictHostKeyChecking=no \
+            deploy/hfville/docker-compose.yml nut@hfville.thehfhotel.org:~/hfville/
+          sshpass -p banana scp -o ProxyCommand="$PROXY_CMD" -o StrictHostKeyChecking=no \
+            deploy/hfville/init-db/init-hfville.sql nut@hfville.thehfhotel.org:~/hfville/init-db/
+
+          # Save ville-sync image locally, transfer to jump box, load and start
+          docker pull ghcr.io/thehfhotel/ville-sync:latest
+          docker save ghcr.io/thehfhotel/ville-sync:latest | gzip > /tmp/ville-sync.tar.gz
+
+          sshpass -p banana scp -o ProxyCommand="$PROXY_CMD" -o StrictHostKeyChecking=no \
+            /tmp/ville-sync.tar.gz nut@hfville.thehfhotel.org:~/hfville/
+
+          sshpass -p banana ssh -o ProxyCommand="$PROXY_CMD" -o StrictHostKeyChecking=no \
+            nut@hfville.thehfhotel.org "echo banana | sudo -S docker load -i ~/hfville/ville-sync.tar.gz && cd ~/hfville && echo banana | sudo -S docker compose up -d && rm ~/hfville/ville-sync.tar.gz"
+
+          rm -f /tmp/ville-sync.tar.gz
+          echo "HF Ville deployment complete!"
