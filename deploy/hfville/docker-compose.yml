@@ -24,15 +24,17 @@ services:
 
   # Sync binary: SQL Server 2005 -> PostgreSQL mirror
   # Runs every 90 seconds, uses SHA256 hash-based change detection
+  # Uses host networking to reach MSSQL on local LAN (192.168.11.51)
   ville-sync:
     image: ghcr.io/thehfhotel/ville-sync:latest
     container_name: ville-sync
+    network_mode: host
     environment:
       - MSSQL_SERVER=192.168.11.51
       - MSSQL_DATABASE=hotel
       - MSSQL_USER=sa
       - MSSQL_PASSWORD=12345678
-      - PG_SERVER=hfville-db
+      - PG_SERVER=127.0.0.1
       - PG_PORT=5440
       - PG_DATABASE=hfville
       - PG_USER=postgres
