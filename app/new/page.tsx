@@ -48,12 +48,12 @@ interface CheckIn {
 }
 
 const statusConfig: Record<RoomStatus, { dot: string; bg: string; border: string; label: string }> = {
-  available: { dot: 'bg-emerald-500', bg: 'bg-emerald-500/10 hover:bg-emerald-500/20', border: 'border-emerald-500/30', label: 'ว่าง' },
-  occupied: { dot: 'bg-red-500', bg: 'bg-red-500/10 hover:bg-red-500/20', border: 'border-red-500/30', label: 'มีผู้เข้าพัก' },
-  booked: { dot: 'bg-amber-500', bg: 'bg-amber-500/10 hover:bg-amber-500/20', border: 'border-amber-500/30', label: 'จองแล้ว' },
-  maintenance: { dot: 'bg-zinc-500', bg: 'bg-gray-100 hover:bg-gray-200', border: 'border-gray-400', label: 'ซ่อมบำรุง' },
-  cleaning: { dot: 'bg-orange-500', bg: 'bg-orange-500/10 hover:bg-orange-500/20', border: 'border-orange-500/30', label: 'ทำความสะอาด' },
-  checkout: { dot: 'bg-sky-500', bg: 'bg-sky-500/10 hover:bg-sky-500/20', border: 'border-sky-500/30', label: 'รอเช็คเอาท์' },
+  available: { dot: 'bg-green-500', bg: 'bg-white hover:bg-green-50', border: 'border-b-green-500', label: 'ว่าง' },
+  occupied: { dot: 'bg-red-500', bg: 'bg-red-50 hover:bg-red-100', border: 'border-b-red-500', label: 'มีผู้เข้าพัก' },
+  booked: { dot: 'bg-yellow-500', bg: 'bg-yellow-50 hover:bg-yellow-100', border: 'border-b-yellow-500', label: 'จองแล้ว' },
+  maintenance: { dot: 'bg-gray-400', bg: 'bg-gray-100 hover:bg-gray-200', border: 'border-b-gray-400', label: 'ซ่อมบำรุง' },
+  cleaning: { dot: 'bg-orange-500', bg: 'bg-orange-50 hover:bg-orange-100', border: 'border-b-orange-500', label: 'ทำความสะอาด' },
+  checkout: { dot: 'bg-blue-400', bg: 'bg-blue-50 hover:bg-blue-100', border: 'border-b-blue-400', label: 'รอเช็คเอาท์' },
 }
 
 // HF Hotel room layout matching actual hotel floor plan
@@ -244,18 +244,19 @@ export default function NewDashboard() {
               {section.label && (
                 <p className="text-sm font-medium text-gray-500 mb-2">{section.label}</p>
               )}
-              <div className="grid gap-1.5" style={{ gridTemplateColumns: `repeat(${Math.max(...section.layout.map(r => r.length))}, minmax(0, 1fr))` }}>
+              <div className="grid gap-2" style={{ gridTemplateColumns: `repeat(${Math.max(...section.layout.map(r => r.length))}, minmax(0, 1fr))` }}>
                 {section.layout.map((row, rowIndex) => (
                   <div key={`row-${sectionIdx}-${rowIndex}`} className="contents">
                     {row.map((roomNumber, colIndex) => {
                       if (roomNumber === null) {
-                        return <div key={`blank-${sectionIdx}-${rowIndex}-${colIndex}`} className="h-[60px]" />
+                        return <div key={`blank-${sectionIdx}-${rowIndex}-${colIndex}`} className="h-[70px]" />
                       }
                       const room = roomMap.get(roomNumber.toUpperCase())
                       if (!room) {
                         return (
-                          <div key={`missing-${sectionIdx}-${roomNumber}`} className="h-[60px] bg-gray-50 rounded-lg flex flex-col items-center justify-center">
-                            <span className="font-bold text-[10px] text-gray-400">{roomNumber}</span>
+                          <div key={`missing-${sectionIdx}-${roomNumber}`} className="h-[70px] bg-gray-200 rounded-lg p-1 flex flex-col items-center justify-center">
+                            <span className="font-bold text-xs text-gray-400">{roomNumber}</span>
+                            <span className="text-[9px] text-gray-400">ไม่พบ</span>
                           </div>
                         )
                       }
@@ -264,16 +265,18 @@ export default function NewDashboard() {
                         <button
                           key={`${sectionIdx}-${roomNumber}`}
                           onClick={() => setSelectedRoom(room)}
-                          className={`${config.bg} border ${config.border} rounded-lg p-1 flex flex-col items-center justify-center h-[60px] transition-colors`}
+                          className={`${config.bg} border border-gray-200 border-b-4 ${config.border} rounded-lg p-1
+                            hover:shadow-md flex flex-col items-center justify-center h-[70px] overflow-hidden`}
                           title={`${room.roomNumber} - ${room.type} ${room.details}`}
                         >
-                          <span className="font-bold text-[11px] text-gray-900">{room.roomNumber}</span>
-                          <span className="text-[8px] text-gray-500">{room.type}</span>
+                          <span className="font-bold text-xs leading-tight text-gray-800">{room.roomNumber}</span>
+                          <span className="text-[8px] leading-tight text-gray-600">{room.type}</span>
+                          <span className="text-[8px] leading-tight text-gray-500">{room.details}</span>
                         </button>
                       )
                     })}
                     {Array.from({ length: Math.max(...section.layout.map(r => r.length)) - row.length }).map((_, i) => (
-                      <div key={`filler-${sectionIdx}-${rowIndex}-${i}`} className="h-[60px]" />
+                      <div key={`filler-${sectionIdx}-${rowIndex}-${i}`} className="h-[70px]" />
                     ))}
                   </div>
                 ))}
@@ -283,29 +286,30 @@ export default function NewDashboard() {
         </div>
 
         {/* Mobile List */}
-        <div className="md:hidden space-y-1.5">
+        <div className="md:hidden space-y-2">
           {[...rooms].sort((a, b) => a.roomNumber.localeCompare(b.roomNumber, undefined, { numeric: true })).map(room => {
             const config = statusConfig[room.status]
             return (
               <button
                 key={room.roomNumber}
                 onClick={() => setSelectedRoom(room)}
-                className={`${config.bg} w-full flex items-center gap-3 p-3 rounded-lg border ${config.border}`}
+                className={`${config.bg} w-full flex items-center gap-3 p-3 rounded-lg border border-gray-200 border-l-4 ${config.border}`}
               >
-                <div className={`w-2.5 h-2.5 rounded-full ${config.dot}`} />
-                <span className="font-bold text-sm text-gray-900">{room.roomNumber}</span>
-                <span className="text-gray-500 text-sm">{room.type}</span>
+                <div className={`w-3 h-3 rounded-full ${config.dot}`} />
+                <span className="font-bold">{room.roomNumber}</span>
+                <span className="text-gray-600">{room.type}</span>
+                <span className="text-gray-500 text-sm">{room.details}</span>
               </button>
             )
           })}
         </div>
 
         {/* Legend */}
-        <div className="flex flex-wrap gap-4 mt-4 pt-4 border-t border-gray-200">
+        <div className="flex flex-wrap gap-2 md:gap-4 mt-4">
           {Object.entries(statusConfig).map(([status, config]) => (
-            <div key={status} className="flex items-center gap-2">
-              <div className={`w-2.5 h-2.5 rounded-full ${config.dot}`} />
-              <span className="text-xs text-gray-500">{config.label}</span>
+            <div key={status} className="flex items-center gap-1 md:gap-2">
+              <div className={`w-2 h-2 md:w-3 md:h-3 rounded-full ${config.dot}`} />
+              <span className="text-xs md:text-sm text-gray-600">{config.label}</span>
             </div>
           ))}
         </div>
