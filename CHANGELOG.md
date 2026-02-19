@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - HF Ville room queries failing with `relation "ht_rooms_new" does not exist` — added legacy-only query functions for ville pool (which only has `ht_rooms_legacy` tables, not HotelNew tables)
-- Room grid not showing "ทำความสะอาด" (cleaning) status — rooms with `Room_Clean = "no"` were incorrectly displayed as available; fixed in both legacy and new dashboards
+- Room grid not showing "ทำความสะอาด" (cleaning) status — `Room_Clean = "yes"` means room needs cleaning (not "is clean"); fixed in both legacy and new dashboards
 - Garbage tsql output artifacts (locale messages, prompt markers) stored as room/customer/checkin rows in HF Ville PG mirror — fixed parser and added cleanup
 
 ## [2.20.0] - 2026-02-19
