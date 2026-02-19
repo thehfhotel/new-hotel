@@ -336,6 +336,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Deploy to HF Ville jump box
         env:
           HFVILLE_CF_SERVICE_TOKEN_ID: ${{ secrets.HFVILLE_CF_SERVICE_TOKEN_ID }}
