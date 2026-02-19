@@ -22,6 +22,9 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    freetds-bin \
+    locales \
+    && sed -i '/en_US.UTF-8/s/^# //' /etc/locale.gen && locale-gen \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -32,5 +35,7 @@ RUN useradd -m -u 1000 appuser
 USER appuser
 
 ENV RUST_LOG=ville_sync=info
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
 
 CMD ["./ville_sync"]

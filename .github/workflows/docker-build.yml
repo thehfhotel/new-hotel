@@ -331,7 +331,7 @@ jobs:
   deploy-hfville:
     runs-on: [self-hosted, linux, deploy]
     needs: [changes, build-ville-sync]
-    if: needs.build-ville-sync.result == 'success'
+    if: always() && (needs.build-ville-sync.result == 'success' || (needs.changes.outputs.hfville == 'true' && needs.changes.outputs.backend != 'true'))
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -347,6 +347,7 @@ jobs:
         env:
           HFVILLE_CF_SERVICE_TOKEN_ID: ${{ secrets.HFVILLE_CF_SERVICE_TOKEN_ID }}
           HFVILLE_CF_SERVICE_TOKEN_SECRET: ${{ secrets.HFVILLE_CF_SERVICE_TOKEN_SECRET }}
+          NEW_IMAGE: ${{ needs.build-ville-sync.result == 'success' }}
         run: |
           set -e
           PROXY_CMD="cloudflared access ssh --hostname hfville.thehfhotel.org --service-token-id $HFVILLE_CF_SERVICE_TOKEN_ID --service-token-secret $HFVILLE_CF_SERVICE_TOKEN_SECRET"
@@ -357,15 +358,25 @@ jobs:
           sshpass -p banana scp -o ProxyCommand="$PROXY_CMD" -o StrictHostKeyChecking=no \
             deploy/hfville/init-db/init-hfville.sql nut@hfville.thehfhotel.org:~/hfville/init-db/
 
-          # Save ville-sync image locally, transfer to jump box, load and start
-          docker pull ghcr.io/thehfhotel/ville-sync:latest
-          docker save ghcr.io/thehfhotel/ville-sync:latest | gzip > /tmp/ville-sync.tar.gz
+          # Transfer new image only if ville-sync was rebuilt
+          if [ "$NEW_IMAGE" = "true" ]; then
+            echo "Transferring new ville-sync image..."
+            docker pull ghcr.io/thehfhotel/ville-sync:latest
+            docker save ghcr.io/thehfhotel/ville-sync:latest | gzip > /tmp/ville-sync.tar.gz
 
-          sshpass -p banana scp -o ProxyCommand="$PROXY_CMD" -o StrictHostKeyChecking=no \
-            /tmp/ville-sync.tar.gz nut@hfville.thehfhotel.org:~/hfville/
+            sshpass -p banana scp -o ProxyCommand="$PROXY_CMD" -o StrictHostKeyChecking=no \
+              /tmp/ville-sync.tar.gz nut@hfville.thehfhotel.org:~/hfville/
 
+            sshpass -p banana ssh -o ProxyCommand="$PROXY_CMD" -o StrictHostKeyChecking=no \
+              nut@hfville.thehfhotel.org "echo banana | sudo -S docker load -i ~/hfville/ville-sync.tar.gz && rm ~/hfville/ville-sync.tar.gz"
+
+            rm -f /tmp/ville-sync.tar.gz
+          else
+            echo "Config-only deploy, skipping image transfer"
+          fi
+
+          # Start/restart services
           sshpass -p banana ssh -o ProxyCommand="$PROXY_CMD" -o StrictHostKeyChecking=no \
-            nut@hfville.thehfhotel.org "echo banana | sudo -S docker load -i ~/hfville/ville-sync.tar.gz && cd ~/hfville && echo banana | sudo -S docker compose up -d && rm ~/hfville/ville-sync.tar.gz"
+            nut@hfville.thehfhotel.org "cd ~/hfville && echo banana | sudo -S docker compose up -d"
 
-          rm -f /tmp/ville-sync.tar.gz
           echo "HF Ville deployment complete!"
