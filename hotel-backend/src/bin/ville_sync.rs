@@ -57,15 +57,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Sync interval: {}s", sync_interval);
 
     // Create SQL Server pool
+    // SQL Server 2005 at HF Ville may not support TLS — disable encryption
     let mut tib_config = tiberius::Config::new();
     tib_config.host(&mssql_server);
     tib_config.port(1433);
     tib_config.database(&mssql_database);
     tib_config.authentication(tiberius::AuthMethod::sql_server(&mssql_user, &mssql_password));
     tib_config.trust_cert();
+    tib_config.encryption(tiberius::EncryptionLevel::Off);
 
     let manager = ConnectionManager::new(tib_config);
-    let mssql_pool = Pool::builder().max_size(3).build(manager).await?;
+    tracing::info!("Connecting to MSSQL...");
+    let mssql_pool = Pool::builder()
+        .max_size(3)
+        .connection_timeout(std::time::Duration::from_secs(30))
+        .build(manager)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to create MSSQL pool: {}", e);
+            e
+        })?;
 
     // Test MSSQL connection
     {
