@@ -345,18 +345,19 @@ jobs:
 
       - name: Deploy to HF Ville jump box
         env:
-          HFVILLE_CF_SERVICE_TOKEN_ID: ${{ secrets.HFVILLE_CF_SERVICE_TOKEN_ID }}
-          HFVILLE_CF_SERVICE_TOKEN_SECRET: ${{ secrets.HFVILLE_CF_SERVICE_TOKEN_SECRET }}
           NEW_IMAGE: ${{ needs.build-ville-sync.result == 'success' }}
         run: |
           set -e
-          PROXY_CMD="cloudflared access ssh --hostname hfville.thehfhotel.org --service-token-id $HFVILLE_CF_SERVICE_TOKEN_ID --service-token-secret $HFVILLE_CF_SERVICE_TOKEN_SECRET"
+          JUMP_BOX=10.10.10.3  # HF Ville jump box via WireGuard
+          SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=15"
+
+          echo "Deploying to HF Ville jump box ($JUMP_BOX) via WireGuard..."
 
           # Copy deployment files to jump box
-          sshpass -p ***REMOVED*** scp -o ProxyCommand="$PROXY_CMD" -o StrictHostKeyChecking=no \
-            deploy/hfville/docker-compose.yml nut@hfville.thehfhotel.org:~/hfville/
-          sshpass -p ***REMOVED*** scp -o ProxyCommand="$PROXY_CMD" -o StrictHostKeyChecking=no \
-            deploy/hfville/init-db/init-hfville.sql nut@hfville.thehfhotel.org:~/hfville/init-db/
+          sshpass -p ***REMOVED*** scp $SSH_OPTS \
+            deploy/hfville/docker-compose.yml nut@$JUMP_BOX:~/hfville/
+          sshpass -p ***REMOVED*** scp $SSH_OPTS \
+            deploy/hfville/init-db/init-hfville.sql nut@$JUMP_BOX:~/hfville/init-db/
 
           # Transfer new image only if ville-sync was rebuilt
           if [ "$NEW_IMAGE" = "true" ]; then
@@ -364,11 +365,11 @@ jobs:
             docker pull ghcr.io/thehfhotel/ville-sync:latest
             docker save ghcr.io/thehfhotel/ville-sync:latest | gzip > /tmp/ville-sync.tar.gz
 
-            sshpass -p ***REMOVED*** scp -o ProxyCommand="$PROXY_CMD" -o StrictHostKeyChecking=no \
-              /tmp/ville-sync.tar.gz nut@hfville.thehfhotel.org:~/hfville/
+            sshpass -p ***REMOVED*** scp $SSH_OPTS \
+              /tmp/ville-sync.tar.gz nut@$JUMP_BOX:~/hfville/
 
-            sshpass -p ***REMOVED*** ssh -o ProxyCommand="$PROXY_CMD" -o StrictHostKeyChecking=no \
-              nut@hfville.thehfhotel.org "echo ***REMOVED*** | sudo -S docker load -i ~/hfville/ville-sync.tar.gz && rm ~/hfville/ville-sync.tar.gz"
+            sshpass -p ***REMOVED*** ssh $SSH_OPTS \
+              nut@$JUMP_BOX "echo ***REMOVED*** | sudo -S docker load -i ~/hfville/ville-sync.tar.gz && rm ~/hfville/ville-sync.tar.gz"
 
             rm -f /tmp/ville-sync.tar.gz
           else
@@ -376,7 +377,7 @@ jobs:
           fi
 
           # Start/restart services
-          sshpass -p ***REMOVED*** ssh -o ProxyCommand="$PROXY_CMD" -o StrictHostKeyChecking=no \
-            nut@hfville.thehfhotel.org "cd ~/hfville && echo ***REMOVED*** | sudo -S docker compose up -d"
+          sshpass -p ***REMOVED*** ssh $SSH_OPTS \
+            nut@$JUMP_BOX "cd ~/hfville && echo ***REMOVED*** | sudo -S docker compose up -d"
 
           echo "HF Ville deployment complete!"
