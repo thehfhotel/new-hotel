@@ -108,12 +108,17 @@ async fn customer_crud_lifecycle() {
 #[tokio::test]
 async fn customer_search_by_name() {
     let pool = common::create_test_pool().await;
-    common::cleanup(&pool).await;
+
+    // Clean up any leftover rows from this specific test
+    sqlx::query("DELETE FROM ht_customers WHERE cust_notes = 'TEST_search_by_name'")
+        .execute(&pool)
+        .await
+        .ok();
 
     // Insert two customers with distinct names
     sqlx::query(
         "INSERT INTO ht_customers (cust_firstname, cust_lastname, cust_notes) \
-         VALUES ('AlphaSearch', 'Bravo', 'TEST_search')",
+         VALUES ('AlphaSearch', 'Bravo', 'TEST_search_by_name')",
     )
     .execute(&pool)
     .await
@@ -121,7 +126,7 @@ async fn customer_search_by_name() {
 
     sqlx::query(
         "INSERT INTO ht_customers (cust_firstname, cust_lastname, cust_notes) \
-         VALUES ('CharlieSearch', 'Delta', 'TEST_search')",
+         VALUES ('CharlieSearch', 'Delta', 'TEST_search_by_name')",
     )
     .execute(&pool)
     .await
@@ -130,7 +135,7 @@ async fn customer_search_by_name() {
     // Search for 'Alpha' -- should find exactly one
     let rows = sqlx::query(
         "SELECT cust_id FROM ht_customers \
-         WHERE cust_firstname LIKE '%AlphaSearch%' AND cust_notes LIKE 'TEST_%'",
+         WHERE cust_firstname LIKE '%AlphaSearch%' AND cust_notes = 'TEST_search_by_name'",
     )
     .fetch_all(&pool)
     .await
@@ -141,7 +146,7 @@ async fn customer_search_by_name() {
     // Search for 'Search' -- should find both
     let rows = sqlx::query(
         "SELECT cust_id FROM ht_customers \
-         WHERE cust_firstname LIKE '%Search%' AND cust_notes LIKE 'TEST_%'",
+         WHERE cust_firstname LIKE '%Search%' AND cust_notes = 'TEST_search_by_name'",
     )
     .fetch_all(&pool)
     .await
@@ -149,5 +154,9 @@ async fn customer_search_by_name() {
 
     assert_eq!(rows.len(), 2, "Search for 'Search' should return 2 rows");
 
-    common::cleanup(&pool).await;
+    // Clean up this test's data
+    sqlx::query("DELETE FROM ht_customers WHERE cust_notes = 'TEST_search_by_name'")
+        .execute(&pool)
+        .await
+        .ok();
 }
