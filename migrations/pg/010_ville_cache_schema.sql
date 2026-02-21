@@ -110,11 +110,6 @@ INSERT INTO ville.sync_status (entity_type) VALUES
     ('checkins')
 ON CONFLICT (entity_type) DO NOTHING;
 
--- Record migration
-INSERT INTO schema_migrations (version, filename, applied_by)
-VALUES ('010', '010_ville_cache_schema.sql', 'migrate-script')
-ON CONFLICT (version) DO NOTHING;
-
 -- DOWN MIGRATION (rollback)
 -- DROP SCHEMA IF EXISTS ville CASCADE;
 -- DELETE FROM schema_migrations WHERE version = '010';
