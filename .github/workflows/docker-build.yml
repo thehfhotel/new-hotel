@@ -337,6 +337,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Log in to Container Registry
+        if: needs.build-ville-sync.result == 'success'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
