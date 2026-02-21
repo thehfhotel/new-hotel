@@ -43,7 +43,7 @@ services:
       - RUST_LOG=ville_sync=info
       # Push to production newdb (ville schema) via WireGuard
       - PUSH_PG_SERVER=10.10.10.4
-      - PUSH_PG_PORT=5439
+      - PUSH_PG_PORT=5441
       - PUSH_PG_NAME=hotelnew
       - PUSH_PG_USER=postgres
       - PUSH_PG_PASSWORD=***REMOVED***
