@@ -22,7 +22,7 @@ services:
       start_period: 10s
     restart: unless-stopped
 
-  # Sync binary: SQL Server 2005 -> PostgreSQL mirror
+  # Sync binary: SQL Server 2005 -> PostgreSQL mirror + push to production
   # Runs every 90 seconds, uses SHA256 hash-based change detection
   # Uses host networking to reach MSSQL on local LAN (192.168.11.51)
   ville-sync:
