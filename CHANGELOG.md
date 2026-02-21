@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.22.0] - 2026-02-21
+
+### Added
+- **Push HF Ville data to local cache for faster API reads** — ville_sync now pushes data to production `ville` schema in newdb
+  - `ville` schema with 4 cached tables (`ht_rooms_legacy`, `ht_bookings_legacy`, `ht_checkins_legacy`, `ht_customers_legacy`) + `sync_status`
+  - ville_sync writes to two targets: local jump box PG (store-and-forward buffer) + production newdb (primary target for API reads)
+  - Backend reads from local `ville` schema instead of crossing WireGuard tunnel (<1ms vs ~50ms latency)
+  - Push is optional/graceful — if production unreachable, local buffer continues; next cycle reconciles via SHA256 hash comparison
+  - Migration `010_ville_cache_schema.sql` creates the ville schema
+  - newdb port exposed on WireGuard interface (`10.10.10.4:5439`) for ville_sync push access
+
+### Changed
+- Backend `ville_pool` now connects to local newdb with `search_path=ville` instead of remote PG via socat
+- Removed VILLE_DB_SERVER/PORT/NAME/USER/PASSWORD env vars from backend (uses newdb credentials)
+- `hfville-pg-forward` socat service on production can now be stopped (no longer needed)
+
 ## [2.21.0] - 2026-02-19
 
 ### Added
