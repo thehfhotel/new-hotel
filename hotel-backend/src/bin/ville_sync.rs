@@ -7,6 +7,10 @@
 //! Uses FreeTDS `tsql` subprocess for MSSQL queries (TDS 7.0 required
 //! by the legacy SQL Server — tiberius only supports TDS 7.2+).
 //!
+//! Writes to two targets:
+//! 1. Local jump box PG (always — store-and-forward buffer)
+//! 2. Production newdb `ville` schema (optional — primary target for API reads)
+//!
 //! Syncs 4 entity types in order:
 //! 1. Customers (View_Customers -> ht_customers_legacy)
 //! 2. Rooms (HT_Rooms -> ht_rooms_legacy)
@@ -218,7 +222,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Create PostgreSQL pool
+    // Create local PostgreSQL pool (jump box buffer)
     let pg_conn_str = format!(
         "postgres://{}:{}@{}:{}/{}",
         pg_user, pg_password, pg_server, pg_port, pg_database
@@ -232,6 +236,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sqlx::query("SELECT 1").execute(&pg_pool).await?;
     tracing::info!("PostgreSQL connection established to {}:{}", pg_server, pg_port);
 
+    // Create push pool for production newdb (optional, graceful degradation)
+    let push_pool: Option<PgPool> = match env::var("PUSH_PG_SERVER") {
+        Ok(push_server) => {
+            let push_port = env::var("PUSH_PG_PORT").unwrap_or_else(|_| "5439".to_string());
+            let push_database = env::var("PUSH_PG_NAME").unwrap_or_else(|_| "hotelnew".to_string());
+            let push_user = env::var("PUSH_PG_USER").unwrap_or_else(|_| "postgres".to_string());
+            let push_password = env::var("PUSH_PG_PASSWORD").unwrap_or_else(|_| "NewHotel@2026!".to_string());
+
+            tracing::info!("[Push] Production target: {}@{}:{}/{}", push_user, push_server, push_port, push_database);
+
+            let push_conn_str = format!(
+                "postgres://{}:{}@{}:{}/{}?options=-csearch_path%3Dville",
+                push_user, push_password, push_server, push_port, push_database
+            );
+            match PgPoolOptions::new()
+                .max_connections(3)
+                .acquire_timeout(std::time::Duration::from_secs(10))
+                .connect(&push_conn_str)
+                .await
+            {
+                Ok(pool) => {
+                    match sqlx::query("SELECT 1").execute(&pool).await {
+                        Ok(_) => {
+                            tracing::info!("[Push] Production push pool connected (ville schema)");
+                            Some(pool)
+                        }
+                        Err(e) => {
+                            tracing::warn!("[Push] Production push pool test failed: {}. Push disabled.", e);
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("[Push] Failed to connect to production: {}. Push disabled.", e);
+                    None
+                }
+            }
+        }
+        Err(_) => {
+            tracing::info!("[Push] PUSH_PG_SERVER not set — push to production disabled");
+            None
+        }
+    };
+
     // Main sync loop
     loop {
         tracing::info!("[Sync] Starting sync cycle...");
@@ -239,21 +287,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(e) = sync_customers(&mssql_config, &pg_pool).await {
             tracing::error!("[Sync] Customer sync failed: {}", e);
             record_error(&pg_pool, "customers", &e.to_string()).await;
+        } else if let Some(ref push) = push_pool {
+            push_customers(&pg_pool, push).await;
         }
 
         if let Err(e) = sync_rooms(&mssql_config, &pg_pool).await {
             tracing::error!("[Sync] Room sync failed: {}", e);
             record_error(&pg_pool, "rooms", &e.to_string()).await;
+        } else if let Some(ref push) = push_pool {
+            push_rooms(&pg_pool, push).await;
         }
 
         if let Err(e) = sync_bookings(&mssql_config, &pg_pool).await {
             tracing::error!("[Sync] Booking sync failed: {}", e);
             record_error(&pg_pool, "bookings", &e.to_string()).await;
+        } else if let Some(ref push) = push_pool {
+            push_bookings(&pg_pool, push).await;
         }
 
         if let Err(e) = sync_checkins(&mssql_config, &pg_pool).await {
             tracing::error!("[Sync] Check-in sync failed: {}", e);
             record_error(&pg_pool, "checkins", &e.to_string()).await;
+        } else if let Some(ref push) = push_pool {
+            push_checkins(&pg_pool, push).await;
         }
 
         tracing::info!("[Sync] Sync cycle complete. Sleeping {}s...", sync_interval);
@@ -329,6 +385,56 @@ async fn record_success(
     .bind(duration_ms)
     .bind(entity)
     .execute(pg_pool)
+    .await;
+}
+
+/// Record push error to production ville.sync_status
+async fn record_push_error(push_pool: &PgPool, entity: &str, error: &str) {
+    let _ = sqlx::query(
+        r#"
+        UPDATE sync_status
+        SET last_error = $1,
+            last_error_at = NOW(),
+            consecutive_failures = consecutive_failures + 1
+        WHERE entity_type = $2
+        "#,
+    )
+    .bind(error)
+    .bind(entity)
+    .execute(push_pool)
+    .await;
+}
+
+/// Record push success to production ville.sync_status
+async fn record_push_success(
+    push_pool: &PgPool,
+    entity: &str,
+    added: i32,
+    updated: i32,
+    unchanged: i32,
+    duration_ms: i32,
+) {
+    let total = added + updated + unchanged;
+    let _ = sqlx::query(
+        r#"
+        UPDATE sync_status
+        SET last_sync_at = NOW(),
+            records_synced = $1,
+            records_added = $2,
+            records_updated = $3,
+            records_unchanged = $4,
+            sync_duration_ms = $5,
+            consecutive_failures = 0
+        WHERE entity_type = $6
+        "#,
+    )
+    .bind(total)
+    .bind(added)
+    .bind(updated)
+    .bind(unchanged)
+    .bind(duration_ms)
+    .bind(entity)
+    .execute(push_pool)
     .await;
 }
 
@@ -806,4 +912,388 @@ async fn sync_checkins(
     );
     record_success(pg_pool, "checkins", added, updated, unchanged, duration_ms).await;
     Ok(())
+}
+
+// =============================================================================
+// Push to Production — reads from local PG, writes to production ville schema
+// Uses same SHA256 hash comparison for idempotent reconciliation.
+// =============================================================================
+
+async fn push_customers(local_pool: &PgPool, push_pool: &PgPool) {
+    let start = Instant::now();
+
+    // Read all customers from local PG
+    let rows = match sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>(
+        "SELECT cust_no, cust_name, cust_type, cust_phone, cust_idcard, cust_address, sync_hash FROM ht_customers_legacy"
+    )
+    .fetch_all(local_pool)
+    .await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("[Push] Failed to read local customers: {}", e);
+            return;
+        }
+    };
+
+    let mut added = 0i32;
+    let mut updated = 0i32;
+    let mut unchanged = 0i32;
+
+    for (cust_no, cust_name, cust_type, cust_phone, cust_idcard, cust_address, sync_hash) in &rows {
+        let hash = sync_hash.as_deref().unwrap_or("");
+
+        let existing: Option<Option<String>> = match sqlx::query_scalar(
+            "SELECT sync_hash FROM ht_customers_legacy WHERE cust_no = $1"
+        )
+        .bind(cust_no)
+        .fetch_optional(push_pool)
+        .await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("[Push] Failed to check customer {}: {}", cust_no, e);
+                record_push_error(push_pool, "customers", &e.to_string()).await;
+                return;
+            }
+        };
+
+        match existing {
+            Some(Some(ref existing_hash)) if existing_hash == hash => {
+                unchanged += 1;
+            }
+            Some(_) => {
+                if let Err(e) = sqlx::query(
+                    "UPDATE ht_customers_legacy SET cust_name = $1, cust_type = $2, cust_phone = $3, cust_idcard = $4, cust_address = $5, sync_hash = $6, synced_at = NOW() WHERE cust_no = $7"
+                )
+                .bind(cust_name)
+                .bind(cust_type)
+                .bind(cust_phone)
+                .bind(cust_idcard)
+                .bind(cust_address)
+                .bind(hash)
+                .bind(cust_no)
+                .execute(push_pool)
+                .await {
+                    tracing::warn!("[Push] Failed to update customer {}: {}", cust_no, e);
+                    record_push_error(push_pool, "customers", &e.to_string()).await;
+                    return;
+                }
+                updated += 1;
+            }
+            None => {
+                if let Err(e) = sqlx::query(
+                    "INSERT INTO ht_customers_legacy (cust_no, cust_name, cust_type, cust_phone, cust_idcard, cust_address, sync_hash) VALUES ($1, $2, $3, $4, $5, $6, $7)"
+                )
+                .bind(cust_no)
+                .bind(cust_name)
+                .bind(cust_type)
+                .bind(cust_phone)
+                .bind(cust_idcard)
+                .bind(cust_address)
+                .bind(hash)
+                .execute(push_pool)
+                .await {
+                    tracing::warn!("[Push] Failed to insert customer {}: {}", cust_no, e);
+                    record_push_error(push_pool, "customers", &e.to_string()).await;
+                    return;
+                }
+                added += 1;
+            }
+        }
+    }
+
+    let duration_ms = start.elapsed().as_millis() as i32;
+    tracing::info!(
+        "[Push] Customers: {} added, {} updated, {} unchanged in {}ms",
+        added, updated, unchanged, duration_ms
+    );
+    record_push_success(push_pool, "customers", added, updated, unchanged, duration_ms).await;
+}
+
+async fn push_rooms(local_pool: &PgPool, push_pool: &PgPool) {
+    let start = Instant::now();
+
+    let rows = match sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<f64>, Option<f64>, Option<f64>, Option<String>, Option<String>, Option<NaiveDateTime>, Option<String>)>(
+        "SELECT room_no, room_type, room_details, room_clean, room_use, room_book, room_manternace, room_price_a::float8, room_price_b::float8, room_price_c::float8, room_group, room_book_name, room_book_time, sync_hash FROM ht_rooms_legacy"
+    )
+    .fetch_all(local_pool)
+    .await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("[Push] Failed to read local rooms: {}", e);
+            return;
+        }
+    };
+
+    let mut added = 0i32;
+    let mut updated = 0i32;
+    let mut unchanged = 0i32;
+
+    for (room_no, room_type, room_details, room_clean, room_use, room_book, room_manternace, room_price_a, room_price_b, room_price_c, room_group, room_book_name, room_book_time, sync_hash) in &rows {
+        let hash = sync_hash.as_deref().unwrap_or("");
+
+        let existing: Option<Option<String>> = match sqlx::query_scalar(
+            "SELECT sync_hash FROM ht_rooms_legacy WHERE room_no = $1"
+        )
+        .bind(room_no)
+        .fetch_optional(push_pool)
+        .await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("[Push] Failed to check room {}: {}", room_no, e);
+                record_push_error(push_pool, "rooms", &e.to_string()).await;
+                return;
+            }
+        };
+
+        match existing {
+            Some(Some(ref existing_hash)) if existing_hash == hash => {
+                unchanged += 1;
+            }
+            Some(_) => {
+                if let Err(e) = sqlx::query(
+                    "UPDATE ht_rooms_legacy SET room_type = $1, room_details = $2, room_clean = $3, room_use = $4, room_book = $5, room_manternace = $6, room_price_a = $7::float8, room_price_b = $8::float8, room_price_c = $9::float8, room_group = $10, room_book_name = $11, room_book_time = $12, sync_hash = $13, synced_at = NOW() WHERE room_no = $14"
+                )
+                .bind(room_type)
+                .bind(room_details)
+                .bind(room_clean)
+                .bind(room_use)
+                .bind(room_book)
+                .bind(room_manternace)
+                .bind(room_price_a)
+                .bind(room_price_b)
+                .bind(room_price_c)
+                .bind(room_group)
+                .bind(room_book_name)
+                .bind(room_book_time)
+                .bind(hash)
+                .bind(room_no)
+                .execute(push_pool)
+                .await {
+                    tracing::warn!("[Push] Failed to update room {}: {}", room_no, e);
+                    record_push_error(push_pool, "rooms", &e.to_string()).await;
+                    return;
+                }
+                updated += 1;
+            }
+            None => {
+                if let Err(e) = sqlx::query(
+                    "INSERT INTO ht_rooms_legacy (room_no, room_type, room_details, room_clean, room_use, room_book, room_manternace, room_price_a, room_price_b, room_price_c, room_group, room_book_name, room_book_time, sync_hash) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::float8, $9::float8, $10::float8, $11, $12, $13, $14)"
+                )
+                .bind(room_no)
+                .bind(room_type)
+                .bind(room_details)
+                .bind(room_clean)
+                .bind(room_use)
+                .bind(room_book)
+                .bind(room_manternace)
+                .bind(room_price_a)
+                .bind(room_price_b)
+                .bind(room_price_c)
+                .bind(room_group)
+                .bind(room_book_name)
+                .bind(room_book_time)
+                .bind(hash)
+                .execute(push_pool)
+                .await {
+                    tracing::warn!("[Push] Failed to insert room {}: {}", room_no, e);
+                    record_push_error(push_pool, "rooms", &e.to_string()).await;
+                    return;
+                }
+                added += 1;
+            }
+        }
+    }
+
+    let duration_ms = start.elapsed().as_millis() as i32;
+    tracing::info!(
+        "[Push] Rooms: {} added, {} updated, {} unchanged in {}ms",
+        added, updated, unchanged, duration_ms
+    );
+    record_push_success(push_pool, "rooms", added, updated, unchanged, duration_ms).await;
+}
+
+async fn push_bookings(local_pool: &PgPool, push_pool: &PgPool) {
+    let start = Instant::now();
+
+    let rows = match sqlx::query_as::<_, (String, Option<NaiveDateTime>, Option<NaiveDateTime>, Option<NaiveDateTime>, Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>)>(
+        "SELECT book_no, book_date, book_date_in, book_date_out, book_cust_name, book_cust_id, book_status, book_room_type, sync_hash FROM ht_bookings_legacy"
+    )
+    .fetch_all(local_pool)
+    .await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("[Push] Failed to read local bookings: {}", e);
+            return;
+        }
+    };
+
+    let mut added = 0i32;
+    let mut updated = 0i32;
+    let mut unchanged = 0i32;
+
+    for (book_no, book_date, book_date_in, book_date_out, book_cust_name, book_cust_id, book_status, book_room_type, sync_hash) in &rows {
+        let hash = sync_hash.as_deref().unwrap_or("");
+        let room_type_key = book_room_type.as_deref().unwrap_or("");
+
+        let existing: Option<Option<String>> = match sqlx::query_scalar(
+            "SELECT sync_hash FROM ht_bookings_legacy WHERE book_no = $1 AND COALESCE(book_room_type, '') = $2"
+        )
+        .bind(book_no)
+        .bind(room_type_key)
+        .fetch_optional(push_pool)
+        .await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("[Push] Failed to check booking {}: {}", book_no, e);
+                record_push_error(push_pool, "bookings", &e.to_string()).await;
+                return;
+            }
+        };
+
+        match existing {
+            Some(Some(ref existing_hash)) if existing_hash == hash => {
+                unchanged += 1;
+            }
+            Some(_) => {
+                if let Err(e) = sqlx::query(
+                    "UPDATE ht_bookings_legacy SET book_date = $1, book_date_in = $2, book_date_out = $3, book_cust_name = $4, book_cust_id = $5, book_status = $6, sync_hash = $7, synced_at = NOW() WHERE book_no = $8 AND COALESCE(book_room_type, '') = $9"
+                )
+                .bind(book_date)
+                .bind(book_date_in)
+                .bind(book_date_out)
+                .bind(book_cust_name)
+                .bind(book_cust_id)
+                .bind(book_status)
+                .bind(hash)
+                .bind(book_no)
+                .bind(room_type_key)
+                .execute(push_pool)
+                .await {
+                    tracing::warn!("[Push] Failed to update booking {}: {}", book_no, e);
+                    record_push_error(push_pool, "bookings", &e.to_string()).await;
+                    return;
+                }
+                updated += 1;
+            }
+            None => {
+                if let Err(e) = sqlx::query(
+                    "INSERT INTO ht_bookings_legacy (book_no, book_date, book_date_in, book_date_out, book_cust_name, book_cust_id, book_status, book_room_type, sync_hash) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+                )
+                .bind(book_no)
+                .bind(book_date)
+                .bind(book_date_in)
+                .bind(book_date_out)
+                .bind(book_cust_name)
+                .bind(book_cust_id)
+                .bind(book_status)
+                .bind(book_room_type)
+                .bind(hash)
+                .execute(push_pool)
+                .await {
+                    tracing::warn!("[Push] Failed to insert booking {}: {}", book_no, e);
+                    record_push_error(push_pool, "bookings", &e.to_string()).await;
+                    return;
+                }
+                added += 1;
+            }
+        }
+    }
+
+    let duration_ms = start.elapsed().as_millis() as i32;
+    tracing::info!(
+        "[Push] Bookings: {} added, {} updated, {} unchanged in {}ms",
+        added, updated, unchanged, duration_ms
+    );
+    record_push_success(push_pool, "bookings", added, updated, unchanged, duration_ms).await;
+}
+
+async fn push_checkins(local_pool: &PgPool, push_pool: &PgPool) {
+    let start = Instant::now();
+
+    let rows = match sqlx::query_as::<_, (String, Option<String>, Option<NaiveDateTime>, Option<NaiveDateTime>, Option<String>, Option<String>, Option<String>, Option<String>)>(
+        "SELECT cin_no, cin_room_no, cin_room_in, cin_room_out, cin_cust_name, cin_cust_no, cin_status, sync_hash FROM ht_checkins_legacy"
+    )
+    .fetch_all(local_pool)
+    .await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("[Push] Failed to read local checkins: {}", e);
+            return;
+        }
+    };
+
+    let mut added = 0i32;
+    let mut updated = 0i32;
+    let mut unchanged = 0i32;
+
+    for (cin_no, cin_room_no, cin_room_in, cin_room_out, cin_cust_name, cin_cust_no, cin_status, sync_hash) in &rows {
+        let hash = sync_hash.as_deref().unwrap_or("");
+
+        let existing: Option<Option<String>> = match sqlx::query_scalar(
+            "SELECT sync_hash FROM ht_checkins_legacy WHERE cin_no = $1"
+        )
+        .bind(cin_no)
+        .fetch_optional(push_pool)
+        .await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("[Push] Failed to check checkin {}: {}", cin_no, e);
+                record_push_error(push_pool, "checkins", &e.to_string()).await;
+                return;
+            }
+        };
+
+        match existing {
+            Some(Some(ref existing_hash)) if existing_hash == hash => {
+                unchanged += 1;
+            }
+            Some(_) => {
+                if let Err(e) = sqlx::query(
+                    "UPDATE ht_checkins_legacy SET cin_room_no = $1, cin_room_in = $2, cin_room_out = $3, cin_cust_name = $4, cin_cust_no = $5, cin_status = $6, sync_hash = $7, synced_at = NOW() WHERE cin_no = $8"
+                )
+                .bind(cin_room_no)
+                .bind(cin_room_in)
+                .bind(cin_room_out)
+                .bind(cin_cust_name)
+                .bind(cin_cust_no)
+                .bind(cin_status)
+                .bind(hash)
+                .bind(cin_no)
+                .execute(push_pool)
+                .await {
+                    tracing::warn!("[Push] Failed to update checkin {}: {}", cin_no, e);
+                    record_push_error(push_pool, "checkins", &e.to_string()).await;
+                    return;
+                }
+                updated += 1;
+            }
+            None => {
+                if let Err(e) = sqlx::query(
+                    "INSERT INTO ht_checkins_legacy (cin_no, cin_room_no, cin_room_in, cin_room_out, cin_cust_name, cin_cust_no, cin_status, sync_hash) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+                )
+                .bind(cin_no)
+                .bind(cin_room_no)
+                .bind(cin_room_in)
+                .bind(cin_room_out)
+                .bind(cin_cust_name)
+                .bind(cin_cust_no)
+                .bind(cin_status)
+                .bind(hash)
+                .execute(push_pool)
+                .await {
+                    tracing::warn!("[Push] Failed to insert checkin {}: {}", cin_no, e);
+                    record_push_error(push_pool, "checkins", &e.to_string()).await;
+                    return;
+                }
+                added += 1;
+            }
+        }
+    }
+
+    let duration_ms = start.elapsed().as_millis() as i32;
+    tracing::info!(
+        "[Push] Check-ins: {} added, {} updated, {} unchanged in {}ms",
+        added, updated, unchanged, duration_ms
+    );
+    record_push_success(push_pool, "checkins", added, updated, unchanged, duration_ms).await;
 }

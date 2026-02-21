@@ -108,6 +108,7 @@ These are automatically applied by `scripts/migrate.sh` during deployment.
 | 000 | `000_baseline.sql` | Baseline marker for initial schema from `init-hotelnew.sql` | v2.14.0 |
 | 008 | `008_legacy_sync_tables.sql` | Legacy sync staging tables + sync_status + source columns | v2.16.0 |
 | 009 | `009_widen_legacy_varchar_columns.sql` | Widen varchar columns in ht_customers_legacy to prevent truncation | v2.17.1 |
+| 010 | `010_ville_cache_schema.sql` | Create `ville` schema with cached HF Ville tables for local reads | v2.22.0 |
 
 ## Tables Owned by This Application
 

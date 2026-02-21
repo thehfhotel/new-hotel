@@ -11,6 +11,8 @@ services:
     volumes:
       - newdb_data:/var/lib/postgresql/data
       - ./init-db:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "10.10.10.4:5439:5439"  # Expose on WireGuard interface for ville_sync push
     networks:
       - hotel-network
     healthcheck:
@@ -59,15 +61,8 @@ services:
       - SLACK_NOTIFICATIONS_ENABLED=true
       - HOST=0.0.0.0
       - PORT=3003
-      # HF Ville database (PostgreSQL mirror via SSH tunnel on host port 5440)
-      - VILLE_DB_SERVER=host.docker.internal
-      - VILLE_DB_PORT=5440
-      - VILLE_DB_NAME=hfville
-      - VILLE_DB_USER=postgres
-      - VILLE_DB_PASSWORD=HfVille@2026!
+      # HF Ville — reads from local newdb ville schema (pushed by ville_sync)
       - VILLE_DB_ENABLED=${VILLE_DB_ENABLED:-true}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     depends_on:
       newdb:
         condition: service_healthy
