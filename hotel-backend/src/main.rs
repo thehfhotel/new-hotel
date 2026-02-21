@@ -93,22 +93,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Try to create HF Ville PostgreSQL pool (optional, graceful degradation)
+    // Create HF Ville pool from local newdb with search_path=ville
+    // (ville_sync pushes data to the ville schema in production newdb)
     let ville_pool = if config.ville_db.enabled {
-        match create_pg_pool(&crate::config::NewDbConfig {
-            server: config.ville_db.server.clone(),
-            port: config.ville_db.port,
-            database: config.ville_db.database.clone(),
-            user: config.ville_db.user.clone(),
-            password: config.ville_db.password.clone(),
-            pool_max: config.ville_db.pool_max,
-        }).await {
+        let ville_conn = format!(
+            "postgres://{}:{}@{}:{}/{}?options=-csearch_path%3Dville",
+            config.new_db.user, config.new_db.password,
+            config.new_db.server, config.new_db.port, config.new_db.database
+        );
+        match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(config.ville_db.pool_max)
+            .connect(&ville_conn)
+            .await
+        {
             Ok(pool) => {
-                tracing::info!("HF Ville PostgreSQL pool created successfully");
+                tracing::info!("HF Ville local pool created (ville schema in newdb)");
                 Some(pool)
             }
             Err(e) => {
-                tracing::warn!("Failed to create HF Ville pool (ville routes will be unavailable): {}", e);
+                tracing::warn!("Failed to create HF Ville local pool: {}", e);
                 None
             }
         }
