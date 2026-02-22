@@ -30,6 +30,7 @@ import {
   Legend,
 } from 'recharts'
 import { RevenueDataPoint, OccupancyResponse, RoomTypeRevenue, GroupBy } from '@/types/reports'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 
 // Format date for API (YYYY-MM-DD)
 function formatDateForApi(date: Date): string {
@@ -75,6 +76,8 @@ function getDefaultDateRange(): [Date, Date] {
 }
 
 export default function ReportsPage() {
+  const branchFetch = useBranchFetch()
+
   // Date range state
   const [dateRange, setDateRange] = useState<[Date | null, Date | null]>(getDefaultDateRange)
   const [startDate, endDate] = dateRange
@@ -104,9 +107,9 @@ export default function ReportsPage() {
 
       // Fetch all data in parallel
       const [revenueRes, occupancyRes, roomTypeRes] = await Promise.all([
-        fetch(`/api/new/reports/revenue?from=${fromDate}&to=${toDate}&groupBy=${groupBy}`),
-        fetch(`/api/new/reports/occupancy?from=${fromDate}&to=${toDate}`),
-        fetch(`/api/new/reports/revenue-by-room-type?from=${fromDate}&to=${toDate}`),
+        branchFetch(`/api/new/reports/revenue?from=${fromDate}&to=${toDate}&groupBy=${groupBy}`),
+        branchFetch(`/api/new/reports/occupancy?from=${fromDate}&to=${toDate}`),
+        branchFetch(`/api/new/reports/revenue-by-room-type?from=${fromDate}&to=${toDate}`),
       ])
 
       const [revenueJson, occupancyJson, roomTypeJson] = await Promise.all([
@@ -131,7 +134,7 @@ export default function ReportsPage() {
     } finally {
       setLoading(false)
     }
-  }, [startDate, endDate, groupBy])
+  }, [startDate, endDate, groupBy, branchFetch])
 
   useEffect(() => {
     fetchReportData()

@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useEffect, useCallback } from 'react'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 import {
   RefreshCw,
   CheckCircle,
@@ -105,13 +106,14 @@ function formatDuration(ms: number): string {
 }
 
 export default function SyncStatusPage() {
+  const branchFetch = useBranchFetch()
   const [data, setData] = useState<SyncStatusData | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
   const fetchStatus = useCallback(async () => {
     try {
-      const res = await fetch('/api/new/sync/status')
+      const res = await branchFetch('/api/new/sync/status')
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const json = await res.json()
       setData(json)
@@ -121,7 +123,7 @@ export default function SyncStatusPage() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [branchFetch])
 
   useEffect(() => {
     fetchStatus()

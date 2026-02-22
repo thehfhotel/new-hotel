@@ -16,6 +16,7 @@ import {
 } from 'lucide-react'
 import { RoomInventory, INVENTORY_CATEGORIES } from '@/types/inventory'
 import RoomInventoryChecklist from '@/components/inventory/RoomInventoryChecklist'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 
 interface Room {
   id: number
@@ -28,6 +29,7 @@ interface Room {
 }
 
 export default function RoomInventoryPage() {
+  const branchFetch = useBranchFetch()
   const [rooms, setRooms] = useState<Room[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -63,7 +65,7 @@ export default function RoomInventoryPage() {
         params.append('filter', filterStatus)
       }
 
-      const response = await fetch(`/api/new/inventory/rooms?${params}`)
+      const response = await branchFetch(`/api/new/inventory/rooms?${params}`)
       if (!response.ok) {
         throw new Error('Failed to fetch rooms')
       }
@@ -79,7 +81,7 @@ export default function RoomInventoryPage() {
     } finally {
       setLoading(false)
     }
-  }, [debouncedSearch, filterStatus])
+  }, [debouncedSearch, filterStatus, branchFetch])
 
   useEffect(() => {
     fetchRooms()

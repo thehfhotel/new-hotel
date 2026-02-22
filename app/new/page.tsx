@@ -8,6 +8,7 @@ import {
   LogIn,
 } from 'lucide-react'
 import { useBranch, BRANCH_LABELS } from '@/contexts/BranchContext'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 
 interface Stats {
   totalRooms: number
@@ -86,6 +87,7 @@ function getRoomStatus(room: ApiRoom, isCheckoutToday: boolean): RoomStatus {
 
 export default function NewDashboard() {
   const { branch } = useBranch()
+  const branchFetch = useBranchFetch()
   const [stats, setStats] = useState<Stats>({
     totalRooms: 0, occupiedRooms: 0, availableRooms: 0, bookedRooms: 0,
     checkoutRooms: 0, totalCustomers: 0, activeBookings: 0, todayCheckIns: 0, todayCheckOuts: 0,
@@ -98,12 +100,11 @@ export default function NewDashboard() {
 
   const fetchData = useCallback(async () => {
     try {
-      const bp = `branch=${branch}`
       const [statsRes, roomsRes, checkoutsRes, checkInsRes] = await Promise.all([
-        fetch(`/api/stats?${bp}`),
-        fetch(`/api/rooms?${bp}`),
-        fetch(`/api/rooms/checkouts-today?${bp}`),
-        fetch(`/api/checkins?limit=10&${bp}`),
+        branchFetch('/api/stats'),
+        branchFetch('/api/rooms'),
+        branchFetch('/api/rooms/checkouts-today'),
+        branchFetch('/api/checkins?limit=10'),
       ])
 
       if (statsRes.ok) {
@@ -152,7 +153,7 @@ export default function NewDashboard() {
     } finally {
       setLoading(false)
     }
-  }, [branch])
+  }, [branchFetch])
 
   useEffect(() => {
     setLoading(true)

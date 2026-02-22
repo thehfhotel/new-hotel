@@ -15,6 +15,7 @@ import RoomCleaningCard, {
   HousekeepingRoom,
   HousekeepingStatus,
 } from '@/components/housekeeping/RoomCleaningCard'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 
 // API response type
 interface RoomsResponse {
@@ -71,6 +72,7 @@ const columns = [
 ]
 
 export default function HousekeepingPage() {
+  const branchFetch = useBranchFetch()
   const [rooms, setRooms] = useState<HousekeepingRoom[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -93,7 +95,7 @@ export default function HousekeepingPage() {
   // Fetch rooms data
   const fetchRooms = useCallback(async () => {
     try {
-      const response = await fetch('/api/new/rooms?limit=200')
+      const response = await branchFetch('/api/new/rooms?limit=200')
       if (!response.ok) {
         throw new Error('ไม่สามารถดึงข้อมูลห้องได้')
       }
@@ -124,7 +126,7 @@ export default function HousekeepingPage() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [branchFetch])
 
   // Initial fetch and auto-refresh every 30 seconds
   useEffect(() => {
@@ -147,7 +149,7 @@ export default function HousekeepingPage() {
       // Map housekeeping status to API status
       const apiStatus = newStatus === 'dirty' ? 'available' : newStatus // 'dirty' maps to available with isClean=false
 
-      const response = await fetch(`/api/new/rooms/${roomId}/status`, {
+      const response = await branchFetch(`/api/new/rooms/${roomId}/status`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status: apiStatus }),

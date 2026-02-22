@@ -19,6 +19,7 @@ import {
 } from 'lucide-react'
 import RateForm, { RateFormData } from '@/components/forms/RateForm'
 import RateCalendar, { Rate } from '@/components/ui/RateCalendar'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 
 interface RoomType {
   id: number
@@ -65,6 +66,8 @@ function formatDateBE(dateStr: string | null): string {
 }
 
 export default function RatesPage() {
+  const branchFetch = useBranchFetch()
+
   // State
   const [rates, setRates] = useState<RateRecord[]>([])
   const [roomTypes, setRoomTypes] = useState<RoomType[]>([])
@@ -99,7 +102,7 @@ export default function RatesPage() {
   // Fetch room types
   const fetchRoomTypes = useCallback(async () => {
     try {
-      const response = await fetch('/api/new/room-types')
+      const response = await branchFetch('/api/new/room-types')
       if (!response.ok) throw new Error('Failed to fetch room types')
       const data = await response.json()
       if (data.success) {
@@ -108,7 +111,7 @@ export default function RatesPage() {
     } catch (err) {
       console.error('Error fetching room types:', err)
     }
-  }, [])
+  }, [branchFetch])
 
   // Fetch rates
   const fetchRates = useCallback(async () => {
@@ -120,7 +123,7 @@ export default function RatesPage() {
       if (roomTypeFilter) params.append('roomTypeId', roomTypeFilter.toString())
       if (activeOnlyFilter) params.append('activeOnly', 'true')
 
-      const response = await fetch(`/api/new/rates?${params}`)
+      const response = await branchFetch(`/api/new/rates?${params}`)
       if (!response.ok) throw new Error('Failed to fetch rates')
       const data = await response.json()
       if (data.success) {
@@ -133,7 +136,7 @@ export default function RatesPage() {
     } finally {
       setLoading(false)
     }
-  }, [debouncedSearch, roomTypeFilter, activeOnlyFilter])
+  }, [branchFetch, debouncedSearch, roomTypeFilter, activeOnlyFilter])
 
   useEffect(() => {
     fetchRoomTypes()
@@ -170,7 +173,7 @@ export default function RatesPage() {
     const endpoint = data.id ? `/api/new/rates/${data.id}` : '/api/new/rates'
     const method = data.id ? 'PUT' : 'POST'
 
-    const response = await fetch(endpoint, {
+    const response = await branchFetch(endpoint, {
       method,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -198,7 +201,7 @@ export default function RatesPage() {
   const handleDeleteRate = async (id: number) => {
     setDeleting(true)
     try {
-      const response = await fetch(`/api/new/rates/${id}`, {
+      const response = await branchFetch(`/api/new/rates/${id}`, {
         method: 'DELETE',
       })
 
