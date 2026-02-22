@@ -13,6 +13,7 @@ import {
   Filter,
   RefreshCw,
 } from 'lucide-react'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 import {
   InventoryItem,
   InventoryItemFormData,
@@ -29,6 +30,7 @@ type SortField = 'itemCode' | 'itemName' | 'currentStock'
 type SortOrder = 'asc' | 'desc'
 
 export default function InventoryItemsPage() {
+  const branchFetch = useBranchFetch()
   const searchParams = useSearchParams()
   const initialFilter = searchParams.get('filter')
   const initialMode = searchParams.get('mode')
@@ -83,7 +85,7 @@ export default function InventoryItemsPage() {
         params.append('lowStock', 'true')
       }
 
-      const response = await fetch(`/api/new/inventory/items?${params}`)
+      const response = await branchFetch(`/api/new/inventory/items?${params}`)
       if (!response.ok) {
         throw new Error('Failed to fetch items')
       }
@@ -99,7 +101,7 @@ export default function InventoryItemsPage() {
     } finally {
       setLoading(false)
     }
-  }, [debouncedSearch, categoryFilter, showLowStockOnly, sortField, sortOrder])
+  }, [branchFetch, debouncedSearch, categoryFilter, showLowStockOnly, sortField, sortOrder])
 
   useEffect(() => {
     fetchItems()
@@ -152,7 +154,7 @@ export default function InventoryItemsPage() {
       : '/api/new/inventory/items'
     const method = data.id ? 'PUT' : 'POST'
 
-    const response = await fetch(endpoint, {
+    const response = await branchFetch(endpoint, {
       method,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -179,7 +181,7 @@ export default function InventoryItemsPage() {
 
   // Handle delete item
   const handleDeleteItem = async (id: number) => {
-    const response = await fetch(`/api/new/inventory/items/${id}`, {
+    const response = await branchFetch(`/api/new/inventory/items/${id}`, {
       method: 'DELETE',
     })
 

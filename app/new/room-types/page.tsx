@@ -17,6 +17,7 @@ import {
   XCircle,
 } from 'lucide-react'
 import RoomTypeForm, { RoomTypeFormData } from '@/components/forms/RoomTypeForm'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 
 interface RoomType {
   id: number
@@ -37,6 +38,7 @@ type SortField = 'typeCode' | 'typeName'
 type SortOrder = 'asc' | 'desc'
 
 export default function RoomTypesPage() {
+  const branchFetch = useBranchFetch()
   const [roomTypes, setRoomTypes] = useState<RoomType[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -73,7 +75,7 @@ export default function RoomTypesPage() {
         params.append('search', debouncedSearch)
       }
 
-      const response = await fetch(`/api/new/room-types?${params}`)
+      const response = await branchFetch(`/api/new/room-types?${params}`)
       if (!response.ok) {
         throw new Error('Failed to fetch room types')
       }
@@ -89,7 +91,7 @@ export default function RoomTypesPage() {
     } finally {
       setLoading(false)
     }
-  }, [debouncedSearch, sortField, sortOrder])
+  }, [branchFetch, debouncedSearch, sortField, sortOrder])
 
   useEffect(() => {
     fetchRoomTypes()
@@ -137,7 +139,7 @@ export default function RoomTypesPage() {
       : '/api/new/room-types'
     const method = data.id ? 'PUT' : 'POST'
 
-    const response = await fetch(endpoint, {
+    const response = await branchFetch(endpoint, {
       method,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -165,7 +167,7 @@ export default function RoomTypesPage() {
 
   // Handle delete room type
   const handleDeleteRoomType = async (id: number) => {
-    const response = await fetch(`/api/new/room-types/${id}`, {
+    const response = await branchFetch(`/api/new/room-types/${id}`, {
       method: 'DELETE',
     })
 

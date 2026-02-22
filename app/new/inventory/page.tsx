@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from 'react'
 import Link from 'next/link'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 import {
   Package,
   AlertTriangle,
@@ -33,6 +34,7 @@ interface DashboardStats {
 }
 
 export default function InventoryDashboardPage() {
+  const branchFetch = useBranchFetch()
   const [stats, setStats] = useState<DashboardStats>({
     totalItems: 0,
     lowStockCount: 0,
@@ -53,9 +55,9 @@ export default function InventoryDashboardPage() {
     try {
       // Fetch all data in parallel
       const [statsRes, lowStockRes, transactionsRes] = await Promise.all([
-        fetch('/api/new/inventory/stats'),
-        fetch('/api/new/inventory/items?lowStock=true&limit=5'),
-        fetch('/api/new/inventory/transactions?limit=10'),
+        branchFetch('/api/new/inventory/stats'),
+        branchFetch('/api/new/inventory/items?lowStock=true&limit=5'),
+        branchFetch('/api/new/inventory/transactions?limit=10'),
       ])
 
       const [statsData, lowStockData, transactionsData] = await Promise.all([
@@ -78,7 +80,7 @@ export default function InventoryDashboardPage() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [branchFetch])
 
   useEffect(() => {
     fetchDashboardData()

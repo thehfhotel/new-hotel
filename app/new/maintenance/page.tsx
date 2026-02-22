@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useEffect, useCallback } from 'react'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 import {
   RefreshCw,
   Filter,
@@ -94,6 +95,7 @@ export default function MaintenancePage() {
   const [isModalOpen, setIsModalOpen] = useState(false)
   const [editingRequest, setEditingRequest] = useState<MaintenanceRequest | null>(null)
 
+  const branchFetch = useBranchFetch()
   const [lastRefresh, setLastRefresh] = useState<Date>(new Date())
 
   // Fetch categories and rooms on mount
@@ -101,8 +103,8 @@ export default function MaintenancePage() {
     const fetchMetadata = async () => {
       try {
         const [catRes, roomsRes] = await Promise.all([
-          fetch('/api/new/maintenance/categories'),
-          fetch('/api/new/rooms?limit=200'),
+          branchFetch('/api/new/maintenance/categories'),
+          branchFetch('/api/new/rooms?limit=200'),
         ])
 
         if (catRes.ok) {
@@ -124,7 +126,7 @@ export default function MaintenancePage() {
     }
 
     fetchMetadata()
-  }, [])
+  }, [branchFetch])
 
   // Fetch requests
   const fetchRequests = useCallback(async () => {
@@ -135,7 +137,7 @@ export default function MaintenancePage() {
       if (categoryFilter) params.set('categoryId', categoryFilter.toString())
       if (priorityFilter) params.set('priority', priorityFilter.toString())
 
-      const response = await fetch(`/api/new/maintenance/requests?${params.toString()}`)
+      const response = await branchFetch(`/api/new/maintenance/requests?${params.toString()}`)
       if (!response.ok) {
         throw new Error('ไม่สามารถดึงข้อมูลได้')
       }
@@ -153,7 +155,7 @@ export default function MaintenancePage() {
     } finally {
       setLoading(false)
     }
-  }, [roomFilter, categoryFilter, priorityFilter])
+  }, [branchFetch, roomFilter, categoryFilter, priorityFilter])
 
   // Initial fetch and auto-refresh every 30 seconds
   useEffect(() => {
@@ -169,7 +171,7 @@ export default function MaintenancePage() {
   // Handle status change
   const handleStatusChange = async (requestId: number, newStatus: MaintenanceStatus) => {
     try {
-      const response = await fetch(`/api/new/maintenance/requests/${requestId}/status`, {
+      const response = await branchFetch(`/api/new/maintenance/requests/${requestId}/status`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status: newStatus }),

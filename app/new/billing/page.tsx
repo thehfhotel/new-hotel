@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from 'react'
 import Link from 'next/link'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 import {
   Receipt,
   Search,
@@ -36,6 +37,7 @@ interface Pagination {
 }
 
 export default function BillingPage() {
+  const branchFetch = useBranchFetch()
   const [checkIns, setCheckIns] = useState<CheckIn[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -72,7 +74,7 @@ export default function BillingPage() {
         params.set('endDate', endDate)
       }
 
-      const response = await fetch(`/api/new/checkins?${params.toString()}`)
+      const response = await branchFetch(`/api/new/checkins?${params.toString()}`)
       const data = await response.json()
 
       if (data.success) {
@@ -98,7 +100,7 @@ export default function BillingPage() {
     } finally {
       setLoading(false)
     }
-  }, [pagination.page, pagination.limit, statusFilter, startDate, endDate, searchTerm])
+  }, [pagination.page, pagination.limit, statusFilter, startDate, endDate, searchTerm, branchFetch])
 
   useEffect(() => {
     fetchCheckIns()
