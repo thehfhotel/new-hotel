@@ -21,8 +21,10 @@ import {
   TransactionType,
   TRANSACTION_TYPES,
 } from '@/types/inventory'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 
 export default function TransactionHistoryPage() {
+  const branchFetch = useBranchFetch()
   const [transactions, setTransactions] = useState<InventoryTransaction[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -66,7 +68,7 @@ export default function TransactionHistoryPage() {
         params.append('dateTo', dateTo)
       }
 
-      const response = await fetch(`/api/new/inventory/transactions?${params}`)
+      const response = await branchFetch(`/api/new/inventory/transactions?${params}`)
       if (!response.ok) {
         throw new Error('Failed to fetch transactions')
       }
@@ -82,7 +84,7 @@ export default function TransactionHistoryPage() {
     } finally {
       setLoading(false)
     }
-  }, [debouncedSearch, typeFilter, dateFrom, dateTo])
+  }, [branchFetch, debouncedSearch, typeFilter, dateFrom, dateTo])
 
   useEffect(() => {
     fetchTransactions()

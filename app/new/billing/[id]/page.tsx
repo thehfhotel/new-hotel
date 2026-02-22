@@ -1,6 +1,7 @@
 'use client'
 
-import { useState, useEffect, use } from 'react'
+import { useState, useEffect, use, useCallback } from 'react'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 import Link from 'next/link'
 import { ArrowLeft, Loader2, AlertCircle, Receipt } from 'lucide-react'
 import InvoiceTemplate from '@/components/documents/InvoiceTemplate'
@@ -62,60 +63,61 @@ export default function InvoiceDetailPage({
   params: Promise<{ id: string }>
 }) {
   const resolvedParams = use(params)
+  const branchFetch = useBranchFetch()
   const [invoiceData, setInvoiceData] = useState<InvoiceData | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
-  useEffect(() => {
-    const fetchInvoice = async () => {
-      setLoading(true)
-      setError(null)
+  const fetchInvoice = useCallback(async () => {
+    setLoading(true)
+    setError(null)
 
-      try {
-        const response = await fetch(`/api/new/checkins/${resolvedParams.id}/invoice`)
-        const data: InvoiceApiResponse = await response.json()
+    try {
+      const response = await branchFetch(`/api/new/checkins/${resolvedParams.id}/invoice`)
+      const data: InvoiceApiResponse = await response.json()
 
-        if (data.success && data.invoice) {
-          // Transform API response to InvoiceData format
-          const invoice = data.invoice
-          const transformedData: InvoiceData = {
-            invoiceNumber: invoice.cinNo,
-            checkInId: invoice.checkinId,
-            guestName: invoice.guest.fullName,
-            guestIdCard: invoice.guest.idCard || invoice.guest.passport || '',
-            guestContact: invoice.guest.phone || invoice.guest.email || '',
-            checkInDate: invoice.checkInTime || '',
-            checkOutDate: invoice.checkOutTime || invoice.expectedCheckout || '',
-            rooms: [
-              {
-                roomNumber: invoice.room.roomNo,
-                roomType: invoice.room.roomType || 'Standard',
-                ratePerNight: invoice.rates.ratePerNight,
-                nights: invoice.rates.nights,
-                subtotal: invoice.rates.subtotal,
-              },
-            ],
-            subtotal: invoice.rates.subtotal,
-            discount: 0,
-            vatAmount: 0,
-            grandTotal: invoice.totalAmount || invoice.rates.subtotal,
-            paymentMethod: invoice.paymentStatus || 'pending',
-            paidAmount: invoice.totalAmount || 0,
-            createdAt: invoice.createdAt || new Date().toISOString(),
-          }
-          setInvoiceData(transformedData)
-        } else {
-          setError(data.error || 'ไม่สามารถโหลดข้อมูลใบแจ้งหนี้ได้')
+      if (data.success && data.invoice) {
+        // Transform API response to InvoiceData format
+        const invoice = data.invoice
+        const transformedData: InvoiceData = {
+          invoiceNumber: invoice.cinNo,
+          checkInId: invoice.checkinId,
+          guestName: invoice.guest.fullName,
+          guestIdCard: invoice.guest.idCard || invoice.guest.passport || '',
+          guestContact: invoice.guest.phone || invoice.guest.email || '',
+          checkInDate: invoice.checkInTime || '',
+          checkOutDate: invoice.checkOutTime || invoice.expectedCheckout || '',
+          rooms: [
+            {
+              roomNumber: invoice.room.roomNo,
+              roomType: invoice.room.roomType || 'Standard',
+              ratePerNight: invoice.rates.ratePerNight,
+              nights: invoice.rates.nights,
+              subtotal: invoice.rates.subtotal,
+            },
+          ],
+          subtotal: invoice.rates.subtotal,
+          discount: 0,
+          vatAmount: 0,
+          grandTotal: invoice.totalAmount || invoice.rates.subtotal,
+          paymentMethod: invoice.paymentStatus || 'pending',
+          paidAmount: invoice.totalAmount || 0,
+          createdAt: invoice.createdAt || new Date().toISOString(),
         }
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'เกิดข้อผิดพลาดในการโหลดข้อมูล')
-      } finally {
-        setLoading(false)
+        setInvoiceData(transformedData)
+      } else {
+        setError(data.error || 'ไม่สามารถโหลดข้อมูลใบแจ้งหนี้ได้')
       }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'เกิดข้อผิดพลาดในการโหลดข้อมูล')
+    } finally {
+      setLoading(false)
     }
+  }, [resolvedParams.id, branchFetch])
 
+  useEffect(() => {
     fetchInvoice()
-  }, [resolvedParams.id])
+  }, [fetchInvoice])
 
   if (loading) {
     return (
