@@ -258,7 +258,7 @@ export default function DataTable<T extends object>({
             ) : (
               sortedData.map((item, index) => (
                 <tr
-                  key={index}
+                  key={(item as Record<string, unknown>)['id'] as string ?? (item as Record<string, unknown>)['bookNo'] as string ?? index}
                   onClick={() => onRowClick?.(item)}
                   className={`
                     transition-colors

@@ -14,7 +14,7 @@ export function useBranchFetch() {
     (input: string | URL | Request, init?: RequestInit) => {
       if (typeof input === 'string' && input.startsWith('/api/')) {
         const separator = input.includes('?') ? '&' : '?'
-        return fetch(`${input}${separator}branch=${branch}`, init)
+        return fetch(`${input}${separator}branch=${encodeURIComponent(branch)}`, init)
       }
       return fetch(input, init)
     },

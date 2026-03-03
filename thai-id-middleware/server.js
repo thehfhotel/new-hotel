@@ -9,7 +9,7 @@ let server = null
 
 // Enable CORS for all origins (localhost web apps)
 app.use(cors({
-  origin: '*',
+  origin: ['http://localhost:3003', 'http://localhost:3000'],
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }))

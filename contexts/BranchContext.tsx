@@ -42,7 +42,7 @@ export function BranchProvider({ children }: { children: ReactNode }) {
           setVilleAvailable(true)
         }
       })
-      .catch(() => {})
+      .catch((err) => console.error('Failed to check ville availability:', err))
   }, [])
 
   const setBranch = (b: Branch) => {
