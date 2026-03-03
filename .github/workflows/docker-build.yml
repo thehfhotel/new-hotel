@@ -274,6 +274,13 @@ jobs:
       - name: Deploy
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+          DB_SERVER: ${{ secrets.DB_SERVER }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
         run: |
           set -e
           DEPLOY_DIR=/home/nut/new-hotel-production
@@ -290,6 +297,19 @@ jobs:
           chmod +x $DEPLOY_DIR/scripts/migrate.sh
 
           cd $DEPLOY_DIR
+
+          # Write .env file from GitHub Secrets
+          printf '%s\n' \
+            "DB_SERVER=${DB_SERVER}" \
+            "DB_NAME=${DB_NAME}" \
+            "DB_USER=${DB_USER}" \
+            "DB_PASSWORD=${DB_PASSWORD}" \
+            "POSTGRES_DB=${POSTGRES_DB}" \
+            "POSTGRES_USER=${POSTGRES_USER}" \
+            "POSTGRES_PASSWORD=${POSTGRES_PASSWORD}" \
+            "SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}" \
+            > .env
+          chmod 600 .env
 
           # Pull latest images and start all services
           docker compose pull
