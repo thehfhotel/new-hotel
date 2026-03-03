@@ -348,6 +348,17 @@ jobs:
           echo "Deployment complete!"
           docker compose ps
 
+          # Verify backend is running (not crash-looping)
+          sleep 5
+          BACKEND_STATUS=$(docker inspect --format='{{.State.Status}}' new-hotel-production-backend-1 2>/dev/null || echo "not_found")
+          if [ "$BACKEND_STATUS" != "running" ]; then
+            echo "WARNING: Backend container is not running (status: $BACKEND_STATUS)"
+            echo "--- Backend logs (last 50 lines) ---"
+            docker logs new-hotel-production-backend-1 --tail 50
+            exit 1
+          fi
+          echo "Backend is running."
+
   deploy-hfville:
     runs-on: [self-hosted, linux, deploy]
     needs: [changes, build-ville-sync]
