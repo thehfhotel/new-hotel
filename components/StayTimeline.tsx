@@ -93,11 +93,11 @@ export default function StayTimeline({
     }
   }, [selectedDate, viewMode])
 
-  const today = useMemo(() => {
+  const today = (() => {
     const t = new Date()
     t.setHours(0, 0, 0, 0)
     return t
-  }, [])
+  })()
 
   // Calculate data for each day
   const dayData: DayData[] = useMemo(() => {
@@ -191,7 +191,7 @@ export default function StayTimeline({
     <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
       {/* Header */}
       <div className="flex items-center justify-between p-4 border-b border-gray-200 bg-gray-100">
-        <button onClick={() => navigate('prev')} className="p-2 hover:bg-gray-100 rounded-full">
+        <button onClick={() => navigate('prev')} className="p-2 hover:bg-gray-100 rounded-full" aria-label="ก่อนหน้า">
           <ChevronLeft className="w-5 h-5" />
         </button>
         <div className="text-center">
@@ -200,7 +200,7 @@ export default function StayTimeline({
             เช็คอิน {stats.totalCheckins} · จอง {stats.totalBookings} · เฉลี่ย {stats.avgOccupancy} ห้อง/วัน
           </p>
         </div>
-        <button onClick={() => navigate('next')} className="p-2 hover:bg-gray-100 rounded-full">
+        <button onClick={() => navigate('next')} className="p-2 hover:bg-gray-100 rounded-full" aria-label="ถัดไป">
           <ChevronRight className="w-5 h-5" />
         </button>
       </div>

@@ -45,3 +45,4 @@ backups/*.sql
 
 # TypeScript
 *.tsbuildinfo
+.polish/

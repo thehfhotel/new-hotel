@@ -261,10 +261,10 @@ export default function GuestRegistryModal({
             {/* TM.30 Notice */}
             <div className="mb-4 p-3 bg-amber-500/5 border border-amber-900/30 rounded-lg">
               <div className="flex items-start gap-2">
-                <FileText className="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" />
-                <div className="text-sm text-amber-300">
+                <FileText className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
+                <div className="text-sm text-amber-700">
                   <p className="font-medium">สำหรับการแจ้ง ต.ม.30</p>
-                  <p className="text-amber-400">กรุณาลงทะเบียนผู้เข้าพักทุกคนที่พักในห้อง รวมถึงข้อมูลบัตรประชาชน/พาสปอร์ต</p>
+                  <p className="text-amber-600">กรุณาลงทะเบียนผู้เข้าพักทุกคนที่พักในห้อง รวมถึงข้อมูลบัตรประชาชน/พาสปอร์ต</p>
                 </div>
               </div>
             </div>

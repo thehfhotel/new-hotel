@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import Link from 'next/link'
 import {
   X,
@@ -108,14 +108,9 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
   const [newNote, setNewNote] = useState('')
   const [addingNote, setAddingNote] = useState(false)
   const [deletingNoteId, setDeletingNoteId] = useState<number | null>(null)
+  const [noteError, setNoteError] = useState<string | null>(null)
 
-  useEffect(() => {
-    if (bookNo) {
-      fetchBooking()
-    }
-  }, [bookNo])
-
-  async function fetchBooking() {
+  const fetchBooking = useCallback(async () => {
     if (!bookNo) return
 
     setLoading(true)
@@ -135,12 +130,19 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
     } finally {
       setLoading(false)
     }
-  }
+  }, [bookNo])
+
+  useEffect(() => {
+    if (bookNo) {
+      fetchBooking()
+    }
+  }, [bookNo, fetchBooking])
 
   async function handleAddNote() {
     if (!bookNo || !newNote.trim()) return
 
     setAddingNote(true)
+    setNoteError(null)
 
     try {
       const res = await fetch(`/api/bookings/${encodeURIComponent(bookNo)}/notes`, {
@@ -162,7 +164,7 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
       } : null)
       setNewNote('')
     } catch (err) {
-      alert(err instanceof Error ? err.message : 'Failed to add note')
+      setNoteError(err instanceof Error ? err.message : 'Failed to add note')
     } finally {
       setAddingNote(false)
     }
@@ -172,6 +174,7 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
     if (!bookNo) return
 
     setDeletingNoteId(noteId)
+    setNoteError(null)
 
     try {
       const res = await fetch(`/api/bookings/${encodeURIComponent(bookNo)}/notes?noteId=${noteId}`, {
@@ -190,7 +193,7 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
         notes: prev.notes.filter(n => n.id !== noteId),
       } : null)
     } catch (err) {
-      alert(err instanceof Error ? err.message : 'Failed to delete note')
+      setNoteError(err instanceof Error ? err.message : 'Failed to delete note')
     } finally {
       setDeletingNoteId(null)
     }
@@ -337,6 +340,12 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
                   บันทึก ({booking.notes.length})
                 </h3>
 
+                {noteError && (
+                  <div className="mb-3 p-2 bg-red-50 border border-red-200 rounded-lg text-red-600 text-sm">
+                    {noteError}
+                  </div>
+                )}
+
                 {/* Add Note Form */}
                 <div className="mb-4">
                   <textarea
@@ -376,7 +385,8 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
                           <button
                             onClick={() => handleDeleteNote(note.id)}
                             disabled={deletingNoteId === note.id}
-                            className="p-1 text-gray-500 hover:text-red-600 transition-colors"
+                            className="p-2 text-gray-500 hover:text-red-600 transition-colors"
+                            aria-label="ลบบันทึก"
                           >
                             {deletingNoteId === note.id ? (
                               <Loader2 className="h-4 w-4 animate-spin" />
@@ -410,7 +420,13 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
       />
 
       {/* Drawer */}
-      <div className="fixed right-0 top-0 h-full w-full sm:w-96 bg-white shadow-xl border-l border-gray-200 overflow-y-auto z-50">
+      <div
+        role="dialog"
+        aria-modal="true"
+        tabIndex={-1}
+        onKeyDown={(e) => { if (e.key === 'Escape') onClose() }}
+        className="fixed right-0 top-0 h-full w-full sm:w-96 bg-white shadow-xl border-l border-gray-200 overflow-y-auto z-50"
+      >
         <div className="p-4">
           {/* Header */}
           <div className="flex items-center justify-between mb-4 pb-4 border-b border-gray-200">
@@ -545,6 +561,12 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
                   บันทึก ({booking.notes.length})
                 </h3>
 
+                {noteError && (
+                  <div className="mb-3 p-2 bg-red-50 border border-red-200 rounded-lg text-red-600 text-sm">
+                    {noteError}
+                  </div>
+                )}
+
                 {/* Add Note Form */}
                 <div className="mb-4">
                   <textarea
@@ -584,7 +606,8 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
                           <button
                             onClick={() => handleDeleteNote(note.id)}
                             disabled={deletingNoteId === note.id}
-                            className="p-1 text-gray-500 hover:text-red-600 transition-colors"
+                            className="p-2 text-gray-500 hover:text-red-600 transition-colors"
+                            aria-label="ลบบันทึก"
                           >
                             {deletingNoteId === note.id ? (
                               <Loader2 className="h-4 w-4 animate-spin" />

@@ -447,6 +447,7 @@ export default function BookingsPage() {
                       onClick={() => goToPage(currentPage - 1)}
                       disabled={currentPage === 1}
                       className="relative inline-flex items-center px-2 py-2 rounded-l-md border border-gray-300 bg-white text-sm font-medium text-gray-500 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                      aria-label="หน้าก่อนหน้า"
                     >
                       <ChevronLeft className="h-5 w-5" />
                     </button>
@@ -483,6 +484,7 @@ export default function BookingsPage() {
                       onClick={() => goToPage(currentPage + 1)}
                       disabled={currentPage === totalPages}
                       className="relative inline-flex items-center px-2 py-2 rounded-r-md border border-gray-300 bg-white text-sm font-medium text-gray-500 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                      aria-label="หน้าถัดไป"
                     >
                       <ChevronRight className="h-5 w-5" />
                     </button>

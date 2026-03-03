@@ -45,9 +45,12 @@ export function ModeProvider({ children }: ModeProviderProps) {
     isNew: mode === 'new',
   }
 
-  // Prevent hydration mismatch by not rendering until initialized
   if (!isInitialized) {
-    return null
+    return (
+      <ModeContext.Provider value={value}>
+        {children}
+      </ModeContext.Provider>
+    )
   }
 
   return (

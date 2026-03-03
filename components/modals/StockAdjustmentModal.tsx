@@ -328,10 +328,10 @@ export default function StockAdjustmentModal({
                   className={`flex items-center justify-center gap-2 px-3 py-2 rounded-lg border transition-colors ${
                     adjustmentType === type.value
                       ? type.value === 'add'
-                        ? 'border-red-500 bg-red-500/10 text-red-600'
+                        ? 'border-green-500 bg-green-500/10 text-green-600'
                         : type.value === 'remove'
                         ? 'border-red-500 bg-red-500/10 text-red-600'
-                        : 'border-red-500 bg-red-500/10 text-red-600'
+                        : 'border-blue-500 bg-blue-500/10 text-blue-600'
                       : 'border-gray-300 text-gray-500 hover:bg-gray-100'
                   }`}
                 >

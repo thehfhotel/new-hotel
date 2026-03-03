@@ -73,8 +73,11 @@ export default function Dashboard() {
   const [checkIns, setCheckIns] = useState<CheckIn[]>([])
   const [occupancyData, setOccupancyData] = useState<OccupancyData[]>([])
   const [loading, setLoading] = useState(true)
+  const [fetchError, setFetchError] = useState<string | null>(null)
 
   const fetchData = useCallback(async () => {
+    setFetchError(null)
+
     try {
       // Fetch stats
       const statsRes = await branchFetch('/api/stats')
@@ -93,6 +96,7 @@ export default function Dashboard() {
       }
     } catch (error) {
       console.error('Error fetching stats:', error)
+      setFetchError('ไม่สามารถโหลดข้อมูลสถิติได้')
     }
 
     try {
@@ -127,6 +131,7 @@ export default function Dashboard() {
       }
     } catch (error) {
       console.error('Error fetching rooms:', error)
+      setFetchError('ไม่สามารถโหลดข้อมูลห้องพักได้')
     }
 
     try {
@@ -149,6 +154,7 @@ export default function Dashboard() {
       }
     } catch (error) {
       console.error('Error fetching check-ins:', error)
+      setFetchError('ไม่สามารถโหลดข้อมูลเช็คอินได้')
     }
 
     try {
@@ -167,6 +173,7 @@ export default function Dashboard() {
       }
     } catch (error) {
       console.error('Error fetching occupancy data:', error)
+      setFetchError('ไม่สามารถโหลดข้อมูลการเข้าพักได้')
     }
 
     setLoading(false)
@@ -189,6 +196,12 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-6">
+      {fetchError && (
+        <div className="flex items-center gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-600">
+          <span>{fetchError}</span>
+        </div>
+      )}
+
       {/* Page Title */}
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold text-gray-800">หน้าหลัก</h1>
