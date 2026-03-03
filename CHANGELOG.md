@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.22.1] - 2026-03-04
+
+### Fixed
+- **Charts**: Fix missing `yAxisId="right"` YAxis in LineChart causing runtime error; guard empty data domain
+- **BookingDetailDrawer**: Fix stale closure in useEffect, add dialog role/aria-modal/Escape handler, replace alert() with inline errors, increase delete button touch target
+- **PaymentModal**: Fix useEffect silently resetting user-typed payment amount on re-render
+- **XSS**: Escape all server data in inventory transactions print view (document.write)
+- **Timezone**: Use UTC methods in formatDateBE, toBuddhistYear, customers page dates per CLAUDE.md convention
+- **StayTimeline**: Guard dayData.reduce against empty array crash; add aria-labels to nav buttons
+- **StockAdjustmentModal**: Differentiate add/remove/set button colors (green/red/blue)
+- **DataTable**: Use unique data ID as React key instead of array index
+- **Dashboard**: Accumulate fetch errors instead of overwriting; show error banner
+- **Customers page**: Add error banner for fetch failures; fix date-fns timezone issue
+- **Bookings page**: Add aria-labels to pagination buttons
+- **BookingForm**: Rename shadowing BookingFormData to BookingFormState; fix calculateNights date parsing
+
+### Security
+- **CORS**: Restrict thai-id-middleware from `origin: '*'` to localhost app origins
+- **Headers**: Add X-Content-Type-Options, X-Frame-Options, Referrer-Policy; disable X-Powered-By
+- **Credentials**: Remove hardcoded passwords from docker-compose.yml; require .env file
+- **escapeHtml**: Add single-quote escaping for defense-in-depth
+- **URL encoding**: Add encodeURIComponent to branch query parameter
+
+### Changed
+- BranchContext and ModeContext now wrap children in Provider during initialization (no flash of empty)
+- Exclude playwright.config.ts from TypeScript compilation
+- Update .env.example with placeholder passwords and POSTGRES container vars
+- GuestRegistryModal TM.30 notice uses higher-contrast text colors
+
 ## [2.22.0] - 2026-02-21
 
 ### Added
