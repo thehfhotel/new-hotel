@@ -15,9 +15,9 @@ set -euo pipefail
 
 # Configuration
 DB_CONTAINER="${DB_CONTAINER:-new-hotel-db}"
-DB_USER="${DB_USER:-postgres}"
-DB_PORT="${DB_PORT:-5439}"
-DB_NAME="${DB_NAME:-hotelnew}"
+DB_USER="${POSTGRES_USER:-postgres}"
+DB_PORT="${PGPORT:-5439}"
+DB_NAME="${POSTGRES_DB:-hotelnew}"
 MIGRATIONS_DIR="${MIGRATIONS_DIR:-migrations/pg}"
 BACKUP_DIR="${BACKUP_DIR:-backups}"
 MAX_BACKUPS="${MAX_BACKUPS:-10}"
