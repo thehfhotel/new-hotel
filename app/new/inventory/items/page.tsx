@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, Suspense } from 'react'
 import { useSearchParams } from 'next/navigation'
 import {
   Package,
@@ -30,6 +30,14 @@ type SortField = 'itemCode' | 'itemName' | 'currentStock'
 type SortOrder = 'asc' | 'desc'
 
 export default function InventoryItemsPage() {
+  return (
+    <Suspense fallback={<div className="flex items-center justify-center min-h-[50vh]"><Loader2 className="w-8 h-8 animate-spin text-red-600" /></div>}>
+      <InventoryItemsContent />
+    </Suspense>
+  )
+}
+
+function InventoryItemsContent() {
   const branchFetch = useBranchFetch()
   const searchParams = useSearchParams()
   const initialFilter = searchParams.get('filter')
