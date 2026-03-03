@@ -23,6 +23,11 @@ import {
 } from '@/types/inventory'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 
+function escapeHtml(str: string | null | undefined): string {
+  if (!str) return ''
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+}
+
 export default function TransactionHistoryPage() {
   const branchFetch = useBranchFetch()
   const [transactions, setTransactions] = useState<InventoryTransaction[]>([])
@@ -190,12 +195,12 @@ export default function TransactionHistoryPage() {
                 return `
                   <tr>
                     <td>${formatDate(tx.createdAt)}</td>
-                    <td class="type-${tx.transactionType}">${typeInfo.label}</td>
-                    <td>${tx.itemName} (${tx.itemCode})</td>
-                    <td class="text-right type-${tx.transactionType}">${tx.transactionType === 'IN' ? '+' : tx.transactionType === 'OUT' ? '-' : ''}${tx.quantity}</td>
-                    <td>${tx.roomNumber || '-'}</td>
-                    <td>${tx.notes || '-'}</td>
-                    <td>${tx.createdBy || '-'}</td>
+                    <td class="type-${escapeHtml(tx.transactionType)}">${escapeHtml(typeInfo.label)}</td>
+                    <td>${escapeHtml(tx.itemName)} (${escapeHtml(tx.itemCode)})</td>
+                    <td class="text-right type-${escapeHtml(tx.transactionType)}">${tx.transactionType === 'IN' ? '+' : tx.transactionType === 'OUT' ? '-' : ''}${tx.quantity}</td>
+                    <td>${escapeHtml(tx.roomNumber) || '-'}</td>
+                    <td>${escapeHtml(tx.notes) || '-'}</td>
+                    <td>${escapeHtml(tx.createdBy) || '-'}</td>
                   </tr>
                 `
               }).join('')}

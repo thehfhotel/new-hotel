@@ -17,7 +17,7 @@ import {
 } from 'lucide-react'
 import DatePicker from 'react-datepicker'
 import 'react-datepicker/dist/react-datepicker.css'
-import BookingForm, { BookingFormData } from '@/components/forms/BookingForm'
+import BookingForm, { BookingFormState } from '@/components/forms/BookingForm'
 import { RoomOption } from '@/components/pickers/RoomPicker'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 
@@ -134,7 +134,7 @@ export default function NewBookingsPage() {
   // Form modal
   const [showForm, setShowForm] = useState(false)
   const [formMode, setFormMode] = useState<'create' | 'edit'>('create')
-  const [editingBooking, setEditingBooking] = useState<BookingFormData | null>(null)
+  const [editingBooking, setEditingBooking] = useState<BookingFormState | null>(null)
   const [loadingDetail, setLoadingDetail] = useState(false)
 
   // Debounce search
@@ -255,7 +255,7 @@ export default function NewBookingsPage() {
   }
 
   // Handle save booking
-  const handleSaveBooking = async (data: BookingFormData) => {
+  const handleSaveBooking = async (data: BookingFormState) => {
     const endpoint = data.id
       ? `/api/new/bookings/${data.id}`
       : '/api/new/bookings'

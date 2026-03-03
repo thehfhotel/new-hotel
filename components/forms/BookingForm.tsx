@@ -18,7 +18,7 @@ import CustomerPicker, { CustomerOption } from '@/components/pickers/CustomerPic
 import CustomerForm, { CustomerFormData } from '@/components/forms/CustomerForm'
 import RoomPicker, { RoomOption } from '@/components/pickers/RoomPicker'
 
-export interface BookingFormData {
+export interface BookingFormState {
   id?: number
   bookNo?: string
   customerId: number
@@ -37,9 +37,9 @@ export interface BookingFormData {
 interface BookingFormProps {
   isOpen: boolean
   onClose: () => void
-  onSave: (data: BookingFormData) => Promise<void>
+  onSave: (data: BookingFormState) => Promise<void>
   onCancel?: (id: number) => Promise<void>
-  initialData?: BookingFormData | null
+  initialData?: BookingFormState | null
   mode: 'create' | 'edit'
 }
 
@@ -84,7 +84,7 @@ function calculateNights(checkIn: string, checkOut: string): number {
   return Math.max(0, Math.ceil(diff / (1000 * 60 * 60 * 24)))
 }
 
-const emptyFormData: BookingFormData = {
+const emptyFormData: BookingFormState = {
   customerId: 0,
   checkIn: '',
   checkOut: '',
@@ -105,7 +105,7 @@ export default function BookingForm({
   initialData,
   mode,
 }: BookingFormProps) {
-  const [formData, setFormData] = useState<BookingFormData>(emptyFormData)
+  const [formData, setFormData] = useState<BookingFormState>(emptyFormData)
   const [selectedCustomer, setSelectedCustomer] = useState<CustomerOption | null>(null)
   const [selectedRooms, setSelectedRooms] = useState<RoomOption[]>([])
   const [saving, setSaving] = useState(false)

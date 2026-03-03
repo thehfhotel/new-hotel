@@ -9,7 +9,7 @@ import type { Booking, CheckIn } from '@/components/Calendar'
 import type { Room, RoomStatus } from '@/components/RoomGrid'
 import type { CustomerOption } from '@/components/pickers/CustomerPicker'
 import type { RoomOption } from '@/components/pickers/RoomPicker'
-import type { BookingFormData } from '@/components/forms/BookingForm'
+import type { BookingFormState } from '@/components/forms/BookingForm'
 import type {
   InvoiceData,
   InvoiceRoom,
@@ -117,9 +117,9 @@ export const createMockBooking = (overrides?: Partial<Booking>): Booking => ({
   ...overrides,
 })
 
-export const createMockBookingFormData = (
-  overrides?: Partial<BookingFormData>
-): BookingFormData => ({
+export const createMockBookingFormState = (
+  overrides?: Partial<BookingFormState>
+): BookingFormState => ({
   customerId: 1,
   customerName: 'ทดสอบ ลูกค้า',
   checkIn: '2026-01-15',

@@ -16,6 +16,7 @@ import {
   TrendingUp,
   Clock,
   Star,
+  AlertCircle,
 } from 'lucide-react'
 import DataTable, { Column, PaginationInfo } from '@/components/DataTable'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
@@ -55,6 +56,7 @@ export default function CustomersPage() {
   const branchFetch = useBranchFetch()
   const [customers, setCustomers] = useState<Customer[]>([])
   const [loading, setLoading] = useState(true)
+  const [fetchError, setFetchError] = useState<string | null>(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [debouncedSearch, setDebouncedSearch] = useState('')
   const [pagination, setPagination] = useState<PaginationInfo>({
@@ -87,6 +89,7 @@ export default function CustomersPage() {
   // Fetch customers
   const fetchCustomers = useCallback(async () => {
     setLoading(true)
+    setFetchError(null)
     try {
       const params = new URLSearchParams({
         page: pagination.currentPage.toString(),
@@ -115,6 +118,7 @@ export default function CustomersPage() {
       }
     } catch (error) {
       console.error('Error fetching customers:', error)
+      setFetchError('เกิดข้อผิดพลาดในการโหลดข้อมูลลูกค้า')
     } finally {
       setLoading(false)
     }
@@ -306,6 +310,13 @@ export default function CustomersPage() {
           </p>
         )}
       </div>
+
+      {fetchError && (
+        <div className="flex items-center gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-600">
+          <AlertCircle className="w-5 h-5 flex-shrink-0" />
+          <span>{fetchError}</span>
+        </div>
+      )}
 
       {/* Data Table */}
       <DataTable

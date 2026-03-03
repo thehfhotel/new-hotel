@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { X, Loader2, CreditCard, FileText, DollarSign, Banknote, QrCode } from 'lucide-react'
 
 interface PaymentModalProps {
@@ -47,15 +47,17 @@ export default function PaymentModal({
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  // Reset form and pre-fill amount when modal opens
+  const prevIsOpenRef = useRef(false)
+
   useEffect(() => {
-    if (isOpen) {
+    if (isOpen && !prevIsOpenRef.current) {
       setAmount(balance > 0 ? balance.toString() : '')
       setPaymentMethod('cash')
       setReference('')
       setNotes('')
       setError(null)
     }
+    prevIsOpenRef.current = isOpen
   }, [isOpen, balance])
 
   const handleClose = () => {

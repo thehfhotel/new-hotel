@@ -182,7 +182,7 @@ export function RevenueChart({
   chartType = 'bar',
   title = 'รายได้',
 }: RevenueChartProps) {
-  const maxRevenue = Math.max(...data.map(d => d.revenue), 0)
+  const maxRevenue = data.length > 0 ? Math.max(...data.map(d => d.revenue)) : 1000
 
   return (
     <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
@@ -207,6 +207,13 @@ export function RevenueChart({
                 tickLine={{ stroke: '#e5e7eb' }}
                 domain={[0, Math.ceil(maxRevenue * 1.2)]}
                 tickFormatter={(value) => formatCurrency(value)}
+              />
+              <YAxis
+                yAxisId="right"
+                orientation="right"
+                tick={{ fill: '#6b7280', fontSize: 12 }}
+                tickLine={{ stroke: '#e5e7eb' }}
+                tickFormatter={(value) => `${value}`}
               />
               <Tooltip content={<RevenueTooltip />} />
               <Legend
