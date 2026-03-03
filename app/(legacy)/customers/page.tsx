@@ -254,7 +254,7 @@ export default function CustomersPage() {
       render: (item) => (
         <div className="flex items-center gap-2">
           <Calendar className="w-4 h-4 text-gray-400" />
-          <span>{item.lastVisit ? format(new Date(item.lastVisit), 'dd/MM/yyyy') : '-'}</span>
+          <span>{item.lastVisit ? new Date(item.lastVisit).toLocaleDateString('th-TH', { day: '2-digit', month: '2-digit', year: 'numeric', timeZone: 'UTC' }) : '-'}</span>
         </div>
       ),
     },
@@ -443,7 +443,7 @@ export default function CustomersPage() {
                       </div>
                       <p className="text-lg font-bold text-purple-800">
                         {customerStats?.firstVisit
-                          ? format(new Date(customerStats.firstVisit), 'dd/MM/yyyy')
+                          ? new Date(customerStats.firstVisit).toLocaleDateString('th-TH', { day: '2-digit', month: '2-digit', year: 'numeric', timeZone: 'UTC' })
                           : '-'}
                       </p>
                     </div>
@@ -456,7 +456,7 @@ export default function CustomersPage() {
                       </div>
                       <p className="text-lg font-bold text-indigo-800">
                         {customerStats?.lastVisit
-                          ? format(new Date(customerStats.lastVisit), 'dd/MM/yyyy')
+                          ? new Date(customerStats.lastVisit).toLocaleDateString('th-TH', { day: '2-digit', month: '2-digit', year: 'numeric', timeZone: 'UTC' })
                           : '-'}
                       </p>
                     </div>
@@ -525,8 +525,8 @@ export default function CustomersPage() {
                             </div>
                             <div className="flex items-center gap-1 text-sm text-gray-600">
                               <Calendar className="w-4 h-4" />
-                              {format(new Date(booking.checkInDate), 'dd/MM/yyyy')} -{' '}
-                              {format(new Date(booking.checkOutDate), 'dd/MM/yyyy')}
+                              {new Date(booking.checkInDate).toLocaleDateString('th-TH', { day: '2-digit', month: '2-digit', year: 'numeric', timeZone: 'UTC' })} -{' '}
+                              {new Date(booking.checkOutDate).toLocaleDateString('th-TH', { day: '2-digit', month: '2-digit', year: 'numeric', timeZone: 'UTC' })}
                             </div>
                             {booking.totalAmount > 0 && (
                               <p className="text-sm text-gray-600 mt-1">
