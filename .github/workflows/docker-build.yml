@@ -298,18 +298,27 @@ jobs:
 
           cd $DEPLOY_DIR
 
-          # Write .env file from GitHub Secrets
-          printf '%s\n' \
-            "DB_SERVER=${DB_SERVER}" \
-            "DB_NAME=${DB_NAME}" \
-            "DB_USER=${DB_USER}" \
-            "DB_PASSWORD=${DB_PASSWORD}" \
-            "POSTGRES_DB=${POSTGRES_DB}" \
-            "POSTGRES_USER=${POSTGRES_USER}" \
-            "POSTGRES_PASSWORD=${POSTGRES_PASSWORD}" \
-            "SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}" \
-            > .env
+          # Write .env file from GitHub Secrets (values single-quoted for special chars)
+          {
+            echo "DB_SERVER='${DB_SERVER}'"
+            echo "DB_NAME='${DB_NAME}'"
+            echo "DB_USER='${DB_USER}'"
+            echo "DB_PASSWORD='${DB_PASSWORD}'"
+            echo "POSTGRES_DB='${POSTGRES_DB}'"
+            echo "POSTGRES_USER='${POSTGRES_USER}'"
+            echo "POSTGRES_PASSWORD='${POSTGRES_PASSWORD}'"
+            echo "SLACK_WEBHOOK_URL='${SLACK_WEBHOOK_URL}'"
+          } > .env
           chmod 600 .env
+
+          # Debug: verify .env file structure (lengths only, no values)
+          echo "--- .env file check ---"
+          while IFS= read -r line; do
+            key="${line%%=*}"
+            val="${line#*=}"
+            echo "  $key = (${#val} chars)"
+          done < .env
+          echo "---"
 
           # Pull latest images and start all services
           docker compose pull
