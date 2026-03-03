@@ -25,7 +25,7 @@ import { useBranchFetch } from '@/lib/use-branch-fetch'
 
 function escapeHtml(str: string | null | undefined): string {
   if (!str) return ''
-  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;')
 }
 
 export default function TransactionHistoryPage() {
@@ -194,7 +194,7 @@ export default function TransactionHistoryPage() {
                 const typeInfo = getTransactionTypeInfo(tx.transactionType)
                 return `
                   <tr>
-                    <td>${formatDate(tx.createdAt)}</td>
+                    <td>${escapeHtml(formatDate(tx.createdAt))}</td>
                     <td class="type-${escapeHtml(tx.transactionType)}">${escapeHtml(typeInfo.label)}</td>
                     <td>${escapeHtml(tx.itemName)} (${escapeHtml(tx.itemCode)})</td>
                     <td class="text-right type-${escapeHtml(tx.transactionType)}">${tx.transactionType === 'IN' ? '+' : tx.transactionType === 'OUT' ? '-' : ''}${tx.quantity}</td>

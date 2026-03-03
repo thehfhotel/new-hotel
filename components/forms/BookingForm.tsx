@@ -61,9 +61,9 @@ const statusOptions = [
 
 // Convert Gregorian year to Buddhist Era
 function toBuddhistYear(date: Date): string {
-  const year = date.getFullYear() + 543
-  const month = String(date.getMonth() + 1).padStart(2, '0')
-  const day = String(date.getDate()).padStart(2, '0')
+  const year = date.getUTCFullYear() + 543
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0')
+  const day = String(date.getUTCDate()).padStart(2, '0')
   return `${day}/${month}/${year}`
 }
 
@@ -78,8 +78,8 @@ function formatDateForApi(date: Date): string {
 // Calculate nights between two dates
 function calculateNights(checkIn: string, checkOut: string): number {
   if (!checkIn || !checkOut) return 0
-  const start = new Date(checkIn)
-  const end = new Date(checkOut)
+  const start = new Date(checkIn + 'T00:00')
+  const end = new Date(checkOut + 'T00:00')
   const diff = end.getTime() - start.getTime()
   return Math.max(0, Math.ceil(diff / (1000 * 60 * 60 * 24)))
 }

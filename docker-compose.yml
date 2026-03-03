@@ -4,9 +4,9 @@ services:
     image: postgres:17-alpine
     container_name: new-hotel-db
     environment:
-      - POSTGRES_DB=${POSTGRES_DB:-hotelnew}
-      - POSTGRES_USER=${POSTGRES_USER:-postgres}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-***REMOVED***}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - PGPORT=${PGPORT:-5439}
     volumes:
       - newdb_data:/var/lib/postgresql/data
@@ -28,10 +28,10 @@ services:
     ports:
       - "3003:3003"
     environment:
-      - DB_SERVER=${DB_SERVER:-192.168.100.222}
-      - DB_NAME=${DB_NAME:-db}
-      - DB_USER=${DB_USER:-sa}
-      - DB_PASSWORD=${DB_PASSWORD:-***REMOVED***}
+      - DB_SERVER=${DB_SERVER}
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
       - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
       - SLACK_NOTIFICATIONS_ENABLED=false
       - BACKEND_URL=http://backend:3003
@@ -45,16 +45,16 @@ services:
     image: ghcr.io/thehfhotel/new-hotel-backend:latest
     environment:
       # Legacy database (external server - shared with legacy application)
-      - DB_SERVER=${DB_SERVER:-192.168.100.222}
-      - DB_NAME=${DB_NAME:-db}
-      - DB_USER=${DB_USER:-sa}
-      - DB_PASSWORD=${DB_PASSWORD:-***REMOVED***}
+      - DB_SERVER=${DB_SERVER}
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
       # New database (PostgreSQL Docker container - owned by this application)
       - NEW_DB_SERVER=newdb
       - NEW_DB_PORT=${PGPORT:-5439}
-      - NEW_DB_NAME=${POSTGRES_DB:-hotelnew}
-      - NEW_DB_USER=${POSTGRES_USER:-postgres}
-      - NEW_DB_PASSWORD=${POSTGRES_PASSWORD:-***REMOVED***}
+      - NEW_DB_NAME=${POSTGRES_DB}
+      - NEW_DB_USER=${POSTGRES_USER}
+      - NEW_DB_PASSWORD=${POSTGRES_PASSWORD}
       # System mode: 'legacy' or 'new' (controls which database is primary)
       - SYSTEM_MODE=new
       - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}

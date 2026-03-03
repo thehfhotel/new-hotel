@@ -159,11 +159,11 @@ export default function StayTimeline({
     const avgOccupancy = dayData.length > 0
       ? (totalRooms / dayData.length).toFixed(1)
       : '0'
-    const peakDay = dayData.reduce((max, d) => {
+    const peakDay = dayData.length > 0 ? dayData.reduce((max, d) => {
       const dTotal = d.checkedIn + d.booked
       const maxTotal = max.checkedIn + max.booked
       return dTotal > maxTotal ? d : max
-    }, dayData[0])
+    }, dayData[0]) : null
     return { totalCheckins, totalBookings, avgOccupancy, peakDay }
   }, [stays, dayData])
 
