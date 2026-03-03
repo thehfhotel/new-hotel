@@ -76,7 +76,7 @@ export default function Dashboard() {
   const [fetchError, setFetchError] = useState<string | null>(null)
 
   const fetchData = useCallback(async () => {
-    setFetchError(null)
+    const errors: string[] = []
 
     try {
       // Fetch stats
@@ -96,7 +96,7 @@ export default function Dashboard() {
       }
     } catch (error) {
       console.error('Error fetching stats:', error)
-      setFetchError('ไม่สามารถโหลดข้อมูลสถิติได้')
+      errors.push('สถิติ')
     }
 
     try {
@@ -131,7 +131,7 @@ export default function Dashboard() {
       }
     } catch (error) {
       console.error('Error fetching rooms:', error)
-      setFetchError('ไม่สามารถโหลดข้อมูลห้องพักได้')
+      errors.push('ห้องพัก')
     }
 
     try {
@@ -154,7 +154,7 @@ export default function Dashboard() {
       }
     } catch (error) {
       console.error('Error fetching check-ins:', error)
-      setFetchError('ไม่สามารถโหลดข้อมูลเช็คอินได้')
+      errors.push('เช็คอิน')
     }
 
     try {
@@ -173,9 +173,10 @@ export default function Dashboard() {
       }
     } catch (error) {
       console.error('Error fetching occupancy data:', error)
-      setFetchError('ไม่สามารถโหลดข้อมูลการเข้าพักได้')
+      errors.push('การเข้าพัก')
     }
 
+    setFetchError(errors.length > 0 ? `ไม่สามารถโหลดข้อมูล: ${errors.join(', ')}` : null)
     setLoading(false)
   }, [branchFetch])
 

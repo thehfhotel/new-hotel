@@ -53,7 +53,11 @@ export function BranchProvider({ children }: { children: ReactNode }) {
   }
 
   if (!mounted) {
-    return <>{children}</>
+    return (
+      <BranchContext.Provider value={{ branch, setBranch, villeAvailable }}>
+        {children}
+      </BranchContext.Provider>
+    )
   }
 
   return (
