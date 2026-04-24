@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::error::{ApiError, ApiResult};
+use crate::outbox::{EventBus, OutboxRepository};
 
 /// System operating mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -53,6 +54,12 @@ pub struct AppState {
     pub ville_pool: Option<crate::db::PgPool>,
     /// Current system operating mode
     pub mode: Arc<std::sync::RwLock<SystemMode>>,
+    /// Outbox publisher for legacy MSSQL writebacks (Phase 3b — `architecture.md` §3.6c).
+    /// Stateless; wrapped in `Arc` for cheap clone across handlers.
+    pub outbox: Arc<OutboxRepository>,
+    /// Domain-event bus publisher (Phase 3b — `architecture.md` §3.6c).
+    /// Stateless; wrapped in `Arc` for cheap clone across handlers.
+    pub events: Arc<EventBus>,
 }
 
 impl AppState {
@@ -63,6 +70,8 @@ impl AppState {
             new_pool,
             ville_pool: None,
             mode: Arc::new(std::sync::RwLock::new(SystemMode::Legacy)),
+            outbox: Arc::new(OutboxRepository::new()),
+            events: Arc::new(EventBus::new()),
         }
     }
 
@@ -73,6 +82,8 @@ impl AppState {
             new_pool,
             ville_pool: None,
             mode: Arc::new(std::sync::RwLock::new(mode)),
+            outbox: Arc::new(OutboxRepository::new()),
+            events: Arc::new(EventBus::new()),
         }
     }
 

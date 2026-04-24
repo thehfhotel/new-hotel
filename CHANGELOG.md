@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.25.0] - 2026-04-25
+
+### Added
+- **Backend outbox + event-bus runtime** (`hotel-backend/src/outbox/`) — Phase 3b
+  per `docs/architecture.md` §3.6c. New modules:
+  - `queue.rs` — `OutboxRepository::enqueue()` writes a `writeback_jobs` row
+    inside the caller's `&mut Transaction<Postgres>`, atomic with the canonical
+    write. Returns the BIGSERIAL job id; relies on the
+    `writeback_jobs.idempotency_key` UNIQUE constraint for retry-safe dedup.
+  - `bus.rs` — `EventBus::publish()` performs two SQL ops in the caller's TX:
+    `INSERT INTO event_log` (durable history) + `SELECT pg_notify('domain_events', $1)`
+    (best-effort fan-out, deferred to COMMIT by PG). Returns the new event_log id.
+  - `idempotency.rs` — `generate_idempotency_key()` derives a deterministic
+    UUID v5 from `(intent_name, aggregate_id)` under a frozen project namespace
+    `WRITEBACK_NAMESPACE = d86fe320-5424-58cd-8c00-50ea7d998b36` (= `Uuid::new_v5(NAMESPACE_OID, "new-hotel.writeback")`).
+- **`WritebackIntent::aggregate_id()` / `intent_name()`** helpers — extract the
+  aggregate uuid + the persisted `intent` discriminant string from any variant.
+- **`DomainEvent::source()`** + **`EventSource::our_app() / kind_str() / correlation()`**
+  helpers — service-layer ergonomics for constructing and persisting events.
+- **`hotel-backend/src/lib.rs`** — exposes the existing `config / db / domain /
+  outbox / routes / scheduler / …` modules so integration tests under `tests/`
+  can `use hotel_backend::…`. The binary (`main.rs`) now `use`s the lib instead
+  of re-declaring `mod`s, so source files compile exactly once.
+- **`AppState.outbox: Arc<OutboxRepository>`** + **`AppState.events: Arc<EventBus>`**
+  — wired into the route state so service-layer callers (Wave 4) can grab them
+  via the standard `State<AppState>` extractor.
+- **Integration tests** (`hotel-backend/tests/test_outbox.rs`, 4 cases):
+  `test_enqueue_inserts_row`, `test_idempotency_key_dedup`,
+  `test_publish_inserts_event_log_and_notifies` (subscribes via `PgListener`
+  before publish, asserts the JSON `NOTIFY` payload arrives within 2 s of
+  COMMIT), `test_rollback_emits_no_event_and_no_notify` (defends the atomicity
+  contract). Plus 5 pure unit tests in `outbox::idempotency::tests`.
+
+### Changed
+- **`hotel-backend/Cargo.toml`** — `uuid` feature `v5` enabled; `sqlx` feature
+  `uuid` enabled (needed to bind/decode `Uuid` against PG `uuid` columns).
+- **`hotel-backend/src/main.rs`** — switched from inline `mod foo;` to `use
+  hotel_backend::{...}` so binary + tests share a single compilation of the
+  source tree.
+
 ## [2.24.0] - 2026-04-25
 
 ### Removed

@@ -131,6 +131,45 @@ pub struct CreateCheckInPayload {
     pub guest_country: String,
 }
 
+impl WritebackIntent {
+    /// Stable string identifier for this variant — matches the `intent` discriminant
+    /// produced by `serde(tag = "intent", rename_all = "snake_case")`.
+    ///
+    /// Persisted into `writeback_jobs.intent` so the worker can dispatch to the
+    /// matching recipe without having to deserialize the whole payload.
+    pub fn intent_name(&self) -> &'static str {
+        match self {
+            WritebackIntent::CreateBooking { .. } => "create_booking",
+            WritebackIntent::ModifyBooking { .. } => "modify_booking",
+            WritebackIntent::CancelBooking { .. } => "cancel_booking",
+            WritebackIntent::CreateCheckIn { .. } => "create_check_in",
+            WritebackIntent::CancelCheckIn { .. } => "cancel_check_in",
+            WritebackIntent::ExtendStay { .. } => "extend_stay",
+            WritebackIntent::CheckOut { .. } => "check_out",
+            WritebackIntent::RecordPayment { .. } => "record_payment",
+            WritebackIntent::MarkRoomClean { .. } => "mark_room_clean",
+        }
+    }
+
+    /// The aggregate root id this intent mutates.
+    ///
+    /// Persisted into `writeback_jobs.aggregate_id` so jobs for the same entity
+    /// can be located by the index `ix_writeback_jobs_aggregate`.
+    pub fn aggregate_id(&self) -> Uuid {
+        match self {
+            WritebackIntent::CreateBooking { booking_id, .. }
+            | WritebackIntent::ModifyBooking { booking_id, .. }
+            | WritebackIntent::CancelBooking { booking_id } => *booking_id,
+            WritebackIntent::CreateCheckIn { check_in_id, .. }
+            | WritebackIntent::CancelCheckIn { check_in_id, .. }
+            | WritebackIntent::ExtendStay { check_in_id, .. }
+            | WritebackIntent::CheckOut { check_in_id }
+            | WritebackIntent::RecordPayment { check_in_id, .. } => *check_in_id,
+            WritebackIntent::MarkRoomClean { room_id, .. } => *room_id,
+        }
+    }
+}
+
 /// Diff payload for [`WritebackIntent::ModifyBooking`].
 ///
 /// Only the fields a user actually edits round-trip through here — fields
