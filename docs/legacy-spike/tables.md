@@ -34,8 +34,8 @@ Columns marked **observed** were seen written to in our 2026-04-24 capture.
 | Table | Rows | Notes |
 |---|---|---|
 | `HT_Changed_Room` | 3,866 | Room change history. |
-| `HT_Round_Bill` | 4,575 | End-of-day billing rounds? |
-| `HT_Rooms_Cancel` | 297 | Cancelled rooms (per booking?). |
+| `HT_Round_Bill` | 4,575 | End-of-day billing rounds. |
+| `HT_Rooms_Cancel` | 298 | **Cancel-check-in audit log.** Captured: INSERT on cancel-check-in. `id` is app-allocated MAX+1. Records `(room_no, cin_no, cancel_date, cancel_by, cancel_note)`. Distinct from booking cancel which only flips status. |
 | `HT_Rooms_Repair` | 683 | Maintenance / out-of-service log. |
 | `HT_Rooms_Price` | 32 | Pricing rules. |
 | `HT_Log` | 6,224 | Generic activity log. |

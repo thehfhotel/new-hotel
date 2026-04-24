@@ -1,0 +1,2 @@
+[11:50:59] update HT_Rooms set Room_Clean='no',Room_Clean_Time='' where id=6
+[11:50:59] INSERT INTO HT_Housewife ([h_name],[h_room],[h_date],[h_note],[h_cin],[h_cin_name]) VALUES ('Admin', '306', '4/24/2026 6:50:59 PM', '','CH26-005159','สุภัตร์ตรา พุทธกูล')

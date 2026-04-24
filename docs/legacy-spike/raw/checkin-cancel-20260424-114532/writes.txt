@@ -1,0 +1,9 @@
+[11:47:05] INSERT INTO [HT_Customers]([id],[Cust_no],[Cust_name],[Cust_name2],[Cust_Type],[Cust_Email],[Cust_Add_no],[Cust_Add_moo],[Cust_Add_soi],[Cust_Add_road],[Cust_Add_tambon],[Cust_Add_ampore],[Cust_Add_province],[Cust_Add_code],[Cust_Add_tel],[Cust_Add_fax],[C
+[11:47:05] update Tb_Save_Image set cin_no='CH26-005233',cust_no='C21618',tmp_no='' where tmp_no='895450'
+[11:47:05] INSERT INTO [HT_POWER_LOG]([ROOM_NO],[ROOM_POWER_START],[ROOM_POWER_START_BY],[ROOM_POWER_END_BY],[ROOM_POWER_NOTE],[ROOM_POWER_NOTE2])VALUES('306',GETDATE(),'Admin','','เปิดไฟ อัตโนมัติ จากเช็คอิน No.CH26-005233','')
+[11:47:05] INSERT INTO [HT_CheckIn_Ds]([id],[Cin_No],[Cin_Room_No],[Cin_Room_Type],[Cin_Room_In],[Cin_Room_Out],[Cin_Room_Status],[Cin_Room_Dep],[Cin_Room_Price],[Cin_Room_Night],[Cin_Room_PriceToTal],[Cin_Room_Pay_Before],[Cin_Room_Pay_Total],[Cin_note],[Cin_dep_sta
+[11:47:05] update HT_Rooms set room_use='yes' where room_no='306'
+[11:47:05] INSERT INTO [HT_Room_Status]([id],[room_no],[room_date],[room_status],[room_Details],[room_CheckIn_No],[room_date_oa])VALUES(50243,'306','4/24/2026','เข้าพัก','SPIKE TEST ','CH26-005233',46136)
+[11:47:05] INSERT INTO [HT_CheckIn_Other_People]([Cin_no],[Cin_name],[Cin_contry])VALUES('CH26-005233','Mr. SPIKE TEST  ','')
+[11:47:05] INSERT INTO [HT_CheckIn_H]([Cin_no],[Cin_Date],[Cin_Book_no],[Cin_cust_no],[Cin_cust_price],[Cin_status],[Total_Price_Room],[Total_Price_Product],[Total_Price_Net],[Total_Price_Pay],[Total_Price_Balance],[Cin_Car_type],[Cin_Car_id],[Cin_Room_ALL],[Cin_by],
+[11:47:05] update HT_Cupon set cupon_print=1 where cupon_cin_no='CH26-005233'
