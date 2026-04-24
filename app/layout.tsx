@@ -3,6 +3,7 @@ import { Sarabun } from 'next/font/google'
 import './globals.css'
 import 'react-datepicker/dist/react-datepicker.css'
 import Providers from '@/components/Providers'
+import AppShell from '@/components/AppShell'
 
 // Sarabun is the Thai government standard typeface (supports both Thai + Latin).
 // Exposed as a CSS variable so tailwind.config.ts can pick it up via `var(--font-sarabun)`.
@@ -27,7 +28,9 @@ export default function RootLayout({
     <html lang="th" className={sarabun.variable}>
       <body className="font-sans bg-shell text-text">
         <Providers>
-          {children}
+          <AppShell>
+            {children}
+          </AppShell>
         </Providers>
       </body>
     </html>

@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.24.0] - 2026-04-25
+
+### Removed
+- **Legacy app tree** (`app/(legacy)/*`): legacy dashboard, bookings, calendar, rooms pages and their `BlueNavbar` shell. Superseded by the modern Sidebar-based UI. Per `docs/architecture.md` §8 Phase 0.
+- **`components/Navbar.tsx`** (legacy blue navbar with branch picker + Legacy/New mode toggle). Replaced by the renamed `Navbar` (formerly `NewNavbar`).
+- **`__tests__/components/LegacyDashboard.test.tsx`**: tested the deleted `app/(legacy)/page.tsx` (10 tests).
+
+### Changed
+- **App tree collapsed**: `app/new/*` promoted to `app/*` — every former `/new/...` URL is now its canonical `/...` path (e.g. `/new/bookings` → `/bookings`). Internal `<Link>` hrefs and Sidebar entries updated accordingly. **Backend `/api/new/*` routes are unaffected.**
+- **`components/NewNavbar.tsx` → `components/Navbar.tsx`**: renamed (history preserved via `git mv`); breadcrumb logic updated to drop the obsolete `/new` prefix; "Legacy" escape link removed.
+- **Root layout (`app/layout.tsx`)**: now wraps children in a new `AppShell` client component that renders `<Sidebar>` + `<BranchProvider>` (logic lifted from the deleted `app/new/layout.tsx`). Single root layout for the whole app.
+- **Sidebar**: nav entries point at the new flat URLs; ported `card-reader`, `customers`, `changelog` added so all formerly-legacy features remain reachable. Bottom "Legacy" exit link removed (no longer a destination).
+
 ## [2.23.0] - 2026-04-24
 
 ### Added
