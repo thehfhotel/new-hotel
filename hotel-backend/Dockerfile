@@ -11,7 +11,7 @@
 # source-file change (the old "dummy main" trick re-cooked deps whenever
 # Cargo.toml's [[bin]] list changed and was fragile around lockfile updates).
 
-FROM rust:1.85-bookworm AS chef
+FROM rust:1.89-bookworm AS chef
 RUN apt-get update \
     && apt-get install -y --no-install-recommends mold clang \
     && rm -rf /var/lib/apt/lists/*
