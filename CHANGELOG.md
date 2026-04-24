@@ -46,6 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **app/layout.tsx**: switched to `Sarabun` from `next/font/google`, exposed as `--font-sarabun` CSS variable
 - **app/globals.css**: removed body gradient; added brand palette CSS variables; re-skinned react-datepicker to brand palette
 - **Backend Dockerfile**: install `curl` for HTTP healthcheck
+- **Backend Docker builds**: switched from the dummy-source dependency-cache trick to `cargo-chef` (`planner` + `builder` stages cooking `recipe.json`); fragile-when-Cargo.toml-changes pattern replaced with the standard chef recipe (applied to both `Dockerfile` and `Dockerfile.ville-sync`)
+- **Backend Docker builds**: install `mold` + `clang` in the Rust builder stage and added `hotel-backend/.cargo/config.toml` with a target-scoped `linker = "clang"` + `-fuse-ld=mold` rustflag (only applies to `x86_64-unknown-linux-gnu`, so macOS/aarch64 local builds are unaffected); cuts release link time substantially
+- **CI test-backend job**: added `mozilla-actions/sccache-action` + `RUSTC_WRAPPER=sccache` (with `SCCACHE_GHA_ENABLED=true`) alongside the existing `Swatinem/rust-cache` step, giving per-rustc-call cache hits on top of the whole-`target/` cache
 
 ### Removed
 - `Hotel` lucide icon import in Sidebar (now bare wordmark)
