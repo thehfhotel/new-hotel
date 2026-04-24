@@ -46,3 +46,4 @@ backups/*.sql
 # TypeScript
 *.tsbuildinfo
 .polish/
+.claude/
