@@ -1,0 +1,39 @@
+[10:19:53] INSERT INTO [HT_Customers]([id],[Cust_no],[Cust_perfix],[Cust_name],[Cust_name2],[Cust_Type],[Cust_Email],[Cust_Add_no],[Cust_Add_moo],[Cust_Add_soi],[Cust_Add_road],[Cust_Add_tambon],[Cust_Add_ampore],[Cust_Add_province],[Cust_Add_code],[Cust_Add_tel],[Cu
+[10:19:53] INSERT INTO [HT_Book_H]( [Book_ID],[Book_Date],[Book_Cust_ID],[Book_Cust_Name],[Book_Cust_Name2],[Book_Cust_Tel],[Book_Price_Total],[Book_Price_Pay],[Book_Status],[Book_Date_in],[Book_Date_out],[Book_by],[Book_room_all],[Book_room_note],[book_room_type],Bo
+[10:19:53] INSERT INTO [HT_Book_Ds]([Book_No],[Book_Room_Type],[Book_Room_Start],[Book_Room_End],[Book_Room_Price],[Book_Room_Night],[Book_Room_Num],[Book_Room_PriceToTal],[Book_Room_Note])VALUES( 'R014810','402','4/25/2026 12:00:00 PM','4/26/2026 11:59:59 AM','890',
+[10:19:53] INSERT INTO [HT_Book_Date]([id],[Book_no],[Book_type],[Book_date_ds],[Book_Num],[Book_USE])VALUES(47285,'R014810','402','4/25/2026',1,0)
+[10:20:13] update HT_Customers set Cust_name='SPIKE TEST WALKIN',Cust_name2='',Cust_Type='ราคาปกติ',Cust_Add_tel='0900000088' where Cust_no='C21610'
+[10:20:13] update HT_Rooms set room_book_ds='',Room_Book='',Room_Book_Name='',Room_Book_Time='' where room_book in (select id from ht_book_date  where Book_no='R014810')
+[10:20:13] delete from  HT_Book_Date where Book_no='R014810'
+[10:20:13] delete from  HT_Book_H where Book_ID='R014810'
+[10:20:13] delete from  HT_Book_Pro where [B_NO]='R014810'
+[10:20:13] delete from  HT_Book_Ds where Book_no='R014810'
+[10:20:13] INSERT INTO [HT_Book_H]( [Book_ID],[Book_Date],[Book_Cust_ID],[Book_Cust_Name],[Book_Cust_Name2],[Book_Cust_Tel],[Book_Price_Total],[Book_Price_Pay],[Book_Status],[Book_Date_in],[Book_Date_out],[Book_by],[Book_room_all],[Book_room_note],[book_room_type],Bo
+[10:20:13] INSERT INTO [HT_Book_Ds]([Book_No],[Book_Room_Type],[Book_Room_Start],[Book_Room_End],[Book_Room_Price],[Book_Room_Night],[Book_Room_Num],[Book_Room_PriceToTal],[Book_Room_Note])VALUES( 'R014810','402','4/25/2026 12:00:00 PM','4/26/2026 11:59:59 AM','890',
+[10:20:13] INSERT INTO [HT_Book_Date]([id],[Book_no],[Book_type],[Book_date_ds],[Book_Num],[Book_USE])VALUES(47285,'R014810','402','4/25/2026',1,0)
+[10:22:10] update HT_Rooms set room_book_ds='',Room_Book='',Room_Book_Name='',Room_Book_Time='' where room_book in (select id from ht_book_date  where Book_no='R014810')
+[10:22:10] update HT_book_date set book_ok=0 where Book_no='R014810'
+[10:22:19] update HT_Customers set Cust_name='SPIKE TEST WALKIN',Cust_name2='',Cust_Type='ราคาปกติ',Cust_Add_tel='0900000088' where Cust_no='C21610'
+[10:22:19] update HT_Rooms set room_book_ds='',Room_Book='',Room_Book_Name='',Room_Book_Time='' where room_book in (select id from ht_book_date  where Book_no='R014810')
+[10:22:19] delete from  HT_Book_Date where Book_no='R014810'
+[10:22:19] delete from  HT_Book_H where Book_ID='R014810'
+[10:22:19] delete from  HT_Book_Ds where Book_no='R014810'
+[10:22:19] INSERT INTO [HT_Book_H]( [Book_ID],[Book_Date],[Book_Cust_ID],[Book_Cust_Name],[Book_Cust_Name2],[Book_Cust_Tel],[Book_Price_Total],[Book_Price_Pay],[Book_Status],[Book_Date_in],[Book_Date_out],[Book_by],[Book_room_all],[Book_room_note],[book_room_type],Bo
+[10:22:19] delete from  HT_Book_Pro where [B_NO]='R014810'
+[10:22:19] INSERT INTO [HT_Book_Ds]([Book_No],[Book_Room_Type],[Book_Room_Start],[Book_Room_End],[Book_Room_Price],[Book_Room_Night],[Book_Room_Num],[Book_Room_PriceToTal],[Book_Room_Note])VALUES( 'R014810','402','4/24/2026 12:00:00 PM','4/26/2026 11:59:59 AM','890',
+[10:22:19] INSERT INTO [HT_Book_Date]([id],[Book_no],[Book_type],[Book_date_ds],[Book_Num],[Book_USE])VALUES(47285,'R014810','402','4/24/2026',1,0)
+[10:22:19] INSERT INTO [HT_Book_Date]([id],[Book_no],[Book_type],[Book_date_ds],[Book_Num],[Book_USE])VALUES(47286,'R014810','402','4/25/2026',1,0)
+[10:22:24] update HT_Rooms set room_book_ds='SPIKE TEST WALKIN
+[10:22:24] update HT_Book_Date set Book_ok=Book_ok+1 where id=47285
+[10:23:02] UPDATE [HT_Customers] SET  [Cust_name]='SPIKE TEST WALKIN',[Cust_name2]='',[Cust_Type]='ราคาปกติ',[Cust_Type_main]='บุคคลธรรมดา',[Cust_Email]='',[Cust_Add_no]='',[Cust_Add_moo]='',[Cust_Add_soi]='',[Cust_Add_road]='',[Cust_Add_tambon]='',[Cust_Add_ampore]=
+[10:23:02] update Tb_Save_Image set cin_no='CH26-005231',cust_no='C21610',tmp_no='' where tmp_no='221643'
+[10:23:02] INSERT INTO [HT_POWER_LOG]([ROOM_NO],[ROOM_POWER_START],[ROOM_POWER_START_BY],[ROOM_POWER_END_BY],[ROOM_POWER_NOTE],[ROOM_POWER_NOTE2])VALUES('402',GETDATE(),'Admin','','เปิดไฟ อัตโนมัติ จากเช็คอิน No.CH26-005231','')
+[10:23:02] INSERT INTO [HT_CheckIn_Ds]([id],[Cin_No],[Cin_Room_No],[Cin_Room_Type],[Cin_Room_In],[Cin_Room_Out],[Cin_Room_Status],[Cin_Room_Dep],[Cin_Room_Price],[Cin_Room_Night],[Cin_Room_PriceToTal],[Cin_Room_Pay_Before],[Cin_Room_Pay_Total],[Cin_note],[Cin_dep_sta
+[10:23:02] update HT_Rooms set room_use='yes' where room_no='402'
+[10:23:02] update [HT_Room_Status] SET  [room_status]='เข้าพัก',[room_Details]='SPIKE TEST WALKIN',[room_CheckIn_No]='CH26-005231' where room_date='4/24/2026' and room_no='402'
+[10:23:02] INSERT INTO [HT_CheckIn_Other_People]([Cin_no],[Cin_name],[Cin_contry])VALUES('CH26-005231','Mr. SPIKE TEST WALKIN ','')
+[10:23:02] INSERT INTO [HT_Room_Status]([id],[room_no],[room_date],[room_status],[room_Details],[room_CheckIn_No],[room_date_oa])VALUES(50237,'402','4/25/2026','เข้าพัก','SPIKE TEST WALKIN','CH26-005231',46137)
+[10:23:02] update HT_Book_H set Book_Status='เข้าพัก' where Book_ID='R014810'
+[10:23:02] update HT_Rooms set room_book_ds='',room_book='',room_book_name='',room_book_time='' where room_no in (select room_no from View_HT_ROOM where book_no='R014810')
+[10:23:02] INSERT INTO [HT_CheckIn_H]([Cin_no],[Cin_Date],[Cin_Book_no],[Cin_cust_no],[Cin_cust_price],[Cin_status],[Total_Price_Room],[Total_Price_Product],[Total_Price_Net],[Total_Price_Pay],[Total_Price_Balance],[Cin_Car_type],[Cin_Car_id],[Cin_Room_ALL],[Cin_by],
+[10:23:02] update HT_Cupon set cupon_print=1 where cupon_cin_no='CH26-005231'
