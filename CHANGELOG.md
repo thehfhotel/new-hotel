@@ -12,11 +12,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`components/Navbar.tsx`** (legacy blue navbar with branch picker + Legacy/New mode toggle). Replaced by the renamed `Navbar` (formerly `NewNavbar`).
 - **`__tests__/components/LegacyDashboard.test.tsx`**: tested the deleted `app/(legacy)/page.tsx` (10 tests).
 
+### Added
+- **Backend domain layer** (`hotel-backend/src/domain/`) — pure types, no I/O, no SQL.
+  Per `docs/architecture.md` §1, §2 (Phase 1a). New modules:
+  - `customer.rs` — `Customer` struct + `CustomerType` enum + Thai national-ID checksum validation
+  - `booking.rs` — `Booking` struct + `BookingState` state machine (Pending / Active / CheckedIn / Completed / Cancelled) with legacy literal mappings
+  - `checkin.rs` — `CheckIn` struct + `CheckInState` enum (Active / CheckedOut / Cancelled) with split `Cin_Room_Status` vs `room_status` legacy-literal helpers per spike findings §3e
+  - `room.rs` — `Room` struct + `RoomStatus` + `CleanState` enums (with the inverted `Room_Clean='yes'` = "needs cleaning" semantic preserved per spike §3i)
+  - `payment.rs` — `Payment` struct + `PaymentMethod` enum (Cash / Credit / Transfer)
+  - `shared.rs` — `DateRange`, `Money` (i64 satang), `RoomNumber` primitives
+- **Backend outbox enums** (`hotel-backend/src/outbox/`) — type-only contracts (Phase 3a):
+  - `event.rs` — `DomainEvent` (11 variants) + `EventSource` + `BookingSnapshot` / `CheckInSnapshot` / `CustomerSnapshot` per `architecture.md` §3.6b
+  - `intent.rs` — `WritebackIntent` (one variant per spike-validated recipe §3a–k) with `CreateBookingPayload` / `CreateCheckInPayload` / `BookingChanges`
+- **PostgreSQL migrations** (Phase 3a tables, no consumers yet — Wave 2 fills them in):
+  - `011_writeback_jobs.sql` — outbox queue (per `architecture.md` §4c)
+  - `012_event_log.sql` — durable domain-event bus with 3 indexes (per `architecture.md` §4d-bis)
+  - `013_legacy_ct_state.sql` — single-row Change Tracking watermark (per `architecture.md` §4d-tris)
+  - Same DDL appended to `init-db/init-hotelnew.sql` for fresh deploys
+- **Cargo dependency**: `uuid = "1"` declared explicitly with `["serde", "v4"]` features
+  (was previously only available transitively through tiberius).
+
 ### Changed
 - **App tree collapsed**: `app/new/*` promoted to `app/*` — every former `/new/...` URL is now its canonical `/...` path (e.g. `/new/bookings` → `/bookings`). Internal `<Link>` hrefs and Sidebar entries updated accordingly. **Backend `/api/new/*` routes are unaffected.**
 - **`components/NewNavbar.tsx` → `components/Navbar.tsx`**: renamed (history preserved via `git mv`); breadcrumb logic updated to drop the obsolete `/new` prefix; "Legacy" escape link removed.
 - **Root layout (`app/layout.tsx`)**: now wraps children in a new `AppShell` client component that renders `<Sidebar>` + `<BranchProvider>` (logic lifted from the deleted `app/new/layout.tsx`). Single root layout for the whole app.
 - **Sidebar**: nav entries point at the new flat URLs; ported `card-reader`, `customers`, `changelog` added so all formerly-legacy features remain reachable. Bottom "Legacy" exit link removed (no longer a destination).
+- **`hotel-backend/Cargo.toml`** version bumped 2.8.1 → 2.8.2
+- **`hotel-backend/src/main.rs`** — registers new `domain` and `outbox` top-level modules
 
 ## [2.23.0] - 2026-04-24
 
