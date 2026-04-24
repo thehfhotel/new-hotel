@@ -138,7 +138,7 @@ pub async fn get_revenue(
         )
         SELECT
             period,
-            COALESCE(SUM(revenue), 0) as total_revenue,
+            COALESCE(SUM(revenue), 0)::float8 as total_revenue,
             COUNT(*)::int as booking_count
         FROM DateRange
         GROUP BY period
@@ -239,7 +239,7 @@ pub async fn get_occupancy(
                      ELSE ci.cin_checkin_time::date END)
             ), 0) as occupied_nights,
             COALESCE(SUM(COALESCE(ci.cin_total_amount,
-                ci.cin_rate_per_night * (COALESCE(ci.cin_checkout_time, ci.cin_expected_checkout)::date - ci.cin_checkin_time::date))), 0) as total_revenue,
+                ci.cin_rate_per_night * (COALESCE(ci.cin_checkout_time, ci.cin_expected_checkout)::date - ci.cin_checkin_time::date))), 0)::float8 as total_revenue,
             COUNT(*)::int as checkin_count,
             COALESCE(AVG((COALESCE(ci.cin_checkout_time, ci.cin_expected_checkout)::date - ci.cin_checkin_time::date)::float8), 0) as avg_stay
         FROM ht_checkins ci
@@ -321,7 +321,7 @@ pub async fn get_revenue_by_room_type(
         SELECT
             COALESCE(rt.type_name, 'Unknown') as room_type,
             COALESCE(SUM(COALESCE(ci.cin_total_amount,
-                ci.cin_rate_per_night * (COALESCE(ci.cin_checkout_time, ci.cin_expected_checkout)::date - ci.cin_checkin_time::date))), 0) as revenue
+                ci.cin_rate_per_night * (COALESCE(ci.cin_checkout_time, ci.cin_expected_checkout)::date - ci.cin_checkin_time::date))), 0)::float8 as revenue
         FROM ht_checkins ci
         LEFT JOIN ht_rooms_new r ON ci.cin_room_id = r.room_id
         LEFT JOIN ht_room_types rt ON r.room_type_id = rt.type_id

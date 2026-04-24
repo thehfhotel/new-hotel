@@ -12,18 +12,22 @@ const Input = forwardRef<HTMLInputElement, InputProps>(
   ({ label, error, icon, className = '', ...props }, ref) => {
     return (
       <div>
-        {label && <label className="block text-sm font-medium text-gray-700 mb-1.5">{label}</label>}
+        {label && (
+          <label className="block text-[12px] font-medium text-text mb-1">{label}</label>
+        )}
         <div className="relative">
-          {icon && <div className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500">{icon}</div>}
+          {icon && (
+            <div className="absolute left-2 top-1/2 -translate-y-1/2 text-textMuted">{icon}</div>
+          )}
           <input
             ref={ref}
-            className={`w-full bg-gray-100 border rounded-lg px-3 py-2 text-sm text-gray-800 placeholder:text-gray-400 transition-colors focus:outline-none focus:ring-2 focus:ring-red-600/50 focus:border-red-600 ${
-              icon ? 'pl-10' : ''
-            } ${error ? 'border-red-500' : 'border-gray-300'} ${className}`}
+            className={`w-full bg-panel border rounded-[2px] h-7 px-2 text-[13px] text-text placeholder:text-textMuted transition-colors focus:outline-none focus:border-brand-500 ${
+              icon ? 'pl-7' : ''
+            } ${error ? 'border-error' : 'border-borderStrong'} ${className}`}
             {...props}
           />
         </div>
-        {error && <p className="mt-1 text-xs text-red-600">{error}</p>}
+        {error && <p className="mt-1 text-[11px] text-error">{error}</p>}
       </div>
     )
   }

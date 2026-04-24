@@ -113,6 +113,8 @@ pub struct NewBookingsQuery {
     pub limit: i32,
     pub sort_by: Option<String>,
     pub sort_order: Option<String>,
+    /// Branch selector: 'hfhotel' | 'hfville' | 'all' (HotelNew only contains hfhotel data)
+    pub branch: Option<String>,
 }
 
 fn default_page() -> i32 { 1 }
@@ -178,6 +180,15 @@ pub async fn list_bookings(
     Query(params): Query<NewBookingsQuery>,
 ) -> ApiResult<Json<NewBookingsResponse>> {
     let pool = &state.new_pool;
+
+    // HotelNew only stores HF Hotel data; HF Ville request -> empty list.
+    if params.branch.as_deref() == Some("hfville") {
+        return Ok(Json(NewBookingsResponse {
+            success: true,
+            data: vec![],
+            pagination: Pagination::new(params.page, params.limit, 0),
+        }));
+    }
 
     let offset = (params.page - 1) * params.limit;
     let sort_order = params
@@ -267,8 +278,8 @@ pub async fn list_bookings(
             b.book_children,
             b.book_status,
             b.book_source,
-            b.book_total_amount,
-            b.book_deposit_amount,
+            b.book_total_amount::float8 as book_total_amount,
+            b.book_deposit_amount::float8 as book_deposit_amount,
             b.book_notes,
             b.created_at,
             b.updated_at,

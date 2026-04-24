@@ -91,6 +91,8 @@ pub struct NewCheckInsQuery {
     pub limit: i32,
     pub sort_by: Option<String>,
     pub sort_order: Option<String>,
+    /// Branch selector: 'hfhotel' | 'hfville' | 'all' (HotelNew only contains hfhotel data)
+    pub branch: Option<String>,
 }
 
 fn default_page() -> i32 { 1 }
@@ -161,6 +163,15 @@ pub async fn list_checkins(
     Query(params): Query<NewCheckInsQuery>,
 ) -> ApiResult<Json<NewCheckInsResponse>> {
     let pool = &state.new_pool;
+
+    // HotelNew DB only contains hfhotel data; hfville selector returns empty.
+    if params.branch.as_deref() == Some("hfville") {
+        return Ok(Json(NewCheckInsResponse {
+            success: true,
+            data: vec![],
+            pagination: Pagination::new(params.page, params.limit, 0),
+        }));
+    }
 
     let offset = (params.page - 1) * params.limit;
     let sort_order = params

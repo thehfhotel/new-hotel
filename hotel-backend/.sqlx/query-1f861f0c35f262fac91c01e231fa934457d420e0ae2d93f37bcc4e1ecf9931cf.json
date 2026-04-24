@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            ri.ri_item_id,\n            COALESCE(i.item_code, '') as \"item_code!\",\n            COALESCE(i.item_name, '') as \"item_name!\",\n            COALESCE(c.cat_name, 'Equipment') as \"category!\",\n            COALESCE(i.item_unit, '') as \"item_unit!\",\n            ri.ri_quantity,\n            ri.ri_last_checked\n        FROM ht_room_inventory ri\n        LEFT JOIN ht_inventory_items i ON ri.ri_item_id = i.item_id\n        LEFT JOIN ht_inventory_categories c ON i.item_category_id = c.cat_id\n        WHERE ri.ri_room_id = $1\n        ORDER BY i.item_name ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "ri_item_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "item_code!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "item_name!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "category!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "item_unit!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "ri_quantity",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "ri_last_checked",
+        "type_info": "Timestamp"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      true,
+      null,
+      null,
+      null,
+      null,
+      true,
+      true
+    ]
+  },
+  "hash": "1f861f0c35f262fac91c01e231fa934457d420e0ae2d93f37bcc4e1ecf9931cf"
+}

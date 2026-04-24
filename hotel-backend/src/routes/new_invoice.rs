@@ -106,11 +106,11 @@ pub async fn get_invoice(
                 ci.cin_id,
                 ci.cin_no,
                 ci.cin_book_id,
-                b.book_no,
+                COALESCE(b.book_no, '') as "book_no!",
 
-                -- Customer/Guest info
-                c.cust_id,
-                c.cust_firstname,
+                -- Customer/Guest info (LEFT JOIN — coalesce to satisfy NOT NULL bindings; missing customer is rare for walk-ins)
+                COALESCE(c.cust_id, 0) as "cust_id!",
+                COALESCE(c.cust_firstname, '') as "cust_firstname!",
                 c.cust_lastname,
                 c.cust_email,
                 c.cust_phone,
@@ -118,11 +118,11 @@ pub async fn get_invoice(
                 c.cust_idcard,
                 c.cust_passport,
 
-                -- Room info
-                r.room_id,
-                r.room_no,
+                -- Room info (LEFT JOIN — coalesce in case of orphaned room_id)
+                COALESCE(r.room_id, 0) as "room_id!",
+                COALESCE(r.room_no, '') as "room_no!",
                 r.room_floor,
-                rt.type_name as room_type,
+                COALESCE(rt.type_name, '') as "room_type!",
 
                 -- Stay details
                 ci.cin_checkin_time,

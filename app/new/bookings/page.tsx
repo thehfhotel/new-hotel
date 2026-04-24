@@ -312,29 +312,29 @@ export default function NewBookingsPage() {
   }
 
   return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold text-gray-900">การจอง (New Mode)</h1>
-          <p className="text-sm text-gray-500 mt-1">
-            {totalItems.toLocaleString()} รายการ
-          </p>
-        </div>
+    <div className="space-y-3">
+      {/* Page header bar — 40px tall, flat panel */}
+      <div className="flex items-center justify-between bg-panel border border-border h-10 px-3">
         <div className="flex items-center gap-3">
+          <h1 className="text-base font-semibold text-text">การจอง</h1>
+          <span className="text-[11px] text-textMuted">
+            {totalItems.toLocaleString()} รายการ
+          </span>
+        </div>
+        <div className="flex items-center gap-1.5">
           <button
             onClick={fetchBookings}
             disabled={loading}
-            className="flex items-center space-x-2 px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-100 disabled:opacity-50"
+            className="inline-flex items-center gap-1 h-6 px-2 bg-panel border border-borderStrong text-text hover:bg-headerBar disabled:opacity-50 text-[12px]"
           >
-            <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
+            <RefreshCw className={`h-3 w-3 ${loading ? 'animate-spin' : ''}`} />
             <span className="hidden sm:inline">รีเฟรช</span>
           </button>
           <button
             onClick={handleAddBooking}
-            className="flex items-center space-x-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700"
+            className="inline-flex items-center gap-1 h-6 px-2 bg-brand-500 text-white border border-brand-700 hover:bg-brand-600 text-[12px]"
           >
-            <Plus className="h-4 w-4" />
+            <Plus className="h-3 w-3" />
             <span>เพิ่มการจอง</span>
           </button>
         </div>

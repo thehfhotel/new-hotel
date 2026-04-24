@@ -32,9 +32,12 @@ log_info()  { echo -e "${GREEN}[migrate]${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[migrate]${NC} $1"; }
 log_error() { echo -e "${RED}[migrate]${NC} $1"; }
 
-# Helper: run SQL in the container
+# Helper: run SQL in the container.
+# `-v ON_ERROR_STOP=1` ensures any SQL error aborts psql with a non-zero exit
+# code, which lets the migration loop detect failures (otherwise psql would
+# happily keep going and the schema_migrations row would still be inserted).
 run_sql() {
-    docker exec -i "$DB_CONTAINER" psql -U "$DB_USER" -p "$DB_PORT" -d "$DB_NAME" -t -A "$@"
+    docker exec -i "$DB_CONTAINER" psql -v ON_ERROR_STOP=1 -U "$DB_USER" -p "$DB_PORT" -d "$DB_NAME" -t -A "$@"
 }
 
 # Step 1: Verify container is running and healthy
@@ -120,17 +123,19 @@ for migration_file in "${PENDING[@]}"; do
 
     log_info "Applying: $filename (version $version)..."
 
-    # Wrap migration + tracking insert in a single transaction
-    {
+    # Wrap migration + tracking insert in a single transaction.
+    # `\set ON_ERROR_STOP on` plus a guarded BEGIN/COMMIT means a failure inside
+    # the migration aborts the transaction, psql exits non-zero, and the
+    # schema_migrations INSERT never runs.
+    if ! {
+        echo "\\set ON_ERROR_STOP on"
         echo "BEGIN;"
         cat "$migration_file"
         echo ""
         echo "INSERT INTO schema_migrations (version, filename, checksum, applied_by)"
         echo "VALUES ('${version}', '${filename}', '${checksum}', 'migrate-script');"
         echo "COMMIT;"
-    } | run_sql 2>&1
-
-    if [ $? -ne 0 ]; then
+    } | run_sql 2>&1; then
         log_error "Migration $filename FAILED. Transaction rolled back."
         log_error "Backup available at: $BACKUP_FILE"
         exit 1

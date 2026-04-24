@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE ht_room_inventory SET ri_last_checked = NOW()\n            WHERE ri_room_id = $1 AND ri_item_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "72d8dca738d6420ec2e66afb32aa348c2049c9b3aa1336bc55dc4a25bfc29a35"
+}

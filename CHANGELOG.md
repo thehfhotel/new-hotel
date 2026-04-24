@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.23.0] - 2026-04-24
+
+### Added
+- **Design system**: SAP Fiori Compact UI with oxidized blood-red brand palette (`brand-50` … `brand-800`)
+  - 13px base font, 28px row height, dense spacing
+  - Sarabun (Thai government typeface) replaces DM Sans — supports Thai + Latin
+  - Tailwind tokens for `shell`, `panel`, `headerBar`, `border`, `borderStrong`, `text`, `textMuted`
+  - Semantic colours: `success`, `warning`, `error`, `info`
+  - All border radii squashed to 2px (rounded-full preserved for circular elements)
+- **Inventory backend**: missing mutation endpoints
+  - `GET /api/new/inventory/rooms` — room rollup list with inventory count + last-checked
+  - `POST /api/new/inventory/rooms/:room_id/check` — record an inventory check
+  - `POST /api/new/inventory/rooms/:room_id/replenish` — replenish room stock (deducts from main inventory, logs OUT transactions)
+  - `POST /api/new/inventory/adjustments` — generic add/remove/set stock adjustment
+- **Backend healthcheck**: `/api/mode` probe + curl in Docker image; web service now waits for backend `service_healthy` before starting
+
+### Fixed
+- **Backend NUMERIC casts**: every dynamic-SQL `SELECT` reading DECIMAL columns now `::float8` casts so `try_get::<f64, _>` succeeds instead of silently defaulting (rooms prices, rate values, room-type base price/size, booking totals, inventory cost, report revenue)
+- **Backend invoice**: `LEFT JOIN` columns `book_no`/`cust_firstname`/`room_no`/`type_name` are now `COALESCE`'d so walk-in check-ins without a booking/customer no longer fail (`new_invoice.rs`)
+- **Backend invoice/inventory**: `.sqlx/` cache regenerated for all modified `query!()` calls
+- **Branch filter**: `GET /api/new/{rooms,bookings,customers,checkins,inventory/rooms}` now honour `?branch=hfville` by returning empty results (HotelNew DB only contains HF Hotel data)
+- **Room inventory checklist**: backend response shape now matches frontend expectations (`{ success, data: { roomId, roomNumber, roomType, items: [{ assignedQuantity, ... }] } }`)
+- **Migrations**: `psql -v ON_ERROR_STOP=1` + `\set ON_ERROR_STOP on` so a failed migration aborts and the `schema_migrations` row is NOT inserted (previously a SQL error was silently ignored and the migration was marked applied)
+- **Docker compose**: `web` waits for `backend: service_healthy` (and backend has a healthcheck on `/api/mode`); previously web could start before backend was listening
+
+### Changed
+- **Sidebar**: redesigned per Fiori — active item is `bg-brand-50` + 3px left border + `brand-700` text; nav rows reduced to `px-3 py-1.5`; section labels at 10px uppercase; removed `Hotel` logo icon and red "NEW" pill
+- **NewNavbar**: thin 40px top bar with breadcrumb + Legacy link
+- **DataTable**: `bg-headerBar` 12px header, 32px (h-8) rows with `even:bg-rowAlt` zebra stripes, sort indicators in `text-brand-500`; removed `rounded-lg` wrapper
+- **Button / Input / Card / Badge / StatCard**: re-skinned to brand palette and Fiori sizing
+  - Button primary: `bg-brand-500` + `border-brand-700`; sizes `h-6/h-7/h-8`
+  - Input: 28px tall (`h-7`), `bg-panel`, `border-borderStrong`, `focus:border-brand-500`
+  - Card: flat panel, `p-3` default, optional `<CardHeader>` with header-bar styling
+  - Badge: flat rectangles with semantic 1px border (no pills)
+  - StatCard: 20px value text, 11px uppercase label
+- **Dashboard tiles**: removed `bg-{red,yellow,orange,blue}-50` tint backgrounds and `border-b-4` colored borders; now neutral white panels with a 8px coloured status dot in the corner
+- **Dashboard modal**: flat panel, no shadow, no rounded corners
+- **Page headers**: top pages (`/new`, `/new/bookings`, `/new/rooms`) now use a 40px-tall flat panel header bar with `text-base font-semibold` titles instead of `text-2xl font-bold`
+- **app/layout.tsx**: switched to `Sarabun` from `next/font/google`, exposed as `--font-sarabun` CSS variable
+- **app/globals.css**: removed body gradient; added brand palette CSS variables; re-skinned react-datepicker to brand palette
+- **Backend Dockerfile**: install `curl` for HTTP healthcheck
+
+### Removed
+- `Hotel` lucide icon import in Sidebar (now bare wordmark)
+
 ## [2.22.1] - 2026-03-04
 
 ### Fixed

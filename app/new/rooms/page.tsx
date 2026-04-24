@@ -238,9 +238,9 @@ export default function RoomsPage() {
     <div className="flex gap-6">
       {/* Main Content */}
       <div className={`flex-1 space-y-6 ${selectedRoom ? 'lg:mr-80' : ''}`}>
-        {/* Header */}
-        <div className="flex items-center justify-between">
-          <h1 className="text-2xl font-bold text-gray-900">จัดการห้องพัก</h1>
+        {/* Page header bar */}
+        <div className="flex items-center justify-between bg-panel border border-border h-10 px-3">
+          <h1 className="text-base font-semibold text-text">จัดการห้องพัก</h1>
           <div className="flex items-center space-x-2">
             <div className="flex items-center bg-gray-100 rounded-lg p-1">
               <button
