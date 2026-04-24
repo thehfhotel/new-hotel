@@ -1,23 +1,34 @@
-# Build stage (shared with hotel-backend Dockerfile)
-FROM rust:1.85-bookworm AS builder
+# syntax=docker/dockerfile:1.7
+#
+# ville-sync image — same chef/planner/builder pattern as ./Dockerfile, but the
+# final `cargo build` selects the `ville_sync` bin target. Deps cooked via
+# cargo-chef are shared across all bins in the workspace, so this layer is
+# cache-compatible with the main backend build when both run on the same
+# BuildKit cache.
 
+FROM rust:1.85-bookworm AS chef
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends mold clang \
+    && rm -rf /var/lib/apt/lists/*
+RUN cargo install cargo-chef --locked
 WORKDIR /usr/src/app
 
+# ---- Plan stage -----------------------------------------------------------
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ---- Build stage ----------------------------------------------------------
+FROM chef AS builder
 ENV SQLX_OFFLINE=true
 
-COPY Cargo.toml Cargo.lock* ./
+COPY --from=planner /usr/src/app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
 
-# Create dummy sources matching Cargo.toml bin targets to cache dependencies
-RUN mkdir -p src/bin && echo "fn main() {}" > src/main.rs && echo "fn main() {}" > src/bin/migrate_legacy.rs && echo "fn main() {}" > src/bin/ville_sync.rs
-RUN cargo build --release
-RUN rm -rf src
+COPY . .
+RUN cargo build --release --bin ville_sync
 
-COPY .sqlx .sqlx
-COPY src ./src
-
-RUN find src -name "*.rs" -exec touch {} + && cargo build --release --bin ville_sync
-
-# Runtime stage
+# ---- Runtime stage --------------------------------------------------------
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
