@@ -69,18 +69,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
           version: 10
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
 
       - name: Run component tests
         run: pnpm test:components
@@ -128,11 +129,11 @@ jobs:
         env:
           DATABASE_URL: postgres://postgres:***REMOVED***@localhost:5439/hotelnew
           SQLX_OFFLINE: "true"
-        run: cargo test --release
+        run: cargo test
 
   build-frontend:
     runs-on: ubuntu-latest
-    needs: [changes, test-frontend]
+    needs: changes
     if: needs.changes.outputs.code == 'true'
     permissions:
       contents: read
@@ -175,7 +176,7 @@ jobs:
 
   build-backend:
     runs-on: ubuntu-latest
-    needs: [changes, test-backend]
+    needs: changes
     if: needs.changes.outputs.backend == 'true'
     permissions:
       contents: read
@@ -216,7 +217,7 @@ jobs:
 
   build-ville-sync:
     runs-on: ubuntu-latest
-    needs: [changes, test-backend]
+    needs: changes
     if: needs.changes.outputs.hfville == 'true'
     permissions:
       contents: read
@@ -258,8 +259,12 @@ jobs:
 
   deploy:
     runs-on: [self-hosted, linux, deploy]
-    needs: [changes, build-frontend, build-backend]
-    if: always() && (needs.build-frontend.result == 'success' || needs.build-backend.result == 'success' || (needs.changes.outputs.deploy == 'true' && needs.changes.outputs.code != 'true' && needs.changes.outputs.backend != 'true'))
+    needs: [changes, test-frontend, test-backend, build-frontend, build-backend]
+    if: |
+      always() &&
+      (needs.test-frontend.result == 'success' || needs.test-frontend.result == 'skipped') &&
+      (needs.test-backend.result == 'success' || needs.test-backend.result == 'skipped') &&
+      (needs.build-frontend.result == 'success' || needs.build-backend.result == 'success' || (needs.changes.outputs.deploy == 'true' && needs.changes.outputs.code != 'true' && needs.changes.outputs.backend != 'true'))
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -370,8 +375,11 @@ jobs:
 
   deploy-hfville:
     runs-on: [self-hosted, linux, deploy]
-    needs: [changes, build-ville-sync]
-    if: always() && (needs.build-ville-sync.result == 'success' || (needs.changes.outputs.hfville == 'true' && needs.changes.outputs.backend != 'true'))
+    needs: [changes, test-backend, build-ville-sync]
+    if: |
+      always() &&
+      (needs.test-backend.result == 'success' || needs.test-backend.result == 'skipped') &&
+      (needs.build-ville-sync.result == 'success' || (needs.changes.outputs.hfville == 'true' && needs.changes.outputs.backend != 'true'))
     steps:
       - name: Checkout
         uses: actions/checkout@v4
