@@ -2,20 +2,36 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Brand palette + SAP Fiori shell tokens. Mirror tailwind.config.ts so plain
+   CSS (datepicker overrides, third-party widgets) can use them. */
 :root {
-  --foreground-rgb: 0, 0, 0;
-  --background-start-rgb: 248, 250, 252;
-  --background-end-rgb: 241, 245, 249;
+  --brand-50:  #FBEAEA;
+  --brand-100: #F5C9C9;
+  --brand-300: #C76060;
+  --brand-500: #8B0000;
+  --brand-600: #7A0000;
+  --brand-700: #6B1212;
+  --brand-800: #4F0E0E;
+
+  --shell:         #F5F6F7;
+  --panel:         #FFFFFF;
+  --header-bar:    #EFF1F2;
+  --row-alt:       #FAFAFB;
+  --border:        #D5D9DD;
+  --border-strong: #89919A;
+  --text:          #32363A;
+  --text-muted:    #6A6D70;
+
+  --radius: 2px;
 }
 
-body {
-  color: rgb(var(--foreground-rgb));
-  background: linear-gradient(
-      to bottom,
-      transparent,
-      rgb(var(--background-end-rgb))
-    )
-    rgb(var(--background-start-rgb));
+html, body {
+  /* Flat shell — no gradient. Background and color are set on body via Tailwind
+     in layout.tsx (`bg-shell text-text`); these are belt-and-braces fallbacks. */
+  background-color: var(--shell);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.4;
   min-height: 100vh;
 }
 
@@ -26,56 +42,59 @@ body {
 }
 
 .new-system-scrollbar ::-webkit-scrollbar-track {
-  background: #f9fafb;
+  background: var(--header-bar);
 }
 
 .new-system-scrollbar ::-webkit-scrollbar-thumb {
-  background: #d1d5db;
-  border-radius: 3px;
+  background: var(--border);
+  border-radius: var(--radius);
 }
 
 .new-system-scrollbar ::-webkit-scrollbar-thumb:hover {
-  background: #9ca3af;
+  background: var(--border-strong);
 }
 
-/* Date picker light theme overrides for new system */
+/* Date picker — re-skinned to brand palette */
 .react-datepicker {
-  background-color: #ffffff;
-  border-color: #e5e7eb;
-  color: #111827;
+  background-color: var(--panel);
+  border-color: var(--border);
+  color: var(--text);
+  border-radius: var(--radius) !important;
 }
 
 .react-datepicker__header {
-  background-color: #f3f4f6;
-  border-bottom-color: #d1d5db;
+  background-color: var(--header-bar);
+  border-bottom-color: var(--border);
 }
 
 .react-datepicker__current-month,
 .react-datepicker__day-name {
-  color: #111827;
+  color: var(--text);
 }
 
 .react-datepicker__day {
-  color: #6b7280;
+  color: var(--text-muted);
+  border-radius: var(--radius);
 }
 
 .react-datepicker__day:hover {
-  background-color: #f3f4f6;
-  color: #111827;
+  background-color: var(--header-bar);
+  color: var(--text);
 }
 
 .react-datepicker__day--selected {
-  background-color: #dc2626 !important;
+  background-color: var(--brand-500) !important;
   color: #ffffff !important;
 }
 
 .react-datepicker__day--keyboard-selected {
-  background-color: #991b1b;
+  background-color: var(--brand-700);
   color: #ffffff;
 }
 
 .react-datepicker__input-container input {
-  background-color: #ffffff;
-  border-color: #e5e7eb;
-  color: #111827;
+  background-color: var(--panel);
+  border-color: var(--border);
+  color: var(--text);
+  border-radius: var(--radius);
 }

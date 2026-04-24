@@ -10,14 +10,15 @@ interface CardProps {
 
 const paddingStyles: Record<string, string> = {
   none: '',
-  sm: 'p-3',
-  md: 'p-4',
-  lg: 'p-5',
+  sm: 'p-2',
+  md: 'p-3',
+  lg: 'p-4',
 }
 
+// Flat panel — no rounded corners, single 1px border. Subtle visual weight only.
 export default function Card({ children, className = '', padding = 'md' }: CardProps) {
   return (
-    <div className={`bg-white rounded-lg border border-gray-200 ${paddingStyles[padding]} ${className}`}>
+    <div className={`bg-panel border border-border ${paddingStyles[padding]} ${className}`}>
       {children}
     </div>
   )
@@ -25,12 +26,14 @@ export default function Card({ children, className = '', padding = 'md' }: CardP
 
 export function CardHeader({ children, className = '' }: { children: ReactNode; className?: string }) {
   return (
-    <div className={`flex items-center justify-between p-4 border-b border-gray-200 ${className}`}>
+    <div
+      className={`flex items-center justify-between bg-headerBar border-b border-border px-3 py-2 text-[12px] font-semibold uppercase tracking-wide text-text ${className}`}
+    >
       {children}
     </div>
   )
 }
 
 export function CardContent({ children, className = '' }: { children: ReactNode; className?: string }) {
-  return <div className={`p-4 ${className}`}>{children}</div>
+  return <div className={`p-3 ${className}`}>{children}</div>
 }

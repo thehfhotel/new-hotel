@@ -140,7 +140,7 @@ pub async fn list_rates(
             r.rate_room_type_id,
             rt.type_name,
             r.rate_type,
-            r.rate_value,
+            r.rate_value::float8 as rate_value,
             r.rate_valid_from,
             r.rate_valid_to,
             r.rate_days_of_week,

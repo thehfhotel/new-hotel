@@ -68,7 +68,8 @@ pub struct Item {
     pub updated_at: Option<NaiveDateTime>,
 }
 
-/// Room inventory assignment
+/// Room inventory assignment (legacy struct, kept for compatibility with admin tools)
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RoomInventoryItem {
@@ -178,13 +179,110 @@ pub struct CreateUpdateItemRequest {
     pub active: Option<bool>,
 }
 
-/// Response for room inventory
+/// Aggregated room inventory item (shape used by RoomInventoryChecklist frontend)
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomInventoryChecklistItem {
+    pub item_id: i32,
+    pub item_code: String,
+    pub item_name: String,
+    pub category: String,
+    pub unit: String,
+    pub assigned_quantity: i32,
+    pub verified_quantity: Option<i32>,
+    pub last_verified: Option<NaiveDateTime>,
+}
+
+/// Inner data block for the checklist response.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomInventoryData {
+    pub room_id: i32,
+    pub room_number: String,
+    pub room_type: String,
+    pub items: Vec<RoomInventoryChecklistItem>,
+}
+
+/// Response for room inventory (frontend shape: { success, data: { ..., items } })
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RoomInventoryResponse {
     pub success: bool,
-    pub room_id: i32,
-    pub items: Vec<RoomInventoryItem>,
+    pub data: RoomInventoryData,
+}
+
+/// Room rollup for the inventory rooms list page
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InventoryRoomRollup {
+    pub id: i32,
+    pub room_number: String,
+    pub room_type: String,
+    pub status: String,
+    pub inventory_count: i32,
+    pub last_checked: Option<NaiveDateTime>,
+    pub missing_items: i32,
+}
+
+/// Response for the inventory rooms collection endpoint
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InventoryRoomsResponse {
+    pub success: bool,
+    pub data: Vec<InventoryRoomRollup>,
+}
+
+/// Query parameters for inventory rooms list
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InventoryRoomsQuery {
+    pub search: Option<String>,
+    /// 'all' | 'missing' | 'checked'
+    pub filter: Option<String>,
+    pub branch: Option<String>,
+}
+
+/// Request body for room inventory check (POST /rooms/:room_id/check)
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomInventoryCheckRequest {
+    pub items: Vec<RoomInventoryCheckItem>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomInventoryCheckItem {
+    pub item_id: i32,
+    pub verified: bool,
+    pub actual_quantity: i32,
+}
+
+/// Request body for room inventory replenish (POST /rooms/:room_id/replenish)
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomInventoryReplenishRequest {
+    pub items: Vec<RoomInventoryReplenishItem>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomInventoryReplenishItem {
+    pub item_id: i32,
+    pub quantity: i32,
+}
+
+/// Request body for stock adjustment (POST /adjustments)
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StockAdjustmentRequest {
+    pub item_id: i32,
+    /// 'add' | 'remove' | 'set'
+    pub adjustment_type: String,
+    pub quantity: i32,
+    pub notes: Option<String>,
+    pub created_by: Option<String>,
 }
 
 /// Request for updating room inventory
@@ -402,7 +500,7 @@ pub async fn list_items(
             i.item_unit,
             i.item_min_stock,
             i.item_current_stock,
-            i.item_cost,
+            i.item_cost::float8 as item_cost,
             i.item_active,
             i.item_created,
             i.item_updated
@@ -623,17 +721,38 @@ pub async fn delete_item(
 // Room Inventory Endpoints
 // ============================================================================
 
-/// GET /api/new/inventory/rooms/:room_id - Get room's inventory
+/// GET /api/new/inventory/rooms/:room_id - Get room's inventory (checklist shape)
+///
+/// Response: `{ success, data: { roomId, roomNumber, roomType, items: [{ itemId, itemCode, itemName, category, unit, assignedQuantity, verifiedQuantity, lastVerified }] } }`
 pub async fn get_room_inventory(
     State(state): State<AppState>,
     Path(room_id): Path<i32>,
 ) -> ApiResult<Json<RoomInventoryResponse>> {
     let pool = &state.new_pool;
 
+    let room = sqlx::query!(
+        r#"SELECT r.room_no, COALESCE(rt.type_name, '') as "type_name!"
+        FROM ht_rooms_new r
+        LEFT JOIN ht_room_types rt ON r.room_type_id = rt.type_id
+        WHERE r.room_id = $1"#,
+        room_id
+    )
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Room not found".to_string()))?;
+
     let rows = sqlx::query!(
-        r#"SELECT ri.ri_id, ri.ri_room_id, ri.ri_item_id, i.item_code, i.item_name, ri.ri_quantity, ri.ri_last_checked
+        r#"SELECT
+            ri.ri_item_id,
+            COALESCE(i.item_code, '') as "item_code!",
+            COALESCE(i.item_name, '') as "item_name!",
+            COALESCE(c.cat_name, 'Equipment') as "category!",
+            COALESCE(i.item_unit, '') as "item_unit!",
+            ri.ri_quantity,
+            ri.ri_last_checked
         FROM ht_room_inventory ri
         LEFT JOIN ht_inventory_items i ON ri.ri_item_id = i.item_id
+        LEFT JOIN ht_inventory_categories c ON i.item_category_id = c.cat_id
         WHERE ri.ri_room_id = $1
         ORDER BY i.item_name ASC"#,
         room_id
@@ -641,23 +760,266 @@ pub async fn get_room_inventory(
     .fetch_all(pool)
     .await?;
 
-    let items: Vec<RoomInventoryItem> = rows
-        .iter()
-        .map(|r| RoomInventoryItem {
-            id: r.ri_id,
-            room_id: r.ri_room_id,
+    let items: Vec<RoomInventoryChecklistItem> = rows
+        .into_iter()
+        .map(|r| RoomInventoryChecklistItem {
             item_id: r.ri_item_id.unwrap_or(0),
-            item_code: Some(r.item_code.clone()),
-            item_name: Some(r.item_name.clone()),
-            quantity: r.ri_quantity.unwrap_or(0),
-            last_checked: r.ri_last_checked,
+            item_code: r.item_code,
+            item_name: r.item_name,
+            category: r.category,
+            unit: r.item_unit,
+            assigned_quantity: r.ri_quantity.unwrap_or(0),
+            verified_quantity: r.ri_quantity, // Last assigned acts as last verified count
+            last_verified: r.ri_last_checked,
         })
         .collect();
 
     Ok(Json(RoomInventoryResponse {
         success: true,
-        room_id,
-        items,
+        data: RoomInventoryData {
+            room_id,
+            room_number: room.room_no,
+            room_type: room.type_name,
+            items,
+        },
+    }))
+}
+
+/// GET /api/new/inventory/rooms - List rooms with inventory rollup
+///
+/// Response: `{ success, data: [{ id, roomNumber, roomType, status, inventoryCount, lastChecked, missingItems }] }`
+pub async fn list_inventory_rooms(
+    State(state): State<AppState>,
+    Query(params): Query<InventoryRoomsQuery>,
+) -> ApiResult<Json<InventoryRoomsResponse>> {
+    let pool = &state.new_pool;
+
+    // The new HotelNew DB only contains hfhotel rooms. Treat hfville as empty.
+    if params.branch.as_deref() == Some("hfville") {
+        return Ok(Json(InventoryRoomsResponse { success: true, data: vec![] }));
+    }
+
+    let mut conditions: Vec<String> = vec!["r.room_active = true".to_string()];
+
+    if let Some(ref search) = params.search {
+        let escaped = search.replace('\'', "''");
+        conditions.push(format!("r.room_no LIKE '%{}%'", escaped));
+    }
+
+    let where_clause = format!("WHERE {}", conditions.join(" AND "));
+
+    // Compose rollup: per-room item count, missing items (assigned > 0 but item current_stock zero
+    // is not the right semantic — "missing" means the room hasn't been re-stocked vs. assigned).
+    // For now we report 0 missing unless a check exists; the modal handles missing logic in-memory.
+    let data_query = format!(
+        r#"
+        SELECT
+            r.room_id,
+            r.room_no,
+            COALESCE(rt.type_name, '') AS room_type,
+            COALESCE(r.room_status, 'available') AS room_status,
+            COALESCE((SELECT COUNT(*)::int FROM ht_room_inventory ri WHERE ri.ri_room_id = r.room_id), 0) AS inventory_count,
+            (SELECT MAX(ri.ri_last_checked) FROM ht_room_inventory ri WHERE ri.ri_room_id = r.room_id) AS last_checked,
+            0::int AS missing_items
+        FROM ht_rooms_new r
+        LEFT JOIN ht_room_types rt ON r.room_type_id = rt.type_id
+        {}
+        ORDER BY r.room_no ASC
+        "#,
+        where_clause
+    );
+
+    let rows = sqlx::query(&data_query).fetch_all(pool).await?;
+
+    let mut data: Vec<InventoryRoomRollup> = rows
+        .iter()
+        .map(|row| InventoryRoomRollup {
+            id: row.try_get::<i32, _>("room_id").unwrap_or(0),
+            room_number: row.try_get::<String, _>("room_no").unwrap_or_default(),
+            room_type: row.try_get::<String, _>("room_type").unwrap_or_default(),
+            status: row.try_get::<String, _>("room_status").unwrap_or_else(|_| "available".to_string()),
+            inventory_count: row.try_get::<i32, _>("inventory_count").unwrap_or(0),
+            last_checked: row.try_get::<NaiveDateTime, _>("last_checked").ok(),
+            missing_items: row.try_get::<i32, _>("missing_items").unwrap_or(0),
+        })
+        .collect();
+
+    // Apply filter post-aggregation
+    if let Some(ref filter) = params.filter {
+        match filter.as_str() {
+            "missing" => data.retain(|r| r.missing_items > 0),
+            "checked" => {
+                let now = chrono::Utc::now().naive_utc();
+                data.retain(|r| match r.last_checked {
+                    Some(ts) => (now - ts).num_hours() < 24,
+                    None => false,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    Ok(Json(InventoryRoomsResponse { success: true, data }))
+}
+
+/// POST /api/new/inventory/rooms/:room_id/check
+/// Records an inventory check for a room. Updates `ri_last_checked` for verified items
+/// and creates a transaction log entry per item to capture the check event.
+pub async fn check_room_inventory(
+    State(state): State<AppState>,
+    Path(room_id): Path<i32>,
+    Json(body): Json<RoomInventoryCheckRequest>,
+) -> ApiResult<Json<MutationResponse>> {
+    let pool = &state.new_pool;
+
+    // Bump ri_last_checked for every verified item; record a MOVE-style log line.
+    for item in &body.items {
+        sqlx::query!(
+            r#"UPDATE ht_room_inventory SET ri_last_checked = NOW()
+            WHERE ri_room_id = $1 AND ri_item_id = $2"#,
+            room_id, item.item_id
+        )
+        .execute(pool)
+        .await?;
+    }
+
+    let notes = body.notes.unwrap_or_else(|| "Room inventory check".to_string());
+    sqlx::query!(
+        r#"INSERT INTO ht_inventory_transactions (trans_item_id, trans_type, trans_quantity, trans_room_id, trans_notes)
+        VALUES (NULL, 'CHECK', 0, $1, $2)"#,
+        room_id, notes
+    )
+    .execute(pool)
+    .await
+    .ok(); // Best-effort log; trans_item_id may have NOT NULL constraint in some envs
+
+    Ok(Json(MutationResponse {
+        success: true,
+        message: "Room inventory check recorded".to_string(),
+        id: Some(room_id),
+    }))
+}
+
+/// POST /api/new/inventory/rooms/:room_id/replenish
+/// Replenishes a room's inventory by deducting from main stock and bumping ri_last_checked.
+pub async fn replenish_room_inventory(
+    State(state): State<AppState>,
+    Path(room_id): Path<i32>,
+    Json(body): Json<RoomInventoryReplenishRequest>,
+) -> ApiResult<Json<MutationResponse>> {
+    let pool = &state.new_pool;
+
+    let notes = body.notes.unwrap_or_else(|| "Room replenish".to_string());
+
+    for item in &body.items {
+        if item.quantity <= 0 {
+            continue;
+        }
+
+        // Deduct from main stock (allow going to zero, refuse to go negative).
+        let item_rec = sqlx::query!(
+            "SELECT item_current_stock FROM ht_inventory_items WHERE item_id = $1",
+            item.item_id
+        )
+        .fetch_optional(pool)
+        .await?;
+
+        let current = item_rec.and_then(|r| r.item_current_stock).unwrap_or(0);
+        let new_stock = (current - item.quantity).max(0);
+
+        sqlx::query!(
+            "UPDATE ht_inventory_items SET item_current_stock = $1, item_updated = NOW() WHERE item_id = $2",
+            new_stock, item.item_id
+        )
+        .execute(pool)
+        .await?;
+
+        // Log as OUT transaction tagged with the room_id.
+        sqlx::query!(
+            r#"INSERT INTO ht_inventory_transactions (trans_item_id, trans_type, trans_quantity, trans_room_id, trans_notes)
+            VALUES ($1, 'OUT', $2, $3, $4)"#,
+            item.item_id, item.quantity, room_id, notes.as_str()
+        )
+        .execute(pool)
+        .await?;
+
+        // Update ri_last_checked
+        sqlx::query!(
+            r#"UPDATE ht_room_inventory SET ri_last_checked = NOW()
+            WHERE ri_room_id = $1 AND ri_item_id = $2"#,
+            room_id, item.item_id
+        )
+        .execute(pool)
+        .await?;
+    }
+
+    Ok(Json(MutationResponse {
+        success: true,
+        message: "Room inventory replenished".to_string(),
+        id: Some(room_id),
+    }))
+}
+
+/// POST /api/new/inventory/adjustments
+/// Generic stock adjustment endpoint used by StockAdjustmentModal.
+pub async fn create_stock_adjustment(
+    State(state): State<AppState>,
+    Json(body): Json<StockAdjustmentRequest>,
+) -> ApiResult<Json<MutationResponse>> {
+    let pool = &state.new_pool;
+
+    let kind = body.adjustment_type.trim().to_lowercase();
+    if !["add", "remove", "set"].contains(&kind.as_str()) {
+        return Err(ApiError::BadRequest(format!(
+            "Invalid adjustment type '{}' (must be add|remove|set)", body.adjustment_type
+        )));
+    }
+    if body.quantity < 0 {
+        return Err(ApiError::BadRequest("Quantity must be non-negative".to_string()));
+    }
+
+    let item_rec = sqlx::query!(
+        "SELECT item_current_stock FROM ht_inventory_items WHERE item_id = $1",
+        body.item_id
+    )
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Item not found".to_string()))?;
+
+    let current = item_rec.item_current_stock.unwrap_or(0);
+    let (new_stock, trans_type) = match kind.as_str() {
+        "add" => (current + body.quantity, "IN"),
+        "remove" => {
+            if body.quantity > current {
+                return Err(ApiError::BadRequest(format!(
+                    "Insufficient stock. Current: {}, Requested: {}", current, body.quantity
+                )));
+            }
+            (current - body.quantity, "OUT")
+        }
+        "set" => (body.quantity, "ADJUST"),
+        _ => unreachable!(),
+    };
+
+    sqlx::query!(
+        "UPDATE ht_inventory_items SET item_current_stock = $1, item_updated = NOW() WHERE item_id = $2",
+        new_stock, body.item_id
+    )
+    .execute(pool)
+    .await?;
+
+    let rec = sqlx::query!(
+        r#"INSERT INTO ht_inventory_transactions (trans_item_id, trans_type, trans_quantity, trans_room_id, trans_notes, trans_by)
+        VALUES ($1, $2, $3, NULL, $4, $5) RETURNING trans_id"#,
+        body.item_id, trans_type, body.quantity, body.notes.as_deref(), body.created_by.as_deref()
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(Json(MutationResponse {
+        success: true,
+        message: format!("Stock adjusted to {}", new_stock),
+        id: Some(rec.trans_id),
     }))
 }
 

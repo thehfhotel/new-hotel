@@ -9,22 +9,26 @@ interface BadgeProps {
   size?: 'sm' | 'md'
 }
 
+// Flat rectangles, never pills. Each variant is a faint tinted background +
+// matching 1px border + saturated text for legibility.
 const variantStyles: Record<string, string> = {
-  success: 'bg-emerald-500/10 text-emerald-400',
-  warning: 'bg-amber-500/10 text-amber-400',
-  error: 'bg-red-500/10 text-red-400',
-  info: 'bg-sky-500/10 text-sky-400',
-  neutral: 'bg-gray-200 text-gray-700',
+  success: 'bg-success/10 text-success border border-success/40',
+  warning: 'bg-warning/10 text-warning border border-warning/40',
+  error:   'bg-error/10 text-error border border-error/40',
+  info:    'bg-info/10 text-info border border-info/40',
+  neutral: 'bg-headerBar text-text border border-border',
 }
 
 const sizeStyles: Record<string, string> = {
-  sm: 'text-xs px-2 py-0.5',
-  md: 'text-sm px-2.5 py-1',
+  sm: 'text-[11px] px-1.5 py-0',
+  md: 'text-[12px] px-2 py-0.5',
 }
 
 export default function Badge({ children, variant = 'neutral', className, size = 'sm' }: BadgeProps) {
   return (
-    <span className={`inline-flex items-center font-medium rounded-full ${sizeStyles[size]} ${className || variantStyles[variant]}`}>
+    <span
+      className={`inline-flex items-center font-medium rounded-[2px] leading-tight ${sizeStyles[size]} ${className || variantStyles[variant]}`}
+    >
       {children}
     </span>
   )

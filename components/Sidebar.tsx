@@ -15,7 +15,6 @@ import {
   BarChart3,
   LayoutGrid,
   DollarSign,
-  Hotel,
   ArrowLeftRight,
   ChevronLeft,
   ChevronRight,
@@ -103,78 +102,87 @@ export default function Sidebar() {
 
   return (
     <aside
-      className={`fixed top-0 left-0 h-screen bg-white border-r border-gray-200 z-40 flex flex-col transition-all duration-300 ${
+      className={`fixed top-0 left-0 h-screen bg-panel border-r border-border z-40 flex flex-col transition-all duration-300 ${
         !mounted ? 'opacity-0' : 'opacity-100'
       }`}
       style={{ width }}
     >
-      {/* Logo */}
-      <div className="flex items-center gap-2 px-3 h-16 border-b border-gray-200 shrink-0">
-        <Hotel size={28} className="text-red-500 shrink-0" />
-        {!collapsed && (
-          <div className="overflow-hidden whitespace-nowrap">
-            <span className="text-lg font-bold text-gray-900 tracking-tight">ระบบจัดการโรงแรม</span>
-            <span className="ml-2 text-[10px] font-semibold bg-red-600 text-white px-1.5 py-0.5 rounded tracking-wider uppercase">
-              New
-            </span>
-          </div>
+      {/* Brand bar — minimal wordmark, no icon, no NEW pill */}
+      <div className="flex items-center px-3 h-12 border-b border-border shrink-0">
+        {!collapsed ? (
+          <span className="text-[14px] font-semibold text-text tracking-tight whitespace-nowrap overflow-hidden">
+            ระบบจัดการโรงแรม
+          </span>
+        ) : (
+          <div className="w-full text-center text-[12px] font-semibold text-brand-500">HF</div>
         )}
       </div>
 
       {/* Branch Selector */}
-      {(
-        <div className="px-2 py-2 border-b border-gray-200 shrink-0">
-          {collapsed ? (
-            <button
-              onClick={() => {
-                const branches: Branch[] = ['hfhotel', 'hfville', 'all']
-                const idx = branches.indexOf(branch)
-                setBranch(branches[(idx + 1) % branches.length])
-              }}
-              className="w-full flex items-center justify-center p-2 rounded-lg text-gray-500 hover:bg-gray-100"
-              title={BRANCH_LABELS[branch]}
-            >
-              <MapPin size={18} className={branch === 'hfhotel' ? 'text-red-500' : branch === 'hfville' ? 'text-blue-500' : 'text-purple-500'} />
-            </button>
-          ) : (
-            <div className="flex gap-1">
-              {(['hfhotel', 'hfville', 'all'] as Branch[]).map((b) => (
+      <div className="px-2 py-1.5 border-b border-border shrink-0">
+        {collapsed ? (
+          <button
+            onClick={() => {
+              const branches: Branch[] = ['hfhotel', 'hfville', 'all']
+              const idx = branches.indexOf(branch)
+              setBranch(branches[(idx + 1) % branches.length])
+            }}
+            className="w-full flex items-center justify-center p-1.5 text-textMuted hover:bg-headerBar"
+            title={BRANCH_LABELS[branch]}
+          >
+            <MapPin
+              size={16}
+              className={
+                branch === 'hfhotel'
+                  ? 'text-brand-500'
+                  : branch === 'hfville'
+                  ? 'text-info'
+                  : 'text-textMuted'
+              }
+            />
+          </button>
+        ) : (
+          <div className="flex gap-0.5">
+            {(['hfhotel', 'hfville', 'all'] as Branch[]).map((b) => {
+              const disabled = b === 'hfville' && !villeAvailable
+              return (
                 <button
                   key={b}
-                  onClick={() => setBranch(b)}
-                  className={`flex-1 text-[11px] font-medium py-1.5 rounded-md transition-colors ${
+                  onClick={() => !disabled && setBranch(b)}
+                  disabled={disabled}
+                  className={`flex-1 text-[11px] font-medium py-1 transition-colors ${
                     branch === b
-                      ? 'bg-red-600 text-white'
-                      : 'text-gray-500 hover:bg-gray-100'
+                      ? 'bg-brand-500 text-white'
+                      : 'text-textMuted hover:bg-headerBar disabled:opacity-50'
                   }`}
                 >
                   {BRANCH_LABELS[b]}
                 </button>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
+              )
+            })}
+          </div>
+        )}
+      </div>
 
       {/* Navigation */}
-      <nav className="flex-1 overflow-y-auto py-4 px-2">
+      <nav className="flex-1 overflow-y-auto py-2 px-1">
         {sections.map((section, idx) => (
-          <div key={section.title} className={idx > 0 ? 'mt-6' : ''}>
+          <div key={section.title} className={idx > 0 ? 'mt-3' : ''}>
             {!collapsed && (
-              <div className="text-[10px] uppercase tracking-wider text-gray-500 font-semibold px-3 mb-1">
+              <div className="text-[10px] uppercase tracking-wide text-textMuted font-semibold px-3 py-1">
                 {section.title}
               </div>
             )}
-            <div className="space-y-1">
+            <div>
               {section.items.map((item) => (
                 <Link
                   key={item.href}
                   href={item.href}
                   title={collapsed ? item.label : undefined}
-                  className={`flex items-center gap-3 px-3 py-2 rounded-lg transition-colors text-sm ${
+                  className={`flex items-center gap-2 px-3 py-1.5 transition-colors text-[13px] ${
                     isActive(item.href)
-                      ? 'bg-red-600/15 text-red-600 border-l-2 border-red-500'
-                      : 'text-gray-500 hover:bg-gray-100 hover:text-gray-900'
+                      ? 'bg-brand-50 border-l-[3px] border-brand-500 text-brand-700 font-semibold'
+                      : 'border-l-[3px] border-transparent text-text hover:bg-headerBar'
                   } ${collapsed ? 'justify-center' : ''}`}
                 >
                   <span className="shrink-0">{item.icon}</span>
@@ -187,24 +195,24 @@ export default function Sidebar() {
       </nav>
 
       {/* Bottom */}
-      <div className="border-t border-gray-200 p-2 shrink-0 space-y-1">
+      <div className="border-t border-border p-1 shrink-0">
         <Link
           href="/"
           title={collapsed ? 'Legacy' : undefined}
-          className={`flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-gray-500 hover:bg-gray-100 hover:text-gray-900 transition-colors ${
+          className={`flex items-center gap-2 px-3 py-1.5 text-[13px] text-textMuted hover:bg-headerBar hover:text-text transition-colors ${
             collapsed ? 'justify-center' : ''
           }`}
         >
-          <ArrowLeftRight size={20} className="shrink-0" />
+          <ArrowLeftRight size={16} className="shrink-0" />
           {!collapsed && <span>Legacy</span>}
         </Link>
         <button
           onClick={toggleCollapse}
-          className={`flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-gray-500 hover:bg-gray-100 hover:text-gray-900 transition-colors w-full ${
+          className={`flex items-center gap-2 px-3 py-1.5 text-[13px] text-textMuted hover:bg-headerBar hover:text-text transition-colors w-full ${
             collapsed ? 'justify-center' : ''
           }`}
         >
-          {collapsed ? <ChevronRight size={20} /> : <ChevronLeft size={20} />}
+          {collapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
           {!collapsed && <span>ย่อเมนู</span>}
         </button>
       </div>

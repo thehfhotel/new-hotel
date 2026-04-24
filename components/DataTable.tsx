@@ -149,35 +149,35 @@ export default function DataTable<T extends object>({
     }
 
     return (
-      <div className="flex items-center justify-between px-4 py-3 bg-white border-t border-gray-200">
-        <div className="text-sm text-gray-500">
-          แสดง <span className="font-medium text-gray-800">{startItem}</span> -{' '}
-          <span className="font-medium text-gray-800">{endItem}</span> จาก{' '}
-          <span className="font-medium text-gray-800">{totalItems.toLocaleString()}</span> รายการ
+      <div className="flex items-center justify-between px-3 py-1.5 bg-panel border-t border-border">
+        <div className="text-[12px] text-textMuted">
+          แสดง <span className="font-semibold text-text">{startItem}</span> -{' '}
+          <span className="font-semibold text-text">{endItem}</span> จาก{' '}
+          <span className="font-semibold text-text">{totalItems.toLocaleString()}</span> รายการ
         </div>
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-0.5">
           <button
             onClick={() => onPageChange(currentPage - 1)}
             disabled={currentPage === 1}
-            className="p-2 rounded-md hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-gray-500"
+            className="p-1 hover:bg-headerBar disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-textMuted"
             aria-label="หน้าก่อนหน้า"
           >
-            <ChevronLeft className="w-5 h-5" />
+            <ChevronLeft className="w-4 h-4" />
           </button>
 
           {pageNumbers.map((page, index) =>
             typeof page === 'string' ? (
-              <span key={`ellipsis-${index}`} className="px-3 py-1 text-gray-500">
+              <span key={`ellipsis-${index}`} className="px-2 py-0.5 text-textMuted text-[12px]">
                 {page}
               </span>
             ) : (
               <button
                 key={page}
                 onClick={() => onPageChange(page)}
-                className={`px-3 py-1 rounded-md transition-colors ${
+                className={`px-2 py-0.5 text-[12px] transition-colors ${
                   currentPage === page
-                    ? 'bg-red-600 text-white'
-                    : 'hover:bg-gray-100 text-gray-500'
+                    ? 'bg-brand-500 text-white'
+                    : 'hover:bg-headerBar text-text'
                 }`}
               >
                 {page}
@@ -188,10 +188,10 @@ export default function DataTable<T extends object>({
           <button
             onClick={() => onPageChange(currentPage + 1)}
             disabled={currentPage === totalPages}
-            className="p-2 rounded-md hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-gray-500"
+            className="p-1 hover:bg-headerBar disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-textMuted"
             aria-label="หน้าถัดไป"
           >
-            <ChevronRight className="w-5 h-5" />
+            <ChevronRight className="w-4 h-4" />
           </button>
         </div>
       </div>
@@ -199,18 +199,18 @@ export default function DataTable<T extends object>({
   }
 
   return (
-    <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+    <div className="bg-panel border border-border overflow-hidden">
       <div className="overflow-x-auto">
-        <table className="w-full">
-          <thead className="bg-gray-100 border-b border-gray-300">
+        <table className="w-full text-[13px]">
+          <thead className="bg-headerBar border-b border-border">
             <tr>
               {columns.map((column) => (
                 <th
                   key={String(column.key)}
                   onClick={() => handleSort(String(column.key), column.sortable)}
                   className={`
-                    px-4 py-3 text-left text-sm font-semibold text-gray-700
-                    ${column.sortable ? 'cursor-pointer hover:bg-gray-200' : ''}
+                    px-3 py-1.5 text-left text-[12px] font-semibold text-text
+                    ${column.sortable ? 'cursor-pointer hover:bg-border/40' : ''}
                     ${column.width || ''}
                   `}
                 >
@@ -221,15 +221,15 @@ export default function DataTable<T extends object>({
                         <ChevronUp
                           className={`w-3 h-3 -mb-1 ${
                             sortColumn === column.key && sortDirection === 'asc'
-                              ? 'text-red-600'
-                              : 'text-gray-400'
+                              ? 'text-brand-500'
+                              : 'text-textMuted/60'
                           }`}
                         />
                         <ChevronDown
                           className={`w-3 h-3 ${
                             sortColumn === column.key && sortDirection === 'desc'
-                              ? 'text-red-600'
-                              : 'text-gray-400'
+                              ? 'text-brand-500'
+                              : 'text-textMuted/60'
                           }`}
                         />
                       </span>
@@ -239,19 +239,19 @@ export default function DataTable<T extends object>({
               ))}
             </tr>
           </thead>
-          <tbody className="divide-y divide-gray-200">
+          <tbody>
             {loading ? (
               <tr>
-                <td colSpan={columns.length} className="px-4 py-12 text-center">
+                <td colSpan={columns.length} className="px-3 py-8 text-center">
                   <div className="flex items-center justify-center gap-2">
-                    <div className="w-5 h-5 border-2 border-red-500 border-t-transparent rounded-full animate-spin"></div>
-                    <span className="text-gray-500">กำลังโหลดข้อมูล...</span>
+                    <div className="w-4 h-4 border-2 border-brand-500 border-t-transparent rounded-full animate-spin"></div>
+                    <span className="text-textMuted">กำลังโหลดข้อมูล...</span>
                   </div>
                 </td>
               </tr>
             ) : sortedData.length === 0 ? (
               <tr>
-                <td colSpan={columns.length} className="px-4 py-12 text-center text-gray-500">
+                <td colSpan={columns.length} className="px-3 py-8 text-center text-textMuted">
                   ไม่พบข้อมูล
                 </td>
               </tr>
@@ -261,14 +261,14 @@ export default function DataTable<T extends object>({
                   key={(item as Record<string, unknown>)['id'] as string ?? (item as Record<string, unknown>)['bookNo'] as string ?? index}
                   onClick={() => onRowClick?.(item)}
                   className={`
-                    transition-colors
-                    ${onRowClick ? 'cursor-pointer hover:bg-gray-100' : 'hover:bg-gray-100/50'}
+                    h-8 border-b border-border/60 even:bg-rowAlt transition-colors
+                    ${onRowClick ? 'cursor-pointer hover:bg-brand-50' : 'hover:bg-headerBar'}
                   `}
                 >
                   {columns.map((column) => (
                     <td
                       key={String(column.key)}
-                      className={`px-4 py-3 text-sm text-gray-700 ${column.width || ''}`}
+                      className={`px-3 py-1 text-text ${column.width || ''}`}
                     >
                       {column.render
                         ? column.render(item)
