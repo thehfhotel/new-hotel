@@ -71,3 +71,8 @@ sha2 = "0.10"
 
 # Config
 dotenvy = "0.15"
+
+# async fn in traits with object-safety. Already pulled in transitively by axum,
+# bb8 and tiberius — declared explicitly so we can `#[async_trait::async_trait]`
+# our `repository::*Repository` traits without depending on a transitive feature.
+async-trait = "0.1"
