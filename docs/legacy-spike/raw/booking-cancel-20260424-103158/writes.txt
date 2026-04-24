@@ -1,0 +1,10 @@
+[10:33:33] INSERT INTO [HT_Customers]([id],[Cust_no],[Cust_perfix],[Cust_name],[Cust_name2],[Cust_Type],[Cust_Email],[Cust_Add_no],[Cust_Add_moo],[Cust_Add_soi],[Cust_Add_road],[Cust_Add_tambon],[Cust_Add_ampore],[Cust_Add_province],[Cust_Add_code],[Cust_Add_tel],[Cu
+[10:33:33] INSERT INTO [HT_Book_H]( [Book_ID],[Book_Date],[Book_Cust_ID],[Book_Cust_Name],[Book_Cust_Name2],[Book_Cust_Tel],[Book_Price_Total],[Book_Price_Pay],[Book_Status],[Book_Date_in],[Book_Date_out],[Book_by],[Book_room_all],[Book_room_note],[book_room_type],Bo
+[10:33:33] INSERT INTO [HT_Book_Ds]([Book_No],[Book_Room_Type],[Book_Room_Start],[Book_Room_End],[Book_Room_Price],[Book_Room_Night],[Book_Room_Num],[Book_Room_PriceToTal],[Book_Room_Note])VALUES( 'R014811','403','4/25/2026 12:00:00 PM','4/27/2026 11:59:59 AM','0','2
+[10:33:33] INSERT INTO [HT_Book_Date]([id],[Book_no],[Book_type],[Book_date_ds],[Book_Num],[Book_USE])VALUES(47288,'R014811','403','4/26/2026',1,0)
+[10:33:33] INSERT INTO [HT_Book_Date]([id],[Book_no],[Book_type],[Book_date_ds],[Book_Num],[Book_USE])VALUES(47287,'R014811','403','4/25/2026',1,0)
+[10:34:02] update HT_Rooms set room_book_ds='',Room_Book='',Room_Book_Name='',Room_Book_Time='' where room_book in (select id from ht_book_date  where Book_no='R014811')
+[10:34:02] update HT_Book_H set Book_Status='ยกเลิก' where Book_ID='R014811'
+[10:34:02] update HT_Book_ds set Book_status=3 where Book_No='R014811'
+[10:34:02] delete from  HT_Book_Date where Book_no='R014811'
+[10:34:02] update HT_Book_H set book_status='ยกเลิก' where book_id='R014811'
