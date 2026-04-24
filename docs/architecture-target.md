@@ -15,17 +15,18 @@ State C (decommissioned): Only our app                — sync + writeback both 
 
 ---
 
-## 1. Layered architecture
+## 1. Layered architecture (event-driven)
 
 ```
-                    BROWSER
-                       │
-                       │ HTTPS
-                       ▼
-        ┌──────────────────────────────┐
-        │  Frontend: Next.js 16        │
-        │  – single /app/* tree        │
-        │  – fetch /api/*              │
+                    BROWSER  ◀── SSE /api/events ──┐
+                       │                            │
+                       │ HTTPS                      │
+                       ▼                            │ real-time
+        ┌──────────────────────────────┐            │ event push
+        │  Frontend: Next.js 16        │            │ (sub-100ms)
+        │  – single /app/* tree        │            │
+        │  – fetch /api/*              │            │
+        │  – useRealtimeEvents() hook  │ ───────────┘
         └──────────────┬───────────────┘
                        │
                        ▼
@@ -65,60 +66,68 @@ State C (decommissioned): Only our app                — sync + writeback both 
                          │
                          ▼
         ┌──────────────────────────────────────┐
-        │  Postgres (newdb) — SOURCE OF TRUTH  │
-        │                                      │
-        │  ┌─────────────────────────────┐     │
-        │  │ canonical tables (ht_*)     │     │
-        │  │ – customers, bookings, etc. │     │
-        │  │ – owns its own IDs (UUIDs)  │     │
-        │  │ – stores legacy_id refs     │     │
-        │  └─────────────────────────────┘     │
-        │                                      │
-        │  ┌─────────────────────────────┐     │
-        │  │ writeback_jobs (outbox)     │     │
-        │  │ – id, intent, payload       │     │
-        │  │ – idempotency_key, status   │     │
-        │  │ – LISTEN/NOTIFY channel     │     │
-        │  └─────────────────────────────┘     │
-        │                                      │
-        │  ┌─────────────────────────────┐     │
-        │  │ legacy_mirror schema        │     │
-        │  │ – read-only snapshot of MSS │     │
-        │  │ – populated by sync worker  │     │
-        │  │ – used to detect drift /    │     │
-        │  │   backfill new legacy data  │     │
-        │  └─────────────────────────────┘     │
-        └──────────┬──────────┬────────────────┘
-                   │          │
-                   │ NOTIFY   │ SELECT (drift detection)
-                   ▼          ▼
+        │  Postgres (newdb) — SOURCE OF TRUTH + EVENT BUS │
+        │                                                 │
+        │  ┌─────────────────────────────┐                │
+        │  │ canonical tables (ht_*)     │                │
+        │  │ – customers, bookings, etc. │                │
+        │  │ – owns its own IDs (UUIDs)  │                │
+        │  │ – stores legacy_id refs     │                │
+        │  └─────────────────────────────┘                │
+        │                                                 │
+        │  ┌─────────────────────────────┐                │
+        │  │ writeback_jobs (outbox)     │  ◀─┐           │
+        │  │ – queue for legacy MSSQL    │    │ enqueued  │
+        │  └─────────────────────────────┘    │ in same   │
+        │                                     │ TX as     │
+        │  ┌─────────────────────────────┐    │ canonical │
+        │  │ event_log (durable bus)     │  ◀─┤ write     │
+        │  │ – every domain event        │    │           │
+        │  │ – pg_notify('domain_events')│    │           │
+        │  │ – replay-safe               │    │           │
+        │  └────────────┬────────────────┘    │           │
+        │               │                     │           │
+        │  ┌────────────│────────────────┐    │           │
+        │  │ legacy_mir │or schema       │    │           │
+        │  │ – read-onl │ snapshot of MSS│    │           │
+        │  │ – CT water │ark stored too  │    │           │
+        │  └────────────│────────────────┘    │           │
+        └───────┬───────┴──────┬──────────────┴───────────┘
+                │              │ NOTIFY
+                │              │ 'domain_events'
+                │ SELECT       │
+                │              ├────────────────────┐
+                ▼              ▼                    ▼
+        ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐
+        │ writeback    │  │ SSE          │  │ audit logger,    │
+        │ worker       │  │ broadcaster  │  │ notifications,   │
+        │ (Rust bin)   │  │ (in api proc)│  │ etc.             │
+        │              │  │              │  │ (subscribers)    │
+        │ – LISTEN'er  │  │ – LISTEN'er  │  └──────────────────┘
+        │ – pops outbox│  │ – pushes via │
+        │ – tiberius   │  │   SSE to all │
+        │ – TABLOCKX   │  │   browsers   │
+        └──────┬───────┘  └──────────────┘
+               │ tiberius (TDS)
+               ▼
+        ┌─────────────────────┐
+        │ Legacy MSSQL        │ ◀──── direct writes from .NET app
+        │ (external system)   │
+        │ + Change Tracking   │
+        │   ENABLED           │
+        └────────┬────────────┘
+                 │ SYS_CHANGE_VERSION poll (every 1s)
+                 ▼
         ┌──────────────────────────────────────┐
-        │  ★Adapter workers★ (3 Rust binaries) │
-        │                                      │
-        │  bin/writeback.rs                    │
-        │  – LISTENs writeback_channel         │
-        │  – pops jobs, replays to MSSQL       │
-        │  – TABLOCKX, HOLDLOCK pattern        │
-        │  – TOGGLE: WRITEBACK_ENABLED         │
-        │                                      │
-        │  bin/sync.rs (was scheduler/sync.rs) │
-        │  – pulls MSSQL → legacy_mirror       │
-        │  – detects new rows the .NET app     │
-        │    created (other clerks)            │
-        │  – upserts into canonical ht_* if    │
-        │    no matching row exists            │
+        │  bin/sync.rs  CT watcher             │
+        │  – pulls changed rows                │
+        │  – translates → DomainEvent          │
+        │  – UPSERTs into public.ht_*          │
+        │  – publishes to event bus            │
         │  – TOGGLE: LEGACY_SYNC_ENABLED       │
-        │                                      │
-        │  bin/ville_sync.rs (existing)        │
-        │  – cross-site to HF Ville            │
-        │  – TOGGLE: VILLE_SYNC_ENABLED        │
-        └──────────────┬───────────────────────┘
-                       │ tiberius (TDS)
-                       ▼
-              ┌─────────────────────┐
-              │ Legacy MSSQL        │ ◀──▶ 3rd-party .NET app
-              │ (external system)   │      (will be retired)
-              └─────────────────────┘
+        └──────────────────────────────────────┘
+        
+        Plus: bin/ville_sync.rs (existing, cross-site)
 ```
 
 The double-walled box (`╔ ... ╗`) is the **decommission boundary**. Everything inside survives the legacy app's removal. Everything outside (the workers + the legacy MSSQL) gets turned off without touching application code.
@@ -443,26 +452,348 @@ T+5:00  Sync runs
 
 Both are nice-to-have, not blockers.
 
-### 3.5d. Sync frequency vs freshness
+### 3.5d. Sync via event bus (not polling)
 
-Default: **every 1 minute** (was 5 min in the existing scheduler). The legacy DB load is minimal (incremental query on indexed columns). Tradeoff:
+**Replaced full-table polling with event-driven sync.** Latency target: sub-second in both directions.
 
-| Sync interval | Freshness | Legacy DB load | Recommended? |
-|---|---|---|---|
-| 30 sec | <1 min stale | very low | ✓ if legacy DB has spare capacity |
-| 1 min | <2 min stale | low | ✓ default |
-| 5 min | <10 min stale | minimal | only if DB is overloaded |
+See §3.6 below for the full event-driven design. Summary here:
 
-For "live" screens (e.g. room availability dashboard the front desk stares at), the UI can also fire a **manual refresh** button that triggers an on-demand sync via an internal endpoint — fast path for the rare cases someone needs absolute freshness.
+| Direction | Mechanism | Latency |
+|---|---|---|
+| Our app → PG → MSSQL | PG `LISTEN/NOTIFY` 'domain_events' channel + `writeback_jobs` outbox + worker | **~50ms** local, ~200ms to MSSQL |
+| .NET app → MSSQL → PG | SQL Server **Change Tracking** + watcher polling SYS_CHANGE_VERSION every 1 sec → publish to event bus | **~1 sec** worst case |
+| PG → Frontend browsers | Axum SSE endpoint subscribes to PG NOTIFY → pushes to all connected clients | **~50ms** end-to-end |
+
+**No more 1-minute polling tables.** The full-table scan moves to a fallback "reconcile drift" job that runs every 15 min as a safety net, not as the primary sync path.
 
 ### 3.5e. Transition-period reality
 
 During State B, the receptionist will probably:
 - Use whichever app they're more comfortable with for each task
-- Notice ~1-2 minute lag for the OTHER app to "see" their changes
+- Notice **sub-2-second lag** for the OTHER app to "see" their changes (event-driven, not polling)
 - Occasionally hit a conflict (last-write-wins)
 
-This matches what they're already used to (the .NET app is multi-client, already has clerks racing each other with no conflict resolution). Our system adds nothing worse.
+This matches what they're already used to (the .NET app is multi-client, already has clerks racing each other with no conflict resolution). Our system adds nothing worse — and adds real-time UI updates as a bonus.
+
+---
+
+## 3.6. Event-driven sync design
+
+**Goal:** sub-second propagation of changes from any source (our app, .NET app, system events) to all interested parties (other connected browsers, the writeback worker, the legacy MSSQL adapter, audit logs).
+
+### 3.6a. The event bus topology
+
+```
+                                  EVENT BUS
+                          (PG LISTEN/NOTIFY 'domain_events')
+                                       │
+       ┌───────────────────────────────┼───────────────────────────────┐
+       │                               │                               │
+   PUBLISHERS                          │                          SUBSCRIBERS
+       │                               │                               │
+       │                               │                               │
+       │                               │                  ┌────────────▼─────────┐
+   ┌───┴──────────────┐                │                  │ writeback worker     │
+   │ Service layer    │                │                  │ – picks intent       │
+   │ – publishes on   │ ──INSERT into──┤                  │   from outbox        │
+   │   every write    │  pg_notify(...)│                  │ – pushes to MSSQL    │
+   └──────────────────┘                │                  └──────────────────────┘
+                                       │
+                                       │                  ┌──────────────────────┐
+   ┌──────────────────┐                │                  │ SSE broadcaster      │
+   │ MSSQL CT watcher │ ──polls SYS_───┤                  │ – holds open HTTP    │
+   │ – every 1 sec    │  CHANGE_VERSION│ ────receives───▶ │   conns to browsers  │
+   │ – publishes      │  & publishes   │                  │ – pushes events      │
+   │   detected       │                │                  │   to UI              │
+   │   changes        │                │                  └──────────────────────┘
+   └──────────────────┘                │
+                                       │                  ┌──────────────────────┐
+   ┌──────────────────┐                │                  │ audit log writer     │
+   │ Cron jobs        │ ──occasionally─┤                  │ – appends every event│
+   │ (notifications,  │                │                  │   to ht_audit_log    │
+   │  reports, etc.)  │                │                  └──────────────────────┘
+   └──────────────────┘                │
+                                       │                  ┌──────────────────────┐
+                                       │                  │ notification fanout  │
+                                       │                  │ – Slack / email      │
+                                       └──────────────▶  │ – filters by type    │
+                                                          └──────────────────────┘
+```
+
+### 3.6b. Domain events (the contract)
+
+Every change in the system emits a typed event:
+
+```rust
+// outbox/event.rs
+pub enum DomainEvent {
+    BookingCreated     { id: Uuid, source: EventSource, snapshot: BookingSnapshot },
+    BookingModified    { id: Uuid, source: EventSource, before: BookingSnapshot, after: BookingSnapshot },
+    BookingCancelled   { id: Uuid, source: EventSource, reason: Option<String> },
+    
+    CheckInCreated     { id: Uuid, source: EventSource, snapshot: CheckInSnapshot },
+    CheckOutCompleted  { id: Uuid, source: EventSource },
+    CheckInCancelled   { id: Uuid, source: EventSource, reason: Option<String> },
+    
+    CustomerCreated    { id: Uuid, source: EventSource, snapshot: CustomerSnapshot },
+    CustomerModified   { id: Uuid, source: EventSource, changed_fields: Vec<String> },
+    
+    PaymentReceived    { check_in_id: Uuid, amount: Money, method: PaymentMethod, source: EventSource },
+    
+    RoomMarkedClean    { room_id: Uuid, by: String, source: EventSource },
+    RoomMarkedDirty    { room_id: Uuid, source: EventSource },
+}
+
+pub enum EventSource {
+    OurApp { user_id: Uuid, request_id: Uuid },     // came through our routes
+    LegacyApp { detected_at: DateTime<Utc> },        // detected via Change Tracking
+    System { reason: String },                       // scheduled job, reconcile, etc.
+}
+```
+
+Event payloads are JSON-serializable, durable (stored in `event_log` table), and back-compatible (new fields are optional).
+
+### 3.6c. Publication path (our writes)
+
+Our app's writes publish events in the **same transaction** as the canonical PG write:
+
+```rust
+// service/booking.rs
+impl BookingService {
+    pub async fn create(&self, cmd: CreateBookingCommand) -> Result<Booking, ServiceError> {
+        let mut tx = self.pg.begin().await?;
+        
+        // 1. Write canonical
+        let booking = self.repo.insert(&mut tx, ...).await?;
+        
+        // 2. Enqueue writeback (existing)
+        self.outbox.enqueue(&mut tx, WritebackIntent::CreateBooking { ... }).await?;
+        
+        // 3. Publish domain event
+        self.events.publish(&mut tx, DomainEvent::BookingCreated {
+            id: booking.id,
+            source: EventSource::OurApp { user_id: cmd.user_id, request_id: cmd.request_id },
+            snapshot: BookingSnapshot::from(&booking),
+        }).await?;
+        
+        // 4. Commit. PG NOTIFY fires AFTER commit (PG semantics).
+        //    All 3 effects are atomic — either all happen or none.
+        tx.commit().await?;
+        
+        Ok(booking)
+    }
+}
+
+// outbox/event.rs
+impl EventBus {
+    async fn publish(&self, tx: &mut PgTx, event: DomainEvent) -> Result<(), Error> {
+        // Persist for audit + replay capability
+        sqlx::query!(
+            "INSERT INTO event_log (id, event_type, payload, source, created_at)
+             VALUES (gen_random_uuid(), $1, $2, $3, NOW())",
+            event.type_name(), serde_json::to_value(&event)?, event.source_json()
+        ).execute(&mut **tx).await?;
+        
+        // Notify subscribers (fires on commit)
+        sqlx::query!("SELECT pg_notify('domain_events', $1)",
+                     serde_json::to_string(&event)?)
+            .execute(&mut **tx).await?;
+        
+        Ok(())
+    }
+}
+```
+
+### 3.6d. Detection path (.NET app's writes via Change Tracking)
+
+SQL Server Change Tracking is enabled per-database + per-table. **It doesn't modify table structure** (only adds metadata). The vendor's app is unaffected.
+
+**Setup (one-time, requires sysadmin):**
+```sql
+ALTER DATABASE db SET CHANGE_TRACKING = ON
+    (CHANGE_RETENTION = 2 DAYS, AUTO_CLEANUP = ON);
+
+-- Enable per table we care about
+ALTER TABLE HT_Customers     ENABLE CHANGE_TRACKING WITH (TRACK_COLUMNS_UPDATED = ON);
+ALTER TABLE HT_Book_H        ENABLE CHANGE_TRACKING WITH (TRACK_COLUMNS_UPDATED = ON);
+ALTER TABLE HT_Book_Ds       ENABLE CHANGE_TRACKING WITH (TRACK_COLUMNS_UPDATED = ON);
+ALTER TABLE HT_Book_Date     ENABLE CHANGE_TRACKING WITH (TRACK_COLUMNS_UPDATED = ON);
+ALTER TABLE HT_CheckIn_H     ENABLE CHANGE_TRACKING WITH (TRACK_COLUMNS_UPDATED = ON);
+ALTER TABLE HT_CheckIn_Ds    ENABLE CHANGE_TRACKING WITH (TRACK_COLUMNS_UPDATED = ON);
+ALTER TABLE HT_CheckIn_Pay   ENABLE CHANGE_TRACKING WITH (TRACK_COLUMNS_UPDATED = ON);
+ALTER TABLE HT_Receipt_H     ENABLE CHANGE_TRACKING WITH (TRACK_COLUMNS_UPDATED = ON);
+ALTER TABLE HT_Receipt_Ds    ENABLE CHANGE_TRACKING WITH (TRACK_COLUMNS_UPDATED = ON);
+ALTER TABLE HT_Rooms         ENABLE CHANGE_TRACKING WITH (TRACK_COLUMNS_UPDATED = ON);
+ALTER TABLE HT_Room_Status   ENABLE CHANGE_TRACKING WITH (TRACK_COLUMNS_UPDATED = ON);
+ALTER TABLE HT_Rooms_Cancel  ENABLE CHANGE_TRACKING WITH (TRACK_COLUMNS_UPDATED = ON);
+ALTER TABLE HT_Housewife     ENABLE CHANGE_TRACKING WITH (TRACK_COLUMNS_UPDATED = ON);
+ALTER TABLE HT_POWER_LOG     ENABLE CHANGE_TRACKING WITH (TRACK_COLUMNS_UPDATED = ON);
+```
+
+**⚠️ Decision needed:** enabling Change Tracking technically counts as a database-level alteration. CLAUDE.md says no `ALTER TABLE` on legacy tables. CT enablement adds metadata storage but doesn't modify columns or change app behavior. **Need confirmation that this is acceptable** — if not, we fall back to high-frequency timestamp polling (more load on legacy DB, harder to detect deletes).
+
+**Watcher loop (Rust binary, in `bin/sync.rs`):**
+```rust
+loop {
+    let last_version = pg.get_last_seen_version().await?;
+    
+    let changes = mssql.query(format!(r#"
+        DECLARE @current BIGINT = CHANGE_TRACKING_CURRENT_VERSION();
+        
+        -- Pull all changes since last_version, joined with current row data
+        SELECT 
+            ct.SYS_CHANGE_VERSION,
+            ct.SYS_CHANGE_OPERATION,    -- 'I' / 'U' / 'D'
+            ct.Book_ID,                  -- the PK
+            h.*                          -- current row state (NULL if deleted)
+        FROM CHANGETABLE(CHANGES HT_Book_H, {last_version}) ct
+        LEFT JOIN HT_Book_H h ON h.Book_ID = ct.Book_ID
+        ORDER BY ct.SYS_CHANGE_VERSION;
+    "#)).await?;
+    
+    for change in changes {
+        // Map MSSQL row → DomainEvent
+        let event = translate_mssql_change_to_event(change);
+        
+        // Apply to canonical (UPSERT into public.ht_*)
+        let mut tx = pg.begin().await?;
+        apply_event_to_canonical(&mut tx, &event).await?;
+        
+        // Publish to event bus (other clients see it via SSE)
+        events.publish(&mut tx, event).await?;
+        
+        tx.commit().await?;
+    }
+    
+    pg.update_last_seen_version(@current).await?;
+    
+    sleep(Duration::from_secs(1)).await;  // 1-sec poll = ~1-sec worst-case latency
+}
+```
+
+CT polling is **incremental** — we only pull rows changed since `@last_version`. Even on a busy day (~100 receptionist actions/hour), this is a few hundred rows/day total, queried once per second. Legacy DB load is negligible.
+
+### 3.6e. Subscription path (real-time UI)
+
+Browsers subscribe via Server-Sent Events (SSE):
+
+```
+   Browser                                    Axum               PG
+     │                                          │                 │
+     │  GET /api/events  (SSE, kept open)       │                 │
+     ├─────────────────────────────────────────▶│                 │
+     │                                          │                 │
+     │                                          │  LISTEN         │
+     │                                          │  domain_events  │
+     │                                          ├────────────────▶│
+     │                                          │                 │
+     │                                          │                 │
+     │  ── (long-lived connection) ──           │                 │
+     │                                          │                 │
+     │                                          │      NOTIFY     │
+     │                                          │  ◀──────────────┤
+     │                                          │  (event arrives)│
+     │  data: {"type":"BookingCreated", ...}    │                 │
+     │  ◀───────────────────────────────────────┤                 │
+     │                                          │                 │
+     │  React Query: invalidate('bookings')    │                 │
+     │  → re-fetch /api/bookings                │                 │
+     │                                          │                 │
+```
+
+**Frontend reaction pattern (recommended):**
+```typescript
+// lib/use-realtime-events.ts
+export function useRealtimeEvents() {
+  const queryClient = useQueryClient();
+  
+  useEffect(() => {
+    const sse = new EventSource('/api/events');
+    
+    sse.addEventListener('BookingCreated', () => {
+      queryClient.invalidateQueries({ queryKey: ['bookings'] });
+    });
+    sse.addEventListener('BookingModified', () => {
+      queryClient.invalidateQueries({ queryKey: ['bookings'] });
+    });
+    sse.addEventListener('CheckInCreated', () => {
+      queryClient.invalidateQueries({ queryKey: ['checkins'] });
+      queryClient.invalidateQueries({ queryKey: ['rooms'] });  // room availability
+    });
+    // ... one mapping per event type
+    
+    return () => sse.close();
+  }, [queryClient]);
+}
+```
+
+**Why invalidate-and-refetch (not patch-from-event):** simpler, more correct, handles permission filtering centrally. The cost of an extra fetch is tiny (~5-15ms PG query).
+
+### 3.6f. Latency budget end-to-end
+
+Worst case (most pessimistic) for "user A in our app modifies a booking → user B in our app sees it":
+
+```
+T+0ms     User A clicks save
+T+5ms     Browser POST /api/bookings/X
+T+10ms    Axum starts handling
+T+15ms    Service BEGIN TRAN
+T+20ms    INSERT public.ht_bookings; INSERT outbox; INSERT event_log; pg_notify
+T+25ms    COMMIT (NOTIFY fires)
+T+30ms    SSE broadcaster wakes, sends to all connected browsers
+T+35ms    User B's browser receives event
+T+40ms    React Query invalidates
+T+50ms    Re-fetch issued
+T+65ms    User B's UI shows the new booking
+
+Total: ~65ms — sub-100ms for in-app changes
+```
+
+For ".NET app modifies → user in our app sees it":
+```
+T+0ms        Receptionist clicks save in .NET app
+T+5ms        MSSQL INSERT completes; CHANGE_TRACKING records version+1
+T+0..1000ms  CT watcher's next poll cycle
+T+1010ms     Watcher pulls the change, builds DomainEvent
+T+1020ms     INSERT canonical + event_log + pg_notify; COMMIT
+T+1025ms     SSE broadcaster forwards to browsers
+T+1080ms     Our app shows the change
+
+Total: ~1 sec worst case (avg ~500ms, since events are uniformly distributed)
+```
+
+### 3.6g. What still needs polling (the safety net)
+
+A 15-min reconcile job runs as a backstop, doing a full incremental scan:
+- Catches any change CT missed (bug, watcher downtime, etc.)
+- Verifies our `legacy_book_id` mappings are still correct
+- Logs drift to `ht_reconcile_log` for engineer review
+
+This is the existing `scheduler/sync.rs` logic, just downgraded from "primary sync" to "safety net."
+
+### 3.6h. Why this isn't over-engineered
+
+We were going to need:
+- ✅ `pg_notify` channel for the writeback worker anyway (outbox queue)
+- ✅ Some way to detect .NET app changes (existing 5-min polling we wanted to improve)
+- ✅ Change Tracking is a free SQL Server feature, no infra
+- ✅ SSE in Axum is ~50 LOC — `axum::response::sse`
+
+The only NEW concept is "publish a domain event at every write." That's already what the outbox table is doing — we're just generalizing the channel.
+
+### 3.6i. Trade-offs and limitations
+
+| Concern | Mitigation |
+|---|---|
+| Change Tracking requires DB-level enablement | One-time setup, no schema modification, vendor unaffected. ⚠️ Needs user confirmation it's acceptable. |
+| SSE doesn't auto-reconnect on network blips | Browser EventSource auto-reconnects (built into the spec). On reconnect, fire a "stale check" → invalidate all queries once. |
+| Many subscribers on PG NOTIFY | PG handles thousands of LISTEN'ers fine. Real concern only at very high scale (not us). |
+| Event ordering across publishers | We use Postgres `event_log.created_at` as the canonical order. Subscribers can query for "events since X" if they reconnect. |
+| Event payload size | Snapshots can be large for booking-with-many-rooms. Mitigation: include only the aggregate's primary fields; subscribers re-fetch full state if needed. |
+| What if event_log fills up? | Time-based retention (drop events older than 30 days). Audit log fans out to a separate cold-storage table. |
+| What if PG NOTIFY drops a message? | Treat NOTIFY as **best-effort**. Subscribers rely on event_log + a "since" query for guaranteed delivery. Reconnection always replays missed events from event_log. |
+| What if the CT watcher is down? | When it restarts, queries with the saved `last_version` and replays everything missed. CT retains 2 days. |
+| Polling frequency (1 sec) | Tunable via env. `CT_POLL_INTERVAL_MS=500` for snappier UI; `=5000` if legacy DB load matters. |
 
 ---
 
@@ -585,7 +916,50 @@ CREATE INDEX ON writeback_jobs (status, created_at) WHERE status IN ('pending', 
 
 The service layer INSERTs into this in the same transaction as the canonical write. The worker LISTENs on `writeback_channel` and dequeues.
 
-### 4d. Schema fingerprint guard
+### 4d-bis. Event log (durable bus)
+
+```sql
+CREATE TABLE event_log (
+    id              UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_type      TEXT         NOT NULL,         -- 'BookingCreated', 'CheckInCancelled', etc.
+    aggregate_id    UUID,                          -- the entity this event is about (nullable for system events)
+    payload         JSONB        NOT NULL,
+    source_kind     TEXT         NOT NULL,         -- 'our_app' | 'legacy_app' | 'system'
+    source_user_id  UUID,
+    source_request_id UUID,
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+
+CREATE INDEX ON event_log (created_at DESC);
+CREATE INDEX ON event_log (aggregate_id, created_at DESC);
+CREATE INDEX ON event_log (event_type, created_at DESC);
+
+-- Retention: drop events older than 30 days (run nightly)
+-- Audit log preservation: separate cold-storage table mirrors important events
+```
+
+Each subscriber (SSE broadcaster, writeback worker, audit logger) maintains its own `last_processed_event_id` cursor. On reconnect they replay anything missed:
+```sql
+SELECT * FROM event_log
+ WHERE id > $cursor
+ ORDER BY created_at, id;
+```
+
+### 4d-tris. Change Tracking watermark
+
+```sql
+CREATE TABLE legacy_ct_state (
+    id                BIGINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),  -- single row
+    last_seen_version BIGINT NOT NULL DEFAULT 0,
+    last_polled_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO legacy_ct_state (id, last_seen_version) VALUES (1, 0)
+    ON CONFLICT DO NOTHING;
+```
+
+Single-row table tracks the highest `SYS_CHANGE_VERSION` we've successfully imported from MSSQL. On worker restart, we resume from this point.
+
+### 4e. Schema fingerprint guard
 
 ```sql
 CREATE TABLE legacy_schema_fingerprint (
@@ -810,22 +1184,39 @@ When the writeback worker is disabled:
 
 ---
 
-## 8. Migration roadmap (stay-current stack, decommission-ready)
+## 8. Migration roadmap (stay-current stack, decommission-ready, event-driven)
 
 | Phase | Time | What | Independently shippable? |
 |---|---|---|---|
 | **0** | 3 days | Frontend collapse — delete `app/(legacy)`, single tree | ✅ |
-| **1** | 1 week | Domain + Repository layer scaffolding. Move ALL existing route SQL into PgRepository implementations. No behavior change. | ✅ — refactor only |
-| **2** | 1 week | Service layer scaffolding. Move business logic out of routes into BookingService, CheckInService, etc. Routes become thin. | ✅ — still no behavior change |
-| **3** | 3 days | Outbox table + WritebackIntent enum + outbox enqueue helpers. Wired into service layer. **Worker not yet built — jobs accumulate harmlessly.** | ✅ |
-| **4** | 2 weeks | Writeback worker binary. Implement 11 flow recipes from spike. Schema fingerprint guard. Idempotency. **Goal #1 ✓** | ✅ |
-| **5** | 3 days | Split scheduler into `bin/sync.rs` (own binary). Add reconcile logic — when sync detects new rows in legacy_mirror not in canonical, upsert into canonical. | ✅ |
-| **6** | 1 week | Multi-site full deploy at HF Ville (after Phase 4 proven 1 month). Same image, different `.env`. **Goals #2 + #3 ✓** | ✅ |
-| **∞** | 1 day (someday) | Decommission. Set `WRITEBACK_ENABLED=false`. Stop sync workers. Drop legacy_mirror schema. | ✅ |
+| **1** | 1 week | Domain + Repository layer scaffolding. Move ALL route SQL into `PgRepository` implementations. No behavior change. | ✅ — refactor only |
+| **2** | 1 week | Service layer scaffolding. Move business logic out of routes into `BookingService` etc. Routes become thin. | ✅ — still no behavior change |
+| **3** | 3 days | Outbox table + `event_log` table + `WritebackIntent` enum + `DomainEvent` enum + service emission helpers. **No subscribers yet — events accumulate harmlessly.** | ✅ |
+| **4a** | 3 days | SSE endpoint `/api/events` + browser `useRealtimeEvents` hook. **Now: our writes propagate to other browsers in <100ms.** | ✅ |
+| **4b** | 2 weeks | Writeback worker binary. Implement 11 flow recipes from spike. Schema fingerprint guard. Idempotency. **Goal #1 ✓** | ✅ |
+| **5** | 1 week | Split scheduler into `bin/sync.rs` (own binary). Enable SQL Server Change Tracking on legacy DB (one-time DBA task). Implement CT watcher loop → publishes detected changes to event bus. **Now: .NET app writes propagate to our app in ~1 sec.** | ✅ — needs CT enable approval |
+| **6** | 3 days | Drift-reconcile job (15-min cron) as safety net for missed CT events. Drop polling-sync (replaced by event-driven). | ✅ |
+| **7** | 1 week | Multi-site full deploy at HF Ville (after Phase 4 proven 1 month). Same image, different `.env`. **Goals #2 + #3 ✓** | ✅ |
+| **∞** | 1 day | Decommission. Set `WRITEBACK_ENABLED=false`, `LEGACY_SYNC_ENABLED=false`. Stop sync + writeback workers. SSE broadcaster keeps running for in-app real-time. Drop `legacy_mirror` schema. | ✅ |
 
-**Total: ~5-6 weeks to production-ready writeback** + **1 day to decommission whenever you're ready**.
+**Total: ~6-7 weeks to production-ready writeback + event-driven sync** + **1 day to decommission**.
 
-Phases 0-3 are pure refactoring — they ship the same behavior with cleaner code. Phase 4 is where the new capability lands. After Phase 4 the architecture is decommission-ready forever.
+Phases 0-3 are pure refactoring + scaffolding. Phase 4a ships real-time UI updates for our own writes (immediately useful even without writeback). Phase 4b unlocks Goal #1. Phase 5 closes the loop with .NET-app-side detection.
+
+### Why split Phase 4 into a/b
+
+Phase 4a (SSE + DomainEvent emission) is **immediately user-visible**: if two staff members are looking at our app, their screens stay in sync without F5. Tiny, high-impact, gives you something to show stakeholders within a sprint of starting Phase 1.
+
+Phase 4b (writeback worker) is the bigger lift but doesn't affect the UI behavior — it's the legacy-DB-facing adapter.
+
+### Event-driven gives you a fourth state for free
+
+| State | Workers active | Event bus active | Behavior |
+|---|---|---|---|
+| A — today | sync + writeback ON | YES | bidirectional event propagation in/out of MSSQL |
+| B — transition | sync + writeback ON | YES | same as A; users gradually shift to our app |
+| **A.5 — read-only sneak peek** | sync ON, writeback OFF | YES | our app shows .NET app data in real-time, doesn't write back. Useful for early UAT before writeback is trusted in production. |
+| C — decommissioned | sync + writeback OFF | YES | our app continues with real-time UI sync between browsers; legacy MSSQL gone |
 
 ---
 
@@ -862,7 +1253,10 @@ Phases 0-3 are pure refactoring — they ship the same behavior with cleaner cod
 1. **PG schema as source of truth** — confirmed by your "our own data layer" requirement
 2. **Layered architecture (domain/repo/service)** — recommended approach. Pushback OK.
 3. **UUID primary keys with `legacy_*_id` reference columns** — best practice for decommission readiness
-4. **Outbox pattern with PG `LISTEN/NOTIFY`** vs alternatives (HTTP RPC, dedicated queue like Redis) — recommended outbox/PG because it requires no new infra and is durable
+4. **Outbox + event log via PG `LISTEN/NOTIFY`** vs alternatives (Redis Streams, NATS, RabbitMQ) — recommended PG because it requires no new infra and is durable. Tens of thousands of events/day is well within PG's comfort zone.
 5. **Split into 3 binaries (api, sync, writeback)** vs keep monolith with feature flags — recommended split for blast-radius isolation
 6. **Frontend collapse to single `/app/*` tree** — confirmed
-7. **HF Ville deployment shape** — full stack at Ville (Phase 6) vs central-only with Tailscale tunnels — recommended full stack
+7. **HF Ville deployment shape** — full stack at Ville (Phase 7) vs central-only with Tailscale tunnels — recommended full stack
+8. **⚠️ SQL Server Change Tracking enablement on legacy DB** — needs DBA approval. Adds metadata storage, no schema modification, vendor app unaffected. Without CT, fall back to high-frequency timestamp polling (works but heavier on legacy DB and harder to detect deletes). **CT is strongly recommended.**
+9. **SSE vs WebSockets for real-time UI** — recommended SSE (simpler, one-way is sufficient for our needs, auto-reconnects, works through proxies). Pushback OK if WebSockets are needed later for chat / collaborative editing.
+10. **Event payload size budget** — recommend ≤8KB per event (full snapshots for small aggregates, just IDs for large ones — subscribers re-fetch).
