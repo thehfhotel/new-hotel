@@ -1,0 +1,3 @@
+Created XE session: hotel_legacy_capture
+Filter: database_name = db, excluding tiberius/CEIP/SQLCMD
+Output: xe_hotel_legacy_capture.xel (in SQL Server default LOG dir)
