@@ -10,16 +10,9 @@
 //! When SYSTEM_MODE=new, the app can run without the legacy database.
 //! Legacy routes will return 503 Service Unavailable when legacy DB is unavailable.
 
-mod config;
-mod db;
-mod domain;
-mod error;
-mod models;
-mod notifications;
-mod outbox;
-mod routes;
-mod scheduler;
-mod utils;
+// Modules live in `lib.rs` so they're reachable from integration tests under
+// `tests/`. The binary just brings them into scope via `use hotel_backend::*`.
+use hotel_backend::{config, db, routes, scheduler};
 
 use axum::{
     routing::{get, patch, put, delete},
