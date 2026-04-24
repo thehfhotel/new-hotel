@@ -1,0 +1,7 @@
+[11:48:45] delete from HT_Room_Status where room_no='306' and room_CheckIn_No='CH26-005233'
+[11:48:45] delete from HT_CheckIn_Ds where Cin_Room_No='306' and Cin_No='CH26-005233'
+[11:48:45] update HT_Rooms set Room_Clean='yes',Room_Use='no' where room_no='306'
+[11:48:45] INSERT INTO [HT_Rooms_Cancel]([id],[room_no],[cin_no],[cancel_date],[cancel_by],[cancel_note])VALUES(298,'306','CH26-005233',getdate(),'Admin','ยกเลิกคุณนัท')
+[11:48:45] UPDATE [HT_CheckIn_H] SET  [Total_Price_Room]=Total_Price_Room-890,[Total_Price_Net]=[Total_Price_Net]-890,[Total_Price_Pay]=[Total_Price_Pay]-0,[Total_Price_Balance]=([Total_Price_Balance]-890)+0 where [Cin_no]='CH26-005233'
+[11:48:45] update HT_CheckIn_H set cin_status='ยกเลิก' where cin_no='CH26-005233'
+[11:48:45] update HT_POWER_LOG SET ROOM_POWER_END=GETDATE(),ROOM_POWER_END_BY='Admin',ROOM_POWER_NOTE2='ปิดไฟ เนื่องจากยกเลิกห้องพัก' where room_no='306' and ROOM_POWER_END_BY=''

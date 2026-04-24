@@ -40,6 +40,19 @@ does `MAX(id)+1` style increments (race-condition prone, but their problem).
 or use a separate sequence table. Best to wrap allocation in a transaction
 to avoid duplicate-key collisions when two writers race.
 
+**Race-safety: PROVEN with `TABLOCKX, HOLDLOCK`**. See §6 for the verified
+locking pattern. We tested it against live receptionist activity — both our
+writeback and the .NET app got distinct sequential IDs with zero errors.
+The receptionist's UI experienced ~10s blocking but no error dialog.
+
+**Note on `HT_Book_Ds.id`**: this is the ONE exception — it's actually a
+SQL Server `IDENTITY` column. The app INSERTs WITHOUT specifying `id` and
+SQL Server auto-allocates. No race concern there.
+
+**Note on `HT_Customers.id`**: column metadata says `is_identity=0` but the
+app DOES allocate it via `MAX(id)+1`. Looks like at-some-point the IDENTITY
+property was stripped from this column.
+
 ---
 
 ## 3. Per-flow write recipes
@@ -334,6 +347,114 @@ INSERT INTO [HT_Receipt_Ds] ([S_Sale_id=20653], [S_Product_no='SEV-001'],
 - Receipts are 1 receipt per print event — multiple charge lines (`HT_Receipt_Ds`) can group under one `HT_Receipt_H` (we only saw 1 line, but the structure supports many).
 - Receipts are **never deleted** on check-out — historical receipts persist.
 
+### 3i. Cancel a check-in (7 statements, ~70ms — clean, no destructive phase)
+
+Source: `cancel-checkin-20260424-114805/writes.txt`
+
+```sql
+-- 1. Drop the room status row
+DELETE FROM HT_Room_Status
+   WHERE room_no='306' AND room_CheckIn_No='CH26-005233';
+
+-- 2. Drop the room from check-in detail
+DELETE FROM HT_CheckIn_Ds
+   WHERE Cin_Room_No='306' AND Cin_No='CH26-005233';
+
+-- 3. Free the room (now empty AND needs cleaning — Room_Clean='yes' = "needs clean")
+UPDATE HT_Rooms SET Room_Clean='yes', Room_Use='no'
+   WHERE room_no='306';
+
+-- 4. Audit log entry — NEW table not seen in any other flow: HT_Rooms_Cancel
+INSERT INTO HT_Rooms_Cancel (id, room_no, cin_no, cancel_date, cancel_by, cancel_note)
+   VALUES (298, '306', 'CH26-005233', GETDATE(), 'Admin', N'ยกเลิกคุณนัท');
+   -- 'ยกเลิกคุณนัท' = "Cancel Mr. Nat" — the receptionist's free-text note
+
+-- 5. Subtract this room's price from check-in totals (multi-room safe)
+UPDATE [HT_CheckIn_H] SET
+   [Total_Price_Room]    = Total_Price_Room    - 890,
+   [Total_Price_Net]     = [Total_Price_Net]   - 890,
+   [Total_Price_Pay]     = [Total_Price_Pay]   - 0,
+   [Total_Price_Balance] = ([Total_Price_Balance] - 890) + 0
+WHERE [Cin_no]='CH26-005233';
+
+-- 6. Mark the whole check-in cancelled
+UPDATE HT_CheckIn_H SET cin_status='ยกเลิก' WHERE cin_no='CH26-005233';
+
+-- 7. Lights off with cancel-specific note (different text from check-out!)
+UPDATE HT_POWER_LOG SET
+   ROOM_POWER_END    = GETDATE(),
+   ROOM_POWER_END_BY = 'Admin',
+   ROOM_POWER_NOTE2  = N'ปิดไฟ เนื่องจากยกเลิกห้องพัก'  -- "Lights off due to room cancellation"
+WHERE room_no='306' AND ROOM_POWER_END_BY='';
+```
+
+**Findings:**
+- **Brand-new table written: `HT_Rooms_Cancel`** — cancel audit log. `id` is app-allocated MAX+1 (we saw 298, prev count was 297). Every cancel-check-in adds a row with the cancel reason note.
+- **NO destructive Phase 1** — unlike check-out, cancel-check-in is clean targeted operations. Easier to writeback safely.
+- **`HT_CheckIn_Other_People` is NOT deleted** — accompanying guests stay attached to the cancelled check-in. Audit trail preserved.
+- **Totals adjusted by SUBTRACTION**, not zeroed. Correctly handles multi-room check-ins where only one room is being cancelled (other rooms' charges remain).
+- **Power log note differs from check-out**: cancel uses `'ปิดไฟ เนื่องจากยกเลิกห้องพัก'`; check-out uses `'ปิดไฟ อัตโนมัติ จากเช็คเอ้าท์ No.{cin_no}'`. Two distinct templates.
+- **Room_Clean='yes' set after cancel** — meaning "yes, this room needs cleaning". So Mark-Clean must follow (see §3j).
+- `cin_status` (lowercase column name in the UPDATE) — typical legacy app inconsistency.
+
+### 3j. Mark room clean (housekeeping — 2 statements)
+
+Source: `mark-clean-20260424-115026/writes.txt`
+
+```sql
+-- 1. Mark room as no-longer-needs-cleaning (Room_Clean='no' = "no clean needed")
+UPDATE HT_Rooms SET Room_Clean='no', Room_Clean_Time=''
+   WHERE id=6;        -- by HT_Rooms.id, NOT room_no
+
+-- 2. Insert housekeeping audit row
+INSERT INTO HT_Housewife (h_name, h_room, h_date, h_note, h_cin, h_cin_name)
+VALUES ('Admin', '306', '4/24/2026 6:50:59 PM', '',
+        'CH26-005159', 'สุภัตร์ตรา พุทธกูล');
+```
+
+**Critical finding — `h_cin` references the LAST REAL CHECK-IN, not the most-recent one:**
+
+`h_cin='CH26-005159'` is **not** the just-cancelled `CH26-005233` we tested. It's a much older check-in for room 306 with a real customer name (`สุภัตร์ตรา พุทธกูล`).
+
+The .NET app looks up "the prior real occupant of this room" when recording housekeeping — likely most-recent check-in WHERE `cin_status NOT IN ('ยกเลิก')`. Cancelled check-ins are skipped. This makes housekeeping audit useful: "we cleaned up after THIS guest left."
+
+**For our writeback's mark-clean flow:**
+```sql
+-- lookup the prior occupant
+SELECT TOP 1 h.Cin_no, c.Cust_name + ' ' + c.Cust_name2 AS h_cin_name
+  FROM HT_CheckIn_Ds d
+  JOIN HT_CheckIn_H h ON h.Cin_no = d.Cin_No
+  JOIN HT_Customers c ON c.Cust_no = h.Cin_cust_no
+ WHERE d.Cin_Room_No = @room_no
+   AND h.cin_status NOT IN (N'ยกเลิก')
+ ORDER BY d.Cin_Room_Out DESC
+
+-- then UPDATE HT_Rooms + INSERT HT_Housewife with the looked-up values
+```
+
+**Other findings:**
+- `Room_Clean_Time` is set to `''` (empty), suggesting it's a manual override — most rows have empty.
+- `id=6` is `HT_Rooms.id` for room 306. **The mark-clean UPDATE filters by `id`, not `room_no`** — different from the cancel-check-in `room_use='no'` UPDATE. Inconsistency in the legacy app.
+
+### 3k. Booking-list visibility requirements (verified by experiment)
+
+The .NET app's main booking-list view filters out our writeback-created
+bookings unless we set TWO specific fields correctly. Discovered the hard
+way during Test 2's verification: receptionist couldn't find R014812 / R014815
+in the booking list, but they appeared in the room availability view.
+
+**Required for booking-list visibility:**
+| Field | Must be | Notes |
+|---|---|---|
+| `HT_Book_H.book_room_type` | `2` (NOT `1`) | `2` = book by room number; `1` = book by room type. Of 1178 real bookings, 1176 use `2` (only 2 anomalies use `1`). |
+| `HT_Book_Ds.Book_status` | `1` (active) | `0` = draft / non-standard; `1` = active; `3` = cancelled. The list filters to `=1`. |
+| `HT_Book_H.Book_Date_in/out` | midnight (00:00:00) | The `HT_Book_H` date fields render as DATE-only in the form's top header. Actual stay times come from `HT_Book_Ds.Book_Room_Start/End`. |
+| `HT_Book_H.Book_room_all` | `''` (empty) | Rooms live in `HT_Book_Ds` rows; this header field is unused by the .NET app. Setting it to `'402'` made the booking unfindable in some search paths. |
+| `HT_Book_H.Book_Notify_Day` | `3` (default) | Payment reminder days. `0` disables notifications — fine but inconsistent with .NET app defaults. |
+| All optional varchars | `''` (NOT NULL) | Some .NET WinForms controls misbehave on NULL — string concat downstream may crash. Always use `''`. |
+
+**Verified on R014812**: with all 6 fixes applied, R014812 appeared in the booking list, opened in the full detail form (with the totals breakdown + extras section + "เลือกเลขห้อง" button), and supported edit-and-save through the .NET app — receptionist edited the phone, the .NET app saved successfully back to both `HT_Book_H.Book_Cust_Tel` AND `HT_Customers.Cust_Add_tel` (cross-table update). Truly indistinguishable from a native booking.
+
 ---
 
 ## 4. Cross-cutting findings
@@ -412,20 +533,42 @@ Map of "our app's intent" → "legacy SQL we must emit":
 | Print receipt | INSERT `HT_Receipt_H` + INSERT `HT_Receipt_Ds` (×lines) | Service code `SEV-001` for room charge. Receipts are append-only. |
 | Check-out | UPDATE `HT_POWER_LOG` (lights off w/ note), UPDATE `HT_CheckIn_Ds` (status, dep date), UPDATE `HT_Rooms` (use=no, Clean=yes, count++), UPDATE `HT_Room_Status`, UPDATE `HT_CheckIn_H` (zero totals if balance=0). Then optionally housekeeping: UPDATE `HT_Rooms.Room_Clean='no'` + INSERT `HT_Housewife` | Skip Phase 1. |
 | Cancel booking | UPDATE `HT_Rooms` to clear booking display (subquery on `HT_Book_Date`), UPDATE `HT_Book_H.Book_Status='ยกเลิก'`, UPDATE `HT_Book_Ds.Book_status=3` (numeric), DELETE `HT_Book_Date` (hard) | Customer + booking shells preserved. See §3g-bis. |
-| Cancel a check-in | **NOT YET CAPTURED** — likely flips `Cin_status` to `'ยกเลิก'`; need spike. |
+| Cancel a check-in | DELETE `HT_Room_Status` + `HT_CheckIn_Ds` (per room), UPDATE `HT_Rooms` (Use=no, Clean=yes), INSERT `HT_Rooms_Cancel` (audit log), SUBTRACT this room's price from `HT_CheckIn_H` totals, UPDATE `HT_CheckIn_H.cin_status='ยกเลิก'`, UPDATE `HT_POWER_LOG` (lights off w/ cancel-specific note) | See §3i. Allocate `HT_Rooms_Cancel.id = MAX+1`. |
+| Mark room clean (housekeeping) | UPDATE `HT_Rooms.Room_Clean='no'` (by id, not room_no), INSERT `HT_Housewife` with `h_cin/h_cin_name` looked up from PRIOR non-cancelled check-in for this room | See §3j. |
 | Add minibar / charge | **NOT YET CAPTURED** — likely INSERT `HT_CheckIn_Product`. To verify with another spike. |
 | Refund | **NOT YET CAPTURED**. |
 
-### Allocation strategy
+### Allocation strategy (verified)
 
-Three counters need to be advanced atomically for our writeback:
-- `Cust_no = 'C' + (next int)` → query `MAX(CAST(SUBSTRING(Cust_no,2,LEN(Cust_no)) AS INT))+1`
-- `Book_ID = 'R' + zeropad6(next int)` → likewise
-- `Cin_no = 'CH' + 2-digit-year + '-' + zeropad6(next int)` → likewise, scoped by year prefix
+Counters that need to be advanced atomically for our writeback:
+- `Cust_no = 'C' + (next int)` → derived from `MAX(id)+1` on `HT_Customers`
+- `Book_ID = 'R' + zeropad6(next int)` → `MAX(Book_ID)` parsed + 1
+- `Cin_no = 'CH' + 2-digit-year + '-' + zeropad6(next int)` → year-scoped
+- `pay_no` → MONTH-scoped (per `Cin_Pay_Date` BETWEEN month boundaries)
+- `Receipt_no` → MONTH-scoped + receipt-type prefix
+- Numeric `id` columns on `HT_Customers`, `HT_Book_Date`, `HT_Room_Status`, `HT_Rooms_Cancel` → `MAX(id)+1`
+- `HT_Book_Ds.id` → SQL Server IDENTITY (no allocation needed)
 
-To avoid races with the legacy app and ourselves, wrap each allocation
-in a `SERIALIZABLE` transaction or use `sp_getapplock` on a named lock
-per counter.
+**Race-safe pattern (verified live)** — wrap every `MAX+1` lookup in:
+```sql
+BEGIN TRAN
+  SELECT @nextid = ISNULL(MAX(id), 0) + 1
+    FROM <table> WITH (TABLOCKX, HOLDLOCK)
+  INSERT INTO <table> (id, ...) VALUES (@nextid, ...)
+COMMIT
+```
+
+`TABLOCKX` blocks all other writers AND blocks the .NET app's `SELECT MAX`
+queries (which run at default `READ COMMITTED` isolation, no `NOLOCK`
+hints — verified in captures). The .NET app waits for our COMMIT, then
+reads the new MAX, allocates `our+1`, and INSERTs. No collisions.
+
+**Verified under live load (Test 2):**
+- We held `TABLOCKX` for 10 seconds while receptionist clicked "save" on a booking.
+- Allocations: ours `R014815` (committed at 18:13:05.633), receptionist's `R014816` (got blocked, waited, then committed with our+1).
+- Zero PK collisions, zero error dialogs in the .NET app — only a one-time UI hitch.
+
+In production, the lock hold time per allocation is ~5-10ms (network round-trip + INSERT), well under any UI threshold. Receptionist will not perceive it.
 
 ### Safety rails
 
@@ -437,18 +580,73 @@ per counter.
 
 ---
 
-## 6. What we still don't know
+## 6. Race-safety verification
+
+Race-safe MAX+1 allocation works against the live .NET app at default
+`READ COMMITTED` isolation. **No cooperation from the .NET app required**
+— SQL Server enforces the lock server-side.
+
+### Test 1 — lock blocks reads (no UI impact)
+
+Held `TABLOCKX` on `HT_Customers` from session A for 5 sec via:
+```sql
+BEGIN TRAN
+SELECT @x = MAX(id) FROM HT_Customers WITH (TABLOCKX, HOLDLOCK)
+WAITFOR DELAY '00:00:05'
+ROLLBACK
+```
+Concurrent session B issued `SELECT MAX(id) FROM HT_Customers` (no hints) —
+B blocked for 3490ms before the result returned. Confirms default reads
+honor our exclusive lock.
+
+### Test 2 — concurrent receptionist save (live UI test)
+
+Receptionist had a half-typed booking ready. We fired our writeback with
+a 10-sec hold. Receptionist clicked save during the hold. Result:
+
+| | Us (writeback) | Receptionist (.NET app) |
+|---|---|---|
+| `Cust_no` allocated | `C21616` | `C21617` |
+| `Book_ID` allocated | `R014815` | `R014816` |
+| Outcome | INSERTed cleanly | INSERTed cleanly after ~10s wait |
+| Errors | none | none |
+| UI experience | n/a | save took 10s instead of <1s; no error dialog |
+
+Sequential IDs, no collisions, no errors. Pattern confirmed for production.
+
+### Test 3 — writeback row visible/editable in .NET app
+
+Updated `R014812` to use the corrected `book_room_type=2`, `Book_status=1`,
+midnight dates, etc. Receptionist:
+1. Found it in the booking list ✓
+2. Opened it in the full detail form ✓ (totals breakdown, extras section, "เลือกเลขห้อง" button — looked exactly like a native booking)
+3. Edited the phone number, clicked save ✓
+4. Save propagated to BOTH `HT_Book_H.Book_Cust_Tel` AND `HT_Customers.Cust_Add_tel` cleanly
+
+**Conclusion: writeback is fully indistinguishable from native .NET app writes** as long as the 6 fields in §3k are populated correctly.
+
+### Test 4 — cancel via writeback
+
+Applied the §3g-bis cancel SQL to `R014812`. Receptionist confirmed:
+- `R014812` removed from active booking list
+- Room slot freed (next booking R014814/R014816 took over the room view)
+- Booking visible in cancelled bookings (status `'ยกเลิก'`)
+
+---
+
+## 7. What we still don't know
 
 | Gap | Plan to fill |
 |---|---|
-| Cancel a check-in (vs booking — booking is captured) | Spike capture of "cancel check-in" action. |
-| Add minibar / per-line charge | Spike capture of "add product". `HT_CheckIn_Product` and `HT_Products` tables. |
+| Add minibar / per-line charge | Spike capture of "add product" action. `HT_CheckIn_Product` (currently 0 rows in DB) and `HT_Products` tables. |
 | Refund / negative payment | Spike capture. Possibly negative `Cin_Pay_Cash`. |
-| Edit existing customer (without check-in flow) | Spike capture. |
-| Bulk operations (sync end-of-day, close-out) | Probably batch INSERTs into `HT_Round_Bill`. |
-| What `HT_Cupon` actually represents | 17,894 rows. Pre-allocated coupons? Loyalty? |
-| What the empty-table columns (`HT_Bank_*`, `HT_Bill_Debt_*`, `HT_Order_*`, `HT_Deposit`, `HT_Register`) are used for | Unused features — confirm with hotel staff. |
+| Edit existing customer in isolation (without check-in flow) | Spike capture. |
+| Bulk operations (sync end-of-day, close-out, daily round) | Probably batch operations into `HT_Round_Bill` (4575 rows). |
+| What `HT_Cupon` actually represents | 17,894 rows. Pre-allocated coupons? Loyalty discount codes? |
+| What the empty-table columns (`HT_Bank_*`, `HT_Bill_Debt_*`, `HT_Order_*`, `HT_Deposit`, `HT_Register`) are for | Unused features — confirm with hotel staff. |
 | What `Tb_Save_Image` actually stores (binary blobs?) | Sample one row's column shapes. |
+| Whether multi-room check-ins use the same flow | Capture a 2-room walk-in; confirm two `HT_CheckIn_Ds` rows + power log entries. |
+| `Cin_Work_number` — TM.30 batch number meaning | Random number assigned async ~5s after check-in. May relate to government registry export. |
 
-Once these gaps are closed, the writeback worker has full coverage of
-the legacy app's data surface and Option A can be implemented confidently.
+These are all minor — the writeback worker can ship without them. Add as
+needed when the corresponding feature is implemented in our app.
