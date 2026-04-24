@@ -1,0 +1,6 @@
+# Linker config — target-scoped so it only applies to Linux x86_64 builds (CI / Docker).
+# macOS (aarch64-apple-darwin / x86_64-apple-darwin) and other targets are unaffected,
+# so local `cargo build` on Darwin continues to use the default linker.
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

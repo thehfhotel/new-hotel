@@ -119,6 +119,14 @@ jobs:
         with:
           toolchain: "1.85"
 
+      # sccache wraps every rustc invocation and caches its output keyed on the
+      # exact crate inputs. It complements Swatinem/rust-cache (which caches
+      # the whole target/ dir): rust-cache wins when the cache key matches
+      # exactly, sccache wins on partial matches (e.g. one dep version bumped
+      # but the other 200 deps are identical).
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -129,6 +137,8 @@ jobs:
         env:
           DATABASE_URL: postgres://postgres:***REMOVED***@localhost:5439/hotelnew
           SQLX_OFFLINE: "true"
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: sccache
         run: cargo test
 
   build-frontend:
