@@ -122,12 +122,27 @@ jobs:
       # sccache wraps every rustc invocation and caches its output keyed on the
       # exact crate inputs. It complements Swatinem/rust-cache (which caches
       # the whole target/ dir). Treated as opportunistic: if the action fails
-      # (e.g. GHA Cache outage), we skip RUSTC_WRAPPER and fall through to a
-      # plain build instead of failing the job.
+      # OR the GHA Cache service is unreachable at server-start time, we skip
+      # RUSTC_WRAPPER and fall through to a plain build instead of failing
+      # the job. The probe step does the real check — the action above only
+      # installs the binary.
       - name: Set up sccache
         id: sccache_setup
         uses: mozilla-actions/sccache-action@v0.0.6
         continue-on-error: true
+
+      - name: Probe sccache (verify GHA Cache reachable)
+        id: sccache_probe
+        if: steps.sccache_setup.outcome == 'success'
+        continue-on-error: true
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          ACTIONS_CACHE_URL: ${{ env.ACTIONS_CACHE_URL }}
+          ACTIONS_RUNTIME_TOKEN: ${{ env.ACTIONS_RUNTIME_TOKEN }}
+        run: |
+          sccache --start-server
+          sccache --show-stats
+          sccache --stop-server
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
@@ -139,8 +154,8 @@ jobs:
         env:
           DATABASE_URL: postgres://postgres:***REMOVED***@localhost:5439/hotelnew
           SQLX_OFFLINE: "true"
-          SCCACHE_GHA_ENABLED: ${{ steps.sccache_setup.outcome == 'success' && 'true' || 'false' }}
-          RUSTC_WRAPPER: ${{ steps.sccache_setup.outcome == 'success' && 'sccache' || '' }}
+          SCCACHE_GHA_ENABLED: ${{ steps.sccache_probe.outcome == 'success' && 'true' || 'false' }}
+          RUSTC_WRAPPER: ${{ steps.sccache_probe.outcome == 'success' && 'sccache' || '' }}
         run: cargo test
 
   build-frontend:
