@@ -11,6 +11,9 @@ const customJestConfig = {
     '^@/(.*)$': '<rootDir>/$1',
   },
   testMatch: ['**/__tests__/**/*.test.ts', '**/__tests__/**/*.test.tsx'],
+  // Ignore git worktrees (created by agent isolation) so jest doesn't double-run tests.
+  testPathIgnorePatterns: ['/node_modules/', '/\\.claude/worktrees/'],
+  modulePathIgnorePatterns: ['<rootDir>/\\.claude/worktrees/'],
   transformIgnorePatterns: [
     '/node_modules/(?!(@azure|tedious)/)',
   ],
