@@ -298,6 +298,174 @@ pub enum WritebackIntent {
 
 ---
 
+## 3.5. Bidirectional data flow (the daily reality)
+
+The receptionist will use BOTH apps during transition. Data must flow in both directions seamlessly. Our app must show:
+- Bookings/check-ins/customers we created (obviously)
+- **Bookings/check-ins/customers receptionist created in the .NET app today** (the use case you raised)
+- Updates the .NET app made to records we created earlier
+
+### 3.5a. Read path (always against canonical PG)
+
+The repository ALWAYS reads from `public.ht_*`. Routes never know about MSSQL. But `public.ht_*` contains:
+- ✅ Rows our app created (immediately visible)
+- ✅ Rows the .NET app created (visible after next reconcile cycle, ~1-5 min)
+- ✅ Rows that exist in both (de-duplicated by `legacy_book_id`)
+
+```
+        Browser
+          │ GET /api/bookings?date=2026-04-25
+          ▼
+        Axum route
+          │
+          ▼
+        BookingService::list_by_date()
+          │
+          ▼
+        BookingRepository::list_by_date()  ──────┐
+                                                  │
+                       ┌─────────────────────────┐│
+                       │ SELECT * FROM           ││
+                       │   public.ht_bookings    │◀┘
+                       │  WHERE stay_overlaps... │
+                       └─────────────────────────┘
+                       Returns:
+                       - rows with legacy_book_id set (synced from .NET)
+                       - rows with legacy_book_id NULL (we created, writeback pending)
+                       - rows with both (we created, writeback completed)
+                       
+                       ALL appear in the result set indistinguishably.
+```
+
+### 3.5b. Write paths (both directions converge to canonical)
+
+Two write origins, both end up in `public.ht_*`:
+
+```
+   ╭─────────────────────────────────────────────────────────────────────╮
+   │                                                                     │
+   │  Origin A: Our app                                                  │
+   │  ════════════════════                                               │
+   │   user clicks "create booking"                                      │
+   │     │                                                               │
+   │     ▼                                                               │
+   │   Service: BEGIN TRAN                                               │
+   │     INSERT public.ht_bookings (id=UUID-A, legacy_book_id=NULL)      │
+   │     INSERT writeback_jobs (intent='create_booking', ...)            │
+   │     NOTIFY                                                          │
+   │   COMMIT                                                            │
+   │                                                                     │
+   │   ── ~5-50ms async later ──                                         │
+   │                                                                     │
+   │   Writeback worker:                                                 │
+   │     allocate Book_ID via TABLOCKX → 'R014820'                       │
+   │     INSERT into MSSQL (Book_ID='R014820', ...)                      │
+   │     UPDATE public.ht_bookings SET legacy_book_id='R014820'          │
+   │            WHERE id=UUID-A                                          │
+   │                                                                     │
+   │   Now visible in:                                                   │
+   │   - Our app (was visible immediately at INSERT)                     │
+   │   - .NET app (visible after writeback)                              │
+   │                                                                     │
+   ╰─────────────────────────────────────────────────────────────────────╯
+
+   ╭─────────────────────────────────────────────────────────────────────╮
+   │                                                                     │
+   │  Origin B: .NET app                                                 │
+   │  ════════════════════                                               │
+   │   receptionist clicks "save" in 3rd-party Windows app               │
+   │     │                                                               │
+   │     ▼                                                               │
+   │   .NET app: INSERT INTO HT_Book_H (Book_ID='R014821', ...)          │
+   │             [direct T-SQL, no involvement from our system]          │
+   │                                                                     │
+   │   ── up to ~5 min later (sync interval) ──                          │
+   │                                                                     │
+   │   Sync worker Phase 1:                                              │
+   │     Pull MSSQL changes → INSERT INTO legacy_mirror.ht_book_h        │
+   │            (book_id='R014821', mirror_synced_at=NOW)                │
+   │                                                                     │
+   │   Sync worker Phase 2 (reconcile):                                  │
+   │     SELECT mirror.* FROM legacy_mirror.ht_book_h mirror             │
+   │      LEFT JOIN public.ht_bookings public ON public.legacy_book_id   │
+   │                                          = mirror.book_id           │
+   │      WHERE public.id IS NULL  -- new from .NET app                  │
+   │                                                                     │
+   │     For each new row:                                               │
+   │       INSERT INTO public.ht_bookings                                │
+   │              (id=NEW UUID, legacy_book_id='R014821', ...)           │
+   │                                                                     │
+   │   Now visible in:                                                   │
+   │   - .NET app (was visible immediately at INSERT)                    │
+   │   - Our app (visible after reconcile completes)                     │
+   │                                                                     │
+   ╰─────────────────────────────────────────────────────────────────────╯
+```
+
+**Net result: `public.ht_*` is the unified view of all bookings/customers/check-ins from both apps, with sub-5-minute eventual consistency.**
+
+### 3.5c. Conflict resolution (when both apps modify the same row)
+
+Rare in practice (one receptionist works on one booking at a time), but possible. Example:
+
+```
+T+0:00  .NET app reads R014820 (sees phone='0900000076')
+T+0:30  Our app reads R014820  (sees phone='0900000076')
+T+0:45  Our app saves phone='0900000099'
+        → public.ht_bookings.updated_at = T+0:45
+        → outbox enqueued (status=pending)
+T+1:00  .NET app saves phone='0900000088'
+        → MSSQL HT_Book_H.Book_Cust_Tel = '0900000088'
+        → MSSQL has no concept of last-modified timestamp from us
+T+1:15  Writeback worker fires our pending job
+        → MSSQL HT_Book_H.Book_Cust_Tel = '0900000099' (overwrites theirs)
+T+5:00  Sync runs
+        → mirror.book_cust_tel = '0900000099' (matches us — no conflict)
+```
+
+**Order matters:** the writeback fires the moment our user clicks save. The .NET app saves to MSSQL directly. **The later writer wins at MSSQL.** If they collide perfectly within ~50ms (unlikely), TABLOCKX serializes them — one waits for the other, then proceeds with the latest data.
+
+For the inverse (their write happens AFTER our user starts typing but BEFORE we save):
+```
+T+0:00  Our app reads R014820 (sees phone='0900000076')
+T+0:15  .NET app saves phone='0900000088'
+T+0:45  Our app saves phone='0900000099'
+        → public.updated_at = T+0:45
+        → outbox enqueued
+T+1:00  Writeback fires → MSSQL gets '0900000099'
+T+5:00  Sync runs
+        → mirror.book_cust_tel = '0900000099' (because we overwrote at T+1:00)
+```
+
+**Last writer wins**, with no per-field merge. This is acceptable for hotel domain (rare same-record concurrent edits). To be more careful, we could:
+- Show an "updated by another clerk" warning in our app's edit form (compare `updated_at` from initial load vs current state on save)
+- Add an "audit" view that lists rows where mirror and canonical disagreed during reconcile (engineer reviews weekly)
+
+Both are nice-to-have, not blockers.
+
+### 3.5d. Sync frequency vs freshness
+
+Default: **every 1 minute** (was 5 min in the existing scheduler). The legacy DB load is minimal (incremental query on indexed columns). Tradeoff:
+
+| Sync interval | Freshness | Legacy DB load | Recommended? |
+|---|---|---|---|
+| 30 sec | <1 min stale | very low | ✓ if legacy DB has spare capacity |
+| 1 min | <2 min stale | low | ✓ default |
+| 5 min | <10 min stale | minimal | only if DB is overloaded |
+
+For "live" screens (e.g. room availability dashboard the front desk stares at), the UI can also fire a **manual refresh** button that triggers an on-demand sync via an internal endpoint — fast path for the rare cases someone needs absolute freshness.
+
+### 3.5e. Transition-period reality
+
+During State B, the receptionist will probably:
+- Use whichever app they're more comfortable with for each task
+- Notice ~1-2 minute lag for the OTHER app to "see" their changes
+- Occasionally hit a conflict (last-write-wins)
+
+This matches what they're already used to (the .NET app is multi-client, already has clerks racing each other with no conflict resolution). Our system adds nothing worse.
+
+---
+
 ## 4. Data layer design (PG schema for source-of-truth)
 
 The PG schema must hold **everything** the legacy MSSQL holds, plus our extensions. Today many `ht_*` tables already exist — they need an audit to ensure full coverage. Key principles:
@@ -342,9 +510,58 @@ CREATE TABLE legacy_mirror.ht_book_h (
 );
 ```
 
-The sync worker maintains `legacy_mirror.*`. The repository layer only reads canonical `public.ht_*`. The **service layer** sometimes consults `legacy_mirror.*` to detect drift or backfill — but that's a service-layer concern, not a repository one.
+The sync worker maintains `legacy_mirror.*` AND **upserts new/changed rows into canonical `public.ht_*`** via the reconcile step (§4e below). The repository layer only ever reads `public.ht_*` — bidirectional flow is hidden from it.
 
 When legacy is decommissioned, drop the whole `legacy_mirror` schema.
+
+### 4e. Reconcile = how legacy data becomes visible to our app
+
+**This is the missing piece for bidirectional flow.** The sync worker runs in two phases:
+
+```
+Phase 1: Pull MSSQL → legacy_mirror      (fast, ~5s, every 1-5 min)
+Phase 2: Reconcile legacy_mirror → public.ht_*  (the bidirectional bridge)
+```
+
+Reconcile logic for each table:
+
+```
+For every row in legacy_mirror.ht_book_h:
+  Find canonical row WHERE legacy_book_id = mirror.book_id
+  
+  CASE 1 — no canonical row exists yet:
+    → INSERT into public.ht_bookings with new UUID,
+      legacy_book_id = mirror.book_id, all other fields from mirror
+    → Row is now visible to our app's reads
+  
+  CASE 2 — canonical exists, mirror is newer:
+    (mirror.book_date > public.updated_at AND no pending writeback for this row)
+    → UPDATE public.ht_bookings with mirror's values
+    → Row is now refreshed from legacy
+  
+  CASE 3 — canonical exists, public is newer (we have a pending writeback):
+    → SKIP. Our writeback will push to MSSQL shortly.
+    → Don't pull stale legacy data over our newer changes.
+  
+  CASE 4 — canonical exists and we just wrote to MSSQL successfully:
+    → Match found by legacy_book_id (set by writeback worker on success)
+    → No-op, both sides consistent
+```
+
+**Key invariant:** reconcile must NEVER overwrite a canonical row that has a `pending` outbox job for it. Otherwise we'd lose our user's just-typed changes when the next sync cycle pulls the legacy app's stale data.
+
+To enforce this, the reconcile step does:
+```sql
+UPDATE public.ht_bookings
+   SET (...) = (...)
+ WHERE id = $canonical_id
+   AND NOT EXISTS (
+     SELECT 1 FROM writeback_jobs
+      WHERE aggregate_id = public.ht_bookings.id
+        AND status IN ('pending', 'in_progress')
+   )
+   AND $mirror_updated_at > public.ht_bookings.updated_at;
+```
 
 ### 4c. Outbox table
 
