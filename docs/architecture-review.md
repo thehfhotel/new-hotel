@@ -133,9 +133,15 @@ The architecture must produce a **deployment artifact that is location-agnostic*
 
 ---
 
-## E. Recommendation
+## E. Recommendation (UPDATED 2026-04-25 after user decision)
 
-**Pick Option 3 (Hybrid).**
+**User chose: stay with current stack — no Elysia, no language migration. Add a layered architecture (domain / repository / service / outbox) so the system is decommission-ready when the legacy app is retired.**
+
+See `architecture-target.md` for the full target design. Original Hybrid recommendation preserved below for reference.
+
+---
+
+### Original recommendation (NOT chosen): Pick Option 3 (Hybrid).
 
 **Reasoning:**
 
