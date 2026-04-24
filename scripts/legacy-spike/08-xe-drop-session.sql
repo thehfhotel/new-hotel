@@ -2,6 +2,7 @@
 -- Cleanup. Removes the session definition from the server. The .xel file
 -- on disk is NOT deleted — copy it off the server first if you want it.
 
+SET QUOTED_IDENTIFIER ON;
 SET NOCOUNT ON;
 
 IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = 'hotel_legacy_capture')
