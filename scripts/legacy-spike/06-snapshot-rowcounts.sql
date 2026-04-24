@@ -6,16 +6,17 @@
 SET NOCOUNT ON;
 
 DECLARE @sql NVARCHAR(MAX) = N'';
-SELECT @sql = STRING_AGG(
+SELECT @sql = STRING_AGG(CAST(
   'SELECT ''' + s.name + '.' + t.name + ''' AS table_name, '
   + 'COUNT_BIG(*) AS row_count, '
   + 'CHECKSUM_AGG(BINARY_CHECKSUM(*)) AS data_checksum '
-  + 'FROM ' + QUOTENAME(s.name) + '.' + QUOTENAME(t.name) + ' WITH (NOLOCK)',
-  ' UNION ALL '
+  + 'FROM ' + QUOTENAME(s.name) + '.' + QUOTENAME(t.name) + ' WITH (NOLOCK)'
+  AS NVARCHAR(MAX)),
+  N' UNION ALL '
 )
 FROM sys.tables t
 JOIN sys.schemas s ON s.schema_id = t.schema_id
 WHERE OBJECT_SCHEMA_NAME(t.object_id) NOT IN ('sys');
 
-SET @sql = @sql + ' ORDER BY table_name';
+SET @sql = N'SELECT * FROM (' + @sql + N') AS t ORDER BY table_name';
 EXEC sp_executesql @sql;
