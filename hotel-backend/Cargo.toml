@@ -1,6 +1,6 @@
 [package]
 name = "hotel-backend"
-version = "2.8.0"
+version = "2.8.1"
 edition = "2021"
 description = "Hotel Management System Backend API"
 authors = [""]
@@ -20,7 +20,13 @@ path = "src/bin/ville_sync.rs"
 [dependencies]
 # Web framework (matches Tauri middleware)
 axum = "0.7"
-tokio = { version = "1", features = ["full"] }
+# Tokio: explicit minimal feature list (was "full", trimmed for faster builds).
+# - macros: #[tokio::main], #[tokio::test]
+# - rt-multi-thread: multi-threaded runtime + Runtime::new() in migrate_legacy bin
+# - net: tokio::net::TcpListener for axum
+# - time: tokio::time::sleep used by scheduler/ville_sync
+# - sync: tokio::sync::Mutex used by scheduler state
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 
 # Database - Legacy (SQL Server via tiberius for read-only legacy DB)
@@ -30,14 +36,17 @@ bb8-tiberius = "0.15"
 tokio-util = { version = "0.7", features = ["compat"] }
 
 # Database - New (PostgreSQL via sqlx for HotelNew DB)
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "macros", "bigdecimal"] }
+# Note: "bigdecimal" feature dropped — no NUMERIC columns are read into BigDecimal;
+# all DECIMAL columns are cast to ::float8 (f64) at the SQL level (see CLAUDE.md).
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "macros"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# HTTP client (Slack webhooks)
-reqwest = { version = "0.12", features = ["json"] }
+# HTTP client (Slack webhooks) — sync/blocking, called via tokio::task::spawn_blocking
+# from async context. Chosen over reqwest to avoid pulling in hyper/h2/tower (~100 crates).
+ureq = { version = "2.12", features = ["json", "tls"], default-features = false }
 
 # Scheduling
 tokio-cron-scheduler = "0.10"

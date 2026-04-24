@@ -52,23 +52,35 @@ pub struct SlackMessage {
 }
 
 /// Slack client for sending messages
+///
+/// Uses `ureq` (blocking HTTP) under the hood — Slack webhooks are not
+/// performance-critical and `ureq` pulls in ~100 fewer crates than `reqwest`.
+/// The blocking call is dispatched via `tokio::task::spawn_blocking` so the
+/// async runtime is never blocked.
 #[derive(Clone)]
 pub struct SlackClient {
     config: SlackConfig,
-    client: reqwest::Client,
+    agent: ureq::Agent,
 }
+
+/// Maximum number of retry attempts for a Slack webhook POST.
+const SLACK_MAX_RETRIES: u32 = 3;
 
 impl SlackClient {
     /// Create a new Slack client
     pub fn new(config: SlackConfig) -> Self {
-        Self {
-            config,
-            client: reqwest::Client::new(),
-        }
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(10))
+            .build();
+        Self { config, agent }
     }
 
-    /// Send a message to Slack via webhook
-    /// Retries up to 3 times with exponential backoff (1s, 2s, 4s)
+    /// Send a message to Slack via webhook.
+    ///
+    /// Retries up to 3 times with exponential backoff (1s, 2s, 4s).
+    /// Returns `true` on success, `false` on failure — Slack errors are
+    /// logged but never propagated, since notifications are best-effort.
     pub async fn send_message(&self, message: &SlackMessage) -> bool {
         if !self.config.enabled {
             tracing::debug!("[Slack] Notifications disabled");
@@ -76,44 +88,80 @@ impl SlackClient {
         }
 
         let webhook_url = match &self.config.webhook_url {
-            Some(url) => url,
+            Some(url) => url.clone(),
             None => {
                 tracing::warn!("[Slack] SLACK_WEBHOOK_URL not configured");
                 return false;
             }
         };
 
-        const MAX_RETRIES: u32 = 3;
+        // Serialize the payload once, before moving into the blocking task.
+        let payload = match serde_json::to_value(message) {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::error!("[Slack] Failed to serialize message: {}", e);
+                return false;
+            }
+        };
 
-        for attempt in 1..=MAX_RETRIES {
-            match self.client.post(webhook_url).json(&message).send().await {
-                Ok(response) => {
-                    if response.status().is_success() {
+        for attempt in 1..=SLACK_MAX_RETRIES {
+            let agent = self.agent.clone();
+            let url = webhook_url.clone();
+            let body = payload.clone();
+
+            // Dispatch the blocking ureq call onto a blocking-task thread so
+            // we don't stall the async runtime.
+            let result = tokio::task::spawn_blocking(move || {
+                agent.post(&url).send_json(body)
+            })
+            .await;
+
+            match result {
+                Ok(Ok(response)) => {
+                    let status = response.status();
+                    if (200..300).contains(&status) {
                         tracing::info!("[Slack] Message sent successfully");
                         return true;
                     }
 
-                    let status = response.status();
-                    let error_text = response.text().await.unwrap_or_default();
+                    let error_text = response.into_string().unwrap_or_default();
                     tracing::error!(
                         "[Slack] Attempt {}/{} failed: {} - {}",
                         attempt,
-                        MAX_RETRIES,
+                        SLACK_MAX_RETRIES,
                         status,
                         error_text
                     );
                 }
-                Err(e) => {
+                Ok(Err(ureq::Error::Status(status, response))) => {
+                    let error_text = response.into_string().unwrap_or_default();
+                    tracing::error!(
+                        "[Slack] Attempt {}/{} failed: {} - {}",
+                        attempt,
+                        SLACK_MAX_RETRIES,
+                        status,
+                        error_text
+                    );
+                }
+                Ok(Err(e)) => {
                     tracing::error!(
                         "[Slack] Attempt {}/{} failed: {}",
                         attempt,
-                        MAX_RETRIES,
+                        SLACK_MAX_RETRIES,
                         e
+                    );
+                }
+                Err(join_err) => {
+                    tracing::error!(
+                        "[Slack] Attempt {}/{} blocking task panicked: {}",
+                        attempt,
+                        SLACK_MAX_RETRIES,
+                        join_err
                     );
                 }
             }
 
-            if attempt < MAX_RETRIES {
+            if attempt < SLACK_MAX_RETRIES {
                 let delay = std::time::Duration::from_secs(2u64.pow(attempt - 1));
                 tokio::time::sleep(delay).await;
             }

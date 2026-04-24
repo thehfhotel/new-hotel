@@ -49,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Backend Docker builds**: switched from the dummy-source dependency-cache trick to `cargo-chef` (`planner` + `builder` stages cooking `recipe.json`); fragile-when-Cargo.toml-changes pattern replaced with the standard chef recipe (applied to both `Dockerfile` and `Dockerfile.ville-sync`)
 - **Backend Docker builds**: install `mold` + `clang` in the Rust builder stage and added `hotel-backend/.cargo/config.toml` with a target-scoped `linker = "clang"` + `-fuse-ld=mold` rustflag (only applies to `x86_64-unknown-linux-gnu`, so macOS/aarch64 local builds are unaffected); cuts release link time substantially
 - **CI test-backend job**: added `mozilla-actions/sccache-action` + `RUSTC_WRAPPER=sccache` (with `SCCACHE_GHA_ENABLED=true`) alongside the existing `Swatinem/rust-cache` step, giving per-rustc-call cache hits on top of the whole-`target/` cache
+- **Backend dep graph**: shrunk transitive crate count from 662 → 568 (-94, ~14%) for faster cold Docker builds (`hotel-backend` v2.8.0 → v2.8.1):
+  - Replaced `reqwest` with `ureq 2.12` for the Slack webhook client (drops `hyper-tls`, `h2`, `hyper-rustls`, ~90 transitive crates); blocking call dispatched via `tokio::task::spawn_blocking` so the async runtime is never blocked; same 3-attempt retry semantics with exponential backoff
+  - Slimmed `tokio` from `["full"]` to explicit minimal feature list `["macros", "rt-multi-thread", "net", "time", "sync"]` based on actual usage audit
+  - Dropped the `bigdecimal` feature from `sqlx` — no `BigDecimal` types are read in code; all `DECIMAL`/`NUMERIC` columns are `::float8`-cast to `f64` at the SQL level (per CLAUDE.md guidance)
 
 ### Removed
 - `Hotel` lucide icon import in Sidebar (now bare wordmark)
