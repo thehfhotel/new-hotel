@@ -1,0 +1,26 @@
+-- 02-snapshot-rowcounts.sql
+-- Row count + lightweight checksum per table. Run BEFORE the receptionist
+-- starts. Re-run as 06-snapshot-rowcounts.sql AFTER. Diff the two files
+-- column by column to identify which tables changed during the session.
+--
+-- CHECKSUM_AGG over all rows is fast and detects ANY data change in the
+-- selected columns. We use * (all columns) which gives the strongest
+-- signal at the cost of more CPU on wide tables.
+
+SET NOCOUNT ON;
+
+-- Loop over all base tables and emit one row per table with count + checksum.
+DECLARE @sql NVARCHAR(MAX) = N'';
+SELECT @sql = STRING_AGG(
+  'SELECT ''' + s.name + '.' + t.name + ''' AS table_name, '
+  + 'COUNT_BIG(*) AS row_count, '
+  + 'CHECKSUM_AGG(BINARY_CHECKSUM(*)) AS data_checksum '
+  + 'FROM ' + QUOTENAME(s.name) + '.' + QUOTENAME(t.name) + ' WITH (NOLOCK)',
+  ' UNION ALL '
+)
+FROM sys.tables t
+JOIN sys.schemas s ON s.schema_id = t.schema_id
+WHERE OBJECT_SCHEMA_NAME(t.object_id) NOT IN ('sys');
+
+SET @sql = @sql + ' ORDER BY table_name';
+EXEC sp_executesql @sql;
