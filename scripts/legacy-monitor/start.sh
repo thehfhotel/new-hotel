@@ -12,10 +12,36 @@ scp -q 01-setup-session.sql 02-tail-events.sql tail-loop.sh check-errors.sh chec
 echo "[$(date -u +%H:%M:%S)] enabling XE session..."
 ssh evergreen 'pw=$(grep "^DB_PASSWORD=" ~/new-hotel-production/.env | cut -d= -f2- | tr -d "\"'\''"); cat ~/legacy-monitor/scripts/01-setup-session.sql | docker run --rm -i --network host --entrypoint /opt/mssql-tools18/bin/sqlcmd mcr.microsoft.com/mssql/server:2022-latest -C -S 192.168.100.222 -U sa -P "$pw" -d master -W 2>&1 | grep -v "container is" | grep -v "non-root" | grep -v "linkid"'
 
-echo "[$(date -u +%H:%M:%S)] starting tail loop in background on evergreen..."
-ssh evergreen 'chmod +x ~/legacy-monitor/scripts/*.sh && cd ~/legacy-monitor/scripts && nohup ./tail-loop.sh > ~/legacy-monitor/tail-loop.out 2>&1 & disown'
-sleep 2
-ssh evergreen 'cat ~/legacy-monitor/tail-loop.pid 2>/dev/null && echo "OK — running"'
+echo "[$(date -u +%H:%M:%S)] starting tail loop as systemd user service on evergreen..."
+# systemd-run --user --scope detaches fully from SSH session; survives logout.
+# Loginctl enable-linger ensures the service stays alive even with no user logged in.
+ssh evergreen '
+  set -e
+  chmod +x ~/legacy-monitor/scripts/*.sh
+  loginctl enable-linger "$USER" 2>/dev/null || true
+  systemctl --user stop legacy-monitor.service 2>/dev/null || true
+  mkdir -p ~/.config/systemd/user
+  cat > ~/.config/systemd/user/legacy-monitor.service <<UNIT
+[Unit]
+Description=Legacy MSSQL monitor (XE tail loop)
+
+[Service]
+Type=simple
+WorkingDirectory=%h/legacy-monitor/scripts
+ExecStart=/bin/bash %h/legacy-monitor/scripts/tail-loop.sh
+StandardOutput=append:%h/legacy-monitor/tail-loop.out
+StandardError=append:%h/legacy-monitor/tail-loop.out
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+UNIT
+  systemctl --user daemon-reload
+  systemctl --user enable --now legacy-monitor.service
+  sleep 2
+  systemctl --user status legacy-monitor.service --no-pager | head -10
+'
 
 echo
 echo "Monitor active. Files on evergreen:"
