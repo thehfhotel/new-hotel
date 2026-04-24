@@ -58,6 +58,9 @@ CREATE EVENT SESSION ' + QUOTENAME(@session_name) + N' ON SERVER
       sqlserver.sql_text, sqlserver.transaction_id
     )
     WHERE sqlserver.database_name = N''' + REPLACE(@target_db_name, '''', '''''') + N'''
+          AND sqlserver.client_app_name <> N''tiberius''
+          AND sqlserver.client_app_name NOT LIKE N''SQLServerCEIP%''
+          AND sqlserver.client_app_name NOT LIKE N''SQLCMD%''
   ),
 
   ADD EVENT sqlserver.rpc_completed (
@@ -67,6 +70,9 @@ CREATE EVENT SESSION ' + QUOTENAME(@session_name) + N' ON SERVER
       sqlserver.transaction_id
     )
     WHERE sqlserver.database_name = N''' + REPLACE(@target_db_name, '''', '''''') + N'''
+          AND sqlserver.client_app_name <> N''tiberius''
+          AND sqlserver.client_app_name NOT LIKE N''SQLServerCEIP%''
+          AND sqlserver.client_app_name NOT LIKE N''SQLCMD%''
   ),
 
   ADD EVENT sqlserver.error_reported (
@@ -75,6 +81,9 @@ CREATE EVENT SESSION ' + QUOTENAME(@session_name) + N' ON SERVER
       sqlserver.username, sqlserver.database_name, sqlserver.sql_text
     )
     WHERE sqlserver.database_name = N''' + REPLACE(@target_db_name, '''', '''''') + N'''
+          AND sqlserver.client_app_name <> N''tiberius''
+          AND sqlserver.client_app_name NOT LIKE N''SQLServerCEIP%''
+          AND sqlserver.client_app_name NOT LIKE N''SQLCMD%''
       AND severity >= 11
   )
 
@@ -82,6 +91,9 @@ CREATE EVENT SESSION ' + QUOTENAME(@session_name) + N' ON SERVER
   -- ,ADD EVENT sqlserver.sp_statement_completed (
   --    ACTION (sqlserver.session_id, sqlserver.client_app_name, sqlserver.sql_text)
   --    WHERE sqlserver.database_name = N''' + REPLACE(@target_db_name, '''', '''''') + N'''
+          AND sqlserver.client_app_name <> N''tiberius''
+          AND sqlserver.client_app_name NOT LIKE N''SQLServerCEIP%''
+          AND sqlserver.client_app_name NOT LIKE N''SQLCMD%''
   --  )
 
   ADD TARGET package0.event_file (
