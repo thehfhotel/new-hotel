@@ -1,6 +1,13 @@
-# Target Architecture — Decommission-Ready (Stay-Current Stack)
+# Architecture
 
-**Stack: unchanged.** Next.js 16 frontend, Rust + Axum backend, Postgres + Legacy MSSQL.
+**Stack: Rust+Axum backend, Next.js 16+React 19 frontend, PostgreSQL, Legacy MSSQL via Change Tracking.**
+
+> **Stack decision (2026-04-25):** Keep current stack. Rejected paths:
+> - Full Elysia/Bun rewrite — would throw away the proven `tiberius`+`TABLOCKX` writeback infrastructure that the spike validated. ~2-3 month rewrite for marginal velocity gains.
+> - Hybrid (Elysia API + Rust workers) — adds two-language complexity for one engineer.
+> - Leptos / HTMX — a hotel-management UI is exactly what React's component ecosystem (calendars, datepickers, datatables, charts) was built for.
+>
+> The chosen path: layered architecture inside the existing Rust backend + event-driven sync. See §1 for the layout, §3.6 for the event bus, §8 for the migration roadmap.
 
 **Core principle:** PostgreSQL is the **single source of truth** from day one.
 The legacy MSSQL is treated as an **external system we currently mirror to/from** for backward-compatibility with the 3rd-party Windows app. When the 3rd-party app is decommissioned, we turn off the sync + writeback workers; everything else keeps working unchanged.

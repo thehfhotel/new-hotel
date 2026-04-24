@@ -1,5 +1,21 @@
 # Claude Code Instructions
 
+## Target Architecture (READ FIRST)
+
+**Source of truth:** [`docs/architecture.md`](docs/architecture.md). Read it before designing or implementing.
+
+Summary:
+- Stay-current stack: Rust+Axum backend, Next.js 16 frontend, PostgreSQL, legacy MSSQL.
+- PostgreSQL is the source of truth from day one. Legacy MSSQL is an external sink.
+- Layered architecture inside the decommission boundary: `domain/` → `repository/` (PG-only) → `service/` (business logic + outbox emission) → thin `routes/`.
+- Adapter workers OUTSIDE the boundary: `bin/writeback.rs` (LISTEN'er → MSSQL via tiberius), `bin/sync.rs` (Change Tracking watcher → publishes events), `bin/ville_sync.rs` (existing).
+- Event-driven sync via PG `LISTEN/NOTIFY` + SQL Server Change Tracking. Sub-second latency target.
+- Three operational states (today / transition / decommissioned) controlled by env vars only — no code changes between states.
+
+**Companion docs:**
+- `docs/legacy-spike/findings.md` — validated SQL recipes for every writeback flow. Don't re-derive.
+- `scripts/legacy-monitor/` — long-running XE session for error alerting + activity recording.
+
 ## Versioning & Changelog Policy
 
 **MANDATORY**: When making changes to this project, Claude MUST:
