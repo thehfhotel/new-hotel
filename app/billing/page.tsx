@@ -363,7 +363,7 @@ export default function BillingPage() {
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-center">
                       <Link
-                        href={`/new/billing/${checkIn.id}`}
+                        href={`/billing/${checkIn.id}`}
                         className="inline-flex items-center gap-1 px-3 py-1.5 text-sm font-medium text-red-600 hover:text-red-500 hover:bg-red-500/10 rounded-lg"
                       >
                         <Eye className="w-4 h-4" />
