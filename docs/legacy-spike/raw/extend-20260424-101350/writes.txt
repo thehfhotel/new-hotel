@@ -1,0 +1,25 @@
+[10:14:12] update HT_CheckIn_H set Cin_Work_number=242859 where Cin_No='CH26-005230'
+[10:15:22] update HT_CheckIn_H set Cin_Work_number=539215 where Cin_No='CH26-005230'
+[10:15:26] update HT_Rooms set room_use='no' where room_no in (select Cin_Room_No from HT_CheckIn_Ds where Cin_no='CH26-005230' and Cin_Room_Status<>'Check-Out')
+[10:15:26] delete from HT_Room_Status where room_CheckIn_No='CH26-005230'
+[10:15:26] UPDATE [HT_CheckIn_H] SET  [Total_Price_Room]=1780.00,[Total_Price_Product]=0.00,[Total_Price_Net]=1780.00,[Total_Price_Pay]=0.00,[Total_Price_Balance]=1780.00 where [Cin_no]='CH26-005230'
+[10:15:26] update [HT_CheckIn_Ds] SET  [Cin_Room_night]=2,[Cin_Room_PriceTotal]=1780,[Cin_note]='',[Cin_Room_Out]='4/26/2026 12:00:00 PM' where id=25009
+[10:15:26] update HT_Rooms set room_use='yes' where room_no='508'
+[10:15:26] INSERT INTO [HT_Room_Status]([id],[room_no],[room_date],[room_status],[room_Details],[room_CheckIn_No],[room_date_oa])VALUES(50235,'508','4/24/2026','เข้าพัก','SPIKE TEST WALKIN 3','CH26-005230',46136)
+[10:15:26] INSERT INTO [HT_Room_Status]([id],[room_no],[room_date],[room_status],[room_Details],[room_CheckIn_No],[room_date_oa])VALUES(50236,'508','4/25/2026','เข้าพัก','SPIKE TEST WALKIN 3','CH26-005230',46137)
+[10:16:30] update HT_CheckIn_H set Cin_Work_number=785424 where Cin_No='CH26-005230'
+[10:16:35] UPDATE [HT_Customers] SET  [Cust_name]='SPIKE TEST WALKIN 3',[Cust_name2]='',[Cust_Type]='ราคาปกติ',[Cust_Type_main]='บุคคลธรรมดา',[Cust_Email]='',[Cust_Add_no]='',[Cust_Add_moo]='',[Cust_Add_soi]='',[Cust_Add_road]='',[Cust_Add_tambon]='',[Cust_Add_ampore
+[10:16:35] update HT_Rooms set room_use='no' where room_no in (select Cin_Room_No from HT_CheckIn_Ds where Cin_no='CH26-005230' and Cin_Room_Status <> 'Check-Out')
+[10:16:35] delete from HT_Room_Status where room_CheckIn_No='CH26-005230'
+[10:16:35] delete from HT_CheckIn_H where Cin_no='CH26-005230'
+[10:16:35] delete from HT_CheckIn_Product where Cin_no='CH26-005230'
+[10:16:35] delete from HT_CheckIn_Ds where Cin_no='CH26-005230' and Cin_Room_Status <> 'Check-Out'
+[10:16:35] update Tb_Save_Image set cin_no='CH26-005230',cust_no='C21609',tmp_no='' where tmp_no='622039'
+[10:16:35] INSERT INTO [HT_CheckIn_Ds]([id],[Cin_No],[Cin_Room_No],[Cin_Room_Type],[Cin_Room_In],[Cin_Room_Out],[Cin_Room_Status],[Cin_Room_Dep],[Cin_Room_Price],[Cin_Room_Night],[Cin_Room_PriceToTal],[Cin_Room_Pay_Before],[Cin_Room_Pay_Total],[Cin_note],[Cin_dep_sta
+[10:16:35] update HT_Rooms set room_use='yes' where room_no='508'
+[10:16:35] INSERT INTO [HT_Room_Status]([id],[room_no],[room_date],[room_status],[room_Details],[room_CheckIn_No],[room_date_oa])VALUES(50235,'508','4/24/2026','เข้าพัก','SPIKE TEST WALKIN 3','CH26-005230',46136)
+[10:16:35] INSERT INTO [HT_Room_Status]([id],[room_no],[room_date],[room_status],[room_Details],[room_CheckIn_No],[room_date_oa])VALUES(50236,'508','4/25/2026','เข้าพัก','SPIKE TEST WALKIN 3','CH26-005230',46137)
+[10:16:35] delete from HT_CheckIn_Other_People where Cin_no='CH26-005230'
+[10:16:35] INSERT INTO [HT_CheckIn_H]([Cin_no],[Cin_Date],[Cin_Book_no],[Cin_cust_no],[Cin_cust_price],[Cin_status],[Total_Price_Room],[Total_Price_Product],[Total_Price_Net],[Total_Price_Pay],[Total_Price_Balance],[Cin_Car_type],[Cin_Car_id],[Cin_Room_ALL],[Cin_Date
+[10:16:35] INSERT INTO [HT_CheckIn_Other_People]([Cin_no],[Cin_name],[Cin_contry])VALUES('CH26-005230','นาย SPIKE TEST WALKIN 3 ','')
+[10:16:36] update HT_CheckIn_H set Cin_Work_number=143625 where Cin_No='CH26-005230'

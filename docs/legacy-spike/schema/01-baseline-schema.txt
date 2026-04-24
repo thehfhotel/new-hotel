@@ -1,0 +1,751 @@
+==== Tables (filter to HT_* and View_* — adjust if your prefix differs) ====
+table_name|create_date|modify_date|approx_row_count
+----------|-----------|-----------|----------------
+dbo.HT_Bank_Accounts|2017-01-30 22:14:33.987|2017-01-30 22:14:34.003|0
+dbo.HT_Bank_Transfer|2017-01-30 22:14:34.050|2017-01-30 22:14:34.063|0
+dbo.HT_Bill_Debt_Ds|2013-10-28 01:09:02.863|2013-10-28 01:09:02.867|0
+dbo.HT_Bill_Debt_H|2013-10-28 01:09:02.833|2014-09-17 10:59:04.497|0
+dbo.HT_Book_Date|2012-12-15 14:34:13.013|2012-12-15 14:41:52.350|1009
+dbo.HT_Book_Ds|2012-12-15 12:55:07.570|2013-10-21 09:47:42.013|15949
+dbo.HT_Book_Ds2|2012-11-26 11:04:57.977|2012-11-26 11:04:57.980|0
+dbo.HT_Book_H|2013-11-11 11:08:24.130|2016-06-30 14:22:54.140|14809
+dbo.HT_Book_H2|2012-11-26 11:04:58.057|2012-11-26 11:04:58.060|0
+dbo.HT_Book_Pro|2015-06-01 12:00:56.503|2015-06-01 12:00:56.597|0
+dbo.HT_Book_Status|2012-11-26 11:05:00.710|2012-11-26 11:05:00.713|0
+dbo.HT_Booking_Notes|2026-01-29 22:16:52.837|2026-01-29 22:16:52.860|0
+dbo.HT_Changed_Room|2013-06-29 12:50:05.870|2017-04-07 13:07:58.803|3866
+dbo.HT_CheckIn_Ds|2013-01-20 01:19:57.530|2013-08-09 22:37:15.360|24862
+dbo.HT_CheckIn_H|2012-11-26 11:05:00.787|2018-12-29 18:21:03.673|19329
+dbo.HT_CheckIn_Other_People|2013-07-19 16:50:07.437|2013-07-19 16:50:07.467|19336
+dbo.HT_CheckIn_Pay|2012-12-15 12:54:20.577|2019-09-30 10:38:37.333|27090
+dbo.HT_CheckIn_Product|2012-12-15 12:54:38.750|2012-12-15 12:54:38.760|0
+dbo.HT_ContinueTime|2015-06-21 23:56:11.543|2015-06-21 23:56:11.547|0
+dbo.HT_Cupon|2013-08-09 22:42:49.180|2013-08-09 22:42:49.183|17894
+dbo.HT_Customers|2013-03-06 16:28:55.473|2014-09-19 20:46:24.820|21606
+dbo.HT_Deposit|2012-11-26 11:05:03.587|2012-11-26 11:05:03.590|0
+dbo.HT_EMP_SMS|2012-12-15 12:57:08.083|2012-12-15 12:57:08.117|78
+dbo.HT_Housewife|2013-07-19 16:50:07.437|2013-08-03 18:36:09.023|30208
+dbo.HT_INVOICE|2016-06-29 13:59:32.223|2016-06-29 13:59:32.227|5
+dbo.HT_Invoice_Ds|2014-08-06 11:30:28.857|2014-08-06 11:30:28.860|3
+dbo.HT_Invoice_H|2014-08-06 11:30:28.827|2014-08-06 11:30:28.857|2
+dbo.HT_Invoice_Note|2017-06-23 23:13:21.230|2019-11-10 12:01:55.183|0
+dbo.HT_Log|2018-12-29 18:21:03.303|2018-12-29 18:21:03.493|6224
+dbo.HT_Log_Debt|2013-03-01 01:56:36.497|2013-03-01 01:56:36.507|686
+dbo.HT_Order_Down|2012-11-26 11:05:03.663|2012-11-26 11:05:03.667|0
+dbo.HT_Order_Up|2012-11-26 11:05:03.697|2012-11-26 11:05:03.700|0
+dbo.HT_POWER_LOG|2016-06-09 12:06:16.370|2016-06-09 12:06:16.373|29749
+dbo.HT_Products|2012-11-26 11:05:05.737|2014-09-19 20:46:24.693|5
+dbo.HT_Products_Price|2012-12-15 12:57:33.160|2012-12-15 12:57:33.180|20
+dbo.HT_Receipt_Ds|2012-12-15 12:57:49.267|2012-12-15 12:57:49.277|26063
+dbo.HT_Receipt_H|2012-11-26 11:05:05.830|2014-02-12 16:31:29.767|20652
+dbo.HT_Register|2012-11-26 11:05:05.847|2012-11-26 11:05:05.860|0
+dbo.HT_Room_SMS|2012-12-15 12:58:12.893|2012-12-15 12:58:12.903|2379
+dbo.HT_Room_Status|2012-11-26 11:05:07.557|2024-12-13 13:33:56.800|4443
+dbo.HT_Rooms|2013-10-28 01:09:58.860|2015-06-19 00:44:47.797|58
+dbo.HT_Rooms_Cancel|2013-07-20 20:34:44.300|2013-07-20 20:39:11.377|297
+dbo.HT_Rooms_Price|2012-12-15 12:58:46.053|2015-02-19 11:20:45.633|32
+dbo.HT_Rooms_Repair|2013-10-31 22:20:01.680|2013-10-31 22:20:01.697|683
+dbo.HT_Round_Bill|2013-07-20 13:10:55.000|2013-07-20 13:10:55.207|4575
+dbo.HT_SET_CusType|2012-12-15 12:58:56.447|2013-01-19 23:35:28.337|4
+dbo.HT_SET_CusType_Main|2012-12-15 12:59:11.327|2013-03-06 18:05:28.197|4
+dbo.HT_SET_ProductType|2012-12-15 12:59:23.177|2012-12-15 12:59:23.187|6
+dbo.HT_SET_RoomType|2012-12-15 12:59:35.120|2012-12-15 12:59:35.130|8
+dbo.HT_SET_Sale|2016-06-30 14:22:54.093|2016-06-30 14:22:54.123|1
+dbo.TB_FOLIO|2015-05-02 15:45:03.993|2019-11-10 12:01:54.757|6
+dbo.TB_MRP_EMPLOYEE|2012-12-15 12:59:50.753|2012-12-15 12:59:50.763|4
+dbo.TB_MRP_Permission|2013-06-28 21:07:29.670|2013-06-28 21:07:29.683|24
+dbo.TB_MRP_Permission_name|2012-11-26 11:05:09.977|2012-11-26 11:05:09.980|1
+dbo.TB_Pay_History|2015-05-02 15:45:04.070|2015-05-02 15:45:04.073|3
+dbo.Tb_Save_Image|2012-12-25 01:36:10.533|2012-12-25 02:05:57.100|9688
+dbo.TB_SET_Branch|2017-11-20 10:53:34.413|2017-11-20 10:53:34.507|1
+dbo.TB_SET_MyType2|2015-05-02 15:45:04.087|2015-05-02 15:45:04.090|5
+dbo.TB_SET_MyType2_2|2015-05-02 15:45:04.103|2015-05-02 15:45:04.107|20
+dbo.TB_SET_MyType3|2015-05-02 15:45:04.120|2015-05-02 15:45:04.123|40
+dbo.TB_SETTINGS|2012-11-26 11:05:12.163|2019-09-14 18:26:04.430|1
+dbo.Tb_Version|2013-04-10 06:22:31.997|2013-04-10 06:22:32.010|1
+ 
+==== Columns ====
+table_name|ord|column_name|data_type|max_length|precision|scale|is_nullable|is_identity|default_value
+----------|---|-----------|---------|----------|---------|-----|-----------|-----------|-------------
+dbo.HT_Bank_Accounts|1|id|int|4|10|0|1|0|NULL
+dbo.HT_Bank_Accounts|2|AC_NAME|varchar|100|0|0|1|0|NULL
+dbo.HT_Bank_Accounts|3|AC_BANK_NAME|varchar|100|0|0|1|0|NULL
+dbo.HT_Bank_Accounts|4|AC_BANK_NO|varchar|100|0|0|1|0|NULL
+dbo.HT_Bank_Accounts|5|AC_BANK_TYPE|varchar|100|0|0|1|0|NULL
+dbo.HT_Bank_Accounts|6|AC_BANK_BRANCH|varchar|100|0|0|1|0|NULL
+dbo.HT_Bank_Transfer|1|id|int|4|10|0|1|0|NULL
+dbo.HT_Bank_Transfer|2|Bank_Name|varchar|100|0|0|1|0|NULL
+dbo.HT_Bank_Transfer|3|Bank_Account_Name|varchar|100|0|0|1|0|NULL
+dbo.HT_Bank_Transfer|4|Bank_Account_No|varchar|100|0|0|1|0|NULL
+dbo.HT_Bank_Transfer|5|Bank_Account_Type|varchar|100|0|0|1|0|NULL
+dbo.HT_Bank_Transfer|6|Bank_Account_BRANCH|varchar|100|0|0|1|0|NULL
+dbo.HT_Bank_Transfer|7|Cust_Name|varchar|100|0|0|1|0|NULL
+dbo.HT_Bank_Transfer|8|Cust_Bank_Name|varchar|100|0|0|1|0|NULL
+dbo.HT_Bank_Transfer|9|Transfer_Date|datetime|8|23|3|1|0|NULL
+dbo.HT_Bank_Transfer|10|Transfer_Time|varchar|100|0|0|1|0|NULL
+dbo.HT_Bank_Transfer|11|Transfer_no|varchar|100|0|0|1|0|NULL
+dbo.HT_Bank_Transfer|12|Transfer_Price|float|8|53|0|1|0|NULL
+dbo.HT_Bank_Transfer|13|Transfer_Note|float|8|53|0|1|0|NULL
+dbo.HT_Bank_Transfer|14|Transfer_Slip|varbinary|-1|0|0|1|0|NULL
+dbo.HT_Bank_Transfer|15|All_Price|float|8|53|0|1|0|NULL
+dbo.HT_Bank_Transfer|16|emp_name|varchar|100|0|0|1|0|NULL
+dbo.HT_Bill_Debt_Ds|1|id|int|4|10|0|0|1|NULL
+dbo.HT_Bill_Debt_Ds|2|Bill_No|varchar|20|0|0|1|0|NULL
+dbo.HT_Bill_Debt_Ds|3|DS_ID|int|4|10|0|1|0|NULL
+dbo.HT_Bill_Debt_Ds|4|DS_NO|varchar|50|0|0|1|0|NULL
+dbo.HT_Bill_Debt_Ds|5|DS_NAME|varchar|250|0|0|1|0|NULL
+dbo.HT_Bill_Debt_Ds|6|DS_UNIT|varchar|50|0|0|1|0|NULL
+dbo.HT_Bill_Debt_Ds|7|DS_NUM|float|8|53|0|1|0|NULL
+dbo.HT_Bill_Debt_Ds|8|DS_PRICE|float|8|53|0|1|0|NULL
+dbo.HT_Bill_Debt_Ds|9|DS_PRICE_TOTAL|float|8|53|0|1|0|NULL
+dbo.HT_Bill_Debt_H|1|Bill_No|varchar|20|0|0|1|0|NULL
+dbo.HT_Bill_Debt_H|2|Bill_Cust_ID|varchar|50|0|0|1|0|NULL
+dbo.HT_Bill_Debt_H|3|Bill_Cust_Name|varchar|250|0|0|1|0|NULL
+dbo.HT_Bill_Debt_H|4|Bill_Cust_Address|varchar|500|0|0|1|0|NULL
+dbo.HT_Bill_Debt_H|5|Bill_Cust_Tel|varchar|250|0|0|1|0|NULL
+dbo.HT_Bill_Debt_H|6|Bill_Cust_Fax|varchar|250|0|0|1|0|NULL
+dbo.HT_Bill_Debt_H|7|Bill_Date|datetime|8|23|3|1|0|NULL
+dbo.HT_Bill_Debt_H|8|Bill_Ref|varchar|250|0|0|1|0|NULL
+dbo.HT_Bill_Debt_H|9|Bill_Price_Type|varchar|50|0|0|1|0|NULL
+dbo.HT_Bill_Debt_H|10|Bill_Type|varchar|50|0|0|1|0|NULL
+dbo.HT_Bill_Debt_H|11|Bill_Total|float|8|53|0|1|0|NULL
+dbo.HT_Bill_Debt_H|12|Bill_Pay|float|8|53|0|1|0|NULL
+dbo.HT_Bill_Debt_H|13|Bill_Debt|float|8|53|0|1|0|NULL
+dbo.HT_Bill_Debt_H|14|Bill_Pay_CASH|float|8|53|0|1|0|NULL
+dbo.HT_Bill_Debt_H|15|Bill_Pay_CREDIT|float|8|53|0|1|0|NULL
+dbo.HT_Bill_Debt_H|16|Bill_Status|varchar|50|0|0|1|0|NULL
+dbo.HT_Bill_Debt_H|17|Bill_by|varchar|50|0|0|1|0|NULL
+dbo.HT_Bill_Debt_H|18|Bill_Note|varchar|50|0|0|1|0|NULL
+dbo.HT_Book_Date|1|id|int|4|10|0|0|0|NULL
+dbo.HT_Book_Date|2|Book_no|varchar|50|0|0|1|0|NULL
+dbo.HT_Book_Date|3|Book_type|varchar|50|0|0|1|0|NULL
+dbo.HT_Book_Date|4|Book_date_ds|datetime|8|23|3|1|0|NULL
+dbo.HT_Book_Date|5|Book_Num|int|4|10|0|1|0|NULL
+dbo.HT_Book_Date|6|Book_USE|int|4|10|0|0|0|((0))
+dbo.HT_Book_Date|7|Book_ok|int|4|10|0|0|0|((0))
+dbo.HT_Book_Date|8|Cin_no|varchar|50|0|0|1|0|NULL
+dbo.HT_Book_Ds|1|id|int|4|10|0|0|1|NULL
+dbo.HT_Book_Ds|2|Book_No|varchar|50|0|0|1|0|NULL
+dbo.HT_Book_Ds|3|Book_Room_Type|varchar|50|0|0|1|0|NULL
+dbo.HT_Book_Ds|4|Book_Room_Start|datetime|8|23|3|1|0|NULL
+dbo.HT_Book_Ds|5|Book_Room_End|datetime|8|23|3|1|0|NULL
+dbo.HT_Book_Ds|6|Book_Room_Price|float|8|53|0|1|0|NULL
+dbo.HT_Book_Ds|7|Book_Room_Night|float|8|53|0|1|0|NULL
+dbo.HT_Book_Ds|8|Book_Room_Num|float|8|53|0|1|0|NULL
+dbo.HT_Book_Ds|9|Book_Room_PriceToTal|float|8|53|0|1|0|NULL
+dbo.HT_Book_Ds|10|Book_Room_Note|varchar|500|0|0|1|0|NULL
+dbo.HT_Book_Ds|11|Book_status|int|4|10|0|0|0|((1))
+dbo.HT_Book_Ds2|1|id|int|4|10|0|1|0|NULL
+dbo.HT_Book_Ds2|2|Book_No|varchar|50|0|0|1|0|NULL
+dbo.HT_Book_Ds2|3|Book_Room_Type|varchar|50|0|0|1|0|NULL
+dbo.HT_Book_Ds2|4|Book_Room_Ds|varchar|550|0|0|1|0|NULL
+dbo.HT_Book_Ds2|5|Book_Room_Num|float|8|53|0|1|0|NULL
+dbo.HT_Book_Ds2|6|Book_Room_Days|float|8|53|0|1|0|NULL
+dbo.HT_Book_Ds2|7|Book_Room_Price|float|8|53|0|1|0|NULL
+dbo.HT_Book_Ds2|8|Book_Room_PriceToTal|float|8|53|0|1|0|NULL
+dbo.HT_Book_H|1|Book_ID|varchar|50|0|0|1|0|NULL
+dbo.HT_Book_H|2|Book_Date|datetime|8|23|3|1|0|NULL
+dbo.HT_Book_H|3|Book_Date_in|datetime|8|23|3|1|0|NULL
+dbo.HT_Book_H|4|Book_Date_out|datetime|8|23|3|1|0|NULL
+dbo.HT_Book_H|5|Book_Cust_ID|varchar|50|0|0|1|0|NULL
+dbo.HT_Book_H|6|Book_Cust_Name|varchar|200|0|0|1|0|NULL
+dbo.HT_Book_H|7|Book_Cust_Name2|varchar|200|0|0|1|0|NULL
+dbo.HT_Book_H|8|Book_Cust_Tel|varchar|80|0|0|1|0|NULL
+dbo.HT_Book_H|9|Book_Price_Total|float|8|53|0|1|0|NULL
+dbo.HT_Book_H|10|Book_Price_Pay|float|8|53|0|1|0|NULL
+dbo.HT_Book_H|11|Book_Status|varchar|50|0|0|1|0|NULL
+dbo.HT_Book_H|12|Book_by|varchar|100|0|0|1|0|NULL
+dbo.HT_Book_H|13|Book_room_all|text|16|0|0|1|0|NULL
+dbo.HT_Book_H|14|Book_room_note|text|16|0|0|1|0|NULL
+dbo.HT_Book_H|15|Book_room_type|int|4|10|0|0|0|((1))
+dbo.HT_Book_H|16|Book_Notify_Day|int|4|10|0|0|0|((0))
+dbo.HT_Book_H|17|Book_Notify_Note|varchar|50|0|0|1|0|NULL
+dbo.HT_Book_H|18|Book_Sale|varchar|150|0|0|1|0|NULL
+dbo.HT_Book_H2|1|id|int|4|10|0|1|0|NULL
+dbo.HT_Book_H2|2|Book_ID|varchar|50|0|0|1|0|NULL
+dbo.HT_Book_H2|3|Book_Date|datetime|8|23|3|1|0|NULL
+dbo.HT_Book_H2|4|Book_Date_in|datetime|8|23|3|1|0|NULL
+dbo.HT_Book_H2|5|Book_Date_out|datetime|8|23|3|1|0|NULL
+dbo.HT_Book_H2|6|Book_days|float|8|53|0|1|0|NULL
+dbo.HT_Book_H2|7|Book_Cust_ID|varchar|50|0|0|1|0|NULL
+dbo.HT_Book_H2|8|Book_Cust_Name|varchar|500|0|0|1|0|NULL
+dbo.HT_Book_H2|9|Book_Cust_Tel|varchar|80|0|0|1|0|NULL
+dbo.HT_Book_H2|10|Book_Cust_Fax|varchar|80|0|0|1|0|NULL
+dbo.HT_Book_H2|11|Book_Cust_Address|varchar|500|0|0|1|0|NULL
+dbo.HT_Book_H2|12|Book_Cust_Price|varchar|50|0|0|1|0|NULL
+dbo.HT_Book_H2|13|Book_Cust_Note|varchar|500|0|0|1|0|NULL
+dbo.HT_Book_H2|14|Book_Price_Total|float|8|53|0|1|0|NULL
+dbo.HT_Book_H2|15|Book_Status|varchar|50|0|0|1|0|NULL
+dbo.HT_Book_Pro|1|id|int|4|10|0|0|1|NULL
+dbo.HT_Book_Pro|2|B_NO|varchar|50|0|0|1|0|NULL
+dbo.HT_Book_Pro|3|B_ROOM|varchar|50|0|0|1|0|NULL
+dbo.HT_Book_Pro|4|B_NAME|varchar|250|0|0|1|0|NULL
+dbo.HT_Book_Pro|5|B_UNIT|varchar|50|0|0|1|0|NULL
+dbo.HT_Book_Pro|6|B_NUM|float|8|53|0|1|0|NULL
+dbo.HT_Book_Pro|7|B_PRICE|float|8|53|0|1|0|NULL
+dbo.HT_Book_Pro|8|B_PRICE_TOTAL|float|8|53|0|1|0|NULL
+dbo.HT_Book_Pro|9|B_PRO_ID|int|4|10|0|1|0|NULL
+dbo.HT_Book_Status|1|id|int|4|10|0|1|0|NULL
+dbo.HT_Book_Status|2|room_no|varchar|50|0|0|1|0|NULL
+dbo.HT_Book_Status|3|room_date|datetime|8|23|3|1|0|NULL
+dbo.HT_Book_Status|4|room_status|varchar|50|0|0|1|0|NULL
+dbo.HT_Book_Status|5|room_Details|varchar|500|0|0|1|0|NULL
+dbo.HT_Book_Status|6|room_Book_No|varchar|50|0|0|1|0|NULL
+dbo.HT_Book_Status|7|room_CheckIn_No|varchar|50|0|0|1|0|NULL
+dbo.HT_Booking_Notes|1|Note_ID|int|4|10|0|0|1|NULL
+dbo.HT_Booking_Notes|2|Book_No|nvarchar|100|0|0|0|0|NULL
+dbo.HT_Booking_Notes|3|Note_Text|nvarchar|-1|0|0|0|0|NULL
+dbo.HT_Booking_Notes|4|Created_At|datetime|8|23|3|1|0|(getdate())
+dbo.HT_Booking_Notes|5|Updated_At|datetime|8|23|3|1|0|(getdate())
+dbo.HT_Changed_Room|1|id|int|4|10|0|0|1|NULL
+dbo.HT_Changed_Room|2|cin_no|varchar|50|0|0|0|0|NULL
+dbo.HT_Changed_Room|3|room_before|varchar|50|0|0|1|0|NULL
+dbo.HT_Changed_Room|4|room_after|varchar|50|0|0|1|0|NULL
+dbo.HT_Changed_Room|5|change_date|datetime|8|23|3|1|0|NULL
+dbo.HT_Changed_Room|6|room_before_price|float|8|53|0|0|0|((0))
+dbo.HT_Changed_Room|7|Note|varchar|255|0|0|1|0|NULL
+dbo.HT_Changed_Room|8|ToPrice|varchar|20|0|0|1|0|NULL
+dbo.HT_CheckIn_Ds|1|id|int|4|10|0|0|0|NULL
+dbo.HT_CheckIn_Ds|2|Cin_No|varchar|50|0|0|1|0|NULL
+dbo.HT_CheckIn_Ds|3|Cin_Room_No|varchar|50|0|0|1|0|NULL
+dbo.HT_CheckIn_Ds|4|Cin_Room_Type|varchar|50|0|0|1|0|NULL
+dbo.HT_CheckIn_Ds|5|Cin_Room_In|datetime|8|23|3|1|0|NULL
+dbo.HT_CheckIn_Ds|6|Cin_Room_Out|datetime|8|23|3|1|0|NULL
+dbo.HT_CheckIn_Ds|7|Cin_Room_Status|varchar|500|0|0|1|0|NULL
+dbo.HT_CheckIn_Ds|8|Cin_Room_Dep|float|8|53|0|1|0|NULL
+dbo.HT_CheckIn_Ds|9|Cin_Room_Price|float|8|53|0|1|0|NULL
+dbo.HT_CheckIn_Ds|10|Cin_Room_Night|float|8|53|0|1|0|NULL
+dbo.HT_CheckIn_Ds|11|Cin_Room_PriceToTal|float|8|53|0|1|0|NULL
+dbo.HT_CheckIn_Ds|12|Cin_Room_Pay_Before|float|8|53|0|1|0|NULL
+dbo.HT_CheckIn_Ds|13|Cin_Room_Pay_Total|float|8|53|0|1|0|NULL
+dbo.HT_CheckIn_Ds|14|Cin_note|varchar|500|0|0|1|0|NULL
+dbo.HT_CheckIn_Ds|15|Cin_Dep_Status|varchar|50|0|0|1|0|NULL
+dbo.HT_CheckIn_Ds|16|Dep_by|varchar|100|0|0|1|0|NULL
+dbo.HT_CheckIn_Ds|17|Cin_cupon|int|4|10|0|0|0|((0))
+dbo.HT_CheckIn_Ds|18|Cin_Dep_return_date|datetime|8|23|3|1|0|NULL
+dbo.HT_CheckIn_Ds|19|Cin_Dep_return_by|varchar|50|0|0|1|0|NULL
+dbo.HT_CheckIn_H|1|Cin_no|varchar|50|0|0|0|0|NULL
+dbo.HT_CheckIn_H|2|Cin_Date|datetime|8|23|3|1|0|NULL
+dbo.HT_CheckIn_H|3|Cin_Book_no|varchar|50|0|0|1|0|NULL
+dbo.HT_CheckIn_H|4|Cin_cust_no|varchar|50|0|0|1|0|NULL
+dbo.HT_CheckIn_H|5|Cin_cust_price|varchar|50|0|0|1|0|NULL
+dbo.HT_CheckIn_H|6|Cin_Car_type|varchar|50|0|0|1|0|NULL
+dbo.HT_CheckIn_H|7|Cin_Car_id|varchar|50|0|0|1|0|NULL
+dbo.HT_CheckIn_H|8|Cin_status|varchar|50|0|0|1|0|NULL
+dbo.HT_CheckIn_H|9|Total_Price_Room|float|8|53|0|0|0|((0))
+dbo.HT_CheckIn_H|10|Total_Price_Product|float|8|53|0|0|0|((0))
+dbo.HT_CheckIn_H|11|Total_Price_Net|float|8|53|0|0|0|((0))
+dbo.HT_CheckIn_H|12|Total_Price_Pay|float|8|53|0|0|0|((0))
+dbo.HT_CheckIn_H|13|Total_Price_Balance|float|8|53|0|0|0|((0))
+dbo.HT_CheckIn_H|14|Cin_Room_ALL|varchar|500|0|0|1|0|NULL
+dbo.HT_CheckIn_H|15|Total_Price_vat|float|8|53|0|0|0|((0))
+dbo.HT_CheckIn_H|16|Cin_by|varchar|100|0|0|1|0|NULL
+dbo.HT_CheckIn_H|17|Cin_Date_in|datetime|8|23|3|1|0|NULL
+dbo.HT_CheckIn_H|18|Cin_Date_out|datetime|8|23|3|1|0|NULL
+dbo.HT_CheckIn_H|19|Cin_type|int|4|10|0|0|0|((0))
+dbo.HT_CheckIn_H|20|Cin_note|varchar|250|0|0|1|0|NULL
+dbo.HT_CheckIn_H|21|Cin_foreign|varchar|50|0|0|0|0|('False')
+dbo.HT_CheckIn_H|22|Cin_Work_number|int|4|10|0|0|0|((0))
+dbo.HT_CheckIn_Other_People|1|id|int|4|10|0|0|1|NULL
+dbo.HT_CheckIn_Other_People|2|Cin_no|varchar|50|0|0|1|0|NULL
+dbo.HT_CheckIn_Other_People|3|Cin_name|varchar|250|0|0|1|0|NULL
+dbo.HT_CheckIn_Other_People|4|Cin_contry|varchar|50|0|0|1|0|NULL
+dbo.HT_CheckIn_Pay|1|id|int|4|10|0|0|1|NULL
+dbo.HT_CheckIn_Pay|2|Pay_no|varchar|50|0|0|1|0|NULL
+dbo.HT_CheckIn_Pay|3|Cin_No|varchar|50|0|0|1|0|NULL
+dbo.HT_CheckIn_Pay|4|Cin_Pay_Ds|varchar|500|0|0|1|0|NULL
+dbo.HT_CheckIn_Pay|5|Cin_Pay_Cash|float|8|53|0|1|0|NULL
+dbo.HT_CheckIn_Pay|6|Cin_Pay_Credit|float|8|53|0|1|0|NULL
+dbo.HT_CheckIn_Pay|7|Cin_Pay_Date|datetime|8|23|3|1|0|NULL
+dbo.HT_CheckIn_Pay|8|Cin_Pay_Ds_Name|varchar|500|0|0|1|0|NULL
+dbo.HT_CheckIn_Pay|9|Cin_Pay_Ds_ID|varchar|50|0|0|1|0|NULL
+dbo.HT_CheckIn_Pay|10|Cin_Pay_Ds_Price|float|8|53|0|1|0|NULL
+dbo.HT_CheckIn_Pay|11|Cin_Pay_Ds_unit|varchar|100|0|0|1|0|NULL
+dbo.HT_CheckIn_Pay|12|Cin_Pay_Ds_Num|float|8|53|0|1|0|NULL
+dbo.HT_CheckIn_Pay|13|Cin_Pay_Ds_PriceOne|float|8|53|0|1|0|NULL
+dbo.HT_CheckIn_Pay|14|Cin_Pay_Ds_PriceTotal|float|8|53|0|1|0|NULL
+dbo.HT_CheckIn_Pay|15|Cin_Cust_no|varchar|50|0|0|1|0|NULL
+dbo.HT_CheckIn_Pay|16|Cin_Status|varchar|50|0|0|0|0|((1))
+dbo.HT_CheckIn_Pay|17|Cin_Pay_Note|varchar|500|0|0|1|0|NULL
+dbo.HT_CheckIn_Pay|18|Pay_by|varchar|100|0|0|1|0|NULL
+dbo.HT_CheckIn_Pay|19|Cin_Pay_Free|float|8|53|0|0|0|((0))
+dbo.HT_CheckIn_Pay|20|Cin_Pay_Tran|float|8|53|0|0|0|((0))
+dbo.HT_CheckIn_Pay|21|Branch|varchar|50|0|0|1|0|NULL
+dbo.HT_CheckIn_Pay|22|Cin_Pay_web|float|8|53|0|0|0|((0))
+dbo.HT_CheckIn_Product|1|id|int|4|10|0|0|1|NULL
+dbo.HT_CheckIn_Product|2|Cin_No|varchar|50|0|0|1|0|NULL
+dbo.HT_CheckIn_Product|3|Cin_Room_no|varchar|50|0|0|1|0|NULL
+dbo.HT_CheckIn_Product|4|Cin_Ds_date|datetime|8|23|3|1|0|NULL
+dbo.HT_CheckIn_Product|5|Cin_Pro_id|varchar|250|0|0|1|0|NULL
+dbo.HT_CheckIn_Product|6|Cin_Pro_name|varchar|500|0|0|1|0|NULL
+dbo.HT_CheckIn_Product|7|Cin_Pro_Unit|varchar|250|0|0|1|0|NULL
+dbo.HT_CheckIn_Product|8|Cin_Pro_num|float|8|53|0|1|0|NULL
+dbo.HT_CheckIn_Product|9|Cin_Pro_price|float|8|53|0|1|0|NULL
+dbo.HT_CheckIn_Product|10|Cin_Pro_priceTotal|float|8|53|0|1|0|NULL
+dbo.HT_CheckIn_Product|11|Cin_Pro_pay|float|8|53|0|1|0|NULL
+dbo.HT_CheckIn_Product|12|Cin_Pro_note|varchar|500|0|0|1|0|NULL
+dbo.HT_ContinueTime|1|id|int|4|10|0|0|1|NULL
+dbo.HT_ContinueTime|2|Con_Name|varchar|250|0|0|1|0|NULL
+dbo.HT_ContinueTime|3|Con_Minute|int|4|10|0|1|0|NULL
+dbo.HT_ContinueTime|4|Con_Price|float|8|53|0|1|0|NULL
+dbo.HT_ContinueTime|5|Con_Type|varchar|50|0|0|1|0|NULL
+dbo.HT_Cupon|1|cupon_no|int|4|10|0|1|0|NULL
+dbo.HT_Cupon|2|cupon_cin_no|varchar|50|0|0|1|0|NULL
+dbo.HT_Cupon|3|cupon_cin_room|varchar|50|0|0|1|0|NULL
+dbo.HT_Cupon|4|cupon_date|datetime|8|23|3|1|0|NULL
+dbo.HT_Cupon|5|cupon_gen_date|datetime|8|23|3|1|0|NULL
+dbo.HT_Cupon|6|cupon_by|varchar|50|0|0|1|0|NULL
+dbo.HT_Cupon|7|cupon_print|int|4|10|0|0|0|((0))
+dbo.HT_Customers|1|id|int|4|10|0|0|0|NULL
+dbo.HT_Customers|2|Cust_no|varchar|50|0|0|1|0|NULL
+dbo.HT_Customers|3|Cust_perfix|varchar|50|0|0|1|0|NULL
+dbo.HT_Customers|4|Cust_name|varchar|250|0|0|1|0|NULL
+dbo.HT_Customers|5|Cust_name2|varchar|250|0|0|1|0|NULL
+dbo.HT_Customers|6|Cust_sex|varchar|50|0|0|1|0|NULL
+dbo.HT_Customers|7|Cust_IDcard|varchar|50|0|0|1|0|NULL
+dbo.HT_Customers|8|Cust_Type|varchar|50|0|0|1|0|NULL
+dbo.HT_Customers|9|Cust_Email|varchar|250|0|0|1|0|NULL
+dbo.HT_Customers|10|Cust_Add_no|varchar|250|0|0|1|0|NULL
+dbo.HT_Customers|11|Cust_Add_moo|varchar|50|0|0|1|0|NULL
+dbo.HT_Customers|12|Cust_Add_soi|varchar|250|0|0|1|0|NULL
+dbo.HT_Customers|13|Cust_Add_road|varchar|250|0|0|1|0|NULL
+dbo.HT_Customers|14|Cust_Add_tambon|varchar|250|0|0|1|0|NULL
+dbo.HT_Customers|15|Cust_Add_ampore|varchar|250|0|0|1|0|NULL
+dbo.HT_Customers|16|Cust_Add_province|varchar|250|0|0|1|0|NULL
+dbo.HT_Customers|17|Cust_Add_code|varchar|50|0|0|1|0|NULL
+dbo.HT_Customers|18|Cust_Add_tel|varchar|250|0|0|1|0|NULL
+dbo.HT_Customers|19|Cust_Add_fax|varchar|250|0|0|1|0|NULL
+dbo.HT_Customers|20|Cust_Work_Name|varchar|250|0|0|1|0|NULL
+dbo.HT_Customers|21|Cust_Work_no|varchar|250|0|0|1|0|NULL
+dbo.HT_Customers|22|Cust_Work_moo|varchar|50|0|0|1|0|NULL
+dbo.HT_Customers|23|Cust_Work_soi|varchar|250|0|0|1|0|NULL
+dbo.HT_Customers|24|Cust_Work_road|varchar|250|0|0|1|0|NULL
+dbo.HT_Customers|25|Cust_Work_tambon|varchar|250|0|0|1|0|NULL
+dbo.HT_Customers|26|Cust_Work_ampore|varchar|250|0|0|1|0|NULL
+dbo.HT_Customers|27|Cust_Work_province|varchar|250|0|0|1|0|NULL
+dbo.HT_Customers|28|Cust_Work_code|varchar|50|0|0|1|0|NULL
+dbo.HT_Customers|29|Cust_Work_tel|varchar|250|0|0|1|0|NULL
+dbo.HT_Customers|30|Cust_Work_fax|varchar|250|0|0|1|0|NULL
+dbo.HT_Customers|31|Cust_Last_Change|datetime|8|23|3|1|0|NULL
+dbo.HT_Customers|32|Cust_Type_Main|varchar|250|0|0|1|0|NULL
+dbo.HT_Customers|33|Cust_Price_Over|float|8|53|0|0|0|((0))
+dbo.HT_Customers|34|Cust_Contry|varchar|50|0|0|1|0|NULL
+dbo.HT_Customers|35|Cust_Work_Tax|varchar|50|0|0|1|0|NULL
+dbo.HT_Deposit|1|id|int|4|10|0|1|0|NULL
+dbo.HT_Deposit|2|Dep_no|varchar|250|0|0|1|0|NULL
+dbo.HT_Deposit|3|Dep_Date|datetime|8|23|3|1|0|NULL
+dbo.HT_Deposit|4|Dep_Room|varchar|250|0|0|1|0|NULL
+dbo.HT_Deposit|5|Dep_Name|varchar|250|0|0|1|0|NULL
+dbo.HT_Deposit|6|Dep_Price|float|8|53|0|1|0|NULL
+dbo.HT_Deposit|7|Dep_Status|varchar|50|0|0|1|0|NULL
+dbo.HT_Deposit|8|Dep_ref|varchar|50|0|0|1|0|NULL
+dbo.HT_EMP_SMS|1|SMS_ID|int|4|10|0|0|1|NULL
+dbo.HT_EMP_SMS|2|SMS_TO|varchar|50|0|0|1|0|NULL
+dbo.HT_EMP_SMS|3|SMS_Details|text|16|0|0|1|0|NULL
+dbo.HT_EMP_SMS|4|SMS_By|varchar|250|0|0|1|0|NULL
+dbo.HT_EMP_SMS|5|SMS_Readed|varchar|50|0|0|1|0|NULL
+dbo.HT_Housewife|1|id|int|4|10|0|0|1|NULL
+dbo.HT_Housewife|2|h_name|varchar|150|0|0|1|0|NULL
+dbo.HT_Housewife|3|h_room|varchar|50|0|0|1|0|NULL
+dbo.HT_Housewife|4|h_date|datetime|8|23|3|1|0|NULL
+dbo.HT_Housewife|5|h_note|text|16|0|0|1|0|NULL
+dbo.HT_Housewife|6|h_cin|varchar|50|0|0|1|0|NULL
+dbo.HT_Housewife|7|h_cin_name|varchar|250|0|0|1|0|NULL
+dbo.HT_INVOICE|1|INV_NO|int|4|10|0|0|0|NULL
+dbo.HT_INVOICE|2|INV_booking_no|varchar|50|0|0|1|0|NULL
+dbo.HT_INVOICE|3|INV_STAY|varchar|100|0|0|1|0|NULL
+dbo.HT_INVOICE|4|INV_DATE|datetime|8|23|3|1|0|NULL
+dbo.HT_INVOICE|5|INV_BY|varchar|50|0|0|1|0|NULL
+dbo.HT_INVOICE|6|INV_TITLE|varchar|400|0|0|1|0|NULL
+dbo.HT_INVOICE|7|INV_NAME|varchar|300|0|0|1|0|NULL
+dbo.HT_INVOICE|8|INV_COMPANY|varchar|300|0|0|1|0|NULL
+dbo.HT_INVOICE|9|INV_ADDRESS|varchar|500|0|0|1|0|NULL
+dbo.HT_INVOICE|10|INV_TEL|varchar|50|0|0|1|0|NULL
+dbo.HT_INVOICE|11|INV_NIGHT|varchar|20|0|0|1|0|NULL
+dbo.HT_INVOICE|12|INV_PAX|varchar|20|0|0|1|0|NULL
+dbo.HT_INVOICE|13|INV_PAX_CHILD|varchar|20|0|0|1|0|NULL
+dbo.HT_INVOICE|14|INV_PAYMENT|varchar|50|0|0|1|0|NULL
+dbo.HT_INVOICE|15|INV_DUEDATE|datetime|8|23|3|1|0|NULL
+dbo.HT_INVOICE|16|INV_NOTE|text|16|0|0|1|0|NULL
+dbo.HT_Invoice_Ds|1|id|int|4|10|0|0|1|NULL
+dbo.HT_Invoice_Ds|2|S_Sale_id|int|4|10|0|1|0|NULL
+dbo.HT_Invoice_Ds|3|S_Product_no|varchar|50|0|0|1|0|NULL
+dbo.HT_Invoice_Ds|4|S_Product_name|varchar|50|0|0|1|0|NULL
+dbo.HT_Invoice_Ds|5|S_Unit|float|8|53|0|1|0|NULL
+dbo.HT_Invoice_Ds|6|S_UnitName|varchar|50|0|0|1|0|NULL
+dbo.HT_Invoice_Ds|7|S_Price|float|8|53|0|1|0|NULL
+dbo.HT_Invoice_Ds|8|S_Total|float|8|53|0|1|0|NULL
+dbo.HT_Invoice_Ds|9|S_PriceDiscount|float|8|53|0|1|0|NULL
+dbo.HT_Invoice_Ds|10|S_PriceDiscount_per|varchar|50|0|0|1|0|NULL
+dbo.HT_Invoice_H|1|id|int|4|10|0|1|0|NULL
+dbo.HT_Invoice_H|2|Receipt_no|varchar|50|0|0|1|0|NULL
+dbo.HT_Invoice_H|3|Receipt_Date|datetime|8|23|3|1|0|NULL
+dbo.HT_Invoice_H|4|Receipt_c_no|varchar|50|0|0|1|0|NULL
+dbo.HT_Invoice_H|5|Receipt_Name|varchar|500|0|0|1|0|NULL
+dbo.HT_Invoice_H|6|Receipt_Address|varchar|500|0|0|1|0|NULL
+dbo.HT_Invoice_H|7|Receipt_Tel|varchar|50|0|0|1|0|NULL
+dbo.HT_Invoice_H|8|Receipt_Fax|varchar|50|0|0|1|0|NULL
+dbo.HT_Invoice_H|9|Receipt_Discount|float|8|53|0|1|0|NULL
+dbo.HT_Invoice_H|10|Receipt_Total|float|8|53|0|1|0|NULL
+dbo.HT_Invoice_H|11|Receipt_Vat|float|8|53|0|1|0|NULL
+dbo.HT_Invoice_H|12|Receipt_BeforeVat|float|8|53|0|1|0|NULL
+dbo.HT_Invoice_H|13|Receipt_VatIn|varchar|50|0|0|1|0|NULL
+dbo.HT_Invoice_H|14|Receipt_VatPer|float|8|53|0|1|0|NULL
+dbo.HT_Invoice_H|15|status_name|varchar|50|0|0|1|0|NULL
+dbo.HT_Invoice_H|16|Receipt_Ref|varchar|50|0|0|1|0|NULL
+dbo.HT_Invoice_H|17|Receipt_cin_vat_before|float|8|53|0|1|0|NULL
+dbo.HT_Invoice_H|18|Receipt_note|text|16|0|0|1|0|NULL
+dbo.HT_Invoice_H|19|Receipt_Tax|varchar|50|0|0|1|0|NULL
+dbo.HT_Invoice_H|20|Receipt_noteUP|text|16|0|0|1|0|NULL
+dbo.HT_Invoice_Note|1|Cin_no|varchar|50|0|0|1|0|NULL
+dbo.HT_Invoice_Note|2|note|text|16|0|0|1|0|NULL
+dbo.HT_Invoice_Note|3|NOTE_STATUS|varchar|20|0|0|1|0|NULL
+dbo.HT_Log|1|id|int|4|10|0|0|1|NULL
+dbo.HT_Log|2|details|varchar|250|0|0|1|0|NULL
+dbo.HT_Log|3|Emp_name|varchar|150|0|0|1|0|NULL
+dbo.HT_Log|4|DODATE|varchar|50|0|0|1|0|NULL
+dbo.HT_Log_Debt|1|id|int|4|10|0|0|1|NULL
+dbo.HT_Log_Debt|2|log_cus|varchar|50|0|0|1|0|NULL
+dbo.HT_Log_Debt|3|log_ds|varchar|250|0|0|1|0|NULL
+dbo.HT_Log_Debt|4|log_date|datetime|8|23|3|1|0|NULL
+dbo.HT_Log_Debt|5|log_price_From|float|8|53|0|1|0|NULL
+dbo.HT_Log_Debt|6|log_price|float|8|53|0|1|0|NULL
+dbo.HT_Log_Debt|7|log_price_To|float|8|53|0|1|0|NULL
+dbo.HT_Order_Down|1|id|int|4|10|0|1|0|NULL
+dbo.HT_Order_Down|2|Cust_Type|varchar|50|0|0|1|0|NULL
+dbo.HT_Order_Down|3|Cust_Month|int|4|10|0|1|0|NULL
+dbo.HT_Order_Down|4|Cast_Type|varchar|250|0|0|1|0|NULL
+dbo.HT_Order_Up|1|id|int|4|10|0|1|0|NULL
+dbo.HT_Order_Up|2|Cust_Type|varchar|50|0|0|1|0|NULL
+dbo.HT_Order_Up|3|Cust_Month|int|4|10|0|1|0|NULL
+dbo.HT_Order_Up|4|Cast_Type|varchar|250|0|0|1|0|NULL
+dbo.HT_POWER_LOG|1|id|int|4|10|0|0|1|NULL
+dbo.HT_POWER_LOG|2|ROOM_NO|varchar|50|0|0|1|0|NULL
+dbo.HT_POWER_LOG|3|ROOM_POWER_START|datetime|8|23|3|1|0|NULL
+dbo.HT_POWER_LOG|4|ROOM_POWER_END|datetime|8|23|3|1|0|NULL
+dbo.HT_POWER_LOG|5|ROOM_POWER_START_BY|varchar|50|0|0|1|0|NULL
+dbo.HT_POWER_LOG|6|ROOM_POWER_END_BY|varchar|50|0|0|1|0|NULL
+dbo.HT_POWER_LOG|7|ROOM_POWER_NOTE|varchar|250|0|0|1|0|NULL
+dbo.HT_POWER_LOG|8|ROOM_POWER_NOTE2|varchar|250|0|0|1|0|NULL
+dbo.HT_Products|1|id|int|4|10|0|1|0|NULL
+dbo.HT_Products|2|Pro_no|varchar|50|0|0|1|0|NULL
+dbo.HT_Products|3|Pro_Type|varchar|50|0|0|1|0|NULL
+dbo.HT_Products|4|Pro_Name|varchar|500|0|0|1|0|NULL
+dbo.HT_Products|5|Pro_PriceA|float|8|53|0|1|0|NULL
+dbo.HT_Products|6|Pro_PriceB|float|8|53|0|1|0|NULL
+dbo.HT_Products|7|Pro_PriceC|float|8|53|0|1|0|NULL
+dbo.HT_Products|8|Pro_Amt|float|8|53|0|1|0|NULL
+dbo.HT_Products|9|Pro_Unit|varchar|50|0|0|1|0|NULL
+dbo.HT_Products|10|Pro_cap|float|8|53|0|1|0|((0))
+dbo.HT_Products|11|Pro_Barcode|varchar|50|0|0|1|0|NULL
+dbo.HT_Products_Price|1|id|int|4|10|0|0|1|NULL
+dbo.HT_Products_Price|2|P_ID|varchar|50|0|0|1|0|NULL
+dbo.HT_Products_Price|3|P_CustType|varchar|50|0|0|1|0|NULL
+dbo.HT_Products_Price|4|P_Price|float|8|53|0|1|0|NULL
+dbo.HT_Receipt_Ds|1|id|int|4|10|0|0|1|NULL
+dbo.HT_Receipt_Ds|2|S_Sale_id|int|4|10|0|1|0|NULL
+dbo.HT_Receipt_Ds|3|S_Product_no|varchar|50|0|0|1|0|NULL
+dbo.HT_Receipt_Ds|4|S_Product_name|varchar|50|0|0|1|0|NULL
+dbo.HT_Receipt_Ds|5|S_Unit|float|8|53|0|1|0|NULL
+dbo.HT_Receipt_Ds|6|S_UnitName|varchar|50|0|0|1|0|NULL
+dbo.HT_Receipt_Ds|7|S_Price|float|8|53|0|1|0|NULL
+dbo.HT_Receipt_Ds|8|S_Total|float|8|53|0|1|0|NULL
+dbo.HT_Receipt_Ds|9|S_PriceDiscount|float|8|53|0|1|0|NULL
+dbo.HT_Receipt_Ds|10|S_PriceDiscount_per|varchar|50|0|0|1|0|NULL
+dbo.HT_Receipt_H|1|id|int|4|10|0|1|0|NULL
+dbo.HT_Receipt_H|2|Receipt_no|varchar|50|0|0|1|0|NULL
+dbo.HT_Receipt_H|3|Receipt_Date|datetime|8|23|3|1|0|NULL
+dbo.HT_Receipt_H|4|Receipt_c_no|varchar|50|0|0|1|0|NULL
+dbo.HT_Receipt_H|5|Receipt_Name|varchar|500|0|0|1|0|NULL
+dbo.HT_Receipt_H|6|Receipt_Address|varchar|500|0|0|1|0|NULL
+dbo.HT_Receipt_H|7|Receipt_Tel|varchar|50|0|0|1|0|NULL
+dbo.HT_Receipt_H|8|Receipt_Fax|varchar|50|0|0|1|0|NULL
+dbo.HT_Receipt_H|9|Receipt_Discount|float|8|53|0|1|0|NULL
+dbo.HT_Receipt_H|10|Receipt_Total|float|8|53|0|1|0|NULL
+dbo.HT_Receipt_H|11|Receipt_Vat|float|8|53|0|1|0|NULL
+dbo.HT_Receipt_H|12|Receipt_BeforeVat|float|8|53|0|1|0|NULL
+dbo.HT_Receipt_H|13|Receipt_VatIn|varchar|50|0|0|1|0|NULL
+dbo.HT_Receipt_H|14|Receipt_VatPer|float|8|53|0|1|0|NULL
+dbo.HT_Receipt_H|15|status_name|varchar|50|0|0|1|0|NULL
+dbo.HT_Receipt_H|16|Receipt_Ref|varchar|50|0|0|1|0|NULL
+dbo.HT_Receipt_H|17|Receipt_cin_vat_before|float|8|53|0|1|0|NULL
+dbo.HT_Receipt_H|18|Receipt_note|text|16|0|0|1|0|NULL
+dbo.HT_Receipt_H|19|Receipt_Tax|varchar|50|0|0|1|0|NULL
+dbo.HT_Receipt_H|20|Receipt_noteUP|text|16|0|0|1|0|NULL
+dbo.HT_Register|1|id|int|4|10|0|1|0|NULL
+dbo.HT_Register|2|Reg_no|varchar|250|0|0|1|0|NULL
+dbo.HT_Register|3|Reg_Date|datetime|8|23|3|1|0|NULL
+dbo.HT_Register|4|Reg_Room|varchar|250|0|0|1|0|NULL
+dbo.HT_Register|5|Reg_Name|varchar|250|0|0|1|0|NULL
+dbo.HT_Register|6|Reg_Address|varchar|500|0|0|1|0|NULL
+dbo.HT_Register|7|Reg_Doing|varchar|250|0|0|1|0|NULL
+dbo.HT_Register|8|Reg_Nation|varchar|250|0|0|1|0|NULL
+dbo.HT_Register|9|Reg_From|varchar|250|0|0|1|0|NULL
+dbo.HT_Register|10|Reg_To|varchar|250|0|0|1|0|NULL
+dbo.HT_Register|11|Reg_Passport|varchar|250|0|0|1|0|NULL
+dbo.HT_Register|12|Reg_Status|varchar|250|0|0|1|0|NULL
+dbo.HT_Register|13|Reg_ref|varchar|50|0|0|1|0|NULL
+dbo.HT_Room_SMS|1|SMS_ID|int|4|10|0|0|1|NULL
+dbo.HT_Room_SMS|2|SMS_Room|varchar|50|0|0|1|0|NULL
+dbo.HT_Room_SMS|3|SMS_Details|text|16|0|0|1|0|NULL
+dbo.HT_Room_SMS|4|SMS_By|varchar|250|0|0|1|0|NULL
+dbo.HT_Room_SMS|5|SMS_Readed|varchar|50|0|0|1|0|NULL
+dbo.HT_Room_Status|1|id|int|4|10|0|1|0|NULL
+dbo.HT_Room_Status|2|room_no|varchar|50|0|0|1|0|NULL
+dbo.HT_Room_Status|3|room_date|datetime|8|23|3|1|0|NULL
+dbo.HT_Room_Status|4|room_status|varchar|50|0|0|1|0|NULL
+dbo.HT_Room_Status|5|room_Details|varchar|500|0|0|1|0|NULL
+dbo.HT_Room_Status|6|room_Book_No|varchar|50|0|0|1|0|NULL
+dbo.HT_Room_Status|7|room_CheckIn_No|varchar|50|0|0|1|0|NULL
+dbo.HT_Room_Status|8|room_date_oa|float|8|53|0|0|0|((0))
+dbo.HT_Rooms|1|id|int|4|10|0|1|0|NULL
+dbo.HT_Rooms|2|Room_no|varchar|50|0|0|1|0|NULL
+dbo.HT_Rooms|3|Room_Type|varchar|50|0|0|1|0|NULL
+dbo.HT_Rooms|4|Room_Details|varchar|500|0|0|1|0|NULL
+dbo.HT_Rooms|5|Room_PriceA|float|8|53|0|1|0|NULL
+dbo.HT_Rooms|6|Room_PriceB|float|8|53|0|1|0|NULL
+dbo.HT_Rooms|7|Room_PriceC|float|8|53|0|1|0|NULL
+dbo.HT_Rooms|8|Room_Clean|varchar|50|0|0|0|0|('no')
+dbo.HT_Rooms|9|Room_Use|varchar|50|0|0|0|0|('no')
+dbo.HT_Rooms|10|Room_Manternace|varchar|50|0|0|0|0|('no')
+dbo.HT_Rooms|11|Room_X|int|4|10|0|0|0|((0))
+dbo.HT_Rooms|12|Room_Y|int|4|10|0|0|0|((0))
+dbo.HT_Rooms|13|Room_Use_Count|int|4|10|0|0|0|((0))
+dbo.HT_Rooms|14|Room_Polity|int|4|10|0|0|0|((1))
+dbo.HT_Rooms|15|Room_Book|varchar|50|0|0|1|0|NULL
+dbo.HT_Rooms|16|Room_Book_Name|varchar|250|0|0|1|0|NULL
+dbo.HT_Rooms|17|Room_Book_Time|varchar|50|0|0|1|0|NULL
+dbo.HT_Rooms|18|Room_Group|varchar|50|0|0|1|0|NULL
+dbo.HT_Rooms|19|Room_Book_ds|text|16|0|0|1|0|NULL
+dbo.HT_Rooms|20|Room_Power_OPEN|varchar|50|0|0|1|0|NULL
+dbo.HT_Rooms|21|Room_Power_CLOSE|varchar|50|0|0|1|0|NULL
+dbo.HT_Rooms|22|Room_Power_STATUS|varchar|50|0|0|0|0|('off')
+dbo.HT_Rooms|23|Room_Clean_Time|varchar|30|0|0|1|0|NULL
+dbo.HT_Rooms_Cancel|1|id|int|4|10|0|1|0|NULL
+dbo.HT_Rooms_Cancel|2|room_no|varchar|50|0|0|1|0|NULL
+dbo.HT_Rooms_Cancel|3|cin_no|varchar|50|0|0|1|0|NULL
+dbo.HT_Rooms_Cancel|4|cancel_date|datetime|8|23|3|1|0|NULL
+dbo.HT_Rooms_Cancel|5|cancel_by|varchar|50|0|0|1|0|NULL
+dbo.HT_Rooms_Cancel|6|cancel_note|text|16|0|0|1|0|NULL
+dbo.HT_Rooms_Price|1|id|int|4|10|0|0|1|NULL
+dbo.HT_Rooms_Price|2|Room_Type|varchar|50|0|0|1|0|NULL
+dbo.HT_Rooms_Price|3|Room_CustType|varchar|50|0|0|1|0|NULL
+dbo.HT_Rooms_Price|4|Room_Price|float|8|53|0|1|0|NULL
+dbo.HT_Rooms_Price|5|Room_Price_H|float|8|53|0|1|0|NULL
+dbo.HT_Rooms_Price|6|Room_Price_M|float|8|53|0|1|0|NULL
+dbo.HT_Rooms_Repair|1|id|int|4|10|0|0|1|NULL
+dbo.HT_Rooms_Repair|2|room_no|varchar|50|0|0|1|0|NULL
+dbo.HT_Rooms_Repair|3|Repair_date|datetime|8|23|3|1|0|NULL
+dbo.HT_Rooms_Repair|4|Repair_by|varchar|250|0|0|1|0|NULL
+dbo.HT_Rooms_Repair|5|Repair_note|text|16|0|0|1|0|NULL
+dbo.HT_Round_Bill|1|id|int|4|10|0|0|0|NULL
+dbo.HT_Round_Bill|2|round_no|int|4|10|0|1|0|NULL
+dbo.HT_Round_Bill|3|round_price|float|8|53|0|1|0|NULL
+dbo.HT_Round_Bill|4|round_by|varchar|150|0|0|1|0|NULL
+dbo.HT_Round_Bill|5|round_start|datetime|8|23|3|1|0|NULL
+dbo.HT_Round_Bill|6|round_end|datetime|8|23|3|1|0|NULL
+dbo.HT_SET_CusType|1|id|int|4|10|0|0|1|NULL
+dbo.HT_SET_CusType|2|id_full|varchar|50|0|0|1|0|NULL
+dbo.HT_SET_CusType|3|name|varchar|50|0|0|1|0|NULL
+dbo.HT_SET_CusType|4|deposit|float|8|53|0|0|0|((0))
+dbo.HT_SET_CusType_Main|1|id|int|4|10|0|0|1|NULL
+dbo.HT_SET_CusType_Main|2|id_full|varchar|50|0|0|1|0|NULL
+dbo.HT_SET_CusType_Main|3|name|varchar|50|0|0|1|0|NULL
+dbo.HT_SET_ProductType|1|id|int|4|10|0|0|1|NULL
+dbo.HT_SET_ProductType|2|id_full|varchar|50|0|0|1|0|NULL
+dbo.HT_SET_ProductType|3|name|varchar|50|0|0|1|0|NULL
+dbo.HT_SET_RoomType|1|id|int|4|10|0|0|1|NULL
+dbo.HT_SET_RoomType|2|id_full|varchar|50|0|0|1|0|NULL
+dbo.HT_SET_RoomType|3|name|varchar|50|0|0|1|0|NULL
+dbo.HT_SET_RoomType|4|Room_PriceA|float|8|53|0|1|0|NULL
+dbo.HT_SET_RoomType|5|Room_PriceB|float|8|53|0|1|0|NULL
+dbo.HT_SET_RoomType|6|Room_PriceC|float|8|53|0|1|0|NULL
+dbo.HT_SET_Sale|1|id|int|4|10|0|0|1|NULL
+dbo.HT_SET_Sale|2|id_full|varchar|50|0|0|1|0|NULL
+dbo.HT_SET_Sale|3|name|varchar|150|0|0|1|0|NULL
+dbo.HT_SET_Sale|4|tel|varchar|50|0|0|1|0|NULL
+dbo.HT_SET_Sale|5|address|varchar|400|0|0|1|0|NULL
+dbo.HT_SET_Sale|6|other|varchar|500|0|0|1|0|NULL
+dbo.TB_FOLIO|1|id|int|4|10|0|1|0|NULL
+dbo.TB_FOLIO|2|NO|varchar|20|0|0|1|0|NULL
+dbo.TB_FOLIO|3|CIN_NAME1|varchar|255|0|0|1|0|NULL
+dbo.TB_FOLIO|4|CIN_NAME2|varchar|255|0|0|1|0|NULL
+dbo.TB_FOLIO|5|CIN_NAME3|varchar|255|0|0|1|0|NULL
+dbo.TB_FOLIO|6|F_ROOM|varchar|50|0|0|1|0|NULL
+dbo.TB_FOLIO|7|F_NAME|varchar|250|0|0|1|0|NULL
+dbo.TB_FOLIO|8|F_IN|varchar|50|0|0|1|0|NULL
+dbo.TB_FOLIO|9|F_OUT|varchar|50|0|0|1|0|NULL
+dbo.TB_FOLIO|10|F_NIGHT|varchar|50|0|0|1|0|NULL
+dbo.TB_FOLIO|11|F_PRICE|varchar|50|0|0|1|0|NULL
+dbo.TB_FOLIO|12|F_PRICE_TOTAL|varchar|50|0|0|1|0|NULL
+dbo.TB_FOLIO|13|F_STATUS|varchar|20|0|0|1|0|NULL
+dbo.TB_MRP_EMPLOYEE|1|ID|int|4|10|0|0|1|NULL
+dbo.TB_MRP_EMPLOYEE|2|Emp_Username|varchar|50|0|0|1|0|NULL
+dbo.TB_MRP_EMPLOYEE|3|Emp_Password|varchar|50|0|0|1|0|NULL
+dbo.TB_MRP_EMPLOYEE|4|Emp_Name|varchar|50|0|0|1|0|NULL
+dbo.TB_MRP_EMPLOYEE|5|Emp_Level|varchar|50|0|0|1|0|NULL
+dbo.TB_MRP_EMPLOYEE|6|Emp_Vat|varchar|50|0|0|1|0|NULL
+dbo.TB_MRP_Permission|1|Level_Name|varchar|50|0|0|1|0|NULL
+dbo.TB_MRP_Permission|2|Level_Command|varchar|50|0|0|1|0|NULL
+dbo.TB_MRP_Permission_name|1|Permission_name|varchar|50|0|0|1|0|NULL
+dbo.TB_Pay_History|1|id|int|4|10|0|1|0|NULL
+dbo.TB_Pay_History|2|Pay_Date|float|8|53|0|1|0|NULL
+dbo.TB_Pay_History|3|Pay_Bill|varchar|255|0|0|1|0|NULL
+dbo.TB_Pay_History|4|Pay_Cust|varchar|500|0|0|1|0|NULL
+dbo.TB_Pay_History|5|Pay_Type|varchar|50|0|0|1|0|NULL
+dbo.TB_Pay_History|6|Pay_Total|float|8|53|0|1|0|NULL
+dbo.TB_Pay_History|7|Pay_Note|varchar|500|0|0|1|0|NULL
+dbo.TB_Pay_History|8|Pay_Program|float|8|53|0|1|0|NULL
+dbo.TB_Pay_History|9|Pay_Group|varchar|50|0|0|1|0|NULL
+dbo.TB_Pay_History|10|Pay_Account|varchar|50|0|0|1|0|NULL
+dbo.Tb_Save_Image|1|id|int|4|10|0|0|1|NULL
+dbo.Tb_Save_Image|2|cin_no|varchar|50|0|0|1|0|NULL
+dbo.Tb_Save_Image|3|ttype|varchar|250|0|0|1|0|NULL
+dbo.Tb_Save_Image|4|pic|varbinary|-1|0|0|1|0|NULL
+dbo.Tb_Save_Image|5|cust_no|varchar|50|0|0|1|0|NULL
+dbo.Tb_Save_Image|6|tmp_no|varchar|50|0|0|1|0|NULL
+dbo.Tb_Save_Image|7|pic_date|datetime|8|23|3|1|0|NULL
+dbo.TB_SET_Branch|1|id|int|4|10|0|0|1|NULL
+dbo.TB_SET_Branch|2|id_full|varchar|50|0|0|1|0|NULL
+dbo.TB_SET_Branch|3|name|varchar|100|0|0|1|0|NULL
+dbo.TB_SET_MyType2|1|id|int|4|10|0|0|1|NULL
+dbo.TB_SET_MyType2|2|id_full|varchar|50|0|0|1|0|NULL
+dbo.TB_SET_MyType2|3|name|varchar|100|0|0|1|0|NULL
+dbo.TB_SET_MyType2_2|1|id|int|4|10|0|0|1|NULL
+dbo.TB_SET_MyType2_2|2|id_full|varchar|50|0|0|1|0|NULL
+dbo.TB_SET_MyType2_2|3|name|varchar|100|0|0|1|0|NULL
+dbo.TB_SET_MyType3|1|id|int|4|10|0|0|1|NULL
+dbo.TB_SET_MyType3|2|id_full|varchar|50|0|0|1|0|NULL
+dbo.TB_SET_MyType3|3|name|varchar|100|0|0|1|0|NULL
+dbo.TB_SETTINGS|1|Company_Name|varchar|500|0|0|1|0|NULL
+dbo.TB_SETTINGS|2|Company_Address|varchar|500|0|0|1|0|NULL
+dbo.TB_SETTINGS|3|Company_Tel|varchar|100|0|0|1|0|NULL
+dbo.TB_SETTINGS|4|Company_Fax|varchar|100|0|0|1|0|NULL
+dbo.TB_SETTINGS|5|Company_Image|varbinary|-1|0|0|1|0|NULL
+dbo.TB_SETTINGS|6|Company_Tax|varchar|50|0|0|1|0|NULL
+dbo.TB_SETTINGS|7|CHK_IN_Before|float|8|53|0|1|0|NULL
+dbo.TB_SETTINGS|8|CHK_Out|float|8|53|0|1|0|NULL
+dbo.TB_SETTINGS|9|CHK_Out_Alert|float|8|53|0|1|0|NULL
+dbo.TB_SETTINGS|10|CHK_Out_Before|float|8|53|0|1|0|NULL
+dbo.TB_SETTINGS|11|CHK_Out_H_price|float|8|53|0|1|0|NULL
+dbo.TB_SETTINGS|12|Maximum_Book|float|8|53|0|1|0|NULL
+dbo.TB_SETTINGS|13|Pority|float|8|53|0|1|0|NULL
+dbo.TB_SETTINGS|14|Vat_Over|float|8|53|0|1|0|NULL
+dbo.TB_SETTINGS|15|Cal_Pority_Cust|varchar|50|0|0|1|0|NULL
+dbo.TB_SETTINGS|16|receipt_type|varchar|50|0|0|1|0|NULL
+dbo.TB_SETTINGS|17|receipt_print|varchar|50|0|0|1|0|NULL
+dbo.TB_SETTINGS|18|receipt_preview|varchar|50|0|0|1|0|NULL
+dbo.TB_SETTINGS|19|Vat_per|float|8|53|0|1|0|NULL
+dbo.TB_SETTINGS|20|Vat_Head|varchar|50|0|0|1|0|NULL
+dbo.TB_SETTINGS|21|reg_type|varchar|10|0|0|1|0|NULL
+dbo.TB_SETTINGS|22|login_url|varchar|250|0|0|1|0|NULL
+dbo.TB_SETTINGS|23|Min_HOURS|float|8|53|0|1|0|NULL
+dbo.TB_SETTINGS|24|AUTO_CUT_POWER|varchar|10|0|0|1|0|NULL
+dbo.TB_SETTINGS|25|MANUAL_POWER|varchar|10|0|0|1|0|NULL
+dbo.TB_SETTINGS|26|POWER_Delay|varchar|10|0|0|1|0|NULL
+dbo.TB_SETTINGS|27|VAT_OUT|varchar|10|0|0|1|0|NULL
+dbo.TB_SETTINGS|28|Vat_Head2|varchar|50|0|0|1|0|NULL
+dbo.TB_SETTINGS|29|Vat_Rows|int|4|10|0|1|0|NULL
+dbo.TB_SETTINGS|30|Room_Clean_Time|varchar|10|0|0|1|0|NULL
+dbo.TB_SETTINGS|31|SHOW_ICON|varchar|10|0|0|1|0|NULL
+dbo.TB_SETTINGS|32|Time_Logout|varchar|10|0|0|1|0|NULL
+dbo.TB_SETTINGS|33|CompanyName|varchar|500|0|0|1|0|NULL
+dbo.Tb_Version|1|V_NO|varchar|50|0|0|1|0|NULL
+ 
+==== Primary keys ====
+table_name|index_name|pk_columns
+----------|----------|----------
+HT_Booking_Notes|PK__HT_Booki__F94B51471D6AB78C|Note_ID
+ 
+==== Foreign keys ====
+fk_name|parent_table|parent_column|ref_table|ref_column|on_delete|on_update
+-------|------------|-------------|---------|----------|---------|---------
+ 
+==== Indexes (excluding PK / unique constraints) ====
+table_name|index_name|type_desc|is_unique|columns
+----------|----------|---------|---------|-------
+HT_Booking_Notes|IX_Booking_Notes_BookNo|NONCLUSTERED|0|Book_No
+ 
+==== Views (definitions — critical: shows whether updatable) ====
+view_name|definition_sql
+---------|--------------
+dbo.View_Bill_Cancel|CREATE VIEW [View_Bill_Cancel] AS  SELECT HT_Rooms_Cancel.id, HT_Rooms_Cancel.room_no, HT_Rooms_Cancel.cin_no, HT_Rooms_Cancel.cancel_date, HT_Rooms_Cancel.cancel_by, HT_Rooms_Cancel.cancel_note, HT_Bill_Debt_H.Bill_Cust_ID, HT_Bill_Debt_H.Bill_Cust_Name, 
+dbo.View_Bill_Debt_Ds|CREATE VIEW dbo.View_Bill_Debt_Ds
+AS
+SELECT     dbo.HT_Bill_Debt_H.Bill_No, dbo.HT_Bill_Debt_H.Bill_Cust_ID, dbo.HT_Bill_Debt_H.Bill_Cust_Name, dbo.HT_Bill_Debt_H.Bill_Cust_Address, 
+                      dbo.HT_Bill_Debt_H.Bill_Cust_Tel, dbo.HT_Bill_De
+dbo.View_Book_Date|CREATE VIEW [View_Book_Date] AS SELECT HT_Book_Date.id, HT_Book_Date.Book_no, HT_Book_H.Book_Sale, HT_Book_Date.Book_type, HT_Book_Date.Book_date_ds, HT_Book_Date.Book_Num, HT_Book_Date.Book_USE, HT_Book_H.Book_Cust_Name, HT_Book_H.Book_Cust_Name2, HT_Book
+dbo.View_Book_Ds2|CREATE VIEW dbo.View_Book_Ds2
+AS
+SELECT        dbo.HT_Book_Ds2.id, dbo.HT_Book_Ds2.Book_No, dbo.HT_Book_Ds2.Book_Room_Type, dbo.HT_Book_Ds2.Book_Room_Ds, 
+                         dbo.HT_Book_Ds2.Book_Room_Price, dbo.HT_Book_Ds2.Book_Room_PriceToTal, db
+dbo.View_Booking_Ds|CREATE VIEW [View_Booking_Ds] AS SELECT HT_Book_Ds.Book_No, HT_Book_Ds.Book_Room_Type, HT_Book_Ds.Book_Room_Start, HT_Book_Ds.Book_Room_End, HT_Book_Ds.Book_Room_Price,  HT_Book_Ds.Book_Room_Night, HT_Book_Ds.Book_Room_Num, HT_Book_Ds.Book_Room_PriceToTal,
+dbo.View_Changed_Room|CREATE VIEW [View_Changed_Room] AS  SELECT HT_Changed_Room.id, HT_Changed_Room.cin_no, HT_Changed_Room.Note, HT_Changed_Room.ToPrice, HT_Changed_Room.room_before, HT_Changed_Room.room_after, HT_Changed_Room.change_date, View_CheckIn_H.Cin_Date_in, View_Che
+dbo.View_Check_Out|CREATE VIEW dbo.View_Check_Out
+AS
+SELECT     dbo.HT_CheckIn_H.Cin_no, dbo.HT_CheckIn_H.Cin_Date, dbo.HT_CheckIn_H.Cin_Book_no, dbo.HT_CheckIn_H.Cin_cust_no, dbo.HT_CheckIn_H.Cin_cust_price, 
+                      dbo.HT_CheckIn_H.Cin_Car_type, dbo.HT_Ch
+dbo.View_CheckIn_Ds|CREATE VIEW [View_CheckIn_Ds] AS SELECT     HT_CheckIn_Ds.id, HT_CheckIn_H.Cin_no, HT_CheckIn_H.Cin_Date, HT_CheckIn_H.Cin_Book_no, HT_CheckIn_H.Cin_cust_no, HT_CheckIn_H.Cin_cust_price, HT_CheckIn_H.Cin_Car_type, HT_CheckIn_H.Cin_Car_id, HT_CheckIn_H.Cin_
+dbo.View_CheckIn_H|CREATE VIEW dbo.View_CheckIn_H
+AS
+SELECT     dbo.HT_CheckIn_H.Cin_no, dbo.HT_CheckIn_H.Cin_Date, dbo.HT_CheckIn_H.Cin_Book_no, dbo.HT_CheckIn_H.Cin_cust_no, dbo.HT_CheckIn_H.Cin_cust_price, dbo.HT_CheckIn_H.Cin_Car_type, 
+                      dbo.HT_Ch
+dbo.View_cupon|CREATE VIEW dbo.View_cupon
+AS
+SELECT     dbo.HT_Cupon.cupon_no, dbo.HT_Cupon.cupon_cin_no, dbo.HT_Cupon.cupon_cin_room, dbo.HT_Cupon.cupon_date, dbo.HT_Cupon.cupon_gen_date, dbo.HT_Cupon.cupon_by, 
+                      dbo.HT_Cupon.cupon_print, dbo.Vie
+dbo.View_Customers|CREATE VIEW [View_Customers] AS SELECT id, Cust_no, ISNULL(CAST(Cust_perfix AS varchar(MAX)), '') + Cust_name + ' ' + Cust_name2 AS Cust_name, Cust_Type, Cust_Email, Cust_Add_no + ' หมู่ ' + Cust_Add_moo + ' ซอย' + Cust_Add_soi + ' ถนน' + Cust_Add_road + '
+dbo.View_Deposit_H|CREATE VIEW dbo.View_Deposit_H
+AS
+SELECT     dbo.HT_CheckIn_H.Cin_no, dbo.HT_CheckIn_H.Cin_Date, dbo.HT_CheckIn_H.Cin_Book_no, dbo.HT_CheckIn_H.Cin_cust_no, dbo.HT_CheckIn_H.Cin_cust_price, dbo.HT_CheckIn_H.Cin_Car_type, 
+                      dbo.HT_Ch
+dbo.View_HT_ROOM|CREATE VIEW dbo.View_HT_ROOM
+AS
+SELECT        id, Room_no, Room_Type, Room_Details, Room_PriceA, Room_PriceB, Room_PriceC, Room_Clean, Room_Use, Room_X, Room_Y, Room_Use_Count, 
+                         Room_Polity, Room_Book, Room_Book_Name, Room_Book_
+dbo.View_MRP_EMPLOYEE|CREATE VIEW dbo.View_MRP_EMPLOYEE
+AS
+SELECT     ID, Emp_Username, Emp_Password, Emp_Name, Emp_Level
+FROM         dbo.TB_MRP_EMPLOYEE
+
+dbo.View_Pay_Ds|CREATE VIEW [View_Pay_Ds] AS SELECT HT_CheckIn_Pay.Pay_no, HT_CheckIn_Pay.Cin_No, HT_CheckIn_Pay.Cin_Pay_Ds, HT_CheckIn_Pay.Cin_Pay_Cash, HT_CheckIn_Pay.Cin_Pay_Credit, HT_CheckIn_Pay.Cin_Pay_Date, HT_CheckIn_Pay.Cin_Pay_Ds_Name, HT_CheckIn_Pay.Cin_Pay_Ds_
+dbo.View_Pay_H|CREATE VIEW dbo.View_Pay_H
+AS
+SELECT     Pay_no, Cin_Pay_Cash, Cin_Pay_Credit, Cin_Pay_Tran, Cin_Pay_Date
+FROM         dbo.HT_CheckIn_Pay
+WHERE     (Cin_Status <> 'ยกเลิก')
+GROUP BY Pay_no, Cin_Pay_Cash, Cin_Pay_Credit, Cin_Pay_Tran, Cin_Pay_Date
+
+dbo.View_people|CREATE VIEW dbo.View_people
+AS
+SELECT     dbo.HT_CheckIn_Other_People.id, dbo.HT_CheckIn_Other_People.Cin_no, dbo.HT_CheckIn_Other_People.Cin_name, dbo.HT_CheckIn_Other_People.Cin_contry, dbo.View_CheckIn_H.Cin_Date, 
+                      dbo.View_Chec
+dbo.View_RBill_H|CREATE VIEW [View_RBill_H] AS SELECT id, round_no, round_price, round_by, round_start, round_end, CASE WHEN round_end IS NULL THEN (SELECT     COALESCE (SUM(Cin_Pay_cash) * - 1, 0) AS Expr1  FROM          View_Pay_H WHERE      Cin_Pay_cash < 0 AND (Cin_Pay
+dbo.View_RBill_H_Round_Only|CREATE VIEW dbo.View_RBill_H_Round_Only
+AS
+SELECT     id, round_no, round_price, round_by, round_start, round_end, CASE WHEN round_end IS NULL THEN 'รอบปัจจุบัน [ ' + round_by + ']' ELSE '[ ' + RIGHT(CAST('000000' + CAST(id AS varchar) AS varchar), 
+   
+dbo.View_Report_RR4|CREATE VIEW [View_Report_RR4] AS  SELECT HT_CheckIn_Ds.Cin_Room_In, HT_CheckIn_Ds.Cin_Room_No, View_Customers.Cust_name, View_Customers.Cust_Contry, View_Customers.Cust_IDcard, View_Customers.C_Address, HT_CheckIn_Ds.Cin_Room_Out, HT_CheckIn_H.Cin_status F
+dbo.View_Room_All|CREATE VIEW [View_Room_All] AS SELECT HT_Room_Status.id, HT_Room_Status.room_no, HT_Room_Status.room_date, HT_Room_Status.room_date_oa, HT_Room_Status.room_status, HT_Room_Status.room_Details,HT_Room_Status.room_Book_No, HT_Room_Status.room_CheckIn_No, Vie
+dbo.View_Room_status|CREATE VIEW [View_Room_status] AS SELECT HT_Room_Status.id, HT_Room_Status.room_no, HT_Room_Status.room_date, HT_Room_Status.room_status, HT_Room_Status.room_Details, HT_Room_Status.room_Book_No, HT_Room_Status.room_CheckIn_No, HT_Rooms.Room_Type FROM HT_R
+dbo.View_Rooms_Cancel|CREATE VIEW dbo.View_Rooms_Cancel
+AS
+SELECT     dbo.HT_Rooms_Cancel.id, dbo.HT_Rooms_Cancel.room_no, dbo.HT_Rooms_Cancel.cin_no, dbo.HT_Rooms_Cancel.cancel_date, dbo.HT_Rooms_Cancel.cancel_by, 
+                      dbo.View_CheckIn_H.Cust_name, dbo.Vie
+dbo.View_Round_Bill|CREATE VIEW [View_Round_Bill] AS SELECT id, round_no, round_price, round_by, round_start, round_end, FLOOR(RAND() * (10000 - 5 + 1) + 5) AS round_price_pay, FLOOR(RAND() * (1000 - 5 + 1) + 5) AS round_price_rec, FLOOR(RAND()  * (20000 - 5 + 1) + 5) AS roun
+ 
+==== Triggers (definitions — what fires on INSERT/UPDATE/DELETE) ====
+table_name|trigger_name|type_desc|is_disabled|definition_sql
+----------|------------|---------|-----------|--------------
+ 
+==== Stored procedures (definitions) ====
+proc_name|create_date|modify_date|definition_sql
+---------|-----------|-----------|--------------
+ 
+==== Scalar / table-valued functions ====
+func_name|type_desc|definition_sql
+---------|---------|--------------
+ 
+==== Sequences (if any — alternative to identity) ====
+name|current_value|increment|start_value|minimum_value|maximum_value
+----|-------------|---------|-----------|-------------|-------------
