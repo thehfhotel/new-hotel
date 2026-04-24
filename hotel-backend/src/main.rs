@@ -17,6 +17,7 @@ mod error;
 mod models;
 mod notifications;
 mod outbox;
+mod repository;
 mod routes;
 mod scheduler;
 mod utils;

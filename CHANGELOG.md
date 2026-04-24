@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Backend repository layer** (`hotel-backend/src/repository/`) — Phase 1b per
+  `docs/architecture.md` §1, §6. Each aggregate gets a trait + PostgreSQL impl:
+  - `customer.rs` — `CustomerRepository` + `PgCustomerRepository`
+  - `booking.rs` — `BookingRepository` + `PgBookingRepository` (covers list,
+    get + rooms, insert, update, delete-rooms, cancel, sequence helpers)
+  - `checkin.rs` — `CheckInRepository` + `PgCheckInRepository` (walk-in /
+    book-in / check-out / guest registry as data ops only)
+  - `room.rs` — `RoomRepository` + `PgRoomRepository`
+  - `payment.rs` — `PaymentRepository` + `PgPaymentRepository`
+  - `inventory.rs` — `InventoryRepository` + `PgInventoryRepository`
+  - `outbox.rs` — `OutboxRepository` trait + `PgOutboxRepository` stub
+    (Agent D fills in `enqueue` body in parallel)
+  - `event_log.rs` — `EventLogRepository` trait + `PgEventLogRepository` stub
+    (Agent D fills in `publish` body in parallel)
+- **Routes thinned**: `routes/new_customers.rs`, `new_bookings.rs`,
+  `new_checkins.rs`, `new_rooms.rs`, `new_payments.rs`, `new_inventory.rs` no
+  longer call `sqlx::query!()` directly. They translate request bodies into
+  repository writes, start their own transaction, and shape the response from
+  repository row types. SQL text is byte-identical to before, so the existing
+  `.sqlx/` cache stays valid (no regeneration needed).
+- **`AppState` (`routes/mode.rs`)** holds `Arc<dyn ...Repository>` per
+  aggregate so test setups can swap in fakes. Default constructor wires up
+  the `Pg<Aggregate>Repository` impls.
+- **`hotel-backend/Cargo.toml`**: declared `async-trait = "0.1"` explicitly
+  (was already in the dep tree transitively via axum / bb8 / tiberius). Used
+  by every repository trait for object-safe `async fn` methods.
+- **`hotel-backend/src/main.rs`**: registers the new `repository` top-level
+  module.
+- **Endpoint contracts unchanged.** Frontend `/api/new/*` calls behave
+  identically; no DTO field added or removed.
+
 ## [2.24.0] - 2026-04-25
 
 ### Removed
