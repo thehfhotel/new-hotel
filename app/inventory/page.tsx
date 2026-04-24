@@ -149,7 +149,7 @@ export default function InventoryDashboardPage() {
 
       {/* Stats Cards */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <Link href="/new/inventory/items" className="block">
+        <Link href="/inventory/items" className="block">
           <div className="bg-white rounded-lg border border-gray-200 p-6 hover:border-gray-300 transition-colors">
             <div className="flex items-center justify-between">
               <div>
@@ -165,7 +165,7 @@ export default function InventoryDashboardPage() {
           </div>
         </Link>
 
-        <Link href="/new/inventory/items?filter=low" className="block">
+        <Link href="/inventory/items?filter=low" className="block">
           <div className="bg-white rounded-lg border border-gray-200 p-6 hover:border-gray-300 transition-colors">
             <div className="flex items-center justify-between">
               <div>
@@ -201,7 +201,7 @@ export default function InventoryDashboardPage() {
         <h2 className="text-lg font-semibold text-gray-900 mb-4">การดำเนินการด่วน</h2>
         <div className="flex flex-wrap gap-3">
           <Link
-            href="/new/inventory/items?mode=add"
+            href="/inventory/items?mode=add"
             className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors"
           >
             <Plus className="w-4 h-4" />
@@ -218,7 +218,7 @@ export default function InventoryDashboardPage() {
             ปรับสต็อก
           </button>
           <Link
-            href="/new/inventory/transactions"
+            href="/inventory/transactions"
             className="flex items-center gap-2 px-4 py-2 bg-gray-200 text-gray-900 rounded-lg hover:bg-gray-300 transition-colors"
           >
             <FileText className="w-4 h-4" />
@@ -236,7 +236,7 @@ export default function InventoryDashboardPage() {
               สินค้าใกล้หมด
             </h2>
             <Link
-              href="/new/inventory/items?filter=low"
+              href="/inventory/items?filter=low"
               className="text-red-600 hover:text-red-500 text-sm flex items-center gap-1"
             >
               ดูทั้งหมด <ArrowRight className="w-4 h-4" />
@@ -304,7 +304,7 @@ export default function InventoryDashboardPage() {
               การเคลื่อนไหวล่าสุด
             </h2>
             <Link
-              href="/new/inventory/transactions"
+              href="/inventory/transactions"
               className="text-red-600 hover:text-red-500 text-sm flex items-center gap-1"
             >
               ดูทั้งหมด <ArrowRight className="w-4 h-4" />
