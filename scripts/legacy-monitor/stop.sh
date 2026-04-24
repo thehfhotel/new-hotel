@@ -6,7 +6,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-echo "[$(date -u +%H:%M:%S)] stopping tail loop..."
+echo "[$(date -u +%H:%M:%S)] stopping tail loop systemd unit..."
+systemctl --user stop legacy-monitor.service 2>/dev/null || true
 ./tail-loop.sh --stop || true
 
 echo "[$(date -u +%H:%M:%S)] stopping XE session..."
