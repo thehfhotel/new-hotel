@@ -109,6 +109,9 @@ These are automatically applied by `scripts/migrate.sh` during deployment.
 | 008 | `008_legacy_sync_tables.sql` | Legacy sync staging tables + sync_status + source columns | v2.16.0 |
 | 009 | `009_widen_legacy_varchar_columns.sql` | Widen varchar columns in ht_customers_legacy to prevent truncation | v2.17.1 |
 | 010 | `010_ville_cache_schema.sql` | Create `ville` schema with cached HF Ville tables for local reads | v2.22.0 |
+| 011 | `011_writeback_jobs.sql` | Outbox queue for legacy MSSQL writeback (Phase 3a / 4b) | v2.8.2 |
+| 012 | `012_event_log.sql` | Durable domain-event bus (Phase 3a / 4a) | v2.8.2 |
+| 013 | `013_legacy_ct_state.sql` | Change Tracking watermark for the CT watcher (Phase 5) | v2.8.2 |
 
 ## Tables Owned by This Application
 
@@ -147,6 +150,9 @@ All table and column names are **lowercase** (PostgreSQL convention). The canoni
 | `ht_checkins_legacy` | Legacy check-ins mirror (synced from View_CheckIn_Ds) | v2.16.0 |
 | `ht_customers_legacy` | Legacy customers mirror (synced from View_Customers) | v2.16.0 |
 | `sync_status` | Background sync health tracking per entity type | v2.16.0 |
+| `writeback_jobs` | Outbox queue for legacy MSSQL writeback (one row per pending intent) | v2.8.2 |
+| `event_log` | Durable domain-event bus (every state-mutating action emits one row) | v2.8.2 |
+| `legacy_ct_state` | Single-row Change Tracking watermark consumed by `bin/sync.rs` | v2.8.2 |
 
 ## Tables Used (Read-Only or Shared)
 

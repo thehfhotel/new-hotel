@@ -718,5 +718,83 @@ VALUES ('010', '010_ville_cache_schema.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================
+-- Migration 011: writeback_jobs (outbox queue for legacy MSSQL writeback)
+-- Per docs/architecture.md §4c.
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS writeback_jobs (
+    id                BIGSERIAL    PRIMARY KEY,
+    intent            TEXT         NOT NULL,
+    payload           JSONB        NOT NULL,
+    aggregate_id      UUID         NOT NULL,
+    idempotency_key   UUID         NOT NULL UNIQUE,
+    status            TEXT         NOT NULL DEFAULT 'pending',
+    attempts          INT          NOT NULL DEFAULT 0,
+    last_error        TEXT,
+    legacy_ids        JSONB,
+    created_at        TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    completed_at      TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS ix_writeback_jobs_pending_created
+    ON writeback_jobs (status, created_at)
+    WHERE status IN ('pending', 'failed');
+
+CREATE INDEX IF NOT EXISTS ix_writeback_jobs_aggregate
+    ON writeback_jobs (aggregate_id);
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('011', '011_writeback_jobs.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
+-- Migration 012: event_log (durable domain-event bus)
+-- Per docs/architecture.md §3.6, §4d-bis.
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS event_log (
+    id                  UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_type          TEXT         NOT NULL,
+    aggregate_id        UUID,
+    payload             JSONB        NOT NULL,
+    source_kind         TEXT         NOT NULL,
+    source_user_id      UUID,
+    source_request_id   UUID,
+    created_at          TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS ix_event_log_created_at
+    ON event_log (created_at DESC);
+
+CREATE INDEX IF NOT EXISTS ix_event_log_aggregate_created
+    ON event_log (aggregate_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS ix_event_log_type_created
+    ON event_log (event_type, created_at DESC);
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('012', '012_event_log.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
+-- Migration 013: legacy_ct_state (Change Tracking watermark)
+-- Per docs/architecture.md §4d-tris.
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS legacy_ct_state (
+    id                  BIGINT       PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    last_seen_version   BIGINT       NOT NULL DEFAULT 0,
+    last_polled_at      TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+
+INSERT INTO legacy_ct_state (id, last_seen_version)
+VALUES (1, 0)
+ON CONFLICT DO NOTHING;
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('013', '013_legacy_ct_state.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
 -- Initialization complete
 -- =============================================================================

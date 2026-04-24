@@ -12,9 +12,11 @@
 
 mod config;
 mod db;
+mod domain;
 mod error;
 mod models;
 mod notifications;
+mod outbox;
 mod routes;
 mod scheduler;
 mod utils;
