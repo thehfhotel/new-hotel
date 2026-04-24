@@ -674,6 +674,7 @@ dependencies = [
 name = "hotel-backend"
 version = "2.8.2"
 dependencies = [
+ "async-trait",
  "axum",
  "bb8",
  "bb8-tiberius",
