@@ -117,15 +117,17 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.85"
+          toolchain: "1.89"
 
       # sccache wraps every rustc invocation and caches its output keyed on the
       # exact crate inputs. It complements Swatinem/rust-cache (which caches
-      # the whole target/ dir): rust-cache wins when the cache key matches
-      # exactly, sccache wins on partial matches (e.g. one dep version bumped
-      # but the other 200 deps are identical).
+      # the whole target/ dir). Treated as opportunistic: if the action fails
+      # (e.g. GHA Cache outage), we skip RUSTC_WRAPPER and fall through to a
+      # plain build instead of failing the job.
       - name: Set up sccache
+        id: sccache_setup
         uses: mozilla-actions/sccache-action@v0.0.6
+        continue-on-error: true
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
@@ -137,8 +139,8 @@ jobs:
         env:
           DATABASE_URL: postgres://postgres:***REMOVED***@localhost:5439/hotelnew
           SQLX_OFFLINE: "true"
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: ${{ steps.sccache_setup.outcome == 'success' && 'true' || 'false' }}
+          RUSTC_WRAPPER: ${{ steps.sccache_setup.outcome == 'success' && 'sccache' || '' }}
         run: cargo test
 
   build-frontend:
