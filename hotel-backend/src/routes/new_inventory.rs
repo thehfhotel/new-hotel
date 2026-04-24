@@ -22,6 +22,10 @@
 //! Dashboard:
 //! - GET /api/new/inventory/stats - Summary stats
 //! - GET /api/new/inventory/low-stock - Items below minimum stock
+//!
+//! Per `docs/architecture.md` §1, §6 (Phase 1b) the SQL has moved to
+//! `repository::inventory`. Validation, derived totals, and DTO mapping stay
+//! here.
 
 use axum::{
     extract::{Path, Query, State},
@@ -29,11 +33,14 @@ use axum::{
 };
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
 
 use super::mode::AppState;
 use crate::error::{ApiError, ApiResult};
 use crate::models::Pagination;
+use crate::repository::inventory::{
+    CategoryInsert, CategoryRow, InventoryRoomRollupRow, ItemRow, ItemWrite,
+    RoomChecklistItemRow, TransactionRow,
+};
 
 // ============================================================================
 // Data Structures
@@ -48,6 +55,18 @@ pub struct Category {
     pub description: Option<String>,
     pub active: bool,
     pub created_at: Option<NaiveDateTime>,
+}
+
+impl Category {
+    fn from_row(row: CategoryRow) -> Self {
+        Self {
+            id: row.cat_id,
+            name: row.cat_name,
+            description: row.cat_description,
+            active: row.cat_active.unwrap_or(true),
+            created_at: row.cat_created,
+        }
+    }
 }
 
 /// Inventory item
@@ -66,6 +85,25 @@ pub struct Item {
     pub active: bool,
     pub created_at: Option<NaiveDateTime>,
     pub updated_at: Option<NaiveDateTime>,
+}
+
+impl Item {
+    fn from_row(row: ItemRow) -> Self {
+        Self {
+            id: row.item_id,
+            code: row.item_code,
+            name: row.item_name,
+            category_id: row.item_category_id,
+            category_name: row.cat_name,
+            unit: row.item_unit,
+            min_stock: row.item_min_stock.unwrap_or(0),
+            current_stock: row.item_current_stock.unwrap_or(0),
+            cost: row.item_cost,
+            active: row.item_active.unwrap_or(true),
+            created_at: row.item_created,
+            updated_at: row.item_updated,
+        }
+    }
 }
 
 /// Room inventory assignment (legacy struct, kept for compatibility with admin tools)
@@ -96,6 +134,23 @@ pub struct Transaction {
     pub notes: Option<String>,
     pub date: Option<NaiveDateTime>,
     pub created_by: Option<String>,
+}
+
+impl Transaction {
+    fn from_row(row: TransactionRow) -> Self {
+        Self {
+            id: row.trans_id,
+            item_id: row.trans_item_id.unwrap_or(0),
+            item_code: row.item_code,
+            item_name: row.item_name,
+            trans_type: row.trans_type,
+            quantity: row.trans_quantity,
+            room_id: row.trans_room_id,
+            notes: row.trans_notes,
+            date: row.trans_date,
+            created_by: row.trans_by,
+        }
+    }
 }
 
 /// Inventory stats for dashboard
@@ -193,6 +248,22 @@ pub struct RoomInventoryChecklistItem {
     pub last_verified: Option<NaiveDateTime>,
 }
 
+impl RoomInventoryChecklistItem {
+    fn from_row(row: RoomChecklistItemRow) -> Self {
+        Self {
+            item_id: row.item_id,
+            item_code: row.item_code,
+            item_name: row.item_name,
+            category: row.category,
+            unit: row.item_unit,
+            assigned_quantity: row.assigned_quantity,
+            // Original behavior: verified_quantity defaults to the assigned count.
+            verified_quantity: Some(row.assigned_quantity),
+            last_verified: row.last_checked,
+        }
+    }
+}
+
 /// Inner data block for the checklist response.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -222,6 +293,20 @@ pub struct InventoryRoomRollup {
     pub inventory_count: i32,
     pub last_checked: Option<NaiveDateTime>,
     pub missing_items: i32,
+}
+
+impl InventoryRoomRollup {
+    fn from_row(row: InventoryRoomRollupRow) -> Self {
+        Self {
+            id: row.room_id,
+            room_number: row.room_no,
+            room_type: row.room_type,
+            status: row.room_status,
+            inventory_count: row.inventory_count,
+            last_checked: row.last_checked,
+            missing_items: row.missing_items,
+        }
+    }
 }
 
 /// Response for the inventory rooms collection endpoint
@@ -371,26 +456,8 @@ pub struct MutationResponse {
 pub async fn list_categories(
     State(state): State<AppState>,
 ) -> ApiResult<Json<CategoriesResponse>> {
-    let pool = &state.new_pool;
-
-    let rows = sqlx::query!(
-        r#"SELECT cat_id, cat_name, cat_description, cat_active, cat_created
-        FROM ht_inventory_categories ORDER BY cat_name ASC"#
-    )
-    .fetch_all(pool)
-    .await?;
-
-    let categories: Vec<Category> = rows
-        .iter()
-        .map(|r| Category {
-            id: r.cat_id,
-            name: r.cat_name.clone(),
-            description: r.cat_description.clone(),
-            active: r.cat_active.unwrap_or(true),
-            created_at: r.cat_created,
-        })
-        .collect();
-
+    let rows = state.inventory.list_categories(&state.new_pool).await?;
+    let categories: Vec<Category> = rows.into_iter().map(Category::from_row).collect();
     let total = categories.len() as i32;
 
     Ok(Json(CategoriesResponse {
@@ -410,19 +477,21 @@ pub async fn create_category(
         return Err(ApiError::BadRequest("Category name is required".to_string()));
     }
 
-    let pool = &state.new_pool;
-
     let active = body.active.unwrap_or(true);
 
-    let rec = sqlx::query!(
-        r#"INSERT INTO ht_inventory_categories (cat_name, cat_description, cat_active)
-        VALUES ($1, $2, $3) RETURNING cat_id"#,
-        name, body.description.as_deref(), active
-    )
-    .fetch_one(pool)
-    .await?;
-
-    let id = rec.cat_id;
+    let mut tx = state.new_pool.begin().await?;
+    let id = state
+        .inventory
+        .insert_category(
+            &mut tx,
+            CategoryInsert {
+                name,
+                description: body.description.as_deref(),
+                active,
+            },
+        )
+        .await?;
+    tx.commit().await?;
 
     Ok(Json(MutationResponse {
         success: true,
@@ -440,100 +509,11 @@ pub async fn list_items(
     State(state): State<AppState>,
     Query(params): Query<ItemsQuery>,
 ) -> ApiResult<Json<ItemsResponse>> {
-    let pool = &state.new_pool;
-
-    let offset = (params.page - 1) * params.limit;
-
-    // Build WHERE conditions
-    let mut conditions: Vec<String> = Vec::new();
-
-    if let Some(cat_id) = params.category_id {
-        conditions.push(format!("i.item_category_id = {}", cat_id));
-    }
-
-    if params.low_stock == Some(true) {
-        conditions.push("i.item_current_stock <= i.item_min_stock".to_string());
-    }
-
-    if let Some(ref search) = params.search {
-        let escaped = search.replace('\'', "''");
-        conditions.push(format!(
-            "(i.item_code LIKE '%{}%' OR i.item_name LIKE '%{}%')",
-            escaped, escaped
-        ));
-    }
-
-    if let Some(active) = params.active {
-        conditions.push(format!("i.item_active = {}", if active { "true" } else { "false" }));
-    }
-
-    let where_clause = if conditions.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", conditions.join(" AND "))
-    };
-
-    // Count query
-    let count_query = format!(
-        "SELECT COUNT(*)::int as total FROM ht_inventory_items i {}",
-        where_clause
-    );
-
-    let count_rows = sqlx::query(&count_query)
-        .fetch_all(pool)
+    let (rows, total) = state
+        .inventory
+        .list_items_with_count(&state.new_pool, &params)
         .await?;
-
-    let total: i32 = count_rows
-        .first()
-        .and_then(|r| r.try_get::<i32, _>("total").ok())
-        .unwrap_or(0);
-
-    // Data query
-    let data_query = format!(
-        r#"
-        SELECT
-            i.item_id,
-            i.item_code,
-            i.item_name,
-            i.item_category_id,
-            c.cat_name,
-            i.item_unit,
-            i.item_min_stock,
-            i.item_current_stock,
-            i.item_cost::float8 as item_cost,
-            i.item_active,
-            i.item_created,
-            i.item_updated
-        FROM ht_inventory_items i
-        LEFT JOIN ht_inventory_categories c ON i.item_category_id = c.cat_id
-        {}
-        ORDER BY i.item_name ASC
-        LIMIT {} OFFSET {}
-        "#,
-        where_clause, params.limit, offset
-    );
-
-    let rows = sqlx::query(&data_query)
-        .fetch_all(pool)
-        .await?;
-
-    let items: Vec<Item> = rows
-        .iter()
-        .map(|row| Item {
-            id: row.try_get::<i32, _>("item_id").unwrap_or(0),
-            code: row.try_get::<String, _>("item_code").unwrap_or_default(),
-            name: row.try_get::<String, _>("item_name").unwrap_or_default(),
-            category_id: row.try_get::<i32, _>("item_category_id").ok(),
-            category_name: row.try_get::<String, _>("cat_name").ok(),
-            unit: row.try_get::<String, _>("item_unit").unwrap_or_default(),
-            min_stock: row.try_get::<i32, _>("item_min_stock").unwrap_or(0),
-            current_stock: row.try_get::<i32, _>("item_current_stock").unwrap_or(0),
-            cost: row.try_get::<f64, _>("item_cost").ok(),
-            active: row.try_get::<bool, _>("item_active").unwrap_or(true),
-            created_at: row.try_get::<NaiveDateTime, _>("item_created").ok(),
-            updated_at: row.try_get::<NaiveDateTime, _>("item_updated").ok(),
-        })
-        .collect();
+    let items: Vec<Item> = rows.into_iter().map(Item::from_row).collect();
 
     Ok(Json(ItemsResponse {
         success: true,
@@ -561,17 +541,12 @@ pub async fn create_item(
         return Err(ApiError::BadRequest("Item unit is required".to_string()));
     }
 
-    let pool = &state.new_pool;
-
-    // Check for duplicate code
-    let existing = sqlx::query!(
-        "SELECT item_id FROM ht_inventory_items WHERE item_code = $1",
-        code
-    )
-    .fetch_optional(pool)
-    .await?;
-
-    if existing.is_some() {
+    if state
+        .inventory
+        .find_item_id_by_code(&state.new_pool, code)
+        .await?
+        .is_some()
+    {
         return Err(ApiError::BadRequest("Item code already exists".to_string()));
     }
 
@@ -579,15 +554,24 @@ pub async fn create_item(
     let current_stock = body.current_stock.unwrap_or(0);
     let active = body.active.unwrap_or(true);
 
-    let rec = sqlx::query!(
-        r#"INSERT INTO ht_inventory_items (item_code, item_name, item_category_id, item_unit, item_min_stock, item_current_stock, item_cost, item_active)
-        VALUES ($1, $2, $3, $4, $5, $6, $7::float8, $8) RETURNING item_id"#,
-        code, name, body.category_id, unit, min_stock, current_stock, body.cost, active
-    )
-    .fetch_one(pool)
-    .await?;
-
-    let id = rec.item_id;
+    let mut tx = state.new_pool.begin().await?;
+    let id = state
+        .inventory
+        .insert_item(
+            &mut tx,
+            ItemWrite {
+                code,
+                name,
+                category_id: body.category_id,
+                unit,
+                min_stock,
+                current_stock,
+                cost: body.cost,
+                active,
+            },
+        )
+        .await?;
+    tx.commit().await?;
 
     Ok(Json(MutationResponse {
         success: true,
@@ -601,37 +585,16 @@ pub async fn get_item(
     State(state): State<AppState>,
     Path(item_id): Path<i32>,
 ) -> ApiResult<Json<ItemResponse>> {
-    let pool = &state.new_pool;
+    let row = state
+        .inventory
+        .get_item(&state.new_pool, item_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Item not found".to_string()))?;
 
-    let rec = sqlx::query!(
-        r#"SELECT i.item_id, i.item_code, i.item_name, i.item_category_id, c.cat_name,
-            i.item_unit, i.item_min_stock, i.item_current_stock,
-            i.item_cost::float8 as item_cost, i.item_active, i.item_created, i.item_updated
-        FROM ht_inventory_items i
-        LEFT JOIN ht_inventory_categories c ON i.item_category_id = c.cat_id
-        WHERE i.item_id = $1"#,
-        item_id
-    )
-    .fetch_optional(pool)
-    .await?
-    .ok_or_else(|| ApiError::NotFound("Item not found".to_string()))?;
-
-    let item = Item {
-        id: rec.item_id,
-        code: rec.item_code,
-        name: rec.item_name,
-        category_id: rec.item_category_id,
-        category_name: Some(rec.cat_name),
-        unit: rec.item_unit,
-        min_stock: rec.item_min_stock.unwrap_or(0),
-        current_stock: rec.item_current_stock.unwrap_or(0),
-        cost: rec.item_cost,
-        active: rec.item_active.unwrap_or(true),
-        created_at: rec.item_created,
-        updated_at: rec.item_updated,
-    };
-
-    Ok(Json(ItemResponse { success: true, item }))
+    Ok(Json(ItemResponse {
+        success: true,
+        item: Item::from_row(row),
+    }))
 }
 
 /// PUT /api/new/inventory/items/:id - Update item
@@ -654,17 +617,12 @@ pub async fn update_item(
         return Err(ApiError::BadRequest("Item unit is required".to_string()));
     }
 
-    let pool = &state.new_pool;
-
-    // Check for duplicate code (excluding current item)
-    let existing = sqlx::query!(
-        "SELECT item_id FROM ht_inventory_items WHERE item_code = $1 AND item_id != $2",
-        code, item_id
-    )
-    .fetch_optional(pool)
-    .await?;
-
-    if existing.is_some() {
+    if state
+        .inventory
+        .find_item_id_by_code_excluding(&state.new_pool, code, item_id)
+        .await?
+        .is_some()
+    {
         return Err(ApiError::BadRequest("Item code already exists".to_string()));
     }
 
@@ -672,18 +630,30 @@ pub async fn update_item(
     let current_stock = body.current_stock.unwrap_or(0);
     let active = body.active.unwrap_or(true);
 
-    let result = sqlx::query!(
-        r#"UPDATE ht_inventory_items SET item_code = $1, item_name = $2, item_category_id = $3, item_unit = $4,
-        item_min_stock = $5, item_current_stock = $6, item_cost = $7::float8, item_active = $8, item_updated = NOW()
-        WHERE item_id = $9"#,
-        code, name, body.category_id, unit, min_stock, current_stock, body.cost, active, item_id
-    )
-    .execute(pool)
-    .await?;
+    let mut tx = state.new_pool.begin().await?;
+    let rows_affected = state
+        .inventory
+        .update_item(
+            &mut tx,
+            item_id,
+            ItemWrite {
+                code,
+                name,
+                category_id: body.category_id,
+                unit,
+                min_stock,
+                current_stock,
+                cost: body.cost,
+                active,
+            },
+        )
+        .await?;
 
-    if result.rows_affected() == 0 {
+    if rows_affected == 0 {
+        tx.rollback().await?;
         return Err(ApiError::NotFound("Item not found".to_string()));
     }
+    tx.commit().await?;
 
     Ok(Json(MutationResponse {
         success: true,
@@ -697,18 +667,14 @@ pub async fn delete_item(
     State(state): State<AppState>,
     Path(item_id): Path<i32>,
 ) -> ApiResult<Json<MutationResponse>> {
-    let pool = &state.new_pool;
+    let mut tx = state.new_pool.begin().await?;
+    let rows_affected = state.inventory.deactivate_item(&mut tx, item_id).await?;
 
-    let result = sqlx::query!(
-        "UPDATE ht_inventory_items SET item_active = false, item_updated = NOW() WHERE item_id = $1",
-        item_id
-    )
-    .execute(pool)
-    .await?;
-
-    if result.rows_affected() == 0 {
+    if rows_affected == 0 {
+        tx.rollback().await?;
         return Err(ApiError::NotFound("Item not found".to_string()));
     }
+    tx.commit().await?;
 
     Ok(Json(MutationResponse {
         success: true,
@@ -728,50 +694,19 @@ pub async fn get_room_inventory(
     State(state): State<AppState>,
     Path(room_id): Path<i32>,
 ) -> ApiResult<Json<RoomInventoryResponse>> {
-    let pool = &state.new_pool;
+    let room = state
+        .inventory
+        .get_room_lite(&state.new_pool, room_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Room not found".to_string()))?;
 
-    let room = sqlx::query!(
-        r#"SELECT r.room_no, COALESCE(rt.type_name, '') as "type_name!"
-        FROM ht_rooms_new r
-        LEFT JOIN ht_room_types rt ON r.room_type_id = rt.type_id
-        WHERE r.room_id = $1"#,
-        room_id
-    )
-    .fetch_optional(pool)
-    .await?
-    .ok_or_else(|| ApiError::NotFound("Room not found".to_string()))?;
-
-    let rows = sqlx::query!(
-        r#"SELECT
-            ri.ri_item_id,
-            COALESCE(i.item_code, '') as "item_code!",
-            COALESCE(i.item_name, '') as "item_name!",
-            COALESCE(c.cat_name, 'Equipment') as "category!",
-            COALESCE(i.item_unit, '') as "item_unit!",
-            ri.ri_quantity,
-            ri.ri_last_checked
-        FROM ht_room_inventory ri
-        LEFT JOIN ht_inventory_items i ON ri.ri_item_id = i.item_id
-        LEFT JOIN ht_inventory_categories c ON i.item_category_id = c.cat_id
-        WHERE ri.ri_room_id = $1
-        ORDER BY i.item_name ASC"#,
-        room_id
-    )
-    .fetch_all(pool)
-    .await?;
-
+    let rows = state
+        .inventory
+        .list_room_checklist(&state.new_pool, room_id)
+        .await?;
     let items: Vec<RoomInventoryChecklistItem> = rows
         .into_iter()
-        .map(|r| RoomInventoryChecklistItem {
-            item_id: r.ri_item_id.unwrap_or(0),
-            item_code: r.item_code,
-            item_name: r.item_name,
-            category: r.category,
-            unit: r.item_unit,
-            assigned_quantity: r.ri_quantity.unwrap_or(0),
-            verified_quantity: r.ri_quantity, // Last assigned acts as last verified count
-            last_verified: r.ri_last_checked,
-        })
+        .map(RoomInventoryChecklistItem::from_row)
         .collect();
 
     Ok(Json(RoomInventoryResponse {
@@ -792,59 +727,18 @@ pub async fn list_inventory_rooms(
     State(state): State<AppState>,
     Query(params): Query<InventoryRoomsQuery>,
 ) -> ApiResult<Json<InventoryRoomsResponse>> {
-    let pool = &state.new_pool;
-
     // The new HotelNew DB only contains hfhotel rooms. Treat hfville as empty.
     if params.branch.as_deref() == Some("hfville") {
         return Ok(Json(InventoryRoomsResponse { success: true, data: vec![] }));
     }
 
-    let mut conditions: Vec<String> = vec!["r.room_active = true".to_string()];
+    let rows = state
+        .inventory
+        .list_inventory_rooms(&state.new_pool, &params)
+        .await?;
+    let mut data: Vec<InventoryRoomRollup> = rows.into_iter().map(InventoryRoomRollup::from_row).collect();
 
-    if let Some(ref search) = params.search {
-        let escaped = search.replace('\'', "''");
-        conditions.push(format!("r.room_no LIKE '%{}%'", escaped));
-    }
-
-    let where_clause = format!("WHERE {}", conditions.join(" AND "));
-
-    // Compose rollup: per-room item count, missing items (assigned > 0 but item current_stock zero
-    // is not the right semantic — "missing" means the room hasn't been re-stocked vs. assigned).
-    // For now we report 0 missing unless a check exists; the modal handles missing logic in-memory.
-    let data_query = format!(
-        r#"
-        SELECT
-            r.room_id,
-            r.room_no,
-            COALESCE(rt.type_name, '') AS room_type,
-            COALESCE(r.room_status, 'available') AS room_status,
-            COALESCE((SELECT COUNT(*)::int FROM ht_room_inventory ri WHERE ri.ri_room_id = r.room_id), 0) AS inventory_count,
-            (SELECT MAX(ri.ri_last_checked) FROM ht_room_inventory ri WHERE ri.ri_room_id = r.room_id) AS last_checked,
-            0::int AS missing_items
-        FROM ht_rooms_new r
-        LEFT JOIN ht_room_types rt ON r.room_type_id = rt.type_id
-        {}
-        ORDER BY r.room_no ASC
-        "#,
-        where_clause
-    );
-
-    let rows = sqlx::query(&data_query).fetch_all(pool).await?;
-
-    let mut data: Vec<InventoryRoomRollup> = rows
-        .iter()
-        .map(|row| InventoryRoomRollup {
-            id: row.try_get::<i32, _>("room_id").unwrap_or(0),
-            room_number: row.try_get::<String, _>("room_no").unwrap_or_default(),
-            room_type: row.try_get::<String, _>("room_type").unwrap_or_default(),
-            status: row.try_get::<String, _>("room_status").unwrap_or_else(|_| "available".to_string()),
-            inventory_count: row.try_get::<i32, _>("inventory_count").unwrap_or(0),
-            last_checked: row.try_get::<NaiveDateTime, _>("last_checked").ok(),
-            missing_items: row.try_get::<i32, _>("missing_items").unwrap_or(0),
-        })
-        .collect();
-
-    // Apply filter post-aggregation
+    // Apply filter post-aggregation (matches the previous in-process filter).
     if let Some(ref filter) = params.filter {
         match filter.as_str() {
             "missing" => data.retain(|r| r.missing_items > 0),
@@ -870,28 +764,23 @@ pub async fn check_room_inventory(
     Path(room_id): Path<i32>,
     Json(body): Json<RoomInventoryCheckRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
-    let pool = &state.new_pool;
+    let mut tx = state.new_pool.begin().await?;
 
-    // Bump ri_last_checked for every verified item; record a MOVE-style log line.
     for item in &body.items {
-        sqlx::query!(
-            r#"UPDATE ht_room_inventory SET ri_last_checked = NOW()
-            WHERE ri_room_id = $1 AND ri_item_id = $2"#,
-            room_id, item.item_id
-        )
-        .execute(pool)
-        .await?;
+        state
+            .inventory
+            .touch_room_item_last_checked(&mut tx, room_id, item.item_id)
+            .await?;
     }
 
     let notes = body.notes.unwrap_or_else(|| "Room inventory check".to_string());
-    sqlx::query!(
-        r#"INSERT INTO ht_inventory_transactions (trans_item_id, trans_type, trans_quantity, trans_room_id, trans_notes)
-        VALUES (NULL, 'CHECK', 0, $1, $2)"#,
-        room_id, notes
-    )
-    .execute(pool)
-    .await
-    .ok(); // Best-effort log; trans_item_id may have NOT NULL constraint in some envs
+    // Best-effort log entry (matches the route's prior `.ok()`-swallowed call).
+    let _ = state
+        .inventory
+        .log_room_check(&mut tx, room_id, notes.as_str())
+        .await;
+
+    tx.commit().await?;
 
     Ok(Json(MutationResponse {
         success: true,
@@ -907,9 +796,9 @@ pub async fn replenish_room_inventory(
     Path(room_id): Path<i32>,
     Json(body): Json<RoomInventoryReplenishRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
-    let pool = &state.new_pool;
-
     let notes = body.notes.unwrap_or_else(|| "Room replenish".to_string());
+
+    let mut tx = state.new_pool.begin().await?;
 
     for item in &body.items {
         if item.quantity <= 0 {
@@ -917,41 +806,31 @@ pub async fn replenish_room_inventory(
         }
 
         // Deduct from main stock (allow going to zero, refuse to go negative).
-        let item_rec = sqlx::query!(
-            "SELECT item_current_stock FROM ht_inventory_items WHERE item_id = $1",
-            item.item_id
-        )
-        .fetch_optional(pool)
-        .await?;
-
-        let current = item_rec.and_then(|r| r.item_current_stock).unwrap_or(0);
+        let current = state
+            .inventory
+            .get_item_current_stock(&state.new_pool, item.item_id)
+            .await?
+            .and_then(|stock| stock)
+            .unwrap_or(0);
         let new_stock = (current - item.quantity).max(0);
 
-        sqlx::query!(
-            "UPDATE ht_inventory_items SET item_current_stock = $1, item_updated = NOW() WHERE item_id = $2",
-            new_stock, item.item_id
-        )
-        .execute(pool)
-        .await?;
+        state
+            .inventory
+            .set_item_current_stock(&mut tx, item.item_id, new_stock)
+            .await?;
 
-        // Log as OUT transaction tagged with the room_id.
-        sqlx::query!(
-            r#"INSERT INTO ht_inventory_transactions (trans_item_id, trans_type, trans_quantity, trans_room_id, trans_notes)
-            VALUES ($1, 'OUT', $2, $3, $4)"#,
-            item.item_id, item.quantity, room_id, notes.as_str()
-        )
-        .execute(pool)
-        .await?;
+        state
+            .inventory
+            .log_replenish_out(&mut tx, item.item_id, item.quantity, room_id, notes.as_str())
+            .await?;
 
-        // Update ri_last_checked
-        sqlx::query!(
-            r#"UPDATE ht_room_inventory SET ri_last_checked = NOW()
-            WHERE ri_room_id = $1 AND ri_item_id = $2"#,
-            room_id, item.item_id
-        )
-        .execute(pool)
-        .await?;
+        state
+            .inventory
+            .touch_room_item_last_checked(&mut tx, room_id, item.item_id)
+            .await?;
     }
+
+    tx.commit().await?;
 
     Ok(Json(MutationResponse {
         success: true,
@@ -966,33 +845,31 @@ pub async fn create_stock_adjustment(
     State(state): State<AppState>,
     Json(body): Json<StockAdjustmentRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
-    let pool = &state.new_pool;
-
     let kind = body.adjustment_type.trim().to_lowercase();
     if !["add", "remove", "set"].contains(&kind.as_str()) {
         return Err(ApiError::BadRequest(format!(
-            "Invalid adjustment type '{}' (must be add|remove|set)", body.adjustment_type
+            "Invalid adjustment type '{}' (must be add|remove|set)",
+            body.adjustment_type
         )));
     }
     if body.quantity < 0 {
         return Err(ApiError::BadRequest("Quantity must be non-negative".to_string()));
     }
 
-    let item_rec = sqlx::query!(
-        "SELECT item_current_stock FROM ht_inventory_items WHERE item_id = $1",
-        body.item_id
-    )
-    .fetch_optional(pool)
-    .await?
-    .ok_or_else(|| ApiError::NotFound("Item not found".to_string()))?;
+    let stock_opt = state
+        .inventory
+        .get_item_current_stock(&state.new_pool, body.item_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Item not found".to_string()))?;
+    let current = stock_opt.unwrap_or(0);
 
-    let current = item_rec.item_current_stock.unwrap_or(0);
     let (new_stock, trans_type) = match kind.as_str() {
         "add" => (current + body.quantity, "IN"),
         "remove" => {
             if body.quantity > current {
                 return Err(ApiError::BadRequest(format!(
-                    "Insufficient stock. Current: {}, Requested: {}", current, body.quantity
+                    "Insufficient stock. Current: {}, Requested: {}",
+                    current, body.quantity
                 )));
             }
             (current - body.quantity, "OUT")
@@ -1001,25 +878,29 @@ pub async fn create_stock_adjustment(
         _ => unreachable!(),
     };
 
-    sqlx::query!(
-        "UPDATE ht_inventory_items SET item_current_stock = $1, item_updated = NOW() WHERE item_id = $2",
-        new_stock, body.item_id
-    )
-    .execute(pool)
-    .await?;
+    let mut tx = state.new_pool.begin().await?;
+    state
+        .inventory
+        .set_item_current_stock(&mut tx, body.item_id, new_stock)
+        .await?;
 
-    let rec = sqlx::query!(
-        r#"INSERT INTO ht_inventory_transactions (trans_item_id, trans_type, trans_quantity, trans_room_id, trans_notes, trans_by)
-        VALUES ($1, $2, $3, NULL, $4, $5) RETURNING trans_id"#,
-        body.item_id, trans_type, body.quantity, body.notes.as_deref(), body.created_by.as_deref()
-    )
-    .fetch_one(pool)
-    .await?;
+    let trans_id = state
+        .inventory
+        .insert_stock_adjustment_transaction(
+            &mut tx,
+            body.item_id,
+            trans_type,
+            body.quantity,
+            body.notes.as_deref(),
+            body.created_by.as_deref(),
+        )
+        .await?;
+    tx.commit().await?;
 
     Ok(Json(MutationResponse {
         success: true,
         message: format!("Stock adjusted to {}", new_stock),
-        id: Some(rec.trans_id),
+        id: Some(trans_id),
     }))
 }
 
@@ -1029,27 +910,20 @@ pub async fn update_room_inventory(
     Path(room_id): Path<i32>,
     Json(body): Json<UpdateRoomInventoryRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
-    let pool = &state.new_pool;
+    let mut tx = state.new_pool.begin().await?;
 
-    // Delete existing room inventory entries
-    sqlx::query!(
-        "DELETE FROM ht_room_inventory WHERE ri_room_id = $1",
-        room_id
-    )
-    .execute(pool)
-    .await?;
+    state.inventory.delete_room_inventory(&mut tx, room_id).await?;
 
-    // Insert new entries
     for item in &body.items {
         if item.quantity > 0 {
-            sqlx::query!(
-                r#"INSERT INTO ht_room_inventory (ri_room_id, ri_item_id, ri_quantity, ri_last_checked) VALUES ($1, $2, $3, NOW())"#,
-                room_id, item.item_id, item.quantity
-            )
-            .execute(pool)
-            .await?;
+            state
+                .inventory
+                .insert_room_inventory(&mut tx, room_id, item.item_id, item.quantity)
+                .await?;
         }
     }
+
+    tx.commit().await?;
 
     Ok(Json(MutationResponse {
         success: true,
@@ -1067,95 +941,12 @@ pub async fn list_transactions(
     State(state): State<AppState>,
     Query(params): Query<TransactionsQuery>,
 ) -> ApiResult<Json<TransactionsResponse>> {
-    let pool = &state.new_pool;
-
-    let offset = (params.page - 1) * params.limit;
-
-    // Build WHERE conditions
-    let mut conditions: Vec<String> = Vec::new();
-
-    if let Some(item_id) = params.item_id {
-        conditions.push(format!("t.trans_item_id = {}", item_id));
-    }
-
-    if let Some(ref trans_type) = params.trans_type {
-        let escaped = trans_type.replace('\'', "''").to_uppercase();
-        conditions.push(format!("t.trans_type = '{}'", escaped));
-    }
-
-    if let Some(ref from) = params.from {
-        let escaped = from.replace('\'', "''");
-        conditions.push(format!("t.trans_date >= '{}'", escaped));
-    }
-
-    if let Some(ref to) = params.to {
-        let escaped = to.replace('\'', "''");
-        conditions.push(format!("t.trans_date <= '{}'", escaped));
-    }
-
-    let where_clause = if conditions.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", conditions.join(" AND "))
-    };
-
-    // Count query
-    let count_query = format!(
-        "SELECT COUNT(*)::int as total FROM ht_inventory_transactions t {}",
-        where_clause
-    );
-
-    let count_rows = sqlx::query(&count_query)
-        .fetch_all(pool)
+    let (rows, total) = state
+        .inventory
+        .list_transactions_with_count(&state.new_pool, &params)
         .await?;
 
-    let total: i32 = count_rows
-        .first()
-        .and_then(|r| r.try_get::<i32, _>("total").ok())
-        .unwrap_or(0);
-
-    // Data query
-    let data_query = format!(
-        r#"
-        SELECT
-            t.trans_id,
-            t.trans_item_id,
-            i.item_code,
-            i.item_name,
-            t.trans_type,
-            t.trans_quantity,
-            t.trans_room_id,
-            t.trans_notes,
-            t.trans_date,
-            t.trans_by
-        FROM ht_inventory_transactions t
-        LEFT JOIN ht_inventory_items i ON t.trans_item_id = i.item_id
-        {}
-        ORDER BY t.trans_date DESC
-        LIMIT {} OFFSET {}
-        "#,
-        where_clause, params.limit, offset
-    );
-
-    let rows = sqlx::query(&data_query)
-        .fetch_all(pool)
-        .await?;
-
-    let transactions: Vec<Transaction> = rows
-        .iter()
-        .map(|row| Transaction {
-            id: row.try_get::<i32, _>("trans_id").unwrap_or(0),
-            item_id: row.try_get::<i32, _>("trans_item_id").unwrap_or(0),
-            item_code: row.try_get::<String, _>("item_code").ok(),
-            item_name: row.try_get::<String, _>("item_name").ok(),
-            trans_type: row.try_get::<String, _>("trans_type").unwrap_or_default(),
-            quantity: row.try_get::<i32, _>("trans_quantity").unwrap_or(0),
-            room_id: row.try_get::<i32, _>("trans_room_id").ok(),
-            notes: row.try_get::<String, _>("trans_notes").ok(),
-            date: row.try_get::<NaiveDateTime, _>("trans_date").ok(),
-            created_by: row.try_get::<String, _>("trans_by").ok(),
-        })
-        .collect();
+    let transactions: Vec<Transaction> = rows.into_iter().map(Transaction::from_row).collect();
 
     Ok(Json(TransactionsResponse {
         success: true,
@@ -1176,7 +967,6 @@ pub async fn create_transaction(
 ) -> ApiResult<Json<MutationResponse>> {
     let trans_type = body.trans_type.trim().to_uppercase();
 
-    // Validate transaction type
     let valid_types = ["IN", "OUT", "ADJUST", "MOVE"];
     if !valid_types.contains(&trans_type.as_str()) {
         return Err(ApiError::BadRequest(format!(
@@ -1190,23 +980,16 @@ pub async fn create_transaction(
         return Err(ApiError::BadRequest("Quantity must be non-negative".to_string()));
     }
 
-    let pool = &state.new_pool;
+    let stock_opt = state
+        .inventory
+        .get_item_current_stock(&state.new_pool, body.item_id)
+        .await?;
 
-    // Check if item exists
-    let item_rec = sqlx::query!(
-        "SELECT item_id, item_current_stock FROM ht_inventory_items WHERE item_id = $1",
-        body.item_id
-    )
-    .fetch_optional(pool)
-    .await?;
-
-    if item_rec.is_none() {
+    if stock_opt.is_none() {
         return Err(ApiError::NotFound("Item not found".to_string()));
     }
+    let current_stock = stock_opt.and_then(|s| s).unwrap_or(0);
 
-    let current_stock = item_rec.unwrap().item_current_stock.unwrap_or(0);
-
-    // Calculate new stock based on transaction type
     let new_stock = match trans_type.as_str() {
         "IN" => current_stock + body.quantity,
         "OUT" => {
@@ -1219,36 +1002,39 @@ pub async fn create_transaction(
             }
             result
         }
-        "ADJUST" => body.quantity, // Set to absolute value
-        "MOVE" => current_stock,   // No change to main stock
+        "ADJUST" => body.quantity,
+        "MOVE" => current_stock,
         _ => current_stock,
     };
 
-    // Insert transaction record
-    let rec = sqlx::query!(
-        r#"INSERT INTO ht_inventory_transactions (trans_item_id, trans_type, trans_quantity, trans_room_id, trans_notes, trans_by)
-        VALUES ($1, $2, $3, $4, $5, $6) RETURNING trans_id"#,
-        body.item_id, trans_type.as_str(), body.quantity, body.room_id,
-        body.notes.as_deref(), body.created_by.as_deref()
-    )
-    .fetch_one(pool)
-    .await?;
+    let mut tx = state.new_pool.begin().await?;
 
-    let trans_id = rec.trans_id;
-
-    // Update item stock (except for MOVE type)
-    if trans_type != "MOVE" {
-        sqlx::query!(
-            "UPDATE ht_inventory_items SET item_current_stock = $1, item_updated = NOW() WHERE item_id = $2",
-            new_stock, body.item_id
+    let trans_id = state
+        .inventory
+        .insert_transaction(
+            &mut tx,
+            body.item_id,
+            trans_type.as_str(),
+            body.quantity,
+            body.room_id,
+            body.notes.as_deref(),
+            body.created_by.as_deref(),
         )
-        .execute(pool)
         .await?;
+
+    if trans_type != "MOVE" {
+        state
+            .inventory
+            .set_item_current_stock(&mut tx, body.item_id, new_stock)
+            .await?;
     }
+
+    tx.commit().await?;
 
     Ok(Json(MutationResponse {
         success: true,
-        message: format!("Transaction created. Stock {} to {}",
+        message: format!(
+            "Transaction created. Stock {} to {}",
             match trans_type.as_str() {
                 "IN" => "increased",
                 "OUT" => "decreased",
@@ -1270,25 +1056,14 @@ pub async fn create_transaction(
 pub async fn get_stats(
     State(state): State<AppState>,
 ) -> ApiResult<Json<StatsResponse>> {
-    let pool = &state.new_pool;
-
-    let rec = sqlx::query!(
-        r#"SELECT
-            (SELECT COUNT(*)::int FROM ht_inventory_items WHERE item_active = true) as total_items,
-            (SELECT COUNT(*)::int FROM ht_inventory_categories WHERE cat_active = true) as total_categories,
-            (SELECT COUNT(*)::int FROM ht_inventory_items WHERE item_active = true AND item_current_stock <= item_min_stock AND item_current_stock > 0) as low_stock_count,
-            (SELECT COUNT(*)::int FROM ht_inventory_items WHERE item_active = true AND item_current_stock = 0) as out_of_stock_count,
-            (SELECT COALESCE(SUM(item_current_stock * COALESCE(item_cost, 0)), 0)::float8 FROM ht_inventory_items WHERE item_active = true) as total_stock_value"#
-    )
-    .fetch_one(pool)
-    .await?;
+    let row = state.inventory.get_stats(&state.new_pool).await?;
 
     let stats = InventoryStats {
-        total_items: rec.total_items.unwrap_or(0),
-        total_categories: rec.total_categories.unwrap_or(0),
-        low_stock_count: rec.low_stock_count.unwrap_or(0),
-        out_of_stock_count: rec.out_of_stock_count.unwrap_or(0),
-        total_stock_value: rec.total_stock_value.unwrap_or(0.0),
+        total_items: row.total_items.unwrap_or(0),
+        total_categories: row.total_categories.unwrap_or(0),
+        low_stock_count: row.low_stock_count.unwrap_or(0),
+        out_of_stock_count: row.out_of_stock_count.unwrap_or(0),
+        total_stock_value: row.total_stock_value.unwrap_or(0.0),
     };
 
     Ok(Json(StatsResponse { success: true, stats }))
@@ -1298,38 +1073,8 @@ pub async fn get_stats(
 pub async fn get_low_stock(
     State(state): State<AppState>,
 ) -> ApiResult<Json<LowStockResponse>> {
-    let pool = &state.new_pool;
-
-    let rows = sqlx::query!(
-        r#"SELECT i.item_id, i.item_code, i.item_name, i.item_category_id, c.cat_name,
-            i.item_unit, i.item_min_stock, i.item_current_stock,
-            i.item_cost::float8 as item_cost, i.item_active, i.item_created, i.item_updated
-        FROM ht_inventory_items i
-        LEFT JOIN ht_inventory_categories c ON i.item_category_id = c.cat_id
-        WHERE i.item_active = true AND i.item_current_stock <= i.item_min_stock
-        ORDER BY (i.item_current_stock - i.item_min_stock) ASC, i.item_name ASC"#
-    )
-    .fetch_all(pool)
-    .await?;
-
-    let items: Vec<Item> = rows
-        .iter()
-        .map(|r| Item {
-            id: r.item_id,
-            code: r.item_code.clone(),
-            name: r.item_name.clone(),
-            category_id: r.item_category_id,
-            category_name: Some(r.cat_name.clone()),
-            unit: r.item_unit.clone(),
-            min_stock: r.item_min_stock.unwrap_or(0),
-            current_stock: r.item_current_stock.unwrap_or(0),
-            cost: r.item_cost,
-            active: r.item_active.unwrap_or(true),
-            created_at: r.item_created,
-            updated_at: r.item_updated,
-        })
-        .collect();
-
+    let rows = state.inventory.list_low_stock(&state.new_pool).await?;
+    let items: Vec<Item> = rows.into_iter().map(Item::from_row).collect();
     let total = items.len() as i32;
 
     Ok(Json(LowStockResponse {
