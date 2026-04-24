@@ -36,7 +36,7 @@ PRINT '==== Primary keys ====';
 SELECT
   OBJECT_NAME(i.object_id)     AS table_name,
   i.name                       AS index_name,
-  STRING_AGG(c.name, ', ')     AS pk_columns
+  STRING_AGG(CAST(c.name AS NVARCHAR(MAX)), ', ') AS pk_columns
 FROM sys.indexes i
 JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
 JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
@@ -67,7 +67,7 @@ SELECT
   i.name                       AS index_name,
   i.type_desc,
   i.is_unique,
-  STRING_AGG(c.name, ', ') WITHIN GROUP (ORDER BY ic.key_ordinal) AS columns
+  STRING_AGG(CAST(c.name AS NVARCHAR(MAX)), ', ') AS columns
 FROM sys.indexes i
 JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
 JOIN sys.columns c       ON c.object_id  = ic.object_id AND c.column_id  = ic.column_id
