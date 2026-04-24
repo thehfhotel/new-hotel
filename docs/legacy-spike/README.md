@@ -31,6 +31,9 @@ Extended Events session capturing every SQL batch the app sent.
 | `extend-20260424-101350` | Extend stay (room 508, +1 night) | Destructive Phase B fires AFTER the actual extend. |
 | `booking-checkin-20260424-101838` | Create future booking + modify booking + check-in to it (R014810 → CH26-005231, room 402) | Three flows in one capture. |
 | `booking-cancel-20260424-103158` | Create booking R014811 + cancel it (room 403) | Cleanest capture: cancel uses targeted UPDATEs + DELETE only, no destructive phase. |
+| `checkin-cancel-20260424-114532` | Walk-in for room 306 (CH26-005233) | Confirms walk-in pattern repeats deterministically. |
+| `cancel-checkin-20260424-114805` | Cancel CH26-005233 | New flow — INSERTs into `HT_Rooms_Cancel` audit table, no destructive phase. |
+| `mark-clean-20260424-115026` | Mark room 306 as clean (housekeeping) | Reveals `Room_Clean='no'` = "no clean needed", and `HT_Housewife.h_cin` references PRIOR non-cancelled occupant. |
 
 ## How to revisit
 
@@ -60,5 +63,9 @@ Test data from the spike that should eventually be voided in the legacy app
 | C21607 | CH26-005228 | — | 402 | walked-in then checked out (already cleared) |
 | C21609 | CH26-005230 | — | 508 | walked in, extended stay — still active? |
 | C21608 | CH26-005229 | — | 403 | walked in then checked out (already cleared) |
-| C21610 | CH26-005231 | R014810 | 402 | booking → check-in still active |
+| C21610 | CH26-005231 | R014810 | 402 | booking → check-in then checked out (already done) |
 | C21611 | — | R014811 | 403 | booking already cancelled (status='ยกเลิก'), customer record stays |
+| C21613 | — | R014812 | 402 | RACE TEST — booking, fixed, then cancelled via writeback (already cleaned) |
+| C21615 | — | R014814 | 402 | RACE TEST — booking cancelled via writeback (already cleaned) |
+| C21616 | — | R014815 | 402 | RACE TEST — booking cancelled via writeback (already cleaned) |
+| C21618 | CH26-005233 | — | 306 | walk-in then cancelled via .NET app, room then marked clean |
