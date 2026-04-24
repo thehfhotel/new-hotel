@@ -10,20 +10,12 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  cancel-previous:
-    runs-on: ubuntu-latest
-    permissions:
-      actions: write
-    steps:
-      - name: Cancel Previous Runs
-        uses: styfle/cancel-workflow-action@0.12.1
-        with:
-          access_token: ${{ github.token }}
-          all_but_latest: true
-
+  # Note: no cancel-previous job. The workflow only triggers on master pushes
+  # and workflow_dispatch (no PR builds), so cancelling earlier runs only
+  # serves to orphan in-flight deploys when commits land back-to-back. We let
+  # all runs complete; the deploy step is idempotent (docker compose up -d).
   changes:
     runs-on: ubuntu-latest
-    needs: cancel-previous
     outputs:
       code: ${{ steps.filter.outputs.code }}
       backend: ${{ steps.filter.outputs.backend }}
