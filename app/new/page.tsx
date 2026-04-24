@@ -48,13 +48,15 @@ interface CheckIn {
   checkOutDate: string
 }
 
-const statusConfig: Record<RoomStatus, { dot: string; bg: string; border: string; label: string }> = {
-  available: { dot: 'bg-green-500', bg: 'bg-white hover:bg-green-50', border: 'border-b-green-500', label: 'ว่าง' },
-  occupied: { dot: 'bg-red-500', bg: 'bg-red-50 hover:bg-red-100', border: 'border-b-red-500', label: 'มีผู้เข้าพัก' },
-  booked: { dot: 'bg-yellow-500', bg: 'bg-yellow-50 hover:bg-yellow-100', border: 'border-b-yellow-500', label: 'จองแล้ว' },
-  maintenance: { dot: 'bg-gray-400', bg: 'bg-gray-100 hover:bg-gray-200', border: 'border-b-gray-400', label: 'ซ่อมบำรุง' },
-  cleaning: { dot: 'bg-orange-500', bg: 'bg-orange-50 hover:bg-orange-100', border: 'border-b-orange-500', label: 'ทำความสะอาด' },
-  checkout: { dot: 'bg-blue-400', bg: 'bg-blue-50 hover:bg-blue-100', border: 'border-b-blue-400', label: 'รอเช็คเอาท์' },
+// Each room status maps to a tiny coloured status dot. Tile bodies stay neutral
+// (white panel + 1px border) — colour communicates state, not the whole tile.
+const statusConfig: Record<RoomStatus, { dot: string; label: string }> = {
+  available:   { dot: 'bg-success',     label: 'ว่าง' },
+  occupied:    { dot: 'bg-brand-500',   label: 'มีผู้เข้าพัก' },
+  booked:      { dot: 'bg-warning',     label: 'จองแล้ว' },
+  maintenance: { dot: 'bg-textMuted',   label: 'ซ่อมบำรุง' },
+  cleaning:    { dot: 'bg-warning/70',  label: 'ทำความสะอาด' },
+  checkout:    { dot: 'bg-info',        label: 'รอเช็คเอาท์' },
 }
 
 // HF Hotel room layout matching actual hotel floor plan
@@ -174,26 +176,26 @@ export default function NewDashboard() {
     return (
       <div className="flex items-center justify-center min-h-[50vh]">
         <div className="text-center">
-          <Loader2 className="animate-spin h-12 w-12 text-red-500 mx-auto mb-4" />
-          <p className="text-gray-500">กำลังโหลดข้อมูล...</p>
+          <Loader2 className="animate-spin h-8 w-8 text-brand-500 mx-auto mb-2" />
+          <p className="text-textMuted text-[13px]">กำลังโหลดข้อมูล...</p>
         </div>
       </div>
     )
   }
 
   return (
-    <div className="space-y-6">
-      {/* Page Header */}
-      <div className="flex items-center justify-between">
+    <div className="space-y-3">
+      {/* Page Header — 40px-tall bar with bottom border */}
+      <div className="flex items-center justify-between bg-panel border border-border h-10 px-3">
         <div className="flex items-center gap-3">
-          <h1 className="text-2xl font-bold text-gray-900 tracking-tight">หน้าหลัก</h1>
+          <h1 className="text-base font-semibold text-text">หน้าหลัก</h1>
           {branch !== 'hfhotel' && (
-            <span className="text-sm font-medium px-2 py-0.5 rounded-md bg-gray-100 text-gray-600">
+            <span className="text-[11px] font-medium px-1.5 py-0.5 bg-headerBar border border-border text-textMuted">
               {BRANCH_LABELS[branch]}
             </span>
           )}
         </div>
-        <p className="text-gray-400 text-sm">
+        <p className="text-textMuted text-[11px]">
           อัปเดตล่าสุด: {new Date().toLocaleDateString('th-TH', {
             year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit',
           })}
@@ -201,64 +203,67 @@ export default function NewDashboard() {
       </div>
 
       {error && (
-        <div className="flex items-center gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-600">
-          <AlertCircle className="w-5 h-5 flex-shrink-0" />
+        <div className="flex items-center gap-2 p-2 bg-error/10 border border-error/40 text-error text-[12px]">
+          <AlertCircle className="w-4 h-4 flex-shrink-0" />
           <span>{error}</span>
         </div>
       )}
 
-      {/* Stats Cards */}
-      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
-        <div className="bg-white rounded-xl px-6 py-5 border border-gray-200">
-          <p className="text-sm font-medium text-gray-500 mb-1">ห้องทั้งหมด</p>
-          <p className="text-3xl font-bold text-gray-900">{stats.totalRooms}</p>
+      {/* Stats tiles — flat panels, neutral background, single colour accent (the value text) */}
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-2">
+        <div className="bg-panel border border-border px-3 py-2">
+          <p className="text-[11px] uppercase tracking-wide text-textMuted">ห้องทั้งหมด</p>
+          <p className="text-[20px] font-semibold text-text leading-tight">{stats.totalRooms}</p>
         </div>
-        <div className="bg-white rounded-xl px-6 py-5 border border-gray-200">
-          <p className="text-sm font-medium text-gray-500 mb-1">ห้องว่าง</p>
-          <p className="text-3xl font-bold text-emerald-400">{stats.availableRooms}</p>
+        <div className="bg-panel border border-border px-3 py-2">
+          <p className="text-[11px] uppercase tracking-wide text-textMuted">ห้องว่าง</p>
+          <p className="text-[20px] font-semibold text-success leading-tight">{stats.availableRooms}</p>
         </div>
-        <div className="bg-white rounded-xl px-6 py-5 border border-gray-200">
-          <p className="text-sm font-medium text-gray-500 mb-1">มีผู้เข้าพัก</p>
-          <p className="text-3xl font-bold text-red-600">{stats.occupiedRooms}</p>
+        <div className="bg-panel border border-border px-3 py-2">
+          <p className="text-[11px] uppercase tracking-wide text-textMuted">มีผู้เข้าพัก</p>
+          <p className="text-[20px] font-semibold text-brand-500 leading-tight">{stats.occupiedRooms}</p>
         </div>
-        <div className="bg-white rounded-xl px-6 py-5 border border-gray-200">
-          <p className="text-sm font-medium text-gray-500 mb-1">จองแล้ว</p>
-          <p className="text-3xl font-bold text-amber-400">{stats.bookedRooms}</p>
+        <div className="bg-panel border border-border px-3 py-2">
+          <p className="text-[11px] uppercase tracking-wide text-textMuted">จองแล้ว</p>
+          <p className="text-[20px] font-semibold text-warning leading-tight">{stats.bookedRooms}</p>
         </div>
-        <div className="bg-white rounded-xl px-6 py-5 border border-gray-200">
-          <p className="text-sm font-medium text-gray-500 mb-1">เช็คอินวันนี้</p>
-          <p className="text-3xl font-bold text-gray-900">{stats.todayCheckIns}</p>
+        <div className="bg-panel border border-border px-3 py-2">
+          <p className="text-[11px] uppercase tracking-wide text-textMuted">เช็คอินวันนี้</p>
+          <p className="text-[20px] font-semibold text-text leading-tight">{stats.todayCheckIns}</p>
         </div>
-        <div className="bg-white rounded-xl px-6 py-5 border border-gray-200">
-          <p className="text-sm font-medium text-gray-500 mb-1">เช็คเอาท์วันนี้</p>
-          <p className="text-3xl font-bold text-sky-400">{stats.todayCheckOuts}</p>
+        <div className="bg-panel border border-border px-3 py-2">
+          <p className="text-[11px] uppercase tracking-wide text-textMuted">เช็คเอาท์วันนี้</p>
+          <p className="text-[20px] font-semibold text-info leading-tight">{stats.todayCheckOuts}</p>
         </div>
       </div>
 
       {/* Room Grid */}
-      <div className="bg-white rounded-xl border border-gray-200 p-6">
-        <h2 className="text-lg font-semibold text-gray-800 mb-4">สถานะห้องพัก</h2>
+      <div className="bg-panel border border-border">
+        <div className="bg-headerBar border-b border-border px-3 py-1.5 text-[12px] font-semibold uppercase tracking-wide text-text">
+          สถานะห้องพัก
+        </div>
+        <div className="p-3">
 
         {/* Desktop Grid */}
-        <div className="hidden md:block space-y-6">
+        <div className="hidden md:block space-y-4">
           {roomLayouts.map((section, sectionIdx) => (
             <div key={sectionIdx}>
               {section.label && (
-                <p className="text-sm font-medium text-gray-500 mb-2">{section.label}</p>
+                <p className="text-[12px] font-semibold text-textMuted uppercase tracking-wide mb-1">{section.label}</p>
               )}
-              <div className="grid gap-2" style={{ gridTemplateColumns: `repeat(${Math.max(...section.layout.map(r => r.length))}, minmax(0, 1fr))` }}>
+              <div className="grid gap-1" style={{ gridTemplateColumns: `repeat(${Math.max(...section.layout.map(r => r.length))}, minmax(0, 1fr))` }}>
                 {section.layout.map((row, rowIndex) => (
                   <div key={`row-${sectionIdx}-${rowIndex}`} className="contents">
                     {row.map((roomNumber, colIndex) => {
                       if (roomNumber === null) {
-                        return <div key={`blank-${sectionIdx}-${rowIndex}-${colIndex}`} className="h-[70px]" />
+                        return <div key={`blank-${sectionIdx}-${rowIndex}-${colIndex}`} className="h-[60px]" />
                       }
                       const room = roomMap.get(roomNumber.toUpperCase())
                       if (!room) {
                         return (
-                          <div key={`missing-${sectionIdx}-${roomNumber}`} className="h-[70px] bg-gray-200 rounded-lg p-1 flex flex-col items-center justify-center">
-                            <span className="font-bold text-xs text-gray-400">{roomNumber}</span>
-                            <span className="text-[9px] text-gray-400">ไม่พบ</span>
+                          <div key={`missing-${sectionIdx}-${roomNumber}`} className="h-[60px] bg-headerBar border border-border p-1 flex flex-col items-center justify-center">
+                            <span className="font-semibold text-[11px] text-textMuted">{roomNumber}</span>
+                            <span className="text-[9px] text-textMuted">ไม่พบ</span>
                           </div>
                         )
                       }
@@ -267,18 +272,19 @@ export default function NewDashboard() {
                         <button
                           key={`${sectionIdx}-${roomNumber}`}
                           onClick={() => setSelectedRoom(room)}
-                          className={`${config.bg} border border-gray-200 border-b-4 ${config.border} rounded-lg p-1
-                            hover:shadow-md flex flex-col items-center justify-center h-[70px] overflow-hidden`}
+                          className="bg-panel border border-border hover:border-borderStrong p-1 flex flex-col items-center justify-center h-[60px] overflow-hidden transition-colors relative"
                           title={`${room.roomNumber} - ${room.type} ${room.details}`}
                         >
-                          <span className="font-bold text-xs leading-tight text-gray-800">{room.roomNumber}</span>
-                          <span className="text-[8px] leading-tight text-gray-600">{room.type}</span>
-                          <span className="text-[8px] leading-tight text-gray-500">{room.details}</span>
+                          {/* Tiny status dot in the top-right corner — colour without flooding the tile */}
+                          <span className={`absolute top-1 right-1 w-2 h-2 rounded-full ${config.dot}`} />
+                          <span className="font-semibold text-[12px] leading-tight text-text">{room.roomNumber}</span>
+                          <span className="text-[9px] leading-tight text-textMuted">{room.type}</span>
+                          <span className="text-[9px] leading-tight text-textMuted/80">{room.details}</span>
                         </button>
                       )
                     })}
                     {Array.from({ length: Math.max(...section.layout.map(r => r.length)) - row.length }).map((_, i) => (
-                      <div key={`filler-${sectionIdx}-${rowIndex}-${i}`} className="h-[70px]" />
+                      <div key={`filler-${sectionIdx}-${rowIndex}-${i}`} className="h-[60px]" />
                     ))}
                   </div>
                 ))}
@@ -288,56 +294,57 @@ export default function NewDashboard() {
         </div>
 
         {/* Mobile List */}
-        <div className="md:hidden space-y-2">
+        <div className="md:hidden space-y-1">
           {[...rooms].sort((a, b) => a.roomNumber.localeCompare(b.roomNumber, undefined, { numeric: true })).map(room => {
             const config = statusConfig[room.status]
             return (
               <button
                 key={room.roomNumber}
                 onClick={() => setSelectedRoom(room)}
-                className={`${config.bg} w-full flex items-center gap-3 p-3 rounded-lg border border-gray-200 border-l-4 ${config.border}`}
+                className="bg-panel hover:bg-headerBar w-full flex items-center gap-3 p-2 border border-border"
               >
-                <div className={`w-3 h-3 rounded-full ${config.dot}`} />
-                <span className="font-bold">{room.roomNumber}</span>
-                <span className="text-gray-600">{room.type}</span>
-                <span className="text-gray-500 text-sm">{room.details}</span>
+                <div className={`w-2 h-2 rounded-full ${config.dot}`} />
+                <span className="font-semibold text-text">{room.roomNumber}</span>
+                <span className="text-textMuted text-[12px]">{room.type}</span>
+                <span className="text-textMuted/80 text-[12px]">{room.details}</span>
               </button>
             )
           })}
         </div>
 
         {/* Legend */}
-        <div className="flex flex-wrap gap-2 md:gap-4 mt-4">
+        <div className="flex flex-wrap gap-3 mt-3 pt-3 border-t border-border">
           {Object.entries(statusConfig).map(([status, config]) => (
-            <div key={status} className="flex items-center gap-1 md:gap-2">
-              <div className={`w-2 h-2 md:w-3 md:h-3 rounded-full ${config.dot}`} />
-              <span className="text-xs md:text-sm text-gray-600">{config.label}</span>
+            <div key={status} className="flex items-center gap-1.5">
+              <div className={`w-2 h-2 rounded-full ${config.dot}`} />
+              <span className="text-[11px] text-textMuted">{config.label}</span>
             </div>
           ))}
+        </div>
         </div>
       </div>
 
       {/* Recent Activity */}
-      <div className="bg-white rounded-xl border border-gray-200 p-6">
-        <h3 className="text-lg font-semibold text-gray-800 mb-4 flex items-center gap-2">
-          <Clock size={20} className="text-red-500" />
+      <div className="bg-panel border border-border">
+        <div className="bg-headerBar border-b border-border px-3 py-1.5 text-[12px] font-semibold uppercase tracking-wide text-text flex items-center gap-2">
+          <Clock size={12} className="text-brand-500" />
           กิจกรรมล่าสุด
-        </h3>
-        <div className="space-y-2">
+        </div>
+        <div className="p-3 space-y-1">
           {checkIns.length > 0 ? (
             checkIns.slice(0, 5).map((checkin, i) => (
-              <div key={i} className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
-                <div className="flex items-center gap-3">
-                  <div className="w-9 h-9 bg-red-500/10 rounded-full flex items-center justify-center">
-                    <LogIn size={16} className="text-red-600" />
+              <div key={i} className="flex items-center justify-between p-2 hover:bg-headerBar transition-colors">
+                <div className="flex items-center gap-2">
+                  <div className="w-6 h-6 bg-brand-50 border border-brand-100 flex items-center justify-center">
+                    <LogIn size={12} className="text-brand-700" />
                   </div>
                   <div>
-                    <p className="font-medium text-gray-800 text-sm">{checkin.guestName}</p>
-                    <p className="text-xs text-gray-500">ห้อง {checkin.roomNumber}</p>
+                    <p className="font-medium text-text text-[13px]">{checkin.guestName}</p>
+                    <p className="text-[11px] text-textMuted">ห้อง {checkin.roomNumber}</p>
                   </div>
                 </div>
                 <div className="text-right">
-                  <p className="text-xs text-gray-500">
+                  <p className="text-[11px] text-textMuted">
                     {new Date(checkin.checkInDate).toLocaleDateString('th-TH', { day: 'numeric', month: 'short', timeZone: 'UTC' })}
                     {' - '}
                     {new Date(checkin.checkOutDate).toLocaleDateString('th-TH', { day: 'numeric', month: 'short', timeZone: 'UTC' })}
@@ -346,31 +353,38 @@ export default function NewDashboard() {
               </div>
             ))
           ) : (
-            <p className="text-gray-500 text-center py-4">ไม่มีกิจกรรมล่าสุด</p>
+            <p className="text-textMuted text-center py-3 text-[12px]">ไม่มีกิจกรรมล่าสุด</p>
           )}
         </div>
       </div>
 
-      {/* Room Detail Modal */}
+      {/* Room Detail Modal — flat panel, no shadow, no rounded corners */}
       {selectedRoom && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={() => setSelectedRoom(null)}>
-          <div className="bg-white border border-gray-200 rounded-xl shadow-2xl p-6 max-w-sm w-full mx-4" onClick={e => e.stopPropagation()}>
-            <div className="flex justify-between items-start mb-4">
-              <div>
-                <h3 className="text-2xl font-bold text-gray-900">ห้อง {selectedRoom.roomNumber}</h3>
-                <p className="text-gray-500">{selectedRoom.type} {selectedRoom.details}</p>
-              </div>
-              <span className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs ${statusConfig[selectedRoom.status].bg} border ${statusConfig[selectedRoom.status].border}`}>
+        <div
+          className="fixed inset-0 bg-black/40 flex items-center justify-center z-50"
+          onClick={() => setSelectedRoom(null)}
+        >
+          <div className="bg-panel border border-border max-w-sm w-full mx-4" onClick={e => e.stopPropagation()}>
+            <div className="bg-headerBar border-b border-border px-3 py-2 flex items-center justify-between">
+              <h3 className="text-[14px] font-semibold text-text">
+                ห้อง {selectedRoom.roomNumber}
+              </h3>
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[11px] bg-panel border border-border">
                 <span className={`w-2 h-2 rounded-full ${statusConfig[selectedRoom.status].dot}`} />
                 {statusConfig[selectedRoom.status].label}
               </span>
             </div>
-            <button
-              onClick={() => setSelectedRoom(null)}
-              className="w-full mt-4 bg-gray-100 hover:bg-gray-200 text-gray-900 py-2 rounded-lg transition-colors"
-            >
-              ปิด
-            </button>
+            <div className="p-3">
+              <p className="text-textMuted text-[12px] mb-3">
+                {selectedRoom.type} {selectedRoom.details}
+              </p>
+              <button
+                onClick={() => setSelectedRoom(null)}
+                className="w-full h-7 bg-panel border border-borderStrong text-text hover:bg-headerBar transition-colors text-[13px]"
+              >
+                ปิด
+              </button>
+            </div>
           </div>
         </div>
       )}

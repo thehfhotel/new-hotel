@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO ht_inventory_transactions (trans_item_id, trans_type, trans_quantity, trans_room_id, trans_notes, trans_by)\n        VALUES ($1, $2, $3, NULL, $4, $5) RETURNING trans_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "trans_id",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Varchar",
+        "Int4",
+        "Varchar",
+        "Varchar"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "83ad640b66f88f7605ca8057ac66a7d9272bb54377197c6091168e8f6a6d007d"
+}

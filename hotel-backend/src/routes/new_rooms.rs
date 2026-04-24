@@ -50,6 +50,8 @@ pub struct NewRoomsQuery {
     pub limit: i32,
     pub sort_by: Option<String>,
     pub sort_order: Option<String>,
+    /// Branch selector: 'hfhotel' | 'hfville' | 'all' (HotelNew only contains hfhotel data)
+    pub branch: Option<String>,
 }
 
 fn default_page() -> i32 { 1 }
@@ -104,6 +106,16 @@ pub async fn list_rooms(
     Query(params): Query<NewRoomsQuery>,
 ) -> ApiResult<Json<NewRoomsResponse>> {
     let pool = &state.new_pool;
+
+    // The HotelNew database only contains HF Hotel data; for HF Ville return an empty
+    // result so the UI shows "no rooms" rather than mixing HF Hotel rooms in.
+    if params.branch.as_deref() == Some("hfville") {
+        return Ok(Json(NewRoomsResponse {
+            success: true,
+            data: vec![],
+            pagination: Pagination::new(params.page, params.limit, 0),
+        }));
+    }
 
     let offset = (params.page - 1) * params.limit;
     let sort_order = params
@@ -170,9 +182,9 @@ pub async fn list_rooms(
             r.room_status,
             r.room_clean,
             r.room_maintenance,
-            r.room_price_weekday,
-            r.room_price_weekend,
-            r.room_price_special,
+            r.room_price_weekday::float8 as room_price_weekday,
+            r.room_price_weekend::float8 as room_price_weekend,
+            r.room_price_special::float8 as room_price_special,
             r.room_notes,
             r.created_at,
             r.updated_at

@@ -49,6 +49,8 @@ pub struct NewCustomersQuery {
     pub sort_order: Option<String>,
     #[serde(default = "default_active_only")]
     pub active_only: bool,
+    /// Branch selector: 'hfhotel' | 'hfville' | 'all' (HotelNew only contains hfhotel data)
+    pub branch: Option<String>,
 }
 
 fn default_page() -> i32 { 1 }
@@ -102,6 +104,15 @@ pub async fn list_customers(
     Query(params): Query<NewCustomersQuery>,
 ) -> ApiResult<Json<NewCustomersResponse>> {
     let pool = &state.new_pool;
+
+    // HotelNew DB only contains hfhotel data; hfville selector returns empty.
+    if params.branch.as_deref() == Some("hfville") {
+        return Ok(Json(NewCustomersResponse {
+            success: true,
+            data: vec![],
+            pagination: Pagination::new(params.page, params.limit, 0),
+        }));
+    }
 
     let offset = (params.page - 1) * params.limit;
     let sort_order = params

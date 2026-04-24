@@ -36,7 +36,8 @@ services:
       - SLACK_NOTIFICATIONS_ENABLED=false
       - BACKEND_URL=http://backend:3003
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     networks:
       - hotel-network
     restart: unless-stopped
@@ -68,6 +69,14 @@ services:
         condition: service_healthy
     networks:
       - hotel-network
+    healthcheck:
+      # /api/mode is a cheap, dependency-light endpoint that confirms the
+      # backend has bound to the port and answered an HTTP request.
+      test: ["CMD-SHELL", "curl -fsS --max-time 3 http://localhost:3003/api/mode > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
     restart: unless-stopped
 
 volumes:
