@@ -279,7 +279,29 @@ Then Phase B (destructive save) fires too — same pattern as on check-out.
 
 **Implication for writeback**: extend = recompute totals + replace `HT_Room_Status` rows for the changed date range. Targeted, no destructive Phase B needed.
 
-### 3g. Take payment + print invoice (4 statements, ~26s gap for print dialog)
+### 3g-bis. Cancel booking (4 UPDATEs + 1 DELETE — clean, no destructive phase!)
+
+Source: `booking-cancel-20260424-103158/writes.txt`
+
+```sql
+UPDATE HT_Rooms SET room_book_ds='', Room_Book='', Room_Book_Name='', Room_Book_Time=''
+   WHERE room_book IN (SELECT id FROM ht_book_date WHERE Book_no='R014811')
+
+UPDATE HT_Book_H  SET Book_Status='ยกเลิก' WHERE Book_ID='R014811'  -- Thai: cancelled
+UPDATE HT_Book_ds SET Book_status=3        WHERE Book_No='R014811'  -- numeric status code
+DELETE FROM HT_Book_Date                   WHERE Book_no='R014811'  -- HARD delete
+UPDATE HT_Book_H  SET book_status='ยกเลิก' WHERE book_id='R014811'  -- duplicate UPDATE (lowercase column)
+```
+
+**Findings:**
+- Cancel is **soft on `HT_Book_H` / `HT_Book_Ds`** — status flipped to `'ยกเลิก'` (Thai: cancelled). Records preserved.
+- Cancel is **HARD on `HT_Book_Date`** — those rows are deleted permanently. The room is freed.
+- `HT_Customers` is preserved (customer may return).
+- **`HT_Book_Ds.Book_status` is a numeric field** (`3` = cancelled). Different from the varchar `Book_Status` on `HT_Book_H`. Watch the case sensitivity.
+- The two `UPDATE HT_Book_H ... book_status='ยกเลิก'` statements at 10:34:02.099 and 10:34:02.124 are duplicates — set the same value twice. Likely a bug in the legacy app's UI handler.
+- No destructive Phase B runs. **This is the cleanest flow we've captured.** 🎉
+
+### 3h. Take payment + print invoice (4 statements, ~26s gap for print dialog)
 
 Source: `invoice-20260424-100827/writes.txt`
 
@@ -389,7 +411,8 @@ Map of "our app's intent" → "legacy SQL we must emit":
 | Take payment | INSERT `HT_CheckIn_Pay`, UPDATE `HT_CheckIn_H` totals | One-shot. |
 | Print receipt | INSERT `HT_Receipt_H` + INSERT `HT_Receipt_Ds` (×lines) | Service code `SEV-001` for room charge. Receipts are append-only. |
 | Check-out | UPDATE `HT_POWER_LOG` (lights off w/ note), UPDATE `HT_CheckIn_Ds` (status, dep date), UPDATE `HT_Rooms` (use=no, Clean=yes, count++), UPDATE `HT_Room_Status`, UPDATE `HT_CheckIn_H` (zero totals if balance=0). Then optionally housekeeping: UPDATE `HT_Rooms.Room_Clean='no'` + INSERT `HT_Housewife` | Skip Phase 1. |
-| Cancel booking / check-in | **NOT YET CAPTURED** — assume sets `*_Status='ยกเลิก'` (Thai for cancelled) on relevant header. To verify with another spike. |
+| Cancel booking | UPDATE `HT_Rooms` to clear booking display (subquery on `HT_Book_Date`), UPDATE `HT_Book_H.Book_Status='ยกเลิก'`, UPDATE `HT_Book_Ds.Book_status=3` (numeric), DELETE `HT_Book_Date` (hard) | Customer + booking shells preserved. See §3g-bis. |
+| Cancel a check-in | **NOT YET CAPTURED** — likely flips `Cin_status` to `'ยกเลิก'`; need spike. |
 | Add minibar / charge | **NOT YET CAPTURED** — likely INSERT `HT_CheckIn_Product`. To verify with another spike. |
 | Refund | **NOT YET CAPTURED**. |
 
@@ -418,7 +441,7 @@ per counter.
 
 | Gap | Plan to fill |
 |---|---|
-| Cancel booking / check-in | Spike capture of "cancel" action. |
+| Cancel a check-in (vs booking — booking is captured) | Spike capture of "cancel check-in" action. |
 | Add minibar / per-line charge | Spike capture of "add product". `HT_CheckIn_Product` and `HT_Products` tables. |
 | Refund / negative payment | Spike capture. Possibly negative `Cin_Pay_Cash`. |
 | Edit existing customer (without check-in flow) | Spike capture. |
