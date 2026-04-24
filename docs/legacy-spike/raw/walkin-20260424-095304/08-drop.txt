@@ -1,0 +1,1 @@
+Dropped session hotel_legacy_capture

@@ -1,0 +1,8 @@
+[10:08:47] update HT_CheckIn_H set Cin_Work_number=361383 where Cin_No='CH26-005227'
+[10:08:51] delete from HT_CheckIn_Product where Cin_no='CH26-005227'
+[10:08:51] update [HT_CheckIn_Ds] SET  [Cin_Room_Pay_Total]=711,[Cin_note]='' where id=25006
+[10:08:51] INSERT INTO [HT_CheckIn_Pay](  [Cin_No],[Cin_Pay_Ds],[Cin_Pay_Cash],[Cin_Pay_Credit],[Cin_Pay_Date],[Cin_Pay_Ds_Name],[Cin_Pay_Ds_Price],[Cin_Pay_Ds_unit],[Pay_No],[Cin_Cust_no],[Cin_Pay_Ds_ID],[Cin_Pay_Ds_Num],[Cin_Pay_Ds_PriceTotal],[Cin_Pay_Ds_PriceOne]
+[10:08:51] UPDATE [HT_CheckIn_H] SET  [Total_Price_Room]=711.00,[Total_Price_Product]=0.00,[Total_Price_Net]=711.00,[Total_Price_Pay]=711.00,[Total_Price_Balance]=0.00 where [Cin_no]='CH26-005227'
+[10:09:17] update HT_CheckIn_H set Total_Price_vat=Total_Price_vat+711.00 where Cin_no='CH26-005227'
+[10:09:17] INSERT INTO [HT_Receipt_H]([id],[Receipt_no],[Receipt_Date],[Receipt_Name],[Receipt_Address],[Receipt_Tel],[Receipt_Fax],[Receipt_Total],[Receipt_Vat],[Receipt_BeforeVat],[Receipt_VatIn],[Receipt_VatPer],[status_name],[Receipt_Discount],[Receipt_ref],[Rece
+[10:09:17] INSERT INTO [HT_Receipt_Ds]([S_Sale_id],[S_Product_no],[S_Product_name],[S_Unit],[S_UnitName],[S_Price],[S_Total],S_PriceDiscount_per,S_PriceDiscount)VALUES(20653,'SEV-001','ค่าห้องพัก [414]',1.00,'คืน',711.00,711.00,'',0.00)
