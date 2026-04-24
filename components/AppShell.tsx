@@ -1,14 +1,18 @@
 'use client'
 
+import { useState, useEffect } from 'react'
 import Sidebar, { SIDEBAR_WIDTH, SIDEBAR_COLLAPSED_WIDTH } from '@/components/Sidebar'
 import { BranchProvider } from '@/contexts/BranchContext'
-import { useState, useEffect } from 'react'
 
-export default function NewLayout({
-  children,
-}: {
-  children: React.ReactNode
-}) {
+/**
+ * Client shell that renders the sidebar + main content area for every page.
+ * Wraps children in the BranchProvider so any descendant can read the active
+ * branch via `useBranch()` / `useBranchFetch()`.
+ *
+ * Sidebar collapse state is mirrored from localStorage and kept in sync via
+ * the `sidebar-toggle` window event dispatched by `<Sidebar>`.
+ */
+export default function AppShell({ children }: { children: React.ReactNode }) {
   const [collapsed, setCollapsed] = useState(false)
   const [mounted, setMounted] = useState(false)
 

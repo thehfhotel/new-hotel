@@ -15,10 +15,12 @@ import {
   BarChart3,
   LayoutGrid,
   DollarSign,
-  ArrowLeftRight,
   ChevronLeft,
   ChevronRight,
   MapPin,
+  Users,
+  CreditCard,
+  ScrollText,
 } from 'lucide-react'
 import { useBranch, BRANCH_LABELS, type Branch } from '@/contexts/BranchContext'
 
@@ -40,32 +42,35 @@ const sections: NavSection[] = [
   {
     title: 'การดำเนินงาน',
     items: [
-      { href: '/new', label: 'หน้าหลัก', icon: <Home size={20} /> },
-      { href: '/new/calendar', label: 'ปฏิทิน', icon: <Calendar size={20} /> },
-      { href: '/new/bookings', label: 'การจอง', icon: <BookOpen size={20} /> },
-      { href: '/new/rooms', label: 'ห้องพัก', icon: <BedDouble size={20} /> },
+      { href: '/', label: 'หน้าหลัก', icon: <Home size={20} /> },
+      { href: '/calendar', label: 'ปฏิทิน', icon: <Calendar size={20} /> },
+      { href: '/bookings', label: 'การจอง', icon: <BookOpen size={20} /> },
+      { href: '/rooms', label: 'ห้องพัก', icon: <BedDouble size={20} /> },
+      { href: '/customers', label: 'ลูกค้า', icon: <Users size={20} /> },
     ],
   },
   {
     title: 'ปฏิบัติการ',
     items: [
-      { href: '/new/housekeeping', label: 'แม่บ้าน', icon: <Sparkles size={20} /> },
-      { href: '/new/maintenance', label: 'แจ้งซ่อม', icon: <Wrench size={20} /> },
-      { href: '/new/inventory', label: 'คลังสินค้า', icon: <Package size={20} /> },
+      { href: '/housekeeping', label: 'แม่บ้าน', icon: <Sparkles size={20} /> },
+      { href: '/maintenance', label: 'แจ้งซ่อม', icon: <Wrench size={20} /> },
+      { href: '/inventory', label: 'คลังสินค้า', icon: <Package size={20} /> },
+      { href: '/card-reader', label: 'อ่านบัตร', icon: <CreditCard size={20} /> },
     ],
   },
   {
     title: 'ธุรกิจ',
     items: [
-      { href: '/new/billing', label: 'ใบแจ้งหนี้', icon: <Receipt size={20} /> },
-      { href: '/new/reports', label: 'รายงาน', icon: <BarChart3 size={20} /> },
+      { href: '/billing', label: 'ใบแจ้งหนี้', icon: <Receipt size={20} /> },
+      { href: '/reports', label: 'รายงาน', icon: <BarChart3 size={20} /> },
     ],
   },
   {
     title: 'ผู้ดูแล',
     items: [
-      { href: '/new/room-types', label: 'ประเภทห้อง', icon: <LayoutGrid size={20} /> },
-      { href: '/new/rates', label: 'ราคา', icon: <DollarSign size={20} /> },
+      { href: '/room-types', label: 'ประเภทห้อง', icon: <LayoutGrid size={20} /> },
+      { href: '/rates', label: 'ราคา', icon: <DollarSign size={20} /> },
+      { href: '/changelog', label: 'ประวัติ', icon: <ScrollText size={20} /> },
     ],
   },
 ]
@@ -94,7 +99,7 @@ export default function Sidebar() {
   }
 
   const isActive = (href: string) => {
-    if (href === '/new') return pathname === '/new'
+    if (href === '/') return pathname === '/'
     return pathname.startsWith(href)
   }
 
@@ -196,16 +201,6 @@ export default function Sidebar() {
 
       {/* Bottom */}
       <div className="border-t border-border p-1 shrink-0">
-        <Link
-          href="/"
-          title={collapsed ? 'Legacy' : undefined}
-          className={`flex items-center gap-2 px-3 py-1.5 text-[13px] text-textMuted hover:bg-headerBar hover:text-text transition-colors ${
-            collapsed ? 'justify-center' : ''
-          }`}
-        >
-          <ArrowLeftRight size={16} className="shrink-0" />
-          {!collapsed && <span>Legacy</span>}
-        </Link>
         <button
           onClick={toggleCollapse}
           className={`flex items-center gap-2 px-3 py-1.5 text-[13px] text-textMuted hover:bg-headerBar hover:text-text transition-colors w-full ${

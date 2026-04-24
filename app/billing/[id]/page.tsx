@@ -133,7 +133,7 @@ export default function InvoiceDetailPage({
       <div className="space-y-6">
         {/* Back Button */}
         <Link
-          href="/new/billing"
+          href="/billing"
           className="inline-flex items-center gap-2 text-gray-500 hover:text-gray-900"
         >
           <ArrowLeft className="w-5 h-5" />
@@ -159,7 +159,7 @@ export default function InvoiceDetailPage({
       <div className="space-y-6">
         {/* Back Button */}
         <Link
-          href="/new/billing"
+          href="/billing"
           className="inline-flex items-center gap-2 text-gray-500 hover:text-gray-900"
         >
           <ArrowLeft className="w-5 h-5" />
@@ -180,7 +180,7 @@ export default function InvoiceDetailPage({
       {/* Header Actions */}
       <div className="flex items-center justify-between no-print">
         <Link
-          href="/new/billing"
+          href="/billing"
           className="inline-flex items-center gap-2 text-gray-500 hover:text-gray-900"
         >
           <ArrowLeft className="w-5 h-5" />
