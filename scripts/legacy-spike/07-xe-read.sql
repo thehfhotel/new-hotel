@@ -7,6 +7,7 @@
 -- pattern with a wildcard, so we use 'xe_hotel_legacy_capture*.xel' to
 -- catch the rolled-over files too.
 
+SET QUOTED_IDENTIFIER ON;
 SET NOCOUNT ON;
 
 WITH events_xml AS (
