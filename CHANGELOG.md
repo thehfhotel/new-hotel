@@ -5,6 +5,87 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.28.0] - 2026-04-25
+
+### Added
+- **Phase 4b — writeback worker** (per `docs/architecture.md` §3.6c, §6, §8).
+  New `hotel-backend/src/writeback/` module + `bin/writeback.rs` binary that
+  drains the `writeback_jobs` outbox into the legacy MSSQL DB.
+  - **9 recipes** in `writeback/recipes/`, each a faithful translation of
+    `docs/legacy-spike/findings.md` §3a–k:
+    - `walkin` (§3a) — 7 INSERTs + 3 UPDATEs across 7 tables for a walk-in
+      check-in. Allocates `Cust_no`, `Cin_no`, `HT_Customers.id`, and
+      `HT_Room_Status.id` under TABLOCKX.
+    - `checkin_to_booking` (§3d) — like walk-in but skips the customer
+      INSERT, sets `Cin_Book_no`, marks the booking `'เข้าพัก'`, and
+      UPDATEs the first existing `HT_Room_Status` row instead of INSERTing
+      it.
+    - `booking_create` (§3b + §3k visibility) — 4 INSERTs (5 if customer
+      new). Sets `book_room_type=2`, `Book_status=1`, midnight
+      `Book_Date_in/out`, `Book_Notify_Day=3`, all-empty optional varchars
+      so the booking is visible in the .NET app's main booking-list view.
+    - `booking_modify` (§3c) — **targeted UPDATEs only**. Deliberately
+      skips the legacy app's destructive DELETE-everything+REINSERT
+      pattern; diffs `HT_Book_Date` rows to drop dates that no longer
+      apply and INSERTs new ones with `WHERE NOT EXISTS` for idempotency.
+    - `booking_cancel` (§3g-bis) — 4 UPDATEs + 1 DELETE. Soft-cancels
+      `HT_Book_H` (`'ยกเลิก'`) and `HT_Book_Ds` (`status=3`); hard-deletes
+      `HT_Book_Date`. Preserves the duplicate `book_status` UPDATE for
+      byte-for-byte parity with the .NET capture.
+    - `checkin_cancel` (§3i) — 7 statements. Allocates `HT_Rooms_Cancel.id`
+      under TABLOCKX. **Subtracts** the cancelled room's price from
+      `HT_CheckIn_H` totals (multi-room safe). Lights off with the
+      cancel-specific note `'ปิดไฟ เนื่องจากยกเลิกห้องพัก'`.
+    - `extend_stay` (§3f) — 5 fixed UPDATEs + N HT_Room_Status INSERTs.
+      Skips the destructive Phase B per spike recommendation.
+    - `checkout` (§3e Phase 2 ONLY) — 5 UPDATEs. **Skips Phase 1** (the
+      destructive DELETE+REINSERT pattern in the legacy app). Uses
+      `'Check-Out'` (hyphen) on `HT_CheckIn_Ds` and `'Check Out'` (space)
+      on `HT_Room_Status` per spike §4c verbatim.
+    - `payment` (§3h) — 4 statements: payment + totals refresh + receipt
+      header + receipt line. Cash → `Cin_Pay_Cash`; credit/transfer →
+      `Cin_Pay_Credit`. Receipt label `'ค่าห้องพัก [{room_no}]'`,
+      service code `SEV-001`, unit `'คืน'`, no-VAT zeros.
+    - `mark_clean` (§3j) — 2 statements + a prior-occupant lookup query.
+      Filters by `HT_Rooms.id` (not `room_no`!) per spike §4e. Looks up
+      the **most recent non-cancelled** occupant of the room for the
+      `HT_Housewife.h_cin/h_cin_name` audit fields.
+  - **Race-safe MAX+1 ID allocation** via `WITH (TABLOCKX, HOLDLOCK)`
+    (verified live in spike §6 Test 2 — receptionist's UI hitched 10s
+    but never erred). Helpers in `writeback/allocate.rs` cover all 10
+    legacy ID counters (`Cust_no`, `Book_ID`, `Cin_no`, `Pay_No`,
+    `Receipt_no`, `HT_Book_Date.id`, `HT_Room_Status.id`,
+    `HT_Rooms_Cancel.id`, `HT_CheckIn_Ds.id`, `HT_Receipt_H.id`).
+  - **Schema fingerprint guard** (`writeback/fingerprint.rs`): on startup
+    hashes live MSSQL `(table, ord, column, type)` for the 10
+    fingerprinted tables and refuses to start if it differs from the
+    captured baseline. Fingerprint:
+    `5f2c17bc402edfc80e04fecb9dd741e26ed4cf1036f16855626051cd276376d2`.
+  - **Worker loop** (`bin/writeback.rs`): `LISTEN writeback_channel` +
+    30-sec poll fallback, atomic `UPDATE … RETURNING` claim with
+    `FOR UPDATE SKIP LOCKED` so multiple worker replicas can run safely.
+    SIGTERM drains in-flight, then exits. Toggle via `WRITEBACK_ENABLED`
+    env var (per architecture §7).
+  - **Date format helpers** (`writeback/format.rs`): `M/D/YYYY h:mm:ss tt`
+    matching .NET's `CultureInfo.InvariantCulture` per spike §4b.
+    `format_legacy_datetime`, `format_legacy_date`, `date_to_ole_serial`
+    (for `room_date_oa`), `sql_quote` (with `''`-doubling), `midnight_of`
+    for §3k visibility.
+  - **Constants** (`writeback/constants.rs`): mixed Thai/English literals
+    copied verbatim per spike §4c — `'เข้าพัก'`, `'ยกเลิก'`, `'Check-Out'`
+    (hyphen), `'Check Out'` (space), power-log note templates, etc.
+  - **docker-compose**: new `writeback` service under `profiles: [legacy]`
+    so State C deploys (`docker compose up`) skip it. Activate with
+    `docker compose --profile legacy up -d`.
+  - **90 unit tests** (`cargo test --lib writeback::`) cover SQL output,
+    section-3k visibility, mixed Thai/English literal preservation, and
+    skipping the destructive Phase 1/B patterns.
+
+### Changed
+- `hotel-backend/Cargo.toml` version bumped 2.8.3 → 2.9.0 (new feature).
+- Added `signal` feature to tokio dependency for SIGTERM handling in the
+  writeback worker.
+
 ## [2.27.3] - 2026-04-25
 
 ### Fixed
