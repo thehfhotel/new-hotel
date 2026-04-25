@@ -178,6 +178,16 @@ pub async fn create_payment(
     let pay_id = match parse_payment_method(&method) {
         Some(domain_method) => {
             let receipt = build_receipt_header(&state, cin_id).await?;
+            // Per-room apportionment: spike §3h capture line 3 fires
+            // `UPDATE HT_CheckIn_Ds SET Cin_Room_Pay_Total=<amt>, Cin_note=''`
+            // just before inserting the payment. The route currently doesn't
+            // know which room a payment maps to (single-room check-ins are
+            // unambiguous; multi-room would need an explicit body field).
+            // Until that wire-contract change lands, leave `None` so the
+            // recipe skips the per-room UPDATE — header totals still settle.
+            // TODO: thread `room_id` through `CreatePaymentRequest` for
+            // multi-room support.
+            let checkin_ds_id: Option<i32> = None;
             let outcome = state
                 .payments_service
                 .record_payment(RecordPaymentCommand {
@@ -188,6 +198,7 @@ pub async fn create_payment(
                     notes: body.notes.clone(),
                     created_by: body.created_by.clone(),
                     receipt,
+                    checkin_ds_id,
                     // TODO: wire user_id from auth middleware
                     source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
                 })

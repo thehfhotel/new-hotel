@@ -51,7 +51,7 @@ impl DateRange {
 ///
 /// Range: ±9.2 × 10^16 satang ≈ ±9.2 × 10^14 baht — comfortably above any
 /// realistic hotel transaction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Money(pub i64);
 
