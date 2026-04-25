@@ -1,9 +1,0 @@
-node_modules/
-dist/
-out/
-*.log
-.DS_Store
-Thumbs.db
-
-# Generated during build from icon.svg
-icon.png

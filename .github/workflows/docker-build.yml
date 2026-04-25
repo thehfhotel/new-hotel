@@ -111,6 +111,12 @@ jobs:
         with:
           toolchain: "1.89"
 
+      # hotel-backend/.cargo/config.toml pins `-fuse-ld=mold` for x86_64-linux
+      # so local + Docker builds link fast. The GitHub runner ships neither
+      # mold nor clang by default — install both so `cargo test` can link.
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mold clang
+
       # sccache wraps every rustc invocation and caches its output keyed on the
       # exact crate inputs. It complements Swatinem/rust-cache (which caches
       # the whole target/ dir). Treated as opportunistic: if the action fails

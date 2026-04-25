@@ -1,6 +1,6 @@
 {
   "name": "new-hotel",
-  "version": "2.27.0",
+  "version": "2.27.1",
   "private": true,
   "scripts": {
     "dev": "next dev -p 3003",
@@ -16,7 +16,7 @@
   "dependencies": {
     "date-fns": "^3.6.0",
     "lucide-react": "^0.469.0",
-    "next": "16.1.6",
+    "next": "16.2.4",
     "react": "^19.1.0",
     "react-datepicker": "^9.1.0",
     "react-dom": "^19.1.0",
@@ -33,7 +33,7 @@
     "autoprefixer": "^10.4.20",
     "dotenv": "^17.2.3",
     "eslint": "^9.39.2",
-    "eslint-config-next": "16.1.6",
+    "eslint-config-next": "16.2.4",
     "husky": "^9.1.7",
     "jest": "^30.2.0",
     "jest-environment-jsdom": "^30.2.0",
@@ -44,7 +44,19 @@
   },
   "pnpm": {
     "overrides": {
-      "glob": ">=10.5.0"
+      "glob": ">=10.5.0",
+      "ajv@<6.14.0": "6.14.0",
+      "brace-expansion@<1.1.13": "1.1.13",
+      "brace-expansion@>=2.0.0 <2.0.3": "2.0.3",
+      "flatted": "^3.4.2",
+      "handlebars": "^4.7.9",
+      "lodash": "^4.18.0",
+      "minimatch@<3.1.4": "3.1.4",
+      "minimatch@>=9.0.0 <9.0.7": "9.0.7",
+      "minimatch@>=10.0.0 <10.2.3": "10.2.3",
+      "picomatch@<2.3.2": "2.3.2",
+      "picomatch@>=4.0.0 <4.0.4": "4.0.4",
+      "postcss": "^8.5.10"
     }
   }
 }

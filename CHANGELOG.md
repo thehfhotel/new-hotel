@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.27.1] - 2026-04-25
+
+### Security
+- **Bumped Next.js 16.1.6 → 16.2.4** (and `eslint-config-next` to match) — closes
+  6 advisories: DoS via Server Components, request smuggling in rewrites,
+  unbounded `next/image` cache, unbounded postponed-resume buffering, null-origin
+  Server Actions CSRF bypass, null-origin dev HMR websocket CSRF bypass.
+- **Forced patched transitive deps via pnpm overrides**: `lodash >=4.18.0`,
+  `handlebars >=4.7.9`, `postcss >=8.5.10`, `flatted >=3.4.2`, `ajv >=6.14.0`,
+  scoped `brace-expansion`/`minimatch`/`picomatch` to patched versions per
+  affected major. Resolves ~19 transitive advisories (lodash code-injection,
+  handlebars JS-injection, postcss XSS, flatted prototype-pollution, ajv ReDoS,
+  brace-expansion DoS, minimatch ReDoS, picomatch ReDoS).
+- **Backend `cargo update`**: `rustls-webpki 0.103.9 → 0.103.13` (CRL-panic
+  DoS + CRL-distribution-point logic), `rand 0.8.5 → 0.8.6` in both
+  `hotel-backend` and `thai-id-middleware-tauri`.
+- 3 low-severity Rust advisories remain transitively pinned by `tiberius@0.12.3`
+  (latest), and will resolve when MSSQL is decommissioned per
+  `docs/architecture.md`: `rand@0.7.3` (via `winauth`) and two
+  `rustls-webpki@0.101.7` name-constraint issues (via `rustls@0.21`).
+
+### Fixed
+- **CI `test-backend` job**: install `mold` + `clang` on the Ubuntu runner so
+  `hotel-backend/.cargo/config.toml`'s `-fuse-ld=mold` link flag resolves.
+  Previously `cargo test` failed with `invalid linker name in argument
+  '-fuse-ld=mold'` because the Dockerfile installs mold but the bare-runner
+  backend test job did not.
+
+### Removed
+- **Legacy `thai-id-middleware/` (Electron) sub-project** — superseded by
+  `thai-id-middleware-tauri/` (the only target of `.github/workflows/middleware-build.yml`,
+  per its own release notes "~10MB Tauri vs ~150MB Electron"). Deletion drops
+  ~50 Dependabot advisories tied to the bundled Electron + npm transitive tree
+  (electron CVEs, xmldom XML injection, lodash, minimatch, picomatch, tar,
+  path-to-regexp, brace-expansion, ajv, electron-builder).
+
 ## [2.27.0] - 2026-04-25
 
 ### Added
@@ -64,7 +100,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **`hotel-backend/src/lib.rs`** — declares `pub mod service;` so the service layer is reachable from the binary, integration tests, and Wave 4 routes.
-
 ## [2.25.0] - 2026-04-25
 
 ### Added
