@@ -112,15 +112,16 @@ pub fn build_statements(inputs: &PaymentInputs<'_>) -> Vec<String> {
         ));
     }
 
-    // 3. HT_CheckIn_Pay — payment row. Now includes [Cin_Pay_Ds] (column 4)
-    //    per spike §3h `invoice/writes.txt:4`. Empty-string default mirrors
-    //    the .NET capture (no extra description text).
+    // 3. HT_CheckIn_Pay — payment row. Includes [Cin_Pay_Ds_PriceOne]
+    //    (column 13 per schema dump 2026-04-26) — per-unit price, equal to
+    //    {amount} when qty=1. The audit found we were dropping this column;
+    //    legacy stores it for receipt unit-price reports.
     statements.push(format!(
         "INSERT INTO [HT_CheckIn_Pay]([Cin_No],[Cin_Pay_Ds],[Cin_Pay_Cash],[Cin_Pay_Credit],\
          [Cin_Pay_Date],[Cin_Pay_Ds_Name],[Cin_Pay_Ds_Price],[Cin_Pay_Ds_unit],[Pay_No],\
-         [Cin_Cust_no],[Cin_Pay_Ds_ID],[Cin_Pay_Ds_Num],[Cin_Pay_Ds_PriceTotal])\
+         [Cin_Cust_no],[Cin_Pay_Ds_ID],[Cin_Pay_Ds_Num],[Cin_Pay_Ds_PriceOne],[Cin_Pay_Ds_PriceTotal])\
          VALUES({cin_no_q},'',{cash},{credit},{now_q},{receipt_label_q},{amount},1,{pay_no_q},\
-         {cust_no_q},{service_code_q},1,{amount})"
+         {cust_no_q},{service_code_q},1,{amount},{amount})"
     ));
 
     // 4. HT_CheckIn_H — accumulate Pay, recompute Balance from Net (HIGH-3).

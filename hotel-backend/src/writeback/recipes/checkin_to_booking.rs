@@ -36,7 +36,9 @@
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 
 use crate::outbox::intent::CreateCheckInPayload;
-use crate::writeback::allocate::{allocate_cin_no, allocate_room_status_id, LegacyConn};
+use crate::writeback::allocate::{
+    allocate_checkin_ds_id, allocate_cin_no, allocate_room_status_id, LegacyConn,
+};
 use crate::writeback::constants::{
     power_log_note_check_in, BOOK_STATUS_OCCUPYING, CIN_ROOM_STATUS_OCCUPYING, DEFAULT_OPERATOR,
     ROOM_STATUS_OCCUPYING,
@@ -68,6 +70,9 @@ pub struct CheckInToBookingInputs<'a> {
     /// First `HT_Room_Status.id` to use for new-night INSERTs.
     pub room_status_id_base: i32,
     pub nights_calendar: Vec<NaiveDate>,
+    /// Pre-allocated `HT_CheckIn_Ds.id`. NOT IDENTITY (schema dump
+    /// 2026-04-26) — caller must allocate via TABLOCKX MAX+1.
+    pub checkin_ds_id: i32,
 }
 
 /// Build statements for a check-in linked to a booking. PURE — no I/O.
@@ -120,13 +125,14 @@ pub fn build_statements(inputs: &CheckInToBookingInputs<'_>) -> Vec<String> {
          VALUES({room_no_q},GETDATE(),{by_q},'',{power_note_q},'')"
     ));
 
-    // 3. HT_CheckIn_Ds — id is IDENTITY, omit
+    // 3. HT_CheckIn_Ds — `id` is NOT IDENTITY (schema dump 2026-04-26 confirmed).
+    let ds_id = inputs.checkin_ds_id;
     statements.push(format!(
-        "INSERT INTO [HT_CheckIn_Ds]([Cin_No],[Cin_Room_No],[Cin_Room_Type],[Cin_Room_In],\
+        "INSERT INTO [HT_CheckIn_Ds]([id],[Cin_No],[Cin_Room_No],[Cin_Room_Type],[Cin_Room_In],\
          [Cin_Room_Out],[Cin_Room_Status],[Cin_Room_Dep],[Cin_Room_Price],[Cin_Room_Night],\
          [Cin_Room_PriceToTal],[Cin_Room_Pay_Before],[Cin_Room_Pay_Total],[Cin_note],\
          [Cin_Dep_Status],[Dep_by],[Cin_cupon])\
-         VALUES({cin_no_q},{room_no_q},{room_type_q},{stay_start_q},{stay_end_q},\
+         VALUES({ds_id},{cin_no_q},{room_no_q},{room_type_q},{stay_start_q},{stay_end_q},\
          {occupying_q},0,{price},{nights},{total},0,0,'','','',0)"
     ));
 
@@ -211,6 +217,8 @@ pub async fn execute(
     })?;
     let cin_no = allocate_cin_no(conn).await?;
     let room_status_id_base = allocate_room_status_id(conn).await?;
+    // HT_CheckIn_Ds.id is NOT IDENTITY (schema dump 2026-04-26).
+    let checkin_ds_id = allocate_checkin_ds_id(conn).await?;
 
     let nights_calendar = enumerate_calendar_nights(payload.stay.start, payload.stay.end);
 
@@ -232,11 +240,10 @@ pub async fn execute(
         price_total_baht: (payload.price_total.as_satang() as f64) / 100.0,
         room_status_id_base,
         nights_calendar,
+        checkin_ds_id,
     };
     let statements = build_statements(&inputs);
-    let checkin_ds_id =
-        super::execute_capturing_identity_at(conn, &statements, "INSERT INTO [HT_CheckIn_Ds]")
-            .await?;
+    super::execute_all(conn, &statements).await?;
 
     let _ = DEFAULT_OPERATOR; // silence unused-import lint
     let mut ids = LegacyIds::new()
@@ -301,6 +308,7 @@ mod tests {
                 NaiveDate::from_ymd_opt(2026, 4, 24).unwrap(),
                 NaiveDate::from_ymd_opt(2026, 4, 25).unwrap(),
             ],
+            checkin_ds_id: 25009,
         }
     }
 
