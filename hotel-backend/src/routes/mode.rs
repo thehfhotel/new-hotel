@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::error::{ApiError, ApiResult};
+use crate::outbox::{EventBus, OutboxRepository};
 use crate::repository::{
-    BookingRepository, CheckInRepository, CustomerRepository, EventLogRepository,
-    InventoryRepository, OutboxRepository, PaymentRepository, PgBookingRepository,
-    PgCheckInRepository, PgCustomerRepository, PgEventLogRepository, PgInventoryRepository,
-    PgOutboxRepository, PgPaymentRepository, PgRoomRepository, RoomRepository,
+    BookingRepository, CheckInRepository, CustomerRepository, InventoryRepository,
+    PaymentRepository, PgBookingRepository, PgCheckInRepository, PgCustomerRepository,
+    PgInventoryRepository, PgPaymentRepository, PgRoomRepository, RoomRepository,
 };
 
 /// System operating mode
@@ -77,10 +77,12 @@ pub struct AppState {
     pub rooms: Arc<dyn RoomRepository>,
     pub payments: Arc<dyn PaymentRepository>,
     pub inventory: Arc<dyn InventoryRepository>,
-    /// Stub today; Agent D ships the real impl in parallel (Phase 1b).
-    pub outbox: Arc<dyn OutboxRepository>,
-    /// Stub today; Agent D ships the real impl in parallel (Phase 1b).
-    pub events: Arc<dyn EventLogRepository>,
+
+    // ----- Outbox + event bus (per architecture.md §3.6c) -----
+    /// Outbox publisher for legacy MSSQL writebacks. Stateless; cheap Arc clone.
+    pub outbox: Arc<OutboxRepository>,
+    /// Domain-event bus (event_log + pg_notify). Stateless; cheap Arc clone.
+    pub events: Arc<EventBus>,
 }
 
 impl AppState {
@@ -92,8 +94,6 @@ impl AppState {
         Arc<dyn RoomRepository>,
         Arc<dyn PaymentRepository>,
         Arc<dyn InventoryRepository>,
-        Arc<dyn OutboxRepository>,
-        Arc<dyn EventLogRepository>,
     ) {
         (
             Arc::new(PgCustomerRepository::new()),
@@ -102,14 +102,12 @@ impl AppState {
             Arc::new(PgRoomRepository::new()),
             Arc::new(PgPaymentRepository::new()),
             Arc::new(PgInventoryRepository::new()),
-            Arc::new(PgOutboxRepository::new()),
-            Arc::new(PgEventLogRepository::new()),
         )
     }
 
     /// Create new AppState with both pools and default legacy mode
     pub fn new(legacy_pool: crate::db::DbPool, new_pool: crate::db::PgPool) -> Self {
-        let (customers, bookings, checkins, rooms, payments, inventory, outbox, events) =
+        let (customers, bookings, checkins, rooms, payments, inventory) =
             Self::default_repositories();
         Self {
             legacy_pool,
@@ -122,14 +120,14 @@ impl AppState {
             rooms,
             payments,
             inventory,
-            outbox,
-            events,
+            outbox: Arc::new(OutboxRepository::new()),
+            events: Arc::new(EventBus::new()),
         }
     }
 
     /// Create new AppState with specified mode
     pub fn with_mode(legacy_pool: crate::db::DbPool, new_pool: crate::db::PgPool, mode: SystemMode) -> Self {
-        let (customers, bookings, checkins, rooms, payments, inventory, outbox, events) =
+        let (customers, bookings, checkins, rooms, payments, inventory) =
             Self::default_repositories();
         Self {
             legacy_pool,
@@ -142,8 +140,8 @@ impl AppState {
             rooms,
             payments,
             inventory,
-            outbox,
-            events,
+            outbox: Arc::new(OutboxRepository::new()),
+            events: Arc::new(EventBus::new()),
         }
     }
 
