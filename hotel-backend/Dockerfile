@@ -1,42 +1,57 @@
 # syntax=docker/dockerfile:1.7
 #
 # Build pipeline:
-#   chef    — base image with mold linker + cargo-chef installed
-#   planner — produces recipe.json describing the dependency graph
-#   builder — cooks deps from the recipe (cached), then compiles the real source
-#   runtime — minimal debian image with just the binary
+#   builder — single stage that compiles all 3 binaries with BuildKit cache
+#             mounts persisted across CI runs via `cache-to: type=gha,mode=max`
+#             on the docker/build-push-action step.
+#   runtime — minimal debian image with just the binaries.
+#
+# ## Caching strategy
+#
+# Three cache mounts persist across builds (the GHA Cache backend stores
+# them between CI runs):
+#
+# - `/usr/local/cargo/registry` — cargo's downloaded crate registry. Saves
+#   the registry-clone time (~5-15s) on every build.
+# - `/usr/local/cargo/git`      — git dependencies (none today, kept for
+#   future-proofing).
+# - `/usr/src/app/target`       — cargo's incremental compile artifacts.
+#   This is the BIG win: unchanged code never recompiles. A source-only
+#   change rebuilds only the affected crate, not the dependency closure.
+#
+# We dropped cargo-chef (was: chef → planner → builder, ~5 layers) — its
+# dep-layer-pinning value is fully subsumed by `--mount=type=cache` on
+# target/, and the simpler Dockerfile is easier to reason about.
+#
+# Cache-mount contents are NOT included in the image layer (the mount is
+# overlaid only during the RUN). That's why the build step `cp`s the
+# binaries out to `/out/` first — the COPY in the runtime stage needs
+# them in a layer-persisted path.
 #
 # mold linker shaves a large chunk off link time vs the default GNU ld.
-# cargo-chef gives us deterministic dependency-only caching that survives any
-# source-file change (the old "dummy main" trick re-cooked deps whenever
-# Cargo.toml's [[bin]] list changed and was fragile around lockfile updates).
 
-FROM rust:1.89-bookworm AS chef
+FROM rust:1.89-bookworm AS builder
 RUN apt-get update \
     && apt-get install -y --no-install-recommends mold clang \
     && rm -rf /var/lib/apt/lists/*
-RUN cargo install cargo-chef --locked
 WORKDIR /usr/src/app
 
-# ---- Plan stage: hash the dependency graph into recipe.json ---------------
-FROM chef AS planner
-COPY . .
-RUN cargo chef prepare --recipe-path recipe.json
-
-# ---- Build stage: cook deps (cached layer) then compile real source -------
-FROM chef AS builder
 ENV SQLX_OFFLINE=true
+# Force cargo to use the sparse registry protocol (faster than git clone of
+# crates.io-index, which sccache/rustup-1.86+ defaults to anyway, but be
+# explicit so future Rust upgrades don't change behavior under us).
+ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 
-# Cook the recipe — this layer is cached as long as recipe.json is unchanged,
-# i.e. as long as Cargo.toml/Cargo.lock haven't moved. Builds all bin targets'
-# dependency closures via cargo-chef's synthesised dummy mains.
-COPY --from=planner /usr/src/app/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
-
-# Now copy the real source and build the actual binary. Deps are already
-# compiled in target/, so this only recompiles first-party code.
 COPY . .
-RUN cargo build --release --bin hotel-backend --bin writeback --bin backfill_rooms
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
+    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
+    --mount=type=cache,target=/usr/src/app/target,id=hotel-backend-target \
+    cargo build --release --bin hotel-backend --bin writeback --bin backfill_rooms \
+    && mkdir -p /out \
+    && cp target/release/hotel-backend /out/ \
+    && cp target/release/writeback /out/ \
+    && cp target/release/backfill_rooms /out/
 
 # ---- Runtime stage --------------------------------------------------------
 FROM debian:bookworm-slim
@@ -48,9 +63,9 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY --from=builder /usr/src/app/target/release/hotel-backend /app/hotel-backend
-COPY --from=builder /usr/src/app/target/release/writeback /app/writeback
-COPY --from=builder /usr/src/app/target/release/backfill_rooms /app/backfill_rooms
+COPY --from=builder /out/hotel-backend /app/hotel-backend
+COPY --from=builder /out/writeback /app/writeback
+COPY --from=builder /out/backfill_rooms /app/backfill_rooms
 
 RUN useradd -m -u 1000 appuser
 USER appuser

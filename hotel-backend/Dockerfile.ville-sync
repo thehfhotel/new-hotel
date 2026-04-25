@@ -1,32 +1,26 @@
 # syntax=docker/dockerfile:1.7
 #
-# ville-sync image — same chef/planner/builder pattern as ./Dockerfile, but the
-# final `cargo build` selects the `ville_sync` bin target. Deps cooked via
-# cargo-chef are shared across all bins in the workspace, so this layer is
-# cache-compatible with the main backend build when both run on the same
-# BuildKit cache.
+# ville-sync image — see ./Dockerfile for the full caching-strategy comment.
+# Same BuildKit cache-mount pattern; sharing the `hotel-backend-target` cache
+# id means a build of either image warms the other (target/ is workspace-wide).
 
-FROM rust:1.89-bookworm AS chef
+FROM rust:1.89-bookworm AS builder
 RUN apt-get update \
     && apt-get install -y --no-install-recommends mold clang \
     && rm -rf /var/lib/apt/lists/*
-RUN cargo install cargo-chef --locked
 WORKDIR /usr/src/app
 
-# ---- Plan stage -----------------------------------------------------------
-FROM chef AS planner
-COPY . .
-RUN cargo chef prepare --recipe-path recipe.json
-
-# ---- Build stage ----------------------------------------------------------
-FROM chef AS builder
 ENV SQLX_OFFLINE=true
-
-COPY --from=planner /usr/src/app/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
+ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 
 COPY . .
-RUN cargo build --release --bin ville_sync
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
+    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
+    --mount=type=cache,target=/usr/src/app/target,id=hotel-backend-target \
+    cargo build --release --bin ville_sync \
+    && mkdir -p /out \
+    && cp target/release/ville_sync /out/
 
 # ---- Runtime stage --------------------------------------------------------
 FROM debian:bookworm-slim
@@ -40,7 +34,7 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY --from=builder /usr/src/app/target/release/ville_sync /app/ville_sync
+COPY --from=builder /out/ville_sync /app/ville_sync
 
 RUN useradd -m -u 1000 appuser
 USER appuser
