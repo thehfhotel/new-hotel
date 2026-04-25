@@ -3,6 +3,7 @@
 import { useState, useEffect } from 'react'
 import Sidebar, { SIDEBAR_WIDTH, SIDEBAR_COLLAPSED_WIDTH } from '@/components/Sidebar'
 import { BranchProvider } from '@/contexts/BranchContext'
+import { useRealtimeEvents } from '@/lib/use-realtime-events'
 
 /**
  * Client shell that renders the sidebar + main content area for every page.
@@ -15,6 +16,11 @@ import { BranchProvider } from '@/contexts/BranchContext'
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const [collapsed, setCollapsed] = useState(false)
   const [mounted, setMounted] = useState(false)
+
+  // Single app-wide SSE subscription to /api/events. Fans DomainEvent variants
+  // out to per-bucket window events that list views listen on. See
+  // lib/use-realtime-events.ts and docs/architecture.md §3.6e.
+  useRealtimeEvents()
 
   useEffect(() => {
     const stored = localStorage.getItem('sidebar-collapsed')
