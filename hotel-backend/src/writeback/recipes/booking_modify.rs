@@ -42,7 +42,7 @@
 //! Our targeted approach achieves the same end state without the data-loss
 //! window the legacy app's no-transaction implementation has (§3c warning).
 
-use crate::outbox::intent::BookingChanges;
+use crate::outbox::intent::{BookingChanges, CustomerResave};
 use crate::writeback::allocate::{allocate_book_date_id, LegacyConn};
 use crate::writeback::dispatcher::LegacyIds;
 use crate::writeback::error::WritebackResult;
@@ -69,6 +69,21 @@ pub struct ModifyBookingInputs<'a> {
 pub fn build_statements(inputs: &ModifyBookingInputs<'_>) -> Vec<String> {
     let book_id_q = sql_quote(inputs.book_id);
     let mut statements = Vec::new();
+
+    // 0a. Customer re-save — spike §3c capture lines 5,16,28. The .NET app
+    //     re-saves the customer record on every booking modify. Without it,
+    //     phone/address edits don't propagate to the customer master.
+    if let Some(resave) = inputs.changes.customer_resave.as_ref() {
+        statements.push(build_customer_resave_update(resave));
+    }
+
+    // 0b. Clear stale HT_Rooms display fields BEFORE the date diff —
+    //     spike §3c capture lines 6,14,17. Otherwise after a date change the
+    //     calendar grid keeps stale "booked" captions.
+    statements.push(format!(
+        "update HT_Rooms set room_book_ds='',Room_Book='',Room_Book_Name='',Room_Book_Time='' \
+         where room_book in (select id from ht_book_date  where Book_no={book_id_q})"
+    ));
 
     // 1. UPDATE HT_Book_H — set only the changed fields. Builds the SET clause
     //    incrementally; if no header changes, we skip the UPDATE entirely.
@@ -172,9 +187,94 @@ pub fn build_statements(inputs: &ModifyBookingInputs<'_>) -> Vec<String> {
                  WHERE Book_no={book_id_q} AND Book_date_ds={date_q})"
             ));
         }
+
+        // Re-write the HT_Rooms display caption with the new dates — spike
+        // §3c capture line 26. Mirrors `booking_create`'s caption format
+        // (commit 0179f81). We need a customer name + room number to render
+        // the caption; if either is missing we skip (the .NET app would also
+        // skip in that case — phone/notes are optional).
+        if let (Some(customer_name), Some(room_no), Some(stay)) = (
+            inputs.changes.new_customer_name.as_deref(),
+            inputs.changes.new_room_no.as_deref(),
+            inputs.changes.new_stay.as_ref(),
+        ) {
+            let stay_in_short = stay.start.format("%d/%m %H:%M").to_string();
+            let stay_end_actual = end_of_stay_at_almost_noon(stay.end);
+            let stay_out_short = stay_end_actual.format("%d/%m %H:%M").to_string();
+            let phone = inputs.changes.new_customer_phone.as_deref().unwrap_or("");
+            let notes = inputs.changes.new_notes.as_deref().unwrap_or("");
+            let room_book_ds_q = sql_quote(&format!(
+                "{name}  {phone} เวลาเข้าพัก : 00:00  1. {room}  ({in_short}) ถึง ({out_short})  หมายเหตุ : {notes} ",
+                name = customer_name,
+                phone = phone,
+                room = room_no,
+                in_short = stay_in_short,
+                out_short = stay_out_short,
+                notes = notes,
+            ));
+            let first_book_date_id = inputs.book_date_id_base;
+            let room_book_q = sql_quote(&first_book_date_id.to_string());
+            let room_book_name_q = sql_quote(customer_name);
+            let room_book_time_q = sql_quote("00:00");
+            let room_no_q = sql_quote(room_no);
+            statements.push(format!(
+                "update HT_Rooms set room_book_ds={room_book_ds_q}, Room_Book={room_book_q},\
+                 Room_Book_Name={room_book_name_q},Room_Book_Time={room_book_time_q} \
+                 where room_no={room_no_q}"
+            ));
+        }
     }
 
     statements
+}
+
+/// Build the `UPDATE [HT_Customers] SET ... WHERE Cust_no=…` statement that
+/// re-saves the customer record on every booking modify. Spike §3c capture
+/// line 28 — the .NET app writes the full address/work field set even when
+/// only the phone changed. We mirror that for parity (NULLs would also be
+/// safe but empty strings match the WinForms-friendly default).
+fn build_customer_resave_update(r: &CustomerResave) -> String {
+    let cust_no_q = sql_quote(&r.legacy_cust_no);
+    format!(
+        "UPDATE [HT_Customers] SET  [Cust_name]={name},[Cust_name2]={name2},\
+         [Cust_Type]={ctype},[Cust_Type_main]={ctype_main},[Cust_Email]={email},\
+         [Cust_Add_no]={add_no},[Cust_Add_moo]={add_moo},[Cust_Add_soi]={add_soi},\
+         [Cust_Add_road]={add_road},[Cust_Add_tambon]={add_tambon},\
+         [Cust_Add_ampore]={add_ampore},[Cust_Add_province]={add_province},\
+         [Cust_Add_code]={add_code},[Cust_Add_tel]={add_tel},[Cust_Add_fax]={add_fax},\
+         [Cust_Work_Name]={work_name},[Cust_Work_no]={work_no},[Cust_Work_moo]={work_moo},\
+         [Cust_Work_soi]={work_soi},[Cust_Work_road]={work_road},\
+         [Cust_Work_tambon]={work_tambon},[Cust_Work_ampore]={work_ampore},\
+         [Cust_Work_province]={work_province},[Cust_Work_code]={work_code},\
+         [Cust_Work_tel]={work_tel},[Cust_Work_fax]={work_fax} \
+         WHERE Cust_no={cust_no_q}",
+        name = sql_quote(&r.cust_name),
+        name2 = sql_quote(&r.cust_name2),
+        ctype = sql_quote(&r.cust_type),
+        ctype_main = sql_quote(&r.cust_type_main),
+        email = sql_quote(&r.cust_email),
+        add_no = sql_quote(&r.cust_add_no),
+        add_moo = sql_quote(&r.cust_add_moo),
+        add_soi = sql_quote(&r.cust_add_soi),
+        add_road = sql_quote(&r.cust_add_road),
+        add_tambon = sql_quote(&r.cust_add_tambon),
+        add_ampore = sql_quote(&r.cust_add_ampore),
+        add_province = sql_quote(&r.cust_add_province),
+        add_code = sql_quote(&r.cust_add_code),
+        add_tel = sql_quote(&r.cust_add_tel),
+        add_fax = sql_quote(&r.cust_add_fax),
+        work_name = sql_quote(&r.cust_work_name),
+        work_no = sql_quote(&r.cust_work_no),
+        work_moo = sql_quote(&r.cust_work_moo),
+        work_soi = sql_quote(&r.cust_work_soi),
+        work_road = sql_quote(&r.cust_work_road),
+        work_tambon = sql_quote(&r.cust_work_tambon),
+        work_ampore = sql_quote(&r.cust_work_ampore),
+        work_province = sql_quote(&r.cust_work_province),
+        work_code = sql_quote(&r.cust_work_code),
+        work_tel = sql_quote(&r.cust_work_tel),
+        work_fax = sql_quote(&r.cust_work_fax),
+    )
 }
 
 fn end_of_stay_at_almost_noon(stay_end: DateTime<Utc>) -> DateTime<Utc> {
@@ -262,6 +362,8 @@ mod tests {
             new_state: None,
             new_notes: None,
             new_customer_phone: None,
+            new_customer_name: None,
+            customer_resave: None,
         };
         let inputs = ModifyBookingInputs {
             book_id: "R014810",
@@ -284,7 +386,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_changes_produces_no_statements() {
+    fn empty_changes_only_emits_room_book_clear() {
+        // Spike §3c capture lines 6/14/17: the .NET app fires the
+        // `update HT_Rooms set room_book_*=''` clear on EVERY save, even
+        // when no fields change. Mirroring keeps the calendar grid in sync.
         let changes = BookingChanges {
             new_stay: None,
             new_room_no: None,
@@ -293,6 +398,8 @@ mod tests {
             new_state: None,
             new_notes: None,
             new_customer_phone: None,
+            new_customer_name: None,
+            customer_resave: None,
         };
         let inputs = ModifyBookingInputs {
             book_id: "R014810",
@@ -300,7 +407,10 @@ mod tests {
             changes: &changes,
             new_nights_calendar: vec![],
         };
-        assert!(build_statements(&inputs).is_empty());
+        let s = build_statements(&inputs);
+        assert_eq!(s.len(), 1);
+        assert!(s[0].starts_with("update HT_Rooms set room_book_ds=''"));
+        assert!(s[0].contains("Book_no='R014810'"));
     }
 
     #[test]
@@ -316,6 +426,8 @@ mod tests {
             new_state: None,
             new_notes: None,
             new_customer_phone: None,
+            new_customer_name: None,
+            customer_resave: None,
         };
         let inputs = ModifyBookingInputs {
             book_id: "R014810",
@@ -342,6 +454,8 @@ mod tests {
             new_state: None,
             new_notes: None,
             new_customer_phone: None,
+            new_customer_name: None,
+            customer_resave: None,
         };
         let inputs = ModifyBookingInputs {
             book_id: "R014810",
@@ -356,7 +470,9 @@ mod tests {
     }
 
     #[test]
-    fn updates_room_phone_only_when_phone_changed() {
+    fn updates_book_h_with_phone_when_phone_changed() {
+        // After fix #7 we always emit the room_book clear (statement 0). The
+        // phone change adds the [Book_Cust_Tel] UPDATE on HT_Book_H.
         let changes = BookingChanges {
             new_stay: None,
             new_room_no: None,
@@ -365,6 +481,8 @@ mod tests {
             new_state: None,
             new_notes: None,
             new_customer_phone: Some("0900000099".into()),
+            new_customer_name: None,
+            customer_resave: None,
         };
         let inputs = ModifyBookingInputs {
             book_id: "R014810",
@@ -373,8 +491,133 @@ mod tests {
             new_nights_calendar: vec![],
         };
         let s = build_statements(&inputs);
-        assert_eq!(s.len(), 1);
-        assert!(s[0].contains("[Book_Cust_Tel]='0900000099'"));
+        // Statement 0: room_book clear; statement 1: HT_Book_H UPDATE.
+        assert_eq!(s.len(), 2);
+        let book_h = s.iter().find(|s| s.contains("[HT_Book_H]")).unwrap();
+        assert!(book_h.contains("[Book_Cust_Tel]='0900000099'"));
+    }
+
+    #[test]
+    fn clear_room_book_display_fires_before_date_diff() {
+        // Spike §3c capture lines 6,14,17 — the clear must come BEFORE any
+        // HT_Book_Date INSERT, otherwise the .NET calendar grid keeps stale
+        // captions briefly even after a date change.
+        let changes = BookingChanges {
+            new_stay: Some(DateRange::new(
+                Utc.with_ymd_and_hms(2026, 4, 25, 12, 0, 0).unwrap(),
+                Utc.with_ymd_and_hms(2026, 4, 26, 12, 0, 0).unwrap(),
+            )),
+            new_room_no: Some("402".into()),
+            new_room_type: None,
+            new_price: None,
+            new_state: None,
+            new_notes: None,
+            new_customer_phone: None,
+            new_customer_name: None,
+            customer_resave: None,
+        };
+        let inputs = ModifyBookingInputs {
+            book_id: "R014810",
+            book_date_id_base: 47300,
+            changes: &changes,
+            new_nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],
+        };
+        let s = build_statements(&inputs);
+        let clear_idx = s
+            .iter()
+            .position(|s| s.starts_with("update HT_Rooms set room_book_ds=''"))
+            .unwrap();
+        let date_insert_idx = s
+            .iter()
+            .position(|s| s.contains("INSERT INTO [HT_Book_Date]"))
+            .unwrap();
+        assert!(clear_idx < date_insert_idx, "clear must precede date INSERT");
+    }
+
+    #[test]
+    fn customer_resave_emits_full_field_update() {
+        // Spike §3c capture line 28 — the .NET app re-saves the full address
+        // + work field set on every booking modify (most blanks).
+        let resave = CustomerResave {
+            legacy_cust_no: "C21610".into(),
+            cust_name: "SPIKE TEST WALKIN".into(),
+            cust_type: "ราคาปกติ".into(),
+            cust_type_main: "บุคคลธรรมดา".into(),
+            cust_add_tel: "0900000088".into(),
+            ..CustomerResave::default()
+        };
+        let changes = BookingChanges {
+            new_stay: None,
+            new_room_no: None,
+            new_room_type: None,
+            new_price: None,
+            new_state: None,
+            new_notes: None,
+            new_customer_phone: None,
+            new_customer_name: None,
+            customer_resave: Some(resave),
+        };
+        let inputs = ModifyBookingInputs {
+            book_id: "R014810",
+            book_date_id_base: 0,
+            changes: &changes,
+            new_nights_calendar: vec![],
+        };
+        let s = build_statements(&inputs);
+        let upd = s
+            .iter()
+            .find(|s| s.starts_with("UPDATE [HT_Customers]"))
+            .expect("customer re-save UPDATE must be emitted when payload set");
+        assert!(upd.contains("[Cust_name]='SPIKE TEST WALKIN'"));
+        assert!(upd.contains("[Cust_Type_main]='บุคคลธรรมดา'"));
+        assert!(upd.contains("[Cust_Add_tel]='0900000088'"));
+        assert!(upd.contains("WHERE Cust_no='C21610'"));
+        // The customer re-save must come BEFORE the room_book clear.
+        let resave_idx = s
+            .iter()
+            .position(|s| s.starts_with("UPDATE [HT_Customers]"))
+            .unwrap();
+        let clear_idx = s
+            .iter()
+            .position(|s| s.starts_with("update HT_Rooms"))
+            .unwrap();
+        assert!(resave_idx < clear_idx);
+    }
+
+    #[test]
+    fn caption_rewrite_uses_new_dates_when_full_context_supplied() {
+        // Spike §3c capture line 26: re-write HT_Rooms display caption with
+        // the new dates after a modify. Mirrors `booking_create`'s format.
+        let stay = DateRange::new(
+            Utc.with_ymd_and_hms(2026, 4, 25, 12, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 4, 26, 12, 0, 0).unwrap(),
+        );
+        let changes = BookingChanges {
+            new_stay: Some(stay),
+            new_room_no: Some("402".into()),
+            new_room_type: None,
+            new_price: None,
+            new_state: None,
+            new_notes: Some("vip".into()),
+            new_customer_phone: Some("0900000088".into()),
+            new_customer_name: Some("SPIKE TEST WALKIN".into()),
+            customer_resave: None,
+        };
+        let inputs = ModifyBookingInputs {
+            book_id: "R014810",
+            book_date_id_base: 47300,
+            changes: &changes,
+            new_nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],
+        };
+        let s = build_statements(&inputs);
+        // Caption rewrite is the LAST statement.
+        let caption = s
+            .iter()
+            .rev()
+            .find(|s| s.contains("Room_Book_Name="))
+            .expect("caption rewrite must be emitted when full context set");
+        assert!(caption.contains("'SPIKE TEST WALKIN'"));
+        assert!(caption.contains("where room_no='402'"));
     }
 
     #[test]
@@ -390,6 +633,8 @@ mod tests {
             new_state: None,
             new_notes: None,
             new_customer_phone: None,
+            new_customer_name: None,
+            customer_resave: None,
         };
         let inputs = ModifyBookingInputs {
             book_id: "R014810",
@@ -419,6 +664,8 @@ mod tests {
             new_state: None,
             new_notes: None,
             new_customer_phone: None,
+            new_customer_name: None,
+            customer_resave: None,
         };
         let inputs = ModifyBookingInputs {
             book_id: "R014810",
