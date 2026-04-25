@@ -21,6 +21,10 @@ path = "src/bin/ville_sync.rs"
 name = "writeback"
 path = "src/bin/writeback.rs"
 
+[[bin]]
+name = "backfill_rooms"
+path = "src/bin/backfill_rooms.rs"
+
 [dependencies]
 # Web framework (matches Tauri middleware)
 axum = "0.7"
