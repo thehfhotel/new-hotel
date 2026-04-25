@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.35.0] - 2026-04-25
+
+### Fixed
+
+- **Writeback worker — final 6 audit findings closed in parallel.**
+  Three worktree-isolated agents tackled the deferred items
+  concurrently; reconciled into 3 commits on top of `ac4ca67`.
+
+  - **HIGH-1: atomic `mark_failed`** (commit `25ccb3c`). Folded the
+    backoff computation into the post-claim `attempts` already on
+    `ClaimedJob`, eliminating the second SELECT (`get_attempts_for_backoff`
+    deleted). Removes the read-modify-write race against the janitor in
+    a multi-worker deploy.
+  - **MED-2: claim-gated `mark_done`/`mark_failed`** (commit `25ccb3c`).
+    `ClaimedJob` carries `claimed_at: DateTime<Utc>`; the UPDATE adds
+    `AND status='in_progress' AND claimed_at = $X`. On 0-row response
+    the worker logs "re-claimed by another worker; discarding result"
+    and skips back-population, preventing two workers from racing to
+    write different `legacy_*` values into the same `ht_*` row.
+  - **MED-4: throttled self-heal Slack alert** (commit `d3307cb`).
+    `salvage_legacy_ids` now records each event into a process-local
+    counter; after 5 events within 5 minutes a single Slack message
+    fires (with the inspection SQL the operator should run), then
+    resets. Pure `should_alert(state, now, threshold, window)` extracted
+    for unit testing.
+  - **LOW-2: resolution Slack on exhausted→done** (commit `d3307cb`).
+    `mark_done`'s UPDATE rewritten as a CTE capturing the prior status
+    atomically with the flip; on `prior_status='exhausted'` posts a
+    `:white_check_mark:` Slack via new `send_resolved_alert`. Operator
+    sees closure, not just alarms.
+  - **LOW-3: listener auto-respawn** (commit `d3307cb`). `run_listener`
+    wrapped in `run_listener_supervised` that loops with 5s backoff
+    after every error; after 10 consecutive failures fires Slack and
+    backs off to 60s. Never gives up — exiting would silently degrade
+    the worker to 30s polling.
+  - **MED-1: `validate_finite` in `booking_modify` + `checkin_cancel`**
+    (this commit). Adds NaN/Infinity guards at the top of `execute()`
+    in both recipes, matching the pattern in `payment.rs` /
+    `extend_stay.rs` / `booking_create.rs`. 4 new unit tests.
+
+  All 118 lib + 15 binary tests pass. Release build clean.
+
+  Operational footprint of the audit work (commits `e6e5e66` →
+  `25ccb3c`, ~10 commits):
+  - 2 CRIT, 4 HIGH, 5 MED, 4 LOW closed.
+  - 3 PG migrations: 014 (legacy_* columns), 015 (writeback_jobs retry
+    state).
+  - Lib tests: 78 → 118 (+40); binary tests: 0 → 15.
+  - Self-heal, panic isolation, atomic claim-gating, exponential
+    backoff, exhausted state, Slack alerts on exhaustion + schema drift
+    + resolution + listener degradation. End-to-end error catching /
+    retry / recovery / reporting now production-ready for the live
+    receptionist test.
+
 ## [2.34.0] - 2026-04-25
 
 ### Fixed
