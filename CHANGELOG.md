@@ -5,25 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.28.1] - 2026-04-25
 
 ### Added
 - **One-shot rooms backfill binary** (`hotel-backend/src/bin/backfill_rooms.rs`).
   Mirrors the 58 rooms in legacy `HT_Rooms` and the 8 room types in
-  `HT_SET_RoomType` into `ht_rooms_new` + `ht_room_types`, **preserving the
-  legacy integer ids** as the PG primary keys so the writeback worker can
-  resolve `room_id → legacy room_no` and so the frontend's room picker
-  (booking creation UI) finally has rows to render.
-  - Idempotent — `INSERT ... ON CONFLICT (room_id) DO UPDATE` lets the
-    binary be re-run after legacy edits without producing duplicates.
-  - Bumps the SERIAL sequences past `MAX(id)` so subsequent UI-created
-    rooms don't collide with preserved legacy ids.
-  - Inverts `Room_Clean` per spike §3i (legacy `'yes'` = needs cleaning).
-  - New `backfill-rooms` service in `docker-compose.yml` under
-    `profiles: [backfill]`. Activate on demand:
-    `docker compose --profile backfill run --rm backfill-rooms`
-  - Dockerfile builds + ships the binary alongside `hotel-backend` and
-    `writeback`.
+  `HT_SET_RoomType` into `ht_rooms_new` + `ht_room_types`, preserving the
+  legacy integer ids as PG primary keys so the writeback worker can resolve
+  `room_id → legacy room_no` and so the frontend's room picker has rows.
+  Idempotent (ON CONFLICT DO UPDATE). Inverts `Room_Clean` per spike §3i.
+  New `backfill-rooms` service in `docker-compose.yml` under
+  `profiles: [backfill]`. Run via `docker compose --profile backfill run --rm backfill-rooms`.
+
+### Fixed
+- **Writeback payload gaps** — bookings synced from the new app to legacy MSSQL
+  appeared in the .NET booking list with empty `Book_Cust_Name`,
+  `Book_Cust_Tel`, `Book_Room_Type` (room number column), and
+  `Book_Room_Price=0`. Same blanks on `HT_CheckIn_Ds.Cin_Room_No` /
+  `Cin_Room_Type` / `Cin_Room_Price` for check-ins, and on the receipt
+  header (`HT_Receipt_H.Receipt_Name` / `Address` / `Tel`) for payments. Root
+  cause: route handlers (`create_booking`, `create_checkin`, `create_payment`)
+  filled the writeback context with empty placeholders — a known gap flagged
+  in [2.28.0]. Fix lookups + forwards customer/room metadata into the
+  writeback intent payload:
+  - `routes::new_bookings::create_booking` — looks up the customer
+    (`ht_customers`) and the first assigned room (`ht_rooms_new`) before
+    constructing `BookingWritebackContext`. Pulls `customer_name`,
+    `customer_phone`, `room_no`, `room_type` (from the joined `ht_room_types`),
+    and per-night price (request override → room weekday default →
+    booking total).
+  - `routes::new_checkins::create_checkin` — same pattern; resolves the
+    customer through the booking for booking-linked check-ins, otherwise
+    uses the request `customer_id`. Populates `room_no` / `room_type` /
+    `price_per_night` (with weekday-default fallback) and
+    `guest_name_for_registry` for the walk-in customer INSERT and the
+    TM.30 primary-guest row.
+  - `routes::new_payments::create_payment` — looks up the check-in's
+    customer to populate the receipt header
+    (`Receipt_Name` / `Address` / `Tel`).
+  - **`outbox::intent::WritebackIntent::RecordPayment`** gained a `receipt:
+    RecordPaymentReceipt` field carrying the receipt-header metadata. New
+    `RecordPaymentReceipt` struct (customer_name + address + tel) lives in
+    `outbox::intent`. Recipe signature
+    `writeback::recipes::payment::execute` updated to consume it.
+  - **`service::payment::RecordPaymentCommand`** gained a matching `receipt`
+    field. The other two contexts (`BookingWritebackContext`,
+    `CheckInWritebackContext`) already had the right shape — only the route
+    helpers needed enrichment.
+  - Lookup failures (deleted customer / deleted room between form submit
+    and route) degrade to empty strings rather than failing the canonical
+    write — preserves the legacy app's tolerance for orphaned FKs and
+    matches the prior behavior for receipts.
 
 ## [2.28.0] - 2026-04-25
 
