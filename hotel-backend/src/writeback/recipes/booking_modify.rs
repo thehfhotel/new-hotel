@@ -352,6 +352,21 @@ pub async fn execute(
     } else {
         None
     };
+
+    // MED-1: reject NaN/Infinity before SQL formatting. Today the price comes
+    // from `Money` (always finite), but `build_statements` also interpolates
+    // `baht * nights` into `[Book_Room_PriceToTal]` — defense-in-depth against
+    // a future code path that introduces a non-Money f64 or an arithmetic
+    // overflow producing infinity.
+    if let Some(price) = &changes.new_price {
+        let room_price_baht = (price.as_satang() as f64) / 100.0;
+        let nights = new_nights.len().max(1) as f64;
+        super::helpers::validate_finite(&[
+            ("room_price_baht", room_price_baht),
+            ("room_price_total_baht", room_price_baht * nights),
+        ])?;
+    }
+
     let inputs = ModifyBookingInputs {
         book_id,
         book_date_id_base,
@@ -778,6 +793,35 @@ mod tests {
             .find(|s| s.contains("INSERT INTO [HT_Book_Date]"))
             .unwrap();
         assert!(insert.contains("WHERE NOT EXISTS"));
+    }
+
+    #[test]
+    fn validate_finite_rejects_nan_room_price_baht() {
+        // MED-1 guard: a non-finite f64 in the price would otherwise interpolate
+        // as the literal string "NaN" / "inf" into SQL and fail the entire
+        // legacy transaction. The execute() guard wraps the same call we
+        // verify here directly — keeping this unit test pure (no MSSQL conn).
+        let result = super::super::helpers::validate_finite(&[
+            ("room_price_baht", f64::NAN),
+            ("room_price_total_baht", 1780.0),
+        ]);
+        let err = result.expect_err("NaN must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("room_price_baht"), "msg: {msg}");
+        assert!(msg.contains("NaN"), "msg: {msg}");
+    }
+
+    #[test]
+    fn validate_finite_rejects_infinity_in_room_price_total() {
+        // MED-1 guard: defends the `baht * nights` interpolation specifically.
+        // Even if `room_price_baht` is finite, the multiplication can overflow
+        // to infinity for extreme inputs.
+        let result = super::super::helpers::validate_finite(&[
+            ("room_price_baht", 950.0),
+            ("room_price_total_baht", f64::INFINITY),
+        ]);
+        let err = result.expect_err("Infinity must be rejected");
+        assert!(err.to_string().contains("room_price_total_baht"));
     }
 
     #[test]

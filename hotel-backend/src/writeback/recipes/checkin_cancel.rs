@@ -128,13 +128,24 @@ pub async fn execute(
     room_price: Money,
     pay_to_subtract: Money,
 ) -> WritebackResult<LegacyIds> {
+    // MED-1: reject NaN/Infinity before SQL formatting. Today these come from
+    // `Money` (always finite), but `build_statements` interpolates them
+    // directly into the `[Total_Price_*]` arithmetic — defense-in-depth
+    // against a future code path that introduces a non-Money f64.
+    let price_to_subtract_baht = (room_price.as_satang() as f64) / 100.0;
+    let pay_to_subtract_baht = (pay_to_subtract.as_satang() as f64) / 100.0;
+    super::helpers::validate_finite(&[
+        ("price_to_subtract_baht", price_to_subtract_baht),
+        ("pay_to_subtract_baht", pay_to_subtract_baht),
+    ])?;
+
     let cancel_id = allocate_rooms_cancel_id(conn).await?;
     let inputs = CancelCheckInInputs {
         cin_no,
         room_no,
         rooms_cancel_id: cancel_id,
-        price_to_subtract: (room_price.as_satang() as f64) / 100.0,
-        pay_to_subtract: (pay_to_subtract.as_satang() as f64) / 100.0,
+        price_to_subtract: price_to_subtract_baht,
+        pay_to_subtract: pay_to_subtract_baht,
         cancel_by: DEFAULT_OPERATOR,
         cancel_note: reason,
     };
@@ -210,6 +221,35 @@ mod tests {
         assert!(totals.contains("[Total_Price_Net]-1500"));
         assert!(totals.contains("[Total_Price_Pay]-250"));
         assert!(totals.contains("([Total_Price_Balance]-1500)+250"));
+    }
+
+    #[test]
+    fn validate_finite_rejects_nan_price_to_subtract() {
+        // MED-1 guard: a non-finite f64 in `price_to_subtract` would otherwise
+        // emit `Total_Price_Room-NaN` and fail the entire legacy transaction.
+        // The execute() guard wraps the same call we verify here directly —
+        // keeping this unit test pure (no MSSQL conn).
+        let result = super::super::helpers::validate_finite(&[
+            ("price_to_subtract_baht", f64::NAN),
+            ("pay_to_subtract_baht", 0.0),
+        ]);
+        let err = result.expect_err("NaN must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("price_to_subtract_baht"), "msg: {msg}");
+        assert!(msg.contains("NaN"), "msg: {msg}");
+    }
+
+    #[test]
+    fn validate_finite_rejects_infinity_in_pay_to_subtract() {
+        // MED-1 guard: `pay_to_subtract` lands in `[Total_Price_Pay]-{pay}` and
+        // `([Total_Price_Balance]-{price})+{pay}` — both would emit invalid
+        // SQL if `pay` is non-finite.
+        let result = super::super::helpers::validate_finite(&[
+            ("price_to_subtract_baht", 890.0),
+            ("pay_to_subtract_baht", f64::NEG_INFINITY),
+        ]);
+        let err = result.expect_err("Infinity must be rejected");
+        assert!(err.to_string().contains("pay_to_subtract_baht"));
     }
 
     #[test]
