@@ -26,6 +26,7 @@ use super::mode::AppState;
 use crate::domain::payment::PaymentMethod;
 use crate::error::{ApiError, ApiResult};
 use crate::outbox::event::EventSource;
+use crate::outbox::intent::RecordPaymentReceipt;
 use crate::repository::payment::{PaymentInsert, PaymentRow};
 use crate::service::RecordPaymentCommand;
 
@@ -176,6 +177,7 @@ pub async fn create_payment(
 
     let pay_id = match parse_payment_method(&method) {
         Some(domain_method) => {
+            let receipt = build_receipt_header(&state, cin_id).await?;
             let outcome = state
                 .payments_service
                 .record_payment(RecordPaymentCommand {
@@ -185,6 +187,7 @@ pub async fn create_payment(
                     reference: body.reference.clone(),
                     notes: body.notes.clone(),
                     created_by: body.created_by.clone(),
+                    receipt,
                     // TODO: wire user_id from auth middleware
                     source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
                 })
@@ -238,6 +241,45 @@ fn parse_payment_method(method: &str) -> Option<PaymentMethod> {
         "credit" => Some(PaymentMethod::Credit),
         "transfer" => Some(PaymentMethod::Transfer),
         _ => None,
+    }
+}
+
+/// Look up the customer attached to this check-in and assemble the receipt
+/// header (`HT_Receipt_H.Receipt_Name` / `Address` / `Tel`).
+///
+/// Returns an all-empty header on lookup failure rather than erroring — a
+/// missing customer name is a UX nit on the printed receipt; failing the
+/// payment over it would be a regression. The legacy schema also rejects
+/// `NULL` in these columns, so empty strings preserve compatibility.
+async fn build_receipt_header(
+    state: &AppState,
+    cin_id: i32,
+) -> ApiResult<RecordPaymentReceipt> {
+    let Some(check_in) = state.checkins.get(&state.new_pool, cin_id).await? else {
+        return Ok(RecordPaymentReceipt::default());
+    };
+    let Some(customer) = state
+        .customers
+        .get(&state.new_pool, check_in.cin_cust_id)
+        .await?
+    else {
+        return Ok(RecordPaymentReceipt::default());
+    };
+
+    Ok(RecordPaymentReceipt {
+        customer_name: full_customer_name(&customer.cust_firstname, customer.cust_lastname.as_deref()),
+        customer_address: customer.cust_address.unwrap_or_default(),
+        customer_tel: customer.cust_phone.unwrap_or_default(),
+    })
+}
+
+/// Join `cust_firstname` + `cust_lastname` with a single space, trimming
+/// trailing whitespace when the last name is missing or empty. Mirrors the
+/// .NET app's `Cust_name` column which stores the combined value.
+fn full_customer_name(first: &str, last: Option<&str>) -> String {
+    match last {
+        Some(last) if !last.is_empty() => format!("{} {}", first, last),
+        _ => first.to_string(),
     }
 }
 

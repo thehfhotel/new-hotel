@@ -74,6 +74,12 @@ pub enum WritebackIntent {
         check_in_id: Uuid,
         amount: Money,
         method: PaymentMethod,
+        /// Customer + room metadata for the receipt header (`HT_Receipt_H`).
+        /// Populated by the route from `ht_customers` + `ht_rooms_new` so the
+        /// recipe doesn't have to re-query MSSQL/PG. Defaulted to empty
+        /// strings if the route lookup fails (preserves the prior behavior
+        /// of issuing a no-detail receipt rather than failing the payment).
+        receipt: RecordPaymentReceipt,
     },
 
     /// Spike §3j — `UPDATE HT_Rooms` (by `id`, not `room_no`!) +
@@ -168,6 +174,19 @@ impl WritebackIntent {
             WritebackIntent::MarkRoomClean { room_id, .. } => *room_id,
         }
     }
+}
+
+/// Receipt-header fields carried by [`WritebackIntent::RecordPayment`].
+///
+/// The `payment` recipe (spike §3h) copies these straight into `HT_Receipt_H`:
+/// `Receipt_Name`, `Receipt_Address`, `Receipt_Tel`. Empty strings are
+/// preferred over `NULL` per the legacy schema (NULL crashes WinForms
+/// downstream — see the same convention in `booking_create` recipe).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RecordPaymentReceipt {
+    pub customer_name: String,
+    pub customer_address: String,
+    pub customer_tel: String,
 }
 
 /// Diff payload for [`WritebackIntent::ModifyBooking`].
