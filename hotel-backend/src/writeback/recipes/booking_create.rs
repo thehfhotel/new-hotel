@@ -159,13 +159,24 @@ pub fn build_statements(inputs: &CreateBookingInputs<'_>) -> Vec<String> {
         status = BOOK_DS_STATUS_ACTIVE,
     ));
 
-    // 4..N. HT_Book_Date — one row per calendar night
+    // 4..N. HT_Book_Date — one row per calendar night, immediately followed
+    // by `SET Book_ok = Book_ok + 1` per spike capture
+    // booking-checkin/writes.txt:27. Without that increment the booking
+    // remains in "draft" state in the .NET app's calendar grid view (the
+    // booking-list view ignores Book_ok and shows it regardless — which is
+    // why the 2026-04-25 incident showed bookings missing only from the
+    // calendar). Book_ok defaults to 0 on INSERT; the legacy app's pattern
+    // is `INSERT(... 0 ...); UPDATE Book_ok = Book_ok + 1`. We mirror it
+    // exactly.
     for (i, day) in inputs.nights_calendar.iter().enumerate() {
         let id = inputs.book_date_id_base + i as i32;
         let date_q = sql_quote(&format_legacy_date(*day));
         statements.push(format!(
             "INSERT INTO [HT_Book_Date]([id],[Book_no],[Book_type],[Book_date_ds],[Book_Num],\
              [Book_USE])VALUES({id},{book_id_q},{room_no_q},{date_q},1,0)"
+        ));
+        statements.push(format!(
+            "update HT_Book_Date set Book_ok=Book_ok+1 where id={id}"
         ));
     }
 
@@ -406,11 +417,58 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 4, 27).unwrap(),
         ];
         let statements = build_statements(&inputs);
-        let date_inserts: Vec<&String> = statements.iter().filter(|s| s.contains("HT_Book_Date")).collect();
+        let date_inserts: Vec<&String> = statements
+            .iter()
+            .filter(|s| s.starts_with("INSERT INTO [HT_Book_Date]"))
+            .collect();
         assert_eq!(date_inserts.len(), 3);
         assert!(date_inserts[0].contains("47285"));
         assert!(date_inserts[1].contains("47286"));
         assert!(date_inserts[2].contains("47287"));
+    }
+
+    /// Spike capture booking-checkin/writes.txt:27 — every HT_Book_Date
+    /// INSERT must be followed by `Book_ok = Book_ok + 1` so the booking
+    /// shows up in the .NET app's calendar grid view (not just the
+    /// booking-list view). Regression test for the 2026-04-25 incident
+    /// where bookings written via our app's writeback didn't appear in the
+    /// 3rd party room view.
+    #[test]
+    fn book_date_inserts_each_followed_by_book_ok_increment() {
+        let mut inputs = sample_inputs();
+        inputs.nights_calendar = vec![
+            NaiveDate::from_ymd_opt(2026, 4, 25).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 4, 26).unwrap(),
+        ];
+        let statements = build_statements(&inputs);
+        let book_ok_updates: Vec<&String> = statements
+            .iter()
+            .filter(|s| s.contains("set Book_ok=Book_ok+1"))
+            .collect();
+        assert_eq!(book_ok_updates.len(), 2, "one Book_ok bump per night");
+        assert!(book_ok_updates[0].contains("where id=47285"));
+        assert!(book_ok_updates[1].contains("where id=47286"));
+
+        // Each Book_ok update must come immediately after its HT_Book_Date
+        // INSERT — the legacy app's pattern. A re-ordered emission could
+        // race a concurrent reader between INSERT and bump and briefly hide
+        // the booking.
+        let mut last_insert_id: Option<i32> = None;
+        for s in &statements {
+            if let Some(stripped) = s
+                .strip_prefix("INSERT INTO [HT_Book_Date]([id],[Book_no],[Book_type],[Book_date_ds],[Book_Num],[Book_USE])VALUES(")
+            {
+                let id_str = stripped.split(',').next().unwrap();
+                last_insert_id = Some(id_str.parse().unwrap());
+            } else if let Some(rest) = s.strip_prefix("update HT_Book_Date set Book_ok=Book_ok+1 where id=") {
+                let id: i32 = rest.parse().expect("id is integer");
+                assert_eq!(
+                    last_insert_id,
+                    Some(id),
+                    "Book_ok bump for id={id} must immediately follow its INSERT"
+                );
+            }
+        }
     }
 
     #[test]
