@@ -317,5 +317,8 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route("/api/new/maintenance/requests/:id/status", put(routes::new_maintenance::update_request_status))
         // Sync status
         .route("/api/new/sync/status", get(routes::new_sync::get_sync_status))
+        // Real-time domain-event stream (Phase 4a per architecture.md §3.6e).
+        // Long-lived SSE connection; one PgListener per client.
+        .route("/api/events", get(routes::events::stream))
         .with_state(app_state)
 }
