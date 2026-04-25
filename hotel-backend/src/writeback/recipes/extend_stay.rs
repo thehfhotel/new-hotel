@@ -42,8 +42,9 @@
 //! - `Cin_Room_Out` is the canonical departure time the user picked. Format
 //!   matches the legacy app's `12:00:00 PM` convention.
 
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Days, NaiveDate, Utc};
 
+use crate::domain::shared::Money;
 use crate::writeback::allocate::{allocate_room_status_id, LegacyConn};
 use crate::writeback::constants::{CIN_ROOM_STATUS_OCCUPYING, ROOM_STATUS_OCCUPYING};
 use crate::writeback::dispatcher::LegacyIds;
@@ -79,9 +80,21 @@ pub struct ExtendStayInputs<'a> {
     /// First `HT_Room_Status.id` to use. Recipe assigns
     /// `room_status_id_base + i` for the i-th night.
     pub room_status_id_base: i32,
+    /// Random TM.30 batch numbers — spike §3a + §3f capture lines 1-2.
+    /// The .NET app emits two `UPDATE HT_CheckIn_H SET Cin_Work_number=<rand>`
+    /// before every save. Each is a non-sequential i32. The caller generates
+    /// these via `rand::random::<i32>()` so `build_statements` stays pure.
+    /// An empty Vec emits zero touches (useful for tests that focus on the
+    /// downstream statements).
+    pub tm30_touch_ids: Vec<i32>,
 }
 
 /// Build all statements for an extend-stay. PURE — no I/O.
+///
+/// `tm30_touch_ids` injects the two leading TM.30 touches (spike §3a + §3f
+/// `extend/writes.txt:1,2`). Each is a random `i32` per spike §3a — the
+/// caller (`execute()`) generates two via `rand::random()` so this function
+/// stays pure and trivially unit-testable.
 pub fn build_statements(inputs: &ExtendStayInputs<'_>) -> Vec<String> {
     let cin_no_q = sql_quote(inputs.cin_no);
     let room_no_q = sql_quote(inputs.room_no);
@@ -90,39 +103,53 @@ pub fn build_statements(inputs: &ExtendStayInputs<'_>) -> Vec<String> {
     let _ = CIN_ROOM_STATUS_OCCUPYING; // silence the unused-constant warning if any
     let label_q = sql_quote(inputs.guest_label);
 
-    let mut statements = vec![
-        // 1. Temp clear room_use (will be reverted)
-        format!(
-            "update HT_Rooms set room_use='no' where room_no in (select Cin_Room_No from HT_CheckIn_Ds where Cin_no={cin_no_q} and Cin_Room_Status<>'Check-Out')"
-        ),
-        // 2. Wipe all room_status rows for this check-in
-        format!("delete from HT_Room_Status where room_CheckIn_No={cin_no_q}"),
-        // 3. Update HT_CheckIn_H totals
-        format!(
-            "UPDATE [HT_CheckIn_H] SET  [Total_Price_Room]={room_price},\
-             [Total_Price_Product]={product},\
-             [Total_Price_Net]={net},\
-             [Total_Price_Pay]={pay},\
-             [Total_Price_Balance]={balance} \
-             where [Cin_no]={cin_no_q}",
-            room_price = inputs.new_room_price_total,
-            product = inputs.product_total,
-            net = inputs.new_net_total,
-            pay = inputs.pay_total,
-            balance = inputs.new_balance,
-        ),
-        // 4. Update HT_CheckIn_Ds (by id) with new nights + price + departure
-        format!(
-            "update [HT_CheckIn_Ds] SET  [Cin_Room_night]={nights},\
-             [Cin_Room_PriceTotal]={price_total},[Cin_note]='',\
-             [Cin_Room_Out]={new_end_q} where id={ds_id}",
-            nights = inputs.new_nights,
-            price_total = inputs.new_room_price_total,
-            ds_id = inputs.checkin_ds_id,
-        ),
-        // 5. Revert room_use back to 'yes' (parity with legacy capture)
-        format!("update HT_Rooms set room_use='yes' where room_no={room_no_q}"),
-    ];
+    let mut statements: Vec<String> = Vec::new();
+
+    // 0a/0b. TM.30 touches — spike §3a (`Cin_Work_number` is random + async)
+    //        and §3f extend capture lines 1-2: the .NET app fires two such
+    //        UPDATEs at the start of every Save action that touches a
+    //        check-in. Random i32 per touch, supplied by caller.
+    for tm30_id in &inputs.tm30_touch_ids {
+        statements.push(format!(
+            "update HT_CheckIn_H set Cin_Work_number={tm30_id} where Cin_No={cin_no_q}"
+        ));
+    }
+
+    // 1. Temp clear room_use (will be reverted)
+    statements.push(format!(
+        "update HT_Rooms set room_use='no' where room_no in (select Cin_Room_No from HT_CheckIn_Ds where Cin_no={cin_no_q} and Cin_Room_Status<>'Check-Out')"
+    ));
+    // 2. Wipe all room_status rows for this check-in
+    statements.push(format!(
+        "delete from HT_Room_Status where room_CheckIn_No={cin_no_q}"
+    ));
+    // 3. Update HT_CheckIn_H totals
+    statements.push(format!(
+        "UPDATE [HT_CheckIn_H] SET  [Total_Price_Room]={room_price},\
+         [Total_Price_Product]={product},\
+         [Total_Price_Net]={net},\
+         [Total_Price_Pay]={pay},\
+         [Total_Price_Balance]={balance} \
+         where [Cin_no]={cin_no_q}",
+        room_price = inputs.new_room_price_total,
+        product = inputs.product_total,
+        net = inputs.new_net_total,
+        pay = inputs.pay_total,
+        balance = inputs.new_balance,
+    ));
+    // 4. Update HT_CheckIn_Ds (by id) with new nights + price + departure
+    statements.push(format!(
+        "update [HT_CheckIn_Ds] SET  [Cin_Room_night]={nights},\
+         [Cin_Room_PriceTotal]={price_total},[Cin_note]='',\
+         [Cin_Room_Out]={new_end_q} where id={ds_id}",
+        nights = inputs.new_nights,
+        price_total = inputs.new_room_price_total,
+        ds_id = inputs.checkin_ds_id,
+    ));
+    // 5. Revert room_use back to 'yes' (parity with legacy capture)
+    statements.push(format!(
+        "update HT_Rooms set room_use='yes' where room_no={room_no_q}"
+    ));
 
     // 6..N. Re-insert HT_Room_Status, one per night
     for (i, day) in inputs.nights.iter().enumerate() {
@@ -140,43 +167,36 @@ pub fn build_statements(inputs: &ExtendStayInputs<'_>) -> Vec<String> {
 
 /// Execute the extend-stay recipe.
 ///
-/// **Note on input incompleteness:** the current `WritebackIntent::ExtendStay`
-/// payload only carries `{ check_in_id, new_end }`. The full recipe needs
-/// totals, the original `Cin_Room_In` (to enumerate calendar nights), and the
-/// guest label. For now we derive what we can:
-/// - `new_nights` = days between `(now, new_end)` (rough approximation —
-///   service should send the canonical value).
-/// - Other totals default to 0 (PG side has the canonical values).
-/// - Guest label defaults to `''`.
+/// Now consumes the full payload (spike §3f) — `stay_start`, `guest_label`,
+/// and the four totals (`new_room_price_total`, `new_net_total`, `new_pay`,
+/// `new_balance`) come from the [`WritebackIntent::ExtendStay`] variant the
+/// service layer enriches before enqueuing. Calendar nights span the full
+/// `[stay_start, new_end)` range so `HT_Room_Status` rows cover the entire
+/// stay (not just `[today, new_end)` as the prior implementation did).
 ///
-/// TODO: extend `ExtendStayPayload` with the full set (spike §3f) so the
-/// recipe doesn't need defaults.
+/// The two leading TM.30 touches (capture lines 1-2) are generated via
+/// `rand::random::<i32>()` per spike §3a — `Cin_Work_number` is a
+/// non-sequential random i32 the .NET app assigns ~5s after each save.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute(
     conn: &mut LegacyConn<'_>,
     cin_no: &str,
     room_no: &str,
     checkin_ds_id: i32,
+    stay_start: DateTime<Utc>,
     new_end: DateTime<Utc>,
+    guest_label: &str,
+    new_room_price_total: Money,
+    new_net_total: Money,
+    new_pay_total: Money,
+    new_balance_total: Money,
 ) -> WritebackResult<LegacyIds> {
     // Allocate the starting room_status id under TABLOCKX so concurrent
     // writers can't collide.
     let id_base = allocate_room_status_id(conn).await?;
 
-    // Without a payload-supplied stay_start, we approximate the nights as
-    // [today .. new_end). This is the conservative default; the receptionist
-    // sees the right thing as long as service-layer also calls extend.
-    let today_naive = Utc::now().date_naive();
-    let end_naive = new_end.date_naive();
-    let mut nights: Vec<NaiveDate> = Vec::new();
-    let mut day = today_naive;
-    while day < end_naive {
-        nights.push(day);
-        day = day.succ_opt().unwrap_or(day);
-        if nights.len() > 365 {
-            break; // safety cap
-        }
-    }
-    let _ = (Datelike::year(&end_naive),); // silence unused-import lint when no cfg
+    let nights = enumerate_calendar_nights(stay_start, new_end);
+    let _ = (Datelike::year(&new_end.date_naive()),); // silence unused-import lint
 
     let inputs = ExtendStayInputs {
         cin_no,
@@ -184,18 +204,52 @@ pub async fn execute(
         checkin_ds_id,
         new_end,
         new_nights: nights.len() as i32,
-        new_room_price_total: 0.0,
-        new_net_total: 0.0,
-        new_balance: 0.0,
+        new_room_price_total: money_to_baht_f64(new_room_price_total),
+        new_net_total: money_to_baht_f64(new_net_total),
+        new_balance: money_to_baht_f64(new_balance_total),
         product_total: 0.0,
-        pay_total: 0.0,
-        guest_label: "",
+        pay_total: money_to_baht_f64(new_pay_total),
+        guest_label,
         nights,
         room_status_id_base: id_base,
+        // Spike §3a: TM.30 batch numbers are non-sequential random i32
+        // assigned by the .NET app's async post-save job. We mirror two
+        // touches per the extend capture (lines 1-2).
+        tm30_touch_ids: vec![rand::random::<i32>(), rand::random::<i32>()],
     };
     let statements = build_statements(&inputs);
     super::execute_all(conn, &statements).await?;
     Ok(LegacyIds::new().with_cin_no(cin_no.to_string()))
+}
+
+/// Enumerate calendar nights in `[stay_start, new_end)` — one
+/// `HT_Room_Status` row per night. Capped at 365 nights as a safety net.
+fn enumerate_calendar_nights(
+    stay_start: DateTime<Utc>,
+    new_end: DateTime<Utc>,
+) -> Vec<NaiveDate> {
+    let start = stay_start.date_naive();
+    let end = new_end.date_naive();
+    let mut nights = Vec::new();
+    let mut day = start;
+    while day < end {
+        nights.push(day);
+        day = match day.checked_add_days(Days::new(1)) {
+            Some(d) => d,
+            None => break,
+        };
+        if nights.len() > 365 {
+            break;
+        }
+    }
+    if nights.is_empty() {
+        nights.push(start);
+    }
+    nights
+}
+
+fn money_to_baht_f64(m: Money) -> f64 {
+    (m.as_satang() as f64) / 100.0
 }
 
 #[cfg(test)]
@@ -223,6 +277,7 @@ mod tests {
                 NaiveDate::from_ymd_opt(2026, 4, 25).unwrap(),
             ],
             room_status_id_base: 50235,
+            tm30_touch_ids: vec![],
         };
         let statements = build_statements(&inputs);
         // 5 fixed + 2 night rows
@@ -259,6 +314,51 @@ mod tests {
     }
 
     #[test]
+    fn tm30_touches_lead_when_provided() {
+        // Spike §3f capture lines 1-2: two leading TM.30 UPDATEs before any
+        // other statement.
+        let inputs = ExtendStayInputs {
+            cin_no: "CH26-005230",
+            room_no: "508",
+            checkin_ds_id: 25009,
+            new_end: Utc.with_ymd_and_hms(2026, 4, 26, 12, 0, 0).unwrap(),
+            new_nights: 2,
+            new_room_price_total: 1780.0,
+            new_net_total: 1780.0,
+            new_balance: 1780.0,
+            product_total: 0.0,
+            pay_total: 0.0,
+            guest_label: "SPIKE TEST WALKIN 3",
+            nights: vec![],
+            room_status_id_base: 50235,
+            tm30_touch_ids: vec![539215, 539216],
+        };
+        let statements = build_statements(&inputs);
+        // First two statements must be TM.30 touches in order.
+        assert!(statements[0].contains("Cin_Work_number=539215"));
+        assert!(statements[0].contains("Cin_No='CH26-005230'"));
+        assert!(statements[1].contains("Cin_Work_number=539216"));
+        assert!(statements[1].contains("Cin_No='CH26-005230'"));
+    }
+
+    #[test]
+    fn enumerate_calendar_nights_covers_full_extended_range() {
+        // Stay started Apr 24, extend to Apr 27 → 3 nights (24, 25, 26).
+        let nights = enumerate_calendar_nights(
+            Utc.with_ymd_and_hms(2026, 4, 24, 12, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 0).unwrap(),
+        );
+        assert_eq!(
+            nights,
+            vec![
+                NaiveDate::from_ymd_opt(2026, 4, 24).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 4, 25).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 4, 26).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
     fn no_destructive_phase_b_in_emitted_statements() {
         // Spike §3f explicitly says skip Phase B (delete+reinsert HT_CheckIn_*).
         // Verify our recipe doesn't emit any DELETE on HT_CheckIn_*.
@@ -276,6 +376,7 @@ mod tests {
             guest_label: "",
             nights: vec![],
             room_status_id_base: 50235,
+            tm30_touch_ids: vec![],
         };
         let statements = build_statements(&inputs);
         for s in &statements {

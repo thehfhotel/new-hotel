@@ -51,16 +51,51 @@ pub enum WritebackIntent {
 
     /// Spike §3i — clean targeted DELETEs + audit row in `HT_Rooms_Cancel`.
     /// Subtracts this room's price from `HT_CheckIn_H` totals (multi-room safe).
+    ///
+    /// `room_price` is the cancelled room's `Cin_Room_Price` (in baht satang) —
+    /// the recipe subtracts it from `HT_CheckIn_H.Total_Price_Room` /
+    /// `Total_Price_Net` / `Total_Price_Balance`. `pay_to_subtract` is the
+    /// portion of `Total_Price_Pay` to subtract — usually 0 unless a deposit
+    /// was paid against only the cancelled room.
     CancelCheckIn {
         check_in_id: Uuid,
         reason: Option<String>,
+        /// `Cin_Room_Price` of the cancelled room, in satang. The recipe
+        /// converts to baht for the legacy `Total_Price_*` UPDATE.
+        #[serde(default)]
+        room_price: Money,
+        /// Pay amount to subtract from `Total_Price_Pay`, in satang. 0 in the
+        /// spike capture; populate only when a per-room deposit was applied.
+        #[serde(default)]
+        pay_to_subtract: Money,
     },
 
     /// Spike §3f — recompute totals + replace `HT_Room_Status` rows for the
     /// changed date range. Targeted; skip the destructive Phase B.
+    ///
+    /// The recipe needs the original `stay_start` (to enumerate the full
+    /// `[stay_start, new_end)` calendar range correctly), the guest label
+    /// (for `HT_Room_Status.room_Details`), and the recomputed totals so it
+    /// doesn't have to re-derive any of them from MSSQL.
     ExtendStay {
         check_in_id: Uuid,
         new_end: DateTime<Utc>,
+        /// Original `Cin_Room_In` from the canonical PG state. Used by the
+        /// recipe to enumerate calendar nights in `[stay_start, new_end)`.
+        #[serde(default = "default_extend_stay_start")]
+        stay_start: DateTime<Utc>,
+        /// Customer-name label for `HT_Room_Status.room_Details`.
+        #[serde(default)]
+        guest_label: String,
+        /// Recomputed totals to push into `HT_CheckIn_H` (in satang).
+        #[serde(default)]
+        new_room_price_total: Money,
+        #[serde(default)]
+        new_net_total: Money,
+        #[serde(default)]
+        new_pay_total: Money,
+        #[serde(default)]
+        new_balance_total: Money,
     },
 
     /// Spike §3e Phase 2 — 5 UPDATEs across `HT_POWER_LOG`, `HT_CheckIn_Ds`,
@@ -80,6 +115,15 @@ pub enum WritebackIntent {
         /// strings if the route lookup fails (preserves the prior behavior
         /// of issuing a no-detail receipt rather than failing the payment).
         receipt: RecordPaymentReceipt,
+        /// Specific `HT_CheckIn_Ds.id` the payment is being apportioned to —
+        /// per spike §3h capture line 3, the legacy app fires
+        /// `UPDATE HT_CheckIn_Ds SET Cin_Room_Pay_Total=<amt>, Cin_note='' WHERE id=<ds_id>`
+        /// just before inserting the `HT_CheckIn_Pay` row. `None` when the
+        /// route hasn't resolved a specific room (multi-room check-ins where
+        /// the payment is allocated across all rooms). When `None` the recipe
+        /// skips the per-room UPDATE — totals on `HT_CheckIn_H` still settle.
+        #[serde(default)]
+        checkin_ds_id: Option<i32>,
     },
 
     /// Spike §3j — `UPDATE HT_Rooms` (by `id`, not `room_no`!) +
@@ -176,6 +220,14 @@ impl WritebackIntent {
     }
 }
 
+/// Default `stay_start` used when an [`WritebackIntent::ExtendStay`] payload
+/// from a previous schema version (pre-fix-#16) is deserialized — falls back
+/// to `Utc::now()` so the recipe degrades gracefully (single-night re-insert
+/// rather than a panic). New emitters always populate the field explicitly.
+fn default_extend_stay_start() -> DateTime<Utc> {
+    Utc::now()
+}
+
 /// Receipt-header fields carried by [`WritebackIntent::RecordPayment`].
 ///
 /// The `payment` recipe (spike §3h) copies these straight into `HT_Receipt_H`:
@@ -194,6 +246,11 @@ pub struct RecordPaymentReceipt {
 /// Only the fields a user actually edits round-trip through here — fields
 /// retained as `None` are left untouched. The writeback recipe applies these
 /// as targeted UPDATEs (not the legacy app's DELETE-then-REINSERT).
+///
+/// `customer_resave` mirrors spike §3c lines 5/16/28: the .NET app re-saves
+/// the customer record on every booking modify. Phone/address edits never
+/// propagate to the customer master without it. When `Some(_)` the recipe
+/// emits an `UPDATE HT_Customers SET …` with the full field set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BookingChanges {
     pub new_stay: Option<DateRange>,
@@ -203,4 +260,55 @@ pub struct BookingChanges {
     pub new_state: Option<BookingState>,
     pub new_notes: Option<String>,
     pub new_customer_phone: Option<String>,
+    /// Customer display name — used by the recipe to re-write the
+    /// `HT_Rooms.Room_Book_Name` / `room_book_ds` display caption when a
+    /// modify changes any caption-relevant field (date / room / notes).
+    /// Not the same as `customer_resave.cust_name`; populated separately so
+    /// the caption rewrite still works even when the route doesn't have the
+    /// full re-save payload.
+    #[serde(default)]
+    pub new_customer_name: Option<String>,
+    /// Full customer profile re-save (spike §3c). `None` skips the UPDATE.
+    /// Set on every modify so the legacy app's "phone edit triggers customer
+    /// master sync" expectation holds.
+    #[serde(default)]
+    pub customer_resave: Option<CustomerResave>,
+}
+
+/// Full customer-record re-save payload for [`BookingChanges::customer_resave`].
+///
+/// Fields mirror the .NET app's UPDATE in spike §3c capture line 28 — the
+/// recipe writes them all so the legacy customer record reflects the latest
+/// values from PG. Empty strings are preferred over NULL (NULL crashes the
+/// .NET WinForms downstream — see `booking_create` recipe).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CustomerResave {
+    /// `HT_Customers.Cust_no` of the row to update.
+    pub legacy_cust_no: String,
+    pub cust_name: String,
+    pub cust_name2: String,
+    pub cust_type: String,
+    pub cust_type_main: String,
+    pub cust_email: String,
+    pub cust_add_no: String,
+    pub cust_add_moo: String,
+    pub cust_add_soi: String,
+    pub cust_add_road: String,
+    pub cust_add_tambon: String,
+    pub cust_add_ampore: String,
+    pub cust_add_province: String,
+    pub cust_add_code: String,
+    pub cust_add_tel: String,
+    pub cust_add_fax: String,
+    pub cust_work_name: String,
+    pub cust_work_no: String,
+    pub cust_work_moo: String,
+    pub cust_work_soi: String,
+    pub cust_work_road: String,
+    pub cust_work_tambon: String,
+    pub cust_work_ampore: String,
+    pub cust_work_province: String,
+    pub cust_work_code: String,
+    pub cust_work_tel: String,
+    pub cust_work_fax: String,
 }

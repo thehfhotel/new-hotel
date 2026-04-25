@@ -35,6 +35,7 @@ pub mod checkin_cancel;
 pub mod checkin_to_booking;
 pub mod checkout;
 pub mod extend_stay;
+pub mod helpers;
 pub mod mark_clean;
 pub mod payment;
 pub mod walkin;
