@@ -214,9 +214,9 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
               <h2 className="text-lg font-bold text-gray-900">
                 #{bookNo}
               </h2>
-              {detail?.legacyBookId && (
+              {booking?.legacyBookId && (
                 <span className="text-xs text-gray-500 font-mono" title="Legacy system reference">
-                  Legacy: {detail.legacyBookId}
+                  Legacy: {booking.legacyBookId}
                 </span>
               )}
             </div>
@@ -443,9 +443,9 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
               <h2 className="text-lg font-bold text-gray-900">
                 Booking #{bookNo}
               </h2>
-              {detail?.legacyBookId && (
+              {booking?.legacyBookId && (
                 <span className="text-xs text-gray-500 font-mono" title="Legacy system reference">
-                  Legacy: {detail.legacyBookId}
+                  Legacy: {booking.legacyBookId}
                 </span>
               )}
             </div>
