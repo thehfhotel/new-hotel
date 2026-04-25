@@ -98,6 +98,11 @@ impl NewBookingRoom {
 pub struct NewBooking {
     pub id: i32,
     pub book_no: String,
+    /// Legacy MSSQL identifier (`R\d{6}`). `None` until the writeback worker
+    /// successfully mirrors the booking to the .NET app's DB. UI surfaces it
+    /// next to `book_no` so receptionists can cross-reference both apps.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_book_id: Option<String>,
     pub customer_id: i32,
     pub customer_name: Option<String>,
     pub check_in: Option<NaiveDateTime>,
@@ -120,6 +125,7 @@ impl NewBooking {
         Self {
             id: row.book_id,
             book_no: row.book_no,
+            legacy_book_id: row.legacy_book_id,
             customer_id: row.book_cust_id,
             customer_name: row.customer_name,
             check_in: row.book_checkin,
@@ -142,6 +148,7 @@ impl NewBooking {
         Self {
             id: row.book_id,
             book_no: row.book_no,
+            legacy_book_id: row.legacy_book_id,
             customer_id: row.book_cust_id,
             customer_name: row.customer_name,
             check_in: Some(row.book_checkin.and_hms_opt(0, 0, 0).unwrap()),

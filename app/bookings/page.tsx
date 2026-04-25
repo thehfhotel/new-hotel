@@ -33,6 +33,9 @@ interface BookingRoom {
 interface Booking {
   id: number
   bookNo: string
+  /** Legacy MSSQL identifier (R\d{6}). Populated by writeback worker; absent
+   *  until the booking has been mirrored to the .NET app's DB. */
+  legacyBookId?: string
   customerId: number
   customerName: string | null
   checkIn: string | null
@@ -477,9 +480,19 @@ export default function NewBookingsPage() {
                       className="hover:bg-red-500/10 cursor-pointer"
                     >
                       <td className="px-3 py-3 truncate">
-                        <span className="text-sm font-medium text-red-600">
-                          {booking.bookNo}
-                        </span>
+                        <div className="flex flex-col">
+                          <span className="text-sm font-medium text-red-600">
+                            {booking.bookNo}
+                          </span>
+                          {booking.legacyBookId && (
+                            <span
+                              className="text-xs text-gray-500 font-mono"
+                              title="Legacy system reference"
+                            >
+                              {booking.legacyBookId}
+                            </span>
+                          )}
+                        </div>
                       </td>
                       <td className="px-3 py-3 text-sm text-gray-900">
                         {formatDateBE(booking.createdAt)}
