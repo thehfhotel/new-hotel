@@ -114,6 +114,7 @@ These are automatically applied by `scripts/migrate.sh` during deployment.
 | 013 | `013_legacy_ct_state.sql` | Change Tracking watermark for the CT watcher (Phase 5) | v2.8.2 |
 | 014 | `014_legacy_id_columns.sql` | Add `legacy_*` + `aggregate_id` columns to `ht_bookings`/`ht_checkins`/`ht_rooms_new` so the writeback worker's resolver can map UUID→row and back-populate allocated MSSQL identifiers | v2.31.0 |
 | 015 | `015_writeback_retry_state.sql` | Add `claimed_at`/`next_retry_at` to `writeback_jobs`; introduce `exhausted` terminal status. Enables stuck-in-progress recovery, retry backoff, and Slack alerting on retry exhaustion | v2.33.0 |
+| 016 | `016_writeback_notify_trigger.sql` | Auto-fire `NOTIFY writeback_channel` on every `writeback_jobs` INSERT so the worker wakes sub-second instead of waiting on the 30-second poll fallback | v2.38.0 |
 
 ## Tables Owned by This Application
 
