@@ -780,6 +780,21 @@ CREATE INDEX IF NOT EXISTS ix_writeback_jobs_exhausted
     ON writeback_jobs (created_at DESC)
     WHERE status = 'exhausted';
 
+-- Trigger: NOTIFY writeback_channel on every INSERT so the worker wakes
+-- immediately instead of waiting on the 30-second poll fallback. Migration 016.
+CREATE OR REPLACE FUNCTION writeback_jobs_notify() RETURNS trigger AS $$
+BEGIN
+    PERFORM pg_notify('writeback_channel', NEW.id::text);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS writeback_jobs_notify_trigger ON writeback_jobs;
+CREATE TRIGGER writeback_jobs_notify_trigger
+    AFTER INSERT ON writeback_jobs
+    FOR EACH ROW
+    EXECUTE FUNCTION writeback_jobs_notify();
+
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('011', '011_writeback_jobs.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
