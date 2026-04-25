@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.27.0] - 2026-04-25
+
+### Added
+- **Backend SSE endpoint** `GET /api/events` (`hotel-backend/src/routes/events.rs`)
+  — Phase 4a per `docs/architecture.md` §3.6e. Long-lived Server-Sent Events
+  stream of every `DomainEvent` published via `EventBus::publish`. Each
+  request opens a dedicated `sqlx::postgres::PgListener`, `LISTEN`s on the
+  `domain_events` channel, and forwards each notification to the browser as
+  `event: <DomainEvent::type_name()>` / `data: <raw JSON payload>`. 30-second
+  `KeepAlive` heartbeat prevents proxy idle-timeouts; client disconnect drops
+  the stream and releases the PG connection automatically. Malformed
+  payloads are logged and skipped (per-event isolation); recv() errors end
+  the stream so the browser's `EventSource` auto-reconnects per spec.
+- **Cargo deps** — `async-stream = "0.3"` (for the `stream!` macro keeping
+  the SSE handler linear) and `futures-util = "0.3"` (for the `Stream` trait
+  the macro produces; previously transitive only).
+
 ## [2.26.0] - 2026-04-25
 
 ### Added

@@ -76,3 +76,12 @@ dotenvy = "0.15"
 # bb8 and tiberius — declared explicitly so we can `#[async_trait::async_trait]`
 # our `repository::*Repository` traits without depending on a transitive feature.
 async-trait = "0.1"
+
+# Stream plumbing for the SSE endpoint (`routes/events.rs`, Phase 4a).
+# - `async-stream` provides the `stream!` macro so the SSE handler reads as a
+#   straight async loop (`while let Some(n) = listener.recv().await`) rather
+#   than hand-rolling `Stream::poll_next`.
+# - `futures-util` carries the `Stream` trait the macro produces; already
+#   pulled in transitively by axum/sqlx so this is a zero-cost declaration.
+async-stream = "0.3"
+futures-util = { version = "0.3", default-features = false }
