@@ -20,9 +20,9 @@ INSERT INTO legacy_ct_state (id, last_seen_version)
 VALUES (1, 0)
 ON CONFLICT DO NOTHING;
 
-INSERT INTO schema_migrations (version, filename, applied_by)
-VALUES ('013', '013_legacy_ct_state.sql', 'migrate-script')
-ON CONFLICT (version) DO NOTHING;
+-- Schema-migrations row is inserted by scripts/migrate.sh (same TX, includes
+-- the file checksum). Do NOT INSERT here — duplicates in the same TX violate
+-- schema_migrations_version_key.
 
 -- =============================================================================
 -- DOWN MIGRATION (commented — apply manually for rollback)

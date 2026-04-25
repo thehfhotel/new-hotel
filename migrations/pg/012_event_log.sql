@@ -34,9 +34,9 @@ CREATE INDEX IF NOT EXISTS ix_event_log_type_created
 -- A nightly cron job (Phase 6) will run:
 --   DELETE FROM event_log WHERE created_at < now() - INTERVAL '30 days';
 
-INSERT INTO schema_migrations (version, filename, applied_by)
-VALUES ('012', '012_event_log.sql', 'migrate-script')
-ON CONFLICT (version) DO NOTHING;
+-- Schema-migrations row is inserted by scripts/migrate.sh (same TX, includes
+-- the file checksum). Do NOT INSERT here — duplicates in the same TX violate
+-- schema_migrations_version_key.
 
 -- =============================================================================
 -- DOWN MIGRATION (commented — apply manually for rollback)

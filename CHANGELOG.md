@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.27.3] - 2026-04-25
+
+### Fixed
+- **Migration 011/012/013 deploy failure** — each file's body contained a
+  redundant `INSERT INTO schema_migrations ... ON CONFLICT DO NOTHING`,
+  which collided with `scripts/migrate.sh`'s appended INSERT (without
+  ON CONFLICT) in the same transaction:
+  `duplicate key value violates unique constraint "schema_migrations_version_key"`.
+  Removed the internal INSERTs; tracking is owned by `migrate.sh` (it also
+  records the file checksum, which the internal INSERTs did not).
+
 ## [2.27.2] - 2026-04-25
 
 ### Fixed
