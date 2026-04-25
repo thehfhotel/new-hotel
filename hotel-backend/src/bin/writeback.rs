@@ -515,6 +515,7 @@ async fn process_job(
             mark_done(
                 pg,
                 job_id,
+                job.claimed_at,
                 job.aggregate_id,
                 &job.intent,
                 slack,
@@ -1028,9 +1029,23 @@ async fn salvage_legacy_ids(
 /// reset the row to `pending`, the next attempt succeeded). On that
 /// transition we post a `:white_check_mark:` Slack so the operator sees
 /// closure, not just the original `:rotating_light:` alarm.
+///
+/// **Claim-gating (audit MED-2):** the UPDATE matches only when
+/// `status='in_progress' AND claimed_at = $X`. If a slow recipe ran past
+/// `STUCK_IN_PROGRESS_TIMEOUT_SECS`, the janitor in another worker may
+/// have already re-claimed the row (bumping `claimed_at`) — in which case
+/// THIS worker's MSSQL transaction has already been honored on the legacy
+/// side but the new claim's recipe will run a second time on top of it
+/// (the MSSQL `TABLOCKX` serializes execution so the duplicate recipe
+/// gets clean `R-numbers`). The 0-row response is the signal: log a loud
+/// warning and skip back-population so we don't race the new claim's
+/// `mark_done` to write possibly-different `legacy_*` values into the
+/// canonical row.
+#[allow(clippy::too_many_arguments)]
 async fn mark_done(
     pg: &PgPool,
     job_id: i64,
+    claimed_at: DateTime<Utc>,
     aggregate_id: Uuid,
     intent: &WritebackIntent,
     slack: &Option<SlackClient>,
@@ -1038,7 +1053,10 @@ async fn mark_done(
 ) {
     // CTE pattern keeps prior-status capture atomic with the status flip —
     // no race between SELECT and UPDATE in case another worker / janitor
-    // touches the row mid-call.
+    // touches the row mid-call. The MED-2 claim-gate (status + claimed_at)
+    // lives on the UPDATE, not on the prev SELECT — we still want to read
+    // the row's prior_status for the LOW-2 closure alert even if the gate
+    // would otherwise reject our update.
     let row = sqlx::query(
         r#"
         WITH prev AS (
@@ -1050,11 +1068,14 @@ async fn mark_done(
                legacy_ids   = $2
           FROM prev
          WHERE wj.id = prev.id
+           AND wj.status = 'in_progress'
+           AND wj.claimed_at = $3
         RETURNING wj.attempts, wj.intent, wj.aggregate_id, prev.prior_status
         "#,
     )
     .bind(job_id)
     .bind(&legacy_ids)
+    .bind(claimed_at)
     .fetch_optional(pg)
     .await;
 
@@ -1079,13 +1100,25 @@ async fn mark_done(
             }
         }
         Ok(None) => {
-            tracing::error!(
+            // 0 rows updated means the original claim was stolen by the
+            // stuck-in-progress janitor in another worker (audit MED-2).
+            // The other worker will re-run the recipe and write its own
+            // legacy_ids; ours would race and possibly clobber theirs with
+            // stale values. Discard quietly with a loud log so the operator
+            // can spot the race in their dashboards. Skip back-population
+            // — the new claim's mark_done will handle that.
+            tracing::warn!(
                 job_id,
-                "mark_done UPDATE matched zero rows — job may have been deleted by operator"
+                "Job {job_id} was re-claimed by another worker before mark_done; discarding result"
             );
+            return;
         }
         Err(err) => {
             tracing::error!(job_id, error = %err, "Failed to mark job done");
+            // Don't bail — still attempt back-population so subsequent
+            // intents on the same aggregate can resolve. The stuck-in-
+            // progress janitor will eventually retry this job's status row
+            // if the UPDATE truly never landed.
         }
     }
 
@@ -1767,5 +1800,55 @@ mod tests {
             LISTENER_BACKOFF_AFTER_ALERT_SECS > LISTENER_BACKOFF_SECS,
             "post-alert backoff must be longer than normal backoff"
         );
+    }
+
+    /// HIGH-1 contract: the backoff fed into `mark_failed`'s UPDATE must
+    /// be derived from the post-claim `attempts` carried on `ClaimedJob`,
+    /// NOT from a separate SELECT after the UPDATE (which could read a
+    /// re-claimed `attempts` if the janitor in another worker got there
+    /// first). This mirrors the in-function call
+    /// `let backoff = backoff_secs(attempts);` — if the function ever
+    /// reverts to a second PG round-trip the read could observe a stale
+    /// or post-steal value, and this test won't directly catch that, but
+    /// it locks in the *expected* mapping so a regression in the schedule
+    /// surfaces immediately.
+    #[test]
+    fn backoff_is_consistent_with_post_claim_attempts() {
+        // Worker claimed a row that's now on attempt #2; the backoff
+        // written to next_retry_at must be the 2nd schedule entry (120s),
+        // regardless of any concurrent re-claim that might have bumped
+        // the row's attempts to 3 between the UPDATE and a hypothetical
+        // re-SELECT.
+        assert_eq!(backoff_secs(2), 120);
+    }
+
+    /// MED-2 round-trip: `ClaimedJob.claimed_at` is a required
+    /// `DateTime<Utc>` field that survives `Clone` unmodified — the worker
+    /// effectively clones the field every time it copies `job.claimed_at`
+    /// into a `mark_failed` / `mark_done` callsite inside `process_job`.
+    /// If someone changes the type to `Option<...>`, removes the field,
+    /// or strips `Clone` from `ClaimedJob`, this test fails fast at
+    /// compile time rather than at the next live writeback. The `intent`
+    /// value is arbitrary — we're asserting the metadata round-trip, not
+    /// anything about the recipe.
+    #[test]
+    fn claimed_job_carries_claimed_at_through_clone() {
+        let claimed_at: DateTime<Utc> =
+            DateTime::parse_from_rfc3339("2026-04-25T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc);
+        let job = ClaimedJob {
+            id: 42,
+            intent: WritebackIntent::CheckOut {
+                check_in_id: Uuid::nil(),
+            },
+            aggregate_id: Uuid::nil(),
+            attempts: 1,
+            claimed_at,
+        };
+        let cloned = job.clone();
+        assert_eq!(cloned.claimed_at, claimed_at);
+        assert_eq!(cloned.id, 42);
+        assert_eq!(cloned.attempts, 1);
     }
 }
