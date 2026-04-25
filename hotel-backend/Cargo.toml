@@ -1,6 +1,6 @@
 [package]
 name = "hotel-backend"
-version = "2.8.3"
+version = "2.9.0"
 edition = "2021"
 description = "Hotel Management System Backend API"
 authors = [""]
@@ -17,6 +17,10 @@ path = "src/bin/migrate_legacy.rs"
 name = "ville_sync"
 path = "src/bin/ville_sync.rs"
 
+[[bin]]
+name = "writeback"
+path = "src/bin/writeback.rs"
+
 [dependencies]
 # Web framework (matches Tauri middleware)
 axum = "0.7"
@@ -26,7 +30,7 @@ axum = "0.7"
 # - net: tokio::net::TcpListener for axum
 # - time: tokio::time::sleep used by scheduler/ville_sync
 # - sync: tokio::sync::Mutex used by scheduler state
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 
 # Database - Legacy (SQL Server via tiberius for read-only legacy DB)
