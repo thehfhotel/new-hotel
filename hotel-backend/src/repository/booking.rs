@@ -22,6 +22,11 @@ use crate::routes::new_bookings::NewBookingsQuery;
 pub struct BookingListRow {
     pub book_id: i32,
     pub book_no: String,
+    /// Legacy MSSQL identifier (`R\d{6}`) — populated by the writeback worker
+    /// after the booking is mirrored to the .NET app's DB. `None` until then.
+    /// Surfaced to the UI so receptionists can cross-reference between our
+    /// app and the legacy app on the same booking.
+    pub legacy_book_id: Option<String>,
     pub book_cust_id: i32,
     pub customer_name: Option<String>,
     pub book_checkin: Option<NaiveDateTime>,
@@ -44,6 +49,8 @@ pub struct BookingListRow {
 pub struct BookingDetailRow {
     pub book_id: i32,
     pub book_no: String,
+    /// See `BookingListRow::legacy_book_id`.
+    pub legacy_book_id: Option<String>,
     pub book_cust_id: i32,
     pub customer_name: Option<String>,
     pub book_checkin: NaiveDate,
@@ -283,6 +290,7 @@ impl BookingRepository for PgBookingRepository {
         SELECT
             b.book_id,
             b.book_no,
+            b.legacy_book_id,
             b.book_cust_id,
             CONCAT(c.cust_firstname, ' ', COALESCE(c.cust_lastname, '')) as customer_name,
             b.book_checkin,
@@ -314,6 +322,7 @@ impl BookingRepository for PgBookingRepository {
             .map(|row| BookingListRow {
                 book_id: row.try_get::<i32, _>("book_id").unwrap_or(0),
                 book_no: row.try_get::<String, _>("book_no").unwrap_or_default(),
+                legacy_book_id: row.try_get::<String, _>("legacy_book_id").ok(),
                 book_cust_id: row.try_get::<i32, _>("book_cust_id").unwrap_or(0),
                 customer_name: row.try_get::<String, _>("customer_name").ok(),
                 book_checkin: row.try_get::<NaiveDateTime, _>("book_checkin").ok(),
@@ -342,10 +351,13 @@ impl BookingRepository for PgBookingRepository {
         pool: &PgPool,
         book_id: i32,
     ) -> Result<Option<BookingDetailRow>, sqlx::Error> {
-        let rec = sqlx::query!(
+        // Runtime `query()` (not `query!`) so we don't have to regenerate the
+        // sqlx offline cache every time we add a column to the SELECT.
+        let row = sqlx::query(
             r#"SELECT
             b.book_id,
             b.book_no,
+            b.legacy_book_id,
             b.book_cust_id,
             CONCAT(c.cust_firstname, ' ', COALESCE(c.cust_lastname, '')) as customer_name,
             b.book_checkin,
@@ -363,28 +375,29 @@ impl BookingRepository for PgBookingRepository {
         FROM ht_bookings b
         LEFT JOIN ht_customers c ON b.book_cust_id = c.cust_id
         WHERE b.book_id = $1"#,
-            book_id
         )
+        .bind(book_id)
         .fetch_optional(pool)
         .await?;
 
-        Ok(rec.map(|r| BookingDetailRow {
-            book_id: r.book_id,
-            book_no: r.book_no,
-            book_cust_id: r.book_cust_id,
-            customer_name: r.customer_name,
-            book_checkin: r.book_checkin,
-            book_checkout: r.book_checkout,
-            book_nights: r.book_nights,
-            book_adults: r.book_adults,
-            book_children: r.book_children,
-            book_status: r.book_status,
-            book_source: r.book_source,
-            book_total_amount: r.book_total_amount,
-            book_deposit_amount: r.book_deposit_amount,
-            book_notes: r.book_notes,
-            created_at: r.created_at,
-            updated_at: r.updated_at,
+        Ok(row.map(|r| BookingDetailRow {
+            book_id: r.try_get("book_id").unwrap_or(0),
+            book_no: r.try_get::<String, _>("book_no").unwrap_or_default(),
+            legacy_book_id: r.try_get::<String, _>("legacy_book_id").ok(),
+            book_cust_id: r.try_get("book_cust_id").unwrap_or(0),
+            customer_name: r.try_get("customer_name").ok(),
+            book_checkin: r.try_get("book_checkin").expect("book_checkin NOT NULL"),
+            book_checkout: r.try_get("book_checkout").expect("book_checkout NOT NULL"),
+            book_nights: r.try_get("book_nights").ok(),
+            book_adults: r.try_get("book_adults").ok(),
+            book_children: r.try_get("book_children").ok(),
+            book_status: r.try_get("book_status").ok(),
+            book_source: r.try_get("book_source").ok(),
+            book_total_amount: r.try_get("book_total_amount").ok(),
+            book_deposit_amount: r.try_get("book_deposit_amount").ok(),
+            book_notes: r.try_get("book_notes").ok(),
+            created_at: r.try_get("created_at").ok(),
+            updated_at: r.try_get("updated_at").ok(),
         }))
     }
 

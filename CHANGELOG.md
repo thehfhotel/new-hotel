@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.37.0] - 2026-04-25
+
+### Added
+
+- **Legacy booking number displayed in our app's UI.** `BookingListRow`
+  and `BookingDetailRow` now carry `legacy_book_id` (the `R\d{6}`
+  identifier the writeback worker back-populates after mirroring to the
+  .NET app). The `/api/new/bookings*` JSON response surfaces it as
+  `legacyBookId` (omitted when absent — booking hasn't been written
+  back yet). The bookings list table shows it as a small mono-font
+  reference under the booking number. Lets receptionists cross-
+  reference a single booking between our app and the legacy app
+  without manual lookups.
+
+  `repository::booking::get` was converted from `sqlx::query!` macro
+  to runtime `sqlx::query()` so column additions don't require
+  regenerating the offline cache for every change.
+
 ## [2.36.0] - 2026-04-25
 
 ### Fixed
