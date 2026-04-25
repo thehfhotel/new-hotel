@@ -79,6 +79,41 @@ services:
       start_period: 30s
     restart: unless-stopped
 
+  # Writeback worker — drains the writeback_jobs outbox into the legacy MSSQL DB
+  # via the Phase 4b adapter (per docs/architecture.md §3.6c, §6, §8).
+  #
+  # Same image as `backend`, different entrypoint. Lives under the `legacy`
+  # profile so State C deploys (`docker compose up`) skip it. Activate with:
+  #     docker compose --profile legacy up -d
+  #
+  # When WRITEBACK_ENABLED=false the binary exits cleanly, so it's safe to
+  # leave the service registered even mid-cutover.
+  writeback:
+    image: ghcr.io/thehfhotel/new-hotel-backend:latest
+    command: ["./writeback"]
+    profiles:
+      - legacy
+    environment:
+      # Legacy database (external server - shared with legacy application)
+      - DB_SERVER=${DB_SERVER}
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      # PostgreSQL — same DSN the backend uses, but with explicit URL form
+      # because the writeback bin reads DATABASE_URL directly (no AppConfig).
+      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@newdb:${PGPORT:-5439}/${POSTGRES_DB}
+      # Worker-specific knobs (per docs/architecture.md §7)
+      - WRITEBACK_ENABLED=${WRITEBACK_ENABLED:-true}
+      - WRITEBACK_POLL_INTERVAL_SECS=${WRITEBACK_POLL_INTERVAL_SECS:-30}
+      - WRITEBACK_MAX_ATTEMPTS=${WRITEBACK_MAX_ATTEMPTS:-3}
+      - RUST_LOG=${RUST_LOG:-hotel_backend=info,writeback=info}
+    depends_on:
+      newdb:
+        condition: service_healthy
+    networks:
+      - hotel-network
+    restart: unless-stopped
+
 volumes:
   newdb_data:
 
