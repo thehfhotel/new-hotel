@@ -153,10 +153,10 @@ pub async fn allocate_rooms_cancel_id(conn: &mut LegacyConn<'_>) -> WritebackRes
 
 /// Allocate the next `HT_CheckIn_Ds.id`.
 ///
-/// **Note:** spike §2 calls out this column as the ONE exception that *is*
-/// SQL Server `IDENTITY` — INSERTs without `id` auto-allocate. We expose this
-/// helper anyway for symmetry, but recipes should prefer the IDENTITY path
-/// (omit `id` from the INSERT column list).
+/// **Note:** the spike §2 narrative claimed this column was IDENTITY. The
+/// 2026-04-26 schema dump (via `inspect_schema`) confirmed it is NOT —
+/// `int NOT NULL, default=NULL`. INSERTs MUST provide an explicit `id`
+/// or fail. Recipes (`walkin`, `checkin_to_booking`) call this helper.
 pub async fn allocate_checkin_ds_id(conn: &mut LegacyConn<'_>) -> WritebackResult<i32> {
     select_next_int_with_lock(
         conn,
@@ -167,8 +167,9 @@ pub async fn allocate_checkin_ds_id(conn: &mut LegacyConn<'_>) -> WritebackResul
 
 /// Allocate the next `HT_Receipt_H.id`.
 ///
-/// `id` here is IDENTITY per spike baseline (`is_identity=1`). Same caveat as
-/// [`allocate_checkin_ds_id`] — prefer omitting from the INSERT column list.
+/// Schema dump 2026-04-26 confirmed: `int NOT NULL, default=NULL`, NOT
+/// IDENTITY. The `payment` recipe correctly allocates and includes `[id]`
+/// in its INSERT.
 pub async fn allocate_receipt_h_id(conn: &mut LegacyConn<'_>) -> WritebackResult<i32> {
     select_next_int_with_lock(
         conn,
