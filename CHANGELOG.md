@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.33.0] - 2026-04-25
+
+### Added
+
+- **Operational hardening for the writeback worker** before first live
+  test — error catching / retry / recovery / reporting paths now closed.
+
+  **Recovery from stuck `in_progress` jobs.** Worker process crashes
+  mid-recipe, or `mark_done`/`mark_failed` PG failures, previously left
+  the `writeback_jobs` row in `status='in_progress'` forever and
+  required manual SQL intervention. Migration 015 adds `claimed_at`;
+  `claim_next_job` now also re-claims `in_progress` rows whose
+  `claimed_at < NOW() - 5 min` (`STUCK_IN_PROGRESS_TIMEOUT_SECS`).
+  No more stuck jobs.
+
+  **Retry backoff.** A `failed` job was previously re-claimable on the
+  next loop tick, burning through `WRITEBACK_MAX_ATTEMPTS` in seconds
+  during an MSSQL outage. Migration 015 adds `next_retry_at`;
+  `mark_failed` schedules retries with exponential backoff (30s, 2min,
+  10min by default) and `claim_next_job` filters by it.
+
+  **`exhausted` terminal status.** Once `attempts >= max_attempts` the
+  worker now transitions the row to `status='exhausted'` instead of
+  leaving it as `failed` (which was indistinguishable from "currently
+  retrying"). Operator triage is one query:
+  `SELECT * FROM writeback_jobs WHERE status='exhausted'`.
+
+  **Slack alerts on terminal failures.** New
+  `send_exhausted_alert()` posts a `:rotating_light:` message to
+  `SLACK_WEBHOOK_URL` (when configured) the moment a job exhausts its
+  retry budget, with the intent name, aggregate id, attempt count,
+  truncated last error, and the recovery one-liner. Schema-fingerprint
+  failures at startup also alert before the worker exits — the operator
+  sees the failure even if they're not tailing logs.
+
+  4 new unit tests for the backoff + timeout constants. 114 lib +
+  4 binary tests pass.
+
+  Operator notes:
+  - Set `SLACK_WEBHOOK_URL` to enable alerts; otherwise failures are
+    log-only.
+  - To manually retry an `exhausted` job after fixing the underlying
+    cause: `UPDATE writeback_jobs SET status='pending',
+    attempts=0, next_retry_at=NULL WHERE id=...`.
+  - To inspect queue depth: `SELECT status, COUNT(*) FROM
+    writeback_jobs GROUP BY status`.
+
 ## [2.32.0] - 2026-04-25
 
 ### Fixed

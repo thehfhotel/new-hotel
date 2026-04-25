@@ -754,20 +754,31 @@ CREATE TABLE IF NOT EXISTS writeback_jobs (
     payload           JSONB        NOT NULL,
     aggregate_id      UUID         NOT NULL,
     idempotency_key   UUID         NOT NULL UNIQUE,
+    -- Status lifecycle: pending → in_progress → done (success)
+    --                                        → failed (transient, will retry per next_retry_at)
+    --                                        → exhausted (attempts >= max, requires operator)
     status            TEXT         NOT NULL DEFAULT 'pending',
     attempts          INT          NOT NULL DEFAULT 0,
     last_error        TEXT,
     legacy_ids        JSONB,
     created_at        TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    -- Set by claim_next_job; lets the janitor reset stuck `in_progress` rows.
+    claimed_at        TIMESTAMPTZ,
+    -- Set by mark_failed; gates retry until backoff window elapses.
+    next_retry_at     TIMESTAMPTZ,
     completed_at      TIMESTAMPTZ
 );
 
-CREATE INDEX IF NOT EXISTS ix_writeback_jobs_pending_created
-    ON writeback_jobs (status, created_at)
-    WHERE status IN ('pending', 'failed');
+CREATE INDEX IF NOT EXISTS ix_writeback_jobs_claim
+    ON writeback_jobs (status, next_retry_at, created_at)
+    WHERE status IN ('pending', 'failed', 'in_progress');
 
 CREATE INDEX IF NOT EXISTS ix_writeback_jobs_aggregate
     ON writeback_jobs (aggregate_id);
+
+CREATE INDEX IF NOT EXISTS ix_writeback_jobs_exhausted
+    ON writeback_jobs (created_at DESC)
+    WHERE status = 'exhausted';
 
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('011', '011_writeback_jobs.sql', 'init-script')
