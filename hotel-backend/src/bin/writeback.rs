@@ -430,10 +430,31 @@ async fn resolve_legacy_ids(
                 resolved.legacy_room_id_int = row.try_get("legacy_room_id_int").ok();
             }
         }
-        // CreateBooking / CreateCheckIn don't need PG-side IDs — the payload
-        // carries the canonical data and the recipe allocates legacy IDs
-        // itself with TABLOCKX.
-        CreateBooking { .. } | CreateCheckIn { .. } => {}
+        // CreateBooking carries everything in its payload — no resolution.
+        CreateBooking { .. } => {}
+        // CreateCheckIn (linked-to-booking variant) needs the linked
+        // booking's legacy_book_id. Normally the payload supplies it, but
+        // when the booking was created via UI moments earlier and its
+        // CreateBooking writeback hasn't completed yet (back-population
+        // race or partial failure), the payload's `linked_legacy_book_id`
+        // is None and the dispatcher must fall back to a PG lookup. Walkin
+        // (linked_booking_id=None) needs nothing here.
+        CreateCheckIn { payload, .. } => {
+            if let (Some(linked_booking_id), None) = (
+                payload.linked_booking_id,
+                payload.linked_legacy_book_id.as_deref(),
+            ) {
+                if let Some(row) = sqlx::query(
+                    "SELECT legacy_book_id FROM ht_bookings WHERE aggregate_id = $1",
+                )
+                .bind(linked_booking_id)
+                .fetch_optional(pg)
+                .await?
+                {
+                    resolved.legacy_book_id = row.try_get("legacy_book_id").ok();
+                }
+            }
+        }
     }
     Ok(resolved)
 }
