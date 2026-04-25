@@ -198,6 +198,14 @@ pub async fn execute(
     let nights = enumerate_calendar_nights(stay_start, new_end);
     let _ = (Datelike::year(&new_end.date_naive()),); // silence unused-import lint
 
+    // HIGH-4: reject NaN/Infinity before SQL formatting.
+    super::helpers::validate_finite(&[
+        ("new_room_price_total", money_to_baht_f64(new_room_price_total)),
+        ("new_net_total", money_to_baht_f64(new_net_total)),
+        ("new_pay_total", money_to_baht_f64(new_pay_total)),
+        ("new_balance_total", money_to_baht_f64(new_balance_total)),
+    ])?;
+
     let inputs = ExtendStayInputs {
         cin_no,
         room_no,
@@ -214,8 +222,11 @@ pub async fn execute(
         room_status_id_base: id_base,
         // Spike §3a: TM.30 batch numbers are non-sequential random i32
         // assigned by the .NET app's async post-save job. We mirror two
-        // touches per the extend capture (lines 1-2).
-        tm30_touch_ids: vec![rand::random::<i32>(), rand::random::<i32>()],
+        // touches per the extend capture (lines 1-2). MED-3: clamp to the
+        // positive i32 range — the .NET app's Cin_Work_number column is
+        // signed but no spike capture has ever observed a negative value,
+        // and a negative number may trip the WinForms grid control.
+        tm30_touch_ids: vec![positive_i32(), positive_i32()],
     };
     let statements = build_statements(&inputs);
     super::execute_all(conn, &statements).await?;
@@ -228,8 +239,8 @@ fn enumerate_calendar_nights(
     stay_start: DateTime<Utc>,
     new_end: DateTime<Utc>,
 ) -> Vec<NaiveDate> {
-    let start = stay_start.date_naive();
-    let end = new_end.date_naive();
+    let start = crate::writeback::format::bangkok_date(stay_start);
+    let end = crate::writeback::format::bangkok_date(new_end);
     let mut nights = Vec::new();
     let mut day = start;
     while day < end {
@@ -252,6 +263,12 @@ fn money_to_baht_f64(m: Money) -> f64 {
     (m.as_satang() as f64) / 100.0
 }
 
+/// Random positive i32 (1..=i32::MAX) for TM.30 `Cin_Work_number`. See MED-3
+/// in the call site.
+fn positive_i32() -> i32 {
+    (rand::random::<u32>() & 0x7FFF_FFFF).max(1) as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,7 +281,8 @@ mod tests {
             cin_no: "CH26-005230",
             room_no: "508",
             checkin_ds_id: 25009,
-            new_end: Utc.with_ymd_and_hms(2026, 4, 26, 12, 0, 0).unwrap(),
+            // 5 AM UTC = noon Bangkok (the wall-clock the legacy app sees).
+            new_end: Utc.with_ymd_and_hms(2026, 4, 26, 5, 0, 0).unwrap(),
             new_nights: 2,
             new_room_price_total: 1780.0,
             new_net_total: 1780.0,

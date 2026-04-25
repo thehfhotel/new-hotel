@@ -268,18 +268,18 @@ async fn process_job(pg: &PgPool, mssql: &DbPool, job: ClaimedJob) {
         }
     };
 
-    // Acquire MSSQL connection. We do NOT open `BEGIN TRAN` at the
-    // connection level — the recipes themselves must wrap their statements in
-    // `BEGIN TRAN ... COMMIT` because tiberius doesn't expose a typed
-    // transaction handle the way sqlx does. The `TABLOCKX, HOLDLOCK` in the
-    // allocate helpers needs to live inside an explicit transaction; recipes
-    // that allocate IDs already start one.
+    // Acquire MSSQL connection and wrap the entire recipe in an explicit
+    // transaction. This is mandatory: the recipes' `TABLOCKX, HOLDLOCK` MAX+1
+    // ID allocation pattern only holds the table lock for the life of the
+    // surrounding transaction. In autocommit mode (no `BEGIN TRAN`), MSSQL
+    // releases the lock at the end of each statement — so the SELECT that
+    // computes `MAX(...)+1` releases the lock before the corresponding INSERT
+    // runs, and a concurrent worker / .NET client can read the same value.
+    // That voids the spike §6 race-safety guarantee.
     //
-    // For now we issue the statements outside an explicit transaction wrapper
-    // — each recipe's allocate call holds the table-level lock for the
-    // duration of the connection's batch. This matches the spike §6 verified
-    // pattern (auto-commit per statement; the lock holds until the connection
-    // returns to the pool).
+    // The transaction also gives us atomic rollback: a recipe failure mid-batch
+    // (e.g. statement 4 of 8 errors) un-does statements 1-3 instead of leaving
+    // a half-applied booking in MSSQL.
     let mut conn = match mssql.get().await {
         Ok(c) => c,
         Err(err) => {
@@ -294,10 +294,10 @@ async fn process_job(pg: &PgPool, mssql: &DbPool, job: ClaimedJob) {
         aggregate_id: job.aggregate_id,
     };
 
-    let dispatch_result = dispatch(&mut conn, &job.intent, &resolved, ctx).await;
-    drop(conn); // release back to pool
+    let outcome = run_in_transaction(&mut conn, &job.intent, &resolved, ctx).await;
+    drop(conn); // release back to pool before any further awaits
 
-    match dispatch_result {
+    match outcome {
         Ok(legacy_ids) => {
             tracing::info!(job_id, intent = intent_name, "Writeback succeeded");
             mark_done(pg, job_id, legacy_ids.into_json()).await;
@@ -311,6 +311,54 @@ async fn process_job(pg: &PgPool, mssql: &DbPool, job: ClaimedJob) {
                 "Writeback recipe failed"
             );
             mark_failed(pg, job_id, &err.to_string()).await;
+        }
+    }
+}
+
+/// Wrap `dispatch` in an explicit MSSQL transaction.
+///
+/// **Why this is mandatory:** the recipes' `TABLOCKX, HOLDLOCK` MAX+1 ID
+/// allocation pattern only holds the table lock for the life of the
+/// surrounding transaction. In autocommit mode (no `BEGIN TRAN`), MSSQL
+/// releases the lock at the end of each statement — so the SELECT that
+/// computes `MAX(...)+1` releases its lock before the corresponding INSERT
+/// runs, and a concurrent writeback worker / .NET client can read the same
+/// value. That voids the spike §6 race-safety guarantee.
+///
+/// The transaction also gives us atomic rollback: a recipe failure mid-batch
+/// (e.g. statement 4 of 8 errors) un-does statements 1-3 instead of leaving
+/// a half-applied booking in MSSQL.
+async fn run_in_transaction(
+    conn: &mut hotel_backend::writeback::allocate::LegacyConn<'_>,
+    intent: &WritebackIntent,
+    resolved: &ResolvedJob,
+    ctx: DispatchContext,
+) -> Result<hotel_backend::writeback::LegacyIds, WritebackError> {
+    {
+        let begin = conn.simple_query("BEGIN TRAN").await?;
+        drop(begin);
+    }
+
+    let dispatch_result = dispatch(conn, intent, resolved, ctx).await;
+
+    match dispatch_result {
+        Ok(legacy_ids) => {
+            let commit = conn.simple_query("COMMIT TRAN").await?;
+            drop(commit);
+            Ok(legacy_ids)
+        }
+        Err(err) => {
+            // Best-effort rollback. If ROLLBACK itself fails, the connection
+            // is poisoned and bb8 will discard it on next acquire — the data
+            // remains safe because nothing was committed.
+            match conn.simple_query("ROLLBACK TRAN").await {
+                Ok(stream) => drop(stream),
+                Err(rb_err) => tracing::warn!(
+                    rollback_error = %rb_err,
+                    "ROLLBACK TRAN failed — connection will be dropped from pool"
+                ),
+            }
+            Err(err)
         }
     }
 }
