@@ -19,4 +19,5 @@ pub mod outbox;
 pub mod repository;
 pub mod routes;
 pub mod scheduler;
+pub mod service;
 pub mod utils;
