@@ -4,6 +4,7 @@ pub mod bookings;
 pub mod calendar;
 pub mod checkins;
 pub mod customers;
+pub mod events;
 pub mod mode;
 pub mod new_bookings;
 pub mod new_checkins;
