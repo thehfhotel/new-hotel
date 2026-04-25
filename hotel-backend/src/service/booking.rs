@@ -201,6 +201,11 @@ impl BookingService {
         }
 
         let aggregate_id = aggregate_uuid(AggregateKind::Booking, book_id);
+        // Stamp the deterministic UUID onto the row so the writeback worker's
+        // resolver can map `writeback_jobs.aggregate_id` → `ht_bookings`
+        // (migration 014). Same transaction as the INSERT — if the outbox
+        // enqueue fails, the row never becomes visible.
+        self.repo.set_aggregate_id(&mut tx, book_id, aggregate_id).await?;
         let nights = nights_between(cmd.check_in, cmd.check_out);
         let payload = CreateBookingPayload {
             customer_id: cmd.writeback_context.customer_aggregate_id,

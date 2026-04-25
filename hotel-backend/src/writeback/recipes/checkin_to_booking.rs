@@ -234,13 +234,17 @@ pub async fn execute(
         nights_calendar,
     };
     let statements = build_statements(&inputs);
-    super::execute_all(conn, &statements).await?;
+    let checkin_ds_id =
+        super::execute_capturing_identity_at(conn, &statements, "INSERT INTO [HT_CheckIn_Ds]")
+            .await?;
 
     let _ = DEFAULT_OPERATOR; // silence unused-import lint
     let mut ids = LegacyIds::new()
         .with_cin_no(cin_no.clone())
         .with_cust_no(cust_no.clone())
-        .with_book_id(book_id.to_string());
+        .with_book_id(book_id.to_string())
+        .with_room_no(payload.room_no.clone())
+        .with_checkin_ds_id(checkin_ds_id);
     ids.extra
         .insert("room_status_id_base".into(), serde_json::Value::from(room_status_id_base));
     Ok(ids)

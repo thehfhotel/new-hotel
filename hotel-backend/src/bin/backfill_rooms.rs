@@ -71,6 +71,7 @@
 
 use std::collections::HashMap;
 use std::env;
+use hotel_backend::service::ids::{aggregate_uuid, AggregateKind};
 
 use bb8::Pool;
 use bb8_tiberius::ConnectionManager;
@@ -282,19 +283,28 @@ async fn backfill_rooms(
             .and_then(|c| c.to_digit(10))
             .map(|d| d as i32);
 
+        // Migration 014: also populate the writeback resolver columns. The
+        // legacy room_no IS the canonical room_no (HT_Rooms.room_no in MSSQL),
+        // and legacy_room_id_int IS the SERIAL room_id (we preserve HT_Rooms.id
+        // → ht_rooms_new.room_id end-to-end). aggregate_id is the deterministic
+        // UUID derived from room_id so MarkRoomClean can resolve.
+        let aggregate_id = aggregate_uuid(AggregateKind::Room, legacy_id);
+
         let result = sqlx::query(
             r#"
             INSERT INTO ht_rooms_new (
                 room_id, room_no, room_type_id, room_floor, room_building,
                 room_status, room_clean, room_maintenance,
                 room_price_weekday, room_price_weekend, room_price_special,
-                room_notes
+                room_notes,
+                legacy_room_no, legacy_room_id_int, aggregate_id
             )
             VALUES (
                 $1, $2, $3, $4, $5,
                 $6, $7, $8,
                 $9::float8, $10::float8, $11::float8,
-                $12
+                $12,
+                $13, $14, $15
             )
             ON CONFLICT (room_id) DO UPDATE SET
                 room_no              = EXCLUDED.room_no,
@@ -308,6 +318,9 @@ async fn backfill_rooms(
                 room_price_weekend   = EXCLUDED.room_price_weekend,
                 room_price_special   = EXCLUDED.room_price_special,
                 room_notes           = EXCLUDED.room_notes,
+                legacy_room_no       = EXCLUDED.legacy_room_no,
+                legacy_room_id_int   = EXCLUDED.legacy_room_id_int,
+                aggregate_id         = EXCLUDED.aggregate_id,
                 updated_at           = NOW()
             RETURNING (xmax = 0) AS was_insert
             "#,
@@ -324,6 +337,9 @@ async fn backfill_rooms(
         .bind(price_b)
         .bind(price_c)
         .bind(&room_details)
+        .bind(&room_no)
+        .bind(legacy_id)
+        .bind(aggregate_id)
         .fetch_one(pg)
         .await?;
 
