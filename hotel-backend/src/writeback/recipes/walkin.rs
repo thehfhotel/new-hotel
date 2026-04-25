@@ -37,7 +37,8 @@ use chrono::{DateTime, Datelike, NaiveDate, Utc};
 
 use crate::outbox::intent::CreateCheckInPayload;
 use crate::writeback::allocate::{
-    allocate_cin_no, allocate_cust_no, allocate_customer_id, allocate_room_status_id, LegacyConn,
+    allocate_checkin_ds_id, allocate_cin_no, allocate_cust_no, allocate_customer_id,
+    allocate_room_status_id, LegacyConn,
 };
 use crate::writeback::constants::{
     power_log_note_check_in, CIN_ROOM_STATUS_OCCUPYING, CUST_TYPE_MAIN_INDIVIDUAL,
@@ -71,6 +72,11 @@ pub struct WalkInInputs<'a> {
     pub price_total_baht: f64,
     /// First `HT_Room_Status.id` to use for night INSERTs.
     pub room_status_id_base: i32,
+    /// Pre-allocated `HT_CheckIn_Ds.id`. Despite the spike's earlier note,
+    /// schema dump (2026-04-26 inspect_schema) confirms this column is NOT
+    /// IDENTITY — `int NOT NULL default=NULL`. INSERTs without explicit `id`
+    /// fail; the recipe must allocate via TABLOCKX MAX+1 and pass it here.
+    pub checkin_ds_id: i32,
     pub nights_calendar: Vec<NaiveDate>,
 }
 
@@ -123,13 +129,17 @@ pub fn build_statements(inputs: &WalkInInputs<'_>) -> Vec<String> {
         "update HT_Rooms set room_use='yes' where room_no={room_no_q}"
     ));
 
-    // 3. HT_CheckIn_Ds — id is IDENTITY, omit from column list per spike §2
+    // 3. HT_CheckIn_Ds — `id` is NOT IDENTITY (schema dump 2026-04-26
+    // confirmed: int NOT NULL, no default). The earlier "id is IDENTITY"
+    // comment was a misread of spike §2 — that note was for HT_CheckIn_Pay,
+    // not HT_CheckIn_Ds. Caller pre-allocates via TABLOCKX MAX+1.
+    let ds_id = inputs.checkin_ds_id;
     statements.push(format!(
-        "INSERT INTO [HT_CheckIn_Ds]([Cin_No],[Cin_Room_No],[Cin_Room_Type],[Cin_Room_In],\
+        "INSERT INTO [HT_CheckIn_Ds]([id],[Cin_No],[Cin_Room_No],[Cin_Room_Type],[Cin_Room_In],\
          [Cin_Room_Out],[Cin_Room_Status],[Cin_Room_Dep],[Cin_Room_Price],[Cin_Room_Night],\
          [Cin_Room_PriceToTal],[Cin_Room_Pay_Before],[Cin_Room_Pay_Total],[Cin_note],\
          [Cin_Dep_Status],[Dep_by],[Cin_cupon])\
-         VALUES({cin_no_q},{room_no_q},{room_type_q},{stay_start_q},{stay_end_q},\
+         VALUES({ds_id},{cin_no_q},{room_no_q},{room_type_q},{stay_start_q},{stay_end_q},\
          {occupying_q},0,{price},{nights},{total},0,0,'','','',0)"
     ));
 
@@ -192,6 +202,10 @@ pub async fn execute(
     let cust_id_int = allocate_customer_id(conn).await?;
     let cin_no = allocate_cin_no(conn).await?;
     let room_status_id_base = allocate_room_status_id(conn).await?;
+    // Allocate HT_CheckIn_Ds.id under TABLOCKX. Schema dump 2026-04-26
+    // confirmed this column is NOT IDENTITY despite the spike's earlier
+    // note — INSERT must provide an explicit value.
+    let checkin_ds_id = allocate_checkin_ds_id(conn).await?;
 
     let nights_calendar = enumerate_calendar_nights(payload.stay.start, payload.stay.end);
 
@@ -213,14 +227,10 @@ pub async fn execute(
         price_total_baht: (payload.price_total.as_satang() as f64) / 100.0,
         room_status_id_base,
         nights_calendar,
+        checkin_ds_id,
     };
     let statements = build_statements(&inputs);
-    // Capture SCOPE_IDENTITY() right after the HT_CheckIn_Ds INSERT so the
-    // writeback worker's mark_done can back-populate
-    // ht_checkins.legacy_checkin_ds_id (used by ExtendStay / CheckOut).
-    let checkin_ds_id =
-        super::execute_capturing_identity_at(conn, &statements, "INSERT INTO [HT_CheckIn_Ds]")
-            .await?;
+    super::execute_all(conn, &statements).await?;
 
     let _ = DEFAULT_OPERATOR; // silence unused-import lint
     let mut ids = LegacyIds::new()
@@ -286,6 +296,7 @@ mod tests {
             price_total_baht: 890.0,
             room_status_id_base: 50230,
             nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 24).unwrap()],
+            checkin_ds_id: 25001,
         }
     }
 
@@ -349,12 +360,18 @@ mod tests {
     }
 
     #[test]
-    fn checkin_ds_omits_id_column_for_identity() {
+    fn checkin_ds_includes_explicit_id_column() {
+        // Schema dump 2026-04-26 confirmed HT_CheckIn_Ds.id is NOT IDENTITY
+        // (`int NOT NULL, default=NULL`). The earlier "IDENTITY, omit" comment
+        // was wrong — INSERT must provide an explicit value or fail.
         let s = build_statements(&sample_inputs());
         let ds = s.iter().find(|s| s.contains("HT_CheckIn_Ds")).unwrap();
-        // id is IDENTITY (spike §2) — verify it's not in the column list
-        assert!(!ds.contains("[id]"));
+        assert!(ds.contains("[id]"), "[id] must be in column list: {ds}");
         assert!(ds.contains("[Cin_No]"));
+        assert!(
+            ds.contains("VALUES(25001,"),
+            "[id] value must be the pre-allocated checkin_ds_id (25001 in sample): {ds}"
+        );
     }
 
     #[test]
