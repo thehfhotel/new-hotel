@@ -126,7 +126,11 @@ jobs:
       # installs the binary.
       - name: Set up sccache
         id: sccache_setup
-        uses: mozilla-actions/sccache-action@v0.0.6
+        # v0.0.9+ uses the GHA Cache v2 API (`ACTIONS_RESULTS_URL`).
+        # GitHub sunset the v1 cache API on 2026-02-01, after which v0.0.6
+        # got 400s from artifactcache.actions.githubusercontent.com on every
+        # probe. Pinned to v0.0.10 (latest as of 2026-04).
+        uses: mozilla-actions/sccache-action@v0.0.10
         continue-on-error: true
 
       - name: Probe sccache (verify GHA Cache reachable)
