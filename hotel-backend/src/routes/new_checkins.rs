@@ -10,10 +10,9 @@
 //! - POST /api/new/checkins/:id/guests - Add guest to check-in
 //! - DELETE /api/new/checkins/:id/guests/:guestId - Remove guest from check-in
 //!
-//! Per `docs/architecture.md` §1, §6 (Phase 1b) the SQL has moved to
-//! `repository::checkin`. The route still owns request validation, response
-//! shaping, and the multi-step workflow choreography (which the Phase 2
-//! service layer will absorb).
+//! Per `docs/architecture.md` §1, §6 (Phase 2.5) the create / checkout
+//! handlers delegate to `state.checkins_service`. Reads + the guest-registry
+//! handlers stay on the repository for now (no service method exists yet).
 
 use axum::{
     extract::{Path, Query, State},
@@ -21,12 +20,18 @@ use axum::{
 };
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use super::mode::AppState;
+use crate::domain::shared::{DateRange, Money};
 use crate::error::{ApiError, ApiResult};
 use crate::models::Pagination;
+use crate::outbox::event::EventSource;
 use crate::repository::checkin::{
-    CheckInDetailRow, CheckInInsert, CheckInListRow, CheckOutWrite, GuestInsert, GuestRow,
+    CheckInDetailRow, CheckInListRow, GuestInsert, GuestRow,
+};
+use crate::service::{
+    CheckInToBookingCommand, CheckInWritebackContext, CheckOutCommand, ServiceError, WalkInCommand,
 };
 
 /// Check-in status enum
@@ -264,97 +269,69 @@ pub async fn get_checkin(
 }
 
 /// POST /api/new/checkins - Create check-in (walk-in or from booking)
+///
+/// Delegates to either [`crate::service::CheckInService::walk_in`] or
+/// [`crate::service::CheckInService::check_in_to_booking`] depending on
+/// whether a `booking_id` was provided.
 pub async fn create_checkin(
     State(state): State<AppState>,
     Json(body): Json<CreateCheckInRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
-    // Determine customer ID
-    let customer_id = if let Some(booking_id) = body.booking_id {
-        state
-            .checkins
-            .get_booking_customer_id(&state.new_pool, booking_id)
-            .await?
-            .ok_or_else(|| ApiError::NotFound("Booking not found".to_string()))?
-    } else {
-        body.customer_id
-            .ok_or_else(|| ApiError::BadRequest("Customer ID is required for walk-ins".to_string()))?
-    };
-
-    // Check if room is available
-    let active_count = state
-        .checkins
-        .count_active_for_room(&state.new_pool, body.room_id)
-        .await?;
-    if active_count > 0 {
-        return Err(ApiError::BadRequest("Room is currently occupied".to_string()));
-    }
-
-    // Generate check-in number (CIN-YYYYMMDD-NNNN format)
-    let last_cin_no = state.checkins.latest_cin_no_today(&state.new_pool).await?;
-    let next_seq = if let Some(last) = last_cin_no {
-        let parts: Vec<&str> = last.split('-').collect();
-        if parts.len() == 3 {
-            parts[2].parse::<i32>().unwrap_or(0) + 1
-        } else {
-            1
-        }
-    } else {
-        1
-    };
-
-    let today = state.checkins.today_yyyymmdd(&state.new_pool).await?;
-    let cin_no = format!("CIN-{}-{:04}", today, next_seq);
-
+    let cin_no = generate_cin_no(&state).await?;
+    let expected_checkout = parse_expected_checkout(&body.expected_checkout)?;
+    let check_in_time = parse_check_in_time(body.check_in_time.as_deref())?;
+    let writeback_context = build_check_in_writeback_context(&body, expected_checkout);
     let adults = body.adults.unwrap_or(1);
     let children = body.children.unwrap_or(0);
+    // TODO: wire user_id from auth middleware
+    let source = EventSource::our_app(Uuid::nil(), Uuid::new_v4());
 
-    // Parse expected checkout date
-    let expected_checkout_date = NaiveDate::parse_from_str(&body.expected_checkout, "%Y-%m-%d")
-        .map_err(|_| ApiError::BadRequest("Invalid expected checkout date format (expected YYYY-MM-DD)".to_string()))?;
-
-    // Parse optional check-in time
-    let check_in_time: Option<NaiveDateTime> = match &body.check_in_time {
-        Some(s) => Some(
-            NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
-                .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
-                .or_else(|_| NaiveDate::parse_from_str(s, "%Y-%m-%d").map(|d| d.and_hms_opt(14, 0, 0).unwrap()))
-                .map_err(|_| ApiError::BadRequest("Invalid check-in time format".to_string()))?,
-        ),
-        None => None,
-    };
-
-    let mut tx = state.new_pool.begin().await?;
-    let cin_id = state
-        .checkins
-        .insert(
-            &mut tx,
-            CheckInInsert {
-                cin_no: cin_no.as_str(),
-                booking_id: body.booking_id,
-                customer_id,
+    let outcome = match body.booking_id {
+        Some(booking_id) => state
+            .checkins_service
+            .check_in_to_booking(CheckInToBookingCommand {
+                cin_no: cin_no.clone(),
+                booking_id,
                 room_id: body.room_id,
                 check_in_time,
-                expected_checkout: expected_checkout_date,
+                expected_checkout,
                 adults,
                 children,
                 rate_per_night: body.rate_per_night,
-                notes: body.notes.as_deref(),
-            },
-        )
-        .await?;
-
-    state.checkins.mark_room_occupied(&mut tx, body.room_id).await?;
-
-    if let Some(booking_id) = body.booking_id {
-        state.checkins.set_booking_checkedin(&mut tx, booking_id).await?;
-    }
-
-    tx.commit().await?;
+                notes: body.notes.clone(),
+                writeback_context,
+                source,
+            })
+            .await
+            .map_err(map_create_checkin_error)?,
+        None => {
+            let customer_id = body.customer_id.ok_or_else(|| {
+                ApiError::BadRequest("Customer ID is required for walk-ins".to_string())
+            })?;
+            state
+                .checkins_service
+                .walk_in(WalkInCommand {
+                    cin_no: cin_no.clone(),
+                    customer_id,
+                    room_id: body.room_id,
+                    check_in_time,
+                    expected_checkout,
+                    adults,
+                    children,
+                    rate_per_night: body.rate_per_night,
+                    notes: body.notes.clone(),
+                    writeback_context,
+                    source,
+                })
+                .await
+                .map_err(map_create_checkin_error)?
+        }
+    };
 
     Ok(Json(MutationResponse {
         success: true,
         message: "Check-in created successfully".to_string(),
-        id: Some(cin_id),
+        id: Some(outcome.check_in_id),
         cin_no: Some(cin_no),
     }))
 }
@@ -365,67 +342,153 @@ pub async fn checkout(
     Path(cin_id): Path<i32>,
     Json(body): Json<CheckOutRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
+    // The service runs the same status/active check, but we still need
+    // `cin_no` for the response (the service outcome only carries the id).
     let status_snap = state
         .checkins
         .find_status(&state.new_pool, cin_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
-
-    let status = status_snap.cin_status.unwrap_or_default();
-    if status != "active" {
-        return Err(ApiError::BadRequest("Check-in is not active".to_string()));
-    }
-
     let cin_no = status_snap.cin_no;
-    let room_id = status_snap.cin_room_id;
-    let booking_id = status_snap.cin_book_id;
 
-    let payment_status = body.payment_status.as_deref().unwrap_or("paid");
+    let check_out_time = parse_check_out_time(body.check_out_time.as_deref())?;
 
-    // Parse optional check-out time
-    let check_out_time: Option<NaiveDateTime> = match &body.check_out_time {
-        Some(s) => Some(
-            NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
-                .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
-                .or_else(|_| NaiveDate::parse_from_str(s, "%Y-%m-%d").map(|d| d.and_hms_opt(12, 0, 0).unwrap()))
-                .map_err(|_| ApiError::BadRequest("Invalid check-out time format".to_string()))?,
-        ),
-        None => None,
-    };
-
-    let mut tx = state.new_pool.begin().await?;
-    state
-        .checkins
-        .apply_checkout(
-            &mut tx,
-            cin_id,
-            CheckOutWrite {
-                check_out_time,
-                total_amount: body.total_amount,
-                payment_status,
-                notes: body.notes.as_deref(),
-            },
-        )
-        .await?;
-
-    state.checkins.mark_room_available_dirty(&mut tx, room_id).await?;
-
-    if let Some(book_id) = booking_id {
-        state.checkins.set_booking_completed(&mut tx, book_id).await?;
-    }
-
-    tx.commit().await?;
+    let outcome = state
+        .checkins_service
+        .check_out(CheckOutCommand {
+            check_in_id: cin_id,
+            check_out_time,
+            total_amount: body.total_amount,
+            payment_status: body
+                .payment_status
+                .clone()
+                .unwrap_or_else(|| "paid".to_string()),
+            notes: body.notes.clone(),
+            // TODO: wire user_id from auth middleware
+            source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
+        })
+        .await
+        .map_err(map_checkout_error)?;
 
     Ok(Json(MutationResponse {
         success: true,
         message: "Check-out completed successfully".to_string(),
-        id: Some(cin_id),
+        id: Some(outcome.check_in_id),
         cin_no: Some(cin_no),
     }))
 }
 
+// ---------- create/checkout helpers ----------
+
+async fn generate_cin_no(state: &AppState) -> ApiResult<String> {
+    let last_cin_no = state.checkins.latest_cin_no_today(&state.new_pool).await?;
+    let next_seq = last_cin_no
+        .as_deref()
+        .and_then(|s| s.split('-').nth(2))
+        .and_then(|n| n.parse::<i32>().ok())
+        .map(|n| n + 1)
+        .unwrap_or(1);
+    let today = state.checkins.today_yyyymmdd(&state.new_pool).await?;
+    Ok(format!("CIN-{}-{:04}", today, next_seq))
+}
+
+fn parse_expected_checkout(raw: &str) -> ApiResult<NaiveDate> {
+    NaiveDate::parse_from_str(raw, "%Y-%m-%d").map_err(|_| {
+        ApiError::BadRequest(
+            "Invalid expected checkout date format (expected YYYY-MM-DD)".to_string(),
+        )
+    })
+}
+
+fn parse_check_in_time(raw: Option<&str>) -> ApiResult<Option<NaiveDateTime>> {
+    let Some(s) = raw else { return Ok(None) };
+    let parsed = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
+        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
+        .or_else(|_| {
+            NaiveDate::parse_from_str(s, "%Y-%m-%d").map(|d| d.and_hms_opt(14, 0, 0).unwrap())
+        })
+        .map_err(|_| ApiError::BadRequest("Invalid check-in time format".to_string()))?;
+    Ok(Some(parsed))
+}
+
+fn parse_check_out_time(raw: Option<&str>) -> ApiResult<Option<NaiveDateTime>> {
+    let Some(s) = raw else { return Ok(None) };
+    let parsed = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
+        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
+        .or_else(|_| {
+            NaiveDate::parse_from_str(s, "%Y-%m-%d").map(|d| d.and_hms_opt(12, 0, 0).unwrap())
+        })
+        .map_err(|_| ApiError::BadRequest("Invalid check-out time format".to_string()))?;
+    Ok(Some(parsed))
+}
+
+/// Build a [`CheckInWritebackContext`] from the request body.
+///
+/// TODO: enrich with room number / type / customer name lookups so the
+/// writeback worker (Phase 4b) has everything it needs without re-querying.
+/// Today the worker isn't deployed, so accumulating outbox rows with the
+/// minimum context is acceptable.
+fn build_check_in_writeback_context(
+    body: &CreateCheckInRequest,
+    expected_checkout: NaiveDate,
+) -> CheckInWritebackContext {
+    use chrono::{NaiveTime, TimeZone, Utc};
+
+    let midnight = NaiveTime::from_hms_opt(0, 0, 0).expect("hardcoded midnight is valid");
+    let now = chrono::Local::now().date_naive();
+    let stay_start = Utc.from_utc_datetime(&now.and_time(midnight));
+    let stay_end = Utc.from_utc_datetime(&expected_checkout.and_time(midnight));
+    let nights = (expected_checkout - now).num_days().max(1) as i32;
+    let price_per_night = body
+        .rate_per_night
+        .map(money_from_baht_f64)
+        .unwrap_or(Money::ZERO);
+    let price_total =
+        Money::from_satang(price_per_night.as_satang().saturating_mul(nights as i64));
+
+    CheckInWritebackContext {
+        legacy_cust_no: None,
+        linked_legacy_book_id: None,
+        room_no: String::new(),
+        room_type: String::new(),
+        stay: DateRange::new(stay_start, stay_end),
+        price_per_night,
+        nights,
+        price_total,
+        created_by: String::new(),
+        guest_name_for_registry: String::new(),
+        guest_country: String::new(),
+    }
+}
+
+fn money_from_baht_f64(baht: f64) -> Money {
+    let satang = (baht * 100.0).round() as i64;
+    Money::from_satang(satang)
+}
+
+/// Translate the service's `Conflict` outcome (room already occupied) to
+/// the route's prior 400 wording so the wire contract is preserved.
+fn map_create_checkin_error(err: ServiceError) -> ApiError {
+    match err {
+        ServiceError::Conflict(_) => ApiError::BadRequest("Room is currently occupied".to_string()),
+        other => other.into(),
+    }
+}
+
+/// Translate the service's `Conflict` outcome (check-in not active) to
+/// the route's prior 400 wording.
+fn map_checkout_error(err: ServiceError) -> ApiError {
+    match err {
+        ServiceError::Conflict(_) => ApiError::BadRequest("Check-in is not active".to_string()),
+        other => other.into(),
+    }
+}
+
 // =============================================================================
 // Guest Registry Types and Endpoints
+//
+// Stays on the repository: no service method exists yet for guest registry
+// CRUD. When a `GuestService` lands, these handlers delegate the same way.
 // =============================================================================
 
 /// Guest from HT_Guest_Registry table
