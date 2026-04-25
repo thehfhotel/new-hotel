@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.36.0] - 2026-04-25
+
+### Fixed
+
+- **`booking_create` recipe now bumps `HT_Book_Date.Book_ok`** —
+  closes the 2026-04-25 incident where bookings written via our app's
+  writeback (R014831/2/3/...) appeared in the .NET app's booking-list
+  view but NOT in the calendar grid view (room view).
+
+  Per spike capture `booking-checkin/writes.txt:27`, the legacy app's
+  pattern after every `HT_Book_Date` INSERT is to immediately fire
+  `update HT_Book_Date set Book_ok=Book_ok+1 where id=<id>`.
+  `Book_ok` defaults to 0 on INSERT; the calendar grid view filters
+  for rows where `Book_ok > 0` (treating `Book_ok = 0` as draft state),
+  so without the bump our bookings stayed invisible in the grid.
+
+  Fix is a single additional `update HT_Book_Date set Book_ok=Book_ok+1
+  where id={id}` after each night's INSERT. New regression test
+  `book_date_inserts_each_followed_by_book_ok_increment` locks in both
+  the count (one bump per night) and the ordering (bump immediately
+  follows its INSERT).
+
+  Existing bookings R014831/2/3 written before this release will need
+  manual patching — either receptionist re-saves them in the .NET app
+  (which fires the legacy pattern) or operator runs:
+  `UPDATE HT_Book_Date SET Book_ok=Book_ok+1 WHERE Book_no IN
+   ('R014831','R014832','R014833') AND Book_ok=0`.
+
+  119 lib tests pass.
+
 ## [2.35.0] - 2026-04-25
 
 ### Fixed
