@@ -5,6 +5,69 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.30.0] - 2026-04-25
+
+### Fixed
+
+- **Writeback safety audit — CRIT/HIGH/MED gaps closed before live test.**
+  Independent re-audit of the merged writeback worker (commit `d02d20d`)
+  surfaced 2 CRIT bugs that would corrupt data on the first receptionist
+  action, plus 3 HIGH and 2 MED issues. All addressed in this release.
+  One CRIT (PG schema missing `legacy_*` resolver columns) is documented
+  as task #24 — substantive design work, not a quick patch.
+
+  **CRIT (2):**
+  - **CRIT-1: Recipes now run inside an explicit MSSQL transaction.**
+    Previously `bin/writeback.rs` issued statements in autocommit mode,
+    which releases `TABLOCKX, HOLDLOCK` at the end of each statement —
+    voiding the spike §6 race-safety guarantee. The MAX+1 SELECT and the
+    INSERT it feeds were no longer in the same lock scope, so a
+    concurrent worker / .NET client could read the same value. Wrapping
+    `dispatch()` in `BEGIN TRAN ... COMMIT/ROLLBACK` restores the
+    guarantee and gives us atomic rollback on partial-recipe failure.
+  - **CRIT-2: Bangkok timezone conversion for every legacy datetime.**
+    `format_legacy_datetime` previously called `dt.naive_utc()`, which
+    treats a real UTC instant as Thai-local. Recipes pulling from PG
+    `TIMESTAMPTZ` columns and `Utc::now()` would write times 7h behind
+    the wall clock the receptionist actually entered. New `chrono-tz`
+    dependency; `format_legacy_datetime`, `midnight_of`,
+    `end_of_stay_at_almost_noon`, and `enumerate_calendar_nights` all
+    convert to `Asia/Bangkok` first. New `format::bangkok_date` and
+    `format::format_bangkok` helpers used across recipes.
+
+  **HIGH (3):**
+  - **HIGH-1: `booking_modify` falls back to existing room_no when the
+    user only changes dates.** Previously every new `HT_Book_Date` row
+    got `Book_type=''`, making the booking disappear from the .NET app's
+    calendar grid. New `ModifyBookingInputs.existing_room_no` field;
+    `execute()` queries MSSQL for the current `Book_type` when needed.
+  - **HIGH-3: `payment` recipe accumulates instead of overwriting
+    totals.** Previously set `Total_Price_Pay={amount}` and
+    `Balance=0`, losing prior partial payments and clobbering Room/Net
+    totals (which `booking_create` / `extend_stay` own). Now uses
+    additive `Total_Price_Pay = ISNULL(...,0) + amount` and recomputes
+    `Balance = Net - new_Pay`.
+  - **HIGH-4: NaN/Infinity guard before SQL formatting.** New
+    `helpers::validate_finite()` rejects non-finite f64 at recipe
+    `execute()` entry. `format!("{}", f64::NAN)` would have produced
+    the literal string `"NaN"` in SQL. Wired into `payment`,
+    `extend_stay`, and `booking_create`.
+
+  **MED (2):**
+  - **MED-1: Empty legacy ID strings are now treated as missing.**
+    `dispatcher.rs` resolution previously accepted `Some("")` as a
+    valid resolved ID, producing silent no-op `WHERE Cin_no=''`
+    UPDATEs. New `nonempty()` helper used at every resolution site.
+  - **MED-3: TM.30 random IDs constrained to positive i32 range.**
+    `rand::random::<i32>()` could produce negatives that the .NET
+    WinForms grid may mishandle. New `positive_i32()` helper masks the
+    sign bit.
+
+  **Test suite:** 99 → 104 writeback unit tests (5 new regressions).
+  Existing tests' wall-clock-as-UTC fixtures updated to Bangkok-local-as-UTC
+  (e.g. `Utc.with_ymd_and_hms(_, _, _, 12, 0, 0)` became `(_, _, _, 5, 0, 0)`
+  to mean noon Bangkok). All 114 lib tests pass.
+
 ## [2.29.0] - 2026-04-25
 
 ### Fixed

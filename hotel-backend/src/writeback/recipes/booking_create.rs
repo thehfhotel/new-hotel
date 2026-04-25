@@ -175,8 +175,15 @@ pub fn build_statements(inputs: &CreateBookingInputs<'_>) -> Vec<String> {
     // in the booking-list view, not the room-availability grid. The match-by-
     // room_no avoids the destructive subquery pattern; we already know the
     // room number from the recipe inputs.
-    let stay_in_short = inputs.stay_start.format("%d/%m %H:%M").to_string();
-    let stay_out_short = stay_end_actual.format("%d/%m %H:%M").to_string();
+    let stay_in_short = inputs
+        .stay_start
+        .with_timezone(&chrono_tz::Asia::Bangkok)
+        .format("%d/%m %H:%M")
+        .to_string();
+    let stay_out_short = stay_end_actual
+        .with_timezone(&chrono_tz::Asia::Bangkok)
+        .format("%d/%m %H:%M")
+        .to_string();
     let room_book_ds_q = sql_quote(&format!(
         "{name}  {phone} เวลาเข้าพัก : 00:00  1. {room}  ({in_short}) ถึง ({out_short})  หมายเหตุ : {notes} ",
         name = inputs.customer_name,
@@ -200,25 +207,33 @@ pub fn build_statements(inputs: &CreateBookingInputs<'_>) -> Vec<String> {
     statements
 }
 
-/// Snap a stay-end DateTime to `11:59:59 AM` of the same calendar day.
-/// Per spike §3b — convenient for date-range BETWEEN queries.
+/// Snap a stay-end DateTime to `11:59:59 AM` of the same Bangkok calendar day.
+/// Per spike §3b — convenient for date-range BETWEEN queries. Uses Bangkok
+/// time to determine the calendar day (a 17:00Z instant is the *next* day in
+/// Bangkok, so `date_naive()` on UTC would return the wrong day).
 pub fn end_of_stay_at_almost_noon(stay_end: DateTime<Utc>) -> DateTime<Utc> {
-    let date = stay_end.date_naive();
-    Utc.from_utc_datetime(
-        &date
-            .and_hms_opt(11, 59, 59)
-            .expect("11:59:59 is a valid time"),
-    )
+    use chrono_tz::Asia::Bangkok;
+    let bkk_date = stay_end.with_timezone(&Bangkok).date_naive();
+    let bkk_target = bkk_date
+        .and_hms_opt(11, 59, 59)
+        .expect("11:59:59 is a valid time");
+    Bangkok
+        .from_local_datetime(&bkk_target)
+        .single()
+        .expect("11:59:59 is unambiguous in Asia/Bangkok (no DST)")
+        .with_timezone(&Utc)
 }
 
-/// Enumerate calendar nights in `[stay_start, stay_end)`. Each becomes one
-/// `HT_Book_Date` row.
+/// Enumerate Bangkok calendar nights in `[stay_start, stay_end)`. Each becomes
+/// one `HT_Book_Date` row. The boundaries are the Bangkok calendar day, not
+/// the UTC one — a 17:00Z instant is already the next day in Bangkok.
 pub fn enumerate_calendar_nights(
     stay_start: DateTime<Utc>,
     stay_end: DateTime<Utc>,
 ) -> Vec<NaiveDate> {
-    let start = stay_start.date_naive();
-    let end = stay_end.date_naive();
+    use chrono_tz::Asia::Bangkok;
+    let start = stay_start.with_timezone(&Bangkok).date_naive();
+    let end = stay_end.with_timezone(&Bangkok).date_naive();
     let mut nights = Vec::new();
     let mut day = start;
     while day < end {
@@ -258,6 +273,15 @@ pub async fn execute(
 
     let nights_calendar = enumerate_calendar_nights(payload.stay.start, payload.stay.end);
     let nights = payload.nights.max(1);
+    let price_baht = (payload.price.as_satang() as f64) / 100.0;
+
+    // HIGH-4: defense-in-depth NaN/Infinity guard. Money-derived f64s are
+    // always finite today, but the night-total interpolation
+    // (`price * nights`) could overflow to infinity for extreme inputs.
+    super::helpers::validate_finite(&[
+        ("price_baht", price_baht),
+        ("nightly_total", price_baht * (nights as f64)),
+    ])?;
 
     let inputs = CreateBookingInputs {
         book_id: &book_id,
@@ -270,7 +294,7 @@ pub async fn execute(
         stay_start: payload.stay.start,
         stay_end: payload.stay.end,
         room_no: &payload.room_no,
-        price_baht: (payload.price.as_satang() as f64) / 100.0,
+        price_baht,
         nights,
         book_date_id_base,
         nights_calendar,
@@ -304,8 +328,9 @@ mod tests {
             customer_phone: Some("0900000088"),
             created_by: "Admin",
             notes: None,
-            stay_start: Utc.with_ymd_and_hms(2026, 4, 25, 12, 0, 0).unwrap(),
-            stay_end: Utc.with_ymd_and_hms(2026, 4, 26, 12, 0, 0).unwrap(),
+            // 5 AM UTC = noon Bangkok (legacy app's wall-clock view).
+            stay_start: Utc.with_ymd_and_hms(2026, 4, 25, 5, 0, 0).unwrap(),
+            stay_end: Utc.with_ymd_and_hms(2026, 4, 26, 5, 0, 0).unwrap(),
             room_no: "402",
             price_baht: 890.0,
             nights: 1,

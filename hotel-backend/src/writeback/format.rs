@@ -13,22 +13,24 @@
 //!   on NULL, so we always send empty string.
 
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc};
+use chrono_tz::Asia::Bangkok;
 
 /// Format a `DateTime<Utc>` into the legacy app's `M/D/YYYY h:mm:ss tt`
-/// representation (spike §4b).
+/// representation (spike §4b), converting from UTC to Asia/Bangkok wall-clock
+/// time first.
 ///
-/// Examples (verified against captures):
-/// * `2026-04-24T17:05:04Z` → `"4/24/2026 5:05:04 PM"`
-/// * `2026-04-26T11:59:59Z` → `"4/26/2026 11:59:59 AM"`
-/// * `2026-04-25T00:00:00Z` → `"4/25/2026 12:00:00 AM"` (midnight = 12 AM in 12-hour clock)
-/// * `2026-04-25T12:00:00Z` → `"4/25/2026 12:00:00 PM"` (noon = 12 PM)
+/// **Why the timezone conversion:** the .NET app stores Thai-local naive
+/// datetimes (no offset). Our PG `TIMESTAMPTZ` columns store real UTC
+/// instants. Without the conversion, every value we write to MSSQL would be
+/// 7h behind the wall-clock time the receptionist actually entered.
 ///
-/// We deliberately treat the input as **wall-clock Thai time** (matching the
-/// legacy app's `CultureInfo.InvariantCulture` / `en-US` `DateTime.ToString()`
-/// — see spike §4b). All hotel data lives in GMT+7 by convention; the
-/// timezone offset is dropped at the format layer.
+/// Examples (the input is the real UTC instant; the output is the Bangkok
+/// wall clock that the .NET app expects):
+/// * `2026-04-24T10:05:04Z` (= 17:05 Bangkok) → `"4/24/2026 5:05:04 PM"`
+/// * `2026-04-26T04:59:59Z` (= 11:59 Bangkok) → `"4/26/2026 11:59:59 AM"`
+/// * `2026-04-24T17:00:00Z` (= 00:00 Bangkok next day) → `"4/25/2026 12:00:00 AM"`
 pub fn format_legacy_datetime(dt: DateTime<Utc>) -> String {
-    format_legacy_naive(dt.naive_utc())
+    format_legacy_naive(dt.with_timezone(&Bangkok).naive_local())
 }
 
 /// Like [`format_legacy_datetime`] but for `NaiveDateTime` (no offset).
@@ -51,6 +53,38 @@ pub fn format_legacy_naive(dt: NaiveDateTime) -> String {
 /// and `HT_Room_Status.room_date` (per spike captures).
 pub fn format_legacy_date(date: NaiveDate) -> String {
     format!("{}/{}/{}", date.month(), date.day(), date.year())
+}
+
+/// Convert a UTC instant to its Bangkok calendar day. Use this everywhere we
+/// derive a `NaiveDate` from a `DateTime<Utc>` — `dt.date_naive()` returns
+/// the UTC day, which is wrong for any instant after 17:00Z (already the
+/// next day in Bangkok). Spike captures and the .NET app's date logic both
+/// use the Bangkok calendar.
+pub fn bangkok_date(dt: DateTime<Utc>) -> NaiveDate {
+    dt.with_timezone(&Bangkok).date_naive()
+}
+
+/// Format a UTC instant using a chrono `strftime` pattern in Bangkok-local
+/// wall-clock. Use for non-spike-captured display strings (e.g. the
+/// `HT_Rooms.room_book_ds` summary text).
+pub fn format_bangkok(dt: DateTime<Utc>, fmt: &str) -> String {
+    dt.with_timezone(&Bangkok).format(fmt).to_string()
+}
+
+/// Render an `f64` as a SQL numeric literal. Errors loudly on NaN/Infinity
+/// rather than letting `format!("{}", f64::NAN)` produce the literal string
+/// `"NaN"`, which would silently emit invalid SQL like `Total_Price=NaN` and
+/// fail the entire transaction (audit HIGH-4).
+///
+/// Use this instead of bare `format!("{amount}")` everywhere a recipe
+/// interpolates a money / count / price value into SQL.
+pub fn f64_sql(value: f64) -> Result<String, crate::writeback::error::WritebackError> {
+    if !value.is_finite() {
+        return Err(crate::writeback::error::WritebackError::Recipe(format!(
+            "non-finite f64 cannot be rendered as SQL: {value}"
+        )));
+    }
+    Ok(value.to_string())
 }
 
 /// Convert 24-hour clock to (12-hour, "AM"/"PM"). Matches .NET's
@@ -107,12 +141,21 @@ pub fn sql_quote_or_empty(value: Option<&str>) -> String {
     sql_quote(value.unwrap_or(""))
 }
 
-/// Convert a `DateTime<Utc>` into its midnight (00:00:00) equivalent for the
-/// **same calendar day**. Spike §3k requires `HT_Book_H.Book_Date_in/out` at
-/// midnight so the booking-list view renders correctly.
+/// Convert a `DateTime<Utc>` into midnight (00:00:00) of its **Bangkok
+/// calendar day**. Spike §3k requires `HT_Book_H.Book_Date_in/out` at midnight
+/// so the booking-list view renders correctly. The day boundary must be the
+/// Bangkok one — a 17:00Z instant is 00:00 the *next* day in Bangkok, so
+/// `date_naive()` on the raw UTC instant returns the wrong calendar day.
 pub fn midnight_of(dt: DateTime<Utc>) -> DateTime<Utc> {
-    let date = dt.date_naive();
-    Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).expect("hms 0 0 0 is valid"))
+    let bkk_date = dt.with_timezone(&Bangkok).date_naive();
+    let bkk_midnight = bkk_date
+        .and_hms_opt(0, 0, 0)
+        .expect("hms 0 0 0 is valid");
+    Bangkok
+        .from_local_datetime(&bkk_midnight)
+        .single()
+        .expect("midnight is unambiguous in Asia/Bangkok (no DST)")
+        .with_timezone(&Utc)
 }
 
 #[cfg(test)]
@@ -123,34 +166,47 @@ mod tests {
     #[test]
     fn format_datetime_matches_spike_capture_5pm() {
         // Spike checkout-20260424-100323/writes.txt:20 — Cin_Room_Out='4/24/2026 5:05:04 PM'
-        let dt = Utc.with_ymd_and_hms(2026, 4, 24, 17, 5, 4).unwrap();
+        // Bangkok 17:05:04 = UTC 10:05:04
+        let dt = Utc.with_ymd_and_hms(2026, 4, 24, 10, 5, 4).unwrap();
         assert_eq!(format_legacy_datetime(dt), "4/24/2026 5:05:04 PM");
     }
 
     #[test]
     fn format_datetime_matches_spike_booking_checkin() {
         // Spike booking-checkin-20260424-101838/writes.txt:3 — Book_Date_in='4/25/2026 12:00:00 PM'
-        let dt = Utc.with_ymd_and_hms(2026, 4, 25, 12, 0, 0).unwrap();
+        // Bangkok noon = UTC 05:00
+        let dt = Utc.with_ymd_and_hms(2026, 4, 25, 5, 0, 0).unwrap();
         assert_eq!(format_legacy_datetime(dt), "4/25/2026 12:00:00 PM");
     }
 
     #[test]
     fn format_datetime_matches_spike_booking_checkout() {
         // Spike — Book_Date_out='4/26/2026 11:59:59 AM'
-        let dt = Utc.with_ymd_and_hms(2026, 4, 26, 11, 59, 59).unwrap();
+        // Bangkok 11:59:59 = UTC 04:59:59
+        let dt = Utc.with_ymd_and_hms(2026, 4, 26, 4, 59, 59).unwrap();
         assert_eq!(format_legacy_datetime(dt), "4/26/2026 11:59:59 AM");
     }
 
     #[test]
     fn format_datetime_midnight_renders_as_12_am() {
-        let dt = Utc.with_ymd_and_hms(2026, 4, 25, 0, 0, 0).unwrap();
+        // Bangkok midnight on 4/25 = UTC 17:00 on 4/24
+        let dt = Utc.with_ymd_and_hms(2026, 4, 24, 17, 0, 0).unwrap();
         assert_eq!(format_legacy_datetime(dt), "4/25/2026 12:00:00 AM");
     }
 
     #[test]
     fn format_datetime_noon_renders_as_12_pm() {
-        let dt = Utc.with_ymd_and_hms(2026, 4, 25, 12, 0, 0).unwrap();
+        // Bangkok noon = UTC 05:00
+        let dt = Utc.with_ymd_and_hms(2026, 4, 25, 5, 0, 0).unwrap();
         assert_eq!(format_legacy_datetime(dt), "4/25/2026 12:00:00 PM");
+    }
+
+    #[test]
+    fn format_datetime_converts_utc_to_bangkok() {
+        // Regression for CRIT-2: a real UTC instant from PG must be shifted
+        // +7h before formatting. UTC noon = 19:00 Bangkok, NOT 12:00.
+        let utc_noon = Utc.with_ymd_and_hms(2026, 4, 25, 12, 0, 0).unwrap();
+        assert_eq!(format_legacy_datetime(utc_noon), "4/25/2026 7:00:00 PM");
     }
 
     #[test]
@@ -183,8 +239,18 @@ mod tests {
     }
 
     #[test]
-    fn midnight_of_preserves_calendar_day() {
-        let dt = Utc.with_ymd_and_hms(2026, 4, 25, 14, 30, 45).unwrap();
-        assert_eq!(midnight_of(dt), Utc.with_ymd_and_hms(2026, 4, 25, 0, 0, 0).unwrap());
+    fn midnight_of_preserves_bangkok_calendar_day() {
+        // Bangkok 14:30:45 on 4/25 = UTC 07:30:45 on 4/25
+        // Bangkok midnight on 4/25 = UTC 17:00:00 on 4/24
+        let dt = Utc.with_ymd_and_hms(2026, 4, 25, 7, 30, 45).unwrap();
+        assert_eq!(midnight_of(dt), Utc.with_ymd_and_hms(2026, 4, 24, 17, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn midnight_of_handles_late_utc_that_is_next_bangkok_day() {
+        // UTC 18:00 on 4/24 = Bangkok 01:00 on 4/25
+        // Midnight of that Bangkok day = Bangkok 00:00 on 4/25 = UTC 17:00 on 4/24
+        let dt = Utc.with_ymd_and_hms(2026, 4, 24, 18, 0, 0).unwrap();
+        assert_eq!(format_legacy_datetime(midnight_of(dt)), "4/25/2026 12:00:00 AM");
     }
 }
