@@ -280,7 +280,20 @@ pub async fn create_checkin(
     let cin_no = generate_cin_no(&state).await?;
     let expected_checkout = parse_expected_checkout(&body.expected_checkout)?;
     let check_in_time = parse_check_in_time(body.check_in_time.as_deref())?;
-    let writeback_context = build_check_in_writeback_context(&body, expected_checkout);
+    // Walk-ins use `body.customer_id`; booking-linked check-ins resolve the
+    // customer through the booking. Both feed the writeback recipe (`walkin`
+    // or `checkin_to_booking`) which copies `guest_name_for_registry` into
+    // both `HT_Customers.Cust_name` and `HT_CheckIn_Other_People.Cin_name`.
+    let resolved_customer_id = match body.booking_id {
+        Some(booking_id) => state
+            .checkins
+            .get_booking_customer_id(&state.new_pool, booking_id)
+            .await?,
+        None => body.customer_id,
+    };
+    let writeback_context =
+        build_check_in_writeback_context(&state, &body, expected_checkout, resolved_customer_id)
+            .await?;
     let adults = body.adults.unwrap_or(1);
     let children = body.children.unwrap_or(0);
     // TODO: wire user_id from auth middleware
@@ -422,16 +435,21 @@ fn parse_check_out_time(raw: Option<&str>) -> ApiResult<Option<NaiveDateTime>> {
     Ok(Some(parsed))
 }
 
-/// Build a [`CheckInWritebackContext`] from the request body.
+/// Build a [`CheckInWritebackContext`] from the request body + PG lookups.
 ///
-/// TODO: enrich with room number / type / customer name lookups so the
-/// writeback worker (Phase 4b) has everything it needs without re-querying.
-/// Today the worker isn't deployed, so accumulating outbox rows with the
-/// minimum context is acceptable.
-fn build_check_in_writeback_context(
+/// The walk-in recipe (spike §3a) uses `guest_name_for_registry` for both
+/// `HT_Customers.Cust_name` and `HT_CheckIn_Other_People.Cin_name`. The
+/// linked-to-booking recipe (§3d) uses it for the `HT_CheckIn_Ds.room_Details`
+/// label that shows on the room grid. Either way, it MUST be populated or the
+/// .NET app shows the row with blank guest. Same story for `room_no` /
+/// `room_type` (which lands on `HT_CheckIn_Ds.Cin_Room_No` / `Cin_Room_Type`)
+/// and `price_per_night` (`HT_CheckIn_Ds.Cin_Room_Price`).
+async fn build_check_in_writeback_context(
+    state: &AppState,
     body: &CreateCheckInRequest,
     expected_checkout: NaiveDate,
-) -> CheckInWritebackContext {
+    resolved_customer_id: Option<i32>,
+) -> ApiResult<CheckInWritebackContext> {
     use chrono::{NaiveTime, TimeZone, Utc};
 
     let midnight = NaiveTime::from_hms_opt(0, 0, 0).expect("hardcoded midnight is valid");
@@ -439,25 +457,65 @@ fn build_check_in_writeback_context(
     let stay_start = Utc.from_utc_datetime(&now.and_time(midnight));
     let stay_end = Utc.from_utc_datetime(&expected_checkout.and_time(midnight));
     let nights = (expected_checkout - now).num_days().max(1) as i32;
+
+    // Look up the room first — its weekday price is the fallback when the
+    // request omits `rate_per_night`. Ditto for room_no / room_type which
+    // the recipe inserts verbatim into HT_CheckIn_Ds.
+    let room = state.rooms.get(&state.new_pool, body.room_id).await?;
+    let (room_no, room_type, default_weekday) = match room {
+        Some(r) => (
+            r.room_no,
+            r.type_name.unwrap_or_default(),
+            r.room_price_weekday,
+        ),
+        None => (String::new(), String::new(), None),
+    };
+
     let price_per_night = body
         .rate_per_night
+        .or(default_weekday)
         .map(money_from_baht_f64)
         .unwrap_or(Money::ZERO);
     let price_total =
         Money::from_satang(price_per_night.as_satang().saturating_mul(nights as i64));
 
-    CheckInWritebackContext {
+    // Customer lookup. The walkin recipe also INSERTs HT_Customers from this
+    // value when legacy_cust_no is None, so an empty name here results in a
+    // blank-named customer in legacy. We try hard, but fall back to empty
+    // rather than failing the check-in (matches build_writeback_context for
+    // bookings — degrade gracefully on missing FKs).
+    let guest_name = match resolved_customer_id {
+        Some(cust_id) => state
+            .customers
+            .get(&state.new_pool, cust_id)
+            .await?
+            .map(|c| full_customer_name(&c.cust_firstname, c.cust_lastname.as_deref()))
+            .unwrap_or_default(),
+        None => String::new(),
+    };
+
+    Ok(CheckInWritebackContext {
         legacy_cust_no: None,
         linked_legacy_book_id: None,
-        room_no: String::new(),
-        room_type: String::new(),
+        room_no,
+        room_type,
         stay: DateRange::new(stay_start, stay_end),
         price_per_night,
         nights,
         price_total,
         created_by: String::new(),
-        guest_name_for_registry: String::new(),
+        guest_name_for_registry: guest_name,
         guest_country: String::new(),
+    })
+}
+
+/// Join `cust_firstname` + `cust_lastname` with a single space, dropping the
+/// trailing space when the last name is missing. Mirrors the
+/// `HT_Customers.Cust_name` shape (legacy stores the joined value).
+fn full_customer_name(first: &str, last: Option<&str>) -> String {
+    match last {
+        Some(last) if !last.is_empty() => format!("{} {}", first, last),
+        _ => first.to_string(),
     }
 }
 

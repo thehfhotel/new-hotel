@@ -314,6 +314,12 @@ pub async fn create_booking(
     let book_no = generate_book_no(&state).await?;
     let (check_in_date, check_out_date) = parse_stay_range(&body.check_in, &body.check_out)?;
 
+    // Fetch customer + first room so the writeback context lands populated
+    // (otherwise the .NET booking list shows blank Book_Cust_Name +
+    // Book_Room_Type + Book_Room_Price — see the [2.28.0] CHANGELOG entry).
+    let writeback_context =
+        build_writeback_context(&state, &body, check_in_date, check_out_date).await?;
+
     let cmd = CreateBookingCommand {
         book_no: book_no.clone(),
         customer_id: body.customer_id,
@@ -327,7 +333,7 @@ pub async fn create_booking(
         deposit_amount: body.deposit_amount,
         notes: body.notes.clone(),
         rooms: body.rooms.iter().map(room_request_to_command).collect(),
-        writeback_context: build_writeback_context(&body, check_in_date, check_out_date),
+        writeback_context,
         // TODO: wire user_id from auth middleware
         source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
     };
@@ -463,33 +469,90 @@ fn room_request_to_command(req: &BookingRoomRequest) -> BookingRoomCommand {
     }
 }
 
-/// Build a [`BookingWritebackContext`] from the request body.
+/// Build a [`BookingWritebackContext`] from the request body + PG lookups
+/// for the customer (`ht_customers`) and the first assigned room
+/// (`ht_rooms_new`).
 ///
-/// TODO: enrich with customer name/phone, room number/type lookups so the
-/// writeback worker (Phase 4b) has everything it needs without re-querying.
-/// Today the worker isn't deployed, so accumulating outbox rows with the
-/// minimum context is acceptable.
-fn build_writeback_context(
+/// The legacy `HT_Book_H` row needs `Book_Cust_Name`, `Book_Cust_Tel`, and
+/// `Book_Room_Type` (which actually stores the room number per spike §3b).
+/// Without populating these the .NET booking list shows blank cells and the
+/// receptionist can't identify the booking — the failure mode the [2.28.0]
+/// CHANGELOG flagged.
+///
+/// Multi-room bookings: `HT_Book_Ds` only carries one room number per row in
+/// the legacy schema. We pick the first room's price/number for the recipe
+/// payload — additional rooms in `body.rooms` still get persisted in
+/// `ht_booking_rooms` (PG canonical), but the legacy view only sees the first.
+/// This matches the .NET app's own behavior for multi-room bookings (it
+/// surfaces them as one HT_Book_Ds row).
+async fn build_writeback_context(
+    state: &AppState,
     body: &CreateUpdateBookingRequest,
     check_in: NaiveDate,
     check_out: NaiveDate,
-) -> BookingWritebackContext {
+) -> ApiResult<BookingWritebackContext> {
     use crate::service::{aggregate_uuid, AggregateKind};
 
     let stay = DateRange::new(naive_date_to_utc(check_in), naive_date_to_utc(check_out));
-    let price = body.total_amount.map(money_from_baht_f64).unwrap_or(Money::ZERO);
 
-    BookingWritebackContext {
+    let customer = state.customers.get(&state.new_pool, body.customer_id).await?;
+    let (customer_name, customer_phone) = match customer {
+        Some(c) => (
+            full_customer_name(&c.cust_firstname, c.cust_lastname.as_deref()),
+            c.cust_phone,
+        ),
+        // Customer was deleted between the form submit and the route — fall
+        // back to empty so the booking still lands. The receipt will show
+        // blank for this booking; matches the legacy app's tolerance.
+        None => (String::new(), None),
+    };
+
+    let primary_room = body.rooms.first();
+    let (room_no, room_type, room_price_baht) = match primary_room {
+        Some(req) => {
+            let room = state.rooms.get(&state.new_pool, req.room_id).await?;
+            let (room_no, room_type, default_weekday) = match room {
+                Some(r) => (
+                    r.room_no,
+                    r.type_name.unwrap_or_default(),
+                    r.room_price_weekday,
+                ),
+                None => (String::new(), String::new(), None),
+            };
+            // Per-room override on the request beats the room's default; if
+            // neither is set, fall back to the booking total (existing
+            // behavior for one-room bookings).
+            let price = req
+                .price_per_night
+                .or(default_weekday)
+                .or(body.total_amount)
+                .unwrap_or(0.0);
+            (room_no, room_type, price)
+        }
+        None => (String::new(), String::new(), body.total_amount.unwrap_or(0.0)),
+    };
+
+    Ok(BookingWritebackContext {
         customer_aggregate_id: aggregate_uuid(AggregateKind::Customer, body.customer_id),
         legacy_cust_no: None,
-        customer_name: String::new(),
-        customer_phone: None,
+        customer_name,
+        customer_phone,
         stay,
-        room_no: String::new(),
-        room_type: String::new(),
-        price,
+        room_no,
+        room_type,
+        price: money_from_baht_f64(room_price_baht),
         created_by: String::new(),
         notes: body.notes.clone(),
+    })
+}
+
+/// Join `cust_firstname` + `cust_lastname` with a single space, dropping the
+/// trailing space when the last name is missing or empty. Mirrors the
+/// `HT_Customers.Cust_name` shape (the legacy schema stores the joined value).
+fn full_customer_name(first: &str, last: Option<&str>) -> String {
+    match last {
+        Some(last) if !last.is_empty() => format!("{} {}", first, last),
+        _ => first.to_string(),
     }
 }
 
