@@ -7,7 +7,28 @@
 //! literal in lock-step (drift across recipes would surface as parity
 //! errors against the legacy DB only after deployment).
 
+use crate::writeback::error::{WritebackError, WritebackResult};
 use crate::writeback::format::sql_quote;
+
+/// Reject any non-finite f64 (NaN/Infinity) before it gets interpolated into
+/// SQL. `format!("{}", f64::NAN)` produces the literal string `"NaN"`, which
+/// would emit invalid SQL like `Total_Price=NaN` and fail the entire
+/// transaction (audit HIGH-4). Callers should validate every monetary /
+/// price / count value at the entry of `execute()` so the failure surfaces
+/// before any allocate / INSERT runs.
+///
+/// Pass `(label, value)` pairs so the error message identifies the offending
+/// field.
+pub fn validate_finite(values: &[(&str, f64)]) -> WritebackResult<()> {
+    for (label, value) in values {
+        if !value.is_finite() {
+            return Err(WritebackError::Recipe(format!(
+                "non-finite {label} cannot be written to legacy DB: {value}"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// `UPDATE HT_Cupon SET cupon_print=1 WHERE cupon_cin_no=<cin_no>` — fired
 /// after every walk-in (spike `walkin/writes.txt:9`) and after the linked-
@@ -44,5 +65,26 @@ mod tests {
     fn embedded_quote_in_cin_no_is_escaped() {
         let stmt = mark_cupon_printed("CH'26-005228");
         assert!(stmt.contains("'CH''26-005228'"));
+    }
+
+    #[test]
+    fn validate_finite_passes_normal_values() {
+        assert!(validate_finite(&[("amount", 890.0), ("nights", 2.0)]).is_ok());
+        assert!(validate_finite(&[("zero", 0.0)]).is_ok());
+        assert!(validate_finite(&[("negative", -100.5)]).is_ok());
+    }
+
+    #[test]
+    fn validate_finite_rejects_nan() {
+        let err = validate_finite(&[("amount", f64::NAN)]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("amount"), "msg: {msg}");
+        assert!(msg.contains("NaN"), "msg: {msg}");
+    }
+
+    #[test]
+    fn validate_finite_rejects_infinity() {
+        assert!(validate_finite(&[("price", f64::INFINITY)]).is_err());
+        assert!(validate_finite(&[("price", f64::NEG_INFINITY)]).is_err());
     }
 }

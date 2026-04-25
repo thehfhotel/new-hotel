@@ -250,8 +250,8 @@ fn enumerate_calendar_nights(
     stay_start: DateTime<Utc>,
     stay_end: DateTime<Utc>,
 ) -> Vec<NaiveDate> {
-    let start = stay_start.date_naive();
-    let end = stay_end.date_naive();
+    let start = crate::writeback::format::bangkok_date(stay_start);
+    let end = crate::writeback::format::bangkok_date(stay_end);
     let mut nights = Vec::new();
     let mut day = start;
     while day < end {

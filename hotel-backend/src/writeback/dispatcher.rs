@@ -89,6 +89,14 @@ pub struct ResolvedJob {
     pub legacy_checkin_ds_id: Option<i32>,
 }
 
+/// Treat empty-string legacy IDs as missing (audit MED-1). PG can return
+/// `Some("")` for a `legacy_*` column that has never been populated by a
+/// successful writeback yet — letting that through would produce
+/// `WHERE Cin_no=''` (a silent no-op) instead of failing loudly.
+fn nonempty<'a>(opt: Option<&'a String>) -> Option<&'a str> {
+    opt.map(|s| s.as_str()).filter(|s| !s.is_empty())
+}
+
 /// Job context carried through dispatch. Lets the recipe trace its own
 /// activity in logs without having to re-derive identifiers from the payload.
 #[derive(Debug, Clone, Copy)]
@@ -120,7 +128,7 @@ pub async fn dispatch(
             recipes::booking_create::execute(conn, payload).await
         }
         WritebackIntent::ModifyBooking { booking_id: _, changes } => {
-            let book_id = resolved.legacy_book_id.as_deref().ok_or_else(|| {
+            let book_id = nonempty(resolved.legacy_book_id.as_ref()).ok_or_else(|| {
                 WritebackError::Recipe(
                     "ModifyBooking requires resolved legacy_book_id".into(),
                 )
@@ -128,7 +136,7 @@ pub async fn dispatch(
             recipes::booking_modify::execute(conn, book_id, changes).await
         }
         WritebackIntent::CancelBooking { booking_id: _ } => {
-            let book_id = resolved.legacy_book_id.as_deref().ok_or_else(|| {
+            let book_id = nonempty(resolved.legacy_book_id.as_ref()).ok_or_else(|| {
                 WritebackError::Recipe(
                     "CancelBooking requires resolved legacy_book_id".into(),
                 )
@@ -137,10 +145,8 @@ pub async fn dispatch(
         }
         WritebackIntent::CreateCheckIn { check_in_id: _, payload } => {
             if payload.linked_booking_id.is_some() {
-                let book_id = payload
-                    .linked_legacy_book_id
-                    .as_deref()
-                    .or(resolved.legacy_book_id.as_deref())
+                let book_id = nonempty(payload.linked_legacy_book_id.as_ref())
+                    .or(nonempty(resolved.legacy_book_id.as_ref()))
                     .ok_or_else(|| {
                         WritebackError::Recipe(
                             "CheckIn-to-booking requires legacy_book_id (in payload \
@@ -159,10 +165,10 @@ pub async fn dispatch(
             room_price,
             pay_to_subtract,
         } => {
-            let cin_no = resolved.legacy_cin_no.as_deref().ok_or_else(|| {
+            let cin_no = nonempty(resolved.legacy_cin_no.as_ref()).ok_or_else(|| {
                 WritebackError::Recipe("CancelCheckIn requires resolved legacy_cin_no".into())
             })?;
-            let room_no = resolved.legacy_room_no.as_deref().ok_or_else(|| {
+            let room_no = nonempty(resolved.legacy_room_no.as_ref()).ok_or_else(|| {
                 WritebackError::Recipe("CancelCheckIn requires resolved legacy_room_no".into())
             })?;
             recipes::checkin_cancel::execute(
@@ -185,10 +191,10 @@ pub async fn dispatch(
             new_pay_total,
             new_balance_total,
         } => {
-            let cin_no = resolved.legacy_cin_no.as_deref().ok_or_else(|| {
+            let cin_no = nonempty(resolved.legacy_cin_no.as_ref()).ok_or_else(|| {
                 WritebackError::Recipe("ExtendStay requires resolved legacy_cin_no".into())
             })?;
-            let room_no = resolved.legacy_room_no.as_deref().ok_or_else(|| {
+            let room_no = nonempty(resolved.legacy_room_no.as_ref()).ok_or_else(|| {
                 WritebackError::Recipe("ExtendStay requires resolved legacy_room_no".into())
             })?;
             let ds_id = resolved.legacy_checkin_ds_id.ok_or_else(|| {
@@ -212,10 +218,10 @@ pub async fn dispatch(
             .await
         }
         WritebackIntent::CheckOut { check_in_id: _ } => {
-            let cin_no = resolved.legacy_cin_no.as_deref().ok_or_else(|| {
+            let cin_no = nonempty(resolved.legacy_cin_no.as_ref()).ok_or_else(|| {
                 WritebackError::Recipe("CheckOut requires resolved legacy_cin_no".into())
             })?;
-            let room_no = resolved.legacy_room_no.as_deref().ok_or_else(|| {
+            let room_no = nonempty(resolved.legacy_room_no.as_ref()).ok_or_else(|| {
                 WritebackError::Recipe("CheckOut requires resolved legacy_room_no".into())
             })?;
             let ds_id = resolved.legacy_checkin_ds_id.ok_or_else(|| {
@@ -232,13 +238,13 @@ pub async fn dispatch(
             receipt,
             checkin_ds_id,
         } => {
-            let cin_no = resolved.legacy_cin_no.as_deref().ok_or_else(|| {
+            let cin_no = nonempty(resolved.legacy_cin_no.as_ref()).ok_or_else(|| {
                 WritebackError::Recipe("RecordPayment requires resolved legacy_cin_no".into())
             })?;
-            let cust_no = resolved.legacy_cust_no.as_deref().ok_or_else(|| {
+            let cust_no = nonempty(resolved.legacy_cust_no.as_ref()).ok_or_else(|| {
                 WritebackError::Recipe("RecordPayment requires resolved legacy_cust_no".into())
             })?;
-            let room_no = resolved.legacy_room_no.as_deref().ok_or_else(|| {
+            let room_no = nonempty(resolved.legacy_room_no.as_ref()).ok_or_else(|| {
                 WritebackError::Recipe("RecordPayment requires resolved legacy_room_no".into())
             })?;
             recipes::payment::execute(
@@ -247,7 +253,7 @@ pub async fn dispatch(
             .await
         }
         WritebackIntent::MarkRoomClean { room_id: _, by } => {
-            let room_no = resolved.legacy_room_no.as_deref().ok_or_else(|| {
+            let room_no = nonempty(resolved.legacy_room_no.as_ref()).ok_or_else(|| {
                 WritebackError::Recipe("MarkRoomClean requires resolved legacy_room_no".into())
             })?;
             let room_id_int = resolved.legacy_room_id_int.ok_or_else(|| {

@@ -123,10 +123,16 @@ pub fn build_statements(inputs: &PaymentInputs<'_>) -> Vec<String> {
          {cust_no_q},{service_code_q},1,{amount})"
     ));
 
-    // 4. HT_CheckIn_H — refresh totals (mirrors the spike capture's update)
+    // 4. HT_CheckIn_H — accumulate Pay, recompute Balance from Net (HIGH-3).
+    //    The spike capture (§3h) was a full-settle so it set Pay=amount and
+    //    Balance=0 verbatim. Replaying that on a partial payment would lose
+    //    prior payments and clobber Total_Price_Room / Total_Price_Net (which
+    //    the booking_create / extend_stay recipes own). We additively update
+    //    Pay and recompute Balance = Net - Pay, leaving Room/Net/Product
+    //    alone.
     statements.push(format!(
-        "UPDATE [HT_CheckIn_H] SET  [Total_Price_Room]={amount},[Total_Price_Product]=0,\
-         [Total_Price_Net]={amount},[Total_Price_Pay]={amount},[Total_Price_Balance]=0 \
+        "UPDATE [HT_CheckIn_H] SET [Total_Price_Pay]=ISNULL([Total_Price_Pay],0)+{amount},\
+         [Total_Price_Balance]=ISNULL([Total_Price_Net],0)-(ISNULL([Total_Price_Pay],0)+{amount}) \
          where [Cin_no]={cin_no_q}"
     ));
 
@@ -197,6 +203,10 @@ pub async fn execute(
         );
     }
 
+    // HIGH-4: reject NaN/Infinity before SQL formatting.
+    let amount_f64 = (amount.as_satang() as f64) / 100.0;
+    super::helpers::validate_finite(&[("amount_baht", amount_f64)])?;
+
     let pay_no = allocate_pay_no(conn).await?;
     let receipt_no = allocate_receipt_no(conn).await?;
     let receipt_h_id = allocate_receipt_h_id(conn).await?;
@@ -208,7 +218,7 @@ pub async fn execute(
         customer_name: receipt.customer_name.as_str(),
         customer_address: receipt.customer_address.as_str(),
         customer_tel: receipt.customer_tel.as_str(),
-        amount_baht: (amount.as_satang() as f64) / 100.0,
+        amount_baht: amount_f64,
         method,
         pay_no: &pay_no,
         receipt_no: &receipt_no,
@@ -335,11 +345,25 @@ mod tests {
     }
 
     #[test]
-    fn checkin_h_totals_include_payment() {
+    fn checkin_h_totals_accumulate_payment_per_high3() {
+        // HIGH-3: the previous recipe set Total_Price_Pay={amount}, which lost
+        // any prior partial payment and clobbered Room/Net. Now we additively
+        // update Pay and recompute Balance from Net.
         let s = build_statements(&sample_inputs());
         let upd = s.iter().find(|s| s.contains("UPDATE [HT_CheckIn_H]")).unwrap();
-        assert!(upd.contains("[Total_Price_Pay]=711"));
-        assert!(upd.contains("[Total_Price_Balance]=0"));
+        // additive Pay
+        assert!(
+            upd.contains("[Total_Price_Pay]=ISNULL([Total_Price_Pay],0)+711"),
+            "Pay must accumulate: {upd}"
+        );
+        // Balance = Net - new Pay
+        assert!(
+            upd.contains("[Total_Price_Balance]=ISNULL([Total_Price_Net],0)-(ISNULL([Total_Price_Pay],0)+711)"),
+            "Balance must recompute from Net: {upd}"
+        );
+        // Must NOT touch Room or Net (those belong to booking_create / extend_stay)
+        assert!(!upd.contains("[Total_Price_Room]="), "must not touch Room: {upd}");
+        assert!(!upd.contains("[Total_Price_Net]=ISNULL"), "must not write Net: {upd}");
         assert!(upd.contains("[Cin_no]='CH26-005227'"));
     }
 

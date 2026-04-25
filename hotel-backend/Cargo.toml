@@ -1,6 +1,6 @@
 [package]
 name = "hotel-backend"
-version = "2.10.0"
+version = "2.11.0"
 edition = "2021"
 description = "Hotel Management System Backend API"
 authors = [""]
@@ -61,6 +61,10 @@ tokio-cron-scheduler = "0.10"
 
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }
+# Asia/Bangkok conversion for legacy MSSQL writes — the .NET app stores
+# wall-clock Thai-local times (no offset). PG stores TIMESTAMPTZ in UTC, so the
+# writeback worker must convert UTC → Bangkok before formatting.
+chrono-tz = "0.9"
 
 # UUID — canonical primary keys for the domain layer (per docs/architecture.md §4a).
 # Already pulled in transitively by tiberius + tokio-cron-scheduler; declared
