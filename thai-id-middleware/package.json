@@ -16,7 +16,7 @@
     "cors": "^2.8.5"
   },
   "devDependencies": {
-    "electron": "^40.0.0",
+    "electron": "^40.8.5",
     "electron-builder": "^26.6.0"
   },
   "build": {
