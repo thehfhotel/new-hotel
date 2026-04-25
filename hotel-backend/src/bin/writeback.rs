@@ -300,7 +300,14 @@ async fn process_job(pg: &PgPool, mssql: &DbPool, job: ClaimedJob) {
     match outcome {
         Ok(legacy_ids) => {
             tracing::info!(job_id, intent = intent_name, "Writeback succeeded");
-            mark_done(pg, job_id, legacy_ids.into_json()).await;
+            mark_done(
+                pg,
+                job_id,
+                job.aggregate_id,
+                &job.intent,
+                legacy_ids.into_json(),
+            )
+            .await;
         }
         Err(err) => {
             let retryable = err.is_retryable();
@@ -375,10 +382,15 @@ async fn resolve_legacy_ids(
     use WritebackIntent::*;
     let mut resolved = ResolvedJob::default();
 
+    // The intent's `*_id` field carries the deterministic UUID derived from
+    // PG's SERIAL via `service::ids::aggregate_uuid` — the canonical row was
+    // stamped with the same UUID at insert time (migration 014). So we
+    // resolve the legacy_* fields by joining on `aggregate_id`, not on the
+    // SERIAL primary key.
     match &job.intent {
         ModifyBooking { booking_id, .. } | CancelBooking { booking_id } => {
             if let Some(row) = sqlx::query(
-                "SELECT legacy_book_id FROM ht_bookings WHERE id = $1",
+                "SELECT legacy_book_id FROM ht_bookings WHERE aggregate_id = $1",
             )
             .bind(booking_id)
             .fetch_optional(pg)
@@ -393,7 +405,7 @@ async fn resolve_legacy_ids(
         | RecordPayment { check_in_id, .. } => {
             if let Some(row) = sqlx::query(
                 "SELECT legacy_cin_no, legacy_room_no, legacy_cust_no, legacy_checkin_ds_id \
-                 FROM ht_checkins WHERE id = $1",
+                 FROM ht_checkins WHERE aggregate_id = $1",
             )
             .bind(check_in_id)
             .fetch_optional(pg)
@@ -408,7 +420,7 @@ async fn resolve_legacy_ids(
         MarkRoomClean { room_id, .. } => {
             if let Some(row) = sqlx::query(
                 "SELECT legacy_room_no, legacy_room_id_int \
-                 FROM ht_rooms_new WHERE id = $1",
+                 FROM ht_rooms_new WHERE aggregate_id = $1",
             )
             .bind(room_id)
             .fetch_optional(pg)
@@ -426,19 +438,112 @@ async fn resolve_legacy_ids(
     Ok(resolved)
 }
 
-/// Mark the job done + persist allocated legacy IDs.
-async fn mark_done(pg: &PgPool, job_id: i64, legacy_ids: serde_json::Value) {
+/// Mark the job done, persist allocated legacy IDs into the writeback_jobs
+/// audit row, AND back-populate the canonical PG row's `legacy_*` columns so
+/// subsequent intents on the same aggregate can resolve immediately.
+///
+/// The back-population is essential for the second-and-later writebacks on
+/// the same aggregate. Example:
+///
+///   1. CreateBooking → allocates `R014812` in MSSQL → mark_done writes
+///      `legacy_book_id='R014812'` into ht_bookings.
+///   2. ModifyBooking on same aggregate_id → resolver finds 'R014812' and
+///      passes it to the recipe.
+///
+/// Without step 1, step 2 fails with "ModifyBooking requires resolved
+/// legacy_book_id".
+async fn mark_done(
+    pg: &PgPool,
+    job_id: i64,
+    aggregate_id: Uuid,
+    intent: &WritebackIntent,
+    legacy_ids: serde_json::Value,
+) {
     let res = sqlx::query(
         "UPDATE writeback_jobs SET status='done', completed_at=NOW(), legacy_ids=$2 \
          WHERE id=$1",
     )
     .bind(job_id)
-    .bind(legacy_ids)
+    .bind(&legacy_ids)
     .execute(pg)
     .await;
     if let Err(err) = res {
         tracing::error!(job_id, error = %err, "Failed to mark job done");
     }
+
+    if let Err(err) = back_populate_legacy_ids(pg, aggregate_id, intent, &legacy_ids).await {
+        // Don't fail the job — the writeback succeeded, MSSQL is canonical.
+        // But log loudly so the operator knows the next intent on the same
+        // aggregate may struggle to resolve.
+        tracing::error!(
+            job_id,
+            %aggregate_id,
+            error = %err,
+            "Failed to back-populate legacy_* columns; subsequent intents on \
+             this aggregate may fail to resolve until next successful writeback"
+        );
+    }
+}
+
+/// Write the recipe's allocated legacy identifiers (book_id, cin_no, etc.)
+/// back to the canonical PG row. Used after a successful writeback so the
+/// next intent on the same aggregate can resolve immediately. Quietly skips
+/// fields the intent variant doesn't produce.
+async fn back_populate_legacy_ids(
+    pg: &PgPool,
+    aggregate_id: Uuid,
+    intent: &WritebackIntent,
+    legacy_ids: &serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    let book_id = legacy_ids.get("book_id").and_then(|v| v.as_str());
+    let cust_no = legacy_ids.get("cust_no").and_then(|v| v.as_str());
+    let cin_no = legacy_ids.get("cin_no").and_then(|v| v.as_str());
+    let room_no = legacy_ids.get("room_no").and_then(|v| v.as_str());
+    let checkin_ds_id = legacy_ids.get("checkin_ds_id").and_then(|v| v.as_i64()).map(|n| n as i32);
+
+    use WritebackIntent::*;
+    match intent {
+        CreateBooking { .. } | ModifyBooking { .. } | CancelBooking { .. } => {
+            if book_id.is_some() || cust_no.is_some() {
+                sqlx::query(
+                    "UPDATE ht_bookings SET \
+                       legacy_book_id = COALESCE($2, legacy_book_id), \
+                       legacy_cust_no = COALESCE($3, legacy_cust_no), \
+                       updated_at = NOW() \
+                     WHERE aggregate_id = $1",
+                )
+                .bind(aggregate_id)
+                .bind(book_id)
+                .bind(cust_no)
+                .execute(pg)
+                .await?;
+            }
+        }
+        CreateCheckIn { .. } | CancelCheckIn { .. } | ExtendStay { .. } | CheckOut { .. } | RecordPayment { .. } => {
+            if cin_no.is_some() || room_no.is_some() || cust_no.is_some() || checkin_ds_id.is_some() {
+                sqlx::query(
+                    "UPDATE ht_checkins SET \
+                       legacy_cin_no        = COALESCE($2, legacy_cin_no), \
+                       legacy_room_no       = COALESCE($3, legacy_room_no), \
+                       legacy_cust_no       = COALESCE($4, legacy_cust_no), \
+                       legacy_checkin_ds_id = COALESCE($5, legacy_checkin_ds_id), \
+                       updated_at = NOW() \
+                     WHERE aggregate_id = $1",
+                )
+                .bind(aggregate_id)
+                .bind(cin_no)
+                .bind(room_no)
+                .bind(cust_no)
+                .bind(checkin_ds_id)
+                .execute(pg)
+                .await?;
+            }
+        }
+        MarkRoomClean { .. } => {
+            // mark_clean doesn't allocate any new legacy IDs.
+        }
+    }
+    Ok(())
 }
 
 /// Mark the job failed (will retry until attempts >= max_attempts).

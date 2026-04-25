@@ -174,6 +174,18 @@ pub trait BookingRepository: Send + Sync {
         tx: &mut Transaction<'_, Postgres>,
         book_id: i32,
     ) -> Result<u64, sqlx::Error>;
+
+    /// Stamp the deterministic aggregate UUID onto a freshly-inserted booking.
+    /// The service layer computes this via `service::ids::aggregate_uuid` once
+    /// `insert_booking` returns the SERIAL `book_id`. Without it, the writeback
+    /// worker's resolver cannot map the UUID in `writeback_jobs.aggregate_id`
+    /// back to a row in `ht_bookings`.
+    async fn set_aggregate_id(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        book_id: i32,
+        aggregate_id: uuid::Uuid,
+    ) -> Result<(), sqlx::Error>;
 }
 
 /// Default `BookingRepository` impl backed by sqlx + PostgreSQL.
@@ -543,5 +555,21 @@ impl BookingRepository for PgBookingRepository {
         .execute(&mut **tx)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    async fn set_aggregate_id(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        book_id: i32,
+        aggregate_id: uuid::Uuid,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE ht_bookings SET aggregate_id = $2 WHERE book_id = $1",
+        )
+        .bind(book_id)
+        .bind(aggregate_id)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
     }
 }

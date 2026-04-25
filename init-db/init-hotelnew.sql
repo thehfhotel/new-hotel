@@ -90,6 +90,10 @@ CREATE TABLE IF NOT EXISTS ht_rooms_new (
     room_price_weekday DECIMAL(10,2),
     room_price_weekend DECIMAL(10,2),
     room_price_special DECIMAL(10,2),
+    -- Writeback resolver back-populates these (migration 014).
+    legacy_room_no VARCHAR(10),
+    legacy_room_id_int INTEGER,
+    aggregate_id UUID,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW(),
 
@@ -98,6 +102,10 @@ CREATE TABLE IF NOT EXISTS ht_rooms_new (
 );
 CREATE INDEX IF NOT EXISTS ix_ht_rooms_status ON ht_rooms_new(room_status);
 CREATE INDEX IF NOT EXISTS ix_ht_rooms_type ON ht_rooms_new(room_type_id);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ht_rooms_new_aggregate_id
+    ON ht_rooms_new (aggregate_id) WHERE aggregate_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS ix_ht_rooms_new_legacy_room_no
+    ON ht_rooms_new (legacy_room_no) WHERE legacy_room_no IS NOT NULL;
 
 -- ht_bookings - Booking records
 CREATE TABLE IF NOT EXISTS ht_bookings (
@@ -121,6 +129,10 @@ CREATE TABLE IF NOT EXISTS ht_bookings (
     book_notes TEXT,
     book_cancelled_at TIMESTAMP,
     book_cancel_reason VARCHAR(500),
+    -- Writeback resolver back-populates these (migration 014).
+    legacy_book_id VARCHAR(20),
+    legacy_cust_no VARCHAR(20),
+    aggregate_id UUID,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW(),
     book_created_by VARCHAR(50),
@@ -135,6 +147,10 @@ CREATE INDEX IF NOT EXISTS ix_ht_bookings_checkin ON ht_bookings(book_checkin);
 CREATE INDEX IF NOT EXISTS ix_ht_bookings_checkout ON ht_bookings(book_checkout);
 CREATE INDEX IF NOT EXISTS ix_ht_bookings_status ON ht_bookings(book_status);
 CREATE INDEX IF NOT EXISTS ix_ht_bookings_daterange ON ht_bookings(book_checkin, book_checkout);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ht_bookings_aggregate_id
+    ON ht_bookings (aggregate_id) WHERE aggregate_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS ix_ht_bookings_legacy_book_id
+    ON ht_bookings (legacy_book_id) WHERE legacy_book_id IS NOT NULL;
 
 -- ht_booking_rooms - Junction table for booking-room assignments
 CREATE TABLE IF NOT EXISTS ht_booking_rooms (
@@ -177,6 +193,12 @@ CREATE TABLE IF NOT EXISTS ht_checkins (
     cin_key_card_no VARCHAR(20),
     cin_vehicle_plate VARCHAR(20),
     cin_notes TEXT,
+    -- Writeback resolver back-populates these (migration 014).
+    legacy_cin_no VARCHAR(20),
+    legacy_room_no VARCHAR(10),
+    legacy_cust_no VARCHAR(20),
+    legacy_checkin_ds_id INTEGER,
+    aggregate_id UUID,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW(),
     cin_created_by VARCHAR(50),
@@ -195,6 +217,10 @@ CREATE INDEX IF NOT EXISTS ix_ht_checkins_room ON ht_checkins(cin_room_id);
 CREATE INDEX IF NOT EXISTS ix_ht_checkins_status ON ht_checkins(cin_status);
 CREATE INDEX IF NOT EXISTS ix_ht_checkins_checkin ON ht_checkins(cin_checkin_time);
 CREATE INDEX IF NOT EXISTS ix_ht_checkins_expectedout ON ht_checkins(cin_expected_checkout);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ht_checkins_aggregate_id
+    ON ht_checkins (aggregate_id) WHERE aggregate_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS ix_ht_checkins_legacy_cin_no
+    ON ht_checkins (legacy_cin_no) WHERE legacy_cin_no IS NOT NULL;
 
 -- ht_guest_registry - Guest registration (multiple guests per check-in)
 CREATE TABLE IF NOT EXISTS ht_guest_registry (

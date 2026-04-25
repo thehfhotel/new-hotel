@@ -214,6 +214,8 @@ impl CheckInService {
         .await?;
 
         let aggregate_id = aggregate_uuid(AggregateKind::CheckIn, cin_id);
+        // Stamp UUID on the row for the writeback resolver (migration 014).
+        self.repo.set_aggregate_id(&mut tx, cin_id, aggregate_id).await?;
         let snapshot = build_check_in_snapshot(
             aggregate_id,
             None,
@@ -298,6 +300,8 @@ impl CheckInService {
         .await?;
 
         let aggregate_id = aggregate_uuid(AggregateKind::CheckIn, cin_id);
+        // Stamp UUID on the row for the writeback resolver (migration 014).
+        self.repo.set_aggregate_id(&mut tx, cin_id, aggregate_id).await?;
         let snapshot = build_check_in_snapshot(
             aggregate_id,
             Some(cmd.booking_id),
