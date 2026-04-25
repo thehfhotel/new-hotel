@@ -168,6 +168,34 @@ pub fn build_statements(inputs: &CreateBookingInputs<'_>) -> Vec<String> {
              [Book_USE])VALUES({id},{book_id_q},{room_no_q},{date_q},1,0)"
         ));
     }
+
+    // N+1. HT_Rooms display fields — makes the booking visible in the room view
+    // (calendar grid). The .NET app fires this UPDATE on every save (per spike
+    // §3c destructive Phase B). Without it, our writeback bookings show only
+    // in the booking-list view, not the room-availability grid. The match-by-
+    // room_no avoids the destructive subquery pattern; we already know the
+    // room number from the recipe inputs.
+    let stay_in_short = inputs.stay_start.format("%d/%m %H:%M").to_string();
+    let stay_out_short = stay_end_actual.format("%d/%m %H:%M").to_string();
+    let room_book_ds_q = sql_quote(&format!(
+        "{name}  {phone} เวลาเข้าพัก : 00:00  1. {room}  ({in_short}) ถึง ({out_short})  หมายเหตุ : {notes} ",
+        name = inputs.customer_name,
+        phone = inputs.customer_phone.unwrap_or(""),
+        room = inputs.room_no,
+        in_short = stay_in_short,
+        out_short = stay_out_short,
+        notes = inputs.notes.unwrap_or(""),
+    ));
+    let first_book_date_id = inputs.book_date_id_base;
+    let room_book_q = sql_quote(&first_book_date_id.to_string());
+    let room_book_name_q = sql_quote(inputs.customer_name);
+    let room_book_time_q = sql_quote("00:00");
+    statements.push(format!(
+        "update HT_Rooms set room_book_ds={room_book_ds_q}, Room_Book={room_book_q},\
+         Room_Book_Name={room_book_name_q},Room_Book_Time={room_book_time_q} \
+         where room_no={room_no_q}"
+    ));
+
     let _ = Datelike::year(&Utc::now().date_naive()); // silence unused-import lint
     statements
 }
