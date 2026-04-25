@@ -19,6 +19,22 @@ use crate::repository::{
     PaymentRepository, PgBookingRepository, PgCheckInRepository, PgCustomerRepository,
     PgInventoryRepository, PgPaymentRepository, PgRoomRepository, RoomRepository,
 };
+use crate::service::{
+    BookingService, CheckInService, CustomerService, HousekeepingService, PaymentService,
+};
+
+/// Bundle of fully-wired Phase-2 services produced by `AppState::wire_services`.
+///
+/// Returned by the helper so the two public constructors (`new` and
+/// `with_mode`) can spread the fields into [`AppState`] without repeating the
+/// service graph wiring twice.
+struct WiredServices {
+    customers: Arc<CustomerService>,
+    bookings: Arc<BookingService>,
+    checkins: Arc<CheckInService>,
+    payments: Arc<PaymentService>,
+    housekeeping: Arc<HousekeepingService>,
+}
 
 /// System operating mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -83,6 +99,18 @@ pub struct AppState {
     pub outbox: Arc<OutboxRepository>,
     /// Domain-event bus (event_log + pg_notify). Stateless; cheap Arc clone.
     pub events: Arc<EventBus>,
+
+    // ----- Service layer handles (per architecture.md §1, §6 — Phase 2) -----
+    /// Customer service — orchestrates `ht_customers` writes + outbox + events.
+    pub customers_service: Arc<CustomerService>,
+    /// Booking service — orchestrates `ht_bookings` writes + outbox + events.
+    pub bookings_service: Arc<BookingService>,
+    /// Check-in service — orchestrates `ht_checkins` writes + outbox + events.
+    pub checkins_service: Arc<CheckInService>,
+    /// Payment service — orchestrates `ht_payments` writes + outbox + events.
+    pub payments_service: Arc<PaymentService>,
+    /// Housekeeping service — orchestrates room cleanliness flips + events.
+    pub housekeeping_service: Arc<HousekeepingService>,
 }
 
 impl AppState {
@@ -109,6 +137,18 @@ impl AppState {
     pub fn new(legacy_pool: crate::db::DbPool, new_pool: crate::db::PgPool) -> Self {
         let (customers, bookings, checkins, rooms, payments, inventory) =
             Self::default_repositories();
+        let outbox = Arc::new(OutboxRepository::new());
+        let events = Arc::new(EventBus::new());
+        let services = Self::wire_services(
+            customers.clone(),
+            bookings.clone(),
+            checkins.clone(),
+            rooms.clone(),
+            payments.clone(),
+            outbox.clone(),
+            events.clone(),
+            new_pool.clone(),
+        );
         Self {
             legacy_pool,
             new_pool,
@@ -120,8 +160,13 @@ impl AppState {
             rooms,
             payments,
             inventory,
-            outbox: Arc::new(OutboxRepository::new()),
-            events: Arc::new(EventBus::new()),
+            outbox,
+            events,
+            customers_service: services.customers,
+            bookings_service: services.bookings,
+            checkins_service: services.checkins,
+            payments_service: services.payments,
+            housekeeping_service: services.housekeeping,
         }
     }
 
@@ -129,6 +174,18 @@ impl AppState {
     pub fn with_mode(legacy_pool: crate::db::DbPool, new_pool: crate::db::PgPool, mode: SystemMode) -> Self {
         let (customers, bookings, checkins, rooms, payments, inventory) =
             Self::default_repositories();
+        let outbox = Arc::new(OutboxRepository::new());
+        let events = Arc::new(EventBus::new());
+        let services = Self::wire_services(
+            customers.clone(),
+            bookings.clone(),
+            checkins.clone(),
+            rooms.clone(),
+            payments.clone(),
+            outbox.clone(),
+            events.clone(),
+            new_pool.clone(),
+        );
         Self {
             legacy_pool,
             new_pool,
@@ -140,8 +197,61 @@ impl AppState {
             rooms,
             payments,
             inventory,
-            outbox: Arc::new(OutboxRepository::new()),
-            events: Arc::new(EventBus::new()),
+            outbox,
+            events,
+            customers_service: services.customers,
+            bookings_service: services.bookings,
+            checkins_service: services.checkins,
+            payments_service: services.payments,
+            housekeeping_service: services.housekeeping,
+        }
+    }
+
+    /// Wire all five Phase-2 services from the shared repository / outbox /
+    /// event-bus handles. Kept as a single helper so both `new()` and
+    /// `with_mode()` produce identical service graphs.
+    #[allow(clippy::too_many_arguments)]
+    fn wire_services(
+        customers: Arc<dyn CustomerRepository>,
+        bookings: Arc<dyn BookingRepository>,
+        checkins: Arc<dyn CheckInRepository>,
+        rooms: Arc<dyn RoomRepository>,
+        payments: Arc<dyn PaymentRepository>,
+        outbox: Arc<OutboxRepository>,
+        events: Arc<EventBus>,
+        pg: crate::db::PgPool,
+    ) -> WiredServices {
+        WiredServices {
+            customers: Arc::new(CustomerService::new(
+                customers,
+                outbox.clone(),
+                events.clone(),
+                pg.clone(),
+            )),
+            bookings: Arc::new(BookingService::new(
+                bookings,
+                outbox.clone(),
+                events.clone(),
+                pg.clone(),
+            )),
+            checkins: Arc::new(CheckInService::new(
+                checkins,
+                outbox.clone(),
+                events.clone(),
+                pg.clone(),
+            )),
+            payments: Arc::new(PaymentService::new(
+                payments,
+                outbox.clone(),
+                events.clone(),
+                pg.clone(),
+            )),
+            housekeeping: Arc::new(HousekeepingService::new(
+                rooms,
+                outbox,
+                events,
+                pg,
+            )),
         }
     }
 
