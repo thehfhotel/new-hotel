@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.32.0] - 2026-04-25
+
+### Fixed
+
+- **Writeback resolver self-heals from `writeback_jobs.legacy_ids`** —
+  closes audit LOW-1 (back-population race). The `writeback_jobs` audit
+  row's `legacy_ids` JSONB is the **source of truth** for what the recipe
+  allocated; the `ht_*.legacy_*` columns are a denormalized cache. If
+  `mark_done` fails to back-populate the cache (PG hiccup, pool
+  starvation, network glitch between MSSQL COMMIT and the PG UPDATE),
+  the next intent's resolver now falls back to a `SELECT legacy_ids
+  FROM writeback_jobs WHERE aggregate_id = $1 AND status = 'done' ORDER
+  BY completed_at DESC LIMIT 1` lookup. Logs `warn!` so an operator can
+  see when the cache is stale, but no manual intervention is needed —
+  the system recovers automatically.
+
+  Also: `mark_done` now retries back-population with bounded
+  exponential backoff (3 attempts, 100/400/1600 ms) before giving up.
+  Most transient failures self-recover at write time without ever
+  reaching the resolver fallback.
+
+  Net effect: the previously-documented "manually patch the row"
+  recovery path is no longer required. Worst case is one extra SELECT
+  per future intent on the affected aggregate.
+
 ## [2.31.0] - 2026-04-25
 
 ### Fixed
