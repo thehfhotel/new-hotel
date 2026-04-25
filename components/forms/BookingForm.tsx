@@ -50,12 +50,19 @@ const sourceOptions = [
   { value: 'ota', label: 'OTA' },
 ]
 
+// User-settable booking statuses. `checkedin` and `completed` are
+// intentionally NOT in this list — those transitions must go through the
+// proper Check-In and Check-Out flows so the legacy MSSQL DB also gets the
+// matching `HT_CheckIn_H` / `HT_Power_Log` / `HT_Cupon` rows. Setting
+// `book_status='checkedin'` directly via this form (which fires
+// `modify_booking` writeback) leaves the booking status updated but no
+// check-in record exists in legacy — receptionist sees the room flip back
+// to "available" because no active check-in claims it.
+// Cancellation also goes through its own button (PUT /cancel) for the same
+// reason, so we omit `cancelled` here too.
 const statusOptions = [
   { value: 'pending', label: 'รอยืนยัน' },
   { value: 'confirmed', label: 'ยืนยันแล้ว' },
-  { value: 'checkedin', label: 'เช็คอินแล้ว' },
-  { value: 'completed', label: 'เสร็จสิ้น' },
-  { value: 'cancelled', label: 'ยกเลิก' },
   { value: 'noshow', label: 'ไม่มาตามนัด' },
 ]
 
