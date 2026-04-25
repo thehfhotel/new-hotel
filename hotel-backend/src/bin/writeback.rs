@@ -41,8 +41,9 @@ use sqlx::{PgPool, Row};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-use hotel_backend::config::DbConfig;
+use hotel_backend::config::{DbConfig, SlackConfig};
 use hotel_backend::db::{create_pool, DbPool};
+use hotel_backend::notifications::slack::{SlackClient, SlackMessage};
 use hotel_backend::outbox::intent::WritebackIntent;
 use hotel_backend::writeback::{
     dispatch, verify_schema_fingerprint, DispatchContext, ResolvedJob, WritebackError,
@@ -58,6 +59,22 @@ const DEFAULT_POLL_INTERVAL_SECS: u64 = 30;
 
 /// Default retry cap.
 const DEFAULT_MAX_ATTEMPTS: i32 = 3;
+
+/// How long an `in_progress` claim is allowed to live before another worker
+/// can re-claim it. Covers worker crashes mid-recipe and `mark_done` /
+/// `mark_failed` PG failures. Set conservatively at 5 minutes — longer than
+/// any realistic recipe execution but short enough that a stuck job recovers
+/// within one operator coffee break.
+const STUCK_IN_PROGRESS_TIMEOUT_SECS: i64 = 300;
+
+/// Exponential backoff (in seconds) between retry attempts. Indexed by
+/// `attempts` (0-based: backoff_secs(1) is the wait before attempt #2).
+/// Caps at the last entry. Default schedule: 30s, 2min, 10min.
+fn backoff_secs(attempts_so_far: i32) -> i64 {
+    const BACKOFFS: &[i64] = &[30, 120, 600];
+    let idx = (attempts_so_far as usize).saturating_sub(1).min(BACKOFFS.len() - 1);
+    BACKOFFS[idx]
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -113,11 +130,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .map_err(|e| format!("MSSQL pool init failed: {e}"))?;
     tracing::info!(server = %mssql_config.server, "Connected to legacy MSSQL");
 
-    // 4. Schema fingerprint guard — refuse to start on drift
-    verify_schema_fingerprint(&mssql).await.map_err(|e| {
+    // 4a. Slack notifier — best-effort alerts on schema drift + retry
+    //     exhaustion. None = SLACK_WEBHOOK_URL not configured / disabled.
+    let slack_config = SlackConfig::from_env();
+    let slack: Option<SlackClient> = if slack_config.is_configured() {
+        tracing::info!("Slack notifications enabled for writeback worker");
+        Some(SlackClient::new(slack_config))
+    } else {
+        tracing::warn!(
+            "Slack notifications NOT configured (set SLACK_WEBHOOK_URL); \
+             retry-exhausted jobs will only surface in logs"
+        );
+        None
+    };
+
+    // 4b. Schema fingerprint guard — refuse to start on drift, but post
+    //     a Slack alert first so the operator sees the failure even if
+    //     they're not tailing logs.
+    if let Err(e) = verify_schema_fingerprint(&mssql).await {
         tracing::error!(error = %e, "Schema fingerprint check failed — refusing to start");
-        format!("Schema fingerprint check failed: {e}")
-    })?;
+        if let Some(slack) = &slack {
+            let msg = SlackMessage::with_text(format!(
+                ":warning: *Writeback worker REFUSED TO START* :warning:\n\
+                 Legacy MSSQL schema fingerprint mismatch.\n\
+                 *Error:* `{e}`\n\
+                 _The legacy DB columns drifted from the captured baseline. \
+                 Run_ `./scripts/writeback-fingerprint.sh` _and follow the \
+                 README to update the baseline before restarting the worker._"
+            ));
+            let _ = slack.send_message(&msg).await;
+        }
+        return Err(format!("Schema fingerprint check failed: {e}").into());
+    }
 
     // 5. NOTIFY listener + poll fallback
     let wakeup = Arc::new(Notify::new());
@@ -153,7 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         loop {
             match claim_next_job(&pg, max_attempts).await {
                 Ok(Some(job)) => {
-                    process_job(&pg, &mssql, job).await;
+                    process_job(&pg, &mssql, max_attempts, &slack, job).await;
                 }
                 Ok(None) => break, // queue empty
                 Err(err) => {
@@ -193,10 +237,23 @@ struct ClaimedJob {
     attempts: i32,
 }
 
-/// Atomically claim the next pending (or retry-eligible failed) job.
+/// Atomically claim the next pending / retry-eligible / stuck job.
 ///
 /// Implemented as a single `UPDATE … RETURNING` so two worker instances can
-/// race without producing duplicate processing.
+/// race without producing duplicate processing. The selection covers three
+/// retry-eligible cases:
+///
+/// 1. **`pending`** — never tried.
+/// 2. **`failed`** — temporary failure; only re-claimable once
+///    `next_retry_at <= NOW()` (exponential backoff set by `mark_failed`).
+/// 3. **`in_progress` with stale `claimed_at`** — recovery from a worker
+///    crash mid-recipe or a `mark_done`/`mark_failed` PG failure that left
+///    the row stuck. Stale = claimed > `STUCK_IN_PROGRESS_TIMEOUT_SECS` ago.
+///    Without this clause, stuck jobs would require manual SQL intervention.
+///
+/// `exhausted` rows are never re-claimed — they require operator triage and
+/// a manual status reset. The Slack alert sent at the moment of exhaustion
+/// is the operator's notification path.
 async fn claim_next_job(
     pg: &PgPool,
     max_attempts: i32,
@@ -204,12 +261,19 @@ async fn claim_next_job(
     let row = sqlx::query(
         r#"
         UPDATE writeback_jobs
-           SET status = 'in_progress',
-               attempts = attempts + 1
+           SET status     = 'in_progress',
+               attempts   = attempts + 1,
+               claimed_at = NOW()
          WHERE id = (
              SELECT id FROM writeback_jobs
               WHERE (status = 'pending')
-                 OR (status = 'failed' AND attempts < $1)
+                 OR (status = 'failed'
+                     AND attempts < $1
+                     AND (next_retry_at IS NULL OR next_retry_at <= NOW()))
+                 OR (status = 'in_progress'
+                     AND attempts < $1
+                     AND claimed_at IS NOT NULL
+                     AND claimed_at < NOW() - make_interval(secs => $2))
               ORDER BY created_at
               FOR UPDATE SKIP LOCKED
               LIMIT 1
@@ -218,6 +282,7 @@ async fn claim_next_job(
         "#,
     )
     .bind(max_attempts)
+    .bind(STUCK_IN_PROGRESS_TIMEOUT_SECS)
     .fetch_optional(pg)
     .await?;
 
@@ -248,7 +313,13 @@ async fn claim_next_job(
 }
 
 /// Process one claimed job: open MSSQL conn, dispatch, persist outcome.
-async fn process_job(pg: &PgPool, mssql: &DbPool, job: ClaimedJob) {
+async fn process_job(
+    pg: &PgPool,
+    mssql: &DbPool,
+    max_attempts: i32,
+    slack: &Option<SlackClient>,
+    job: ClaimedJob,
+) {
     let job_id = job.id;
     let intent_name = job.intent.intent_name();
     tracing::info!(
@@ -263,7 +334,7 @@ async fn process_job(pg: &PgPool, mssql: &DbPool, job: ClaimedJob) {
         Ok(r) => r,
         Err(err) => {
             tracing::error!(job_id, error = %err, "Failed to resolve legacy IDs");
-            mark_failed(pg, job_id, &format!("resolve_legacy_ids: {err}")).await;
+            mark_failed(pg, job_id, max_attempts, slack, &format!("resolve_legacy_ids: {err}")).await;
             return;
         }
     };
@@ -284,7 +355,7 @@ async fn process_job(pg: &PgPool, mssql: &DbPool, job: ClaimedJob) {
         Ok(c) => c,
         Err(err) => {
             tracing::error!(job_id, error = %err, "Failed to acquire MSSQL connection");
-            mark_failed(pg, job_id, &format!("mssql_acquire: {err}")).await;
+            mark_failed(pg, job_id, max_attempts, slack, &format!("mssql_acquire: {err}")).await;
             return;
         }
     };
@@ -317,7 +388,7 @@ async fn process_job(pg: &PgPool, mssql: &DbPool, job: ClaimedJob) {
                 retryable,
                 "Writeback recipe failed"
             );
-            mark_failed(pg, job_id, &err.to_string()).await;
+            mark_failed(pg, job_id, max_attempts, slack, &err.to_string()).await;
         }
     }
 }
@@ -688,18 +759,125 @@ async fn back_populate_legacy_ids(
     Ok(())
 }
 
-/// Mark the job failed (will retry until attempts >= max_attempts).
-async fn mark_failed(pg: &PgPool, job_id: i64, err_msg: &str) {
-    let res = sqlx::query(
-        "UPDATE writeback_jobs SET status='failed', last_error=$2 WHERE id=$1",
+/// Mark the job failed and either schedule a retry (`failed` + `next_retry_at`)
+/// or transition to the terminal `exhausted` state once `attempts >=
+/// max_attempts`. Fires a Slack alert on the exhaustion transition so the
+/// operator sees the failure within seconds, not whenever they next look at
+/// the queue.
+///
+/// Reads `attempts` back from the row inside the same UPDATE so the retry
+/// decision is consistent with what the next claim cycle will see.
+async fn mark_failed(
+    pg: &PgPool,
+    job_id: i64,
+    max_attempts: i32,
+    slack: &Option<SlackClient>,
+    err_msg: &str,
+) {
+    // Bump status conditionally. RETURNING gives us the post-UPDATE state so
+    // we know whether this attempt exhausted the budget.
+    let row = sqlx::query(
+        r#"
+        UPDATE writeback_jobs
+           SET status        = CASE WHEN attempts >= $2 THEN 'exhausted' ELSE 'failed' END,
+               last_error    = $3,
+               next_retry_at = CASE
+                                   WHEN attempts >= $2 THEN NULL
+                                   ELSE NOW() + make_interval(secs => $4)
+                               END
+         WHERE id = $1
+        RETURNING attempts, status, intent, aggregate_id
+        "#,
     )
     .bind(job_id)
+    .bind(max_attempts)
     .bind(err_msg)
-    .execute(pg)
+    .bind(backoff_secs(get_attempts_for_backoff(pg, job_id).await))
+    .fetch_one(pg)
     .await;
-    if let Err(err) = res {
-        tracing::error!(job_id, error = %err, "Failed to mark job failed");
+
+    let row = match row {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::error!(
+                job_id,
+                error = %err,
+                "Failed to mark job failed — job will be picked up by stuck-in-progress janitor in {STUCK_IN_PROGRESS_TIMEOUT_SECS}s"
+            );
+            return;
+        }
+    };
+
+    let attempts: i32 = row.try_get("attempts").unwrap_or(0);
+    let status: String = row.try_get("status").unwrap_or_default();
+    let intent: String = row.try_get("intent").unwrap_or_default();
+    let aggregate_id: Option<Uuid> = row.try_get("aggregate_id").ok();
+
+    if status == "exhausted" {
+        tracing::error!(
+            job_id,
+            attempts,
+            intent = %intent,
+            ?aggregate_id,
+            "Writeback job EXHAUSTED retries — manual intervention required"
+        );
+        if let Some(slack) = slack {
+            send_exhausted_alert(slack, job_id, &intent, aggregate_id, attempts, err_msg).await;
+        }
+    } else {
+        tracing::warn!(
+            job_id,
+            attempts,
+            "Writeback job failed; will retry after backoff"
+        );
     }
+}
+
+/// Read just `attempts` so we can compute the right backoff. Two queries
+/// instead of one (we already issued the UPDATE) trades a tiny extra round
+/// trip for keeping the UPDATE statement readable; could be folded in via a
+/// CTE if it ever shows up in a profile.
+async fn get_attempts_for_backoff(pg: &PgPool, job_id: i64) -> i32 {
+    sqlx::query_scalar::<_, i32>("SELECT attempts FROM writeback_jobs WHERE id = $1")
+        .bind(job_id)
+        .fetch_one(pg)
+        .await
+        .unwrap_or(1)
+}
+
+/// Post a Slack alert when a writeback job exhausts its retry budget.
+/// Best-effort — Slack failures are logged inside `send_message` but never
+/// propagated. Avoids blocking the writeback main loop on Slack timeouts.
+async fn send_exhausted_alert(
+    slack: &SlackClient,
+    job_id: i64,
+    intent: &str,
+    aggregate_id: Option<Uuid>,
+    attempts: i32,
+    err_msg: &str,
+) {
+    let aggregate_id_str = aggregate_id
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| "(unknown)".into());
+    let truncated_err = if err_msg.len() > 500 {
+        format!("{}…", &err_msg[..500])
+    } else {
+        err_msg.to_string()
+    };
+    let text = format!(
+        ":rotating_light: *Writeback EXHAUSTED retries* :rotating_light:\n\
+         *Job ID:* `{job_id}`\n\
+         *Intent:* `{intent}`\n\
+         *Aggregate:* `{aggregate_id_str}`\n\
+         *Attempts:* {attempts}\n\
+         *Last error:*\n```\n{truncated_err}\n```\n\
+         _Manual intervention required. Inspect_ \
+         `SELECT * FROM writeback_jobs WHERE id = {job_id}` _and either fix \
+         the underlying cause + manually reset_ `status='pending'` _to retry, \
+         or delete the row if the writeback is no longer needed._"
+    );
+    let msg = SlackMessage::with_text(text);
+    let _ = slack.send_message(&msg).await;
 }
 
 /// Long-lived PG LISTEN connection; signals the main loop on every NOTIFY.
@@ -725,3 +903,47 @@ async fn run_listener(pg: PgPool, wakeup: Arc<Notify>) -> Result<(), sqlx::Error
 // in error returns. (`is_retryable` covers the visible path.)
 #[allow(dead_code)]
 fn _suppress_unused_writeback_error_import(_: WritebackError) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Backoff schedule: 30s, 2min, 10min — matches the constants and
+    /// guards against an accidental edit that could collapse the schedule
+    /// (e.g. all 0s would re-enable the previous thrashing behavior).
+    #[test]
+    fn backoff_schedule_matches_documented_values() {
+        assert_eq!(backoff_secs(1), 30);
+        assert_eq!(backoff_secs(2), 120);
+        assert_eq!(backoff_secs(3), 600);
+    }
+
+    /// The function is called with `attempts` from the post-update row.
+    /// `attempts == 0` is the pre-claim state — should never reach the
+    /// backoff path, but if it does, must not panic and must produce a
+    /// non-zero wait.
+    #[test]
+    fn backoff_for_zero_attempts_does_not_panic() {
+        let n = backoff_secs(0);
+        assert!(n > 0, "backoff_secs(0) should be safe and non-zero, got {n}");
+    }
+
+    /// Anything past the schedule (would only happen if max_attempts is
+    /// raised mid-flight) caps at the longest backoff. Prevents an
+    /// off-by-one panic.
+    #[test]
+    fn backoff_caps_at_longest_for_overflow() {
+        assert_eq!(backoff_secs(10), 600);
+        assert_eq!(backoff_secs(i32::MAX), 600);
+    }
+
+    /// Stuck-in-progress timeout must be longer than the longest realistic
+    /// recipe execution but shorter than an operator coffee break — guards
+    /// against accidentally setting it to a value that would let stuck
+    /// jobs sit for hours, OR letting a slow recipe get re-claimed mid-run.
+    #[test]
+    fn stuck_in_progress_timeout_is_in_safe_range() {
+        assert!(STUCK_IN_PROGRESS_TIMEOUT_SECS >= 60, "less than 1 min risks racing slow recipes");
+        assert!(STUCK_IN_PROGRESS_TIMEOUT_SECS <= 1800, "more than 30 min is too slow to recover");
+    }
+}

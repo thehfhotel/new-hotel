@@ -51,6 +51,14 @@ pub struct SlackMessage {
     pub blocks: Option<Vec<SlackBlock>>,
 }
 
+impl SlackMessage {
+    /// Convenience constructor — text-only message, no blocks. Use for
+    /// alerts and short notifications where Block Kit layout isn't needed.
+    pub fn with_text(text: impl Into<String>) -> Self {
+        Self { text: text.into(), blocks: None }
+    }
+}
+
 /// Slack client for sending messages
 ///
 /// Uses `ureq` (blocking HTTP) under the hood — Slack webhooks are not
