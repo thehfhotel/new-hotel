@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Routes thinned (Phase 2.5)** per `docs/architecture.md` §1, §6. Write
+  handlers in `routes/new_*.rs` now delegate through the service layer
+  instead of calling repositories directly:
+  - `routes/new_customers.rs` — `create_customer` / `update_customer`
+    delegate to `state.customers_service.{create,update}`. The soft-delete
+    handler stays on the repository (no service method yet).
+  - `routes/new_bookings.rs` — `create_booking` / `update_booking` /
+    `cancel_booking` delegate to
+    `state.bookings_service.{create,modify,cancel}`. The route generates
+    `book_no` (presentation concern) and constructs the matching
+    `*Command` from the request DTO + a minimal
+    `BookingWritebackContext`.
+  - `routes/new_checkins.rs` — `create_checkin` / `checkout` delegate to
+    `state.checkins_service.{walk_in,check_in_to_booking,check_out}`.
+    Guest-registry handlers stay on the repository for now (no service).
+  - `routes/new_payments.rs` — `create_payment` delegates to
+    `state.payments_service.record_payment` for the cash / credit /
+    transfer methods. The legacy "qr" tender stays on the repository so
+    the literal `pay_method = 'qr'` value is preserved (no `PaymentMethod::Qr`
+    variant in the domain enum yet).
+- Reads (`GET` / `list`) keep calling repositories directly — the service
+  layer's value is in writes (TX + outbox + events), not in reads.
+- `EventSource::our_app(Uuid::nil(), Uuid::new_v4())` is used as a
+  temporary placeholder pending auth middleware. `// TODO: wire user_id
+  from auth middleware` markers tag every site.
+- **Endpoint contracts unchanged.** Frontend `/api/new/*` calls behave
+  identically — same request shapes, same response shapes, same status
+  codes. Specific 4xx wording is preserved via thin error mappers
+  (`map_cancel_error`, `map_create_checkin_error`, `map_checkout_error`).
+
 ## [2.26.0] - 2026-04-25
 
 ### Added
