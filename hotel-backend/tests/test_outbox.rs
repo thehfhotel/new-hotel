@@ -108,7 +108,11 @@ async fn test_enqueue_inserts_row() {
     assert_eq!(stored_aggregate, booking_id);
     assert_eq!(stored_key, key);
     assert_eq!(stored_payload["intent"], "create_booking");
-    assert_eq!(stored_payload["payload"]["customer_id"], customer_id.to_string());
+    // serde(tag="intent", content="payload") wraps the variant fields under
+    // "payload"; the CreateBooking variant's struct field is also named
+    // `payload`, so the inner CreateBookingPayload sits at payload.payload.
+    assert_eq!(stored_payload["payload"]["booking_id"], booking_id.to_string());
+    assert_eq!(stored_payload["payload"]["payload"]["customer_id"], customer_id.to_string());
 
     // Cleanup so reruns don't accumulate test rows.
     sqlx::query("DELETE FROM writeback_jobs WHERE id = $1")
@@ -203,17 +207,12 @@ async fn test_publish_inserts_event_log_and_notifies() {
     assert_eq!(payload["type"], "BookingCreated");
     assert_eq!(payload["data"]["id"], booking_id.to_string());
 
-    // 2) NOTIFY was delivered. PG buffers NOTIFY until COMMIT, so by now the
-    //    listener should have something queued. Cap the wait so a missing
-    //    delivery fails the test rather than hanging CI.
-    let received = tokio::time::timeout(Duration::from_secs(2), listener.recv())
+    // 2) NOTIFY was delivered. PG buffers NOTIFY until COMMIT. Tests run in
+    //    parallel and share the `domain_events` channel, so drain notifications
+    //    until we see one for OUR booking_id (or time out).
+    let notify_payload = recv_for_booking(&mut listener, booking_id, Duration::from_secs(2))
         .await
-        .expect("NOTIFY should arrive within 2s of commit")
-        .expect("listener.recv should yield a notification");
-
-    assert_eq!(received.channel(), "domain_events");
-    let notify_payload: serde_json::Value =
-        serde_json::from_str(received.payload()).expect("NOTIFY payload is JSON");
+        .expect("NOTIFY for this booking_id should arrive within 2s of commit");
     assert_eq!(notify_payload["type"], "BookingCreated");
     assert_eq!(notify_payload["data"]["id"], booking_id.to_string());
 
@@ -258,10 +257,47 @@ async fn test_rollback_emits_no_event_and_no_notify() {
         .expect("count");
     assert_eq!(count, 0, "rollback must not leak an event_log row");
 
-    // No NOTIFY should arrive within a reasonable window.
-    let recv = tokio::time::timeout(Duration::from_millis(500), listener.recv()).await;
+    // No NOTIFY for OUR booking_id should arrive — but the channel is shared
+    // across the parallel `test_publish_inserts_event_log_and_notifies`, so we
+    // drain anything that lands and only fail on a match.
+    let received = recv_for_booking(&mut listener, booking_id, Duration::from_millis(500)).await;
     assert!(
-        recv.is_err(),
-        "rollback must not emit a NOTIFY; got: {recv:?}"
+        received.is_none(),
+        "rollback must not emit a NOTIFY for booking_id={booking_id}; got: {received:?}"
     );
+}
+
+/// Drain notifications until either `deadline` expires or a `domain_events`
+/// notification whose `data.id` equals `booking_id` arrives. Returns the
+/// matching JSON payload, or `None` on timeout.
+///
+/// Tests run in parallel against a shared PG, and the bus uses a single
+/// `domain_events` channel, so this filter is required to avoid cross-test
+/// pollution.
+async fn recv_for_booking(
+    listener: &mut PgListener,
+    booking_id: Uuid,
+    timeout: Duration,
+) -> Option<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        match tokio::time::timeout(remaining, listener.recv()).await {
+            Err(_) => return None,
+            Ok(Err(e)) => panic!("listener error: {e}"),
+            Ok(Ok(notif)) => {
+                let payload: serde_json::Value = match serde_json::from_str(notif.payload()) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if payload["data"]["id"] == booking_id.to_string() {
+                    return Some(payload);
+                }
+                // Different booking — keep listening.
+            }
+        }
+    }
 }

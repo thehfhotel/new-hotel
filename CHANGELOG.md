@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.27.2] - 2026-04-25
+
+### Fixed
+- **Backend integration tests** (`hotel-backend/tests/test_outbox.rs`):
+  - `test_enqueue_inserts_row` asserted on the wrong JSON path: with
+    `serde(tag="intent", content="payload")` the variant fields are wrapped
+    under `payload`, and the `CreateBooking` variant has a struct field also
+    named `payload` — so the inner `CreateBookingPayload` lives at
+    `payload.payload`, not `payload`. Assertion adjusted; no source change.
+  - `test_publish_inserts_event_log_and_notifies` and
+    `test_rollback_emits_no_event_and_no_notify` raced against each other on
+    the shared `domain_events` PG channel under cargo's parallel test runner.
+    Added a `recv_for_booking` helper that drains `pg_notify` messages until
+    one matches the test's own `booking_id` (or times out), so cross-test
+    notifications no longer cause spurious failures.
+
 ## [2.27.1] - 2026-04-25
 
 ### Security
