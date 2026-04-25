@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.27.0] - 2026-04-25
+
+### Added
+- **Frontend `useRealtimeEvents` hook** (`lib/use-realtime-events.ts`) — Phase 4a-frontend
+  per `docs/architecture.md` §3.6e. Opens a single `EventSource('/api/events')`
+  on mount and registers one `addEventListener` per `DomainEvent` variant
+  (`BookingCreated`, `BookingModified`, `BookingCancelled`, `CheckInCreated`,
+  `CheckOutCompleted`, `CheckInCancelled`, `CustomerCreated`, `CustomerModified`,
+  `PaymentReceived`, `RoomMarkedClean`, `RoomMarkedDirty`). Each event fans out
+  to its mapped cache buckets (`bookings`, `checkins`, `customers`, `payments`,
+  `rooms`, `housekeeping`) by dispatching a `realtime:invalidate` window
+  `CustomEvent`, allowing list views to subscribe via the companion
+  `useRealtimeInvalidate(key, refetch)` helper.
+  - Mapping: `BookingCreated/Modified/Cancelled → ['bookings', 'rooms']`;
+    `CheckInCreated/CheckOutCompleted/CheckInCancelled → ['checkins', 'rooms']`;
+    `CustomerCreated/Modified → ['customers']`;
+    `PaymentReceived → ['payments', 'checkins']`;
+    `RoomMarkedClean/Dirty → ['rooms', 'housekeeping']`.
+  - `EventSource` auto-reconnects per WHATWG spec; `onerror` only logs.
+  - **Window `CustomEvent` fallback** is used because the app does not currently
+    bundle React Query / SWR. `EVENT_TO_QUERY_KEYS` is the migration contract:
+    once a cache lib lands, swap the dispatch for
+    `queryClient.invalidateQueries({ queryKey: [key] })` (or `mutate(key)`)
+    without renaming any listener call site. TODO marked in the source.
+  - Wired into `<AppShell>` so it is active app-wide; runs exactly once.
+- **Hook unit tests** (`__tests__/components/useRealtimeEvents.test.tsx`) — 14 tests
+  covering EventSource lifecycle (open / close on unmount), per-variant fan-out
+  for all 11 `DomainEvent` variants, and `useRealtimeInvalidate` key filtering.
+  Mocks `EventSource` globally so tests stay deterministic.
+
 ## [2.26.0] - 2026-04-25
 
 ### Added
