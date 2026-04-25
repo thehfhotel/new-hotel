@@ -31,9 +31,9 @@ CREATE INDEX IF NOT EXISTS ix_writeback_jobs_pending_created
 CREATE INDEX IF NOT EXISTS ix_writeback_jobs_aggregate
     ON writeback_jobs (aggregate_id);
 
-INSERT INTO schema_migrations (version, filename, applied_by)
-VALUES ('011', '011_writeback_jobs.sql', 'migrate-script')
-ON CONFLICT (version) DO NOTHING;
+-- Schema-migrations row is inserted by scripts/migrate.sh (same TX, includes
+-- the file checksum). Do NOT INSERT here — duplicates in the same TX violate
+-- schema_migrations_version_key.
 
 -- =============================================================================
 -- DOWN MIGRATION (commented — apply manually for rollback)
