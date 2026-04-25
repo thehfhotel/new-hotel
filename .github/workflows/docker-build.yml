@@ -388,6 +388,17 @@ jobs:
           docker compose restart backend
           sleep 5
 
+          # Force-recreate the writeback worker too. It lives under
+          # `profiles: [legacy]` so plain `docker compose up -d` (above)
+          # skips it. It also shares the backend image, but Docker won't
+          # swap an existing container's image without --force-recreate
+          # — so without this step the worker keeps running OLD code
+          # while the backend is fresh, which is how a 2026-04-25 incident
+          # produced bookings missing back-population.
+          docker compose --profile legacy pull writeback
+          docker compose --profile legacy up -d --force-recreate writeback
+          sleep 3
+
           echo "Deployment complete!"
           docker compose ps
 
@@ -401,6 +412,24 @@ jobs:
             exit 1
           fi
           echo "Backend is running."
+
+          # Verify writeback worker is running. It refuses to start on
+          # legacy-MSSQL schema fingerprint mismatch (per writeback/fingerprint.rs)
+          # — that's an intentional fail-loud, but CI/CD must surface it
+          # as a deploy failure, not silently leave the worker dead.
+          WRITEBACK_STATUS=$(docker inspect --format='{{.State.Status}}' new-hotel-production-writeback-1 2>/dev/null || echo "not_found")
+          if [ "$WRITEBACK_STATUS" != "running" ]; then
+            echo "WARNING: Writeback worker is not running (status: $WRITEBACK_STATUS)"
+            echo "--- Writeback logs (last 50 lines) ---"
+            docker logs new-hotel-production-writeback-1 --tail 50 2>&1 || true
+            # Don't fail the deploy — writeback being down means the
+            # outbox accumulates pending jobs (recoverable when the
+            # worker comes back up), not data loss. But operators need
+            # the loud warning to investigate.
+            echo "::warning::Writeback worker not running after deploy — outbox jobs will queue"
+          else
+            echo "Writeback worker is running."
+          fi
 
   deploy-hfville:
     runs-on: [self-hosted, linux, deploy]
