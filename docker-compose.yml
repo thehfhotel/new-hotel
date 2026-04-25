@@ -114,6 +114,30 @@ services:
       - hotel-network
     restart: unless-stopped
 
+  # One-shot backfill: legacy MSSQL HT_Rooms + HT_SET_RoomType -> PG.
+  # Same image as `backend`, different entrypoint. Lives under the `backfill`
+  # profile so normal `docker compose up` skips it. Activate on demand:
+  #     docker compose --profile backfill run --rm backfill-rooms
+  # Idempotent — safe to re-run after legacy room edits.
+  backfill-rooms:
+    image: ghcr.io/thehfhotel/new-hotel-backend:latest
+    command: ["./backfill_rooms"]
+    profiles:
+      - backfill
+    environment:
+      - DB_SERVER=${DB_SERVER}
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@newdb:${PGPORT:-5439}/${POSTGRES_DB}
+      - RUST_LOG=${RUST_LOG:-backfill_rooms=info}
+    depends_on:
+      newdb:
+        condition: service_healthy
+    networks:
+      - hotel-network
+    # No restart: this is a one-shot job. `--rm` cleans up the container.
+
 volumes:
   newdb_data:
 
