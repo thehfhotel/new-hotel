@@ -125,6 +125,27 @@ impl DomainEvent {
             | DomainEvent::RoomMarkedDirty { room_id, .. } => *room_id,
         }
     }
+
+    /// Borrow the originating [`EventSource`].
+    ///
+    /// Subscribers (e.g. the writeback worker) use this to filter out events
+    /// they themselves caused — preventing feedback loops between the legacy
+    /// detector and our writeback adapter.
+    pub fn source(&self) -> &EventSource {
+        match self {
+            DomainEvent::BookingCreated { source, .. }
+            | DomainEvent::BookingModified { source, .. }
+            | DomainEvent::BookingCancelled { source, .. }
+            | DomainEvent::CheckInCreated { source, .. }
+            | DomainEvent::CheckOutCompleted { source, .. }
+            | DomainEvent::CheckInCancelled { source, .. }
+            | DomainEvent::CustomerCreated { source, .. }
+            | DomainEvent::CustomerModified { source, .. }
+            | DomainEvent::PaymentReceived { source, .. }
+            | DomainEvent::RoomMarkedClean { source, .. }
+            | DomainEvent::RoomMarkedDirty { source, .. } => source,
+        }
+    }
 }
 
 /// Where a domain event originated.
@@ -141,6 +162,35 @@ pub enum EventSource {
     LegacyApp { detected_at: DateTime<Utc> },
     /// Internal scheduled job (reconcile, retention sweep, etc.).
     System { reason: String },
+}
+
+impl EventSource {
+    /// Convenience constructor for service-layer callers — most events come
+    /// from an HTTP request and carry both the authenticated user id and the
+    /// request correlation id.
+    pub fn our_app(user_id: Uuid, request_id: Uuid) -> Self {
+        EventSource::OurApp { user_id, request_id }
+    }
+
+    /// Stable string for the `event_log.source_kind` column. Matches the
+    /// `serde(tag = "kind")` discriminant.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            EventSource::OurApp { .. } => "our_app",
+            EventSource::LegacyApp { .. } => "legacy_app",
+            EventSource::System { .. } => "system",
+        }
+    }
+
+    /// Return the `(user_id, request_id)` pair for `OurApp` sources, otherwise
+    /// `(None, None)` — used to populate `event_log.source_user_id` /
+    /// `source_request_id` (both nullable for non-`OurApp` events).
+    pub fn correlation(&self) -> (Option<Uuid>, Option<Uuid>) {
+        match self {
+            EventSource::OurApp { user_id, request_id } => (Some(*user_id), Some(*request_id)),
+            _ => (None, None),
+        }
+    }
 }
 
 /// Minimal snapshot of a booking carried in events.

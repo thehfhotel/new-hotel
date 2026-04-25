@@ -1,6 +1,6 @@
 [package]
 name = "hotel-backend"
-version = "2.8.2"
+version = "2.8.3"
 edition = "2021"
 description = "Hotel Management System Backend API"
 authors = [""]
@@ -38,7 +38,7 @@ tokio-util = { version = "0.7", features = ["compat"] }
 # Database - New (PostgreSQL via sqlx for HotelNew DB)
 # Note: "bigdecimal" feature dropped — no NUMERIC columns are read into BigDecimal;
 # all DECIMAL columns are cast to ::float8 (f64) at the SQL level (see CLAUDE.md).
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "macros"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "macros", "uuid"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -57,7 +57,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # UUID — canonical primary keys for the domain layer (per docs/architecture.md §4a).
 # Already pulled in transitively by tiberius + tokio-cron-scheduler; declared
 # explicitly here so the `serde` feature is available for our domain types.
-uuid = { version = "1", features = ["serde", "v4"] }
+uuid = { version = "1", features = ["serde", "v4", "v5"] }
 
 # Error handling (matches Tauri)
 thiserror = "1"
