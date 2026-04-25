@@ -101,7 +101,7 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_Book_H", 12, "Book_by", "varchar"),
     ("HT_Book_H", 13, "Book_room_all", "text"),
     ("HT_Book_H", 14, "Book_room_note", "text"),
-    ("HT_Book_H", 15, "book_room_type", "int"),
+    ("HT_Book_H", 15, "Book_room_type", "int"),
     ("HT_Book_H", 16, "Book_Notify_Day", "int"),
     ("HT_Book_H", 17, "Book_Notify_Note", "varchar"),
     ("HT_Book_H", 18, "Book_Sale", "varchar"),
@@ -255,7 +255,7 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
 /// committed alongside `01-baseline-schema.txt` so the worker can refuse to
 /// start without re-running the test.
 pub const EXPECTED_FINGERPRINT: &str =
-    "5f2c17bc402edfc80e04fecb9dd741e26ed4cf1036f16855626051cd276376d2";
+    "1bcda8e267e8e8279d76193cc2d25d00ae42aeeafafe7fd7f6fbb26ca85410e3";
 
 /// Compute the fingerprint of a column-tuple slice.
 ///
