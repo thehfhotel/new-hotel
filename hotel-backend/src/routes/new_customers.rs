@@ -6,9 +6,13 @@
 //! - PUT /api/new/customers/:id - Update customer
 //! - DELETE /api/new/customers/:id - Soft delete (set Cust_Active=0)
 //!
-//! Per `docs/architecture.md` §1, §6 (Phase 1b) the SQL has moved to
-//! `repository::customer`. This file owns request validation, response shaping,
-//! and translates between the repository's row shape and the wire DTOs below.
+//! Per `docs/architecture.md` §1, §6 (Phase 2.5) writes delegate through
+//! `state.customers_service`. Reads keep calling `state.customers` (the
+//! repository) directly — the service layer's value is in writes (TX +
+//! outbox + events), not in reads. The soft-delete handler also stays on
+//! the repository today: there is no `delete` recipe in the service yet
+//! (only `create` / `update` are wired). When that lands, the same
+//! delegation pattern applies.
 
 use axum::{
     extract::{Path, Query, State},
@@ -16,11 +20,14 @@ use axum::{
 };
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use super::mode::AppState;
 use crate::error::{ApiError, ApiResult};
 use crate::models::Pagination;
-use crate::repository::customer::{CustomerRow, CustomerWrite};
+use crate::outbox::event::EventSource;
+use crate::repository::customer::CustomerRow;
+use crate::service::{CreateCustomerCommand, UpdateCustomerCommand};
 
 /// Customer from HT_Customers table
 #[derive(Debug, Serialize)]
@@ -171,34 +178,26 @@ pub async fn create_customer(
     State(state): State<AppState>,
     Json(body): Json<CreateUpdateCustomerRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
-    let first_name = body.first_name.trim();
-    if first_name.is_empty() {
-        return Err(ApiError::BadRequest("First name is required".to_string()));
-    }
-
-    let mut tx = state.new_pool.begin().await?;
-    let id = state
-        .customers
-        .insert(
-            &mut tx,
-            CustomerWrite {
-                first_name,
-                last_name: body.last_name.as_deref(),
-                phone: body.phone.as_deref(),
-                email: body.email.as_deref(),
-                id_card: body.id_card.as_deref(),
-                address: body.address.as_deref(),
-                customer_type: body.customer_type.as_deref(),
-                notes: body.notes.as_deref(),
-            },
-        )
+    let outcome = state
+        .customers_service
+        .create(CreateCustomerCommand {
+            first_name: body.first_name,
+            last_name: body.last_name,
+            phone: body.phone,
+            email: body.email,
+            id_card: body.id_card,
+            address: body.address,
+            customer_type: body.customer_type,
+            notes: body.notes,
+            // TODO: wire user_id from auth middleware
+            source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
+        })
         .await?;
-    tx.commit().await?;
 
     Ok(Json(MutationResponse {
         success: true,
         message: "Customer created successfully".to_string(),
-        id: Some(id),
+        id: Some(outcome.customer_id),
     }))
 }
 
@@ -208,45 +207,35 @@ pub async fn update_customer(
     Path(cust_id): Path<i32>,
     Json(body): Json<CreateUpdateCustomerRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
-    let first_name = body.first_name.trim();
-    if first_name.is_empty() {
-        return Err(ApiError::BadRequest("First name is required".to_string()));
-    }
-
-    let mut tx = state.new_pool.begin().await?;
-    let rows_affected = state
-        .customers
-        .update(
-            &mut tx,
-            cust_id,
-            CustomerWrite {
-                first_name,
-                last_name: body.last_name.as_deref(),
-                phone: body.phone.as_deref(),
-                email: body.email.as_deref(),
-                id_card: body.id_card.as_deref(),
-                address: body.address.as_deref(),
-                customer_type: body.customer_type.as_deref(),
-                notes: body.notes.as_deref(),
-            },
-        )
+    let outcome = state
+        .customers_service
+        .update(UpdateCustomerCommand {
+            customer_id: cust_id,
+            first_name: body.first_name,
+            last_name: body.last_name,
+            phone: body.phone,
+            email: body.email,
+            id_card: body.id_card,
+            address: body.address,
+            customer_type: body.customer_type,
+            notes: body.notes,
+            // TODO: wire user_id from auth middleware
+            source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
+        })
         .await?;
-
-    if rows_affected == 0 {
-        // Roll back the (no-op) transaction explicitly so the connection returns clean.
-        tx.rollback().await?;
-        return Err(ApiError::NotFound("Customer not found".to_string()));
-    }
-    tx.commit().await?;
 
     Ok(Json(MutationResponse {
         success: true,
         message: "Customer updated successfully".to_string(),
-        id: Some(cust_id),
+        id: Some(outcome.customer_id),
     }))
 }
 
 /// DELETE /api/new/customers/:id - Soft delete (set Cust_Active=0)
+///
+/// Stays on the repository: the service layer does not yet expose a `delete`
+/// method (no writeback recipe for soft-deleting a customer). When that
+/// lands, this delegates via `state.customers_service.soft_delete(...)`.
 pub async fn delete_customer(
     State(state): State<AppState>,
     Path(cust_id): Path<i32>,
