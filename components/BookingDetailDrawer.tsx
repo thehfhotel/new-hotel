@@ -44,6 +44,8 @@ interface Customer {
 
 interface BookingDetail {
   bookNo: string
+  /** Legacy MSSQL identifier (R\d{6}). Populated by writeback worker. */
+  legacyBookId?: string
   bookDate: string
   checkIn: string
   checkOut: string
@@ -208,9 +210,16 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
         <div className="p-4 max-h-[calc(100vh-2rem)] overflow-y-auto">
           {/* Header */}
           <div className="flex items-center justify-between mb-4 pb-4 border-b border-gray-200">
-            <h2 className="text-lg font-bold text-gray-900">
-              #{bookNo}
-            </h2>
+            <div className="flex flex-col">
+              <h2 className="text-lg font-bold text-gray-900">
+                #{bookNo}
+              </h2>
+              {detail?.legacyBookId && (
+                <span className="text-xs text-gray-500 font-mono" title="Legacy system reference">
+                  Legacy: {detail.legacyBookId}
+                </span>
+              )}
+            </div>
             <button
               onClick={onClose}
               className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
@@ -430,9 +439,16 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
         <div className="p-4">
           {/* Header */}
           <div className="flex items-center justify-between mb-4 pb-4 border-b border-gray-200">
-            <h2 className="text-lg font-bold text-gray-900">
-              Booking #{bookNo}
-            </h2>
+            <div className="flex flex-col">
+              <h2 className="text-lg font-bold text-gray-900">
+                Booking #{bookNo}
+              </h2>
+              {detail?.legacyBookId && (
+                <span className="text-xs text-gray-500 font-mono" title="Legacy system reference">
+                  Legacy: {detail.legacyBookId}
+                </span>
+              )}
+            </div>
             <button
               onClick={onClose}
               className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
