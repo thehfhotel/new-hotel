@@ -394,6 +394,12 @@ pub async fn update_booking(
             new_state: None,
             new_notes: body.notes.clone(),
             new_customer_phone: None,
+            // The route doesn't yet load the prior customer row to populate
+            // these — Wave 4 will. Today they stay `None` so the recipe skips
+            // the caption rewrite + customer re-save (matches prior behavior
+            // until the route enrichment lands).
+            new_customer_name: None,
+            customer_resave: None,
         },
         // TODO: load prior snapshot from repo for richer event payload.
         before_snapshot: None,

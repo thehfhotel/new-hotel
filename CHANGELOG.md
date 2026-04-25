@@ -5,6 +5,111 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.29.0] - 2026-04-25
+
+### Fixed
+
+- **Writeback recipe gaps from spike-vs-recipe audit** — comprehensive
+  follow-up to commit `0179f81` (which closed the room-display gap on
+  booking create). The audit compared every recipe in
+  `hotel-backend/src/writeback/recipes/` against the captured legacy SQL
+  in `docs/legacy-spike/raw/*/writes.txt` and `docs/legacy-spike/findings.md`
+  §3a–k and surfaced 17 divergences. This release fixes 16 of them in
+  one branch (gap #1 was a miscount in the audit and verified
+  already-correct). New shared helper `writeback/recipes/helpers.rs`
+  hosts cross-recipe SQL (`mark_cupon_printed`).
+
+  **HIGH severity (3):**
+  - `booking_modify` now re-saves `HT_Customers` (spike §3c capture
+    lines 5/16/28) when the new `BookingChanges.customer_resave` payload
+    is set. Phone/address edits will propagate to the customer master
+    once the route is enriched.
+  - `payment` now updates `HT_CheckIn_Ds.Cin_Room_Pay_Total` per-room
+    (spike §3h capture line 3) when `RecordPaymentCommand.checkin_ds_id`
+    is `Some`. Multi-room revenue tracking restored.
+  - `extend_stay` now emits two leading TM.30 touches
+    (`UPDATE HT_CheckIn_H SET Cin_Work_number=<random>`) per spike §3a +
+    §3f capture lines 1-2. Random `i32` per touch via the new `rand`
+    dependency.
+
+  **MEDIUM severity (6):**
+  - `walkin` and `checkin_to_booking` both now emit
+    `UPDATE HT_Cupon SET cupon_print=1` (spike §3a `walkin/writes.txt:9`
+    / §3d `booking-checkin/writes.txt:39`) via the shared
+    `mark_cupon_printed` helper.
+  - `booking_modify` clears stale `HT_Rooms` display fields BEFORE the
+    date diff (spike §3c capture lines 6/14/17) — fires on every modify
+    to keep the calendar grid in sync.
+  - `booking_modify` re-writes the `HT_Rooms` display caption with the
+    new dates after a stay-range change (spike §3c capture line 26)
+    when the new `BookingChanges.new_customer_name` field is supplied.
+    Mirrors the `booking_create` caption format from `0179f81`.
+  - `checkin_to_booking` `UPDATE HT_Customers` now spans the full ~25
+    address + work field set (spike §3d capture line 28) instead of just
+    the 5 fields it previously updated.
+  - `payment` increments `HT_CheckIn_H.Total_Price_vat` (spike §3h
+    capture line 6) — this hotel uses no VAT but the .NET app still
+    writes the running total, so we mirror for parity with reports.
+  - `payment` clears `HT_CheckIn_Product` defensively (spike §3h capture
+    line 2) — almost always a no-op since we don't write that table, but
+    emitted for byte-level parity with the legacy capture.
+
+  **LOW severity (6):**
+  - `payment` `HT_CheckIn_Pay` INSERT now includes the `[Cin_Pay_Ds]`
+    column (spike §3h capture line 4 / schema column 4, varchar(500)).
+    Empty-string default mirrors the .NET capture.
+  - `payment` `HT_Receipt_H` INSERT — `[Receipt_c_no]` column verified
+    against the schema baseline (column 4, varchar(50), nullable). The
+    recipe already included it; documented the rationale (storing
+    `cin_no` here lets receipts trace back to the originating check-in).
+  - `extend_stay` payload extended with `stay_start`, `guest_label`, and
+    the four totals (`new_room_price_total`, `new_net_total`,
+    `new_pay_total`, `new_balance_total`). The recipe now enumerates
+    calendar nights across the full `[stay_start, new_end)` range
+    instead of `[today, new_end)`, fixing the bug where extends from a
+    past start date would leave gaps in `HT_Room_Status`.
+  - `checkin_cancel` payload extended with `room_price` + `pay_to_subtract`
+    so the recipe can SUBTRACT the right amounts from `HT_CheckIn_H`
+    totals (multi-room safe per spike §3i). Previously zeroed,
+    leaving legacy totals stale.
+  - `payment` recipe logs a warning when `RecordPaymentReceipt` is
+    fully empty (all three of `customer_name` / `address` / `tel`
+    blank) — surfaces silent route-enrichment failures in worker logs.
+
+  **Audit gap #1 (CRIT, claimed):** verified the
+  `booking_create.rs` `HT_Customers` INSERT has 33 columns and 33
+  values aligned correctly (`'บุคคลธรรมดา'` lands in `[Cust_Type_Main]`
+  at position 31). The audit's gap claim was a miscount; no fix needed.
+
+  **Payload extensions:**
+  - `outbox::intent::WritebackIntent::CancelCheckIn` gained `room_price`,
+    `pay_to_subtract`.
+  - `outbox::intent::WritebackIntent::ExtendStay` gained `stay_start`,
+    `guest_label`, `new_room_price_total`, `new_net_total`,
+    `new_pay_total`, `new_balance_total`.
+  - `outbox::intent::WritebackIntent::RecordPayment` gained
+    `checkin_ds_id: Option<i32>` for per-room apportionment.
+  - `outbox::intent::BookingChanges` gained `new_customer_name` and
+    `customer_resave: Option<CustomerResave>`. New `CustomerResave`
+    struct mirrors the .NET app's full `HT_Customers` UPDATE field set.
+  - `service::checkin::CancelCheckInCommand` and `ExtendStayCommand`
+    gained matching fields. `service::payment::RecordPaymentCommand`
+    gained `checkin_ds_id`.
+  - All payload struct extensions use `#[serde(default)]` so jobs
+    enqueued under the previous schema continue to deserialize cleanly
+    (zero-downtime upgrade).
+
+  **Tests:** all 107 lib tests pass (97 in `writeback::*` — up from 78).
+  Added 11 new tests covering the cupon helper, walkin / checkin-to-booking
+  cupon emission, the full HT_Customers field set, the `extend_stay`
+  TM.30 touches and night-enumeration, the `payment` per-room
+  apportionment / cart-clear / VAT accumulator / `Cin_Pay_Ds` column,
+  the `booking_modify` room-book clear ordering, customer re-save, and
+  caption rewrite, and the `checkin_cancel` price subtraction.
+
+  **New dep:** `rand = "0.8"` (default-features-off, `std` + `std_rng`)
+  for the TM.30 batch-number generator.
+
 ## [2.28.1] - 2026-04-25
 
 ### Added

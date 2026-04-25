@@ -169,6 +169,11 @@ pub fn build_statements(inputs: &WalkInInputs<'_>) -> Vec<String> {
          '','',{room_no_q},0,{by_q},{stay_start_q},{stay_end_q},0,'','',0)"
     ));
 
+    // N+3. HT_Cupon — mark loyalty coupon as printed (spike §3a, walkin/writes.txt:9).
+    // Extracted into the shared helper so this recipe and `checkin_to_booking`
+    // emit byte-identical SQL.
+    statements.push(super::helpers::mark_cupon_printed(inputs.cin_no));
+
     let _ = NaiveDate::from_ymd_opt(2026, 1, 1); // silence unused-import lint
     let _ = Datelike::year(&Utc::now()); // silence unused-import lint
     statements
@@ -365,6 +370,18 @@ mod tests {
         let cust = s.iter().find(|s| s.contains("HT_Customers")).unwrap();
         // First positional value is the explicit id (21607)
         assert!(cust.contains("VALUES(21607,'C21607',"));
+    }
+
+    #[test]
+    fn emits_cupon_print_update_after_checkin_h() {
+        // Spike §3a `walkin/writes.txt:9` — every walk-in fires this.
+        let s = build_statements(&sample_inputs());
+        let cupon = s
+            .iter()
+            .find(|s| s.starts_with("update HT_Cupon"))
+            .expect("HT_Cupon mark-printed UPDATE must be emitted");
+        assert!(cupon.contains("cupon_print=1"));
+        assert!(cupon.contains("cupon_cin_no='CH26-005228'"));
     }
 
     #[test]
