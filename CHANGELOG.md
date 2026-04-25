@@ -16,6 +16,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `event: <DomainEvent::type_name()>` / `data: <raw JSON payload>`. 30-second
   `KeepAlive` heartbeat; client disconnect releases the PG connection.
 - **Cargo deps** — `async-stream = "0.3"`, `futures-util = "0.3"`.
+- **Frontend `useRealtimeEvents` hook** (`lib/use-realtime-events.ts`) — Phase 4a-frontend
+  per `docs/architecture.md` §3.6e. Opens a single `EventSource('/api/events')` and
+  fans 11 `DomainEvent` variants out to mapped cache buckets via a window
+  `CustomEvent('realtime:invalidate')`. Companion `useRealtimeInvalidate(key, refetch)`
+  lets list views subscribe in one line.
+  - Mapping: `BookingCreated/Modified/Cancelled → ['bookings', 'rooms']`;
+    `CheckInCreated/CheckOutCompleted/CheckInCancelled → ['checkins', 'rooms']`;
+    `CustomerCreated/Modified → ['customers']`;
+    `PaymentReceived → ['payments', 'checkins']`;
+    `RoomMarkedClean/Dirty → ['rooms', 'housekeeping']`.
+  - `EventSource` auto-reconnects per WHATWG spec; `onerror` only logs.
+  - **Window `CustomEvent` fallback** because the app does not currently bundle
+    React Query / SWR. `EVENT_TO_QUERY_KEYS` is the migration contract: once a
+    cache lib lands, swap the dispatch for `queryClient.invalidateQueries(...)`
+    without renaming any listener. TODO marked in the source.
+  - Wired into `<AppShell>` — active app-wide.
+- **Hook unit tests** (`__tests__/components/useRealtimeEvents.test.tsx`) — 14 tests
+  covering EventSource lifecycle, per-variant fan-out, and key filtering.
 
 ### Changed
 - **Routes thinned (Phase 2.5)** per `docs/architecture.md` §1, §6. Write
