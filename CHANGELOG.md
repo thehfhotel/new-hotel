@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.34.0] - 2026-04-25
+
+### Fixed
+
+- **Writeback worker — final pre-live-test hardening** (audit findings
+  HIGH-2, HIGH-3, MED-3, MED-5, LOW-1).
+
+  - **HIGH-3 — panic isolation.** Every `process_job` call now runs in
+    `tokio::spawn`; a panic inside any recipe (or a tiberius driver
+    bug) is caught via `JoinHandle::is_panic`, the job is force-
+    exhausted with the panic message, and the main loop continues.
+    Without this, a single panic would kill the worker; Docker would
+    restart it but the in-flight job would sit `in_progress` for 5
+    minutes before the janitor reclaimed — invisible to the operator
+    until the alert fired elsewhere.
+  - **HIGH-2 — non-retryable errors short-circuit to exhausted.**
+    `mark_failed_with_retryable` checks `WritebackError::is_retryable()`
+    and skips the retry budget for deterministic failures (intent
+    mismatch, recipe business-rule errors, payload deserialize, schema
+    drift). Slack alert fires immediately instead of waiting 12 minutes
+    of wasted retries on the same payload.
+  - **MED-5 — schema-drift Slack flood throttle.** Worker sleeps 60s
+    after posting the schema-fingerprint Slack alert and before
+    returning `Err`, so Docker's `restart: unless-stopped` doesn't loop
+    the worker every 5s and page the operator 6×/min.
+  - **MED-3 — exhausted-job Slack instruction.** The `:rotating_light:`
+    Slack message now includes the full reset SQL (`status='pending',
+    attempts=0, next_retry_at=NULL`) instead of just the status — the
+    previous instruction would leave `attempts` at the cap and
+    re-exhaust on the first retry.
+  - **LOW-1 — head+tail error truncation in Slack.** `truncate_head_tail()`
+    keeps the first 200 + last 300 chars (multi-byte safe for Thai),
+    preserving the row context tiberius/sqlx errors put at the end.
+
+  3 new binary unit tests for `truncate_head_tail` (short pass-through,
+  long head+tail preservation, Thai multi-byte safety). 114 lib + 7
+  binary tests pass.
+
 ## [2.33.0] - 2026-04-25
 
 ### Added
