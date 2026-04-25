@@ -14,6 +14,14 @@
 // Status / state literals
 // ───────────────────────────────────────────────────────────────────────────
 
+/// `HT_Book_H.Book_Status` literal for "booked" / "reserved" — the initial
+/// state set on every fresh booking-create. The .NET app's future-date
+/// room view (`View_Book_Date`) filters by this exact value:
+/// `WHERE book_status='จอง'`. Set to empty string previously, which kept
+/// our writeback bookings invisible in the future room view (the
+/// 2026-04-26 R014838/R014839 incident — bookings 0008/0009 in our app).
+pub const BOOK_STATUS_BOOKED: &str = "จอง";
+
 /// `HT_Book_H.Book_Status` literal for "cancelled". Spike §3g-bis.
 pub const BOOK_STATUS_CANCELLED: &str = "ยกเลิก";
 

@@ -56,8 +56,8 @@ use crate::writeback::allocate::{
     allocate_book_date_id, allocate_book_id, allocate_cust_no, allocate_customer_id, LegacyConn,
 };
 use crate::writeback::constants::{
-    BOOK_DS_STATUS_ACTIVE, BOOK_NOTIFY_DAY_DEFAULT, BOOK_ROOM_TYPE_BY_ROOM_NUMBER, CUST_TYPE_NORMAL,
-    DEFAULT_OPERATOR,
+    BOOK_DS_STATUS_ACTIVE, BOOK_NOTIFY_DAY_DEFAULT, BOOK_ROOM_TYPE_BY_ROOM_NUMBER,
+    BOOK_STATUS_BOOKED, CUST_TYPE_NORMAL, DEFAULT_OPERATOR,
 };
 use crate::writeback::dispatcher::LegacyIds;
 use crate::writeback::error::WritebackResult;
@@ -128,16 +128,21 @@ pub fn build_statements(inputs: &CreateBookingInputs<'_>) -> Vec<String> {
         ));
     }
 
-    // 2. HT_Book_H — full §3k visibility set
+    // 2. HT_Book_H — full §3k visibility set. Book_Status='จอง' is the
+    // visibility key for the future-date room view (View_Book_Date filters
+    // by `book_status='จอง'`). We previously sent '' which made our
+    // bookings invisible there.
+    let booked_q = sql_quote(BOOK_STATUS_BOOKED);
     statements.push(format!(
         "INSERT INTO [HT_Book_H]( [Book_ID],[Book_Date],[Book_Cust_ID],[Book_Cust_Name],\
          [Book_Cust_Name2],[Book_Cust_Tel],[Book_Price_Total],[Book_Price_Pay],[Book_Status],\
          [Book_Date_in],[Book_Date_out],[Book_by],[Book_room_all],[Book_room_note],\
          [book_room_type],[Book_Notify_Day],[Book_Notify_Note],[Book_Sale])\
          VALUES({book_id_q},{now_q},{cust_no_q},{cust_name_q},'',{cust_phone_q},\
-         {price},0,'',{stay_in},{stay_out},{by_q},'',{notes_q},{room_type_code},\
+         {price},0,{status},{stay_in},{stay_out},{by_q},'',{notes_q},{room_type_code},\
          {notify_day},'','')",
         price = inputs.price_baht,
+        status = booked_q,
         stay_in = stay_start_midnight_q,
         stay_out = stay_end_midnight_q,
         room_type_code = BOOK_ROOM_TYPE_BY_ROOM_NUMBER,
@@ -407,6 +412,21 @@ mod tests {
         let book_h = statements.iter().find(|s| s.contains("HT_Book_H")).unwrap();
         // Book_room_all must be '' or .NET hides the booking
         assert!(book_h.contains(",'',")); // there will be many '' but at minimum present
+    }
+
+    /// Book_Status must be 'จอง' (Thai for "booked") — visibility key for
+    /// the .NET app's future-date room view. The view query is
+    /// `SELECT * FROM View_Book_Date WHERE book_status='จอง' AND
+    /// Book_Date_ds=...`. Empty string (the prior value) hid bookings from
+    /// that view — the 2026-04-26 R014838/R014839 incident.
+    #[test]
+    fn book_h_status_is_jong_for_visibility_in_future_room_view() {
+        let statements = build_statements(&sample_inputs());
+        let book_h = statements.iter().find(|s| s.contains("HT_Book_H")).unwrap();
+        assert!(
+            book_h.contains("'จอง'"),
+            "Book_Status must be 'จอง' for future-room-view visibility: {book_h}"
+        );
     }
 
     #[test]
