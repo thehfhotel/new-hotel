@@ -82,10 +82,22 @@ pub struct CheckInToBookingCommand {
 }
 
 /// Command for [`CheckInService::cancel`].
+///
+/// `room_price` + `pay_to_subtract` ride into [`WritebackIntent::CancelCheckIn`]
+/// so the recipe can SUBTRACT the right amounts from `HT_CheckIn_H` totals
+/// (multi-room safe per spike §3i). Routes look these up from the canonical
+/// PG state — defaulting to `Money::ZERO` only when the room being cancelled
+/// is missing from the join (degrades gracefully — totals stay unchanged on
+/// MSSQL, but the cancel still proceeds).
 #[derive(Debug, Clone)]
 pub struct CancelCheckInCommand {
     pub check_in_id: i32,
     pub reason: Option<String>,
+    /// `Cin_Room_Price` of the cancelled room, in satang. Subtracted from
+    /// `HT_CheckIn_H.Total_Price_Room` / `Net` / `Balance`.
+    pub room_price: Money,
+    /// Pay portion to subtract from `Total_Price_Pay`. Usually `Money::ZERO`.
+    pub pay_to_subtract: Money,
     pub source: EventSource,
 }
 
@@ -99,6 +111,18 @@ pub struct ExtendStayCommand {
     /// the repository will own in a later wave. Today we only emit the
     /// writeback intent + event so the worker can apply the legacy diff.
     pub new_end: DateTime<Utc>,
+    /// Original `Cin_Room_In` from the canonical PG state. The recipe enumerates
+    /// calendar nights in `[stay_start, new_end)` so the legacy `HT_Room_Status`
+    /// rows cover the full range (not just `[today, new_end)`).
+    pub stay_start: DateTime<Utc>,
+    /// Customer name to display in `HT_Room_Status.room_Details` (the .NET
+    /// app's calendar grid label).
+    pub guest_label: String,
+    /// Recomputed totals to push into `HT_CheckIn_H`. All in satang.
+    pub new_room_price_total: Money,
+    pub new_net_total: Money,
+    pub new_pay_total: Money,
+    pub new_balance_total: Money,
     pub source: EventSource,
 }
 
@@ -324,6 +348,8 @@ impl CheckInService {
         let intent = WritebackIntent::CancelCheckIn {
             check_in_id: aggregate_id,
             reason: cmd.reason.clone(),
+            room_price: cmd.room_price,
+            pay_to_subtract: cmd.pay_to_subtract,
         };
         let key = generate_idempotency_key(&intent, aggregate_id);
         OutboxRepository::enqueue(&mut tx, &intent, key)
@@ -377,6 +403,12 @@ impl CheckInService {
         let intent = WritebackIntent::ExtendStay {
             check_in_id: aggregate_id,
             new_end: cmd.new_end,
+            stay_start: cmd.stay_start,
+            guest_label: cmd.guest_label.clone(),
+            new_room_price_total: cmd.new_room_price_total,
+            new_net_total: cmd.new_net_total,
+            new_pay_total: cmd.new_pay_total,
+            new_balance_total: cmd.new_balance_total,
         };
         let key = generate_idempotency_key(&intent, aggregate_id);
         OutboxRepository::enqueue(&mut tx, &intent, key)

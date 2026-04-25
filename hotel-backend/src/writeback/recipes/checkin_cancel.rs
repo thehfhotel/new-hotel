@@ -37,6 +37,7 @@
 //! - `HT_CheckIn_Other_People` is intentionally NOT deleted — accompanying
 //!   guests stay attached for the audit trail.
 
+use crate::domain::shared::Money;
 use crate::writeback::allocate::{allocate_rooms_cancel_id, LegacyConn};
 use crate::writeback::constants::{
     CIN_STATUS_CANCELLED, DEFAULT_OPERATOR, POWER_LOG_NOTE_CHECKIN_CANCELLED,
@@ -113,25 +114,27 @@ pub fn build_statements(inputs: &CancelCheckInInputs<'_>) -> Vec<String> {
 }
 
 /// Execute the cancel-check-in recipe.
+///
+/// `room_price` + `pay_to_subtract` flow in from the
+/// [`WritebackIntent::CancelCheckIn`] payload (route enrichment populates them
+/// from the canonical PG state per spike §3i). Both default to `Money::ZERO`
+/// when the route lookup couldn't resolve a per-room price — the cancel
+/// still proceeds, but `HT_CheckIn_H` totals stay unchanged on MSSQL.
 pub async fn execute(
     conn: &mut LegacyConn<'_>,
     cin_no: &str,
     room_no: &str,
     reason: Option<&str>,
+    room_price: Money,
+    pay_to_subtract: Money,
 ) -> WritebackResult<LegacyIds> {
     let cancel_id = allocate_rooms_cancel_id(conn).await?;
     let inputs = CancelCheckInInputs {
         cin_no,
         room_no,
         rooms_cancel_id: cancel_id,
-        // The current `WritebackIntent::CancelCheckIn` payload doesn't carry
-        // the per-room price (only the check_in_id and reason). Until that
-        // payload is extended, we pass 0 — totals end up unchanged on MSSQL.
-        // The PG side already tracks the canonical totals; this is purely a
-        // best-effort sync of the legacy view.
-        // TODO: extend CancelCheckIn payload with `room_price` (spike §3i note).
-        price_to_subtract: 0.0,
-        pay_to_subtract: 0.0,
+        price_to_subtract: (room_price.as_satang() as f64) / 100.0,
+        pay_to_subtract: (pay_to_subtract.as_satang() as f64) / 100.0,
         cancel_by: DEFAULT_OPERATOR,
         cancel_note: reason,
     };
@@ -186,6 +189,27 @@ mod tests {
         );
         assert!(statements[6].contains("ROOM_POWER_NOTE2='ปิดไฟ เนื่องจากยกเลิกห้องพัก'"));
         assert!(statements[6].contains("ROOM_POWER_END_BY=''"));
+    }
+
+    #[test]
+    fn price_to_subtract_propagates_to_totals_update() {
+        // After fix #15 the recipe takes the room_price as input rather than
+        // defaulting to 0. Verify that a real value lands in the SUBTRACT.
+        let inputs = CancelCheckInInputs {
+            cin_no: "CH26-005233",
+            room_no: "306",
+            rooms_cancel_id: 298,
+            price_to_subtract: 1500.0,
+            pay_to_subtract: 250.0,
+            cancel_by: "Admin",
+            cancel_note: None,
+        };
+        let s = build_statements(&inputs);
+        let totals = s.iter().find(|s| s.contains("[Total_Price_Room]")).unwrap();
+        assert!(totals.contains("Total_Price_Room-1500"));
+        assert!(totals.contains("[Total_Price_Net]-1500"));
+        assert!(totals.contains("[Total_Price_Pay]-250"));
+        assert!(totals.contains("([Total_Price_Balance]-1500)+250"));
     }
 
     #[test]

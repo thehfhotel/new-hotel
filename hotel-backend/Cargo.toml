@@ -1,6 +1,6 @@
 [package]
 name = "hotel-backend"
-version = "2.9.1"
+version = "2.10.0"
 edition = "2021"
 description = "Hotel Management System Backend API"
 authors = [""]
@@ -76,6 +76,11 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
 # Hashing (SHA256 for sync change detection)
 sha2 = "0.10"
+
+# Randomness (used by writeback recipes for TM.30 batch numbers per spike §3a —
+# `HT_CheckIn_H.Cin_Work_number` is a non-sequential random i32 the legacy app
+# assigns ~5s after each save). Minimal feature set: only need `rand::random`.
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 
 # Config
 dotenvy = "0.15"
