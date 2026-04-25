@@ -5,39 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.25.0] - 2026-04-25
+
+### Added
+- **Backend repository layer** (`hotel-backend/src/repository/`) — Phase 1b per
+  `docs/architecture.md` §1, §6. Each aggregate gets a trait + PostgreSQL impl
+  (`customer`, `booking`, `checkin`, `room`, `payment`, `inventory`).
+- **Backend outbox + event-bus runtime** (`hotel-backend/src/outbox/`) — Phase 3b
+  per `docs/architecture.md` §3.6c:
+  - `queue.rs` — `OutboxRepository::enqueue()` writes a `writeback_jobs` row
+    inside the caller's `&mut Transaction<Postgres>`, atomic with canonical write.
+  - `bus.rs` — `EventBus::publish()` performs `INSERT event_log` + `pg_notify('domain_events', ...)` in caller's TX (NOTIFY deferred to COMMIT).
+  - `idempotency.rs` — deterministic UUID v5 keys (namespace `d86fe320-5424-58cd-8c00-50ea7d998b36`).
+- **`AppState.outbox: Arc<OutboxRepository>`** + **`AppState.events: Arc<EventBus>`** — wired into route state for service-layer callers.
+- **`hotel-backend/src/lib.rs`** — exposes modules so integration tests can `use hotel_backend::…`.
+- **Integration tests** (`hotel-backend/tests/test_outbox.rs`): 4 sqlx::test cases + 5 pure unit tests in `outbox::idempotency`.
 
 ### Changed
-- **Backend repository layer** (`hotel-backend/src/repository/`) — Phase 1b per
-  `docs/architecture.md` §1, §6. Each aggregate gets a trait + PostgreSQL impl:
-  - `customer.rs` — `CustomerRepository` + `PgCustomerRepository`
-  - `booking.rs` — `BookingRepository` + `PgBookingRepository` (covers list,
-    get + rooms, insert, update, delete-rooms, cancel, sequence helpers)
-  - `checkin.rs` — `CheckInRepository` + `PgCheckInRepository` (walk-in /
-    book-in / check-out / guest registry as data ops only)
-  - `room.rs` — `RoomRepository` + `PgRoomRepository`
-  - `payment.rs` — `PaymentRepository` + `PgPaymentRepository`
-  - `inventory.rs` — `InventoryRepository` + `PgInventoryRepository`
-  - `outbox.rs` — `OutboxRepository` trait + `PgOutboxRepository` stub
-    (Agent D fills in `enqueue` body in parallel)
-  - `event_log.rs` — `EventLogRepository` trait + `PgEventLogRepository` stub
-    (Agent D fills in `publish` body in parallel)
-- **Routes thinned**: `routes/new_customers.rs`, `new_bookings.rs`,
-  `new_checkins.rs`, `new_rooms.rs`, `new_payments.rs`, `new_inventory.rs` no
-  longer call `sqlx::query!()` directly. They translate request bodies into
-  repository writes, start their own transaction, and shape the response from
-  repository row types. SQL text is byte-identical to before, so the existing
-  `.sqlx/` cache stays valid (no regeneration needed).
-- **`AppState` (`routes/mode.rs`)** holds `Arc<dyn ...Repository>` per
-  aggregate so test setups can swap in fakes. Default constructor wires up
-  the `Pg<Aggregate>Repository` impls.
-- **`hotel-backend/Cargo.toml`**: declared `async-trait = "0.1"` explicitly
-  (was already in the dep tree transitively via axum / bb8 / tiberius). Used
-  by every repository trait for object-safe `async fn` methods.
-- **`hotel-backend/src/main.rs`**: registers the new `repository` top-level
-  module.
-- **Endpoint contracts unchanged.** Frontend `/api/new/*` calls behave
-  identically; no DTO field added or removed.
+- **Routes thinned**: `routes/new_{customers,bookings,checkins,rooms,payments,inventory}.rs` no longer call `sqlx::query!()` directly; SQL text is byte-identical so existing `.sqlx/` cache stays valid.
+- **`hotel-backend/Cargo.toml`**: declared `async-trait = "0.1"` explicitly; `uuid` feature `v5` enabled; `sqlx` feature `uuid` enabled.
+- **`hotel-backend/src/main.rs`**: switched from inline `mod foo;` to `use hotel_backend::{...}` (single compilation between binary + tests).
+- **Endpoint contracts unchanged.** Frontend `/api/new/*` calls behave identically.
 
 ## [2.24.0] - 2026-04-25
 
