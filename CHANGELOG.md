@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **One-shot rooms backfill binary** (`hotel-backend/src/bin/backfill_rooms.rs`).
+  Mirrors the 58 rooms in legacy `HT_Rooms` and the 8 room types in
+  `HT_SET_RoomType` into `ht_rooms_new` + `ht_room_types`, **preserving the
+  legacy integer ids** as the PG primary keys so the writeback worker can
+  resolve `room_id → legacy room_no` and so the frontend's room picker
+  (booking creation UI) finally has rows to render.
+  - Idempotent — `INSERT ... ON CONFLICT (room_id) DO UPDATE` lets the
+    binary be re-run after legacy edits without producing duplicates.
+  - Bumps the SERIAL sequences past `MAX(id)` so subsequent UI-created
+    rooms don't collide with preserved legacy ids.
+  - Inverts `Room_Clean` per spike §3i (legacy `'yes'` = needs cleaning).
+  - New `backfill-rooms` service in `docker-compose.yml` under
+    `profiles: [backfill]`. Activate on demand:
+    `docker compose --profile backfill run --rm backfill-rooms`
+  - Dockerfile builds + ships the binary alongside `hotel-backend` and
+    `writeback`.
+
 ## [2.28.0] - 2026-04-25
 
 ### Added
