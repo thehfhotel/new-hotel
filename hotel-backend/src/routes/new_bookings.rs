@@ -6,22 +6,29 @@
 //! - PUT /api/new/bookings/:id - Update booking
 //! - PUT /api/new/bookings/:id/cancel - Cancel booking
 //!
-//! Per `docs/architecture.md` §1, §6 (Phase 1b) the SQL has moved to
-//! `repository::booking`. This file now owns request validation, response
-//! shaping, and translates between repository row shapes and the wire DTOs.
+//! Per `docs/architecture.md` §1, §6 (Phase 2.5) writes delegate through
+//! `state.bookings_service`. Reads keep calling `state.bookings` (the
+//! repository) directly — the service layer's value is in writes (TX +
+//! outbox + events), not in reads.
 
 use axum::{
     extract::{Path, Query, State},
     Json,
 };
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use super::mode::AppState;
+use crate::domain::shared::{DateRange, Money};
 use crate::error::{ApiError, ApiResult};
 use crate::models::Pagination;
-use crate::repository::booking::{
-    BookingDetailRow, BookingListRow, BookingRoomAssignment, BookingRoomRow, BookingWrite,
+use crate::outbox::event::EventSource;
+use crate::outbox::intent::BookingChanges;
+use crate::repository::booking::{BookingDetailRow, BookingListRow, BookingRoomRow};
+use crate::service::{
+    BookingRoomCommand, BookingWritebackContext, CancelBookingCommand, CreateBookingCommand,
+    ModifyBookingCommand,
 };
 
 /// Booking status enum
@@ -291,6 +298,11 @@ pub async fn get_booking(
 }
 
 /// POST /api/new/bookings - Create booking
+///
+/// Delegates the canonical write + outbox enqueue + event publish to
+/// [`crate::service::BookingService::create`]. The route generates the
+/// `book_no` (today/sequence based) since that's a presentation concern,
+/// then constructs the [`CreateBookingCommand`] from the request body.
 pub async fn create_booking(
     State(state): State<AppState>,
     Json(body): Json<CreateUpdateBookingRequest>,
@@ -299,74 +311,33 @@ pub async fn create_booking(
         return Err(ApiError::BadRequest("At least one room is required".to_string()));
     }
 
-    // Generate booking number (YYYYMMDD-NNNN format).
-    let last_book_no = state.bookings.latest_book_no_today(&state.new_pool).await?;
+    let book_no = generate_book_no(&state).await?;
+    let (check_in_date, check_out_date) = parse_stay_range(&body.check_in, &body.check_out)?;
 
-    let next_seq = if let Some(last) = last_book_no {
-        let parts: Vec<&str> = last.split('-').collect();
-        if parts.len() == 2 {
-            parts[1].parse::<i32>().unwrap_or(0) + 1
-        } else {
-            1
-        }
-    } else {
-        1
+    let cmd = CreateBookingCommand {
+        book_no: book_no.clone(),
+        customer_id: body.customer_id,
+        check_in: check_in_date,
+        check_out: check_out_date,
+        adults: body.adults.unwrap_or(1),
+        children: body.children.unwrap_or(0),
+        status: body.status.clone().unwrap_or_else(|| "pending".to_string()),
+        source_label: body.source.clone(),
+        total_amount: body.total_amount,
+        deposit_amount: body.deposit_amount,
+        notes: body.notes.clone(),
+        rooms: body.rooms.iter().map(room_request_to_command).collect(),
+        writeback_context: build_writeback_context(&body, check_in_date, check_out_date),
+        // TODO: wire user_id from auth middleware
+        source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
     };
 
-    let today = state.bookings.today_yyyymmdd(&state.new_pool).await?;
-
-    let book_no = format!("{}-{:04}", today, next_seq);
-
-    let status = body.status.as_deref().unwrap_or("pending");
-    let adults = body.adults.unwrap_or(1);
-    let children = body.children.unwrap_or(0);
-
-    let check_in_date = NaiveDate::parse_from_str(&body.check_in, "%Y-%m-%d")
-        .map_err(|_| ApiError::BadRequest("Invalid check-in date format (expected YYYY-MM-DD)".to_string()))?;
-    let check_out_date = NaiveDate::parse_from_str(&body.check_out, "%Y-%m-%d")
-        .map_err(|_| ApiError::BadRequest("Invalid check-out date format (expected YYYY-MM-DD)".to_string()))?;
-
-    let mut tx = state.new_pool.begin().await?;
-    let book_id = state
-        .bookings
-        .insert_booking(
-            &mut tx,
-            BookingWrite {
-                book_no: book_no.as_str(),
-                customer_id: body.customer_id,
-                check_in: check_in_date,
-                check_out: check_out_date,
-                adults,
-                children,
-                status,
-                source: body.source.as_deref(),
-                total_amount: body.total_amount,
-                deposit_amount: body.deposit_amount,
-                notes: body.notes.as_deref(),
-            },
-        )
-        .await?;
-
-    for room in &body.rooms {
-        state
-            .bookings
-            .insert_booking_room(
-                &mut tx,
-                book_id,
-                BookingRoomAssignment {
-                    room_id: room.room_id,
-                    price_per_night: room.price_per_night,
-                },
-            )
-            .await?;
-    }
-
-    tx.commit().await?;
+    let outcome = state.bookings_service.create(cmd).await?;
 
     Ok(Json(MutationResponse {
         success: true,
         message: "Booking created successfully".to_string(),
-        id: Some(book_id),
+        id: Some(outcome.book_id),
         book_no: Some(book_no),
     }))
 }
@@ -381,66 +352,56 @@ pub async fn update_booking(
         return Err(ApiError::BadRequest("At least one room is required".to_string()));
     }
 
-    // Check if booking exists (and grab the existing book_no for the response)
+    // Verify the booking exists (404 vs 400) and grab book_no for the response.
     let book_no = state
         .bookings
         .get_book_no(&state.new_pool, book_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Booking not found".to_string()))?;
 
-    let status = body.status.as_deref().unwrap_or("pending");
-    let adults = body.adults.unwrap_or(1);
-    let children = body.children.unwrap_or(0);
+    let (check_in_date, check_out_date) = parse_stay_range(&body.check_in, &body.check_out)?;
 
-    let check_in_date = NaiveDate::parse_from_str(&body.check_in, "%Y-%m-%d")
-        .map_err(|_| ApiError::BadRequest("Invalid check-in date format (expected YYYY-MM-DD)".to_string()))?;
-    let check_out_date = NaiveDate::parse_from_str(&body.check_out, "%Y-%m-%d")
-        .map_err(|_| ApiError::BadRequest("Invalid check-out date format (expected YYYY-MM-DD)".to_string()))?;
+    let snapshot = build_snapshot_inputs(&body, check_in_date, check_out_date);
 
-    let mut tx = state.new_pool.begin().await?;
-    state
-        .bookings
-        .update_booking(
-            &mut tx,
-            book_id,
-            BookingWrite {
-                book_no: book_no.as_str(),
-                customer_id: body.customer_id,
-                check_in: check_in_date,
-                check_out: check_out_date,
-                adults,
-                children,
-                status,
-                source: body.source.as_deref(),
-                total_amount: body.total_amount,
-                deposit_amount: body.deposit_amount,
-                notes: body.notes.as_deref(),
-            },
-        )
-        .await?;
+    let cmd = ModifyBookingCommand {
+        book_id,
+        customer_id: body.customer_id,
+        check_in: check_in_date,
+        check_out: check_out_date,
+        adults: body.adults.unwrap_or(1),
+        children: body.children.unwrap_or(0),
+        status: body.status.clone().unwrap_or_else(|| "pending".to_string()),
+        source_label: body.source.clone(),
+        total_amount: body.total_amount,
+        deposit_amount: body.deposit_amount,
+        notes: body.notes.clone(),
+        rooms: body.rooms.iter().map(room_request_to_command).collect(),
+        // TODO: diff against the loaded prior row to populate per-field changes.
+        changes: BookingChanges {
+            new_stay: Some(DateRange::new(
+                naive_date_to_utc(check_in_date),
+                naive_date_to_utc(check_out_date),
+            )),
+            new_room_no: None,
+            new_room_type: None,
+            new_price: body.total_amount.map(money_from_baht_f64),
+            new_state: None,
+            new_notes: body.notes.clone(),
+            new_customer_phone: None,
+        },
+        // TODO: load prior snapshot from repo for richer event payload.
+        before_snapshot: None,
+        after_snapshot: snapshot,
+        // TODO: wire user_id from auth middleware
+        source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
+    };
 
-    state.bookings.delete_booking_rooms(&mut tx, book_id).await?;
-
-    for room in &body.rooms {
-        state
-            .bookings
-            .insert_booking_room(
-                &mut tx,
-                book_id,
-                BookingRoomAssignment {
-                    room_id: room.room_id,
-                    price_per_night: room.price_per_night,
-                },
-            )
-            .await?;
-    }
-
-    tx.commit().await?;
+    let outcome = state.bookings_service.modify(cmd).await?;
 
     Ok(Json(MutationResponse {
         success: true,
         message: "Booking updated successfully".to_string(),
-        id: Some(book_id),
+        id: Some(outcome.book_id),
         book_no: Some(book_no),
     }))
 }
@@ -450,20 +411,134 @@ pub async fn cancel_booking(
     State(state): State<AppState>,
     Path(book_id): Path<i32>,
 ) -> ApiResult<Json<MutationResponse>> {
-    let mut tx = state.new_pool.begin().await?;
-    let rows_affected = state.bookings.cancel(&mut tx, book_id).await?;
-
-    if rows_affected == 0 {
-        tx.rollback().await?;
-        return Err(ApiError::BadRequest("Booking not found or cannot be cancelled".to_string()));
-    }
-
-    tx.commit().await?;
+    let outcome = state
+        .bookings_service
+        .cancel(CancelBookingCommand {
+            book_id,
+            reason: None,
+            // TODO: wire user_id from auth middleware
+            source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
+        })
+        .await
+        .map_err(map_cancel_error)?;
 
     Ok(Json(MutationResponse {
         success: true,
         message: "Booking cancelled successfully".to_string(),
-        id: Some(book_id),
+        id: Some(outcome.book_id),
         book_no: None,
     }))
+}
+
+// ---------- helpers (presentation glue) ----------
+
+/// Generate `YYYYMMDD-NNNN` booking number from the latest sequence today.
+async fn generate_book_no(state: &AppState) -> ApiResult<String> {
+    let last_book_no = state.bookings.latest_book_no_today(&state.new_pool).await?;
+    let next_seq = last_book_no
+        .as_deref()
+        .and_then(|s| s.split('-').nth(1))
+        .and_then(|n| n.parse::<i32>().ok())
+        .map(|n| n + 1)
+        .unwrap_or(1);
+
+    let today = state.bookings.today_yyyymmdd(&state.new_pool).await?;
+    Ok(format!("{}-{:04}", today, next_seq))
+}
+
+fn parse_stay_range(check_in: &str, check_out: &str) -> ApiResult<(NaiveDate, NaiveDate)> {
+    let check_in_date = NaiveDate::parse_from_str(check_in, "%Y-%m-%d").map_err(|_| {
+        ApiError::BadRequest("Invalid check-in date format (expected YYYY-MM-DD)".to_string())
+    })?;
+    let check_out_date = NaiveDate::parse_from_str(check_out, "%Y-%m-%d").map_err(|_| {
+        ApiError::BadRequest("Invalid check-out date format (expected YYYY-MM-DD)".to_string())
+    })?;
+    Ok((check_in_date, check_out_date))
+}
+
+fn room_request_to_command(req: &BookingRoomRequest) -> BookingRoomCommand {
+    BookingRoomCommand {
+        room_id: req.room_id,
+        price_per_night: req.price_per_night,
+    }
+}
+
+/// Build a [`BookingWritebackContext`] from the request body.
+///
+/// TODO: enrich with customer name/phone, room number/type lookups so the
+/// writeback worker (Phase 4b) has everything it needs without re-querying.
+/// Today the worker isn't deployed, so accumulating outbox rows with the
+/// minimum context is acceptable.
+fn build_writeback_context(
+    body: &CreateUpdateBookingRequest,
+    check_in: NaiveDate,
+    check_out: NaiveDate,
+) -> BookingWritebackContext {
+    use crate::service::{aggregate_uuid, AggregateKind};
+
+    let stay = DateRange::new(naive_date_to_utc(check_in), naive_date_to_utc(check_out));
+    let price = body.total_amount.map(money_from_baht_f64).unwrap_or(Money::ZERO);
+
+    BookingWritebackContext {
+        customer_aggregate_id: aggregate_uuid(AggregateKind::Customer, body.customer_id),
+        legacy_cust_no: None,
+        customer_name: String::new(),
+        customer_phone: None,
+        stay,
+        room_no: String::new(),
+        room_type: String::new(),
+        price,
+        created_by: String::new(),
+        notes: body.notes.clone(),
+    }
+}
+
+fn build_snapshot_inputs(
+    body: &CreateUpdateBookingRequest,
+    check_in: NaiveDate,
+    check_out: NaiveDate,
+) -> crate::service::BookingSnapshotInputs {
+    use crate::domain::booking::BookingState;
+
+    let state = match body.status.as_deref().unwrap_or("pending") {
+        "active" | "confirmed" => BookingState::Active,
+        "checkedin" | "checked_in" | "checked-in" => BookingState::CheckedIn,
+        "completed" => BookingState::Completed,
+        "cancelled" | "canceled" => BookingState::Cancelled,
+        _ => BookingState::Pending,
+    };
+
+    crate::service::BookingSnapshotInputs {
+        legacy_book_id: None,
+        state,
+        stay_start: naive_date_to_utc(check_in),
+        stay_end: naive_date_to_utc(check_out),
+        room_no: None,
+        price: body.total_amount.map(money_from_baht_f64).unwrap_or(Money::ZERO),
+    }
+}
+
+fn naive_date_to_utc(date: NaiveDate) -> chrono::DateTime<Utc> {
+    let midnight = NaiveTime::from_hms_opt(0, 0, 0).expect("hardcoded midnight is valid");
+    Utc.from_utc_datetime(&date.and_time(midnight))
+}
+
+/// Convert a baht-denominated `f64` from the request DTO to the integer-cent
+/// [`Money`] type the service speaks. Mirrors `Money::from_baht` semantics.
+fn money_from_baht_f64(baht: f64) -> Money {
+    let satang = (baht * 100.0).round() as i64;
+    Money::from_satang(satang)
+}
+
+/// Translate the service's `Conflict` outcome (booking missing or already
+/// terminal) to the route's prior 400 message so the wire contract is
+/// preserved verbatim.
+fn map_cancel_error(err: crate::service::ServiceError) -> ApiError {
+    match err {
+        crate::service::ServiceError::Conflict(_)
+        | crate::service::ServiceError::NotFound(_) => {
+            ApiError::BadRequest("Booking not found or cannot be cancelled".to_string())
+        }
+        other => other.into(),
+    }
 }

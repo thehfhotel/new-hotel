@@ -4,9 +4,15 @@
 //! - POST /api/new/checkins/:id/payments - Record a payment
 //! - DELETE /api/new/payments/:id - Void a payment (soft delete)
 //!
-//! Per `docs/architecture.md` §1, §6 (Phase 1b) the SQL has moved to
-//! `repository::payment`. Validation, derived totals, and DTO mapping stay
-//! here; the multi-step business logic moves to the service layer in Phase 2.
+//! Per `docs/architecture.md` §1, §6 (Phase 2.5) the create handler
+//! delegates to `state.payments_service` for the three legacy-known tender
+//! methods (cash / credit / transfer) so the canonical write, outbox
+//! enqueue, and event publish all happen atomically. The QR method has no
+//! legacy counterpart yet (and no `PaymentMethod::Qr` variant in the
+//! domain enum); that path stays on the repository so the wire contract
+//! preserves the literal `"qr"` value in `ht_payments.pay_method`. The
+//! list + void handlers stay on the repository (reads + a soft-delete
+//! that has no service method yet).
 
 use axum::{
     extract::{Path, State},
@@ -14,10 +20,14 @@ use axum::{
 };
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use super::mode::AppState;
+use crate::domain::payment::PaymentMethod;
 use crate::error::{ApiError, ApiResult};
+use crate::outbox::event::EventSource;
 use crate::repository::payment::{PaymentInsert, PaymentRow};
+use crate::service::RecordPaymentCommand;
 
 /// Payment from HT_Payments table
 #[derive(Debug, Serialize)]
@@ -135,6 +145,12 @@ pub async fn list_payments(
 }
 
 /// POST /api/new/checkins/:id/payments - Record a payment
+///
+/// Cash / credit / transfer flow through [`crate::service::PaymentService::record_payment`]
+/// for atomic canonical write + outbox enqueue + event publish. The legacy
+/// "qr" tender has no `PaymentMethod` variant yet, so it falls back to a
+/// direct repository insert — preserving the literal `"qr"` string value
+/// in `ht_payments.pay_method` for the wire contract.
 pub async fn create_payment(
     State(state): State<AppState>,
     Path(cin_id): Path<i32>,
@@ -153,28 +169,30 @@ pub async fn create_payment(
         )));
     }
 
-    // Verify check-in exists. Mirrors the route's prior `find_status`-shaped
-    // existence check.
+    // Verify check-in exists. Mirrors the route's prior `find_status` check.
     if state.checkins.find_status(&state.new_pool, cin_id).await?.is_none() {
         return Err(ApiError::NotFound("Check-in not found".to_string()));
     }
 
-    let mut tx = state.new_pool.begin().await?;
-    let pay_id = state
-        .payments
-        .insert(
-            &mut tx,
-            PaymentInsert {
-                cin_id,
-                amount: body.amount,
-                method: method.as_str(),
-                reference: body.reference.as_deref(),
-                notes: body.notes.as_deref(),
-                created_by: body.created_by.as_deref(),
-            },
-        )
-        .await?;
-    tx.commit().await?;
+    let pay_id = match parse_payment_method(&method) {
+        Some(domain_method) => {
+            let outcome = state
+                .payments_service
+                .record_payment(RecordPaymentCommand {
+                    check_in_id: cin_id,
+                    amount_satang: baht_f64_to_satang(body.amount),
+                    method: domain_method,
+                    reference: body.reference.clone(),
+                    notes: body.notes.clone(),
+                    created_by: body.created_by.clone(),
+                    // TODO: wire user_id from auth middleware
+                    source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
+                })
+                .await?;
+            outcome.pay_id
+        }
+        None => insert_qr_payment_directly(&state, cin_id, &body, &method).await?,
+    };
 
     Ok(Json(PaymentMutationResponse {
         success: true,
@@ -184,6 +202,9 @@ pub async fn create_payment(
 }
 
 /// DELETE /api/new/payments/:id - Void a payment (soft delete)
+///
+/// Stays on the repository: the service layer does not yet expose a
+/// `void_payment` method.
 pub async fn void_payment(
     State(state): State<AppState>,
     Path(pay_id): Path<i32>,
@@ -207,4 +228,47 @@ pub async fn void_payment(
         message: "Payment voided successfully".to_string(),
         id: Some(pay_id),
     }))
+}
+
+// ---------- helpers ----------
+
+fn parse_payment_method(method: &str) -> Option<PaymentMethod> {
+    match method {
+        "cash" => Some(PaymentMethod::Cash),
+        "credit" => Some(PaymentMethod::Credit),
+        "transfer" => Some(PaymentMethod::Transfer),
+        _ => None,
+    }
+}
+
+fn baht_f64_to_satang(baht: f64) -> i64 {
+    (baht * 100.0).round() as i64
+}
+
+/// Direct repository insert for the "qr" tender method. Preserves the
+/// literal column value (`pay_method = 'qr'`) since the domain
+/// [`PaymentMethod`] enum has no `Qr` variant today.
+async fn insert_qr_payment_directly(
+    state: &AppState,
+    cin_id: i32,
+    body: &CreatePaymentRequest,
+    method_lc: &str,
+) -> ApiResult<i32> {
+    let mut tx = state.new_pool.begin().await?;
+    let pay_id = state
+        .payments
+        .insert(
+            &mut tx,
+            PaymentInsert {
+                cin_id,
+                amount: body.amount,
+                method: method_lc,
+                reference: body.reference.as_deref(),
+                notes: body.notes.as_deref(),
+                created_by: body.created_by.as_deref(),
+            },
+        )
+        .await?;
+    tx.commit().await?;
+    Ok(pay_id)
 }
