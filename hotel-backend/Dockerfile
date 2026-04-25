@@ -36,7 +36,7 @@ RUN cargo chef cook --release --recipe-path recipe.json
 # Now copy the real source and build the actual binary. Deps are already
 # compiled in target/, so this only recompiles first-party code.
 COPY . .
-RUN cargo build --release --bin hotel-backend
+RUN cargo build --release --bin hotel-backend --bin writeback
 
 # ---- Runtime stage --------------------------------------------------------
 FROM debian:bookworm-slim
@@ -49,6 +49,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY --from=builder /usr/src/app/target/release/hotel-backend /app/hotel-backend
+COPY --from=builder /usr/src/app/target/release/writeback /app/writeback
 
 RUN useradd -m -u 1000 appuser
 USER appuser
