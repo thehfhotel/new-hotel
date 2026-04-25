@@ -22,7 +22,7 @@ use uuid::Uuid;
 use crate::domain::payment::PaymentMethod;
 use crate::domain::shared::Money;
 use crate::outbox::event::{DomainEvent, EventSource};
-use crate::outbox::intent::WritebackIntent;
+use crate::outbox::intent::{RecordPaymentReceipt, WritebackIntent};
 use crate::outbox::{generate_idempotency_key, EventBus, OutboxRepository};
 use crate::repository::payment::{PaymentInsert, PaymentRepository};
 
@@ -38,6 +38,11 @@ pub struct RecordPaymentCommand {
     pub reference: Option<String>,
     pub notes: Option<String>,
     pub created_by: Option<String>,
+    /// Customer + room metadata copied straight into the
+    /// [`WritebackIntent::RecordPayment`] payload so the receipt header
+    /// (`HT_Receipt_H.Receipt_Name` / `Address` / `Tel`) lands populated.
+    /// Routes look these up from `ht_customers` before issuing the command.
+    pub receipt: RecordPaymentReceipt,
     pub source: EventSource,
 }
 
@@ -128,6 +133,7 @@ impl PaymentService {
             check_in_id: check_in_aggregate_id,
             amount: Money::from_satang(cmd.amount_satang),
             method: cmd.method,
+            receipt: cmd.receipt.clone(),
         };
         // Use the payment id (not the check-in id) as the idempotency
         // discriminator so multiple payments against the same check-in

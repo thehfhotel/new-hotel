@@ -190,7 +190,7 @@ pub async fn dispatch(
             })?;
             recipes::checkout::execute(conn, cin_no, room_no, ds_id).await
         }
-        WritebackIntent::RecordPayment { check_in_id: _, amount, method } => {
+        WritebackIntent::RecordPayment { check_in_id: _, amount, method, receipt } => {
             let cin_no = resolved.legacy_cin_no.as_deref().ok_or_else(|| {
                 WritebackError::Recipe("RecordPayment requires resolved legacy_cin_no".into())
             })?;
@@ -200,7 +200,10 @@ pub async fn dispatch(
             let room_no = resolved.legacy_room_no.as_deref().ok_or_else(|| {
                 WritebackError::Recipe("RecordPayment requires resolved legacy_room_no".into())
             })?;
-            recipes::payment::execute(conn, cin_no, cust_no, room_no, *amount, *method).await
+            recipes::payment::execute(
+                conn, cin_no, cust_no, room_no, *amount, *method, receipt,
+            )
+            .await
         }
         WritebackIntent::MarkRoomClean { room_id: _, by } => {
             let room_no = resolved.legacy_room_no.as_deref().ok_or_else(|| {

@@ -33,6 +33,7 @@
 
 use crate::domain::payment::PaymentMethod;
 use crate::domain::shared::Money;
+use crate::outbox::intent::RecordPaymentReceipt;
 use crate::writeback::allocate::{
     allocate_pay_no, allocate_receipt_h_id, allocate_receipt_no, LegacyConn,
 };
@@ -122,6 +123,12 @@ pub fn build_statements(inputs: &PaymentInputs<'_>) -> Vec<String> {
 }
 
 /// Execute the payment + receipt recipe.
+///
+/// `receipt` carries the customer name/address/tel for `HT_Receipt_H`. The
+/// route layer populates these by looking up the customer attached to the
+/// check-in; if the lookup fails (e.g. orphaned check-in) the route still
+/// enqueues the intent with empty strings — receipts get printed with blank
+/// header fields rather than dropping the payment.
 pub async fn execute(
     conn: &mut LegacyConn<'_>,
     cin_no: &str,
@@ -129,22 +136,19 @@ pub async fn execute(
     room_no: &str,
     amount: Money,
     method: PaymentMethod,
+    receipt: &RecordPaymentReceipt,
 ) -> WritebackResult<LegacyIds> {
     let pay_no = allocate_pay_no(conn).await?;
     let receipt_no = allocate_receipt_no(conn).await?;
     let receipt_h_id = allocate_receipt_h_id(conn).await?;
 
-    // The current `WritebackIntent::RecordPayment` payload doesn't carry the
-    // customer name/address — defaults match what the legacy capture shows for
-    // a no-VAT no-detail receipt. Service layer can extend the payload later.
-    // TODO: extend RecordPayment payload with customer_name/address (spike §3h).
     let inputs = PaymentInputs {
         cin_no,
         cust_no,
         room_no,
-        customer_name: "",
-        customer_address: "",
-        customer_tel: "",
+        customer_name: receipt.customer_name.as_str(),
+        customer_address: receipt.customer_address.as_str(),
+        customer_tel: receipt.customer_tel.as_str(),
         amount_baht: (amount.as_satang() as f64) / 100.0,
         method,
         pay_no: &pay_no,
