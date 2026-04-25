@@ -47,11 +47,16 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
     --mount=type=cache,target=/usr/src/app/target,id=hotel-backend-target \
-    cargo build --release --bin hotel-backend --bin writeback --bin backfill_rooms \
+    cargo build --release \
+        --bin hotel-backend \
+        --bin writeback \
+        --bin backfill_rooms \
+        --bin inspect_booking \
     && mkdir -p /out \
     && cp target/release/hotel-backend /out/ \
     && cp target/release/writeback /out/ \
-    && cp target/release/backfill_rooms /out/
+    && cp target/release/backfill_rooms /out/ \
+    && cp target/release/inspect_booking /out/
 
 # ---- Runtime stage --------------------------------------------------------
 FROM debian:bookworm-slim
@@ -66,6 +71,7 @@ WORKDIR /app
 COPY --from=builder /out/hotel-backend /app/hotel-backend
 COPY --from=builder /out/writeback /app/writeback
 COPY --from=builder /out/backfill_rooms /app/backfill_rooms
+COPY --from=builder /out/inspect_booking /app/inspect_booking
 
 RUN useradd -m -u 1000 appuser
 USER appuser
