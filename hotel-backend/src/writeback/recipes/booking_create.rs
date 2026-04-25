@@ -159,15 +159,15 @@ pub fn build_statements(inputs: &CreateBookingInputs<'_>) -> Vec<String> {
         status = BOOK_DS_STATUS_ACTIVE,
     ));
 
-    // 4..N. HT_Book_Date — one row per calendar night, immediately followed
-    // by `SET Book_ok = Book_ok + 1` per spike capture
-    // booking-checkin/writes.txt:27. Without that increment the booking
-    // remains in "draft" state in the .NET app's calendar grid view (the
-    // booking-list view ignores Book_ok and shows it regardless — which is
-    // why the 2026-04-25 incident showed bookings missing only from the
-    // calendar). Book_ok defaults to 0 on INSERT; the legacy app's pattern
-    // is `INSERT(... 0 ...); UPDATE Book_ok = Book_ok + 1`. We mirror it
-    // exactly.
+    // 4..N. HT_Book_Date — one row per calendar night.
+    //
+    // We do NOT emit `update HT_Book_Date set Book_ok = Book_ok + 1` here.
+    // That bump was previously added based on a misread of spike capture
+    // booking-checkin/writes.txt:27 — but that capture was from a
+    // CHECK-IN flow, not a fresh booking-create. The legacy-monitor
+    // capture of R014836 (a clean future booking-create on 2026-04-25)
+    // confirms: legacy emits zero Book_ok bumps for fresh creates. The
+    // bump belongs in the check-in recipe path.
     for (i, day) in inputs.nights_calendar.iter().enumerate() {
         let id = inputs.book_date_id_base + i as i32;
         let date_q = sql_quote(&format_legacy_date(*day));
@@ -175,44 +175,52 @@ pub fn build_statements(inputs: &CreateBookingInputs<'_>) -> Vec<String> {
             "INSERT INTO [HT_Book_Date]([id],[Book_no],[Book_type],[Book_date_ds],[Book_Num],\
              [Book_USE])VALUES({id},{book_id_q},{room_no_q},{date_q},1,0)"
         ));
-        statements.push(format!(
-            "update HT_Book_Date set Book_ok=Book_ok+1 where id={id}"
-        ));
     }
 
-    // N+1. HT_Rooms display fields — makes the booking visible in the room view
-    // (calendar grid). The .NET app fires this UPDATE on every save (per spike
-    // §3c destructive Phase B). Without it, our writeback bookings show only
-    // in the booking-list view, not the room-availability grid. The match-by-
-    // room_no avoids the destructive subquery pattern; we already know the
-    // room number from the recipe inputs.
-    let stay_in_short = inputs
-        .stay_start
-        .with_timezone(&chrono_tz::Asia::Bangkok)
-        .format("%d/%m %H:%M")
-        .to_string();
-    let stay_out_short = stay_end_actual
-        .with_timezone(&chrono_tz::Asia::Bangkok)
-        .format("%d/%m %H:%M")
-        .to_string();
-    let room_book_ds_q = sql_quote(&format!(
-        "{name}  {phone} เวลาเข้าพัก : 00:00  1. {room}  ({in_short}) ถึง ({out_short})  หมายเหตุ : {notes} ",
-        name = inputs.customer_name,
-        phone = inputs.customer_phone.unwrap_or(""),
-        room = inputs.room_no,
-        in_short = stay_in_short,
-        out_short = stay_out_short,
-        notes = inputs.notes.unwrap_or(""),
-    ));
-    let first_book_date_id = inputs.book_date_id_base;
-    let room_book_q = sql_quote(&first_book_date_id.to_string());
-    let room_book_name_q = sql_quote(inputs.customer_name);
-    let room_book_time_q = sql_quote("00:00");
-    statements.push(format!(
-        "update HT_Rooms set room_book_ds={room_book_ds_q}, Room_Book={room_book_q},\
-         Room_Book_Name={room_book_name_q},Room_Book_Time={room_book_time_q} \
-         where room_no={room_no_q}"
-    ));
+    // N+1. HT_Rooms display fields — only set when the booking STARTS TODAY
+    // (Bangkok). The .NET app's room-list view (the "rooms now booked" panel)
+    // reads HT_Rooms.Room_Book / room_book_ds to figure out which rooms are
+    // currently claimed; setting them for a future booking makes the room
+    // appear booked TODAY in that panel.
+    //
+    // Verified against legacy app capture (R014836, future booking 4/28-4/29
+    // created on 4/25): legacy emits ZERO HT_Rooms statements for future
+    // bookings — only HT_Book_H + HT_Book_Ds + HT_Book_Date. The room_book
+    // caption gets populated later (presumably by the day-of housekeeping
+    // refresh OR by the check-in flow itself). Our recipe was unconditionally
+    // setting it, which corrupted the room-list view per the 2026-04-25
+    // R014835 incident.
+    let bkk_today = Utc::now().with_timezone(&chrono_tz::Asia::Bangkok).date_naive();
+    let bkk_stay_start = inputs.stay_start.with_timezone(&chrono_tz::Asia::Bangkok).date_naive();
+    if bkk_stay_start <= bkk_today {
+        let stay_in_short = inputs
+            .stay_start
+            .with_timezone(&chrono_tz::Asia::Bangkok)
+            .format("%d/%m %H:%M")
+            .to_string();
+        let stay_out_short = stay_end_actual
+            .with_timezone(&chrono_tz::Asia::Bangkok)
+            .format("%d/%m %H:%M")
+            .to_string();
+        let room_book_ds_q = sql_quote(&format!(
+            "{name}  {phone} เวลาเข้าพัก : 00:00  1. {room}  ({in_short}) ถึง ({out_short})  หมายเหตุ : {notes} ",
+            name = inputs.customer_name,
+            phone = inputs.customer_phone.unwrap_or(""),
+            room = inputs.room_no,
+            in_short = stay_in_short,
+            out_short = stay_out_short,
+            notes = inputs.notes.unwrap_or(""),
+        ));
+        let first_book_date_id = inputs.book_date_id_base;
+        let room_book_q = sql_quote(&first_book_date_id.to_string());
+        let room_book_name_q = sql_quote(inputs.customer_name);
+        let room_book_time_q = sql_quote("00:00");
+        statements.push(format!(
+            "update HT_Rooms set room_book_ds={room_book_ds_q}, Room_Book={room_book_q},\
+             Room_Book_Name={room_book_name_q},Room_Book_Time={room_book_time_q} \
+             where room_no={room_no_q}"
+        ));
+    }
 
     let _ = Datelike::year(&Utc::now().date_naive()); // silence unused-import lint
     statements
@@ -427,14 +435,13 @@ mod tests {
         assert!(date_inserts[2].contains("47287"));
     }
 
-    /// Spike capture booking-checkin/writes.txt:27 — every HT_Book_Date
-    /// INSERT must be followed by `Book_ok = Book_ok + 1` so the booking
-    /// shows up in the .NET app's calendar grid view (not just the
-    /// booking-list view). Regression test for the 2026-04-25 incident
-    /// where bookings written via our app's writeback didn't appear in the
-    /// 3rd party room view.
+    /// Reverse of the prior (now-deleted) Book_ok regression test. The
+    /// legacy app's monitor capture of R014836 (clean future booking-create
+    /// on 2026-04-25) shows ZERO Book_ok bumps — only the 3 INSERTs.
+    /// Earlier code added a bump per night based on a misread of a
+    /// CHECK-IN flow capture; this test guards against re-introducing it.
     #[test]
-    fn book_date_inserts_each_followed_by_book_ok_increment() {
+    fn book_date_inserts_do_not_bump_book_ok() {
         let mut inputs = sample_inputs();
         inputs.nights_calendar = vec![
             NaiveDate::from_ymd_opt(2026, 4, 25).unwrap(),
@@ -443,32 +450,75 @@ mod tests {
         let statements = build_statements(&inputs);
         let book_ok_updates: Vec<&String> = statements
             .iter()
-            .filter(|s| s.contains("set Book_ok=Book_ok+1"))
+            .filter(|s| s.to_lowercase().contains("book_ok"))
             .collect();
-        assert_eq!(book_ok_updates.len(), 2, "one Book_ok bump per night");
-        assert!(book_ok_updates[0].contains("where id=47285"));
-        assert!(book_ok_updates[1].contains("where id=47286"));
+        assert!(
+            book_ok_updates.is_empty(),
+            "booking_create must NOT touch Book_ok — that bump belongs to \
+             the check-in recipe path. Got: {book_ok_updates:?}"
+        );
+    }
 
-        // Each Book_ok update must come immediately after its HT_Book_Date
-        // INSERT — the legacy app's pattern. A re-ordered emission could
-        // race a concurrent reader between INSERT and bump and briefly hide
-        // the booking.
-        let mut last_insert_id: Option<i32> = None;
-        for s in &statements {
-            if let Some(stripped) = s
-                .strip_prefix("INSERT INTO [HT_Book_Date]([id],[Book_no],[Book_type],[Book_date_ds],[Book_Num],[Book_USE])VALUES(")
-            {
-                let id_str = stripped.split(',').next().unwrap();
-                last_insert_id = Some(id_str.parse().unwrap());
-            } else if let Some(rest) = s.strip_prefix("update HT_Book_Date set Book_ok=Book_ok+1 where id=") {
-                let id: i32 = rest.parse().expect("id is integer");
-                assert_eq!(
-                    last_insert_id,
-                    Some(id),
-                    "Book_ok bump for id={id} must immediately follow its INSERT"
-                );
-            }
-        }
+    /// HT_Rooms display-field UPDATE must be SKIPPED for future bookings.
+    /// Setting Room_Book / room_book_ds for a booking starting tomorrow (or
+    /// later) makes the room appear "currently booked" in the .NET app's
+    /// room-list view today — the 2026-04-25 R014835 incident. Legacy app
+    /// (R014836 capture) emits zero HT_Rooms statements for future creates.
+    #[test]
+    fn skips_ht_rooms_update_for_future_booking() {
+        let mut inputs = sample_inputs();
+        // Push the stay 30 days into the future relative to "today" (Bangkok
+        // wall-clock at test time). A 30-day delta dwarfs any plausible
+        // test-clock skew (the Bangkok timezone offset is +7h, so 30 days is
+        // safely > today no matter what UTC minute the test runs at).
+        let today_bkk = Utc::now().with_timezone(&chrono_tz::Asia::Bangkok).date_naive();
+        let future = today_bkk
+            .checked_add_days(chrono::Days::new(30))
+            .expect("today + 30d is a valid date");
+        let future_noon = chrono_tz::Asia::Bangkok
+            .from_local_datetime(&future.and_hms_opt(12, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .with_timezone(&Utc);
+        inputs.stay_start = future_noon;
+        inputs.stay_end = future_noon + chrono::Duration::days(1);
+        inputs.nights_calendar = vec![future];
+        let statements = build_statements(&inputs);
+        let ht_rooms_updates: Vec<&String> = statements
+            .iter()
+            .filter(|s| s.contains("update HT_Rooms"))
+            .collect();
+        assert!(
+            ht_rooms_updates.is_empty(),
+            "future booking must NOT touch HT_Rooms display fields. Got: {ht_rooms_updates:?}"
+        );
+    }
+
+    /// Inverse: bookings starting TODAY DO get the HT_Rooms display update.
+    /// (For the same-day walk-in-via-booking flow, since it's a today-start
+    /// booking that would replace whatever caption was there.)
+    #[test]
+    fn emits_ht_rooms_update_for_today_booking() {
+        let mut inputs = sample_inputs();
+        let today_bkk = Utc::now().with_timezone(&chrono_tz::Asia::Bangkok).date_naive();
+        let today_noon = chrono_tz::Asia::Bangkok
+            .from_local_datetime(&today_bkk.and_hms_opt(12, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .with_timezone(&Utc);
+        inputs.stay_start = today_noon;
+        inputs.stay_end = today_noon + chrono::Duration::days(1);
+        inputs.nights_calendar = vec![today_bkk];
+        let statements = build_statements(&inputs);
+        let ht_rooms_updates: Vec<&String> = statements
+            .iter()
+            .filter(|s| s.contains("update HT_Rooms"))
+            .collect();
+        assert_eq!(
+            ht_rooms_updates.len(),
+            1,
+            "today booking must emit exactly one HT_Rooms display UPDATE"
+        );
     }
 
     #[test]
