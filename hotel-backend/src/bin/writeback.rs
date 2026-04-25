@@ -146,7 +146,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // 4b. Schema fingerprint guard — refuse to start on drift, but post
     //     a Slack alert first so the operator sees the failure even if
-    //     they're not tailing logs.
+    //     they're not tailing logs. Sleep before returning so the Docker
+    //     `restart: unless-stopped` policy backs off (without the sleep,
+    //     the worker exits in ms, restarts, fingerprint fails again, fires
+    //     another Slack — operator gets paged 6×/min until they intervene).
     if let Err(e) = verify_schema_fingerprint(&mssql).await {
         tracing::error!(error = %e, "Schema fingerprint check failed — refusing to start");
         if let Some(slack) = &slack {
@@ -160,6 +163,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             ));
             let _ = slack.send_message(&msg).await;
         }
+        tracing::warn!(
+            "Sleeping 60s before exit to throttle Docker restart cadence \
+             and avoid Slack alert flood"
+        );
+        tokio::time::sleep(Duration::from_secs(60)).await;
         return Err(format!("Schema fingerprint check failed: {e}").into());
     }
 
@@ -197,7 +205,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         loop {
             match claim_next_job(&pg, max_attempts).await {
                 Ok(Some(job)) => {
-                    process_job(&pg, &mssql, max_attempts, &slack, job).await;
+                    // HIGH-3 fix: panic-isolate every job. A panic inside any
+                    // recipe (or a tiberius driver bug) would otherwise crash
+                    // the whole worker process. Docker would restart it but
+                    // the in-flight job would sit `in_progress` for 5 min
+                    // before the janitor re-claims — invisible to operator
+                    // until the alert fires elsewhere. With panic isolation,
+                    // a single bad job is marked exhausted with the panic
+                    // message and the worker keeps draining the queue.
+                    let job_id = job.id;
+                    let intent_name = job.intent.intent_name();
+                    let attempts = job.attempts;
+                    let pg_inner = pg.clone();
+                    let mssql_inner = mssql.clone();
+                    let slack_inner = slack.clone();
+                    let result = tokio::spawn(async move {
+                        process_job(&pg_inner, &mssql_inner, max_attempts, &slack_inner, job)
+                            .await;
+                    })
+                    .await;
+                    if let Err(join_err) = result {
+                        let panic_msg = if join_err.is_panic() {
+                            // Try to recover the panic payload as a string —
+                            // tokio gives us Box<dyn Any + Send>; common
+                            // payload types are &'static str and String.
+                            let payload = join_err.into_panic();
+                            payload
+                                .downcast_ref::<&'static str>()
+                                .map(|s| (*s).to_string())
+                                .or_else(|| payload.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "panic with non-string payload".to_string())
+                        } else {
+                            format!("task cancelled: {join_err}")
+                        };
+                        tracing::error!(
+                            job_id,
+                            intent = intent_name,
+                            attempt = attempts,
+                            panic = %panic_msg,
+                            "Writeback job PANICKED — marking exhausted and continuing main loop"
+                        );
+                        // Force-exhaust the job so it doesn't sit stuck. The
+                        // panic is unrecoverable for this payload — retrying
+                        // wouldn't help. Slack alert fires inside mark_failed.
+                        force_exhaust_job(
+                            &pg,
+                            job_id,
+                            &slack,
+                            &format!("PANIC: {panic_msg}"),
+                        )
+                        .await;
+                    }
                 }
                 Ok(None) => break, // queue empty
                 Err(err) => {
@@ -388,7 +446,15 @@ async fn process_job(
                 retryable,
                 "Writeback recipe failed"
             );
-            mark_failed(pg, job_id, max_attempts, slack, &err.to_string()).await;
+            mark_failed_with_retryable(
+                pg,
+                job_id,
+                max_attempts,
+                slack,
+                &err.to_string(),
+                retryable,
+            )
+            .await;
         }
     }
 }
@@ -759,14 +825,78 @@ async fn back_populate_legacy_ids(
     Ok(())
 }
 
-/// Mark the job failed and either schedule a retry (`failed` + `next_retry_at`)
-/// or transition to the terminal `exhausted` state once `attempts >=
+/// Force a job into the terminal `exhausted` state, regardless of attempt
+/// count. Used for panics (no point retrying — the recipe code is broken or
+/// the payload is unparseable) and other deterministic failures where the
+/// retry budget would just delay operator visibility.
+async fn force_exhaust_job(
+    pg: &PgPool,
+    job_id: i64,
+    slack: &Option<SlackClient>,
+    err_msg: &str,
+) {
+    let row = sqlx::query(
+        "UPDATE writeback_jobs SET status='exhausted', last_error=$2, next_retry_at=NULL \
+         WHERE id=$1 RETURNING attempts, intent, aggregate_id",
+    )
+    .bind(job_id)
+    .bind(err_msg)
+    .fetch_one(pg)
+    .await;
+
+    match row {
+        Ok(row) => {
+            let attempts: i32 = row.try_get("attempts").unwrap_or(0);
+            let intent: String = row.try_get("intent").unwrap_or_default();
+            let aggregate_id: Option<Uuid> = row.try_get("aggregate_id").ok();
+            tracing::error!(
+                job_id, attempts, intent = %intent, ?aggregate_id,
+                "Writeback job force-exhausted"
+            );
+            if let Some(slack) = slack {
+                send_exhausted_alert(slack, job_id, &intent, aggregate_id, attempts, err_msg)
+                    .await;
+            }
+        }
+        Err(err) => {
+            tracing::error!(
+                job_id, error = %err,
+                "Failed to force-exhaust job — janitor will reset it in {STUCK_IN_PROGRESS_TIMEOUT_SECS}s"
+            );
+        }
+    }
+}
+
+/// Mark the job failed. If the underlying error is `retryable=false`
+/// (deterministic — schema drift, intent mismatch, recipe business-rule
+/// failure, payload deserialize error), skip the retry budget entirely and
+/// go straight to `exhausted` so the operator gets a Slack alert immediately
+/// instead of waiting for 12 minutes of wasted retries on the same failure
+/// (audit HIGH-2).
+///
+/// Otherwise, schedule a retry (`failed` + `next_retry_at` set via
+/// exponential backoff) or transition to `exhausted` once `attempts >=
 /// max_attempts`. Fires a Slack alert on the exhaustion transition so the
 /// operator sees the failure within seconds, not whenever they next look at
 /// the queue.
-///
-/// Reads `attempts` back from the row inside the same UPDATE so the retry
-/// decision is consistent with what the next claim cycle will see.
+async fn mark_failed_with_retryable(
+    pg: &PgPool,
+    job_id: i64,
+    max_attempts: i32,
+    slack: &Option<SlackClient>,
+    err_msg: &str,
+    retryable: bool,
+) {
+    if !retryable {
+        force_exhaust_job(pg, job_id, slack, err_msg).await;
+        return;
+    }
+    mark_failed(pg, job_id, max_attempts, slack, err_msg).await;
+}
+
+/// See [`mark_failed_with_retryable`]. Convenience wrapper for callsites
+/// that don't have a typed error in hand (e.g. PG resolve failures).
+/// Defaults to retryable=true.
 async fn mark_failed(
     pg: &PgPool,
     job_id: i64,
@@ -859,11 +989,11 @@ async fn send_exhausted_alert(
     let aggregate_id_str = aggregate_id
         .map(|u| u.to_string())
         .unwrap_or_else(|| "(unknown)".into());
-    let truncated_err = if err_msg.len() > 500 {
-        format!("{}…", &err_msg[..500])
-    } else {
-        err_msg.to_string()
-    };
+    // Head+tail truncation — tiberius/sqlx errors put the actually-useful
+    // row context at the END (e.g. "in row 23, column foo: <value>"). A
+    // pure head truncation would lose it. Slice on character boundaries
+    // (Thai messages are multi-byte) by walking with `char_indices`.
+    let truncated_err = truncate_head_tail(err_msg, 200, 300);
     let text = format!(
         ":rotating_light: *Writeback EXHAUSTED retries* :rotating_light:\n\
          *Job ID:* `{job_id}`\n\
@@ -873,11 +1003,32 @@ async fn send_exhausted_alert(
          *Last error:*\n```\n{truncated_err}\n```\n\
          _Manual intervention required. Inspect_ \
          `SELECT * FROM writeback_jobs WHERE id = {job_id}` _and either fix \
-         the underlying cause + manually reset_ `status='pending'` _to retry, \
+         the underlying cause + manually reset_ \
+         `UPDATE writeback_jobs SET status='pending', attempts=0, \
+         next_retry_at=NULL WHERE id={job_id}` _to retry, \
          or delete the row if the writeback is no longer needed._"
     );
     let msg = SlackMessage::with_text(text);
     let _ = slack.send_message(&msg).await;
+}
+
+/// Truncate `s` to at most `head_chars + tail_chars` chars, keeping the
+/// head and tail with `…` between them. Walks `char_indices` so multi-byte
+/// (Thai, Chinese) text never splits in the middle of a code point.
+fn truncate_head_tail(s: &str, head_chars: usize, tail_chars: usize) -> String {
+    let total = s.chars().count();
+    if total <= head_chars + tail_chars {
+        return s.to_string();
+    }
+    let mut chars = s.char_indices();
+    let head_end = chars.nth(head_chars).map(|(i, _)| i).unwrap_or(s.len());
+    let tail_start = s
+        .char_indices()
+        .rev()
+        .nth(tail_chars.saturating_sub(1))
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    format!("{}…{}", &s[..head_end], &s[tail_start..])
 }
 
 /// Long-lived PG LISTEN connection; signals the main loop on every NOTIFY.
@@ -945,5 +1096,34 @@ mod tests {
     fn stuck_in_progress_timeout_is_in_safe_range() {
         assert!(STUCK_IN_PROGRESS_TIMEOUT_SECS >= 60, "less than 1 min risks racing slow recipes");
         assert!(STUCK_IN_PROGRESS_TIMEOUT_SECS <= 1800, "more than 30 min is too slow to recover");
+    }
+
+    /// Short error messages pass through unchanged.
+    #[test]
+    fn truncate_head_tail_preserves_short_strings() {
+        assert_eq!(truncate_head_tail("hello", 200, 300), "hello");
+        assert_eq!(truncate_head_tail("", 200, 300), "");
+    }
+
+    /// Long messages keep both ends — important for tiberius errors that
+    /// put row context at the end.
+    #[test]
+    fn truncate_head_tail_keeps_both_ends_for_long_strings() {
+        let s = "A".repeat(200) + &"B".repeat(500) + &"C".repeat(300);
+        let out = truncate_head_tail(&s, 200, 300);
+        assert!(out.starts_with(&"A".repeat(200)), "head missing");
+        assert!(out.ends_with(&"C".repeat(300)), "tail missing");
+        assert!(out.contains('…'), "ellipsis missing");
+    }
+
+    /// Multi-byte (Thai) text must not split inside a code point — would
+    /// panic in the underlying str slice if the boundary is wrong.
+    #[test]
+    fn truncate_head_tail_safe_on_thai_multibyte() {
+        let thai = "เข้าพัก".repeat(100); // each char is 3 bytes
+        let out = truncate_head_tail(&thai, 5, 5);
+        // No panic = pass. Sanity: result must be a valid String shorter
+        // than the input.
+        assert!(out.chars().count() < thai.chars().count());
     }
 }
