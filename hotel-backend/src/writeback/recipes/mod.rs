@@ -103,17 +103,17 @@ pub(crate) async fn execute_capturing_identity_at(
         .enumerate()
         .filter_map(|(i, s)| s.contains(marker_sql_substring).then_some(i))
         .collect();
-    debug_assert_eq!(
-        matches.len(),
-        1,
-        "marker {marker_sql_substring:?} matched {} statements; expected exactly 1",
-        matches.len()
-    );
-    let pivot = matches.first().copied().ok_or_else(|| {
-        crate::writeback::error::WritebackError::Recipe(format!(
-            "execute_capturing_identity_at: marker {marker_sql_substring:?} not found"
-        ))
-    })?;
+    // Hard error in release too (LOW-2 hardening): if a future maintainer
+    // adds a second statement matching the marker, capturing the wrong
+    // SCOPE_IDENTITY would silently corrupt back-population.
+    if matches.len() != 1 {
+        return Err(crate::writeback::error::WritebackError::Recipe(format!(
+            "execute_capturing_identity_at: marker {:?} matched {} statements; expected exactly 1",
+            marker_sql_substring,
+            matches.len()
+        )));
+    }
+    let pivot = matches[0];
     execute_all(conn, &statements[..=pivot]).await?;
     let id = fetch_scope_identity(conn).await?;
     execute_all(conn, &statements[pivot + 1..]).await?;
