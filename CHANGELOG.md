@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.26.0] - 2026-04-25
+
+### Added
+- **Backend service layer** (`hotel-backend/src/service/`) — Phase 2 per
+  `docs/architecture.md` §1, §6. One service per aggregate, each opening a
+  single PG transaction, performing the canonical write through the
+  repository, enqueuing the matching `WritebackIntent` via
+  `OutboxRepository::enqueue`, publishing the matching `DomainEvent` via
+  `EventBus::publish`, and committing — all four effects atomic.
+  - `customer.rs` — `CustomerService { create, update }` + `CreateCustomerCommand` / `UpdateCustomerCommand` / `CustomerOutcome`.
+  - `booking.rs` — `BookingService { create, modify, cancel }` + `CreateBookingCommand` / `ModifyBookingCommand` / `CancelBookingCommand` / `BookingOutcome` / `BookingSnapshotInputs` / `BookingWritebackContext` / `BookingRoomCommand`.
+  - `checkin.rs` — `CheckInService { walk_in, check_in_to_booking, cancel, extend, check_out }` + `WalkInCommand` / `CheckInToBookingCommand` / `CancelCheckInCommand` / `ExtendStayCommand` / `CheckOutCommand` / `CheckInOutcome` / `CheckInWritebackContext`.
+  - `payment.rs` — `PaymentService { record_payment, generate_receipt }` + `RecordPaymentCommand` / `GenerateReceiptCommand`.
+  - `housekeeping.rs` — `HousekeepingService { mark_clean, mark_dirty }` + `MarkCleanCommand` / `MarkDirtyCommand`.
+  - `error.rs` — `ServiceError` enum (`Validation` / `NotFound` / `Conflict` / `Repository(sqlx::Error)` / `Outbox` / `Internal`) with `From<sqlx::Error>` and a bridge `From<ServiceError> for ApiError`.
+  - `ids.rs` — deterministic `i32` ⇄ `Uuid` aggregate-id bridge via `Uuid::new_v5(NAMESPACE_OID + "new-hotel.aggregate.<kind>")`. Lets the `WritebackIntent`/`DomainEvent` `Uuid` contracts coexist with today's SERIAL `i32` PG schema. Forward-compatible: when the schema migrates to native UUID columns the shim disappears without changing event payloads.
+- **`AppState` service handles** — `customers_service`, `bookings_service`, `checkins_service`, `payments_service`, `housekeeping_service` (each `Arc<…Service>`). Constructed via `AppState::wire_services` from existing repositories + outbox + event bus + new pool. Routes are NOT yet refactored to delegate (Wave 4 Agent F).
+
+### Changed
+- **`hotel-backend/src/lib.rs`** — declares `pub mod service;` so the service layer is reachable from the binary, integration tests, and Wave 4 routes.
+
 ## [2.25.0] - 2026-04-25
 
 ### Added
