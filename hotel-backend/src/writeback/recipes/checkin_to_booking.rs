@@ -97,10 +97,19 @@ pub fn build_statements(inputs: &CheckInToBookingInputs<'_>) -> Vec<String> {
 
     let mut statements: Vec<String> = Vec::with_capacity(8 + inputs.nights_calendar.len());
 
-    // 1. UPDATE HT_Customers (re-save profile — §3d difference vs walk-in)
+    // 1. UPDATE HT_Customers (re-save profile — §3d difference vs walk-in).
+    //    Spike §3d / `booking-checkin/writes.txt:28` updates the full field
+    //    set (~25 fields), most blanks. Mirroring keeps our recipe parity with
+    //    the .NET app's behavior of resetting unedited fields on save.
     statements.push(format!(
         "UPDATE [HT_Customers] SET  [Cust_name]={cust_name_q},[Cust_name2]='',\
-         [Cust_Type]='ราคาปกติ',[Cust_Type_Main]='บุคคลธรรมดา',[Cust_Add_tel]={cust_phone_q} \
+         [Cust_Type]='ราคาปกติ',[Cust_Type_Main]='บุคคลธรรมดา',[Cust_Email]='',\
+         [Cust_Add_no]='',[Cust_Add_moo]='',[Cust_Add_soi]='',[Cust_Add_road]='',\
+         [Cust_Add_tambon]='',[Cust_Add_ampore]='',[Cust_Add_province]='',\
+         [Cust_Add_code]='',[Cust_Add_tel]={cust_phone_q},[Cust_Add_fax]='',\
+         [Cust_Work_Name]='',[Cust_Work_no]='',[Cust_Work_moo]='',[Cust_Work_soi]='',\
+         [Cust_Work_road]='',[Cust_Work_tambon]='',[Cust_Work_ampore]='',\
+         [Cust_Work_province]='',[Cust_Work_code]='',[Cust_Work_tel]='',[Cust_Work_fax]='' \
          WHERE Cust_no={cust_no_q}"
     ));
 
@@ -177,6 +186,11 @@ pub fn build_statements(inputs: &CheckInToBookingInputs<'_>) -> Vec<String> {
          VALUES({cin_no_q},{now_q},{book_id_q},{cust_no_q},'',{occupying_q},{total},0,{total},0,\
          {total},'','',{room_no_q},0,{by_q},{stay_start_q},{stay_end_q},0,'','',0)"
     ));
+
+    // 11. HT_Cupon — mark loyalty coupon as printed (spike §3d,
+    //     booking-checkin/writes.txt:39). Shared helper with `walkin` so the
+    //     literal SQL stays identical.
+    statements.push(super::helpers::mark_cupon_printed(inputs.cin_no));
 
     let _ = NaiveDate::from_ymd_opt(2026, 1, 1); // silence unused-import lint
     let _ = Datelike::year(&Utc::now()); // silence unused-import lint
@@ -352,6 +366,41 @@ mod tests {
         assert_eq!(inserts.len(), 1); // only the second night
         assert!(inserts[0].contains("'4/25/2026'"));
         assert!(inserts[0].contains("(50237,"));
+    }
+
+    #[test]
+    fn emits_cupon_print_update_at_end() {
+        // Spike §3d `booking-checkin/writes.txt:39` — the linked-to-booking
+        // check-in fires the same HT_Cupon mark-printed UPDATE as walk-in.
+        let s = build_statements(&sample_inputs());
+        let cupon = s
+            .iter()
+            .find(|s| s.starts_with("update HT_Cupon"))
+            .expect("HT_Cupon mark-printed UPDATE must be emitted");
+        assert!(cupon.contains("cupon_print=1"));
+        assert!(cupon.contains("cupon_cin_no='CH26-005231'"));
+    }
+
+    #[test]
+    fn ht_customers_update_spans_full_field_set() {
+        // Spike §3d `booking-checkin/writes.txt:28` — full address + work
+        // field set, most blanks. Mirrors the .NET app's reset behavior.
+        let s = build_statements(&sample_inputs());
+        let upd = s
+            .iter()
+            .find(|s| s.starts_with("UPDATE [HT_Customers]"))
+            .unwrap();
+        // Check a sampling of fields that should be present (and cleared).
+        for field in [
+            "[Cust_Email]=''",
+            "[Cust_Add_no]=''",
+            "[Cust_Add_moo]=''",
+            "[Cust_Work_Name]=''",
+            "[Cust_Work_no]=''",
+            "[Cust_Work_road]=''",
+        ] {
+            assert!(upd.contains(field), "missing field in UPDATE: {field}");
+        }
     }
 
     #[test]

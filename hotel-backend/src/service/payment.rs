@@ -43,6 +43,14 @@ pub struct RecordPaymentCommand {
     /// (`HT_Receipt_H.Receipt_Name` / `Address` / `Tel`) lands populated.
     /// Routes look these up from `ht_customers` before issuing the command.
     pub receipt: RecordPaymentReceipt,
+    /// Specific `HT_CheckIn_Ds.id` the payment is being apportioned against —
+    /// per spike §3h capture line 3, the .NET app fires
+    /// `UPDATE HT_CheckIn_Ds SET Cin_Room_Pay_Total=<amt>, Cin_note='' WHERE id=<ds_id>`
+    /// just before inserting `HT_CheckIn_Pay`. Routes resolve this via the
+    /// canonical PG state when the payment maps to a single room. `None` for
+    /// multi-room allocations — the recipe then skips the per-room UPDATE
+    /// and only refreshes the header totals.
+    pub checkin_ds_id: Option<i32>,
     pub source: EventSource,
 }
 
@@ -134,6 +142,7 @@ impl PaymentService {
             amount: Money::from_satang(cmd.amount_satang),
             method: cmd.method,
             receipt: cmd.receipt.clone(),
+            checkin_ds_id: cmd.checkin_ds_id,
         };
         // Use the payment id (not the check-in id) as the idempotency
         // discriminator so multiple payments against the same check-in

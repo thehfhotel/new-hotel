@@ -61,6 +61,12 @@ pub struct PaymentInputs<'a> {
     pub pay_no: &'a str,
     pub receipt_no: &'a str,
     pub receipt_h_id: i32,
+    /// `HT_CheckIn_Ds.id` for the room being paid for. When `Some(_)` the
+    /// recipe emits the spike §3h capture line 3 statement
+    /// `UPDATE HT_CheckIn_Ds SET Cin_Room_Pay_Total=<amt>, Cin_note='' WHERE id=<ds_id>`
+    /// to apportion the payment to a single check-in detail row. `None`
+    /// skips that UPDATE — header totals still settle.
+    pub checkin_ds_id: Option<i32>,
 }
 
 /// Build the 4 payment + receipt statements. PURE — no I/O.
@@ -87,39 +93,75 @@ pub fn build_statements(inputs: &PaymentInputs<'_>) -> Vec<String> {
         PaymentMethod::Credit | PaymentMethod::Transfer => (0.0, amount),
     };
 
-    vec![
-        // 1. HT_CheckIn_Pay — payment row
-        format!(
-            "INSERT INTO [HT_CheckIn_Pay]([Cin_No],[Cin_Pay_Cash],[Cin_Pay_Credit],\
-             [Cin_Pay_Date],[Cin_Pay_Ds_Name],[Cin_Pay_Ds_Price],[Cin_Pay_Ds_unit],[Pay_No],\
-             [Cin_Cust_no],[Cin_Pay_Ds_ID],[Cin_Pay_Ds_Num],[Cin_Pay_Ds_PriceTotal])\
-             VALUES({cin_no_q},{cash},{credit},{now_q},{receipt_label_q},{amount},1,{pay_no_q},\
-             {cust_no_q},{service_code_q},1,{amount})"
-        ),
-        // 2. HT_CheckIn_H — refresh totals (mirrors the spike capture's update)
-        format!(
-            "UPDATE [HT_CheckIn_H] SET  [Total_Price_Room]={amount},[Total_Price_Product]=0,\
-             [Total_Price_Net]={amount},[Total_Price_Pay]={amount},[Total_Price_Balance]=0 \
-             where [Cin_no]={cin_no_q}"
-        ),
-        // 3. HT_Receipt_H — receipt header (id is IDENTITY but we still pass one;
-        //    legacy capture provides a value, so we mirror that for parity)
-        format!(
-            "INSERT INTO [HT_Receipt_H]([id],[Receipt_no],[Receipt_Date],[Receipt_c_no],\
-             [Receipt_Name],[Receipt_Address],[Receipt_Tel],[Receipt_Fax],[Receipt_Discount],\
-             [Receipt_Total],[Receipt_Vat],[Receipt_BeforeVat],[Receipt_VatIn],[Receipt_VatPer],\
-             [status_name],[Receipt_Ref],[Receipt_cin_vat_before],[Receipt_Tax])\
-             VALUES({receipt_id},{receipt_no_q},{now_q},{cin_no_q},{cust_name_q},{cust_addr_q},\
-             {cust_tel_q},'',0,{amount},0,{amount},'',0,'','',0,'')"
-        ),
-        // 4. HT_Receipt_Ds — receipt line for the room charge
-        format!(
-            "INSERT INTO [HT_Receipt_Ds]([S_Sale_id],[S_Product_no],[S_Product_name],[S_Unit],\
-             [S_UnitName],[S_Price],[S_Total],[S_PriceDiscount_per],[S_PriceDiscount])\
-             VALUES({receipt_id},{service_code_q},{receipt_label_q},1,{unit_name_q},\
-             {amount},{amount},'',0)"
-        ),
-    ]
+    let mut statements: Vec<String> = Vec::with_capacity(8);
+
+    // 1. Defensive cart clear — spike §3h `invoice/writes.txt:2`. The .NET app
+    //    drops any in-progress `HT_CheckIn_Product` rows before settling. We
+    //    don't write that table today, so this is almost always a no-op, but
+    //    we emit it for byte-level parity with the legacy capture.
+    statements.push(format!(
+        "delete from HT_CheckIn_Product where Cin_no={cin_no_q}"
+    ));
+
+    // 2. Per-room apportionment — spike §3h `invoice/writes.txt:3`. Fires
+    //    immediately before the HT_CheckIn_Pay INSERT. Only emitted when the
+    //    route resolved a specific `HT_CheckIn_Ds.id`.
+    if let Some(ds_id) = inputs.checkin_ds_id {
+        statements.push(format!(
+            "update [HT_CheckIn_Ds] SET  [Cin_Room_Pay_Total]={amount},[Cin_note]='' where id={ds_id}"
+        ));
+    }
+
+    // 3. HT_CheckIn_Pay — payment row. Now includes [Cin_Pay_Ds] (column 4)
+    //    per spike §3h `invoice/writes.txt:4`. Empty-string default mirrors
+    //    the .NET capture (no extra description text).
+    statements.push(format!(
+        "INSERT INTO [HT_CheckIn_Pay]([Cin_No],[Cin_Pay_Ds],[Cin_Pay_Cash],[Cin_Pay_Credit],\
+         [Cin_Pay_Date],[Cin_Pay_Ds_Name],[Cin_Pay_Ds_Price],[Cin_Pay_Ds_unit],[Pay_No],\
+         [Cin_Cust_no],[Cin_Pay_Ds_ID],[Cin_Pay_Ds_Num],[Cin_Pay_Ds_PriceTotal])\
+         VALUES({cin_no_q},'',{cash},{credit},{now_q},{receipt_label_q},{amount},1,{pay_no_q},\
+         {cust_no_q},{service_code_q},1,{amount})"
+    ));
+
+    // 4. HT_CheckIn_H — refresh totals (mirrors the spike capture's update)
+    statements.push(format!(
+        "UPDATE [HT_CheckIn_H] SET  [Total_Price_Room]={amount},[Total_Price_Product]=0,\
+         [Total_Price_Net]={amount},[Total_Price_Pay]={amount},[Total_Price_Balance]=0 \
+         where [Cin_no]={cin_no_q}"
+    ));
+
+    // 5. VAT accumulator — spike §3h `invoice/writes.txt:6`. This hotel uses
+    //    no VAT (the captured value is the gross amount), but the .NET app
+    //    still increments `Total_Price_vat` by the payment amount on every
+    //    invoice. Emit it for parity so reports that aggregate this column
+    //    match the legacy app's running total.
+    statements.push(format!(
+        "update HT_CheckIn_H set Total_Price_vat=Total_Price_vat+{amount} where Cin_no={cin_no_q}"
+    ));
+
+    // 6. HT_Receipt_H — receipt header (id is IDENTITY but we still pass one;
+    //    legacy capture provides a value, so we mirror that for parity).
+    //    Includes [Receipt_c_no] per the schema (column 4, varchar(50),
+    //    nullable). Storing `cin_no` here is the .NET app's convention so the
+    //    receipt can be traced back to the originating check-in.
+    statements.push(format!(
+        "INSERT INTO [HT_Receipt_H]([id],[Receipt_no],[Receipt_Date],[Receipt_c_no],\
+         [Receipt_Name],[Receipt_Address],[Receipt_Tel],[Receipt_Fax],[Receipt_Discount],\
+         [Receipt_Total],[Receipt_Vat],[Receipt_BeforeVat],[Receipt_VatIn],[Receipt_VatPer],\
+         [status_name],[Receipt_Ref],[Receipt_cin_vat_before],[Receipt_Tax])\
+         VALUES({receipt_id},{receipt_no_q},{now_q},{cin_no_q},{cust_name_q},{cust_addr_q},\
+         {cust_tel_q},'',0,{amount},0,{amount},'',0,'','',0,'')"
+    ));
+
+    // 7. HT_Receipt_Ds — receipt line for the room charge
+    statements.push(format!(
+        "INSERT INTO [HT_Receipt_Ds]([S_Sale_id],[S_Product_no],[S_Product_name],[S_Unit],\
+         [S_UnitName],[S_Price],[S_Total],[S_PriceDiscount_per],[S_PriceDiscount])\
+         VALUES({receipt_id},{service_code_q},{receipt_label_q},1,{unit_name_q},\
+         {amount},{amount},'',0)"
+    ));
+
+    statements
 }
 
 /// Execute the payment + receipt recipe.
@@ -128,7 +170,10 @@ pub fn build_statements(inputs: &PaymentInputs<'_>) -> Vec<String> {
 /// route layer populates these by looking up the customer attached to the
 /// check-in; if the lookup fails (e.g. orphaned check-in) the route still
 /// enqueues the intent with empty strings — receipts get printed with blank
-/// header fields rather than dropping the payment.
+/// header fields rather than dropping the payment. We log a warning when all
+/// three fields are empty so the fact that the receipt header is unpopulated
+/// is visible in the writeback worker logs.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute(
     conn: &mut LegacyConn<'_>,
     cin_no: &str,
@@ -137,7 +182,21 @@ pub async fn execute(
     amount: Money,
     method: PaymentMethod,
     receipt: &RecordPaymentReceipt,
+    checkin_ds_id: Option<i32>,
 ) -> WritebackResult<LegacyIds> {
+    if receipt.customer_name.is_empty()
+        && receipt.customer_address.is_empty()
+        && receipt.customer_tel.is_empty()
+    {
+        tracing::warn!(
+            cin_no,
+            cust_no,
+            "RecordPayment receipt header is fully empty — printed receipt \
+             will have blank Receipt_Name/Address/Tel. Route enrichment from \
+             ht_customers may have failed."
+        );
+    }
+
     let pay_no = allocate_pay_no(conn).await?;
     let receipt_no = allocate_receipt_no(conn).await?;
     let receipt_h_id = allocate_receipt_h_id(conn).await?;
@@ -154,6 +213,7 @@ pub async fn execute(
         pay_no: &pay_no,
         receipt_no: &receipt_no,
         receipt_h_id,
+        checkin_ds_id,
     };
     let statements = build_statements(&inputs);
     super::execute_all(conn, &statements).await?;
@@ -184,13 +244,66 @@ mod tests {
             pay_no: "P2604-000001",
             receipt_no: "RC2604-000001",
             receipt_h_id: 20653,
+            checkin_ds_id: Some(25006),
         }
     }
 
     #[test]
-    fn produces_four_statements() {
+    fn produces_seven_statements_when_per_room_apportionment_set() {
+        // 1 cart-clear + 1 per-room update + 1 HT_CheckIn_Pay + 1 HT_CheckIn_H
+        // totals + 1 VAT accumulator + 1 HT_Receipt_H + 1 HT_Receipt_Ds = 7
         let s = build_statements(&sample_inputs());
-        assert_eq!(s.len(), 4);
+        assert_eq!(s.len(), 7);
+    }
+
+    #[test]
+    fn skips_per_room_update_when_checkin_ds_id_none() {
+        let mut inputs = sample_inputs();
+        inputs.checkin_ds_id = None;
+        let s = build_statements(&inputs);
+        // Without ds_id we drop the per-room UPDATE — 6 statements total.
+        assert_eq!(s.len(), 6);
+        assert!(!s.iter().any(|s| s.contains("[Cin_Room_Pay_Total]=")));
+    }
+
+    #[test]
+    fn includes_defensive_cart_clear_per_spike_capture_line_2() {
+        let s = build_statements(&sample_inputs());
+        let clear = s
+            .iter()
+            .find(|s| s.starts_with("delete from HT_CheckIn_Product"))
+            .expect("cart clear must be emitted");
+        assert!(clear.contains("Cin_no='CH26-005227'"));
+    }
+
+    #[test]
+    fn per_room_apportionment_matches_capture_line_3() {
+        let s = build_statements(&sample_inputs());
+        let upd = s
+            .iter()
+            .find(|s| s.contains("[Cin_Room_Pay_Total]"))
+            .expect("per-room UPDATE must be emitted when ds_id is Some");
+        assert!(upd.contains("[Cin_Room_Pay_Total]=711"));
+        assert!(upd.contains("[Cin_note]=''"));
+        assert!(upd.contains("where id=25006"));
+    }
+
+    #[test]
+    fn checkin_pay_includes_cin_pay_ds_column() {
+        let s = build_statements(&sample_inputs());
+        let pay = s.iter().find(|s| s.contains("[HT_CheckIn_Pay]")).unwrap();
+        assert!(pay.contains("[Cin_Pay_Ds]"));
+    }
+
+    #[test]
+    fn includes_vat_accumulator_increment_per_capture_line_6() {
+        let s = build_statements(&sample_inputs());
+        let vat = s
+            .iter()
+            .find(|s| s.contains("Total_Price_vat=Total_Price_vat+"))
+            .expect("VAT accumulator UPDATE must be emitted");
+        assert!(vat.contains("Total_Price_vat=Total_Price_vat+711"));
+        assert!(vat.contains("Cin_no='CH26-005227'"));
     }
 
     #[test]
