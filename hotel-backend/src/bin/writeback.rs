@@ -33,9 +33,10 @@
 //! - Does not auto-fix schema drift — fail loud, alert ops, wait for human.
 
 use std::env;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgListener, PgPoolOptions};
 use sqlx::{PgPool, Row};
 use tokio::sync::Notify;
@@ -66,6 +67,41 @@ const DEFAULT_MAX_ATTEMPTS: i32 = 3;
 /// any realistic recipe execution but short enough that a stuck job recovers
 /// within one operator coffee break.
 const STUCK_IN_PROGRESS_TIMEOUT_SECS: i64 = 300;
+
+/// Self-heal alert threshold (audit MED-4). When `salvage_legacy_ids` recovers
+/// IDs from the writeback_jobs audit log this many times within
+/// `SELF_HEAL_WINDOW_SECS`, fire a single Slack alert. The threshold is
+/// deliberately above zero so a one-off race (e.g. CreateBooking + immediate
+/// CheckIn before back-population finishes) doesn't page the operator. A
+/// sustained burst means back-population is broken (PG perms regression,
+/// migration drift, etc.) and needs investigation.
+const SELF_HEAL_ALERT_THRESHOLD: u32 = 5;
+
+/// Self-heal alert window (audit MED-4). Sized to be longer than the
+/// "expected" salvages (a handful per hour from CreateBooking↔CheckIn races)
+/// but short enough that an operator gets the page within one coffee break of
+/// a real regression. After firing, the counter resets — back-to-back bursts
+/// produce back-to-back alerts (every 5 min, not every event).
+const SELF_HEAL_WINDOW_SECS: u64 = 300;
+
+/// Listener supervisor: max consecutive immediate failures before we slow
+/// down + page the operator (audit LOW-3). Matches the ~10 retries-in-50s
+/// budget below; past this point the listener is broken in a way that
+/// reconnecting won't fix (PG down, network partition, auth revoked).
+const LISTENER_MAX_CONSECUTIVE_FAILURES: u32 = 10;
+
+/// Listener supervisor: base sleep between respawn attempts. Short enough
+/// that a transient PG conn drop is invisible to the operator (5s gap in
+/// NOTIFY ⇒ poll fallback covers it), long enough that a hard failure
+/// doesn't spin the CPU.
+const LISTENER_BACKOFF_SECS: u64 = 5;
+
+/// Listener supervisor: extended backoff after exceeding
+/// `LISTENER_MAX_CONSECUTIVE_FAILURES`. We don't give up — exiting would
+/// leave the worker with no NOTIFY signal source, relying solely on the
+/// 30s poll. We keep retrying but at a sustainable cadence so the operator
+/// has time to investigate.
+const LISTENER_BACKOFF_AFTER_ALERT_SECS: u64 = 60;
 
 /// Exponential backoff (in seconds) between retry attempts. Indexed by
 /// `attempts` (0-based: backoff_secs(1) is the wait before attempt #2).
@@ -171,14 +207,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Err(format!("Schema fingerprint check failed: {e}").into());
     }
 
-    // 5. NOTIFY listener + poll fallback
+    // 5. NOTIFY listener + poll fallback. The listener is wrapped in a
+    //    supervisor (audit LOW-3) so a transient PG conn drop respawns
+    //    automatically; without this the worker would silently degrade
+    //    to 30s polling forever after a single recv() error.
     let wakeup = Arc::new(Notify::new());
     let listener_wakeup = wakeup.clone();
     let pg_for_listener = pg.clone();
+    let slack_for_listener = slack.clone();
     let listener_handle = tokio::spawn(async move {
-        if let Err(err) = run_listener(pg_for_listener, listener_wakeup).await {
-            tracing::error!(error = %err, "PgListener task ended");
-        }
+        run_listener_supervised(pg_for_listener, listener_wakeup, slack_for_listener).await;
     });
 
     // SIGTERM handling — drain in-flight then stop
@@ -247,10 +285,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         );
                         // Force-exhaust the job so it doesn't sit stuck. The
                         // panic is unrecoverable for this payload — retrying
-                        // wouldn't help. Slack alert fires inside mark_failed.
+                        // wouldn't help. Slack alert fires inside
+                        // force_exhaust_job. We pass `attempts` (the
+                        // post-claim value preserved from `ClaimedJob`) so
+                        // the alert reports the correct number even if a
+                        // janitor steal would have bumped the row's
+                        // counter mid-panic. Note: no claim-gate on this
+                        // path (audit MED-2) — the panic recovery must
+                        // terminate the row regardless of who currently
+                        // holds the claim, otherwise a panicked recipe +
+                        // concurrent janitor steal would leak a stuck row.
                         force_exhaust_job(
                             &pg,
                             job_id,
+                            attempts,
                             &slack,
                             &format!("PANIC: {panic_msg}"),
                         )
@@ -287,12 +335,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 /// Claimed job — what we got from `writeback_jobs` after the atomic claim.
+///
+/// `claimed_at` is the exact `NOW()` the claim UPDATE stamped onto the row.
+/// It travels with the job so `mark_done` / `mark_failed` can pass it back
+/// into their UPDATE WHERE clause as a claim-gate (audit MED-2): if a slow
+/// recipe runs past `STUCK_IN_PROGRESS_TIMEOUT_SECS`, the janitor in another
+/// worker may have already re-claimed the row (bumping `claimed_at`); in
+/// that case the gate ensures the original worker silently discards its
+/// result instead of double-writing back-population columns with possibly-
+/// different `legacy_*` values than the new claim's recipe will produce.
 #[derive(Debug, Clone)]
 struct ClaimedJob {
     id: i64,
     intent: WritebackIntent,
     aggregate_id: Uuid,
     attempts: i32,
+    claimed_at: DateTime<Utc>,
 }
 
 /// Atomically claim the next pending / retry-eligible / stuck job.
@@ -336,7 +394,7 @@ async fn claim_next_job(
               FOR UPDATE SKIP LOCKED
               LIMIT 1
          )
-        RETURNING id, intent, payload, aggregate_id, attempts
+        RETURNING id, intent, payload, aggregate_id, attempts, claimed_at
         "#,
     )
     .bind(max_attempts)
@@ -351,6 +409,10 @@ async fn claim_next_job(
     let payload: serde_json::Value = row.try_get("payload")?;
     let aggregate_id: Uuid = row.try_get("aggregate_id")?;
     let attempts: i32 = row.try_get("attempts")?;
+    // claimed_at is set by this very UPDATE (NOW()); guaranteed NOT NULL
+    // on the returned row. Used downstream to gate mark_done / mark_failed
+    // against a parallel janitor steal (audit MED-2).
+    let claimed_at: DateTime<Utc> = row.try_get("claimed_at")?;
 
     // Deserialize payload into the matching variant. The JSON shape is
     // produced by `serde(tag = "intent", content = "payload")` — the queue's
@@ -367,6 +429,7 @@ async fn claim_next_job(
         intent,
         aggregate_id,
         attempts,
+        claimed_at,
     }))
 }
 
@@ -387,12 +450,23 @@ async fn process_job(
         "Processing writeback job"
     );
 
-    // Resolve legacy IDs from PG canonical tables.
-    let resolved = match resolve_legacy_ids(pg, &job).await {
+    // Resolve legacy IDs from PG canonical tables. `slack` is plumbed in
+    // for the MED-4 throttled self-heal alert, which fires from inside
+    // `salvage_legacy_ids` when back-population is silently broken.
+    let resolved = match resolve_legacy_ids(pg, slack, &job).await {
         Ok(r) => r,
         Err(err) => {
             tracing::error!(job_id, error = %err, "Failed to resolve legacy IDs");
-            mark_failed(pg, job_id, max_attempts, slack, &format!("resolve_legacy_ids: {err}")).await;
+            mark_failed(
+                pg,
+                job_id,
+                job.attempts,
+                job.claimed_at,
+                max_attempts,
+                slack,
+                &format!("resolve_legacy_ids: {err}"),
+            )
+            .await;
             return;
         }
     };
@@ -413,7 +487,16 @@ async fn process_job(
         Ok(c) => c,
         Err(err) => {
             tracing::error!(job_id, error = %err, "Failed to acquire MSSQL connection");
-            mark_failed(pg, job_id, max_attempts, slack, &format!("mssql_acquire: {err}")).await;
+            mark_failed(
+                pg,
+                job_id,
+                job.attempts,
+                job.claimed_at,
+                max_attempts,
+                slack,
+                &format!("mssql_acquire: {err}"),
+            )
+            .await;
             return;
         }
     };
@@ -434,6 +517,7 @@ async fn process_job(
                 job_id,
                 job.aggregate_id,
                 &job.intent,
+                slack,
                 legacy_ids.into_json(),
             )
             .await;
@@ -449,6 +533,8 @@ async fn process_job(
             mark_failed_with_retryable(
                 pg,
                 job_id,
+                job.attempts,
+                job.claimed_at,
                 max_attempts,
                 slack,
                 &err.to_string(),
@@ -511,9 +597,13 @@ async fn run_in_transaction(
 /// numeric `HT_Rooms.id`, etc.). Each intent has different requirements; we
 /// best-effort-fetch every column the recipes might need.
 ///
-/// Reads only — does not modify PG.
+/// Reads only — does not modify PG. `slack` is plumbed through solely so
+/// the self-heal fallback (`salvage_legacy_ids`) can fire the throttled
+/// MED-4 alert on sustained back-population failure; passing `None` is
+/// safe (the throttle still tracks events for log-grep visibility).
 async fn resolve_legacy_ids(
     pg: &PgPool,
+    slack: &Option<SlackClient>,
     job: &ClaimedJob,
 ) -> Result<ResolvedJob, sqlx::Error> {
     use WritebackIntent::*;
@@ -547,7 +637,7 @@ async fn resolve_legacy_ids(
             }
             // Self-heal from writeback_jobs audit log if cache missed.
             if resolved.legacy_book_id.is_none() {
-                let salvaged = salvage_legacy_ids(pg, *booking_id).await?;
+                let salvaged = salvage_legacy_ids(pg, slack, *booking_id).await?;
                 resolved.legacy_book_id = salvaged.book_id;
                 if resolved.legacy_cust_no.is_none() {
                     resolved.legacy_cust_no = salvaged.cust_no;
@@ -577,7 +667,7 @@ async fn resolve_legacy_ids(
                 || resolved.legacy_cust_no.is_none()
                 || resolved.legacy_checkin_ds_id.is_none()
             {
-                let salvaged = salvage_legacy_ids(pg, *check_in_id).await?;
+                let salvaged = salvage_legacy_ids(pg, slack, *check_in_id).await?;
                 resolved.legacy_cin_no = resolved.legacy_cin_no.or(salvaged.cin_no);
                 resolved.legacy_room_no = resolved.legacy_room_no.or(salvaged.room_no);
                 resolved.legacy_cust_no = resolved.legacy_cust_no.or(salvaged.cust_no);
@@ -625,7 +715,7 @@ async fn resolve_legacy_ids(
                 }
                 // Self-heal from writeback_jobs audit log if cache missed.
                 if resolved.legacy_book_id.is_none() {
-                    let salvaged = salvage_legacy_ids(pg, linked_booking_id).await?;
+                    let salvaged = salvage_legacy_ids(pg, slack, linked_booking_id).await?;
                     resolved.legacy_book_id = salvaged.book_id;
                 }
             }
@@ -647,6 +737,224 @@ struct SalvagedLegacyIds {
     checkin_ds_id: Option<i32>,
 }
 
+/// Process-local throttle state for self-heal Slack alerts (audit MED-4).
+///
+/// Tracks how many self-heal events fired since `window_start`, plus the
+/// list of `aggregate_id`s involved so the Slack message can name them for
+/// the operator. Bounded — we drop excess IDs from the inspection list
+/// to keep the Slack message under the 40k-char webhook limit.
+#[derive(Debug)]
+struct SelfHealCounter {
+    /// When the current counting window opened. None = no events yet.
+    window_start: Option<Instant>,
+    /// Events observed inside the current window.
+    count: u32,
+    /// Aggregate IDs that triggered self-heal in this window. Capped at
+    /// `SELF_HEAL_ALERT_THRESHOLD * 2` so Slack body stays small even if
+    /// the threshold is bumped in env config later.
+    aggregates: Vec<Uuid>,
+}
+
+impl SelfHealCounter {
+    const fn new() -> Self {
+        Self {
+            window_start: None,
+            count: 0,
+            aggregates: Vec::new(),
+        }
+    }
+}
+
+/// Outcome of recording a self-heal event — separates the throttle decision
+/// (pure, easy to test) from the Slack send (impure, hard to test).
+#[derive(Debug, PartialEq, Eq)]
+struct AlertDecision {
+    /// True ⇒ caller should fire Slack and reset the counter.
+    fire: bool,
+    /// Counter value at decision time (for logging + Slack body).
+    count: u32,
+    /// Width of the window the counter has been accumulating in.
+    window_secs: u64,
+}
+
+/// Process-global counter — `OnceLock` initialized lazily. A static keeps
+/// the call-site change in `salvage_legacy_ids` to a single
+/// `record_self_heal()` call instead of threading another arg through the
+/// resolver tree.
+static SELF_HEAL_COUNTER: OnceLock<Arc<Mutex<SelfHealCounter>>> = OnceLock::new();
+
+/// Lazily get-or-init the process-global self-heal counter. The `OnceLock`
+/// guarantees one allocation across all worker threads.
+fn self_heal_counter() -> &'static Arc<Mutex<SelfHealCounter>> {
+    SELF_HEAL_COUNTER.get_or_init(|| Arc::new(Mutex::new(SelfHealCounter::new())))
+}
+
+/// Pure throttle decision — extracted from the IO path so the threshold and
+/// window logic can be unit-tested without spinning up Slack or PG.
+///
+/// Rules:
+///   - First event in a new window opens the window at `now` and counts 1.
+///   - Subsequent events inside the same window bump the count.
+///   - When count reaches `threshold`, return `fire=true` AND reset the
+///     window so the next event opens a fresh one (no spam — exactly one
+///     alert per `window_secs` per burst).
+///   - When an event arrives after the window has expired, the window
+///     resets to `now` with count=1 (no spurious alert from a stale count).
+fn should_alert(
+    state: &mut SelfHealCounter,
+    now: Instant,
+    threshold: u32,
+    window: Duration,
+) -> AlertDecision {
+    // Roll the window if it's expired (or never opened).
+    let window_alive = state
+        .window_start
+        .map(|start| now.duration_since(start) < window)
+        .unwrap_or(false);
+
+    if !window_alive {
+        state.window_start = Some(now);
+        state.count = 0;
+        state.aggregates.clear();
+    }
+
+    state.count = state.count.saturating_add(1);
+
+    let fire = state.count >= threshold;
+    let decision = AlertDecision {
+        fire,
+        count: state.count,
+        window_secs: window.as_secs(),
+    };
+
+    if fire {
+        // Reset for the next window so we don't re-fire on every event past
+        // the threshold (audit-mandated throttle).
+        state.window_start = None;
+        state.count = 0;
+        state.aggregates.clear();
+    }
+    decision
+}
+
+/// Record a single self-heal event and, if the burst threshold is breached,
+/// fire one Slack alert. Logs at warn-level on every event (so log-grep
+/// also catches what Slack does) and at error-level on the alert.
+///
+/// `slack` is `&Option<SlackClient>` for parity with the rest of the file —
+/// when Slack isn't configured the throttle still runs, the operator just
+/// sees the warn/error log lines.
+async fn record_self_heal(slack: &Option<SlackClient>, aggregate_id: Uuid) {
+    let counter = self_heal_counter();
+    // Compute decision under the lock — short critical section, no awaits.
+    // If the lock is poisoned (some prior call panicked) we recover and
+    // keep going: this is a reporting path, not a correctness path.
+    let (decision, aggregates_at_alert) = {
+        let mut guard = match counter.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // Track the aggregate ID for the Slack body — bounded so a sustained
+        // outage doesn't blow up the message size.
+        let cap = (SELF_HEAL_ALERT_THRESHOLD as usize).saturating_mul(2);
+        if guard.aggregates.len() < cap {
+            guard.aggregates.push(aggregate_id);
+        }
+        // Snapshot aggregates BEFORE should_alert (which clears them on
+        // fire=true). The snapshot is what populates the Slack message.
+        let snapshot = guard.aggregates.clone();
+        let decision = should_alert(
+            &mut guard,
+            Instant::now(),
+            SELF_HEAL_ALERT_THRESHOLD,
+            Duration::from_secs(SELF_HEAL_WINDOW_SECS),
+        );
+        (decision, snapshot)
+    };
+
+    // Per-event log (warn) so a log-grep alert can catch sustained drift
+    // even if Slack is offline.
+    tracing::warn!(
+        %aggregate_id,
+        count = decision.count,
+        window_secs = decision.window_secs,
+        threshold = SELF_HEAL_ALERT_THRESHOLD,
+        "Self-heal event recorded"
+    );
+
+    if !decision.fire {
+        return;
+    }
+
+    tracing::error!(
+        count = decision.count,
+        window_secs = decision.window_secs,
+        threshold = SELF_HEAL_ALERT_THRESHOLD,
+        aggregates = ?aggregates_at_alert,
+        "Self-heal threshold breached — back-population may be broken"
+    );
+
+    if let Some(slack) = slack {
+        send_self_heal_alert(
+            slack,
+            decision.count,
+            decision.window_secs,
+            &aggregates_at_alert,
+        )
+        .await;
+    }
+}
+
+/// Post a Slack alert when the self-heal counter trips its threshold within
+/// the throttle window (audit MED-4). Best-effort: failures are swallowed
+/// inside `send_message` so a Slack outage never blocks the writeback loop.
+async fn send_self_heal_alert(
+    slack: &SlackClient,
+    count: u32,
+    window_secs: u64,
+    aggregates: &[Uuid],
+) {
+    // Format aggregate UUIDs as a comma-separated SQL `IN (…)` list the
+    // operator can paste into the inspection query. Capped already by the
+    // counter so this stays under a few hundred bytes.
+    let in_list = if aggregates.is_empty() {
+        "/* no aggregates captured */".to_string()
+    } else {
+        aggregates
+            .iter()
+            .map(|u| format!("'{u}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let last_aggregate = aggregates
+        .last()
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| "(none)".to_string());
+
+    let text = format!(
+        ":warning: *Writeback self-heal threshold breached* :warning:\n\
+         *Events:* {count} self-heals in the last {window_secs}s \
+         (threshold: {SELF_HEAL_ALERT_THRESHOLD})\n\
+         *Last aggregate:* `{last_aggregate}`\n\
+         _Back-population to `ht_*.legacy_*` cache may be broken — likely a \
+         PG perms regression, schema drift on the `ht_*` tables, or a \
+         mark_done failure pattern. Inspect with:_\n\
+         ```\n\
+         SELECT id, intent, aggregate_id, last_error\n\
+         FROM writeback_jobs\n\
+         WHERE status = 'exhausted'\n\
+            OR aggregate_id IN ({in_list})\n\
+         ORDER BY completed_at DESC NULLS LAST\n\
+         LIMIT 50;\n\
+         ```\n\
+         _Then verify_ \
+         `SELECT legacy_book_id, legacy_cin_no FROM ht_bookings JOIN ht_checkins …` \
+         _has values and `mark_done`'s UPDATE is succeeding for that intent class._"
+    );
+    let msg = SlackMessage::with_text(text);
+    let _ = slack.send_message(&msg).await;
+}
+
 /// Pull the most recently successful writeback's allocated legacy IDs for
 /// `aggregate_id` out of the audit log. Tolerant of missing fields and
 /// missing rows — every field is `Option`.
@@ -656,8 +964,14 @@ struct SalvagedLegacyIds {
 /// row with `status='done'` and a non-NULL `legacy_ids` is a strict superset
 /// of what a successful back-population would have written to `ht_*`. If
 /// back-population fails, this audit row is the source of truth.
+///
+/// Side-effect: every successful salvage feeds `record_self_heal`, which
+/// drives the throttled MED-4 Slack alert on sustained back-population
+/// failure. `slack` is plumbed in solely for that path; passing `None` is
+/// safe (the throttle still tracks events for log-grep visibility).
 async fn salvage_legacy_ids(
     pg: &PgPool,
+    slack: &Option<SlackClient>,
     aggregate_id: Uuid,
 ) -> Result<SalvagedLegacyIds, sqlx::Error> {
     let row = sqlx::query(
@@ -686,6 +1000,9 @@ async fn salvage_legacy_ids(
                 "Self-healed missing legacy_* from writeback_jobs audit log; \
                  ht_* cache row likely needs re-stamping"
             );
+            // Audit MED-4: feed the throttled alert path. Operator gets one
+            // Slack ping per `SELF_HEAL_WINDOW_SECS` if these fire in bursts.
+            record_self_heal(slack, aggregate_id).await;
         }
     }
     Ok(out)
@@ -705,23 +1022,71 @@ async fn salvage_legacy_ids(
 ///
 /// Without step 1, step 2 fails with "ModifyBooking requires resolved
 /// legacy_book_id".
+///
+/// Audit LOW-2: the UPDATE captures the *prior* status via a CTE so we can
+/// detect the `exhausted → done` transition (operator manually fixed +
+/// reset the row to `pending`, the next attempt succeeded). On that
+/// transition we post a `:white_check_mark:` Slack so the operator sees
+/// closure, not just the original `:rotating_light:` alarm.
 async fn mark_done(
     pg: &PgPool,
     job_id: i64,
     aggregate_id: Uuid,
     intent: &WritebackIntent,
+    slack: &Option<SlackClient>,
     legacy_ids: serde_json::Value,
 ) {
-    let res = sqlx::query(
-        "UPDATE writeback_jobs SET status='done', completed_at=NOW(), legacy_ids=$2 \
-         WHERE id=$1",
+    // CTE pattern keeps prior-status capture atomic with the status flip —
+    // no race between SELECT and UPDATE in case another worker / janitor
+    // touches the row mid-call.
+    let row = sqlx::query(
+        r#"
+        WITH prev AS (
+            SELECT id, status AS prior_status FROM writeback_jobs WHERE id = $1
+        )
+        UPDATE writeback_jobs wj
+           SET status       = 'done',
+               completed_at = NOW(),
+               legacy_ids   = $2
+          FROM prev
+         WHERE wj.id = prev.id
+        RETURNING wj.attempts, wj.intent, wj.aggregate_id, prev.prior_status
+        "#,
     )
     .bind(job_id)
     .bind(&legacy_ids)
-    .execute(pg)
+    .fetch_optional(pg)
     .await;
-    if let Err(err) = res {
-        tracing::error!(job_id, error = %err, "Failed to mark job done");
+
+    match &row {
+        Ok(Some(r)) => {
+            let prior_status: String = r.try_get("prior_status").unwrap_or_default();
+            // LOW-2: closure alert on operator-driven recovery.
+            if prior_status == "exhausted" {
+                let attempts: i32 = r.try_get("attempts").unwrap_or(0);
+                let intent_name: String = r.try_get("intent").unwrap_or_default();
+                let agg: Option<Uuid> = r.try_get("aggregate_id").ok();
+                tracing::warn!(
+                    job_id,
+                    attempts,
+                    intent = %intent_name,
+                    ?agg,
+                    "Writeback job RESOLVED on retry after prior exhaustion"
+                );
+                if let Some(slack) = slack {
+                    send_resolved_alert(slack, job_id, &intent_name, agg, attempts).await;
+                }
+            }
+        }
+        Ok(None) => {
+            tracing::error!(
+                job_id,
+                "mark_done UPDATE matched zero rows — job may have been deleted by operator"
+            );
+        }
+        Err(err) => {
+            tracing::error!(job_id, error = %err, "Failed to mark job done");
+        }
     }
 
     // Bounded retry — three attempts with exponential backoff. If all fail,
@@ -829,15 +1194,28 @@ async fn back_populate_legacy_ids(
 /// count. Used for panics (no point retrying — the recipe code is broken or
 /// the payload is unparseable) and other deterministic failures where the
 /// retry budget would just delay operator visibility.
+///
+/// **No claim-gate here (intentional, audit MED-2):** the panic recovery
+/// path needs to terminate the row regardless of who currently holds the
+/// claim. If a recipe panics AND the janitor in another worker has already
+/// stolen the claim, both would otherwise leak — gating this UPDATE would
+/// leave a stuck `in_progress` row.
+///
+/// `attempts` is passed in from the caller's `ClaimedJob` (the post-claim
+/// value) so the Slack alert reports the correct number even though we no
+/// longer rely on the row's stored `attempts` — that would have been the
+/// *new* claim's incremented attempts if the row was stolen, which is
+/// misleading in the alert.
 async fn force_exhaust_job(
     pg: &PgPool,
     job_id: i64,
+    attempts: i32,
     slack: &Option<SlackClient>,
     err_msg: &str,
 ) {
     let row = sqlx::query(
         "UPDATE writeback_jobs SET status='exhausted', last_error=$2, next_retry_at=NULL \
-         WHERE id=$1 RETURNING attempts, intent, aggregate_id",
+         WHERE id=$1 RETURNING intent, aggregate_id",
     )
     .bind(job_id)
     .bind(err_msg)
@@ -846,7 +1224,6 @@ async fn force_exhaust_job(
 
     match row {
         Ok(row) => {
-            let attempts: i32 = row.try_get("attempts").unwrap_or(0);
             let intent: String = row.try_get("intent").unwrap_or_default();
             let aggregate_id: Option<Uuid> = row.try_get("aggregate_id").ok();
             tracing::error!(
@@ -879,33 +1256,62 @@ async fn force_exhaust_job(
 /// max_attempts`. Fires a Slack alert on the exhaustion transition so the
 /// operator sees the failure within seconds, not whenever they next look at
 /// the queue.
+#[allow(clippy::too_many_arguments)]
 async fn mark_failed_with_retryable(
     pg: &PgPool,
     job_id: i64,
+    attempts: i32,
+    claimed_at: DateTime<Utc>,
     max_attempts: i32,
     slack: &Option<SlackClient>,
     err_msg: &str,
     retryable: bool,
 ) {
     if !retryable {
-        force_exhaust_job(pg, job_id, slack, err_msg).await;
+        force_exhaust_job(pg, job_id, attempts, slack, err_msg).await;
         return;
     }
-    mark_failed(pg, job_id, max_attempts, slack, err_msg).await;
+    mark_failed(pg, job_id, attempts, claimed_at, max_attempts, slack, err_msg).await;
 }
 
 /// See [`mark_failed_with_retryable`]. Convenience wrapper for callsites
 /// that don't have a typed error in hand (e.g. PG resolve failures).
 /// Defaults to retryable=true.
+///
+/// **HIGH-1 fix:** this used to do an UPDATE then a separate SELECT
+/// (`get_attempts_for_backoff`) to compute the backoff seconds. Between
+/// the two queries, the stuck-in-progress janitor in another worker could
+/// re-claim the row and bump `attempts`, so the backoff was computed
+/// against the wrong number. Folded into a single statement: the
+/// post-claim `attempts` (preserved on `ClaimedJob`) is passed in by the
+/// caller and `backoff_secs` is computed client-side, so the round-trip
+/// is gone and the value is always consistent with the row we actually
+/// claimed.
+///
+/// **MED-2 fix:** the UPDATE is gated on
+/// `status='in_progress' AND claimed_at = $X` so a slow-recipe + janitor-
+/// steal race (where another worker already re-claimed the row) silently
+/// discards instead of clobbering the new claim's status. `RETURNING`
+/// signals: 0 rows = our claim was stolen.
+#[allow(clippy::too_many_arguments)]
 async fn mark_failed(
     pg: &PgPool,
     job_id: i64,
+    attempts: i32,
+    claimed_at: DateTime<Utc>,
     max_attempts: i32,
     slack: &Option<SlackClient>,
     err_msg: &str,
 ) {
-    // Bump status conditionally. RETURNING gives us the post-UPDATE state so
-    // we know whether this attempt exhausted the budget.
+    // HIGH-1: backoff is computed from the post-claim `attempts` carried on
+    // ClaimedJob, NOT from a separate SELECT after the UPDATE. That removes
+    // the read-modify-write race where a janitor steal between the two
+    // queries would have skewed the backoff value.
+    let backoff = backoff_secs(attempts);
+    // Single statement: bumps status conditionally (CASE on attempts vs
+    // max_attempts) AND gates on the claim still being ours (audit MED-2).
+    // RETURNING gives us the post-UPDATE state so we can fire the Slack
+    // alert exactly on the transition into `exhausted`.
     let row = sqlx::query(
         r#"
         UPDATE writeback_jobs
@@ -916,18 +1322,32 @@ async fn mark_failed(
                                    ELSE NOW() + make_interval(secs => $4)
                                END
          WHERE id = $1
+           AND status = 'in_progress'
+           AND claimed_at = $5
         RETURNING attempts, status, intent, aggregate_id
         "#,
     )
     .bind(job_id)
     .bind(max_attempts)
     .bind(err_msg)
-    .bind(backoff_secs(get_attempts_for_backoff(pg, job_id).await))
-    .fetch_one(pg)
+    .bind(backoff)
+    .bind(claimed_at)
+    .fetch_optional(pg)
     .await;
 
     let row = match row {
-        Ok(r) => r,
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            // 0 rows updated — our claim was stolen by the stuck-in-progress
+            // janitor in another worker (audit MED-2). The new claim will
+            // run the recipe again and call its own mark_failed/mark_done.
+            // Discard quietly with a loud log so the race is visible.
+            tracing::warn!(
+                job_id,
+                "Job {job_id} was re-claimed by another worker before mark_failed; discarding result"
+            );
+            return;
+        }
         Err(err) => {
             tracing::error!(
                 job_id,
@@ -938,7 +1358,7 @@ async fn mark_failed(
         }
     };
 
-    let attempts: i32 = row.try_get("attempts").unwrap_or(0);
+    let post_attempts: i32 = row.try_get("attempts").unwrap_or(attempts);
     let status: String = row.try_get("status").unwrap_or_default();
     let intent: String = row.try_get("intent").unwrap_or_default();
     let aggregate_id: Option<Uuid> = row.try_get("aggregate_id").ok();
@@ -946,33 +1366,22 @@ async fn mark_failed(
     if status == "exhausted" {
         tracing::error!(
             job_id,
-            attempts,
+            attempts = post_attempts,
             intent = %intent,
             ?aggregate_id,
             "Writeback job EXHAUSTED retries — manual intervention required"
         );
         if let Some(slack) = slack {
-            send_exhausted_alert(slack, job_id, &intent, aggregate_id, attempts, err_msg).await;
+            send_exhausted_alert(slack, job_id, &intent, aggregate_id, post_attempts, err_msg)
+                .await;
         }
     } else {
         tracing::warn!(
             job_id,
-            attempts,
+            attempts = post_attempts,
             "Writeback job failed; will retry after backoff"
         );
     }
-}
-
-/// Read just `attempts` so we can compute the right backoff. Two queries
-/// instead of one (we already issued the UPDATE) trades a tiny extra round
-/// trip for keeping the UPDATE statement readable; could be folded in via a
-/// CTE if it ever shows up in a profile.
-async fn get_attempts_for_backoff(pg: &PgPool, job_id: i64) -> i32 {
-    sqlx::query_scalar::<_, i32>("SELECT attempts FROM writeback_jobs WHERE id = $1")
-        .bind(job_id)
-        .fetch_one(pg)
-        .await
-        .unwrap_or(1)
 }
 
 /// Post a Slack alert when a writeback job exhausts its retry budget.
@@ -1007,6 +1416,34 @@ async fn send_exhausted_alert(
          `UPDATE writeback_jobs SET status='pending', attempts=0, \
          next_retry_at=NULL WHERE id={job_id}` _to retry, \
          or delete the row if the writeback is no longer needed._"
+    );
+    let msg = SlackMessage::with_text(text);
+    let _ = slack.send_message(&msg).await;
+}
+
+/// Post a Slack closure alert when an `exhausted` job is recovered (audit
+/// LOW-2). Fires once per resolution from `mark_done`. The operator
+/// previously got a `:rotating_light:` alarm via `send_exhausted_alert`;
+/// this `:white_check_mark:` lets them confirm their fix worked without
+/// having to query the queue manually. Best-effort like the other alerts.
+async fn send_resolved_alert(
+    slack: &SlackClient,
+    job_id: i64,
+    intent: &str,
+    aggregate_id: Option<Uuid>,
+    attempts: i32,
+) {
+    let aggregate_id_str = aggregate_id
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| "(unknown)".into());
+    let text = format!(
+        ":white_check_mark: *Writeback exhausted job RESOLVED* :white_check_mark:\n\
+         *Job ID:* `{job_id}`\n\
+         *Intent:* `{intent}`\n\
+         *Aggregate:* `{aggregate_id_str}`\n\
+         *Resolved on attempt:* {attempts}\n\
+         _The previously-exhausted job succeeded after operator intervention. \
+         Closure of the_ `:rotating_light:` _alert sent earlier for this job._"
     );
     let msg = SlackMessage::with_text(text);
     let _ = slack.send_message(&msg).await;
@@ -1048,6 +1485,94 @@ async fn run_listener(pg: PgPool, wakeup: Arc<Notify>) -> Result<(), sqlx::Error
             }
         }
     }
+}
+
+/// Supervisor for `run_listener` (audit LOW-3). Respawns the listener on
+/// every error with a 5s backoff; if `LISTENER_MAX_CONSECUTIVE_FAILURES`
+/// happen back-to-back, fires a Slack alert and slows the retry cadence
+/// to `LISTENER_BACKOFF_AFTER_ALERT_SECS` (one alert per burst — same
+/// throttle pattern as MED-4) but never gives up.
+///
+/// Why we keep retrying instead of exiting: the worker has two signal
+/// sources — NOTIFY and the 30s poll. If we exit the listener task entirely
+/// the worker still functions (it just sees jobs ~30s late). But an
+/// operator under time pressure during the live test won't realize sync
+/// silently degraded. Persistent reconnect + Slack alert preserves both
+/// liveness AND visibility.
+async fn run_listener_supervised(
+    pg: PgPool,
+    wakeup: Arc<Notify>,
+    slack: Option<SlackClient>,
+) {
+    let mut consecutive_failures: u32 = 0;
+    loop {
+        let pg_inner = pg.clone();
+        let wakeup_inner = wakeup.clone();
+        match run_listener(pg_inner, wakeup_inner).await {
+            Ok(()) => {
+                // Listener returned Ok — the only path is `loop {}` exit,
+                // which currently can't happen. Treated as success: reset
+                // the failure counter and respawn after the standard backoff.
+                tracing::warn!("PgListener returned Ok unexpectedly — respawning");
+                consecutive_failures = 0;
+            }
+            Err(err) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                tracing::error!(
+                    error = %err,
+                    consecutive_failures,
+                    "PgListener task ended; will respawn after backoff"
+                );
+            }
+        }
+
+        let sleep_secs = if consecutive_failures >= LISTENER_MAX_CONSECUTIVE_FAILURES {
+            // First time we cross the threshold (or every threshold-th
+            // failure after that): page the operator, then back off.
+            // Counter is reset post-alert so we get one alert per burst,
+            // not one per attempt past the threshold.
+            tracing::error!(
+                consecutive_failures,
+                threshold = LISTENER_MAX_CONSECUTIVE_FAILURES,
+                "PgListener supervisor: alert threshold breached — paging operator + slowing respawn"
+            );
+            if let Some(slack) = &slack {
+                send_listener_alert(slack, consecutive_failures).await;
+            }
+            consecutive_failures = 0;
+            LISTENER_BACKOFF_AFTER_ALERT_SECS
+        } else {
+            LISTENER_BACKOFF_SECS
+        };
+
+        tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+    }
+}
+
+/// Post a Slack alert when the PG NOTIFY listener has failed to stay up
+/// across `LISTENER_MAX_CONSECUTIVE_FAILURES` consecutive respawn attempts
+/// (audit LOW-3). The worker is still functional via the 30s poll fallback,
+/// but sync latency has degraded from sub-second to ~30s — the operator
+/// needs to know.
+async fn send_listener_alert(slack: &SlackClient, consecutive_failures: u32) {
+    let text = format!(
+        ":warning: *Writeback PG NOTIFY listener UNHEALTHY* :warning:\n\
+         *Consecutive failures:* {consecutive_failures} \
+         (threshold: {LISTENER_MAX_CONSECUTIVE_FAILURES})\n\
+         _The worker is still draining the queue via 30s poll fallback, but \
+         sync latency has degraded from sub-second to ~30s. Likely causes: \
+         PG down, network partition, role missing LISTEN privilege, or \
+         max_connections exhausted. Inspect:_\n\
+         ```\n\
+         SELECT * FROM pg_stat_activity WHERE query LIKE '%LISTEN%';\n\
+         SELECT count(*) FROM pg_stat_activity;\n\
+         ```\n\
+         _The supervisor will keep retrying every \
+         {LISTENER_BACKOFF_AFTER_ALERT_SECS}s — fix the underlying issue and \
+         the next reconnect will succeed automatically._"
+    );
+    let msg = SlackMessage::with_text(text);
+    let _ = slack.send_message(&msg).await;
 }
 
 // Suppress unused import warning when WritebackError isn't directly referenced
@@ -1125,5 +1650,122 @@ mod tests {
         // No panic = pass. Sanity: result must be a valid String shorter
         // than the input.
         assert!(out.chars().count() < thai.chars().count());
+    }
+
+    /// MED-4 throttle: a single self-heal event must NOT trip the alert —
+    /// CreateBooking↔CheckIn races are normal and shouldn't page the
+    /// operator. The decision must report fire=false until the threshold
+    /// is reached.
+    #[test]
+    fn should_alert_below_threshold_does_not_fire() {
+        let mut state = SelfHealCounter::new();
+        let now = Instant::now();
+        let decision = should_alert(&mut state, now, 5, Duration::from_secs(300));
+        assert!(!decision.fire, "first event must not fire");
+        assert_eq!(decision.count, 1);
+        assert_eq!(decision.window_secs, 300);
+    }
+
+    /// MED-4 throttle: the Nth event inside the window fires exactly once,
+    /// then resets the counter so the next event opens a fresh window.
+    #[test]
+    fn should_alert_at_threshold_fires_once_then_resets() {
+        let mut state = SelfHealCounter::new();
+        let now = Instant::now();
+        let window = Duration::from_secs(300);
+
+        // Events 1..=4 must not fire.
+        for expected_count in 1..=4 {
+            let d = should_alert(&mut state, now, 5, window);
+            assert!(!d.fire, "event {expected_count} must not fire");
+            assert_eq!(d.count, expected_count);
+        }
+
+        // Event 5 fires and resets.
+        let fifth = should_alert(&mut state, now, 5, window);
+        assert!(fifth.fire, "5th event must fire");
+        assert_eq!(fifth.count, 5);
+
+        // Event 6 (immediately after) must NOT fire — counter was reset,
+        // so it reopens a fresh window with count=1. Operator gets exactly
+        // one alert per threshold-burst, not one per event past the threshold.
+        let sixth = should_alert(&mut state, now, 5, window);
+        assert!(!sixth.fire, "6th event must not fire (counter just reset)");
+        assert_eq!(sixth.count, 1);
+    }
+
+    /// MED-4 throttle: events arriving past the window boundary reset the
+    /// counter without firing — a stale partial-burst from yesterday must
+    /// not contribute to today's count.
+    #[test]
+    fn should_alert_window_expiry_resets_counter() {
+        let mut state = SelfHealCounter::new();
+        let t0 = Instant::now();
+        let window = Duration::from_secs(60);
+
+        // Two events open the window with count=2.
+        let _ = should_alert(&mut state, t0, 5, window);
+        let _ = should_alert(&mut state, t0, 5, window);
+        assert_eq!(state.count, 2);
+
+        // Jump past the window — the next event must reset to count=1
+        // and not fire (because threshold is 5, not 1).
+        let t1 = t0 + Duration::from_secs(120);
+        let decision = should_alert(&mut state, t1, 5, window);
+        assert!(!decision.fire, "event after window expiry must not fire");
+        assert_eq!(decision.count, 1, "counter must reset after window expiry");
+    }
+
+    /// MED-4 throttle: threshold of 1 fires immediately on every event —
+    /// edge case but the math should still be safe (no off-by-one panic).
+    #[test]
+    fn should_alert_threshold_of_one_fires_every_event() {
+        let mut state = SelfHealCounter::new();
+        let now = Instant::now();
+        let window = Duration::from_secs(60);
+
+        for _ in 0..3 {
+            let d = should_alert(&mut state, now, 1, window);
+            assert!(d.fire, "threshold=1 must fire every event");
+            assert_eq!(d.count, 1, "counter resets after each fire");
+        }
+    }
+
+    /// MED-4 constants must form a sensible throttle: threshold > 1 (or
+    /// every event would page) and window > 0 (or we'd divide by zero
+    /// somewhere reading these). Guards against an env-driven config error
+    /// shipping a no-op throttle.
+    #[test]
+    fn self_heal_constants_are_in_safe_range() {
+        assert!(
+            SELF_HEAL_ALERT_THRESHOLD >= 2,
+            "threshold of 1 means every salvage pages — likely a misconfig"
+        );
+        assert!(
+            SELF_HEAL_WINDOW_SECS >= 60,
+            "window <60s makes the throttle useless against bursts"
+        );
+        assert!(
+            SELF_HEAL_WINDOW_SECS <= 3600,
+            "window >1h hides regressions for too long"
+        );
+    }
+
+    /// LOW-3 listener constants must form a usable supervisor: backoff
+    /// short enough to be invisible normally, long enough not to spin;
+    /// alert threshold high enough to absorb transient flaps but low
+    /// enough to page within a minute on a real outage.
+    #[test]
+    fn listener_supervisor_constants_are_in_safe_range() {
+        assert!(LISTENER_BACKOFF_SECS >= 1, "<1s would spin CPU");
+        assert!(LISTENER_BACKOFF_SECS <= 30, ">30s defeats the point of NOTIFY");
+        assert!(
+            LISTENER_MAX_CONSECUTIVE_FAILURES >= 3,
+            "<3 would page on every flap"
+        );
+        assert!(
+            LISTENER_BACKOFF_AFTER_ALERT_SECS > LISTENER_BACKOFF_SECS,
+            "post-alert backoff must be longer than normal backoff"
+        );
     }
 }
