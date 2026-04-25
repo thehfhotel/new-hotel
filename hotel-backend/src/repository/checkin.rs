@@ -264,6 +264,16 @@ pub trait CheckInRepository: Send + Sync {
         cin_id: i32,
         guest_id: i32,
     ) -> Result<(), sqlx::Error>;
+
+    /// Stamp the deterministic aggregate UUID onto a freshly-inserted check-in.
+    /// Same role as `BookingRepository::set_aggregate_id` — required for the
+    /// writeback worker's resolver to map UUID → row (migration 014).
+    async fn set_aggregate_id(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        cin_id: i32,
+        aggregate_id: uuid::Uuid,
+    ) -> Result<(), sqlx::Error>;
 }
 
 /// Default `CheckInRepository` impl backed by sqlx + PostgreSQL.
@@ -764,6 +774,22 @@ impl CheckInRepository for PgCheckInRepository {
             guest_id,
             cin_id
         )
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    async fn set_aggregate_id(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        cin_id: i32,
+        aggregate_id: uuid::Uuid,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE ht_checkins SET aggregate_id = $2 WHERE cin_id = $1",
+        )
+        .bind(cin_id)
+        .bind(aggregate_id)
         .execute(&mut **tx)
         .await?;
         Ok(())

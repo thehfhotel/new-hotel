@@ -38,6 +38,16 @@ pub struct LegacyIds {
     pub cin_no: Option<String>,
     pub pay_no: Option<String>,
     pub receipt_no: Option<String>,
+    /// Room number on the MSSQL side (`HT_Rooms.room_no`, e.g. `"402"`).
+    /// Captured by walkin / checkin_to_booking so the writeback worker's
+    /// `mark_done` can back-populate `ht_checkins.legacy_room_no` for the
+    /// next intent on the same check-in (CancelCheckIn, ExtendStay,
+    /// CheckOut, RecordPayment all need this).
+    pub room_no: Option<String>,
+    /// `HT_CheckIn_Ds.id` (IDENTITY) for the row created during walkin /
+    /// checkin_to_booking. Required by ExtendStay and CheckOut recipes;
+    /// captured via `SELECT SCOPE_IDENTITY()` after the INSERT.
+    pub checkin_ds_id: Option<i32>,
     /// Free-form extras (e.g. `HT_Rooms_Cancel.id`).
     #[serde(default)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -66,6 +76,14 @@ impl LegacyIds {
     }
     pub fn with_receipt_no(mut self, receipt_no: String) -> Self {
         self.receipt_no = Some(receipt_no);
+        self
+    }
+    pub fn with_room_no(mut self, room_no: String) -> Self {
+        self.room_no = Some(room_no);
+        self
+    }
+    pub fn with_checkin_ds_id(mut self, id: i32) -> Self {
+        self.checkin_ds_id = Some(id);
         self
     }
 

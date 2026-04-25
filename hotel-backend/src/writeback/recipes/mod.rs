@@ -59,3 +59,63 @@ pub(crate) async fn execute_all(
     }
     Ok(())
 }
+
+/// Read `SCOPE_IDENTITY()` from MSSQL — the IDENTITY value of the last INSERT
+/// in the current scope. Use immediately after a recipe's INSERT into an
+/// IDENTITY-keyed table (e.g. `HT_CheckIn_Ds`) to capture the assigned id
+/// for back-population to PG.
+///
+/// Returns `Err(Recipe(...))` if MSSQL returns NULL — that means the prior
+/// statement did not insert into an IDENTITY-keyed table within the scope,
+/// which is a recipe ordering bug.
+pub(crate) async fn fetch_scope_identity(
+    conn: &mut LegacyConn<'_>,
+) -> WritebackResult<i32> {
+    let stream = conn.simple_query("SELECT CAST(SCOPE_IDENTITY() AS INT)").await?;
+    let row = stream.into_row().await?;
+    let row = row.ok_or_else(|| {
+        crate::writeback::error::WritebackError::Recipe(
+            "SCOPE_IDENTITY returned no row".into(),
+        )
+    })?;
+    let id: Option<i32> = row.get(0);
+    id.ok_or_else(|| {
+        crate::writeback::error::WritebackError::Recipe(
+            "SCOPE_IDENTITY returned NULL — prior statement did not insert into an IDENTITY table".into(),
+        )
+    })
+}
+
+/// Run statements up to and including the one matching `marker_sql_substring`,
+/// capture `SCOPE_IDENTITY()`, then run the remaining statements. Used for
+/// recipes that need the IDENTITY value of one INSERT to feed into either
+/// later SQL or back-population (audit CRIT-3 — `HT_CheckIn_Ds.id`).
+///
+/// `marker_sql_substring` must match exactly one statement; panics in tests
+/// (debug_assert) if 0 or >1 match.
+pub(crate) async fn execute_capturing_identity_at(
+    conn: &mut LegacyConn<'_>,
+    statements: &[String],
+    marker_sql_substring: &str,
+) -> WritebackResult<i32> {
+    let matches: Vec<usize> = statements
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| s.contains(marker_sql_substring).then_some(i))
+        .collect();
+    debug_assert_eq!(
+        matches.len(),
+        1,
+        "marker {marker_sql_substring:?} matched {} statements; expected exactly 1",
+        matches.len()
+    );
+    let pivot = matches.first().copied().ok_or_else(|| {
+        crate::writeback::error::WritebackError::Recipe(format!(
+            "execute_capturing_identity_at: marker {marker_sql_substring:?} not found"
+        ))
+    })?;
+    execute_all(conn, &statements[..=pivot]).await?;
+    let id = fetch_scope_identity(conn).await?;
+    execute_all(conn, &statements[pivot + 1..]).await?;
+    Ok(id)
+}

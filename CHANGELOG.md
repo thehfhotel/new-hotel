@@ -5,6 +5,55 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.31.0] - 2026-04-25
+
+### Fixed
+
+- **Writeback resolver — close CRIT-3.** The Phase 4b writeback worker's
+  resolver in `bin/writeback.rs` queried `legacy_book_id` /
+  `legacy_cin_no` / `legacy_room_no` columns that never existed in the PG
+  schema, and joined on `WHERE id = $1` against tables whose primary keys
+  are actually `book_id` / `cin_id` / `room_id` (and they're SERIAL `i32`,
+  while the intent's `*_id` is a `Uuid`). Result: only `CreateBooking` and
+  walk-in `CreateCheckIn` worked end-to-end; every modify / cancel /
+  extend / checkout / payment / mark-clean intent silently failed at
+  resolution time.
+
+  Closes the gap with three coordinated changes (commit `<this release>`):
+
+  - **Migration 014** adds `legacy_book_id` / `legacy_cust_no` to
+    `ht_bookings`; `legacy_cin_no` / `legacy_room_no` / `legacy_cust_no`
+    / `legacy_checkin_ds_id` to `ht_checkins`; `legacy_room_no` /
+    `legacy_room_id_int` to `ht_rooms_new`; plus an `aggregate_id UUID`
+    column on each (UNIQUE partial index, NULL allowed for pre-migration
+    rows). `init-db/init-hotelnew.sql` mirrors the same columns for
+    fresh deployments.
+  - **Service layer** (`service/booking.rs`, `service/checkin.rs`) now
+    stamps `aggregate_id = aggregate_uuid(kind, serial_id)` onto each
+    freshly inserted row in the same transaction as the outbox enqueue.
+    New `BookingRepository::set_aggregate_id` and
+    `CheckInRepository::set_aggregate_id` methods. Without this stamp,
+    the worker's resolver cannot map UUID→row.
+  - **Writeback worker** now resolves via `WHERE aggregate_id = $1` (no
+    more spurious `id` column reference). The renamed `mark_done`
+    callback also back-populates the freshly allocated `legacy_*`
+    identifiers (e.g. `R014812`, `CH26-005230`) onto the canonical PG
+    row, so the next intent on the same aggregate (modify, cancel,
+    extend, etc.) resolves immediately. Walk-in / check-in-to-booking
+    recipes capture `SCOPE_IDENTITY()` after the `HT_CheckIn_Ds` INSERT
+    via the new `recipes::execute_capturing_identity_at` helper, so
+    `legacy_checkin_ds_id` is available for ExtendStay / CheckOut.
+  - **`backfill_rooms`** also writes `legacy_room_no` / `legacy_room_id_int`
+    / `aggregate_id` so MarkRoomClean works on the existing 58 rooms
+    without waiting for the next room mutation.
+
+  New `LegacyIds.with_room_no()` and `with_checkin_ds_id()` builders;
+  walkin / checkin_to_booking populate both. JSON shape of
+  `writeback_jobs.legacy_ids` extended with `room_no` and `checkin_ds_id`.
+
+  All 114 lib tests pass — no recipe SQL changed, only orchestration
+  around the existing INSERT statements.
+
 ## [2.30.0] - 2026-04-25
 
 ### Fixed
