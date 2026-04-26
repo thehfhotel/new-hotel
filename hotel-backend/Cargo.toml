@@ -68,7 +68,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # Asia/Bangkok conversion for legacy MSSQL writes — the .NET app stores
 # wall-clock Thai-local times (no offset). PG stores TIMESTAMPTZ in UTC, so the
 # writeback worker must convert UTC → Bangkok before formatting.
-chrono-tz = "0.9"
+chrono-tz = "0.10"
 
 # UUID — canonical primary keys for the domain layer (per docs/architecture.md §4a).
 # Already pulled in transitively by tiberius + tokio-cron-scheduler; declared
