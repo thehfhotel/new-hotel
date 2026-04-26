@@ -848,5 +848,43 @@ VALUES ('013', '013_legacy_ct_state.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================
+-- Migration 017: legacy_sync_status (per-table CT watcher observability)
+-- Per docs/architecture.md §3.6d, §3.7. Adds the soft-delete column on
+-- ht_customers (Phase 5.2 HT_Customers `D` events will populate it) and
+-- the per-table progress / health table consumed by `bin/sync.rs`.
+-- =============================================================================
+
+ALTER TABLE ht_customers
+    ADD COLUMN IF NOT EXISTS cust_deleted_at TIMESTAMPTZ;
+
+CREATE TABLE IF NOT EXISTS legacy_sync_status (
+    table_name           TEXT        PRIMARY KEY,
+    last_processed_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    rows_ingested        BIGINT      NOT NULL DEFAULT 0,
+    rows_skipped         BIGINT      NOT NULL DEFAULT 0,
+    last_error           TEXT,
+    last_error_at        TIMESTAMPTZ,
+    consecutive_failures INT         NOT NULL DEFAULT 0
+);
+
+INSERT INTO legacy_sync_status (table_name)
+VALUES
+    ('HT_Customers'),
+    ('HT_Rooms'),
+    ('HT_Room_Status'),
+    ('HT_Book_H'),
+    ('HT_Book_Ds'),
+    ('HT_Book_Date'),
+    ('HT_CheckIn_H'),
+    ('HT_CheckIn_Ds'),
+    ('HT_CheckIn_Pay'),
+    ('HT_Receipt_H')
+ON CONFLICT (table_name) DO NOTHING;
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('017', '017_legacy_sync_status.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
 -- Initialization complete
 -- =============================================================================

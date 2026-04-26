@@ -5,6 +5,67 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.43.0] - 2026-04-26
+
+### Added
+
+- **Phase 5.1 — Change Tracking watcher skeleton.** First sub-phase of
+  the MSSQL→PG sync half of the decommission boundary
+  (`docs/architecture.md` §3.6d, §3.7, §4d-tris, §10 #8). Lands the
+  scaffolding the 5.2+ per-table mappers will plug into without changing
+  any existing flow:
+  - **New binary `bin/sync.rs`** — long-running CT watcher modeled on
+    `bin/writeback.rs`. Honours `LEGACY_SYNC_ENABLED` (intentional
+    disable exits 0, not 1, so Docker `restart: unless-stopped` doesn't
+    loop). Parses `LEGACY_SYNC_SHADOW_MODE`, `LEGACY_SYNC_TABLE_ALLOWLIST`,
+    `CT_POLL_INTERVAL_MS` (default 1000ms). Verifies the legacy schema
+    fingerprint, surfaces drift to Slack, sleeps 60s before exit to
+    throttle Docker restart cadence. Per-mapper panic isolation via
+    `tokio::spawn`, SIGTERM drains the in-flight tick. Per-poll
+    `MIN_VALID_VERSION` retention check refuses to advance past CT
+    cleanup and Slack-alerts ops with the recovery path. Ships 10
+    `NoopMapper`s in 5.1 — real mappers swap in one-by-one in 5.2+.
+  - **New module `src/sync/`** — `MssqlChangeMapper` async-trait + the
+    `NoopMapper` placeholder, `ChangeOp` typed wrapper around CT's
+    `'I'`/`'U'`/`'D'` `SYS_CHANGE_OPERATION` codes,
+    `watermark::{read_last_seen, advance}` against `legacy_ct_state`,
+    and a `SyncError` enum covering sqlx/tiberius/bb8 + a typed
+    `RetentionOverflow` variant for the CT-cleanup path.
+  - **Loop-prevention chokepoint.** `db::mssql_session::set_context_info`
+    issues `SET CONTEXT_INFO 0x4E48` ("NH" = New Hotel) on the writeback
+    session. SQL Server CT surfaces it as `SYS_CHANGE_CONTEXT`; the
+    watcher's `CHANGETABLE` SELECT filters those rows out. Wired as the
+    first statement of `writeback::dispatcher::dispatch` — the single
+    entry point through which every recipe runs. Belt-and-suspenders:
+    5.2+ mappers will be idempotent UPSERTs so a missed tag costs at
+    most one extra cycle.
+  - **Per-table observability table `legacy_sync_status`** (migration
+    017) — pre-seeded for the 10 CT-enabled tables (`HT_Customers`,
+    `HT_Rooms`, `HT_Room_Status`, `HT_Book_H`, `HT_Book_Ds`,
+    `HT_Book_Date`, `HT_CheckIn_H`, `HT_CheckIn_Ds`, `HT_CheckIn_Pay`,
+    `HT_Receipt_H`). Rows ingested / skipped / last error / consecutive
+    failure count so operators can spot a wedged mapper without
+    log-tailing. Same migration adds `ht_customers.cust_deleted_at` for
+    the upcoming HT_Customers `D` (delete) mapper in 5.2.
+  - **Tests** — exhaustive unit coverage of the new code: `ChangeOp`
+    parsing (I/U/D recognised, unknown rejected, char round-trip),
+    allowlist parsing (none/blank/comma/whitespace), mapper-builder
+    filtering, `CT_ENABLED_TABLES` ↔ migration-017 seed parity,
+    structural assertion that `dispatch()` calls `set_context_info`
+    BEFORE the recipe `match`, structural assertion that
+    `count_ct_rows` filters `SYS_CHANGE_CONTEXT <> 0x4E48`. Integration
+    test `tests/test_sync_watermark.rs` exercises the read/advance
+    round-trip against a live PG.
+
+  Phase 5.1 is intentionally behavior-preserving: every entry in the
+  watcher's mapper list is a `NoopMapper`, the watermark is left
+  un-advanced (commented-out with a 5.2 TODO so we don't silently skip
+  the rows the real mappers will need), and no `docker-compose.yml`
+  service block is wired (5.5). The chokepoint is the only code change
+  that touches an existing runtime path, and its only effect on the
+  legacy DB is one extra `SET CONTEXT_INFO 0x4E48` statement per
+  writeback session.
+
 ## [2.42.0] - 2026-04-26
 
 ### Changed

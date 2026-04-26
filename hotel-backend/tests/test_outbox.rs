@@ -47,6 +47,10 @@ fn sample_create_booking(booking_id: Uuid, customer_id: Uuid) -> WritebackIntent
             room_type: "TST".into(),
             price: Money::from_satang(123_45),
             nights: 1,
+            // deposit was added in v2.23.0 (CreateBookingPayload.deposit).
+            // Existing fixture predates that change — defaulting to zero
+            // preserves the prior test semantics.
+            deposit: Money::ZERO,
             created_by: "outbox_test".into(),
             notes: Some("TEST_outbox row — safe to delete".into()),
         },

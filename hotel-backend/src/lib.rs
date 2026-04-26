@@ -20,5 +20,6 @@ pub mod repository;
 pub mod routes;
 pub mod scheduler;
 pub mod service;
+pub mod sync;
 pub mod utils;
 pub mod writeback;
