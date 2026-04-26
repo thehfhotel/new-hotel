@@ -40,6 +40,16 @@ services:
         condition: service_healthy
     networks:
       - hotel-network
+    healthcheck:
+      # `wget --spider` returns non-zero on connection refused / non-2xx.
+      # node:alpine ships wget; no extra package needed. Hitting the
+      # root path is enough to confirm Next.js bound the port and is
+      # serving — a deeper API probe would couple us to backend health.
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:3003 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
 
   backend:
@@ -112,7 +122,11 @@ services:
         condition: service_healthy
     networks:
       - hotel-network
-    restart: unless-stopped
+    # `on-failure:5` instead of `unless-stopped` so the binary's clean
+    # `Ok(0)` exit when WRITEBACK_ENABLED=false does NOT trigger the
+    # restart-loop (Docker treats exit 0 as expected under on-failure;
+    # the `:5` cap protects against a genuine hot-loop crash).
+    restart: on-failure:5
 
   # CT watcher worker — Phase 5.5 production cutover. Polls MSSQL Change
   # Tracking on the 10 CT-enabled legacy tables, projects each change into
@@ -172,7 +186,10 @@ services:
         condition: service_healthy
     networks:
       - hotel-network
-    restart: unless-stopped
+    # `on-failure:5` instead of `unless-stopped` so the binary's clean
+    # `Ok(0)` exit when LEGACY_SYNC_ENABLED=false (the default) does NOT
+    # trigger the restart-loop. Same reasoning as the writeback service.
+    restart: on-failure:5
 
   # One-shot backfill: legacy MSSQL HT_Rooms + HT_SET_RoomType -> PG.
   # Same image as `backend`, different entrypoint. Lives under the `backfill`

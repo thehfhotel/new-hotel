@@ -66,10 +66,19 @@ VALUES ('000', '000_baseline.sql', 'migrate-script')
 ON CONFLICT (version) DO NOTHING;
 SQL
 
-# Step 3: Get list of already-applied versions
-APPLIED_VERSIONS=$(run_sql -c "SELECT version FROM schema_migrations ORDER BY version;" 2>/dev/null || echo "")
+# Step 3: Get list of already-applied versions into an associative array.
+# Set-membership lookup avoids the substring-match footgun of `grep -q`
+# (e.g. version "1" would falsely match "10" with the previous code).
+declare -A APPLIED_SET=()
+while IFS= read -r v; do
+    [ -n "$v" ] && APPLIED_SET["$v"]=1
+done < <(run_sql -c "SELECT version FROM schema_migrations ORDER BY version;" 2>/dev/null || true)
 
-# Step 4: Find pending migrations
+# Step 4: Find pending migrations.
+# Expected naming: `NNN_*.sql` where NNN is up to 3 digits, zero-padded.
+# The schema_migrations.version column is VARCHAR(10) so we compare on
+# the exact zero-padded prefix (e.g. "001", "017") — never the stripped
+# integer form.
 if [ ! -d "$MIGRATIONS_DIR" ]; then
     log_warn "Migrations directory '$MIGRATIONS_DIR' not found. Nothing to do."
     exit 0
@@ -78,12 +87,15 @@ fi
 PENDING=()
 for migration_file in $(ls "$MIGRATIONS_DIR"/*.sql 2>/dev/null | sort); do
     filename=$(basename "$migration_file")
-    # Extract version number (everything before the first underscore)
-    version=$(echo "$filename" | sed 's/_.*//' | sed 's/^0*//' )
-    # Keep leading zeros for comparison
-    version_padded=$(echo "$filename" | sed 's/_.*//')
+    # Extract version number (everything before the first underscore).
+    # Reject malformed names early so a typo can't be silently skipped.
+    if [[ ! "$filename" =~ ^([0-9]{1,3})_.+\.sql$ ]]; then
+        log_error "Skipping malformed migration filename: $filename (expected NNN_*.sql)"
+        exit 1
+    fi
+    version_padded="${BASH_REMATCH[1]}"
 
-    if echo "$APPLIED_VERSIONS" | grep -q "^${version_padded}$"; then
+    if [ -n "${APPLIED_SET[$version_padded]:-}" ]; then
         continue
     fi
     PENDING+=("$migration_file")
