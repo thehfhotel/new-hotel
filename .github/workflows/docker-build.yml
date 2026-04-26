@@ -292,6 +292,14 @@ jobs:
   deploy:
     runs-on: [self-hosted, linux, deploy]
     needs: [changes, test-frontend, test-backend, build-frontend, build-backend]
+    # Serialise deploys to evergreen so two back-to-back master pushes can
+    # never have their `docker compose up` interleave. cancel-in-progress
+    # is OFF because the in-flight deploy already pulled images + is
+    # mid-migration; aborting it leaves PG and the backend container in
+    # mismatched-schema state.
+    concurrency:
+      group: deploy-prod-evergreen
+      cancel-in-progress: false
     if: |
       always() &&
       (needs.test-frontend.result == 'success' || needs.test-frontend.result == 'skipped') &&
@@ -364,39 +372,56 @@ jobs:
           } > .env
           chmod 600 .env
 
-          # Pull latest images and start all services
+          # ----- container-state helpers ----------------------------------
+          # `wait_healthy` polls a container's healthcheck until it reports
+          # "healthy" (or, for services without a healthcheck, until the
+          # container reaches "running"). Replaces the previous mix of
+          # fixed `sleep 3/5/5` waits, which were both too long on the happy
+          # path and too short under load.
+          wait_healthy() {
+            local container=$1
+            local timeout=${2:-60}
+            local elapsed=0
+            while [ $elapsed -lt $timeout ]; do
+              local health
+              health=$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container" 2>/dev/null || echo "not_found")
+              case "$health" in
+                healthy|running) return 0 ;;
+                not_found) ;;
+                *) ;;
+              esac
+              sleep 2
+              elapsed=$((elapsed + 2))
+            done
+            echo "::error::$container did not become healthy within ${timeout}s (last state: $health)"
+            docker logs "$container" --tail 50 2>&1 || true
+            return 1
+          }
+
+          # ----- bring up the database FIRST and run migrations ----------
+          # New ordering (B2 of the post-Phase-5.5 audit):
+          #   pull -> up -d newdb -> migrate -> up -d (backend + web)
+          # Migrations run against the EXISTING backend so the schema
+          # change is in place before the new backend image starts.
+          # Operator note: migrations that are NOT backwards-compatible
+          # with the previously-deployed backend code MUST be split into
+          # an expand/contract sequence, OR the operator must scale
+          # backend to 0 first, migrate, then redeploy. This step does
+          # not auto-handle that case.
           docker compose pull
-          docker compose up -d
+          docker compose up -d newdb
 
           echo "Waiting for database to be healthy..."
+          wait_healthy new-hotel-db 120
 
-          # Wait for database container to be healthy (max 2 minutes)
-          TIMEOUT=120
-          ELAPSED=0
-          while [ $ELAPSED -lt $TIMEOUT ]; do
-            HEALTH=$(docker inspect --format='{{.State.Health.Status}}' new-hotel-db 2>/dev/null || echo "not_found")
-            if [ "$HEALTH" = "healthy" ]; then
-              echo "Database is healthy!"
-              break
-            fi
-            echo "Database status: $HEALTH (waiting...)"
-            sleep 5
-            ELAPSED=$((ELAPSED + 5))
-          done
-
-          if [ "$HEALTH" != "healthy" ]; then
-            echo "ERROR: Database did not become healthy within $TIMEOUT seconds"
-            docker logs new-hotel-db --tail 50
-            exit 1
-          fi
-
-          # Run database migrations
-          echo "Running database migrations..."
+          echo "Running database migrations against running newdb..."
           ./scripts/migrate.sh
 
-          # Restart backend to pick up schema changes
-          docker compose restart backend
-          sleep 5
+          # ----- bring up the rest of the stack --------------------------
+          docker compose up -d
+
+          echo "Waiting for backend healthcheck..."
+          wait_healthy new-hotel-production-backend-1 90
 
           # Force-recreate the writeback worker too. It lives under
           # `profiles: [legacy]` so plain `docker compose up -d` (above)
@@ -407,7 +432,6 @@ jobs:
           # produced bookings missing back-population.
           docker compose --profile legacy pull writeback
           docker compose --profile legacy up -d --force-recreate writeback
-          sleep 3
 
           # Force-recreate the CT-watcher worker (Phase 5.5). Same image as
           # backend + writeback, lives under `profiles: [legacy]`, ships
@@ -418,21 +442,19 @@ jobs:
           # see docs/runbook-sync.md.
           docker compose --profile legacy pull sync
           docker compose --profile legacy up -d --force-recreate sync
-          sleep 3
 
           echo "Deployment complete!"
           docker compose ps
 
-          # Verify backend is running (not crash-looping)
-          sleep 5
-          BACKEND_STATUS=$(docker inspect --format='{{.State.Status}}' new-hotel-production-backend-1 2>/dev/null || echo "not_found")
-          if [ "$BACKEND_STATUS" != "running" ]; then
-            echo "WARNING: Backend container is not running (status: $BACKEND_STATUS)"
-            echo "--- Backend logs (last 50 lines) ---"
+          # Backend health re-check via the actual healthcheck (not just
+          # State.Status). State.Status=running can be true mid-crash-loop;
+          # State.Health.Status=healthy means it's actually serving HTTP.
+          if ! wait_healthy new-hotel-production-backend-1 30; then
+            echo "::error::Backend container failed post-deploy healthcheck"
             docker logs new-hotel-production-backend-1 --tail 50
             exit 1
           fi
-          echo "Backend is running."
+          echo "Backend is healthy."
 
           # Verify writeback worker is running. It refuses to start on
           # legacy-MSSQL schema fingerprint mismatch (per writeback/fingerprint.rs)
@@ -478,9 +500,18 @@ jobs:
 
   deploy-hfville:
     runs-on: [self-hosted, linux, deploy]
-    needs: [changes, test-backend, build-ville-sync]
+    # `deploy` must succeed first so the canonical HF Hotel newdb is up to
+    # date before the HF Ville push target accepts new ville-schema rows
+    # (the ville-sync push goes straight at newdb on 10.10.10.4:5441).
+    needs: [changes, test-backend, build-ville-sync, deploy]
+    # Serialise hfville deploys (parallel pushes would race on jump box
+    # docker daemon + the same .env file).
+    concurrency:
+      group: deploy-hfville
+      cancel-in-progress: false
     if: |
       always() &&
+      needs.deploy.result == 'success' &&
       (needs.test-backend.result == 'success' || needs.test-backend.result == 'skipped') &&
       (needs.build-ville-sync.result == 'success' || (needs.changes.outputs.hfville == 'true' && needs.changes.outputs.backend != 'true'))
     steps:

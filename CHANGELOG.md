@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.45.2] - 2026-04-26
+
+### Fixed
+
+- **Deploy ordering, concurrency, healthcheck polling, restart policies
+  (Batch B of post-Phase-5.5 audit).**
+  - **Concurrency guards** on both deploy jobs — `deploy-prod-evergreen`
+    and `deploy-hfville` groups, `cancel-in-progress: false`. Two
+    back-to-back master pushes can no longer interleave their
+    `docker compose up` (the cancel-mid-flight case left
+    `migrate.sh` half-applied + backend on stale schema).
+  - **Migrations now run BEFORE the new backend image starts**
+    (`pull -> up -d newdb -> migrate -> up -d`). Previously:
+    `pull -> up -d (full stack) -> migrate -> restart backend`, which
+    started the new backend against the OLD schema for ~10s. Operator
+    note: backwards-incompatible migrations still need expand/contract
+    or a manual `scale backend=0` first — flagged in the deploy step
+    comment.
+  - **`wait_healthy` polling helper** replaces the fixed `sleep 3/5/5`
+    waits. Polls `State.Health.Status` (or falls back to `State.Status`
+    for services without a healthcheck) every 2s up to a per-call
+    timeout, and dumps the last 50 log lines on timeout.
+  - **Backend post-deploy probe** now uses `State.Health.Status`
+    (actual healthcheck) instead of `State.Status` (which can be
+    `running` mid-crash-loop). Same probe is invoked twice — once
+    after `up -d`, once after the writeback/sync recreation — so a
+    crash-loop introduced by the worker recreations is also caught.
+  - **`deploy-hfville` now `needs: [deploy]`** with
+    `needs.deploy.result == 'success'` in the `if:`. Stops a half-broken
+    HF Hotel deploy from cascading into a HF Ville push that would
+    write to a stale-schema target.
+  - **`web` service healthcheck** added (`wget --spider http://localhost:3003`).
+    The deploy job's wait_healthy on the backend container now has a
+    parallel for the frontend, and `depends_on: backend service_healthy`
+    in compose chains correctly.
+  - **`writeback` and `sync` restart policy** changed from
+    `unless-stopped` to `on-failure:5`. The clean `Ok(0)` exit when
+    `WRITEBACK_ENABLED=false` / `LEGACY_SYNC_ENABLED=false` no longer
+    triggers the respawn-loop (Docker treats exit 0 as expected under
+    on-failure; the `:5` cap still protects against a real hot-loop).
+  - **Migration version-comparison hardening** in `scripts/migrate.sh`.
+    The previous `grep -q "^${version_padded}$"` would substring-match
+    on a multi-line input under some `grep` versions and failed silently
+    on malformed filenames. Replaced with:
+    1. Strict regex on filename (`^([0-9]{1,3})_.+\.sql$` — anything
+       else aborts the script with a clear error).
+    2. Explicit set-membership lookup against an associative array
+       (`APPLIED_SET[$version_padded]`). Documented expected naming.
+  - **Tests:** `scripts/test-migrate-parse.sh` covers 16 cases against
+    the parser logic without needing a live PostgreSQL — runs in <1s.
+
 ## [2.45.1] - 2026-04-26
 
 ### Security
