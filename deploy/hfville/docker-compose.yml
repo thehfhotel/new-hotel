@@ -7,7 +7,9 @@ services:
     environment:
       - POSTGRES_DB=hfville
       - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=***REMOVED***
+      # Required: HFVILLE_PG_PASSWORD must come from .env (deploy pipeline writes it).
+      # ${VAR:?msg} fails fast at compose-up if the value is unset/empty.
+      - POSTGRES_PASSWORD=${HFVILLE_PG_PASSWORD:?HFVILLE_PG_PASSWORD is required}
       - PGPORT=5440
     ports:
       - "5440:5440"
@@ -33,12 +35,12 @@ services:
       - MSSQL_SERVER=192.168.11.51
       - MSSQL_DATABASE=hotel
       - MSSQL_USER=sa
-      - MSSQL_PASSWORD=***REMOVED***
+      - MSSQL_PASSWORD=${HFVILLE_MSSQL_PASSWORD:?HFVILLE_MSSQL_PASSWORD is required}
       - PG_SERVER=127.0.0.1
       - PG_PORT=5440
       - PG_DATABASE=hfville
       - PG_USER=postgres
-      - PG_PASSWORD=***REMOVED***
+      - PG_PASSWORD=${HFVILLE_PG_PASSWORD:?HFVILLE_PG_PASSWORD is required}
       - SYNC_INTERVAL_SECS=90
       - RUST_LOG=ville_sync=info
       # Push to production newdb (ville schema) via WireGuard
@@ -46,7 +48,9 @@ services:
       - PUSH_PG_PORT=5441
       - PUSH_PG_NAME=hotelnew
       - PUSH_PG_USER=postgres
-      - PUSH_PG_PASSWORD=***REMOVED***
+      # Push target is the production HF Hotel newdb — its password lives
+      # under the existing POSTGRES_PASSWORD secret (NOT a separate one).
+      - PUSH_PG_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
     depends_on:
       hfville-db:
         condition: service_healthy
