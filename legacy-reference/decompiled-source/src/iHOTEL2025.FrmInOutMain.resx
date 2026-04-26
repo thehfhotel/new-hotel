@@ -1,0 +1,30 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <xsd:schema id="root" xmlns="" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:msdata="urn:schemas-microsoft-com:xml-msdata">
+    <xsd:element name="root" msdata:IsDataSet="true">
+      <xsd:complexType>
+        <xsd:choice maxOccurs="unbounded">
+          <xsd:element name="data">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" />
+                <xsd:element name="comment" type="xsd:string" minOccurs="0" msdata:Ordinal="2" />
+              </xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" msdata:Ordinal="1" />
+              <xsd:attribute name="type" type="xsd:string" msdata:Ordinal="3" />
+              <xsd:attribute name="mimetype" type="xsd:string" msdata:Ordinal="4" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="resheader">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" />
+              </xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" use="required" />
+            </xsd:complexType>
+          </xsd:element>
+        </xsd:choice>
+      </xsd:complexType>
+    </xsd:element>
+  </xsd:schema>
+<resheader name="resmimetype"><value>text/microsoft-resx</value></resheader><resheader name="version"><value>1.3</value></resheader><resheader name="reader"><value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader><resheader name="writer"><value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader><data name="ออกใบFolioแบบราชการToolStripMenuItem.Image" mimetype="application/x-microsoft.net.object.binary.base64"><value>AAEAAAD/////AQAAAAAAAAAMAgAAAFFTeXN0ZW0uRHJhd2luZywgVmVyc2lvbj0yLjAuMC4wLCBDdWx0dXJlPW5ldXRyYWwsIFB1YmxpY0tleVRva2VuPWIwM2Y1ZjdmMTFkNTBhM2EFAQAAABVTeXN0ZW0uRHJhd2luZy5CaXRtYXABAAAABERhdGEHAgIAAAAJAwAAAA8DAAAApwEAAAKJUE5HDQoaCgAAAA1JSERSAAAAEAAAABAIBgAAAB/z/2EAAAAEZ0FNQQAAr8g3BYrpAAAAGXRFWHRTb2Z0d2FyZQBBZG9iZSBJbWFnZVJlYWR5ccllPAAAATlJREFUOE+Nk8GqgkAUhnu4XqF36hVCUAIXemkhYQsRiSAQokUrV7lp0dKKJFG0/84/3YmG0UsHPjx6vvlnFuMIgGS/368PhwOyLMPxeMTpdML5fJawF3OhvdxP3s1utxOP4WLAbDZj2x+Qpimez+cgfycwQt7NdrtF13WDLJdLuVhhBGw2G7Rt+xV0jYAkSdA0DcY/4zeTeCL5/EaHrhEQRRHqupbStJhKVIB654wOXSNgtVqhqirEcfwvdOgaAUEQ4PF4SElVnucSVZzRoStKD1gsFijLUtutDzp0jQDP83C/36Wkqu8EdOiK0gNc18XtdtN264MOXSNgPp/jer1KSVXfCejQFaUH2LaNy+Wi7dYHHbpGgGVZKIriK+gaAeJ+rx3Hge/7CMNQ3jb+H4Q9v3FGh+5rHUa/ny5JCffNSKsAAAAASUVORK5CYIIL</value></data><data name="ใบกำกบภาษToolStripMenuItem.Image" mimetype="application/x-microsoft.net.object.binary.base64"><value>AAEAAAD/////AQAAAAAAAAAMAgAAAFFTeXN0ZW0uRHJhd2luZywgVmVyc2lvbj0yLjAuMC4wLCBDdWx0dXJlPW5ldXRyYWwsIFB1YmxpY0tleVRva2VuPWIwM2Y1ZjdmMTFkNTBhM2EFAQAAABVTeXN0ZW0uRHJhd2luZy5CaXRtYXABAAAABERhdGEHAgIAAAAJAwAAAA8DAAAAkwIAAAKJUE5HDQoaCgAAAA1JSERSAAAAEAAAABAIBgAAAB/z/2EAAAAEZ0FNQQAAsY8L/GEFAAAAGXRFWHRTb2Z0d2FyZQBBZG9iZSBJbWFnZVJlYWR5ccllPAAAAiVJREFUOE+lk81PE1EUxec/0oTEhQvdGSsEaAPFuMC4MLpRd5IUBUuRTjG47ZJNbRSUtAVqbStJU/yIUj5HDdEgsY1NWu10OqW0yMzx3tdCWsGF8SYnM/fcmd/MmfdGAvBfEmUff/HJ5n4O21gYfOwcnUfHyBzajxH7XTTv9UTUQ0DnWBRKCVA0E5bhEPnAnlnXLzpnHfQsLoZQSZJ3Qsb62wSuXbJhMJnHubsBVA3Av1TAk2UVT9eKQtMrRTxOFYRfI0iHa64OoGrrdkfxYK2G4cU8zhOgtAc8W1URUjScGZiGw7+CAV8KgXWCka/TK3GUA4Bk9cRx6o4Pzlc/YBkKoFA1EaSLgxsaZj/oBCohSGIA+2qtCeB9KEN5l8SN/h7xBpahIHI7Jmbp5ny5EbhRubIh/FzlmAiT24AjlhaArG4g/JG+KtWoy4mFhZeIx6KiZz9L4GaAZJXjOD3ox+35LVqFIDIlA7HNOoBvZIBrxCl69jN6E+AwwuVe3JrZxIV7IWS0fSQ+6yhUWiOouyYSX3Qxb40gR+H7Clx/tCoAac3Am+0yFrfKSDaJe/bTtF9aI9AqnHVM4erke7Q7GbCP5XQFqW87WGoS9+zz/EiEm1f60O99LbZrpmRCyVax8X33iNjneUsEK0WYoggXJ+Jii/6kdeaLOMqfYp/n3fcbW5nLLoeLdk8EfeMR/knEkJ/wN/G8xx3mZaoDqE6Q2v5RJwFIvwGm9N/4tVSQVgAAAABJRU5ErkJgggs=</value></data><data name="พมพใบลงทะเบยนToolStripMenuItem.Image" mimetype="application/x-microsoft.net.object.binary.base64"><value>AAEAAAD/////AQAAAAAAAAAMAgAAAFFTeXN0ZW0uRHJhd2luZywgVmVyc2lvbj0yLjAuMC4wLCBDdWx0dXJlPW5ldXRyYWwsIFB1YmxpY0tleVRva2VuPWIwM2Y1ZjdmMTFkNTBhM2EFAQAAABVTeXN0ZW0uRHJhd2luZy5CaXRtYXABAAAABERhdGEHAgIAAAAJAwAAAA8DAAAAJwIAAAKJUE5HDQoaCgAAAA1JSERSAAAAEAAAABAIBgAAAB/z/2EAAAAEZ0FNQQAAsY8L/GEFAAAACXBIWXMAAAsSAAALEgHS3X78AAAAHHRFWHRTb2Z0d2FyZQBBZG9iZSBGaXJld29ya3MgQ1MzmNZGAwAAAaFJREFUOE+NkkFLAlEUhYf6G/2B2g6ZpWFUioQZYUEU7QpaRNAPcBW4aFEroSBIXGdBJFnmKC4UNwpCKrhxJaIGMiiOgtzeueVQiDgHDvcN99xv3nszEhFJgcB9Lhb7oHGORt8pEnmlcPiFFCUWbzabHkmSpjDLAIT6/f5Yt9ttqtfrIkqUTCYFLJIExDBAVVWqVqsMgABRFCUulsZ3UKvVeHgoHEfIGKDb7VKr1WIIdoLj4E4MA3q9HkOwExwHFRc7FjAYDNA0Ij8DxGckTdMolUqxoWfVNNGQDuh0OrohuSjRZ3/zn2+e1kiW5Z8q+pAOwCUlEgk2hIAvuMoD14/rlO65yWqb52eHyzQKaDQa7Eqlwg0ELL8Drj0zvWluOjy38POxd3kUgM8j/jAKhULcQODk0sYDqA/aFl2lnWTfXuA6AsCb4Xw+zw0ELlJOcuyaud5+uclzZiHn/iJXOTfNOR1QLpcpm82yIQQ2jpbIIQZQD3wrvB5a9s5wTgcUCgXKZDJsCAF5Z1a39XSO7GLwr4OhOx2QA2ToUqnIkMki/zcXKyraBKNU1gAAAABJRU5ErkJgggs=</value></data><data name="ออกใบFolioแบบธรรมดาToolStripMenuItem.Image" mimetype="application/x-microsoft.net.object.binary.base64"><value>AAEAAAD/////AQAAAAAAAAAMAgAAAFFTeXN0ZW0uRHJhd2luZywgVmVyc2lvbj0yLjAuMC4wLCBDdWx0dXJlPW5ldXRyYWwsIFB1YmxpY0tleVRva2VuPWIwM2Y1ZjdmMTFkNTBhM2EFAQAAABVTeXN0ZW0uRHJhd2luZy5CaXRtYXABAAAABERhdGEHAgIAAAAJAwAAAA8DAAAAYwEAAAKJUE5HDQoaCgAAAA1JSERSAAAAEAAAABAIBgAAAB/z/2EAAAAgY0hSTQAAeiUAAICDAAD5/wAAgOkAAHUwAADqYAAAOpgAABdvkl/FRgAAAAlwSFlzAAALEwAACxMBAJqcGAAAAOlJREFUOE+dkDsKg0AURVO6hJTZXuq0Nunci2W2kG0oWihEUcG/or7MfYmD8TvkwuGNeOfAvBMRMYZhXAWPNUzTFJVPb448oCjmaiDYksjDkWAy9wX354uZZhQgc4myYI6IumCeb3dfMAwD9X3PcwTfiJKgbdsfmqahqqpQUROgDOq65pllGaVpioqaABfyPOcZxzGFYUhBEKCyLcA7R0GSJBRFEV/yfZ/xPI93sSnouk4KUHZdl2zbJsdxyLIsPmMXmwIxeWF4c1mWVBSFBN+7S9R1/YYfKqC7EIhogrPgcgA62kLwH3R6A7e+E6aYjPBUAAAAAElFTkSuQmCCCw==</value></data></root>
