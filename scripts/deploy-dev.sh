@@ -43,6 +43,13 @@ for arg in "$@"; do
     esac
 done
 
+# --backend-only + --writeback-only would silently restart neither —
+# guard against the foot-gun.
+if [[ "$RESTART_BACKEND" == "0" && "$RESTART_WRITEBACK" == "0" ]]; then
+    echo "ERROR: --backend-only and --writeback-only are mutually exclusive (each disables the OTHER service)." >&2
+    exit 2
+fi
+
 if [[ "$SKIP_RSYNC" == "0" ]]; then
     echo "==> Rsyncing source to evergreen ($REMOTE_BUILD_DIR)..."
     ssh "$SSH_HOST" "mkdir -p $REMOTE_BUILD_DIR"
