@@ -12,8 +12,11 @@ pub type DbPool = Pool<ConnectionManager>;
 /// Create a new database connection pool
 ///
 /// Connects to SQL Server using the provided configuration.
-/// Pool settings match the Node.js implementation:
-/// - max connections: 10 (configurable via DB_POOL_MAX)
+/// Pool settings:
+/// - max connections: 20 (configurable via `MSSQL_POOL_MAX_SIZE`,
+///   legacy `DB_POOL_MAX` still honored). Sized for the shared
+///   writeback + sync + ville-sync workload — see
+///   `DbConfig::from_env`.
 /// - encryption: disabled (matches encrypt: false in Node.js)
 /// - trust_cert: true (matches trustServerCertificate in Node.js)
 pub async fn create_pool(config: &DbConfig) -> Result<DbPool, Box<dyn std::error::Error>> {

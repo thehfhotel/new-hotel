@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.49.2] - 2026-04-26
+
+### Changed
+
+- **Phase 5 sync — bump MSSQL pool to 20 + throttle CT retention check
+  30s → 5min.** Operational tuning to silence "Timed out in bb8"
+  warnings observed on the hotter mappers (HT_CheckIn_H, HT_CheckIn_Ds,
+  HT_CheckIn_Pay, HT_Receipt_H — the ones whose mappers also do
+  parent-aggregate re-loads). Two complementary changes:
+  - **`MSSQL_POOL_MAX_SIZE` env var (default 20).** Was previously
+    `DB_POOL_MAX` (default 10). The bb8-tiberius pool is shared by
+    writeback + sync + ville-sync, so doubling the cap gives all three
+    workers headroom. Backward compatible: `DB_POOL_MAX` still honored
+    if set, but the new name is preferred for clarity.
+  - **`LEGACY_SYNC_RETENTION_CHECK_INTERVAL_SECS` env var (default
+    300).** Was effectively firing every poll-tick (1s) per table — 10
+    tables × 1Hz × 1 MSSQL connection each = 10 conn/s of pure
+    safety-net overhead. Throttled to once per 5 min per table inside
+    the watcher's main loop via a per-table `Instant` map.
+    Trade-off: retention overflow is a >48h outage scenario; recovery
+    is operator-driven via Slack alert + manual `--bootstrap`
+    reconcile, so 5-min detection vs 30s detection is operationally
+    equivalent. The 10× reduction in pool pressure removes the bb8
+    timeout noise.
+  - Data-path CT poll cadence (`CT_POLL_INTERVAL_MS=1000`) untouched —
+    latency budget preserved.
+
 ## [2.49.1] - 2026-04-26
 
 ### Fixed
