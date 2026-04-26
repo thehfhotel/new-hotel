@@ -46,15 +46,6 @@ The original app was VB.NET (clues: `Microsoft.VisualBasic.*` imports, `[Accesse
 - **Adding a new writeback flow**: find the Form that performs the action in the legacy app, list its SQL queries, then capture a fresh Extended Events session via `scripts/legacy-spike/run.sh` to validate.
 - **Replacing reports**: see `_REPORTS_INVENTORY.md` — recommends QuestPDF + ZXing.Net.
 
-## Database backup (NOT in repo)
-
-A 2.4 GB backup of the **local-dev** SQL Server Express `db` database is at:
-```
-nut@evergreen:~/legacy-data/db.bak
-```
-
-⚠️ This is a snapshot of a developer-machine `db` database (different from production at `192.168.100.222`). Row counts will be lower and dates older. Mostly useful for offline experiments. Restore with `RESTORE DATABASE`.
-
 ## Critical landmines (also in `_COMPAT_CHEATSHEET.md`)
 
 1. **Thai-text encoding**: text columns are `varchar Thai_CI_AS` (Windows-874/TIS-620). Sending `N'…'` Unicode literals corrupts Thai → `?`. Use plain `varchar` parameters.

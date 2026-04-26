@@ -34,11 +34,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/legacy-spike/`** — it's based on live Extended Events captures of
   the running app; this folder is inferred from decompiled source.
 
-  Companion 2.4 GB SQL Server backup of the local-dev `db` database lives
-  at `nut@evergreen:~/legacy-data/db.bak` (NOT in repo; it's a stale
-  developer-machine snapshot, different from production).
-
-
 ## [2.41.0] - 2026-04-25
 
 ### Fixed
