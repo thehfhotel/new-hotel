@@ -9,6 +9,27 @@
 # Usage:
 #   ./scripts/migrate.sh              # Run from project root
 #   DEPLOY_DIR=/path ./scripts/migrate.sh  # Run from deploy directory
+#
+# ## Per-migration pragmas
+#
+# Migration files MAY declare a header pragma to opt out of the default
+# per-migration BEGIN/COMMIT atomic wrap. The pragma is a SQL comment that
+# must appear in the first 20 lines of the file:
+#
+#     -- @transactional false
+#
+# When detected, the runner streams the file body directly to psql with
+# `-f` instead of wrapping it in BEGIN/COMMIT. This is required for
+# statements that PostgreSQL forbids inside a transaction block, e.g.
+# `CREATE INDEX CONCURRENTLY`, `VACUUM`, `REINDEX CONCURRENTLY`,
+# `ALTER TYPE ... ADD VALUE` (in older versions).
+#
+# IMPORTANT: a non-transactional migration that fails mid-way leaves the
+# DB in a partially-applied state. The schema_migrations row is recorded
+# in a SEPARATE follow-up transaction only after the file completes
+# successfully — so a partial failure will be re-attempted on the next
+# run, not silently skipped. The migration body is responsible for being
+# idempotent (e.g. `CREATE INDEX CONCURRENTLY IF NOT EXISTS`).
 # =============================================================================
 
 set -euo pipefail
@@ -126,31 +147,80 @@ fi
 BACKUP_SIZE=$(du -h "$BACKUP_FILE" | cut -f1)
 log_info "Backup complete ($BACKUP_SIZE)."
 
-# Step 6: Apply each pending migration in a transaction
+# Helper: detect `-- @transactional false` pragma in the first 20 lines of a
+# migration file. Case-insensitive, tolerates extra whitespace. Echoes "false"
+# when the pragma opts out of the default BEGIN/COMMIT wrap, "true" otherwise.
+detect_transactional_pragma() {
+    local file="$1"
+    # Grep -E with case-insensitive (-i) match against:
+    #   ^\s*--\s*@transactional\s+false\s*$
+    # Look only at the first 20 lines (head) so a stray comment lower in the
+    # file can't accidentally flip the pragma.
+    if head -n 20 "$file" | grep -Eiq '^[[:space:]]*--[[:space:]]*@transactional[[:space:]]+false[[:space:]]*$'; then
+        echo "false"
+    else
+        echo "true"
+    fi
+}
+
+# Step 6: Apply each pending migration (transactionally by default)
 APPLIED_COUNT=0
 for migration_file in "${PENDING[@]}"; do
     filename=$(basename "$migration_file")
     version=$(echo "$filename" | sed 's/_.*//')
     checksum=$(sha256sum "$migration_file" | cut -d' ' -f1)
+    transactional=$(detect_transactional_pragma "$migration_file")
 
-    log_info "Applying: $filename (version $version)..."
+    if [ "$transactional" = "false" ]; then
+        log_info "Applying: $filename (version $version) [non-transactional]..."
 
-    # Wrap migration + tracking insert in a single transaction.
-    # `\set ON_ERROR_STOP on` plus a guarded BEGIN/COMMIT means a failure inside
-    # the migration aborts the transaction, psql exits non-zero, and the
-    # schema_migrations INSERT never runs.
-    if ! {
-        echo "\\set ON_ERROR_STOP on"
-        echo "BEGIN;"
-        cat "$migration_file"
-        echo ""
-        echo "INSERT INTO schema_migrations (version, filename, checksum, applied_by)"
-        echo "VALUES ('${version}', '${filename}', '${checksum}', 'migrate-script');"
-        echo "COMMIT;"
-    } | run_sql 2>&1; then
-        log_error "Migration $filename FAILED. Transaction rolled back."
-        log_error "Backup available at: $BACKUP_FILE"
-        exit 1
+        # Stream the file body directly without BEGIN/COMMIT so statements
+        # like `CREATE INDEX CONCURRENTLY` are allowed. We pipe the body
+        # through psql with `\set ON_ERROR_STOP on` so the FIRST failing
+        # statement aborts and exits non-zero.
+        if ! {
+            echo "\\set ON_ERROR_STOP on"
+            cat "$migration_file"
+        } | run_sql 2>&1; then
+            log_error "Migration $filename FAILED (non-transactional — DB may be partially applied)."
+            log_error "Re-running migrate.sh will retry this migration. Make sure the file is idempotent."
+            log_error "Backup available at: $BACKUP_FILE"
+            exit 1
+        fi
+
+        # Record the migration in a separate, atomic statement — only after
+        # the body succeeded. If THIS step fails the row is missing and a
+        # re-run will attempt the (idempotent) body again.
+        if ! run_sql <<SQL 2>&1
+\set ON_ERROR_STOP on
+INSERT INTO schema_migrations (version, filename, checksum, applied_by)
+VALUES ('${version}', '${filename}', '${checksum}', 'migrate-script');
+SQL
+        then
+            log_error "Migration $filename body applied but schema_migrations INSERT failed."
+            log_error "Manually insert: INSERT INTO schema_migrations (version, filename, checksum, applied_by) VALUES ('${version}', '${filename}', '${checksum}', 'migrate-script');"
+            exit 1
+        fi
+    else
+        log_info "Applying: $filename (version $version)..."
+
+        # Wrap migration + tracking insert in a single transaction.
+        # `\set ON_ERROR_STOP on` plus a guarded BEGIN/COMMIT means a failure inside
+        # the migration aborts the transaction, psql exits non-zero, and the
+        # schema_migrations INSERT never runs.
+        if ! {
+            echo "\\set ON_ERROR_STOP on"
+            echo "BEGIN;"
+            cat "$migration_file"
+            echo ""
+            echo "INSERT INTO schema_migrations (version, filename, checksum, applied_by)"
+            echo "VALUES ('${version}', '${filename}', '${checksum}', 'migrate-script');"
+            echo "COMMIT;"
+        } | run_sql 2>&1; then
+            log_error "Migration $filename FAILED. Transaction rolled back."
+            log_error "Backup available at: $BACKUP_FILE"
+            exit 1
+        fi
     fi
 
     log_info "Applied: $filename"

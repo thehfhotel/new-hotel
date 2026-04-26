@@ -61,6 +61,52 @@ As of v2.14.0, HotelNew schema changes are **automatically applied** by the CI/C
 docker exec -i new-hotel-db psql -U postgres -p 5439 -d hotelnew < migrations/pg/001_description.sql
 ```
 
+#### Per-migration pragmas
+
+Migration files MAY declare a header pragma to opt out of the default
+per-migration `BEGIN`/`COMMIT` atomic wrap. The pragma is a SQL comment
+that must appear in the first 20 lines of the file:
+
+```sql
+-- @transactional false
+```
+
+When detected, `migrate.sh` runs the migration body directly (no
+transaction wrap) so statements like `CREATE INDEX CONCURRENTLY`,
+`VACUUM`, `REINDEX CONCURRENTLY`, and similar
+forbidden-inside-a-transaction operations are allowed.
+
+**Caveat.** A non-transactional migration that fails halfway through
+leaves the database in a partially-applied state. The
+`schema_migrations` row is recorded in a separate follow-up statement
+only after the body succeeds, so a partial failure will be re-attempted
+on the next run rather than silently skipped — but the migration body
+itself MUST be idempotent (e.g. `CREATE INDEX CONCURRENTLY IF NOT
+EXISTS`).
+
+Use the pragma only when the default transactional wrap is genuinely
+incompatible with what the migration needs to do; otherwise leave it
+off and benefit from automatic rollback on failure.
+
+#### Drift check (init-db ↔ migrations/pg/)
+
+Every CI run includes an `init-db-migrations-drift-check` job that
+spins up a throwaway Postgres, runs `init-db/init-hotelnew.sql`, then
+runs `scripts/migrate.sh`. The contract is **zero pending migrations**
+on top of a fresh seed.
+
+If the job fails with `Drift detected: init-db/init-hotelnew.sql is
+out of sync with migrations/pg/.`, you forgot one of:
+
+1. The DDL change in your new migration didn't get mirrored into
+   `init-db/init-hotelnew.sql`.
+2. The `INSERT INTO schema_migrations VALUES ('NNN', ...)` seed row
+   didn't get added to `init-db/init-hotelnew.sql` for the new
+   migration version.
+
+Both are required for fresh deployments to land on the same schema as
+upgraded ones.
+
 #### Schema Migration Tracking
 
 Applied migrations are tracked in the `schema_migrations` table:

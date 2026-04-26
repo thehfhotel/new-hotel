@@ -181,6 +181,94 @@ jobs:
         # CI parity with the production Dockerfile build (also uses --locked).
         run: cargo test --locked
 
+  # init-db / migrations drift check (Batch E of post-Phase-5.5 audit).
+  #
+  # Why this exists: a fresh deployment runs `init-db/init-hotelnew.sql` (the
+  # canonical seed) and then `scripts/migrate.sh` against the same database.
+  # If a developer adds a migration to `migrations/pg/` but forgets to mirror
+  # the change into `init-hotelnew.sql`, the seed lands one schema and migrate
+  # then re-applies the same DDL on top — producing inconsistent schema_migrations
+  # rows on fresh deploys vs. upgrade paths and (worse) silently masking that
+  # the seed file is incomplete.
+  #
+  # The check spins up a throwaway Postgres, applies the init seed, then runs
+  # migrate.sh. The contract is: zero migrations applied on top of the seed.
+  # The migration runner emits "No pending migrations" when it has nothing
+  # to do — we grep for that. Any other outcome fails the job loudly.
+  #
+  # Runs on EVERY push (not just master) so PRs catch drift before merge.
+  init-db-migrations-drift-check:
+    runs-on: ubuntu-latest
+    needs: changes
+    # Only worth running when init-db, migrations, the runner script, OR this
+    # workflow itself was touched. The `deploy` paths-filter already covers
+    # init-db + migrations + migrate.sh; piggyback on it.
+    if: needs.changes.outputs.deploy == 'true'
+    permissions:
+      contents: read
+    services:
+      postgres:
+        # Same digest as the runtime newdb container in docker-compose.yml
+        # (Batch C). Pinning the test runner to the same image ensures the
+        # drift check exercises the exact PostgreSQL version production sees.
+        image: postgres:17-alpine@sha256:c7526c0f6c3f30260a563d7bcf8ad778effac59a44f8ffa86678c35418338609
+        env:
+          POSTGRES_DB: hotelnew
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
+          PGPORT: "5439"
+        ports:
+          - 5439:5439
+        options: >-
+          --name new-hotel-db
+          --health-cmd "pg_isready -U postgres -p 5439"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Apply init-db seed
+        env:
+          PGPASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
+        # ON_ERROR_STOP=1 fails the step on the first SQL error so a broken
+        # seed doesn't masquerade as "drift detected".
+        run: |
+          psql -h localhost -p 5439 -U postgres -d hotelnew \
+            -v ON_ERROR_STOP=1 \
+            -f init-db/init-hotelnew.sql
+
+      - name: Run migrate.sh against seeded database
+        env:
+          # migrate.sh shells `docker exec new-hotel-db ...`. The service
+          # container above is named `new-hotel-db` via `--name`; expose the
+          # same auth env so the inner psql can connect.
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
+          POSTGRES_DB: hotelnew
+          PGPORT: "5439"
+        run: |
+          set -uo pipefail   # NOT -e: we want to inspect the runner's exit code
+          OUTPUT=$(./scripts/migrate.sh 2>&1)
+          STATUS=$?
+          echo "$OUTPUT"
+          echo "----- migrate.sh exit code: $STATUS -----"
+
+          # Contract: a fresh init-db + migrate.sh must apply ZERO migrations.
+          # The runner prints exactly "Database is up to date. No pending
+          # migrations." when the schema_migrations table already lists every
+          # version found in migrations/pg/. Any other terminal state means
+          # init-hotelnew.sql is missing something a migration adds.
+          if [ "$STATUS" -eq 0 ] && echo "$OUTPUT" | grep -q "No pending migrations"; then
+            echo "PASS: init-db/init-hotelnew.sql is in sync with migrations/pg/."
+            exit 0
+          fi
+
+          echo "::error::Drift detected: init-db/init-hotelnew.sql is out of sync with migrations/pg/."
+          echo "::error::Update init-db/init-hotelnew.sql to include the contents of the pending migrations (DDL + matching schema_migrations seed row)."
+          exit 1
+
   build-frontend:
     runs-on: ubuntu-latest
     # Block pushing :latest if frontend tests fail (Batch D of audit).
@@ -318,7 +406,7 @@ jobs:
 
   deploy:
     runs-on: [self-hosted, linux, deploy]
-    needs: [changes, test-frontend, test-backend, build-frontend, build-backend]
+    needs: [changes, test-frontend, test-backend, init-db-migrations-drift-check, build-frontend, build-backend]
     # Least-privilege: the deploy step only needs to pull images from GHCR
     # (read on packages) and read the working tree.
     permissions:
@@ -332,10 +420,16 @@ jobs:
     concurrency:
       group: deploy-prod-evergreen
       cancel-in-progress: false
+    # Gate on the new drift check too (Batch E): if init-db/init-hotelnew.sql
+    # is out of sync with migrations/pg/, we refuse to deploy so the operator
+    # can't accidentally leave production with a half-seeded schema.
+    # `success || skipped` mirrors the test-* jobs — the check is skipped
+    # when no migration / init-db / migrate.sh files changed.
     if: |
       always() &&
       (needs.test-frontend.result == 'success' || needs.test-frontend.result == 'skipped') &&
       (needs.test-backend.result == 'success' || needs.test-backend.result == 'skipped') &&
+      (needs.init-db-migrations-drift-check.result == 'success' || needs.init-db-migrations-drift-check.result == 'skipped') &&
       (needs.build-frontend.result == 'success' || needs.build-backend.result == 'success' || (needs.changes.outputs.deploy == 'true' && needs.changes.outputs.code != 'true' && needs.changes.outputs.backend != 'true'))
     steps:
       - name: Checkout
