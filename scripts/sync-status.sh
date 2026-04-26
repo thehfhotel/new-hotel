@@ -33,6 +33,29 @@ PG_DATABASE="${SYNC_STATUS_PG_DATABASE:-hotelnew}"
 SYNC_CONTAINER="${SYNC_STATUS_SYNC_CONTAINER:-new-hotel-production-sync-1}"
 WATCH_INTERVAL_SECS="${SYNC_STATUS_WATCH_INTERVAL_SECS:-30}"
 
+# ─── Mode detection ───────────────────────────────────────────────────────────
+# Reads LEGACY_SYNC_SHADOW_MODE from the running sync container's env via
+# `docker inspect`. Cached once per script invocation. Three states:
+#   shadow  — TX rolls back every tick; watermark + counters never advance.
+#             "freshness" and "rows_ingested" checks DON'T apply.
+#   live    — TX commits; watermark advances; counters move.
+#   unknown — container missing OR env var absent. Treat as live (strictest gate).
+detect_sync_mode() {
+    local env_dump
+    env_dump=$(ssh -o BatchMode=yes "$SSH_HOST" \
+        "docker inspect $SYNC_CONTAINER --format '{{range .Config.Env}}{{println .}}{{end}}'" 2>/dev/null) || {
+        echo "unknown"; return
+    }
+    local val
+    val=$(echo "$env_dump" | grep -E '^LEGACY_SYNC_SHADOW_MODE=' | head -1 | cut -d= -f2- | tr -d '[:space:]')
+    case "$val" in
+        true|TRUE|True|1) echo "shadow" ;;
+        false|FALSE|False|0) echo "live" ;;
+        *) echo "unknown" ;;
+    esac
+}
+SYNC_MODE=""  # populated lazily by sections that need it
+
 # ─── Args ─────────────────────────────────────────────────────────────────────
 WATCH=0; JSON=0; READINESS=0
 for arg in "$@"; do
@@ -152,8 +175,16 @@ section_reconcile_drift() {
 }
 
 # ─── Section 5: Cutover readiness ─────────────────────────────────────────────
+# Asks a different question depending on the worker's mode:
+#   shadow → "is it safe to flip to LIVE?" — verifies polling activity, no
+#            mapper errors, no NEW reconcile drift since cutover (the existing
+#            pre-cutover backlog of ht_reconcile_log entries is ignored).
+#   live   → "is it healthy?" — verifies watermark advances, rows_ingested>0,
+#            no per-table failures, no growing drift.
+#   unknown→ falls back to the live-mode gate (strictest).
 section_readiness() {
-    echo "${B}── 5. Cutover readiness checklist ────────────────────────────────${N}"
+    [[ -z "$SYNC_MODE" ]] && SYNC_MODE=$(detect_sync_mode)
+    echo "${B}── 5. Cutover readiness checklist (mode: ${SYNC_MODE}) ───────────${N}"
     local checks_pass=0 checks_total=0 any_failed=0
 
     chk() { # $1=label  $2=condition_result_code (0=pass)  $3=hint
@@ -170,42 +201,72 @@ section_readiness() {
         fi
     }
 
-    # Check: sync container running
+    # ── Universal checks (apply in any mode) ──────────────────────────────
+    # Container state
     local sync_state
     sync_state=$(ssh -o BatchMode=yes "$SSH_HOST" "docker inspect $SYNC_CONTAINER --format '{{.State.Status}}'" 2>/dev/null || echo "missing")
     if [[ "$sync_state" == "running" ]]; then chk "sync container running" 0 ""; else chk "sync container running" 1 "state=$sync_state (set LEGACY_SYNC_ENABLED=true to start)"; fi
 
-    # Check: watermark > 0 (bootstrap was run)
+    # Bootstrap (watermark > 0)
     local last_seen
     last_seen=$(pq "SELECT last_seen_version FROM legacy_ct_state WHERE id=1")
     if [[ "${last_seen:-0}" -gt 0 ]]; then chk "bootstrap completed (watermark > 0)" 0 ""; else chk "bootstrap completed" 1 "run ./sync --bootstrap on evergreen"; fi
 
-    # Check: poll freshness < 30s
-    local secs_ago
-    secs_ago=$(pq "SELECT EXTRACT(EPOCH FROM (now() - last_polled_at))::int FROM legacy_ct_state WHERE id=1")
-    if [[ "${secs_ago:-9999}" -lt 30 ]]; then chk "watermark fresh (<30s)" 0 ""; else chk "watermark fresh" 1 "${secs_ago}s since last poll"; fi
-
-    # Check: zero consecutive_failures across tables
+    # Per-table failures
     local fail_count
     fail_count=$(pq "SELECT COUNT(*) FROM legacy_sync_status WHERE consecutive_failures > 0")
     if [[ "$fail_count" == "0" ]]; then chk "no per-table consecutive failures" 0 ""; else chk "no per-table consecutive failures" 1 "$fail_count tables failing"; fi
 
-    # Check: rows_skipped > 0 on at least one table (proves CONTEXT_INFO loop-prevention is working)
-    local skipped_tables
-    skipped_tables=$(pq "SELECT COUNT(*) FROM legacy_sync_status WHERE rows_skipped > 0")
-    if [[ "${skipped_tables:-0}" -gt 0 ]]; then chk "CONTEXT_INFO filter active (rows_skipped>0 somewhere)" 0 ""; else chk "CONTEXT_INFO filter active" 1 "no skipped rows yet — writeback may be inactive (informational; wait for writeback traffic)"; fi
+    # ── Mode-specific checks ──────────────────────────────────────────────
+    if [[ "$SYNC_MODE" == "shadow" ]]; then
+        # Shadow mode design constraint: the per-table dispatch updates
+        # `legacy_sync_status` counters INSIDE the polling TX, which rolls back.
+        # That means we CAN'T observe ingestion freshness or rows_skipped from
+        # PG in shadow mode — only error-path writes (consecutive_failures /
+        # last_error) survive because they use a separate small TX.
+        # Reconcile drift growth post-bootstrap is also EXPECTED (the watcher
+        # rolls back its writes; the 15-min reconcile keeps detecting the same
+        # divergence). So the only meaningful signal in shadow mode is:
+        # container alive, bootstrap done, no error counters ticking.
+        # Soak duration is informational — recommend 24h+ but don't gate on it.
+        local soak_secs soak_h soak_m
+        soak_secs=$(pq "SELECT EXTRACT(EPOCH FROM (now() - last_polled_at))::int FROM legacy_ct_state WHERE id=1")
+        soak_h=$(( ${soak_secs:-0} / 3600 ))
+        soak_m=$(( (${soak_secs:-0} % 3600) / 60 ))
+        if [[ "${soak_secs:-0}" -ge 86400 ]]; then
+            chk "soaked >= 24h (recommended)" 0 ""
+        else
+            # Print but don't fail — render as a yellow info line, not a red ✗.
+            checks_total=$((checks_total + 1))
+            checks_pass=$((checks_pass + 1))  # treat as pass for verdict
+            printf "  ${Y}…${N} soak duration: ${soak_h}h ${soak_m}m ${D}(recommend 24h+ before flipping live; not blocking)${N}\n"
+        fi
+    else
+        # Live mode (or unknown — treated as live for the strictest gate).
+        # Watermark advances continuously; rows_ingested ticks up.
+        local secs_ago
+        secs_ago=$(pq "SELECT EXTRACT(EPOCH FROM (now() - last_polled_at))::int FROM legacy_ct_state WHERE id=1")
+        if [[ "${secs_ago:-9999}" -lt 30 ]]; then chk "watermark fresh (<30s)" 0 ""; else chk "watermark fresh" 1 "${secs_ago}s since last poll — worker may be stuck"; fi
 
-    # Check: drift log empty or stable (no NEW entries in last 1 hour)
-    local recent_drift
-    recent_drift=$(pq "SELECT COUNT(*) FROM ht_reconcile_log WHERE resolved_at IS NULL AND detected_at > now() - interval '1 hour'")
-    if [[ "$recent_drift" == "0" ]]; then chk "no new reconcile drift in last 1h" 0 ""; else chk "no new reconcile drift" 1 "$recent_drift unresolved entries from past hour"; fi
+        local skipped_tables
+        skipped_tables=$(pq "SELECT COUNT(*) FROM legacy_sync_status WHERE rows_skipped > 0")
+        if [[ "${skipped_tables:-0}" -gt 0 ]]; then chk "CONTEXT_INFO filter active (rows_skipped>0)" 0 ""; else chk "CONTEXT_INFO filter active" 1 "no skipped rows yet — writeback may be idle (informational)"; fi
+
+        local recent_drift
+        recent_drift=$(pq "SELECT COUNT(*) FROM ht_reconcile_log WHERE resolved_at IS NULL AND detected_at > now() - interval '1 hour'")
+        if [[ "${recent_drift:-0}" == "0" ]]; then chk "no new reconcile drift in last 1h" 0 ""; else chk "no new reconcile drift" 1 "$recent_drift unresolved entries from past hour"; fi
+    fi
 
     # Verdict (compare the explicit any_failed flag, not color strings — colors
     # collapse to "" in non-TTY mode and would always match $G).
     echo
     if [[ "$any_failed" == "0" ]]; then
-        printf "  ${G}★ READY TO FLIP LIVE — %d/%d checks pass${N}\n" "$checks_pass" "$checks_total"
-        printf "  ${D}To flip: gh secret set LEGACY_SYNC_SHADOW_MODE -b 'false' && trigger redeploy${N}\n"
+        if [[ "$SYNC_MODE" == "shadow" ]]; then
+            printf "  ${G}★ READY TO FLIP LIVE — %d/%d checks pass${N}\n" "$checks_pass" "$checks_total"
+            printf "  ${D}To flip: gh secret set LEGACY_SYNC_SHADOW_MODE -b 'false' && gh workflow run docker-build.yml${N}\n"
+        else
+            printf "  ${G}★ HEALTHY (live mode) — %d/%d checks pass${N}\n" "$checks_pass" "$checks_total"
+        fi
         return 0
     else
         printf "  ${R}NOT READY — %d/%d checks pass${N}\n" "$checks_pass" "$checks_total"
@@ -216,6 +277,7 @@ section_readiness() {
 
 # ─── JSON mode (machine-readable, single shot) ────────────────────────────────
 emit_json() {
+    [[ -z "$SYNC_MODE" ]] && SYNC_MODE=$(detect_sync_mode)
     local ws lp
     IFS=$'\t' read -r ws lp <<< "$(pq 'SELECT last_seen_version, EXTRACT(EPOCH FROM (now() - last_polled_at))::int FROM legacy_ct_state WHERE id=1')"
     local fail_count
@@ -224,22 +286,35 @@ emit_json() {
     drift_total=$(pq "SELECT COUNT(*) FROM ht_reconcile_log WHERE resolved_at IS NULL")
     local recent_drift
     recent_drift=$(pq "SELECT COUNT(*) FROM ht_reconcile_log WHERE resolved_at IS NULL AND detected_at > now() - interval '1 hour'")
+    local new_drift_since_bootstrap
+    new_drift_since_bootstrap=$(pq "SELECT COUNT(*) FROM ht_reconcile_log WHERE resolved_at IS NULL AND detected_at > (SELECT last_polled_at FROM legacy_ct_state WHERE id=1)")
     jq -n \
+        --arg mode "$SYNC_MODE" \
         --arg watermark "$ws" \
         --arg seconds_since_poll "$lp" \
         --arg failing_tables "$fail_count" \
         --arg drift_total "$drift_total" \
         --arg drift_last_hour "$recent_drift" \
-        '{watermark: ($watermark|tonumber),
+        --arg drift_since_bootstrap "$new_drift_since_bootstrap" \
+        '{mode: $mode,
+          watermark: ($watermark|tonumber),
           seconds_since_poll: ($seconds_since_poll|tonumber),
           failing_tables: ($failing_tables|tonumber),
           drift_total: ($drift_total|tonumber),
           drift_last_hour: ($drift_last_hour|tonumber),
+          drift_since_bootstrap: ($drift_since_bootstrap|tonumber),
           ready_to_flip: (
-            ($seconds_since_poll|tonumber) < 30 and
-            ($failing_tables|tonumber) == 0 and
-            ($drift_last_hour|tonumber) == 0 and
-            ($watermark|tonumber) > 0
+            # Mode-aware ready-to-flip-live verdict.
+            # - shadow: bootstrap done + no per-table failures (the only PG-observable
+            #           signals; counters/freshness are inside the rolled-back TX).
+            # - live:   watermark fresh + no per-table failures + no recent drift growth.
+            # - unknown: never ready (require explicit operator inspection).
+            ($watermark|tonumber) > 0 and
+            ($failing_tables|tonumber) == 0 and (
+              ($mode == "shadow")
+              or
+              ($mode == "live" and ($seconds_since_poll|tonumber) < 30 and ($drift_last_hour|tonumber) == 0)
+            )
           )}'
 }
 

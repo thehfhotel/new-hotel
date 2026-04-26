@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.49.1] - 2026-04-26
+
+### Fixed
+
+- **`scripts/sync-status.sh` — mode-aware readiness checks.** The
+  cutover-readiness section now detects whether the sync worker is in
+  `shadow` or `live` mode (via `docker inspect` of the container's
+  `LEGACY_SYNC_SHADOW_MODE` env) and runs different checks accordingly.
+  - **Shadow mode** (the cutover-soak state): only checks container
+    alive, bootstrap done, no per-table consecutive failures. Soak
+    duration is informational (recommend 24h+, not blocking). Doesn't
+    check watermark freshness or rows_skipped because those counters
+    update inside the polling TX which rolls back in shadow mode —
+    stale `legacy_sync_status` is expected design, not a problem.
+    Doesn't check reconcile drift growth either, because the watcher
+    rolls back its writes and the 15-min reconcile keeps detecting the
+    same divergence — that's expected, not a regression.
+  - **Live mode**: keeps the strict watermark-fresh + drift-stable
+    checks since these signals are real once the worker commits.
+  - JSON output adds `mode` field; `ready_to_flip` is mode-aware.
+
 ## [2.49.0] - 2026-04-26
 
 ### Changed
