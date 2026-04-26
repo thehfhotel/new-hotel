@@ -1,7 +1,10 @@
 services:
   # PostgreSQL container for HotelNew database (self-hosted)
   newdb:
-    image: postgres:17-alpine
+    # Pinned to digest (Batch C of post-Phase-5.5 audit). Source: Docker Hub
+    # API `library/postgres/tags/17-alpine` on 2026-04-26. Dependabot
+    # (`docker` ecosystem) will surface new digests as PRs.
+    image: postgres:17-alpine@sha256:c7526c0f6c3f30260a563d7bcf8ad778effac59a44f8ffa86678c35418338609
     container_name: new-hotel-db
     environment:
       - POSTGRES_DB=${POSTGRES_DB}
@@ -22,6 +25,17 @@ services:
       retries: 10
       start_period: 10s
     restart: unless-stopped
+    # Resource ceiling — newdb is the heaviest service (Phase 5.5 CT
+    # watcher amplifies write volume). 2G cap leaves enough headroom on
+    # the evergreen 8G host while protecting other services from a
+    # runaway query.
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+        reservations:
+          memory: 512M
 
   web:
     image: ghcr.io/thehfhotel/new-hotel:latest
@@ -51,6 +65,13 @@ services:
       retries: 3
       start_period: 30s
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+        reservations:
+          memory: 128M
 
   backend:
     image: ghcr.io/thehfhotel/new-hotel-backend:latest
@@ -88,6 +109,13 @@ services:
       retries: 12
       start_period: 30s
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '2.0'
+        reservations:
+          memory: 256M
 
   # Writeback worker — drains the writeback_jobs outbox into the legacy MSSQL DB
   # via the Phase 4b adapter (per docs/architecture.md §3.6c, §6, §8).
@@ -127,6 +155,13 @@ services:
     # restart-loop (Docker treats exit 0 as expected under on-failure;
     # the `:5` cap protects against a genuine hot-loop crash).
     restart: on-failure:5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+        reservations:
+          memory: 128M
 
   # CT watcher worker — Phase 5.5 production cutover. Polls MSSQL Change
   # Tracking on the 10 CT-enabled legacy tables, projects each change into
@@ -190,6 +225,13 @@ services:
     # `Ok(0)` exit when LEGACY_SYNC_ENABLED=false (the default) does NOT
     # trigger the restart-loop. Same reasoning as the writeback service.
     restart: on-failure:5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+        reservations:
+          memory: 128M
 
   # One-shot backfill: legacy MSSQL HT_Rooms + HT_SET_RoomType -> PG.
   # Same image as `backend`, different entrypoint. Lives under the `backfill`

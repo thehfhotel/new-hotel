@@ -5,6 +5,61 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.45.3] - 2026-04-26
+
+### Security
+
+- **Image hardening (Batch C of post-Phase-5.5 audit).**
+  - **Pinned every base image to digest** in all 3 Dockerfiles +
+    `docker-compose.yml`. Sources (Docker Hub registry API on 2026-04-26):
+    `node:20-alpine` -> `sha256:fb4cd12c…372293`,
+    `rust:1.89-bookworm` -> `sha256:948f9b08…3c84ff`,
+    `debian:bookworm-slim` -> `sha256:f9c6a2fd…c5c252`,
+    `postgres:17-alpine` -> `sha256:c7526c0f…338609`.
+    Stops a base-image hijack from injecting a malicious layer between
+    pull and rebuild. Dependabot (`docker` ecosystem, added in Batch D)
+    will surface new digests as PRs.
+  - **Web runner stage now drops root.** Mirrors the backend pattern:
+    creates `nextjs:nextjs` (UID 1001), `chown -R nextjs /app`,
+    `USER nextjs`. UID 1001 picked to avoid colliding with the
+    backend's UID 1000 if both ever land on the same host.
+  - **Web runner stage is bare `node:20-alpine` (NOT `FROM base`).**
+    No pnpm, no corepack, no build tooling in the runtime image —
+    smaller surface, nothing for an attacker to leverage if they
+    get RCE on the web pod.
+  - **`hotel-backend/.dockerignore` widened.** Was 6 lines (`target/`,
+    `.git/`, `.gitignore`, `Dockerfile`, `.dockerignore`, `*.md`,
+    `.env`), now explicitly excludes `node_modules/`, `.next/`,
+    `coverage/`, `.github/`, `.vscode/`, `.claude/`, `*.log`,
+    `docs/`, `__tests__/`, `app/`, `components/`, `public/`, `lib/`,
+    `legacy-reference/`, etc. Defense-in-depth: even if the build
+    context ever changes from `./hotel-backend` to `.`, sensitive
+    repo state stays out of the image build.
+  - **Dropped `inspect_booking` and `inspect_schema` debug binaries
+    from the production runtime image.** They remain available via
+    `cargo run --bin inspect_*` locally for ops use, but never ship.
+    Removes ~10 MB and a debugger-grade Postgres client from the
+    image attack surface.
+  - **Added `HEALTHCHECK` directives to all 3 runtime stages.** Web:
+    `wget --spider http://localhost:3003`. Backend:
+    `curl /api/mode`. ville-sync: declared no-op (`CMD true`) — the
+    binary has no HTTP endpoint or liveness sentinel today; a deeper
+    probe (touch `/tmp/sync_alive` per poll-loop iteration) is a
+    follow-up. Container-level health complements the existing
+    compose-level healthchecks for non-compose runners.
+  - **Added OCI labels** (`org.opencontainers.image.source`,
+    `org.opencontainers.image.licenses=Proprietary`) to all 3 images.
+    Makes the GHCR repo back-link visible in `docker inspect` and
+    `docker scout`.
+
+### Changed
+
+- **Resource limits added to every service in `docker-compose.yml`**
+  (`deploy.resources.limits` / `reservations`). Per-service ceilings:
+  newdb 2G/2 cpus, backend 1G/2 cpus, web 512M/1 cpu, writeback
+  512M/1 cpu, sync 512M/1 cpu. Caps a runaway query or worker from
+  starving the host.
+
 ## [2.45.2] - 2026-04-26
 
 ### Fixed

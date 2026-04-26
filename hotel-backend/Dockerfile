@@ -30,7 +30,11 @@
 #
 # mold linker shaves a large chunk off link time vs the default GNU ld.
 
-FROM rust:1.89-bookworm AS builder
+# Pin to digest (Batch C of post-Phase-5.5 audit). Source: Docker Hub API
+# `hub.docker.com/v2/repositories/library/rust/tags/1.89-bookworm` on 2026-04-26.
+FROM rust:1.89-bookworm@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff AS builder
+LABEL org.opencontainers.image.source=https://github.com/thehfhotel/new-hotel
+LABEL org.opencontainers.image.licenses=Proprietary
 RUN apt-get update \
     && apt-get install -y --no-install-recommends mold clang \
     && rm -rf /var/lib/apt/lists/*
@@ -44,26 +48,30 @@ ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 
 COPY . .
 
+# Build ONLY the production binaries. The `inspect_*` debug bins are
+# explicitly excluded from the runtime image (Batch C of audit) — they
+# remain available via `cargo run --bin inspect_*` locally for ops use,
+# but never ship to production.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
     --mount=type=cache,target=/usr/src/app/target,id=hotel-backend-target \
-    cargo build --release \
+    cargo build --release --locked \
         --bin hotel-backend \
         --bin writeback \
         --bin sync \
         --bin backfill_rooms \
-        --bin inspect_booking \
-        --bin inspect_schema \
     && mkdir -p /out \
     && cp target/release/hotel-backend /out/ \
     && cp target/release/writeback /out/ \
     && cp target/release/sync /out/ \
-    && cp target/release/backfill_rooms /out/ \
-    && cp target/release/inspect_booking /out/ \
-    && cp target/release/inspect_schema /out/
+    && cp target/release/backfill_rooms /out/
 
 # ---- Runtime stage --------------------------------------------------------
-FROM debian:bookworm-slim
+# Pin to digest. Source: Docker Hub API `library/debian/tags/bookworm-slim`
+# on 2026-04-26.
+FROM debian:bookworm-slim@sha256:f9c6a2fd2ddbc23e336b6257a5245e31f996953ef06cd13a59fa0a1df2d5c252
+LABEL org.opencontainers.image.source=https://github.com/thehfhotel/new-hotel
+LABEL org.opencontainers.image.licenses=Proprietary
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
@@ -76,8 +84,6 @@ COPY --from=builder /out/hotel-backend /app/hotel-backend
 COPY --from=builder /out/writeback /app/writeback
 COPY --from=builder /out/sync /app/sync
 COPY --from=builder /out/backfill_rooms /app/backfill_rooms
-COPY --from=builder /out/inspect_booking /app/inspect_booking
-COPY --from=builder /out/inspect_schema /app/inspect_schema
 
 RUN useradd -m -u 1000 appuser
 USER appuser
@@ -87,5 +93,11 @@ EXPOSE 3003
 ENV HOST=0.0.0.0
 ENV PORT=3003
 ENV RUST_LOG=hotel_backend=info,tower_http=info
+
+# Container-level healthcheck. Same endpoint the docker-compose healthcheck
+# uses — present here so `docker run` users + non-compose orchestrators
+# also get the signal.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -fsS --max-time 3 http://localhost:3003/api/mode || exit 1
 
 CMD ["./hotel-backend"]
