@@ -150,6 +150,7 @@ mod tests {
             room_type: "STD".into(),
             price: Money::from_satang(100_00),
             nights: 1,
+            deposit: Money::from_satang(0),
             created_by: "user_a".into(),
             notes: None,
         };

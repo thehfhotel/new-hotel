@@ -77,6 +77,9 @@ pub struct CreateBookingInputs<'a> {
     pub stay_end: DateTime<Utc>,
     pub room_no: &'a str,
     pub price_baht: f64,
+    /// Deposit (`เงินมัดจำ`) the receptionist entered on the form. Lands
+    /// in `HT_Book_H.Book_Price_Pay`. Zero means no upfront payment.
+    pub deposit_baht: f64,
     pub nights: i32,
     /// First `HT_Book_Date.id` to use for night INSERTs.
     pub book_date_id_base: i32,
@@ -160,9 +163,10 @@ pub fn build_statements(inputs: &CreateBookingInputs<'_>) -> Vec<String> {
          [Book_Date_in],[Book_Date_out],[Book_by],[Book_room_all],[Book_room_note],\
          [book_room_type],Book_Notify_Day,Book_sale)\
          VALUES( {book_id_q},{now_q},{cust_no_q},{cust_name_q},'',{cust_phone_q},\
-         {price_2dp},0.00,{status},{stay_in},{stay_out},{by_q},'',{notes_q},{room_type_code},\
+         {price_2dp},{deposit_2dp},{status},{stay_in},{stay_out},{by_q},'',{notes_q},{room_type_code},\
          {notify_day},'')",
         price_2dp = format!("{:.2}", inputs.price_baht),
+        deposit_2dp = format!("{:.2}", inputs.deposit_baht),
         status = booked_q,
         stay_in = stay_start_date_q,
         stay_out = stay_end_date_q,
@@ -323,9 +327,11 @@ pub async fn execute(
     // HIGH-4: defense-in-depth NaN/Infinity guard. Money-derived f64s are
     // always finite today, but the night-total interpolation
     // (`price * nights`) could overflow to infinity for extreme inputs.
+    let deposit_baht = (payload.deposit.as_satang() as f64) / 100.0;
     super::helpers::validate_finite(&[
         ("price_baht", price_baht),
         ("nightly_total", price_baht * (nights as f64)),
+        ("deposit_baht", deposit_baht),
     ])?;
 
     let inputs = CreateBookingInputs {
@@ -340,6 +346,7 @@ pub async fn execute(
         stay_end: payload.stay.end,
         room_no: &payload.room_no,
         price_baht,
+        deposit_baht,
         nights,
         book_date_id_base,
         nights_calendar,
@@ -378,11 +385,35 @@ mod tests {
             stay_end: Utc.with_ymd_and_hms(2026, 4, 26, 5, 0, 0).unwrap(),
             room_no: "402",
             price_baht: 890.0,
+            deposit_baht: 0.0,
             nights: 1,
             book_date_id_base: 47285,
             nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],
             customer_is_new: false,
         }
+    }
+
+    /// Deposit (`เงินมัดจำ`) lands in `HT_Book_H.Book_Price_Pay` formatted
+    /// to 2 decimal places. Was hardcoded `0.00` until 2.23.0.
+    #[test]
+    fn book_h_book_price_pay_carries_deposit_amount() {
+        let mut inputs = sample_inputs();
+        inputs.deposit_baht = 500.0;
+        let statements = build_statements(&inputs);
+        let book_h = statements.iter().find(|s| s.contains("HT_Book_H")).unwrap();
+        // 7th and 8th positional values are Total then Pay (deposit). Capture
+        // the comma-separated VALUES tuple to assert exact placement.
+        assert!(
+            book_h.contains(",890.00,500.00,"),
+            "expected '...,Total,Pay,...' = '...,890.00,500.00,...' in {book_h}"
+        );
+    }
+
+    #[test]
+    fn book_h_book_price_pay_zero_when_no_deposit() {
+        let statements = build_statements(&sample_inputs());
+        let book_h = statements.iter().find(|s| s.contains("HT_Book_H")).unwrap();
+        assert!(book_h.contains(",890.00,0.00,"), "expected '...,890.00,0.00,...' in {book_h}");
     }
 
     #[test]
@@ -431,6 +462,7 @@ mod tests {
             stay_end: Utc.with_ymd_and_hms(2026, 4, 26, 5, 0, 0).unwrap(),
             room_no: "414",
             price_baht: 801.0,
+            deposit_baht: 0.0,
             nights: 1,
             book_date_id_base: 47200,
             nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],

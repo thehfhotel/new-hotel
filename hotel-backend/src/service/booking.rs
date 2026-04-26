@@ -124,6 +124,10 @@ pub struct BookingWritebackContext {
     pub room_no: String,
     pub room_type: String,
     pub price: Money,
+    /// Deposit (`เงินมัดจำ`) the receptionist entered on the booking form.
+    /// Maps to legacy `HT_Book_H.Book_Price_Pay`. Defaults to zero — most
+    /// bookings have no upfront deposit.
+    pub deposit: Money,
     pub created_by: String,
     pub notes: Option<String>,
 }
@@ -217,6 +221,7 @@ impl BookingService {
             room_type: cmd.writeback_context.room_type,
             price: cmd.writeback_context.price,
             nights,
+            deposit: cmd.writeback_context.deposit,
             created_by: cmd.writeback_context.created_by,
             notes: cmd.writeback_context.notes,
         };
