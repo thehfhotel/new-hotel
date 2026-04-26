@@ -179,7 +179,17 @@ jobs:
           RUSTC_WRAPPER: ${{ steps.sccache_probe.outcome == 'success' && 'sccache' || '' }}
         # `--locked` aborts if Cargo.lock is out of date with Cargo.toml.
         # CI parity with the production Dockerfile build (also uses --locked).
-        run: cargo test --locked
+        #
+        # `--test-threads=1`: integration tests share ONE PostgreSQL instance
+        # and ONE `ht_*` schema namespace. Running them in parallel races
+        # against shared rows — see the `customer_search_by_name` flake
+        # (CI run 24957295146) where a concurrent `customer_crud_lifecycle`
+        # cleanup nuked the search test's freshly-inserted rows mid-assertion.
+        # The cleanup helper in `tests/common/mod.rs` was tightened to use
+        # exact-match markers instead of `LIKE 'TEST_%'`; this flag is
+        # belt-and-suspenders against any future shared-DB race we haven't
+        # yet enumerated. Cost is ~5-10s on a 13-test suite — acceptable.
+        run: cargo test --locked -- --test-threads=1
 
   # init-db / migrations drift check (Batch E of post-Phase-5.5 audit).
   #

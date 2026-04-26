@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.46.5] - 2026-04-26
+
+### Fixed
+
+- **`customer_search_by_name` flake — shared-DB race, root-caused.**
+  The integration suite shares a single PostgreSQL instance and the
+  `ht_*` schema namespace. `customer_crud_lifecycle` called the shared
+  `tests/common/mod.rs::cleanup` helper, which deleted every row matching
+  `cust_notes LIKE 'TEST_%'`. That glob also matched `'TEST_search_by_name'`
+  — the marker on the search test's just-inserted rows — so when the two
+  tests ran concurrently (cargo's default), the lifecycle cleanup nuked
+  the search test's data between its first assertion (1 row, passed)
+  and its second (expected 2, got 0). Surfaced as 3 cascading CI failures
+  (runs 24956846194, 24957055216, 24957295146).
+  - Tightened `cleanup()` to use exact-match markers (`'TEST_customer_crud'`)
+    instead of `LIKE 'TEST_%'`, so the helper only touches rows owned by
+    the lifecycle test that calls it. Each query now uses parameter
+    binding (`= $1`) for safety.
+  - Added `--test-threads=1` to the CI `cargo test` invocation as
+    defense-in-depth against shared-DB races we haven't enumerated.
+    Cost: ~5-10s on a 13-test suite.
+  - Documented the rule in the module-level comment of `tests/common/mod.rs`.
+
 ## [2.46.4] - 2026-04-26
 
 ### Fixed
