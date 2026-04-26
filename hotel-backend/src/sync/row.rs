@@ -38,6 +38,26 @@ pub trait MappableRow: Send + Sync {
     fn try_get_i32(&self, col: &str) -> Result<Option<i32>, SyncError>;
     fn try_get_i64(&self, col: &str) -> Result<Option<i64>, SyncError>;
     fn try_get_f64(&self, col: &str) -> Result<Option<f64>, SyncError>;
+    /// Read a SQL Server NUMERIC / DECIMAL / FLOAT column.
+    ///
+    /// Returns `f64` rather than a true big-decimal type because:
+    ///
+    /// 1. Every monetary column we mirror from MSSQL (`HT_Book_H.Book_Price_Total`,
+    ///    `Book_Price_Pay`, `Book_Room_Price`, …) is declared `float` in the
+    ///    legacy schema (verified via `legacy-reference/analysis/_SCHEMA.sql`),
+    ///    not `numeric` / `decimal`. tiberius surfaces `float` as `f64` already.
+    /// 2. Our canonical PG `DECIMAL(12,2)` columns are bound via `$N::float8`
+    ///    casts (see `repository/booking.rs::insert_booking`), so a round-trip
+    ///    through `f64` is the existing, validated boundary representation.
+    /// 3. The writeback adapter (`writeback/format.rs::f64_sql`,
+    ///    `money_2dp`) renders all baht amounts from `f64`, so adding a true
+    ///    `rust_decimal::Decimal` arm here would mean translating back to
+    ///    `f64` at every consumer.
+    ///
+    /// If a future legacy column lands as a true `decimal`/`numeric` type,
+    /// extend the trait with a `try_get_big_decimal` arm rather than
+    /// silently truncating through `f64`.
+    fn try_get_decimal(&self, col: &str) -> Result<Option<f64>, SyncError>;
     fn try_get_datetime(
         &self,
         col: &str,
@@ -64,6 +84,19 @@ impl MappableRow for tiberius::Row {
 
     fn try_get_f64(&self, col: &str) -> Result<Option<f64>, SyncError> {
         Ok(tiberius::Row::try_get::<f64, _>(self, col)?)
+    }
+
+    fn try_get_decimal(&self, col: &str) -> Result<Option<f64>, SyncError> {
+        // SQL Server `float` and `real` arrive as `f64`/`f32` respectively.
+        // Try `f64` first (the common case) and fall back to `f32` so a
+        // schema where someone declared `Book_Price_*` as `real` still works.
+        if let Ok(v) = tiberius::Row::try_get::<f64, _>(self, col) {
+            return Ok(v);
+        }
+        match tiberius::Row::try_get::<f32, _>(self, col)? {
+            Some(v) => Ok(Some(v as f64)),
+            None => Ok(None),
+        }
     }
 
     fn try_get_datetime(
@@ -101,6 +134,10 @@ pub mod test_support {
         I32(i32),
         I64(i64),
         F64(f64),
+        /// SQL Server `numeric` / `decimal` / `float` column. Stored as
+        /// `f64` for the same reasons documented on
+        /// [`MappableRow::try_get_decimal`].
+        Decimal(f64),
         DateTime(chrono::NaiveDateTime),
         Bytes(Vec<u8>),
         /// Column is present but its value is SQL NULL.
@@ -181,7 +218,23 @@ pub mod test_support {
                 None => Err(missing(self.table, col)),
                 Some(MockValue::Null) => Ok(None),
                 Some(MockValue::F64(n)) => Ok(Some(*n)),
+                // Decimals are also valid f64 sources — keeps tests that
+                // mix `Decimal` and `F64` ergonomic.
+                Some(MockValue::Decimal(n)) => Ok(Some(*n)),
                 Some(_) => Err(type_mismatch(self.table, col, "f64")),
+            }
+        }
+
+        fn try_get_decimal(&self, col: &str) -> Result<Option<f64>, SyncError> {
+            match self.cells.get(col) {
+                None => Err(missing(self.table, col)),
+                Some(MockValue::Null) => Ok(None),
+                Some(MockValue::Decimal(n)) => Ok(Some(*n)),
+                // `F64` cells are interchangeable with `Decimal` for the
+                // purposes of probe; we accept both so test fixtures can
+                // pick whichever variant reads more naturally.
+                Some(MockValue::F64(n)) => Ok(Some(*n)),
+                Some(_) => Err(type_mismatch(self.table, col, "decimal")),
             }
         }
 
@@ -243,5 +296,37 @@ mod tests {
         let row = HashMapRow::new("HT_Test").with("c", MockValue::I32(1));
         let err = row.try_get_str("c").expect_err("wrong type must error");
         assert!(err.to_string().contains("not of type str"));
+    }
+
+    /// Phase 5.3 — `try_get_decimal` exists, returns the cell value for
+    /// both `Decimal` and `F64` mock arms, and propagates SQL NULL.
+    #[test]
+    fn hashmap_row_decimal_arm_returns_value() {
+        let row = HashMapRow::new("HT_Book_H").with("Book_Price_Total", MockValue::Decimal(890.0));
+        assert_eq!(row.try_get_decimal("Book_Price_Total").unwrap(), Some(890.0));
+    }
+
+    #[test]
+    fn hashmap_row_decimal_arm_accepts_f64_cells_too() {
+        // Decimal/F64 are interchangeable so test fixtures can pick whichever
+        // reads more naturally without forcing a type-tag rewrite.
+        let row = HashMapRow::new("HT_Book_H").with("Book_Price_Pay", MockValue::F64(0.0));
+        assert_eq!(row.try_get_decimal("Book_Price_Pay").unwrap(), Some(0.0));
+    }
+
+    #[test]
+    fn hashmap_row_decimal_arm_returns_none_for_null() {
+        let row = HashMapRow::new("HT_Book_H").with("Book_Price_Vat", MockValue::Null);
+        assert!(row.try_get_decimal("Book_Price_Vat").unwrap().is_none());
+    }
+
+    #[test]
+    fn hashmap_row_decimal_arm_rejects_str_cells() {
+        let row = HashMapRow::new("HT_Book_H")
+            .with("Book_Price_Total", MockValue::Str("not-a-number".into()));
+        let err = row
+            .try_get_decimal("Book_Price_Total")
+            .expect_err("Str cell must not satisfy decimal probe");
+        assert!(err.to_string().contains("not of type decimal"));
     }
 }

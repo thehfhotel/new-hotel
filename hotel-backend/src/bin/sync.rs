@@ -35,8 +35,21 @@
 //! Phase 5.2 advances the watermark per-table at the end of each
 //! table's own TX. Customer / room mappers are flat tables — one CT row
 //! produces at most one mapper call and at most one event, so per-table
-//! advance is equivalent to min-of-all and simpler. 5.3 may revisit
-//! once cross-aggregate booking coalescing lands.
+//! advance is equivalent to min-of-all and simpler.
+//!
+//! **Phase 5.3 keeps per-table watermark advance** even though the
+//! booking aggregate spans HT_Book_H + HT_Book_Ds + HT_Book_Date.
+//! `SYS_CHANGE_VERSION` is global-monotonic across the whole database,
+//! so committing the per-table max version after a successful TX
+//! cannot lose rows from any other table. The "one event per
+//! aggregate per tick" guarantee is enforced one level up — by
+//! coalescing CT rows in `poll_table` (see the per-row vs coalesced
+//! branches there), not by watermark mechanics. Net effect: a booking
+//! header + 2 line + 5 night change touches all three tables, but
+//! produces exactly one DomainEvent (header tick emits the
+//! BookingModified; the subsequent Ds + Date ticks load the same
+//! aggregate, find the canonical row already matches, and skip the
+//! event).
 
 #![allow(clippy::doc_lazy_continuation)]
 
@@ -55,7 +68,11 @@ use hotel_backend::notifications::slack::{SlackClient, SlackMessage};
 use hotel_backend::outbox::bus::EventBus;
 use hotel_backend::outbox::event::DomainEvent;
 use hotel_backend::sync::change_op::ChangeOp;
-use hotel_backend::sync::mappers::{CustomerMapper, RoomMasterMapper, RoomStatusMapper};
+use hotel_backend::sync::mappers::{
+    apply_booking_aggregate, BookingDatesMapper, BookingHeaderMapper, BookingRoomsMapper,
+    CustomerMapper, RoomMasterMapper, RoomStatusMapper,
+};
+use hotel_backend::sync::parent_loader::load_booking_aggregate;
 use hotel_backend::sync::{MssqlChangeMapper, NoopMapper};
 use hotel_backend::writeback::verify_schema_fingerprint;
 
@@ -246,6 +263,9 @@ fn build_mappers(allowlist: &Option<HashSet<String>>) -> Vec<Box<dyn MssqlChange
             "HT_Customers" => Box::new(CustomerMapper),
             "HT_Rooms" => Box::new(RoomMasterMapper),
             "HT_Room_Status" => Box::new(RoomStatusMapper),
+            "HT_Book_H" => Box::new(BookingHeaderMapper),
+            "HT_Book_Ds" => Box::new(BookingRoomsMapper),
+            "HT_Book_Date" => Box::new(BookingDatesMapper),
             other => Box::new(NoopMapper { table_name: other }),
         };
         out.push(mapper);
@@ -386,10 +406,31 @@ async fn poll_table(
         }
     };
 
-    for (version, op_char, row) in &rows {
-        let op = match ChangeOp::try_from(op_char.as_str()) {
-            Ok(o) => o,
-            Err(err) => {
+    // 4a. Aggregate-coalesced path (Phase 5.3): when the mapper opts
+    //     in via `coalesce_key`, group rows by the aggregate root and
+    //     dispatch each unique key exactly once per tick. Currently
+    //     only the booking mappers (HT_Book_H / HT_Book_Ds /
+    //     HT_Book_Date) opt in — see `sync::mappers::booking`.
+    //
+    //     The dispatch path branches on whether ANY row in the batch
+    //     produced a Some-key. If so, the entire batch goes through
+    //     the coalesced path; rows without a key (e.g. D rows on
+    //     child tables where the parent FK isn't projected) are
+    //     skipped with a debug log — a sibling header / line CT row
+    //     in the same tick almost always covers the same booking and
+    //     drives the canonical re-load.
+    let any_coalesce_key = rows
+        .iter()
+        .any(|(_, _, r)| mapper.coalesce_key(r).is_some());
+
+    if any_coalesce_key {
+        for (version, op_char, _row) in &rows {
+            // We still parse the op code to surface unknown operations
+            // loudly (matches the per-row path's behaviour). Beyond
+            // that, the op itself is informational for the aggregate
+            // path — the parent re-load supersedes per-row I/U/D
+            // semantics.
+            if let Err(err) = ChangeOp::try_from(op_char.as_str()) {
                 tracing::warn!(
                     table,
                     sys_change_operation = %op_char,
@@ -399,56 +440,140 @@ async fn poll_table(
                 skipped += 1;
                 continue;
             }
-        };
+            if *version > max_version {
+                max_version = *version;
+            }
+        }
 
-        // For Delete, the joined row is NULL but the PK columns are
-        // still in the projection (CT carries them). Pass `Some(&row)`
-        // either way and let the mapper decide.
-        let result = mapper.apply(&mut tx, op, Some(row)).await;
+        // Group all rows by aggregate root key (de-dup by HashSet).
+        let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (_v, _op, row) in &rows {
+            if let Some(k) = mapper.coalesce_key(row) {
+                keys.insert(k);
+            }
+        }
 
-        match result {
-            Ok(Some(event)) => {
-                if shadow_mode {
-                    tracing::info!(
+        for book_id in &keys {
+            let aggregate = match load_booking_aggregate(mssql, book_id).await {
+                Ok(a) => a,
+                Err(err) => {
+                    tracing::warn!(
                         table,
-                        version,
-                        op = ?op,
-                        event_type = event.type_name(),
-                        "would publish (shadow mode)"
+                        book_id = %book_id,
+                        error = %err,
+                        "Failed to load booking aggregate; recording and continuing"
+                    );
+                    let _ = record_table_error(pg, table, &err.to_string()).await;
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let result = apply_booking_aggregate(&mut tx, &aggregate, book_id).await;
+            match result {
+                Ok(Some(event)) => {
+                    if shadow_mode {
+                        tracing::info!(
+                            table,
+                            book_id = %book_id,
+                            event_type = event.type_name(),
+                            "would publish (shadow mode)"
+                        );
+                        skipped += 1;
+                    } else if let Err(err) = persist_event(&mut tx, &event).await {
+                        tracing::error!(
+                            table,
+                            book_id = %book_id,
+                            error = %err,
+                            "Failed to persist event_log row"
+                        );
+                        skipped += 1;
+                    } else {
+                        ingested += 1;
+                    }
+                }
+                Ok(None) => {
+                    // Idempotent skip — canonical row already matches.
+                    skipped += 1;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        table,
+                        book_id = %book_id,
+                        error = %err,
+                        "apply_booking_aggregate error — recording and continuing"
+                    );
+                    let _ = record_table_error(pg, table, &err.to_string()).await;
+                    skipped += 1;
+                }
+            }
+        }
+    } else {
+        // 4b. Legacy per-row dispatch path (Phase 5.2). Customer / room /
+        //     room_status mappers stay here.
+        for (version, op_char, row) in &rows {
+            let op = match ChangeOp::try_from(op_char.as_str()) {
+                Ok(o) => o,
+                Err(err) => {
+                    tracing::warn!(
+                        table,
+                        sys_change_operation = %op_char,
+                        error = %err,
+                        "Unknown CT operation code — skipping row"
                     );
                     skipped += 1;
-                } else if let Err(err) = persist_event(&mut tx, &event).await {
-                    tracing::error!(
+                    continue;
+                }
+            };
+
+            // For Delete, the joined row is NULL but the PK columns are
+            // still in the projection (CT carries them). Pass `Some(&row)`
+            // either way and let the mapper decide.
+            let result = mapper.apply(&mut tx, op, Some(row)).await;
+
+            match result {
+                Ok(Some(event)) => {
+                    if shadow_mode {
+                        tracing::info!(
+                            table,
+                            version,
+                            op = ?op,
+                            event_type = event.type_name(),
+                            "would publish (shadow mode)"
+                        );
+                        skipped += 1;
+                    } else if let Err(err) = persist_event(&mut tx, &event).await {
+                        tracing::error!(
+                            table,
+                            version,
+                            op = ?op,
+                            error = %err,
+                            "Failed to persist event_log row"
+                        );
+                        skipped += 1;
+                    } else {
+                        ingested += 1;
+                    }
+                }
+                Ok(None) => {
+                    // Idempotent skip / D-event with no event payload.
+                    skipped += 1;
+                }
+                Err(err) => {
+                    tracing::warn!(
                         table,
                         version,
                         op = ?op,
                         error = %err,
-                        "Failed to persist event_log row"
+                        "Mapper error — recording and continuing"
                     );
+                    let _ = record_table_error(pg, table, &err.to_string()).await;
                     skipped += 1;
-                } else {
-                    ingested += 1;
                 }
             }
-            Ok(None) => {
-                // Idempotent skip / D-event with no event payload.
-                skipped += 1;
-            }
-            Err(err) => {
-                tracing::warn!(
-                    table,
-                    version,
-                    op = ?op,
-                    error = %err,
-                    "Mapper error — recording and continuing"
-                );
-                let _ = record_table_error(pg, table, &err.to_string()).await;
-                skipped += 1;
-            }
-        }
 
-        if *version > max_version {
-            max_version = *version;
+            if *version > max_version {
+                max_version = *version;
+            }
         }
     }
 
@@ -872,16 +997,58 @@ mod tests {
         assert_eq!(mappers[0].primary_key_cols(), &["id"]);
     }
 
+    /// Phase 5.3: HT_Book_H + HT_Book_Ds + HT_Book_Date are now real
+    /// mappers (BookingHeaderMapper / BookingRoomsMapper /
+    /// BookingDatesMapper). Locks the wiring so a refactor doesn't
+    /// silently regress them to NoopMapper.
     #[test]
-    fn build_mappers_keeps_noop_for_5_3_tables() {
+    fn build_mappers_wires_booking_header_to_booking_header_mapper() {
         let mut allow = HashSet::new();
         allow.insert("HT_Book_H".to_string());
         let mappers = build_mappers(&Some(allow));
         assert_eq!(mappers.len(), 1);
-        assert!(
-            mappers[0].primary_key_cols().is_empty(),
-            "HT_Book_H must still be NoopMapper in 5.2"
+        assert_eq!(
+            mappers[0].primary_key_cols(),
+            &["Book_ID"],
+            "HT_Book_H must be wired to BookingHeaderMapper (PK=Book_ID), not NoopMapper"
         );
+    }
+
+    #[test]
+    fn build_mappers_wires_booking_ds_to_booking_rooms_mapper() {
+        let mut allow = HashSet::new();
+        allow.insert("HT_Book_Ds".to_string());
+        let mappers = build_mappers(&Some(allow));
+        assert_eq!(mappers.len(), 1);
+        assert_eq!(mappers[0].primary_key_cols(), &["id"]);
+        assert!(mappers[0].select_sql().contains("Book_Room_Type"));
+    }
+
+    #[test]
+    fn build_mappers_wires_booking_date_to_booking_dates_mapper() {
+        let mut allow = HashSet::new();
+        allow.insert("HT_Book_Date".to_string());
+        let mappers = build_mappers(&Some(allow));
+        assert_eq!(mappers.len(), 1);
+        assert_eq!(mappers[0].primary_key_cols(), &["id"]);
+        assert!(mappers[0].select_sql().contains("Book_ok"));
+    }
+
+    /// 5.4 will retire / promote these — until then, they ride on
+    /// NoopMapper. Locks the deferred wiring so a future PR can't
+    /// silently turn one of them on without intent.
+    #[test]
+    fn build_mappers_keeps_noop_for_5_4_tables() {
+        for t in &["HT_CheckIn_H", "HT_CheckIn_Ds", "HT_CheckIn_Pay", "HT_Receipt_H"] {
+            let mut allow = HashSet::new();
+            allow.insert((*t).to_string());
+            let mappers = build_mappers(&Some(allow));
+            assert_eq!(mappers.len(), 1, "{t}: expected one mapper");
+            assert!(
+                mappers[0].primary_key_cols().is_empty(),
+                "{t} must still be NoopMapper until 5.4"
+            );
+        }
     }
 
     #[test]
