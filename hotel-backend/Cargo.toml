@@ -22,6 +22,10 @@ name = "writeback"
 path = "src/bin/writeback.rs"
 
 [[bin]]
+name = "sync"
+path = "src/bin/sync.rs"
+
+[[bin]]
 name = "backfill_rooms"
 path = "src/bin/backfill_rooms.rs"
 
