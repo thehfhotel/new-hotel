@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.45.1] - 2026-04-26
+
+### Security
+
+- **CI/CD pipeline credential cleanup (Batch A of post-Phase-5.5 audit).**
+  Replaced every hardcoded credential in `.github/workflows/docker-build.yml`
+  and `deploy/hfville/docker-compose.yml` with GitHub Secrets references.
+  - **Removed `sshpass -p ***REMOVED***`** from the `deploy-hfville` job
+    (previously plaintext-shipped the jump-box SSH password literal twice
+    per deploy and once per `sudo -S`). The job now loads
+    `HFVILLE_SSH_KEY` into ssh-agent via `webfactory/ssh-agent@v0.9.0`,
+    pins the host key with a one-shot `ssh-keyscan -H` (drops
+    `StrictHostKeyChecking=no`), and runs `sudo docker …` directly —
+    requires a one-time NOPASSWD sudoers rule on the jump box (see
+    "Operator setup" below).
+  - **Replaced `***REMOVED***` literal** in the `test-backend` job
+    (CI-only Postgres) with `${{ secrets.TEST_POSTGRES_PASSWORD }}`. The
+    secret value is constrained to URL-safe characters so it embeds in
+    `DATABASE_URL` without percent-encoding.
+  - **Replaced `***REMOVED***`, `***REMOVED***`, and `***REMOVED***`
+    literals** in `deploy/hfville/docker-compose.yml` with
+    `${HFVILLE_PG_PASSWORD:?…}`, `${HFVILLE_MSSQL_PASSWORD:?…}`, and
+    `${POSTGRES_PASSWORD:?…}` (fail-fast if unset). The deploy-hfville
+    step writes `~/hfville/.env` from GH Secrets via `umask 077`+heredoc
+    so the file is born 600 (no 644-then-chmod race window).
+  - **Added secret-non-empty validation** at the top of both `deploy`
+    and `deploy-hfville` jobs — fails loud (`::error::`) before writing
+    `.env`, so a misconfigured GH secret never silently produces an
+    empty value the runtime would accept and misuse.
+  - **Removed the `--- .env file check ---` debug echo** from the
+    `deploy` job (info disclosure: enumerated env-var key names in the
+    log even though it omitted the values).
+  - **Operator setup required (one-time, separately from this commit):**
+    1. Install the public half of `HFVILLE_SSH_KEY` into
+       `~nut/.ssh/authorized_keys` on the HF Ville jump box (10.10.10.3).
+    2. Add `nut ALL=(ALL) NOPASSWD: /usr/bin/docker, /usr/bin/docker compose`
+       to `/etc/sudoers.d/nut-docker` on the jump box (replaces the
+       `echo ***REMOVED*** | sudo -S …` pattern).
+    3. After the operator confirms steps 1–2, rotate the in-place
+       passwords on the jump box's PG + MSSQL + production-push target.
+    4. Future password rotations: edit the corresponding GH Secret +
+       re-run the deploy workflow — no code change needed.
+
 ## [2.45.0] - 2026-04-26
 
 ### Added
