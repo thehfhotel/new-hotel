@@ -77,6 +77,33 @@ pub trait MssqlChangeMapper: Send + Sync {
         op: ChangeOp,
         row: Option<&dyn MappableRow>,
     ) -> Result<Option<DomainEvent>, SyncError>;
+
+    /// Optional **aggregate root key** for this row.
+    ///
+    /// Phase 5.3 introduces a "collect-then-dispatch" pass in the
+    /// watcher: when multiple CT rows in the same tick belong to the
+    /// same logical aggregate (booking header + line items + per-night
+    /// rows all under one `Book_no`), the watcher groups them by
+    /// `coalesce_key()` and runs the mapper exactly once per unique
+    /// key per tick. This keeps the canonical UPSERT + emitted
+    /// `DomainEvent` count at one-per-aggregate, regardless of how
+    /// many child rows changed.
+    ///
+    /// **Default `None`** — flat-table mappers (customer, room) want
+    /// per-row dispatch; the coalescing layer is bypassed for them.
+    /// Aggregate-root child mappers (booking_h / booking_ds /
+    /// booking_date) override this to return `Some(book_id)` so all
+    /// three feed into one shared `apply_booking_aggregate` call.
+    ///
+    /// Returns `None` when the key cannot be derived from the row
+    /// (e.g. a D-row on a child table whose CT PK is `id` only) — the
+    /// watcher falls back to per-row dispatch in that case, and the
+    /// next aggregate-level CT row (almost always within the same
+    /// tick, because legacy edits touch the header in the same TX)
+    /// drives the canonical re-load.
+    fn coalesce_key(&self, _row: &dyn MappableRow) -> Option<String> {
+        None
+    }
 }
 
 /// Phase 5.1 placeholder — exercises the watcher loop without any PG
