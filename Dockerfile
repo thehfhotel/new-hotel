@@ -7,7 +7,7 @@
 # Pin to digest (Batch C of post-Phase-5.5 audit). Source: Docker Hub API
 # `hub.docker.com/v2/repositories/library/node/tags/20-alpine` on 2026-04-26.
 # Dependabot (`docker` ecosystem, see .github/dependabot.yml) will bump this.
-FROM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS base
+FROM node:25-alpine@sha256:bdf2cca6fe3dabd014ea60163eca3f0f7015fbd5c7ee1b0e9ccb4ced6eb02ef4 AS base
 LABEL org.opencontainers.image.source=https://github.com/thehfhotel/new-hotel
 LABEL org.opencontainers.image.licenses=Proprietary
 RUN corepack enable && corepack prepare pnpm@10 --activate
@@ -40,7 +40,7 @@ RUN --mount=type=cache,target=/app/.next/cache,id=next-cache \
 # Runner stage — bare node:20-alpine (NOT FROM base): no pnpm in the
 # runtime image, just the standalone server output. Smaller surface +
 # nothing for an attacker to leverage if they get RCE on the web pod.
-FROM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS runner
+FROM node:25-alpine@sha256:bdf2cca6fe3dabd014ea60163eca3f0f7015fbd5c7ee1b0e9ccb4ced6eb02ef4 AS runner
 LABEL org.opencontainers.image.source=https://github.com/thehfhotel/new-hotel
 LABEL org.opencontainers.image.licenses=Proprietary
 WORKDIR /app
