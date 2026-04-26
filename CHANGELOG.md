@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.48.0] - 2026-04-26
+
+### Changed
+
+- **Tightened `paths-filter` so doc-only commits skip every build job.**
+  Previous filter set used a coarse `code` filter that triggered on most
+  frontend-side files; doc-only commits (CHANGELOG, docs/**, README.md,
+  AGENTS.md) sometimes still triggered jobs depending on which file
+  in the root was touched.
+  - Renamed `code` → `frontend`. New filter list explicitly enumerates
+    every Next.js / tooling path: `app/**`, `components/**`, `lib/**`,
+    `public/**`, `__tests__/**`, package files, `next.config.*`,
+    `tsconfig.json`, `tailwind.config.*`, `postcss.config.*`,
+    `Dockerfile`, `.dockerignore`.
+  - Added `migrations/pg/**` and `init-db/**` to the `backend` filter.
+    Schema changes affect `sqlx::query!()` compile-time validation, so
+    a migration MUST retest + rebuild the backend before deploy. This
+    closes a class of subtle drift bugs where the `.sqlx/` cache could
+    silently go stale.
+  - Added `scripts/backup-db.sh` to the `deploy` filter (it ships into
+    the deploy directory; a change must trigger a re-deploy).
+  - Module-level comment in the workflow documents the design
+    contract: paths NOT covered by any filter intentionally cause every
+    job to skip — that's the correct outcome for doc-only commits.
+  - All `if:` conditions migrated from `outputs.code` to
+    `outputs.frontend`. No catch-all globs introduced; the test/build
+    matrix remains legible for future maintainers.
+
 ## [2.47.0] - 2026-04-26
 
 ### Changed

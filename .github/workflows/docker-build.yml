@@ -20,10 +20,21 @@ jobs:
     permissions:
       contents: read
     outputs:
-      code: ${{ steps.filter.outputs.code }}
+      # `frontend` (was: `code`) — Next.js webapp + tooling files only.
+      # Anything else (backend, infra, docs) leaves it false.
+      frontend: ${{ steps.filter.outputs.frontend }}
+      # `backend` — Rust workspace + schema files (sqlx compile-time queries
+      # depend on schema). A migrations/ change retests + rebuilds the
+      # backend so a schema/code mismatch can never reach a green deploy.
       backend: ${{ steps.filter.outputs.backend }}
-      deploy: ${{ steps.filter.outputs.deploy }}
+      # `hfville` — kept BROAD on hotel-backend/** because ville-sync compiles
+      # in the same Cargo workspace; any backend file change can affect it.
+      # Narrowing is unsafe without per-target dep analysis.
       hfville: ${{ steps.filter.outputs.hfville }}
+      # `deploy` — files that ONLY affect the running services (compose,
+      # migrations, deploy/runner scripts). When any of these fires WITHOUT
+      # a build, the deploy job re-rolls the existing :latest images.
+      deploy: ${{ steps.filter.outputs.deploy }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,37 +43,58 @@ jobs:
         # v3 pinned to commit SHA per Batch D of post-Phase-5.5 audit.
         # Resolved via `gh api /repos/dorny/paths-filter/git/refs/tags/v3`.
         # Bumps surface as Dependabot PRs (.github/dependabot.yml).
+        #
+        # ## Filter design
+        #
+        # Each filter is the COMPLETE list of paths whose change MUST trigger
+        # the corresponding job(s). Paths NOT covered by any filter (e.g.
+        # CHANGELOG.md, docs/**, README.md, AGENTS.md) cause every job to skip
+        # — which is the correct outcome for doc-only commits: no rebuild,
+        # no deploy, no wasted runner minutes.
+        #
+        # If you add a new top-level path, decide which filter it belongs
+        # under and add it. Catch-all globs (`**` at the root) are deliberately
+        # NOT used here — explicit lists make the test/build matrix legible.
         uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590  # v3
         id: filter
         with:
           filters: |
-            code:
+            frontend:
               - 'app/**'
               - 'components/**'
               - 'lib/**'
               - 'public/**'
+              - '__tests__/**'
               - 'package.json'
               - 'pnpm-lock.yaml'
-              - 'Dockerfile'
-              - 'next.config.js'
-              - 'tailwind.config.ts'
+              - 'next.config.*'
               - 'tsconfig.json'
-              - 'postcss.config.mjs'
+              - 'tailwind.config.*'
+              - 'postcss.config.*'
+              - 'Dockerfile'
+              - '.dockerignore'
             backend:
               - 'hotel-backend/**'
+              # Schema changes affect sqlx::query!() compile-time validation,
+              # so any migration / init-db DDL change must retest + rebuild
+              # the backend. Without this the .sqlx/ cache could go stale
+              # without CI catching it before deploy.
+              - 'migrations/pg/**'
+              - 'init-db/**'
+            hfville:
+              - 'hotel-backend/**'
+              - 'deploy/hfville/**'
             deploy:
               - 'docker-compose.yml'
               - 'init-db/**'
               - 'migrations/pg/**'
               - 'scripts/migrate.sh'
-            hfville:
-              - 'hotel-backend/**'
-              - 'deploy/hfville/**'
+              - 'scripts/backup-db.sh'
 
   test-frontend:
     runs-on: ubuntu-latest
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.frontend == 'true'
     permissions:
       contents: read
     steps:
@@ -283,7 +315,7 @@ jobs:
     runs-on: ubuntu-latest
     # Block pushing :latest if frontend tests fail (Batch D of audit).
     needs: [changes, test-frontend]
-    if: needs.changes.outputs.code == 'true' && (needs.test-frontend.result == 'success' || needs.test-frontend.result == 'skipped')
+    if: needs.changes.outputs.frontend == 'true' && (needs.test-frontend.result == 'success' || needs.test-frontend.result == 'skipped')
     permissions:
       contents: read
       packages: write
@@ -440,7 +472,7 @@ jobs:
       (needs.test-frontend.result == 'success' || needs.test-frontend.result == 'skipped') &&
       (needs.test-backend.result == 'success' || needs.test-backend.result == 'skipped') &&
       (needs.init-db-migrations-drift-check.result == 'success' || needs.init-db-migrations-drift-check.result == 'skipped') &&
-      (needs.build-frontend.result == 'success' || needs.build-backend.result == 'success' || (needs.changes.outputs.deploy == 'true' && needs.changes.outputs.code != 'true' && needs.changes.outputs.backend != 'true'))
+      (needs.build-frontend.result == 'success' || needs.build-backend.result == 'success' || (needs.changes.outputs.deploy == 'true' && needs.changes.outputs.frontend != 'true' && needs.changes.outputs.backend != 'true'))
     steps:
       - name: Checkout
         uses: actions/checkout@v4
