@@ -535,10 +535,15 @@ async fn build_writeback_context(
             // Per-room override on the request beats the room's default; if
             // neither is set, fall back to the booking total (existing
             // behavior for one-room bookings).
+            // `.filter(|p| *p > 0.0)` on the room default keeps the chain
+            // falling through when the room is genuinely priceless (rare —
+            // a type that has no `ราคาปกติ` row in legacy `HT_Rooms_Price`)
+            // instead of latching on `Some(0.0)`.
             let price = req
                 .price_per_night
-                .or(default_weekday)
-                .or(body.total_amount)
+                .filter(|p| *p > 0.0)
+                .or(default_weekday.filter(|p| *p > 0.0))
+                .or(body.total_amount.filter(|p| *p > 0.0))
                 .unwrap_or(0.0);
             (room_no, room_type, price)
         }

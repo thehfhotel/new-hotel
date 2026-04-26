@@ -97,8 +97,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     tracing::info!("Connected to legacy MSSQL + PostgreSQL — starting backfill");
 
-    let type_stats = backfill_room_types(&legacy, &pg).await?;
-    let room_stats = backfill_rooms(&legacy, &pg).await?;
+    // Load `HT_Rooms_Price` upfront — the legacy app keys prices by
+    // (Room_Type, Room_CustType) where Room_CustType is the price tier
+    // (`ราคาปกติ` is the default / standard one). HT_Rooms.Room_PriceA is
+    // legacy-deprecated and shipped as 0 on every row in production.
+    let default_prices = load_default_prices(&legacy).await?;
+    let type_stats = backfill_room_types(&legacy, &pg, &default_prices).await?;
+    let room_stats = backfill_rooms(&legacy, &pg, &default_prices).await?;
     bump_sequences(&pg).await?;
 
     tracing::info!(
@@ -120,12 +125,66 @@ struct UpsertCounts {
 }
 
 // =============================================================================
+// Step 0: Default-price lookup
+// =============================================================================
+//
+// The legacy app stores the canonical room rate in `HT_Rooms_Price`, NOT
+// in `HT_Rooms.Room_PriceA` (which is shipped as 0 on every row in
+// production). The schema is `(Room_Type, Room_CustType, Room_Price)`
+// where `Room_CustType` is the price tier label — `ราคาปกติ` is the
+// standard rate the booking form uses by default.
+//
+// Returns a map from room type name (e.g. `"เตียงคู่"`) to the standard
+// price. Rooms whose type has no standard-price row will have None and
+// the per-room `room_price_weekday` is left NULL (so the route's
+// fallback chain can pick body.total_amount instead of being short-
+// circuited by Some(0.0)).
+
+/// `Room_CustType` literal that selects the "standard" price tier.
+const STANDARD_PRICE_TIER: &str = "ราคาปกติ";
+
+async fn load_default_prices(
+    legacy: &Pool<ConnectionManager>,
+) -> Result<HashMap<String, f64>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut conn = legacy.get().await?;
+    let rows = conn
+        .simple_query(
+            r#"
+            SELECT Room_Type, Room_Price
+            FROM HT_Rooms_Price
+            WHERE Room_CustType = N'ราคาปกติ'
+              AND Room_Price > 0
+            "#,
+        )
+        .await?
+        .into_first_result()
+        .await?;
+
+    let mut map = HashMap::with_capacity(rows.len());
+    for row in &rows {
+        let Some(name) = row.get::<&str, _>("Room_Type") else { continue };
+        let name = name.trim();
+        if name.is_empty() { continue }
+        let price = row.get::<f64, _>("Room_Price").unwrap_or(0.0);
+        if price <= 0.0 { continue }
+        map.insert(name.to_string(), price);
+    }
+    tracing::info!(
+        "  Default prices: loaded {n} room types with non-zero {tier} price",
+        n = map.len(),
+        tier = STANDARD_PRICE_TIER
+    );
+    Ok(map)
+}
+
+// =============================================================================
 // Step 1: Room Types
 // =============================================================================
 
 async fn backfill_room_types(
     legacy: &Pool<ConnectionManager>,
     pg: &PgPool,
+    default_prices: &HashMap<String, f64>,
 ) -> Result<UpsertCounts, Box<dyn std::error::Error + Send + Sync>> {
     let mut conn = legacy.get().await?;
 
@@ -154,7 +213,11 @@ async fn backfill_room_types(
                 format!("HT_SET_RoomType id={legacy_id}: 'name' is null/empty")
             })?
             .to_string();
-        let base_price = row.get::<f64, _>("Room_PriceA");
+        // Standard price for this type — sourced from HT_Rooms_Price (the
+        // legacy app's actual price table), NOT HT_SET_RoomType.Room_PriceA
+        // which is shipped as 0 in production. Falls back to 0 only when
+        // there's no `ราคาปกติ` row at all for this type.
+        let base_price = default_prices.get(&name).copied().unwrap_or(0.0);
 
         // type_code is NOT NULL UNIQUE in PG. Prefer id_full; fall back to
         // a deterministic stub so re-runs land on the same row.
@@ -208,6 +271,7 @@ async fn backfill_room_types(
 async fn backfill_rooms(
     legacy: &Pool<ConnectionManager>,
     pg: &PgPool,
+    default_prices: &HashMap<String, f64>,
 ) -> Result<UpsertCounts, Box<dyn std::error::Error + Send + Sync>> {
     // Build name → type_id lookup from PG (room_types must be backfilled first).
     let type_lookup = load_type_name_index(pg).await?;
@@ -255,9 +319,24 @@ async fn backfill_rooms(
         }
 
         let room_details = row.get::<&str, _>("Room_Details").map(String::from);
-        let price_a = row.get::<f64, _>("Room_PriceA");
-        let price_b = row.get::<f64, _>("Room_PriceB");
-        let price_c = row.get::<f64, _>("Room_PriceC");
+        // HT_Rooms.Room_PriceA/B/C are legacy-deprecated and ship as 0 in
+        // production. Real prices live in HT_Rooms_Price keyed by Room_Type
+        // — we preloaded them into `default_prices`. We assign the standard
+        // tier (`ราคาปกติ`) to room_price_weekday; weekend/special are left
+        // None until we wire the multi-tier table (HT_Rooms_Price has
+        // Room_Price_H / Room_Price_M variants but we don't surface tiers
+        // in our UI yet).
+        //
+        // Leaving NULL (None) when the type has no `ราคาปกติ` entry — the
+        // route's `r.room_price_weekday.or(body.total_amount)` chain then
+        // correctly falls through to the user-entered total.
+        let price_weekday: Option<f64> = room_type_name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .and_then(|name| default_prices.get(name).copied())
+            .filter(|p| *p > 0.0);
+        let price_b: Option<f64> = None;
+        let price_c: Option<f64> = None;
         let room_use = row.get::<&str, _>("Room_Use").unwrap_or("no");
         let room_clean_legacy = row.get::<&str, _>("Room_Clean").unwrap_or("no");
         let room_maint_legacy = row.get::<&str, _>("Room_Manternace").unwrap_or("no");
@@ -333,7 +412,7 @@ async fn backfill_rooms(
         .bind(room_status)
         .bind(room_clean)
         .bind(room_maintenance)
-        .bind(price_a)
+        .bind(price_weekday)
         .bind(price_b)
         .bind(price_c)
         .bind(&room_details)
