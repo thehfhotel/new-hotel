@@ -5,9 +5,71 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.44.0] - 2026-04-26
+## [2.44.1] - 2026-04-26
 
 ### Added
+
+- **Phase 5.4 — checkin + payment CT mappers (completing 10-table CT
+  coverage). Every CT-enabled table now has a real mapper or an
+  intentional retired stub.**
+  - **`sync::parent_loader::load_checkin_aggregate(cin_no)`** — thin
+    wrapper around the 5.3-factored `fetch_rows` helper. Owns
+    `HT_CheckIn_H` (where_col=`Cin_no`), `HT_CheckIn_Ds` (where_col
+    `Cin_No` — capital N, verbatim from legacy schema), and
+    `HT_CheckIn_Pay`. Returns `CheckInAggregate { header, rooms,
+    payments }`.
+  - **`sync::resolve` module** — factored out of `mappers/booking.rs`
+    for symmetry with the check-in mapper. Exposes
+    `resolve_customer_id`, `resolve_booking_id`, `resolve_room_id`,
+    `resolve_checkin_id`. Defer-on-missing semantics
+    (`Ok(None)` → caller skips publish, next tick re-resolves).
+  - **`sync::mappers::checkin`** ships two `MssqlChangeMapper` impls
+    (`CheckInHeaderMapper`, `CheckInRoomsMapper`) that delegate to the
+    shared `apply_checkin_aggregate` helper. The helper:
+    - Re-loads the aggregate via `load_checkin_aggregate`.
+    - Idempotently UPSERTs `ht_checkins` (skip-on-no-change).
+    - Emits exactly one `CheckInCreated` / `CheckInCancelled` /
+      `CheckOutCompleted` event per aggregate per tick.
+    - On full check-out (every `Cin_Room_Status='Check-Out'`) AND a
+      non-empty `Cin_Book_no`, also re-projects the parent booking
+      aggregate inside the same TX so `Book_Status='ออกแล้ว'` →
+      `book_status='completed'` propagates atomically.
+  - **`sync::mappers::payment`** ships two impls — `PaymentMapper`
+    (`HT_CheckIn_Pay` — coalesces by `Cin_No` so payment changes flow
+    through the check-in aggregate sweep, keeping `cin_paid_amount`
+    in sync with the legacy `Total_Price_Pay`) and `ReceiptMapper`
+    (`HT_Receipt_H` — per-row dispatch, UPSERTs into `ht_payments`,
+    emits `PaymentReceived`). Receipt cancellations
+    (`status_name='ยกเลิก'`) flip `pay_voided=true`.
+  - **`Cin_status` Thai literal mapping** — `'ปกติ'` (and unknown) →
+    `'active'`; `'ยกเลิก'` → `'cancelled'`. Per-room
+    `Cin_Room_Status='Check-Out'` (English with HYPHEN, verbatim from
+    legacy) on every detail row promotes the canonical status to
+    `'checked_out'`. Header cancel always wins.
+  - **`RoomStatusMapper` retired**. `HT_Room_Status` CT rows are now
+    documented log-only stubs; the check-in aggregate is the source
+    of truth for "which room is occupied tonight". The mapper stays
+    registered so the table appears in `legacy_sync_status`
+    observability — operators can still see CT row counts tick.
+  - **Wiring**: `bin/sync.rs::build_mappers` now wires real mappers
+    for `HT_CheckIn_H`, `HT_CheckIn_Ds`, `HT_CheckIn_Pay`, and
+    `HT_Receipt_H` (was `NoopMapper` in 5.3). The coalesced dispatch
+    path branches on table name to route booking / checkin / payment
+    aggregates through their respective `apply_*_aggregate` helpers.
+  - **`apply_checkin_aggregate` mssql parameter is `Option<&DbPool>`**
+    so contexts without legacy access (unit tests, walk-in flows
+    that never trigger the parent re-projection side-effect) can
+    pass `None`. The watcher always passes `Some(&pool)`.
+  - 30+ new unit tests covering legacy-status mapping, projection,
+    coalescing dedup, idempotency, FK defer paths, checkout
+    detection, and event-shape regression. 6 new integration tests
+    against testcontainers PG covering walk-in upsert, idempotent
+    re-apply, status flip to cancelled, header-delete cancel,
+    full-checkout transition, and customer-defer behavior.
+  - **Migration**: none needed — `ht_checkins.legacy_*` +
+    `aggregate_id` already added in migration 014;
+    `ht_payments.pay_reference` (the receipt-no key) is part of the
+    baseline schema.
 
 - **Phase 5.3 — booking aggregate CT mapper (3-table HT_Book_H +
   HT_Book_Ds + HT_Book_Date with parent re-load + per-tick coalescing

@@ -269,27 +269,32 @@ fn build_clean_event(room_id: Uuid, is_now_clean: bool) -> DomainEvent {
 }
 
 // =============================================================================
-// HT_Room_Status — per-night occupancy ledger (Phase 5.2 stub)
+// HT_Room_Status — per-night occupancy ledger (Phase 5.4: retired stub)
 // =============================================================================
 
 /// CT mapper for the legacy `HT_Room_Status` ledger table.
 ///
-/// **Phase 5.2 stub.** This table is the per-night occupancy ledger; the
-/// canonical mirror lives in `ht_checkins` + `ht_booking_rooms`, both of
-/// which the 5.3 / 5.4 booking + checkin mappers own. Materialising it
-/// here would duplicate state the upstream mappers will rebuild from
-/// their own CT rows.
+/// **Phase 5.4 — retired-stub status.** The 5.4 check-in aggregate
+/// owns the canonical "which room is occupied tonight" view. Every
+/// `HT_Room_Status` change in MSSQL is paired with a corresponding
+/// `HT_CheckIn_H` / `HT_CheckIn_Ds` change in the same legacy
+/// transaction (verified across walkin / checkin-from-booking /
+/// checkout / cancel flows in the spike captures); the check-in mapper
+/// re-loads the parent aggregate and re-projects occupancy from the
+/// ground truth.
 ///
-/// For 5.2 we accept the CT rows (so the watcher's `rows_skipped`
-/// counter ticks visibly), log them at `info`, and emit no events. When
-/// 5.4 lands the booking + checkin mappers, this stub gets either:
+/// Materialising `HT_Room_Status` here would either:
+/// 1. Duplicate state the check-in mapper already projects, OR
+/// 2. Race against it (two CT ticks could land on the same room-night
+///    in opposite orders).
 ///
-/// - retired (booking mapper rebuilds occupancy from `HT_Book_Date` +
-///   `HT_CheckIn_Ds`), or
-/// - promoted into a thin "room currently occupied?" view.
-///
-/// The decision is deferred to 5.4 once the writeback flows are
-/// re-validated end-to-end against live data.
+/// We keep the mapper registered so the table appears in
+/// `legacy_sync_status` observability — operators can see the row
+/// count tick visibly — but `apply` is a documented no-op that simply
+/// logs and increments `rows_skipped`. This intentional retirement was
+/// agreed in the 5.4 prep notes (item #3); a future PR could replace
+/// this stub with a thin read-side view if a use case appears, but
+/// today no subscriber needs it.
 pub struct RoomStatusMapper;
 
 const ROOM_STATUS_TABLE: &str = "HT_Room_Status";
@@ -317,7 +322,9 @@ impl MssqlChangeMapper for RoomStatusMapper {
         op: ChangeOp,
         row: Option<&dyn MappableRow>,
     ) -> Result<Option<DomainEvent>, SyncError> {
-        // Log + skip. See the type-level doc comment for the rationale.
+        // Log + skip. See the type-level doc comment for the rationale:
+        // 5.4 retired this mapper in favour of the check-in aggregate's
+        // ground-truth occupancy projection.
         let pk = row
             .and_then(|r| r.try_get_i32("id").ok().flatten())
             .unwrap_or(-1);
@@ -330,8 +337,8 @@ impl MssqlChangeMapper for RoomStatusMapper {
             op = ?op,
             id = pk,
             room_no = %room_no,
-            "HT_Room_Status CT row observed (5.2 stub — deferred to 5.4 \
-             booking/checkin mappers)"
+            "HT_Room_Status CT row observed (5.4 retired stub — \
+             occupancy is owned by the check-in aggregate)"
         );
         Ok(None)
     }
@@ -440,12 +447,12 @@ mod tests {
         assert!(m.select_sql().contains("room_status"));
     }
 
-    /// `HT_Room_Status::apply` always returns `Ok(None)` in 5.2 — it's
-    /// a logging stub. This test pins the stub semantics until 5.4
-    /// replaces it; if a future PR accidentally emits an event from
-    /// here, the duplicate-publication risk surfaces in CI.
+    /// `HT_Room_Status::apply` always returns `Ok(None)`. As of 5.4
+    /// this is a *retired* stub — the check-in aggregate owns
+    /// occupancy. The mapper stays registered only so the table
+    /// appears in `legacy_sync_status` observability.
     #[tokio::test]
-    async fn room_status_mapper_apply_is_a_logging_stub_in_phase_52() {
+    async fn room_status_mapper_apply_is_a_retired_stub_in_phase_54() {
         // We can construct a `RoomStatusMapper` and assert its metadata
         // without a tx. The actual `apply` call requires a tx; rely on
         // the integration suite for runtime coverage. Here we lock the

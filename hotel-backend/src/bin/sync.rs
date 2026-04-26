@@ -69,10 +69,12 @@ use hotel_backend::outbox::bus::EventBus;
 use hotel_backend::outbox::event::DomainEvent;
 use hotel_backend::sync::change_op::ChangeOp;
 use hotel_backend::sync::mappers::{
-    apply_booking_aggregate, BookingDatesMapper, BookingHeaderMapper, BookingRoomsMapper,
-    CustomerMapper, RoomMasterMapper, RoomStatusMapper,
+    apply_booking_aggregate, apply_checkin_aggregate, apply_payment_aggregate,
+    BookingDatesMapper, BookingHeaderMapper, BookingRoomsMapper, CheckInHeaderMapper,
+    CheckInRoomsMapper, CustomerMapper, PaymentMapper, ReceiptMapper, RoomMasterMapper,
+    RoomStatusMapper,
 };
-use hotel_backend::sync::parent_loader::load_booking_aggregate;
+use hotel_backend::sync::parent_loader::{load_booking_aggregate, load_checkin_aggregate};
 use hotel_backend::sync::{MssqlChangeMapper, NoopMapper};
 use hotel_backend::writeback::verify_schema_fingerprint;
 
@@ -192,7 +194,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mappers = build_mappers(&allowlist);
     tracing::info!(
         count = mappers.len(),
-        "Mappers initialised (Phase 5.2: customer + room real, others NoopMapper)"
+        "Mappers initialised (Phase 5.4: 10-table coverage — every CT-enabled \
+         table has a real mapper or an intentional retired stub)"
     );
 
     let shutdown = Arc::new(Notify::new());
@@ -248,8 +251,8 @@ fn parse_allowlist(raw: Option<String>) -> Option<HashSet<String>> {
 }
 
 /// Build the per-table mapper list, filtered by the allowlist. Phase
-/// 5.2 wires real mappers for `HT_Customers` / `HT_Rooms` /
-/// `HT_Room_Status`; the rest ride on `NoopMapper` until 5.3 / 5.4.
+/// 5.4 completes 10-table coverage: every CT-enabled table now has a
+/// real mapper or an intentional retired stub (`HT_Room_Status`).
 fn build_mappers(allowlist: &Option<HashSet<String>>) -> Vec<Box<dyn MssqlChangeMapper>> {
     let allowed = |t: &str| allowlist.as_ref().map(|a| a.contains(t)).unwrap_or(true);
 
@@ -266,6 +269,10 @@ fn build_mappers(allowlist: &Option<HashSet<String>>) -> Vec<Box<dyn MssqlChange
             "HT_Book_H" => Box::new(BookingHeaderMapper),
             "HT_Book_Ds" => Box::new(BookingRoomsMapper),
             "HT_Book_Date" => Box::new(BookingDatesMapper),
+            "HT_CheckIn_H" => Box::new(CheckInHeaderMapper),
+            "HT_CheckIn_Ds" => Box::new(CheckInRoomsMapper),
+            "HT_CheckIn_Pay" => Box::new(PaymentMapper),
+            "HT_Receipt_H" => Box::new(ReceiptMapper),
             other => Box::new(NoopMapper { table_name: other }),
         };
         out.push(mapper);
@@ -453,28 +460,63 @@ async fn poll_table(
             }
         }
 
-        for book_id in &keys {
-            let aggregate = match load_booking_aggregate(mssql, book_id).await {
-                Ok(a) => a,
-                Err(err) => {
+        for key in &keys {
+            // Route the coalesced apply by table. Three aggregate
+            // shapes ship today:
+            //
+            // * booking_*  → load_booking_aggregate + apply_booking_aggregate
+            // * checkin_*  → load_checkin_aggregate + apply_checkin_aggregate
+            // * payment_*  → apply_payment_aggregate (loads internally)
+            let result = match table {
+                "HT_Book_H" | "HT_Book_Ds" | "HT_Book_Date" => {
+                    match load_booking_aggregate(mssql, key).await {
+                        Ok(a) => apply_booking_aggregate(&mut tx, &a, key).await,
+                        Err(err) => {
+                            tracing::warn!(
+                                table,
+                                key = %key,
+                                error = %err,
+                                "Failed to load booking aggregate; recording and continuing"
+                            );
+                            let _ = record_table_error(pg, table, &err.to_string()).await;
+                            skipped += 1;
+                            continue;
+                        }
+                    }
+                }
+                "HT_CheckIn_H" | "HT_CheckIn_Ds" => {
+                    match load_checkin_aggregate(mssql, key).await {
+                        Ok(a) => apply_checkin_aggregate(&mut tx, Some(mssql), &a, key).await,
+                        Err(err) => {
+                            tracing::warn!(
+                                table,
+                                key = %key,
+                                error = %err,
+                                "Failed to load checkin aggregate; recording and continuing"
+                            );
+                            let _ = record_table_error(pg, table, &err.to_string()).await;
+                            skipped += 1;
+                            continue;
+                        }
+                    }
+                }
+                "HT_CheckIn_Pay" => apply_payment_aggregate(&mut tx, mssql, key).await,
+                other => {
                     tracing::warn!(
-                        table,
-                        book_id = %book_id,
-                        error = %err,
-                        "Failed to load booking aggregate; recording and continuing"
+                        table = other,
+                        "Unknown coalesced aggregate table — skipping"
                     );
-                    let _ = record_table_error(pg, table, &err.to_string()).await;
                     skipped += 1;
                     continue;
                 }
             };
-            let result = apply_booking_aggregate(&mut tx, &aggregate, book_id).await;
+
             match result {
                 Ok(Some(event)) => {
                     if shadow_mode {
                         tracing::info!(
                             table,
-                            book_id = %book_id,
+                            key = %key,
                             event_type = event.type_name(),
                             "would publish (shadow mode)"
                         );
@@ -482,7 +524,7 @@ async fn poll_table(
                     } else if let Err(err) = persist_event(&mut tx, &event).await {
                         tracing::error!(
                             table,
-                            book_id = %book_id,
+                            key = %key,
                             error = %err,
                             "Failed to persist event_log row"
                         );
@@ -498,9 +540,9 @@ async fn poll_table(
                 Err(err) => {
                     tracing::warn!(
                         table,
-                        book_id = %book_id,
+                        key = %key,
                         error = %err,
-                        "apply_booking_aggregate error — recording and continuing"
+                        "aggregate apply error — recording and continuing"
                     );
                     let _ = record_table_error(pg, table, &err.to_string()).await;
                     skipped += 1;
@@ -1034,19 +1076,26 @@ mod tests {
         assert!(mappers[0].select_sql().contains("Book_ok"));
     }
 
-    /// 5.4 will retire / promote these — until then, they ride on
-    /// NoopMapper. Locks the deferred wiring so a future PR can't
-    /// silently turn one of them on without intent.
+    /// 5.4 wired the four checkin/receipt tables to real mappers.
+    /// Locks the wiring so a refactor can't silently regress them
+    /// back to NoopMapper.
     #[test]
-    fn build_mappers_keeps_noop_for_5_4_tables() {
-        for t in &["HT_CheckIn_H", "HT_CheckIn_Ds", "HT_CheckIn_Pay", "HT_Receipt_H"] {
+    fn build_mappers_wires_5_4_tables_to_real_mappers() {
+        let cases: &[(&str, &[&str])] = &[
+            ("HT_CheckIn_H", &["Cin_no"]),
+            ("HT_CheckIn_Ds", &["id"]),
+            ("HT_CheckIn_Pay", &["id"]),
+            ("HT_Receipt_H", &["id"]),
+        ];
+        for (t, expected_pk) in cases {
             let mut allow = HashSet::new();
             allow.insert((*t).to_string());
             let mappers = build_mappers(&Some(allow));
             assert_eq!(mappers.len(), 1, "{t}: expected one mapper");
-            assert!(
-                mappers[0].primary_key_cols().is_empty(),
-                "{t} must still be NoopMapper until 5.4"
+            assert_eq!(
+                mappers[0].primary_key_cols(),
+                *expected_pk,
+                "{t} must be wired to its real 5.4 mapper, not NoopMapper"
             );
         }
     }
