@@ -6,9 +6,12 @@ import {
   AlertCircle,
   Clock,
   LogIn,
+  LogOut,
 } from 'lucide-react'
 import { useBranch, BRANCH_LABELS } from '@/contexts/BranchContext'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import CheckInModal from '@/components/CheckInModal'
+import CheckOutModal from '@/components/CheckOutModal'
 
 interface Stats {
   totalRooms: number
@@ -99,6 +102,38 @@ export default function NewDashboard() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [selectedRoom, setSelectedRoom] = useState<Room | null>(null)
+  // PG room_id by uppercase Room_no — populated once on mount from
+  // /api/new/rooms (the new app's room table). The dashboard's main data
+  // source (/api/rooms, legacy) only exposes the string Room_no, but
+  // POST /api/new/checkins requires the integer room_id. Built once
+  // because room inventory rarely changes.
+  const [roomIdByNo, setRoomIdByNo] = useState<Map<string, number>>(new Map())
+  const [showCheckIn, setShowCheckIn] = useState(false)
+  const [showCheckOut, setShowCheckOut] = useState(false)
+
+  // One-shot lookup of PG room ids — needed to drive the check-in/out
+  // modals (which require integer room_id, while /api/rooms only exposes
+  // the string Room_no). Re-runs only on branch change.
+  useEffect(() => {
+    let cancelled = false
+    const loadIds = async () => {
+      try {
+        const res = await branchFetch('/api/new/rooms?limit=200')
+        if (!res.ok) return
+        const data = await res.json()
+        if (cancelled) return
+        const map = new Map<string, number>()
+        for (const r of (data.data || []) as { id: number; roomNo: string }[]) {
+          if (r.roomNo) map.set(r.roomNo.toUpperCase(), r.id)
+        }
+        setRoomIdByNo(map)
+      } catch {
+        // Silent — buttons will be disabled if id lookup fails
+      }
+    }
+    loadIds()
+    return () => { cancelled = true }
+  }, [branchFetch])
 
   const fetchData = useCallback(async () => {
     try {
@@ -374,10 +409,33 @@ export default function NewDashboard() {
                 {statusConfig[selectedRoom.status].label}
               </span>
             </div>
-            <div className="p-3">
-              <p className="text-textMuted text-[12px] mb-3">
+            <div className="p-3 space-y-2">
+              <p className="text-textMuted text-[12px]">
                 {selectedRoom.type} {selectedRoom.details}
               </p>
+              {/* Action buttons — gated on resolved PG room_id. If the
+                  /api/new/rooms lookup hasn't landed yet (or this room
+                  isn't in PG), buttons stay disabled. */}
+              {selectedRoom.status === 'available' && (
+                <button
+                  onClick={() => setShowCheckIn(true)}
+                  disabled={!roomIdByNo.get(selectedRoom.roomNumber.toUpperCase())}
+                  className="w-full h-8 flex items-center justify-center gap-1.5 bg-brand-600 text-white hover:bg-brand-700 disabled:opacity-50 transition-colors text-[13px]"
+                >
+                  <LogIn size={12} />
+                  เช็คอิน
+                </button>
+              )}
+              {selectedRoom.status === 'occupied' && (
+                <button
+                  onClick={() => setShowCheckOut(true)}
+                  disabled={!roomIdByNo.get(selectedRoom.roomNumber.toUpperCase())}
+                  className="w-full h-8 flex items-center justify-center gap-1.5 bg-info text-white hover:opacity-90 disabled:opacity-50 transition-colors text-[13px]"
+                >
+                  <LogOut size={12} />
+                  เช็คเอ้าท์
+                </button>
+              )}
               <button
                 onClick={() => setSelectedRoom(null)}
                 className="w-full h-7 bg-panel border border-borderStrong text-text hover:bg-headerBar transition-colors text-[13px]"
@@ -387,6 +445,35 @@ export default function NewDashboard() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Check-in / check-out modals */}
+      {showCheckIn && selectedRoom && roomIdByNo.get(selectedRoom.roomNumber.toUpperCase()) && (
+        <CheckInModal
+          room={{
+            id: roomIdByNo.get(selectedRoom.roomNumber.toUpperCase())!,
+            roomNo: selectedRoom.roomNumber,
+            roomTypeName: selectedRoom.type,
+          }}
+          onClose={() => setShowCheckIn(false)}
+          onSuccess={() => {
+            fetchData()
+            setSelectedRoom(null)
+          }}
+        />
+      )}
+      {showCheckOut && selectedRoom && roomIdByNo.get(selectedRoom.roomNumber.toUpperCase()) && (
+        <CheckOutModal
+          room={{
+            id: roomIdByNo.get(selectedRoom.roomNumber.toUpperCase())!,
+            roomNo: selectedRoom.roomNumber,
+          }}
+          onClose={() => setShowCheckOut(false)}
+          onSuccess={() => {
+            fetchData()
+            setSelectedRoom(null)
+          }}
+        />
       )}
     </div>
   )
