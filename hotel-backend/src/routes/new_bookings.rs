@@ -550,6 +550,10 @@ async fn build_writeback_context(
         None => (String::new(), String::new(), body.total_amount.unwrap_or(0.0)),
     };
 
+    // Deposit (`เงินมัดจำ`) is optional on the form — None / 0 means no
+    // upfront payment. Lands in legacy `HT_Book_H.Book_Price_Pay`.
+    let deposit = money_from_baht_f64(body.deposit_amount.unwrap_or(0.0));
+
     Ok(BookingWritebackContext {
         customer_aggregate_id: aggregate_uuid(AggregateKind::Customer, body.customer_id),
         legacy_cust_no: None,
@@ -559,6 +563,7 @@ async fn build_writeback_context(
         room_no,
         room_type,
         price: money_from_baht_f64(room_price_baht),
+        deposit,
         created_by: String::new(),
         notes: body.notes.clone(),
     })
