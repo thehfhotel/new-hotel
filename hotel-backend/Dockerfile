@@ -107,57 +107,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     && cp target/release/sync /out/ \
     && cp target/release/backfill_rooms /out/
 
-# ---- test: compile + run the integration suite ---------------------------
-#
-# This stage exists for CI use — `docker buildx build --target test --network host`
-# from the test-backend job. It is NOT part of the runtime image lineage
-# (the runtime FROM scratch starts a new chain below, so this stage is
-# only built when a target=test is explicitly requested).
-#
-# ## Why it lives here, not in a separate Dockerfile
-#
-# It SHARES the `hotel-backend-target` cache mount with the builder stage.
-# When test-backend runs in CI, the gha-cache backend supplies cooked-deps
-# layers from the prior build-backend run (same `cache-from: gha,scope=backend`),
-# so the test compile only does the test-specific code on top — no
-# 800-crate dep recompile. Pre-cargo-chef this was a separate ~2.5-minute
-# cargo compile path; with chef + shared cache it's expected to drop
-# substantially.
-#
-# ## Network requirement
-#
-# Integration tests connect to PostgreSQL via DATABASE_URL. The test
-# stage's RUN inherits the build host's network when buildx is invoked
-# with `network: host`. The workflow's `services: postgres` block
-# exposes PG on localhost:5439 of the runner; the test container reaches
-# it through the host network namespace.
-#
-# DATABASE_URL is supplied as a build-arg (passed by docker/build-push-action
-# from a GH secret + literal port). It is NOT secret in the conventional
-# sense — the value is the CI-only DSN with the throwaway TEST_POSTGRES_PASSWORD
-# — but we still keep it as a build-arg rather than baking it into the
-# image because this stage is never pushed to a registry.
-FROM builder AS test
-ARG DATABASE_URL
-ENV DATABASE_URL=${DATABASE_URL}
-# SQLX_OFFLINE=true is inherited from the `chef` stage. The lib crate's
-# sqlx::query!() invocations are validated against the .sqlx/ cache file
-# (committed to repo) at COMPILE time. The test code itself uses
-# sqlx::query() (string-based, runtime-validated against DATABASE_URL)
-# so it needs PG reachable at RUN time but NOT at compile time.
-# Run cargo test directly inside the build. Result of the RUN = result
-# of the test suite; failing tests fail the build (and therefore the CI
-# job). Same `--locked` and `--test-threads=1` knobs as the runner-mode
-# invocation — see the `Run backend tests` step's commit body for why
-# threads=1 is mandatory (shared-DB race; flake fix `1e61bd6`).
-RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
-    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
-    --mount=type=cache,target=/usr/src/app/target,id=hotel-backend-target \
-    cargo test --release --locked -- --test-threads=1
-# Sentinel marker — buildx would otherwise return zero output for a
-# pure-RUN stage; this gives the image a writable layer above `builder`.
-RUN touch /tests-passed
-
 # ---- Runtime stage --------------------------------------------------------
 # Pin to digest. Source: Docker Hub API `library/debian/tags/bookworm-slim`
 # on 2026-04-26.
