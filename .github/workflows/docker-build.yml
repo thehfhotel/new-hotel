@@ -568,7 +568,7 @@ jobs:
         # installed on the jump box once by the operator (see commit body
         # for the operator setup). The action wipes the agent at job end.
         # v0.9.0 pinned to commit SHA per Batch D.
-        uses: webfactory/ssh-agent@dc588b651fe13675774614f8e6a936a468676387  # v0.9.0
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555  # v0.10.0
         with:
           ssh-private-key: ${{ secrets.HFVILLE_SSH_KEY }}
 
