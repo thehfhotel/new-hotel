@@ -13,6 +13,8 @@ on:
 
 jobs:
   build:
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -37,7 +39,9 @@ jobs:
           cache-dependency-path: thai-id-middleware-tauri/package-lock.json
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        # Pinned to a `1.89` branch SHA per Batch D — matches the backend
+        # toolchain in docker-build.yml so both pipelines use the same Rust.
+        uses: dtolnay/rust-toolchain@193d6aa1dbbc28bd2c0a6b0e327cfdce68baaf6e  # 1.89
 
       - name: Install Rust targets (macOS)
         if: matrix.platform == 'macos-latest'
@@ -48,14 +52,17 @@ jobs:
         run: rustup target add ${{ matrix.target }}
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        # v2 pinned to SHA per Batch D.
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
           workspaces: thai-id-middleware-tauri/src-tauri -> target
           cache-on-failure: true
 
       - name: Install npm dependencies
         working-directory: thai-id-middleware-tauri
-        run: npm install
+        # `npm ci` (Batch D) instead of `npm install`: refuses to update the
+        # lockfile, fails on any drift between package.json + package-lock.json.
+        run: npm ci
 
       - name: Build Tauri app (macOS)
         if: matrix.platform == 'macos-latest'
@@ -108,7 +115,8 @@ jobs:
         run: find dist -type f | head -20
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        # v2 pinned to SHA per Batch D.
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
         with:
           tag_name: middleware-${{ github.event.inputs.release_version }}
           name: Thai ID Middleware ${{ github.event.inputs.release_version }}

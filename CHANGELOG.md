@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.46.0] - 2026-04-26
+
+### Added
+
+- **`.github/dependabot.yml`** — covers cargo (`/hotel-backend`), npm
+  (`/` and `/thai-id-middleware-tauri`), github-actions, and docker
+  (`/` and `/hotel-backend`). Weekly cadence. The previous file was
+  the GitHub-template stub with `package-ecosystem: ""`.
+
+### Changed
+
+- **CI hygiene (Batch D of post-Phase-5.5 audit).**
+  - **`build-frontend`, `build-backend`, `build-ville-sync` now
+    `needs:` their respective test jobs** with explicit success-or-
+    skipped guards in the `if:`. The `:latest` tag is no longer
+    pushed to GHCR if tests fail, which the existing `deploy.if`
+    treated as recoverable.
+  - **Per-job `permissions:` blocks** (least-privilege GITHUB_TOKEN):
+    - `changes`, `test-frontend`, `test-backend`, middleware `build`:
+      `{ contents: read }` only.
+    - `build-frontend`, `build-backend`, `build-ville-sync`:
+      `{ contents: read, packages: write }` (push to GHCR).
+    - `deploy`, `deploy-hfville`: `{ contents: read, packages: read }`
+      (pull only — they don't push).
+  - **GHA cache `scope:`** added to all 3 `docker/build-push-action`
+    invocations: `frontend`, `backend`, `ville-sync`. Stops one image
+    build's cache from evicting another's.
+  - **`cargo test --locked`** in CI (matches the production Dockerfile
+    build).
+  - **`npm install` -> `npm ci`** in `middleware-build.yml`: refuses to
+    update the lockfile, fails on any drift.
+
+### Security
+
+- **Pin third-party actions to commit SHA**:
+    dorny/paths-filter           v3      -> d1c1ffe0…
+    mozilla-actions/sccache-action v0.0.10 -> 9e7fa8a1…
+    Swatinem/rust-cache          v2      -> e18b4977…
+    pnpm/action-setup            v4      -> b906affc…
+    webfactory/ssh-agent         v0.9.0  -> dc588b65…
+    softprops/action-gh-release  v2      -> 3bb12739…
+    dtolnay/rust-toolchain       1.89    -> 193d6aa1…
+  Each call site has a `# vN.x.y` comment so future bumps stay obvious.
+  The `actions/*` and `docker/*` calls remain on float — they're owned
+  by GitHub and Docker respectively, so a SHA pin trades trust for
+  Dependabot churn with no real attack-surface reduction.
+- **Pin `dtolnay/rust-toolchain` to a `1.89` branch SHA** in BOTH
+  `docker-build.yml` (was `@stable`) and `middleware-build.yml` (was
+  `@stable`). Same Rust toolchain across both pipelines + matches the
+  version that generated `.sqlx/` cache files.
+
 ## [2.45.3] - 2026-04-26
 
 ### Security
