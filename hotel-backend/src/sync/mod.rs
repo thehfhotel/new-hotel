@@ -34,10 +34,13 @@
 
 pub mod change_op;
 pub mod mapper;
+pub mod mappers;
+pub mod row;
 pub mod watermark;
 
 pub use change_op::ChangeOp;
 pub use mapper::{MssqlChangeMapper, NoopMapper};
+pub use row::MappableRow;
 
 use thiserror::Error;
 

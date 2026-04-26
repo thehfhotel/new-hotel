@@ -116,6 +116,7 @@ These are automatically applied by `scripts/migrate.sh` during deployment.
 | 015 | `015_writeback_retry_state.sql` | Add `claimed_at`/`next_retry_at` to `writeback_jobs`; introduce `exhausted` terminal status. Enables stuck-in-progress recovery, retry backoff, and Slack alerting on retry exhaustion | v2.33.0 |
 | 016 | `016_writeback_notify_trigger.sql` | Auto-fire `NOTIFY writeback_channel` on every `writeback_jobs` INSERT so the worker wakes sub-second instead of waiting on the 30-second poll fallback | v2.38.0 |
 | 017 | `017_legacy_sync_status.sql` | Phase 5.1 — per-table CT-watcher observability table (`legacy_sync_status`) seeded for the 10 CT-enabled tables, plus `ht_customers.cust_deleted_at` soft-delete column for upcoming HT_Customers `D` mapper | v2.43.0 |
+| 018 | `018_ht_customers_aggregate_keys.sql` | Phase 5.2 — adds `legacy_cust_no` + `aggregate_id` to `ht_customers` (with partial unique indexes) so the new HT_Customers CT mapper can map MSSQL `Cust_no` → canonical PG row and emit `DomainEvent::Customer{Created,Modified}` with stable aggregate UUIDs | v2.43.1 |
 
 ## Tables Owned by This Application
 
