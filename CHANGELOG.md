@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.49.0] - 2026-04-26
+
+### Changed
+
+- **Phase 5 cutover step 1 — wire `LEGACY_SYNC_*` flags into deploy `.env`.**
+  The `deploy` job now reads `LEGACY_SYNC_ENABLED` and `LEGACY_SYNC_SHADOW_MODE`
+  from GH secrets and writes them into `~/new-hotel-production/.env` on
+  evergreen, so the operator's flip survives subsequent deploys (the known
+  pitfall documented in `docs/runbook-sync.md` §4a). Both secrets are
+  added to the non-empty validation gate. Initial values: both `true` —
+  worker enabled, shadow-mode rolling back every TX (observation only).
+  Cutover sequence next: `--bootstrap` once, then `./scripts/sync-status.sh
+  --watch` to soak 24–48h before flipping `LEGACY_SYNC_SHADOW_MODE=false`
+  for live writes.
+
 ## [2.48.1] - 2026-04-26
 
 ### Reverted
