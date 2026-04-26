@@ -54,7 +54,7 @@ const hotelInfo: HotelInfo = {
   name: 'The HF Hotel',
   address: '123 ถนนตัวอย่าง อ.เมือง จ.กรุงเทพฯ 10000',
   phone: '02-123-4567',
-  taxId: '0***REMOVED***9012',
+  taxId: '0REDACTED-sa-pw9012',
 }
 
 export default function InvoiceDetailPage({

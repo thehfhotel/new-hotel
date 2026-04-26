@@ -48,9 +48,9 @@ describe('Mock Factories', () => {
       expect(customer.id).toBe(1)
       expect(customer.firstName).toBe('ทดสอบ')
       expect(customer.lastName).toBe('ลูกค้า')
-      expect(customer.phone).toBe('08***REMOVED***')
+      expect(customer.phone).toBe('08REDACTED-sa-pw')
       expect(customer.email).toBe('test@example.com')
-      expect(customer.idCard).toBe('***REMOVED***90123')
+      expect(customer.idCard).toBe('REDACTED-sa-pw90123')
     })
 
     it('allows overriding default values', () => {
@@ -64,7 +64,7 @@ describe('Mock Factories', () => {
       expect(customer.firstName).toBe('สมชาย')
       expect(customer.lastName).toBe('ใจดี')
       // Other values should still be defaults
-      expect(customer.phone).toBe('08***REMOVED***')
+      expect(customer.phone).toBe('08REDACTED-sa-pw')
     })
   })
 

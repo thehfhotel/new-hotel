@@ -227,7 +227,7 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
               type="tel"
               value={phone}
               onChange={(e) => { setPhone(e.target.value); clearPicked() }}
-              placeholder="เช่น 08***REMOVED***"
+              placeholder="เช่น 08REDACTED-sa-pw"
               className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-500"
             />
             {phoneMatches.length > 0 && pickedCustomerId === null && (

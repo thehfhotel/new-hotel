@@ -20,7 +20,7 @@ jest.mock('lucide-react', () => ({
 
 // Mock customer data
 const mockCustomers = [
-  { id: 1, firstName: 'John', lastName: 'Doe', phone: '08***REMOVED***', idCard: '***REMOVED***90123' },
+  { id: 1, firstName: 'John', lastName: 'Doe', phone: '08REDACTED-sa-pw', idCard: 'REDACTED-sa-pw90123' },
   { id: 2, firstName: 'Jane', lastName: 'Smith', phone: '0898765432', idCard: '9876543210987' },
   { id: 3, firstName: 'Test', lastName: 'Customer', phone: '0811112222', idCard: null },
 ]
@@ -166,7 +166,7 @@ describe('QuickCheckInModal Component', () => {
 
       await waitFor(() => {
         expect(screen.getByText('John Doe')).toBeInTheDocument()
-        expect(screen.getByText('08***REMOVED***')).toBeInTheDocument()
+        expect(screen.getByText('08REDACTED-sa-pw')).toBeInTheDocument()
       })
     })
 

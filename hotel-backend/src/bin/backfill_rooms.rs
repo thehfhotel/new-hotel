@@ -489,7 +489,7 @@ async fn connect_legacy() -> Result<Pool<ConnectionManager>, Box<dyn std::error:
     let server = env::var("DB_SERVER").unwrap_or_else(|_| "192.168.100.222".to_string());
     let database = env::var("DB_NAME").unwrap_or_else(|_| "db".to_string());
     let user = env::var("DB_USER").unwrap_or_else(|_| "sa".to_string());
-    let password = env::var("DB_PASSWORD").unwrap_or_else(|_| "***REMOVED***".to_string());
+    let password = env::var("DB_PASSWORD").unwrap_or_else(|_| "REDACTED-sa-pw".to_string());
 
     let mut config = tiberius::Config::new();
     config.host(&server);

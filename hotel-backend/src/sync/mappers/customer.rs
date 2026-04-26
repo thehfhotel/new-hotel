@@ -413,14 +413,14 @@ mod tests {
             .with("Cust_no", MockValue::Str(cust_no.into()))
             .with("Cust_name", MockValue::Str(name.into()))
             .with("Cust_perfix", MockValue::Str("นาย".into()))
-            .with("Cust_IDcard", MockValue::Str("***REMOVED***90123".into()))
+            .with("Cust_IDcard", MockValue::Str("REDACTED-sa-pw90123".into()))
             .with(
                 "Cust_Type_Main",
                 MockValue::Str("บุคคลธรรมดา".into()),
             )
             .with("Cust_Email", MockValue::Str("a@b.co".into()))
             .with("Cust_Add_no", MockValue::Str("123/4".into()))
-            .with("Cust_Add_tel", MockValue::Str("08***REMOVED***".into()))
+            .with("Cust_Add_tel", MockValue::Str("08REDACTED-sa-pw".into()))
     }
 
     #[test]
@@ -430,11 +430,11 @@ mod tests {
         assert_eq!(p.cust_no, "C00001");
         assert_eq!(p.cust_name, "ทดสอบ");
         assert_eq!(p.cust_title.as_deref(), Some("นาย"));
-        assert_eq!(p.cust_idcard.as_deref(), Some("***REMOVED***90123"));
+        assert_eq!(p.cust_idcard.as_deref(), Some("REDACTED-sa-pw90123"));
         assert_eq!(p.cust_type.as_deref(), Some("บุคคลธรรมดา"));
         assert_eq!(p.cust_email.as_deref(), Some("a@b.co"));
         assert_eq!(p.cust_address.as_deref(), Some("123/4"));
-        assert_eq!(p.cust_phone.as_deref(), Some("08***REMOVED***"));
+        assert_eq!(p.cust_phone.as_deref(), Some("08REDACTED-sa-pw"));
     }
 
     #[test]

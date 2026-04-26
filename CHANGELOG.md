@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.46.4] - 2026-04-26
+
+### Fixed
+
+- **BFG over-scrubbed `REDACTED-sa-pw` from non-credential contexts.** The
+  history-rewrite pass replaced every occurrence of the 4 leaked
+  literals with `***REMOVED***`, but `REDACTED-sa-pw` was the most generic of
+  them — it appeared as fake Thai ID/phone/tax-ID test data, as fallback
+  default values in dev binaries, and as the literal in legacy-reference
+  decompiled C#. The replacement broke a regex literal in
+  `InvoiceTemplate.test.tsx` (turning `/…REDACTED-sa-pw…/` into
+  `/…***REMOVED***…/` — `*` is a regex metacharacter, "Nothing to repeat"
+  parse error), which cascaded to 3 failed CI runs.
+  - Restored `REDACTED-sa-pw` in test fixtures (Thai IDs/phones/tax IDs),
+    .env.example fallbacks, dev-binary `unwrap_or_else` defaults,
+    sqlx-prepare.sh dev DSN, and legacy-reference decompiled C#.
+  - Kept the scrub in `CHANGELOG.md` and one workflow comment, but
+    rewrote those entries with descriptive prose ("the SSH password",
+    "<hardcoded>") so future readers understand without the literal
+    being re-introduced.
+  - The actual sensitive `REDACTED-sa-pw` use (HF Ville `sa` MSSQL password
+    in `deploy/hfville/docker-compose.yml`) stays gone — it's now
+    `${HFVILLE_MSSQL_PASSWORD:?…}` from a GH secret per Batch A.
+
 ## [2.46.3] - 2026-04-26
 
 ### Added
@@ -252,7 +276,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CI/CD pipeline credential cleanup (Batch A of post-Phase-5.5 audit).**
   Replaced every hardcoded credential in `.github/workflows/docker-build.yml`
   and `deploy/hfville/docker-compose.yml` with GitHub Secrets references.
-  - **Removed `sshpass -p ***REMOVED***`** from the `deploy-hfville` job
+  - **Removed `sshpass -p <hardcoded>`** from the `deploy-hfville` job
     (previously plaintext-shipped the jump-box SSH password literal twice
     per deploy and once per `sudo -S`). The job now loads
     `HFVILLE_SSH_KEY` into ssh-agent via `webfactory/ssh-agent@v0.9.0`,
@@ -260,12 +284,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `StrictHostKeyChecking=no`), and runs `sudo docker …` directly —
     requires a one-time NOPASSWD sudoers rule on the jump box (see
     "Operator setup" below).
-  - **Replaced `***REMOVED***` literal** in the `test-backend` job
-    (CI-only Postgres) with `${{ secrets.TEST_POSTGRES_PASSWORD }}`. The
+  - **Replaced the production-PG password literal** in the `test-backend`
+    job (CI-only Postgres) with `${{ secrets.TEST_POSTGRES_PASSWORD }}`. The
     secret value is constrained to URL-safe characters so it embeds in
     `DATABASE_URL` without percent-encoding.
-  - **Replaced `***REMOVED***`, `***REMOVED***`, and `***REMOVED***`
-    literals** in `deploy/hfville/docker-compose.yml` with
+  - **Replaced the HF Ville hfville-db PG, legacy-MSSQL `sa`, and
+    production-PG password literals** in `deploy/hfville/docker-compose.yml` with
     `${HFVILLE_PG_PASSWORD:?…}`, `${HFVILLE_MSSQL_PASSWORD:?…}`, and
     `${POSTGRES_PASSWORD:?…}` (fail-fast if unset). The deploy-hfville
     step writes `~/hfville/.env` from GH Secrets via `umask 077`+heredoc
@@ -282,7 +306,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
        `~nut/.ssh/authorized_keys` on the HF Ville jump box (10.10.10.3).
     2. Add `nut ALL=(ALL) NOPASSWD: /usr/bin/docker, /usr/bin/docker compose`
        to `/etc/sudoers.d/nut-docker` on the jump box (replaces the
-       `echo ***REMOVED*** | sudo -S …` pattern).
+       `echo <password> | sudo -S …` pattern).
     3. After the operator confirms steps 1–2, rotate the in-place
        passwords on the jump box's PG + MSSQL + production-push target.
     4. Future password rotations: edit the corresponding GH Secret +
@@ -2020,7 +2044,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - Creates HotelNew database with all tables, indexes, sequences, and stored procedures
   - **Environment Configuration**
     - `NEW_DB_SERVER=newdb` - Backend connects to Docker container via service name
-    - `NEW_DB_PASSWORD=***REMOVED***` - Strong password for SA account
+    - `NEW_DB_PASSWORD=<see GH secret>` - Strong password for SA account
     - `SYSTEM_MODE=new` - Default to New Mode for fresh deployments
   - **Documentation**
     - Updated `CLAUDE.md` with dual-database architecture diagram
@@ -2039,7 +2063,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 - SQL Server container only accessible within Docker network (not exposed to host)
-- Strong SA password enforced (was using weak `***REMOVED***` for legacy connection)
+- Strong SA password enforced (was using a weak literal for legacy connection)
 
 ## [2.7.1] - 2026-02-05
 

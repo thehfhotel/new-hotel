@@ -24,9 +24,9 @@ const mockCustomerData: CustomerFormData = {
   id: 1,
   firstName: 'John',
   lastName: 'Doe',
-  phone: '08***REMOVED***',
+  phone: '08REDACTED-sa-pw',
   email: 'john@example.com',
-  idCard: '***REMOVED***90123',
+  idCard: 'REDACTED-sa-pw90123',
   address: '123 Main Street',
   notes: 'VIP customer',
 }
@@ -224,9 +224,9 @@ describe('CustomerForm Component', () => {
 
       expect(screen.getByDisplayValue('John')).toBeInTheDocument()
       expect(screen.getByDisplayValue('Doe')).toBeInTheDocument()
-      expect(screen.getByDisplayValue('08***REMOVED***')).toBeInTheDocument()
+      expect(screen.getByDisplayValue('08REDACTED-sa-pw')).toBeInTheDocument()
       expect(screen.getByDisplayValue('john@example.com')).toBeInTheDocument()
-      expect(screen.getByDisplayValue('***REMOVED***90123')).toBeInTheDocument()
+      expect(screen.getByDisplayValue('REDACTED-sa-pw90123')).toBeInTheDocument()
       expect(screen.getByDisplayValue('123 Main Street')).toBeInTheDocument()
       expect(screen.getByDisplayValue('VIP customer')).toBeInTheDocument()
     })

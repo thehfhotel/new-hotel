@@ -31,7 +31,7 @@ const mockCustomers: CustomerOption[] = [
     lastName: 'ใจดี',
     phone: '081-234-5678',
     email: 'somchai@email.com',
-    idCard: '***REMOVED***90123',
+    idCard: 'REDACTED-sa-pw90123',
   },
   {
     id: 2,

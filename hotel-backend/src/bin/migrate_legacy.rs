@@ -701,7 +701,7 @@ async fn create_legacy_pool() -> Result<bb8::Pool<bb8_tiberius::ConnectionManage
     let server = std::env::var("DB_SERVER").unwrap_or_else(|_| "192.168.100.222".to_string());
     let database = std::env::var("DB_NAME").unwrap_or_else(|_| "db".to_string());
     let user = std::env::var("DB_USER").unwrap_or_else(|_| "sa".to_string());
-    let password = std::env::var("DB_PASSWORD").unwrap_or_else(|_| "***REMOVED***".to_string());
+    let password = std::env::var("DB_PASSWORD").unwrap_or_else(|_| "REDACTED-sa-pw".to_string());
 
     let mut config = tiberius::Config::new();
     config.host(&server);
@@ -734,7 +734,7 @@ async fn create_pg_pool() -> Result<sqlx::PgPool, Box<dyn std::error::Error>> {
         .unwrap_or(5439);
     let database = std::env::var("NEW_DB_NAME").unwrap_or_else(|_| "hotelnew".to_string());
     let user = std::env::var("NEW_DB_USER").unwrap_or_else(|_| "postgres".to_string());
-    let password = std::env::var("NEW_DB_PASSWORD").unwrap_or_else(|_| "***REMOVED***".to_string());
+    let password = std::env::var("NEW_DB_PASSWORD").unwrap_or_else(|_| "REDACTED-sa-pw".to_string());
 
     let conn_str = format!("postgres://{}:{}@{}:{}/{}", user, password, server, port, database);
 

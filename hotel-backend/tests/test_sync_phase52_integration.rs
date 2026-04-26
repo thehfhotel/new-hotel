@@ -33,7 +33,7 @@ fn customer_row_full(cust_no: &str, name: &str, phone: &str) -> HashMapRow {
         .with("Cust_no", MockValue::Str(cust_no.into()))
         .with("Cust_name", MockValue::Str(name.into()))
         .with("Cust_perfix", MockValue::Str("นาย".into()))
-        .with("Cust_IDcard", MockValue::Str("***REMOVED***90123".into()))
+        .with("Cust_IDcard", MockValue::Str("REDACTED-sa-pw90123".into()))
         .with(
             "Cust_Type_Main",
             MockValue::Str("บุคคลธรรมดา".into()),

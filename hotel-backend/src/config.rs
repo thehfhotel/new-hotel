@@ -18,7 +18,7 @@ impl DbConfig {
             server: env::var("DB_SERVER").unwrap_or_else(|_| "192.168.100.222".to_string()),
             database: env::var("DB_NAME").unwrap_or_else(|_| "db".to_string()),
             user: env::var("DB_USER").unwrap_or_else(|_| "sa".to_string()),
-            password: env::var("DB_PASSWORD").unwrap_or_else(|_| "***REMOVED***".to_string()),
+            password: env::var("DB_PASSWORD").unwrap_or_else(|_| "REDACTED-sa-pw".to_string()),
             pool_max: env::var("DB_POOL_MAX")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -48,7 +48,7 @@ impl NewDbConfig {
                 .unwrap_or(5439),
             database: env::var("NEW_DB_NAME").unwrap_or_else(|_| "hotelnew".to_string()),
             user: env::var("NEW_DB_USER").unwrap_or_else(|_| "postgres".to_string()),
-            password: env::var("NEW_DB_PASSWORD").unwrap_or_else(|_| "***REMOVED***".to_string()),
+            password: env::var("NEW_DB_PASSWORD").unwrap_or_else(|_| "REDACTED-sa-pw".to_string()),
             pool_max: env::var("NEW_DB_POOL_MAX")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -161,7 +161,7 @@ impl VilleDbConfig {
                 .unwrap_or(5440),
             database: env::var("VILLE_DB_NAME").unwrap_or_else(|_| "hfville".to_string()),
             user: env::var("VILLE_DB_USER").unwrap_or_else(|_| "postgres".to_string()),
-            password: env::var("VILLE_DB_PASSWORD").unwrap_or_else(|_| "***REMOVED***".to_string()),
+            password: env::var("VILLE_DB_PASSWORD").unwrap_or_else(|_| "REDACTED-sa-pw".to_string()),
             pool_max: env::var("VILLE_DB_POOL_MAX")
                 .ok()
                 .and_then(|v| v.parse().ok())
