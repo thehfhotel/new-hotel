@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.42.0] - 2026-04-26
+
+### Changed
+
+- **`docs/architecture.md`** — incorporated 2026-04 reverse-engineering
+  findings from `legacy-reference/`. Recipe-level audits (booking, check-in,
+  checkout/payment) found no new code divergences — recipes are aligned with
+  decompiled C#. Doc updates only:
+  - Fixed misleading "owns its own IDs (UUIDs)" bullet in §1 ASCII diagram —
+    PG owns UUIDs internally; writeback emits legacy-shape string IDs
+    (`C0001`, `R000001`, `CH26-000001`).
+  - New §3.7 "Ground-truth principle" — codifies the 3-tier source-of-truth
+    precedence (live captures > decompiled C# > inferred analysis), with the
+    `HT_CheckIn_Ds.id IDENTITY` mistake as the case-in-point. Documents
+    pricing source (`HT_Rooms_Price` not `HT_Rooms.Room_PriceA/B/C`), VAT 7%
+    inclusive split formula, mixed Thai/English status enum landmines, and
+    the `varchar Thai_CI_AS` text-encoding rule.
+  - §4a — added legacy ID format table + the `MAX(id)+1 + TABLOCKX/HOLDLOCK`
+    allocation pattern for the two non-IDENTITY PKs (`HT_CheckIn_Ds.id`,
+    `HT_Receipt_H.id`).
+  - §8 roadmap — promoted Phase 5 (CT watcher) to **TOP PRIORITY** and
+    framed it as the missing half of co-existence; added Phase 5.5
+    (read-only mirror tables for legacy-only entities — coupons, deposits,
+    products, room moves, etc.).
+  - §10 #8 — Change Tracking marked enabled & live-verified (was warning).
+  - New §11 "Legacy-only features (opaque pass-through)" — explicit table
+    of 10 legacy-only tables we mirror but never write to, plus 10 legacy
+    behaviors we don't replicate (coupons, standalone deposits, in-stay
+    POS, credit sales, hourly pricing, room-move, photos, SMS, etc.).
+
 ## [2.41.1] - 2026-04-26
 
 ### Added

@@ -78,8 +78,11 @@ State C (decommissioned): Only our app                — sync + writeback both 
         │  ┌─────────────────────────────┐                │
         │  │ canonical tables (ht_*)     │                │
         │  │ – customers, bookings, etc. │                │
-        │  │ – owns its own IDs (UUIDs)  │                │
+        │  │ – PG owns UUID PKs internal │                │
         │  │ – stores legacy_id refs     │                │
+        │  │ – writeback emits legacy-   │                │
+        │  │   shape string IDs (C0001,  │                │
+        │  │   R000001, CH26-000001)     │                │
         │  └─────────────────────────────┘                │
         │                                                 │
         │  ┌─────────────────────────────┐                │
@@ -804,6 +807,44 @@ The only NEW concept is "publish a domain event at every write." That's already 
 
 ---
 
+## 3.7. Ground-truth principle (lessons from 2026-04 reverse-engineering)
+
+The legacy MSSQL schema and the `.NET` app's behavior are not documented anywhere we control. We have three independent sources of truth, and after the 2026-04 reverse-engineering pass we now treat them in a strict precedence order. **When sources disagree, trust the higher tier.**
+
+| Tier | Source | Location | Confidence |
+|---|---|---|---|
+| 1 | Live SQL Server captures (Extended Events, sniffed `RPC:Completed`) | `docs/legacy-spike/` (11 sessions + `findings.md`, ~700 LOC) | Highest — observed reality |
+| 2 | Decompiled C# from the legacy `.exe` | `legacy-reference/` | High — but reflects intent, not always behavior |
+| 3 | Inferred / cheatsheet analysis | scattered notes, early write-ups | Lowest — may be stale or wrong |
+
+**Case in point — `HT_CheckIn_Ds.id`.** The original spike cheatsheet recorded this column as `IDENTITY` (autoincrement). The decompiled C# in `legacy-reference/` clearly shows the legacy app allocating the next id manually with `MAX(id)+1`, and a re-capture against the live DB confirmed the column is a plain `int`. We were one bug away from writebacks blowing up under concurrency. The current writeback (`hotel-backend/src/writeback/allocate.rs`) treats both `HT_CheckIn_Ds.id` and `HT_Receipt_H.id` as manual-allocation columns under `TABLOCKX, HOLDLOCK`. See §4a for the SQL recipe.
+
+Other ground-truth facts that fall out of this precedence rule:
+
+- **Pricing lives in the per-tier override table, not the room row.** Real per-room nightly prices come from `HT_Rooms_Price` keyed by `(Room_Type, Room_CustType='ราคาปกติ')`, columns `Room_Price` (nightly), `Room_Price_H` (hourly), `Room_Price_M` (monthly). The `HT_Rooms.Room_PriceA / Room_PriceB / Room_PriceC` columns are all zero in production — they look like the obvious source but they aren't. `bin/backfill_rooms.rs` was fixed in commit `8d8864e` to read from `HT_Rooms_Price`; any new pricing reads must do the same.
+
+- **VAT is 7% inclusive, with a specific rounding rule.** Receipts and bookings store VAT-inclusive totals; the split is computed as:
+
+  ```
+  Total      = BeforeVat + Vat
+  BeforeVat  = round(Total × 100 / 107, 2)   -- banker's rounding to 2dp
+  Vat        = Total − BeforeVat
+  ```
+
+  Implemented in `hotel-backend/src/writeback/format.rs::vat_inclusive_split`, with regression tests against captured legacy values (801, 1390, 3560 baht). Receipts that compute VAT any other way will fail to match the printed totals from the legacy app, which is what the receptionists reconcile against.
+
+- **Status enums are mixed Thai/English and contain bug-for-bug surprises** — every writeback recipe respects them exactly:
+  - `HT_Rooms.room_status` — Thai: `'ว่าง'` (vacant), `'เข้าพัก'` (occupied), `'จอง'` (reserved).
+  - `HT_CheckIn_Ds.Cin_Room_Status` — English **with a hyphen**: `'Check-In'`, `'Check-Out'`. The legacy `.NET` app has a known bug at `FrmCheckOut.cs:6246` that writes `'Check Out'` (space, no hyphen) on one path; we **write the hyphenated form** and **tolerate both forms on read**.
+  - `HT_CheckIn_H.Cin_status` — Thai: `'ปกติ'` (normal), `'ยกเลิก'` (cancelled).
+  - `HT_Customers.Cust_Type_Main` — value is `'ราคาปกติ'`. **The column-name casing differs by code path**: INSERTs use `Cust_Type_Main` (capital M), UPDATEs use `Cust_Type_main` (lowercase m). SQL Server is case-insensitive on identifiers so the legacy app got away with it; we preserve both spellings bug-for-bug so the writeback diffs cleanly against legacy-app traffic captures.
+
+- **Text encoding is `varchar Thai_CI_AS` (Windows-874 / TIS-620), not Unicode.** Sending an `N'…'` Unicode literal corrupts every Thai character into `?` because `nvarchar → varchar` conversion strips anything outside the codepage. **Always pass plain `varchar` parameters** — the `tiberius` driver handles the codepage transcoding when the column type is `varchar`. The same rule applies to the `WHERE` clause: looking up a Thai name with `N'…'` will silently miss because the search text round-trips through the same lossy conversion.
+
+When in doubt, do a fresh live capture against `192.168.100.222` rather than trusting a years-old note. The Extended Events session in `scripts/legacy-monitor/` is the canonical way to do this.
+
+---
+
 ## 4. Data layer design (PG schema for source-of-truth)
 
 The PG schema must hold **everything** the legacy MSSQL holds, plus our extensions. Today many `ht_*` tables already exist — they need an audit to ensure full coverage. Key principles:
@@ -833,6 +874,27 @@ CREATE INDEX ON ht_bookings (legacy_book_id) WHERE legacy_book_id IS NOT NULL;
 - We can create a booking instantly. Writeback later fills in `legacy_book_id` from the MAX+1 allocation.
 - If MSSQL is down, our app keeps working — writeback queues up.
 - When legacy is decommissioned, the `legacy_book_id` column stays as historical reference (set on rows created during States A/B).
+
+**Legacy ID formats** (writeback emits these into MSSQL — never inferred from PG UUIDs):
+
+| Counter | Format | Regex | Example |
+|---|---|---|---|
+| `Cust_no` | `C` + 4-digit sequence | `^C\d{4,}$` | `C21607` |
+| `Book_ID` | `R` + 6-digit zero-padded | `^R\d{6}$` | `R014810` |
+| `Cin_no` | `CH` + 2-digit year + `-` + 6-digit zero-padded | `^CH\d{2}-\d{6}$` | `CH26-005228` |
+
+The format helpers and per-counter `MAX(...)+1` allocators live in `hotel-backend/src/writeback/allocate.rs` (`allocate_cust_no`, `allocate_book_id`, `allocate_cin_no`). All allocators run inside `TABLOCKX, HOLDLOCK` to prevent races against the legacy app.
+
+**Legacy PK landmine — `HT_CheckIn_Ds.id` and `HT_Receipt_H.id` are NOT IDENTITY columns.** The original spike notes incorrectly assumed they were `IDENTITY`; live SQL Server captures and the decompiled C# both confirm they are plain `int` PKs that the legacy app allocates manually. Writeback must therefore allocate them the same way as the prefixed string IDs above:
+
+```sql
+SELECT @next = ISNULL(MAX(id), 0) + 1
+  FROM HT_CheckIn_Ds WITH (TABLOCKX, HOLDLOCK);
+INSERT INTO HT_CheckIn_Ds (id, ...) VALUES (@next, ...);
+-- COMMIT releases the lock
+```
+
+If you ever see the writeback skip the lock or rely on `SCOPE_IDENTITY()` here, that is a bug — see §3.7 for the source-of-truth precedence that caught this.
 
 ### 4b. Legacy mirror is a separate schema, not entangled
 
@@ -1201,7 +1263,8 @@ When the writeback worker is disabled:
 | **3** | 3 days | Outbox table + `event_log` table + `WritebackIntent` enum + `DomainEvent` enum + service emission helpers. **No subscribers yet — events accumulate harmlessly.** | ✅ |
 | **4a** | 3 days | SSE endpoint `/api/events` + browser `useRealtimeEvents` hook. **Now: our writes propagate to other browsers in <100ms.** | ✅ |
 | **4b** | 2 weeks | Writeback worker binary. Implement 11 flow recipes from spike. Schema fingerprint guard. Idempotency. **Goal #1 ✓** | ✅ |
-| **5** | 1 week | Split scheduler into `bin/sync.rs` (own binary). Enable SQL Server Change Tracking on legacy DB (one-time DBA task). Implement CT watcher loop → publishes detected changes to event bus. **Now: .NET app writes propagate to our app in ~1 sec.** | ✅ — needs CT enable approval |
+| **5 — TOP PRIORITY** | 1 week | **Missing half of co-existence.** Split scheduler into `bin/sync.rs` (own binary). Implement CT watcher loop on the 10 CT-enabled legacy tables → publishes detected changes to event bus. **Without this, State B is aspirational: the .NET app's writes are invisible to ours until the next 5-min reconcile, so receptionists working in two apps see stale data in ours.** With it: .NET-app writes propagate to our app in ~1 sec. | ✅ — CT already enabled & live-verified 2026-04-25 |
+| **5.5** | 1 week | Read-only mirror tables for legacy-only features. CT watcher imports `HT_Cupon`, `HT_Deposit`, `HT_ContinueTime`, `HT_Changed_Room`, `HT_Bill_Debt_*`, `HT_CheckIn_Product`, `HT_Rooms_Cancel` into PG read-only schema. Our UI can SHOW these entities (coupons attached, deposits taken, products charged, room changes) even though our app can't EDIT them. Dramatically improves UX during co-existence — receptionists see the full picture in our app instead of switching to the .NET app for legacy-only features. | ✅ |
 | **6** | 3 days | Drift-reconcile job (15-min cron) as safety net for missed CT events. Drop polling-sync (replaced by event-driven). | ✅ |
 | **7** | 1 week | Multi-site full deploy at HF Ville (after Phase 4 proven 1 month). Same image, different `.env`. **Goals #2 + #3 ✓** | ✅ |
 | **∞** | 1 day | Decommission. Set `WRITEBACK_ENABLED=false`, `LEGACY_SYNC_ENABLED=false`. Stop sync + writeback workers. SSE broadcaster keeps running for in-app real-time. Drop `legacy_mirror` schema. | ✅ |
@@ -1264,6 +1327,44 @@ Phase 4b (writeback worker) is the bigger lift but doesn't affect the UI behavio
 5. **Split into 3 binaries (api, sync, writeback)** vs keep monolith with feature flags — recommended split for blast-radius isolation
 6. **Frontend collapse to single `/app/*` tree** — confirmed
 7. **HF Ville deployment shape** — full stack at Ville (Phase 7) vs central-only with Tailscale tunnels — recommended full stack
-8. **⚠️ SQL Server Change Tracking enablement on legacy DB** — needs DBA approval. Adds metadata storage, no schema modification, vendor app unaffected. Without CT, fall back to high-frequency timestamp polling (works but heavier on legacy DB and harder to detect deletes). **CT is strongly recommended.**
+8. ✅ **SQL Server Change Tracking enabled 2026-04-25** — CT (and primary keys, where missing) is live on the 10 tables that drive sync: `HT_Customers`, `HT_Rooms`, `HT_Room_Status`, `HT_Book_H`, `HT_Book_Ds`, `HT_Book_Date`, `HT_CheckIn_H`, `HT_CheckIn_Ds`, `HT_CheckIn_Pay`, `HT_Receipt_H`. Vendor app unaffected. Rollback script lives in `scripts/legacy-monitor/` and the long-running XE session there records activity + alerts on errors. No further DBA approval needed for Phase 5; the watcher can be implemented immediately.
 9. **SSE vs WebSockets for real-time UI** — recommended SSE (simpler, one-way is sufficient for our needs, auto-reconnects, works through proxies). Pushback OK if WebSockets are needed later for chat / collaborative editing.
 10. **Event payload size budget** — recommend ≤8KB per event (full snapshots for small aggregates, just IDs for large ones — subscribers re-fetch).
+
+---
+
+## 11. Legacy-only features (opaque pass-through)
+
+The legacy .NET app implements a number of features our app does not — and likely never will, until decommission. During co-existence (State A / B), receptionists may still create coupons, take standalone deposits, ring up minibar charges, etc. in the .NET app. Our app must not corrupt those rows on writeback, and ideally should *display* them so receptionists see a complete picture in our UI even when the underlying data was authored elsewhere.
+
+The strategy is **opaque pass-through**: Phase 5.5 mirrors the relevant tables into a PG `legacy_mirror` schema as read-only copies. Our UI renders them as "informational" panels. We never write to these tables (with one documented exception, `HT_Rooms_Cancel`, already handled by the writeback path). On decommission, the mirror schema is dropped.
+
+### 11a. Tables we do NOT replicate but MUST preserve
+
+| Table | Legacy purpose | Our policy |
+|---|---|---|
+| `HT_Cupon` | Food/breakfast vouchers generated per check-in | Read-only mirror in Phase 5.5; never write |
+| `HT_CheckIn_Product` | In-stay POS / minibar charges per room | Read-only mirror; show on folio |
+| `HT_Deposit` | Standalone deposit ledger + refunds (FormShowDEPBack) | Read-only mirror; show "deposit on file" |
+| `HT_ContinueTime` | Hourly extension price master | Read-only mirror; informational |
+| `HT_Changed_Room` | Mid-stay room-move audit | Read-only mirror; show in stay history |
+| `HT_Rooms_Cancel` | Per-room cancel audit (multi-room cancellation) | Already used by `checkin_cancel.rs` writeback (we DO write here — this exists as a known exception) |
+| `HT_Rooms_Price` | Per-customer-type room price overrides | Read in `bin/backfill_rooms.rs`; never write |
+| `HT_Bill_Debt_H` / `HT_Bill_Debt_Ds` | Credit-sales ledger | Read-only mirror; informational only |
+| `HT_Order_Up` / `HT_Order_Down` | Per-customer-type pricing tiers | Read-only mirror; informational |
+| `Tb_Save_Image` | Guest/ID photo varbinary blobs | Skip in Phase 5.5; photos stay legacy-app-only until our app implements its own photo capture |
+
+### 11b. Behaviors we do NOT replicate (will trigger receptionist to switch to .NET app)
+
+- Coupon generation/printing (`FrmCuponMain`)
+- Standalone deposit & refund (`FrmAddDep`, `FormShowDEPBack`)
+- In-stay POS / minibar (`FrmAddSale`, `FrmPayAddPro`)
+- Tax invoice with VAT customer info (`FrmReceiptInvoice`, `FrmAddInvoiceSale`)
+- Credit sales (`FrmPayDebt`, `FrmPayDebt2`)
+- Hourly / time-extension pricing
+- Room-move mid-stay
+- Crystal Reports (replaced by future `bin/reports.rs` + QuestPDF — see `legacy-reference/analysis/_REPORTS_INVENTORY.md`)
+- Photo capture (TWAIN / webcam) — out of scope until web-camera UX designed
+- SMS sending (`FormSMSSendManual`, `FormSMS_DEBT`)
+
+Reverse-sync (Phase 5) treats these tables as opaque — Change Tracking surfaces row-change notifications, our subscriber persists them into the read-only mirror schema, no semantic interpretation.
