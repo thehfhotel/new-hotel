@@ -238,11 +238,17 @@ pub fn build_statements(inputs: &ModifyBookingInputs<'_>) -> Vec<String> {
     statements
 }
 
-/// Build the `UPDATE [HT_Customers] SET ... WHERE Cust_no=…` statement that
-/// re-saves the customer record on every booking modify. Spike §3c capture
-/// line 28 — the .NET app writes the full address/work field set even when
-/// only the phone changed. We mirror that for parity (NULLs would also be
-/// safe but empty strings match the WinForms-friendly default).
+/// Build the `UPDATE [HT_Customers] SET ... where Cust_no=…` statement
+/// that re-saves the customer record on every booking modify.
+///
+/// 31 SET fields in the canonical legacy order — verified from
+/// `/tmp/legacy-events-full.log` capture for `C21624` (line 3988):
+/// name, name2, Type, Type_main, Email, Add_*, Work_*, Work_tax,
+/// perfix, sex, IDcard, Contry. `[Cust_Type_main]` is lowercase m
+/// (distinct from the INSERT path's `[Cust_Type_Main]`); the WHERE
+/// clause uses lowercase `where`. Defaults to empty string for the
+/// trailing 5 fields when the payload doesn't supply them yet
+/// (payload extension is a follow-up task).
 fn build_customer_resave_update(r: &CustomerResave) -> String {
     let cust_no_q = sql_quote(&r.legacy_cust_no);
     format!(
@@ -256,8 +262,9 @@ fn build_customer_resave_update(r: &CustomerResave) -> String {
          [Cust_Work_soi]={work_soi},[Cust_Work_road]={work_road},\
          [Cust_Work_tambon]={work_tambon},[Cust_Work_ampore]={work_ampore},\
          [Cust_Work_province]={work_province},[Cust_Work_code]={work_code},\
-         [Cust_Work_tel]={work_tel},[Cust_Work_fax]={work_fax} \
-         WHERE Cust_no={cust_no_q}",
+         [Cust_Work_tel]={work_tel},[Cust_Work_fax]={work_fax},[Cust_Work_tax]={work_tax},\
+         [Cust_perfix]={perfix},[Cust_sex]={sex},[Cust_IDcard]={idcard},\
+         [Cust_Contry]={contry} where Cust_no={cust_no_q}",
         name = sql_quote(&r.cust_name),
         name2 = sql_quote(&r.cust_name2),
         ctype = sql_quote(&r.cust_type),
@@ -284,6 +291,11 @@ fn build_customer_resave_update(r: &CustomerResave) -> String {
         work_code = sql_quote(&r.cust_work_code),
         work_tel = sql_quote(&r.cust_work_tel),
         work_fax = sql_quote(&r.cust_work_fax),
+        work_tax = sql_quote(&r.cust_work_tax),
+        perfix = sql_quote(&r.cust_perfix),
+        sex = sql_quote(&r.cust_sex),
+        idcard = sql_quote(&r.cust_idcard),
+        contry = sql_quote(&r.cust_contry),
     )
 }
 
@@ -676,15 +688,19 @@ mod tests {
     }
 
     #[test]
-    fn customer_resave_emits_full_field_update() {
-        // Spike §3c capture line 28 — the .NET app re-saves the full address
-        // + work field set on every booking modify (most blanks).
+    fn customer_resave_emits_full_31_field_update() {
+        // Verified from /tmp/legacy-events-full.log capture for
+        // C21624 (line 3988): the .NET app's UPDATE includes the
+        // trailing 5 fields Cust_Work_tax, Cust_perfix, Cust_sex,
+        // Cust_IDcard, Cust_Contry — and the WHERE clause uses
+        // lowercase `where` (not `WHERE`).
         let resave = CustomerResave {
-            legacy_cust_no: "C21610".into(),
-            cust_name: "SPIKE TEST WALKIN".into(),
+            legacy_cust_no: "C21624".into(),
+            cust_name: "Alberto Calvo Alvarez".into(),
             cust_type: "ราคาปกติ".into(),
             cust_type_main: "บุคคลธรรมดา".into(),
-            cust_add_tel: "0900000088".into(),
+            cust_perfix: "925".into(),
+            cust_sex: "ชาย".into(),
             ..CustomerResave::default()
         };
         let changes = BookingChanges {
@@ -699,7 +715,7 @@ mod tests {
             customer_resave: Some(resave),
         };
         let inputs = ModifyBookingInputs {
-            book_id: "R014810",
+            book_id: "R014820",
             book_date_id_base: 0,
             changes: &changes,
             new_nights_calendar: vec![],
@@ -710,11 +726,16 @@ mod tests {
             .iter()
             .find(|s| s.starts_with("UPDATE [HT_Customers]"))
             .expect("customer re-save UPDATE must be emitted when payload set");
-        assert!(upd.contains("[Cust_name]='SPIKE TEST WALKIN'"));
+        assert!(upd.contains("[Cust_name]='Alberto Calvo Alvarez'"));
         assert!(upd.contains("[Cust_Type_main]='บุคคลธรรมดา'"));
-        assert!(upd.contains("[Cust_Add_tel]='0900000088'"));
-        assert!(upd.contains("WHERE Cust_no='C21610'"));
-        // The customer re-save must come BEFORE the room_book clear.
+        assert!(upd.contains("[Cust_Work_tax]=''"));
+        assert!(upd.contains("[Cust_perfix]='925'"));
+        assert!(upd.contains("[Cust_sex]='ชาย'"));
+        assert!(upd.contains("[Cust_IDcard]=''"));
+        assert!(upd.contains("[Cust_Contry]=''"));
+        // Lowercase `where` matches the legacy capture form.
+        assert!(upd.contains(" where Cust_no='C21624'"));
+        // Customer re-save must come BEFORE the room_book clear.
         let resave_idx = s
             .iter()
             .position(|s| s.starts_with("UPDATE [HT_Customers]"))

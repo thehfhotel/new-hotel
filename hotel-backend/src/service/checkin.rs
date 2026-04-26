@@ -527,6 +527,8 @@ impl CheckInService {
             created_by: ctx.created_by.clone(),
             guest_name_for_registry: ctx.guest_name_for_registry.clone(),
             guest_country: ctx.guest_country.clone(),
+            // photo plumbing arrives in a follow-up — see audit HIGH-3.
+            photo_tmp_no: None,
         };
         let intent = WritebackIntent::CreateCheckIn {
             check_in_id: aggregate_id,

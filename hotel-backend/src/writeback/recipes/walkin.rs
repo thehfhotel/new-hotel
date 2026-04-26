@@ -41,8 +41,8 @@ use crate::writeback::allocate::{
     allocate_room_status_id, LegacyConn,
 };
 use crate::writeback::constants::{
-    power_log_note_check_in, CIN_ROOM_STATUS_OCCUPYING, CUST_TYPE_MAIN_INDIVIDUAL,
-    CUST_TYPE_NORMAL, DEFAULT_OPERATOR, ROOM_STATUS_OCCUPYING,
+    power_log_note_check_in, CIN_DEP_STATUS_NONE, CIN_ROOM_STATUS_OCCUPYING, CIN_STATUS_NORMAL,
+    CUST_TYPE_MAIN_NORMAL, CUST_TYPE_NORMAL, DEFAULT_OPERATOR, ROOM_STATUS_OCCUPYING,
 };
 use crate::writeback::dispatcher::LegacyIds;
 use crate::writeback::error::WritebackResult;
@@ -78,6 +78,8 @@ pub struct WalkInInputs<'a> {
     /// fail; the recipe must allocate via TABLOCKX MAX+1 and pass it here.
     pub checkin_ds_id: i32,
     pub nights_calendar: Vec<NaiveDate>,
+    /// Optional `Tb_Save_Image.tmp_no` — see [`CreateCheckInPayload::photo_tmp_no`].
+    pub photo_tmp_no: Option<&'a str>,
 }
 
 /// Build the statements for a walk-in. PURE — no I/O.
@@ -90,57 +92,85 @@ pub fn build_statements(inputs: &WalkInInputs<'_>) -> Vec<String> {
     let cust_name_q = sql_quote(inputs.customer_name);
     let cust_phone_q = sql_quote(inputs.customer_phone.unwrap_or(""));
     let cust_type_q = sql_quote(CUST_TYPE_NORMAL);
-    let cust_type_main_q = sql_quote(CUST_TYPE_MAIN_INDIVIDUAL);
+    let cust_type_main_q = sql_quote(CUST_TYPE_MAIN_NORMAL);
+    let cust_last_change_q = sql_quote(&format_legacy_date(
+        crate::writeback::format::bangkok_date(Utc::now()),
+    ));
     let stay_start_q = sql_quote(&format_legacy_datetime(inputs.stay_start));
     let stay_end_q = sql_quote(&format_legacy_datetime(inputs.stay_end));
     let now_q = sql_quote(&format_legacy_datetime(Utc::now()));
     let occupying_q = sql_quote(CIN_ROOM_STATUS_OCCUPYING);
+    let cin_status_q = sql_quote(CIN_STATUS_NORMAL);
+    let cust_price_q = sql_quote(CUST_TYPE_NORMAL);
+    let dep_status_q = sql_quote(CIN_DEP_STATUS_NONE);
     let room_status_q = sql_quote(ROOM_STATUS_OCCUPYING);
     let power_note = power_log_note_check_in(inputs.cin_no);
     let power_note_q = sql_quote(&power_note);
-    // Spike §3a: prefix is 'Mr. ' (English) or 'นาย ' (Thai). We default to
-    // 'Mr. ' because both forms are observed and Mr. is non-Thai-locale-safe.
-    let registry_name = format!("Mr. {}", inputs.guest_name_for_registry);
+    let registry_prefix = guest_prefix_for_country(inputs.guest_country);
+    // Legacy capture pattern (verified 10 captured Other_People rows in
+    // /tmp/legacy-events-full.log): prefix + ' ' + name + ' '. The
+    // trailing space comes from `name + ' ' + name2` when name2 is
+    // empty — we emulate the empty-name2 case directly.
+    let registry_name = format!("{registry_prefix} {} ", inputs.guest_name_for_registry);
     let registry_name_q = sql_quote(&registry_name);
     let country_q = sql_quote(inputs.guest_country);
     let cust_id = inputs.customer_id_int;
     let price = inputs.price_per_night_baht;
     let total = inputs.price_total_baht;
     let nights = inputs.nights;
+    // Cin_Room_ALL carries the room number with a trailing space — the
+    // .NET app concatenates room numbers separated by spaces and the
+    // single-room form keeps the trailing pad.
+    let room_all = format!("{} ", inputs.room_no);
+    let room_all_q = sql_quote(&room_all);
 
-    let mut statements: Vec<String> = Vec::with_capacity(7 + inputs.nights_calendar.len());
+    let mut statements: Vec<String> = Vec::with_capacity(8 + inputs.nights_calendar.len());
 
-    // 1. HT_Customers — new customer for the walk-in
+    // 1. HT_Customers — new customer for the walk-in. 30 columns in the
+    //    legacy app's canonical order (verified from
+    //    /tmp/legacy-events-full.log captures of Cust_no C21624..C21634).
+    //    `Cust_Last_Change` carries today's Bangkok-local date.
     statements.push(format!(
         "INSERT INTO [HT_Customers]([id],[Cust_no],[Cust_perfix],[Cust_name],[Cust_name2],\
-         [Cust_sex],[Cust_IDcard],[Cust_Type],[Cust_Email],[Cust_Add_no],[Cust_Add_moo],\
-         [Cust_Add_soi],[Cust_Add_road],[Cust_Add_tambon],[Cust_Add_ampore],[Cust_Add_province],\
-         [Cust_Add_code],[Cust_Add_tel],[Cust_Add_fax],[Cust_Work_Name],[Cust_Work_no],\
-         [Cust_Work_moo],[Cust_Work_soi],[Cust_Work_road],[Cust_Work_tambon],[Cust_Work_ampore],\
-         [Cust_Work_province],[Cust_Work_code],[Cust_Work_tel],[Cust_Work_fax],[Cust_Type_Main],\
-         [Cust_Contry],[Cust_Work_Tax])\
-         VALUES({cust_id},{cust_no_q},'',{cust_name_q},'','','',{cust_type_q},'','','','','',\
-         '','','','',{cust_phone_q},'','','','','','','','','','','',\
-         {cust_type_main_q},{country_q},'')"
+         [Cust_Type],[Cust_Email],[Cust_Add_no],[Cust_Add_moo],[Cust_Add_soi],[Cust_Add_road],\
+         [Cust_Add_tambon],[Cust_Add_ampore],[Cust_Add_province],[Cust_Add_code],[Cust_Add_tel],\
+         [Cust_Add_fax],[Cust_Work_Name],[Cust_Work_no],[Cust_Work_moo],[Cust_Work_soi],\
+         [Cust_Work_road],[Cust_Work_tambon],[Cust_Work_ampore],[Cust_Work_province],\
+         [Cust_Work_code],[Cust_Work_tel],[Cust_Work_fax],[Cust_Last_Change],[Cust_Type_Main]) \
+         VALUES ({cust_id},{cust_no_q},'',{cust_name_q},'',{cust_type_q},'','','','','','','','',\
+         '',{cust_phone_q},'','','','','','','','','','','','',{cust_last_change_q},\
+         {cust_type_main_q})"
     ));
+
+    // 1b. Tb_Save_Image — link uploaded photo to the new check-in.
+    //     The .NET app fires this on every save; UPDATE matches 0 rows
+    //     when no photo was uploaded. Skip when no tmp_no was supplied
+    //     (matches the legacy app's behavior on photo-less check-ins).
+    if let Some(tmp_no) = inputs.photo_tmp_no {
+        let tmp_no_q = sql_quote(tmp_no);
+        statements.push(format!(
+            "update Tb_Save_Image set cin_no={cin_no_q},cust_no={cust_no_q},tmp_no='' \
+             where tmp_no={tmp_no_q}"
+        ));
+    }
 
     // 2. Mark room occupied — by room_no per spike §3a
     statements.push(format!(
         "update HT_Rooms set room_use='yes' where room_no={room_no_q}"
     ));
 
-    // 3. HT_CheckIn_Ds — `id` is NOT IDENTITY (schema dump 2026-04-26
-    // confirmed: int NOT NULL, no default). The earlier "id is IDENTITY"
-    // comment was a misread of spike §2 — that note was for HT_CheckIn_Pay,
-    // not HT_CheckIn_Ds. Caller pre-allocates via TABLOCKX MAX+1.
+    // 3. HT_CheckIn_Ds — 16 cols in legacy order (verified from
+    //    /tmp/legacy-events-full.log). `[Cin_dep_status]` is lowercase
+    //    d-s in the legacy SQL; `[Dep_by]` is NOT in the column list.
+    //    `id` is NOT IDENTITY (schema dump 2026-04-26 confirmed).
     let ds_id = inputs.checkin_ds_id;
     statements.push(format!(
         "INSERT INTO [HT_CheckIn_Ds]([id],[Cin_No],[Cin_Room_No],[Cin_Room_Type],[Cin_Room_In],\
          [Cin_Room_Out],[Cin_Room_Status],[Cin_Room_Dep],[Cin_Room_Price],[Cin_Room_Night],\
          [Cin_Room_PriceToTal],[Cin_Room_Pay_Before],[Cin_Room_Pay_Total],[Cin_note],\
-         [Cin_Dep_Status],[Dep_by],[Cin_cupon])\
-         VALUES({ds_id},{cin_no_q},{room_no_q},{room_type_q},{stay_start_q},{stay_end_q},\
-         {occupying_q},0,{price},{nights},{total},0,0,'','','',0)"
+         [Cin_dep_status],[Cin_cupon])\
+         VALUES( {ds_id},{cin_no_q},{room_no_q},{room_type_q},{stay_start_q},{stay_end_q},\
+         {occupying_q},0,{price},{nights},{total},0,0,'',{dep_status_q},0)"
     ));
 
     // 4. HT_POWER_LOG — lights on with check-in note
@@ -168,15 +198,23 @@ pub fn build_statements(inputs: &WalkInInputs<'_>) -> Vec<String> {
          VALUES({cin_no_q},{registry_name_q},{country_q})"
     ));
 
-    // N+2. HT_CheckIn_H — header (Cin_Book_no is empty for walk-ins per §3a)
+    // N+2. HT_CheckIn_H — 19-col canonical legacy order (verified from
+    //     16 captures in /tmp/legacy-events-full.log; `Cin_by` precedes
+    //     `Cin_Date_in`). Drops the obsolete `[Total_Price_vat]`,
+    //     `[Cin_note]`, and `[Cin_Work_number]` columns the audit
+    //     identified, and uses the lowercase `[Cin_cust_price]`,
+    //     mixed-case `[Cin_Date_Out]`, `[Cin_Type]` casing the legacy
+    //     app emits. `[Cin_Type]` is the integer 0; `[Cin_foreign]` is
+    //     the string `'False'`. For walk-ins `[Cin_Book_no]` is empty.
     statements.push(format!(
         "INSERT INTO [HT_CheckIn_H]([Cin_no],[Cin_Date],[Cin_Book_no],[Cin_cust_no],\
          [Cin_cust_price],[Cin_status],[Total_Price_Room],[Total_Price_Product],\
          [Total_Price_Net],[Total_Price_Pay],[Total_Price_Balance],[Cin_Car_type],[Cin_Car_id],\
-         [Cin_Room_ALL],[Total_Price_vat],[Cin_by],[Cin_Date_in],[Cin_Date_out],[Cin_type],\
-         [Cin_note],[Cin_foreign],[Cin_Work_number])\
-         VALUES({cin_no_q},{now_q},'',{cust_no_q},'',{occupying_q},{total},0,{total},0,{total},\
-         '','',{room_no_q},0,{by_q},{stay_start_q},{stay_end_q},0,'','',0)"
+         [Cin_Room_ALL],[Cin_by],[Cin_Date_in],[Cin_Date_Out],[Cin_Type],[Cin_foreign])\
+         VALUES({cin_no_q},{now_q},'',{cust_no_q},{cust_price_q},{cin_status_q},\
+         {total_2dp},0.00,{total_2dp},0.00,{total_2dp},'','',{room_all_q},{by_q},\
+         {stay_start_q},{stay_end_q},0,'False')",
+        total_2dp = format!("{total:.2}"),
     ));
 
     // N+3. HT_Cupon — mark loyalty coupon as printed (spike §3a, walkin/writes.txt:9).
@@ -186,7 +224,28 @@ pub fn build_statements(inputs: &WalkInInputs<'_>) -> Vec<String> {
 
     let _ = NaiveDate::from_ymd_opt(2026, 1, 1); // silence unused-import lint
     let _ = Datelike::year(&Utc::now()); // silence unused-import lint
+    let _ = price; // silence: kept on PaymentInputs for future per-night reporting
     statements
+}
+
+/// Pick a Thai-or-English personal-prefix string for the
+/// `HT_CheckIn_Other_People.Cin_name` field based on the guest's
+/// country. Heuristic: country starting with "TH" → `'นาย'` (Thai
+/// "Mr."), otherwise `'Mr.'`. The legacy capture shows mixed forms
+/// (`'นาย'`, `'น.ส.'`, `'นาง'`, `'Mr.'`, `'Mrs.'`, custom IDs like
+/// `'925'`); plumbing the actual `Cust_perfix` through the payload
+/// is a separate task — this heuristic is the minimum that
+/// preserves the Thai-vs-foreign distinction. Empty country falls
+/// back to `'Mr.'` (the safer non-Thai-locale default).
+fn guest_prefix_for_country(country: &str) -> &'static str {
+    let trimmed = country.trim();
+    if !trimmed.is_empty()
+        && (trimmed.eq_ignore_ascii_case("TH") || trimmed.to_ascii_uppercase().starts_with("TH"))
+    {
+        "นาย"
+    } else {
+        "Mr."
+    }
 }
 
 /// Execute the walk-in recipe.
@@ -228,6 +287,7 @@ pub async fn execute(
         room_status_id_base,
         nights_calendar,
         checkin_ds_id,
+        photo_tmp_no: payload.photo_tmp_no.as_deref(),
     };
     let statements = build_statements(&inputs);
     super::execute_all(conn, &statements).await?;
@@ -297,7 +357,69 @@ mod tests {
             room_status_id_base: 50230,
             nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 24).unwrap()],
             checkin_ds_id: 25001,
+            photo_tmp_no: None,
         }
+    }
+
+    /// Walk-in inputs that mirror the captured legacy walk-in for
+    /// `CH26-005242` (Cust C21636, room 407, single night). Used to
+    /// assert byte-for-byte parity on the HT_CheckIn_H statement.
+    fn capture_inputs() -> WalkInInputs<'static> {
+        WalkInInputs {
+            cin_no: "CH26-005242",
+            cust_no: "C21636",
+            customer_id_int: 21636,
+            customer_name: "phetreudi",
+            customer_phone: None,
+            guest_name_for_registry: "phetreudi",
+            guest_country: "",
+            created_by: "Admin",
+            room_no: "407",
+            room_type: "เตียงเดี่ยว",
+            // Bangkok 4:12:18 PM = UTC 09:12:18 — and the captured
+            // Cin_Date is `'4/25/2026 4:12:18 PM'`. We test the
+            // stay_start/Cin_Date_in column independently because
+            // Cin_Date uses Utc::now() in build_statements.
+            stay_start: Utc.with_ymd_and_hms(2026, 4, 25, 9, 12, 18).unwrap(),
+            stay_end: Utc.with_ymd_and_hms(2026, 4, 26, 5, 0, 0).unwrap(),
+            price_per_night_baht: 890.0,
+            nights: 1,
+            price_total_baht: 890.0,
+            room_status_id_base: 50300,
+            nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],
+            checkin_ds_id: 25025,
+            photo_tmp_no: None,
+        }
+    }
+
+    /// Byte-level parity for the HT_CheckIn_H statement against the
+    /// captured walk-in for `CH26-005242` in
+    /// `/tmp/legacy-events-full.log`. We assert the column list +
+    /// value tail (Cin_Date is the only field that depends on
+    /// `Utc::now()` at build time, so we substring-match around it).
+    #[test]
+    fn checkin_h_matches_legacy_capture_byte_for_byte() {
+        let s = build_statements(&capture_inputs());
+        let cin_h = s
+            .iter()
+            .find(|s| s.contains("[HT_CheckIn_H]"))
+            .expect("HT_CheckIn_H INSERT must be emitted");
+        let head = "INSERT INTO [HT_CheckIn_H]([Cin_no],[Cin_Date],[Cin_Book_no],[Cin_cust_no],\
+                    [Cin_cust_price],[Cin_status],[Total_Price_Room],[Total_Price_Product],\
+                    [Total_Price_Net],[Total_Price_Pay],[Total_Price_Balance],[Cin_Car_type],\
+                    [Cin_Car_id],[Cin_Room_ALL],[Cin_by],[Cin_Date_in],[Cin_Date_Out],\
+                    [Cin_Type],[Cin_foreign])\
+                    VALUES('CH26-005242',";
+        assert!(
+            cin_h.starts_with(head),
+            "HT_CheckIn_H must use legacy column order; got:\n{cin_h}"
+        );
+        let tail = ",'','C21636','ราคาปกติ','ปกติ',890.00,0.00,890.00,0.00,890.00,'','',\
+                    '407 ','Admin','4/25/2026 4:12:18 PM','4/26/2026 12:00:00 PM',0,'False')";
+        assert!(
+            cin_h.ends_with(tail),
+            "HT_CheckIn_H value tail must match legacy capture; got:\n{cin_h}"
+        );
     }
 
     #[test]
@@ -312,9 +434,79 @@ mod tests {
     fn checkin_h_has_empty_book_no_for_walkin() {
         let s = build_statements(&sample_inputs());
         let cin_h = s.iter().find(|s| s.contains("HT_CheckIn_H")).unwrap();
-        // Cin_Book_no = '' for walk-ins per spike §3a
-        // Position after Cin_Date: VALUES(cin_no, now, '', cust_no, ...)
-        assert!(cin_h.contains(",'',"));
+        // Cin_Book_no = '' for walk-ins per spike §3a — third VALUES() position
+        // (after cin_no and Cin_Date which carries Utc::now()).
+        assert!(
+            cin_h.contains(",'','C21607',"),
+            "Cin_Book_no must be empty for walkin: {cin_h}"
+        );
+    }
+
+    #[test]
+    fn checkin_h_uses_normal_status_for_active_stay() {
+        // The header status is 'ปกติ' (normal), distinct from the
+        // HT_CheckIn_Ds.Cin_Room_Status which is 'เข้าพัก'. Verified
+        // from /tmp/legacy-events-full.log captures.
+        let s = build_statements(&sample_inputs());
+        let cin_h = s.iter().find(|s| s.contains("HT_CheckIn_H")).unwrap();
+        assert!(cin_h.contains("'ปกติ'"));
+        assert!(!cin_h.contains("'เข้าพัก'"));
+    }
+
+    #[test]
+    fn checkin_h_uses_balance_equal_to_net_per_capture() {
+        // Pre-payment, Total_Price_Balance equals Total_Price_Net (not 0).
+        let s = build_statements(&sample_inputs());
+        let cin_h = s.iter().find(|s| s.contains("HT_CheckIn_H")).unwrap();
+        // Net=890.00, Pay=0.00, Balance=890.00
+        assert!(cin_h.contains(",890.00,0.00,890.00,"));
+    }
+
+    #[test]
+    fn checkin_h_room_all_has_trailing_space() {
+        let s = build_statements(&sample_inputs());
+        let cin_h = s.iter().find(|s| s.contains("HT_CheckIn_H")).unwrap();
+        assert!(cin_h.contains("'402 '"));
+    }
+
+    #[test]
+    fn checkin_h_drops_obsolete_columns_per_audit() {
+        let s = build_statements(&sample_inputs());
+        let cin_h = s.iter().find(|s| s.contains("HT_CheckIn_H")).unwrap();
+        assert!(!cin_h.contains("[Total_Price_vat]"));
+        assert!(!cin_h.contains("[Cin_note]"));
+        assert!(!cin_h.contains("[Cin_Work_number]"));
+    }
+
+    #[test]
+    fn checkin_ds_uses_lowercase_dep_status_column_and_no_dep_by() {
+        let s = build_statements(&sample_inputs());
+        let ds = s.iter().find(|s| s.contains("HT_CheckIn_Ds")).unwrap();
+        assert!(ds.contains("[Cin_dep_status]"));
+        assert!(!ds.contains("[Cin_Dep_Status]"));
+        assert!(!ds.contains("[Dep_by]"));
+        assert!(ds.contains("'ไม่เก็บค่ามัดจำ'"));
+    }
+
+    #[test]
+    fn fires_tb_save_image_update_when_photo_tmp_no_supplied() {
+        let mut inputs = sample_inputs();
+        inputs.photo_tmp_no = Some("924127");
+        let s = build_statements(&inputs);
+        let upd = s
+            .iter()
+            .find(|s| s.starts_with("update Tb_Save_Image"))
+            .expect("Tb_Save_Image UPDATE must be emitted when tmp_no supplied");
+        assert!(upd.contains("cin_no='CH26-005228'"));
+        assert!(upd.contains("cust_no='C21607'"));
+        assert!(upd.contains("tmp_no=''"));
+        assert!(upd.contains("where tmp_no='924127'"));
+    }
+
+    #[test]
+    fn skips_tb_save_image_when_photo_tmp_no_none() {
+        let s = build_statements(&sample_inputs());
+        assert!(!s.iter().any(|s| s.starts_with("update Tb_Save_Image")));
     }
 
     #[test]
@@ -350,13 +542,28 @@ mod tests {
     }
 
     #[test]
-    fn registry_name_uses_mr_prefix() {
+    fn registry_name_uses_mr_prefix_for_non_thai_country() {
         let s = build_statements(&sample_inputs());
         let people = s
             .iter()
             .find(|s| s.contains("HT_CheckIn_Other_People"))
             .unwrap();
-        assert!(people.contains("'Mr. SPIKE TEST WALKIN'"));
+        // Trailing space comes from `prefix + ' ' + name + ' '` — matches
+        // captured pattern (e.g. 'Mr. Thomas Meininghaus  ').
+        assert!(people.contains("'Mr. SPIKE TEST WALKIN '"));
+    }
+
+    #[test]
+    fn registry_name_uses_thai_prefix_when_country_is_th() {
+        let mut inputs = sample_inputs();
+        inputs.guest_country = "TH";
+        inputs.guest_name_for_registry = "อุทัย สุขผล";
+        let s = build_statements(&inputs);
+        let people = s
+            .iter()
+            .find(|s| s.contains("HT_CheckIn_Other_People"))
+            .unwrap();
+        assert!(people.contains("'นาย อุทัย สุขผล '"));
     }
 
     #[test]
@@ -368,8 +575,9 @@ mod tests {
         let ds = s.iter().find(|s| s.contains("HT_CheckIn_Ds")).unwrap();
         assert!(ds.contains("[id]"), "[id] must be in column list: {ds}");
         assert!(ds.contains("[Cin_No]"));
+        // Legacy capture begins `VALUES( {id},` — note the leading space.
         assert!(
-            ds.contains("VALUES(25001,"),
+            ds.contains("VALUES( 25001,"),
             "[id] value must be the pre-allocated checkin_ds_id (25001 in sample): {ds}"
         );
     }
@@ -392,8 +600,10 @@ mod tests {
     fn customer_id_is_passed_explicitly() {
         let s = build_statements(&sample_inputs());
         let cust = s.iter().find(|s| s.contains("HT_Customers")).unwrap();
-        // First positional value is the explicit id (21607)
-        assert!(cust.contains("VALUES(21607,'C21607',"));
+        // First positional value is the explicit id (21607). Legacy
+        // capture wraps the column-list with `) VALUES (` (trailing
+        // space before the open paren).
+        assert!(cust.contains("VALUES (21607,'C21607',"));
     }
 
     #[test]

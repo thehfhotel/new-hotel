@@ -32,6 +32,19 @@ pub const BOOK_STATUS_OCCUPYING: &str = "เข้าพัก";
 /// `HT_CheckIn_H.cin_status` literal for "cancelled". Spike §3i.
 pub const CIN_STATUS_CANCELLED: &str = "ยกเลิก";
 
+/// `HT_CheckIn_H.Cin_status` literal for "normal" (Thai: "ปกติ") — the
+/// state set on every fresh check-in. Distinct from
+/// [`CIN_ROOM_STATUS_OCCUPYING`] (`'เข้าพัก'`), which is the
+/// `HT_CheckIn_Ds.Cin_Room_Status` value. Verified from
+/// `/tmp/legacy-events-full.log` (every captured `HT_CheckIn_H` INSERT
+/// emits `'ปกติ'` for the header status).
+pub const CIN_STATUS_NORMAL: &str = "ปกติ";
+
+/// `HT_CheckIn_Ds.Cin_dep_status` literal for "no deposit collected".
+/// Verified from `/tmp/legacy-events-full.log` (every captured
+/// `HT_CheckIn_Ds` INSERT emits `'ไม่เก็บค่ามัดจำ'`).
+pub const CIN_DEP_STATUS_NONE: &str = "ไม่เก็บค่ามัดจำ";
+
 /// `HT_CheckIn_Ds.Cin_Room_Status` initial value for an active stay (Thai:
 /// "occupying"). Spike §3a.
 pub const CIN_ROOM_STATUS_OCCUPYING: &str = "เข้าพัก";
@@ -52,7 +65,18 @@ pub const ROOM_STATUS_CHECKED_OUT: &str = "Check Out";
 /// `HT_Customers.Cust_Type` default. Spike §3a (and elsewhere).
 pub const CUST_TYPE_NORMAL: &str = "ราคาปกติ";
 
-/// `HT_Customers.Cust_Type_Main` default. Spike §3a.
+/// `HT_Customers.Cust_Type_Main` default for the .NET app's INSERT
+/// path — the legacy customer-create captures all show `'ราคาปกติ'`
+/// (verified from `/tmp/legacy-events-full.log`, all 12 captured
+/// `INSERT INTO [HT_Customers]` rows). The earlier
+/// [`CUST_TYPE_MAIN_INDIVIDUAL`] (`'บุคคลธรรมดา'`) is what the .NET
+/// app's UPDATE path emits — kept for that flow only.
+pub const CUST_TYPE_MAIN_NORMAL: &str = "ราคาปกติ";
+
+/// `HT_Customers.Cust_Type_Main` value emitted by the .NET app's
+/// `UPDATE [HT_Customers]` path (booking-modify / checkin-to-booking).
+/// Verified from `/tmp/legacy-events-full.log` `UPDATE` captures —
+/// distinct from [`CUST_TYPE_MAIN_NORMAL`] which the INSERT path uses.
 pub const CUST_TYPE_MAIN_INDIVIDUAL: &str = "บุคคลธรรมดา";
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -99,6 +123,28 @@ pub const BOOK_NOTIFY_DAY_DEFAULT: i32 = 3;
 /// the legacy app's logged-in employee always shows in our captures.
 pub const DEFAULT_OPERATOR: &str = "Admin";
 
+/// `HT_CheckIn_Pay.Branch` default — the legacy app fills this with
+/// the literal Thai phrase for "head office" on every payment row.
+/// Verified from `/tmp/legacy-events-full.log` (all 24 captured
+/// `INSERT INTO [HT_CheckIn_Pay]` rows).
+pub const BRANCH_HEAD_OFFICE: &str = "สำนักงานใหญ่";
+
+/// `HT_CheckIn_Pay.Cin_Pay_Ds_Name` literal for room-charge payments
+/// (Thai: "room cost"). Verified from `/tmp/legacy-events-full.log`
+/// — all 24 captured payment rows use this exact string, NOT the
+/// receipt-line label `'ค่าห้องพัก [room]'` which is HT_Receipt_Ds only.
+pub const PAY_DS_NAME_ROOM: &str = "ค่าห้อง";
+
+/// `HT_CheckIn_Pay.Cin_Pay_Ds_unit` literal (Thai: "item"). Verified
+/// from `/tmp/legacy-events-full.log` — captured as the string
+/// `'รายการ'`, not the integer `1`.
+pub const PAY_DS_UNIT_ITEM: &str = "รายการ";
+
+/// `HT_CheckIn_Pay.Cin_Pay_Ds_ID` literal — the legacy product code
+/// emitted into the payment row (NOT the receipt-line `SEV-001`
+/// service code). Verified from `/tmp/legacy-events-full.log`.
+pub const PAY_DS_ID_ROOM: &str = "P001";
+
 // ───────────────────────────────────────────────────────────────────────────
 // Receipt
 // ───────────────────────────────────────────────────────────────────────────
@@ -114,3 +160,42 @@ pub const RECEIPT_UNIT_NIGHT: &str = "คืน";
 pub fn receipt_room_label(room_no: &str) -> String {
     format!("ค่าห้องพัก [{room_no}]")
 }
+
+/// `HT_Receipt_H.Receipt_VatPer` value emitted by the legacy app — the
+/// hotel's standard 7% Thai VAT. Verified from
+/// `/tmp/legacy-events-full.log` (captured Receipt_H rows render
+/// `Receipt_BeforeVat = round(Total / 1.07, 2)`,
+/// `Receipt_Vat = Total - BeforeVat`, `Receipt_VatIn='True'`,
+/// `Receipt_VatPer=7`).
+pub const RECEIPT_VAT_PERCENT: i32 = 7;
+
+/// `HT_Receipt_H.Receipt_VatIn` literal — the legacy app emits the
+/// string `'True'` (not a SQL bit), indicating the headline `Total`
+/// figure is VAT-inclusive. Verified from `/tmp/legacy-events-full.log`.
+pub const RECEIPT_VAT_INCLUSIVE: &str = "True";
+
+/// `HT_Receipt_H.status_name` value for an active receipt (Thai:
+/// "normal"). Verified from `/tmp/legacy-events-full.log` — every
+/// captured Receipt_H row emits `'ปกติ'`, never empty.
+pub const RECEIPT_STATUS_NORMAL: &str = "ปกติ";
+
+/// Compose the `HT_Receipt_H.Receipt_note` blurb the legacy app
+/// renders for a stay (e.g. `'เข้าพัก วันที่ 25/04/26 ถึง 26/04/26'`).
+/// Two-digit day/month/year matching the captured format.
+pub fn receipt_stay_note(check_in: chrono::NaiveDate, check_out: chrono::NaiveDate) -> String {
+    use chrono::Datelike;
+    format!(
+        "เข้าพัก วันที่ {:02}/{:02}/{:02} ถึง {:02}/{:02}/{:02}",
+        check_in.day(),
+        check_in.month(),
+        check_in.year() % 100,
+        check_out.day(),
+        check_out.month(),
+        check_out.year() % 100,
+    )
+}
+
+/// `HT_Receipt_H.Receipt_noteUP` literal for receipts that originated
+/// from a booking (vs a walk-in). Captured forms: `'Booking'` when
+/// `Cin_Book_no` is set, empty string otherwise.
+pub const RECEIPT_NOTE_UP_BOOKING: &str = "Booking";

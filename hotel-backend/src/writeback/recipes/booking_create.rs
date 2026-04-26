@@ -57,11 +57,11 @@ use crate::writeback::allocate::{
 };
 use crate::writeback::constants::{
     BOOK_DS_STATUS_ACTIVE, BOOK_NOTIFY_DAY_DEFAULT, BOOK_ROOM_TYPE_BY_ROOM_NUMBER,
-    BOOK_STATUS_BOOKED, CUST_TYPE_NORMAL, DEFAULT_OPERATOR,
+    BOOK_STATUS_BOOKED, CUST_TYPE_MAIN_NORMAL, CUST_TYPE_NORMAL, DEFAULT_OPERATOR,
 };
 use crate::writeback::dispatcher::LegacyIds;
 use crate::writeback::error::WritebackResult;
-use crate::writeback::format::{format_legacy_date, format_legacy_datetime, midnight_of, sql_quote};
+use crate::writeback::format::{format_legacy_date, format_legacy_datetime, sql_quote};
 
 /// Inputs for the booking-create recipe.
 #[derive(Debug, Clone)]
@@ -99,10 +99,16 @@ pub fn build_statements(inputs: &CreateBookingInputs<'_>) -> Vec<String> {
     let cust_type_q = sql_quote(CUST_TYPE_NORMAL);
     let room_no_q = sql_quote(inputs.room_no);
 
-    // §3k: midnight on HT_Book_H, actual stay times on HT_Book_Ds.
-    let stay_start_midnight_q =
-        sql_quote(&format_legacy_datetime(midnight_of(inputs.stay_start)));
-    let stay_end_midnight_q = sql_quote(&format_legacy_datetime(midnight_of(inputs.stay_end)));
+    // §3k: HT_Book_H carries date-only forms (verified from
+    // /tmp/legacy-events-full.log captures of R014820..R014824 — every
+    // row emits `'4/25/2026'`-style dates, NOT midnight datetimes).
+    // HT_Book_Ds keeps the actual stay times.
+    let stay_start_date_q = sql_quote(&format_legacy_date(
+        crate::writeback::format::bangkok_date(inputs.stay_start),
+    ));
+    let stay_end_date_q = sql_quote(&format_legacy_date(
+        crate::writeback::format::bangkok_date(inputs.stay_end),
+    ));
 
     // HT_Book_Ds: actual stay times. Departure is hardcoded 11:59:59 AM per spike §3b.
     let stay_start_actual_q = sql_quote(&format_legacy_datetime(inputs.stay_start));
@@ -111,40 +117,55 @@ pub fn build_statements(inputs: &CreateBookingInputs<'_>) -> Vec<String> {
 
     let mut statements: Vec<String> = Vec::with_capacity(4 + inputs.nights_calendar.len());
 
-    // 1. HT_Customers (only if new)
+    // 1. HT_Customers (only if new). 30 columns in canonical legacy
+    //    order — verified from /tmp/legacy-events-full.log (12 captured
+    //    INSERT INTO [HT_Customers] rows across Cust_no C21624..C21634).
+    //    Drops the obsolete `Cust_sex`, `Cust_IDcard`, `Cust_Contry`,
+    //    `Cust_Work_Tax` columns the audit identified; adds the
+    //    `[Cust_Last_Change]` date emitted by every legacy INSERT.
+    //    `[Cust_Type_Main]` value is `'ราคาปกติ'` (NOT
+    //    `'บุคคลธรรมดา'`) — that latter form is only emitted by the
+    //    UPDATE path, never INSERT.
     if inputs.customer_is_new {
         let id = inputs.customer_id_int.unwrap_or(0);
+        let cust_type_main_q = sql_quote(CUST_TYPE_MAIN_NORMAL);
+        let last_change_q = sql_quote(&format_legacy_date(
+            crate::writeback::format::bangkok_date(Utc::now()),
+        ));
         statements.push(format!(
             "INSERT INTO [HT_Customers]([id],[Cust_no],[Cust_perfix],[Cust_name],[Cust_name2],\
-             [Cust_sex],[Cust_IDcard],[Cust_Type],[Cust_Email],[Cust_Add_no],[Cust_Add_moo],\
-             [Cust_Add_soi],[Cust_Add_road],[Cust_Add_tambon],[Cust_Add_ampore],\
-             [Cust_Add_province],[Cust_Add_code],[Cust_Add_tel],[Cust_Add_fax],[Cust_Work_Name],\
-             [Cust_Work_no],[Cust_Work_moo],[Cust_Work_soi],[Cust_Work_road],[Cust_Work_tambon],\
-             [Cust_Work_ampore],[Cust_Work_province],[Cust_Work_code],[Cust_Work_tel],\
-             [Cust_Work_fax],[Cust_Type_Main],[Cust_Contry],[Cust_Work_Tax])\
-             VALUES({id},{cust_no_q},'',{cust_name_q},'','','',{cust_type_q},'','','','','',\
-             '','','','',{cust_phone_q},'','','','','','','','','','','',\
-             '','บุคคลธรรมดา','','')"
+             [Cust_Type],[Cust_Email],[Cust_Add_no],[Cust_Add_moo],[Cust_Add_soi],[Cust_Add_road],\
+             [Cust_Add_tambon],[Cust_Add_ampore],[Cust_Add_province],[Cust_Add_code],\
+             [Cust_Add_tel],[Cust_Add_fax],[Cust_Work_Name],[Cust_Work_no],[Cust_Work_moo],\
+             [Cust_Work_soi],[Cust_Work_road],[Cust_Work_tambon],[Cust_Work_ampore],\
+             [Cust_Work_province],[Cust_Work_code],[Cust_Work_tel],[Cust_Work_fax],\
+             [Cust_Last_Change],[Cust_Type_Main]) VALUES ({id},{cust_no_q},'',{cust_name_q},'',\
+             {cust_type_q},'','','','','','','','','',{cust_phone_q},'','','','','','','','','',\
+             '','','',{last_change_q},{cust_type_main_q})"
         ));
     }
 
-    // 2. HT_Book_H — full §3k visibility set. Book_Status='จอง' is the
-    // visibility key for the future-date room view (View_Book_Date filters
-    // by `book_status='จอง'`). We previously sent '' which made our
-    // bookings invisible there.
+    // 2. HT_Book_H — 17-col canonical legacy order. Verified from
+    //    /tmp/legacy-events-full.log captures of R014820..R014824:
+    //    drops `[Book_Notify_Note]`; emits `Book_Notify_Day,Book_sale`
+    //    WITHOUT square brackets (the .NET app's column-list builder
+    //    apparently switches off brackets for the trailing two cols);
+    //    `Book_Date_in/out` are date-only (`'4/25/2026'`).
+    //    Book_Status='จอง' is the future-date-room-view visibility
+    //    key.
     let booked_q = sql_quote(BOOK_STATUS_BOOKED);
     statements.push(format!(
         "INSERT INTO [HT_Book_H]( [Book_ID],[Book_Date],[Book_Cust_ID],[Book_Cust_Name],\
          [Book_Cust_Name2],[Book_Cust_Tel],[Book_Price_Total],[Book_Price_Pay],[Book_Status],\
          [Book_Date_in],[Book_Date_out],[Book_by],[Book_room_all],[Book_room_note],\
-         [book_room_type],[Book_Notify_Day],[Book_Notify_Note],[Book_Sale])\
-         VALUES({book_id_q},{now_q},{cust_no_q},{cust_name_q},'',{cust_phone_q},\
-         {price},0,{status},{stay_in},{stay_out},{by_q},'',{notes_q},{room_type_code},\
-         {notify_day},'','')",
-        price = inputs.price_baht,
+         [book_room_type],Book_Notify_Day,Book_sale)\
+         VALUES( {book_id_q},{now_q},{cust_no_q},{cust_name_q},'',{cust_phone_q},\
+         {price_2dp},0.00,{status},{stay_in},{stay_out},{by_q},'',{notes_q},{room_type_code},\
+         {notify_day},'')",
+        price_2dp = format!("{:.2}", inputs.price_baht),
         status = booked_q,
-        stay_in = stay_start_midnight_q,
-        stay_out = stay_end_midnight_q,
+        stay_in = stay_start_date_q,
+        stay_out = stay_end_date_q,
         room_type_code = BOOK_ROOM_TYPE_BY_ROOM_NUMBER,
         notify_day = BOOK_NOTIFY_DAY_DEFAULT,
     ));
@@ -381,12 +402,108 @@ mod tests {
     }
 
     #[test]
-    fn book_h_dates_are_midnight_per_section_3k() {
+    fn book_h_dates_are_date_only_per_legacy_capture() {
+        // Verified from /tmp/legacy-events-full.log captures of
+        // R014820..R014824: HT_Book_H carries date-only forms
+        // (`'4/25/2026'`), not midnight datetimes. The .NET app's
+        // booking-list view binds to the date string directly.
         let statements = build_statements(&sample_inputs());
         let book_h = statements.iter().find(|s| s.contains("HT_Book_H")).unwrap();
-        // Midnight = "12:00:00 AM"
-        assert!(book_h.contains("'4/25/2026 12:00:00 AM'"));
-        assert!(book_h.contains("'4/26/2026 12:00:00 AM'"));
+        assert!(book_h.contains("'4/25/2026'"));
+        assert!(book_h.contains("'4/26/2026'"));
+        assert!(!book_h.contains("'4/25/2026 12:00:00 AM'"));
+    }
+
+    /// Byte-level parity for HT_Book_H against the captured booking
+    /// `R014820` (Cust C21624). Source: `/tmp/legacy-events-full.log`.
+    #[test]
+    fn book_h_matches_legacy_capture_byte_for_byte() {
+        let inputs = CreateBookingInputs {
+            book_id: "R014820",
+            cust_no: "C21624",
+            customer_id_int: Some(21624),
+            customer_name: "Alberto Calvo Alvarez",
+            customer_phone: Some(""),
+            created_by: "Admin",
+            notes: Some("เก็บเงิน "),
+            // Bangkok 4/25..4/26
+            stay_start: Utc.with_ymd_and_hms(2026, 4, 25, 5, 0, 0).unwrap(),
+            stay_end: Utc.with_ymd_and_hms(2026, 4, 26, 5, 0, 0).unwrap(),
+            room_no: "414",
+            price_baht: 801.0,
+            nights: 1,
+            book_date_id_base: 47200,
+            nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],
+            customer_is_new: false,
+        };
+        let s = build_statements(&inputs);
+        let book_h = s.iter().find(|s| s.contains("[HT_Book_H]")).unwrap();
+        let head = "INSERT INTO [HT_Book_H]( [Book_ID],[Book_Date],[Book_Cust_ID],\
+                    [Book_Cust_Name],[Book_Cust_Name2],[Book_Cust_Tel],[Book_Price_Total],\
+                    [Book_Price_Pay],[Book_Status],[Book_Date_in],[Book_Date_out],[Book_by],\
+                    [Book_room_all],[Book_room_note],[book_room_type],Book_Notify_Day,\
+                    Book_sale)VALUES( 'R014820',";
+        assert!(
+            book_h.starts_with(head),
+            "HT_Book_H column list must match legacy capture; got:\n{book_h}"
+        );
+        let tail = ",'C21624','Alberto Calvo Alvarez','','',801.00,0.00,'จอง','4/25/2026',\
+                    '4/26/2026','Admin','','เก็บเงิน ',2,3,'')";
+        assert!(
+            book_h.ends_with(tail),
+            "HT_Book_H value tail must match legacy capture; got:\n{book_h}"
+        );
+    }
+
+    #[test]
+    fn book_h_drops_obsolete_book_notify_note_column() {
+        let s = build_statements(&sample_inputs());
+        let book_h = s.iter().find(|s| s.contains("HT_Book_H")).unwrap();
+        assert!(!book_h.contains("Book_Notify_Note"));
+    }
+
+    /// Byte-level parity for the new-customer HT_Customers INSERT
+    /// against captured C21624 in `/tmp/legacy-events-full.log`.
+    /// Cust_Last_Change is determined from `Utc::now()` so we
+    /// substring-match around the column list and value head.
+    #[test]
+    fn ht_customers_insert_matches_legacy_capture_byte_for_byte() {
+        let mut inputs = sample_inputs();
+        inputs.customer_is_new = true;
+        inputs.cust_no = "C21624";
+        inputs.customer_id_int = Some(21624);
+        inputs.customer_name = "Alberto Calvo Alvarez";
+        inputs.customer_phone = Some("");
+        let s = build_statements(&inputs);
+        let cust = s
+            .iter()
+            .find(|s| s.starts_with("INSERT INTO [HT_Customers]"))
+            .expect("HT_Customers INSERT must be emitted for new customer");
+        let head = "INSERT INTO [HT_Customers]([id],[Cust_no],[Cust_perfix],[Cust_name],\
+                    [Cust_name2],[Cust_Type],[Cust_Email],[Cust_Add_no],[Cust_Add_moo],\
+                    [Cust_Add_soi],[Cust_Add_road],[Cust_Add_tambon],[Cust_Add_ampore],\
+                    [Cust_Add_province],[Cust_Add_code],[Cust_Add_tel],[Cust_Add_fax],\
+                    [Cust_Work_Name],[Cust_Work_no],[Cust_Work_moo],[Cust_Work_soi],\
+                    [Cust_Work_road],[Cust_Work_tambon],[Cust_Work_ampore],[Cust_Work_province],\
+                    [Cust_Work_code],[Cust_Work_tel],[Cust_Work_fax],[Cust_Last_Change],\
+                    [Cust_Type_Main]) VALUES (21624,'C21624','','Alberto Calvo Alvarez','',\
+                    'ราคาปกติ','','','','','','','','','','','','','','','','','','','','','',\
+                    '',";
+        assert!(
+            cust.starts_with(head),
+            "HT_Customers INSERT must match legacy column list + leading values; got:\n{cust}"
+        );
+        // Tail: 'M/D/YYYY' last_change + 'ราคาปกติ' type_main + ')'.
+        // The date depends on Utc::now() so we just assert the type_main ending.
+        assert!(
+            cust.ends_with(",'ราคาปกติ')"),
+            "HT_Customers Cust_Type_Main must be 'ราคาปกติ'; got:\n{cust}"
+        );
+        // Drops the four obsolete columns the audit identified.
+        assert!(!cust.contains("[Cust_sex]"));
+        assert!(!cust.contains("[Cust_IDcard]"));
+        assert!(!cust.contains("[Cust_Contry]"));
+        assert!(!cust.contains("[Cust_Work_Tax]"));
     }
 
     #[test]
