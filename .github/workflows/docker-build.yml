@@ -152,58 +152,76 @@ jobs:
           PGPASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
         run: psql -h localhost -p 5439 -U postgres -d hotelnew -f init-db/init-hotelnew.sql
 
-      # ------------------------------------------------------------------
-      # Tests run inside the Dockerfile `test` stage (added in this commit).
-      #
-      # Why move tests into the Docker build:
-      #   - The `test` stage `FROM builder` shares the SAME `cargo chef cook`
-      #     layer + `hotel-backend-target` cache mount as the build-backend
-      #     job. With `cache-from: type=gha,scope=backend`, gha supplies the
-      #     cooked-deps layer from the prior build-backend run; the test
-      #     compile only does test-specific code on top — no 800-crate dep
-      #     recompile per job.
-      #   - Pre-this-change: test-backend ran cargo on the runner with
-      #     sccache + Swatinem rust-cache, which works but maintains a
-      #     SEPARATE cache from the Dockerfile builds. Two parallel caches,
-      #     two upload/download paths, no cross-job sharing of cooked deps.
-      #
-      # `network: host` makes the runner's Postgres service container (port
-      # 5439 on localhost) reachable to the test stage's `cargo test` RUN.
-      # DATABASE_URL is passed as a build-arg (see Dockerfile `test` stage
-      # comment for why this is acceptable here).
-      #
-      # `cache-from` only (no `cache-to`): build-backend owns the write side
-      # for `scope=backend`. We don't want test runs upserting partial /
-      # test-only state into the same cache namespace.
-      # ------------------------------------------------------------------
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        # `--allow-insecure-entitlement network.host` is required so the
-        # build step below can pass `network: host` and the test stage's
-        # `cargo test` RUN can reach the runner's Postgres service
-        # container on localhost:5439. Buildkit defaults to deny on
-        # host-network RUNs (defense in depth against build-time exfil);
-        # the risk profile is acceptable for this CI-only test stage —
-        # it talks to a runner-scoped throwaway PG, never builds an image
-        # we push.
+      - name: Install Rust toolchain
+        # Pinned to a `1.89` branch SHA (per Batch D). The `@stable` ref the
+        # action publishes is a moving target — pinning it caps the toolchain
+        # at the version used to generate `.sqlx/` cache files.
+        uses: dtolnay/rust-toolchain@193d6aa1dbbc28bd2c0a6b0e327cfdce68baaf6e  # 1.89
         with:
-          buildkitd-flags: --allow-insecure-entitlement network.host
+          toolchain: "1.89"
 
-      - name: Build & run backend tests (Docker `test` stage)
-        uses: docker/build-push-action@v6
+      # hotel-backend/.cargo/config.toml pins `-fuse-ld=mold` for x86_64-linux
+      # so local + Docker builds link fast. The GitHub runner ships neither
+      # mold nor clang by default — install both so `cargo test` can link.
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mold clang
+
+      # sccache wraps every rustc invocation and caches its output keyed on the
+      # exact crate inputs. It complements Swatinem/rust-cache (which caches
+      # the whole target/ dir). Treated as opportunistic: if the action fails
+      # OR the GHA Cache service is unreachable at server-start time, we skip
+      # RUSTC_WRAPPER and fall through to a plain build instead of failing
+      # the job. The probe step does the real check — the action above only
+      # installs the binary.
+      - name: Set up sccache
+        id: sccache_setup
+        # v0.0.9+ uses the GHA Cache v2 API (`ACTIONS_RESULTS_URL`).
+        # GitHub sunset the v1 cache API on 2026-02-01, after which v0.0.6
+        # got 400s from artifactcache.actions.githubusercontent.com on every
+        # probe. Pinned to v0.0.10 (Batch D pinned to commit SHA — the
+        # tag itself was last moved on the v0.0.10 release).
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696  # v0.0.10
+        continue-on-error: true
+
+      - name: Probe sccache (verify GHA Cache reachable)
+        id: sccache_probe
+        if: steps.sccache_setup.outcome == 'success'
+        continue-on-error: true
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          ACTIONS_CACHE_URL: ${{ env.ACTIONS_CACHE_URL }}
+          ACTIONS_RUNTIME_TOKEN: ${{ env.ACTIONS_RUNTIME_TOKEN }}
+        run: |
+          sccache --start-server
+          sccache --show-stats
+          sccache --stop-server
+
+      - name: Cache Rust dependencies
+        # v2 pinned to SHA. Resolved via gh api git/refs/tags/v2.
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
-          context: ./hotel-backend
-          target: test
-          push: false
-          load: false
-          # `network: host` so the test stage's `cargo test` RUN can reach
-          # the Postgres service container at localhost:5439.
-          network: host
-          # Pull the cooked-deps layer from build-backend's cache. NO
-          # cache-to here — build-backend owns the write side.
-          cache-from: type=gha,scope=backend
-          build-args: |
-            DATABASE_URL=postgres://postgres:${{ secrets.TEST_POSTGRES_PASSWORD }}@localhost:5439/hotelnew
+          workspaces: hotel-backend
+
+      - name: Run backend tests
+        working-directory: hotel-backend
+        env:
+          DATABASE_URL: postgres://postgres:${{ secrets.TEST_POSTGRES_PASSWORD }}@localhost:5439/hotelnew
+          SQLX_OFFLINE: "true"
+          SCCACHE_GHA_ENABLED: ${{ steps.sccache_probe.outcome == 'success' && 'true' || 'false' }}
+          RUSTC_WRAPPER: ${{ steps.sccache_probe.outcome == 'success' && 'sccache' || '' }}
+        # `--locked` aborts if Cargo.lock is out of date with Cargo.toml.
+        # CI parity with the production Dockerfile build (also uses --locked).
+        #
+        # `--test-threads=1`: integration tests share ONE PostgreSQL instance
+        # and ONE `ht_*` schema namespace. Running them in parallel races
+        # against shared rows — see the `customer_search_by_name` flake
+        # (CI run 24957295146) where a concurrent `customer_crud_lifecycle`
+        # cleanup nuked the search test's freshly-inserted rows mid-assertion.
+        # The cleanup helper in `tests/common/mod.rs` was tightened to use
+        # exact-match markers instead of `LIKE 'TEST_%'`; this flag is
+        # belt-and-suspenders against any future shared-DB race we haven't
+        # yet enumerated. Cost is ~5-10s on a 13-test suite — acceptable.
+        run: cargo test --locked -- --test-threads=1
 
   # init-db / migrations drift check (Batch E of post-Phase-5.5 audit).
   #

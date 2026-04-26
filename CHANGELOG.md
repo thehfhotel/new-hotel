@@ -5,35 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.49.0] - 2026-04-26
+## [2.48.1] - 2026-04-26
 
-### Changed
+### Reverted
 
-- **Backend tests now run inside the Docker `test` stage, sharing the
-  cargo-chef cooked-deps layer with build-backend.**
-  The runner-mode cargo invocation maintained a SEPARATE cache from
-  the Dockerfile builds (sccache + Swatinem rust-cache), so the
-  ~800-crate dep recompile happened TWICE per push — once for tests,
-  once for the runtime image. Moving tests into the Docker build lets
-  both jobs read from the same `cache-from: type=gha,scope=backend`
-  layer. Test compile drops from a full dep-recompile to test-only
-  code on top of the cooked deps.
-  - New `test` stage in `hotel-backend/Dockerfile`, `FROM builder`,
-    runs `cargo test --release --locked -- --test-threads=1` inside
-    the buildkit RUN. Result of the RUN = result of the test suite.
-  - `network: host` on the buildx build step + `--allow-insecure-entitlement
-    network.host` on buildkit so the test stage's RUN can reach the
-    runner's Postgres service container at `localhost:5439`. Risk
-    profile is acceptable: the test stage is never pushed to a
-    registry, talks only to a runner-scoped throwaway PG, and reads
-    the throwaway TEST_POSTGRES_PASSWORD from a CI-only secret.
-  - `cache-from` only (no `cache-to`) on the test job — `build-backend`
-    owns the write side for `scope=backend` so test runs can't upsert
-    partial / test-only state into the same namespace.
-  - Removed runner-side Rust toolchain install + sccache + Swatinem
-    rust-cache steps — all replaced by the buildx build. Result: the
-    `test-backend` job has fewer moving parts and reuses build-backend's
-    work directly.
+- **Reverted 07b1dcb (`perf(ci): move backend tests into Docker test
+  stage`).** The Docker `test` stage RUN step requires reaching the
+  runner's PG service container at `localhost:5439`. Buildkit's
+  docker-container driver runs the buildkit daemon in its OWN
+  container; even with `network: host` + `--allow-insecure-entitlement
+  network.host`, the host-network namespace exposed to the test RUN is
+  the BUILDKIT container's host, not the runner's host. Result:
+  `Failed to connect to test database: PoolTimedOut` on every test
+  that calls `common::create_test_pool()`.
+  - 3 failures in `test_bookings.rs::booking_*`, then aborted (sequential
+    --test-threads=1 means the suite stops at the first PG-touching
+    test). CI run 24958364935 — failure log retained for audit.
+  - To re-attempt this optimisation we'd need either:
+    `driver: docker` on `setup-buildx-action` (uses runner's docker
+    daemon, so RUN host-network = runner host-network), or a sidecar
+    PG container inside the buildkit network. Both are non-trivial
+    and out of scope for this batch.
+  - Test-backend reverts to runner-mode cargo with sccache + Swatinem
+    rust-cache. Net effect on per-push CI time: zero (we're back to
+    the post-cargo-chef baseline).
+  - cargo-chef itself (commit e51eea8) remains in place — the
+    revert is scoped to the Docker `test` stage + workflow changes.
 
 ## [2.48.0] - 2026-04-26
 
