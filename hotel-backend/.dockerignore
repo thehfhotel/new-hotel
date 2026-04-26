@@ -1,3 +1,8 @@
+# Backend build context — pin tightly. The Dockerfile + Dockerfile.ville-sync
+# both `COPY . .` from `./hotel-backend`, so anything not excluded here
+# travels into the build daemon (slower builds, bigger cache hits, and
+# more bytes for an exfil if the builder is ever compromised).
+
 target/
 .git/
 .gitignore
@@ -5,3 +10,38 @@ Dockerfile
 .dockerignore
 *.md
 .env
+*.log
+
+# Editor / IDE / agent state — never used by the build, never want it leaked.
+.vscode/
+.claude/
+.polish/
+.idea/
+
+# Wider repo paste-throughs (the build runs with context=./hotel-backend
+# so these only matter if anyone changes the context, but defense-in-depth).
+node_modules/
+.next/
+.swc/
+coverage/
+.github/
+docs/
+__tests__/
+e2e/
+app/
+components/
+contexts/
+public/
+lib/
+types/
+init-db/
+migrations/
+deploy/
+scripts/legacy-monitor/
+scripts/legacy-spike/
+
+# Reverse-engineering reference (committed for grep, excluded from images).
+legacy-reference/
+
+# Backend-specific transient state.
+.sqlx/cache/

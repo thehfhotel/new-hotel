@@ -4,7 +4,12 @@
 # pnpm's content-addressed store and Next.js's webpack cache. Both persist
 # across CI runs via `cache-to: type=gha,mode=max` on the build-push-action.
 
-FROM node:20-alpine AS base
+# Pin to digest (Batch C of post-Phase-5.5 audit). Source: Docker Hub API
+# `hub.docker.com/v2/repositories/library/node/tags/20-alpine` on 2026-04-26.
+# Dependabot (`docker` ecosystem, see .github/dependabot.yml) will bump this.
+FROM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS base
+LABEL org.opencontainers.image.source=https://github.com/thehfhotel/new-hotel
+LABEL org.opencontainers.image.licenses=Proprietary
 RUN corepack enable && corepack prepare pnpm@10 --activate
 # pnpm puts its store under $HOME/.local/share/pnpm by default; setting
 # PNPM_STORE_DIR explicitly ensures the cache mount path matches even if
@@ -32,13 +37,33 @@ ENV NEXT_PUBLIC_CARD_READER_URL=$NEXT_PUBLIC_CARD_READER_URL
 RUN --mount=type=cache,target=/app/.next/cache,id=next-cache \
     pnpm build
 
-FROM base AS runner
+# Runner stage — bare node:20-alpine (NOT FROM base): no pnpm in the
+# runtime image, just the standalone server output. Smaller surface +
+# nothing for an attacker to leverage if they get RCE on the web pod.
+FROM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS runner
+LABEL org.opencontainers.image.source=https://github.com/thehfhotel/new-hotel
+LABEL org.opencontainers.image.licenses=Proprietary
 WORKDIR /app
 ENV NODE_ENV=production
+# Copy output, then chown to the non-root user we're about to switch to.
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
 COPY --from=builder /app/public ./public
 COPY --from=builder /app/CHANGELOG.md ./
+
+# Drop root for runtime (mirrors the backend pattern). UID 1001 picked to
+# avoid collision with the backend's UID 1000 if both ever land on the
+# same host.
+RUN addgroup -g 1001 -S nextjs \
+    && adduser -S -D -H -u 1001 -G nextjs nextjs \
+    && chown -R nextjs:nextjs /app
+USER nextjs
+
 EXPOSE 3003
 ENV PORT=3003
+# Container-level healthcheck (compose-level health is in docker-compose.yml).
+# Belt+braces: even outside compose (e.g. local `docker run`), `docker ps`
+# surfaces the health state. node:alpine ships wget by default.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD wget --quiet --tries=1 --spider http://localhost:3003 || exit 1
 CMD ["node", "server.js"]
