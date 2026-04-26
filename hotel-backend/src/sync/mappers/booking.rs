@@ -51,6 +51,7 @@ use crate::service::ids::{aggregate_uuid, AggregateKind};
 use crate::sync::change_op::ChangeOp;
 use crate::sync::mapper::MssqlChangeMapper;
 use crate::sync::parent_loader::BookingAggregate;
+use crate::sync::resolve;
 use crate::sync::row::MappableRow;
 use crate::sync::SyncError;
 
@@ -280,8 +281,11 @@ pub async fn apply_booking_aggregate(
     }
 
     // Resolve the customer FK before the UPSERT — `ht_bookings.book_cust_id`
-    // is `NOT NULL` and references `ht_customers(cust_id)`.
-    let cust_id = match resolve_customer_id(tx, projection.legacy_cust_no.as_deref()).await? {
+    // is `NOT NULL` and references `ht_customers(cust_id)`. Defer-on-
+    // missing per `sync::resolve` contract.
+    let cust_id = match resolve::resolve_customer_id(tx, projection.legacy_cust_no.as_deref())
+        .await?
+    {
         Some(id) => id,
         None => {
             // Customer hasn't been mirrored yet (the customer mapper
@@ -500,24 +504,6 @@ async fn fetch_existing(
             book_checkout,
         },
     ))
-}
-
-/// Resolve the canonical `cust_id` from `legacy_cust_no`. Returns
-/// `None` when the customer hasn't been mirrored yet — caller must
-/// defer the booking apply.
-async fn resolve_customer_id(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    legacy_cust_no: Option<&str>,
-) -> Result<Option<i32>, SyncError> {
-    let Some(no) = legacy_cust_no else {
-        return Ok(None);
-    };
-    let row: Option<(i32,)> =
-        sqlx::query_as("SELECT cust_id FROM ht_customers WHERE legacy_cust_no = $1 LIMIT 1")
-            .bind(no)
-            .fetch_optional(&mut **tx)
-            .await?;
-    Ok(row.map(|(id,)| id))
 }
 
 /// Compare the existing canonical row to the freshly projected legacy
