@@ -5,6 +5,70 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.43.1] - 2026-04-26
+
+### Added
+
+- **Phase 5.2 — customer + room CT mappers (read-only mode).**
+  - **Migration 018** (`018_ht_customers_aggregate_keys.sql`) adds
+    `legacy_cust_no VARCHAR(20)` and `aggregate_id UUID` to
+    `ht_customers`, with partial unique indexes mirroring the
+    migration-014 pattern. Required so the new CT mapper can map MSSQL
+    `Cust_no` to the canonical PG row and emit `DomainEvent` payloads
+    keyed on a stable aggregate UUID.
+  - **`MappableRow` trait** (`hotel-backend/src/sync/row.rs`) — testable
+    abstraction over a single CT-projection row. Production impl wraps
+    `tiberius::Row`; the `HashMapRow` fixture (also reused by the
+    watcher binary as the boundary representation) means production and
+    tests both flow through the same `MappableRow` code path. Mapper
+    `apply` signature changed from `Option<&tiberius::Row>` to
+    `Option<&dyn MappableRow>`.
+  - **Real JOIN dispatch in `bin/sync.rs`.** `poll_table` now composes
+    the per-mapper `CHANGETABLE(CHANGES …) LEFT JOIN <table>` query
+    using `mapper.select_sql()` + `primary_key_cols()`, parses each row
+    into a `HashMapRow`, dispatches to the mapper, and persists the
+    returned `DomainEvent` into `event_log` via `EventBus::publish`
+    (live mode) or logs "would publish" + rolls back (shadow mode).
+    Per-table TX with per-table watermark advance after commit. `0x4E48`
+    `SYS_CHANGE_CONTEXT` filter applied on the SELECT.
+  - **`CustomerMapper`** (`hotel-backend/src/sync/mappers/customer.rs`,
+    ~370 LOC). Full I/U/D coverage for `HT_Customers`. UPSERT into
+    `ht_customers` resolved by `legacy_cust_no`; `aggregate_id` derived
+    via `service::ids::aggregate_uuid(AggregateKind::Customer, …)` and
+    pinned on first insert. Idempotent — re-applies with identical
+    content skip publication. D events soft-delete via
+    `cust_deleted_at = now()` and emit no `DomainEvent` in 5.2
+    (subscribers will re-add it as needed in later phases). Translates
+    legacy Thai `Cust_Type_Main` literal back to the canonical
+    `CustomerType` enum.
+  - **`RoomMasterMapper`** (`hotel-backend/src/sync/mappers/room.rs`).
+    Mirrors `HT_Rooms` (Room_Clean / Room_Use) into `ht_rooms_new` per
+    user constraint "stick to current setup we have in HOTEL legacy
+    app for now" — no new English status taxonomy, no metadata schema
+    additions, no `RoomMasterChanged` event variant. Emits
+    `RoomMarkedClean` / `RoomMarkedDirty` only when `Room_Clean`
+    actually flips. Resolves rows by `legacy_room_id_int` then
+    `room_no`. Refuses to auto-create unknown rooms (operator runs
+    `bin/backfill_rooms` first).
+  - **`RoomStatusMapper`** (same file). Phase 5.2 logging stub for
+    `HT_Room_Status` — the per-night occupancy ledger is owned by the
+    upcoming 5.3 / 5.4 booking + checkin mappers (rebuilt from
+    `HT_Book_Date` / `HT_CheckIn_Ds`); duplicating it here would
+    diverge from the canonical reconstruction. Returns `Ok(None)` for
+    every row in 5.2.
+  - **Tests.** 33 unit tests across `sync::mappers::customer` (10),
+    `sync::mappers::room` (8), `sync::row` (5), plus 4 wiring tests in
+    `bin/sync.rs` confirming each table dispatches to the right mapper
+    type. Integration suite `tests/test_sync_phase52_integration.rs`
+    (6 tests, gated on live PG via `DATABASE_URL`) covers the
+    customer-insert / customer-idempotent-reapply / customer-update /
+    customer-soft-delete + room-clean-flip / room-clean-no-op end-to-end
+    against the real `event_log`.
+
+  Phase 5.2 stays opt-in: `LEGACY_SYNC_ENABLED` defaults to `false`
+  (the watcher binary exits 0 when disabled, intentionally). Flipping
+  it to `true` in production is an operator decision.
+
 ## [2.43.0] - 2026-04-26
 
 ### Added

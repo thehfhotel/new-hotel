@@ -12,20 +12,30 @@
 //!    on the canonical `public.ht_*` table, returning the
 //!    `DomainEvent` to publish.
 //!
-//! Phase 5.1 ships only [`NoopMapper`] — the watcher's main loop iterates
-//! one mapper per CT-enabled table, exercising the polling, watermark,
-//! and observability plumbing without touching any PG row. Real mappers
-//! land in 5.2+.
+//! ## Row abstraction
+//!
+//! `apply` takes `Option<&dyn MappableRow>` rather than the concrete
+//! `tiberius::Row` so unit tests can pass a `HashMapRow` fixture (see
+//! [`crate::sync::row`]). The watcher binary wraps the real tiberius row
+//! in `&row` (which has the production [`MappableRow`] impl) before
+//! calling `apply`.
+//!
+//! Phase 5.1 shipped only [`NoopMapper`] — the watcher's main loop
+//! iterated one mapper per CT-enabled table, exercising the polling,
+//! watermark, and observability plumbing without touching any PG row.
+//! Phase 5.2 lands real mappers for `HT_Customers` / `HT_Rooms` /
+//! `HT_Room_Status` (the last is still a logging stub deferred to
+//! 5.3/5.4 — see [`crate::sync::mappers::room`]).
 
 use async_trait::async_trait;
-use tiberius::Row;
 
 use crate::outbox::event::DomainEvent;
 use crate::sync::change_op::ChangeOp;
+use crate::sync::row::MappableRow;
 use crate::sync::SyncError;
 
 /// One per CT-enabled MSSQL table. Implementations live next to their
-/// table-specific PG repository code (Phase 5.2+).
+/// table-specific PG repository code.
 #[async_trait]
 pub trait MssqlChangeMapper: Send + Sync {
     /// Verbatim MSSQL table name as it appears in `CHANGETABLE(CHANGES
@@ -40,7 +50,13 @@ pub trait MssqlChangeMapper: Send + Sync {
 
     /// SELECT projection (column list) appended after `ct.SYS_CHANGE_VERSION,
     /// ct.SYS_CHANGE_OPERATION, …pks…,` in the watcher's polling query.
-    /// Must produce the exact tiberius row shape expected by [`apply`].
+    /// Must produce the exact row shape (column names) expected by [`apply`].
+    ///
+    /// The watcher composes the rest of the query around this string;
+    /// callers should return only the projection clause (e.g.
+    /// `"t.Cust_no, t.Cust_name, t.Cust_Add_tel"`) — no `SELECT`, no
+    /// `FROM`. An empty string disables the JOIN entirely (placeholder
+    /// mappers that only need the PK from CT itself).
     fn select_sql(&self) -> &'static str;
 
     /// Translate one CT row into a canonical mutation + domain event.
@@ -53,12 +69,13 @@ pub trait MssqlChangeMapper: Send + Sync {
     /// Returns `Ok(Some(event))` to publish on the bus, `Ok(None)` to
     /// silently skip (e.g. the change came from our own writeback and
     /// would be a no-op — though the `SET CONTEXT_INFO 0x4E48` filter
-    /// already covers that case at the SQL layer).
+    /// already covers that case at the SQL layer; mappers also self-skip
+    /// when the canonical row already matches the legacy row).
     async fn apply(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         op: ChangeOp,
-        row: Option<&Row>,
+        row: Option<&dyn MappableRow>,
     ) -> Result<Option<DomainEvent>, SyncError>;
 }
 
@@ -66,9 +83,10 @@ pub trait MssqlChangeMapper: Send + Sync {
 /// mutations. Returns `Ok(None)` for every input.
 ///
 /// The watcher iterates `Vec<Box<dyn MssqlChangeMapper>>`, one per
-/// CT-enabled table, all initially `NoopMapper { table_name }`. As 5.2+
-/// lands real mappers (e.g. `HtCustomersMapper`), they replace the
-/// `NoopMapper` entry for that table without touching the loop.
+/// CT-enabled table. As real mappers land they replace the matching
+/// `NoopMapper` entry without touching the loop. A handful of
+/// `NoopMapper` entries remain in 5.2 for the booking / checkin tables
+/// that 5.3 / 5.4 will fill in.
 pub struct NoopMapper {
     pub table_name: &'static str,
 }
@@ -81,9 +99,9 @@ impl MssqlChangeMapper for NoopMapper {
 
     fn primary_key_cols(&self) -> &'static [&'static str] {
         // No PK projection is needed because the no-op mapper never
-        // joins to the underlying table — the 5.1 polling loop only
-        // counts rows + advances the watermark. Real mappers in 5.2+
-        // override this with the actual PK columns.
+        // joins to the underlying table — the watcher detects an empty
+        // `select_sql()` and skips the JOIN clause entirely (counts CT
+        // rows only).
         &[]
     }
 
@@ -98,7 +116,7 @@ impl MssqlChangeMapper for NoopMapper {
         &self,
         _tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         _op: ChangeOp,
-        _row: Option<&Row>,
+        _row: Option<&dyn MappableRow>,
     ) -> Result<Option<DomainEvent>, SyncError> {
         Ok(None)
     }
@@ -118,26 +136,18 @@ mod tests {
         assert!(m.select_sql().is_empty());
     }
 
-    /// The Phase 5.1 smoke test required by the plan: `NoopMapper.apply`
-    /// returns `Ok(None)` regardless of operation. Confirms the trait
-    /// scaffolding compiles and exercises the async-trait codegen
-    /// without needing a live PG transaction.
+    /// `NoopMapper.apply` returns `Ok(None)` regardless of operation.
+    /// We can't construct a real `sqlx::Transaction` without a pool, so
+    /// we exercise the trait shape via a `Send + Sync` compile check —
+    /// the fact that this test compiles is the proof that the
+    /// async-trait codegen produced a `Send` future.
     #[tokio::test]
     async fn noop_mapper_apply_returns_none_for_every_op() {
-        // We can't construct a real `sqlx::Transaction` without a pool,
-        // so we exercise the trait shape via a const-generic-style
-        // compile check: the impl exists and is `Send + Sync` because
-        // `NoopMapper` is. The fact that this test compiles is the
-        // proof — Rust's async-trait would have rejected a non-`Send`
-        // future at the impl line.
         fn assert_send_sync<T: Send + Sync>(_: &T) {}
         let m = NoopMapper {
             table_name: "HT_Rooms",
         };
         assert_send_sync(&m);
-        // Verify the dispatch returns the trait's expected variant
-        // shape via the public API. We can't await without a tx; the
-        // compile-time shape proof above is sufficient for 5.1.
         let _ = m.table();
     }
 }
