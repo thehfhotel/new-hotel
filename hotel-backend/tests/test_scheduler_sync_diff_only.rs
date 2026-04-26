@@ -124,7 +124,12 @@ async fn diff_only_mode_does_not_mutate_canonical_state() {
     // We seed a canonical row, log a divergence against it, and assert
     // the canonical row is unchanged.
     let pool = common::create_test_pool().await;
-    let unique_legacy = format!("TEST_p55_immutable_{}", uuid::Uuid::new_v4());
+    // `ht_customers.legacy_cust_no` is VARCHAR(20). Use a short suffix
+    // (first 8 hex chars of a UUID) to stay under the limit while still
+    // being collision-free across parallel test runs. The full UUID
+    // version is fine for `ht_reconcile_log.legacy_pk` (TEXT).
+    let unique_suffix: String = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+    let unique_legacy = format!("Tp55i{unique_suffix}"); // 13 chars, < 20
 
     // Seed canonical ht_customers row (the CT watcher would normally
     // own this, but we forge one to assert that record_divergence
@@ -172,13 +177,13 @@ async fn diff_only_mode_does_not_mutate_canonical_state() {
         "diff-only mode must not mutate canonical ht_customers state"
     );
 
-    // Cleanup
+    // Cleanup — match the same short-prefix format used at insert time.
     sqlx::query("DELETE FROM ht_customers WHERE cust_id = $1")
         .bind(cust_id)
         .execute(&pool)
         .await
         .ok();
-    cleanup_log(&pool, "customers", "TEST_p55_immutable_").await;
+    cleanup_log(&pool, "customers", "Tp55i").await;
 }
 
 #[tokio::test]
