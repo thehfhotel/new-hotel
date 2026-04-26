@@ -5,6 +5,118 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.41.0] - 2026-04-25
+
+### Fixed
+
+- **Writeback recipes now emit byte-for-byte legacy SQL.** Re-derived
+  every `INSERT INTO [HT_*]` statement against the live capture log
+  (`/tmp/legacy-events-full.log`, 270 MB of `.Net SqlClient` events
+  recorded from the production legacy app), then patched each recipe
+  to match column order, casing, value forms, and Thai literals
+  exactly. Receivers diffing our writeback output against legacy
+  output now see no spurious deltas.
+
+  Recipe-level changes:
+
+  - `payment.rs` (`HT_CheckIn_Pay`):
+    - Reordered to the legacy 20-column canonical layout (PriceTotal
+      precedes PriceOne).
+    - Added 6 missing columns: `Cin_Pay_Note`, `Pay_by`,
+      `Cin_Pay_Free`, `Cin_Pay_Tran`, `Branch`, `Cin_Pay_web`.
+    - `Cin_Pay_Ds` now carries the room number (was empty); unit
+      column emits the literal string `'รายการ'` (was integer 1);
+      product-id is `'P001'` (the payment-row code, distinct from
+      the receipt-line `'SEV-001'`); branch defaults to
+      `'สำนักงานใหญ่'` (Thai "head office"); per-night vs total
+      price split honored.
+  - `payment.rs` (`HT_Receipt_H`):
+    - VAT-inclusive split (`Total / 1.07`) computed via the new
+      `vat_inclusive_split` helper. `Receipt_VatIn='True'`,
+      `Receipt_VatPer=7`.
+    - Added missing columns: `Receipt_ref` (lowercase r),
+      `Receipt_note` (Thai stay-period blurb),
+      `Receipt_noteUP` (`'Booking'` when sourced from a booking),
+      `Receipt_Tax` (caller-supplied tax/customer ID).
+    - `status_name='ปกติ'` (was empty).
+  - `walkin.rs` + `checkin_to_booking.rs` (`HT_CheckIn_H`):
+    - Dropped 3 obsolete columns (`Total_Price_vat`, `Cin_note`,
+      `Cin_Work_number`); fixed casing on `Cin_Date_Out` and
+      `Cin_Type`; reordered `Cin_by` before `Cin_Date_in`.
+    - `Cin_status='ปกติ'` (was `'เข้าพัก'` — that's the Ds-level
+      `Cin_Room_Status` value, not the header status); added new
+      `CIN_STATUS_NORMAL` constant.
+    - `Cin_cust_price='ราคาปกติ'` (was empty);
+      `Cin_Room_ALL='{room_no} '` with trailing space;
+      `Cin_foreign='False'` (literal string); `Cin_Type=0` integer;
+      `Total_Price_Pay=0.00` and `Total_Price_Balance=Net` (settle
+      is now correctly pre-payment).
+  - `walkin.rs` + `checkin_to_booking.rs` (`HT_CheckIn_Ds`):
+    - Renamed `[Cin_Dep_Status]` to lowercase `[Cin_dep_status]`;
+      dropped `[Dep_by]`; value is `'ไม่เก็บค่ามัดจำ'` (added
+      `CIN_DEP_STATUS_NONE` constant).
+  - `walkin.rs` + `checkin_to_booking.rs` (`HT_CheckIn_Other_People`):
+    - Replaced hardcoded `'Mr. {name}'` with country-aware prefix
+      heuristic (`'TH*'` → `'นาย'`, else `'Mr.'`) and a trailing
+      space matching the legacy `name + ' ' + name2` pattern when
+      `name2` is empty. Plumbing the actual `Cust_perfix` through
+      the payload is a separate task.
+  - `walkin.rs` + `checkin_to_booking.rs` (`Tb_Save_Image`):
+    - Added optional photo-link UPDATE driven by new
+      `CreateCheckInPayload.photo_tmp_no`. The .NET app fires this
+      on every save (UPDATE matches 0 rows when no photo was
+      uploaded). When the field is `None` we skip the UPDATE.
+  - `booking_create.rs` (`HT_Customers`):
+    - Dropped 4 obsolete columns (`Cust_sex`, `Cust_IDcard`,
+      `Cust_Contry`, `Cust_Work_Tax`); added `Cust_Last_Change`
+      with today's Bangkok date.
+    - `Cust_Type_Main='ราคาปกติ'` (was `'บุคคลธรรมดา'` — that
+      latter form is the UPDATE path's value, not INSERT). Added
+      `CUST_TYPE_MAIN_NORMAL` constant; kept
+      `CUST_TYPE_MAIN_INDIVIDUAL` for the UPDATE-path value.
+  - `booking_create.rs` (`HT_Book_H`):
+    - Dropped `[Book_Notify_Note]`; emits `Book_Notify_Day,Book_sale`
+      WITHOUT square brackets to match the legacy column-list builder.
+    - `Book_Date_in/out` are date-only forms (`'4/25/2026'`) — not
+      midnight datetimes; the .NET booking-list view binds to the
+      date string directly.
+  - `booking_modify.rs` (`UPDATE [HT_Customers]`):
+    - Extended the customer re-save from 26 to 31 SET fields,
+      adding `Cust_Work_tax`, `Cust_perfix`, `Cust_sex`,
+      `Cust_IDcard`, `Cust_Contry`. Renamed `[Cust_Type_Main]` to
+      lowercase `[Cust_Type_main]`. `WHERE` becomes lowercase `where`.
+      Extended `CustomerResave` payload with the 5 new fields.
+  - `booking_cancel.rs`:
+    - Documented the per-room DELETE pattern the legacy app emits;
+      the bulk DELETE is functionally equivalent and remains in
+      place until multi-room tracking lands.
+
+  New helpers:
+
+  - `format::vat_inclusive_split` — splits a VAT-inclusive total
+    into `(before_vat, vat)` rounded to 2dp. Three tests assert
+    parity with captured legacy receipts.
+  - `format::money_2dp` — renders a finite f64 with exactly 2
+    decimal places, the form the legacy app uses for VAT split
+    and tender columns.
+  - `constants::CIN_STATUS_NORMAL` (`'ปกติ'`),
+    `CIN_DEP_STATUS_NONE` (`'ไม่เก็บค่ามัดจำ'`),
+    `CUST_TYPE_MAIN_NORMAL` (`'ราคาปกติ'`),
+    `BRANCH_HEAD_OFFICE` (`'สำนักงานใหญ่'`),
+    `PAY_DS_NAME_ROOM` (`'ค่าห้อง'`),
+    `PAY_DS_UNIT_ITEM` (`'รายการ'`),
+    `PAY_DS_ID_ROOM` (`'P001'`),
+    `RECEIPT_VAT_PERCENT=7`,
+    `RECEIPT_VAT_INCLUSIVE` (`'True'`),
+    `RECEIPT_STATUS_NORMAL` (`'ปกติ'`),
+    `RECEIPT_NOTE_UP_BOOKING` (`'Booking'`),
+    plus the `receipt_stay_note(check_in, check_out)` helper.
+
+  Each touched recipe gained a `*_matches_legacy_capture_byte_for_byte`
+  test that asserts column-list + value-tail substrings against the
+  exact statement captured in `/tmp/legacy-events-full.log`. Total
+  test count grew from 122 to 147 (25 new tests).
+
 ## [2.37.0] - 2026-04-25
 
 ### Added
