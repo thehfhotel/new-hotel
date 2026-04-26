@@ -110,6 +110,42 @@ pub fn date_to_ole_serial(date: NaiveDate) -> f64 {
     (date - epoch).num_days() as f64
 }
 
+/// Split a VAT-inclusive total into `(before_vat, vat)`, both rounded to
+/// 2 decimal places. The legacy app's receipt-print path treats the
+/// headline `Total` as VAT-inclusive at 7%, then renders both
+/// components for the printed receipt. Mirrors the captured
+/// `HT_Receipt_H` math: `Total=801.00 → BeforeVat=748.60, Vat=52.40`
+/// (verified from `/tmp/legacy-events-full.log`).
+///
+/// `vat_percent=7` → divisor `1.07`; the Vat is the remainder so the
+/// two parts sum back to exactly `total` after rounding.
+pub fn vat_inclusive_split(total: f64, vat_percent: i32) -> (f64, f64) {
+    let divisor = 1.0 + (vat_percent as f64) / 100.0;
+    let before_vat = round_money(total / divisor);
+    let vat = round_money(total - before_vat);
+    (before_vat, vat)
+}
+
+/// Round a money figure to 2 decimal places using "round half away from
+/// zero" — the convention the legacy .NET app's `Math.Round(value, 2)`
+/// uses by default.
+fn round_money(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
+/// Render an `f64` money amount with exactly 2 decimal places (e.g.
+/// `801.00`, `52.40`) — the format the legacy app emits for VAT split
+/// columns on `HT_Receipt_H`. Use [`f64_sql`] elsewhere where the
+/// legacy app emits trailing-zero-stripped numerics.
+pub fn money_2dp(value: f64) -> Result<String, crate::writeback::error::WritebackError> {
+    if !value.is_finite() {
+        return Err(crate::writeback::error::WritebackError::Recipe(format!(
+            "non-finite f64 cannot be rendered as money: {value}"
+        )));
+    }
+    Ok(format!("{value:.2}"))
+}
+
 /// Quote a string for inline SQL — escapes embedded single quotes and wraps
 /// in single quotes. Mirrors what the legacy `.Net SqlClient` produces when
 /// it interpolates parameter values into the captured statements.
@@ -244,6 +280,40 @@ mod tests {
         // Bangkok midnight on 4/25 = UTC 17:00:00 on 4/24
         let dt = Utc.with_ymd_and_hms(2026, 4, 25, 7, 30, 45).unwrap();
         assert_eq!(midnight_of(dt), Utc.with_ymd_and_hms(2026, 4, 24, 17, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn vat_inclusive_split_matches_legacy_801_capture() {
+        // Receipt_H 20663 from /tmp/legacy-events-full.log:
+        //   Total=801.00, BeforeVat=748.60, Vat=52.40, VatPer=7
+        let (before, vat) = vat_inclusive_split(801.00, 7);
+        assert_eq!(before, 748.60);
+        assert_eq!(vat, 52.40);
+    }
+
+    #[test]
+    fn vat_inclusive_split_matches_legacy_3560_capture() {
+        // Receipt_H 20662 from /tmp/legacy-events-full.log:
+        //   Total=3560.00, BeforeVat=3327.10, Vat=232.90, VatPer=7
+        let (before, vat) = vat_inclusive_split(3560.00, 7);
+        assert_eq!(before, 3327.10);
+        assert_eq!(vat, 232.90);
+    }
+
+    #[test]
+    fn vat_inclusive_split_matches_legacy_1390_capture() {
+        // Receipt_H 20664 from /tmp/legacy-events-full.log:
+        //   Total=1390.00, BeforeVat=1299.07, Vat=90.93, VatPer=7
+        let (before, vat) = vat_inclusive_split(1390.00, 7);
+        assert_eq!(before, 1299.07);
+        assert_eq!(vat, 90.93);
+    }
+
+    #[test]
+    fn money_2dp_renders_two_decimals() {
+        assert_eq!(money_2dp(801.0).unwrap(), "801.00");
+        assert_eq!(money_2dp(52.4).unwrap(), "52.40");
+        assert_eq!(money_2dp(0.0).unwrap(), "0.00");
     }
 
     #[test]

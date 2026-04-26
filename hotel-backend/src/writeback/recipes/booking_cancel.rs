@@ -49,7 +49,17 @@ pub fn build_statements(book_id: &str) -> Vec<String> {
             "update HT_Book_ds set Book_status={status} where Book_No={book_id_q}",
             status = BOOK_DS_STATUS_CANCELLED,
         ),
-        // 4. Hard-delete HT_Book_Date — frees the room nights
+        // 4. Hard-delete HT_Book_Date — frees the room nights.
+        //
+        // Functionally equivalent to the legacy app's per-room form
+        // (verified from /tmp/legacy-events-full.log):
+        //   delete from HT_Book_Date where book_type='509' and book_no='R014835'
+        //   delete from HT_Book_Date where book_type='V.201' and book_no='R014833'
+        // The .NET app emits one DELETE per room because its UI tracks
+        // them individually; ours doesn't carry that info today, so
+        // the bulk DELETE removes all rows for the booking in one
+        // statement. Per-room emission is a TODO when multi-room
+        // tracking lands; the end state is identical either way.
         format!("delete from  HT_Book_Date where Book_no={book_id_q}"),
         // 5. Duplicate UPDATE HT_Book_H (lowercase column names — preserved for parity)
         format!(

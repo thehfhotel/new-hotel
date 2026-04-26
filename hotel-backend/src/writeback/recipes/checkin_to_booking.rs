@@ -40,8 +40,9 @@ use crate::writeback::allocate::{
     allocate_checkin_ds_id, allocate_cin_no, allocate_room_status_id, LegacyConn,
 };
 use crate::writeback::constants::{
-    power_log_note_check_in, BOOK_STATUS_OCCUPYING, CIN_ROOM_STATUS_OCCUPYING, DEFAULT_OPERATOR,
-    ROOM_STATUS_OCCUPYING,
+    power_log_note_check_in, BOOK_STATUS_OCCUPYING, CIN_DEP_STATUS_NONE,
+    CIN_ROOM_STATUS_OCCUPYING, CIN_STATUS_NORMAL, CUST_TYPE_MAIN_INDIVIDUAL, CUST_TYPE_NORMAL,
+    DEFAULT_OPERATOR, ROOM_STATUS_OCCUPYING,
 };
 use crate::writeback::dispatcher::LegacyIds;
 use crate::writeback::error::WritebackResult;
@@ -73,6 +74,8 @@ pub struct CheckInToBookingInputs<'a> {
     /// Pre-allocated `HT_CheckIn_Ds.id`. NOT IDENTITY (schema dump
     /// 2026-04-26) — caller must allocate via TABLOCKX MAX+1.
     pub checkin_ds_id: i32,
+    /// Optional `Tb_Save_Image.tmp_no` — see [`CreateCheckInPayload::photo_tmp_no`].
+    pub photo_tmp_no: Option<&'a str>,
 }
 
 /// Build statements for a check-in linked to a booking. PURE — no I/O.
@@ -85,38 +88,61 @@ pub fn build_statements(inputs: &CheckInToBookingInputs<'_>) -> Vec<String> {
     let room_type_q = sql_quote(inputs.room_type);
     let cust_name_q = sql_quote(inputs.customer_name);
     let cust_phone_q = sql_quote(inputs.customer_phone.unwrap_or(""));
+    let cust_type_q = sql_quote(CUST_TYPE_NORMAL);
+    let cust_type_main_q = sql_quote(CUST_TYPE_MAIN_INDIVIDUAL);
     let stay_start_q = sql_quote(&format_legacy_datetime(inputs.stay_start));
     let stay_end_q = sql_quote(&format_legacy_datetime(inputs.stay_end));
     let now_q = sql_quote(&format_legacy_datetime(Utc::now()));
     let occupying_q = sql_quote(CIN_ROOM_STATUS_OCCUPYING);
+    let cin_status_q = sql_quote(CIN_STATUS_NORMAL);
+    let cust_price_q = sql_quote(CUST_TYPE_NORMAL);
+    let dep_status_q = sql_quote(CIN_DEP_STATUS_NONE);
     let room_status_q = sql_quote(ROOM_STATUS_OCCUPYING);
     let book_status_q = sql_quote(BOOK_STATUS_OCCUPYING);
     let power_note = power_log_note_check_in(inputs.cin_no);
     let power_note_q = sql_quote(&power_note);
-    let registry_name = format!("Mr. {}", inputs.guest_name_for_registry);
+    let registry_prefix = guest_prefix_for_country(inputs.guest_country);
+    let registry_name = format!("{registry_prefix} {} ", inputs.guest_name_for_registry);
     let registry_name_q = sql_quote(&registry_name);
     let country_q = sql_quote(inputs.guest_country);
     let price = inputs.price_per_night_baht;
     let total = inputs.price_total_baht;
     let nights = inputs.nights;
+    let room_all_q = sql_quote(&format!("{} ", inputs.room_no));
 
-    let mut statements: Vec<String> = Vec::with_capacity(8 + inputs.nights_calendar.len());
+    let mut statements: Vec<String> = Vec::with_capacity(9 + inputs.nights_calendar.len());
 
-    // 1. UPDATE HT_Customers (re-save profile — §3d difference vs walk-in).
-    //    Spike §3d / `booking-checkin/writes.txt:28` updates the full field
-    //    set (~25 fields), most blanks. Mirroring keeps our recipe parity with
-    //    the .NET app's behavior of resetting unedited fields on save.
+    // 1. UPDATE HT_Customers — full 31-field re-save (verified from
+    //    /tmp/legacy-events-full.log capture for Cust_no C21624 line
+    //    3988). Field order: name, name2, Type, Type_main, Email,
+    //    Add_*, Work_*, Work_tax, perfix, sex, IDcard, Contry. Most
+    //    fields blank by default; payload extension to surface them
+    //    is a separate task. `[Cust_Type_main]` lowercase m matches
+    //    the .NET app's UPDATE form (distinct from the INSERT form's
+    //    `[Cust_Type_Main]` capital M).
     statements.push(format!(
         "UPDATE [HT_Customers] SET  [Cust_name]={cust_name_q},[Cust_name2]='',\
-         [Cust_Type]='ราคาปกติ',[Cust_Type_Main]='บุคคลธรรมดา',[Cust_Email]='',\
+         [Cust_Type]={cust_type_q},[Cust_Type_main]={cust_type_main_q},[Cust_Email]='',\
          [Cust_Add_no]='',[Cust_Add_moo]='',[Cust_Add_soi]='',[Cust_Add_road]='',\
          [Cust_Add_tambon]='',[Cust_Add_ampore]='',[Cust_Add_province]='',\
          [Cust_Add_code]='',[Cust_Add_tel]={cust_phone_q},[Cust_Add_fax]='',\
          [Cust_Work_Name]='',[Cust_Work_no]='',[Cust_Work_moo]='',[Cust_Work_soi]='',\
          [Cust_Work_road]='',[Cust_Work_tambon]='',[Cust_Work_ampore]='',\
-         [Cust_Work_province]='',[Cust_Work_code]='',[Cust_Work_tel]='',[Cust_Work_fax]='' \
-         WHERE Cust_no={cust_no_q}"
+         [Cust_Work_province]='',[Cust_Work_code]='',[Cust_Work_tel]='',[Cust_Work_fax]='',\
+         [Cust_Work_tax]='',[Cust_perfix]='',[Cust_sex]='',[Cust_IDcard]='',\
+         [Cust_Contry]={country_q} where Cust_no={cust_no_q}"
     ));
+
+    // 1b. Tb_Save_Image — link uploaded photo to the new check-in.
+    //     UPDATE matches 0 rows when no photo was uploaded (mirrors the
+    //     legacy app's behavior). Skip when no tmp_no was supplied.
+    if let Some(tmp_no) = inputs.photo_tmp_no {
+        let tmp_no_q = sql_quote(tmp_no);
+        statements.push(format!(
+            "update Tb_Save_Image set cin_no={cin_no_q},cust_no={cust_no_q},tmp_no='' \
+             where tmp_no={tmp_no_q}"
+        ));
+    }
 
     // 2. HT_POWER_LOG — lights on
     statements.push(format!(
@@ -125,15 +151,18 @@ pub fn build_statements(inputs: &CheckInToBookingInputs<'_>) -> Vec<String> {
          VALUES({room_no_q},GETDATE(),{by_q},'',{power_note_q},'')"
     ));
 
-    // 3. HT_CheckIn_Ds — `id` is NOT IDENTITY (schema dump 2026-04-26 confirmed).
+    // 3. HT_CheckIn_Ds — 16-col canonical legacy order (verified from
+    //    /tmp/legacy-events-full.log). `[Cin_dep_status]` lowercase
+    //    d-s, no `[Dep_by]`. `id` is NOT IDENTITY (schema dump
+    //    2026-04-26 confirmed).
     let ds_id = inputs.checkin_ds_id;
     statements.push(format!(
         "INSERT INTO [HT_CheckIn_Ds]([id],[Cin_No],[Cin_Room_No],[Cin_Room_Type],[Cin_Room_In],\
          [Cin_Room_Out],[Cin_Room_Status],[Cin_Room_Dep],[Cin_Room_Price],[Cin_Room_Night],\
          [Cin_Room_PriceToTal],[Cin_Room_Pay_Before],[Cin_Room_Pay_Total],[Cin_note],\
-         [Cin_Dep_Status],[Dep_by],[Cin_cupon])\
-         VALUES({ds_id},{cin_no_q},{room_no_q},{room_type_q},{stay_start_q},{stay_end_q},\
-         {occupying_q},0,{price},{nights},{total},0,0,'','','',0)"
+         [Cin_dep_status],[Cin_cupon])\
+         VALUES( {ds_id},{cin_no_q},{room_no_q},{room_type_q},{stay_start_q},{stay_end_q},\
+         {occupying_q},0,{price},{nights},{total},0,0,'',{dep_status_q},0)"
     ));
 
     // 4. Mark room occupied
@@ -182,15 +211,23 @@ pub fn build_statements(inputs: &CheckInToBookingInputs<'_>) -> Vec<String> {
          where room_no in (select room_no from View_HT_ROOM where book_no={book_id_q})"
     ));
 
-    // 10. HT_CheckIn_H — Cin_Book_no set to the linked booking
+    // 10. HT_CheckIn_H — 19-col canonical legacy order (verified from
+    //     /tmp/legacy-events-full.log captures of CH26-005236, line
+    //     3988). Cin_Book_no carries the linked booking. Drops the
+    //     obsolete `[Total_Price_vat]`, `[Cin_note]`, and
+    //     `[Cin_Work_number]` columns; uses the lowercase
+    //     `[Cin_cust_price]`, mixed-case `[Cin_Date_Out]` and
+    //     `[Cin_Type]` casing the legacy app emits. `[Cin_Type]=0`
+    //     (integer); `[Cin_foreign]='False'` (literal string).
     statements.push(format!(
         "INSERT INTO [HT_CheckIn_H]([Cin_no],[Cin_Date],[Cin_Book_no],[Cin_cust_no],\
          [Cin_cust_price],[Cin_status],[Total_Price_Room],[Total_Price_Product],\
          [Total_Price_Net],[Total_Price_Pay],[Total_Price_Balance],[Cin_Car_type],[Cin_Car_id],\
-         [Cin_Room_ALL],[Total_Price_vat],[Cin_by],[Cin_Date_in],[Cin_Date_out],[Cin_type],\
-         [Cin_note],[Cin_foreign],[Cin_Work_number])\
-         VALUES({cin_no_q},{now_q},{book_id_q},{cust_no_q},'',{occupying_q},{total},0,{total},0,\
-         {total},'','',{room_no_q},0,{by_q},{stay_start_q},{stay_end_q},0,'','',0)"
+         [Cin_Room_ALL],[Cin_by],[Cin_Date_in],[Cin_Date_Out],[Cin_Type],[Cin_foreign])\
+         VALUES({cin_no_q},{now_q},{book_id_q},{cust_no_q},{cust_price_q},{cin_status_q},\
+         {total_2dp},0.00,{total_2dp},0.00,{total_2dp},'','',{room_all_q},{by_q},\
+         {stay_start_q},{stay_end_q},0,'False')",
+        total_2dp = format!("{total:.2}"),
     ));
 
     // 11. HT_Cupon — mark loyalty coupon as printed (spike §3d,
@@ -200,7 +237,23 @@ pub fn build_statements(inputs: &CheckInToBookingInputs<'_>) -> Vec<String> {
 
     let _ = NaiveDate::from_ymd_opt(2026, 1, 1); // silence unused-import lint
     let _ = Datelike::year(&Utc::now()); // silence unused-import lint
+    let _ = price; // silence: kept on inputs for future per-night reporting
     statements
+}
+
+/// Pick a Thai-or-English personal-prefix string for the
+/// `HT_CheckIn_Other_People.Cin_name` field — see `walkin::guest_prefix_for_country`
+/// for rationale. Mirrored here to keep the recipe self-contained
+/// (no cross-recipe dependency).
+fn guest_prefix_for_country(country: &str) -> &'static str {
+    let trimmed = country.trim();
+    if !trimmed.is_empty()
+        && (trimmed.eq_ignore_ascii_case("TH") || trimmed.to_ascii_uppercase().starts_with("TH"))
+    {
+        "นาย"
+    } else {
+        "Mr."
+    }
 }
 
 /// Execute the check-in-to-booking recipe.
@@ -241,6 +294,7 @@ pub async fn execute(
         room_status_id_base,
         nights_calendar,
         checkin_ds_id,
+        photo_tmp_no: payload.photo_tmp_no.as_deref(),
     };
     let statements = build_statements(&inputs);
     super::execute_all(conn, &statements).await?;
@@ -309,7 +363,65 @@ mod tests {
                 NaiveDate::from_ymd_opt(2026, 4, 25).unwrap(),
             ],
             checkin_ds_id: 25009,
+            photo_tmp_no: None,
         }
+    }
+
+    /// Inputs that mirror the captured legacy check-in for
+    /// `CH26-005236` (Cust C21624, room 414, booking R014820, single
+    /// night). Used to assert byte-for-byte parity on HT_CheckIn_H.
+    fn capture_inputs() -> CheckInToBookingInputs<'static> {
+        CheckInToBookingInputs {
+            cin_no: "CH26-005236",
+            cust_no: "C21624",
+            book_id: "R014820",
+            customer_name: "Alberto Calvo Alvarez",
+            customer_phone: None,
+            guest_name_for_registry: "Alberto Calvo Alvarez",
+            guest_country: "",
+            created_by: "Admin",
+            room_no: "414",
+            room_type: "เตียงเดี่ยว",
+            // Bangkok 11:32:02 AM = UTC 04:32:02
+            stay_start: Utc.with_ymd_and_hms(2026, 4, 25, 4, 32, 02).unwrap(),
+            stay_end: Utc.with_ymd_and_hms(2026, 4, 26, 4, 59, 59).unwrap(),
+            price_per_night_baht: 801.0,
+            nights: 1,
+            price_total_baht: 801.0,
+            room_status_id_base: 50300,
+            nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],
+            checkin_ds_id: 25014,
+            photo_tmp_no: None,
+        }
+    }
+
+    /// Byte-level parity for the HT_CheckIn_H statement against the
+    /// captured booking-checkin for `CH26-005236` in
+    /// `/tmp/legacy-events-full.log`. We assert column list + value
+    /// tail; Cin_Date depends on `Utc::now()` at build time.
+    #[test]
+    fn checkin_h_matches_legacy_capture_byte_for_byte() {
+        let s = build_statements(&capture_inputs());
+        let cin_h = s
+            .iter()
+            .find(|s| s.contains("[HT_CheckIn_H]"))
+            .expect("HT_CheckIn_H INSERT must be emitted");
+        let head = "INSERT INTO [HT_CheckIn_H]([Cin_no],[Cin_Date],[Cin_Book_no],[Cin_cust_no],\
+                    [Cin_cust_price],[Cin_status],[Total_Price_Room],[Total_Price_Product],\
+                    [Total_Price_Net],[Total_Price_Pay],[Total_Price_Balance],[Cin_Car_type],\
+                    [Cin_Car_id],[Cin_Room_ALL],[Cin_by],[Cin_Date_in],[Cin_Date_Out],\
+                    [Cin_Type],[Cin_foreign])\
+                    VALUES('CH26-005236',";
+        assert!(
+            cin_h.starts_with(head),
+            "HT_CheckIn_H column list must match legacy capture; got:\n{cin_h}"
+        );
+        let tail = ",'R014820','C21624','ราคาปกติ','ปกติ',801.00,0.00,801.00,0.00,801.00,'','',\
+                    '414 ','Admin','4/25/2026 11:32:02 AM','4/26/2026 11:59:59 AM',0,'False')";
+        assert!(
+            cin_h.ends_with(tail),
+            "HT_CheckIn_H value tail must match legacy capture; got:\n{cin_h}"
+        );
     }
 
     #[test]
@@ -355,6 +467,54 @@ mod tests {
     }
 
     #[test]
+    fn checkin_h_uses_normal_status_and_normal_price_per_capture() {
+        let s = build_statements(&sample_inputs());
+        let cin_h = s.iter().find(|s| s.contains("HT_CheckIn_H")).unwrap();
+        assert!(cin_h.contains("'ราคาปกติ'"));
+        assert!(cin_h.contains("'ปกติ'"));
+    }
+
+    #[test]
+    fn checkin_h_drops_obsolete_columns_per_audit() {
+        let s = build_statements(&sample_inputs());
+        let cin_h = s.iter().find(|s| s.contains("HT_CheckIn_H")).unwrap();
+        assert!(!cin_h.contains("[Total_Price_vat]"));
+        assert!(!cin_h.contains("[Cin_note]"));
+        assert!(!cin_h.contains("[Cin_Work_number]"));
+    }
+
+    #[test]
+    fn checkin_ds_uses_lowercase_dep_status_column_and_no_dep_by() {
+        let s = build_statements(&sample_inputs());
+        let ds = s.iter().find(|s| s.contains("HT_CheckIn_Ds")).unwrap();
+        assert!(ds.contains("[Cin_dep_status]"));
+        assert!(!ds.contains("[Cin_Dep_Status]"));
+        assert!(!ds.contains("[Dep_by]"));
+        assert!(ds.contains("'ไม่เก็บค่ามัดจำ'"));
+    }
+
+    #[test]
+    fn fires_tb_save_image_update_when_photo_tmp_no_supplied() {
+        let mut inputs = sample_inputs();
+        inputs.photo_tmp_no = Some("687233");
+        let s = build_statements(&inputs);
+        let upd = s
+            .iter()
+            .find(|s| s.starts_with("update Tb_Save_Image"))
+            .expect("Tb_Save_Image UPDATE must be emitted when tmp_no supplied");
+        assert!(upd.contains("cin_no='CH26-005231'"));
+        assert!(upd.contains("cust_no='C21610'"));
+        assert!(upd.contains("tmp_no=''"));
+        assert!(upd.contains("where tmp_no='687233'"));
+    }
+
+    #[test]
+    fn skips_tb_save_image_when_photo_tmp_no_none() {
+        let s = build_statements(&sample_inputs());
+        assert!(!s.iter().any(|s| s.starts_with("update Tb_Save_Image")));
+    }
+
+    #[test]
     fn first_room_status_row_is_updated_not_inserted() {
         let s = build_statements(&sample_inputs());
         // The UPDATE on existing HT_Room_Status row by (room_date, room_no)
@@ -394,15 +554,18 @@ mod tests {
     }
 
     #[test]
-    fn ht_customers_update_spans_full_field_set() {
-        // Spike §3d `booking-checkin/writes.txt:28` — full address + work
-        // field set, most blanks. Mirrors the .NET app's reset behavior.
+    fn ht_customers_update_spans_full_field_set_with_perfix_sex_idcard_contry() {
+        // Verified from /tmp/legacy-events-full.log capture for
+        // Cust_no C21624 (line 3988): the .NET app's UPDATE includes
+        // the trailing 5 fields Cust_Work_tax, Cust_perfix, Cust_sex,
+        // Cust_IDcard, Cust_Contry — and uses [Cust_Type_main]
+        // (lowercase m), distinct from the INSERT path's
+        // [Cust_Type_Main].
         let s = build_statements(&sample_inputs());
         let upd = s
             .iter()
             .find(|s| s.starts_with("UPDATE [HT_Customers]"))
             .unwrap();
-        // Check a sampling of fields that should be present (and cleared).
         for field in [
             "[Cust_Email]=''",
             "[Cust_Add_no]=''",
@@ -410,9 +573,17 @@ mod tests {
             "[Cust_Work_Name]=''",
             "[Cust_Work_no]=''",
             "[Cust_Work_road]=''",
+            "[Cust_Type_main]='บุคคลธรรมดา'",
+            "[Cust_Work_tax]=''",
+            "[Cust_perfix]=''",
+            "[Cust_sex]=''",
+            "[Cust_IDcard]=''",
+            "[Cust_Contry]=''",
         ] {
             assert!(upd.contains(field), "missing field in UPDATE: {field}");
         }
+        // Lowercase "where" — matches the legacy capture form.
+        assert!(upd.contains(" where Cust_no='C21610'"));
     }
 
     #[test]

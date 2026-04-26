@@ -179,6 +179,15 @@ pub struct CreateCheckInPayload {
     pub created_by: String,
     pub guest_name_for_registry: String,
     pub guest_country: String,
+
+    /// Optional `Tb_Save_Image.tmp_no` for the temporary photo upload
+    /// associated with this check-in. The legacy app fires
+    /// `update Tb_Save_Image set cin_no=…, cust_no=…, tmp_no=''
+    ///  where tmp_no=<photo_tmp_no>` on every save (UPDATE matches 0
+    /// rows when no photo was uploaded). Mirroring it keeps the
+    /// legacy photo-attachment flow intact. None ⇒ skip the UPDATE.
+    #[serde(default)]
+    pub photo_tmp_no: Option<String>,
 }
 
 impl WritebackIntent {
@@ -311,4 +320,22 @@ pub struct CustomerResave {
     pub cust_work_code: String,
     pub cust_work_tel: String,
     pub cust_work_fax: String,
+    /// `Cust_Work_tax` — work tax ID. Default empty string.
+    #[serde(default)]
+    pub cust_work_tax: String,
+    /// `Cust_perfix` — personal title (Mr., Mrs., นาย, น.ส., etc.).
+    /// Default empty string.
+    #[serde(default)]
+    pub cust_perfix: String,
+    /// `Cust_sex` — Thai gender literal (e.g. `'ชาย'` for male).
+    /// Default empty string.
+    #[serde(default)]
+    pub cust_sex: String,
+    /// `Cust_IDcard` — national ID / passport number. Default empty string.
+    #[serde(default)]
+    pub cust_idcard: String,
+    /// `Cust_Contry` — country (note legacy spelling: "Contry").
+    /// Default empty string.
+    #[serde(default)]
+    pub cust_contry: String,
 }
