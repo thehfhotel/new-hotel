@@ -632,6 +632,17 @@ VALUES ('008', '008_legacy_sync_tables.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================
+-- Migration 009: widen legacy varchar columns
+-- The widened types (cust_no/cust_type/cust_phone/cust_idcard) are already
+-- baked into the ht_customers_legacy CREATE TABLE above. Seed the row so a
+-- fresh init does not have migrate.sh re-apply 009 on top.
+-- =============================================================================
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('009', '009_widen_legacy_varchar_columns.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
 -- HF Ville Local Cache Schema (v2.22.0)
 -- =============================================================================
 -- ville_sync on the jump box pushes HF Ville data here so the backend reads
@@ -845,6 +856,37 @@ ON CONFLICT DO NOTHING;
 
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('013', '013_legacy_ct_state.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
+-- Migration 014: legacy_* + aggregate_id columns on canonical tables
+-- The columns + partial indexes are already baked into ht_bookings/ht_checkins/
+-- ht_rooms_new above. Seed the row so a fresh init does not re-apply 014.
+-- =============================================================================
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('014', '014_legacy_id_columns.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
+-- Migration 015: writeback_jobs retry state (claimed_at, next_retry_at)
+-- Columns + ix_writeback_jobs_claim + ix_writeback_jobs_exhausted are already
+-- baked into the writeback_jobs CREATE TABLE above. Seed the row so a fresh
+-- init does not re-apply 015.
+-- =============================================================================
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('015', '015_writeback_retry_state.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
+-- Migration 016: writeback_jobs NOTIFY trigger
+-- The function + trigger are already created above. Seed the row so a fresh
+-- init does not re-apply 016.
+-- =============================================================================
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('016', '016_writeback_notify_trigger.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================

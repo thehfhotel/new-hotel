@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.46.1] - 2026-04-26
+
+### Changed
+
+- **CI/CD operational quality (Batch E of post-Phase-5.5 audit).**
+  Final follow-up to the 5x batch audit (A–D shipped 2026-04-26).
+  - **`docs/runbook-sync.md` — operator-flip-revert pitfall (doc-only).**
+    New §4a "Known operator pitfall — `.env` is rewritten by every CI
+    deploy" documents that every master push regenerates
+    `~/new-hotel-production/.env` from GitHub Secrets, so SSH-edited
+    flag flips (`LEGACY_SYNC_ENABLED=true` etc.) are silently reverted
+    on the next deploy. Two remediations laid out side-by-side:
+    (a) recommended GH-secrets approach (`gh secret set
+    LEGACY_SYNC_ENABLED ...` + add to the deploy heredoc) and
+    (b) alternative PG flag-table (`legacy_sync_control`) for mid-tick
+    flips without redeploy. Cutover §4 steps 3-4 + rollback §5 now
+    cross-link §4a. **Wiring is intentionally NOT included in this
+    commit** — the operator decides when to flip the flag for the
+    first time before exposing it via secrets.
+  - **`init-db-migrations-drift-check` CI job** in
+    `.github/workflows/docker-build.yml`. Spins up a throwaway
+    `postgres:17-alpine` (same Batch C digest as the runtime newdb),
+    applies `init-db/init-hotelnew.sql`, then runs `scripts/migrate.sh`
+    and asserts "No pending migrations". Fails loudly with
+    `Drift detected: init-db/init-hotelnew.sql is out of sync with
+    migrations/pg/.` if the seed file is missing DDL or
+    `schema_migrations` rows that any migration adds. Runs on every
+    push (PRs catch drift early) and gates the `deploy` job's `if:`.
+    Backfilled the four missing seed rows (009, 014, 015, 016) into
+    `init-hotelnew.sql` so the check passes on master today.
+  - **`-- @transactional false` pragma in `scripts/migrate.sh`.**
+    Migration files can now opt out of the default per-migration
+    `BEGIN`/`COMMIT` wrap by including the pragma comment in the first
+    20 lines. Required for statements PostgreSQL forbids inside a
+    transaction (`CREATE INDEX CONCURRENTLY`, `VACUUM`, etc.). The
+    runner streams the body via `\set ON_ERROR_STOP on` and records
+    the `schema_migrations` row in a separate atomic statement only
+    after the body succeeds. Documented in the `migrate.sh` header
+    block + `migrations/README.md`. Pragma-detection coverage added
+    to `scripts/test-migrate-parse.sh` (case-insensitive,
+    extra-whitespace, header-window-bounded — 9 new assertions, 25
+    total).
+
 ## [2.46.0] - 2026-04-26
 
 ### Added

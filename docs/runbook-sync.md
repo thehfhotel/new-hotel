@@ -89,6 +89,11 @@ prefixed so they're triagable in one glance.
 The supported sequence from "code deployed, default-disabled" to "live
 production CT watcher". Each step gates on the prior step's success.
 
+> **Read first:** Section 4a documents an operator-flip-revert pitfall
+> that affects every step below where the procedure says "edit `.env`".
+> Skipping it will silently revert your flag flips on the next
+> `git push master`.
+
 1. **Deploy code.** `git push master` triggers the pipeline.
    `docker-compose.yml` ships `LEGACY_SYNC_ENABLED=false` and
    `LEGACY_SYNC_SHADOW_MODE=true`. The `sync` container starts and
@@ -105,9 +110,11 @@ production CT watcher". Each step gates on the prior step's success.
    Tail logs: `docker logs -f new-hotel-production-sync-1`. Look for
    `would publish (shadow mode)` lines; verify no mapper errors. Check
    `legacy_sync_status.last_error` is NULL for every row after 24h.
+   ⚠️ **Editing `.env` directly will be reverted on the next master
+   push — see Section 4a.**
 4. **Go live.** Set `LEGACY_SYNC_SHADOW_MODE=false`, recreate the
    container. Now CT changes flow into canonical PG state and the
-   event bus.
+   event bus. ⚠️ **Same `.env`-revert pitfall — see Section 4a.**
 5. **24h live soak.** Run the receptionist test plan (Section 7).
    Verify `event_log` rows with `source_kind='legacy_app'` accumulate.
    Verify `ht_reconcile_log` stays empty (no drift between CT watcher
@@ -119,9 +126,144 @@ production CT watcher". Each step gates on the prior step's success.
 
 ---
 
+## 4a. Known operator pitfall — `.env` is rewritten by every CI deploy
+
+**Symptom.** You SSH to evergreen, edit `~/new-hotel-production/.env` to
+flip `LEGACY_SYNC_ENABLED=true`, recreate the `sync` container, watch
+events flow. A few hours (or days) later someone merges an unrelated
+PR, the CI deploy job runs, and the watcher silently goes back to
+`exited` state because `.env` was reset to `LEGACY_SYNC_ENABLED=false`.
+
+**Why.** The deploy job in `.github/workflows/docker-build.yml` (search
+for the `Deploy` step under `jobs.deploy.steps`) writes `.env` from
+scratch on every push, sourcing values from GitHub Secrets. The current
+heredoc only contains the secrets the production runtime requires
+(`DB_*`, `POSTGRES_*`, `SLACK_WEBHOOK_URL`); it does NOT carry
+`LEGACY_SYNC_ENABLED` / `LEGACY_SYNC_SHADOW_MODE`. Anything you write
+into `.env` by hand that isn't in that heredoc is lost the next time
+master is pushed.
+
+The `docker-compose.yml` for the `sync` service falls back to
+`LEGACY_SYNC_ENABLED=false` and `LEGACY_SYNC_SHADOW_MODE=true` when the
+`.env` doesn't supply them — which is why the watcher silently
+"reverts" to disabled-shadow rather than failing loudly.
+
+### Recommended remediation — promote the flags to GitHub Secrets
+
+This is the lowest-friction, smallest-blast-radius fix. Do this BEFORE
+you flip the watcher live for the first time.
+
+1. **Set the secrets on the repo:**
+   ```bash
+   gh secret set LEGACY_SYNC_ENABLED      --body "true"
+   gh secret set LEGACY_SYNC_SHADOW_MODE  --body "true"   # or "false" once soaked
+   ```
+
+2. **Add them to the deploy job's heredoc.** In
+   `.github/workflows/docker-build.yml`, locate the `Deploy` step under
+   `jobs.deploy.steps` (the block that begins
+   `# Write .env file from GitHub Secrets`). Add:
+   ```yaml
+   env:
+     # …existing env vars…
+     LEGACY_SYNC_ENABLED:     ${{ secrets.LEGACY_SYNC_ENABLED }}
+     LEGACY_SYNC_SHADOW_MODE: ${{ secrets.LEGACY_SYNC_SHADOW_MODE }}
+   ```
+   And inside the `.env` heredoc body:
+   ```bash
+   echo "LEGACY_SYNC_ENABLED='${LEGACY_SYNC_ENABLED}'"
+   echo "LEGACY_SYNC_SHADOW_MODE='${LEGACY_SYNC_SHADOW_MODE}'"
+   ```
+
+3. **Add them to the secret-validation loop** (the `for var in DB_SERVER
+   DB_NAME …` block) so a missing secret fails the deploy loudly
+   instead of producing an empty value compose silently treats as the
+   default.
+
+4. **Push the workflow change.** From now on, flipping the flag means
+   `gh secret set LEGACY_SYNC_ENABLED --body "true"` plus a re-run of
+   the deploy workflow (or any push to master). No more SSH-to-edge
+   drift.
+
+> The wiring is intentionally NOT shipped in the same commit as this
+> documentation update — the operator should decide WHEN to flip the
+> flag for the first time before exposing it via secrets.
+
+### Alternative — move the gate to a PG flag table
+
+If you want operator changes to take effect mid-tick without a deploy
+or a container restart, move the flag out of the env into a PG row.
+
+1. **Add a migration** under `migrations/pg/` (e.g.
+   `020_legacy_sync_control.sql`):
+   ```sql
+   CREATE TABLE IF NOT EXISTS legacy_sync_control (
+       id              BIGINT       PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+       enabled         BOOLEAN      NOT NULL DEFAULT false,
+       shadow_mode     BOOLEAN      NOT NULL DEFAULT true,
+       updated_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
+       updated_by      TEXT
+   );
+   INSERT INTO legacy_sync_control (id) VALUES (1) ON CONFLICT DO NOTHING;
+   ```
+
+2. **Re-point `bin/sync.rs`** to read this row at the top of every poll
+   tick instead of reading the env once at startup. The watcher
+   evaluates the flag fresh, so the operator can flip it via:
+   ```sql
+   UPDATE legacy_sync_control
+      SET enabled = true, shadow_mode = false, updated_at = now(),
+          updated_by = 'on-call-operator'
+    WHERE id = 1;
+   ```
+
+3. **Audit log.** Because every flip is a row update, you get a free
+   audit trail (extend the table with a history side-table if you want
+   per-flip records). Survives `.env` resets, no deploy needed, more
+   granular control (you can disable a single table via additional
+   columns later).
+
+The PG-flag approach trades a small amount of code complexity for
+operational flexibility. Pick it if you expect to flip the flag more
+than a couple of times in the cutover window; pick the GH-secrets
+approach if you'll flip it twice and forget about it.
+
+### Rollback path — re-enabling shadow mode mid-incident
+
+If a Phase 5.5 mapper bug is detected in production and you need to
+switch the watcher back to shadow mode WITHOUT taking it offline:
+
+**Using the GH-secrets approach (recommended above):**
+```bash
+gh secret set LEGACY_SYNC_SHADOW_MODE --body "true"
+gh workflow run docker-build.yml --ref master   # re-runs deploy with new .env
+# OR for a faster path that skips image rebuild:
+ssh deploy@evergreen \
+  "cd /home/nut/new-hotel-production && \
+   sed -i \"s/^LEGACY_SYNC_SHADOW_MODE=.*/LEGACY_SYNC_SHADOW_MODE='true'/\" .env && \
+   docker compose --profile legacy up -d --force-recreate sync"
+# IMPORTANT: the sed-on-evergreen path is only stable until the next
+# master push; immediately follow with the `gh secret set` so the
+# next deploy carries the flag forward.
+```
+
+**Using the PG-flag approach:**
+```sql
+UPDATE legacy_sync_control SET shadow_mode = true, updated_at = now() WHERE id = 1;
+```
+No restart needed — the next poll tick reads the new value. Use this
+if you wired the alternative remediation above.
+
+---
+
 ## 5. Rollback procedure
 
 If something goes wrong during cutover, the reverse sequence:
+
+> **Reminder:** every step that says "set X in `.env`" is subject to
+> the operator-flip-revert pitfall in Section 4a. Follow each `.env`
+> edit with a `gh secret set` for the matching key (once the GH-secrets
+> remediation is wired) so the next CI deploy doesn't undo it.
 
 1. **Disable the watcher.** Set `LEGACY_SYNC_ENABLED=false` in `.env`.
    `docker compose --profile legacy up -d --force-recreate sync` —
