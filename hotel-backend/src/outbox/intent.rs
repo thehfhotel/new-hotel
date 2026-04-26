@@ -149,6 +149,11 @@ pub struct CreateBookingPayload {
     pub room_type: String,
     pub price: Money,
     pub nights: i32,
+    /// Deposit (`เงินมัดจำ` baht). Lands in `HT_Book_H.Book_Price_Pay`.
+    /// Defaults to zero. Serde default keeps older queue rows
+    /// (pre-2.23.0) deserializable — they'll appear with zero deposit.
+    #[serde(default)]
+    pub deposit: Money,
 
     pub created_by: String,
     pub notes: Option<String>,
