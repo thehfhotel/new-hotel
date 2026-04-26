@@ -5,6 +5,95 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.45.0] - 2026-04-26
+
+### Added
+
+- **Phase 5.5 — production cutover scaffolding for the CT watcher.**
+  The 10-table mapper coverage shipped in 5.4 (commit ea3dae0); 5.5
+  ships the operational scaffolding so an operator can flip the
+  watcher live.
+  - **`sync` docker service block** (`docker-compose.yml`). Same image
+    as `backend` + `writeback`, different command (`./sync`), under
+    `profiles: [legacy]` so plain `docker compose up` skips it.
+    Activate via `docker compose --profile legacy up -d`. Ships
+    default-DISABLED — `LEGACY_SYNC_ENABLED=false` causes the binary
+    to log + exit 0 cleanly. `.github/workflows/docker-build.yml`
+    `deploy` step now force-recreates the `sync` container alongside
+    the existing writeback recreation, with a state check that
+    surfaces `running` (live) vs `exited` (default-disabled — the
+    expected post-deploy state) without failing the deploy.
+  - **`bin/sync --bootstrap` flag.** Cold-start path the operator
+    runs ONCE before flipping `LEGACY_SYNC_ENABLED=true`. Steps:
+    (1) verify schema fingerprint, (2) invoke
+    `scheduler::sync::run_sync` in temporarily-overridden `upsert`
+    mode to bring canonical PG state up to date with MSSQL, (3) read
+    `CHANGE_TRACKING_CURRENT_VERSION()` from MSSQL, (4) UPSERT it as
+    the watermark via direct UPDATE (overwrites unconditionally — does
+    NOT use `watermark::advance`'s `<=` guard, so a partial prior run
+    can be force-recovered). Exit 0. Bootstrap runs INDEPENDENTLY of
+    `LEGACY_SYNC_ENABLED` — operator bootstraps first, then flips the
+    flag (per `docs/runbook-sync.md` cutover sequence).
+  - **Cold-replay refusal** (`bin/sync.rs` main loop). When
+    `last_seen_version=0` (the migration's seed value) AND
+    `LEGACY_SYNC_ALLOW_COLD_REPLAY != true` (default), the watcher
+    refuses to start with a clear error message pointing at
+    `--bootstrap`, fires a Slack alert, sleeps 60s before exit (to
+    throttle Docker `restart: unless-stopped` cadence), and returns
+    Err. Mitigates the "process every CT row from time-zero" footgun
+    flagged in the original Phase 5 plan.
+  - **Migration 019 — `ht_reconcile_log`.** Drift-detection tripwire
+    table consumed by the demoted `scheduler::sync::run_sync`
+    diff-only mode. Schema: `id`, `detected_at`, `table_name`,
+    `legacy_pk`, `pg_hash`, `mssql_hash`, `mssql_row_json`,
+    `pg_row_json`, `resolved_at`. Two partial indexes on
+    `WHERE resolved_at IS NULL` for cheap dashboard / alerting reads.
+    Mirrored in `init-db/init-hotelnew.sql` for fresh deployments.
+  - **`docs/runbook-sync.md`** — operator runbook covering: bootstrap
+    procedure, env-var matrix (every flag, default, when to flip),
+    Slack alert meanings, cutover procedure (deploy → bootstrap →
+    shadow soak 24h → enable → live soak 24h), rollback procedure,
+    known limitations (payment-cancel cascade race window, receipt
+    `pay_method='cash'` default, MSSQL probe in tests), 5-scenario
+    receptionist test plan (create / cancel booking, check-in /
+    check-out, add / cancel payment) for the receptionist team to
+    run during live soak, and observability dashboard SQL pointers
+    (`legacy_sync_status`, `legacy_ct_state`, `event_log` filter,
+    `ht_reconcile_log` unresolved-set query).
+  - **`SYNC_TEST_SKIP_MSSQL_PROBE` env var.** QoL escape hatch in
+    `tests/test_sync_phase54_integration.rs::mssql_stub`. When set,
+    skips the bb8-tiberius probe and returns `None` immediately —
+    saves ~30s per test process when MSSQL is unreachable. Documented
+    in the runbook env-var matrix.
+  - **Tests:** `tests/test_scheduler_sync_diff_only.rs` (4 cases —
+    PG-miss logged, hash divergence logged, canonical state
+    untouched, partial-index unresolved-set query) +
+    `tests/test_sync_phase55_bootstrap.rs` (6 cases — watermark
+    overwrite semantics, cold-replay sentinel contract, post-bootstrap
+    non-zero invariant, plus 3 compile-time guards on the env-var /
+    flag literal names that must stay in sync with the runbook).
+
+### Changed
+
+- **`scheduler::sync::run_sync` demoted to diff-only safety net**
+  (Phase 5.5). The CT watcher (`bin/sync`) is now authoritative for
+  canonical PG state. The legacy 5-min full-UPSERT job is downgraded
+  to a 15-min drift-detection tripwire that LOGS divergent rows into
+  `ht_reconcile_log` instead of UPSERTing canonical state.
+  - Env var `LEGACY_SYNC_RECONCILE_MODE` controls behaviour:
+    `diff_only` (default) = hash-compare + log; `upsert` = original
+    behaviour, kept as an escape hatch for operational rollback.
+    Unknown values fall back to the safe (non-mutating) default with
+    a warning log.
+  - Cron schedule changed from `0 */5 * * * *` (every 5 min) to
+    `0 */15 * * * *` (every 15 min — quarters of the hour for easier
+    log correlation). Operators relying on the legacy 5-min cadence
+    must understand canonical state is now sub-second-fresh via the
+    CT watcher; the 15-min reconcile is purely a safety net.
+  - Per-entity log lines now include the active mode tag (e.g.
+    `[Sync] Customers (DiffOnly): … added, … updated, … unchanged …`)
+    so operators can tell at a glance which path ran.
+
 ## [2.44.1] - 2026-04-26
 
 ### Added

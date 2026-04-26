@@ -50,12 +50,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     cargo build --release \
         --bin hotel-backend \
         --bin writeback \
+        --bin sync \
         --bin backfill_rooms \
         --bin inspect_booking \
         --bin inspect_schema \
     && mkdir -p /out \
     && cp target/release/hotel-backend /out/ \
     && cp target/release/writeback /out/ \
+    && cp target/release/sync /out/ \
     && cp target/release/backfill_rooms /out/ \
     && cp target/release/inspect_booking /out/ \
     && cp target/release/inspect_schema /out/
@@ -72,6 +74,7 @@ WORKDIR /app
 
 COPY --from=builder /out/hotel-backend /app/hotel-backend
 COPY --from=builder /out/writeback /app/writeback
+COPY --from=builder /out/sync /app/sync
 COPY --from=builder /out/backfill_rooms /app/backfill_rooms
 COPY --from=builder /out/inspect_booking /app/inspect_booking
 COPY --from=builder /out/inspect_schema /app/inspect_schema
