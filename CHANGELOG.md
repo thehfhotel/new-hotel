@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.46.3] - 2026-04-26
+
+### Added
+
+- **`scripts/sync-status.sh`** — Phase 5 sync worker observability dashboard.
+  SSHes to evergreen and prints a sectioned, color-coded report covering:
+  container status (sync/writeback/backend/newdb running + healthy?),
+  CT watermark + freshness (last_seen_version vs last_polled_at),
+  per-table activity (`legacy_sync_status` rows_ingested/skipped/errors),
+  reconcile drift (`ht_reconcile_log` unresolved counts + sample),
+  and a 6-check cutover-readiness verdict. Modes: `--watch` (refresh
+  every 30s), `--json` (machine-readable), `--readiness` (focused
+  exit-code-driven check; 0=green-to-flip, 1=not ready). Designed as
+  the operator's primary tool for deciding when to flip
+  `LEGACY_SYNC_SHADOW_MODE=false`.
+
+### Fixed
+
+- **Disable image-baked HEALTHCHECK on writeback + sync services.**
+  The `hotel-backend` Dockerfile bakes a `HEALTHCHECK CMD curl /api/mode`
+  for the backend HTTP service. Writeback and sync share that image but
+  run different binaries that never bind port 3003 — Docker was reporting
+  both as `unhealthy` indefinitely (surfaced by `sync-status.sh`).
+  Compose-level `healthcheck: disable: true` per service.
+
 ## [2.46.2] - 2026-04-26
 
 ### Security

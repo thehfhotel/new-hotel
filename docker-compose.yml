@@ -150,6 +150,11 @@ services:
         condition: service_healthy
     networks:
       - hotel-network
+    # The image's baked HEALTHCHECK probes /api/mode (the backend HTTP endpoint).
+    # Writeback doesn't bind that port — disable per-service so it's not flagged
+    # `unhealthy` and starve restart attempts under `on-failure:5`.
+    healthcheck:
+      disable: true
     # `on-failure:5` instead of `unless-stopped` so the binary's clean
     # `Ok(0)` exit when WRITEBACK_ENABLED=false does NOT trigger the
     # restart-loop (Docker treats exit 0 as expected under on-failure;
@@ -221,6 +226,10 @@ services:
         condition: service_healthy
     networks:
       - hotel-network
+    # See the writeback healthcheck note — the image's baked /api/mode probe
+    # doesn't apply to this binary either.
+    healthcheck:
+      disable: true
     # `on-failure:5` instead of `unless-stopped` so the binary's clean
     # `Ok(0)` exit when LEGACY_SYNC_ENABLED=false (the default) does NOT
     # trigger the restart-loop. Same reasoning as the writeback service.
