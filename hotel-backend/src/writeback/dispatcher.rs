@@ -129,6 +129,24 @@ pub struct DispatchContext {
 ///
 /// Recipes consume the intent by reference because callers (the worker) keep
 /// the deserialized intent alive for tracing/error messages.
+///
+/// ## Loop-prevention chokepoint (Phase 5.1)
+///
+/// `dispatch` is the **single** entry point through which every recipe
+/// runs. The first thing it does after the trace line is call
+/// [`crate::db::mssql_session::set_context_info`] which issues
+/// `SET CONTEXT_INFO 0x4E48` ("NH" = New Hotel). SQL Server Change
+/// Tracking surfaces that value as `SYS_CHANGE_CONTEXT` on every row
+/// the recipe mutates, and the CT watcher (`bin/sync.rs`) filters those
+/// rows out — preventing a feedback loop where our writeback fires CT,
+/// the watcher re-detects it, re-publishes the event, and the writeback
+/// fires again.
+///
+/// **DO NOT** add a recipe entry point that bypasses `dispatch`. The
+/// loop-prevention guarantee depends on the tag being applied exactly
+/// once per writeback session BEFORE any recipe SQL runs. New
+/// `WritebackIntent` variants must extend the `match` below — the
+/// compiler's exhaustiveness check is the structural enforcement.
 pub async fn dispatch(
     conn: &mut LegacyConn<'_>,
     intent: &WritebackIntent,
@@ -141,6 +159,11 @@ pub async fn dispatch(
         intent = intent.intent_name(),
         "Dispatching writeback intent"
     );
+    // Phase 5.1 loop-prevention — tag this writeback session so the CT
+    // watcher can filter out our own changes. Belt-and-suspenders: the
+    // 5.2+ mappers are idempotent UPSERTs, so a missed tag costs at
+    // most one extra cycle.
+    crate::db::mssql_session::set_context_info(conn).await?;
     match intent {
         WritebackIntent::CreateBooking { booking_id: _, payload } => {
             recipes::booking_create::execute(conn, payload).await
@@ -340,5 +363,39 @@ mod tests {
         // Counting expected variants here keeps the test cheap and
         // deterministic.
         assert_eq!(names.len(), 9, "expected 9 WritebackIntent variants");
+    }
+
+    /// Phase 5.1 chokepoint guarantee — every recipe MUST run after
+    /// `set_context_info` so its mutations carry the `0x4E48` tag that
+    /// the CT watcher filters out. The structural enforcement is:
+    ///
+    /// 1. `dispatch` is the single public entry point — recipes are only
+    ///    reachable through `crate::writeback::recipes` which is `pub`
+    ///    inside the `writeback` module but the recipes' `execute`
+    ///    functions are only called from this file.
+    /// 2. `dispatch` calls `set_context_info` BEFORE the `match`.
+    /// 3. The `match` is exhaustive over `WritebackIntent` — the
+    ///    compiler refuses to build if a new variant skips the call.
+    ///
+    /// This test pins point 2 by reading the source and asserting the
+    /// invocation appears before the variant arms. It's a textual
+    /// check, not a runtime assertion, but combined with the compiler-
+    /// level exhaustiveness in point 3 and the module-level privacy of
+    /// recipes, it's sufficient to make a regression visible in CI.
+    #[test]
+    fn dispatch_calls_set_context_info_before_recipes() {
+        let source = include_str!("dispatcher.rs");
+        let context_pos = source
+            .find("set_context_info(conn)")
+            .expect("dispatch() must call set_context_info(conn)");
+        let match_pos = source
+            .find("match intent {")
+            .expect("dispatch() must contain `match intent {`");
+        assert!(
+            context_pos < match_pos,
+            "set_context_info must be called BEFORE the match on intent — \
+             otherwise the loop-prevention tag is missing for the first \
+             statement of every recipe"
+        );
     }
 }

@@ -115,6 +115,7 @@ These are automatically applied by `scripts/migrate.sh` during deployment.
 | 014 | `014_legacy_id_columns.sql` | Add `legacy_*` + `aggregate_id` columns to `ht_bookings`/`ht_checkins`/`ht_rooms_new` so the writeback worker's resolver can map UUID→row and back-populate allocated MSSQL identifiers | v2.31.0 |
 | 015 | `015_writeback_retry_state.sql` | Add `claimed_at`/`next_retry_at` to `writeback_jobs`; introduce `exhausted` terminal status. Enables stuck-in-progress recovery, retry backoff, and Slack alerting on retry exhaustion | v2.33.0 |
 | 016 | `016_writeback_notify_trigger.sql` | Auto-fire `NOTIFY writeback_channel` on every `writeback_jobs` INSERT so the worker wakes sub-second instead of waiting on the 30-second poll fallback | v2.38.0 |
+| 017 | `017_legacy_sync_status.sql` | Phase 5.1 — per-table CT-watcher observability table (`legacy_sync_status`) seeded for the 10 CT-enabled tables, plus `ht_customers.cust_deleted_at` soft-delete column for upcoming HT_Customers `D` mapper | v2.43.0 |
 
 ## Tables Owned by This Application
 
@@ -156,6 +157,7 @@ All table and column names are **lowercase** (PostgreSQL convention). The canoni
 | `writeback_jobs` | Outbox queue for legacy MSSQL writeback (one row per pending intent) | v2.8.2 |
 | `event_log` | Durable domain-event bus (every state-mutating action emits one row) | v2.8.2 |
 | `legacy_ct_state` | Single-row Change Tracking watermark consumed by `bin/sync.rs` | v2.8.2 |
+| `legacy_sync_status` | Per-table CT-watcher observability — rows ingested/skipped, last error, consecutive failure count | v2.43.0 |
 
 ## Tables Used (Read-Only or Shared)
 

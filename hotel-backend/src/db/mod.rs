@@ -4,6 +4,7 @@
 //! - HotelNew DB: PostgreSQL via sqlx
 
 mod dual_pool;
+pub mod mssql_session;
 mod pg_pool;
 mod pool;
 
