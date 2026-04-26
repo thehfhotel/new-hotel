@@ -1343,7 +1343,7 @@ public class FrmAddEditServer : Office2007Form
 			{
 				TextBox_password.PasswordChar = '\0';
 			}
-			else if (Operators.CompareString(TextBox_password.Text, "***REMOVED***", TextCompare: false) == 0)
+			else if (Operators.CompareString(TextBox_password.Text, "12345678", TextCompare: false) == 0)
 			{
 				TextBox_password.PasswordChar = '\0';
 			}
@@ -1380,7 +1380,7 @@ public class FrmAddEditServer : Office2007Form
 				}
 				if (Operators.CompareString(TextBox_password.Text, "", TextCompare: false) == 0)
 				{
-					TextBox_password.Text = "***REMOVED***";
+					TextBox_password.Text = "12345678";
 				}
 			}
 			return;
@@ -1394,7 +1394,7 @@ public class FrmAddEditServer : Office2007Form
 			}
 			if (Operators.CompareString(TextBox_password.Text, "", TextCompare: false) == 0)
 			{
-				TextBox_password.Text = "***REMOVED***";
+				TextBox_password.Text = "12345678";
 			}
 		}
 	}
@@ -1438,7 +1438,7 @@ public class FrmAddEditServer : Office2007Form
 			{
 				obj = Operators.ConcatenateObject(obj, string.Concat("Password = " + TextBox_password.Text, "\r\n"));
 			}
-			else if ((Operators.CompareString(TextBox_password.Text, "1234", TextCompare: false) == 0) | (Operators.CompareString(TextBox_password.Text, "12340000", TextCompare: false) == 0) | (Operators.CompareString(TextBox_password.Text, "***REMOVED***", TextCompare: false) == 0))
+			else if ((Operators.CompareString(TextBox_password.Text, "1234", TextCompare: false) == 0) | (Operators.CompareString(TextBox_password.Text, "12340000", TextCompare: false) == 0) | (Operators.CompareString(TextBox_password.Text, "12345678", TextCompare: false) == 0))
 			{
 				obj = Operators.ConcatenateObject(obj, string.Concat("Password = " + TextBox_password.Text, "\r\n"));
 			}

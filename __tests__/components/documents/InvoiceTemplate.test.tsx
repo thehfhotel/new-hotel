@@ -11,8 +11,8 @@ const createMockInvoiceData = (overrides: Partial<InvoiceData> = {}): InvoiceDat
   invoiceNumber: 'INV-2569-0001',
   checkInId: 1,
   guestName: 'John Doe',
-  guestIdCard: '***REMOVED***90123',
-  guestContact: '08***REMOVED***',
+  guestIdCard: '1234567890123',
+  guestContact: '0812345678',
   checkInDate: '2026-01-20T07:00:00.000Z',
   checkOutDate: '2026-01-25T05:00:00.000Z',
   rooms: [
@@ -39,7 +39,7 @@ const createMockHotelInfo = (overrides: Partial<HotelInfo> = {}): HotelInfo => (
   name: 'The HF Hotel',
   address: '123 Beach Road, Pattaya, Chonburi 20150',
   phone: '038-123-4567',
-  taxId: '***REMOVED***90123',
+  taxId: '1234567890123',
   ...overrides,
 })
 
@@ -71,7 +71,7 @@ describe('InvoiceTemplate Component', () => {
     test('displays hotel tax ID', () => {
       render(<InvoiceTemplate {...defaultProps} />)
 
-      expect(screen.getByText(/เลขประจำตัวผู้เสียภาษี: ***REMOVED***90123/)).toBeInTheDocument()
+      expect(screen.getByText(/เลขประจำตัวผู้เสียภาษี: 1234567890123/)).toBeInTheDocument()
     })
 
     test('displays hotel logo when provided', () => {
@@ -114,13 +114,13 @@ describe('InvoiceTemplate Component', () => {
     test('displays guest ID card number', () => {
       render(<InvoiceTemplate {...defaultProps} />)
 
-      expect(screen.getByText('***REMOVED***90123')).toBeInTheDocument()
+      expect(screen.getByText('1234567890123')).toBeInTheDocument()
     })
 
     test('displays guest contact information', () => {
       render(<InvoiceTemplate {...defaultProps} />)
 
-      expect(screen.getByText('08***REMOVED***')).toBeInTheDocument()
+      expect(screen.getByText('0812345678')).toBeInTheDocument()
     })
 
     test('displays check-in ID', () => {

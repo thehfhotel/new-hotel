@@ -44,9 +44,9 @@ export const createMockCustomer = (overrides?: Partial<MockCustomer>): MockCusto
   id: 1,
   firstName: 'ทดสอบ',
   lastName: 'ลูกค้า',
-  phone: '08***REMOVED***',
+  phone: '0812345678',
   email: 'test@example.com',
-  idCard: '***REMOVED***90123',
+  idCard: '1234567890123',
   ...overrides,
 })
 
@@ -56,9 +56,9 @@ export const createMockCustomerOption = (
   id: 1,
   firstName: 'ทดสอบ',
   lastName: 'ลูกค้า',
-  phone: '08***REMOVED***',
+  phone: '0812345678',
   email: 'test@example.com',
-  idCard: '***REMOVED***90123',
+  idCard: '1234567890123',
   ...overrides,
 })
 
@@ -283,8 +283,8 @@ export const createMockInvoiceData = (
   invoiceNumber: 'INV-2026-0001',
   checkInId: 1,
   guestName: 'ทดสอบ ลูกค้า',
-  guestIdCard: '***REMOVED***90123',
-  guestContact: '08***REMOVED***',
+  guestIdCard: '1234567890123',
+  guestContact: '0812345678',
   checkInDate: '2026-01-15T14:00:00.000Z',
   checkOutDate: '2026-01-20T12:00:00.000Z',
   rooms: [
@@ -319,7 +319,7 @@ export const createMockHotelInfo = (overrides?: Partial<HotelInfo>): HotelInfo =
   name: 'โรงแรมทดสอบ',
   address: '123 ถนนทดสอบ ตำบลทดสอบ อำเภอเมือง จังหวัดทดสอบ 10000',
   phone: '02-123-4567',
-  taxId: '***REMOVED***90123',
+  taxId: '1234567890123',
   logo: undefined,
   ...overrides,
 })

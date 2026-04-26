@@ -194,14 +194,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         port: env::var("MSSQL_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(1433),
         database: env::var("MSSQL_DATABASE").unwrap_or_else(|_| "hotel".to_string()),
         user: env::var("MSSQL_USER").unwrap_or_else(|_| "sa".to_string()),
-        password: env::var("MSSQL_PASSWORD").unwrap_or_else(|_| "***REMOVED***".to_string()),
+        password: env::var("MSSQL_PASSWORD").unwrap_or_else(|_| "12345678".to_string()),
     };
 
     let pg_server = env::var("PG_SERVER").unwrap_or_else(|_| "localhost".to_string());
     let pg_port = env::var("PG_PORT").unwrap_or_else(|_| "5440".to_string());
     let pg_database = env::var("PG_DATABASE").unwrap_or_else(|_| "hfville".to_string());
     let pg_user = env::var("PG_USER").unwrap_or_else(|_| "postgres".to_string());
-    let pg_password = env::var("PG_PASSWORD").unwrap_or_else(|_| "***REMOVED***".to_string());
+    let pg_password = env::var("PG_PASSWORD").unwrap_or_else(|_| "12345678".to_string());
 
     let sync_interval: u64 = env::var("SYNC_INTERVAL_SECS")
         .ok()
@@ -242,7 +242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let push_port = env::var("PUSH_PG_PORT").unwrap_or_else(|_| "5439".to_string());
             let push_database = env::var("PUSH_PG_NAME").unwrap_or_else(|_| "hotelnew".to_string());
             let push_user = env::var("PUSH_PG_USER").unwrap_or_else(|_| "postgres".to_string());
-            let push_password = env::var("PUSH_PG_PASSWORD").unwrap_or_else(|_| "***REMOVED***".to_string());
+            let push_password = env::var("PUSH_PG_PASSWORD").unwrap_or_else(|_| "12345678".to_string());
 
             tracing::info!("[Push] Production target: {}@{}:{}/{}", push_user, push_server, push_port, push_database);
 

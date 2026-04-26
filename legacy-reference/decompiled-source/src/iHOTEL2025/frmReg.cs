@@ -1811,7 +1811,7 @@ public class frmReg : Office2007Form
 		{
 			MessageBox.Show("ไม\u0e48สามารถปลอบล\u0e4aอคได\u0e49 เน\u0e37\u0e48องจากเคร\u0e37\u0e48อง " + TextBox1.Text + " ได\u0e49เล\u0e34กใช\u0e49งานไปแล\u0e49ว กร\u0e38ณาต\u0e34ดต\u0e48อผ\u0e39\u0e49ด\u0e39แลโปรแกรม", "ERROR!!", MessageBoxButtons.OK, MessageBoxIcon.Hand);
 		}
-		else if ((documentText.IndexOf(TextBox1.Text) == -1) & (documentText.IndexOf("***REMOVED***9123") != -1))
+		else if ((documentText.IndexOf(TextBox1.Text) == -1) & (documentText.IndexOf("123456789123") != -1))
 		{
 			StreamWriter streamWriter = new StreamWriter(Module1.PathF + "reg.txt");
 			streamWriter.Write("1234");

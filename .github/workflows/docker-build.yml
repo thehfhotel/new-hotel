@@ -658,7 +658,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Load HF Ville SSH key into agent
-        # Replaces the previous `sshpass -p ***REMOVED***` literal — pubkey is
+        # Replaces the previous `sshpass -p <hardcoded>` pattern — pubkey is
         # installed on the jump box once by the operator (see commit body
         # for the operator setup). The action wipes the agent at job end.
         # v0.9.0 pinned to commit SHA per Batch D.
