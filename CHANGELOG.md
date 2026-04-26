@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.49.0] - 2026-04-26
+
+### Changed
+
+- **Backend tests now run inside the Docker `test` stage, sharing the
+  cargo-chef cooked-deps layer with build-backend.**
+  The runner-mode cargo invocation maintained a SEPARATE cache from
+  the Dockerfile builds (sccache + Swatinem rust-cache), so the
+  ~800-crate dep recompile happened TWICE per push — once for tests,
+  once for the runtime image. Moving tests into the Docker build lets
+  both jobs read from the same `cache-from: type=gha,scope=backend`
+  layer. Test compile drops from a full dep-recompile to test-only
+  code on top of the cooked deps.
+  - New `test` stage in `hotel-backend/Dockerfile`, `FROM builder`,
+    runs `cargo test --release --locked -- --test-threads=1` inside
+    the buildkit RUN. Result of the RUN = result of the test suite.
+  - `network: host` on the buildx build step + `--allow-insecure-entitlement
+    network.host` on buildkit so the test stage's RUN can reach the
+    runner's Postgres service container at `localhost:5439`. Risk
+    profile is acceptable: the test stage is never pushed to a
+    registry, talks only to a runner-scoped throwaway PG, and reads
+    the throwaway TEST_POSTGRES_PASSWORD from a CI-only secret.
+  - `cache-from` only (no `cache-to`) on the test job — `build-backend`
+    owns the write side for `scope=backend` so test runs can't upsert
+    partial / test-only state into the same namespace.
+  - Removed runner-side Rust toolchain install + sccache + Swatinem
+    rust-cache steps — all replaced by the buildx build. Result: the
+    `test-backend` job has fewer moving parts and reuses build-backend's
+    work directly.
+
 ## [2.48.0] - 2026-04-26
 
 ### Changed
