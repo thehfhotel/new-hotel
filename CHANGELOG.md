@@ -5,6 +5,69 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.44.0] - 2026-04-26
+
+### Added
+
+- **Phase 5.3 — booking aggregate CT mapper (3-table HT_Book_H +
+  HT_Book_Ds + HT_Book_Date with parent re-load + per-tick coalescing
+  emitting one DomainEvent per aggregate).**
+  - **`sync::parent_loader`** (`hotel-backend/src/sync/parent_loader.rs`) —
+    `load_booking_aggregate(book_no)` pulls header + every line + every
+    calendar night for one booking from MSSQL into a `BookingAggregate`
+    struct of `MappableRow` projections. Internal `fetch_rows` helper
+    is generic over `(table, where_col, projection)` so 5.4's
+    `load_checkin_aggregate(cin_no)` is one extra public wrapper, no
+    refactor.
+  - **`sync::mappers::booking`** ships three `MssqlChangeMapper` impls
+    (`BookingHeaderMapper`, `BookingRoomsMapper`, `BookingDatesMapper`)
+    that all delegate to a shared `apply_booking_aggregate` helper.
+    The helper re-loads the aggregate, idempotently UPSERTs
+    `ht_bookings` + `ht_booking_rooms`, and emits exactly one
+    `BookingCreated` / `BookingModified` / `BookingCancelled` event
+    per aggregate per tick.
+  - **Coalescing layer in `bin/sync.rs::poll_table`.** Mappers opt in
+    via the new `MssqlChangeMapper::coalesce_key(row)` trait method;
+    when present, the watcher groups CT rows by aggregate root key
+    (HashSet dedup) and dispatches `apply_booking_aggregate` exactly
+    once per unique key per tick. Customer / room mappers return
+    `None` (the trait default) and stay on the legacy 5.2 per-row
+    dispatch path.
+  - **`MappableRow` extended with a decimal arm** (`try_get_decimal`)
+    so booking-header monetary columns (`Book_Price_Total`,
+    `Book_Price_Pay`) project cleanly. Stored as `f64` to match the
+    existing writeback (`writeback/format.rs`) + repository
+    (`$N::float8` casts) precedent — see the rustdoc on the trait
+    method for the rationale.
+  - **`HashMapRow::MockValue::Decimal`** mirrors the new arm;
+    `try_get_f64` and `try_get_decimal` cells are interchangeable so
+    fixtures pick whichever variant reads more naturally.
+  - **`Book_Status` literal mapping** (`'จอง'` → `'confirmed'`,
+    `'เข้าพัก'` → `'checked_in'`, `'ยกเลิก'` → `'cancelled'`,
+    `'ออกแล้ว'` → `'completed'`, anything else → `'pending'`) —
+    legacy literals stay verbatim per the user's standing constraint;
+    PG canonical column reuses the existing string convention from
+    `routes/new_bookings`.
+  - **Customer / room FK resolvers** in the booking mapper defer the
+    apply when `legacy_cust_no` (resolved against `ht_customers`) or
+    `room_no` (resolved against `ht_rooms_new`) hasn't been mirrored
+    yet — the next tick's customer / room CT row brings the booking
+    in via the same code path.
+  - **Real wiring in `bin/sync.rs::build_mappers`** for `HT_Book_H`,
+    `HT_Book_Ds`, `HT_Book_Date` (was `NoopMapper` in 5.2). Mapper
+    count and CT-enabled-table list unchanged.
+  - 28 new unit tests covering legacy-status mapping, projection,
+    coalescing dedup, idempotency, and event-shape regression. 5 new
+    integration tests under `tests/test_sync_phase53_integration.rs`
+    covering insert / re-apply / modify / cancel / coalescing
+    end-to-end against the canonical PG.
+  - **No new migration** — `ht_bookings.legacy_book_id` /
+    `legacy_cust_no` / `aggregate_id` already added by migration 014.
+    `ht_booking_rooms` schema (already shipped) accommodates the
+    projection.
+  - **`LEGACY_SYNC_ENABLED` stays default-false.** Operator decision
+    to flip live; the watcher remains opt-in.
+
 ## [2.43.1] - 2026-04-26
 
 ### Added
