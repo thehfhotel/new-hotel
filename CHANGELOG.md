@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.47.0] - 2026-04-26
+
+### Changed
+
+- **Restored cargo-chef in `hotel-backend/Dockerfile` + `Dockerfile.ville-sync`.**
+  Source-only changes (the common case) now hit a cached `cargo chef cook`
+  layer and skip the ~800-crate dependency recompile. Expected backend
+  build time on warm cache: ~5min → ~1-2min. Cold-cache build (deps
+  changed) is unchanged.
+  - `chef → planner → builder → runtime` four-stage layout. The planner
+    derives `recipe.json` (a hash of the dependency graph); the builder
+    `cooks` deps once before COPYing the source. Docker's layer cache
+    keys the cook step on `recipe.json` alone — when only source files
+    change, the cook layer is a hit and never re-executes.
+  - cargo-chef pinned to `0.1.71` (security + reproducibility — there is
+    no Dependabot ecosystem for `cargo install` binaries; bumps are
+    Dockerfile edits).
+  - All Batch C / D guarantees preserved: pinned base-image digest,
+    non-root runtime user, OCI labels, HEALTHCHECK, `--locked` flag,
+    `inspect_*` debug bins excluded from runtime.
+  - Both Dockerfiles share the `hotel-backend-target` cache id so a
+    build of either image warms the other's `target/`.
+
 ## [2.46.5] - 2026-04-26
 
 ### Fixed
