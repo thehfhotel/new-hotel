@@ -47,7 +47,13 @@ pub async fn init_scheduler(
     let scheduler = JobScheduler::new().await?;
     let state = Arc::new(Mutex::new(SchedulerState::default()));
 
-    // Legacy sync job: runs every 5 minutes if PgPool is available
+    // Legacy reconcile job — Phase 5.5: demoted from 5-min full UPSERT
+    // to a 15-min diff-only safety net. The CT watcher (`bin/sync.rs`)
+    // is now authoritative for canonical PG state; this job's role is
+    // to LOG drift into `ht_reconcile_log` so an operator can investigate
+    // (mode controlled by env var `LEGACY_SYNC_RECONCILE_MODE`).
+    //
+    // Per docs/architecture.md §3.6d, §8 (Phase 5.5 row).
     if let Some(ref pg) = pg_pool {
         let sync_legacy = pool.clone();
         let sync_pg = pg.clone();
@@ -57,7 +63,10 @@ pub async fn init_scheduler(
             .unwrap_or(true);
 
         if sync_enabled {
-            let sync_job = Job::new_async("0 */5 * * * *", move |_uuid, _l| {
+            // Cron: minute 0 of every 15 minutes (00, 15, 30, 45). Quarters of
+            // the hour are easier for operators to correlate with logs than
+            // an arbitrary 15-min phase.
+            let sync_job = Job::new_async("0 */15 * * * *", move |_uuid, _l| {
                 let legacy = sync_legacy.clone();
                 let pg = sync_pg.clone();
                 Box::pin(async move {
@@ -65,9 +74,11 @@ pub async fn init_scheduler(
                 })
             })?;
             scheduler.add(sync_job).await?;
-            tracing::info!("[Scheduler] - Legacy sync: every 5 minutes");
+            tracing::info!(
+                "[Scheduler] - Legacy reconcile: every 15 minutes (Phase 5.5 — diff-only safety net)"
+            );
         } else {
-            tracing::info!("[Scheduler] - Legacy sync: DISABLED (SYNC_ENABLED=false)");
+            tracing::info!("[Scheduler] - Legacy reconcile: DISABLED (SYNC_ENABLED=false)");
         }
     }
 

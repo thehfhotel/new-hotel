@@ -399,6 +399,17 @@ jobs:
           docker compose --profile legacy up -d --force-recreate writeback
           sleep 3
 
+          # Force-recreate the CT-watcher worker (Phase 5.5). Same image as
+          # backend + writeback, lives under `profiles: [legacy]`, ships
+          # default-DISABLED via LEGACY_SYNC_ENABLED=false in docker-compose.yml.
+          # When disabled the binary exits cleanly (Ok(0)) so the container
+          # state is "exited" — that's intentional, not a failure. The
+          # operator flips LEGACY_SYNC_ENABLED=true after running --bootstrap;
+          # see docs/runbook-sync.md.
+          docker compose --profile legacy pull sync
+          docker compose --profile legacy up -d --force-recreate sync
+          sleep 3
+
           echo "Deployment complete!"
           docker compose ps
 
@@ -430,6 +441,30 @@ jobs:
           else
             echo "Writeback worker is running."
           fi
+
+          # Verify CT-watcher worker (Phase 5.5). It ships default-disabled
+          # — `LEGACY_SYNC_ENABLED=false` causes the binary to log + exit 0.
+          # That is the EXPECTED post-deploy state until an operator flips
+          # the flag. We surface both states ("running" or "exited")
+          # without failing the deploy; only an unexpected restart loop or
+          # missing container is a problem.
+          SYNC_STATUS=$(docker inspect --format='{{.State.Status}}' new-hotel-production-sync-1 2>/dev/null || echo "not_found")
+          case "$SYNC_STATUS" in
+            running)
+              echo "CT-watcher worker is running (LEGACY_SYNC_ENABLED=true)."
+              ;;
+            exited)
+              echo "CT-watcher worker exited cleanly (LEGACY_SYNC_ENABLED=false — expected default)."
+              ;;
+            not_found)
+              echo "::warning::CT-watcher container not found — verify docker-compose.yml `sync` service block"
+              ;;
+            *)
+              echo "::warning::CT-watcher worker in unexpected state: $SYNC_STATUS"
+              echo "--- Sync logs (last 50 lines) ---"
+              docker logs new-hotel-production-sync-1 --tail 50 2>&1 || true
+              ;;
+          esac
 
   deploy-hfville:
     runs-on: [self-hosted, linux, deploy]

@@ -114,6 +114,66 @@ services:
       - hotel-network
     restart: unless-stopped
 
+  # CT watcher worker — Phase 5.5 production cutover. Polls MSSQL Change
+  # Tracking on the 10 CT-enabled legacy tables, projects each change into
+  # canonical PG state, and publishes one DomainEvent per aggregate per
+  # tick. Per docs/architecture.md §3.6d, §8 Phase 5 / 5.5.
+  #
+  # Same image as `backend`, different entrypoint. Lives under the `legacy`
+  # profile so State C deploys (`docker compose up`) skip it. Activate with:
+  #     docker compose --profile legacy up -d
+  #
+  # CRITICAL: ships default-DISABLED. Operator flips LEGACY_SYNC_ENABLED=true
+  # AFTER running `docker compose --profile legacy run --rm sync ./sync --bootstrap`
+  # once to seed the canonical state + watermark. See docs/runbook-sync.md.
+  #
+  # When LEGACY_SYNC_ENABLED=false the binary exits cleanly, so it's safe to
+  # leave the service registered even mid-cutover.
+  sync:
+    image: ghcr.io/thehfhotel/new-hotel-backend:latest
+    command: ["./sync"]
+    profiles:
+      - legacy
+    environment:
+      # Legacy database (external server - shared with legacy application)
+      - DB_SERVER=${DB_SERVER}
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      # PostgreSQL — same DSN the writeback worker uses, explicit URL form
+      # because the sync bin reads DATABASE_URL directly (no AppConfig).
+      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@newdb:${PGPORT:-5439}/${POSTGRES_DB}
+      # Slack notifier — schema fingerprint drift, CT retention overflow,
+      # mapper consecutive-failure threshold all alert here.
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+      - SLACK_NOTIFICATIONS_ENABLED=true
+      # Phase 5.5 watcher knobs (per docs/architecture.md §3.6d, §7).
+      # MUST stay default-false. Operator flip is the cutover step.
+      - LEGACY_SYNC_ENABLED=${LEGACY_SYNC_ENABLED:-false}
+      # Default-on for first deploy: shadow mode runs the full pipeline
+      # (read CT, dispatch mappers, build events) but rolls back the PG
+      # TX so canonical state stays untouched. Lets operators soak the
+      # mappers against live traffic before flipping live.
+      - LEGACY_SYNC_SHADOW_MODE=${LEGACY_SYNC_SHADOW_MODE:-true}
+      # Empty allowlist = poll every CT-enabled table. Comma-separated
+      # subset (e.g. `HT_Customers,HT_Rooms`) narrows the watcher during
+      # incremental rollout.
+      - LEGACY_SYNC_TABLE_ALLOWLIST=${LEGACY_SYNC_TABLE_ALLOWLIST:-}
+      # Sub-second polling target per architecture §3.6d.
+      - CT_POLL_INTERVAL_MS=${CT_POLL_INTERVAL_MS:-1000}
+      # Cold-replay refusal: if last_seen_version=0 the watcher refuses
+      # to start unless explicitly overridden — protects against the
+      # "process every CT row from time-zero" footgun. Operator flips
+      # via `--bootstrap` (preferred) or this env var (escape hatch).
+      - LEGACY_SYNC_ALLOW_COLD_REPLAY=${LEGACY_SYNC_ALLOW_COLD_REPLAY:-false}
+      - RUST_LOG=${RUST_LOG:-hotel_backend=info,sync=info}
+    depends_on:
+      newdb:
+        condition: service_healthy
+    networks:
+      - hotel-network
+    restart: unless-stopped
+
   # One-shot backfill: legacy MSSQL HT_Rooms + HT_SET_RoomType -> PG.
   # Same image as `backend`, different entrypoint. Lives under the `backfill`
   # profile so normal `docker compose up` skips it. Activate on demand:
