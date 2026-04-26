@@ -42,9 +42,14 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time",
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 
 # Database - Legacy (SQL Server via tiberius for read-only legacy DB)
-tiberius = { version = "0.12", default-features = false, features = ["chrono", "rustls"] }
-bb8 = "0.8"
-bb8-tiberius = "0.15"
+# - Drop `rustls` feature: legacy MSSQL connection is plaintext over WireGuard;
+#   carrying rustls-webpki costs us 2 LOW CVEs (#118, #119) for code we never run.
+# - Default-features off + explicit `chrono`: drops `winauth` (Windows NTLM,
+#   never exercised on our Linux deploy) which transitively pulled in vulnerable
+#   rand 0.7.3 (#120, #121).
+tiberius = { version = "0.12", default-features = false, features = ["chrono", "tds73"] }
+bb8 = "0.9"
+bb8-tiberius = { version = "0.16", default-features = false, features = ["chrono", "tds73", "with-tokio"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 
 # Database - New (PostgreSQL via sqlx for HotelNew DB)

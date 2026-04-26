@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.46.2] - 2026-04-26
+
+### Security
+
+- **Removed unused `tiberius` features carrying vulnerable transitive deps.**
+  Dropped `rustls` and `winauth` features from the legacy MSSQL driver. We
+  connect to legacy SQL Server in plaintext over WireGuard (no TLS) using
+  SA auth (no Windows NTLM), so neither feature was exercised. Eliminates
+  4 Dependabot alerts:
+  - `rustls-webpki@0.101.7` (GHSA-xgp8-3hg3-c2mh, GHSA-965h-392x-2mh5) — `< 0.103.12`
+  - `rand@0.7.3` (GHSA-cq8v-f236-94qc) — pulled in by `winauth` (Windows NTLM)
+  Bumped `bb8-tiberius 0.15 → 0.16` (necessitates `bb8 0.8 → 0.9`).
+  HIGH alert (#133) on `rustls-webpki@0.103.13` was already patched (we have
+  the patched version); will auto-close on next Dependabot scan.
+
 ## [2.46.1] - 2026-04-26
 
 ### Changed
