@@ -58,8 +58,8 @@ runsql() {
     docker run --rm -i --network host \
         --entrypoint /opt/mssql-tools18/bin/sqlcmd \
         mcr.microsoft.com/mssql/server:2022-latest \
-        -C -S 192.168.100.222 -U sa -P "$DB_PASSWORD" -d master \
-        -W -s $'\t' -h -1 \
+        -C -S 192.168.100.222 -U sa -P "$DB_PASSWORD" -d master -y 8000 -Y 8000 \
+        -s $'\t' -h -1 \
         -v since="$1"
 }
 
