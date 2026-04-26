@@ -53,10 +53,10 @@
 
 #![allow(clippy::doc_lazy_continuation)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -79,6 +79,19 @@ use hotel_backend::sync::{MssqlChangeMapper, NoopMapper};
 use hotel_backend::writeback::verify_schema_fingerprint;
 
 const DEFAULT_CT_POLL_INTERVAL_MS: u64 = 1000;
+
+/// How often to verify each table's CT retention window
+/// (`MIN_VALID_VERSION(<table>) <= last_seen_version`).
+///
+/// Retention overflow is a >48h outage scenario; recovery is
+/// operator-driven via Slack alert + manual `--bootstrap` reconcile,
+/// so 5-min detection vs 30s detection is operationally equivalent.
+/// The 10× reduction in pool pressure removes the bb8 timeout noise
+/// observed on the hotter mappers (HT_CheckIn_*, HT_Receipt_H) whose
+/// parent-aggregate re-loads dominate MSSQL connection demand.
+///
+/// Override at runtime via `LEGACY_SYNC_RETENTION_CHECK_INTERVAL_SECS`.
+const DEFAULT_RETENTION_CHECK_INTERVAL_SECS: u64 = 300;
 
 /// All CT-enabled MSSQL tables — must stay in sync with the seed in
 /// migration 017 and `legacy_sync_status` rows. Adding a new mapper
@@ -143,6 +156,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_CT_POLL_INTERVAL_MS);
 
+    let retention_check_interval = Duration::from_secs(
+        env::var("LEGACY_SYNC_RETENTION_CHECK_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_RETENTION_CHECK_INTERVAL_SECS),
+    );
+
     let shadow_mode = env::var("LEGACY_SYNC_SHADOW_MODE")
         .map(|v| v == "true")
         .unwrap_or(false);
@@ -151,6 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     tracing::info!(
         poll_interval_ms,
+        retention_check_interval_secs = retention_check_interval.as_secs(),
         shadow_mode,
         allowlist = ?allowlist,
         "Starting CT watcher"
@@ -262,8 +283,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         shutdown_clone.notify_waiters();
     });
 
+    // Per-table retention check timestamps. The first tick after
+    // startup runs the check unconditionally (no prior `Instant`); after
+    // that, each table re-checks at most once per
+    // `retention_check_interval`. Holding this map in the main loop
+    // keeps state local to the watcher process — no PG round-trip
+    // needed and the map dies cleanly with the worker on SIGTERM.
+    let mut retention_last_checked: HashMap<String, Instant> = HashMap::new();
+
     loop {
-        run_one_tick(&pg, &mssql, &mappers, &slack, shadow_mode).await;
+        run_one_tick(
+            &pg,
+            &mssql,
+            &mappers,
+            &slack,
+            shadow_mode,
+            &mut retention_last_checked,
+            retention_check_interval,
+        )
+        .await;
 
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(poll_interval_ms)) => {
@@ -450,6 +488,8 @@ async fn run_one_tick(
     mappers: &[Box<dyn MssqlChangeMapper>],
     slack: &Option<SlackClient>,
     shadow_mode: bool,
+    retention_last_checked: &mut HashMap<String, Instant>,
+    retention_check_interval: Duration,
 ) {
     let last_seen = match hotel_backend::sync::watermark::read_last_seen(pg).await {
         Ok(v) => v,
@@ -459,10 +499,24 @@ async fn run_one_tick(
         }
     };
 
+    let now = Instant::now();
     for mapper in mappers {
         let table = mapper.table();
         let pk_cols = mapper.primary_key_cols();
         let select_sql = mapper.select_sql();
+
+        // Gate the retention guard to once per
+        // `retention_check_interval` per table. The first tick (no
+        // recorded timestamp) always checks; subsequent ticks within
+        // the window skip the MSSQL round-trip entirely, slashing pool
+        // pressure on the hot mappers.
+        let should_check_retention = retention_last_checked
+            .get(table)
+            .map(|last| now.duration_since(*last) >= retention_check_interval)
+            .unwrap_or(true);
+        if should_check_retention {
+            retention_last_checked.insert(table.to_string(), now);
+        }
 
         // Run each table inside its own future; panics are isolated
         // via `tokio::spawn` further down for the per-row dispatch.
@@ -476,6 +530,7 @@ async fn run_one_tick(
             select_sql,
             last_seen,
             shadow_mode,
+            should_check_retention,
         )
         .await
         {
@@ -488,6 +543,13 @@ async fn run_one_tick(
 /// Poll one table for CT changes since `last_seen`. Per the lifecycle:
 /// retention check → SELECT CT changes → for each row, dispatch to
 /// mapper → INSERT event_log → bump counters → advance watermark.
+///
+/// `should_check_retention` is throttled by the caller to
+/// `LEGACY_SYNC_RETENTION_CHECK_INTERVAL_SECS` (default 300s) per
+/// table. When false the retention round-trip to MSSQL is skipped
+/// entirely — the safety net runs at most once every 5 min, which is
+/// well within the operator-driven recovery window for a >48h
+/// retention overflow.
 #[allow(clippy::too_many_arguments)]
 async fn poll_table(
     pg: &PgPool,
@@ -499,24 +561,27 @@ async fn poll_table(
     select_sql: &str,
     last_seen: i64,
     shadow_mode: bool,
+    should_check_retention: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // 1. Retention guard.
-    if let Err(err) = check_retention(mssql, table, last_seen).await {
-        tracing::error!(table, error = %err, "Retention check failed");
-        let _ = record_table_error(pg, table, &err).await;
-        if let Some(s) = slack {
-            if err.contains("retention") {
-                let msg = SlackMessage::with_text(format!(
-                    ":rotating_light: *CT retention overflow* :rotating_light:\n\
-                     Table: `{table}`\n\
-                     Watermark fell behind CT retention; \
-                     row history beyond `MIN_VALID_VERSION` is gone.\n\
-                     _Recover with_ `bin/sync --bootstrap` _(Phase 5.5)_."
-                ));
-                let _ = s.send_message(&msg).await;
+    // 1. Retention guard (throttled — see fn doc comment).
+    if should_check_retention {
+        if let Err(err) = check_retention(mssql, table, last_seen).await {
+            tracing::error!(table, error = %err, "Retention check failed");
+            let _ = record_table_error(pg, table, &err).await;
+            if let Some(s) = slack {
+                if err.contains("retention") {
+                    let msg = SlackMessage::with_text(format!(
+                        ":rotating_light: *CT retention overflow* :rotating_light:\n\
+                         Table: `{table}`\n\
+                         Watermark fell behind CT retention; \
+                         row history beyond `MIN_VALID_VERSION` is gone.\n\
+                         _Recover with_ `bin/sync --bootstrap` _(Phase 5.5)_."
+                    ));
+                    let _ = s.send_message(&msg).await;
+                }
             }
+            return Ok(()); // intentional skip — retention can't be repaired by retry
         }
-        return Ok(()); // intentional skip — retention can't be repaired by retry
     }
 
     // 2. NoopMapper short-circuit — when select_sql is empty there's

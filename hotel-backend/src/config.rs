@@ -14,15 +14,25 @@ pub struct DbConfig {
 
 impl DbConfig {
     pub fn from_env() -> Self {
+        // Pool sizing: prefer the explicit `MSSQL_POOL_MAX_SIZE`
+        // (introduced 2.49.2 to give operators a clearly-named knob for
+        // the legacy MSSQL bb8 pool shared by writeback + sync +
+        // ville-sync), falling back to the historical `DB_POOL_MAX`
+        // for backward compatibility. Default bumped 10 → 20 to give
+        // headroom to the Phase 5 sync worker; tighten via env if
+        // legacy MSSQL ever pushes back on connection count.
+        let pool_max = env::var("MSSQL_POOL_MAX_SIZE")
+            .or_else(|_| env::var("DB_POOL_MAX"))
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+
         Self {
             server: env::var("DB_SERVER").unwrap_or_else(|_| "192.168.100.222".to_string()),
             database: env::var("DB_NAME").unwrap_or_else(|_| "db".to_string()),
             user: env::var("DB_USER").unwrap_or_else(|_| "sa".to_string()),
             password: env::var("DB_PASSWORD").unwrap_or_else(|_| "REDACTED-sa-pw".to_string()),
-            pool_max: env::var("DB_POOL_MAX")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10),
+            pool_max,
         }
     }
 }

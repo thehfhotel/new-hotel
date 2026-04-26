@@ -84,7 +84,8 @@ cargo build --release
 | `DB_NAME` | `db` | Legacy database name |
 | `DB_USER` | `sa` | Legacy database user |
 | `DB_PASSWORD` | `REDACTED-sa-pw` | Legacy database password |
-| `DB_POOL_MAX` | `10` | Legacy max pool connections |
+| `MSSQL_POOL_MAX_SIZE` | `20` | Legacy MSSQL bb8 pool max (shared by writeback + sync + ville-sync). Legacy alias: `DB_POOL_MAX`. |
+| `LEGACY_SYNC_RETENTION_CHECK_INTERVAL_SECS` | `300` | Per-table CT retention guard cadence in `bin/sync`. |
 | `NEW_DB_SERVER` | `newdb` | PostgreSQL host (Docker service name) |
 | `NEW_DB_PORT` | `5439` | PostgreSQL port |
 | `NEW_DB_NAME` | `hotelnew` | PostgreSQL database name |
