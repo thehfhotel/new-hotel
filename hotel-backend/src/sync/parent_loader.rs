@@ -57,6 +57,37 @@ impl BookingAggregate {
     }
 }
 
+/// Owned snapshot of one check-in aggregate as it currently lives in
+/// legacy MSSQL.
+///
+/// Mirrors the booking shape: `header` is `None` when the legacy header
+/// has been deleted (caller emits `CheckInCancelled`). `rooms` are the
+/// per-room detail lines (`HT_CheckIn_Ds`) and `payments` are the
+/// payment ledger rows (`HT_CheckIn_Pay`) for that `Cin_no`.
+///
+/// Per the 5.4 spec the check-in aggregate's `payments` collection rolls
+/// up into `ht_checkins.cin_paid_amount` so the `HT_CheckIn_Pay` mapper
+/// can re-trigger an aggregate sync without a separate code path.
+#[derive(Debug, Clone)]
+pub struct CheckInAggregate {
+    /// `HT_CheckIn_H` row (one per `Cin_no`). `None` when the header
+    /// has been deleted — caller treats this as "the aggregate no
+    /// longer exists" and emits a `CheckInCancelled`.
+    pub header: Option<HashMapRow>,
+    /// `HT_CheckIn_Ds` rows (one per assigned room). For multi-room
+    /// stays this is >1; for the typical single-room flow it's exactly 1.
+    pub rooms: Vec<HashMapRow>,
+    /// `HT_CheckIn_Pay` rows (one per tender event). Empty for stays
+    /// that haven't paid yet.
+    pub payments: Vec<HashMapRow>,
+}
+
+impl CheckInAggregate {
+    pub fn is_present(&self) -> bool {
+        self.header.is_some()
+    }
+}
+
 /// Pull `HT_Book_H` + all `HT_Book_Ds` rows + all `HT_Book_Date` rows
 /// for one booking by `Book_no`.
 ///
@@ -140,6 +171,96 @@ pub async fn load_booking_aggregate(
         header,
         rooms,
         nights,
+    })
+}
+
+/// Pull `HT_CheckIn_H` + all `HT_CheckIn_Ds` rows + all `HT_CheckIn_Pay`
+/// rows for one check-in by `Cin_no`.
+///
+/// Returns `Ok(CheckInAggregate { header: None, … })` when the check-in
+/// header is missing — caller emits `CheckInCancelled`.
+///
+/// Note the WHERE-column casing per cheatsheet §3.4 / §3.4 schema dump:
+/// `HT_CheckIn_H.Cin_no` (lowercase n), `HT_CheckIn_Ds.Cin_No` (capital
+/// N — the discrepancy is verbatim from the legacy schema), and
+/// `HT_CheckIn_Pay.Cin_No` (also capital N).
+pub async fn load_checkin_aggregate(
+    mssql: &DbPool,
+    cin_no: &str,
+) -> Result<CheckInAggregate, SyncError> {
+    let header_rows = fetch_rows(
+        mssql,
+        "HT_CheckIn_H",
+        "Cin_no",
+        cin_no,
+        // Mirror what walkin / checkin_to_booking recipes write
+        // (cheatsheet §3.6, walkin/writes.txt). Add columns here as the
+        // canonical PG projection grows.
+        &[
+            "Cin_no",
+            "Cin_Date",
+            "Cin_Book_no",
+            "Cin_cust_no",
+            "Cin_status",
+            "Total_Price_Room",
+            "Total_Price_Net",
+            "Total_Price_Pay",
+            "Total_Price_Balance",
+            "Cin_Date_in",
+            "Cin_Date_Out",
+            "Cin_by",
+            "Cin_Room_ALL",
+        ],
+    )
+    .await?;
+    let header = header_rows.into_iter().next();
+
+    let rooms = fetch_rows(
+        mssql,
+        "HT_CheckIn_Ds",
+        // Legacy schema uses capital N here (cheatsheet §3.4 schema
+        // dump: `Cin_No varchar(50)`). Locked test in
+        // sync/mappers/checkin.rs guards against accidental rename.
+        "Cin_No",
+        cin_no,
+        &[
+            "id",
+            "Cin_No",
+            "Cin_Room_No",
+            "Cin_Room_Type",
+            "Cin_Room_In",
+            "Cin_Room_Out",
+            "Cin_Room_Status",
+            "Cin_Room_Price",
+            "Cin_Room_Night",
+            "Cin_Room_PriceToTal",
+            "Cin_Room_Pay_Total",
+        ],
+    )
+    .await?;
+
+    let payments = fetch_rows(
+        mssql,
+        "HT_CheckIn_Pay",
+        "Cin_No",
+        cin_no,
+        &[
+            "id",
+            "Cin_No",
+            "Cin_Pay_Date",
+            "Cin_Pay_Cash",
+            "Cin_Pay_Credit",
+            "Cin_Pay_Tran",
+            "Pay_No",
+            "Cin_Pay_Status",
+        ],
+    )
+    .await?;
+
+    Ok(CheckInAggregate {
+        header,
+        rooms,
+        payments,
     })
 }
 
@@ -266,5 +387,29 @@ mod tests {
         assert_eq!(sql_quote_inline("R014810"), "'R014810'");
         assert_eq!(sql_quote_inline("O'Brien"), "'O''Brien'");
         assert_eq!(sql_quote_inline(""), "''");
+    }
+
+    /// Phase 5.4 — `CheckInAggregate::is_present` mirrors the booking
+    /// version. Used by the check-in mapper to choose between
+    /// `CheckInCancelled` (header gone) and `CheckInCreated` /
+    /// `CheckInModified` (header present).
+    #[test]
+    fn checkin_is_present_is_true_when_header_set() {
+        let agg = CheckInAggregate {
+            header: Some(HashMapRow::new("HT_CheckIn_H")),
+            rooms: vec![],
+            payments: vec![],
+        };
+        assert!(agg.is_present());
+    }
+
+    #[test]
+    fn checkin_is_present_is_false_when_header_missing() {
+        let agg = CheckInAggregate {
+            header: None,
+            rooms: vec![HashMapRow::new("HT_CheckIn_Ds")],
+            payments: vec![HashMapRow::new("HT_CheckIn_Pay")],
+        };
+        assert!(!agg.is_present());
     }
 }

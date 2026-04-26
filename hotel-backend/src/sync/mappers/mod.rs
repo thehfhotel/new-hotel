@@ -10,20 +10,33 @@
 //!
 //! - [`customer`] — full I/U/D coverage of `HT_Customers` (5.2).
 //! - [`room`] — `HT_Rooms` master mapper (room_clean / room_use mirror)
-//!   and `HT_Room_Status` stub (deferred to 5.4 where the checkin
-//!   mapper owns the per-night occupancy table) (5.2).
+//!   plus the `HT_Room_Status` *retired* stub (5.4: occupancy is owned
+//!   by the check-in aggregate; the stub stays for observability).
 //! - [`booking`] — `HT_Book_H` + `HT_Book_Ds` + `HT_Book_Date` aggregate
 //!   mappers with shared parent re-load + per-tick coalescing (5.3).
+//! - [`checkin`] — `HT_CheckIn_H` + `HT_CheckIn_Ds` aggregate mappers
+//!   (5.4). Drives `ht_checkins` UPSERT + `CheckIn{Created,Cancelled}`
+//!   / `CheckOutCompleted` events. Triggers a parent-booking
+//!   re-projection on full check-out so `Book_Status='ออกแล้ว'`
+//!   propagates atomically.
+//! - [`payment`] — `HT_CheckIn_Pay` + `HT_Receipt_H` (5.4). The
+//!   payment row coalesces back into the check-in aggregate sweep
+//!   (totals re-projection); receipts UPSERT into `ht_payments` and
+//!   emit `PaymentReceived`.
 //!
-//! Checkin tables (`HT_CheckIn_*`, `HT_Receipt_H`) still ride on
-//! `NoopMapper` until 5.4 lands.
+//! Phase 5.4 completes 10-table CT coverage: every CT-enabled table
+//! now has a real mapper or an intentional retired stub.
 
 pub mod booking;
+pub mod checkin;
 pub mod customer;
+pub mod payment;
 pub mod room;
 
 pub use booking::{
     apply_booking_aggregate, BookingDatesMapper, BookingHeaderMapper, BookingRoomsMapper,
 };
+pub use checkin::{apply_checkin_aggregate, CheckInHeaderMapper, CheckInRoomsMapper};
 pub use customer::CustomerMapper;
+pub use payment::{apply_payment_aggregate, PaymentMapper, ReceiptMapper};
 pub use room::{RoomMasterMapper, RoomStatusMapper};

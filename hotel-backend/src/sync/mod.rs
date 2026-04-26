@@ -36,6 +36,7 @@ pub mod change_op;
 pub mod mapper;
 pub mod mappers;
 pub mod parent_loader;
+pub mod resolve;
 pub mod row;
 pub mod watermark;
 
