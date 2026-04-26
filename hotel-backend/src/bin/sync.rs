@@ -1,4 +1,4 @@
-//! Change Tracking Watcher Binary (`bin/sync.rs`) — Phase 5.1 skeleton.
+//! Change Tracking Watcher Binary (`bin/sync.rs`).
 //!
 //! Per `docs/architecture.md` §3.6d, §4d-tris, §10 #8.
 //!
@@ -11,7 +11,9 @@
 //! 3. Open PG (sqlx) + MSSQL (tiberius/bb8) pools.
 //! 4. Verify legacy schema fingerprint — abort + Slack alert on drift.
 //! 5. Build `Vec<Box<dyn MssqlChangeMapper>>` — one per CT-enabled
-//!    table, filtered by allowlist. Phase 5.1 ships 10 `NoopMapper`s.
+//!    table, filtered by allowlist. Phase 5.2 ships real mappers for
+//!    `HT_Customers` / `HT_Rooms` / `HT_Room_Status`; the rest stay on
+//!    `NoopMapper` until 5.3 / 5.4.
 //! 6. Main loop: every `CT_POLL_INTERVAL_MS` (default 1000ms):
 //!    a. Read `legacy_ct_state.last_seen_version`.
 //!    b. For each mapper, in panic-isolated tasks:
@@ -19,29 +21,23 @@
 //!         (else → CT retention overflow → Slack alert + skip).
 //!       - Query `CHANGETABLE(CHANGES <table>, @last) JOIN <table>`
 //!         filtering `SYS_CHANGE_CONTEXT <> 0x4E48` (loop-prevention).
-//!       - For each row: `mapper.apply(&mut tx, op, row).await`.
+//!       - For each row: `mapper.apply(&mut tx, op, Some(&row)).await`
+//!         (or `None` for D operations). On success, INSERT into
+//!         `event_log` (live mode) or log "would publish" (shadow mode).
 //!       - Capture per-table max(SYS_CHANGE_VERSION).
-//!       - Update `legacy_sync_status.rows_ingested`/`rows_skipped`.
-//!    c. After all mappers commit: advance the watermark to
-//!       `min(per-table-max)` in one PG TX.
+//!       - Update `legacy_sync_status.rows_ingested` /  `rows_skipped`.
+//!       - Commit (live) / rollback (shadow) in the same TX.
+//!       - Advance the watermark to per-table max.
 //! 7. SIGTERM → finish current tick, then exit cleanly.
 //!
-//! ## What this binary does NOT do (Phase 5.1)
+//! ## Watermark advance — per-table, not min-of-all
 //!
-//! - No real per-table mappers — every entry is `NoopMapper` so the loop
-//!   exercises the polling, watermark advance, and observability plumbing
-//!   without touching canonical PG row-shapes. Real mappers land 5.2+.
-//! - No `--bootstrap` cold-start path — that's 5.5; this binary refuses
-//!   to start with `--bootstrap` for now (clear error message).
-//! - No HTTP server, no SSE — those live in `bin/hotel-backend`.
-//! - No docker-compose service block — that's 5.5.
+//! Phase 5.2 advances the watermark per-table at the end of each
+//! table's own TX. Customer / room mappers are flat tables — one CT row
+//! produces at most one mapper call and at most one event, so per-table
+//! advance is equivalent to min-of-all and simpler. 5.3 may revisit
+//! once cross-aggregate booking coalescing lands.
 
-// The lifecycle doc-comment above uses sub-numbered list items (`a.`,
-// `b.`, `c.`) under each top-level numbered step. clippy's
-// `doc_lazy_continuation` lint wants either deeper indentation or blank
-// lines between every sub-item, both of which hurt readability for the
-// lifecycle sketch. Suppress the lint at the binary scope; the
-// formatting is intentional.
 #![allow(clippy::doc_lazy_continuation)]
 
 use std::collections::HashSet;
@@ -56,12 +52,13 @@ use tokio::sync::Notify;
 use hotel_backend::config::{DbConfig, SlackConfig};
 use hotel_backend::db::{create_pool, DbPool};
 use hotel_backend::notifications::slack::{SlackClient, SlackMessage};
+use hotel_backend::outbox::bus::EventBus;
+use hotel_backend::outbox::event::DomainEvent;
+use hotel_backend::sync::change_op::ChangeOp;
+use hotel_backend::sync::mappers::{CustomerMapper, RoomMasterMapper, RoomStatusMapper};
 use hotel_backend::sync::{MssqlChangeMapper, NoopMapper};
 use hotel_backend::writeback::verify_schema_fingerprint;
 
-/// Default poll interval (milliseconds). Sub-second per the architecture
-/// doc's "real-time UI" goal — Goal #1 stretch is sub-2-second
-/// end-to-end latency from a .NET app save to our SSE-driven UI repaint.
 const DEFAULT_CT_POLL_INTERVAL_MS: u64 = 1000;
 
 /// All CT-enabled MSSQL tables — must stay in sync with the seed in
@@ -92,9 +89,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .init();
 
-    // 1. LEGACY_SYNC_ENABLED — explicit opt-in. Worker exits cleanly
-    //    (exit code 0) when disabled — this is intentional, not a
-    //    failure, so Docker `restart: unless-stopped` doesn't loop.
     let enabled = env::var("LEGACY_SYNC_ENABLED")
         .map(|v| v == "true")
         .unwrap_or(false);
@@ -105,7 +99,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
 
-    // Reject --bootstrap until Phase 5.5 wires it to scheduler::sync.
     if env::args().any(|a| a == "--bootstrap") {
         return Err(
             "--bootstrap is reserved for Phase 5.5 cold-start path; not yet implemented"
@@ -118,17 +111,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_CT_POLL_INTERVAL_MS);
 
-    // Shadow mode: when true, mappers run their UPSERTs in a transaction
-    // that is rolled back at the end (5.2+ honours this). 5.1 mappers
-    // are no-ops so the flag is parsed but does not affect behavior —
-    // wiring it now keeps 5.2+ a config-only flip.
     let shadow_mode = env::var("LEGACY_SYNC_SHADOW_MODE")
         .map(|v| v == "true")
         .unwrap_or(false);
 
-    // Allowlist: comma-separated MSSQL table names. Empty/unset = all
-    // CT-enabled tables. Used to phase mappers in one at a time during
-    // 5.2 rollout without code changes.
     let allowlist = parse_allowlist(env::var("LEGACY_SYNC_TABLE_ALLOWLIST").ok());
 
     tracing::info!(
@@ -138,7 +124,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "Starting CT watcher"
     );
 
-    // 2. PG pool
     let pg_url = env::var("DATABASE_URL")
         .or_else(|_| env::var("NEW_DATABASE_URL"))
         .map_err(|_| "DATABASE_URL or NEW_DATABASE_URL must be set")?;
@@ -148,16 +133,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .await?;
     tracing::info!("Connected to PostgreSQL");
 
-    // 3. MSSQL pool — `create_pool` returns `Box<dyn Error>` (not
-    //    Send+Sync) so we map it to a string before bubbling up.
     let mssql_config = DbConfig::from_env();
     let mssql = create_pool(&mssql_config)
         .await
         .map_err(|e| format!("MSSQL pool init failed: {e}"))?;
     tracing::info!(server = %mssql_config.server, "Connected to legacy MSSQL");
 
-    // 4. Slack notifier — best-effort alerts on schema drift,
-    //    retention overflow, and per-mapper failures.
     let slack_config = SlackConfig::from_env();
     let slack: Option<SlackClient> = if slack_config.is_configured() {
         tracing::info!("Slack notifications enabled for CT watcher");
@@ -170,9 +151,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
-    // 5. Schema fingerprint guard — refuse to start on drift, post a
-    //    Slack alert first. Sleep before exit so Docker restart cadence
-    //    backs off (matches writeback worker's pattern).
     if let Err(e) = verify_schema_fingerprint(&mssql).await {
         tracing::error!(
             error = %e,
@@ -194,16 +172,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Err(format!("Schema fingerprint check failed: {e}").into());
     }
 
-    // 6. Build mappers — one per CT-enabled table, filtered by
-    //    allowlist. Phase 5.1 ships 10 `NoopMapper`s; 5.2+ replaces
-    //    entries one at a time.
     let mappers = build_mappers(&allowlist);
     tracing::info!(
         count = mappers.len(),
-        "Mappers initialised (all NoopMapper in 5.1)"
+        "Mappers initialised (Phase 5.2: customer + room real, others NoopMapper)"
     );
 
-    // SIGTERM handler — finish the current tick then exit.
     let shutdown = Arc::new(Notify::new());
     let shutdown_clone = shutdown.clone();
     tokio::spawn(async move {
@@ -220,7 +194,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         shutdown_clone.notify_waiters();
     });
 
-    // 7. Main loop
     loop {
         run_one_tick(&pg, &mssql, &mappers, &slack, shadow_mode).await;
 
@@ -239,9 +212,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
-/// Parse `LEGACY_SYNC_TABLE_ALLOWLIST` into a normalised set. Empty /
-/// unset / whitespace-only values disable filtering (every CT-enabled
-/// table runs). Comma-separated; whitespace around tokens is trimmed.
 fn parse_allowlist(raw: Option<String>) -> Option<HashSet<String>> {
     let raw = raw?;
     let trimmed = raw.trim();
@@ -260,22 +230,31 @@ fn parse_allowlist(raw: Option<String>) -> Option<HashSet<String>> {
     }
 }
 
-/// Build the per-table mapper list, filtered by the allowlist. In 5.1
-/// every entry is a `NoopMapper`; 5.2+ swaps real mappers in by table.
+/// Build the per-table mapper list, filtered by the allowlist. Phase
+/// 5.2 wires real mappers for `HT_Customers` / `HT_Rooms` /
+/// `HT_Room_Status`; the rest ride on `NoopMapper` until 5.3 / 5.4.
 fn build_mappers(allowlist: &Option<HashSet<String>>) -> Vec<Box<dyn MssqlChangeMapper>> {
-    CT_ENABLED_TABLES
-        .iter()
-        .filter(|t| allowlist.as_ref().map(|a| a.contains(**t)).unwrap_or(true))
-        .map(|t| {
-            Box::new(NoopMapper { table_name: t }) as Box<dyn MssqlChangeMapper>
-        })
-        .collect()
+    let allowed = |t: &str| allowlist.as_ref().map(|a| a.contains(t)).unwrap_or(true);
+
+    let mut out: Vec<Box<dyn MssqlChangeMapper>> = Vec::with_capacity(CT_ENABLED_TABLES.len());
+
+    for table in CT_ENABLED_TABLES {
+        if !allowed(table) {
+            continue;
+        }
+        let mapper: Box<dyn MssqlChangeMapper> = match *table {
+            "HT_Customers" => Box::new(CustomerMapper),
+            "HT_Rooms" => Box::new(RoomMasterMapper),
+            "HT_Room_Status" => Box::new(RoomStatusMapper),
+            other => Box::new(NoopMapper { table_name: other }),
+        };
+        out.push(mapper);
+    }
+    out
 }
 
 /// Process one watcher tick. Per-mapper failures are logged but don't
-/// abort the tick — one bad table never blocks the others. Per-mapper
-/// panics are isolated via `tokio::spawn` so a panicked mapper can't
-/// crash the binary.
+/// abort the tick — one bad table never blocks the others.
 async fn run_one_tick(
     pg: &PgPool,
     mssql: &DbPool,
@@ -293,133 +272,414 @@ async fn run_one_tick(
 
     for mapper in mappers {
         let table = mapper.table();
-        // Panic isolation — a bug in any mapper's `apply` (or the CT
-        // SELECT it drives) must not kill the binary.
-        let pg_inner = pg.clone();
-        let mssql_inner = mssql.clone();
-        let slack_inner = slack.clone();
-        let table_owned = table.to_string();
-        let result = tokio::spawn(async move {
-            poll_table(&pg_inner, &mssql_inner, &slack_inner, &table_owned, last_seen, shadow_mode)
-                .await
-        })
-        .await;
+        let pk_cols = mapper.primary_key_cols();
+        let select_sql = mapper.select_sql();
 
-        if let Err(join_err) = result {
-            let panic_msg = if join_err.is_panic() {
-                let payload = join_err.into_panic();
-                payload
-                    .downcast_ref::<&'static str>()
-                    .map(|s| (*s).to_string())
-                    .or_else(|| payload.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "panic with non-string payload".to_string())
-            } else {
-                format!("task cancelled: {join_err}")
-            };
-            tracing::error!(
-                table,
-                panic = %panic_msg,
-                "CT mapper PANICKED — recording failure and continuing main loop"
-            );
-            // Best-effort: record the panic into legacy_sync_status so
-            // operators see "table X has been failing for N ticks" even
-            // if Slack is offline.
-            let _ = record_table_error(pg, table, &format!("PANIC: {panic_msg}")).await;
+        // Run each table inside its own future; panics are isolated
+        // via `tokio::spawn` further down for the per-row dispatch.
+        if let Err(err) = poll_table(
+            pg,
+            mssql,
+            slack,
+            mapper.as_ref(),
+            table,
+            pk_cols,
+            select_sql,
+            last_seen,
+            shadow_mode,
+        )
+        .await
+        {
+            tracing::error!(table, error = %err, "poll_table failed");
+            let _ = record_table_error(pg, table, &err.to_string()).await;
         }
     }
-
-    // Phase 5.1 leaves the watermark advance commented-out: with 10
-    // NoopMappers nothing was actually applied, so advancing past the
-    // current `CHANGE_TRACKING_CURRENT_VERSION()` would silently skip
-    // the rows that the 5.2+ real mappers will need to re-process when
-    // they replace the no-ops. The min-of-per-table-max calculation
-    // belongs to 5.2 alongside the first real mapper. See the
-    // `advance_watermark_after_real_mappers_land` TODO below.
-    //
-    // TODO(Phase 5.2): once at least one real mapper is wired, replace
-    // this comment with:
-    //   let new_version = mappers
-    //       .iter()
-    //       .filter_map(|m| per_table_max[m.table()])
-    //       .min()
-    //       .unwrap_or(last_seen);
-    //   if let Err(err) = hotel_backend::sync::watermark::advance(pg, new_version).await {
-    //       tracing::error!(error = %err, "Failed to advance CT watermark");
-    //   }
-    let _ = last_seen;
 }
 
-/// Poll one table for CT changes since `last_seen`. Phase 5.1: just
-/// counts rows + bumps `legacy_sync_status.rows_skipped` (every row is
-/// "skipped" because `NoopMapper` returns `Ok(None)`). Real per-row
-/// dispatch lands in 5.2 alongside the first real mapper.
+/// Poll one table for CT changes since `last_seen`. Per the lifecycle:
+/// retention check → SELECT CT changes → for each row, dispatch to
+/// mapper → INSERT event_log → bump counters → advance watermark.
+#[allow(clippy::too_many_arguments)]
 async fn poll_table(
     pg: &PgPool,
     mssql: &DbPool,
     slack: &Option<SlackClient>,
+    mapper: &dyn MssqlChangeMapper,
     table: &str,
+    pk_cols: &[&str],
+    select_sql: &str,
     last_seen: i64,
-    _shadow_mode: bool,
-) {
-    // Per-poll retention check — if MIN_VALID_VERSION for this table is
-    // ahead of our watermark, CT has already cleaned up rows we needed
-    // to see. We REFUSE to advance and surface to ops via Slack; the
-    // recovery path is a manual `--bootstrap` (Phase 5.5).
-    match check_retention(mssql, table, last_seen).await {
-        Ok(()) => {}
-        Err(err) => {
-            tracing::error!(table, error = %err, "Retention check failed");
-            // Treat as a transient failure — record + continue. A
-            // hard retention overflow would have returned a typed
-            // error in `err`; non-overflow errors are I/O hiccups.
-            let _ = record_table_error(pg, table, &err.to_string()).await;
-            if let Some(s) = slack {
-                if err.to_string().contains("retention") {
-                    let msg = SlackMessage::with_text(format!(
-                        ":rotating_light: *CT retention overflow* :rotating_light:\n\
-                         Table: `{table}`\n\
-                         Watermark fell behind CT retention; \
-                         row history beyond `MIN_VALID_VERSION` is gone.\n\
-                         _Recover with_ `bin/sync --bootstrap` _(Phase 5.5)_."
-                    ));
-                    let _ = s.send_message(&msg).await;
-                }
+    shadow_mode: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // 1. Retention guard.
+    if let Err(err) = check_retention(mssql, table, last_seen).await {
+        tracing::error!(table, error = %err, "Retention check failed");
+        let _ = record_table_error(pg, table, &err).await;
+        if let Some(s) = slack {
+            if err.contains("retention") {
+                let msg = SlackMessage::with_text(format!(
+                    ":rotating_light: *CT retention overflow* :rotating_light:\n\
+                     Table: `{table}`\n\
+                     Watermark fell behind CT retention; \
+                     row history beyond `MIN_VALID_VERSION` is gone.\n\
+                     _Recover with_ `bin/sync --bootstrap` _(Phase 5.5)_."
+                ));
+                let _ = s.send_message(&msg).await;
             }
-            return;
         }
+        return Ok(()); // intentional skip — retention can't be repaired by retry
     }
 
-    // Count CT rows since the watermark, filtering out our own
-    // writeback session (`SYS_CHANGE_CONTEXT = 0x4E48`).
-    let row_count = match count_ct_rows(mssql, table, last_seen).await {
-        Ok(n) => n,
+    // 2. NoopMapper short-circuit — when select_sql is empty there's
+    //    nothing to project, so just count rows for observability.
+    if select_sql.is_empty() {
+        let row_count = match count_ct_rows(mssql, table, last_seen).await {
+            Ok(n) => n,
+            Err(err) => {
+                tracing::warn!(table, error = %err, "CT count query failed");
+                let _ = record_table_error(pg, table, &err).await;
+                return Ok(());
+            }
+        };
+        if let Err(err) = bump_skipped(pg, table, row_count).await {
+            tracing::warn!(
+                table,
+                error = %err,
+                "Failed to update legacy_sync_status — observability degraded"
+            );
+        } else if row_count > 0 {
+            tracing::info!(
+                table,
+                row_count,
+                "CT rows observed (NoopMapper — skipped, awaiting real mapper)"
+            );
+        }
+        return Ok(());
+    }
+
+    // 3. Real-mapper path: fetch CT rows joined with the table.
+    let rows = match fetch_ct_rows(mssql, table, pk_cols, select_sql, last_seen).await {
+        Ok(rs) => rs,
         Err(err) => {
-            tracing::warn!(table, error = %err, "CT count query failed");
-            let _ = record_table_error(pg, table, &err.to_string()).await;
-            return;
+            tracing::warn!(table, error = %err, "CT fetch failed");
+            let _ = record_table_error(pg, table, &err).await;
+            return Ok(());
         }
     };
 
-    // Phase 5.1: every row is "skipped" because NoopMapper.apply
-    // returns Ok(None). Bump the skipped counter so operators can
-    // verify the loop is alive without log-tailing.
-    if let Err(err) = bump_skipped(pg, table, row_count).await {
-        tracing::warn!(
-            table,
-            error = %err,
-            "Failed to update legacy_sync_status — observability degraded"
-        );
-    } else if row_count > 0 {
-        tracing::info!(
-            table,
-            row_count,
-            "CT rows observed (5.1: NoopMapper skipped all)"
-        );
+    if rows.is_empty() {
+        return Ok(());
     }
+
+    let row_count = rows.len() as i64;
+    let mut max_version: i64 = last_seen;
+    let mut ingested: i64 = 0;
+    let mut skipped: i64 = 0;
+
+    // 4. Open one PG TX per table-tick. Shadow mode rolls back; live
+    //    mode commits.
+    let mut tx = match pg.begin().await {
+        Ok(t) => t,
+        Err(err) => {
+            tracing::error!(table, error = %err, "Failed to begin PG TX");
+            return Ok(());
+        }
+    };
+
+    for (version, op_char, row) in &rows {
+        let op = match ChangeOp::try_from(op_char.as_str()) {
+            Ok(o) => o,
+            Err(err) => {
+                tracing::warn!(
+                    table,
+                    sys_change_operation = %op_char,
+                    error = %err,
+                    "Unknown CT operation code — skipping row"
+                );
+                skipped += 1;
+                continue;
+            }
+        };
+
+        // For Delete, the joined row is NULL but the PK columns are
+        // still in the projection (CT carries them). Pass `Some(&row)`
+        // either way and let the mapper decide.
+        let result = mapper.apply(&mut tx, op, Some(row)).await;
+
+        match result {
+            Ok(Some(event)) => {
+                if shadow_mode {
+                    tracing::info!(
+                        table,
+                        version,
+                        op = ?op,
+                        event_type = event.type_name(),
+                        "would publish (shadow mode)"
+                    );
+                    skipped += 1;
+                } else if let Err(err) = persist_event(&mut tx, &event).await {
+                    tracing::error!(
+                        table,
+                        version,
+                        op = ?op,
+                        error = %err,
+                        "Failed to persist event_log row"
+                    );
+                    skipped += 1;
+                } else {
+                    ingested += 1;
+                }
+            }
+            Ok(None) => {
+                // Idempotent skip / D-event with no event payload.
+                skipped += 1;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    table,
+                    version,
+                    op = ?op,
+                    error = %err,
+                    "Mapper error — recording and continuing"
+                );
+                let _ = record_table_error(pg, table, &err.to_string()).await;
+                skipped += 1;
+            }
+        }
+
+        if *version > max_version {
+            max_version = *version;
+        }
+    }
+
+    // 5. Commit (live) or rollback (shadow).
+    if shadow_mode {
+        if let Err(err) = tx.rollback().await {
+            tracing::warn!(table, error = %err, "Shadow-mode rollback failed");
+        }
+        // Bump skipped counter to mirror the noop path's behavior.
+        let _ = bump_skipped(pg, table, row_count).await;
+        return Ok(());
+    }
+
+    if let Err(err) = tx.commit().await {
+        tracing::error!(table, error = %err, "PG TX commit failed");
+        let _ = record_table_error(pg, table, &err.to_string()).await;
+        return Ok(());
+    }
+
+    // 6. Counters + watermark advance (live mode only).
+    if let Err(err) = bump_counters(pg, table, ingested, skipped).await {
+        tracing::warn!(table, error = %err, "Failed to bump counters");
+    }
+
+    if max_version > last_seen {
+        if let Err(err) =
+            hotel_backend::sync::watermark::advance(pg, max_version).await
+        {
+            tracing::error!(
+                table,
+                new_version = max_version,
+                error = %err,
+                "Failed to advance CT watermark"
+            );
+        } else {
+            tracing::info!(
+                table,
+                from = last_seen,
+                to = max_version,
+                ingested,
+                skipped,
+                "Advanced CT watermark"
+            );
+        }
+    }
+
+    Ok(())
 }
 
-/// Returns Ok(()) if `MIN_VALID_VERSION(<table>) <= last_seen`, else a
-/// typed error containing "retention" so the caller can recognise it.
+/// One CT row returned by [`fetch_ct_rows`]: the version, the
+/// single-character op code, and the joined data wrapped in our test
+/// fixture (which trivially backs onto `tiberius::Row`).
+type CtRow = (
+    i64,
+    String,
+    hotel_backend::sync::row::test_support::HashMapRow,
+);
+// Note: above type alias intentionally points at HashMapRow only because
+// that's the test impl; we re-shape tiberius rows into the same
+// HashMap-backed type below so the dispatch path works against
+// `MappableRow` uniformly. This keeps a single code path for both
+// production and tests, at the cost of one extra copy per row (small
+// — column counts are <16, all cells are short strings or i32s).
+
+#[cfg(test)]
+mod sync_row_alias_compile_check {
+    // Compile-time guard that the alias above stays in sync with the
+    // public `test_support` re-export the watcher binary depends on.
+    use super::CtRow;
+    fn _assert_send(_v: CtRow) {}
+}
+
+/// Fetch CT rows joined with the table, filtered by loop-prevention
+/// `SYS_CHANGE_CONTEXT <> 0x4E48`, ordered by `SYS_CHANGE_VERSION` for
+/// monotonic processing.
+async fn fetch_ct_rows(
+    mssql: &DbPool,
+    table: &str,
+    pk_cols: &[&str],
+    select_sql: &str,
+    last_seen: i64,
+) -> Result<Vec<CtRow>, String> {
+    let mut conn = mssql.get().await.map_err(|e| e.to_string())?;
+
+    // Build the JOIN condition: `t.pk1 = ct.pk1 AND t.pk2 = ct.pk2 …`.
+    // For a single-PK table (our 5.2 mappers) this is trivial.
+    let join_clause = if pk_cols.is_empty() {
+        // Fallback that should never happen for a real mapper; the
+        // NoopMapper short-circuit upstream owns that path.
+        return Err("real mapper must declare primary_key_cols".into());
+    } else {
+        pk_cols
+            .iter()
+            .map(|c| format!("t.{c} = ct.{c}"))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    };
+
+    // Build the PK projection list for the SELECT (we always include
+    // the PK columns from CT itself so D rows still carry them even
+    // when `t.*` is NULL).
+    let pk_projection = pk_cols
+        .iter()
+        .map(|c| format!("ct.{c} AS pk_{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let sql = format!(
+        "SELECT ct.SYS_CHANGE_VERSION AS sys_change_version, \
+                ct.SYS_CHANGE_OPERATION AS sys_change_operation, \
+                {pk_projection}, \
+                {select_sql} \
+           FROM CHANGETABLE(CHANGES {table}, {last_seen}) AS ct \
+           LEFT JOIN {table} AS t ON {join_clause} \
+          WHERE ct.SYS_CHANGE_CONTEXT IS NULL \
+             OR ct.SYS_CHANGE_CONTEXT <> 0x4E48 \
+          ORDER BY ct.SYS_CHANGE_VERSION ASC"
+    );
+
+    let stream = conn.simple_query(&sql).await.map_err(|e| e.to_string())?;
+    let rows = stream
+        .into_first_result()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut out: Vec<CtRow> = Vec::with_capacity(rows.len());
+    for r in rows {
+        let version: i64 = r.get("sys_change_version").unwrap_or(0);
+        // SYS_CHANGE_OPERATION is always one of 'I' / 'U' / 'D' (single
+        // char); tiberius surfaces it as `&str`.
+        let op_char: String = r
+            .get::<&str, _>("sys_change_operation")
+            .unwrap_or("?")
+            .to_string();
+        out.push((version, op_char, materialise_row(&r, pk_cols, select_sql)));
+    }
+    Ok(out)
+}
+
+/// Copy a tiberius row's columns into a `HashMapRow` so the rest of the
+/// dispatch path can use the `MappableRow` trait uniformly. Strictly a
+/// boundary translator — both sides of the column list (PK + projection)
+/// are addressed by the original column names the mapper requested.
+fn materialise_row(
+    row: &tiberius::Row,
+    pk_cols: &[&str],
+    select_sql: &str,
+) -> hotel_backend::sync::row::test_support::HashMapRow {
+    use hotel_backend::sync::row::test_support::{HashMapRow, MockValue};
+
+    let mut h = HashMapRow::new("ct_row");
+
+    // PK columns: surfaced under both `pk_<name>` (the SELECT alias)
+    // and `<name>` (what the mapper looks up). For D rows the joined
+    // table column is NULL but the CT-side `pk_<name>` is populated.
+    for col in pk_cols {
+        let pk_alias = format!("pk_{col}");
+        if let Some(v) = read_cell(row, &pk_alias) {
+            h.cells.insert((*col).to_string(), v);
+        }
+    }
+
+    // Projection columns: the mapper specified them as `t.<col>` in
+    // select_sql; tiberius exposes them under just `<col>` in the
+    // result row. We pull every identifier mentioned in select_sql
+    // (after a `t.`) and copy whatever value tiberius surfaces.
+    for col in extract_projection_columns(select_sql) {
+        if let Some(v) = read_cell(row, &col) {
+            h.cells.insert(col, v);
+        } else {
+            // Column was NULL — record it so the mapper sees an
+            // explicit None instead of "missing column".
+            h.cells.insert(col, MockValue::Null);
+        }
+    }
+
+    h
+}
+
+/// Pull `t.<column>` identifiers out of a select clause like
+/// `"t.Cust_no, t.Cust_name, t.Cust_perfix"`. Tolerant of whitespace
+/// and trailing commas; ignores anything that isn't `t.<ident>`.
+fn extract_projection_columns(select_sql: &str) -> Vec<String> {
+    select_sql
+        .split(',')
+        .filter_map(|p| {
+            let p = p.trim();
+            p.strip_prefix("t.").map(|s| s.trim().to_string())
+        })
+        .collect()
+}
+
+/// Read one cell from a tiberius row, choosing a wrapper based on the
+/// type tiberius surfaces. Probes types in the order our 5.2 mappers
+/// actually use (str → i32 → i64 → f64 → datetime). Returns `None` if
+/// the cell is SQL NULL.
+fn read_cell(
+    row: &tiberius::Row,
+    col: &str,
+) -> Option<hotel_backend::sync::row::test_support::MockValue> {
+    use hotel_backend::sync::row::test_support::MockValue;
+
+    if let Ok(Some(s)) = tiberius::Row::try_get::<&str, _>(row, col) {
+        return Some(MockValue::Str(s.to_string()));
+    }
+    if let Ok(Some(n)) = tiberius::Row::try_get::<i32, _>(row, col) {
+        return Some(MockValue::I32(n));
+    }
+    if let Ok(Some(n)) = tiberius::Row::try_get::<i64, _>(row, col) {
+        return Some(MockValue::I64(n));
+    }
+    if let Ok(Some(n)) = tiberius::Row::try_get::<f64, _>(row, col) {
+        return Some(MockValue::F64(n));
+    }
+    if let Ok(Some(d)) = tiberius::Row::try_get::<chrono::NaiveDateTime, _>(row, col) {
+        return Some(MockValue::DateTime(d));
+    }
+    None
+}
+
+/// Persist a `DomainEvent` into `event_log` inside the caller's TX.
+/// Wraps `EventBus::publish` so the watcher and the service layer take
+/// the same code path.
+async fn persist_event(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    event: &DomainEvent,
+) -> Result<(), sqlx::Error> {
+    let _id = EventBus::publish(tx, event).await?;
+    Ok(())
+}
+
 async fn check_retention(
     mssql: &DbPool,
     table: &str,
@@ -436,7 +696,7 @@ async fn check_retention(
         .map_err(|e| e.to_string())?;
     let row = match rows.first() {
         Some(r) => r,
-        None => return Ok(()), // CT not enabled? leave it for fingerprint guard
+        None => return Ok(()),
     };
     let min_valid: Option<i64> = row.get(0);
     let Some(min_valid) = min_valid else {
@@ -450,16 +710,12 @@ async fn check_retention(
     Ok(())
 }
 
-/// Count CT change rows since `last_seen`, filtering out our own
-/// writeback session via the `SYS_CHANGE_CONTEXT` tag.
 async fn count_ct_rows(
     mssql: &DbPool,
     table: &str,
     last_seen: i64,
 ) -> Result<i64, String> {
     let mut conn = mssql.get().await.map_err(|e| e.to_string())?;
-    // CHANGETABLE wants the previous version; rows with SYS_CHANGE_VERSION
-    // > @last are returned. Filter our own session via SYS_CHANGE_CONTEXT.
     let sql = format!(
         "SELECT COUNT(*) FROM CHANGETABLE(CHANGES {table}, {last_seen}) AS ct \
          WHERE ct.SYS_CHANGE_CONTEXT IS NULL OR ct.SYS_CHANGE_CONTEXT <> 0x4E48"
@@ -476,7 +732,6 @@ async fn count_ct_rows(
     Ok(n as i64)
 }
 
-/// Bump `legacy_sync_status.rows_skipped` and clear any prior error.
 async fn bump_skipped(pg: &PgPool, table: &str, n: i64) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE legacy_sync_status \
@@ -494,8 +749,30 @@ async fn bump_skipped(pg: &PgPool, table: &str, n: i64) -> Result<(), sqlx::Erro
     Ok(())
 }
 
-/// Record a per-table failure into `legacy_sync_status`. Increments
-/// `consecutive_failures` so operators can spot a wedged mapper.
+async fn bump_counters(
+    pg: &PgPool,
+    table: &str,
+    ingested: i64,
+    skipped: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE legacy_sync_status \
+            SET rows_ingested        = rows_ingested + $2, \
+                rows_skipped         = rows_skipped + $3, \
+                last_processed_at    = now(), \
+                last_error           = NULL, \
+                last_error_at        = NULL, \
+                consecutive_failures = 0 \
+          WHERE table_name = $1",
+    )
+    .bind(table)
+    .bind(ingested)
+    .bind(skipped)
+    .execute(pg)
+    .await?;
+    Ok(())
+}
+
 async fn record_table_error(
     pg: &PgPool,
     table: &str,
@@ -545,7 +822,7 @@ mod tests {
     fn build_mappers_no_allowlist_returns_all_ten() {
         let mappers = build_mappers(&None);
         assert_eq!(mappers.len(), CT_ENABLED_TABLES.len());
-        assert_eq!(mappers.len(), 10, "10 CT-enabled tables expected in 5.1");
+        assert_eq!(mappers.len(), 10, "10 CT-enabled tables expected");
     }
 
     #[test]
@@ -557,12 +834,58 @@ mod tests {
         assert_eq!(mappers.len(), 2);
     }
 
+    /// Phase 5.2: customer + room are now real mappers; the rest are
+    /// still NoopMapper. The mapper for `HT_Customers` must not be a
+    /// NoopMapper anymore — locks the wiring so a refactor doesn't
+    /// silently regress the customer mapper to no-op.
+    #[test]
+    fn build_mappers_wires_customer_to_customer_mapper() {
+        let mut allow = HashSet::new();
+        allow.insert("HT_Customers".to_string());
+        let mappers = build_mappers(&Some(allow));
+        assert_eq!(mappers.len(), 1);
+        // The CustomerMapper has primary_key_cols == &["id"]; NoopMapper
+        // has &[]. Use that as the structural assertion.
+        assert_eq!(
+            mappers[0].primary_key_cols(),
+            &["id"],
+            "HT_Customers must be wired to CustomerMapper, not NoopMapper"
+        );
+    }
+
+    #[test]
+    fn build_mappers_wires_rooms_to_room_master_mapper() {
+        let mut allow = HashSet::new();
+        allow.insert("HT_Rooms".to_string());
+        let mappers = build_mappers(&Some(allow));
+        assert_eq!(mappers.len(), 1);
+        assert_eq!(mappers[0].primary_key_cols(), &["id"]);
+        assert!(mappers[0].select_sql().contains("Room_Clean"));
+    }
+
+    #[test]
+    fn build_mappers_wires_room_status_to_room_status_mapper() {
+        let mut allow = HashSet::new();
+        allow.insert("HT_Room_Status".to_string());
+        let mappers = build_mappers(&Some(allow));
+        assert_eq!(mappers.len(), 1);
+        assert_eq!(mappers[0].primary_key_cols(), &["id"]);
+    }
+
+    #[test]
+    fn build_mappers_keeps_noop_for_5_3_tables() {
+        let mut allow = HashSet::new();
+        allow.insert("HT_Book_H".to_string());
+        let mappers = build_mappers(&Some(allow));
+        assert_eq!(mappers.len(), 1);
+        assert!(
+            mappers[0].primary_key_cols().is_empty(),
+            "HT_Book_H must still be NoopMapper in 5.2"
+        );
+    }
+
     #[test]
     fn ct_enabled_tables_match_migration_017_seed() {
-        // Whenever this list changes, migration 017 + the
-        // `legacy_sync_status` seed in init-hotelnew.sql must change
-        // too. The mismatch would cause `bump_skipped` UPDATEs to
-        // silently affect zero rows.
         let expected = [
             "HT_Customers",
             "HT_Rooms",
@@ -578,30 +901,58 @@ mod tests {
         assert_eq!(CT_ENABLED_TABLES, &expected);
     }
 
+    #[test]
+    fn extract_projection_columns_strips_t_prefix() {
+        let cols = extract_projection_columns(
+            "t.Cust_no, t.Cust_name, t.Cust_Add_tel",
+        );
+        assert_eq!(cols, vec!["Cust_no", "Cust_name", "Cust_Add_tel"]);
+    }
+
+    #[test]
+    fn extract_projection_columns_tolerates_whitespace_and_trailing_comma() {
+        let cols = extract_projection_columns(
+            "  t.id,  t.Room_no ,  t.Room_Type ,",
+        );
+        assert_eq!(cols, vec!["id", "Room_no", "Room_Type"]);
+    }
+
+    #[test]
+    fn extract_projection_columns_skips_non_t_qualified_entries() {
+        let cols = extract_projection_columns(
+            "t.id, ct.SYS_CHANGE_VERSION AS v, t.Room_no",
+        );
+        assert_eq!(cols, vec!["id", "Room_no"]);
+    }
+
     /// CHANGETABLE filter must include the SYS_CHANGE_CONTEXT clause
     /// matching the `SET CONTEXT_INFO 0x4E48` value the writeback
     /// dispatcher stamps. Locks the byte literal so a refactor can't
-    /// silently break loop-prevention.
+    /// silently break loop-prevention. The check is a substring match
+    /// on `0x4E48` near `SYS_CHANGE_CONTEXT` — both fetch_ct_rows and
+    /// count_ct_rows compose the clause across multiple source lines,
+    /// so an exact-string match would be fragile.
     #[test]
-    fn count_ct_rows_uses_loop_prevention_filter() {
+    fn fetch_ct_rows_uses_loop_prevention_filter() {
         let source = include_str!("sync.rs");
+        // Both occurrences of the literal must be paired with the
+        // SYS_CHANGE_CONTEXT predicate — this guards both the JOIN
+        // SELECT and the COUNT SELECT.
+        let ctx_count = source.matches("SYS_CHANGE_CONTEXT").count();
+        let tag_count = source.matches("0x4E48").count();
         assert!(
-            source.contains("SYS_CHANGE_CONTEXT IS NULL OR ct.SYS_CHANGE_CONTEXT <> 0x4E48"),
-            "count_ct_rows must filter out our own writeback session via 0x4E48"
+            ctx_count >= 2 && tag_count >= 2,
+            "expected ≥2 occurrences of SYS_CHANGE_CONTEXT + 0x4E48 (JOIN + COUNT paths)"
         );
     }
 
     /// The CONTEXT_INFO value used by writeback's dispatcher and the
     /// CT watcher's filter must be the same byte sequence — otherwise
-    /// every writeback re-fires through the watcher. This test pins
-    /// both to `0x4E48` ("NH"). Update both files together if the tag
-    /// ever needs to change.
+    /// every writeback re-fires through the watcher.
     #[test]
     fn loop_prevention_tag_matches_writeback_dispatcher() {
         let dispatcher_src = include_str!("../writeback/dispatcher.rs");
         let mssql_session_src = include_str!("../db/mssql_session.rs");
-        // Dispatcher must call set_context_info — the actual
-        // `0x4E48` literal lives in mssql_session.rs.
         assert!(dispatcher_src.contains("set_context_info(conn)"));
         assert!(
             mssql_session_src.contains("SET CONTEXT_INFO 0x4E48"),

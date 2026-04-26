@@ -886,5 +886,25 @@ VALUES ('017', '017_legacy_sync_status.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================
+-- Migration 018: ht_customers aggregate keys (Phase 5.2 — customer CT mapper)
+-- Per docs/architecture.md §3.6d. Adds legacy_cust_no + aggregate_id so the
+-- HT_Customers CT mapper can map MSSQL Cust_no → canonical row and emit
+-- DomainEvent::Customer{Created,Modified} with stable aggregate UUIDs.
+-- =============================================================================
+
+ALTER TABLE ht_customers ADD COLUMN IF NOT EXISTS legacy_cust_no VARCHAR(20);
+ALTER TABLE ht_customers ADD COLUMN IF NOT EXISTS aggregate_id   UUID;
+
+CREATE UNIQUE INDEX IF NOT EXISTS ht_customers_legacy_cust_no_uniq
+    ON ht_customers (legacy_cust_no) WHERE legacy_cust_no IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS ht_customers_aggregate_id_uniq
+    ON ht_customers (aggregate_id) WHERE aggregate_id IS NOT NULL;
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('018', '018_ht_customers_aggregate_keys.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
 -- Initialization complete
 -- =============================================================================
