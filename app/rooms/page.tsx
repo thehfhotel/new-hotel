@@ -17,8 +17,12 @@ import {
   XCircle,
   Clock,
   History,
+  LogIn,
+  LogOut,
 } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import CheckInModal from '@/components/CheckInModal'
+import CheckOutModal from '@/components/CheckOutModal'
 
 // API response types (from /api/new/rooms)
 interface RoomApiItem {
@@ -70,6 +74,8 @@ export default function RoomsPage() {
   const [selectedRoom, setSelectedRoom] = useState<RoomApiItem | null>(null)
   const [roomDetail, setRoomDetail] = useState<RoomApiItem | null>(null)
   const [loadingDetail, setLoadingDetail] = useState(false)
+  const [showCheckIn, setShowCheckIn] = useState(false)
+  const [showCheckOut, setShowCheckOut] = useState(false)
 
   const fetchRooms = useCallback(async () => {
     setLoading(true)
@@ -463,6 +469,30 @@ export default function RoomsPage() {
                   </div>
                 )}
 
+                {/* Action buttons — check-in / check-out depending on status.
+                    Maintenance / dirty rooms get neither (legacy app's policy:
+                    can't check in to a dirty/under-repair room). */}
+                <div className="flex gap-2 pt-2 border-t border-gray-200">
+                  {selectedRoom.status === 'available' && (
+                    <button
+                      onClick={() => setShowCheckIn(true)}
+                      className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-red-600 text-white text-sm font-medium rounded hover:bg-red-700"
+                    >
+                      <LogIn size={14} />
+                      เช็คอิน
+                    </button>
+                  )}
+                  {selectedRoom.status === 'occupied' && (
+                    <button
+                      onClick={() => setShowCheckOut(true)}
+                      className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-sky-600 text-white text-sm font-medium rounded hover:bg-sky-700"
+                    >
+                      <LogOut size={14} />
+                      เช็คเอ้าท์
+                    </button>
+                  )}
+                </div>
+
                 {/* Updated at */}
                 {selectedRoom.updatedAt && (
                   <div className="text-xs text-gray-400 flex items-center">
@@ -474,6 +504,32 @@ export default function RoomsPage() {
             )}
           </div>
         </div>
+      )}
+
+      {/* Check-in / check-out modals */}
+      {showCheckIn && selectedRoom && (
+        <CheckInModal
+          room={{
+            id: selectedRoom.id,
+            roomNo: selectedRoom.roomNo,
+            roomTypeName: selectedRoom.roomTypeName,
+          }}
+          onClose={() => setShowCheckIn(false)}
+          onSuccess={() => {
+            fetchRooms()
+            if (selectedRoom) fetchRoomDetail(selectedRoom)
+          }}
+        />
+      )}
+      {showCheckOut && selectedRoom && (
+        <CheckOutModal
+          room={{ id: selectedRoom.id, roomNo: selectedRoom.roomNo }}
+          onClose={() => setShowCheckOut(false)}
+          onSuccess={() => {
+            fetchRooms()
+            if (selectedRoom) fetchRoomDetail(selectedRoom)
+          }}
+        />
       )}
     </div>
   )
