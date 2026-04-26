@@ -494,6 +494,11 @@ jobs:
           POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
           POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          # Phase 5 cutover: persist operator's enable + shadow-mode flip
+          # across deploys (otherwise this .env would revert them every push,
+          # per the known pitfall documented in docs/runbook-sync.md §4a).
+          LEGACY_SYNC_ENABLED: ${{ secrets.LEGACY_SYNC_ENABLED }}
+          LEGACY_SYNC_SHADOW_MODE: ${{ secrets.LEGACY_SYNC_SHADOW_MODE }}
         run: |
           set -e
           DEPLOY_DIR=/home/nut/new-hotel-production
@@ -516,7 +521,8 @@ jobs:
           # an empty value that the runtime would accept and then misuse.
           for var in DB_SERVER DB_NAME DB_USER DB_PASSWORD \
                      POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD \
-                     SLACK_WEBHOOK_URL; do
+                     SLACK_WEBHOOK_URL \
+                     LEGACY_SYNC_ENABLED LEGACY_SYNC_SHADOW_MODE; do
             if [ -z "${!var:-}" ]; then
               echo "::error::required secret $var is empty — refusing to write .env"
               exit 1
@@ -537,6 +543,8 @@ jobs:
             echo "POSTGRES_USER='${POSTGRES_USER}'"
             echo "POSTGRES_PASSWORD='${POSTGRES_PASSWORD}'"
             echo "SLACK_WEBHOOK_URL='${SLACK_WEBHOOK_URL}'"
+            echo "LEGACY_SYNC_ENABLED='${LEGACY_SYNC_ENABLED}'"
+            echo "LEGACY_SYNC_SHADOW_MODE='${LEGACY_SYNC_SHADOW_MODE}'"
           } > .env
           chmod 600 .env
 
