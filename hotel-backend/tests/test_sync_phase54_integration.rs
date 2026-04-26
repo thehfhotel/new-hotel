@@ -175,7 +175,19 @@ async fn cleanup(pool: &sqlx::PgPool, cin_no: &str, cust_no: &str, room_no: &str
 /// available, even without legacy MSSQL (the booking-linked side-effect
 /// path is exercised end-to-end against a live MSSQL only in Phase 5.5
 /// once the watcher is cut over).
+///
+/// Phase 5.5 QoL: `SYNC_TEST_SKIP_MSSQL_PROBE=true` skips the pool-init
+/// probe entirely and returns `None`. Use this for pure-PG test runs that
+/// don't need MSSQL (the bb8-tiberius probe otherwise blocks ~30s when
+/// MSSQL is unreachable, before the test can even start). See
+/// `docs/runbook-sync.md` env-var matrix.
 async fn mssql_stub() -> Option<hotel_backend::db::DbPool> {
+    if std::env::var("SYNC_TEST_SKIP_MSSQL_PROBE")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+    {
+        return None;
+    }
     let config = hotel_backend::config::DbConfig::from_env();
     hotel_backend::db::create_pool(&config).await.ok()
 }

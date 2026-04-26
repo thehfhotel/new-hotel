@@ -906,5 +906,38 @@ VALUES ('018', '018_ht_customers_aggregate_keys.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================
+-- Migration 019: ht_reconcile_log (Phase 5.5 — drift-detection tripwire)
+-- Per docs/architecture.md §3.6d. CT watcher is now authoritative for
+-- canonical PG state; the legacy 5-min reconcile job is demoted to a
+-- 15-min diff-only safety net that LOGS divergent rows here instead of
+-- UPSERTing them. See migrations/pg/019_ht_reconcile_log.sql for full
+-- rationale.
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS ht_reconcile_log (
+    id              BIGSERIAL    PRIMARY KEY,
+    detected_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    table_name      TEXT         NOT NULL,
+    legacy_pk       TEXT         NOT NULL,
+    pg_hash         TEXT,
+    mssql_hash      TEXT,
+    mssql_row_json  JSONB,
+    pg_row_json     JSONB,
+    resolved_at     TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_ht_reconcile_log_unresolved
+    ON ht_reconcile_log (detected_at)
+    WHERE resolved_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_ht_reconcile_log_table_unresolved
+    ON ht_reconcile_log (table_name, detected_at)
+    WHERE resolved_at IS NULL;
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('019', '019_ht_reconcile_log.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
 -- Initialization complete
 -- =============================================================================

@@ -108,21 +108,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .init();
 
+    let bootstrap_requested = env::args().any(|a| a == "--bootstrap");
+
     let enabled = env::var("LEGACY_SYNC_ENABLED")
         .map(|v| v == "true")
         .unwrap_or(false);
+
+    // `--bootstrap` is an explicit one-shot operator action: cold-seed
+    // canonical PG state from MSSQL via the legacy reconcile path, then
+    // record the current `CHANGE_TRACKING_CURRENT_VERSION()` as the
+    // watermark so the next run can resume from sub-second tip-of-stream.
+    // It runs INDEPENDENTLY of LEGACY_SYNC_ENABLED — operators bootstrap
+    // first, then flip the flag (per docs/runbook-sync.md cutover sequence).
+    if bootstrap_requested {
+        if !enabled {
+            tracing::warn!(
+                "LEGACY_SYNC_ENABLED!=true but --bootstrap was requested; \
+                 proceeding as an explicit one-shot bootstrap. The watcher \
+                 main loop will still refuse to start until the flag is flipped."
+            );
+        }
+        return run_bootstrap().await;
+    }
+
     if !enabled {
         tracing::info!(
             "LEGACY_SYNC_ENABLED!=true — CT watcher exiting cleanly without polling"
         );
         return Ok(());
-    }
-
-    if env::args().any(|a| a == "--bootstrap") {
-        return Err(
-            "--bootstrap is reserved for Phase 5.5 cold-start path; not yet implemented"
-                .into(),
-        );
     }
 
     let poll_interval_ms = env::var("CT_POLL_INTERVAL_MS")
@@ -191,9 +204,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Err(format!("Schema fingerprint check failed: {e}").into());
     }
 
+    // Cold-replay refusal (Phase 5.5). If the watermark is still at the
+    // seed value (`last_seen_version = 0`) AND the operator hasn't
+    // explicitly opted into a cold replay via env var, refuse to start
+    // and point at `--bootstrap`. Without this guard, a fresh deploy
+    // would attempt to process every CT row from time-zero, which
+    // either fails immediately on retention overflow (long-lived
+    // databases) or floods downstream subscribers with months of
+    // historical events.
+    let cold_replay_allowed = env::var("LEGACY_SYNC_ALLOW_COLD_REPLAY")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    let current_watermark = hotel_backend::sync::watermark::read_last_seen(&pg)
+        .await
+        .map_err(|e| format!("Failed to read CT watermark: {e}"))?;
+    if current_watermark == 0 && !cold_replay_allowed {
+        let msg = "CT watermark is 0 (cold start) and \
+                   LEGACY_SYNC_ALLOW_COLD_REPLAY != true — refusing to start. \
+                   Run `bin/sync --bootstrap` first to seed canonical state \
+                   and the watermark, OR set LEGACY_SYNC_ALLOW_COLD_REPLAY=true \
+                   to override (will replay all CT history). \
+                   See docs/runbook-sync.md for the full cutover procedure.";
+        tracing::error!("{msg}");
+        if let Some(s) = &slack {
+            let payload = SlackMessage::with_text(format!(
+                ":no_entry: *CT watcher REFUSED TO START* :no_entry:\n{msg}"
+            ));
+            let _ = s.send_message(&payload).await;
+        }
+        // Sleep before exit so Docker `restart: unless-stopped` doesn't
+        // turn this into a tight loop + alert flood.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        return Err(msg.into());
+    }
+
     let mappers = build_mappers(&allowlist);
     tracing::info!(
         count = mappers.len(),
+        watermark = current_watermark,
         "Mappers initialised (Phase 5.4: 10-table coverage — every CT-enabled \
          table has a real mapper or an intentional retired stub)"
     );
@@ -230,6 +278,120 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     tracing::info!("CT watcher exited cleanly");
     Ok(())
+}
+
+/// One-shot operator action: cold-seed canonical PG state from MSSQL
+/// (legacy reconcile) and record the current
+/// `CHANGE_TRACKING_CURRENT_VERSION()` as the CT watermark.
+///
+/// Per docs/architecture.md §3.6d and docs/runbook-sync.md, this is
+/// the prerequisite for the watcher's cutover step. After bootstrap
+/// completes, the operator flips `LEGACY_SYNC_ENABLED=true` and the
+/// watcher resumes from sub-second tip-of-stream — no cold-replay
+/// catch-up, no retention-overflow risk.
+///
+/// Bootstrap is intentionally NOT idempotent in shape (the reconcile
+/// it invokes IS idempotent — UPSERT-by-hash). Re-running just re-runs
+/// the reconcile and re-stamps the watermark to the new tip.
+async fn run_bootstrap() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing::info!("Phase 5.5 bootstrap — cold-seeding canonical PG + CT watermark");
+
+    let pg_url = env::var("DATABASE_URL")
+        .or_else(|_| env::var("NEW_DATABASE_URL"))
+        .map_err(|_| "DATABASE_URL or NEW_DATABASE_URL must be set")?;
+    let pg = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&pg_url)
+        .await?;
+    tracing::info!("[bootstrap] Connected to PostgreSQL");
+
+    let mssql_config = DbConfig::from_env();
+    let mssql = create_pool(&mssql_config)
+        .await
+        .map_err(|e| format!("MSSQL pool init failed: {e}"))?;
+    tracing::info!(server = %mssql_config.server, "[bootstrap] Connected to legacy MSSQL");
+
+    // Schema fingerprint guard — same gate the watcher main loop uses.
+    // Refusing to bootstrap on drift prevents seeding canonical state
+    // from a DB shape we don't understand.
+    if let Err(e) = verify_schema_fingerprint(&mssql).await {
+        return Err(format!(
+            "[bootstrap] Schema fingerprint check failed; refusing to bootstrap: {e}"
+        )
+        .into());
+    }
+
+    // Phase 1: run the existing reconcile path ONCE to bring canonical
+    // PG state up to date with MSSQL. The legacy `scheduler::sync::run_sync`
+    // (5-min full-sync) already does this work via UPSERT-by-hash. After
+    // Phase 5.5 the steady-state cron version of `run_sync` is demoted
+    // to diff-only, but the bootstrap path uses it in upsert mode here
+    // by temporarily overriding the env var.
+    tracing::info!("[bootstrap] Running reconcile (UPSERT mode)…");
+    let prior_mode = env::var("LEGACY_SYNC_RECONCILE_MODE").ok();
+    // SAFETY: setting an env var pre-tokio-runtime is safe here because
+    // we own the entire process state; the watcher binary doesn't fork.
+    env::set_var("LEGACY_SYNC_RECONCILE_MODE", "upsert");
+    hotel_backend::scheduler::sync::run_sync(&mssql, &pg).await;
+    match prior_mode {
+        Some(v) => env::set_var("LEGACY_SYNC_RECONCILE_MODE", v),
+        None => env::remove_var("LEGACY_SYNC_RECONCILE_MODE"),
+    }
+    tracing::info!("[bootstrap] Reconcile complete");
+
+    // Phase 2: read CHANGE_TRACKING_CURRENT_VERSION() and pin it as the
+    // watermark. This is the critical step — the watcher's next tick
+    // will resume from this version, picking up any CT rows produced
+    // AFTER the reconcile snapshot. Reconcile itself doesn't see CT
+    // rows, so there's a small window between the reconcile read and
+    // the watermark stamp where new MSSQL writes could land. Those
+    // writes will be replayed by the watcher (idempotent UPSERT means
+    // re-applying them is safe).
+    let current_version = read_change_tracking_current_version(&mssql).await?;
+    tracing::info!(
+        current_version,
+        "[bootstrap] Read CHANGE_TRACKING_CURRENT_VERSION() from MSSQL"
+    );
+
+    // Phase 3: stamp the watermark. Use a direct UPDATE (NOT
+    // `watermark::advance`) because advance has a guard
+    // `last_seen_version <= $1` that blocks moving backward; bootstrap
+    // is allowed to OVERWRITE the watermark even if a prior partial run
+    // bumped it past `current_version`.
+    sqlx::query(
+        "UPDATE legacy_ct_state \
+            SET last_seen_version = $1, \
+                last_polled_at    = now() \
+          WHERE id = 1",
+    )
+    .bind(current_version)
+    .execute(&pg)
+    .await?;
+    tracing::info!(
+        watermark = current_version,
+        "[bootstrap] CT watermark stamped — bootstrap complete. \
+         Operator may now flip LEGACY_SYNC_ENABLED=true."
+    );
+
+    Ok(())
+}
+
+/// Read `SELECT CHANGE_TRACKING_CURRENT_VERSION()` from MSSQL — the
+/// global-monotonic version every CT row carries. Returns the watermark
+/// the watcher should resume from after `run_bootstrap`.
+async fn read_change_tracking_current_version(
+    mssql: &DbPool,
+) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+    let mut conn = mssql.get().await?;
+    let stream = conn
+        .simple_query("SELECT CHANGE_TRACKING_CURRENT_VERSION() AS v")
+        .await?;
+    let rows = stream.into_first_result().await?;
+    let row = rows.first().ok_or_else(|| {
+        "CHANGE_TRACKING_CURRENT_VERSION() returned no rows".to_string()
+    })?;
+    let v: Option<i64> = row.get("v");
+    Ok(v.unwrap_or(0))
 }
 
 fn parse_allowlist(raw: Option<String>) -> Option<HashSet<String>> {
