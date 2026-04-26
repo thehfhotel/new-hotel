@@ -1,0 +1,220 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    REFERENCE-ONLY project file for the Hotel-2018 V.1.45 decompile.
+
+    This project is meant to LOAD in Rider / VS / VS Code (so F12 / Find Usages
+    work) — building cleanly is a bonus, not the goal. The original code:
+      - was VB.NET, not C# (decompiled by ilspycmd, expect VB.NET artifacts
+        like Operators.CompareString, Conversions.ToString, [AccessedThroughProperty])
+      - originally targeted .NET Framework 2.0 / x86
+      - depends on Crystal Reports for VS, which has no clean modern (net8) story
+
+    We retarget to net8.0-windows so a current SDK can load it. The Crystal
+    Reports plumbing (~95 typed-DataSet / ReportClass wrappers) is excluded
+    from compile because it pulls in CrystalDecisions.* assemblies that we
+    cannot satisfy on .NET 8. The .cs files stay in the folder so you can
+    still F12 into them.
+
+    DLL HintPaths point at the existing DLLs in the parent folder
+    `C:\Users\nutok\Downloads\Hotel-2018- V.1.45\` — do not move/rename them.
+  -->
+
+  <PropertyGroup>
+    <AssemblyName>HOTEL</AssemblyName>
+    <RootNamespace>iHOTEL2025</RootNamespace>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <PlatformTarget>x86</PlatformTarget>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>disable</Nullable>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
+
+    <!-- This project is reference-only. We don't expect a clean build.
+         Treat warnings as warnings, not errors, and silence the noisiest ones. -->
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <NoWarn>$(NoWarn);CS0108;CS0114;CS0162;CS0168;CS0169;CS0219;CS0414;CS0628;CS0649;CS0660;CS0661;CS1591;CS8981;CS0436;CS0103</NoWarn>
+    <ApplicationIcon>src\app.ico</ApplicationIcon>
+    <ApplicationManifest>src\app.manifest</ApplicationManifest>
+  </PropertyGroup>
+
+  <!--
+    Crystal Reports plumbing — typed-DataSet wrappers (Cached*) and
+    ReportClass wrappers (Crystal*, inv_*, sale*, and the ReportClass-based
+    Report*). These reference CrystalDecisions.CrystalReports.Engine /
+    .Shared / .ReportSource which are only shipped as legacy 32-bit
+    .NET Framework assemblies. Excluding them lets the rest of the project
+    load. The files remain on disk for F12 navigation.
+
+    NOTE: Office2007Form-based Report*.cs viewers (ReportDays, ReportDebt,
+    ReportTax, ReportCleanRoom, ReportContnueRoom(2), ReportCustChange,
+    ReportCustDays, ReportCustIn, ReportCustOut, ReportCustOutToday(2))
+    are NOT excluded — they're real Form classes with UI, even though they
+    eventually invoke the wrappers we excluded.
+  -->
+  <ItemGroup>
+    <Compile Remove="src\iHOTEL2025\Cached*.cs" />
+    <Compile Remove="src\iHOTEL2025\Crystal*.cs" />
+    <Compile Remove="src\iHOTEL2025\inv_sale_vat.cs" />
+    <Compile Remove="src\iHOTEL2025\inv_sale_vat0.cs" />
+    <Compile Remove="src\iHOTEL2025\inv_sale_vat0_debt.cs" />
+    <Compile Remove="src\iHOTEL2025\inv_sale_vat0_debt_hhotel.cs" />
+    <Compile Remove="src\iHOTEL2025\inv_sale_vat0_debt_hhotel_no.cs" />
+    <Compile Remove="src\iHOTEL2025\inv_sale_vat0_debt_hhotel_other.cs" />
+    <Compile Remove="src\iHOTEL2025\Cachedinv_sale_vat.cs" />
+    <Compile Remove="src\iHOTEL2025\Cachedinv_sale_vat0.cs" />
+    <Compile Remove="src\iHOTEL2025\Cachedinv_sale_vat0_debt.cs" />
+    <Compile Remove="src\iHOTEL2025\Cachedinv_sale_vat0_debt_hhotel.cs" />
+    <Compile Remove="src\iHOTEL2025\Cachedinv_sale_vat0_debt_hhotel_no.cs" />
+    <Compile Remove="src\iHOTEL2025\Cachedinv_sale_vat0_debt_hhotel_other.cs" />
+    <Compile Remove="src\iHOTEL2025\sale.cs" />
+    <Compile Remove="src\iHOTEL2025\sale2_58.cs" />
+    <Compile Remove="src\iHOTEL2025\sale2_80.cs" />
+    <Compile Remove="src\iHOTEL2025\sale3_folio.cs" />
+    <Compile Remove="src\iHOTEL2025\sale_cin_credit.cs" />
+    <Compile Remove="src\iHOTEL2025\sale_credit.cs" />
+    <Compile Remove="src\iHOTEL2025\sale_vat.cs" />
+    <Compile Remove="src\iHOTEL2025\sale_vat0.cs" />
+    <Compile Remove="src\iHOTEL2025\sale_vat0CB.cs" />
+    <Compile Remove="src\iHOTEL2025\sale_vat0SB.cs" />
+    <!-- ReportClass-based Report* (the Office2007Form-based ones stay) -->
+    <Compile Remove="src\iHOTEL2025\ReportBooking.cs" />
+    <Compile Remove="src\iHOTEL2025\ReportBookingINV.cs" />
+    <Compile Remove="src\iHOTEL2025\ReportCupon58.cs" />
+    <Compile Remove="src\iHOTEL2025\ReportCupon80.cs" />
+    <Compile Remove="src\iHOTEL2025\ReportDep.cs" />
+    <Compile Remove="src\iHOTEL2025\ReportDep2_58.cs" />
+    <Compile Remove="src\iHOTEL2025\ReportDep2_80.cs" />
+    <Compile Remove="src\iHOTEL2025\ReportFolio1.cs" />
+    <Compile Remove="src\iHOTEL2025\ReportFolio1_2.cs" />
+    <Compile Remove="src\iHOTEL2025\ReportFolio2.cs" />
+    <Compile Remove="src\iHOTEL2025\ReportIncome.cs" />
+    <Compile Remove="src\iHOTEL2025\ReportIncome2.cs" />
+    <Compile Remove="src\iHOTEL2025\ReportPictures.cs" />
+    <Compile Remove="src\iHOTEL2025\ReportReg2.cs" />
+    <Compile Remove="src\iHOTEL2025\ReportReg_1.cs" />
+    <Compile Remove="src\iHOTEL2025\ReportReg_2.cs" />
+    <Compile Remove="src\iHOTEL2025\ReportReg_3.cs" />
+    <Compile Remove="src\iHOTEL2025\ReportSaleVat.cs" />
+    <Compile Remove="src\iHOTEL2025\ReportShipCash.cs" />
+    <Compile Remove="src\iHOTEL2025\Report_RR4.cs" />
+  </ItemGroup>
+
+  <!-- Exclude the _archived/ folder from compile entirely. -->
+  <ItemGroup>
+    <Compile Remove="_archived\**\*.cs" />
+    <EmbeddedResource Remove="_archived\**\*.resx" />
+    <None Remove="_archived\**\*" />
+  </ItemGroup>
+
+  <!--
+    A handful of files reach into Crystal Reports types directly (not just
+    through the wrappers we excluded). Without the CR runtime these can't
+    compile on .NET 8. Excluded from build, kept for navigation.
+  -->
+  <ItemGroup>
+    <Compile Remove="src\iHOTEL2025\Print_Report.cs" />
+    <Compile Remove="src\iHOTEL2025\FrmPrint.cs" />
+    <Compile Remove="src\iHOTEL2025\FrmReportRR4.cs" />
+    <Compile Remove="src\iHOTEL2025\ReportTax.cs" />
+    <Compile Remove="src\iHOTEL2025\GClass3.cs" />
+    <Compile Remove="src\iHOTEL2025\GClass4.cs" />
+    <Compile Remove="src\iHOTEL2025\GForm0.cs" />
+  </ItemGroup>
+
+  <!--
+    A few decompiled forms have invalid C# (override of properties on a
+    sealed type). They're decompiler artifacts; the IL is fine but the C#
+    round-trip isn't. AboutBox1 just emits a sealed class with new virtual
+    members on every WinForms-designer property — excluded from build only.
+    (PrintFactory, ResizeableControl, TwCapability had similar artifacts that
+    were patched in-place; see comments at the top of each file.)
+  -->
+  <ItemGroup>
+    <Compile Remove="src\iHOTEL2025\AboutBox1.cs" />
+  </ItemGroup>
+
+  <!--
+    The original Microsoft.VisualBasic.* runtime helpers are still required
+    because the decompile shows Conversions.*, Operators.*, [DesignerGenerated],
+    [AccessedThroughProperty] etc. throughout. .NET 8 ships a compatible
+    Microsoft.VisualBasic via NuGet.
+  -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.VisualBasic" Version="10.3.0" />
+    <PackageReference Include="System.Management" Version="8.0.0" />
+    <PackageReference Include="System.IO.Ports" Version="8.0.0" />
+    <PackageReference Include="System.ServiceProcess.ServiceController" Version="8.0.0" />
+    <PackageReference Include="System.Drawing.Common" Version="8.0.0" />
+    <PackageReference Include="System.Data.OleDb" Version="8.0.0" />
+    <PackageReference Include="System.Data.SqlClient" Version="4.8.6" />
+  </ItemGroup>
+
+  <!--
+    Global usings — VB's My namespace lookup doesn't translate to C# directly.
+    These two pull `iHOTEL2025` and `iHOTEL2025.My` into scope for every file
+    so unqualified references like `MyProject.Forms.frmMain1` resolve.
+  -->
+  <ItemGroup>
+    <Using Include="iHOTEL2025" />
+    <Using Include="iHOTEL2025.My" />
+  </ItemGroup>
+
+  <!--
+    Third-party DLLs — point at the originals in the parent install folder.
+    DO NOT move or rename these files.
+
+    Crystal Reports references are intentionally OMITTED. They have no clean
+    .NET 8 story; their only consumers are excluded from build above.
+  -->
+  <ItemGroup>
+    <Reference Include="DevComponents.DotNetBar2">
+      <HintPath>..\DevComponents.DotNetBar2.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="C1.Win.C1FlexGrid.2">
+      <HintPath>..\C1.Win.C1FlexGrid.2.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="C1.Win.C1FlexGrid.Classic.2">
+      <HintPath>..\C1.Win.C1FlexGrid.Classic.2.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="GlacialList">
+      <HintPath>..\GlacialList.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="PrintableListView">
+      <HintPath>..\PrintableListView.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="BarcodeLib">
+      <HintPath>..\BarcodeLib.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="pcsc-sharp">
+      <HintPath>..\pcsc-sharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="ThaiNationalIDCardByKP">
+      <HintPath>..\ThaiNationalIDCardByKP.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Microsoft.Office.Interop.Excel">
+      <HintPath>..\Microsoft.Office.Interop.Excel.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Microsoft.Vbe.Interop">
+      <HintPath>..\Microsoft.Vbe.Interop.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="office">
+      <HintPath>..\office.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.41.1] - 2026-04-26
+
+### Added
+
+- **`legacy-reference/`** — reverse-engineering artifacts derived from the
+  original Windows `HOTEL.exe` binary, complementary to (not authoritative
+  over) `docs/legacy-spike/`. Contains:
+  - `analysis/` — `_FEATURE_MAP.md` (every form + navigation graph),
+    `_COMPAT_CHEATSHEET.md` (1,901-line code-derived coexistence contract),
+    `_REPORTS_INVENTORY.md` (46 Crystal Reports cataloged + QuestPDF
+    replacement plan), `_SCHEMA.sql` (all 61 CREATE TABLEs).
+  - `decompiled-source/` — buildable C# reference codebase (~298 .cs files)
+    reconstructed from `HOTEL-cleaned.exe` via ilspycmd. Loads in
+    Rider/VS/VSCode for F12 navigation; doesn't fully build (~280 known
+    decompiler-artifact errors documented in its own README), but that
+    doesn't matter for reference use.
+  - `binaries/` — original `HOTEL.exe` (obfuscated, Dec 2024),
+    `HOTEL-cleaned.exe` (de4dot output with .NET Reactor protections
+    stripped and string literals decrypted), and `HOTEL.pdb` (debug
+    symbols — what made the decompile so clean).
+  - `vendor/` — commercial 3rd-party DLLs the .csproj references
+    (DotNetBar, C1FlexGrid, BarcodeLib, etc.). Internal use only;
+    do not redistribute.
+  - Excluded from Docker builds via `.dockerignore`.
+
+  Where this folder and `docs/legacy-spike/` disagree, **trust
+  `docs/legacy-spike/`** — it's based on live Extended Events captures of
+  the running app; this folder is inferred from decompiled source.
+
+  Companion 2.4 GB SQL Server backup of the local-dev `db` database lives
+  at `nut@evergreen:~/legacy-data/db.bak` (NOT in repo; it's a stale
+  developer-machine snapshot, different from production).
+
+
 ## [2.41.0] - 2026-04-25
 
 ### Fixed

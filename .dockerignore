@@ -12,3 +12,6 @@ coverage
 .github
 .vscode
 *.log
+
+# Legacy reverse-engineering reference (committed to repo, excluded from Docker images)
+legacy-reference
