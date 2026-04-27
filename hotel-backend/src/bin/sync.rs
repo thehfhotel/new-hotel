@@ -595,7 +595,7 @@ async fn poll_table(
                 return Ok(());
             }
         };
-        if let Err(err) = bump_skipped(pg, table, row_count).await {
+        if let Err(err) = bump_skipped(pg, table, row_count, false).await {
             tracing::warn!(
                 table,
                 error = %err,
@@ -629,6 +629,13 @@ async fn poll_table(
     let mut max_version: i64 = last_seen;
     let mut ingested: i64 = 0;
     let mut skipped: i64 = 0;
+    // Tracks whether ANY per-row / aggregate path errored this tick.
+    // The end-of-tick counter bumps must NOT clear last_error /
+    // consecutive_failures when this is set, otherwise per-row
+    // increments from `record_table_error` get wiped before the
+    // dashboard can see them — exactly the silent-failure mode that
+    // hid the Cin_Pay_Status schema drift through a 16h soak.
+    let mut errored = false;
 
     // 4. Open one PG TX per table-tick. Shadow mode rolls back; live
     //    mode commits.
@@ -706,6 +713,7 @@ async fn poll_table(
                                 "Failed to load booking aggregate; recording and continuing"
                             );
                             let _ = record_table_error(pg, table, &err.to_string()).await;
+                            errored = true;
                             skipped += 1;
                             continue;
                         }
@@ -722,6 +730,7 @@ async fn poll_table(
                                 "Failed to load checkin aggregate; recording and continuing"
                             );
                             let _ = record_table_error(pg, table, &err.to_string()).await;
+                            errored = true;
                             skipped += 1;
                             continue;
                         }
@@ -772,6 +781,7 @@ async fn poll_table(
                         "aggregate apply error — recording and continuing"
                     );
                     let _ = record_table_error(pg, table, &err.to_string()).await;
+                    errored = true;
                     skipped += 1;
                 }
             }
@@ -836,6 +846,7 @@ async fn poll_table(
                         "Mapper error — recording and continuing"
                     );
                     let _ = record_table_error(pg, table, &err.to_string()).await;
+                    errored = true;
                     skipped += 1;
                 }
             }
@@ -852,7 +863,7 @@ async fn poll_table(
             tracing::warn!(table, error = %err, "Shadow-mode rollback failed");
         }
         // Bump skipped counter to mirror the noop path's behavior.
-        let _ = bump_skipped(pg, table, row_count).await;
+        let _ = bump_skipped(pg, table, row_count, errored).await;
         return Ok(());
     }
 
@@ -863,7 +874,7 @@ async fn poll_table(
     }
 
     // 6. Counters + watermark advance (live mode only).
-    if let Err(err) = bump_counters(pg, table, ingested, skipped).await {
+    if let Err(err) = bump_counters(pg, table, ingested, skipped, errored).await {
         tracing::warn!(table, error = %err, "Failed to bump counters");
     }
 
@@ -1126,20 +1137,32 @@ async fn count_ct_rows(
     Ok(n as i64)
 }
 
-async fn bump_skipped(pg: &PgPool, table: &str, n: i64) -> Result<(), sqlx::Error> {
-    sqlx::query(
+async fn bump_skipped(
+    pg: &PgPool,
+    table: &str,
+    n: i64,
+    errored: bool,
+) -> Result<(), sqlx::Error> {
+    // When the tick produced any per-row error, leave last_error /
+    // consecutive_failures alone so the increments from
+    // `record_table_error` survive — otherwise a 100%-failing tick that
+    // also reaches this counter bump would silently reset the failure
+    // count to 0 and the dashboard would never see the failure.
+    let sql = if errored {
+        "UPDATE legacy_sync_status \
+            SET rows_skipped      = rows_skipped + $2, \
+                last_processed_at = now() \
+          WHERE table_name = $1"
+    } else {
         "UPDATE legacy_sync_status \
             SET rows_skipped         = rows_skipped + $2, \
                 last_processed_at    = now(), \
                 last_error           = NULL, \
                 last_error_at        = NULL, \
                 consecutive_failures = 0 \
-          WHERE table_name = $1",
-    )
-    .bind(table)
-    .bind(n)
-    .execute(pg)
-    .await?;
+          WHERE table_name = $1"
+    };
+    sqlx::query(sql).bind(table).bind(n).execute(pg).await?;
     Ok(())
 }
 
@@ -1148,8 +1171,15 @@ async fn bump_counters(
     table: &str,
     ingested: i64,
     skipped: i64,
+    errored: bool,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    let sql = if errored {
+        "UPDATE legacy_sync_status \
+            SET rows_ingested     = rows_ingested + $2, \
+                rows_skipped      = rows_skipped + $3, \
+                last_processed_at = now() \
+          WHERE table_name = $1"
+    } else {
         "UPDATE legacy_sync_status \
             SET rows_ingested        = rows_ingested + $2, \
                 rows_skipped         = rows_skipped + $3, \
@@ -1157,13 +1187,14 @@ async fn bump_counters(
                 last_error           = NULL, \
                 last_error_at        = NULL, \
                 consecutive_failures = 0 \
-          WHERE table_name = $1",
-    )
-    .bind(table)
-    .bind(ingested)
-    .bind(skipped)
-    .execute(pg)
-    .await?;
+          WHERE table_name = $1"
+    };
+    sqlx::query(sql)
+        .bind(table)
+        .bind(ingested)
+        .bind(skipped)
+        .execute(pg)
+        .await?;
     Ok(())
 }
 

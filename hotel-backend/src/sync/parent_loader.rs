@@ -252,7 +252,6 @@ pub async fn load_checkin_aggregate(
             "Cin_Pay_Credit",
             "Cin_Pay_Tran",
             "Pay_No",
-            "Cin_Pay_Status",
         ],
     )
     .await?;
