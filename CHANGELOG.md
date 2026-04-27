@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.49.3] - 2026-04-27
+
+### Fixed
+
+- **Phase 5 sync — drop dead `Cin_Pay_Status` column from check-in
+  aggregate loader.** `parent_loader::load_checkin_aggregate` projected
+  `Cin_Pay_Status` from `HT_CheckIn_Pay`, but that column does not
+  exist in the legacy schema (verified against the live INSERT captured
+  in `docs/legacy-spike/raw/checkout2-20260424-101023/07-events.txt`).
+  Result: every CT-driven check-in aggregate load failed with
+  `Invalid column name 'Cin_Pay_Status'` — ~470 errors/min, all
+  silently swallowed by the skip-and-continue path. Caught during the
+  shadow-mode soak (TX rolled back so no PG damage); would have meant
+  zero check-in / payment mirroring once flipped live. The mapper
+  itself only consumes `id, Cin_No, Cin_Pay_Cash, Cin_Pay_Credit,
+  Cin_Pay_Tran, Pay_No`, so dropping the projection is non-functional.
+- **Phase 5 sync — close alerting gap that hid the above for ~16h.**
+  `bump_counters` and `bump_skipped` unconditionally cleared
+  `last_error`, `last_error_at`, and reset `consecutive_failures = 0`
+  at the end of every tick. Per-row error increments from
+  `record_table_error` were therefore wiped before the dashboard could
+  read them, so `legacy_sync_status.consecutive_failures` stayed at 0
+  through a 100%-failing 16h window. Threaded an `errored` flag
+  through `poll_table` → `bump_counters` / `bump_skipped`; when set,
+  the SQL no longer touches the error fields, so per-error increments
+  survive into the next tick and the dashboard's
+  `consecutive_failures >= 5` alert criteria actually fires.
+
 ## [2.49.2] - 2026-04-26
 
 ### Changed
