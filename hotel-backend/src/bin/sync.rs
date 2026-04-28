@@ -145,12 +145,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // watermark so the next run can resume from sub-second tip-of-stream.
     // It runs INDEPENDENTLY of LEGACY_SYNC_ENABLED — operators bootstrap
     // first, then flip the flag (per docs/runbook-sync.md cutover sequence).
+    //
+    // Audit finding N1 (Phase 5.5 codebase audit, 2026-04-29) — refuse
+    // a live bootstrap unless the operator opts in. When
+    // `LEGACY_SYNC_ENABLED=true`, the watcher is (or will shortly be)
+    // pulling CT rows and UPSERTing into `legacy_mirror.<table>` with
+    // `mirror_source='ct'`. The bootstrap snapshot path runs
+    // `DELETE FROM legacy_mirror.<table>` then re-inserts every row
+    // with `mirror_source='reconcile'` — that DELETE races the
+    // watcher's UPSERTs and can clobber `mirror_source='ct'` rows the
+    // mapper just wrote (and the snapshot doesn't carry, e.g. legacy
+    // INSERTs newer than the snapshot SELECT). To proceed against a
+    // live deployment, set `LEGACY_SYNC_ALLOW_LIVE_BOOTSTRAP=true`
+    // (matches the cold-replay / overflow override pattern below).
     if bootstrap_requested {
-        if !enabled {
+        if enabled {
+            let allow_live_bootstrap = env::var("LEGACY_SYNC_ALLOW_LIVE_BOOTSTRAP")
+                .map(|v| v == "true")
+                .unwrap_or(false);
+            if !allow_live_bootstrap {
+                let slack_config = SlackConfig::from_env();
+                let slack: Option<SlackClient> = if slack_config.is_configured() {
+                    Some(SlackClient::new(slack_config))
+                } else {
+                    None
+                };
+                let msg = build_live_bootstrap_refusal_message();
+                tracing::error!("{msg}");
+                if let Some(s) = &slack {
+                    let payload = SlackMessage::with_text(format!(
+                        ":no_entry: *Bootstrap REFUSED — live deployment* :no_entry:\n{msg}"
+                    ));
+                    let _ = s.send_message(&payload).await;
+                }
+                // Sleep before exit so Docker `restart: unless-stopped`
+                // doesn't turn this into a tight loop + alert flood.
+                tracing::warn!(
+                    "Sleeping 60s before exit to throttle Docker restart cadence"
+                );
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                return Err(msg.into());
+            }
             tracing::warn!(
-                "LEGACY_SYNC_ENABLED!=true but --bootstrap was requested; \
-                 proceeding as an explicit one-shot bootstrap. The watcher \
-                 main loop will still refuse to start until the flag is flipped."
+                "LEGACY_SYNC_ALLOW_LIVE_BOOTSTRAP=true — proceeding with bootstrap \
+                 against a live deployment. Watcher CT writes during the snapshot \
+                 window may be clobbered by the snapshot DELETE."
             );
         }
         return run_bootstrap().await;
@@ -438,6 +477,31 @@ async fn run_bootstrap() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
         .into());
     }
 
+    // Audit finding N2 (Phase 5.5 codebase audit, 2026-04-29) — capture
+    // CHANGE_TRACKING_CURRENT_VERSION() BEFORE the reconcile + snapshot
+    // and use that captured value as the watermark stamped at the end.
+    //
+    // Why: `CHANGETABLE(CHANGES <table>, @version)` returns rows
+    // strictly greater than `@version`. If we read the version AFTER
+    // the snapshots, any CT row produced between snapshot SELECT and
+    // version read is silently skipped on the next watcher tick. For
+    // canonical tables this self-heals on the next update (idempotent
+    // UPSERT-by-hash), but for the legacy_mirror tables an INSERT in
+    // that window with no follow-up update would never land until
+    // somebody touches the row again — silent data loss.
+    //
+    // Capturing the version at the START guarantees the next watcher
+    // tick replays everything from snapshot-time-onward. The overlap
+    // (rows we both snapshotted AND will replay via CT) is harmless:
+    // the CT mappers UPSERT idempotently and `mirror_source` is the
+    // only column that changes (snapshot writes 'reconcile', CT writes
+    // 'ct' — the latest write wins, which is what we want anyway).
+    let snapshot_version = read_change_tracking_current_version(&mssql).await?;
+    tracing::info!(
+        snapshot_version,
+        "[bootstrap] Captured CHANGE_TRACKING_CURRENT_VERSION() before snapshot"
+    );
+
     // Phase 1: run the existing reconcile path ONCE to bring canonical
     // PG state up to date with MSSQL. The legacy `scheduler::sync::run_sync`
     // (5-min full-sync) already does this work via UPSERT-by-hash. After
@@ -467,36 +531,28 @@ async fn run_bootstrap() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     hotel_backend::scheduler::mirror::snapshot_mirror_transactional_tables(&mssql, &pg).await;
     tracing::info!("[bootstrap] Mirror transactional snapshot complete");
 
-    // Phase 2: read CHANGE_TRACKING_CURRENT_VERSION() and pin it as the
-    // watermark. This is the critical step — the watcher's next tick
-    // will resume from this version, picking up any CT rows produced
-    // AFTER the reconcile snapshot. Reconcile itself doesn't see CT
-    // rows, so there's a small window between the reconcile read and
-    // the watermark stamp where new MSSQL writes could land. Those
-    // writes will be replayed by the watcher (idempotent UPSERT means
-    // re-applying them is safe).
-    let current_version = read_change_tracking_current_version(&mssql).await?;
-    tracing::info!(
-        current_version,
-        "[bootstrap] Read CHANGE_TRACKING_CURRENT_VERSION() from MSSQL"
-    );
-
-    // Phase 3: stamp the watermark. Use a direct UPDATE (NOT
-    // `watermark::advance`) because advance has a guard
+    // Phase 2: stamp the watermark to the version captured BEFORE the
+    // reconcile + snapshot (audit finding N2). Use a direct UPDATE
+    // (NOT `watermark::advance`) because advance has a guard
     // `last_seen_version <= $1` that blocks moving backward; bootstrap
     // is allowed to OVERWRITE the watermark even if a prior partial run
-    // bumped it past `current_version`.
+    // bumped it past `snapshot_version`.
+    //
+    // The watcher's next tick will resume from `snapshot_version`,
+    // re-applying every CT row produced from snapshot-time onward. The
+    // overlap with the snapshot itself is harmless (idempotent UPSERT
+    // / DELETE — see the comment above the version capture).
     sqlx::query(
         "UPDATE legacy_ct_state \
             SET last_seen_version = $1, \
                 last_polled_at    = now() \
           WHERE id = 1",
     )
-    .bind(current_version)
+    .bind(snapshot_version)
     .execute(&pg)
     .await?;
     tracing::info!(
-        watermark = current_version,
+        watermark = snapshot_version,
         "[bootstrap] CT watermark stamped — bootstrap complete. \
          Operator may now flip LEGACY_SYNC_ENABLED=true."
     );
@@ -520,6 +576,23 @@ async fn read_change_tracking_current_version(
     })?;
     let v: Option<i64> = row.get("v");
     Ok(v.unwrap_or(0))
+}
+
+/// Operator-facing refusal message for the N1 live-bootstrap guard.
+/// Pulled into a helper so the unit test in `mod tests` can pin the
+/// wording (operators triage by message text in Slack alerts and
+/// docs/runbook-sync.md cross-references it).
+fn build_live_bootstrap_refusal_message() -> &'static str {
+    "LEGACY_SYNC_ENABLED=true and --bootstrap was requested, but \
+     LEGACY_SYNC_ALLOW_LIVE_BOOTSTRAP != true — refusing to bootstrap. \
+     The bootstrap snapshot runs `DELETE FROM legacy_mirror.<table>` \
+     before re-inserting `mirror_source='reconcile'` rows, which races \
+     the live CT watcher's `mirror_source='ct'` UPSERTs and can clobber \
+     real-time changes that landed during the snapshot window. \
+     Stop the watcher first (set LEGACY_SYNC_ENABLED=false and redeploy), \
+     then run --bootstrap, then re-enable. \
+     Set LEGACY_SYNC_ALLOW_LIVE_BOOTSTRAP=true ONLY if you accept the \
+     race window. See docs/runbook-sync.md."
 }
 
 fn parse_allowlist(raw: Option<String>) -> Option<HashSet<String>> {
@@ -1640,6 +1713,43 @@ mod tests {
             mssql_session_src.contains("SET CONTEXT_INFO 0x4E48"),
             "mssql_session::set_context_info must issue 0x4E48 \
              so the watcher's CHANGETABLE filter can match it"
+        );
+    }
+
+    /// Audit finding N1 (Phase 5.5 codebase audit, 2026-04-29) — pin
+    /// the live-bootstrap refusal message so operators triaging Slack
+    /// alerts and following docs/runbook-sync.md can rely on the
+    /// wording. The runbook cross-references the env var name; if the
+    /// message drifts, the operator playbook silently rots.
+    #[test]
+    fn live_bootstrap_refusal_names_the_override_env_var() {
+        let msg = build_live_bootstrap_refusal_message();
+        assert!(
+            msg.contains("LEGACY_SYNC_ENABLED=true"),
+            "refusal must explain the live-deployment trigger"
+        );
+        assert!(
+            msg.contains("LEGACY_SYNC_ALLOW_LIVE_BOOTSTRAP"),
+            "refusal must name the override env var so operators can find it"
+        );
+        assert!(
+            msg.contains("--bootstrap"),
+            "refusal must reference the operator action being refused"
+        );
+        assert!(
+            msg.contains("docs/runbook-sync.md"),
+            "refusal must point at the runbook for full procedure"
+        );
+    }
+
+    /// The refusal must explain WHY (race window) so operators don't
+    /// just slap the override on without understanding the risk.
+    #[test]
+    fn live_bootstrap_refusal_explains_the_race() {
+        let msg = build_live_bootstrap_refusal_message();
+        assert!(
+            msg.contains("DELETE") && msg.contains("clobber"),
+            "refusal must explain the snapshot-DELETE-vs-CT-UPSERT race"
         );
     }
 }

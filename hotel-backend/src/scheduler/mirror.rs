@@ -118,10 +118,15 @@ async fn reload_continuetime(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<(
             skipped += 1;
             continue;
         };
-        let con_name: Option<&str> = r.get(1);
-        let con_minute: Option<i32> = r.get(2);
-        let con_price: Option<f64> = r.get(3);
-        let con_type: Option<&str> = r.get(4);
+        // Audit finding N5 — defense-in-depth: `try_get` returns
+        // `Result<Option<T>>` so a type mismatch becomes `None` instead
+        // of crashing the whole reload. The schema-fingerprint guard
+        // upstream catches most drift; this is the belt to that
+        // suspenders.
+        let con_name: Option<&str> = r.try_get(1).ok().flatten();
+        let con_minute: Option<i32> = r.try_get(2).ok().flatten();
+        let con_price: Option<f64> = r.try_get(3).ok().flatten();
+        let con_type: Option<&str> = r.try_get(4).ok().flatten();
         sqlx::query(
             "INSERT INTO legacy_mirror.ht_continuetime \
                 (id, con_name, con_minute, con_price, con_type, mirror_source) \
@@ -168,11 +173,12 @@ async fn reload_rooms_price(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<()
             skipped += 1;
             continue;
         };
-        let room_type: Option<&str> = r.get(1);
-        let room_custtype: Option<&str> = r.get(2);
-        let room_price: Option<f64> = r.get(3);
-        let room_price_h: Option<f64> = r.get(4);
-        let room_price_m: Option<f64> = r.get(5);
+        // Audit finding N5 — see snapshot_cupon comment on try_get.
+        let room_type: Option<&str> = r.try_get(1).ok().flatten();
+        let room_custtype: Option<&str> = r.try_get(2).ok().flatten();
+        let room_price: Option<f64> = r.try_get(3).ok().flatten();
+        let room_price_h: Option<f64> = r.try_get(4).ok().flatten();
+        let room_price_m: Option<f64> = r.try_get(5).ok().flatten();
         sqlx::query(
             "INSERT INTO legacy_mirror.ht_rooms_price \
                 (id, room_type, room_custtype, room_price, room_price_h, room_price_m, mirror_source) \
@@ -245,9 +251,10 @@ async fn reload_order_table(
             skipped += 1;
             continue;
         };
-        let cust_type: Option<&str> = r.get(1);
-        let cust_month: Option<i32> = r.get(2);
-        let cast_type: Option<&str> = r.get(3);
+        // Audit finding N5 — see snapshot_cupon comment on try_get.
+        let cust_type: Option<&str> = r.try_get(1).ok().flatten();
+        let cust_month: Option<i32> = r.try_get(2).ok().flatten();
+        let cast_type: Option<&str> = r.try_get(3).ok().flatten();
         sqlx::query(&insert_sql)
             .bind(id)
             .bind(cust_type)
@@ -303,12 +310,12 @@ async fn snapshot_cupon(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<(), An
              VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, 0), 'reconcile')",
         )
         .bind(cupon_no)
-        .bind(r.get::<&str, _>(1))
-        .bind(r.get::<&str, _>(2))
-        .bind(r.get::<chrono::NaiveDateTime, _>(3))
-        .bind(r.get::<chrono::NaiveDateTime, _>(4))
-        .bind(r.get::<&str, _>(5))
-        .bind(r.get::<i32, _>(6))
+        .bind(r.try_get::<&str, _>(1).ok().flatten())
+        .bind(r.try_get::<&str, _>(2).ok().flatten())
+        .bind(r.try_get::<chrono::NaiveDateTime, _>(3).ok().flatten())
+        .bind(r.try_get::<chrono::NaiveDateTime, _>(4).ok().flatten())
+        .bind(r.try_get::<&str, _>(5).ok().flatten())
+        .bind(r.try_get::<i32, _>(6).ok().flatten())
         .execute(&mut *tx)
         .await?;
         inserted += 1;
@@ -354,17 +361,17 @@ async fn snapshot_checkin_product(legacy_pool: &DbPool, pg_pool: &PgPool) -> Res
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'reconcile')",
         )
         .bind(id)
-        .bind(r.get::<&str, _>(1))
-        .bind(r.get::<&str, _>(2))
-        .bind(r.get::<chrono::NaiveDateTime, _>(3))
-        .bind(r.get::<&str, _>(4))
-        .bind(r.get::<&str, _>(5))
-        .bind(r.get::<&str, _>(6))
-        .bind(r.get::<f64, _>(7))
-        .bind(r.get::<f64, _>(8))
-        .bind(r.get::<f64, _>(9))
-        .bind(r.get::<f64, _>(10))
-        .bind(r.get::<&str, _>(11))
+        .bind(r.try_get::<&str, _>(1).ok().flatten())
+        .bind(r.try_get::<&str, _>(2).ok().flatten())
+        .bind(r.try_get::<chrono::NaiveDateTime, _>(3).ok().flatten())
+        .bind(r.try_get::<&str, _>(4).ok().flatten())
+        .bind(r.try_get::<&str, _>(5).ok().flatten())
+        .bind(r.try_get::<&str, _>(6).ok().flatten())
+        .bind(r.try_get::<f64, _>(7).ok().flatten())
+        .bind(r.try_get::<f64, _>(8).ok().flatten())
+        .bind(r.try_get::<f64, _>(9).ok().flatten())
+        .bind(r.try_get::<f64, _>(10).ok().flatten())
+        .bind(r.try_get::<&str, _>(11).ok().flatten())
         .execute(&mut *tx)
         .await?;
         inserted += 1;
@@ -408,13 +415,13 @@ async fn snapshot_deposit(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<(), 
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'reconcile')",
         )
         .bind(id)
-        .bind(r.get::<&str, _>(1))
-        .bind(r.get::<chrono::NaiveDateTime, _>(2))
-        .bind(r.get::<&str, _>(3))
-        .bind(r.get::<&str, _>(4))
-        .bind(r.get::<f64, _>(5))
-        .bind(r.get::<&str, _>(6))
-        .bind(r.get::<&str, _>(7))
+        .bind(r.try_get::<&str, _>(1).ok().flatten())
+        .bind(r.try_get::<chrono::NaiveDateTime, _>(2).ok().flatten())
+        .bind(r.try_get::<&str, _>(3).ok().flatten())
+        .bind(r.try_get::<&str, _>(4).ok().flatten())
+        .bind(r.try_get::<f64, _>(5).ok().flatten())
+        .bind(r.try_get::<&str, _>(6).ok().flatten())
+        .bind(r.try_get::<&str, _>(7).ok().flatten())
         .execute(&mut *tx)
         .await?;
         inserted += 1;
@@ -466,12 +473,12 @@ async fn snapshot_changed_room(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result
         )
         .bind(id)
         .bind(cin_no)
-        .bind(r.get::<&str, _>(2))
-        .bind(r.get::<&str, _>(3))
-        .bind(r.get::<chrono::NaiveDateTime, _>(4))
-        .bind(r.get::<f64, _>(5))
-        .bind(r.get::<&str, _>(6))
-        .bind(r.get::<&str, _>(7))
+        .bind(r.try_get::<&str, _>(2).ok().flatten())
+        .bind(r.try_get::<&str, _>(3).ok().flatten())
+        .bind(r.try_get::<chrono::NaiveDateTime, _>(4).ok().flatten())
+        .bind(r.try_get::<f64, _>(5).ok().flatten())
+        .bind(r.try_get::<&str, _>(6).ok().flatten())
+        .bind(r.try_get::<&str, _>(7).ok().flatten())
         .execute(&mut *tx)
         .await?;
         inserted += 1;
@@ -523,23 +530,23 @@ async fn snapshot_bill_debt_h(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<
                      $13, $14, $15, $16, $17, $18, 'reconcile')",
         )
         .bind(bill_no)
-        .bind(r.get::<&str, _>(1))
-        .bind(r.get::<&str, _>(2))
-        .bind(r.get::<&str, _>(3))
-        .bind(r.get::<&str, _>(4))
-        .bind(r.get::<&str, _>(5))
-        .bind(r.get::<chrono::NaiveDateTime, _>(6))
-        .bind(r.get::<&str, _>(7))
-        .bind(r.get::<&str, _>(8))
-        .bind(r.get::<&str, _>(9))
-        .bind(r.get::<f64, _>(10))
-        .bind(r.get::<f64, _>(11))
-        .bind(r.get::<f64, _>(12))
-        .bind(r.get::<f64, _>(13))
-        .bind(r.get::<f64, _>(14))
-        .bind(r.get::<&str, _>(15))
-        .bind(r.get::<&str, _>(16))
-        .bind(r.get::<&str, _>(17))
+        .bind(r.try_get::<&str, _>(1).ok().flatten())
+        .bind(r.try_get::<&str, _>(2).ok().flatten())
+        .bind(r.try_get::<&str, _>(3).ok().flatten())
+        .bind(r.try_get::<&str, _>(4).ok().flatten())
+        .bind(r.try_get::<&str, _>(5).ok().flatten())
+        .bind(r.try_get::<chrono::NaiveDateTime, _>(6).ok().flatten())
+        .bind(r.try_get::<&str, _>(7).ok().flatten())
+        .bind(r.try_get::<&str, _>(8).ok().flatten())
+        .bind(r.try_get::<&str, _>(9).ok().flatten())
+        .bind(r.try_get::<f64, _>(10).ok().flatten())
+        .bind(r.try_get::<f64, _>(11).ok().flatten())
+        .bind(r.try_get::<f64, _>(12).ok().flatten())
+        .bind(r.try_get::<f64, _>(13).ok().flatten())
+        .bind(r.try_get::<f64, _>(14).ok().flatten())
+        .bind(r.try_get::<&str, _>(15).ok().flatten())
+        .bind(r.try_get::<&str, _>(16).ok().flatten())
+        .bind(r.try_get::<&str, _>(17).ok().flatten())
         .execute(&mut *tx)
         .await?;
         inserted += 1;
@@ -570,10 +577,21 @@ async fn snapshot_bill_debt_ds(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result
         .execute(&mut *tx)
         .await?;
 
-    let (mut inserted, mut skipped) = (0i64, 0i64);
+    let (mut inserted, mut skipped_null_pk, mut skipped_null_bill_no) = (0i64, 0i64, 0i64);
     for r in &rows {
         let Some(id): Option<i32> = r.get(0) else {
-            skipped += 1;
+            skipped_null_pk += 1;
+            continue;
+        };
+        // Audit finding N7 (Phase 5.5 codebase audit, 2026-04-29) —
+        // skip rows with NULL bill_no. `bill_no` is the FK to
+        // HT_Bill_Debt_H (the actual PK is `id` identity). Downstream
+        // queries always filter by bill_no, so a row with NULL bill_no
+        // is invisible to consumers — inserting it is wasted storage
+        // and a foot-gun. Empty table at HF Hotel today; no migration
+        // needed.
+        let Some(bill_no): Option<&str> = r.try_get(1).ok().flatten() else {
+            skipped_null_bill_no += 1;
             continue;
         };
         sqlx::query(
@@ -583,14 +601,14 @@ async fn snapshot_bill_debt_ds(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'reconcile')",
         )
         .bind(id)
-        .bind(r.get::<&str, _>(1))
-        .bind(r.get::<i32, _>(2))
-        .bind(r.get::<&str, _>(3))
-        .bind(r.get::<&str, _>(4))
-        .bind(r.get::<&str, _>(5))
-        .bind(r.get::<f64, _>(6))
-        .bind(r.get::<f64, _>(7))
-        .bind(r.get::<f64, _>(8))
+        .bind(bill_no)
+        .bind(r.try_get::<i32, _>(2).ok().flatten())
+        .bind(r.try_get::<&str, _>(3).ok().flatten())
+        .bind(r.try_get::<&str, _>(4).ok().flatten())
+        .bind(r.try_get::<&str, _>(5).ok().flatten())
+        .bind(r.try_get::<f64, _>(6).ok().flatten())
+        .bind(r.try_get::<f64, _>(7).ok().flatten())
+        .bind(r.try_get::<f64, _>(8).ok().flatten())
         .execute(&mut *tx)
         .await?;
         inserted += 1;
@@ -599,7 +617,8 @@ async fn snapshot_bill_debt_ds(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result
     tracing::info!(
         table = "HT_Bill_Debt_Ds",
         inserted,
-        skipped_null_pk = skipped,
+        skipped_null_pk,
+        skipped_null_bill_no,
         "[Mirror] snapshot complete"
     );
     Ok(())
