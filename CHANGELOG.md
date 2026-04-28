@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.53.0] - 2026-04-29
+
+### Added
+
+- **Phase 5.5e — `LegacyMirrorPanels` UI component** + integration on
+  the billing/folio detail page (`app/billing/[id]/page.tsx`). Three
+  read-only panels render below the printable invoice (hidden in
+  print via `no-print`):
+  - **Coupons attached** (food / breakfast vouchers from `HT_Cupon`)
+  - **Minibar / in-stay POS charges** (from `HT_CheckIn_Product`)
+  - **Mid-stay room moves** (from `HT_Changed_Room`)
+
+  Each panel has its own loading/empty/error states so unused
+  features at this site (e.g. minibar table is empty at HF Hotel)
+  show meaningfully ("ไม่มีข้อมูล") instead of breaking the layout.
+  An amber "จากระบบเดิม / view-only" badge on every panel header
+  makes the legacy provenance clear at a glance.
+
+  Each panel calls one `/api/legacy-mirror/*` endpoint with the
+  legacy `cinNo` from the loaded invoice. `InvoiceData` type
+  extended with optional `cinNo` field; pages that don't populate
+  it just don't render the panels.
+
+  Phase 5.5 user-visible payoff: receptionists no longer need to
+  switch to the .NET app to check coupon / minibar / room-move
+  history for a check-in.
+
 ## [2.52.0] - 2026-04-29
 
 ### Added

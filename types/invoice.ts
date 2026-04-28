@@ -12,6 +12,11 @@ export interface InvoiceRoom {
 
 export interface InvoiceData {
   invoiceNumber: string;
+  /** Legacy check-in number (e.g. "CH26-005258"). Used by the
+   *  legacy_mirror panels to fetch coupons/minibar/room-changes
+   *  attached to this stay. Optional — pages that don't have it
+   *  set just won't render the panels. */
+  cinNo?: string;
   checkInId: number;
   guestName: string;
   guestIdCard: string;
