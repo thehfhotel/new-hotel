@@ -981,5 +981,170 @@ VALUES ('019', '019_ht_reconcile_log.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================
+-- Migration 020: legacy_mirror schema (Phase 5.5a)
+--
+-- Opaque pass-through mirror of 11 legacy-only tables. See
+-- migrations/pg/020_legacy_mirror_schema.sql for the full rationale.
+-- =============================================================================
+
+CREATE SCHEMA IF NOT EXISTS legacy_mirror;
+
+CREATE TABLE IF NOT EXISTS legacy_mirror.ht_cupon (
+    cupon_no       INTEGER          PRIMARY KEY,
+    cupon_cin_no   TEXT,
+    cupon_cin_room TEXT,
+    cupon_date     TIMESTAMP,
+    cupon_gen_date TIMESTAMP,
+    cupon_by       TEXT,
+    cupon_print    INTEGER          NOT NULL DEFAULT 0,
+    mirrored_at    TIMESTAMPTZ      NOT NULL DEFAULT now(),
+    mirror_source  TEXT             NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ht_cupon_cin_no_idx
+    ON legacy_mirror.ht_cupon (cupon_cin_no);
+
+CREATE TABLE IF NOT EXISTS legacy_mirror.ht_checkin_product (
+    id                  INTEGER          PRIMARY KEY,
+    cin_no              TEXT,
+    cin_room_no         TEXT,
+    cin_ds_date         TIMESTAMP,
+    cin_pro_id          TEXT,
+    cin_pro_name        TEXT,
+    cin_pro_unit        TEXT,
+    cin_pro_num         DOUBLE PRECISION,
+    cin_pro_price       DOUBLE PRECISION,
+    cin_pro_pricetotal  DOUBLE PRECISION,
+    cin_pro_pay         DOUBLE PRECISION,
+    cin_pro_note        TEXT,
+    mirrored_at         TIMESTAMPTZ      NOT NULL DEFAULT now(),
+    mirror_source       TEXT             NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ht_checkin_product_cin_no_idx
+    ON legacy_mirror.ht_checkin_product (cin_no);
+
+CREATE TABLE IF NOT EXISTS legacy_mirror.ht_deposit (
+    id            INTEGER          PRIMARY KEY,
+    dep_no        TEXT,
+    dep_date      TIMESTAMP,
+    dep_room      TEXT,
+    dep_name      TEXT,
+    dep_price     DOUBLE PRECISION,
+    dep_status    TEXT,
+    dep_ref       TEXT,
+    mirrored_at   TIMESTAMPTZ      NOT NULL DEFAULT now(),
+    mirror_source TEXT             NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS legacy_mirror.ht_continuetime (
+    id            INTEGER          PRIMARY KEY,
+    con_name      TEXT,
+    con_minute    INTEGER,
+    con_price     DOUBLE PRECISION,
+    con_type      TEXT,
+    mirrored_at   TIMESTAMPTZ      NOT NULL DEFAULT now(),
+    mirror_source TEXT             NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS legacy_mirror.ht_changed_room (
+    id                INTEGER          PRIMARY KEY,
+    cin_no            TEXT             NOT NULL,
+    room_before       TEXT,
+    room_after        TEXT,
+    change_date       TIMESTAMP,
+    room_before_price DOUBLE PRECISION NOT NULL DEFAULT 0,
+    note              TEXT,
+    toprice           TEXT,
+    mirrored_at       TIMESTAMPTZ      NOT NULL DEFAULT now(),
+    mirror_source     TEXT             NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ht_changed_room_cin_no_idx
+    ON legacy_mirror.ht_changed_room (cin_no);
+
+CREATE TABLE IF NOT EXISTS legacy_mirror.ht_rooms_cancel (
+    id            INTEGER          PRIMARY KEY,
+    room_no       TEXT,
+    cin_no        TEXT,
+    cancel_date   TIMESTAMP,
+    cancel_by     TEXT,
+    cancel_note   TEXT,
+    mirrored_at   TIMESTAMPTZ      NOT NULL DEFAULT now(),
+    mirror_source TEXT             NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ht_rooms_cancel_cin_no_idx
+    ON legacy_mirror.ht_rooms_cancel (cin_no);
+
+CREATE TABLE IF NOT EXISTS legacy_mirror.ht_rooms_price (
+    id              INTEGER          PRIMARY KEY,
+    room_type       TEXT,
+    room_custtype   TEXT,
+    room_price      DOUBLE PRECISION,
+    room_price_h    DOUBLE PRECISION,
+    room_price_m    DOUBLE PRECISION,
+    mirrored_at     TIMESTAMPTZ      NOT NULL DEFAULT now(),
+    mirror_source   TEXT             NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS legacy_mirror.ht_bill_debt_h (
+    bill_no            TEXT             PRIMARY KEY,
+    bill_cust_id       TEXT,
+    bill_cust_name     TEXT,
+    bill_cust_address  TEXT,
+    bill_cust_tel      TEXT,
+    bill_cust_fax      TEXT,
+    bill_date          TIMESTAMP,
+    bill_ref           TEXT,
+    bill_price_type    TEXT,
+    bill_type          TEXT,
+    bill_total         DOUBLE PRECISION,
+    bill_pay           DOUBLE PRECISION,
+    bill_debt          DOUBLE PRECISION,
+    bill_pay_cash      DOUBLE PRECISION,
+    bill_pay_credit    DOUBLE PRECISION,
+    bill_status        TEXT,
+    bill_by            TEXT,
+    bill_note          TEXT,
+    mirrored_at        TIMESTAMPTZ      NOT NULL DEFAULT now(),
+    mirror_source      TEXT             NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS legacy_mirror.ht_bill_debt_ds (
+    id              INTEGER          PRIMARY KEY,
+    bill_no         TEXT,
+    ds_id           INTEGER,
+    ds_no           TEXT,
+    ds_name         TEXT,
+    ds_unit         TEXT,
+    ds_num          DOUBLE PRECISION,
+    ds_price        DOUBLE PRECISION,
+    ds_price_total  DOUBLE PRECISION,
+    mirrored_at     TIMESTAMPTZ      NOT NULL DEFAULT now(),
+    mirror_source   TEXT             NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ht_bill_debt_ds_bill_no_idx
+    ON legacy_mirror.ht_bill_debt_ds (bill_no);
+
+CREATE TABLE IF NOT EXISTS legacy_mirror.ht_order_up (
+    id            INTEGER          PRIMARY KEY,
+    cust_type     TEXT,
+    cust_month    INTEGER,
+    cast_type     TEXT,
+    mirrored_at   TIMESTAMPTZ      NOT NULL DEFAULT now(),
+    mirror_source TEXT             NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS legacy_mirror.ht_order_down (
+    id            INTEGER          PRIMARY KEY,
+    cust_type     TEXT,
+    cust_month    INTEGER,
+    cast_type     TEXT,
+    mirrored_at   TIMESTAMPTZ      NOT NULL DEFAULT now(),
+    mirror_source TEXT             NOT NULL
+);
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('020', '020_legacy_mirror_schema.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
 -- Initialization complete
 -- =============================================================================
