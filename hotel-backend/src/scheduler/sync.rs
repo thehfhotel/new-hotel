@@ -106,6 +106,13 @@ pub async fn run_sync(legacy_pool: &DbPool, pg_pool: &PgPool) {
         record_error(pg_pool, "checkins", &e.to_string()).await;
     }
 
+    // Phase 5.5a: full-table reload of legacy-only dimension tables into
+    // legacy_mirror.*. Independent of the canonical reconcile above —
+    // these tables are slow-changing reference data (pricing tiers,
+    // hourly extension prices), reloaded in their own TX, and don't
+    // interact with ReconcileMode (always full-reload).
+    crate::scheduler::mirror::reload_mirror_dimensions(legacy_pool, pg_pool).await;
+
     tracing::info!("[Sync] Sync cycle complete");
 }
 

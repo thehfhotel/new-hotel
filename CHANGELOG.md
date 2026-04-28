@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.50.0] - 2026-04-28
+
+### Added
+
+- **Phase 5.5a — `legacy_mirror.*` schema for opaque pass-through of
+  legacy-only features.** New PG schema with 11 mirror tables for the
+  legacy-only features per `docs/architecture.md` §11: `ht_cupon`
+  (food/breakfast vouchers), `ht_checkin_product` (in-stay POS /
+  minibar), `ht_deposit` (standalone deposit ledger), `ht_continuetime`
+  (hourly extension price master), `ht_changed_room` (mid-stay room-
+  move audit), `ht_rooms_cancel` (per-room cancel audit),
+  `ht_rooms_price` (per-customer-type room price overrides),
+  `ht_bill_debt_h` + `ht_bill_debt_ds` (credit-sales ledger),
+  `ht_order_up` + `ht_order_down` (per-customer-type pricing tiers).
+  Each mirror table uses the legacy natural key as PK plus two
+  bookkeeping columns: `mirrored_at TIMESTAMPTZ` (last write) and
+  `mirror_source TEXT` (`'reconcile'` or `'ct'`). On decommission the
+  schema is dropped wholesale.
+- **Phase 5.5a — full-table reload of 4 dimension mirror tables in
+  `scheduler::sync`.** `HT_ContinueTime`, `HT_Rooms_Price`,
+  `HT_Order_Up`, `HT_Order_Down` are slow-changing reference data
+  (max ~32 rows per table at HF Hotel) — reloaded via DELETE+INSERT
+  in one PG TX per table on the existing reconcile cadence. No CT
+  enablement needed on the legacy DB. Lays the foundation for the
+  CT-mapper work in Phase 5.5c which will populate the 6 transactional
+  mirror tables incrementally.
+
 ## [2.49.4] - 2026-04-28
 
 ### Added
