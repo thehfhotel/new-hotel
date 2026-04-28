@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.49.4] - 2026-04-28
+
+### Added
+
+- **Phase 5 sync — startup-time CT-retention overflow guardrail.**
+  After the 2-day shadow-mode soak we discovered a foreseeable trap:
+  shadow mode rolls back the PG transaction every tick, which freezes
+  `legacy_ct_state.last_seen_version`. Meanwhile SQL Server's CT
+  garbage collector keeps running, and once `MIN_VALID_VERSION`
+  marches past our frozen watermark on any tracked table the row
+  history we'd need to catch up incrementally is gone. Per-table
+  observability counters (`bump_skipped` writes outside the TX) hide
+  this — the dashboard stays green right up until everything goes red
+  at once. The watcher now runs `check_retention()` against every
+  CT-tracked table at startup and refuses to start (parallel to the
+  existing cold-replay refusal) if any table has overflowed. Operator
+  must run `bin/sync --bootstrap` to recover. Override available via
+  `LEGACY_SYNC_ALLOW_OVERFLOW=true` (data-loss escape hatch — never
+  in production). Documented in `docs/runbook-sync.md` §4b with the
+  full recovery sequence and prevention guidance.
+
 ## [2.49.3] - 2026-04-27
 
 ### Fixed
