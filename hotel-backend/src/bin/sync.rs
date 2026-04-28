@@ -259,6 +259,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Err(msg.into());
     }
 
+    // Retention-overflow refusal. If the watermark is older than the CT
+    // MIN_VALID_VERSION on ANY tracked table, the row history we'd need
+    // to catch up has aged out — incremental replay would silently miss
+    // changes since the watermark. Canonical scenario is the
+    // shadow-mode 2-day trap (watermark frozen by TX rollback while
+    // MIN_VALID_VERSION marches forward), but a long worker outage
+    // hits the same wall. Force the operator to --bootstrap.
+    let allow_overflow = env::var("LEGACY_SYNC_ALLOW_OVERFLOW")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    let allowed_tables: Vec<&'static str> = CT_ENABLED_TABLES
+        .iter()
+        .filter(|t| {
+            allowlist
+                .as_ref()
+                .map(|a| a.contains(**t))
+                .unwrap_or(true)
+        })
+        .copied()
+        .collect();
+    let mut overflowed: Vec<String> = Vec::new();
+    for table in &allowed_tables {
+        match check_retention(&mssql, table, current_watermark).await {
+            Ok(()) => {}
+            Err(err) if err.contains("retention overflow") => {
+                overflowed.push(format!("{table}: {err}"));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    table,
+                    error = %err,
+                    "Pre-flight retention probe failed; treating as transient"
+                );
+            }
+        }
+    }
+    if !overflowed.is_empty() && !allow_overflow {
+        let msg = format!(
+            "CT retention overflow on {} table(s) — refusing to start.\n  \
+             Affected:\n    - {}\n  \
+             The CT row history we need has aged out. Common cause: \
+             shadow-mode soak >= MSSQL CT retention (default 2 days) — \
+             watermark gets rolled back every tick while \
+             MIN_VALID_VERSION marches forward. Long worker outage hits \
+             the same wall.\n  \
+             Recover with `bin/sync --bootstrap` to re-snapshot \
+             canonical PG and reset the watermark to the current SQL \
+             Server CT version. After bootstrap, restart this binary.\n  \
+             Set LEGACY_SYNC_ALLOW_OVERFLOW=true ONLY if you accept \
+             that incremental rows since the watermark are silently \
+             skipped (data loss). See docs/runbook-sync.md.",
+            overflowed.len(),
+            overflowed.join("\n    - "),
+        );
+        tracing::error!("{msg}");
+        if let Some(s) = &slack {
+            let payload = SlackMessage::with_text(format!(
+                ":no_entry: *CT watcher REFUSED TO START — retention overflow* :no_entry:\n{msg}"
+            ));
+            let _ = s.send_message(&payload).await;
+        }
+        // Sleep before exit so Docker `restart: unless-stopped` doesn't
+        // turn this into a tight loop + alert flood.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        return Err(msg.into());
+    }
+
     let mappers = build_mappers(&allowlist);
     tracing::info!(
         count = mappers.len(),

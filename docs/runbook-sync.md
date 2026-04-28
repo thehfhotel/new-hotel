@@ -60,6 +60,7 @@ Every variable consumed by `bin/sync`. Defaults are what
 | `LEGACY_SYNC_SHADOW_MODE` | `true` = run mappers, log "would publish", roll back PG TX (canonical state untouched). | `true` | Flip to `false` after 24h shadow-mode soak shows zero mapper errors. |
 | `LEGACY_SYNC_TABLE_ALLOWLIST` | Comma-separated CT-enabled table names. Empty = all 10 tables. | `` (all) | Set during incremental rollout (e.g. `HT_Customers,HT_Rooms` first). |
 | `LEGACY_SYNC_ALLOW_COLD_REPLAY` | `true` = allow start with `last_seen_version=0` (replay all CT history). | `false` | NEVER in production. Test-only escape hatch — bootstrap is the supported path. |
+| `LEGACY_SYNC_ALLOW_OVERFLOW` | `true` = start even when the watermark is already past CT retention on one or more tables (incremental rows since the watermark are silently skipped — DATA LOSS). | `false` | NEVER in production. Bootstrap is the supported path. See Section 4b for the shadow-mode trap that makes overflow a foreseeable scenario. |
 | `LEGACY_SYNC_RECONCILE_MODE` | Mode for the demoted `scheduler::sync::run_sync` job. `diff_only` = log drift to `ht_reconcile_log`; `upsert` = legacy 5-min-style UPSERT into `ht_*_legacy`. | `diff_only` | Flip to `upsert` ONLY if the CT watcher is operationally disabled and you need the legacy safety net to keep canonical state in sync. |
 | `CT_POLL_INTERVAL_MS` | How often the watcher polls MSSQL CT. Lower = lower latency, higher load. | `1000` (1s) | Increase only if MSSQL load is a concern. |
 | `SYNC_TEST_SKIP_MSSQL_PROBE` | Test-only. `true` = skip the bb8-tiberius probe in `tests/test_sync_phase54_integration.rs::mssql_stub`. | unset | Set when running pure-PG tests without legacy MSSQL access (saves 30s per process). |
@@ -79,6 +80,7 @@ prefixed so they're triagable in one glance.
 |---|---|---|
 | `:warning: CT watcher REFUSED TO START` (schema fingerprint) | Legacy MSSQL columns drifted from the captured baseline. The watcher refuses to project against an unknown shape. | Run `./scripts/writeback-fingerprint.sh` and follow the README to update the baseline before restarting. Same workflow as the writeback worker — fingerprint is shared. |
 | `:no_entry: CT watcher REFUSED TO START` (cold replay) | `last_seen_version=0` and `LEGACY_SYNC_ALLOW_COLD_REPLAY != true`. | Run the bootstrap procedure (Section 1). |
+| `:no_entry: CT watcher REFUSED TO START` (retention overflow) | At startup, `MIN_VALID_VERSION` is higher than the watermark on at least one CT-tracked table. CT history we'd need to catch up has aged out. The pre-flight check refuses rather than silently skipping rows. | Run the bootstrap procedure (Section 1) — `--bootstrap` re-snapshots canonical PG and stamps the watermark to `CHANGE_TRACKING_CURRENT_VERSION()`. After bootstrap, restart the watcher. See Section 4b for the shadow-mode trap that triggers this. |
 | `:rotating_light: CT retention overflow` | A specific table's `MIN_VALID_VERSION` is higher than the watermark — CT history we needed has aged out (default retention 2 days). | Re-bootstrap (Section 1). The reconcile inside `--bootstrap` will catch us up via the canonical UPSERT path. |
 | Mapper consecutive-failure threshold (future) | Per-table `legacy_sync_status.consecutive_failures` exceeds N. | Inspect `legacy_sync_status.last_error` for that table; check mapper logs for the failing CT row payload. |
 
@@ -253,6 +255,71 @@ UPDATE legacy_sync_control SET shadow_mode = true, updated_at = now() WHERE id =
 ```
 No restart needed — the next poll tick reads the new value. Use this
 if you wired the alternative remediation above.
+
+---
+
+## 4b. The shadow-mode 2-day CT-retention trap
+
+**Symptom.** After 1–2 days of shadow-mode soak, every CT-tracked
+table simultaneously starts firing `:rotating_light: CT retention
+overflow` alerts. On restart, the watcher refuses to start with
+`:no_entry: CT watcher REFUSED TO START — retention overflow`. The
+soak metrics looked perfect right up until the moment everything went
+red.
+
+**Why.** Shadow mode rolls back the PG transaction at the end of every
+tick. The watermark UPDATE on `legacy_ct_state.last_seen_version`
+lives inside that transaction, so it gets rolled back too — the
+watermark is **frozen** for the entire shadow soak. Meanwhile SQL
+Server's CT garbage collector keeps running on its own schedule
+(default retention: **2 days**), so `MIN_VALID_VERSION` marches
+forward. Once `MIN_VALID_VERSION > last_seen_version`, the row history
+we'd need to catch up incrementally is gone.
+
+The per-table `last_processed_at` counters DO update during the soak
+(`bump_skipped` writes outside the transaction for observability),
+which is why the dashboard's per-table freshness checks stay green —
+masking that the watermark itself is stale.
+
+**The startup guardrail.** As of v2.49.4 the watcher runs a pre-flight
+`check_retention()` against every CT-tracked table at boot. If any
+table has overflowed, the watcher refuses to start (parallel to the
+cold-replay guardrail) — surfacing the trap at restart time instead of
+letting it silently skip rows on the next live tick.
+
+**Recovery (this sequence is what we did on 2026-04-28):**
+
+1. Flip live first: `gh secret set LEGACY_SYNC_SHADOW_MODE -b "false"`
+   then `gh workflow run docker-build.yml`. Without this the trap will
+   re-arm in another 2 days.
+2. Wait for deploy. The new container will refuse to start with
+   `retention overflow` because the watermark is still frozen.
+3. Run bootstrap from the deploy host:
+   ```bash
+   cd /home/nut/new-hotel-production
+   docker compose --profile legacy run --rm sync ./sync --bootstrap
+   ```
+   Snapshots all 10 tables into canonical PG and stamps the watermark
+   to `CHANGE_TRACKING_CURRENT_VERSION()`.
+4. The next deploy or container restart now passes the guardrail and
+   live polling resumes from the fresh watermark.
+
+**Prevention for future shadow soaks.** Either:
+- Keep shadow soaks shorter than the legacy DB's CT retention period,
+  or
+- Increase CT retention on the legacy DB to comfortably exceed the
+  longest planned shadow soak. To check current setting:
+  ```sql
+  SELECT retention_period, retention_period_units_desc, is_auto_cleanup_on
+    FROM sys.change_tracking_databases
+   WHERE database_id = DB_ID('HotelNew');
+  ```
+  To extend (example: 7 days) — coordinate with the legacy app vendor
+  before changing:
+  ```sql
+  ALTER DATABASE HotelNew
+    SET CHANGE_TRACKING (CHANGE_RETENTION = 7 DAYS, AUTO_CLEANUP = ON);
+  ```
 
 ---
 
