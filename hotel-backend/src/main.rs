@@ -263,6 +263,13 @@ fn build_new_routes(app_state: AppState) -> Router {
         // Mode and calendar routes
         .route("/api/mode", get(routes::mode::get_mode))
         .route("/api/calendar", get(routes::calendar::get_calendar))
+        // Phase 5.5d — legacy_mirror.* read-only endpoints (coupons,
+        // minibar, room moves, pricing reference). Surfaces legacy-
+        // only features so receptionists don't switch to the .NET app.
+        .route("/api/legacy-mirror/coupons", get(routes::legacy_mirror::list_coupons))
+        .route("/api/legacy-mirror/products", get(routes::legacy_mirror::list_products))
+        .route("/api/legacy-mirror/room-changes", get(routes::legacy_mirror::list_room_changes))
+        .route("/api/legacy-mirror/pricing", get(routes::legacy_mirror::get_pricing_reference))
         // New stats
         .route("/api/new/stats", get(routes::new_stats::get_stats))
         // New customers CRUD
