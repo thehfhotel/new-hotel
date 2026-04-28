@@ -1103,31 +1103,57 @@ fn materialise_row(
     pk_cols: &[&str],
     select_sql: &str,
 ) -> hotel_backend::sync::row::test_support::HashMapRow {
+    let projection: Vec<String> = extract_projection_columns(select_sql);
+    build_materialised_row(pk_cols, &projection, |col| read_cell(row, col))
+}
+
+/// Inner pure helper extracted from [`materialise_row`] so the loop
+/// ordering — which is correctness-critical on D rows — is unit-
+/// testable without constructing a `tiberius::Row`.
+///
+/// **Loop ordering rationale.** The PK columns can appear in BOTH
+/// `pk_cols` AND the projection (e.g. mirror mappers like
+/// `CuponMirrorMapper` declare `cupon_no` as PK *and* project
+/// `t.cupon_no`). On D rows the LEFT JOIN nulls every `t.<col>`
+/// projection while CT's `pk_<col>` aliases stay populated. If the PK
+/// loop runs first and the projection loop runs second, the
+/// projection's `MockValue::Null` overwrite silently clobbers the
+/// real PK and the mapper crashes with "PK NULL — should not happen"
+/// on every D event. Running the projection FIRST and the PK loop
+/// LAST lets the PK overwrite the projection's NULL on D rows
+/// without affecting I/U semantics (where both reads agree).
+fn build_materialised_row<F>(
+    pk_cols: &[&str],
+    projection_cols: &[String],
+    mut read: F,
+) -> hotel_backend::sync::row::test_support::HashMapRow
+where
+    F: FnMut(&str) -> Option<hotel_backend::sync::row::test_support::MockValue>,
+{
     use hotel_backend::sync::row::test_support::{HashMapRow, MockValue};
 
     let mut h = HashMapRow::new("ct_row");
 
-    // PK columns: surfaced under both `pk_<name>` (the SELECT alias)
-    // and `<name>` (what the mapper looks up). For D rows the joined
-    // table column is NULL but the CT-side `pk_<name>` is populated.
-    for col in pk_cols {
-        let pk_alias = format!("pk_{col}");
-        if let Some(v) = read_cell(row, &pk_alias) {
-            h.cells.insert((*col).to_string(), v);
-        }
+    // 1. Projection columns FIRST. The mapper specified them as
+    //    `t.<col>` in select_sql; tiberius exposes them under just
+    //    `<col>` in the result row. NULL gets recorded explicitly so
+    //    the mapper sees `None` instead of "missing column".
+    for col in projection_cols {
+        match read(col) {
+            Some(v) => h.cells.insert(col.clone(), v),
+            None => h.cells.insert(col.clone(), MockValue::Null),
+        };
     }
 
-    // Projection columns: the mapper specified them as `t.<col>` in
-    // select_sql; tiberius exposes them under just `<col>` in the
-    // result row. We pull every identifier mentioned in select_sql
-    // (after a `t.`) and copy whatever value tiberius surfaces.
-    for col in extract_projection_columns(select_sql) {
-        if let Some(v) = read_cell(row, &col) {
-            h.cells.insert(col, v);
-        } else {
-            // Column was NULL — record it so the mapper sees an
-            // explicit None instead of "missing column".
-            h.cells.insert(col, MockValue::Null);
+    // 2. PK columns LAST. Surfaced under both `pk_<name>` (the SELECT
+    //    alias) and `<name>` (what the mapper looks up). For D rows
+    //    the joined table column is NULL but `pk_<name>` is
+    //    populated — running this AFTER projection lets the PK
+    //    overwrite the NULL the projection loop just wrote.
+    for col in pk_cols {
+        let pk_alias = format!("pk_{col}");
+        if let Some(v) = read(&pk_alias) {
+            h.cells.insert((*col).to_string(), v);
         }
     }
 
@@ -1510,6 +1536,75 @@ mod tests {
             "t.id, ct.SYS_CHANGE_VERSION AS v, t.Room_no",
         );
         assert_eq!(cols, vec!["id", "Room_no"]);
+    }
+
+    /// Regression: on D rows the LEFT JOIN nulls the projection's
+    /// `t.<pk>` cell while CT's `pk_<pk>` alias stays populated. The
+    /// PK loop MUST run after the projection loop so it overwrites
+    /// the projection's NULL with the real CT-side PK value;
+    /// otherwise mirror mappers (whose PK column is also projected)
+    /// crash with "PK NULL — should not happen" on every D event.
+    /// Discovered 2026-04-29 in the codebase audit; fix is the loop
+    /// reorder in `build_materialised_row`.
+    #[test]
+    fn d_row_pk_survives_null_projection_overwrite() {
+        use hotel_backend::sync::row::test_support::MockValue;
+        use std::collections::HashMap;
+
+        // Simulate the tiberius row a D event produces for HT_Cupon:
+        // pk_cupon_no is populated (CT-side authoritative PK), the
+        // projection's plain "cupon_no" alias is NULL (LEFT JOIN
+        // nulled the row), and other projected columns are NULL too.
+        let mut cells: HashMap<&'static str, MockValue> = HashMap::new();
+        cells.insert("pk_cupon_no", MockValue::I32(12345));
+        // Note: "cupon_no" (without pk_) is NOT inserted — read() returns None,
+        // which the projection loop records as MockValue::Null.
+
+        let projection: Vec<String> = vec![
+            "cupon_no".into(),
+            "cupon_cin_no".into(),
+            "cupon_cin_room".into(),
+        ];
+        let h = build_materialised_row(&["cupon_no"], &projection, |col| {
+            cells.get(col).cloned()
+        });
+
+        // Post-fix: the PK loop runs after projection and the real
+        // CT-side `12345` survives.
+        match h.cells.get("cupon_no") {
+            Some(MockValue::I32(12345)) => {}
+            other => panic!(
+                "expected cupon_no to be I32(12345) (PK from CT alias), got {other:?}"
+            ),
+        }
+        // Other projection columns stay NULL (D-row JOIN behavior).
+        assert!(matches!(h.cells.get("cupon_cin_no"), Some(MockValue::Null)));
+        assert!(matches!(h.cells.get("cupon_cin_room"), Some(MockValue::Null)));
+    }
+
+    /// I/U rows must continue to work — projection writes the actual
+    /// `t.<col>` value and the PK loop overwrites with the same value
+    /// (CT-side and table-side agree on PK on I/U).
+    #[test]
+    fn iu_row_pk_value_consistent_after_loop_swap() {
+        use hotel_backend::sync::row::test_support::MockValue;
+        use std::collections::HashMap;
+
+        let mut cells: HashMap<&'static str, MockValue> = HashMap::new();
+        cells.insert("pk_cupon_no", MockValue::I32(7777));
+        cells.insert("cupon_no", MockValue::I32(7777)); // table-side projection
+        cells.insert("cupon_cin_no", MockValue::Str("CH26-005258".into()));
+
+        let projection: Vec<String> = vec!["cupon_no".into(), "cupon_cin_no".into()];
+        let h = build_materialised_row(&["cupon_no"], &projection, |col| {
+            cells.get(col).cloned()
+        });
+
+        assert!(matches!(h.cells.get("cupon_no"), Some(MockValue::I32(7777))));
+        match h.cells.get("cupon_cin_no") {
+            Some(MockValue::Str(s)) => assert_eq!(s, "CH26-005258"),
+            other => panic!("unexpected cupon_cin_no: {other:?}"),
+        }
     }
 
     /// CHANGETABLE filter must include the SYS_CHANGE_CONTEXT clause

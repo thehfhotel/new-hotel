@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.53.1] - 2026-04-29
+
+### Fixed
+
+- **Audit finding N4 — D-row PK NULL overwrite in `materialise_row`**
+  silently broke every Delete event on the 6 legacy_mirror tables.
+  `bin/sync.rs::materialise_row` previously inserted PK columns
+  first, then ran the projection loop second; the projection loop
+  unconditionally wrote `MockValue::Null` for any cell where
+  `read_cell` returned None. On D rows the LEFT JOIN nulls every
+  `t.<col>` projection, so for any mapper whose PK column is also
+  projected (every mirror mapper — `t.cupon_no`, `t.id`, `t.Bill_No`)
+  the projection loop's NULL clobbered the real CT-side PK and
+  `apply()` crashed with "PK NULL — should not happen post Phase
+  5.5b" on every legacy delete. Canonical mappers were unaffected
+  because their `id` PK is never projected.
+  Fix: extracted the inner logic into a pure helper
+  `build_materialised_row` and reordered the loops so the projection
+  runs first and the PK loop runs last (overwriting the projection's
+  NULL on D rows). Insert/Update behaviour unchanged (CT-side and
+  table-side PK agree on I/U).
+  Latent in production since 2026-04-29 ~16:00 UTC; no observed
+  hits prior to the fix because no legacy DELETE on the 6 mirror
+  tables had fired yet (receptionists rarely delete coupons /
+  minibar / room-moves).
+
+### Added
+
+- **Regression tests for the loop-order fix** (`bin/sync.rs::tests`):
+  `d_row_pk_survives_null_projection_overwrite` and
+  `iu_row_pk_value_consistent_after_loop_swap` lock the new
+  `build_materialised_row` ordering at the unit level (no
+  `tiberius::Row` construction needed).
+- **Integration tests for `CuponMirrorMapper`** in
+  `tests/test_sync_phase55c_mirror_apply.rs` — Insert lands a row
+  with `mirror_source='ct'`; Delete on a D-shape row (PK populated,
+  every projected non-PK column NULL) removes the mirror row;
+  Delete on an already-gone row is idempotent. Other 5 mirror
+  mappers follow identical structure — backlog (test-suite-analyzer
+  P1 follow-up) but skipped here intentionally since the bug under
+  repair lives in shared `materialise_row` code.
+
 ## [2.53.0] - 2026-04-29
 
 ### Added
