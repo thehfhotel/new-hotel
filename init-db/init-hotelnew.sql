@@ -1146,5 +1146,28 @@ VALUES ('020', '020_legacy_mirror_schema.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================
+-- Migration 022: legacy_mirror sync_status seed (Phase 5.5c)
+--
+-- Add 6 rows to legacy_sync_status so the CT watcher tracks per-table
+-- observability for the legacy_mirror.* tables. See migrations/pg/022
+-- and bin/sync.rs::CT_ENABLED_TABLES for the corresponding mapper
+-- wiring.
+-- =============================================================================
+
+INSERT INTO legacy_sync_status (table_name)
+VALUES
+    ('HT_Cupon'),
+    ('HT_CheckIn_Product'),
+    ('HT_Deposit'),
+    ('HT_Changed_Room'),
+    ('HT_Bill_Debt_H'),
+    ('HT_Bill_Debt_Ds')
+ON CONFLICT (table_name) DO NOTHING;
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('022', '022_legacy_mirror_sync_status_seed.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
 -- Initialization complete
 -- =============================================================================

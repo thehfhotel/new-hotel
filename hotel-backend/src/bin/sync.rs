@@ -70,9 +70,10 @@ use hotel_backend::outbox::event::DomainEvent;
 use hotel_backend::sync::change_op::ChangeOp;
 use hotel_backend::sync::mappers::{
     apply_booking_aggregate, apply_checkin_aggregate, apply_payment_aggregate,
-    BookingDatesMapper, BookingHeaderMapper, BookingRoomsMapper, CheckInHeaderMapper,
-    CheckInRoomsMapper, CustomerMapper, PaymentMapper, ReceiptMapper, RoomMasterMapper,
-    RoomStatusMapper,
+    BillDebtDsMirrorMapper, BillDebtHMirrorMapper, BookingDatesMapper, BookingHeaderMapper,
+    BookingRoomsMapper, ChangedRoomMirrorMapper, CheckInHeaderMapper, CheckInRoomsMapper,
+    CheckinProductMirrorMapper, CuponMirrorMapper, CustomerMapper, DepositMirrorMapper,
+    PaymentMapper, ReceiptMapper, RoomMasterMapper, RoomStatusMapper,
 };
 use hotel_backend::sync::parent_loader::{load_booking_aggregate, load_checkin_aggregate};
 use hotel_backend::sync::{MssqlChangeMapper, NoopMapper};
@@ -94,10 +95,12 @@ const DEFAULT_CT_POLL_INTERVAL_MS: u64 = 1000;
 const DEFAULT_RETENTION_CHECK_INTERVAL_SECS: u64 = 300;
 
 /// All CT-enabled MSSQL tables — must stay in sync with the seed in
-/// migration 017 and `legacy_sync_status` rows. Adding a new mapper
-/// means inserting a row in 017, adding the table here, and replacing
-/// the matching `NoopMapper` entry in `build_mappers`.
+/// migrations 017 (canonical sync, 10 tables) + 022 (legacy_mirror, 6
+/// tables) and the `legacy_sync_status` rows. Adding a new mapper
+/// means inserting a row in the relevant seed migration, adding the
+/// table here, and wiring its mapper in `build_mappers`.
 const CT_ENABLED_TABLES: &[&str] = &[
+    // Phase 5 — canonical sync (10 tables, CT enabled 2026-04-25)
     "HT_Customers",
     "HT_Rooms",
     "HT_Room_Status",
@@ -108,6 +111,15 @@ const CT_ENABLED_TABLES: &[&str] = &[
     "HT_CheckIn_Ds",
     "HT_CheckIn_Pay",
     "HT_Receipt_H",
+    // Phase 5.5b — legacy_mirror.* opaque pass-through (6 tables, CT
+    // enabled 2026-04-29). HF Hotel only — Ville stays on FreeTDS
+    // hash-polling because its SS2005 has no CT support.
+    "HT_Cupon",
+    "HT_CheckIn_Product",
+    "HT_Deposit",
+    "HT_Changed_Room",
+    "HT_Bill_Debt_H",
+    "HT_Bill_Debt_Ds",
 ];
 
 #[tokio::main]
@@ -330,8 +342,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!(
         count = mappers.len(),
         watermark = current_watermark,
-        "Mappers initialised (Phase 5.4: 10-table coverage — every CT-enabled \
-         table has a real mapper or an intentional retired stub)"
+        "Mappers initialised (10 canonical sync + 6 legacy_mirror = 16 \
+         CT-enabled tables; every table has a real mapper)"
     );
 
     let shutdown = Arc::new(Notify::new());
@@ -518,8 +530,10 @@ fn parse_allowlist(raw: Option<String>) -> Option<HashSet<String>> {
 }
 
 /// Build the per-table mapper list, filtered by the allowlist. Phase
-/// 5.4 completes 10-table coverage: every CT-enabled table now has a
-/// real mapper or an intentional retired stub (`HT_Room_Status`).
+/// 5.4 finished the 10-table canonical sync (every CT-enabled table
+/// has a real mapper or an intentional retired stub `HT_Room_Status`).
+/// Phase 5.5c adds the 6 legacy_mirror.* mappers, bringing total
+/// mapper coverage to 16 tables.
 fn build_mappers(allowlist: &Option<HashSet<String>>) -> Vec<Box<dyn MssqlChangeMapper>> {
     let allowed = |t: &str| allowlist.as_ref().map(|a| a.contains(t)).unwrap_or(true);
 
@@ -540,6 +554,15 @@ fn build_mappers(allowlist: &Option<HashSet<String>>) -> Vec<Box<dyn MssqlChange
             "HT_CheckIn_Ds" => Box::new(CheckInRoomsMapper),
             "HT_CheckIn_Pay" => Box::new(PaymentMapper),
             "HT_Receipt_H" => Box::new(ReceiptMapper),
+            // Phase 5.5c — legacy_mirror.* opaque pass-through mappers.
+            // No DomainEvent emission, no aggregate coalescing — flat
+            // per-row dispatch UPSERTs into legacy_mirror.<table>.
+            "HT_Cupon" => Box::new(CuponMirrorMapper),
+            "HT_CheckIn_Product" => Box::new(CheckinProductMirrorMapper),
+            "HT_Deposit" => Box::new(DepositMirrorMapper),
+            "HT_Changed_Room" => Box::new(ChangedRoomMirrorMapper),
+            "HT_Bill_Debt_H" => Box::new(BillDebtHMirrorMapper),
+            "HT_Bill_Debt_Ds" => Box::new(BillDebtDsMirrorMapper),
             other => Box::new(NoopMapper { table_name: other }),
         };
         out.push(mapper);
@@ -1311,10 +1334,14 @@ mod tests {
     }
 
     #[test]
-    fn build_mappers_no_allowlist_returns_all_ten() {
+    fn build_mappers_no_allowlist_returns_all_sixteen() {
         let mappers = build_mappers(&None);
         assert_eq!(mappers.len(), CT_ENABLED_TABLES.len());
-        assert_eq!(mappers.len(), 10, "10 CT-enabled tables expected");
+        assert_eq!(
+            mappers.len(),
+            16,
+            "16 CT-enabled tables expected (10 canonical + 6 legacy_mirror)"
+        );
     }
 
     #[test]
@@ -1426,8 +1453,9 @@ mod tests {
     }
 
     #[test]
-    fn ct_enabled_tables_match_migration_017_seed() {
+    fn ct_enabled_tables_match_migration_017_and_022_seed() {
         let expected = [
+            // Phase 5 — canonical sync (migration 017)
             "HT_Customers",
             "HT_Rooms",
             "HT_Room_Status",
@@ -1438,6 +1466,13 @@ mod tests {
             "HT_CheckIn_Ds",
             "HT_CheckIn_Pay",
             "HT_Receipt_H",
+            // Phase 5.5b — legacy_mirror.* (migration 022)
+            "HT_Cupon",
+            "HT_CheckIn_Product",
+            "HT_Deposit",
+            "HT_Changed_Room",
+            "HT_Bill_Debt_H",
+            "HT_Bill_Debt_Ds",
         ];
         assert_eq!(CT_ENABLED_TABLES, &expected);
     }

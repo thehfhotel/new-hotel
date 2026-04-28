@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.51.0] - 2026-04-29
+
+### Added
+
+- **Phase 5.5c — CT mappers for the 6 transactional `legacy_mirror.*`
+  tables.** New `hotel_backend::sync::mappers::mirror` module ships
+  six per-table `MssqlChangeMapper` impls (`CuponMirrorMapper`,
+  `CheckinProductMirrorMapper`, `DepositMirrorMapper`,
+  `ChangedRoomMirrorMapper`, `BillDebtHMirrorMapper`,
+  `BillDebtDsMirrorMapper`). Each translates a CT row from the
+  corresponding legacy table into an UPSERT (I/U) or DELETE (D) on
+  `legacy_mirror.<table>`, sets `mirror_source = 'ct'`, and returns
+  `Ok(None)` from `apply` (no `DomainEvent` emission — mirrors are
+  opaque pass-through; nothing in our app subscribes to them via the
+  bus). Flat per-row dispatch — no aggregate coalescing needed.
+- **Phase 5.5c — `bin/sync.rs` extended to 16 tables.**
+  `CT_ENABLED_TABLES` adds the 6 mirror tables; `build_mappers()`
+  wires each to its `MirrorMapper`. The watcher picks them up on
+  the next tick after deploy. PG watermark (1888) > MIN_VALID_VERSION
+  (1887) for all new tables, so the v2.49.4 startup guardrail passes
+  cleanly on deploy (no bootstrap step required for cutover).
+- **Migration 022 — seed `legacy_sync_status` for the 6 new tables**
+  so the watcher's per-tick `UPDATE legacy_sync_status WHERE
+  table_name = $1` finds rows to update and the dashboard surfaces
+  per-table observability for them.
+
+### Known limitations
+
+- **Historical pre-DDL rows are not mirrored.** CT enablement on
+  2026-04-29 means MSSQL only has CT history from version 1887
+  onward; the existing 17,894 HT_Cupon rows and 3,872
+  HT_Changed_Room rows will NOT appear in the mirror unless they're
+  touched by the .NET app post-deploy. A bootstrap-snapshot path
+  for the 6 transactional mirror tables (full DELETE+INSERT once,
+  same pattern as `scheduler::mirror::reload_mirror_dimensions`) is
+  the natural follow-up — deferred from 5.5c since the UX
+  hypothesis ("show coupons / room-moves on current/upcoming
+  check-ins") is satisfied by deltas.
+
 ## [2.50.1] - 2026-04-29
 
 ### Changed

@@ -30,6 +30,7 @@
 pub mod booking;
 pub mod checkin;
 pub mod customer;
+pub mod mirror;
 pub mod payment;
 pub mod room;
 
@@ -38,5 +39,9 @@ pub use booking::{
 };
 pub use checkin::{apply_checkin_aggregate, CheckInHeaderMapper, CheckInRoomsMapper};
 pub use customer::CustomerMapper;
+pub use mirror::{
+    BillDebtDsMirrorMapper, BillDebtHMirrorMapper, ChangedRoomMirrorMapper,
+    CheckinProductMirrorMapper, CuponMirrorMapper, DepositMirrorMapper,
+};
 pub use payment::{apply_payment_aggregate, PaymentMapper, ReceiptMapper};
 pub use room::{RoomMasterMapper, RoomStatusMapper};
