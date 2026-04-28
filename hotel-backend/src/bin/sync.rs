@@ -456,6 +456,17 @@ async fn run_bootstrap() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     }
     tracing::info!("[bootstrap] Reconcile complete");
 
+    // Phase 5.5c-b: snapshot the 6 transactional legacy_mirror tables.
+    // These are CT-tracked (5.5b) and the CT mappers (5.5c) maintain
+    // them incrementally going forward, but CT history only carries
+    // changes from MIN_VALID_VERSION onward — pre-existing rows would
+    // never appear in the mirror without this one-shot snapshot.
+    // Bootstrap-only path; the regular reconcile cycle does NOT touch
+    // these tables (would defeat the point of CT real-time mirroring).
+    tracing::info!("[bootstrap] Snapshotting legacy_mirror transactional tables…");
+    hotel_backend::scheduler::mirror::snapshot_mirror_transactional_tables(&mssql, &pg).await;
+    tracing::info!("[bootstrap] Mirror transactional snapshot complete");
+
     // Phase 2: read CHANGE_TRACKING_CURRENT_VERSION() and pin it as the
     // watermark. This is the critical step — the watcher's next tick
     // will resume from this version, picking up any CT rows produced

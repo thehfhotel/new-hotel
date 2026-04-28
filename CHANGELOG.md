@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.51.1] - 2026-04-29
+
+### Added
+
+- **Phase 5.5c-b — bootstrap-only snapshot of the 6 transactional
+  legacy_mirror tables.** New
+  `scheduler::mirror::snapshot_mirror_transactional_tables()` does a
+  one-shot DELETE+INSERT for each of `HT_Cupon` (~17,894 rows at HF
+  Hotel), `HT_CheckIn_Product`, `HT_Deposit`, `HT_Changed_Room`
+  (~3,872 rows), `HT_Bill_Debt_H`, `HT_Bill_Debt_Ds`. Wired into
+  `bin/sync --bootstrap` — runs after the canonical reconcile and
+  the dimension reload but before the watermark stamp. Closes the
+  Phase 5.5c known limitation: pre-DDL historical rows are now
+  brought into the mirror once at bootstrap, then CT mappers
+  maintain steady state from there. `mirror_source = 'reconcile'`
+  distinguishes snapshot rows from CT-incremental ('ct') rows.
+- Periodic reconcile (`run_sync` on the 5-min cron) does NOT touch
+  these tables — that would defeat the CT real-time mirror. Re-run
+  `--bootstrap` manually if drift recovery is ever needed.
+
 ## [2.51.0] - 2026-04-29
 
 ### Added

@@ -51,6 +51,52 @@ pub async fn reload_mirror_dimensions(legacy_pool: &DbPool, pg_pool: &PgPool) {
     );
 }
 
+/// **Bootstrap-only** snapshot of the 6 transactional legacy_mirror
+/// tables (HT_Cupon, HT_CheckIn_Product, HT_Deposit, HT_Changed_Room,
+/// HT_Bill_Debt_H, HT_Bill_Debt_Ds).
+///
+/// Why bootstrap-only: these tables are CT-tracked (Phase 5.5b) and
+/// the CT mappers (Phase 5.5c) handle every change that lands AFTER
+/// CT was enabled. But CT history starts from `MIN_VALID_VERSION`,
+/// which is the version when CT was enabled — pre-existing rows
+/// never appear in CT-driven updates. This function fills that gap
+/// by full-table DELETE + INSERT once during `--bootstrap`. After
+/// bootstrap, CT mappers maintain steady state.
+///
+/// `mirror_source = 'reconcile'` distinguishes these snapshot rows
+/// from `'ct'` rows the mappers stamp in incrementally.
+///
+/// Errors per-table are logged but don't abort the others — partial
+/// progress is preferable to all-or-nothing in a one-shot bootstrap.
+pub async fn snapshot_mirror_transactional_tables(legacy_pool: &DbPool, pg_pool: &PgPool) {
+    let start = Instant::now();
+    tracing::info!("[Mirror] Bootstrap snapshot of legacy_mirror transactional tables...");
+
+    if let Err(e) = snapshot_cupon(legacy_pool, pg_pool).await {
+        tracing::error!(error = %e, "[Mirror] snapshot HT_Cupon failed");
+    }
+    if let Err(e) = snapshot_checkin_product(legacy_pool, pg_pool).await {
+        tracing::error!(error = %e, "[Mirror] snapshot HT_CheckIn_Product failed");
+    }
+    if let Err(e) = snapshot_deposit(legacy_pool, pg_pool).await {
+        tracing::error!(error = %e, "[Mirror] snapshot HT_Deposit failed");
+    }
+    if let Err(e) = snapshot_changed_room(legacy_pool, pg_pool).await {
+        tracing::error!(error = %e, "[Mirror] snapshot HT_Changed_Room failed");
+    }
+    if let Err(e) = snapshot_bill_debt_h(legacy_pool, pg_pool).await {
+        tracing::error!(error = %e, "[Mirror] snapshot HT_Bill_Debt_H failed");
+    }
+    if let Err(e) = snapshot_bill_debt_ds(legacy_pool, pg_pool).await {
+        tracing::error!(error = %e, "[Mirror] snapshot HT_Bill_Debt_Ds failed");
+    }
+
+    tracing::info!(
+        duration_ms = start.elapsed().as_millis(),
+        "[Mirror] Transactional snapshot complete"
+    );
+}
+
 async fn reload_continuetime(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<(), AnyError> {
     let mut conn = legacy_pool.get().await?;
     let rows = conn
@@ -217,6 +263,344 @@ async fn reload_order_table(
         inserted,
         skipped_null_pk = skipped,
         "[Mirror] reloaded"
+    );
+    Ok(())
+}
+
+// ============================================================================
+// Phase 5.5c-b — Bootstrap-only snapshots of the 6 transactional mirror
+// tables. Same DELETE+INSERT pattern as the dimension reloads above, just
+// bigger volumes (HT_Cupon ~17k, HT_Changed_Room ~3.9k at HF Hotel as of
+// 2026-04). Other 4 tables empty at HF Hotel; snapshots no-op cleanly.
+// ============================================================================
+
+async fn snapshot_cupon(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<(), AnyError> {
+    let mut conn = legacy_pool.get().await?;
+    let rows = conn
+        .simple_query(
+            "SELECT cupon_no, cupon_cin_no, cupon_cin_room, cupon_date, \
+                    cupon_gen_date, cupon_by, cupon_print FROM HT_Cupon",
+        )
+        .await?
+        .into_first_result()
+        .await?;
+
+    let mut tx = pg_pool.begin().await?;
+    sqlx::query("DELETE FROM legacy_mirror.ht_cupon")
+        .execute(&mut *tx)
+        .await?;
+
+    let (mut inserted, mut skipped) = (0i64, 0i64);
+    for r in &rows {
+        let Some(cupon_no): Option<i32> = r.get(0) else {
+            skipped += 1;
+            continue;
+        };
+        sqlx::query(
+            "INSERT INTO legacy_mirror.ht_cupon \
+                (cupon_no, cupon_cin_no, cupon_cin_room, cupon_date, \
+                 cupon_gen_date, cupon_by, cupon_print, mirror_source) \
+             VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, 0), 'reconcile')",
+        )
+        .bind(cupon_no)
+        .bind(r.get::<&str, _>(1))
+        .bind(r.get::<&str, _>(2))
+        .bind(r.get::<chrono::NaiveDateTime, _>(3))
+        .bind(r.get::<chrono::NaiveDateTime, _>(4))
+        .bind(r.get::<&str, _>(5))
+        .bind(r.get::<i32, _>(6))
+        .execute(&mut *tx)
+        .await?;
+        inserted += 1;
+    }
+    tx.commit().await?;
+    tracing::info!(
+        table = "HT_Cupon",
+        inserted,
+        skipped_null_pk = skipped,
+        "[Mirror] snapshot complete"
+    );
+    Ok(())
+}
+
+async fn snapshot_checkin_product(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<(), AnyError> {
+    let mut conn = legacy_pool.get().await?;
+    let rows = conn
+        .simple_query(
+            "SELECT id, Cin_No, Cin_Room_no, Cin_Ds_date, Cin_Pro_id, Cin_Pro_name, \
+                    Cin_Pro_Unit, Cin_Pro_num, Cin_Pro_price, Cin_Pro_priceTotal, \
+                    Cin_Pro_pay, Cin_Pro_note FROM HT_CheckIn_Product",
+        )
+        .await?
+        .into_first_result()
+        .await?;
+
+    let mut tx = pg_pool.begin().await?;
+    sqlx::query("DELETE FROM legacy_mirror.ht_checkin_product")
+        .execute(&mut *tx)
+        .await?;
+
+    let (mut inserted, mut skipped) = (0i64, 0i64);
+    for r in &rows {
+        let Some(id): Option<i32> = r.get(0) else {
+            skipped += 1;
+            continue;
+        };
+        sqlx::query(
+            "INSERT INTO legacy_mirror.ht_checkin_product \
+                (id, cin_no, cin_room_no, cin_ds_date, cin_pro_id, cin_pro_name, \
+                 cin_pro_unit, cin_pro_num, cin_pro_price, cin_pro_pricetotal, \
+                 cin_pro_pay, cin_pro_note, mirror_source) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'reconcile')",
+        )
+        .bind(id)
+        .bind(r.get::<&str, _>(1))
+        .bind(r.get::<&str, _>(2))
+        .bind(r.get::<chrono::NaiveDateTime, _>(3))
+        .bind(r.get::<&str, _>(4))
+        .bind(r.get::<&str, _>(5))
+        .bind(r.get::<&str, _>(6))
+        .bind(r.get::<f64, _>(7))
+        .bind(r.get::<f64, _>(8))
+        .bind(r.get::<f64, _>(9))
+        .bind(r.get::<f64, _>(10))
+        .bind(r.get::<&str, _>(11))
+        .execute(&mut *tx)
+        .await?;
+        inserted += 1;
+    }
+    tx.commit().await?;
+    tracing::info!(
+        table = "HT_CheckIn_Product",
+        inserted,
+        skipped_null_pk = skipped,
+        "[Mirror] snapshot complete"
+    );
+    Ok(())
+}
+
+async fn snapshot_deposit(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<(), AnyError> {
+    let mut conn = legacy_pool.get().await?;
+    let rows = conn
+        .simple_query(
+            "SELECT id, Dep_no, Dep_Date, Dep_Room, Dep_Name, \
+                    Dep_Price, Dep_Status, Dep_ref FROM HT_Deposit",
+        )
+        .await?
+        .into_first_result()
+        .await?;
+
+    let mut tx = pg_pool.begin().await?;
+    sqlx::query("DELETE FROM legacy_mirror.ht_deposit")
+        .execute(&mut *tx)
+        .await?;
+
+    let (mut inserted, mut skipped) = (0i64, 0i64);
+    for r in &rows {
+        let Some(id): Option<i32> = r.get(0) else {
+            skipped += 1;
+            continue;
+        };
+        sqlx::query(
+            "INSERT INTO legacy_mirror.ht_deposit \
+                (id, dep_no, dep_date, dep_room, dep_name, \
+                 dep_price, dep_status, dep_ref, mirror_source) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'reconcile')",
+        )
+        .bind(id)
+        .bind(r.get::<&str, _>(1))
+        .bind(r.get::<chrono::NaiveDateTime, _>(2))
+        .bind(r.get::<&str, _>(3))
+        .bind(r.get::<&str, _>(4))
+        .bind(r.get::<f64, _>(5))
+        .bind(r.get::<&str, _>(6))
+        .bind(r.get::<&str, _>(7))
+        .execute(&mut *tx)
+        .await?;
+        inserted += 1;
+    }
+    tx.commit().await?;
+    tracing::info!(
+        table = "HT_Deposit",
+        inserted,
+        skipped_null_pk = skipped,
+        "[Mirror] snapshot complete"
+    );
+    Ok(())
+}
+
+async fn snapshot_changed_room(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<(), AnyError> {
+    let mut conn = legacy_pool.get().await?;
+    let rows = conn
+        .simple_query(
+            "SELECT id, cin_no, room_before, room_after, change_date, \
+                    room_before_price, Note, ToPrice FROM HT_Changed_Room",
+        )
+        .await?
+        .into_first_result()
+        .await?;
+
+    let mut tx = pg_pool.begin().await?;
+    sqlx::query("DELETE FROM legacy_mirror.ht_changed_room")
+        .execute(&mut *tx)
+        .await?;
+
+    let (mut inserted, mut skipped_null_pk, mut skipped_null_cin) = (0i64, 0i64, 0i64);
+    for r in &rows {
+        let Some(id): Option<i32> = r.get(0) else {
+            skipped_null_pk += 1;
+            continue;
+        };
+        let Some(cin_no): Option<&str> = r.get(1) else {
+            // ht_changed_room.cin_no is NOT NULL in the mirror schema
+            // (matches the legacy column constraint). A NULL cin_no in
+            // legacy data means the row is malformed — skip and log.
+            skipped_null_cin += 1;
+            continue;
+        };
+        sqlx::query(
+            "INSERT INTO legacy_mirror.ht_changed_room \
+                (id, cin_no, room_before, room_after, change_date, \
+                 room_before_price, note, toprice, mirror_source) \
+             VALUES ($1, $2, $3, $4, $5, COALESCE($6, 0), $7, $8, 'reconcile')",
+        )
+        .bind(id)
+        .bind(cin_no)
+        .bind(r.get::<&str, _>(2))
+        .bind(r.get::<&str, _>(3))
+        .bind(r.get::<chrono::NaiveDateTime, _>(4))
+        .bind(r.get::<f64, _>(5))
+        .bind(r.get::<&str, _>(6))
+        .bind(r.get::<&str, _>(7))
+        .execute(&mut *tx)
+        .await?;
+        inserted += 1;
+    }
+    tx.commit().await?;
+    tracing::info!(
+        table = "HT_Changed_Room",
+        inserted,
+        skipped_null_pk,
+        skipped_null_cin,
+        "[Mirror] snapshot complete"
+    );
+    Ok(())
+}
+
+async fn snapshot_bill_debt_h(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<(), AnyError> {
+    let mut conn = legacy_pool.get().await?;
+    let rows = conn
+        .simple_query(
+            "SELECT Bill_No, Bill_Cust_ID, Bill_Cust_Name, Bill_Cust_Address, \
+                    Bill_Cust_Tel, Bill_Cust_Fax, Bill_Date, Bill_Ref, \
+                    Bill_Price_Type, Bill_Type, Bill_Total, Bill_Pay, \
+                    Bill_Debt, Bill_Pay_CASH, Bill_Pay_CREDIT, Bill_Status, \
+                    Bill_by, Bill_Note FROM HT_Bill_Debt_H",
+        )
+        .await?
+        .into_first_result()
+        .await?;
+
+    let mut tx = pg_pool.begin().await?;
+    sqlx::query("DELETE FROM legacy_mirror.ht_bill_debt_h")
+        .execute(&mut *tx)
+        .await?;
+
+    let (mut inserted, mut skipped) = (0i64, 0i64);
+    for r in &rows {
+        let Some(bill_no): Option<&str> = r.get(0) else {
+            skipped += 1;
+            continue;
+        };
+        sqlx::query(
+            "INSERT INTO legacy_mirror.ht_bill_debt_h \
+                (bill_no, bill_cust_id, bill_cust_name, bill_cust_address, \
+                 bill_cust_tel, bill_cust_fax, bill_date, bill_ref, \
+                 bill_price_type, bill_type, bill_total, bill_pay, \
+                 bill_debt, bill_pay_cash, bill_pay_credit, bill_status, \
+                 bill_by, bill_note, mirror_source) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
+                     $13, $14, $15, $16, $17, $18, 'reconcile')",
+        )
+        .bind(bill_no)
+        .bind(r.get::<&str, _>(1))
+        .bind(r.get::<&str, _>(2))
+        .bind(r.get::<&str, _>(3))
+        .bind(r.get::<&str, _>(4))
+        .bind(r.get::<&str, _>(5))
+        .bind(r.get::<chrono::NaiveDateTime, _>(6))
+        .bind(r.get::<&str, _>(7))
+        .bind(r.get::<&str, _>(8))
+        .bind(r.get::<&str, _>(9))
+        .bind(r.get::<f64, _>(10))
+        .bind(r.get::<f64, _>(11))
+        .bind(r.get::<f64, _>(12))
+        .bind(r.get::<f64, _>(13))
+        .bind(r.get::<f64, _>(14))
+        .bind(r.get::<&str, _>(15))
+        .bind(r.get::<&str, _>(16))
+        .bind(r.get::<&str, _>(17))
+        .execute(&mut *tx)
+        .await?;
+        inserted += 1;
+    }
+    tx.commit().await?;
+    tracing::info!(
+        table = "HT_Bill_Debt_H",
+        inserted,
+        skipped_null_pk = skipped,
+        "[Mirror] snapshot complete"
+    );
+    Ok(())
+}
+
+async fn snapshot_bill_debt_ds(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<(), AnyError> {
+    let mut conn = legacy_pool.get().await?;
+    let rows = conn
+        .simple_query(
+            "SELECT id, Bill_No, DS_ID, DS_NO, DS_NAME, \
+                    DS_UNIT, DS_NUM, DS_PRICE, DS_PRICE_TOTAL FROM HT_Bill_Debt_Ds",
+        )
+        .await?
+        .into_first_result()
+        .await?;
+
+    let mut tx = pg_pool.begin().await?;
+    sqlx::query("DELETE FROM legacy_mirror.ht_bill_debt_ds")
+        .execute(&mut *tx)
+        .await?;
+
+    let (mut inserted, mut skipped) = (0i64, 0i64);
+    for r in &rows {
+        let Some(id): Option<i32> = r.get(0) else {
+            skipped += 1;
+            continue;
+        };
+        sqlx::query(
+            "INSERT INTO legacy_mirror.ht_bill_debt_ds \
+                (id, bill_no, ds_id, ds_no, ds_name, ds_unit, ds_num, ds_price, \
+                 ds_price_total, mirror_source) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'reconcile')",
+        )
+        .bind(id)
+        .bind(r.get::<&str, _>(1))
+        .bind(r.get::<i32, _>(2))
+        .bind(r.get::<&str, _>(3))
+        .bind(r.get::<&str, _>(4))
+        .bind(r.get::<&str, _>(5))
+        .bind(r.get::<f64, _>(6))
+        .bind(r.get::<f64, _>(7))
+        .bind(r.get::<f64, _>(8))
+        .execute(&mut *tx)
+        .await?;
+        inserted += 1;
+    }
+    tx.commit().await?;
+    tracing::info!(
+        table = "HT_Bill_Debt_Ds",
+        inserted,
+        skipped_null_pk = skipped,
+        "[Mirror] snapshot complete"
     );
     Ok(())
 }
