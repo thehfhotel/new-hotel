@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.53.2] - 2026-04-29
+
+### Fixed
+
+- **Audit finding N1 — bootstrap-vs-CT race.** `bin/sync.rs` now hard-
+  refuses `--bootstrap` when `LEGACY_SYNC_ENABLED=true` unless the
+  operator opts in via `LEGACY_SYNC_ALLOW_LIVE_BOOTSTRAP=true`.
+  Previously the operator got a warning and the bootstrap proceeded;
+  the snapshot's `DELETE FROM legacy_mirror.<table>` could clobber
+  `mirror_source='ct'` rows the watcher just wrote. The refusal
+  matches the cold-replay / overflow style (loud Slack alert if
+  configured, 60s sleep before exit to throttle Docker restart
+  cadence). Added unit tests pinning the refusal-message wording so
+  Slack-triage and runbook references stay in sync.
+- **Audit finding N2 — bootstrap data-loss window for mirror tables.**
+  `run_bootstrap` now reads `CHANGE_TRACKING_CURRENT_VERSION()` BEFORE
+  the reconcile + transactional snapshot (was: after) and stamps that
+  captured value as the watermark. `CHANGETABLE(CHANGES <table>,
+  @version)` returns rows strictly greater than `@version`; reading
+  AFTER snapshots silently skipped any CT row produced during the
+  snapshot window. For canonical tables this self-heals on the next
+  update (idempotent UPSERT-by-hash), but mirror-table INSERTs in that
+  window with no follow-up update would never land.
+- **Audit finding N5 — `snapshot_*` panic on schema drift.** Replaced
+  every `r.get::<T, _>(N)` with `r.try_get::<T, _>(N).ok().flatten()`
+  across the 6 transactional snapshots and the 3 dimension reload
+  paths in `scheduler/mirror.rs`. The schema-fingerprint check
+  upstream catches most drift; this is defense-in-depth so a type
+  mismatch becomes `None` for that cell instead of crashing the entire
+  bootstrap.
+- **Audit finding N7 — orphan NULL `bill_no` rows in
+  `HT_Bill_Debt_Ds`.** `snapshot_bill_debt_ds` now skips rows whose
+  `bill_no` (FK to `HT_Bill_Debt_H`) is NULL and counts them in a new
+  `skipped_null_bill_no` log field. Downstream queries always filter
+  by `bill_no`, so a NULL-bill_no row is invisible to consumers
+  anyway. Empty table at HF Hotel today; no migration required.
+
+### Changed
+
+- `docs/runbook-sync.md` env-var matrix gained an entry for
+  `LEGACY_SYNC_ALLOW_LIVE_BOOTSTRAP`.
+
 ## [2.53.1] - 2026-04-29
 
 ### Fixed
