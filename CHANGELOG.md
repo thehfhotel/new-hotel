@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.52.0] - 2026-04-29
+
+### Added
+
+- **Phase 5.5d — `/api/legacy-mirror/*` read-only HTTP endpoints.**
+  Surfaces the `legacy_mirror.*` schema to the UI:
+  - `GET /api/legacy-mirror/coupons?cin_no=…` — coupons attached to
+    one check-in.
+  - `GET /api/legacy-mirror/products?cin_no=…` — in-stay POS / minibar
+    charges per check-in.
+  - `GET /api/legacy-mirror/room-changes?cin_no=…` — mid-stay room-
+    move audit per check-in.
+  - `GET /api/legacy-mirror/pricing` — consolidated reference data
+    (extension prices, room prices, pricing tiers up/down) in one
+    response so the settings page makes one fetch.
+
+  All four endpoints are thin SELECTs against `legacy_mirror.*` —
+  no service layer, no event emission. Endpoints take legacy
+  `cin_no` directly (the UI already has it from the loaded check-in
+  object) — keeps them decoupled from our PG UUIDs and easy to drop
+  on decommission. Unblocks the 5.5e UI panels.
+
 ## [2.51.1] - 2026-04-29
 
 ### Added

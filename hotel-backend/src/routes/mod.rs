@@ -5,6 +5,7 @@ pub mod calendar;
 pub mod checkins;
 pub mod customers;
 pub mod events;
+pub mod legacy_mirror;
 pub mod mode;
 pub mod new_bookings;
 pub mod new_checkins;
