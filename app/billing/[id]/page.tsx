@@ -5,6 +5,7 @@ import { useBranchFetch } from '@/lib/use-branch-fetch'
 import Link from 'next/link'
 import { ArrowLeft, Loader2, AlertCircle, Receipt } from 'lucide-react'
 import InvoiceTemplate from '@/components/documents/InvoiceTemplate'
+import LegacyMirrorPanels from '@/components/LegacyMirrorPanels'
 import PrintButton from '@/components/ui/PrintButton'
 import { InvoiceData, HotelInfo } from '@/types/invoice'
 
@@ -81,6 +82,7 @@ export default function InvoiceDetailPage({
         const invoice = data.invoice
         const transformedData: InvoiceData = {
           invoiceNumber: invoice.cinNo,
+          cinNo: invoice.cinNo,
           checkInId: invoice.checkinId,
           guestName: invoice.guest.fullName,
           guestIdCard: invoice.guest.idCard || invoice.guest.passport || '',
@@ -192,6 +194,14 @@ export default function InvoiceDetailPage({
 
       {/* Invoice Template */}
       <InvoiceTemplate checkInData={invoiceData} hotelInfo={hotelInfo} showVat={false} />
+
+      {/* Phase 5.5e — legacy_mirror panels (coupons / minibar / room moves).
+          Hidden in print so the receipt itself stays clean. */}
+      {invoiceData.cinNo && (
+        <div className="no-print">
+          <LegacyMirrorPanels cinNo={invoiceData.cinNo} />
+        </div>
+      )}
     </div>
   )
 }
