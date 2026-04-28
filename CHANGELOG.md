@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.0] - 2026-04-27
+
+### Phase 6 — drift-reconcile finalize + retire polling-sync
+
+The CT watcher (`bin/sync.rs`) is the authoritative real-time path;
+the demoted `scheduler::sync::run_sync` is now a slower safety net
+with operator alerting. Per `docs/architecture.md` §8 (Phase 6 row).
+
+### Added
+
+- **Drift alert at end of every reconcile tick.** `scheduler::sync::run_sync`
+  now counts unresolved `ht_reconcile_log` rows added in the last hour,
+  grouped by `table_name`. If any table breaches the threshold (default
+  **50**, override via `LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD`), one
+  `:rotating_light:` Slack message is fired listing every offending table.
+  Always logs the same data even when Slack is unconfigured. The
+  threshold logic is split into a pure function
+  (`tables_breaching_threshold`) and unit-tested for boundary behaviour
+  (strict-greater-than, empty input, garbage env values, custom thresholds).
+- **`SlackClient` plumbed through `scheduler::sync::run_sync`.** Signature
+  now takes `Option<&SlackClient>`. `init_scheduler` constructs the
+  client when `SlackConfig::is_configured()` and threads it into the
+  cron job. Bootstrap (`bin/sync --bootstrap`) passes `None` because
+  every legacy row is a "PG miss" by construction during a fresh seed
+  and would otherwise trigger an unconditional alert.
+- **Runbook §9 — Phase 6 drift-reconcile safety net.** Documents cadence,
+  alert mechanic, three-step investigation procedure (classify → resolve),
+  threshold tuning guidance, and the contract that
+  `record_success`/`record_error` continue to feed dashboards.
+
+### Changed
+
+- **Reconcile cadence locked at 15 min on the quarter-hour** (`0 */15 * * * *`).
+  Doc-comment in `scheduler/jobs.rs` now spells out why we deliberately
+  do NOT poll faster: the CT watcher's sub-second path covers the
+  latency-sensitive case; reconcile faster would only add legacy-MSSQL
+  load without changing recovery posture (operator response time to a
+  Slack alert dominates).
+- `record_success` and `record_error` in `scheduler/sync.rs` carry
+  Phase 6 doc-comments stating the dashboard contract — they continue
+  to update `sync_status` rows in BOTH `Upsert` and `DiffOnly` modes
+  for observability and must not be removed without updating consumers.
+
+### Verified unchanged
+
+- `LEGACY_SYNC_RECONCILE_MODE` already defaults to `DiffOnly` (locked
+  in v2.45.0). Re-asserted by existing
+  `from_env_defaults_to_diff_only_when_unset` test.
+- `scheduler/mirror.rs` reload of the 4 legacy-only dimension tables is
+  NOT polling-sync to retire — it's the canonical source for tables
+  with no CT mapper. Untouched.
+- CT watcher infrastructure (`bin/sync.rs` and `src/sync/`) unchanged
+  — Phase 6 is a safety-net feature, not a watcher replacement.
+
 ## [2.53.2] - 2026-04-29
 
 ### Fixed

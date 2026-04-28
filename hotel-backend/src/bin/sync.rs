@@ -513,7 +513,12 @@ async fn run_bootstrap() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     // SAFETY: setting an env var pre-tokio-runtime is safe here because
     // we own the entire process state; the watcher binary doesn't fork.
     env::set_var("LEGACY_SYNC_RECONCILE_MODE", "upsert");
-    hotel_backend::scheduler::sync::run_sync(&mssql, &pg).await;
+    // Pass `None` for the slack client: bootstrap uses the Slack
+    // channel for its own progress + refusal messages and must not
+    // emit a Phase 6 drift alert during a fresh seed (canonical state
+    // hasn't existed yet, so every legacy row is a "PG miss" by
+    // construction — a drift alert would fire unconditionally).
+    hotel_backend::scheduler::sync::run_sync(&mssql, &pg, None).await;
     match prior_mode {
         Some(v) => env::set_var("LEGACY_SYNC_RECONCILE_MODE", v),
         None => env::remove_var("LEGACY_SYNC_RECONCILE_MODE"),

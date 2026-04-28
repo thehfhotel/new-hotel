@@ -478,3 +478,120 @@ Where to look for "is the watcher healthy?" data.
   saw a row whose hash didn't match — investigate the listed
   `(table_name, legacy_pk)` against the canonical PG row to find
   what the CT watcher missed.
+
+---
+
+## 9. Phase 6 — drift-reconcile safety net
+
+**As of v2.54.0**, the demoted reconcile job is wired with an alerting
+loop. The CT watcher remains the real-time path; the reconcile is a
+slower safety net that surfaces rows the watcher missed (CT retention
+overflow, transient mapper bug, schema regression).
+
+### Cadence
+
+* **15 minutes**, on the quarter-hour (`0 */15 * * * *`).
+* Polling more often would only add legacy-MSSQL load without changing
+  the recovery posture — operator response time to a Slack alert
+  dominates real-time latency, and the CT watcher's sub-second path
+  already covers the latency-sensitive case.
+
+### Alert mechanic
+
+At the end of each tick the job runs:
+
+```sql
+SELECT table_name, count(*)
+  FROM ht_reconcile_log
+ WHERE resolved_at IS NULL
+   AND detected_at > now() - interval '1 hour'
+ GROUP BY table_name;
+```
+
+If any `table_name` count exceeds the configured threshold (default
+**50**, override via `LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD`), one
+Slack message is fired listing every offending table:
+
+```
+:rotating_light: *Reconcile drift threshold exceeded* :rotating_light:
+The drift-reconcile job recorded more than 50 unresolved
+ht_reconcile_log rows for the following table(s) in the last hour:
+• `customers`: 73 unresolved rows in last hour
+• `bookings`: 412 unresolved rows in last hour
+_Investigate via docs/runbook-sync.md §9 (Phase 6 drift alert)._
+```
+
+Logs always carry the same data even when Slack isn't configured —
+look for `[Sync] Drift alert: table exceeds reconcile-log threshold`
+in the backend container logs.
+
+### Investigating a drift alert
+
+Two probable causes — distinguish them before deciding the action.
+
+**Step 1 — pull the offending rows** for the alerting `table_name`:
+
+```sql
+SELECT detected_at, legacy_pk, pg_hash, mssql_hash,
+       mssql_row_json, pg_row_json
+  FROM ht_reconcile_log
+ WHERE resolved_at IS NULL
+   AND table_name = 'customers'   -- replace with the alerting table
+   AND detected_at > now() - interval '1 hour'
+ ORDER BY detected_at DESC;
+```
+
+**Step 2 — classify**:
+
+| Pattern | Likely cause | Action |
+|---|---|---|
+| `pg_hash IS NULL` on most rows. | Bulk PG-miss — canonical rows never landed. Most often: CT retention overflow (Section 4b) or watcher offline window. | Cross-check `legacy_sync_status.last_processed_at` — stale on the matching MSSQL table? Run `--bootstrap` (Section 1). After bootstrap, mark the rows resolved: `UPDATE ht_reconcile_log SET resolved_at = now() WHERE resolved_at IS NULL AND table_name = 'customers';` |
+| `pg_hash` and `mssql_hash` both populated, both differ on every row. | Mapper-projection bug — the CT watcher is writing canonical state but with a different shape than reconcile expects. | Pick one row, compare `mssql_row_json` to the canonical PG row, identify the diverging column. Fix the mapper in `src/sync/mappers/`, ship via CI. Mark rows resolved AFTER the next reconcile tick goes clean. |
+| Single isolated row, no pattern across `table_name`. | One-off CT overflow or a hand-edit on the legacy DB after a watcher restart. | Re-fire the CT mapper for that PK by writing a no-op UPDATE on the source MSSQL row, OR resolve by hand if the canonical PG state matches business intent. |
+| Counts climb monotonically each tick on the same `table_name`. | The watcher is offline for that table, OR a mapper consistently rejects the CT row. | Check `legacy_sync_status` for the matching MSSQL table — `last_error` non-NULL or `consecutive_failures` climbing means a mapper crash; restart the watcher after fixing. If `last_processed_at` is recent and `last_error` is NULL, the watcher is processing but the mapper silently swallows the row — file a bug. |
+
+**Step 3 — resolve.** Once the underlying cause is fixed (or
+classified as a non-issue), mark the rows resolved so they stop
+counting toward the alert threshold:
+
+```sql
+UPDATE ht_reconcile_log
+   SET resolved_at = now()
+ WHERE resolved_at IS NULL
+   AND table_name = 'customers'      -- the alerting table
+   AND detected_at < now() - interval '5 minutes';
+```
+
+The 5-minute window leaves rows from the in-flight reconcile tick
+alone in case the operator is still investigating.
+
+### Tuning the threshold
+
+The default of 50/hour/table is well above steady-state noise
+(should be 0) and below the volume a genuine bulk catch-up would
+produce. If a particular table has chatty steady-state drift you
+genuinely don't care about (e.g. a clock-skew column that never
+matters), prefer fixing the mapper or hash input over raising the
+threshold — the threshold is a global blast-radius dial, not a
+per-table mute. To tune:
+
+```bash
+# Production: set on the deploy host (subject to the .env-revert
+# pitfall in Section 4a — promote to GH secrets if you want it to
+# survive deploys).
+LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD=100
+```
+
+Setting `0` or a negative value falls back to the default with a
+warning log line; non-numeric values do the same.
+
+### Retiring `record_success` / `record_error`
+
+`scheduler/sync.rs::record_success` and `record_error` continue to
+update `sync_status` rows for the operator dashboard. They are NOT
+control-flow critical to the diff-only path but observability still
+depends on them. Do not delete without first updating any dashboards
+that read `sync_status`. The doc-comments in those functions carry
+this contract.
+
+---

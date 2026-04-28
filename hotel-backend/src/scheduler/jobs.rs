@@ -47,35 +47,56 @@ pub async fn init_scheduler(
     let scheduler = JobScheduler::new().await?;
     let state = Arc::new(Mutex::new(SchedulerState::default()));
 
-    // Legacy reconcile job — Phase 5.5: demoted from 5-min full UPSERT
-    // to a 15-min diff-only safety net. The CT watcher (`bin/sync.rs`)
-    // is now authoritative for canonical PG state; this job's role is
-    // to LOG drift into `ht_reconcile_log` so an operator can investigate
-    // (mode controlled by env var `LEGACY_SYNC_RECONCILE_MODE`).
+    // Legacy reconcile job — Phase 6 (built on Phase 5.5 demotion).
     //
-    // Per docs/architecture.md §3.6d, §8 (Phase 5.5 row).
+    // Cadence: minute 0 of every 15 minutes (00, 15, 30, 45). Quarters
+    // of the hour are easier for operators to correlate with logs than
+    // an arbitrary 15-min phase. We deliberately do NOT poll faster:
+    // the CT watcher (`bin/sync.rs`) is the real-time path with sub-
+    // second latency; this reconcile is a slower safety net that
+    // surfaces rows the watcher missed (CT retention overflow,
+    // transient mapper bug, schema regression). Polling more often
+    // would only add legacy-MSSQL load without changing the recovery
+    // posture — operator response time to a Slack alert dominates.
+    //
+    // Mode: `LEGACY_SYNC_RECONCILE_MODE` defaults to `diff_only` (see
+    // `ReconcileMode::from_env`). `diff_only` LOGS divergent rows into
+    // `ht_reconcile_log` instead of mutating canonical state, which
+    // the CT watcher owns. `upsert` remains as an escape hatch.
+    //
+    // Phase 6 alerting: at the end of each tick the job counts
+    // unresolved `ht_reconcile_log` rows in the last hour, grouped by
+    // `table_name`, and fires a `:rotating_light:` Slack alert if any
+    // table breaches `LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD`
+    // (default 50). Threshold pure-function logic is unit-tested in
+    // `scheduler::sync::tests`.
+    //
+    // Per docs/architecture.md §3.6d, §8 (Phase 6 row); runbook §9.
     if let Some(ref pg) = pg_pool {
         let sync_legacy = pool.clone();
         let sync_pg = pg.clone();
+        let sync_slack: Option<SlackClient> = if slack_config.is_configured() {
+            Some(SlackClient::new(slack_config.clone()))
+        } else {
+            None
+        };
 
         let sync_enabled = std::env::var("SYNC_ENABLED")
             .map(|v| v != "false")
             .unwrap_or(true);
 
         if sync_enabled {
-            // Cron: minute 0 of every 15 minutes (00, 15, 30, 45). Quarters of
-            // the hour are easier for operators to correlate with logs than
-            // an arbitrary 15-min phase.
             let sync_job = Job::new_async("0 */15 * * * *", move |_uuid, _l| {
                 let legacy = sync_legacy.clone();
                 let pg = sync_pg.clone();
+                let slack = sync_slack.clone();
                 Box::pin(async move {
-                    sync::run_sync(&legacy, &pg).await;
+                    sync::run_sync(&legacy, &pg, slack.as_ref()).await;
                 })
             })?;
             scheduler.add(sync_job).await?;
             tracing::info!(
-                "[Scheduler] - Legacy reconcile: every 15 minutes (Phase 5.5 — diff-only safety net)"
+                "[Scheduler] - Legacy reconcile: every 15 minutes (Phase 6 — diff-only safety net + drift alerts)"
             );
         } else {
             tracing::info!("[Scheduler] - Legacy reconcile: DISABLED (SYNC_ENABLED=false)");
