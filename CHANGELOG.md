@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.50.1] - 2026-04-29
+
+### Changed
+
+- **Phase 5.5b — CT enabled on 6 legacy-only tables (HF Hotel only;
+  HF Ville pending audit).** Per-table Change Tracking with
+  `TRACK_COLUMNS_UPDATED=ON` enabled on `HT_Cupon` (17,894 rows),
+  `HT_CheckIn_Product`, `HT_Deposit`, `HT_Changed_Room` (3,872 rows),
+  `HT_Bill_Debt_H`, `HT_Bill_Debt_Ds`. Where the natural-key column
+  was nullable (`HT_Cupon.cupon_no`, `HT_Deposit.id`,
+  `HT_Bill_Debt_H.Bill_No`) it was tightened to NOT NULL first
+  (verified zero NULLs and zero duplicates pre-flight). PKs added on
+  every table (`PK_<table>`); CT enabled. .NET app unaffected.
+  Maintenance window completed 2026-04-29 ~01:00 UTC. CT
+  current_version at apply time: 1887. Apply + rollback scripts
+  formalized in new `migrations/legacy-mssql/` directory (the prior
+  `/tmp/disable-ct-rollback.sql` pattern is retired).
+  HF Ville's legacy DB still needs an independent audit + apply
+  before its CT mappers can come online.
+
 ## [2.50.0] - 2026-04-28
 
 ### Added
