@@ -629,6 +629,17 @@ jobs:
           docker compose --profile legacy pull sync
           docker compose --profile legacy up -d --force-recreate sync
 
+          # Phase 5 (Ville) worker pair — same image, different env (Ville
+          # MSSQL via WG, hotelville PG, SITE_ID=hfville). Lives under
+          # `profiles: [hfville]`. Ships default-DISABLED (HFVILLE_LEGACY_SYNC_ENABLED=false,
+          # HFVILLE_WRITEBACK_ENABLED=false) so the binaries exit Ok(0) on
+          # first deploy and the containers sit in "exited" state — that's
+          # intentional until task #74 (bootstrap) flips the switch.
+          # Force-recreate so a fresh image rollout actually swaps the
+          # running binary, same reasoning as the legacy profile above.
+          docker compose --profile hfville pull sync-hfville writeback-hfville
+          docker compose --profile hfville up -d --force-recreate sync-hfville writeback-hfville
+
           echo "Deployment complete!"
           docker compose ps
 

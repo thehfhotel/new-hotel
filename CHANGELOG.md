@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.10] - 2026-04-29
+
+### Added
+
+- **`sync-hfville` + `writeback-hfville` services in `docker-compose.yml`**
+  (both under `profiles: [hfville]`, default-INERT). The Phase 5 (Ville)
+  worker pair — same backend image, different env: Ville MSSQL via WG
+  (`192.168.11.51,1436`), `hotelville` PG database, `SITE_ID=hfville`.
+  Per ADR 0001 Q2 the Ville stack runs CENTRAL on evergreen alongside
+  HF Hotel — no separate backend container needed (the existing
+  `backend` service's `ville_pool` repoints at `hotelville` at cutover,
+  task #76). Ships with all watcher knobs default-disabled
+  (`HFVILLE_LEGACY_SYNC_ENABLED=false`, `HFVILLE_WRITEBACK_ENABLED=false`)
+  so the binaries exit `Ok(0)` and `restart: on-failure:5` does NOT
+  loop. Bootstrap (task #74) flips the env to enable shadow mode;
+  cutover (#76) flips to live.
+- **CI deploy step** now pulls + force-recreates the hfville profile
+  after the HF Hotel pair, mirroring the legacy-profile pattern.
+  Container naming uses the `-hfville` suffix
+  (`new-hotel-production-sync-hfville-1` etc.) so they cannot collide
+  with HF Hotel containers under the same compose project.
+
+### Notes
+
+- Both Ville services reuse `DB_PASSWORD` for now since both sites' MSSQL
+  share `sa/REDACTED-sa-pw`. Split into a dedicated `HFVILLE_DB_PASSWORD` GH
+  secret when one site rotates ahead of the other (Phase 8 ops hardening).
+- No CI matrix refactor was needed — for two sites a single compose with
+  per-site profiles is simpler than a deploy-job matrix. Revisit when a
+  third site appears.
+
 ## [2.54.9] - 2026-04-29
 
 ### Fixed
