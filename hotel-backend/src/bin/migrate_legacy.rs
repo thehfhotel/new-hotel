@@ -344,8 +344,9 @@ async fn import_customers(
             r#"
             INSERT INTO ht_customers
                 (cust_code, cust_firstname, cust_lastname, cust_phone,
-                 cust_idcard, cust_address, cust_type, source)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, 'legacy')
+                 cust_idcard, cust_address, cust_type, source,
+                 legacy_cust_no)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'legacy', $1)
             RETURNING cust_id
             "#,
         )
@@ -474,8 +475,8 @@ async fn import_bookings(
             r#"
             INSERT INTO ht_bookings
                 (book_no, book_date, book_cust_id, book_checkin, book_checkout,
-                 book_status, source)
-            VALUES ($1, COALESCE($2, NOW()::timestamp), $3, $4, $5, $6, 'legacy')
+                 book_status, source, legacy_book_id)
+            VALUES ($1, COALESCE($2, NOW()::timestamp), $3, $4, $5, $6, 'legacy', $1)
             RETURNING book_id
             "#,
         )
@@ -617,8 +618,9 @@ async fn import_checkins(
             r#"
             INSERT INTO ht_checkins
                 (cin_no, cin_cust_id, cin_room_id, cin_checkin_time,
-                 cin_checkout_time, cin_expected_checkout, cin_status, source)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, 'legacy')
+                 cin_checkout_time, cin_expected_checkout, cin_status, source,
+                 legacy_cin_no)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'legacy', $1)
             "#,
         )
         .bind(&cin_no)
