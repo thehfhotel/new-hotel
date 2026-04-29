@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.5] - 2026-04-29
+
+### Added
+
+- **`migrations/legacy-mssql/020_phase5_enable_ct.sql`** (+ rollback) —
+  backfill of the original Phase 5 cutover DDL. At HF Hotel the
+  equivalent statements were applied manually 2026-04-25 before the
+  legacy-mssql migration system existed; this file captures them so
+  HF Ville (and any future restore / new site) can reach the same
+  pre-Phase-5.5 baseline auditably from a single file. Covers DB-level
+  CT enable + PKs + per-table CT on the 11 canonical-sync tables:
+  `HT_Customers`, `HT_Rooms`, `HT_Book_H`, `HT_Book_Ds`, `HT_Book_Date`,
+  `HT_CheckIn_H`, `HT_CheckIn_Ds`, `HT_CheckIn_Pay`, `HT_Room_Status`,
+  `HT_Rooms_Cancel`, `HT_Receipt_H`. Pre-flight verified clean against
+  Ville (0 NULLs, 0 dupes on every PK candidate column). DO NOT
+  re-apply at HF Hotel — `ALTER DATABASE SET CHANGE_TRACKING ON` would
+  error if already enabled. README + reference network path for Ville
+  (`192.168.11.51,1436` over WG `hfville` interface) updated to match.
+
 ## [2.54.4] - 2026-04-29
 
 ### Fixed
