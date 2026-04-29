@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.20] - 2026-04-29
+
+### Fixed
+
+- **`migrate_legacy.rs` checkin import duplicate-key error** —
+  `View_CheckIn_Ds` returns multiple rows per `Cin_no` for group
+  bookings (one row per booked room — the same multi-row shape
+  that bit us in #64). The check-in import loop only deduped
+  against the existing-set populated from `ht_checkins` at the
+  start, not against rows it had already inserted in the current
+  pass. So the second row for any group-booking `Cin_no` blew up
+  with `duplicate key value violates unique constraint`. Fix:
+  insert each successfully-imported `cin_no` into the dedup set
+  so subsequent rows for the same PK skip cleanly. Caught and
+  fixed during Phase 5 Ville #85 backfill.
+- **`init-db/init-hotelnew.sql` schema_migrations seed for 023 + 024.**
+  CI's drift check fired because the init-db baseline had the
+  migrated schema for both ALTERs but no matching seed rows in
+  schema_migrations — so `migrate.sh` on a fresh init-baselined
+  DB saw 023 + 024 as pending and tried to re-apply them, which
+  the drift gate rejects. Appended two `INSERT INTO schema_migrations`
+  rows matching the pattern for 008-022.
+
 ## [2.54.19] - 2026-04-29
 
 ### Fixed
