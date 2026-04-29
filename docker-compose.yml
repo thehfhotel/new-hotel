@@ -105,6 +105,13 @@ services:
       - PORT=3003
       # HF Ville — reads from local newdb ville schema (pushed by ville_sync)
       - VILLE_DB_ENABLED=${VILLE_DB_ENABLED:-true}
+      # VilleDbConfig requires a password when enabled. For the existing
+      # single-cluster setup (ville pool reads the `ville` schema in the same
+      # newdb container), POSTGRES_PASSWORD is the right value — falling back
+      # via shell expansion keeps HF Hotel deploys working without a separate
+      # GH secret. Override VILLE_DB_PASSWORD explicitly when Ville migrates
+      # to its own DB/cluster (Phase 5 Ville cutover).
+      - VILLE_DB_PASSWORD=${VILLE_DB_PASSWORD:-${POSTGRES_PASSWORD}}
     depends_on:
       newdb:
         condition: service_healthy
