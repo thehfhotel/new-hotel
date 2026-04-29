@@ -25,21 +25,25 @@ CREATE TABLE IF NOT EXISTS ht_booking_notes (
 CREATE INDEX IF NOT EXISTS ix_booking_notes_bookno ON ht_booking_notes(book_no);
 
 -- ht_customers - Customer master data
+-- VARCHAR widths follow migration 024 — Ville's legacy data has phone numbers
+-- up to 21 chars (canonical Cust_Add_tel can carry comma-separated multi-phones).
+-- Match the cache-table widths from migration 009 so a fresh deploy doesn't
+-- need 024 to apply on top.
 CREATE TABLE IF NOT EXISTS ht_customers (
     cust_id SERIAL PRIMARY KEY,
-    cust_code VARCHAR(20),
-    cust_title VARCHAR(20),
+    cust_code VARCHAR(100),
+    cust_title VARCHAR(100),
     cust_firstname VARCHAR(100) NOT NULL,
     cust_lastname VARCHAR(100),
     cust_nickname VARCHAR(50),
-    cust_idcard VARCHAR(20),
+    cust_idcard VARCHAR(100),
     cust_passport VARCHAR(50),
     cust_nationality VARCHAR(50),
-    cust_phone VARCHAR(20),
+    cust_phone VARCHAR(200),
     cust_email VARCHAR(100),
     cust_address VARCHAR(500),
     cust_company VARCHAR(200),
-    cust_taxid VARCHAR(20),
+    cust_taxid VARCHAR(100),
     cust_notes TEXT,
     cust_type VARCHAR(50),
     cust_vip BOOLEAN DEFAULT false,
