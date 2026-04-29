@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.11] - 2026-04-29
+
+### Changed
+
+- **`sync-hfville` defaults flipped to shadow-soak posture.** With Phase 5
+  Ville bootstrap complete (task #74, watermark stamped at 2026-04-29
+  ~17:50 ICT), the CT watcher now needs to keep polling in shadow mode
+  through the 48 h soak (task #75). Operator-side `.env` edits don't
+  survive CI deploys (the deploy step rewrites `.env` from GH secrets),
+  so the `docker-compose.yml` defaults must encode the shadow posture:
+  - `HFVILLE_LEGACY_SYNC_ENABLED` default `false` → **`true`** (was previously default-OFF as a safety guard for the not-yet-bootstrapped state; that guard is no longer needed now that bootstrap is done)
+  - `HFVILLE_LEGACY_SYNC_SHADOW_MODE` stays default `true` (operator flips to `false` at cutover #76)
+  - `HFVILLE_LEGACY_SYNC_TABLE_ALLOWLIST` default empty → **`HT_Customers,HT_Rooms,HT_Book_H,HT_Book_Ds,HT_Book_Date,HT_CheckIn_H,HT_CheckIn_Ds,HT_CheckIn_Pay,HT_Room_Status,HT_Rooms_Cancel,HT_Receipt_H`** (the 11 tables enabled by 020). Phase 5.5b (021, task #80) adds 6 more mirror tables — at that point clear the env to fall back to "all enabled".
+
+  Profile gate (`profiles: [hfville]`) still ensures the container only
+  starts when explicitly opted in via `--profile hfville`. HF Hotel
+  containers do not read these env vars and remain unaffected.
+
 ## [2.54.10] - 2026-04-29
 
 ### Added
