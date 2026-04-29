@@ -567,10 +567,15 @@ async fn import_checkins(
     .fetch_all(&mut *tx)
     .await?;
 
-    let existing_set: std::collections::HashSet<String> = existing_checkins.into_iter().collect();
+    let mut existing_set: std::collections::HashSet<String> = existing_checkins.into_iter().collect();
 
     for row in &rows {
         let cin_no = row.get::<&str, _>("Cin_no").unwrap_or_default().to_string();
+        // View_CheckIn_Ds is multi-row per Cin_no (one row per booked room
+        // for group bookings — same shape that bit us in #64). Dedupe within
+        // this loop by inserting into existing_set on each successful INSERT
+        // so the next row with the same Cin_no skips cleanly instead of
+        // tripping the unique constraint on ht_checkins.cin_no.
         if cin_no.is_empty() || existing_set.contains(&cin_no) {
             stats.checkins_skipped += 1;
             continue;
@@ -626,6 +631,9 @@ async fn import_checkins(
         .execute(&mut *tx)
         .await?;
 
+        // Mark as inserted so subsequent rows for the same Cin_no
+        // (group bookings, multi-room) skip rather than blow up.
+        existing_set.insert(cin_no.clone());
         stats.checkins += 1;
     }
 
