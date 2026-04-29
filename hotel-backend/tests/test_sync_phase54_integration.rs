@@ -188,6 +188,17 @@ async fn mssql_stub() -> Option<hotel_backend::db::DbPool> {
     {
         return None;
     }
+    // `DbConfig::from_env` panics when `DB_PASSWORD` is unset (the
+    // 2.54.6 fail-loud removed the hardcoded fallback). In CI / pure-PG
+    // runs that env var is intentionally not provided, so treat its
+    // absence as the same signal as `SYNC_TEST_SKIP_MSSQL_PROBE=true`:
+    // skip the probe rather than panic the test process.
+    if std::env::var("DB_PASSWORD")
+        .map(|v| v.is_empty())
+        .unwrap_or(true)
+    {
+        return None;
+    }
     let config = hotel_backend::config::DbConfig::from_env();
     hotel_backend::db::create_pool(&config).await.ok()
 }

@@ -88,6 +88,9 @@ services:
       - DB_NAME=${DB_NAME}
       - DB_USER=${DB_USER}
       - DB_PASSWORD=${DB_PASSWORD}
+      # TCP port. Default 1433 (HF Hotel). HF Ville's SS2025 Express
+      # instance listens on 1436 — set MSSQL_PORT=1436 in that .env.
+      - MSSQL_PORT=${MSSQL_PORT:-1433}
       # New database (PostgreSQL Docker container - owned by this application)
       - NEW_DB_SERVER=newdb
       - NEW_DB_PORT=${PGPORT:-5439}
@@ -144,6 +147,7 @@ services:
       - DB_NAME=${DB_NAME}
       - DB_USER=${DB_USER}
       - DB_PASSWORD=${DB_PASSWORD}
+      - MSSQL_PORT=${MSSQL_PORT:-1433}
       # PostgreSQL — same DSN the backend uses, but with explicit URL form
       # because the writeback bin reads DATABASE_URL directly (no AppConfig).
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@newdb:${PGPORT:-5439}/${POSTGRES_DB}
@@ -201,6 +205,7 @@ services:
       - DB_NAME=${DB_NAME}
       - DB_USER=${DB_USER}
       - DB_PASSWORD=${DB_PASSWORD}
+      - MSSQL_PORT=${MSSQL_PORT:-1433}
       # PostgreSQL — same DSN the writeback worker uses, explicit URL form
       # because the sync bin reads DATABASE_URL directly (no AppConfig).
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@newdb:${PGPORT:-5439}/${POSTGRES_DB}
@@ -264,6 +269,7 @@ services:
       - DB_NAME=${DB_NAME}
       - DB_USER=${DB_USER}
       - DB_PASSWORD=${DB_PASSWORD}
+      - MSSQL_PORT=${MSSQL_PORT:-1433}
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@newdb:${PGPORT:-5439}/${POSTGRES_DB}
       - RUST_LOG=${RUST_LOG:-backfill_rooms=info}
     depends_on:
