@@ -486,26 +486,23 @@ async fn bump_sequence_to_max(
 
 async fn connect_legacy() -> Result<Pool<ConnectionManager>, Box<dyn std::error::Error + Send + Sync>>
 {
-    let server = env::var("DB_SERVER").unwrap_or_else(|_| "192.168.100.222".to_string());
-    let database = env::var("DB_NAME").unwrap_or_else(|_| "db".to_string());
-    let user = env::var("DB_USER").unwrap_or_else(|_| "sa".to_string());
-    let password = env::var("DB_PASSWORD").unwrap_or_else(|_| "REDACTED-sa-pw".to_string());
-
-    let mut config = tiberius::Config::new();
-    config.host(&server);
-    config.port(1433);
-    config.database(&database);
-    config.authentication(tiberius::AuthMethod::sql_server(&user, &password));
-    config.trust_cert();
-
-    let manager = ConnectionManager::new(config);
-    let pool = Pool::builder().max_size(POOL_MAX).build(manager).await?;
+    // Use the centralised DbConfig + create_pool so this binary inherits the
+    // MSSQL_PORT env handling (HF Ville on 1436), the require_secret check
+    // for DB_PASSWORD (no silent default-credentials fallback), and the bb8
+    // circuit-breaker timeouts. The local POOL_MAX constant (2) is now
+    // overridden by DbConfig's pool_max (default 20), which is fine because
+    // backfill_rooms issues serial UPSERTs and the pool sits mostly idle.
+    let config = hotel_backend::config::DbConfig::from_env();
+    let server = config.server.clone();
+    let pool = hotel_backend::db::create_pool(&config)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
 
     {
         let mut conn = pool.get().await?;
         let _ = conn.simple_query("SELECT 1").await?;
     }
-    tracing::info!("Connected to legacy SQL Server at {}", server);
+    tracing::info!("Connected to legacy SQL Server at {}:{}", server, config.port);
 
     Ok(pool)
 }
