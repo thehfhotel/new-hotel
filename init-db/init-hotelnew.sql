@@ -1123,22 +1123,28 @@ CREATE TABLE IF NOT EXISTS legacy_mirror.ht_bill_debt_ds (
 CREATE INDEX IF NOT EXISTS ht_bill_debt_ds_bill_no_idx
     ON legacy_mirror.ht_bill_debt_ds (bill_no);
 
+-- ht_order_up / ht_order_down — pricing-tier matrices. PK is composite
+-- (id, cust_type, cast_type) per migration 023 — `id` alone is a tier
+-- number with duplicates, NOT a unique key. See migration 023 header
+-- comment for the diagnosis (Phase 5 Ville bootstrap, 2026-04-29).
 CREATE TABLE IF NOT EXISTS legacy_mirror.ht_order_up (
-    id            INTEGER          PRIMARY KEY,
-    cust_type     TEXT,
+    id            INTEGER          NOT NULL,
+    cust_type     TEXT             NOT NULL,
     cust_month    INTEGER,
-    cast_type     TEXT,
+    cast_type     TEXT             NOT NULL,
     mirrored_at   TIMESTAMPTZ      NOT NULL DEFAULT now(),
-    mirror_source TEXT             NOT NULL
+    mirror_source TEXT             NOT NULL,
+    PRIMARY KEY (id, cust_type, cast_type)
 );
 
 CREATE TABLE IF NOT EXISTS legacy_mirror.ht_order_down (
-    id            INTEGER          PRIMARY KEY,
-    cust_type     TEXT,
+    id            INTEGER          NOT NULL,
+    cust_type     TEXT             NOT NULL,
     cust_month    INTEGER,
-    cast_type     TEXT,
+    cast_type     TEXT             NOT NULL,
     mirrored_at   TIMESTAMPTZ      NOT NULL DEFAULT now(),
-    mirror_source TEXT             NOT NULL
+    mirror_source TEXT             NOT NULL,
+    PRIMARY KEY (id, cust_type, cast_type)
 );
 
 INSERT INTO schema_migrations (version, filename, applied_by)

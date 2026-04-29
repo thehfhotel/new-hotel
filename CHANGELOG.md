@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.17] - 2026-04-29
+
+### Fixed
+
+- **`legacy_mirror.ht_order_up` / `ht_order_down` PK changed from
+  `(id)` to composite `(id, cust_type, cast_type)`** (task #84,
+  diagnosed 2026-04-29 during Phase 5 Ville bootstrap). HF Ville's
+  legacy `HT_Order_Up` / `HT_Order_Down` tables hold 8 rows each
+  where `id` is a tier number (1, 2, 3) — NOT a unique key. Real
+  composite key is `(id, cust_type, cast_type)`. The original
+  single-column PK from migration 020 blew up the dimension reload
+  TX with `duplicate key value violates unique constraint` on every
+  reconcile tick at any site that actually populated the tables.
+  HF Hotel never hit it because both tables are empty there. Fix:
+  new migration 023 plus matching `init-hotelnew.sql` schema. Both
+  DBs converge on the corrected baseline. Phase 5.5b mirror feature
+  (#80) can now bootstrap these dimension tables successfully.
+
+  Pre-flight verified all 4 affected tables (hotelnew + hotelville,
+  ht_order_up + ht_order_down) were empty before applying — no row
+  data conversion needed for the `ALTER COLUMN ... NOT NULL` step.
+  Migration 023 manually applied to both DBs on evergreen 2026-04-29
+  ahead of CI; subsequent CI deploys see migration 023 already in
+  schema_migrations and skip cleanly.
+
 ## [2.54.16] - 2026-04-29
 
 ### Added
