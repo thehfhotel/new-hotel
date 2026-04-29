@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.6] - 2026-04-29
+
+### Added
+
+- **`MSSQL_PORT` env var (default `1433`).** Phase 5 enabling work for HF
+  Ville: the new SS2025 Express instance there listens on `1436`, not the
+  default `1433`. Previously `hotel-backend/src/db/pool.rs` hardcoded
+  `tib_config.port(1433)`, so a multi-site deploy was impossible without
+  forking. The new `DbConfig::port: u16` field threads through into
+  `tiberius::Config::port()`, defaulting to 1433 for back-compat at HF
+  Hotel. Plumbed into `docker-compose.yml` for `backend`, `writeback`,
+  `sync`, and `backfill-rooms` services as `MSSQL_PORT=${MSSQL_PORT:-1433}`,
+  and into `.github/workflows/docker-build.yml` as an optional GH secret
+  (defaults to 1433 in the generated `.env` when the secret is absent).
+  A typo in the value (`MSSQL_PORT=garbage`) panics at startup with a
+  clear message rather than silently falling back to 1433 and connecting
+  to the wrong instance. Documented in both `.env.example` files.
+
+### Changed
+
+- **bb8/tiberius circuit-breaker timeouts.** Audit-flagged gap: the bb8
+  pool used the library defaults (`connection_timeout: 30s`,
+  `max_lifetime: 30 min`, `idle_timeout: 10 min`) implicitly, and
+  tiberius's `Config` builder exposes no socket-level connect timeout.
+  Result: a hung MSSQL or a dropped WireGuard tunnel produced an
+  unbounded bb8 acquire queue with no alert. Now `db/pool.rs`
+  explicitly sets `connection_timeout(15s)` (also caps the TCP connect
+  since bb8 wraps `ConnectionManager::connect` in
+  `tokio::time::timeout`), `max_lifetime(30 min)`, and `idle_timeout(10
+  min)` as named `POOL_*` constants with one-line "why" comments. Pool
+  builder values asserted in unit tests via `pool.config()` so a future
+  typo on the timeout setter can't silently regress to the bb8 default.
+
+### Security
+
+- **Removed the hardcoded `DB_PASSWORD` fallback (`"12345678"`).** Audit
+  finding: `hotel-backend/src/config.rs:34` previously fell through to a
+  default password string when the GH secret was missing/empty — exactly
+  the silent-credential-leak failure mode flagged in the
+  `.env`-rewrite-by-CI pitfall (see `docs/runbook-sync.md §4a`). The new
+  `require_secret` helper panics loudly at startup if `DB_PASSWORD` is
+  unset OR is the empty string (a botched `.env` rewrite produces
+  `DB_PASSWORD=''`, which `env::var` returns as `Ok("")` — also rejected).
+  Same fail-loud policy applied to `VilleDbConfig::password` when
+  `VILLE_DB_ENABLED=true`; left as best-effort when the mirror is
+  disabled (the HF Hotel default) so operators without the Ville secret
+  provisioned can still boot the backend. Six new unit tests cover
+  default port, explicit port, garbage port, missing password, empty
+  password, and password-propagation paths.
+
 ## [2.54.5] - 2026-04-29
 
 ### Added

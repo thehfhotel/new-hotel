@@ -491,6 +491,10 @@ jobs:
           DB_NAME: ${{ secrets.DB_NAME }}
           DB_USER: ${{ secrets.DB_USER }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          # Optional override — when the secret isn't set the deploy
+          # script defaults to 1433 (HF Hotel). HF Ville will set this
+          # to 1436 when its pipeline lands (task #69).
+          MSSQL_PORT: ${{ secrets.MSSQL_PORT }}
           POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
           POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
@@ -533,12 +537,18 @@ jobs:
           # 644-then-chmod, which leaves a brief world-readable window).
           umask 077
 
+          # MSSQL_PORT is optional — default 1433 if the GH secret isn't
+          # set so existing HF Hotel deploys are unchanged. HF Ville
+          # will provide this secret to point at SS2025 Express on 1436.
+          MSSQL_PORT_VALUE="${MSSQL_PORT:-1433}"
+
           # Write .env file from GitHub Secrets (values single-quoted for special chars)
           {
             echo "DB_SERVER='${DB_SERVER}'"
             echo "DB_NAME='${DB_NAME}'"
             echo "DB_USER='${DB_USER}'"
             echo "DB_PASSWORD='${DB_PASSWORD}'"
+            echo "MSSQL_PORT='${MSSQL_PORT_VALUE}'"
             echo "POSTGRES_DB='${POSTGRES_DB}'"
             echo "POSTGRES_USER='${POSTGRES_USER}'"
             echo "POSTGRES_PASSWORD='${POSTGRES_PASSWORD}'"
