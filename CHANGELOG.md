@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.14] - 2026-04-29
+
+### Added
+
+- **`scripts/sync-status.sh --site <hfhotel|hfville>`** flag (task #78,
+  finishing the per-site observability slice begun in #69). Selects which
+  site's canonical PG database to query — `hfhotel` (default) → `hotelnew`,
+  `hfville` → `hotelville`. Both databases live in the same `new-hotel-db`
+  container, so only the `psql -d` target changes; SSH host, container
+  name, and Postgres user are unchanged. Default is `hfhotel` for
+  back-compat with every pre-#78 invocation. `SYNC_STATUS_PG_DATABASE`
+  override still wins for `hfhotel`; a new `SYNC_STATUS_PG_DATABASE_HFVILLE`
+  override is recognized for ad-hoc Ville database renames.
+
+### Changed
+
+- **Backend `/health` endpoint** now also returns the current site's CT
+  watermark snapshot — `ct_watermark` (i64) and `last_polled_at` (RFC3339
+  string), pulled from the canonical PG `legacy_ct_state` row (task #78).
+  The endpoint remains a LIVENESS probe — `ok: true` always, even when
+  the watermark fields are `null`. Pre-bootstrap installs (no row),
+  legacy-only mode (no PG pool), and transient PG errors all collapse to
+  `null` watermark fields with a `tracing::warn!` on the SQL-error path,
+  so the load-balancer probe contract is preserved. Existing fields
+  (`site`, `ok`, `service`) are unchanged. New unit tests cover both the
+  populated and null-watermark response shapes; the SQL fetch path uses
+  the runtime `sqlx::query_as` (no `.sqlx/` macro cache regeneration
+  needed).
+
 ## [2.54.13] - 2026-04-29
 
 ### Fixed

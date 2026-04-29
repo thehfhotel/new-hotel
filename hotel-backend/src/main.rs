@@ -200,12 +200,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Legacy-read routes (rooms, bookings, customers, stats) use LEGACY_READ_SOURCE feature flag
     let new_routes = if let Some(ref app_state) = final_app_state {
         build_new_routes(app_state.clone())
-    } else if let Some(pg_pool) = new_pool_for_newonly {
+    } else if let Some(ref pg_pool) = new_pool_for_newonly {
         // New-only mode: create a placeholder AppState
         // Legacy pool won't be used since legacy routes are disabled
         // We need a DbPool though... Let's try creating one that will fail gracefully
+        // Clone the pg_pool here so the original stays available for the
+        // /health route's HealthState construction below (task #78).
         match create_pool(&config.db).await {
-            Ok(legacy) => build_new_routes(AppState::with_mode(legacy, pg_pool, SystemMode::New)),
+            Ok(legacy) => build_new_routes(AppState::with_mode(legacy, pg_pool.clone(), SystemMode::New)),
             Err(_) => {
                 // Can't get legacy pool at all - create routes with just the PG pool
                 // We'll need to handle this differently
@@ -217,11 +219,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Router::new()
     };
 
-    // Healthcheck (`/health`) — task #69. Carries the site id so an
-    // operator / external monitor can tell which deployment responded
-    // when HF Hotel + HF Ville share a Slack webhook + log sink.
+    // Healthcheck (`/health`) — task #69 (site id) + task #78 (CT
+    // watermark). Carries the site id so an operator / external monitor
+    // can tell which deployment responded when HF Hotel + HF Ville
+    // share a Slack webhook + log sink, AND the canonical PG pool so
+    // the handler can include the current `legacy_ct_state` snapshot.
+    // The PG pool is optional: legacy-only mode (no PG configured) is
+    // still supported, and the handler renders `null` for the
+    // watermark fields in that case.
+    let health_pg_pool = match &final_app_state {
+        Some(state) => Some(state.new_pool.clone()),
+        None => new_pool_for_newonly.as_ref().cloned(),
+    };
     let health_state = routes::health::HealthState {
         site_id: config.site.id.clone(),
+        pg_pool: health_pg_pool,
     };
     let health_routes = Router::new()
         .route("/health", get(routes::health::health))
