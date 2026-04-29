@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.12] - 2026-04-29
+
+### Fixed
+
+- **`bin/backfill_rooms.rs` + `bin/migrate_legacy.rs`** — both binaries
+  had their own duplicated MSSQL connection logic that bypassed task
+  #68's `MSSQL_PORT` env handling, password-fallback removal, and bb8
+  circuit-breaker timeouts. Caught when trying to run
+  `backfill_rooms` against HF Ville on port 1436: TCP connect timed
+  out because the binary was hardcoded to 1433 (the SS2025 Express
+  instance at Ville does not listen on the default port). Refactor:
+  both binaries now call `DbConfig::from_env()` + `db::create_pool()`
+  so they inherit the same env handling and timeouts as the main
+  backend. Removed the duplicated `unwrap_or_else(|| "12345678")`
+  fallbacks and the hardcoded `.port(1433)` calls.
+
 ## [2.54.11] - 2026-04-29
 
 ### Changed

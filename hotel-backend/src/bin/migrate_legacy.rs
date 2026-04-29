@@ -698,30 +698,19 @@ async fn bump_sequences(
 // =============================================================================
 
 async fn create_legacy_pool() -> Result<bb8::Pool<bb8_tiberius::ConnectionManager>, Box<dyn std::error::Error>> {
-    let server = std::env::var("DB_SERVER").unwrap_or_else(|_| "192.168.100.222".to_string());
-    let database = std::env::var("DB_NAME").unwrap_or_else(|_| "db".to_string());
-    let user = std::env::var("DB_USER").unwrap_or_else(|_| "sa".to_string());
-    let password = std::env::var("DB_PASSWORD").unwrap_or_else(|_| "12345678".to_string());
+    // Use the centralised DbConfig + create_pool to inherit MSSQL_PORT env
+    // handling, the require_secret check for DB_PASSWORD, and the bb8
+    // circuit-breaker timeouts. Same pattern as backfill_rooms.rs.
+    let config = hotel_backend::config::DbConfig::from_env();
+    let server = config.server.clone();
+    let port = config.port;
+    let pool = hotel_backend::db::create_pool(&config).await?;
 
-    let mut config = tiberius::Config::new();
-    config.host(&server);
-    config.port(1433);
-    config.database(&database);
-    config.authentication(tiberius::AuthMethod::sql_server(&user, &password));
-    config.trust_cert();
-
-    let manager = bb8_tiberius::ConnectionManager::new(config);
-    let pool = bb8::Pool::builder()
-        .max_size(5)
-        .build(manager)
-        .await?;
-
-    // Test connection
     {
         let mut conn = pool.get().await?;
         let _ = conn.simple_query("SELECT 1").await?;
     }
-    tracing::info!("Connected to legacy SQL Server at {}", server);
+    tracing::info!("Connected to legacy SQL Server at {}:{}", server, port);
 
     Ok(pool)
 }
