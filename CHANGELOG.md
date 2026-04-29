@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.19] - 2026-04-29
+
+### Fixed
+
+- **`migrate_legacy.rs` referenced `Book_Room_No` column** that does not
+  exist in `View_Booking_Ds` at EITHER site (legacy reservations record
+  only the room TYPE at booking time; the actual room is assigned at
+  check-in via `HT_CheckIn_Ds.Cin_Room_No`). Discovered 2026-04-29 when
+  trying to backfill canonical state for HF Ville (task #85). The
+  binary worked at HF Hotel only because nobody had run it post-cutover
+  there — canonical bookings flowed in via CT events instead. Fix:
+  remove the column from the SELECT, set `room_id = None` in the
+  booking-room loop, rely on the checkin-import / CT-mapper flow to
+  materialise the room linkage. The booking-room insert still skips
+  when `room_id` is None (as it always did for any booking that didn't
+  match a known room).
+- **Migration 024** widened canonical `ht_customers` VARCHAR(20)
+  columns to match what migration 009 did to the `ht_customers_legacy`
+  cache. Specifically `cust_phone` 20 → 200, plus
+  `cust_code` / `cust_idcard` / `cust_title` / `cust_taxid` /
+  `legacy_cust_no` to 100, and `source` to 50. Required because one
+  HF Ville customer's `Cust_Add_tel` is 21 chars — exceeds the old
+  cap. Manually applied to both DBs on evergreen ahead of CI; later
+  CI deploys see migration 024 in `schema_migrations` and skip.
+
 ## [2.54.18] - 2026-04-29
 
 ### Added

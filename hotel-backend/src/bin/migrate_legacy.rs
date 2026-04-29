@@ -411,7 +411,7 @@ async fn import_bookings(
             SELECT
                 Book_No, Book_Date, Book_Date_in, Book_Date_out,
                 Book_Cust_Name, Book_Cust_ID, Book_Status,
-                Book_Room_Type, Book_Room_No
+                Book_Room_Type
             FROM View_Booking_Ds
             ORDER BY Book_No, Book_Room_Type
             "#,
@@ -490,16 +490,22 @@ async fn import_bookings(
 
         stats.bookings += 1;
 
-        // Create booking-room records for each row in the group
+        // Create booking-room records for each row in the group.
+        // Note: View_Booking_Ds at both sites does NOT carry Book_Room_No
+        // (legacy reservations record only the room TYPE at booking time;
+        // the actual room is assigned at check-in via HT_CheckIn_Ds).
+        // We can still create the booking-rooms row to record the type
+        // grouping but room_id stays NULL — the room linkage gets
+        // populated later by the checkin import / CT mapper flow.
+        // The br_book_id+br_room_id PK requires a non-NULL room_id, so
+        // we skip the insert entirely for now and rely on the checkin
+        // import to materialise the linkage.
         for r in rows {
             let room_type = r.get::<&str, _>("Book_Room_Type").unwrap_or_default().to_string();
-            let room_no = r.get::<&str, _>("Book_Room_No").map(String::from);
+            let room_id: Option<i32> = None; // never set at booking time
 
             let room_type_id = room_type_map.get(&room_type).copied();
-            let room_id = room_no
-                .as_ref()
-                .and_then(|no| room_map.get(no))
-                .copied();
+            let _ = room_type_id; // silence unused-var until booking_rooms accepts room_type-only rows
 
             // Only create booking_room if we have a room
             if let Some(room_id) = room_id {
