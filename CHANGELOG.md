@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.4] - 2026-04-29
+
+### Fixed
+
+- **Drift-reconcile spam loop, round 2 (multi-row PK aggregation).** The
+  2.54.2 fix (cache-write the new hash after `record_divergence`) was
+  necessary but not sufficient: `View_CheckIn_Ds` returns 41-45 rows
+  per `Cin_no` (24,904 total / 19,169 distinct PKs) and
+  `View_Booking_Ds` returns up to 3 rows per `(Book_No, Book_Room_Type)`
+  composite PK. The per-row loop in `sync_checkins` / `sync_bookings`
+  hashed each row independently against the single-row-per-PK
+  `ht_*_legacy` cache — every iteration produced a different hash, and
+  consecutive iterations of the same PK in one tick re-flagged
+  divergence and overwrote the cache, so the next reconcile tick
+  re-flagged the whole world again. Slack alert fired every 15 min at
+  ~8,773 unresolved rows on `checkins`. Fix: aggregate all detail rows
+  by PK into a `BTreeMap<PK, Vec<Detail>>` first, deterministic-sort
+  the group (checkins by `(room_no, room_in, room_out)`; bookings by
+  the six non-key fields), and hash a deterministic concatenation of
+  the entire group — one `record_divergence` and one cache UPDATE per
+  PK regardless of how many rows the view projected. Extracted pure
+  helpers `aggregate_checkin_hash` / `aggregate_booking_hash` (+ small
+  `CheckinDetail` / `BookingDetail` private structs) so the
+  determinism + sensitivity contract is unit-tested. SQL strings
+  unchanged; `ht_*_legacy` schema unchanged. `sync_customers` /
+  `sync_rooms` left untouched (1:1 PKs, not affected). Also: in
+  `DiffOnly` mode the `mssql_row_json` payload now carries the full
+  sorted `details` array so an operator can see what changed across
+  all rooms on the booking, not just one row.
+
 ## [2.54.3] - 2026-04-29
 
 ### Removed

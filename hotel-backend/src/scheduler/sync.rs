@@ -35,6 +35,7 @@
 use chrono::NaiveDateTime;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::env;
 use std::time::Instant;
 
@@ -256,6 +257,193 @@ fn sha256(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+// =============================================================================
+// Multi-row PK aggregation (Phase 6 hotfix 2026-04-29)
+// =============================================================================
+//
+// `View_CheckIn_Ds` and `View_Booking_Ds` both project multiple rows
+// per logical PK (one per booked detail/room). Hashing each row
+// independently against the single-row-per-PK `ht_*_legacy` cache
+// caused the reconcile job to flag the same PKs as drifted on every
+// tick (~22-24k/hour Slack spam observed 2026-04-29).
+//
+// Fix: aggregate rows by PK into a deterministic group, sort the group
+// by stable discriminating fields, and hash a deterministic
+// concatenation of the entire group. One hash per PK, one
+// `record_divergence` per PK, one cache UPDATE per PK.
+//
+// Helpers below are pure (no PG, no env, no time) so they're
+// unit-testable in `mod tests`.
+
+/// One detail-row of a check-in. `View_CheckIn_Ds` returns 41-45 of
+/// these per `Cin_no` (one per booked room).
+#[derive(Debug, Clone)]
+struct CheckinDetail {
+    room_no: Option<String>,
+    room_in: Option<NaiveDateTime>,
+    room_out: Option<NaiveDateTime>,
+    cust_name: Option<String>,
+    cust_no: Option<String>,
+    status: Option<String>,
+}
+
+/// One detail-row of a booking. `View_Booking_Ds` returns up to 3 of
+/// these per composite PK `(Book_No, Book_Room_Type)`.
+#[derive(Debug, Clone)]
+struct BookingDetail {
+    book_date: Option<NaiveDateTime>,
+    book_date_in: Option<NaiveDateTime>,
+    book_date_out: Option<NaiveDateTime>,
+    book_cust_name: Option<String>,
+    book_cust_id: Option<String>,
+    book_status: Option<i32>,
+    book_room_type: Option<String>,
+}
+
+/// Render an `Option<NaiveDateTime>` deterministically. Empty string
+/// for `None` so it's distinguishable from the `Debug` `"None"` literal
+/// only by absence — both encodings are stable, but using a fixed
+/// sentinel avoids the `Some(...)` wrapper noise and matches what the
+/// JSON projection emits.
+fn fmt_dt(dt: &Option<NaiveDateTime>) -> String {
+    dt.map(|d| d.to_string()).unwrap_or_default()
+}
+
+/// Render an `Option<String>` deterministically.
+fn fmt_str(s: &Option<String>) -> String {
+    s.clone().unwrap_or_default()
+}
+
+/// Aggregate all detail rows for one `Cin_no` into a single
+/// deterministic SHA256 hash. Sorts `details` in place by
+/// `(room_no, room_in, room_out)` so the hash is independent of the
+/// order MSSQL returned the rows.
+fn aggregate_checkin_hash(cin_no: &str, details: &mut Vec<CheckinDetail>) -> String {
+    details.sort_by(|a, b| {
+        (
+            fmt_str(&a.room_no),
+            fmt_dt(&a.room_in),
+            fmt_dt(&a.room_out),
+        )
+            .cmp(&(
+                fmt_str(&b.room_no),
+                fmt_dt(&b.room_in),
+                fmt_dt(&b.room_out),
+            ))
+    });
+
+    let body = details
+        .iter()
+        .map(|d| {
+            format!(
+                "{}|{}|{}|{}|{}|{}",
+                fmt_str(&d.room_no),
+                fmt_dt(&d.room_in),
+                fmt_dt(&d.room_out),
+                fmt_str(&d.cust_name),
+                fmt_str(&d.cust_no),
+                fmt_str(&d.status),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    sha256(&format!("{cin_no}|{body}"))
+}
+
+/// Aggregate all detail rows for one `(Book_No, Book_Room_Type)` PK
+/// into a single deterministic SHA256 hash. Sorts `details` in place
+/// by `(book_date, book_date_in, book_date_out, book_cust_name,
+/// book_cust_id, book_status)` — every non-key field — so the hash is
+/// independent of the order MSSQL returned the rows.
+fn aggregate_booking_hash(
+    book_no: &str,
+    room_type_key: &str,
+    details: &mut Vec<BookingDetail>,
+) -> String {
+    details.sort_by(|a, b| {
+        (
+            fmt_dt(&a.book_date),
+            fmt_dt(&a.book_date_in),
+            fmt_dt(&a.book_date_out),
+            fmt_str(&a.book_cust_name),
+            fmt_str(&a.book_cust_id),
+            a.book_status.unwrap_or(i32::MIN),
+        )
+            .cmp(&(
+                fmt_dt(&b.book_date),
+                fmt_dt(&b.book_date_in),
+                fmt_dt(&b.book_date_out),
+                fmt_str(&b.book_cust_name),
+                fmt_str(&b.book_cust_id),
+                b.book_status.unwrap_or(i32::MIN),
+            ))
+    });
+
+    let body = details
+        .iter()
+        .map(|d| {
+            format!(
+                "{}|{}|{}|{}|{}|{:?}|{}",
+                fmt_dt(&d.book_date),
+                fmt_dt(&d.book_date_in),
+                fmt_dt(&d.book_date_out),
+                fmt_str(&d.book_cust_name),
+                fmt_str(&d.book_cust_id),
+                d.book_status,
+                fmt_str(&d.book_room_type),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    sha256(&format!("{book_no}|{room_type_key}|{body}"))
+}
+
+/// Build the `mssql_row_json` payload for a check-in PK group. Includes
+/// the full sorted details array so an operator can see what changed
+/// across all rooms on the booking — not just one row.
+fn checkin_group_json(cin_no: &str, details: &[CheckinDetail]) -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = details
+        .iter()
+        .map(|d| {
+            json!({
+                "Cin_Room_No": d.room_no,
+                "Cin_Room_In": d.room_in.map(|t| t.to_string()),
+                "Cin_Room_Out": d.room_out.map(|t| t.to_string()),
+                "Cin_cust_name": d.cust_name,
+                "Cin_cust_no": d.cust_no,
+                "Cin_status": d.status,
+            })
+        })
+        .collect();
+    json!({
+        "Cin_no": cin_no,
+        "details": rows,
+    })
+}
+
+/// Build the `mssql_row_json` payload for a booking PK group. Includes
+/// the full sorted details array.
+fn booking_group_json(book_no: &str, details: &[BookingDetail]) -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = details
+        .iter()
+        .map(|d| {
+            json!({
+                "Book_Date": d.book_date.map(|t| t.to_string()),
+                "Book_Date_in": d.book_date_in.map(|t| t.to_string()),
+                "Book_Date_out": d.book_date_out.map(|t| t.to_string()),
+                "Book_Cust_Name": d.book_cust_name,
+                "Book_Cust_ID": d.book_cust_id,
+                "Book_Status": d.book_status,
+                "Book_Room_Type": d.book_room_type,
+            })
+        })
+        .collect();
+    json!({
+        "Book_No": book_no,
+        "details": rows,
+    })
 }
 
 /// Phase 5.5 diff-only path: record a divergence into `ht_reconcile_log`
@@ -806,37 +994,37 @@ async fn sync_bookings(
     let mut updated = 0i32;
     let mut unchanged = 0i32;
 
+    // Phase 6 hotfix (2026-04-29): `View_Booking_Ds` returns up to 3
+    // rows per `(Book_No, Book_Room_Type)` composite PK. The previous
+    // per-row loop computed a different hash for each iteration of the
+    // same PK and re-flagged divergence forever. Aggregate by composite
+    // PK first, then hash the whole group deterministically — one
+    // record_divergence + one cache UPDATE per PK.
+    let mut groups: BTreeMap<(String, String), Vec<BookingDetail>> = BTreeMap::new();
     for row in &rows {
         let book_no = row.get::<&str, _>("Book_No").unwrap_or_default().to_string();
-        let book_date: Option<NaiveDateTime> = row.try_get("Book_Date").unwrap_or(None);
-        let book_date_in: Option<NaiveDateTime> = row.try_get("Book_Date_in").unwrap_or(None);
-        let book_date_out: Option<NaiveDateTime> = row.try_get("Book_Date_out").unwrap_or(None);
-        let book_cust_name = row.get::<&str, _>("Book_Cust_Name").map(String::from);
-        let book_cust_id = row.get::<&str, _>("Book_Cust_ID").map(String::from);
-        let book_status = row.get::<i32, _>("Book_Status");
         let book_room_type = row.get::<&str, _>("Book_Room_Type").map(String::from);
+        let detail = BookingDetail {
+            book_date: row.try_get("Book_Date").unwrap_or(None),
+            book_date_in: row.try_get("Book_Date_in").unwrap_or(None),
+            book_date_out: row.try_get("Book_Date_out").unwrap_or(None),
+            book_cust_name: row.get::<&str, _>("Book_Cust_Name").map(String::from),
+            book_cust_id: row.get::<&str, _>("Book_Cust_ID").map(String::from),
+            book_status: row.get::<i32, _>("Book_Status"),
+            book_room_type: book_room_type.clone(),
+        };
+        let room_type_key = book_room_type.unwrap_or_default();
+        groups.entry((book_no, room_type_key)).or_default().push(detail);
+    }
 
-        let hash_input = format!(
-            "{}|{:?}|{:?}|{:?}|{}|{}|{:?}|{}",
-            book_no,
-            book_date,
-            book_date_in,
-            book_date_out,
-            book_cust_name.as_deref().unwrap_or(""),
-            book_cust_id.as_deref().unwrap_or(""),
-            book_status,
-            book_room_type.as_deref().unwrap_or(""),
-        );
-        let hash = sha256(&hash_input);
-
-        // Composite key: book_no + room_type
-        let room_type_key = book_room_type.as_deref().unwrap_or("");
+    for ((book_no, room_type_key), mut details) in groups {
+        let hash = aggregate_booking_hash(&book_no, &room_type_key, &mut details);
 
         let existing = sqlx::query_scalar::<_, Option<String>>(
             "SELECT sync_hash FROM ht_bookings_legacy WHERE book_no = $1 AND COALESCE(book_room_type, '') = $2"
         )
         .bind(&book_no)
-        .bind(room_type_key)
+        .bind(&room_type_key)
         .fetch_optional(pg_pool)
         .await?;
 
@@ -846,6 +1034,11 @@ async fn sync_bookings(
             }
             Some(prior_hash) => match mode {
                 ReconcileMode::Upsert => {
+                    // Cache row is single-row per PK by schema; canonical
+                    // multi-row data lives in `ht_bookings`. Pick the
+                    // first deterministically-sorted detail as the
+                    // representative row for the cache columns.
+                    let canonical = &details[0];
                     sqlx::query(
                         r#"
                         UPDATE ht_bookings_legacy
@@ -855,30 +1048,21 @@ async fn sync_bookings(
                         WHERE book_no = $8 AND COALESCE(book_room_type, '') = $9
                         "#,
                     )
-                    .bind(&book_date)
-                    .bind(&book_date_in)
-                    .bind(&book_date_out)
-                    .bind(&book_cust_name)
-                    .bind(&book_cust_id)
-                    .bind(&book_status)
+                    .bind(&canonical.book_date)
+                    .bind(&canonical.book_date_in)
+                    .bind(&canonical.book_date_out)
+                    .bind(&canonical.book_cust_name)
+                    .bind(&canonical.book_cust_id)
+                    .bind(&canonical.book_status)
                     .bind(&hash)
                     .bind(&book_no)
-                    .bind(room_type_key)
+                    .bind(&room_type_key)
                     .execute(pg_pool)
                     .await?;
                     updated += 1;
                 }
                 ReconcileMode::DiffOnly => {
-                    let mssql_json = json!({
-                        "Book_No": book_no,
-                        "Book_Date": book_date.map(|d| d.to_string()),
-                        "Book_Date_in": book_date_in.map(|d| d.to_string()),
-                        "Book_Date_out": book_date_out.map(|d| d.to_string()),
-                        "Book_Cust_Name": book_cust_name,
-                        "Book_Cust_ID": book_cust_id,
-                        "Book_Status": book_status,
-                        "Book_Room_Type": book_room_type,
-                    });
+                    let mssql_json = booking_group_json(&book_no, &details);
                     let composite_pk = format!("{book_no}|{room_type_key}");
                     record_divergence(
                         pg_pool,
@@ -893,14 +1077,15 @@ async fn sync_bookings(
                     // Phase 6 fix: ack the divergence in the cache so the
                     // next reconcile tick doesn't re-flag the same row.
                     // Composite PK on bookings — match the SELECT shape
-                    // at line 811 above.
+                    // above. ONE UPDATE per PK now (was per-row, which
+                    // race-tripped the spam under multi-row PKs).
                     let _ = sqlx::query(
                         "UPDATE ht_bookings_legacy SET sync_hash = $1, synced_at = NOW() \
                          WHERE book_no = $2 AND COALESCE(book_room_type, '') = $3",
                     )
                     .bind(&hash)
                     .bind(&book_no)
-                    .bind(room_type_key)
+                    .bind(&room_type_key)
                     .execute(pg_pool)
                     .await;
                     updated += 1;
@@ -908,6 +1093,7 @@ async fn sync_bookings(
             },
             None => match mode {
                 ReconcileMode::Upsert => {
+                    let canonical = &details[0];
                     sqlx::query(
                         r#"
                         INSERT INTO ht_bookings_legacy
@@ -918,29 +1104,20 @@ async fn sync_bookings(
                         "#,
                     )
                     .bind(&book_no)
-                    .bind(&book_date)
-                    .bind(&book_date_in)
-                    .bind(&book_date_out)
-                    .bind(&book_cust_name)
-                    .bind(&book_cust_id)
-                    .bind(&book_status)
-                    .bind(&book_room_type)
+                    .bind(&canonical.book_date)
+                    .bind(&canonical.book_date_in)
+                    .bind(&canonical.book_date_out)
+                    .bind(&canonical.book_cust_name)
+                    .bind(&canonical.book_cust_id)
+                    .bind(&canonical.book_status)
+                    .bind(&canonical.book_room_type)
                     .bind(&hash)
                     .execute(pg_pool)
                     .await?;
                     added += 1;
                 }
                 ReconcileMode::DiffOnly => {
-                    let mssql_json = json!({
-                        "Book_No": book_no,
-                        "Book_Date": book_date.map(|d| d.to_string()),
-                        "Book_Date_in": book_date_in.map(|d| d.to_string()),
-                        "Book_Date_out": book_date_out.map(|d| d.to_string()),
-                        "Book_Cust_Name": book_cust_name,
-                        "Book_Cust_ID": book_cust_id,
-                        "Book_Status": book_status,
-                        "Book_Room_Type": book_room_type,
-                    });
+                    let mssql_json = booking_group_json(&book_no, &details);
                     let composite_pk = format!("{book_no}|{room_type_key}");
                     record_divergence(
                         pg_pool,
@@ -1004,26 +1181,26 @@ async fn sync_checkins(
     let mut updated = 0i32;
     let mut unchanged = 0i32;
 
+    // Phase 6 hotfix (2026-04-29): `View_CheckIn_Ds` returns 41-45 rows
+    // per `Cin_no` (one per booked room/detail). Aggregate by PK first,
+    // then compute one deterministic hash per PK, so we record one
+    // divergence + one cache UPDATE per PK instead of per-row.
+    let mut groups: BTreeMap<String, Vec<CheckinDetail>> = BTreeMap::new();
     for row in &rows {
         let cin_no = row.get::<&str, _>("Cin_no").unwrap_or_default().to_string();
-        let cin_room_no = row.get::<&str, _>("Cin_Room_No").map(String::from);
-        let cin_room_in: Option<NaiveDateTime> = row.try_get("Cin_Room_In").unwrap_or(None);
-        let cin_room_out: Option<NaiveDateTime> = row.try_get("Cin_Room_Out").unwrap_or(None);
-        let cin_cust_name = row.get::<&str, _>("Cin_cust_name").map(String::from);
-        let cin_cust_no = row.get::<&str, _>("Cin_cust_no").map(String::from);
-        let cin_status = row.get::<&str, _>("Cin_status").map(String::from);
+        let detail = CheckinDetail {
+            room_no: row.get::<&str, _>("Cin_Room_No").map(String::from),
+            room_in: row.try_get("Cin_Room_In").unwrap_or(None),
+            room_out: row.try_get("Cin_Room_Out").unwrap_or(None),
+            cust_name: row.get::<&str, _>("Cin_cust_name").map(String::from),
+            cust_no: row.get::<&str, _>("Cin_cust_no").map(String::from),
+            status: row.get::<&str, _>("Cin_status").map(String::from),
+        };
+        groups.entry(cin_no).or_default().push(detail);
+    }
 
-        let hash_input = format!(
-            "{}|{}|{:?}|{:?}|{}|{}|{}",
-            cin_no,
-            cin_room_no.as_deref().unwrap_or(""),
-            cin_room_in,
-            cin_room_out,
-            cin_cust_name.as_deref().unwrap_or(""),
-            cin_cust_no.as_deref().unwrap_or(""),
-            cin_status.as_deref().unwrap_or(""),
-        );
-        let hash = sha256(&hash_input);
+    for (cin_no, mut details) in groups {
+        let hash = aggregate_checkin_hash(&cin_no, &mut details);
 
         let existing = sqlx::query_scalar::<_, Option<String>>(
             "SELECT sync_hash FROM ht_checkins_legacy WHERE cin_no = $1"
@@ -1038,6 +1215,11 @@ async fn sync_checkins(
             }
             Some(prior_hash) => match mode {
                 ReconcileMode::Upsert => {
+                    // Cache row is single-row per PK by schema; canonical
+                    // multi-room data lives in `ht_checkins`. Pick the
+                    // first deterministically-sorted detail as the
+                    // representative row for the cache columns.
+                    let canonical = &details[0];
                     sqlx::query(
                         r#"
                         UPDATE ht_checkins_legacy
@@ -1047,12 +1229,12 @@ async fn sync_checkins(
                         WHERE cin_no = $8
                         "#,
                     )
-                    .bind(&cin_room_no)
-                    .bind(&cin_room_in)
-                    .bind(&cin_room_out)
-                    .bind(&cin_cust_name)
-                    .bind(&cin_cust_no)
-                    .bind(&cin_status)
+                    .bind(&canonical.room_no)
+                    .bind(&canonical.room_in)
+                    .bind(&canonical.room_out)
+                    .bind(&canonical.cust_name)
+                    .bind(&canonical.cust_no)
+                    .bind(&canonical.status)
                     .bind(&hash)
                     .bind(&cin_no)
                     .execute(pg_pool)
@@ -1060,15 +1242,7 @@ async fn sync_checkins(
                     updated += 1;
                 }
                 ReconcileMode::DiffOnly => {
-                    let mssql_json = json!({
-                        "Cin_no": cin_no,
-                        "Cin_Room_No": cin_room_no,
-                        "Cin_Room_In": cin_room_in.map(|d| d.to_string()),
-                        "Cin_Room_Out": cin_room_out.map(|d| d.to_string()),
-                        "Cin_cust_name": cin_cust_name,
-                        "Cin_cust_no": cin_cust_no,
-                        "Cin_status": cin_status,
-                    });
+                    let mssql_json = checkin_group_json(&cin_no, &details);
                     record_divergence(
                         pg_pool,
                         "checkins",
@@ -1083,7 +1257,9 @@ async fn sync_checkins(
                     // next reconcile tick doesn't re-flag the same row.
                     // This is the dominant source of the 22-24k/hour drift
                     // alert spam observed 2026-04-29 — every reconcile
-                    // re-detected the same ~3k checkin PKs forever.
+                    // re-detected the same ~3k checkin PKs forever. ONE
+                    // UPDATE per PK (was per-row → re-flagged within tick
+                    // for multi-row PKs).
                     let _ = sqlx::query(
                         "UPDATE ht_checkins_legacy SET sync_hash = $1, synced_at = NOW() \
                          WHERE cin_no = $2",
@@ -1097,6 +1273,7 @@ async fn sync_checkins(
             },
             None => match mode {
                 ReconcileMode::Upsert => {
+                    let canonical = &details[0];
                     sqlx::query(
                         r#"
                         INSERT INTO ht_checkins_legacy
@@ -1106,27 +1283,19 @@ async fn sync_checkins(
                         "#,
                     )
                     .bind(&cin_no)
-                    .bind(&cin_room_no)
-                    .bind(&cin_room_in)
-                    .bind(&cin_room_out)
-                    .bind(&cin_cust_name)
-                    .bind(&cin_cust_no)
-                    .bind(&cin_status)
+                    .bind(&canonical.room_no)
+                    .bind(&canonical.room_in)
+                    .bind(&canonical.room_out)
+                    .bind(&canonical.cust_name)
+                    .bind(&canonical.cust_no)
+                    .bind(&canonical.status)
                     .bind(&hash)
                     .execute(pg_pool)
                     .await?;
                     added += 1;
                 }
                 ReconcileMode::DiffOnly => {
-                    let mssql_json = json!({
-                        "Cin_no": cin_no,
-                        "Cin_Room_No": cin_room_no,
-                        "Cin_Room_In": cin_room_in.map(|d| d.to_string()),
-                        "Cin_Room_Out": cin_room_out.map(|d| d.to_string()),
-                        "Cin_cust_name": cin_cust_name,
-                        "Cin_cust_no": cin_cust_no,
-                        "Cin_status": cin_status,
-                    });
+                    let mssql_json = checkin_group_json(&cin_no, &details);
                     record_divergence(
                         pg_pool,
                         "checkins",
@@ -1306,5 +1475,168 @@ mod tests {
     fn threshold_falls_back_on_garbage() {
         let v = with_threshold_env(Some("not-a-number"), drift_alert_threshold_from_env);
         assert_eq!(v, DEFAULT_DRIFT_ALERT_THRESHOLD);
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 6 hotfix (2026-04-29) — multi-row PK aggregation determinism
+    // -------------------------------------------------------------------
+    //
+    // `View_CheckIn_Ds` returns 41-45 rows per `Cin_no`; `View_Booking_Ds`
+    // returns up to 3 rows per `(Book_No, Book_Room_Type)`. Hashing each
+    // row independently against a single-row-per-PK cache caused a
+    // ~22-24k/hour drift-alert spam loop. These tests pin the
+    // determinism + sensitivity contract of the aggregation helpers.
+
+    use chrono::NaiveDate;
+
+    fn dt(y: i32, m: u32, d: u32, h: u32, min: u32) -> Option<NaiveDateTime> {
+        Some(
+            NaiveDate::from_ymd_opt(y, m, d)
+                .unwrap()
+                .and_hms_opt(h, min, 0)
+                .unwrap(),
+        )
+    }
+
+    fn checkin_detail(
+        room: &str,
+        in_dt: Option<NaiveDateTime>,
+        out_dt: Option<NaiveDateTime>,
+    ) -> CheckinDetail {
+        CheckinDetail {
+            room_no: Some(room.to_string()),
+            room_in: in_dt,
+            room_out: out_dt,
+            cust_name: Some("Somchai".to_string()),
+            cust_no: Some("C001".to_string()),
+            status: Some("OPEN".to_string()),
+        }
+    }
+
+    #[test]
+    fn aggregate_checkin_hash_is_order_independent() {
+        let a = checkin_detail("101", dt(2026, 4, 1, 14, 0), dt(2026, 4, 3, 12, 0));
+        let b = checkin_detail("102", dt(2026, 4, 1, 14, 0), dt(2026, 4, 3, 12, 0));
+        let c = checkin_detail("103", dt(2026, 4, 1, 14, 0), dt(2026, 4, 3, 12, 0));
+
+        let mut forward = vec![a.clone(), b.clone(), c.clone()];
+        let mut reversed = vec![c, b, a];
+
+        let h1 = aggregate_checkin_hash("CIN-1", &mut forward);
+        let h2 = aggregate_checkin_hash("CIN-1", &mut reversed);
+        assert_eq!(h1, h2, "row order must not affect the aggregate hash");
+    }
+
+    #[test]
+    fn aggregate_checkin_hash_changes_when_a_field_changes() {
+        let a = checkin_detail("101", dt(2026, 4, 1, 14, 0), dt(2026, 4, 3, 12, 0));
+        let mut original = vec![a.clone()];
+        let mut mutated = vec![CheckinDetail {
+            status: Some("CLOSED".to_string()),
+            ..a
+        }];
+
+        let h1 = aggregate_checkin_hash("CIN-1", &mut original);
+        let h2 = aggregate_checkin_hash("CIN-1", &mut mutated);
+        assert_ne!(h1, h2, "field change must produce a different hash");
+    }
+
+    #[test]
+    fn aggregate_checkin_hash_handles_single_row_pk() {
+        // Smoke test for the common case: 1:1 PKs (which `Cin_no`
+        // technically is for the older customer subset). Helper must
+        // not panic and must return a stable hash.
+        let a = checkin_detail("101", dt(2026, 4, 1, 14, 0), dt(2026, 4, 3, 12, 0));
+        let mut once = vec![a.clone()];
+        let mut twice = vec![a];
+
+        let h1 = aggregate_checkin_hash("CIN-1", &mut once);
+        let h2 = aggregate_checkin_hash("CIN-1", &mut twice);
+        assert_eq!(h1, h2);
+        assert!(!h1.is_empty());
+    }
+
+    #[test]
+    fn aggregate_checkin_hash_distinguishes_pk() {
+        let a = checkin_detail("101", dt(2026, 4, 1, 14, 0), dt(2026, 4, 3, 12, 0));
+        let mut g1 = vec![a.clone()];
+        let mut g2 = vec![a];
+
+        let h1 = aggregate_checkin_hash("CIN-1", &mut g1);
+        let h2 = aggregate_checkin_hash("CIN-2", &mut g2);
+        assert_ne!(h1, h2, "PK must be part of the hashed material");
+    }
+
+    fn booking_detail(room_type: &str, status: i32) -> BookingDetail {
+        BookingDetail {
+            book_date: dt(2026, 4, 1, 10, 0),
+            book_date_in: dt(2026, 4, 5, 14, 0),
+            book_date_out: dt(2026, 4, 7, 12, 0),
+            book_cust_name: Some("Somchai".to_string()),
+            book_cust_id: Some("ID-001".to_string()),
+            book_status: Some(status),
+            book_room_type: Some(room_type.to_string()),
+        }
+    }
+
+    #[test]
+    fn aggregate_booking_hash_is_order_independent() {
+        let a = booking_detail("DELUXE", 1);
+        let b = BookingDetail {
+            book_cust_name: Some("Anan".to_string()),
+            ..booking_detail("DELUXE", 2)
+        };
+        let c = BookingDetail {
+            book_cust_id: Some("ID-002".to_string()),
+            ..booking_detail("DELUXE", 1)
+        };
+
+        let mut forward = vec![a.clone(), b.clone(), c.clone()];
+        let mut reversed = vec![c, b, a];
+
+        let h1 = aggregate_booking_hash("BK-1", "DELUXE", &mut forward);
+        let h2 = aggregate_booking_hash("BK-1", "DELUXE", &mut reversed);
+        assert_eq!(h1, h2, "row order must not affect the aggregate hash");
+    }
+
+    #[test]
+    fn aggregate_booking_hash_changes_when_a_field_changes() {
+        let a = booking_detail("DELUXE", 1);
+        let mut original = vec![a.clone()];
+        let mut mutated = vec![BookingDetail {
+            book_status: Some(2),
+            ..a
+        }];
+
+        let h1 = aggregate_booking_hash("BK-1", "DELUXE", &mut original);
+        let h2 = aggregate_booking_hash("BK-1", "DELUXE", &mut mutated);
+        assert_ne!(h1, h2, "field change must produce a different hash");
+    }
+
+    #[test]
+    fn aggregate_booking_hash_handles_single_row_pk() {
+        let a = booking_detail("DELUXE", 1);
+        let mut once = vec![a.clone()];
+        let mut twice = vec![a];
+
+        let h1 = aggregate_booking_hash("BK-1", "DELUXE", &mut once);
+        let h2 = aggregate_booking_hash("BK-1", "DELUXE", &mut twice);
+        assert_eq!(h1, h2);
+        assert!(!h1.is_empty());
+    }
+
+    #[test]
+    fn aggregate_booking_hash_distinguishes_composite_pk() {
+        // (BK-1, DELUXE) vs (BK-1, STANDARD) — the room_type half of
+        // the composite PK must be part of the hash so two PKs
+        // sharing a Book_No don't collide.
+        let a = booking_detail("DELUXE", 1);
+        let b = booking_detail("STANDARD", 1);
+        let mut g1 = vec![a];
+        let mut g2 = vec![b];
+
+        let h1 = aggregate_booking_hash("BK-1", "DELUXE", &mut g1);
+        let h2 = aggregate_booking_hash("BK-1", "STANDARD", &mut g2);
+        assert_ne!(h1, h2, "composite PK key half must be part of the hash");
     }
 }
