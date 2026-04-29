@@ -1,6 +1,9 @@
 //! Calendar API route with hybrid database support
 //!
 //! - GET /api/calendar - Hybrid calendar endpoint fetching from both databases
+//!
+//! Reads legacy data from PG (`ht_bookings_legacy` + `ht_checkins_legacy` cache,
+//! fed by drift-reconcile + CT mappers).
 
 use axum::{
     extract::{Query, State},
@@ -12,14 +15,6 @@ use sqlx::Row;
 
 use crate::error::{ApiError, ApiResult};
 use super::mode::{AppState, Branch, SystemMode};
-
-/// Check if we should read from PostgreSQL (default) or SQL Server
-fn use_pg_source() -> bool {
-    std::env::var("LEGACY_READ_SOURCE")
-        .unwrap_or_else(|_| "pg".to_string())
-        .to_lowercase()
-        != "sqlserver"
-}
 
 /// Query parameters for calendar endpoint
 #[derive(Debug, Deserialize)]
@@ -106,20 +101,12 @@ pub async fn get_calendar(
     let fetch_hfville = branch == Branch::Hfville || branch == Branch::All;
 
     if fetch_hfhotel {
-        // Fetch legacy data from PG mirror or SQL Server based on feature flag
-        let (legacy_bookings, legacy_checkins) = if use_pg_source() {
-            fetch_legacy_calendar_data_pg(
-                &state.new_pool,
-                &params.start_date,
-                &params.end_date,
-            ).await?
-        } else {
-            fetch_legacy_calendar_data(
-                &state.legacy_pool,
-                &params.start_date,
-                &params.end_date,
-            ).await?
-        };
+        // Fetch legacy data from PG mirror (cache fed by drift-reconcile + CT mappers)
+        let (legacy_bookings, legacy_checkins) = fetch_legacy_calendar_data_pg(
+            &state.new_pool,
+            &params.start_date,
+            &params.end_date,
+        ).await?;
 
         all_bookings.extend(legacy_bookings);
         all_checkins.extend(legacy_checkins);
@@ -168,99 +155,6 @@ pub async fn get_calendar(
         },
         mode,
     }))
-}
-
-/// Fetch calendar data from legacy database
-async fn fetch_legacy_calendar_data(
-    pool: &crate::db::DbPool,
-    start_date: &str,
-    end_date: &str,
-) -> ApiResult<(Vec<CalendarBooking>, Vec<CalendarCheckin>)> {
-    let mut conn = pool.get().await?;
-
-    // Fetch bookings from legacy database
-    let booking_query = format!(
-        r#"
-        SELECT
-            Book_No,
-            Book_Cust_Name,
-            Book_Room_No,
-            Book_Date_in,
-            Book_Date_out,
-            Book_Status
-        FROM View_Booking_Ds
-        WHERE CAST(Book_Date_out AS DATE) >= '{}'
-          AND CAST(Book_Date_in AS DATE) <= '{}'
-        ORDER BY Book_Date_in
-        "#,
-        start_date.replace('\'', "''"),
-        end_date.replace('\'', "''")
-    );
-
-    let booking_rows = conn
-        .simple_query(&booking_query)
-        .await?
-        .into_first_result()
-        .await?;
-
-    let bookings: Vec<CalendarBooking> = booking_rows
-        .iter()
-        .map(|row| {
-            let book_no = row.get::<&str, _>("Book_No").unwrap_or_default().to_string();
-            CalendarBooking {
-                id: format!("legacy-booking-{}", book_no),
-                booking_no: book_no,
-                customer_name: row.get::<&str, _>("Book_Cust_Name").map(String::from),
-                room_no: row.get::<&str, _>("Book_Room_No").map(String::from),
-                check_in: row.get::<NaiveDateTime, _>("Book_Date_in").map(|dt| dt.and_utc()),
-                check_out: row.get::<NaiveDateTime, _>("Book_Date_out").map(|dt| dt.and_utc()),
-                status: row.get::<i32, _>("Book_Status").map(|s| map_legacy_status(s)),
-                source: DataSource::Legacy,
-            }
-        })
-        .collect();
-
-    // Fetch check-ins from legacy database
-    let checkin_query = format!(
-        r#"
-        SELECT
-            Cin_CheckIn_No,
-            Cin_Cust_Name,
-            Cin_Room_No,
-            Cin_Room_In,
-            Cin_Room_Out
-        FROM View_CheckIn_Ds
-        WHERE CAST(Cin_Room_Out AS DATE) >= '{}'
-          AND CAST(Cin_Room_In AS DATE) <= '{}'
-        ORDER BY Cin_Room_In
-        "#,
-        start_date.replace('\'', "''"),
-        end_date.replace('\'', "''")
-    );
-
-    let checkin_rows = conn
-        .simple_query(&checkin_query)
-        .await?
-        .into_first_result()
-        .await?;
-
-    let checkins: Vec<CalendarCheckin> = checkin_rows
-        .iter()
-        .map(|row| {
-            let cin_no = row.get::<&str, _>("Cin_CheckIn_No").unwrap_or_default().to_string();
-            CalendarCheckin {
-                id: format!("legacy-checkin-{}", cin_no),
-                checkin_no: cin_no,
-                customer_name: row.get::<&str, _>("Cin_Cust_Name").map(String::from),
-                room_no: row.get::<&str, _>("Cin_Room_No").map(String::from),
-                check_in: row.get::<NaiveDateTime, _>("Cin_Room_In").map(|dt| dt.and_utc()),
-                check_out: row.get::<NaiveDateTime, _>("Cin_Room_Out").map(|dt| dt.and_utc()),
-                source: DataSource::Legacy,
-            }
-        })
-        .collect();
-
-    Ok((bookings, checkins))
 }
 
 /// Fetch legacy calendar data from PostgreSQL mirror tables

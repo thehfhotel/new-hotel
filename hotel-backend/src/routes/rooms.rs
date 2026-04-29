@@ -5,9 +5,8 @@
 //! - GET /api/rooms/status - Get room status history
 //! - GET /api/rooms/checkouts-today - Get rooms with checkout today
 //!
-//! Supports dual read source via LEGACY_READ_SOURCE env var:
-//! - "pg" (default): Read from PostgreSQL tables (ht_rooms_legacy, ht_checkins_legacy)
-//! - "sqlserver": Read from SQL Server (legacy tiberius path)
+//! Reads from PG (`ht_rooms_legacy` / `ht_checkins_legacy` cache, fed by
+//! drift-reconcile + CT mappers).
 
 use axum::{
     extract::{Path, Query, State},
@@ -16,7 +15,6 @@ use axum::{
 use chrono::NaiveDateTime;
 use serde::Deserialize;
 use sqlx::Row;
-use tiberius::Row as TiberiusRow;
 
 use crate::error::{ApiError, ApiResult};
 use crate::models::{
@@ -24,14 +22,6 @@ use crate::models::{
     RoomStatusResponse, RoomsResponse,
 };
 use crate::routes::mode::{AppState, Branch};
-
-/// Check if we should read from PostgreSQL (default) or SQL Server
-fn use_pg_source() -> bool {
-    std::env::var("LEGACY_READ_SOURCE")
-        .unwrap_or_else(|_| "pg".to_string())
-        .to_lowercase()
-        != "sqlserver"
-}
 
 // ─────────────────────────────────────────────────────────────
 // PostgreSQL helpers
@@ -369,249 +359,6 @@ async fn get_checkouts_today_pg(pool: &crate::db::PgPool) -> ApiResult<Vec<Strin
     Ok(room_numbers)
 }
 
-// ─────────────────────────────────────────────────────────────
-// SQL Server (tiberius) helpers - original legacy path
-// ─────────────────────────────────────────────────────────────
-
-/// List all rooms from SQL Server
-async fn list_rooms_sqlserver(pool: &crate::db::DbPool) -> ApiResult<Vec<Room>> {
-    let mut conn = pool.get().await?;
-
-    let rows = conn
-        .simple_query(
-            r#"
-            SELECT
-                Room_no,
-                Room_Type,
-                Room_Details,
-                Room_Clean,
-                Room_Use,
-                Room_Book,
-                Room_Manternace,
-                Room_PriceA,
-                Room_PriceB,
-                Room_PriceC,
-                Room_Group,
-                Room_Book_Name
-            FROM HT_Rooms
-            ORDER BY Room_no
-            "#,
-        )
-        .await?
-        .into_first_result()
-        .await?;
-
-    let rooms: Vec<Room> = rows
-        .iter()
-        .map(|row: &TiberiusRow| Room {
-            room_no: row.get::<&str, _>("Room_no").unwrap_or_default().to_string(),
-            room_type: row.get::<&str, _>("Room_Type").map(String::from),
-            room_details: row.get::<&str, _>("Room_Details").map(String::from),
-            room_clean: row.get::<&str, _>("Room_Clean").map(String::from),
-            room_use: row.get::<&str, _>("Room_Use").map(String::from),
-            room_book: row.get::<&str, _>("Room_Book").map(String::from),
-            room_manternace: row.get::<&str, _>("Room_Manternace").map(String::from),
-            room_price_a: row.get::<f64, _>("Room_PriceA"),
-            room_price_b: row.get::<f64, _>("Room_PriceB"),
-            room_price_c: row.get::<f64, _>("Room_PriceC"),
-            room_group: row.get::<&str, _>("Room_Group").map(String::from),
-            room_book_name: row.get::<&str, _>("Room_Book_Name").map(String::from),
-        })
-        .collect();
-
-    Ok(rooms)
-}
-
-/// Get a single room detail from SQL Server with current guest info
-async fn get_room_sqlserver(
-    pool: &crate::db::DbPool,
-    room_no: &str,
-) -> ApiResult<RoomDetail> {
-    let mut conn = pool.get().await?;
-
-    // Get room details
-    let room_rows = conn
-        .query(
-            r#"
-            SELECT
-                Room_no,
-                Room_Type,
-                Room_Details,
-                Room_Clean,
-                Room_Use,
-                Room_Book,
-                Room_Manternace,
-                Room_PriceA,
-                Room_PriceB,
-                Room_PriceC,
-                Room_Group,
-                Room_Book_Name,
-                Room_Book_Time
-            FROM HT_Rooms
-            WHERE Room_no = @P1
-            "#,
-            &[&room_no],
-        )
-        .await?
-        .into_first_result()
-        .await?;
-
-    let room_row = room_rows
-        .first()
-        .ok_or_else(|| ApiError::NotFound("Room not found".to_string()))?;
-
-    // Get current/recent check-in
-    let checkin_rows = conn
-        .query(
-            r#"
-            SELECT TOP 1
-                Cin_Cust_Name,
-                Cin_Room_In,
-                Cin_Room_Out
-            FROM View_CheckIn_Ds
-            WHERE Cin_Room_No = @P1
-            ORDER BY Cin_Room_In DESC
-            "#,
-            &[&room_no],
-        )
-        .await?
-        .into_first_result()
-        .await?;
-
-    let current_guest = checkin_rows.first().map(|row: &TiberiusRow| CurrentGuest {
-        name: row.get::<&str, _>("Cin_Cust_Name").map(String::from),
-        check_in: row
-            .try_get::<NaiveDateTime, _>("Cin_Room_In")
-            .ok()
-            .flatten()
-            .map(|dt| dt.and_utc()),
-        check_out: row
-            .try_get::<NaiveDateTime, _>("Cin_Room_Out")
-            .ok()
-            .flatten()
-            .map(|dt| dt.and_utc()),
-    });
-
-    let room = RoomDetail {
-        room_no: room_row
-            .get::<&str, _>("Room_no")
-            .unwrap_or_default()
-            .to_string(),
-        room_type: room_row.get::<&str, _>("Room_Type").map(String::from),
-        room_details: room_row.get::<&str, _>("Room_Details").map(String::from),
-        room_clean: room_row.get::<&str, _>("Room_Clean").map(String::from),
-        room_use: room_row.get::<&str, _>("Room_Use").map(String::from),
-        room_book: room_row.get::<&str, _>("Room_Book").map(String::from),
-        room_manternace: room_row
-            .get::<&str, _>("Room_Manternace")
-            .map(String::from),
-        room_price_a: room_row.get::<f64, _>("Room_PriceA"),
-        room_price_b: room_row.get::<f64, _>("Room_PriceB"),
-        room_price_c: room_row.get::<f64, _>("Room_PriceC"),
-        room_group: room_row.get::<&str, _>("Room_Group").map(String::from),
-        room_book_name: room_row
-            .get::<&str, _>("Room_Book_Name")
-            .map(String::from),
-        room_book_time: room_row
-            .try_get::<NaiveDateTime, _>("Room_Book_Time")
-            .ok()
-            .flatten()
-            .map(|dt| dt.and_utc()),
-        current_guest,
-    };
-
-    Ok(room)
-}
-
-/// Get room status from SQL Server (View_Room_status)
-async fn get_room_status_sqlserver(
-    pool: &crate::db::DbPool,
-    params: &RoomStatusQuery,
-) -> ApiResult<Vec<RoomStatus>> {
-    let mut conn = pool.get().await?;
-
-    // Build dynamic query
-    let mut query = String::from(
-        r#"
-        SELECT
-            room_no,
-            room_date,
-            room_status,
-            room_Details,
-            room_CheckIn_No,
-            Room_Type
-        FROM View_Room_status
-        "#,
-    );
-
-    let mut conditions: Vec<String> = Vec::new();
-
-    if params.start_date.is_some() {
-        conditions.push("room_date >= @P1".to_string());
-    }
-
-    if params.end_date.is_some() {
-        conditions.push(format!(
-            "room_date <= @P{}",
-            if params.start_date.is_some() { 2 } else { 1 }
-        ));
-    }
-
-    if !conditions.is_empty() {
-        query.push_str(" WHERE ");
-        query.push_str(&conditions.join(" AND "));
-    }
-
-    query.push_str(" ORDER BY room_no, room_date");
-
-    // Execute based on parameters
-    let rows: Vec<TiberiusRow> = match (&params.start_date, &params.end_date) {
-        (Some(start), Some(end)) => {
-            conn.query(&query, &[&start.as_str(), &end.as_str()])
-                .await?
-                .into_first_result()
-                .await?
-        }
-        (Some(start), None) => {
-            conn.query(&query, &[&start.as_str()])
-                .await?
-                .into_first_result()
-                .await?
-        }
-        (None, Some(end)) => {
-            conn.query(&query, &[&end.as_str()])
-                .await?
-                .into_first_result()
-                .await?
-        }
-        (None, None) => {
-            conn.simple_query(&query)
-                .await?
-                .into_first_result()
-                .await?
-        }
-    };
-
-    let statuses: Vec<RoomStatus> = rows
-        .iter()
-        .map(|row: &TiberiusRow| RoomStatus {
-            room_no: row
-                .get::<&str, _>("room_no")
-                .unwrap_or_default()
-                .to_string(),
-            room_date: row
-                .get::<NaiveDateTime, _>("room_date")
-                .map(|dt| dt.and_utc()),
-            room_status: row.get::<&str, _>("room_status").map(String::from),
-            room_details: row.get::<&str, _>("room_Details").map(String::from),
-            room_checkin_no: row.get::<&str, _>("room_CheckIn_No").map(String::from),
-            room_type: row.get::<&str, _>("Room_Type").map(String::from),
-        })
-        .collect();
-
-    Ok(statuses)
-}
-
 /// Get room status from PostgreSQL (PG mirror tables)
 async fn get_room_status_pg(
     pool: &crate::db::PgPool,
@@ -672,39 +419,8 @@ async fn get_room_status_pg(
     Ok(statuses)
 }
 
-/// Get rooms checking out today from SQL Server
-async fn get_checkouts_today_sqlserver(pool: &crate::db::DbPool) -> ApiResult<Vec<String>> {
-    let mut conn = pool.get().await?;
-
-    let rows = conn
-        .simple_query(
-            r#"
-            SELECT DISTINCT c.Cin_Room_no as room_no
-            FROM View_CheckIn_Ds c
-            INNER JOIN HT_Rooms r ON c.Cin_Room_No = r.Room_no
-            WHERE CAST(c.Cin_Room_Out AS DATE) = CAST(GETDATE() AS DATE)
-                AND r.Room_Use = 'yes'
-                AND c.Cin_Room_In = (
-                    SELECT MAX(c2.Cin_Room_In)
-                    FROM View_CheckIn_Ds c2
-                    WHERE c2.Cin_Room_No = c.Cin_Room_No
-                )
-            "#,
-        )
-        .await?
-        .into_first_result()
-        .await?;
-
-    let room_numbers: Vec<String> = rows
-        .iter()
-        .filter_map(|row: &TiberiusRow| row.get::<&str, _>("room_no").map(String::from))
-        .collect();
-
-    Ok(room_numbers)
-}
-
 // ─────────────────────────────────────────────────────────────
-// Public route handlers (feature-flagged)
+// Public route handlers
 // ─────────────────────────────────────────────────────────────
 
 /// Query parameters for rooms list (branch support)
@@ -714,6 +430,8 @@ pub struct RoomsQuery {
 }
 
 /// GET /api/rooms - List all rooms
+///
+/// Reads from PG (`ht_rooms_legacy` cache, fed by drift-reconcile + CT mappers).
 pub async fn list_rooms(
     State(state): State<AppState>,
     Query(params): Query<RoomsQuery>,
@@ -721,22 +439,10 @@ pub async fn list_rooms(
     let branch = params.branch.unwrap_or_default();
 
     let rooms = match branch {
-        Branch::Hfhotel => {
-            if use_pg_source() {
-                list_rooms_pg(&state.new_pool).await?
-            } else {
-                list_rooms_sqlserver(&state.legacy_pool).await?
-            }
-        }
-        Branch::Hfville => {
-            list_rooms_legacy_only(state.ville_pool()?).await?
-        }
+        Branch::Hfhotel => list_rooms_pg(&state.new_pool).await?,
+        Branch::Hfville => list_rooms_legacy_only(state.ville_pool()?).await?,
         Branch::All => {
-            let mut all = if use_pg_source() {
-                list_rooms_pg(&state.new_pool).await?
-            } else {
-                list_rooms_sqlserver(&state.legacy_pool).await?
-            };
+            let mut all = list_rooms_pg(&state.new_pool).await?;
             if let Ok(vp) = state.ville_pool() {
                 all.extend(list_rooms_legacy_only(vp).await?);
             }
@@ -760,6 +466,9 @@ pub struct GetRoomQuery {
 }
 
 /// GET /api/rooms/:id - Get room details with current guest
+///
+/// Reads from PG (`ht_rooms_legacy` + `ht_checkins_legacy` cache, fed by
+/// drift-reconcile + CT mappers).
 pub async fn get_room(
     State(state): State<AppState>,
     Path(room_no): Path<String>,
@@ -768,16 +477,8 @@ pub async fn get_room(
     let branch = params.branch.unwrap_or_default();
 
     let room = match branch {
-        Branch::Hfhotel | Branch::All => {
-            if use_pg_source() {
-                get_room_pg(&state.new_pool, &room_no).await?
-            } else {
-                get_room_sqlserver(&state.legacy_pool, &room_no).await?
-            }
-        }
-        Branch::Hfville => {
-            get_room_legacy_only(state.ville_pool()?, &room_no).await?
-        }
+        Branch::Hfhotel | Branch::All => get_room_pg(&state.new_pool, &room_no).await?,
+        Branch::Hfville => get_room_legacy_only(state.ville_pool()?, &room_no).await?,
     };
 
     Ok(Json(RoomDetailResponse {
@@ -796,6 +497,9 @@ pub struct RoomStatusQuery {
 }
 
 /// GET /api/rooms/status - Get room status history
+///
+/// Reads from PG (`ht_rooms_legacy` + `ht_checkins_legacy` + `ht_bookings_legacy`
+/// cache, fed by drift-reconcile + CT mappers).
 pub async fn get_room_status(
     State(state): State<AppState>,
     Query(params): Query<RoomStatusQuery>,
@@ -803,22 +507,10 @@ pub async fn get_room_status(
     let branch = params.branch.unwrap_or_default();
 
     let statuses = match branch {
-        Branch::Hfhotel => {
-            if use_pg_source() {
-                get_room_status_pg(&state.new_pool, &params).await?
-            } else {
-                get_room_status_sqlserver(&state.legacy_pool, &params).await?
-            }
-        }
-        Branch::Hfville => {
-            get_room_status_pg(state.ville_pool()?, &params).await?
-        }
+        Branch::Hfhotel => get_room_status_pg(&state.new_pool, &params).await?,
+        Branch::Hfville => get_room_status_pg(state.ville_pool()?, &params).await?,
         Branch::All => {
-            let mut all = if use_pg_source() {
-                get_room_status_pg(&state.new_pool, &params).await?
-            } else {
-                get_room_status_sqlserver(&state.legacy_pool, &params).await?
-            };
+            let mut all = get_room_status_pg(&state.new_pool, &params).await?;
             if let Ok(vp) = state.ville_pool() {
                 all.extend(get_room_status_pg(vp, &params).await?);
             }
@@ -841,6 +533,9 @@ pub struct CheckoutsTodayQuery {
 }
 
 /// GET /api/rooms/checkouts-today - Get rooms with checkout today
+///
+/// Reads from PG (`ht_checkins_legacy` + `ht_rooms_legacy` cache, fed by
+/// drift-reconcile + CT mappers).
 pub async fn get_checkouts_today(
     State(state): State<AppState>,
     Query(params): Query<CheckoutsTodayQuery>,
@@ -848,22 +543,10 @@ pub async fn get_checkouts_today(
     let branch = params.branch.unwrap_or_default();
 
     let room_numbers = match branch {
-        Branch::Hfhotel => {
-            if use_pg_source() {
-                get_checkouts_today_pg(&state.new_pool).await?
-            } else {
-                get_checkouts_today_sqlserver(&state.legacy_pool).await?
-            }
-        }
-        Branch::Hfville => {
-            get_checkouts_today_pg(state.ville_pool()?).await?
-        }
+        Branch::Hfhotel => get_checkouts_today_pg(&state.new_pool).await?,
+        Branch::Hfville => get_checkouts_today_pg(state.ville_pool()?).await?,
         Branch::All => {
-            let mut all = if use_pg_source() {
-                get_checkouts_today_pg(&state.new_pool).await?
-            } else {
-                get_checkouts_today_sqlserver(&state.legacy_pool).await?
-            };
+            let mut all = get_checkouts_today_pg(&state.new_pool).await?;
             if let Ok(vp) = state.ville_pool() {
                 all.extend(get_checkouts_today_pg(vp).await?);
             }

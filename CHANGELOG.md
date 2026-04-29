@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.22] - 2026-04-30
+
+### Removed
+
+- **Phase 8 transition (HF Hotel) — MSSQL-fallback dead code in user-facing
+  read routes.** Production has been running with `LEGACY_READ_SOURCE` UNSET
+  (PG default) since the CT mappers + drift-reconcile job stabilized the
+  `ht_*_legacy` mirrors, so the `*_sqlserver` branches were unreachable
+  dead code on the read path. Deleted from
+  `routes/{bookings,customers,rooms,checkins,stats,occupancy,calendar}.rs`:
+  the `use_sqlserver()` / `use_pg_source()` env-flag helpers, every
+  `*_sqlserver` private function (10 in total), and every `if use_sqlserver()
+  { … } else { *_pg } …` branch in the public handlers. Net diff: -1407
+  lines / +84 lines across 8 files. `cargo check` clean (5 pre-existing
+  warnings); `cargo test --lib` passes (301/301).
+- **`LEGACY_READ_SOURCE` env var — formally deprecated.** The flag is no
+  longer read anywhere in the codebase. MSSQL is now write-only for the
+  legacy .NET app (writeback worker + ville_sync continue to use
+  `legacy_pool`); the user-facing read path is PG-only. See
+  `docs/architecture.md` Phase 8.
+
+### Changed
+
+- **`routes/calendar.rs` — legacy calendar fetch is PG-only.** Dropped the
+  `fetch_legacy_calendar_data` MSSQL helper; HF Hotel now reads from
+  `ht_bookings_legacy` + `ht_checkins_legacy` exclusively. The HF Ville
+  branch (already PG via `ville_pool`) and the new-mode `fetch_new_calendar_data`
+  branch are unchanged.
+- **`routes/{bookings,customers,rooms,checkins,stats,occupancy,calendar}.rs`
+  — module docstrings updated** to reflect "Reads from PG (`ht_*_legacy`
+  cache, fed by drift-reconcile + CT mappers)".
+
 ## [2.54.21] - 2026-04-29
 
 ### Fixed

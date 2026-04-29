@@ -2,8 +2,7 @@
 //!
 //! - GET /api/checkins - List check-ins (paginated with filters)
 //!
-//! Reads from PostgreSQL (ht_checkins_legacy) by default.
-//! Set LEGACY_READ_SOURCE=sqlserver to read from SQL Server (View_CheckIn_Ds).
+//! Reads from PG (`ht_checkins_legacy` cache, fed by drift-reconcile + CT mappers).
 
 use axum::{
     extract::{Query, State},
@@ -13,7 +12,7 @@ use chrono::NaiveDateTime;
 use serde::Deserialize;
 use sqlx::Row;
 
-use crate::db::{DbPool, PgPool};
+use crate::db::PgPool;
 use crate::error::ApiResult;
 use crate::models::{CheckIn, CheckInsResponse, Pagination};
 use crate::routes::mode::{AppState, Branch};
@@ -35,14 +34,6 @@ pub struct CheckInsQuery {
 fn default_page() -> i32 { 1 }
 fn default_limit() -> i32 { 20 }
 
-/// Determine whether to read from PostgreSQL or SQL Server
-fn use_pg_source() -> bool {
-    match std::env::var("LEGACY_READ_SOURCE") {
-        Ok(val) => val.to_lowercase() != "sqlserver",
-        Err(_) => true, // default to PG
-    }
-}
-
 /// GET /api/checkins - List check-ins (paginated)
 pub async fn list_checkins(
     State(state): State<AppState>,
@@ -51,26 +42,10 @@ pub async fn list_checkins(
     let branch = params.branch.unwrap_or_default();
 
     match branch {
-        Branch::Hfhotel => {
-            if use_pg_source() {
-                list_checkins_pg(&state.new_pool, params).await
-            } else {
-                list_checkins_sqlserver(&state.legacy_pool, params).await
-            }
-        }
-        Branch::Hfville => {
-            list_checkins_pg(state.ville_pool()?, params).await
-        }
-        Branch::All => {
-            let hf_result = if use_pg_source() {
-                list_checkins_pg(&state.new_pool, params).await?
-            } else {
-                list_checkins_sqlserver(&state.legacy_pool, params).await?
-            };
-            // Note: for All branch with pagination, we just return the primary branch
-            // as merging paginated results is complex. Frontend handles by switching branches.
-            Ok(hf_result)
-        }
+        // Note: for the All branch with pagination, we just return the primary branch
+        // as merging paginated results is complex. Frontend handles by switching branches.
+        Branch::Hfhotel | Branch::All => list_checkins_pg(&state.new_pool, params).await,
+        Branch::Hfville => list_checkins_pg(state.ville_pool()?, params).await,
     }
 }
 
@@ -160,95 +135,3 @@ async fn list_checkins_pg(
     }))
 }
 
-/// Read check-ins from SQL Server (View_CheckIn_Ds) - legacy fallback
-async fn list_checkins_sqlserver(
-    pool: &DbPool,
-    params: CheckInsQuery,
-) -> ApiResult<Json<CheckInsResponse>> {
-    let mut conn = pool.get().await?;
-
-    let offset = (params.page - 1) * params.limit;
-
-    // Build WHERE conditions with direct value interpolation
-    let mut conditions: Vec<String> = Vec::new();
-
-    if let Some(ref status) = params.status {
-        conditions.push(format!("Cin_status = '{}'", status.replace('\'', "''")));
-    }
-
-    // Date range filter: find check-ins that OVERLAP the given range
-    // A check-in overlaps if it starts before the end AND ends after the start
-    // Use CAST to compare dates without time component
-    if let Some(ref start_date) = params.start_date {
-        conditions.push(format!("CAST(Cin_Room_Out AS DATE) >= '{}'", start_date.replace('\'', "''")));
-    }
-
-    if let Some(ref end_date) = params.end_date {
-        conditions.push(format!("CAST(Cin_Room_In AS DATE) <= '{}'", end_date.replace('\'', "''")));
-    }
-
-    let where_clause = if conditions.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", conditions.join(" AND "))
-    };
-
-    // Get total count
-    let count_query = format!(
-        "SELECT COUNT(*) as total FROM View_CheckIn_Ds {}",
-        where_clause
-    );
-
-    let count_rows = conn
-        .simple_query(&count_query)
-        .await?
-        .into_first_result()
-        .await?;
-
-    let total: i32 = count_rows
-        .first()
-        .and_then(|r| r.get::<i32, _>("total"))
-        .unwrap_or(0);
-
-    // Get paginated data
-    let data_query = format!(
-        r#"
-        SELECT
-            Cin_no,
-            Cin_Room_No,
-            Cin_Room_In,
-            Cin_Room_Out,
-            Cin_cust_name,
-            Cin_status
-        FROM View_CheckIn_Ds
-        {}
-        ORDER BY Cin_Room_In DESC
-        OFFSET {} ROWS FETCH NEXT {} ROWS ONLY
-        "#,
-        where_clause, offset, params.limit
-    );
-
-    let rows = conn
-        .simple_query(&data_query)
-        .await?
-        .into_first_result()
-        .await?;
-
-    let checkins: Vec<CheckIn> = rows
-        .iter()
-        .map(|row| CheckIn {
-            cin_no: row.get::<&str, _>("Cin_no").map(String::from),
-            cin_room_no: row.get::<&str, _>("Cin_Room_No").map(String::from),
-            cin_room_in: row.get::<NaiveDateTime, _>("Cin_Room_In").map(|dt| dt.and_utc()),
-            cin_room_out: row.get::<NaiveDateTime, _>("Cin_Room_Out").map(|dt| dt.and_utc()),
-            cin_cust_name: row.get::<&str, _>("Cin_cust_name").map(String::from),
-            cin_status: row.get::<&str, _>("Cin_status").map(String::from),
-        })
-        .collect();
-
-    Ok(Json(CheckInsResponse {
-        success: true,
-        data: checkins,
-        pagination: Pagination::new(params.page, params.limit, total),
-    }))
-}
