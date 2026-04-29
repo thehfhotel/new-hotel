@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.15] - 2026-04-29
+
+### Fixed
+
+- **`web` container healthcheck false-positive `unhealthy`** discovered
+  during HF Hotel post-Phase-5-Ville-deploy audit. The probe was
+  `wget --spider http://localhost:3003`; the container's `/etc/hosts`
+  defines BOTH `127.0.0.1 localhost` and `::1 localhost`, and wget
+  prefers IPv6, but Next.js 16 standalone with `HOSTNAME=0.0.0.0`
+  binds IPv4 only — so the IPv6 connect to `[::1]:3003` returns
+  Connection refused even though the site serves correctly to all
+  external traffic. Healthcheck flapped `unhealthy` for 21 consecutive
+  attempts despite zero user-facing impact. Fix: change probe to
+  `http://127.0.0.1:3003` (force IPv4). Same outcome could be reached
+  by setting `HOSTNAME=::` to dual-bind, but explicit IPv4 in the
+  healthcheck is the smaller diff and matches the actual production
+  bind. Inline comment captures the trap.
+
 ## [2.54.14] - 2026-04-29
 
 ### Added
