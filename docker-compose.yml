@@ -49,6 +49,13 @@ services:
       - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
       - SLACK_NOTIFICATIONS_ENABLED=false
       - BACKEND_URL=http://backend:3003
+      # Bind Next.js standalone server to ALL interfaces (incl. 127.0.0.1)
+      # so the container-internal `wget http://localhost:3003` healthcheck
+      # below actually resolves. Without this, Next.js 16 standalone binds
+      # to the docker bridge IP only and the healthcheck flaps `unhealthy`
+      # despite traffic working from outside the container. Mirrors the
+      # `HOST=0.0.0.0` line on the `backend` service.
+      - HOSTNAME=0.0.0.0
     depends_on:
       backend:
         condition: service_healthy

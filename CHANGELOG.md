@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.1] - 2026-04-27
+
+### Fixed
+
+- **Inventory dashboard stats card silently rendered zeros.** The frontend
+  read `statsData.data` but the backend `/api/new/inventory/stats` returns
+  `{ success, stats }` (verified in `hotel-backend/src/routes/new_inventory.rs`,
+  `StatsResponse` struct). Switched the access to `statsData.stats`. Also
+  renamed the local `DashboardStats.categoriesCount` field to
+  `totalCategories` so it aligns with the backend's camelCased
+  `totalCategories` (from `total_categories: i32`) — and updated the JSX
+  reference at the categories card so it actually reads the new field
+  instead of `undefined`. Without the JSX fix, the categories tile would
+  have continued to show `0` even after the data-flow fix.
+- **`web` container healthcheck flapped `unhealthy` despite traffic working.**
+  Next.js 16 standalone binds to the docker bridge IP only (e.g.
+  `172.19.0.5:3003`), so the in-container `wget http://localhost:3003`
+  healthcheck always timed out. Added `HOSTNAME=0.0.0.0` to the `web`
+  service env in `docker-compose.yml`, mirroring the `HOST=0.0.0.0` line
+  on `backend`. No service depends on `web`'s health, so the alternative
+  (disabling the healthcheck) was viable, but matching the existing
+  bind-on-all-interfaces pattern is the smallest, most consistent diff
+  and keeps an honest signal for ops.
+
 ## [2.54.0] - 2026-04-27
 
 ### Phase 6 — drift-reconcile finalize + retire polling-sync

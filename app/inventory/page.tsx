@@ -30,7 +30,7 @@ import StockAdjustmentModal from '@/components/modals/StockAdjustmentModal'
 interface DashboardStats {
   totalItems: number
   lowStockCount: number
-  categoriesCount: number
+  totalCategories: number
 }
 
 export default function InventoryDashboardPage() {
@@ -38,7 +38,7 @@ export default function InventoryDashboardPage() {
   const [stats, setStats] = useState<DashboardStats>({
     totalItems: 0,
     lowStockCount: 0,
-    categoriesCount: 0,
+    totalCategories: 0,
   })
   const [lowStockItems, setLowStockItems] = useState<InventoryItem[]>([])
   const [recentTransactions, setRecentTransactions] = useState<InventoryTransaction[]>([])
@@ -67,7 +67,7 @@ export default function InventoryDashboardPage() {
       ])
 
       if (statsData.success) {
-        setStats(statsData.data)
+        setStats(statsData.stats)
       }
       if (lowStockData.success) {
         setLowStockItems(lowStockData.data || [])
@@ -186,7 +186,7 @@ export default function InventoryDashboardPage() {
             <div>
               <p className="text-sm text-gray-500">หมวดหมู่</p>
               <p className="text-3xl font-bold text-gray-900">
-                {loading ? '-' : stats.categoriesCount}
+                {loading ? '-' : stats.totalCategories}
               </p>
             </div>
             <div className="w-12 h-12 bg-violet-500/10 rounded-full flex items-center justify-center">
