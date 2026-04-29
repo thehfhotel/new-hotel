@@ -1,7 +1,7 @@
 //! Booking API routes
 //!
-//! - GET /api/bookings - List bookings (paginated) - uses PG by default, legacy DB if LEGACY_READ_SOURCE=sqlserver
-//! - GET /api/bookings/:id - Get booking details - uses PG by default, legacy DB if LEGACY_READ_SOURCE=sqlserver
+//! - GET /api/bookings - List bookings (paginated). Reads from PG (`ht_bookings_legacy` cache, fed by drift-reconcile + CT mappers).
+//! - GET /api/bookings/:id - Get booking details. Reads from PG (`ht_bookings_legacy` cache, fed by drift-reconcile + CT mappers).
 //! - GET /api/bookings/:id/notes - Get booking notes - uses HotelNew DB
 //! - POST /api/bookings/:id/notes - Add booking note - uses HotelNew DB
 //! - DELETE /api/bookings/:id/notes - Delete booking note - uses HotelNew DB
@@ -19,7 +19,7 @@ use chrono::NaiveDateTime;
 use serde::Deserialize;
 use sqlx::Row;
 
-use crate::db::{DbPool, PgPool};
+use crate::db::PgPool;
 use crate::error::{ApiError, ApiResult};
 use crate::models::{
     get_status_code, map_status, Booking, BookingCustomer, BookingCustomerDetail, BookingDetail,
@@ -52,17 +52,9 @@ fn default_limit() -> i32 { 20 }
 fn default_sort_by() -> String { "bookDate".to_string() }
 fn default_sort_order() -> String { "desc".to_string() }
 
-/// Check if legacy read source is SQL Server (feature flag)
-fn use_sqlserver() -> bool {
-    std::env::var("LEGACY_READ_SOURCE")
-        .map(|v| v.eq_ignore_ascii_case("sqlserver"))
-        .unwrap_or(false)
-}
-
 /// GET /api/bookings - List bookings (paginated)
 ///
-/// Reads from `ht_bookings_legacy` (PostgreSQL) by default.
-/// Set `LEGACY_READ_SOURCE=sqlserver` to read from legacy SQL Server instead.
+/// Reads from PG (`ht_bookings_legacy` cache, fed by drift-reconcile + CT mappers).
 pub async fn list_bookings(
     State(state): State<AppState>,
     Query(params): Query<BookingsQuery>,
@@ -70,24 +62,11 @@ pub async fn list_bookings(
     let branch = params.branch.unwrap_or_default();
 
     match branch {
-        Branch::Hfhotel => {
-            if use_sqlserver() {
-                list_bookings_sqlserver(&state.legacy_pool, &params).await
-            } else {
-                list_bookings_pg(&state.new_pool, &params).await
-            }
-        }
-        Branch::Hfville => {
-            list_bookings_pg(state.ville_pool()?, &params).await
-        }
+        Branch::Hfhotel => list_bookings_pg(&state.new_pool, &params).await,
+        Branch::Hfville => list_bookings_pg(state.ville_pool()?, &params).await,
         Branch::All => {
             // For "All", we merge results from both branches
-            // Get HF Hotel data
-            let hf_result = if use_sqlserver() {
-                list_bookings_sqlserver(&state.legacy_pool, &params).await?
-            } else {
-                list_bookings_pg(&state.new_pool, &params).await?
-            };
+            let hf_result = list_bookings_pg(&state.new_pool, &params).await?;
             // Try to get HF Ville data
             if let Ok(vp) = state.ville_pool() {
                 if let Ok(ville_result) = list_bookings_pg(vp, &params).await {
@@ -291,160 +270,10 @@ async fn list_bookings_pg(
     }))
 }
 
-/// List bookings from legacy SQL Server `View_Booking_Ds` view
-async fn list_bookings_sqlserver(
-    pool: &DbPool,
-    params: &BookingsQuery,
-) -> ApiResult<Json<BookingsResponse>> {
-    let mut conn = pool.get().await?;
-
-    // Build WHERE conditions with direct value interpolation
-    let mut conditions: Vec<String> = Vec::new();
-
-    if let Some(ref search) = params.search {
-        let escaped = search.replace('\'', "''");
-        conditions.push(format!(
-            "(Book_No LIKE '%{}%' OR Book_Cust_Name LIKE '%{}%')",
-            escaped, escaped
-        ));
-    }
-
-    if let Some(ref status) = params.status {
-        if let Some(code) = get_status_code(status) {
-            conditions.push(format!("Book_Status = {}", code));
-        }
-    }
-
-    // Date range filter: find bookings that OVERLAP the given range
-    // A booking overlaps if it starts before the end AND ends after the start
-    // Use CAST to compare dates without time component
-    if let Some(ref start_date) = params.start_date {
-        conditions.push(format!("CAST(Book_Date_out AS DATE) >= '{}'", start_date.replace('\'', "''")));
-    }
-
-    if let Some(ref end_date) = params.end_date {
-        conditions.push(format!("CAST(Book_Date_in AS DATE) <= '{}'", end_date.replace('\'', "''")));
-    }
-
-    let where_clause = if conditions.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", conditions.join(" AND "))
-    };
-
-    // Count distinct bookings
-    let count_query = format!(
-        "SELECT COUNT(DISTINCT Book_No) as total FROM View_Booking_Ds {}",
-        where_clause
-    );
-
-    let count_rows = conn
-        .simple_query(&count_query)
-        .await?
-        .into_first_result()
-        .await?;
-
-    let total: i32 = count_rows
-        .first()
-        .and_then(|r| r.get::<i32, _>("total"))
-        .unwrap_or(0);
-
-    // Get all data (group and paginate in Rust like the Node.js version)
-    let data_query = format!(
-        r#"
-        SELECT
-            Book_No,
-            Book_Date,
-            Book_Date_in,
-            Book_Date_out,
-            Book_Cust_Name,
-            Book_Status,
-            Book_Room_Type
-        FROM View_Booking_Ds
-        {}
-        ORDER BY Book_Date DESC
-        "#,
-        where_clause
-    );
-
-    let rows = conn
-        .simple_query(&data_query)
-        .await?
-        .into_first_result()
-        .await?;
-
-    // Group records by Book_No
-    let mut grouped: HashMap<String, Booking> = HashMap::new();
-
-    for row in &rows {
-        let book_no = row
-            .get::<&str, _>("Book_No")
-            .unwrap_or_default()
-            .to_string();
-
-        let entry = grouped.entry(book_no.clone()).or_insert_with(|| Booking {
-            book_no: book_no.clone(),
-            book_date: row.get::<NaiveDateTime, _>("Book_Date").map(|dt| dt.and_utc()),
-            check_in: row.get::<NaiveDateTime, _>("Book_Date_in").map(|dt| dt.and_utc()),
-            check_out: row.get::<NaiveDateTime, _>("Book_Date_out").map(|dt| dt.and_utc()),
-            customer: BookingCustomer {
-                name: row
-                    .get::<&str, _>("Book_Cust_Name")
-                    .unwrap_or_default()
-                    .to_string(),
-            },
-            status: map_status(row.get::<i32, _>("Book_Status")),
-            rooms: Vec::new(),
-            room_count: 0,
-        });
-
-        entry.rooms.push(BookingRoom {
-            room_no: "-".to_string(),
-            room_type: row
-                .get::<&str, _>("Book_Room_Type")
-                .unwrap_or("-")
-                .to_string(),
-        });
-        entry.room_count = entry.rooms.len();
-    }
-
-    let mut all_grouped: Vec<Booking> = grouped.into_values().collect();
-
-    // Sort by requested field
-    let sort_asc = params.sort_order.to_lowercase() == "asc";
-    all_grouped.sort_by(|a, b| {
-        let cmp = match params.sort_by.as_str() {
-            "bookNo" => a.book_no.cmp(&b.book_no),
-            "status" => a.status.cmp(&b.status),
-            "customer" => a.customer.name.to_lowercase().cmp(&b.customer.name.to_lowercase()),
-            "checkIn" => a.check_in.cmp(&b.check_in),
-            "checkOut" => a.check_out.cmp(&b.check_out),
-            "roomCount" => a.room_count.cmp(&b.room_count),
-            _ => a.book_date.cmp(&b.book_date), // bookDate default
-        };
-        if sort_asc { cmp } else { cmp.reverse() }
-    });
-
-    // Paginate
-    let start_idx = ((params.page - 1) * params.limit) as usize;
-    let paginated_data: Vec<Booking> = all_grouped
-        .into_iter()
-        .skip(start_idx)
-        .take(params.limit as usize)
-        .collect();
-
-    Ok(Json(BookingsResponse {
-        success: true,
-        data: paginated_data,
-        pagination: Pagination::new(params.page, params.limit, total),
-    }))
-}
-
 /// GET /api/bookings/:id - Get booking details
 ///
-/// Reads from `ht_bookings_legacy` (PostgreSQL) by default.
-/// Set `LEGACY_READ_SOURCE=sqlserver` to read from legacy SQL Server instead.
-/// Notes are always fetched from HotelNew PostgreSQL.
+/// Reads from PG (`ht_bookings_legacy` cache, fed by drift-reconcile + CT mappers).
+/// Notes are fetched from HotelNew PostgreSQL.
 pub async fn get_booking(
     State(state): State<AppState>,
     Path(book_no): Path<String>,
@@ -479,65 +308,7 @@ pub async fn get_booking(
         Err(_) => Vec::new(),
     };
 
-    // Fetch booking data from PG or SQL Server
-    let mut booking = if use_sqlserver() {
-        // Existing SQL Server path
-        let mut legacy_conn = state.legacy_pool.get().await?;
-
-        let booking_rows = match legacy_conn
-            .query(
-                r#"
-                SELECT Book_No, Book_Date, Book_Date_in, Book_Date_out,
-                       Book_Cust_Name, Book_Status, Book_Room_Type
-                FROM View_Booking_Ds
-                WHERE Book_No = @P1
-                ORDER BY Book_Room_Type
-                "#,
-                &[&book_no],
-            )
-            .await
-        {
-            Ok(result) => result.into_first_result().await?,
-            Err(_) => {
-                return Err(ApiError::NotFound(
-                    "Legacy booking not available (running in new-only mode)".to_string()
-                ));
-            }
-        };
-
-        if booking_rows.is_empty() {
-            return Err(ApiError::NotFound("Booking not found".to_string()));
-        }
-
-        let first_record = &booking_rows[0];
-
-        let rooms: Vec<BookingRoomDetail> = booking_rows
-            .iter()
-            .map(|r| BookingRoomDetail {
-                room_no: "-".to_string(),
-                room_type: r.get::<&str, _>("Book_Room_Type").unwrap_or("-").to_string(),
-                total: 0.0,
-            })
-            .collect();
-
-        BookingDetail {
-            book_no: first_record.get::<&str, _>("Book_No").unwrap_or_default().to_string(),
-            book_date: first_record.get::<NaiveDateTime, _>("Book_Date").map(|dt| dt.and_utc()),
-            check_in: first_record.get::<NaiveDateTime, _>("Book_Date_in").map(|dt| dt.and_utc()),
-            check_out: first_record.get::<NaiveDateTime, _>("Book_Date_out").map(|dt| dt.and_utc()),
-            status: map_status(first_record.get::<i32, _>("Book_Status")),
-            status_code: first_record.get::<i32, _>("Book_Status"),
-            customer: BookingCustomerDetail {
-                full_name: first_record.get::<&str, _>("Book_Cust_Name").unwrap_or_default().to_string(),
-            },
-            room_count: rooms.len(),
-            rooms,
-            total_amount: 0.0,
-            notes: Vec::new(),
-        }
-    } else {
-        get_booking_pg(new_pool, &book_no).await?
-    };
+    let mut booking = get_booking_pg(new_pool, &book_no).await?;
 
     // Attach notes
     booking.notes = notes;

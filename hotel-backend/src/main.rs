@@ -196,8 +196,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    // Build all routes (use AppState for dual-database access)
-    // Legacy-read routes (rooms, bookings, customers, stats) use LEGACY_READ_SOURCE feature flag
+    // Build all routes (use AppState for dual-database access).
+    // User-facing legacy-read routes (rooms, bookings, customers, stats, etc.)
+    // are PG-only as of Phase 8 — they read from `ht_*_legacy` mirror tables
+    // populated by the CT mappers + drift-reconcile job. MSSQL is write-only
+    // (writeback worker) for the legacy .NET app.
     let new_routes = if let Some(ref app_state) = final_app_state {
         build_new_routes(app_state.clone())
     } else if let Some(ref pg_pool) = new_pool_for_newonly {
@@ -266,12 +269,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Build the new routes router with AppState
 fn build_new_routes(app_state: AppState) -> Router {
     Router::new()
-        // Rooms routes (reads from PG by default, SQL Server if LEGACY_READ_SOURCE=sqlserver)
+        // Rooms routes (PG-only, Phase 8 — reads `ht_rooms_legacy` mirror)
         .route("/api/rooms", get(routes::rooms::list_rooms))
         .route("/api/rooms/status", get(routes::rooms::get_room_status))
         .route("/api/rooms/checkouts-today", get(routes::rooms::get_checkouts_today))
         .route("/api/rooms/:id", get(routes::rooms::get_room))
-        // Legacy booking routes (reads from PG by default, SQL Server if LEGACY_READ_SOURCE=sqlserver)
+        // Legacy booking routes (PG-only, Phase 8 — reads `ht_bookings_legacy` mirror)
         .route("/api/bookings", get(routes::bookings::list_bookings))
         .route("/api/bookings/:id", get(routes::bookings::get_booking))
         .route(
@@ -280,15 +283,15 @@ fn build_new_routes(app_state: AppState) -> Router {
                 .post(routes::bookings::create_note)
                 .delete(routes::bookings::delete_note),
         )
-        // Check-ins route (reads from PG by default, SQL Server if LEGACY_READ_SOURCE=sqlserver)
+        // Check-ins route (PG-only, Phase 8 — reads `ht_checkins_legacy` mirror)
         .route("/api/checkins", get(routes::checkins::list_checkins))
-        // Legacy customers routes (reads from PG by default, SQL Server if LEGACY_READ_SOURCE=sqlserver)
+        // Legacy customers routes (PG-only, Phase 8 — reads `ht_customers_legacy` mirror)
         .route("/api/customers", get(routes::customers::list_customers))
         .route("/api/customers/:id/bookings", get(routes::customers::get_customer_bookings))
         .route("/api/customers/:id/stats", get(routes::customers::get_customer_stats))
-        // Stats route (reads from PG by default, SQL Server if LEGACY_READ_SOURCE=sqlserver)
+        // Stats route (PG-only, Phase 8 — reads `ht_*_legacy` mirrors)
         .route("/api/stats", get(routes::stats::get_stats))
-        // Occupancy route (reads from PG by default, SQL Server if LEGACY_READ_SOURCE=sqlserver)
+        // Occupancy route (PG-only, Phase 8 — reads `ht_checkins_legacy` mirror)
         .route("/api/occupancy", get(routes::occupancy::get_occupancy))
         // Mode and calendar routes
         .route("/api/mode", get(routes::mode::get_mode))
