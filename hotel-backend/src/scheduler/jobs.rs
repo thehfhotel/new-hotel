@@ -11,11 +11,11 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_cron_scheduler::{Job, JobScheduler};
 
-use crate::config::SlackConfig;
+use crate::config::{SiteConfig, SlackConfig};
 use crate::db::{DbPool, PgPool};
 use crate::notifications::slack::{
     build_check_in_alert_message, build_check_out_alert_message, build_hourly_report_message,
-    build_new_booking_alert_message, SlackClient,
+    build_new_booking_alert_message, format_site_prefixed, SlackClient, SlackMessage,
 };
 use super::sync;
 
@@ -36,13 +36,19 @@ impl Default for SchedulerState {
     }
 }
 
-/// Initialize the cron job scheduler
+/// Initialize the cron job scheduler.
+///
+/// `site` is plumbed through so every Slack message and tracing span
+/// carries `site=<id>` (task #69). HF Hotel and HF Ville share a single
+/// Slack webhook from Phase 5 onward, so without this prefix an on-call
+/// operator can't tell which deployment fired the alert.
 pub async fn init_scheduler(
     pool: DbPool,
     pg_pool: Option<PgPool>,
     slack_config: SlackConfig,
+    site: SiteConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tracing::info!("[Scheduler] Starting cron jobs...");
+    tracing::info!(site = %site.id, "[Scheduler] Starting cron jobs...");
 
     let scheduler = JobScheduler::new().await?;
     let state = Arc::new(Mutex::new(SchedulerState::default()));
@@ -86,16 +92,21 @@ pub async fn init_scheduler(
             .unwrap_or(true);
 
         if sync_enabled {
+            let sync_site_id = site.id.clone();
             let sync_job = Job::new_async("0 */15 * * * *", move |_uuid, _l| {
                 let legacy = sync_legacy.clone();
                 let pg = sync_pg.clone();
                 let slack = sync_slack.clone();
+                let site_id = sync_site_id.clone();
                 Box::pin(async move {
-                    sync::run_sync(&legacy, &pg, slack.as_ref()).await;
+                    let span = tracing::info_span!("reconcile_tick", site = %site_id);
+                    let _enter = span.enter();
+                    sync::run_sync(&legacy, &pg, slack.as_ref(), &site_id).await;
                 })
             })?;
             scheduler.add(sync_job).await?;
             tracing::info!(
+                site = %site.id,
                 "[Scheduler] - Legacy reconcile: every 15 minutes (Phase 6 — diff-only safety net + drift alerts)"
             );
         } else {
@@ -126,13 +137,21 @@ pub async fn init_scheduler(
     let slack_bookings = SlackClient::new(slack_config.clone());
     let state_bookings = state.clone();
 
+    // Site id is small + Clone-cheap so we just clone it into each
+    // closure rather than wrapping in an Arc.
+    let hourly_site = site.id.clone();
+    let checkin_site = site.id.clone();
+    let checkout_site = site.id.clone();
+    let booking_site = site.id.clone();
+
     // Hourly report at minute 0 of every hour
     let hourly_job = Job::new_async("0 0 * * * *", move |_uuid, _l| {
         let pool = pool_hourly.clone();
         let slack = slack_hourly.clone();
+        let site_id = hourly_site.clone();
         Box::pin(async move {
-            if let Err(e) = send_hourly_report(&pool, &slack).await {
-                tracing::error!("[Scheduler] Error in hourly report: {}", e);
+            if let Err(e) = send_hourly_report(&pool, &slack, &site_id).await {
+                tracing::error!(site = %site_id, "[Scheduler] Error in hourly report: {}", e);
             }
         })
     })?;
@@ -143,9 +162,10 @@ pub async fn init_scheduler(
         let pool = pool_checkins.clone();
         let slack = slack_checkins.clone();
         let state = state_checkins.clone();
+        let site_id = checkin_site.clone();
         Box::pin(async move {
-            if let Err(e) = poll_checkins(&pool, &slack, &state).await {
-                tracing::error!("[Scheduler] Error polling check-ins: {}", e);
+            if let Err(e) = poll_checkins(&pool, &slack, &state, &site_id).await {
+                tracing::error!(site = %site_id, "[Scheduler] Error polling check-ins: {}", e);
             }
         })
     })?;
@@ -156,9 +176,10 @@ pub async fn init_scheduler(
         let pool = pool_checkouts.clone();
         let slack = slack_checkouts.clone();
         let state = state_checkouts.clone();
+        let site_id = checkout_site.clone();
         Box::pin(async move {
-            if let Err(e) = poll_checkouts(&pool, &slack, &state).await {
-                tracing::error!("[Scheduler] Error polling checkouts: {}", e);
+            if let Err(e) = poll_checkouts(&pool, &slack, &state, &site_id).await {
+                tracing::error!(site = %site_id, "[Scheduler] Error polling checkouts: {}", e);
             }
         })
     })?;
@@ -169,9 +190,10 @@ pub async fn init_scheduler(
         let pool = pool_bookings.clone();
         let slack = slack_bookings.clone();
         let state = state_bookings.clone();
+        let site_id = booking_site.clone();
         Box::pin(async move {
-            if let Err(e) = poll_new_bookings(&pool, &slack, &state).await {
-                tracing::error!("[Scheduler] Error polling bookings: {}", e);
+            if let Err(e) = poll_new_bookings(&pool, &slack, &state, &site_id).await {
+                tracing::error!(site = %site_id, "[Scheduler] Error polling bookings: {}", e);
             }
         })
     })?;
@@ -188,12 +210,22 @@ pub async fn init_scheduler(
     Ok(())
 }
 
+/// Apply the task #69 site-id prefix to a Block-Kit Slack message in
+/// place. The `text` field is what shows in Slack notification previews
+/// and channel summaries — prefixing it lets an operator triage which
+/// site fired the alert without expanding the full block payload.
+fn prefix_message_with_site(message: &mut SlackMessage, site_id: &str) {
+    let prefixed = format_site_prefixed(site_id, &message.text);
+    message.text = prefixed;
+}
+
 /// Send hourly report to Slack
 async fn send_hourly_report(
     pool: &DbPool,
     slack: &SlackClient,
+    site_id: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tracing::info!("[Scheduler] Running hourly report...");
+    tracing::info!(site = %site_id, "[Scheduler] Running hourly report...");
 
     let mut conn = pool.get().await?;
 
@@ -240,10 +272,11 @@ async fn send_hourly_report(
         .and_then(|r| r.get::<i32, _>("count"))
         .unwrap_or(0);
 
-    let message = build_hourly_report_message(occupied_rooms, total_rooms, today_bookings);
+    let mut message = build_hourly_report_message(occupied_rooms, total_rooms, today_bookings);
+    prefix_message_with_site(&mut message, site_id);
     slack.send_message(&message).await;
 
-    tracing::info!("[Scheduler] Hourly report sent successfully");
+    tracing::info!(site = %site_id, "[Scheduler] Hourly report sent successfully");
     Ok(())
 }
 
@@ -252,8 +285,9 @@ async fn poll_checkins(
     pool: &DbPool,
     slack: &SlackClient,
     state: &Arc<Mutex<SchedulerState>>,
+    site_id: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tracing::debug!("[Scheduler] Polling for new check-ins...");
+    tracing::debug!(site = %site_id, "[Scheduler] Polling for new check-ins...");
 
     let mut conn = pool.get().await?;
     let mut state = state.lock().await;
@@ -300,7 +334,8 @@ async fn poll_checkins(
             let check_in_time = row.get::<NaiveDateTime, _>("Cin_Room_In");
 
             if let Some(time) = check_in_time {
-                let message = build_check_in_alert_message(&guest_name, &room_no, time);
+                let mut message = build_check_in_alert_message(&guest_name, &room_no, time);
+                prefix_message_with_site(&mut message, site_id);
                 slack.send_message(&message).await;
 
                 // Update last checked timestamp
@@ -321,8 +356,9 @@ async fn poll_checkouts(
     pool: &DbPool,
     slack: &SlackClient,
     state: &Arc<Mutex<SchedulerState>>,
+    site_id: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tracing::debug!("[Scheduler] Polling for new checkouts...");
+    tracing::debug!(site = %site_id, "[Scheduler] Polling for new checkouts...");
 
     let mut conn = pool.get().await?;
     let mut state = state.lock().await;
@@ -369,7 +405,8 @@ async fn poll_checkouts(
             let checkout_time = row.get::<NaiveDateTime, _>("Cin_Room_Out");
 
             if let Some(time) = checkout_time {
-                let message = build_check_out_alert_message(&guest_name, &room_no, time);
+                let mut message = build_check_out_alert_message(&guest_name, &room_no, time);
+                prefix_message_with_site(&mut message, site_id);
                 slack.send_message(&message).await;
 
                 // Update last checked timestamp
@@ -390,8 +427,9 @@ async fn poll_new_bookings(
     pool: &DbPool,
     slack: &SlackClient,
     state: &Arc<Mutex<SchedulerState>>,
+    site_id: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tracing::debug!("[Scheduler] Polling for new bookings...");
+    tracing::debug!(site = %site_id, "[Scheduler] Polling for new bookings...");
 
     let mut conn = pool.get().await?;
     let mut state = state.lock().await;
@@ -440,7 +478,8 @@ async fn poll_new_bookings(
             let booking_time = row.get::<NaiveDateTime, _>("Book_Date");
 
             if let (Some(cin), Some(cout)) = (check_in_date, check_out_date) {
-                let message = build_new_booking_alert_message(&guest_name, &room_type, cin, cout);
+                let mut message = build_new_booking_alert_message(&guest_name, &room_type, cin, cout);
+                prefix_message_with_site(&mut message, site_id);
                 slack.send_message(&message).await;
 
                 // Update last checked timestamp
