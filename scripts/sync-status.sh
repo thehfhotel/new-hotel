@@ -6,10 +6,20 @@
 # on your laptop — it SSHes to evergreen and queries PG directly.
 #
 # Usage:
-#   scripts/sync-status.sh                # one-shot report
-#   scripts/sync-status.sh --watch        # refresh every 30s (Ctrl-C to exit)
-#   scripts/sync-status.sh --json         # machine-readable, single shot
-#   scripts/sync-status.sh --readiness    # cutover readiness check (exit 0 = green)
+#   scripts/sync-status.sh                  # one-shot report (HF Hotel)
+#   scripts/sync-status.sh --watch          # refresh every 30s (Ctrl-C to exit)
+#   scripts/sync-status.sh --json           # machine-readable, single shot
+#   scripts/sync-status.sh --readiness      # cutover readiness check (exit 0 = green)
+#   scripts/sync-status.sh --site hfville   # query the Ville canonical PG database
+#
+# Flags:
+#   --site <hfhotel|hfville>  Pick which site's PG database to query.
+#                             hfhotel (default) → database `hotelnew`.
+#                             hfville            → database `hotelville`.
+#                             Both live in the same `new-hotel-db` container;
+#                             only the database name changes. Container
+#                             selection (sync/writeback) is NOT switched here —
+#                             that's task #78's out-of-scope item.
 #
 # Sections:
 #   1. Container status — sync, writeback, backend, newdb (running? healthy?)
@@ -29,7 +39,9 @@ set -euo pipefail
 SSH_HOST="${SYNC_STATUS_SSH_HOST:-evergreen}"
 PG_CONTAINER="${SYNC_STATUS_PG_CONTAINER:-new-hotel-db}"
 PG_USER="${SYNC_STATUS_PG_USER:-postgres}"
-PG_DATABASE="${SYNC_STATUS_PG_DATABASE:-hotelnew}"
+# PG_DATABASE is set after argument parsing — it depends on `--site`. The
+# default is `hotelnew` (HF Hotel), preserving pre-#78 behavior.
+PG_DATABASE=""
 SYNC_CONTAINER="${SYNC_STATUS_SYNC_CONTAINER:-new-hotel-production-sync-1}"
 WATCH_INTERVAL_SECS="${SYNC_STATUS_WATCH_INTERVAL_SECS:-30}"
 
@@ -57,16 +69,35 @@ detect_sync_mode() {
 SYNC_MODE=""  # populated lazily by sections that need it
 
 # ─── Args ─────────────────────────────────────────────────────────────────────
+# `--site` is parsed in a `while`-shift loop because it takes a value. The
+# other flags stay boolean. Default site is `hfhotel`, which maps to the
+# original `hotelnew` database name (back-compat — pre-#78 callers see no
+# change).
 WATCH=0; JSON=0; READINESS=0
-for arg in "$@"; do
-    case "$arg" in
-        -w|--watch) WATCH=1 ;;
-        --json) JSON=1 ;;
-        --readiness) READINESS=1 ;;
+SITE="hfhotel"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -w|--watch) WATCH=1; shift ;;
+        --json) JSON=1; shift ;;
+        --readiness) READINESS=1; shift ;;
+        --site)
+            [[ $# -lt 2 ]] && { echo "--site requires a value (hfhotel|hfville)" >&2; exit 2; }
+            SITE="$2"; shift 2 ;;
+        --site=*)
+            SITE="${1#--site=}"; shift ;;
         -h|--help) grep '^#' "$0" | sed 's/^# \?//'; exit 0 ;;
-        *) echo "unknown flag: $arg" >&2; exit 2 ;;
+        *) echo "unknown flag: $1" >&2; exit 2 ;;
     esac
 done
+
+# Derive the PG database name from --site. Override is still honored via
+# SYNC_STATUS_PG_DATABASE for one-off operator sessions (e.g. pointing at
+# a staging DB), but --site always wins when it's explicit.
+case "$SITE" in
+    hfhotel) PG_DATABASE="${SYNC_STATUS_PG_DATABASE:-hotelnew}" ;;
+    hfville) PG_DATABASE="${SYNC_STATUS_PG_DATABASE_HFVILLE:-hotelville}" ;;
+    *) echo "unknown site: $SITE (expected hfhotel or hfville)" >&2; exit 2 ;;
+esac
 
 # ─── Color helpers (no color when piped or --json) ────────────────────────────
 if [[ -t 1 && "$JSON" == "0" ]]; then
