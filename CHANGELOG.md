@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.18] - 2026-04-29
+
+### Added
+
+- **`migrate_legacy` binary now ships in the production backend image**
+  (added to `hotel-backend/Dockerfile` builder + runtime stages).
+  Previously only `hotel-backend`, `writeback`, `sync`, and
+  `backfill_rooms` were copied into the runtime image. Discovered
+  during Phase 5 Ville soak that the checkin mapper defers with
+  "customer not yet mirrored" warnings — the canonical `ht_customers`
+  / `ht_bookings` / `ht_checkins` at `hotelville` are empty because
+  bootstrap snapshots only the legacy CACHE tables (`ht_*_legacy`),
+  not canonical state. `migrate_legacy.rs` already does the right
+  imports (`View_Customers` → `ht_customers`,
+  `View_Booking_Ds` → `ht_bookings` + `ht_booking_rooms`,
+  `View_CheckIn_Ds` → `ht_checkins`) but wasn't reachable from the
+  deploy host. Now it is — operator can run a one-shot
+  `docker compose --profile backfill run --rm
+  -e DB_SERVER=… -e DB_NAME=HOTEL -e MSSQL_PORT=1436
+  -e DATABASE_URL=…/hotelville
+  --entrypoint ./migrate_legacy backfill-rooms`
+  to seed canonical state before #76 cutover (task #85).
+
 ## [2.54.17] - 2026-04-29
 
 ### Fixed
