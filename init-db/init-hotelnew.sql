@@ -1178,6 +1178,21 @@ INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('022', '022_legacy_mirror_sync_status_seed.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
+-- Migration 023 — `legacy_mirror.ht_order_up` / `ht_order_down` PK is composite
+-- (id, cust_type, cast_type). The schema above already reflects this; this
+-- INSERT marks 023 as applied for fresh deploys so migrate.sh doesn't try to
+-- re-apply it on top of the already-correct baseline (drift-check requirement).
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('023', '023_legacy_mirror_order_composite_pk.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 024 — canonical `ht_customers` VARCHAR widening. The schema above
+-- already reflects the wider widths (cust_phone 200, cust_idcard 100, etc.).
+-- Same drift-check rationale as 023.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('024', '024_widen_canonical_customer_varchars.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
 -- =============================================================================
 -- Initialization complete
 -- =============================================================================
