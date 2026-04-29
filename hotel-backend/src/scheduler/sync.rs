@@ -751,6 +751,25 @@ async fn sync_customers(
                         None,
                     )
                     .await;
+                    // Phase 6 fix (#65): cache-only marker insert so the
+                    // next reconcile tick sees a row and goes through the
+                    // Some-branch (which already does the proper UPDATE).
+                    // Without this, every tick re-detects the same PK as
+                    // None and re-fires divergence forever (~3 entries
+                    // per 15 min on bookings observed). Detail columns
+                    // are left NULL — canonical state is owned by the
+                    // CT watcher; this row is purely a bookkeeping
+                    // marker for the diff-only safety net. Best-effort:
+                    // a failed insert just re-fires the alert next tick.
+                    let _ = sqlx::query(
+                        "INSERT INTO ht_customers_legacy (cust_no, sync_hash, synced_at) \
+                         VALUES ($1, $2, NOW()) \
+                         ON CONFLICT (cust_no) DO NOTHING",
+                    )
+                    .bind(&cust_no)
+                    .bind(&hash)
+                    .execute(pg_pool)
+                    .await;
                     added += 1;
                 }
             },
@@ -980,6 +999,17 @@ async fn sync_rooms(
                         None,
                     )
                     .await;
+                    // Phase 6 fix (#65): cache-only marker insert. See
+                    // sync_customers DiffOnly None-branch for rationale.
+                    let _ = sqlx::query(
+                        "INSERT INTO ht_rooms_legacy (room_no, sync_hash, synced_at) \
+                         VALUES ($1, $2, NOW()) \
+                         ON CONFLICT (room_no) DO NOTHING",
+                    )
+                    .bind(&room_no)
+                    .bind(&hash)
+                    .execute(pg_pool)
+                    .await;
                     added += 1;
                 }
             },
@@ -1168,6 +1198,23 @@ async fn sync_bookings(
                         None,
                     )
                     .await;
+                    // Phase 6 fix (#65): cache-only marker insert. The
+                    // UNIQUE constraint `uq_bookings_legacy_key` is on
+                    // (book_no, book_room_type) raw columns; we bind
+                    // `room_type_key` (always non-NULL — empty string
+                    // for legacy NULL) so subsequent SELECTs using
+                    // COALESCE(book_room_type,'') match this row. See
+                    // sync_customers DiffOnly None-branch for rationale.
+                    let _ = sqlx::query(
+                        "INSERT INTO ht_bookings_legacy (book_no, book_room_type, sync_hash, synced_at) \
+                         VALUES ($1, $2, $3, NOW()) \
+                         ON CONFLICT (book_no, book_room_type) DO NOTHING",
+                    )
+                    .bind(&book_no)
+                    .bind(&room_type_key)
+                    .bind(&hash)
+                    .execute(pg_pool)
+                    .await;
                     added += 1;
                 }
             },
@@ -1344,6 +1391,17 @@ async fn sync_checkins(
                         mssql_json,
                         None,
                     )
+                    .await;
+                    // Phase 6 fix (#65): cache-only marker insert. See
+                    // sync_customers DiffOnly None-branch for rationale.
+                    let _ = sqlx::query(
+                        "INSERT INTO ht_checkins_legacy (cin_no, sync_hash, synced_at) \
+                         VALUES ($1, $2, NOW()) \
+                         ON CONFLICT (cin_no) DO NOTHING",
+                    )
+                    .bind(&cin_no)
+                    .bind(&hash)
+                    .execute(pg_pool)
                     .await;
                     added += 1;
                 }
