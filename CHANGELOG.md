@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.21] - 2026-04-29
+
+### Fixed
+
+- **`migrate_legacy.rs` populates `legacy_cust_no` / `legacy_book_id` /
+  `legacy_cin_no`** on the canonical inserts. Caught during Phase 5
+  Ville #85 backfill: customers + bookings + check-ins all imported
+  cleanly, but the CT mappers continued to emit "customer not yet
+  mirrored" warnings because they look up by `legacy_cust_no` while
+  the import only set `cust_code`. Same shape applies to bookings
+  (`legacy_book_id` vs `book_no`) and check-ins (`legacy_cin_no` vs
+  `cin_no`). Each INSERT now binds `$1` to BOTH the user-facing key
+  AND the legacy lookup column. For the existing hotelville import
+  ran 2026-04-29, a one-shot `UPDATE … SET legacy_X = X WHERE source =
+  'legacy' AND legacy_X IS NULL` filled the columns retroactively
+  (1812 customers + 1079 bookings + 1417 check-ins). Mapper warnings
+  silenced within seconds of the UPDATE.
+
 ## [2.54.20] - 2026-04-29
 
 ### Fixed
