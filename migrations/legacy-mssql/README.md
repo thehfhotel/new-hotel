@@ -39,7 +39,9 @@ ssh evergreen "cat <path-to-sql> | docker run --rm -i --network host \
 ```
 
 For HF Ville: same command, swap the `-S` server address for Ville's
-MSSQL (over the WireGuard mesh).
+MSSQL — `192.168.11.51,1436` over the WireGuard `hfville` interface
+(after the 2026-04-29 cutover; see `ville_constraint.md` for the
+network path). Database is `HOTEL`, not `db`.
 
 ## Coordination
 
@@ -53,5 +55,5 @@ auto-memory tracks current state across runs.
 
 | # | File | Date | What |
 |---|------|------|------|
-| 020 | `Phase 5 prep` (inline, archived as `/tmp/disable-ct-rollback.sql` on evergreen) | 2026-04-25 | PKs + CT on the 10 canonical-sync tables |
+| 020 | `020_phase5_enable_ct.sql` / `.rollback.sql` | written 2026-04-29 (backfill); applied to HF Hotel manually 2026-04-25 | Phase 5 — DB-level CT + PKs + CT on the 11 canonical-sync tables (HT_Customers, HT_Rooms, HT_Book_H, HT_Book_Ds, HT_Book_Date, HT_CheckIn_H, HT_CheckIn_Ds, HT_CheckIn_Pay, HT_Room_Status, HT_Rooms_Cancel, HT_Receipt_H). At HF Hotel the equivalent statements were applied manually before this file existed; this captures them for new sites (HF Ville, future restores). DO NOT re-apply at HF Hotel — `ALTER DATABASE SET CHANGE_TRACKING ON` would error if already enabled. |
 | 021 | `021_phase55b_enable_ct.sql` / `.rollback.sql` | 2026-04-28 | Phase 5.5b — PKs + CT on 6 legacy-only tables (HT_Cupon, HT_CheckIn_Product, HT_Deposit, HT_Changed_Room, HT_Bill_Debt_H, HT_Bill_Debt_Ds) for the legacy_mirror.\* schema (CT mappers in Phase 5.5c will populate) |
