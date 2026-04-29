@@ -465,6 +465,20 @@ async fn sync_customers(
                         None,
                     )
                     .await;
+                    // Acknowledge the divergence in the cache so the next
+                    // reconcile tick doesn't re-flag this same row forever
+                    // and spam the Phase 6 drift alert. Cache-only write —
+                    // does NOT mutate canonical state. Best-effort: a
+                    // failed cache update only re-fires the alert next
+                    // tick, never a data-correctness issue.
+                    let _ = sqlx::query(
+                        "UPDATE ht_customers_legacy SET sync_hash = $1, synced_at = NOW() \
+                         WHERE cust_no = $2",
+                    )
+                    .bind(&hash)
+                    .bind(&cust_no)
+                    .execute(pg_pool)
+                    .await;
                     updated += 1;
                 }
             },
@@ -670,6 +684,17 @@ async fn sync_rooms(
                         None,
                     )
                     .await;
+                    // Phase 6 fix: ack the divergence in the cache so the
+                    // next reconcile tick doesn't re-flag the same row.
+                    // See sync_customers DiffOnly branch for the rationale.
+                    let _ = sqlx::query(
+                        "UPDATE ht_rooms_legacy SET sync_hash = $1, synced_at = NOW() \
+                         WHERE room_no = $2",
+                    )
+                    .bind(&hash)
+                    .bind(&room_no)
+                    .execute(pg_pool)
+                    .await;
                     updated += 1;
                 }
             },
@@ -865,6 +890,19 @@ async fn sync_bookings(
                         None,
                     )
                     .await;
+                    // Phase 6 fix: ack the divergence in the cache so the
+                    // next reconcile tick doesn't re-flag the same row.
+                    // Composite PK on bookings — match the SELECT shape
+                    // at line 811 above.
+                    let _ = sqlx::query(
+                        "UPDATE ht_bookings_legacy SET sync_hash = $1, synced_at = NOW() \
+                         WHERE book_no = $2 AND COALESCE(book_room_type, '') = $3",
+                    )
+                    .bind(&hash)
+                    .bind(&book_no)
+                    .bind(room_type_key)
+                    .execute(pg_pool)
+                    .await;
                     updated += 1;
                 }
             },
@@ -1040,6 +1078,19 @@ async fn sync_checkins(
                         mssql_json,
                         None,
                     )
+                    .await;
+                    // Phase 6 fix: ack the divergence in the cache so the
+                    // next reconcile tick doesn't re-flag the same row.
+                    // This is the dominant source of the 22-24k/hour drift
+                    // alert spam observed 2026-04-29 — every reconcile
+                    // re-detected the same ~3k checkin PKs forever.
+                    let _ = sqlx::query(
+                        "UPDATE ht_checkins_legacy SET sync_hash = $1, synced_at = NOW() \
+                         WHERE cin_no = $2",
+                    )
+                    .bind(&hash)
+                    .bind(&cin_no)
+                    .execute(pg_pool)
                     .await;
                     updated += 1;
                 }

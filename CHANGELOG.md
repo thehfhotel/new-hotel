@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.2] - 2026-04-29
+
+### Fixed
+
+- **Drift-reconcile spam loop** — Phase 6 alert was firing every 15 min
+  with 22-24k unresolved `ht_reconcile_log` rows on `checkins` (~3,041
+  distinct PKs being re-flagged ~1.9× per tick). Root cause: `DiffOnly`
+  mode in `scheduler::sync` logs divergence via `record_divergence()`
+  but never writes the new hash back to the `ht_*_legacy` cache, so
+  every subsequent reconcile tick recomputes the same hash, sees the
+  same prior_hash mismatch, and re-logs the same drift forever. Fix:
+  after `record_divergence` in each of the 4 `sync_*` DiffOnly
+  Some-branches (customers/rooms/bookings/checkins), `UPDATE` the
+  matching `ht_*_legacy.sync_hash + synced_at` so the cache reflects
+  what we just observed. Cache-only write — does NOT mutate canonical
+  state (which the CT watcher owns). Best-effort: a failed cache
+  update only re-fires the alert next tick, never a correctness issue.
+  Also: marked the existing 1,521,844 stale unresolved log entries as
+  resolved on prod (one-shot SQL outside the deploy). None-branch
+  (legacy row with no PG cache row yet) deferred — no observed spam
+  coming from that path.
+
 ## [2.54.1] - 2026-04-27
 
 ### Fixed
