@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.13] - 2026-04-29
+
+### Fixed
+
+- **drift-reconcile None-branch cache leak (#65).** The 4 `sync_*`
+  functions in `hotel-backend/src/scheduler/sync.rs` (customers, rooms,
+  bookings, checkins) had a slow leak in the `DiffOnly` mode None-branch:
+  when the legacy PK was absent from `ht_*_legacy` (cache-miss), they
+  called `record_divergence()` and incremented `added`, but never
+  inserted a cache row. The next reconcile tick (every 15 min) re-read
+  the same cache-miss, recorded the same divergence again, ad infinitum.
+  Observed steady-state rate: ~3 entries per 15 min on bookings driven
+  by genuinely new PKs landing between ticks (below the 50/hour alert
+  threshold so it didn't spam, but the unresolved-rows count grew with
+  new-PK velocity). Fix: each None-branch now writes a minimal
+  cache-only marker row (`INSERT ... ON CONFLICT DO NOTHING` with PK +
+  sync_hash + synced_at; detail columns left NULL) so the next tick
+  sees the row and goes through the Some-branch's already-correct
+  UPDATE path. Canonical state remains owned by the CT watcher; the
+  marker row is purely diff-only bookkeeping. Companion to #62
+  (Some-branch cache UPDATE) and #64 (multi-row aggregation). Bookings
+  uses the composite UNIQUE `uq_bookings_legacy_key (book_no,
+  book_room_type)` with `room_type_key` (always non-NULL — empty
+  string for legacy NULL) so subsequent SELECTs using
+  `COALESCE(book_room_type,'')` match this row.
+
 ## [2.54.12] - 2026-04-29
 
 ### Fixed
