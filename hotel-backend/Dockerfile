@@ -101,11 +101,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
         --bin writeback \
         --bin sync \
         --bin backfill_rooms \
+        --bin migrate_legacy \
     && mkdir -p /out \
     && cp target/release/hotel-backend /out/ \
     && cp target/release/writeback /out/ \
     && cp target/release/sync /out/ \
-    && cp target/release/backfill_rooms /out/
+    && cp target/release/backfill_rooms /out/ \
+    && cp target/release/migrate_legacy /out/
 
 # ---- Runtime stage --------------------------------------------------------
 # Pin to digest. Source: Docker Hub API `library/debian/tags/bookworm-slim`
@@ -125,6 +127,7 @@ COPY --from=builder /out/hotel-backend /app/hotel-backend
 COPY --from=builder /out/writeback /app/writeback
 COPY --from=builder /out/sync /app/sync
 COPY --from=builder /out/backfill_rooms /app/backfill_rooms
+COPY --from=builder /out/migrate_legacy /app/migrate_legacy
 
 RUN useradd -m -u 1000 appuser
 USER appuser
