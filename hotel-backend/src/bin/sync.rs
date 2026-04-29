@@ -62,7 +62,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::sync::Notify;
 
-use hotel_backend::config::{DbConfig, SlackConfig};
+use hotel_backend::config::{DbConfig, SiteConfig, SlackConfig};
 use hotel_backend::db::{create_pool, DbPool};
 use hotel_backend::notifications::slack::{SlackClient, SlackMessage};
 use hotel_backend::outbox::bus::EventBus;
@@ -133,6 +133,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .init();
 
+    // Task #69: parse SITE_ID once at startup. Panics on a typo so a
+    // misconfigured deploy fails loud before the watcher starts pulling
+    // CT rows.
+    let site = SiteConfig::from_env();
+    tracing::info!(site = %site.id, "CT watcher: site identity resolved");
+
     let bootstrap_requested = env::args().any(|a| a == "--bootstrap");
 
     let enabled = env::var("LEGACY_SYNC_ENABLED")
@@ -171,28 +177,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     None
                 };
                 let msg = build_live_bootstrap_refusal_message();
-                tracing::error!("{msg}");
+                tracing::error!(site = %site.id, "{msg}");
                 if let Some(s) = &slack {
-                    let payload = SlackMessage::with_text(format!(
-                        ":no_entry: *Bootstrap REFUSED — live deployment* :no_entry:\n{msg}"
-                    ));
+                    let payload = SlackMessage::with_site_text(
+                        &site.id,
+                        format!(
+                            ":no_entry: *Bootstrap REFUSED — live deployment* :no_entry:\n{msg}"
+                        ),
+                    );
                     let _ = s.send_message(&payload).await;
                 }
                 // Sleep before exit so Docker `restart: unless-stopped`
                 // doesn't turn this into a tight loop + alert flood.
                 tracing::warn!(
+                    site = %site.id,
                     "Sleeping 60s before exit to throttle Docker restart cadence"
                 );
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 return Err(msg.into());
             }
             tracing::warn!(
+                site = %site.id,
                 "LEGACY_SYNC_ALLOW_LIVE_BOOTSTRAP=true — proceeding with bootstrap \
                  against a live deployment. Watcher CT writes during the snapshot \
                  window may be clobbered by the snapshot DELETE."
             );
         }
-        return run_bootstrap().await;
+        return run_bootstrap(&site).await;
     }
 
     if !enabled {
@@ -257,21 +268,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     if let Err(e) = verify_schema_fingerprint(&mssql).await {
         tracing::error!(
+            site = %site.id,
             error = %e,
             "Schema fingerprint check failed — refusing to start"
         );
         if let Some(slack) = &slack {
-            let msg = SlackMessage::with_text(format!(
-                ":warning: *CT watcher REFUSED TO START* :warning:\n\
-                 Legacy MSSQL schema fingerprint mismatch.\n\
-                 *Error:* `{e}`\n\
-                 _The legacy DB columns drifted from the captured baseline. \
-                 Run_ `./scripts/writeback-fingerprint.sh` _and follow the \
-                 README to update the baseline before restarting._"
-            ));
+            let msg = SlackMessage::with_site_text(
+                &site.id,
+                format!(
+                    ":warning: *CT watcher REFUSED TO START* :warning:\n\
+                     Legacy MSSQL schema fingerprint mismatch.\n\
+                     *Error:* `{e}`\n\
+                     _The legacy DB columns drifted from the captured baseline. \
+                     Run_ `./scripts/writeback-fingerprint.sh` _and follow the \
+                     README to update the baseline before restarting._"
+                ),
+            );
             let _ = slack.send_message(&msg).await;
         }
-        tracing::warn!("Sleeping 60s before exit to throttle Docker restart cadence");
+        tracing::warn!(site = %site.id, "Sleeping 60s before exit to throttle Docker restart cadence");
         tokio::time::sleep(Duration::from_secs(60)).await;
         return Err(format!("Schema fingerprint check failed: {e}").into());
     }
@@ -297,11 +312,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                    and the watermark, OR set LEGACY_SYNC_ALLOW_COLD_REPLAY=true \
                    to override (will replay all CT history). \
                    See docs/runbook-sync.md for the full cutover procedure.";
-        tracing::error!("{msg}");
+        tracing::error!(site = %site.id, "{msg}");
         if let Some(s) = &slack {
-            let payload = SlackMessage::with_text(format!(
-                ":no_entry: *CT watcher REFUSED TO START* :no_entry:\n{msg}"
-            ));
+            let payload = SlackMessage::with_site_text(
+                &site.id,
+                format!(":no_entry: *CT watcher REFUSED TO START* :no_entry:\n{msg}"),
+            );
             let _ = s.send_message(&payload).await;
         }
         // Sleep before exit so Docker `restart: unless-stopped` doesn't
@@ -364,11 +380,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             overflowed.len(),
             overflowed.join("\n    - "),
         );
-        tracing::error!("{msg}");
+        tracing::error!(site = %site.id, "{msg}");
         if let Some(s) = &slack {
-            let payload = SlackMessage::with_text(format!(
-                ":no_entry: *CT watcher REFUSED TO START — retention overflow* :no_entry:\n{msg}"
-            ));
+            let payload = SlackMessage::with_site_text(
+                &site.id,
+                format!(
+                    ":no_entry: *CT watcher REFUSED TO START — retention overflow* :no_entry:\n{msg}"
+                ),
+            );
             let _ = s.send_message(&payload).await;
         }
         // Sleep before exit so Docker `restart: unless-stopped` doesn't
@@ -409,6 +428,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // needed and the map dies cleanly with the worker on SIGTERM.
     let mut retention_last_checked: HashMap<String, Instant> = HashMap::new();
 
+    // Task #69: wrap the main loop in a tracing span so every log line
+    // emitted from inside the watcher (mapper warnings, watermark
+    // advances, retention probes) carries `site=<id>`. With both HF
+    // Hotel and HF Ville sending logs to the same sink, this is the
+    // only thing that lets an operator filter by site.
+    let watcher_span = tracing::info_span!("ct_watcher", site = %site.id);
+    let _watcher_guard = watcher_span.enter();
+
     loop {
         run_one_tick(
             &pg,
@@ -418,6 +445,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             shadow_mode,
             &mut retention_last_checked,
             retention_check_interval,
+            &site.id,
         )
         .await;
 
@@ -449,8 +477,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 /// Bootstrap is intentionally NOT idempotent in shape (the reconcile
 /// it invokes IS idempotent — UPSERT-by-hash). Re-running just re-runs
 /// the reconcile and re-stamps the watermark to the new tip.
-async fn run_bootstrap() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tracing::info!("Phase 5.5 bootstrap — cold-seeding canonical PG + CT watermark");
+async fn run_bootstrap(site: &SiteConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing::info!(
+        site = %site.id,
+        "Phase 5.5 bootstrap — cold-seeding canonical PG + CT watermark"
+    );
 
     let pg_url = env::var("DATABASE_URL")
         .or_else(|_| env::var("NEW_DATABASE_URL"))
@@ -518,7 +549,7 @@ async fn run_bootstrap() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     // emit a Phase 6 drift alert during a fresh seed (canonical state
     // hasn't existed yet, so every legacy row is a "PG miss" by
     // construction — a drift alert would fire unconditionally).
-    hotel_backend::scheduler::sync::run_sync(&mssql, &pg, None).await;
+    hotel_backend::scheduler::sync::run_sync(&mssql, &pg, None, &site.id).await;
     match prior_mode {
         Some(v) => env::set_var("LEGACY_SYNC_RECONCILE_MODE", v),
         None => env::remove_var("LEGACY_SYNC_RECONCILE_MODE"),
@@ -661,6 +692,7 @@ fn build_mappers(allowlist: &Option<HashSet<String>>) -> Vec<Box<dyn MssqlChange
 
 /// Process one watcher tick. Per-mapper failures are logged but don't
 /// abort the tick — one bad table never blocks the others.
+#[allow(clippy::too_many_arguments)]
 async fn run_one_tick(
     pg: &PgPool,
     mssql: &DbPool,
@@ -669,6 +701,7 @@ async fn run_one_tick(
     shadow_mode: bool,
     retention_last_checked: &mut HashMap<String, Instant>,
     retention_check_interval: Duration,
+    site_id: &str,
 ) {
     let last_seen = match hotel_backend::sync::watermark::read_last_seen(pg).await {
         Ok(v) => v,
@@ -710,10 +743,11 @@ async fn run_one_tick(
             last_seen,
             shadow_mode,
             should_check_retention,
+            site_id,
         )
         .await
         {
-            tracing::error!(table, error = %err, "poll_table failed");
+            tracing::error!(site = %site_id, table, error = %err, "poll_table failed");
             let _ = record_table_error(pg, table, &err.to_string()).await;
         }
     }
@@ -741,21 +775,25 @@ async fn poll_table(
     last_seen: i64,
     shadow_mode: bool,
     should_check_retention: bool,
+    site_id: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 1. Retention guard (throttled — see fn doc comment).
     if should_check_retention {
         if let Err(err) = check_retention(mssql, table, last_seen).await {
-            tracing::error!(table, error = %err, "Retention check failed");
+            tracing::error!(site = %site_id, table, error = %err, "Retention check failed");
             let _ = record_table_error(pg, table, &err).await;
             if let Some(s) = slack {
                 if err.contains("retention") {
-                    let msg = SlackMessage::with_text(format!(
-                        ":rotating_light: *CT retention overflow* :rotating_light:\n\
-                         Table: `{table}`\n\
-                         Watermark fell behind CT retention; \
-                         row history beyond `MIN_VALID_VERSION` is gone.\n\
-                         _Recover with_ `bin/sync --bootstrap` _(Phase 5.5)_."
-                    ));
+                    let msg = SlackMessage::with_site_text(
+                        site_id,
+                        format!(
+                            ":rotating_light: *CT retention overflow* :rotating_light:\n\
+                             Table: `{table}`\n\
+                             Watermark fell behind CT retention; \
+                             row history beyond `MIN_VALID_VERSION` is gone.\n\
+                             _Recover with_ `bin/sync --bootstrap` _(Phase 5.5)_."
+                        ),
+                    );
                     let _ = s.send_message(&msg).await;
                 }
             }

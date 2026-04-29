@@ -57,6 +57,25 @@ impl SlackMessage {
     pub fn with_text(text: impl Into<String>) -> Self {
         Self { text: text.into(), blocks: None }
     }
+
+    /// Convenience constructor — text-only message, prefixed with the
+    /// site identifier so an on-call operator can tell which deployment
+    /// fired the alert when both HF Hotel and HF Ville post to the same
+    /// webhook (task #69). Format: `[site=<id>] <text>`. Kept short on
+    /// purpose so the human-readable body still fits Slack's preview.
+    pub fn with_site_text(site_id: &str, text: impl Into<String>) -> Self {
+        Self {
+            text: format_site_prefixed(site_id, &text.into()),
+            blocks: None,
+        }
+    }
+}
+
+/// Prepend the site-id prefix to a Slack message body. Pulled out as a
+/// pure helper so the prefix shape (`[site=<id>] ...`) is unit-testable
+/// and consistent across every alert call site.
+pub fn format_site_prefixed(site_id: &str, text: &str) -> String {
+    format!("[site={site_id}] {text}")
 }
 
 /// Slack client for sending messages
@@ -393,5 +412,31 @@ pub fn build_new_booking_alert_message(
                 }),
             },
         ]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Task #69 contract: the site prefix must show up at the START of
+    /// the Slack message text so an operator sees `[site=hfvilel]` in
+    /// the notification preview before any context.
+    #[test]
+    fn format_site_prefixed_prepends_marker() {
+        let out = format_site_prefixed("hfville", "Reconcile drift exceeded");
+        assert_eq!(out, "[site=hfville] Reconcile drift exceeded");
+    }
+
+    #[test]
+    fn with_site_text_carries_prefix_into_message_text() {
+        let msg = SlackMessage::with_site_text("hfhotel", "schema fingerprint mismatch");
+        assert!(
+            msg.text.starts_with("[site=hfhotel] "),
+            "site prefix must lead the message text; got {:?}",
+            msg.text
+        );
+        assert!(msg.text.contains("schema fingerprint mismatch"));
+        assert!(msg.blocks.is_none());
     }
 }

@@ -5,6 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.7] - 2026-04-29
+
+### Added
+
+- **`SITE_ID` env var (default `"hfhotel"`).** Phase 5 multi-site
+  observability prerequisite (task #69). HF Hotel and HF Ville will
+  each run a separate instance of the same `hotel-backend` /
+  `bin/sync` / `bin/writeback` binaries against their own per-DB
+  PostgreSQL, but they share a single Slack webhook + log sink. Without
+  a site marker an on-call operator can't tell which deployment fired
+  a `:rotating_light:` alert. New `SiteConfig` validates the env var
+  is one of `"hfhotel"` | `"hfville"` (panics on any other value to
+  catch typos like `hfvilel` at startup, not at 3am during an outage).
+  Threaded into:
+  * **Slack alerts** — every existing alert (schema fingerprint
+    refusal, retention overflow, cold-replay refusal, drift threshold,
+    self-heal, listener UNHEALTHY, exhausted/resolved jobs, hourly
+    report, check-in/checkout/booking notifications) now prefixes the
+    message text with `[site=<id>] ` via the new
+    `SlackMessage::with_site_text` helper. The prefix lives in the
+    `text` field (Slack notification preview), so even a Block Kit
+    payload surfaces the site at-a-glance.
+  * **Tracing spans** — `bin/sync.rs` wraps the main poll loop in
+    `info_span!("ct_watcher", site = %config.site_id)`; `bin/writeback.rs`
+    wraps its main loop in `info_span!("writeback_worker", ...)`;
+    the 15-min reconcile cron job in `scheduler/jobs.rs` wraps each
+    tick in `info_span!("reconcile_tick", ...)`. Every log line emitted
+    inside these scopes carries `site=<id>` automatically.
+- **`/health` endpoint.** Returns `{ "site": "<id>", "ok": true,
+  "service": "backend" }` so external monitors / smoke tests can
+  confirm they hit the right deployment when both HF Hotel and HF
+  Ville are reachable on the same hostname infrastructure. HTTP
+  status code unchanged from the legacy probe contract — additive
+  only.
+- **`LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_<SITE>` per-site override.**
+  The existing `LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD` env var
+  continues to work as a single global. When the per-site var is set
+  (e.g. `LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_HFVILLE=20`), it
+  takes precedence — letting the smaller property run a tighter
+  alert threshold without affecting HF Hotel's tuning. Garbage values
+  in the per-site var fall through to the global instead of panicking.
+
+### Changed
+
+- **`scheduler::sync::run_sync` signature.** Added a trailing
+  `site_id: &str` parameter so the drift-alert message names which
+  deployment fired and the per-site threshold env var can be looked
+  up. Updated callers: `bin/sync::run_bootstrap` (passes the parsed
+  `SiteConfig::id`) and `scheduler::jobs::init_scheduler` (forwards
+  from the `SiteConfig` plumbed in from `main.rs`).
+- **`scheduler::init_scheduler` signature.** Added a trailing
+  `site: SiteConfig` parameter, threaded through to all four cron
+  jobs (hourly report, check-in / checkout / booking polling) so
+  every Slack message they emit carries the site prefix and every
+  log line carries `site=<id>`.
+
 ## [2.54.6] - 2026-04-29
 
 ### Added

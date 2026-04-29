@@ -42,7 +42,7 @@ use sqlx::{PgPool, Row};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-use hotel_backend::config::{DbConfig, SlackConfig};
+use hotel_backend::config::{DbConfig, SiteConfig, SlackConfig};
 use hotel_backend::db::{create_pool, DbPool};
 use hotel_backend::notifications::slack::{SlackClient, SlackMessage};
 use hotel_backend::outbox::intent::WritebackIntent;
@@ -112,6 +112,34 @@ fn backoff_secs(attempts_so_far: i32) -> i64 {
     BACKOFFS[idx]
 }
 
+/// Process-global SITE_ID, captured from `SiteConfig::from_env` at the
+/// top of `main`. Stored in a `OnceLock` so the many free-standing alert
+/// helpers (`send_exhausted_alert`, `send_resolved_alert`,
+/// `send_listener_alert`, `send_self_heal_alert`) don't each need a
+/// `site_id: &str` parameter — task #69 just needs the prefix in the
+/// message text, and threading the value through 6+ deeply-nested
+/// callers would balloon the diff for no readability gain. The string
+/// is set exactly once during startup; reads are lock-free after that.
+///
+/// The fallback to `"hfhotel"` only kicks in if some test harness
+/// constructs a `SlackMessage` via these helpers without calling
+/// `init_site_id` first — production code paths always set it.
+static SITE_ID: OnceLock<String> = OnceLock::new();
+
+/// Set the process-wide SITE_ID. Called exactly once at startup, after
+/// `SiteConfig::from_env` has validated the env var.
+fn init_site_id(id: &str) {
+    let _ = SITE_ID.set(id.to_string());
+}
+
+/// Read the process-wide SITE_ID; defaults to `"hfhotel"` if uninit.
+fn current_site_id() -> &'static str {
+    SITE_ID
+        .get()
+        .map(String::as_str)
+        .unwrap_or("hfhotel")
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     dotenvy::dotenv().ok();
@@ -122,6 +150,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .unwrap_or_else(|_| "hotel_backend=info,writeback=info".into()),
         )
         .init();
+
+    // Task #69: parse SITE_ID once at startup. Panics on a typo so a
+    // misconfigured deploy fails loud before the worker pulls jobs.
+    let site = SiteConfig::from_env();
+    init_site_id(&site.id);
+    tracing::info!(site = %site.id, "Writeback worker: site identity resolved");
 
     // 1. WRITEBACK_ENABLED — graceful no-op for State C
     let enabled = env::var("WRITEBACK_ENABLED")
@@ -187,19 +221,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     //     the worker exits in ms, restarts, fingerprint fails again, fires
     //     another Slack — operator gets paged 6×/min until they intervene).
     if let Err(e) = verify_schema_fingerprint(&mssql).await {
-        tracing::error!(error = %e, "Schema fingerprint check failed — refusing to start");
+        tracing::error!(
+            site = %site.id,
+            error = %e,
+            "Schema fingerprint check failed — refusing to start"
+        );
         if let Some(slack) = &slack {
-            let msg = SlackMessage::with_text(format!(
-                ":warning: *Writeback worker REFUSED TO START* :warning:\n\
-                 Legacy MSSQL schema fingerprint mismatch.\n\
-                 *Error:* `{e}`\n\
-                 _The legacy DB columns drifted from the captured baseline. \
-                 Run_ `./scripts/writeback-fingerprint.sh` _and follow the \
-                 README to update the baseline before restarting the worker._"
-            ));
+            let msg = SlackMessage::with_site_text(
+                &site.id,
+                format!(
+                    ":warning: *Writeback worker REFUSED TO START* :warning:\n\
+                     Legacy MSSQL schema fingerprint mismatch.\n\
+                     *Error:* `{e}`\n\
+                     _The legacy DB columns drifted from the captured baseline. \
+                     Run_ `./scripts/writeback-fingerprint.sh` _and follow the \
+                     README to update the baseline before restarting the worker._"
+                ),
+            );
             let _ = slack.send_message(&msg).await;
         }
         tracing::warn!(
+            site = %site.id,
             "Sleeping 60s before exit to throttle Docker restart cadence \
              and avoid Slack alert flood"
         );
@@ -236,6 +278,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::info!("SIGTERM received — draining pending jobs then exiting");
         shutdown_clone.notify_waiters();
     });
+
+    // Task #69: wrap the main loop in a tracing span so every log line
+    // emitted from inside the worker (job claim, dispatch outcome,
+    // panic recovery) carries `site=<id>`. Same purpose as the watcher
+    // span in `bin/sync.rs`.
+    let worker_span = tracing::info_span!("writeback_worker", site = %site.id);
+    let _worker_guard = worker_span.enter();
 
     // 6. Main loop — process jobs whenever NOTIFY wakes us OR every poll_interval
     loop {
@@ -952,7 +1001,7 @@ async fn send_self_heal_alert(
          `SELECT legacy_book_id, legacy_cin_no FROM ht_bookings JOIN ht_checkins …` \
          _has values and `mark_done`'s UPDATE is succeeding for that intent class._"
     );
-    let msg = SlackMessage::with_text(text);
+    let msg = SlackMessage::with_site_text(current_site_id(), text);
     let _ = slack.send_message(&msg).await;
 }
 
@@ -1450,7 +1499,7 @@ async fn send_exhausted_alert(
          next_retry_at=NULL WHERE id={job_id}` _to retry, \
          or delete the row if the writeback is no longer needed._"
     );
-    let msg = SlackMessage::with_text(text);
+    let msg = SlackMessage::with_site_text(current_site_id(), text);
     let _ = slack.send_message(&msg).await;
 }
 
@@ -1478,7 +1527,7 @@ async fn send_resolved_alert(
          _The previously-exhausted job succeeded after operator intervention. \
          Closure of the_ `:rotating_light:` _alert sent earlier for this job._"
     );
-    let msg = SlackMessage::with_text(text);
+    let msg = SlackMessage::with_site_text(current_site_id(), text);
     let _ = slack.send_message(&msg).await;
 }
 
@@ -1604,7 +1653,7 @@ async fn send_listener_alert(slack: &SlackClient, consecutive_failures: u32) {
          {LISTENER_BACKOFF_AFTER_ALERT_SECS}s — fix the underlying issue and \
          the next reconnect will succeed automatically._"
     );
-    let msg = SlackMessage::with_text(text);
+    let msg = SlackMessage::with_site_text(current_site_id(), text);
     let _ = slack.send_message(&msg).await;
 }
 

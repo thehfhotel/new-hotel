@@ -96,35 +96,42 @@ impl ReconcileMode {
 /// Phase 6: pass an optional `SlackClient` to enable drift alerting.
 /// When the per-table unresolved-drift count in the last hour exceeds
 /// [`DEFAULT_DRIFT_ALERT_THRESHOLD`] (override:
-/// `LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD`), a Slack message is fired
-/// at the end of the cycle. Pass `None` to silence alerts (e.g. from
-/// `bin/sync --bootstrap` where the Slack channel is reserved for
-/// CT-watcher errors and bootstrap progress).
+/// `LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD`, or per-site
+/// `LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_<SITE_ID_UPPER>`), a Slack
+/// message is fired at the end of the cycle. Pass `None` to silence
+/// alerts (e.g. from `bin/sync --bootstrap` where the Slack channel is
+/// reserved for CT-watcher errors and bootstrap progress).
+///
+/// `site_id` is plumbed through so the drift-alert message names which
+/// deployment fired (HF Hotel vs HF Ville share a Slack webhook from
+/// Phase 5 onward) and so the site-specific threshold env var can be
+/// looked up.
 pub async fn run_sync(
     legacy_pool: &DbPool,
     pg_pool: &PgPool,
     slack: Option<&SlackClient>,
+    site_id: &str,
 ) {
     let mode = ReconcileMode::from_env();
-    tracing::info!(?mode, "[Sync] Starting sync cycle...");
+    tracing::info!(?mode, site = %site_id, "[Sync] Starting sync cycle...");
 
     if let Err(e) = sync_customers(legacy_pool, pg_pool).await {
-        tracing::error!("[Sync] Customer sync failed: {}", e);
+        tracing::error!(site = %site_id, "[Sync] Customer sync failed: {}", e);
         record_error(pg_pool, "customers", &e.to_string()).await;
     }
 
     if let Err(e) = sync_rooms(legacy_pool, pg_pool).await {
-        tracing::error!("[Sync] Room sync failed: {}", e);
+        tracing::error!(site = %site_id, "[Sync] Room sync failed: {}", e);
         record_error(pg_pool, "rooms", &e.to_string()).await;
     }
 
     if let Err(e) = sync_bookings(legacy_pool, pg_pool).await {
-        tracing::error!("[Sync] Booking sync failed: {}", e);
+        tracing::error!(site = %site_id, "[Sync] Booking sync failed: {}", e);
         record_error(pg_pool, "bookings", &e.to_string()).await;
     }
 
     if let Err(e) = sync_checkins(legacy_pool, pg_pool).await {
-        tracing::error!("[Sync] Check-in sync failed: {}", e);
+        tracing::error!(site = %site_id, "[Sync] Check-in sync failed: {}", e);
         record_error(pg_pool, "checkins", &e.to_string()).await;
     }
 
@@ -137,28 +144,49 @@ pub async fn run_sync(
 
     // Phase 6: drift-alert tripwire. Best-effort — degraded observability
     // never aborts the reconcile loop.
-    check_drift_and_alert(pg_pool, slack).await;
+    check_drift_and_alert(pg_pool, slack, site_id).await;
 
-    tracing::info!("[Sync] Sync cycle complete");
+    tracing::info!(site = %site_id, "[Sync] Sync cycle complete");
 }
 
 /// Phase 6: read the configured drift-alert threshold (default
 /// [`DEFAULT_DRIFT_ALERT_THRESHOLD`]). Anything that doesn't parse to a
 /// positive integer falls back to the safe default with a warning.
-fn drift_alert_threshold_from_env() -> i64 {
-    match env::var("LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD") {
+///
+/// Task #69 — per-site override. Resolution order, first match wins:
+///   1. `LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_<SITE_ID_UPPER>` —
+///      site-specific knob (e.g. `..._HFVILLE=20` to set a tighter
+///      threshold for the smaller property).
+///   2. `LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD` — global, applies to
+///      all sites that don't have a per-site override.
+///   3. [`DEFAULT_DRIFT_ALERT_THRESHOLD`] — compiled-in fallback (50).
+fn drift_alert_threshold_from_env(site_id: &str) -> i64 {
+    let per_site_var =
+        format!("LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_{}", site_id.to_uppercase());
+    parse_threshold_env(&per_site_var)
+        .or_else(|| parse_threshold_env("LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD"))
+        .unwrap_or(DEFAULT_DRIFT_ALERT_THRESHOLD)
+}
+
+/// Inner helper: parse a single env var into a positive `i64` threshold.
+/// Returns `None` if the var is unset OR parses to a non-positive /
+/// non-numeric value (with a warning logged for the latter so an operator
+/// notices a typo). Pulled out so the per-site / global fallback chain
+/// in [`drift_alert_threshold_from_env`] reads as a single `or_else`.
+fn parse_threshold_env(var_name: &str) -> Option<i64> {
+    match env::var(var_name) {
         Ok(raw) => match raw.trim().parse::<i64>() {
-            Ok(n) if n > 0 => n,
+            Ok(n) if n > 0 => Some(n),
             _ => {
                 tracing::warn!(
+                    var = var_name,
                     value = %raw,
-                    default = DEFAULT_DRIFT_ALERT_THRESHOLD,
-                    "Invalid LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD; using default"
+                    "Invalid drift-alert threshold env var; ignoring"
                 );
-                DEFAULT_DRIFT_ALERT_THRESHOLD
+                None
             }
         },
-        Err(_) => DEFAULT_DRIFT_ALERT_THRESHOLD,
+        Err(_) => None,
     }
 }
 
@@ -185,8 +213,12 @@ pub fn tables_breaching_threshold(
 ///
 /// Uses `idx_ht_reconcile_log_table_unresolved` (migration 019) for
 /// the partial-index group-by.
-async fn check_drift_and_alert(pg_pool: &PgPool, slack: Option<&SlackClient>) {
-    let threshold = drift_alert_threshold_from_env();
+async fn check_drift_and_alert(
+    pg_pool: &PgPool,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+) {
+    let threshold = drift_alert_threshold_from_env(site_id);
 
     let rows = sqlx::query_as::<_, (String, i64)>(
         "SELECT table_name, count(*) \
@@ -202,6 +234,7 @@ async fn check_drift_and_alert(pg_pool: &PgPool, slack: Option<&SlackClient>) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(
+                site = %site_id,
                 error = %e,
                 "[Sync] Failed to query ht_reconcile_log for drift alert — observability degraded"
             );
@@ -212,6 +245,7 @@ async fn check_drift_and_alert(pg_pool: &PgPool, slack: Option<&SlackClient>) {
     let breaches = tables_breaching_threshold(&counts, threshold);
     if breaches.is_empty() {
         tracing::debug!(
+            site = %site_id,
             tables_observed = counts.len(),
             threshold,
             "[Sync] Drift alert: no tables breach threshold"
@@ -222,6 +256,7 @@ async fn check_drift_and_alert(pg_pool: &PgPool, slack: Option<&SlackClient>) {
     // Always log; Slack is opportunistic.
     for (table, count) in &breaches {
         tracing::warn!(
+            site = %site_id,
             table,
             count,
             threshold,
@@ -231,6 +266,7 @@ async fn check_drift_and_alert(pg_pool: &PgPool, slack: Option<&SlackClient>) {
 
     let Some(slack) = slack else {
         tracing::info!(
+            site = %site_id,
             "[Sync] Slack not configured; drift alert logged only ({} table(s) breaching)",
             breaches.len()
         );
@@ -242,13 +278,16 @@ async fn check_drift_and_alert(pg_pool: &PgPool, slack: Option<&SlackClient>) {
         .map(|(t, n)| format!("• `{t}`: {n} unresolved rows in last hour"))
         .collect::<Vec<_>>()
         .join("\n");
-    let msg = SlackMessage::with_text(format!(
-        ":rotating_light: *Reconcile drift threshold exceeded* :rotating_light:\n\
-         The drift-reconcile job recorded more than {threshold} unresolved \
-         `ht_reconcile_log` rows for the following table(s) in the last hour:\n\
-         {body}\n\
-         _Investigate via `docs/runbook-sync.md` §9 (Phase 6 drift alert)._"
-    ));
+    let msg = SlackMessage::with_site_text(
+        site_id,
+        format!(
+            ":rotating_light: *Reconcile drift threshold exceeded* :rotating_light:\n\
+             The drift-reconcile job recorded more than {threshold} unresolved \
+             `ht_reconcile_log` rows for the following table(s) in the last hour:\n\
+             {body}\n\
+             _Investigate via `docs/runbook-sync.md` §9 (Phase 6 drift alert)._"
+        ),
+    );
     slack.send_message(&msg).await;
 }
 
@@ -1433,48 +1472,125 @@ mod tests {
     }
 
     /// Env-isolation helper for the threshold-parsing tests. Same shape
-    /// as `with_mode_env` above.
-    fn with_threshold_env<F: FnOnce() -> i64>(value: Option<&str>, f: F) -> i64 {
+    /// as `with_mode_env` above. Tracks BOTH the global var and the
+    /// per-site override (task #69) so the per-site fallback chain can
+    /// be exercised without leaking state across tests.
+    fn with_threshold_envs<F: FnOnce() -> i64>(
+        global: Option<&str>,
+        per_site_var: Option<(&str, &str)>,
+        f: F,
+    ) -> i64 {
         use std::sync::Mutex;
         static LOCK: Mutex<()> = Mutex::new(());
         let _g = LOCK.lock().unwrap();
-        let prior = env::var("LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD").ok();
-        match value {
+        let prior_global = env::var("LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD").ok();
+        let prior_per_site = per_site_var.map(|(name, _)| (name.to_string(), env::var(name).ok()));
+        match global {
             Some(v) => env::set_var("LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD", v),
             None => env::remove_var("LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD"),
         }
+        if let Some((name, value)) = per_site_var {
+            env::set_var(name, value);
+        }
         let out = f();
-        match prior {
+        match prior_global {
             Some(v) => env::set_var("LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD", v),
             None => env::remove_var("LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD"),
+        }
+        if let Some((name, prior)) = prior_per_site {
+            match prior {
+                Some(v) => env::set_var(&name, v),
+                None => env::remove_var(&name),
+            }
         }
         out
     }
 
+    /// Back-compat shim for tests that only care about the global var.
+    fn with_threshold_env<F: FnOnce() -> i64>(value: Option<&str>, f: F) -> i64 {
+        with_threshold_envs(value, None, f)
+    }
+
     #[test]
     fn threshold_defaults_when_env_unset() {
-        let v = with_threshold_env(None, drift_alert_threshold_from_env);
+        let v = with_threshold_env(None, || drift_alert_threshold_from_env("hfhotel"));
         assert_eq!(v, DEFAULT_DRIFT_ALERT_THRESHOLD);
     }
 
     #[test]
     fn threshold_parses_custom_positive_value() {
-        let v = with_threshold_env(Some("125"), drift_alert_threshold_from_env);
+        let v = with_threshold_env(Some("125"), || drift_alert_threshold_from_env("hfhotel"));
         assert_eq!(v, 125);
     }
 
     #[test]
     fn threshold_falls_back_on_zero_or_negative() {
-        let v = with_threshold_env(Some("0"), drift_alert_threshold_from_env);
+        let v = with_threshold_env(Some("0"), || drift_alert_threshold_from_env("hfhotel"));
         assert_eq!(v, DEFAULT_DRIFT_ALERT_THRESHOLD);
-        let v = with_threshold_env(Some("-5"), drift_alert_threshold_from_env);
+        let v = with_threshold_env(Some("-5"), || drift_alert_threshold_from_env("hfhotel"));
         assert_eq!(v, DEFAULT_DRIFT_ALERT_THRESHOLD);
     }
 
     #[test]
     fn threshold_falls_back_on_garbage() {
-        let v = with_threshold_env(Some("not-a-number"), drift_alert_threshold_from_env);
+        let v = with_threshold_env(Some("not-a-number"), || drift_alert_threshold_from_env("hfhotel"));
         assert_eq!(v, DEFAULT_DRIFT_ALERT_THRESHOLD);
+    }
+
+    // -------------------------------------------------------------------
+    // Task #69 — per-site drift threshold overrides
+    // -------------------------------------------------------------------
+
+    /// Global env honored when the per-site override is unset (the
+    /// HF Hotel back-compat path: existing
+    /// `LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD=80` keeps working
+    /// unchanged after task #69 lands).
+    #[test]
+    fn threshold_global_used_when_per_site_unset() {
+        let v = with_threshold_envs(Some("80"), None, || {
+            drift_alert_threshold_from_env("hfhotel")
+        });
+        assert_eq!(v, 80);
+    }
+
+    /// Per-site override wins when both are set (the HF Ville path:
+    /// operator wants a tighter alert threshold for the smaller
+    /// property without disturbing HF Hotel's tuning).
+    #[test]
+    fn threshold_per_site_overrides_global() {
+        let v = with_threshold_envs(
+            Some("80"),
+            Some(("LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_HFVILLE", "20")),
+            || drift_alert_threshold_from_env("hfville"),
+        );
+        assert_eq!(v, 20, "per-site override must take precedence over global");
+    }
+
+    /// Per-site override is namespaced by the site id — an HF Hotel
+    /// tick must NOT pick up `..._HFVILLE` and vice versa.
+    #[test]
+    fn threshold_per_site_does_not_leak_across_sites() {
+        let v = with_threshold_envs(
+            Some("80"),
+            Some(("LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_HFVILLE", "20")),
+            || drift_alert_threshold_from_env("hfhotel"),
+        );
+        assert_eq!(
+            v, 80,
+            "HF Hotel tick must use the global threshold, not HF Ville's"
+        );
+    }
+
+    /// Garbage in the per-site override falls through to the global
+    /// (instead of crashing) — operator typo doesn't take down alerts.
+    #[test]
+    fn threshold_per_site_garbage_falls_through_to_global() {
+        let v = with_threshold_envs(
+            Some("80"),
+            Some(("LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_HFVILLE", "abc")),
+            || drift_alert_threshold_from_env("hfville"),
+        );
+        assert_eq!(v, 80, "invalid per-site value must fall through to the global");
     }
 
     // -------------------------------------------------------------------

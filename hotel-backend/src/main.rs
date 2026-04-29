@@ -176,7 +176,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(state) => Some(state.new_pool.clone()),
             None => new_pool_for_newonly.as_ref().map(|p| p.clone()),
         };
-        if let Err(e) = init_scheduler(pool.clone(), pg_for_scheduler, config.slack.clone()).await {
+        if let Err(e) = init_scheduler(
+            pool.clone(),
+            pg_for_scheduler,
+            config.slack.clone(),
+            config.site.clone(),
+        )
+        .await
+        {
             tracing::warn!("Failed to initialize scheduler: {}", e);
         }
     } else {
@@ -210,9 +217,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Router::new()
     };
 
+    // Healthcheck (`/health`) — task #69. Carries the site id so an
+    // operator / external monitor can tell which deployment responded
+    // when HF Hotel + HF Ville share a Slack webhook + log sink.
+    let health_state = routes::health::HealthState {
+        site_id: config.site.id.clone(),
+    };
+    let health_routes = Router::new()
+        .route("/health", get(routes::health::health))
+        .with_state(health_state);
+
     // Merge all routes
     let app = Router::new()
         .merge(new_routes)
+        .merge(health_routes)
         .layer(cors)
         .layer(TraceLayer::new_for_http());
 
