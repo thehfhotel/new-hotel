@@ -261,6 +261,113 @@ services:
         reservations:
           memory: 128M
 
+  # =========================================================================
+  # HF Ville stack — Phase 5 (Ville) multi-site deploy.
+  # Per ADR 0001 the Ville backend stack runs CENTRAL on evergreen, talking
+  # to Ville's MSSQL via WG (10.10.10.4 → MikroTik DNAT → 192.168.11.51,1436)
+  # and writing canonical state into the `hotelville` PG database (sibling
+  # of `hotelnew` in the same `newdb` cluster — see init-db/01-create-...).
+  #
+  # NO separate backend container — the existing `backend` service's
+  # `ville_pool` will repoint at hotelville at cutover (#76). These two
+  # services are just the worker pair (CT watcher + writeback LISTEN'er)
+  # for the Ville pipeline.
+  #
+  # Profile `hfville` keeps both services INERT until the operator opts in:
+  #     docker compose --profile hfville up -d
+  # On first activation each service ships LEGACY_SYNC_ENABLED=false /
+  # WRITEBACK_ENABLED=false so they exit cleanly (`Ok(0)` → `restart:
+  # on-failure:5` does NOT loop). The shadow-mode flip happens via env at
+  # task #74 (bootstrap), live flip at #76 (cutover).
+  #
+  # Container names suffixed `-hfville` so they never collide with HF
+  # Hotel's `sync` / `writeback` containers under the same compose project.
+  # =========================================================================
+  sync-hfville:
+    image: ghcr.io/thehfhotel/new-hotel-backend:latest
+    container_name: new-hotel-production-sync-hfville-1
+    command: ["./sync"]
+    profiles:
+      - hfville
+    environment:
+      # Ville legacy MSSQL via WG path (DNAT through MikroTik).
+      - DB_SERVER=192.168.11.51
+      - DB_NAME=HOTEL
+      - DB_USER=sa
+      # Reusing DB_PASSWORD for now — both sites' MSSQL share `sa/12345678`.
+      # Split into HFVILLE_DB_PASSWORD when one site rotates ahead of the
+      # other (see ADR 0001 Phase 8 ops-hardening notes).
+      - DB_PASSWORD=${DB_PASSWORD}
+      - MSSQL_PORT=1436
+      # Canonical Ville state — separate logical DB on the same `newdb`
+      # cluster (per ADR Q1 per-DB topology).
+      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@newdb:${PGPORT:-5439}/hotelville
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+      - SLACK_NOTIFICATIONS_ENABLED=true
+      # Site identity for alert prefixes + tracing spans + healthcheck JSON
+      # (see hotel-backend/src/notifications/slack.rs::format_site_prefixed).
+      - SITE_ID=hfville
+      # All Phase 5/5.5 watcher knobs default OFF for Ville on first deploy.
+      # Bootstrap (#74) flips these via per-site env override on evergreen
+      # (HFVILLE_LEGACY_SYNC_* vars) so HF Hotel's settings stay independent.
+      - LEGACY_SYNC_ENABLED=${HFVILLE_LEGACY_SYNC_ENABLED:-false}
+      - LEGACY_SYNC_SHADOW_MODE=${HFVILLE_LEGACY_SYNC_SHADOW_MODE:-true}
+      - LEGACY_SYNC_TABLE_ALLOWLIST=${HFVILLE_LEGACY_SYNC_TABLE_ALLOWLIST:-}
+      - CT_POLL_INTERVAL_MS=${HFVILLE_CT_POLL_INTERVAL_MS:-1000}
+      - LEGACY_SYNC_ALLOW_COLD_REPLAY=${HFVILLE_LEGACY_SYNC_ALLOW_COLD_REPLAY:-false}
+      - RUST_LOG=${RUST_LOG:-hotel_backend=info,sync=info}
+    depends_on:
+      newdb:
+        condition: service_healthy
+    networks:
+      - hotel-network
+    healthcheck:
+      disable: true
+    restart: on-failure:5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+        reservations:
+          memory: 128M
+
+  writeback-hfville:
+    image: ghcr.io/thehfhotel/new-hotel-backend:latest
+    container_name: new-hotel-production-writeback-hfville-1
+    command: ["./writeback"]
+    profiles:
+      - hfville
+    environment:
+      - DB_SERVER=192.168.11.51
+      - DB_NAME=HOTEL
+      - DB_USER=sa
+      - DB_PASSWORD=${DB_PASSWORD}
+      - MSSQL_PORT=1436
+      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@newdb:${PGPORT:-5439}/hotelville
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+      - SITE_ID=hfville
+      # Default OFF until Ville goes live (#76 cutover).
+      - WRITEBACK_ENABLED=${HFVILLE_WRITEBACK_ENABLED:-false}
+      - WRITEBACK_POLL_INTERVAL_SECS=${HFVILLE_WRITEBACK_POLL_INTERVAL_SECS:-30}
+      - WRITEBACK_MAX_ATTEMPTS=${HFVILLE_WRITEBACK_MAX_ATTEMPTS:-3}
+      - RUST_LOG=${RUST_LOG:-hotel_backend=info,writeback=info}
+    depends_on:
+      newdb:
+        condition: service_healthy
+    networks:
+      - hotel-network
+    healthcheck:
+      disable: true
+    restart: on-failure:5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+        reservations:
+          memory: 128M
+
   # One-shot backfill: legacy MSSQL HT_Rooms + HT_SET_RoomType -> PG.
   # Same image as `backend`, different entrypoint. Lives under the `backfill`
   # profile so normal `docker compose up` skips it. Activate on demand:
