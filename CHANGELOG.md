@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.8] - 2026-04-29
+
+### Added
+
+- **`init-db/01-create-hotelville-database.sh`** — auto-creates the
+  `hotelville` PostgreSQL database alongside `hotelnew` on first
+  container init. Per ADR 0001 (Phase 5 Ville multi-site, decision
+  Q1 = per-DB topology): HF Hotel and HF Ville share the same PG
+  cluster but live in separate logical databases. Each DB gets its
+  own `legacy_ct_state` row, its own `legacy_sync_status`, its own
+  `ht_reconcile_log`, etc. — the single-row `CHECK (id=1)`
+  constraints stay valid because each DB has its own copy.
+  Same script also re-applies `init-hotelnew.sql` against the new
+  `hotelville` DB for schema baseline parity.
+  For existing clusters (evergreen production), the equivalent
+  CREATE DATABASE + init was applied as a one-shot on 2026-04-29 —
+  hotelnew and hotelville now have matching schema_migrations rows
+  (000, 008-020, 022).
+
 ## [2.54.7] - 2026-04-29
 
 ### Added
