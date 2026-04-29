@@ -310,9 +310,18 @@ services:
       # All Phase 5/5.5 watcher knobs default OFF for Ville on first deploy.
       # Bootstrap (#74) flips these via per-site env override on evergreen
       # (HFVILLE_LEGACY_SYNC_* vars) so HF Hotel's settings stay independent.
-      - LEGACY_SYNC_ENABLED=${HFVILLE_LEGACY_SYNC_ENABLED:-false}
+      # Shadow-mode soak (#74→#75): enabled-true + shadow-true means the
+      # watcher polls CT, runs mappers, builds events, then ROLLS BACK the
+      # PG TX so canonical state stays untouched. Operator flips
+      # HFVILLE_LEGACY_SYNC_SHADOW_MODE=false at cutover (#76). Note: the
+      # `.env` file gets rewritten from GH secrets on every CI deploy, so
+      # these defaults MUST persist the shadow-mode soak across deploys.
+      - LEGACY_SYNC_ENABLED=${HFVILLE_LEGACY_SYNC_ENABLED:-true}
       - LEGACY_SYNC_SHADOW_MODE=${HFVILLE_LEGACY_SYNC_SHADOW_MODE:-true}
-      - LEGACY_SYNC_TABLE_ALLOWLIST=${HFVILLE_LEGACY_SYNC_TABLE_ALLOWLIST:-}
+      # Scoped to the 11 canonical-sync tables enabled by 020. Phase 5.5
+      # Ville (021, task #80) adds the 6 mirror tables — at that point set
+      # HFVILLE_LEGACY_SYNC_TABLE_ALLOWLIST="" or unset for "all enabled".
+      - LEGACY_SYNC_TABLE_ALLOWLIST=${HFVILLE_LEGACY_SYNC_TABLE_ALLOWLIST:-HT_Customers,HT_Rooms,HT_Book_H,HT_Book_Ds,HT_Book_Date,HT_CheckIn_H,HT_CheckIn_Ds,HT_CheckIn_Pay,HT_Room_Status,HT_Rooms_Cancel,HT_Receipt_H}
       - CT_POLL_INTERVAL_MS=${HFVILLE_CT_POLL_INTERVAL_MS:-1000}
       - LEGACY_SYNC_ALLOW_COLD_REPLAY=${HFVILLE_LEGACY_SYNC_ALLOW_COLD_REPLAY:-false}
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,sync=info}
