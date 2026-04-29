@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.9] - 2026-04-29
+
+### Fixed
+
+- **Backend container crash-loop after 2.54.7 deploy** — the password
+  fallback removal in 2.54.6 (`config.rs::require_secret`) made
+  `VILLE_DB_PASSWORD` strictly required when `VILLE_DB_ENABLED=true`,
+  but no operator had ever set this env var because the existing
+  single-cluster setup (Ville pool reads the `ville` schema in the
+  same `newdb` container) shares POSTGRES_PASSWORD by reuse. The
+  10:27 UTC deploy hit `panic at config.rs:79` on backend startup,
+  declared unhealthy, and the deploy job exited 1. Hot-fix on
+  evergreen restored production at 10:30 UTC.
+
+  Permanent fix: in `docker-compose.yml`, default the backend
+  service's `VILLE_DB_PASSWORD` env to `${POSTGRES_PASSWORD}` via
+  shell expansion. No new GH secret needed; existing `POSTGRES_PASSWORD`
+  is already validated. Operator overrides `VILLE_DB_PASSWORD` only
+  when Ville migrates to its own cluster (Phase 5 Ville cutover —
+  task #76).
+
 ## [2.54.8] - 2026-04-29
 
 ### Added
