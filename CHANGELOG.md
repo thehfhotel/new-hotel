@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.3] - 2026-04-29
+
+### Removed
+
+- **`scripts/deploy-dev.sh` + `/home/nut/new-hotel-dev/` build dir on evergreen.**
+  The script was a documented break-glass that rsynced source to a
+  separate dir on the deploy host, built `:dev-local` natively in
+  evergreen's Docker daemon, retagged it to `:latest`, and force-recreated
+  the backend + writeback containers — bypassing CI/tests/registry
+  entirely and leaving production running an image that doesn't
+  correspond to any commit. Direct contradiction of CLAUDE.md §"Deployment
+  Policy" ("Pipeline is the only way"). Removed the script, deleted the
+  build dir on evergreen, and untagged stale `:dev-local` and orphaned
+  `ghcr.io/jwinut/new-hotel:latest` (wrong namespace) and `new-hotel:test`
+  images so the version-mixing surface area is gone. If a true break-glass
+  is needed in future: push a branch, build with a dated tag (NOT
+  `:latest`), and pin one container at it explicitly.
+- **Stale source-tree at `/home/nut/new-hotel/` on evergreen** (3.2 G,
+  last updated Apr 26). The deploy job copies into `/home/nut/new-hotel-production/`
+  exclusively; this checkout was a leftover never read by the pipeline.
+  Removed for the same version-mixing-prevention reason as above.
+
 ## [2.54.2] - 2026-04-29
 
 ### Fixed
