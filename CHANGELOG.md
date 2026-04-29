@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.16] - 2026-04-29
+
+### Added
+
+- **`scripts/backup-db.sh --site <hfhotel|hfville>`** flag (task #79,
+  extending the per-site rollout pattern set by #78's `sync-status.sh`).
+  Selects which site's canonical PG database to back up — `hfhotel`
+  (default) → `hotelnew`, `hfville` → `hotelville`. Both databases live
+  in the same `new-hotel-db` container, so only the `pg_dump` target and
+  the output filename change. Output filenames now embed the site
+  discriminator: `hotelnew-hfhotel-YYYYMMDD_HHMMSS.sql` and
+  `hotelville-hfville-YYYYMMDD_HHMMSS.sql` so HF Hotel and HF Ville
+  dumps coexist in the same `BACKUP_DIR` without colliding. The script
+  header now also documents the recommended cron entries for both
+  sites (operator action — not auto-installed) with a 5-minute stagger
+  to avoid I/O contention on the shared disk.
+- **`scripts/migrate.sh --site <hfhotel|hfville>`** flag (task #79).
+  Same site → DB-name mapping as `backup-db.sh`. Precedence is
+  `POSTGRES_DB` env var > `--site` derivation > legacy `hotelnew`
+  default, so the upcoming Phase 5 CI matrix can call
+  `migrate.sh --site hfville` once per site without duplicating the
+  script while one-off operator sessions can still pin
+  `POSTGRES_DB=…`. Pre-migration backup filenames + the prune-old-backups
+  glob are now scoped per-site (`${DB_NAME}-${SITE}-*.sql`) so a Ville
+  migration can't evict HF Hotel's pre-migration history.
+- Both scripts reject any `--site` value other than `hfhotel` or
+  `hfville` with a stderr message + exit 2, matching the convention
+  established in `scripts/sync-status.sh`. Runtime activation (cron
+  entries on evergreen, CI matrix wiring) is deferred to post-cutover.
+
 ## [2.54.15] - 2026-04-29
 
 ### Fixed

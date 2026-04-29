@@ -7,8 +7,27 @@
 # Creates a pg_dump backup before applying any new migrations.
 #
 # Usage:
-#   ./scripts/migrate.sh              # Run from project root
-#   DEPLOY_DIR=/path ./scripts/migrate.sh  # Run from deploy directory
+#   ./scripts/migrate.sh                       # Run from project root (default site: hfhotel)
+#   ./scripts/migrate.sh --site hfhotel        # → migrates hotelnew (default)
+#   ./scripts/migrate.sh --site hfville        # → migrates hotelville
+#   DEPLOY_DIR=/path ./scripts/migrate.sh      # Run from deploy directory
+#   ./scripts/migrate.sh --help
+#
+# Flags:
+#   --site <hfhotel|hfville>   Pick which site's PG database to migrate.
+#                              hfhotel (default) → database `hotelnew`.
+#                              hfville           → database `hotelville`.
+#                              Any other value exits non-zero with an error
+#                              on stderr (matches scripts/sync-status.sh).
+#
+# Precedence for DB_NAME:
+#   1. POSTGRES_DB env var (if set explicitly) — always wins.
+#   2. --site derivation                       — if no env var.
+#   3. Default `hotelnew`                      — if neither given.
+#
+# This lets the upcoming Phase 5 CI matrix call `migrate.sh --site hfville`
+# once per site without duplicating the script, while still allowing one-off
+# operator sessions to override via `POSTGRES_DB=…`.
 #
 # ## Per-migration pragmas
 #
@@ -34,11 +53,44 @@
 
 set -euo pipefail
 
+# ─── Args ─────────────────────────────────────────────────────────────────────
+# `--site` is parsed BEFORE the config block so it can feed into the DB_NAME
+# default. Same pattern + same exit-2-on-bogus-value behavior as
+# scripts/sync-status.sh (#78) and scripts/backup-db.sh (#79).
+SITE="hfhotel"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --site)
+            [[ $# -lt 2 ]] && { echo "--site requires a value (hfhotel|hfville)" >&2; exit 2; }
+            SITE="$2"; shift 2 ;;
+        --site=*)
+            SITE="${1#--site=}"; shift ;;
+        -h|--help)
+            grep '^#' "$0" | sed 's/^# \?//'; exit 0 ;;
+        *)
+            echo "unknown flag: $1" >&2; exit 2 ;;
+    esac
+done
+
+# Map site → site-default DB name. POSTGRES_DB env var still wins below
+# (precedence: env var > --site derivation > legacy hotelnew default).
+case "$SITE" in
+    hfhotel) SITE_DB_DEFAULT="hotelnew"   ;;
+    hfville) SITE_DB_DEFAULT="hotelville" ;;
+    *)
+        echo "unknown site: $SITE (expected hfhotel or hfville)" >&2
+        exit 2
+        ;;
+esac
+
 # Configuration
 DB_CONTAINER="${DB_CONTAINER:-new-hotel-db}"
 DB_USER="${POSTGRES_USER:-postgres}"
 DB_PORT="${PGPORT:-5439}"
-DB_NAME="${POSTGRES_DB:-hotelnew}"
+# DB_NAME precedence: POSTGRES_DB env wins; else fall back to the per-site
+# default derived above. Pre-#79 callers (no --site, no POSTGRES_DB) keep
+# `hotelnew` because SITE defaults to `hfhotel`.
+DB_NAME="${POSTGRES_DB:-$SITE_DB_DEFAULT}"
 MIGRATIONS_DIR="${MIGRATIONS_DIR:-migrations/pg}"
 BACKUP_DIR="${BACKUP_DIR:-backups}"
 MAX_BACKUPS="${MAX_BACKUPS:-10}"
@@ -133,8 +185,12 @@ for f in "${PENDING[@]}"; do
 done
 
 # Step 5: Create backup before applying migrations
+# The filename embeds BOTH the DB name and the site so HF Hotel and HF Ville
+# pre-migration dumps live side-by-side in the same $BACKUP_DIR without
+# colliding, and so the prune step (Step 7) only touches files from the
+# current site.
 mkdir -p "$BACKUP_DIR"
-BACKUP_FILE="$BACKUP_DIR/hotelnew_$(date +%Y%m%d_%H%M%S).sql"
+BACKUP_FILE="$BACKUP_DIR/${DB_NAME}-${SITE}-$(date +%Y%m%d_%H%M%S).sql"
 log_info "Creating backup: $BACKUP_FILE"
 docker exec "$DB_CONTAINER" pg_dump -U "$DB_USER" -p "$DB_PORT" "$DB_NAME" > "$BACKUP_FILE" 2>/dev/null
 
@@ -228,11 +284,14 @@ SQL
 done
 
 # Step 7: Prune old backups (keep last N)
-BACKUP_COUNT=$(ls -1 "$BACKUP_DIR"/hotelnew_*.sql 2>/dev/null | wc -l)
+# Glob is scoped to THIS site's pre-migration dumps so a hfville migration
+# can't accidentally evict hfhotel's history (and vice-versa).
+BACKUP_GLOB="$BACKUP_DIR/${DB_NAME}-${SITE}-*.sql"
+BACKUP_COUNT=$(ls -1 $BACKUP_GLOB 2>/dev/null | wc -l)
 if [ "$BACKUP_COUNT" -gt "$MAX_BACKUPS" ]; then
     PRUNE_COUNT=$((BACKUP_COUNT - MAX_BACKUPS))
-    log_info "Pruning $PRUNE_COUNT old backup(s) (keeping last $MAX_BACKUPS)..."
-    ls -1t "$BACKUP_DIR"/hotelnew_*.sql | tail -n "$PRUNE_COUNT" | xargs rm -f
+    log_info "Pruning $PRUNE_COUNT old backup(s) (keeping last $MAX_BACKUPS) for site=$SITE..."
+    ls -1t $BACKUP_GLOB | tail -n "$PRUNE_COUNT" | xargs rm -f
 fi
 
 # Step 8: Summary
