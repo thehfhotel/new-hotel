@@ -19,7 +19,7 @@ use axum::{
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
-use super::mode::AppState;
+use super::mode::{AppState, Branch};
 use crate::error::ApiResult;
 
 #[derive(Debug, Deserialize)]
@@ -28,6 +28,17 @@ pub struct CinNoQuery {
     /// the value it already has from the loaded check-in object —
     /// keeps this endpoint decoupled from our PG UUIDs.
     pub cin_no: String,
+    /// Hotel branch selector. Routes the read to the correct PG pool
+    /// (`new_pool` for HF Hotel / All / unset, `ville_pool` for HF
+    /// Ville). Frontend's `useBranchFetch` auto-appends this from the
+    /// active `BranchContext`.
+    pub branch: Option<Branch>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BranchOnlyQuery {
+    /// Hotel branch selector. Same dispatch rules as `CinNoQuery::branch`.
+    pub branch: Option<Branch>,
 }
 
 // ─── Coupons ─────────────────────────────────────────────────────────
@@ -50,6 +61,11 @@ pub async fn list_coupons(
     State(state): State<AppState>,
     Query(q): Query<CinNoQuery>,
 ) -> ApiResult<Json<Vec<CouponRow>>> {
+    let pool = match q.branch.unwrap_or_default() {
+        Branch::Hfville => state.ville_pool()?,
+        _ => &state.new_pool,
+    };
+
     let rows = sqlx::query_as::<_, (i32, Option<String>, Option<String>, Option<NaiveDateTime>, Option<NaiveDateTime>, Option<String>, i32)>(
         "SELECT cupon_no, cupon_cin_no, cupon_cin_room, cupon_date, \
                 cupon_gen_date, cupon_by, cupon_print \
@@ -58,7 +74,7 @@ pub async fn list_coupons(
           ORDER BY cupon_no",
     )
     .bind(&q.cin_no)
-    .fetch_all(&state.new_pool)
+    .fetch_all(pool)
     .await?;
 
     Ok(Json(
@@ -101,6 +117,11 @@ pub async fn list_products(
     State(state): State<AppState>,
     Query(q): Query<CinNoQuery>,
 ) -> ApiResult<Json<Vec<ProductRow>>> {
+    let pool = match q.branch.unwrap_or_default() {
+        Branch::Hfville => state.ville_pool()?,
+        _ => &state.new_pool,
+    };
+
     let rows = sqlx::query_as::<_, (i32, Option<String>, Option<String>, Option<NaiveDateTime>, Option<String>, Option<String>, Option<String>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<String>)>(
         "SELECT id, cin_no, cin_room_no, cin_ds_date, cin_pro_id, \
                 cin_pro_name, cin_pro_unit, cin_pro_num, cin_pro_price, \
@@ -110,7 +131,7 @@ pub async fn list_products(
           ORDER BY cin_ds_date NULLS LAST, id",
     )
     .bind(&q.cin_no)
-    .fetch_all(&state.new_pool)
+    .fetch_all(pool)
     .await?;
 
     Ok(Json(
@@ -154,6 +175,11 @@ pub async fn list_room_changes(
     State(state): State<AppState>,
     Query(q): Query<CinNoQuery>,
 ) -> ApiResult<Json<Vec<RoomChangeRow>>> {
+    let pool = match q.branch.unwrap_or_default() {
+        Branch::Hfville => state.ville_pool()?,
+        _ => &state.new_pool,
+    };
+
     let rows = sqlx::query_as::<_, (i32, String, Option<String>, Option<String>, Option<NaiveDateTime>, f64, Option<String>, Option<String>)>(
         "SELECT id, cin_no, room_before, room_after, change_date, \
                 room_before_price, note, toprice \
@@ -162,7 +188,7 @@ pub async fn list_room_changes(
           ORDER BY change_date NULLS LAST, id",
     )
     .bind(&q.cin_no)
-    .fetch_all(&state.new_pool)
+    .fetch_all(pool)
     .await?;
 
     Ok(Json(
@@ -231,12 +257,18 @@ pub struct PricingTier {
 /// settings page makes one fetch.
 pub async fn get_pricing_reference(
     State(state): State<AppState>,
+    Query(q): Query<BranchOnlyQuery>,
 ) -> ApiResult<Json<PricingReference>> {
+    let pool = match q.branch.unwrap_or_default() {
+        Branch::Hfville => state.ville_pool()?,
+        _ => &state.new_pool,
+    };
+
     let extension_prices = sqlx::query_as::<_, (i32, Option<String>, Option<i32>, Option<f64>, Option<String>)>(
         "SELECT id, con_name, con_minute, con_price, con_type \
            FROM legacy_mirror.ht_continuetime ORDER BY id",
     )
-    .fetch_all(&state.new_pool)
+    .fetch_all(pool)
     .await?
     .into_iter()
     .map(|(id, name, minute, price, t)| ExtensionPrice {
@@ -252,7 +284,7 @@ pub async fn get_pricing_reference(
         "SELECT id, room_type, room_custtype, room_price, room_price_h, room_price_m \
            FROM legacy_mirror.ht_rooms_price ORDER BY id",
     )
-    .fetch_all(&state.new_pool)
+    .fetch_all(pool)
     .await?
     .into_iter()
     .map(|(id, t, ct, p, h, m)| RoomPrice {
@@ -265,8 +297,8 @@ pub async fn get_pricing_reference(
     })
     .collect();
 
-    let tier_up = pricing_tier(&state, "legacy_mirror.ht_order_up").await?;
-    let tier_down = pricing_tier(&state, "legacy_mirror.ht_order_down").await?;
+    let tier_up = pricing_tier(pool, "legacy_mirror.ht_order_up").await?;
+    let tier_down = pricing_tier(pool, "legacy_mirror.ht_order_down").await?;
 
     Ok(Json(PricingReference {
         extension_prices,
@@ -276,7 +308,7 @@ pub async fn get_pricing_reference(
     }))
 }
 
-async fn pricing_tier(state: &AppState, table: &str) -> ApiResult<Vec<PricingTier>> {
+async fn pricing_tier(pool: &crate::db::PgPool, table: &str) -> ApiResult<Vec<PricingTier>> {
     // Both ht_order_up and ht_order_down have the identical 4-column
     // shape. Inline-build the SELECT (fixed string interpolation, no
     // user input — `table` is hardcoded by the caller).
@@ -285,7 +317,7 @@ async fn pricing_tier(state: &AppState, table: &str) -> ApiResult<Vec<PricingTie
     );
     let rows =
         sqlx::query_as::<_, (i32, Option<String>, Option<i32>, Option<String>)>(&sql)
-            .fetch_all(&state.new_pool)
+            .fetch_all(pool)
             .await?;
     Ok(rows
         .into_iter()

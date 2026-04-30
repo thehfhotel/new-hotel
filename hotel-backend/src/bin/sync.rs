@@ -112,8 +112,10 @@ const CT_ENABLED_TABLES: &[&str] = &[
     "HT_CheckIn_Pay",
     "HT_Receipt_H",
     // Phase 5.5b — legacy_mirror.* opaque pass-through (6 tables, CT
-    // enabled 2026-04-29). HF Hotel only — Ville stays on FreeTDS
-    // hash-polling because its SS2005 has no CT support.
+    // enabled 2026-04-29 on HF Hotel; Ville's CT enabled by migrations
+    // 020 + 021 after the 2026-04-29 SS2025 upgrade). The mirror mappers
+    // run for both sites — `SiteConfig::from_env()` selects the pool +
+    // legacy connection at startup.
     "HT_Cupon",
     "HT_CheckIn_Product",
     "HT_Deposit",
