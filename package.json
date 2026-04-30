@@ -1,6 +1,6 @@
 {
   "name": "new-hotel",
-  "version": "2.54.30",
+  "version": "2.54.31",
   "private": true,
   "scripts": {
     "dev": "next dev -p 3003",

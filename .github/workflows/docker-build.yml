@@ -15,7 +15,14 @@ jobs:
   # serves to orphan in-flight deploys when commits land back-to-back. We let
   # all runs complete; the deploy step is idempotent (docker compose up -d).
   changes:
-    runs-on: ubuntu-latest
+    # Migrated 2026-04-30 from `ubuntu-latest` to the existing self-hosted
+    # runner on evergreen ([self-hosted, linux, deploy]). Driver: GH Actions
+    # Free-tier quota exhaustion. Self-hosted minutes don't count against
+    # billing, so spending limit at $0 + this label = $0 forever, no
+    # surprise. Trade-off accepted: jobs serialize on the single runner
+    # (~10–15 min wall vs. ~4 min parallel previously) and CI is unavailable
+    # if evergreen is down. See CHANGELOG 2.54.31 for the full rationale.
+    runs-on: [self-hosted, linux, deploy]
     # GITHUB_TOKEN least-privilege: this job only reads the working tree.
     permissions:
       contents: read
@@ -92,7 +99,7 @@ jobs:
               - 'scripts/backup-db.sh'
 
   test-frontend:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, deploy]
     needs: changes
     if: needs.changes.outputs.frontend == 'true'
     permissions:
@@ -120,7 +127,7 @@ jobs:
         run: pnpm test:components
 
   test-backend:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, deploy]
     needs: changes
     if: needs.changes.outputs.backend == 'true'
     permissions:
@@ -161,10 +168,13 @@ jobs:
           toolchain: "1.89"
 
       # hotel-backend/.cargo/config.toml pins `-fuse-ld=mold` for x86_64-linux
-      # so local + Docker builds link fast. The GitHub runner ships neither
-      # mold nor clang by default — install both so `cargo test` can link.
-      - name: Install mold linker
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mold clang
+      # so local + Docker builds link fast. The runner may not have mold or
+      # clang pre-installed; same goes for `psql` once we moved off the
+      # github-hosted ubuntu-latest image (which ships postgresql-client).
+      # `apt-get install -y` is idempotent so re-runs on a warm self-hosted
+      # runner skip already-installed packages.
+      - name: Install build + test prerequisites
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mold clang postgresql-client
 
       # sccache wraps every rustc invocation and caches its output keyed on the
       # exact crate inputs. It complements Swatinem/rust-cache (which caches
@@ -240,7 +250,7 @@ jobs:
   #
   # Runs on EVERY push (not just master) so PRs catch drift before merge.
   init-db-migrations-drift-check:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, deploy]
     needs: changes
     # Only worth running when init-db, migrations, the runner script, OR this
     # workflow itself was touched. The `deploy` paths-filter already covers
@@ -270,6 +280,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Self-hosted runner may not ship postgresql-client by default
+      # (github-hosted ubuntu-latest did). `apt-get install -y` is idempotent.
+      - name: Install psql
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
 
       - name: Apply init-db seed
         env:
@@ -312,7 +327,7 @@ jobs:
           exit 1
 
   build-frontend:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, deploy]
     # Block pushing :latest if frontend tests fail (Batch D of audit).
     needs: [changes, test-frontend]
     if: needs.changes.outputs.frontend == 'true' && (needs.test-frontend.result == 'success' || needs.test-frontend.result == 'skipped')
@@ -358,7 +373,7 @@ jobs:
             NEXT_PUBLIC_CARD_READER_URL=${{ secrets.CARD_READER_URL }}
 
   build-backend:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, deploy]
     # Block pushing :latest if backend tests fail (Batch D of audit).
     needs: [changes, test-backend]
     if: needs.changes.outputs.backend == 'true' && (needs.test-backend.result == 'success' || needs.test-backend.result == 'skipped')
@@ -401,7 +416,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=backend
 
   build-ville-sync:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, deploy]
     # Block pushing :latest if backend tests fail (Batch D of audit).
     # ville-sync shares the hotel-backend workspace, so test-backend
     # exercising it is the right gate.
