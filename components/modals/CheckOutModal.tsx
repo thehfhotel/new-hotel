@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from 'react'
 import { X, Loader2, User, Calendar, DollarSign, FileText, CreditCard } from 'lucide-react'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 
 interface CheckInDetails {
   id: number
@@ -78,6 +79,8 @@ export default function CheckOutModal({
   checkIn,
   onSuccess,
 }: CheckOutModalProps) {
+  const branchFetch = useBranchFetch()
+
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>('cash')
   const [notes, setNotes] = useState('')
   const [isSubmitting, setIsSubmitting] = useState(false)
@@ -111,7 +114,7 @@ export default function CheckOutModal({
     setError(null)
 
     try {
-      const res = await fetch(`/api/new/checkins/${checkIn.id}/checkout`, {
+      const res = await branchFetch(`/api/new/checkins/${checkIn.id}/checkout`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

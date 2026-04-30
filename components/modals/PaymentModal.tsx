@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef } from 'react'
 import { X, Loader2, CreditCard, FileText, DollarSign, Banknote, QrCode } from 'lucide-react'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 
 interface PaymentModalProps {
   isOpen: boolean
@@ -38,6 +39,8 @@ export default function PaymentModal({
   totalPaid,
   onSuccess,
 }: PaymentModalProps) {
+  const branchFetch = useBranchFetch()
+
   const balance = totalAmount - totalPaid
 
   const [amount, setAmount] = useState<string>('')
@@ -78,7 +81,7 @@ export default function PaymentModal({
     setError(null)
 
     try {
-      const res = await fetch(`/api/new/checkins/${checkinId}/payments`, {
+      const res = await branchFetch(`/api/new/checkins/${checkinId}/payments`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
