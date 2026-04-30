@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.26] - 2026-04-30
+
+### Fixed
+
+- **Phase 5 Ville cutover got reverted by CI deploy** — the operator-set
+  `HFVILLE_LEGACY_SYNC_SHADOW_MODE=false` line (added to
+  `/home/nut/new-hotel-production/.env` during the 2026-04-30 ~17:00 UTC
+  cutover) got wiped by the next CI deploy, which rewrites `.env` from
+  GH secrets on every push. With the secret unset, the compose default
+  `:-true` kicked in and `sync-hfville` restarted in shadow mode,
+  silently reverting the cutover to TX-rollback. Watermark stopped
+  advancing. Caught by post-deploy verification when log showed
+  `shadow_mode=true allowlist=Some({...11 tables...})`.
+
+  Fix: flip the compose default for `LEGACY_SYNC_SHADOW_MODE` from `true`
+  to `false`. Now the post-cutover state survives CI deploys without an
+  operator action. To re-enable shadow (e.g. rollback), the operator
+  can set `HFVILLE_LEGACY_SYNC_SHADOW_MODE=true` in `.env` and force-recreate
+  — that env-var value still wins over the compose default.
+
+  This is the same `.env`-rewrite pitfall we hit with `VILLE_DB_PASSWORD`
+  during the 2.54.7 deploy (CHANGELOG entry under that version). The
+  pattern is durable: once cutover happens, compose defaults must
+  reflect the post-cutover state, not the pre-cutover state.
+
 ## [2.54.25] - 2026-04-30
 
 ### Fixed

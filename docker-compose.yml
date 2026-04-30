@@ -315,17 +315,16 @@ services:
       # Site identity for alert prefixes + tracing spans + healthcheck JSON
       # (see hotel-backend/src/notifications/slack.rs::format_site_prefixed).
       - SITE_ID=hfville
-      # All Phase 5/5.5 watcher knobs default OFF for Ville on first deploy.
-      # Bootstrap (#74) flips these via per-site env override on evergreen
-      # (HFVILLE_LEGACY_SYNC_* vars) so HF Hotel's settings stay independent.
-      # Shadow-mode soak (#74→#75): enabled-true + shadow-true means the
-      # watcher polls CT, runs mappers, builds events, then ROLLS BACK the
-      # PG TX so canonical state stays untouched. Operator flips
-      # HFVILLE_LEGACY_SYNC_SHADOW_MODE=false at cutover (#76). Note: the
-      # `.env` file gets rewritten from GH secrets on every CI deploy, so
-      # these defaults MUST persist the shadow-mode soak across deploys.
+      # Phase 5 Ville cutover (#76, 2026-04-30) is LIVE — shadow_mode default
+      # flipped from `true` (soak) to `false` (production) so the next CI
+      # deploy doesn't silently revert the cutover. The `.env` file gets
+      # rewritten from GH secrets on every deploy, so this default MUST be
+      # the desired post-cutover value or the operator-set HFVILLE_LEGACY_SYNC_SHADOW_MODE
+      # in `.env` gets wiped on each push and the watcher reverts to TX-rollback.
+      # Operator can still set HFVILLE_LEGACY_SYNC_SHADOW_MODE=true in .env to
+      # re-soak (e.g. for rollback) and that will win over this default.
       - LEGACY_SYNC_ENABLED=${HFVILLE_LEGACY_SYNC_ENABLED:-true}
-      - LEGACY_SYNC_SHADOW_MODE=${HFVILLE_LEGACY_SYNC_SHADOW_MODE:-true}
+      - LEGACY_SYNC_SHADOW_MODE=${HFVILLE_LEGACY_SYNC_SHADOW_MODE:-false}
       # Scoped to the 11 canonical-sync tables enabled by 020. Phase 5.5
       # Ville (021, task #80) adds the 6 mirror tables — at that point set
       # HFVILLE_LEGACY_SYNC_TABLE_ALLOWLIST="" or unset for "all enabled".
