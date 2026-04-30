@@ -90,25 +90,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Create HF Ville pool from local newdb with search_path=ville
-    // (ville_sync pushes data to the ville schema in production newdb)
+    // Create HF Ville pool. Phase 5 Ville cutover (#76, 2026-04-30) repointed
+    // this from the legacy `?options=-csearch_path%3Dville` (ville schema in
+    // hotelnew, fed by ville_sync FreeTDS poll) to the new `hotelville`
+    // database (fed by sync-hfville CT watcher). Now uses `VilleDbConfig`
+    // verbatim — VILLE_DB_SERVER / _PORT / _NAME / _USER / _PASSWORD env
+    // vars drive the connection.
     let ville_pool = if config.ville_db.enabled {
-        let ville_conn = format!(
-            "postgres://{}:{}@{}:{}/{}?options=-csearch_path%3Dville",
-            config.new_db.user, config.new_db.password,
-            config.new_db.server, config.new_db.port, config.new_db.database
-        );
+        let ville_conn = config.ville_db.connection_string();
         match sqlx::postgres::PgPoolOptions::new()
             .max_connections(config.ville_db.pool_max)
             .connect(&ville_conn)
             .await
         {
             Ok(pool) => {
-                tracing::info!("HF Ville local pool created (ville schema in newdb)");
+                tracing::info!(
+                    "HF Ville pool created ({}:{}/{})",
+                    config.ville_db.server, config.ville_db.port, config.ville_db.database
+                );
                 Some(pool)
             }
             Err(e) => {
-                tracing::warn!("Failed to create HF Ville local pool: {}", e);
+                tracing::warn!("Failed to create HF Ville pool: {}", e);
                 None
             }
         }

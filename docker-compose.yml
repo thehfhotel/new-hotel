@@ -109,14 +109,16 @@ services:
       - SLACK_NOTIFICATIONS_ENABLED=true
       - HOST=0.0.0.0
       - PORT=3003
-      # HF Ville — reads from local newdb ville schema (pushed by ville_sync)
+      # HF Ville — Phase 5 Ville cutover (#76, 2026-04-30): ville_pool
+      # repointed from the defunct `ville-tunnel` default to the local
+      # `hotelville` PG database in the same `newdb` cluster (per ADR 0001
+      # Q1 per-DB topology). Same credentials as POSTGRES_*; fed by
+      # sync-hfville CT watcher.
       - VILLE_DB_ENABLED=${VILLE_DB_ENABLED:-true}
-      # VilleDbConfig requires a password when enabled. For the existing
-      # single-cluster setup (ville pool reads the `ville` schema in the same
-      # newdb container), POSTGRES_PASSWORD is the right value — falling back
-      # via shell expansion keeps HF Hotel deploys working without a separate
-      # GH secret. Override VILLE_DB_PASSWORD explicitly when Ville migrates
-      # to its own DB/cluster (Phase 5 Ville cutover).
+      - VILLE_DB_SERVER=${VILLE_DB_SERVER:-newdb}
+      - VILLE_DB_PORT=${VILLE_DB_PORT:-5439}
+      - VILLE_DB_NAME=${VILLE_DB_NAME:-hotelville}
+      - VILLE_DB_USER=${VILLE_DB_USER:-${POSTGRES_USER}}
       - VILLE_DB_PASSWORD=${VILLE_DB_PASSWORD:-${POSTGRES_PASSWORD}}
     depends_on:
       newdb:
