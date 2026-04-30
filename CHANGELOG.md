@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.32] - 2026-04-30
+
+### Changed
+
+- **Bumped `actions/checkout` v4 → v5.0.0 and `dorny/paths-filter` v3 →
+  v4.0.1.** Both releases are runtime-only updates that move the action
+  from Node.js 20 to Node.js 24, clearing the deprecation warning that
+  surfaced on the first self-hosted CI run (run `25182166656`):
+
+  > Node.js 20 actions are deprecated. Actions will be forced to run
+  > with Node.js 24 by default starting June 2nd, 2026. Node.js 20 will
+  > be removed from the runner on September 16th, 2026.
+
+  No syntax / API changes either side. Both pinned by commit SHA per
+  Batch D convention (the `# vX.Y.Z` comment is the human-readable
+  reference; SHA is the trust anchor).
+
+  - `actions/checkout` → `93cb6efe18208431cddfb8368fd83d5badbf9bfd`
+    (v5.0.0). Requires runner v2.327.1+; self-hosted runners
+    auto-update by default and the `evergreen` runner had just
+    succeeded the v2.54.31 build, so this is met.
+  - `dorny/paths-filter` → `fbd0ab8f3e69293af611ebaee6363fc25e6d187d`
+    (v4.0.1).
+
 ## [2.54.31] - 2026-04-30
 
 ### Changed
