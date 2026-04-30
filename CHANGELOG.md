@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.23] - 2026-04-30
+
+### Fixed
+
+- **Phase 5 Ville cutover (#76): `ville_pool` was bypassing
+  `VilleDbConfig`** — `main.rs:95-114` constructed the connection string
+  from `config.new_db.*` with a hardcoded `?options=-csearch_path%3Dville`,
+  ignoring every `VILLE_DB_*` env var. So the cutover step "set
+  VILLE_DB_NAME=hotelville" had zero runtime effect and the route
+  handlers continued reading from `hotelnew.ville.*` (the stale
+  `ville_sync` push, now 22 h+ stale since `ville_sync` was stopped
+  pre-cutover). Caught during smoke test when
+  `/api/customers?branch=hfville` returned phone-number-shaped IDs and
+  type fields containing Thai address-template strings — clear signal
+  the data wasn't from the new `hotelville` DB. Fix: replace the
+  hardcoded format!() with `config.ville_db.connection_string()`,
+  honoring all five `VILLE_DB_*` env vars per `VilleDbConfig::from_env()`.
+  Logs now show `HF Ville pool created (newdb:5439/hotelville)`
+  instead of `... (ville schema in newdb)`.
+
+  `docker-compose.yml` also gains explicit `VILLE_DB_{SERVER,PORT,NAME,USER}`
+  env passthrough so the deploy step writes them to `.env` consistently.
+  Defaults match the post-cutover topology (`newdb:5439/hotelville`,
+  user from `POSTGRES_USER`).
+
 ## [2.54.22] - 2026-04-30
 
 ### Removed
