@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.30] - 2026-04-30
+
+### Fixed
+
+- **Phase 5.5b Ville (#80): `docker-compose.yml` allowlist default flipped
+  to empty so post-021 state survives CI deploys.** Phase 5 originally
+  pinned `LEGACY_SYNC_TABLE_ALLOWLIST` for `sync-hfville` to the 11
+  canonical-sync tables enabled by migration 020 — anything else (the
+  6 mirror tables) would have failed CT polling. Now that 021 has been
+  applied at Ville and all 16 tables are CT-enabled, the watcher needs
+  to see them all. Operator hot-fix on evergreen cleared the env var,
+  but compose's hardcoded 11-table default kept reasserting itself on
+  every CI deploy (CI rewrites `.env` from GH secrets, so the operator
+  edit didn't survive). Default flipped from the 11-table list to `""`
+  so empty = "all CT-enabled tables", matching post-Phase-5.5b state.
+  An operator can still narrow via `HFVILLE_LEGACY_SYNC_TABLE_ALLOWLIST=HT_X`
+  for debugging.
+
+  Phase 5.5b was applied during the same session: 021 DDL ran cleanly
+  at Ville (all 6 mirror tables show `ct_enabled=YES` with proper PKs),
+  bootstrap-mirror snapshot loaded HT_Cupon/HT_CheckIn_Product (40)/
+  HT_Deposit/HT_Changed_Room (171)/HT_Bill_Debt_H/HT_Bill_Debt_Ds and
+  stamped watermark 643. Closes #80, #81. Task #82 (mount
+  `LegacyMirrorPanels` in billing detail) was already done in commit
+  `fde9dc1` (v2.53.0, 2026-04-29) — no code change needed.
+
 ## [2.54.29] - 2026-04-30
 
 ### Fixed
