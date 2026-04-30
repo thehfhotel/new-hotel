@@ -44,11 +44,12 @@ jobs:
       deploy: ${{ steps.filter.outputs.deploy }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.0
 
       - name: Check for changes
-        # v3 pinned to commit SHA per Batch D of post-Phase-5.5 audit.
-        # Resolved via `gh api /repos/dorny/paths-filter/git/refs/tags/v3`.
+        # v4.0.1 pinned to commit SHA. Bumped 2026-04-30 from v3 to clear
+        # the Node.js 20 deprecation warning (forced node24 by 2026-06-02).
+        # v4 release was a runtime-only update (PR #294) — no syntax change.
         # Bumps surface as Dependabot PRs (.github/dependabot.yml).
         #
         # ## Filter design
@@ -62,7 +63,7 @@ jobs:
         # If you add a new top-level path, decide which filter it belongs
         # under and add it. Catch-all globs (`**` at the root) are deliberately
         # NOT used here — explicit lists make the test/build matrix legible.
-        uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590  # v3
+        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d  # v4.0.1
         id: filter
         with:
           filters: |
@@ -106,7 +107,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.0
 
       - name: Setup pnpm
         # v4 pinned to SHA. Resolved via gh api git/refs/tags/v4.
@@ -152,7 +153,7 @@ jobs:
           --health-retries 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.0
 
       - name: Initialize database
         env:
@@ -279,7 +280,7 @@ jobs:
           --health-retries 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.0
 
       # Self-hosted runner may not ship postgresql-client by default
       # (github-hosted ubuntu-latest did). `apt-get install -y` is idempotent.
@@ -337,7 +338,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -383,7 +384,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -428,7 +429,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -490,7 +491,7 @@ jobs:
       (needs.build-frontend.result == 'success' || needs.build-backend.result == 'success' || (needs.changes.outputs.deploy == 'true' && needs.changes.outputs.frontend != 'true' && needs.changes.outputs.backend != 'true'))
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.0
 
       - name: Log in to Container Registry
         uses: docker/login-action@v3
@@ -733,7 +734,7 @@ jobs:
       (needs.build-ville-sync.result == 'success' || (needs.changes.outputs.hfville == 'true' && needs.changes.outputs.backend != 'true'))
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.0
 
       - name: Log in to Container Registry
         if: needs.build-ville-sync.result == 'success'
