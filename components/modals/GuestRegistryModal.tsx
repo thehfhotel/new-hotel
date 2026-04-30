@@ -14,6 +14,7 @@ import {
   Star,
   FileText,
 } from 'lucide-react'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 
 interface Guest {
   id: number
@@ -81,6 +82,8 @@ export default function GuestRegistryModal({
   checkIn,
   onGuestsChanged,
 }: GuestRegistryModalProps) {
+  const branchFetch = useBranchFetch()
+
   const [guests, setGuests] = useState<Guest[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -94,7 +97,7 @@ export default function GuestRegistryModal({
     setLoading(true)
     setError(null)
     try {
-      const response = await fetch(`/api/new/checkins/${checkIn.id}/guests`)
+      const response = await branchFetch(`/api/new/checkins/${checkIn.id}/guests`)
       if (!response.ok) {
         throw new Error('Failed to fetch guests')
       }
@@ -110,7 +113,7 @@ export default function GuestRegistryModal({
     } finally {
       setLoading(false)
     }
-  }, [checkIn.id])
+  }, [checkIn.id, branchFetch])
 
   useEffect(() => {
     if (isOpen) {
@@ -158,7 +161,7 @@ export default function GuestRegistryModal({
 
     setSaving(true)
     try {
-      const response = await fetch(`/api/new/checkins/${checkIn.id}/guests`, {
+      const response = await branchFetch(`/api/new/checkins/${checkIn.id}/guests`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -194,7 +197,7 @@ export default function GuestRegistryModal({
     setDeleting(guestId)
     setError(null)
     try {
-      const response = await fetch(`/api/new/checkins/${checkIn.id}/guests/${guestId}`, {
+      const response = await branchFetch(`/api/new/checkins/${checkIn.id}/guests/${guestId}`, {
         method: 'DELETE',
       })
 

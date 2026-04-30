@@ -170,7 +170,7 @@ describe('PaymentModal Component', () => {
       fireEvent.click(submitButton)
 
       await waitFor(() => {
-        expect(global.fetch).toHaveBeenCalledWith('/api/new/checkins/1/payments', {
+        expect(global.fetch).toHaveBeenCalledWith('/api/new/checkins/1/payments?branch=hfhotel', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -206,7 +206,7 @@ describe('PaymentModal Component', () => {
       fireEvent.click(submitButton)
 
       await waitFor(() => {
-        expect(global.fetch).toHaveBeenCalledWith('/api/new/checkins/1/payments', {
+        expect(global.fetch).toHaveBeenCalledWith('/api/new/checkins/1/payments?branch=hfhotel', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
