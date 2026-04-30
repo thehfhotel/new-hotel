@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.29] - 2026-04-30
+
+### Fixed
+
+- **Real legal-entity values filled into `lib/hotel-info.ts`** for both
+  branches. HF Hotel was previously hardcoded to `123 ถนนตัวอย่าง`
+  ("123 Sample Road") + `02-123-4567` + `0123456789012` — placeholders
+  that pre-dated this repo's billing module and somehow never got
+  replaced. HF Ville was the placeholder set the #91 agent shipped on
+  2026-04-30 (`[HF Ville — info pending]` etc.).
+
+  Both sites now carry their actual production values:
+  - HF Hotel: from legacy MSSQL `TB_SETTINGS` table — address `33 ถนนชนเกษม ต.ตลาด อ.เมืองสุราษฎร์ธานี จ.สุราษฎร์ธานี 84000`, phone `077313808`, taxId `0845557000341`.
+  - HF Ville: provided by operator — address `196/6 หมู่ 5 ตำบลมะขามเตี้ย อำเภอเมืองสุราษฎร์ธานี จังหวัดสุราษฎร์ธานี 84000`, phone `077275838`, taxId `0845557000341` (same legal entity as HF Hotel — `บริษัท สายชล เฮอริเทจ จำกัด`).
+
+  Display `name` field uses the brand string (`HF Hotel` / `HF Ville`)
+  rather than the registered company name, matching how the staff and
+  guests refer to each property. If invoice templates need to print the
+  legal entity (e.g. "นิติบุคคล: บริษัท สายชล เฮอริเทจ จำกัด"), that's
+  a separate template-level addition, not a `hotel-info` field.
+
+  Source for HF Hotel values is `192.168.100.222 / db / TB_SETTINGS`
+  rendered via `sqlcmd`; the legacy app and the receptionist printers
+  read the same row.
+
 ## [2.54.28] - 2026-04-29
 
 ### Fixed

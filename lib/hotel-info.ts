@@ -13,20 +13,21 @@ export type { HotelInfo }
  */
 export const HOTEL_INFO_BY_BRANCH: Record<Exclude<Branch, 'all'>, HotelInfo> = {
   hfhotel: {
-    name: 'The HF Hotel',
-    address: '123 ถนนตัวอย่าง อ.เมือง จ.กรุงเทพฯ 10000',
-    phone: '02-123-4567',
-    taxId: '0123456789012',
+    // Filled 2026-04-30 from legacy TB_SETTINGS (HF Hotel MSSQL).
+    // Both sites operate under the same legal entity
+    // (บริษัท สายชล เฮอริเทจ จำกัด), hence the shared taxId.
+    name: 'HF Hotel',
+    address: '33 ถนนชนเกษม ต.ตลาด อ.เมืองสุราษฎร์ธานี จ.สุราษฎร์ธานี 84000',
+    phone: '077313808',
+    taxId: '0845557000341',
   },
   hfville: {
-    // TODO(operator): replace these placeholders with the real HF Ville
-    // legal-entity name + address + phone + tax ID before Ville guests
-    // receive their first invoice. Until then, invoices show "[HF Ville
-    // — info pending]" so the gap is visible rather than masked.
-    name: '[HF Ville — info pending]',
-    address: '[address pending — fill in lib/hotel-info.ts]',
-    phone: '[phone pending]',
-    taxId: '[tax id pending]',
+    // Filled 2026-04-30 from operator. Verify before any printed invoice
+    // goes to a real Ville guest.
+    name: 'HF Ville',
+    address: '196/6 หมู่ 5 ตำบลมะขามเตี้ย อำเภอเมืองสุราษฎร์ธานี จังหวัดสุราษฎร์ธานี 84000',
+    phone: '077275838',
+    taxId: '0845557000341',
   },
 }
 
