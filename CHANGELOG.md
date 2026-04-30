@@ -5,6 +5,68 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.25] - 2026-04-30
+
+### Fixed
+
+- **Phase 5 Ville (#90): four frontend modals/forms used bare `fetch('/api/new/*')`
+  instead of `branchFetch`, silently routing Ville users' writes into the HF
+  Hotel pool.** After Phase 5 cutover (2026-04-30) the backend dispatches by
+  `?branch=hfhotel|hfville` to two different connection pools (`new_pool` vs
+  `ville_pool`). The shared `useBranchFetch()` hook auto-appends the active
+  branch from `BranchContext`, but these four call sites called the global
+  `fetch` directly — so the URL had no `?branch=` param and the backend
+  defaulted to HF Hotel. A Ville receptionist creating a check-in, walking up
+  a customer, filing a maintenance ticket, or adjusting inventory stock would
+  see the write succeed in the UI but the row would land in `hotelnew` (HF
+  Hotel) instead of `hotelville`.
+
+  Surgical swap of `fetch` → `branchFetch` (with `useBranchFetch()` invoked
+  at component top) in:
+  - `components/modals/QuickCheckInModal.tsx` — customer search (GET) +
+    check-in submit (POST)
+  - `components/forms/BookingForm.tsx` — new-customer create (POST)
+  - `components/modals/MaintenanceRequestModal.tsx` — request create (POST)
+    + request update (PUT)
+  - `components/modals/StockAdjustmentModal.tsx` — item search (GET) +
+    adjustment submit (POST)
+
+  No behavioural changes — `branchFetch` returns the same `Response` shape, so
+  every call site, response handler, and error path is unchanged. Component
+  tests updated to assert the new `?branch=hfhotel` URL suffix that the hook
+  appends in the default `BranchContext` state. All 621 component tests pass.
+
+## [2.54.24] - 2026-04-30
+
+### Fixed
+
+- **Phase 5 Ville (#91): invoice + receipt templates were hardcoded to
+  HF Hotel identity.** `app/billing/[id]/page.tsx` declared a module-level
+  `hotelInfo` constant with `name: 'The HF Hotel'` plus HF Hotel address /
+  phone / tax ID, and that single value was passed unconditionally to
+  `InvoiceTemplate` (and would have been to `ReceiptTemplate`). When a
+  receptionist switched the branch picker to HF Ville and printed an
+  invoice for a Ville guest, the document showed HF Hotel's name,
+  address and tax ID — a customer-facing legal-entity defect.
+
+  Fix: extracted the data into `lib/hotel-info.ts`
+  (`HOTEL_INFO_BY_BRANCH` keyed on `Exclude<Branch, 'all'>` so TypeScript
+  enforces both branches are present) and a thin
+  `hotelInfoForBranch(branch)` resolver that defensively falls back to
+  HF Hotel for the dashboard-only `'all'` value. The billing page now
+  reads `useBranch()` and passes the resolved info into
+  `InvoiceTemplate`. Templates remain pure prop-driven renderers
+  (no internal branch lookup) so they stay easy to test.
+
+  **OPERATOR ACTION REQUIRED before HF Ville guests check out:** the
+  `hfville` entry in `lib/hotel-info.ts` ships with deliberate
+  placeholders (`'[HF Ville — info pending]'`, `'[address pending —
+  fill in lib/hotel-info.ts]'`, `'[phone pending]'`, `'[tax id
+  pending]'`) so the gap is visible on a printed invoice rather than
+  masked with fake-but-plausible data. Replace these four strings with
+  the real legal-entity name, address, phone and tax ID once the
+  operator provides them — a one-file edit, no schema changes.
+
 ## [2.54.23] - 2026-04-30
 
 ### Fixed

@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from 'react'
 import { X, Search, Loader2, User, Calendar, DollarSign, FileText } from 'lucide-react'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 
 interface Customer {
   id: number
@@ -47,6 +48,8 @@ export default function QuickCheckInModal({
   room,
   onSuccess,
 }: QuickCheckInModalProps) {
+  const branchFetch = useBranchFetch()
+
   // Customer search state
   const [searchQuery, setSearchQuery] = useState('')
   const [customers, setCustomers] = useState<Customer[]>([])
@@ -83,7 +86,7 @@ export default function QuickCheckInModal({
 
     setIsSearching(true)
     try {
-      const res = await fetch(`/api/new/customers?search=${encodeURIComponent(query)}&limit=10`)
+      const res = await branchFetch(`/api/new/customers?search=${encodeURIComponent(query)}&limit=10`)
       const data = await res.json()
       if (data.success) {
         setCustomers(data.data)
@@ -93,7 +96,7 @@ export default function QuickCheckInModal({
     } finally {
       setIsSearching(false)
     }
-  }, [])
+  }, [branchFetch])
 
   // Debounced search
   useEffect(() => {
@@ -158,7 +161,7 @@ export default function QuickCheckInModal({
     setError(null)
 
     try {
-      const res = await fetch('/api/new/checkins', {
+      const res = await branchFetch('/api/new/checkins', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

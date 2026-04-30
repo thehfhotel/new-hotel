@@ -17,6 +17,7 @@ import {
 import CustomerPicker, { CustomerOption } from '@/components/pickers/CustomerPicker'
 import CustomerForm, { CustomerFormData } from '@/components/forms/CustomerForm'
 import RoomPicker, { RoomOption } from '@/components/pickers/RoomPicker'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 
 export interface BookingFormState {
   id?: number
@@ -112,6 +113,7 @@ export default function BookingForm({
   initialData,
   mode,
 }: BookingFormProps) {
+  const branchFetch = useBranchFetch()
   const [formData, setFormData] = useState<BookingFormState>(emptyFormData)
   const [selectedCustomer, setSelectedCustomer] = useState<CustomerOption | null>(null)
   const [selectedRooms, setSelectedRooms] = useState<RoomOption[]>([])
@@ -260,7 +262,7 @@ export default function BookingForm({
   }
 
   const handleSaveNewCustomer = async (data: CustomerFormData) => {
-    const response = await fetch('/api/new/customers', {
+    const response = await branchFetch('/api/new/customers', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
