@@ -325,10 +325,13 @@ services:
       # re-soak (e.g. for rollback) and that will win over this default.
       - LEGACY_SYNC_ENABLED=${HFVILLE_LEGACY_SYNC_ENABLED:-true}
       - LEGACY_SYNC_SHADOW_MODE=${HFVILLE_LEGACY_SYNC_SHADOW_MODE:-false}
-      # Scoped to the 11 canonical-sync tables enabled by 020. Phase 5.5
-      # Ville (021, task #80) adds the 6 mirror tables — at that point set
-      # HFVILLE_LEGACY_SYNC_TABLE_ALLOWLIST="" or unset for "all enabled".
-      - LEGACY_SYNC_TABLE_ALLOWLIST=${HFVILLE_LEGACY_SYNC_TABLE_ALLOWLIST:-HT_Customers,HT_Rooms,HT_Book_H,HT_Book_Ds,HT_Book_Date,HT_CheckIn_H,HT_CheckIn_Ds,HT_CheckIn_Pay,HT_Room_Status,HT_Rooms_Cancel,HT_Receipt_H}
+      # Phase 5.5b Ville cutover (#80, 2026-04-30): allowlist cleared
+      # post-021. Empty = poll every CT-enabled table (all 16 now). The
+      # explicit 11-table list was Phase 5 only; with mirror tables CT-
+      # enabled the watcher needs to see them too. Operator can still
+      # narrow via HFVILLE_LEGACY_SYNC_TABLE_ALLOWLIST=HT_X,HT_Y to
+      # debug a specific table.
+      - LEGACY_SYNC_TABLE_ALLOWLIST=${HFVILLE_LEGACY_SYNC_TABLE_ALLOWLIST:-}
       - CT_POLL_INTERVAL_MS=${HFVILLE_CT_POLL_INTERVAL_MS:-1000}
       - LEGACY_SYNC_ALLOW_COLD_REPLAY=${HFVILLE_LEGACY_SYNC_ALLOW_COLD_REPLAY:-false}
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,sync=info}
