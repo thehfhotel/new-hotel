@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.31] - 2026-04-30
+
+### Changed
+
+- **CI jobs moved off GitHub-hosted runners onto the existing self-hosted
+  runner on evergreen.** Driver: GitHub Actions Free-tier minute quota was
+  exhausted (push `6fe875c` blocked with "recent account payments have
+  failed or your spending limit needs to be increased"). User explicitly
+  rejected pay-as-you-go to keep CI cost predictable; self-hosted runner
+  minutes don't count against Actions billing, so `spending limit = $0`
+  + `runs-on: [self-hosted, linux, deploy]` everywhere = $0 forever, with
+  no risk of a surprise invoice.
+
+  Edits in `.github/workflows/docker-build.yml`:
+  - `changes`, `test-frontend`, `test-backend`,
+    `init-db-migrations-drift-check`, `build-frontend`, `build-backend`,
+    `build-ville-sync` now all run on `[self-hosted, linux, deploy]`,
+    same label the existing `deploy` + `deploy-hfville` jobs already use.
+  - `Install mold linker` step (in `test-backend`) renamed to
+    `Install build + test prerequisites` and extended with
+    `postgresql-client` since the self-hosted runner doesn't ship `psql`
+    by default the way the GitHub-hosted ubuntu-latest image did.
+    `apt-get install -y` is idempotent so re-runs on a warm runner skip
+    already-installed packages.
+  - `init-db-migrations-drift-check` now installs `postgresql-client`
+    too, for the same reason — it shells `psql` to seed the throwaway
+    Postgres before running `migrate.sh`.
+
+  Trade-offs accepted:
+  - **Single point of failure**: evergreen down = no CI. Today CI worked
+    even when evergreen was down. Acceptable because evergreen also
+    hosts every container CI deploys to; if it's down, deploys can't
+    land anyway.
+  - **Serial execution**: a single runner now serializes all CI jobs on
+    one host. Wall time goes from ~4 min (5 jobs in parallel on
+    GitHub-hosted) to ~10–15 min. Acceptable for current change cadence.
+  - **Resource competition**: Rust full rebuilds use ~4 cores at 100%
+    for ~2 min and can pressure the prod containers (backend, web,
+    newdb, writeback, sync, sync-hfville, writeback-hfville) on the
+    same host. Watch for backend healthcheck flapping during builds;
+    if it becomes a problem, register a second runner on a separate VM
+    for builds and keep the existing one for deploy-only.
+  - **Self-hosted runner security**: GitHub recommends self-hosted only
+    for private repos because PRs from forks could otherwise execute
+    untrusted code. This repo is private — fine.
+  - **Disk pressure**: cargo `target/`, pnpm store, Docker buildkit
+    layers accumulate on the runner. Add a periodic cleanup if disk
+    usage on evergreen creeps up (`docker system prune --volumes`,
+    `cargo cache --autoclean` if the binary is installed).
+
 ## [2.54.30] - 2026-04-30
 
 ### Fixed
