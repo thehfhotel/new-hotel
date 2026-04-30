@@ -13,6 +13,7 @@ import {
   FileText,
 } from 'lucide-react'
 import { InventoryItem, getStockStatus, getStockStatusColor, getStockStatusLabel } from '@/types/inventory'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 
 interface StockAdjustmentModalProps {
   isOpen: boolean
@@ -35,6 +36,8 @@ export default function StockAdjustmentModal({
   onSuccess,
   preselectedItem = null,
 }: StockAdjustmentModalProps) {
+  const branchFetch = useBranchFetch()
+
   // Item search state
   const [searchQuery, setSearchQuery] = useState('')
   const [items, setItems] = useState<InventoryItem[]>([])
@@ -72,7 +75,7 @@ export default function StockAdjustmentModal({
 
     setIsSearching(true)
     try {
-      const res = await fetch(`/api/new/inventory/items?search=${encodeURIComponent(query)}&limit=10`)
+      const res = await branchFetch(`/api/new/inventory/items?search=${encodeURIComponent(query)}&limit=10`)
       const data = await res.json()
       if (data.success) {
         setItems(data.data || [])
@@ -82,7 +85,7 @@ export default function StockAdjustmentModal({
     } finally {
       setIsSearching(false)
     }
-  }, [])
+  }, [branchFetch])
 
   // Debounced search
   useEffect(() => {
@@ -162,7 +165,7 @@ export default function StockAdjustmentModal({
     setError(null)
 
     try {
-      const res = await fetch('/api/new/inventory/adjustments', {
+      const res = await branchFetch('/api/new/inventory/adjustments', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

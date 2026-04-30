@@ -133,7 +133,7 @@ describe('QuickCheckInModal Component', () => {
       })
 
       await waitFor(() => {
-        expect(global.fetch).toHaveBeenCalledWith('/api/new/customers?search=John&limit=10')
+        expect(global.fetch).toHaveBeenCalledWith('/api/new/customers?search=John&limit=10&branch=hfhotel', undefined)
       })
     })
 
@@ -367,7 +367,7 @@ describe('QuickCheckInModal Component', () => {
       fireEvent.click(submitButton)
 
       await waitFor(() => {
-        expect(global.fetch).toHaveBeenLastCalledWith('/api/new/checkins', {
+        expect(global.fetch).toHaveBeenLastCalledWith('/api/new/checkins?branch=hfhotel', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: expect.stringContaining('"customerId":1'),
