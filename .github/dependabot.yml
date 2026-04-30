@@ -37,7 +37,7 @@ updates:
       interval: weekly
 
   - package-ecosystem: docker
-    # Backend + ville-sync Dockerfiles share this directory.
+    # Backend Dockerfile.
     directory: /hotel-backend
     schedule:
       interval: weekly

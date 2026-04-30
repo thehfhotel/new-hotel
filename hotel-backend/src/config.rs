@@ -31,11 +31,11 @@ impl DbConfig {
     pub fn from_env() -> Self {
         // Pool sizing: prefer the explicit `MSSQL_POOL_MAX_SIZE`
         // (introduced 2.49.2 to give operators a clearly-named knob for
-        // the legacy MSSQL bb8 pool shared by writeback + sync +
-        // ville-sync), falling back to the historical `DB_POOL_MAX`
-        // for backward compatibility. Default bumped 10 → 20 to give
-        // headroom to the Phase 5 sync worker; tighten via env if
-        // legacy MSSQL ever pushes back on connection count.
+        // the legacy MSSQL bb8 pool shared by writeback + sync),
+        // falling back to the historical `DB_POOL_MAX` for backward
+        // compatibility. Default bumped 10 → 20 to give headroom to the
+        // Phase 5 sync worker; tighten via env if legacy MSSQL ever
+        // pushes back on connection count.
         let pool_max = env::var("MSSQL_POOL_MAX_SIZE")
             .or_else(|_| env::var("DB_POOL_MAX"))
             .ok()

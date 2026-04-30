@@ -14,10 +14,6 @@ name = "migrate_legacy"
 path = "src/bin/migrate_legacy.rs"
 
 [[bin]]
-name = "ville_sync"
-path = "src/bin/ville_sync.rs"
-
-[[bin]]
 name = "writeback"
 path = "src/bin/writeback.rs"
 
@@ -36,7 +32,7 @@ axum = "0.7"
 # - macros: #[tokio::main], #[tokio::test]
 # - rt-multi-thread: multi-threaded runtime + Runtime::new() in migrate_legacy bin
 # - net: tokio::net::TcpListener for axum
-# - time: tokio::time::sleep used by scheduler/ville_sync
+# - time: tokio::time::sleep used by scheduler + sync/writeback workers
 # - sync: tokio::sync::Mutex used by scheduler state
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
