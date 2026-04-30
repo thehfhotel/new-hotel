@@ -2,12 +2,14 @@
 
 import { useState, useEffect, use, useCallback } from 'react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { useBranch } from '@/contexts/BranchContext'
+import { hotelInfoForBranch } from '@/lib/hotel-info'
 import Link from 'next/link'
 import { ArrowLeft, Loader2, AlertCircle, Receipt } from 'lucide-react'
 import InvoiceTemplate from '@/components/documents/InvoiceTemplate'
 import LegacyMirrorPanels from '@/components/LegacyMirrorPanels'
 import PrintButton from '@/components/ui/PrintButton'
-import { InvoiceData, HotelInfo } from '@/types/invoice'
+import { InvoiceData } from '@/types/invoice'
 
 interface InvoiceApiResponse {
   success: boolean
@@ -51,13 +53,6 @@ interface InvoiceApiResponse {
   error?: string
 }
 
-const hotelInfo: HotelInfo = {
-  name: 'The HF Hotel',
-  address: '123 ถนนตัวอย่าง อ.เมือง จ.กรุงเทพฯ 10000',
-  phone: '02-123-4567',
-  taxId: '0REDACTED-sa-pw9012',
-}
-
 export default function InvoiceDetailPage({
   params,
 }: {
@@ -65,6 +60,8 @@ export default function InvoiceDetailPage({
 }) {
   const resolvedParams = use(params)
   const branchFetch = useBranchFetch()
+  const { branch } = useBranch()
+  const hotelInfo = hotelInfoForBranch(branch)
   const [invoiceData, setInvoiceData] = useState<InvoiceData | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
