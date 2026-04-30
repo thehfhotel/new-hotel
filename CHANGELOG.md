@@ -5,6 +5,68 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.28] - 2026-04-29
+
+### Fixed
+
+- **Phase 5.5 Ville (#93): `routes/legacy_mirror.rs` always queried
+  `state.new_pool` regardless of `?branch=`.** Same shape as the main.rs
+  ville_pool wiring bug fixed earlier today (#90/#94 family). The frontend's
+  `LegacyMirrorPanels.tsx` correctly appends `?branch=hfville` via
+  `useBranchFetch`, but every handler in `legacy_mirror.rs` (coupons,
+  in-stay POS / minibar, mid-stay room moves, pricing reference) ignored
+  the param and read from HF Hotel's `new_pool`. Result: a Ville
+  receptionist viewing legacy-mirror panels would silently see HF Hotel
+  data — or empty results once the mirror schemas existed at
+  `hotelville` but the dispatch was wrong.
+  
+  Surgical dispatch fix mirroring the `bookings.rs` pattern: each handler
+  resolves `let pool = match branch { Branch::Hfville => state.ville_pool()?,
+  _ => &state.new_pool };` and threads `pool` to the existing SQL. Query
+  strings, response shapes, and route paths are unchanged — only the
+  pool selection. Added a `BranchOnlyQuery` for `get_pricing_reference`
+  (no `cin_no`) and extended `CinNoQuery` with an optional `branch` field
+  for the three per-checkin endpoints. Also rewrote the stale
+  `bin/sync.rs:CT_ENABLED_TABLES` comment that called the mirror tables
+  "HF Hotel only" — Ville's CT was enabled by migrations 020 + 021 after
+  the 2026-04-29 SS2025 upgrade, so the mirror mappers run for both
+  sites.
+
+  The 6 mirror tables at `hotelville` are still empty today (Phase 5.5
+  Ville bootstrap #80–82 not done yet); empty results when querying
+  `?branch=hfville` are expected and correct post-fix. This unblocks #82
+  — once the mirror tables get bootstrapped, the panels will populate
+  without further code changes.
+
+## [2.54.27] - 2026-04-29
+
+### Fixed
+
+- **Phase 5 Ville (#94): three more frontend modals also bypassed `branchFetch`,
+  follow-up to #90.** While verifying #90's fix (commit `bac0d10`,
+  `CheckOutModal` / `PaymentModal` / `GuestRegistryModal` were missed in the
+  initial sweep — same routing-bypass bug, different files. Each called bare
+  `fetch('/api/new/*')` instead of `branchFetch`, so a Ville receptionist's
+  checkout, payment record, or TM.30 guest add/delete would silently land
+  in HF Hotel's `new_pool` instead of `ville_pool`.
+
+  Surgical swap of `fetch` → `branchFetch` (with `useBranchFetch()` hooked
+  at component top) in:
+  - `components/modals/CheckOutModal.tsx` — checkout submit (PUT
+    `/api/new/checkins/:id/checkout`)
+  - `components/modals/PaymentModal.tsx` — payment submit (POST
+    `/api/new/checkins/:id/payments`)
+  - `components/modals/GuestRegistryModal.tsx` — guest list fetch (GET),
+    guest add (POST), guest delete (DELETE) on
+    `/api/new/checkins/:id/guests[/:guestId]`. `branchFetch` added to
+    `fetchGuests`'s `useCallback` dep array.
+
+  Same zero-behaviour-change pattern as #90 — `branchFetch` returns the
+  same `Response` shape, so all call sites, response handlers, and error
+  paths are unchanged. Component test URL assertions updated to expect the
+  `?branch=hfhotel` suffix that the hook appends in the default
+  `BranchContext` state.
+
 ## [2.54.26] - 2026-04-30
 
 ### Fixed
