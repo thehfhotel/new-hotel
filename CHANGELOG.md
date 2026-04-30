@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.54.33] - 2026-04-30
+
+### Changed
+
+- **Bumped remaining Node.js 20 actions to node24-runtime majors.** The
+  v2.54.32 bump only cleared two actions (the only ones called out in
+  the prior run's annotation); the next run surfaced six more still on
+  Node 20. Bumping all of them now to clear the deprecation in one
+  pass:
+
+  | Action | From | To | Breaking? |
+  |--------|------|----|-----|
+  | `actions/setup-node` | v4 | v6.4.0 (`48b55a0…`) | New `package-manager-cache` opt-in auto-detects from `package.json`'s `packageManager` field — we don't have that field, so behaviour is unchanged. Existing `cache: 'pnpm'` input still works. |
+  | `pnpm/action-setup` | v4 | v5.0.0 (`b307475…`) | Runtime-only. |
+  | `docker/build-push-action` | v6 | v7.1.0 (`bcafcac…`) | Removed `DOCKER_BUILD_NO_SUMMARY` and `DOCKER_BUILD_EXPORT_RETENTION_DAYS` env vars + legacy export-build summary tool. We don't set/use any of these. |
+  | `docker/login-action` | v3 | v4.1.0 (`4907a6d…`) | Runtime + ESM only. |
+  | `docker/metadata-action` | v5 | v6.0.0 (`030e881…`) | List inputs preserve `#` inside values. Our `tags:` / `labels:` blocks have no `#`. |
+  | `docker/setup-buildx-action` | v3 | v4.0.0 (`4d04d5d…`) | Removed deprecated inputs/outputs. We don't set any inputs. |
+
+  All bumps require Actions Runner v2.327.1+. The `evergreen` runner
+  successfully ran v2.54.32 (which did require v2.327.1+ for the
+  checkout v5 bump), so it's already at or past that bar.
+
+  Pinned by SHA per Batch D. The previously-pinned `dtolnay/rust-toolchain`,
+  `mozilla-actions/sccache-action`, `Swatinem/rust-cache`, and
+  `webfactory/ssh-agent` weren't in the warning list — either already
+  on Node 24 or not Node-based.
+
 ## [2.54.32] - 2026-04-30
 
 ### Changed
