@@ -6,7 +6,7 @@ interface StatsCardProps {
 
 export default function StatsCard({ title, value, subtitle }: StatsCardProps) {
   return (
-    <div className="bg-white rounded-xl px-6 py-5 border border-gray-100 shadow-sm">
+    <div className="bg-white rounded-xl px-6 py-5 border border-gray-100 shadow-xs">
       <p className="text-sm font-medium text-gray-500 mb-1">{title}</p>
       <p className="text-3xl font-bold text-gray-900">{value}</p>
       {subtitle && (

@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.56.4] - 2026-05-03
+
+### Changed
+
+- **Bumped `tailwindcss` from `3.4.17` to `4.2.4`** (major version 3 to 4
+  migration). Ran the official `npx @tailwindcss/upgrade` tool, which:
+  - Replaced `tailwind.config.ts` with CSS-based `@theme { ... }` block
+    inside `app/globals.css`. The brand palette, SAP Fiori shell tokens,
+    13px-base type scale, and squashed border-radius values are all
+    preserved as `--color-*`, `--text-*`, and `--radius-*` custom
+    properties. The legacy `tailwind.config.ts` is deleted.
+  - Switched `app/globals.css` from `@tailwind base/components/utilities`
+    directives to the v4 `@import 'tailwindcss';` single-line import.
+  - Migrated `postcss.config.js` from the standalone `tailwindcss`
+    plugin to `@tailwindcss/postcss` (new in v4). Removed
+    `autoprefixer` from `devDependencies` — Tailwind v4's PostCSS
+    plugin includes vendor-prefixing built in via Lightning CSS.
+  - Renamed deprecated v3 utility classes across 37 component/page
+    files: `shadow-sm` → `shadow-xs` (10 sites), `outline-none` →
+    `outline-hidden` (68 sites), `backdrop-blur-sm` → `backdrop-blur-xs`
+    (1 site), `flex-shrink-0` → `shrink-0` (29 sites). All are 1:1
+    behaviour-preserving renames per the Tailwind v4 release notes.
+  - Added a v4-compat `@layer base` block to `app/globals.css` that
+    pins the default border colour to `var(--color-gray-200)`, since
+    v4 changed the default border colour to `currentcolor`. This keeps
+    every existing `border` utility looking identical to v3.
+- Updated `__tests__/components/StatsCard.test.tsx` and
+  `__tests__/components/Charts.test.tsx` to assert the new `shadow-xs`
+  class name (was `shadow-sm`). All 621 component tests pass.
+- Supersedes Dependabot PR #38 (which proposed the same 3.4.19 → 4.2.4
+  bump but without the upgrade-tool migration steps).
+
+**Visual regression risk** — Tailwind v4 may produce subtly different
+output beyond the explicit utility renames (shadow, ring colour,
+gradient interpolation now in OKLab, border colour). The compat shim
+covers border-color; other defaults could shift. Manual `pnpm dev`
+walkthrough recommended before considering this fully verified.
+
 ## [2.56.3] - 2026-05-03
 
 ### Changed

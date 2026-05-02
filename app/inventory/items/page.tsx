@@ -250,7 +250,7 @@ function InventoryItemsContent() {
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="ค้นหาด้วยรหัส หรือ ชื่อสินค้า..."
-              className="w-full pl-10 pr-4 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+              className="w-full pl-10 pr-4 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
             />
             {searchQuery && (
               <button
@@ -269,7 +269,7 @@ function InventoryItemsContent() {
             <select
               value={categoryFilter}
               onChange={(e) => setCategoryFilter(e.target.value as InventoryCategory | '')}
-              className="px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none"
+              className="px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden"
             >
               <option value="">ทุกหมวดหมู่</option>
               {INVENTORY_CATEGORIES.map((cat) => (
@@ -337,7 +337,7 @@ function InventoryItemsContent() {
       {/* Error Message */}
       {error && (
         <div className="flex items-center gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-600">
-          <AlertCircle className="w-5 h-5 flex-shrink-0" />
+          <AlertCircle className="w-5 h-5 shrink-0" />
           <span>{error}</span>
         </div>
       )}

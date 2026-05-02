@@ -188,7 +188,7 @@ export default function StayTimeline({
   const barHeight = viewMode === 'week' ? 160 : 100
 
   return (
-    <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
+    <div className="bg-white rounded-xl shadow-xs border border-gray-200 overflow-hidden">
       {/* Header */}
       <div className="flex items-center justify-between p-4 border-b border-gray-200 bg-gray-100">
         <button onClick={() => navigate('prev')} className="p-2 hover:bg-gray-100 rounded-full" aria-label="ก่อนหน้า">

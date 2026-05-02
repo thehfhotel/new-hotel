@@ -332,7 +332,7 @@ export default function RatesPage() {
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="ค้นหาชื่ออัตรา..."
-              className="w-full pl-10 pr-4 py-2 bg-white text-gray-800 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+              className="w-full pl-10 pr-4 py-2 bg-white text-gray-800 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
             />
             {searchQuery && (
               <button
@@ -350,7 +350,7 @@ export default function RatesPage() {
             <select
               value={roomTypeFilter}
               onChange={(e) => setRoomTypeFilter(e.target.value ? parseInt(e.target.value) : '')}
-              className="w-full px-3 py-2 bg-white text-gray-800 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+              className="w-full px-3 py-2 bg-white text-gray-800 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
             >
               <option value="">ประเภทห้องทั้งหมด</option>
               {roomTypes.map((rt) => (
@@ -399,7 +399,7 @@ export default function RatesPage() {
           {/* Error Message */}
           {error && (
             <div className="flex items-center gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700 mb-4">
-              <AlertCircle className="w-5 h-5 flex-shrink-0" />
+              <AlertCircle className="w-5 h-5 shrink-0" />
               <span>{error}</span>
             </div>
           )}
@@ -583,7 +583,7 @@ export default function RatesPage() {
               onChange={(e) =>
                 setCalendarRoomType(e.target.value ? parseInt(e.target.value) : null)
               }
-              className="w-full px-3 py-2 bg-white text-gray-800 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+              className="w-full px-3 py-2 bg-white text-gray-800 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
             >
               <option value="">-- เลือกประเภทห้อง --</option>
               {roomTypes.map((rt) => (

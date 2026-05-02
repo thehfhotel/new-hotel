@@ -346,7 +346,7 @@ export default function BookingForm({
               {/* Error Message */}
               {error && (
                 <div className="flex items-center gap-2 p-3 bg-red-50 border border-red-200 rounded-lg text-red-600">
-                  <AlertCircle className="w-5 h-5 flex-shrink-0" />
+                  <AlertCircle className="w-5 h-5 shrink-0" />
                   <span className="text-sm">{error}</span>
                 </div>
               )}
@@ -378,7 +378,7 @@ export default function BookingForm({
                     name="checkIn"
                     value={formData.checkIn}
                     onChange={handleInputChange}
-                    className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                    className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                     required
                     disabled={saving}
                   />
@@ -400,7 +400,7 @@ export default function BookingForm({
                     value={formData.checkOut}
                     onChange={handleInputChange}
                     min={formData.checkIn || undefined}
-                    className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                    className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                     required
                     disabled={saving}
                   />
@@ -434,7 +434,7 @@ export default function BookingForm({
                     value={formData.adults}
                     onChange={handleInputChange}
                     min="1"
-                    className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                    className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                     disabled={saving}
                   />
                 </div>
@@ -448,7 +448,7 @@ export default function BookingForm({
                     value={formData.children}
                     onChange={handleInputChange}
                     min="0"
-                    className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                    className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                     disabled={saving}
                   />
                 </div>
@@ -480,7 +480,7 @@ export default function BookingForm({
                     name="source"
                     value={formData.source || ''}
                     onChange={handleInputChange}
-                    className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                    className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                     disabled={saving}
                   >
                     <option value="">-- เลือก --</option>
@@ -501,7 +501,7 @@ export default function BookingForm({
                       name="status"
                       value={formData.status}
                       onChange={handleInputChange}
-                      className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                      className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                       disabled={saving}
                     >
                       {statusOptions.map((opt) => (
@@ -528,7 +528,7 @@ export default function BookingForm({
                   min="0"
                   step="0.01"
                   placeholder="ระบุจำนวนเงินมัดจำ"
-                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                   disabled={saving}
                 />
               </div>
@@ -545,7 +545,7 @@ export default function BookingForm({
                   onChange={handleInputChange}
                   placeholder="ระบุความต้องการพิเศษหรือหมายเหตุ..."
                   rows={3}
-                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors resize-none"
+                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors resize-none"
                   disabled={saving}
                 />
               </div>

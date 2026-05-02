@@ -210,7 +210,7 @@ export default function CustomerPicker({
         {value && !isOpen ? (
           // Show selected customer
           <>
-            <User className="w-4 h-4 text-gray-500 flex-shrink-0" />
+            <User className="w-4 h-4 text-gray-500 shrink-0" />
             <div className="flex-1 min-w-0">
               <span className="font-medium text-gray-800 truncate">
                 {getDisplayName(value)}
@@ -238,7 +238,7 @@ export default function CustomerPicker({
         ) : (
           // Show search input
           <>
-            <Search className="w-4 h-4 text-gray-500 flex-shrink-0" />
+            <Search className="w-4 h-4 text-gray-500 shrink-0" />
             <input
               ref={inputRef}
               type="text"
@@ -248,7 +248,7 @@ export default function CustomerPicker({
               onFocus={() => setIsOpen(true)}
               placeholder={placeholder}
               disabled={disabled}
-              className="flex-1 min-w-0 bg-transparent outline-none text-gray-800 placeholder-gray-400"
+              className="flex-1 min-w-0 bg-transparent outline-hidden text-gray-800 placeholder-gray-400"
             />
             {searchQuery && (
               <button
@@ -304,7 +304,7 @@ export default function CustomerPicker({
                   aria-selected={value?.id === customer.id}
                 >
                   <div className="flex items-start gap-3">
-                    <div className="w-8 h-8 bg-gray-100 rounded-full flex items-center justify-center flex-shrink-0 mt-0.5">
+                    <div className="w-8 h-8 bg-gray-100 rounded-full flex items-center justify-center shrink-0 mt-0.5">
                       <User className="w-4 h-4 text-gray-500" />
                     </div>
                     <div className="flex-1 min-w-0">

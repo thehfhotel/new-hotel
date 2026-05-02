@@ -167,7 +167,7 @@ export default function CheckOutModal({ room, onClose, onSuccess }: CheckOutModa
 
           {error && (
             <div className="flex items-start p-3 bg-red-50 border border-red-200 rounded text-sm text-red-700">
-              <AlertCircle size={16} className="mr-2 flex-shrink-0 mt-0.5" />
+              <AlertCircle size={16} className="mr-2 shrink-0 mt-0.5" />
               {error}
             </div>
           )}

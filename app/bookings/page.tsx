@@ -404,7 +404,7 @@ export default function NewBookingsPage() {
                   setCurrentPage(1)
                 }}
                 placeholderText="เลือกช่วงวันที่"
-                className="w-full px-3 py-2 bg-white text-gray-800 border-0 focus:ring-0 text-sm focus:outline-none"
+                className="w-full px-3 py-2 bg-white text-gray-800 border-0 focus:ring-0 text-sm focus:outline-hidden"
                 dateFormat="dd/MM/yy"
                 isClearable
               />

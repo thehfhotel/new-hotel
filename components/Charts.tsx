@@ -65,7 +65,7 @@ export function OccupancyChart({
   const maxRooms = Math.max(...data.map(d => d.occupiedRooms), 10)
 
   return (
-    <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
+    <div className="bg-white rounded-xl shadow-xs border border-gray-100 p-6">
       {title && (
         <h3 className="text-lg font-semibold text-gray-800 mb-4">{title}</h3>
       )}
@@ -185,7 +185,7 @@ export function RevenueChart({
   const maxRevenue = data.length > 0 ? Math.max(...data.map(d => d.revenue)) : 1000
 
   return (
-    <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
+    <div className="bg-white rounded-xl shadow-xs border border-gray-100 p-6">
       {title && (
         <h3 className="text-lg font-semibold text-gray-800 mb-4">{title}</h3>
       )}
@@ -319,7 +319,7 @@ export function PieChart({
   title = 'รายได้ตามประเภทห้อง',
 }: PieChartProps) {
   return (
-    <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
+    <div className="bg-white rounded-xl shadow-xs border border-gray-100 p-6">
       {title && (
         <h3 className="text-lg font-semibold text-gray-800 mb-4">{title}</h3>
       )}

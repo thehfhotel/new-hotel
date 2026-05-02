@@ -239,7 +239,7 @@ export default function NewDashboard() {
 
       {error && (
         <div className="flex items-center gap-2 p-2 bg-error/10 border border-error/40 text-error text-[12px]">
-          <AlertCircle className="w-4 h-4 flex-shrink-0" />
+          <AlertCircle className="w-4 h-4 shrink-0" />
           <span>{error}</span>
         </div>
       )}
