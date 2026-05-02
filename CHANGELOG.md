@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.56.1] - 2026-05-03
+
+### Changed
+
+- **Bumped React + React DOM to 19.2.5** (from `^19.1.0`) and matching
+  type packages `@types/react` to `^19.2.14` and `@types/react-dom` to
+  `^19.2.3`. Latest 19.x stable line; 19.2.5 lands additional cycle
+  protections for React Server Components. Compatible with our pinned
+  `next@16.2.4` (peer requires `^19.0.0`) and all React-consuming deps
+  (`@testing-library/react`, `react-datepicker`, `recharts`,
+  `lucide-react`). Supersedes Dependabot PR #40 which only bumped
+  `react` + `@types/react` and left `react-dom` / `@types/react-dom`
+  out of lockstep. All 621 component tests pass; `pnpm build` clean.
+
 ## [2.56.0] - 2026-05-01
 
 ### Changed
