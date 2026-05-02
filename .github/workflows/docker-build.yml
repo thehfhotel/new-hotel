@@ -34,10 +34,6 @@ jobs:
       # depend on schema). A migrations/ change retests + rebuilds the
       # backend so a schema/code mismatch can never reach a green deploy.
       backend: ${{ steps.filter.outputs.backend }}
-      # `hfville` — kept BROAD on hotel-backend/** because ville-sync compiles
-      # in the same Cargo workspace; any backend file change can affect it.
-      # Narrowing is unsafe without per-target dep analysis.
-      hfville: ${{ steps.filter.outputs.hfville }}
       # `deploy` — files that ONLY affect the running services (compose,
       # migrations, deploy/runner scripts). When any of these fires WITHOUT
       # a build, the deploy job re-rolls the existing :latest images.
@@ -89,9 +85,6 @@ jobs:
               # without CI catching it before deploy.
               - 'migrations/pg/**'
               - 'init-db/**'
-            hfville:
-              - 'hotel-backend/**'
-              - 'deploy/hfville/**'
             deploy:
               - 'docker-compose.yml'
               - 'init-db/**'
@@ -367,7 +360,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # `scope: frontend` (Batch D): isolates the GHA cache namespace
-          # so build-backend and build-ville-sync can't evict it.
+          # so build-backend can't evict it.
           cache-from: type=gha,scope=frontend
           cache-to: type=gha,mode=max,scope=frontend
           build-args: |
@@ -415,52 +408,6 @@ jobs:
           # `scope: backend` per Batch D — isolates GHA cache namespace.
           cache-from: type=gha,scope=backend
           cache-to: type=gha,mode=max,scope=backend
-
-  build-ville-sync:
-    runs-on: [self-hosted, linux, deploy]
-    # Block pushing :latest if backend tests fail (Batch D of audit).
-    # ville-sync shares the hotel-backend workspace, so test-backend
-    # exercising it is the right gate.
-    needs: [changes, test-backend]
-    if: needs.changes.outputs.hfville == 'true' && (needs.test-backend.result == 'success' || needs.test-backend.result == 'skipped')
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.0
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4.0.0
-
-      - name: Log in to Container Registry
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121  # v4.1.0
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf  # v6.0.0
-        with:
-          images: ${{ env.REGISTRY }}/thehfhotel/ville-sync
-          tags: |
-            type=sha,prefix=
-            type=raw,value=latest
-
-      - name: Build and push ville-sync
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
-        with:
-          context: ./hotel-backend
-          file: ./hotel-backend/Dockerfile.ville-sync
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # `scope: ville-sync` per Batch D — isolates GHA cache namespace.
-          cache-from: type=gha,scope=ville-sync
-          cache-to: type=gha,mode=max,scope=ville-sync
 
   deploy:
     runs-on: [self-hosted, linux, deploy]
@@ -711,136 +658,3 @@ jobs:
               ;;
           esac
 
-  deploy-hfville:
-    runs-on: [self-hosted, linux, deploy]
-    # `deploy` must succeed first so the canonical HF Hotel newdb is up to
-    # date before the HF Ville push target accepts new ville-schema rows
-    # (the ville-sync push goes straight at newdb on 10.10.10.4:5441).
-    needs: [changes, test-backend, build-ville-sync, deploy]
-    # Least-privilege: pull ville-sync image from GHCR (read on packages),
-    # read the tree.
-    permissions:
-      contents: read
-      packages: read
-    # Serialise hfville deploys (parallel pushes would race on jump box
-    # docker daemon + the same .env file).
-    concurrency:
-      group: deploy-hfville
-      cancel-in-progress: false
-    if: |
-      always() &&
-      needs.deploy.result == 'success' &&
-      (needs.test-backend.result == 'success' || needs.test-backend.result == 'skipped') &&
-      (needs.build-ville-sync.result == 'success' || (needs.changes.outputs.hfville == 'true' && needs.changes.outputs.backend != 'true'))
-    steps:
-      - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.0
-
-      - name: Log in to Container Registry
-        if: needs.build-ville-sync.result == 'success'
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121  # v4.1.0
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Load HF Ville SSH key into agent
-        # Replaces the previous `sshpass -p <hardcoded>` pattern — pubkey is
-        # installed on the jump box once by the operator (see commit body
-        # for the operator setup). The action wipes the agent at job end.
-        # v0.9.0 pinned to commit SHA per Batch D.
-        uses: webfactory/ssh-agent@dc588b651fe13675774614f8e6a936a468676387  # v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.HFVILLE_SSH_KEY }}
-
-      - name: Pin HF Ville host key
-        env:
-          JUMP_BOX: ${{ secrets.HFVILLE_SSH_HOST }}
-        # Pre-populate known_hosts so we never need StrictHostKeyChecking=no.
-        # `ssh-keyscan -H` hashes the hostname so it isn't readable in the
-        # log. If the jump box host key ever rotates, the operator must
-        # re-run this once locally and re-pin (or accept TOFU here).
-        run: |
-          mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          ssh-keyscan -H -T 15 "$JUMP_BOX" >> ~/.ssh/known_hosts 2>/dev/null
-          chmod 600 ~/.ssh/known_hosts
-
-      - name: Validate required HF Ville secrets
-        env:
-          HFVILLE_SSH_HOST: ${{ secrets.HFVILLE_SSH_HOST }}
-          HFVILLE_SSH_USER: ${{ secrets.HFVILLE_SSH_USER }}
-          HFVILLE_PG_PASSWORD: ${{ secrets.HFVILLE_PG_PASSWORD }}
-          HFVILLE_MSSQL_PASSWORD: ${{ secrets.HFVILLE_MSSQL_PASSWORD }}
-          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
-        run: |
-          for var in HFVILLE_SSH_HOST HFVILLE_SSH_USER \
-                     HFVILLE_PG_PASSWORD HFVILLE_MSSQL_PASSWORD \
-                     POSTGRES_PASSWORD; do
-            if [ -z "${!var:-}" ]; then
-              echo "::error::required secret $var is empty — refusing to deploy"
-              exit 1
-            fi
-          done
-
-      - name: Deploy to HF Ville jump box
-        env:
-          NEW_IMAGE: ${{ needs.build-ville-sync.result == 'success' }}
-          JUMP_BOX: ${{ secrets.HFVILLE_SSH_HOST }}
-          SSH_USER: ${{ secrets.HFVILLE_SSH_USER }}
-          HFVILLE_PG_PASSWORD: ${{ secrets.HFVILLE_PG_PASSWORD }}
-          HFVILLE_MSSQL_PASSWORD: ${{ secrets.HFVILLE_MSSQL_PASSWORD }}
-          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
-        run: |
-          set -e
-          # NOTE: -o StrictHostKeyChecking=no removed — known_hosts pinned above.
-          SSH_OPTS="-o ConnectTimeout=15"
-
-          echo "Deploying to HF Ville jump box ($JUMP_BOX) via WireGuard..."
-
-          # Ensure remote directory layout exists.
-          ssh $SSH_OPTS "$SSH_USER@$JUMP_BOX" "mkdir -p ~/hfville/init-db"
-
-          # Copy deployment files to jump box
-          scp $SSH_OPTS \
-            deploy/hfville/docker-compose.yml "$SSH_USER@$JUMP_BOX:~/hfville/"
-          scp $SSH_OPTS \
-            deploy/hfville/init-db/init-hfville.sql "$SSH_USER@$JUMP_BOX:~/hfville/init-db/"
-
-          # Write .env on the jump box from GH Secrets. umask 077 BEFORE the
-          # heredoc so the file is born 600 with no world-readable window.
-          # `printf %s "$ENV_BODY"` sends the body verbatim — no shell expansion
-          # on the remote side (vars already expanded locally), no leading-space
-          # weirdness from heredoc indentation under YAML's run-block stripping.
-          ENV_BODY="HFVILLE_PG_PASSWORD='${HFVILLE_PG_PASSWORD}'
-          HFVILLE_MSSQL_PASSWORD='${HFVILLE_MSSQL_PASSWORD}'
-          POSTGRES_PASSWORD='${POSTGRES_PASSWORD}'"
-          # Strip the YAML-induced leading whitespace before transmission.
-          ENV_BODY=$(printf '%s\n' "$ENV_BODY" | sed -e 's/^[[:space:]]\{10\}//')
-          printf '%s\n' "$ENV_BODY" | \
-            ssh $SSH_OPTS "$SSH_USER@$JUMP_BOX" \
-              "umask 077 && cat > ~/hfville/.env && chmod 600 ~/hfville/.env"
-
-          # Transfer new image only if ville-sync was rebuilt
-          if [ "$NEW_IMAGE" = "true" ]; then
-            echo "Transferring new ville-sync image..."
-            docker pull ghcr.io/thehfhotel/ville-sync:latest
-            docker save ghcr.io/thehfhotel/ville-sync:latest | gzip > /tmp/ville-sync.tar.gz
-
-            scp $SSH_OPTS \
-              /tmp/ville-sync.tar.gz "$SSH_USER@$JUMP_BOX:~/hfville/"
-
-            # `sudo` on the jump box must be configured NOPASSWD for docker
-            # (see commit body). No password literal anywhere in this pipeline.
-            ssh $SSH_OPTS "$SSH_USER@$JUMP_BOX" \
-              "sudo docker load -i ~/hfville/ville-sync.tar.gz && rm ~/hfville/ville-sync.tar.gz"
-
-            rm -f /tmp/ville-sync.tar.gz
-          else
-            echo "Config-only deploy, skipping image transfer"
-          fi
-
-          # Start/restart services
-          ssh $SSH_OPTS "$SSH_USER@$JUMP_BOX" \
-            "cd ~/hfville && sudo docker compose up -d"
-
-          echo "HF Ville deployment complete!"

@@ -92,10 +92,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create HF Ville pool. Phase 5 Ville cutover (#76, 2026-04-30) repointed
     // this from the legacy `?options=-csearch_path%3Dville` (ville schema in
-    // hotelnew, fed by ville_sync FreeTDS poll) to the new `hotelville`
-    // database (fed by sync-hfville CT watcher). Now uses `VilleDbConfig`
-    // verbatim — VILLE_DB_SERVER / _PORT / _NAME / _USER / _PASSWORD env
-    // vars drive the connection.
+    // hotelnew, formerly fed by the retired ville_sync FreeTDS poll — see
+    // task #77) to the new `hotelville` database (fed by sync-hfville CT
+    // watcher). Now uses `VilleDbConfig` verbatim — VILLE_DB_SERVER / _PORT /
+    // _NAME / _USER / _PASSWORD env vars drive the connection.
     let ville_pool = if config.ville_db.enabled {
         let ville_conn = config.ville_db.connection_string();
         match sqlx::postgres::PgPoolOptions::new()

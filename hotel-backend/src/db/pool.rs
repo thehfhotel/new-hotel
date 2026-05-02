@@ -41,8 +41,7 @@ const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Pool settings:
 /// - max connections: 20 (configurable via `MSSQL_POOL_MAX_SIZE`,
 ///   legacy `DB_POOL_MAX` still honored). Sized for the shared
-///   writeback + sync + ville-sync workload — see
-///   `DbConfig::from_env`.
+///   writeback + sync workload — see `DbConfig::from_env`.
 /// - port: 1433 by default, override via `MSSQL_PORT` (HF Ville uses
 ///   1436 — its SS2025 Express instance does not listen on the
 ///   default port).

@@ -14,8 +14,10 @@ services:
     volumes:
       - newdb_data:/var/lib/postgresql/data
       - ./init-db:/docker-entrypoint-initdb.d:ro
-    ports:
-      - "10.10.10.4:5441:5439"  # Expose on WireGuard interface for ville_sync push
+    # No host-port publish: ville_sync (the only external consumer of the
+    # WG-exposed 10.10.10.4:5441 mapping) was retired in task #77 once Phase
+    # 5 Ville cutover repointed reads at the local `hotelville` PG database.
+    # newdb is now reachable only on the internal `hotel-network` bridge.
     networks:
       - hotel-network
     healthcheck:
