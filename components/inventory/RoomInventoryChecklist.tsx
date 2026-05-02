@@ -249,7 +249,7 @@ export default function RoomInventoryChecklist({
               {/* Error Message */}
               {error && (
                 <div className="flex items-center gap-2 p-3 bg-red-500/10 border border-red-500 rounded-lg text-red-600 text-sm">
-                  <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+                  <AlertTriangle className="w-4 h-4 shrink-0" />
                   {error}
                 </div>
               )}

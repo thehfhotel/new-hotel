@@ -1,6 +1,70 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: var(--font-sarabun), Sarabun, Helvetica Neue, Arial, sans-serif;
+
+  --text-xs: 11px;
+  --text-xs--line-height: 14px;
+  --text-sm: 12px;
+  --text-sm--line-height: 16px;
+  --text-base: 13px;
+  --text-base--line-height: 18px;
+  --text-lg: 15px;
+  --text-lg--line-height: 20px;
+  --text-xl: 17px;
+  --text-xl--line-height: 22px;
+  --text-2xl: 20px;
+  --text-2xl--line-height: 26px;
+
+  --color-brand-50: #fbeaea;
+  --color-brand-100: #f5c9c9;
+  --color-brand-300: #c76060;
+  --color-brand-500: #8b0000;
+  --color-brand-600: #7a0000;
+  --color-brand-700: #6b1212;
+  --color-brand-800: #4f0e0e;
+
+  --color-shell: #f5f6f7;
+  --color-panel: #ffffff;
+  --color-headerBar: #eff1f2;
+  --color-rowAlt: #fafafb;
+  --color-border: #d5d9dd;
+  --color-borderStrong: #89919a;
+  --color-text: #32363a;
+  --color-textMuted: #6a6d70;
+  --color-success: #107e3e;
+  --color-warning: #e9730c;
+  --color-error: #bb0000;
+  --color-info: #0a6ed1;
+
+  --radius: 2px;
+  --radius-none: 0;
+  --radius-sm: 2px;
+  --radius-md: 2px;
+  --radius-lg: 2px;
+  --radius-xl: 2px;
+  --radius-2xl: 2px;
+  --radius-3xl: 2px;
+  --radius-full: 9999px;
+}
+
+/*
+  The default border color has changed to `currentcolor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+}
 
 /* Brand palette + SAP Fiori shell tokens. Mirror tailwind.config.ts so plain
    CSS (datepicker overrides, third-party widgets) can use them. */

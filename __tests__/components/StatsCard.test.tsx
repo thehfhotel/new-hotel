@@ -26,7 +26,7 @@ describe('StatsCard Component', () => {
     const card = container.firstChild as HTMLElement
     expect(card.className).toContain('bg-white')
     expect(card.className).toContain('border-gray-100')
-    expect(card.className).toContain('shadow-sm')
+    expect(card.className).toContain('shadow-xs')
     expect(card.className).not.toContain('bg-zinc-900')
     expect(card.className).not.toContain('border-zinc-800')
   })

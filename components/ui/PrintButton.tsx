@@ -102,7 +102,7 @@ export default function PrintButton({
   return (
     <div className="relative inline-block no-print">
       {/* Main Button Group */}
-      <div className="inline-flex rounded-lg shadow-sm">
+      <div className="inline-flex rounded-lg shadow-xs">
         {/* Print Button */}
         <button
           onClick={handlePrint}

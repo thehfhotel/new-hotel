@@ -144,7 +144,7 @@ export default function ReportsPage() {
   const RevenueTooltip = ({ active, payload, label }: { active?: boolean; payload?: { value: number; dataKey: string }[]; label?: string }) => {
     if (active && payload && payload.length) {
       return (
-        <div className="bg-white p-3 rounded-lg border border-gray-300 shadow-sm">
+        <div className="bg-white p-3 rounded-lg border border-gray-300 shadow-xs">
           <p className="text-sm font-medium text-gray-900">{label}</p>
           {payload.map((entry, index) => (
             <p key={index} className="text-sm text-gray-500">
@@ -165,7 +165,7 @@ export default function ReportsPage() {
     if (active && payload && payload.length) {
       const data = payload[0].payload
       return (
-        <div className="bg-white p-3 rounded-lg border border-gray-300 shadow-sm">
+        <div className="bg-white p-3 rounded-lg border border-gray-300 shadow-xs">
           <p className="text-sm font-medium text-gray-900">{data.roomType}</p>
           <p className="text-sm text-gray-500">
             รายได้: <span className="font-medium">{formatCurrency(data.revenue)}</span>
@@ -217,7 +217,7 @@ export default function ReportsPage() {
                   endDate={endDate}
                   onChange={(update) => setDateRange(update)}
                   placeholderText="เลือกช่วงวันที่"
-                  className="w-48 px-3 py-2 border-0 focus:ring-0 text-sm focus:outline-none bg-white text-gray-800"
+                  className="w-48 px-3 py-2 border-0 focus:ring-0 text-sm focus:outline-hidden bg-white text-gray-800"
                   dateFormat="dd/MM/yyyy"
                   isClearable
                 />
@@ -267,7 +267,7 @@ export default function ReportsPage() {
       {/* Error Message */}
       {error && (
         <div className="flex items-center gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-600">
-          <AlertCircle className="w-5 h-5 flex-shrink-0" />
+          <AlertCircle className="w-5 h-5 shrink-0" />
           <span>{error}</span>
         </div>
       )}

@@ -167,7 +167,7 @@ export default function ChangelogPage() {
           {releases.map((release) => (
             <div
               key={release.tag}
-              className="bg-white rounded-lg shadow border border-gray-200 overflow-hidden"
+              className="bg-white rounded-lg shadow-sm border border-gray-200 overflow-hidden"
             >
               {/* Release Header */}
               <div className="bg-gray-50 px-6 py-4 border-b border-gray-200">

@@ -111,7 +111,7 @@ function PanelShell({
   children: React.ReactNode
 }) {
   return (
-    <section className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
+    <section className="bg-white rounded-xl shadow-xs border border-gray-200 overflow-hidden">
       <header className="flex items-center justify-between px-4 py-3 border-b border-gray-100 bg-gray-50">
         <div className="flex items-center gap-2 text-gray-700 font-medium">
           {icon}

@@ -21,7 +21,7 @@ const Input = forwardRef<HTMLInputElement, InputProps>(
           )}
           <input
             ref={ref}
-            className={`w-full bg-panel border rounded-[2px] h-7 px-2 text-[13px] text-text placeholder:text-textMuted transition-colors focus:outline-none focus:border-brand-500 ${
+            className={`w-full bg-panel border rounded-[2px] h-7 px-2 text-[13px] text-text placeholder:text-textMuted transition-colors focus:outline-hidden focus:border-brand-500 ${
               icon ? 'pl-7' : ''
             } ${error ? 'border-error' : 'border-borderStrong'} ${className}`}
             {...props}

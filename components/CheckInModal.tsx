@@ -203,7 +203,7 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
               value={firstName}
               onChange={(e) => { setFirstName(e.target.value); clearPicked() }}
               required
-              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-500"
+              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-hidden focus:ring-2 focus:ring-red-500"
             />
           </div>
 
@@ -215,7 +215,7 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
               type="text"
               value={lastName}
               onChange={(e) => { setLastName(e.target.value); clearPicked() }}
-              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-500"
+              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-hidden focus:ring-2 focus:ring-red-500"
             />
           </div>
 
@@ -228,7 +228,7 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
               value={phone}
               onChange={(e) => { setPhone(e.target.value); clearPicked() }}
               placeholder="เช่น 0812345678"
-              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-500"
+              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-hidden focus:ring-2 focus:ring-red-500"
             />
             {phoneMatches.length > 0 && pickedCustomerId === null && (
               <ul className="absolute z-10 left-0 right-0 mt-1 bg-white border border-gray-300 rounded shadow-lg max-h-40 overflow-y-auto">
@@ -254,7 +254,7 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
               type="text"
               value={idCard}
               onChange={(e) => setIdCard(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-500"
+              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-hidden focus:ring-2 focus:ring-red-500"
             />
           </div>
 
@@ -268,7 +268,7 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
                 min={1}
                 value={adults}
                 onChange={(e) => setAdults(Math.max(1, parseInt(e.target.value) || 1))}
-                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-500"
+                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-hidden focus:ring-2 focus:ring-red-500"
               />
             </div>
             <div>
@@ -280,7 +280,7 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
                 min={0}
                 value={children}
                 onChange={(e) => setChildren(Math.max(0, parseInt(e.target.value) || 0))}
-                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-500"
+                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-hidden focus:ring-2 focus:ring-red-500"
               />
             </div>
           </div>
@@ -295,13 +295,13 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
               value={expectedCheckout}
               onChange={(e) => setExpectedCheckout(e.target.value)}
               required
-              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-red-500"
+              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-hidden focus:ring-2 focus:ring-red-500"
             />
           </div>
 
           {error && (
             <div className="flex items-start p-3 bg-red-50 border border-red-200 rounded text-sm text-red-700">
-              <AlertCircle size={16} className="mr-2 flex-shrink-0 mt-0.5" />
+              <AlertCircle size={16} className="mr-2 shrink-0 mt-0.5" />
               {error}
             </div>
           )}
