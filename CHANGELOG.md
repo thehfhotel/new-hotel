@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.56.2] - 2026-05-03
+
+### Changed
+
+- **Bumped `lucide-react` from `^0.469.0` to `^1.14.0`.** This is the
+  upstream's first stable v1 release (Oct 2026) plus all subsequent
+  v1.x patches. Supersedes Dependabot PR #43 (which only reached 1.14.0
+  by aiming at the same target).
+
+  Audit results from this repo:
+  - 84 unique icon imports across 53 frontend files (`app/`,
+    `components/`). Every single one still exists in v1.14.0 — no
+    renames required, no code changes to import statements.
+  - The "numbered alias" icons we rely on (`BarChart3`, `CheckCircle2`,
+    `Edit2`, `Edit3`, `Grid3X3`, `Loader2`) are all still exported.
+  - The v1.x release notes' renames (`text-select` →
+    `square-dashed-text`, etc.) do not touch any icon we use.
+
+  What does change between 0.469 and 1.x — but does not require code
+  changes from us:
+  - Brand icons removed (we use none).
+  - `aria-hidden="true"` is now set on every icon by default (better
+    a11y; visual unchanged).
+  - UMD build dropped, ESM/CJS only (we consume via the bundler so this
+    is a no-op).
+  - New context-provider API for setting default props app-wide
+    (available; not yet adopted).
+
+  Verified locally: `pnpm test:components` → 621/621 passing,
+  `pnpm build` → green with no TypeScript errors.
+
 ## [2.56.1] - 2026-05-03
 
 ### Changed
@@ -18,7 +49,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `lucide-react`). Supersedes Dependabot PR #40 which only bumped
   `react` + `@types/react` and left `react-dom` / `@types/react-dom`
   out of lockstep. All 621 component tests pass; `pnpm build` clean.
-
 ## [2.56.0] - 2026-05-01
 
 ### Changed
