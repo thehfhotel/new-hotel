@@ -1,6 +1,6 @@
 {
   "name": "new-hotel",
-  "version": "2.56.2",
+  "version": "2.56.3",
   "private": true,
   "scripts": {
     "dev": "next dev -p 3003",
@@ -20,7 +20,7 @@
     "react": "^19.2.5",
     "react-datepicker": "^9.1.0",
     "react-dom": "^19.2.5",
-    "recharts": "^2.15.0"
+    "recharts": "^3.8.1"
   },
   "devDependencies": {
     "@playwright/test": "^1.58.2",

@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.56.3] - 2026-05-03
+
+### Changed
+
+- **Bumped `recharts` from `^2.15.0` (was 2.15.4 installed) to `^3.8.1`** to
+  pick up the v3 line. Supersedes the dependabot proposal in PR #41 (which
+  also targeted 3.8.1 — this branch tracks the same version but ships the
+  required v3 API migrations rather than just bumping the lockfile).
+
+  Two chart-bearing files were touched for the v3 breaking changes:
+
+  - `components/Charts.tsx:340-344` — `<Pie label>` callback signature
+    changed in v3. The callback now receives a `PieLabelRenderProps` object
+    where the source datum lives under `props.payload`, not flattened onto
+    the root. Rewrote the inline `({ roomType, percentage }) => …` arrow
+    to read `props.payload` and guard the `undefined` case before
+    formatting `${roomType} (${percentage}%)`.
+
+  - `app/reports/page.tsx:401-405` — same `<Pie label>` signature fix,
+    typed against the local `RoomTypeRevenue` interface.
+
+  - `app/reports/page.tsx:460` — `<Tooltip formatter>` now types its
+    `value` parameter as `ValueType | undefined` instead of `number`.
+    Dropped the `(value: number)` annotation, let TS infer, and added a
+    `value ?? 0` fallback so the existing `${value} รายการ` string
+    rendering is preserved.
+
+  Tooltip/Legend custom-content components were unaffected (we already
+  type props inline via destructuring, not through the renamed
+  `TooltipProps` → `TooltipContentProps` import). No use of removed v3
+  props (`activeIndex`, `Pie blendStroke`, `Legend payload`,
+  `Reference alwaysShow`/`isFront`, `Area animateNewValues`). Multiple
+  YAxis ordering change does not affect `RevenueChart` (default `yAxisId`
+  `0` sorts before custom `right`, matching prior visual order).
+
+  All 621 component tests pass; production build succeeds. Visuals on
+  the reports page were not verified in a real browser by this change —
+  reviewer should spot-check the pie-slice labels and the line-chart
+  tooltip on `/reports` once deployed to dev.
+
 ## [2.56.2] - 2026-05-03
 
 ### Changed

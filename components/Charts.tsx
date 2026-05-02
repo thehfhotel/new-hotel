@@ -331,7 +331,11 @@ export function PieChart({
               cx="50%"
               cy="50%"
               labelLine={false}
-              label={({ roomType, percentage }) => `${roomType} (${percentage.toFixed(0)}%)`}
+              label={(props: { payload?: PieChartData }) => {
+                const entry = props.payload
+                if (!entry) return ''
+                return `${entry.roomType} (${entry.percentage.toFixed(0)}%)`
+              }}
               outerRadius={100}
               fill="#8884d8"
               dataKey="revenue"
