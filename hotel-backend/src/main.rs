@@ -276,12 +276,12 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route("/api/rooms", get(routes::rooms::list_rooms))
         .route("/api/rooms/status", get(routes::rooms::get_room_status))
         .route("/api/rooms/checkouts-today", get(routes::rooms::get_checkouts_today))
-        .route("/api/rooms/:id", get(routes::rooms::get_room))
+        .route("/api/rooms/{id}", get(routes::rooms::get_room))
         // Legacy booking routes (PG-only, Phase 8 — reads `ht_bookings_legacy` mirror)
         .route("/api/bookings", get(routes::bookings::list_bookings))
-        .route("/api/bookings/:id", get(routes::bookings::get_booking))
+        .route("/api/bookings/{id}", get(routes::bookings::get_booking))
         .route(
-            "/api/bookings/:id/notes",
+            "/api/bookings/{id}/notes",
             get(routes::bookings::get_notes)
                 .post(routes::bookings::create_note)
                 .delete(routes::bookings::delete_note),
@@ -290,8 +290,8 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route("/api/checkins", get(routes::checkins::list_checkins))
         // Legacy customers routes (PG-only, Phase 8 — reads `ht_customers_legacy` mirror)
         .route("/api/customers", get(routes::customers::list_customers))
-        .route("/api/customers/:id/bookings", get(routes::customers::get_customer_bookings))
-        .route("/api/customers/:id/stats", get(routes::customers::get_customer_stats))
+        .route("/api/customers/{id}/bookings", get(routes::customers::get_customer_bookings))
+        .route("/api/customers/{id}/stats", get(routes::customers::get_customer_stats))
         // Stats route (PG-only, Phase 8 — reads `ht_*_legacy` mirrors)
         .route("/api/stats", get(routes::stats::get_stats))
         // Occupancy route (PG-only, Phase 8 — reads `ht_checkins_legacy` mirror)
@@ -310,45 +310,45 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route("/api/new/stats", get(routes::new_stats::get_stats))
         // New customers CRUD
         .route("/api/new/customers", get(routes::new_customers::list_customers).post(routes::new_customers::create_customer))
-        .route("/api/new/customers/:id", get(routes::new_customers::get_customer).put(routes::new_customers::update_customer).delete(routes::new_customers::delete_customer))
+        .route("/api/new/customers/{id}", get(routes::new_customers::get_customer).put(routes::new_customers::update_customer).delete(routes::new_customers::delete_customer))
         // New rooms CRUD
         .route("/api/new/rooms", get(routes::new_rooms::list_rooms).post(routes::new_rooms::create_room))
-        .route("/api/new/rooms/:id", get(routes::new_rooms::get_room).put(routes::new_rooms::update_room))
-        .route("/api/new/rooms/:id/status", patch(routes::new_rooms::update_room_status))
+        .route("/api/new/rooms/{id}", get(routes::new_rooms::get_room).put(routes::new_rooms::update_room))
+        .route("/api/new/rooms/{id}/status", patch(routes::new_rooms::update_room_status))
         // New bookings CRUD
         .route("/api/new/bookings", get(routes::new_bookings::list_bookings).post(routes::new_bookings::create_booking))
-        .route("/api/new/bookings/:id", get(routes::new_bookings::get_booking).put(routes::new_bookings::update_booking))
-        .route("/api/new/bookings/:id/cancel", put(routes::new_bookings::cancel_booking))
+        .route("/api/new/bookings/{id}", get(routes::new_bookings::get_booking).put(routes::new_bookings::update_booking))
+        .route("/api/new/bookings/{id}/cancel", put(routes::new_bookings::cancel_booking))
         // New check-ins CRUD
         .route("/api/new/checkins", get(routes::new_checkins::list_checkins).post(routes::new_checkins::create_checkin))
-        .route("/api/new/checkins/:id", get(routes::new_checkins::get_checkin))
-        .route("/api/new/checkins/:id/checkout", put(routes::new_checkins::checkout))
+        .route("/api/new/checkins/{id}", get(routes::new_checkins::get_checkin))
+        .route("/api/new/checkins/{id}/checkout", put(routes::new_checkins::checkout))
         // Guest registry
-        .route("/api/new/checkins/:id/guests", get(routes::new_checkins::list_guests).post(routes::new_checkins::create_guest))
-        .route("/api/new/checkins/:id/guests/:guest_id", delete(routes::new_checkins::delete_guest))
+        .route("/api/new/checkins/{id}/guests", get(routes::new_checkins::list_guests).post(routes::new_checkins::create_guest))
+        .route("/api/new/checkins/{id}/guests/{guest_id}", delete(routes::new_checkins::delete_guest))
         // Room types CRUD
         .route("/api/new/room-types", get(routes::new_room_types::list_room_types).post(routes::new_room_types::create_room_type))
-        .route("/api/new/room-types/:id", get(routes::new_room_types::get_room_type).put(routes::new_room_types::update_room_type).delete(routes::new_room_types::delete_room_type))
+        .route("/api/new/room-types/{id}", get(routes::new_room_types::get_room_type).put(routes::new_room_types::update_room_type).delete(routes::new_room_types::delete_room_type))
         // Rates CRUD
         .route("/api/new/rates", get(routes::new_rates::list_rates).post(routes::new_rates::create_rate))
-        .route("/api/new/rates/:id", get(routes::new_rates::get_rate).put(routes::new_rates::update_rate).delete(routes::new_rates::delete_rate))
+        .route("/api/new/rates/{id}", get(routes::new_rates::get_rate).put(routes::new_rates::update_rate).delete(routes::new_rates::delete_rate))
         // Reports
         .route("/api/new/reports/revenue", get(routes::new_reports::get_revenue))
         .route("/api/new/reports/occupancy", get(routes::new_reports::get_occupancy))
         .route("/api/new/reports/revenue-by-room-type", get(routes::new_reports::get_revenue_by_room_type))
         // Invoice
-        .route("/api/new/checkins/:id/invoice", get(routes::new_invoice::get_invoice))
+        .route("/api/new/checkins/{id}/invoice", get(routes::new_invoice::get_invoice))
         // Payments
-        .route("/api/new/checkins/:id/payments", get(routes::new_payments::list_payments).post(routes::new_payments::create_payment))
-        .route("/api/new/payments/:id", delete(routes::new_payments::void_payment))
+        .route("/api/new/checkins/{id}/payments", get(routes::new_payments::list_payments).post(routes::new_payments::create_payment))
+        .route("/api/new/payments/{id}", delete(routes::new_payments::void_payment))
         // Inventory Management
         .route("/api/new/inventory/categories", get(routes::new_inventory::list_categories).post(routes::new_inventory::create_category))
         .route("/api/new/inventory/items", get(routes::new_inventory::list_items).post(routes::new_inventory::create_item))
-        .route("/api/new/inventory/items/:id", get(routes::new_inventory::get_item).put(routes::new_inventory::update_item).delete(routes::new_inventory::delete_item))
+        .route("/api/new/inventory/items/{id}", get(routes::new_inventory::get_item).put(routes::new_inventory::update_item).delete(routes::new_inventory::delete_item))
         .route("/api/new/inventory/rooms", get(routes::new_inventory::list_inventory_rooms))
-        .route("/api/new/inventory/rooms/:room_id", get(routes::new_inventory::get_room_inventory).put(routes::new_inventory::update_room_inventory))
-        .route("/api/new/inventory/rooms/:room_id/check", axum::routing::post(routes::new_inventory::check_room_inventory))
-        .route("/api/new/inventory/rooms/:room_id/replenish", axum::routing::post(routes::new_inventory::replenish_room_inventory))
+        .route("/api/new/inventory/rooms/{room_id}", get(routes::new_inventory::get_room_inventory).put(routes::new_inventory::update_room_inventory))
+        .route("/api/new/inventory/rooms/{room_id}/check", axum::routing::post(routes::new_inventory::check_room_inventory))
+        .route("/api/new/inventory/rooms/{room_id}/replenish", axum::routing::post(routes::new_inventory::replenish_room_inventory))
         .route("/api/new/inventory/adjustments", axum::routing::post(routes::new_inventory::create_stock_adjustment))
         .route("/api/new/inventory/transactions", get(routes::new_inventory::list_transactions).post(routes::new_inventory::create_transaction))
         .route("/api/new/inventory/stats", get(routes::new_inventory::get_stats))
@@ -356,8 +356,8 @@ fn build_new_routes(app_state: AppState) -> Router {
         // Maintenance Management
         .route("/api/new/maintenance/categories", get(routes::new_maintenance::list_categories))
         .route("/api/new/maintenance/requests", get(routes::new_maintenance::list_requests).post(routes::new_maintenance::create_request))
-        .route("/api/new/maintenance/requests/:id", get(routes::new_maintenance::get_request).put(routes::new_maintenance::update_request))
-        .route("/api/new/maintenance/requests/:id/status", put(routes::new_maintenance::update_request_status))
+        .route("/api/new/maintenance/requests/{id}", get(routes::new_maintenance::get_request).put(routes::new_maintenance::update_request))
+        .route("/api/new/maintenance/requests/{id}/status", put(routes::new_maintenance::update_request_status))
         // Sync status
         .route("/api/new/sync/status", get(routes::new_sync::get_sync_status))
         // Real-time domain-event stream (Phase 4a per architecture.md §3.6e).
