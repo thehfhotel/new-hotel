@@ -148,6 +148,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.0
 
+      # MUST run before "Initialize database" — that step shells `psql`,
+      # which is in `postgresql-client` and isn't pre-installed on the
+      # self-hosted runner the way it was on github-hosted ubuntu-latest.
+      # Also installs mold + clang, both required by hotel-backend's
+      # `-fuse-ld=mold` linker pin in `.cargo/config.toml`.
+      # `apt-get install -y` is idempotent so re-runs on a warm runner skip
+      # already-installed packages.
+      - name: Install build + test prerequisites
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mold clang postgresql-client
+
       - name: Initialize database
         env:
           PGPASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
@@ -160,15 +170,6 @@ jobs:
         uses: dtolnay/rust-toolchain@193d6aa1dbbc28bd2c0a6b0e327cfdce68baaf6e  # 1.89
         with:
           toolchain: "1.89"
-
-      # hotel-backend/.cargo/config.toml pins `-fuse-ld=mold` for x86_64-linux
-      # so local + Docker builds link fast. The runner may not have mold or
-      # clang pre-installed; same goes for `psql` once we moved off the
-      # github-hosted ubuntu-latest image (which ships postgresql-client).
-      # `apt-get install -y` is idempotent so re-runs on a warm self-hosted
-      # runner skip already-installed packages.
-      - name: Install build + test prerequisites
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mold clang postgresql-client
 
       # sccache wraps every rustc invocation and caches its output keyed on the
       # exact crate inputs. It complements Swatinem/rust-cache (which caches
@@ -266,7 +267,7 @@ jobs:
         ports:
           - 5439:5439
         options: >-
-          --name new-hotel-db
+          --name drift-check-db
           --health-cmd "pg_isready -U postgres -p 5439"
           --health-interval 10s
           --health-timeout 5s
@@ -275,8 +276,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.0
 
-      # Self-hosted runner may not ship postgresql-client by default
-      # (github-hosted ubuntu-latest did). `apt-get install -y` is idempotent.
+      # MUST run before "Apply init-db seed" — that step shells `psql`,
+      # which is in `postgresql-client` and isn't pre-installed on the
+      # self-hosted runner (github-hosted ubuntu-latest shipped it).
+      # `apt-get install -y` is idempotent.
       - name: Install psql
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
 
@@ -292,9 +295,12 @@ jobs:
 
       - name: Run migrate.sh against seeded database
         env:
-          # migrate.sh shells `docker exec new-hotel-db ...`. The service
-          # container above is named `new-hotel-db` via `--name`; expose the
-          # same auth env so the inner psql can connect.
+          # migrate.sh shells `docker exec ${DB_CONTAINER:-new-hotel-db} ...`.
+          # The service container is renamed `drift-check-db` here to avoid
+          # colliding with the prod `new-hotel-db` container that lives on
+          # the same self-hosted runner host (post-Phase-7 self-hosted
+          # migration). DB_CONTAINER overrides the default for this step.
+          DB_CONTAINER: drift-check-db
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
           POSTGRES_DB: hotelnew

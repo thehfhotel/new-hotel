@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.55.1] - 2026-05-02
+
+### Fixed
+
+- **CI: two leftover bugs from the v2.54.31 self-hosted-runner migration
+  surfaced the moment a deploy-trigger commit (#44) needed both
+  `test-backend` and `init-db-migrations-drift-check` to pass.** Both
+  jobs failed pre-deploy, blocking the ville_sync retirement
+  rollout from reaching evergreen. Production was unchanged (gate
+  worked as designed); fix below restores the pipeline.
+
+  **Bug 1 — `test-backend` step ordering.** The "Install build + test
+  prerequisites" step (which apt-installs `postgresql-client`) was
+  written AFTER the "Initialize database" step that shells `psql`. On
+  github-hosted ubuntu-latest the order didn't matter because the
+  image ships psql; on the self-hosted runner the apt-install is the
+  only source. Reordered so prereqs install first.
+
+  **Bug 2 — `init-db-migrations-drift-check` container-name collision.**
+  The service-container `--name new-hotel-db` clashes with the prod
+  `new-hotel-db` PostgreSQL container that lives on the same evergreen
+  host as the runner. Docker daemon refused to create the second
+  container with that name, killing the job before it could even start
+  Postgres. Renamed the service container to `drift-check-db` (unique)
+  and set `DB_CONTAINER=drift-check-db` on the migrate.sh step so the
+  script targets the right container — `migrate.sh` already supports
+  the env-var override (`DB_CONTAINER="${DB_CONTAINER:-new-hotel-db}"`),
+  so prod behaviour is unchanged.
+
+  Both fixes are within the workflow file only; no code, schema, or
+  migrate.sh changes were needed.
+
 ## [2.55.0] - 2026-05-02
 
 ### Removed
