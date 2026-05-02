@@ -27,7 +27,7 @@ path = "src/bin/backfill_rooms.rs"
 
 [dependencies]
 # Web framework (matches Tauri middleware)
-axum = "0.7"
+axum = "0.8"
 # Tokio: explicit minimal feature list (was "full", trimmed for faster builds).
 # - macros: #[tokio::main], #[tokio::test]
 # - rt-multi-thread: multi-threaded runtime + Runtime::new() in migrate_legacy bin
