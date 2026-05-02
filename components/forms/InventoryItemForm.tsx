@@ -196,7 +196,7 @@ export default function InventoryItemForm({
               {/* Error Message */}
               {error && (
                 <div className="flex items-center gap-2 p-3 bg-red-50 border border-red-200 rounded-lg text-red-600">
-                  <AlertCircle className="w-5 h-5 flex-shrink-0" />
+                  <AlertCircle className="w-5 h-5 shrink-0" />
                   <span className="text-sm">{error}</span>
                 </div>
               )}
@@ -214,7 +214,7 @@ export default function InventoryItemForm({
                   onChange={handleInputChange}
                   placeholder="เช่น AMT-001, MNB-001"
                   maxLength={20}
-                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors uppercase"
+                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors uppercase"
                   required
                 />
                 <p className="mt-1 text-xs text-gray-500">รหัสสินค้า (ไม่เกิน 20 ตัวอักษร)</p>
@@ -232,7 +232,7 @@ export default function InventoryItemForm({
                   value={formData.itemName}
                   onChange={handleInputChange}
                   placeholder="กรอกชื่อสินค้า"
-                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                   required
                 />
               </div>
@@ -247,7 +247,7 @@ export default function InventoryItemForm({
                   name="category"
                   value={formData.category}
                   onChange={handleInputChange}
-                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                   required
                 >
                   {INVENTORY_CATEGORIES.map((cat) => (
@@ -268,7 +268,7 @@ export default function InventoryItemForm({
                   name="unit"
                   value={formData.unit}
                   onChange={handleInputChange}
-                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                   required
                 >
                   <option value="">-- เลือกหน่วยนับ --</option>
@@ -293,7 +293,7 @@ export default function InventoryItemForm({
                     onChange={handleInputChange}
                     placeholder="0"
                     min="0"
-                    className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                    className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                   />
                 </div>
                 <div>
@@ -307,7 +307,7 @@ export default function InventoryItemForm({
                     onChange={handleInputChange}
                     placeholder="0"
                     min="0"
-                    className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                    className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                   />
                 </div>
               </div>
@@ -326,7 +326,7 @@ export default function InventoryItemForm({
                   placeholder="0"
                   min="0"
                   step="0.01"
-                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                 />
               </div>
 
@@ -343,7 +343,7 @@ export default function InventoryItemForm({
                     onChange={handleInputChange}
                     className="sr-only peer"
                   />
-                  <div className="w-11 h-6 bg-gray-100 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-red-500/50 rounded-full peer peer-checked:after:translate-x-full rtl:peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-red-600"></div>
+                  <div className="w-11 h-6 bg-gray-100 peer-focus:outline-hidden peer-focus:ring-4 peer-focus:ring-red-500/50 rounded-full peer peer-checked:after:translate-x-full peer-checked:rtl:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:inset-s-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-red-600"></div>
                 </label>
               </div>
             </div>

@@ -251,14 +251,14 @@ export default function RoomsPage() {
             <div className="flex items-center bg-gray-100 rounded-lg p-1">
               <button
                 onClick={() => setViewMode('grid')}
-                className={`p-2 rounded ${viewMode === 'grid' ? 'bg-white shadow' : 'text-gray-500 hover:text-gray-700'}`}
+                className={`p-2 rounded ${viewMode === 'grid' ? 'bg-white shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
                 title="มุมมองตาราง"
               >
                 <Grid3X3 className="h-5 w-5" />
               </button>
               <button
                 onClick={() => setViewMode('list')}
-                className={`p-2 rounded ${viewMode === 'list' ? 'bg-white shadow' : 'text-gray-500 hover:text-gray-700'}`}
+                className={`p-2 rounded ${viewMode === 'list' ? 'bg-white shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
                 title="มุมมองรายการ"
               >
                 <List className="h-5 w-5" />
@@ -275,7 +275,7 @@ export default function RoomsPage() {
         </div>
 
         {/* Filters */}
-        <div className="bg-white rounded-lg shadow p-4">
+        <div className="bg-white rounded-lg shadow-sm p-4">
           <div className="flex items-center space-x-2 mb-4">
             <Filter className="h-5 w-5 text-gray-500" />
             <span className="font-medium text-gray-700">ตัวกรอง</span>
@@ -342,7 +342,7 @@ export default function RoomsPage() {
             ))}
           </div>
         ) : (
-          <div className="bg-white rounded-lg shadow overflow-hidden">
+          <div className="bg-white rounded-lg shadow-sm overflow-hidden">
             <div className="overflow-x-auto">
               <table className="min-w-full divide-y divide-gray-200">
                 <thead className="bg-gray-50">

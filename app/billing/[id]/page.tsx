@@ -142,7 +142,7 @@ export default function InvoiceDetailPage({
         {/* Error Message */}
         <div className="flex flex-col items-center justify-center min-h-[300px]">
           <div className="flex items-center gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-600 max-w-md">
-            <AlertCircle className="w-6 h-6 flex-shrink-0" />
+            <AlertCircle className="w-6 h-6 shrink-0" />
             <div>
               <p className="font-medium">เกิดข้อผิดพลาด</p>
               <p className="text-sm">{error}</p>

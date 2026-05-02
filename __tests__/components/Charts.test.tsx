@@ -65,7 +65,7 @@ describe('OccupancyChart Component', () => {
     render(<OccupancyChart data={mockData} />)
 
     const container = screen.getByTestId('responsive-container').closest('.bg-white')
-    expect(container).toHaveClass('rounded-xl', 'shadow-sm')
+    expect(container).toHaveClass('rounded-xl', 'shadow-xs')
   })
 })
 
@@ -144,6 +144,6 @@ describe('PieChart Component', () => {
     render(<PieChart data={mockData} />)
 
     const container = screen.getByTestId('responsive-container').closest('.bg-white')
-    expect(container).toHaveClass('rounded-xl', 'shadow-sm')
+    expect(container).toHaveClass('rounded-xl', 'shadow-xs')
   })
 })

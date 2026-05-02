@@ -319,7 +319,7 @@ export default function RateForm({
               {/* Error Message */}
               {error && (
                 <div className="flex items-center gap-2 p-3 bg-red-50 border border-red-200 rounded-lg text-red-600">
-                  <AlertCircle className="w-5 h-5 flex-shrink-0" />
+                  <AlertCircle className="w-5 h-5 shrink-0" />
                   <span className="text-sm">{error}</span>
                 </div>
               )}
@@ -336,7 +336,7 @@ export default function RateForm({
                   value={formData.rateName}
                   onChange={handleInputChange}
                   placeholder="เช่น Weekend Special, Low Season"
-                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                   required
                 />
               </div>
@@ -351,7 +351,7 @@ export default function RateForm({
                   name="roomTypeId"
                   value={formData.roomTypeId ?? ''}
                   onChange={handleInputChange}
-                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                   required
                 >
                   <option value="">-- เลือกประเภทห้อง --</option>
@@ -411,7 +411,7 @@ export default function RateForm({
                   min={formData.rateType === 'multiplier' ? '0.1' : '1'}
                   max={formData.rateType === 'multiplier' ? '2.0' : undefined}
                   step={formData.rateType === 'multiplier' ? '0.01' : '1'}
-                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                   required
                 />
                 {formData.rateType === 'multiplier' && (
@@ -464,7 +464,7 @@ export default function RateForm({
                     name="validFrom"
                     value={formData.validFrom}
                     onChange={handleInputChange}
-                    className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                    className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                     required
                   />
                   {formData.validFrom && (
@@ -484,7 +484,7 @@ export default function RateForm({
                     value={formData.validTo}
                     onChange={handleInputChange}
                     min={formData.validFrom || undefined}
-                    className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                    className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                     required
                   />
                   {formData.validTo && (
@@ -560,7 +560,7 @@ export default function RateForm({
                     onChange={handleInputChange}
                     className="sr-only peer"
                   />
-                  <div className="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-red-500/30 rounded-full peer peer-checked:after:translate-x-full rtl:peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-gray-400 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-red-600"></div>
+                  <div className="w-11 h-6 bg-gray-200 peer-focus:outline-hidden peer-focus:ring-4 peer-focus:ring-red-500/30 rounded-full peer peer-checked:after:translate-x-full peer-checked:rtl:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:inset-s-[2px] after:bg-white after:border-gray-400 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-red-600"></div>
                 </label>
               </div>
             </div>

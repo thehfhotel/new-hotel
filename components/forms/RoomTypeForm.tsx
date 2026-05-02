@@ -199,7 +199,7 @@ export default function RoomTypeForm({
               {/* Error Message */}
               {error && (
                 <div className="flex items-center gap-2 p-3 bg-red-50 border border-red-200 rounded-lg text-red-600">
-                  <AlertCircle className="w-5 h-5 flex-shrink-0" />
+                  <AlertCircle className="w-5 h-5 shrink-0" />
                   <span className="text-sm">{error}</span>
                 </div>
               )}
@@ -217,7 +217,7 @@ export default function RoomTypeForm({
                   onChange={handleInputChange}
                   placeholder="เช่น STD, DLX, SUI"
                   maxLength={20}
-                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors uppercase"
+                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors uppercase"
                   required
                 />
                 <p className="mt-1 text-xs text-gray-500">รหัสประเภทห้อง (ไม่เกิน 20 ตัวอักษร)</p>
@@ -235,7 +235,7 @@ export default function RoomTypeForm({
                   value={formData.typeName}
                   onChange={handleInputChange}
                   placeholder="กรอกชื่อประเภทห้อง"
-                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                   required
                 />
               </div>
@@ -252,7 +252,7 @@ export default function RoomTypeForm({
                   value={formData.typeNameEn}
                   onChange={handleInputChange}
                   placeholder="Enter English name"
-                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                 />
               </div>
 
@@ -268,7 +268,7 @@ export default function RoomTypeForm({
                   onChange={handleInputChange}
                   placeholder="กรอกรายละเอียดประเภทห้อง"
                   rows={3}
-                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors resize-none"
+                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors resize-none"
                 />
               </div>
 
@@ -286,7 +286,7 @@ export default function RoomTypeForm({
                   placeholder="0"
                   min="0"
                   step="0.01"
-                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                 />
               </div>
 
@@ -304,7 +304,7 @@ export default function RoomTypeForm({
                   placeholder="2"
                   min="1"
                   max="20"
-                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                 />
               </div>
 
@@ -318,7 +318,7 @@ export default function RoomTypeForm({
                   name="bedType"
                   value={formData.bedType}
                   onChange={handleInputChange}
-                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                 >
                   <option value="">-- เลือกประเภทเตียง --</option>
                   {bedTypes.map((bed) => (
@@ -343,7 +343,7 @@ export default function RoomTypeForm({
                   placeholder="0"
                   min="0"
                   step="0.01"
-                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                 />
               </div>
 
@@ -360,7 +360,7 @@ export default function RoomTypeForm({
                     onChange={handleInputChange}
                     className="sr-only peer"
                   />
-                  <div className="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-red-500/30 rounded-full peer peer-checked:after:translate-x-full rtl:peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-gray-400 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-red-600"></div>
+                  <div className="w-11 h-6 bg-gray-200 peer-focus:outline-hidden peer-focus:ring-4 peer-focus:ring-red-500/30 rounded-full peer peer-checked:after:translate-x-full peer-checked:rtl:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:inset-s-[2px] after:bg-white after:border-gray-400 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-red-600"></div>
                 </label>
               </div>
             </div>

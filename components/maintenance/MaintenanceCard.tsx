@@ -110,7 +110,7 @@ export default function MaintenanceCard({
 
   return (
     <div
-      className={`${colors.bg} ${colors.border} border rounded-xl p-4 shadow-sm hover:shadow-md relative`}
+      className={`${colors.bg} ${colors.border} border rounded-xl p-4 shadow-xs hover:shadow-md relative`}
     >
       {/* Header with Title and Priority */}
       <div className="flex items-start justify-between mb-2">

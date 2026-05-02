@@ -149,7 +149,7 @@ export default function CardReaderPage() {
         </div>
 
         {/* Connection Status */}
-        <div className="bg-white rounded-lg shadow p-4 mb-6">
+        <div className="bg-white rounded-lg shadow-sm p-4 mb-6">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <Server size={20} className="text-gray-500" />
@@ -180,7 +180,7 @@ export default function CardReaderPage() {
         {connectionStatus === 'disconnected' && (
           <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-6 mb-6">
             <div className="flex items-start gap-4">
-              <Terminal size={32} className="text-yellow-600 flex-shrink-0 mt-1" />
+              <Terminal size={32} className="text-yellow-600 shrink-0 mt-1" />
               <div className="flex-1">
                 <h3 className="font-semibold text-yellow-800 mb-2">ต้องติดตั้ง Middleware</h3>
                 <p className="text-yellow-700 text-sm mb-4">
@@ -253,7 +253,7 @@ export default function CardReaderPage() {
         {readStatus === 'error' && (
           <div className="bg-red-50 rounded-lg p-8">
             <div className="flex items-start gap-4">
-              <AlertCircle size={48} className="text-red-500 flex-shrink-0" />
+              <AlertCircle size={48} className="text-red-500 shrink-0" />
               <div>
                 <h3 className="text-red-700 font-semibold text-lg mb-2">เกิดข้อผิดพลาด</h3>
                 <p className="text-red-600 mb-4">{errorMessage}</p>
@@ -270,11 +270,11 @@ export default function CardReaderPage() {
 
         {/* Success State - Card Data Display */}
         {readStatus === 'success' && cardData && (
-          <div className="bg-white rounded-lg shadow">
+          <div className="bg-white rounded-lg shadow-sm">
             <div className="p-6">
               <div className="flex gap-6">
                 {/* Photo */}
-                <div className="flex-shrink-0">
+                <div className="shrink-0">
                   {cardData.photo ? (
                     <img
                       src={`data:image/jpeg;base64,${cardData.photo}`}
@@ -289,7 +289,7 @@ export default function CardReaderPage() {
                 </div>
 
                 {/* Card Information */}
-                <div className="flex-grow">
+                <div className="grow">
                   <h2 className="text-lg font-semibold mb-4 border-b pb-2">ข้อมูลบัตร</h2>
 
                   <div className="space-y-3">

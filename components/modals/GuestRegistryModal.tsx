@@ -264,7 +264,7 @@ export default function GuestRegistryModal({
             {/* TM.30 Notice */}
             <div className="mb-4 p-3 bg-amber-500/5 border border-amber-900/30 rounded-lg">
               <div className="flex items-start gap-2">
-                <FileText className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
+                <FileText className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
                 <div className="text-sm text-amber-700">
                   <p className="font-medium">สำหรับการแจ้ง ต.ม.30</p>
                   <p className="text-amber-600">กรุณาลงทะเบียนผู้เข้าพักทุกคนที่พักในห้อง รวมถึงข้อมูลบัตรประชาชน/พาสปอร์ต</p>
@@ -275,7 +275,7 @@ export default function GuestRegistryModal({
             {/* Error Message */}
             {error && (
               <div className="mb-4 flex items-center gap-2 p-3 bg-red-50 border border-red-200 rounded-lg text-red-600">
-                <AlertCircle className="w-5 h-5 flex-shrink-0" />
+                <AlertCircle className="w-5 h-5 shrink-0" />
                 <span className="text-sm">{error}</span>
               </div>
             )}
@@ -376,7 +376,7 @@ export default function GuestRegistryModal({
                       value={formData.firstName}
                       onChange={handleInputChange}
                       placeholder="กรอกชื่อ"
-                      className="w-full px-3 py-2 bg-white border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                      className="w-full px-3 py-2 bg-white border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                       required
                     />
                   </div>
@@ -393,7 +393,7 @@ export default function GuestRegistryModal({
                       value={formData.lastName}
                       onChange={handleInputChange}
                       placeholder="กรอกนามสกุล"
-                      className="w-full px-3 py-2 bg-white border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                      className="w-full px-3 py-2 bg-white border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                     />
                   </div>
 
@@ -410,7 +410,7 @@ export default function GuestRegistryModal({
                       onChange={handleInputChange}
                       placeholder="กรอกเลขบัตรประชาชน"
                       maxLength={13}
-                      className="w-full px-3 py-2 bg-white border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors font-mono"
+                      className="w-full px-3 py-2 bg-white border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors font-mono"
                     />
                   </div>
 
@@ -426,7 +426,7 @@ export default function GuestRegistryModal({
                       value={formData.passport}
                       onChange={handleInputChange}
                       placeholder="กรอกหมายเลขพาสปอร์ต"
-                      className="w-full px-3 py-2 bg-white border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors font-mono"
+                      className="w-full px-3 py-2 bg-white border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors font-mono"
                     />
                   </div>
 
@@ -440,7 +440,7 @@ export default function GuestRegistryModal({
                       name="nationality"
                       value={formData.nationality}
                       onChange={handleInputChange}
-                      className="w-full px-3 py-2 bg-white border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-colors"
+                      className="w-full px-3 py-2 bg-white border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                     >
                       {nationalities.map((nat) => (
                         <option key={nat} value={nat}>
