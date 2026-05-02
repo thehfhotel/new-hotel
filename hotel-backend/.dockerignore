@@ -1,7 +1,7 @@
-# Backend build context — pin tightly. The Dockerfile + Dockerfile.ville-sync
-# both `COPY . .` from `./hotel-backend`, so anything not excluded here
-# travels into the build daemon (slower builds, bigger cache hits, and
-# more bytes for an exfil if the builder is ever compromised).
+# Backend build context — pin tightly. The Dockerfile `COPY . .` from
+# `./hotel-backend`, so anything not excluded here travels into the build
+# daemon (slower builds, bigger cache hits, and more bytes for an exfil if
+# the builder is ever compromised).
 
 target/
 .git/

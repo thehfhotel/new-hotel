@@ -5,6 +5,77 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.55.0] - 2026-05-02
+
+### Removed
+
+- **Phase 7 — retired the legacy `ville_sync` FreeTDS hash-polling
+  infrastructure (task #77).** Phase 5 Ville cutover (#76, 2026-04-30)
+  repointed the backend's `ville_pool` from the old `hotelnew.ville.*`
+  cache to the new `hotelville` PG database (fed by the central
+  `sync-hfville` Change-Tracking watcher). Strangler-pattern soak
+  defined in ADR 0001 Q5 (~1 week of clean cutover operation) was
+  shortened to 48 h after evidence proved acceptable: 21 WARN-level
+  bb8 connection timeouts in 48 h (two transient bursts on 2026-05-01
+  09:05 UTC and 2026-05-02 05:55 UTC, all 16 tables hit in sequence
+  consistent with brief Ville MSSQL connectivity drops), zero ERROR
+  events, watcher recovers automatically each retry cycle, watermark
+  advanced cleanly from 651 → 1880 (1200+ events processed). The
+  `ville-sync` container on the Ville jumpbox would have hit the same
+  transients (same MSSQL endpoint over the same WireGuard path), so
+  keeping it adds no resilience — only operational surface area.
+
+  Files deleted:
+  - `hotel-backend/src/bin/ville_sync.rs` — the FreeTDS-based
+    hash-polling worker (1299 lines).
+  - `hotel-backend/Dockerfile.ville-sync` — separate image build for
+    that bin (82 lines).
+  - `deploy/hfville/` — entire jumpbox compose stack
+    (`docker-compose.yml` + `init-db/init-hfville.sql`, 172 lines).
+
+  `hotel-backend/Cargo.toml` drops the `[[bin]] ville_sync` entry. No
+  dependencies were removable: `ville_sync.rs` only used crates
+  (`chrono`, `sha2`, `sqlx`, `tokio time`) that are still used by the
+  remaining workers (`bin/sync.rs`, `bin/writeback.rs`,
+  `writeback/fingerprint.rs`, etc.).
+
+  `.github/workflows/docker-build.yml` drops the `build-ville-sync` and
+  `deploy-hfville` jobs, the `hfville` paths-filter entry, and the
+  `cache-from: type=gha,scope=ville-sync` GHA cache scope. The Ville
+  jumpbox is no longer addressed by CI; the `room-daily-reporter`
+  workload it hosts (different project) is unaffected.
+
+  `docker-compose.yml` drops the `10.10.10.4:5441:5439` host-port
+  publish on `newdb` — that mapping existed solely to expose PG to the
+  Ville jumpbox over WireGuard for the `ville_sync` push.
+
+  `migrations/pg/025_drop_ville_schema.sql` (NEW) drops the now-orphaned
+  `ville` schema in `hotelnew` via `DROP SCHEMA IF EXISTS ville
+  CASCADE`. Migration 010 stays in the repo for archaeology; 025 is its
+  rollback companion. `init-db/init-hotelnew.sql` is updated: fresh
+  deploys skip migration 010's DDL outright (no point creating tables
+  we'd immediately drop) and seed both `010` + `025` rows in
+  `schema_migrations` so the init-db ↔ migrations drift-check stays
+  green.
+
+  GitHub Secrets to be cleaned up manually (pipeline no longer
+  references them; flagged for operator deletion in the GH Secrets UI):
+  - `HFVILLE_SSH_KEY`
+  - `HFVILLE_SSH_HOST`
+  - `HFVILLE_SSH_USER`
+  (`HFVILLE_PG_PASSWORD` and `HFVILLE_MSSQL_PASSWORD` are also no
+  longer used by this pipeline, but verify no other workflow references
+  them before removal.)
+
+  Doc updates: `CLAUDE.md`, `docs/architecture.md`,
+  `hotel-backend/README.md`, `hotel-backend/.dockerignore`,
+  `hotel-backend/src/{main.rs,config.rs,db/pool.rs}`, and
+  `.github/dependabot.yml` had stale `ville_sync` / `ville-sync`
+  references rewritten to reflect the post-cutover topology
+  (HF Ville now uses the same `bin/sync.rs` CT watcher with per-site
+  env). `docs/runbook-cutover-hfville.md` left untouched (historical
+  cutover playbook).
+
 ## [2.54.33] - 2026-04-30
 
 ### Changed

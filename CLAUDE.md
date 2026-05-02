@@ -8,7 +8,7 @@ Summary:
 - Stay-current stack: Rust+Axum backend, Next.js 16 frontend, PostgreSQL, legacy MSSQL.
 - PostgreSQL is the source of truth from day one. Legacy MSSQL is an external sink.
 - Layered architecture inside the decommission boundary: `domain/` → `repository/` (PG-only) → `service/` (business logic + outbox emission) → thin `routes/`.
-- Adapter workers OUTSIDE the boundary: `bin/writeback.rs` (LISTEN'er → MSSQL via tiberius), `bin/sync.rs` (Change Tracking watcher → publishes events), `bin/ville_sync.rs` (existing).
+- Adapter workers OUTSIDE the boundary: `bin/writeback.rs` (LISTEN'er → MSSQL via tiberius), `bin/sync.rs` (Change Tracking watcher → publishes events; serves both HF Hotel and HF Ville via per-site env).
 - Event-driven sync via PG `LISTEN/NOTIFY` + SQL Server Change Tracking. Sub-second latency target.
 - Three operational states (today / transition / decommissioned) controlled by env vars only — no code changes between states.
 

@@ -137,7 +137,8 @@ State C (decommissioned): Only our app                — sync + writeback both 
         │  – TOGGLE: LEGACY_SYNC_ENABLED       │
         └──────────────────────────────────────┘
         
-        Plus: bin/ville_sync.rs (existing, cross-site)
+        Note: bin/ville_sync.rs retired (task #77, 2026-04-30) post Ville cutover.
+        HF Ville now uses the same bin/sync.rs CT watcher via per-site env.
 ```
 
 The double-walled box (`╔ ... ╗`) is the **decommission boundary**. Everything inside survives the legacy app's removal. Everything outside (the workers + the legacy MSSQL) gets turned off without touching application code.
@@ -1106,7 +1107,7 @@ hotel-backend/src/
 │   ├── api.rs                 ◀── EXISTING main.rs renamed (HTTP server only)
 │   ├── writeback.rs           ★ NEW — LISTEN loop, dispatcher
 │   ├── sync.rs                ★ NEW — separate scheduler binary (pulled out of API process)
-│   └── ville_sync.rs          ◀── EXISTING (unchanged)
+│   └── (ville_sync.rs removed task #77 — HF Ville now uses bin/sync.rs)
 │
 ├── db/                        ◀── EXISTING (PG + MSSQL connection helpers)
 ├── error.rs                   – unified error types
@@ -1301,7 +1302,7 @@ Phase 4b (writeback worker) is the bigger lift but doesn't affect the UI behavio
 | Database 2 (Legacy MSSQL) | External system. Eventually retired. |
 | `routes/*.rs` | Stays but **thinned** — calls service, returns DTOs. |
 | `scheduler/sync.rs` | Stays but **moves** to `bin/sync.rs`. Reconcile logic added. |
-| `bin/ville_sync.rs` | Stays unchanged. |
+| `bin/ville_sync.rs` | **Retired (task #77, 2026-04-30)** — HF Ville now uses the same `bin/sync.rs` CT watcher with per-site env. |
 | `main.rs` mode logic | Goes away — replaced by clean layer boundaries. |
 | **NEW: `domain/`** | Pure types, no I/O |
 | **NEW: `repository/`** | PG-only SQL behind traits |
