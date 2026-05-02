@@ -398,7 +398,11 @@ export default function ReportsPage() {
                   paddingAngle={2}
                   dataKey="revenue"
                   nameKey="roomType"
-                  label={({ roomType, percentage }) => `${roomType} (${percentage.toFixed(0)}%)`}
+                  label={(props: { payload?: RoomTypeRevenue }) => {
+                    const entry = props.payload
+                    if (!entry) return ''
+                    return `${entry.roomType} (${entry.percentage.toFixed(0)}%)`
+                  }}
                   labelLine={false}
                 >
                   {roomTypeRevenue.map((entry, index) => (
@@ -453,7 +457,7 @@ export default function ReportsPage() {
                   border: '1px solid #e5e7eb',
                   borderRadius: '8px',
                 }}
-                formatter={(value: number) => [`${value} รายการ`, 'จำนวนการจอง']}
+                formatter={(value) => [`${value ?? 0} รายการ`, 'จำนวนการจอง']}
               />
               <Line
                 type="monotone"
