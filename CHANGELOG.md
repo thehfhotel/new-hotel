@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.56.0] - 2026-05-01
+
+### Changed
+
+- **Backend: bumped `axum` 0.7.9 → 0.8.9** (latest stable, supersedes
+  Dependabot PR #32 which proposed the same bump but without applying
+  the required code migration). Pulled `axum-core` 0.4 → 0.5 and
+  `tower-http` 0.5 → 0.6 in lockstep so they share the same `http`
+  1.x family. Lockfile re-resolved, `cargo check --workspace --locked`
+  clean, all 342 unit + bin tests pass; integration tests defer to
+  CI's postgres service container as usual.
+
+  **Breaking change handled — path-parameter syntax migration**
+  (`matchit` 0.7 → 0.8, axum #2645): every route declared with the
+  old `/:param` / `/*rest` syntax now panics at startup. Migrated
+  all 24 affected routes in `hotel-backend/src/main.rs` (`/api/...`)
+  to the new `{param}` form, e.g.:
+
+  ```diff
+  - .route("/api/new/checkins/:id/guests/:guest_id", delete(...))
+  + .route("/api/new/checkins/{id}/guests/{guest_id}", delete(...))
+  ```
+
+  No call-site changes were needed inside route handlers — the
+  `Path<T>` extractor and `#[derive(Deserialize)]` field names work
+  identically; only the `route()` literal had to change. Frontend
+  HTTP clients are untouched (they already issue concrete URLs like
+  `/api/new/checkins/123`, not pattern strings).
+
+  No `axum-extra`, `axum-macros`, websocket, multipart, or `Host`
+  extractor usage in the codebase, so the other 0.8 breaking
+  changes (Host moved to `axum-extra`, `Option<Path>` rejection
+  semantics, `WebSocket::close` removal, `axum::extract::ws::Message`
+  switching to `Bytes`/`Utf8Bytes`, mandatory `Sync` on handlers)
+  required no edits. `cargo check`, `cargo test --no-run`, and the
+  unit + bin test runs all passed without warnings introduced by
+  this bump.
+
+  No `sqlx::query!()` SQL strings changed, so the `.sqlx/` offline
+  cache is still valid — no `cargo sqlx prepare` rerun needed; the
+  CI image build with `SQLX_OFFLINE=true` will continue to work.
+
 ## [2.55.2] - 2026-05-02
 
 ### Fixed
