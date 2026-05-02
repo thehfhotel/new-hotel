@@ -446,12 +446,33 @@ jobs:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.0
 
-      - name: Log in to Container Registry
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121  # v4.1.0
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      # Inline retry loop instead of docker/login-action: the snap-installed
+      # docker daemon on evergreen periodically returns "network is
+      # unreachable" on outbound TCP to ghcr.io's IP (`20.205.243.164`) due
+      # to snap's mount-namespace shim flapping under container churn.
+      # Symptoms: ~30 % of `docker login` / `docker pull` calls fail
+      # immediately with ENETUNREACH while host curl to the same IP works
+      # fine. This is a band-aid until snap-docker is replaced with
+      # Docker CE (planned, requires a maintenance window). 5 attempts
+      # with 5/10/15/20s linear backoff covers the worst flap windows
+      # we've observed (~60 s); failing the whole step after that is the
+      # right outcome.
+      - name: Log in to Container Registry (retry-wrapped)
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin; then
+              echo "ghcr login OK on attempt $attempt"
+              exit 0
+            fi
+            sleep_s=$((attempt * 5))
+            echo "::warning::ghcr login attempt $attempt failed; retrying in ${sleep_s}s (snap-docker network flap workaround)"
+            sleep $sleep_s
+          done
+          echo "::error::ghcr login failed after 5 attempts; investigate snap-docker on evergreen"
+          exit 1
 
       - name: Deploy
         env:
@@ -527,6 +548,31 @@ jobs:
           } > .env
           chmod 600 .env
 
+          # ----- ghcr.io retry helper ------------------------------------
+          # Same snap-docker workaround documented on the login step above:
+          # `docker compose pull` calls go through the same daemon and hit
+          # the same intermittent ENETUNREACH on ghcr.io. Wrap each pull in
+          # 5 attempts with linear backoff. Without this, a single dropped
+          # connection during pull silently fails the whole deploy because
+          # `set -e` is in effect.
+          # Caller passes the full subcommand after `docker compose`,
+          # i.e. `retry_compose_pull pull` or
+          # `retry_compose_pull --profile legacy pull writeback`. This keeps
+          # the original argument order intact (compose is picky: profile
+          # flags come before the verb, service names after).
+          retry_compose_pull() {
+            for attempt in 1 2 3 4 5; do
+              if docker compose "$@"; then
+                return 0
+              fi
+              sleep_s=$((attempt * 5))
+              echo "::warning::compose pull (args: $*) attempt $attempt failed; retrying in ${sleep_s}s (snap-docker network flap)"
+              sleep $sleep_s
+            done
+            echo "::error::compose pull (args: $*) failed after 5 attempts"
+            return 1
+          }
+
           # ----- container-state helpers ----------------------------------
           # `wait_healthy` polls a container's healthcheck until it reports
           # "healthy" (or, for services without a healthcheck, until the
@@ -563,7 +609,7 @@ jobs:
           # an expand/contract sequence, OR the operator must scale
           # backend to 0 first, migrate, then redeploy. This step does
           # not auto-handle that case.
-          docker compose pull
+          retry_compose_pull pull
           docker compose up -d newdb
 
           echo "Waiting for database to be healthy..."
@@ -585,7 +631,7 @@ jobs:
           # — so without this step the worker keeps running OLD code
           # while the backend is fresh, which is how a 2026-04-25 incident
           # produced bookings missing back-population.
-          docker compose --profile legacy pull writeback
+          retry_compose_pull --profile legacy pull writeback
           docker compose --profile legacy up -d --force-recreate writeback
 
           # Force-recreate the CT-watcher worker (Phase 5.5). Same image as
@@ -595,7 +641,7 @@ jobs:
           # state is "exited" — that's intentional, not a failure. The
           # operator flips LEGACY_SYNC_ENABLED=true after running --bootstrap;
           # see docs/runbook-sync.md.
-          docker compose --profile legacy pull sync
+          retry_compose_pull --profile legacy pull sync
           docker compose --profile legacy up -d --force-recreate sync
 
           # Phase 5 (Ville) worker pair — same image, different env (Ville
@@ -606,7 +652,7 @@ jobs:
           # intentional until task #74 (bootstrap) flips the switch.
           # Force-recreate so a fresh image rollout actually swaps the
           # running binary, same reasoning as the legacy profile above.
-          docker compose --profile hfville pull sync-hfville writeback-hfville
+          retry_compose_pull --profile hfville pull sync-hfville writeback-hfville
           docker compose --profile hfville up -d --force-recreate sync-hfville writeback-hfville
 
           echo "Deployment complete!"

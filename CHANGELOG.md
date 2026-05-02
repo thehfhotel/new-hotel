@@ -5,6 +5,55 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.55.2] - 2026-05-02
+
+### Fixed
+
+- **CI deploy: retry-wrapped `docker login` and `docker compose pull`
+  in the `deploy` job** to mask the snap-docker network-shim flap on
+  evergreen. After 4 manual `gh run rerun` cycles to land the v2.55.1
+  deploy, the daemon-log evidence pointed at snap confinement (not the
+  network or ghcr.io itself):
+
+  ```
+  docker.dockerd[1385115]: Handler for POST /v1.54/auth returned error:
+    Get "https://ghcr.io/v2/": dial tcp 20.205.243.164:443:
+    connect: network is unreachable
+  ```
+
+  ~30 % of outbound TCP attempts from snap-confined dockerd return
+  `ENETUNREACH` immediately while `curl` from the same shell to the
+  same IP works fine — a classic snap-mount-namespace artifact.
+  Also visible in dmesg: `error="copy shim log" error="read
+  /proc/self/fd/138: file already closed"` and `write unix
+  /var/run/docker.sock->@: write: broken pipe` during container churn.
+
+  The proper fix is to migrate from `snap install docker` (canonical
+  29.3.1) to apt Docker CE (`get.docker.com`). That's a planned
+  ~45-minute maintenance window with `pg_dump newdb` insurance — too
+  risky to do under CI pressure.
+
+  Workflow-only band-aid: 5 attempts with 5/10/15/20s linear backoff
+  on every ghcr.io operation in the `deploy` job. Covers the worst
+  flap window observed (~60 s). Build jobs (`build-frontend`,
+  `build-backend`) still use the unwrapped `docker/login-action`
+  because they use docker buildx, which has a different network path
+  and hasn't hit the issue. If they start failing, extend the same
+  pattern there.
+
+  - `Log in to Container Registry` step: replaced `docker/login-action`
+    call with an inline `for attempt in 1..5` loop wrapping
+    `echo $GHCR_TOKEN | docker login ghcr.io --password-stdin`.
+  - `Deploy` step: added `retry_compose_pull()` bash function near
+    `wait_healthy()`, then swapped all 4 `docker compose pull` calls
+    to use it (top-level pull + 3 profile-scoped pulls for writeback,
+    sync, and the hfville pair).
+
+  Net effect: deploys self-heal through the snap-docker flap. Each
+  failed attempt logs a `::warning::` so we can still see the
+  underlying issue is not gone, just papered over until the CE
+  migration.
+
 ## [2.55.1] - 2026-05-02
 
 ### Fixed
