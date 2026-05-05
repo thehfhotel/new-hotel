@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.56.5] - 2026-05-05
+
+### Added
+
+- **Phase 1 CI/CD modernization artifacts** — `scripts/deploy/run-deploy.sh`
+  + `docs/runbook-deploy-modernization.md`. Documents and implements the
+  upgrade from "self-hosted runner IS prod, deploy as `nut` with full sudo"
+  to "GH-hosted runner SSHes via Cloudflare Access service token to a
+  dedicated `deploy` user, whose authorized_keys forces a single root-owned
+  script."
+
+  Files added are passive — `.github/workflows/docker-build.yml` is
+  intentionally NOT changed in this version. The workflow swap is a
+  separate follow-up (step 7 of the runbook) that only happens after the
+  evergreen-side setup (steps 1–6) is verified working manually. So the
+  current self-hosted-runner pipeline keeps running unchanged; the new
+  files are reference + future use.
+
+  Hardening applied vs. typical SSH-deploy patterns: `restrict` directive
+  + forced-command in `authorized_keys` (deploy key can ONLY trigger the
+  script), `flock`-based mutex against concurrent deploys, scoped `umask
+  077` only around `.env` write, payload size cap at 16 MB to bound OOM
+  risk, `KbdInteractiveAuthentication no` alongside `PasswordAuthentication
+  no` in a fragment file under `sshd_config.d/`, CF Access service-token
+  credentials passed via `TUNNEL_SERVICE_TOKEN_*` env vars (not CLI flags
+  — keeps secrets out of `/proc/<pid>/cmdline`).
+
+  Independent code review surfaced 4 must-fix issues (umask placement,
+  `/var/log/deploy` ownership, sed regex BRE/ERE confusion, missing
+  `KbdInteractiveAuthentication`) — all addressed before this commit.
+
+  Phase 1 is one part of a broader plan (Phases 0–9) toward eventually
+  flipping the repo public; this is the first concrete deliverable.
+
 ## [2.56.4] - 2026-05-03
 
 ### Changed
