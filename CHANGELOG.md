@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.57.2] - 2026-05-05
+
+### Added
+
+- **Phase 1 soak-substitute test (#tests 1+2)** — `migrations/pg/026_phase1_soak_no_op.sql`
+  is a pure no-op migration (`SELECT 1 WHERE FALSE`) that triggers the
+  full backend deploy path:
+  - `changes` filter sees `migrations/pg/**` → backend filter fires
+  - `init-db-migrations-drift-check` runs (deploy filter also fires) →
+    must pass
+  - `test-backend` runs → must pass
+  - `build-backend` runs → produces a new image SHA (functionally
+    identical, but recreates the container on deploy)
+  - `deploy` step runs migrate.sh → applies migration → seeds
+    schema_migrations row
+  - Backend container is force-recreated (or recreated by image-SHA
+    change), healthcheck verifies it stays healthy
+
+  All paths the v2.57.1 deploy DIDN'T exercise (it was workflow + script
+  + docs only). Combined with manual flock + rollback drills already
+  done, this substitutes for the 2-week natural-traffic soak window
+  the runbook originally proposed.
+
+  Migration is safe to leave permanently or remove later — `SELECT 1
+  WHERE FALSE` returns no rows and modifies nothing. If removed, the
+  schema_migrations row stays (benign; migrate.sh tolerates extra rows).
+
 ## [2.57.1] - 2026-05-05
 
 ### Fixed

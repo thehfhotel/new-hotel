@@ -1107,6 +1107,12 @@ INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('025', '025_drop_ville_schema.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
+-- Migration 026 — Phase 1 deploy-pipeline soak test. Pure no-op
+-- (`SELECT 1 WHERE FALSE`); seeded here for drift-check parity.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('026', '026_phase1_soak_no_op.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
 -- =============================================================================
 -- Initialization complete
 -- =============================================================================
