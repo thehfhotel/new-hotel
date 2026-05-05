@@ -5,6 +5,65 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.57.0] - 2026-05-05
+
+### Changed
+
+- **Phase 1 CI/CD modernization landed: workflow refactored to GitHub-hosted
+  runners + SSH-based deploy.** Replaces the v2.54.31 self-hosted-runner
+  setup that ran ALL jobs on evergreen and inlined ~250 lines of deploy
+  shell in the workflow YAML.
+
+  All 6 jobs (`changes`, `test-frontend`, `test-backend`,
+  `init-db-migrations-drift-check`, `build-frontend`, `build-backend`,
+  `deploy`) now `runs-on: ubuntu-latest`. Build/test jobs run in parallel
+  again (~4 min wall vs. ~12 min on the serial self-hosted runner). No
+  more snap-docker network flap blocking builds.
+
+  Deploy job is rewritten end-to-end. New flow:
+  1. Install `cloudflared` on the runner (curl from GitHub releases)
+  2. Install ed25519 SSH key + pinned host key from GH Secrets
+     (`EVERGREEN_DEPLOY_SSH_KEY`, `EVERGREEN_HOST_KEY`)
+  3. tar up deploy artifacts (`docker-compose.yml`, `init-db/`,
+     `migrations/pg/`, `scripts/migrate.sh`)
+  4. `jq -n` builds JSON payload: `{commit_sha, deploy_payload_b64,
+     env: {...all secrets...}}`
+  5. Pipe to `ssh deploy@evergreen.thehfhotel.org` over the existing
+     `asgard` cloudflared tunnel (no CF Access app gates the hostname,
+     so no service token needed — verified via CF Access API)
+  6. Forced-command in `deploy@`'s `authorized_keys` runs
+     `/srv/run-deploy.sh` (root-owned, mode 755). The SSH key cannot
+     execute anything else.
+
+  Compared to the old setup:
+  - **No more "the runner IS prod"**: workflow can no longer shell out
+    arbitrary commands on evergreen
+  - **No password SSH**: hardening fragment in
+    `/etc/ssh/sshd_config.d/00-hardening.conf` disables
+    `PasswordAuthentication`, `KbdInteractiveAuthentication`,
+    `ChallengeResponseAuthentication`
+  - **No root deploys**: `deploy` user is in the `docker` group; nothing
+    else
+  - **Snap-docker reliability isolated**: still flaky, but only the deploy
+    step on evergreen sees it (and the `retry_compose` helper in
+    `/srv/run-deploy.sh` masks it). Build/test on github-hosted is
+    pristine. Snap → apt CE migration becomes optional, not blocking.
+
+  Verified pre-merge:
+  - SSH transport tested end-to-end (Phase 6a in runbook): cloudflared
+    tunnel → SSH key auth as `deploy` → forced-command runs script →
+    JSON validation rejects malformed payload cleanly. Proves auth
+    + transport + script all work; full deploy via this commit is the
+    integration test.
+
+  Self-hosted runner stays REGISTERED but disabled for the next 2 weeks
+  as the rollback path. After 14 days of green deploys via the new flow,
+  fully deregister per `docs/runbook-deploy-modernization.md` step 8.
+
+  Setup recipe captured in `docs/runbook-deploy-modernization.md` (added
+  in v2.56.5). All steps 2–6 of that runbook are complete; this commit
+  is step 7.
+
 ## [2.56.5] - 2026-05-05
 
 ### Added
