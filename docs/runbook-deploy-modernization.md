@@ -79,11 +79,15 @@ SSH to evergreen as `nut` via your existing CF Access path. Run as root:
 sudo useradd --create-home --shell /bin/bash --comment "GitHub Actions deploy" deploy
 sudo usermod -aG docker deploy
 
-# 3b. Move the prod deploy directory; chown to the new user
-sudo mkdir -p /srv
-sudo mv /home/nut/new-hotel-production /srv/new-hotel-production
-sudo ln -s /srv/new-hotel-production /home/nut/new-hotel-production   # muscle-memory parity
-sudo chown -R deploy:deploy /srv/new-hotel-production
+# 3b. Move the prod deploy directory under /home/deploy; chown to the new user.
+# IMPORTANT: must live under /home/, /media/, or /mnt/ — the snap-confined
+# `docker` package on this host CANNOT see /srv/, /opt/, /var/, or arbitrary
+# paths. `docker compose pull` from /srv/new-hotel-production silently returns
+# "no configuration file provided: not found" even with the file present and
+# readable. /home/deploy/ keeps the dir under the deploy user's namespace.
+sudo mv /home/nut/new-hotel-production /home/deploy/new-hotel-production
+sudo ln -s /home/deploy/new-hotel-production /home/nut/new-hotel-production   # muscle-memory parity
+sudo chown -R deploy:deploy /home/deploy/new-hotel-production
 
 # 3c. Install the deploy script (root-owned, mode 755 — workflow can run, can't modify)
 sudo install -m 755 -o root -g root \
