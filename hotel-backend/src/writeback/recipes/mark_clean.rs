@@ -14,7 +14,7 @@
 //! 2. INSERT INTO HT_Housewife (h_name, h_room, h_date, h_note, h_cin, h_cin_name)
 //!    VALUES ('Admin', '306', '4/24/2026 6:50:59 PM', '',
 //!            'CH26-005159',                           -- prior real check-in
-//!            'สุภัตร์ตรา พุทธกูล')                    -- prior customer name
+//!            '<REDACTED-real-guest-name>')                    -- prior customer name
 //! ```
 //!
 //! Spike §3j critical findings:
@@ -146,7 +146,7 @@ mod tests {
     fn build_statements_matches_spike_capture_with_prior() {
         let prior = PriorOccupant {
             cin_no: "CH26-005159".into(),
-            customer_full_name: "สุภัตร์ตรา พุทธกูล".into(),
+            customer_full_name: "<REDACTED-real-guest-name>".into(),
         };
         let statements = build_statements(6, "306", "Admin", Some(&prior));
         assert_eq!(statements.len(), 2);
@@ -156,7 +156,7 @@ mod tests {
         );
         assert!(statements[1].contains("INSERT INTO HT_Housewife"));
         assert!(statements[1].contains("'CH26-005159'"));
-        assert!(statements[1].contains("'สุภัตร์ตรา พุทธกูล'"));
+        assert!(statements[1].contains("'<REDACTED-real-guest-name>'"));
         assert!(statements[1].contains("'Admin'"));
         assert!(statements[1].contains("'306'"));
     }
