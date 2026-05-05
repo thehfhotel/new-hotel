@@ -198,7 +198,7 @@ Tell receptionist the .NET app is fine (we didn't touch it) and the new-app's HF
 - **Phase 5.5 (Ville)** mirror feature — that's task #80, separate maintenance window weeks later.
 - **Backups + DR drill** (#79) — set up after cutover stabilizes.
 - **Permanent retirement of ville_sync code + deploy/hfville/ directory** — task #77, done after 1 week of clean cutover state.
-- **Move MSSQL off VLAN 10 guest WiFi at Ville** — separate security concern, defer to Phase 8 ops hardening.
+- **Move MSSQL off the network segment an internal segment at Ville** — separate security concern, defer to Phase 8 ops hardening.
 
 ## References
 

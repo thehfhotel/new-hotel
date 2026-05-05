@@ -40,14 +40,14 @@ If a cross-site query is ever needed (corporate dashboard), it can come from a t
 The codebase auditor pushed back on "central" with: tiberius/bb8 today has no `connection_timeout` and no circuit-breaker, so a 60-second WG tunnel drop turns into a 60-deep bb8 acquire queue with no alert.
 
 Resolution: **keep central**, but mitigate at two layers:
-- **Network layer**: WG path `evergreen → MikroTik DNAT → MSSQL` instead of Tailscale-direct-to-Windows-desktop. WG is purpose-built network gear (RouterOS kernel WG, no userspace daemon, no sleep, no Windows update interference). Today the WG link has 87 GiB throughput history at audit time and 11+ d jumpbox uptime. (See `docs/runbook-sync.md` and `ville_constraint.md` for the WG path.)
+- **Network layer**: WG path `evergreen → the edge router DNAT → MSSQL` instead of Tailscale-direct-to-Windows-desktop. WG is purpose-built network gear (RouterOS kernel WG, no userspace daemon, no sleep, no Windows update interference). Today the WG link has 87 GiB throughput history at audit time and 11+ d jumpbox uptime. (See `docs/runbook-sync.md` and `ville_constraint.md` for the WG path.)
 - **App layer**: task #68 adds `MSSQL_PORT` env, bb8 `connection_timeout` + `acquire_timeout`, tiberius socket timeout. Application-level circuit breaker that's independent of network.
 
 Re-evaluate Q2 only if Ville's WAN proves unreliable (>1 outage/quarter that the WG path can't survive).
 
 ### Q3 — Tailscale subnet routing
 
-`desktop-0be5led` advertises no subnet routes. Two options were considered: enable `192.168.11.0/24` advertising via Tailscale admin, OR rely on the WG path through the jumpbox. WG was chosen because `192.168.11.0/24` is the **guest WiFi VLAN** (per HF Ville network repo `vlan-analysis.md`) and exposing the whole subnet is contrary to the network's isolation intent. The WG path scopes routing to `<ville-mssql-host>/32` — only MSSQL, nothing else.
+`desktop-0be5led` advertises no subnet routes. Two options were considered: enable `<ville-lan>` advertising via Tailscale admin, OR rely on the WG path through the jumpbox. WG was chosen because `<ville-lan>` is the **an internal network segment** (per HF Ville network repo `vlan-analysis.md`) and exposing the whole subnet is contrary to the network's isolation intent. The WG path scopes routing to `<ville-mssql-host>/32` — only MSSQL, nothing else.
 
 ### Q4 — Frontend already wired
 
@@ -85,7 +85,7 @@ All of the schema-shaped concerns dissolve under the per-DB topology choice. The
 - **Phase 5.5 (Ville mirror feature)** roll-out timing is intentionally deferred. Phase 5 (Ville) gives canonical-sync parity. Phase 5.5 (Ville) adds the 6 mirror tables and view-only history panels. Splitting them lets us validate the multi-site infrastructure against the more battle-tested Phase 5 scope first. Tracked as tasks #80-#82.
 - **Phase 8 / 9 (transition / decommission)** of the legacy MSSQL — this ADR doesn't pre-judge them, but every Q1 / Q2 choice is deliberately compatible with both eventual states.
 - **HF Hotel SS2022 → SS2025 upgrade** for version parity — defer 30+ days post-Phase 7 cutover. No functional gap today.
-- **Move MSSQL off VLAN 10 (guest WiFi) at Ville** — out of scope here. Isolation is enforced at MikroTik forward chain + WG `/32` AllowedIPs scope. Worth scheduling separately as ops hardening.
+- **Move MSSQL off the network segment (an internal segment) at Ville** — out of scope here. Isolation is enforced at the edge router forward chain + WG `/32` AllowedIPs scope. Worth scheduling separately as ops hardening.
 - **`sa / REDACTED-sa-pw` password rotation** at both sites — out of scope. Audit flagged it; schedule when next maintenance window opens.
 
 ## References

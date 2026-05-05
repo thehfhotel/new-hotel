@@ -409,12 +409,12 @@ UPDATE HT_Rooms SET Room_Clean='no', Room_Clean_Time=''
 -- 2. Insert housekeeping audit row
 INSERT INTO HT_Housewife (h_name, h_room, h_date, h_note, h_cin, h_cin_name)
 VALUES ('Admin', '306', '4/24/2026 6:50:59 PM', '',
-        'CH26-005159', 'สุภัตร์ตรา พุทธกูล');
+        'CH26-005159', '<REDACTED-real-guest-name>');
 ```
 
 **Critical finding — `h_cin` references the LAST REAL CHECK-IN, not the most-recent one:**
 
-`h_cin='CH26-005159'` is **not** the just-cancelled `CH26-005233` we tested. It's a much older check-in for room 306 with a real customer name (`สุภัตร์ตรา พุทธกูล`).
+`h_cin='CH26-005159'` is **not** the just-cancelled `CH26-005233` we tested. It's a much older check-in for room 306 with a real customer name (`<REDACTED-real-guest-name>`).
 
 The .NET app looks up "the prior real occupant of this room" when recording housekeeping — likely most-recent check-in WHERE `cin_status NOT IN ('ยกเลิก')`. Cancelled check-ins are skipped. This makes housekeeping audit useful: "we cleaned up after THIS guest left."
 
