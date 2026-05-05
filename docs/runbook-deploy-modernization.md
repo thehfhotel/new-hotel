@@ -11,13 +11,26 @@ slated to go public. This phase is independent of the public flip — it improve
 deploy security regardless and is the foundation Phase 5 (workflow refactor)
 will plug into.
 
-**Why Cloudflare Access service tokens (not Tailscale or direct SSH)**: you
-already use Cloudflare Access for daily SSH to evergreen (`~/.ssh/config`
-points at `cloudflared access ssh` as ProxyCommand). Adding a Tailscale OAuth
-dependency would put a second SaaS in the deploy critical path. CF Access
-service tokens are the official documented pattern for headless/automated
-access through the same Zero Trust app you already have, so failure modes
-stay on a single vendor.
+**Why this transport (not Tailscale, not direct SSH, not service tokens)**:
+your `asgard` Cloudflare Tunnel routes `evergreen.thehfhotel.org → ssh://192.168.100.228`,
+and there is **no Access application** gating that hostname (verified via the
+CF Access API — only 15 apps exist in the account, none for evergreen). So
+your daily `cloudflared access ssh --hostname evergreen.thehfhotel.org` works
+purely through the tunnel; Access auth never triggers because there's no app
+to trigger it.
+
+The deploy uses the SAME tunnel-only path. No service token, no Access app
+changes. SSH-key auth + `restrict` + forced-command on `deploy@evergreen` is
+the entire auth model — and that's sufficient because:
+
+- The tunnel hostname is non-trivial to discover (not in DNS until you query it)
+- Even if discovered, attacker hits the SSH layer needing a valid ed25519 key
+- Forced-command means even with the key they get one script's stdout, nothing else
+- `nut`'s daily SSH (existing key) keeps working unchanged
+
+Defense-in-depth via an Access app for evergreen + service token is a future
+option — pure additive layer on top of this design, no changes to the deploy
+script or workflow.
 
 ---
 
@@ -28,7 +41,7 @@ stay on a single vendor.
 | Self-hosted runner is `evergreen` itself | GitHub-hosted ubuntu-latest runners reach evergreen via `cloudflared access ssh` |
 | Deploy step runs locally on evergreen as `nut` (uid 1000), full sudo | GitHub runner SSHes as `deploy` user (no sudo, just `docker` group) |
 | SSH auth: password (interactive) when needed | SSH auth: ed25519 key only; password auth disabled |
-| CF Access auth (today): user identity (Google OAuth) via browser | CF Access auth (CD): service token (headless, dedicated to GH Actions) |
+| CF Access in front of evergreen SSH | None today; tunnel-only. Adding one is a future defense-in-depth option, not in scope here |
 | Workflow YAML inlines all deploy logic | Deploy logic lives in `/srv/run-deploy.sh` (root-owned, 755) |
 | Workflow can shell-out arbitrary commands on prod | Workflow can ONLY trigger the script (forced-command in authorized_keys) |
 | Snap-docker flap blocks CI | Same flap, but only affects deploy step; build/test on GH-hosted is reliable |
@@ -37,24 +50,12 @@ stay on a single vendor.
 
 ## One-time setup
 
-### 1. Cloudflare Access service token (≈10 min)
+### 1. (Skipped — no CF Access setup needed)
 
-The token authenticates GH Actions to the same CF Access SSH app you already
-use for human access — no new vendor, no new app.
-
-In Cloudflare Zero Trust dashboard (https://one.dash.cloudflare.com):
-
-1. **Access → Service Auth → Service Tokens → Create Service Token**
-   - Name: `gh-actions-new-hotel-deploy`
-   - Token duration: leave default (12 months — calendar a rotation reminder)
-   - Save the **Client ID** and **Client Secret** — these become GH Secrets in step 5
-2. **Access → Applications → evergreen SSH app → Edit policies**
-   - Add a new policy:
-     - Name: `GitHub Actions deploy`
-     - Action: `Service Auth`
-     - Include: `Service Token` → select `gh-actions-new-hotel-deploy`
-     - Save
-3. The existing user-identity policy stays untouched — your daily SSH still works.
+Your `asgard` tunnel already routes evergreen SSH; no Access app exists for
+that hostname so there's nothing to configure on the CF side. If you created
+a `gh-actions-new-hotel-deploy` service token earlier, you can delete it
+(no policy attached → it does nothing). Proceed to step 2.
 
 ### 2. SSH keypair (≈5 min)
 
@@ -149,8 +150,6 @@ Add these via `gh secret set NAME --body @file` or repo Settings → Secrets:
 
 | Secret | Source | Purpose |
 |--------|--------|---------|
-| `CF_ACCESS_CLIENT_ID` | step 1 | Cloudflare Access service token client ID |
-| `CF_ACCESS_CLIENT_SECRET` | step 1 | Matching service token secret |
 | `EVERGREEN_DEPLOY_SSH_KEY` | step 2 (private half) | The ed25519 private key |
 | `EVERGREEN_HOST_KEY` | step 4 | Server's pubkey for known_hosts pinning |
 
@@ -186,18 +185,12 @@ jq -n \
     }
   }' > /tmp/payload.json
 
-# Test path 1: via your existing user-identity CF Access (proves the deploy script works)
+# Pipe payload to deploy@evergreen via the existing tunnel.
+# `cloudflared access ssh --hostname %h` is the same ProxyCommand your daily
+# SSH uses — no Access app gates it, the tunnel just routes the connection.
 ssh -i /tmp/evergreen-deploy -o StrictHostKeyChecking=accept-new \
+  -o ProxyCommand="cloudflared access ssh --hostname %h" \
   deploy@evergreen.thehfhotel.org < /tmp/payload.json
-
-# Test path 2: via service token (proves the CD path will work from GH Actions)
-# IMPORTANT: pass the secret via env vars, NOT CLI flags — CLI args are visible
-# in `ps`/proc to other local users; env vars are not (kernel-enforced on Linux).
-TUNNEL_SERVICE_TOKEN_ID="$CF_ACCESS_CLIENT_ID" \
-TUNNEL_SERVICE_TOKEN_SECRET="$CF_ACCESS_CLIENT_SECRET" \
-  ssh -i /tmp/evergreen-deploy -o StrictHostKeyChecking=accept-new \
-    -o ProxyCommand="cloudflared access ssh --hostname %h" \
-    deploy@evergreen.thehfhotel.org < /tmp/payload.json
 ```
 
 You should see the script's stdout streaming back, ending in
@@ -248,10 +241,6 @@ deploy:
 
     - name: Deploy via SSH
       env:
-        # cloudflared reads these via env (not CLI flags) so the secret never
-        # appears in /proc/<pid>/cmdline of the spawned process.
-        TUNNEL_SERVICE_TOKEN_ID:     ${{ secrets.CF_ACCESS_CLIENT_ID }}
-        TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
         DB_SERVER: ${{ secrets.DB_SERVER }}
         DB_NAME: ${{ secrets.DB_NAME }}
         DB_USER: ${{ secrets.DB_USER }}
@@ -366,15 +355,4 @@ After everything's working, verify:
 - [ ] `/srv/run-deploy.sh` is `-rwxr-xr-x root root`
 - [ ] `/home/deploy/.ssh/authorized_keys` is `-rw------- deploy deploy`
 - [ ] A real deploy via the new pipeline lands cleanly, and `/var/log/deploy/deploy-*.log` is captured
-- [ ] CF Access dashboard → Logs → SSH application shows the deploy session attributed to the service token (not a user identity)
-
----
-
-## Service token rotation (annual)
-
-Calendar reminder for ~11 months out:
-
-1. CF Zero Trust → Service Auth → `gh-actions-new-hotel-deploy` → **Refresh**
-2. Update `CF_ACCESS_CLIENT_SECRET` (and `CF_ACCESS_CLIENT_ID` if it changed) in GH Secrets
-3. Trigger a manual `workflow_dispatch` deploy to verify the new token works
-4. Old token auto-expires after refresh; no manual revoke needed
+- [ ] Cloudflare tunnel `asgard` shows the deploy connection in `cloudflared` logs / CF dashboard tunnel metrics
