@@ -59,11 +59,25 @@ if [ "${#PAYLOAD}" -gt "$MAX_BYTES" ]; then
   exit 1
 fi
 
-echo "$PAYLOAD" | jq -e 'has("commit_sha") and has("deploy_payload_b64") and has("env")' >/dev/null \
+echo "$PAYLOAD" | jq -e 'has("commit_sha") and has("deploy_payload_b64") and has("env") and has("ghcr")' >/dev/null \
   || { echo "::error::malformed payload (missing fields)"; exit 1; }
 
 COMMIT_SHA=$(echo "$PAYLOAD" | jq -r '.commit_sha')
 echo "[deploy] commit: $COMMIT_SHA"
+
+# --- ghcr.io login --------------------------------------------------------
+# The GH-hosted runner's GITHUB_TOKEN has `packages: read` scope on this
+# repo's private images. Pass it here so the local docker daemon can pull;
+# without this `docker compose pull` returns "denied: denied" on the
+# private :latest images. Token expires when the workflow run ends, so each
+# deploy gets a fresh one — no long-lived credential lives on evergreen.
+GHCR_USER=$(echo "$PAYLOAD" | jq -r '.ghcr.user')
+GHCR_TOKEN=$(echo "$PAYLOAD" | jq -r '.ghcr.token')
+[[ -n "$GHCR_USER" && -n "$GHCR_TOKEN" ]] \
+  || { echo "::error::missing ghcr.user / ghcr.token in payload"; exit 1; }
+echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin >/dev/null \
+  || { echo "::error::docker login ghcr.io failed"; exit 1; }
+echo "[deploy] ghcr authenticated as $GHCR_USER"
 
 # --- extract deploy artifacts -----------------------------------------------
 # The tar contains: docker-compose.yml, init-db/, migrations/pg/, scripts/migrate.sh

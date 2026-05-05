@@ -467,6 +467,12 @@ jobs:
 
       - name: Deploy via SSH to evergreen
         env:
+          # Auth for the docker daemon on evergreen to pull private GHCR images.
+          # GITHUB_TOKEN's packages:read scope is enough for `docker pull`;
+          # token expires when this run ends, so no long-lived credential
+          # lives on evergreen.
+          GHCR_USER:               ${{ github.actor }}
+          GHCR_TOKEN:              ${{ secrets.GITHUB_TOKEN }}
           DB_SERVER:               ${{ secrets.DB_SERVER }}
           DB_NAME:                 ${{ secrets.DB_NAME }}
           DB_USER:                 ${{ secrets.DB_USER }}
@@ -490,6 +496,8 @@ jobs:
           jq -n \
             --arg commit_sha          "$GITHUB_SHA" \
             --arg deploy_payload_b64  "$(base64 -w0 < /tmp/deploy.tar.gz)" \
+            --arg ghcr_user           "$GHCR_USER" \
+            --arg ghcr_token          "$GHCR_TOKEN" \
             --arg DB_SERVER           "$DB_SERVER" \
             --arg DB_NAME             "$DB_NAME" \
             --arg DB_USER             "$DB_USER" \
@@ -504,6 +512,7 @@ jobs:
             '{
               commit_sha: $commit_sha,
               deploy_payload_b64: $deploy_payload_b64,
+              ghcr: { user: $ghcr_user, token: $ghcr_token },
               env: {
                 DB_SERVER:               $DB_SERVER,
                 DB_NAME:                 $DB_NAME,
