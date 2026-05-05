@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.57.3] - 2026-05-05
+
+### Fixed
+
+- **Phase 1 ghcr auth gap**: the soak-substitute deploy (v2.57.2) failed
+  because evergreen's docker daemon couldn't pull the private GHCR
+  images — `denied: denied` on
+  `ghcr.io/v2/thehfhotel/new-hotel-backend/manifests/latest`. Old
+  workflow logged docker into ghcr ON evergreen via `docker/login-action`
+  (because the runner WAS evergreen); the new GH-hosted runner logs
+  itself in but evergreen never gets the auth.
+
+  Fix: pass `GHCR_USER` + `GHCR_TOKEN` (= `${{ github.actor }}` +
+  `${{ secrets.GITHUB_TOKEN }}`) in the JSON payload's new `ghcr`
+  block. `/srv/run-deploy.sh` does `docker login ghcr.io
+  --password-stdin` once at start of run, before `compose pull`. Token
+  expires when the workflow run ends, so no long-lived ghcr credential
+  lives on evergreen.
+
+  This was the only path the Phase 1 first-deploy (v2.57.1) didn't
+  exercise — that deploy didn't actually pull a new image (frontend
+  hadn't changed in a way that produced a new SHA), so compose's pull
+  step silently returned "no work needed" without authenticating.
+  v2.57.2 was the first one that needed a fresh pull (new backend image
+  from migration 026), which surfaced the auth gap.
+
 ## [2.57.2] - 2026-05-05
 
 ### Added
