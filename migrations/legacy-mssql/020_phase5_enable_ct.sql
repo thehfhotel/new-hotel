@@ -14,7 +14,7 @@
 --   HT_Room_Status, HT_Rooms_Cancel, HT_Receipt_H
 --
 -- Pre-flight (verified 2026-04-29 against Ville HOTEL via WG path
--- 192.168.11.51:1436):
+-- <ville-mssql-host>:1436):
 --   * Zero NULLs and zero duplicates on every PK candidate column
 --   * Five tables had their PK column still NULLABLE (HT_Rooms,
 --     HT_Book_H, HT_Room_Status, HT_Rooms_Cancel, HT_Receipt_H) —
@@ -36,7 +36,7 @@
 --       mcr.microsoft.com/mssql-tools \
 --       -S <ip,port> -U sa -P "$DB_PASSWORD" -d <db> -W'
 --
--- For HF Ville: -S 192.168.11.51,1436 -d HOTEL.
+-- For HF Ville: -S <ville-mssql-host>,1436 -d HOTEL.
 -- For HF Hotel: ALREADY APPLIED (2026-04-25, manually). Do not re-run —
 --   ALTER DATABASE SET CHANGE_TRACKING ON would error if already on.
 

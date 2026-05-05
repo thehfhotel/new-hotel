@@ -8,7 +8,7 @@
 
 Until 2026-04-29, HF Ville's MSSQL was SQL Server 2005 — no Change Tracking, no `tiberius` support, no `MERGE`. The only Ville sync path was `bin/ville_sync.rs` (FreeTDS hash-polling, 4 tables, 90 s poll cadence) running on the Ville jumpbox and pushing to a `ville` schema in HF Hotel's central PG.
 
-Today the Ville MSSQL was upgraded to SQL Server 2025 Express RTM (`17.0.1000.7`, host `DESKTOP-0BE5LED`, db `HOTEL`). Schema is identical to HF Hotel's legacy DB. The Phase 5 CT-based real-time sync stack is now feasible at Ville with the same backend binary.
+Today the Ville MSSQL was upgraded to SQL Server 2025 Express RTM (`17.0.1000.7`, host `<ville-db-host>`, db `HOTEL`). Schema is identical to HF Hotel's legacy DB. The Phase 5 CT-based real-time sync stack is now feasible at Ville with the same backend binary.
 
 This ADR locks the six topology decisions that drive Phase 5 (Ville) implementation. Decisions came out of two parallel sub-agent analyses (Plan + codebase-auditor) on 2026-04-29 and were ratified in conversation with the project owner.
 
@@ -18,7 +18,7 @@ This ADR locks the six topology decisions that drive Phase 5 (Ville) implementat
 |---|---|---|---|
 | 1 | PG topology | **Per-DB**: one PG cluster, two databases (`hotelnew` + new `hotelville`) | `migrations/pg/013_legacy_ct_state.sql:14` enforces `id BIGINT PRIMARY KEY DEFAULT 1 CHECK (id = 1)` — single-row by design. Per-DB inherits this naturally; per-schema or site-column adds weeks of schema rewrites. Each site gets its own row/copy for free. Backups per site without filtering. Receptionist data never co-mingled. |
 | 2 | Where Ville stack runs | **Central on evergreen, MSSQL via WG** | One deploy host, one CI runner, one Slack channel. ~50 ms RTT is invisible at 1 s CT poll cadence. Co-locating Ville compute on `desktop-0be5led` (same host as MSSQL) increases blast radius of a single host failure. |
-| 3 | Tailscale subnet routing on `desktop-0be5led` | **Skip** — use WG path `10.10.10.4 → 10.10.10.1 (DNAT) → 192.168.11.51:1436` | Mooted by the WG path actually deployed today. Smaller surface area. `desktop-0be5led`'s Tailscale daemon is fragile (Windows userspace, sleeps with RDP logout). |
+| 3 | Tailscale subnet routing on `desktop-0be5led` | **Skip** — use WG path `<wg-self> → <wg-router> (DNAT) → <ville-mssql-host>:1436` | Mooted by the WG path actually deployed today. Smaller surface area. `desktop-0be5led`'s Tailscale daemon is fragile (Windows userspace, sleeps with RDP logout). |
 | 4 | Frontend | **Extend existing `BranchContext`** | `contexts/BranchContext.tsx:5-32` already models `'hfhotel' \| 'hfville' \| 'all'`. Backend `AppState` (`hotel-backend/src/routes/mode.rs:85-298`) already exposes `ville_pool: Option<PgPool>`. Replace the old "ville_pool reads from `ville` schema in central newdb" with "ville_pool points at the new Ville DB." Same UX. |
 | 5 | `ville_sync` retirement | **Strangler**: shadow mode → divert pool → drop after 1 wk parity | (i) Deploy new stack alongside `ville_sync` in shadow; (ii) divert backend `ville_pool` to new Ville DB; (iii) verify parity for 1 week using `scheduler/sync.rs` `DiffOnly` mode; (iv) stop `ville_sync`, remove `deploy/hfville/`, drop the `ville` schema. Zero downtime. |
 | 6 | Backups / DR | **Parameterise `scripts/backup-db.sh` per site, daily `pg_dump`** | Reuse existing infra. Two cron entries on evergreen, retention 30 d, restore drill quarterly. Express-source MSSQL is upstream, NOT a backup target. |
@@ -47,7 +47,7 @@ Re-evaluate Q2 only if Ville's WAN proves unreliable (>1 outage/quarter that the
 
 ### Q3 — Tailscale subnet routing
 
-`desktop-0be5led` advertises no subnet routes. Two options were considered: enable `192.168.11.0/24` advertising via Tailscale admin, OR rely on the WG path through the jumpbox. WG was chosen because `192.168.11.0/24` is the **guest WiFi VLAN** (per HF Ville network repo `vlan-analysis.md`) and exposing the whole subnet is contrary to the network's isolation intent. The WG path scopes routing to `192.168.11.51/32` — only MSSQL, nothing else.
+`desktop-0be5led` advertises no subnet routes. Two options were considered: enable `192.168.11.0/24` advertising via Tailscale admin, OR rely on the WG path through the jumpbox. WG was chosen because `192.168.11.0/24` is the **guest WiFi VLAN** (per HF Ville network repo `vlan-analysis.md`) and exposing the whole subnet is contrary to the network's isolation intent. The WG path scopes routing to `<ville-mssql-host>/32` — only MSSQL, nothing else.
 
 ### Q4 — Frontend already wired
 

@@ -21,7 +21,7 @@
 //! ```text
 //! cd hotel-backend
 //! DATABASE_URL=postgres://postgres:NewHotel%402026%21@localhost:5439/hotelnew \
-//!   DB_SERVER=192.168.100.222 DB_USER=sa DB_PASSWORD=... DB_NAME=db \
+//!   DB_SERVER=<legacy-mssql-host> DB_USER=sa DB_PASSWORD=... DB_NAME=db \
 //!   cargo run --release --bin backfill_rooms
 //! ```
 //!

@@ -9,7 +9,7 @@
 #
 # Usage:
 #   CAPTURE_DIR=captured-2026-04-24-1530 \
-#   DB_HOST=192.168.100.222 DB_USER=sa DB_PASS=... DB_NAME=db \
+#   DB_HOST=<legacy-mssql-host> DB_USER=sa DB_PASS=... DB_NAME=db \
 #   ./finalize.sh
 
 set -euo pipefail

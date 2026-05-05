@@ -69,7 +69,7 @@ This application uses a **dual-database architecture**:
 
 | Database | Location | Purpose |
 |----------|----------|---------|
-| Legacy DB | 192.168.100.222 | Shared with legacy app, READ-ONLY |
+| Legacy DB | <legacy-mssql-host> | Shared with legacy app, READ-ONLY |
 | HotelNew DB | Docker container (`newdb`) | Self-hosted, full CRUD |
 
 ### Architecture Diagram
@@ -92,7 +92,7 @@ This application uses a **dual-database architecture**:
                            ▼
               ┌─────────────────────────┐
               │  Legacy DB              │
-              │  192.168.100.222:1433   │
+              │  <legacy-mssql-host>:1433   │
               │  (external, read-only)  │
               └─────────────────────────┘
 ```
@@ -132,7 +132,7 @@ The backend uses `sqlx::query!()` compile-time macros for ~76 static SQL queries
 - SELECT: Cast to `::float8` for `f64` return (e.g., `r.room_price_weekday::float8`)
 - INSERT/UPDATE parameters: Cast with `$N::float8` so sqlx accepts `f64` and PostgreSQL converts to NUMERIC
 
-### Legacy Database (192.168.100.222)
+### Legacy Database (<legacy-mssql-host>)
 
 - **SHARED DATABASE**: Used by another legacy application. Exercise caution.
 

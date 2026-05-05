@@ -15,7 +15,7 @@
 -- has been stale since `ville_sync` was stopped pre-cutover. Task #77
 -- retires the worker (deletes `bin/ville_sync.rs`,
 -- `Dockerfile.ville-sync`, `deploy/hfville/`, the `build-ville-sync` +
--- `deploy-hfville` workflow jobs, and the `10.10.10.4:5441` host-port
+-- `deploy-hfville` workflow jobs, and the `<wg-self>:5441` host-port
 -- mapping that exposed `newdb` for the now-defunct push). This
 -- migration drops the orphaned schema so the canonical `hotelnew`
 -- database matches its post-retirement reality.

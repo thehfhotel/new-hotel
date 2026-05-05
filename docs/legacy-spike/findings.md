@@ -1,6 +1,6 @@
 # Legacy DB — Findings
 
-Captured 2026-04-24 from the live HF Hotel legacy DB (`192.168.100.222 / db`)
+Captured 2026-04-24 from the live HF Hotel legacy DB (`<legacy-mssql-host> / db`)
 while the receptionist drove the 3rd-party Windows app through controlled
 actions. All quotes/identifiers below are direct from the captured event
 stream — see `raw/<capture>/writes.txt` for the unedited record.
@@ -12,9 +12,9 @@ stream — see `raw/<capture>/writes.txt` for the unedited record.
 | Property | Value |
 |---|---|
 | SQL Server | 2022 RTM Express (16.0.1000.6) on Windows 10 Pro |
-| @@SERVERNAME | `DESKTOP-DQTEBJJ\SQLEXPRESS` (the host was renamed `FRONT2` later) |
+| @@SERVERNAME | `<legacy-host>\SQLEXPRESS` (the host was renamed `<legacy-host>` later) |
 | Database | `db` (only user DB on the instance) |
-| 3rd-party app | `.Net SqlClient Data Provider`, host `FRONT2`, login `sa` |
+| 3rd-party app | `.Net SqlClient Data Provider`, host `<legacy-host>`, login `sa` |
 | Connection | Same physical box — receptionist app and SQL Server are co-located |
 | Triggers / sprocs / functions in `db` | **Zero** |
 

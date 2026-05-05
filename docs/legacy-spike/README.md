@@ -1,8 +1,8 @@
 # Legacy DB Reverse-Engineering Spike — Capture Archive
 
-Captured 2026-04-24 against `192.168.100.222 / db` (HF Hotel) using
+Captured 2026-04-24 against `<legacy-mssql-host> / db` (HF Hotel) using
 `scripts/legacy-spike/`. Receptionist drove the 3rd-party Windows app
-(`.Net SqlClient Data Provider` from host `FRONT2`) while we ran an
+(`.Net SqlClient Data Provider` from host `<legacy-host>`) while we ran an
 Extended Events session capturing every SQL batch the app sent.
 
 ## What's in here

@@ -11,13 +11,13 @@
 # Then prints "READY — hand the playbook to the receptionist."
 #
 # Usage:
-#   DB_HOST=192.168.100.222 DB_USER=sa DB_PASS=... DB_NAME=db ./run.sh
+#   DB_HOST=<legacy-mssql-host> DB_USER=sa DB_PASS=... DB_NAME=db ./run.sh
 #
 # Output goes to ./captured-YYYY-MM-DD-HHMM/ in the cwd.
 
 set -euo pipefail
 
-: "${DB_HOST:?Set DB_HOST (e.g. 192.168.100.222)}"
+: "${DB_HOST:?Set DB_HOST (e.g. <legacy-mssql-host>)}"
 : "${DB_USER:?Set DB_USER (e.g. sa)}"
 : "${DB_PASS:?Set DB_PASS}"
 : "${DB_NAME:=master}"   # 00-prereqs queries cross-DB; later scripts work in the legacy DB context per their own filter

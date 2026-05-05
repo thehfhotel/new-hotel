@@ -10,7 +10,7 @@ ssh evergreen 'mkdir -p ~/legacy-monitor/scripts'
 scp -q 01-setup-session.sql 02-tail-events.sql tail-loop.sh check-errors.sh check-activity.sh stop.sh evergreen:~/legacy-monitor/scripts/
 
 echo "[$(date -u +%H:%M:%S)] enabling XE session..."
-ssh evergreen 'pw=$(grep "^DB_PASSWORD=" ~/new-hotel-production/.env | cut -d= -f2- | tr -d "\"'\''"); cat ~/legacy-monitor/scripts/01-setup-session.sql | docker run --rm -i --network host --entrypoint /opt/mssql-tools18/bin/sqlcmd mcr.microsoft.com/mssql/server:2022-latest -C -S 192.168.100.222 -U sa -P "$pw" -d master -W 2>&1 | grep -v "container is" | grep -v "non-root" | grep -v "linkid"'
+ssh evergreen 'pw=$(grep "^DB_PASSWORD=" ~/new-hotel-production/.env | cut -d= -f2- | tr -d "\"'\''"); cat ~/legacy-monitor/scripts/01-setup-session.sql | docker run --rm -i --network host --entrypoint /opt/mssql-tools18/bin/sqlcmd mcr.microsoft.com/mssql/server:2022-latest -C -S <legacy-mssql-host> -U sa -P "$pw" -d master -W 2>&1 | grep -v "container is" | grep -v "non-root" | grep -v "linkid"'
 
 echo "[$(date -u +%H:%M:%S)] starting tail loop as systemd user service on evergreen..."
 # systemd-run --user --scope detaches fully from SSH session; survives logout.

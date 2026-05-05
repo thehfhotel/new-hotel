@@ -43,7 +43,7 @@ impl DbConfig {
             .unwrap_or(20);
 
         Self {
-            server: env::var("DB_SERVER").unwrap_or_else(|_| "192.168.100.222".to_string()),
+            server: env::var("DB_SERVER").unwrap_or_else(|_| "<legacy-mssql-host>".to_string()),
             port: parse_mssql_port("MSSQL_PORT", DEFAULT_MSSQL_PORT),
             database: env::var("DB_NAME").unwrap_or_else(|_| "db".to_string()),
             user: env::var("DB_USER").unwrap_or_else(|_| "sa".to_string()),

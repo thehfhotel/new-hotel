@@ -6,7 +6,7 @@ writes from our app.
 
 ## Prerequisites
 
-- Network access to the legacy MSSQL server (HF Hotel: `192.168.100.222:1433`)
+- Network access to the legacy MSSQL server (HF Hotel: `<legacy-mssql-host>:1433`)
 - `sa` credentials (or any login with `ALTER ANY EVENT SESSION` server-level perm)
 - `mssql-cli` or `sqlcmd` installed locally; `bash` for the runner script
 - ~30 minutes of dedicated receptionist time (no other clerks using the app)
@@ -32,7 +32,7 @@ writes from our app.
 ## Workflow
 
 ```
-1. SSH / RDP to a host with line of sight to 192.168.100.222
+1. SSH / RDP to a host with line of sight to <legacy-mssql-host>
 2. Edit run.sh + finalize.sh to set DB_HOST / DB_USER / DB_PASS
 3. ./run.sh                          # captures baseline + starts XE session
 4. Hand ACTION-PLAYBOOK.md to receptionist; they perform actions

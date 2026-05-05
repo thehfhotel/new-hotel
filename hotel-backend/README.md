@@ -6,7 +6,7 @@ High-performance Rust backend for the Hotel Management System, replacing the Nex
 
 - **Framework**: Axum 0.7
 - **Runtime**: Tokio
-- **Legacy Database**: SQL Server via tiberius (read-only, 192.168.100.222)
+- **Legacy Database**: SQL Server via tiberius (read-only, <legacy-mssql-host>)
 - **HotelNew Database**: PostgreSQL via sqlx (full CRUD)
 - **Scheduling**: tokio-cron-scheduler
 - **HTTP Client**: reqwest (for Slack webhooks)
@@ -80,7 +80,7 @@ cargo build --release
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DB_SERVER` | `192.168.100.222` | Legacy SQL Server host |
+| `DB_SERVER` | `<legacy-mssql-host>` | Legacy SQL Server host |
 | `DB_NAME` | `db` | Legacy database name |
 | `DB_USER` | `sa` | Legacy database user |
 | `DB_PASSWORD` | `12345678` | Legacy database password |
@@ -104,7 +104,7 @@ docker build -t hotel-backend .
 
 # Run the container
 docker run -p 3003:3003 \
-  -e DB_SERVER=192.168.100.222 \
+  -e DB_SERVER=<legacy-mssql-host> \
   -e DB_NAME=db \
   -e DB_USER=sa \
   -e DB_PASSWORD=12345678 \
@@ -131,7 +131,7 @@ This backend uses a **dual-database architecture**:
 
 | Database | Driver | Access | Purpose |
 |----------|--------|--------|---------|
-| Legacy SQL Server (192.168.100.222) | tiberius/bb8 | Read-only | Shared with legacy application |
+| Legacy SQL Server (<legacy-mssql-host>) | tiberius/bb8 | Read-only | Shared with legacy application |
 | HotelNew PostgreSQL (Docker `newdb`) | sqlx | Full CRUD | Application-owned tables |
 
 **Legacy read-only tables**:

@@ -17,7 +17,7 @@ SET QUOTED_IDENTIFIER ON;
 IF EXISTS (SELECT 1 FROM sys.dm_xe_sessions WHERE name = 'hotel_monitor')
     ALTER EVENT SESSION [hotel_monitor] ON SERVER STATE = STOP;
 PRINT 'hotel_monitor stopped';
-" | docker run --rm -i --network host --entrypoint /opt/mssql-tools18/bin/sqlcmd mcr.microsoft.com/mssql/server:2022-latest -C -S 192.168.100.222 -U sa -P "$DB_PASSWORD" -d master -W 2>&1 | grep -v "container is" | grep -v "non-root" | grep -v "linkid"
+" | docker run --rm -i --network host --entrypoint /opt/mssql-tools18/bin/sqlcmd mcr.microsoft.com/mssql/server:2022-latest -C -S <legacy-mssql-host> -U sa -P "$DB_PASSWORD" -d master -W 2>&1 | grep -v "container is" | grep -v "non-root" | grep -v "linkid"
 
 echo "Done. Logs preserved in ~/legacy-monitor/"
 echo "To DROP the session entirely (cleanup): cat 03-drop-session.sql | sqlcmd ..."

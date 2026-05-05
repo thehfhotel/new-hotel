@@ -7,7 +7,7 @@
 --   HT_Cupon, HT_CheckIn_Product, HT_Deposit,
 --   HT_Changed_Room, HT_Bill_Debt_H, HT_Bill_Debt_Ds
 --
--- Pre-flight (verified 2026-04-28 against 192.168.100.222):
+-- Pre-flight (verified 2026-04-28 against <legacy-mssql-host>):
 --   * No existing PRIMARY KEY on any of the 6 tables
 --   * No existing per-table CT on any
 --   * Zero NULLs and zero duplicates on every candidate PK column
@@ -24,7 +24,7 @@
 --     docker run --rm -i --network host \
 --       --entrypoint /opt/mssql-tools18/bin/sqlcmd \
 --       mcr.microsoft.com/mssql/server:2022-latest \
---       -C -S 192.168.100.222 -U sa -P "$DB_PASSWORD" -d db -W'
+--       -C -S <legacy-mssql-host> -U sa -P "$DB_PASSWORD" -d db -W'
 
 SET NOCOUNT ON;
 GO

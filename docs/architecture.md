@@ -842,7 +842,7 @@ Other ground-truth facts that fall out of this precedence rule:
 
 - **Text encoding is `varchar Thai_CI_AS` (Windows-874 / TIS-620), not Unicode.** Sending an `N'…'` Unicode literal corrupts every Thai character into `?` because `nvarchar → varchar` conversion strips anything outside the codepage. **Always pass plain `varchar` parameters** — the `tiberius` driver handles the codepage transcoding when the column type is `varchar`. The same rule applies to the `WHERE` clause: looking up a Thai name with `N'…'` will silently miss because the search text round-trips through the same lossy conversion.
 
-When in doubt, do a fresh live capture against `192.168.100.222` rather than trusting a years-old note. The Extended Events session in `scripts/legacy-monitor/` is the canonical way to do this.
+When in doubt, do a fresh live capture against `<legacy-mssql-host>` rather than trusting a years-old note. The Extended Events session in `scripts/legacy-monitor/` is the canonical way to do this.
 
 ---
 
@@ -1224,7 +1224,7 @@ Single `.env` file controls all three states:
 # State A or B (today/transition)
 LEGACY_SYNC_ENABLED=true
 WRITEBACK_ENABLED=true
-LEGACY_DB_URL=mssql://sa:...@192.168.100.222/db
+LEGACY_DB_URL=mssql://sa:...@<legacy-mssql-host>/db
 
 # State C (decommissioned)
 LEGACY_SYNC_ENABLED=false
