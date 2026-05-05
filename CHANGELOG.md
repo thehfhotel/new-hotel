@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.57.1] - 2026-05-05
+
+### Fixed
+
+- **Phase 1 first-deploy bug: snap-docker can't see `/srv/`.** The first
+  CI run via the new SSH path (`4ccaca3`) failed with
+  `compose pull → no configuration file provided: not found` despite the
+  file being present at `/srv/new-hotel-production/docker-compose.yml`
+  with correct perms. Root cause: the snap-confined `docker` package on
+  evergreen has the standard `home` interface, which only grants access
+  to `/home/`, `/media/`, `/mnt/` — `/srv/` is outside the confinement
+  allowlist. The runbook's "move dir to `/srv/`" step was wrong for this
+  host's docker installation.
+
+  Fix: `DEPLOY_DIR` moved to `/home/deploy/new-hotel-production`. The
+  symlink at `/home/nut/new-hotel-production` now points there for
+  muscle-memory parity. The deploy script (`/srv/run-deploy.sh` itself
+  stays root-owned at /srv — bash isn't snap-confined) updated. Runbook
+  3b updated with a heads-up about the snap confinement constraint so
+  future operators don't hit the same trap.
+
+  All other Phase 1 work (SSH key + forced-command + cloudflared
+  transport + JSON payload + script logic) is unchanged. Pure DEPLOY_DIR
+  path fix.
+
 ## [2.57.0] - 2026-05-05
 
 ### Changed

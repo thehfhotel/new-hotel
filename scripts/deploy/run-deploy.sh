@@ -25,9 +25,15 @@ set -euo pipefail
 # (b) blocks `nut` from inspecting via the /home/nut/new-hotel-production
 # symlink during incidents.
 
-DEPLOY_DIR=/srv/new-hotel-production
+DEPLOY_DIR=/home/deploy/new-hotel-production
 LOG_DIR=/var/log/deploy
 LOCK_FILE="$LOG_DIR/.run-deploy.lock"   # under LOG_DIR so we know deploy user owns it
+# DEPLOY_DIR lives under /home/ rather than /srv/ because the snap-confined
+# docker on this host can only see /home/, /media/, /mnt/ via the snap
+# `home` interface — putting docker-compose.yml in /srv/ would result in
+# `docker compose pull` returning "no configuration file provided: not found"
+# even though the file exists with correct perms. /home/deploy/ is the
+# minimal-blast-radius location: owned by the deploy user, snap-readable.
 
 mkdir -p "$LOG_DIR" "$DEPLOY_DIR"
 LOG_FILE="$LOG_DIR/deploy-$(date +%Y%m%d-%H%M%S).log"
