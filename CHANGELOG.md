@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.58.0] - 2026-05-05
+
+### Removed
+
+- **Phase 2 sanitization landed** — pre-public-flip cleanup of the repo
+  surface. Three stages, each its own commit:
+  - **Stage A** (`44683df^`): deleted `legacy-reference/` entirely
+    (35 MB, 466 files). Was decompiled iHOTEL2025 vendor source +
+    commercial DLLs (DotNetBar, C1FlexGrid, Office Interop,
+    ThaiNationalIDCardByKP). Distributing decompiled source of a paid
+    commercial competitor product on a public repo is a copyright/EULA
+    exposure that's bigger than any PII finding in the audit.
+    Analytical value is preserved in `docs/legacy-spike/` SQL recipes,
+    `docs/architecture.md` writeback explanations, and the writeback
+    code itself.
+  - **Stage B** (`44683df`): bulk sed replacing internal IPs + hostnames
+    across 41 docs/scripts/migration files (2400 line replacements).
+    Mappings: `192.168.100.222 → <legacy-mssql-host>`,
+    `192.168.11.51 → <ville-mssql-host>`, `10.10.10.x → <wg-*>`,
+    `DESKTOP-* / FRONT2 → <legacy-host>` etc. Workflow YAML and
+    `docker-compose.yml` deliberately untouched (need real values for
+    runtime). `hotel-backend/src/config.rs:46` fallback string also
+    sanitized; Phase 3 will replace with `panic!` to remove the
+    fallback entirely.
+  - **Stage C** (`6858501`): prose-level fixes the bulk sed couldn't
+    cover. "MikroTik" → "the edge router" (don't reveal firewall
+    vendor), VLAN role descriptions genericized, real customer name
+    `<REDACTED-real-guest-name>` (was a Thai full name) redacted from
+    `docs/legacy-spike/findings.md`, XE capture outputs, and the
+    `mark_clean.rs` doc comment.
+
+  Still in repo (deliberate):
+  - `evergreen.thehfhotel.org` in workflow YAML (needed for runtime;
+    hostname is publicly resolvable anyway)
+  - Real IPs in `docker-compose.yml` env defaults (runtime-required)
+  - `lib/hotel-info.ts` legal-entity values — Thai tax IDs are
+    DBD-public; Phase 3 will decide whether to env-var-ize
+  - CHANGELOG historical tax-ID mentions — same as above
+
+  Not yet done (separate from this working-tree pass):
+  - Git history rewrite to remove sanitized blobs from prior commits.
+    Live secrets there will be rotated in Phase 3 anyway, so the
+    rewrite is a flip-day step rather than now.
+
 ## [2.57.3] - 2026-05-05
 
 ### Fixed
