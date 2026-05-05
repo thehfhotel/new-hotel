@@ -1,7 +1,7 @@
 # Legacy MSSQL migrations
 
 Schema changes that we apply to the **legacy MSSQL database**
-(`192.168.100.222 / db` for HF Hotel; HF Ville's MSSQL behind the
+(`<legacy-mssql-host> / db` for HF Hotel; HF Ville's MSSQL behind the
 WireGuard mesh) to support the event-driven sync architecture.
 
 The legacy DB is **shared with the legacy .NET app** (per `CLAUDE.md`
@@ -35,11 +35,11 @@ container on the deploy host (no need to install MSSQL tools locally):
 ssh evergreen "cat <path-to-sql> | docker run --rm -i --network host \
     --entrypoint /opt/mssql-tools18/bin/sqlcmd \
     mcr.microsoft.com/mssql/server:2022-latest \
-    -C -S 192.168.100.222 -U sa -P \"\$DB_PASSWORD\" -d db -W"
+    -C -S <legacy-mssql-host> -U sa -P \"\$DB_PASSWORD\" -d db -W"
 ```
 
 For HF Ville: same command, swap the `-S` server address for Ville's
-MSSQL — `192.168.11.51,1436` over the WireGuard `hfville` interface
+MSSQL — `<ville-mssql-host>,1436` over the WireGuard `hfville` interface
 (after the 2026-04-29 cutover; see `ville_constraint.md` for the
 network path). Database is `HOTEL`, not `db`.
 

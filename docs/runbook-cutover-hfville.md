@@ -14,7 +14,7 @@ This is the playbook for flipping HF Ville from "ville_sync FreeTDS polling" to 
 - [ ] `scripts/sync-status.sh --site hfville` shows healthy state, no consecutive-failure trip
 - [ ] HF Hotel sync still healthy (drift-reconcile ticks clean, no `[site=hfhotel]` alerts during the soak window)
 - [ ] All Phase 5 (Ville) prep tasks complete: #67-#73, #74, #83
-- [ ] WG path verified live: `ssh evergreen "timeout 5 bash -c '</dev/tcp/192.168.11.51/1436'"` returns OK
+- [ ] WG path verified live: `ssh evergreen "timeout 5 bash -c '</dev/tcp/<ville-mssql-host>/1436'"` returns OK
 - [ ] Receptionist comms ready (see `docs/runbook-cutover-hfville-thai.md` for the template)
 - [ ] At least 30 min reserved on the calendar
 - [ ] You are on a stable internet connection (not on mobile data)
@@ -134,13 +134,13 @@ The .NET app at Ville should be unchanged (we didn't touch its data path). The n
 `ville-sync` was already stopped pre-cutover (during the shadow soak). Now remove it cleanly so it can never restart accidentally:
 
 ```bash
-ssh evergreen 'ssh hfville-ts "cd ~/hfville && docker compose down 2>&1 | tail -5"'
+ssh evergreen 'ssh <ville-jumpbox> "cd ~/hfville && docker compose down 2>&1 | tail -5"'
 ```
 
 The local `hfville-db` PG container can stop too — its data was a hash-polled mirror, no longer needed:
 
 ```bash
-ssh evergreen 'ssh hfville-ts "docker stop hfville-db 2>&1 | tail -3"'
+ssh evergreen 'ssh <ville-jumpbox> "docker stop hfville-db 2>&1 | tail -3"'
 ```
 
 Don't `docker rm` yet — keep the volumes for 7 days as a fallback, then task #77 cleans them up properly.
@@ -182,7 +182,7 @@ ssh evergreen "cd /home/nut/new-hotel-production && docker compose up -d --force
 ### Rollback step 3: Restart old ville_sync on jumpbox
 
 ```bash
-ssh evergreen 'ssh hfville-ts "cd ~/hfville && docker compose up -d ville-sync"'
+ssh evergreen 'ssh <ville-jumpbox> "cd ~/hfville && docker compose up -d ville-sync"'
 ```
 
 (Note: `ville-sync` was failing in restart-loop because of the MSSQL upgrade port change. The OLD ville-sync code reads from port 1433. To make it work as a rollback fallback, you'd need to ALSO patch the OLD ville-sync .env on the jumpbox to use port 1436. Or accept that rollback gives you "fresh hotelnew read of the old `ville` schema" which is stale to whatever extent ville-sync has been broken. If shadow soak was clean for 48 h pre-cutover and cutover introduced a problem, rollback is to a known-stale state, not catastrophic.)

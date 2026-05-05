@@ -12,7 +12,7 @@ deploy security regardless and is the foundation Phase 5 (workflow refactor)
 will plug into.
 
 **Why this transport (not Tailscale, not direct SSH, not service tokens)**:
-your `asgard` Cloudflare Tunnel routes `evergreen.thehfhotel.org → ssh://192.168.100.228`,
+your `asgard` Cloudflare Tunnel routes `evergreen.thehfhotel.org → ssh://<runner-host>`,
 and there is **no Access application** gating that hostname (verified via the
 CF Access API — only 15 apps exist in the account, none for evergreen). So
 your daily `cloudflared access ssh --hostname evergreen.thehfhotel.org` works

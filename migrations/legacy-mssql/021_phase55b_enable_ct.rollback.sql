@@ -16,7 +16,7 @@
 --     docker run --rm -i --network host \
 --       --entrypoint /opt/mssql-tools18/bin/sqlcmd \
 --       mcr.microsoft.com/mssql/server:2022-latest \
---       -C -S 192.168.100.222 -U sa -P "$DB_PASSWORD" -d db -W'
+--       -C -S <legacy-mssql-host> -U sa -P "$DB_PASSWORD" -d db -W'
 
 SET NOCOUNT ON;
 

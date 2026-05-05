@@ -461,7 +461,7 @@ walkthrough recommended before considering this fully verified.
   jumpbox is no longer addressed by CI; the `room-daily-reporter`
   workload it hosts (different project) is unaffected.
 
-  `docker-compose.yml` drops the `10.10.10.4:5441:5439` host-port
+  `docker-compose.yml` drops the `<wg-self>:5441:5439` host-port
   publish on `newdb` — that mapping existed solely to expose PG to the
   Ville jumpbox over WireGuard for the `ville_sync` push.
 
@@ -641,7 +641,7 @@ walkthrough recommended before considering this fully verified.
   legal entity (e.g. "นิติบุคคล: บริษัท สายชล เฮอริเทจ จำกัด"), that's
   a separate template-level addition, not a `hotel-info` field.
 
-  Source for HF Hotel values is `192.168.100.222 / db / TB_SETTINGS`
+  Source for HF Hotel values is `<legacy-mssql-host> / db / TB_SETTINGS`
   rendered via `sqlcmd`; the legacy app and the receptionist printers
   read the same row.
 
@@ -1109,7 +1109,7 @@ walkthrough recommended before considering this fully verified.
 - **`sync-hfville` + `writeback-hfville` services in `docker-compose.yml`**
   (both under `profiles: [hfville]`, default-INERT). The Phase 5 (Ville)
   worker pair — same backend image, different env: Ville MSSQL via WG
-  (`192.168.11.51,1436`), `hotelville` PG database, `SITE_ID=hfville`.
+  (`<ville-mssql-host>,1436`), `hotelville` PG database, `SITE_ID=hfville`.
   Per ADR 0001 Q2 the Ville stack runs CENTRAL on evergreen alongside
   HF Hotel — no separate backend container needed (the existing
   `backend` service's `ville_pool` repoints at `hotelville` at cutover,
@@ -1296,7 +1296,7 @@ walkthrough recommended before considering this fully verified.
   Ville (0 NULLs, 0 dupes on every PK candidate column). DO NOT
   re-apply at HF Hotel — `ALTER DATABASE SET CHANGE_TRACKING ON` would
   error if already enabled. README + reference network path for Ville
-  (`192.168.11.51,1436` over WG `hfville` interface) updated to match.
+  (`<ville-mssql-host>,1436` over WG `hfville` interface) updated to match.
 
 ## [2.54.4] - 2026-04-29
 
@@ -2200,7 +2200,7 @@ with operator alerting. Per `docs/architecture.md` §8 (Phase 6 row).
     log even though it omitted the values).
   - **Operator setup required (one-time, separately from this commit):**
     1. Install the public half of `HFVILLE_SSH_KEY` into
-       `~nut/.ssh/authorized_keys` on the HF Ville jump box (10.10.10.3).
+       `~nut/.ssh/authorized_keys` on the HF Ville jump box (<wg-jumpbox>).
     2. Add `nut ALL=(ALL) NOPASSWD: /usr/bin/docker, /usr/bin/docker compose`
        to `/etc/sudoers.d/nut-docker` on the jump box (replaces the
        `echo <password> | sudo -S …` pattern).
@@ -3550,7 +3550,7 @@ with operator alerting. Per `docs/architecture.md` §8 (Phase 6 row).
   - Backend reads from local `ville` schema instead of crossing WireGuard tunnel (<1ms vs ~50ms latency)
   - Push is optional/graceful — if production unreachable, local buffer continues; next cycle reconciles via SHA256 hash comparison
   - Migration `010_ville_cache_schema.sql` creates the ville schema
-  - newdb port exposed on WireGuard interface (`10.10.10.4:5439`) for ville_sync push access
+  - newdb port exposed on WireGuard interface (`<wg-self>:5439`) for ville_sync push access
 
 ### Changed
 - Backend `ville_pool` now connects to local newdb with `search_path=ville` instead of remote PG via socat
@@ -3749,7 +3749,7 @@ with operator alerting. Per `docs/architecture.md` §8 (Phase 6 row).
 - **Migrate HotelNew database from SQL Server to PostgreSQL** - Major infrastructure change
   - Replaced SQL Server 2022 container (~2GB RAM, 1.6GB image) with PostgreSQL 17 Alpine (~50-100MB RAM, ~100MB image)
   - Backend now uses `sqlx` crate for PostgreSQL queries (replacing tiberius/bb8 for HotelNew DB)
-  - Legacy database (192.168.100.222) unchanged - still uses tiberius/bb8 for read-only access
+  - Legacy database (<legacy-mssql-host>) unchanged - still uses tiberius/bb8 for read-only access
   - Converted all 14 route files from T-SQL to PostgreSQL syntax
   - Converted DDL init script (`init-db/init-hotelnew.sql`) to PostgreSQL
   - Stored procedures replaced with PL/pgSQL functions
@@ -3909,7 +3909,7 @@ with operator alerting. Per `docs/architecture.md` §8 (Phase 6 row).
     - `GET /api/bookings/:id/notes` - Uses HotelNew DB (read)
     - `POST /api/bookings/:id/notes` - Uses HotelNew DB (write)
     - `DELETE /api/bookings/:id/notes` - Uses HotelNew DB (write)
-  - Legacy database (192.168.100.222) is now truly read-only
+  - Legacy database (<legacy-mssql-host>) is now truly read-only
 
 ### Changed
 - **Backend Architecture** - `bookings.rs` now uses `AppState` instead of `DbPool` for booking detail and notes routes
@@ -3955,7 +3955,7 @@ with operator alerting. Per `docs/architecture.md` §8 (Phase 6 row).
     - Detailed logging for deployment troubleshooting
 
 ### Changed
-- **Backend database connection** - `NEW_DB_SERVER` now points to Docker container (`newdb`) instead of external server (192.168.100.222)
+- **Backend database connection** - `NEW_DB_SERVER` now points to Docker container (`newdb`) instead of external server (<legacy-mssql-host>)
 - **System mode default** - Changed from `legacy` to `new` in docker-compose.yml for new deployments
 
 ### Security

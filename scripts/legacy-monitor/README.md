@@ -1,6 +1,6 @@
 # Legacy DB Monitor
 
-Long-running passive monitoring of the legacy MSSQL DB (`192.168.100.222`).
+Long-running passive monitoring of the legacy MSSQL DB (`<legacy-mssql-host>`).
 
 ## Two purposes
 
@@ -109,5 +109,5 @@ manually rotated.
 
 ```bash
 ssh evergreen ~/legacy-monitor/scripts/stop.sh
-ssh evergreen 'cat ~/legacy-monitor/scripts/03-drop-session.sql | docker run --rm -i --network host --entrypoint /opt/mssql-tools18/bin/sqlcmd mcr.microsoft.com/mssql/server:2022-latest -C -S 192.168.100.222 -U sa -P "$DB_PASSWORD" -d master'
+ssh evergreen 'cat ~/legacy-monitor/scripts/03-drop-session.sql | docker run --rm -i --network host --entrypoint /opt/mssql-tools18/bin/sqlcmd mcr.microsoft.com/mssql/server:2022-latest -C -S <legacy-mssql-host> -U sa -P "$DB_PASSWORD" -d master'
 ```

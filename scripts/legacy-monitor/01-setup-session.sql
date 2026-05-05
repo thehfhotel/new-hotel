@@ -7,7 +7,7 @@
 -- Excludes our own backend (tiberius) so the noise stays low.
 -- Output: rolling .xel file in SQL Server LOG dir, max 4 × 100MB = 400MB cap.
 --
--- Run: cat 01-setup-session.sql | sqlcmd -S 192.168.100.222 -U sa -P ... -d master
+-- Run: cat 01-setup-session.sql | sqlcmd -S <legacy-mssql-host> -U sa -P ... -d master
 
 SET QUOTED_IDENTIFIER ON;
 SET NOCOUNT ON;

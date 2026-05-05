@@ -27,7 +27,7 @@ NNN_description.sql
 
 ```bash
 # Using sqlcmd
-sqlcmd -S 192.168.100.222 -d HotelDB -U username -P password -i migrations/001_create_booking_notes_table.sql
+sqlcmd -S <legacy-mssql-host> -d HotelDB -U username -P password -i migrations/001_create_booking_notes_table.sql
 ```
 
 ### HotelNew Database (PostgreSQL) — Automated Migrations

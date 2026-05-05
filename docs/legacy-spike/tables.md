@@ -1,4 +1,4 @@
-# Legacy DB Table Catalog (`db` on FRONT2)
+# Legacy DB Table Catalog (`db` on <legacy-host>)
 
 60+ tables in `dbo` schema. Names prefix conventions:
 - `HT_*` — hotel domain (the bulk)
