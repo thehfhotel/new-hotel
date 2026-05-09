@@ -732,20 +732,16 @@ async fn create_legacy_pool() -> Result<bb8::Pool<bb8_tiberius::ConnectionManage
 }
 
 async fn create_pg_pool() -> Result<sqlx::PgPool, Box<dyn std::error::Error>> {
-    let server = std::env::var("NEW_DB_SERVER").unwrap_or_else(|_| "localhost".to_string());
-    let port: u16 = std::env::var("NEW_DB_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(5439);
-    let database = std::env::var("NEW_DB_NAME").unwrap_or_else(|_| "hotelnew".to_string());
-    let user = std::env::var("NEW_DB_USER").unwrap_or_else(|_| "postgres".to_string());
-    let password = std::env::var("NEW_DB_PASSWORD").unwrap_or_else(|_| "REDACTED-sa-pw".to_string());
-
-    let conn_str = format!("postgres://{}:{}@{}:{}/{}", user, password, server, port, database);
+    // Inherit the centralised NewDbConfig: same require_secret panic on
+    // missing NEW_DB_PASSWORD as the main backend, no silent fallback to a
+    // shared "REDACTED-sa-pw" default that would mask a missing env var.
+    let config = hotel_backend::config::NewDbConfig::from_env();
+    let server = config.server.clone();
+    let port = config.port;
 
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
-        .connect(&conn_str)
+        .connect(&config.connection_string())
         .await?;
 
     tracing::info!("Connected to PostgreSQL at {}:{}", server, port);
