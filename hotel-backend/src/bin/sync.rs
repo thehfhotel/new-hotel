@@ -639,6 +639,24 @@ async fn run_bootstrap(site: &SiteConfig) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+/// One-shot reachability probe against legacy MSSQL. Acquires a pool
+/// connection and runs `SELECT 1` — both must succeed.
+///
+/// Used at the top of `run_one_tick` to short-circuit the whole tick
+/// when the legacy tunnel is down. Without this, every CT-enabled
+/// table's fetch sequentially burns one `POOL_CONNECTION_TIMEOUT`
+/// (15s) before bb8 gives up, so a 2-minute WG flap fans out into
+/// ~16×15s = 4 minutes of WARN events before the watcher catches up.
+/// One probe up front collapses that to a single WARN per tick + the
+/// next tick (1s later) re-probes and resumes immediately on recovery.
+async fn probe_legacy_connectivity(
+    mssql: &DbPool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut conn = mssql.get().await?;
+    let _ = conn.simple_query("SELECT 1").await?;
+    Ok(())
+}
+
 /// Read `SELECT CHANGE_TRACKING_CURRENT_VERSION()` from MSSQL — the
 /// global-monotonic version every CT row carries. Returns the watermark
 /// the watcher should resume from after `run_bootstrap`.
@@ -753,6 +771,22 @@ async fn run_one_tick(
             return;
         }
     };
+
+    // Connectivity probe — when the legacy WG tunnel flaps the bb8
+    // pool's 15s connection_timeout fires once per CT-enabled table,
+    // turning a 2-min outage into a ~4-min (16×15s) sequential WARN
+    // sweep. Probing once up front lets us bail the entire tick on a
+    // single failure; the next tick (1s later) re-probes and resumes
+    // the moment the tunnel comes back. See `probe_legacy_connectivity`
+    // doc for the burn-in evidence.
+    if let Err(err) = probe_legacy_connectivity(mssql).await {
+        tracing::warn!(
+            site = %site_id,
+            error = %err,
+            "Legacy MSSQL probe failed; skipping tick"
+        );
+        return;
+    }
 
     let now = Instant::now();
     for mapper in mappers {
