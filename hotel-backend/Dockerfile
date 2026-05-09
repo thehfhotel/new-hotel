@@ -15,7 +15,7 @@
 #
 # Previous iteration relied solely on `--mount=type=cache` for target/.
 # That works WITHIN a build, but the cache mount lives at the BuildKit
-# layer — sibling builds (build-backend vs build-ville-sync) share it
+# layer — sibling builds (build-frontend vs build-backend) share it
 # only when they run on the same runner with the same gha cache scope.
 # In CI today every job pulls its own gha-scoped cache, and a CI
 # `cache-to: type=gha,mode=max` upload of a 4GB target/ directory takes
