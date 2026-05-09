@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.58.3] - 2026-05-09
+
+### Fixed
+
+- **CT watcher: empty-fetch path now clears stale `last_error` on HF Ville's
+  low-traffic / empty CT-tracked tables.** `bin/sync.rs` `poll_table` was
+  early-returning on a successful 0-row CT fetch (`if rows.is_empty() {
+  return Ok(()) }`) without calling `bump_skipped` to update
+  `last_processed_at` and clear `last_error` / `consecutive_failures`.
+  Combined with HF Ville's transient WireGuard tunnel flaps that produce
+  bb8 connection-pool timeouts on every table in the loop, this left
+  five Ville tables permanently STUCK in `legacy_sync_status` with
+  `consecutive_failures` in the dozens and a stale "Timed out in bb8"
+  `last_error` even though the watcher was in fact polling them
+  successfully (just with no CT changes to ingest):
+
+  | Table             | Ville rows | CT rows ever | Why stuck                     |
+  |-------------------|-----------:|-------------:|-------------------------------|
+  | `HT_Cupon`        |          0 |            0 | Empty table; only failures bump |
+  | `HT_Deposit`      |          0 |            0 | Empty table; only failures bump |
+  | `HT_Bill_Debt_H`  |          0 |            0 | Empty table; only failures bump |
+  | `HT_Bill_Debt_Ds` |          0 |            0 | Empty table; only failures bump |
+  | `HT_Receipt_H`    |        101 |            0 | Pre-CT rows; no change events  |
+
+  CT was confirmed enabled with PKs on all 5 tables on Ville's MSSQL
+  (`<ville-mssql-host>:1436` / `HOTEL`); migrations 020 + 021 had
+  applied correctly during the 2026-04-30 Phase 5/5.5 cutover. Root
+  cause was purely an observability bug in the watcher.
+
+  Fix: call `bump_skipped(pg, table, 0, false)` before the early return,
+  mirroring what the NoopMapper short-circuit at the top of `poll_table`
+  already does. Adds a regression test
+  (`empty_fetch_clears_error_via_bump_skipped`) that source-greps for
+  the call inside the empty-rows guard region.
+
+  Verification post-deploy: query `legacy_sync_status` on the
+  `hotelville` PG and confirm the 5 tables show `consecutive_failures =
+  0`, `last_error = NULL`, and a recent `last_processed_at`. No
+  Ville-side MSSQL changes required — receptionist coordination NOT
+  needed.
+
 ## [2.58.2] - 2026-05-09
 
 ### Removed

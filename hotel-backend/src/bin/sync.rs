@@ -94,6 +94,31 @@ const DEFAULT_CT_POLL_INTERVAL_MS: u64 = 1000;
 /// Override at runtime via `LEGACY_SYNC_RETENTION_CHECK_INTERVAL_SECS`.
 const DEFAULT_RETENTION_CHECK_INTERVAL_SECS: u64 = 300;
 
+/// MSSQL-pool-outage circuit breaker (v2.58.4). HF Ville's WG tunnel
+/// flaps for ~2 min every couple of days; when the legacy MSSQL is
+/// unreachable, every `mssql.get().await` blocks for the full 15s
+/// `POOL_CONNECTION_TIMEOUT` and returns "Timed out in bb8". Without
+/// short-circuiting we walk the 16-table loop sequentially, each
+/// table's own `fetch_ct_rows` paying its own 15s — the burst lasts
+/// 16×15s ≈ 4 min and produces 16 identical WARNs. The breaker
+/// trips on the FIRST pool-timeout in a tick, abandons the rest of
+/// the tick, and sleeps a cooldown so the next tick gives the
+/// tunnel a chance to recover before retrying.
+///
+/// Override at runtime via `LEGACY_SYNC_OUTAGE_COOLDOWN_SECS`.
+const DEFAULT_OUTAGE_COOLDOWN_SECS: u64 = 30;
+
+/// Number of consecutive ticks that must trip the pool-outage breaker
+/// before the watcher pages an operator. A single tick failure is
+/// almost always a 1s WG keepalive miss + immediate recovery — paging
+/// on it would be pure noise. Two consecutive failed ticks (separated
+/// by the cooldown above ≈ 30s minimum) only happen when the tunnel
+/// has stayed dead for >30s, which is the operationally interesting
+/// case.
+///
+/// Override at runtime via `LEGACY_SYNC_OUTAGE_ALERT_THRESHOLD`.
+const DEFAULT_OUTAGE_ALERT_THRESHOLD: u32 = 2;
+
 /// All CT-enabled MSSQL tables — must stay in sync with the seed in
 /// migrations 017 (canonical sync, 10 tables) + 022 (legacy_mirror, 6
 /// tables) and the `legacy_sync_status` rows. Adding a new mapper
@@ -227,6 +252,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .unwrap_or(DEFAULT_RETENTION_CHECK_INTERVAL_SECS),
     );
 
+    // Phase 5.5/2.58.4 — MSSQL-pool-outage breaker knobs. Both are
+    // operator-visible env vars so a noisy WG tunnel can be tuned
+    // without a redeploy.
+    let outage_cooldown = Duration::from_secs(
+        env::var("LEGACY_SYNC_OUTAGE_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_OUTAGE_COOLDOWN_SECS),
+    );
+    let outage_alert_threshold = env::var("LEGACY_SYNC_OUTAGE_ALERT_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_OUTAGE_ALERT_THRESHOLD);
+
     let shadow_mode = env::var("LEGACY_SYNC_SHADOW_MODE")
         .map(|v| v == "true")
         .unwrap_or(false);
@@ -236,6 +275,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!(
         poll_interval_ms,
         retention_check_interval_secs = retention_check_interval.as_secs(),
+        outage_cooldown_secs = outage_cooldown.as_secs(),
+        outage_alert_threshold,
         shadow_mode,
         allowlist = ?allowlist,
         "Starting CT watcher"
@@ -841,6 +882,21 @@ async fn poll_table(
     };
 
     if rows.is_empty() {
+        // Empty-fetch success: no CT changes since `last_seen`. Bump the
+        // skipped/processed counters with 0 so `last_processed_at` ticks
+        // forward and any prior `last_error` / `consecutive_failures`
+        // accumulated from a transient bb8 timeout get cleared. Without
+        // this, low-traffic / empty tables (HF Ville's HT_Cupon,
+        // HT_Deposit, HT_Bill_Debt_*, HT_Receipt_H — all 0-row or
+        // CT-history-empty on Ville) would stay permanently stuck in
+        // `legacy_sync_status` showing "Timed out in bb8" with high
+        // `consecutive_failures` even though their fetches now succeed,
+        // because the counter-clearing path was only reachable via a
+        // non-empty `bump_counters` call. Mirrors what the NoopMapper
+        // short-circuit at the top of this function already does on a
+        // 0-row count. Fixes the 5-stuck-table observability bug
+        // (v2.58.3, fix/hfville-stuck-ct-tables).
+        let _ = bump_skipped(pg, table, 0, false).await;
         return Ok(());
     }
 
@@ -1795,6 +1851,41 @@ mod tests {
         assert!(
             msg.contains("DELETE") && msg.contains("clobber"),
             "refusal must explain the snapshot-DELETE-vs-CT-UPSERT race"
+        );
+    }
+
+    /// Regression: the empty-fetch path in `poll_table` must call
+    /// `bump_skipped(.., 0, false)` before its early return so a prior
+    /// `last_error` (e.g. transient bb8 timeout from a tunnel flap)
+    /// gets cleared on the next successful 0-row fetch. Without this,
+    /// low-traffic / empty tables (HF Ville's HT_Cupon, HT_Deposit,
+    /// HT_Bill_Debt_*, HT_Receipt_H — all 0-row or CT-history-empty
+    /// on Ville post-Phase-5.5b) accumulate `consecutive_failures`
+    /// indefinitely and never recover their healthy status, even
+    /// though the watcher is in fact polling them successfully.
+    /// Discovered 2026-05-09; fix in v2.58.3.
+    #[test]
+    fn empty_fetch_clears_error_via_bump_skipped() {
+        let source = include_str!("sync.rs");
+        // Slice the file at the empty-rows guard so the assertion only
+        // sees the relevant region (avoids false positives from the
+        // NoopMapper-path bump_skipped a few dozen lines earlier).
+        let marker = "if rows.is_empty() {";
+        let idx = source
+            .find(marker)
+            .expect("poll_table must contain the empty-rows guard");
+        let region_end = idx
+            + source[idx..]
+                .find("return Ok(())")
+                .expect("empty-rows guard must early-return")
+            + "return Ok(())".len();
+        let region = &source[idx..region_end];
+        assert!(
+            region.contains("bump_skipped(pg, table, 0, false)"),
+            "empty-fetch path must clear last_error / consecutive_failures \
+             via bump_skipped(.., 0, false) before returning, otherwise \
+             low-traffic tables stay stuck on stale bb8-timeout errors. \
+             Got region:\n{region}"
         );
     }
 }
