@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.58.5] - 2026-05-09
+
+### Changed
+
+- **`docker-compose.yml`** — `writeback-hfville` service default flipped
+  from `WRITEBACK_ENABLED=false` to `true`, mirroring the post-cutover
+  default already in place for `sync-hfville` (`LEGACY_SYNC_ENABLED=true`).
+
+  Background: the #76 Ville cutover landed 2026-04-30 but the writeback
+  flag was never flipped, so PG canonical state has not been mirrored
+  back into Ville's legacy MSSQL since cutover. The Ville legacy app is
+  still active at the receptionist desk for nightly billing/reports —
+  without writeback those workflows don't see new bookings/checkins
+  written through the new system.
+
+  Operator can still set `HFVILLE_WRITEBACK_ENABLED=false` in `.env` to
+  pause writeback (e.g. during a Ville-MSSQL incident) and that override
+  wins over the new default.
+
+  Mirrors prior pattern: `HFVILLE_LEGACY_SYNC_ENABLED:-true` (set 2026-04-30)
+  and `HFVILLE_LEGACY_SYNC_SHADOW_MODE:-false` (set 2026-04-30).
+
 ## [2.58.4] - 2026-05-09
 
 ### Fixed
