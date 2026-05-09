@@ -37,7 +37,7 @@
     "husky": "^9.1.7",
     "jest": "^30.3.0",
     "jest-environment-jsdom": "^30.2.0",
-    "postcss": "^8.4.49",
+    "postcss": "^8.5.14",
     "tailwindcss": "^4.2.4",
     "ts-jest": "^29.4.6",
     "typescript": "^5.7.2"
