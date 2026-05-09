@@ -842,7 +842,7 @@ Other ground-truth facts that fall out of this precedence rule:
 
 - **Text encoding is `varchar Thai_CI_AS` (Windows-874 / TIS-620), not Unicode.** Sending an `N'…'` Unicode literal corrupts every Thai character into `?` because `nvarchar → varchar` conversion strips anything outside the codepage. **Always pass plain `varchar` parameters** — the `tiberius` driver handles the codepage transcoding when the column type is `varchar`. The same rule applies to the `WHERE` clause: looking up a Thai name with `N'…'` will silently miss because the search text round-trips through the same lossy conversion.
 
-When in doubt, do a fresh live capture against `<legacy-mssql-host>` rather than trusting a years-old note. The Extended Events session in `scripts/legacy-monitor/` is the canonical way to do this.
+When in doubt, do a fresh live capture against `<legacy-mssql-host>` rather than trusting a years-old note. An ad-hoc Extended Events session against the live MSSQL instance is the canonical way to do this — see `docs/legacy-spike/` for the methodology used during the 2026-04 reverse-engineering pass.
 
 ---
 
@@ -1328,7 +1328,7 @@ Phase 4b (writeback worker) is the bigger lift but doesn't affect the UI behavio
 5. **Split into 3 binaries (api, sync, writeback)** vs keep monolith with feature flags — recommended split for blast-radius isolation
 6. **Frontend collapse to single `/app/*` tree** — confirmed
 7. **HF Ville deployment shape** — full stack at Ville (Phase 7) vs central-only with Tailscale tunnels — recommended full stack
-8. ✅ **SQL Server Change Tracking enabled 2026-04-25** — CT (and primary keys, where missing) is live on the 10 tables that drive sync: `HT_Customers`, `HT_Rooms`, `HT_Room_Status`, `HT_Book_H`, `HT_Book_Ds`, `HT_Book_Date`, `HT_CheckIn_H`, `HT_CheckIn_Ds`, `HT_CheckIn_Pay`, `HT_Receipt_H`. Vendor app unaffected. Rollback script lives in `scripts/legacy-monitor/` and the long-running XE session there records activity + alerts on errors. No further DBA approval needed for Phase 5; the watcher can be implemented immediately.
+8. ✅ **SQL Server Change Tracking enabled 2026-04-25** — CT (and primary keys, where missing) is live on the 10 tables that drive sync: `HT_Customers`, `HT_Rooms`, `HT_Room_Status`, `HT_Book_H`, `HT_Book_Ds`, `HT_Book_Date`, `HT_CheckIn_H`, `HT_CheckIn_Ds`, `HT_CheckIn_Pay`, `HT_Receipt_H`. Vendor app unaffected. Apply/rollback migrations live in `migrations/legacy-mssql/`. No further DBA approval needed for Phase 5; the watcher can be implemented immediately.
 9. **SSE vs WebSockets for real-time UI** — recommended SSE (simpler, one-way is sufficient for our needs, auto-reconnects, works through proxies). Pushback OK if WebSockets are needed later for chat / collaborative editing.
 10. **Event payload size budget** — recommend ≤8KB per event (full snapshots for small aggregates, just IDs for large ones — subscribers re-fetch).
 
