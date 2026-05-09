@@ -14,7 +14,6 @@ Summary:
 
 **Companion docs:**
 - `docs/legacy-spike/findings.md` — validated SQL recipes for every writeback flow. Don't re-derive.
-- `scripts/legacy-monitor/` — long-running XE session for error alerting + activity recording.
 
 ## Versioning & Changelog Policy
 

@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.58.6] - 2026-05-09
+
+### Removed
+
+- **`scripts/legacy-monitor/` and the corresponding evergreen systemd
+  service have been retired.** The directory held an Extended Events
+  session that served two purposes during the 2026-04 migration:
+  1. Tripwire for the CT/PK enable migrations on legacy MSSQL.
+  2. Capture stream for the writeback reverse-engineering spike.
+
+  Both are satisfied. The CT/PK enable went live 2026-04-25 (HF Hotel)
+  and 2026-04-30 (HF Ville Phase 5/5.5) with 9+ days of clean post-
+  cutover burn-in. The spike findings have been finalised in
+  `docs/legacy-spike/findings.md` (700 LOC, the source of truth for
+  every writeback recipe). The XE-session log files had grown to
+  ~7.4 GB of mostly noise (`error_number = 0` `sql_batch_completed`
+  reads) on evergreen and were no longer being consulted.
+
+  Changes:
+  - Deleted `scripts/legacy-monitor/` (9 files: 3 SQL setup files,
+    `tail-loop.sh`, `start.sh`, `stop.sh`, `check-errors.sh`,
+    `check-activity.sh`, `README.md`).
+  - Stopped + disabled `legacy-monitor.service` on evergreen, removed
+    `~/.config/systemd/user/legacy-monitor.service` and `~/legacy-monitor/`.
+  - Dropped the `scripts/legacy-monitor/` line from
+    `hotel-backend/.dockerignore`.
+  - Updated `docs/architecture.md` §3.7: replaced "Extended Events
+    session in `scripts/legacy-monitor/` is the canonical way" with a
+    pointer to ad-hoc XE sessions + `docs/legacy-spike/` methodology.
+  - Updated `docs/architecture.md` §10 item 8: corrected the
+    rollback-script location to `migrations/legacy-mssql/` (which is
+    where the apply/rollback files actually live).
+  - Dropped the `scripts/legacy-monitor/` companion-doc bullet from
+    `CLAUDE.md`.
+
+  Should a future schema change need a similar tripwire, the
+  methodology in `docs/legacy-spike/README.md` covers how to spin one
+  up ad-hoc — no need to keep the long-running daemon.
+
 ## [2.58.5] - 2026-05-09
 
 ### Changed
