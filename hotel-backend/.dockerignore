@@ -37,7 +37,6 @@ types/
 init-db/
 migrations/
 deploy/
-scripts/legacy-monitor/
 scripts/legacy-spike/
 
 # Reverse-engineering reference (committed for grep, excluded from images).
