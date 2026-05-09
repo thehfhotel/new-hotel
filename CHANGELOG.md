@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.58.2] - 2026-05-09
+
+### Removed
+
+- **Vestigial `ville_sync` references scrubbed from code comments.** The
+  `bin/ville_sync.rs` binary was retired on 2026-04-30 (task #77) when HF
+  Ville's MSSQL was upgraded to SS2025 Express, allowing the unified
+  `bin/sync.rs` CT watcher to serve both HF Hotel and HF Ville via
+  per-site env (`SITE_ID`). The binary, its container service, and its
+  `Cargo.toml` `[[bin]]` entry were removed at that time. Three stale
+  comments survived and are now scrubbed:
+  - `hotel-backend/src/main.rs` — dropped the "formerly fed by the
+    retired ville_sync FreeTDS poll" parenthetical from the HF Ville
+    pool comment block.
+  - `hotel-backend/Dockerfile` — replaced the `build-ville-sync`
+    sibling-build example with the current real pair
+    (`build-frontend vs build-backend`).
+  - `hotel-backend/.env.example` — dropped `+ ville-sync` from the
+    `MSSQL_POOL_MAX_SIZE` description, leaving `(writeback + sync)`.
+
+  Cosmetic only; no behaviour change, no build/runtime impact.
+
 ## [2.58.1] - 2026-05-06
 
 ### Added
