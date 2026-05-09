@@ -106,7 +106,7 @@ impl NewDbConfig {
                 .unwrap_or(5439),
             database: env::var("NEW_DB_NAME").unwrap_or_else(|_| "hotelnew".to_string()),
             user: env::var("NEW_DB_USER").unwrap_or_else(|_| "postgres".to_string()),
-            password: env::var("NEW_DB_PASSWORD").unwrap_or_else(|_| "12345678".to_string()),
+            password: require_secret("NEW_DB_PASSWORD"),
             pool_max: env::var("NEW_DB_POOL_MAX")
                 .ok()
                 .and_then(|v| v.parse().ok())

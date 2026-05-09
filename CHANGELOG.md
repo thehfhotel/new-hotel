@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.59.0] - 2026-05-09
+
+### Security
+
+- **Phase 3 hardening — replace `NEW_DB_PASSWORD` silent fallback with
+  `panic!` (via `require_secret`).** `hotel-backend/src/config.rs:109`
+  previously did `unwrap_or_else(|_| "12345678".to_string())` if the
+  env var was missing or empty. The legacy `12345678` value matches
+  the historical leaked MSSQL `sa` password, so a deploy that dropped
+  `NEW_DB_PASSWORD` (CI secret rotation typo, runbook §4a `.env`-rewrite
+  pitfall) would silently fall back to that string and may successfully
+  connect to a freshly-bootstrapped PG instance using the same default.
+
+  Now uses the existing `require_secret()` helper (same pattern already
+  applied to `DB_PASSWORD` and `VILLE_DB_PASSWORD`) which panics at
+  config load with a clear message. A misconfigured deploy fails LOUD
+  at startup instead of silently routing to a default-credentials DB.
+
+  Also collapsed `hotel-backend/src/bin/migrate_legacy.rs:734-742` —
+  was duplicating the env-var read logic with the same `12345678`
+  fallback. Replaced with `NewDbConfig::from_env()` so both paths share
+  the same panic-on-missing-password contract. Same shape as
+  `create_legacy_pool` already does for the MSSQL side via `DbConfig`.
+
+  Audit reference: HIGH-2 in the threat model agent's report
+  (`a89bc2c9f267b1f2d` session, 2026-05-05).
+
 ## [2.58.6] - 2026-05-09
 
 ### Removed
