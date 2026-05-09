@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.58.4] - 2026-05-09
+
+### Fixed
+
+- **`hotel-backend/src/bin/sync.rs`** — added a connectivity probe at
+  the top of `run_one_tick`. When the legacy WG tunnel flaps, the bb8
+  pool's 15s `connection_timeout` was firing once per CT-enabled
+  table, turning a 2-minute outage into a ~4-minute (16×15s)
+  sequential WARN sweep before the watcher caught up.
+
+  The probe acquires a connection and runs `SELECT 1`. If it fails,
+  the whole tick is skipped (one WARN logged); the next tick (1s
+  later) re-probes and resumes the moment the tunnel comes back.
+
+  Burn-in evidence (HF Ville sync, 2026-05-05 → 2026-05-08): three
+  daily ~2-3 min bursts of the form "CT fetch failed: Timed out in
+  bb8" repeated across all 16 tables. Pattern matches WG handshake
+  flap on the `10.10.10.4 → MikroTik DNAT → 192.168.11.51,1436` path.
+  Watcher self-recovered without restart, but recovery was slow
+  (~4 min) and noisy (~16 WARNs per outage). Probe collapses both.
+
 ## [2.58.3] - 2026-05-09
 
 ### Fixed
