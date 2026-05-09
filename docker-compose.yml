@@ -368,8 +368,13 @@ services:
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@newdb:${PGPORT:-5439}/hotelville
       - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
       - SITE_ID=hfville
-      # Default OFF until Ville goes live (#76 cutover).
-      - WRITEBACK_ENABLED=${HFVILLE_WRITEBACK_ENABLED:-false}
+      # Default ON post-#76 cutover (2026-04-30): mirrors the sync-hfville
+      # default flip pattern. The Ville legacy app is still active at the
+      # receptionist desk, so canonical-PG → Ville-MSSQL writeback must run
+      # for nightly billing/reports to see new bookings. Operator can flip
+      # HFVILLE_WRITEBACK_ENABLED=false in .env to pause (e.g. during a
+      # MSSQL-side incident) and that override will win over this default.
+      - WRITEBACK_ENABLED=${HFVILLE_WRITEBACK_ENABLED:-true}
       - WRITEBACK_POLL_INTERVAL_SECS=${HFVILLE_WRITEBACK_POLL_INTERVAL_SECS:-30}
       - WRITEBACK_MAX_ATTEMPTS=${HFVILLE_WRITEBACK_MAX_ATTEMPTS:-3}
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,writeback=info}
