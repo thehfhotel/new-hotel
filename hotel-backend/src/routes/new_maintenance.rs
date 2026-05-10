@@ -210,12 +210,15 @@ pub async fn list_requests(
 
     let offset = (params.page - 1) * params.limit;
 
-    // Build WHERE conditions
+    // Build WHERE conditions. The `status` filter is parameterized (sqlx bind)
+    // because it accepts arbitrary user input; the integer filters are safely
+    // formatted in-place since `i32` cannot encode SQL syntax.
     let mut conditions: Vec<String> = Vec::new();
+    let mut next_param_index: i32 = 1;
 
-    if let Some(ref status) = params.status {
-        let escaped = status.replace('\'', "''");
-        conditions.push(format!("r.mreq_status = '{}'", escaped));
+    if params.status.is_some() {
+        conditions.push(format!("r.mreq_status = ${}", next_param_index));
+        next_param_index += 1;
     }
 
     if let Some(room_id) = params.room_id {
@@ -230,6 +233,9 @@ pub async fn list_requests(
         conditions.push(format!("r.mreq_priority = {}", priority));
     }
 
+    // Silence unused-assignment warning if no further binds are added.
+    let _ = next_param_index;
+
     let where_clause = if conditions.is_empty() {
         String::new()
     } else {
@@ -242,9 +248,9 @@ pub async fn list_requests(
         where_clause
     );
 
-    let count_rows = sqlx::query(&count_query)
-        .fetch_all(pool)
-        .await?;
+    let count_q = sqlx::query(&count_query);
+    let count_q = match &params.status { Some(s) => count_q.bind(s), None => count_q };
+    let count_rows = count_q.fetch_all(pool).await?;
 
     let total: i32 = count_rows
         .first()
@@ -290,9 +296,9 @@ pub async fn list_requests(
         where_clause, params.limit, offset
     );
 
-    let rows = sqlx::query(&data_query)
-        .fetch_all(pool)
-        .await?;
+    let data_q = sqlx::query(&data_query);
+    let data_q = match &params.status { Some(s) => data_q.bind(s), None => data_q };
+    let rows = data_q.fetch_all(pool).await?;
 
     let requests: Vec<MaintenanceRequest> = rows
         .iter()
@@ -464,17 +470,22 @@ pub async fn update_request(
 ) -> ApiResult<Json<MutationResponse>> {
     let pool = &state.new_pool;
 
-    // Build dynamic UPDATE query
+    // Build dynamic UPDATE query with parameterized placeholders. Each text/
+    // numeric column that takes a user-supplied value reserves the next `$N`
+    // slot; the values are bound below in the same order via sqlx, so they
+    // cannot be interpreted as SQL. Integer columns are still safe to inline
+    // because `i32`/`f64` cannot encode SQL syntax.
     let mut set_parts: Vec<String> = Vec::new();
+    let mut next_param_index: i32 = 1;
 
-    if let Some(ref title) = body.title {
-        let escaped = title.replace('\'', "''");
-        set_parts.push(format!("mreq_title = '{}'", escaped));
+    if body.title.is_some() {
+        set_parts.push(format!("mreq_title = ${}", next_param_index));
+        next_param_index += 1;
     }
 
-    if let Some(ref description) = body.description {
-        let escaped = description.replace('\'', "''");
-        set_parts.push(format!("mreq_description = '{}'", escaped));
+    if body.description.is_some() {
+        set_parts.push(format!("mreq_description = ${}", next_param_index));
+        next_param_index += 1;
     }
 
     if let Some(priority) = body.priority {
@@ -482,8 +493,8 @@ pub async fn update_request(
     }
 
     if let Some(ref status) = body.status {
-        let escaped = status.replace('\'', "''");
-        set_parts.push(format!("mreq_status = '{}'", escaped));
+        set_parts.push(format!("mreq_status = ${}", next_param_index));
+        next_param_index += 1;
 
         // Automatically set timestamps based on status
         if status == "in_progress" {
@@ -493,14 +504,14 @@ pub async fn update_request(
         }
     }
 
-    if let Some(ref assigned_to) = body.assigned_to {
-        let escaped = assigned_to.replace('\'', "''");
-        set_parts.push(format!("mreq_assigned_to = '{}'", escaped));
+    if body.assigned_to.is_some() {
+        set_parts.push(format!("mreq_assigned_to = ${}", next_param_index));
+        next_param_index += 1;
     }
 
-    if let Some(ref resolution) = body.resolution {
-        let escaped = resolution.replace('\'', "''");
-        set_parts.push(format!("mreq_resolution = '{}'", escaped));
+    if body.resolution.is_some() {
+        set_parts.push(format!("mreq_resolution = ${}", next_param_index));
+        next_param_index += 1;
     }
 
     if let Some(cost) = body.cost {
@@ -513,13 +524,27 @@ pub async fn update_request(
 
     set_parts.push("mreq_updated_at = NOW()".to_string());
 
+    // mreq_id is the LAST bind so it occupies the final `$N` slot regardless
+    // of which optional columns appeared above.
+    let id_param_index = next_param_index;
+
     let update_query = format!(
-        "UPDATE ht_maintenance_requests SET {} WHERE mreq_id = {}",
+        "UPDATE ht_maintenance_requests SET {} WHERE mreq_id = ${}",
         set_parts.join(", "),
-        request_id
+        id_param_index
     );
 
-    let result = sqlx::query(&update_query).execute(pool).await?;
+    // Bind values in the same order the placeholders were assigned above, then
+    // bind `request_id` last to match the WHERE-clause `$id_param_index`.
+    let q = sqlx::query(&update_query);
+    let q = match &body.title { Some(v) => q.bind(v), None => q };
+    let q = match &body.description { Some(v) => q.bind(v), None => q };
+    let q = match &body.status { Some(v) => q.bind(v), None => q };
+    let q = match &body.assigned_to { Some(v) => q.bind(v), None => q };
+    let q = match &body.resolution { Some(v) => q.bind(v), None => q };
+    let q = q.bind(request_id);
+
+    let result = q.execute(pool).await?;
 
     if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("Maintenance request not found".to_string()));
