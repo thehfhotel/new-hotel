@@ -5,6 +5,100 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.61.0] - 2026-05-10
+
+### Added
+
+- **Phase 4 PRs 2 + 3 + 4 — full backend authentication + frontend
+  login + admin user management.** Combined release of 3
+  parallel-developed PRs cherry-picked onto master in order
+  (PR2 backend → PR3 frontend → PR4 admin). Like PR1, **inert in
+  production by default** — operator must flip both
+  `AUTH_ENABLED=true` (backend) and `NEXT_PUBLIC_AUTH_REQUIRED=true`
+  (frontend) to take effect.
+
+  - `f4bec2e` (PR2) — `feat(auth): add /api/auth/{login,logout,me}
+    routes + AUTH_ENABLED middleware`. Three new endpoints under
+    `/api/auth/*`. `POST /api/auth/login` validates creds, sets
+    `Set-Cookie: session=<64-hex>; HttpOnly; SameSite=Lax; Path=/;
+    Max-Age=86400[; Secure]` (Secure when `X-Forwarded-Proto:
+    https`). `POST /api/auth/logout` clears it (idempotent).
+    `GET /api/auth/me` returns the current `UserDto` (drops
+    `password_hash`) or 401. Uniform `invalid_credentials` error
+    on missing-user / wrong-password / inactive-user paths to
+    prevent enumeration. New `axum-extra = "0.12"` (cookie
+    feature) + `cookie = "0.18"` deps. New
+    `hotel-backend/src/middleware/auth.rs` provides
+    `require_auth` — when `AUTH_ENABLED=false` (default) it's a
+    no-op pass-through; when true it validates the cookie,
+    injects `crate::domain::user::User` into request extensions,
+    or returns 401 JSON. Applied via `route_layer` to the
+    `/api/new/*` subrouter only (public routes — health, mode,
+    changelog, auth itself — are not gated). +14 unit tests in
+    `routes::auth::tests`.
+
+  - `cd0058a` (PR3) — `feat(auth): add /login page, AuthContext,
+    and 401-redirect guard`. New `contexts/AuthContext.tsx` exposes
+    `user`, `loading`, `error`, `login()`, `logout()`, `refresh()`
+    via the `useAuth()` hook. `AuthGuard` (embedded in the
+    provider) reads `process.env.NEXT_PUBLIC_AUTH_REQUIRED` —
+    when `'true'` and the user is null and we're not already on
+    `/login`, redirects with `?redirect=<current-path>`; when
+    anything else, renders children regardless (the dev-mode
+    escape hatch). `app/login/page.tsx` renders a Thai-localized
+    centered card matching the dashboard's flat-panel style
+    (ชื่อผู้ใช้ / รหัสผ่าน / เข้าสู่ระบบ); Suspense-wrapped per
+    Next.js 16's `useSearchParams` rules. New `lib/api.ts`
+    `apiFetch` helper always sends `credentials: 'include'`.
+    `components/Sidebar.tsx` got a logout block above the
+    collapse toggle (icon-only when collapsed). +1 test suite,
+    +5 tests.
+
+  - `ea7dff0` (PR4) — `feat(auth): admin user management
+    endpoints + /admin/users page`. Three admin-only endpoints
+    under `/api/admin/users` (gated by the same `require_auth`
+    middleware + per-handler `actor.role == Admin` check):
+    `GET` lists, `POST` creates (409 on username collision),
+    `PATCH /{user_id}` updates any subset of `{active, role,
+    password}` (422 on bad role string, 404 on missing user).
+    Repository got `list_all`, `update_active`, `update_role`,
+    `update_password_hash` methods plus `apply_admin_patch`
+    façade. Service got `list_users`, `create_user`,
+    `update_user` plus new `AuthError::UserNotFound` and
+    `AuthError::UsernameTaken` variants. New
+    `app/admin/users/page.tsx` renders a table with toggle-active
+    and reset-password actions; sidebar's new "ผู้ใช้งาน" entry
+    only appears when `useAuth().user?.role === 'admin'`. The
+    `CreateUserModal` and `ResetPasswordModal` follow existing
+    modal patterns. +8 service tests + 12 route tests + 3
+    frontend tests.
+
+  Combined verification on master:
+  - `cargo test --lib` = **352 passed** (was 318 pre-Phase-4;
+    PR1 +12 + PR2 +14 + PR4 +20 = +46 net)
+  - `pnpm test` = **667 passed across 25 suites** (was 621/22
+    pre-Phase-4; PR3 +5 + PR4 +3 = +8 net)
+  - `cargo build --bin hotel-backend` and
+    `cargo build --bin create_user` both link
+  - `pnpm build` produces `/login` + `/admin/users` as
+    pre-rendered routes
+
+### Operator cutover (deferred — flip when ready)
+
+1. `cargo run --bin create_user -- --username <op> --role admin`
+   on prod (or container exec equivalent) — bootstrap the first
+   admin while AUTH still off.
+2. Set `AUTH_ENABLED=true` in backend env.
+3. Set `NEXT_PUBLIC_AUTH_REQUIRED=true` in frontend env (the
+   web image must rebuild for this since `NEXT_PUBLIC_*` is
+   inlined at build time).
+4. Push a no-op commit (or restart containers via the deploy
+   runner) to roll the new env.
+5. Verify: `curl -i https://<host>/api/auth/me` → 401,
+   `/api/new/rooms` → 401, `/login` renders, post-login the
+   admin sees the `ผู้ใช้งาน` sidebar entry and can create
+   receptionist accounts at `/admin/users`.
+
 ## [2.60.0] - 2026-05-10
 
 ### Added
