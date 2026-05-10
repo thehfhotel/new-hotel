@@ -56,22 +56,33 @@ async fn list_checkins_pg(
 ) -> ApiResult<Json<CheckInsResponse>> {
     let offset = (params.page - 1) * params.limit;
 
-    // Build WHERE conditions with direct value interpolation
+    // Build WHERE conditions with parameterized placeholders. Each filter that
+    // contributes a bind value reserves the next `$N` slot; the values are
+    // bound below in the same order via sqlx, eliminating SQL injection risk.
     let mut conditions: Vec<String> = Vec::new();
+    let mut next_param_index: i32 = 1;
 
-    if let Some(ref status) = params.status {
-        conditions.push(format!("cin_status = '{}'", status.replace('\'', "''")));
+    if params.status.is_some() {
+        conditions.push(format!("cin_status = ${}", next_param_index));
+        next_param_index += 1;
     }
 
-    // Date range filter: find check-ins that OVERLAP the given range
-    // A check-in overlaps if it starts before the end AND ends after the start
-    if let Some(ref start_date) = params.start_date {
-        conditions.push(format!("cin_room_out::date >= '{}'", start_date.replace('\'', "''")));
+    // Date range filter: find check-ins that OVERLAP the given range.
+    // A check-in overlaps if it starts before the end AND ends after the start.
+    if params.start_date.is_some() {
+        conditions.push(format!("cin_room_out::date >= ${}", next_param_index));
+        next_param_index += 1;
     }
 
-    if let Some(ref end_date) = params.end_date {
-        conditions.push(format!("cin_room_in::date <= '{}'", end_date.replace('\'', "''")));
+    if params.end_date.is_some() {
+        conditions.push(format!("cin_room_in::date <= ${}", next_param_index));
+        next_param_index += 1;
     }
+
+    // Discard the final increment to keep the unused-assignment lint quiet
+    // when `end_date` is the last filter; the bind chain below still relies
+    // on the placeholders generated above.
+    let _ = next_param_index;
 
     let where_clause = if conditions.is_empty() {
         String::new()
@@ -85,9 +96,11 @@ async fn list_checkins_pg(
         where_clause
     );
 
-    let count_rows = sqlx::query(&count_query)
-        .fetch_all(pool)
-        .await?;
+    let count_q = sqlx::query(&count_query);
+    let count_q = match &params.status { Some(s) => count_q.bind(s), None => count_q };
+    let count_q = match &params.start_date { Some(s) => count_q.bind(s), None => count_q };
+    let count_q = match &params.end_date { Some(s) => count_q.bind(s), None => count_q };
+    let count_rows = count_q.fetch_all(pool).await?;
 
     let total: i32 = count_rows
         .first()
@@ -112,9 +125,11 @@ async fn list_checkins_pg(
         where_clause, offset, params.limit
     );
 
-    let rows = sqlx::query(&data_query)
-        .fetch_all(pool)
-        .await?;
+    let data_q = sqlx::query(&data_query);
+    let data_q = match &params.status { Some(s) => data_q.bind(s), None => data_q };
+    let data_q = match &params.start_date { Some(s) => data_q.bind(s), None => data_q };
+    let data_q = match &params.end_date { Some(s) => data_q.bind(s), None => data_q };
+    let rows = data_q.fetch_all(pool).await?;
 
     let checkins: Vec<CheckIn> = rows
         .iter()
