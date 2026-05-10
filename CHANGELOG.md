@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.59.3] - 2026-05-10
+
+### Security
+
+- **Tauri 2.9.5 → 2.11.1** — patches CVE-2026-42184
+  (GHSA-7gmj-67g7-phm9, "Origin Confusion in `is_local_url()`",
+  CVSS 4.0 = 6.1 medium). Affects `thai-id-middleware-tauri/`, the
+  Tauri desktop helper distributed to receptionist workstations for
+  Thai national ID card reading. The bug allowed remote pages whose
+  domain's first label matches a registered custom protocol (e.g.
+  `http://app.attacker.com/`) to be classified as local origins on
+  Windows/Android — letting them invoke IPC commands explicitly
+  scoped `local: true`. We don't ship a malicious frontend, but this
+  is patched defensively and to keep Dependabot quiet now that the
+  repo is moving toward public.
+
+  Lock-only update via `cargo update -p tauri --precise 2.11.1`.
+  Chained bumps: `tao 0.34.5→0.35.2`, `tauri-build 2.5.3→2.6.1`,
+  `tauri-codegen/macros 2.5.2→2.6.1`, `tauri-runtime{,-wry}
+  2.9.x→2.11.1`, `tauri-utils 2.8.1→2.9.1`, `tray-icon 0.21.3→0.23.1`,
+  `wry 0.53.5→0.55.1`, plus a few transitive additions
+  (`web_atoms`, `string_cache`, `tendril`).
+
+### Added
+
+- **`SECURITY.md`** (Phase 0 of the public-flip plan). Defines the
+  vulnerability reporting process (email + 5-business-day ack +
+  90-day disclosure), scope (this repo's app + middleware +
+  deployment config), supported versions (latest master only), and
+  out-of-scope items (social engineering, DoS, third-party services).
+
 ## [2.59.2] - 2026-05-10
 
 ### Security
