@@ -352,9 +352,14 @@ impl InventoryRepository for PgInventoryRepository {
     ) -> Result<(Vec<ItemRow>, i32), sqlx::Error> {
         let offset = (params.page - 1) * params.limit;
 
+        // Bind values are pushed in the same order conditions reference $N.
+        // Both count_query and data_query bind in this exact order below.
         let mut conditions: Vec<String> = Vec::new();
+        let mut bind_index: i32 = 0;
 
         if let Some(cat_id) = params.category_id {
+            // i32 is safe to inline (no string content), kept inline to keep
+            // the `.bind()` chain focused on user-supplied strings.
             conditions.push(format!("i.item_category_id = {}", cat_id));
         }
 
@@ -362,15 +367,30 @@ impl InventoryRepository for PgInventoryRepository {
             conditions.push("i.item_current_stock <= i.item_min_stock".to_string());
         }
 
-        if let Some(ref search) = params.search {
-            let escaped = search.replace('\'', "''");
+        // Build a parameterized LIKE pattern. Escape the LIKE-special
+        // characters (`\`, `%`, `_`) so user input cannot inject wildcards or
+        // break out of the pattern. The actual value is passed via sqlx
+        // `.bind()` below, which prevents SQL injection at the protocol level.
+        let like_pattern: Option<String> = params.search.as_ref().map(|search| {
+            format!(
+                "%{}%",
+                search
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+            )
+        });
+
+        if like_pattern.is_some() {
+            bind_index += 1;
+            let n = bind_index;
             conditions.push(format!(
-                "(i.item_code LIKE '%{}%' OR i.item_name LIKE '%{}%')",
-                escaped, escaped
+                "(i.item_code LIKE ${n} ESCAPE '\\' OR i.item_name LIKE ${n} ESCAPE '\\')"
             ));
         }
 
         if let Some(active) = params.active {
+            // Boolean literal — safe to inline.
             conditions.push(format!(
                 "i.item_active = {}",
                 if active { "true" } else { "false" }
@@ -388,7 +408,12 @@ impl InventoryRepository for PgInventoryRepository {
             where_clause
         );
 
-        let count_rows = sqlx::query(&count_query).fetch_all(pool).await?;
+        let count_q = sqlx::query(&count_query);
+        let count_q = match &like_pattern {
+            Some(v) => count_q.bind(v),
+            None => count_q,
+        };
+        let count_rows = count_q.fetch_all(pool).await?;
 
         let total: i32 = count_rows
             .first()
@@ -419,7 +444,12 @@ impl InventoryRepository for PgInventoryRepository {
             where_clause, params.limit, offset
         );
 
-        let rows = sqlx::query(&data_query).fetch_all(pool).await?;
+        let data_q = sqlx::query(&data_query);
+        let data_q = match &like_pattern {
+            Some(v) => data_q.bind(v),
+            None => data_q,
+        };
+        let rows = data_q.fetch_all(pool).await?;
 
         let items: Vec<ItemRow> = rows
             .iter()
@@ -662,9 +692,22 @@ impl InventoryRepository for PgInventoryRepository {
     ) -> Result<Vec<InventoryRoomRollupRow>, sqlx::Error> {
         let mut conditions: Vec<String> = vec!["r.room_active = true".to_string()];
 
-        if let Some(ref search) = params.search {
-            let escaped = search.replace('\'', "''");
-            conditions.push(format!("r.room_no LIKE '%{}%'", escaped));
+        // Build a parameterized LIKE pattern. Escape the LIKE-special
+        // characters (`\`, `%`, `_`) so user input cannot inject wildcards or
+        // break out of the pattern. The actual value is bound via sqlx
+        // `.bind()` below.
+        let like_pattern: Option<String> = params.search.as_ref().map(|search| {
+            format!(
+                "%{}%",
+                search
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+            )
+        });
+
+        if like_pattern.is_some() {
+            conditions.push("r.room_no LIKE $1 ESCAPE '\\'".to_string());
         }
 
         let where_clause = format!("WHERE {}", conditions.join(" AND "));
@@ -687,7 +730,12 @@ impl InventoryRepository for PgInventoryRepository {
             where_clause
         );
 
-        let rows = sqlx::query(&data_query).fetch_all(pool).await?;
+        let data_q = sqlx::query(&data_query);
+        let data_q = match &like_pattern {
+            Some(v) => data_q.bind(v),
+            None => data_q,
+        };
+        let rows = data_q.fetch_all(pool).await?;
 
         Ok(rows
             .iter()
@@ -803,25 +851,39 @@ impl InventoryRepository for PgInventoryRepository {
     ) -> Result<(Vec<TransactionRow>, i32), sqlx::Error> {
         let offset = (params.page - 1) * params.limit;
 
+        // Bind values are pushed in the same order conditions reference $N.
+        // Both count_query and data_query bind these in the exact same order.
         let mut conditions: Vec<String> = Vec::new();
+        let mut bind_index: i32 = 0;
 
         if let Some(item_id) = params.item_id {
+            // i32 — safe to inline.
             conditions.push(format!("t.trans_item_id = {}", item_id));
         }
 
-        if let Some(ref trans_type) = params.trans_type {
-            let escaped = trans_type.replace('\'', "''").to_uppercase();
-            conditions.push(format!("t.trans_type = '{}'", escaped));
+        // Equality on trans_type (route preserves the original .to_uppercase()
+        // semantics by normalizing the bind value, not the SQL).
+        let trans_type_bind: Option<String> = params
+            .trans_type
+            .as_ref()
+            .map(|t| t.to_uppercase());
+        if trans_type_bind.is_some() {
+            bind_index += 1;
+            conditions.push(format!("t.trans_type = ${}", bind_index));
         }
 
-        if let Some(ref from) = params.from {
-            let escaped = from.replace('\'', "''");
-            conditions.push(format!("t.trans_date >= '{}'", escaped));
+        // Date range filters bind the raw string and cast to ::date in SQL,
+        // matching the original SQL semantics exactly (no parsing in Rust).
+        let from_bind: Option<String> = params.from.clone();
+        if from_bind.is_some() {
+            bind_index += 1;
+            conditions.push(format!("t.trans_date >= ${}::date", bind_index));
         }
 
-        if let Some(ref to) = params.to {
-            let escaped = to.replace('\'', "''");
-            conditions.push(format!("t.trans_date <= '{}'", escaped));
+        let to_bind: Option<String> = params.to.clone();
+        if to_bind.is_some() {
+            bind_index += 1;
+            conditions.push(format!("t.trans_date <= ${}::date", bind_index));
         }
 
         let where_clause = if conditions.is_empty() {
@@ -835,7 +897,20 @@ impl InventoryRepository for PgInventoryRepository {
             where_clause
         );
 
-        let count_rows = sqlx::query(&count_query).fetch_all(pool).await?;
+        let count_q = sqlx::query(&count_query);
+        let count_q = match &trans_type_bind {
+            Some(v) => count_q.bind(v),
+            None => count_q,
+        };
+        let count_q = match &from_bind {
+            Some(v) => count_q.bind(v),
+            None => count_q,
+        };
+        let count_q = match &to_bind {
+            Some(v) => count_q.bind(v),
+            None => count_q,
+        };
+        let count_rows = count_q.fetch_all(pool).await?;
 
         let total: i32 = count_rows
             .first()
@@ -864,7 +939,20 @@ impl InventoryRepository for PgInventoryRepository {
             where_clause, params.limit, offset
         );
 
-        let rows = sqlx::query(&data_query).fetch_all(pool).await?;
+        let data_q = sqlx::query(&data_query);
+        let data_q = match &trans_type_bind {
+            Some(v) => data_q.bind(v),
+            None => data_q,
+        };
+        let data_q = match &from_bind {
+            Some(v) => data_q.bind(v),
+            None => data_q,
+        };
+        let data_q = match &to_bind {
+            Some(v) => data_q.bind(v),
+            None => data_q,
+        };
+        let rows = data_q.fetch_all(pool).await?;
 
         let transactions: Vec<TransactionRow> = rows
             .iter()
