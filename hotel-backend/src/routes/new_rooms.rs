@@ -16,7 +16,7 @@ use axum::{
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
-use super::mode::AppState;
+use super::mode::{AppState, Branch};
 use crate::error::{ApiError, ApiResult};
 use crate::models::Pagination;
 use crate::repository::room::{RoomRow, RoomWrite};
@@ -78,7 +78,7 @@ pub struct NewRoomsQuery {
     pub sort_by: Option<String>,
     pub sort_order: Option<String>,
     /// Branch selector: 'hfhotel' | 'hfville' | 'all' (HotelNew only contains hfhotel data)
-    pub branch: Option<String>,
+    pub branch: Option<Branch>,
 }
 
 fn default_page() -> i32 { 1 }
@@ -134,7 +134,7 @@ pub async fn list_rooms(
 ) -> ApiResult<Json<NewRoomsResponse>> {
     // The HotelNew database only contains HF Hotel data; for HF Ville return an empty
     // result so the UI shows "no rooms" rather than mixing HF Hotel rooms in.
-    if params.branch.as_deref() == Some("hfville") {
+    if params.branch == Some(Branch::Hfville) {
         return Ok(Json(NewRoomsResponse {
             success: true,
             data: vec![],

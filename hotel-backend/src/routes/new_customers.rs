@@ -22,7 +22,7 @@ use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::mode::AppState;
+use super::mode::{AppState, Branch};
 use crate::error::{ApiError, ApiResult};
 use crate::models::Pagination;
 use crate::outbox::event::EventSource;
@@ -80,7 +80,7 @@ pub struct NewCustomersQuery {
     #[serde(default = "default_active_only")]
     pub active_only: bool,
     /// Branch selector: 'hfhotel' | 'hfville' | 'all' (HotelNew only contains hfhotel data)
-    pub branch: Option<String>,
+    pub branch: Option<Branch>,
 }
 
 fn default_page() -> i32 { 1 }
@@ -134,7 +134,7 @@ pub async fn list_customers(
     Query(params): Query<NewCustomersQuery>,
 ) -> ApiResult<Json<NewCustomersResponse>> {
     // HotelNew DB only contains hfhotel data; hfville selector returns empty.
-    if params.branch.as_deref() == Some("hfville") {
+    if params.branch == Some(Branch::Hfville) {
         return Ok(Json(NewCustomersResponse {
             success: true,
             data: vec![],
