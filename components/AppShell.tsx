@@ -1,9 +1,15 @@
 'use client'
 
 import { useState, useEffect } from 'react'
+import { usePathname } from 'next/navigation'
 import Sidebar, { SIDEBAR_WIDTH, SIDEBAR_COLLAPSED_WIDTH } from '@/components/Sidebar'
 import { BranchProvider } from '@/contexts/BranchContext'
 import { useRealtimeEvents } from '@/lib/use-realtime-events'
+
+// Pages that should render WITHOUT the sidebar / branch context — the only
+// public route today is /login (the auth landing). Kept as a Set so additional
+// future public pages (e.g. /forgot-password) only need a single edit.
+const CHROMELESS_PATHS = new Set<string>(['/login'])
 
 /**
  * Client shell that renders the sidebar + main content area for every page.
@@ -12,8 +18,22 @@ import { useRealtimeEvents } from '@/lib/use-realtime-events'
  *
  * Sidebar collapse state is mirrored from localStorage and kept in sync via
  * the `sidebar-toggle` window event dispatched by `<Sidebar>`.
+ *
+ * For chromeless paths (e.g. /login), the sidebar + BranchProvider are
+ * skipped entirely so the auth screen can occupy the full viewport.
  */
 export default function AppShell({ children }: { children: React.ReactNode }) {
+  const pathname = usePathname()
+  const isChromeless = pathname ? CHROMELESS_PATHS.has(pathname) : false
+
+  if (isChromeless) {
+    return <>{children}</>
+  }
+
+  return <ChromedShell>{children}</ChromedShell>
+}
+
+function ChromedShell({ children }: { children: React.ReactNode }) {
   const [collapsed, setCollapsed] = useState(false)
   const [mounted, setMounted] = useState(false)
 
