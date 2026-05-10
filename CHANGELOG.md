@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.62.2] - 2026-05-10
+
+### Fixed
+
+- **Backend healthcheck failed after AUTH_ENABLED=true cutover** —
+  the docker-compose + Dockerfile probes hit `/api/mode`, which is
+  registered inside the `build_new_routes` subrouter that's wrapped
+  by `require_auth`. With auth on, the cookieless healthcheck
+  request got back 401 → container marked `unhealthy` → `web`
+  service refused to start (depends_on backend healthy). Switched
+  both healthcheck commands to hit `/health` instead, which is
+  mounted in `health_routes` outside the auth-gated subrouter
+  exactly for this case. v2.62.1 deploy was tagged `failure` for
+  this reason; v2.62.2 reapplies it cleanly.
+
 ## [2.62.1] - 2026-05-10
 
 ### Changed
