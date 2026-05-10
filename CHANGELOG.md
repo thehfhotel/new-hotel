@@ -5,6 +5,58 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.59.2] - 2026-05-10
+
+### Security
+
+- **Phase 3 hardening — CORS allowlist + transport security headers
+  + branch type-narrowing** (3-agent parallel batch, cherry-picked
+  onto master in order):
+
+  - `81a7530` (was `a55de69`) — `fix(backend): lock CORS to env-driven
+    allowlist`. Replaces `CorsLayer::new().allow_origin(Any)` in
+    `hotel-backend/src/main.rs` with a `BACKEND_ALLOWED_ORIGINS`
+    env-driven list (default `http://localhost:3003,http://web:3003`
+    — the only legitimate callers today). Malformed entries panic at
+    startup, mirroring the `require_secret` style. Backend port
+    isn't externally exposed today, so this is defense-in-depth in
+    case it gets exposed later. Documented under `backend` in
+    `docker-compose.yml`.
+
+  - `9fb2073` (was `39b9cfc`) — `feat(security): add CSP, HSTS,
+    Permissions-Policy response headers`. `next.config.js` now sends:
+    - `Strict-Transport-Security: max-age=31536000; includeSubDomains`
+      (1y, no `preload` — internal app, off the HSTS preload list).
+    - `Permissions-Policy: camera=(), microphone=(), geolocation=(),
+      payment=(), usb=(), interest-cohort=()` (denies features the
+      app doesn't use, opts out of FLoC).
+    - `Content-Security-Policy: default-src 'self'; script-src 'self'
+      'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline';
+      img-src 'self' data: blob:; font-src 'self' data:; connect-src
+      'self'; frame-ancestors 'none'; base-uri 'self'; form-action
+      'self'`. The `'unsafe-inline'`/`'unsafe-eval'` in `script-src`
+      are required by Next.js client bundles + recharts; tightening
+      them needs a nonce-injection pass (deferred). `frame-ancestors
+      'none'` matches the existing `X-Frame-Options: DENY`.
+
+### Changed
+
+- `67d0e96` (was `707a7be`) — `refactor(backend): replace
+  stringly-typed branch with Branch enum`. Five route query structs
+  (`NewCustomersQuery`, `NewBookingsQuery`, `NewRoomsQuery`,
+  `InventoryRoomsQuery`, `NewCheckInsQuery`) migrated from
+  `branch: Option<String>` to `Option<Branch>`, reusing the existing
+  enum from `routes::mode` (already used by `routes::calendar`).
+  Serde handles wire-form parsing — invalid branch values now reject
+  at request-parse time instead of being silently treated as
+  "neither hfhotel nor hfville" deep inside each handler. Five
+  `params.branch.as_deref() == Some("hfville")` checks updated to
+  `params.branch == Some(Branch::Hfville)`.
+
+  Verified: `cargo check`, `cargo clippy --all-targets -- -D
+  warnings` (zero new lints; the 58 pre-existing errors on master
+  are out-of-scope), `cargo test --no-run` all 20 binaries compile.
+
 ## [2.59.1] - 2026-05-10
 
 ### Security
