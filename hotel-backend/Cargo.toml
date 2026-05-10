@@ -90,7 +90,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
 # Hashing (SHA256 for sync change detection)
-sha2 = "0.10"
+sha2 = "0.11"
 
 # Randomness (used by writeback recipes for TM.30 batch numbers per spike §3a —
 # `HT_CheckIn_H.Cin_Work_number` is a non-sequential random i32 the legacy app
