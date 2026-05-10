@@ -12,7 +12,11 @@ const customJestConfig = {
   },
   testMatch: ['**/__tests__/**/*.test.ts', '**/__tests__/**/*.test.tsx'],
   // Ignore git worktrees (created by agent isolation) so jest doesn't double-run tests.
-  testPathIgnorePatterns: ['/node_modules/', '/\\.claude/worktrees/'],
+  // Anchored to <rootDir> so that running jest FROM inside a worktree only excludes
+  // *child* worktrees, not the worktree itself. (The unrooted previous pattern
+  // matched any path containing `/.claude/worktrees/` and zeroed out the
+  // worktree's own tests, which broke the husky pre-push hook.)
+  testPathIgnorePatterns: ['/node_modules/', '<rootDir>/\\.claude/worktrees/'],
   modulePathIgnorePatterns: ['<rootDir>/\\.claude/worktrees/'],
   transformIgnorePatterns: [
     '/node_modules/(?!(@azure|tedious)/)',

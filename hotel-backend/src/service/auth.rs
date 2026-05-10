@@ -75,6 +75,19 @@ pub enum AuthError {
     #[error("user account is deactivated")]
     UserDeactivated,
 
+    /// Admin requested PATCH/GET on a user_id that no longer exists.
+    /// Phase 4 PR4 — the admin route layer maps this to HTTP 404.
+    #[error("user not found")]
+    UserNotFound,
+
+    /// Admin tried to create a user with a username that already exists.
+    /// Phase 4 PR4 — the admin route layer maps this to HTTP 409. We
+    /// pre-check via `get_by_username` rather than relying on the unique
+    /// index violation so the admin UI gets a clean error code rather
+    /// than a generic database error.
+    #[error("username already taken")]
+    UsernameTaken,
+
     /// Underlying repository / database failure.
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
@@ -263,6 +276,110 @@ impl<U: UserRepository, S: SessionRepository> AuthService<U, S> {
 
         Ok(Some((user, session)))
     }
+
+    // =========================================================================
+    // Admin-side user management — Phase 4 PR4.
+    //
+    // These operations are gated by the route layer (admin role only) and
+    // share the same `AuthService` instance the login flow uses, so the
+    // PG-backed repositories are already wired. Each method opens its own
+    // transaction (or none, for read-only `list_users`) — callers do not
+    // need to manage TX boundaries.
+    // =========================================================================
+
+    /// Return every user, sorted by username. Read-only passthrough to
+    /// [`UserRepository::list_all`]. Returns the full domain `User`
+    /// (including `password_hash`) — the route layer projects to a hash-
+    /// free DTO before serializing.
+    pub async fn list_users(&self, pool: &PgPool) -> Result<Vec<User>, AuthError> {
+        Ok(self.users.list_all(pool).await?)
+    }
+
+    /// Provision a new user.
+    ///
+    /// Pre-checks username uniqueness via `get_by_username` so the admin
+    /// UI gets `UsernameTaken` rather than a raw DB unique-violation.
+    /// There IS a TOCTOU window between the check and the insert — the
+    /// `ht_users.username` unique index is the actual enforcement; the
+    /// pre-check is just for friendly error mapping.
+    ///
+    /// Hashes the plaintext password before persisting; the plaintext
+    /// is never stored.
+    pub async fn create_user(
+        &self,
+        pool: &PgPool,
+        username: &str,
+        password: &str,
+        role: crate::domain::user::Role,
+    ) -> Result<User, AuthError> {
+        if self
+            .users
+            .get_by_username(pool, username)
+            .await?
+            .is_some()
+        {
+            return Err(AuthError::UsernameTaken);
+        }
+
+        let password_hash = Self::hash_password(password)?;
+        let user_id = self
+            .users
+            .insert_via_pool(pool, username, &password_hash, role)
+            .await?;
+
+        // Round-trip read so callers receive the canonical row (with
+        // server-stamped `created_at`) rather than reconstructing it.
+        self.users
+            .get_by_id(pool, user_id)
+            .await?
+            .ok_or(AuthError::UserNotFound)
+    }
+
+    /// Apply an admin-side patch to an existing user. Each parameter is
+    /// optional; only the `Some` ones are written. All sub-updates run
+    /// in a single transaction (`UserRepository::apply_admin_patch`),
+    /// so a partial failure rolls everything back.
+    ///
+    /// When `password` is supplied it is hashed via `hash_password`
+    /// before being persisted. Returns the refreshed `User` row.
+    /// `AuthError::UserNotFound` indicates the row vanished (or never
+    /// existed) — the route layer maps this to HTTP 404.
+    pub async fn update_user(
+        &self,
+        pool: &PgPool,
+        user_id: i64,
+        active: Option<bool>,
+        role: Option<crate::domain::user::Role>,
+        password: Option<&str>,
+    ) -> Result<User, AuthError> {
+        // Existence check up front — apply_admin_patch returns 0 when
+        // either the row is missing OR no field changed (e.g. setting
+        // `active = active`). Disambiguating the two on the back end
+        // keeps the route layer simple.
+        if self.users.get_by_id(pool, user_id).await?.is_none() {
+            return Err(AuthError::UserNotFound);
+        }
+
+        let password_hash = match password {
+            Some(plain) => Some(Self::hash_password(plain)?),
+            None => None,
+        };
+
+        self.users
+            .apply_admin_patch(
+                pool,
+                user_id,
+                active,
+                role,
+                password_hash.as_deref(),
+            )
+            .await?;
+
+        self.users
+            .get_by_id(pool, user_id)
+            .await?
+            .ok_or(AuthError::UserNotFound)
+    }
 }
 
 /// 32 random bytes from the OS RNG, hex-encoded → 64 ASCII chars.
@@ -380,6 +497,113 @@ mod tests {
             user_id: i64,
         ) -> Result<u64, sqlx::Error> {
             self.touch_internal(user_id)
+        }
+
+        async fn list_all(&self, _pool: &PgPool) -> Result<Vec<User>, sqlx::Error> {
+            let mut all: Vec<User> = self.rows.lock().unwrap().values().cloned().collect();
+            all.sort_by(|a, b| a.username.cmp(&b.username));
+            Ok(all)
+        }
+
+        async fn update_active(
+            &self,
+            _tx: &mut Transaction<'_, Postgres>,
+            user_id: i64,
+            active: bool,
+        ) -> Result<u64, sqlx::Error> {
+            let mut rows = self.rows.lock().unwrap();
+            match rows.get_mut(&user_id) {
+                Some(user) => {
+                    user.active = active;
+                    Ok(1)
+                }
+                None => Ok(0),
+            }
+        }
+
+        async fn update_role(
+            &self,
+            _tx: &mut Transaction<'_, Postgres>,
+            user_id: i64,
+            role: Role,
+        ) -> Result<u64, sqlx::Error> {
+            let mut rows = self.rows.lock().unwrap();
+            match rows.get_mut(&user_id) {
+                Some(user) => {
+                    user.role = role;
+                    Ok(1)
+                }
+                None => Ok(0),
+            }
+        }
+
+        async fn update_password_hash(
+            &self,
+            _tx: &mut Transaction<'_, Postgres>,
+            user_id: i64,
+            password_hash: &str,
+        ) -> Result<u64, sqlx::Error> {
+            let mut rows = self.rows.lock().unwrap();
+            match rows.get_mut(&user_id) {
+                Some(user) => {
+                    user.password_hash = password_hash.to_string();
+                    Ok(1)
+                }
+                None => Ok(0),
+            }
+        }
+
+        // Override admin-patch + insert façades so mocks skip the
+        // default impls' `pool.begin()` call (which would fail without
+        // a real PG behind the lazy pool).
+        async fn apply_admin_patch(
+            &self,
+            _pool: &PgPool,
+            user_id: i64,
+            active: Option<bool>,
+            role: Option<Role>,
+            password_hash: Option<&str>,
+        ) -> Result<u64, sqlx::Error> {
+            let mut rows = self.rows.lock().unwrap();
+            let Some(user) = rows.get_mut(&user_id) else {
+                return Ok(0);
+            };
+            if let Some(value) = active {
+                user.active = value;
+            }
+            if let Some(value) = role {
+                user.role = value;
+            }
+            if let Some(value) = password_hash {
+                user.password_hash = value.to_string();
+            }
+            Ok(1)
+        }
+
+        async fn insert_via_pool(
+            &self,
+            _pool: &PgPool,
+            username: &str,
+            password_hash: &str,
+            role: Role,
+        ) -> Result<i64, sqlx::Error> {
+            let mut next = self.next_id.lock().unwrap();
+            let id = *next;
+            *next += 1;
+            drop(next);
+            self.rows.lock().unwrap().insert(
+                id,
+                User {
+                    user_id: id,
+                    username: username.to_string(),
+                    password_hash: password_hash.to_string(),
+                    role,
+                    active: true,
+                    created_at: chrono::Utc::now().naive_utc(),
+                    last_login_at: None,
+                },
+            );
+            Ok(id)
         }
     }
 
@@ -728,5 +952,151 @@ mod tests {
         // logout requests as no-ops.
         let (svc, _users, _sessions) = build_service();
         svc.logout(&dummy_pool(), "no-such-session").await.unwrap();
+    }
+
+    // =========================================================================
+    // Admin user-management tests — Phase 4 PR4.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn list_users_returns_rows_sorted_by_username() {
+        let (svc, users, _sessions) = build_service();
+        users.insert_direct(User {
+            user_id: 10,
+            username: "zelda".to_string(),
+            ..fixed_user("zelda", "x")
+        });
+        users.insert_direct(User {
+            user_id: 11,
+            username: "alice".to_string(),
+            ..fixed_user("alice", "x")
+        });
+        users.insert_direct(User {
+            user_id: 12,
+            username: "bob".to_string(),
+            ..fixed_user("bob", "x")
+        });
+
+        let listed = svc.list_users(&dummy_pool()).await.unwrap();
+        let usernames: Vec<&str> = listed.iter().map(|u| u.username.as_str()).collect();
+        assert_eq!(usernames, vec!["alice", "bob", "zelda"]);
+    }
+
+    #[tokio::test]
+    async fn create_user_succeeds_and_returns_persisted_row() {
+        let (svc, users, _sessions) = build_service();
+        let created = svc
+            .create_user(&dummy_pool(), "newbie", "supersecret", Role::Receptionist)
+            .await
+            .expect("create_user should succeed");
+
+        assert_eq!(created.username, "newbie");
+        assert_eq!(created.role, Role::Receptionist);
+        assert!(created.active, "freshly-created users default to active");
+        // Password is hashed — the plaintext must not appear anywhere on the
+        // returned struct.
+        assert_ne!(created.password_hash, "supersecret");
+        // And the hash must verify against the original plaintext.
+        assert!(AuthService::<MockUserRepository, MockSessionRepository>::verify_password(
+            "supersecret",
+            &created.password_hash,
+        )
+        .unwrap());
+        assert_eq!(users.rows.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_user_rejects_duplicate_username() {
+        let (svc, users, _sessions) = build_service();
+        users.insert_direct(fixed_user("alice", "hunter2"));
+
+        let err = svc
+            .create_user(&dummy_pool(), "alice", "another", Role::Admin)
+            .await
+            .expect_err("duplicate username must be rejected");
+        assert!(matches!(err, AuthError::UsernameTaken));
+    }
+
+    #[tokio::test]
+    async fn update_user_can_toggle_active_flag() {
+        let (svc, users, _sessions) = build_service();
+        users.insert_direct(fixed_user("alice", "hunter2"));
+
+        let updated = svc
+            .update_user(&dummy_pool(), 1, Some(false), None, None)
+            .await
+            .unwrap();
+        assert!(!updated.active);
+        // Round-trip back to active.
+        let updated = svc
+            .update_user(&dummy_pool(), 1, Some(true), None, None)
+            .await
+            .unwrap();
+        assert!(updated.active);
+    }
+
+    #[tokio::test]
+    async fn update_user_can_change_role() {
+        let (svc, users, _sessions) = build_service();
+        users.insert_direct(fixed_user("alice", "hunter2"));
+        // Seed user is Admin per fixed_user.
+        let updated = svc
+            .update_user(&dummy_pool(), 1, None, Some(Role::Receptionist), None)
+            .await
+            .unwrap();
+        assert_eq!(updated.role, Role::Receptionist);
+    }
+
+    #[tokio::test]
+    async fn update_user_can_reset_password_via_hashing() {
+        let (svc, _users, _sessions) = build_service();
+        let created = svc
+            .create_user(&dummy_pool(), "alice", "old-password", Role::Admin)
+            .await
+            .unwrap();
+
+        let original_hash = created.password_hash.clone();
+        let updated = svc
+            .update_user(&dummy_pool(), created.user_id, None, None, Some("new-password"))
+            .await
+            .unwrap();
+
+        assert_ne!(updated.password_hash, original_hash, "hash must rotate");
+        assert!(AuthService::<MockUserRepository, MockSessionRepository>::verify_password(
+            "new-password",
+            &updated.password_hash,
+        )
+        .unwrap());
+        assert!(!AuthService::<MockUserRepository, MockSessionRepository>::verify_password(
+            "old-password",
+            &updated.password_hash,
+        )
+        .unwrap());
+    }
+
+    #[tokio::test]
+    async fn update_user_returns_user_not_found_for_missing_id() {
+        let (svc, _users, _sessions) = build_service();
+        let err = svc
+            .update_user(&dummy_pool(), 999, Some(false), None, None)
+            .await
+            .expect_err("missing user must error");
+        assert!(matches!(err, AuthError::UserNotFound));
+    }
+
+    #[tokio::test]
+    async fn update_user_with_no_fields_still_returns_current_row() {
+        // PATCH with an empty body is unusual but legal — the route
+        // layer accepts it. The service must not crash and should
+        // return the unchanged user.
+        let (svc, users, _sessions) = build_service();
+        users.insert_direct(fixed_user("alice", "hunter2"));
+
+        let updated = svc
+            .update_user(&dummy_pool(), 1, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(updated.username, "alice");
+        assert_eq!(updated.role, Role::Admin);
     }
 }

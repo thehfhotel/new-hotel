@@ -273,6 +273,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => Router::new(),
     };
 
+    // Phase 4 PR4: mount the protected `/api/admin/*` endpoints. The
+    // subrouter is wrapped with the same `require_auth` middleware
+    // PR2 added to `/api/new/*` so an authenticated `User` extension
+    // is injected on every request. Each handler then performs an
+    // explicit role check (admin vs receptionist) — see
+    // `routes::admin_users::require_admin`.
+    let admin_routes = match &final_app_state {
+        Some(state) => {
+            let auth_layer = axum_middleware::from_fn_with_state(
+                state.clone(),
+                app_middleware::require_auth,
+            );
+            routes::admin_users::router()
+                .with_state(state.clone())
+                .layer(auth_layer)
+        }
+        None => Router::new(),
+    };
+
     // Merge all routes. Public routers (auth, health) MUST be merged
     // alongside the protected `new_routes`, never inside it — the
     // `require_auth` middleware below is applied only to `new_routes`,
@@ -280,6 +299,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .merge(new_routes)
         .merge(auth_routes)
+        .merge(admin_routes)
         .merge(health_routes)
         .layer(cors)
         .layer(TraceLayer::new_for_http());
