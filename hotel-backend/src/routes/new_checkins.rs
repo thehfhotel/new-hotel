@@ -22,7 +22,7 @@ use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::mode::AppState;
+use super::mode::{AppState, Branch};
 use crate::domain::shared::{DateRange, Money};
 use crate::error::{ApiError, ApiResult};
 use crate::models::Pagination;
@@ -158,7 +158,7 @@ pub struct NewCheckInsQuery {
     pub sort_by: Option<String>,
     pub sort_order: Option<String>,
     /// Branch selector: 'hfhotel' | 'hfville' | 'all' (HotelNew only contains hfhotel data)
-    pub branch: Option<String>,
+    pub branch: Option<Branch>,
 }
 
 fn default_page() -> i32 { 1 }
@@ -229,7 +229,7 @@ pub async fn list_checkins(
     Query(params): Query<NewCheckInsQuery>,
 ) -> ApiResult<Json<NewCheckInsResponse>> {
     // HotelNew DB only contains hfhotel data; hfville selector returns empty.
-    if params.branch.as_deref() == Some("hfville") {
+    if params.branch == Some(Branch::Hfville) {
         return Ok(Json(NewCheckInsResponse {
             success: true,
             data: vec![],

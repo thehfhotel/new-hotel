@@ -34,7 +34,7 @@ use axum::{
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
-use super::mode::AppState;
+use super::mode::{AppState, Branch};
 use crate::error::{ApiError, ApiResult};
 use crate::models::Pagination;
 use crate::repository::inventory::{
@@ -324,7 +324,7 @@ pub struct InventoryRoomsQuery {
     pub search: Option<String>,
     /// 'all' | 'missing' | 'checked'
     pub filter: Option<String>,
-    pub branch: Option<String>,
+    pub branch: Option<Branch>,
 }
 
 /// Request body for room inventory check (POST /rooms/:room_id/check)
@@ -728,7 +728,7 @@ pub async fn list_inventory_rooms(
     Query(params): Query<InventoryRoomsQuery>,
 ) -> ApiResult<Json<InventoryRoomsResponse>> {
     // The new HotelNew DB only contains hfhotel rooms. Treat hfville as empty.
-    if params.branch.as_deref() == Some("hfville") {
+    if params.branch == Some(Branch::Hfville) {
         return Ok(Json(InventoryRoomsResponse { success: true, data: vec![] }));
     }
 
