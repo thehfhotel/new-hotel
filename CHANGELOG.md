@@ -5,6 +5,77 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.60.0] - 2026-05-10
+
+### Added
+
+- **Phase 4 PR1 — Backend authentication foundation** (commit
+  `486a236`, the first of 4 PRs to add auth to a backend that has
+  none today). **Inert in production** — no HTTP routes, no
+  middleware, no env flags wired. Future PRs add the routes (PR2),
+  the frontend login page (PR3), and the admin user UI (PR4).
+
+  - **Schema** (migrations 027 + 028):
+    - `ht_users` — `user_id BIGSERIAL PK`, `username` UNIQUE,
+      `password_hash TEXT` (argon2id PHC strings), `role` CHECK
+      `IN ('admin','receptionist')`, `active`, `created_at`,
+      `last_login_at`.
+    - `ht_sessions` — `session_id VARCHAR(64) PK` (32 random bytes
+      hex-encoded; the cookie itself IS the bearer token, so no
+      additional hashing), `user_id` FK with `ON DELETE CASCADE`,
+      `created_at`, `expires_at` (indexed for periodic cleanup),
+      `ip INET`, `user_agent TEXT`. 24-hour fixed expiry by
+      default (PR2 will decide on sliding-expiry).
+    - `init-db/init-hotelnew.sql` updated with the same tables
+      for fresh deploys; `migrations/README.md` updated with the
+      new entries + ownership rows.
+
+  - **Layered code** (per `docs/architecture.md` §6):
+    - `domain/{user,session}.rs` — `User`, `Role` (Admin |
+      Receptionist), `Session` with `is_expired()`. `User`
+      derives `Serialize` for tests only — PR2 must wrap it in a
+      `UserDto` that drops `password_hash` before HTTP exposure.
+    - `repository/{user,session}.rs` — `UserRepository` +
+      `SessionRepository` traits with `PgUserRepository` /
+      `PgSessionRepository` impls. Uses `sqlx::query()` (dynamic)
+      to avoid the `.sqlx/` cache regeneration step; PR2 may
+      switch to `sqlx::query!()` once 027/028 land on a dev DB.
+      Two high-level façade methods (`create_and_touch_login`,
+      `delete_by_id`) wrap `pool.begin()` so unit tests can mock
+      without fabricating a real `sqlx::Transaction`.
+    - `service/auth.rs` — `AuthService` with `hash_password`,
+      `verify_password` (constant-time, returns false on parse
+      error), `login`, `logout`, `validate_session`. `AuthError`
+      enum: `InvalidCredentials`, `UserDeactivated` (returned
+      AFTER successful password verify so timing matches; PR2 may
+      collapse on the wire), `Db`, `Hash`. Wrong-password and
+      missing-user both return `InvalidCredentials` to prevent
+      user enumeration.
+
+  - **Admin CLI** (`bin/create_user`):
+    - `cargo run --bin create_user -- --username NAME --role
+      admin|receptionist [--password PASS]`. Without `--password`,
+      reads from tty via `rpassword` with confirmation prompt.
+      Uses `NewDbConfig::from_env()` to build the pool. Insert +
+      hash in one TX.
+
+  - **New crate deps** (`hotel-backend/Cargo.toml`): `argon2 =
+    "0.5"` (clean transitive tree: `base64ct`, `blake2`,
+    `password-hash`, `rand_core`), `rpassword = "7"` (only
+    `libc` + `rtoolbox`).
+
+  - **12 new unit tests** in `service::auth::tests` — all use
+    in-memory `Mutex<HashMap>` mocks of the repository traits,
+    no DB needed. Cover password round-trip, login success/wrong-
+    password/missing-user/deactivated paths, session validation
+    for unknown/expired/post-deactivation cases, logout idempotency.
+    Plus 4 pure tests in `domain/{user,session}.rs`.
+
+  Verified: `cargo check` clean (only pre-existing warnings),
+  `cargo test --lib service::auth` 12/12 pass on combined master,
+  `cargo build --bin create_user` links cleanly. PR1 is mergeable
+  in isolation and CANNOT affect production behavior.
+
 ## [2.59.3] - 2026-05-10
 
 ### Security
