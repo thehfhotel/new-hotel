@@ -375,6 +375,13 @@ impl<U: UserRepository, S: SessionRepository> AuthService<U, S> {
             )
             .await?;
 
+        // Security: when an admin resets a password, revoke every
+        // active session for the user. Otherwise a stolen cookie
+        // would outlive the rotation by up to 24h. Audit M-1.
+        if password.is_some() {
+            self.sessions.delete_for_user(pool, user_id).await?;
+        }
+
         self.users
             .get_by_id(pool, user_id)
             .await?
@@ -736,6 +743,40 @@ mod tests {
                 .unwrap()
                 .remove(session_id)
                 .is_some() as u64)
+        }
+
+        async fn delete_all_for_user(
+            &self,
+            _tx: &mut Transaction<'_, Postgres>,
+            user_id: i64,
+        ) -> Result<u64, sqlx::Error> {
+            let mut rows = self.rows.lock().unwrap();
+            let to_delete: Vec<String> = rows
+                .iter()
+                .filter_map(|(k, v)| if v.user_id == user_id { Some(k.clone()) } else { None })
+                .collect();
+            let n = to_delete.len() as u64;
+            for k in to_delete {
+                rows.remove(&k);
+            }
+            Ok(n)
+        }
+
+        async fn delete_for_user(
+            &self,
+            _pool: &PgPool,
+            user_id: i64,
+        ) -> Result<u64, sqlx::Error> {
+            let mut rows = self.rows.lock().unwrap();
+            let to_delete: Vec<String> = rows
+                .iter()
+                .filter_map(|(k, v)| if v.user_id == user_id { Some(k.clone()) } else { None })
+                .collect();
+            let n = to_delete.len() as u64;
+            for k in to_delete {
+                rows.remove(&k);
+            }
+            Ok(n)
         }
     }
 

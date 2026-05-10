@@ -34,7 +34,14 @@ function LoginPageInner() {
   const [submitting, setSubmitting] = useState(false)
   const [localError, setLocalError] = useState<string | null>(null)
 
-  const redirectTarget = searchParams?.get('redirect') ?? '/'
+  // Open-redirect guard: only same-origin paths are allowed. Reject
+  // anything that doesn't start with `/`, AND reject `//evil.com` (which
+  // is protocol-relative and would navigate the browser to evil.com).
+  const rawRedirect = searchParams?.get('redirect') ?? '/'
+  const redirectTarget =
+    rawRedirect.startsWith('/') && !rawRedirect.startsWith('//')
+      ? rawRedirect
+      : '/'
   const displayedError = localError ?? contextError
 
   // Already logged in? Bounce out of /login.
