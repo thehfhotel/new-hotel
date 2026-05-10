@@ -83,7 +83,7 @@ chrono-tz = "0.9"
 uuid = { version = "1", features = ["serde", "v4", "v5"] }
 
 # Error handling (matches Tauri)
-thiserror = "1"
+thiserror = "2"
 
 # Logging
 tracing = "0.1"
