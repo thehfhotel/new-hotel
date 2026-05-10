@@ -3,6 +3,7 @@
 import { useState, useEffect } from 'react'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
+import { useRouter } from 'next/navigation'
 import {
   Home,
   Calendar,
@@ -21,8 +22,11 @@ import {
   Users,
   CreditCard,
   ScrollText,
+  LogOut,
+  UserCircle,
 } from 'lucide-react'
 import { useBranch, BRANCH_LABELS, type Branch } from '@/contexts/BranchContext'
+import { useAuth } from '@/contexts/AuthContext'
 
 export const SIDEBAR_WIDTH = 240
 export const SIDEBAR_COLLAPSED_WIDTH = 64
@@ -77,9 +81,16 @@ const sections: NavSection[] = [
 
 export default function Sidebar() {
   const pathname = usePathname()
+  const router = useRouter()
   const [collapsed, setCollapsed] = useState(false)
   const [mounted, setMounted] = useState(false)
   const { branch, setBranch, villeAvailable } = useBranch()
+  const { user, logout } = useAuth()
+
+  const handleLogout = async () => {
+    await logout()
+    router.replace('/login')
+  }
 
   useEffect(() => {
     const stored = localStorage.getItem('sidebar-collapsed')
@@ -201,6 +212,35 @@ export default function Sidebar() {
 
       {/* Bottom */}
       <div className="border-t border-border p-1 shrink-0">
+        {/* Logged-in user + logout. Hidden entirely when there is no user
+            so dev / pre-cutover (NEXT_PUBLIC_AUTH_REQUIRED=false) shows
+            no auth chrome at all — matches the additive-only PR contract. */}
+        {user && (
+          <div className="border-b border-border pb-1 mb-1">
+            {!collapsed && (
+              <div
+                className="flex items-center gap-2 px-3 py-1 text-[12px] text-text"
+                title={`${user.username} (${user.role})`}
+              >
+                <UserCircle size={14} className="text-textMuted shrink-0" />
+                <span className="truncate font-medium">{user.username}</span>
+                <span className="text-[10px] text-textMuted uppercase tracking-wide ml-auto">
+                  {user.role}
+                </span>
+              </div>
+            )}
+            <button
+              onClick={handleLogout}
+              title="ออกจากระบบ"
+              className={`flex items-center gap-2 px-3 py-1.5 text-[13px] text-textMuted hover:bg-headerBar hover:text-text transition-colors w-full ${
+                collapsed ? 'justify-center' : ''
+              }`}
+            >
+              <LogOut size={16} />
+              {!collapsed && <span>ออกจากระบบ</span>}
+            </button>
+          </div>
+        )}
         <button
           onClick={toggleCollapse}
           className={`flex items-center gap-2 px-3 py-1.5 text-[13px] text-textMuted hover:bg-headerBar hover:text-text transition-colors w-full ${

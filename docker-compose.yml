@@ -51,6 +51,12 @@ services:
       - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
       - SLACK_NOTIFICATIONS_ENABLED=false
       - BACKEND_URL=http://backend:3003
+      # Phase 4 PR3: enables the AuthGuard's redirect-to-/login enforcement.
+      # MUST be flipped to `true` simultaneously with backend `AUTH_ENABLED=true`
+      # at cutover — flipping only one side will either (a) lock users out of
+      # every page with no working /api/auth/me, or (b) allow access without
+      # authentication. Default `false` preserves additive-only behaviour.
+      # - NEXT_PUBLIC_AUTH_REQUIRED=${NEXT_PUBLIC_AUTH_REQUIRED:-false}
       # Bind Next.js standalone server to ALL interfaces (incl. 127.0.0.1)
       # so the container-internal `wget http://localhost:3003` healthcheck
       # below actually resolves. Without this, Next.js 16 standalone binds
