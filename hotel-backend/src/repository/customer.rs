@@ -135,12 +135,29 @@ impl CustomerRepository for PgCustomerRepository {
             conditions.push("cust_active = true".to_string());
         }
 
-        if let Some(ref search) = params.search {
-            let escaped = search.replace('\'', "''");
-            conditions.push(format!(
-                "(cust_firstname LIKE '%{}%' OR cust_lastname LIKE '%{}%' OR cust_phone LIKE '%{}%' OR cust_email LIKE '%{}%' OR cust_idcard LIKE '%{}%')",
-                escaped, escaped, escaped, escaped, escaped
-            ));
+        // Build a parameterized LIKE pattern. Escape the LIKE-special characters
+        // (`\`, `%`, `_`) so user input cannot inject wildcards or break out of
+        // the pattern. The actual value is passed via sqlx `.bind($1)` below,
+        // which prevents SQL injection at the protocol level.
+        let like_pattern: Option<String> = params.search.as_ref().map(|search| {
+            format!(
+                "%{}%",
+                search
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+            )
+        });
+
+        if like_pattern.is_some() {
+            conditions.push(
+                "(cust_firstname LIKE $1 ESCAPE '\\' \
+                 OR cust_lastname LIKE $1 ESCAPE '\\' \
+                 OR cust_phone LIKE $1 ESCAPE '\\' \
+                 OR cust_email LIKE $1 ESCAPE '\\' \
+                 OR cust_idcard LIKE $1 ESCAPE '\\')"
+                    .to_string(),
+            );
         }
 
         let where_clause = if conditions.is_empty() {
@@ -154,7 +171,11 @@ impl CustomerRepository for PgCustomerRepository {
             where_clause
         );
 
-        let count_rows = sqlx::query(&count_query).fetch_all(pool).await?;
+        let mut count_q = sqlx::query(&count_query);
+        if let Some(ref pattern) = like_pattern {
+            count_q = count_q.bind(pattern);
+        }
+        let count_rows = count_q.fetch_all(pool).await?;
 
         let total: i32 = count_rows
             .first()
@@ -184,7 +205,11 @@ impl CustomerRepository for PgCustomerRepository {
             where_clause, order_by_column, sort_order, params.limit, offset
         );
 
-        let rows = sqlx::query(&data_query).fetch_all(pool).await?;
+        let mut data_q = sqlx::query(&data_query);
+        if let Some(ref pattern) = like_pattern {
+            data_q = data_q.bind(pattern);
+        }
+        let rows = data_q.fetch_all(pool).await?;
 
         let customers: Vec<CustomerRow> = rows
             .iter()
