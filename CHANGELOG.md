@@ -5,6 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.62.3] - 2026-05-10
+
+### Security
+
+- **Phase 7 audit medium-severity fixes** (post-public-flip
+  hardening pass):
+  - **M-2** (`8741678`): per-IP rate limit on `POST
+    /api/auth/login` — 10 attempts per IP per 15 minutes,
+    sliding-window. Custom `Arc<Mutex<HashMap<IpKey,
+    VecDeque<Instant>>>>` limiter (~150 LOC); `tower_governor`
+    rejected because cargo-tree showed 261 lines of transitive
+    deps including `tonic`/gRPC. IP source: `X-Forwarded-For`
+    leftmost → `X-Real-IP` → shared `IpKey::Unknown` bucket
+    (header-omission can't bypass). 429 response body
+    `{"error":"too_many_attempts"}` + `Retry-After` header in
+    seconds. Only the login route is throttled — `/api/auth/me`
+    and `/api/auth/logout` remain unmetered. +11 unit tests.
+  - **M-3** (`8741678`): tightened CORS in `hotel-backend/src/main.rs`
+    — replaced `.allow_methods(Any)` with explicit
+    `[GET, POST, PUT, PATCH, DELETE, OPTIONS]` and
+    `.allow_headers(Any)` with `[CONTENT_TYPE]`. Origin allowlist
+    (`BACKEND_ALLOWED_ORIGINS`) unchanged from v2.59.2.
+    `.allow_credentials(true)` retained for cookie sessions.
+  - **M-4** (`8741678`): `tracing::trace!` in
+    `writeback/recipes/mod.rs` no longer logs the full SQL
+    statement. Now logs `stmt_kind` (first whitespace-delimited
+    word — `INSERT`/`UPDATE`/etc) + `stmt_len` only. Production
+    runs at `info` level so the previous behaviour was dormant
+    in practice; this prevents a `RUST_LOG=trace` toggle from
+    leaking guest PII into logs.
+  - **M-5** (`f935bef`): locked `thai-id-middleware-tauri/src-tauri/src/server.rs`
+    CORS — replaced `Any/Any/Any` with env-driven `AllowOrigin::list`
+    (env var `CARD_READER_ALLOWED_ORIGINS`, default
+    `http://localhost:3003,http://web:3003`), methods limited to
+    `[GET, OPTIONS]`, headers to `[CONTENT_TYPE]`, no credentials.
+    Closes the cross-origin Thai-ID exfiltration finding flagged
+    in Phase 7. New `thai-id-middleware-tauri/README.md`
+    documents the env var. +3 unit tests.
+
+  Verified on combined master: `cargo test --lib` = 363 pass
+  (was 352, +11 from M-2). Tauri `cargo check` clean.
+
+### Added
+
+- **Phase 9 — CodeQL workflow** (`9b9e9e7` — landed earlier in
+  this version cycle, recorded here for completeness).
+  `.github/workflows/codeql.yml` runs CodeQL on every push,
+  every PR, and weekly cron, with a matrix over
+  `javascript-typescript` + `rust`. Uses the `security-and-quality`
+  query pack for verbose post-flip soak; can downgrade to
+  `security-extended` later if too noisy.
+
+- **Branch protection on `master`** (set via REST API, not in
+  source). Blocks `force-push` and branch deletion. No required
+  reviewers / status checks (single-maintainer repo).
+
 ## [2.62.2] - 2026-05-10
 
 ### Fixed
