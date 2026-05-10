@@ -366,6 +366,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=frontend
           build-args: |
             NEXT_PUBLIC_CARD_READER_URL=${{ secrets.CARD_READER_URL }}
+            NEXT_PUBLIC_AUTH_REQUIRED=${{ vars.AUTH_REQUIRED || 'false' }}
 
   build-backend:
     runs-on: ubuntu-latest
@@ -484,6 +485,7 @@ jobs:
           SLACK_WEBHOOK_URL:       ${{ secrets.SLACK_WEBHOOK }}
           LEGACY_SYNC_ENABLED:     ${{ secrets.LEGACY_SYNC_ENABLED }}
           LEGACY_SYNC_SHADOW_MODE: ${{ secrets.LEGACY_SYNC_SHADOW_MODE }}
+          AUTH_ENABLED:            ${{ vars.AUTH_ENABLED || 'false' }}
         # Build a JSON payload the way /srv/run-deploy.sh expects:
         #   { commit_sha, deploy_payload_b64 (tar.gz), env: {...} }
         # then pipe it over SSH to deploy@evergreen. The forced-command
@@ -509,6 +511,7 @@ jobs:
             --arg SLACK_WEBHOOK_URL   "$SLACK_WEBHOOK_URL" \
             --arg LEGACY_SYNC_ENABLED "$LEGACY_SYNC_ENABLED" \
             --arg LEGACY_SYNC_SHADOW_MODE "$LEGACY_SYNC_SHADOW_MODE" \
+            --arg AUTH_ENABLED        "$AUTH_ENABLED" \
             '{
               commit_sha: $commit_sha,
               deploy_payload_b64: $deploy_payload_b64,
@@ -525,6 +528,7 @@ jobs:
                 SLACK_WEBHOOK_URL:       $SLACK_WEBHOOK_URL,
                 LEGACY_SYNC_ENABLED:     $LEGACY_SYNC_ENABLED,
                 LEGACY_SYNC_SHADOW_MODE: $LEGACY_SYNC_SHADOW_MODE,
+                AUTH_ENABLED:            $AUTH_ENABLED,
               }
             }' \
           | ssh -i ~/.ssh/deploy_key \
