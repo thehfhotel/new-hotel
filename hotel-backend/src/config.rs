@@ -343,6 +343,28 @@ impl AppConfig {
     }
 }
 
+/// Read the Phase 4 PR2 auth-middleware flag from `AUTH_ENABLED`.
+///
+/// Defaults to `false` so existing deployments keep their pre-PR2
+/// behavior — the operator path to turn auth on is:
+/// 1. Provision an admin via `cargo run --bin create_user`,
+/// 2. Set `AUTH_ENABLED=true` in `.env`,
+/// 3. Redeploy.
+///
+/// Accepted truthy values: `true`, `1` (case-insensitive). Anything
+/// else (including unset, empty, `0`, `false`, garbage) → `false`.
+/// Kept liberal-on-input on purpose — operator typos should default
+/// to safe rather than panic at startup.
+pub fn auth_enabled_from_env() -> bool {
+    match std::env::var("AUTH_ENABLED") {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            normalized == "true" || normalized == "1"
+        }
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

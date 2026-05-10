@@ -13,6 +13,7 @@ pub mod config;
 pub mod db;
 pub mod domain;
 pub mod error;
+pub mod middleware;
 pub mod models;
 pub mod notifications;
 pub mod outbox;

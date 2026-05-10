@@ -129,6 +129,20 @@ services:
       # Production should set this explicitly to the public hostname(s)
       # if the backend ever gets exposed externally.
       # - BACKEND_ALLOWED_ORIGINS=https://hotel.example.com,http://web:3003
+      # Auth middleware (Phase 4 PR2). Defaults to `false` so existing
+      # deployments stay unauthenticated until an operator opts in.
+      # FLIP CHECKLIST before setting `true`:
+      #   1. Provision at least one admin user — exec into the backend
+      #      container (or run locally against PG) and run:
+      #        cargo run --bin create_user -- --username alice --role admin
+      #   2. Set `AUTH_ENABLED=true` in `.env` (or uncomment below).
+      #   3. Redeploy.
+      # When false: `/api/new/*` is wide open (legacy behavior).
+      # When true:  every `/api/new/*` request must carry the `session`
+      #             HttpOnly cookie minted by `POST /api/auth/login`.
+      # Either way, `/api/auth/{login,logout,me}` and `/api/health`
+      # remain public — that's how the frontend bootstraps.
+      # - AUTH_ENABLED=${AUTH_ENABLED:-false}
     depends_on:
       newdb:
         condition: service_healthy

@@ -121,3 +121,15 @@ futures-util = { version = "0.3", default-features = false }
 #   up in shell history. Pure Rust, no curses dep.
 argon2 = "0.5"
 rpassword = "7"
+
+# Cookie extraction for the Phase 4 PR2 auth routes + middleware.
+# - axum-extra: `cookie` feature gives us `axum_extra::extract::cookie::CookieJar`,
+#   the canonical extractor + builder for `Cookie` request / `Set-Cookie`
+#   response headers in axum 0.8. Version 0.12 is the line that targets
+#   axum 0.8 (older 0.9.x lines target axum 0.7).
+# - cookie: direct dep so we can refer to `cookie::time::Duration` (the
+#   type `CookieBuilder::max_age` requires) without bouncing through a
+#   transitive path. axum-extra carries the same crate transitively
+#   under the `cookie` feature, so this adds no new compile work.
+axum-extra = { version = "0.12", features = ["cookie"] }
+cookie = "0.18"

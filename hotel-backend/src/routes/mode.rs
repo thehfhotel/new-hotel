@@ -19,6 +19,7 @@ use crate::repository::{
     PaymentRepository, PgBookingRepository, PgCheckInRepository, PgCustomerRepository,
     PgInventoryRepository, PgPaymentRepository, PgRoomRepository, RoomRepository,
 };
+use crate::routes::auth::ProdAuthService;
 use crate::service::{
     BookingService, CheckInService, CustomerService, HousekeepingService, PaymentService,
 };
@@ -111,6 +112,19 @@ pub struct AppState {
     pub payments_service: Arc<PaymentService>,
     /// Housekeeping service — orchestrates room cleanliness flips + events.
     pub housekeeping_service: Arc<HousekeepingService>,
+
+    // ----- Auth (Phase 4 PR2) -----
+    /// Cookie-session auth service — wired with PG-backed user + session
+    /// repositories. Cheap to clone (Arcs all the way down). Reachable
+    /// from both the `/api/auth/*` route handlers and the
+    /// `middleware::auth::require_auth` layer wrapping `/api/new/*`.
+    pub auth_service: Arc<ProdAuthService>,
+    /// Master switch for the auth middleware. Read from `AUTH_ENABLED`
+    /// in `main.rs`; defaults to `false` so production stays exactly
+    /// as-is until an operator provisions an admin user and flips the
+    /// flag. The `/api/auth/*` endpoints REMAIN reachable in either
+    /// state — only the gate on `/api/new/*` is toggled.
+    pub auth_enabled: bool,
 }
 
 impl AppState {
@@ -133,7 +147,11 @@ impl AppState {
         )
     }
 
-    /// Create new AppState with both pools and default legacy mode
+    /// Create new AppState with both pools and default legacy mode.
+    ///
+    /// Auth is wired with PG-backed repositories but disabled by
+    /// default (`auth_enabled = false`). Callers that want auth on
+    /// chain `.with_auth_enabled(true)` after construction.
     pub fn new(legacy_pool: crate::db::DbPool, new_pool: crate::db::PgPool) -> Self {
         let (customers, bookings, checkins, rooms, payments, inventory) =
             Self::default_repositories();
@@ -167,10 +185,16 @@ impl AppState {
             checkins_service: services.checkins,
             payments_service: services.payments,
             housekeeping_service: services.housekeeping,
+            auth_service: crate::routes::auth::build_auth_service(),
+            auth_enabled: false,
         }
     }
 
-    /// Create new AppState with specified mode
+    /// Create new AppState with specified mode.
+    ///
+    /// Auth is wired but disabled by default — see [`Self::new`] for
+    /// the full rationale. Use [`Self::with_auth_enabled`] to flip the
+    /// middleware on.
     pub fn with_mode(legacy_pool: crate::db::DbPool, new_pool: crate::db::PgPool, mode: SystemMode) -> Self {
         let (customers, bookings, checkins, rooms, payments, inventory) =
             Self::default_repositories();
@@ -204,7 +228,18 @@ impl AppState {
             checkins_service: services.checkins,
             payments_service: services.payments,
             housekeeping_service: services.housekeeping,
+            auth_service: crate::routes::auth::build_auth_service(),
+            auth_enabled: false,
         }
+    }
+
+    /// Builder-style toggle for the auth middleware. Called from
+    /// `main.rs` once it has read `AUTH_ENABLED` from the environment.
+    /// Does NOT affect the `/api/auth/*` endpoints — those stay reachable
+    /// regardless so the frontend can probe the auth state.
+    pub fn with_auth_enabled(mut self, enabled: bool) -> Self {
+        self.auth_enabled = enabled;
+        self
     }
 
     /// Wire all five Phase-2 services from the shared repository / outbox /
