@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.59.1] - 2026-05-10
+
+### Security
+
+- **Phase 3 hardening — SQL LIKE/equality injection fixed across 7
+  files** (audit HIGH-3 from the 2026-05-05 threat model). Previous
+  pattern was string concat with `escaped = search.replace('\'',
+  "''")` which only neutralised single quotes — leaving `%` and `_`
+  LIKE wildcards open for enumeration attacks (`%a%`, `%b%`, etc.) and
+  the broader SQL-injection-shaped pattern fragile to any future
+  PostgreSQL `standard_conforming_strings` flip.
+
+  Fix landed via 5 parallel agent worktrees, cherry-picked onto master
+  in order:
+  - `c069d22` `customer.rs` — 5 LIKE patterns on firstname/lastname/phone/email/idcard
+  - `1373d70` `checkin.rs` + `room.rs` — status equality filters
+  - `7c51d6c` `inventory.rs` — 3 functions (item search, room search, transactions filter)
+  - `f72172c` `routes/checkins.rs` + `routes/new_maintenance.rs` —
+    WHERE filters AND 5 UPDATE SET sites in the maintenance update
+    handler (more involved refactor: tracks `next_param_index` across
+    SET clauses, reserves the WHERE `mreq_id` slot last)
+  - `40b5f26` `booking.rs` — 5 conditional binds (search + status +
+    start_date + end_date + customer_id), the most complex of the batch
+
+  Pattern applied uniformly: `let pattern = format!("%{}%",
+  search.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));`
+  then `LIKE $N ESCAPE '\\'`. Equality filters use `= $N`. Date ranges
+  use `>= $N::date` / `<= $N::date`. All `sqlx::query(&q).bind(value)`
+  with the chained `let q = match &p { Some(v) => q.bind(v), None => q };`
+  idiom so bind order matches conditional-add order.
+
+  Integer columns (`customer_id`, `room_id`, `category_id`, etc.) and
+  `bool` columns (`active`) are still inlined since their Rust types
+  preclude string injection.
+
+  Verified: `cargo check --workspace` clean on each branch + on the
+  combined master. Integration tests deferred to CI (no local PG;
+  test-backend job exercises the full path).
+
 ## [2.59.0] - 2026-05-09
 
 ### Security
