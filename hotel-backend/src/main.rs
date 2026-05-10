@@ -17,10 +17,11 @@
 use hotel_backend::{config, db, routes, scheduler};
 
 use axum::{
+    http::HeaderValue,
     routing::{get, patch, put, delete},
     Router,
 };
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -192,9 +193,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Scheduler disabled (legacy database unavailable)");
     }
 
-    // Configure CORS
+    // Configure CORS — origins are locked to a curated allowlist read from
+    // `BACKEND_ALLOWED_ORIGINS` (comma-separated). Default covers the only
+    // legitimate callers today: the Next.js dev server on the host and the
+    // in-container `web` service. Production should set the env var
+    // explicitly with the public hostname(s). Methods + headers stay open
+    // (these are far less risky than origin without a strict policy).
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(parse_allowed_origins())
         .allow_methods(Any)
         .allow_headers(Any);
 
@@ -266,6 +272,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+/// Default CORS allowlist when `BACKEND_ALLOWED_ORIGINS` is unset.
+/// Covers the Next.js dev server on the host (3003) + the in-container
+/// `web` service. Production deployments should set the env var with the
+/// public hostname(s) instead of relying on the default.
+const DEFAULT_ALLOWED_ORIGINS: &str = "http://localhost:3003,http://web:3003";
+
+/// Parse the CORS allowlist from `BACKEND_ALLOWED_ORIGINS` (comma-separated)
+/// or fall back to `DEFAULT_ALLOWED_ORIGINS`. Empty entries are skipped
+/// silently so trailing commas don't break startup. Malformed origins
+/// panic loudly — config errors should fail at startup, not at request
+/// time (same loud-failure stance as `config::require_secret`).
+fn parse_allowed_origins() -> AllowOrigin {
+    let raw = std::env::var("BACKEND_ALLOWED_ORIGINS")
+        .unwrap_or_else(|_| DEFAULT_ALLOWED_ORIGINS.to_string());
+
+    let origins: Vec<HeaderValue> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .map(|origin| {
+            HeaderValue::from_str(origin).unwrap_or_else(|err| {
+                panic!(
+                    "BACKEND_ALLOWED_ORIGINS contains a malformed origin {:?}: {}. \
+                     Expected comma-separated absolute origins (e.g. \
+                     'https://hotel.example.com,http://web:3003').",
+                    origin, err
+                )
+            })
+        })
+        .collect();
+
+    if origins.is_empty() {
+        panic!(
+            "BACKEND_ALLOWED_ORIGINS is set but resolved to zero origins after \
+             trimming. Refusing to start with an empty CORS allowlist — set the \
+             env var to a comma-separated list of absolute origins, or unset it \
+             to use the default ({}).",
+            DEFAULT_ALLOWED_ORIGINS
+        );
+    }
+
+    tracing::info!(
+        "CORS allowlist: {}",
+        origins
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    AllowOrigin::list(origins)
 }
 
 /// Build the new routes router with AppState

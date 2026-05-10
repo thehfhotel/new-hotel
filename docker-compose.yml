@@ -122,6 +122,13 @@ services:
       - VILLE_DB_NAME=${VILLE_DB_NAME:-hotelville}
       - VILLE_DB_USER=${VILLE_DB_USER:-${POSTGRES_USER}}
       - VILLE_DB_PASSWORD=${VILLE_DB_PASSWORD:-${POSTGRES_PASSWORD}}
+      # CORS allowlist (Phase 3 hardening). Comma-separated absolute
+      # origins. Default (when unset) covers the Next.js dev server on
+      # the host + the in-container `web` service — fine for the current
+      # internal-only deploy where the backend port isn't exposed.
+      # Production should set this explicitly to the public hostname(s)
+      # if the backend ever gets exposed externally.
+      # - BACKEND_ALLOWED_ORIGINS=https://hotel.example.com,http://web:3003
     depends_on:
       newdb:
         condition: service_healthy
