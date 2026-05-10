@@ -28,6 +28,8 @@ pub mod customer;
 pub mod inventory;
 pub mod payment;
 pub mod room;
+pub mod session;
+pub mod user;
 
 pub use booking::{BookingRepository, PgBookingRepository};
 pub use checkin::{CheckInRepository, PgCheckInRepository};
@@ -35,6 +37,8 @@ pub use customer::{CustomerRepository, PgCustomerRepository};
 pub use inventory::{InventoryRepository, PgInventoryRepository};
 pub use payment::{PaymentRepository, PgPaymentRepository};
 pub use room::{PgRoomRepository, RoomRepository};
+pub use session::{PgSessionRepository, SessionRepository};
+pub use user::{PgUserRepository, UserRepository};
 
 // Outbox + EventBus impls live under `crate::outbox` (Phase 3b) — concrete
 // stateless structs, not trait+impl. Reach via `crate::outbox::{OutboxRepository, EventBus}`.

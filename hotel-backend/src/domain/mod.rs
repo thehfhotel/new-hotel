@@ -16,11 +16,15 @@ pub mod checkin;
 pub mod customer;
 pub mod payment;
 pub mod room;
+pub mod session;
 pub mod shared;
+pub mod user;
 
 pub use booking::{Booking, BookingState};
 pub use checkin::{CheckIn, CheckInState};
 pub use customer::{Customer, CustomerType};
 pub use payment::{Payment, PaymentMethod};
 pub use room::{CleanState, Room, RoomStatus};
+pub use session::Session;
 pub use shared::{DateRange, Money, RoomNumber};
+pub use user::{ParseRoleError, Role, User};

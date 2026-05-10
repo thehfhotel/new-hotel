@@ -1114,5 +1114,47 @@ VALUES ('026', '026_phase1_soak_no_op.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================
+-- Migration 027: ht_users (Phase 4 PR1 — auth foundation)
+-- Local username + Argon2id password hash + role. PR1 lays the schema +
+-- service layer; PR2 wires HTTP routes + Axum middleware on top.
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS ht_users (
+    user_id        BIGSERIAL    PRIMARY KEY,
+    username       VARCHAR(64)  NOT NULL UNIQUE,
+    password_hash  TEXT         NOT NULL,
+    role           VARCHAR(16)  NOT NULL CHECK (role IN ('admin', 'receptionist')),
+    active         BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at     TIMESTAMP    NOT NULL DEFAULT NOW(),
+    last_login_at  TIMESTAMP
+);
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('027', '027_create_ht_users.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
+-- Migration 028: ht_sessions (Phase 4 PR1 — auth foundation)
+-- Server-side session table; the HttpOnly cookie value IS the PK.
+-- ON DELETE CASCADE wipes a user's sessions when the user row is removed.
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS ht_sessions (
+    session_id  VARCHAR(64) PRIMARY KEY,
+    user_id     BIGINT      NOT NULL REFERENCES ht_users(user_id) ON DELETE CASCADE,
+    created_at  TIMESTAMP   NOT NULL DEFAULT NOW(),
+    expires_at  TIMESTAMP   NOT NULL,
+    ip          INET,
+    user_agent  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS ix_ht_sessions_expires_at
+    ON ht_sessions (expires_at);
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('028', '028_create_ht_sessions.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
 -- Initialization complete
 -- =============================================================================

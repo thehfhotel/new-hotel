@@ -34,6 +34,7 @@
 //! call but unused by HTTP handlers — installing them now keeps the Wave 4
 //! diff small + greppable.
 
+pub mod auth;
 pub mod booking;
 pub mod checkin;
 pub mod customer;
@@ -42,6 +43,7 @@ pub mod housekeeping;
 pub mod ids;
 pub mod payment;
 
+pub use auth::{AuthError, AuthService, DEFAULT_SESSION_TTL};
 pub use booking::{
     BookingOutcome, BookingRoomCommand, BookingService, BookingSnapshotInputs,
     BookingWritebackContext, CancelBookingCommand, CreateBookingCommand, ModifyBookingCommand,
