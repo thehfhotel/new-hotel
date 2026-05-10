@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.62.0] - 2026-05-10
+
+### Security
+
+- **Phase 7 pre-flip audit fixes** (audit run 2026-05-10 against
+  master @ `2096d53`; full report archived in conversation):
+  - **H-1**: replaced literal `REDACTED-sa-pw` placeholder in
+    `hotel-backend/.env.example`, `hotel-backend/README.md`, and
+    `scripts/sqlx-prepare.sh` with `CHANGE-ME-LOCAL-DEV-ONLY`.
+    The literal is the actual production legacy MSSQL `sa`
+    password (per the docker-compose comment fixed in H-2), so
+    leaving it in `.env.example` after the public flip would
+    leak the prod credential to anyone who reads the example +
+    the comment side-by-side.
+  - **H-2**: rewrote the `docker-compose.yml:334` comment that
+    spelled out `sa/REDACTED-sa-pw` in plain text — replaced with a
+    pointer to the rotation runbook (no literal credentials).
+  - **H-3**: open-redirect guard on `/login?redirect=...` —
+    previously `app/login/page.tsx` fed any `redirect` query
+    param straight to `router.replace()`, accepting external
+    URLs (`?redirect=https://evil.com`) and protocol-relative
+    URLs (`?redirect=//evil.com`). Now requires the value to
+    start with `/` AND not start with `//`; otherwise falls
+    back to `/`.
+  - **M-1**: invalidate all sessions for a user when an admin
+    resets their password. Without this, a stolen cookie kept
+    its full 24h expiry past the rotation. Added
+    `SessionRepository::delete_for_user` /
+    `delete_all_for_user` methods + wired into
+    `AuthService::update_user` so any `password.is_some()`
+    update bulk-revokes that user's `ht_sessions` rows in the
+    same flow. Mock repo updated to match.
+
+### Added
+
+- **`create_user` binary in the deployed backend image.** The
+  `bin/create_user.rs` source shipped in v2.60.0 (PR1) but
+  `hotel-backend/Dockerfile` only COPY'd the 5 production
+  binaries from the builder stage — the CLI was missing from
+  the runtime image, blocking the operator's Phase 4 cutover
+  step (`docker compose exec backend ./create_user ...`). Added
+  `--bin create_user` to the cargo build line + the COPY in the
+  runtime stage. Image grows by one ~5 MB statically-linked Rust
+  binary.
+
+### Operations (no code change, recorded for audit trail)
+
+- `POSTGRES_PASSWORD` rotated on prod (`newdb` container live
+  ALTER USER + `.env` update + `gh secret set` + `backend` /
+  `sync` / `writeback` recreate). New value is held only in
+  the GitHub Actions secret + `/home/deploy/new-hotel-production/.env`
+  on evergreen. Old value (`REDACTED-pg-2026`) is now dead.
+- `SLACK_WEBHOOK` rotated to a new Slack incoming webhook URL.
+
 ## [2.61.0] - 2026-05-10
 
 ### Added

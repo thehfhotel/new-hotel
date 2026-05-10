@@ -19,7 +19,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BACKEND_DIR="$PROJECT_DIR/hotel-backend"
 
 # Default DATABASE_URL (matches docker-compose.yml newdb service)
-DEFAULT_DB_URL="postgres://postgres:REDACTED-sa-pw@localhost:5439/hotelnew"
+DEFAULT_DB_URL="postgres://postgres:CHANGE-ME-LOCAL-DEV-ONLY@localhost:5439/hotelnew"
 
 DATABASE_URL="${1:-$DEFAULT_DB_URL}"
 export DATABASE_URL

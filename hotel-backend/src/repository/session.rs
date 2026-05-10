@@ -104,6 +104,31 @@ pub trait SessionRepository: Send + Sync {
         tx.commit().await?;
         Ok(n)
     }
+
+    /// Bulk-revoke every session belonging to a user — used by
+    /// `AuthService::update_user` when an admin resets the user's
+    /// password (so a stolen cookie doesn't outlive the rotation by
+    /// up to 24h). Default impl opens its own `pool.begin()` and
+    /// dispatches to [`Self::delete_all_for_user`]; mocks override.
+    async fn delete_for_user(
+        &self,
+        pool: &PgPool,
+        user_id: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let mut tx = pool.begin().await?;
+        let n = self.delete_all_for_user(&mut tx, user_id).await?;
+        tx.commit().await?;
+        Ok(n)
+    }
+
+    /// Low-level: DELETE every `ht_sessions` row for a `user_id`.
+    /// Returns rows-affected. Production uses sqlx; mocks override
+    /// with their HashMap retention.
+    async fn delete_all_for_user(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        user_id: i64,
+    ) -> Result<u64, sqlx::Error>;
 }
 
 /// Default `SessionRepository` impl backed by sqlx + PostgreSQL.
@@ -190,6 +215,18 @@ impl SessionRepository for PgSessionRepository {
     ) -> Result<u64, sqlx::Error> {
         let result = sqlx::query("DELETE FROM ht_sessions WHERE expires_at <= $1")
             .bind(now)
+            .execute(&mut **tx)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn delete_all_for_user(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        user_id: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query("DELETE FROM ht_sessions WHERE user_id = $1")
+            .bind(user_id)
             .execute(&mut **tx)
             .await?;
         Ok(result.rows_affected())

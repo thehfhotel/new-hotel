@@ -331,9 +331,10 @@ services:
       - DB_SERVER=192.168.11.51
       - DB_NAME=HOTEL
       - DB_USER=sa
-      # Reusing DB_PASSWORD for now — both sites' MSSQL share `sa/REDACTED-sa-pw`.
-      # Split into HFVILLE_DB_PASSWORD when one site rotates ahead of the
-      # other (see ADR 0001 Phase 8 ops-hardening notes).
+      # Reusing DB_PASSWORD for now — both sites' legacy MSSQL share the
+      # same `sa` credential. Split into HFVILLE_DB_PASSWORD when one site
+      # rotates ahead of the other (see ADR 0001 Phase 8 ops-hardening
+      # notes; gated on iHOTEL2025 vendor coordination).
       - DB_PASSWORD=${DB_PASSWORD}
       - MSSQL_PORT=1436
       # Canonical Ville state — separate logical DB on the same `newdb`

@@ -83,14 +83,14 @@ cargo build --release
 | `DB_SERVER` | `<legacy-mssql-host>` | Legacy SQL Server host |
 | `DB_NAME` | `db` | Legacy database name |
 | `DB_USER` | `sa` | Legacy database user |
-| `DB_PASSWORD` | `REDACTED-sa-pw` | Legacy database password |
+| `DB_PASSWORD` | `CHANGE-ME-LOCAL-DEV-ONLY` | Legacy database password |
 | `MSSQL_POOL_MAX_SIZE` | `20` | Legacy MSSQL bb8 pool max (shared by writeback + sync). Legacy alias: `DB_POOL_MAX`. |
 | `LEGACY_SYNC_RETENTION_CHECK_INTERVAL_SECS` | `300` | Per-table CT retention guard cadence in `bin/sync`. |
 | `NEW_DB_SERVER` | `newdb` | PostgreSQL host (Docker service name) |
 | `NEW_DB_PORT` | `5439` | PostgreSQL port |
 | `NEW_DB_NAME` | `hotelnew` | PostgreSQL database name |
 | `NEW_DB_USER` | `postgres` | PostgreSQL user |
-| `NEW_DB_PASSWORD` | `REDACTED-sa-pw` | PostgreSQL password |
+| `NEW_DB_PASSWORD` | `CHANGE-ME-LOCAL-DEV-ONLY` | PostgreSQL password |
 | `HOST` | `0.0.0.0` | Server bind address |
 | `PORT` | `3003` | Server port |
 | `SLACK_WEBHOOK_URL` | - | Slack webhook URL |
@@ -107,12 +107,12 @@ docker run -p 3003:3003 \
   -e DB_SERVER=<legacy-mssql-host> \
   -e DB_NAME=db \
   -e DB_USER=sa \
-  -e DB_PASSWORD=REDACTED-sa-pw \
+  -e DB_PASSWORD=CHANGE-ME-LOCAL-DEV-ONLY \
   -e NEW_DB_SERVER=newdb \
   -e NEW_DB_PORT=5439 \
   -e NEW_DB_NAME=hotelnew \
   -e NEW_DB_USER=postgres \
-  -e NEW_DB_PASSWORD=REDACTED-sa-pw \
+  -e NEW_DB_PASSWORD=CHANGE-ME-LOCAL-DEV-ONLY \
   hotel-backend
 ```
 
