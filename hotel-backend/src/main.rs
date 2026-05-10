@@ -14,10 +14,11 @@
 // `tests/`. The binary brings them into scope via `use hotel_backend::*`.
 // Phase 1b added `repository`; Phase 3b moved declaration to lib.rs — kept here
 // so integration tests can reach all 11 top-level modules.
-use hotel_backend::{config, db, routes, scheduler};
+use hotel_backend::{config, db, middleware as app_middleware, routes, scheduler};
 
 use axum::{
     http::HeaderValue,
+    middleware as axum_middleware,
     routing::{get, patch, put, delete},
     Router,
 };
@@ -25,7 +26,7 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::config::AppConfig;
+use crate::config::{auth_enabled_from_env, AppConfig};
 use crate::db::{create_pool, create_pg_pool};
 use crate::routes::mode::{AppState, SystemMode};
 use crate::scheduler::init_scheduler;
@@ -120,13 +121,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Phase 4 PR2: read AUTH_ENABLED once at startup. Defaults to false
+    // so existing deployments stay unauthenticated until the operator
+    // provisions an admin via `cargo run --bin create_user` and flips
+    // the flag. The `/api/auth/*` endpoints are mounted regardless so
+    // the frontend can probe for "auth is on" via `/api/auth/me`.
+    let auth_enabled = auth_enabled_from_env();
+    tracing::info!("Auth middleware: enabled={}", auth_enabled);
+
     // Create AppState based on available pools
     // Note: Pool types differ now (legacy=DbPool/tiberius, new=PgPool/sqlx)
     // so we can't clone one for the other.
     let (app_state, legacy_available, new_available) = match (&legacy_pool, new_pool) {
         (Some(legacy), Some(new_hotel)) => {
             tracing::info!("Dual database mode: Both databases available");
-            let mut state = AppState::with_mode(legacy.clone(), new_hotel, system_mode);
+            let mut state = AppState::with_mode(legacy.clone(), new_hotel, system_mode)
+                .with_auth_enabled(auth_enabled);
             if let Some(vp) = ville_pool {
                 state = state.with_ville(vp);
             }
@@ -218,7 +228,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Clone the pg_pool here so the original stays available for the
         // /health route's HealthState construction below (task #78).
         match create_pool(&config.db).await {
-            Ok(legacy) => build_new_routes(AppState::with_mode(legacy, pg_pool.clone(), SystemMode::New)),
+            Ok(legacy) => build_new_routes(
+                AppState::with_mode(legacy, pg_pool.clone(), SystemMode::New)
+                    .with_auth_enabled(auth_enabled),
+            ),
             Err(_) => {
                 // Can't get legacy pool at all - create routes with just the PG pool
                 // We'll need to handle this differently
@@ -250,9 +263,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/health", get(routes::health::health))
         .with_state(health_state);
 
-    // Merge all routes
+    // Phase 4 PR2: mount the public `/api/auth/*` endpoints. These are
+    // ALWAYS reachable — they're how unauthenticated callers acquire a
+    // session, and `/api/auth/me` is how the frontend probes whether
+    // auth is enabled at all (returns 401 + `{"error":"unauthenticated"}`
+    // when no cookie is present, regardless of `AUTH_ENABLED`).
+    let auth_routes = match &final_app_state {
+        Some(state) => routes::auth::router(state.clone()),
+        None => Router::new(),
+    };
+
+    // Merge all routes. Public routers (auth, health) MUST be merged
+    // alongside the protected `new_routes`, never inside it — the
+    // `require_auth` middleware below is applied only to `new_routes`,
+    // so anything mounted there gets gated when `AUTH_ENABLED=true`.
     let app = Router::new()
         .merge(new_routes)
+        .merge(auth_routes)
         .merge(health_routes)
         .layer(cors)
         .layer(TraceLayer::new_for_http());
@@ -327,8 +354,20 @@ fn parse_allowed_origins() -> AllowOrigin {
     AllowOrigin::list(origins)
 }
 
-/// Build the new routes router with AppState
+/// Build the new routes router with AppState.
+///
+/// Phase 4 PR2: the entire returned router is wrapped with the
+/// `require_auth` middleware. The middleware itself short-circuits to
+/// a no-op pass-through when `AppState::auth_enabled` is `false`
+/// (the production default), so there is no per-request cost until an
+/// operator opts in. The middleware is applied to THIS subrouter only
+/// — `/api/auth/*` and `/health` are mounted separately in `main()`
+/// and stay public.
 fn build_new_routes(app_state: AppState) -> Router {
+    let auth_layer = axum_middleware::from_fn_with_state(
+        app_state.clone(),
+        app_middleware::require_auth,
+    );
     Router::new()
         // Rooms routes (PG-only, Phase 8 — reads `ht_rooms_legacy` mirror)
         .route("/api/rooms", get(routes::rooms::list_rooms))
@@ -422,4 +461,11 @@ fn build_new_routes(app_state: AppState) -> Router {
         // Long-lived SSE connection; one PgListener per client.
         .route("/api/events", get(routes::events::stream))
         .with_state(app_state)
+        // Phase 4 PR2: gate every route above behind the cookie-session
+        // auth middleware. The middleware itself is a no-op when
+        // `AUTH_ENABLED=false` (the production default), so this is
+        // free until an operator opts in. Applied AFTER `with_state`
+        // so the inner routes already have their state attached when
+        // the layer wraps them.
+        .layer(auth_layer)
 }
