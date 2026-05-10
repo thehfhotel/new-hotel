@@ -54,7 +54,22 @@ pub(crate) async fn execute_all(
     statements: &[String],
 ) -> WritebackResult<()> {
     for stmt in statements {
-        tracing::trace!(sql = %stmt, "Writeback statement");
+        // Phase 7 audit M-4 (2026-05-10): trace logs used to embed the
+        // full statement (`sql = %stmt`), which leaks PII / payment
+        // amounts / customer ids if the trace level is ever enabled in
+        // production. Replaced with two redacted fields:
+        //   * `stmt_kind` — first whitespace-delimited token, typically
+        //     INSERT/UPDATE/DELETE. Lets ops correlate without leaking
+        //     column values.
+        //   * `stmt_len`  — byte length of the statement; helps spot
+        //     anomalously large writes during incident review.
+        // The statement is still passed to `simple_query` verbatim — the
+        // wire behaviour is unchanged.
+        tracing::trace!(
+            stmt_kind = stmt.split_whitespace().next().unwrap_or("UNKNOWN"),
+            stmt_len = stmt.len(),
+            "writeback statement"
+        );
         let _ = conn.simple_query(stmt.as_str()).await?;
     }
     Ok(())

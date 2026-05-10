@@ -17,12 +17,12 @@
 use hotel_backend::{config, db, middleware as app_middleware, routes, scheduler};
 
 use axum::{
-    http::HeaderValue,
+    http::{header::CONTENT_TYPE, HeaderValue, Method},
     middleware as axum_middleware,
-    routing::{get, patch, put, delete},
+    routing::{delete, get, patch, post, put},
     Router,
 };
-use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -204,15 +204,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Configure CORS — origins are locked to a curated allowlist read from
-    // `BACKEND_ALLOWED_ORIGINS` (comma-separated). Default covers the only
-    // legitimate callers today: the Next.js dev server on the host and the
-    // in-container `web` service. Production should set the env var
-    // explicitly with the public hostname(s). Methods + headers stay open
-    // (these are far less risky than origin without a strict policy).
+    // `BACKEND_ALLOWED_ORIGINS` (comma-separated, locked in v2.59.2).
+    // Phase 7 audit M-3 (2026-05-10): tightened methods + headers from
+    // wildcard `Any` to explicit lists so an origin-spoofed pre-flight
+    // can't probe for arbitrary verbs/headers, and so credentialed
+    // requests (cookie session) round-trip cleanly — `Any` is forbidden
+    // by the CORS spec when `Access-Control-Allow-Credentials: true`.
     let cors = CorsLayer::new()
         .allow_origin(parse_allowed_origins())
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([CONTENT_TYPE])
+        .allow_credentials(true);
 
     // Build all routes (use AppState for dual-database access).
     // User-facing legacy-read routes (rooms, bookings, customers, stats, etc.)
@@ -268,8 +277,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // session, and `/api/auth/me` is how the frontend probes whether
     // auth is enabled at all (returns 401 + `{"error":"unauthenticated"}`
     // when no cookie is present, regardless of `AUTH_ENABLED`).
+    //
+    // Phase 7 audit M-2 (2026-05-10): the `/api/auth/login` route is
+    // wrapped with the in-process per-IP rate limiter (10 attempts per
+    // 15-minute sliding window). The limiter is mounted ONLY on login
+    // — `/api/auth/me` and `/api/auth/logout` need to stay free of
+    // throttling so a stuck client can always rotate its session
+    // without first solving a 429. The limiter is wired here rather
+    // than inside `routes::auth::router()` so the route module stays
+    // free of cross-cutting concerns.
     let auth_routes = match &final_app_state {
-        Some(state) => routes::auth::router(state.clone()),
+        Some(state) => {
+            let login_limiter = app_middleware::LoginRateLimitState::new();
+            let login_layer = axum_middleware::from_fn_with_state(
+                login_limiter,
+                app_middleware::login_rate_limit,
+            );
+            Router::new()
+                .route("/api/auth/login", post(routes::auth::login).layer(login_layer))
+                .route("/api/auth/logout", post(routes::auth::logout))
+                .route("/api/auth/me", get(routes::auth::me))
+                .with_state(state.clone())
+        }
         None => Router::new(),
     };
 
