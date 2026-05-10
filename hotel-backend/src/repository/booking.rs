@@ -229,37 +229,55 @@ impl BookingRepository for PgBookingRepository {
             _ => "b.created_at",
         };
 
+        // Build a parameterized WHERE clause. All user-supplied filter values
+        // flow through `.bind()` (see below), never via string interpolation.
+        // For the LIKE search we additionally escape `\`, `%`, `_` so the user
+        // cannot inject wildcards or break out of the pattern; the literal
+        // value still rides on a parameter slot — `ESCAPE '\\'` only changes
+        // how PostgreSQL interprets the bound text.
+        let search_pattern: Option<String> = params.search.as_ref().map(|search| {
+            format!(
+                "%{}%",
+                search
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+            )
+        });
+
         let mut conditions: Vec<String> = Vec::new();
+        let mut next_idx: usize = 0;
 
-        if let Some(ref search) = params.search {
-            let escaped = search.replace('\'', "''");
+        if search_pattern.is_some() {
+            next_idx += 1;
+            let i = next_idx;
             conditions.push(format!(
-                "(b.book_no LIKE '%{}%' OR c.cust_firstname LIKE '%{}%' OR c.cust_lastname LIKE '%{}%' OR c.cust_phone LIKE '%{}%')",
-                escaped, escaped, escaped, escaped
+                "(b.book_no LIKE ${i} ESCAPE '\\' \
+                 OR c.cust_firstname LIKE ${i} ESCAPE '\\' \
+                 OR c.cust_lastname LIKE ${i} ESCAPE '\\' \
+                 OR c.cust_phone LIKE ${i} ESCAPE '\\')",
+                i = i
             ));
         }
 
-        if let Some(ref status) = params.status {
-            let escaped = status.replace('\'', "''");
-            conditions.push(format!("b.book_status = '{}'", escaped));
+        if params.status.is_some() {
+            next_idx += 1;
+            conditions.push(format!("b.book_status = ${}", next_idx));
         }
 
-        if let Some(ref start_date) = params.start_date {
-            conditions.push(format!(
-                "b.book_checkout::date >= '{}'",
-                start_date.replace('\'', "''")
-            ));
+        if params.start_date.is_some() {
+            next_idx += 1;
+            conditions.push(format!("b.book_checkout::date >= ${}::date", next_idx));
         }
 
-        if let Some(ref end_date) = params.end_date {
-            conditions.push(format!(
-                "b.book_checkin::date <= '{}'",
-                end_date.replace('\'', "''")
-            ));
+        if params.end_date.is_some() {
+            next_idx += 1;
+            conditions.push(format!("b.book_checkin::date <= ${}::date", next_idx));
         }
 
-        if let Some(cust_id) = params.customer_id {
-            conditions.push(format!("b.book_cust_id = {}", cust_id));
+        if params.customer_id.is_some() {
+            next_idx += 1;
+            conditions.push(format!("b.book_cust_id = ${}", next_idx));
         }
 
         let where_clause = if conditions.is_empty() {
@@ -278,7 +296,27 @@ impl BookingRepository for PgBookingRepository {
             where_clause
         );
 
-        let count_rows = sqlx::query(&count_query).fetch_all(pool).await?;
+        // Bind in the SAME order the conditions were appended above: search,
+        // status, start_date, end_date, customer_id. sqlx binds positionally
+        // by call order, not by `$N` literal — so the order must match the
+        // `next_idx` increments above.
+        let mut count_q = sqlx::query(&count_query);
+        if let Some(ref pattern) = search_pattern {
+            count_q = count_q.bind(pattern);
+        }
+        if let Some(ref status) = params.status {
+            count_q = count_q.bind(status);
+        }
+        if let Some(ref start_date) = params.start_date {
+            count_q = count_q.bind(start_date);
+        }
+        if let Some(ref end_date) = params.end_date {
+            count_q = count_q.bind(end_date);
+        }
+        if let Some(cust_id) = params.customer_id {
+            count_q = count_q.bind(cust_id);
+        }
+        let count_rows = count_q.fetch_all(pool).await?;
 
         let total: i32 = count_rows
             .first()
@@ -315,7 +353,23 @@ impl BookingRepository for PgBookingRepository {
             where_clause, order_by_column, sort_order, params.limit, offset
         );
 
-        let rows = sqlx::query(&data_query).fetch_all(pool).await?;
+        let mut data_q = sqlx::query(&data_query);
+        if let Some(ref pattern) = search_pattern {
+            data_q = data_q.bind(pattern);
+        }
+        if let Some(ref status) = params.status {
+            data_q = data_q.bind(status);
+        }
+        if let Some(ref start_date) = params.start_date {
+            data_q = data_q.bind(start_date);
+        }
+        if let Some(ref end_date) = params.end_date {
+            data_q = data_q.bind(end_date);
+        }
+        if let Some(cust_id) = params.customer_id {
+            data_q = data_q.bind(cust_id);
+        }
+        let rows = data_q.fetch_all(pool).await?;
 
         let bookings: Vec<BookingListRow> = rows
             .iter()
