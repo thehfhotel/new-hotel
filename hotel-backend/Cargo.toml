@@ -25,6 +25,10 @@ path = "src/bin/sync.rs"
 name = "backfill_rooms"
 path = "src/bin/backfill_rooms.rs"
 
+[[bin]]
+name = "create_user"
+path = "src/bin/create_user.rs"
+
 [dependencies]
 # Web framework (matches Tauri middleware).
 # 0.8 migration (2026-05-01): path param syntax changed from `/:id` to `/{id}`
@@ -109,3 +113,11 @@ async-trait = "0.1"
 #   pulled in transitively by axum/sqlx so this is a zero-cost declaration.
 async-stream = "0.3"
 futures-util = { version = "0.3", default-features = false }
+
+# Authentication (Phase 4 PR1) — local-credentials login.
+# - argon2: PHC-string Argon2id password hashing/verification. Pure Rust,
+#   no system deps. Pulls in `password-hash` for the encoded format.
+# - rpassword: TTY prompt for the create_user CLI so passwords don't end
+#   up in shell history. Pure Rust, no curses dep.
+argon2 = "0.5"
+rpassword = "7"

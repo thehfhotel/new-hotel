@@ -167,6 +167,8 @@ These are automatically applied by `scripts/migrate.sh` during deployment.
 | 020 | `020_legacy_mirror_schema.sql` | Phase 5.5a — `legacy_mirror.*` opaque pass-through schema mirroring 11 legacy-only tables (`ht_cupon`, `ht_checkin_product`, `ht_deposit`, `ht_continuetime`, `ht_changed_room`, `ht_rooms_cancel`, `ht_rooms_price`, `ht_bill_debt_h`, `ht_bill_debt_ds`, `ht_order_up`, `ht_order_down`). UI surfaces these as informational panels so receptionists don't switch to the .NET app for coupons / deposits / minibar / room moves / pricing tiers. 5.5a populates the 4 dimension tables via reconcile; 5.5c adds CT mappers for the 6 transactional tables | v2.50.0 |
 | 025 | `025_drop_ville_schema.sql` | Task #77 — drop the obsolete `ville` schema in `hotelnew`. Migration 010 created it as a local cache for the FreeTDS-based `ville_sync` worker; Phase 5 Ville cutover (#76) repointed `ville_pool` to the new `hotelville` PG database, and after a 1-week soak window the schema is no longer read by any backend code path | v2.55.1 |
 | 026 | `026_phase1_soak_no_op.sql` | Pure no-op migration to exercise the Phase 1 CI/CD modernization pipeline (drift-check + migrate.sh + build-backend recreate). Substitutes for the 2-week soak window; safe to leave or remove later | v2.57.2 |
+| 027 | `027_create_ht_users.sql` | Phase 4 PR1 — `ht_users` table with `(user_id, username, password_hash, role, active, created_at, last_login_at)`. Argon2id PHC password hashes; role enum `admin`/`receptionist` enforced by CHECK. Foundation for local cookie-session auth (no SSO, no JWT) | v2.60.0 |
+| 028 | `028_create_ht_sessions.sql` | Phase 4 PR1 — `ht_sessions` table keyed by 32-byte hex session token (`session_id` PK). FK to `ht_users` with `ON DELETE CASCADE`; tracks `expires_at` (PR1 default = login + 24h), client `ip`, `user_agent`. Index on `expires_at` for the periodic cleanup pass. PR2 will add HTTP routes + Axum middleware that read this table | v2.60.0 |
 
 ## Tables Owned by This Application
 
@@ -210,6 +212,8 @@ All table and column names are **lowercase** (PostgreSQL convention). The canoni
 | `legacy_ct_state` | Single-row Change Tracking watermark consumed by `bin/sync.rs` | v2.8.2 |
 | `legacy_sync_status` | Per-table CT-watcher observability — rows ingested/skipped, last error, consecutive failure count | v2.43.0 |
 | `ht_reconcile_log` | Phase 5.5 drift tripwire — rows where MSSQL hash != canonical PG hash (logged by the demoted `scheduler::sync::run_sync` 15-min diff-only safety net) | v2.45.0 |
+| `ht_users` | Local username + Argon2id password hash + role (`admin` / `receptionist`). Backs Phase 4 cookie-session authentication (PR1 introduces the schema; PR2 adds HTTP login routes) | v2.60.0 |
+| `ht_sessions` | Active server-side sessions keyed by HttpOnly cookie token. `ON DELETE CASCADE` from `ht_users`; `expires_at` index drives periodic cleanup. (Phase 4 PR1) | v2.60.0 |
 
 ## Tables Used (Read-Only or Shared)
 
