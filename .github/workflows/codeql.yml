@@ -1,0 +1,59 @@
+name: CodeQL
+
+# Phase 9 — post-flip security scanning. CodeQL runs on:
+#   - every push to master (so a regression surfaces immediately)
+#   - every PR (Dependabot + future external contributors)
+#   - weekly cron (catches new advisories landing against unchanged code)
+#
+# Languages enabled: javascript-typescript (frontend) + rust (backend
+# + Tauri middleware). The matrix splits them so a slow Rust build
+# doesn't block JS results.
+#
+# Findings surface in the Security tab → Code scanning. Configure
+# branch protection later if you want PRs to block on CodeQL.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  schedule:
+    # Weekly on Sunday 03:00 UTC = 10:00 Thai. Off-hours, low-traffic.
+    - cron: '0 3 * * 0'
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # `javascript-typescript` covers app/, components/, lib/, contexts/.
+        # `rust` covers hotel-backend/ + thai-id-middleware-tauri/.
+        language: [javascript-typescript, rust]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          # `security-and-quality` is the more thorough pack;
+          # `security-extended` is the minimum-noise default. Picking the
+          # noisier one because we want signal during the post-flip soak.
+          queries: security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: '/language:${{ matrix.language }}'
