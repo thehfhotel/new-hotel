@@ -30,6 +30,13 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 ARG NEXT_PUBLIC_CARD_READER_URL
 ENV NEXT_PUBLIC_CARD_READER_URL=$NEXT_PUBLIC_CARD_READER_URL
+# AuthGuard runtime gate (Phase 4 cutover). When `'true'` the frontend
+# enforces the /login redirect on any unauthenticated page navigation.
+# When unset/anything-else: AuthGuard is a no-op (auth-off escape hatch
+# for local dev). NEXT_PUBLIC_* values are inlined at build time, so a
+# flip from false→true requires this image to rebuild.
+ARG NEXT_PUBLIC_AUTH_REQUIRED
+ENV NEXT_PUBLIC_AUTH_REQUIRED=$NEXT_PUBLIC_AUTH_REQUIRED
 # Next.js writes its incremental webpack/SWC cache to .next/cache. Mounting
 # it as a BuildKit cache means re-builds skip work for unchanged modules.
 # Output (.next/standalone, .next/static) is NOT under .next/cache, so the

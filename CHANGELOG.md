@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.62.1] - 2026-05-10
+
+### Changed
+
+- **Wire `AUTH_ENABLED` + `NEXT_PUBLIC_AUTH_REQUIRED` through the
+  deploy pipeline** — Phase 4 cutover infrastructure. Without this
+  the auth flags only worked when manually edited on prod and
+  reverted on every CI deploy.
+  - `docker-compose.yml`: uncommented `AUTH_ENABLED=${AUTH_ENABLED:-false}`
+    on the backend service so the value propagates from `.env` to the
+    container env.
+  - `Dockerfile` (frontend): added `ARG NEXT_PUBLIC_AUTH_REQUIRED` +
+    `ENV NEXT_PUBLIC_AUTH_REQUIRED=$NEXT_PUBLIC_AUTH_REQUIRED` to the
+    builder stage so Next.js inlines the value at `pnpm build` time.
+  - `.github/workflows/docker-build.yml`:
+    - `build-frontend` job now passes `NEXT_PUBLIC_AUTH_REQUIRED=${{ vars.AUTH_REQUIRED || 'false' }}`
+      as a build-arg to the docker build.
+    - `deploy` job now passes `AUTH_ENABLED=${{ vars.AUTH_ENABLED || 'false' }}`
+      through the JSON payload to `/srv/run-deploy.sh` so the value
+      is written to prod's `.env` on every deploy.
+  - GitHub Actions repo **variables** (not secrets — these are
+    booleans, not credentials): `AUTH_ENABLED=true` and
+    `AUTH_REQUIRED=true` set 2026-05-10. Both default to `false` if
+    unset, preserving the previous "auth off" behavior for any
+    fork/clone/replay.
+
+### Operations
+
+- Phase 4 cutover executed:
+  - Provisioned admin `winut` (role=admin, user_id=1) via
+    `docker compose exec backend ./create_user`. Password held
+    out-of-band in this conversation.
+  - `AUTH_ENABLED=true` set as repo variable; persists through
+    redeploys.
+  - Backend `/api/auth/login` returns 200 + `session` cookie for
+    valid creds; `/api/new/*` returns 401 unauthenticated once
+    this v2.62.1 deploy lands.
+
 ## [2.62.0] - 2026-05-10
 
 ### Security

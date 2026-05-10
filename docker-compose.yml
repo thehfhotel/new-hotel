@@ -148,7 +148,7 @@ services:
       #             HttpOnly cookie minted by `POST /api/auth/login`.
       # Either way, `/api/auth/{login,logout,me}` and `/api/health`
       # remain public — that's how the frontend bootstraps.
-      # - AUTH_ENABLED=${AUTH_ENABLED:-false}
+      - AUTH_ENABLED=${AUTH_ENABLED:-false}
     depends_on:
       newdb:
         condition: service_healthy
