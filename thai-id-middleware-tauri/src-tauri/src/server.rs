@@ -5,7 +5,7 @@
 
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
+    http::{header::CONTENT_TYPE, HeaderValue, Method, StatusCode},
     response::IntoResponse,
     routing::get,
     Json, Router,
@@ -13,12 +13,19 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::card_reader::{CardData, CardReader, FullDebugInfo, set_debug_mode, is_debug_mode};
 
 /// Server port for the HTTP API
 const SERVER_PORT: u16 = 9898;
+
+/// Default CORS allowlist when `CARD_READER_ALLOWED_ORIGINS` is unset.
+/// Mirrors the backend's `BACKEND_ALLOWED_ORIGINS` default — covers the
+/// Next.js dev server on the host (3003) plus the in-container `web`
+/// service. Production deployments MUST set the env var explicitly with
+/// the public hostname(s) of the frontend(s) allowed to read cards.
+const DEFAULT_ALLOWED_ORIGINS: &str = "http://localhost:3003,http://web:3003";
 
 /// Shared application state for Axum handlers
 #[derive(Clone)]
@@ -89,11 +96,21 @@ pub struct ReadParams {
 pub async fn start_http_server(card_reader: Arc<Mutex<CardReader>>) -> Result<(), String> {
     let state = AppState { card_reader };
 
-    // Configure CORS to allow all origins (for localhost web apps)
+    // Lock CORS down to a curated allowlist. The middleware is bound to
+    // 127.0.0.1 but the browser still happily proxies cross-origin
+    // `fetch('http://localhost:9898/read')` requests from any tab the
+    // receptionist visits — which would let any malicious page exfiltrate
+    // a card-on-reader. The allowlist is sourced from
+    // `CARD_READER_ALLOWED_ORIGINS` (comma-separated) and defaults to the
+    // legitimate frontends only. Methods are restricted to GET (every
+    // handler is a GET today) plus OPTIONS for the preflight; headers are
+    // restricted to `Content-Type` since none of the endpoints inspect
+    // anything else. No credentials/cookies are involved, so
+    // `allow_credentials` stays off.
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_origin(parse_allowed_origins())
+        .allow_methods([Method::GET, Method::OPTIONS])
+        .allow_headers([CONTENT_TYPE]);
 
     // Build the router with all endpoints
     let app = Router::new()
@@ -118,6 +135,54 @@ pub async fn start_http_server(card_reader: Arc<Mutex<CardReader>>) -> Result<()
     axum::serve(listener, app)
         .await
         .map_err(|e| format!("Server error: {}", e))
+}
+
+/// Parse the CORS allowlist from `CARD_READER_ALLOWED_ORIGINS`
+/// (comma-separated) or fall back to `DEFAULT_ALLOWED_ORIGINS`. Empty
+/// entries are skipped silently so trailing commas don't break startup.
+/// Malformed origins panic loudly — config errors should fail at startup,
+/// not at request time, so a misconfigured deployment is impossible to
+/// miss instead of silently letting cards leak.
+fn parse_allowed_origins() -> AllowOrigin {
+    let raw = std::env::var("CARD_READER_ALLOWED_ORIGINS")
+        .unwrap_or_else(|_| DEFAULT_ALLOWED_ORIGINS.to_string());
+
+    let origins: Vec<HeaderValue> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .map(|origin| {
+            HeaderValue::from_str(origin).unwrap_or_else(|err| {
+                panic!(
+                    "CARD_READER_ALLOWED_ORIGINS contains a malformed origin {:?}: {}. \
+                     Expected comma-separated absolute origins (e.g. \
+                     'https://hotel.example.com,http://web:3003').",
+                    origin, err
+                )
+            })
+        })
+        .collect();
+
+    if origins.is_empty() {
+        panic!(
+            "CARD_READER_ALLOWED_ORIGINS is set but resolved to zero origins after \
+             trimming. Refusing to start with an empty CORS allowlist — set the \
+             env var to a comma-separated list of absolute origins, or unset it \
+             to use the default ({}).",
+            DEFAULT_ALLOWED_ORIGINS
+        );
+    }
+
+    println!(
+        "CORS allowlist: {}",
+        origins
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    AllowOrigin::list(origins)
 }
 
 /// GET /health - Returns server and reader status
@@ -376,5 +441,36 @@ mod tests {
     fn test_read_params_with_photo() {
         let params: ReadParams = serde_json::from_str("{\"photo\": true}").unwrap();
         assert_eq!(params.photo, Some(true));
+    }
+
+    #[test]
+    fn test_default_allowed_origins_constant() {
+        // Default must cover the legitimate frontends only — never `*`.
+        // Sentinel test so a future "let's just open it back up" change
+        // trips a failing assertion.
+        assert_eq!(
+            DEFAULT_ALLOWED_ORIGINS,
+            "http://localhost:3003,http://web:3003"
+        );
+        assert!(!DEFAULT_ALLOWED_ORIGINS.contains('*'));
+    }
+
+    #[test]
+    fn test_parse_allowed_origins_uses_default_when_unset() {
+        // Avoid leaking env state into other tests in this process.
+        std::env::remove_var("CARD_READER_ALLOWED_ORIGINS");
+        // Should not panic — default origins are valid HeaderValues.
+        let _ = parse_allowed_origins();
+    }
+
+    #[test]
+    fn test_parse_allowed_origins_accepts_custom_list() {
+        std::env::set_var(
+            "CARD_READER_ALLOWED_ORIGINS",
+            "https://hotel.example.com, http://localhost:3003",
+        );
+        // Should not panic — both are valid origins; whitespace is trimmed.
+        let _ = parse_allowed_origins();
+        std::env::remove_var("CARD_READER_ALLOWED_ORIGINS");
     }
 }
