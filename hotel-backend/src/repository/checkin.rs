@@ -312,9 +312,12 @@ impl CheckInRepository for PgCheckInRepository {
 
         let mut conditions: Vec<String> = Vec::new();
 
-        if let Some(ref status) = params.status {
-            let escaped = status.replace('\'', "''");
-            conditions.push(format!("ci.cin_status = '{}'", escaped));
+        // Parameterize the status equality filter to remove the SQL string-concat
+        // injection vector. The actual value is passed via sqlx `.bind($1)` below.
+        // It is the only parameterized condition in this query, so the `$1`
+        // placeholder index is fixed.
+        if params.status.is_some() {
+            conditions.push("ci.cin_status = $1".to_string());
         }
 
         if let Some(ref start_date) = params.start_date {
@@ -354,7 +357,12 @@ impl CheckInRepository for PgCheckInRepository {
             where_clause
         );
 
-        let count_rows = sqlx::query(&count_query).fetch_all(pool).await?;
+        let count_q = sqlx::query(&count_query);
+        let count_q = match &params.status {
+            Some(v) => count_q.bind(v),
+            None => count_q,
+        };
+        let count_rows = count_q.fetch_all(pool).await?;
 
         let total: i32 = count_rows
             .first()
@@ -397,7 +405,12 @@ impl CheckInRepository for PgCheckInRepository {
             where_clause, order_by_column, sort_order, params.limit, offset
         );
 
-        let rows = sqlx::query(&data_query).fetch_all(pool).await?;
+        let data_q = sqlx::query(&data_query);
+        let data_q = match &params.status {
+            Some(v) => data_q.bind(v),
+            None => data_q,
+        };
+        let rows = data_q.fetch_all(pool).await?;
 
         let checkins: Vec<CheckInListRow> = rows
             .iter()
