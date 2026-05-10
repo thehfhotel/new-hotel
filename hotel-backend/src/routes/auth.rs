@@ -192,6 +192,15 @@ pub async fn login(
             tracing::error!(error = %err, "auth/login: hash error");
             return Err(internal_error());
         }
+        // PR4 added admin-only error variants to `AuthError`
+        // (`UserNotFound`, `UsernameTaken`). They cannot arise from the
+        // `login()` code path, but the exhaustiveness checker still
+        // requires us to spell out the case. If one ever surfaces it
+        // points at a service-layer regression — alarm and 500.
+        Err(other) => {
+            tracing::error!(error = %other, "auth/login: unexpected service error");
+            return Err(internal_error());
+        }
     };
 
     let secure = is_https_request(&headers);

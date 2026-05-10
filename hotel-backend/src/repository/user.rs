@@ -74,6 +74,89 @@ pub trait UserRepository: Send + Sync {
         tx.commit().await?;
         Ok(n)
     }
+
+    /// List every user row, ordered by `username` ASC.
+    ///
+    /// Used by the admin user-management page (Phase 4 PR4). Returns
+    /// the full domain `User` (including `password_hash`) — the route
+    /// layer is responsible for projecting to a hash-free DTO before
+    /// sending to the wire. Read-only, takes the pool directly.
+    async fn list_all(&self, pool: &PgPool) -> Result<Vec<User>, sqlx::Error>;
+
+    /// Flip `active` for an existing user. Returns rows affected so the
+    /// caller can detect "user vanished" (0) and surface a 404.
+    async fn update_active(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        user_id: i64,
+        active: bool,
+    ) -> Result<u64, sqlx::Error>;
+
+    /// Replace `role` for an existing user. Returns rows affected so
+    /// the caller can detect a missing user.
+    async fn update_role(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        user_id: i64,
+        role: Role,
+    ) -> Result<u64, sqlx::Error>;
+
+    /// Replace `password_hash` for an existing user. The caller MUST
+    /// have run the plaintext through [`crate::service::auth::AuthService::hash_password`]
+    /// — this method does not hash. Returns rows affected.
+    async fn update_password_hash(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        user_id: i64,
+        password_hash: &str,
+    ) -> Result<u64, sqlx::Error>;
+
+    /// High-level façade for admin-side user mutation: opens one
+    /// transaction, applies whichever of `active` / `role` / `password_hash`
+    /// are `Some`, commits. Returns the total number of UPDATE rows
+    /// affected across all sub-statements so the caller can detect
+    /// "user not found" (0 from every sub-update).
+    ///
+    /// Default impl chains the trait methods inside `pool.begin()`. Mock
+    /// repos that ignore `Transaction` should override.
+    async fn apply_admin_patch(
+        &self,
+        pool: &PgPool,
+        user_id: i64,
+        active: Option<bool>,
+        role: Option<Role>,
+        password_hash: Option<&str>,
+    ) -> Result<u64, sqlx::Error> {
+        let mut tx = pool.begin().await?;
+        let mut affected = 0u64;
+        if let Some(value) = active {
+            affected = affected.max(self.update_active(&mut tx, user_id, value).await?);
+        }
+        if let Some(value) = role {
+            affected = affected.max(self.update_role(&mut tx, user_id, value).await?);
+        }
+        if let Some(value) = password_hash {
+            affected = affected.max(self.update_password_hash(&mut tx, user_id, value).await?);
+        }
+        tx.commit().await?;
+        Ok(affected)
+    }
+
+    /// High-level façade for `INSERT INTO ht_users`: opens one
+    /// transaction, inserts, commits. Returns the new `user_id`. Mock
+    /// repos that ignore `Transaction` should override.
+    async fn insert_via_pool(
+        &self,
+        pool: &PgPool,
+        username: &str,
+        password_hash: &str,
+        role: Role,
+    ) -> Result<i64, sqlx::Error> {
+        let mut tx = pool.begin().await?;
+        let id = self.insert(&mut tx, username, password_hash, role).await?;
+        tx.commit().await?;
+        Ok(id)
+    }
 }
 
 /// Default `UserRepository` implementation backed by sqlx + PostgreSQL.
@@ -171,6 +254,84 @@ impl UserRepository for PgUserRepository {
             "#,
         )
         .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
+    async fn list_all(&self, pool: &PgPool) -> Result<Vec<User>, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"
+            SELECT user_id, username, password_hash, role, active,
+                   created_at, last_login_at
+            FROM ht_users
+            ORDER BY username ASC
+            "#,
+        )
+        .fetch_all(pool)
+        .await?;
+
+        rows.into_iter().map(map_user_row).collect()
+    }
+
+    async fn update_active(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        user_id: i64,
+        active: bool,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE ht_users
+            SET active = $2
+            WHERE user_id = $1
+            "#,
+        )
+        .bind(user_id)
+        .bind(active)
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
+    async fn update_role(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        user_id: i64,
+        role: Role,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE ht_users
+            SET role = $2
+            WHERE user_id = $1
+            "#,
+        )
+        .bind(user_id)
+        .bind(role.as_str())
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
+    async fn update_password_hash(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        user_id: i64,
+        password_hash: &str,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE ht_users
+            SET password_hash = $2
+            WHERE user_id = $1
+            "#,
+        )
+        .bind(user_id)
+        .bind(password_hash)
         .execute(&mut **tx)
         .await?;
 

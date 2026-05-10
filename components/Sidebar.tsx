@@ -35,6 +35,8 @@ interface NavItem {
   href: string
   label: string
   icon: React.ReactNode
+  /** When true, the item is hidden unless the current user is an admin. */
+  adminOnly?: boolean
 }
 
 interface NavSection {
@@ -74,6 +76,15 @@ const sections: NavSection[] = [
     items: [
       { href: '/room-types', label: 'ประเภทห้อง', icon: <LayoutGrid size={20} /> },
       { href: '/rates', label: 'ราคา', icon: <DollarSign size={20} /> },
+      // Phase 4 PR4: admin-only — hidden when there's no logged-in
+      // user OR when role !== 'admin'. The page itself enforces the
+      // same gate server-side; this is just a nav-discoverability hint.
+      {
+        href: '/admin/users',
+        label: 'ผู้ใช้งาน',
+        icon: <Users size={20} />,
+        adminOnly: true,
+      },
       { href: '/changelog', label: 'ประวัติ', icon: <ScrollText size={20} /> },
     ],
   },
@@ -180,34 +191,43 @@ export default function Sidebar() {
         )}
       </div>
 
-      {/* Navigation */}
+      {/* Navigation. Admin-only items are filtered out unless the
+          current user has the admin role — see PR4. When the user is
+          null (not logged in OR auth disabled) admin items stay
+          hidden, matching the additive-only PR contract. */}
       <nav className="flex-1 overflow-y-auto py-2 px-1">
-        {sections.map((section, idx) => (
-          <div key={section.title} className={idx > 0 ? 'mt-3' : ''}>
-            {!collapsed && (
-              <div className="text-[10px] uppercase tracking-wide text-textMuted font-semibold px-3 py-1">
-                {section.title}
+        {sections.map((section, idx) => {
+          const visibleItems = section.items.filter(
+            (item) => !item.adminOnly || user?.role === 'admin',
+          )
+          if (visibleItems.length === 0) return null
+          return (
+            <div key={section.title} className={idx > 0 ? 'mt-3' : ''}>
+              {!collapsed && (
+                <div className="text-[10px] uppercase tracking-wide text-textMuted font-semibold px-3 py-1">
+                  {section.title}
+                </div>
+              )}
+              <div>
+                {visibleItems.map((item) => (
+                  <Link
+                    key={item.href}
+                    href={item.href}
+                    title={collapsed ? item.label : undefined}
+                    className={`flex items-center gap-2 px-3 py-1.5 transition-colors text-[13px] ${
+                      isActive(item.href)
+                        ? 'bg-brand-50 border-l-[3px] border-brand-500 text-brand-700 font-semibold'
+                        : 'border-l-[3px] border-transparent text-text hover:bg-headerBar'
+                    } ${collapsed ? 'justify-center' : ''}`}
+                  >
+                    <span className="shrink-0">{item.icon}</span>
+                    {!collapsed && <span>{item.label}</span>}
+                  </Link>
+                ))}
               </div>
-            )}
-            <div>
-              {section.items.map((item) => (
-                <Link
-                  key={item.href}
-                  href={item.href}
-                  title={collapsed ? item.label : undefined}
-                  className={`flex items-center gap-2 px-3 py-1.5 transition-colors text-[13px] ${
-                    isActive(item.href)
-                      ? 'bg-brand-50 border-l-[3px] border-brand-500 text-brand-700 font-semibold'
-                      : 'border-l-[3px] border-transparent text-text hover:bg-headerBar'
-                  } ${collapsed ? 'justify-center' : ''}`}
-                >
-                  <span className="shrink-0">{item.icon}</span>
-                  {!collapsed && <span>{item.label}</span>}
-                </Link>
-              ))}
             </div>
-          </div>
-        ))}
+          )
+        })}
       </nav>
 
       {/* Bottom */}

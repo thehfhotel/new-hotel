@@ -1,5 +1,6 @@
 //! API route handlers
 
+pub mod admin_users;
 pub mod auth;
 pub mod bookings;
 pub mod calendar;
