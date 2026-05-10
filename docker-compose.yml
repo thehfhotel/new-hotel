@@ -155,9 +155,13 @@ services:
     networks:
       - hotel-network
     healthcheck:
-      # /api/mode is a cheap, dependency-light endpoint that confirms the
-      # backend has bound to the port and answered an HTTP request.
-      test: ["CMD-SHELL", "curl -fsS --max-time 3 http://localhost:3003/api/mode > /dev/null || exit 1"]
+      # /health is the public, no-auth liveness endpoint. /api/mode used
+      # to be the probe but is now behind `require_auth` middleware
+      # (Phase 4 cutover) — without a session cookie it returns 401 and
+      # would mark this container `unhealthy`. /health is mounted in
+      # `health_routes` outside the auth-gated subrouter precisely so
+      # ops/healthcheck callers don't need credentials.
+      test: ["CMD-SHELL", "curl -fsS --max-time 3 http://localhost:3003/health > /dev/null || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 12

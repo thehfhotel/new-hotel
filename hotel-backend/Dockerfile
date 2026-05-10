@@ -145,6 +145,6 @@ ENV RUST_LOG=hotel_backend=info,tower_http=info
 # uses — present here so `docker run` users + non-compose orchestrators
 # also get the signal.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD curl -fsS --max-time 3 http://localhost:3003/api/mode || exit 1
+    CMD curl -fsS --max-time 3 http://localhost:3003/health || exit 1
 
 CMD ["./hotel-backend"]
