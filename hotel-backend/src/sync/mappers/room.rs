@@ -56,7 +56,7 @@ const ROOMS_TABLE: &str = "HT_Rooms";
 /// listed via [`primary_key_cols`] separately — we still re-project it
 /// into the SELECT for `apply` to read alongside the data columns.
 const ROOMS_SELECT_COLS: &str =
-    "t.id, t.Room_no, t.Room_Type, t.Room_Clean, t.Room_Use, t.Room_Details";
+    "t.id, t.Room_no, t.Room_Type, t.Room_Clean, t.Room_Use, t.Room_Manternace, t.Room_Details";
 
 #[async_trait]
 impl MssqlChangeMapper for RoomMasterMapper {
@@ -116,6 +116,9 @@ struct RoomProjection {
     /// Legacy literal `'yes'` / `'no'` / NULL. Translated to `bool`
     /// at the boundary (NULL → keep existing value).
     room_clean_legacy: Option<String>,
+    /// Legacy `Room_Manternace` (sic — typo in legacy schema). Same
+    /// `'yes'` / `'no'` / NULL semantics as `room_clean_legacy`.
+    room_manternace_legacy: Option<String>,
     room_use_legacy: Option<String>,
     room_details: Option<String>,
 }
@@ -138,6 +141,7 @@ fn project_room(row: &dyn MappableRow) -> Result<RoomProjection, SyncError> {
         room_no,
         room_type: row.try_get_str("Room_Type")?.map(str::to_string),
         room_clean_legacy: row.try_get_str("Room_Clean")?.map(str::to_string),
+        room_manternace_legacy: row.try_get_str("Room_Manternace")?.map(str::to_string),
         room_use_legacy: row.try_get_str("Room_Use")?.map(str::to_string),
         room_details: row.try_get_str("Room_Details")?.map(str::to_string),
     })
@@ -196,6 +200,7 @@ async fn apply_room_upsert(
     let existing = fetch_existing_room(tx, projected.legacy_id, &projected.room_no).await?;
 
     let new_clean = legacy_yesno_to_bool(&projected.room_clean_legacy);
+    let new_maintenance = legacy_yesno_to_bool(&projected.room_manternace_legacy);
     let new_use = legacy_yesno_to_bool(&projected.room_use_legacy);
 
     let (room_id, agg_id, prior_clean) = match existing {
@@ -206,14 +211,16 @@ async fn apply_room_upsert(
             sqlx::query(
                 "UPDATE ht_rooms_new \
                     SET room_clean         = COALESCE($1, room_clean), \
-                        room_notes         = COALESCE($2, room_notes), \
-                        legacy_room_no     = COALESCE(legacy_room_no, $3), \
-                        legacy_room_id_int = COALESCE(legacy_room_id_int, $4), \
-                        aggregate_id       = COALESCE(aggregate_id, $5), \
+                        room_maintenance   = COALESCE($2::bool, room_maintenance), \
+                        room_notes         = COALESCE($3, room_notes), \
+                        legacy_room_no     = COALESCE(legacy_room_no, $4), \
+                        legacy_room_id_int = COALESCE(legacy_room_id_int, $5), \
+                        aggregate_id       = COALESCE(aggregate_id, $6), \
                         updated_at         = NOW() \
-                  WHERE room_id = $6",
+                  WHERE room_id = $7",
             )
             .bind(new_clean)
+            .bind(new_maintenance)
             .bind(&projected.room_details)
             .bind(&projected.room_no)
             .bind(projected.legacy_id)
@@ -354,6 +361,15 @@ mod tests {
     use crate::sync::row::test_support::{HashMapRow, MockValue};
 
     fn make_room_row(id: i32, room_no: &str, clean: Option<&str>) -> HashMapRow {
+        make_room_row_with_maintenance(id, room_no, clean, None)
+    }
+
+    fn make_room_row_with_maintenance(
+        id: i32,
+        room_no: &str,
+        clean: Option<&str>,
+        maintenance: Option<&str>,
+    ) -> HashMapRow {
         let mut r = HashMapRow::new(ROOMS_TABLE)
             .with("id", MockValue::I32(id))
             .with("Room_no", MockValue::Str(room_no.into()))
@@ -363,6 +379,10 @@ mod tests {
         r = match clean {
             Some(s) => r.with("Room_Clean", MockValue::Str(s.into())),
             None => r.with("Room_Clean", MockValue::Null),
+        };
+        r = match maintenance {
+            Some(s) => r.with("Room_Manternace", MockValue::Str(s.into())),
+            None => r.with("Room_Manternace", MockValue::Null),
         };
         r
     }
@@ -375,6 +395,37 @@ mod tests {
         assert_eq!(p.room_no, "402");
         assert_eq!(p.room_clean_legacy.as_deref(), Some("yes"));
         assert_eq!(p.room_type.as_deref(), Some("Standard"));
+    }
+
+    #[test]
+    fn project_room_extracts_room_manternace_yes() {
+        let row = make_room_row_with_maintenance(11, "210", Some("no"), Some("yes"));
+        let p = project_room(&row).expect("project must succeed");
+        assert_eq!(p.room_manternace_legacy.as_deref(), Some("yes"));
+    }
+
+    #[test]
+    fn project_room_extracts_room_manternace_no() {
+        let row = make_room_row_with_maintenance(12, "211", Some("yes"), Some("no"));
+        let p = project_room(&row).expect("project must succeed");
+        assert_eq!(p.room_manternace_legacy.as_deref(), Some("no"));
+    }
+
+    #[test]
+    fn project_room_room_manternace_null_keeps_none() {
+        let row = make_room_row_with_maintenance(13, "212", Some("yes"), None);
+        let p = project_room(&row).expect("project must succeed");
+        assert!(p.room_manternace_legacy.is_none());
+    }
+
+    #[test]
+    fn legacy_yesno_translates_room_manternace_yes_to_true() {
+        // Locks the wiring between Room_Manternace projection and the
+        // boolean we bind into ht_rooms_new.room_maintenance.
+        let row = make_room_row_with_maintenance(20, "301", None, Some("yes"));
+        let p = project_room(&row).expect("project must succeed");
+        let new_maintenance = legacy_yesno_to_bool(&p.room_manternace_legacy);
+        assert_eq!(new_maintenance, Some(true));
     }
 
     #[test]
@@ -437,6 +488,10 @@ mod tests {
         assert_eq!(m.primary_key_cols(), &["id"]);
         assert!(m.select_sql().contains("Room_Clean"));
         assert!(m.select_sql().contains("Room_no"));
+        // Maintenance column uses the legacy typo `Room_Manternace`.
+        // The mapper must project it so the dashboard's maintenance
+        // flag stays in sync with the legacy app.
+        assert!(m.select_sql().contains("Room_Manternace"));
     }
 
     #[test]

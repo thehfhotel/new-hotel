@@ -32,6 +32,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - CT watcher (`bin/sync.rs`) was already keeping canonical tables
     fresh, so this is a pure routing layer fix — no migration or
     backfill needed.
+- **Room maintenance flag now propagates from legacy** — extended the
+  CT room mapper (`sync/mappers/room.rs`) to project legacy
+  `Room_Manternace` (sic) into canonical `ht_rooms_new.room_maintenance`
+  on every HT_Rooms CT tick. Previously only `room_clean` was being
+  written by the mapper, so `room_maintenance` stayed at the
+  backfill-time value forever — making the dashboard's maintenance
+  indicator unreliable. Silent UPSERT (no domain event emitted),
+  matching the existing pattern for non-clean column edits.
 
 ### Changed
 
@@ -40,7 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `GET /api/rooms/status` calendar route (`get_room_status_pg`) —
     requires careful date-range/booking-window remodelling.
   - `scheduler/sync.rs` reconcile job — still pointed at legacy mirrors.
-  - `sync/mappers/` — orthogonal, not touched.
+- **Known canonical-state gap** (tracked separately): the checkin CT
+  mapper has rows stuck in `cin_status='active'` past their expected
+  checkout in some cases. This release exposes the gap (the dashboard
+  now reads canonical) but does NOT fix the upstream mapper bug —
+  diagnosis ongoing.
 
 ## [2.62.3] - 2026-05-10
 
