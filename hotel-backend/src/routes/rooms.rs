@@ -2,11 +2,16 @@
 //!
 //! - GET /api/rooms - List all rooms
 //! - GET /api/rooms/:id - Get room details with current guest
-//! - GET /api/rooms/status - Get room status history
+//! - GET /api/rooms/status - Get room status history (calendar)
 //! - GET /api/rooms/checkouts-today - Get rooms with checkout today
 //!
-//! Reads from PG (`ht_rooms_legacy` / `ht_checkins_legacy` cache, fed by
-//! drift-reconcile + CT mappers).
+//! `list_rooms`, `get_room`, and `get_checkouts_today` read from the
+//! canonical PG tables (`ht_rooms_new`, `ht_checkins`, `ht_bookings`,
+//! `ht_customers`). Previously read `ht_*_legacy` mirrors which stopped
+//! receiving row-level updates after the Phase 5.5 cutover on 2026-04-28.
+//!
+//! `get_room_status_pg` (calendar) is intentionally left on the legacy
+//! mirror tables for now — separate follow-up to migrate that route.
 
 use axum::{
     extract::{Path, Query, State},
@@ -24,328 +29,200 @@ use crate::models::{
 use crate::routes::mode::{AppState, Branch};
 
 // ─────────────────────────────────────────────────────────────
-// PostgreSQL helpers
+// Canonical-table SQL fragments (DRY: same projection in list & detail)
 // ─────────────────────────────────────────────────────────────
 
-/// List all rooms from PostgreSQL (ht_rooms_legacy + ht_rooms_new)
-async fn list_rooms_pg(pool: &crate::db::PgPool) -> ApiResult<Vec<Room>> {
-    // Primary: ht_rooms_legacy with optional price overrides from ht_rooms_new.
-    // Also include rooms that exist only in ht_rooms_new (via UNION ALL).
-    // Note: ht_rooms_new has different column names (room_clean is boolean, room_type_id
-    // is FK to ht_room_types, etc.), so we map them to the legacy string format.
-    let rows = sqlx::query(
-        r#"
-        SELECT
-            l.room_no,
-            l.room_type,
-            l.room_details,
-            l.room_clean,
-            l.room_use,
-            l.room_book,
-            l.room_manternace,
-            COALESCE(n.room_price_weekday::float8, l.room_price_a::float8) AS room_price_a,
-            COALESCE(n.room_price_weekend::float8, l.room_price_b::float8) AS room_price_b,
-            l.room_price_c::float8 AS room_price_c,
-            l.room_group,
-            l.room_book_name
-        FROM ht_rooms_legacy l
-        LEFT JOIN ht_rooms_new n ON n.room_no = l.room_no
-
-        UNION ALL
-
-        SELECT
-            n.room_no,
-            COALESCE(rt.type_name, n.room_status) AS room_type,
-            n.room_notes AS room_details,
-            CASE WHEN n.room_clean THEN 'yes' ELSE 'no' END AS room_clean,
-            CASE WHEN n.room_status = 'occupied' THEN 'yes' ELSE 'no' END AS room_use,
-            'no' AS room_book,
-            CASE WHEN n.room_maintenance THEN 'yes' ELSE 'no' END AS room_manternace,
-            n.room_price_weekday::float8 AS room_price_a,
-            n.room_price_weekend::float8 AS room_price_b,
-            n.room_price_special::float8 AS room_price_c,
-            NULL AS room_group,
-            NULL AS room_book_name
-        FROM ht_rooms_new n
-        LEFT JOIN ht_room_types rt ON rt.type_id = n.room_type_id
-        WHERE n.room_active = true
+/// SQL projection mapping `ht_rooms_new` → the legacy-shaped `Room`/`RoomDetail`
+/// API contract. Centralised so list and detail queries stay in sync.
+///
+/// Bool-to-yes/no string mapping preserves the frontend contract at
+/// `app/page.tsx` (`getRoomStatus` reads `Room_Use === 'yes'` etc.).
+///
+/// `Room_Use` is true when an active, not-yet-checked-out checkin exists.
+/// `Room_Book` returns the booking number of a currently active reservation
+/// (today between book_checkin and book_checkout, confirmed/pending) when
+/// the room is not currently in use — matching the legacy mirror semantics.
+const ROOM_PROJECTION: &str = r#"
+    r.room_no AS room_no,
+    COALESCE(rt.type_name, '') AS room_type,
+    COALESCE(r.room_notes, '') AS room_details,
+    CASE WHEN r.room_clean THEN 'yes' ELSE 'no' END AS room_clean,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM ht_checkins c
+        WHERE c.cin_room_id = r.room_id
+          AND c.cin_status = 'active'
+          AND c.cin_checkout_time IS NULL
+    ) THEN 'yes' ELSE 'no' END AS room_use,
+    COALESCE((
+        SELECT b.book_no::text
+        FROM ht_booking_rooms br
+        JOIN ht_bookings b ON b.book_id = br.br_book_id
+        WHERE br.br_room_id = r.room_id
+          AND b.book_status IN ('confirmed', 'pending')
+          AND b.book_checkin <= CURRENT_DATE
+          AND b.book_checkout > CURRENT_DATE
           AND NOT EXISTS (
-              SELECT 1 FROM ht_rooms_legacy l WHERE l.room_no = n.room_no
+              SELECT 1 FROM ht_checkins c2
+              WHERE c2.cin_room_id = r.room_id
+                AND c2.cin_status = 'active'
+                AND c2.cin_checkout_time IS NULL
           )
-
-        ORDER BY room_no
-        "#,
-    )
-    .fetch_all(pool)
-    .await?;
-
-    let rooms: Vec<Room> = rows
-        .iter()
-        .map(|row| Room {
-            room_no: row.get::<String, _>("room_no"),
-            room_type: row.get::<Option<String>, _>("room_type"),
-            room_details: row.get::<Option<String>, _>("room_details"),
-            room_clean: row.get::<Option<String>, _>("room_clean"),
-            room_use: row.get::<Option<String>, _>("room_use"),
-            room_book: row.get::<Option<String>, _>("room_book"),
-            room_manternace: row.get::<Option<String>, _>("room_manternace"),
-            room_price_a: row.get::<Option<f64>, _>("room_price_a"),
-            room_price_b: row.get::<Option<f64>, _>("room_price_b"),
-            room_price_c: row.get::<Option<f64>, _>("room_price_c"),
-            room_group: row.get::<Option<String>, _>("room_group"),
-            room_book_name: row.get::<Option<String>, _>("room_book_name"),
-        })
-        .collect();
-
-    Ok(rooms)
-}
-
-/// Get a single room detail from PostgreSQL with current guest info
-async fn get_room_pg(pool: &crate::db::PgPool, room_no: &str) -> ApiResult<RoomDetail> {
-    // Try legacy first (with new-system price overrides), then new-only
-    let room_row = sqlx::query(
-        r#"
-        SELECT
-            l.room_no,
-            l.room_type,
-            l.room_details,
-            l.room_clean,
-            l.room_use,
-            l.room_book,
-            l.room_manternace,
-            COALESCE(n.room_price_weekday::float8, l.room_price_a::float8) AS room_price_a,
-            COALESCE(n.room_price_weekend::float8, l.room_price_b::float8) AS room_price_b,
-            l.room_price_c::float8 AS room_price_c,
-            l.room_group,
-            l.room_book_name,
-            l.room_book_time
-        FROM ht_rooms_legacy l
-        LEFT JOIN ht_rooms_new n ON n.room_no = l.room_no
-        WHERE l.room_no = $1
-        "#,
-    )
-    .bind(room_no)
-    .fetch_optional(pool)
-    .await?;
-
-    // If not found in legacy, try new-only rooms
-    let room_row = match room_row {
-        Some(row) => row,
-        None => {
-            sqlx::query(
-                r#"
-                SELECT
-                    n.room_no,
-                    COALESCE(rt.type_name, n.room_status) AS room_type,
-                    n.room_notes AS room_details,
-                    CASE WHEN n.room_clean THEN 'yes' ELSE 'no' END AS room_clean,
-                    CASE WHEN n.room_status = 'occupied' THEN 'yes' ELSE 'no' END AS room_use,
-                    'no' AS room_book,
-                    CASE WHEN n.room_maintenance THEN 'yes' ELSE 'no' END AS room_manternace,
-                    n.room_price_weekday::float8 AS room_price_a,
-                    n.room_price_weekend::float8 AS room_price_b,
-                    n.room_price_special::float8 AS room_price_c,
-                    NULL::varchar AS room_group,
-                    NULL::varchar AS room_book_name,
-                    NULL::timestamp AS room_book_time
-                FROM ht_rooms_new n
-                LEFT JOIN ht_room_types rt ON rt.type_id = n.room_type_id
-                WHERE n.room_no = $1 AND n.room_active = true
-                "#,
-            )
-            .bind(room_no)
-            .fetch_optional(pool)
-            .await?
-            .ok_or_else(|| ApiError::NotFound("Room not found".to_string()))?
-        }
-    };
-
-    // Get current/recent check-in from ht_checkins_legacy
-    let checkin_row = sqlx::query(
-        r#"
-        SELECT
-            cin_cust_name,
-            cin_room_in,
-            cin_room_out
-        FROM ht_checkins_legacy
-        WHERE cin_room_no = $1
-        ORDER BY cin_room_in DESC
         LIMIT 1
-        "#,
-    )
-    .bind(room_no)
-    .fetch_optional(pool)
-    .await?;
+    ), '') AS room_book,
+    CASE WHEN r.room_maintenance THEN 'yes' ELSE 'no' END AS room_manternace,
+    r.room_price_weekday::float8 AS room_price_a,
+    r.room_price_weekend::float8 AS room_price_b,
+    r.room_price_special::float8 AS room_price_c
+"#;
 
-    let current_guest = checkin_row.map(|row| CurrentGuest {
-        name: row.get::<Option<String>, _>("cin_cust_name"),
-        check_in: row
-            .get::<Option<NaiveDateTime>, _>("cin_room_in")
-            .map(|dt| dt.and_utc()),
-        check_out: row
-            .get::<Option<NaiveDateTime>, _>("cin_room_out")
-            .map(|dt| dt.and_utc()),
-    });
+// ─────────────────────────────────────────────────────────────
+// PostgreSQL helpers — canonical tables
+// ─────────────────────────────────────────────────────────────
 
-    let room = RoomDetail {
-        room_no: room_row.get::<String, _>("room_no"),
-        room_type: room_row.get::<Option<String>, _>("room_type"),
-        room_details: room_row.get::<Option<String>, _>("room_details"),
-        room_clean: room_row.get::<Option<String>, _>("room_clean"),
-        room_use: room_row.get::<Option<String>, _>("room_use"),
-        room_book: room_row.get::<Option<String>, _>("room_book"),
-        room_manternace: room_row.get::<Option<String>, _>("room_manternace"),
-        room_price_a: room_row.get::<Option<f64>, _>("room_price_a"),
-        room_price_b: room_row.get::<Option<f64>, _>("room_price_b"),
-        room_price_c: room_row.get::<Option<f64>, _>("room_price_c"),
-        room_group: room_row.get::<Option<String>, _>("room_group"),
-        room_book_name: room_row.get::<Option<String>, _>("room_book_name"),
-        room_book_time: room_row
-            .get::<Option<NaiveDateTime>, _>("room_book_time")
-            .map(|dt| dt.and_utc()),
-        current_guest,
-    };
-
-    Ok(room)
+/// Map a result row from `ROOM_PROJECTION` to the API `Room` struct.
+fn row_to_room(row: &sqlx::postgres::PgRow) -> Room {
+    Room {
+        room_no: row.get::<String, _>("room_no"),
+        room_type: Some(row.get::<String, _>("room_type")),
+        room_details: Some(row.get::<String, _>("room_details")),
+        room_clean: Some(row.get::<String, _>("room_clean")),
+        room_use: Some(row.get::<String, _>("room_use")),
+        room_book: Some(row.get::<String, _>("room_book")),
+        room_manternace: Some(row.get::<String, _>("room_manternace")),
+        room_price_a: row.try_get::<f64, _>("room_price_a").ok(),
+        room_price_b: row.try_get::<f64, _>("room_price_b").ok(),
+        room_price_c: row.try_get::<f64, _>("room_price_c").ok(),
+        // `room_group` and `room_book_name` are legacy-only metadata not
+        // tracked in the canonical schema; surface as None for now.
+        room_group: None,
+        room_book_name: None,
+    }
 }
 
-/// List all rooms from PostgreSQL legacy mirror only (no ht_rooms_new join)
-/// Used for HF Ville which only has ht_rooms_legacy tables.
+/// List all rooms from canonical PG tables.
+async fn list_rooms_pg(pool: &crate::db::PgPool) -> ApiResult<Vec<Room>> {
+    let sql = format!(
+        r#"
+        SELECT {projection}
+        FROM ht_rooms_new r
+        LEFT JOIN ht_room_types rt ON rt.type_id = r.room_type_id
+        WHERE r.room_active = true
+        ORDER BY r.room_no
+        "#,
+        projection = ROOM_PROJECTION,
+    );
+
+    let rows = sqlx::query(&sql).fetch_all(pool).await?;
+    Ok(rows.iter().map(row_to_room).collect())
+}
+
+/// HF Ville variant. Schema is now identical post-Ville-upgrade
+/// (see CLAUDE memory: ville_constraint upgraded 2026-04-29), so it
+/// delegates to `list_rooms_pg`. Kept as a named function to preserve
+/// the call sites and signal intent at the dispatch layer.
 async fn list_rooms_legacy_only(pool: &crate::db::PgPool) -> ApiResult<Vec<Room>> {
-    let rows = sqlx::query(
-        r#"
-        SELECT
-            room_no,
-            room_type,
-            room_details,
-            room_clean,
-            room_use,
-            room_book,
-            room_manternace,
-            room_price_a::float8 AS room_price_a,
-            room_price_b::float8 AS room_price_b,
-            room_price_c::float8 AS room_price_c,
-            room_group,
-            room_book_name
-        FROM ht_rooms_legacy
-        ORDER BY room_no
-        "#,
-    )
-    .fetch_all(pool)
-    .await?;
-
-    let rooms: Vec<Room> = rows
-        .iter()
-        .map(|row| Room {
-            room_no: row.get::<String, _>("room_no"),
-            room_type: row.get::<Option<String>, _>("room_type"),
-            room_details: row.get::<Option<String>, _>("room_details"),
-            room_clean: row.get::<Option<String>, _>("room_clean"),
-            room_use: row.get::<Option<String>, _>("room_use"),
-            room_book: row.get::<Option<String>, _>("room_book"),
-            room_manternace: row.get::<Option<String>, _>("room_manternace"),
-            room_price_a: row.get::<Option<f64>, _>("room_price_a"),
-            room_price_b: row.get::<Option<f64>, _>("room_price_b"),
-            room_price_c: row.get::<Option<f64>, _>("room_price_c"),
-            room_group: row.get::<Option<String>, _>("room_group"),
-            room_book_name: row.get::<Option<String>, _>("room_book_name"),
-        })
-        .collect();
-
-    Ok(rooms)
+    list_rooms_pg(pool).await
 }
 
-/// Get a single room detail from legacy mirror only (no ht_rooms_new)
-/// Used for HF Ville.
-async fn get_room_legacy_only(pool: &crate::db::PgPool, room_no: &str) -> ApiResult<RoomDetail> {
-    let room_row = sqlx::query(
+/// Get a single room detail from canonical PG tables with current guest info.
+async fn get_room_pg(pool: &crate::db::PgPool, room_no: &str) -> ApiResult<RoomDetail> {
+    let sql = format!(
         r#"
         SELECT
-            room_no,
-            room_type,
-            room_details,
-            room_clean,
-            room_use,
-            room_book,
-            room_manternace,
-            room_price_a::float8 AS room_price_a,
-            room_price_b::float8 AS room_price_b,
-            room_price_c::float8 AS room_price_c,
-            room_group,
-            room_book_name,
-            room_book_time
-        FROM ht_rooms_legacy
-        WHERE room_no = $1
+            {projection},
+            r.room_id AS room_id
+        FROM ht_rooms_new r
+        LEFT JOIN ht_room_types rt ON rt.type_id = r.room_type_id
+        WHERE r.room_no = $1 AND r.room_active = true
         "#,
-    )
-    .bind(room_no)
-    .fetch_optional(pool)
-    .await?
-    .ok_or_else(|| ApiError::NotFound("Room not found".to_string()))?;
+        projection = ROOM_PROJECTION,
+    );
 
-    // Get current/recent check-in from ht_checkins_legacy
+    let room_row = sqlx::query(&sql)
+        .bind(room_no)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Room not found".to_string()))?;
+
+    let room_id: i32 = room_row.get("room_id");
+
+    // Most recent checkin for this room (any status). The
+    // current-guest section in the UI shows the latest stay even
+    // after checkout, matching the prior legacy-mirror behaviour.
     let checkin_row = sqlx::query(
         r#"
         SELECT
-            cin_cust_name,
-            cin_room_in,
-            cin_room_out
-        FROM ht_checkins_legacy
-        WHERE cin_room_no = $1
-        ORDER BY cin_room_in DESC
+            TRIM(COALESCE(cu.cust_firstname, '') || ' ' || COALESCE(cu.cust_lastname, '')) AS cust_name,
+            c.cin_checkin_time,
+            c.cin_checkout_time
+        FROM ht_checkins c
+        LEFT JOIN ht_customers cu ON cu.cust_id = c.cin_cust_id
+        WHERE c.cin_room_id = $1
+        ORDER BY c.cin_checkin_time DESC
         LIMIT 1
         "#,
     )
-    .bind(room_no)
+    .bind(room_id)
     .fetch_optional(pool)
     .await?;
 
     let current_guest = checkin_row.map(|row| CurrentGuest {
-        name: row.get::<Option<String>, _>("cin_cust_name"),
+        name: row.try_get::<String, _>("cust_name").ok(),
         check_in: row
-            .get::<Option<NaiveDateTime>, _>("cin_room_in")
+            .try_get::<NaiveDateTime, _>("cin_checkin_time")
+            .ok()
             .map(|dt| dt.and_utc()),
         check_out: row
-            .get::<Option<NaiveDateTime>, _>("cin_room_out")
+            .try_get::<NaiveDateTime, _>("cin_checkout_time")
+            .ok()
             .map(|dt| dt.and_utc()),
     });
 
     let room = RoomDetail {
         room_no: room_row.get::<String, _>("room_no"),
-        room_type: room_row.get::<Option<String>, _>("room_type"),
-        room_details: room_row.get::<Option<String>, _>("room_details"),
-        room_clean: room_row.get::<Option<String>, _>("room_clean"),
-        room_use: room_row.get::<Option<String>, _>("room_use"),
-        room_book: room_row.get::<Option<String>, _>("room_book"),
-        room_manternace: room_row.get::<Option<String>, _>("room_manternace"),
-        room_price_a: room_row.get::<Option<f64>, _>("room_price_a"),
-        room_price_b: room_row.get::<Option<f64>, _>("room_price_b"),
-        room_price_c: room_row.get::<Option<f64>, _>("room_price_c"),
-        room_group: room_row.get::<Option<String>, _>("room_group"),
-        room_book_name: room_row.get::<Option<String>, _>("room_book_name"),
-        room_book_time: room_row
-            .get::<Option<NaiveDateTime>, _>("room_book_time")
-            .map(|dt| dt.and_utc()),
+        room_type: Some(room_row.get::<String, _>("room_type")),
+        room_details: Some(room_row.get::<String, _>("room_details")),
+        room_clean: Some(room_row.get::<String, _>("room_clean")),
+        room_use: Some(room_row.get::<String, _>("room_use")),
+        room_book: Some(room_row.get::<String, _>("room_book")),
+        room_manternace: Some(room_row.get::<String, _>("room_manternace")),
+        room_price_a: room_row.try_get::<f64, _>("room_price_a").ok(),
+        room_price_b: room_row.try_get::<f64, _>("room_price_b").ok(),
+        room_price_c: room_row.try_get::<f64, _>("room_price_c").ok(),
+        room_group: None,
+        room_book_name: None,
+        // `Room_Book_Time` isn't tracked on the canonical booking row
+        // (booking has a date range, not a single "book at" instant).
+        // Leave None for now; future enhancement could surface
+        // `ht_bookings.created_at` if/when that column lands.
+        room_book_time: None,
         current_guest,
     };
 
     Ok(room)
 }
 
-/// Get rooms checking out today from PostgreSQL
+/// HF Ville variant — see `list_rooms_legacy_only` rationale.
+async fn get_room_legacy_only(pool: &crate::db::PgPool, room_no: &str) -> ApiResult<RoomDetail> {
+    get_room_pg(pool, room_no).await
+}
+
+/// Get rooms checking out today from canonical PG tables.
+///
+/// Same flip rule as `stats::get_stats_pg`: only rooms with an active
+/// checkin whose `cin_expected_checkout = CURRENT_DATE`, surfaced after
+/// 06:00 local so the morning crew can process departures.
 async fn get_checkouts_today_pg(pool: &crate::db::PgPool) -> ApiResult<Vec<String>> {
     let rows = sqlx::query(
         r#"
-        SELECT DISTINCT c.cin_room_no AS room_no
-        FROM ht_checkins_legacy c
-        INNER JOIN ht_rooms_legacy r ON c.cin_room_no = r.room_no
-        WHERE c.cin_room_out::date = CURRENT_DATE
-          AND r.room_use = 'yes'
-          AND c.cin_room_in = (
-              SELECT MAX(c2.cin_room_in)
-              FROM ht_checkins_legacy c2
-              WHERE c2.cin_room_no = c.cin_room_no
-          )
+        SELECT DISTINCT r.room_no AS room_no
+        FROM ht_rooms_new r
+        JOIN ht_checkins c ON c.cin_room_id = r.room_id
+        WHERE c.cin_status = 'active'
+          AND c.cin_expected_checkout = CURRENT_DATE
+          AND c.cin_checkout_time IS NULL
+          AND EXTRACT(HOUR FROM NOW()) >= 6
+        ORDER BY r.room_no
         "#,
     )
     .fetch_all(pool)
@@ -353,13 +230,17 @@ async fn get_checkouts_today_pg(pool: &crate::db::PgPool) -> ApiResult<Vec<Strin
 
     let room_numbers: Vec<String> = rows
         .iter()
-        .filter_map(|row| row.get::<Option<String>, _>("room_no"))
+        .map(|row| row.get::<String, _>("room_no"))
         .collect();
 
     Ok(room_numbers)
 }
 
-/// Get room status from PostgreSQL (PG mirror tables)
+/// Get room status from PostgreSQL (PG mirror tables).
+///
+/// NOTE: This route still reads the legacy mirror tables. Tracked as
+/// a separate follow-up — migrating the calendar query requires
+/// careful date-range handling and isn't in scope for the dashboard fix.
 async fn get_room_status_pg(
     pool: &crate::db::PgPool,
     params: &RoomStatusQuery,
@@ -431,7 +312,7 @@ pub struct RoomsQuery {
 
 /// GET /api/rooms - List all rooms
 ///
-/// Reads from PG (`ht_rooms_legacy` cache, fed by drift-reconcile + CT mappers).
+/// Reads from canonical PG tables (`ht_rooms_new` + `ht_checkins` + `ht_bookings`).
 pub async fn list_rooms(
     State(state): State<AppState>,
     Query(params): Query<RoomsQuery>,
@@ -467,8 +348,7 @@ pub struct GetRoomQuery {
 
 /// GET /api/rooms/:id - Get room details with current guest
 ///
-/// Reads from PG (`ht_rooms_legacy` + `ht_checkins_legacy` cache, fed by
-/// drift-reconcile + CT mappers).
+/// Reads from canonical PG tables (`ht_rooms_new` + `ht_checkins` + `ht_customers`).
 pub async fn get_room(
     State(state): State<AppState>,
     Path(room_no): Path<String>,
@@ -498,8 +378,7 @@ pub struct RoomStatusQuery {
 
 /// GET /api/rooms/status - Get room status history
 ///
-/// Reads from PG (`ht_rooms_legacy` + `ht_checkins_legacy` + `ht_bookings_legacy`
-/// cache, fed by drift-reconcile + CT mappers).
+/// NOTE: Still reads legacy mirror tables — separate follow-up to migrate.
 pub async fn get_room_status(
     State(state): State<AppState>,
     Query(params): Query<RoomStatusQuery>,
@@ -534,8 +413,7 @@ pub struct CheckoutsTodayQuery {
 
 /// GET /api/rooms/checkouts-today - Get rooms with checkout today
 ///
-/// Reads from PG (`ht_checkins_legacy` + `ht_rooms_legacy` cache, fed by
-/// drift-reconcile + CT mappers).
+/// Reads from canonical PG tables (`ht_rooms_new` + `ht_checkins`).
 pub async fn get_checkouts_today(
     State(state): State<AppState>,
     Query(params): Query<CheckoutsTodayQuery>,

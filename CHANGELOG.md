@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.63.0] - 2026-05-11
+
+### Fixed
+
+- **Dashboard occupancy/checkin counts no longer stale** — `/api/stats`
+  and `/api/rooms` now read canonical PG tables (`ht_rooms_new`,
+  `ht_checkins`, `ht_bookings`, `ht_customers`) instead of the demoted
+  `ht_*_legacy` mirror tables, which the Phase 5.5 diff-only reconcile
+  job stopped updating on 2026-04-28. The receptionist dashboard had
+  been showing ~2-week-stale occupancy/booking/checkout counts since
+  the cutover.
+  - `routes/stats.rs` — all 8 dashboard counters (`total_rooms`,
+    `occupied_rooms`, `checkout_rooms`, `booked_rooms`,
+    `today_check_ins`, `today_check_outs`, `active_bookings`,
+    `total_customers`) rewritten against canonical tables. Preserves
+    the 06:00 "checkout today" flip rule and the response shape
+    consumed by `app/page.tsx`.
+  - `routes/rooms.rs` — `list_rooms_pg`, `list_rooms_legacy_only`
+    (HF Ville), `get_room_pg`, `get_room_legacy_only`, and
+    `get_checkouts_today_pg` rewritten against canonical tables.
+    API contract (`Room_no`, `Room_Type`, `Room_Use`, `Room_Book`,
+    `Room_Clean`, `Room_Manternace`, etc.) preserved verbatim — no
+    frontend changes required. Bool→yes/no string mapping and the
+    morning grace period for checkouts are unchanged.
+  - CT watcher (`bin/sync.rs`) was already keeping canonical tables
+    fresh, so this is a pure routing layer fix — no migration or
+    backfill needed.
+
+### Changed
+
+- **Follow-up legacy-mirror readers** still pending migration to
+  canonical tables (tracked separately, NOT in this release):
+  - `GET /api/rooms/status` calendar route (`get_room_status_pg`) —
+    requires careful date-range/booking-window remodelling.
+  - `scheduler/sync.rs` reconcile job — still pointed at legacy mirrors.
+  - `sync/mappers/` — orthogonal, not touched.
+
 ## [2.62.3] - 2026-05-10
 
 ### Security

@@ -2,7 +2,11 @@
 //!
 //! - GET /api/stats - Get dashboard statistics
 //!
-//! Reads from PG (`ht_*_legacy` cache, fed by drift-reconcile + CT mappers).
+//! Reads from canonical PostgreSQL tables (`ht_rooms_new`, `ht_checkins`,
+//! `ht_bookings`, `ht_customers`). Previously read `ht_*_legacy` mirrors,
+//! but those were demoted to hash-only drift detection in Phase 5.5
+//! (2026-04-28) and stopped receiving row-level updates — leaving the
+//! receptionist dashboard 2+ weeks stale.
 
 use axum::{extract::{Query, State}, Json};
 use serde::{Deserialize, Serialize};
@@ -75,32 +79,37 @@ pub async fn get_stats(
     }))
 }
 
-/// Fetch dashboard stats from PostgreSQL legacy mirror tables
+/// Fetch dashboard stats from canonical PostgreSQL tables.
+///
+/// "Active checkin" predicate (reused across queries):
+///     cin_status = 'active' AND cin_checkout_time IS NULL
+///
+/// Checkout-day flip rule (preserves prior behaviour from legacy mirror):
+/// a room whose active checkin has `cin_expected_checkout = CURRENT_DATE`
+/// flips from "occupied" to "checkout" once the clock passes 06:00 local —
+/// giving the morning crew time to process the departure.
 async fn get_stats_pg(pool: &PgPool) -> ApiResult<DashboardStats> {
-    // Total rooms count
-    let total_rooms: i64 = sqlx::query("SELECT COUNT(*) as count FROM ht_rooms_legacy")
-        .fetch_one(pool)
-        .await?
-        .try_get("count")
-        .unwrap_or(0);
+    // Total active rooms in inventory
+    let total_rooms: i64 = sqlx::query(
+        r#"SELECT COUNT(*) AS count FROM ht_rooms_new WHERE room_active = true"#,
+    )
+    .fetch_one(pool)
+    .await?
+    .try_get("count")
+    .unwrap_or(0);
 
-    // Occupied rooms count - rooms with guests checked in (excludes checkout rooms after 6 AM)
+    // Occupied rooms: distinct rooms with an active checkin, EXCLUDING
+    // those that have already flipped to "checkout today" (handled below).
     let occupied_rooms: i64 = sqlx::query(
         r#"
-        SELECT COUNT(*) as count
-        FROM ht_rooms_legacy
-        WHERE room_use = 'yes'
-            AND room_no NOT IN (
-                SELECT DISTINCT c.cin_room_no
-                FROM ht_checkins_legacy c
-                WHERE c.cin_room_out::date = CURRENT_DATE
-                    AND EXTRACT(HOUR FROM NOW()) >= 6
-                    AND c.cin_room_in = (
-                        SELECT MAX(c2.cin_room_in)
-                        FROM ht_checkins_legacy c2
-                        WHERE c2.cin_room_no = c.cin_room_no
-                    )
-            )
+        SELECT COUNT(DISTINCT c.cin_room_id) AS count
+        FROM ht_checkins c
+        WHERE c.cin_status = 'active'
+          AND c.cin_checkout_time IS NULL
+          AND NOT (
+              c.cin_expected_checkout = CURRENT_DATE
+              AND EXTRACT(HOUR FROM NOW()) >= 6
+          )
         "#,
     )
     .fetch_one(pool)
@@ -108,20 +117,16 @@ async fn get_stats_pg(pool: &PgPool) -> ApiResult<DashboardStats> {
     .try_get("count")
     .unwrap_or(0);
 
-    // Checkout rooms count - rooms with checkout today (after 6 AM)
+    // Checkout rooms: active checkin whose expected checkout is today,
+    // and the morning grace period (06:00) has passed.
     let checkout_rooms: i64 = sqlx::query(
         r#"
-        SELECT COUNT(DISTINCT r.room_no) as count
-        FROM ht_rooms_legacy r
-        INNER JOIN ht_checkins_legacy c ON r.room_no = c.cin_room_no
-        WHERE r.room_use = 'yes'
-            AND c.cin_room_out::date = CURRENT_DATE
-            AND EXTRACT(HOUR FROM NOW()) >= 6
-            AND c.cin_room_in = (
-                SELECT MAX(c2.cin_room_in)
-                FROM ht_checkins_legacy c2
-                WHERE c2.cin_room_no = c.cin_room_no
-            )
+        SELECT COUNT(DISTINCT c.cin_room_id) AS count
+        FROM ht_checkins c
+        WHERE c.cin_status = 'active'
+          AND c.cin_checkout_time IS NULL
+          AND c.cin_expected_checkout = CURRENT_DATE
+          AND EXTRACT(HOUR FROM NOW()) >= 6
         "#,
     )
     .fetch_one(pool)
@@ -129,12 +134,22 @@ async fn get_stats_pg(pool: &PgPool) -> ApiResult<DashboardStats> {
     .try_get("count")
     .unwrap_or(0);
 
-    // Booked rooms count - rooms with booking but not checked in
+    // Booked rooms: distinct rooms with a confirmed/pending booking
+    // straddling today, with no active checkin in that room yet.
     let booked_rooms: i64 = sqlx::query(
         r#"
-        SELECT COUNT(*) as count
-        FROM ht_rooms_legacy
-        WHERE room_use <> 'yes' AND room_book IS NOT NULL AND room_book <> ''
+        SELECT COUNT(DISTINCT br.br_room_id) AS count
+        FROM ht_booking_rooms br
+        JOIN ht_bookings b ON b.book_id = br.br_book_id
+        WHERE b.book_status IN ('confirmed', 'pending')
+          AND b.book_checkin <= CURRENT_DATE
+          AND b.book_checkout > CURRENT_DATE
+          AND NOT EXISTS (
+              SELECT 1 FROM ht_checkins c
+              WHERE c.cin_room_id = br.br_room_id
+                AND c.cin_status = 'active'
+                AND c.cin_checkout_time IS NULL
+          )
         "#,
     )
     .fetch_one(pool)
@@ -142,12 +157,12 @@ async fn get_stats_pg(pool: &PgPool) -> ApiResult<DashboardStats> {
     .try_get("count")
     .unwrap_or(0);
 
-    // Today's check-ins count
+    // Today's check-ins (any checkin row whose checkin_time landed today)
     let today_check_ins: i64 = sqlx::query(
         r#"
-        SELECT COUNT(*) as count
-        FROM ht_checkins_legacy
-        WHERE cin_room_in::date = CURRENT_DATE
+        SELECT COUNT(*) AS count
+        FROM ht_checkins
+        WHERE cin_checkin_time::date = CURRENT_DATE
         "#,
     )
     .fetch_one(pool)
@@ -155,12 +170,12 @@ async fn get_stats_pg(pool: &PgPool) -> ApiResult<DashboardStats> {
     .try_get("count")
     .unwrap_or(0);
 
-    // Today's check-outs count
+    // Today's check-outs (rows that were actually checked out today)
     let today_check_outs: i64 = sqlx::query(
         r#"
-        SELECT COUNT(*) as count
-        FROM ht_checkins_legacy
-        WHERE cin_room_out::date = CURRENT_DATE
+        SELECT COUNT(*) AS count
+        FROM ht_checkins
+        WHERE cin_checkout_time::date = CURRENT_DATE
         "#,
     )
     .fetch_one(pool)
@@ -168,12 +183,14 @@ async fn get_stats_pg(pool: &PgPool) -> ApiResult<DashboardStats> {
     .try_get("count")
     .unwrap_or(0);
 
-    // Active bookings count
+    // Active bookings: anything not cancelled/checked-out is "active" on
+    // the dashboard. Matches prior legacy-mirror semantics (book_status
+    // IS NOT NULL) more precisely now that we have the canonical enum.
     let active_bookings: i64 = sqlx::query(
         r#"
-        SELECT COUNT(*) as count
-        FROM ht_bookings_legacy
-        WHERE book_status IS NOT NULL
+        SELECT COUNT(*) AS count
+        FROM ht_bookings
+        WHERE book_status IN ('confirmed', 'pending', 'checked_in')
         "#,
     )
     .fetch_one(pool)
@@ -181,12 +198,14 @@ async fn get_stats_pg(pool: &PgPool) -> ApiResult<DashboardStats> {
     .try_get("count")
     .unwrap_or(0);
 
-    // Total customers count
-    let total_customers: i64 = sqlx::query("SELECT COUNT(*) as count FROM ht_customers_legacy")
-        .fetch_one(pool)
-        .await?
-        .try_get("count")
-        .unwrap_or(0);
+    // Total customers (soft-delete aware)
+    let total_customers: i64 = sqlx::query(
+        r#"SELECT COUNT(*) AS count FROM ht_customers WHERE cust_deleted_at IS NULL"#,
+    )
+    .fetch_one(pool)
+    .await?
+    .try_get("count")
+    .unwrap_or(0);
 
     Ok(DashboardStats {
         total_rooms: total_rooms as i32,
@@ -199,4 +218,3 @@ async fn get_stats_pg(pool: &PgPool) -> ApiResult<DashboardStats> {
         total_customers: total_customers as i32,
     })
 }
-
