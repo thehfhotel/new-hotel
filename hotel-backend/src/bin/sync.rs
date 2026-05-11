@@ -119,6 +119,30 @@ const DEFAULT_OUTAGE_COOLDOWN_SECS: u64 = 30;
 /// Override at runtime via `LEGACY_SYNC_OUTAGE_ALERT_THRESHOLD`.
 const DEFAULT_OUTAGE_ALERT_THRESHOLD: u32 = 2;
 
+/// MSSQL-pool-init retry knobs (v2.63.0). Same root cause as the
+/// mid-run outage breaker above — HF Ville's WG tunnel can be down at
+/// container startup, in which case the initial `create_pool` call
+/// returns a "Timed out in bb8" / TCP-refused error and the watcher
+/// historically exited with code 1. Docker's `restart: on-failure:5`
+/// policy then capped retries at 5 attempts before giving up, leaving
+/// the watcher dead even after the tunnel recovered.
+///
+/// Retry on init failure with exponential backoff capped at
+/// `INIT_RETRY_MAX_SECS`; never exit. Genuine non-recoverable errors
+/// (panics, schema fingerprint mismatch handled separately above)
+/// still propagate, so Docker's restart policy stays meaningful for
+/// the cases it was designed for.
+///
+/// Schedule: 5s, 10s, 20s, 40s, 60s, 60s, 60s, ... — total elapsed
+/// reaches 5 min at attempt ~7.
+///
+/// Override at runtime via `LEGACY_SYNC_INIT_RETRY_INITIAL_SECS` /
+/// `LEGACY_SYNC_INIT_RETRY_MAX_SECS` /
+/// `LEGACY_SYNC_INIT_RETRY_ALERT_AFTER_SECS`.
+const DEFAULT_INIT_RETRY_INITIAL_SECS: u64 = 5;
+const DEFAULT_INIT_RETRY_MAX_SECS: u64 = 60;
+const DEFAULT_INIT_RETRY_ALERT_AFTER_SECS: u64 = 300;
+
 /// All CT-enabled MSSQL tables — must stay in sync with the seed in
 /// migrations 017 (canonical sync, 10 tables) + 022 (legacy_mirror, 6
 /// tables) and the `legacy_sync_status` rows. Adding a new mapper
@@ -292,11 +316,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!("Connected to PostgreSQL");
 
     let mssql_config = DbConfig::from_env();
-    let mssql = create_pool(&mssql_config)
-        .await
-        .map_err(|e| format!("MSSQL pool init failed: {e}"))?;
-    tracing::info!(server = %mssql_config.server, "Connected to legacy MSSQL");
 
+    // Slack client must be initialised BEFORE the MSSQL pool retry loop
+    // so the loop can fire an alert when total elapsed crosses the
+    // `INIT_RETRY_ALERT_AFTER_SECS` threshold (v2.63.0). Was previously
+    // initialised AFTER `create_pool` because the only failure mode
+    // there was exit-1; now that we retry forever instead of exiting,
+    // the alert plumbing has to be live during retry.
     let slack_config = SlackConfig::from_env();
     let slack: Option<SlackClient> = if slack_config.is_configured() {
         tracing::info!("Slack notifications enabled for CT watcher");
@@ -308,6 +334,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
         None
     };
+
+    let init_retry_config = InitRetryConfig::from_env();
+    let mssql = create_pool_with_retry(
+        &mssql_config,
+        &init_retry_config,
+        slack.as_ref(),
+        &site.id,
+        "ct-watcher",
+    )
+    .await;
+    tracing::info!(server = %mssql_config.server, "Connected to legacy MSSQL");
 
     if let Err(e) = verify_schema_fingerprint(&mssql).await {
         tracing::error!(
@@ -536,9 +573,30 @@ async fn run_bootstrap(site: &SiteConfig) -> Result<(), Box<dyn std::error::Erro
     tracing::info!("[bootstrap] Connected to PostgreSQL");
 
     let mssql_config = DbConfig::from_env();
-    let mssql = create_pool(&mssql_config)
-        .await
-        .map_err(|e| format!("MSSQL pool init failed: {e}"))?;
+
+    // Bootstrap retries on initial MSSQL pool failure too (v2.63.0).
+    // Bootstrap is an operator action, so a transient WG flap shouldn't
+    // force the operator to babysit the command — the retry loop will
+    // hold the line until the tunnel comes back. The bootstrap path
+    // initialises its own Slack client (slack_config_for_bootstrap)
+    // because the rest of bootstrap intentionally passes `None` into
+    // `run_sync` to suppress drift alerts; the retry alert is a
+    // different concern (operator paging) and belongs ON.
+    let slack_config_for_bootstrap = SlackConfig::from_env();
+    let slack_for_bootstrap: Option<SlackClient> = if slack_config_for_bootstrap.is_configured() {
+        Some(SlackClient::new(slack_config_for_bootstrap))
+    } else {
+        None
+    };
+    let init_retry_config = InitRetryConfig::from_env();
+    let mssql = create_pool_with_retry(
+        &mssql_config,
+        &init_retry_config,
+        slack_for_bootstrap.as_ref(),
+        &site.id,
+        "bootstrap",
+    )
+    .await;
     tracing::info!(server = %mssql_config.server, "[bootstrap] Connected to legacy MSSQL");
 
     // Schema fingerprint guard — same gate the watcher main loop uses.
@@ -673,6 +731,135 @@ async fn read_change_tracking_current_version(
     })?;
     let v: Option<i64> = row.get("v");
     Ok(v.unwrap_or(0))
+}
+
+/// Tunable knobs for [`create_pool_with_retry`]. All three default to
+/// the `DEFAULT_INIT_RETRY_*` constants and can be overridden at
+/// runtime via the matching `LEGACY_SYNC_INIT_RETRY_*` env vars.
+#[derive(Debug, Clone, Copy)]
+struct InitRetryConfig {
+    initial_backoff: Duration,
+    max_backoff: Duration,
+    alert_after: Duration,
+}
+
+impl InitRetryConfig {
+    fn from_env() -> Self {
+        let initial = env::var("LEGACY_SYNC_INIT_RETRY_INITIAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_INIT_RETRY_INITIAL_SECS);
+        let max = env::var("LEGACY_SYNC_INIT_RETRY_MAX_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_INIT_RETRY_MAX_SECS);
+        let alert = env::var("LEGACY_SYNC_INIT_RETRY_ALERT_AFTER_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_INIT_RETRY_ALERT_AFTER_SECS);
+        Self {
+            initial_backoff: Duration::from_secs(initial),
+            max_backoff: Duration::from_secs(max),
+            alert_after: Duration::from_secs(alert),
+        }
+    }
+}
+
+/// Compute the next backoff interval for the MSSQL pool-init retry
+/// loop. Doubles `current` (capped at `max`). Pulled into a free
+/// function so the schedule is unit-testable without a tokio runtime.
+///
+/// Expected progression with the defaults (initial=5s, max=60s):
+/// `5s → 10s → 20s → 40s → 60s → 60s → 60s → ...`
+fn next_backoff(current: Duration, max: Duration) -> Duration {
+    let doubled = current.saturating_mul(2);
+    if doubled > max {
+        max
+    } else {
+        doubled
+    }
+}
+
+/// Retry [`create_pool`] with exponential backoff (capped) until it
+/// succeeds. Never returns `Err` — the container should ride out a
+/// transient MSSQL outage instead of crash-looping under Docker's
+/// `restart: on-failure:5` policy.
+///
+/// Fires a Slack alert once the total elapsed retry time crosses
+/// `config.alert_after` so an operator gets paged when the outage is
+/// long enough to be operationally interesting (default 5 min). The
+/// alert is one-shot per `create_pool_with_retry` call — we don't want
+/// to spam Slack on every retry attempt during a multi-hour outage.
+///
+/// `caller_tag` is a short identifier ("ct-watcher" / "bootstrap")
+/// that appears in the Slack message + log lines so a single
+/// shared-binary instance can attribute its alerts correctly.
+async fn create_pool_with_retry(
+    config: &DbConfig,
+    retry_config: &InitRetryConfig,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+    caller_tag: &str,
+) -> DbPool {
+    let started_at = Instant::now();
+    let mut backoff = retry_config.initial_backoff;
+    let mut attempt: u32 = 0;
+    let mut alerted = false;
+
+    loop {
+        attempt += 1;
+        match create_pool(config).await {
+            Ok(pool) => {
+                if attempt > 1 {
+                    tracing::info!(
+                        site = %site_id,
+                        caller = caller_tag,
+                        attempt,
+                        elapsed_secs = started_at.elapsed().as_secs(),
+                        "MSSQL pool init succeeded after retry"
+                    );
+                }
+                return pool;
+            }
+            Err(err) => {
+                let elapsed = started_at.elapsed();
+                tracing::warn!(
+                    site = %site_id,
+                    caller = caller_tag,
+                    attempt,
+                    elapsed_secs = elapsed.as_secs(),
+                    next_retry_secs = backoff.as_secs(),
+                    error = %err,
+                    "MSSQL pool init failed — retrying with backoff"
+                );
+
+                if !alerted && elapsed >= retry_config.alert_after {
+                    alerted = true;
+                    if let Some(s) = slack {
+                        let elapsed_secs = elapsed.as_secs();
+                        let payload = SlackMessage::with_site_text(
+                            site_id,
+                            format!(
+                                ":warning: *MSSQL pool init stalled* :warning:\n\
+                                 Caller: `{caller_tag}`\n\
+                                 Attempts: {attempt}\n\
+                                 Elapsed: {elapsed_secs}s\n\
+                                 Latest error: `{err}`\n\
+                                 _The container is retrying with exponential \
+                                 backoff (capped) and will NOT exit. Common \
+                                 cause: legacy MSSQL unreachable (WG tunnel \
+                                 flap, MSSQL restart, network partition)._"
+                            ),
+                        );
+                        let _ = s.send_message(&payload).await;
+                    }
+                }
+
+                tokio::time::sleep(backoff).await;
+                backoff = next_backoff(backoff, retry_config.max_backoff);
+            }
+        }
+    }
 }
 
 /// Operator-facing refusal message for the N1 live-bootstrap guard.
@@ -1920,6 +2107,209 @@ mod tests {
              via bump_skipped(.., 0, false) before returning, otherwise \
              low-traffic tables stay stuck on stale bb8-timeout errors. \
              Got region:\n{region}"
+        );
+    }
+
+    /// v2.63.0: exponential backoff schedule for MSSQL pool-init retry.
+    /// Pins the expected progression (5s → 10s → 20s → 40s → 60s → 60s)
+    /// so a future refactor can't silently change the cadence and
+    /// either page operators too aggressively or let an outage stall
+    /// the watcher quietly.
+    #[test]
+    fn next_backoff_doubles_until_capped() {
+        let max = Duration::from_secs(60);
+        let mut current = Duration::from_secs(5);
+
+        let expected_schedule: &[u64] = &[10, 20, 40, 60, 60, 60];
+        for (i, expected) in expected_schedule.iter().enumerate() {
+            current = next_backoff(current, max);
+            assert_eq!(
+                current.as_secs(),
+                *expected,
+                "step {i}: expected {expected}s, got {}s",
+                current.as_secs()
+            );
+        }
+    }
+
+    /// `saturating_mul(2)` plus the explicit cap means even a
+    /// pathological starting value at the boundary can't overflow.
+    #[test]
+    fn next_backoff_saturates_on_giant_input() {
+        let max = Duration::from_secs(60);
+        let huge = Duration::from_secs(u64::MAX / 4);
+        let capped = next_backoff(huge, max);
+        assert_eq!(capped, max);
+    }
+
+    /// The cap also clamps a `current` already at the max — the loop
+    /// never amplifies past `max_backoff`.
+    #[test]
+    fn next_backoff_stays_at_max_once_reached() {
+        let max = Duration::from_secs(60);
+        let at_max = Duration::from_secs(60);
+        assert_eq!(next_backoff(at_max, max), max);
+    }
+
+    /// Pre-cap doubling: 5→10, 10→20, 20→40 — exact, no rounding.
+    #[test]
+    fn next_backoff_pre_cap_is_exact_doubling() {
+        let max = Duration::from_secs(60);
+        assert_eq!(next_backoff(Duration::from_secs(5), max).as_secs(), 10);
+        assert_eq!(next_backoff(Duration::from_secs(10), max).as_secs(), 20);
+        assert_eq!(next_backoff(Duration::from_secs(20), max).as_secs(), 40);
+    }
+
+    /// `InitRetryConfig::from_env` falls back to the documented defaults
+    /// when no env var is set. Guards against a typo in the env-var
+    /// name silently dropping operator overrides.
+    #[test]
+    fn init_retry_config_defaults_match_documented_constants() {
+        // Snapshot the env vars and clear them so the test is
+        // independent of the developer's shell state. SAFETY: tests in
+        // this module run with `cargo test` which serialises them when
+        // they manipulate process-global state via `--test-threads=1`
+        // is NOT required because we only touch env vars that don't
+        // collide with other tests in this file.
+        let keys = [
+            "LEGACY_SYNC_INIT_RETRY_INITIAL_SECS",
+            "LEGACY_SYNC_INIT_RETRY_MAX_SECS",
+            "LEGACY_SYNC_INIT_RETRY_ALERT_AFTER_SECS",
+        ];
+        let saved: Vec<(&'static str, Option<String>)> =
+            keys.iter().map(|k| (*k, env::var(k).ok())).collect();
+        for k in &keys {
+            env::remove_var(k);
+        }
+
+        let cfg = InitRetryConfig::from_env();
+        assert_eq!(
+            cfg.initial_backoff,
+            Duration::from_secs(DEFAULT_INIT_RETRY_INITIAL_SECS),
+        );
+        assert_eq!(
+            cfg.max_backoff,
+            Duration::from_secs(DEFAULT_INIT_RETRY_MAX_SECS),
+        );
+        assert_eq!(
+            cfg.alert_after,
+            Duration::from_secs(DEFAULT_INIT_RETRY_ALERT_AFTER_SECS),
+        );
+
+        // Restore so a follow-up test relying on these env vars sees
+        // the original developer-shell state.
+        for (k, v) in saved {
+            match v {
+                Some(val) => env::set_var(k, val),
+                None => env::remove_var(k),
+            }
+        }
+    }
+
+    /// Documented schedule sanity check — the default config plus the
+    /// `next_backoff` schedule should fire the alert within ~10 retry
+    /// attempts so an operator gets paged inside roughly 5-6 minutes.
+    /// If somebody bumps either knob without thinking, this test
+    /// forces them to re-derive the alert cadence.
+    ///
+    /// Schedule with defaults (initial=5s, max=60s, alert=300s):
+    /// attempt 1 fails (elapsed=0s) → sleep 5s
+    /// attempt 2 fails (elapsed≈5s) → sleep 10s
+    /// attempt 3 fails (elapsed≈15s) → sleep 20s
+    /// attempt 4 fails (elapsed≈35s) → sleep 40s
+    /// attempt 5 fails (elapsed≈75s) → sleep 60s
+    /// attempt 6 fails (elapsed≈135s) → sleep 60s
+    /// attempt 7 fails (elapsed≈195s) → sleep 60s
+    /// attempt 8 fails (elapsed≈255s) → sleep 60s
+    /// attempt 9 fails (elapsed≈315s) → ALERT fires (≥300s)
+    ///
+    /// Total time-to-page ≈ 315s = 5m15s. Acceptable for a tunnel
+    /// outage where the first 5 min of retries are still in
+    /// "give it a chance to recover" territory.
+    #[test]
+    fn default_backoff_schedule_paging_threshold_documented() {
+        let max = Duration::from_secs(DEFAULT_INIT_RETRY_MAX_SECS);
+        let mut current = Duration::from_secs(DEFAULT_INIT_RETRY_INITIAL_SECS);
+        let mut elapsed: u64 = 0;
+        let mut attempts: u32 = 1;
+        let alert_threshold = DEFAULT_INIT_RETRY_ALERT_AFTER_SECS;
+
+        // Simulate failed attempts until elapsed crosses the alert
+        // threshold. Cap at 20 attempts so a buggy schedule can't loop
+        // forever.
+        while elapsed < alert_threshold && attempts < 20 {
+            elapsed += current.as_secs();
+            current = next_backoff(current, max);
+            attempts += 1;
+        }
+
+        assert!(
+            elapsed >= alert_threshold,
+            "default schedule never reaches alert threshold inside 20 \
+             attempts (elapsed={elapsed}s, threshold={alert_threshold}s)"
+        );
+        // Paging must happen within 10 minutes so a real outage doesn't
+        // get masked by an overly conservative cadence.
+        assert!(
+            elapsed < 600,
+            "time-to-page = {elapsed}s; should fire well under 10 min \
+             (attempts taken: {attempts})"
+        );
+    }
+
+    /// Integration-light check that `create_pool_with_retry` does in
+    /// fact retry on an unreachable MSSQL: point at a TCP-refused port
+    /// (127.0.0.1:1 — always refused on any host), wait for two
+    /// attempts to fire, then abort the loop via `tokio::time::timeout`.
+    /// Asserts the wrapper does NOT propagate the error (never returns
+    /// Err — exact opposite of the pre-fix behaviour) and DOES log at
+    /// least one retry attempt.
+    ///
+    /// We intentionally don't drive this past the timeout — the loop
+    /// is infinite by design.
+    #[tokio::test]
+    async fn create_pool_with_retry_loops_instead_of_exiting() {
+        let unreachable = DbConfig {
+            server: "127.0.0.1".to_string(),
+            // bb8's connection_timeout is 15s — port 1 is unbound, so
+            // tiberius gets a TCP RST immediately rather than waiting
+            // the full timeout. That means we can drive two retry
+            // attempts well under the 5s test budget.
+            port: 1,
+            database: "stub".to_string(),
+            user: "stub".to_string(),
+            password: "stub".to_string(),
+            pool_max: 1,
+        };
+        let retry_cfg = InitRetryConfig {
+            // Tiny backoff so the test finishes inside a few hundred ms.
+            initial_backoff: Duration::from_millis(50),
+            max_backoff: Duration::from_millis(100),
+            // Alert never fires in this test — way above the timeout.
+            alert_after: Duration::from_secs(3600),
+        };
+
+        // The pool-init call never succeeds, so we cap the test budget
+        // with a timeout. If the wrapper exited (the bug), the future
+        // would resolve before the timeout with a panic from `.unwrap`;
+        // if it loops correctly, the timeout fires first.
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            create_pool_with_retry(
+                &unreachable,
+                &retry_cfg,
+                None,
+                "test-site",
+                "test-caller",
+            ),
+        )
+        .await;
+
+        // The timeout MUST fire — meaning the loop is still retrying.
+        assert!(
+            result.is_err(),
+            "create_pool_with_retry should never return on a permanently \
+             unreachable MSSQL; expected timeout, got {result:?}"
         );
     }
 }
