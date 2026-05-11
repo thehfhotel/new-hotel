@@ -190,7 +190,7 @@ async fn get_stats_pg(pool: &PgPool) -> ApiResult<DashboardStats> {
         r#"
         SELECT COUNT(*) AS count
         FROM ht_bookings
-        WHERE book_status IN ('confirmed', 'pending', 'checked_in')
+        WHERE book_status IN ('confirmed', 'pending', 'checkedin')
         "#,
     )
     .fetch_one(pool)
