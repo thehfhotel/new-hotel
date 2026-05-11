@@ -245,6 +245,23 @@ pub async fn apply_checkin_aggregate(
         }
     }
 
+    // Short-circuit: header is still present but says cancelled AND
+    // every `HT_CheckIn_Ds` row was deleted (so `legacy_room_no=None`,
+    // `derive_room_state` line ~504-515). FK resolution below would
+    // defer indefinitely on `resolve_room_id(None)`, permanently
+    // stranding the canonical row in `cin_status='active'` while the
+    // legacy is cancelled. Skip straight to the UPDATE on the existing
+    // row — there's nothing else to mirror.
+    //
+    // Guard: only short-circuit when the canonical row already exists.
+    // If it doesn't, the cancellation is legitimately deferred (we need
+    // to wait for the original INSERT CT row to land first).
+    if projection.cin_status == "cancelled" {
+        if let Some(ex) = existing.as_ref() {
+            return apply_cancelled_for_present_header(tx, ex, cin_no).await;
+        }
+    }
+
     // Resolve FKs. Defer-on-missing per `sync::resolve` contract.
     let cust_id = match resolve::resolve_customer_id(tx, projection.legacy_cust_no.as_deref())
         .await?
@@ -338,6 +355,44 @@ pub async fn apply_checkin_aggregate(
 
     let _ = cin_id_serial; // kept for readability; aggregate_id is the public handle.
     Ok(Some(event))
+}
+
+/// Cancellation short-circuit for the case where the legacy header
+/// is still present (`Cin_status='ยกเลิก'`) but every `HT_CheckIn_Ds`
+/// row has been deleted. In that state `derive_room_state` returns
+/// `first_room_no=None`, so the normal `apply_checkin_aggregate` path
+/// can't resolve a room FK and defers indefinitely — stranding the
+/// canonical row in `cin_status='active'`.
+///
+/// Same UPDATE semantics as [`apply_cancelled`] (the header-gone path),
+/// but skipped if the canonical row is already cancelled. Returns
+/// `Ok(None)` for the event: a domain event would mismatch the bus
+/// invariant that `CheckInCancelled` carries a real cancellation
+/// transition, and these strands are recoveries, not transitions.
+async fn apply_cancelled_for_present_header(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    existing: &ExistingCheckIn,
+    cin_no: &str,
+) -> Result<Option<DomainEvent>, SyncError> {
+    if existing.cin_status.as_deref() == Some("cancelled") {
+        return Ok(None);
+    }
+    tracing::debug!(
+        cin_no,
+        cin_id = existing.cin_id,
+        "ht_checkins apply: short-circuit cancellation \
+         (legacy header present but all HT_CheckIn_Ds rows deleted)"
+    );
+    sqlx::query(
+        "UPDATE ht_checkins \
+            SET cin_status = 'cancelled', \
+                updated_at = NOW() \
+          WHERE cin_id = $1",
+    )
+    .bind(existing.cin_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(None)
 }
 
 /// Mark the canonical row cancelled when the legacy header has gone.
@@ -972,6 +1027,29 @@ mod tests {
         };
         let p = project_aggregate(&agg, "CH26-005231").unwrap();
         assert_eq!(p.legacy_book_id.as_deref(), Some("R014810"));
+    }
+
+    /// Regression for the v2.63.0 strand bug: when the legacy header
+    /// says cancelled AND every `HT_CheckIn_Ds` row was deleted, the
+    /// projection MUST carry `cin_status='cancelled'` with
+    /// `legacy_room_no=None`. The `apply_checkin_aggregate`
+    /// short-circuit relies on this projection shape to skip FK
+    /// resolution.
+    #[test]
+    fn project_cancelled_with_deleted_ds_rows_carries_no_room() {
+        let agg = CheckInAggregate {
+            header: Some(header_row("CH26-005252", "C21607", "ยกเลิก")),
+            rooms: vec![], // legacy deleted every Ds row
+            payments: vec![],
+        };
+        let p = project_aggregate(&agg, "CH26-005252").unwrap();
+        assert_eq!(p.cin_status, "cancelled");
+        assert!(
+            p.legacy_room_no.is_none(),
+            "no Ds rows -> no legacy_room_no -> would have stranded the row \
+             pre-fix"
+        );
+        assert!(!p.is_fully_checked_out);
     }
 
     #[test]

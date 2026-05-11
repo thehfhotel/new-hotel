@@ -40,6 +40,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backfill-time value forever — making the dashboard's maintenance
   indicator unreliable. Silent UPSERT (no domain event emitted),
   matching the existing pattern for non-clean column edits.
+- **Checkin CT mapper no longer strands cancellations when legacy
+  deleted all `HT_CheckIn_Ds` rows but left the header.** Apply path
+  now short-circuits to a `cin_status='cancelled'` UPDATE on the
+  existing canonical row instead of waiting indefinitely for a
+  resolvable room FK. Two production rows that had been stuck in
+  `cin_status='active'` (`legacy_cin_no` IN `('CH26-005252',
+  'CH26-005270')`) were backfilled alongside the deploy.
+  - `sync/mappers/checkin.rs::apply_checkin_aggregate` — before FK
+    resolution, when `projection.cin_status == 'cancelled'` AND a
+    canonical row already exists, route into a new
+    `apply_cancelled_for_present_header` helper that issues the same
+    UPDATE as the header-gone `apply_cancelled` path. Guard keeps the
+    legitimate-defer behaviour when the canonical row doesn't exist
+    yet (the original INSERT CT row hasn't landed).
+  - No domain event emitted on the short-circuit path — this is a
+    recovery, not a transition. Subscribers re-observe state by
+    re-reading the canonical row.
+  - Tests: 1 new unit test in `sync::mappers::checkin::tests`
+    (`project_cancelled_with_deleted_ds_rows_carries_no_room`) plus
+    2 new PG-backed integration tests in
+    `tests/test_sync_phase54_integration.rs`.
 
 ### Changed
 
@@ -48,11 +69,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `GET /api/rooms/status` calendar route (`get_room_status_pg`) —
     requires careful date-range/booking-window remodelling.
   - `scheduler/sync.rs` reconcile job — still pointed at legacy mirrors.
-- **Known canonical-state gap** (tracked separately): the checkin CT
-  mapper has rows stuck in `cin_status='active'` past their expected
-  checkout in some cases. This release exposes the gap (the dashboard
-  now reads canonical) but does NOT fix the upstream mapper bug —
-  diagnosis ongoing.
 
 ## [2.62.3] - 2026-05-10
 

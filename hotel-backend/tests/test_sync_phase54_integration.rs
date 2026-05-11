@@ -515,3 +515,153 @@ async fn checkin_apply_defers_when_customer_not_yet_mirrored() {
         .await
         .ok();
 }
+
+/// Regression for the v2.63.0 strand bug.
+///
+/// Production scenario: legacy iHOTEL cancels a check-in by setting
+/// `HT_CheckIn_H.Cin_status='ยกเลิก'` AND deleting every `HT_CheckIn_Ds`
+/// row. The next CT tick brings a header-present aggregate with
+/// `rooms.is_empty()`. `derive_room_state` returns `first_room_no=None`,
+/// so the normal FK-resolution path defers indefinitely
+/// (`resolve_room_id(None) -> None`) — leaving the canonical row stuck
+/// at `cin_status='active'` forever.
+///
+/// Expected behaviour after the fix: when an existing canonical row is
+/// found AND the projection's `cin_status` is `'cancelled'`, the mapper
+/// short-circuits to a `cin_status='cancelled'` UPDATE on the existing
+/// row WITHOUT requiring a resolvable room FK. No domain event is
+/// emitted (recovery, not transition).
+#[tokio::test]
+async fn checkin_cancelled_with_deleted_ds_rows_lands_via_short_circuit() {
+    // No MSSQL gate — the short-circuit path never triggers the parent
+    // booking re-projection side-effect (walk-in: empty Cin_Book_no),
+    // so the mssql_stub is genuinely optional.
+    let pool = common::create_test_pool().await;
+    let mssql = mssql_stub().await;
+    let cin_no = unique_cin_no();
+    let cust_no = unique_cust_no();
+    let room_no = unique_room_no();
+
+    let _cust_pg_id = seed_customer(&pool, &cust_no).await;
+    let _room_id = seed_room(&pool, &room_no).await;
+
+    // Seed: original active check-in lands normally.
+    let active = CheckInAggregate {
+        header: Some(header_row(&cin_no, &cust_no, "ปกติ")),
+        rooms: vec![ds_row(&cin_no, &room_no, "เข้าพัก")],
+        payments: vec![],
+    };
+    let mut tx = pool.begin().await.unwrap();
+    let _ = apply_checkin_aggregate(&mut tx, mssql.as_ref(), &active, &cin_no)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    // Sanity: the canonical row is 'active'.
+    let status_before: String = sqlx::query_scalar(
+        "SELECT cin_status FROM ht_checkins WHERE legacy_cin_no = $1",
+    )
+    .bind(&cin_no)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status_before, "active");
+
+    // Legacy: header flipped to ยกเลิก AND every HT_CheckIn_Ds row
+    // deleted. Header is still present — so `is_present()` is true and
+    // the aggregate goes through `project_aggregate` (NOT through the
+    // header-gone `apply_cancelled` path).
+    let cancelled_with_deleted_rooms = CheckInAggregate {
+        header: Some(header_row(&cin_no, &cust_no, "ยกเลิก")),
+        rooms: vec![], // <- legacy deleted all Ds rows
+        payments: vec![],
+    };
+    let mut tx2 = pool.begin().await.unwrap();
+    let event = apply_checkin_aggregate(
+        &mut tx2,
+        mssql.as_ref(),
+        &cancelled_with_deleted_rooms,
+        &cin_no,
+    )
+    .await
+    .unwrap();
+    tx2.commit().await.unwrap();
+
+    // No event emitted — short-circuit path is a recovery, not a
+    // transition. The cancellation transition was already captured by
+    // the header-status flip (and is observed on the canonical row).
+    assert!(
+        event.is_none(),
+        "short-circuit cancellation must not emit a domain event"
+    );
+
+    // Canonical row must now be cancelled — the bug was that it would
+    // stay 'active' forever because room FK resolution deferred.
+    let status_after: String = sqlx::query_scalar(
+        "SELECT cin_status FROM ht_checkins WHERE legacy_cin_no = $1",
+    )
+    .bind(&cin_no)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        status_after, "cancelled",
+        "cin_status must flip to 'cancelled' even with no resolvable room"
+    );
+
+    cleanup(&pool, &cin_no, &cust_no, &room_no).await;
+}
+
+/// Companion regression: when NO canonical row exists yet, a cancelled
+/// header (with deleted Ds rows) must still defer — the original INSERT
+/// CT row hasn't landed yet, so there's nothing to update. The
+/// short-circuit is guarded by `existing.is_some()`.
+#[tokio::test]
+async fn checkin_cancelled_with_no_existing_row_still_defers() {
+    // Same MSSQL exemption as the sibling test above.
+    let pool = common::create_test_pool().await;
+    let mssql = mssql_stub().await;
+    let cin_no = unique_cin_no();
+    let cust_no = unique_cust_no();
+    let room_no = unique_room_no();
+
+    let _cust_pg_id = seed_customer(&pool, &cust_no).await;
+    let _room_id = seed_room(&pool, &room_no).await;
+
+    // No prior INSERT — first CT tick we ever see for this cin_no is
+    // the cancellation itself (with all Ds rows already deleted).
+    let cancelled = CheckInAggregate {
+        header: Some(header_row(&cin_no, &cust_no, "ยกเลิก")),
+        rooms: vec![],
+        payments: vec![],
+    };
+    let mut tx = pool.begin().await.unwrap();
+    let event = apply_checkin_aggregate(&mut tx, mssql.as_ref(), &cancelled, &cin_no)
+        .await
+        .unwrap();
+    tx.rollback().await.ok();
+
+    assert!(
+        event.is_none(),
+        "no canonical row exists yet — short-circuit must not fire blind"
+    );
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM ht_checkins WHERE legacy_cin_no = $1",
+    )
+    .bind(&cin_no)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 0, "no row must be inserted by the short-circuit path");
+
+    sqlx::query("DELETE FROM ht_customers WHERE legacy_cust_no = $1")
+        .bind(&cust_no)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = $1")
+        .bind(&room_no)
+        .execute(&pool)
+        .await
+        .ok();
+}
