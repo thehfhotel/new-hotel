@@ -37,7 +37,10 @@ pub mod room;
 pub use booking::{
     apply_booking_aggregate, BookingDatesMapper, BookingHeaderMapper, BookingRoomsMapper,
 };
-pub use checkin::{apply_checkin_aggregate, CheckInHeaderMapper, CheckInRoomsMapper};
+pub use checkin::{
+    apply_checkin_aggregate, resolve_customer_via_eager_mirror_for_test, CheckInHeaderMapper,
+    CheckInRoomsMapper,
+};
 pub use customer::CustomerMapper;
 pub use mirror::{
     BillDebtDsMirrorMapper, BillDebtHMirrorMapper, ChangedRoomMirrorMapper,

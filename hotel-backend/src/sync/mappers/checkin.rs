@@ -53,8 +53,13 @@ use crate::service::ids::{aggregate_uuid, AggregateKind};
 use crate::sync::change_op::ChangeOp;
 use crate::sync::mapper::MssqlChangeMapper;
 use crate::sync::mappers::booking::apply_booking_aggregate;
+use crate::sync::mappers::customer::{
+    upsert_customer_from_row, EAGER_FETCH_COLUMNS as CUSTOMER_EAGER_FETCH_COLUMNS,
+    TABLE as HT_CUSTOMERS,
+};
 use crate::sync::parent_loader::{load_booking_aggregate, CheckInAggregate};
 use crate::sync::resolve;
+use crate::sync::row::test_support::{HashMapRow, MockValue};
 use crate::sync::row::MappableRow;
 use crate::sync::SyncError;
 
@@ -262,20 +267,21 @@ pub async fn apply_checkin_aggregate(
         }
     }
 
-    // Resolve FKs. Defer-on-missing per `sync::resolve` contract.
-    let cust_id = match resolve::resolve_customer_id(tx, projection.legacy_cust_no.as_deref())
-        .await?
-    {
-        Some(id) => id,
-        None => {
-            tracing::warn!(
-                cin_no,
-                legacy_cust_no = ?projection.legacy_cust_no,
-                "ht_checkins apply deferred: customer not yet mirrored"
-            );
-            return Ok(None);
-        }
-    };
+    // Resolve FKs. Defer-on-missing per `sync::resolve` contract — with
+    // one targeted exception for customers (see
+    // `resolve_customer_or_eager_mirror` rationale): a deferred customer
+    // FK previously stranded the checkin row forever because the
+    // watermark advanced past the deferred row and never re-read it.
+    // The eager-mirror path pulls the matching `HT_Customers` row from
+    // MSSQL synchronously, INSERTs it into canonical `ht_customers` in
+    // the same TX, then retries the FK lookup.
+    let cust_id =
+        match resolve_customer_or_eager_mirror(tx, mssql, projection.legacy_cust_no.as_deref())
+            .await?
+        {
+            Some(id) => id,
+            None => return Ok(None),
+        };
     let room_id = match resolve::resolve_room_id(tx, projection.legacy_room_no.as_deref())
         .await?
     {
@@ -459,6 +465,199 @@ async fn reproject_parent_booking(
         );
     }
     Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// Customer FK resolution with eager mirror (defer-forever recovery)
+// -----------------------------------------------------------------------------
+
+/// Strategy for sourcing a `HT_Customers` row when the canonical FK
+/// lookup misses. The production strategy hits MSSQL via tiberius; tests
+/// inject a closure that returns a synthesised `HashMapRow` so the
+/// eager-mirror path is exercised without a live legacy connection.
+///
+/// Kept module-private — callers route through
+/// [`resolve_customer_or_eager_mirror`].
+///
+/// The `Stub` variant is gated behind `#[doc(hidden)]` rather than
+/// `#[cfg(test)]` so the integration suite (a separate crate, compiled
+/// without the lib's `test` cfg) can also reach it via
+/// [`resolve_customer_via_eager_mirror_for_test`].
+#[doc(hidden)]
+pub enum CustomerSource<'a> {
+    /// Production: borrow a live MSSQL pool and `SELECT` one row by
+    /// `Cust_no`.
+    Mssql(&'a DbPool),
+    /// Test injection: deterministic stub returning the row a real MSSQL
+    /// fetch would have returned.
+    Stub(Box<dyn Fn(&str) -> Option<HashMapRow> + Send + Sync + 'a>),
+}
+
+/// Resolve `cin_cust_id` via the standard canonical lookup; on miss,
+/// eagerly mirror the referenced `HT_Customers` row from MSSQL into
+/// `ht_customers` and retry. Returns `Ok(Some(id))` on success and
+/// `Ok(None)` only for legitimate defers (no `legacy_cust_no` on the
+/// projection, no MSSQL pool available, or the customer is truly
+/// missing in MSSQL too).
+///
+/// ## Why eager-mirror instead of defer
+///
+/// The CT watermark advances past a deferred row, so a `legacy_cust_no`
+/// that hasn't been mirrored yet would never trigger a re-read of the
+/// checkin row. Recovery was accidental — it depended on a later CT
+/// update for the same checkin re-firing the aggregate load. Production
+/// log lines like `ht_checkins apply deferred: customer not yet
+/// mirrored cin_no="CH26-001061" legacy_cust_no=Some("C1951")` are the
+/// observable form of that bug. The eager-mirror path closes the
+/// window: if the checkin references a customer, that customer MUST
+/// exist in MSSQL (the legacy app inserts it before pointing the
+/// checkin at it), so a synchronous fetch is always safe.
+async fn resolve_customer_or_eager_mirror(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    mssql: Option<&DbPool>,
+    legacy_cust_no: Option<&str>,
+) -> Result<Option<i32>, SyncError> {
+    // Fast path — canonical row already there.
+    if let Some(id) = resolve::resolve_customer_id(tx, legacy_cust_no).await? {
+        return Ok(Some(id));
+    }
+
+    // Need a Cust_no AND an MSSQL pool to attempt the eager fetch.
+    let (Some(cust_no), Some(pool)) = (legacy_cust_no, mssql) else {
+        tracing::warn!(
+            legacy_cust_no = ?legacy_cust_no,
+            "ht_checkins apply deferred: customer not yet mirrored \
+             (no legacy_cust_no or no MSSQL pool available)"
+        );
+        return Ok(None);
+    };
+
+    resolve_customer_via_eager_mirror(tx, CustomerSource::Mssql(pool), cust_no).await
+}
+
+/// Inner of [`resolve_customer_or_eager_mirror`] that takes a
+/// [`CustomerSource`] so tests can inject a row-supplier closure. Holds
+/// the actual mirror + retry plumbing.
+async fn resolve_customer_via_eager_mirror(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    source: CustomerSource<'_>,
+    cust_no: &str,
+) -> Result<Option<i32>, SyncError> {
+    let fetched = match &source {
+        CustomerSource::Mssql(pool) => fetch_customer_row_from_mssql(pool, cust_no).await?,
+        CustomerSource::Stub(f) => f(cust_no),
+    };
+
+    let Some(row) = fetched else {
+        // Truly missing in MSSQL — should not happen under the legacy
+        // app's own ordering invariant, but be defensive. Distinct log
+        // message so production can tell the two cases apart.
+        tracing::warn!(
+            legacy_cust_no = cust_no,
+            "ht_checkins apply deferred: customer not in MSSQL \
+             — leaving checkin deferred"
+        );
+        return Ok(None);
+    };
+
+    let cust_id = upsert_customer_from_row(tx, &row).await?;
+    tracing::debug!(
+        legacy_cust_no = cust_no,
+        cust_id,
+        "ht_checkins apply: eagerly mirrored referenced customer from MSSQL"
+    );
+    Ok(Some(cust_id))
+}
+
+/// Test seam for integration tests: lets the integration suite exercise
+/// the eager-mirror path without a live MSSQL connection by injecting a
+/// stub row-supplier. Gated `#[doc(hidden)]` so it does not appear in
+/// the public-facing rustdoc surface — the suite calls it but
+/// production never should.
+///
+/// Returns the resolved `cust_id` on the eager-mirror hit; `Ok(None)`
+/// when the stub returns no row (i.e. customer truly missing in MSSQL).
+#[doc(hidden)]
+pub async fn resolve_customer_via_eager_mirror_for_test<F>(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    cust_no: &str,
+    supplier: F,
+) -> Result<Option<i32>, SyncError>
+where
+    F: Fn(&str) -> Option<HashMapRow> + Send + Sync + 'static,
+{
+    let source = CustomerSource::Stub(Box::new(supplier));
+    resolve_customer_via_eager_mirror(tx, source, cust_no).await
+}
+
+/// Pull one `HT_Customers` row by `Cust_no`. Mirrors
+/// `parent_loader::fetch_rows` shape — a single-table `SELECT` via
+/// `simple_query` with inline-quoted WHERE value.
+///
+/// Returns `Ok(None)` when the row genuinely doesn't exist in MSSQL —
+/// caller treats that as the defensive "leave deferred" branch.
+async fn fetch_customer_row_from_mssql(
+    pool: &DbPool,
+    cust_no: &str,
+) -> Result<Option<HashMapRow>, SyncError> {
+    let mut conn = pool.get().await?;
+    let where_q = sql_quote_inline(cust_no);
+    let select_list = CUSTOMER_EAGER_FETCH_COLUMNS.join(", ");
+    let sql = format!(
+        "SELECT {select_list} FROM {HT_CUSTOMERS} WHERE Cust_no = {where_q}"
+    );
+
+    let stream = conn.simple_query(&sql).await?;
+    let raw_rows = stream.into_first_result().await?;
+    let Some(raw) = raw_rows.first() else {
+        return Ok(None);
+    };
+
+    let mut h = HashMapRow::new(HT_CUSTOMERS);
+    for col in CUSTOMER_EAGER_FETCH_COLUMNS {
+        let cell = read_cell(raw, col).unwrap_or(MockValue::Null);
+        h.cells.insert((*col).to_string(), cell);
+    }
+    Ok(Some(h))
+}
+
+/// SQL-quote a value for inline interpolation. Same semantics as
+/// `parent_loader::sql_quote_inline` — duplicated here so this module
+/// stays self-contained for the eager-fetch path.
+fn sql_quote_inline(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Probe a tiberius cell as the most-specific type that succeeds.
+/// Mirrors `parent_loader::read_cell` — kept private here so the
+/// boundary translator stays close to the eager-fetch caller.
+fn read_cell(row: &tiberius::Row, col: &str) -> Option<MockValue> {
+    if let Ok(Some(s)) = tiberius::Row::try_get::<&str, _>(row, col) {
+        return Some(MockValue::Str(s.to_string()));
+    }
+    if let Ok(Some(n)) = tiberius::Row::try_get::<i32, _>(row, col) {
+        return Some(MockValue::I32(n));
+    }
+    if let Ok(Some(d)) = tiberius::Row::try_get::<chrono::NaiveDateTime, _>(row, col) {
+        return Some(MockValue::DateTime(d));
+    }
+    if let Ok(Some(n)) = tiberius::Row::try_get::<f64, _>(row, col) {
+        return Some(MockValue::Decimal(n));
+    }
+    if let Ok(Some(n)) = tiberius::Row::try_get::<i64, _>(row, col) {
+        return Some(MockValue::I64(n));
+    }
+    None
 }
 
 // -----------------------------------------------------------------------------

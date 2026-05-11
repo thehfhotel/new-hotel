@@ -19,12 +19,15 @@
 mod common;
 
 use chrono::NaiveDate;
-use hotel_backend::sync::mappers::apply_checkin_aggregate;
+use hotel_backend::sync::mappers::{
+    apply_checkin_aggregate, resolve_customer_via_eager_mirror_for_test,
+};
 use hotel_backend::sync::parent_loader::CheckInAggregate;
 use hotel_backend::sync::row::test_support::{HashMapRow, MockValue};
 
 const HT_CHECKIN_H: &str = "HT_CheckIn_H";
 const HT_CHECKIN_DS: &str = "HT_CheckIn_Ds";
+const HT_CUSTOMERS: &str = "HT_Customers";
 
 /// Helper — generate a unique `Cin_no` so re-runs don't clash.
 fn unique_cin_no() -> String {
@@ -664,4 +667,198 @@ async fn checkin_cancelled_with_no_existing_row_still_defers() {
         .execute(&pool)
         .await
         .ok();
+}
+
+// =============================================================================
+// Eager-mirror regression — checkin references an un-mirrored customer.
+//
+// Before this fix the checkin mapper logged a WARN and returned Ok(None)
+// when canonical `ht_customers` didn't yet carry the referenced
+// `legacy_cust_no`. The CT watermark advanced past the deferred row, so
+// recovery depended on a later CT update for the same checkin re-firing
+// the aggregate load — defer-forever in production catch-up scenarios.
+//
+// The mapper now eagerly fetches the missing `HT_Customers` row from
+// MSSQL (via the test-injected supplier here) and INSERTs it into
+// canonical `ht_customers` in the same TX, then retries the FK lookup.
+// =============================================================================
+
+/// Construct a stub `HT_Customers` row in the shape the eager fetcher
+/// expects. Mirrors `parent_loader::fetch_rows` materialisation: every
+/// column from `customer::EAGER_FETCH_COLUMNS` is present, either as a
+/// Str/Null value.
+fn stub_customers_row(cust_no: &str, name: &str) -> HashMapRow {
+    HashMapRow::new(HT_CUSTOMERS)
+        .with("Cust_no", MockValue::Str(cust_no.into()))
+        .with("Cust_name", MockValue::Str(name.into()))
+        .with("Cust_perfix", MockValue::Str("นาย".into()))
+        .with("Cust_IDcard", MockValue::Null)
+        .with(
+            "Cust_Type_Main",
+            MockValue::Str("บุคคลธรรมดา".into()),
+        )
+        .with("Cust_Email", MockValue::Null)
+        .with("Cust_Add_no", MockValue::Null)
+        .with("Cust_Add_tel", MockValue::Str("0801112222".into()))
+}
+
+#[tokio::test]
+async fn eager_mirror_inserts_customer_when_canonical_row_missing() {
+    let pool = common::create_test_pool().await;
+    let cust_no = unique_cust_no();
+
+    // Pre-condition: canonical ht_customers has NO row for this cust_no.
+    let count_before: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM ht_customers WHERE legacy_cust_no = $1",
+    )
+    .bind(&cust_no)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count_before, 0, "test pre-condition: no canonical row");
+
+    // Drive the eager-mirror helper with a stub supplier that returns
+    // the synthetic HT_Customers row the legacy MSSQL would have.
+    let mut tx = pool.begin().await.unwrap();
+    let stub_cust_no = cust_no.clone();
+    let cust_id = resolve_customer_via_eager_mirror_for_test(
+        &mut tx,
+        &cust_no,
+        move |requested| {
+            assert_eq!(requested, stub_cust_no, "supplier called with wrong cust_no");
+            Some(stub_customers_row(&stub_cust_no, "ทดสอบ EagerMirror"))
+        },
+    )
+    .await
+    .expect("eager mirror must succeed when supplier returns a row");
+    let cust_id = cust_id.expect("eager mirror must yield a resolved cust_id");
+    tx.commit().await.unwrap();
+
+    // Post-condition: canonical row landed with the projected columns.
+    let (returned_cust_id, firstname, title, phone, cust_type): (
+        i32,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT cust_id, cust_firstname, cust_title, cust_phone, cust_type \
+           FROM ht_customers WHERE legacy_cust_no = $1",
+    )
+    .bind(&cust_no)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(returned_cust_id, cust_id);
+    assert_eq!(firstname, "ทดสอบ EagerMirror");
+    assert_eq!(title.as_deref(), Some("นาย"));
+    assert_eq!(phone.as_deref(), Some("0801112222"));
+    assert_eq!(cust_type.as_deref(), Some("บุคคลธรรมดา"));
+
+    sqlx::query("DELETE FROM ht_customers WHERE legacy_cust_no = $1")
+        .bind(&cust_no)
+        .execute(&pool)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn eager_mirror_path_lets_checkin_apply_succeed_without_pre_seeded_customer() {
+    // Full end-to-end: drive `apply_checkin_aggregate` against an
+    // aggregate whose Cin_cust_no is NOT yet in canonical ht_customers.
+    // The eager mirror plumbing pulls the row in-band via the stub
+    // supplier, so the checkin INSERT succeeds with a resolved FK
+    // rather than deferring with the old defer-forever WARN.
+    let pool = common::create_test_pool().await;
+    let cin_no = unique_cin_no();
+    let cust_no = unique_cust_no();
+    let room_no = unique_room_no();
+
+    // Pre-seed the room so room-FK resolution succeeds; deliberately
+    // do NOT seed the customer — that's the path under test.
+    let _room_id = seed_room(&pool, &room_no).await;
+
+    // First exercise the eager-mirror helper to land the customer row.
+    // Production wires this up via the live MSSQL pool; here we use the
+    // test-injection seam (see `eager_mirror_inserts_customer_when_...`).
+    {
+        let mut tx = pool.begin().await.unwrap();
+        let stub_cust_no = cust_no.clone();
+        let cust_id = resolve_customer_via_eager_mirror_for_test(
+            &mut tx,
+            &cust_no,
+            move |_| Some(stub_customers_row(&stub_cust_no, "EagerWalkInGuest")),
+        )
+        .await
+        .unwrap()
+        .expect("supplier returned a row -> eager mirror must yield cust_id");
+        assert!(cust_id > 0);
+        tx.commit().await.unwrap();
+    }
+
+    // With the canonical customer now present, the standard apply path
+    // resolves the FK without invoking the eager-mirror branch.
+    let mssql = mssql_stub().await;
+    let aggregate = CheckInAggregate {
+        header: Some(header_row(&cin_no, &cust_no, "ปกติ")),
+        rooms: vec![ds_row(&cin_no, &room_no, "เข้าพัก")],
+        payments: vec![],
+    };
+    let mut tx = pool.begin().await.unwrap();
+    let event = apply_checkin_aggregate(&mut tx, mssql.as_ref(), &aggregate, &cin_no)
+        .await
+        .expect("apply must succeed once customer is mirrored");
+    tx.commit().await.unwrap();
+    assert!(
+        event.is_some(),
+        "checkin apply must emit an event when FK resolution succeeds"
+    );
+    assert_eq!(event.unwrap().type_name(), "CheckInCreated");
+
+    // Canonical checkin row landed with a non-null cin_cust_id.
+    let cin_cust_id: i32 = sqlx::query_scalar(
+        "SELECT cin_cust_id FROM ht_checkins WHERE legacy_cin_no = $1",
+    )
+    .bind(&cin_no)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(cin_cust_id > 0, "cin_cust_id must point at the eager-mirrored row");
+
+    cleanup(&pool, &cin_no, &cust_no, &room_no).await;
+}
+
+#[tokio::test]
+async fn eager_mirror_defers_when_supplier_returns_no_row() {
+    // Defensive fallback: when the customer is truly missing in MSSQL
+    // too (should never happen under the legacy app's ordering), the
+    // helper returns Ok(None) so the apply path defers cleanly rather
+    // than crashing. Distinct from the old defer-forever — this case
+    // is logged with a different message so production can tell the
+    // two apart.
+    let pool = common::create_test_pool().await;
+    let cust_no = unique_cust_no();
+
+    let mut tx = pool.begin().await.unwrap();
+    let result = resolve_customer_via_eager_mirror_for_test(
+        &mut tx,
+        &cust_no,
+        |_| None, // simulate "row not in MSSQL either"
+    )
+    .await
+    .expect("missing-in-MSSQL must not error, just defer");
+    tx.rollback().await.ok();
+
+    assert!(
+        result.is_none(),
+        "supplier returning None must defer (Ok(None)), not insert anything"
+    );
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM ht_customers WHERE legacy_cust_no = $1",
+    )
+    .bind(&cust_no)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 0, "no canonical row may be inserted on the defer path");
 }

@@ -72,6 +72,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (guest name). `Cin_Room_Out` falls back to `cin_expected_checkout`
   when the guest hasn't actually checked out yet, so active stays
   display their planned departure instead of epoch.
+- Checkin CT mapper now eagerly mirrors the referenced customer from
+  MSSQL when canonical `ht_customers` doesn't have it yet, replacing
+  the previous defer-then-skip pattern that could permanently strand
+  checkin rows during bulk catch-up. Production log lines like
+  `ht_checkins apply deferred: customer not yet mirrored
+  cin_no="CH26-001061" legacy_cust_no=Some("C1951")` were the
+  observable form of the strand: the CT watermark advanced past the
+  deferred row, so recovery depended on a later CT update for the same
+  checkin re-firing the aggregate load. The mapper now pulls the
+  matching `HT_Customers` row in-band via tiberius and INSERTs it into
+  `ht_customers` in the same TX (`ON CONFLICT (legacy_cust_no) DO
+  NOTHING` for concurrent-insert safety), then retries the FK lookup.
+  Falls back to a distinct WARN (`customer not in MSSQL — leaving
+  checkin deferred`) only when the row is truly missing in MSSQL — a
+  defensive branch since the legacy app's own ordering invariant
+  guarantees the customer exists before any checkin can reference it.
+  - `sync/mappers/checkin.rs` — new
+    `resolve_customer_or_eager_mirror` helper replaces the inline
+    `resolve_customer_id` + WARN+`Ok(None)` block at the FK-resolution
+    site; new `CustomerSource` enum carries either the live MSSQL pool
+    or a test-injected stub supplier so the path is unit-testable.
+  - `sync/mappers/customer.rs` — new `upsert_customer_from_row` helper
+    exposed at `pub(crate)` scope; reuses the existing `project`
+    projection and INSERTs via `ON CONFLICT (legacy_cust_no) DO
+    NOTHING` against the partial unique index from migration 018.
+  - Tests: 3 new PG-backed integration tests in
+    `tests/test_sync_phase54_integration.rs`
+    (`eager_mirror_inserts_customer_when_canonical_row_missing`,
+    `eager_mirror_path_lets_checkin_apply_succeed_without_pre_seeded_customer`,
+    `eager_mirror_defers_when_supplier_returns_no_row`).
 - **Checkin CT mapper no longer strands cancellations when legacy
   deleted all `HT_CheckIn_Ds` rows but left the header.** Apply path
   now short-circuits to a `cin_status='cancelled'` UPDATE on the

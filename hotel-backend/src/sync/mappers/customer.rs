@@ -50,7 +50,23 @@ use crate::sync::SyncError;
 /// CT mapper for the legacy `HT_Customers` table.
 pub struct CustomerMapper;
 
-const TABLE: &str = "HT_Customers";
+pub(crate) const TABLE: &str = "HT_Customers";
+
+/// Column list (without aliases or commas) used by the eager-mirror
+/// fetch in [`crate::sync::mappers::checkin`] when it pulls a single
+/// `HT_Customers` row by `Cust_no`. Kept here so the projection layer
+/// (see [`project`]) and the eager fetcher always reach for the same
+/// set of columns.
+pub(crate) const EAGER_FETCH_COLUMNS: &[&str] = &[
+    "Cust_no",
+    "Cust_name",
+    "Cust_perfix",
+    "Cust_IDcard",
+    "Cust_Type_Main",
+    "Cust_Email",
+    "Cust_Add_no",
+    "Cust_Add_tel",
+];
 
 /// Columns we project into the CT JOIN. Must match the field names the
 /// `apply` body reads via `try_get_str` etc.
@@ -401,6 +417,91 @@ fn build_event(
             changed_fields: Vec::new(),
         }
     }
+}
+
+/// Eager-mirror a single `HT_Customers` row into canonical `ht_customers`.
+///
+/// Used by the check-in mapper when a CT-driven checkin references a
+/// `Cust_no` that hasn't been mirrored yet — fetching the customer
+/// in-band (rather than deferring to the next CT tick on `HT_Customers`)
+/// prevents the "defer-forever" strand class of bug. See
+/// `sync::mappers::checkin::resolve_customer_or_eager_mirror`.
+///
+/// Semantics:
+/// - Projects `row` via the same shared [`project`] helper the I/U path
+///   uses, so column extraction stays consistent across both entry points.
+/// - INSERTs with `ON CONFLICT (legacy_cust_no) DO NOTHING` against the
+///   partial unique index defined in migration 018. Concurrent inserts
+///   from another tick or another aggregate apply in the same TX collapse
+///   silently to the existing row.
+/// - Sets `aggregate_id` on the freshly-inserted row in a follow-up
+///   UPDATE (matching the I/U path's pattern of deriving the UUID from
+///   the SERIAL `cust_id`).
+/// - Returns the canonical `cust_id` so the caller can resolve its FK
+///   without an extra round-trip.
+///
+/// Emits no `DomainEvent` — the caller is reconstructing a missing FK,
+/// not observing a customer-level transition. The next CT tick on
+/// `HT_Customers` (if any) will surface a normal `CustomerCreated` via
+/// the I/U path; subscribers de-dup by `aggregate_id`.
+pub(crate) async fn upsert_customer_from_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    row: &dyn MappableRow,
+) -> Result<i32, SyncError> {
+    let projected = project(row)?;
+
+    // Race-safe INSERT: another concurrent tick (or a sibling aggregate
+    // apply within the same outer TX) may have just inserted the row.
+    // `ON CONFLICT DO NOTHING` against the partial unique index on
+    // `legacy_cust_no` collapses that case to a no-op so we don't error
+    // out on the duplicate. The RETURNING clause is therefore optional
+    // (returns 0 rows on conflict), and we follow up with a SELECT to
+    // resolve the canonical `cust_id` in both branches.
+    let inserted: Option<(i32,)> = sqlx::query_as(
+        "INSERT INTO ht_customers \
+             (cust_firstname, cust_title, cust_idcard, cust_type, \
+              cust_email, cust_address, cust_phone, legacy_cust_no) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+         ON CONFLICT (legacy_cust_no) DO NOTHING \
+         RETURNING cust_id",
+    )
+    .bind(&projected.cust_name)
+    .bind(&projected.cust_title)
+    .bind(&projected.cust_idcard)
+    .bind(&projected.cust_type)
+    .bind(&projected.cust_email)
+    .bind(&projected.cust_address)
+    .bind(&projected.cust_phone)
+    .bind(&projected.cust_no)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    let cust_id = match inserted {
+        Some((id,)) => {
+            // Fresh INSERT — pin aggregate_id to the SERIAL id so
+            // subsequent subscribers can deduplicate by UUID.
+            let agg_id = aggregate_uuid(AggregateKind::Customer, id);
+            sqlx::query("UPDATE ht_customers SET aggregate_id = $1 WHERE cust_id = $2")
+                .bind(agg_id)
+                .bind(id)
+                .execute(&mut **tx)
+                .await?;
+            id
+        }
+        None => {
+            // Concurrent insert raced us — resolve the existing row by
+            // legacy_cust_no.
+            let existing: (i32,) = sqlx::query_as(
+                "SELECT cust_id FROM ht_customers WHERE legacy_cust_no = $1 LIMIT 1",
+            )
+            .bind(&projected.cust_no)
+            .fetch_one(&mut **tx)
+            .await?;
+            existing.0
+        }
+    };
+
+    Ok(cust_id)
 }
 
 #[cfg(test)]
