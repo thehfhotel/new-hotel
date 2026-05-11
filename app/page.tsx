@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   Loader2,
   AlertCircle,
@@ -12,6 +12,27 @@ import { useBranch, BRANCH_LABELS } from '@/contexts/BranchContext'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import CheckInModal from '@/components/CheckInModal'
 import CheckOutModal from '@/components/CheckOutModal'
+
+// Domain-event variants that mutate the dashboard's tile counts or room grid.
+// Names match `DomainEvent::type_name()` in
+// `hotel-backend/src/outbox/event.rs` — keep in sync. Payment / customer
+// events deliberately omitted: they don't shift the room-status grid or
+// occupancy counters.
+const DASHBOARD_REFRESH_EVENTS = [
+  'RoomMarkedClean',
+  'RoomMarkedDirty',
+  'CheckInCreated',
+  'CheckOutCompleted',
+  'CheckInCancelled',
+  'BookingCreated',
+  'BookingModified',
+  'BookingCancelled',
+] as const
+
+// Debounce window for batched refetches. A full booking aggregate can emit
+// 5+ events back-to-back (one per night); 500ms lets the burst collapse to
+// one fetch without making the dashboard feel stale.
+const REFETCH_DEBOUNCE_MS = 500
 
 interface Stats {
   totalRooms: number
@@ -110,6 +131,13 @@ export default function NewDashboard() {
   const [roomIdByNo, setRoomIdByNo] = useState<Map<string, number>>(new Map())
   const [showCheckIn, setShowCheckIn] = useState(false)
   const [showCheckOut, setShowCheckOut] = useState(false)
+  // SSE connection status — drives the tiny header dot. Starts pessimistic
+  // so the dot reads "reconnecting" until the EventSource fires `onopen`.
+  const [isLiveConnected, setIsLiveConnected] = useState(false)
+  // Refs hold the latest fetchData and a debounce timer so the SSE effect
+  // can stay stable across renders without re-subscribing on every fetch.
+  const fetchDataRef = useRef<() => void>(() => {})
+  const refetchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // One-shot lookup of PG room ids — needed to drive the check-in/out
   // modals (which require integer room_id, while /api/rooms only exposes
@@ -197,6 +225,48 @@ export default function NewDashboard() {
     fetchData()
   }, [fetchData])
 
+  // Keep the SSE effect decoupled from `fetchData`'s identity — otherwise
+  // every re-render would tear down and rebuild the EventSource.
+  useEffect(() => {
+    fetchDataRef.current = fetchData
+  }, [fetchData])
+
+  // Live updates: subscribe to /api/events and trigger a debounced refetch
+  // whenever a dashboard-relevant DomainEvent arrives. Also refetch when the
+  // tab regains visibility (covers laptop sleep / dropped SSE / etc.).
+  useEffect(() => {
+    const scheduleRefetch = () => {
+      if (refetchTimerRef.current) clearTimeout(refetchTimerRef.current)
+      refetchTimerRef.current = setTimeout(() => {
+        fetchDataRef.current()
+      }, REFETCH_DEBOUNCE_MS)
+    }
+
+    const eventSource = new EventSource(`/api/events?branch=${encodeURIComponent(branch)}`)
+    eventSource.onopen = () => setIsLiveConnected(true)
+    eventSource.onerror = () => setIsLiveConnected(false)
+    for (const eventName of DASHBOARD_REFRESH_EVENTS) {
+      eventSource.addEventListener(eventName, scheduleRefetch)
+    }
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        fetchDataRef.current()
+      }
+    }
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+      if (refetchTimerRef.current) {
+        clearTimeout(refetchTimerRef.current)
+        refetchTimerRef.current = null
+      }
+      eventSource.close()
+      setIsLiveConnected(false)
+    }
+  }, [branch])
+
   const roomMap = new Map<string, Room>()
   rooms.forEach(r => roomMap.set(r.roomNumber.toUpperCase(), r))
 
@@ -230,11 +300,20 @@ export default function NewDashboard() {
             </span>
           )}
         </div>
-        <p className="text-textMuted text-[11px]">
-          อัปเดตล่าสุด: {new Date().toLocaleDateString('th-TH', {
-            year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit',
-          })}
-        </p>
+        <div className="flex items-center gap-2">
+          {/* Live SSE indicator — green when connected, gray while
+              reconnecting. Tiny on purpose so it stays informational. */}
+          <span
+            className={`w-1.5 h-1.5 rounded-full ${isLiveConnected ? 'bg-success' : 'bg-textMuted'}`}
+            title={isLiveConnected ? 'อัปเดตอัตโนมัติ: เชื่อมต่ออยู่' : 'อัปเดตอัตโนมัติ: กำลังเชื่อมต่อ'}
+            aria-label={isLiveConnected ? 'Live updates connected' : 'Live updates reconnecting'}
+          />
+          <p className="text-textMuted text-[11px]">
+            อัปเดตล่าสุด: {new Date().toLocaleDateString('th-TH', {
+              year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit',
+            })}
+          </p>
+        </div>
       </div>
 
       {error && (

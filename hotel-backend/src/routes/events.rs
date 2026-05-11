@@ -20,9 +20,22 @@
 //! `EventSource.addEventListener("BookingCreated", ...)` without parsing the
 //! payload.
 //!
+//! ## Branch routing
+//!
+//! Each branch has its own PostgreSQL database with an independent
+//! `domain_events` channel. The optional `?branch=` query param selects:
+//!
+//! - `hfhotel` (default, also `branch` unset) — listen on `state.new_pool`
+//! - `hfville` — listen on `state.ville_pool()`
+//! - `all` — multiplex BOTH pools through one stream
+//!
+//! If `ville_pool()` is unavailable (Ville disabled at startup) for `hfville`
+//! or `all`, we degrade to hfhotel-only and emit a tracing warning rather
+//! than failing the SSE connection.
+//!
 //! ## Connection lifecycle
 //!
-//! - One dedicated `PgListener` per client. `LISTEN` holds a Postgres
+//! - One dedicated `PgListener` per pool per client. `LISTEN` holds a Postgres
 //!   connection for the life of the stream — we deliberately do NOT share
 //!   one listener across clients, so a slow consumer can't backpressure
 //!   others.
@@ -35,8 +48,8 @@
 //!
 //! ## Error handling
 //!
-//! - Failure to open the listener returns HTTP 500 before the stream starts
-//!   (handled in [`stream`]).
+//! - Failure to open the primary listener emits a one-shot comment and ends
+//!   the stream so the browser's `EventSource` auto-reconnects.
 //! - A malformed payload from PG is logged and skipped — we do NOT kill the
 //!   stream, since one bad event shouldn't sever every browser. Subscribers
 //!   reconcile via `event_log` on reconnect (see architecture §3.6e).
@@ -47,14 +60,15 @@
 use std::{convert::Infallible, time::Duration};
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     response::sse::{Event, KeepAlive, Sse},
 };
 use futures_util::Stream;
+use serde::Deserialize;
 use sqlx::postgres::PgListener;
 
 use crate::outbox::event::DomainEvent;
-use crate::routes::mode::AppState;
+use crate::routes::mode::{AppState, Branch};
 
 /// SSE channel name. Must match the literal used by
 /// [`crate::outbox::bus::EventBus::publish`].
@@ -65,6 +79,13 @@ const DOMAIN_EVENTS_CHANNEL: &str = "domain_events";
 /// nginx/Cloudflare defaults).
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Query string for the SSE endpoint. `branch` is optional so existing
+/// callers (no query string) keep their hfhotel-only behavior.
+#[derive(Debug, Deserialize, Default)]
+pub struct EventStreamQuery {
+    pub branch: Option<Branch>,
+}
+
 /// `GET /api/events` — long-lived SSE stream of every [`DomainEvent`]
 /// published since the connection opened.
 ///
@@ -74,31 +95,62 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// auto-reconnect.
 pub async fn stream(
     State(state): State<AppState>,
+    Query(query): Query<EventStreamQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let pool = state.new_pool.clone();
+    let branch = query.branch.unwrap_or_default();
+    let (primary_pool, secondary_pool) = resolve_pools(&state, branch);
 
-    // We can't use `?` here because the function returns `Sse<...>`, not a
-    // `Result`. Build the listener up-front so that channel-listen failures
-    // surface in the logs immediately, then move ownership into the stream.
-    let listener_result = open_domain_events_listener(&pool).await;
+    // Build the listener(s) up front so channel-listen failures surface in
+    // the logs immediately, then move ownership into the stream.
+    let primary_listener_result = open_domain_events_listener(&primary_pool).await;
+    let secondary_listener_result = match secondary_pool {
+        Some(pool) => Some(open_domain_events_listener(&pool).await),
+        None => None,
+    };
 
     let event_stream = async_stream::stream! {
-        let mut listener = match listener_result {
+        let mut primary_listener = match primary_listener_result {
             Ok(listener) => listener,
             Err(err) => {
                 tracing::error!(
                     error = %err,
                     "Failed to open PgListener for {DOMAIN_EVENTS_CHANNEL}; closing SSE stream",
                 );
-                // Surface the failure to the client as a one-shot comment so
-                // the browser logs something useful, then end the stream.
                 yield Ok(Event::default().comment("listener-open-failed"));
                 return;
             }
         };
 
+        // Secondary listener is only present for `Branch::All`. If opening it
+        // failed, degrade gracefully to single-pool streaming rather than
+        // killing the connection.
+        let mut secondary_listener: Option<PgListener> = match secondary_listener_result {
+            Some(Ok(listener)) => Some(listener),
+            Some(Err(err)) => {
+                tracing::warn!(
+                    error = %err,
+                    "Failed to open secondary PgListener for branch=all; degrading to primary-only",
+                );
+                None
+            }
+            None => None,
+        };
+
         loop {
-            match listener.recv().await {
+            // When we have two listeners, race them with `select!` and
+            // forward whichever fires first. The single-listener branch
+            // (default) stays on the simple `.recv().await` path.
+            let notification_result = match secondary_listener.as_mut() {
+                Some(secondary) => {
+                    tokio::select! {
+                        result = primary_listener.recv() => result,
+                        result = secondary.recv() => result,
+                    }
+                }
+                None => primary_listener.recv().await,
+            };
+
+            match notification_result {
                 Ok(notification) => {
                     let payload = notification.payload();
                     match serde_json::from_str::<DomainEvent>(payload) {
@@ -139,6 +191,43 @@ pub async fn stream(
             .interval(KEEPALIVE_INTERVAL)
             .text("ping"),
     )
+}
+
+/// Pick which PG pool(s) this SSE connection should listen on, based on the
+/// `branch` query param.
+///
+/// Returns `(primary, Option<secondary>)`. `secondary` is only `Some` for
+/// `Branch::All` when the Ville pool is available — in that case the caller
+/// opens two listeners and multiplexes them.
+///
+/// `Branch::Hfville` with no Ville pool falls back to `new_pool` with a
+/// tracing warning rather than 500-ing, matching the contract documented in
+/// the module preamble.
+fn resolve_pools(
+    state: &AppState,
+    branch: Branch,
+) -> (crate::db::PgPool, Option<crate::db::PgPool>) {
+    match branch {
+        Branch::Hfhotel => (state.new_pool.clone(), None),
+        Branch::Hfville => match state.ville_pool.as_ref() {
+            Some(pool) => (pool.clone(), None),
+            None => {
+                tracing::warn!(
+                    "SSE branch=hfville requested but ville_pool unavailable; falling back to hfhotel"
+                );
+                (state.new_pool.clone(), None)
+            }
+        },
+        Branch::All => match state.ville_pool.as_ref() {
+            Some(ville) => (state.new_pool.clone(), Some(ville.clone())),
+            None => {
+                tracing::warn!(
+                    "SSE branch=all requested but ville_pool unavailable; falling back to hfhotel-only"
+                );
+                (state.new_pool.clone(), None)
+            }
+        },
+    }
 }
 
 /// Acquire a dedicated `PgListener` from the shared pool and subscribe to

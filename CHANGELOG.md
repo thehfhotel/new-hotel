@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.63.0] - 2026-05-11
 
+### Added
+
+- **Dashboard live updates via Server-Sent Events** — the receptionist
+  homepage (`app/page.tsx`) now subscribes to `/api/events` and refetches
+  stats/rooms/checkins automatically whenever a relevant `DomainEvent`
+  arrives (`RoomMarkedClean`/`RoomMarkedDirty`, `CheckInCreated`/
+  `CheckOutCompleted`/`CheckInCancelled`, `BookingCreated`/
+  `BookingModified`/`BookingCancelled`). No more manual reloads after a
+  booking or housekeeping flip. A 500ms debounce collapses event bursts
+  (e.g. multi-night booking aggregates) into a single refetch, and a
+  `visibilitychange` listener forces a refresh when the tab regains focus
+  (covers laptop sleep / dropped SSE). A tiny dot in the page header
+  shows live-connection status (green = connected, gray = reconnecting).
+- **`/api/events` is now branch-aware** — `routes/events.rs` accepts
+  `?branch=hfhotel|hfville|all`. HF Hotel uses `state.new_pool` (default,
+  unchanged for existing callers), HF Ville switches to `state.ville_pool`,
+  and `all` opens TWO `PgListener`s and multiplexes both `domain_events`
+  channels through a single SSE stream via `tokio::select!`. If
+  `ville_pool` is unavailable, the endpoint degrades to hfhotel-only with
+  a tracing warning rather than 500-ing the connection. Previously Ville
+  receptionists never saw live updates because their `domain_events`
+  channel lives on a different PG database.
+
 ### Fixed
 
 - **Dashboard occupancy/checkin counts no longer stale** — `/api/stats`
