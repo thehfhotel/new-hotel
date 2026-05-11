@@ -49,6 +49,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Calendar route `/api/rooms/status` migrated off demoted legacy
+  mirrors** — `routes/rooms.rs::get_room_status_pg` (the per-room-per-date
+  calendar) was the last reader still hitting `ht_rooms_legacy`,
+  `ht_checkins_legacy`, and `ht_bookings_legacy`, all of which stopped
+  receiving row-level updates after the Phase 5.5 cutover on 2026-04-28
+  (deferred from the v2.63.0 dashboard fix family because of its
+  cross-join + `generate_series` + double-LEFT-JOIN shape). Rewritten
+  against canonical `ht_rooms_new` (filtered `room_active = true`) +
+  `ht_room_types` (for `type_name`) + `ht_checkins` (joined on the
+  `cin_room_id` FK rather than the legacy `cin_room_no` string, with
+  occupancy window `[cin_checkin_time, COALESCE(cin_checkout_time,
+  cin_expected_checkout))` and `cin_status IN ('active','checkedout')`)
+  + `ht_bookings` via `ht_booking_rooms.br_room_id` (window
+  `[book_checkin, book_checkout)`, `book_status IN ('confirmed',
+  'pending','checkedin')`). Checkin still takes precedence over an
+  overlapping booking — the booking LEFT JOIN carries the
+  `ci.cin_id IS NULL` guard. Response shape unchanged
+  (`room_no`/`room_date`/`room_status`/`room_details`/`room_checkin_no`/
+  `room_type`), with the legacy `cin_checkin_no` field now sourced from
+  the canonical `cin_no` column.
 - **Dashboard occupancy/checkin counts no longer stale** — `/api/stats`
   and `/api/rooms` now read canonical PG tables (`ht_rooms_new`,
   `ht_checkins`, `ht_bookings`, `ht_customers`) instead of the demoted

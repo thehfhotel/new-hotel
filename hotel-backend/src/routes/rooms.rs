@@ -5,13 +5,12 @@
 //! - GET /api/rooms/status - Get room status history (calendar)
 //! - GET /api/rooms/checkouts-today - Get rooms with checkout today
 //!
-//! `list_rooms`, `get_room`, and `get_checkouts_today` read from the
-//! canonical PG tables (`ht_rooms_new`, `ht_checkins`, `ht_bookings`,
+//! All read paths use the canonical PG tables (`ht_rooms_new`,
+//! `ht_checkins`, `ht_bookings`, `ht_booking_rooms`, `ht_room_types`,
 //! `ht_customers`). Previously read `ht_*_legacy` mirrors which stopped
 //! receiving row-level updates after the Phase 5.5 cutover on 2026-04-28.
-//!
-//! `get_room_status_pg` (calendar) is intentionally left on the legacy
-//! mirror tables for now — separate follow-up to migrate that route.
+//! The calendar route (`get_room_status_pg`) was the final holdout and
+//! was migrated alongside the v2.63.0 dashboard fix family.
 
 use axum::{
     extract::{Path, Query, State},
@@ -236,11 +235,27 @@ async fn get_checkouts_today_pg(pool: &crate::db::PgPool) -> ApiResult<Vec<Strin
     Ok(room_numbers)
 }
 
-/// Get room status from PostgreSQL (PG mirror tables).
+/// Get room status calendar from canonical PG tables.
 ///
-/// NOTE: This route still reads the legacy mirror tables. Tracked as
-/// a separate follow-up — migrating the calendar query requires
-/// careful date-range handling and isn't in scope for the dashboard fix.
+/// Generates a per-room-per-date matrix between `start_date` and `end_date`
+/// (inclusive) and reports one of `'เข้าพัก'` (occupied checkin),
+/// `'จอง'` (active booking, no overriding checkin), or `'ว่าง'` (vacant).
+///
+/// Sources:
+/// - `ht_rooms_new` filtered to `room_active = true` — active inventory only
+/// - `ht_room_types` for the displayed `room_type` (`type_name`)
+/// - `ht_checkins` joined on `cin_room_id` (canonical FK, not the legacy
+///   string `cin_room_no`). Occupancy window is
+///   `[cin_checkin_time::date, COALESCE(cin_checkout_time::date, cin_expected_checkout))`.
+///   Restricted to non-cancelled rows (`cin_status IN ('active','checkedout')`).
+/// - `ht_bookings` joined via `ht_booking_rooms` on `br_room_id`. Reservation
+///   window is `[book_checkin, book_checkout)`. Restricted to
+///   `book_status IN ('confirmed','pending','checkedin')`. Checkin takes
+///   precedence (`ci.cin_id IS NULL` guard on the booking LEFT JOIN).
+///
+/// Output shape (`room_no`, `room_date`, `room_status`, `room_details`,
+/// `room_checkin_no`, `room_type`) preserved verbatim for the calendar UI.
+/// The legacy `cin_checkin_no` column maps to canonical `cin_no`.
 async fn get_room_status_pg(
     pool: &crate::db::PgPool,
     params: &RoomStatusQuery,
@@ -259,24 +274,29 @@ async fn get_room_status_pg(
             d.dt::timestamp AS room_date,
             CASE
                 WHEN ci.cin_no IS NOT NULL THEN 'เข้าพัก'
-                WHEN bl.book_no IS NOT NULL THEN 'จอง'
+                WHEN b.book_no IS NOT NULL THEN 'จอง'
                 ELSE 'ว่าง'
             END AS room_status,
-            COALESCE(r.room_details, '') AS room_details,
-            ci.cin_checkin_no AS room_checkin_no,
-            r.room_type
-        FROM ht_rooms_legacy r
+            COALESCE(r.room_notes, '') AS room_details,
+            ci.cin_no AS room_checkin_no,
+            COALESCE(rt.type_name, '') AS room_type
+        FROM ht_rooms_new r
+        LEFT JOIN ht_room_types rt ON rt.type_id = r.room_type_id
         CROSS JOIN generate_series($1::date, $2::date, '1 day'::interval) AS d(dt)
-        LEFT JOIN ht_checkins_legacy ci
-            ON ci.cin_room_no = r.room_no
-            AND d.dt::date >= ci.cin_room_in::date
-            AND d.dt::date < ci.cin_room_out::date
-        LEFT JOIN ht_bookings_legacy bl
-            ON bl.book_room_no = r.room_no
-            AND d.dt::date >= bl.book_date_in::date
-            AND d.dt::date < bl.book_date_out::date
-            AND bl.book_status = 1
-            AND ci.cin_no IS NULL
+        LEFT JOIN ht_checkins ci
+            ON ci.cin_room_id = r.room_id
+            AND ci.cin_status IN ('active', 'checkedout')
+            AND d.dt::date >= ci.cin_checkin_time::date
+            AND d.dt::date < COALESCE(ci.cin_checkout_time::date, ci.cin_expected_checkout)
+        LEFT JOIN ht_booking_rooms br
+            ON br.br_room_id = r.room_id
+            AND ci.cin_id IS NULL
+        LEFT JOIN ht_bookings b
+            ON b.book_id = br.br_book_id
+            AND b.book_status IN ('confirmed', 'pending', 'checkedin')
+            AND d.dt::date >= b.book_checkin
+            AND d.dt::date < b.book_checkout
+        WHERE r.room_active = true
         ORDER BY r.room_no, d.dt
         "#,
     )
@@ -376,9 +396,10 @@ pub struct RoomStatusQuery {
     pub branch: Option<Branch>,
 }
 
-/// GET /api/rooms/status - Get room status history
+/// GET /api/rooms/status - Get room status history (calendar)
 ///
-/// NOTE: Still reads legacy mirror tables — separate follow-up to migrate.
+/// Reads from canonical PG tables (`ht_rooms_new` + `ht_room_types` +
+/// `ht_checkins` + `ht_bookings` + `ht_booking_rooms`).
 pub async fn get_room_status(
     State(state): State<AppState>,
     Query(params): Query<RoomStatusQuery>,
