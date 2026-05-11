@@ -46,14 +46,25 @@ The `.md` analysis docs in this directory's parent are FACTS DERIVED from
 those artifacts (table layouts, write sequences, business rules) and don't
 themselves contain vendor code.
 
-## Git history concern (public-flip blocker)
+## Git history status (public-flip context)
 
-Prior commit history of this repo contained `legacy-reference/` with all the
-above binaries. The working tree was cleaned in commit `9cfc8ac` (2026-05-05,
-"chore(legal): drop legacy-reference/") but **the binaries remain reachable
-through git pack objects**. Verified 2026-05-11:
+`legacy-reference/` was originally committed to this repo with the binaries
+listed above. The history has since been **rewritten** to drop them:
 
-| Path in git history | Size |
+- **`9cfc8ac` (2026-05-05)** — working-tree deletion (commit message
+  acknowledged the history-rewrite todo)
+- **Phase 6.5 history rewrite (2026-05-10)** — `git filter-repo` rewrite of
+  master from `c44b7c7` → `c6a82e1`. Dropped `legacy-reference/` (466 files /
+  ~26 MB) from all of history; also scrubbed rotated secrets. Force-pushed.
+  Local repo size 31 MB → 14 MB after re-clone.
+
+**Remaining blocker for public flip**: the safety tag
+`pre-history-rewrite-2026-05-10` on origin still points at `c44b7c7` (the
+pre-rewrite head). That tag keeps the old `legacy-reference/binaries/*`
+blobs reachable in pack objects. Verified 2026-05-11 — large blobs reachable
+only via this tag:
+
+| Path | Size |
 |---|---|
 | `legacy-reference/binaries/HOTEL.exe` | 7.0 MB |
 | `legacy-reference/binaries/HOTEL-cleaned.exe` | 6.2 MB |
@@ -61,11 +72,12 @@ through git pack objects**. Verified 2026-05-11:
 | `legacy-reference/vendor/DevComponents.DotNetBar2.dll` | 3.5 MB |
 | `legacy-reference/vendor/Microsoft.Office.Interop.Excel.dll` | 1.1 MB |
 
-A `git clone` of this repo today still downloads these. **History rewrite is
-required before public-flip.** The `9cfc8ac` commit message acknowledges this
-("sanitize during the eventual git history rewrite step, separate, closer to
-public flip"); per the [public-flip plan](../../public-flip-plan) it's
-Phase 5+ work.
+When the rewrite is ratified (no rollback needed within the agreed window),
+delete the tag locally + on origin and run `git gc --aggressive --prune=now`
+to drop the unreachable blobs. After that, a fresh `git clone` will not see
+any vendor binaries in pack history. Mirror copy at
+`~/backup/new-hotel-pre-rewrite-2026-05-10.git` (31 MB) keeps offline access
+for true emergencies.
 
 ## Reproducibility
 

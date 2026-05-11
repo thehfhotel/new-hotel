@@ -14,6 +14,7 @@ Summary:
 
 **Companion docs:**
 - `docs/legacy-spike/findings.md` — validated SQL recipes for every writeback flow. Don't re-derive.
+- `docs/legacy-app/` — iHOTEL coexistence reference (`COMPAT_CHEATSHEET.md`, `FEATURE_MAP.md`, `REPORTS_INVENTORY.md`, `SCHEMA.sql`) derived from the legal de4dot+ilspycmd decompile. Authoritative when canonical PG state and iHOTEL displays disagree. The off-repo vendor binaries live on evergreen — see `docs/legacy-app/EVERGREEN_ARTIFACTS.md`.
 
 ## Versioning & Changelog Policy
 
@@ -51,7 +52,8 @@ Summary:
    - Running tests
    - Building Docker images (frontend + backend)
    - Pushing to GitHub Container Registry (ghcr.io/thehfhotel/*)
-   - Deploying to production server via self-hosted runner
+   - Deploying to production server via cloudflared SSH from a GH-hosted runner
+     (Phase 1 modernization, v2.57.x — self-hosted runner has been retired)
 
 4. **To deploy**: Simply `git push` to master - the pipeline handles everything automatically
 
