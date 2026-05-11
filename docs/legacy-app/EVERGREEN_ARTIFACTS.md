@@ -1,0 +1,106 @@
+# Evergreen Off-Repo Artifacts
+
+Pointer to the full iHOTEL2025 working folder + reverse-engineering artifacts
+that live on `evergreen` and are deliberately NOT in this repo. The analytical
+output (the `.md` files in this directory) is what's in git; the raw vendor
+binaries and the full decompile that produced them stay off-repo for IP
+safety.
+
+## Location
+
+```
+evergreen:/home/nut/new-hotel/legacy/
+├── README.md                    ← inventory + how to resume
+└── Hotel-2018- V.1.45/          ← exact mirror of the dev-machine working folder
+    ├── HOTEL.exe                Original obfuscated .NET Reactor binary
+    ├── HOTEL-cleaned.exe        de4dot output (de-obfuscated)
+    ├── HOTEL.pdb                Debug symbols (the reason decompile is so clean)
+    ├── *.dll, *.rpt             Vendor DLLs (DotNetBar, C1FlexGrid, etc.) + Crystal Reports
+    ├── _decompiled/             Initial ilspycmd output (obfuscated)
+    ├── _decompiled_clean/       Cleaned ilspycmd output + analysis docs (source for this directory)
+    ├── _reference/              Buildable .csproj reference codebase
+    ├── _de4dot_src/             Patched de4dot source (already built)
+    └── ProgramManage/           Microsoft installers (freely redistributable — SQL Server 2005, CRRedist)
+```
+
+Total size: ~165 MB after MS-installer cleanup (was 302 MB pre-cleanup;
+`ProgramManage/` + `CRRedist2008_x86.msi` were removed on 2026-05-11 since
+they're freely downloadable from Microsoft).
+
+## Why off-repo
+
+Three layers of IP risk if these are committed to a repo that goes public:
+
+1. **HOTEL.exe / HOTEL.pdb / HOTEL-cleaned.exe** — proprietary build of the
+   commercial iHOTEL2025 product. Distributing decompiled-or-not violates the
+   vendor's EULA.
+2. **Vendor DLLs** — `DevComponents.DotNetBar2.dll` (commercial UI library),
+   `C1.Win.C1FlexGrid` (commercial grid), `Microsoft.Office.Interop.Excel`,
+   `KPThaiNationalIDCard.dll`. Each has its own redistribution rules; we
+   don't have the right to ship them.
+3. **Decompiled source** (`_decompiled*/`, `_reference/`) — same EULA
+   concern as the binary; even cleaned-up `de4dot` output is a derivative
+   work.
+
+The `.md` analysis docs in this directory's parent are FACTS DERIVED from
+those artifacts (table layouts, write sequences, business rules) and don't
+themselves contain vendor code.
+
+## Git history concern (public-flip blocker)
+
+Prior commit history of this repo contained `legacy-reference/` with all the
+above binaries. The working tree was cleaned in commit `9cfc8ac` (2026-05-05,
+"chore(legal): drop legacy-reference/") but **the binaries remain reachable
+through git pack objects**. Verified 2026-05-11:
+
+| Path in git history | Size |
+|---|---|
+| `legacy-reference/binaries/HOTEL.exe` | 7.0 MB |
+| `legacy-reference/binaries/HOTEL-cleaned.exe` | 6.2 MB |
+| `legacy-reference/binaries/HOTEL.pdb` | 2.1 MB |
+| `legacy-reference/vendor/DevComponents.DotNetBar2.dll` | 3.5 MB |
+| `legacy-reference/vendor/Microsoft.Office.Interop.Excel.dll` | 1.1 MB |
+
+A `git clone` of this repo today still downloads these. **History rewrite is
+required before public-flip.** The `9cfc8ac` commit message acknowledges this
+("sanitize during the eventual git history rewrite step, separate, closer to
+public flip"); per the [public-flip plan](../../public-flip-plan) it's
+Phase 5+ work.
+
+## Reproducibility
+
+If you need to re-derive any of the analysis docs:
+
+```bash
+ssh evergreen
+cd '/home/nut/new-hotel/legacy/Hotel-2018- V.1.45'
+# Reference codebase is buildable:
+cd _reference && dotnet build
+# Decompile from scratch:
+ilspycmd HOTEL-cleaned.exe -o /tmp/new-decompile
+```
+
+The full Claude Code conversation that produced the original analysis
+(including all the reasoning) is also preserved on evergreen at:
+
+```
+evergreen:/home/nut/.claude/projects/-home-nut-new-hotel-legacy/
+├── e9d17934-01ce-4288-a34b-91f4411acef4.jsonl  ← main session (1.8 MB)
+├── 962526a1-561e-45a7-8d5e-719ea4ce2b62.jsonl  (148 KB)
+├── fae3ac60-4a41-4519-8f0c-b74768655e92.jsonl  (1.8 KB)
+└── memory/                                      ← MEMORY.md + project notes
+```
+
+To resume the session on evergreen: `cd /home/nut/new-hotel/legacy && claude --resume`.
+
+## Risk: single-host loss
+
+The artifacts above exist on exactly one machine (`evergreen`). A disk failure
+or filesystem corruption today loses the entire 165 MB of analysis work —
+including the JSONL transcripts that document the reasoning. Off-host
+encrypted backup to cold storage (S3, NAS, etc.) is recommended but **not
+yet implemented** as of 2026-05-11. Mitigations to revisit:
+
+- Encrypted tarball pushed to an S3 bucket on a different account
+- Synced copy on a NAS in a different physical location
+- Periodic `restic` snapshots to B2 / Backblaze

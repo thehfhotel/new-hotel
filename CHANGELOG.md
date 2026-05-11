@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`docs/legacy-app/` — iHOTEL coexistence reference restored to repo.** Five
+  analysis docs derived from the legal `de4dot` + `ilspycmd` decompile of the
+  production `HOTEL.exe` (~210 KB total): `COMPAT_CHEATSHEET.md` (1900-line
+  per-table contract with cascade catalog), `FEATURE_MAP.md` (UI-screen →
+  tables map), `REPORTS_INVENTORY.md` (Crystal Report catalog), `SCHEMA.sql`
+  (live schema dump), `OBFUSCATOR_STUBS_REMOVED.md` (de4dot cleanup notes).
+  Previously committed as `legacy-reference/` and removed in `9cfc8ac`
+  alongside the vendor binaries — but the analysis-only docs are ours,
+  contain no vendor code, and are critical for resolving discrepancies
+  between canonical PG state and what iHOTEL displays to receptionists.
+- **`docs/legacy-app/EVERGREEN_ARTIFACTS.md`** — pointer to the off-repo
+  vendor binaries + full decompile at `evergreen:/home/nut/new-hotel/legacy/`.
+  Documents the public-flip blocker: `9cfc8ac` removed the working-tree
+  copy but the vendor binaries (HOTEL.exe, vendor DLLs, Crystal Reports)
+  are still reachable through git pack objects; history rewrite is required
+  before going public. Also notes the single-host-loss risk and recommended
+  off-host backup mitigations (not yet implemented).
 - **Dashboard live updates via Server-Sent Events** — the receptionist
   homepage (`app/page.tsx`) now subscribes to `/api/events` and refetches
   stats/rooms/checkins automatically whenever a relevant `DomainEvent`
