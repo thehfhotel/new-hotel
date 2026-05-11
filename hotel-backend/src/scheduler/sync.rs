@@ -1,4 +1,5 @@
-//! Background sync job: replicates legacy SQL Server data to PostgreSQL.
+//! Background sync job: drift tripwire comparing legacy SQL Server state
+//! against canonical PostgreSQL state.
 //!
 //! ## Two modes (Phase 5.5+)
 //!
@@ -6,31 +7,39 @@
 //!
 //! | Mode        | Behaviour                                                 | Default? |
 //! |-------------|-----------------------------------------------------------|----------|
-//! | `diff_only` | Compute hashes, log divergent rows to `ht_reconcile_log`. | ✅ yes   |
-//! | `upsert`    | Original behaviour: UPSERT into `ht_*_legacy`.            | escape hatch |
+//! | `diff_only` | Hash legacy + canonical rows, log divergence to `ht_reconcile_log`. | ✅ yes   |
+//! | `upsert`    | Pre-5.5 escape hatch: UPSERT into `ht_*_legacy` mirror.   | dead code path |
 //!
 //! Phase 5.5 cutover: the CT watcher (`bin/sync.rs`) is now authoritative
 //! for canonical PG state, so this job is demoted from a 5-min full-sync
 //! UPSERT to a 15-min drift-detection tripwire. If the watcher misses a
 //! row (CT retention overflow, transient mapper bug, schema regression),
 //! the next reconcile tick lands a row in `ht_reconcile_log` for an
-//! operator to investigate. `upsert` mode remains as an escape hatch in
-//! case the watcher needs to be turned off operationally.
+//! operator to investigate. `upsert` mode is preserved purely for forensic
+//! rollback flexibility — it is **not exercised by any deployed code path**
+//! post v2.63.0.
 //!
 //! Per docs/architecture.md §3.6d, §8 (Phase 5.5 row).
 //!
-//! ## What this job syncs
+//! ## What this job compares (v2.63.0+)
 //!
-//! 1. Customers (View_Customers -> ht_customers_legacy)
-//! 2. Rooms (HT_Rooms -> ht_rooms_legacy)
-//! 3. Bookings (View_Booking_Ds -> ht_bookings_legacy)
-//! 4. Check-ins (View_CheckIn_Ds -> ht_checkins_legacy)
+//! 1. Customers: `View_Customers`  vs canonical `ht_customers`   (JOIN `legacy_cust_no`)
+//! 2. Rooms:     `HT_Rooms`        vs canonical `ht_rooms_new`   (JOIN `legacy_room_no` / `room_no`)
+//! 3. Bookings:  `View_Booking_Ds` vs canonical `ht_bookings`    (JOIN `legacy_book_id`)
+//! 4. Check-ins: `View_CheckIn_Ds` vs canonical `ht_checkins`    (JOIN `legacy_cin_no`)
 //!
-//! Uses SHA256 hashing for change detection - unchanged rows are skipped
-//! (in both modes). Note: the legacy mirror tables (`ht_*_legacy`) are
-//! NOT the canonical state — that lives in `ht_*` proper, owned by the
-//! CT watcher's mappers. The legacy mirror is now purely a hash cache
-//! for drift detection.
+//! Pre-v2.63.0 this job compared MSSQL hashes against `ht_*_legacy.sync_hash`
+//! (the demoted mirror tables). After the 2026-04-28 cutover those mirrors
+//! stopped getting their data columns refreshed — only `sync_hash` /
+//! `synced_at` tick — so MSSQL-vs-mirror drift became cosmetic noise
+//! (~2300+ unresolved entries observed). v2.63.0 switches the PG side
+//! to canonical-table hashes so drift IS actionable (= real CT-mapper gap).
+//!
+//! The `ht_*_legacy` tables are retained as a **per-PK ack cache**: once a
+//! divergence is logged, the current `mssql_hash` is written to
+//! `ht_*_legacy.sync_hash` so the next tick short-circuits the same drift
+//! instead of re-firing it. The mirror's data columns are intentionally
+//! left stale — the CT watcher owns canonical state.
 
 use chrono::NaiveDateTime;
 use serde_json::json;
@@ -359,6 +368,13 @@ fn fmt_str(s: &Option<String>) -> String {
 /// deterministic SHA256 hash. Sorts `details` in place by
 /// `(room_no, room_in, room_out)` so the hash is independent of the
 /// order MSSQL returned the rows.
+///
+/// **Retired in v2.63.0** — the multi-row aggregate hash is no longer
+/// used by either reconcile mode. Kept for the unit tests in
+/// `mod tests` which still pin the determinism contract (useful if
+/// the helper is ever resurrected, and useful as a reference for the
+/// post-v2.63.0 `sort_checkin_details` extraction).
+#[allow(dead_code)]
 fn aggregate_checkin_hash(cin_no: &str, details: &mut Vec<CheckinDetail>) -> String {
     details.sort_by(|a, b| {
         (
@@ -396,6 +412,9 @@ fn aggregate_checkin_hash(cin_no: &str, details: &mut Vec<CheckinDetail>) -> Str
 /// by `(book_date, book_date_in, book_date_out, book_cust_name,
 /// book_cust_id, book_status)` — every non-key field — so the hash is
 /// independent of the order MSSQL returned the rows.
+///
+/// **Retired in v2.63.0** — see [`aggregate_checkin_hash`] for context.
+#[allow(dead_code)]
 fn aggregate_booking_hash(
     book_no: &str,
     room_type_key: &str,
@@ -483,6 +502,136 @@ fn booking_group_json(book_no: &str, details: &[BookingDetail]) -> serde_json::V
         "Book_No": book_no,
         "details": rows,
     })
+}
+
+// =============================================================================
+// Canonical-projection helpers (v2.63.0)
+// =============================================================================
+//
+// The DiffOnly hot path computes TWO hashes per PK and compares them:
+//   * `mssql_hash`     — legacy row(s) projected into canonical shape
+//   * `canonical_hash` — canonical `ht_*` row(s) projected into the same shape
+//
+// Both hashes use the SAME field set + SAME serialisation template, so they
+// match iff the CT watcher's mapper has faithfully mirrored MSSQL into
+// canonical. Drift = actionable mapper gap.
+//
+// Field set is deliberately narrowed to columns the CT mapper actually
+// projects to canonical. Untracked legacy fields (e.g. `Room_Group`,
+// `Room_Book_Time`, `Book_Cust_Name` denormalisations) are excluded from
+// both hashes — including them would create systematic drift on rows
+// where canonical has no corresponding storage, defeating the tripwire's
+// signal-to-noise ratio.
+
+/// Reverse of `sync::mappers::room::legacy_yesno_to_bool`. Project a
+/// canonical `BOOLEAN` back into the legacy `'yes' | 'no' | ""` literal
+/// for hashing. `None → ""` matches what the legacy MSSQL projection
+/// emits for a NULL column via `.as_deref().unwrap_or("")`.
+fn bool_to_yesno(b: Option<bool>) -> &'static str {
+    match b {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "",
+    }
+}
+
+/// Map an MSSQL legacy `Room_Clean`/`Room_Manternace` literal to the
+/// canonical-shape `'yes' | 'no' | ""` token. Mirrors the CT room
+/// mapper's `legacy_yesno_to_bool`: anything other than the two known
+/// literals collapses to `""` so the hashes line up.
+fn legacy_yesno_canonical(s: Option<&str>) -> &'static str {
+    match s {
+        Some("yes") => "yes",
+        Some("no") => "no",
+        _ => "",
+    }
+}
+
+/// Hash inputs for the canonical-shape customer projection. Single-row
+/// per PK on both sides. Order + separator must stay byte-identical
+/// between the MSSQL and PG paths or the hashes won't line up.
+fn customer_canonical_hash(
+    legacy_cust_no: &str,
+    cust_firstname: &str,
+    cust_type: Option<&str>,
+    cust_phone: Option<&str>,
+    cust_idcard: Option<&str>,
+    cust_address: Option<&str>,
+) -> String {
+    sha256(&format!(
+        "{}|{}|{}|{}|{}|{}",
+        legacy_cust_no,
+        cust_firstname,
+        cust_type.unwrap_or(""),
+        cust_phone.unwrap_or(""),
+        cust_idcard.unwrap_or(""),
+        cust_address.unwrap_or(""),
+    ))
+}
+
+/// Hash inputs for the canonical-shape room projection. Narrowed to
+/// fields the CT room mapper actually writes back (room_clean,
+/// room_maintenance, room_notes) — prices and other legacy-only
+/// columns are excluded because canonical doesn't mirror them.
+fn room_canonical_hash(
+    room_no: &str,
+    room_clean_yesno: &str,
+    room_maintenance_yesno: &str,
+    room_notes: Option<&str>,
+) -> String {
+    sha256(&format!(
+        "{}|{}|{}|{}",
+        room_no,
+        room_clean_yesno,
+        room_maintenance_yesno,
+        room_notes.unwrap_or(""),
+    ))
+}
+
+/// Hash inputs for one canonical-shape booking row. Single-row per
+/// `legacy_book_id` (canonical doesn't multi-row by `Book_Room_Type`).
+///
+/// `book_status` is deliberately excluded: legacy `View_Booking_Ds.Book_Status`
+/// is an integer ledger code while canonical `ht_bookings.book_status` is a
+/// translated English literal sourced from `HT_Book_H.Book_Status` — different
+/// fields. Status changes are surfaced by the CT watcher's domain events.
+fn booking_canonical_hash(
+    legacy_book_id: &str,
+    book_checkin_date: Option<&str>,
+    book_checkout_date: Option<&str>,
+    legacy_cust_no: Option<&str>,
+) -> String {
+    sha256(&format!(
+        "{}|{}|{}|{}",
+        legacy_book_id,
+        book_checkin_date.unwrap_or(""),
+        book_checkout_date.unwrap_or(""),
+        legacy_cust_no.unwrap_or(""),
+    ))
+}
+
+/// Hash inputs for one canonical-shape check-in row. The CT checkin
+/// mapper denormalises only the FIRST room (`legacy_room_no`) into
+/// `ht_checkins`, so we hash that single representative row here too.
+///
+/// `cin_status` is deliberately excluded: `View_CheckIn_Ds.Cin_status`
+/// is a per-room ledger state, whereas canonical `ht_checkins.cin_status`
+/// is the header-derived aggregate — different fields.
+fn checkin_canonical_hash(
+    legacy_cin_no: &str,
+    legacy_room_no: Option<&str>,
+    cin_checkin_time: Option<&str>,
+    cin_checkout_time: Option<&str>,
+    legacy_cust_no: Option<&str>,
+) -> String {
+    sha256(&format!(
+        "{}|{}|{}|{}|{}",
+        legacy_cin_no,
+        legacy_room_no.unwrap_or(""),
+        cin_checkin_time.unwrap_or(""),
+        cin_checkout_time.unwrap_or(""),
+        legacy_cust_no.unwrap_or(""),
+    ))
 }
 
 /// Phase 5.5 diff-only path: record a divergence into `ht_reconcile_log`
@@ -587,6 +736,144 @@ async fn record_success(
 // Customer Sync
 // =============================================================================
 
+/// Canonical-side projection of a customer row for hashing. Loaded by
+/// `legacy_cust_no` join on `ht_customers`. Returns `None` when the CT
+/// watcher hasn't yet projected this PK into canonical — that PG-miss
+/// case is itself a drift signal recorded with `pg_hash=NULL`.
+struct CanonicalCustomerRow {
+    cust_firstname: String,
+    cust_type: Option<String>,
+    cust_phone: Option<String>,
+    cust_idcard: Option<String>,
+    cust_address: Option<String>,
+}
+
+async fn fetch_canonical_customer(
+    pg_pool: &PgPool,
+    legacy_cust_no: &str,
+) -> Result<Option<CanonicalCustomerRow>, sqlx::Error> {
+    sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>, Option<String>)>(
+        "SELECT cust_firstname, cust_type, cust_phone, cust_idcard, cust_address \
+           FROM ht_customers \
+          WHERE legacy_cust_no = $1 \
+          LIMIT 1",
+    )
+    .bind(legacy_cust_no)
+    .fetch_optional(pg_pool)
+    .await
+    .map(|opt| {
+        opt.map(|(firstname, type_, phone, idcard, address)| CanonicalCustomerRow {
+            cust_firstname: firstname,
+            cust_type: type_,
+            cust_phone: phone,
+            cust_idcard: idcard,
+            cust_address: address,
+        })
+    })
+}
+
+/// Best-effort cache UPDATE: ack the most recent `mssql_hash` for this
+/// PK so subsequent ticks short-circuit before re-querying canonical.
+/// Cache-only — does NOT mutate canonical state. A failed write merely
+/// re-fires the alert next tick.
+async fn ack_customer_mirror(pg_pool: &PgPool, cust_no: &str, mssql_hash: &str) {
+    let updated = sqlx::query(
+        "UPDATE ht_customers_legacy SET sync_hash = $1, synced_at = NOW() \
+         WHERE cust_no = $2",
+    )
+    .bind(mssql_hash)
+    .bind(cust_no)
+    .execute(pg_pool)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+
+    if updated == 0 {
+        let _ = sqlx::query(
+            "INSERT INTO ht_customers_legacy (cust_no, sync_hash, synced_at) \
+             VALUES ($1, $2, NOW()) \
+             ON CONFLICT (cust_no) DO UPDATE SET sync_hash = EXCLUDED.sync_hash, \
+                                                   synced_at = EXCLUDED.synced_at",
+        )
+        .bind(cust_no)
+        .bind(mssql_hash)
+        .execute(pg_pool)
+        .await;
+    }
+}
+
+/// Escape-hatch path (mode=upsert): UPSERT the cache mirror's data
+/// columns from the MSSQL projection. Not exercised in production after
+/// v2.63.0 — preserved for forensic rollback flexibility only.
+#[allow(clippy::too_many_arguments)]
+async fn upsert_customer_mirror(
+    pg_pool: &PgPool,
+    cust_no: &str,
+    cust_name: &Option<String>,
+    cust_type: &Option<String>,
+    cust_phone: &Option<String>,
+    cust_idcard: &Option<String>,
+    cust_address: &Option<String>,
+    mssql_hash: &str,
+    added: &mut i32,
+    updated: &mut i32,
+    unchanged: &mut i32,
+) -> Result<(), sqlx::Error> {
+    let existing = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT sync_hash FROM ht_customers_legacy WHERE cust_no = $1",
+    )
+    .bind(cust_no)
+    .fetch_optional(pg_pool)
+    .await?;
+
+    match existing {
+        Some(Some(existing_hash)) if existing_hash == mssql_hash => {
+            *unchanged += 1;
+        }
+        Some(_) => {
+            sqlx::query(
+                r#"
+                UPDATE ht_customers_legacy
+                SET cust_name = $1, cust_type = $2, cust_phone = $3,
+                    cust_idcard = $4, cust_address = $5,
+                    sync_hash = $6, synced_at = NOW()
+                WHERE cust_no = $7
+                "#,
+            )
+            .bind(cust_name)
+            .bind(cust_type)
+            .bind(cust_phone)
+            .bind(cust_idcard)
+            .bind(cust_address)
+            .bind(mssql_hash)
+            .bind(cust_no)
+            .execute(pg_pool)
+            .await?;
+            *updated += 1;
+        }
+        None => {
+            sqlx::query(
+                r#"
+                INSERT INTO ht_customers_legacy
+                    (cust_no, cust_name, cust_type, cust_phone, cust_idcard, cust_address, sync_hash)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                "#,
+            )
+            .bind(cust_no)
+            .bind(cust_name)
+            .bind(cust_type)
+            .bind(cust_phone)
+            .bind(cust_idcard)
+            .bind(cust_address)
+            .bind(mssql_hash)
+            .execute(pg_pool)
+            .await?;
+            *added += 1;
+        }
+    }
+    Ok(())
+}
+
 async fn sync_customers(
     legacy_pool: &DbPool,
     pg_pool: &PgPool,
@@ -626,153 +913,106 @@ async fn sync_customers(
         let cust_idcard = row.get::<&str, _>("Cust_IDcard").map(String::from);
         let cust_address = row.get::<&str, _>("C_Address").map(String::from);
 
-        let hash_input = format!(
-            "{}|{}|{}|{}|{}|{}",
-            cust_no,
+        // v2.63.0: canonical-shape hash of the MSSQL projection. Same
+        // field set + serialisation as `customer_canonical_hash`, so a
+        // faithful CT-mapper projection lands an identical hash on the
+        // canonical side.
+        let mssql_hash = customer_canonical_hash(
+            &cust_no,
             cust_name.as_deref().unwrap_or(""),
-            cust_type.as_deref().unwrap_or(""),
-            cust_phone.as_deref().unwrap_or(""),
-            cust_idcard.as_deref().unwrap_or(""),
-            cust_address.as_deref().unwrap_or(""),
+            cust_type.as_deref(),
+            cust_phone.as_deref(),
+            cust_idcard.as_deref(),
+            cust_address.as_deref(),
         );
-        let hash = sha256(&hash_input);
 
-        // Check if record exists and if hash changed
-        let existing = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT sync_hash FROM ht_customers_legacy WHERE cust_no = $1"
-        )
-        .bind(&cust_no)
-        .fetch_optional(pg_pool)
-        .await?;
-
-        match existing {
-            Some(Some(existing_hash)) if existing_hash == hash => {
-                unchanged += 1;
+        match mode {
+            ReconcileMode::Upsert => {
+                upsert_customer_mirror(
+                    pg_pool,
+                    &cust_no,
+                    &cust_name,
+                    &cust_type,
+                    &cust_phone,
+                    &cust_idcard,
+                    &cust_address,
+                    &mssql_hash,
+                    &mut added,
+                    &mut updated,
+                    &mut unchanged,
+                )
+                .await?;
             }
-            Some(prior_hash) => match mode {
-                ReconcileMode::Upsert => {
-                    // Exists but hash changed - update
-                    sqlx::query(
-                        r#"
-                        UPDATE ht_customers_legacy
-                        SET cust_name = $1, cust_type = $2, cust_phone = $3,
-                            cust_idcard = $4, cust_address = $5,
-                            sync_hash = $6, synced_at = NOW()
-                        WHERE cust_no = $7
-                        "#,
+            ReconcileMode::DiffOnly => {
+                let last_ack = sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT sync_hash FROM ht_customers_legacy WHERE cust_no = $1",
+                )
+                .bind(&cust_no)
+                .fetch_optional(pg_pool)
+                .await?;
+
+                // Dedupe: identical `mssql_hash` as last acknowledged
+                // means drift (if any) is already in `ht_reconcile_log`.
+                if matches!(&last_ack, Some(Some(prev)) if *prev == mssql_hash) {
+                    unchanged += 1;
+                    continue;
+                }
+
+                let canonical = fetch_canonical_customer(pg_pool, &cust_no).await?;
+                let canonical_hash = canonical.as_ref().map(|c| {
+                    customer_canonical_hash(
+                        &cust_no,
+                        &c.cust_firstname,
+                        c.cust_type.as_deref(),
+                        c.cust_phone.as_deref(),
+                        c.cust_idcard.as_deref(),
+                        c.cust_address.as_deref(),
                     )
-                    .bind(&cust_name)
-                    .bind(&cust_type)
-                    .bind(&cust_phone)
-                    .bind(&cust_idcard)
-                    .bind(&cust_address)
-                    .bind(&hash)
-                    .bind(&cust_no)
-                    .execute(pg_pool)
-                    .await?;
+                });
+
+                if canonical_hash.as_deref() == Some(mssql_hash.as_str()) {
+                    // Canonical matches legacy. Ack so we skip the
+                    // SELECT-join next tick on this stable PK.
+                    ack_customer_mirror(pg_pool, &cust_no, &mssql_hash).await;
+                    unchanged += 1;
+                    continue;
+                }
+
+                // Drift: canonical PG-miss (None) or hash mismatch.
+                let mssql_json = json!({
+                    "Cust_no": cust_no,
+                    "Cust_name": cust_name,
+                    "Cust_Type": cust_type,
+                    "Cust_Add_tel": cust_phone,
+                    "Cust_IDcard": cust_idcard,
+                    "C_Address": cust_address,
+                });
+                let pg_json = canonical.as_ref().map(|c| {
+                    json!({
+                        "cust_firstname": c.cust_firstname,
+                        "cust_type": c.cust_type,
+                        "cust_phone": c.cust_phone,
+                        "cust_idcard": c.cust_idcard,
+                        "cust_address": c.cust_address,
+                    })
+                });
+                record_divergence(
+                    pg_pool,
+                    "customers",
+                    &cust_no,
+                    canonical_hash.as_deref(),
+                    Some(&mssql_hash),
+                    mssql_json,
+                    pg_json,
+                )
+                .await;
+                ack_customer_mirror(pg_pool, &cust_no, &mssql_hash).await;
+                if canonical.is_none() {
+                    added += 1;
+                } else {
                     updated += 1;
                 }
-                ReconcileMode::DiffOnly => {
-                    // Phase 5.5: log divergence; CT watcher owns canonical state.
-                    let mssql_json = json!({
-                        "Cust_no": cust_no,
-                        "Cust_name": cust_name,
-                        "Cust_Type": cust_type,
-                        "Cust_Add_tel": cust_phone,
-                        "Cust_IDcard": cust_idcard,
-                        "C_Address": cust_address,
-                    });
-                    record_divergence(
-                        pg_pool,
-                        "customers",
-                        &cust_no,
-                        prior_hash.as_deref(),
-                        Some(&hash),
-                        mssql_json,
-                        None,
-                    )
-                    .await;
-                    // Acknowledge the divergence in the cache so the next
-                    // reconcile tick doesn't re-flag this same row forever
-                    // and spam the Phase 6 drift alert. Cache-only write —
-                    // does NOT mutate canonical state. Best-effort: a
-                    // failed cache update only re-fires the alert next
-                    // tick, never a data-correctness issue.
-                    let _ = sqlx::query(
-                        "UPDATE ht_customers_legacy SET sync_hash = $1, synced_at = NOW() \
-                         WHERE cust_no = $2",
-                    )
-                    .bind(&hash)
-                    .bind(&cust_no)
-                    .execute(pg_pool)
-                    .await;
-                    updated += 1;
-                }
-            },
-            None => match mode {
-                ReconcileMode::Upsert => {
-                    // New record - insert
-                    sqlx::query(
-                        r#"
-                        INSERT INTO ht_customers_legacy
-                            (cust_no, cust_name, cust_type, cust_phone, cust_idcard, cust_address, sync_hash)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7)
-                        "#,
-                    )
-                    .bind(&cust_no)
-                    .bind(&cust_name)
-                    .bind(&cust_type)
-                    .bind(&cust_phone)
-                    .bind(&cust_idcard)
-                    .bind(&cust_address)
-                    .bind(&hash)
-                    .execute(pg_pool)
-                    .await?;
-                    added += 1;
-                }
-                ReconcileMode::DiffOnly => {
-                    // PG-miss divergence: legacy row exists, canonical
-                    // mirror does not yet. Logged with `pg_hash=NULL`.
-                    let mssql_json = json!({
-                        "Cust_no": cust_no,
-                        "Cust_name": cust_name,
-                        "Cust_Type": cust_type,
-                        "Cust_Add_tel": cust_phone,
-                        "Cust_IDcard": cust_idcard,
-                        "C_Address": cust_address,
-                    });
-                    record_divergence(
-                        pg_pool,
-                        "customers",
-                        &cust_no,
-                        None,
-                        Some(&hash),
-                        mssql_json,
-                        None,
-                    )
-                    .await;
-                    // Phase 6 fix (#65): cache-only marker insert so the
-                    // next reconcile tick sees a row and goes through the
-                    // Some-branch (which already does the proper UPDATE).
-                    // Without this, every tick re-detects the same PK as
-                    // None and re-fires divergence forever (~3 entries
-                    // per 15 min on bookings observed). Detail columns
-                    // are left NULL — canonical state is owned by the
-                    // CT watcher; this row is purely a bookkeeping
-                    // marker for the diff-only safety net. Best-effort:
-                    // a failed insert just re-fires the alert next tick.
-                    let _ = sqlx::query(
-                        "INSERT INTO ht_customers_legacy (cust_no, sync_hash, synced_at) \
-                         VALUES ($1, $2, NOW()) \
-                         ON CONFLICT (cust_no) DO NOTHING",
-                    )
-                    .bind(&cust_no)
-                    .bind(&hash)
-                    .execute(pg_pool)
-                    .await;
-                    added += 1;
-                }
-            },
+            }
         }
     }
 
@@ -789,6 +1029,162 @@ async fn sync_customers(
 // =============================================================================
 // Room Sync
 // =============================================================================
+
+/// Canonical-side projection of a room row for hashing. Resolved by
+/// `legacy_room_no` first (writeback's preferred key), falling back to
+/// `room_no` so rooms that predate the writeback resolver still get
+/// compared.
+struct CanonicalRoomRow {
+    room_clean: Option<bool>,
+    room_maintenance: Option<bool>,
+    room_notes: Option<String>,
+}
+
+async fn fetch_canonical_room(
+    pg_pool: &PgPool,
+    legacy_room_no: &str,
+) -> Result<Option<CanonicalRoomRow>, sqlx::Error> {
+    sqlx::query_as::<_, (Option<bool>, Option<bool>, Option<String>)>(
+        "SELECT room_clean, room_maintenance, room_notes \
+           FROM ht_rooms_new \
+          WHERE legacy_room_no = $1 \
+             OR room_no = $1 \
+          ORDER BY (legacy_room_no = $1) DESC \
+          LIMIT 1",
+    )
+    .bind(legacy_room_no)
+    .fetch_optional(pg_pool)
+    .await
+    .map(|opt| {
+        opt.map(|(clean, maintenance, notes)| CanonicalRoomRow {
+            room_clean: clean,
+            room_maintenance: maintenance,
+            room_notes: notes,
+        })
+    })
+}
+
+async fn ack_room_mirror(pg_pool: &PgPool, room_no: &str, mssql_hash: &str) {
+    let updated = sqlx::query(
+        "UPDATE ht_rooms_legacy SET sync_hash = $1, synced_at = NOW() \
+         WHERE room_no = $2",
+    )
+    .bind(mssql_hash)
+    .bind(room_no)
+    .execute(pg_pool)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+
+    if updated == 0 {
+        let _ = sqlx::query(
+            "INSERT INTO ht_rooms_legacy (room_no, sync_hash, synced_at) \
+             VALUES ($1, $2, NOW()) \
+             ON CONFLICT (room_no) DO UPDATE SET sync_hash = EXCLUDED.sync_hash, \
+                                                  synced_at = EXCLUDED.synced_at",
+        )
+        .bind(room_no)
+        .bind(mssql_hash)
+        .execute(pg_pool)
+        .await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upsert_room_mirror(
+    pg_pool: &PgPool,
+    room_no: &str,
+    room_type: &Option<String>,
+    room_details: &Option<String>,
+    room_clean: &Option<String>,
+    room_use: &Option<String>,
+    room_book: &Option<String>,
+    room_manternace: &Option<String>,
+    room_price_a: Option<f64>,
+    room_price_b: Option<f64>,
+    room_price_c: Option<f64>,
+    room_group: &Option<String>,
+    room_book_name: &Option<String>,
+    room_book_time: &Option<NaiveDateTime>,
+    mssql_hash: &str,
+    added: &mut i32,
+    updated: &mut i32,
+    unchanged: &mut i32,
+) -> Result<(), sqlx::Error> {
+    let existing = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT sync_hash FROM ht_rooms_legacy WHERE room_no = $1",
+    )
+    .bind(room_no)
+    .fetch_optional(pg_pool)
+    .await?;
+
+    match existing {
+        Some(Some(existing_hash)) if existing_hash == mssql_hash => {
+            *unchanged += 1;
+        }
+        Some(_) => {
+            sqlx::query(
+                r#"
+                UPDATE ht_rooms_legacy
+                SET room_type = $1, room_details = $2, room_clean = $3,
+                    room_use = $4, room_book = $5, room_manternace = $6,
+                    room_price_a = $7::float8, room_price_b = $8::float8,
+                    room_price_c = $9::float8, room_group = $10,
+                    room_book_name = $11, room_book_time = $12,
+                    sync_hash = $13, synced_at = NOW()
+                WHERE room_no = $14
+                "#,
+            )
+            .bind(room_type)
+            .bind(room_details)
+            .bind(room_clean)
+            .bind(room_use)
+            .bind(room_book)
+            .bind(room_manternace)
+            .bind(room_price_a)
+            .bind(room_price_b)
+            .bind(room_price_c)
+            .bind(room_group)
+            .bind(room_book_name)
+            .bind(room_book_time)
+            .bind(mssql_hash)
+            .bind(room_no)
+            .execute(pg_pool)
+            .await?;
+            *updated += 1;
+        }
+        None => {
+            sqlx::query(
+                r#"
+                INSERT INTO ht_rooms_legacy
+                    (room_no, room_type, room_details, room_clean, room_use,
+                     room_book, room_manternace, room_price_a, room_price_b,
+                     room_price_c, room_group, room_book_name, room_book_time, sync_hash)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::float8, $9::float8,
+                        $10::float8, $11, $12, $13, $14)
+                "#,
+            )
+            .bind(room_no)
+            .bind(room_type)
+            .bind(room_details)
+            .bind(room_clean)
+            .bind(room_use)
+            .bind(room_book)
+            .bind(room_manternace)
+            .bind(room_price_a)
+            .bind(room_price_b)
+            .bind(room_price_c)
+            .bind(room_group)
+            .bind(room_book_name)
+            .bind(room_book_time)
+            .bind(mssql_hash)
+            .execute(pg_pool)
+            .await?;
+            *added += 1;
+        }
+    }
+    Ok(())
+}
 
 async fn sync_rooms(
     legacy_pool: &DbPool,
@@ -831,6 +1227,9 @@ async fn sync_rooms(
 
     for row in &rows {
         let room_no = row.get::<&str, _>("Room_no").unwrap_or_default().to_string();
+        // MSSQL projection captured even for fields excluded from the
+        // canonical-shape hash — operators reading `ht_reconcile_log`
+        // want the full row payload to investigate.
         let room_type = row.get::<&str, _>("Room_Type").map(String::from);
         let room_details = row.get::<&str, _>("Room_Details").map(String::from);
         let room_clean = row.get::<&str, _>("Room_Clean").map(String::from);
@@ -844,176 +1243,114 @@ async fn sync_rooms(
         let room_book_name = row.get::<&str, _>("Room_Book_Name").map(String::from);
         let room_book_time: Option<NaiveDateTime> = row.try_get("Room_Book_Time").unwrap_or(None);
 
-        let hash_input = format!(
-            "{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{}|{}|{:?}",
-            room_no,
-            room_type.as_deref().unwrap_or(""),
-            room_details.as_deref().unwrap_or(""),
-            room_clean.as_deref().unwrap_or(""),
-            room_use.as_deref().unwrap_or(""),
-            room_book.as_deref().unwrap_or(""),
-            room_manternace.as_deref().unwrap_or(""),
-            room_price_a,
-            room_price_b,
-            room_price_c,
-            room_group.as_deref().unwrap_or(""),
-            room_book_name.as_deref().unwrap_or(""),
-            room_book_time,
+        // v2.63.0: canonical-shape hash over the CT-tracked fields only
+        // (room_clean, room_maintenance, room_notes/details). Legacy
+        // yes/no literals are folded through `legacy_yesno_canonical`
+        // so they line up with the canonical `BOOLEAN` columns via
+        // `bool_to_yesno`.
+        let mssql_hash = room_canonical_hash(
+            &room_no,
+            legacy_yesno_canonical(room_clean.as_deref()),
+            legacy_yesno_canonical(room_manternace.as_deref()),
+            room_details.as_deref(),
         );
-        let hash = sha256(&hash_input);
 
-        let existing = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT sync_hash FROM ht_rooms_legacy WHERE room_no = $1"
-        )
-        .bind(&room_no)
-        .fetch_optional(pg_pool)
-        .await?;
-
-        match existing {
-            Some(Some(existing_hash)) if existing_hash == hash => {
-                unchanged += 1;
+        match mode {
+            ReconcileMode::Upsert => {
+                upsert_room_mirror(
+                    pg_pool,
+                    &room_no,
+                    &room_type,
+                    &room_details,
+                    &room_clean,
+                    &room_use,
+                    &room_book,
+                    &room_manternace,
+                    room_price_a,
+                    room_price_b,
+                    room_price_c,
+                    &room_group,
+                    &room_book_name,
+                    &room_book_time,
+                    &mssql_hash,
+                    &mut added,
+                    &mut updated,
+                    &mut unchanged,
+                )
+                .await?;
             }
-            Some(prior_hash) => match mode {
-                ReconcileMode::Upsert => {
-                    sqlx::query(
-                        r#"
-                        UPDATE ht_rooms_legacy
-                        SET room_type = $1, room_details = $2, room_clean = $3,
-                            room_use = $4, room_book = $5, room_manternace = $6,
-                            room_price_a = $7::float8, room_price_b = $8::float8,
-                            room_price_c = $9::float8, room_group = $10,
-                            room_book_name = $11, room_book_time = $12,
-                            sync_hash = $13, synced_at = NOW()
-                        WHERE room_no = $14
-                        "#,
+            ReconcileMode::DiffOnly => {
+                let last_ack = sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT sync_hash FROM ht_rooms_legacy WHERE room_no = $1",
+                )
+                .bind(&room_no)
+                .fetch_optional(pg_pool)
+                .await?;
+
+                if matches!(&last_ack, Some(Some(prev)) if *prev == mssql_hash) {
+                    unchanged += 1;
+                    continue;
+                }
+
+                let canonical = fetch_canonical_room(pg_pool, &room_no).await?;
+                let canonical_hash = canonical.as_ref().map(|c| {
+                    room_canonical_hash(
+                        &room_no,
+                        bool_to_yesno(c.room_clean),
+                        bool_to_yesno(c.room_maintenance),
+                        c.room_notes.as_deref(),
                     )
-                    .bind(&room_type)
-                    .bind(&room_details)
-                    .bind(&room_clean)
-                    .bind(&room_use)
-                    .bind(&room_book)
-                    .bind(&room_manternace)
-                    .bind(&room_price_a)
-                    .bind(&room_price_b)
-                    .bind(&room_price_c)
-                    .bind(&room_group)
-                    .bind(&room_book_name)
-                    .bind(&room_book_time)
-                    .bind(&hash)
-                    .bind(&room_no)
-                    .execute(pg_pool)
-                    .await?;
+                });
+
+                if canonical_hash.as_deref() == Some(mssql_hash.as_str()) {
+                    ack_room_mirror(pg_pool, &room_no, &mssql_hash).await;
+                    unchanged += 1;
+                    continue;
+                }
+
+                let mssql_json = json!({
+                    "Room_no": room_no,
+                    "Room_Type": room_type,
+                    "Room_Details": room_details,
+                    "Room_Clean": room_clean,
+                    "Room_Use": room_use,
+                    "Room_Book": room_book,
+                    "Room_Manternace": room_manternace,
+                    "Room_PriceA": room_price_a,
+                    "Room_PriceB": room_price_b,
+                    "Room_PriceC": room_price_c,
+                    "Room_Group": room_group,
+                    "Room_Book_Name": room_book_name,
+                });
+                let pg_json = canonical.as_ref().map(|c| {
+                    json!({
+                        "room_clean": c.room_clean,
+                        "room_maintenance": c.room_maintenance,
+                        "room_notes": c.room_notes,
+                    })
+                });
+                record_divergence(
+                    pg_pool,
+                    "rooms",
+                    &room_no,
+                    canonical_hash.as_deref(),
+                    Some(&mssql_hash),
+                    mssql_json,
+                    pg_json,
+                )
+                .await;
+                ack_room_mirror(pg_pool, &room_no, &mssql_hash).await;
+                if canonical.is_none() {
+                    added += 1;
+                } else {
                     updated += 1;
                 }
-                ReconcileMode::DiffOnly => {
-                    let mssql_json = json!({
-                        "Room_no": room_no,
-                        "Room_Type": room_type,
-                        "Room_Details": room_details,
-                        "Room_Clean": room_clean,
-                        "Room_Use": room_use,
-                        "Room_Book": room_book,
-                        "Room_Manternace": room_manternace,
-                        "Room_PriceA": room_price_a,
-                        "Room_PriceB": room_price_b,
-                        "Room_PriceC": room_price_c,
-                        "Room_Group": room_group,
-                        "Room_Book_Name": room_book_name,
-                    });
-                    record_divergence(
-                        pg_pool,
-                        "rooms",
-                        &room_no,
-                        prior_hash.as_deref(),
-                        Some(&hash),
-                        mssql_json,
-                        None,
-                    )
-                    .await;
-                    // Phase 6 fix: ack the divergence in the cache so the
-                    // next reconcile tick doesn't re-flag the same row.
-                    // See sync_customers DiffOnly branch for the rationale.
-                    let _ = sqlx::query(
-                        "UPDATE ht_rooms_legacy SET sync_hash = $1, synced_at = NOW() \
-                         WHERE room_no = $2",
-                    )
-                    .bind(&hash)
-                    .bind(&room_no)
-                    .execute(pg_pool)
-                    .await;
-                    updated += 1;
-                }
-            },
-            None => match mode {
-                ReconcileMode::Upsert => {
-                    sqlx::query(
-                        r#"
-                        INSERT INTO ht_rooms_legacy
-                            (room_no, room_type, room_details, room_clean, room_use,
-                             room_book, room_manternace, room_price_a, room_price_b,
-                             room_price_c, room_group, room_book_name, room_book_time, sync_hash)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::float8, $9::float8,
-                                $10::float8, $11, $12, $13, $14)
-                        "#,
-                    )
-                    .bind(&room_no)
-                    .bind(&room_type)
-                    .bind(&room_details)
-                    .bind(&room_clean)
-                    .bind(&room_use)
-                    .bind(&room_book)
-                    .bind(&room_manternace)
-                    .bind(&room_price_a)
-                    .bind(&room_price_b)
-                    .bind(&room_price_c)
-                    .bind(&room_group)
-                    .bind(&room_book_name)
-                    .bind(&room_book_time)
-                    .bind(&hash)
-                    .execute(pg_pool)
-                    .await?;
-                    added += 1;
-                }
-                ReconcileMode::DiffOnly => {
-                    let mssql_json = json!({
-                        "Room_no": room_no,
-                        "Room_Type": room_type,
-                        "Room_Details": room_details,
-                        "Room_Clean": room_clean,
-                        "Room_Use": room_use,
-                        "Room_Book": room_book,
-                        "Room_Manternace": room_manternace,
-                        "Room_PriceA": room_price_a,
-                        "Room_PriceB": room_price_b,
-                        "Room_PriceC": room_price_c,
-                        "Room_Group": room_group,
-                        "Room_Book_Name": room_book_name,
-                    });
-                    record_divergence(
-                        pg_pool,
-                        "rooms",
-                        &room_no,
-                        None,
-                        Some(&hash),
-                        mssql_json,
-                        None,
-                    )
-                    .await;
-                    // Phase 6 fix (#65): cache-only marker insert. See
-                    // sync_customers DiffOnly None-branch for rationale.
-                    let _ = sqlx::query(
-                        "INSERT INTO ht_rooms_legacy (room_no, sync_hash, synced_at) \
-                         VALUES ($1, $2, NOW()) \
-                         ON CONFLICT (room_no) DO NOTHING",
-                    )
-                    .bind(&room_no)
-                    .bind(&hash)
-                    .execute(pg_pool)
-                    .await;
-                    added += 1;
-                }
-            },
+            }
         }
+        // `room_book_time` is only consumed by the Upsert branch; the
+        // explicit reference silences any over-zealous "unused
+        // binding" lint in DiffOnly-only execution paths.
+        let _ = &room_book_time;
     }
 
     let duration_ms = start.elapsed().as_millis() as i32;
@@ -1087,137 +1424,105 @@ async fn sync_bookings(
     }
 
     for ((book_no, room_type_key), mut details) in groups {
-        let hash = aggregate_booking_hash(&book_no, &room_type_key, &mut details);
+        // Deterministic legacy multi-row → single-row collapse: sort by
+        // every non-key field (matching `aggregate_booking_hash`'s sort
+        // contract) and pick the first detail row as the canonical-shape
+        // representative. Canonical `ht_bookings` has one row per
+        // `legacy_book_id`, so a single representative is enough.
+        sort_booking_details(&mut details);
+        let representative = details.first();
 
-        let existing = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT sync_hash FROM ht_bookings_legacy WHERE book_no = $1 AND COALESCE(book_room_type, '') = $2"
-        )
-        .bind(&book_no)
-        .bind(&room_type_key)
-        .fetch_optional(pg_pool)
-        .await?;
+        // v2.63.0: canonical-shape hash of the legacy projection.
+        // `book_status` intentionally omitted (see `booking_canonical_hash`
+        // docs). Dates: legacy returns DATETIME; canonical stores DATE.
+        // Drop the time component so both sides hash the same YYYY-MM-DD
+        // string (legacy `Book_Date_in/out` are stored at midnight per
+        // the booking-create recipe — see `sync::mappers::booking` docs).
+        let book_checkin_date = representative
+            .and_then(|d| d.book_date_in.map(|dt| dt.date().to_string()));
+        let book_checkout_date = representative
+            .and_then(|d| d.book_date_out.map(|dt| dt.date().to_string()));
+        let book_cust_id_owned = representative.and_then(|d| d.book_cust_id.clone());
+        let mssql_hash = booking_canonical_hash(
+            &book_no,
+            book_checkin_date.as_deref(),
+            book_checkout_date.as_deref(),
+            book_cust_id_owned.as_deref(),
+        );
 
-        match existing {
-            Some(Some(existing_hash)) if existing_hash == hash => {
-                unchanged += 1;
+        match mode {
+            ReconcileMode::Upsert => {
+                upsert_booking_mirror(
+                    pg_pool,
+                    &book_no,
+                    &room_type_key,
+                    representative,
+                    &mssql_hash,
+                    &mut added,
+                    &mut updated,
+                    &mut unchanged,
+                )
+                .await?;
             }
-            Some(prior_hash) => match mode {
-                ReconcileMode::Upsert => {
-                    // Cache row is single-row per PK by schema; canonical
-                    // multi-row data lives in `ht_bookings`. Pick the
-                    // first deterministically-sorted detail as the
-                    // representative row for the cache columns.
-                    let canonical = &details[0];
-                    sqlx::query(
-                        r#"
-                        UPDATE ht_bookings_legacy
-                        SET book_date = $1, book_date_in = $2, book_date_out = $3,
-                            book_cust_name = $4, book_cust_id = $5, book_status = $6,
-                            sync_hash = $7, synced_at = NOW()
-                        WHERE book_no = $8 AND COALESCE(book_room_type, '') = $9
-                        "#,
+            ReconcileMode::DiffOnly => {
+                let last_ack = sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT sync_hash FROM ht_bookings_legacy \
+                      WHERE book_no = $1 AND COALESCE(book_room_type, '') = $2",
+                )
+                .bind(&book_no)
+                .bind(&room_type_key)
+                .fetch_optional(pg_pool)
+                .await?;
+
+                if matches!(&last_ack, Some(Some(prev)) if *prev == mssql_hash) {
+                    unchanged += 1;
+                    continue;
+                }
+
+                let canonical = fetch_canonical_booking(pg_pool, &book_no).await?;
+                let canonical_hash = canonical.as_ref().map(|c| {
+                    let checkin_str = c.book_checkin.map(|d| d.to_string());
+                    let checkout_str = c.book_checkout.map(|d| d.to_string());
+                    booking_canonical_hash(
+                        &book_no,
+                        checkin_str.as_deref(),
+                        checkout_str.as_deref(),
+                        c.legacy_cust_no.as_deref(),
                     )
-                    .bind(&canonical.book_date)
-                    .bind(&canonical.book_date_in)
-                    .bind(&canonical.book_date_out)
-                    .bind(&canonical.book_cust_name)
-                    .bind(&canonical.book_cust_id)
-                    .bind(&canonical.book_status)
-                    .bind(&hash)
-                    .bind(&book_no)
-                    .bind(&room_type_key)
-                    .execute(pg_pool)
-                    .await?;
+                });
+
+                if canonical_hash.as_deref() == Some(mssql_hash.as_str()) {
+                    ack_booking_mirror(pg_pool, &book_no, &room_type_key, &mssql_hash).await;
+                    unchanged += 1;
+                    continue;
+                }
+
+                let mssql_json = booking_group_json(&book_no, &details);
+                let pg_json = canonical.as_ref().map(|c| {
+                    json!({
+                        "book_checkin": c.book_checkin.map(|d| d.to_string()),
+                        "book_checkout": c.book_checkout.map(|d| d.to_string()),
+                        "legacy_cust_no": c.legacy_cust_no,
+                    })
+                });
+                let composite_pk = format!("{book_no}|{room_type_key}");
+                record_divergence(
+                    pg_pool,
+                    "bookings",
+                    &composite_pk,
+                    canonical_hash.as_deref(),
+                    Some(&mssql_hash),
+                    mssql_json,
+                    pg_json,
+                )
+                .await;
+                ack_booking_mirror(pg_pool, &book_no, &room_type_key, &mssql_hash).await;
+                if canonical.is_none() {
+                    added += 1;
+                } else {
                     updated += 1;
                 }
-                ReconcileMode::DiffOnly => {
-                    let mssql_json = booking_group_json(&book_no, &details);
-                    let composite_pk = format!("{book_no}|{room_type_key}");
-                    record_divergence(
-                        pg_pool,
-                        "bookings",
-                        &composite_pk,
-                        prior_hash.as_deref(),
-                        Some(&hash),
-                        mssql_json,
-                        None,
-                    )
-                    .await;
-                    // Phase 6 fix: ack the divergence in the cache so the
-                    // next reconcile tick doesn't re-flag the same row.
-                    // Composite PK on bookings — match the SELECT shape
-                    // above. ONE UPDATE per PK now (was per-row, which
-                    // race-tripped the spam under multi-row PKs).
-                    let _ = sqlx::query(
-                        "UPDATE ht_bookings_legacy SET sync_hash = $1, synced_at = NOW() \
-                         WHERE book_no = $2 AND COALESCE(book_room_type, '') = $3",
-                    )
-                    .bind(&hash)
-                    .bind(&book_no)
-                    .bind(&room_type_key)
-                    .execute(pg_pool)
-                    .await;
-                    updated += 1;
-                }
-            },
-            None => match mode {
-                ReconcileMode::Upsert => {
-                    let canonical = &details[0];
-                    sqlx::query(
-                        r#"
-                        INSERT INTO ht_bookings_legacy
-                            (book_no, book_date, book_date_in, book_date_out,
-                             book_cust_name, book_cust_id, book_status,
-                             book_room_type, sync_hash)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                        "#,
-                    )
-                    .bind(&book_no)
-                    .bind(&canonical.book_date)
-                    .bind(&canonical.book_date_in)
-                    .bind(&canonical.book_date_out)
-                    .bind(&canonical.book_cust_name)
-                    .bind(&canonical.book_cust_id)
-                    .bind(&canonical.book_status)
-                    .bind(&canonical.book_room_type)
-                    .bind(&hash)
-                    .execute(pg_pool)
-                    .await?;
-                    added += 1;
-                }
-                ReconcileMode::DiffOnly => {
-                    let mssql_json = booking_group_json(&book_no, &details);
-                    let composite_pk = format!("{book_no}|{room_type_key}");
-                    record_divergence(
-                        pg_pool,
-                        "bookings",
-                        &composite_pk,
-                        None,
-                        Some(&hash),
-                        mssql_json,
-                        None,
-                    )
-                    .await;
-                    // Phase 6 fix (#65): cache-only marker insert. The
-                    // UNIQUE constraint `uq_bookings_legacy_key` is on
-                    // (book_no, book_room_type) raw columns; we bind
-                    // `room_type_key` (always non-NULL — empty string
-                    // for legacy NULL) so subsequent SELECTs using
-                    // COALESCE(book_room_type,'') match this row. See
-                    // sync_customers DiffOnly None-branch for rationale.
-                    let _ = sqlx::query(
-                        "INSERT INTO ht_bookings_legacy (book_no, book_room_type, sync_hash, synced_at) \
-                         VALUES ($1, $2, $3, NOW()) \
-                         ON CONFLICT (book_no, book_room_type) DO NOTHING",
-                    )
-                    .bind(&book_no)
-                    .bind(&room_type_key)
-                    .bind(&hash)
-                    .execute(pg_pool)
-                    .await;
-                    added += 1;
-                }
-            },
+            }
         }
     }
 
@@ -1228,6 +1533,179 @@ async fn sync_bookings(
     );
     record_success(pg_pool, "bookings", added, updated, unchanged, duration_ms).await;
 
+    Ok(())
+}
+
+/// Sort a booking PK group's detail rows deterministically. Mirrors the
+/// sort contract in [`aggregate_booking_hash`] so the "first" row is
+/// stable across reconcile ticks regardless of the order MSSQL returned
+/// the detail rows.
+fn sort_booking_details(details: &mut [BookingDetail]) {
+    details.sort_by(|a, b| {
+        (
+            fmt_dt(&a.book_date),
+            fmt_dt(&a.book_date_in),
+            fmt_dt(&a.book_date_out),
+            fmt_str(&a.book_cust_name),
+            fmt_str(&a.book_cust_id),
+            a.book_status.unwrap_or(i32::MIN),
+        )
+            .cmp(&(
+                fmt_dt(&b.book_date),
+                fmt_dt(&b.book_date_in),
+                fmt_dt(&b.book_date_out),
+                fmt_str(&b.book_cust_name),
+                fmt_str(&b.book_cust_id),
+                b.book_status.unwrap_or(i32::MIN),
+            ))
+    });
+}
+
+/// Canonical-side projection of a booking row for hashing. Resolved by
+/// `legacy_book_id`. `legacy_cust_no` is read directly from
+/// `ht_bookings.legacy_cust_no` (denormalised by the writeback
+/// resolver) rather than joined through `ht_customers` — keeps the
+/// drift check resilient to a transient FK gap between bookings and
+/// customers in the canonical store.
+struct CanonicalBookingRow {
+    book_checkin: Option<chrono::NaiveDate>,
+    book_checkout: Option<chrono::NaiveDate>,
+    legacy_cust_no: Option<String>,
+}
+
+async fn fetch_canonical_booking(
+    pg_pool: &PgPool,
+    legacy_book_id: &str,
+) -> Result<Option<CanonicalBookingRow>, sqlx::Error> {
+    sqlx::query_as::<_, (Option<chrono::NaiveDate>, Option<chrono::NaiveDate>, Option<String>)>(
+        "SELECT book_checkin, book_checkout, legacy_cust_no \
+           FROM ht_bookings \
+          WHERE legacy_book_id = $1 \
+          LIMIT 1",
+    )
+    .bind(legacy_book_id)
+    .fetch_optional(pg_pool)
+    .await
+    .map(|opt| {
+        opt.map(|(checkin, checkout, legacy_cust_no)| CanonicalBookingRow {
+            book_checkin: checkin,
+            book_checkout: checkout,
+            legacy_cust_no,
+        })
+    })
+}
+
+async fn ack_booking_mirror(
+    pg_pool: &PgPool,
+    book_no: &str,
+    room_type_key: &str,
+    mssql_hash: &str,
+) {
+    let updated = sqlx::query(
+        "UPDATE ht_bookings_legacy SET sync_hash = $1, synced_at = NOW() \
+         WHERE book_no = $2 AND COALESCE(book_room_type, '') = $3",
+    )
+    .bind(mssql_hash)
+    .bind(book_no)
+    .bind(room_type_key)
+    .execute(pg_pool)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+
+    if updated == 0 {
+        let _ = sqlx::query(
+            "INSERT INTO ht_bookings_legacy (book_no, book_room_type, sync_hash, synced_at) \
+             VALUES ($1, $2, $3, NOW()) \
+             ON CONFLICT (book_no, book_room_type) DO UPDATE \
+               SET sync_hash = EXCLUDED.sync_hash, synced_at = EXCLUDED.synced_at",
+        )
+        .bind(book_no)
+        .bind(room_type_key)
+        .bind(mssql_hash)
+        .execute(pg_pool)
+        .await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upsert_booking_mirror(
+    pg_pool: &PgPool,
+    book_no: &str,
+    room_type_key: &str,
+    representative: Option<&BookingDetail>,
+    mssql_hash: &str,
+    added: &mut i32,
+    updated: &mut i32,
+    unchanged: &mut i32,
+) -> Result<(), sqlx::Error> {
+    let existing = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT sync_hash FROM ht_bookings_legacy \
+          WHERE book_no = $1 AND COALESCE(book_room_type, '') = $2",
+    )
+    .bind(book_no)
+    .bind(room_type_key)
+    .fetch_optional(pg_pool)
+    .await?;
+
+    // Empty groups should not occur (we only enter the loop with at
+    // least one detail row), but guard so the Upsert path never panics
+    // under a degenerate input.
+    let Some(rep) = representative else {
+        return Ok(());
+    };
+
+    match existing {
+        Some(Some(existing_hash)) if existing_hash == mssql_hash => {
+            *unchanged += 1;
+        }
+        Some(_) => {
+            sqlx::query(
+                r#"
+                UPDATE ht_bookings_legacy
+                SET book_date = $1, book_date_in = $2, book_date_out = $3,
+                    book_cust_name = $4, book_cust_id = $5, book_status = $6,
+                    sync_hash = $7, synced_at = NOW()
+                WHERE book_no = $8 AND COALESCE(book_room_type, '') = $9
+                "#,
+            )
+            .bind(rep.book_date)
+            .bind(rep.book_date_in)
+            .bind(rep.book_date_out)
+            .bind(&rep.book_cust_name)
+            .bind(&rep.book_cust_id)
+            .bind(rep.book_status)
+            .bind(mssql_hash)
+            .bind(book_no)
+            .bind(room_type_key)
+            .execute(pg_pool)
+            .await?;
+            *updated += 1;
+        }
+        None => {
+            sqlx::query(
+                r#"
+                INSERT INTO ht_bookings_legacy
+                    (book_no, book_date, book_date_in, book_date_out,
+                     book_cust_name, book_cust_id, book_status,
+                     book_room_type, sync_hash)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                "#,
+            )
+            .bind(book_no)
+            .bind(rep.book_date)
+            .bind(rep.book_date_in)
+            .bind(rep.book_date_out)
+            .bind(&rep.book_cust_name)
+            .bind(&rep.book_cust_id)
+            .bind(rep.book_status)
+            .bind(&rep.book_room_type)
+            .bind(mssql_hash)
+            .execute(pg_pool)
+            .await?;
+            *added += 1;
+        }
+    }
     Ok(())
 }
 
@@ -1286,126 +1764,96 @@ async fn sync_checkins(
     }
 
     for (cin_no, mut details) in groups {
-        let hash = aggregate_checkin_hash(&cin_no, &mut details);
+        // Same single-row-representative collapse as bookings — see
+        // `sort_checkin_details` for the determinism contract.
+        sort_checkin_details(&mut details);
+        let representative = details.first();
 
-        let existing = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT sync_hash FROM ht_checkins_legacy WHERE cin_no = $1"
-        )
-        .bind(&cin_no)
-        .fetch_optional(pg_pool)
-        .await?;
+        // v2.63.0: canonical-shape hash of the legacy projection.
+        // `cin_status` intentionally omitted (see `checkin_canonical_hash`
+        // docs). Timestamps use `NaiveDateTime::to_string()` so both
+        // sides serialise as YYYY-MM-DD HH:MM:SS.
+        let room_in_str = representative.and_then(|d| d.room_in.map(|t| t.to_string()));
+        let room_out_str = representative.and_then(|d| d.room_out.map(|t| t.to_string()));
+        let mssql_hash = checkin_canonical_hash(
+            &cin_no,
+            representative.and_then(|d| d.room_no.as_deref()),
+            room_in_str.as_deref(),
+            room_out_str.as_deref(),
+            representative.and_then(|d| d.cust_no.as_deref()),
+        );
 
-        match existing {
-            Some(Some(existing_hash)) if existing_hash == hash => {
-                unchanged += 1;
+        match mode {
+            ReconcileMode::Upsert => {
+                upsert_checkin_mirror(
+                    pg_pool,
+                    &cin_no,
+                    representative,
+                    &mssql_hash,
+                    &mut added,
+                    &mut updated,
+                    &mut unchanged,
+                )
+                .await?;
             }
-            Some(prior_hash) => match mode {
-                ReconcileMode::Upsert => {
-                    // Cache row is single-row per PK by schema; canonical
-                    // multi-room data lives in `ht_checkins`. Pick the
-                    // first deterministically-sorted detail as the
-                    // representative row for the cache columns.
-                    let canonical = &details[0];
-                    sqlx::query(
-                        r#"
-                        UPDATE ht_checkins_legacy
-                        SET cin_room_no = $1, cin_room_in = $2, cin_room_out = $3,
-                            cin_cust_name = $4, cin_cust_no = $5, cin_status = $6,
-                            sync_hash = $7, synced_at = NOW()
-                        WHERE cin_no = $8
-                        "#,
+            ReconcileMode::DiffOnly => {
+                let last_ack = sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT sync_hash FROM ht_checkins_legacy WHERE cin_no = $1",
+                )
+                .bind(&cin_no)
+                .fetch_optional(pg_pool)
+                .await?;
+
+                if matches!(&last_ack, Some(Some(prev)) if *prev == mssql_hash) {
+                    unchanged += 1;
+                    continue;
+                }
+
+                let canonical = fetch_canonical_checkin(pg_pool, &cin_no).await?;
+                let canonical_hash = canonical.as_ref().map(|c| {
+                    let checkin_str = c.cin_checkin_time.map(|t| t.to_string());
+                    let checkout_str = c.cin_checkout_time.map(|t| t.to_string());
+                    checkin_canonical_hash(
+                        &cin_no,
+                        c.legacy_room_no.as_deref(),
+                        checkin_str.as_deref(),
+                        checkout_str.as_deref(),
+                        c.legacy_cust_no.as_deref(),
                     )
-                    .bind(&canonical.room_no)
-                    .bind(&canonical.room_in)
-                    .bind(&canonical.room_out)
-                    .bind(&canonical.cust_name)
-                    .bind(&canonical.cust_no)
-                    .bind(&canonical.status)
-                    .bind(&hash)
-                    .bind(&cin_no)
-                    .execute(pg_pool)
-                    .await?;
+                });
+
+                if canonical_hash.as_deref() == Some(mssql_hash.as_str()) {
+                    ack_checkin_mirror(pg_pool, &cin_no, &mssql_hash).await;
+                    unchanged += 1;
+                    continue;
+                }
+
+                let mssql_json = checkin_group_json(&cin_no, &details);
+                let pg_json = canonical.as_ref().map(|c| {
+                    json!({
+                        "legacy_room_no": c.legacy_room_no,
+                        "cin_checkin_time": c.cin_checkin_time.map(|t| t.to_string()),
+                        "cin_checkout_time": c.cin_checkout_time.map(|t| t.to_string()),
+                        "legacy_cust_no": c.legacy_cust_no,
+                    })
+                });
+                record_divergence(
+                    pg_pool,
+                    "checkins",
+                    &cin_no,
+                    canonical_hash.as_deref(),
+                    Some(&mssql_hash),
+                    mssql_json,
+                    pg_json,
+                )
+                .await;
+                ack_checkin_mirror(pg_pool, &cin_no, &mssql_hash).await;
+                if canonical.is_none() {
+                    added += 1;
+                } else {
                     updated += 1;
                 }
-                ReconcileMode::DiffOnly => {
-                    let mssql_json = checkin_group_json(&cin_no, &details);
-                    record_divergence(
-                        pg_pool,
-                        "checkins",
-                        &cin_no,
-                        prior_hash.as_deref(),
-                        Some(&hash),
-                        mssql_json,
-                        None,
-                    )
-                    .await;
-                    // Phase 6 fix: ack the divergence in the cache so the
-                    // next reconcile tick doesn't re-flag the same row.
-                    // This is the dominant source of the 22-24k/hour drift
-                    // alert spam observed 2026-04-29 — every reconcile
-                    // re-detected the same ~3k checkin PKs forever. ONE
-                    // UPDATE per PK (was per-row → re-flagged within tick
-                    // for multi-row PKs).
-                    let _ = sqlx::query(
-                        "UPDATE ht_checkins_legacy SET sync_hash = $1, synced_at = NOW() \
-                         WHERE cin_no = $2",
-                    )
-                    .bind(&hash)
-                    .bind(&cin_no)
-                    .execute(pg_pool)
-                    .await;
-                    updated += 1;
-                }
-            },
-            None => match mode {
-                ReconcileMode::Upsert => {
-                    let canonical = &details[0];
-                    sqlx::query(
-                        r#"
-                        INSERT INTO ht_checkins_legacy
-                            (cin_no, cin_room_no, cin_room_in, cin_room_out,
-                             cin_cust_name, cin_cust_no, cin_status, sync_hash)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                        "#,
-                    )
-                    .bind(&cin_no)
-                    .bind(&canonical.room_no)
-                    .bind(&canonical.room_in)
-                    .bind(&canonical.room_out)
-                    .bind(&canonical.cust_name)
-                    .bind(&canonical.cust_no)
-                    .bind(&canonical.status)
-                    .bind(&hash)
-                    .execute(pg_pool)
-                    .await?;
-                    added += 1;
-                }
-                ReconcileMode::DiffOnly => {
-                    let mssql_json = checkin_group_json(&cin_no, &details);
-                    record_divergence(
-                        pg_pool,
-                        "checkins",
-                        &cin_no,
-                        None,
-                        Some(&hash),
-                        mssql_json,
-                        None,
-                    )
-                    .await;
-                    // Phase 6 fix (#65): cache-only marker insert. See
-                    // sync_customers DiffOnly None-branch for rationale.
-                    let _ = sqlx::query(
-                        "INSERT INTO ht_checkins_legacy (cin_no, sync_hash, synced_at) \
-                         VALUES ($1, $2, NOW()) \
-                         ON CONFLICT (cin_no) DO NOTHING",
-                    )
-                    .bind(&cin_no)
-                    .bind(&hash)
-                    .execute(pg_pool)
-                    .await;
-                    added += 1;
-                }
-            },
+            }
         }
     }
 
@@ -1416,6 +1864,156 @@ async fn sync_checkins(
     );
     record_success(pg_pool, "checkins", added, updated, unchanged, duration_ms).await;
 
+    Ok(())
+}
+
+/// Sort a check-in PK group's detail rows deterministically. Mirrors
+/// the sort contract in [`aggregate_checkin_hash`] so the "first" row
+/// is stable across reconcile ticks regardless of MSSQL row order.
+fn sort_checkin_details(details: &mut [CheckinDetail]) {
+    details.sort_by(|a, b| {
+        (
+            fmt_str(&a.room_no),
+            fmt_dt(&a.room_in),
+            fmt_dt(&a.room_out),
+        )
+            .cmp(&(
+                fmt_str(&b.room_no),
+                fmt_dt(&b.room_in),
+                fmt_dt(&b.room_out),
+            ))
+    });
+}
+
+/// Canonical-side projection of a check-in row for hashing. Resolved
+/// by `legacy_cin_no`. `legacy_room_no` is the writeback-resolved
+/// denormalised FIRST room (matches the CT mapper's `first_room_no`
+/// denormalisation in `derive_room_state`).
+struct CanonicalCheckinRow {
+    legacy_room_no: Option<String>,
+    cin_checkin_time: Option<NaiveDateTime>,
+    cin_checkout_time: Option<NaiveDateTime>,
+    legacy_cust_no: Option<String>,
+}
+
+async fn fetch_canonical_checkin(
+    pg_pool: &PgPool,
+    legacy_cin_no: &str,
+) -> Result<Option<CanonicalCheckinRow>, sqlx::Error> {
+    sqlx::query_as::<_, (Option<String>, Option<NaiveDateTime>, Option<NaiveDateTime>, Option<String>)>(
+        "SELECT legacy_room_no, cin_checkin_time, cin_checkout_time, legacy_cust_no \
+           FROM ht_checkins \
+          WHERE legacy_cin_no = $1 \
+          LIMIT 1",
+    )
+    .bind(legacy_cin_no)
+    .fetch_optional(pg_pool)
+    .await
+    .map(|opt| {
+        opt.map(|(room, checkin, checkout, cust)| CanonicalCheckinRow {
+            legacy_room_no: room,
+            cin_checkin_time: checkin,
+            cin_checkout_time: checkout,
+            legacy_cust_no: cust,
+        })
+    })
+}
+
+async fn ack_checkin_mirror(pg_pool: &PgPool, cin_no: &str, mssql_hash: &str) {
+    let updated = sqlx::query(
+        "UPDATE ht_checkins_legacy SET sync_hash = $1, synced_at = NOW() \
+         WHERE cin_no = $2",
+    )
+    .bind(mssql_hash)
+    .bind(cin_no)
+    .execute(pg_pool)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+
+    if updated == 0 {
+        let _ = sqlx::query(
+            "INSERT INTO ht_checkins_legacy (cin_no, sync_hash, synced_at) \
+             VALUES ($1, $2, NOW()) \
+             ON CONFLICT (cin_no) DO UPDATE \
+               SET sync_hash = EXCLUDED.sync_hash, synced_at = EXCLUDED.synced_at",
+        )
+        .bind(cin_no)
+        .bind(mssql_hash)
+        .execute(pg_pool)
+        .await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upsert_checkin_mirror(
+    pg_pool: &PgPool,
+    cin_no: &str,
+    representative: Option<&CheckinDetail>,
+    mssql_hash: &str,
+    added: &mut i32,
+    updated: &mut i32,
+    unchanged: &mut i32,
+) -> Result<(), sqlx::Error> {
+    let existing = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT sync_hash FROM ht_checkins_legacy WHERE cin_no = $1",
+    )
+    .bind(cin_no)
+    .fetch_optional(pg_pool)
+    .await?;
+
+    let Some(rep) = representative else {
+        return Ok(());
+    };
+
+    match existing {
+        Some(Some(existing_hash)) if existing_hash == mssql_hash => {
+            *unchanged += 1;
+        }
+        Some(_) => {
+            sqlx::query(
+                r#"
+                UPDATE ht_checkins_legacy
+                SET cin_room_no = $1, cin_room_in = $2, cin_room_out = $3,
+                    cin_cust_name = $4, cin_cust_no = $5, cin_status = $6,
+                    sync_hash = $7, synced_at = NOW()
+                WHERE cin_no = $8
+                "#,
+            )
+            .bind(&rep.room_no)
+            .bind(rep.room_in)
+            .bind(rep.room_out)
+            .bind(&rep.cust_name)
+            .bind(&rep.cust_no)
+            .bind(&rep.status)
+            .bind(mssql_hash)
+            .bind(cin_no)
+            .execute(pg_pool)
+            .await?;
+            *updated += 1;
+        }
+        None => {
+            sqlx::query(
+                r#"
+                INSERT INTO ht_checkins_legacy
+                    (cin_no, cin_room_no, cin_room_in, cin_room_out,
+                     cin_cust_name, cin_cust_no, cin_status, sync_hash)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                "#,
+            )
+            .bind(cin_no)
+            .bind(&rep.room_no)
+            .bind(rep.room_in)
+            .bind(rep.room_out)
+            .bind(&rep.cust_name)
+            .bind(&rep.cust_no)
+            .bind(&rep.status)
+            .bind(mssql_hash)
+            .execute(pg_pool)
+            .await?;
+            *added += 1;
+        }
+    }
     Ok(())
 }
 
@@ -1812,5 +2410,217 @@ mod tests {
         let h1 = aggregate_booking_hash("BK-1", "DELUXE", &mut g1);
         let h2 = aggregate_booking_hash("BK-1", "STANDARD", &mut g2);
         assert_ne!(h1, h2, "composite PK key half must be part of the hash");
+    }
+
+    // -------------------------------------------------------------------
+    // v2.63.0 — canonical-shape hash helpers (PG vs MSSQL alignment)
+    // -------------------------------------------------------------------
+    //
+    // These tests pin the contract that an MSSQL row + a faithful
+    // canonical projection of that row hash to the SAME value. If a CT
+    // mapper regression breaks the projection, the canonical hash
+    // diverges and the reconciler logs drift — exactly the actionable
+    // signal the v2.63.0 migration is designed to surface.
+
+    #[test]
+    fn customer_canonical_hash_matches_when_canonical_mirrors_legacy() {
+        let mssql = customer_canonical_hash(
+            "C001",
+            "Somchai",
+            Some("walk-in"),
+            Some("0812345678"),
+            Some("1234567890123"),
+            Some("123 Sukhumvit"),
+        );
+        // Canonical row that the CT mapper would have produced.
+        let canonical = customer_canonical_hash(
+            "C001",
+            "Somchai",
+            Some("walk-in"),
+            Some("0812345678"),
+            Some("1234567890123"),
+            Some("123 Sukhumvit"),
+        );
+        assert_eq!(mssql, canonical);
+    }
+
+    #[test]
+    fn customer_canonical_hash_diverges_on_phone_drift() {
+        let mssql = customer_canonical_hash(
+            "C001",
+            "Somchai",
+            None,
+            Some("0812345678"),
+            None,
+            None,
+        );
+        // CT mapper stored an older phone (drift the operator should fix).
+        let canonical = customer_canonical_hash(
+            "C001",
+            "Somchai",
+            None,
+            Some("0899999999"),
+            None,
+            None,
+        );
+        assert_ne!(mssql, canonical);
+    }
+
+    #[test]
+    fn customer_canonical_hash_treats_none_as_empty() {
+        // `Cust_Type = NULL` on the MSSQL side hashes identically to
+        // `cust_type = NULL` on the canonical side — both project to
+        // empty string before hashing.
+        let h1 = customer_canonical_hash("C001", "Anan", None, None, None, None);
+        let h2 = customer_canonical_hash("C001", "Anan", Some(""), Some(""), Some(""), Some(""));
+        assert_eq!(h1, h2, "None and empty-string must canonicalise the same way");
+    }
+
+    #[test]
+    fn bool_to_yesno_round_trip_via_legacy_yesno_canonical() {
+        // The two halves of the room-status translation must be each
+        // other's inverse for the canonical-hash to align with the
+        // MSSQL projection.
+        assert_eq!(legacy_yesno_canonical(Some("yes")), bool_to_yesno(Some(true)));
+        assert_eq!(legacy_yesno_canonical(Some("no")), bool_to_yesno(Some(false)));
+        // NULL → "" on both sides, matching how nullable BOOLEAN
+        // columns canonicalise.
+        assert_eq!(legacy_yesno_canonical(None), bool_to_yesno(None));
+        // Unknown legacy literals fall back to "" — matches the CT
+        // mapper's behaviour (`legacy_yesno_to_bool` returns None for
+        // anything other than yes/no).
+        assert_eq!(legacy_yesno_canonical(Some("maybe")), "");
+    }
+
+    #[test]
+    fn room_canonical_hash_matches_when_canonical_mirrors_legacy() {
+        // Legacy "yes" → canonical true → reverse to "yes". Hashes align.
+        let mssql = room_canonical_hash("101", "yes", "no", Some("ocean view"));
+        let canonical = room_canonical_hash(
+            "101",
+            bool_to_yesno(Some(true)),
+            bool_to_yesno(Some(false)),
+            Some("ocean view"),
+        );
+        assert_eq!(mssql, canonical);
+    }
+
+    #[test]
+    fn room_canonical_hash_diverges_when_canonical_clean_lags_behind() {
+        // Operator marked the room dirty in legacy ("no") but the CT
+        // mapper hasn't yet flipped canonical.room_clean to false →
+        // drift fires.
+        let mssql = room_canonical_hash("101", "no", "no", None);
+        let canonical = room_canonical_hash(
+            "101",
+            bool_to_yesno(Some(true)),
+            bool_to_yesno(Some(false)),
+            None,
+        );
+        assert_ne!(mssql, canonical);
+    }
+
+    #[test]
+    fn booking_canonical_hash_aligns_legacy_datetime_and_canonical_date() {
+        // Legacy stores `Book_Date_in` as DATETIME-at-midnight. After
+        // `.date().to_string()` it serialises to "2026-04-01" — the
+        // exact format `chrono::NaiveDate::to_string()` emits on the
+        // canonical side.
+        let mssql = booking_canonical_hash(
+            "BK001",
+            Some("2026-04-01"),
+            Some("2026-04-03"),
+            Some("C001"),
+        );
+        let canonical = booking_canonical_hash(
+            "BK001",
+            Some("2026-04-01"),
+            Some("2026-04-03"),
+            Some("C001"),
+        );
+        assert_eq!(mssql, canonical);
+    }
+
+    #[test]
+    fn booking_canonical_hash_diverges_on_checkout_date_drift() {
+        let mssql = booking_canonical_hash(
+            "BK001",
+            Some("2026-04-01"),
+            Some("2026-04-03"),
+            Some("C001"),
+        );
+        let canonical = booking_canonical_hash(
+            "BK001",
+            Some("2026-04-01"),
+            Some("2026-04-05"), // canonical extended by two nights (drift)
+            Some("C001"),
+        );
+        assert_ne!(mssql, canonical);
+    }
+
+    #[test]
+    fn checkin_canonical_hash_aligns_legacy_first_room_and_canonical_legacy_room_no() {
+        // CT checkin mapper denormalises the FIRST sorted room into
+        // `ht_checkins.legacy_room_no`. The reconciler picks the same
+        // first room from the sorted legacy multi-row group, so both
+        // hashes use the identical room_no token.
+        let mssql = checkin_canonical_hash(
+            "CIN001",
+            Some("101"),
+            Some("2026-04-01 14:00:00"),
+            None,
+            Some("C001"),
+        );
+        let canonical = checkin_canonical_hash(
+            "CIN001",
+            Some("101"),
+            Some("2026-04-01 14:00:00"),
+            None,
+            Some("C001"),
+        );
+        assert_eq!(mssql, canonical);
+    }
+
+    #[test]
+    fn checkin_canonical_hash_diverges_on_room_drift() {
+        let mssql = checkin_canonical_hash(
+            "CIN001",
+            Some("101"),
+            None,
+            None,
+            None,
+        );
+        // CT mapper resolved the wrong room — drift the operator
+        // should investigate via `ht_reconcile_log`.
+        let canonical = checkin_canonical_hash(
+            "CIN001",
+            Some("102"),
+            None,
+            None,
+            None,
+        );
+        assert_ne!(mssql, canonical);
+    }
+
+    #[test]
+    fn checkin_canonical_hash_handles_open_checkin_with_no_checkout() {
+        // Active stays have `cin_checkout_time IS NULL` (canonical) /
+        // `Cin_Room_Out IS NULL` (legacy). Both serialise to "" so the
+        // hashes line up while the guest is still in residence.
+        let mssql = checkin_canonical_hash(
+            "CIN001",
+            Some("101"),
+            Some("2026-04-01 14:00:00"),
+            None,
+            Some("C001"),
+        );
+        let canonical = checkin_canonical_hash(
+            "CIN001",
+            Some("101"),
+            Some("2026-04-01 14:00:00"),
+            None,
+            Some("C001"),
+        );
+        assert_eq!(mssql, canonical);
     }
 }

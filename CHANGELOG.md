@@ -49,6 +49,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Diff-only reconcile job now compares MSSQL against canonical `ht_*`
+  instead of the demoted `ht_*_legacy` mirrors** — `scheduler/sync.rs`
+  (the 15-min drift tripwire) had been comparing MSSQL hashes against
+  `ht_*_legacy.sync_hash`, but after the Phase 5.5 cutover on 2026-04-28
+  the mirror tables stopped getting their data columns populated by the
+  CT watcher — only `sync_hash`/`synced_at` tick. As a result, drift
+  detection had become cosmetic noise: `ht_reconcile_log` accumulated
+  ~2300+ unresolved entries pointing at nothing actionable (the
+  canonical PG state was current via the CT watcher; only the mirror
+  was stale). The DiffOnly hot path now hashes each MSSQL row in
+  canonical shape and compares against the same-shape hash of the
+  canonical `ht_*` row (joined by `legacy_cust_no` / `legacy_room_no` /
+  `legacy_book_id` / `legacy_cin_no`). Drift now means "the CT mapper
+  has a real gap" — an actionable signal worth alerting on. The field
+  set is narrowed to columns the CT mapper actually projects (e.g.
+  drops `Room_Group`/`Room_Book_Time`/`Book_Cust_Name` denormalisations
+  that canonical doesn't store), so the signal-to-noise ratio stays
+  meaningful. `Upsert` mode is retained as a forensic escape hatch but
+  is no longer exercised by any deployed code path. 11 new unit tests
+  cover hash alignment (canonical mirror = legacy → equal hashes),
+  drift sensitivity (any tracked field change → different hashes), and
+  the `bool_to_yesno` / `legacy_yesno_canonical` round-trip contract
+  for room.clean/maintenance translation. The migration also adds a
+  per-PK cache-only ack via `ht_*_legacy.sync_hash`: each unique
+  `mssql_hash` is logged once per PK and subsequent ticks short-circuit
+  before re-querying canonical, preserving the Phase 6 anti-spam
+  property of the prior implementation.
 - **Stay-extension dates now propagate from legacy** — `sync/mappers/
   checkin.rs::derive_stay_range` now sources `cin_expected_checkout`
   from `max(HT_CheckIn_Ds.Cin_Room_Out)` across still-active Ds rows,
