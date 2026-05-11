@@ -454,15 +454,20 @@ pub(crate) async fn upsert_customer_from_row(
     // apply within the same outer TX) may have just inserted the row.
     // `ON CONFLICT DO NOTHING` against the partial unique index on
     // `legacy_cust_no` collapses that case to a no-op so we don't error
-    // out on the duplicate. The RETURNING clause is therefore optional
-    // (returns 0 rows on conflict), and we follow up with a SELECT to
-    // resolve the canonical `cust_id` in both branches.
+    // out on the duplicate. The matching `WHERE legacy_cust_no IS NOT
+    // NULL` predicate is required because `ON CONFLICT (col)` only
+    // matches a partial unique index when the same predicate is named
+    // explicitly (PostgreSQL 42P10 otherwise). The RETURNING clause is
+    // therefore optional (returns 0 rows on conflict), and we follow
+    // up with a SELECT to resolve the canonical `cust_id` in both
+    // branches.
     let inserted: Option<(i32,)> = sqlx::query_as(
         "INSERT INTO ht_customers \
              (cust_firstname, cust_title, cust_idcard, cust_type, \
               cust_email, cust_address, cust_phone, legacy_cust_no) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-         ON CONFLICT (legacy_cust_no) DO NOTHING \
+         ON CONFLICT (legacy_cust_no) WHERE legacy_cust_no IS NOT NULL \
+             DO NOTHING \
          RETURNING cust_id",
     )
     .bind(&projected.cust_name)
