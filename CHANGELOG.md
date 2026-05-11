@@ -40,6 +40,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backfill-time value forever — making the dashboard's maintenance
   indicator unreliable. Silent UPSERT (no domain event emitted),
   matching the existing pattern for non-clean column edits.
+- **`/api/checkins` "Recent Activity" list no longer blank** — same
+  Phase 5.5 fallout: the route was reading `ht_checkins_legacy` whose
+  data columns are NULL for every row inserted after 2026-04-28, so
+  the dashboard's recent-activity panel rendered "ไม่ระบุ / ห้อง /
+  1 ม.ค. - 1 ม.ค." for every entry. Rewritten to JOIN canonical
+  `ht_checkins` against `ht_rooms_new` (room number) and `ht_customers`
+  (guest name). `Cin_Room_Out` falls back to `cin_expected_checkout`
+  when the guest hasn't actually checked out yet, so active stays
+  display their planned departure instead of epoch.
 - **Checkin CT mapper no longer strands cancellations when legacy
   deleted all `HT_CheckIn_Ds` rows but left the header.** Apply path
   now short-circuits to a `cin_status='cancelled'` UPDATE on the

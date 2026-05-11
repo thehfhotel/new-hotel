@@ -2,7 +2,11 @@
 //!
 //! - GET /api/checkins - List check-ins (paginated with filters)
 //!
-//! Reads from PG (`ht_checkins_legacy` cache, fed by drift-reconcile + CT mappers).
+//! Reads canonical PG tables (`ht_checkins` JOIN `ht_rooms_new` + `ht_customers`).
+//! The legacy `ht_checkins_legacy` mirror was demoted to hash-only drift detection
+//! by the Phase 5.5 cutover (2026-04-28), so its data columns are NULL for all
+//! rows inserted after that date — reading it left "Recent Activity" showing
+//! "ไม่ระบุ / ห้อง / 1 ม.ค. - 1 ม.ค." for every check-in.
 
 use axum::{
     extract::{Query, State},
@@ -49,7 +53,13 @@ pub async fn list_checkins(
     }
 }
 
-/// Read check-ins from PostgreSQL (ht_checkins_legacy)
+/// Read check-ins from canonical PG (`ht_checkins` JOIN `ht_rooms_new` + `ht_customers`).
+///
+/// The output uses legacy field names (`Cin_Room_No`, `Cin_cust_name`, etc.)
+/// via the `CheckIn` model's serde renames so the frontend contract is
+/// preserved. `Cin_Room_Out` falls back to `cin_expected_checkout` when the
+/// guest hasn't actually checked out yet — otherwise active stays would render
+/// as epoch (Jan 1) in the UI.
 async fn list_checkins_pg(
     pool: &PgPool,
     params: CheckInsQuery,
@@ -63,25 +73,29 @@ async fn list_checkins_pg(
     let mut next_param_index: i32 = 1;
 
     if params.status.is_some() {
-        conditions.push(format!("cin_status = ${}", next_param_index));
+        conditions.push(format!("c.cin_status = ${}", next_param_index));
         next_param_index += 1;
     }
 
     // Date range filter: find check-ins that OVERLAP the given range.
-    // A check-in overlaps if it starts before the end AND ends after the start.
+    // For active stays without an actual checkout, fall back to the planned
+    // checkout date so the row still participates in overlap checks.
     if params.start_date.is_some() {
-        conditions.push(format!("cin_room_out::date >= ${}", next_param_index));
+        conditions.push(format!(
+            "COALESCE(c.cin_checkout_time::date, c.cin_expected_checkout) >= ${}",
+            next_param_index
+        ));
         next_param_index += 1;
     }
 
     if params.end_date.is_some() {
-        conditions.push(format!("cin_room_in::date <= ${}", next_param_index));
+        conditions.push(format!(
+            "c.cin_checkin_time::date <= ${}",
+            next_param_index
+        ));
         next_param_index += 1;
     }
 
-    // Discard the final increment to keep the unused-assignment lint quiet
-    // when `end_date` is the last filter; the bind chain below still relies
-    // on the placeholders generated above.
     let _ = next_param_index;
 
     let where_clause = if conditions.is_empty() {
@@ -90,9 +104,10 @@ async fn list_checkins_pg(
         format!("WHERE {}", conditions.join(" AND "))
     };
 
-    // Get total count
+    // Total count — same WHERE clause, no JOIN needed (status + dates are on
+    // ht_checkins directly).
     let count_query = format!(
-        "SELECT COUNT(*)::int as total FROM ht_checkins_legacy {}",
+        "SELECT COUNT(*)::int as total FROM ht_checkins c {}",
         where_clause
     );
 
@@ -107,19 +122,25 @@ async fn list_checkins_pg(
         .and_then(|r| r.try_get::<i32, _>("total").ok())
         .unwrap_or(0);
 
-    // Get paginated data
+    // Paginated data. Customer name is built from first + last, trimmed,
+    // because cust_lastname is nullable. NULLIF/TRIM keeps the result NULL
+    // when both halves are empty so the frontend's "ไม่ระบุ" fallback fires.
     let data_query = format!(
         r#"
         SELECT
-            cin_no,
-            cin_room_no,
-            cin_room_in,
-            cin_room_out,
-            cin_cust_name,
-            cin_status
-        FROM ht_checkins_legacy
+            c.cin_no                                AS cin_no,
+            COALESCE(r.room_no, c.legacy_room_no)   AS cin_room_no,
+            c.cin_checkin_time                      AS cin_room_in,
+            COALESCE(c.cin_checkout_time, c.cin_expected_checkout::timestamp) AS cin_room_out,
+            NULLIF(TRIM(BOTH ' ' FROM
+                COALESCE(cu.cust_firstname, '') || ' ' || COALESCE(cu.cust_lastname, '')
+            ), '')                                  AS cin_cust_name,
+            c.cin_status                            AS cin_status
+        FROM ht_checkins c
+        LEFT JOIN ht_rooms_new r ON r.room_id = c.cin_room_id
+        LEFT JOIN ht_customers cu ON cu.cust_id = c.cin_cust_id
         {}
-        ORDER BY cin_room_in DESC
+        ORDER BY c.cin_checkin_time DESC
         OFFSET {} LIMIT {}
         "#,
         where_clause, offset, params.limit
