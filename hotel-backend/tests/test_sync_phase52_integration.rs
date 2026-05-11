@@ -307,6 +307,9 @@ async fn room_master_clean_flip_emits_marked_clean_event() {
         .with("Room_Type", MockValue::Str("Standard".into()))
         .with("Room_Clean", MockValue::Str("yes".into()))
         .with("Room_Use", MockValue::Str("no".into()))
+        // `Room_Manternace` (legacy typo) became required after v2.63.0
+        // extended the room mapper to project the maintenance flag.
+        .with("Room_Manternace", MockValue::Str("no".into()))
         .with("Room_Details", MockValue::Null);
 
     let mut tx = pool.begin().await.unwrap();
@@ -370,6 +373,9 @@ async fn room_master_unchanged_clean_skips_event() {
         .with("Room_Type", MockValue::Str("Standard".into()))
         .with("Room_Clean", MockValue::Str("yes".into())) // already true
         .with("Room_Use", MockValue::Str("no".into()))
+        // `Room_Manternace` (legacy typo) became required after v2.63.0
+        // extended the room mapper to project the maintenance flag.
+        .with("Room_Manternace", MockValue::Str("no".into()))
         .with("Room_Details", MockValue::Null);
 
     let mut tx = pool.begin().await.unwrap();
