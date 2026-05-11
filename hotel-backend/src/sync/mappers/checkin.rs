@@ -693,7 +693,8 @@ fn project_aggregate(
     // synchronised with the ledger).
     let paid_amount = header.try_get_decimal("Total_Price_Pay")?;
 
-    let (cin_checkin_time, cin_expected_checkout) = derive_stay_range(header)?;
+    let (cin_checkin_time, cin_expected_checkout) =
+        derive_stay_range(header, &agg.rooms)?;
 
     // Per-room state determines status + checkout-completion.
     let room_state = derive_room_state(&agg.rooms, &legacy_status_raw)?;
@@ -818,9 +819,36 @@ fn derive_room_state(
     })
 }
 
-/// `HT_CheckIn_H.Cin_Date_in/Out` carry the planned stay window.
+/// Derive the canonical stay range — `(cin_checkin_time,
+/// cin_expected_checkout)` — from the legacy aggregate.
+///
+/// `cin_checkin_time` is always sourced from `HT_CheckIn_H.Cin_Date_in`.
+/// That value is set on insert and never moves on extension.
+///
+/// `cin_expected_checkout` is the trickier piece. The legacy iHOTEL app
+/// writes extensions to `HT_CheckIn_Ds.Cin_Room_Out`, NOT to
+/// `HT_CheckIn_H.Cin_Date_Out`. Per
+/// `docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_CheckIn_Ds` (line
+/// "Update on extend (ClickUSE.cs:1146): updates Cin_Room_Out for stay
+/// extension."), the Ds-row value is the source of truth for the
+/// current expected checkout once a stay has been extended.
+///
+/// Strategy:
+/// 1. Compute `max(Cin_Room_Out)` across Ds rows that are NOT already
+///    `'Check-Out'`. Already-checked-out rooms carry the actual
+///    departure timestamp, which is stale relative to a later
+///    extension on other still-active rooms.
+/// 2. Fall back to `HT_CheckIn_H.Cin_Date_Out` when:
+///    - no Ds rows are loaded yet (transient mid-edit state), OR
+///    - every Ds row is fully checked out (status is `'checked_out'`
+///      anyway; keep the date stable rather than backwards-jumping to
+///      a stale Ds value), OR
+///    - the still-active Ds rows have no `Cin_Room_Out` populated yet
+///      (the legacy app sets `Cin_Room_Out` only after the user picks
+///      a checkout time — until then it's NULL).
 fn derive_stay_range(
     header: &dyn MappableRow,
+    rooms: &[HashMapRow],
 ) -> Result<(NaiveDateTime, NaiveDate), SyncError> {
     let date_in: NaiveDateTime = header
         .try_get_datetime("Cin_Date_in")?
@@ -828,13 +856,37 @@ fn derive_stay_range(
             table: HT_CHECKIN_H,
             message: "Cin_Date_in is NULL on header".into(),
         })?;
-    let date_out: NaiveDateTime = header
+    let header_date_out: NaiveDateTime = header
         .try_get_datetime("Cin_Date_Out")?
         .ok_or_else(|| SyncError::Mapper {
             table: HT_CHECKIN_H,
             message: "Cin_Date_Out is NULL on header".into(),
         })?;
-    Ok((date_in, date_out.date()))
+
+    let expected_checkout = max_room_out_among_active(rooms)?
+        .map(|dt| dt.date())
+        .unwrap_or_else(|| header_date_out.date());
+
+    Ok((date_in, expected_checkout))
+}
+
+/// Largest `Cin_Room_Out` across Ds rows whose `Cin_Room_Status` is NOT
+/// `'Check-Out'`. Returns `None` when no still-active row carries a
+/// populated `Cin_Room_Out` — caller falls back to the header date.
+fn max_room_out_among_active(
+    rooms: &[HashMapRow],
+) -> Result<Option<NaiveDateTime>, SyncError> {
+    let mut latest: Option<NaiveDateTime> = None;
+    for r in rooms {
+        let status = r.try_get_str("Cin_Room_Status")?.unwrap_or_default();
+        if status == CIN_ROOM_STATUS_CHECKED_OUT {
+            continue;
+        }
+        if let Some(out) = r.try_get_datetime("Cin_Room_Out")? {
+            latest = Some(latest.map_or(out, |existing| existing.max(out)));
+        }
+    }
+    Ok(latest)
 }
 
 // -----------------------------------------------------------------------------
@@ -1249,6 +1301,175 @@ mod tests {
              pre-fix"
         );
         assert!(!p.is_fully_checked_out);
+    }
+
+    /// Helper: build an active Ds row that carries an explicit
+    /// `Cin_Room_Out` (the column the legacy app stamps on stay
+    /// extension per `docs/legacy-app/COMPAT_CHEATSHEET.md`
+    /// §`HT_CheckIn_Ds`).
+    fn ds_row_with_room_out(
+        cin_no: &str,
+        room_no: &str,
+        status: &str,
+        room_out: NaiveDateTime,
+    ) -> HashMapRow {
+        ds_row(cin_no, room_no, status).with("Cin_Room_Out", MockValue::DateTime(room_out))
+    }
+
+    fn dt(y: i32, m: u32, d: u32, h: u32, min: u32) -> NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(h, min, 0)
+            .unwrap()
+    }
+
+    // ----- derive_stay_range (stay-extension propagation) ----------------
+
+    /// Regression for the stay-extension bug
+    /// (`docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_CheckIn_Ds`,
+    /// "Update on extend (ClickUSE.cs:1146)"): the legacy app writes
+    /// extensions to `HT_CheckIn_Ds.Cin_Room_Out`, NOT to
+    /// `HT_CheckIn_H.Cin_Date_Out`. The mapper must surface the Ds
+    /// value as `cin_expected_checkout`.
+    #[test]
+    fn derive_stay_range_uses_max_cin_room_out_from_active_ds_rows() {
+        let header = header_row("CH26-005351", "C21607", "ปกติ");
+        // Header says 4/27 but receptionist extended the stay; the Ds
+        // row carries the new checkout date.
+        let extended_out = dt(2026, 4, 30, 12, 0);
+        let rooms = vec![ds_row_with_room_out(
+            "CH26-005351",
+            "402",
+            "เข้าพัก",
+            extended_out,
+        )];
+        let (date_in, expected_out) = derive_stay_range(&header, &rooms).unwrap();
+        assert_eq!(date_in, dt(2026, 4, 26, 14, 30), "checkin time stays on header");
+        assert_eq!(expected_out, extended_out.date(), "extension must propagate");
+    }
+
+    /// Multi-room aggregate: pick the maximum `Cin_Room_Out` across all
+    /// still-active rooms (the latest extension wins).
+    #[test]
+    fn derive_stay_range_picks_latest_room_out_when_multiple_active() {
+        let header = header_row("CH26-005351", "C21607", "ปกติ");
+        let rooms = vec![
+            ds_row_with_room_out("CH26-005351", "402", "เข้าพัก", dt(2026, 4, 28, 12, 0)),
+            ds_row_with_room_out("CH26-005351", "403", "เข้าพัก", dt(2026, 5, 2, 12, 0)),
+            ds_row_with_room_out("CH26-005351", "404", "เข้าพัก", dt(2026, 4, 30, 12, 0)),
+        ];
+        let (_, expected_out) = derive_stay_range(&header, &rooms).unwrap();
+        assert_eq!(
+            expected_out,
+            chrono::NaiveDate::from_ymd_opt(2026, 5, 2).unwrap(),
+            "must pick max across rooms"
+        );
+    }
+
+    /// Empty rooms list (transient mid-edit state): fall back to the
+    /// header `Cin_Date_Out`. Mirrors `derive_room_state`'s
+    /// `rooms.is_empty()` branch.
+    #[test]
+    fn derive_stay_range_falls_back_to_header_when_no_rooms() {
+        let header = header_row("CH26-005351", "C21607", "ปกติ");
+        let (_, expected_out) = derive_stay_range(&header, &[]).unwrap();
+        assert_eq!(
+            expected_out,
+            chrono::NaiveDate::from_ymd_opt(2026, 4, 27).unwrap(),
+            "header date wins when no Ds rows are loaded"
+        );
+    }
+
+    /// All rooms already `'Check-Out'`: their `Cin_Room_Out` carries
+    /// the actual departure timestamp, which would backwards-jump the
+    /// expected date relative to any later extension. Use header.
+    #[test]
+    fn derive_stay_range_falls_back_to_header_when_all_rooms_checked_out() {
+        let header = header_row("CH26-005351", "C21607", "ปกติ");
+        // The dt here is the actual departure (a day BEFORE header's
+        // 4/27 expected). We must NOT pick this — header wins.
+        let rooms = vec![
+            ds_row_with_room_out(
+                "CH26-005351",
+                "402",
+                CIN_ROOM_STATUS_CHECKED_OUT,
+                dt(2026, 4, 25, 11, 0),
+            ),
+            ds_row_with_room_out(
+                "CH26-005351",
+                "403",
+                CIN_ROOM_STATUS_CHECKED_OUT,
+                dt(2026, 4, 25, 11, 0),
+            ),
+        ];
+        let (_, expected_out) = derive_stay_range(&header, &rooms).unwrap();
+        assert_eq!(
+            expected_out,
+            chrono::NaiveDate::from_ymd_opt(2026, 4, 27).unwrap(),
+            "fully-checked-out aggregate must not regress to a stale Ds value"
+        );
+    }
+
+    /// Mixed: one room checked out, another still active. Only the
+    /// active room's `Cin_Room_Out` counts toward the max.
+    #[test]
+    fn derive_stay_range_ignores_checked_out_rows_when_others_active() {
+        let header = header_row("CH26-005351", "C21607", "ปกติ");
+        let rooms = vec![
+            // Already departed — its room_out is stale.
+            ds_row_with_room_out(
+                "CH26-005351",
+                "402",
+                CIN_ROOM_STATUS_CHECKED_OUT,
+                dt(2026, 4, 25, 11, 0),
+            ),
+            // Still occupying with an extended checkout.
+            ds_row_with_room_out("CH26-005351", "403", "เข้าพัก", dt(2026, 5, 1, 12, 0)),
+        ];
+        let (_, expected_out) = derive_stay_range(&header, &rooms).unwrap();
+        assert_eq!(
+            expected_out,
+            chrono::NaiveDate::from_ymd_opt(2026, 5, 1).unwrap(),
+            "checked-out room_out must be ignored, active extension must win"
+        );
+    }
+
+    /// Active rooms exist but `Cin_Room_Out` is NULL on each (the
+    /// legacy app hasn't stamped one yet — booking-only state, pre any
+    /// extension or checkout). Fall back to header.
+    #[test]
+    fn derive_stay_range_falls_back_to_header_when_active_rooms_have_null_room_out() {
+        let header = header_row("CH26-005351", "C21607", "ปกติ");
+        // ds_row default sets Cin_Room_Out=Null.
+        let rooms = vec![ds_row("CH26-005351", "402", "เข้าพัก")];
+        let (_, expected_out) = derive_stay_range(&header, &rooms).unwrap();
+        assert_eq!(
+            expected_out,
+            chrono::NaiveDate::from_ymd_opt(2026, 4, 27).unwrap(),
+            "NULL Cin_Room_Out on active rows falls through to header"
+        );
+    }
+
+    /// End-to-end through `project_aggregate`: the extension date must
+    /// land on the canonical projection's `cin_expected_checkout`.
+    #[test]
+    fn project_aggregate_carries_extended_checkout_from_ds_room_out() {
+        let agg = CheckInAggregate {
+            header: Some(header_row("CH26-005351", "C21607", "ปกติ")),
+            rooms: vec![ds_row_with_room_out(
+                "CH26-005351",
+                "402",
+                "เข้าพัก",
+                dt(2026, 5, 3, 12, 0),
+            )],
+            payments: vec![],
+        };
+        let p = project_aggregate(&agg, "CH26-005351").unwrap();
+        assert_eq!(
+            p.cin_expected_checkout,
+            chrono::NaiveDate::from_ymd_opt(2026, 5, 3).unwrap(),
+            "stay extension on Ds.Cin_Room_Out must surface as cin_expected_checkout"
+        );
     }
 
     #[test]

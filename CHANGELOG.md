@@ -49,6 +49,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Stay-extension dates now propagate from legacy** — `sync/mappers/
+  checkin.rs::derive_stay_range` now sources `cin_expected_checkout`
+  from `max(HT_CheckIn_Ds.Cin_Room_Out)` across still-active Ds rows,
+  falling back to `HT_CheckIn_H.Cin_Date_Out` only when no Ds row is
+  loaded, every Ds row is already `'Check-Out'`, or no active row has
+  a populated `Cin_Room_Out` yet. Per `docs/legacy-app/COMPAT_CHEATSHEET
+  .md` §`HT_CheckIn_Ds` (line "Update on extend (ClickUSE.cs:1146):
+  updates Cin_Room_Out for stay extension."), the legacy iHOTEL writes
+  stay extensions to the Ds row's `Cin_Room_Out`, NOT to the header's
+  `Cin_Date_Out`. The previous mapper only read the header, so
+  extensions never reached canonical PG — 4 production rows
+  (HF Hotel CH26-005351, CH26-005385; HF Ville CH26-001041,
+  CH26-001057) showed `cin_expected_checkout` 3-5 days in the past
+  despite guests still actively staying. Includes 7 unit tests covering
+  the single-room extend, multi-room max, empty-Ds fallback,
+  fully-checked-out fallback, mixed (one checked-out, one active),
+  NULL-Cin_Room_Out fallback, and end-to-end via `project_aggregate`.
+  Backfill applied to the 4 stranded canonical rows (CURRENT_DATE on
+  HF Hotel and HF Ville) so the dashboard isn't misleading until each
+  guest's next CT tick re-projects the aggregate.
 - **Calendar route `/api/rooms/status` migrated off demoted legacy
   mirrors** — `routes/rooms.rs::get_room_status_pg` (the per-room-per-date
   calendar) was the last reader still hitting `ht_rooms_legacy`,
@@ -160,6 +180,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (`project_cancelled_with_deleted_ds_rows_carries_no_room`) plus
     2 new PG-backed integration tests in
     `tests/test_sync_phase54_integration.rs`.
+- **CT watcher / bootstrap survive transient MSSQL outages at startup.**
+  `bin/sync.rs` previously exited with code 1 when the initial
+  `create_pool` failed (e.g. WG tunnel down at container boot). Docker's
+  `restart: on-failure:5` policy then capped retries at 5 attempts —
+  HF Ville observed a 13-minute sync outage on 2026-05-11 because the
+  legacy MSSQL came back online ~10 min after boot, well after Docker
+  gave up. `create_pool_with_retry` now wraps both pool-init sites
+  (CT watcher main + `--bootstrap`) in an exponential-backoff loop
+  (5s, 10s, 20s, 40s, 60s, 60s, ... capped at 60s), Slack-pages once
+  total elapsed crosses 5 min, and never propagates the error to
+  `main()`. PG pool init is intentionally untouched — PG lives in the
+  same docker network and exit-1 on its failure is the right behaviour
+  (docker-compose dependency ordering catches it). New env-var knobs:
+  `LEGACY_SYNC_INIT_RETRY_INITIAL_SECS`,
+  `LEGACY_SYNC_INIT_RETRY_MAX_SECS`,
+  `LEGACY_SYNC_INIT_RETRY_ALERT_AFTER_SECS`. Tests: 6 new unit tests
+  in `src/bin/sync.rs::tests` covering the backoff schedule, saturation
+  behaviour, default config, paging cadence, and an async loop-doesn't-
+  exit assertion against an unreachable MSSQL.
 
 ### Changed
 
