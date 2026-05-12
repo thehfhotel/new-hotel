@@ -5,6 +5,83 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.63.10] - 2026-05-13
+
+### Fixed
+
+- **Coexistence payment concurrency hardening — Track C
+  (`docs/coexistence/audit-2026-05-13.md`).** Four findings spanning T5
+  (concurrency) and T2 (sync mappers). No schema migrations, no UX
+  behavior removed. The spike (2026-04-24 §6) validated booking-edit
+  race-safety with `TABLOCKX`+`HOLDLOCK`, but payment was never
+  retested — this wave closes that gap by applying the same
+  held-through-COMMIT pattern to every payment-touching write.
+  - **T5 CRIT-1 — Payment `Total_Price_Pay` / `Total_Price_vat`
+    re-aggregated from `HT_CheckIn_Pay` rows under
+    UPDLOCK+HOLDLOCK held through COMMIT.**
+    `writeback/recipes/payment.rs` previously emitted
+    `Total_Price_Pay = ISNULL(...,0) + amount` (additive) and
+    `Total_Price_vat = Total_Price_vat + amount` (additive). The
+    header row's X-lock under default Read Committed isolation
+    released at statement end (not COMMIT), so iHOTEL's absolute
+    `SET Total_Price_Pay=<precomputed>` could commit after our
+    additive UPDATE and silently overwrite our contribution —
+    payment vanished from the legacy view. Both UPDATEs now
+    re-aggregate live from `HT_CheckIn_Pay` rows held under
+    UPDLOCK+HOLDLOCK; the lock survives through COMMIT and blocks
+    any concurrent iHOTEL read-modify-write until we finish.
+    Cancelled tender rows (`ISNULL(Cin_Status,'1') <> N'ยกเลิก'`)
+    excluded per T2 CRIT-2.
+  - **T5 HIGH-4 — Checkout `Total_Price_Pay` / `Total_Price_Balance`
+    re-aggregated at recipe time, not trusted from intent payload.**
+    `writeback/recipes/checkout.rs` previously emitted
+    `Total_Price_Pay = <intent payload pay_total>` (absolute). The
+    payload's `pay_total` was computed from PG state at intent-emit
+    time; a payment writeback committing between emit and the
+    checkout's `BEGIN TRAN` would clobber the second payment with
+    the stale value. The recipe now emits a SELECT subquery
+    aggregating live from `HT_CheckIn_Pay` rows under
+    UPDLOCK+HOLDLOCK, same shape as payment.rs. The intent's
+    `pay_total` is kept as a sanity-check input — `execute()` reads
+    the live aggregate and logs a WARN if drift ≥ 0.005 baht.
+  - **T5 HIGH-3 — `HT_Housewife` INSERT guarded by 5-minute dedup
+    window.** `writeback/recipes/mark_clean.rs` previously emitted
+    an unconditional INSERT. With no UNIQUE constraint we control on
+    the legacy schema (read-only), two concurrent mark-clean events
+    (housekeeper in iHOTEL at T0 + mobile app at T0+50ms) both
+    succeeded → audit log over-counted. INSERT now uses
+    `INSERT … SELECT … WHERE NOT EXISTS (SELECT 1 FROM HT_Housewife
+    WHERE h_room=… AND h_cin=… AND h_date > DATEADD(minute, -5,
+    GETDATE()))`. The 5-minute window matches realistic concurrent
+    housekeeping scenarios; beyond it, subsequent marks are treated
+    as legitimate re-cleans.
+  - **T2 CRIT-2 — `Cin_Status` projected on the payment mapper +
+    parent loader.** `sync/mappers/payment.rs::PAYMENT_SELECT_COLS`
+    and `sync/parent_loader.rs::load_checkin_aggregate` now SELECT
+    `Cin_Status` (the per-row cancel marker — `'1'` active or
+    `'ยกเลิก'` cancelled per COMPAT_CHEATSHEET line 106 / 492). The
+    aggregate sweep already mirrors the header's
+    `Total_Price_Pay` (which now correctly excludes cancelled
+    rows via T5 CRIT-1's filter), so this projection closes the
+    CT-pipeline-to-canonical link. `Cin_Pay_Free` and `Cin_Pay_web`
+    also added to the projection so a future aggregate-by-tender
+    canonical column can be derived without another pipeline
+    change. `ht_payments.pay_voided` schema column was already
+    present in `init-db/init-hotelnew.sql` (since v2.13.0), so no
+    new migration is required.
+
+### Security
+
+- **Track C closes a financial-integrity coexistence gap.** Concurrent
+  iHOTEL save-payment + our writeback could silently drop our payment
+  from the legacy view (T5 CRIT-1). Concurrent payment + checkout could
+  silently clobber the second payment (T5 HIGH-4). Concurrent
+  iHOTEL+our-app mark-clean could double-write the housekeeping audit
+  log (T5 HIGH-3). Cancelled payments (`Cin_Status='ยกเลิก'`) were
+  silently kept in `cin_paid_amount` (T2 CRIT-2). All four windows now
+  closed with the UPDLOCK+HOLDLOCK pattern validated under live load in
+  spike §6.
+
 ## [2.63.9] - 2026-05-13
 
 ### Fixed

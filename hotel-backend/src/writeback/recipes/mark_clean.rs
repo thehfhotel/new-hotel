@@ -69,10 +69,36 @@ pub fn build_statements(
         format!(
             "update HT_Rooms set Room_Clean='no',Room_Clean_Time='' where id={room_id}"
         ),
-        // 2. Audit row in HT_Housewife
+        // 2. Audit row in HT_Housewife — Track C T5 HIGH-3 dedup guard
+        //    (`docs/coexistence/audit-2026-05-13.md`).
+        //
+        //    HT_Housewife has no UNIQUE constraint we control (the legacy
+        //    schema is read-only — we cannot add one without breaking the
+        //    legacy app's INSERT path). Without a guard, two concurrent
+        //    mark-clean events (housekeeper marks clean in iHOTEL at T0,
+        //    our mobile app fires the same intent at T0+50ms) both succeed
+        //    and the audit log over-counts.
+        //
+        //    The `WHERE NOT EXISTS` guard skips the INSERT when a matching
+        //    audit row was written for the same (room, prior cin) pair in
+        //    the last 5 minutes. The window matches realistic concurrent
+        //    housekeeping scenarios:
+        //    - A receptionist marks the room clean in iHOTEL and a
+        //      housekeeper marks it clean on the mobile app within minutes
+        //      of each other — coexistence path.
+        //    - The writeback worker retries after a transient network
+        //      failure on COMMIT — idempotency path.
+        //    Anything beyond 5 minutes is treated as a legitimate
+        //    re-clean (e.g. the room was re-occupied and freshly cleaned
+        //    again the same shift).
         format!(
             "INSERT INTO HT_Housewife ([h_name],[h_room],[h_date],[h_note],[h_cin],[h_cin_name]) \
-             VALUES ({by_q}, {room_no_q}, {now_q}, '',{h_cin_q},{h_name_q})"
+             SELECT {by_q}, {room_no_q}, {now_q}, '',{h_cin_q},{h_name_q} \
+             WHERE NOT EXISTS (\
+                 SELECT 1 FROM HT_Housewife \
+                  WHERE h_room={room_no_q} AND h_cin={h_cin_q} \
+                    AND h_date > DATEADD(minute, -5, GETDATE())\
+             )"
         ),
     ]
 }
@@ -267,5 +293,84 @@ mod tests {
         // Apostrophe in room_no (synthetic edge case) must be doubled by sql_quote.
         let sql = build_prior_occupant_sql("3'06");
         assert!(sql.contains("d.Cin_Room_No = '3''06'"));
+    }
+
+    /// Track C — T5 HIGH-3: the HT_Housewife INSERT must be guarded by a
+    /// 5-minute dedup window so concurrent iHOTEL + our-app mark-clean
+    /// events don't double-write the audit log. Without a UNIQUE
+    /// constraint we control on the legacy schema (read-only), this
+    /// `WHERE NOT EXISTS` guard is the only mechanism to enforce
+    /// idempotency on a per-(room, prior-cin) basis.
+    ///
+    /// The 5-minute window is chosen for the realistic concurrent
+    /// scenario: receptionist marks clean in iHOTEL + housekeeper marks
+    /// clean on the mobile app within minutes of each other. Beyond
+    /// 5 minutes the system treats subsequent marks as a legitimate
+    /// re-clean (e.g. room re-occupied and cleaned again the same shift).
+    #[test]
+    fn ht_housewife_dedup_5_minute_window() {
+        let prior = PriorOccupant {
+            cin_no: "CH26-005159".into(),
+            customer_full_name: "Jane Doe".into(),
+        };
+        let statements = build_statements(6, "306", "Admin", Some(&prior), pinned_now());
+        let insert = &statements[1];
+        // Must use INSERT ... SELECT ... WHERE NOT EXISTS (NOT INSERT ... VALUES).
+        assert!(
+            insert.starts_with("INSERT INTO HT_Housewife"),
+            "must INSERT INTO HT_Housewife; got:\n{insert}"
+        );
+        assert!(
+            insert.contains(" SELECT "),
+            "must use INSERT … SELECT … WHERE NOT EXISTS guard, not VALUES; got:\n{insert}"
+        );
+        assert!(
+            !insert.contains(" VALUES "),
+            "must NOT use the legacy VALUES shape (no dedup window); got:\n{insert}"
+        );
+        // Dedup guard fires the WHERE NOT EXISTS subquery on (h_room, h_cin).
+        assert!(
+            insert.contains("WHERE NOT EXISTS"),
+            "must guard with WHERE NOT EXISTS; got:\n{insert}"
+        );
+        assert!(
+            insert.contains("FROM HT_Housewife"),
+            "guard must scan HT_Housewife; got:\n{insert}"
+        );
+        assert!(
+            insert.contains("h_room='306'"),
+            "guard must match on h_room; got:\n{insert}"
+        );
+        assert!(
+            insert.contains("h_cin='CH26-005159'"),
+            "guard must match on h_cin (prior occupant); got:\n{insert}"
+        );
+        // 5-minute window.
+        assert!(
+            insert.contains("h_date > DATEADD(minute, -5, GETDATE())"),
+            "guard must scope to the last 5 minutes via DATEADD(minute, -5, GETDATE()); got:\n{insert}"
+        );
+    }
+
+    /// Track C — T5 HIGH-3: when the room has no prior occupant
+    /// (brand-new room or fully-cancelled history), `h_cin=''`. The
+    /// dedup window still applies — back-to-back day-one mark-cleans
+    /// within 5 minutes should not double-log.
+    #[test]
+    fn ht_housewife_dedup_applies_even_when_no_prior_occupant() {
+        let statements = build_statements(6, "306", "Admin", None, pinned_now());
+        let insert = &statements[1];
+        assert!(
+            insert.contains("WHERE NOT EXISTS"),
+            "guard must still fire when no prior occupant; got:\n{insert}"
+        );
+        assert!(
+            insert.contains("h_cin=''"),
+            "guard must compare h_cin to '' when no prior; got:\n{insert}"
+        );
+        assert!(
+            insert.contains("h_date > DATEADD(minute, -5, GETDATE())"),
+            "5-minute window must still apply; got:\n{insert}"
+        );
     }
 }

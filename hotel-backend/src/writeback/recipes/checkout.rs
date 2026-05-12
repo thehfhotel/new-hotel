@@ -44,6 +44,7 @@
 //! - Power-log note format: `ปิดไฟ อัตโนมัติ จากเช็คเอ้าท์ No.{cin_no}`
 
 use chrono::{DateTime, Utc};
+use tiberius::Row;
 
 use crate::writeback::allocate::LegacyConn;
 use crate::writeback::constants::{
@@ -91,8 +92,17 @@ pub fn build_statements(inputs: &CheckOutInputs<'_>) -> Vec<String> {
     let room_price = format!("{:.2}", inputs.room_price_total);
     let product_total = format!("{:.2}", inputs.product_total);
     let net = format!("{:.2}", inputs.net_total);
+    // `pay` is still used on the HT_CheckIn_Ds per-room totals UPDATE
+    // (the per-room column reflects the snapshot at checkout time; only
+    // the header HT_CheckIn_H Total_Price_Pay is re-aggregated live —
+    // see the §5 statement in this function for the rationale).
     let pay = format!("{:.2}", inputs.pay_total);
-    let balance = format!("{:.2}", inputs.balance);
+    // Track C — T5 HIGH-4: `inputs.balance` is no longer emitted as a
+    // SQL literal — the `[Total_Price_Balance]` value in the
+    // HT_CheckIn_H UPDATE is now `Net - (live aggregate)`. The input
+    // remains in `CheckOutInputs` for the legacy-event sanity-check
+    // surface and is referenced by `validate_finite` in `execute()`.
+    let _balance_unused = inputs.balance;
     let nights = inputs.nights;
     // Audit H2: Room_Use_Count must be bumped by the real nights count
     // (COMPAT_CHEATSHEET.md:289 / 1164), not always +1. Cast to i64 — the
@@ -123,13 +133,88 @@ pub fn build_statements(inputs: &CheckOutInputs<'_>) -> Vec<String> {
              and room_CheckIn_No={cin_no_q}"
         ),
         // 5. Final totals on HT_CheckIn_H
+        //
+        //    Track C — T5 HIGH-4 (`docs/coexistence/audit-2026-05-13.md`):
+        //    `Total_Price_Pay` is re-aggregated from `HT_CheckIn_Pay` rows
+        //    under UPDLOCK+HOLDLOCK held through COMMIT — NOT trusted from
+        //    the intent payload's `pay_total`. The intent's `pay_total` was
+        //    computed from PG state at intent-emit time; if a second
+        //    payment writeback commits between emit and this checkout's
+        //    BEGIN TRAN, the stale `pay_total` would clobber the second
+        //    payment from the legacy view. Re-aggregating live and locking
+        //    the rows through COMMIT closes the window — same pattern as
+        //    payment.rs (T5 CRIT-1) and the booking-edit recipe validated
+        //    in spike §6.
+        //
+        //    `inputs.pay_total` is kept as a sanity-check input — `execute()`
+        //    logs a WARN if the live aggregate drifts from the payload (see
+        //    `pay_total_drift_threshold_baht`). The other totals
+        //    (Room/Product/Net) remain authoritative from the payload —
+        //    payment doesn't touch those columns so no concurrent-write
+        //    risk exists there.
+        //
+        //    `cin_status <> N'ยกเลิก'` filter on the Pay rows excludes
+        //    cancelled tender rows (T2 CRIT-2 — COMPAT_CHEATSHEET line 106).
         format!(
-            "UPDATE [HT_CheckIn_H] SET  [Total_Price_Room]={room_price},\
-             [Total_Price_Product]={product_total},[Total_Price_Net]={net},\
-             [Total_Price_Pay]={pay},[Total_Price_Balance]={balance},[Cin_note]='' \
-             where [Cin_no]={cin_no_q}"
+            "UPDATE [HT_CheckIn_H] WITH (UPDLOCK, HOLDLOCK) SET \
+             [Total_Price_Room]={room_price},\
+             [Total_Price_Product]={product_total},\
+             [Total_Price_Net]={net},\
+             [Total_Price_Pay]=(SELECT ISNULL(SUM(ISNULL(Cin_Pay_Cash,0)+ISNULL(Cin_Pay_Credit,0)\
+             +ISNULL(Cin_Pay_Tran,0)+ISNULL(Cin_Pay_Free,0)+ISNULL(Cin_Pay_web,0)),0) \
+             FROM HT_CheckIn_Pay WITH (UPDLOCK, HOLDLOCK) \
+             WHERE Cin_No={cin_no_q} AND ISNULL(Cin_Status,'1') <> N'ยกเลิก'),\
+             [Total_Price_Balance]={net}-(SELECT ISNULL(SUM(ISNULL(Cin_Pay_Cash,0)\
+             +ISNULL(Cin_Pay_Credit,0)+ISNULL(Cin_Pay_Tran,0)+ISNULL(Cin_Pay_Free,0)\
+             +ISNULL(Cin_Pay_web,0)),0) FROM HT_CheckIn_Pay WITH (UPDLOCK, HOLDLOCK) \
+             WHERE Cin_No={cin_no_q} AND ISNULL(Cin_Status,'1') <> N'ยกเลิก'),\
+             [Cin_note]='' where [Cin_no]={cin_no_q}"
         ),
     ]
+}
+
+/// Threshold (in baht) at which `execute()` logs a WARN if the
+/// intent payload's `pay_total` drifts from the live MSSQL aggregate
+/// computed in the recipe's `HT_CheckIn_H` UPDATE.
+///
+/// Track C — T5 HIGH-4: the intent's `pay_total` is no longer used as
+/// the authoritative value (we re-aggregate from rows under
+/// UPDLOCK+HOLDLOCK) but we keep it as a sanity-check sentinel. A drift
+/// at or above this threshold means a payment slipped in between intent
+/// emit and checkout writeback — useful for monitoring but no longer a
+/// correctness problem since the live aggregate wins.
+const PAY_TOTAL_DRIFT_THRESHOLD_BAHT: f64 = 0.005;
+
+/// SELECT the live sum of every tender column from `HT_CheckIn_Pay` for
+/// the given `Cin_no`, excluding cancelled rows. Used by `execute()` to
+/// sanity-check the intent payload's `pay_total` (Track C — T5 HIGH-4).
+///
+/// Returns `Ok(None)` if MSSQL returns no row (e.g. transient stream
+/// error materialised as an empty result). The caller treats a missing
+/// row as "skip the drift check" rather than aborting — the
+/// authoritative aggregate is the in-UPDATE subquery in
+/// `build_statements`, which always reads live.
+async fn fetch_live_pay_total(
+    conn: &mut LegacyConn<'_>,
+    cin_no: &str,
+) -> WritebackResult<Option<f64>> {
+    let cin_no_q = sql_quote(cin_no);
+    let sql = format!(
+        "SELECT ISNULL(SUM(ISNULL(Cin_Pay_Cash,0)+ISNULL(Cin_Pay_Credit,0)\
+         +ISNULL(Cin_Pay_Tran,0)+ISNULL(Cin_Pay_Free,0)+ISNULL(Cin_Pay_web,0)),0) \
+         AS live_pay_total \
+         FROM HT_CheckIn_Pay \
+         WHERE Cin_No={cin_no_q} AND ISNULL(Cin_Status,'1') <> N'ยกเลิก'"
+    );
+    let stream = conn.simple_query(sql).await?;
+    let rows: Vec<Row> = stream.into_first_result().await?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    // The aggregate is rendered as `float` by SQL Server — tiberius
+    // returns it as f64. `live_pay_total` is the column alias.
+    let v: Option<f64> = row.get(0);
+    Ok(v)
 }
 
 /// Execute the check-out recipe.
@@ -171,6 +256,24 @@ pub async fn execute(
     // Coexistence audit T6 HIGH-1: capture `Utc::now()` once at the entry to
     // `execute()` so `build_statements` is purely a function of its inputs.
     let created_at = Utc::now();
+
+    // Track C — T5 HIGH-4: sanity-check the intent payload's `pay_total`
+    // against the live MSSQL aggregate. The actual SQL UPDATE re-aggregates
+    // from rows under UPDLOCK+HOLDLOCK so the intent's value is no longer
+    // authoritative; this log surfaces the drift for observability.
+    if let Some(live_pay_total) = fetch_live_pay_total(conn, cin_no).await? {
+        if (live_pay_total - pay_total).abs() >= PAY_TOTAL_DRIFT_THRESHOLD_BAHT {
+            tracing::warn!(
+                cin_no,
+                intent_pay_total = pay_total,
+                live_pay_total,
+                drift_baht = (live_pay_total - pay_total).abs(),
+                "checkout intent payload pay_total drifted from live HT_CheckIn_Pay \
+                 aggregate (concurrent payment writeback between intent emit and \
+                 checkout commit). Live aggregate wins — Track C T5 HIGH-4."
+            );
+        }
+    }
 
     let inputs = CheckOutInputs {
         cin_no,
@@ -278,8 +381,13 @@ mod tests {
         assert!(!statements[3].contains("'Check-Out'"));
     }
 
+    /// Track C — T5 HIGH-4: only the non-Pay totals (Room, Product, Net)
+    /// remain literal pass-throughs from the intent payload. `Total_Price_Pay`
+    /// and `Total_Price_Balance` are now SELECT subqueries aggregating from
+    /// `HT_CheckIn_Pay` rows under UPDLOCK+HOLDLOCK — see
+    /// `pay_total_re_aggregated_from_rows_not_input_payload` below.
     #[test]
-    fn totals_are_passed_through() {
+    fn non_pay_totals_are_passed_through() {
         let inputs = CheckOutInputs {
             cin_no: "CH26-005228",
             room_no: "402",
@@ -295,8 +403,18 @@ mod tests {
         let statements = build_statements(&inputs);
         assert!(statements[4].contains("[Total_Price_Room]=1780"));
         assert!(statements[4].contains("[Total_Price_Net]=1780"));
-        assert!(statements[4].contains("[Total_Price_Pay]=1780"));
-        assert!(statements[4].contains("[Total_Price_Balance]=0"));
+        assert!(statements[4].contains("[Total_Price_Product]=0"));
+        // Pay is no longer a literal — it's a SELECT subquery (T5 HIGH-4).
+        assert!(
+            !statements[4].contains("[Total_Price_Pay]=1780"),
+            "Total_Price_Pay must NOT be the input literal — it must re-aggregate; got:\n{}",
+            statements[4]
+        );
+        assert!(
+            statements[4].contains("[Total_Price_Pay]=(SELECT"),
+            "Total_Price_Pay must be a SELECT subquery; got:\n{}",
+            statements[4]
+        );
     }
 
     /// Coexistence audit T6 HIGH-1: `build_statements` is PURE — calling it
@@ -354,8 +472,8 @@ mod tests {
             "Cin_Room_night must reflect real nights; got:\n{}",
             statements[1]
         );
-        // HT_CheckIn_H row (statement 5): Total_Price_* must reflect real
-        // figures.
+        // HT_CheckIn_H row (statement 5): Room and Net remain literal
+        // pass-throughs (no concurrent-write risk on those columns).
         assert!(
             statements[4].contains("[Total_Price_Room]=2670"),
             "Total_Price_Room must reflect real room revenue; got:\n{}",
@@ -366,10 +484,81 @@ mod tests {
             "Total_Price_Net must reflect real net; got:\n{}",
             statements[4]
         );
+        // Track C — T5 HIGH-4: Pay is re-aggregated, not literal.
         assert!(
-            statements[4].contains("[Total_Price_Pay]=2670"),
-            "Total_Price_Pay must reflect real pay total; got:\n{}",
+            statements[4].contains("[Total_Price_Pay]=(SELECT"),
+            "Total_Price_Pay must be the re-aggregate subquery (T5 HIGH-4); got:\n{}",
             statements[4]
+        );
+    }
+
+    /// Track C — T5 HIGH-4: the HT_CheckIn_H totals UPDATE must re-aggregate
+    /// `Total_Price_Pay` from `HT_CheckIn_Pay` rows under UPDLOCK+HOLDLOCK
+    /// rather than trusting the intent payload's `pay_total`. The payload's
+    /// `pay_total` was computed from PG state at intent-emit time; if a
+    /// payment writeback commits between emit and the checkout's
+    /// BEGIN TRAN, the stale `pay_total` would clobber the second payment.
+    /// Re-aggregating live and locking through COMMIT closes the window.
+    #[test]
+    fn pay_total_re_aggregated_from_rows_not_input_payload() {
+        // Pass a deliberately wrong `pay_total` (9999) — the SQL must not
+        // contain that literal because the value comes from a subquery.
+        let inputs = CheckOutInputs {
+            cin_no: "CH26-005228",
+            room_no: "402",
+            checkin_ds_id: 25007,
+            room_price_total: 2670.0,
+            product_total: 0.0,
+            net_total: 2670.0,
+            pay_total: 9999.0, // intent-payload value — must NOT appear in SQL
+            balance: -7329.0,  // intent-payload balance — also must NOT appear
+            nights: 3.0,
+            created_at: pinned_now(),
+        };
+        let statements = build_statements(&inputs);
+        let h = &statements[4];
+
+        // The intent's pay_total literal must NOT be embedded.
+        assert!(
+            !h.contains("[Total_Price_Pay]=9999"),
+            "intent payload pay_total must NOT be emitted as a literal; got:\n{h}"
+        );
+        // Header UPDATE must take UPDLOCK+HOLDLOCK (held through COMMIT).
+        assert!(
+            h.contains("UPDATE [HT_CheckIn_H] WITH (UPDLOCK, HOLDLOCK)"),
+            "HT_CheckIn_H UPDATE must take UPDLOCK+HOLDLOCK; got:\n{h}"
+        );
+        // Pay-from-rows aggregate must hold UPDLOCK+HOLDLOCK on HT_CheckIn_Pay.
+        assert!(
+            h.contains("FROM HT_CheckIn_Pay WITH (UPDLOCK, HOLDLOCK)"),
+            "Pay aggregate SELECT must take UPDLOCK+HOLDLOCK on HT_CheckIn_Pay; got:\n{h}"
+        );
+        // Aggregate must sum every tender column (Cash + Credit + Tran + Free + web).
+        for col in [
+            "Cin_Pay_Cash",
+            "Cin_Pay_Credit",
+            "Cin_Pay_Tran",
+            "Cin_Pay_Free",
+            "Cin_Pay_web",
+        ] {
+            assert!(
+                h.contains(col),
+                "Pay aggregate must include {col}; got:\n{h}"
+            );
+        }
+        // Cancelled tender rows filtered (T2 CRIT-2).
+        assert!(
+            h.contains("ISNULL(Cin_Status,'1') <> N'ยกเลิก'"),
+            "Pay aggregate must exclude cancelled (Cin_Status=N'ยกเลิก'); got:\n{h}"
+        );
+        // Balance must be Net - aggregate (not the intent's balance literal).
+        assert!(
+            !h.contains("[Total_Price_Balance]=-7329"),
+            "intent payload balance must NOT be emitted as a literal; got:\n{h}"
+        );
+        assert!(
+            h.contains("[Total_Price_Balance]=2670.00-(SELECT"),
+            "Total_Price_Balance must be Net - aggregate subquery; got:\n{h}"
         );
     }
 

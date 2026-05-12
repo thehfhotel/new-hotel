@@ -54,8 +54,25 @@ const HT_RECEIPT_H: &str = "HT_Receipt_H";
 /// aggregate apply.
 pub struct PaymentMapper;
 
-const PAYMENT_SELECT_COLS: &str =
-    "t.id, t.Cin_No, t.Cin_Pay_Cash, t.Cin_Pay_Credit, t.Cin_Pay_Tran, t.Pay_No";
+// Track C — T2 CRIT-2 (`docs/coexistence/audit-2026-05-13.md`):
+// `Cin_Status` projected so the CT pipeline carries the cancellation
+// marker (`'ยกเลิก'`) down to the check-in aggregate sweep. The legacy
+// app cascades a folio cancel into `HT_CheckIn_Pay` via
+// `update HT_CheckIn_Pay set cin_status='ยกเลิก' where cin_no=…`
+// (COMPAT_CHEATSHEET line 531). Without the projection the sync layer
+// silently treats the cancelled rows as active and over-counts
+// `cin_paid_amount`. Verified column shape per COMPAT_CHEATSHEET
+// line 492 (`Cin_Status varchar(50) NOT NULL DEFAULT '1'`).
+//
+// The two additional tender columns (`Cin_Pay_Free`, `Cin_Pay_web`)
+// round out the canonical sum so a future aggregate-by-tender
+// projection has every contributor available without another CT
+// pipeline change. Order matches the canonical writeback-recipe order
+// (Cash + Credit + Free + Tran + web) so downstream code reads
+// left-to-right in the same sequence as the legacy invariant
+// (COMPAT_CHEATSHEET line 534).
+const PAYMENT_SELECT_COLS: &str = "t.id, t.Cin_No, t.Cin_Pay_Cash, t.Cin_Pay_Credit, \
+    t.Cin_Pay_Free, t.Cin_Pay_Tran, t.Cin_Pay_web, t.Pay_No, t.Cin_Status";
 
 #[async_trait]
 impl MssqlChangeMapper for PaymentMapper {
@@ -409,6 +426,46 @@ mod tests {
         // CRITICAL: capital N. Locks against accidental rename.
         assert!(m.select_sql().contains("t.Cin_No"));
         assert!(m.select_sql().contains("Cin_Pay_Cash"));
+    }
+
+    /// Track C — T2 CRIT-2 (`docs/coexistence/audit-2026-05-13.md`):
+    /// the payment mapper's SELECT projection must include `Cin_Status`
+    /// so the CT pipeline carries the cancellation marker
+    /// (`'ยกเลิก'`) into the check-in aggregate sweep. Without it the
+    /// cascade `update HT_CheckIn_Pay set cin_status='ยกเลิก' where
+    /// cin_no=…` (COMPAT_CHEATSHEET line 531) is silently dropped at
+    /// the sync layer and `ht_checkins.cin_paid_amount` over-counts.
+    #[test]
+    fn projects_cin_pay_status() {
+        let m = PaymentMapper;
+        let select = m.select_sql();
+        assert!(
+            select.contains("t.Cin_Status"),
+            "PAYMENT_SELECT_COLS must project Cin_Status; got: {select}"
+        );
+    }
+
+    /// Track C — T2 CRIT-2: the projection rounds out every tender
+    /// column so an aggregate-by-tender computation can be derived
+    /// from CT-delivered rows without another pipeline change. The
+    /// canonical writeback recipe sums Cash + Credit + Free + Tran +
+    /// web (COMPAT_CHEATSHEET line 534).
+    #[test]
+    fn projects_every_tender_column() {
+        let m = PaymentMapper;
+        let select = m.select_sql();
+        for col in [
+            "Cin_Pay_Cash",
+            "Cin_Pay_Credit",
+            "Cin_Pay_Free",
+            "Cin_Pay_Tran",
+            "Cin_Pay_web",
+        ] {
+            assert!(
+                select.contains(col),
+                "PAYMENT_SELECT_COLS must project {col}; got: {select}"
+            );
+        }
     }
 
     #[test]

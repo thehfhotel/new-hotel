@@ -237,17 +237,42 @@ pub fn build_statements(
          WHERE NOT EXISTS (SELECT 1 FROM HT_CheckIn_Pay WHERE Pay_no={pay_no_q})"
     ));
 
-    // 4. HT_CheckIn_H — accumulate Pay, recompute Balance from Net (HIGH-3).
-    //    The spike capture (§3h) was a full-settle so it set Pay=amount and
-    //    Balance=0 verbatim. Replaying that on a partial payment would lose
-    //    prior payments and clobber Total_Price_Room / Total_Price_Net (which
-    //    the booking_create / extend_stay recipes own). We additively update
-    //    Pay and recompute Balance = Net - Pay, leaving Room/Net/Product
-    //    alone.
-    // Wave 6 LOW item 4: 2dp for consistency.
+    // 4. HT_CheckIn_H — Total_Price_Pay + Total_Price_Balance re-aggregated
+    //    from `HT_CheckIn_Pay` rows under UPDLOCK+HOLDLOCK
+    //    (Track C — T5 CRIT-1, `docs/coexistence/audit-2026-05-13.md`).
+    //
+    //    Why not the previous additive UPDATE?
+    //    The earlier `Total_Price_Pay = ISNULL(...,0) + amount` shape only
+    //    held the header row's X-lock for the duration of one UPDATE
+    //    statement (RC default) — released at COMMIT. iHOTEL's save-payment
+    //    uses an absolute `SET Total_Price_Pay=<precomputed>`; if our
+    //    writeback commits first, iHOTEL's subsequent absolute write
+    //    overwrites the header with its pre-computed total (which never
+    //    saw our amount) → payment silently disappears from the legacy view.
+    //
+    //    Race-safe pattern: SELECT-aggregate from `HT_CheckIn_Pay` rows with
+    //    UPDLOCK+HOLDLOCK; the lock is held *through COMMIT* (HOLDLOCK
+    //    promotes to serializable-range), blocking iHOTEL's read-modify-write
+    //    until we finish. The absolute SET we then write is correct by
+    //    re-aggregation, so we no longer race the iHOTEL absolute SET. The
+    //    `cin_status <> N'ยกเลิก'` filter excludes cancelled tender rows
+    //    per T2 CRIT-2 (`Cin_Status` column on HT_CheckIn_Pay carries
+    //    `'1'` for active or `'ยกเลิก'` for cancelled — COMPAT_CHEATSHEET
+    //    line 106 / 498-500).
+    //
+    //    Pattern matches the booking-edit race-safety recipe validated in
+    //    spike §6.
     statements.push(format!(
-        "UPDATE [HT_CheckIn_H] SET [Total_Price_Pay]=ISNULL([Total_Price_Pay],0)+{amount_2dp},\
-         [Total_Price_Balance]=ISNULL([Total_Price_Net],0)-(ISNULL([Total_Price_Pay],0)+{amount_2dp}) \
+        "UPDATE [HT_CheckIn_H] WITH (UPDLOCK, HOLDLOCK) SET \
+         [Total_Price_Pay]=(SELECT ISNULL(SUM(ISNULL(Cin_Pay_Cash,0)+ISNULL(Cin_Pay_Credit,0)\
+         +ISNULL(Cin_Pay_Tran,0)+ISNULL(Cin_Pay_Free,0)+ISNULL(Cin_Pay_web,0)),0) \
+         FROM HT_CheckIn_Pay WITH (UPDLOCK, HOLDLOCK) \
+         WHERE Cin_No={cin_no_q} AND ISNULL(Cin_Status,'1') <> N'ยกเลิก'),\
+         [Total_Price_Balance]=ISNULL([Total_Price_Net],0)-(SELECT ISNULL(SUM(\
+         ISNULL(Cin_Pay_Cash,0)+ISNULL(Cin_Pay_Credit,0)+ISNULL(Cin_Pay_Tran,0)\
+         +ISNULL(Cin_Pay_Free,0)+ISNULL(Cin_Pay_web,0)),0) \
+         FROM HT_CheckIn_Pay WITH (UPDLOCK, HOLDLOCK) \
+         WHERE Cin_No={cin_no_q} AND ISNULL(Cin_Status,'1') <> N'ยกเลิก') \
          where [Cin_no]={cin_no_q}"
     ));
 
@@ -256,9 +281,19 @@ pub fn build_statements(
     //    still increments `Total_Price_vat` by the payment amount on every
     //    invoice. Emit it for parity so reports that aggregate this column
     //    match the legacy app's running total.
-    // Wave 6 LOW item 4: 2dp for consistency.
+    //
+    //    Track C — T5 CRIT-1: same race-safe pattern as Total_Price_Pay
+    //    above. Re-aggregate `Total_Price_vat` from `HT_CheckIn_Pay` rows
+    //    under UPDLOCK+HOLDLOCK held through COMMIT instead of additively
+    //    incrementing — concurrent iHOTEL absolute-write on the column
+    //    would otherwise clobber our contribution.
     statements.push(format!(
-        "update HT_CheckIn_H set Total_Price_vat=Total_Price_vat+{amount_2dp} where Cin_no={cin_no_q}"
+        "UPDATE HT_CheckIn_H WITH (UPDLOCK, HOLDLOCK) SET \
+         Total_Price_vat=(SELECT ISNULL(SUM(ISNULL(Cin_Pay_Cash,0)+ISNULL(Cin_Pay_Credit,0)\
+         +ISNULL(Cin_Pay_Tran,0)+ISNULL(Cin_Pay_Free,0)+ISNULL(Cin_Pay_web,0)),0) \
+         FROM HT_CheckIn_Pay WITH (UPDLOCK, HOLDLOCK) \
+         WHERE Cin_No={cin_no_q} AND ISNULL(Cin_Status,'1') <> N'ยกเลิก') \
+         where Cin_no={cin_no_q}"
     ));
 
     // 6. HT_Receipt_H — receipt header. 20-column canonical order
@@ -571,31 +606,111 @@ mod tests {
         assert!(pay.contains(",0.00,801.00,'สำนักงานใหญ่',0.00 WHERE NOT EXISTS"));
     }
 
+    /// Track C — T5 CRIT-1: the VAT accumulator is re-aggregated from
+    /// `HT_CheckIn_Pay` rows under UPDLOCK+HOLDLOCK held through COMMIT
+    /// (was additive `Total_Price_vat=Total_Price_vat+amount`, which
+    /// raced iHOTEL's absolute-write).
     #[test]
-    fn includes_vat_accumulator_increment_per_capture_line_6() {
+    fn vat_accumulator_re_aggregates_from_rows_under_updlock() {
         let s = build_statements(&sample_inputs()).unwrap();
         let vat = s
             .iter()
-            .find(|s| s.contains("Total_Price_vat=Total_Price_vat+"))
+            .find(|s| s.contains("UPDATE HT_CheckIn_H") && s.contains("Total_Price_vat="))
             .expect("VAT accumulator UPDATE must be emitted");
-        // Wave 6 LOW item 4: 2dp money formatting (was raw `801`).
-        assert!(vat.contains("Total_Price_vat=Total_Price_vat+801.00"));
-        assert!(vat.contains("Cin_no='CH26-005236'"));
+        // Must NOT use the additive shape (legacy race-prone pattern).
+        assert!(
+            !vat.contains("Total_Price_vat=Total_Price_vat+"),
+            "VAT must be re-aggregated (absolute), not additive; got:\n{vat}"
+        );
+        // Must promote UPDLOCK+HOLDLOCK on HT_CheckIn_Pay (held through
+        // COMMIT — blocks iHOTEL's read-modify-write on the same rows).
+        assert!(
+            vat.contains("FROM HT_CheckIn_Pay WITH (UPDLOCK, HOLDLOCK)"),
+            "VAT aggregate SELECT must take UPDLOCK+HOLDLOCK on HT_CheckIn_Pay; got:\n{vat}"
+        );
+        // Must filter cancelled rows (T2 CRIT-2).
+        assert!(
+            vat.contains("ISNULL(Cin_Status,'1') <> N'ยกเลิก'"),
+            "VAT aggregate must exclude cancelled (Cin_Status=N'ยกเลิก') tender rows; got:\n{vat}"
+        );
+        // Must filter by current Cin_No.
+        assert!(vat.contains("WHERE Cin_No='CH26-005236'"));
+        assert!(vat.contains("where Cin_no='CH26-005236'"));
     }
 
+    /// Track C — T5 CRIT-1: HT_CheckIn_H totals UPDATE re-aggregates from
+    /// `HT_CheckIn_Pay` rows under UPDLOCK+HOLDLOCK held through COMMIT
+    /// (was additive — concurrent iHOTEL absolute SET silently overwrote
+    /// our contribution).
     #[test]
-    fn checkin_h_totals_accumulate_payment_per_high3() {
+    fn checkin_h_pay_total_re_aggregates_from_rows_under_updlock() {
         let s = build_statements(&sample_inputs()).unwrap();
-        let upd = s.iter().find(|s| s.contains("UPDATE [HT_CheckIn_H]")).unwrap();
-        // Wave 6 LOW item 4: 2dp money formatting (was raw `801`).
-        assert!(upd.contains("[Total_Price_Pay]=ISNULL([Total_Price_Pay],0)+801.00"));
-        assert!(upd.contains(
-            "[Total_Price_Balance]=ISNULL([Total_Price_Net],0)-\
-             (ISNULL([Total_Price_Pay],0)+801.00)"
-        ));
+        let upd = s
+            .iter()
+            .find(|s| s.contains("UPDATE [HT_CheckIn_H]"))
+            .expect("HT_CheckIn_H totals UPDATE must be emitted");
+        // Header must take UPDLOCK+HOLDLOCK (held through COMMIT).
+        assert!(
+            upd.contains("UPDATE [HT_CheckIn_H] WITH (UPDLOCK, HOLDLOCK)"),
+            "HT_CheckIn_H UPDATE must take UPDLOCK+HOLDLOCK on the header; got:\n{upd}"
+        );
+        // Must NOT use the legacy additive shape.
+        assert!(
+            !upd.contains("ISNULL([Total_Price_Pay],0)+"),
+            "Total_Price_Pay must be absolute re-aggregate, not additive; got:\n{upd}"
+        );
+        // SELECT re-aggregation must hold UPDLOCK+HOLDLOCK on HT_CheckIn_Pay.
+        assert!(
+            upd.contains("FROM HT_CheckIn_Pay WITH (UPDLOCK, HOLDLOCK)"),
+            "Pay aggregate SELECT must take UPDLOCK+HOLDLOCK on HT_CheckIn_Pay; got:\n{upd}"
+        );
+        // Aggregate sums every tender column.
+        for col in [
+            "Cin_Pay_Cash",
+            "Cin_Pay_Credit",
+            "Cin_Pay_Tran",
+            "Cin_Pay_Free",
+            "Cin_Pay_web",
+        ] {
+            assert!(
+                upd.contains(col),
+                "aggregate must include {col}; got:\n{upd}"
+            );
+        }
+        // Cancelled tender rows excluded (T2 CRIT-2).
+        assert!(
+            upd.contains("ISNULL(Cin_Status,'1') <> N'ยกเลิก'"),
+            "aggregate must exclude cancelled (Cin_Status=N'ยกเลิก') tender rows; got:\n{upd}"
+        );
+        // Balance = Net - aggregate (relative to canonical aggregate).
+        assert!(
+            upd.contains("[Total_Price_Balance]=ISNULL([Total_Price_Net],0)-"),
+            "balance must be Net - aggregate; got:\n{upd}"
+        );
+        // Untouched columns: Room / Net / Product.
         assert!(!upd.contains("[Total_Price_Room]="));
         assert!(!upd.contains("[Total_Price_Net]=ISNULL"));
-        assert!(upd.contains("[Cin_no]='CH26-005236'"));
+        assert!(!upd.contains("[Total_Price_Product]="));
+        // Filtered by current Cin_no.
+        assert!(upd.contains("where [Cin_no]='CH26-005236'"));
+    }
+
+    /// Track C — T5 CRIT-1: locking pattern must match the booking-edit
+    /// recipe validated in spike §6. UPDLOCK+HOLDLOCK on both the header
+    /// UPDATE and the SELECT-from-rows guarantees the lock survives
+    /// through COMMIT and blocks any concurrent iHOTEL absolute write
+    /// on the same Cin_no until our transaction commits.
+    #[test]
+    fn aggregate_from_rows_with_updlock_blocks_concurrent_absolute_write() {
+        let s = build_statements(&sample_inputs()).unwrap();
+        let combined = s.join("\n");
+        // Both updates (Pay/Balance and Vat) must promote UPDLOCK+HOLDLOCK.
+        let updlock_holdlock_count = combined.matches("WITH (UPDLOCK, HOLDLOCK)").count();
+        assert!(
+            updlock_holdlock_count >= 4,
+            "expected ≥4 UPDLOCK+HOLDLOCK hints (header UPDATE × 2 + SELECT aggregate × 2); \
+             got {updlock_holdlock_count}:\n{combined}"
+        );
     }
 
     #[test]

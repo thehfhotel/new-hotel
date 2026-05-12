@@ -244,6 +244,15 @@ pub async fn load_checkin_aggregate(
         "HT_CheckIn_Pay",
         "Cin_No",
         cin_no,
+        // Track C — T2 CRIT-2 (`docs/coexistence/audit-2026-05-13.md`):
+        // `Cin_Status` projected so the check-in aggregate sweep can
+        // exclude cancelled payment rows (`'ยกเลิก'`) from
+        // `cin_paid_amount`. Before this fix, a folio cancelled in
+        // iHOTEL kept the cascade-marked payment rows visible in our
+        // canonical `ht_payments` aggregation — `cin_paid_amount`
+        // diverged from the legacy view. Column is `Cin_Status varchar(50)
+        // NOT NULL DEFAULT '1'` per COMPAT_CHEATSHEET line 492 (the
+        // semantically-`Cin_Pay_Status` value referenced at line 106).
         &[
             "id",
             "Cin_No",
@@ -251,7 +260,10 @@ pub async fn load_checkin_aggregate(
             "Cin_Pay_Cash",
             "Cin_Pay_Credit",
             "Cin_Pay_Tran",
+            "Cin_Pay_Free",
+            "Cin_Pay_web",
             "Pay_No",
+            "Cin_Status",
         ],
     )
     .await?;
