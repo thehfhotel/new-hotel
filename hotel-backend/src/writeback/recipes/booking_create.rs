@@ -98,13 +98,18 @@ pub struct CreateBookingInputs<'a> {
     pub nights_calendar: Vec<NaiveDate>,
     /// Whether the customer is new (recipe will INSERT HT_Customers if so).
     pub customer_is_new: bool,
+    /// "Now" timestamp threaded in by `execute()` so `build_statements` stays
+    /// PURE — coexistence audit T6 HIGH-1. Drives `HT_Book_H.Book_Date`,
+    /// `HT_Customers.Cust_Last_Change`, and the same-day HT_Rooms-display
+    /// decision below. Tests pin a fixed instant for byte-parity assertions.
+    pub created_at: DateTime<Utc>,
 }
 
 /// Build the statements for a booking. PURE — no I/O.
 pub fn build_statements(inputs: &CreateBookingInputs<'_>) -> Vec<String> {
     let book_id_q = sql_quote(inputs.book_id);
     let cust_no_q = sql_quote(inputs.cust_no);
-    let now_q = sql_quote(&format_legacy_datetime(Utc::now()));
+    let now_q = sql_quote(&format_legacy_datetime(inputs.created_at));
     let by_q = sql_quote(inputs.created_by);
     let cust_name_q = sql_quote(inputs.customer_name);
     let cust_phone_q = sql_quote(inputs.customer_phone.unwrap_or(""));
@@ -143,7 +148,7 @@ pub fn build_statements(inputs: &CreateBookingInputs<'_>) -> Vec<String> {
         let id = inputs.customer_id_int.unwrap_or(0);
         let cust_type_main_q = sql_quote(CUST_TYPE_MAIN_NORMAL);
         let last_change_q = sql_quote(&format_legacy_date(
-            crate::writeback::format::bangkok_date(Utc::now()),
+            crate::writeback::format::bangkok_date(inputs.created_at),
         ));
         statements.push(format!(
             "INSERT INTO [HT_Customers]([id],[Cust_no],[Cust_perfix],[Cust_name],[Cust_name2],\
@@ -261,7 +266,7 @@ pub fn build_statements(inputs: &CreateBookingInputs<'_>) -> Vec<String> {
     // refresh OR by the check-in flow itself). Our recipe was unconditionally
     // setting it, which corrupted the room-list view per the 2026-04-25
     // R014835 incident.
-    let bkk_today = Utc::now().with_timezone(&chrono_tz::Asia::Bangkok).date_naive();
+    let bkk_today = inputs.created_at.with_timezone(&chrono_tz::Asia::Bangkok).date_naive();
     let bkk_stay_start = inputs.stay_start.with_timezone(&chrono_tz::Asia::Bangkok).date_naive();
     if bkk_stay_start <= bkk_today {
         let stay_in_short = inputs
@@ -293,7 +298,7 @@ pub fn build_statements(inputs: &CreateBookingInputs<'_>) -> Vec<String> {
         ));
     }
 
-    let _ = Datelike::year(&Utc::now().date_naive()); // silence unused-import lint
+    let _ = Datelike::year(&inputs.created_at.date_naive()); // silence unused-import lint
     statements
 }
 
@@ -345,6 +350,12 @@ pub async fn execute(
         ("deposit_baht", deposit_baht),
     ])?;
 
+    // Coexistence audit T6 HIGH-1: capture `Utc::now()` once at the entry to
+    // `execute()` so `build_statements` is purely a function of its inputs.
+    // Tests can swap in a fixed instant for exact byte-parity assertions.
+    // Mirrors the Wave 5b pattern in `walkin` / `checkin_to_booking`.
+    let created_at = Utc::now();
+
     let inputs = CreateBookingInputs {
         book_id: &book_id,
         cust_no: &cust_no,
@@ -363,6 +374,7 @@ pub async fn execute(
         room_status_id_base,
         nights_calendar,
         customer_is_new: payload.legacy_cust_no.is_none(),
+        created_at,
     };
     let statements = build_statements(&inputs);
     super::execute_all(conn, &statements).await?;
@@ -406,7 +418,54 @@ mod tests {
             room_status_id_base: 50237,
             nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],
             customer_is_new: false,
+            // T6 HIGH-1: fixed instant so `build_statements` is deterministic.
+            // 5 AM UTC = noon Bangkok (same as stay_start, keeps Cust_Last_Change
+            // and Book_Date aligned with the captured shape).
+            created_at: Utc.with_ymd_and_hms(2026, 4, 25, 5, 0, 0).unwrap(),
         }
+    }
+
+    /// Coexistence audit T6 HIGH-1: `build_statements` must be PURE — calling
+    /// it twice with the same inputs (including a fixed `created_at`) must
+    /// produce byte-identical output. Pins the purity contract against a
+    /// future regression that re-introduces `Utc::now()` inside.
+    #[test]
+    fn build_statements_is_pure_with_fixed_instant() {
+        let inputs = sample_inputs();
+        let first = build_statements(&inputs);
+        let second = build_statements(&inputs);
+        assert_eq!(first, second, "build_statements must be deterministic");
+    }
+
+    /// Coexistence audit T6 HIGH-1: pinned `created_at` drives `Book_Date`,
+    /// `Cust_Last_Change`, AND the "today vs future booking" branching that
+    /// decides whether to emit the HT_Rooms display-field UPDATE. The prior
+    /// shape recomputed `Utc::now()` for each of these — a booking
+    /// straddling BKK midnight could see Book_Date and the today-comparison
+    /// disagree, with HT_Rooms emitting (or not) inconsistently with the
+    /// Cust_Last_Change date already written.
+    #[test]
+    fn created_at_drives_book_date_consistently() {
+        let mut inputs = sample_inputs();
+        inputs.customer_is_new = true;
+        // Pin to noon BKK 4/25 so every derived date column sees 4/25.
+        inputs.created_at = Utc.with_ymd_and_hms(2026, 4, 25, 5, 0, 0).unwrap();
+        let s = build_statements(&inputs);
+        let book_h = s.iter().find(|s| s.contains("[HT_Book_H]")).unwrap();
+        // Book_Date: legacy datetime form 4/25/2026 12:00:00 PM.
+        assert!(
+            book_h.contains("'4/25/2026 12:00:00 PM'"),
+            "Book_Date must derive from inputs.created_at; got:\n{book_h}"
+        );
+        let cust = s
+            .iter()
+            .find(|s| s.contains("[HT_Customers]"))
+            .expect("customer row must be emitted");
+        // Cust_Last_Change: bangkok date 4/25/2026 (date-only).
+        assert!(
+            cust.contains(",'4/25/2026',"),
+            "Cust_Last_Change must derive from inputs.created_at; got:\n{cust}"
+        );
     }
 
     /// Deposit (`เงินมัดจำ`) lands in `HT_Book_H.Book_Price_Pay` formatted
@@ -484,6 +543,9 @@ mod tests {
             room_status_id_base: 50200,
             nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],
             customer_is_new: false,
+            // T6 HIGH-1: pinned to noon Bangkok on 4/25/2026 — drives
+            // Book_Date verbatim per the captured legacy row.
+            created_at: Utc.with_ymd_and_hms(2026, 4, 25, 5, 0, 0).unwrap(),
         };
         let s = build_statements(&inputs);
         let book_h = s.iter().find(|s| s.contains("[HT_Book_H]")).unwrap();
@@ -653,12 +715,16 @@ mod tests {
     #[test]
     fn skips_ht_rooms_update_for_future_booking() {
         let mut inputs = sample_inputs();
-        // Push the stay 30 days into the future relative to "today" (Bangkok
-        // wall-clock at test time). A 30-day delta dwarfs any plausible
-        // test-clock skew (the Bangkok timezone offset is +7h, so 30 days is
-        // safely > today no matter what UTC minute the test runs at).
-        let today_bkk = Utc::now().with_timezone(&chrono_tz::Asia::Bangkok).date_naive();
-        let future = today_bkk
+        // T6 HIGH-1: anchor "today" via the now-input `created_at` so the
+        // test is deterministic. Push the stay 30 days into the future
+        // relative to that pinned BKK day.
+        let pinned_today_bkk = NaiveDate::from_ymd_opt(2026, 4, 25).unwrap();
+        inputs.created_at = chrono_tz::Asia::Bangkok
+            .from_local_datetime(&pinned_today_bkk.and_hms_opt(12, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .with_timezone(&Utc);
+        let future = pinned_today_bkk
             .checked_add_days(chrono::Days::new(30))
             .expect("today + 30d is a valid date");
         let future_noon = chrono_tz::Asia::Bangkok
@@ -686,15 +752,18 @@ mod tests {
     #[test]
     fn emits_ht_rooms_update_for_today_booking() {
         let mut inputs = sample_inputs();
-        let today_bkk = Utc::now().with_timezone(&chrono_tz::Asia::Bangkok).date_naive();
+        // T6 HIGH-1: pin "today" to a fixed BKK day so the today-vs-future
+        // branch in build_statements is exercised deterministically.
+        let pinned_today_bkk = NaiveDate::from_ymd_opt(2026, 4, 25).unwrap();
         let today_noon = chrono_tz::Asia::Bangkok
-            .from_local_datetime(&today_bkk.and_hms_opt(12, 0, 0).unwrap())
+            .from_local_datetime(&pinned_today_bkk.and_hms_opt(12, 0, 0).unwrap())
             .single()
             .unwrap()
             .with_timezone(&Utc);
+        inputs.created_at = today_noon;
         inputs.stay_start = today_noon;
         inputs.stay_end = today_noon + chrono::Duration::days(1);
-        inputs.nights_calendar = vec![today_bkk];
+        inputs.nights_calendar = vec![pinned_today_bkk];
         let statements = build_statements(&inputs);
         let ht_rooms_updates: Vec<&String> = statements
             .iter()

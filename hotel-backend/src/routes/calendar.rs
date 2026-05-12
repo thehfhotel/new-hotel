@@ -101,26 +101,36 @@ pub async fn get_calendar(
     let fetch_hfville = branch == Branch::Hfville || branch == Branch::All;
 
     if fetch_hfhotel {
-        // Fetch legacy data from PG mirror (cache fed by drift-reconcile + CT mappers)
-        let (legacy_bookings, legacy_checkins) = fetch_legacy_calendar_data_pg(
-            &state.new_pool,
-            &params.start_date,
-            &params.end_date,
-        ).await?;
+        // Coexistence audit T3 MED-3: in `SystemMode::New` the canonical
+        // tables ARE the source of truth — fetching the legacy mirror in
+        // addition produces duplicate rows with nondeterministic ordering
+        // (the frontend dedup-by-key paper-overs most cases, but where the
+        // mirror and canonical disagree on a field the displayed value
+        // flipped between page loads). The legacy fetch now only runs in
+        // `SystemMode::Legacy`; New mode reads canonical exclusively.
+        match mode {
+            SystemMode::Legacy => {
+                let (legacy_bookings, legacy_checkins) = fetch_legacy_calendar_data_pg(
+                    &state.new_pool,
+                    &params.start_date,
+                    &params.end_date,
+                )
+                .await?;
 
-        all_bookings.extend(legacy_bookings);
-        all_checkins.extend(legacy_checkins);
+                all_bookings.extend(legacy_bookings);
+                all_checkins.extend(legacy_checkins);
+            }
+            SystemMode::New => {
+                let (new_bookings, new_checkins) = fetch_new_calendar_data(
+                    &state.new_pool,
+                    &params.start_date,
+                    &params.end_date,
+                )
+                .await?;
 
-        // In new mode, also fetch from new_hotel database
-        if mode == SystemMode::New {
-            let (new_bookings, new_checkins) = fetch_new_calendar_data(
-                &state.new_pool,
-                &params.start_date,
-                &params.end_date,
-            ).await?;
-
-            all_bookings.extend(new_bookings);
-            all_checkins.extend(new_checkins);
+                all_bookings.extend(new_bookings);
+                all_checkins.extend(new_checkins);
+            }
         }
     }
 

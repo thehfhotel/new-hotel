@@ -26,7 +26,7 @@
 //! - If no prior occupant exists (brand-new room), `h_cin` and `h_cin_name`
 //!   are `''` (empty) — matches the legacy app's behavior on day-one rooms.
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tiberius::Row;
 
 use crate::writeback::allocate::LegacyConn;
@@ -45,14 +45,17 @@ pub struct PriorOccupant {
 ///
 /// `room_id` is `HT_Rooms.id` (numeric PK). `room_no` is the display value
 /// (e.g. `"306"`). `prior` is the lookup result from [`fetch_prior_occupant`]
-/// (or `None` if the room has never been occupied).
+/// (or `None` if the room has never been occupied). `now` is threaded in by
+/// `execute()` so the function stays purely deterministic for tests —
+/// coexistence audit T6 HIGH-1.
 pub fn build_statements(
     room_id: i32,
     room_no: &str,
     by: &str,
     prior: Option<&PriorOccupant>,
+    now: DateTime<Utc>,
 ) -> Vec<String> {
-    let now_str = format_legacy_datetime(Utc::now());
+    let now_str = format_legacy_datetime(now);
     let now_q = sql_quote(&now_str);
     let by_q = sql_quote(by);
     let room_no_q = sql_quote(room_no);
@@ -108,7 +111,11 @@ pub async fn execute(
     by: &str,
 ) -> WritebackResult<LegacyIds> {
     let prior = fetch_prior_occupant(conn, room_no).await?;
-    let statements = build_statements(room_id_int, room_no, by, prior.as_ref());
+    // Coexistence audit T6 HIGH-1: capture `Utc::now()` once so the
+    // `h_date` audit stamp is deterministic relative to the rest of the
+    // recipe (no longer recomputed inside build_statements).
+    let now = Utc::now();
+    let statements = build_statements(room_id_int, room_no, by, prior.as_ref(), now);
     super::execute_all(conn, &statements).await?;
 
     let mut ids = LegacyIds::new();
@@ -153,6 +160,13 @@ fn build_prior_occupant_sql(room_no: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    /// Fixed instant used by every mark-clean test for the `h_date` stamp.
+    /// T6 HIGH-1.
+    fn pinned_now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 4, 24, 11, 50, 26).unwrap()
+    }
 
     /// Matches `mark-clean-20260424-115026/writes.txt` lines 1-2 (modulo the
     /// dynamic timestamp which we render with `format_legacy_datetime(now)`).
@@ -162,7 +176,7 @@ mod tests {
             cin_no: "CH26-005159".into(),
             customer_full_name: "<REDACTED-real-guest-name>".into(),
         };
-        let statements = build_statements(6, "306", "Admin", Some(&prior));
+        let statements = build_statements(6, "306", "Admin", Some(&prior), pinned_now());
         assert_eq!(statements.len(), 2);
         assert_eq!(
             statements[0],
@@ -175,9 +189,19 @@ mod tests {
         assert!(statements[1].contains("'306'"));
     }
 
+    /// Coexistence audit T6 HIGH-1: `build_statements` is PURE — repeated
+    /// calls with the same inputs produce byte-identical output, including
+    /// the `h_date` stamp.
+    #[test]
+    fn build_statements_is_pure_with_fixed_instant() {
+        let first = build_statements(6, "306", "Admin", None, pinned_now());
+        let second = build_statements(6, "306", "Admin", None, pinned_now());
+        assert_eq!(first, second, "build_statements must be deterministic");
+    }
+
     #[test]
     fn build_statements_uses_empty_strings_when_no_prior_occupant() {
-        let statements = build_statements(6, "306", "Admin", None);
+        let statements = build_statements(6, "306", "Admin", None, pinned_now());
         // Both h_cin and h_cin_name should be '' (empty)
         // INSERT format ends with ", h_cin_q, h_name_q)"
         // We include 4 commas after the 4 known values: ('Admin', '306', '<date>', '',
@@ -191,7 +215,7 @@ mod tests {
 
     #[test]
     fn updates_ht_rooms_by_numeric_id_not_room_no() {
-        let statements = build_statements(50, "403", "Admin", None);
+        let statements = build_statements(50, "403", "Admin", None, pinned_now());
         assert!(statements[0].contains("where id=50"));
         assert!(!statements[0].contains("room_no"));
     }

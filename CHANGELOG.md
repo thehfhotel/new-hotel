@@ -5,6 +5,65 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.63.9] - 2026-05-13
+
+### Fixed
+
+- **Coexistence read-path triage — Track A
+  (`docs/coexistence/audit-2026-05-13.md`).** Six findings spanning T3
+  (read paths) and T6 (identifiers/formats). No schema migrations, no UX
+  behavior removed.
+  - **T3 HIGH-4 — `/api/occupancy` reads canonical `ht_checkins`.**
+    `routes/occupancy.rs` now joins canonical and counts DISTINCT
+    `cin_room_id`, filtered to `cin_status IN ('active','checkedout')`.
+    Previously read `ht_checkins_legacy`, which has been demoted to
+    drift-detection-only since 2026-04-28 — the occupancy trend chart had
+    been silently broken for two weeks. The query is exposed as
+    `OCCUPANCY_TREND_SQL` and four inline tests pin the canonical shape.
+  - **T3 HIGH-5 — `/api/customers/*` reads canonical
+    `ht_customers` + `ht_bookings` + `ht_checkins`.**
+    `routes/customers.rs::list_customers_pg`, `get_customer_bookings_pg`,
+    and `get_customer_stats_pg` migrated. Customer-name search now
+    operates against the derived
+    `TRIM(cust_firstname || ' ' || COALESCE(cust_lastname, ''))` alias.
+    A new `resolve_customer_id_int` helper accepts either the canonical
+    integer `cust_id` or the legacy `cust_no` (e.g. `C21636`) on path
+    parameters so saved links and frontend pagination keep working
+    through cutover. The legacy `book_status` i32-keyed map is gone; the
+    canonical text enum is forwarded verbatim. Eight inline tests pin
+    each canonical SQL string.
+  - **T3 MED-3 — calendar `mode=new` drops the duplicate legacy fetch.**
+    `routes/calendar.rs` previously ran both `fetch_legacy_calendar_data_pg`
+    AND `fetch_new_calendar_data` when `SystemMode::New`, producing
+    duplicate rows where the frontend dedup-by-key papered over divergent
+    field values. The match-on-mode now picks exactly one source per mode.
+  - **T3 MED-1 + MED-2 — Bangkok timezone for "today" / 06:00
+    morning-flip.** `routes/stats.rs` exposes
+    `BANGKOK_TODAY_SQL` and `BANGKOK_HOUR_SQL` constants and routes
+    `stats::get_stats_pg`, `rooms::get_checkouts_today_pg`, and
+    `new_stats::get_stats` through them. Previously bare `CURRENT_DATE`
+    and `EXTRACT(HOUR FROM NOW())` evaluated in UTC; the
+    `today_check_outs` tile missed any departure done before 07:00 BKK
+    and the 06:00 morning-flip fired at 13:00 BKK. Four inline tests pin
+    the constants against regression to bare UTC.
+  - **T6 HIGH-1 — `Utc::now()` captured once per recipe in
+    `booking_create`, `payment`, `checkout`, `mark_clean`.** Each recipe's
+    `execute()` now captures `Utc::now()` at entry and threads it into
+    `build_statements` via an `Inputs::created_at` field. Matches the
+    Wave 5b pattern in `walkin` / `checkin_to_booking`. Closes the
+    BKK-midnight straddle window where a recipe's first `Utc::now()`
+    landed on today and a later one on tomorrow. Each recipe gains a
+    `build_statements_is_pure_with_fixed_instant` test.
+  - **T3 CRIT-1 — inactive-room "58 = 23 + 34" mystery: DEFERRED.**
+    Live data shows zero `room_active = false` rows
+    (`SELECT room_no FROM ht_rooms_new WHERE NOT room_active` → 0 rows),
+    so the audit's hypothesis (one inactive cell rendered as
+    "ไม่พบ") is not the proximate cause. The dashboard formula
+    `available = total - occupied - checkout - booked` reconciles
+    correctly with today's numbers (58 = 34 + 1 + 0 + 23). The audit
+    rated this finding "Medium confidence — requires data spot-check"
+    and the spot-check failed; reopen if/when an inactive room appears.
+
 ## [2.63.8] - 2026-05-12
 
 ### Changed

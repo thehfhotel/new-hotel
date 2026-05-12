@@ -63,16 +63,24 @@ pub async fn get_stats(State(state): State<AppState>) -> ApiResult<Json<StatsRes
             })
             .unwrap_or((0, 0, 0, 0, 0));
 
-    // Query today's check-ins (active check-ins that started today)
-    let checkin_stats_sql =
+    // Query today's check-ins / check-outs. Coexistence audit T3 MED-1 +
+    // MED-2: "today" is Bangkok local, not UTC. `cin_checkin_time` /
+    // `cin_checkout_time` are naive TIMESTAMP columns that store Bangkok
+    // wall-clock (per CLAUDE.md timezone discipline), so we compare their
+    // `::date` directly against the Bangkok-today fragment. Reuses the
+    // same constant `stats::get_stats_pg` uses to keep the two dashboards
+    // in lockstep.
+    let checkin_stats_sql = format!(
         r#"
             SELECT
-                SUM(CASE WHEN cin_checkin_time::date = NOW()::date THEN 1 ELSE 0 END)::int as today_check_ins,
-                SUM(CASE WHEN cin_checkout_time::date = NOW()::date THEN 1 ELSE 0 END)::int as today_check_outs
+                SUM(CASE WHEN cin_checkin_time::date = {today} THEN 1 ELSE 0 END)::int AS today_check_ins,
+                SUM(CASE WHEN cin_checkout_time::date = {today} THEN 1 ELSE 0 END)::int AS today_check_outs
             FROM ht_checkins
-            "#;
+            "#,
+        today = crate::routes::stats::BANGKOK_TODAY_SQL,
+    );
 
-    let checkin_stats_rows = sqlx::query(checkin_stats_sql).fetch_all(pool).await?;
+    let checkin_stats_rows = sqlx::query(&checkin_stats_sql).fetch_all(pool).await?;
 
     let (today_check_ins, today_check_outs) = checkin_stats_rows
         .first()

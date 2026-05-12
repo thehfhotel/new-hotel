@@ -43,7 +43,7 @@
 //!   so the worker can pass real values.
 //! - Power-log note format: `ปิดไฟ อัตโนมัติ จากเช็คเอ้าท์ No.{cin_no}`
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use crate::writeback::allocate::LegacyConn;
 use crate::writeback::constants::{
@@ -68,6 +68,10 @@ pub struct CheckOutInputs<'a> {
     pub pay_total: f64,
     pub balance: f64,
     pub nights: f64,
+    /// "Now" timestamp threaded in by `execute()` so `build_statements`
+    /// stays PURE — coexistence audit T6 HIGH-1. Drives
+    /// `HT_CheckIn_Ds.Cin_Room_Out` (the per-room checkout stamp).
+    pub created_at: DateTime<Utc>,
 }
 
 /// Build the 5 statements that complete a check-out. PURE — no I/O.
@@ -75,7 +79,7 @@ pub fn build_statements(inputs: &CheckOutInputs<'_>) -> Vec<String> {
     let cin_no_q = sql_quote(inputs.cin_no);
     let room_no_q = sql_quote(inputs.room_no);
     let by_q = sql_quote(DEFAULT_OPERATOR);
-    let now_str = format_legacy_datetime(Utc::now());
+    let now_str = format_legacy_datetime(inputs.created_at);
     let now_q = sql_quote(&now_str);
     let power_note = power_log_note_check_out(inputs.cin_no);
     let power_note_q = sql_quote(&power_note);
@@ -164,6 +168,10 @@ pub async fn execute(
         ("balance", balance),
     ])?;
 
+    // Coexistence audit T6 HIGH-1: capture `Utc::now()` once at the entry to
+    // `execute()` so `build_statements` is purely a function of its inputs.
+    let created_at = Utc::now();
+
     let inputs = CheckOutInputs {
         cin_no,
         room_no,
@@ -174,6 +182,7 @@ pub async fn execute(
         pay_total,
         balance,
         nights,
+        created_at,
     };
     let statements = build_statements(&inputs);
     super::execute_all(conn, &statements).await?;
@@ -183,6 +192,13 @@ pub async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    /// Fixed instant used by every CheckOutInputs test literal so
+    /// `Cin_Room_Out` renders to a stable wall-clock string. T6 HIGH-1.
+    fn pinned_now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 4, 24, 10, 5, 4).unwrap()
+    }
 
     #[test]
     fn build_statements_matches_spike_capture_structure() {
@@ -197,6 +213,7 @@ mod tests {
             pay_total: 0.0,
             balance: 0.0,
             nights: 1.0,
+            created_at: pinned_now(),
         };
         let statements = build_statements(&inputs);
         assert_eq!(statements.len(), 5);
@@ -235,6 +252,7 @@ mod tests {
             pay_total: 0.0,
             balance: 0.0,
             nights: 1.0,
+            created_at: pinned_now(),
         };
         let statements = build_statements(&inputs);
         assert!(statements[1].contains("'Check-Out'"));
@@ -253,6 +271,7 @@ mod tests {
             pay_total: 0.0,
             balance: 0.0,
             nights: 1.0,
+            created_at: pinned_now(),
         };
         let statements = build_statements(&inputs);
         assert!(statements[3].contains("'Check Out'"));
@@ -271,12 +290,36 @@ mod tests {
             pay_total: 1780.0,
             balance: 0.0,
             nights: 2.0,
+            created_at: pinned_now(),
         };
         let statements = build_statements(&inputs);
         assert!(statements[4].contains("[Total_Price_Room]=1780"));
         assert!(statements[4].contains("[Total_Price_Net]=1780"));
         assert!(statements[4].contains("[Total_Price_Pay]=1780"));
         assert!(statements[4].contains("[Total_Price_Balance]=0"));
+    }
+
+    /// Coexistence audit T6 HIGH-1: `build_statements` is PURE — calling it
+    /// twice with the same inputs produces byte-identical output (the
+    /// `Cin_Room_Out` stamp derives from `inputs.created_at`, not a fresh
+    /// `Utc::now()`).
+    #[test]
+    fn build_statements_is_pure_with_fixed_instant() {
+        let inputs = CheckOutInputs {
+            cin_no: "CH26-005228",
+            room_no: "402",
+            checkin_ds_id: 25007,
+            room_price_total: 0.0,
+            product_total: 0.0,
+            net_total: 0.0,
+            pay_total: 0.0,
+            balance: 0.0,
+            nights: 1.0,
+            created_at: pinned_now(),
+        };
+        let first = build_statements(&inputs);
+        let second = build_statements(&inputs);
+        assert_eq!(first, second, "build_statements must be deterministic");
     }
 
     /// Fix for audit H1: a 3-night checkout with real revenue totals
@@ -295,6 +338,7 @@ mod tests {
             pay_total: 2670.0,
             balance: 0.0,
             nights: 3.0,
+            created_at: pinned_now(),
         };
         let statements = build_statements(&inputs);
         // HT_CheckIn_Ds row (statement 2): Cin_Room_PriceTotal must equal
@@ -387,6 +431,7 @@ mod tests {
             pay_total: 2670.0,
             balance: 0.0,
             nights: 3.0,
+            created_at: pinned_now(),
         };
         let statements = build_statements(&inputs);
         assert!(

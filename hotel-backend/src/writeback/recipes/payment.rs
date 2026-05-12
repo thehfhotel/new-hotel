@@ -95,6 +95,12 @@ pub struct PaymentInputs<'a> {
     /// Captured values look like Thai national ID numbers, foreign
     /// passport-style IDs, or short codes. Empty string when unknown.
     pub receipt_tax: &'a str,
+    /// "Now" timestamp threaded in by `execute()` so `build_statements`
+    /// stays PURE — coexistence audit T6 HIGH-1. Drives
+    /// `HT_CheckIn_Pay.Cin_Pay_Date` and `HT_Receipt_H.Receipt_Date` from a
+    /// single source; the prior `Utc::now()` recompute could straddle BKK
+    /// midnight between the two rows. Tests pin a fixed instant.
+    pub created_at: DateTime<Utc>,
 }
 
 /// Build the payment + receipt statements. PURE — no I/O.
@@ -112,7 +118,7 @@ pub fn build_statements(
     let room_no_q = sql_quote(inputs.room_no);
     let pay_no_q = sql_quote(inputs.pay_no);
     let receipt_no_q = sql_quote(inputs.receipt_no);
-    let now_q = sql_quote(&format_legacy_datetime(Utc::now()));
+    let now_q = sql_quote(&format_legacy_datetime(inputs.created_at));
     let amount = inputs.amount_baht;
     let amount_2dp = money_2dp(amount)?;
     let cust_name_q = sql_quote(inputs.customer_name);
@@ -336,6 +342,10 @@ pub async fn execute(
     let receipt_no = allocate_receipt_no(conn).await?;
     let receipt_h_id = allocate_receipt_h_id(conn).await?;
 
+    // Coexistence audit T6 HIGH-1: capture `Utc::now()` once so
+    // `Cin_Pay_Date` and `Receipt_Date` share the same instant.
+    let created_at = Utc::now();
+
     let inputs = PaymentInputs {
         cin_no,
         cust_no,
@@ -363,6 +373,7 @@ pub async fn execute(
         stay_check_out: None,
         from_booking: false,
         receipt_tax: "",
+        created_at,
     };
     let statements = build_statements(&inputs)?;
     super::execute_all(conn, &statements).await?;
@@ -402,7 +413,21 @@ mod tests {
             stay_check_out: Some(Utc.with_ymd_and_hms(2026, 4, 26, 4, 59, 59).unwrap()),
             from_booking: true,
             receipt_tax: "XDD619524",
+            // T6 HIGH-1: fixed instant so Cin_Pay_Date and Receipt_Date are
+            // deterministic for byte-parity assertions.
+            created_at: Utc.with_ymd_and_hms(2026, 4, 25, 4, 35, 47).unwrap(),
         }
+    }
+
+    /// Coexistence audit T6 HIGH-1: `build_statements` is PURE — calling it
+    /// twice with the same inputs must produce byte-identical output, with
+    /// `Cin_Pay_Date` and `Receipt_Date` derived from `inputs.created_at`.
+    #[test]
+    fn build_statements_is_pure_with_fixed_instant() {
+        let inputs = sample_inputs();
+        let first = build_statements(&inputs).unwrap();
+        let second = build_statements(&inputs).unwrap();
+        assert_eq!(first, second, "build_statements must be deterministic");
     }
 
     /// Byte-for-byte test of the HT_CheckIn_Pay statement against a

@@ -7,6 +7,14 @@
 //! but those were demoted to hash-only drift detection in Phase 5.5
 //! (2026-04-28) and stopped receiving row-level updates — leaving the
 //! receptionist dashboard 2+ weeks stale.
+//!
+//! Timezone discipline: every "today" or "06:00 morning-flip" predicate is
+//! evaluated in Bangkok local time. The PG server runs UTC; bare
+//! `CURRENT_DATE` / `NOW()` would interpret "today" as UTC and the
+//! `today_check_outs` tile would silently miss any checkout done between
+//! 00:00 and 07:00 BKK (17:00–24:00 UTC the prior day). Same story for
+//! the morning-flip — the 06:00 grace period must trigger at 06:00 BKK,
+//! not 06:00 UTC (= 13:00 BKK). Coexistence audit T3 MED-1 + MED-2.
 
 use axum::{extract::{Query, State}, Json};
 use serde::{Deserialize, Serialize};
@@ -15,6 +23,17 @@ use sqlx::Row;
 use crate::db::PgPool;
 use crate::error::ApiResult;
 use crate::routes::mode::{AppState, Branch};
+
+/// SQL fragment for "today" in Bangkok — replaces bare `CURRENT_DATE` so
+/// the dashboard never reads "today" off the UTC clock. Use everywhere a
+/// receptionist-facing date is being computed.
+pub(crate) const BANGKOK_TODAY_SQL: &str = "(NOW() AT TIME ZONE 'Asia/Bangkok')::date";
+
+/// SQL fragment for "current hour" in Bangkok — gates the morning-flip
+/// (06:00 BKK) that moves an expected-checkout-today from "occupied" to
+/// "checkout pending" on the dashboard.
+pub(crate) const BANGKOK_HOUR_SQL: &str =
+    "EXTRACT(HOUR FROM NOW() AT TIME ZONE 'Asia/Bangkok')";
 
 /// Dashboard statistics
 #[derive(Debug, Serialize)]
@@ -100,50 +119,54 @@ async fn get_stats_pg(pool: &PgPool) -> ApiResult<DashboardStats> {
 
     // Occupied rooms: distinct rooms with an active checkin, EXCLUDING
     // those that have already flipped to "checkout today" (handled below).
-    let occupied_rooms: i64 = sqlx::query(
+    let occupied_rooms: i64 = sqlx::query(&format!(
         r#"
         SELECT COUNT(DISTINCT c.cin_room_id) AS count
         FROM ht_checkins c
         WHERE c.cin_status = 'active'
           AND c.cin_checkout_time IS NULL
           AND NOT (
-              c.cin_expected_checkout = CURRENT_DATE
-              AND EXTRACT(HOUR FROM NOW()) >= 6
+              c.cin_expected_checkout = {today}
+              AND {hour} >= 6
           )
         "#,
-    )
+        today = BANGKOK_TODAY_SQL,
+        hour = BANGKOK_HOUR_SQL,
+    ))
     .fetch_one(pool)
     .await?
     .try_get("count")
     .unwrap_or(0);
 
     // Checkout rooms: active checkin whose expected checkout is today,
-    // and the morning grace period (06:00) has passed.
-    let checkout_rooms: i64 = sqlx::query(
+    // and the morning grace period (06:00 BKK) has passed.
+    let checkout_rooms: i64 = sqlx::query(&format!(
         r#"
         SELECT COUNT(DISTINCT c.cin_room_id) AS count
         FROM ht_checkins c
         WHERE c.cin_status = 'active'
           AND c.cin_checkout_time IS NULL
-          AND c.cin_expected_checkout = CURRENT_DATE
-          AND EXTRACT(HOUR FROM NOW()) >= 6
+          AND c.cin_expected_checkout = {today}
+          AND {hour} >= 6
         "#,
-    )
+        today = BANGKOK_TODAY_SQL,
+        hour = BANGKOK_HOUR_SQL,
+    ))
     .fetch_one(pool)
     .await?
     .try_get("count")
     .unwrap_or(0);
 
     // Booked rooms: distinct rooms with a confirmed/pending booking
-    // straddling today, with no active checkin in that room yet.
-    let booked_rooms: i64 = sqlx::query(
+    // straddling today (BKK), with no active checkin in that room yet.
+    let booked_rooms: i64 = sqlx::query(&format!(
         r#"
         SELECT COUNT(DISTINCT br.br_room_id) AS count
         FROM ht_booking_rooms br
         JOIN ht_bookings b ON b.book_id = br.br_book_id
         WHERE b.book_status IN ('confirmed', 'pending')
-          AND b.book_checkin <= CURRENT_DATE
-          AND b.book_checkout > CURRENT_DATE
+          AND b.book_checkin <= {today}
+          AND b.book_checkout > {today}
           AND NOT EXISTS (
               SELECT 1 FROM ht_checkins c
               WHERE c.cin_room_id = br.br_room_id
@@ -151,33 +174,43 @@ async fn get_stats_pg(pool: &PgPool) -> ApiResult<DashboardStats> {
                 AND c.cin_checkout_time IS NULL
           )
         "#,
-    )
+        today = BANGKOK_TODAY_SQL,
+    ))
     .fetch_one(pool)
     .await?
     .try_get("count")
     .unwrap_or(0);
 
-    // Today's check-ins (any checkin row whose checkin_time landed today)
-    let today_check_ins: i64 = sqlx::query(
+    // Today's check-ins (any checkin row whose checkin_time landed today
+    // in Bangkok local time). Per CLAUDE.md timezone discipline,
+    // `cin_checkin_time` is a naive TIMESTAMP storing Bangkok wall-clock —
+    // compare its `::date` directly against `BANGKOK_TODAY_SQL`. Do NOT
+    // also `AT TIME ZONE 'Asia/Bangkok'` the value (that would treat it
+    // as UTC and shift it forward by 7h, giving the next-day date).
+    let today_check_ins: i64 = sqlx::query(&format!(
         r#"
         SELECT COUNT(*) AS count
         FROM ht_checkins
-        WHERE cin_checkin_time::date = CURRENT_DATE
+        WHERE cin_checkin_time::date = {today}
         "#,
-    )
+        today = BANGKOK_TODAY_SQL,
+    ))
     .fetch_one(pool)
     .await?
     .try_get("count")
     .unwrap_or(0);
 
-    // Today's check-outs (rows that were actually checked out today)
-    let today_check_outs: i64 = sqlx::query(
+    // Today's check-outs (rows that were actually checked out today in
+    // Bangkok local time). Same reasoning: `cin_checkout_time` is naive
+    // BKK wall-clock, compare directly.
+    let today_check_outs: i64 = sqlx::query(&format!(
         r#"
         SELECT COUNT(*) AS count
         FROM ht_checkins
-        WHERE cin_checkout_time::date = CURRENT_DATE
+        WHERE cin_checkout_time::date = {today}
         "#,
-    )
+        today = BANGKOK_TODAY_SQL,
+    ))
     .fetch_one(pool)
     .await?
     .try_get("count")
@@ -217,4 +250,37 @@ async fn get_stats_pg(pool: &PgPool) -> ApiResult<DashboardStats> {
         active_bookings: active_bookings as i32,
         total_customers: total_customers as i32,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BANGKOK_HOUR_SQL, BANGKOK_TODAY_SQL};
+
+    /// Coexistence audit T3 MED-1 + MED-2: every "today" predicate must be
+    /// evaluated against the Bangkok wall-clock, not UTC. The constants
+    /// carry the exact SQL fragments callers splice into queries; a
+    /// regression to bare `CURRENT_DATE` would surface immediately here.
+    #[test]
+    fn bangkok_today_uses_at_time_zone_asia_bangkok() {
+        assert_eq!(BANGKOK_TODAY_SQL, "(NOW() AT TIME ZONE 'Asia/Bangkok')::date");
+    }
+
+    #[test]
+    fn bangkok_hour_uses_at_time_zone_asia_bangkok() {
+        assert_eq!(
+            BANGKOK_HOUR_SQL,
+            "EXTRACT(HOUR FROM NOW() AT TIME ZONE 'Asia/Bangkok')"
+        );
+    }
+
+    #[test]
+    fn bangkok_today_is_not_bare_current_date() {
+        assert!(!BANGKOK_TODAY_SQL.contains("CURRENT_DATE"));
+        assert!(BANGKOK_TODAY_SQL.contains("AT TIME ZONE 'Asia/Bangkok'"));
+    }
+
+    #[test]
+    fn bangkok_hour_is_not_bare_now() {
+        assert!(BANGKOK_HOUR_SQL.contains("AT TIME ZONE 'Asia/Bangkok'"));
+    }
 }

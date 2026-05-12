@@ -209,21 +209,26 @@ async fn get_room_legacy_only(pool: &crate::db::PgPool, room_no: &str) -> ApiRes
 /// Get rooms checking out today from canonical PG tables.
 ///
 /// Same flip rule as `stats::get_stats_pg`: only rooms with an active
-/// checkin whose `cin_expected_checkout = CURRENT_DATE`, surfaced after
-/// 06:00 local so the morning crew can process departures.
+/// checkin whose expected checkout is "today in Bangkok", surfaced after
+/// 06:00 BKK so the morning crew can process departures. Coexistence
+/// audit T3 MED-1 + MED-2: the prior `CURRENT_DATE` / `EXTRACT(HOUR FROM
+/// NOW())` shape evaluated in UTC, which delayed the morning flip until
+/// 13:00 BKK.
 async fn get_checkouts_today_pg(pool: &crate::db::PgPool) -> ApiResult<Vec<String>> {
-    let rows = sqlx::query(
+    let rows = sqlx::query(&format!(
         r#"
         SELECT DISTINCT r.room_no AS room_no
         FROM ht_rooms_new r
         JOIN ht_checkins c ON c.cin_room_id = r.room_id
         WHERE c.cin_status = 'active'
-          AND c.cin_expected_checkout = CURRENT_DATE
+          AND c.cin_expected_checkout = {today}
           AND c.cin_checkout_time IS NULL
-          AND EXTRACT(HOUR FROM NOW()) >= 6
+          AND {hour} >= 6
         ORDER BY r.room_no
         "#,
-    )
+        today = crate::routes::stats::BANGKOK_TODAY_SQL,
+        hour = crate::routes::stats::BANGKOK_HOUR_SQL,
+    ))
     .fetch_all(pool)
     .await?;
 
