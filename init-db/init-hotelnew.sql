@@ -1156,5 +1156,21 @@ VALUES ('028', '028_create_ht_sessions.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================
+-- 029_normalize_cin_status_terminal.sql
+-- Canonicalize ht_checkins.cin_status post-checkout terminal value on
+-- 'checkedout'. No-op on a fresh database (no rows exist) but kept for
+-- drift-check parity with migrations/pg/029_normalize_cin_status_terminal.sql.
+-- =============================================================================
+
+UPDATE ht_checkins
+   SET cin_status = 'checkedout',
+       updated_at = NOW()
+ WHERE cin_status IN ('checked_out', 'completed');
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('029', '029_normalize_cin_status_terminal.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
 -- Initialization complete
 -- =============================================================================
