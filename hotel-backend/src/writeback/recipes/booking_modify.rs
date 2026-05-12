@@ -46,9 +46,7 @@ use crate::outbox::intent::{BookingChanges, CustomerResave};
 use crate::writeback::allocate::{allocate_book_date_id, LegacyConn};
 use crate::writeback::dispatcher::LegacyIds;
 use crate::writeback::error::WritebackResult;
-use crate::writeback::format::{
-    format_legacy_date, format_legacy_datetime, midnight_of, sql_quote,
-};
+use crate::writeback::format::{format_legacy_date, format_legacy_datetime, sql_quote};
 use chrono::{DateTime, Days, NaiveDate, Utc};
 
 /// Inputs for the modify-booking recipe — already-resolved legacy IDs +
@@ -69,6 +67,16 @@ pub struct ModifyBookingInputs<'a> {
     /// otherwise the booking disappears from the .NET app's calendar grid
     /// (audit HIGH-1). Resolved by `execute()` from HT_Book_Date.
     pub existing_room_no: Option<&'a str>,
+    /// Customer name on the booking *before* this modification — used as a
+    /// fallback to render the calendar caption when only dates change (H8).
+    /// Resolved by `execute()` from HT_Book_H.
+    pub existing_customer_name: Option<&'a str>,
+    /// `HT_Book_Ds.Book_Room_Night` on the booking *before* this
+    /// modification — used when computing `Book_Room_PriceToTal` for a
+    /// price-only modify (H10). Without it the total collapses to
+    /// `price * 1` and corrupts multi-night bookings.
+    /// Resolved by `execute()` from HT_Book_Ds.
+    pub book_room_night_existing: Option<i32>,
 }
 
 /// Build the targeted-UPDATE statements. PURE — no I/O.
@@ -95,9 +103,18 @@ pub fn build_statements(inputs: &ModifyBookingInputs<'_>) -> Vec<String> {
     //    incrementally; if no header changes, we skip the UPDATE entirely.
     let mut header_sets: Vec<String> = Vec::new();
     if let Some(stay) = &inputs.changes.new_stay {
-        // §3k: Book_Date_in/out on HT_Book_H render at midnight
-        let in_q = sql_quote(&format_legacy_datetime(midnight_of(stay.start)));
-        let out_q = sql_quote(&format_legacy_datetime(midnight_of(stay.end)));
+        // H9: HT_Book_H carries date-only forms (matches `booking_create`
+        // and the latest legacy capture — see `booking_create.rs:105-114`
+        // and the byte-parity test at `booking_create.rs::book_h_matches_legacy_capture_byte_for_byte`).
+        // The earlier midnight-suffix shape (`'4/25/2026 12:00:00 AM'`)
+        // diverged from create and broke the .NET app's booking-list view
+        // when both code paths fired in the same writeback session.
+        let in_q = sql_quote(&format_legacy_date(
+            crate::writeback::format::bangkok_date(stay.start),
+        ));
+        let out_q = sql_quote(&format_legacy_date(
+            crate::writeback::format::bangkok_date(stay.end),
+        ));
         header_sets.push(format!("[Book_Date_in]={in_q}"));
         header_sets.push(format!("[Book_Date_out]={out_q}"));
     }
@@ -140,7 +157,17 @@ pub fn build_statements(inputs: &ModifyBookingInputs<'_>) -> Vec<String> {
     }
     if let Some(price) = &inputs.changes.new_price {
         let baht = (price.as_satang() as f64) / 100.0;
-        let nights = inputs.new_nights_calendar.len().max(1) as i32;
+        // H10: when `new_stay` is None, the `new_nights_calendar` vec is
+        // empty — falling back to `.len().max(1)=1` would corrupt a
+        // multi-night booking's total (`Book_Room_PriceToTal` collapses to
+        // a single-night value). Prefer the existing night count fetched
+        // from MSSQL; fall back to the new calendar length when the stay
+        // is genuinely changing.
+        let nights = if inputs.changes.new_stay.is_some() {
+            inputs.new_nights_calendar.len().max(1) as i32
+        } else {
+            inputs.book_room_night_existing.unwrap_or(1).max(1)
+        };
         ds_sets.push(format!("[Book_Room_Price]={baht}"));
         ds_sets.push(format!(
             "[Book_Room_PriceToTal]={total}",
@@ -200,17 +227,32 @@ pub fn build_statements(inputs: &ModifyBookingInputs<'_>) -> Vec<String> {
 
         // Re-write the HT_Rooms display caption with the new dates — spike
         // §3c capture line 26. Mirrors `booking_create`'s caption format
-        // (commit 0179f81). We need a customer name + room number to render
-        // the caption; if either is missing we skip (the .NET app would also
-        // skip in that case — phone/notes are optional).
-        if let (Some(customer_name), Some(room_no), Some(stay)) = (
-            inputs.changes.new_customer_name.as_deref(),
-            inputs.changes.new_room_no.as_deref(),
-            inputs.changes.new_stay.as_ref(),
-        ) {
+        // (commit 0179f81).
+        //
+        // H8: a date-only edit (no `new_customer_name`, no `new_room_no` in
+        // the payload) previously skipped this rewrite, so step 0b cleared
+        // the caption and nothing put it back — the .NET calendar grid lost
+        // the booking caption for the new date range. Fix: fall back to the
+        // existing customer name + room no fetched from MSSQL (the same
+        // pattern as `existing_room_no` for HT_Book_Date INSERTs). The
+        // rewrite still requires `new_stay` (otherwise we have nothing to
+        // re-render).
+        let stay = inputs.changes.new_stay.as_ref();
+        let customer_name = inputs
+            .changes
+            .new_customer_name
+            .as_deref()
+            .or(inputs.existing_customer_name);
+        let room_no = inputs
+            .changes
+            .new_room_no
+            .as_deref()
+            .or(inputs.existing_room_no);
+        if let (Some(stay), Some(customer_name), Some(room_no)) = (stay, customer_name, room_no) {
             let stay_in_short = crate::writeback::format::format_bangkok(stay.start, "%d/%m %H:%M");
             let stay_end_actual = end_of_stay_at_almost_noon(stay.end);
-            let stay_out_short = crate::writeback::format::format_bangkok(stay_end_actual, "%d/%m %H:%M");
+            let stay_out_short =
+                crate::writeback::format::format_bangkok(stay_end_actual, "%d/%m %H:%M");
             let phone = inputs.changes.new_customer_phone.as_deref().unwrap_or("");
             let notes = inputs.changes.new_notes.as_deref().unwrap_or("");
             let room_book_ds_q = sql_quote(&format!(
@@ -358,9 +400,27 @@ pub async fn execute(
         Vec::new()
     };
     // If the stay is changing without moving rooms, we need the current
-    // room_no for the new HT_Book_Date INSERTs (audit HIGH-1).
+    // room_no for the new HT_Book_Date INSERTs (audit HIGH-1) AND for the
+    // calendar-caption rewrite (H8).
     let existing_room_no = if changes.new_stay.is_some() && changes.new_room_no.is_none() {
         fetch_existing_room_no(conn, book_id).await?
+    } else {
+        None
+    };
+    // H8: when only dates change, fall back to the existing customer name
+    // for the caption rewrite. Only needed when stay changed AND the
+    // payload didn't carry a name (the rewrite uses payload-or-existing).
+    let existing_customer_name =
+        if changes.new_stay.is_some() && changes.new_customer_name.is_none() {
+            fetch_existing_customer_name(conn, book_id).await?
+        } else {
+            None
+        };
+    // H10: a price-only modify (no `new_stay`) collapses the
+    // `Book_Room_PriceToTal` to `price * 1` unless we know the existing
+    // night count. Mirror the `existing_room_no` lookup pattern.
+    let book_room_night_existing = if changes.new_price.is_some() && changes.new_stay.is_none() {
+        fetch_existing_book_room_night(conn, book_id).await?
     } else {
         None
     };
@@ -372,7 +432,13 @@ pub async fn execute(
     // overflow producing infinity.
     if let Some(price) = &changes.new_price {
         let room_price_baht = (price.as_satang() as f64) / 100.0;
-        let nights = new_nights.len().max(1) as f64;
+        // H10: mirror the same precedence `build_statements` uses — when
+        // `new_stay` is None we use the existing night count for the total.
+        let nights = if changes.new_stay.is_some() {
+            new_nights.len().max(1) as f64
+        } else {
+            book_room_night_existing.unwrap_or(1).max(1) as f64
+        };
         super::helpers::validate_finite(&[
             ("room_price_baht", room_price_baht),
             ("room_price_total_baht", room_price_baht * nights),
@@ -382,9 +448,11 @@ pub async fn execute(
     let inputs = ModifyBookingInputs {
         book_id,
         book_date_id_base,
+        book_room_night_existing,
         changes,
         new_nights_calendar: new_nights,
         existing_room_no: existing_room_no.as_deref(),
+        existing_customer_name: existing_customer_name.as_deref(),
     };
     let statements = build_statements(&inputs);
     super::execute_all(conn, &statements).await?;
@@ -408,6 +476,48 @@ async fn fetch_existing_room_no(
     let row = stream.into_row().await?;
     match row {
         Some(r) => Ok(r.get::<&str, _>(0).map(|s| s.to_string())),
+        None => Ok(None),
+    }
+}
+
+/// Look up the current customer name on the booking from `HT_Book_H`.
+/// Mirrors `fetch_existing_room_no` — used by H8 to render the calendar
+/// caption when only dates change and the payload doesn't carry the name.
+async fn fetch_existing_customer_name(
+    conn: &mut LegacyConn<'_>,
+    book_id: &str,
+) -> WritebackResult<Option<String>> {
+    let book_id_q = sql_quote(book_id);
+    let sql = format!(
+        "SELECT TOP 1 Book_Cust_Name FROM HT_Book_H \
+         WHERE Book_ID={book_id_q}"
+    );
+    let stream = conn.simple_query(sql).await?;
+    let row = stream.into_row().await?;
+    match row {
+        Some(r) => Ok(r.get::<&str, _>(0).map(|s| s.to_string())),
+        None => Ok(None),
+    }
+}
+
+/// Look up the current `Book_Room_Night` on the booking from `HT_Book_Ds`.
+/// Used by H10 to preserve the multi-night total when a price-only modify
+/// fires (no `new_stay`, so `new_nights_calendar` is empty).
+async fn fetch_existing_book_room_night(
+    conn: &mut LegacyConn<'_>,
+    book_id: &str,
+) -> WritebackResult<Option<i32>> {
+    let book_id_q = sql_quote(book_id);
+    let sql = format!(
+        "SELECT TOP 1 Book_Room_Night FROM HT_Book_Ds \
+         WHERE Book_No={book_id_q}"
+    );
+    let stream = conn.simple_query(sql).await?;
+    let row = stream.into_row().await?;
+    match row {
+        // HT_Book_Ds.Book_Room_Night is declared `int` in the schema dump
+        // (2026-04-26); read as i32. Defensively widen None.
+        Some(r) => Ok(r.get::<i32, _>(0)),
         None => Ok(None),
     }
 }
@@ -445,6 +555,8 @@ mod tests {
                 NaiveDate::from_ymd_opt(2026, 4, 26).unwrap(),
             ],
             existing_room_no: None,
+            existing_customer_name: None,
+            book_room_night_existing: None,
         };
         let statements = build_statements(&inputs);
         for s in &statements {
@@ -479,6 +591,8 @@ mod tests {
             changes: &changes,
             new_nights_calendar: vec![],
             existing_room_no: None,
+            existing_customer_name: None,
+            book_room_night_existing: None,
         };
         let s = build_statements(&inputs);
         assert_eq!(s.len(), 1);
@@ -515,6 +629,8 @@ mod tests {
                 NaiveDate::from_ymd_opt(2026, 4, 26).unwrap(),
             ],
             existing_room_no: Some("402"),
+            existing_customer_name: None,
+            book_room_night_existing: None,
         };
         let s = build_statements(&inputs);
         let inserts: Vec<_> = s.iter().filter(|x| x.contains("INSERT INTO [HT_Book_Date]")).collect();
@@ -554,40 +670,13 @@ mod tests {
             changes: &changes,
             new_nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],
             existing_room_no: Some("402"), // would be the wrong choice
+            existing_customer_name: None,
+            book_room_night_existing: None,
         };
         let s = build_statements(&inputs);
         let insert = s.iter().find(|x| x.contains("INSERT INTO [HT_Book_Date]")).unwrap();
         assert!(insert.contains(",'510',"), "got: {insert}");
         assert!(!insert.contains(",'402',"));
-    }
-
-    #[test]
-    fn updates_book_h_dates_at_midnight_per_section_3k() {
-        let changes = BookingChanges {
-            new_stay: Some(DateRange::new(
-                Utc.with_ymd_and_hms(2026, 4, 25, 14, 30, 0).unwrap(),
-                Utc.with_ymd_and_hms(2026, 4, 26, 11, 0, 0).unwrap(),
-            )),
-            new_room_no: None,
-            new_room_type: None,
-            new_price: None,
-            new_state: None,
-            new_notes: None,
-            new_customer_phone: None,
-            new_customer_name: None,
-            customer_resave: None,
-        };
-        let inputs = ModifyBookingInputs {
-            book_id: "R014810",
-            book_date_id_base: 47300,
-            changes: &changes,
-            new_nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],
-            existing_room_no: None,
-        };
-        let s = build_statements(&inputs);
-        let h = s.iter().find(|s| s.contains("[HT_Book_H]")).unwrap();
-        assert!(h.contains("'4/25/2026 12:00:00 AM'"));
-        assert!(h.contains("'4/26/2026 12:00:00 AM'"));
     }
 
     #[test]
@@ -613,6 +702,8 @@ mod tests {
             changes: &changes,
             new_nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],
             existing_room_no: None,
+            existing_customer_name: None,
+            book_room_night_existing: None,
         };
         let s = build_statements(&inputs);
         let d = s.iter().find(|s| s.contains("[HT_Book_Ds]")).unwrap();
@@ -641,6 +732,8 @@ mod tests {
             changes: &changes,
             new_nights_calendar: vec![],
             existing_room_no: None,
+            existing_customer_name: None,
+            book_room_night_existing: None,
         };
         let s = build_statements(&inputs);
         // Statement 0: room_book clear; statement 1: HT_Book_H UPDATE.
@@ -674,6 +767,8 @@ mod tests {
             changes: &changes,
             new_nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],
             existing_room_no: None,
+            existing_customer_name: None,
+            book_room_night_existing: None,
         };
         let s = build_statements(&inputs);
         let clear_idx = s
@@ -720,6 +815,8 @@ mod tests {
             changes: &changes,
             new_nights_calendar: vec![],
             existing_room_no: None,
+            existing_customer_name: None,
+            book_room_night_existing: None,
         };
         let s = build_statements(&inputs);
         let upd = s
@@ -772,6 +869,8 @@ mod tests {
             changes: &changes,
             new_nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],
             existing_room_no: None,
+            existing_customer_name: None,
+            book_room_night_existing: None,
         };
         let s = build_statements(&inputs);
         // Caption rewrite is the LAST statement.
@@ -806,6 +905,8 @@ mod tests {
             changes: &changes,
             new_nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],
             existing_room_no: None,
+            existing_customer_name: None,
+            book_room_night_existing: None,
         };
         let s = build_statements(&inputs);
         // The night INSERT should be guarded by NOT EXISTS for idempotency
@@ -845,6 +946,150 @@ mod tests {
         assert!(err.to_string().contains("room_price_total_baht"));
     }
 
+    /// H8 — caption rewrite must fire on a date-only edit. Previously only
+    /// fired when `customer_name + room_no + stay` were ALL `Some`; a date
+    /// change cleared the caption at step 0b but never re-wrote it, so the
+    /// calendar grid lost the booking caption for the new date range.
+    /// Fix: when `new_stay.is_some()`, resolve customer_name + room_no from
+    /// existing rows and always emit the caption rewrite.
+    #[test]
+    fn caption_rewrite_fires_on_date_only_edit() {
+        let changes = BookingChanges {
+            new_stay: Some(DateRange::new(
+                Utc.with_ymd_and_hms(2026, 4, 25, 5, 0, 0).unwrap(),
+                Utc.with_ymd_and_hms(2026, 4, 27, 5, 0, 0).unwrap(),
+            )),
+            new_room_no: None,         // user only changed dates
+            new_customer_name: None,   // not in payload
+            new_room_type: None,
+            new_price: None,
+            new_state: None,
+            new_notes: None,
+            new_customer_phone: None,
+            customer_resave: None,
+        };
+        let inputs = ModifyBookingInputs {
+            book_id: "R014812",
+            book_date_id_base: 47301,
+            book_room_night_existing: None,
+            changes: &changes,
+            new_nights_calendar: vec![
+                NaiveDate::from_ymd_opt(2026, 4, 25).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 4, 26).unwrap(),
+            ],
+            existing_room_no: Some("402"),
+            existing_customer_name: Some("SPIKE TEST GUEST"),
+        };
+        let s = build_statements(&inputs);
+        // The rewrite is the LAST `update HT_Rooms` — distinguished from the
+        // step-0b clear because the clear sets `room_book_ds=''` while the
+        // rewrite sets a populated caption + `where room_no=…`.
+        let caption = s
+            .iter()
+            .rev()
+            .find(|stmt| stmt.contains("update HT_Rooms") && stmt.contains("where room_no="))
+            .expect("caption rewrite must fire when stay changes, even without room/customer in payload");
+        assert!(
+            caption.contains("'SPIKE TEST GUEST'"),
+            "caption must use existing customer name: {caption}"
+        );
+        assert!(
+            caption.contains("where room_no='402'"),
+            "caption must target existing room: {caption}"
+        );
+    }
+
+    /// H9 — `Book_Date_in/out` on HT_Book_H must use date-only format
+    /// (`'4/25/2026'`) to match `booking_create` and the latest legacy
+    /// capture. Previously used midnight-suffix (`'4/25/2026 12:00:00 AM'`),
+    /// creating two shapes for the same column in one writeback session.
+    #[test]
+    fn book_h_dates_use_date_only_format() {
+        let changes = BookingChanges {
+            new_stay: Some(DateRange::new(
+                Utc.with_ymd_and_hms(2026, 4, 25, 14, 30, 0).unwrap(),
+                Utc.with_ymd_and_hms(2026, 4, 26, 11, 0, 0).unwrap(),
+            )),
+            new_room_no: None,
+            new_room_type: None,
+            new_price: None,
+            new_state: None,
+            new_notes: None,
+            new_customer_phone: None,
+            new_customer_name: None,
+            customer_resave: None,
+        };
+        let inputs = ModifyBookingInputs {
+            book_id: "R014810",
+            book_date_id_base: 47300,
+            book_room_night_existing: None,
+            changes: &changes,
+            new_nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],
+            existing_room_no: None,
+            existing_customer_name: None,
+        };
+        let s = build_statements(&inputs);
+        let h = s.iter().find(|stmt| stmt.contains("[HT_Book_H]")).unwrap();
+        assert!(
+            h.contains("[Book_Date_in]='4/25/2026'"),
+            "Book_Date_in must be date-only ('4/25/2026'), got: {h}"
+        );
+        assert!(
+            h.contains("[Book_Date_out]='4/26/2026'"),
+            "Book_Date_out must be date-only ('4/26/2026'), got: {h}"
+        );
+        // The old midnight-suffix form must be gone.
+        assert!(
+            !h.contains("12:00:00 AM"),
+            "midnight-suffix must NOT appear in HT_Book_H update: {h}"
+        );
+    }
+
+    /// H10 — price-only modify must preserve `Book_Room_Night` (and the
+    /// computed `Book_Room_PriceToTal`). Previously fell back to
+    /// `new_nights_calendar.len().max(1) = 1` when `new_stay` was None,
+    /// corrupting a 3-night booking's total from `2670.00` to `890.00`.
+    /// Fix: look up the existing night count from MSSQL when computing
+    /// the total for a price-only modify.
+    #[test]
+    fn price_only_modify_preserves_multi_night_total() {
+        let changes = BookingChanges {
+            new_stay: None,                       // no date change
+            new_price: Some(Money::from_baht(890)),
+            new_room_no: None,
+            new_room_type: None,
+            new_state: None,
+            new_notes: None,
+            new_customer_phone: None,
+            new_customer_name: None,
+            customer_resave: None,
+        };
+        let inputs = ModifyBookingInputs {
+            book_id: "R014810",
+            book_date_id_base: 0,
+            book_room_night_existing: Some(3), // existing 3-night booking
+            changes: &changes,
+            new_nights_calendar: vec![], // empty because no stay change
+            existing_room_no: None,
+            existing_customer_name: None,
+        };
+        let s = build_statements(&inputs);
+        let ds = s
+            .iter()
+            .find(|stmt| stmt.contains("[HT_Book_Ds]"))
+            .expect("HT_Book_Ds UPDATE must be emitted for a price-only modify");
+        // 890 * 3 = 2670, formatted to 2dp per the canonical legacy shape.
+        assert!(
+            ds.contains("[Book_Room_PriceToTal]=2670"),
+            "total must be price * existing_nights = 2670, got: {ds}"
+        );
+        assert!(
+            !ds.contains("[Book_Room_PriceToTal]=890.00")
+                && !ds.contains("[Book_Room_PriceToTal]=890,"),
+            "total must NOT collapse to a single-night value: {ds}"
+        );
+    }
+
     #[test]
     fn book_date_keeps_only_new_calendar_dates() {
         let changes = BookingChanges {
@@ -867,6 +1112,8 @@ mod tests {
             changes: &changes,
             new_nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],
             existing_room_no: None,
+            existing_customer_name: None,
+            book_room_night_existing: None,
         };
         let s = build_statements(&inputs);
         let del = s

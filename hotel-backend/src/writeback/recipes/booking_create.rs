@@ -41,7 +41,7 @@
 //! |---|---|---|
 //! | `book_room_type` | `2` | by-room-number; the list filters out `=1` |
 //! | `Book_status` (HT_Book_Ds) | `1` | active; cancelled = 3 |
-//! | `Book_Date_in/out` (HT_Book_H) | midnight | top-of-form date display |
+//! | `Book_Date_in/out` (HT_Book_H) | date-only (`'M/D/YYYY'`) | top-of-form date display; verified from /tmp/legacy-events-full.log R014820..R014824 |
 //! | `Book_room_all` | `''` | unused header field; must be empty |
 //! | `Book_Notify_Day` | `3` | .NET app default |
 //! | All optional varchars | `''` | NULL crashes WinForms downstream |
@@ -53,15 +53,19 @@ use chrono::{DateTime, Datelike, Days, NaiveDate, TimeZone, Utc};
 
 use crate::outbox::intent::CreateBookingPayload;
 use crate::writeback::allocate::{
-    allocate_book_date_id, allocate_book_id, allocate_cust_no, allocate_customer_id, LegacyConn,
+    allocate_book_date_id, allocate_book_id, allocate_cust_no, allocate_customer_id,
+    allocate_room_status_id, LegacyConn,
 };
 use crate::writeback::constants::{
     BOOK_DS_STATUS_ACTIVE, BOOK_NOTIFY_DAY_DEFAULT, BOOK_ROOM_TYPE_BY_ROOM_NUMBER,
     BOOK_STATUS_BOOKED, CUST_TYPE_MAIN_NORMAL, CUST_TYPE_NORMAL, DEFAULT_OPERATOR,
+    ROOM_STATUS_RESERVED,
 };
 use crate::writeback::dispatcher::LegacyIds;
 use crate::writeback::error::WritebackResult;
-use crate::writeback::format::{format_legacy_date, format_legacy_datetime, sql_quote};
+use crate::writeback::format::{
+    date_to_ole_serial, format_legacy_date, format_legacy_datetime, sql_quote,
+};
 
 /// Inputs for the booking-create recipe.
 #[derive(Debug, Clone)]
@@ -83,6 +87,11 @@ pub struct CreateBookingInputs<'a> {
     pub nights: i32,
     /// First `HT_Book_Date.id` to use for night INSERTs.
     pub book_date_id_base: i32,
+    /// First `HT_Room_Status.id` to use for the per-night occupancy-ledger
+    /// INSERTs (H7 fix — without these rows the booking is invisible in the
+    /// .NET app's calendar grid AND `checkin_to_booking`'s night-0 UPDATE
+    /// silently matches 0 rows).
+    pub room_status_id_base: i32,
     /// Each booking covers nights[start..end). `nights` enumerates them in
     /// calendar order — recipe assigns `book_date_id_base + i`.
     pub nights_calendar: Vec<NaiveDate>,
@@ -207,6 +216,29 @@ pub fn build_statements(inputs: &CreateBookingInputs<'_>) -> Vec<String> {
         ));
     }
 
+    // N+1..M. HT_Room_Status — per-room-per-day occupancy-ledger rows for each
+    //   booked night. H7 fix: without these rows the .NET app's calendar grid
+    //   shows the booking as empty (the grid query filters
+    //   `where (room_status='จอง' or room_status='เข้าพัก')`), AND when a
+    //   check-in is later created against this booking, `checkin_to_booking`'s
+    //   night-0 UPDATE matches 0 rows silently.
+    //   Per `COMPAT_CHEATSHEET.md` line 347: status='จอง', room_Book_No=Book_ID.
+    //   room_CheckIn_No is empty until the booking converts to a check-in
+    //   (mirrors legacy app's FrmBookRooms emit shape).
+    let room_status_q = sql_quote(ROOM_STATUS_RESERVED);
+    let cust_name_for_status_q = sql_quote(inputs.customer_name);
+    for (i, day) in inputs.nights_calendar.iter().enumerate() {
+        let id = inputs.room_status_id_base + i as i32;
+        let date_q = sql_quote(&format_legacy_date(*day));
+        let oa = date_to_ole_serial(*day) as i64;
+        statements.push(format!(
+            "INSERT INTO [HT_Room_Status]([id],[room_no],[room_date],[room_status],\
+             [room_Details],[room_Book_No],[room_CheckIn_No],[room_date_oa])\
+             VALUES({id},{room_no_q},{date_q},{room_status_q},{cust_name_for_status_q},\
+             {book_id_q},'',{oa})"
+        ));
+    }
+
     // N+1. HT_Rooms display fields — only set when the booking STARTS TODAY
     // (Bangkok). The .NET app's room-list view (the "rooms now booked" panel)
     // reads HT_Rooms.Room_Book / room_book_ds to figure out which rooms are
@@ -319,6 +351,9 @@ pub async fn execute(
     };
     let book_id = allocate_book_id(conn).await?;
     let book_date_id_base = allocate_book_date_id(conn).await?;
+    // H7: per-night HT_Room_Status rows need a base id allocated under
+    // TABLOCKX, same lock pattern as the other counters.
+    let room_status_id_base = allocate_room_status_id(conn).await?;
 
     let nights_calendar = enumerate_calendar_nights(payload.stay.start, payload.stay.end);
     let nights = payload.nights.max(1);
@@ -349,6 +384,7 @@ pub async fn execute(
         deposit_baht,
         nights,
         book_date_id_base,
+        room_status_id_base,
         nights_calendar,
         customer_is_new: payload.legacy_cust_no.is_none(),
     };
@@ -361,6 +397,8 @@ pub async fn execute(
     let _ = DEFAULT_OPERATOR; // silence unused-import lint when no fallback path used
     ids.extra
         .insert("book_date_id_base".into(), serde_json::Value::from(book_date_id_base));
+    ids.extra
+        .insert("room_status_id_base".into(), serde_json::Value::from(room_status_id_base));
     if let Some(id) = cust_id_int {
         ids.extra.insert("customer_id_int".into(), serde_json::Value::from(id));
     }
@@ -388,6 +426,7 @@ mod tests {
             deposit_baht: 0.0,
             nights: 1,
             book_date_id_base: 47285,
+            room_status_id_base: 50237,
             nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],
             customer_is_new: false,
         }
@@ -465,6 +504,7 @@ mod tests {
             deposit_baht: 0.0,
             nights: 1,
             book_date_id_base: 47200,
+            room_status_id_base: 50200,
             nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],
             customer_is_new: false,
         };
@@ -739,5 +779,67 @@ mod tests {
         let snapped =
             end_of_stay_at_almost_noon(Utc.with_ymd_and_hms(2026, 4, 26, 14, 30, 0).unwrap());
         assert_eq!(format_legacy_datetime(snapped), "4/26/2026 11:59:59 AM");
+    }
+
+    /// H7 — booking-create must insert one `HT_Room_Status` row per booked
+    /// night with `status='จอง'`, `room_Book_No=Book_ID`. Without these
+    /// rows, the .NET app's calendar grid shows the night as empty AND
+    /// `checkin_to_booking`'s night-0 UPDATE matches 0 rows silently.
+    /// Per `COMPAT_CHEATSHEET.md` line 347.
+    #[test]
+    fn inserts_ht_room_status_per_booked_night() {
+        let mut inputs = sample_inputs();
+        inputs.nights_calendar = vec![
+            NaiveDate::from_ymd_opt(2026, 4, 25).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 4, 26).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 4, 27).unwrap(),
+        ];
+        inputs.nights = 3;
+        inputs.room_status_id_base = 50300;
+        let statements = build_statements(&inputs);
+        let room_status_inserts: Vec<&String> = statements
+            .iter()
+            .filter(|s| s.starts_with("INSERT INTO [HT_Room_Status]"))
+            .collect();
+        assert_eq!(
+            room_status_inserts.len(),
+            3,
+            "expected one HT_Room_Status row per booked night"
+        );
+        for stmt in &room_status_inserts {
+            assert!(
+                stmt.contains("'จอง'"),
+                "room_status must be 'จอง' for booking nights: {stmt}"
+            );
+            assert!(
+                stmt.contains("'R014810'"),
+                "room_Book_No must carry Book_ID: {stmt}"
+            );
+        }
+        // Distinct room_date per night.
+        assert!(room_status_inserts[0].contains("'4/25/2026'"));
+        assert!(room_status_inserts[1].contains("'4/26/2026'"));
+        assert!(room_status_inserts[2].contains("'4/27/2026'"));
+        // ids increment from base.
+        assert!(room_status_inserts[0].contains("50300"));
+        assert!(room_status_inserts[1].contains("50301"));
+        assert!(room_status_inserts[2].contains("50302"));
+    }
+
+    /// HT_Room_Status rows for a booking carry the room number (denormalized)
+    /// and an empty `room_CheckIn_No` (the booking has no check-in yet).
+    #[test]
+    fn ht_room_status_for_booking_uses_room_no_and_empty_checkin() {
+        let mut inputs = sample_inputs();
+        inputs.room_status_id_base = 50400;
+        let statements = build_statements(&inputs);
+        let row = statements
+            .iter()
+            .find(|s| s.starts_with("INSERT INTO [HT_Room_Status]"))
+            .expect("HT_Room_Status row must be emitted");
+        // room_no = '402'
+        assert!(row.contains("'402'"));
+        // room_Book_No carries Book_ID, room_CheckIn_No is empty for a booking
+        assert!(row.contains("'R014810'"));
     }
 }

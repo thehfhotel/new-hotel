@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.63.4] - 2026-05-12
+
+### Fixed
+
+- **Writeback booking-visibility coordination — Wave 3
+  (`docs/legacy-spike/writeback-audit-2026-05-12.md`).** Four HIGH-severity
+  bugs that left bookings invisible (or partially visible) in the .NET
+  app's calendar grid, all in `hotel-backend/src/writeback/recipes/`:
+  - **H7** `booking_create.rs` — now inserts one `HT_Room_Status` row per
+    booked night with `status='จอง'`, `room_Book_No=Book_ID` per
+    `COMPAT_CHEATSHEET.md:347`. Without these rows the calendar grid (which
+    filters `where (room_status='จอง' or room_status='เข้าพัก')`) showed
+    the booking as empty AND `checkin_to_booking`'s night-0 UPDATE
+    matched 0 rows silently when a check-in was created against the
+    booking. Added `room_status_id_base` field + allocator wiring.
+  - **H8** `booking_modify.rs:202-234` — caption rewrite (`UPDATE HT_Rooms
+    SET room_book_ds=…`) now fires on a date-only edit. Previously only
+    fired when `customer_name + room_no + stay` were ALL `Some`; a date
+    change cleared the caption at step 0b but never re-wrote it, so the
+    calendar grid lost the booking caption for the new date range. Added
+    `fetch_existing_customer_name` helper (mirrors `fetch_existing_room_no`)
+    so the rewrite uses the existing values when the payload doesn't
+    carry them.
+  - **H9** `booking_modify.rs:99-102` — `HT_Book_H.Book_Date_in/out` now
+    uses the date-only format (`'4/25/2026'`) to match `booking_create`
+    and the latest legacy capture. Previously emitted midnight-suffix
+    (`'4/25/2026 12:00:00 AM'`), creating two shapes for the same column
+    in one writeback session. Dropped `midnight_of` from the imports.
+    Rewrote the related test (was pinning the wrong format).
+  - **H10** `booking_modify.rs:144-148` — price-only modify now preserves
+    `Book_Room_Night` (and the computed `Book_Room_PriceToTal`) by
+    fetching the existing value from MSSQL. Previously fell back to
+    `new_nights_calendar.len().max(1) = 1` when `new_stay` was None,
+    corrupting a 3-night booking's total from `2670.00` to `890.00`.
+    Added `fetch_existing_book_room_night` helper; `validate_finite`
+    guard now uses the same precedence so it actually defends the
+    written total.
+  - Added `ROOM_STATUS_RESERVED` constant (`'จอง'`) to
+    `writeback/constants.rs`.
+
 ## [2.63.3] - 2026-05-12
 
 ### Fixed
