@@ -169,6 +169,7 @@ These are automatically applied by `scripts/migrate.sh` during deployment.
 | 026 | `026_phase1_soak_no_op.sql` | Pure no-op migration to exercise the Phase 1 CI/CD modernization pipeline (drift-check + migrate.sh + build-backend recreate). Substitutes for the 2-week soak window; safe to leave or remove later | v2.57.2 |
 | 027 | `027_create_ht_users.sql` | Phase 4 PR1 — `ht_users` table with `(user_id, username, password_hash, role, active, created_at, last_login_at)`. Argon2id PHC password hashes; role enum `admin`/`receptionist` enforced by CHECK. Foundation for local cookie-session auth (no SSO, no JWT) | v2.60.0 |
 | 028 | `028_create_ht_sessions.sql` | Phase 4 PR1 — `ht_sessions` table keyed by 32-byte hex session token (`session_id` PK). FK to `ht_users` with `ON DELETE CASCADE`; tracks `expires_at` (PR1 default = login + 24h), client `ip`, `user_agent`. Index on `expires_at` for the periodic cleanup pass. PR2 will add HTTP routes + Axum middleware that read this table | v2.60.0 |
+| 029 | `029_normalize_cin_status_terminal.sql` | Canonicalize `ht_checkins.cin_status` post-checkout terminal value. Flips legacy `'checked_out'` (CT-mapper output) and `'completed'` (bootstrap output) to `'checkedout'` (route-layer convention) so all readers/writers agree. Writeback contract unaffected — legacy MSSQL still receives `'Check-Out'` per the cheatsheet | v2.63.x |
 
 ## Tables Owned by This Application
 

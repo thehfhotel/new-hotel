@@ -193,7 +193,7 @@ struct CanonicalCheckIn {
     legacy_cust_no: Option<String>,
     legacy_room_no: Option<String>,
     /// Legacy literal verbatim (per user constraint) translated to our
-    /// PG enum literal (`'active'`/`'checked_out'`/`'cancelled'`). The
+    /// PG enum literal (`'active'`/`'checkedout'`/`'cancelled'`). The
     /// translation sits in [`legacy_status_to_pg`].
     cin_status: String,
     cin_checkin_time: NaiveDateTime,
@@ -743,7 +743,7 @@ struct RoomState {
 
 /// Examine all `HT_CheckIn_Ds` rows and decide:
 ///
-/// * the canonical PG status (`'active'` / `'checked_out'` /
+/// * the canonical PG status (`'active'` / `'checkedout'` /
 ///   `'cancelled'`)
 /// * whether ALL rooms have flipped to `'Check-Out'` (drives the
 ///   booking re-projection side-effect)
@@ -803,7 +803,7 @@ fn derive_room_state(
     }
 
     let canonical_status = if all_checked_out {
-        "checked_out"
+        "checkedout"
     } else {
         legacy_status_to_pg(legacy_header_status)
     };
@@ -840,7 +840,7 @@ fn derive_room_state(
 ///    extension on other still-active rooms.
 /// 2. Fall back to `HT_CheckIn_H.Cin_Date_Out` when:
 ///    - no Ds rows are loaded yet (transient mid-edit state), OR
-///    - every Ds row is fully checked out (status is `'checked_out'`
+///    - every Ds row is fully checked out (status is `'checkedout'`
 ///      anyway; keep the date stable rather than backwards-jumping to
 ///      a stale Ds value), OR
 ///    - the still-active Ds rows have no `Cin_Room_Out` populated yet
@@ -1080,7 +1080,7 @@ fn build_event(
         booking_id: booking_uuid,
         customer_id: aggregate_uuid(AggregateKind::Customer, cust_id),
         status: match p.cin_status.as_str() {
-            "checked_out" => CheckInState::CheckedOut,
+            "checkedout" => CheckInState::CheckedOut,
             "cancelled" => CheckInState::Cancelled,
             _ => CheckInState::Active,
         },
@@ -1186,9 +1186,9 @@ mod tests {
 
     #[test]
     fn legacy_status_unknown_falls_back_to_active() {
-        // Per-room state may still flip this to 'checked_out' in
+        // Per-room state may still flip this to 'checkedout' in
         // derive_room_state — header status alone never returns
-        // 'checked_out'.
+        // 'checkedout'.
         assert_eq!(legacy_status_to_pg(""), "active");
         assert_eq!(legacy_status_to_pg("?"), "active");
     }
@@ -1240,7 +1240,7 @@ mod tests {
             payments: vec![],
         };
         let p = project_aggregate(&agg, "CH26-005228").unwrap();
-        assert_eq!(p.cin_status, "checked_out");
+        assert_eq!(p.cin_status, "checkedout");
         assert!(p.is_fully_checked_out);
         assert!(
             p.cin_checkout_time.is_some(),
@@ -1527,7 +1527,7 @@ mod tests {
         let ex = ExistingCheckIn {
             cin_id: 1,
             aggregate_id: Some(uuid::Uuid::nil()),
-            cin_status: Some("checked_out".into()),
+            cin_status: Some("checkedout".into()),
             cin_total_amount: Some(890.0),
             cin_paid_amount: Some(0.0),
             cin_checkout_time: None,
@@ -1621,7 +1621,7 @@ mod tests {
     #[test]
     fn build_event_for_fully_checked_out_emits_checkout_completed() {
         let mut p = sample_canonical();
-        p.cin_status = "checked_out".into();
+        p.cin_status = "checkedout".into();
         p.is_fully_checked_out = true;
         p.cin_checkout_time = Some(
             chrono::NaiveDate::from_ymd_opt(2026, 4, 27)

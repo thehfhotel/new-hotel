@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Canonicalize `ht_checkins.cin_status` post-checkout terminal value.** Three
+  forms had accumulated in production: `'checked_out'` (CT mapper),
+  `'completed'` (bootstrap `bin/migrate_legacy.rs`), and `'checkedout'`
+  (route layer via `repository/checkin.rs`). The route-layer readers in
+  `routes/new_reports.rs` and the calendar route in `routes/rooms.rs`
+  already filtered for `'checkedout'`, so reports + calendar were silently
+  missing every CT-mapper-written checkout and the entire HF Ville bootstrap
+  pool. Standardized on `'checkedout'`:
+  - Migration `029_normalize_cin_status_terminal.sql` flips existing
+    `'checked_out'` + `'completed'` rows (HF Hotel: 187, HF Ville: 1543).
+  - CT mapper `sync/mappers/checkin.rs::derive_room_state` now writes
+    `'checkedout'`.
+  - Bootstrap binary `bin/migrate_legacy.rs` updated to write `'checkedout'`
+    for forward consistency if ever re-run.
+  - Writeback contract (`Cin_Room_Status = 'Check-Out'` to legacy MSSQL) is
+    unaffected — the new app's canonical literal and the legacy MSSQL
+    literal were always distinct.
+
 ## [2.63.0] - 2026-05-11
 
 ### Added

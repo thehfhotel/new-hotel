@@ -607,9 +607,10 @@ async fn import_checkins(
             .map(|dt| dt.date())
             .unwrap_or_else(|| (chrono::Utc::now() + chrono::Duration::days(1)).naive_utc().date());
 
-        // Determine status
+        // Determine status. Use 'checkedout' to match the canonical terminal
+        // form (repository/checkin.rs writer + CT mapper post-029 migration).
         let status = if cin_room_out.is_some() {
-            "completed"
+            "checkedout"
         } else {
             "active"
         };
