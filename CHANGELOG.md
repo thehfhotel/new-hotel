@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.63.2] - 2026-05-12
+
+### Fixed
+
+- **Writeback allocators now emit legacy-compatible IDs and use Bangkok wall-
+  clock for period prefixes.** Three CRIT findings from
+  `docs/legacy-spike/writeback-audit-2026-05-12.md` (Wave 1):
+  - `allocate_pay_no` now emits `R{yyMM}-{4digit}` (e.g. `R2604-0241`) instead
+    of `P{yyMM}-{6digit}` (e.g. `P2604-000001`). Pre-fix, the `LIKE 'P2604-%'`
+    predicate never matched the iHOTEL-allocated rows visible in
+    `findings.md` §2 line 129 / live capture
+    `docs/legacy-spike/raw/invoice-20260424-100827/07-events.txt:154`, so our
+    MAX+1 sequence ran in a parallel namespace — invisible collisions would
+    have appeared the instant writeback turned on.
+  - `allocate_receipt_no` now emits `B{yyMM}-{4digit}` instead of
+    `RC{yyMM}-{6digit}` (`findings.md` §2 line 130 / capture
+    `walkin-20260424-095304/07-events.txt:120`).
+  - `allocate_cin_no` / `allocate_pay_no` / `allocate_receipt_no` now derive
+    year/month from the Bangkok wall-clock (via `format::bangkok_date`) rather
+    than `Utc::now()`. The 7-hour BKK-vs-UTC offset would otherwise emit the
+    previous period's prefix around month/year rollover.
+  - `SUBSTRING(..., offset, 50)` offsets are now derived from `prefix.len()+1`
+    rather than hardcoded, so future format tweaks can't silently misalign
+    the MAX scan.
+
+  New unit tests in `hotel-backend/src/writeback/allocate.rs::tests` lock in
+  the format invariants and the Bangkok-calendar boundary behaviour without
+  requiring a live MSSQL. The existing `payment.rs` byte-parity test (which
+  bypasses the allocator with hardcoded `R2604-0250`) continues to pass.
+
 ## [2.63.1] - 2026-05-12
 
 ### Security

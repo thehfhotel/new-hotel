@@ -29,10 +29,11 @@
 
 use bb8::PooledConnection;
 use bb8_tiberius::ConnectionManager;
-use chrono::{Datelike, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use tiberius::Row;
 
 use crate::writeback::error::{WritebackError, WritebackResult};
+use crate::writeback::format::bangkok_date;
 
 /// Convenience alias — the type bb8 hands out for our legacy connection.
 pub type LegacyConn<'a> = PooledConnection<'a, ConnectionManager>;
@@ -103,23 +104,42 @@ pub async fn allocate_book_id(conn: &mut LegacyConn<'_>) -> WritebackResult<Stri
 /// Allocate the next `HT_CheckIn_H.Cin_no` — `'CH' + 2-digit-year + '-' + 6-digit integer`.
 ///
 /// Per spike §2: format is `CH\d{2}-\d{6}` (e.g. `CH26-005228`). Year-scoped
-/// — allocation rolls over each calendar year. We use the *current Thai year*
-/// (system clock) to match the .NET app's behavior.
+/// — allocation rolls over each calendar year. We use the *current Thai
+/// (Bangkok) year* to match the .NET app's behavior; using `Utc::now().year()`
+/// directly would emit the wrong prefix for ~7h around the Bangkok new-year
+/// rollover (audit CRIT-C3 — `docs/legacy-spike/writeback-audit-2026-05-12.md`).
 pub async fn allocate_cin_no(conn: &mut LegacyConn<'_>) -> WritebackResult<String> {
-    let year_two = Utc::now().year() % 100;
-    let prefix = format!("CH{year_two:02}-");
+    allocate_cin_no_with_now(conn, Utc::now()).await
+}
+
+/// Test-only variant of [`allocate_cin_no`] that takes the "now" instant
+/// explicitly so tests can pin the wall-clock and assert behaviour around the
+/// Bangkok calendar boundary without mocking the global clock.
+pub(crate) async fn allocate_cin_no_with_now(
+    conn: &mut LegacyConn<'_>,
+    now: DateTime<Utc>,
+) -> WritebackResult<String> {
+    let prefix = cin_no_prefix(now);
+    let suffix_offset = prefix.len() + 1;
 
     // Match exactly the year prefix, then extract the trailing 6-digit suffix.
     let next = select_next_int_with_lock(
         conn,
         &format!(
-            "SELECT ISNULL(MAX(TRY_CAST(SUBSTRING(Cin_no, 6, 50) AS INT)), 0) + 1 \
+            "SELECT ISNULL(MAX(TRY_CAST(SUBSTRING(Cin_no, {suffix_offset}, 50) AS INT)), 0) + 1 \
              FROM HT_CheckIn_H WITH (TABLOCKX, HOLDLOCK) \
              WHERE Cin_no LIKE '{prefix}%'",
         ),
     )
     .await?;
     Ok(format!("{prefix}{next:06}"))
+}
+
+/// Pure helper — compute the `CH{yy}-` prefix from a UTC instant, using the
+/// Bangkok calendar year. Extracted for unit-test access.
+fn cin_no_prefix(now: DateTime<Utc>) -> String {
+    let year_two = bangkok_date(now).year() % 100;
+    format!("CH{year_two:02}-")
 }
 
 /// Allocate the next `HT_Book_Date.id`. App-allocated MAX+1 (per spike §2 — the
@@ -178,53 +198,115 @@ pub async fn allocate_receipt_h_id(conn: &mut LegacyConn<'_>) -> WritebackResult
     .await
 }
 
-/// Format a `Pay_No` for `HT_CheckIn_Pay`. Spike §3h captures show this is
-/// month-scoped but the exact prefix/format wasn't fully derived. Until a
-/// dedicated capture lands, we use the timestamp-based pattern matching the
-/// .NET app's observed output.
-///
-/// Returns a `MM`-prefixed sequential integer, allocated under `TABLOCKX,
-/// HOLDLOCK` for the current month.
+/// Format a `Pay_No` for `HT_CheckIn_Pay`. Per `findings.md` §2 line 129 and
+/// live capture `docs/legacy-spike/raw/invoice-20260424-100827/07-events.txt:154`
+/// the legacy app emits `R{yyMM}-{4digit}` (e.g. `R2604-0241`). The `R` prefix
+/// and 4-digit suffix MUST match exactly — the `LIKE 'R{yyMM}-%'` predicate is
+/// how we read the same sequence iHOTEL writes. Year/month are scoped to the
+/// Bangkok calendar (audit CRIT-C1 + CRIT-C3 —
+/// `docs/legacy-spike/writeback-audit-2026-05-12.md`).
 pub async fn allocate_pay_no(conn: &mut LegacyConn<'_>) -> WritebackResult<String> {
-    let now = Utc::now();
-    let month_prefix = format!("P{:02}{:02}-", now.year() % 100, now.month());
+    allocate_pay_no_with_now(conn, Utc::now()).await
+}
+
+/// Test-only variant of [`allocate_pay_no`] that takes the "now" instant
+/// explicitly so tests can pin the wall-clock without mocking the global clock.
+pub(crate) async fn allocate_pay_no_with_now(
+    conn: &mut LegacyConn<'_>,
+    now: DateTime<Utc>,
+) -> WritebackResult<String> {
+    let month_prefix = pay_no_prefix(now);
+    // SUBSTRING is 1-based in T-SQL; the suffix starts one position past the
+    // prefix. Derive from prefix length so future format tweaks don't silently
+    // misalign the MAX scan.
+    let suffix_offset = month_prefix.len() + 1;
     let next = select_next_int_with_lock(
         conn,
         &format!(
-            "SELECT ISNULL(MAX(TRY_CAST(SUBSTRING(Pay_No, 7, 50) AS INT)), 0) + 1 \
+            "SELECT ISNULL(MAX(TRY_CAST(SUBSTRING(Pay_No, {suffix_offset}, 50) AS INT)), 0) + 1 \
              FROM HT_CheckIn_Pay WITH (TABLOCKX, HOLDLOCK) \
              WHERE Pay_No LIKE '{month_prefix}%'",
         ),
     )
     .await?;
-    Ok(format!("{month_prefix}{next:06}"))
+    Ok(format!("{month_prefix}{next:04}"))
 }
 
-/// Format a `Receipt_no` for `HT_Receipt_H`. Spike §3h doesn't fully derive
-/// the format either — captured value `RC2604-000001` matches the same pattern
-/// as `Pay_No`.
+/// Pure helper — compute the `R{yy}{MM}-` prefix from a UTC instant, using the
+/// Bangkok calendar.
+fn pay_no_prefix(now: DateTime<Utc>) -> String {
+    let bkk = bangkok_date(now);
+    format!("R{:02}{:02}-", bkk.year() % 100, bkk.month())
+}
+
+/// Format a `Receipt_no` for `HT_Receipt_H`. Per `findings.md` §2 line 130 +
+/// `COMPAT_CHEATSHEET.md:130` + live capture
+/// `docs/legacy-spike/raw/walkin-20260424-095304/07-events.txt:120` the legacy
+/// app emits `B{yyMM}-{4digit}` (single `B` is the default; `SB`/`CB` are
+/// SmallBill/CreditBill variants). The prefix and 4-digit suffix MUST match
+/// exactly or the `LIKE` predicate forks our sequence away from iHOTEL's
+/// (audit CRIT-C2 + CRIT-C3 —
+/// `docs/legacy-spike/writeback-audit-2026-05-12.md`).
 pub async fn allocate_receipt_no(conn: &mut LegacyConn<'_>) -> WritebackResult<String> {
-    let now = Utc::now();
-    let month_prefix = format!("RC{:02}{:02}-", now.year() % 100, now.month());
+    allocate_receipt_no_with_now(conn, Utc::now()).await
+}
+
+/// Test-only variant of [`allocate_receipt_no`] that takes the "now" instant
+/// explicitly so tests can pin the wall-clock without mocking the global clock.
+pub(crate) async fn allocate_receipt_no_with_now(
+    conn: &mut LegacyConn<'_>,
+    now: DateTime<Utc>,
+) -> WritebackResult<String> {
+    let month_prefix = receipt_no_prefix(now);
+    let suffix_offset = month_prefix.len() + 1;
     let next = select_next_int_with_lock(
         conn,
         &format!(
-            "SELECT ISNULL(MAX(TRY_CAST(SUBSTRING(Receipt_no, 8, 50) AS INT)), 0) + 1 \
+            "SELECT ISNULL(MAX(TRY_CAST(SUBSTRING(Receipt_no, {suffix_offset}, 50) AS INT)), 0) + 1 \
              FROM HT_Receipt_H WITH (TABLOCKX, HOLDLOCK) \
              WHERE Receipt_no LIKE '{month_prefix}%'",
         ),
     )
     .await?;
-    Ok(format!("{month_prefix}{next:06}"))
+    Ok(format!("{month_prefix}{next:04}"))
+}
+
+/// Pure helper — compute the `B{yy}{MM}-` prefix from a UTC instant, using the
+/// Bangkok calendar.
+fn receipt_no_prefix(now: DateTime<Utc>) -> String {
+    let bkk = bangkok_date(now);
+    format!("B{:02}{:02}-", bkk.year() % 100, bkk.month())
 }
 
 #[cfg(test)]
 mod tests {
-    //! These tests verify the SQL TEXT we emit — not the I/O. A live MSSQL is
-    //! out of scope for the unit suite per the Phase 4b spec; any live
-    //! interaction is the receptionist's job.
+    //! These tests verify the SQL TEXT we emit and the pure prefix/format
+    //! helpers — not the I/O. A live MSSQL is out of scope for the unit suite
+    //! per the Phase 4b spec; any live interaction is the receptionist's job.
+    //!
+    //! Allocator end-to-end correctness (the `LIKE` predicate actually
+    //! matching a freshly-installed iHOTEL row) is the receptionist-driven
+    //! acceptance test described in Wave 1 of
+    //! `docs/legacy-spike/writeback-audit-2026-05-12.md`.
 
     use super::*;
+    use chrono::TimeZone;
+
+    /// Tiny shape-matcher: confirm `s` matches `<letters><N digits>-<M digits>`.
+    /// Avoids pulling in `regex` as a dev-dep just for two assertions.
+    fn matches_shape(s: &str, leading_letters: &str, head_digits: usize, tail_digits: usize) -> bool {
+        let Some(rest) = s.strip_prefix(leading_letters) else { return false; };
+        let bytes = rest.as_bytes();
+        if bytes.len() != head_digits + 1 + tail_digits {
+            return false;
+        }
+        if bytes[head_digits] != b'-' {
+            return false;
+        }
+        let head_digits_ok = bytes[..head_digits].iter().all(|b| b.is_ascii_digit());
+        let tail_digits_ok = bytes[head_digits + 1..].iter().all(|b| b.is_ascii_digit());
+        head_digits_ok && tail_digits_ok
+    }
 
     #[test]
     fn cust_no_format_padding_lookup() {
@@ -247,5 +329,126 @@ mod tests {
         let prefix = format!("CH{year_two:02}-");
         let cin_no = format!("{prefix}{:06}", 5228);
         assert_eq!(cin_no, "CH26-005228");
+    }
+
+    // --- CRIT-C1 / C2 / C3 regression tests ---
+    //
+    // These tests exercise the *pure prefix + emitted-string* invariants for
+    // the three allocators audited in
+    // `docs/legacy-spike/writeback-audit-2026-05-12.md`. They guard against
+    // the original bug pattern (wrong letter, wrong digit width, UTC clock
+    // straddling the Bangkok calendar boundary) without requiring a live
+    // MSSQL.
+
+    /// Compose an example emitted ID from the prefix helper + a fake
+    /// `next` integer, mirroring exactly what the allocator returns.
+    /// Lets the regex tests below run without a DB.
+    fn compose_pay_no(now: DateTime<Utc>, next: i32) -> String {
+        format!("{}{next:04}", pay_no_prefix(now))
+    }
+    fn compose_receipt_no(now: DateTime<Utc>, next: i32) -> String {
+        format!("{}{next:04}", receipt_no_prefix(now))
+    }
+    fn compose_cin_no(now: DateTime<Utc>, next: i32) -> String {
+        format!("{}{next:06}", cin_no_prefix(now))
+    }
+
+    #[test]
+    fn allocate_pay_no_emits_r_prefix_with_4_digit_suffix() {
+        // CRIT-C1: must be R{yyMM}-{4digit}, not P{yyMM}-{6digit}.
+        let now = Utc.with_ymd_and_hms(2026, 4, 24, 10, 5, 4).unwrap(); // 4/24 17:05 BKK
+        let id = compose_pay_no(now, 241);
+        assert_eq!(id, "R2604-0241", "must match findings.md §2 capture R2604-0241");
+        assert!(
+            matches_shape(&id, "R", 4, 4),
+            "Pay_No {id} must match shape R<4digits>-<4digits>"
+        );
+    }
+
+    #[test]
+    fn allocate_receipt_no_emits_b_prefix_with_4_digit_suffix() {
+        // CRIT-C2: must be B{yyMM}-{4digit}, not RC{yyMM}-{6digit}.
+        let now = Utc.with_ymd_and_hms(2026, 4, 24, 10, 5, 4).unwrap();
+        let id = compose_receipt_no(now, 1);
+        assert_eq!(id, "B2604-0001");
+        assert!(
+            matches_shape(&id, "B", 4, 4),
+            "Receipt_no {id} must match shape B<4digits>-<4digits>"
+        );
+    }
+
+    #[test]
+    fn allocate_cin_no_emits_ch_prefix_with_6_digit_suffix() {
+        // Format width unchanged from prior behaviour — guard regression.
+        let now = Utc.with_ymd_and_hms(2026, 4, 24, 10, 5, 4).unwrap();
+        let id = compose_cin_no(now, 5228);
+        assert_eq!(id, "CH26-005228");
+        assert!(
+            matches_shape(&id, "CH", 2, 6),
+            "Cin_no {id} must match shape CH<2digits>-<6digits>"
+        );
+    }
+
+    // --- BKK calendar boundary tests (CRIT-C3) ---
+    //
+    // At a UTC instant that's still in the previous BKK day/month/year but
+    // already past midnight UTC of the next, the allocator MUST emit the
+    // Bangkok-side period — NOT the UTC one.
+
+    #[test]
+    fn allocate_cin_no_uses_bangkok_calendar_year() {
+        // 2026-12-31 17:30:00 UTC = 2027-01-01 00:30 Bangkok.
+        // Cin_No prefix must roll over to CH27- (not stay on CH26-).
+        let utc_just_before_bkk_new_year = Utc.with_ymd_and_hms(2026, 12, 31, 17, 30, 0).unwrap();
+        let id = compose_cin_no(utc_just_before_bkk_new_year, 1);
+        assert!(
+            id.starts_with("CH27-"),
+            "expected CH27- prefix (Bangkok already in new year), got {id}"
+        );
+    }
+
+    #[test]
+    fn allocate_pay_no_uses_bangkok_calendar_month() {
+        // 2026-04-30 17:30:00 UTC = 2026-05-01 00:30 Bangkok.
+        // Pay_No prefix must roll over to R2605- (not stay on R2604-).
+        let utc_just_before_bkk_month_rollover =
+            Utc.with_ymd_and_hms(2026, 4, 30, 17, 30, 0).unwrap();
+        let id = compose_pay_no(utc_just_before_bkk_month_rollover, 1);
+        assert!(
+            id.starts_with("R2605-"),
+            "expected R2605- prefix (Bangkok already in May), got {id}"
+        );
+    }
+
+    #[test]
+    fn allocate_receipt_no_uses_bangkok_calendar_month() {
+        // Same boundary as the Pay_No test — must roll forward to B2605-.
+        let utc_just_before_bkk_month_rollover =
+            Utc.with_ymd_and_hms(2026, 4, 30, 17, 30, 0).unwrap();
+        let id = compose_receipt_no(utc_just_before_bkk_month_rollover, 1);
+        assert!(
+            id.starts_with("B2605-"),
+            "expected B2605- prefix (Bangkok already in May), got {id}"
+        );
+    }
+
+    // --- SUBSTRING offset is derived from prefix length ---
+    //
+    // The audit calls out the original hardcoded `SUBSTRING(..., 7, 50)` /
+    // `SUBSTRING(..., 8, 50)` offsets as fragile. These checks confirm the
+    // offset arithmetic stays in sync with the emitted prefix.
+
+    #[test]
+    fn pay_no_substring_offset_is_one_past_prefix_length() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 24, 10, 0, 0).unwrap();
+        // prefix "R2604-" is 6 chars; SUBSTRING (1-based) of suffix starts at 7.
+        assert_eq!(pay_no_prefix(now).len() + 1, 7);
+    }
+
+    #[test]
+    fn receipt_no_substring_offset_is_one_past_prefix_length() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 24, 10, 0, 0).unwrap();
+        // prefix "B2604-" is 6 chars; SUBSTRING (1-based) of suffix starts at 7.
+        assert_eq!(receipt_no_prefix(now).len() + 1, 7);
     }
 }
