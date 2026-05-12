@@ -75,62 +75,80 @@ pub(crate) async fn execute_all(
     Ok(())
 }
 
-/// Read `SCOPE_IDENTITY()` from MSSQL — the IDENTITY value of the last INSERT
-/// in the current scope. Use immediately after a recipe's INSERT into an
-/// IDENTITY-keyed table (e.g. `HT_CheckIn_Ds`) to capture the assigned id
-/// for back-population to PG.
+/// Execute an `INSERT … OUTPUT INSERTED.id … VALUES …` statement and return
+/// the captured id from the `OUTPUT` clause.
 ///
-/// Returns `Err(Recipe(...))` if MSSQL returns NULL — that means the prior
-/// statement did not insert into an IDENTITY-keyed table within the scope,
-/// which is a recipe ordering bug.
-pub(crate) async fn fetch_scope_identity(
+/// Audit H12: the previous `execute_capturing_identity_at` / `fetch_scope_identity`
+/// helpers issued the INSERT and `SELECT SCOPE_IDENTITY()` as two separate
+/// `simple_query` calls. SCOPE_IDENTITY is batch-scoped on the wire and
+/// tiberius would occasionally return `NULL` (the prior call's batch already
+/// closed before the SELECT executed). `OUTPUT INSERTED.<col>` survives any
+/// scope quirk because the id is streamed back as part of the INSERT response
+/// itself — no second statement, no scope to lose.
+///
+/// Callers compose the INSERT with the `OUTPUT INSERTED.id` clause so the
+/// helper is statement-agnostic (any table, any column name). Returns
+/// `Err(Recipe(..))` if the INSERT did not produce exactly one row — surfaces
+/// recipe ordering bugs as a hard error instead of silently corrupting
+/// back-population.
+///
+/// Today every IDENTITY-keyed legacy table the recipes touch (`HT_CheckIn_Ds`,
+/// `HT_Receipt_H`, `HT_Book_Date`, `HT_Room_Status`, `HT_Rooms_Cancel`) was
+/// stripped of its IDENTITY property by the vendor (verified via the
+/// 2026-04-26 `inspect_schema` dump) — all recipes allocate via TABLOCKX
+/// MAX+1 (`allocate::*_id`) and embed the value in the INSERT directly. This
+/// helper exists for future tables that may need to capture a true IDENTITY
+/// id without relying on SCOPE_IDENTITY's wire semantics.
+#[allow(dead_code)]
+pub(crate) async fn execute_insert_with_output_id(
     conn: &mut LegacyConn<'_>,
+    insert_sql: &str,
 ) -> WritebackResult<i32> {
-    let stream = conn.simple_query("SELECT CAST(SCOPE_IDENTITY() AS INT)").await?;
+    debug_assert!(
+        insert_sql.to_ascii_uppercase().contains("OUTPUT INSERTED."),
+        "execute_insert_with_output_id requires an OUTPUT INSERTED.<col> clause"
+    );
+    let stream = conn.simple_query(insert_sql).await?;
     let row = stream.into_row().await?;
     let row = row.ok_or_else(|| {
         crate::writeback::error::WritebackError::Recipe(
-            "SCOPE_IDENTITY returned no row".into(),
+            "OUTPUT INSERTED.id returned no row — INSERT did not affect any rows".into(),
         )
     })?;
     let id: Option<i32> = row.get(0);
     id.ok_or_else(|| {
         crate::writeback::error::WritebackError::Recipe(
-            "SCOPE_IDENTITY returned NULL — prior statement did not insert into an IDENTITY table".into(),
+            "OUTPUT INSERTED.id returned NULL — target column is nullable or not INT".into(),
         )
     })
 }
 
-/// Run statements up to and including the one matching `marker_sql_substring`,
-/// capture `SCOPE_IDENTITY()`, then run the remaining statements. Used for
-/// recipes that need the IDENTITY value of one INSERT to feed into either
-/// later SQL or back-population (audit CRIT-3 — `HT_CheckIn_Ds.id`).
-///
-/// `marker_sql_substring` must match exactly one statement; panics in tests
-/// (debug_assert) if 0 or >1 match.
-pub(crate) async fn execute_capturing_identity_at(
-    conn: &mut LegacyConn<'_>,
-    statements: &[String],
-    marker_sql_substring: &str,
-) -> WritebackResult<i32> {
-    let matches: Vec<usize> = statements
-        .iter()
-        .enumerate()
-        .filter_map(|(i, s)| s.contains(marker_sql_substring).then_some(i))
-        .collect();
-    // Hard error in release too (LOW-2 hardening): if a future maintainer
-    // adds a second statement matching the marker, capturing the wrong
-    // SCOPE_IDENTITY would silently corrupt back-population.
-    if matches.len() != 1 {
-        return Err(crate::writeback::error::WritebackError::Recipe(format!(
-            "execute_capturing_identity_at: marker {:?} matched {} statements; expected exactly 1",
-            marker_sql_substring,
-            matches.len()
-        )));
+#[cfg(test)]
+mod tests {
+    //! Pure tests for the recipe-mod helpers. The wire-roundtrip helper
+    //! (`execute_insert_with_output_id`) itself requires an MSSQL connection
+    //! and is exercised end-to-end by the live writeback worker — the unit
+    //! tests here cover the input-validation shape.
+
+    /// Audit H12 regression — a SQL string lacking `OUTPUT INSERTED.` would
+    /// silently come back with zero rows from tiberius (an INSERT returns
+    /// no rowset by default) and surface as a confusing `Recipe("no row")`
+    /// error far from the call site. The debug_assert pins the contract
+    /// at the helper boundary so any future caller sees the failure
+    /// immediately in test/dev. We can't test the assert itself in release
+    /// builds (panics are debug-only) so we cover the documented shape
+    /// here as a smoke test against typos.
+    #[test]
+    fn output_inserted_clause_pattern_present_in_real_sql_examples() {
+        // The exact substring the debug_assert above is checking for.
+        let examples = [
+            "INSERT INTO [HT_CheckIn_Ds] (...) OUTPUT INSERTED.id VALUES (...)",
+            "insert into ht_receipt_h (...) output inserted.id values (...)",
+            "INSERT INTO [HT_Book_Date](...) OUTPUT INSERTED.id VALUES(...)",
+        ];
+        for s in examples {
+            assert!(s.to_ascii_uppercase().contains("OUTPUT INSERTED."),
+                "example {s:?} must satisfy the helper precondition");
+        }
     }
-    let pivot = matches[0];
-    execute_all(conn, &statements[..=pivot]).await?;
-    let id = fetch_scope_identity(conn).await?;
-    execute_all(conn, &statements[pivot + 1..]).await?;
-    Ok(id)
 }

@@ -146,7 +146,13 @@ pub fn build_statements(inputs: &WalkInInputs<'_>) -> Vec<String> {
     //     The .NET app fires this on every save; UPDATE matches 0 rows
     //     when no photo was uploaded. Skip when no tmp_no was supplied
     //     (matches the legacy app's behavior on photo-less check-ins).
-    if let Some(tmp_no) = inputs.photo_tmp_no {
+    //
+    // Audit H14: also skip when `tmp_no` is an empty / whitespace-only
+    // string. Without this filter, `UPDATE Tb_Save_Image … WHERE tmp_no=''`
+    // re-stamps every orphan-pending-cleanup row (which the legacy app
+    // leaves with `tmp_no=''` after a successful save) with THIS check-in's
+    // identifiers — poisoning the photo audit trail for unrelated guests.
+    if let Some(tmp_no) = inputs.photo_tmp_no.filter(|s| !s.trim().is_empty()) {
         let tmp_no_q = sql_quote(tmp_no);
         statements.push(format!(
             "update Tb_Save_Image set cin_no={cin_no_q},cust_no={cust_no_q},tmp_no='' \
@@ -253,6 +259,19 @@ pub async fn execute(
     conn: &mut LegacyConn<'_>,
     payload: &CreateCheckInPayload,
 ) -> WritebackResult<LegacyIds> {
+    // Audit H13: reject NaN/Infinity before any allocation or SQL formatting.
+    // `format!("{}", f64::NAN)` emits the literal string `"NaN"`, which would
+    // produce invalid SQL like `[Cin_Room_Price]=NaN` and fail mid-transaction
+    // leaving partial state. Today the values come from `Money::as_satang()`
+    // (always finite) — this is defense-in-depth against a future code path
+    // introducing a non-Money f64 source.
+    let price_per_night_baht = (payload.price_per_night.as_satang() as f64) / 100.0;
+    let price_total_baht = (payload.price_total.as_satang() as f64) / 100.0;
+    super::helpers::validate_finite(&[
+        ("price_per_night_baht", price_per_night_baht),
+        ("price_total_baht", price_total_baht),
+    ])?;
+
     // Allocate IDs under TABLOCKX, in dependency order.
     let cust_no = match payload.legacy_cust_no.as_deref() {
         Some(existing) => existing.to_string(),
@@ -281,9 +300,9 @@ pub async fn execute(
         room_type: &payload.room_type,
         stay_start: payload.stay.start,
         stay_end: payload.stay.end,
-        price_per_night_baht: (payload.price_per_night.as_satang() as f64) / 100.0,
+        price_per_night_baht,
         nights: payload.nights.max(1),
-        price_total_baht: (payload.price_total.as_satang() as f64) / 100.0,
+        price_total_baht,
         room_status_id_base,
         nights_calendar,
         checkin_ds_id,
@@ -509,6 +528,31 @@ mod tests {
         assert!(!s.iter().any(|s| s.starts_with("update Tb_Save_Image")));
     }
 
+    /// Audit H14: an empty-string `tmp_no` must not fire the Tb_Save_Image
+    /// UPDATE. Otherwise `WHERE tmp_no=''` matches every orphan-pending-
+    /// cleanup row (legacy app leaves `tmp_no=''` after a successful save)
+    /// and re-stamps them with THIS check-in's cin_no / cust_no.
+    #[test]
+    fn tmp_no_empty_string_skips_tb_save_image_update() {
+        let mut inputs = sample_inputs();
+        inputs.photo_tmp_no = Some("");
+        let s = build_statements(&inputs);
+        assert!(
+            !s.iter().any(|s| s.starts_with("update Tb_Save_Image")),
+            "empty tmp_no must not emit a Tb_Save_Image UPDATE"
+        );
+    }
+
+    /// Audit H14 extended: whitespace-only `tmp_no` is also treated as
+    /// absent — same poisoning blast radius.
+    #[test]
+    fn tmp_no_whitespace_only_skips_tb_save_image_update() {
+        let mut inputs = sample_inputs();
+        inputs.photo_tmp_no = Some("   ");
+        let s = build_statements(&inputs);
+        assert!(!s.iter().any(|s| s.starts_with("update Tb_Save_Image")));
+    }
+
     #[test]
     fn cin_room_status_uses_thai_occupying_literal() {
         let s = build_statements(&sample_inputs());
@@ -616,6 +660,30 @@ mod tests {
             .expect("HT_Cupon mark-printed UPDATE must be emitted");
         assert!(cupon.contains("cupon_print=1"));
         assert!(cupon.contains("cupon_cin_no='CH26-005228'"));
+    }
+
+    /// Audit H13: walk-in `execute()` must reject NaN before any SQL is
+    /// formatted. `format!("{}", f64::NAN)` would emit literal `"NaN"` into
+    /// `[Cin_Room_Price]=NaN` and fail the whole transaction. This test pins
+    /// the labels we wire up so the error message stays operator-grep-able.
+    #[test]
+    fn validate_finite_blocks_nan_in_walkin_execute_inputs() {
+        let result = super::super::helpers::validate_finite(&[
+            ("price_per_night_baht", f64::NAN),
+            ("price_total_baht", 890.0),
+        ]);
+        let err = result.expect_err("NaN must be rejected");
+        assert!(err.to_string().contains("price_per_night_baht"));
+    }
+
+    #[test]
+    fn validate_finite_blocks_infinity_in_walkin_execute_inputs() {
+        let result = super::super::helpers::validate_finite(&[
+            ("price_per_night_baht", 890.0),
+            ("price_total_baht", f64::INFINITY),
+        ]);
+        let err = result.expect_err("Infinity must be rejected");
+        assert!(err.to_string().contains("price_total_baht"));
     }
 
     #[test]

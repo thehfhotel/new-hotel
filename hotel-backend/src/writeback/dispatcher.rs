@@ -44,9 +44,12 @@ pub struct LegacyIds {
     /// next intent on the same check-in (CancelCheckIn, ExtendStay,
     /// CheckOut, RecordPayment all need this).
     pub room_no: Option<String>,
-    /// `HT_CheckIn_Ds.id` (IDENTITY) for the row created during walkin /
-    /// checkin_to_booking. Required by ExtendStay and CheckOut recipes;
-    /// captured via `SELECT SCOPE_IDENTITY()` after the INSERT.
+    /// `HT_CheckIn_Ds.id` for the row created during walkin / checkin_to_booking.
+    /// Required by ExtendStay and CheckOut recipes. Despite earlier notes
+    /// this column is NOT IDENTITY (schema dump 2026-04-26 confirmed
+    /// `int NOT NULL, default=NULL`) — the recipe allocates it via
+    /// `allocate_checkin_ds_id` (TABLOCKX MAX+1) and propagates that
+    /// value here, so no wire-scope SCOPE_IDENTITY capture is needed.
     pub checkin_ds_id: Option<i32>,
     /// Free-form extras (e.g. `HT_Rooms_Cancel.id`).
     #[serde(default)]

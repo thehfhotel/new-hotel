@@ -5,6 +5,120 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.63.5] - 2026-05-12
+
+### Fixed
+
+- **Writeback robustness — pool, scope, validation (Wave 4
+  `docs/legacy-spike/writeback-audit-2026-05-12.md`).** Five
+  HIGH-severity bugs plus a Wave 3 follow-up that left the writeback
+  worker exposed to pool poisoning, wire-scope corruption, NaN/Infinity
+  injection, photo audit-trail poisoning, prefix-injection sinks, and
+  HT_Room_Status double-inserts:
+  - **H11** `bin/writeback.rs::process_job` — defensive
+    `IF @@TRANCOUNT > 0 ROLLBACK` sentinel runs on every legacy-conn
+    checkout. If a previous job's `run_in_transaction` saw its
+    `ROLLBACK TRAN` itself fail (network blip mid-rollback, MSSQL hiccup)
+    the connection would return to the bb8 pool with an open transaction
+    and the next `BEGIN TRAN` would nest instead of starting fresh
+    (T-SQL `BEGIN TRAN` bumps `@@TRANCOUNT` rather than opening a new
+    outer scope), causing the next TABLOCKX to hang or commit against
+    the wrong scope. The sentinel is idempotent — zero wire overhead
+    beyond a round-trip when `@@TRANCOUNT` is 0 (the normal case),
+    heals the connection otherwise. Scoped to the writeback worker
+    only (not added to `db::pool::create_pool`'s shared init) because
+    only the writeback worker opens explicit transactions against the
+    legacy pool — sync.rs / backfill_rooms.rs / API routes don't.
+    Pinned by `reset_trancount_sql_is_guarded_idempotent_form`.
+  - **H12** `writeback/recipes/mod.rs` — replaced the dual-statement
+    `execute_capturing_identity_at` + `fetch_scope_identity` helpers
+    with a single `execute_insert_with_output_id` that runs
+    `INSERT … OUTPUT INSERTED.id … VALUES …` and reads the id from the
+    INSERT response itself. The old helpers issued the INSERT and
+    `SELECT SCOPE_IDENTITY()` as two separate `simple_query` calls,
+    and SCOPE_IDENTITY is batch-scoped on the wire — tiberius would
+    occasionally return `NULL` when the prior call's batch closed
+    before the SELECT executed, surfacing as a confusing `Recipe(...)`
+    error. `OUTPUT INSERTED.<col>` survives any scope quirk because
+    the id streams back as part of the INSERT response. A
+    `debug_assert!` pins the `OUTPUT INSERTED.` substring at the
+    helper boundary so any future caller wired up without the clause
+    fails immediately in test/dev. The legacy IDENTITY-keyed tables
+    we touch today (`HT_CheckIn_Ds`, `HT_Receipt_H`, `HT_Book_Date`,
+    `HT_Room_Status`, `HT_Rooms_Cancel`) had IDENTITY stripped by the
+    vendor — all current recipes allocate via TABLOCKX MAX+1 — so the
+    helper is `#[allow(dead_code)]` until a future table needs true
+    IDENTITY capture.
+  - **H13** `recipes/walkin.rs`, `recipes/checkin_to_booking.rs`,
+    `recipes/checkout.rs` — every `execute()` entry point now calls
+    `helpers::validate_finite(&[…])` to reject NaN/Infinity *before*
+    any allocation or SQL formatting. `format!("{}", f64::NAN)` emits
+    the literal string `"NaN"`, producing invalid SQL like
+    `[Cin_Room_Price]=NaN` that fails MSSQL mid-transaction and leaves
+    partial state (e.g. checkout's power log already stamped off but
+    the totals UPDATE never written). For walkin / checkin_to_booking
+    the values currently flow from `Money::as_satang()` (always finite)
+    so the guard is defense-in-depth; for checkout the values arrive
+    straight from the caller as `f64` with no Money wrapper, so the
+    guard is necessary. Six new tests pin the labels so the error
+    messages stay operator-grep-able.
+  - **H14** `recipes/walkin.rs:148-156`, `recipes/checkin_to_booking.rs:138-146`
+    — empty / whitespace-only `tmp_no` now suppresses the
+    `Tb_Save_Image` UPDATE entirely. Previously
+    `if let Some(tmp_no) = inputs.photo_tmp_no` accepted `Some("")`
+    and emitted `WHERE tmp_no=''`, which matched every
+    orphan-pending-cleanup row (the legacy app leaves `tmp_no=''`
+    after a successful save) and re-stamped them with THIS check-in's
+    `cin_no` / `cust_no` — poisoning the photo audit trail for
+    unrelated guests. Filter via
+    `.filter(|s| !s.trim().is_empty())`. Four new tests
+    (`tmp_no_empty_string_skips_…`, `tmp_no_whitespace_only_skips_…`
+    on both recipes).
+  - **H15** `writeback/allocate.rs::validate_allocator_prefix` —
+    defense-in-depth regex (hand-rolled, no `regex` dev-dep) validates
+    every allocator prefix interpolated into `LIKE '{prefix}%'`
+    before the SUBSTRING/MAX+1 SELECT executes. Accepts 1-4 uppercase
+    ASCII letters + up to 4 ASCII digits + optional trailing `-`;
+    rejects `'` `;` `%` `_` whitespace and anything outside the
+    documented shape. Wired into `allocate_cin_no_with_now`,
+    `allocate_pay_no_with_now`, `allocate_receipt_no_with_now`.
+    Today every caller derives the prefix from integer year/month
+    arithmetic so production values are guaranteed safe — the guard
+    closes the templated-injection sink against any future code path
+    that takes the prefix from untrusted input (config, request
+    payload, etc.). Three new tests
+    (`allocate_prefix_validation_accepts_real_prefixes`,
+    `…_rejects_special_chars`, `…_caps_digit_run_length`).
+  - **Wave 3 follow-up** `recipes/checkin_to_booking.rs:189-220`
+    — the night-1..N branch now emits a single-statement
+    `IF EXISTS … UPDATE … ELSE INSERT` upsert per night instead of
+    a plain INSERT. Wave 3's H7 fix made `booking_create`
+    pre-insert `HT_Room_Status` rows for every booked night with
+    `status='จอง'`; when a multi-night booking later converts to a
+    check-in, those rows already exist for nights 1..N and a plain
+    INSERT would create duplicates (the table has no unique
+    constraint per `SCHEMA.sql` inspection). The upsert matches the
+    legacy app's "upsert per night" semantics
+    (`COMPAT_CHEATSHEET.md:347-348`) and keeps the recipe atomic; a
+    future check-in that extends past the original booking's last
+    night still works (the extra night has no pre-existing row, so
+    it INSERTs through the `ELSE` branch). Two new tests
+    (`additional_nights_are_upserts_not_plain_inserts`,
+    `multi_night_does_not_double_insert_room_status`) replace the
+    old `additional_nights_are_inserted` test.
+
+  Fifteen new unit tests across `writeback::allocate::tests`,
+  `writeback::recipes::walkin::tests`,
+  `writeback::recipes::checkin_to_booking::tests`,
+  `writeback::recipes::checkout::tests`, `writeback::recipes::mod::tests`,
+  and `bin::writeback::tests` lock in the fixes. Full unit suite
+  (475 tests across lib + binaries) passes; the 3 PG-requiring
+  integration tests in `tests/test_bookings.rs` continue to fail on a
+  host without a live PostgreSQL instance (pre-existing baseline,
+  not regression). Clippy output unchanged modulo the removal of the
+  now-dead `fetch_scope_identity` / `execute_capturing_identity_at`
+  warnings (net -2 warnings, zero new).
+
 ## [2.63.4] - 2026-05-12
 
 ### Fixed

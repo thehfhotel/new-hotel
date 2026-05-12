@@ -96,6 +96,13 @@ const LISTENER_MAX_CONSECUTIVE_FAILURES: u32 = 10;
 /// doesn't spin the CPU.
 const LISTENER_BACKOFF_SECS: u64 = 5;
 
+/// Audit H11 — defensive sentinel run on every legacy-conn checkout to clear
+/// any open transaction the previous worker may have left behind after a
+/// failed `ROLLBACK TRAN`. Idempotent: zero-cost when @@TRANCOUNT is 0 (the
+/// normal case), heals the connection when it isn't. See the call site in
+/// `process_job` for the full rationale.
+const RESET_TRANCOUNT_SQL: &str = "IF @@TRANCOUNT > 0 ROLLBACK";
+
 /// Listener supervisor: extended backoff after exceeding
 /// `LISTENER_MAX_CONSECUTIVE_FAILURES`. We don't give up — exiting would
 /// leave the worker with no NOTIFY signal source, relying solely on the
@@ -549,6 +556,50 @@ async fn process_job(
             return;
         }
     };
+
+    // Audit H11: defensive `IF @@TRANCOUNT > 0 ROLLBACK` at acquisition.
+    //
+    // If a previous job's `run_in_transaction` failed and its `ROLLBACK TRAN`
+    // itself errored (network blip mid-rollback, MSSQL hiccup, etc.) the
+    // connection returns to the bb8 pool with an open transaction. bb8-tiberius
+    // has no per-checkout `is_valid` hook, so the next worker that checks out
+    // that connection inherits the open tran — the next `BEGIN TRAN` nests it
+    // (T-SQL `BEGIN TRAN` does NOT start a new outer tran when one is already
+    // open, it bumps @@TRANCOUNT), and the next TABLOCKX hangs or commits
+    // against the wrong tran scope.
+    //
+    // This sentinel runs against every checkout and is idempotent: when
+    // @@TRANCOUNT is 0 (the normal case) the IF body is skipped — zero wire
+    // overhead beyond the round-trip. When it's >0 we ROLLBACK to clear the
+    // poison; the connection is then safe for `BEGIN TRAN` below.
+    //
+    // Lower-blast-radius choice: we do this here (in the worker's hot path)
+    // rather than in `db::pool::create_pool` or a bb8 `on_release` /
+    // `is_valid` hook, because the legacy pool is shared with other consumers
+    // (sync.rs, backfill_rooms.rs, API routes) that don't open explicit
+    // transactions — adding a sentinel everywhere would be overhead for no
+    // benefit. Only the writeback worker opens `BEGIN TRAN` against this
+    // pool, so only the writeback worker needs to clean up poisoned conns.
+    let trancount_reset = conn.simple_query(RESET_TRANCOUNT_SQL).await.map(drop);
+    if let Err(err) = trancount_reset {
+        tracing::warn!(
+            job_id,
+            error = %err,
+            "defensive @@TRANCOUNT rollback failed — dropping conn"
+        );
+        drop(conn);
+        mark_failed(
+            pg,
+            job_id,
+            job.attempts,
+            job.claimed_at,
+            max_attempts,
+            slack,
+            &format!("trancount_reset: {err}"),
+        )
+        .await;
+        return;
+    }
 
     let ctx = DispatchContext {
         job_id,
@@ -1703,6 +1754,24 @@ mod tests {
     fn stuck_in_progress_timeout_is_in_safe_range() {
         assert!(STUCK_IN_PROGRESS_TIMEOUT_SECS >= 60, "less than 1 min risks racing slow recipes");
         assert!(STUCK_IN_PROGRESS_TIMEOUT_SECS <= 1800, "more than 30 min is too slow to recover");
+    }
+
+    /// Audit H11: the defensive sentinel SQL MUST gate the ROLLBACK on
+    /// `@@TRANCOUNT > 0` so it's a no-op when the connection is clean
+    /// (the normal case). An unconditional `ROLLBACK` would error with
+    /// "no transaction is active" on every checkout — slow + noisy.
+    ///
+    /// We assert the literal form here because a typo (`@@TRANCOUNT >= 0`,
+    /// or omitting the IF) would silently regress the invariant in a way
+    /// no integration test would catch on a healthy pool.
+    #[test]
+    fn reset_trancount_sql_is_guarded_idempotent_form() {
+        assert_eq!(RESET_TRANCOUNT_SQL, "IF @@TRANCOUNT > 0 ROLLBACK");
+        let upper = RESET_TRANCOUNT_SQL.to_ascii_uppercase();
+        assert!(upper.contains("IF @@TRANCOUNT > 0"));
+        assert!(upper.contains("ROLLBACK"));
+        assert!(!upper.contains("BEGIN"), "must not BEGIN a tran");
+        assert!(!upper.contains("COMMIT"), "must not COMMIT");
     }
 
     /// Short error messages pass through unchanged.

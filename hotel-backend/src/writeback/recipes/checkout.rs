@@ -146,6 +146,22 @@ pub async fn execute(
     pay_total: f64,
     balance: f64,
 ) -> WritebackResult<LegacyIds> {
+    // Audit H13: reject NaN/Infinity for every monetary input before any SQL
+    // formatting. `format!("{}", f64::NAN)` emits literal `"NaN"`, which
+    // would cause MSSQL to reject the UPDATE mid-transaction and leave the
+    // check-out partially applied (power log already stamped off but totals
+    // never overwritten). Unlike walkin/checkin_to_booking these values flow
+    // straight from the caller as f64 — there is no Money type to guarantee
+    // finiteness — so the check is necessary, not just defense-in-depth.
+    super::helpers::validate_finite(&[
+        ("nights", nights),
+        ("room_price_total", room_price_total),
+        ("product_total", product_total),
+        ("net_total", net_total),
+        ("pay_total", pay_total),
+        ("balance", balance),
+    ])?;
+
     let inputs = CheckOutInputs {
         cin_no,
         room_no,
@@ -309,6 +325,49 @@ mod tests {
             "Total_Price_Pay must reflect real pay total; got:\n{}",
             statements[4]
         );
+    }
+
+    /// Audit H13: checkout `execute()` must reject NaN/Infinity for every
+    /// monetary input before any SQL is formatted. Unlike walkin /
+    /// checkin_to_booking these values flow straight from the caller as
+    /// f64 (not derived from `Money`), so the check is necessary not just
+    /// defense-in-depth: a NaN reaching `[Total_Price_Pay]={pay}` would
+    /// emit `[Total_Price_Pay]=NaN` and fail the transaction after the
+    /// power log was already stamped off. This test pins the labels.
+    #[test]
+    fn validate_finite_blocks_nan_in_checkout_execute_inputs() {
+        let result = super::super::helpers::validate_finite(&[
+            ("nights", f64::NAN),
+            ("room_price_total", 2670.0),
+            ("product_total", 0.0),
+            ("net_total", 2670.0),
+            ("pay_total", 2670.0),
+            ("balance", 0.0),
+        ]);
+        let err = result.expect_err("NaN nights must be rejected");
+        assert!(err.to_string().contains("nights"));
+    }
+
+    #[test]
+    fn validate_finite_blocks_infinity_in_checkout_execute_inputs() {
+        for (label, payload) in [
+            ("room_price_total", f64::INFINITY),
+            ("net_total", f64::NEG_INFINITY),
+            ("pay_total", f64::INFINITY),
+            ("balance", f64::INFINITY),
+            ("product_total", f64::INFINITY),
+        ] {
+            let result = super::super::helpers::validate_finite(&[
+                ("nights", 3.0),
+                ("room_price_total", if label == "room_price_total" { payload } else { 2670.0 }),
+                ("product_total", if label == "product_total" { payload } else { 0.0 }),
+                ("net_total", if label == "net_total" { payload } else { 2670.0 }),
+                ("pay_total", if label == "pay_total" { payload } else { 2670.0 }),
+                ("balance", if label == "balance" { payload } else { 0.0 }),
+            ]);
+            let err = result.expect_err("Infinity must be rejected");
+            assert!(err.to_string().contains(label), "label {label} not in: {err}");
+        }
     }
 
     /// Fix for audit H2: Room_Use_Count is bumped by the real nights count

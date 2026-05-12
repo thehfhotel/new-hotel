@@ -35,6 +35,58 @@ use tiberius::Row;
 use crate::writeback::error::{WritebackError, WritebackResult};
 use crate::writeback::format::bangkok_date;
 
+/// Audit H15: every allocator interpolates a `prefix` into the `LIKE` clause of
+/// its TABLOCKX `MAX+1` SELECT via `format!`. Today every caller derives the
+/// prefix from integer year/month so the values are guaranteed safe; this
+/// validator is a defense-in-depth guard against a future code path that takes
+/// the prefix from untrusted input (config, request payload, etc.).
+///
+/// Accepts: 1–4 uppercase ASCII letters, optionally followed by up to 4 ASCII
+/// digits, optionally followed by a single `-`. Examples that pass:
+/// `R2604-`, `B2604-`, `CH26-`, `SB-`, `CB-`, `R`, `R26`. Anything containing
+/// a quote, semicolon, percent sign, underscore, or whitespace is rejected —
+/// these are the metacharacters that would matter inside a T-SQL string
+/// literal or a `LIKE` pattern.
+fn validate_allocator_prefix(prefix: &str) -> WritebackResult<()> {
+    if prefix.is_empty() || prefix.len() > 10 {
+        return Err(WritebackError::Recipe(format!(
+            "allocator prefix has invalid length: {prefix:?}"
+        )));
+    }
+    let bytes = prefix.as_bytes();
+    let mut idx = 0;
+    let mut letters = 0;
+    while idx < bytes.len() && bytes[idx].is_ascii_uppercase() {
+        letters += 1;
+        idx += 1;
+    }
+    if !(1..=4).contains(&letters) {
+        return Err(WritebackError::Recipe(format!(
+            "allocator prefix must start with 1-4 uppercase letters: {prefix:?}"
+        )));
+    }
+    let mut digits = 0;
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        digits += 1;
+        idx += 1;
+    }
+    if digits > 4 {
+        return Err(WritebackError::Recipe(format!(
+            "allocator prefix has too many digits: {prefix:?}"
+        )));
+    }
+    // Optional trailing dash.
+    if idx < bytes.len() && bytes[idx] == b'-' {
+        idx += 1;
+    }
+    if idx != bytes.len() {
+        return Err(WritebackError::Recipe(format!(
+            "allocator prefix contains disallowed character: {prefix:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Convenience alias — the type bb8 hands out for our legacy connection.
 pub type LegacyConn<'a> = PooledConnection<'a, ConnectionManager>;
 
@@ -120,6 +172,10 @@ pub(crate) async fn allocate_cin_no_with_now(
     now: DateTime<Utc>,
 ) -> WritebackResult<String> {
     let prefix = cin_no_prefix(now);
+    // Audit H15: defense-in-depth — fail loud if the prefix ever contains
+    // anything other than letters/digits/dash. Today the prefix is derived
+    // from integer year arithmetic so this is unreachable in production.
+    validate_allocator_prefix(&prefix)?;
     let suffix_offset = prefix.len() + 1;
 
     // Match exactly the year prefix, then extract the trailing 6-digit suffix.
@@ -216,6 +272,10 @@ pub(crate) async fn allocate_pay_no_with_now(
     now: DateTime<Utc>,
 ) -> WritebackResult<String> {
     let month_prefix = pay_no_prefix(now);
+    // Audit H15: validate the prefix before interpolation. Cheap arithmetic
+    // check today; required guard if `pay_no_prefix` is ever refactored to
+    // accept caller-supplied input.
+    validate_allocator_prefix(&month_prefix)?;
     // SUBSTRING is 1-based in T-SQL; the suffix starts one position past the
     // prefix. Derive from prefix length so future format tweaks don't silently
     // misalign the MAX scan.
@@ -258,6 +318,9 @@ pub(crate) async fn allocate_receipt_no_with_now(
     now: DateTime<Utc>,
 ) -> WritebackResult<String> {
     let month_prefix = receipt_no_prefix(now);
+    // Audit H15: defense-in-depth against prefix injection — see
+    // `validate_allocator_prefix` for the accepted shape.
+    validate_allocator_prefix(&month_prefix)?;
     let suffix_offset = month_prefix.len() + 1;
     let next = select_next_int_with_lock(
         conn,
@@ -437,6 +500,54 @@ mod tests {
     // The audit calls out the original hardcoded `SUBSTRING(..., 7, 50)` /
     // `SUBSTRING(..., 8, 50)` offsets as fragile. These checks confirm the
     // offset arithmetic stays in sync with the emitted prefix.
+
+    // --- Allocator prefix validation (CRIT-H15) ---
+    //
+    // The audit calls out the `LIKE '{prefix}%'` interpolation as a templated
+    // injection sink. Today the prefix is integer-derived (year/month) so the
+    // production values are safe, but the validator guards against any future
+    // code path that wires a caller-supplied string into the prefix.
+
+    #[test]
+    fn allocate_prefix_validation_accepts_real_prefixes() {
+        // These are the exact prefixes the three production allocators emit.
+        for good in ["R2604-", "B2604-", "CH26-", "R", "CH27-"] {
+            assert!(
+                validate_allocator_prefix(good).is_ok(),
+                "real allocator prefix {good:?} must validate"
+            );
+        }
+    }
+
+    #[test]
+    fn allocate_prefix_validation_rejects_special_chars() {
+        // Each of these would be catastrophic interpolated into `LIKE '<p>%'`
+        // or into the SUBSTRING start offset — they MUST be rejected.
+        for bad in [
+            "R26';--",     // statement terminator + SQL comment
+            "R2604%",      // explicit wildcard
+            "R26_4-",      // single-char LIKE wildcard
+            "R 2604-",     // whitespace (impossible from current callers)
+            "r2604-",      // lowercase (production prefixes are all uppercase)
+            "R26+4-",      // arithmetic / operator
+            "R'2604-",     // embedded quote
+            "",            // empty
+            "TOOLONGPREFIX1234", // > 10 chars
+        ] {
+            let result = validate_allocator_prefix(bad);
+            assert!(
+                result.is_err(),
+                "bad prefix {bad:?} must be rejected, got: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn allocate_prefix_validation_caps_digit_run_length() {
+        // Five trailing digits is the next-most-likely typo (forgetting the
+        // `-`); reject to keep the format invariant tight.
+        assert!(validate_allocator_prefix("R12345-").is_err());
+    }
 
     #[test]
     fn pay_no_substring_offset_is_one_past_prefix_length() {

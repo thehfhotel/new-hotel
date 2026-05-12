@@ -136,7 +136,13 @@ pub fn build_statements(inputs: &CheckInToBookingInputs<'_>) -> Vec<String> {
     // 1b. Tb_Save_Image — link uploaded photo to the new check-in.
     //     UPDATE matches 0 rows when no photo was uploaded (mirrors the
     //     legacy app's behavior). Skip when no tmp_no was supplied.
-    if let Some(tmp_no) = inputs.photo_tmp_no {
+    //
+    // Audit H14: also skip when `tmp_no` is an empty / whitespace-only
+    // string. `WHERE tmp_no=''` would re-stamp every orphan-pending-cleanup
+    // row (which the legacy app leaves with `tmp_no=''` after a successful
+    // save) with THIS check-in's identifiers — poisoning the photo audit
+    // trail for unrelated guests.
+    if let Some(tmp_no) = inputs.photo_tmp_no.filter(|s| !s.trim().is_empty()) {
         let tmp_no_q = sql_quote(tmp_no);
         statements.push(format!(
             "update Tb_Save_Image set cin_no={cin_no_q},cust_no={cust_no_q},tmp_no='' \
@@ -181,14 +187,33 @@ pub fn build_statements(inputs: &CheckInToBookingInputs<'_>) -> Vec<String> {
         ));
     }
 
-    // 6..N. HT_Room_Status INSERTs for additional nights (skip the first —
-    //       handled by UPDATE above per spike §3d).
+    // 6..N. HT_Room_Status for additional nights (skip the first — handled
+    //       by the UPDATE above per spike §3d).
+    //
+    // Wave 3 followup: each night must be an UPSERT, not a plain INSERT.
+    // The Wave 3 H7 fix made `booking_create` pre-insert HT_Room_Status
+    // rows for every booked night with status='จอง'. When a multi-night
+    // booking converts to a check-in, those rows already exist for nights
+    // 1..N — a plain INSERT would create duplicate rows (the table has no
+    // unique constraint per SCHEMA.sql inspection).
+    //
+    // The `IF EXISTS … UPDATE … ELSE INSERT` form matches the legacy app's
+    // "upsert per night" semantics (`COMPAT_CHEATSHEET.md:347-348`) in a
+    // single statement so we keep the recipe atomic and a future check-in
+    // that extends past the original booking's last night still works
+    // (the extra night has no pre-existing row, so it INSERTs).
     for (i, day) in inputs.nights_calendar.iter().enumerate().skip(1) {
         let id = inputs.room_status_id_base + (i as i32 - 1);
         let date_q = sql_quote(&format_legacy_date(*day));
         let oa = date_to_ole_serial(*day) as i64;
         statements.push(format!(
-            "INSERT INTO [HT_Room_Status]([id],[room_no],[room_date],[room_status],\
+            "IF EXISTS (SELECT 1 FROM [HT_Room_Status] WHERE room_date={date_q} \
+             AND room_no={room_no_q}) \
+             UPDATE [HT_Room_Status] SET [room_status]={room_status_q},\
+             [room_Details]={cust_name_q},[room_CheckIn_No]={cin_no_q} \
+             WHERE room_date={date_q} AND room_no={room_no_q} \
+             ELSE \
+             INSERT INTO [HT_Room_Status]([id],[room_no],[room_date],[room_status],\
              [room_Details],[room_CheckIn_No],[room_date_oa])\
              VALUES({id},{room_no_q},{date_q},{room_status_q},{cust_name_q},{cin_no_q},{oa})"
         ));
@@ -262,6 +287,16 @@ pub async fn execute(
     payload: &CreateCheckInPayload,
     book_id: &str,
 ) -> WritebackResult<LegacyIds> {
+    // Audit H13: reject NaN/Infinity before any allocation or SQL formatting.
+    // Same rationale as `walkin::execute` — `format!("{}", f64::NAN)` emits the
+    // literal `"NaN"`, which would fail mid-transaction with partial state.
+    let price_per_night_baht = (payload.price_per_night.as_satang() as f64) / 100.0;
+    let price_total_baht = (payload.price_total.as_satang() as f64) / 100.0;
+    super::helpers::validate_finite(&[
+        ("price_per_night_baht", price_per_night_baht),
+        ("price_total_baht", price_total_baht),
+    ])?;
+
     let cust_no = payload.legacy_cust_no.clone().ok_or_else(|| {
         crate::writeback::error::WritebackError::Recipe(
             "CheckIn-to-booking requires legacy_cust_no in payload (§3d: customer already exists)"
@@ -288,9 +323,9 @@ pub async fn execute(
         room_type: &payload.room_type,
         stay_start: payload.stay.start,
         stay_end: payload.stay.end,
-        price_per_night_baht: (payload.price_per_night.as_satang() as f64) / 100.0,
+        price_per_night_baht,
         nights: payload.nights.max(1),
-        price_total_baht: (payload.price_total.as_satang() as f64) / 100.0,
+        price_total_baht,
         room_status_id_base,
         nights_calendar,
         checkin_ds_id,
@@ -514,6 +549,28 @@ mod tests {
         assert!(!s.iter().any(|s| s.starts_with("update Tb_Save_Image")));
     }
 
+    /// Audit H14: empty `tmp_no` must skip the Tb_Save_Image UPDATE — same
+    /// reason as `walkin`: `WHERE tmp_no=''` re-stamps every orphan-pending-
+    /// cleanup row with THIS check-in's identifiers.
+    #[test]
+    fn tmp_no_empty_string_skips_tb_save_image_update() {
+        let mut inputs = sample_inputs();
+        inputs.photo_tmp_no = Some("");
+        let s = build_statements(&inputs);
+        assert!(
+            !s.iter().any(|s| s.starts_with("update Tb_Save_Image")),
+            "empty tmp_no must not emit a Tb_Save_Image UPDATE"
+        );
+    }
+
+    #[test]
+    fn tmp_no_whitespace_only_skips_tb_save_image_update() {
+        let mut inputs = sample_inputs();
+        inputs.photo_tmp_no = Some("   ");
+        let s = build_statements(&inputs);
+        assert!(!s.iter().any(|s| s.starts_with("update Tb_Save_Image")));
+    }
+
     #[test]
     fn first_room_status_row_is_updated_not_inserted() {
         let s = build_statements(&sample_inputs());
@@ -527,17 +584,74 @@ mod tests {
         assert!(upd.contains("[room_CheckIn_No]='CH26-005231'"));
     }
 
+    /// Wave 3 followup — after H7 made `booking_create` insert
+    /// `HT_Room_Status` rows for every booked night, the nights-1..N branch
+    /// of `checkin_to_booking` must NOT fire a plain INSERT for rows that
+    /// already exist (multi-night booking conversion). Instead it emits a
+    /// single-statement `IF EXISTS … UPDATE … ELSE INSERT` upsert that
+    /// matches the legacy app's "upsert per night" semantics
+    /// (`COMPAT_CHEATSHEET.md:347-348`).
     #[test]
-    fn additional_nights_are_inserted() {
+    fn additional_nights_are_upserts_not_plain_inserts() {
         let s = build_statements(&sample_inputs());
-        // 2 nights total, first is UPDATE, second is INSERT
-        let inserts: Vec<&String> = s
+        let nights_1_plus: Vec<&String> = s
             .iter()
-            .filter(|s| s.contains("INSERT INTO [HT_Room_Status]"))
+            .filter(|stmt| stmt.starts_with("IF EXISTS (SELECT 1 FROM [HT_Room_Status]"))
             .collect();
-        assert_eq!(inserts.len(), 1); // only the second night
-        assert!(inserts[0].contains("'4/25/2026'"));
-        assert!(inserts[0].contains("(50237,"));
+        assert_eq!(
+            nights_1_plus.len(),
+            1,
+            "expected one upsert per night-1..N (2-night sample has 1)"
+        );
+        let upsert = nights_1_plus[0];
+        assert!(upsert.contains("room_date='4/25/2026'"));
+        assert!(upsert.contains("room_no='402'"));
+        assert!(upsert.contains("UPDATE [HT_Room_Status]"));
+        assert!(upsert.contains("ELSE"));
+        assert!(upsert.contains("INSERT INTO [HT_Room_Status]"));
+        assert!(upsert.contains("(50237,"));
+    }
+
+    /// Wave 3 followup regression — a multi-night conversion must NOT emit
+    /// a bare `INSERT INTO [HT_Room_Status]` (i.e. one that isn't guarded by
+    /// an `IF EXISTS … ELSE` clause) for nights 1..N. The night-0 path is
+    /// still an UPDATE-only (it relies on the booking-created row existing).
+    #[test]
+    fn multi_night_does_not_double_insert_room_status() {
+        let mut inputs = sample_inputs();
+        inputs.nights_calendar = vec![
+            NaiveDate::from_ymd_opt(2026, 4, 24).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 4, 25).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 4, 26).unwrap(),
+        ];
+        let s = build_statements(&inputs);
+        // Every HT_Room_Status statement must be either an UPDATE (night 0)
+        // or an `IF EXISTS … UPDATE … ELSE INSERT` upsert (nights 1..N).
+        // A bare INSERT line (not preceded by `IF EXISTS …`) would risk
+        // duplicate rows since the table has no unique constraint per
+        // SCHEMA.sql inspection.
+        for stmt in s.iter().filter(|s| s.contains("HT_Room_Status")) {
+            let is_night_zero_update = stmt.starts_with("update [HT_Room_Status] SET");
+            let is_guarded_upsert =
+                stmt.starts_with("IF EXISTS (SELECT 1 FROM [HT_Room_Status]")
+                && stmt.contains("ELSE")
+                && stmt.contains("INSERT INTO [HT_Room_Status]");
+            assert!(
+                is_night_zero_update || is_guarded_upsert,
+                "unguarded HT_Room_Status statement would double-insert:\n{stmt}"
+            );
+        }
+        // Exactly one night-0 UPDATE + (N-1) upserts for an N-night stay.
+        let night_zero_updates = s
+            .iter()
+            .filter(|s| s.starts_with("update [HT_Room_Status] SET"))
+            .count();
+        let upserts = s
+            .iter()
+            .filter(|s| s.starts_with("IF EXISTS (SELECT 1 FROM [HT_Room_Status]"))
+            .count();
+        assert_eq!(night_zero_updates, 1);
+        assert_eq!(upserts, 2, "3-night stay must emit 2 upserts for nights 1+2");
     }
 
     #[test]
@@ -584,6 +698,29 @@ mod tests {
         }
         // Lowercase "where" — matches the legacy capture form.
         assert!(upd.contains(" where Cust_no='C21610'"));
+    }
+
+    /// Audit H13: linked-to-booking `execute()` must reject NaN before any
+    /// SQL is formatted. Mirrors the walk-in guard — `format!("{}", f64::NAN)`
+    /// would emit literal `"NaN"` and fail mid-transaction.
+    #[test]
+    fn validate_finite_blocks_nan_in_checkin_to_booking_execute_inputs() {
+        let result = super::super::helpers::validate_finite(&[
+            ("price_per_night_baht", f64::NAN),
+            ("price_total_baht", 1780.0),
+        ]);
+        let err = result.expect_err("NaN must be rejected");
+        assert!(err.to_string().contains("price_per_night_baht"));
+    }
+
+    #[test]
+    fn validate_finite_blocks_infinity_in_checkin_to_booking_execute_inputs() {
+        let result = super::super::helpers::validate_finite(&[
+            ("price_per_night_baht", 890.0),
+            ("price_total_baht", f64::NEG_INFINITY),
+        ]);
+        let err = result.expect_err("Infinity must be rejected");
+        assert!(err.to_string().contains("price_total_baht"));
     }
 
     #[test]
