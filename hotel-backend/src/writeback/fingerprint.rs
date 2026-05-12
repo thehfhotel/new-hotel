@@ -431,6 +431,57 @@ async fn fetch_live_columns(pool: &DbPool) -> WritebackResult<Vec<(String, i32, 
     Ok(out)
 }
 
+/// Audit Wave 6 LOW item 8 — Ville cutover safety predicate.
+///
+/// Returns `Err` when the collation name contains `_CS_` (case-sensitive).
+/// Pure function extracted so unit tests can exercise the rejection logic
+/// without a live MSSQL connection.
+fn collation_safety_check(collation: &str) -> WritebackResult<()> {
+    if collation.contains("_CS_") {
+        return Err(WritebackError::Config(format!(
+            "Legacy server collation is case-sensitive ({collation}) — \
+             writeback recipes assume case-insensitive (Thai_CI_AS). Refusing \
+             to start to prevent silent SQL filter mismatches on a fresh Ville \
+             cutover. Restore the database with COLLATE Thai_CI_AS or another \
+             _CI_ collation before retrying."
+        )));
+    }
+    Ok(())
+}
+
+/// Audit Wave 6 LOW item 8 — Ville cutover safety check.
+///
+/// Refuse to start the writeback worker if the server-level collation is
+/// **case-sensitive** (`_CS_`). Every string literal in our recipes is
+/// pinned to the case the .NET app emits (e.g. `'จอง'`, `'เข้าพัก'`,
+/// `Cust_no` not `cust_no`); a case-sensitive collation would silently
+/// fork our writes from the legacy app's filters on the day someone
+/// stands up a fresh Ville instance with the wrong collation. This check
+/// fails fast at startup so the misconfiguration is impossible to miss.
+///
+/// HF Hotel + HF Ville both run `Thai_CI_AS` (case-insensitive, accent-
+/// sensitive) per the Ville-upgrade decision documented in
+/// `MEMORY.md::ville_constraint`. We treat anything else with `_CS_` in
+/// the name as a hard refusal; other deviations (different language
+/// prefix, `_AS` vs `_AI`) log a WARN but don't block — the case
+/// distinction is the one that breaks recipes byte-for-byte.
+pub async fn verify_legacy_collation_safety(pool: &DbPool) -> WritebackResult<()> {
+    let mut conn = pool.get().await?;
+    let stream = conn
+        .simple_query("SELECT CAST(SERVERPROPERTY('Collation') AS NVARCHAR(128)) AS c")
+        .await?;
+    let rows: Vec<Row> = stream.into_first_result().await?;
+    let row = rows.first().ok_or_else(|| {
+        WritebackError::Config("SERVERPROPERTY('Collation') returned no rows".into())
+    })?;
+    let collation: &str = row
+        .get(0)
+        .ok_or_else(|| WritebackError::Config("Collation column missing".into()))?;
+    collation_safety_check(collation)?;
+    tracing::info!(collation, "Legacy MSSQL collation OK (not case-sensitive)");
+    Ok(())
+}
+
 /// Suppress the unused-import warning on `Query` — kept for the future
 /// CT-watcher bin that lives in the same crate.
 #[allow(dead_code)]
@@ -568,5 +619,53 @@ mod tests {
         assert_eq!(rows.len(), 8);
         assert!(rows.iter().any(|(_, _, c, _)| *c == "room_before"));
         assert!(rows.iter().any(|(_, _, c, _)| *c == "room_after"));
+    }
+
+    // --- Wave 6 LOW item 8 — collation safety check ---
+
+    #[test]
+    fn collation_safety_accepts_case_insensitive_thai() {
+        // Production collation on both HF Hotel + HF Ville (verified
+        // 2026-04-29 Ville upgrade — MEMORY.md::ville_constraint).
+        assert!(collation_safety_check("Thai_CI_AS").is_ok());
+    }
+
+    #[test]
+    fn collation_safety_accepts_other_case_insensitive_variants() {
+        // Other plausible _CI_ collations a future env might use. None
+        // contain `_CS_` so all must pass.
+        for ok in [
+            "Thai_CI_AI",
+            "SQL_Latin1_General_CP1_CI_AS",
+            "Latin1_General_100_CI_AS_SC",
+        ] {
+            assert!(
+                collation_safety_check(ok).is_ok(),
+                "expected {ok:?} to be accepted (no `_CS_`)"
+            );
+        }
+    }
+
+    #[test]
+    fn collation_safety_rejects_case_sensitive_thai() {
+        let err = collation_safety_check("Thai_CS_AS").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("case-sensitive"));
+        assert!(msg.contains("Thai_CS_AS"));
+        assert!(msg.contains("Refusing"));
+    }
+
+    #[test]
+    fn collation_safety_rejects_any_cs_variant() {
+        for bad in [
+            "Thai_CS_AS",
+            "SQL_Latin1_General_CP1_CS_AS",
+            "Latin1_General_100_CS_AS_SC",
+        ] {
+            assert!(
+                collation_safety_check(bad).is_err(),
+                "expected {bad:?} to be rejected (contains `_CS_`)"
+            );
+        }
     }
 }

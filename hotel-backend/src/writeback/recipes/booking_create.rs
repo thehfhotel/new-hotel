@@ -49,7 +49,7 @@
 //! Departure on `HT_Book_Ds.Book_Room_End` is `'11:59:59 AM'` — convenient
 //! for date-range BETWEEN queries (per spike §3b).
 
-use chrono::{DateTime, Datelike, Days, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 
 use crate::outbox::intent::CreateBookingPayload;
 use crate::writeback::allocate::{
@@ -62,9 +62,10 @@ use crate::writeback::constants::{
     ROOM_STATUS_RESERVED,
 };
 use crate::writeback::dispatcher::LegacyIds;
-use crate::writeback::error::WritebackResult;
+use crate::writeback::error::{WritebackError, WritebackResult};
 use crate::writeback::format::{
-    date_to_ole_serial, format_legacy_date, format_legacy_datetime, sql_quote,
+    date_to_ole_serial, end_of_stay_at_almost_noon, enumerate_calendar_nights, format_legacy_date,
+    format_legacy_datetime, sql_quote,
 };
 
 /// Inputs for the booking-create recipe.
@@ -185,6 +186,14 @@ pub fn build_statements(inputs: &CreateBookingInputs<'_>) -> Vec<String> {
 
     // 3. HT_Book_Ds — Book_Room_Type stores ROOM NUMBER (per §3b finding)
     //    id is IDENTITY → omit from column list.
+    //
+    // Wave 6 LOW item 4: money values rendered with 2dp for consistency with
+    // the HT_Book_H price columns and the HT_Receipt_H formatting (Wave 2
+    // H4 / `money_2dp`). The legacy app emits `890` (no decimals) here, but
+    // the columns are float-typed so `890.00` is operationally identical;
+    // pinning the unified shape keeps recipes mutually consistent.
+    let book_ds_price_2dp = format!("{:.2}", inputs.price_baht);
+    let book_ds_total_2dp = format!("{:.2}", inputs.price_baht * inputs.nights as f64);
     statements.push(format!(
         "INSERT INTO [HT_Book_Ds]([Book_No],[Book_Room_Type],[Book_Room_Start],[Book_Room_End],\
          [Book_Room_Price],[Book_Room_Night],[Book_Room_Num],[Book_Room_PriceToTal],\
@@ -192,9 +201,9 @@ pub fn build_statements(inputs: &CreateBookingInputs<'_>) -> Vec<String> {
          {price},{nights},1,{total},'',{status})",
         start = stay_start_actual_q,
         end = stay_end_actual_q,
-        price = inputs.price_baht,
+        price = book_ds_price_2dp,
         nights = inputs.nights,
-        total = inputs.price_baht * inputs.nights as f64,
+        total = book_ds_total_2dp,
         status = BOOK_DS_STATUS_ACTIVE,
     ));
 
@@ -288,57 +297,22 @@ pub fn build_statements(inputs: &CreateBookingInputs<'_>) -> Vec<String> {
     statements
 }
 
-/// Snap a stay-end DateTime to `11:59:59 AM` of the same Bangkok calendar day.
-/// Per spike §3b — convenient for date-range BETWEEN queries. Uses Bangkok
-/// time to determine the calendar day (a 17:00Z instant is the *next* day in
-/// Bangkok, so `date_naive()` on UTC would return the wrong day).
-pub fn end_of_stay_at_almost_noon(stay_end: DateTime<Utc>) -> DateTime<Utc> {
-    use chrono_tz::Asia::Bangkok;
-    let bkk_date = stay_end.with_timezone(&Bangkok).date_naive();
-    let bkk_target = bkk_date
-        .and_hms_opt(11, 59, 59)
-        .expect("11:59:59 is a valid time");
-    Bangkok
-        .from_local_datetime(&bkk_target)
-        .single()
-        .expect("11:59:59 is unambiguous in Asia/Bangkok (no DST)")
-        .with_timezone(&Utc)
-}
-
-/// Enumerate Bangkok calendar nights in `[stay_start, stay_end)`. Each becomes
-/// one `HT_Book_Date` row. The boundaries are the Bangkok calendar day, not
-/// the UTC one — a 17:00Z instant is already the next day in Bangkok.
-pub fn enumerate_calendar_nights(
-    stay_start: DateTime<Utc>,
-    stay_end: DateTime<Utc>,
-) -> Vec<NaiveDate> {
-    use chrono_tz::Asia::Bangkok;
-    let start = stay_start.with_timezone(&Bangkok).date_naive();
-    let end = stay_end.with_timezone(&Bangkok).date_naive();
-    let mut nights = Vec::new();
-    let mut day = start;
-    while day < end {
-        nights.push(day);
-        day = match day.checked_add_days(Days::new(1)) {
-            Some(d) => d,
-            None => break,
-        };
-        if nights.len() > 365 {
-            break;
-        }
-    }
-    if nights.is_empty() {
-        // Single-day stay (departure same calendar day) — still record one night
-        nights.push(start);
-    }
-    nights
-}
-
 /// Execute the create-booking recipe.
 pub async fn execute(
     conn: &mut LegacyConn<'_>,
     payload: &CreateBookingPayload,
 ) -> WritebackResult<LegacyIds> {
+    // Wave 6 LOW item 5: hard-validate `nights >= 1` instead of silently
+    // clamping via `.max(1)`. The service layer should reject this at
+    // enqueue time; this is defense-in-depth so a caller bug surfaces as a
+    // `Recipe` error before any TABLOCKX allocation runs.
+    if payload.nights < 1 {
+        return Err(WritebackError::Recipe(format!(
+            "CreateBooking: nights must be >= 1 (got {})",
+            payload.nights
+        )));
+    }
+
     // Allocate IDs under TABLOCKX, in dependency order.
     let cust_no = match payload.legacy_cust_no.as_deref() {
         Some(existing) => existing.to_string(),
@@ -355,8 +329,10 @@ pub async fn execute(
     // TABLOCKX, same lock pattern as the other counters.
     let room_status_id_base = allocate_room_status_id(conn).await?;
 
-    let nights_calendar = enumerate_calendar_nights(payload.stay.start, payload.stay.end);
-    let nights = payload.nights.max(1);
+    // Wave 6 LOW item 6: empty range now surfaces as an error rather than
+    // silently injecting a phantom night. A cap-truncate logs a WARN.
+    let nights_calendar = enumerate_calendar_nights(payload.stay.start, payload.stay.end)?;
+    let nights = payload.nights;
     let price_baht = (payload.price.as_satang() as f64) / 100.0;
 
     // HIGH-4: defense-in-depth NaN/Infinity guard. Money-derived f64s are
@@ -408,6 +384,7 @@ pub async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     fn sample_inputs() -> CreateBookingInputs<'static> {
         CreateBookingInputs {
@@ -750,12 +727,17 @@ mod tests {
         assert!(cust.contains("'0900000088'"));
     }
 
+    /// Wave 6 LOW items 1 + 6: enumerate_calendar_nights now lives in
+    /// `writeback::format` and returns a Result so the empty-range and
+    /// cap-truncate guards surface. The functional cases below confirm the
+    /// per-recipe import still produces the right nights for booking-create.
     #[test]
     fn enumerate_calendar_nights_handles_one_night() {
         let nights = enumerate_calendar_nights(
             Utc.with_ymd_and_hms(2026, 4, 25, 12, 0, 0).unwrap(),
             Utc.with_ymd_and_hms(2026, 4, 26, 12, 0, 0).unwrap(),
-        );
+        )
+        .unwrap();
         assert_eq!(nights, vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()]);
     }
 
@@ -764,7 +746,8 @@ mod tests {
         let nights = enumerate_calendar_nights(
             Utc.with_ymd_and_hms(2026, 4, 25, 12, 0, 0).unwrap(),
             Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 0).unwrap(),
-        );
+        )
+        .unwrap();
         assert_eq!(
             nights,
             vec![

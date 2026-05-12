@@ -177,9 +177,11 @@ pub fn build_statements(
     // 2. Per-room apportionment — spike §3h `invoice/writes.txt:3`. Fires
     //    immediately before the HT_CheckIn_Pay INSERT. Only emitted when the
     //    route resolved a specific `HT_CheckIn_Ds.id`.
+    // Wave 6 LOW item 4: 2dp for consistency with the HT_CheckIn_Pay /
+    // HT_Receipt_H formatting throughout this recipe.
     if let Some(ds_id) = inputs.checkin_ds_id {
         statements.push(format!(
-            "update [HT_CheckIn_Ds] SET  [Cin_Room_Pay_Total]={amount},[Cin_note]='' where id={ds_id}"
+            "update [HT_CheckIn_Ds] SET  [Cin_Room_Pay_Total]={amount_2dp},[Cin_note]='' where id={ds_id}"
         ));
     }
 
@@ -236,9 +238,10 @@ pub fn build_statements(
     //    the booking_create / extend_stay recipes own). We additively update
     //    Pay and recompute Balance = Net - Pay, leaving Room/Net/Product
     //    alone.
+    // Wave 6 LOW item 4: 2dp for consistency.
     statements.push(format!(
-        "UPDATE [HT_CheckIn_H] SET [Total_Price_Pay]=ISNULL([Total_Price_Pay],0)+{amount},\
-         [Total_Price_Balance]=ISNULL([Total_Price_Net],0)-(ISNULL([Total_Price_Pay],0)+{amount}) \
+        "UPDATE [HT_CheckIn_H] SET [Total_Price_Pay]=ISNULL([Total_Price_Pay],0)+{amount_2dp},\
+         [Total_Price_Balance]=ISNULL([Total_Price_Net],0)-(ISNULL([Total_Price_Pay],0)+{amount_2dp}) \
          where [Cin_no]={cin_no_q}"
     ));
 
@@ -247,8 +250,9 @@ pub fn build_statements(
     //    still increments `Total_Price_vat` by the payment amount on every
     //    invoice. Emit it for parity so reports that aggregate this column
     //    match the legacy app's running total.
+    // Wave 6 LOW item 4: 2dp for consistency.
     statements.push(format!(
-        "update HT_CheckIn_H set Total_Price_vat=Total_Price_vat+{amount} where Cin_no={cin_no_q}"
+        "update HT_CheckIn_H set Total_Price_vat=Total_Price_vat+{amount_2dp} where Cin_no={cin_no_q}"
     ));
 
     // 6. HT_Receipt_H — receipt header. 20-column canonical order
@@ -549,7 +553,8 @@ mod tests {
             .iter()
             .find(|s| s.contains("Total_Price_vat=Total_Price_vat+"))
             .expect("VAT accumulator UPDATE must be emitted");
-        assert!(vat.contains("Total_Price_vat=Total_Price_vat+801"));
+        // Wave 6 LOW item 4: 2dp money formatting (was raw `801`).
+        assert!(vat.contains("Total_Price_vat=Total_Price_vat+801.00"));
         assert!(vat.contains("Cin_no='CH26-005236'"));
     }
 
@@ -557,10 +562,11 @@ mod tests {
     fn checkin_h_totals_accumulate_payment_per_high3() {
         let s = build_statements(&sample_inputs()).unwrap();
         let upd = s.iter().find(|s| s.contains("UPDATE [HT_CheckIn_H]")).unwrap();
-        assert!(upd.contains("[Total_Price_Pay]=ISNULL([Total_Price_Pay],0)+801"));
+        // Wave 6 LOW item 4: 2dp money formatting (was raw `801`).
+        assert!(upd.contains("[Total_Price_Pay]=ISNULL([Total_Price_Pay],0)+801.00"));
         assert!(upd.contains(
             "[Total_Price_Balance]=ISNULL([Total_Price_Net],0)-\
-             (ISNULL([Total_Price_Pay],0)+801)"
+             (ISNULL([Total_Price_Pay],0)+801.00)"
         ));
         assert!(!upd.contains("[Total_Price_Room]="));
         assert!(!upd.contains("[Total_Price_Net]=ISNULL"));

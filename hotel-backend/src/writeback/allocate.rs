@@ -90,8 +90,25 @@ fn validate_allocator_prefix(prefix: &str) -> WritebackResult<()> {
 /// Convenience alias — the type bb8 hands out for our legacy connection.
 pub type LegacyConn<'a> = PooledConnection<'a, ConnectionManager>;
 
+/// Approaching-wrap threshold for i32 allocators (audit Wave 6 LOW item 7).
+///
+/// Several legacy `id` columns (`HT_Book_Date.id`, `HT_CheckIn_Ds.id`,
+/// `HT_Receipt_H.id`, `HT_Room_Status.id`, `HT_Rooms_Cancel.id`,
+/// `HT_Customers.id`) are typed `int` and decoded as Rust `i32`. The .NET
+/// app has been writing to these tables for over a decade and at ~15k
+/// receipts/year the absolute counts are well under 1M today, so wrap is
+/// not imminent. But once the value approaches `i32::MAX / 2`
+/// (≈1.07 billion) we want a WARN every allocation so ops can plan a
+/// migration to `bigint` before the column overflows. No hard error —
+/// failing the allocator would block writeback entirely on a column we
+/// don't own the schema of.
+const I32_WRAP_WARN_THRESHOLD: i32 = i32::MAX / 2;
+
 /// Internal helper — run a `SELECT ISNULL(MAX(...), 0) + 1` query under
 /// `TABLOCKX, HOLDLOCK` and return the result.
+///
+/// Audit Wave 6 LOW item 7: logs a WARN when the next value approaches
+/// `i32::MAX / 2` so operators get visibility before any column overflows.
 async fn select_next_int_with_lock(
     conn: &mut LegacyConn<'_>,
     sql: &str,
@@ -104,6 +121,15 @@ async fn select_next_int_with_lock(
     let next: i32 = row
         .get(0)
         .ok_or_else(|| WritebackError::Recipe(format!("MAX+1 column was NULL: {sql}")))?;
+    if next > I32_WRAP_WARN_THRESHOLD {
+        tracing::warn!(
+            next,
+            threshold = I32_WRAP_WARN_THRESHOLD,
+            i32_max = i32::MAX,
+            sql,
+            "allocator: i32 id column approaching wrap — plan a bigint migration",
+        );
+    }
     Ok(next)
 }
 
@@ -547,6 +573,20 @@ mod tests {
         // Five trailing digits is the next-most-likely typo (forgetting the
         // `-`); reject to keep the format invariant tight.
         assert!(validate_allocator_prefix("R12345-").is_err());
+    }
+
+    /// Wave 6 LOW item 7: confirm the i32-wrap warning threshold is set at
+    /// half of `i32::MAX`. The actual WARN log emission is checked by
+    /// `select_next_int_with_lock` callers in live MSSQL; this test pins
+    /// the threshold constant so an accidental edit (e.g. dropping a digit
+    /// in the constant value) surfaces immediately.
+    #[test]
+    fn i32_wrap_warn_threshold_is_half_of_i32_max() {
+        assert_eq!(I32_WRAP_WARN_THRESHOLD, i32::MAX / 2);
+        // Sanity: threshold must be a real, large positive number — not 0 or
+        // a stray negative from an arithmetic typo.
+        assert!(I32_WRAP_WARN_THRESHOLD > 1_000_000_000);
+        assert!(I32_WRAP_WARN_THRESHOLD < i32::MAX);
     }
 
     #[test]

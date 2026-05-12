@@ -60,6 +60,15 @@ pub fn build_statements(book_id: &str) -> Vec<String> {
         // the bulk DELETE removes all rows for the booking in one
         // statement. Per-room emission is a TODO when multi-room
         // tracking lands; the end state is identical either way.
+        //
+        // ⚠️ INTENTIONAL: `delete from  HT_Book_Date` has TWO spaces between
+        // `from` and the table name. This is verbatim from the spike capture
+        // (`booking-cancel-20260424-103158/writes.txt:9`) and pinned by the
+        // byte-parity test below. Do NOT normalize to a single space —
+        // future formatter / clippy autofixes that "clean up" the whitespace
+        // would break the parity assertion and silently fork our SQL from
+        // the legacy .NET app's emitted form. Wave 6 LOW item 3 documents
+        // this pin.
         format!("delete from  HT_Book_Date where Book_no={book_id_q}"),
         // 5. Duplicate UPDATE HT_Book_H (lowercase column names — preserved for parity)
         format!(

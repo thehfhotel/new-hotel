@@ -42,7 +42,7 @@
 //! - `Cin_Room_Out` is the canonical departure time the user picked. Format
 //!   matches the legacy app's `12:00:00 PM` convention.
 
-use chrono::{DateTime, Datelike, Days, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 
 use crate::domain::shared::Money;
 use crate::writeback::allocate::{allocate_room_status_id, LegacyConn};
@@ -50,7 +50,8 @@ use crate::writeback::constants::{CIN_ROOM_STATUS_OCCUPYING, ROOM_STATUS_OCCUPYI
 use crate::writeback::dispatcher::LegacyIds;
 use crate::writeback::error::WritebackResult;
 use crate::writeback::format::{
-    date_to_ole_serial, format_legacy_date, format_legacy_datetime, sql_quote,
+    date_to_ole_serial, enumerate_calendar_nights, format_legacy_date, format_legacy_datetime,
+    sql_quote,
 };
 
 /// Inputs for the extend-stay recipe.
@@ -124,12 +125,14 @@ pub fn build_statements(inputs: &ExtendStayInputs<'_>) -> Vec<String> {
         "delete from HT_Room_Status where room_CheckIn_No={cin_no_q}"
     ));
     // 3. Update HT_CheckIn_H totals
+    // Wave 6 LOW item 4: 2dp for consistency with the HT_CheckIn_H create
+    // path (`walkin::build_statements`).
     statements.push(format!(
-        "UPDATE [HT_CheckIn_H] SET  [Total_Price_Room]={room_price},\
-         [Total_Price_Product]={product},\
-         [Total_Price_Net]={net},\
-         [Total_Price_Pay]={pay},\
-         [Total_Price_Balance]={balance} \
+        "UPDATE [HT_CheckIn_H] SET  [Total_Price_Room]={room_price:.2},\
+         [Total_Price_Product]={product:.2},\
+         [Total_Price_Net]={net:.2},\
+         [Total_Price_Pay]={pay:.2},\
+         [Total_Price_Balance]={balance:.2} \
          where [Cin_no]={cin_no_q}",
         room_price = inputs.new_room_price_total,
         product = inputs.product_total,
@@ -140,7 +143,7 @@ pub fn build_statements(inputs: &ExtendStayInputs<'_>) -> Vec<String> {
     // 4. Update HT_CheckIn_Ds (by id) with new nights + price + departure
     statements.push(format!(
         "update [HT_CheckIn_Ds] SET  [Cin_Room_night]={nights},\
-         [Cin_Room_PriceTotal]={price_total},[Cin_note]='',\
+         [Cin_Room_PriceTotal]={price_total:.2},[Cin_note]='',\
          [Cin_Room_Out]={new_end_q} where id={ds_id}",
         nights = inputs.new_nights,
         price_total = inputs.new_room_price_total,
@@ -198,7 +201,9 @@ pub async fn execute(
     // writers can't collide.
     let id_base = allocate_room_status_id(conn).await?;
 
-    let nights = enumerate_calendar_nights(stay_start, new_end);
+    // Wave 6 LOW item 6: empty range surfaces as error rather than silently
+    // injecting a phantom night; cap-truncate logs WARN.
+    let nights = enumerate_calendar_nights(stay_start, new_end)?;
     let _ = (Datelike::year(&new_end.date_naive()),); // silence unused-import lint
 
     // HIGH-4: reject NaN/Infinity before SQL formatting.
@@ -234,32 +239,6 @@ pub async fn execute(
     let statements = build_statements(&inputs);
     super::execute_all(conn, &statements).await?;
     Ok(LegacyIds::new().with_cin_no(cin_no.to_string()))
-}
-
-/// Enumerate calendar nights in `[stay_start, new_end)` — one
-/// `HT_Room_Status` row per night. Capped at 365 nights as a safety net.
-fn enumerate_calendar_nights(
-    stay_start: DateTime<Utc>,
-    new_end: DateTime<Utc>,
-) -> Vec<NaiveDate> {
-    let start = crate::writeback::format::bangkok_date(stay_start);
-    let end = crate::writeback::format::bangkok_date(new_end);
-    let mut nights = Vec::new();
-    let mut day = start;
-    while day < end {
-        nights.push(day);
-        day = match day.checked_add_days(Days::new(1)) {
-            Some(d) => d,
-            None => break,
-        };
-        if nights.len() > 365 {
-            break;
-        }
-    }
-    if nights.is_empty() {
-        nights.push(start);
-    }
-    nights
 }
 
 fn money_to_baht_f64(m: Money) -> f64 {
@@ -363,13 +342,17 @@ mod tests {
         assert!(statements[1].contains("Cin_No='CH26-005230'"));
     }
 
+    /// Wave 6: enumerate_calendar_nights now lives in `writeback::format`
+    /// and returns Result. Keep the extend-stay-specific coverage; the
+    /// empty-range / cap-truncate guards are tested in `format.rs`.
     #[test]
     fn enumerate_calendar_nights_covers_full_extended_range() {
         // Stay started Apr 24, extend to Apr 27 → 3 nights (24, 25, 26).
         let nights = enumerate_calendar_nights(
             Utc.with_ymd_and_hms(2026, 4, 24, 12, 0, 0).unwrap(),
             Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 0).unwrap(),
-        );
+        )
+        .unwrap();
         assert_eq!(
             nights,
             vec![

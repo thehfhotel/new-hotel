@@ -38,4 +38,6 @@ pub mod recipes;
 
 pub use dispatcher::{dispatch, DispatchContext, LegacyIds, ResolvedJob};
 pub use error::{WritebackError, WritebackResult};
-pub use fingerprint::{verify_schema_fingerprint, EXPECTED_FINGERPRINT};
+pub use fingerprint::{
+    verify_legacy_collation_safety, verify_schema_fingerprint, EXPECTED_FINGERPRINT,
+};

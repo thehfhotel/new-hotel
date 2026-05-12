@@ -12,7 +12,7 @@
 //!   `varchar` columns are nullable but the .NET WinForms controls misbehave
 //!   on NULL, so we always send empty string.
 
-use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, Days, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc};
 use chrono_tz::Asia::Bangkok;
 
 /// Format a `DateTime<Utc>` into the legacy app's `M/D/YYYY h:mm:ss tt`
@@ -199,6 +199,78 @@ pub fn midnight_of(dt: DateTime<Utc>) -> DateTime<Utc> {
         .with_timezone(&Utc)
 }
 
+/// Snap a stay-end `DateTime<Utc>` to `11:59:59 AM` of the same Bangkok
+/// calendar day. Per spike §3b — convenient for date-range BETWEEN queries
+/// (`HT_Book_Ds.Book_Room_End`, etc.). Uses Bangkok time to determine the
+/// calendar day (a 17:00Z instant is the *next* day in Bangkok, so
+/// `date_naive()` on the raw UTC instant would return the wrong day).
+///
+/// Wave 6 de-duplication target — was previously defined identically in
+/// `booking_create.rs` and `booking_modify.rs`; the shared definition lives
+/// here next to [`midnight_of`].
+pub fn end_of_stay_at_almost_noon(stay_end: DateTime<Utc>) -> DateTime<Utc> {
+    let bkk_date = stay_end.with_timezone(&Bangkok).date_naive();
+    let bkk_target = bkk_date
+        .and_hms_opt(11, 59, 59)
+        .expect("11:59:59 is a valid time");
+    Bangkok
+        .from_local_datetime(&bkk_target)
+        .single()
+        .expect("11:59:59 is unambiguous in Asia/Bangkok (no DST)")
+        .with_timezone(&Utc)
+}
+
+/// Enumerate Bangkok calendar nights spanning `[stay_start, stay_end)`. Each
+/// night becomes one `HT_Book_Date` / `HT_Room_Status` row in the recipes
+/// that consume this. Boundaries are the Bangkok calendar day, not the UTC
+/// one (a 17:00Z instant is already the next day in Bangkok).
+///
+/// Wave 6 de-duplication target — was defined identically (with minor
+/// trivial differences) in `booking_create.rs`, `booking_modify.rs`,
+/// `walkin.rs`, `checkin_to_booking.rs`, and `extend_stay.rs`.
+///
+/// **Safety nets** (Wave 6 LOW item 6 — was silent in earlier copies):
+/// * The range is capped at 365 nights. Hitting the cap logs a WARN; the
+///   truncated vec is still returned (preserves the prior behaviour of
+///   never aborting allocation of `HT_Room_Status` ids).
+/// * An empty range (`stay_end <= stay_start` in Bangkok) returns an error
+///   so a caller bug surfaces immediately. Earlier copies silently injected
+///   a phantom single-night row, which was masking the bug at the cost of
+///   writing one ghost calendar row to MSSQL.
+pub fn enumerate_calendar_nights(
+    stay_start: DateTime<Utc>,
+    stay_end: DateTime<Utc>,
+) -> Result<Vec<NaiveDate>, crate::writeback::error::WritebackError> {
+    const NIGHT_CAP: usize = 365;
+    let start = bangkok_date(stay_start);
+    let end = bangkok_date(stay_end);
+    if end <= start {
+        return Err(crate::writeback::error::WritebackError::Recipe(format!(
+            "enumerate_calendar_nights: empty range — stay_start {start} must be \
+             strictly before stay_end {end} (Bangkok calendar)"
+        )));
+    }
+    let mut nights = Vec::new();
+    let mut day = start;
+    while day < end {
+        nights.push(day);
+        if nights.len() >= NIGHT_CAP {
+            tracing::warn!(
+                stay_start = %start,
+                stay_end = %end,
+                cap = NIGHT_CAP,
+                "enumerate_calendar_nights hit night cap — truncating",
+            );
+            break;
+        }
+        day = match day.checked_add_days(Days::new(1)) {
+            Some(d) => d,
+            None => break,
+        };
+    }
+    Ok(nights)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,5 +414,81 @@ mod tests {
         // Midnight of that Bangkok day = Bangkok 00:00 on 4/25 = UTC 17:00 on 4/24
         let dt = Utc.with_ymd_and_hms(2026, 4, 24, 18, 0, 0).unwrap();
         assert_eq!(format_legacy_datetime(midnight_of(dt)), "4/25/2026 12:00:00 AM");
+    }
+
+    /// Wave 6: shared helper snaps to the Bangkok 11:59:59 of the same day.
+    /// Mirrors the prior per-recipe implementations exactly.
+    #[test]
+    fn end_of_stay_at_almost_noon_snaps_to_bangkok_almost_noon() {
+        // Bangkok 14:30 on 4/26 → Bangkok 11:59:59 on 4/26 = UTC 04:59:59
+        let dt = Utc.with_ymd_and_hms(2026, 4, 26, 7, 30, 0).unwrap();
+        let snapped = end_of_stay_at_almost_noon(dt);
+        assert_eq!(format_legacy_datetime(snapped), "4/26/2026 11:59:59 AM");
+    }
+
+    /// Wave 6: enumerate_calendar_nights one-night case (overnight stay).
+    #[test]
+    fn enumerate_calendar_nights_handles_overnight() {
+        // Bangkok noon 4/24 → Bangkok noon 4/25 = one night [4/24, 4/25)
+        let nights = enumerate_calendar_nights(
+            Utc.with_ymd_and_hms(2026, 4, 24, 5, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 4, 25, 5, 0, 0).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(nights, vec![NaiveDate::from_ymd_opt(2026, 4, 24).unwrap()]);
+    }
+
+    /// Wave 6: enumerate_calendar_nights multi-night case.
+    #[test]
+    fn enumerate_calendar_nights_handles_three_nights() {
+        let nights = enumerate_calendar_nights(
+            Utc.with_ymd_and_hms(2026, 4, 24, 5, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 4, 27, 5, 0, 0).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            nights,
+            vec![
+                NaiveDate::from_ymd_opt(2026, 4, 24).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 4, 25).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 4, 26).unwrap(),
+            ]
+        );
+    }
+
+    /// Wave 6 LOW item 6: an empty range surfaces as a Recipe error rather
+    /// than silently injecting a phantom night. Earlier per-recipe copies
+    /// pushed `start` onto the result and pressed on — that masked caller
+    /// bugs at the cost of one ghost `HT_Book_Date` row in MSSQL.
+    #[test]
+    fn enumerate_calendar_nights_empty_range_errors() {
+        // stay_end == stay_start → no nights → error
+        let now = Utc.with_ymd_and_hms(2026, 4, 25, 5, 0, 0).unwrap();
+        let err = enumerate_calendar_nights(now, now).unwrap_err();
+        assert!(
+            err.to_string().contains("empty range"),
+            "expected 'empty range' in error, got: {err}"
+        );
+    }
+
+    /// Wave 6 LOW item 6: stay_end strictly before stay_start also errors
+    /// (same root cause — caller passed an inverted range).
+    #[test]
+    fn enumerate_calendar_nights_inverted_range_errors() {
+        let later = Utc.with_ymd_and_hms(2026, 4, 26, 5, 0, 0).unwrap();
+        let earlier = Utc.with_ymd_and_hms(2026, 4, 25, 5, 0, 0).unwrap();
+        let err = enumerate_calendar_nights(later, earlier).unwrap_err();
+        assert!(err.to_string().contains("empty range"));
+    }
+
+    /// Wave 6 LOW item 6: the 365-night cap holds. Returns 365 entries with
+    /// the cap-truncate WARN logged (test only asserts the count).
+    #[test]
+    fn enumerate_calendar_nights_caps_at_365() {
+        // 400 calendar days in Bangkok between these two instants.
+        let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2027, 2, 5, 0, 0, 0).unwrap();
+        let nights = enumerate_calendar_nights(start, end).unwrap();
+        assert_eq!(nights.len(), 365, "must truncate at 365-night cap");
     }
 }

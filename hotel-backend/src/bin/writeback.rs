@@ -47,7 +47,8 @@ use hotel_backend::db::{create_pool, DbPool};
 use hotel_backend::notifications::slack::{SlackClient, SlackMessage};
 use hotel_backend::outbox::intent::WritebackIntent;
 use hotel_backend::writeback::{
-    dispatch, verify_schema_fingerprint, DispatchContext, ResolvedJob, WritebackError,
+    dispatch, verify_legacy_collation_safety, verify_schema_fingerprint, DispatchContext,
+    ResolvedJob, WritebackError,
 };
 
 /// PG channel name the service layer NOTIFYs after enqueueing a writeback job.
@@ -220,6 +221,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
         None
     };
+
+    // 4b1. Wave 6 LOW item 8 — Ville cutover safety: refuse to start on a
+    //      case-sensitive collation. Recipes pin every string literal to
+    //      the case the .NET app emits; a `_CS_` collation would silently
+    //      fork our SQL filters on a fresh Ville cutover. Cheap one-row
+    //      SELECT — runs before the fingerprint check so a misconfigured
+    //      Ville fails fast at startup.
+    if let Err(e) = verify_legacy_collation_safety(&mssql).await {
+        tracing::error!(
+            site = %site.id,
+            error = %e,
+            "Legacy MSSQL collation check failed — refusing to start"
+        );
+        if let Some(slack) = &slack {
+            let msg = SlackMessage::with_site_text(
+                &site.id,
+                format!(
+                    ":warning: *Writeback worker REFUSED TO START* :warning:\n\
+                     Legacy MSSQL collation is case-sensitive.\n\
+                     *Error:* `{e}`\n\
+                     _Recipes assume `Thai_CI_AS` (or any `_CI_` collation). \
+                     Restore the legacy DB with a case-insensitive collation \
+                     before retrying._"
+                ),
+            );
+            let _ = slack.send_message(&msg).await;
+        }
+        tracing::warn!(
+            site = %site.id,
+            "Sleeping 60s before exit to throttle Docker restart cadence"
+        );
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        return Err(format!("Legacy collation check failed: {e}").into());
+    }
 
     // 4b. Schema fingerprint guard — refuse to start on drift, but post
     //     a Slack alert first so the operator sees the failure even if

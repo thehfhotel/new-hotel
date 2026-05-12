@@ -82,11 +82,13 @@ pub fn build_statements(inputs: &CheckOutInputs<'_>) -> Vec<String> {
     let cin_status_q = sql_quote(CIN_ROOM_STATUS_CHECKED_OUT);
     let room_status_q = sql_quote(ROOM_STATUS_CHECKED_OUT);
     let ds_id = inputs.checkin_ds_id;
-    let room_price = inputs.room_price_total;
-    let product_total = inputs.product_total;
-    let net = inputs.net_total;
-    let pay = inputs.pay_total;
-    let balance = inputs.balance;
+    // Wave 6 LOW item 4: pre-format money to 2dp for consistency with the
+    // HT_CheckIn_H / HT_Receipt_H formatting that already uses 2dp.
+    let room_price = format!("{:.2}", inputs.room_price_total);
+    let product_total = format!("{:.2}", inputs.product_total);
+    let net = format!("{:.2}", inputs.net_total);
+    let pay = format!("{:.2}", inputs.pay_total);
+    let balance = format!("{:.2}", inputs.balance);
     let nights = inputs.nights;
     // Audit H2: Room_Use_Count must be bumped by the real nights count
     // (COMPAT_CHEATSHEET.md:289 / 1164), not always +1. Cast to i64 — the

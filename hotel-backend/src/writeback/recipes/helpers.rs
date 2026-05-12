@@ -44,6 +44,30 @@ pub fn mark_cupon_printed(cin_no: &str) -> String {
     )
 }
 
+/// Pick a Thai-or-English personal-prefix string for the
+/// `HT_CheckIn_Other_People.Cin_name` field based on the guest's country.
+///
+/// Heuristic: country starting with "TH" (case-insensitive) → `'นาย'`
+/// (Thai "Mr."), otherwise `'Mr.'`. The legacy capture shows mixed forms
+/// (`'นาย'`, `'น.ส.'`, `'นาง'`, `'Mr.'`, `'Mrs.'`, custom IDs like `'925'`);
+/// plumbing the actual `Cust_perfix` through the payload is a separate task
+/// — this heuristic is the minimum that preserves the Thai-vs-foreign
+/// distinction. Empty country falls back to `'Mr.'` (the safer non-Thai
+/// default).
+///
+/// Wave 6 de-duplication target — was previously defined identically in
+/// `walkin.rs` and `checkin_to_booking.rs`.
+pub fn guest_prefix_for_country(country: &str) -> &'static str {
+    let trimmed = country.trim();
+    if !trimmed.is_empty()
+        && (trimmed.eq_ignore_ascii_case("TH") || trimmed.to_ascii_uppercase().starts_with("TH"))
+    {
+        "นาย"
+    } else {
+        "Mr."
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +110,24 @@ mod tests {
     fn validate_finite_rejects_infinity() {
         assert!(validate_finite(&[("price", f64::INFINITY)]).is_err());
         assert!(validate_finite(&[("price", f64::NEG_INFINITY)]).is_err());
+    }
+
+    #[test]
+    fn guest_prefix_for_country_picks_thai_prefix_for_th_countries() {
+        assert_eq!(guest_prefix_for_country("TH"), "นาย");
+        assert_eq!(guest_prefix_for_country("Th"), "นาย");
+        assert_eq!(guest_prefix_for_country("th"), "นาย");
+        assert_eq!(guest_prefix_for_country("THA"), "นาย");
+        assert_eq!(guest_prefix_for_country("THAILAND"), "นาย");
+    }
+
+    #[test]
+    fn guest_prefix_for_country_falls_back_to_mr_for_others() {
+        assert_eq!(guest_prefix_for_country(""), "Mr.");
+        assert_eq!(guest_prefix_for_country("US"), "Mr.");
+        assert_eq!(guest_prefix_for_country("UK"), "Mr.");
+        assert_eq!(guest_prefix_for_country("JP"), "Mr.");
+        // Whitespace-only treated as empty.
+        assert_eq!(guest_prefix_for_country("   "), "Mr.");
     }
 }

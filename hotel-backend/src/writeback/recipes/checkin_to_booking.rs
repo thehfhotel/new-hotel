@@ -45,9 +45,10 @@ use crate::writeback::constants::{
     DEFAULT_OPERATOR, ROOM_STATUS_OCCUPYING,
 };
 use crate::writeback::dispatcher::LegacyIds;
-use crate::writeback::error::WritebackResult;
+use crate::writeback::error::{WritebackError, WritebackResult};
 use crate::writeback::format::{
-    date_to_ole_serial, format_legacy_date, format_legacy_datetime, sql_quote,
+    date_to_ole_serial, enumerate_calendar_nights, format_legacy_date, format_legacy_datetime,
+    sql_quote,
 };
 
 /// Inputs for the check-in-to-booking recipe.
@@ -105,12 +106,14 @@ pub fn build_statements(inputs: &CheckInToBookingInputs<'_>) -> Vec<String> {
     let book_status_q = sql_quote(BOOK_STATUS_OCCUPYING);
     let power_note = power_log_note_check_in(inputs.cin_no);
     let power_note_q = sql_quote(&power_note);
-    let registry_prefix = guest_prefix_for_country(inputs.guest_country);
+    let registry_prefix = super::helpers::guest_prefix_for_country(inputs.guest_country);
     let registry_name = format!("{registry_prefix} {} ", inputs.guest_name_for_registry);
     let registry_name_q = sql_quote(&registry_name);
     let country_q = sql_quote(inputs.guest_country);
-    let price = inputs.price_per_night_baht;
-    let total = inputs.price_total_baht;
+    // Wave 6 LOW item 4: pre-format money to 2dp for consistency with the
+    // HT_CheckIn_H VALUES and the rest of the recipe corpus.
+    let price = format!("{:.2}", inputs.price_per_night_baht);
+    let total = format!("{:.2}", inputs.price_total_baht);
     let nights = inputs.nights;
     let room_all_q = sql_quote(&format!("{} ", inputs.room_no));
 
@@ -248,6 +251,8 @@ pub fn build_statements(inputs: &CheckInToBookingInputs<'_>) -> Vec<String> {
     //     `[Cin_cust_price]`, mixed-case `[Cin_Date_Out]` and
     //     `[Cin_Type]` casing the legacy app emits. `[Cin_Type]=0`
     //     (integer); `[Cin_foreign]='False'` (literal string).
+    // Wave 6 LOW item 4: `total` is the pre-formatted 2dp string.
+    let total_2dp = total.as_str();
     statements.push(format!(
         "INSERT INTO [HT_CheckIn_H]([Cin_no],[Cin_Date],[Cin_Book_no],[Cin_cust_no],\
          [Cin_cust_price],[Cin_status],[Total_Price_Room],[Total_Price_Product],\
@@ -256,7 +261,6 @@ pub fn build_statements(inputs: &CheckInToBookingInputs<'_>) -> Vec<String> {
          VALUES({cin_no_q},{now_q},{book_id_q},{cust_no_q},{cust_price_q},{cin_status_q},\
          {total_2dp},0.00,{total_2dp},0.00,{total_2dp},'','',{room_all_q},{by_q},\
          {stay_start_q},{stay_end_q},0,'False')",
-        total_2dp = format!("{total:.2}"),
     ));
 
     // 11. HT_Cupon — mark loyalty coupon as printed (spike §3d,
@@ -266,21 +270,6 @@ pub fn build_statements(inputs: &CheckInToBookingInputs<'_>) -> Vec<String> {
 
     let _ = price; // silence: kept on inputs for future per-night reporting
     statements
-}
-
-/// Pick a Thai-or-English personal-prefix string for the
-/// `HT_CheckIn_Other_People.Cin_name` field — see `walkin::guest_prefix_for_country`
-/// for rationale. Mirrored here to keep the recipe self-contained
-/// (no cross-recipe dependency).
-fn guest_prefix_for_country(country: &str) -> &'static str {
-    let trimmed = country.trim();
-    if !trimmed.is_empty()
-        && (trimmed.eq_ignore_ascii_case("TH") || trimmed.to_ascii_uppercase().starts_with("TH"))
-    {
-        "นาย"
-    } else {
-        "Mr."
-    }
 }
 
 /// Execute the check-in-to-booking recipe.
@@ -299,8 +288,19 @@ pub async fn execute(
         ("price_total_baht", price_total_baht),
     ])?;
 
+    // Wave 6 LOW item 5: hard-validate `nights >= 1` instead of silently
+    // clamping via `.max(1)`. The service layer should reject this at
+    // enqueue time; this is defense-in-depth so a caller bug surfaces as a
+    // `Recipe` error before any TABLOCKX allocation runs.
+    if payload.nights < 1 {
+        return Err(WritebackError::Recipe(format!(
+            "CheckIn-to-booking: nights must be >= 1 (got {})",
+            payload.nights
+        )));
+    }
+
     let cust_no = payload.legacy_cust_no.clone().ok_or_else(|| {
-        crate::writeback::error::WritebackError::Recipe(
+        WritebackError::Recipe(
             "CheckIn-to-booking requires legacy_cust_no in payload (§3d: customer already exists)"
                 .into(),
         )
@@ -310,7 +310,9 @@ pub async fn execute(
     // HT_CheckIn_Ds.id is NOT IDENTITY (schema dump 2026-04-26).
     let checkin_ds_id = allocate_checkin_ds_id(conn).await?;
 
-    let nights_calendar = enumerate_calendar_nights(payload.stay.start, payload.stay.end);
+    // Wave 6 LOW item 6: empty range surfaces as error rather than silently
+    // injecting a phantom night; cap-truncate logs WARN.
+    let nights_calendar = enumerate_calendar_nights(payload.stay.start, payload.stay.end)?;
 
     // Wave 5b item 4: capture `Utc::now()` once at the entry to `execute()`
     // so `build_statements` is purely a function of its inputs.
@@ -333,7 +335,7 @@ pub async fn execute(
         stay_start: payload.stay.start,
         stay_end: payload.stay.end,
         price_per_night_baht,
-        nights: payload.nights.max(1),
+        nights: payload.nights,
         price_total_baht,
         room_status_id_base,
         nights_calendar,
@@ -354,30 +356,6 @@ pub async fn execute(
     ids.extra
         .insert("room_status_id_base".into(), serde_json::Value::from(room_status_id_base));
     Ok(ids)
-}
-
-fn enumerate_calendar_nights(
-    stay_start: DateTime<Utc>,
-    stay_end: DateTime<Utc>,
-) -> Vec<NaiveDate> {
-    let start = crate::writeback::format::bangkok_date(stay_start);
-    let end = crate::writeback::format::bangkok_date(stay_end);
-    let mut nights = Vec::new();
-    let mut day = start;
-    while day < end {
-        nights.push(day);
-        day = match day.succ_opt() {
-            Some(d) => d,
-            None => break,
-        };
-        if nights.len() > 365 {
-            break;
-        }
-    }
-    if nights.is_empty() {
-        nights.push(start);
-    }
-    nights
 }
 
 #[cfg(test)]

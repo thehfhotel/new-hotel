@@ -5,6 +5,80 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.63.8] - 2026-05-12
+
+### Changed
+
+- **Writeback LOW tidying sweep (Wave 6 — audit cleanup
+  `docs/legacy-spike/writeback-audit-2026-05-12.md`).** Final wave of the
+  writeback audit, closing every LOW-severity item that did not require
+  product policy or live-DB schema introspection. Items 1, 2, 4, 7, 10 are
+  pure refactors / documentation; items 5, 6, 8, 9 add defensive guards
+  with focused unit tests.
+  - **Item 1 — shared `end_of_stay_at_almost_noon` + `enumerate_calendar_nights`.**
+    Both helpers moved to `writeback/format.rs`. Previously defined
+    identically in `booking_create.rs`, `booking_modify.rs`,
+    `walkin.rs`, `checkin_to_booking.rs`, and `extend_stay.rs`.
+    `enumerate_calendar_nights` now returns `Result` so its empty-range +
+    365-cap guards (item 6) can surface failures to callers.
+  - **Item 2 — shared `guest_prefix_for_country`.** Moved from `walkin.rs`
+    and `checkin_to_booking.rs` (identical definitions) to
+    `writeback/recipes/helpers.rs` next to `mark_cupon_printed`.
+  - **Item 3 — `booking_cancel.rs:63` double-space documented.** The
+    legacy capture's `delete from  HT_Book_Date` has TWO spaces between
+    `from` and the table name; the parity-pinning comment was added in
+    `writeback/recipes/booking_cancel.rs` so a future formatter autofix
+    cannot silently normalize it away.
+  - **Item 4 — money formatting consolidated to 2dp.** Every raw
+    `{baht}` / `{price}` / `{total}` / `{amount}` interpolation on f64
+    money values across `booking_create.rs`, `booking_modify.rs`,
+    `walkin.rs`, `checkin_to_booking.rs`, `checkout.rs`, `extend_stay.rs`,
+    `checkin_cancel.rs`, and `payment.rs` now renders with 2 decimal
+    places. Matches the existing `HT_Receipt_H` / `HT_CheckIn_Pay` shapes
+    and the `money_2dp` helper introduced in Wave 2 H4.
+  - **Item 5 — `nights` validation hardened.** `walkin.rs`,
+    `checkin_to_booking.rs`, and `booking_create.rs` now return a
+    `WritebackError::Recipe` when `payload.nights < 1`; the silent
+    `.max(1)` clamp that masked caller bugs is gone.
+  - **Item 6 — `enumerate_calendar_nights` cap + empty-range guard rails.**
+    The shared helper now logs a WARN when the 365-night cap truncates
+    the range and returns `Err` on an empty range. The earlier per-recipe
+    copies silently injected a phantom single-night row, which papered
+    over caller bugs at the cost of one ghost `HT_Book_Date` row in
+    MSSQL. Tests in `writeback/format.rs` pin both guards.
+  - **Item 7 — i32-wrap observability.**
+    `writeback/allocate.rs::select_next_int_with_lock` logs a WARN when
+    the next allocated id approaches `i32::MAX / 2`. Affects every i32
+    allocator (`HT_Book_Date.id`, `HT_CheckIn_Ds.id`, `HT_Receipt_H.id`,
+    `HT_Room_Status.id`, `HT_Rooms_Cancel.id`, `HT_Customers.id`).
+  - **Item 8 — Ville cutover collation safety.**
+    `writeback/fingerprint.rs::verify_legacy_collation_safety` runs at
+    worker startup and refuses to start when `SERVERPROPERTY('Collation')`
+    contains `_CS_` (case-sensitive). Recipes pin every string literal
+    to the case the .NET app emits, so a fresh Ville with the wrong
+    collation would silently fork our writes; this check fails fast at
+    startup. Wired into `bin/writeback.rs` between the pool init and the
+    schema fingerprint check.
+  - **Item 9 — `error::is_retryable` pattern-matches PG SQLSTATEs.**
+    `writeback/error.rs` now only retries `sqlx::Error::Database` when
+    the SQLSTATE is one of the documented transient codes (`40001`,
+    `40P01`, `57P01`-`57P03`, `08000`-`08006`, `53300`). Integrity
+    violations (`23xxx`), syntax errors (`42xxx`), and user-raised
+    exceptions (`P0001`) now correctly fail permanently instead of
+    pinning a worker thread on a deterministic failure (e.g.
+    `unique_violation` on `writeback_jobs`). Wire-level
+    `sqlx::Error::Io` / `Tls` / `PoolTimedOut` / `PoolClosed` /
+    `WorkerCrashed` remain retryable.
+  - **Item 10 — `set_context_info` pool-isolation contract re-checked.**
+    `writeback/dispatcher.rs` docs now explicitly explain why no runtime
+    assertion is feasible (bb8 has no API to enumerate other handles to
+    the same `Pool` instance; the backend's separate pool lives in a
+    separate process per `docker-compose.yml`). The contract remains
+    structural and enforced by code organization.
+
+This closes the writeback audit. Remaining: Wave 5c (QR routing + VAT
+consistency) deferred pending product policy.
+
 ## [2.63.7] - 2026-05-12
 
 ### Fixed

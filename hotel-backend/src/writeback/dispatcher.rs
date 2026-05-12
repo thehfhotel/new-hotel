@@ -151,7 +151,7 @@ pub struct DispatchContext {
 /// `WritebackIntent` variants must extend the `match` below — the
 /// compiler's exhaustiveness check is the structural enforcement.
 ///
-/// ## Pool isolation contract (Wave 5a item 6)
+/// ## Pool isolation contract (Wave 5a item 6 — re-checked Wave 6 item 10)
 ///
 /// `SET CONTEXT_INFO 0x4E48` is **session-scoped**: it persists on the bb8
 /// connection after it returns to the pool. That is safe **only** because
@@ -159,12 +159,30 @@ pub struct DispatchContext {
 /// dedicated MSSQL pool created via `create_pool(&mssql_config)` at the
 /// top of `main()`. No other code path acquires from this pool — the
 /// backend's `AppState.legacy_pool` is a separate `bb8::Pool` instance in
-/// a different process. If a future refactor shares the writeback pool
-/// with non-writeback callers (e.g. ad-hoc legacy reads), this assumption
-/// breaks and an `on_release` hook that clears `CONTEXT_INFO` back to 0
-/// would be required to avoid leaking the `0x4E48` tag onto reader
-/// queries. The audit doc (`docs/legacy-spike/writeback-audit-2026-05-12.md`
-/// MED cluster) tracks this contract.
+/// a different process.
+///
+/// **No runtime assertion is feasible** because the contract is a
+/// structural property of how the binary is wired, not a value the bb8
+/// pool can introspect: bb8 has no API to enumerate other handles to the
+/// same `Pool` instance, and the backend's separate pool lives in a
+/// separate process (Docker `backend` vs `writeback` services per
+/// `docker-compose.yml`). The contract is enforced by code organization:
+///
+/// 1. `bin/writeback.rs::main` is the only call site that constructs
+///    this `Pool` via `create_pool(&mssql_config)`.
+/// 2. The backend's `AppState.legacy_pool` is constructed separately in
+///    the `hotel-backend` binary's startup.
+/// 3. `verify_legacy_collation_safety` + `verify_schema_fingerprint`
+///    confirm the writeback binary is on the right server but do not
+///    address pool-share semantics — that's still purely structural.
+///
+/// If a future refactor shares the writeback pool with non-writeback
+/// callers (e.g. ad-hoc legacy reads from the same binary), this
+/// assumption breaks and an `on_release` hook that clears `CONTEXT_INFO`
+/// back to 0 would be required to avoid leaking the `0x4E48` tag onto
+/// reader queries. The audit doc
+/// (`docs/legacy-spike/writeback-audit-2026-05-12.md` MED cluster +
+/// Wave 6 item 10) tracks this contract.
 pub async fn dispatch(
     conn: &mut LegacyConn<'_>,
     intent: &WritebackIntent,

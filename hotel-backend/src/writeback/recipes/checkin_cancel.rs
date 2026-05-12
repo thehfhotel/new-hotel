@@ -70,8 +70,10 @@ pub fn build_statements(inputs: &CancelCheckInInputs<'_>) -> Vec<String> {
     let by_q = sql_quote(inputs.cancel_by);
     let note_q = sql_quote_or_empty(inputs.cancel_note);
     let cancel_id = inputs.rooms_cancel_id;
-    let price = inputs.price_to_subtract;
-    let pay = inputs.pay_to_subtract;
+    // Wave 6 LOW item 4: pre-format money to 2dp for consistency with the
+    // HT_CheckIn_H VALUES that already use 2dp on create / checkout.
+    let price = format!("{:.2}", inputs.price_to_subtract);
+    let pay = format!("{:.2}", inputs.pay_to_subtract);
     let cancel_status_q = sql_quote(CIN_STATUS_CANCELLED);
     let power_note_q = sql_quote(POWER_LOG_NOTE_CHECKIN_CANCELLED);
 
@@ -199,9 +201,10 @@ mod tests {
         );
         assert!(statements[3].contains("[HT_Rooms_Cancel]"));
         assert!(statements[3].contains("VALUES(298,'306','CH26-005233',getdate(),'Admin','ยกเลิกคุณนัท')"));
-        assert!(statements[4].contains("Total_Price_Room-890"));
-        assert!(statements[4].contains("[Total_Price_Net]-890"));
-        assert!(statements[4].contains("([Total_Price_Balance]-890)+0"));
+        // Wave 6 LOW item 4: 2dp money formatting (was raw `890`/`0`).
+        assert!(statements[4].contains("Total_Price_Room-890.00"));
+        assert!(statements[4].contains("[Total_Price_Net]-890.00"));
+        assert!(statements[4].contains("([Total_Price_Balance]-890.00)+0.00"));
         assert_eq!(
             statements[5],
             "update HT_CheckIn_H set cin_status='ยกเลิก' where cin_no='CH26-005233'"
@@ -225,10 +228,11 @@ mod tests {
         };
         let s = build_statements(&inputs);
         let totals = s.iter().find(|s| s.contains("[Total_Price_Room]")).unwrap();
-        assert!(totals.contains("Total_Price_Room-1500"));
-        assert!(totals.contains("[Total_Price_Net]-1500"));
-        assert!(totals.contains("[Total_Price_Pay]-250"));
-        assert!(totals.contains("([Total_Price_Balance]-1500)+250"));
+        // Wave 6 LOW item 4: 2dp money formatting.
+        assert!(totals.contains("Total_Price_Room-1500.00"));
+        assert!(totals.contains("[Total_Price_Net]-1500.00"));
+        assert!(totals.contains("[Total_Price_Pay]-250.00"));
+        assert!(totals.contains("([Total_Price_Balance]-1500.00)+250.00"));
     }
 
     #[test]

@@ -46,8 +46,11 @@ use crate::outbox::intent::{BookingChanges, CustomerResave};
 use crate::writeback::allocate::{allocate_book_date_id, LegacyConn};
 use crate::writeback::dispatcher::LegacyIds;
 use crate::writeback::error::WritebackResult;
-use crate::writeback::format::{format_legacy_date, format_legacy_datetime, sql_quote};
-use chrono::{DateTime, Days, NaiveDate, Utc};
+use crate::writeback::format::{
+    end_of_stay_at_almost_noon, enumerate_calendar_nights, format_legacy_date,
+    format_legacy_datetime, sql_quote,
+};
+use chrono::NaiveDate;
 
 /// Inputs for the modify-booking recipe — already-resolved legacy IDs +
 /// the diff from the `BookingChanges` payload.
@@ -120,7 +123,8 @@ pub fn build_statements(inputs: &ModifyBookingInputs<'_>) -> Vec<String> {
     }
     if let Some(price) = &inputs.changes.new_price {
         let baht = (price.as_satang() as f64) / 100.0;
-        header_sets.push(format!("[Book_Price_Total]={baht}"));
+        // Wave 6 LOW item 4: 2dp matches HT_Book_H's create-side formatting.
+        header_sets.push(format!("[Book_Price_Total]={baht:.2}"));
     }
     if let Some(phone) = &inputs.changes.new_customer_phone {
         let q = sql_quote(phone);
@@ -176,9 +180,10 @@ pub fn build_statements(inputs: &ModifyBookingInputs<'_>) -> Vec<String> {
         } else {
             inputs.book_room_night_existing.unwrap_or(1).max(1)
         };
-        ds_sets.push(format!("[Book_Room_Price]={baht}"));
+        // Wave 6 LOW item 4: 2dp matches HT_Book_Ds's create-side formatting.
+        ds_sets.push(format!("[Book_Room_Price]={baht:.2}"));
         ds_sets.push(format!(
-            "[Book_Room_PriceToTal]={total}",
+            "[Book_Room_PriceToTal]={total:.2}",
             total = baht * nights as f64
         ));
     }
@@ -365,47 +370,6 @@ fn build_customer_resave_update(r: &CustomerResave) -> String {
     )
 }
 
-fn end_of_stay_at_almost_noon(stay_end: DateTime<Utc>) -> DateTime<Utc> {
-    use chrono::TimeZone;
-    use chrono_tz::Asia::Bangkok;
-    let bkk_date = stay_end.with_timezone(&Bangkok).date_naive();
-    let bkk_target = bkk_date
-        .and_hms_opt(11, 59, 59)
-        .expect("11:59:59 is a valid time");
-    Bangkok
-        .from_local_datetime(&bkk_target)
-        .single()
-        .expect("11:59:59 is unambiguous in Asia/Bangkok (no DST)")
-        .with_timezone(&Utc)
-}
-
-/// Enumerate the new calendar nights for the modified stay range.
-/// Self-contained per recipe spec. Uses Bangkok calendar day boundaries —
-/// see `format::bangkok_date` for why UTC `date_naive()` would be wrong.
-fn enumerate_calendar_nights(
-    stay_start: DateTime<Utc>,
-    stay_end: DateTime<Utc>,
-) -> Vec<NaiveDate> {
-    let start = crate::writeback::format::bangkok_date(stay_start);
-    let end = crate::writeback::format::bangkok_date(stay_end);
-    let mut nights = Vec::new();
-    let mut day = start;
-    while day < end {
-        nights.push(day);
-        day = match day.checked_add_days(Days::new(1)) {
-            Some(d) => d,
-            None => break,
-        };
-        if nights.len() > 365 {
-            break;
-        }
-    }
-    if nights.is_empty() {
-        nights.push(start);
-    }
-    nights
-}
-
 /// Execute the modify-booking recipe.
 pub async fn execute(
     conn: &mut LegacyConn<'_>,
@@ -418,8 +382,10 @@ pub async fn execute(
     } else {
         0 // unused
     };
+    // Wave 6 LOW item 6: enumerate_calendar_nights now returns Result —
+    // empty range surfaces as Recipe error, cap-truncate logs WARN.
     let new_nights = if let Some(stay) = &changes.new_stay {
-        enumerate_calendar_nights(stay.start, stay.end)
+        enumerate_calendar_nights(stay.start, stay.end)?
     } else {
         Vec::new()
     };
@@ -550,7 +516,7 @@ async fn fetch_existing_book_room_night(
 mod tests {
     use super::*;
     use crate::domain::shared::{DateRange, Money};
-    use chrono::TimeZone;
+    use chrono::{TimeZone, Utc};
 
     #[test]
     fn no_destructive_delete_on_book_h_or_book_ds() {
