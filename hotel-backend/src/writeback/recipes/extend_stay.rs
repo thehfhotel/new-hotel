@@ -146,9 +146,12 @@ pub fn build_statements(inputs: &ExtendStayInputs<'_>) -> Vec<String> {
         price_total = inputs.new_room_price_total,
         ds_id = inputs.checkin_ds_id,
     ));
-    // 5. Revert room_use back to 'yes' (parity with legacy capture)
+    // 5. Revert room_use back to 'yes' — Wave 5b item 2: mirror step-1's
+    //    subquery so multi-room check-ins get every non-checked-out room
+    //    re-flipped, not just `inputs.room_no`. Prior single-room shape left
+    //    sibling rooms stuck `room_use='no'` after the step-1 wipe.
     statements.push(format!(
-        "update HT_Rooms set room_use='yes' where room_no={room_no_q}"
+        "update HT_Rooms set room_use='yes' where room_no in (select Cin_Room_No from HT_CheckIn_Ds where Cin_no={cin_no_q} and Cin_Room_Status<>'Check-Out')"
     ));
 
     // 6..N. Re-insert HT_Room_Status, one per night
@@ -318,10 +321,11 @@ mod tests {
         assert!(statements[3].contains("[Cin_Room_PriceTotal]=1780"));
         assert!(statements[3].contains("[Cin_Room_Out]='4/26/2026 12:00:00 PM'"));
         assert!(statements[3].contains("where id=25009"));
-        // 5: revert room_use
+        // 5: revert room_use — Wave 5b item 2: subquery over all
+        // non-checked-out rooms of this check-in (multi-room safe).
         assert_eq!(
             statements[4],
-            "update HT_Rooms set room_use='yes' where room_no='508'"
+            "update HT_Rooms set room_use='yes' where room_no in (select Cin_Room_No from HT_CheckIn_Ds where Cin_no='CH26-005230' and Cin_Room_Status<>'Check-Out')"
         );
         // 6: night 1 INSERT
         assert!(statements[5].contains("VALUES(50235,'508','4/24/2026','เข้าพัก'"));
@@ -374,6 +378,87 @@ mod tests {
                 NaiveDate::from_ymd_opt(2026, 4, 26).unwrap(),
             ]
         );
+    }
+
+    /// Wave 5b item 2: step-5's `room_use='yes'` revert must use the same
+    /// subquery shape as step-1's `room_use='no'` clear, otherwise a
+    /// multi-room check-in leaves every sibling room stuck `'no'` after the
+    /// extend. Symmetric subqueries guarantee step-1 / step-5 cover the
+    /// exact same set of rows.
+    #[test]
+    fn step_5_uses_subquery_for_multi_room() {
+        let inputs = ExtendStayInputs {
+            cin_no: "CH26-005230",
+            room_no: "508",
+            checkin_ds_id: 25009,
+            new_end: Utc.with_ymd_and_hms(2026, 4, 26, 5, 0, 0).unwrap(),
+            new_nights: 2,
+            new_room_price_total: 1780.0,
+            new_net_total: 1780.0,
+            new_balance: 1780.0,
+            product_total: 0.0,
+            pay_total: 0.0,
+            guest_label: "MULTI",
+            nights: vec![],
+            room_status_id_base: 50235,
+            tm30_touch_ids: vec![],
+        };
+        let statements = build_statements(&inputs);
+        let step5 = statements
+            .iter()
+            .find(|s| {
+                s.starts_with("update HT_Rooms set room_use='yes'") && s.contains("select")
+            })
+            .expect("step-5 must use subquery for multi-room parity");
+        assert!(step5.contains("Cin_no='CH26-005230'"));
+        assert!(step5.contains("Cin_Room_Status<>'Check-Out'"));
+        // And there must be no single-room form left over (`room_no='508'`
+        // suffix on the same update statement).
+        assert!(
+            !step5.ends_with("where room_no='508'"),
+            "single-room form leaked: {step5}"
+        );
+    }
+
+    /// Wave 5b item 2: a single-room extend (the common case) still works —
+    /// the subquery resolves to exactly that one room, so behaviour stays
+    /// unchanged for the 99% path.
+    #[test]
+    fn single_room_input_still_works() {
+        let inputs = ExtendStayInputs {
+            cin_no: "CH26-005230",
+            room_no: "508",
+            checkin_ds_id: 25009,
+            new_end: Utc.with_ymd_and_hms(2026, 4, 26, 5, 0, 0).unwrap(),
+            new_nights: 1,
+            new_room_price_total: 890.0,
+            new_net_total: 890.0,
+            new_balance: 890.0,
+            product_total: 0.0,
+            pay_total: 0.0,
+            guest_label: "SOLO",
+            nights: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],
+            room_status_id_base: 50235,
+            tm30_touch_ids: vec![],
+        };
+        let statements = build_statements(&inputs);
+        // Step-1 and step-5 must share the EXACT same subquery / WHERE shape
+        // (only differ on `room_use='no'` vs `'yes'`).
+        let step1 = statements.iter().find(|s| s.contains("room_use='no'")).unwrap();
+        let step5 = statements.iter().find(|s| s.contains("room_use='yes'")).unwrap();
+        let step1_tail = step1.trim_start_matches("update HT_Rooms set room_use='no'");
+        let step5_tail = step5.trim_start_matches("update HT_Rooms set room_use='yes'");
+        assert_eq!(
+            step1_tail, step5_tail,
+            "step-1 and step-5 must share the WHERE / subquery shape"
+        );
+        // And the per-night HT_Room_Status INSERT still references the
+        // single room number — proving room_no is not vestigial.
+        let night = statements
+            .iter()
+            .find(|s| s.contains("INSERT INTO [HT_Room_Status]"))
+            .unwrap();
+        assert!(night.contains("'508'"));
     }
 
     #[test]

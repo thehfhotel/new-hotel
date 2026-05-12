@@ -33,7 +33,7 @@
 //!   async batch job. Our writeback doesn't allocate it — the .NET app will
 //!   set it when it next opens the check-in (or it stays 0 until then).
 
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::outbox::intent::CreateCheckInPayload;
 use crate::writeback::allocate::{
@@ -80,6 +80,11 @@ pub struct WalkInInputs<'a> {
     pub nights_calendar: Vec<NaiveDate>,
     /// Optional `Tb_Save_Image.tmp_no` — see [`CreateCheckInPayload::photo_tmp_no`].
     pub photo_tmp_no: Option<&'a str>,
+    /// "Now" timestamp threaded in by `execute()` so `build_statements`
+    /// stays PURE — Wave 5b item 4. Drives `HT_CheckIn_H.Cin_Date` and
+    /// `HT_Customers.Cust_Last_Change` (the latter as a Bangkok-local date).
+    /// Tests pass a fixed instant for exact byte-parity assertions.
+    pub created_at: DateTime<Utc>,
 }
 
 /// Build the statements for a walk-in. PURE — no I/O.
@@ -94,11 +99,11 @@ pub fn build_statements(inputs: &WalkInInputs<'_>) -> Vec<String> {
     let cust_type_q = sql_quote(CUST_TYPE_NORMAL);
     let cust_type_main_q = sql_quote(CUST_TYPE_MAIN_NORMAL);
     let cust_last_change_q = sql_quote(&format_legacy_date(
-        crate::writeback::format::bangkok_date(Utc::now()),
+        crate::writeback::format::bangkok_date(inputs.created_at),
     ));
     let stay_start_q = sql_quote(&format_legacy_datetime(inputs.stay_start));
     let stay_end_q = sql_quote(&format_legacy_datetime(inputs.stay_end));
-    let now_q = sql_quote(&format_legacy_datetime(Utc::now()));
+    let now_q = sql_quote(&format_legacy_datetime(inputs.created_at));
     let occupying_q = sql_quote(CIN_ROOM_STATUS_OCCUPYING);
     let cin_status_q = sql_quote(CIN_STATUS_NORMAL);
     let cust_price_q = sql_quote(CUST_TYPE_NORMAL);
@@ -228,8 +233,6 @@ pub fn build_statements(inputs: &WalkInInputs<'_>) -> Vec<String> {
     // emit byte-identical SQL.
     statements.push(super::helpers::mark_cupon_printed(inputs.cin_no));
 
-    let _ = NaiveDate::from_ymd_opt(2026, 1, 1); // silence unused-import lint
-    let _ = Datelike::year(&Utc::now()); // silence unused-import lint
     let _ = price; // silence: kept on PaymentInputs for future per-night reporting
     statements
 }
@@ -287,6 +290,11 @@ pub async fn execute(
 
     let nights_calendar = enumerate_calendar_nights(payload.stay.start, payload.stay.end);
 
+    // Wave 5b item 4: capture `Utc::now()` once at the entry to `execute()` so
+    // `build_statements` is purely a function of its inputs. Tests can swap in
+    // a fixed instant for exact byte-parity assertions.
+    let created_at = Utc::now();
+
     let inputs = WalkInInputs {
         cin_no: &cin_no,
         cust_no: &cust_no,
@@ -307,6 +315,7 @@ pub async fn execute(
         nights_calendar,
         checkin_ds_id,
         photo_tmp_no: payload.photo_tmp_no.as_deref(),
+        created_at,
     };
     let statements = build_statements(&inputs);
     super::execute_all(conn, &statements).await?;
@@ -377,6 +386,9 @@ mod tests {
             nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 24).unwrap()],
             checkin_ds_id: 25001,
             photo_tmp_no: None,
+            // Wave 5b item 4: fixed instant for byte-parity tests.
+            // 9:56:20 UTC = 4:56:20 PM Bangkok.
+            created_at: Utc.with_ymd_and_hms(2026, 4, 24, 9, 56, 20).unwrap(),
         }
     }
 
@@ -408,14 +420,19 @@ mod tests {
             nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],
             checkin_ds_id: 25025,
             photo_tmp_no: None,
+            // Wave 5b item 4: pin `Cin_Date` to the captured wall-clock
+            // (4/25/2026 4:12:18 PM Bangkok = 09:12:18 UTC) so the legacy
+            // capture-byte-parity assertion below can use exact equality.
+            created_at: Utc.with_ymd_and_hms(2026, 4, 25, 9, 12, 18).unwrap(),
         }
     }
 
     /// Byte-level parity for the HT_CheckIn_H statement against the
-    /// captured walk-in for `CH26-005242` in
-    /// `/tmp/legacy-events-full.log`. We assert the column list +
-    /// value tail (Cin_Date is the only field that depends on
-    /// `Utc::now()` at build time, so we substring-match around it).
+    /// captured walk-in for `CH26-005242` in `/tmp/legacy-events-full.log`.
+    ///
+    /// Wave 5b item 4: `created_at` is now an input, so we can express this
+    /// as an exact-equality check against the full legacy line — no more
+    /// substring-matching around `Cin_Date`.
     #[test]
     fn checkin_h_matches_legacy_capture_byte_for_byte() {
         let s = build_statements(&capture_inputs());
@@ -423,22 +440,28 @@ mod tests {
             .iter()
             .find(|s| s.contains("[HT_CheckIn_H]"))
             .expect("HT_CheckIn_H INSERT must be emitted");
-        let head = "INSERT INTO [HT_CheckIn_H]([Cin_no],[Cin_Date],[Cin_Book_no],[Cin_cust_no],\
-                    [Cin_cust_price],[Cin_status],[Total_Price_Room],[Total_Price_Product],\
-                    [Total_Price_Net],[Total_Price_Pay],[Total_Price_Balance],[Cin_Car_type],\
-                    [Cin_Car_id],[Cin_Room_ALL],[Cin_by],[Cin_Date_in],[Cin_Date_Out],\
-                    [Cin_Type],[Cin_foreign])\
-                    VALUES('CH26-005242',";
-        assert!(
-            cin_h.starts_with(head),
-            "HT_CheckIn_H must use legacy column order; got:\n{cin_h}"
-        );
-        let tail = ",'','C21636','ราคาปกติ','ปกติ',890.00,0.00,890.00,0.00,890.00,'','',\
-                    '407 ','Admin','4/25/2026 4:12:18 PM','4/26/2026 12:00:00 PM',0,'False')";
-        assert!(
-            cin_h.ends_with(tail),
-            "HT_CheckIn_H value tail must match legacy capture; got:\n{cin_h}"
-        );
+        let expected = "INSERT INTO [HT_CheckIn_H]([Cin_no],[Cin_Date],[Cin_Book_no],[Cin_cust_no],\
+                        [Cin_cust_price],[Cin_status],[Total_Price_Room],[Total_Price_Product],\
+                        [Total_Price_Net],[Total_Price_Pay],[Total_Price_Balance],[Cin_Car_type],\
+                        [Cin_Car_id],[Cin_Room_ALL],[Cin_by],[Cin_Date_in],[Cin_Date_Out],\
+                        [Cin_Type],[Cin_foreign])\
+                        VALUES('CH26-005242','4/25/2026 4:12:18 PM','','C21636','ราคาปกติ','ปกติ',\
+                        890.00,0.00,890.00,0.00,890.00,'','','407 ','Admin','4/25/2026 4:12:18 PM',\
+                        '4/26/2026 12:00:00 PM',0,'False')";
+        assert_eq!(cin_h, expected);
+    }
+
+    /// Wave 5b item 4: `build_statements` is PURE — no `Utc::now()`, no
+    /// other I/O. Calling it twice with the same inputs (including a fixed
+    /// `created_at`) must produce byte-identical output. This pins the
+    /// purity contract that the doc-comment claims and makes regressions
+    /// (e.g. someone re-adding `Utc::now()` inside) visible immediately.
+    #[test]
+    fn build_statements_is_pure_with_fixed_instant() {
+        let inputs = sample_inputs();
+        let first = build_statements(&inputs);
+        let second = build_statements(&inputs);
+        assert_eq!(first, second, "build_statements must be deterministic");
     }
 
     #[test]

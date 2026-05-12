@@ -5,6 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.63.7] - 2026-05-12
+
+### Fixed
+
+- **Writeback MED cluster part B — multi-room, purity, misc (Wave 5b
+  `docs/legacy-spike/writeback-audit-2026-05-12.md`).** Six MED-severity
+  fixes that tighten the recipes' multi-room behaviour, pin `build_statements`
+  purity, and harden two `booking_modify` shapes against legacy quirks.
+  - **Item 1 — `mark_clean` prior-occupant filter.**
+    `writeback/recipes/mark_clean.rs::fetch_prior_occupant` now filters by
+    per-room `Cin_Room_Status = N'Check-Out'` (matches
+    `COMPAT_CHEATSHEET.md:864-866`) instead of the whole-check-in
+    `cin_status NOT IN ('ยกเลิก')`. Without the per-room filter a multi-room
+    check-in where one room was already out and another still occupied
+    surfaced the still-occupying sibling as the "prior occupant" for the
+    housekeeping log. The whole-check-in cancellation guard is kept as
+    belt-and-suspenders, and `ORDER BY` now pins NULLs-last on
+    `Cin_Room_Out` so a NULL checkout time can never out-rank a real prior
+    occupant (audit LOW-4 folded in opportunistically).
+  - **Item 2 — `extend_stay` step-5 multi-room revert.**
+    `writeback/recipes/extend_stay.rs::build_statements` step-5 now uses
+    the same `room_no IN (SELECT Cin_Room_No FROM HT_CheckIn_Ds
+    WHERE Cin_no=… AND Cin_Room_Status<>'Check-Out')` subquery as step-1.
+    Prior single-room shape (`WHERE room_no={inputs.room_no}`) left every
+    sibling room of a multi-room check-in stuck `room_use='no'` after the
+    step-1 wipe.
+  - **Item 3 — `checkin_cancel` HT_POWER_LOG row-target precision.**
+    `writeback/recipes/checkin_cancel.rs::build_statements` step-7 now
+    restricts the close-lights UPDATE to `id = (SELECT MAX(id) FROM
+    HT_POWER_LOG WHERE room_no=… AND ROOM_POWER_END_BY='')`. Prior shape
+    would close every open row for the room — overwriting `ROOM_POWER_NOTE2`
+    / `ROOM_POWER_END_BY` on a crashed prior session's leftover row and
+    corrupting the power-log audit trail.
+  - **Item 4 — `Utc::now()` lifted out of `build_statements`
+    (`walkin.rs`, `checkin_to_booking.rs`).** Both recipes' input structs
+    gain a `created_at: DateTime<Utc>` field, threaded in by `execute()`
+    via a single `Utc::now()` capture at the top. `build_statements` is
+    now PURE (its doc-comment claim is finally true). Existing byte-parity
+    tests upgraded from substring-matching to full-line exact-equality;
+    two new `build_statements_is_pure_with_fixed_instant` tests pin the
+    determinism contract.
+  - **Item 5 — `booking_modify` notes also write `HT_Book_Ds.Book_Room_Note`.**
+    `writeback/recipes/booking_modify.rs::build_statements` now pushes
+    `[Book_Room_Note]={q}` to `ds_sets` whenever `new_notes` is set, in
+    addition to the existing `[Book_room_note]={q}` on `header_sets`.
+    iHOTEL's edit-booking form binds the visible note input to
+    `HT_Book_Ds.Book_Room_Note` (capital R per `SCHEMA.sql:6` /
+    `COMPAT_CHEATSHEET.md:671`), so without this write a note edit was
+    invisible in iHOTEL until the receptionist re-saved.
+  - **Item 6 — `booking_modify` `Book_date_ds` NOT-IN cast safety.**
+    The kept-dates filter now casts BOTH sides to `DATE`:
+    `AND CAST(Book_date_ds AS DATE) NOT IN (CAST('4/25/2026' AS DATE), …)`.
+    Defense-in-depth — guarantees correct behaviour even if a future row
+    is stored with a non-midnight time component (the legacy app stores
+    midnight today, but no schema constraint enforces it).
+
 ## [2.63.6] - 2026-05-12
 
 ### Fixed

@@ -74,33 +74,18 @@ pub fn build_statements(
     ]
 }
 
-/// SELECT the prior **non-cancelled** occupant of `room_no`. Per spike §3j:
-///
-/// ```sql
-/// SELECT TOP 1 h.Cin_no, c.Cust_name + ' ' + c.Cust_name2 AS h_cin_name
-///   FROM HT_CheckIn_Ds d
-///   JOIN HT_CheckIn_H h ON h.Cin_no = d.Cin_No
-///   JOIN HT_Customers c ON c.Cust_no = h.Cin_cust_no
-///  WHERE d.Cin_Room_No = @room_no
-///    AND h.cin_status NOT IN ('ยกเลิก')
-///  ORDER BY d.Cin_Room_Out DESC
-/// ```
-///
-/// Returns `None` if no prior real occupant exists.
+/// SELECT the prior occupant of `room_no` whose per-room check-out
+/// completed (Wave 5b item 1). Filter mirrors `COMPAT_CHEATSHEET.md:864-866`
+/// (`View_CheckIn_Ds where Cin_room_status='Check-Out' and cin_room_no=…
+/// order by cin_room_out desc`) so a multi-room check-in where one room is
+/// already out and another still occupied returns the freshly-out row, not
+/// the still-occupying sibling. Returns `None` if no prior real occupant
+/// exists. See [`build_prior_occupant_sql`] for the exact SQL shape.
 pub async fn fetch_prior_occupant(
     conn: &mut LegacyConn<'_>,
     room_no: &str,
 ) -> WritebackResult<Option<PriorOccupant>> {
-    let room_no_q = sql_quote(room_no);
-    let sql = format!(
-        "SELECT TOP 1 h.Cin_no, ISNULL(c.Cust_name, '') + ' ' + ISNULL(c.Cust_name2, '') AS h_cin_name \
-         FROM HT_CheckIn_Ds d \
-         JOIN HT_CheckIn_H h ON h.Cin_no = d.Cin_No \
-         JOIN HT_Customers c ON c.Cust_no = h.Cin_cust_no \
-         WHERE d.Cin_Room_No = {room_no_q} \
-           AND h.cin_status NOT IN (N'ยกเลิก') \
-         ORDER BY d.Cin_Room_Out DESC"
-    );
+    let sql = build_prior_occupant_sql(room_no);
     let stream = conn.simple_query(sql).await?;
     let rows: Vec<Row> = stream.into_first_result().await?;
     let Some(row) = rows.first() else { return Ok(None) };
@@ -134,6 +119,35 @@ pub async fn execute(
             .insert("prior_cin_no".into(), serde_json::Value::from(p.cin_no));
     }
     Ok(ids)
+}
+
+/// Build the prior-occupant lookup SQL — exposed for unit tests so we can
+/// assert the WHERE / ORDER BY shape without a live MSSQL.
+fn build_prior_occupant_sql(room_no: &str) -> String {
+    use crate::writeback::constants::{CIN_ROOM_STATUS_CHECKED_OUT, CIN_STATUS_CANCELLED};
+    let room_no_q = sql_quote(room_no);
+    let checked_out_q = sql_quote(CIN_ROOM_STATUS_CHECKED_OUT);
+    let cancelled_q = sql_quote(CIN_STATUS_CANCELLED);
+    // Wave 5b item 1: per-room status filter (`d.Cin_Room_Status='Check-Out'`)
+    // matches `COMPAT_CHEATSHEET.md:864-866`. The earlier whole-check-in filter
+    // (`h.cin_status NOT IN ('ยกเลิก')`) is kept as belt-and-suspenders so a
+    // partially-cancelled multi-room check-in (where one room shows
+    // `Check-Out` but the header status was force-set to `ยกเลิก`) doesn't
+    // surface as a stale prior occupant.
+    //
+    // Also pin NULLs-last ordering on `Cin_Room_Out` (audit LOW-4) so a
+    // mid-stay row with no checkout time can never out-sort a real prior
+    // occupant.
+    format!(
+        "SELECT TOP 1 h.Cin_no, ISNULL(c.Cust_name, '') + ' ' + ISNULL(c.Cust_name2, '') AS h_cin_name \
+         FROM HT_CheckIn_Ds d \
+         JOIN HT_CheckIn_H h ON h.Cin_no = d.Cin_No \
+         JOIN HT_Customers c ON c.Cust_no = h.Cin_cust_no \
+         WHERE d.Cin_Room_No = {room_no_q} \
+           AND d.Cin_Room_Status = N{checked_out_q} \
+           AND h.cin_status NOT IN (N{cancelled_q}) \
+         ORDER BY CASE WHEN d.Cin_Room_Out IS NULL THEN 1 ELSE 0 END, d.Cin_Room_Out DESC"
+    )
 }
 
 #[cfg(test)]
@@ -180,5 +194,54 @@ mod tests {
         let statements = build_statements(50, "403", "Admin", None);
         assert!(statements[0].contains("where id=50"));
         assert!(!statements[0].contains("room_no"));
+    }
+
+    /// Wave 5b item 1: the prior-occupant lookup must filter by **per-room**
+    /// `Cin_Room_Status='Check-Out'`, not whole-check-in status. Otherwise a
+    /// multi-room check-in where room A is checked out and room B is still
+    /// occupied would return room B's still-occupying detail row as the
+    /// "prior occupant" for mark-clean on room A. Per
+    /// `COMPAT_CHEATSHEET.md:864-866`.
+    #[test]
+    fn filters_by_per_room_status_not_whole_checkin() {
+        let sql = build_prior_occupant_sql("306");
+        assert!(
+            sql.contains("d.Cin_Room_Status = N'Check-Out'"),
+            "per-room status filter missing: {sql}"
+        );
+    }
+
+    /// Wave 5b item 1 (defense-in-depth): keep the whole-check-in
+    /// `cin_status NOT IN ('ยกเลิก')` guard so a partially-cancelled check-in
+    /// with a stuck `Cin_Room_Status='Check-Out'` row can't surface as a
+    /// stale prior occupant either.
+    #[test]
+    fn keeps_cancellation_guard_on_whole_checkin_status() {
+        let sql = build_prior_occupant_sql("306");
+        assert!(
+            sql.contains("h.cin_status NOT IN (N'ยกเลิก')"),
+            "whole-check-in cancellation guard missing: {sql}"
+        );
+    }
+
+    /// Wave 5b item 1 (audit LOW-4): NULL `Cin_Room_Out` rows must sort last,
+    /// otherwise a row with a `NULL` checkout time can out-rank a real prior
+    /// occupant under SQL Server's NULLS-FIRST default.
+    #[test]
+    fn orders_nulls_last_for_cin_room_out_desc() {
+        let sql = build_prior_occupant_sql("306");
+        assert!(
+            sql.contains(
+                "ORDER BY CASE WHEN d.Cin_Room_Out IS NULL THEN 1 ELSE 0 END, d.Cin_Room_Out DESC"
+            ),
+            "NULLs-last ordering missing: {sql}"
+        );
+    }
+
+    #[test]
+    fn prior_occupant_sql_quotes_room_no_safely() {
+        // Apostrophe in room_no (synthetic edge case) must be doubled by sql_quote.
+        let sql = build_prior_occupant_sql("3'06");
+        assert!(sql.contains("d.Cin_Room_No = '3''06'"));
     }
 }

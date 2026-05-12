@@ -128,6 +128,14 @@ pub fn build_statements(inputs: &ModifyBookingInputs<'_>) -> Vec<String> {
     }
     if let Some(notes) = &inputs.changes.new_notes {
         let q = sql_quote(notes);
+        // Wave 5b item 5: write `HT_Book_H.[Book_room_note]` (lowercase r —
+        // header level, used by reports) for parity with the existing flow.
+        // The matching `HT_Book_Ds.[Book_Room_Note]` (capital R) is pushed
+        // into `ds_sets` below — iHOTEL's edit-booking form binds the visible
+        // note column to the Ds row (`SCHEMA.sql:6` for HT_Book_Ds,
+        // `COMPAT_CHEATSHEET.md:671` for the column name), so without that
+        // write a note edit stayed invisible in iHOTEL until the user
+        // re-saved.
         header_sets.push(format!("[Book_room_note]={q}"));
     }
     if !header_sets.is_empty() {
@@ -174,6 +182,16 @@ pub fn build_statements(inputs: &ModifyBookingInputs<'_>) -> Vec<String> {
             total = baht * nights as f64
         ));
     }
+    if let Some(notes) = &inputs.changes.new_notes {
+        // Wave 5b item 5: also write `HT_Book_Ds.[Book_Room_Note]` (capital R
+        // — distinct column from the header-level `Book_room_note`). iHOTEL's
+        // edit-booking form binds the visible note input to the Ds row, so
+        // without this write a note edit was invisible in iHOTEL until the
+        // user re-saved. `SCHEMA.sql` line 6 / `COMPAT_CHEATSHEET.md:671`
+        // confirm the column name + casing.
+        let q = sql_quote(notes);
+        ds_sets.push(format!("[Book_Room_Note]={q}"));
+    }
     if !ds_sets.is_empty() {
         statements.push(format!(
             "UPDATE [HT_Book_Ds] SET {sets} WHERE Book_No={book_id_q}",
@@ -183,11 +201,17 @@ pub fn build_statements(inputs: &ModifyBookingInputs<'_>) -> Vec<String> {
 
     // 3. HT_Book_Date diff — only when stay range changed.
     if inputs.changes.new_stay.is_some() {
-        // Drop nights that aren't in the new calendar
+        // Drop nights that aren't in the new calendar — Wave 5b item 6:
+        // `Book_date_ds` is `datetime`; the kept-list is rendered as date-only
+        // strings (`'4/25/2026'`). Casting BOTH sides to DATE guarantees the
+        // comparison ignores any stored-time component (the legacy app stores
+        // bookings at midnight, but a future row written by a different path
+        // could carry a non-midnight time and silently slip past the filter).
         let kept_dates_q = inputs
             .new_nights_calendar
             .iter()
             .map(|d| sql_quote(&format_legacy_date(*d)))
+            .map(|q| format!("CAST({q} AS DATE)"))
             .collect::<Vec<_>>()
             .join(",");
         if kept_dates_q.is_empty() {
@@ -197,7 +221,7 @@ pub fn build_statements(inputs: &ModifyBookingInputs<'_>) -> Vec<String> {
         } else {
             statements.push(format!(
                 "DELETE FROM HT_Book_Date WHERE Book_no={book_id_q} \
-                 AND Book_date_ds NOT IN ({kept_dates_q})"
+                 AND CAST(Book_date_ds AS DATE) NOT IN ({kept_dates_q})"
             ));
         }
         // Re-insert any nights that don't exist yet. We can't know what's in
@@ -1120,6 +1144,106 @@ mod tests {
             .iter()
             .find(|s| s.starts_with("DELETE FROM HT_Book_Date"))
             .unwrap();
-        assert!(del.contains("NOT IN ('4/25/2026')"));
+        // Wave 5b item 6: both sides of NOT IN are cast to DATE.
+        assert!(del.contains("CAST(Book_date_ds AS DATE) NOT IN (CAST('4/25/2026' AS DATE))"));
+    }
+
+    /// Wave 5b item 5: a notes-only edit must write BOTH
+    /// `HT_Book_H.[Book_room_note]` (header, lowercase r) AND
+    /// `HT_Book_Ds.[Book_Room_Note]` (capital R — what iHOTEL's edit form
+    /// binds to). Without the Ds write, the visible note in iHOTEL stayed
+    /// stale until the user re-saved.
+    #[test]
+    fn notes_change_updates_both_header_and_ds_columns() {
+        let changes = BookingChanges {
+            new_stay: None,
+            new_room_no: None,
+            new_room_type: None,
+            new_price: None,
+            new_state: None,
+            new_notes: Some("VIP — please welcome".to_string()),
+            new_customer_phone: None,
+            new_customer_name: None,
+            customer_resave: None,
+        };
+        let inputs = ModifyBookingInputs {
+            book_id: "R014810",
+            book_date_id_base: 0,
+            book_room_night_existing: None,
+            changes: &changes,
+            new_nights_calendar: vec![],
+            existing_room_no: None,
+            existing_customer_name: None,
+        };
+        let s = build_statements(&inputs);
+        let header = s
+            .iter()
+            .find(|stmt| stmt.starts_with("UPDATE [HT_Book_H]"))
+            .expect("HT_Book_H UPDATE must be emitted");
+        assert!(
+            header.contains("[Book_room_note]='VIP — please welcome'"),
+            "header note (lowercase r) missing: {header}"
+        );
+        let ds = s
+            .iter()
+            .find(|stmt| stmt.starts_with("UPDATE [HT_Book_Ds]"))
+            .expect("HT_Book_Ds UPDATE must be emitted for notes change");
+        assert!(
+            ds.contains("[Book_Room_Note]='VIP — please welcome'"),
+            "ds note (capital R) missing: {ds}"
+        );
+    }
+
+    /// Wave 5b item 6: NOT-IN list and `Book_date_ds` column must BOTH be
+    /// cast to DATE — defends against any future row stored with a
+    /// non-midnight datetime (the legacy app stores midnight, but a row
+    /// written by another path could differ).
+    #[test]
+    fn book_date_ds_filter_casts_to_date() {
+        let changes = BookingChanges {
+            new_stay: Some(DateRange::new(
+                Utc.with_ymd_and_hms(2026, 4, 25, 5, 0, 0).unwrap(),
+                Utc.with_ymd_and_hms(2026, 4, 27, 5, 0, 0).unwrap(),
+            )),
+            new_room_no: None,
+            new_room_type: None,
+            new_price: None,
+            new_state: None,
+            new_notes: None,
+            new_customer_phone: None,
+            new_customer_name: None,
+            customer_resave: None,
+        };
+        let inputs = ModifyBookingInputs {
+            book_id: "R014810",
+            book_date_id_base: 47300,
+            book_room_night_existing: None,
+            changes: &changes,
+            new_nights_calendar: vec![
+                NaiveDate::from_ymd_opt(2026, 4, 25).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 4, 26).unwrap(),
+            ],
+            existing_room_no: Some("402"),
+            existing_customer_name: None,
+        };
+        let s = build_statements(&inputs);
+        let del = s
+            .iter()
+            .find(|stmt| stmt.starts_with("DELETE FROM HT_Book_Date"))
+            .expect("DELETE FROM HT_Book_Date must be emitted");
+        assert!(
+            del.contains("CAST(Book_date_ds AS DATE)"),
+            "column side must be CAST AS DATE: {del}"
+        );
+        assert!(
+            del.contains("CAST('4/25/2026' AS DATE)") && del.contains("CAST('4/26/2026' AS DATE)"),
+            "every kept-list entry must be CAST AS DATE: {del}"
+        );
+        // The old uncast literal form must be gone (would compare datetime
+        // to string and silently miss non-midnight rows).
+        assert!(
+            !del.contains("NOT IN ('4/25/2026'"),
+            "old uncast literal form leaked: {del}"
+        );
     }
 }

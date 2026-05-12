@@ -33,7 +33,7 @@
 //! INSERT INTO [HT_CheckIn_H] (…, Cin_Book_no='R014810', …)
 //! ```
 
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::outbox::intent::CreateCheckInPayload;
 use crate::writeback::allocate::{
@@ -76,6 +76,10 @@ pub struct CheckInToBookingInputs<'a> {
     pub checkin_ds_id: i32,
     /// Optional `Tb_Save_Image.tmp_no` — see [`CreateCheckInPayload::photo_tmp_no`].
     pub photo_tmp_no: Option<&'a str>,
+    /// "Now" timestamp threaded in by `execute()` so `build_statements`
+    /// stays PURE — Wave 5b item 4. Drives `HT_CheckIn_H.Cin_Date`. Tests
+    /// pass a fixed instant for exact byte-parity assertions.
+    pub created_at: DateTime<Utc>,
 }
 
 /// Build statements for a check-in linked to a booking. PURE — no I/O.
@@ -92,7 +96,7 @@ pub fn build_statements(inputs: &CheckInToBookingInputs<'_>) -> Vec<String> {
     let cust_type_main_q = sql_quote(CUST_TYPE_MAIN_INDIVIDUAL);
     let stay_start_q = sql_quote(&format_legacy_datetime(inputs.stay_start));
     let stay_end_q = sql_quote(&format_legacy_datetime(inputs.stay_end));
-    let now_q = sql_quote(&format_legacy_datetime(Utc::now()));
+    let now_q = sql_quote(&format_legacy_datetime(inputs.created_at));
     let occupying_q = sql_quote(CIN_ROOM_STATUS_OCCUPYING);
     let cin_status_q = sql_quote(CIN_STATUS_NORMAL);
     let cust_price_q = sql_quote(CUST_TYPE_NORMAL);
@@ -260,8 +264,6 @@ pub fn build_statements(inputs: &CheckInToBookingInputs<'_>) -> Vec<String> {
     //     literal SQL stays identical.
     statements.push(super::helpers::mark_cupon_printed(inputs.cin_no));
 
-    let _ = NaiveDate::from_ymd_opt(2026, 1, 1); // silence unused-import lint
-    let _ = Datelike::year(&Utc::now()); // silence unused-import lint
     let _ = price; // silence: kept on inputs for future per-night reporting
     statements
 }
@@ -310,6 +312,10 @@ pub async fn execute(
 
     let nights_calendar = enumerate_calendar_nights(payload.stay.start, payload.stay.end);
 
+    // Wave 5b item 4: capture `Utc::now()` once at the entry to `execute()`
+    // so `build_statements` is purely a function of its inputs.
+    let created_at = Utc::now();
+
     let inputs = CheckInToBookingInputs {
         cin_no: &cin_no,
         cust_no: &cust_no,
@@ -333,6 +339,7 @@ pub async fn execute(
         nights_calendar,
         checkin_ds_id,
         photo_tmp_no: payload.photo_tmp_no.as_deref(),
+        created_at,
     };
     let statements = build_statements(&inputs);
     super::execute_all(conn, &statements).await?;
@@ -402,6 +409,8 @@ mod tests {
             ],
             checkin_ds_id: 25009,
             photo_tmp_no: None,
+            // Wave 5b item 4: fixed instant for deterministic tests.
+            created_at: Utc.with_ymd_and_hms(2026, 4, 24, 10, 23, 2).unwrap(),
         }
     }
 
@@ -430,13 +439,20 @@ mod tests {
             nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],
             checkin_ds_id: 25014,
             photo_tmp_no: None,
+            // Wave 5b item 4: pin `Cin_Date` to the captured wall-clock
+            // (4/25/2026 11:32:02 AM Bangkok = 04:32:02 UTC) for exact
+            // byte-parity below.
+            created_at: Utc.with_ymd_and_hms(2026, 4, 25, 4, 32, 2).unwrap(),
         }
     }
 
     /// Byte-level parity for the HT_CheckIn_H statement against the
     /// captured booking-checkin for `CH26-005236` in
-    /// `/tmp/legacy-events-full.log`. We assert column list + value
-    /// tail; Cin_Date depends on `Utc::now()` at build time.
+    /// `/tmp/legacy-events-full.log`.
+    ///
+    /// Wave 5b item 4: `created_at` is now an input, so this asserts the
+    /// FULL line by exact-equality — no more substring-matching around
+    /// `Cin_Date`.
     #[test]
     fn checkin_h_matches_legacy_capture_byte_for_byte() {
         let s = build_statements(&capture_inputs());
@@ -444,22 +460,26 @@ mod tests {
             .iter()
             .find(|s| s.contains("[HT_CheckIn_H]"))
             .expect("HT_CheckIn_H INSERT must be emitted");
-        let head = "INSERT INTO [HT_CheckIn_H]([Cin_no],[Cin_Date],[Cin_Book_no],[Cin_cust_no],\
-                    [Cin_cust_price],[Cin_status],[Total_Price_Room],[Total_Price_Product],\
-                    [Total_Price_Net],[Total_Price_Pay],[Total_Price_Balance],[Cin_Car_type],\
-                    [Cin_Car_id],[Cin_Room_ALL],[Cin_by],[Cin_Date_in],[Cin_Date_Out],\
-                    [Cin_Type],[Cin_foreign])\
-                    VALUES('CH26-005236',";
-        assert!(
-            cin_h.starts_with(head),
-            "HT_CheckIn_H column list must match legacy capture; got:\n{cin_h}"
-        );
-        let tail = ",'R014820','C21624','ราคาปกติ','ปกติ',801.00,0.00,801.00,0.00,801.00,'','',\
-                    '414 ','Admin','4/25/2026 11:32:02 AM','4/26/2026 11:59:59 AM',0,'False')";
-        assert!(
-            cin_h.ends_with(tail),
-            "HT_CheckIn_H value tail must match legacy capture; got:\n{cin_h}"
-        );
+        let expected = "INSERT INTO [HT_CheckIn_H]([Cin_no],[Cin_Date],[Cin_Book_no],[Cin_cust_no],\
+                        [Cin_cust_price],[Cin_status],[Total_Price_Room],[Total_Price_Product],\
+                        [Total_Price_Net],[Total_Price_Pay],[Total_Price_Balance],[Cin_Car_type],\
+                        [Cin_Car_id],[Cin_Room_ALL],[Cin_by],[Cin_Date_in],[Cin_Date_Out],\
+                        [Cin_Type],[Cin_foreign])\
+                        VALUES('CH26-005236','4/25/2026 11:32:02 AM','R014820','C21624','ราคาปกติ',\
+                        'ปกติ',801.00,0.00,801.00,0.00,801.00,'','','414 ','Admin',\
+                        '4/25/2026 11:32:02 AM','4/26/2026 11:59:59 AM',0,'False')";
+        assert_eq!(cin_h, expected);
+    }
+
+    /// Wave 5b item 4: `build_statements` is PURE — no `Utc::now()`, no
+    /// I/O. Two invocations with identical inputs must produce identical
+    /// output. Pins the purity contract.
+    #[test]
+    fn build_statements_is_pure_with_fixed_instant() {
+        let inputs = sample_inputs();
+        let first = build_statements(&inputs);
+        let second = build_statements(&inputs);
+        assert_eq!(first, second, "build_statements must be deterministic");
     }
 
     #[test]

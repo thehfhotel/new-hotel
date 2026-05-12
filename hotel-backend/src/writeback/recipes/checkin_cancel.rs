@@ -105,10 +105,18 @@ pub fn build_statements(inputs: &CancelCheckInInputs<'_>) -> Vec<String> {
         format!(
             "update HT_CheckIn_H set cin_status={cancel_status_q} where cin_no={cin_no_q}"
         ),
-        // 7. Lights off with cancel-specific note
+        // 7. Lights off with cancel-specific note — Wave 5b item 3: restrict
+        //    to the **most-recent** open row for this room. If a prior
+        //    check-in left an open row (rare, but possible after a crashed
+        //    session), the previous shape closed all of them in one shot,
+        //    rewriting their `ROOM_POWER_END_BY` / `ROOM_POWER_NOTE2` and
+        //    polluting the power-log audit trail. The `id =
+        //    (SELECT MAX(id) … WHERE ROOM_POWER_END_BY='')` subquery
+        //    targets only the row this cancel actually owns.
         format!(
             "update HT_POWER_LOG SET ROOM_POWER_END=GETDATE(),ROOM_POWER_END_BY={by_q},\
-             ROOM_POWER_NOTE2={power_note_q} where room_no={room_no_q} and ROOM_POWER_END_BY=''"
+             ROOM_POWER_NOTE2={power_note_q} where room_no={room_no_q} and ROOM_POWER_END_BY='' \
+             and id = (SELECT MAX(id) FROM HT_POWER_LOG WHERE room_no={room_no_q} and ROOM_POWER_END_BY='')"
         ),
     ]
 }
@@ -250,6 +258,38 @@ mod tests {
         ]);
         let err = result.expect_err("Infinity must be rejected");
         assert!(err.to_string().contains("pay_to_subtract_baht"));
+    }
+
+    /// Wave 5b item 3: HT_POWER_LOG cancel must close only the row this
+    /// cancel actually owns — the **most-recent** open row for the room.
+    /// Prior shape (`WHERE room_no=… AND ROOM_POWER_END_BY=''`) would close
+    /// every open row, rewriting `ROOM_POWER_NOTE2` on a prior crashed
+    /// session's leftover row and corrupting the audit trail.
+    #[test]
+    fn ht_power_log_closes_only_most_recent_open_row() {
+        let inputs = CancelCheckInInputs {
+            cin_no: "CH26-005233",
+            room_no: "306",
+            rooms_cancel_id: 298,
+            price_to_subtract: 890.0,
+            pay_to_subtract: 0.0,
+            cancel_by: "Admin",
+            cancel_note: None,
+        };
+        let statements = build_statements(&inputs);
+        let power = statements
+            .iter()
+            .find(|s| s.starts_with("update HT_POWER_LOG"))
+            .expect("HT_POWER_LOG update must be emitted");
+        assert!(
+            power.contains(
+                "id = (SELECT MAX(id) FROM HT_POWER_LOG WHERE room_no='306' and ROOM_POWER_END_BY='')"
+            ),
+            "must restrict to most-recent open row: {power}"
+        );
+        // Defense: original room_no + ROOM_POWER_END_BY filters are still in
+        // the WHERE so the subquery scope and outer-update scope match.
+        assert!(power.contains("where room_no='306' and ROOM_POWER_END_BY=''"));
     }
 
     #[test]
