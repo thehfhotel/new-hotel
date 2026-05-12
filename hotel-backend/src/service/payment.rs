@@ -51,6 +51,18 @@ pub struct RecordPaymentCommand {
     /// multi-room allocations — the recipe then skips the per-room UPDATE
     /// and only refreshes the header totals.
     pub checkin_ds_id: Option<i32>,
+    /// Wave 5a item 2 — canonical per-night rate looked up from
+    /// `ht_checkins.cin_rate_per_night` by the route. Threads into the
+    /// recipe's `HT_CheckIn_Pay.Cin_Pay_Ds_PriceOne` column so the
+    /// printed receipt line shows the real per-night price instead of
+    /// the recipe's `amount/nights` fallback. `None` means the route
+    /// couldn't resolve a rate (orphaned check-in) — the recipe then
+    /// uses the fallback.
+    pub price_per_night_baht: Option<f64>,
+    /// Wave 5a item 2 — nights covered by the payment (>=1). Routes
+    /// pass `ht_checkins.expected_checkout - check_in_time` clamped to
+    /// >=1. `None` defaults to 1 in the recipe.
+    pub nights: Option<i32>,
     pub source: EventSource,
 }
 
@@ -137,12 +149,29 @@ impl PaymentService {
         let check_in_aggregate_id = aggregate_uuid(AggregateKind::CheckIn, cmd.check_in_id);
         let payment_aggregate_id = aggregate_uuid(AggregateKind::Payment, pay_id);
 
+        // Wave 5a item 3: stamp the aggregate_id onto the canonical row so
+        // the writeback worker's `back_populate_legacy_ids` step can target
+        // it via `WHERE aggregate_id = $1` (matches the pattern from
+        // migration 014 for ht_bookings / ht_checkins).
+        self.repo
+            .stamp_aggregate_id(&mut tx, pay_id, payment_aggregate_id)
+            .await?;
+
         let intent = WritebackIntent::RecordPayment {
             check_in_id: check_in_aggregate_id,
             amount: Money::from_satang(cmd.amount_satang),
             method: cmd.method,
             receipt: cmd.receipt.clone(),
             checkin_ds_id: cmd.checkin_ds_id,
+            // Wave 5a item 2: surface the canonical per-night rate so the
+            // recipe stops deriving it as `amount/nights` (which is wrong
+            // for partial-night payments and multi-room apportionment).
+            price_per_night_baht: cmd.price_per_night_baht,
+            nights: cmd.nights,
+            // Wave 5a item 3: target row for `back_populate_legacy_ids` to
+            // stamp `legacy_pay_no` / `legacy_receipt_no` on after the
+            // recipe allocates them.
+            payment_aggregate_id: Some(payment_aggregate_id),
         };
         // Use the payment id (not the check-in id) as the idempotency
         // discriminator so multiple payments against the same check-in

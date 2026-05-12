@@ -447,10 +447,21 @@ CREATE TABLE IF NOT EXISTS ht_payments (
     pay_voided_at TIMESTAMP,
     pay_voided_by VARCHAR(50),
     created_at TIMESTAMP DEFAULT NOW(),
+    -- Migration 030 — populated by the writeback worker's back-population
+    -- step after the legacy `record_payment` recipe allocates them.
+    legacy_pay_no VARCHAR(20),
+    legacy_receipt_no VARCHAR(20),
+    aggregate_id UUID,
     CONSTRAINT fk_ht_payments_checkin FOREIGN KEY (pay_cin_id) REFERENCES ht_checkins(cin_id)
 );
 CREATE INDEX IF NOT EXISTS ix_ht_payments_checkin ON ht_payments(pay_cin_id);
 CREATE INDEX IF NOT EXISTS ix_ht_payments_date ON ht_payments(pay_date);
+CREATE INDEX IF NOT EXISTS ix_ht_payments_legacy_pay_no
+    ON ht_payments (legacy_pay_no) WHERE legacy_pay_no IS NOT NULL;
+CREATE INDEX IF NOT EXISTS ix_ht_payments_legacy_receipt_no
+    ON ht_payments (legacy_receipt_no) WHERE legacy_receipt_no IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ht_payments_aggregate_id
+    ON ht_payments (aggregate_id) WHERE aggregate_id IS NOT NULL;
 
 -- =============================================================================
 -- Maintenance System

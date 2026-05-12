@@ -77,6 +77,17 @@ pub trait PaymentRepository: Send + Sync {
         insert: PaymentInsert<'_>,
     ) -> Result<i32, sqlx::Error>;
 
+    /// Stamp `ht_payments.aggregate_id` for a freshly-inserted row. Required
+    /// for the writeback worker's `back_populate_legacy_ids` step to target
+    /// the payment from `WritebackIntent::RecordPayment.payment_aggregate_id`
+    /// (Wave 5a item 3).
+    async fn stamp_aggregate_id(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        pay_id: i32,
+        aggregate_id: uuid::Uuid,
+    ) -> Result<(), sqlx::Error>;
+
     /// Look up just the void-related fields of a payment.
     async fn find_for_void(
         &self,
@@ -177,6 +188,23 @@ impl PaymentRepository for PgPaymentRepository {
         .fetch_one(&mut **tx)
         .await?;
         Ok(rec.pay_id)
+    }
+
+    async fn stamp_aggregate_id(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        pay_id: i32,
+        aggregate_id: uuid::Uuid,
+    ) -> Result<(), sqlx::Error> {
+        // Dynamic `sqlx::query` (not `query!`) so this doesn't require a
+        // `.sqlx/` cache regeneration. The column was added by migration 030
+        // — `aggregate_id UUID` keyed off the SERIAL `pay_id`.
+        sqlx::query("UPDATE ht_payments SET aggregate_id = $2 WHERE pay_id = $1")
+            .bind(pay_id)
+            .bind(aggregate_id)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
     }
 
     async fn find_for_void(

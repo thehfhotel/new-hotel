@@ -188,6 +188,11 @@ pub async fn create_payment(
             // TODO: thread `room_id` through `CreatePaymentRequest` for
             // multi-room support.
             let checkin_ds_id: Option<i32> = None;
+            // Wave 5a item 2: resolve the canonical per-night rate + nights
+            // from `ht_checkins` so the writeback recipe stamps the real
+            // values into `HT_CheckIn_Pay.Cin_Pay_Ds_PriceOne` /
+            // `Cin_Pay_Ds_Num` instead of deriving them as `amount/nights`.
+            let (price_per_night_baht, nights) = resolve_checkin_billing(&state, cin_id).await;
             let outcome = state
                 .payments_service
                 .record_payment(RecordPaymentCommand {
@@ -199,6 +204,8 @@ pub async fn create_payment(
                     created_by: body.created_by.clone(),
                     receipt,
                     checkin_ds_id,
+                    price_per_night_baht,
+                    nights,
                     // TODO: wire user_id from auth middleware
                     source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
                 })
@@ -296,6 +303,26 @@ fn full_customer_name(first: &str, last: Option<&str>) -> String {
 
 fn baht_f64_to_satang(baht: f64) -> i64 {
     (baht * 100.0).round() as i64
+}
+
+/// Wave 5a item 2 — resolve the canonical per-night rate + nights from
+/// `ht_checkins` so the route can thread them through to the writeback
+/// recipe via the [`RecordPaymentCommand`] payload.
+///
+/// Returns `(None, None)` when the lookup fails (orphaned check-in, PG
+/// outage); the recipe then falls back to its defensive `amount/nights`
+/// derivation. We deliberately swallow the error here rather than failing
+/// the payment: the payment still has to land in `ht_payments` even when
+/// the rate lookup hiccups — the legacy receipt line just won't carry the
+/// real per-night price (cosmetic, not data loss).
+async fn resolve_checkin_billing(
+    state: &AppState,
+    cin_id: i32,
+) -> (Option<f64>, Option<i32>) {
+    match state.payments.check_in_billing(&state.new_pool, cin_id).await {
+        Ok(Some(b)) => (b.cin_rate_per_night, b.nights.map(|n| n.max(1))),
+        _ => (None, None),
+    }
 }
 
 /// Direct repository insert for the "qr" tender method. Preserves the

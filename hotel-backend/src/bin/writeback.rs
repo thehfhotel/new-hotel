@@ -1214,11 +1214,24 @@ async fn mark_done(
             return;
         }
         Err(err) => {
-            tracing::error!(job_id, error = %err, "Failed to mark job done");
-            // Don't bail — still attempt back-population so subsequent
-            // intents on the same aggregate can resolve. The stuck-in-
-            // progress janitor will eventually retry this job's status row
-            // if the UPDATE truly never landed.
+            // Wave 5a item 4: when the `mark_done` UPDATE itself errors we
+            // can't distinguish "status flip never landed" from "status
+            // flipped but the RETURNING read errored" — and we may be
+            // racing the janitor's stolen claim in another worker. The
+            // safe choice is to skip back-population so we don't clobber
+            // a stolen-claim winner's legacy_ids with our (potentially
+            // stale) values. The resolver's self-heal path
+            // (`salvage_legacy_ids`) will fish the ids out of
+            // `writeback_jobs.legacy_ids` JSONB at the next intent on the
+            // same aggregate, so no data loss — just a slower lookup.
+            tracing::error!(
+                job_id,
+                error = %err,
+                "Failed to mark job done; skipping back-population to avoid \
+                 clobbering a stolen-claim winner. Resolver self-heal will \
+                 recover legacy_ids from writeback_jobs at next intent."
+            );
+            return;
         }
     }
 
@@ -1276,6 +1289,8 @@ async fn back_populate_legacy_ids(
     let cust_no = legacy_ids.get("cust_no").and_then(|v| v.as_str());
     let cin_no = legacy_ids.get("cin_no").and_then(|v| v.as_str());
     let room_no = legacy_ids.get("room_no").and_then(|v| v.as_str());
+    let pay_no = legacy_ids.get("pay_no").and_then(|v| v.as_str());
+    let receipt_no = legacy_ids.get("receipt_no").and_then(|v| v.as_str());
     let checkin_ds_id = legacy_ids.get("checkin_ds_id").and_then(|v| v.as_i64()).map(|n| n as i32);
 
     use WritebackIntent::*;
@@ -1296,7 +1311,7 @@ async fn back_populate_legacy_ids(
                 .await?;
             }
         }
-        CreateCheckIn { .. } | CancelCheckIn { .. } | ExtendStay { .. } | CheckOut { .. } | RecordPayment { .. } => {
+        CreateCheckIn { .. } | CancelCheckIn { .. } | ExtendStay { .. } | CheckOut { .. } => {
             if cin_no.is_some() || room_no.is_some() || cust_no.is_some() || checkin_ds_id.is_some() {
                 sqlx::query(
                     "UPDATE ht_checkins SET \
@@ -1312,6 +1327,47 @@ async fn back_populate_legacy_ids(
                 .bind(room_no)
                 .bind(cust_no)
                 .bind(checkin_ds_id)
+                .execute(pg)
+                .await?;
+            }
+        }
+        RecordPayment { payment_aggregate_id, .. } => {
+            // Payment back-population is split-target: ht_checkins keeps the
+            // check-in identifiers (the aggregate_id passed in is the
+            // check-in's), and ht_payments gets the freshly-allocated
+            // legacy_pay_no / legacy_receipt_no keyed off the payment's own
+            // aggregate_id (Wave 5a item 3). Both UPDATEs are independent —
+            // either can land without the other.
+            if cin_no.is_some() || room_no.is_some() || cust_no.is_some() || checkin_ds_id.is_some() {
+                sqlx::query(
+                    "UPDATE ht_checkins SET \
+                       legacy_cin_no        = COALESCE($2, legacy_cin_no), \
+                       legacy_room_no       = COALESCE($3, legacy_room_no), \
+                       legacy_cust_no       = COALESCE($4, legacy_cust_no), \
+                       legacy_checkin_ds_id = COALESCE($5, legacy_checkin_ds_id), \
+                       updated_at = NOW() \
+                     WHERE aggregate_id = $1",
+                )
+                .bind(aggregate_id)
+                .bind(cin_no)
+                .bind(room_no)
+                .bind(cust_no)
+                .bind(checkin_ds_id)
+                .execute(pg)
+                .await?;
+            }
+            if let (Some(pay_aggregate), true) =
+                (payment_aggregate_id, pay_no.is_some() || receipt_no.is_some())
+            {
+                sqlx::query(
+                    "UPDATE ht_payments SET \
+                       legacy_pay_no     = COALESCE($2, legacy_pay_no), \
+                       legacy_receipt_no = COALESCE($3, legacy_receipt_no) \
+                     WHERE aggregate_id = $1",
+                )
+                .bind(pay_aggregate)
+                .bind(pay_no)
+                .bind(receipt_no)
                 .execute(pg)
                 .await?;
             }
@@ -1974,5 +2030,52 @@ mod tests {
         assert_eq!(cloned.claimed_at, claimed_at);
         assert_eq!(cloned.id, 42);
         assert_eq!(cloned.attempts, 1);
+    }
+
+    /// Wave 5a item 4 — the `Err(_)` arm of `mark_done`'s row-match
+    /// must skip back-population entirely. Since the function takes
+    /// a live `&PgPool` argument we can't unit-test the dispatch
+    /// runtime, but we can structurally pin the source-code shape:
+    /// the `Err(err) =>` arm in the match must contain an early
+    /// `return` BEFORE the back_populate_legacy_ids retry loop.
+    /// A regression that drops the `return` would silently let a
+    /// stale `legacy_ids` clobber a stolen-claim winner's row.
+    #[test]
+    fn mark_done_err_arm_returns_before_back_population() {
+        let source = include_str!("writeback.rs");
+        // Find the `mark_done` function body.
+        let fn_start = source
+            .find("async fn mark_done(")
+            .expect("mark_done must exist");
+        // Find the back-pop retry loop.
+        let back_pop_pos = source[fn_start..]
+            .find("back_populate_legacy_ids(pg, aggregate_id, intent, &legacy_ids)")
+            .expect("mark_done must call back_populate_legacy_ids");
+        // Find the `Err(err) =>` arm of the match.
+        let err_arm_pos = source[fn_start..]
+            .find("Err(err) => {")
+            .expect("mark_done must have an Err(err) match arm");
+        assert!(
+            err_arm_pos < back_pop_pos,
+            "Err(err) arm must precede the back-pop call (it's inside the \
+             match that classifies the mark_done UPDATE result)"
+        );
+        // From the Err arm, locate the next `return;` and the next `}` so
+        // we can assert the early-return sits inside the arm.
+        let from_err = &source[fn_start + err_arm_pos..];
+        let return_pos = from_err
+            .find("return;")
+            .expect("Err arm must contain `return;` per Wave 5a item 4");
+        // The back-pop loop is far below the Err arm (after the closing
+        // `}` of the match). We need the `return;` to come BEFORE the
+        // back-pop call to guarantee the Err path skips it.
+        let abs_return = fn_start + err_arm_pos + return_pos;
+        let abs_back_pop = fn_start + back_pop_pos;
+        assert!(
+            abs_return < abs_back_pop,
+            "the Err arm's `return;` must execute before the back-pop \
+             retry loop — otherwise a failed status-flip could still \
+             clobber a stolen-claim winner's legacy_ids"
+        );
     }
 }

@@ -165,6 +165,24 @@ pub enum WritebackIntent {
         /// skips the per-room UPDATE — totals on `HT_CheckIn_H` still settle.
         #[serde(default)]
         checkin_ds_id: Option<i32>,
+        /// Wave 5a item 2 — canonical per-night rate (`ht_checkins.cin_rate_per_night`)
+        /// in baht. Lands verbatim in `HT_CheckIn_Pay.Cin_Pay_Ds_PriceOne` so
+        /// the printed receipt line shows the real per-night price. `None`
+        /// makes the recipe fall back to `amount/nights` (the prior behavior;
+        /// kept defensive for queue rows enqueued before this field landed).
+        #[serde(default)]
+        price_per_night_baht: Option<f64>,
+        /// Wave 5a item 2 — nights covered by the payment (>=1). Lands in
+        /// `HT_CheckIn_Pay.Cin_Pay_Ds_Num`. `None` defaults to 1 in the
+        /// recipe.
+        #[serde(default)]
+        nights: Option<i32>,
+        /// Wave 5a item 3 — `ht_payments.aggregate_id` of the canonical row
+        /// the writeback worker should back-populate with the newly-allocated
+        /// `legacy_pay_no` / `legacy_receipt_no`. `None` skips the
+        /// back-population step (older queued intents won't carry it).
+        #[serde(default)]
+        payment_aggregate_id: Option<Uuid>,
     },
 
     /// Spike §3j — `UPDATE HT_Rooms` (by `id`, not `room_no`!) +
@@ -225,6 +243,17 @@ pub struct CreateCheckInPayload {
     pub created_by: String,
     pub guest_name_for_registry: String,
     pub guest_country: String,
+
+    /// Customer phone number for the booking-linked check-in's
+    /// `UPDATE HT_Customers SET Cust_Add_tel=…` step (Wave 5a item 1).
+    /// `None` is treated as "phone unknown" and renders as the empty
+    /// string in the legacy column (mirrors the prior behavior — the
+    /// legacy schema rejects NULL on Cust_Add_tel so empty string is
+    /// the preferred sentinel). Routes look this up from
+    /// `ht_customers.cust_phone` when assembling the payload so the
+    /// booking-time phone isn't wiped on every check-in.
+    #[serde(default)]
+    pub customer_phone: Option<String>,
 
     /// Optional `Tb_Save_Image.tmp_no` for the temporary photo upload
     /// associated with this check-in. The legacy app fires

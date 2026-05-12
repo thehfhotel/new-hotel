@@ -150,6 +150,21 @@ pub struct DispatchContext {
 /// once per writeback session BEFORE any recipe SQL runs. New
 /// `WritebackIntent` variants must extend the `match` below — the
 /// compiler's exhaustiveness check is the structural enforcement.
+///
+/// ## Pool isolation contract (Wave 5a item 6)
+///
+/// `SET CONTEXT_INFO 0x4E48` is **session-scoped**: it persists on the bb8
+/// connection after it returns to the pool. That is safe **only** because
+/// the writeback worker (`hotel-backend/src/bin/writeback.rs`) owns a
+/// dedicated MSSQL pool created via `create_pool(&mssql_config)` at the
+/// top of `main()`. No other code path acquires from this pool — the
+/// backend's `AppState.legacy_pool` is a separate `bb8::Pool` instance in
+/// a different process. If a future refactor shares the writeback pool
+/// with non-writeback callers (e.g. ad-hoc legacy reads), this assumption
+/// breaks and an `on_release` hook that clears `CONTEXT_INFO` back to 0
+/// would be required to avoid leaking the `0x4E48` tag onto reader
+/// queries. The audit doc (`docs/legacy-spike/writeback-audit-2026-05-12.md`
+/// MED cluster) tracks this contract.
 pub async fn dispatch(
     conn: &mut LegacyConn<'_>,
     intent: &WritebackIntent,
@@ -313,6 +328,9 @@ pub async fn dispatch(
             method,
             receipt,
             checkin_ds_id,
+            price_per_night_baht,
+            nights,
+            payment_aggregate_id: _,
         } => {
             let cin_no = nonempty(resolved.legacy_cin_no.as_ref()).ok_or_else(|| {
                 WritebackError::Recipe("RecordPayment requires resolved legacy_cin_no".into())
@@ -324,7 +342,16 @@ pub async fn dispatch(
                 WritebackError::Recipe("RecordPayment requires resolved legacy_room_no".into())
             })?;
             recipes::payment::execute(
-                conn, cin_no, cust_no, room_no, *amount, *method, receipt, *checkin_ds_id,
+                conn,
+                cin_no,
+                cust_no,
+                room_no,
+                *amount,
+                *method,
+                receipt,
+                *checkin_ds_id,
+                *price_per_night_baht,
+                *nights,
             )
             .await
         }

@@ -45,6 +45,11 @@ pub struct CheckInWritebackContext {
     pub created_by: String,
     pub guest_name_for_registry: String,
     pub guest_country: String,
+    /// Optional customer phone — threaded through to
+    /// [`CreateCheckInPayload::customer_phone`] so the booking-linked
+    /// check-in's `UPDATE HT_Customers SET [Cust_Add_tel]=…` preserves
+    /// the booking-time phone instead of wiping it (Wave 5a item 1).
+    pub customer_phone: Option<String>,
 }
 
 /// Command for [`CheckInService::walk_in`] — no prior booking exists.
@@ -556,6 +561,9 @@ impl CheckInService {
             created_by: ctx.created_by.clone(),
             guest_name_for_registry: ctx.guest_name_for_registry.clone(),
             guest_country: ctx.guest_country.clone(),
+            // Wave 5a item 1 — preserve booking-time phone instead of
+            // wiping `HT_Customers.Cust_Add_tel` on every check-in.
+            customer_phone: ctx.customer_phone.clone(),
             // photo plumbing arrives in a follow-up — see audit HIGH-3.
             photo_tmp_no: None,
         };

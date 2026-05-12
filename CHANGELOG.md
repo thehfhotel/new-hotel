@@ -5,6 +5,109 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.63.6] - 2026-05-12
+
+### Fixed
+
+- **Writeback MED cluster part A — payload, retry, fingerprint (Wave 5a
+  `docs/legacy-spike/writeback-audit-2026-05-12.md`).** Six MED-severity
+  fixes that thicken the service→intent→recipe payload, harden the
+  worker's back-population step against stolen-claim races, and expand
+  the startup schema-drift detector to cover the five tables the recipes
+  actually touch:
+  - **Item 1 — customer phone preserve.**
+    `writeback/recipes/checkin_to_booking.rs::execute` now threads the
+    booking-time phone from `CreateCheckInPayload.customer_phone` into
+    `Cust_Add_tel` instead of passing `None` unconditionally. Prior code
+    wiped `HT_Customers.Cust_Add_tel` on every booking-linked check-in,
+    forcing receptionists to re-enter the phone after each guest
+    arrival. Plumbed end-to-end:
+    `routes/new_checkins::build_check_in_writeback_context` now reads
+    `ht_customers.cust_phone`, `service/checkin::CheckInWritebackContext`
+    carries it, `service/checkin::enqueue_create_check_in` copies it
+    into the payload, and the recipe's
+    `customer_phone_preserved_when_supplied` + `_renders_empty_string_when_none`
+    tests pin both branches.
+  - **Item 2 — `price_per_night` plumbed from service.**
+    `WritebackIntent::RecordPayment` gains `price_per_night_baht:
+    Option<f64>` and `nights: Option<i32>` fields, populated by
+    `routes/new_payments::resolve_checkin_billing` from
+    `ht_checkins.cin_rate_per_night` + the derived stay-nights count.
+    The recipe's `amount/nights` fallback is preserved as defensive
+    only (kept for queue rows enqueued before this field landed).
+    `price_per_night_from_payload_used_when_supplied` +
+    `_falls_back_to_amount_over_nights_when_none` pin both paths.
+  - **Item 3 — `ht_payments` back-population.** Migration 030
+    (`030_add_ht_payments_legacy_columns.sql`) adds
+    `legacy_pay_no VARCHAR(20)`, `legacy_receipt_no VARCHAR(20)`,
+    `aggregate_id UUID` to `ht_payments` (mirrors migration 014's
+    convention for `ht_bookings` / `ht_checkins`).
+    `WritebackIntent::RecordPayment` carries
+    `payment_aggregate_id: Option<Uuid>` so the worker's
+    `back_populate_legacy_ids` can target the canonical payment row
+    after the recipe allocates `Pay_no` / `Receipt_no`.
+    `service/payment::record_payment` stamps `aggregate_id` on the
+    fresh row inside the same PG transaction as the INSERT and the
+    outbox enqueue, so an operator can trace any
+    `ht_payments` row back to its legacy `HT_CheckIn_Pay.Pay_no` /
+    `HT_Receipt_H.Receipt_no` from the canonical state alone — no
+    JSONB dive into `writeback_jobs.legacy_ids` required.
+  - **Item 4 — back-pop guard on `Err` arm.**
+    `bin/writeback.rs::mark_done` now `return`s early on `Err(err)`
+    from the status-flip UPDATE, matching the `Ok(None)` (stolen-claim)
+    behavior. The prior code fell through and ran
+    `back_populate_legacy_ids` even when the UPDATE itself errored,
+    risking a clobber of a stolen-claim winner's `legacy_*` columns
+    with our (possibly stale) values. The resolver's self-heal path
+    (`salvage_legacy_ids`) still recovers the IDs from
+    `writeback_jobs.legacy_ids` JSONB at the next intent, so no data
+    loss — just a slower lookup. Pinned by
+    `mark_done_err_arm_returns_before_back_population`, a textual
+    source-code structural assertion analogous to
+    `dispatcher::dispatch_calls_set_context_info_before_recipes`.
+  - **Item 5 — fingerprint expansion.**
+    `writeback/fingerprint.rs::FINGERPRINTED_TABLES` now covers 15
+    tables (up from 10): added `HT_Cupon` (loyalty mark-printed),
+    `HT_CheckIn_Pay` (payment row), `HT_Receipt_Ds` (receipt line),
+    `HT_POWER_LOG` (lights audit), and `HT_Changed_Room` (room-move
+    audit, pre-emptive). `EXPECTED_SCHEMA_BASELINE` extended with the
+    55 new column tuples derived from
+    `docs/legacy-spike/schema/01-baseline-schema.txt` lines 200-207,
+    253-274, 292-298, 422-429, 445-454. `EXPECTED_FINGERPRINT`
+    recomputed → `8e076342babe5394b149c6e5aea5801348329e4a6a227118b31714e5e5d504b0`.
+    A vendor rename on any of these five tables previously slipped
+    past the startup drift check and would have silently corrupted
+    the recipe; now the worker refuses to start. Six new tests
+    (`fingerprinted_tables_includes_wave_5a_additions`,
+    `tracks_ht_{cupon,checkin_pay,receipt_ds,power_log,changed_room}_table`).
+  - **Item 6 — `set_context_info` pool reuse hygiene.** Documented
+    the writeback pool isolation contract in
+    `writeback/dispatcher.rs::dispatch`'s docstring: `SET CONTEXT_INFO
+    0x4E48` persists on the bb8 connection after release, but that's
+    safe because the writeback binary creates its own MSSQL pool at
+    `main()` startup and no other code path acquires from it (the
+    backend's `AppState.legacy_pool` is a separate `bb8::Pool` in a
+    different process). If a future refactor shares the writeback pool
+    with non-writeback callers, an `on_release` hook clearing
+    `CONTEXT_INFO` to 0 will be required to avoid leaking the tag onto
+    reader queries.
+
+  Eleven new unit tests across `writeback::recipes::checkin_to_booking::tests`,
+  `writeback::recipes::payment::tests`, `writeback::fingerprint::tests`,
+  and `bin::writeback::tests` lock in the fixes. Full unit suite (486
+  tests across lib + binaries, up from 475 baseline) passes; the 3
+  PG-requiring integration tests in `tests/test_bookings.rs` continue to
+  fail on a host without a live PostgreSQL instance (pre-existing
+  baseline). Clippy output unchanged at 81 warnings — zero new.
+
+### Database
+
+- **Migration 030 — `ht_payments.legacy_pay_no` + `legacy_receipt_no` +
+  `aggregate_id`.** See `migrations/pg/030_add_ht_payments_legacy_columns.sql`.
+  Adds three nullable columns with partial unique / lookup indexes; existing
+  rows get NULL (the writeback worker's self-heal path handles missing
+  IDs by falling back to `writeback_jobs.legacy_ids` JSONB).
+
 ## [2.63.5] - 2026-05-12
 
 ### Fixed

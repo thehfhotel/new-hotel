@@ -28,6 +28,14 @@ use crate::writeback::error::{WritebackError, WritebackResult};
 /// Tables the writeback worker touches. The fingerprint check covers exactly
 /// these — adding a recipe that writes to a new table requires extending this
 /// list AND regenerating [`EXPECTED_FINGERPRINT`].
+///
+/// Wave 5a item 5 added the trailing five: `HT_Cupon` (mark-printed UPDATE
+/// from walkin / checkin_to_booking), `HT_CheckIn_Pay` (payment INSERT),
+/// `HT_Receipt_Ds` (receipt line INSERT), `HT_POWER_LOG` (lights on/off
+/// audit from walkin / checkin_to_booking / checkout / checkin_cancel),
+/// `HT_Changed_Room` (room-move audit — not yet touched by a recipe but
+/// the audit doc flagged it as in-scope for the next wave; fingerprinting
+/// up-front avoids a separate baseline bump later).
 pub const FINGERPRINTED_TABLES: &[&str] = &[
     "HT_Customers",
     "HT_Book_H",
@@ -39,6 +47,11 @@ pub const FINGERPRINTED_TABLES: &[&str] = &[
     "HT_Rooms",
     "HT_Room_Status",
     "HT_Rooms_Cancel",
+    "HT_Cupon",
+    "HT_CheckIn_Pay",
+    "HT_Receipt_Ds",
+    "HT_POWER_LOG",
+    "HT_Changed_Room",
 ];
 
 /// Captured column tuples from `docs/legacy-spike/schema/01-baseline-schema.txt`
@@ -65,6 +78,12 @@ pub const FINGERPRINTED_TABLES: &[&str] = &[
 /// - Reordered columns
 /// - Removed columns
 const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
+    // Live MSSQL ORDER BY TABLE_NAME, ORDINAL_POSITION sorts table names
+    // case-sensitive on SQL Server's default collation. Verified order
+    // against the schema dump in `docs/legacy-spike/schema/01-baseline-schema.txt`:
+    //   HT_Book_*, HT_Changed_Room, HT_CheckIn_*, HT_Cupon, HT_Customers,
+    //   HT_POWER_LOG, HT_Receipt_*, HT_Room_Status, HT_Rooms, HT_Rooms_Cancel.
+
     // HT_Book_Date — spike baseline lines 119-126
     ("HT_Book_Date", 1, "id", "int"),
     ("HT_Book_Date", 2, "Book_no", "varchar"),
@@ -105,6 +124,17 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_Book_H", 16, "Book_Notify_Day", "int"),
     ("HT_Book_H", 17, "Book_Notify_Note", "varchar"),
     ("HT_Book_H", 18, "Book_Sale", "varchar"),
+    // HT_Changed_Room — Wave 5a item 5. Spike baseline lines 200-207.
+    // 8 columns. Not yet touched by a recipe (room-move audit) but
+    // fingerprinted so a future recipe doesn't drift unobserved.
+    ("HT_Changed_Room", 1, "id", "int"),
+    ("HT_Changed_Room", 2, "cin_no", "varchar"),
+    ("HT_Changed_Room", 3, "room_before", "varchar"),
+    ("HT_Changed_Room", 4, "room_after", "varchar"),
+    ("HT_Changed_Room", 5, "change_date", "datetime"),
+    ("HT_Changed_Room", 6, "room_before_price", "float"),
+    ("HT_Changed_Room", 7, "Note", "varchar"),
+    ("HT_Changed_Room", 8, "ToPrice", "varchar"),
     // HT_CheckIn_Ds — lines 208-226
     ("HT_CheckIn_Ds", 1, "id", "int"),
     ("HT_CheckIn_Ds", 2, "Cin_No", "varchar"),
@@ -148,6 +178,40 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_CheckIn_H", 20, "Cin_note", "varchar"),
     ("HT_CheckIn_H", 21, "Cin_foreign", "varchar"),
     ("HT_CheckIn_H", 22, "Cin_Work_number", "int"),
+    // HT_CheckIn_Pay — Wave 5a item 5. Spike baseline lines 253-274.
+    // 22 columns. Payment recipe `INSERT INTO [HT_CheckIn_Pay] (...)`.
+    ("HT_CheckIn_Pay", 1, "id", "int"),
+    ("HT_CheckIn_Pay", 2, "Pay_no", "varchar"),
+    ("HT_CheckIn_Pay", 3, "Cin_No", "varchar"),
+    ("HT_CheckIn_Pay", 4, "Cin_Pay_Ds", "varchar"),
+    ("HT_CheckIn_Pay", 5, "Cin_Pay_Cash", "float"),
+    ("HT_CheckIn_Pay", 6, "Cin_Pay_Credit", "float"),
+    ("HT_CheckIn_Pay", 7, "Cin_Pay_Date", "datetime"),
+    ("HT_CheckIn_Pay", 8, "Cin_Pay_Ds_Name", "varchar"),
+    ("HT_CheckIn_Pay", 9, "Cin_Pay_Ds_ID", "varchar"),
+    ("HT_CheckIn_Pay", 10, "Cin_Pay_Ds_Price", "float"),
+    ("HT_CheckIn_Pay", 11, "Cin_Pay_Ds_unit", "varchar"),
+    ("HT_CheckIn_Pay", 12, "Cin_Pay_Ds_Num", "float"),
+    ("HT_CheckIn_Pay", 13, "Cin_Pay_Ds_PriceOne", "float"),
+    ("HT_CheckIn_Pay", 14, "Cin_Pay_Ds_PriceTotal", "float"),
+    ("HT_CheckIn_Pay", 15, "Cin_Cust_no", "varchar"),
+    ("HT_CheckIn_Pay", 16, "Cin_Status", "varchar"),
+    ("HT_CheckIn_Pay", 17, "Cin_Pay_Note", "varchar"),
+    ("HT_CheckIn_Pay", 18, "Pay_by", "varchar"),
+    ("HT_CheckIn_Pay", 19, "Cin_Pay_Free", "float"),
+    ("HT_CheckIn_Pay", 20, "Cin_Pay_Tran", "float"),
+    ("HT_CheckIn_Pay", 21, "Branch", "varchar"),
+    ("HT_CheckIn_Pay", 22, "Cin_Pay_web", "float"),
+    // HT_Cupon — Wave 5a item 5. Spike baseline lines 292-298.
+    // 7 columns. Walkin / checkin_to_booking emit the mark-printed
+    // UPDATE via helpers::mark_cupon_printed.
+    ("HT_Cupon", 1, "cupon_no", "int"),
+    ("HT_Cupon", 2, "cupon_cin_no", "varchar"),
+    ("HT_Cupon", 3, "cupon_cin_room", "varchar"),
+    ("HT_Cupon", 4, "cupon_date", "datetime"),
+    ("HT_Cupon", 5, "cupon_gen_date", "datetime"),
+    ("HT_Cupon", 6, "cupon_by", "varchar"),
+    ("HT_Cupon", 7, "cupon_print", "int"),
     // HT_Customers — lines 299-335 (35 columns)
     ("HT_Customers", 1, "id", "int"),
     ("HT_Customers", 2, "Cust_no", "varchar"),
@@ -184,6 +248,29 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_Customers", 33, "Cust_Price_Over", "float"),
     ("HT_Customers", 34, "Cust_Contry", "varchar"),
     ("HT_Customers", 35, "Cust_Work_Tax", "varchar"),
+    // HT_POWER_LOG — Wave 5a item 5. Spike baseline lines 422-429.
+    // 8 columns. Walkin / checkin_to_booking INSERT (lights on);
+    // checkin_cancel / checkout UPDATE (lights off).
+    ("HT_POWER_LOG", 1, "id", "int"),
+    ("HT_POWER_LOG", 2, "ROOM_NO", "varchar"),
+    ("HT_POWER_LOG", 3, "ROOM_POWER_START", "datetime"),
+    ("HT_POWER_LOG", 4, "ROOM_POWER_END", "datetime"),
+    ("HT_POWER_LOG", 5, "ROOM_POWER_START_BY", "varchar"),
+    ("HT_POWER_LOG", 6, "ROOM_POWER_END_BY", "varchar"),
+    ("HT_POWER_LOG", 7, "ROOM_POWER_NOTE", "varchar"),
+    ("HT_POWER_LOG", 8, "ROOM_POWER_NOTE2", "varchar"),
+    // HT_Receipt_Ds — Wave 5a item 5. Spike baseline lines 445-454.
+    // 10 columns. Payment recipe INSERT (receipt line for room charge).
+    ("HT_Receipt_Ds", 1, "id", "int"),
+    ("HT_Receipt_Ds", 2, "S_Sale_id", "int"),
+    ("HT_Receipt_Ds", 3, "S_Product_no", "varchar"),
+    ("HT_Receipt_Ds", 4, "S_Product_name", "varchar"),
+    ("HT_Receipt_Ds", 5, "S_Unit", "float"),
+    ("HT_Receipt_Ds", 6, "S_UnitName", "varchar"),
+    ("HT_Receipt_Ds", 7, "S_Price", "float"),
+    ("HT_Receipt_Ds", 8, "S_Total", "float"),
+    ("HT_Receipt_Ds", 9, "S_PriceDiscount", "float"),
+    ("HT_Receipt_Ds", 10, "S_PriceDiscount_per", "varchar"),
     // HT_Receipt_H — lines 455-474 (20 columns)
     ("HT_Receipt_H", 1, "id", "int"),
     ("HT_Receipt_H", 2, "Receipt_no", "varchar"),
@@ -255,7 +342,7 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
 /// committed alongside `01-baseline-schema.txt` so the worker can refuse to
 /// start without re-running the test.
 pub const EXPECTED_FINGERPRINT: &str =
-    "1bcda8e267e8e8279d76193cc2d25d00ae42aeeafafe7fd7f6fbb26ca85410e3";
+    "8e076342babe5394b149c6e5aea5801348329e4a6a227118b31714e5e5d504b0";
 
 /// Compute the fingerprint of a column-tuple slice.
 ///
@@ -395,5 +482,91 @@ mod tests {
             compute_fingerprint(EXPECTED_SCHEMA_BASELINE),
             compute_fingerprint(&altered),
         );
+    }
+
+    /// Wave 5a item 5 — the recipes touch five additional tables that
+    /// the baseline list missed: `HT_Cupon` (loyalty coupons),
+    /// `HT_CheckIn_Pay` (payments), `HT_Receipt_Ds` (receipt lines),
+    /// `HT_POWER_LOG` (light on/off audit), and `HT_Changed_Room`
+    /// (room-move audit). A vendor rename on any of these would
+    /// previously silently corrupt our writeback; now the startup
+    /// fingerprint check refuses to run.
+    #[test]
+    fn fingerprinted_tables_includes_wave_5a_additions() {
+        for table in [
+            "HT_Cupon",
+            "HT_CheckIn_Pay",
+            "HT_Receipt_Ds",
+            "HT_POWER_LOG",
+            "HT_Changed_Room",
+        ] {
+            assert!(
+                FINGERPRINTED_TABLES.contains(&table),
+                "Wave 5a expects {table} to be fingerprinted"
+            );
+        }
+    }
+
+    #[test]
+    fn tracks_ht_cupon_table() {
+        // The HT_Cupon mark-printed UPDATE fires from walkin +
+        // checkin_to_booking recipes via helpers::mark_cupon_printed.
+        // Baseline must include every column the vendor schema lists.
+        let cupon_rows: Vec<_> = EXPECTED_SCHEMA_BASELINE
+            .iter()
+            .filter(|(t, _, _, _)| *t == "HT_Cupon")
+            .collect();
+        assert_eq!(
+            cupon_rows.len(),
+            7,
+            "HT_Cupon has 7 columns per docs/legacy-spike/schema/01-baseline-schema.txt"
+        );
+        assert!(cupon_rows.iter().any(|(_, _, c, _)| *c == "cupon_print"));
+    }
+
+    #[test]
+    fn tracks_ht_checkin_pay_table() {
+        let pay_rows: Vec<_> = EXPECTED_SCHEMA_BASELINE
+            .iter()
+            .filter(|(t, _, _, _)| *t == "HT_CheckIn_Pay")
+            .collect();
+        // 22 columns per baseline schema lines 253-274.
+        assert_eq!(pay_rows.len(), 22);
+        assert!(pay_rows.iter().any(|(_, _, c, _)| *c == "Cin_Pay_Tran"));
+        assert!(pay_rows.iter().any(|(_, _, c, _)| *c == "Cin_Pay_web"));
+    }
+
+    #[test]
+    fn tracks_ht_receipt_ds_table() {
+        let ds_rows: Vec<_> = EXPECTED_SCHEMA_BASELINE
+            .iter()
+            .filter(|(t, _, _, _)| *t == "HT_Receipt_Ds")
+            .collect();
+        // 10 columns per baseline schema lines 445-454.
+        assert_eq!(ds_rows.len(), 10);
+        assert!(ds_rows.iter().any(|(_, _, c, _)| *c == "S_PriceDiscount"));
+    }
+
+    #[test]
+    fn tracks_ht_power_log_table() {
+        let pl_rows: Vec<_> = EXPECTED_SCHEMA_BASELINE
+            .iter()
+            .filter(|(t, _, _, _)| *t == "HT_POWER_LOG")
+            .collect();
+        // 8 columns per baseline schema lines 422-429.
+        assert_eq!(pl_rows.len(), 8);
+        assert!(pl_rows.iter().any(|(_, _, c, _)| *c == "ROOM_POWER_NOTE"));
+    }
+
+    #[test]
+    fn tracks_ht_changed_room_table() {
+        let rows: Vec<_> = EXPECTED_SCHEMA_BASELINE
+            .iter()
+            .filter(|(t, _, _, _)| *t == "HT_Changed_Room")
+            .collect();
+        // 8 columns per baseline schema lines 200-207.
+        assert_eq!(rows.len(), 8);
+        assert!(rows.iter().any(|(_, _, c, _)| *c == "room_before"));
+        assert!(rows.iter().any(|(_, _, c, _)| *c == "room_after"));
     }
 }

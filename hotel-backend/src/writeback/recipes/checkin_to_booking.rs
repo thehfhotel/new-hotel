@@ -315,7 +315,10 @@ pub async fn execute(
         cust_no: &cust_no,
         book_id,
         customer_name: &payload.guest_name_for_registry,
-        customer_phone: None,
+        // Wave 5a item 1: preserve booking-time phone. Prior code passed
+        // `None` unconditionally, which mapped to `[Cust_Add_tel]=''` and
+        // wiped the phone on every booking-linked check-in.
+        customer_phone: payload.customer_phone.as_deref(),
         guest_name_for_registry: &payload.guest_name_for_registry,
         guest_country: &payload.guest_country,
         created_by: &payload.created_by,
@@ -728,5 +731,41 @@ mod tests {
         let s = build_statements(&sample_inputs());
         let pl = s.iter().find(|s| s.contains("HT_POWER_LOG")).unwrap();
         assert!(pl.contains("'เปิดไฟ อัตโนมัติ จากเช็คอิน No.CH26-005231'"));
+    }
+
+    /// Wave 5a item 1: when the payload carries a customer phone, the
+    /// UPDATE HT_Customers statement must write it into `Cust_Add_tel`
+    /// — not the empty string. The prior code unconditionally passed
+    /// `customer_phone: None` from `execute()`, which mapped to
+    /// `[Cust_Add_tel]=''` and wiped the booking-time phone every
+    /// time a guest converted from booking to check-in.
+    #[test]
+    fn customer_phone_preserved_when_supplied() {
+        let mut inputs = sample_inputs();
+        inputs.customer_phone = Some("0812345678");
+        let s = build_statements(&inputs);
+        let upd = s
+            .iter()
+            .find(|s| s.starts_with("UPDATE [HT_Customers]"))
+            .expect("UPDATE [HT_Customers] must be emitted");
+        assert!(
+            upd.contains("[Cust_Add_tel]='0812345678'"),
+            "supplied phone must land verbatim in Cust_Add_tel; got:\n{upd}"
+        );
+    }
+
+    /// Wave 5a item 1: an absent phone (`None`) must continue to emit
+    /// `[Cust_Add_tel]=''` — the prior behavior for the no-data path
+    /// is preserved so booking-linked check-ins without a phone don't
+    /// regress to writing `NULL` (the legacy WinForms downstream
+    /// crashes on `NULL` per the booking_create recipe convention).
+    #[test]
+    fn customer_phone_renders_empty_string_when_none() {
+        let s = build_statements(&sample_inputs());
+        let upd = s
+            .iter()
+            .find(|s| s.starts_with("UPDATE [HT_Customers]"))
+            .unwrap();
+        assert!(upd.contains("[Cust_Add_tel]=''"));
     }
 }

@@ -506,14 +506,20 @@ async fn build_check_in_writeback_context(
     // blank-named customer in legacy. We try hard, but fall back to empty
     // rather than failing the check-in (matches build_writeback_context for
     // bookings — degrade gracefully on missing FKs).
-    let guest_name = match resolved_customer_id {
-        Some(cust_id) => state
-            .customers
-            .get(&state.new_pool, cust_id)
-            .await?
-            .map(|c| full_customer_name(&c.cust_firstname, c.cust_lastname.as_deref()))
-            .unwrap_or_default(),
-        None => String::new(),
+    //
+    // Wave 5a item 1: also surface the customer phone so the linked-to-booking
+    // writeback recipe doesn't wipe `HT_Customers.Cust_Add_tel` on every
+    // check-in (the prior code passed `None` unconditionally to
+    // `checkin_to_booking::execute`).
+    let (guest_name, customer_phone) = match resolved_customer_id {
+        Some(cust_id) => match state.customers.get(&state.new_pool, cust_id).await? {
+            Some(c) => (
+                full_customer_name(&c.cust_firstname, c.cust_lastname.as_deref()),
+                c.cust_phone,
+            ),
+            None => (String::new(), None),
+        },
+        None => (String::new(), None),
     };
 
     Ok(CheckInWritebackContext {
@@ -528,6 +534,7 @@ async fn build_check_in_writeback_context(
         created_by: String::new(),
         guest_name_for_registry: guest_name,
         guest_country: String::new(),
+        customer_phone,
     })
 }
 

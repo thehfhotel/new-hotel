@@ -308,6 +308,8 @@ pub async fn execute(
     method: PaymentMethod,
     receipt: &RecordPaymentReceipt,
     checkin_ds_id: Option<i32>,
+    price_per_night_baht: Option<f64>,
+    nights: Option<i32>,
 ) -> WritebackResult<LegacyIds> {
     if receipt.customer_name.is_empty()
         && receipt.customer_address.is_empty()
@@ -347,8 +349,12 @@ pub async fn execute(
         // separate task (the route currently doesn't carry them);
         // defaults match the most-common legacy capture shape.
         operator: None,
-        price_per_night_baht: None,
-        nights: None,
+        // Wave 5a item 2: per-night rate + nights are now plumbed from the
+        // service via the intent payload. None falls back to the recipe's
+        // amount/nights default (defensive only — kept so older queued
+        // intents still drain).
+        price_per_night_baht,
+        nights,
         stay_check_in: None,
         stay_check_out: None,
         from_booking: false,
@@ -697,5 +703,46 @@ mod tests {
         inputs.amount_baht = f64::NAN;
         let err = build_statements(&inputs).expect_err("NaN must be rejected");
         assert!(err.to_string().contains("non-finite"));
+    }
+
+    /// Wave 5a item 2: when the route plumbs the canonical per-night rate
+    /// through to the recipe, that value MUST land verbatim in
+    /// `Cin_Pay_Ds_PriceOne` — the recipe's `amount/nights` fallback is
+    /// defensive only.
+    #[test]
+    fn price_per_night_from_payload_used_when_supplied() {
+        let mut inputs = sample_inputs();
+        inputs.amount_baht = 1780.0; // partial settle on a 2-night room
+        inputs.price_per_night_baht = Some(890.0);
+        inputs.nights = Some(2);
+        let s = build_statements(&inputs).unwrap();
+        let pay = s.iter().find(|s| s.contains("[HT_CheckIn_Pay]")).unwrap();
+        // VALUE position 14 is Cin_Pay_Ds_PriceOne; quantity Cin_Pay_Ds_Num
+        // (position 12) carries nights. Format: ",1780.00,890.00,'',..."
+        // (amount_2dp,price_per_night_2dp,Cin_Pay_Note,...) — note the
+        // num precedes Ds_PriceTotal.
+        assert!(
+            pay.contains(",2,1780.00,890.00,"),
+            "supplied price_per_night must land in Cin_Pay_Ds_PriceOne; got:\n{pay}"
+        );
+    }
+
+    /// Wave 5a item 2 regression — the defensive `amount/nights` fallback
+    /// still fires when the payload omits `price_per_night_baht`, so older
+    /// queued intents that pre-date the service-layer plumbing keep
+    /// behaving the same.
+    #[test]
+    fn price_per_night_falls_back_to_amount_over_nights_when_none() {
+        let mut inputs = sample_inputs();
+        inputs.amount_baht = 1780.0;
+        inputs.price_per_night_baht = None;
+        inputs.nights = Some(2);
+        let s = build_statements(&inputs).unwrap();
+        let pay = s.iter().find(|s| s.contains("[HT_CheckIn_Pay]")).unwrap();
+        // amount/nights = 890.0
+        assert!(
+            pay.contains(",2,1780.00,890.00,"),
+            "fallback price_per_night must be amount/nights; got:\n{pay}"
+        );
     }
 }
