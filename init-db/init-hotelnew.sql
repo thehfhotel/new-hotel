@@ -1182,6 +1182,15 @@ INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('029', '029_normalize_cin_status_terminal.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
+-- Migration 030 — ht_payments.legacy_pay_no + legacy_receipt_no + aggregate_id
+-- (Wave 5a writeback-audit item 3). The DDL is inlined into the `ht_payments`
+-- CREATE TABLE block above; this seed row records the migration as already
+-- applied so the drift check's `migrate.sh` pass against a fresh seed sees
+-- zero pending migrations.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('030', '030_add_ht_payments_legacy_columns.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
 -- =============================================================================
 -- Initialization complete
 -- =============================================================================
