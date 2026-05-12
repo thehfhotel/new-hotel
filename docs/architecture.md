@@ -815,10 +815,10 @@ The legacy MSSQL schema and the `.NET` app's behavior are not documented anywher
 | Tier | Source | Location | Confidence |
 |---|---|---|---|
 | 1 | Live SQL Server captures (Extended Events, sniffed `RPC:Completed`) | `docs/legacy-spike/` (11 sessions + `findings.md`, ~700 LOC) | Highest — observed reality |
-| 2 | Decompiled C# from the legacy `.exe` | `legacy-reference/` | High — but reflects intent, not always behavior |
+| 2 | Decompiled C# from the legacy `.exe` | `docs/legacy-app/` (analysis docs in repo) + `evergreen:/home/nut/new-hotel/legacy/` (vendor binaries off-repo) | High — but reflects intent, not always behavior |
 | 3 | Inferred / cheatsheet analysis | scattered notes, early write-ups | Lowest — may be stale or wrong |
 
-**Case in point — `HT_CheckIn_Ds.id`.** The original spike cheatsheet recorded this column as `IDENTITY` (autoincrement). The decompiled C# in `legacy-reference/` clearly shows the legacy app allocating the next id manually with `MAX(id)+1`, and a re-capture against the live DB confirmed the column is a plain `int`. We were one bug away from writebacks blowing up under concurrency. The current writeback (`hotel-backend/src/writeback/allocate.rs`) treats both `HT_CheckIn_Ds.id` and `HT_Receipt_H.id` as manual-allocation columns under `TABLOCKX, HOLDLOCK`. See §4a for the SQL recipe.
+**Case in point — `HT_CheckIn_Ds.id`.** The original spike cheatsheet recorded this column as `IDENTITY` (autoincrement). The decompiled C# (see `docs/legacy-app/EVERGREEN_ARTIFACTS.md` for the off-repo decompile location) clearly shows the legacy app allocating the next id manually with `MAX(id)+1`, and a re-capture against the live DB confirmed the column is a plain `int`. We were one bug away from writebacks blowing up under concurrency. The current writeback (`hotel-backend/src/writeback/allocate.rs`) treats both `HT_CheckIn_Ds.id` and `HT_Receipt_H.id` as manual-allocation columns under `TABLOCKX, HOLDLOCK`. See §4a for the SQL recipe.
 
 Other ground-truth facts that fall out of this precedence rule:
 
@@ -1364,7 +1364,7 @@ The strategy is **opaque pass-through**: Phase 5.5 mirrors the relevant tables i
 - Credit sales (`FrmPayDebt`, `FrmPayDebt2`)
 - Hourly / time-extension pricing
 - Room-move mid-stay
-- Crystal Reports (replaced by future `bin/reports.rs` + QuestPDF — see `legacy-reference/analysis/_REPORTS_INVENTORY.md`)
+- Crystal Reports (replaced by future `bin/reports.rs` + QuestPDF — see `docs/legacy-app/REPORTS_INVENTORY.md`)
 - Photo capture (TWAIN / webcam) — out of scope until web-camera UX designed
 - SMS sending (`FormSMSSendManual`, `FormSMS_DEBT`)
 
