@@ -5,7 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.63.1] - 2026-05-12
+
+### Security
+
+- **Next.js bumped 16.2.4 → 16.2.6** (also `eslint-config-next`). Closes
+  Dependabot alerts #136 + #137: "Next.js Vulnerable to Denial of Service
+  with Server Components" — vulnerable range `>= 16.0.0, < 16.2.5`. No
+  application code changes required; `pnpm build` clean on 16.2.6 with the
+  existing route tree (23 static + dynamic pages compiled).
 
 ### Fixed
 

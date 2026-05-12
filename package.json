@@ -1,6 +1,6 @@
 {
   "name": "new-hotel",
-  "version": "2.63.0",
+  "version": "2.63.1",
   "private": true,
   "scripts": {
     "dev": "next dev -p 3003",
@@ -16,7 +16,7 @@
   "dependencies": {
     "date-fns": "^3.6.0",
     "lucide-react": "^1.14.0",
-    "next": "16.2.4",
+    "next": "16.2.6",
     "react": "^19.2.5",
     "react-datepicker": "^9.1.0",
     "react-dom": "^19.2.5",
@@ -33,7 +33,7 @@
     "@types/react-dom": "^19.2.3",
     "dotenv": "^17.2.3",
     "eslint": "^9.39.2",
-    "eslint-config-next": "16.2.4",
+    "eslint-config-next": "16.2.6",
     "husky": "^9.1.7",
     "jest": "^30.4.2",
     "jest-environment-jsdom": "^30.4.1",
