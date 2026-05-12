@@ -111,6 +111,33 @@ const RESET_TRANCOUNT_SQL: &str = "IF @@TRANCOUNT > 0 ROLLBACK";
 /// has time to investigate.
 const LISTENER_BACKOFF_AFTER_ALERT_SECS: u64 = 60;
 
+/// Track D / T7 HIGH-2 — queue-depth janitor poll interval (60s).
+/// Reads `writeback_jobs` grouped by status and pages when any
+/// threshold below is breached.
+const QUEUE_DEPTH_POLL_INTERVAL_SECS: u64 = 60;
+
+/// Track D / T7 HIGH-2 — backlog thresholds. Per-condition cooldown
+/// (`QUEUE_DEPTH_ALERT_COOLDOWN_SECS`) so a known-bad MSSQL outage
+/// doesn't flood Slack.
+///
+/// * `pending > 500` — NOTIFY backlog (worker can't keep up).
+/// * `failed > 100` — recipe-level errors stacking; usually a vendor
+///   schema drift / collation issue / network partition. The
+///   exhausted-alert path covers individual jobs; the threshold here
+///   catches the bulk case before it hits the retry cap.
+/// * `in_progress > 5 with claimed_at older than 10 min` — stuck
+///   claims that the janitor's own steal hasn't reclaimed yet (the
+///   `STUCK_IN_PROGRESS_TIMEOUT_SECS` window is 5 min; 10 min is double
+///   that to skip the steady-state recipe-in-flight noise floor).
+const QUEUE_PENDING_ALERT_THRESHOLD: i64 = 500;
+const QUEUE_FAILED_ALERT_THRESHOLD: i64 = 100;
+const QUEUE_STUCK_IN_PROGRESS_THRESHOLD: i64 = 5;
+const QUEUE_STUCK_IN_PROGRESS_AGE_MINS: i64 = 10;
+
+/// Track D / T7 HIGH-2 — minimum gap between queue-depth Slack pages
+/// per condition. 30 min — operator gets one ping per breach window.
+const QUEUE_DEPTH_ALERT_COOLDOWN_SECS: u64 = 1800;
+
 /// Exponential backoff (in seconds) between retry attempts. Indexed by
 /// `attempts` (0-based: backoff_secs(1) is the wait before attempt #2).
 /// Caps at the last entry. Default schedule: 30s, 2min, 10min.
@@ -319,6 +346,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         sigterm.recv().await;
         tracing::info!("SIGTERM received — draining pending jobs then exiting");
         shutdown_clone.notify_waiters();
+    });
+
+    // Track D / T7 HIGH-2 — queue-depth janitor. Background task that
+    // polls `writeback_jobs` every 60s and pages on:
+    //   pending > 500, failed > 100, stuck in_progress > 5
+    // Per-condition cooldown so a known-bad MSSQL outage doesn't flood.
+    let janitor_pg = pg.clone();
+    let janitor_slack = slack.clone();
+    let janitor_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        run_queue_depth_janitor(janitor_pg, janitor_slack, janitor_shutdown).await;
     });
 
     // Task #69: wrap the main loop in a tracing span so every log line
@@ -1799,6 +1837,191 @@ async fn send_listener_alert(slack: &SlackClient, consecutive_failures: u32) {
     let _ = slack.send_message(&msg).await;
 }
 
+/// Track D / T7 HIGH-2 — snapshot of writeback queue depth pulled by
+/// the janitor's group-by-status query. The three counts cover every
+/// alertable condition; `done` rows are omitted because they're the
+/// happy path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueueDepthSnapshot {
+    pub pending: i64,
+    pub failed: i64,
+    /// `in_progress` rows whose `claimed_at` is older than
+    /// `QUEUE_STUCK_IN_PROGRESS_AGE_MINS` minutes. NOT the total
+    /// `in_progress` count — steady-state recipes run for seconds and
+    /// don't count as stuck.
+    pub stuck_in_progress: i64,
+}
+
+/// Track D / T7 HIGH-2 — pure decision function. Given a snapshot,
+/// returns the human-readable reasons for each breached condition.
+/// Empty vec ⇒ everything within tolerance.
+pub fn queue_depth_breaches(snapshot: &QueueDepthSnapshot) -> Vec<String> {
+    let mut out = Vec::new();
+    if snapshot.pending > QUEUE_PENDING_ALERT_THRESHOLD {
+        out.push(format!(
+            "pending={} > {}",
+            snapshot.pending, QUEUE_PENDING_ALERT_THRESHOLD
+        ));
+    }
+    if snapshot.failed > QUEUE_FAILED_ALERT_THRESHOLD {
+        out.push(format!(
+            "failed={} > {}",
+            snapshot.failed, QUEUE_FAILED_ALERT_THRESHOLD
+        ));
+    }
+    if snapshot.stuck_in_progress > QUEUE_STUCK_IN_PROGRESS_THRESHOLD {
+        out.push(format!(
+            "stuck in_progress={} > {} (claimed > {}m ago)",
+            snapshot.stuck_in_progress,
+            QUEUE_STUCK_IN_PROGRESS_THRESHOLD,
+            QUEUE_STUCK_IN_PROGRESS_AGE_MINS,
+        ));
+    }
+    out
+}
+
+/// Track D / T7 HIGH-2 — janitor that polls `writeback_jobs` every
+/// 60s and pages the operator if any threshold is breached. One alert
+/// per condition per `QUEUE_DEPTH_ALERT_COOLDOWN_SECS` to avoid
+/// flooding. Best-effort: a failed PG query only logs a warning.
+async fn run_queue_depth_janitor(
+    pg: PgPool,
+    slack: Option<SlackClient>,
+    shutdown: Arc<Notify>,
+) {
+    let mut last_alerted_pending: Option<Instant> = None;
+    let mut last_alerted_failed: Option<Instant> = None;
+    let mut last_alerted_stuck: Option<Instant> = None;
+    let cooldown = Duration::from_secs(QUEUE_DEPTH_ALERT_COOLDOWN_SECS);
+
+    tracing::info!(
+        pending_threshold = QUEUE_PENDING_ALERT_THRESHOLD,
+        failed_threshold = QUEUE_FAILED_ALERT_THRESHOLD,
+        stuck_threshold = QUEUE_STUCK_IN_PROGRESS_THRESHOLD,
+        stuck_age_mins = QUEUE_STUCK_IN_PROGRESS_AGE_MINS,
+        "[janitor] Queue-depth janitor starting"
+    );
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(QUEUE_DEPTH_POLL_INTERVAL_SECS)) => {}
+            _ = shutdown.notified() => {
+                tracing::info!("[janitor] Shutdown — exiting");
+                return;
+            }
+        }
+
+        let snapshot = match fetch_queue_depth(&pg).await {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "[janitor] Failed to fetch writeback_jobs depth — observability degraded"
+                );
+                continue;
+            }
+        };
+
+        let breaches = queue_depth_breaches(&snapshot);
+        if breaches.is_empty() {
+            tracing::trace!(?snapshot, "[janitor] Queue depth within thresholds");
+            continue;
+        }
+
+        for reason in &breaches {
+            tracing::warn!(
+                pending = snapshot.pending,
+                failed = snapshot.failed,
+                stuck_in_progress = snapshot.stuck_in_progress,
+                reason,
+                "[janitor] Queue-depth breach detected"
+            );
+        }
+
+        let now = Instant::now();
+        // Per-condition cooldown — fire only the kinds whose cooldown
+        // has elapsed; the message lists every active breach for
+        // operator visibility.
+        let pending_due = snapshot.pending > QUEUE_PENDING_ALERT_THRESHOLD
+            && last_alerted_pending
+                .map(|t| now.duration_since(t) >= cooldown)
+                .unwrap_or(true);
+        let failed_due = snapshot.failed > QUEUE_FAILED_ALERT_THRESHOLD
+            && last_alerted_failed
+                .map(|t| now.duration_since(t) >= cooldown)
+                .unwrap_or(true);
+        let stuck_due = snapshot.stuck_in_progress > QUEUE_STUCK_IN_PROGRESS_THRESHOLD
+            && last_alerted_stuck
+                .map(|t| now.duration_since(t) >= cooldown)
+                .unwrap_or(true);
+
+        if !(pending_due || failed_due || stuck_due) {
+            tracing::debug!("[janitor] All breached conditions still in cooldown");
+            continue;
+        }
+
+        if let Some(s) = slack.as_ref() {
+            let body = breaches
+                .iter()
+                .map(|r| format!("• {r}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let payload = SlackMessage::with_site_text(
+                current_site_id(),
+                format!(
+                    ":warning: *Writeback queue depth breach* :warning:\n\
+                     {body}\n\
+                     _Cooldown {QUEUE_DEPTH_ALERT_COOLDOWN_SECS}s per condition. \
+                     Inspect with_ `SELECT intent, status, count(*) FROM \
+                     writeback_jobs GROUP BY intent, status;` _and the \
+                     dashboard at_ `/api/new/sync/status` _(writebackQueue \
+                     section)._"
+                ),
+            );
+            let _ = s.send_message(&payload).await;
+        }
+
+        if pending_due {
+            last_alerted_pending = Some(now);
+        }
+        if failed_due {
+            last_alerted_failed = Some(now);
+        }
+        if stuck_due {
+            last_alerted_stuck = Some(now);
+        }
+    }
+}
+
+/// Track D / T7 HIGH-2 — one round-trip to PG for the three counts.
+async fn fetch_queue_depth(pg: &PgPool) -> Result<QueueDepthSnapshot, sqlx::Error> {
+    // One query for all three numbers. Cheap on the existing
+    // ix_writeback_jobs_claim partial index (status IN
+    // ('pending','failed','in_progress')).
+    let row = sqlx::query_as::<_, (i64, i64, i64)>(
+        r#"
+        SELECT
+            COUNT(*) FILTER (WHERE status = 'pending'),
+            COUNT(*) FILTER (WHERE status = 'failed'),
+            COUNT(*) FILTER (
+                WHERE status = 'in_progress'
+                  AND claimed_at IS NOT NULL
+                  AND claimed_at < now() - make_interval(mins => $1)
+            )
+        FROM writeback_jobs
+        WHERE status IN ('pending', 'failed', 'in_progress')
+        "#,
+    )
+    .bind(QUEUE_STUCK_IN_PROGRESS_AGE_MINS)
+    .fetch_one(pg)
+    .await?;
+    Ok(QueueDepthSnapshot {
+        pending: row.0,
+        failed: row.1,
+        stuck_in_progress: row.2,
+    })
+}
+
 // Suppress unused import warning when WritebackError isn't directly referenced
 // in error returns. (`is_retryable` covers the visible path.)
 #[allow(dead_code)]
@@ -2111,6 +2334,80 @@ mod tests {
             "the Err arm's `return;` must execute before the back-pop \
              retry loop — otherwise a failed status-flip could still \
              clobber a stolen-claim winner's legacy_ids"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Track D / T7 HIGH-2 — queue-depth janitor
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn queue_depth_alert_fires_above_threshold() {
+        // pending=600 > 500 → one breach reason.
+        let snap = QueueDepthSnapshot {
+            pending: 600,
+            failed: 0,
+            stuck_in_progress: 0,
+        };
+        let breaches = queue_depth_breaches(&snap);
+        assert_eq!(breaches.len(), 1);
+        assert!(breaches[0].contains("pending=600"));
+    }
+
+    #[test]
+    fn queue_depth_failed_threshold_fires_above_100() {
+        let snap = QueueDepthSnapshot {
+            pending: 0,
+            failed: 101,
+            stuck_in_progress: 0,
+        };
+        let breaches = queue_depth_breaches(&snap);
+        assert_eq!(breaches.len(), 1);
+        assert!(breaches[0].contains("failed=101"));
+    }
+
+    #[test]
+    fn queue_depth_stuck_in_progress_fires_above_5() {
+        let snap = QueueDepthSnapshot {
+            pending: 0,
+            failed: 0,
+            stuck_in_progress: 6,
+        };
+        let breaches = queue_depth_breaches(&snap);
+        assert_eq!(breaches.len(), 1);
+        assert!(breaches[0].contains("stuck in_progress=6"));
+    }
+
+    #[test]
+    fn queue_depth_no_breach_at_or_below_thresholds() {
+        // Strict-greater semantics — exactly-at-threshold must NOT alert.
+        let snap = QueueDepthSnapshot {
+            pending: 500,
+            failed: 100,
+            stuck_in_progress: 5,
+        };
+        assert!(queue_depth_breaches(&snap).is_empty());
+
+        let snap = QueueDepthSnapshot {
+            pending: 0,
+            failed: 0,
+            stuck_in_progress: 0,
+        };
+        assert!(queue_depth_breaches(&snap).is_empty());
+    }
+
+    #[test]
+    fn queue_depth_multiple_simultaneous_breaches() {
+        let snap = QueueDepthSnapshot {
+            pending: 1000,
+            failed: 200,
+            stuck_in_progress: 50,
+        };
+        let breaches = queue_depth_breaches(&snap);
+        assert_eq!(
+            breaches.len(),
+            3,
+            "all three conditions must produce one reason each"
         );
     }
 }

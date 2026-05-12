@@ -44,8 +44,9 @@
 use chrono::NaiveDateTime;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::db::{DbPool, PgPool};
@@ -58,6 +59,17 @@ use crate::notifications::slack::{SlackClient, SlackMessage};
 /// catch-up scenario would produce. Override at deploy time with
 /// `LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD`.
 pub const DEFAULT_DRIFT_ALERT_THRESHOLD: i64 = 50;
+
+/// Track D / T7 HIGH-1 — level-triggered drift digest cooldown (per
+/// table). The edge-triggered alert above fires on a rolling-window
+/// volume threshold (50 rows/hr); the level-triggered digest below
+/// fires when a table has ANY unresolved divergence older than
+/// `LEVEL_DRIFT_STALE_INTERVAL`, capped at one alert per table per
+/// `LEVEL_DRIFT_COOLDOWN`. The two are complementary: the edge alert
+/// catches bulk regressions, the level alert catches single-row
+/// divergences that never trip 50/hr but still represent stuck state.
+pub const LEVEL_DRIFT_STALE_INTERVAL_HOURS: i64 = 4;
+pub const LEVEL_DRIFT_COOLDOWN_HOURS: i64 = 24;
 
 /// Reconcile mode selected by env var `LEGACY_SYNC_RECONCILE_MODE`.
 /// Default is `DiffOnly` per Phase 5.5 cutover.
@@ -154,6 +166,13 @@ pub async fn run_sync(
     // Phase 6: drift-alert tripwire. Best-effort — degraded observability
     // never aborts the reconcile loop.
     check_drift_and_alert(pg_pool, slack, site_id).await;
+
+    // Track D / T7 HIGH-1: level-triggered drift digest. Catches
+    // long-lived single-row divergences that never breach the
+    // edge-triggered 50/hr volume threshold. Per-table cooldown keeps
+    // Slack from drowning during a known-bad cardinality migration
+    // window.
+    check_level_drift_and_alert(pg_pool, slack, site_id).await;
 
     tracing::info!(site = %site_id, "[Sync] Sync cycle complete");
 }
@@ -295,6 +314,168 @@ async fn check_drift_and_alert(
              `ht_reconcile_log` rows for the following table(s) in the last hour:\n\
              {body}\n\
              _Investigate via `docs/runbook-sync.md` §9 (Phase 6 drift alert)._"
+        ),
+    );
+    slack.send_message(&msg).await;
+}
+
+/// Track D / T7 HIGH-1 — per-(site, table) cooldown for the
+/// level-triggered drift digest. Keyed by `"{site_id}::{table_name}"`
+/// so HF Hotel and HF Ville don't share state. Held as a process-global
+/// Mutex because reconcile is serial per process and one watcher per
+/// container — contention is zero in practice.
+fn level_alert_cooldowns() -> &'static Mutex<HashMap<String, Instant>> {
+    static COOLDOWNS: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> =
+        std::sync::OnceLock::new();
+    COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Track D / T7 HIGH-1 — pure decision function for the level-triggered
+/// cooldown gate. Returns true iff the given table on the given site is
+/// eligible to alert (cooldown elapsed or never alerted). On true, the
+/// caller MUST call `mark_level_alert_sent` to start the next cooldown.
+///
+/// Pulled into a free function with explicit args so the unit test can
+/// inject a `now` instead of relying on `Instant::now()`.
+fn level_alert_eligible(
+    state: &mut HashMap<String, Instant>,
+    site_id: &str,
+    table: &str,
+    now: Instant,
+    cooldown: std::time::Duration,
+) -> bool {
+    let key = format!("{site_id}::{table}");
+    match state.get(&key) {
+        Some(last_sent) => now.duration_since(*last_sent) >= cooldown,
+        None => true,
+    }
+}
+
+/// Record the time of the most recent level-triggered alert for
+/// `(site_id, table)`. Pairs with [`level_alert_eligible`].
+fn mark_level_alert_sent(
+    state: &mut HashMap<String, Instant>,
+    site_id: &str,
+    table: &str,
+    now: Instant,
+) {
+    let key = format!("{site_id}::{table}");
+    state.insert(key, now);
+}
+
+/// Track D / T7 HIGH-1 — level-triggered drift digest. Complements the
+/// edge-triggered `check_drift_and_alert` above: that one fires on
+/// volume (50 rows/hr in a single table), this one fires on persistence
+/// (ANY unresolved row older than 4 hours per table). The edge alert
+/// catches bulk regressions; the level alert catches single-row
+/// divergences that never trip the volume threshold.
+///
+/// Behaviour:
+/// - Counts unresolved rows per `table_name` where `detected_at` is
+///   older than `LEVEL_DRIFT_STALE_INTERVAL_HOURS` (default 4h).
+/// - For each table with ≥1 such row, emits a Slack alert if the
+///   per-table cooldown (`LEVEL_DRIFT_COOLDOWN_HOURS`, default 24h) has
+///   elapsed since the last level alert for that table+site.
+/// - Best-effort: a failed PG query or Slack POST only logs a warning.
+async fn check_level_drift_and_alert(
+    pg_pool: &PgPool,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+) {
+    let rows = sqlx::query_as::<_, (String, i64)>(
+        &format!(
+            "SELECT table_name, count(*) \
+               FROM ht_reconcile_log \
+              WHERE resolved_at IS NULL \
+                AND detected_at < now() - interval '{LEVEL_DRIFT_STALE_INTERVAL_HOURS} hours' \
+              GROUP BY table_name"
+        ),
+    )
+    .fetch_all(pg_pool)
+    .await;
+
+    let counts = match rows {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                site = %site_id,
+                error = %e,
+                "[Sync] Failed to query ht_reconcile_log for level-triggered drift digest"
+            );
+            return;
+        }
+    };
+
+    if counts.is_empty() {
+        tracing::debug!(
+            site = %site_id,
+            "[Sync] Level drift digest: no tables with unresolved rows older than 4h"
+        );
+        return;
+    }
+
+    let cooldown = std::time::Duration::from_secs((LEVEL_DRIFT_COOLDOWN_HOURS * 3600) as u64);
+    let now = Instant::now();
+    let mut to_alert: Vec<(String, i64)> = Vec::new();
+    {
+        let mut state = match level_alert_cooldowns().lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for (table, count) in &counts {
+            if level_alert_eligible(&mut state, site_id, table, now, cooldown) {
+                to_alert.push((table.clone(), *count));
+                mark_level_alert_sent(&mut state, site_id, table, now);
+            } else {
+                tracing::debug!(
+                    site = %site_id,
+                    table,
+                    count,
+                    "[Sync] Level drift alert suppressed by cooldown"
+                );
+            }
+        }
+    }
+
+    for (table, count) in &to_alert {
+        tracing::warn!(
+            site = %site_id,
+            table,
+            count,
+            stale_hours = LEVEL_DRIFT_STALE_INTERVAL_HOURS,
+            "[Sync] Level drift alert: table has unresolved divergence older than threshold"
+        );
+    }
+
+    if to_alert.is_empty() {
+        return;
+    }
+
+    let Some(slack) = slack else {
+        tracing::info!(
+            site = %site_id,
+            "[Sync] Slack not configured; level drift digest logged only ({} table(s))",
+            to_alert.len()
+        );
+        return;
+    };
+
+    let body = to_alert
+        .iter()
+        .map(|(t, n)| format!("• `{t}`: {n} unresolved row(s)"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let msg = SlackMessage::with_site_text(
+        site_id,
+        format!(
+            ":warning: *Reconcile drift unresolved >{LEVEL_DRIFT_STALE_INTERVAL_HOURS}h* :warning:\n\
+             One or more tables have `ht_reconcile_log` rows that have been \
+             unresolved for over {LEVEL_DRIFT_STALE_INTERVAL_HOURS} hours:\n\
+             {body}\n\
+             _Single-row divergences don't trip the volume threshold but still \
+             represent stuck canonical state. Investigate + set \
+             `resolved_at = now()` after fixing. Per-table cooldown \
+             {LEVEL_DRIFT_COOLDOWN_HOURS}h._"
         ),
     );
     slack.send_message(&msg).await;
@@ -634,10 +815,102 @@ fn checkin_canonical_hash(
     ))
 }
 
+/// Track D / T7 CRIT-1 — discriminator for `ht_reconcile_log.divergence_kind`.
+/// Pure enum so the reconcile loop and the (never-silenced) ack guard
+/// agree on the same vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DivergenceKind {
+    /// Same row count on both sides; content drift (a CT-mapper bug
+    /// projected a column wrong, an operator hand-edited canonical,
+    /// etc.). Acked by hash — subsequent ticks short-circuit once the
+    /// `mssql_hash` stops changing.
+    Value,
+    /// Row counts differ between MSSQL and PG. Canonical example: a
+    /// multi-room folio (3 rows in `View_CheckIn_Ds`) collapsed into 1
+    /// `ht_checkins` row by the CT mapper's `first_room_no`
+    /// denormalisation. Hashes will never match while the cardinality
+    /// asymmetry exists — Track D / T7 CRIT-1 says this case must
+    /// NEVER be acked, so every tick re-fires until operator action
+    /// (Track B junction-table migration, or a hand-applied fix).
+    Cardinality,
+    /// Canonical PG row is missing entirely (`pg_hash IS NULL`). The CT
+    /// watcher hasn't yet projected this PK into canonical — could be
+    /// a transient watermark lag, a mapper bug, or a CT retention
+    /// overflow. Highest-signal divergence; never silenced.
+    MissingPg,
+    /// Legacy MSSQL row is missing for a PK that exists in canonical.
+    /// Should be impossible under normal flow (writeback owns the PG-to-
+    /// MSSQL direction) but kept for symmetry — if it ever fires, the
+    /// writeback is broken and operator needs to know.
+    MissingMssql,
+}
+
+impl DivergenceKind {
+    /// String literal stored in `ht_reconcile_log.divergence_kind`.
+    /// Schema constraint isn't enforced via CHECK so the column can
+    /// hold any TEXT — but readers (alerts, dashboards) expect these
+    /// exact values.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Value => "value",
+            Self::Cardinality => "cardinality",
+            Self::MissingPg => "missing_pg",
+            Self::MissingMssql => "missing_mssql",
+        }
+    }
+
+    /// Track D / T7 CRIT-1 invariant: the cache ack must NEVER silence
+    /// a cardinality drift or a canonical-missing divergence. Acking
+    /// these would write the MSSQL hash into `ht_*_legacy.sync_hash`,
+    /// short-circuiting subsequent ticks — but the underlying drift is
+    /// not repaired by hash alone, so the alert would go quiet while
+    /// canonical stayed wrong forever.
+    pub fn is_silenceable(self) -> bool {
+        matches!(self, Self::Value | Self::MissingMssql)
+    }
+}
+
+/// Track D / T7 CRIT-1 — classify a divergence by hash + row-count
+/// comparison. Pure function so the unit tests can exercise the truth
+/// table without a PG pool.
+///
+/// * `pg_hash = None` ⇒ `MissingPg` (highest signal).
+/// * `mssql_hash = None` ⇒ `MissingMssql`.
+/// * `legacy_row_count != pg_row_count` ⇒ `Cardinality` (multi-room
+///   folio collapse, junction-table gap).
+/// * otherwise ⇒ `Value` (hash mismatch with matching cardinality).
+///
+/// The caller has already determined that the two hashes differ; this
+/// helper just sub-classifies the drift for ack-silencing purposes.
+pub fn classify_divergence(
+    pg_hash: Option<&str>,
+    mssql_hash: Option<&str>,
+    legacy_row_count: i32,
+    pg_row_count: i32,
+) -> DivergenceKind {
+    if pg_hash.is_none() {
+        return DivergenceKind::MissingPg;
+    }
+    if mssql_hash.is_none() {
+        return DivergenceKind::MissingMssql;
+    }
+    if legacy_row_count != pg_row_count {
+        return DivergenceKind::Cardinality;
+    }
+    DivergenceKind::Value
+}
+
 /// Phase 5.5 diff-only path: record a divergence into `ht_reconcile_log`
 /// instead of mutating canonical state. Best-effort — a failed insert
 /// only degrades observability, so we never bubble it up to abort the
 /// reconcile loop.
+///
+/// Track D / T7 CRIT-1: every row now carries `divergence_kind` +
+/// `legacy_row_count` + `pg_row_count` so cardinality drift (e.g.
+/// multi-room folio collapsed by the CT mapper) is distinguishable
+/// from value drift, and the ack-cache (`ht_*_legacy.sync_hash`)
+/// silencing rule can refuse to silence non-`value` kinds.
+#[allow(clippy::too_many_arguments)]
 async fn record_divergence(
     pg_pool: &PgPool,
     table_name: &str,
@@ -646,11 +919,16 @@ async fn record_divergence(
     mssql_hash: Option<&str>,
     mssql_row_json: serde_json::Value,
     pg_row_json: Option<serde_json::Value>,
+    divergence_kind: DivergenceKind,
+    legacy_row_count: i32,
+    pg_row_count: i32,
 ) {
     let result = sqlx::query(
         "INSERT INTO ht_reconcile_log \
-            (table_name, legacy_pk, pg_hash, mssql_hash, mssql_row_json, pg_row_json) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
+            (table_name, legacy_pk, pg_hash, mssql_hash, \
+             mssql_row_json, pg_row_json, \
+             divergence_kind, legacy_row_count, pg_row_count) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(table_name)
     .bind(legacy_pk)
@@ -658,6 +936,9 @@ async fn record_divergence(
     .bind(mssql_hash)
     .bind(mssql_row_json)
     .bind(pg_row_json)
+    .bind(divergence_kind.as_str())
+    .bind(legacy_row_count)
+    .bind(pg_row_count)
     .execute(pg_pool)
     .await;
     if let Err(e) = result {
@@ -996,6 +1277,18 @@ async fn sync_customers(
                         "cust_address": c.cust_address,
                     })
                 });
+                // Track D / T7 CRIT-1: customers are flat 1:1 PKs on
+                // both sides — `legacy_row_count` and `pg_row_count`
+                // are 0 or 1 by construction. The pg_row_count == 0
+                // case is the `canonical.is_none()` MissingPg path.
+                let legacy_row_count: i32 = 1;
+                let pg_row_count: i32 = if canonical.is_some() { 1 } else { 0 };
+                let kind = classify_divergence(
+                    canonical_hash.as_deref(),
+                    Some(&mssql_hash),
+                    legacy_row_count,
+                    pg_row_count,
+                );
                 record_divergence(
                     pg_pool,
                     "customers",
@@ -1004,9 +1297,18 @@ async fn sync_customers(
                     Some(&mssql_hash),
                     mssql_json,
                     pg_json,
+                    kind,
+                    legacy_row_count,
+                    pg_row_count,
                 )
                 .await;
-                ack_customer_mirror(pg_pool, &cust_no, &mssql_hash).await;
+                // Track D / T7 CRIT-1: only silence the alert via the
+                // cache UPDATE when the kind is silenceable
+                // (value-drift). Cardinality + missing_pg refire every
+                // tick until operator action.
+                if kind.is_silenceable() {
+                    ack_customer_mirror(pg_pool, &cust_no, &mssql_hash).await;
+                }
                 if canonical.is_none() {
                     added += 1;
                 } else {
@@ -1329,6 +1631,15 @@ async fn sync_rooms(
                         "room_notes": c.room_notes,
                     })
                 });
+                // Track D / T7 CRIT-1: rooms are flat 1:1 PKs.
+                let legacy_row_count: i32 = 1;
+                let pg_row_count: i32 = if canonical.is_some() { 1 } else { 0 };
+                let kind = classify_divergence(
+                    canonical_hash.as_deref(),
+                    Some(&mssql_hash),
+                    legacy_row_count,
+                    pg_row_count,
+                );
                 record_divergence(
                     pg_pool,
                     "rooms",
@@ -1337,9 +1648,14 @@ async fn sync_rooms(
                     Some(&mssql_hash),
                     mssql_json,
                     pg_json,
+                    kind,
+                    legacy_row_count,
+                    pg_row_count,
                 )
                 .await;
-                ack_room_mirror(pg_pool, &room_no, &mssql_hash).await;
+                if kind.is_silenceable() {
+                    ack_room_mirror(pg_pool, &room_no, &mssql_hash).await;
+                }
                 if canonical.is_none() {
                     added += 1;
                 } else {
@@ -1506,6 +1822,22 @@ async fn sync_bookings(
                     })
                 });
                 let composite_pk = format!("{book_no}|{room_type_key}");
+                // Track D / T7 CRIT-1: bookings — `View_Booking_Ds` can
+                // return up to 3 rows per composite PK (booking with
+                // multiple room types within the same Book_No);
+                // canonical `ht_bookings` collapses to one row per
+                // `legacy_book_id`. legacy_row_count exposes the raw
+                // legacy cardinality so a 3-row Book_No vs 1-row PG
+                // mismatch lights up as `Cardinality` instead of being
+                // silenced as a value drift.
+                let legacy_row_count: i32 = details.len() as i32;
+                let pg_row_count: i32 = if canonical.is_some() { 1 } else { 0 };
+                let kind = classify_divergence(
+                    canonical_hash.as_deref(),
+                    Some(&mssql_hash),
+                    legacy_row_count,
+                    pg_row_count,
+                );
                 record_divergence(
                     pg_pool,
                     "bookings",
@@ -1514,9 +1846,14 @@ async fn sync_bookings(
                     Some(&mssql_hash),
                     mssql_json,
                     pg_json,
+                    kind,
+                    legacy_row_count,
+                    pg_row_count,
                 )
                 .await;
-                ack_booking_mirror(pg_pool, &book_no, &room_type_key, &mssql_hash).await;
+                if kind.is_silenceable() {
+                    ack_booking_mirror(pg_pool, &book_no, &room_type_key, &mssql_hash).await;
+                }
                 if canonical.is_none() {
                     added += 1;
                 } else {
@@ -1837,6 +2174,24 @@ async fn sync_checkins(
                         "legacy_cust_no": c.legacy_cust_no,
                     })
                 });
+                // Track D / T7 CRIT-1: check-ins are the headline
+                // cardinality-drift case. `View_CheckIn_Ds` returns
+                // 41-45 rows per `Cin_no` (one per booked room) but
+                // canonical `ht_checkins` denormalises only the first
+                // room into a single row — Track B is the schema fix
+                // (junction table) but until then the row-count delta
+                // is the actionable signal. legacy_row_count =
+                // details.len() exposes "this folio has N rooms";
+                // pg_row_count = 0 or 1 reflects today's denormalised
+                // canonical.
+                let legacy_row_count: i32 = details.len() as i32;
+                let pg_row_count: i32 = if canonical.is_some() { 1 } else { 0 };
+                let kind = classify_divergence(
+                    canonical_hash.as_deref(),
+                    Some(&mssql_hash),
+                    legacy_row_count,
+                    pg_row_count,
+                );
                 record_divergence(
                     pg_pool,
                     "checkins",
@@ -1845,9 +2200,14 @@ async fn sync_checkins(
                     Some(&mssql_hash),
                     mssql_json,
                     pg_json,
+                    kind,
+                    legacy_row_count,
+                    pg_row_count,
                 )
                 .await;
-                ack_checkin_mirror(pg_pool, &cin_no, &mssql_hash).await;
+                if kind.is_silenceable() {
+                    ack_checkin_mirror(pg_pool, &cin_no, &mssql_hash).await;
+                }
                 if canonical.is_none() {
                     added += 1;
                 } else {
@@ -2622,5 +2982,152 @@ mod tests {
             Some("C001"),
         );
         assert_eq!(mssql, canonical);
+    }
+
+    // -------------------------------------------------------------------
+    // Track D / T7 CRIT-1 — cardinality-aware reconcile
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn classify_divergence_returns_missing_pg_when_pg_hash_absent() {
+        let kind = classify_divergence(None, Some("abc"), 1, 0);
+        assert_eq!(kind, DivergenceKind::MissingPg);
+    }
+
+    #[test]
+    fn classify_divergence_returns_missing_mssql_when_mssql_hash_absent() {
+        let kind = classify_divergence(Some("abc"), None, 0, 1);
+        assert_eq!(kind, DivergenceKind::MissingMssql);
+    }
+
+    #[test]
+    fn classify_divergence_returns_cardinality_when_row_counts_differ() {
+        // Multi-room folio: 3 legacy `View_CheckIn_Ds` rows collapsed
+        // into 1 canonical row. Hashes will differ forever — the kind
+        // discriminator surfaces the actionable root cause.
+        let kind = classify_divergence(Some("pg-hash"), Some("mssql-hash"), 3, 1);
+        assert_eq!(kind, DivergenceKind::Cardinality);
+    }
+
+    #[test]
+    fn classify_divergence_returns_value_when_counts_match_and_hashes_differ() {
+        // Pre-condition: caller has already determined hashes differ.
+        // Same row count on both sides ⇒ pure content drift.
+        let kind = classify_divergence(Some("pg-hash"), Some("mssql-hash"), 1, 1);
+        assert_eq!(kind, DivergenceKind::Value);
+    }
+
+    /// Track D / T7 CRIT-1 invariant — cardinality divergences must NEVER
+    /// be silenced via the ack cache. The reconcile loop reads
+    /// `is_silenceable()` before calling `ack_*_mirror`; if this test
+    /// regresses, multi-room folios would re-acquire the silent-failure
+    /// behaviour the post-mortem exposed.
+    #[test]
+    fn cardinality_kind_never_silenced() {
+        assert!(
+            !DivergenceKind::Cardinality.is_silenceable(),
+            "Cardinality drift must never be silenced — the underlying \
+             schema asymmetry isn't repaired by hash alone."
+        );
+    }
+
+    /// Track D / T7 HIGH-1 corollary — `pg_hash IS NULL` (canonical
+    /// missing) is the highest-signal divergence and must never silence.
+    /// Compounds with `cardinality_kind_never_silenced` to lock the two
+    /// non-silenceable kinds.
+    #[test]
+    fn missing_pg_kind_never_silenced() {
+        assert!(
+            !DivergenceKind::MissingPg.is_silenceable(),
+            "Canonical-missing rows must never be silenced — they're the \
+             highest-signal divergence the reconciler surfaces."
+        );
+    }
+
+    #[test]
+    fn value_and_missing_mssql_kinds_are_silenceable() {
+        // Value drift acks-on-hash by design — a one-shot CT regression
+        // becomes silent once the canonical mapper catches up.
+        assert!(DivergenceKind::Value.is_silenceable());
+        // MissingMssql means writeback dropped the row — the alert
+        // fires once at detection; subsequent ticks are silent until
+        // writeback regenerates the row.
+        assert!(DivergenceKind::MissingMssql.is_silenceable());
+    }
+
+    #[test]
+    fn divergence_kind_as_str_matches_schema_constraint_values() {
+        // The migration 032 column doc lists these four exact strings;
+        // the alerting layer + dashboards depend on them.
+        assert_eq!(DivergenceKind::Value.as_str(), "value");
+        assert_eq!(DivergenceKind::Cardinality.as_str(), "cardinality");
+        assert_eq!(DivergenceKind::MissingPg.as_str(), "missing_pg");
+        assert_eq!(DivergenceKind::MissingMssql.as_str(), "missing_mssql");
+    }
+
+    // -------------------------------------------------------------------
+    // Track D / T7 HIGH-1 — level-triggered drift digest cooldown
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn level_alert_eligible_returns_true_for_fresh_table() {
+        let mut state: HashMap<String, Instant> = HashMap::new();
+        let now = Instant::now();
+        let cooldown = std::time::Duration::from_secs(86_400);
+        assert!(level_alert_eligible(
+            &mut state,
+            "hfhotel",
+            "checkins",
+            now,
+            cooldown
+        ));
+    }
+
+    #[test]
+    fn level_alert_eligible_returns_false_inside_cooldown_window() {
+        let mut state: HashMap<String, Instant> = HashMap::new();
+        let now = Instant::now();
+        let cooldown = std::time::Duration::from_secs(86_400);
+        mark_level_alert_sent(&mut state, "hfhotel", "checkins", now);
+        // Same instant → cooldown not yet elapsed.
+        assert!(!level_alert_eligible(
+            &mut state,
+            "hfhotel",
+            "checkins",
+            now,
+            cooldown
+        ));
+    }
+
+    #[test]
+    fn level_alert_eligible_does_not_leak_across_sites() {
+        let mut state: HashMap<String, Instant> = HashMap::new();
+        let now = Instant::now();
+        let cooldown = std::time::Duration::from_secs(86_400);
+        mark_level_alert_sent(&mut state, "hfhotel", "checkins", now);
+        // HF Hotel cooldown active — HF Ville must still be eligible.
+        assert!(level_alert_eligible(
+            &mut state,
+            "hfville",
+            "checkins",
+            now,
+            cooldown
+        ));
+    }
+
+    #[test]
+    fn level_alert_eligible_does_not_leak_across_tables() {
+        let mut state: HashMap<String, Instant> = HashMap::new();
+        let now = Instant::now();
+        let cooldown = std::time::Duration::from_secs(86_400);
+        mark_level_alert_sent(&mut state, "hfhotel", "checkins", now);
+        // Different table on same site → still eligible.
+        assert!(level_alert_eligible(
+            &mut state,
+            "hfhotel",
+            "customers",
+            now,
+            cooldown
+        ));
     }
 }

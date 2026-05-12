@@ -878,15 +878,20 @@ ON CONFLICT (version) DO NOTHING;
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS ht_reconcile_log (
-    id              BIGSERIAL    PRIMARY KEY,
-    detected_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    table_name      TEXT         NOT NULL,
-    legacy_pk       TEXT         NOT NULL,
-    pg_hash         TEXT,
-    mssql_hash      TEXT,
-    mssql_row_json  JSONB,
-    pg_row_json     JSONB,
-    resolved_at     TIMESTAMPTZ
+    id                BIGSERIAL    PRIMARY KEY,
+    detected_at       TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    table_name        TEXT         NOT NULL,
+    legacy_pk         TEXT         NOT NULL,
+    pg_hash           TEXT,
+    mssql_hash        TEXT,
+    mssql_row_json    JSONB,
+    pg_row_json       JSONB,
+    resolved_at       TIMESTAMPTZ,
+    -- Migration 032 — Track D / T7 CRIT-1. Discriminator + row counts so
+    -- cardinality drift (multi-room folio collapse) is never ack-silenced.
+    divergence_kind   TEXT,
+    legacy_row_count  INT,
+    pg_row_count      INT
 );
 
 CREATE INDEX IF NOT EXISTS idx_ht_reconcile_log_unresolved
@@ -1189,6 +1194,15 @@ ON CONFLICT (version) DO NOTHING;
 -- zero pending migrations.
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('030', '030_add_ht_payments_legacy_columns.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 032 — ht_reconcile_log cardinality-aware columns (Track D /
+-- T7 CRIT-1). `divergence_kind` + `legacy_row_count` + `pg_row_count`
+-- are inlined into the `ht_reconcile_log` CREATE TABLE block above;
+-- this seed row marks the migration as applied for fresh deploys.
+-- (031 is intentionally absent — it was never landed.)
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('032', '032_ht_reconcile_log_cardinality.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================

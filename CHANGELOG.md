@@ -5,6 +5,88 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.63.11] - 2026-05-13
+
+### Fixed
+
+- **Coexistence observability runtime fixes — Track D
+  (`docs/coexistence/audit-2026-05-13.md`).** Six findings from T7
+  (operational observability). No UX behavior removed; one schema
+  migration (032) adds three nullable columns to `ht_reconcile_log`.
+  The audit's headline conclusion was "the system has good
+  availability observability and almost no correctness observability";
+  Track D closes that gap before Tracks B/E/F/G touch production.
+  - **T7 CRIT-1 — Cardinality-aware reconcile
+    (`scheduler/sync.rs`).** The reconcile job's ack cache silenced
+    hash-mismatch divergences after the first detection. For a
+    cardinality drift (e.g. 3 multi-room `View_CheckIn_Ds` rows
+    collapsed into 1 `ht_checkins` row), hashes can never match
+    regardless of CT-mapper correctness — but the ack-by-hash
+    silenced every subsequent tick, and a single multi-room folio
+    never tripped the 50-rows/hr volume alert. The reconcile now
+    fetches `(mssql_hash, mssql_row_count)` and
+    `(pg_hash, pg_row_count)` and classifies divergences as one of
+    `value` / `cardinality` / `missing_pg` / `missing_mssql`. Only
+    `value` and `missing_mssql` are silenceable; `cardinality` and
+    `missing_pg` re-fire every tick until operator action repairs
+    canonical state.
+  - **T7 CRIT-2 — `/api/new/sync/status` reads `legacy_sync_status`
+    (`routes/new_sync.rs`).** The endpoint was reading `sync_status`
+    (4 entity_types written only by the demoted 15-min reconciler);
+    12 CT-tracked entities had no health surface so a half-broken CT
+    watcher silently lost mappings while the dashboard showed
+    "healthy". Now reads `legacy_sync_status` (16 entities — 10
+    canonical + 6 legacy_mirror) and unions a `writebackQueue` block
+    with grouped `(intent, status)` counts so operators see queue
+    depth without switching to the DB shell.
+  - **T7 CRIT-3 — Watermark stall watchdog (`bin/sync.rs`).** Shadow
+    mode rolls back every tick including the watermark UPDATE;
+    `legacy_sync_status` counters keep advancing (`rows_skipped++`)
+    so nothing looks broken until the 2-day MSSQL CT retention cliff
+    silently drops changes. New background task polls
+    `legacy_ct_state` every 60s and pages on either (a)
+    `last_seen_version` not advancing for
+    `LEGACY_SYNC_WATERMARK_STALL_ALERT_SECS` (default 30 min) in
+    live mode, or (b) shadow mode running past the 36h hardcoded
+    ceiling (below the 48h cliff with 12h cushion). Per-condition
+    30 min cooldown.
+  - **T7 HIGH-1 — Level-triggered drift alert
+    (`scheduler/sync.rs`).** The pre-existing 50-rows/hr threshold is
+    edge-triggered on volume; a single divergence that persists
+    forever never alerts. New level-triggered digest fires when ANY
+    table has unresolved rows older than 4h, per-table cooldown 24h.
+    Complements (does not replace) the volume alert. The
+    `pg_hash IS NULL` (canonical missing) path is also locked as
+    never-silenceable.
+  - **T7 HIGH-2 — Writeback queue depth alert (`bin/writeback.rs`).**
+    Existing per-job exhausted-alert covers single jobs; bulk
+    failures looked like single failures. New janitor task polls
+    `writeback_jobs` every 60s and pages on `pending > 500`,
+    `failed > 100`, or `in_progress > 5 with claimed_at > 10 min`.
+    Per-condition 30 min cooldown.
+  - **T7 HIGH-3 — Fingerprint expansion (`writeback/fingerprint.rs`).**
+    The legacy schema-drift guard covered 15 writeback-touched tables
+    only; 4 CT-watched mirror tables (`HT_CheckIn_Product`,
+    `HT_Deposit`, `HT_Bill_Debt_H`, `HT_Bill_Debt_Ds`) and 1
+    user-impact table (`HT_CheckIn_Other_People` — TM.30 immigration
+    registry, Track E HIGH-3 will add the mapper) had no
+    fingerprint guard. New `CT_EXTRA_FINGERPRINTED_TABLES` +
+    `verify_ct_schema_fingerprint` cover them with an independent
+    hash so vendor drift on a CT-only table doesn't force a
+    writeback baseline bump and vice versa. `bin/sync.rs` now calls
+    the CT-side guard.
+  - T7 HIGH-4 (CI smoke test with MSSQL service container) deferred
+    to a follow-on PR — the infra work is non-trivial and benefits
+    from its own focus.
+
+### Added
+
+- Migration 032 — `ht_reconcile_log.divergence_kind` (TEXT) +
+  `legacy_row_count` (INT) + `pg_row_count` (INT). Nullable for
+  backward compatibility with rows inserted before Track D. Documented
+  in `migrations/pg/032_ht_reconcile_log_cardinality.sql` and the
+  migrations README.
+
 ## [2.63.10] - 2026-05-13
 
 ### Fixed

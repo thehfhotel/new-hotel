@@ -39,5 +39,7 @@ pub mod recipes;
 pub use dispatcher::{dispatch, DispatchContext, LegacyIds, ResolvedJob};
 pub use error::{WritebackError, WritebackResult};
 pub use fingerprint::{
-    verify_legacy_collation_safety, verify_schema_fingerprint, EXPECTED_FINGERPRINT,
+    ct_fingerprinted_tables, verify_ct_schema_fingerprint, verify_legacy_collation_safety,
+    verify_schema_fingerprint, CT_EXTRA_EXPECTED_FINGERPRINT, CT_EXTRA_FINGERPRINTED_TABLES,
+    EXPECTED_FINGERPRINT, WRITEBACK_FINGERPRINTED_TABLES,
 };

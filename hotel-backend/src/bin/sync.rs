@@ -77,7 +77,7 @@ use hotel_backend::sync::mappers::{
 };
 use hotel_backend::sync::parent_loader::{load_booking_aggregate, load_checkin_aggregate};
 use hotel_backend::sync::{MssqlChangeMapper, NoopMapper};
-use hotel_backend::writeback::verify_schema_fingerprint;
+use hotel_backend::writeback::verify_ct_schema_fingerprint;
 
 const DEFAULT_CT_POLL_INTERVAL_MS: u64 = 1000;
 
@@ -142,6 +142,28 @@ const DEFAULT_OUTAGE_ALERT_THRESHOLD: u32 = 2;
 const DEFAULT_INIT_RETRY_INITIAL_SECS: u64 = 5;
 const DEFAULT_INIT_RETRY_MAX_SECS: u64 = 60;
 const DEFAULT_INIT_RETRY_ALERT_AFTER_SECS: u64 = 300;
+
+/// Track D / T7 CRIT-3 — watermark-stall watchdog poll interval (60s).
+/// Reads `legacy_ct_state.last_seen_version` + `last_polled_at` once
+/// per interval and compares against the previous observation.
+const WATERMARK_WATCHDOG_POLL_INTERVAL_SECS: u64 = 60;
+
+/// Track D / T7 CRIT-3 — emit a Slack alert if `last_seen_version`
+/// hasn't advanced for this long while shadow mode is OFF AND the
+/// watcher claims to be polling (recent `last_polled_at`). Default
+/// 30 min. Override via `LEGACY_SYNC_WATERMARK_STALL_ALERT_SECS`.
+const DEFAULT_WATERMARK_STALL_ALERT_SECS: u64 = 1800;
+
+/// Track D / T7 CRIT-3 — hard ceiling on how long shadow mode can run
+/// before paging the operator. The MSSQL CT retention default is 2
+/// days; we ceiling at 36h to leave 12h of cushion. Hardcoded so a
+/// well-meaning operator can't push it past the cliff via env var.
+const SHADOW_MODE_MAX_DURATION_SECS: u64 = 36 * 3600;
+
+/// Track D / T7 CRIT-3 — minimum gap between watchdog Slack pages.
+/// Flooding the channel once we detect a stall isn't actionable — the
+/// operator just needs to know it's happening.
+const WATCHDOG_ALERT_COOLDOWN_SECS: u64 = 1800;
 
 /// All CT-enabled MSSQL tables — must stay in sync with the seed in
 /// migrations 017 (canonical sync, 10 tables) + 022 (legacy_mirror, 6
@@ -346,7 +368,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await;
     tracing::info!(server = %mssql_config.server, "Connected to legacy MSSQL");
 
-    if let Err(e) = verify_schema_fingerprint(&mssql).await {
+    // Track D / T7 HIGH-3 — verify the CT-side fingerprint (writeback
+    // baseline + 5 CT-only extras) instead of just the writeback set.
+    // A vendor change on HT_CheckIn_Product / HT_Deposit / HT_Bill_Debt_*
+    // / HT_CheckIn_Other_People would silently corrupt CT-mapped rows
+    // without the CT-extra guard.
+    if let Err(e) = verify_ct_schema_fingerprint(&mssql).await {
         tracing::error!(
             site = %site.id,
             error = %e,
@@ -500,6 +527,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         shutdown_clone.notify_waiters();
     });
 
+    // Track D / T7 CRIT-3 — watermark-stall watchdog. Background task
+    // that polls `legacy_ct_state` every 60s and pages on:
+    // (a) live-mode watermark not advancing for `stall_alert_secs`
+    //     (default 30 min, configurable via env), or
+    // (b) shadow mode running past the 36h hardcoded ceiling (below
+    //     the 48h MSSQL CT retention cliff).
+    // Cooldown 30min per alert kind so we don't flood.
+    let stall_alert_secs = env::var("LEGACY_SYNC_WATERMARK_STALL_ALERT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_WATERMARK_STALL_ALERT_SECS);
+    let watchdog_pg = pg.clone();
+    let watchdog_slack = slack.clone();
+    let watchdog_site_id = site.id.clone();
+    let watchdog_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        run_watermark_watchdog(
+            watchdog_pg,
+            watchdog_slack,
+            watchdog_site_id,
+            stall_alert_secs,
+            watchdog_shutdown,
+        )
+        .await;
+    });
+
     // Per-table retention check timestamps. The first tick after
     // startup runs the check unconditionally (no prior `Instant`); after
     // that, each table re-checks at most once per
@@ -601,8 +654,10 @@ async fn run_bootstrap(site: &SiteConfig) -> Result<(), Box<dyn std::error::Erro
 
     // Schema fingerprint guard — same gate the watcher main loop uses.
     // Refusing to bootstrap on drift prevents seeding canonical state
-    // from a DB shape we don't understand.
-    if let Err(e) = verify_schema_fingerprint(&mssql).await {
+    // from a DB shape we don't understand. Track D / T7 HIGH-3 uses
+    // the CT-side fingerprint so a drift on a CT-only mirror table
+    // blocks the cold-seed reconcile too.
+    if let Err(e) = verify_ct_schema_fingerprint(&mssql).await {
         return Err(format!(
             "[bootstrap] Schema fingerprint check failed; refusing to bootstrap: {e}"
         )
@@ -860,6 +915,267 @@ async fn create_pool_with_retry(
             }
         }
     }
+}
+
+/// Track D / T7 CRIT-3 — observation read from `legacy_ct_state`.
+/// Used by [`watermark_stall_watchdog_alerts_when_version_stuck`] to
+/// keep state across polls without a DB round-trip for the prior
+/// version.
+#[derive(Debug, Clone, Copy)]
+struct WatermarkObservation {
+    last_seen_version: i64,
+    /// `last_polled_at` from PG — surfaces whether the watcher is
+    /// actively ticking. If it's stale, the issue isn't a stuck
+    /// watermark — it's a stalled tick loop, handled by other alerts.
+    last_polled_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When we observed this snapshot (process-local, not from PG).
+    /// Used to compute how long the watermark has been stuck across
+    /// the watchdog's own polls.
+    observed_at: Instant,
+}
+
+/// Pure decision function for the watermark-stall alert. Returns
+/// `Some(reason)` when the operator should be paged, `None` otherwise.
+///
+/// Inputs are intentionally explicit (no env reads, no clock) so the
+/// unit test can drive the truth table without spinning a tokio
+/// runtime or mocking PG.
+///
+/// Rules:
+/// 1. If `current.last_seen_version > prior.last_seen_version` → watermark
+///    advanced. Reset the timer; no alert.
+/// 2. If `current.last_seen_version == prior.last_seen_version` AND
+///    the stuck duration is below the threshold → no alert (steady-state
+///    idle is normal).
+/// 3. If the version is stuck for `>= stall_alert_secs` AND shadow_mode
+///    is FALSE AND `last_polled_at` is recent → ALERT (the watcher is
+///    ticking but not advancing — the canonical CT-watermark-stall trap).
+/// 4. Shadow mode stalls don't fire from this rule — they're caught by
+///    [`shadow_mode_pager_eligible`] separately.
+fn watermark_stall_alert_eligible(
+    prior: &WatermarkObservation,
+    current: &WatermarkObservation,
+    now: Instant,
+    shadow_mode: bool,
+    stall_threshold: Duration,
+) -> Option<String> {
+    if current.last_seen_version > prior.last_seen_version {
+        return None;
+    }
+    if shadow_mode {
+        // Shadow stall is loud-by-design — see shadow_mode_pager_eligible.
+        return None;
+    }
+    let stuck_for = now.duration_since(prior.observed_at);
+    if stuck_for < stall_threshold {
+        return None;
+    }
+    Some(format!(
+        "CT watermark stuck at {} for {}s (threshold {}s)",
+        current.last_seen_version,
+        stuck_for.as_secs(),
+        stall_threshold.as_secs(),
+    ))
+}
+
+/// Pure decision function for the shadow-mode-too-long alert. Returns
+/// `Some(reason)` when shadow mode has been running for longer than
+/// the hardcoded ceiling ([`SHADOW_MODE_MAX_DURATION_SECS`], 36h).
+///
+/// The MSSQL CT retention default is 2 days; staying in shadow mode
+/// past 36h leaves <12h before the retention cliff silently drops
+/// changes the next tick would have replayed.
+fn shadow_mode_pager_eligible(
+    shadow_mode: bool,
+    started_at: Instant,
+    now: Instant,
+) -> Option<String> {
+    if !shadow_mode {
+        return None;
+    }
+    let duration = now.duration_since(started_at);
+    let max = Duration::from_secs(SHADOW_MODE_MAX_DURATION_SECS);
+    if duration < max {
+        return None;
+    }
+    Some(format!(
+        "Shadow mode has been running for {}s (ceiling {}s, ≈36h). \
+         MSSQL CT retention is 2 days; staying in shadow much longer \
+         risks the watermark dropping behind MIN_VALID_VERSION.",
+        duration.as_secs(),
+        max.as_secs(),
+    ))
+}
+
+/// Track D / T7 CRIT-3 — spawn the watermark-stall watchdog. Runs as a
+/// detached background task; reads `legacy_ct_state` every 60s and
+/// fires Slack alerts on either (a) version stuck >= `stall_alert_secs`
+/// in live mode, or (b) shadow mode running past the 36h ceiling.
+/// Cooldown 30min per alert kind so we don't flood.
+async fn run_watermark_watchdog(
+    pg: PgPool,
+    slack: Option<SlackClient>,
+    site_id: String,
+    stall_alert_secs: u64,
+    shutdown: Arc<Notify>,
+) {
+    let started_at = Instant::now();
+    let stall_threshold = Duration::from_secs(stall_alert_secs);
+    let cooldown = Duration::from_secs(WATCHDOG_ALERT_COOLDOWN_SECS);
+    let mut prior: Option<WatermarkObservation> = None;
+    let mut last_stall_alert: Option<Instant> = None;
+    let mut last_shadow_alert: Option<Instant> = None;
+
+    let shadow_mode = env::var("LEGACY_SYNC_SHADOW_MODE")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    tracing::info!(
+        site = %site_id,
+        stall_alert_secs,
+        shadow_mode,
+        "[watchdog] Watermark-stall watchdog starting"
+    );
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(WATERMARK_WATCHDOG_POLL_INTERVAL_SECS)) => {}
+            _ = shutdown.notified() => {
+                tracing::info!(site = %site_id, "[watchdog] Shutdown — exiting");
+                return;
+            }
+        }
+
+        let now = Instant::now();
+
+        // Read both watermark + last_polled_at in one round-trip.
+        let observation = match read_ct_state(&pg).await {
+            Ok(o) => o,
+            Err(err) => {
+                tracing::warn!(
+                    site = %site_id,
+                    error = %err,
+                    "[watchdog] Failed to read legacy_ct_state — observability degraded"
+                );
+                continue;
+            }
+        };
+
+        // Watermark stall check (live mode only).
+        if let Some(prior_obs) = prior.as_ref() {
+            if let Some(reason) =
+                watermark_stall_alert_eligible(prior_obs, &observation, now, shadow_mode, stall_threshold)
+            {
+                let cooldown_elapsed = match last_stall_alert {
+                    Some(t) => now.duration_since(t) >= cooldown,
+                    None => true,
+                };
+                if cooldown_elapsed {
+                    tracing::error!(
+                        site = %site_id,
+                        version = observation.last_seen_version,
+                        reason,
+                        "[watchdog] Watermark stall detected — paging operator"
+                    );
+                    if let Some(s) = slack.as_ref() {
+                        let payload = SlackMessage::with_site_text(
+                            &site_id,
+                            format!(
+                                ":rotating_light: *CT watermark STUCK* :rotating_light:\n\
+                                 {reason}\n\
+                                 _The CT watcher is ticking but `last_seen_version` \
+                                 hasn't advanced. Common causes: every tick failing + \
+                                 rolling back the watermark UPDATE (check \
+                                 `legacy_sync_status.last_error`), or all 16 tables \
+                                 happen to be quiet. Tighten the check via the \
+                                 dashboard at `/api/new/sync/status`._"
+                            ),
+                        );
+                        let _ = s.send_message(&payload).await;
+                    }
+                    last_stall_alert = Some(now);
+                }
+            } else if observation.last_seen_version > prior_obs.last_seen_version {
+                tracing::debug!(
+                    site = %site_id,
+                    from = prior_obs.last_seen_version,
+                    to = observation.last_seen_version,
+                    "[watchdog] Watermark advanced"
+                );
+            }
+        }
+
+        // Persist the LATEST advance moment, not the current poll —
+        // so a sustained stall keeps reporting its true duration.
+        let new_prior = if let Some(prior_obs) = prior.as_ref() {
+            if observation.last_seen_version > prior_obs.last_seen_version {
+                WatermarkObservation {
+                    last_seen_version: observation.last_seen_version,
+                    last_polled_at: observation.last_polled_at,
+                    observed_at: now,
+                }
+            } else {
+                // Same version — keep the original observed_at so the
+                // stuck-duration grows monotonically.
+                WatermarkObservation {
+                    last_seen_version: observation.last_seen_version,
+                    last_polled_at: observation.last_polled_at,
+                    observed_at: prior_obs.observed_at,
+                }
+            }
+        } else {
+            // First observation — anchor the stuck-timer here.
+            WatermarkObservation {
+                observed_at: now,
+                ..observation
+            }
+        };
+        prior = Some(new_prior);
+
+        // Shadow-mode-too-long check.
+        if let Some(reason) = shadow_mode_pager_eligible(shadow_mode, started_at, now) {
+            let cooldown_elapsed = match last_shadow_alert {
+                Some(t) => now.duration_since(t) >= cooldown,
+                None => true,
+            };
+            if cooldown_elapsed {
+                tracing::error!(
+                    site = %site_id,
+                    reason,
+                    "[watchdog] Shadow mode exceeded ceiling — paging operator"
+                );
+                if let Some(s) = slack.as_ref() {
+                    let payload = SlackMessage::with_site_text(
+                        &site_id,
+                        format!(
+                            ":no_entry: *Shadow mode exceeded {SHADOW_MODE_MAX_DURATION_SECS}s ceiling* :no_entry:\n\
+                             {reason}\n\
+                             _Flip `LEGACY_SYNC_SHADOW_MODE=false` and redeploy, or \
+                             accept the retention-overflow risk for another tick. \
+                             See docs/runbook-sync.md._"
+                        ),
+                    );
+                    let _ = s.send_message(&payload).await;
+                }
+                last_shadow_alert = Some(now);
+            }
+        }
+    }
+}
+
+/// Read both `last_seen_version` and `last_polled_at` from
+/// `legacy_ct_state` in one query.
+async fn read_ct_state(pg: &PgPool) -> Result<WatermarkObservation, sqlx::Error> {
+    let row = sqlx::query_as::<_, (i64, Option<chrono::DateTime<chrono::Utc>>)>(
+        "SELECT last_seen_version, last_polled_at FROM legacy_ct_state WHERE id = 1",
+    )
+    .fetch_one(pg)
+    .await?;
+    Ok(WatermarkObservation {
+        last_seen_version: row.0,
+        last_polled_at: row.1,
+        observed_at: Instant::now(),
+    })
 }
 
 /// Operator-facing refusal message for the N1 live-bootstrap guard.
@@ -2310,6 +2626,140 @@ mod tests {
             result.is_err(),
             "create_pool_with_retry should never return on a permanently \
              unreachable MSSQL; expected timeout, got {result:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Track D / T7 CRIT-3 — watermark-stall watchdog
+    // -------------------------------------------------------------------
+
+    fn obs(version: i64, observed_offset_secs: u64, anchor: Instant) -> WatermarkObservation {
+        WatermarkObservation {
+            last_seen_version: version,
+            last_polled_at: Some(chrono::Utc::now()),
+            observed_at: anchor + Duration::from_secs(observed_offset_secs),
+        }
+    }
+
+    /// Track D / T7 CRIT-3 — when the version advances between two
+    /// polls, no alert fires (the steady-state happy path).
+    #[test]
+    fn watermark_stall_watchdog_no_alert_when_version_advancing() {
+        let anchor = Instant::now();
+        let prior = obs(100, 0, anchor);
+        let current = obs(150, 60, anchor);
+        let now = anchor + Duration::from_secs(60);
+        let result = watermark_stall_alert_eligible(
+            &prior,
+            &current,
+            now,
+            false,
+            Duration::from_secs(1800),
+        );
+        assert!(result.is_none(), "advancing watermark must never alert");
+    }
+
+    /// Track D / T7 CRIT-3 — the canonical case the watchdog exists for:
+    /// version stuck longer than the threshold in live mode fires.
+    #[test]
+    fn watermark_stall_watchdog_alerts_when_version_stuck() {
+        let anchor = Instant::now();
+        let prior = obs(100, 0, anchor);
+        let current = obs(100, 1801, anchor); // same version, 30m+1s later
+        let now = anchor + Duration::from_secs(1801);
+        let result = watermark_stall_alert_eligible(
+            &prior,
+            &current,
+            now,
+            false,
+            Duration::from_secs(1800),
+        );
+        assert!(result.is_some(), "stuck >threshold must alert in live mode");
+        let msg = result.unwrap();
+        assert!(msg.contains("stuck at 100"));
+        assert!(msg.contains("1801"));
+    }
+
+    /// Track D / T7 CRIT-3 — same input under shadow mode does NOT fire
+    /// (shadow stall is handled by `shadow_mode_pager_eligible`).
+    #[test]
+    fn watermark_stall_watchdog_suppressed_in_shadow_mode() {
+        let anchor = Instant::now();
+        let prior = obs(100, 0, anchor);
+        let current = obs(100, 7200, anchor);
+        let now = anchor + Duration::from_secs(7200);
+        let result = watermark_stall_alert_eligible(
+            &prior,
+            &current,
+            now,
+            true, // shadow mode
+            Duration::from_secs(1800),
+        );
+        assert!(result.is_none(), "shadow stall must be handled by the other rule");
+    }
+
+    /// Track D / T7 CRIT-3 — stuck for less than the threshold must not
+    /// alert. Steady-state low-traffic periods are normal.
+    #[test]
+    fn watermark_stall_watchdog_no_alert_below_threshold() {
+        let anchor = Instant::now();
+        let prior = obs(100, 0, anchor);
+        let current = obs(100, 300, anchor); // 5 min stuck
+        let now = anchor + Duration::from_secs(300);
+        let result = watermark_stall_alert_eligible(
+            &prior,
+            &current,
+            now,
+            false,
+            Duration::from_secs(1800), // 30 min threshold
+        );
+        assert!(result.is_none(), "below threshold must not alert");
+    }
+
+    /// Track D / T7 CRIT-3 — shadow mode older than the ceiling fires.
+    #[test]
+    fn shadow_mode_pager_fires_past_ceiling() {
+        let started_at = Instant::now();
+        let now = started_at + Duration::from_secs(SHADOW_MODE_MAX_DURATION_SECS + 1);
+        let result = shadow_mode_pager_eligible(true, started_at, now);
+        assert!(result.is_some(), "shadow > ceiling must page");
+    }
+
+    /// Track D / T7 CRIT-3 — shadow mode younger than the ceiling does
+    /// not fire (12h is below the 36h threshold).
+    #[test]
+    fn shadow_mode_pager_silent_inside_ceiling() {
+        let started_at = Instant::now();
+        let now = started_at + Duration::from_secs(12 * 3600);
+        let result = shadow_mode_pager_eligible(true, started_at, now);
+        assert!(result.is_none(), "12h shadow run must NOT page");
+    }
+
+    /// Track D / T7 CRIT-3 — live mode never triggers the
+    /// shadow-too-long alert regardless of elapsed time.
+    #[test]
+    fn shadow_mode_pager_silent_in_live_mode() {
+        let started_at = Instant::now();
+        let now = started_at + Duration::from_secs(SHADOW_MODE_MAX_DURATION_SECS + 10_000);
+        let result = shadow_mode_pager_eligible(false, started_at, now);
+        assert!(result.is_none(), "live mode must never fire the shadow pager");
+    }
+
+    /// Track D / T7 CRIT-3 — the ceiling sits below the 48h MSSQL CT
+    /// retention cliff with at least 12h of cushion. Locks the constant
+    /// so a future refactor can't push it past the cliff without
+    /// failing this test.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn shadow_mode_ceiling_below_ct_retention_cliff() {
+        const CT_RETENTION_CLIFF_SECS: u64 = 48 * 3600;
+        assert!(
+            SHADOW_MODE_MAX_DURATION_SECS < CT_RETENTION_CLIFF_SECS,
+            "shadow ceiling must be < 48h MSSQL CT retention"
+        );
+        assert!(
+            CT_RETENTION_CLIFF_SECS - SHADOW_MODE_MAX_DURATION_SECS >= 12 * 3600,
+            "must leave >=12h cushion before the cliff"
         );
     }
 }
