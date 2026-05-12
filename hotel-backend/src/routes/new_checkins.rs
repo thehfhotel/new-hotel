@@ -366,6 +366,22 @@ pub async fn checkout(
 
     let check_out_time = parse_check_out_time(body.check_out_time.as_deref())?;
 
+    // Audit H1: thread real revenue + nights into the writeback intent so
+    // the MSSQL `Total_Price_*` UPDATEs stop wiping legacy revenue. Numbers
+    // come from the canonical PG state via the payment-billing repo (same
+    // query that backs the receipt totals API).
+    let billing = state
+        .payments
+        .check_in_billing(&state.new_pool, cin_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
+    let nights = billing.nights.unwrap_or(1).max(1) as f64;
+    let rate = billing.cin_rate_per_night.unwrap_or(0.0);
+    let room_price_total = rate * nights;
+    let pay_total = body.total_amount.or(billing.cin_total_amount).unwrap_or(0.0);
+    let net_total = room_price_total; // No product/extras plumbing yet.
+    let balance = (net_total - pay_total).max(0.0);
+
     let outcome = state
         .checkins_service
         .check_out(CheckOutCommand {
@@ -379,6 +395,12 @@ pub async fn checkout(
             notes: body.notes.clone(),
             // TODO: wire user_id from auth middleware
             source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
+            nights,
+            room_price_total,
+            product_total: 0.0,
+            net_total,
+            pay_total,
+            balance,
         })
         .await
         .map_err(map_checkout_error)?;

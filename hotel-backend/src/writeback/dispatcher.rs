@@ -258,7 +258,15 @@ pub async fn dispatch(
             )
             .await
         }
-        WritebackIntent::CheckOut { check_in_id: _ } => {
+        WritebackIntent::CheckOut {
+            check_in_id: _,
+            nights,
+            room_price_total,
+            product_total,
+            net_total,
+            pay_total,
+            balance,
+        } => {
             let cin_no = nonempty(resolved.legacy_cin_no.as_ref()).ok_or_else(|| {
                 WritebackError::Recipe("CheckOut requires resolved legacy_cin_no".into())
             })?;
@@ -270,7 +278,31 @@ pub async fn dispatch(
                     "CheckOut requires resolved legacy_checkin_ds_id".into(),
                 )
             })?;
-            recipes::checkout::execute(conn, cin_no, room_no, ds_id).await
+            // Audit H1: legacy events queued before the Wave 2 fix lack the
+            // totals payload. Fall back to the prior all-zeros behavior so
+            // the queue drains, and log a WARN so the partial sync surfaces
+            // in worker logs. New events always carry real totals.
+            if nights.is_none() {
+                tracing::warn!(
+                    cin_no,
+                    "CheckOut intent has no nights/totals payload — falling \
+                     back to legacy zeros (audit H1). This event was likely \
+                     enqueued before the Wave 2 deploy."
+                );
+            }
+            recipes::checkout::execute(
+                conn,
+                cin_no,
+                room_no,
+                ds_id,
+                nights.unwrap_or(1.0),
+                room_price_total.unwrap_or(0.0),
+                product_total.unwrap_or(0.0),
+                net_total.unwrap_or(0.0),
+                pay_total.unwrap_or(0.0),
+                balance.unwrap_or(0.0),
+            )
+            .await
         }
         WritebackIntent::RecordPayment {
             check_in_id: _,

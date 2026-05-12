@@ -5,6 +5,68 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.63.3] - 2026-05-12
+
+### Fixed
+
+- **Writeback financial integrity — Wave 2 (`docs/legacy-spike/writeback-
+  audit-2026-05-12.md`).** Six HIGH-severity bugs from the audit plus the
+  payment-idempotency MED, all in `hotel-backend/src/writeback/`:
+  - **H1** `recipes/checkout.rs::execute()` no longer hardcodes
+    `nights=1, room_price_total=0, product_total=0, net_total=0,
+    pay_total=0, balance=0`. Every checkout was wiping real revenue from
+    MSSQL with zeros. `WritebackIntent::CheckOut` now carries the real
+    totals (added as `Option<f64>` with `#[serde(default)]` for back-compat
+    with pre-Wave-2 queued events — the dispatcher logs a WARN and falls
+    back to zeros for in-flight rows so the queue drains without manual
+    intervention). `CheckOutCommand` extended with the same fields;
+    `routes/new_checkins.rs::checkout` computes them from the canonical PG
+    state (rate × nights + `cin_total_amount`).
+  - **H2** `recipes/checkout.rs:106` — `Room_Use_Count` bumps by the real
+    nights count (`Room_Use_Count + {nights}`) per
+    `COMPAT_CHEATSHEET.md:289`, not always `+1`. Multi-night stays were
+    under-counting by `nights − 1` (hidden because the spike captures were
+    all 1-night).
+  - **H3** `recipes/payment.rs` — `Cin_Pay_Ds_Price` and
+    `Cin_Pay_Ds_PriceTotal` now equal the tender amount, restoring the
+    legacy invariant `Cin_Pay_Ds_Price = Cash + Credit + Free + Tran +
+    Web` (`COMPAT_CHEATSHEET.md:534`). Prior code wrote the nightly total
+    on partial payments, breaking the shift report. `Cin_Pay_Ds_PriceOne`
+    (unit price) and `Cin_Pay_Ds_Num` (nights) stay verbatim so the
+    printed receipt line still shows the per-night breakdown. A
+    `debug_assert!` validates the sum at build time.
+  - **H4** `recipes/payment.rs` `HT_Receipt_Ds` line items now emit
+    `S_Unit=1.00, S_Price=<amt>.00, S_Total=<amt>.00, S_PriceDiscount=0.00`
+    via `money_2dp(…)?`, matching live capture
+    `invoice-20260424-100827/writes.txt:8`. Prior code emitted bare
+    integers (`1, 711, 711, 0`) — printed receipts had inconsistent
+    decimal styling.
+  - **H5** `domain/payment.rs:46` — `PaymentMethod::Transfer.legacy_column()`
+    now returns `"Cin_Pay_Tran"` per `COMPAT_CHEATSHEET.md:515`, not
+    `"Cin_Pay_Credit"`. The recipe was already correct; only the helper
+    was wrong. Latent bug — the helper has no callers today but is
+    `pub` and would silently misroute transfers if used by future code.
+  - **H6** `format.rs::round_money` switched to banker's rounding
+    (`(value * 100.0).round_ties_even() / 100.0`) to match .NET's
+    `Math.Round(value, 2)` default (`MidpointRounding.ToEven`). The
+    prior `f64::round` diverged at the 0.005 / 0.015 / 0.025 midpoints —
+    invisible today (all prices are whole baht) but VAT splits or future
+    fractional pricing would silently fork from the legacy app.
+  - **Payment idempotency** (MED): `HT_CheckIn_Pay` INSERT wrapped in
+    `INSERT … SELECT … WHERE NOT EXISTS (SELECT 1 FROM HT_CheckIn_Pay
+    WHERE Pay_no=…)`. The follow-on
+    `UPDATE Total_Price_Pay = ISNULL(...) + amount` would double-count
+    on a retry after network-drop-on-COMMIT; the guard makes the insert
+    a no-op when the `Pay_no` (allocated under TABLOCKX) already exists.
+
+  Twelve new unit tests in `writeback::recipes::checkout::tests`,
+  `writeback::recipes::payment::tests`, `writeback::format::tests`,
+  `domain::payment::tests`, and `outbox::intent::tests` (including a
+  pre-Wave-2 JSON deserialize regression) lock in the fixes. Existing
+  byte-parity tests updated for the `INSERT … SELECT … WHERE NOT EXISTS`
+  shape (column list and value tuple remain byte-for-byte identical to
+  the legacy capture).
+
 ## [2.63.2] - 2026-05-12
 
 ### Fixed

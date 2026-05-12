@@ -696,7 +696,7 @@ async fn resolve_legacy_ids(
         }
         CancelCheckIn { check_in_id, .. }
         | ExtendStay { check_in_id, .. }
-        | CheckOut { check_in_id }
+        | CheckOut { check_in_id, .. }
         | RecordPayment { check_in_id, .. } => {
             if let Some(row) = sqlx::query(
                 "SELECT legacy_cin_no, legacy_room_no, legacy_cust_no, legacy_checkin_ds_id \
@@ -1890,6 +1890,12 @@ mod tests {
             id: 42,
             intent: WritebackIntent::CheckOut {
                 check_in_id: Uuid::nil(),
+                nights: None,
+                room_price_total: None,
+                product_total: None,
+                net_total: None,
+                pay_total: None,
+                balance: None,
             },
             aggregate_id: Uuid::nil(),
             attempts: 1,

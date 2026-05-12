@@ -100,7 +100,48 @@ pub enum WritebackIntent {
 
     /// Spike §3e Phase 2 — 5 UPDATEs across `HT_POWER_LOG`, `HT_CheckIn_Ds`,
     /// `HT_Rooms`, `HT_Room_Status`, `HT_CheckIn_H`. **Skip Phase 1** (destructive).
-    CheckOut { check_in_id: Uuid },
+    ///
+    /// Audit H1 (Wave 2): the totals fields below propagate the real stay
+    /// revenue, nights, and pay/balance from the canonical PG state into
+    /// the MSSQL UPDATEs. Prior to the fix the recipe hardcoded
+    /// `nights=1, room_price_total=0, ...` regardless of actual stay — every
+    /// checkout wiped the legacy revenue with zeros.
+    ///
+    /// All totals are stored in baht (not satang) because the legacy
+    /// `Total_Price_*` columns are MONEY/decimal in baht. They are
+    /// `Option<f64>` (not bare `f64`) for back-compat with queued events
+    /// emitted before the H1 fix: in-flight rows lack the fields, and the
+    /// dispatcher falls back to the prior all-zeros behavior with a WARN.
+    CheckOut {
+        check_in_id: Uuid,
+        /// Nights actually stayed (>=1). The legacy `Cin_Room_night` /
+        /// `Room_Use_Count` columns expect this as a whole number;
+        /// fractional values are floored.
+        #[serde(default)]
+        nights: Option<f64>,
+        /// Total room revenue in baht. Lands in
+        /// `HT_CheckIn_Ds.Cin_Room_PriceTotal` and
+        /// `HT_CheckIn_H.Total_Price_Room`.
+        #[serde(default)]
+        room_price_total: Option<f64>,
+        /// Total minibar / extras revenue in baht. Lands in
+        /// `HT_CheckIn_H.Total_Price_Product`.
+        #[serde(default)]
+        product_total: Option<f64>,
+        /// Net (room + product) revenue in baht. Lands in
+        /// `HT_CheckIn_H.Total_Price_Net`.
+        #[serde(default)]
+        net_total: Option<f64>,
+        /// Total payments tendered in baht. Lands in
+        /// `HT_CheckIn_Ds.Cin_Room_Pay_Total` and
+        /// `HT_CheckIn_H.Total_Price_Pay`.
+        #[serde(default)]
+        pay_total: Option<f64>,
+        /// Outstanding balance in baht (`net - pay`). Lands in
+        /// `HT_CheckIn_H.Total_Price_Balance`.
+        #[serde(default)]
+        balance: Option<f64>,
+    },
 
     /// Spike §3h — `INSERT HT_CheckIn_Pay` + `UPDATE HT_CheckIn_H` totals.
     /// Receipt INSERTs (`HT_Receipt_H` / `HT_Receipt_Ds`) follow in a separate
@@ -227,7 +268,7 @@ impl WritebackIntent {
             WritebackIntent::CreateCheckIn { check_in_id, .. }
             | WritebackIntent::CancelCheckIn { check_in_id, .. }
             | WritebackIntent::ExtendStay { check_in_id, .. }
-            | WritebackIntent::CheckOut { check_in_id }
+            | WritebackIntent::CheckOut { check_in_id, .. }
             | WritebackIntent::RecordPayment { check_in_id, .. } => *check_in_id,
             WritebackIntent::MarkRoomClean { room_id, .. } => *room_id,
         }
@@ -240,6 +281,77 @@ impl WritebackIntent {
 /// rather than a panic). New emitters always populate the field explicitly.
 fn default_extend_stay_start() -> DateTime<Utc> {
     Utc::now()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Audit H1 back-compat: in-flight CheckOut events queued before the
+    /// Wave 2 deploy carry only `check_in_id` — the new totals fields must
+    /// deserialize as `None` so the queue drains without manual
+    /// intervention. The dispatcher then logs a WARN and falls back to the
+    /// prior all-zeros behavior.
+    #[test]
+    fn check_out_intent_deserializes_pre_wave2_payload_without_totals() {
+        let legacy_json = r#"{"intent":"check_out","payload":{"check_in_id":"550e8400-e29b-41d4-a716-446655440000"}}"#;
+        let intent: WritebackIntent = serde_json::from_str(legacy_json)
+            .expect("pre-Wave-2 CheckOut payload must still deserialize");
+        match intent {
+            WritebackIntent::CheckOut {
+                check_in_id,
+                nights,
+                room_price_total,
+                product_total,
+                net_total,
+                pay_total,
+                balance,
+            } => {
+                assert_eq!(
+                    check_in_id,
+                    Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()
+                );
+                assert!(nights.is_none(), "nights must default to None");
+                assert!(room_price_total.is_none());
+                assert!(product_total.is_none());
+                assert!(net_total.is_none());
+                assert!(pay_total.is_none());
+                assert!(balance.is_none());
+            }
+            other => panic!("expected CheckOut variant, got {other:?}"),
+        }
+    }
+
+    /// Wave-2 emissions carry the full totals payload so the recipe writes
+    /// real numbers to MSSQL.
+    #[test]
+    fn check_out_intent_roundtrips_with_totals_payload() {
+        let intent = WritebackIntent::CheckOut {
+            check_in_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
+            nights: Some(3.0),
+            room_price_total: Some(2670.0),
+            product_total: Some(0.0),
+            net_total: Some(2670.0),
+            pay_total: Some(2670.0),
+            balance: Some(0.0),
+        };
+        let json = serde_json::to_string(&intent).expect("must serialize");
+        let parsed: WritebackIntent =
+            serde_json::from_str(&json).expect("must round-trip");
+        match parsed {
+            WritebackIntent::CheckOut {
+                nights,
+                room_price_total,
+                pay_total,
+                ..
+            } => {
+                assert_eq!(nights, Some(3.0));
+                assert_eq!(room_price_total, Some(2670.0));
+                assert_eq!(pay_total, Some(2670.0));
+            }
+            other => panic!("expected CheckOut variant, got {other:?}"),
+        }
+    }
 }
 
 /// Receipt-header fields carried by [`WritebackIntent::RecordPayment`].

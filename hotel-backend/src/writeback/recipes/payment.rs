@@ -133,7 +133,6 @@ pub fn build_statements(
         .price_per_night_baht
         .unwrap_or(amount / nights as f64);
     let price_per_night_2dp = money_2dp(price_per_night)?;
-    let nightly_total_2dp = money_2dp(price_per_night * nights as f64)?;
 
     // Tender column: cash → Cin_Pay_Cash; credit/transfer → Cin_Pay_Credit.
     // Cin_Pay_Tran is the bank-transfer column — only filled when neither
@@ -191,16 +190,43 @@ pub fn build_statements(
     //    `[Cin_Pay_Ds_PriceOne]` — opposite of the natural English reading.
     //    `[Cin_Pay_Ds]` carries the room number (NOT empty); the unit
     //    column emits the literal string `'รายการ'` not the integer 1.
+    //
+    //    Audit H3: `Cin_Pay_Ds_Price` and `Cin_Pay_Ds_PriceTotal` are the
+    //    actual tender amount (not the nightly total). The legacy invariant
+    //    (COMPAT_CHEATSHEET.md:534) requires
+    //    `Cin_Pay_Ds_Price = Cash + Credit + Free + Tran + Web`. The unit
+    //    price (`Cin_Pay_Ds_PriceOne`) and quantity (`Cin_Pay_Ds_Num`)
+    //    remain verbatim so the printed receipt line still shows the
+    //    per-night breakdown.
+    //
+    //    Idempotency MED: wrap the INSERT in `WHERE NOT EXISTS` on
+    //    `Pay_no`. The Pay_no was allocated under TABLOCKX so a duplicate
+    //    can only arise from a retry after a network drop on the COMMIT
+    //    of a prior attempt. Without the guard, the subsequent
+    //    `Total_Price_Pay = ISNULL(...) + amount` UPDATE would
+    //    double-count the payment.
+    let cash_v = cash_2dp.parse::<f64>().unwrap_or(0.0);
+    let credit_v = credit_2dp.parse::<f64>().unwrap_or(0.0);
+    let free_v = free_2dp.parse::<f64>().unwrap_or(0.0);
+    let transfer_v = transfer_2dp.parse::<f64>().unwrap_or(0.0);
+    let web_v = web_2dp.parse::<f64>().unwrap_or(0.0);
+    let amount_check = cash_v + credit_v + free_v + transfer_v + web_v;
+    debug_assert!(
+        (amount_check - amount).abs() < 0.005,
+        "split tender (cash={cash_v} credit={credit_v} free={free_v} \
+         tran={transfer_v} web={web_v}) must equal amount={amount}"
+    );
     statements.push(format!(
         "INSERT INTO [HT_CheckIn_Pay](  [Cin_No],[Cin_Pay_Ds],[Cin_Pay_Cash],[Cin_Pay_Credit],\
          [Cin_Pay_Date],[Cin_Pay_Ds_Name],[Cin_Pay_Ds_Price],[Cin_Pay_Ds_unit],[Pay_No],\
          [Cin_Cust_no],[Cin_Pay_Ds_ID],[Cin_Pay_Ds_Num],[Cin_Pay_Ds_PriceTotal],\
          [Cin_Pay_Ds_PriceOne],[Cin_Pay_Note],[Pay_by],[Cin_Pay_Free],[Cin_Pay_Tran],\
          [Branch],[Cin_Pay_web])\
-         VALUES( {cin_no_q},{room_no_q},{cash_2dp},{credit_2dp},{now_q},{pay_ds_name_q},\
-         {nightly_total_2dp},{pay_ds_unit_q},{pay_no_q},{cust_no_q},{pay_ds_id_q},{nights},\
-         {nightly_total_2dp},{price_per_night_2dp},'',{operator_q},{free_2dp},{transfer_2dp},\
-         {branch_q},{web_2dp})"
+         SELECT {cin_no_q},{room_no_q},{cash_2dp},{credit_2dp},{now_q},{pay_ds_name_q},\
+         {amount_2dp},{pay_ds_unit_q},{pay_no_q},{cust_no_q},{pay_ds_id_q},{nights},\
+         {amount_2dp},{price_per_night_2dp},'',{operator_q},{free_2dp},{transfer_2dp},\
+         {branch_q},{web_2dp} \
+         WHERE NOT EXISTS (SELECT 1 FROM HT_CheckIn_Pay WHERE Pay_no={pay_no_q})"
     ));
 
     // 4. HT_CheckIn_H — accumulate Pay, recompute Balance from Net (HIGH-3).
@@ -245,12 +271,19 @@ pub fn build_statements(
         vat_per = RECEIPT_VAT_PERCENT,
     ));
 
-    // 7. HT_Receipt_Ds — receipt line for the room charge
+    // 7. HT_Receipt_Ds — receipt line for the room charge. Audit H4: the
+    //    legacy capture (`invoice-20260424-100827/writes.txt:8`) emits
+    //    `S_Unit=1.00, S_Price=711.00, S_Total=711.00, S_PriceDiscount=0.00`
+    //    — every numeric column rendered with two decimals. The prior code
+    //    emitted bare integers (1, 711, 0) which diverged from the
+    //    capture and printed receipts with inconsistent decimal styling.
+    let unit_one_2dp = money_2dp(1.0)?;
+    let zero_2dp = money_2dp(0.0)?;
     statements.push(format!(
         "INSERT INTO [HT_Receipt_Ds]([S_Sale_id],[S_Product_no],[S_Product_name],[S_Unit],\
          [S_UnitName],[S_Price],[S_Total],[S_PriceDiscount_per],[S_PriceDiscount])\
-         VALUES({receipt_id},{service_code_q},{receipt_label_q},1,{unit_name_q},\
-         {amount},{amount},'',0)"
+         VALUES({receipt_id},{service_code_q},{receipt_label_q},{unit_one_2dp},{unit_name_q},\
+         {amount_2dp},{amount_2dp},'',{zero_2dp})"
     ));
 
     Ok(statements)
@@ -366,6 +399,12 @@ mod tests {
     /// captured legacy row. Source: `/tmp/legacy-events-full.log`
     /// timestamped 2026-04-25T04:35:47 — `R2604-0250` payment for
     /// `CH26-005236` room `414`.
+    ///
+    /// The recipe wraps the legacy INSERT in
+    /// `INSERT INTO … SELECT … WHERE NOT EXISTS …` for retry idempotency
+    /// (audit MED — payment idempotency). The column list and value tuple
+    /// remain byte-for-byte identical to the legacy capture — we just
+    /// gate on `Pay_no`.
     #[test]
     fn checkin_pay_matches_legacy_capture_byte_for_byte() {
         // The captured row uses a different timestamp than Utc::now()
@@ -380,16 +419,17 @@ mod tests {
                     [Cin_Pay_Ds_unit],[Pay_No],[Cin_Cust_no],[Cin_Pay_Ds_ID],[Cin_Pay_Ds_Num],\
                     [Cin_Pay_Ds_PriceTotal],[Cin_Pay_Ds_PriceOne],[Cin_Pay_Note],[Pay_by],\
                     [Cin_Pay_Free],[Cin_Pay_Tran],[Branch],[Cin_Pay_web])\
-                    VALUES( 'CH26-005236','414',801.00,0.00,";
+                    SELECT 'CH26-005236','414',801.00,0.00,";
         assert!(
             pay.starts_with(head),
             "HT_CheckIn_Pay must start with the legacy column list + tender values; got:\n{pay}"
         );
         let tail = "'ค่าห้อง',801.00,'รายการ','R2604-0250','C21624','P001',1,801.00,801.00,'',\
-                    'Admin',0.00,0.00,'สำนักงานใหญ่',0.00)";
+                    'Admin',0.00,0.00,'สำนักงานใหญ่',0.00 \
+                    WHERE NOT EXISTS (SELECT 1 FROM HT_CheckIn_Pay WHERE Pay_no='R2604-0250')";
         assert!(
             pay.ends_with(tail),
-            "HT_CheckIn_Pay must end with the legacy value tail; got:\n{pay}"
+            "HT_CheckIn_Pay must end with the legacy value tail + idempotency guard; got:\n{pay}"
         );
     }
 
@@ -489,8 +529,11 @@ mod tests {
         let s = build_statements(&inputs).unwrap();
         let pay = s.iter().find(|s| s.contains("HT_CheckIn_Pay")).unwrap();
         // Cash, Credit, then later Tran are all f64-rendered with 2dp.
+        // The INSERT … SELECT shape (idempotency guard) ends with the
+        // Web=0.00 value followed by the WHERE NOT EXISTS clause — no
+        // trailing `)` after the value list.
         assert!(pay.contains(",0.00,0.00,"));
-        assert!(pay.contains(",0.00,801.00,'สำนักงานใหญ่',0.00)"));
+        assert!(pay.contains(",0.00,801.00,'สำนักงานใหญ่',0.00 WHERE NOT EXISTS"));
     }
 
     #[test]
@@ -560,6 +603,92 @@ mod tests {
         // [Receipt_cin_vat_before] and [Receipt_Tax]. Both flank with
         // commas; an empty note is `''` between them.
         assert!(h.contains("801.00,'','XDD619524'"));
+    }
+
+    /// Fix for audit H3: `Cin_Pay_Ds_Price` and `Cin_Pay_Ds_PriceTotal`
+    /// must equal the actual tender amount, satisfying the legacy invariant
+    /// `Cin_Pay_Ds_Price = Cash + Credit + Free + Tran + Web`
+    /// (COMPAT_CHEATSHEET.md:534). With the prior (nightly_total) wiring a
+    /// partial payment broke the invariant: a 400-baht prepayment against a
+    /// 711-baht nightly stay would write Ds_Price=711 but Cash+...=400.
+    #[test]
+    fn ds_price_equals_amount_not_nightly_total_on_partial_payment() {
+        let mut inputs = sample_inputs();
+        inputs.amount_baht = 400.0; // partial — less than one night's room rate
+        inputs.price_per_night_baht = Some(711.0);
+        inputs.nights = Some(1);
+        let s = build_statements(&inputs).unwrap();
+        let pay = s.iter().find(|s| s.contains("[HT_CheckIn_Pay]")).unwrap();
+        // The Ds_Price (7th VALUE) and Ds_PriceTotal (13th VALUE) must both
+        // be the partial-payment amount (400.00), not the nightly total
+        // (711.00). Cin_Pay_Ds_PriceOne (14th VALUE, unit price) stays at 711.00
+        // and Cin_Pay_Ds_Num (12th VALUE, quantity) stays at 1.
+        assert!(
+            pay.contains("'ค่าห้อง',400.00,'รายการ'"),
+            "Cin_Pay_Ds_Price must be 400.00 (the tender), not nightly total; got:\n{pay}"
+        );
+        // Cash column (3rd VALUE) and Ds_PriceTotal (13th VALUE) — both 400.00.
+        assert!(
+            pay.contains(",400.00,0.00,"),
+            "Cash tender column must be 400.00; got:\n{pay}"
+        );
+        assert!(
+            pay.contains(",1,400.00,711.00,"),
+            "Cin_Pay_Ds_Num=1, Cin_Pay_Ds_PriceTotal=400.00, Cin_Pay_Ds_PriceOne=711.00; got:\n{pay}"
+        );
+    }
+
+    /// Fix for audit H4: HT_Receipt_Ds emits S_Unit, S_Price, S_Total,
+    /// S_PriceDiscount with `.00` decimals — matches live capture
+    /// `invoice-20260424-100827/writes.txt:8`: `1.00, 711.00, 711.00, 0.00`.
+    #[test]
+    fn receipt_ds_emits_two_decimal_format() {
+        let s = build_statements(&sample_inputs()).unwrap();
+        let line = s.iter().find(|s| s.contains("[HT_Receipt_Ds]")).unwrap();
+        // VALUES tail (after Sale_id, product_no, product_name, …):
+        //   …,1.00,'คืน',801.00,801.00,'',0.00)
+        assert!(
+            line.contains(",1.00,'คืน',801.00,801.00,'',0.00)"),
+            "HT_Receipt_Ds must format S_Unit/S_Price/S_Total/S_PriceDiscount with .00; got:\n{line}"
+        );
+        assert!(
+            !line.contains(",1,'คืน'"),
+            "S_Unit must be 1.00, not bare 1; got:\n{line}"
+        );
+    }
+
+    /// Fix for audit H5 (also exercised at domain level): when the recipe
+    /// chooses tender columns for a Transfer payment, the amount lands in
+    /// Cin_Pay_Tran (column 18, immediately before Branch).
+    #[test]
+    fn transfer_routes_to_cin_pay_tran_column() {
+        let mut inputs = sample_inputs();
+        inputs.method = PaymentMethod::Transfer;
+        let s = build_statements(&inputs).unwrap();
+        let pay = s.iter().find(|s| s.contains("[HT_CheckIn_Pay]")).unwrap();
+        // Tail with Cash=0, Credit=0, Free=0, Tran=801.00, Branch, Web=0.
+        // Idempotency guard appends `WHERE NOT EXISTS …` after the values.
+        assert!(
+            pay.contains(",0.00,801.00,'สำนักงานใหญ่',0.00 WHERE NOT EXISTS"),
+            "Transfer amount must land in Cin_Pay_Tran (before Branch); got:\n{pay}"
+        );
+    }
+
+    /// Fix for payment idempotency MED: the INSERT INTO HT_CheckIn_Pay must
+    /// be guarded by `WHERE NOT EXISTS (SELECT 1 FROM HT_CheckIn_Pay WHERE
+    /// Pay_no=<pay_no_q>)` so a retry after a network-drop-on-COMMIT
+    /// doesn't double-write the payment (which would double Total_Price_Pay
+    /// via the subsequent UPDATE).
+    #[test]
+    fn checkin_pay_insert_is_guarded_against_duplicate_pay_no() {
+        let s = build_statements(&sample_inputs()).unwrap();
+        let pay = s.iter().find(|s| s.contains("[HT_CheckIn_Pay]")).unwrap();
+        assert!(
+            pay.contains(
+                "WHERE NOT EXISTS (SELECT 1 FROM HT_CheckIn_Pay WHERE Pay_no='R2604-0250')"
+            ),
+            "HT_CheckIn_Pay INSERT must be idempotent on Pay_no; got:\n{pay}"
+        );
     }
 
     #[test]

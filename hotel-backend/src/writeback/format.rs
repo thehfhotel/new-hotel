@@ -126,11 +126,16 @@ pub fn vat_inclusive_split(total: f64, vat_percent: i32) -> (f64, f64) {
     (before_vat, vat)
 }
 
-/// Round a money figure to 2 decimal places using "round half away from
-/// zero" — the convention the legacy .NET app's `Math.Round(value, 2)`
-/// uses by default.
+/// Round a money figure to 2 decimal places using banker's rounding
+/// (round-half-to-even) — the convention the legacy .NET app's
+/// `Math.Round(value, 2)` uses by default
+/// (`MidpointRounding.ToEven`). Audit H6: the prior implementation used
+/// `f64::round` (round-half-away-from-zero) which diverges from .NET on
+/// the 0.005 / 0.015 / 0.025 midpoints. Today's whole-baht prices never
+/// hit those midpoints, but VAT splits and any future fractional pricing
+/// would silently fork from the legacy app.
 fn round_money(value: f64) -> f64 {
-    (value * 100.0).round() / 100.0
+    (value * 100.0).round_ties_even() / 100.0
 }
 
 /// Render an `f64` money amount with exactly 2 decimal places (e.g.
@@ -314,6 +319,21 @@ mod tests {
         assert_eq!(money_2dp(801.0).unwrap(), "801.00");
         assert_eq!(money_2dp(52.4).unwrap(), "52.40");
         assert_eq!(money_2dp(0.0).unwrap(), "0.00");
+    }
+
+    #[test]
+    fn round_money_uses_banker_s_rounding() {
+        // .NET's `Math.Round(value, 2)` defaults to MidpointRounding.ToEven
+        // (banker's rounding). Round-half-away-from-zero would give 0.01 / 0.02 / 0.03;
+        // banker's rounding gives 0.00 / 0.02 / 0.02 (round to nearest even at the
+        // exact midpoint). Verified against .NET behavior.
+        assert_eq!(round_money(0.005), 0.00, "0.005 should round to 0.00 (even)");
+        assert_eq!(round_money(0.015), 0.02, "0.015 should round to 0.02 (even)");
+        assert_eq!(round_money(0.025), 0.02, "0.025 should round to 0.02 (even)");
+        assert_eq!(round_money(0.035), 0.04, "0.035 should round to 0.04 (even)");
+        // Non-midpoint values still round normally.
+        assert_eq!(round_money(0.014), 0.01);
+        assert_eq!(round_money(0.016), 0.02);
     }
 
     #[test]

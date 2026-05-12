@@ -127,6 +127,12 @@ pub struct ExtendStayCommand {
 }
 
 /// Command for [`CheckInService::check_out`].
+///
+/// The revenue/nights/balance fields ride into
+/// [`WritebackIntent::CheckOut`] so the legacy `HT_CheckIn_Ds` +
+/// `HT_CheckIn_H` UPDATEs receive real values, not zeros (audit H1). All
+/// `*_total` figures are baht (legacy column type is MONEY/decimal in
+/// baht, not satang).
 #[derive(Debug, Clone)]
 pub struct CheckOutCommand {
     pub check_in_id: i32,
@@ -135,6 +141,19 @@ pub struct CheckOutCommand {
     pub payment_status: String,
     pub notes: Option<String>,
     pub source: EventSource,
+    /// Nights actually stayed (>=1).
+    pub nights: f64,
+    /// Total room revenue in baht (rate per night × nights).
+    pub room_price_total: f64,
+    /// Total minibar / extras revenue in baht (0 today — no
+    /// `HT_CheckIn_Product` plumbing yet).
+    pub product_total: f64,
+    /// Net (room + product) revenue in baht.
+    pub net_total: f64,
+    /// Total payments tendered in baht.
+    pub pay_total: f64,
+    /// Outstanding balance in baht (net − pay).
+    pub balance: f64,
 }
 
 /// Outcome of a successful check-in mutation.
@@ -479,7 +498,17 @@ impl CheckInService {
         }
 
         let aggregate_id = aggregate_uuid(AggregateKind::CheckIn, cmd.check_in_id);
-        let intent = WritebackIntent::CheckOut { check_in_id: aggregate_id };
+        // Audit H1: thread real revenue + nights + balance into the intent
+        // so the recipe stops writing zeros to MSSQL on every checkout.
+        let intent = WritebackIntent::CheckOut {
+            check_in_id: aggregate_id,
+            nights: Some(cmd.nights),
+            room_price_total: Some(cmd.room_price_total),
+            product_total: Some(cmd.product_total),
+            net_total: Some(cmd.net_total),
+            pay_total: Some(cmd.pay_total),
+            balance: Some(cmd.balance),
+        };
         let key = generate_idempotency_key(&intent, aggregate_id);
         OutboxRepository::enqueue(&mut tx, &intent, key)
             .await

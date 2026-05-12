@@ -88,6 +88,11 @@ pub fn build_statements(inputs: &CheckOutInputs<'_>) -> Vec<String> {
     let pay = inputs.pay_total;
     let balance = inputs.balance;
     let nights = inputs.nights;
+    // Audit H2: Room_Use_Count must be bumped by the real nights count
+    // (COMPAT_CHEATSHEET.md:289 / 1164), not always +1. Cast to i64 — the
+    // legacy column is INT; floor to integer nights (the payload may carry
+    // fractional values from rate math, but the usage counter is whole).
+    let nights_int = nights.max(0.0) as i64;
 
     vec![
         // 1. Lights off — finds the in-progress entry by ROOM_POWER_END_BY=''
@@ -101,10 +106,10 @@ pub fn build_statements(inputs: &CheckOutInputs<'_>) -> Vec<String> {
              [Cin_Room_Pay_Total]={pay},[Cin_Room_night]={nights},\
              [Cin_Room_PriceTotal]={room_price},[Cin_note]='' where id={ds_id}"
         ),
-        // 3. Free the room + flag dirty + bump usage counter
+        // 3. Free the room + flag dirty + bump usage counter by nights (audit H2)
         format!(
-            "update HT_Rooms set room_use='no',Room_Clean='yes',Room_Use_Count=Room_Use_Count+1 \
-             where room_no={room_no_q}"
+            "update HT_Rooms set room_use='no',Room_Clean='yes',\
+             Room_Use_Count=Room_Use_Count+{nights_int} where room_no={room_no_q}"
         ),
         // 4. Stamp check-out on HT_Room_Status — room_status='Check Out' (SPACE)
         format!(
@@ -123,28 +128,34 @@ pub fn build_statements(inputs: &CheckOutInputs<'_>) -> Vec<String> {
 
 /// Execute the check-out recipe.
 ///
-/// **Important:** the current `WritebackIntent::CheckOut` payload is just
-/// `{ check_in_id }` — totals aren't carried. We pass zeros (matching the
-/// captured behavior, which also wrote zeros). The PG side already has the
-/// canonical totals; this is a best-effort sync of the legacy view.
-/// TODO: extend payload with real totals once a corresponding service-layer
-/// pass adds them.
+/// Audit H1: callers must thread the real revenue totals + nights from
+/// the canonical PG state. The legacy-event fallback (when the payload
+/// pre-dates the H1 fix and the totals are not yet on the intent) passes
+/// zeros — matching the prior buggy behavior — and logs a WARN at the
+/// dispatcher so the partial sync is visible in worker logs.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute(
     conn: &mut LegacyConn<'_>,
     cin_no: &str,
     room_no: &str,
     checkin_ds_id: i32,
+    nights: f64,
+    room_price_total: f64,
+    product_total: f64,
+    net_total: f64,
+    pay_total: f64,
+    balance: f64,
 ) -> WritebackResult<LegacyIds> {
     let inputs = CheckOutInputs {
         cin_no,
         room_no,
         checkin_ds_id,
-        room_price_total: 0.0,
-        product_total: 0.0,
-        net_total: 0.0,
-        pay_total: 0.0,
-        balance: 0.0,
-        nights: 1.0,
+        room_price_total,
+        product_total,
+        net_total,
+        pay_total,
+        balance,
+        nights,
     };
     let statements = build_statements(&inputs);
     super::execute_all(conn, &statements).await?;
@@ -248,5 +259,79 @@ mod tests {
         assert!(statements[4].contains("[Total_Price_Net]=1780"));
         assert!(statements[4].contains("[Total_Price_Pay]=1780"));
         assert!(statements[4].contains("[Total_Price_Balance]=0"));
+    }
+
+    /// Fix for audit H1: a 3-night checkout with real revenue totals
+    /// (2670 baht) must write those values to MSSQL — not zeros. The prior
+    /// `execute()` hardcoded all totals to 0 regardless of the actual stay,
+    /// wiping real revenue from MSSQL on every checkout.
+    #[test]
+    fn build_statements_uses_real_revenue_totals() {
+        let inputs = CheckOutInputs {
+            cin_no: "CH26-005228",
+            room_no: "402",
+            checkin_ds_id: 25007,
+            room_price_total: 2670.0,
+            product_total: 0.0,
+            net_total: 2670.0,
+            pay_total: 2670.0,
+            balance: 0.0,
+            nights: 3.0,
+        };
+        let statements = build_statements(&inputs);
+        // HT_CheckIn_Ds row (statement 2): Cin_Room_PriceTotal must equal
+        // the real room-revenue total, not 0.
+        assert!(
+            statements[1].contains("[Cin_Room_PriceTotal]=2670"),
+            "Cin_Room_PriceTotal must reflect real room revenue; got:\n{}",
+            statements[1]
+        );
+        // Cin_Room_night must be the real nights count.
+        assert!(
+            statements[1].contains("[Cin_Room_night]=3"),
+            "Cin_Room_night must reflect real nights; got:\n{}",
+            statements[1]
+        );
+        // HT_CheckIn_H row (statement 5): Total_Price_* must reflect real
+        // figures.
+        assert!(
+            statements[4].contains("[Total_Price_Room]=2670"),
+            "Total_Price_Room must reflect real room revenue; got:\n{}",
+            statements[4]
+        );
+        assert!(
+            statements[4].contains("[Total_Price_Net]=2670"),
+            "Total_Price_Net must reflect real net; got:\n{}",
+            statements[4]
+        );
+        assert!(
+            statements[4].contains("[Total_Price_Pay]=2670"),
+            "Total_Price_Pay must reflect real pay total; got:\n{}",
+            statements[4]
+        );
+    }
+
+    /// Fix for audit H2: Room_Use_Count is bumped by the real nights count
+    /// (per COMPAT_CHEATSHEET.md:289), not always +1. Spike captures were
+    /// 1-night stays so the bug was hidden.
+    #[test]
+    fn room_use_count_increments_by_nights_not_one() {
+        let inputs = CheckOutInputs {
+            cin_no: "CH26-005228",
+            room_no: "402",
+            checkin_ds_id: 25007,
+            room_price_total: 2670.0,
+            product_total: 0.0,
+            net_total: 2670.0,
+            pay_total: 2670.0,
+            balance: 0.0,
+            nights: 3.0,
+        };
+        let statements = build_statements(&inputs);
+        assert!(
+            statements[2].contains("Room_Use_Count=Room_Use_Count+3"),
+            "Room_Use_Count must be bumped by nights (3), not +1; got:\n{}",
+            statements[2]
+        );
     }
 }

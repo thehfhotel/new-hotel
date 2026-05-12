@@ -121,7 +121,15 @@ mod tests {
     fn different_intents_same_aggregate_produce_different_keys() {
         let agg = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
         let cancel = WritebackIntent::CancelBooking { booking_id: agg };
-        let check_out = WritebackIntent::CheckOut { check_in_id: agg };
+        let check_out = WritebackIntent::CheckOut {
+            check_in_id: agg,
+            nights: None,
+            room_price_total: None,
+            product_total: None,
+            net_total: None,
+            pay_total: None,
+            balance: None,
+        };
 
         assert_ne!(
             generate_idempotency_key(&cancel, agg),

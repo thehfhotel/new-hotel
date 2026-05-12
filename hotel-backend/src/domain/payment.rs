@@ -37,13 +37,38 @@ pub enum PaymentMethod {
 
 impl PaymentMethod {
     /// Legacy column on `HT_CheckIn_Pay` that receives the amount for this method.
+    ///
+    /// Mirrors the recipe in `writeback::recipes::payment::build_statements`
+    /// and `COMPAT_CHEATSHEET.md:515` — bank transfers (PromptPay / wire) land
+    /// in `Cin_Pay_Tran`, not `Cin_Pay_Credit`.
     pub fn legacy_column(self) -> &'static str {
         match self {
             PaymentMethod::Cash => "Cin_Pay_Cash",
             PaymentMethod::Credit => "Cin_Pay_Credit",
-            // Bank transfers are recorded under the credit column historically;
-            // the spike has not yet captured a dedicated transfer flow.
-            PaymentMethod::Transfer => "Cin_Pay_Credit",
+            PaymentMethod::Transfer => "Cin_Pay_Tran",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cash_method_routes_to_cash_column() {
+        assert_eq!(PaymentMethod::Cash.legacy_column(), "Cin_Pay_Cash");
+    }
+
+    #[test]
+    fn credit_method_routes_to_credit_column() {
+        assert_eq!(PaymentMethod::Credit.legacy_column(), "Cin_Pay_Credit");
+    }
+
+    #[test]
+    fn transfer_method_routes_to_tran_column() {
+        // Fix for audit H5: Transfer must route to Cin_Pay_Tran per
+        // COMPAT_CHEATSHEET.md:515 — bank transfers are the third tender
+        // column, distinct from credit cards.
+        assert_eq!(PaymentMethod::Transfer.legacy_column(), "Cin_Pay_Tran");
     }
 }
