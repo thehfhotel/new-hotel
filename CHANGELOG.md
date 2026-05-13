@@ -5,6 +5,66 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.63.14] - 2026-05-13
+
+### Fixed
+
+- **`bin/writeback.rs` — queue-depth alert silently disabled (Track D
+  regression caught in 2026-05-13 production verification).** The
+  `make_interval(mins => $1)` SQL in `fetch_queue_depth` was binding
+  `QUEUE_STUCK_IN_PROGRESS_AGE_MINS: i64 = 10`. PostgreSQL's
+  `make_interval` is overloaded only on `int` (i32) — a `bigint` (i64)
+  bind raises `function make_interval(mins => bigint) does not exist`,
+  which the janitor logs every 60s but never escalates. Net effect:
+  the queue-depth Slack alert (stuck `in_progress` jobs older than 10
+  minutes) has been silently dead since the alert was shipped.
+  - Narrow the const to `i32`. `i32::MAX` minutes is ~4083 years so
+    the narrower type costs nothing semantically.
+  - Add unit test
+    `queue_stuck_in_progress_age_mins_is_i32_for_make_interval` that
+    pins the type via a `let bind_value: i32 = ...` compile-time
+    assertion; a future widening fails to build.
+
+- **Scheduler — Slack replay storm on every backend container redeploy
+  (production verification 2026-05-13).** The polling jobs
+  (`poll_checkins`, `poll_checkouts`, `poll_new_bookings`) tracked their
+  watermark in process memory only. On restart the watermark seeded
+  with `chrono::Utc::now().naive_utc()`, but the legacy MSSQL columns
+  filtered against (`Cin_Room_In`, `Cin_Room_Out`, `Book_Date`) store
+  **Thai local time** (GMT+7). The 7-hour offset between the seeded
+  watermark and the source data made every event from the previous
+  ~7 hours look "new" on the first post-deploy poll — ~45 Slack pages
+  of replayed checkouts per redeploy.
+  - `migrations/pg/037_scheduler_notification_state.sql` adds a
+    singleton-per-pair `scheduler_notification_state(site_id,
+    notification_type, last_event_at, updated_at)` table.
+  - New `scheduler::notification_state` module: `load_watermark`,
+    `save_watermark`, plus `now_thai_local()` for the seed case (used
+    only if the PG row doesn't yet exist).
+  - `scheduler::jobs` polling functions: on first poll after process
+    start, hydrate from PG (or seed in Thai-local time if no row).
+    Persist after every advance via UPSERT. Three unit tests pin the
+    behavior:
+    `now_thai_local_is_approximately_seven_hours_ahead_of_utc`,
+    `notification_type_str_is_stable_db_key`,
+    `notification_type_str_values_are_all_distinct`.
+
+### Added
+
+- **`docs/coexistence/RUNBOOK-mssql-022-apply.md` — apply runbook for
+  the un-applied legacy-mssql migration 022 (Track E1).** The
+  `GuestRegistryMapper` shipped in v2.63.12 has been failing ~1/sec on
+  both sites because the legacy-side CT enablement
+  (`HT_CheckIn_Other_People` PK + CT) never landed. Runbook covers the
+  Phase-5-style sqlcmd-via-docker apply pattern for both sites (HF
+  Hotel on `FRONT2\SQLEXPRESS` / db; HF Ville on `192.168.11.51,1436` /
+  HOTEL via the `hfville` WireGuard interface), pre- and post-apply
+  verification queries on both MSSQL and PG, the rollback path via the
+  existing `.rollback.sql` companion, and what success looks like. The
+  human operator (NOT this PR's deploy pipeline) executes the runbook
+  during a quiet receptionist window — coordination required because
+  the `ADD CONSTRAINT PRIMARY KEY` operation takes a brief Sch-M lock.
+
 ## [2.63.13] - 2026-05-13
 
 ### Added

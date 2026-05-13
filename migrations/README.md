@@ -176,6 +176,7 @@ These are automatically applied by `scripts/migrate.sh` during deployment.
 | 034 | `034_ht_guest_registry_legacy_id.sql` | Track E1 — adds `guest_legacy_id INTEGER UNIQUE` to `ht_guest_registry` so the new `GuestRegistryMapper` can UPSERT companion-guest rows keyed on the legacy IDENTITY column. iHOTEL's DELETE-then-REINSERT edit pattern would otherwise accumulate duplicate canonical rows | v2.63.12 |
 | 035 | `035_track_e2_customer_columns.sql` | Track E2 / T1 HIGH-2 — widens `ht_customers` to mirror the full legacy `HT_Customers` schema (27 new columns: `cust_price_over` running debt balance, address tuple, work-address tuple, `cust_name2`, `cust_sex`, `cust_contry`, `cust_last_change`, `cust_price_tier`, `cust_work_tax`, …). Read-only sync — writeback of `Cust_Price_Over` debt mutations deferred to Track G | v2.63.13 |
 | 036 | `036_track_e2_room_columns.sql` | Track E2 / T1 HIGH-3 — widens `ht_rooms_new` with 8 legacy `HT_Rooms` columns: `room_use_count` (running nights total), `room_x` / `room_y` (drag-drop grid layout), `room_group` (floor/wing), `room_power_open` / `_close` / `_status` (electricity relay), `room_polity` (policy id). Defaults match legacy NOT NULL / DEFAULT clauses | v2.63.13 |
+| 037 | `037_scheduler_notification_state.sql` | Persisted per-(site, notification type) watermark for the scheduler polling jobs (`poll_checkins` / `poll_checkouts` / `poll_new_bookings`). Fixes the post-redeploy Slack replay storm where ~45 historical events were re-paged because the in-memory watermark reset to UTC-now on every container restart (and MSSQL stores Thai local time, so UTC-now was effectively 7h behind any real event time) | v2.63.14 |
 
 ## Tables Owned by This Application
 
@@ -221,6 +222,7 @@ All table and column names are **lowercase** (PostgreSQL convention). The canoni
 | `ht_reconcile_log` | Phase 5.5 drift tripwire — rows where MSSQL hash != canonical PG hash (logged by the demoted `scheduler::sync::run_sync` 15-min diff-only safety net) | v2.45.0 |
 | `ht_users` | Local username + Argon2id password hash + role (`admin` / `receptionist`). Backs Phase 4 cookie-session authentication (PR1 introduces the schema; PR2 adds HTTP login routes) | v2.60.0 |
 | `ht_sessions` | Active server-side sessions keyed by HttpOnly cookie token. `ON DELETE CASCADE` from `ht_users`; `expires_at` index drives periodic cleanup. (Phase 4 PR1) | v2.60.0 |
+| `scheduler_notification_state` | Persisted Slack watermark per (site, notification type) consumed by `scheduler::jobs::{poll_checkins, poll_checkouts, poll_new_bookings}`. Restored across redeploy so the polling jobs don't re-page historical events on container restart | v2.63.14 |
 
 ## Tables Used (Read-Only or Shared)
 

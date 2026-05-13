@@ -17,9 +17,21 @@ use crate::notifications::slack::{
     build_check_in_alert_message, build_check_out_alert_message, build_hourly_report_message,
     build_new_booking_alert_message, format_site_prefixed, SlackClient, SlackMessage,
 };
+use super::notification_state::{
+    load_watermark, now_thai_local, save_watermark, NotificationType,
+};
 use super::sync;
 
-/// Scheduler state for tracking last polled timestamps
+/// Scheduler state for tracking last polled timestamps in-process.
+///
+/// These fields are a CACHE on top of `scheduler_notification_state`
+/// (PG, migration 037). The first poll for each notification type after
+/// a process restart hydrates from PG; subsequent polls write back to
+/// PG every time the in-memory watermark advances. See
+/// `scheduler::notification_state` for the why — TL;DR: the previous
+/// in-memory-only design caused a ~45-message Slack replay storm on
+/// every container redeploy because the seed value (UTC-now) didn't
+/// match the Thai-local timezone of the MSSQL source columns.
 struct SchedulerState {
     last_checkin_timestamp: Option<NaiveDateTime>,
     last_checkout_timestamp: Option<NaiveDateTime>,
@@ -125,17 +137,25 @@ pub async fn init_scheduler(
     let pool_hourly = pool.clone();
     let slack_hourly = SlackClient::new(slack_config.clone());
 
+    // PG pool is OPTIONAL for the polling jobs — if absent, the
+    // scheduler falls back to the legacy in-memory-only watermark
+    // behavior (which has the post-redeploy replay bug). In all
+    // deployment shapes today PG is available, but we keep the option
+    // to match the existing init_scheduler signature.
     let pool_checkins = pool.clone();
     let slack_checkins = SlackClient::new(slack_config.clone());
     let state_checkins = state.clone();
+    let pg_checkins = pg_pool.clone();
 
     let pool_checkouts = pool.clone();
     let slack_checkouts = SlackClient::new(slack_config.clone());
     let state_checkouts = state.clone();
+    let pg_checkouts = pg_pool.clone();
 
     let pool_bookings = pool.clone();
     let slack_bookings = SlackClient::new(slack_config.clone());
     let state_bookings = state.clone();
+    let pg_bookings = pg_pool.clone();
 
     // Site id is small + Clone-cheap so we just clone it into each
     // closure rather than wrapping in an Arc.
@@ -163,8 +183,9 @@ pub async fn init_scheduler(
         let slack = slack_checkins.clone();
         let state = state_checkins.clone();
         let site_id = checkin_site.clone();
+        let pg = pg_checkins.clone();
         Box::pin(async move {
-            if let Err(e) = poll_checkins(&pool, &slack, &state, &site_id).await {
+            if let Err(e) = poll_checkins(&pool, pg.as_ref(), &slack, &state, &site_id).await {
                 tracing::error!(site = %site_id, "[Scheduler] Error polling check-ins: {}", e);
             }
         })
@@ -177,8 +198,9 @@ pub async fn init_scheduler(
         let slack = slack_checkouts.clone();
         let state = state_checkouts.clone();
         let site_id = checkout_site.clone();
+        let pg = pg_checkouts.clone();
         Box::pin(async move {
-            if let Err(e) = poll_checkouts(&pool, &slack, &state, &site_id).await {
+            if let Err(e) = poll_checkouts(&pool, pg.as_ref(), &slack, &state, &site_id).await {
                 tracing::error!(site = %site_id, "[Scheduler] Error polling checkouts: {}", e);
             }
         })
@@ -191,8 +213,9 @@ pub async fn init_scheduler(
         let slack = slack_bookings.clone();
         let state = state_bookings.clone();
         let site_id = booking_site.clone();
+        let pg = pg_bookings.clone();
         Box::pin(async move {
-            if let Err(e) = poll_new_bookings(&pool, &slack, &state, &site_id).await {
+            if let Err(e) = poll_new_bookings(&pool, pg.as_ref(), &slack, &state, &site_id).await {
                 tracing::error!(site = %site_id, "[Scheduler] Error polling bookings: {}", e);
             }
         })
@@ -283,6 +306,7 @@ async fn send_hourly_report(
 /// Poll for new check-ins and send alerts
 async fn poll_checkins(
     pool: &DbPool,
+    pg: Option<&PgPool>,
     slack: &SlackClient,
     state: &Arc<Mutex<SchedulerState>>,
     site_id: &str,
@@ -292,13 +316,19 @@ async fn poll_checkins(
     let mut conn = pool.get().await?;
     let mut state = state.lock().await;
 
-    // Initialize timestamp on first run
+    // Hydrate the watermark on first poll after process start. PG is
+    // authoritative — if a previous backend container already paged
+    // an event we MUST resume past it, otherwise we re-emit (the bug
+    // this whole subsystem exists to fix).
     if state.last_checkin_timestamp.is_none() {
-        state.last_checkin_timestamp = Some(chrono::Utc::now().naive_utc());
-        tracing::info!(
-            "[Scheduler] Initialized check-in polling from: {:?}",
-            state.last_checkin_timestamp
-        );
+        let initial = hydrate_or_seed_watermark(
+            pg,
+            site_id,
+            NotificationType::Checkin,
+            "check-in",
+        )
+        .await;
+        state.last_checkin_timestamp = Some(initial);
         return Ok(());
     }
 
@@ -322,6 +352,7 @@ async fn poll_checkins(
     if !rows.is_empty() {
         tracing::info!("[Scheduler] Found {} new check-in(s)", rows.len());
 
+        let mut advanced_to: Option<NaiveDateTime> = None;
         for row in &rows {
             let guest_name = row
                 .get::<&str, _>("Cin_cust_name")
@@ -341,8 +372,12 @@ async fn poll_checkins(
                 // Update last checked timestamp
                 if time > state.last_checkin_timestamp.unwrap() {
                     state.last_checkin_timestamp = Some(time);
+                    advanced_to = Some(time);
                 }
             }
+        }
+        if let (Some(ts), Some(pg)) = (advanced_to, pg) {
+            persist_watermark(pg, site_id, NotificationType::Checkin, ts, "check-in").await;
         }
     } else {
         tracing::debug!("[Scheduler] No new check-ins found");
@@ -354,6 +389,7 @@ async fn poll_checkins(
 /// Poll for new checkouts and send alerts
 async fn poll_checkouts(
     pool: &DbPool,
+    pg: Option<&PgPool>,
     slack: &SlackClient,
     state: &Arc<Mutex<SchedulerState>>,
     site_id: &str,
@@ -363,13 +399,19 @@ async fn poll_checkouts(
     let mut conn = pool.get().await?;
     let mut state = state.lock().await;
 
-    // Initialize timestamp on first run
+    // Hydrate the watermark on first poll after process start. PG is
+    // authoritative — if a previous backend container already paged
+    // an event we MUST resume past it, otherwise we re-emit ~45
+    // historical events (the production-verified bug 2026-05-13).
     if state.last_checkout_timestamp.is_none() {
-        state.last_checkout_timestamp = Some(chrono::Utc::now().naive_utc());
-        tracing::info!(
-            "[Scheduler] Initialized checkout polling from: {:?}",
-            state.last_checkout_timestamp
-        );
+        let initial = hydrate_or_seed_watermark(
+            pg,
+            site_id,
+            NotificationType::Checkout,
+            "checkout",
+        )
+        .await;
+        state.last_checkout_timestamp = Some(initial);
         return Ok(());
     }
 
@@ -393,6 +435,7 @@ async fn poll_checkouts(
     if !rows.is_empty() {
         tracing::info!("[Scheduler] Found {} new checkout(s)", rows.len());
 
+        let mut advanced_to: Option<NaiveDateTime> = None;
         for row in &rows {
             let guest_name = row
                 .get::<&str, _>("Cin_cust_name")
@@ -412,8 +455,12 @@ async fn poll_checkouts(
                 // Update last checked timestamp
                 if time > state.last_checkout_timestamp.unwrap() {
                     state.last_checkout_timestamp = Some(time);
+                    advanced_to = Some(time);
                 }
             }
+        }
+        if let (Some(ts), Some(pg)) = (advanced_to, pg) {
+            persist_watermark(pg, site_id, NotificationType::Checkout, ts, "checkout").await;
         }
     } else {
         tracing::debug!("[Scheduler] No new checkouts found");
@@ -425,6 +472,7 @@ async fn poll_checkouts(
 /// Poll for new bookings and send alerts
 async fn poll_new_bookings(
     pool: &DbPool,
+    pg: Option<&PgPool>,
     slack: &SlackClient,
     state: &Arc<Mutex<SchedulerState>>,
     site_id: &str,
@@ -434,13 +482,17 @@ async fn poll_new_bookings(
     let mut conn = pool.get().await?;
     let mut state = state.lock().await;
 
-    // Initialize timestamp on first run
+    // Hydrate the watermark on first poll after process start. PG is
+    // authoritative — see poll_checkouts for the full rationale.
     if state.last_booking_timestamp.is_none() {
-        state.last_booking_timestamp = Some(chrono::Utc::now().naive_utc());
-        tracing::info!(
-            "[Scheduler] Initialized booking polling from: {:?}",
-            state.last_booking_timestamp
-        );
+        let initial = hydrate_or_seed_watermark(
+            pg,
+            site_id,
+            NotificationType::Booking,
+            "booking",
+        )
+        .await;
+        state.last_booking_timestamp = Some(initial);
         return Ok(());
     }
 
@@ -464,6 +516,7 @@ async fn poll_new_bookings(
     if !rows.is_empty() {
         tracing::info!("[Scheduler] Found {} new booking(s)", rows.len());
 
+        let mut advanced_to: Option<NaiveDateTime> = None;
         for row in &rows {
             let guest_name = row
                 .get::<&str, _>("Book_Cust_Name")
@@ -486,13 +539,111 @@ async fn poll_new_bookings(
                 if let Some(time) = booking_time {
                     if time > state.last_booking_timestamp.unwrap() {
                         state.last_booking_timestamp = Some(time);
+                        advanced_to = Some(time);
                     }
                 }
             }
+        }
+        if let (Some(ts), Some(pg)) = (advanced_to, pg) {
+            persist_watermark(pg, site_id, NotificationType::Booking, ts, "booking").await;
         }
     } else {
         tracing::debug!("[Scheduler] No new bookings found");
     }
 
     Ok(())
+}
+
+/// Resolve the initial watermark for a notification type on cold start.
+///
+/// Precedence:
+///   1. PG `scheduler_notification_state` row if one exists — resume
+///      exactly where the previous process left off. This is the path
+///      that fixes the replay-on-redeploy bug.
+///   2. `now_thai_local()` if PG is reachable but has no row yet, OR
+///      if `pg` is `None` (no canonical pool configured). Stored so
+///      subsequent polls don't re-seed.
+///
+/// Always returns a `NaiveDateTime` so the caller can unconditionally
+/// `Some(...)` the in-memory cache without an extra error branch. If
+/// PG IO fails we LOG and seed with `now_thai_local` — silently
+/// re-introducing the legacy in-memory behavior for this tick is
+/// better than crashing the polling loop.
+async fn hydrate_or_seed_watermark(
+    pg: Option<&PgPool>,
+    site_id: &str,
+    notification_type: NotificationType,
+    label_for_log: &str,
+) -> NaiveDateTime {
+    let Some(pg) = pg else {
+        let seed = now_thai_local();
+        tracing::info!(
+            site = %site_id,
+            "[Scheduler] No PG pool — seeding {} watermark in-memory at {:?} (replay-on-restart bug NOT mitigated)",
+            label_for_log, seed
+        );
+        return seed;
+    };
+    match load_watermark(pg, site_id, notification_type).await {
+        Ok(Some(ts)) => {
+            tracing::info!(
+                site = %site_id,
+                "[Scheduler] Resumed {} watermark from PG: {:?}",
+                label_for_log, ts
+            );
+            ts
+        }
+        Ok(None) => {
+            let seed = now_thai_local();
+            // Persist immediately so a crash between this seed and the
+            // next event-emitting poll doesn't re-seed (which would
+            // re-introduce the 7-hour bug if Utc::now was reused).
+            if let Err(e) = save_watermark(pg, site_id, notification_type, seed).await {
+                tracing::warn!(
+                    site = %site_id,
+                    "[Scheduler] Failed to persist initial {} watermark to PG: {} — \
+                     in-memory only for this process",
+                    label_for_log, e
+                );
+            } else {
+                tracing::info!(
+                    site = %site_id,
+                    "[Scheduler] Seeded {} watermark in PG at {:?} (no prior row)",
+                    label_for_log, seed
+                );
+            }
+            seed
+        }
+        Err(e) => {
+            let seed = now_thai_local();
+            tracing::warn!(
+                site = %site_id,
+                "[Scheduler] Failed to load {} watermark from PG: {} — \
+                 seeding in-memory at {:?}",
+                label_for_log, e, seed
+            );
+            seed
+        }
+    }
+}
+
+/// Persist an advanced watermark to PG. Log + swallow IO errors so the
+/// polling loop continues; the in-memory cache still has the new value
+/// so this tick won't re-emit, and the next successful save will catch
+/// PG up.
+async fn persist_watermark(
+    pg: &PgPool,
+    site_id: &str,
+    notification_type: NotificationType,
+    advanced_to: NaiveDateTime,
+    label_for_log: &str,
+) {
+    if let Err(e) = save_watermark(pg, site_id, notification_type, advanced_to).await {
+        tracing::warn!(
+            site = %site_id,
+            "[Scheduler] Failed to persist {} watermark ({:?}) to PG: {} — \
+             will retry on next advance",
+            label_for_log, advanced_to, e
+        );
+    }
 }

@@ -1307,5 +1307,41 @@ VALUES ('036', '036_track_e2_room_columns.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================
+-- Migration 037: scheduler_notification_state. Persisted Slack watermark
+-- per (site, notification type) — fixes the post-redeploy replay storm
+-- where ~45 historical checkouts were re-paged because the in-memory
+-- watermark reset to UTC-now on container restart (and MSSQL stores
+-- Thai local time, so UTC-now ≈ 7h behind any "real" event time).
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS scheduler_notification_state (
+    site_id           TEXT        NOT NULL,
+    notification_type TEXT        NOT NULL,
+    last_event_at     TIMESTAMP   NOT NULL,
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (site_id, notification_type)
+);
+
+CREATE OR REPLACE FUNCTION scheduler_notification_state_touch_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_scheduler_notification_state_touch_updated_at
+    ON scheduler_notification_state;
+
+CREATE TRIGGER trg_scheduler_notification_state_touch_updated_at
+    BEFORE UPDATE ON scheduler_notification_state
+    FOR EACH ROW
+    EXECUTE FUNCTION scheduler_notification_state_touch_updated_at();
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('037', '037_scheduler_notification_state.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
 -- Initialization complete
 -- =============================================================================

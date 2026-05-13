@@ -132,7 +132,14 @@ const QUEUE_DEPTH_POLL_INTERVAL_SECS: u64 = 60;
 const QUEUE_PENDING_ALERT_THRESHOLD: i64 = 500;
 const QUEUE_FAILED_ALERT_THRESHOLD: i64 = 100;
 const QUEUE_STUCK_IN_PROGRESS_THRESHOLD: i64 = 5;
-const QUEUE_STUCK_IN_PROGRESS_AGE_MINS: i64 = 10;
+/// Bound directly into `make_interval(mins => $1)` in
+/// `fetch_queue_depth`. PostgreSQL's `make_interval` is overloaded
+/// only on `int` (i32) — a `bigint` (i64) bind raises
+/// `function make_interval(mins => bigint) does not exist`, which
+/// silently disables the queue-depth alert. `i32::MAX` minutes is
+/// ~4083 years so the narrower type costs nothing.
+/// Track D regression caught 2026-05-13 production verification.
+const QUEUE_STUCK_IN_PROGRESS_AGE_MINS: i32 = 10;
 
 /// Track D / T7 HIGH-2 — minimum gap between queue-depth Slack pages
 /// per condition. 30 min — operator gets one ping per breach window.
@@ -2068,6 +2075,28 @@ mod tests {
     fn stuck_in_progress_timeout_is_in_safe_range() {
         assert!(STUCK_IN_PROGRESS_TIMEOUT_SECS >= 60, "less than 1 min risks racing slow recipes");
         assert!(STUCK_IN_PROGRESS_TIMEOUT_SECS <= 1800, "more than 30 min is too slow to recover");
+    }
+
+    /// Track D regression (2026-05-13 production verification):
+    /// `QUEUE_STUCK_IN_PROGRESS_AGE_MINS` is bound directly into
+    /// `make_interval(mins => $1)` in `fetch_queue_depth`. PostgreSQL's
+    /// `make_interval(mins => ...)` is overloaded only on `int` (i32) — a
+    /// `bigint` (i64) bind raises
+    /// `function make_interval(mins => bigint) does not exist`, which
+    /// silently disables the queue-depth alert (the janitor catches and
+    /// logs the error every 60s but never pages).
+    ///
+    /// This test pins the type at the const site. If a future edit widens
+    /// it back to i64 the `let bind_value: i32 = ...` line stops
+    /// type-checking at compile time. i32::MAX minutes is ~4083 years so
+    /// the narrower type costs nothing.
+    #[test]
+    fn queue_stuck_in_progress_age_mins_is_i32_for_make_interval() {
+        // Compile-time: this assignment only type-checks while the const
+        // is exactly i32. A widening to i64 turns this into an error.
+        let bind_value: i32 = QUEUE_STUCK_IN_PROGRESS_AGE_MINS;
+        assert!(bind_value > 0, "must be positive for make_interval");
+        assert!(bind_value < 60 * 24, "more than 1 day is too slow to alert");
     }
 
     /// Audit H11: the defensive sentinel SQL MUST gate the ROLLBACK on
