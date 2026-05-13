@@ -222,6 +222,18 @@ jobs:
           # run pays the full cold-compile cost. Matches middleware-build.yml.
           cache-on-failure: true
 
+      # SPIKE (chore/spike-cargo-nextest): install nextest via prebuilt
+      # tarball (NOT `cargo install` — that compiles from source ~3min
+      # and would erase any wall-time gain).  Pin to v0.9.85 (latest stable
+      # as of spike date).
+      - name: Install cargo-nextest
+        run: |
+          set -eux
+          curl -fsSL --retry 3 \
+            https://get.nexte.st/0.9.85/linux \
+            | tar -xzf - -C /usr/local/bin
+          cargo-nextest --version
+
       - name: Run backend tests
         working-directory: hotel-backend
         env:
@@ -229,19 +241,14 @@ jobs:
           SQLX_OFFLINE: "true"
           SCCACHE_GHA_ENABLED: ${{ steps.sccache_probe.outcome == 'success' && 'true' || 'false' }}
           RUSTC_WRAPPER: ${{ steps.sccache_probe.outcome == 'success' && 'sccache' || '' }}
-        # `--locked` aborts if Cargo.lock is out of date with Cargo.toml.
-        # CI parity with the production Dockerfile build (also uses --locked).
-        #
-        # `--test-threads=1`: integration tests share ONE PostgreSQL instance
-        # and ONE `ht_*` schema namespace. Running them in parallel races
-        # against shared rows — see the `customer_search_by_name` flake
-        # (CI run 24957295146) where a concurrent `customer_crud_lifecycle`
-        # cleanup nuked the search test's freshly-inserted rows mid-assertion.
-        # The cleanup helper in `tests/common/mod.rs` was tightened to use
-        # exact-match markers instead of `LIKE 'TEST_%'`; this flag is
-        # belt-and-suspenders against any future shared-DB race we haven't
-        # yet enumerated. Cost is ~5-10s on a 13-test suite — acceptable.
-        run: cargo test --locked -- --test-threads=1
+        # SPIKE: replace `cargo test --locked -- --test-threads=1` with
+        # `cargo nextest run --workspace --no-fail-fast --test-threads=1`.
+        # We keep --test-threads=1 to preserve the same shared-DB serialization
+        # the original test command relied on; the gain (if any) comes from
+        # nextest's better scheduling between test binaries + smarter output.
+        # If nextest can't fully exploit parallelism here it'll show as a
+        # near-zero delta, which is itself the signal we want.
+        run: cargo nextest run --workspace --locked --no-fail-fast --test-threads=1
 
   # init-db / migrations drift check (Batch E of post-Phase-5.5 audit).
   #

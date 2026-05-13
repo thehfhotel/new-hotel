@@ -1,3 +1,7 @@
+// spike(ci): cargo-nextest measurement marker — comment-only touch
+// to force the backend paths-filter to fire test-backend on this branch.
+// Do NOT merge.
+
 //! Shared test infrastructure for integration tests.
 //!
 //! Provides helpers for creating a database pool and cleaning up test data.
