@@ -32,7 +32,8 @@ async fn cleanup_guest(pool: &sqlx::PgPool) {
 /// creates if the CI database is fresh. Tests that need a brand-new
 /// room set this up themselves; the lookup is exact-match so it can't
 /// race with other tests.
-const FIXTURE_ROOM_NO: &str = "TRACK-E1-RM";
+// `room_no VARCHAR(10)` — keep under 10 chars.
+const FIXTURE_ROOM_NO: &str = "E1FX-RM";
 const FIXTURE_CUST_FIRSTNAME: &str = "TRACK-E1-CUST";
 
 /// Ensure at least one room and customer row exist for the test
