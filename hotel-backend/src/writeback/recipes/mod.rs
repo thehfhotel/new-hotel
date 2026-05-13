@@ -26,6 +26,7 @@
 //! | `extend_stay` | §3f | `ExtendStay` |
 //! | `checkout` | §3e Phase 2 ONLY | `CheckOut` |
 //! | `payment` | §3h | `RecordPayment` (+ receipt) |
+//! | `refund_payment` | Track G2 / T4 CRIT-1 (`docs/legacy-app/COMPAT_CHEATSHEET.md:513`) | `RefundPayment` |
 //! | `mark_clean` | §3j | `MarkRoomClean` |
 //! | `adjust_product_stock` | Track F3 / T1 CRIT-3 (`docs/legacy-app/COMPAT_CHEATSHEET.md:560-564`) | `AdjustProductStock` |
 
@@ -40,6 +41,7 @@ pub mod extend_stay;
 pub mod helpers;
 pub mod mark_clean;
 pub mod payment;
+pub mod refund_payment;
 pub mod walkin;
 
 use crate::writeback::allocate::LegacyConn;

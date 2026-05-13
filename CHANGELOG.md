@@ -82,6 +82,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Service implementation and writeback recipe **not** modified — this
     PR is wiring only.
 
+## [vNext] - 2026-05-13 (Track G2)
+
+### Added
+
+- **Track G2 — Refunds / negative payments (`audit-2026-05-13.md`
+  T4 CRIT-1).** Resolves the daily operational blocker — receptionist
+  no longer forced into iHOTEL to record a refund. Implements end-to-end:
+  service-layer command, outbox intent, writeback recipe, HTTP route,
+  refund modal. Receipt rows (`HT_Receipt_H` / `HT_Receipt_Ds`) are NOT
+  emitted — refunds are a tender adjustment, reprinting refund receipts
+  is a Track G follow-on.
+  - **Migration 044** (`044_ht_payments_refund_columns.sql`): adds
+    `refund_of_payment_id INTEGER` (self-referential FK ON DELETE SET
+    NULL) + `refund_reason VARCHAR(500)` to `ht_payments`, plus partial
+    index `ix_ht_payments_refund_of_payment_id WHERE NOT NULL` for the
+    "show me every refund against payment X" lookup.
+  - **`hotel-backend/src/service/payment.rs::refund_payment`**: new
+    command that validates `amount > 0`, the original payment exists +
+    is not voided + is not itself a refund, and `sum_of_refunds ≤
+    original_amount` (0.005 baht tolerance for f64 round-trip drift).
+    Skips the shift gate (refunds are settlement adjustments, must
+    work during the cashier handover window). Inserts a negative
+    `pay_amount` row via `PaymentRepository::insert_refund`, stamps an
+    aggregate UUID, enqueues `WritebackIntent::RefundPayment`, and
+    publishes `DomainEvent::PaymentRefunded`.
+  - **`hotel-backend/src/outbox/intent.rs::RefundPayment`**: new
+    variant carrying the magnitude (positive — recipe negates),
+    method, original payment aggregate id, refund reason, and the
+    new refund row's payment aggregate id for back-population.
+  - **`hotel-backend/src/outbox/event.rs::PaymentRefunded`**: new
+    `DomainEvent` variant. SSE listeners (Wave 5c reconcile path) get
+    both endpoints (`original_payment_id` + `refund_payment_id`) so a
+    refresh can render the inverse-pair view.
+  - **`hotel-backend/src/writeback/recipes/refund_payment.rs`**: new
+    recipe emitting 3 statements: (1) `HT_CheckIn_Pay` INSERT with
+    NEGATIVE `Cin_Pay_Cash`/`Credit`/`Tran`/`web` (per
+    `docs/legacy-app/COMPAT_CHEATSHEET.md:513` "refunds use
+    negation"), `Cin_Pay_Note` carrying `REFUND of Pay_no=<original>:
+    <reason>`, idempotency-guarded `WHERE NOT EXISTS` on `Pay_no`;
+    (2) `HT_CheckIn_H` totals UPDATE re-aggregating `Total_Price_Pay`
+    + `Total_Price_Balance` from `HT_CheckIn_Pay` rows under
+    UPDLOCK+HOLDLOCK held through COMMIT (Track C pattern — never
+    additive); (3) VAT accumulator UPDATE with the same race-safe
+    pattern. Cancelled tender rows excluded via
+    `ISNULL(Cin_Status,'1') <> N'ยกเลิก'` (T2 CRIT-2).
+  - **`hotel-backend/src/writeback/dispatcher.rs`**: new `RefundPayment`
+    arm resolves the same check-in identifiers as `RecordPayment` plus
+    the original payment's `legacy_pay_no` (best-effort lookup by
+    aggregate id; falls back to a generic `REFUND` note prefix when
+    back-population is still pending). `ResolvedJob` gains
+    `legacy_original_pay_no`. Variant count test bumped 10 → 11.
+  - **`hotel-backend/src/bin/writeback.rs`**: `resolve_legacy_ids`
+    + `back_populate_legacy_ids` extended for the new variant; the
+    refund row's freshly-allocated `legacy_pay_no` is stamped onto
+    `ht_payments` keyed on the refund's aggregate id.
+  - **`hotel-backend/src/routes/new_payments.rs`**: new
+    `POST /api/new/payments/:id/refund` endpoint accepting
+    `{ amount, reason?, createdBy? }`. Wired in `main.rs`.
+  - **`components/modals/RefundPaymentModal.tsx`**: Thai-language
+    refund modal mirroring `PaymentModal`'s shape (default-to-full
+    refund preset, remaining-refundable summary, client-side
+    validation matching the service layer's `≤ remaining` rule).
+  - **Tests added (24 new, 0 failures)**:
+    - `writeback::recipes::refund_payment` — 15 tests covering
+      negative-amount routing per tender column, the Cin_Pay_Ds_Price
+      invariant, idempotency guard, UPDLOCK+HOLDLOCK re-aggregation,
+      no-receipt-emission, finiteness + non-negativity rejections.
+    - `service::payment` — `refund_rejects_zero_amount_without_touching_repo`,
+      `refund_rejects_unknown_original_payment`,
+      `refund_rejects_when_original_already_voided`,
+      `refund_rejects_when_amount_exceeds_original`,
+      `parse_legacy_method_roundtrips_all_variants`.
+    - `routes::new_payments` — body deserialization + route-level
+      input-validation tests for the refund endpoint.
+    - `__tests__/components/modals/RefundPaymentModal.test.tsx` — 9
+      jest/RTL tests for the modal (rendering, default amount,
+      no-remaining-balance disable, over-amount validation, API
+      POST shape, success + failure flows).
+
+### Out of scope (deferred)
+
+- Multi-room refund apportionment — depends on Track B's
+  `payment_lines` split (Track B1's CRIT-2 follow-on). Until then a
+  refund applies to the whole check-in folio.
+- Refund receipt reprinting — would need a new `HT_Receipt_H` /
+  `HT_Receipt_Ds` emission flow; Track G follow-on if needed.
+
 ## [vNext] - 2026-05-13 (Track B1)
 
 ### Added

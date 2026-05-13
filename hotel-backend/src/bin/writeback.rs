@@ -856,6 +856,52 @@ async fn resolve_legacy_ids(
                     resolved.legacy_checkin_ds_id.or(salvaged.checkin_ds_id);
             }
         }
+        // Track G2 / T4 CRIT-1 — `RefundPayment` resolves the same
+        // check-in identifiers as `RecordPayment` plus the original
+        // payment's legacy_pay_no (for the audit note in
+        // `HT_CheckIn_Pay.Cin_Pay_Note`). The original is looked up via
+        // its aggregate id; None when the payment row doesn't exist or
+        // back-population is still pending — the recipe degrades to a
+        // generic `REFUND` note prefix.
+        RefundPayment {
+            check_in_id,
+            original_payment_aggregate_id,
+            ..
+        } => {
+            if let Some(row) = sqlx::query(
+                "SELECT legacy_cin_no, legacy_room_no, legacy_cust_no, legacy_checkin_ds_id \
+                 FROM ht_checkins WHERE aggregate_id = $1",
+            )
+            .bind(check_in_id)
+            .fetch_optional(pg)
+            .await?
+            {
+                resolved.legacy_cin_no = row.try_get("legacy_cin_no").ok();
+                resolved.legacy_room_no = row.try_get("legacy_room_no").ok();
+                resolved.legacy_cust_no = row.try_get("legacy_cust_no").ok();
+                resolved.legacy_checkin_ds_id = row.try_get("legacy_checkin_ds_id").ok();
+            }
+            if resolved.legacy_cin_no.is_none()
+                || resolved.legacy_room_no.is_none()
+                || resolved.legacy_cust_no.is_none()
+            {
+                let salvaged = salvage_legacy_ids(pg, slack, *check_in_id).await?;
+                resolved.legacy_cin_no = resolved.legacy_cin_no.or(salvaged.cin_no);
+                resolved.legacy_room_no = resolved.legacy_room_no.or(salvaged.room_no);
+                resolved.legacy_cust_no = resolved.legacy_cust_no.or(salvaged.cust_no);
+            }
+            if let Some(orig_aggregate) = original_payment_aggregate_id {
+                if let Some(row) = sqlx::query(
+                    "SELECT legacy_pay_no FROM ht_payments WHERE aggregate_id = $1",
+                )
+                .bind(orig_aggregate)
+                .fetch_optional(pg)
+                .await?
+                {
+                    resolved.legacy_original_pay_no = row.try_get("legacy_pay_no").ok();
+                }
+            }
+        }
         MarkRoomClean { room_id, .. } => {
             if let Some(row) = sqlx::query(
                 "SELECT legacy_room_no, legacy_room_id_int \
@@ -1412,6 +1458,42 @@ async fn back_populate_legacy_ids(
                 .bind(room_no)
                 .bind(cust_no)
                 .bind(checkin_ds_id)
+                .execute(pg)
+                .await?;
+            }
+        }
+        // Track G2 / T4 CRIT-1 — refund back-population. Mirrors
+        // RecordPayment but the recipe doesn't allocate a Receipt_no
+        // (refunds don't emit HT_Receipt_H rows), so only legacy_pay_no
+        // matters here. The aggregate_id passed in by the caller is the
+        // check-in's; the new refund row's aggregate id lives in the
+        // intent's `payment_aggregate_id`.
+        RefundPayment { payment_aggregate_id, .. } => {
+            if cin_no.is_some() || room_no.is_some() || cust_no.is_some() {
+                sqlx::query(
+                    "UPDATE ht_checkins SET \
+                       legacy_cin_no  = COALESCE($2, legacy_cin_no), \
+                       legacy_room_no = COALESCE($3, legacy_room_no), \
+                       legacy_cust_no = COALESCE($4, legacy_cust_no), \
+                       updated_at = NOW() \
+                     WHERE aggregate_id = $1",
+                )
+                .bind(aggregate_id)
+                .bind(cin_no)
+                .bind(room_no)
+                .bind(cust_no)
+                .execute(pg)
+                .await?;
+            }
+            if let (Some(refund_aggregate), true) =
+                (payment_aggregate_id, pay_no.is_some())
+            {
+                sqlx::query(
+                    "UPDATE ht_payments SET legacy_pay_no = COALESCE($2, legacy_pay_no) \
+                     WHERE aggregate_id = $1",
+                )
+                .bind(refund_aggregate)
+                .bind(pay_no)
                 .execute(pg)
                 .await?;
             }

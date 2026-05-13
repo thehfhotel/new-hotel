@@ -595,7 +595,15 @@ CREATE TABLE IF NOT EXISTS ht_payments (
     legacy_pay_no VARCHAR(20),
     legacy_receipt_no VARCHAR(20),
     aggregate_id UUID,
-    CONSTRAINT fk_ht_payments_checkin FOREIGN KEY (pay_cin_id) REFERENCES ht_checkins(cin_id)
+    -- Migration 044 — Track G2 / T4 CRIT-1. `refund_of_payment_id` is the
+    -- self-referential FK back to the original payment row a refund
+    -- offsets. `refund_reason` carries free-text operator context (never
+    -- written to legacy MSSQL — no audit column on `HT_CheckIn_Pay`).
+    refund_of_payment_id INTEGER,
+    refund_reason VARCHAR(500),
+    CONSTRAINT fk_ht_payments_checkin FOREIGN KEY (pay_cin_id) REFERENCES ht_checkins(cin_id),
+    CONSTRAINT fk_ht_payments_refund_of FOREIGN KEY (refund_of_payment_id)
+        REFERENCES ht_payments(pay_id) ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS ix_ht_payments_checkin ON ht_payments(pay_cin_id);
 CREATE INDEX IF NOT EXISTS ix_ht_payments_date ON ht_payments(pay_date);
@@ -603,6 +611,8 @@ CREATE INDEX IF NOT EXISTS ix_ht_payments_legacy_pay_no
     ON ht_payments (legacy_pay_no) WHERE legacy_pay_no IS NOT NULL;
 CREATE INDEX IF NOT EXISTS ix_ht_payments_legacy_receipt_no
     ON ht_payments (legacy_receipt_no) WHERE legacy_receipt_no IS NOT NULL;
+CREATE INDEX IF NOT EXISTS ix_ht_payments_refund_of_payment_id
+    ON ht_payments (refund_of_payment_id) WHERE refund_of_payment_id IS NOT NULL;
 
 -- =============================================================================
 -- Room Calendar (canonical for HT_Room_Status — Track F1 / migration 039)
@@ -1541,6 +1551,16 @@ ON CONFLICT (version) DO NOTHING;
 -- B4 (writeback) / B5 (backfill) layer behavior changes on top.
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('043', '043_create_ht_checkin_rooms.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 044 — Track G2 / T4 CRIT-1. `refund_of_payment_id` +
+-- `refund_reason` columns on `ht_payments` so the new refund flow
+-- (service::payment::refund_payment + WritebackIntent::RefundPayment)
+-- can link a negative-amount refund row back to the original payment
+-- it offsets. DDL inlined into the `ht_payments` CREATE TABLE block
+-- above; this seed marks the migration as applied for fresh deploys.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('044', '044_ht_payments_refund_columns.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================

@@ -63,7 +63,7 @@ pub use housekeeping::{
 pub use ids::{aggregate_uuid, AggregateKind};
 pub use payment::{
     GenerateReceiptCommand, GenerateReceiptOutcome, PaymentService, RecordPaymentCommand,
-    RecordPaymentOutcome,
+    RecordPaymentOutcome, RefundPaymentCommand, RefundPaymentOutcome,
 };
 pub use shifts::{
     CloseShiftCommand, OpenShiftCommand, OpenShiftOutcome, Shift, ShiftService, ShiftSummary,
