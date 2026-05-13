@@ -26,6 +26,10 @@ name = "backfill_rooms"
 path = "src/bin/backfill_rooms.rs"
 
 [[bin]]
+name = "backfill_checkin_rooms"
+path = "src/bin/backfill_checkin_rooms.rs"
+
+[[bin]]
 name = "create_user"
 path = "src/bin/create_user.rs"
 

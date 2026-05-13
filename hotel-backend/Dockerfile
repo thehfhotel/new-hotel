@@ -137,6 +137,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
         --bin writeback \
         --bin sync \
         --bin backfill_rooms \
+        --bin backfill_checkin_rooms \
         --bin migrate_legacy \
         --bin create_user \
     && sccache --show-stats \
@@ -145,6 +146,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     && cp target/release/writeback /out/ \
     && cp target/release/sync /out/ \
     && cp target/release/backfill_rooms /out/ \
+    && cp target/release/backfill_checkin_rooms /out/ \
     && cp target/release/migrate_legacy /out/ \
     && cp target/release/create_user /out/
 
@@ -166,6 +168,7 @@ COPY --from=builder /out/hotel-backend /app/hotel-backend
 COPY --from=builder /out/writeback /app/writeback
 COPY --from=builder /out/sync /app/sync
 COPY --from=builder /out/backfill_rooms /app/backfill_rooms
+COPY --from=builder /out/backfill_checkin_rooms /app/backfill_checkin_rooms
 COPY --from=builder /out/migrate_legacy /app/migrate_legacy
 COPY --from=builder /out/create_user /app/create_user
 

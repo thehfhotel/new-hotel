@@ -32,6 +32,7 @@
 //! writeback dispatcher. Together they prevent a feedback loop between
 //! the writeback worker and the CT watcher.
 
+pub mod backfill;
 pub mod change_op;
 pub mod mapper;
 pub mod mappers;
