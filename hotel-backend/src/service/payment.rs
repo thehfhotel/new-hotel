@@ -24,7 +24,7 @@ use crate::domain::shared::Money;
 use crate::outbox::event::{DomainEvent, EventSource};
 use crate::outbox::intent::{RecordPaymentReceipt, WritebackIntent};
 use crate::outbox::{generate_idempotency_key, EventBus, OutboxRepository};
-use crate::repository::payment::{PaymentInsert, PaymentRepository};
+use crate::repository::payment::{PaymentInsert, PaymentRepository, RefundInsert};
 
 use super::error::{ServiceError, ServiceResult};
 use super::ids::{aggregate_uuid, AggregateKind};
@@ -98,6 +98,46 @@ pub struct RecordPaymentOutcome {
 /// The aggregate id is therefore derived from the check-in for now.
 #[derive(Debug, Clone)]
 pub struct GenerateReceiptOutcome {
+    pub check_in_aggregate_id: Uuid,
+}
+
+/// Command for [`PaymentService::refund_payment`].
+///
+/// Track G2 / T4 CRIT-1 (`docs/coexistence/audit-2026-05-13.md`). The
+/// receptionist initiates a refund against an existing payment row. The
+/// service writes a new `ht_payments` row with negative `pay_amount`,
+/// enqueues a `WritebackIntent::RefundPayment`, and publishes a
+/// `DomainEvent::PaymentRefunded`.
+///
+/// `amount_satang` is POSITIVE — the magnitude of the refund. The
+/// repository negates it before writing canonical PG; the writeback
+/// recipe negates it before emitting legacy SQL. Keeping the carrier
+/// positive across the wire matches the audit doc's recommendation and
+/// keeps `Money::from_satang` (which rejects negative) usable.
+#[derive(Debug, Clone)]
+pub struct RefundPaymentCommand {
+    /// `ht_payments.pay_id` of the payment being refunded.
+    pub original_payment_id: i32,
+    /// Magnitude of the refund in satang (must be > 0). Service validates
+    /// `amount_satang ≤ (original_amount - already_refunded)`.
+    pub amount_satang: i64,
+    /// Operator-supplied reason. Empty string treated as "no reason
+    /// provided" — captured into `ht_payments.refund_reason` and
+    /// surfaced via the writeback recipe's `Cin_Pay_Note` prefix.
+    pub reason: Option<String>,
+    pub created_by: Option<String>,
+    pub source: EventSource,
+}
+
+/// Outcome of a successful `refund_payment`.
+#[derive(Debug, Clone)]
+pub struct RefundPaymentOutcome {
+    /// New SERIAL `pay_id` of the refund row inserted into `ht_payments`.
+    pub refund_pay_id: i32,
+    /// Deterministic UUID stamped onto the refund row's `aggregate_id`.
+    pub refund_aggregate_id: Uuid,
+    /// Aggregate UUID of the parent check-in. Surfaced for callers that
+    /// need to correlate the refund to the folio (e.g. SSE listeners).
     pub check_in_aggregate_id: Uuid,
 }
 
@@ -245,6 +285,149 @@ impl PaymentService {
         })
     }
 
+    /// Record a refund — inserts a negative-amount `ht_payments` row,
+    /// enqueues [`WritebackIntent::RefundPayment`], publishes
+    /// [`DomainEvent::PaymentRefunded`].
+    ///
+    /// Track G2 / T4 CRIT-1 (`docs/coexistence/audit-2026-05-13.md`).
+    /// Validation:
+    /// - `amount_satang > 0`
+    /// - original payment exists, is not voided, is not itself a refund
+    /// - sum of magnitudes (this refund + prior refunds) ≤ original amount
+    ///
+    /// The shift gate is intentionally NOT applied: a refund is a
+    /// settlement adjustment against an existing tender row, not a new
+    /// cash-drawer event. If we required an open shift for refunds the
+    /// receptionist would be unable to issue one during the cashier
+    /// handover window — exactly when guest complaints surface most.
+    pub async fn refund_payment(
+        &self,
+        cmd: RefundPaymentCommand,
+    ) -> ServiceResult<RefundPaymentOutcome> {
+        if cmd.amount_satang <= 0 {
+            return Err(ServiceError::validation(format!(
+                "refund amount must be positive (got {} satang)",
+                cmd.amount_satang
+            )));
+        }
+
+        let original = self
+            .repo
+            .find_for_refund(&self.pg, cmd.original_payment_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::not_found(format!(
+                    "payment {} does not exist",
+                    cmd.original_payment_id
+                ))
+            })?;
+
+        if original.pay_voided.unwrap_or(false) {
+            return Err(ServiceError::conflict(format!(
+                "payment {} is already voided — cannot refund",
+                cmd.original_payment_id
+            )));
+        }
+
+        if original.refund_of_payment_id.is_some() {
+            return Err(ServiceError::conflict(format!(
+                "payment {} is itself a refund — cannot refund a refund",
+                cmd.original_payment_id
+            )));
+        }
+
+        let original_amount_baht = original.pay_amount.unwrap_or(0.0);
+        let refund_amount_baht = (cmd.amount_satang as f64) / 100.0;
+        let already_refunded_baht = self
+            .repo
+            .sum_refunded_against(&self.pg, cmd.original_payment_id)
+            .await?;
+        // 0.5 satang tolerance — guards against f64 round-trip drift on
+        // the magnitude comparison (the canonical column is NUMERIC(12,2),
+        // so the round-trip is exact in practice; the slack covers the
+        // legacy float decimal-conversion path).
+        if refund_amount_baht + already_refunded_baht > original_amount_baht + 0.005 {
+            return Err(ServiceError::validation(format!(
+                "refund amount {refund_amount_baht:.2} would exceed remaining \
+                 refundable balance on payment {orig_id} \
+                 (original {original_amount_baht:.2}, already refunded \
+                 {already_refunded_baht:.2})",
+                orig_id = cmd.original_payment_id,
+            )));
+        }
+
+        let method = parse_legacy_method(&original.pay_method).ok_or_else(|| {
+            ServiceError::validation(format!(
+                "unknown legacy payment method {:?} on payment {}",
+                original.pay_method, cmd.original_payment_id
+            ))
+        })?;
+
+        let mut tx = self.pg.begin().await?;
+
+        let refund_pay_id = self
+            .repo
+            .insert_refund(
+                &mut tx,
+                RefundInsert {
+                    cin_id: original.pay_cin_id,
+                    amount: refund_amount_baht,
+                    method: &original.pay_method,
+                    original_payment_id: cmd.original_payment_id,
+                    reason: cmd.reason.as_deref(),
+                    created_by: cmd.created_by.as_deref(),
+                },
+            )
+            .await?;
+
+        let check_in_aggregate_id =
+            aggregate_uuid(AggregateKind::CheckIn, original.pay_cin_id);
+        let refund_aggregate_id = aggregate_uuid(AggregateKind::Payment, refund_pay_id);
+        let original_payment_aggregate_id =
+            aggregate_uuid(AggregateKind::Payment, cmd.original_payment_id);
+
+        self.repo
+            .stamp_aggregate_id(&mut tx, refund_pay_id, refund_aggregate_id)
+            .await?;
+
+        let refund_reason = cmd.reason.clone().unwrap_or_default();
+        let intent = WritebackIntent::RefundPayment {
+            check_in_id: check_in_aggregate_id,
+            original_payment_aggregate_id: Some(original_payment_aggregate_id),
+            amount: Money::from_satang(cmd.amount_satang),
+            method,
+            refund_reason: refund_reason.clone(),
+            payment_aggregate_id: Some(refund_aggregate_id),
+        };
+        // Discriminate by the refund row's aggregate id so a retried
+        // refund against the same original payment doesn't collide on
+        // the outbox unique key.
+        let key = generate_idempotency_key(&intent, refund_aggregate_id);
+        OutboxRepository::enqueue(&mut tx, &intent, key)
+            .await
+            .map_err(|err| ServiceError::outbox(err.to_string()))?;
+
+        let event = DomainEvent::PaymentRefunded {
+            check_in_id: check_in_aggregate_id,
+            original_payment_id: original_payment_aggregate_id,
+            refund_payment_id: refund_aggregate_id,
+            amount: Money::from_satang(cmd.amount_satang),
+            method,
+            source: cmd.source.clone(),
+        };
+        EventBus::publish(&mut tx, &event)
+            .await
+            .map_err(|err| ServiceError::outbox(err.to_string()))?;
+
+        tx.commit().await?;
+
+        Ok(RefundPaymentOutcome {
+            refund_pay_id,
+            refund_aggregate_id,
+            check_in_aggregate_id,
+        })
+    }
+
     /// Generate a receipt — currently a placeholder for Wave 4.
     ///
     /// Validates the input shape (`pay_ids` non-empty) so callers learn
@@ -297,6 +480,20 @@ fn method_to_legacy_string(method: PaymentMethod) -> &'static str {
         PaymentMethod::Credit => "credit",
         PaymentMethod::Transfer => "transfer",
         PaymentMethod::Web => "qr",
+    }
+}
+
+/// Inverse of [`method_to_legacy_string`] — parses the canonical
+/// `ht_payments.pay_method` string back into a [`PaymentMethod`]. Used by
+/// `refund_payment` so the refund debits the same tender column as the
+/// original payment.
+fn parse_legacy_method(method: &str) -> Option<PaymentMethod> {
+    match method {
+        "cash" => Some(PaymentMethod::Cash),
+        "credit" => Some(PaymentMethod::Credit),
+        "transfer" => Some(PaymentMethod::Transfer),
+        "qr" => Some(PaymentMethod::Web),
+        _ => None,
     }
 }
 
@@ -391,6 +588,297 @@ mod tests {
             }
             other => panic!("expected Validation, got {other:?}"),
         }
+    }
+
+    /// Track G2 / T4 CRIT-1 — refund must reject a zero or negative
+    /// `amount_satang` at the validation gate (before any repository
+    /// query). Mirrors the same shape as `record_payment`'s amount
+    /// check. No PG dependency.
+    #[tokio::test]
+    async fn refund_rejects_zero_amount_without_touching_repo() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping refund_rejects_zero_amount — PG not reachable");
+            return;
+        };
+        let svc = build_service_with_gate(pool.clone(), "TEST_refund_zero_amount");
+
+        let err = svc
+            .refund_payment(RefundPaymentCommand {
+                original_payment_id: 1,
+                amount_satang: 0,
+                reason: None,
+                created_by: Some("test".into()),
+                source: EventSource::System {
+                    reason: "G2_refund_zero".into(),
+                },
+            })
+            .await
+            .expect_err("zero refund amount must be rejected");
+        match err {
+            ServiceError::Validation(msg) => {
+                assert!(
+                    msg.contains("refund amount must be positive"),
+                    "expected positive-amount message, got: {msg}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// Track G2 / T4 CRIT-1 — refund must surface NotFound when the
+    /// original payment id has no canonical row.
+    #[tokio::test]
+    async fn refund_rejects_unknown_original_payment() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping refund_rejects_unknown_original_payment — PG not reachable");
+            return;
+        };
+        let svc = build_service_with_gate(pool.clone(), "TEST_refund_unknown_original");
+        let err = svc
+            .refund_payment(RefundPaymentCommand {
+                // i32::MIN guarantees no canonical row matches (the SERIAL
+                // sequence starts at 1).
+                original_payment_id: -987_654,
+                amount_satang: 10_000,
+                reason: None,
+                created_by: Some("test".into()),
+                source: EventSource::System {
+                    reason: "G2_refund_unknown_orig".into(),
+                },
+            })
+            .await
+            .expect_err("missing original payment must surface as NotFound");
+        match err {
+            ServiceError::NotFound(msg) => {
+                assert!(
+                    msg.contains("does not exist"),
+                    "expected does-not-exist message, got: {msg}"
+                );
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    /// Track G2 / T4 CRIT-1 — when the original payment is already
+    /// soft-voided the refund must be rejected as Conflict (refunding
+    /// a voided payment would re-credit money that's already been
+    /// reversed via the void path).
+    #[tokio::test]
+    async fn refund_rejects_when_original_already_voided() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping refund_rejects_when_original_already_voided — PG not reachable");
+            return;
+        };
+        let site = "TEST_refund_voided_original";
+        // Seed: open shift, record one payment against a freshly-inserted
+        // check-in, void it, then attempt a refund. The shift, check-in,
+        // and payment all get torn down at the end so reruns are clean.
+        let svc = build_service_with_gate(pool.clone(), site);
+        let cin_id = match seed_temp_checkin(&pool).await {
+            Some(id) => id,
+            None => {
+                eprintln!("skipping refund_rejects_when_original_already_voided — seed failed");
+                return;
+            }
+        };
+        let pay_id = match seed_payment_for_checkin(&pool, cin_id, "cash", 100.0).await {
+            Some(id) => id,
+            None => {
+                cleanup_temp_checkin(&pool, cin_id).await;
+                eprintln!("skipping — payment seed failed");
+                return;
+            }
+        };
+        mark_payment_voided(&pool, pay_id).await;
+
+        let err = svc
+            .refund_payment(RefundPaymentCommand {
+                original_payment_id: pay_id,
+                amount_satang: 5_000,
+                reason: Some("guest complaint".into()),
+                created_by: Some("test".into()),
+                source: EventSource::System {
+                    reason: "G2_refund_voided".into(),
+                },
+            })
+            .await
+            .expect_err("refund against a voided payment must be rejected");
+
+        // Cleanup before assertion so a panic still leaves the DB clean.
+        cleanup_temp_payment(&pool, pay_id).await;
+        cleanup_temp_checkin(&pool, cin_id).await;
+
+        match err {
+            ServiceError::Conflict(msg) => {
+                assert!(
+                    msg.contains("already voided"),
+                    "expected already-voided message, got: {msg}"
+                );
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    /// Track G2 / T4 CRIT-1 — the refund magnitude (this refund plus
+    /// any prior refunds against the same original) must not exceed
+    /// the original payment amount. Asking for more must surface as
+    /// Validation.
+    #[tokio::test]
+    async fn refund_rejects_when_amount_exceeds_original() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping refund_rejects_when_amount_exceeds_original — PG not reachable");
+            return;
+        };
+        let site = "TEST_refund_amount_exceeds";
+        let svc = build_service_with_gate(pool.clone(), site);
+        let cin_id = match seed_temp_checkin(&pool).await {
+            Some(id) => id,
+            None => {
+                eprintln!("skipping — seed failed");
+                return;
+            }
+        };
+        // Original payment of 100 baht. The refund attempt asks for 250 —
+        // must be rejected.
+        let pay_id = match seed_payment_for_checkin(&pool, cin_id, "cash", 100.0).await {
+            Some(id) => id,
+            None => {
+                cleanup_temp_checkin(&pool, cin_id).await;
+                eprintln!("skipping — payment seed failed");
+                return;
+            }
+        };
+
+        let err = svc
+            .refund_payment(RefundPaymentCommand {
+                original_payment_id: pay_id,
+                amount_satang: 25_000, // 250.00 baht > 100.00 original
+                reason: Some("guest complaint".into()),
+                created_by: Some("test".into()),
+                source: EventSource::System {
+                    reason: "G2_refund_exceeds".into(),
+                },
+            })
+            .await
+            .expect_err("over-refund must be rejected");
+
+        cleanup_temp_payment(&pool, pay_id).await;
+        cleanup_temp_checkin(&pool, cin_id).await;
+
+        match err {
+            ServiceError::Validation(msg) => {
+                assert!(
+                    msg.contains("exceed"),
+                    "expected exceed-remaining-balance message, got: {msg}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    // ----- test seed helpers -----
+
+    /// Seed a minimal `ht_checkins` row whose FK chain is satisfied (we
+    /// borrow an existing customer + room when present; otherwise
+    /// return None and let the test skip). Returns the new `cin_id`.
+    async fn seed_temp_checkin(pool: &PgPool) -> Option<i32> {
+        let cust_id: Option<i32> =
+            sqlx::query_scalar("SELECT cust_id FROM ht_customers ORDER BY cust_id LIMIT 1")
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
+        let room_id: Option<i32> =
+            sqlx::query_scalar("SELECT room_id FROM ht_rooms_new ORDER BY room_id LIMIT 1")
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
+        let (cust_id, room_id) = (cust_id?, room_id?);
+
+        let row: Option<(i32,)> = sqlx::query_as(
+            "INSERT INTO ht_checkins (cin_cust_id, cin_room_id, cin_checkin_time, \
+             cin_expected_checkout, cin_total_amount, cin_status, cin_rate_per_night) \
+             VALUES ($1, $2, NOW(), NOW() + INTERVAL '1 day', 100, 'occupied', 100) \
+             RETURNING cin_id",
+        )
+        .bind(cust_id)
+        .bind(room_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+        row.map(|(id,)| id)
+    }
+
+    async fn cleanup_temp_checkin(pool: &PgPool, cin_id: i32) {
+        let _ = sqlx::query("DELETE FROM ht_payments WHERE pay_cin_id = $1")
+            .bind(cin_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM ht_checkins WHERE cin_id = $1")
+            .bind(cin_id)
+            .execute(pool)
+            .await;
+    }
+
+    async fn seed_payment_for_checkin(
+        pool: &PgPool,
+        cin_id: i32,
+        method: &str,
+        amount: f64,
+    ) -> Option<i32> {
+        let row: Option<(i32,)> = sqlx::query_as(
+            "INSERT INTO ht_payments (pay_cin_id, pay_amount, pay_method) \
+             VALUES ($1, $2::float8, $3) RETURNING pay_id",
+        )
+        .bind(cin_id)
+        .bind(amount)
+        .bind(method)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+        row.map(|(id,)| id)
+    }
+
+    async fn cleanup_temp_payment(pool: &PgPool, pay_id: i32) {
+        let _ = sqlx::query("DELETE FROM ht_payments WHERE pay_id = $1")
+            .bind(pay_id)
+            .execute(pool)
+            .await;
+    }
+
+    async fn mark_payment_voided(pool: &PgPool, pay_id: i32) {
+        let _ = sqlx::query(
+            "UPDATE ht_payments SET pay_voided = true, pay_voided_at = NOW() WHERE pay_id = $1",
+        )
+        .bind(pay_id)
+        .execute(pool)
+        .await;
+    }
+
+    /// Track G2 / T4 CRIT-1 — round-trip the canonical `pay_method`
+    /// strings (`cash`/`credit`/`transfer`/`qr`) back to their
+    /// [`PaymentMethod`] variants so the refund recipe debits the same
+    /// tender column as the original payment.
+    #[test]
+    fn parse_legacy_method_roundtrips_all_variants() {
+        for variant in [
+            PaymentMethod::Cash,
+            PaymentMethod::Credit,
+            PaymentMethod::Transfer,
+            PaymentMethod::Web,
+        ] {
+            let s = method_to_legacy_string(variant);
+            assert_eq!(
+                parse_legacy_method(s),
+                Some(variant),
+                "round-trip failed for {variant:?} via {s:?}"
+            );
+        }
+        assert_eq!(parse_legacy_method("unknown"), None);
+        assert_eq!(parse_legacy_method(""), None);
     }
 
     #[tokio::test]

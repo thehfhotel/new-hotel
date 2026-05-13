@@ -492,6 +492,8 @@ fn build_new_routes(app_state: AppState) -> Router {
         // Payments
         .route("/api/new/checkins/{id}/payments", get(routes::new_payments::list_payments).post(routes::new_payments::create_payment))
         .route("/api/new/payments/{id}", delete(routes::new_payments::void_payment))
+        // Track G2 / T4 CRIT-1 — refund (negative payment) against an existing payment row
+        .route("/api/new/payments/{id}/refund", post(routes::new_payments::refund_payment))
         // Shifts (Track F2 / T1 HIGH-5 — cashier-shift gate for payments)
         .route("/api/new/shifts/open", post(routes::new_shifts::open_shift))
         .route("/api/new/shifts/close", post(routes::new_shifts::close_shift))

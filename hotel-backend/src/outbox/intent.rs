@@ -197,6 +197,56 @@ pub enum WritebackIntent {
     /// non-cancelled check-in for this room.
     MarkRoomClean { room_id: Uuid, by: String },
 
+    /// Track G2 — `audit-2026-05-13.md` T4 CRIT-1. Refund / negative
+    /// payment. The recipe inserts a `HT_CheckIn_Pay` row with a
+    /// negative tender amount (per `docs/legacy-app/COMPAT_CHEATSHEET.md:513`
+    /// — "Cin_Pay_Cash/Credit ... can be negative (refunds use
+    /// negation)") and then re-aggregates `HT_CheckIn_H.Total_Price_Pay`
+    /// / `Total_Price_Balance` / `Total_Price_vat` from `HT_CheckIn_Pay`
+    /// rows under UPDLOCK+HOLDLOCK (Track C pattern — never additive).
+    ///
+    /// Receipt-side rows (`HT_Receipt_H` / `HT_Receipt_Ds`) are NOT
+    /// emitted for a refund — those are append-only invoice records on
+    /// the legacy side, and reprinting a refund receipt is a Track G
+    /// follow-on. The refund is solely a tender adjustment against the
+    /// existing folio.
+    RefundPayment {
+        /// Aggregate id of the parent check-in this refund is recorded
+        /// against. Required so the writeback worker resolves the legacy
+        /// `Cin_no` / `room_no` / `cust_no` triple identically to
+        /// [`Self::RecordPayment`].
+        check_in_id: Uuid,
+        /// Aggregate id of the original `ht_payments` row this refund
+        /// offsets. Persisted into the legacy `Cin_Pay_Note` column
+        /// (e.g. `"REFUND of Pay_no=R2604-0250"`) when the worker has
+        /// back-populated `ht_payments.legacy_pay_no`. Optional so older
+        /// queue rows or partial-resolution scenarios still write a
+        /// generic refund note.
+        original_payment_aggregate_id: Option<Uuid>,
+        /// Refund amount as a POSITIVE money value. The recipe negates
+        /// it before interpolating into the SQL — keeping the carrier
+        /// positive lets the same helpers (`money_2dp`) emit a
+        /// `-801.00` string identically across all tender columns.
+        amount: Money,
+        /// Tender method to negate. Must match the original payment's
+        /// method so the refund debits the same tender column.
+        method: PaymentMethod,
+        /// Operator-supplied free text captured by the route. Lands in
+        /// `HT_CheckIn_Pay.Cin_Pay_Note` (prefixed with the legacy
+        /// "REFUND of Pay_no=…" reference when available). Empty string
+        /// when the operator skipped the field.
+        #[serde(default)]
+        refund_reason: String,
+        /// Wave 5a item 3 — `ht_payments.aggregate_id` of the NEW refund
+        /// row (the one we just inserted into PG). The writeback
+        /// worker's `back_populate_legacy_ids` step uses this to stamp
+        /// the freshly-allocated `legacy_pay_no` onto the canonical
+        /// refund row. `None` skips back-population (defensive — older
+        /// queued intents).
+        #[serde(default)]
+        payment_aggregate_id: Option<Uuid>,
+    },
+
     /// Track F3 — `audit-2026-05-13.md` T1 CRIT-3
     /// (`docs/legacy-app/COMPAT_CHEATSHEET.md:560-564`).
     ///
@@ -325,6 +375,7 @@ impl WritebackIntent {
             WritebackIntent::ExtendStay { .. } => "extend_stay",
             WritebackIntent::CheckOut { .. } => "check_out",
             WritebackIntent::RecordPayment { .. } => "record_payment",
+            WritebackIntent::RefundPayment { .. } => "refund_payment",
             WritebackIntent::MarkRoomClean { .. } => "mark_room_clean",
             WritebackIntent::AdjustProductStock { .. } => "adjust_product_stock",
         }
@@ -343,7 +394,8 @@ impl WritebackIntent {
             | WritebackIntent::CancelCheckIn { check_in_id, .. }
             | WritebackIntent::ExtendStay { check_in_id, .. }
             | WritebackIntent::CheckOut { check_in_id, .. }
-            | WritebackIntent::RecordPayment { check_in_id, .. } => *check_in_id,
+            | WritebackIntent::RecordPayment { check_in_id, .. }
+            | WritebackIntent::RefundPayment { check_in_id, .. } => *check_in_id,
             WritebackIntent::MarkRoomClean { room_id, .. } => *room_id,
             // Track F3 — fall back to a deterministic v5 UUID derived
             // from the legacy `Pro_no` so the

@@ -108,6 +108,13 @@ pub struct ResolvedJob {
     pub legacy_room_id_int: Option<i32>,
     /// `HT_CheckIn_Ds.id` for the row to update (CheckOut, ExtendStay).
     pub legacy_checkin_ds_id: Option<i32>,
+    /// Track G2 / T4 CRIT-1 — `HT_CheckIn_Pay.Pay_no` of the original
+    /// payment row a `RefundPayment` intent refunds. Resolved by the
+    /// worker from `ht_payments.legacy_pay_no` keyed on the original
+    /// payment's aggregate id. None when the back-population hasn't
+    /// landed yet; the recipe then falls back to a generic `REFUND`
+    /// prefix in `Cin_Pay_Note`.
+    pub legacy_original_pay_no: Option<String>,
 }
 
 /// Treat empty-string legacy IDs as missing (audit MED-1). PG can return
@@ -375,6 +382,46 @@ pub async fn dispatch(
             )
             .await
         }
+        // Track G2 / T4 CRIT-1 — refund / negative payment. Mirrors
+        // `RecordPayment` resolution (same check-in identifiers) but
+        // dispatches to the `refund_payment` recipe which emits a
+        // NEGATIVE `HT_CheckIn_Pay` row and re-aggregates totals.
+        WritebackIntent::RefundPayment {
+            check_in_id: _,
+            original_payment_aggregate_id,
+            amount,
+            method,
+            refund_reason,
+            payment_aggregate_id: _,
+        } => {
+            let cin_no = nonempty(resolved.legacy_cin_no.as_ref()).ok_or_else(|| {
+                WritebackError::Recipe("RefundPayment requires resolved legacy_cin_no".into())
+            })?;
+            let cust_no = nonempty(resolved.legacy_cust_no.as_ref()).ok_or_else(|| {
+                WritebackError::Recipe("RefundPayment requires resolved legacy_cust_no".into())
+            })?;
+            let room_no = nonempty(resolved.legacy_room_no.as_ref()).ok_or_else(|| {
+                WritebackError::Recipe("RefundPayment requires resolved legacy_room_no".into())
+            })?;
+            // Resolve the original payment's legacy Pay_no for the audit
+            // note. Best-effort — if the back-population is still pending
+            // the recipe falls back to a generic REFUND prefix.
+            let original_legacy_pay_no = match original_payment_aggregate_id {
+                Some(_uuid) => resolved.legacy_original_pay_no.as_deref(),
+                None => None,
+            };
+            recipes::refund_payment::execute(
+                conn,
+                cin_no,
+                cust_no,
+                room_no,
+                *amount,
+                *method,
+                original_legacy_pay_no,
+                refund_reason,
+            )
+            .await
+        }
         WritebackIntent::MarkRoomClean { room_id: _, by } => {
             let room_no = nonempty(resolved.legacy_room_no.as_ref()).ok_or_else(|| {
                 WritebackError::Recipe("MarkRoomClean requires resolved legacy_room_no".into())
@@ -438,16 +485,17 @@ mod tests {
         assert!(r.legacy_room_no.is_none());
         assert!(r.legacy_room_id_int.is_none());
         assert!(r.legacy_checkin_ds_id.is_none());
+        assert!(r.legacy_original_pay_no.is_none());
     }
 
-    /// Verifies all 10 `WritebackIntent` variants have a matching `intent_name`
+    /// Verifies all `WritebackIntent` variants have a matching `intent_name`
     /// — the dispatcher's match arms cover the same set. If a new variant is
     /// added without updating the dispatcher, the compiler will fail (match
     /// exhaustiveness), and this test catches drift in name strings.
-    /// (Track F3 added `adjust_product_stock` — keep the count and the
-    /// names list in lock-step.)
+    /// (Track F3 added `adjust_product_stock`; Track G2 added
+    /// `refund_payment` — keep the count and the names list in lock-step.)
     #[test]
-    fn all_ten_intent_variants_route_to_recipes() {
+    fn all_intent_variants_route_to_recipes() {
         let names = [
             "create_booking",
             "modify_booking",
@@ -457,6 +505,7 @@ mod tests {
             "extend_stay",
             "check_out",
             "record_payment",
+            "refund_payment",
             "mark_room_clean",
             "adjust_product_stock",
         ];
@@ -464,7 +513,7 @@ mod tests {
         // intent name → no actual MSSQL call, just type-level coverage.
         // Counting expected variants here keeps the test cheap and
         // deterministic.
-        assert_eq!(names.len(), 10, "expected 10 WritebackIntent variants");
+        assert_eq!(names.len(), 11, "expected 11 WritebackIntent variants");
     }
 
     /// Phase 5.1 chokepoint guarantee — every recipe MUST run after

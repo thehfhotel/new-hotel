@@ -52,6 +52,39 @@ pub struct PaymentStatus {
     pub pay_voided: Option<bool>,
 }
 
+/// Snapshot returned by `find_for_refund` — used by `refund_payment` so it
+/// can validate the original payment exists, is not voided, and decide
+/// which tender method the refund should debit. Mirrors the shape of
+/// `PaymentStatus` but carries the extra fields the refund path needs.
+#[derive(Debug, Clone)]
+pub struct PaymentForRefund {
+    pub pay_id: i32,
+    pub pay_cin_id: i32,
+    pub pay_amount: Option<f64>,
+    pub pay_method: String,
+    pub pay_voided: Option<bool>,
+    /// Always `None` for an original payment; populated for an already-
+    /// recorded refund row so the service layer can refuse to refund a
+    /// refund.
+    pub refund_of_payment_id: Option<i32>,
+}
+
+/// Field set for `insert_refund`.
+#[derive(Debug, Clone)]
+pub struct RefundInsert<'a> {
+    pub cin_id: i32,
+    /// POSITIVE refund amount in baht. The repository negates it before
+    /// writing to the canonical `pay_amount` column so consumers reading
+    /// `ht_payments` see a negative `pay_amount` (matches legacy
+    /// `Cin_Pay_Cash/Credit` convention per
+    /// `docs/legacy-app/COMPAT_CHEATSHEET.md:513`).
+    pub amount: f64,
+    pub method: &'a str,
+    pub original_payment_id: i32,
+    pub reason: Option<&'a str>,
+    pub created_by: Option<&'a str>,
+}
+
 /// PostgreSQL data operations for the payment aggregate.
 #[async_trait]
 pub trait PaymentRepository: Send + Sync {
@@ -101,6 +134,38 @@ pub trait PaymentRepository: Send + Sync {
         tx: &mut Transaction<'_, Postgres>,
         pay_id: i32,
     ) -> Result<(), sqlx::Error>;
+
+    /// Read the slice of a payment the refund service needs to validate
+    /// the request: existence, current voided flag, method, amount, the
+    /// owning check-in, and (if this row is already a refund) the FK
+    /// back to its original. Track G2 / T4 CRIT-1.
+    async fn find_for_refund(
+        &self,
+        pool: &PgPool,
+        pay_id: i32,
+    ) -> Result<Option<PaymentForRefund>, sqlx::Error>;
+
+    /// Sum the absolute value of every previously-recorded refund
+    /// against an original payment (`pay_voided = false` only). Returns
+    /// `0.0` when no refunds exist. Used by `refund_payment` to enforce
+    /// the "sum of refunds ≤ original amount" invariant on partial
+    /// refunds. Track G2 / T4 CRIT-1.
+    async fn sum_refunded_against(
+        &self,
+        pool: &PgPool,
+        original_pay_id: i32,
+    ) -> Result<f64, sqlx::Error>;
+
+    /// Insert a refund row (negative `pay_amount`) and return the new
+    /// `pay_id`. Track G2 / T4 CRIT-1. The repository negates the
+    /// caller-supplied positive `amount` before writing so canonical
+    /// rows have a negative `pay_amount` consistent with the legacy
+    /// `Cin_Pay_Cash/Credit` negation convention.
+    async fn insert_refund(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        insert: RefundInsert<'_>,
+    ) -> Result<i32, sqlx::Error>;
 }
 
 /// Default `PaymentRepository` impl backed by sqlx + PostgreSQL.
@@ -236,5 +301,91 @@ impl PaymentRepository for PgPaymentRepository {
         .execute(&mut **tx)
         .await?;
         Ok(())
+    }
+
+    async fn find_for_refund(
+        &self,
+        pool: &PgPool,
+        pay_id: i32,
+    ) -> Result<Option<PaymentForRefund>, sqlx::Error> {
+        // Dynamic `sqlx::query` so we don't require `.sqlx/` cache
+        // regeneration before the migration runs (the new
+        // `refund_of_payment_id` column is brand-new in migration 044
+        // — runtime cache validation would otherwise fail in CI on the
+        // first push before migrate.sh applies it).
+        let row = sqlx::query(
+            "SELECT pay_id, pay_cin_id, pay_amount::float8 AS pay_amount, \
+             pay_method, pay_voided, refund_of_payment_id \
+             FROM ht_payments WHERE pay_id = $1",
+        )
+        .bind(pay_id)
+        .fetch_optional(pool)
+        .await?;
+
+        Ok(row.map(|r| {
+            use sqlx::Row;
+            PaymentForRefund {
+                pay_id: r.try_get("pay_id").unwrap_or(pay_id),
+                pay_cin_id: r.try_get("pay_cin_id").unwrap_or(0),
+                pay_amount: r.try_get("pay_amount").ok(),
+                pay_method: r.try_get("pay_method").unwrap_or_default(),
+                pay_voided: r.try_get("pay_voided").ok(),
+                refund_of_payment_id: r.try_get("refund_of_payment_id").ok(),
+            }
+        }))
+    }
+
+    async fn sum_refunded_against(
+        &self,
+        pool: &PgPool,
+        original_pay_id: i32,
+    ) -> Result<f64, sqlx::Error> {
+        // COALESCE the SUM so an empty result set returns 0.0 instead of
+        // NULL. The ABS() guards against the legacy convention of
+        // negative `pay_amount` — the canonical refund row stores a
+        // negative number, but the invariant we enforce is "total
+        // refunded MAGNITUDE ≤ original payment magnitude".
+        let row = sqlx::query(
+            "SELECT COALESCE(SUM(ABS(pay_amount))::float8, 0.0) AS refunded \
+             FROM ht_payments \
+             WHERE refund_of_payment_id = $1 AND pay_voided = false",
+        )
+        .bind(original_pay_id)
+        .fetch_one(pool)
+        .await?;
+        use sqlx::Row;
+        Ok(row.try_get::<f64, _>("refunded").unwrap_or(0.0))
+    }
+
+    async fn insert_refund(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        insert: RefundInsert<'_>,
+    ) -> Result<i32, sqlx::Error> {
+        // Negate the caller-supplied positive `amount` so canonical
+        // `pay_amount` carries a negative value (matches legacy
+        // `Cin_Pay_Cash/Credit` negation convention per
+        // COMPAT_CHEATSHEET.md:513). The check that `amount` is
+        // positive is the service-layer's responsibility — the
+        // repository writes whatever it's given.
+        let neg_amount = -insert.amount.abs();
+        let row = sqlx::query(
+            "INSERT INTO ht_payments (\
+               pay_cin_id, pay_amount, pay_method, pay_notes, \
+               pay_created_by, refund_of_payment_id, refund_reason) \
+             VALUES ($1, $2::float8, $3, $4, $5, $6, $7) \
+             RETURNING pay_id",
+        )
+        .bind(insert.cin_id)
+        .bind(neg_amount)
+        .bind(insert.method)
+        .bind(insert.reason)
+        .bind(insert.created_by)
+        .bind(insert.original_payment_id)
+        .bind(insert.reason)
+        .fetch_one(&mut **tx)
+        .await?;
+        use sqlx::Row;
+        Ok(row.try_get::<i32, _>("pay_id").unwrap_or(0))
     }
 }

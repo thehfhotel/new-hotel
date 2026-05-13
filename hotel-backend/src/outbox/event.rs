@@ -76,6 +76,21 @@ pub enum DomainEvent {
         source: EventSource,
     },
 
+    /// Track G2 — refund / negative payment recorded against an existing
+    /// `ht_payments` row. `amount` is the POSITIVE magnitude of the
+    /// refund; canonical PG stores a negative `pay_amount` on the new
+    /// refund row. `original_payment_id` carries the aggregate id of
+    /// the payment being refunded so subscribers (SSE, audit log) can
+    /// resolve both ends of the relationship.
+    PaymentRefunded {
+        check_in_id: Uuid,
+        original_payment_id: Uuid,
+        refund_payment_id: Uuid,
+        amount: Money,
+        method: PaymentMethod,
+        source: EventSource,
+    },
+
     RoomMarkedClean {
         room_id: Uuid,
         by: String,
@@ -101,6 +116,7 @@ impl DomainEvent {
             DomainEvent::CustomerCreated { .. } => "CustomerCreated",
             DomainEvent::CustomerModified { .. } => "CustomerModified",
             DomainEvent::PaymentReceived { .. } => "PaymentReceived",
+            DomainEvent::PaymentRefunded { .. } => "PaymentRefunded",
             DomainEvent::RoomMarkedClean { .. } => "RoomMarkedClean",
             DomainEvent::RoomMarkedDirty { .. } => "RoomMarkedDirty",
         }
@@ -120,7 +136,8 @@ impl DomainEvent {
             | DomainEvent::CheckInCancelled { id, .. }
             | DomainEvent::CustomerCreated { id, .. }
             | DomainEvent::CustomerModified { id, .. } => *id,
-            DomainEvent::PaymentReceived { check_in_id, .. } => *check_in_id,
+            DomainEvent::PaymentReceived { check_in_id, .. }
+            | DomainEvent::PaymentRefunded { check_in_id, .. } => *check_in_id,
             DomainEvent::RoomMarkedClean { room_id, .. }
             | DomainEvent::RoomMarkedDirty { room_id, .. } => *room_id,
         }
@@ -142,6 +159,7 @@ impl DomainEvent {
             | DomainEvent::CustomerCreated { source, .. }
             | DomainEvent::CustomerModified { source, .. }
             | DomainEvent::PaymentReceived { source, .. }
+            | DomainEvent::PaymentRefunded { source, .. }
             | DomainEvent::RoomMarkedClean { source, .. }
             | DomainEvent::RoomMarkedDirty { source, .. } => source,
         }
