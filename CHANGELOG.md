@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [vNext] - 2026-05-13 (Track B1)
+
+### Added
+
+- **Track B1 — `ht_checkin_rooms` junction schema (`audit-2026-05-13.md`
+  T1 CRIT-1 + T2 CRIT-1).** Foundation for the multi-room canonical
+  fix. The audit traced the multi-room blind spot through every layer
+  (writeback emits one `HT_CheckIn_Ds` row, sync mapper picks
+  `first_room_no`, dashboard joins on `cin_room_id` so secondary rooms
+  are invisible, calendar's `seenIds` dedup drops rooms 2..N). B1 lands
+  the schema only — no app behavior change yet.
+  - **Migration 043** (`043_create_ht_checkin_rooms.sql`): new
+    `ht_checkin_rooms` junction table keyed on
+    `UNIQUE (cr_cin_id, cr_room_id)` and mirroring legacy
+    `HT_CheckIn_Ds` cardinality (one row per room per check-in folio).
+    Operational columns from the legacy `Ds` row: `cr_room_in/out`,
+    `cr_room_status`, `cr_rate_per_night`, `cr_nights`, `cr_room_total`,
+    `cr_dep_amount` / `cr_dep_status` / `cr_dep_returned_at` /
+    `cr_dep_returned_by`, `cr_cupon_count`, `cr_note`, `cr_legacy_ds_id`
+    (partial-indexed where non-NULL).
+  - **`docs/coexistence/CARDINALITY_MAP.md`**: `ht_checkins` row marked
+    `⚠️` — `cin_room_id` flagged DEPRECATED in favor of the junction,
+    left in place until B5 backfill completes. New `ht_checkin_rooms`
+    ↔ `HT_CheckIn_Ds` row added (`N:1` junction, source `PG canonical`).
+    Open question #1 marked RESOLVED.
+  - **`init-db/init-hotelnew.sql`**: inline CREATE TABLE + indexes +
+    `schema_migrations` seed row for `043` (drift checker stays green).
+  - **`migrations/README.md`**: 043 entry added; `ht_checkin_rooms`
+    added to the "Tables Owned by This Application" table.
+  - **Out of B1 scope** (deferred to follow-on sub-waves):
+    - B2: rewrite `sync::mappers::checkin` to emit per-room rows under
+      the junction (closes T2 CRIT-1).
+    - B3: `routes::rooms`, `routes::stats`, calendar queries join
+      `ht_checkin_rooms` instead of `ht_checkins.cin_room_id` (closes
+      T3 CRIT-2 + T3 HIGH-1 + T3 HIGH-3).
+    - B4: writeback per-room apportionment — emit N
+      `HT_CheckIn_Ds` rows matching the junction.
+    - B5: backfill bin populates the junction for existing folios;
+      only then is `ht_checkins.cin_room_id` safe to drop.
+
 <<<<<<< HEAD
 ## [vNext]
 
