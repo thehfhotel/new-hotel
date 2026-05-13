@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.63.16] - 2026-05-13
+
+### Added
+
+- **Track H — Process + CI gates (`audit-2026-05-13.md` Track H).** Closes
+  three of the audit's Track H items.
+  - `scripts/check-cardinality-map.sh` — CI guard that scans
+    `migrations/pg/*.sql` for `CREATE TABLE ht_*` (bare-namespace,
+    excludes `legacy_mirror.*`, `ville.*`, and `*_legacy` mirrors) and
+    fails if any table lacks a backtick-quoted row in
+    `docs/coexistence/CARDINALITY_MAP.md`. Self-tested via
+    `--self-test` (PASS-case + FAIL-case) so a refactor of the script
+    itself can't ship with a broken matcher. Today: 3 `ht_*` tables
+    introduced by migrations (`ht_reconcile_log`, `ht_users`,
+    `ht_sessions`) — all mapped.
+  - `.github/workflows/docker-build.yml` — new `lint-cardinality-map`
+    job runs on every PR + master push; gates `test-backend`,
+    `build-backend`, and the `deploy` job via `needs:` and the deploy
+    `if:` predicate. PROCESS.md P1 was reviewer discipline only; now a
+    PR introducing a new `ht_*` table without a `CARDINALITY_MAP.md`
+    entry is a red CI status.
+  - `hotel-backend/tests/test_walkin3_multiroom_fixture.rs` — PROCESS.md
+    P3 spike-capture-to-fixture promotion for
+    `walkin3-20260424-100000` and `booking-checkin-20260424-101838`.
+    Contains an active single-room sanity assertion + an `#[ignore]`'d
+    `two_room_walkin_emits_two_checkin_ds_rows_and_one_header` test
+    that codifies the expected multi-room shape per
+    `COMPAT_CHEATSHEET.md:427-430`. Un-ignore when Track B (T1 CRIT-1)
+    lands the `ht_checkin_rooms` junction + multi-room walk-in
+    payload.
+
+### Changed
+
+- **`docs/coexistence/PROCESS.md` — P2.1 sub-rule added.** Rust sync
+  mappers, writeback recipes, or service-layer code changes that
+  depend on a legacy-mssql migration MUST apply the migration in the
+  same change-window as the Rust deploy. Lesson from the 2026-05-12
+  GuestRegistryMapper / migration 022 14-hour gap (1-per-second
+  `Change tracking is not enabled` log spam, TM.30 under-count
+  during the window). Documents the
+  `docs/coexistence/RUNBOOK-mssql-022-apply.md` structure as the
+  standard template for future legacy-mssql migration runbooks.
+
+### Deferred
+
+- **T7 HIGH-4 — MSSQL service container in CI for coexistence smoke
+  test.** Larger infra work; tracked as Track H2.
+- **T7 MED-3 — Backup off-site.** Tracked as Track H2.
+- **T7 MED-4 — Deploy rollback workflow.** Tracked as Track H2.
+
 ## [2.63.15] - 2026-05-13
 
 ### Added

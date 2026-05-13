@@ -58,6 +58,52 @@ multiple rooms)". This landed on 2026-05-11 and triggered no schema
 re-audit. The gap was caught only when the dashboard migration
 2026-05-11/12 surfaced the symptom.
 
+### P2.1 — Rust changes that depend on a legacy-mssql migration must apply in the same change-window
+
+When a Rust sync mapper, writeback recipe, or service-layer code change
+depends on a legacy-mssql migration (Change Tracking enablement, PK
+addition, column expansion), the migration **MUST be applied in the
+same change-window as the Rust deploy**.
+
+The lesson: Track E1's `GuestRegistryMapper` (mirrors
+`HT_CheckIn_Other_People` rows into `ht_guest_registry`) shipped in
+`v2.63.12` on 2026-05-12. It depends on Change Tracking being enabled
+on `HT_CheckIn_Other_People`, which requires
+`migrations/legacy-mssql/022_phase5e_other_people_rooms_cancel.sql` to
+be applied first. The migration was not applied until 2026-05-13 —
+a 14-hour gap during which the `bin/sync.rs` watcher emitted a
+`Change tracking is not enabled for table HT_CheckIn_Other_People`
+error log roughly **once per second on both sites**, and
+`ht_guest_registry` did not accrue companion-guest rows. TM.30
+immigration reporting under-counted foreign guests for the duration.
+
+#### Runbook template for legacy-mssql migration apply
+
+[`RUNBOOK-mssql-022-apply.md`](RUNBOOK-mssql-022-apply.md) is the
+established template for future legacy-mssql migration apply runbooks.
+The structure to copy:
+
+1. **Status banner.** Applied / Unapplied on each site, with date.
+2. **Why this is needed.** Cite the dependent Rust commit/version and
+   the per-second error log message (so future operators can grep
+   their alerts).
+3. **Pre-flight checks.** Receptionist coordination window, backup
+   verification, locking-impact estimate (Sch-M lock duration).
+4. **Apply procedure.** The `sqlcmd` invocation (or equivalent),
+   including the `.rollback.sql` sibling path.
+5. **Post-apply verification.** `sys.change_tracking_tables` SELECT
+   confirming CT is enabled; tail of `bin/sync.rs` log confirming the
+   per-second error stopped.
+6. **Rollback.** Reference the `.rollback.sql` and any cleanup of
+   `ht_*` rows that mistakenly accrued before apply.
+
+The rule of thumb: if a Rust commit lands that REFERENCES a
+legacy-mssql migration in its commit message or CHANGELOG, the same PR
+must include (or link to a same-day-applied) runbook. Never ship a
+mapper "expecting" a migration to be applied later — the lag manifests
+as silent under-counting plus log spam, and the human operator may not
+notice for hours.
+
 ## P3 — Promote spike captures to fixtures
 
 Every raw spike capture under `docs/legacy-spike/raw/` MUST be
