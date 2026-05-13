@@ -60,6 +60,11 @@ pub enum AggregateKind {
     CheckIn,
     Payment,
     Room,
+    /// Track F3 / T1 CRIT-3 — `ht_products` canonical mirror of
+    /// legacy `HT_Products`. The mapper derives the aggregate UUID
+    /// from the SERIAL `prod_id` so subscribers can deduplicate
+    /// stock-adjust events.
+    Product,
 }
 
 impl AggregateKind {
@@ -71,6 +76,7 @@ impl AggregateKind {
             AggregateKind::CheckIn => "new-hotel.aggregate.checkin",
             AggregateKind::Payment => "new-hotel.aggregate.payment",
             AggregateKind::Room => "new-hotel.aggregate.room",
+            AggregateKind::Product => "new-hotel.aggregate.product",
         }
     }
 
@@ -108,6 +114,7 @@ mod tests {
             AggregateKind::CheckIn,
             AggregateKind::Payment,
             AggregateKind::Room,
+            AggregateKind::Product,
         ] {
             for id in [1_i32, 42, 1_000_000, i32::MAX] {
                 assert_eq!(aggregate_uuid(kind, id), aggregate_uuid(kind, id));
@@ -126,6 +133,7 @@ mod tests {
             AggregateKind::CheckIn,
             AggregateKind::Payment,
             AggregateKind::Room,
+            AggregateKind::Product,
         ];
 
         for (a_index, a) in kinds.iter().enumerate() {

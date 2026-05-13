@@ -387,6 +387,23 @@ pub async fn dispatch(
             })?;
             recipes::mark_clean::execute(conn, room_no, room_id_int, by).await
         }
+        // Track F3 — `audit-2026-05-13.md` T1 CRIT-3. The intent
+        // already carries the legacy `Pro_no` business key directly
+        // (no `ResolvedJob` lookup needed — product master is keyed
+        // by the same `Pro_no` on both sides).
+        WritebackIntent::AdjustProductStock {
+            prod_legacy_no,
+            delta,
+            reason: _,
+            product_aggregate_id: _,
+        } => {
+            if prod_legacy_no.is_empty() {
+                return Err(WritebackError::Recipe(
+                    "AdjustProductStock requires non-empty prod_legacy_no".into(),
+                ));
+            }
+            recipes::adjust_product_stock::execute(conn, prod_legacy_no, *delta).await
+        }
     }
 }
 
@@ -423,12 +440,14 @@ mod tests {
         assert!(r.legacy_checkin_ds_id.is_none());
     }
 
-    /// Verifies all 9 `WritebackIntent` variants have a matching `intent_name`
+    /// Verifies all 10 `WritebackIntent` variants have a matching `intent_name`
     /// — the dispatcher's match arms cover the same set. If a new variant is
     /// added without updating the dispatcher, the compiler will fail (match
     /// exhaustiveness), and this test catches drift in name strings.
+    /// (Track F3 added `adjust_product_stock` — keep the count and the
+    /// names list in lock-step.)
     #[test]
-    fn all_nine_intent_variants_route_to_recipes() {
+    fn all_ten_intent_variants_route_to_recipes() {
         let names = [
             "create_booking",
             "modify_booking",
@@ -439,12 +458,13 @@ mod tests {
             "check_out",
             "record_payment",
             "mark_room_clean",
+            "adjust_product_stock",
         ];
         // We verify dispatch handles all by constructing one of each via the
         // intent name → no actual MSSQL call, just type-level coverage.
         // Counting expected variants here keeps the test cheap and
         // deterministic.
-        assert_eq!(names.len(), 9, "expected 9 WritebackIntent variants");
+        assert_eq!(names.len(), 10, "expected 10 WritebackIntent variants");
     }
 
     /// Phase 5.1 chokepoint guarantee — every recipe MUST run after

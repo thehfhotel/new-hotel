@@ -196,6 +196,43 @@ pub enum WritebackIntent {
     /// `INSERT HT_Housewife` with `h_cin/h_cin_name` looked up from the prior
     /// non-cancelled check-in for this room.
     MarkRoomClean { room_id: Uuid, by: String },
+
+    /// Track F3 — `audit-2026-05-13.md` T1 CRIT-3
+    /// (`docs/legacy-app/COMPAT_CHEATSHEET.md:560-564`).
+    ///
+    /// `UPDATE HT_Products SET Pro_Amt = Pro_Amt + <delta> WHERE Pro_no=<no>`
+    /// — closes the stock invariant from our app's writes. The legacy
+    /// side still maintains `Pro_Amt` for iHOTEL's own sales; both
+    /// updates are additive so concurrent writes never clobber each
+    /// other.
+    ///
+    /// `prod_legacy_no` is the legacy `Pro_no` business key (the
+    /// recipe targets MSSQL directly so we don't carry a UUID for the
+    /// product — the canonical `ht_products.aggregate_id` is what
+    /// drives event subscribers; the writeback only needs the legacy
+    /// key). `reason` is captured by the route layer in
+    /// `ht_inventory_transactions.trans_notes` before the intent is
+    /// enqueued and is NOT propagated to legacy (no audit column on
+    /// `HT_Products`).
+    AdjustProductStock {
+        /// `HT_Products.Pro_no` — business key of the product whose
+        /// stock counter to adjust.
+        prod_legacy_no: String,
+        /// Signed delta. Positive increments stock (e.g. restock
+        /// receipt); negative decrements (e.g. consumption recorded
+        /// by our app). `f64` so fractional units (litres, kg) are
+        /// preserved at the wire boundary.
+        delta: f64,
+        /// Human-readable reason — captured canonically, NOT written
+        /// to legacy. Routes pass-through from the request body.
+        #[serde(default)]
+        reason: Option<String>,
+        /// Canonical `ht_products.aggregate_id` of the row this
+        /// intent mutates. Lets subscribers correlate the writeback
+        /// completion back to the canonical product row.
+        #[serde(default)]
+        product_aggregate_id: Option<Uuid>,
+    },
 }
 
 /// Payload for [`WritebackIntent::CreateBooking`].
@@ -289,6 +326,7 @@ impl WritebackIntent {
             WritebackIntent::CheckOut { .. } => "check_out",
             WritebackIntent::RecordPayment { .. } => "record_payment",
             WritebackIntent::MarkRoomClean { .. } => "mark_room_clean",
+            WritebackIntent::AdjustProductStock { .. } => "adjust_product_stock",
         }
     }
 
@@ -307,8 +345,36 @@ impl WritebackIntent {
             | WritebackIntent::CheckOut { check_in_id, .. }
             | WritebackIntent::RecordPayment { check_in_id, .. } => *check_in_id,
             WritebackIntent::MarkRoomClean { room_id, .. } => *room_id,
+            // Track F3 — fall back to a deterministic v5 UUID derived
+            // from the legacy `Pro_no` so the
+            // `writeback_jobs.aggregate_id` index always groups
+            // stock-adjust intents for the same product, even if the
+            // route layer hasn't yet resolved a canonical
+            // `ht_products.aggregate_id`.
+            WritebackIntent::AdjustProductStock {
+                prod_legacy_no,
+                product_aggregate_id,
+                ..
+            } => product_aggregate_id
+                .unwrap_or_else(|| product_aggregate_fallback(prod_legacy_no)),
         }
     }
+}
+
+/// Deterministic aggregate-id fallback for [`WritebackIntent::AdjustProductStock`]
+/// when the route layer hasn't supplied a canonical
+/// `ht_products.aggregate_id`. Uses a v5 UUID under a stable namespace
+/// so repeated calls return the same id and the `writeback_jobs`
+/// `aggregate_id` index groups stock-adjust intents for the same
+/// product. `service::ids::aggregate_uuid(AggregateKind::Product, …)`
+/// is the preferred path; this fallback is defensive for payloads
+/// enqueued before the route resolves the canonical id.
+fn product_aggregate_fallback(prod_legacy_no: &str) -> Uuid {
+    let namespace = Uuid::new_v5(
+        &Uuid::NAMESPACE_OID,
+        b"new-hotel.aggregate.product.legacy_no",
+    );
+    Uuid::new_v5(&namespace, prod_legacy_no.as_bytes())
 }
 
 /// Default `stay_start` used when an [`WritebackIntent::ExtendStay`] payload

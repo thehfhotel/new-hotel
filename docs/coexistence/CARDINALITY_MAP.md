@@ -36,6 +36,7 @@ a row here.
 | `ht_payments` | `HT_CheckIn_Pay` + `HT_Receipt_H` | `1:N` (one payment → one pay row + one receipt row)? | shared | TBD | `routes/new_payments.rs` | `writeback/recipes/payment.rs` | T1: VAT/transfer split + multi-payment-per-checkin |
 | `ht_booking_notes` | `HT_Invoice_Note`? | TBD | TBD | TBD | TBD | TBD | T1: verify |
 | `ht_inventory_*` (4 tables) | `HT_CheckIn_Product`? + housekeeping/stock tables? | TBD | TBD | TBD | TBD | TBD | T1: full mapping |
+| `ht_products` | `HT_Products` | `1:1` on `prod_legacy_no = Pro_no` | shared | `sync/mappers/products.rs` (periodic poll — CT enablement on `HT_Products` deferred to a sibling `migrations/legacy-mssql/` migration) | `routes/new_products.rs` | `writeback/recipes/adjust_product_stock.rs` (additive `Pro_Amt = Pro_Amt + delta` — closes stock invariant from our app's writes; legacy continues to maintain Pro_Amt for its own sales) | ✅ Track F3 / T1 CRIT-3 (migration 041) — `ht_inventory_items.inv_product_id` FK links housekeeping/POS items to canonical product master |
 | `ht_maintenance_*` (2 tables) | none (likely PG-only)? | TBD | PG canonical? | none? | `routes/new_maintenance.rs` | PG-only? | T1: confirm policy |
 | `ht_users` | none | N/A | PG canonical | none | auth routes | manual / admin | ✅ PG-only by design |
 | `ht_sessions` | none | N/A | PG canonical | none | session middleware | auth flow | ✅ PG-only by design |

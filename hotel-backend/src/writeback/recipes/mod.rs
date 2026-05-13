@@ -27,7 +27,9 @@
 //! | `checkout` | §3e Phase 2 ONLY | `CheckOut` |
 //! | `payment` | §3h | `RecordPayment` (+ receipt) |
 //! | `mark_clean` | §3j | `MarkRoomClean` |
+//! | `adjust_product_stock` | Track F3 / T1 CRIT-3 (`docs/legacy-app/COMPAT_CHEATSHEET.md:560-564`) | `AdjustProductStock` |
 
+pub mod adjust_product_stock;
 pub mod booking_cancel;
 pub mod booking_create;
 pub mod booking_modify;

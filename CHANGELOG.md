@@ -98,6 +98,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **T7 MED-3 — Backup off-site.** Tracked as Track H2.
 - **T7 MED-4 — Deploy rollback workflow.** Tracked as Track H2.
 
+<<<<<<< HEAD
 ## [vNext] - 2026-05-13 (Track F1)
 
 ### Added
@@ -144,6 +145,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     NULL-on-required loud errors, date truncation, optional FK
     extraction, SELECT-vs-projection alignment) plus a refreshed
     wiring assertion in `bin/sync.rs` (`build_mappers_wires_room_status_to_room_calendar_mapper`).
+=======
+## [vNext] - 2026-05-13 (Track F3)
+
+### Added
+
+- **Track F3 — `ht_products` canonical table + stock writeback
+  (`docs/coexistence/audit-2026-05-13.md` T1 CRIT-3).** Closes the
+  stock invariant gap documented in
+  `docs/legacy-app/COMPAT_CHEATSHEET.md:560-564` from our app's side.
+  - Migration `041_create_ht_products.sql` — new `ht_products` canonical
+    table (keyed on `prod_legacy_no = Pro_no`), `aggregate_id` column +
+    partial unique index, `ht_products_legacy_no` btree index, and an
+    `ht_inventory_items.inv_product_id` FK so housekeeping / POS items
+    can optionally link to the canonical product master. Existing
+    `ht_inventory_items` seeds (Minibar / Amenities / Linens /
+    Equipment) stay un-linked — semantics unchanged.
+  - `hotel-backend/src/sync/mappers/products.rs` — periodic-poll mapper.
+    `HT_Products` is not currently CT-enabled in legacy MSSQL; the
+    mapper docstring documents the CT-enablement TODO (sibling
+    `migrations/legacy-mssql/` migration would land it). UPSERT keyed
+    on `prod_legacy_no`, pins `aggregate_id` on first INSERT via
+    `service::ids::aggregate_uuid(AggregateKind::Product, …)`.
+  - `WritebackIntent::AdjustProductStock { prod_legacy_no, delta,
+    reason, product_aggregate_id }` — new intent variant. The dispatcher
+    routes to `writeback/recipes/adjust_product_stock.rs` which emits a
+    single additive UPDATE: `UPDATE HT_Products SET Pro_Amt = Pro_Amt +
+    <delta> WHERE Pro_no=<no>`. Additive (never absolute SET) so a
+    concurrent iHOTEL stock movement never clobbers our update.
+  - `routes/new_products.rs` — `GET /api/new/products` (paginated
+    list), `GET /api/new/products/:id` (detail), `POST
+    /api/new/products/:id/stock-adjust` (signed delta with reason).
+    The stock-adjust handler applies the canonical update + audit row
+    + writeback enqueue atomically inside one transaction.
+  - `service::ids::AggregateKind::Product` — new aggregate kind so
+    product UUIDs don't collide with bookings / check-ins / rooms in
+    the event log.
+  - `docs/coexistence/CARDINALITY_MAP.md` — new row for `ht_products`
+    ↔ `HT_Products`.
+  - Tests added: mapper smoke (`project_extracts_all_columns_from_full_row`,
+    `project_round_trips_sentinel_p001_pro_no`,
+    `stock_invariant_passes_through_projection`), recipe byte-shape
+    (`build_statements_matches_compat_cheatsheet_shape`,
+    `stock_invariant_uses_additive_update_not_absolute_set`), route DTO
+    validation (`route_emits_adjust_product_stock_intent_shape`,
+    `non_finite_delta_is_rejected_at_validation`).
+>>>>>>> 0df405c (feat(coexistence): Track F3 — ht_products canonical + stock writeback)
 
 ## [2.63.15] - 2026-05-13
 

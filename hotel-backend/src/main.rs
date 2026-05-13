@@ -502,6 +502,10 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route("/api/new/inventory/transactions", get(routes::new_inventory::list_transactions).post(routes::new_inventory::create_transaction))
         .route("/api/new/inventory/stats", get(routes::new_inventory::get_stats))
         .route("/api/new/inventory/low-stock", get(routes::new_inventory::get_low_stock))
+        // Products (Track F3 — `audit-2026-05-13.md` T1 CRIT-3)
+        .route("/api/new/products", get(routes::new_products::list_products))
+        .route("/api/new/products/{id}", get(routes::new_products::get_product))
+        .route("/api/new/products/{id}/stock-adjust", axum::routing::post(routes::new_products::adjust_stock))
         // Maintenance Management
         .route("/api/new/maintenance/categories", get(routes::new_maintenance::list_categories))
         .route("/api/new/maintenance/requests", get(routes::new_maintenance::list_requests).post(routes::new_maintenance::create_request))
