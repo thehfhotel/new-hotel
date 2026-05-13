@@ -3,6 +3,14 @@
 import { useState, useEffect, useRef } from 'react'
 import { X, Loader2, DollarSign, FileText, Undo2 } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { useAuth } from '@/contexts/AuthContext'
+
+/**
+ * Track G7 permission key required to open this modal. Centralised so
+ * the backend route gate (`require_permission("payment.refund")`) and
+ * the UI gate stay in sync — change one, change both.
+ */
+const REFUND_PERMISSION = 'payment.refund'
 
 /**
  * Refund modal — Track G2 / T4 CRIT-1.
@@ -49,6 +57,14 @@ export default function RefundPaymentModal({
   onSuccess,
 }: RefundPaymentModalProps) {
   const branchFetch = useBranchFetch()
+  const { hasPermission } = useAuth()
+
+  // Track G7 — UI gate. The backend `require_permission` middleware is
+  // the authoritative check (it rejects with 403 regardless of what the
+  // UI does); hiding the modal here just avoids the misleading
+  // "Refund" button glimpse for users who lack the permission. Falsy
+  // permission → render nothing, same shape as `!isOpen`.
+  const canRefund = hasPermission(REFUND_PERMISSION)
 
   const remainingRefundable = Math.max(originalAmount - alreadyRefunded, 0)
 
@@ -120,6 +136,10 @@ export default function RefundPaymentModal({
   }
 
   if (!isOpen) return null
+  // Hide the modal entirely for users without the `payment.refund`
+  // permission. The host component should also hide the "Refund"
+  // launcher button — this is the defensive secondary gate.
+  if (!canRefund) return null
 
   return (
     <div

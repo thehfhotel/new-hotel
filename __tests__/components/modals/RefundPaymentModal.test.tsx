@@ -17,6 +17,25 @@ jest.mock('lucide-react', () => ({
   Undo2: () => <span data-testid="undo-icon">Undo</span>,
 }))
 
+// Track G7 — the modal pulls `hasPermission` from `useAuth`. We mock
+// the entire context here so the tests can dial the permission state up
+// or down without spinning up a real AuthProvider + /api/auth/me stub.
+// `mockHasPermission` is reassigned per-test via `mockReturnValue` —
+// see the "Permission gating" describe block below.
+const mockHasPermission = jest.fn(() => true)
+jest.mock('@/contexts/AuthContext', () => ({
+  useAuth: () => ({
+    user: null,
+    permissions: [],
+    loading: false,
+    error: null,
+    login: jest.fn(),
+    logout: jest.fn(),
+    refresh: jest.fn(),
+    hasPermission: mockHasPermission,
+  }),
+}))
+
 describe('RefundPaymentModal Component', () => {
   const mockOnClose = jest.fn()
   const mockOnSuccess = jest.fn()
@@ -34,6 +53,10 @@ describe('RefundPaymentModal Component', () => {
   beforeEach(() => {
     jest.clearAllMocks()
     global.fetch = jest.fn()
+    // Default the permission gate to "granted" so the pre-G7 tests
+    // continue to exercise the happy path. The G7 gate-specific tests
+    // override this per-test.
+    mockHasPermission.mockReturnValue(true)
   })
 
   describe('Rendering', () => {
@@ -157,6 +180,21 @@ describe('RefundPaymentModal Component', () => {
         expect(mockOnSuccess).toHaveBeenCalled()
         expect(mockOnClose).toHaveBeenCalled()
       })
+    })
+
+    test('hides the modal entirely when the user lacks payment.refund', () => {
+      // Track G7 — non-cashier users should never see the refund UI.
+      mockHasPermission.mockImplementation((key: string) => key !== 'payment.refund')
+      const { container } = render(<RefundPaymentModal {...defaultProps} />)
+
+      expect(screen.queryByRole('heading', { name: 'คืนเงิน' })).not.toBeInTheDocument()
+      // Render falls through to `null` — wrapper carries no DOM children.
+      expect(container.firstChild).toBeNull()
+    })
+
+    test('queries hasPermission with the payment.refund key', () => {
+      render(<RefundPaymentModal {...defaultProps} />)
+      expect(mockHasPermission).toHaveBeenCalledWith('payment.refund')
     })
 
     test('surfaces the API error message on failure', async () => {

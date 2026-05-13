@@ -105,15 +105,28 @@ pub struct LoginRequest {
 }
 
 /// Success body for `POST /api/auth/login`.
+///
+/// Track G7 added the `permissions` field so the frontend has the
+/// user's gate-check set on the very first render after login —
+/// otherwise the UI would briefly show non-cashier users a Refund
+/// button (or similar) while a follow-up `/api/auth/me` call resolved.
 #[derive(Debug, Serialize)]
 pub struct LoginResponse {
     pub user: UserDto,
+    pub permissions: Vec<String>,
 }
 
 /// Success body for `GET /api/auth/me`.
+///
+/// Track G7 (audit T4 HIGH-9) added the `permissions` field so the
+/// frontend can hide buttons the current user lacks permission to
+/// click. Always sorted alphabetically for stable rendering. Empty
+/// when the user has no role assignments (or when auth is disabled —
+/// see [`me`] below).
 #[derive(Debug, Serialize)]
 pub struct MeResponse {
     pub user: UserDto,
+    pub permissions: Vec<String>,
 }
 
 /// Uniform error body — single `error` string keying a machine-readable
@@ -205,7 +218,31 @@ pub async fn login(
 
     let secure = is_https_request(&headers);
     let cookie = build_session_cookie(session.id, secure);
-    Ok((jar.add(cookie), Json(LoginResponse { user: user.into() })))
+
+    // Track G7 — ship permissions alongside the user so the UI is
+    // gate-aware from the very first render. Lookup failures degrade
+    // to an empty list (same rationale as `/api/auth/me`).
+    let permissions = crate::middleware::permissions_for_user(
+        &state.new_pool,
+        user.user_id,
+    )
+    .await
+    .unwrap_or_else(|err| {
+        tracing::warn!(
+            error = %err,
+            user_id = user.user_id,
+            "auth/login: permission lookup failed, returning empty list"
+        );
+        Vec::new()
+    });
+
+    Ok((
+        jar.add(cookie),
+        Json(LoginResponse {
+            user: user.into(),
+            permissions,
+        }),
+    ))
 }
 
 /// `POST /api/auth/logout`
@@ -252,7 +289,31 @@ pub async fn me(
         .validate_session(&state.new_pool, &token)
         .await
     {
-        Ok(Some((user, _session))) => Ok(Json(MeResponse { user: user.into() })),
+        Ok(Some((user, _session))) => {
+            // Track G7 — surface the permission set so the frontend can
+            // pre-hide gated UI. We swallow lookup failures here (returning
+            // an empty list rather than a 500) because the session itself
+            // is valid: a transient permission-table outage should not
+            // log the user out, it should just temporarily under-grant.
+            let permissions = crate::middleware::permissions_for_user(
+                &state.new_pool,
+                user.user_id,
+            )
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    error = %err,
+                    user_id = user.user_id,
+                    "auth/me: permission lookup failed, returning empty list"
+                );
+                Vec::new()
+            });
+
+            Ok(Json(MeResponse {
+                user: user.into(),
+                permissions,
+            }))
+        }
         Ok(None) => Err(unauthenticated()),
         Err(err) => {
             tracing::error!(error = %err, "auth/me: validate_session failed");
@@ -455,14 +516,42 @@ mod tests {
     }
 
     #[test]
-    fn login_response_carries_only_user_field() {
+    fn login_response_carries_user_and_permissions_fields() {
+        // Track G7 widened the contract — frontend relies on
+        // `permissions` being present so it doesn't have to make a
+        // follow-up /me round-trip just to learn the role grid.
         let resp = LoginResponse {
             user: fixed_user().into(),
+            permissions: vec!["payment.refund".to_string()],
         };
         let value = serde_json::to_value(&resp).unwrap();
         let obj = value.as_object().unwrap();
-        assert_eq!(obj.len(), 1);
+        assert_eq!(obj.len(), 2);
         assert!(obj.contains_key("user"));
+        assert!(obj.contains_key("permissions"));
+        assert_eq!(
+            obj.get("permissions").unwrap().as_array().unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn me_response_carries_user_and_permissions_fields() {
+        let resp = MeResponse {
+            user: fixed_user().into(),
+            permissions: vec![
+                "admin.users".to_string(),
+                "payment.refund".to_string(),
+            ],
+        };
+        let value = serde_json::to_value(&resp).unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(obj.contains_key("user"));
+        assert!(obj.contains_key("permissions"));
+        assert_eq!(
+            obj.get("permissions").unwrap().as_array().unwrap().len(),
+            2
+        );
     }
 
     #[test]
