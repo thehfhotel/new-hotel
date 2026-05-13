@@ -1,5 +1,7 @@
 //! Hotel Management System Backend
 //!
+//! spike(ci/release-fast-profile): warm-cache tickle 1. Remove before merge.
+//!
 //! A Rust/Axum backend server for the hotel management system.
 //! Replaces the Next.js API routes with a high-performance Rust implementation.
 //!
