@@ -15,7 +15,7 @@ env:
   # essentially cold (or warm via Swatinem/rust-cache + sccache) rather
   # than dev-loop incremental. Applied at workflow scope so every job
   # picks it up automatically. Mirrored in the chef Dockerfile stage so
-  # the in-Docker `cargo build` follows the same policy.  # warm-cache trigger #1
+  # the in-Docker `cargo build` follows the same policy.  # warm-cache trigger #2
   CARGO_INCREMENTAL: "0"
 
 # Workflow-level concurrency: cancel an in-flight test/build run when a
