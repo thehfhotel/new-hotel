@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   Loader2,
   AlertCircle,
+  ArrowRightLeft,
   Clock,
   LogIn,
   LogOut,
@@ -13,6 +14,7 @@ import { useBranch, BRANCH_LABELS } from '@/contexts/BranchContext'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import CheckInModal from '@/components/CheckInModal'
 import CheckOutModal from '@/components/CheckOutModal'
+import ChangeRoomModal from '@/components/ChangeRoomModal'
 import ExtendStayModal from '@/components/ExtendStayModal'
 
 // Domain-event variants that mutate the dashboard's tile counts or room grid.
@@ -135,6 +137,8 @@ export default function NewDashboard() {
   const [showCheckOut, setShowCheckOut] = useState(false)
   // Track G1 / T4 HIGH-2: extend-stay modal (one-more-night flow).
   const [showExtendStay, setShowExtendStay] = useState(false)
+  // Track G4 / T4 HIGH-3: change-room modal (move guest A → B).
+  const [showChangeRoom, setShowChangeRoom] = useState(false)
   // SSE connection status — drives the tiny header dot. Starts pessimistic
   // so the dot reads "reconnecting" until the EventSource fires `onopen`.
   const [isLiveConnected, setIsLiveConnected] = useState(false)
@@ -522,6 +526,17 @@ export default function NewDashboard() {
                     <CalendarPlus size={12} />
                     ขยายเวลาเข้าพัก
                   </button>
+                  {/* Track G4 / T4 HIGH-3: change-room (mid-stay move). Sits
+                      between extend and checkout so receptionists see the
+                      full lifecycle action set on an occupied tile. */}
+                  <button
+                    onClick={() => setShowChangeRoom(true)}
+                    disabled={!roomIdByNo.get(selectedRoom.roomNumber.toUpperCase())}
+                    className="w-full h-8 flex items-center justify-center gap-1.5 bg-amber-600 text-white hover:bg-amber-700 disabled:opacity-50 transition-colors text-[13px]"
+                  >
+                    <ArrowRightLeft size={12} />
+                    เปลี่ยนห้อง
+                  </button>
                   <button
                     onClick={() => setShowCheckOut(true)}
                     disabled={!roomIdByNo.get(selectedRoom.roomNumber.toUpperCase())}
@@ -578,6 +593,19 @@ export default function NewDashboard() {
             roomNo: selectedRoom.roomNumber,
           }}
           onClose={() => setShowExtendStay(false)}
+          onSuccess={() => {
+            fetchData()
+            setSelectedRoom(null)
+          }}
+        />
+      )}
+      {showChangeRoom && selectedRoom && roomIdByNo.get(selectedRoom.roomNumber.toUpperCase()) && (
+        <ChangeRoomModal
+          room={{
+            id: roomIdByNo.get(selectedRoom.roomNumber.toUpperCase())!,
+            roomNo: selectedRoom.roomNumber,
+          }}
+          onClose={() => setShowChangeRoom(false)}
           onSuccess={() => {
             fetchData()
             setSelectedRoom(null)

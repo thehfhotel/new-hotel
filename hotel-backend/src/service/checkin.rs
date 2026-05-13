@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::domain::checkin::CheckInState;
@@ -105,6 +105,42 @@ pub struct CancelCheckInCommand {
     /// Pay portion to subtract from `Total_Price_Pay`. Usually `Money::ZERO`.
     pub pay_to_subtract: Money,
     pub source: EventSource,
+}
+
+/// Command for [`CheckInService::change_room`].
+///
+/// Track G4 / T4 HIGH-3 (`docs/coexistence/audit-2026-05-13.md`). A
+/// receptionist moves an active guest from `from_room_id` to
+/// `to_room_id` mid-stay. The service:
+///
+/// 1. Validates the check-in is active.
+/// 2. Validates `from_room_id` is currently in this folio's junction.
+/// 3. Validates `to_room_id` is free (no overlapping active occupancy).
+/// 4. Inside one PG transaction: inserts the audit row in
+///    `ht_room_changes`, UPDATEs the matching `ht_checkin_rooms` row's
+///    `cr_room_id` from `from` → `to`, and emits
+///    [`WritebackIntent::RoomChange`] for the legacy mirror.
+///
+/// `actor` is the operator name captured by the route from the auth
+/// session (today: empty string until G7 auth middleware lands).
+#[derive(Debug, Clone)]
+pub struct ChangeRoomCommand {
+    pub check_in_id: i32,
+    pub from_room_id: i32,
+    pub to_room_id: i32,
+    pub reason: Option<String>,
+    pub actor: String,
+    pub source: EventSource,
+}
+
+/// Outcome of a successful `change_room` operation. Carries the newly
+/// inserted `ht_room_changes.rc_id` so the route can return the audit
+/// row without an additional lookup.
+#[derive(Debug, Clone)]
+pub struct ChangeRoomOutcome {
+    pub check_in_id: i32,
+    pub aggregate_id: Uuid,
+    pub rc_id: i64,
 }
 
 /// Command for [`CheckInService::extend`].
@@ -477,6 +513,231 @@ impl CheckInService {
         Ok(CheckInOutcome {
             check_in_id: cmd.check_in_id,
             aggregate_id,
+        })
+    }
+
+    /// Mid-stay room change — Track G4 / T4 HIGH-3.
+    ///
+    /// Validates the move, then in one PG transaction:
+    /// - INSERTs the audit row into `ht_room_changes`.
+    /// - UPDATEs the matching `ht_checkin_rooms.cr_room_id` from `from`
+    ///   to `to` so subsequent reads see the new occupancy.
+    /// - Marks the old room available-dirty and the new room occupied
+    ///   on `ht_rooms_new` so the dashboard's room-grid status flips
+    ///   immediately (matches the create-flow's `mark_room_occupied`
+    ///   convention).
+    /// - Enqueues [`WritebackIntent::RoomChange`] for the legacy mirror.
+    ///
+    /// Returns [`ChangeRoomOutcome::rc_id`] so the route can return the
+    /// freshly-inserted audit row.
+    pub async fn change_room(
+        &self,
+        cmd: ChangeRoomCommand,
+    ) -> ServiceResult<ChangeRoomOutcome> {
+        // 1. Source check-in must exist + be active. We reject any
+        //    non-active state explicitly so receptionists get a clear
+        //    409 wording instead of a silent no-op.
+        let status = self
+            .repo
+            .find_status(&self.pg, cmd.check_in_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::not_found(format!(
+                    "check-in {} does not exist",
+                    cmd.check_in_id
+                ))
+            })?;
+        if !matches!(status.cin_status.as_deref(), Some("active")) {
+            return Err(ServiceError::conflict(format!(
+                "check-in {} is not active ({:?})",
+                cmd.check_in_id, status.cin_status
+            )));
+        }
+        if cmd.from_room_id == cmd.to_room_id {
+            return Err(ServiceError::validation(
+                "from_room_id and to_room_id must differ — nothing to change",
+            ));
+        }
+
+        let mut tx = self.pg.begin().await?;
+
+        // 2. The `from_room_id` MUST currently sit in this folio's
+        //    junction (otherwise we'd be moving a room the guest
+        //    never actually occupied). COALESCE handles pre-B5 folios
+        //    where the junction may not yet be populated — for those
+        //    we fall back to `ht_checkins.cin_room_id`.
+        let from_in_folio: bool = sqlx::query(
+            "SELECT EXISTS(\
+               SELECT 1 FROM ht_checkin_rooms \
+                WHERE cr_cin_id = $1 AND cr_room_id = $2\
+             ) OR EXISTS(\
+               SELECT 1 FROM ht_checkins \
+                WHERE cin_id = $1 AND cin_room_id = $2\
+             ) AS in_folio",
+        )
+        .bind(cmd.check_in_id)
+        .bind(cmd.from_room_id)
+        .fetch_one(&mut *tx)
+        .await?
+        .try_get("in_folio")
+        .unwrap_or(false);
+        if !from_in_folio {
+            return Err(ServiceError::validation(format!(
+                "room {} is not currently assigned to check-in {}",
+                cmd.from_room_id, cmd.check_in_id
+            )));
+        }
+
+        // 3. The `to_room_id` MUST be free. We accept the target room as
+        //    "free" when no OTHER active check-in occupies it. The
+        //    junction is the source of truth for B2+ folios; legacy
+        //    `cin_room_id` is the COALESCE fallback for pre-B2 ones.
+        let target_occupied: bool = sqlx::query(
+            "SELECT EXISTS(\
+               SELECT 1 FROM ht_checkin_rooms cr \
+                 JOIN ht_checkins c ON c.cin_id = cr.cr_cin_id \
+                WHERE cr.cr_room_id = $2 \
+                  AND c.cin_status = 'active' \
+                  AND cr.cr_cin_id <> $1\
+             ) OR EXISTS(\
+               SELECT 1 FROM ht_checkins c \
+                WHERE c.cin_room_id = $2 \
+                  AND c.cin_status = 'active' \
+                  AND c.cin_id <> $1\
+             ) AS occupied",
+        )
+        .bind(cmd.check_in_id)
+        .bind(cmd.to_room_id)
+        .fetch_one(&mut *tx)
+        .await?
+        .try_get("occupied")
+        .unwrap_or(false);
+        if target_occupied {
+            return Err(ServiceError::conflict(format!(
+                "room {} is already occupied by another active check-in",
+                cmd.to_room_id
+            )));
+        }
+
+        // 4. Pull the `cr_rate_per_night` of the from-row so the audit
+        //    row records the pre-move price. Pre-B5 folios that lack
+        //    a junction row fall back to `ht_checkins.cin_rate_per_night`.
+        let room_before_price: f64 = sqlx::query(
+            "SELECT COALESCE(\
+               (SELECT cr_rate_per_night::float8 FROM ht_checkin_rooms \
+                  WHERE cr_cin_id = $1 AND cr_room_id = $2), \
+               (SELECT cin_rate_per_night FROM ht_checkins WHERE cin_id = $1), \
+               0.0 \
+             ) AS price",
+        )
+        .bind(cmd.check_in_id)
+        .bind(cmd.from_room_id)
+        .fetch_one(&mut *tx)
+        .await?
+        .try_get("price")
+        .unwrap_or(0.0);
+
+        // 5. INSERT the canonical audit row.
+        let reason_trimmed = cmd
+            .reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let rc_id: i64 = sqlx::query(
+            "INSERT INTO ht_room_changes ( \
+                rc_cin_id, rc_from_room_id, rc_to_room_id, rc_reason, \
+                rc_changed_at, rc_changed_by, rc_room_before_price \
+             ) VALUES ($1, $2, $3, $4, NOW(), $5, $6::numeric) \
+             RETURNING rc_id",
+        )
+        .bind(cmd.check_in_id)
+        .bind(cmd.from_room_id)
+        .bind(cmd.to_room_id)
+        .bind(reason_trimmed)
+        .bind(if cmd.actor.is_empty() { None } else { Some(cmd.actor.as_str()) })
+        .bind(room_before_price)
+        .fetch_one(&mut *tx)
+        .await?
+        .try_get("rc_id")?;
+
+        // 6. UPDATE the junction row from from-room → to-room. Pre-B5
+        //    folios that don't yet have a junction row get one created
+        //    so the move still lands canonically (matches the B2 mapper
+        //    UPSERT shape).
+        let junction_updated = sqlx::query(
+            "UPDATE ht_checkin_rooms \
+                SET cr_room_id = $3, cr_updated_at = NOW() \
+              WHERE cr_cin_id = $1 AND cr_room_id = $2",
+        )
+        .bind(cmd.check_in_id)
+        .bind(cmd.from_room_id)
+        .bind(cmd.to_room_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if junction_updated == 0 {
+            // Pre-B5 fallback: insert a junction row keyed on the
+            // to-room so the dashboard's B3 reader sees the new
+            // occupancy. cr_room_status mirrors the active-stay
+            // literal the B2 mapper writes.
+            sqlx::query(
+                "INSERT INTO ht_checkin_rooms ( \
+                    cr_cin_id, cr_room_id, cr_room_status, cr_rate_per_night \
+                 ) VALUES ($1, $2, 'active', $3::numeric) \
+                 ON CONFLICT (cr_cin_id, cr_room_id) DO NOTHING",
+            )
+            .bind(cmd.check_in_id)
+            .bind(cmd.to_room_id)
+            .bind(room_before_price)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // 7. Flip room-grid status so the dashboard tile colours update
+        //    on the next refresh. The recipe's MSSQL writeback will
+        //    propagate equivalent `HT_Rooms.Room_Use` flips via the
+        //    sync mapper round-trip — this PG write keeps the local
+        //    view consistent until then.
+        self.repo
+            .mark_room_available_dirty(&mut tx, cmd.from_room_id)
+            .await?;
+        self.repo.mark_room_occupied(&mut tx, cmd.to_room_id).await?;
+
+        // ht_checkins still carries the deprecated single-room column.
+        // Update it as a fallback for legacy-reader code paths so the
+        // existing dashboard rendering doesn't surface stale data
+        // between now and Track B5's column drop.
+        sqlx::query("UPDATE ht_checkins SET cin_room_id = $2, updated_at = NOW() WHERE cin_id = $1")
+            .bind(cmd.check_in_id)
+            .bind(cmd.to_room_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // 8. Enqueue the writeback intent + commit. The aggregate id is
+        //    the check-in's so the writeback worker's resolver picks
+        //    up the same `legacy_cin_no` self-heal path.
+        let aggregate_id = aggregate_uuid(AggregateKind::CheckIn, cmd.check_in_id);
+        let intent = WritebackIntent::RoomChange {
+            check_in_id: aggregate_id,
+            rc_id,
+        };
+        let key = generate_idempotency_key(&intent, aggregate_id);
+        OutboxRepository::enqueue(&mut tx, &intent, key)
+            .await
+            .map_err(|err| ServiceError::outbox(err.to_string()))?;
+
+        // No dedicated DomainEvent variant for room-change today (mirrors
+        // the extend-stay pattern — subscribers learn via writeback row
+        // + UI poll). When a `CheckInRoomChanged` event lands the publish
+        // goes here.
+        let _ = &self.events;
+
+        tx.commit().await?;
+
+        Ok(ChangeRoomOutcome {
+            check_in_id: cmd.check_in_id,
+            aggregate_id,
+            rc_id,
         })
     }
 
@@ -1040,5 +1301,325 @@ mod tests {
             matches!(loser, ServiceError::Conflict(_)),
             "loser must be a Conflict (folio already folded), got: {loser:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod change_room_tests {
+    //! Track G4 / T4 HIGH-3 — tests for `CheckInService::change_room`.
+    //! Integration-style: each test connects to the PG test database and
+    //! seeds its own check-in / room rows. Skipped at runtime when PG
+    //! is unreachable so the suite still passes in environments where
+    //! the DB isn't available.
+
+    use super::*;
+    use crate::outbox::event::EventSource;
+    use crate::outbox::{EventBus, OutboxRepository};
+    use crate::repository::checkin::PgCheckInRepository;
+
+    async fn try_pool() -> Option<PgPool> {
+        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgresql://postgres:REDACTED-pg-2026@localhost:5439/hotelnew".to_string()
+        });
+        PgPool::connect(&url).await.ok()
+    }
+
+    fn build_service(pool: PgPool) -> CheckInService {
+        let repo: Arc<dyn crate::repository::checkin::CheckInRepository> =
+            Arc::new(PgCheckInRepository::new());
+        let outbox = Arc::new(OutboxRepository::new());
+        let events = Arc::new(EventBus::new());
+        CheckInService::new(repo, outbox, events, pool)
+    }
+
+    /// Pure validation: from == to must be rejected before any DB work.
+    /// This guard fires AFTER `find_status` so the test still needs PG
+    /// (the find_status check runs first to surface NotFound on bad ids)
+    /// — but we seed a minimal active check-in to exercise the equality
+    /// guard in isolation.
+    #[tokio::test]
+    async fn change_room_rejects_same_room_id() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping change_room_rejects_same_room_id — PG not reachable");
+            return;
+        };
+        let (cin_id, _from, _to) = match seed_active_checkin(&pool, "G4_same").await {
+            Some(ids) => ids,
+            None => return,
+        };
+        let svc = build_service(pool.clone());
+        let err = svc
+            .change_room(ChangeRoomCommand {
+                check_in_id: cin_id,
+                from_room_id: 999_001,
+                to_room_id: 999_001,
+                reason: None,
+                actor: "tester".into(),
+                source: EventSource::System {
+                    reason: "G4_same".into(),
+                },
+            })
+            .await
+            .expect_err("same-room change must reject");
+        match err {
+            ServiceError::Validation(msg) => {
+                assert!(msg.contains("must differ"), "got: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        cleanup(&pool, cin_id).await;
+    }
+
+    /// Not-found check-in surfaces as NotFound, not as a silent no-op.
+    #[tokio::test]
+    async fn change_room_rejects_missing_checkin() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping change_room_rejects_missing_checkin — PG not reachable");
+            return;
+        };
+        let svc = build_service(pool);
+        let err = svc
+            .change_room(ChangeRoomCommand {
+                check_in_id: -1,
+                from_room_id: 1,
+                to_room_id: 2,
+                reason: None,
+                actor: String::new(),
+                source: EventSource::System {
+                    reason: "G4_missing".into(),
+                },
+            })
+            .await
+            .expect_err("missing check-in must reject");
+        assert!(matches!(err, ServiceError::NotFound(_)));
+    }
+
+    /// Happy path: seed an active check-in occupying room A; move to B.
+    /// Verifies (1) the audit row landed in `ht_room_changes`,
+    /// (2) the junction `cr_room_id` flipped from A→B,
+    /// (3) a `room_change` outbox row was enqueued with the right
+    ///     aggregate id.
+    #[tokio::test]
+    async fn change_room_writes_audit_and_emits_intent() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping change_room_writes_audit_and_emits_intent — PG not reachable");
+            return;
+        };
+        let (cin_id, from_room_id, to_room_id) =
+            match seed_active_checkin(&pool, "G4_happy").await {
+                Some(ids) => ids,
+                None => return,
+            };
+
+        let svc = build_service(pool.clone());
+        let outcome = svc
+            .change_room(ChangeRoomCommand {
+                check_in_id: cin_id,
+                from_room_id,
+                to_room_id,
+                reason: Some("noise complaint".into()),
+                actor: "alice".into(),
+                source: EventSource::System {
+                    reason: "G4_happy".into(),
+                },
+            })
+            .await
+            .expect("happy-path change_room must succeed");
+
+        assert_eq!(outcome.check_in_id, cin_id);
+        assert!(outcome.rc_id > 0);
+
+        // 1. Audit row present with the right values.
+        let audit: (i32, i32, i32, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT rc_cin_id, rc_from_room_id, rc_to_room_id, rc_reason, rc_changed_by \
+               FROM ht_room_changes WHERE rc_id = $1",
+        )
+        .bind(outcome.rc_id)
+        .fetch_one(&pool)
+        .await
+        .expect("audit row must be present");
+        assert_eq!(audit.0, cin_id);
+        assert_eq!(audit.1, from_room_id);
+        assert_eq!(audit.2, to_room_id);
+        assert_eq!(audit.3.as_deref(), Some("noise complaint"));
+        assert_eq!(audit.4.as_deref(), Some("alice"));
+
+        // 2. Junction flipped.
+        let junction: (i32,) = sqlx::query_as(
+            "SELECT cr_room_id FROM ht_checkin_rooms WHERE cr_cin_id = $1",
+        )
+        .bind(cin_id)
+        .fetch_one(&pool)
+        .await
+        .expect("junction row must exist");
+        assert_eq!(
+            junction.0, to_room_id,
+            "junction must point to to_room_id after move"
+        );
+
+        // 3. Outbox row enqueued with intent='room_change' on the
+        //    aggregate id derived from cin_id.
+        let aggregate_id = aggregate_uuid(AggregateKind::CheckIn, cin_id);
+        let outbox: (i64, String) = sqlx::query_as(
+            "SELECT id, intent FROM writeback_jobs \
+              WHERE aggregate_id = $1 \
+                AND intent = 'room_change' \
+              ORDER BY id DESC LIMIT 1",
+        )
+        .bind(aggregate_id)
+        .fetch_one(&pool)
+        .await
+        .expect("room_change outbox row must be enqueued");
+        assert_eq!(outbox.1, "room_change");
+
+        cleanup(&pool, cin_id).await;
+    }
+
+    /// Source room not in folio → 400/Validation. Receptionist sees an
+    /// explicit error rather than a silent no-op that would corrupt the
+    /// audit ledger.
+    #[tokio::test]
+    async fn change_room_rejects_from_room_not_in_folio() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping change_room_rejects_from_room_not_in_folio — PG not reachable");
+            return;
+        };
+        let (cin_id, _from, to_room_id) = match seed_active_checkin(&pool, "G4_notin").await {
+            Some(ids) => ids,
+            None => return,
+        };
+        let svc = build_service(pool.clone());
+        // Pick a definitely-unrelated room id.
+        let err = svc
+            .change_room(ChangeRoomCommand {
+                check_in_id: cin_id,
+                from_room_id: 999_999, // not in this folio
+                to_room_id,
+                reason: None,
+                actor: String::new(),
+                source: EventSource::System {
+                    reason: "G4_notin".into(),
+                },
+            })
+            .await
+            .expect_err("from-room not in folio must reject");
+        match err {
+            ServiceError::Validation(msg) => {
+                assert!(msg.contains("not currently assigned"), "got: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        cleanup(&pool, cin_id).await;
+    }
+
+    // -------------------- test helpers --------------------
+
+    /// Seed a minimal `(customer, two rooms, active check-in, junction row)`
+    /// graph for the change-room tests. Returns `(cin_id, from_room_id,
+    /// to_room_id)` or `None` if any seed step fails (e.g. unique
+    /// constraint on rooms.room_no). All rows are tagged with the
+    /// `marker` so `cleanup` can remove them deterministically.
+    async fn seed_active_checkin(pool: &PgPool, marker: &str) -> Option<(i32, i32, i32)> {
+        // Customer
+        let cust_id: i32 = sqlx::query_scalar(
+            "INSERT INTO ht_customers (cust_firstname, cust_lastname) \
+             VALUES ($1, 'TestG4') RETURNING cust_id",
+        )
+        .bind(format!("Guest_{marker}"))
+        .fetch_one(pool)
+        .await
+        .ok()?;
+
+        // Two rooms. We pick room_no values unlikely to collide with
+        // seed data — the marker is included so reruns don't conflict
+        // (cleanup wipes them but a previous crashed run may have
+        // leftovers).
+        let room_no_from = format!("G4F{marker}");
+        let room_no_to = format!("G4T{marker}");
+        let from_room_id: i32 = sqlx::query_scalar(
+            "INSERT INTO ht_rooms_new (room_no, room_status) \
+             VALUES ($1, 'available') RETURNING room_id",
+        )
+        .bind(&room_no_from)
+        .fetch_one(pool)
+        .await
+        .ok()?;
+        let to_room_id: i32 = sqlx::query_scalar(
+            "INSERT INTO ht_rooms_new (room_no, room_status) \
+             VALUES ($1, 'available') RETURNING room_id",
+        )
+        .bind(&room_no_to)
+        .fetch_one(pool)
+        .await
+        .ok()?;
+
+        // Active check-in
+        let cin_id: i32 = sqlx::query_scalar(
+            "INSERT INTO ht_checkins (\
+                cin_no, cin_cust_id, cin_room_id, cin_checkin_time, \
+                cin_expected_checkout, cin_status, cin_rate_per_night\
+             ) VALUES ($1, $2, $3, NOW(), CURRENT_DATE + 1, 'active', 1200) \
+             RETURNING cin_id",
+        )
+        .bind(format!("CIN-{marker}"))
+        .bind(cust_id)
+        .bind(from_room_id)
+        .fetch_one(pool)
+        .await
+        .ok()?;
+
+        // Junction row (B2 mapper would have populated this; we seed it
+        // explicitly so we exercise the UPDATE path).
+        sqlx::query(
+            "INSERT INTO ht_checkin_rooms (\
+                cr_cin_id, cr_room_id, cr_room_status, cr_rate_per_night\
+             ) VALUES ($1, $2, 'active', 1200)",
+        )
+        .bind(cin_id)
+        .bind(from_room_id)
+        .execute(pool)
+        .await
+        .ok()?;
+
+        Some((cin_id, from_room_id, to_room_id))
+    }
+
+    /// Tear down the rows seeded by `seed_active_checkin`. Best-effort:
+    /// missing rows (already-cleaned, FK cascade) are silently
+    /// tolerated.
+    async fn cleanup(pool: &PgPool, cin_id: i32) {
+        let _ = sqlx::query("DELETE FROM writeback_jobs WHERE aggregate_id = $1")
+            .bind(aggregate_uuid(AggregateKind::CheckIn, cin_id))
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM ht_room_changes WHERE rc_cin_id = $1")
+            .bind(cin_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM ht_checkin_rooms WHERE cr_cin_id = $1")
+            .bind(cin_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query(
+            "DELETE FROM ht_rooms_new WHERE room_id IN \
+              (SELECT cin_room_id FROM ht_checkins WHERE cin_id = $1)",
+        )
+        .bind(cin_id)
+        .execute(pool)
+        .await;
+        let _ = sqlx::query(
+            "DELETE FROM ht_customers WHERE cust_id IN \
+              (SELECT cin_cust_id FROM ht_checkins WHERE cin_id = $1)",
+        )
+        .bind(cin_id)
+        .execute(pool)
+        .await;
+        let _ = sqlx::query("DELETE FROM ht_checkins WHERE cin_id = $1")
+            .bind(cin_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM ht_rooms_new WHERE room_no LIKE 'G4%'")
+            .execute(pool)
+            .await;
     }
 }

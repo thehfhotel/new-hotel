@@ -27,6 +27,7 @@
 //! | `checkout` | §3e Phase 2 ONLY | `CheckOut` |
 //! | `payment` | §3h | `RecordPayment` (+ receipt) |
 //! | `refund_payment` | Track G2 / T4 CRIT-1 (`docs/legacy-app/COMPAT_CHEATSHEET.md:513`) | `RefundPayment` |
+//! | `room_change` | Track G4 / T4 HIGH-3 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_Changed_Room`, §3.17) | `RoomChange` |
 //! | `mark_clean` | §3j | `MarkRoomClean` |
 //! | `adjust_product_stock` | Track F3 / T1 CRIT-3 (`docs/legacy-app/COMPAT_CHEATSHEET.md:560-564`) | `AdjustProductStock` |
 
@@ -42,6 +43,7 @@ pub mod helpers;
 pub mod mark_clean;
 pub mod payment;
 pub mod refund_payment;
+pub mod room_change;
 pub mod walkin;
 
 use crate::writeback::allocate::LegacyConn;
@@ -99,11 +101,12 @@ pub(crate) async fn execute_all(
 /// Today every IDENTITY-keyed legacy table the recipes touch (`HT_CheckIn_Ds`,
 /// `HT_Receipt_H`, `HT_Book_Date`, `HT_Room_Status`, `HT_Rooms_Cancel`) was
 /// stripped of its IDENTITY property by the vendor (verified via the
-/// 2026-04-26 `inspect_schema` dump) — all recipes allocate via TABLOCKX
-/// MAX+1 (`allocate::*_id`) and embed the value in the INSERT directly. This
-/// helper exists for future tables that may need to capture a true IDENTITY
-/// id without relying on SCOPE_IDENTITY's wire semantics.
-#[allow(dead_code)]
+/// 2026-04-26 `inspect_schema` dump) — those recipes allocate via TABLOCKX
+/// MAX+1 (`allocate::*_id`) and embed the value in the INSERT directly. The
+/// exception is `HT_Changed_Room` (Track G4 / migration 045): the vendor
+/// left its `id` column IDENTITY-keyed, so the `room_change` recipe uses
+/// this helper to capture the freshly-allocated id without crossing a
+/// `SCOPE_IDENTITY()` wire boundary.
 pub(crate) async fn execute_insert_with_output_id(
     conn: &mut LegacyConn<'_>,
     insert_sql: &str,

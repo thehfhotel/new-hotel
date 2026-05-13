@@ -309,6 +309,13 @@ impl MssqlChangeMapper for ChangedRoomMirrorMapper {
                     .bind(id)
                     .execute(&mut **tx)
                     .await?;
+                // Track G4 — also cascade the canonical row delete keyed
+                // on the back-link. Idempotent: if no canonical row
+                // exists yet (legacy-origin race) this is a no-op.
+                sqlx::query("DELETE FROM ht_room_changes WHERE rc_legacy_id = $1")
+                    .bind(id)
+                    .execute(&mut **tx)
+                    .await?;
             }
             ChangeOp::Insert | ChangeOp::Update => {
                 let cin_no = row
@@ -317,6 +324,13 @@ impl MssqlChangeMapper for ChangedRoomMirrorMapper {
                         table: "HT_Changed_Room",
                         message: "cin_no NULL — schema declares NOT NULL".into(),
                     })?;
+                let room_before = row.try_get_str("room_before")?;
+                let room_after = row.try_get_str("room_after")?;
+                let change_date = row.try_get_datetime("change_date")?;
+                let price = row.try_get_f64("room_before_price")?;
+                let note = row.try_get_str("Note")?;
+                let toprice = row.try_get_str("ToPrice")?;
+
                 sqlx::query(
                     "INSERT INTO legacy_mirror.ht_changed_room \
                         (id, cin_no, room_before, room_after, change_date, \
@@ -335,18 +349,141 @@ impl MssqlChangeMapper for ChangedRoomMirrorMapper {
                 )
                 .bind(id)
                 .bind(cin_no)
-                .bind(row.try_get_str("room_before")?)
-                .bind(row.try_get_str("room_after")?)
-                .bind(row.try_get_datetime("change_date")?)
-                .bind(row.try_get_f64("room_before_price")?)
-                .bind(row.try_get_str("Note")?)
-                .bind(row.try_get_str("ToPrice")?)
+                .bind(room_before)
+                .bind(room_after)
+                .bind(change_date)
+                .bind(price)
+                .bind(note)
+                .bind(toprice)
                 .execute(&mut **tx)
+                .await?;
+
+                // Track G4 / T4 HIGH-3 — also reverse-sync into the
+                // canonical `ht_room_changes` table so a room change
+                // performed via iHOTEL lands canonically. The legacy
+                // row carries `cin_no` + room_no strings; we resolve
+                // them to canonical ids via the existing junctions.
+                // Skip silently when the parent rows haven't yet been
+                // mirrored (race with CT order) — the next tick will
+                // catch up via the `legacy_mirror.ht_changed_room`
+                // mirror table.
+                upsert_canonical_room_change(
+                    tx, id, cin_no, room_before, room_after, change_date, price, note, toprice,
+                )
                 .await?;
             }
         }
         Ok(None)
     }
+}
+
+/// Track G4 / T4 HIGH-3 — UPSERT a canonical `ht_room_changes` row from
+/// the legacy `HT_Changed_Room` projection. Resolves `cin_no` →
+/// `ht_checkins.cin_id`, `room_before` / `room_after` →
+/// `ht_rooms_new.room_id`. If any of the three lookups misses (the
+/// parent row hasn't been mirrored yet), this is a NO-OP — the next CT
+/// tick on the same row re-fires the mapper after the parent rows
+/// land. The mirror-table UPSERT still completes so `legacy_mirror`
+/// readers see the row immediately.
+#[allow(clippy::too_many_arguments)]
+async fn upsert_canonical_room_change(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    legacy_id: i32,
+    cin_no: &str,
+    room_before: Option<&str>,
+    room_after: Option<&str>,
+    change_date: Option<chrono::NaiveDateTime>,
+    price: Option<f64>,
+    note: Option<&str>,
+    toprice: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    let Some(room_before) = room_before else { return Ok(()) };
+    let Some(room_after) = room_after else { return Ok(()) };
+
+    // Resolve cin_id + both room_ids in a single round-trip. Any NULL
+    // means the parent rows aren't yet mirrored — we bail out so the
+    // canonical state stays consistent (next tick will retry).
+    let resolved: Option<(i32, i32, i32)> = sqlx::query_as(
+        "SELECT c.cin_id, rf.room_id, rt.room_id \
+           FROM ht_checkins  c \
+           JOIN ht_rooms_new rf ON rf.room_no = $2 \
+           JOIN ht_rooms_new rt ON rt.room_no = $3 \
+          WHERE c.legacy_cin_no = $1 \
+          LIMIT 1",
+    )
+    .bind(cin_no)
+    .bind(room_before)
+    .bind(room_after)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    let Some((cin_id, from_room_id, to_room_id)) = resolved else {
+        // Parent rows missing — leave the canonical table alone. The
+        // legacy_mirror row still gives observability into the audit
+        // entry. The legacy_id back-link will be filled on a
+        // subsequent CT tick when the parent rows have mirrored.
+        return Ok(());
+    };
+
+    // Two-step UPSERT keyed on the legacy back-link. The partial
+    // UNIQUE index on `rc_legacy_id WHERE rc_legacy_id IS NOT NULL`
+    // means standard `ON CONFLICT (rc_legacy_id) DO UPDATE` would
+    // need the inference predicate spelled out, which sqlx can't bind
+    // dynamically — manual UPDATE-then-INSERT is clearer and
+    // equally idempotent under our serialized CT-tick driver.
+    //
+    // The canonical row our app originated has `rc_legacy_id IS NULL`
+    // until the writeback worker's `mark_done` back-populates it;
+    // this mapper only touches rows whose `rc_legacy_id` is already
+    // set (legacy-origin) OR creates a fresh legacy-origin row.
+    let updated = sqlx::query(
+        "UPDATE ht_room_changes SET \
+             rc_cin_id            = $1, \
+             rc_from_room_id      = $2, \
+             rc_to_room_id        = $3, \
+             rc_reason            = $4, \
+             rc_changed_at        = COALESCE($5::timestamp AT TIME ZONE 'Asia/Bangkok', rc_changed_at), \
+             rc_room_before_price = COALESCE($6::numeric, rc_room_before_price), \
+             rc_to_price          = $7, \
+             rc_updated_at        = NOW() \
+           WHERE rc_legacy_id = $8",
+    )
+    .bind(cin_id)
+    .bind(from_room_id)
+    .bind(to_room_id)
+    .bind(note)
+    .bind(change_date)
+    .bind(price)
+    .bind(toprice)
+    .bind(legacy_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+
+    if updated == 0 {
+        // Legacy-origin INSERT (no canonical row yet for this id).
+        sqlx::query(
+            "INSERT INTO ht_room_changes ( \
+                 rc_cin_id, rc_from_room_id, rc_to_room_id, rc_reason, \
+                 rc_changed_at, rc_room_before_price, rc_to_price, rc_legacy_id \
+             ) VALUES ( \
+                 $1, $2, $3, $4, \
+                 COALESCE($5::timestamp AT TIME ZONE 'Asia/Bangkok', NOW()), \
+                 COALESCE($6::numeric, 0), $7, $8 \
+             )",
+        )
+        .bind(cin_id)
+        .bind(from_room_id)
+        .bind(to_room_id)
+        .bind(note)
+        .bind(change_date)
+        .bind(price)
+        .bind(toprice)
+        .bind(legacy_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
 }
 
 // ─── HT_Bill_Debt_H ──────────────────────────────────────────────────
@@ -634,6 +771,30 @@ mod tests {
             );
             // No coalesce_key — mirrors are flat-table per-row dispatch.
             assert!(mapper.coalesce_key(&dummy_row()).is_none());
+        }
+    }
+
+    /// Track G4 / T4 HIGH-3 — `HT_Changed_Room` mapper must surface
+    /// every column the canonical `ht_room_changes` projection needs.
+    /// Refactor protection — dropping `Note` / `ToPrice` from the
+    /// projection would silently de-populate the audit detail.
+    #[test]
+    fn changed_room_mapper_projects_columns_for_canonical_upsert() {
+        let select = ChangedRoomMirrorMapper.select_sql();
+        for col in &[
+            "id",
+            "cin_no",
+            "room_before",
+            "room_after",
+            "change_date",
+            "room_before_price",
+            "Note",
+            "ToPrice",
+        ] {
+            assert!(
+                select.contains(col),
+                "select_sql must project {col}; got: {select}"
+            );
         }
     }
 
