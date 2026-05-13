@@ -326,6 +326,27 @@ CREATE TABLE IF NOT EXISTS ht_rates (
 CREATE INDEX IF NOT EXISTS ix_ht_rates_roomtype ON ht_rates(rate_room_type_id);
 CREATE INDEX IF NOT EXISTS ix_ht_rates_validdates ON ht_rates(rate_valid_from, rate_valid_to);
 
+-- ht_rate_tiers - Canonical (Room_Type, Cust_Type) pricing matrix
+-- (Track F4 / migration 042 — T1 CRIT-4 in audit-2026-05-13.md).
+-- Mirrors legacy `HT_Rooms_Price`. `ht_rates` (above) carries the wrong
+-- axis (weekday/weekend/special) and is being phased out — see the
+-- migration header for the deprecation plan.
+CREATE TABLE IF NOT EXISTS ht_rate_tiers (
+    rate_tier_id            BIGSERIAL       PRIMARY KEY,
+    rate_tier_room_type     VARCHAR(100)    NOT NULL,
+    rate_tier_cust_type     VARCHAR(100)    NOT NULL,
+    rate_tier_price         NUMERIC(12, 2)  NOT NULL,
+    rate_tier_price_hourly  NUMERIC(12, 2),
+    rate_tier_price_monthly NUMERIC(12, 2),
+    rate_tier_legacy_id     INTEGER,
+    rate_tier_active        BOOLEAN         NOT NULL DEFAULT TRUE,
+    rate_tier_created_at    TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    rate_tier_updated_at    TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_ht_rate_tiers_room_cust UNIQUE (rate_tier_room_type, rate_tier_cust_type)
+);
+CREATE INDEX IF NOT EXISTS ix_ht_rate_tiers_room_type
+    ON ht_rate_tiers (rate_tier_room_type);
+
 -- ht_settings - System settings
 CREATE TABLE IF NOT EXISTS ht_settings (
     setting_id SERIAL PRIMARY KEY,
@@ -1351,6 +1372,15 @@ ON CONFLICT (version) DO NOTHING;
 -- drift checker doesn't reapply on a fresh init.
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('038', '038_seed_vat_percent.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 042 — Track F4 / T1 CRIT-4. Canonical `ht_rate_tiers`
+-- (composite key on Room_Type × Cust_Type) mirrored to legacy
+-- `HT_Rooms_Price`. The DDL is inlined into the `ht_rate_tiers` CREATE
+-- TABLE block above; this seed marks the migration as applied for
+-- fresh deploys. (039-041 intentionally absent — never landed.)
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('042', '042_create_ht_rate_tiers.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================

@@ -31,6 +31,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "ht_checkins",
     "ht_guest_registry",
     "ht_rates",
+    "ht_rate_tiers",
     "ht_settings",
     "ht_booking_notes",
     "ht_inventory_categories",
