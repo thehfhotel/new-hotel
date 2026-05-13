@@ -1461,6 +1461,51 @@ async fn back_populate_legacy_ids(
                 .execute(pg)
                 .await?;
             }
+            // Track B4 — for multi-room folios the recipe returns one
+            // `HT_CheckIn_Ds.id` per junction room in
+            // `checkin_ds_ids_by_room`. Stamp each one onto the matching
+            // `ht_checkin_rooms` row so the next intent on the same
+            // folio (ExtendStay, RecordPayment by-room, CancelCheckIn
+            // by-room) can target the correct legacy row by id rather
+            // than re-deriving it from `(Cin_no, Cin_Room_No)`.
+            //
+            // Best-effort: a `room_no` that no longer exists in the
+            // junction (e.g. the orchestrator already dropped it as
+            // part of an edit) is a no-op. Single-room folios surface
+            // an empty array so the WHERE-NOT-NULL guard skips the
+            // UPDATE entirely.
+            if let Some(pairs) =
+                legacy_ids.get("checkin_ds_ids_by_room").and_then(|v| v.as_array())
+            {
+                for pair in pairs {
+                    let arr = match pair.as_array() {
+                        Some(a) if a.len() == 2 => a,
+                        _ => continue,
+                    };
+                    let pair_room_no = match arr[0].as_str() {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    let pair_ds_id = match arr[1].as_i64() {
+                        Some(n) => n as i32,
+                        None => continue,
+                    };
+                    sqlx::query(
+                        "UPDATE ht_checkin_rooms cr \
+                            SET cr_legacy_ds_id = $3, cr_updated_at = NOW() \
+                          FROM ht_checkins c, ht_rooms_new r \
+                          WHERE cr.cr_cin_id = c.cin_id \
+                            AND cr.cr_room_id = r.room_id \
+                            AND c.aggregate_id = $1 \
+                            AND r.room_no = $2",
+                    )
+                    .bind(aggregate_id)
+                    .bind(pair_room_no)
+                    .bind(pair_ds_id)
+                    .execute(pg)
+                    .await?;
+                }
+            }
         }
         // Track G2 / T4 CRIT-1 — refund back-population. Mirrors
         // RecordPayment but the recipe doesn't allocate a Receipt_no

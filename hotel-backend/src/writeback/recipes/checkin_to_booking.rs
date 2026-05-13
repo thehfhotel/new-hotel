@@ -35,7 +35,7 @@
 
 use chrono::{DateTime, NaiveDate, Utc};
 
-use crate::outbox::intent::CreateCheckInPayload;
+use crate::outbox::intent::{CreateCheckInPayload, RoomLine};
 use crate::writeback::allocate::{
     allocate_checkin_ds_id, allocate_cin_no, allocate_room_status_id, LegacyConn,
 };
@@ -74,6 +74,10 @@ pub struct CheckInToBookingInputs<'a> {
     pub nights_calendar: Vec<NaiveDate>,
     /// Pre-allocated `HT_CheckIn_Ds.id`. NOT IDENTITY (schema dump
     /// 2026-04-26) — caller must allocate via TABLOCKX MAX+1.
+    ///
+    /// Multi-room (Track B4): when `room_lines` is non-empty this is
+    /// the id for the FIRST room's `HT_CheckIn_Ds` row. Subsequent
+    /// rooms use sequential ids (`checkin_ds_id + 1`, +2, …).
     pub checkin_ds_id: i32,
     /// Optional `Tb_Save_Image.tmp_no` — see [`CreateCheckInPayload::photo_tmp_no`].
     pub photo_tmp_no: Option<&'a str>,
@@ -81,6 +85,12 @@ pub struct CheckInToBookingInputs<'a> {
     /// stays PURE — Wave 5b item 4. Drives `HT_CheckIn_H.Cin_Date`. Tests
     /// pass a fixed instant for exact byte-parity assertions.
     pub created_at: DateTime<Utc>,
+    /// Track B4 — per-room slice from `ht_checkin_rooms`. Empty ⇒
+    /// recipe emits the legacy single-room shape. Non-empty ⇒ recipe
+    /// emits one `HT_CheckIn_Ds` row per slice entry. See
+    /// [`crate::writeback::recipes::walkin::WalkInInputs::room_lines`]
+    /// for the full back-compat / cardinality contract.
+    pub room_lines: Vec<RoomLine>,
 }
 
 /// Build statements for a check-in linked to a booking. PURE — no I/O.
@@ -89,8 +99,6 @@ pub fn build_statements(inputs: &CheckInToBookingInputs<'_>) -> Vec<String> {
     let cust_no_q = sql_quote(inputs.cust_no);
     let book_id_q = sql_quote(inputs.book_id);
     let by_q = sql_quote(inputs.created_by);
-    let room_no_q = sql_quote(inputs.room_no);
-    let room_type_q = sql_quote(inputs.room_type);
     let cust_name_q = sql_quote(inputs.customer_name);
     let cust_phone_q = sql_quote(inputs.customer_phone.unwrap_or(""));
     let cust_type_q = sql_quote(CUST_TYPE_NORMAL);
@@ -112,12 +120,21 @@ pub fn build_statements(inputs: &CheckInToBookingInputs<'_>) -> Vec<String> {
     let country_q = sql_quote(inputs.guest_country);
     // Wave 6 LOW item 4: pre-format money to 2dp for consistency with the
     // HT_CheckIn_H VALUES and the rest of the recipe corpus.
-    let price = format!("{:.2}", inputs.price_per_night_baht);
     let total = format!("{:.2}", inputs.price_total_baht);
-    let nights = inputs.nights;
-    let room_all_q = sql_quote(&format!("{} ", inputs.room_no));
 
-    let mut statements: Vec<String> = Vec::with_capacity(9 + inputs.nights_calendar.len());
+    // Track B4 — derive the per-room slice. Empty ⇒ legacy single-room
+    // path falls back to the top-level fields (byte-identical pre-B4
+    // SQL); non-empty ⇒ N rooms apportioned out via the same loops.
+    let lines = effective_room_lines(inputs);
+    let room_all = lines
+        .iter()
+        .map(|l| format!("{} ", l.room_no))
+        .collect::<String>();
+    let room_all_q = sql_quote(&room_all);
+
+    let mut statements: Vec<String> = Vec::with_capacity(
+        9 + inputs.nights_calendar.len() * lines.len() + lines.len(),
+    );
 
     // 1. UPDATE HT_Customers — full 31-field re-save (verified from
     //    /tmp/legacy-events-full.log capture for Cust_no C21624 line
@@ -157,73 +174,104 @@ pub fn build_statements(inputs: &CheckInToBookingInputs<'_>) -> Vec<String> {
         ));
     }
 
-    // 2. HT_POWER_LOG — lights on
-    statements.push(format!(
-        "INSERT INTO [HT_POWER_LOG]([ROOM_NO],[ROOM_POWER_START],[ROOM_POWER_START_BY],\
-         [ROOM_POWER_END_BY],[ROOM_POWER_NOTE],[ROOM_POWER_NOTE2])\
-         VALUES({room_no_q},GETDATE(),{by_q},'',{power_note_q},'')"
-    ));
+    // Track B4 — per-room fan-out. Single-room (`lines.len() == 1`)
+    // collapses to the legacy pre-B4 shape byte-for-byte; multi-room
+    // fires the same statement template once per room.
 
-    // 3. HT_CheckIn_Ds — 16-col canonical legacy order (verified from
-    //    /tmp/legacy-events-full.log). `[Cin_dep_status]` lowercase
-    //    d-s, no `[Dep_by]`. `id` is NOT IDENTITY (schema dump
-    //    2026-04-26 confirmed).
-    let ds_id = inputs.checkin_ds_id;
-    statements.push(format!(
-        "INSERT INTO [HT_CheckIn_Ds]([id],[Cin_No],[Cin_Room_No],[Cin_Room_Type],[Cin_Room_In],\
-         [Cin_Room_Out],[Cin_Room_Status],[Cin_Room_Dep],[Cin_Room_Price],[Cin_Room_Night],\
-         [Cin_Room_PriceToTal],[Cin_Room_Pay_Before],[Cin_Room_Pay_Total],[Cin_note],\
-         [Cin_dep_status],[Cin_cupon])\
-         VALUES( {ds_id},{cin_no_q},{room_no_q},{room_type_q},{stay_start_q},{stay_end_q},\
-         {occupying_q},0,{price},{nights},{total},0,0,'',{dep_status_q},0)"
-    ));
-
-    // 4. Mark room occupied
-    statements.push(format!(
-        "update HT_Rooms set room_use='yes' where room_no={room_no_q}"
-    ));
-
-    // 5. UPDATE existing HT_Room_Status row(s) — §3d: no Cin_no filter, the
-    //    .NET app overwrites by (room_date, room_no). We do the same for parity.
-    if let Some(first_day) = inputs.nights_calendar.first() {
-        let first_date_q = sql_quote(&format_legacy_date(*first_day));
+    // 2. HT_POWER_LOG — lights on per room
+    for line in &lines {
+        let line_room_no_q = sql_quote(&line.room_no);
         statements.push(format!(
-            "update [HT_Room_Status] SET  [room_status]={room_status_q},\
-             [room_Details]={cust_name_q},[room_CheckIn_No]={cin_no_q} \
-             where room_date={first_date_q} and room_no={room_no_q}"
+            "INSERT INTO [HT_POWER_LOG]([ROOM_NO],[ROOM_POWER_START],[ROOM_POWER_START_BY],\
+             [ROOM_POWER_END_BY],[ROOM_POWER_NOTE],[ROOM_POWER_NOTE2])\
+             VALUES({line_room_no_q},GETDATE(),{by_q},'',{power_note_q},'')"
         ));
     }
 
-    // 6..N. HT_Room_Status for additional nights (skip the first — handled
-    //       by the UPDATE above per spike §3d).
-    //
-    // Wave 3 followup: each night must be an UPSERT, not a plain INSERT.
-    // The Wave 3 H7 fix made `booking_create` pre-insert HT_Room_Status
-    // rows for every booked night with status='จอง'. When a multi-night
-    // booking converts to a check-in, those rows already exist for nights
-    // 1..N — a plain INSERT would create duplicate rows (the table has no
-    // unique constraint per SCHEMA.sql inspection).
-    //
-    // The `IF EXISTS … UPDATE … ELSE INSERT` form matches the legacy app's
-    // "upsert per night" semantics (`COMPAT_CHEATSHEET.md:347-348`) in a
-    // single statement so we keep the recipe atomic and a future check-in
-    // that extends past the original booking's last night still works
-    // (the extra night has no pre-existing row, so it INSERTs).
-    for (i, day) in inputs.nights_calendar.iter().enumerate().skip(1) {
-        let id = inputs.room_status_id_base + (i as i32 - 1);
-        let date_q = sql_quote(&format_legacy_date(*day));
-        let oa = date_to_ole_serial(*day) as i64;
+    // 3. HT_CheckIn_Ds — one row per room. 16-col canonical legacy
+    //    order (verified from /tmp/legacy-events-full.log).
+    //    `[Cin_dep_status]` lowercase d-s, no `[Dep_by]`. `id` is NOT
+    //    IDENTITY (schema dump 2026-04-26 confirmed).
+    for (room_idx, line) in lines.iter().enumerate() {
+        let ds_id = inputs.checkin_ds_id + room_idx as i32;
+        let line_room_no_q = sql_quote(&line.room_no);
+        let line_room_type_q = sql_quote(&line.room_type);
+        let line_price = format!("{:.2}", line.price_per_night);
+        let line_total = format!("{:.2}", line.room_total);
+        let line_nights = line.nights;
+        // Per-room Thai status literal — preserve verbatim.
+        let line_status_q = if line.room_status.is_empty() {
+            occupying_q.clone()
+        } else {
+            sql_quote(&line.room_status)
+        };
         statements.push(format!(
-            "IF EXISTS (SELECT 1 FROM [HT_Room_Status] WHERE room_date={date_q} \
-             AND room_no={room_no_q}) \
-             UPDATE [HT_Room_Status] SET [room_status]={room_status_q},\
-             [room_Details]={cust_name_q},[room_CheckIn_No]={cin_no_q} \
-             WHERE room_date={date_q} AND room_no={room_no_q} \
-             ELSE \
-             INSERT INTO [HT_Room_Status]([id],[room_no],[room_date],[room_status],\
-             [room_Details],[room_CheckIn_No],[room_date_oa])\
-             VALUES({id},{room_no_q},{date_q},{room_status_q},{cust_name_q},{cin_no_q},{oa})"
+            "INSERT INTO [HT_CheckIn_Ds]([id],[Cin_No],[Cin_Room_No],[Cin_Room_Type],[Cin_Room_In],\
+             [Cin_Room_Out],[Cin_Room_Status],[Cin_Room_Dep],[Cin_Room_Price],[Cin_Room_Night],\
+             [Cin_Room_PriceToTal],[Cin_Room_Pay_Before],[Cin_Room_Pay_Total],[Cin_note],\
+             [Cin_dep_status],[Cin_cupon])\
+             VALUES( {ds_id},{cin_no_q},{line_room_no_q},{line_room_type_q},{stay_start_q},{stay_end_q},\
+             {line_status_q},0,{line_price},{line_nights},{line_total},0,0,'',{dep_status_q},0)"
         ));
+    }
+
+    // 4. Mark each room occupied
+    for line in &lines {
+        let line_room_no_q = sql_quote(&line.room_no);
+        statements.push(format!(
+            "update HT_Rooms set room_use='yes' where room_no={line_room_no_q}"
+        ));
+    }
+
+    // 5. UPDATE existing HT_Room_Status row(s) for night 0 — §3d: no
+    //    Cin_no filter, the .NET app overwrites by (room_date, room_no).
+    //    We do the same for parity, once per room.
+    if let Some(first_day) = inputs.nights_calendar.first() {
+        let first_date_q = sql_quote(&format_legacy_date(*first_day));
+        for line in &lines {
+            let line_room_no_q = sql_quote(&line.room_no);
+            statements.push(format!(
+                "update [HT_Room_Status] SET  [room_status]={room_status_q},\
+                 [room_Details]={cust_name_q},[room_CheckIn_No]={cin_no_q} \
+                 where room_date={first_date_q} and room_no={line_room_no_q}"
+            ));
+        }
+    }
+
+    // 6..N. HT_Room_Status for additional nights × rooms (skip night 0
+    //       — handled by the UPDATE block above per spike §3d).
+    //
+    // Wave 3 followup: each night must be an UPSERT, not a plain INSERT
+    // (booking_create pre-inserts night rows). The
+    // `IF EXISTS … UPDATE … ELSE INSERT` form matches the legacy app's
+    // "upsert per night" semantics (`COMPAT_CHEATSHEET.md:347-348`) and
+    // makes the recipe safe for both pre-existing and net-new nights.
+    //
+    // Multi-room id-base layout: `room_status_id_base + (room_idx *
+    // (nights-1)) + (night_idx - 1)`. The `(nights-1)` factor and
+    // `-1` offset reflect that night 0 is handled by the UPDATE above
+    // and consumes no id from the allocator.
+    let extra_nights = inputs.nights_calendar.len().saturating_sub(1) as i32;
+    for (room_idx, line) in lines.iter().enumerate() {
+        let line_room_no_q = sql_quote(&line.room_no);
+        for (night_idx, day) in inputs.nights_calendar.iter().enumerate().skip(1) {
+            let id = inputs.room_status_id_base
+                + (room_idx as i32 * extra_nights)
+                + (night_idx as i32 - 1);
+            let date_q = sql_quote(&format_legacy_date(*day));
+            let oa = date_to_ole_serial(*day) as i64;
+            statements.push(format!(
+                "IF EXISTS (SELECT 1 FROM [HT_Room_Status] WHERE room_date={date_q} \
+                 AND room_no={line_room_no_q}) \
+                 UPDATE [HT_Room_Status] SET [room_status]={room_status_q},\
+                 [room_Details]={cust_name_q},[room_CheckIn_No]={cin_no_q} \
+                 WHERE room_date={date_q} AND room_no={line_room_no_q} \
+                 ELSE \
+                 INSERT INTO [HT_Room_Status]([id],[room_no],[room_date],[room_status],\
+                 [room_Details],[room_CheckIn_No],[room_date_oa])\
+                 VALUES({id},{line_room_no_q},{date_q},{room_status_q},{cust_name_q},{cin_no_q},{oa})"
+            ));
+        }
     }
 
     // 7. HT_CheckIn_Other_People — TM.30 primary guest
@@ -268,8 +316,26 @@ pub fn build_statements(inputs: &CheckInToBookingInputs<'_>) -> Vec<String> {
     //     literal SQL stays identical.
     statements.push(super::helpers::mark_cupon_printed(inputs.cin_no));
 
-    let _ = price; // silence: kept on inputs for future per-night reporting
     statements
+}
+
+/// Track B4 — derive the effective per-room slice (mirrors
+/// [`crate::writeback::recipes::walkin::effective_room_lines`]). Empty
+/// `inputs.room_lines` synthesizes a single-line slice from the top-
+/// level fields so single-room callers see no byte-level diff.
+fn effective_room_lines(inputs: &CheckInToBookingInputs<'_>) -> Vec<RoomLine> {
+    if !inputs.room_lines.is_empty() {
+        return inputs.room_lines.clone();
+    }
+    vec![RoomLine {
+        room_no: inputs.room_no.to_string(),
+        room_type: inputs.room_type.to_string(),
+        price_per_night: inputs.price_per_night_baht,
+        nights: inputs.nights,
+        room_total: inputs.price_total_baht,
+        room_status: String::new(),
+        legacy_ds_id: None,
+    }]
 }
 
 /// Execute the check-in-to-booking recipe.
@@ -307,8 +373,11 @@ pub async fn execute(
     })?;
     let cin_no = allocate_cin_no(conn).await?;
     let room_status_id_base = allocate_room_status_id(conn).await?;
-    // HT_CheckIn_Ds.id is NOT IDENTITY (schema dump 2026-04-26).
-    let checkin_ds_id = allocate_checkin_ds_id(conn).await?;
+    // Track B4 — first ds id under TABLOCKX. The lock is held for the
+    // full transaction so sequential ids checkin_ds_id_base + room_idx
+    // are reserved for the rest of the per-room fan-out (no second
+    // round-trip needed).
+    let checkin_ds_id_base = allocate_checkin_ds_id(conn).await?;
 
     // Wave 6 LOW item 6: empty range surfaces as error rather than silently
     // injecting a phantom night; cap-truncate logs WARN.
@@ -339,20 +408,29 @@ pub async fn execute(
         price_total_baht,
         room_status_id_base,
         nights_calendar,
-        checkin_ds_id,
+        checkin_ds_id: checkin_ds_id_base,
         photo_tmp_no: payload.photo_tmp_no.as_deref(),
         created_at,
+        room_lines: payload.room_lines.clone(),
     };
     let statements = build_statements(&inputs);
     super::execute_all(conn, &statements).await?;
 
     let _ = DEFAULT_OPERATOR; // silence unused-import lint
+    // Track B4 — record per-room (room_no, ds_id) mapping.
+    let lines = effective_room_lines(&inputs);
     let mut ids = LegacyIds::new()
         .with_cin_no(cin_no.clone())
         .with_cust_no(cust_no.clone())
         .with_book_id(book_id.to_string())
         .with_room_no(payload.room_no.clone())
-        .with_checkin_ds_id(checkin_ds_id);
+        .with_checkin_ds_id(checkin_ds_id_base);
+    for (room_idx, line) in lines.iter().enumerate() {
+        ids = ids.with_room_ds_id(
+            line.room_no.clone(),
+            checkin_ds_id_base + room_idx as i32,
+        );
+    }
     ids.extra
         .insert("room_status_id_base".into(), serde_json::Value::from(room_status_id_base));
     Ok(ids)
@@ -387,6 +465,8 @@ mod tests {
             ],
             checkin_ds_id: 25009,
             photo_tmp_no: None,
+            // Track B4 — empty slice ⇒ legacy single-room path.
+            room_lines: Vec::new(),
             // Wave 5b item 4: fixed instant for deterministic tests.
             created_at: Utc.with_ymd_and_hms(2026, 4, 24, 10, 23, 2).unwrap(),
         }
@@ -417,6 +497,8 @@ mod tests {
             nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],
             checkin_ds_id: 25014,
             photo_tmp_no: None,
+            // Track B4 — empty slice ⇒ legacy single-room path.
+            room_lines: Vec::new(),
             // Wave 5b item 4: pin `Cin_Date` to the captured wall-clock
             // (4/25/2026 11:32:02 AM Bangkok = 04:32:02 UTC) for exact
             // byte-parity below.

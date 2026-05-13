@@ -357,6 +357,56 @@ pub struct CreateCheckInPayload {
     /// legacy photo-attachment flow intact. None ⇒ skip the UPDATE.
     #[serde(default)]
     pub photo_tmp_no: Option<String>,
+
+    /// Track B4 / T2 CRIT-1 — per-room slice from the canonical
+    /// `ht_checkin_rooms` junction. When non-empty, the recipe emits
+    /// **one `HT_CheckIn_Ds` INSERT per `RoomLine`** (plus a single
+    /// `HT_CheckIn_H` header carrying every room number in
+    /// `Cin_Room_ALL`) — closing the multi-room writeback blind spot
+    /// captured in `docs/coexistence/audit-2026-05-13.md` T2 CRIT-1.
+    ///
+    /// Empty `Vec` ⇒ fall back to the prior single-room behavior using
+    /// the top-level `room_no` / `room_type` / `price_per_night` /
+    /// `nights` / `price_total` fields. Routes / services that haven't
+    /// migrated to the junction yet leave this empty; back-compat is
+    /// preserved both at the recipe layer and at the wire (serde
+    /// default).
+    #[serde(default)]
+    pub room_lines: Vec<RoomLine>,
+}
+
+/// Track B4 — one room slice for a multi-room check-in folio. Mirrors
+/// the canonical `ht_checkin_rooms` row that the sync mapper / dashboard
+/// readers already walk (Track B2 + B3). When the service layer enqueues
+/// a `CreateCheckIn` intent it reads the junction and packs the rows here
+/// so the writeback recipe emits one `HT_CheckIn_Ds` row per junction row.
+///
+/// `legacy_ds_id` is `Some(_)` for an existing `HT_CheckIn_Ds.id` (edit
+/// path — UPDATE that row) and `None` for new junction rows the recipe
+/// must INSERT under a freshly-allocated id. The recipe writes the
+/// newly-allocated id back via `LegacyIds.checkin_ds_ids_by_room`, and
+/// the worker stamps it into `ht_checkin_rooms.cr_legacy_ds_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomLine {
+    pub room_no: String,
+    pub room_type: String,
+    /// Per-room rate in baht — lands in `HT_CheckIn_Ds.Cin_Room_Price`.
+    pub price_per_night: f64,
+    /// Nights for THIS room (may differ from the folio total when a
+    /// guest extends only one of N rooms).
+    pub nights: i32,
+    /// Per-room total in baht — lands in `HT_CheckIn_Ds.Cin_Room_PriceToTal`.
+    pub room_total: f64,
+    /// Thai status literal preserved verbatim — passed straight into
+    /// `Cin_Room_Status` (e.g. `'เข้าพัก'`, `'จอง'`). Empty string ⇒
+    /// recipe uses the recipe-level default (`'เข้าพัก'` for active stay).
+    #[serde(default)]
+    pub room_status: String,
+    /// Existing `HT_CheckIn_Ds.id` for the edit path — `Some(_)` ⇒ recipe
+    /// emits an UPDATE; `None` ⇒ recipe INSERTs a new row under an
+    /// allocator-minted id.
+    #[serde(default)]
+    pub legacy_ds_id: Option<i32>,
 }
 
 impl WritebackIntent {
@@ -474,6 +524,92 @@ mod tests {
             }
             other => panic!("expected CheckOut variant, got {other:?}"),
         }
+    }
+
+    /// Track B4 — pre-B4 outbox events carry no `room_lines` field. The
+    /// `#[serde(default)]` annotation must keep them deserializable so the
+    /// queue drains without manual replay after deploy; the recipe then
+    /// falls back to the legacy single-room shape via the
+    /// `effective_room_lines` synthesis.
+    #[test]
+    fn create_check_in_payload_deserializes_pre_b4_without_room_lines() {
+        let legacy_json = r#"{
+            "customer_id":"550e8400-e29b-41d4-a716-446655440000",
+            "legacy_cust_no":"C21607",
+            "linked_booking_id":null,
+            "linked_legacy_book_id":null,
+            "room_no":"402",
+            "room_type":"Standard",
+            "stay":{"start":"2026-04-24T09:56:20Z","end":"2026-04-25T11:59:59Z"},
+            "price_per_night":89000,
+            "nights":1,
+            "price_total":89000,
+            "created_by":"Admin",
+            "guest_name_for_registry":"SPIKE TEST",
+            "guest_country":""
+        }"#;
+        let payload: CreateCheckInPayload = serde_json::from_str(legacy_json)
+            .expect("pre-B4 CreateCheckIn payload must still deserialize");
+        assert!(
+            payload.room_lines.is_empty(),
+            "missing room_lines must default to empty vec"
+        );
+        assert_eq!(payload.room_no, "402");
+    }
+
+    /// Track B4 — round-trip a multi-room payload. The `room_lines` field
+    /// serializes/deserializes as a top-level JSON array of structured
+    /// objects (mirrors `ht_checkin_rooms`).
+    #[test]
+    fn create_check_in_payload_roundtrips_multi_room_slice() {
+        use chrono::TimeZone;
+        let payload = CreateCheckInPayload {
+            customer_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
+            legacy_cust_no: Some("C21607".into()),
+            linked_booking_id: None,
+            linked_legacy_book_id: None,
+            room_no: "508".into(),
+            room_type: "Standard".into(),
+            stay: crate::domain::shared::DateRange {
+                start: chrono::Utc.with_ymd_and_hms(2026, 4, 24, 3, 1, 11).unwrap(),
+                end: chrono::Utc.with_ymd_and_hms(2026, 4, 25, 4, 59, 59).unwrap(),
+            },
+            price_per_night: Money::from_satang(89000),
+            nights: 1,
+            price_total: Money::from_satang(178000),
+            created_by: "Admin".into(),
+            guest_name_for_registry: "MULTI ROOM GUEST".into(),
+            guest_country: "".into(),
+            customer_phone: None,
+            photo_tmp_no: None,
+            room_lines: vec![
+                RoomLine {
+                    room_no: "508".into(),
+                    room_type: "Standard".into(),
+                    price_per_night: 890.0,
+                    nights: 1,
+                    room_total: 890.0,
+                    room_status: String::new(),
+                    legacy_ds_id: None,
+                },
+                RoomLine {
+                    room_no: "509".into(),
+                    room_type: "Standard".into(),
+                    price_per_night: 890.0,
+                    nights: 1,
+                    room_total: 890.0,
+                    room_status: String::new(),
+                    legacy_ds_id: Some(25101),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&payload).expect("must serialize");
+        let parsed: CreateCheckInPayload =
+            serde_json::from_str(&json).expect("must round-trip");
+        assert_eq!(parsed.room_lines.len(), 2);
+        assert_eq!(parsed.room_lines[0].room_no, "508");
+        assert_eq!(parsed.room_lines[1].room_no, "509");
+        assert_eq!(parsed.room_lines[1].legacy_ds_id, Some(25101));
     }
 
     /// Wave-2 emissions carry the full totals payload so the recipe writes

@@ -566,6 +566,13 @@ impl CheckInService {
             customer_phone: ctx.customer_phone.clone(),
             // photo plumbing arrives in a follow-up — see audit HIGH-3.
             photo_tmp_no: None,
+            // Track B4 — multi-room slice. Empty for now; populated by
+            // the multi-room walk-in route (T4 HIGH-1) when it lands.
+            // Today the create-check-in flow is single-room so the
+            // recipe falls back to the legacy `room_no` / `room_type`
+            // top-level fields (the synthetic single-line slice in
+            // `effective_room_lines`).
+            room_lines: Vec::new(),
         };
         let intent = WritebackIntent::CreateCheckIn {
             check_in_id: aggregate_id,

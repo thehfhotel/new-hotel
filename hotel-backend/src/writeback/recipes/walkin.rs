@@ -35,7 +35,7 @@
 
 use chrono::{DateTime, NaiveDate, Utc};
 
-use crate::outbox::intent::CreateCheckInPayload;
+use crate::outbox::intent::{CreateCheckInPayload, RoomLine};
 use crate::writeback::allocate::{
     allocate_checkin_ds_id, allocate_cin_no, allocate_cust_no, allocate_customer_id,
     allocate_room_status_id, LegacyConn,
@@ -77,6 +77,12 @@ pub struct WalkInInputs<'a> {
     /// schema dump (2026-04-26 inspect_schema) confirms this column is NOT
     /// IDENTITY — `int NOT NULL default=NULL`. INSERTs without explicit `id`
     /// fail; the recipe must allocate via TABLOCKX MAX+1 and pass it here.
+    ///
+    /// Multi-room (Track B4): when `room_lines` is non-empty this is the
+    /// id for the FIRST room's `HT_CheckIn_Ds` row. Subsequent rows use
+    /// sequential ids (`checkin_ds_id + 1`, +2, …) — `execute()` allocates
+    /// them under a single TABLOCKX MAX+1 sweep so the values stay
+    /// contiguous and race-safe.
     pub checkin_ds_id: i32,
     pub nights_calendar: Vec<NaiveDate>,
     /// Optional `Tb_Save_Image.tmp_no` — see [`CreateCheckInPayload::photo_tmp_no`].
@@ -86,6 +92,14 @@ pub struct WalkInInputs<'a> {
     /// `HT_Customers.Cust_Last_Change` (the latter as a Bangkok-local date).
     /// Tests pass a fixed instant for exact byte-parity assertions.
     pub created_at: DateTime<Utc>,
+    /// Track B4 — per-room slice from `ht_checkin_rooms`. Empty ⇒
+    /// recipe emits the legacy single-room shape using the top-level
+    /// `room_no` / `room_type` / `price_per_night_baht` / `nights` /
+    /// `price_total_baht` fields. Non-empty ⇒ recipe emits one
+    /// `HT_CheckIn_Ds` + `HT_POWER_LOG` row per slice entry, allocates
+    /// `room_lines.len()` sequential ds_ids starting at `checkin_ds_id`,
+    /// and concatenates room numbers into a single `HT_CheckIn_H.Cin_Room_ALL`.
+    pub room_lines: Vec<RoomLine>,
 }
 
 /// Build the statements for a walk-in. PURE — no I/O.
@@ -93,8 +107,6 @@ pub fn build_statements(inputs: &WalkInInputs<'_>) -> Vec<String> {
     let cin_no_q = sql_quote(inputs.cin_no);
     let cust_no_q = sql_quote(inputs.cust_no);
     let by_q = sql_quote(inputs.created_by);
-    let room_no_q = sql_quote(inputs.room_no);
-    let room_type_q = sql_quote(inputs.room_type);
     let cust_name_q = sql_quote(inputs.customer_name);
     let cust_phone_q = sql_quote(inputs.customer_phone.unwrap_or(""));
     let cust_type_q = sql_quote(CUST_TYPE_NORMAL);
@@ -123,16 +135,27 @@ pub fn build_statements(inputs: &WalkInInputs<'_>) -> Vec<String> {
     let cust_id = inputs.customer_id_int;
     // Wave 6 LOW item 4: pre-format money to 2dp for consistency with the
     // HT_CheckIn_H VALUES and the rest of the recipe corpus.
-    let price = format!("{:.2}", inputs.price_per_night_baht);
     let total = format!("{:.2}", inputs.price_total_baht);
-    let nights = inputs.nights;
-    // Cin_Room_ALL carries the room number with a trailing space — the
-    // .NET app concatenates room numbers separated by spaces and the
-    // single-room form keeps the trailing pad.
-    let room_all = format!("{} ", inputs.room_no);
+
+    // Track B4 — derive the per-room slice. Empty `room_lines` falls back
+    // to the legacy single-room shape using the top-level fields so the
+    // recipe stays byte-identical for callers that haven't migrated to
+    // the junction yet (legacy spike captures, pre-B4 outbox events).
+    let lines = effective_room_lines(inputs);
+    let primary_room_no = lines[0].room_no.as_str();
+    let primary_room_no_q = sql_quote(primary_room_no);
+    // `Cin_Room_ALL`: legacy capture pattern is space-separated room
+    // numbers with a trailing space (single-room `'402 '`; multi-room
+    // `'508 509 '`). The same byte-for-byte shape covers both.
+    let room_all = lines
+        .iter()
+        .map(|l| format!("{} ", l.room_no))
+        .collect::<String>();
     let room_all_q = sql_quote(&room_all);
 
-    let mut statements: Vec<String> = Vec::with_capacity(8 + inputs.nights_calendar.len());
+    let mut statements: Vec<String> = Vec::with_capacity(
+        8 + inputs.nights_calendar.len() * lines.len() + lines.len(),
+    );
 
     // 1. HT_Customers — new customer for the walk-in. 30 columns in the
     //    legacy app's canonical order (verified from
@@ -168,43 +191,91 @@ pub fn build_statements(inputs: &WalkInInputs<'_>) -> Vec<String> {
         ));
     }
 
-    // 2. Mark room occupied — by room_no per spike §3a
-    statements.push(format!(
-        "update HT_Rooms set room_use='yes' where room_no={room_no_q}"
-    ));
+    // Track B4 — per-room fan-out. For a single-room folio `lines.len()
+    // == 1` and the loops collapse to one HT_Rooms / HT_CheckIn_Ds /
+    // HT_POWER_LOG / N×HT_Room_Status statements — byte-identical to the
+    // pre-B4 single-room recipe. For multi-room (`lines.len() == N`) the
+    // recipe emits N of each room-scoped statement.
+    //
+    // Sequential ds_id allocation: the caller (`execute()`) acquires a
+    // single `MAX(id)+1` under TABLOCKX, then we assign +0, +1, … +(N-1)
+    // to each room. Holding the lock once per folio keeps the race-safety
+    // guarantee from the spike §6 proof and avoids N round-trips for the
+    // common 1- or 2-room walk-in.
 
-    // 3. HT_CheckIn_Ds — 16 cols in legacy order (verified from
-    //    /tmp/legacy-events-full.log). `[Cin_dep_status]` is lowercase
-    //    d-s in the legacy SQL; `[Dep_by]` is NOT in the column list.
-    //    `id` is NOT IDENTITY (schema dump 2026-04-26 confirmed).
-    let ds_id = inputs.checkin_ds_id;
-    statements.push(format!(
-        "INSERT INTO [HT_CheckIn_Ds]([id],[Cin_No],[Cin_Room_No],[Cin_Room_Type],[Cin_Room_In],\
-         [Cin_Room_Out],[Cin_Room_Status],[Cin_Room_Dep],[Cin_Room_Price],[Cin_Room_Night],\
-         [Cin_Room_PriceToTal],[Cin_Room_Pay_Before],[Cin_Room_Pay_Total],[Cin_note],\
-         [Cin_dep_status],[Cin_cupon])\
-         VALUES( {ds_id},{cin_no_q},{room_no_q},{room_type_q},{stay_start_q},{stay_end_q},\
-         {occupying_q},0,{price},{nights},{total},0,0,'',{dep_status_q},0)"
-    ));
-
-    // 4. HT_POWER_LOG — lights on with check-in note
-    statements.push(format!(
-        "INSERT INTO [HT_POWER_LOG]([ROOM_NO],[ROOM_POWER_START],[ROOM_POWER_START_BY],\
-         [ROOM_POWER_END_BY],[ROOM_POWER_NOTE],[ROOM_POWER_NOTE2])\
-         VALUES({room_no_q},GETDATE(),{by_q},'',{power_note_q},'')"
-    ));
-
-    // 5..N. HT_Room_Status — one row per calendar night
-    for (i, day) in inputs.nights_calendar.iter().enumerate() {
-        let id = inputs.room_status_id_base + i as i32;
-        let date_q = sql_quote(&format_legacy_date(*day));
-        let oa = date_to_ole_serial(*day) as i64;
+    // 2. Mark each room occupied — by room_no per spike §3a
+    for line in &lines {
+        let line_room_no_q = sql_quote(&line.room_no);
         statements.push(format!(
-            "INSERT INTO [HT_Room_Status]([id],[room_no],[room_date],[room_status],\
-             [room_Details],[room_CheckIn_No],[room_date_oa])\
-             VALUES({id},{room_no_q},{date_q},{room_status_q},{cust_name_q},{cin_no_q},{oa})"
+            "update HT_Rooms set room_use='yes' where room_no={line_room_no_q}"
         ));
     }
+
+    // 3. HT_CheckIn_Ds — one row per room. 16 cols in legacy order
+    //    (verified from /tmp/legacy-events-full.log). `[Cin_dep_status]`
+    //    is lowercase d-s; `[Dep_by]` is NOT in the column list. `id` is
+    //    NOT IDENTITY (schema dump 2026-04-26 confirmed). Per-room
+    //    `Cin_Room_Status` is passed through verbatim from the junction
+    //    so Thai literals (`'เข้าพัก'`, `'จอง'`) preserve byte-for-byte.
+    for (room_idx, line) in lines.iter().enumerate() {
+        let ds_id = inputs.checkin_ds_id + room_idx as i32;
+        let line_room_no_q = sql_quote(&line.room_no);
+        let line_room_type_q = sql_quote(&line.room_type);
+        let line_price = format!("{:.2}", line.price_per_night);
+        let line_total = format!("{:.2}", line.room_total);
+        let line_nights = line.nights;
+        // Per-room Thai status literal — preserve verbatim. Falls back
+        // to the recipe-level `'เข้าพัก'` when the slice omits the field
+        // (single-room legacy path).
+        let line_status_q = if line.room_status.is_empty() {
+            occupying_q.clone()
+        } else {
+            sql_quote(&line.room_status)
+        };
+        statements.push(format!(
+            "INSERT INTO [HT_CheckIn_Ds]([id],[Cin_No],[Cin_Room_No],[Cin_Room_Type],[Cin_Room_In],\
+             [Cin_Room_Out],[Cin_Room_Status],[Cin_Room_Dep],[Cin_Room_Price],[Cin_Room_Night],\
+             [Cin_Room_PriceToTal],[Cin_Room_Pay_Before],[Cin_Room_Pay_Total],[Cin_note],\
+             [Cin_dep_status],[Cin_cupon])\
+             VALUES( {ds_id},{cin_no_q},{line_room_no_q},{line_room_type_q},{stay_start_q},{stay_end_q},\
+             {line_status_q},0,{line_price},{line_nights},{line_total},0,0,'',{dep_status_q},0)"
+        ));
+    }
+
+    // 4. HT_POWER_LOG — lights on per room with check-in note
+    for line in &lines {
+        let line_room_no_q = sql_quote(&line.room_no);
+        statements.push(format!(
+            "INSERT INTO [HT_POWER_LOG]([ROOM_NO],[ROOM_POWER_START],[ROOM_POWER_START_BY],\
+             [ROOM_POWER_END_BY],[ROOM_POWER_NOTE],[ROOM_POWER_NOTE2])\
+             VALUES({line_room_no_q},GETDATE(),{by_q},'',{power_note_q},'')"
+        ));
+    }
+
+    // 5..N. HT_Room_Status — one row per (room, calendar night). Ids are
+    //       sequential across the full Cartesian product: room0×night0,
+    //       room0×night1, …, room0×nightN-1, room1×night0, … (caller
+    //       allocates `nights × rooms` ids in one TABLOCKX sweep).
+    for (room_idx, line) in lines.iter().enumerate() {
+        let line_room_no_q = sql_quote(&line.room_no);
+        for (night_idx, day) in inputs.nights_calendar.iter().enumerate() {
+            let id = inputs.room_status_id_base
+                + (room_idx as i32 * inputs.nights_calendar.len() as i32)
+                + night_idx as i32;
+            let date_q = sql_quote(&format_legacy_date(*day));
+            let oa = date_to_ole_serial(*day) as i64;
+            statements.push(format!(
+                "INSERT INTO [HT_Room_Status]([id],[room_no],[room_date],[room_status],\
+                 [room_Details],[room_CheckIn_No],[room_date_oa])\
+                 VALUES({id},{line_room_no_q},{date_q},{room_status_q},{cust_name_q},{cin_no_q},{oa})"
+            ));
+        }
+    }
+    // Silence: `primary_room_no_q` is read below in the header build for
+    // back-compat clarity; suppress the unused-var lint when the header
+    // path doesn't reference it directly.
+    let _ = &primary_room_no_q;
+    let _ = primary_room_no;
 
     // N+1. HT_CheckIn_Other_People — TM.30 primary guest row
     statements.push(format!(
@@ -237,8 +308,27 @@ pub fn build_statements(inputs: &WalkInInputs<'_>) -> Vec<String> {
     // emit byte-identical SQL.
     statements.push(super::helpers::mark_cupon_printed(inputs.cin_no));
 
-    let _ = price; // silence: kept on PaymentInputs for future per-night reporting
     statements
+}
+
+/// Track B4 — derive the effective per-room slice. When `inputs.room_lines`
+/// is non-empty we trust the caller's canonical slice from
+/// `ht_checkin_rooms` verbatim. When empty (single-room legacy path)
+/// we synthesize a one-line slice from the top-level fields so every
+/// downstream emitter loops the same shape.
+fn effective_room_lines(inputs: &WalkInInputs<'_>) -> Vec<RoomLine> {
+    if !inputs.room_lines.is_empty() {
+        return inputs.room_lines.clone();
+    }
+    vec![RoomLine {
+        room_no: inputs.room_no.to_string(),
+        room_type: inputs.room_type.to_string(),
+        price_per_night: inputs.price_per_night_baht,
+        nights: inputs.nights,
+        room_total: inputs.price_total_baht,
+        room_status: String::new(),
+        legacy_ds_id: None,
+    }]
 }
 
 /// Execute the walk-in recipe.
@@ -278,10 +368,16 @@ pub async fn execute(
     let cust_id_int = allocate_customer_id(conn).await?;
     let cin_no = allocate_cin_no(conn).await?;
     let room_status_id_base = allocate_room_status_id(conn).await?;
-    // Allocate HT_CheckIn_Ds.id under TABLOCKX. Schema dump 2026-04-26
-    // confirmed this column is NOT IDENTITY despite the spike's earlier
-    // note — INSERT must provide an explicit value.
-    let checkin_ds_id = allocate_checkin_ds_id(conn).await?;
+    // Track B4 — allocate the FIRST `HT_CheckIn_Ds.id` under TABLOCKX
+    // and use it as the base for sequential per-room ids. The single
+    // TABLOCKX sweep keeps the spike §6 race-safety guarantee even when
+    // the recipe emits N rows in one folio (the tail ids are guaranteed
+    // free because TABLOCKX is held until commit).
+    //
+    // Schema dump 2026-04-26 confirmed `HT_CheckIn_Ds.id` is NOT IDENTITY
+    // despite the spike's earlier note — INSERT must provide an explicit
+    // value.
+    let checkin_ds_id_base = allocate_checkin_ds_id(conn).await?;
 
     // Wave 6 LOW item 6: empty range surfaces as error rather than silently
     // injecting a phantom night; cap-truncate logs WARN.
@@ -310,19 +406,34 @@ pub async fn execute(
         price_total_baht,
         room_status_id_base,
         nights_calendar,
-        checkin_ds_id,
+        checkin_ds_id: checkin_ds_id_base,
         photo_tmp_no: payload.photo_tmp_no.as_deref(),
         created_at,
+        room_lines: payload.room_lines.clone(),
     };
     let statements = build_statements(&inputs);
     super::execute_all(conn, &statements).await?;
 
     let _ = DEFAULT_OPERATOR; // silence unused-import lint
+
+    // Track B4 — record the per-room (room_no, ds_id) mapping for
+    // `ht_checkin_rooms.cr_legacy_ds_id` back-population. Single-room
+    // folios still surface the legacy `checkin_ds_id` field (back-compat
+    // with ExtendStay / CheckOut single-row consumers); multi-room
+    // folios populate both `checkin_ds_id` (= first room's id) AND the
+    // full mapping.
+    let lines = effective_room_lines(&inputs);
     let mut ids = LegacyIds::new()
         .with_cin_no(cin_no.clone())
         .with_cust_no(cust_no.clone())
         .with_room_no(payload.room_no.clone())
-        .with_checkin_ds_id(checkin_ds_id);
+        .with_checkin_ds_id(checkin_ds_id_base);
+    for (room_idx, line) in lines.iter().enumerate() {
+        ids = ids.with_room_ds_id(
+            line.room_no.clone(),
+            checkin_ds_id_base + room_idx as i32,
+        );
+    }
     ids.extra
         .insert("customer_id_int".into(), serde_json::Value::from(cust_id_int));
     ids.extra
@@ -359,6 +470,9 @@ mod tests {
             // Wave 5b item 4: fixed instant for byte-parity tests.
             // 9:56:20 UTC = 4:56:20 PM Bangkok.
             created_at: Utc.with_ymd_and_hms(2026, 4, 24, 9, 56, 20).unwrap(),
+            // Track B4 — empty slice ⇒ legacy single-room path. Multi-
+            // room tests construct their own inputs with `room_lines` set.
+            room_lines: Vec::new(),
         }
     }
 
@@ -394,6 +508,7 @@ mod tests {
             // (4/25/2026 4:12:18 PM Bangkok = 09:12:18 UTC) so the legacy
             // capture-byte-parity assertion below can use exact equality.
             created_at: Utc.with_ymd_and_hms(2026, 4, 25, 9, 12, 18).unwrap(),
+            room_lines: Vec::new(),
         }
     }
 
