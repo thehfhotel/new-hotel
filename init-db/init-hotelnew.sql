@@ -469,7 +469,33 @@ INSERT INTO ht_inventory_categories (cat_name, cat_description) VALUES
     ('Equipment', 'อุปกรณ์ในห้องพัก')
 ON CONFLICT DO NOTHING;
 
+-- ht_products (Track F3 — migration 041)
+-- Canonical mirror of legacy `HT_Products`. 1:1 on prod_legacy_no = Pro_no.
+-- The sync mapper (`hotel-backend/src/sync/mappers/products.rs`) populates
+-- this via periodic poll. The writeback recipe `adjust_product_stock`
+-- updates `HT_Products.Pro_Amt` so the stock invariant closes from our
+-- app's writes (legacy continues to maintain Pro_Amt for its own sales).
+CREATE TABLE IF NOT EXISTS ht_products (
+    prod_id           BIGSERIAL PRIMARY KEY,
+    prod_legacy_no    VARCHAR(50)  NOT NULL UNIQUE,
+    prod_name         VARCHAR(250) NOT NULL,
+    prod_unit         VARCHAR(50),
+    prod_price        NUMERIC(12,2) NOT NULL DEFAULT 0,
+    prod_current_stock NUMERIC(12,3) NOT NULL DEFAULT 0,
+    prod_category     VARCHAR(100),
+    prod_active       BOOLEAN NOT NULL DEFAULT TRUE,
+    aggregate_id      UUID,
+    prod_created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    prod_updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS ht_products_legacy_no ON ht_products(prod_legacy_no);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ht_products_aggregate_id
+    ON ht_products (aggregate_id) WHERE aggregate_id IS NOT NULL;
+
 -- ht_inventory_items
+-- `inv_product_id` is the Track F3 FK (migration 041) — housekeeping/POS
+-- items optionally link to the canonical `ht_products` row. Nullable so
+-- the legacy Minibar/Amenities/Linens/Equipment seeds stay un-linked.
 CREATE TABLE IF NOT EXISTS ht_inventory_items (
     item_id SERIAL PRIMARY KEY,
     item_code VARCHAR(50) NOT NULL UNIQUE,
@@ -481,10 +507,14 @@ CREATE TABLE IF NOT EXISTS ht_inventory_items (
     item_cost DECIMAL(10,2),
     item_active BOOLEAN DEFAULT true,
     item_created TIMESTAMP DEFAULT NOW(),
-    item_updated TIMESTAMP
+    item_updated TIMESTAMP,
+    inv_product_id INTEGER REFERENCES ht_products(prod_id) ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS ix_ht_inventory_items_category ON ht_inventory_items(item_category_id);
 CREATE INDEX IF NOT EXISTS ix_ht_inventory_items_code ON ht_inventory_items(item_code);
+CREATE INDEX IF NOT EXISTS ix_ht_inventory_items_product
+    ON ht_inventory_items(inv_product_id)
+    WHERE inv_product_id IS NOT NULL;
 
 -- ht_room_inventory
 CREATE TABLE IF NOT EXISTS ht_room_inventory (
@@ -1418,11 +1448,19 @@ INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('039', '039_create_ht_room_calendar.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
+-- Migration 041 — Track F3 / T1 CRIT-3. `ht_products` canonical mirror of
+-- `HT_Products` + `ht_inventory_items.inv_product_id` FK linkage already
+-- applied inline above (see the inventory section). Record the version so
+-- the drift checker doesn't reapply on a fresh init.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('041', '041_create_ht_products.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
 -- Migration 042 — Track F4 / T1 CRIT-4. Canonical `ht_rate_tiers`
 -- (composite key on Room_Type × Cust_Type) mirrored to legacy
 -- `HT_Rooms_Price`. The DDL is inlined into the `ht_rate_tiers` CREATE
 -- TABLE block above; this seed marks the migration as applied for
--- fresh deploys. (040-041 intentionally absent — never landed.)
+-- fresh deploys. (040 intentionally absent — never landed.)
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('042', '042_create_ht_rate_tiers.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;

@@ -901,6 +901,11 @@ async fn resolve_legacy_ids(
                 }
             }
         }
+        // Track F3 — AdjustProductStock carries the legacy `Pro_no`
+        // business key directly in its payload (product master is keyed
+        // on the same value on both sides). No PG lookup or self-heal
+        // is required at this layer.
+        AdjustProductStock { .. } => {}
     }
     Ok(resolved)
 }
@@ -1455,6 +1460,12 @@ async fn back_populate_legacy_ids(
         MarkRoomClean { .. } => {
             // mark_clean doesn't allocate any new legacy IDs.
         }
+        // Track F3 — AdjustProductStock targets an existing
+        // `HT_Products` row by `Pro_no` (already in the payload). The
+        // recipe never allocates a new legacy id; the canonical
+        // `ht_products.legacy_*` fields are populated by the sync
+        // mapper, not by writebacks. Nothing to back-populate here.
+        AdjustProductStock { .. } => {}
     }
     Ok(())
 }
