@@ -303,6 +303,37 @@ CREATE TABLE IF NOT EXISTS ht_guest_registry (
 );
 CREATE INDEX IF NOT EXISTS ix_ht_guestreg_checkin ON ht_guest_registry(guest_cin_id);
 
+-- ht_checkin_rooms - Junction table (Track B1 / migration 043).
+-- Mirrors legacy HT_CheckIn_Ds cardinality: one row per room per check-in
+-- folio. The existing ht_checkins.cin_room_id stays in place until the
+-- B5 backfill completes — readers and the writeback recipe still touch
+-- it during the B1-B4 sub-waves.
+CREATE TABLE IF NOT EXISTS ht_checkin_rooms (
+    cr_id              BIGSERIAL    PRIMARY KEY,
+    cr_cin_id          INTEGER      NOT NULL REFERENCES ht_checkins(cin_id) ON DELETE CASCADE,
+    cr_room_id         INTEGER      NOT NULL REFERENCES ht_rooms_new(room_id),
+    cr_room_in         TIMESTAMPTZ,
+    cr_room_out        TIMESTAMPTZ,
+    cr_room_status     VARCHAR(50)  NOT NULL,
+    cr_rate_per_night  NUMERIC(12, 2) NOT NULL DEFAULT 0,
+    cr_nights          INTEGER      NOT NULL DEFAULT 1,
+    cr_room_total      NUMERIC(12, 2) NOT NULL DEFAULT 0,
+    cr_dep_amount      NUMERIC(12, 2) NOT NULL DEFAULT 0,
+    cr_dep_status      VARCHAR(50),
+    cr_dep_returned_at TIMESTAMPTZ,
+    cr_dep_returned_by VARCHAR(50),
+    cr_cupon_count     INTEGER      NOT NULL DEFAULT 0,
+    cr_note            VARCHAR(500),
+    cr_legacy_ds_id    INTEGER,
+    cr_created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    cr_updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_ht_checkin_rooms_folio_room UNIQUE (cr_cin_id, cr_room_id)
+);
+CREATE INDEX IF NOT EXISTS ht_checkin_rooms_room_status
+    ON ht_checkin_rooms (cr_room_id, cr_room_status);
+CREATE INDEX IF NOT EXISTS ht_checkin_rooms_legacy_ds_id
+    ON ht_checkin_rooms (cr_legacy_ds_id) WHERE cr_legacy_ds_id IS NOT NULL;
+
 -- ht_rates - Room rate configurations
 CREATE TABLE IF NOT EXISTS ht_rates (
     rate_id SERIAL PRIMARY KEY,
@@ -1500,6 +1531,16 @@ CREATE INDEX IF NOT EXISTS ix_ht_shifts_site_opened_at
 
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('040', '040_create_ht_shifts.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 043 — Track B1 / T1 CRIT-1 + T2 CRIT-1. Canonical
+-- `ht_checkin_rooms` junction table mirroring legacy `HT_CheckIn_Ds`
+-- (one row per room per check-in folio). DDL inlined above next to
+-- `ht_guest_registry`; this seed marks the migration as applied for
+-- fresh deploys. Follow-on sub-waves B2 (mapper) / B3 (dashboard) /
+-- B4 (writeback) / B5 (backfill) layer behavior changes on top.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('043', '043_create_ht_checkin_rooms.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================
