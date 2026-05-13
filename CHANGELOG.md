@@ -98,6 +98,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **T7 MED-3 — Backup off-site.** Tracked as Track H2.
 - **T7 MED-4 — Deploy rollback workflow.** Tracked as Track H2.
 
+## [vNext] - 2026-05-13 (Track F1)
+
+### Added
+
+- **Track F1 — `ht_room_calendar` canonical for `HT_Room_Status`
+  (`audit-2026-05-13.md` T1 HIGH-4).** New per-(room, date) canonical
+  ledger projected from the legacy booking-calendar table. Closes the
+  T1 finding that no PG canonical existed for the central booking-grid
+  source — every dashboard query previously reconstructed availability
+  from `ht_bookings` + `ht_checkins`, silently missing direct iHOTEL
+  edits to `HT_Room_Status` (mark-clean, walk-in, extend-stay, mid-stay
+  room moves, …).
+  - `migrations/pg/039_create_ht_room_calendar.sql` — `ht_room_calendar`
+    with `BIGSERIAL` PK, `UNIQUE (rcal_room_id, rcal_date)` business
+    key, FKs to `ht_rooms_new` / `ht_bookings` / `ht_checkins`, plus
+    `rcal_legacy_id` (legacy allocator id), `rcal_status` (Thai/English
+    literal preserved verbatim — `จอง` / `เข้าพัก` / `Check Out` / …),
+    `rcal_customer_label` (legacy `room_Details` grid-tile text).
+    Indices: `ix_ht_room_calendar_date_status` for future grid queries,
+    `ux_ht_room_calendar_legacy_id` partial-unique for reconcile lookup.
+  - `init-db/init-hotelnew.sql` — mirrored CREATE TABLE + migration
+    seed (039) for fresh deploys.
+  - `hotel-backend/src/sync/mappers/room_calendar.rs` — new
+    `RoomCalendarMapper` (per-row CT dispatch). UPSERTs keyed on the
+    `(rcal_room_id, rcal_date)` business pair; D-events delete by
+    `rcal_legacy_id`. Required fields (`room_no`, `room_date`,
+    `room_status`) fail loud; optional FKs (`room_Book_No`,
+    `room_CheckIn_No`) collapse to NULL when missing rather than
+    deferring the whole tile.
+  - `hotel-backend/src/bin/sync.rs` — re-wires `HT_Room_Status` from
+    the 5.4 retired-stub `RoomStatusMapper` to the new
+    `RoomCalendarMapper`. The CT subscription was already enabled in
+    Phase 5; this just adds the canonical projection.
+  - `docs/coexistence/CARDINALITY_MAP.md` — row added linking
+    `ht_room_calendar` ↔ `HT_Room_Status` (cardinality `1:1` per
+    `(room, date)`, source `shared`, sync mapper
+    `sync/mappers/room_calendar.rs`).
+  - Read-path migration is intentionally deferred — existing
+    `routes/calendar.rs` + `routes/rooms.rs` keep working off the
+    bookings+checkins reconstruction until a follow-up track switches
+    them to canonical reads.
+  - Tests: 17 new lib tests in `sync::mappers::room_calendar::tests`
+    locking the projection contract (Thai literal passthrough,
+    NULL-on-required loud errors, date truncation, optional FK
+    extraction, SELECT-vs-projection alignment) plus a refreshed
+    wiring assertion in `bin/sync.rs` (`build_mappers_wires_room_status_to_room_calendar_mapper`).
+
 ## [2.63.15] - 2026-05-13
 
 ### Added

@@ -35,6 +35,7 @@ pub mod mirror;
 pub mod payment;
 pub mod rate_tiers;
 pub mod room;
+pub mod room_calendar;
 
 pub use booking::{
     apply_booking_aggregate, BookingDatesMapper, BookingHeaderMapper, BookingRoomsMapper,
@@ -51,3 +52,4 @@ pub use mirror::{
 };
 pub use payment::{apply_payment_aggregate, PaymentMapper, ReceiptMapper};
 pub use room::{RoomMasterMapper, RoomStatusMapper};
+pub use room_calendar::RoomCalendarMapper;

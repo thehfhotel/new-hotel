@@ -73,7 +73,7 @@ use hotel_backend::sync::mappers::{
     BillDebtDsMirrorMapper, BillDebtHMirrorMapper, BookingDatesMapper, BookingHeaderMapper,
     BookingRoomsMapper, ChangedRoomMirrorMapper, CheckInHeaderMapper, CheckInRoomsMapper,
     CheckinProductMirrorMapper, CuponMirrorMapper, CustomerMapper, DepositMirrorMapper,
-    GuestRegistryMapper, PaymentMapper, ReceiptMapper, RoomMasterMapper, RoomStatusMapper,
+    GuestRegistryMapper, PaymentMapper, ReceiptMapper, RoomCalendarMapper, RoomMasterMapper,
     RoomsCancelMirrorMapper,
 };
 use hotel_backend::sync::parent_loader::{load_booking_aggregate, load_checkin_aggregate};
@@ -1241,7 +1241,13 @@ fn build_mappers(allowlist: &Option<HashSet<String>>) -> Vec<Box<dyn MssqlChange
         let mapper: Box<dyn MssqlChangeMapper> = match *table {
             "HT_Customers" => Box::new(CustomerMapper),
             "HT_Rooms" => Box::new(RoomMasterMapper),
-            "HT_Room_Status" => Box::new(RoomStatusMapper),
+            // Track F1 (audit 2026-05-13 T1 HIGH-4) — swap the 5.4
+            // retired-stub `RoomStatusMapper` for the new
+            // `RoomCalendarMapper` that projects to canonical
+            // `ht_room_calendar`. `RoomStatusMapper` stays available
+            // for back-compat / drift-detection tests but no longer
+            // owns CT dispatch.
+            "HT_Room_Status" => Box::new(RoomCalendarMapper),
             "HT_Book_H" => Box::new(BookingHeaderMapper),
             "HT_Book_Ds" => Box::new(BookingRoomsMapper),
             "HT_Book_Date" => Box::new(BookingDatesMapper),
@@ -2229,13 +2235,34 @@ mod tests {
         assert!(mappers[0].select_sql().contains("Room_Clean"));
     }
 
+    /// Track F1 (audit 2026-05-13 T1 HIGH-4) — `HT_Room_Status` is
+    /// wired to the new `RoomCalendarMapper` (projects to canonical
+    /// `ht_room_calendar`) instead of the retired 5.4 stub
+    /// `RoomStatusMapper`. The mapper must project the columns
+    /// needed for the per-night ledger (`room_date`, `room_status`,
+    /// `room_no`, plus the `room_Book_No` / `room_CheckIn_No` /
+    /// `room_Details` FK + label trio).
     #[test]
-    fn build_mappers_wires_room_status_to_room_status_mapper() {
+    fn build_mappers_wires_room_status_to_room_calendar_mapper() {
         let mut allow = HashSet::new();
         allow.insert("HT_Room_Status".to_string());
         let mappers = build_mappers(&Some(allow));
         assert_eq!(mappers.len(), 1);
         assert_eq!(mappers[0].primary_key_cols(), &["id"]);
+        let select = mappers[0].select_sql();
+        for col in &[
+            "room_no",
+            "room_date",
+            "room_status",
+            "room_Details",
+            "room_Book_No",
+            "room_CheckIn_No",
+        ] {
+            assert!(
+                select.contains(col),
+                "RoomCalendarMapper SELECT must project {col}; got: {select}"
+            );
+        }
     }
 
     /// Phase 5.3: HT_Book_H + HT_Book_Ds + HT_Book_Date are now real
