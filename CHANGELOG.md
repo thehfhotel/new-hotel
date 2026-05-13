@@ -7035,3 +7035,4 @@ with operator alerting. Per `docs/architecture.md` §8 (Phase 6 row).
 - Tailwind CSS for styling
 - Recharts for data visualization
 - Jest for testing (22 tests passing)
+
