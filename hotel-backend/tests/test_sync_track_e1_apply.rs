@@ -109,14 +109,14 @@ async fn seed_parent_checkin(pool: &sqlx::PgPool, legacy_cin_no: &str) -> i32 {
     let (cust_id, room_id) = ensure_fixture_room_and_customer(pool).await;
     let cin_id: i32 = sqlx::query_scalar(
         "INSERT INTO ht_checkins \
-            (cin_cust_id, cin_room_id, cin_checkin_time, cin_expected_checkout, \
+            (cin_no, cin_cust_id, cin_room_id, cin_checkin_time, cin_expected_checkout, \
              cin_status, legacy_cin_no) \
-         VALUES ($1, $2, NOW(), CURRENT_DATE + 1, 'active', $3) \
+         VALUES ($1, $2, $3, NOW(), CURRENT_DATE + 1, 'active', $1) \
          RETURNING cin_id",
     )
+    .bind(legacy_cin_no)
     .bind(cust_id)
     .bind(room_id)
-    .bind(legacy_cin_no)
     .fetch_one(pool)
     .await
     .expect("seed parent checkin");
@@ -395,7 +395,8 @@ async fn rooms_cancel_mirror_apply_delete_removes_row_on_d_row_shape() {
 async fn high_6_back_query_resolves_cin_no_from_legacy_checkin_ds_id() {
     let pool = common::create_test_pool().await;
 
-    let test_cin_no = "CT26-E1-HIGH6-RECOVERY";
+    // legacy_cin_no is VARCHAR(20) — must be ≤20 chars.
+    let test_cin_no = "CT26-E1-H6-REC";
     let test_ds_id: i32 = 1_999_999_901;
 
     // Cleanup any prior run.
@@ -408,13 +409,13 @@ async fn high_6_back_query_resolves_cin_no_from_legacy_checkin_ds_id() {
     let (cust_id, room_id) = ensure_fixture_room_and_customer(&pool).await;
     sqlx::query(
         "INSERT INTO ht_checkins \
-            (cin_cust_id, cin_room_id, cin_checkin_time, cin_expected_checkout, \
+            (cin_no, cin_cust_id, cin_room_id, cin_checkin_time, cin_expected_checkout, \
              cin_status, legacy_cin_no, legacy_checkin_ds_id) \
-         VALUES ($1, $2, NOW(), CURRENT_DATE + 1, 'active', $3, $4)",
+         VALUES ($1, $2, $3, NOW(), CURRENT_DATE + 1, 'active', $1, $4)",
     )
+    .bind(test_cin_no)
     .bind(cust_id)
     .bind(room_id)
-    .bind(test_cin_no)
     .bind(test_ds_id)
     .execute(&pool)
     .await
