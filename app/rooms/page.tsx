@@ -19,10 +19,12 @@ import {
   History,
   LogIn,
   LogOut,
+  CalendarPlus,
 } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import CheckInModal from '@/components/CheckInModal'
 import CheckOutModal from '@/components/CheckOutModal'
+import ExtendStayModal from '@/components/ExtendStayModal'
 
 // API response types (from /api/new/rooms)
 interface RoomApiItem {
@@ -76,6 +78,8 @@ export default function RoomsPage() {
   const [loadingDetail, setLoadingDetail] = useState(false)
   const [showCheckIn, setShowCheckIn] = useState(false)
   const [showCheckOut, setShowCheckOut] = useState(false)
+  // Track G1 / T4 HIGH-2: extend-stay modal (one-more-night flow).
+  const [showExtendStay, setShowExtendStay] = useState(false)
 
   const fetchRooms = useCallback(async () => {
     setLoading(true)
@@ -483,13 +487,25 @@ export default function RoomsPage() {
                     </button>
                   )}
                   {selectedRoom.status === 'occupied' && (
-                    <button
-                      onClick={() => setShowCheckOut(true)}
-                      className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-sky-600 text-white text-sm font-medium rounded hover:bg-sky-700"
-                    >
-                      <LogOut size={14} />
-                      เช็คเอ้าท์
-                    </button>
+                    <>
+                      {/* Track G1 / T4 HIGH-2: extend-stay button sits
+                          alongside check-out so receptionists see both
+                          options the moment a guest asks for either. */}
+                      <button
+                        onClick={() => setShowExtendStay(true)}
+                        className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-emerald-600 text-white text-sm font-medium rounded hover:bg-emerald-700"
+                      >
+                        <CalendarPlus size={14} />
+                        ขยายเวลาเข้าพัก
+                      </button>
+                      <button
+                        onClick={() => setShowCheckOut(true)}
+                        className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-sky-600 text-white text-sm font-medium rounded hover:bg-sky-700"
+                      >
+                        <LogOut size={14} />
+                        เช็คเอ้าท์
+                      </button>
+                    </>
                   )}
                 </div>
 
@@ -525,6 +541,16 @@ export default function RoomsPage() {
         <CheckOutModal
           room={{ id: selectedRoom.id, roomNo: selectedRoom.roomNo }}
           onClose={() => setShowCheckOut(false)}
+          onSuccess={() => {
+            fetchRooms()
+            if (selectedRoom) fetchRoomDetail(selectedRoom)
+          }}
+        />
+      )}
+      {showExtendStay && selectedRoom && (
+        <ExtendStayModal
+          room={{ id: selectedRoom.id, roomNo: selectedRoom.roomNo }}
+          onClose={() => setShowExtendStay(false)}
           onSuccess={() => {
             fetchRooms()
             if (selectedRoom) fetchRoomDetail(selectedRoom)
