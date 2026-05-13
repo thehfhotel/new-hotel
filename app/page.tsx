@@ -7,11 +7,13 @@ import {
   Clock,
   LogIn,
   LogOut,
+  CalendarPlus,
 } from 'lucide-react'
 import { useBranch, BRANCH_LABELS } from '@/contexts/BranchContext'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import CheckInModal from '@/components/CheckInModal'
 import CheckOutModal from '@/components/CheckOutModal'
+import ExtendStayModal from '@/components/ExtendStayModal'
 
 // Domain-event variants that mutate the dashboard's tile counts or room grid.
 // Names match `DomainEvent::type_name()` in
@@ -131,6 +133,8 @@ export default function NewDashboard() {
   const [roomIdByNo, setRoomIdByNo] = useState<Map<string, number>>(new Map())
   const [showCheckIn, setShowCheckIn] = useState(false)
   const [showCheckOut, setShowCheckOut] = useState(false)
+  // Track G1 / T4 HIGH-2: extend-stay modal (one-more-night flow).
+  const [showExtendStay, setShowExtendStay] = useState(false)
   // SSE connection status — drives the tiny header dot. Starts pessimistic
   // so the dot reads "reconnecting" until the EventSource fires `onopen`.
   const [isLiveConnected, setIsLiveConnected] = useState(false)
@@ -506,14 +510,27 @@ export default function NewDashboard() {
                 </button>
               )}
               {selectedRoom.status === 'occupied' && (
-                <button
-                  onClick={() => setShowCheckOut(true)}
-                  disabled={!roomIdByNo.get(selectedRoom.roomNumber.toUpperCase())}
-                  className="w-full h-8 flex items-center justify-center gap-1.5 bg-info text-white hover:opacity-90 disabled:opacity-50 transition-colors text-[13px]"
-                >
-                  <LogOut size={12} />
-                  เช็คเอ้าท์
-                </button>
+                <>
+                  {/* Track G1 / T4 HIGH-2: extend-stay (one-more-night) — sits
+                      next to checkout so receptionists see both options at
+                      the same moment a guest asks for either. */}
+                  <button
+                    onClick={() => setShowExtendStay(true)}
+                    disabled={!roomIdByNo.get(selectedRoom.roomNumber.toUpperCase())}
+                    className="w-full h-8 flex items-center justify-center gap-1.5 bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50 transition-colors text-[13px]"
+                  >
+                    <CalendarPlus size={12} />
+                    ขยายเวลาเข้าพัก
+                  </button>
+                  <button
+                    onClick={() => setShowCheckOut(true)}
+                    disabled={!roomIdByNo.get(selectedRoom.roomNumber.toUpperCase())}
+                    className="w-full h-8 flex items-center justify-center gap-1.5 bg-info text-white hover:opacity-90 disabled:opacity-50 transition-colors text-[13px]"
+                  >
+                    <LogOut size={12} />
+                    เช็คเอ้าท์
+                  </button>
+                </>
               )}
               <button
                 onClick={() => setSelectedRoom(null)}
@@ -548,6 +565,19 @@ export default function NewDashboard() {
             roomNo: selectedRoom.roomNumber,
           }}
           onClose={() => setShowCheckOut(false)}
+          onSuccess={() => {
+            fetchData()
+            setSelectedRoom(null)
+          }}
+        />
+      )}
+      {showExtendStay && selectedRoom && roomIdByNo.get(selectedRoom.roomNumber.toUpperCase()) && (
+        <ExtendStayModal
+          room={{
+            id: roomIdByNo.get(selectedRoom.roomNumber.toUpperCase())!,
+            roomNo: selectedRoom.roomNumber,
+          }}
+          onClose={() => setShowExtendStay(false)}
           onSuccess={() => {
             fetchData()
             setSelectedRoom(null)

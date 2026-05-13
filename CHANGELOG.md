@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [vNext] - 2026-05-13 (Track G1)
+
+### Added
+
+- **Track G1 — Extend-stay HTTP route + UI (`audit-2026-05-13.md`
+  T4 HIGH-2).** The `CheckInService::extend` service path and the
+  `writeback/recipes/extend_stay.rs` recipe both already existed (since
+  v2.x) but had no HTTP route and no UI button. The flow was dead behind
+  a closed door — receptionists fell back to iHOTEL for the common
+  "guest wants one more night" request. G1 opens the door.
+  - **`PUT /api/new/checkins/:id/extend`** (`routes/new_checkins.rs`):
+    accepts `{ newCheckoutDate: YYYY-MM-DD, reason?: string }`,
+    validates `new_checkout_date > existing_expected_checkout`
+    (shortening a stay is a separate refund / partial-stay flow tracked
+    under G2), then delegates to the existing
+    `CheckInService::extend`. Recomputes totals from the canonical
+    detail row (`rate × extended_nights` for room/net,
+    `cin_total_amount` for pay, `max(0, room − pay)` for balance) using
+    the same convention as the checkout route (audit H1).
+  - **`components/ExtendStayModal.tsx`**: new modal with a date picker
+    pre-filled at `existing + 1 day` (one-click happy path) plus an
+    optional free-form reason text area. Mirrors `CheckOutModal` shape
+    so receptionists see both options side-by-side.
+  - **`app/page.tsx` + `app/rooms/page.tsx`**: extend-stay button added
+    next to the existing check-out button on occupied-room actions.
+  - Service implementation and writeback recipe **not** modified — this
+    PR is wiring only.
+
 ## [vNext] - 2026-05-13 (Track B1)
 
 ### Added

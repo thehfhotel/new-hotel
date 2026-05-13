@@ -4,13 +4,14 @@
 //! - GET /api/new/checkins/:id - Get single check-in
 //! - POST /api/new/checkins - Create check-in (walk-in or from booking)
 //! - PUT /api/new/checkins/:id/checkout - Process check-out
+//! - PUT /api/new/checkins/:id/extend - Extend stay (Track G1 / T4 HIGH-2)
 //!
 //! Guest Registry endpoints:
 //! - GET /api/new/checkins/:id/guests - List guests for check-in
 //! - POST /api/new/checkins/:id/guests - Add guest to check-in
 //! - DELETE /api/new/checkins/:id/guests/:guestId - Remove guest from check-in
 //!
-//! Per `docs/architecture.md` §1, §6 (Phase 2.5) the create / checkout
+//! Per `docs/architecture.md` §1, §6 (Phase 2.5) the create / checkout / extend
 //! handlers delegate to `state.checkins_service`. Reads + the guest-registry
 //! handlers stay on the repository for now (no service method exists yet).
 
@@ -31,7 +32,8 @@ use crate::repository::checkin::{
     CheckInDetailRow, CheckInListRow, GuestInsert, GuestRow,
 };
 use crate::service::{
-    CheckInToBookingCommand, CheckInWritebackContext, CheckOutCommand, ServiceError, WalkInCommand,
+    CheckInToBookingCommand, CheckInWritebackContext, CheckOutCommand, ExtendStayCommand,
+    ServiceError, WalkInCommand,
 };
 
 /// Check-in status enum
@@ -209,6 +211,27 @@ pub struct CheckOutRequest {
     pub total_amount: Option<f64>,
     pub payment_status: Option<String>,
     pub notes: Option<String>,
+}
+
+/// Request body for extend stay.
+///
+/// Track G1 / T4 HIGH-2 (`docs/coexistence/audit-2026-05-13.md`). The
+/// receptionist supplies the new (later) departure date and an optional
+/// free-form reason. The route validates that the new date is strictly
+/// later than the existing `cin_expected_checkout` before delegating to
+/// [`crate::service::CheckInService::extend`] — shortening a stay is a
+/// separate flow (refunds / partial-stay charges) tracked under Track G2.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtendStayRequest {
+    /// New (later) departure date, ISO `YYYY-MM-DD`. Must be strictly after
+    /// the existing `cin_expected_checkout`.
+    pub new_checkout_date: NaiveDate,
+    /// Optional human-readable reason recorded against the writeback. Not
+    /// persisted in the canonical PG state today (no `extend_reason`
+    /// column); reserved for future audit-trail surface.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// Response for create/checkout operations
@@ -413,6 +436,63 @@ pub async fn checkout(
     }))
 }
 
+/// PUT /api/new/checkins/:id/extend - Extend an active stay.
+///
+/// Track G1 / T4 HIGH-2 (`docs/coexistence/audit-2026-05-13.md`). Wraps
+/// the pre-existing [`crate::service::CheckInService::extend`] (service
+/// landed in v2.x; recipe `writeback::recipes::extend_stay` already
+/// emits the legacy `HT_Book_Date` / `HT_CheckIn_Ds` / `HT_Room_Status`
+/// diff per spike §3f). This handler is the "open the door" wiring so
+/// receptionists no longer fall back to iHOTEL for the common
+/// "one-more-night" request.
+///
+/// Validation: the new departure date MUST be strictly after the existing
+/// `cin_expected_checkout`. Shortening a stay routes through a separate
+/// refund / partial-stay flow (Track G2) which doesn't exist yet — a 400
+/// here keeps the rule explicit instead of silently dropping nights.
+pub async fn extend(
+    State(state): State<AppState>,
+    Path(cin_id): Path<i32>,
+    Json(body): Json<ExtendStayRequest>,
+) -> ApiResult<Json<NewCheckInResponse>> {
+    // Pull the detail row up front so we can (a) validate the date,
+    // (b) compute the recipe inputs (stay_start / rate / nights /
+    // guest_label), and (c) return the post-extend payload.
+    let detail = state
+        .checkins
+        .get(&state.new_pool, cin_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
+
+    validate_new_checkout_after_existing(
+        body.new_checkout_date,
+        detail.cin_expected_checkout,
+    )?;
+
+    let command = build_extend_stay_command(&detail, &body);
+    state
+        .checkins_service
+        .extend(command)
+        .await
+        .map_err(map_extend_error)?;
+
+    // Re-fetch so the response carries any state the service may have
+    // updated (today the service emits a writeback only and does not touch
+    // PG `cin_expected_checkout` — that lives on the worker side via the
+    // recipe. A follow-up wave will land a PG `apply_extend` so the
+    // canonical state and the response stay in lock-step).
+    let updated = state
+        .checkins
+        .get(&state.new_pool, cin_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
+
+    Ok(Json(NewCheckInResponse {
+        success: true,
+        checkin: NewCheckIn::from_detail_row(updated),
+    }))
+}
+
 // ---------- create/checkout helpers ----------
 
 async fn generate_cin_no(state: &AppState) -> ApiResult<String> {
@@ -565,6 +645,93 @@ fn map_create_checkin_error(err: ServiceError) -> ApiError {
 /// Translate the service's `Conflict` outcome (check-in not active) to
 /// the route's prior 400 wording.
 fn map_checkout_error(err: ServiceError) -> ApiError {
+    match err {
+        ServiceError::Conflict(_) => ApiError::BadRequest("Check-in is not active".to_string()),
+        other => other.into(),
+    }
+}
+
+// ---------- extend-stay helpers ----------
+
+/// Reject requests that shorten or no-op the stay. Refund / partial-stay
+/// flows route through Track G2; until that lands, the route rejects loudly
+/// instead of silently dropping nights from the canonical state.
+fn validate_new_checkout_after_existing(
+    new_checkout_date: NaiveDate,
+    existing_expected_checkout: NaiveDate,
+) -> ApiResult<()> {
+    if new_checkout_date <= existing_expected_checkout {
+        return Err(ApiError::BadRequest(format!(
+            "New checkout date ({}) must be strictly after existing expected \
+             checkout ({}). Shortening a stay is not supported by this endpoint.",
+            new_checkout_date, existing_expected_checkout
+        )));
+    }
+    Ok(())
+}
+
+/// Build the [`ExtendStayCommand`] from the canonical PG detail row + the
+/// HTTP body. Pure (no IO, no clock reads) so the test suite can pin the
+/// translation contract without spinning up an `AppState`.
+///
+/// Totals mirror the checkout convention (audit H1): rate × nights for
+/// room price + net, current `cin_total_amount` for pay, max(0) for the
+/// remaining balance. The writeback recipe re-aggregates from
+/// `HT_CheckIn_Pay` anyway (Wave 5a item 2) — these values are only the
+/// fallback that lands on `HT_CheckIn_H` if no payments exist legacy-side.
+pub(crate) fn build_extend_stay_command(
+    detail: &CheckInDetailRow,
+    body: &ExtendStayRequest,
+) -> ExtendStayCommand {
+    use chrono::{NaiveTime, TimeZone, Utc};
+
+    // Same UTC-midnight convention as the create flow (see
+    // `build_check_in_writeback_context`). The audit's BKK-midnight
+    // theme will refactor both call sites in a single Track A wave.
+    let midnight = NaiveTime::from_hms_opt(0, 0, 0).expect("hardcoded midnight is valid");
+    let stay_start = Utc.from_utc_datetime(
+        &detail.cin_checkin_time.date().and_time(midnight),
+    );
+    let new_end = Utc.from_utc_datetime(&body.new_checkout_date.and_time(midnight));
+
+    let nights_new = (body.new_checkout_date - detail.cin_checkin_time.date())
+        .num_days()
+        .max(1) as f64;
+    let rate = detail.cin_rate_per_night.unwrap_or(0.0);
+    let room_price_total_baht = rate * nights_new;
+    let pay_total_baht = detail.cin_total_amount.unwrap_or(0.0);
+    let balance_total_baht = (room_price_total_baht - pay_total_baht).max(0.0);
+
+    let new_room_price_total = money_from_baht_f64(room_price_total_baht);
+    let new_net_total = new_room_price_total; // no product/extras plumbing yet
+    let new_pay_total = money_from_baht_f64(pay_total_baht);
+    let new_balance_total = money_from_baht_f64(balance_total_baht);
+
+    // The `reason` field is reserved for a future audit-trail surface; the
+    // canonical PG schema doesn't have a column for it yet (no migration
+    // landed for `cin_extend_reason`). Keeping it on the wire so the UI
+    // can start collecting the value today and we don't need a v2 of the
+    // request shape when the column lands.
+    let _ = &body.reason;
+
+    ExtendStayCommand {
+        check_in_id: detail.cin_id,
+        new_end,
+        stay_start,
+        guest_label: detail.customer_name.clone().unwrap_or_default(),
+        new_room_price_total,
+        new_net_total,
+        new_pay_total,
+        new_balance_total,
+        // TODO: wire user_id from auth middleware (parity with checkout/create)
+        source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
+    }
+}
+
+/// Translate service outcomes to the route's HTTP semantics. Mirrors the
+/// shape of `map_checkout_error` so receptionists see the same wording
+/// across both "not active" guard paths.
+fn map_extend_error(err: ServiceError) -> ApiError {
     match err {
         ServiceError::Conflict(_) => ApiError::BadRequest("Check-in is not active".to_string()),
         other => other.into(),
@@ -772,4 +939,186 @@ pub async fn delete_guest(
         message: "Guest removed successfully".to_string(),
         id: Some(path.guest_id),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+
+    /// Build a minimal `CheckInDetailRow` fixture for the pure builder/
+    /// validator tests. Real `get()` rows carry more fields populated;
+    /// this stub fills the columns the extend builder actually reads.
+    fn detail_fixture(
+        cin_id: i32,
+        checkin_date: NaiveDate,
+        expected_checkout: NaiveDate,
+        rate_per_night: Option<f64>,
+        total_amount: Option<f64>,
+        customer_name: Option<&str>,
+    ) -> CheckInDetailRow {
+        let noon = NaiveTime::from_hms_opt(12, 0, 0).expect("hardcoded noon is valid");
+        CheckInDetailRow {
+            cin_id,
+            cin_no: format!("CIN-20260513-{:04}", cin_id),
+            cin_book_id: None,
+            book_no: String::new(),
+            cin_cust_id: 1,
+            customer_name: customer_name.map(str::to_string),
+            cin_room_id: 1,
+            room_no: "201".to_string(),
+            type_name: "Standard".to_string(),
+            cin_checkin_time: NaiveDateTime::new(checkin_date, noon),
+            cin_checkout_time: None,
+            cin_expected_checkout: expected_checkout,
+            cin_adults: Some(1),
+            cin_children: Some(0),
+            cin_status: Some("active".to_string()),
+            cin_rate_per_night: rate_per_night,
+            cin_total_amount: total_amount,
+            cin_payment_status: None,
+            cin_notes: None,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    /// Track G1 / T4 HIGH-2: shortening the stay is a different flow.
+    /// Reject `new_checkout_date <= existing_expected_checkout` with a 400
+    /// so receptionists see an explicit error instead of a silent no-op.
+    #[test]
+    fn extend_route_rejects_earlier_date() {
+        let existing = NaiveDate::from_ymd_opt(2026, 5, 15).expect("valid date");
+
+        // Strictly earlier — rejected.
+        let earlier = NaiveDate::from_ymd_opt(2026, 5, 14).expect("valid date");
+        let err = validate_new_checkout_after_existing(earlier, existing)
+            .expect_err("earlier date must reject");
+        match err {
+            ApiError::BadRequest(msg) => {
+                assert!(msg.contains("must be strictly after"), "got: {msg}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+
+        // Equal — also rejected (no-op extend is not a valid request).
+        let err = validate_new_checkout_after_existing(existing, existing)
+            .expect_err("same-day extend must reject");
+        assert!(matches!(err, ApiError::BadRequest(_)));
+
+        // One day later — accepted.
+        let later = NaiveDate::from_ymd_opt(2026, 5, 16).expect("valid date");
+        validate_new_checkout_after_existing(later, existing)
+            .expect("a strictly later date must be accepted");
+    }
+
+    /// Track G1 / T4 HIGH-2: happy path — the route's command builder must
+    /// translate the detail row + body into an [`ExtendStayCommand`] the
+    /// service can execute without further lookups. This pins the
+    /// contract that the route, not the service, owns:
+    /// - `check_in_id` propagates verbatim.
+    /// - `new_end` carries the body's `new_checkout_date` (UTC midnight).
+    /// - `stay_start` carries the existing `cin_checkin_time` at UTC midnight.
+    /// - `guest_label` carries the canonical customer name.
+    /// - The four total fields are computed as
+    ///   `(rate × extended_nights, current_total, max(0, room_total − pay))`,
+    ///   matching the checkout-route convention (audit H1).
+    #[test]
+    fn extend_route_calls_service() {
+        use chrono::{TimeZone, Utc};
+
+        let checkin = NaiveDate::from_ymd_opt(2026, 5, 13).expect("valid date");
+        let existing_checkout = NaiveDate::from_ymd_opt(2026, 5, 15).expect("valid date");
+        let new_checkout = NaiveDate::from_ymd_opt(2026, 5, 17).expect("valid date");
+
+        let detail = detail_fixture(
+            42,
+            checkin,
+            existing_checkout,
+            Some(1200.0),
+            Some(2400.0),
+            Some("Somchai Jaidee"),
+        );
+        let body = ExtendStayRequest {
+            new_checkout_date: new_checkout,
+            reason: Some("Guest extended one more night".to_string()),
+        };
+
+        let command = build_extend_stay_command(&detail, &body);
+
+        assert_eq!(command.check_in_id, 42, "check_in_id must propagate");
+
+        let midnight = NaiveTime::from_hms_opt(0, 0, 0).expect("hardcoded midnight is valid");
+        let expected_new_end = Utc.from_utc_datetime(&new_checkout.and_time(midnight));
+        let expected_stay_start = Utc.from_utc_datetime(&checkin.and_time(midnight));
+        assert_eq!(command.new_end, expected_new_end);
+        assert_eq!(command.stay_start, expected_stay_start);
+
+        assert_eq!(command.guest_label, "Somchai Jaidee");
+
+        // 4 nights × 1200 baht = 4800.00 baht = 480000 satang.
+        assert_eq!(command.new_room_price_total.as_satang(), 480_000);
+        // No product/extras plumbing — net equals room total.
+        assert_eq!(command.new_net_total.as_satang(), 480_000);
+        // Existing total amount = 2400 baht = 240000 satang.
+        assert_eq!(command.new_pay_total.as_satang(), 240_000);
+        // Balance = max(0, room − pay) = 2400 baht = 240000 satang.
+        assert_eq!(command.new_balance_total.as_satang(), 240_000);
+    }
+
+    /// Defensive: an already-overpaid stay (pay > room) must not surface a
+    /// negative balance to the legacy writeback. Mirrors the checkout
+    /// route's `(net − pay).max(0)` clamp.
+    #[test]
+    fn extend_command_clamps_negative_balance_to_zero() {
+        let checkin = NaiveDate::from_ymd_opt(2026, 5, 13).expect("valid date");
+        let existing_checkout = NaiveDate::from_ymd_opt(2026, 5, 14).expect("valid date");
+        let new_checkout = NaiveDate::from_ymd_opt(2026, 5, 15).expect("valid date");
+
+        let detail = detail_fixture(
+            7,
+            checkin,
+            existing_checkout,
+            Some(1000.0),
+            Some(5000.0), // Overpaid relative to 2 nights × 1000.
+            Some("Test Guest"),
+        );
+        let body = ExtendStayRequest {
+            new_checkout_date: new_checkout,
+            reason: None,
+        };
+
+        let command = build_extend_stay_command(&detail, &body);
+        assert_eq!(
+            command.new_balance_total.as_satang(),
+            0,
+            "balance must clamp at zero for overpaid stays"
+        );
+    }
+
+    /// Missing `cin_rate_per_night` must not panic — fall back to zero so
+    /// the recipe still runs (matches the checkout-route fallback).
+    #[test]
+    fn extend_command_tolerates_missing_rate() {
+        let checkin = NaiveDate::from_ymd_opt(2026, 5, 13).expect("valid date");
+        let existing_checkout = NaiveDate::from_ymd_opt(2026, 5, 14).expect("valid date");
+        let new_checkout = NaiveDate::from_ymd_opt(2026, 5, 16).expect("valid date");
+
+        let detail = detail_fixture(
+            7,
+            checkin,
+            existing_checkout,
+            None,
+            None,
+            None,
+        );
+        let body = ExtendStayRequest {
+            new_checkout_date: new_checkout,
+            reason: None,
+        };
+
+        let command = build_extend_stay_command(&detail, &body);
+        assert_eq!(command.new_room_price_total.as_satang(), 0);
+        assert_eq!(command.guest_label, "", "no customer name → empty label");
+    }
 }

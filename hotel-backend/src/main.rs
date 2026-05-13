@@ -469,6 +469,8 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route("/api/new/checkins", get(routes::new_checkins::list_checkins).post(routes::new_checkins::create_checkin))
         .route("/api/new/checkins/{id}", get(routes::new_checkins::get_checkin))
         .route("/api/new/checkins/{id}/checkout", put(routes::new_checkins::checkout))
+        // Track G1 / T4 HIGH-2: extend an active stay (one-more-night flow).
+        .route("/api/new/checkins/{id}/extend", put(routes::new_checkins::extend))
         // Guest registry
         .route("/api/new/checkins/{id}/guests", get(routes::new_checkins::list_guests).post(routes::new_checkins::create_guest))
         .route("/api/new/checkins/{id}/guests/{guest_id}", delete(routes::new_checkins::delete_guest))
