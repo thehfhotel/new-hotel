@@ -5,6 +5,86 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.63.12] - 2026-05-13
+
+### Added
+
+- **`HT_CheckIn_Other_People` CT subscription + canonical mapper —
+  Track E1 / T2 HIGH-3 (`docs/coexistence/audit-2026-05-13.md`).**
+  The legacy iHOTEL app records companion-guest entries via INSERT on
+  save (FrmCheckIn.cs:9490) and DELETE-then-REINSERT on edit
+  (FrmCheckIn.cs:9975); until now the table had no primary key, no
+  CT subscription, and no mapper — so `ht_guest_registry` was silently
+  stale and TM.30 immigration reporting (Thai legal obligation for
+  foreign-guest registration) was under-counting companion entries
+  every time the receptionist used the iHOTEL "Other People" tab.
+  - `migrations/legacy-mssql/022_phase5e_other_people_rooms_cancel.sql`
+    enables `PRIMARY KEY` on `HT_CheckIn_Other_People.id` (IDENTITY)
+    and enables Change Tracking. Rollback script provided.
+  - `migrations/pg/034_ht_guest_registry_legacy_id.sql` adds
+    `guest_legacy_id INTEGER UNIQUE` to `ht_guest_registry` so the
+    sync mapper can UPSERT cleanly across iHOTEL's DELETE+REINSERT
+    edit pattern without accumulating duplicate companion rows. This
+    is the only schema change in Track E1; the wider column expansion
+    on `ht_customers` / `ht_rooms_new` is deferred to Track E2.
+  - `migrations/pg/033_sync_status_seed_track_e1.sql` adds
+    `legacy_sync_status` rows for `HT_CheckIn_Other_People` and
+    `HT_Rooms_Cancel` so the CT watcher's per-tick observability
+    update path hits a row instead of silently no-op-ing.
+  - `sync/mappers/guest_registry.rs::GuestRegistryMapper` projects
+    `(id, Cin_no, Cin_name, Cin_contry)` (the deliberate iHOTEL typo
+    `Cin_contry` is preserved verbatim) and UPSERTs into
+    `ht_guest_registry` keyed on `guest_legacy_id`, resolving
+    `guest_cin_id` from the parent `ht_checkins` row. Deferred apply
+    on parent-not-yet-mirrored matches the existing booking / customer
+    defer pattern.
+  - `bin/sync.rs` wires `HT_CheckIn_Other_People` into
+    `CT_ENABLED_TABLES` + `build_mappers`.
+
+- **`HT_Rooms_Cancel` mirror mapper — Track E1 / T2 HIGH-5
+  (`docs/coexistence/audit-2026-05-13.md`).** CT was enabled on
+  `HT_Rooms_Cancel` back in Phase 5 (legacy-mssql migration 020) but
+  no mapper existed — a dangling subscription that kept SQL Server's
+  CT retention growing forever without a consumer. The new
+  `RoomsCancelMirrorMapper` in `sync/mappers/mirror.rs` mirrors the
+  cancelled-room ledger into `legacy_mirror.ht_rooms_cancel` (mirror
+  table existed since migration 020). Mapper is wired into
+  `CT_ENABLED_TABLES` + `build_mappers` in `bin/sync.rs`.
+
+### Fixed
+
+- **`HT_CheckIn_Ds` D-event orphan recovery — Track E1 / T2 HIGH-6
+  (`bin/sync.rs`).** When a CT tick delivered only `HT_CheckIn_Ds`
+  D-events without a sibling header CT row, the existing
+  `CheckInRoomsMapper::coalesce_key` returned `None` (because the
+  joined `Cin_No` column is nulled on D rows) and the canonical
+  aggregate sweep never ran — stranding the canonical row in its
+  pre-delete state forever. The dispatcher now (a) routes all
+  `HT_CheckIn_Ds` batches into the coalesced aggregate path (even
+  pure-D-only batches), and (b) for D rows that produced no key,
+  back-queries `ht_checkins.legacy_checkin_ds_id` to recover the
+  parent `Cin_no`. Lookup misses (mirror never had the row) emit a
+  WARN; recovery hits emit a DEBUG log so operators can audit the
+  recovery path.
+
+- **Walk-in vs parse-failure log distinction — Track E1 / T2 MED-4
+  (`sync/mappers/checkin.rs`).** The walk-in short-circuit (no
+  parent-booking lookup) matched both `Some("")` (legitimate walk-in
+  where `Cin_Book_no=''`) AND `None` (legacy column was NULL OR a
+  parse failure upstream cleared `legacy_book_id`). The two are
+  operationally distinct: walk-in is normal flow; a parse failure is
+  a sync-quality signal. A debug log at the branch entry now records
+  the exact `legacy_book_id` shape so operators can distinguish the
+  two cases in production trace output.
+
+- **`HT_Book_Date` intentional-drop documentation — Track E1 / T2
+  MED-1 (`sync/parent_loader.rs` + `sync/mappers/booking.rs`).** The
+  per-night `Book_ok` cancellation state was loaded into
+  `BookingAggregate.nights` but silently dropped in `project_aggregate`.
+  Both call sites now carry a doc comment explaining the deliberate
+  drop pending a Track E2 / Track G column on `ht_bookings`.
+  Behaviour unchanged.
+
 ## [2.63.11] - 2026-05-13
 
 ### Fixed

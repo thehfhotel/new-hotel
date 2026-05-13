@@ -25,6 +25,13 @@
 //! | `HT_Changed_Room`    | `legacy_mirror.ht_changed_room`  | `id`       |
 //! | `HT_Bill_Debt_H`     | `legacy_mirror.ht_bill_debt_h`   | `Bill_No`  |
 //! | `HT_Bill_Debt_Ds`    | `legacy_mirror.ht_bill_debt_ds`  | `id`       |
+//! | `HT_Rooms_Cancel`    | `legacy_mirror.ht_rooms_cancel`  | `id`       |
+//!
+//! Track E1 (audit 2026-05-13 T2 HIGH-5) added `HT_Rooms_Cancel` — CT
+//! was enabled back in Phase 5 (migration 020) but no mapper consumed
+//! the rows; the mirror table sat empty while CT retention silently
+//! accumulated row history forever. The new
+//! `RoomsCancelMirrorMapper` closes the dangling subscription.
 
 use async_trait::async_trait;
 
@@ -521,6 +528,83 @@ impl MssqlChangeMapper for BillDebtDsMirrorMapper {
     }
 }
 
+// ─── HT_Rooms_Cancel ─────────────────────────────────────────────────
+// Track E1 / T2 HIGH-5 — CT was enabled in Phase 5 (migration 020) but
+// no mapper existed. The dangling subscription kept CT retention
+// growing forever without a consumer. This mapper closes the gap by
+// mirroring each cancelled-room row into `legacy_mirror.ht_rooms_cancel`
+// where the dashboard can surface the cancelled-room ledger alongside
+// the other mirror tables.
+
+pub struct RoomsCancelMirrorMapper;
+
+#[async_trait]
+impl MssqlChangeMapper for RoomsCancelMirrorMapper {
+    fn table(&self) -> &'static str {
+        "HT_Rooms_Cancel"
+    }
+
+    fn primary_key_cols(&self) -> &'static [&'static str] {
+        // Migration 020 (Phase 5) tightened `id INT NOT NULL` and
+        // added PK_HT_Rooms_Cancel on it. All-lowercase columns per
+        // the SCHEMA.sql dump.
+        &["id"]
+    }
+
+    fn select_sql(&self) -> &'static str {
+        "t.id, t.room_no, t.cin_no, t.cancel_date, t.cancel_by, t.cancel_note"
+    }
+
+    async fn apply(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        op: ChangeOp,
+        row: Option<&dyn MappableRow>,
+    ) -> Result<Option<DomainEvent>, SyncError> {
+        let row = row.ok_or_else(|| SyncError::Mapper {
+            table: "HT_Rooms_Cancel",
+            message: "row required for both I/U and D".into(),
+        })?;
+        let id = row.try_get_i32("id")?.ok_or_else(|| SyncError::Mapper {
+            table: "HT_Rooms_Cancel",
+            message: "id NULL — should not happen post Phase 5 (migration 020)".into(),
+        })?;
+        match op {
+            ChangeOp::Delete => {
+                sqlx::query("DELETE FROM legacy_mirror.ht_rooms_cancel WHERE id = $1")
+                    .bind(id)
+                    .execute(&mut **tx)
+                    .await?;
+            }
+            ChangeOp::Insert | ChangeOp::Update => {
+                sqlx::query(
+                    "INSERT INTO legacy_mirror.ht_rooms_cancel \
+                        (id, room_no, cin_no, cancel_date, cancel_by, cancel_note, \
+                         mirrored_at, mirror_source) \
+                     VALUES ($1, $2, $3, $4, $5, $6, now(), 'ct') \
+                     ON CONFLICT (id) DO UPDATE SET \
+                        room_no       = EXCLUDED.room_no, \
+                        cin_no        = EXCLUDED.cin_no, \
+                        cancel_date   = EXCLUDED.cancel_date, \
+                        cancel_by     = EXCLUDED.cancel_by, \
+                        cancel_note   = EXCLUDED.cancel_note, \
+                        mirrored_at   = now(), \
+                        mirror_source = 'ct'",
+                )
+                .bind(id)
+                .bind(row.try_get_str("room_no")?)
+                .bind(row.try_get_str("cin_no")?)
+                .bind(row.try_get_datetime("cancel_date")?)
+                .bind(row.try_get_str("cancel_by")?)
+                .bind(row.try_get_str("cancel_note")?)
+                .execute(&mut **tx)
+                .await?;
+            }
+        }
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,6 +623,7 @@ mod tests {
             (&ChangedRoomMirrorMapper, "HT_Changed_Room", &["id"]),
             (&BillDebtHMirrorMapper, "HT_Bill_Debt_H", &["Bill_No"]),
             (&BillDebtDsMirrorMapper, "HT_Bill_Debt_Ds", &["id"]),
+            (&RoomsCancelMirrorMapper, "HT_Rooms_Cancel", &["id"]),
         ];
         for (mapper, table, pk) in cases {
             assert_eq!(mapper.table(), *table, "table() mismatch");
@@ -549,6 +634,20 @@ mod tests {
             );
             // No coalesce_key — mirrors are flat-table per-row dispatch.
             assert!(mapper.coalesce_key(&dummy_row()).is_none());
+        }
+    }
+
+    /// Track E1 / T2 HIGH-5 — lock the projection columns for
+    /// `HT_Rooms_Cancel` so a refactor can't silently drop one. The
+    /// mirror PG table has 6 source columns + 2 bookkeeping columns.
+    #[test]
+    fn rooms_cancel_mapper_projects_six_source_columns() {
+        let select = RoomsCancelMirrorMapper.select_sql();
+        for col in &["id", "room_no", "cin_no", "cancel_date", "cancel_by", "cancel_note"] {
+            assert!(
+                select.contains(col),
+                "select_sql must project {col}; got: {select}"
+            );
         }
     }
 

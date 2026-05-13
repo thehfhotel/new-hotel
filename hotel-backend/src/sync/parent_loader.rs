@@ -150,6 +150,16 @@ pub async fn load_booking_aggregate(
     )
     .await?;
 
+    // Track E1 / T2 MED-1 (audit 2026-05-13) — `HT_Book_Date` rows are
+    // loaded here for aggregate completeness (the booking-aggregate
+    // shape mirrors the legacy schema's three-table composition) but
+    // the canonical projection in `sync/mappers/booking.rs::
+    // project_aggregate` does NOT currently surface them. The per-night
+    // `Book_ok` cancellation state would feed an "n nights cancelled
+    // mid-stay" facet on `ht_bookings` (Track G surface), but until
+    // that column lands the rows are dropped intentionally rather than
+    // bag-on-the-floor accidentally. The data sits in `agg.nights`
+    // ready for the projection to read when E2/G adds the column.
     let nights = fetch_rows(
         mssql,
         "HT_Book_Date",

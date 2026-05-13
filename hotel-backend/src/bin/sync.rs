@@ -73,9 +73,11 @@ use hotel_backend::sync::mappers::{
     BillDebtDsMirrorMapper, BillDebtHMirrorMapper, BookingDatesMapper, BookingHeaderMapper,
     BookingRoomsMapper, ChangedRoomMirrorMapper, CheckInHeaderMapper, CheckInRoomsMapper,
     CheckinProductMirrorMapper, CuponMirrorMapper, CustomerMapper, DepositMirrorMapper,
-    PaymentMapper, ReceiptMapper, RoomMasterMapper, RoomStatusMapper,
+    GuestRegistryMapper, PaymentMapper, ReceiptMapper, RoomMasterMapper, RoomStatusMapper,
+    RoomsCancelMirrorMapper,
 };
 use hotel_backend::sync::parent_loader::{load_booking_aggregate, load_checkin_aggregate};
+use hotel_backend::sync::row::MappableRow;
 use hotel_backend::sync::{MssqlChangeMapper, NoopMapper};
 use hotel_backend::writeback::verify_ct_schema_fingerprint;
 
@@ -193,6 +195,15 @@ const CT_ENABLED_TABLES: &[&str] = &[
     "HT_Changed_Room",
     "HT_Bill_Debt_H",
     "HT_Bill_Debt_Ds",
+    // Phase 5/E1 — Track E1 (audit 2026-05-13) sync-gap closure.
+    // `HT_CheckIn_Other_People` (T2 HIGH-3): newly CT-enabled by
+    // legacy-mssql migration 022, mapped to canonical `ht_guest_registry`
+    // for TM.30 immigration compliance.
+    // `HT_Rooms_Cancel` (T2 HIGH-5): CT enabled back in Phase 5 (migration
+    // 020) but had no mapper — dangling subscription closed by a new
+    // mirror mapper.
+    "HT_CheckIn_Other_People",
+    "HT_Rooms_Cancel",
 ];
 
 #[tokio::main]
@@ -1247,6 +1258,10 @@ fn build_mappers(allowlist: &Option<HashSet<String>>) -> Vec<Box<dyn MssqlChange
             "HT_Changed_Room" => Box::new(ChangedRoomMirrorMapper),
             "HT_Bill_Debt_H" => Box::new(BillDebtHMirrorMapper),
             "HT_Bill_Debt_Ds" => Box::new(BillDebtDsMirrorMapper),
+            // Track E1 — companion-guest projection (canonical) +
+            // cancelled-room mirror (legacy_mirror pass-through).
+            "HT_CheckIn_Other_People" => Box::new(GuestRegistryMapper),
+            "HT_Rooms_Cancel" => Box::new(RoomsCancelMirrorMapper),
             other => Box::new(NoopMapper { table_name: other }),
         };
         out.push(mapper);
@@ -1476,7 +1491,16 @@ async fn poll_table(
         .iter()
         .any(|(_, _, r)| mapper.coalesce_key(r).is_some());
 
-    if any_coalesce_key {
+    // Track E1 / T2 HIGH-6 — for `HT_CheckIn_Ds` we MUST use the
+    // aggregate path even when every row is a D-only event (no
+    // sibling I/U row to surface the parent Cin_No). The orphan-
+    // recovery branch below back-queries `ht_checkins` to find the
+    // parent. Per-row dispatch would route to `CheckInRoomsMapper::
+    // apply` which intentionally returns `Ok(None)` (coalesced
+    // semantics) — leaving the canonical aggregate stale forever.
+    let force_coalesce_for_orphan_recovery = table == "HT_CheckIn_Ds" && !rows.is_empty();
+
+    if any_coalesce_key || force_coalesce_for_orphan_recovery {
         for (version, op_char, _row) in &rows {
             // We still parse the op code to surface unknown operations
             // loudly (matches the per-row path's behaviour). Beyond
@@ -1503,6 +1527,80 @@ async fn poll_table(
         for (_v, _op, row) in &rows {
             if let Some(k) = mapper.coalesce_key(row) {
                 keys.insert(k);
+            }
+        }
+
+        // Track E1 / T2 HIGH-6 — D-event orphan recovery for
+        // `HT_CheckIn_Ds`. The CT projection on a D row nulls every
+        // `t.<col>` (LEFT JOIN), so `coalesce_key` (which reads
+        // `Cin_No`) returns None. If there's no sibling header CT row
+        // in the same tick, the parent `Cin_no` is never collected
+        // and the canonical row stays stale forever — a pure D-only
+        // batch (rare under iHOTEL's normal flow but possible after a
+        // cancel-detail-row-only edit) gets silently dropped.
+        //
+        // Recover by back-querying `ht_checkins.legacy_checkin_ds_id`
+        // for each PK in the batch that produced no key. The PG row
+        // is the canonical record of which `HT_CheckIn_Ds.id` belongs
+        // to which `Cin_no`, written during the original Insert sync.
+        // If the lookup misses (mirror never had the row), log a WARN
+        // and let the next CT tick on the parent header handle it.
+        if table == "HT_CheckIn_Ds" {
+            for (_v, op_char, row) in &rows {
+                if mapper.coalesce_key(row).is_some() {
+                    continue; // already collected via I/U row
+                }
+                // Only D rows can produce None (per CheckInRoomsMapper
+                // contract); other op codes were already warned about
+                // upstream.
+                if op_char != "D" {
+                    continue;
+                }
+                let Some(ds_id) = row.try_get_i32("id").ok().flatten() else {
+                    tracing::warn!(
+                        table,
+                        "D-event row missing `id` PK alias — cannot recover \
+                         parent Cin_no; canonical row may stay stale"
+                    );
+                    continue;
+                };
+                match sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT legacy_cin_no FROM ht_checkins \
+                       WHERE legacy_checkin_ds_id = $1 LIMIT 1",
+                )
+                .bind(ds_id)
+                .fetch_optional(&mut *tx)
+                .await
+                {
+                    Ok(Some(Some(cin_no))) => {
+                        tracing::debug!(
+                            table,
+                            ds_id,
+                            cin_no = %cin_no,
+                            "D-event orphan recovery: resolved parent Cin_no \
+                             via ht_checkins.legacy_checkin_ds_id"
+                        );
+                        keys.insert(cin_no);
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            table,
+                            ds_id,
+                            "D-event orphan recovery FAILED: no ht_checkins \
+                             row carries legacy_checkin_ds_id={ds_id}; \
+                             canonical aggregate may stay stale until next \
+                             CT tick on the parent header",
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            table,
+                            ds_id,
+                            error = %err,
+                            "D-event orphan recovery query errored; skipping"
+                        );
+                    }
+                }
             }
         }
 
@@ -2082,13 +2180,14 @@ mod tests {
     }
 
     #[test]
-    fn build_mappers_no_allowlist_returns_all_sixteen() {
+    fn build_mappers_no_allowlist_returns_all_enabled_tables() {
         let mappers = build_mappers(&None);
         assert_eq!(mappers.len(), CT_ENABLED_TABLES.len());
         assert_eq!(
             mappers.len(),
-            16,
-            "16 CT-enabled tables expected (10 canonical + 6 legacy_mirror)"
+            18,
+            "18 CT-enabled tables expected (10 canonical + 6 legacy_mirror \
+             + 2 Track-E1: HT_CheckIn_Other_People + HT_Rooms_Cancel)"
         );
     }
 
@@ -2200,8 +2299,38 @@ mod tests {
         }
     }
 
+    /// Track E1 (audit 2026-05-13) — `HT_CheckIn_Other_People` +
+    /// `HT_Rooms_Cancel` get real mappers. Locks the wiring so a
+    /// refactor can't silently regress them to NoopMapper (which would
+    /// re-open the TM.30 stale-registry bug and the dangling-CT
+    /// retention leak respectively).
     #[test]
-    fn ct_enabled_tables_match_migration_017_and_022_seed() {
+    fn build_mappers_wires_track_e1_tables_to_real_mappers() {
+        let cases: &[(&str, &[&str], &str)] = &[
+            ("HT_CheckIn_Other_People", &["id"], "Cin_contry"),
+            ("HT_Rooms_Cancel", &["id"], "cancel_note"),
+        ];
+        for (t, expected_pk, projection_marker) in cases {
+            let mut allow = HashSet::new();
+            allow.insert((*t).to_string());
+            let mappers = build_mappers(&Some(allow));
+            assert_eq!(mappers.len(), 1, "{t}: expected one mapper");
+            assert_eq!(
+                mappers[0].primary_key_cols(),
+                *expected_pk,
+                "{t} must be wired to its real Track-E1 mapper, not NoopMapper"
+            );
+            assert!(
+                mappers[0].select_sql().contains(projection_marker),
+                "{t} projection must include {projection_marker}; \
+                 got: {}",
+                mappers[0].select_sql()
+            );
+        }
+    }
+
+    #[test]
+    fn ct_enabled_tables_match_migration_017_022_and_033_seed() {
         let expected = [
             // Phase 5 — canonical sync (migration 017)
             "HT_Customers",
@@ -2221,6 +2350,9 @@ mod tests {
             "HT_Changed_Room",
             "HT_Bill_Debt_H",
             "HT_Bill_Debt_Ds",
+            // Phase 5/E1 — Track E1 sync-gap closure (migration 033)
+            "HT_CheckIn_Other_People",
+            "HT_Rooms_Cancel",
         ];
         assert_eq!(CT_ENABLED_TABLES, &expected);
     }

@@ -299,6 +299,14 @@ pub async fn apply_checkin_aggregate(
     // Booking is OPTIONAL — walk-ins write `Cin_Book_no=''`. Only defer
     // when the legacy carries a non-empty `Cin_Book_no` AND the parent
     // booking row hasn't landed yet.
+    //
+    // Track E1 / T2 MED-4 (audit 2026-05-13) — the walk-in short-circuit
+    // matches BOTH `Some("")` (legitimate walk-in) AND `None` (the
+    // legacy column was NULL OR a parse failure upstream set
+    // `legacy_book_id=None`). The two are operationally distinct:
+    // a walk-in is normal flow; a parse failure is a sync-quality
+    // signal worth investigating. The debug log below lets operators
+    // distinguish the two cases in production trace output.
     let book_id_opt = match projection.legacy_book_id.as_deref() {
         Some(id) if !id.is_empty() => {
             match resolve::resolve_booking_id(tx, Some(id)).await? {
@@ -313,7 +321,17 @@ pub async fn apply_checkin_aggregate(
                 }
             }
         }
-        _ => None,
+        other => {
+            tracing::debug!(
+                target: "sync::checkin",
+                cin_no,
+                legacy_book_id = ?other,
+                "walk-in short-circuit (no parent booking lookup): \
+                 distinguishes Some(\"\") = legitimate walk-in vs None = \
+                 NULL/parse-failure on Cin_Book_no"
+            );
+            None
+        }
     };
 
     let (cin_id_serial, agg_id, was_insert) = match existing {

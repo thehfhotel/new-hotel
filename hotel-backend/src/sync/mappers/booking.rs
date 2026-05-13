@@ -365,6 +365,20 @@ async fn apply_cancelled(
 // Projection helpers
 // -----------------------------------------------------------------------------
 
+/// Project the legacy booking aggregate (`HT_Book_H` + `HT_Book_Ds` +
+/// `HT_Book_Date`) onto our canonical PG row shape.
+///
+/// **Intentional drop (Track E1 / T2 MED-1, audit 2026-05-13):** the
+/// per-night `agg.nights` collection (loaded from `HT_Book_Date`) is
+/// NOT read here. Each `Book_Date` row carries `Book_ok` which the
+/// legacy app flips to `1` when that specific night is cancelled
+/// mid-stay (e.g. guest checks out early on a 5-night booking → 2 of
+/// the 5 `Book_Date` rows flip). Surfacing a "nights cancelled" count
+/// on `ht_bookings` waits on a Track E2 / Track G schema column —
+/// until then the aggregate parent-loader keeps the rows present (so
+/// the bus shape mirrors the legacy schema) and this projection
+/// drops them. See `parent_loader::load_booking_aggregate` for the
+/// matching note on the load side.
 fn project_aggregate(
     agg: &BookingAggregate,
     book_id: &str,

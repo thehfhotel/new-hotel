@@ -238,11 +238,17 @@ CREATE TABLE IF NOT EXISTS ht_guest_registry (
     guest_nationality VARCHAR(50),
     guest_is_primary BOOLEAN DEFAULT false,
     guest_created_at TIMESTAMP DEFAULT NOW(),
+    -- Track E1 / migration 034 — legacy IDENTITY from
+    -- HT_CheckIn_Other_People.id. NULL for rows authored locally
+    -- without a legacy counterpart; UNIQUE so the sync mapper can
+    -- UPSERT cleanly through iHOTEL's DELETE+REINSERT edit pattern.
+    guest_legacy_id INTEGER,
 
     CONSTRAINT fk_ht_guestreg_checkin FOREIGN KEY (guest_cin_id)
         REFERENCES ht_checkins(cin_id) ON DELETE CASCADE,
     CONSTRAINT fk_ht_guestreg_customer FOREIGN KEY (guest_cust_id)
-        REFERENCES ht_customers(cust_id)
+        REFERENCES ht_customers(cust_id),
+    CONSTRAINT uq_ht_guest_registry_legacy_id UNIQUE (guest_legacy_id)
 );
 CREATE INDEX IF NOT EXISTS ix_ht_guestreg_checkin ON ht_guest_registry(guest_cin_id);
 
@@ -1203,6 +1209,31 @@ ON CONFLICT (version) DO NOTHING;
 -- (031 is intentionally absent — it was never landed.)
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('032', '032_ht_reconcile_log_cardinality.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
+-- Migration 033: Track E1 sync_status seed (HT_CheckIn_Other_People +
+-- HT_Rooms_Cancel). Two CT-watched tables get mappers in 2.63.12; the
+-- watcher requires a matching legacy_sync_status row to track per-tick
+-- progress. Seed for drift-check parity.
+-- =============================================================================
+
+INSERT INTO legacy_sync_status (table_name)
+VALUES
+    ('HT_CheckIn_Other_People'),
+    ('HT_Rooms_Cancel')
+ON CONFLICT (table_name) DO NOTHING;
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('033', '033_sync_status_seed_track_e1.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 034 — `ht_guest_registry.guest_legacy_id` column + UNIQUE
+-- constraint to support the Track E1 companion-guest sync mapper. The
+-- column is inlined into the CREATE TABLE block above; this seed row
+-- marks the migration as applied for fresh deploys.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('034', '034_ht_guest_registry_legacy_id.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================

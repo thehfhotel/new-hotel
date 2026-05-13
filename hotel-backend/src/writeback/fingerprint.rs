@@ -70,10 +70,12 @@ pub const FINGERPRINTED_TABLES: &[&str] = WRITEBACK_FINGERPRINTED_TABLES;
 /// fingerprint must cover but the writeback worker never touches.
 /// Four mirror tables (`HT_CheckIn_Product`, `HT_Deposit`,
 /// `HT_Bill_Debt_H`, `HT_Bill_Debt_Ds`) PLUS one user-impact table
-/// (`HT_CheckIn_Other_People` — TM.30 immigration registry that the
-/// CT watcher does NOT yet have a mapper for; Track E HIGH-3 will
-/// add the mapper, but fingerprinting up-front avoids a separate
-/// baseline bump when that lands).
+/// (`HT_CheckIn_Other_People` — TM.30 immigration registry).
+///
+/// Track E1 (audit 2026-05-13 T2 HIGH-3) wired `HT_CheckIn_Other_People`
+/// to a real `GuestRegistryMapper` — the table was already fingerprinted
+/// here by Track D so no baseline bump was needed when the mapper
+/// landed.
 ///
 /// The full CT-side fingerprint set is the union of
 /// [`WRITEBACK_FINGERPRINTED_TABLES`] + [`CT_EXTRA_FINGERPRINTED_TABLES`];
@@ -714,8 +716,9 @@ mod tests {
 
     /// Track D / T7 HIGH-3 — the 5 CT-extra tables are exactly the
     /// ones the audit named. Locking the list so a future refactor
-    /// can't silently drop one (e.g. `HT_CheckIn_Other_People` is
-    /// easy to forget because no mapper exists for it yet).
+    /// can't silently drop one (`HT_CheckIn_Other_People` gained its
+    /// mapper in Track E1 but stays in this list — the fingerprint
+    /// guard is independent of mapper presence).
     #[test]
     fn ct_extra_fingerprinted_tables_matches_audit_set() {
         let expected = [
