@@ -5,6 +5,78 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [vNext] - 2026-05-13 (Track B3)
+
+### Fixed
+
+- **Track B3 — Dashboard read-path junction reads (`audit-2026-05-13.md`
+  T3 CRIT-2, T3 HIGH-1, T3 HIGH-3).** The read-side counterpart to Track
+  B2's sync mapper rewrite. Dashboard queries previously joined on
+  `ht_checkins.cin_room_id` only, so every multi-room folio collapsed to
+  its first room on the dashboard tiles, morning-checkout list, calendar
+  matrix, and `/api/calendar` feed. B3 walks `ht_checkin_rooms` (one row
+  per actual room, populated by B2's mapper) with a `COALESCE` fallback
+  to the deprecated header-level `cin_room_id` for pre-B2 folios that
+  haven't been re-synced through the new mapper yet.
+  - **`routes::rooms::ROOM_PROJECTION`** (T3 CRIT-2): the EXISTS
+    subqueries that compute `room_use` and `room_book` now OR on
+    `ht_checkin_rooms` membership in addition to the legacy
+    `cin_room_id`. Secondary rooms of a multi-room folio correctly
+    flip to `room_use = 'yes'` on the dashboard.
+  - **`routes::rooms::get_checkouts_today_pg`** (T3 HIGH-3): switched
+    from `JOIN ht_checkins c ON c.cin_room_id = r.room_id` to
+    `LEFT JOIN ht_checkin_rooms cr + JOIN ht_rooms_new r ON
+    r.room_id = COALESCE(cr.cr_room_id, c.cin_room_id)`. A 2-room
+    folio now emits both rooms in the morning-checkout list, matching
+    the receptionist's actual workload.
+  - **`routes::rooms::get_room_status_pg`** (T3 CRIT-2): the per-room
+    calendar matrix CTE was rewritten to project one `(folio, room)`
+    pair per junction row, with the same `COALESCE` fallback. Both
+    rooms of a multi-room folio turn `'เข้าพัก'` on the matrix.
+  - **`routes::stats::get_stats_pg`** (T3 HIGH-1): `occupied_rooms` and
+    `checkout_rooms` switched from `COUNT(DISTINCT cin_room_id)` to
+    `COUNT(DISTINCT COALESCE(cr.cr_room_id, c.cin_room_id))` over a
+    `LEFT JOIN ht_checkin_rooms`. The `booked_rooms` NOT-EXISTS guard
+    was widened in the same shape so rooms 2..N of an active multi-room
+    folio don't leak back into the "booked" bucket.
+  - **`routes::calendar::fetch_new_calendar_data`** (T3 CRIT-2): the
+    checkin query switched from `INNER JOIN ht_rooms_new ON
+    cin_room_id` to `LEFT JOIN ht_checkin_rooms + INNER JOIN
+    ht_rooms_new ON COALESCE(cr.cr_room_id, ci.cin_room_id)`, emitting
+    one calendar entry per `(folio, room)` pair. The synthetic id
+    widened from `new-checkin-<cin_id>` to
+    `new-checkin-<cin_id>-<room_id>` so the frontend's `seenIds`
+    dedup keeps every room (pre-B3 it collapsed rooms 2..N to room 1
+    of the same folio).
+  - **`tests/test_dashboard_b3_multiroom.rs`**: new integration suite
+    seeding a 2-room folio (1 customer, 2 rooms, 1 active checkin,
+    2 junction rows) and asserting each B3-touched route surfaces
+    both rooms. Covers `ROOM_PROJECTION.room_use`,
+    `get_checkouts_today_pg`, `get_room_status_pg`,
+    `stats.occupied_rooms`, `stats.checkout_rooms`, and
+    `calendar.fetch_new_calendar_data`. A companion fallback test
+    seeds a junction-less folio and asserts the `cin_room_id`
+    fallback path still surfaces its room (covers the pre-B2
+    backfill gap; goes away with B5).
+  - **`docs/coexistence/CARDINALITY_MAP.md`**: `ht_checkin_rooms` row's
+    "Read path" cell updated from `B3 follow-on (currently none ...)`
+    to the three concrete route modules that now consume the
+    junction (`routes/rooms.rs`, `routes/stats.rs`,
+    `routes/calendar.rs`).
+  - **Out of B3 scope** (kept for follow-on sub-waves):
+    - `routes::rooms::get_room_pg`'s "current guest" subquery still
+      joins on `cin_room_id` — fine for click-through-by-room
+      semantics where the room IS the primary axis, but secondary
+      rooms of a multi-room folio see no current guest on the room
+      detail page. Tracked for B3.1 if/when receptionists report it.
+    - `routes::new_reports.rs`, `routes::new_invoice.rs`,
+      `routes::new_checkins.rs`, `routes::checkins.rs`,
+      `routes::occupancy.rs` still read header-only `cin_room_id`.
+      These are not dashboard reads (per audit T3) and their
+      multi-room behavior is tracked under follow-ups.
+    - `ht_checkins.cin_room_id` column kept (DEPRECATED). B5 drops
+      it once historical folios are backfilled into the junction.
+
 ## [vNext] - 2026-05-13 (Track B2)
 
 ### Fixed

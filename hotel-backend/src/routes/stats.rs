@@ -119,10 +119,20 @@ async fn get_stats_pg(pool: &PgPool) -> ApiResult<DashboardStats> {
 
     // Occupied rooms: distinct rooms with an active checkin, EXCLUDING
     // those that have already flipped to "checkout today" (handled below).
+    //
+    // ## Track B3 / T3 HIGH-1 — count rooms through the junction
+    //
+    // Pre-B3 this counted `DISTINCT c.cin_room_id`, which collapsed every
+    // multi-room folio to its first room. Now walks `ht_checkin_rooms`
+    // (one row per actual room) with a `COALESCE` fallback to header-level
+    // `cin_room_id` for pre-B2 folios that haven't been re-synced through
+    // the B2 mapper. After B5 backfill the fallback is dead code and the
+    // column drops.
     let occupied_rooms: i64 = sqlx::query(&format!(
         r#"
-        SELECT COUNT(DISTINCT c.cin_room_id) AS count
+        SELECT COUNT(DISTINCT COALESCE(cr.cr_room_id, c.cin_room_id)) AS count
         FROM ht_checkins c
+        LEFT JOIN ht_checkin_rooms cr ON cr.cr_cin_id = c.cin_id
         WHERE c.cin_status = 'active'
           AND c.cin_checkout_time IS NULL
           AND NOT (
@@ -140,10 +150,15 @@ async fn get_stats_pg(pool: &PgPool) -> ApiResult<DashboardStats> {
 
     // Checkout rooms: active checkin whose expected checkout is today,
     // and the morning grace period (06:00 BKK) has passed.
+    //
+    // Track B3 / T3 HIGH-3: same junction-walk pattern as `occupied_rooms`
+    // — the morning checkout tile must enumerate every room of a
+    // multi-room folio, not just the first.
     let checkout_rooms: i64 = sqlx::query(&format!(
         r#"
-        SELECT COUNT(DISTINCT c.cin_room_id) AS count
+        SELECT COUNT(DISTINCT COALESCE(cr.cr_room_id, c.cin_room_id)) AS count
         FROM ht_checkins c
+        LEFT JOIN ht_checkin_rooms cr ON cr.cr_cin_id = c.cin_id
         WHERE c.cin_status = 'active'
           AND c.cin_checkout_time IS NULL
           AND c.cin_expected_checkout = {today}
@@ -159,6 +174,11 @@ async fn get_stats_pg(pool: &PgPool) -> ApiResult<DashboardStats> {
 
     // Booked rooms: distinct rooms with a confirmed/pending booking
     // straddling today (BKK), with no active checkin in that room yet.
+    //
+    // Track B3 / T3 HIGH-1: the "no active checkin in that room" guard
+    // now also walks `ht_checkin_rooms` so a 2-room folio doesn't
+    // inadvertently leak rooms 2..N back into the "booked" bucket while
+    // the folio is checked in.
     let booked_rooms: i64 = sqlx::query(&format!(
         r#"
         SELECT COUNT(DISTINCT br.br_room_id) AS count
@@ -169,9 +189,16 @@ async fn get_stats_pg(pool: &PgPool) -> ApiResult<DashboardStats> {
           AND b.book_checkout > {today}
           AND NOT EXISTS (
               SELECT 1 FROM ht_checkins c
-              WHERE c.cin_room_id = br.br_room_id
-                AND c.cin_status = 'active'
+              WHERE c.cin_status = 'active'
                 AND c.cin_checkout_time IS NULL
+                AND (
+                    c.cin_room_id = br.br_room_id
+                    OR EXISTS (
+                        SELECT 1 FROM ht_checkin_rooms cr
+                        WHERE cr.cr_cin_id = c.cin_id
+                          AND cr.cr_room_id = br.br_room_id
+                    )
+                )
           )
         "#,
         today = BANGKOK_TODAY_SQL,

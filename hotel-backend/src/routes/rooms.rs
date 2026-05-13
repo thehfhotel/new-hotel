@@ -41,6 +41,21 @@ use crate::routes::mode::{AppState, Branch};
 /// `Room_Book` returns the booking number of a currently active reservation
 /// (today between book_checkin and book_checkout, confirmed/pending) when
 /// the room is not currently in use — matching the legacy mirror semantics.
+///
+/// ## Track B3 / T3 CRIT-2 — multi-room junction reads
+///
+/// Pre-B3 the "room is in use?" predicate only joined on
+/// `ht_checkins.cin_room_id`, which collapsed every multi-room folio to
+/// its first room (Theme 1 of `audit-2026-05-13.md`). B3 adds an OR-clause
+/// against the canonical `ht_checkin_rooms` junction (one row per
+/// `HT_CheckIn_Ds` row, populated by B2's mapper) so secondary rooms 2..N
+/// of a multi-room folio also flip to `room_use = 'yes'`.
+///
+/// The legacy `cin_room_id` branch is kept additive: per CARDINALITY_MAP
+/// the column is DEPRECATED but stays in place until B5 backfills every
+/// historical folio into the junction. Until then it remains the only
+/// signal for any pre-B2 row that hasn't been re-synced through the new
+/// mapper.
 const ROOM_PROJECTION: &str = r#"
     r.room_no AS room_no,
     COALESCE(rt.type_name, '') AS room_type,
@@ -48,9 +63,16 @@ const ROOM_PROJECTION: &str = r#"
     CASE WHEN r.room_clean THEN 'yes' ELSE 'no' END AS room_clean,
     CASE WHEN EXISTS (
         SELECT 1 FROM ht_checkins c
-        WHERE c.cin_room_id = r.room_id
-          AND c.cin_status = 'active'
+        WHERE c.cin_status = 'active'
           AND c.cin_checkout_time IS NULL
+          AND (
+              c.cin_room_id = r.room_id
+              OR EXISTS (
+                  SELECT 1 FROM ht_checkin_rooms cr
+                  WHERE cr.cr_cin_id = c.cin_id
+                    AND cr.cr_room_id = r.room_id
+              )
+          )
     ) THEN 'yes' ELSE 'no' END AS room_use,
     COALESCE((
         SELECT b.book_no::text
@@ -62,9 +84,16 @@ const ROOM_PROJECTION: &str = r#"
           AND b.book_checkout > CURRENT_DATE
           AND NOT EXISTS (
               SELECT 1 FROM ht_checkins c2
-              WHERE c2.cin_room_id = r.room_id
-                AND c2.cin_status = 'active'
+              WHERE c2.cin_status = 'active'
                 AND c2.cin_checkout_time IS NULL
+                AND (
+                    c2.cin_room_id = r.room_id
+                    OR EXISTS (
+                        SELECT 1 FROM ht_checkin_rooms cr2
+                        WHERE cr2.cr_cin_id = c2.cin_id
+                          AND cr2.cr_room_id = r.room_id
+                    )
+                )
           )
         LIMIT 1
     ), '') AS room_book,
@@ -214,12 +243,23 @@ async fn get_room_legacy_only(pool: &crate::db::PgPool, room_no: &str) -> ApiRes
 /// audit T3 MED-1 + MED-2: the prior `CURRENT_DATE` / `EXTRACT(HOUR FROM
 /// NOW())` shape evaluated in UTC, which delayed the morning flip until
 /// 13:00 BKK.
+///
+/// ## Track B3 / T3 CRIT-2 — multi-room junction reads
+///
+/// Walks through `ht_checkin_rooms` so a 2-room folio surfaces BOTH room
+/// numbers (pre-B3 the `JOIN ON cin_room_id` shape collapsed to the first
+/// room only). The `LEFT JOIN` on the junction with `COALESCE` falls back
+/// to the legacy `cin_room_id` for any pre-B2 row that hasn't been
+/// re-synced through the new mapper yet — see CARDINALITY_MAP's
+/// `ht_checkins.cin_room_id` DEPRECATED note. After B5's backfill the
+/// fallback becomes dead code and the column drops.
 async fn get_checkouts_today_pg(pool: &crate::db::PgPool) -> ApiResult<Vec<String>> {
     let rows = sqlx::query(&format!(
         r#"
         SELECT DISTINCT r.room_no AS room_no
-        FROM ht_rooms_new r
-        JOIN ht_checkins c ON c.cin_room_id = r.room_id
+        FROM ht_checkins c
+        LEFT JOIN ht_checkin_rooms cr ON cr.cr_cin_id = c.cin_id
+        JOIN ht_rooms_new r ON r.room_id = COALESCE(cr.cr_room_id, c.cin_room_id)
         WHERE c.cin_status = 'active'
           AND c.cin_expected_checkout = {today}
           AND c.cin_checkout_time IS NULL
@@ -249,10 +289,15 @@ async fn get_checkouts_today_pg(pool: &crate::db::PgPool) -> ApiResult<Vec<Strin
 /// Sources:
 /// - `ht_rooms_new` filtered to `room_active = true` — active inventory only
 /// - `ht_room_types` for the displayed `room_type` (`type_name`)
-/// - `ht_checkins` joined on `cin_room_id` (canonical FK, not the legacy
-///   string `cin_room_no`). Occupancy window is
-///   `[cin_checkin_time::date, COALESCE(cin_checkout_time::date, cin_expected_checkout))`.
-///   Restricted to non-cancelled rows (`cin_status IN ('active','checkedout')`).
+/// - `ht_checkins` joined through the `ht_checkin_rooms` junction (Track
+///   B3 / T3 CRIT-2). `COALESCE(cr.cr_room_id, ci.cin_room_id)` resolves
+///   the room identity: when the junction has any rows for the folio,
+///   they are authoritative (one row per actual room); otherwise the
+///   header-level `cin_room_id` is the fallback for pre-B2 folios that
+///   haven't been re-synced through the new mapper. Occupancy window
+///   is `[cin_checkin_time::date, COALESCE(cin_checkout_time::date,
+///   cin_expected_checkout))`. Restricted to non-cancelled rows
+///   (`cin_status IN ('active','checkedout')`).
 /// - `ht_bookings` joined via `ht_booking_rooms` on `br_room_id`. Reservation
 ///   window is `[book_checkin, book_checkout)`. Restricted to
 ///   `book_status IN ('confirmed','pending','checkedin')`. Checkin takes
@@ -274,6 +319,24 @@ async fn get_room_status_pg(
 
     let rows = sqlx::query(
         r#"
+        WITH checkin_rooms AS (
+            -- One row per (folio, room) pair. The junction takes
+            -- precedence when present; falls back to header-level
+            -- `cin_room_id` for pre-B2 folios. After B5 backfill the
+            -- LEFT JOIN always yields a non-null cr_room_id and the
+            -- COALESCE branch becomes dead.
+            SELECT
+                ci.cin_id,
+                ci.cin_no,
+                ci.cin_status,
+                ci.cin_checkin_time,
+                ci.cin_checkout_time,
+                ci.cin_expected_checkout,
+                COALESCE(cr.cr_room_id, ci.cin_room_id) AS room_id
+            FROM ht_checkins ci
+            LEFT JOIN ht_checkin_rooms cr ON cr.cr_cin_id = ci.cin_id
+            WHERE ci.cin_status IN ('active', 'checkedout')
+        )
         SELECT
             r.room_no,
             d.dt::timestamp AS room_date,
@@ -288,9 +351,8 @@ async fn get_room_status_pg(
         FROM ht_rooms_new r
         LEFT JOIN ht_room_types rt ON rt.type_id = r.room_type_id
         CROSS JOIN generate_series($1::date, $2::date, '1 day'::interval) AS d(dt)
-        LEFT JOIN ht_checkins ci
-            ON ci.cin_room_id = r.room_id
-            AND ci.cin_status IN ('active', 'checkedout')
+        LEFT JOIN checkin_rooms ci
+            ON ci.room_id = r.room_id
             AND d.dt::date >= ci.cin_checkin_time::date
             AND d.dt::date < COALESCE(ci.cin_checkout_time::date, ci.cin_expected_checkout)
         LEFT JOIN ht_booking_rooms br
