@@ -1,6 +1,7 @@
 // spike(ci): cargo-nextest measurement marker — comment-only touch
 // to force the backend paths-filter to fire test-backend on this branch.
 // Do NOT merge.
+// warm-cache tickle 1
 
 //! Shared test infrastructure for integration tests.
 //!
