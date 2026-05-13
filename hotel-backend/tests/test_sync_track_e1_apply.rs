@@ -28,6 +28,65 @@ async fn cleanup_guest(pool: &sqlx::PgPool) {
         .expect("cleanup guest");
 }
 
+/// Test-scoped marker for the room + customer the seed routine
+/// creates if the CI database is fresh. Tests that need a brand-new
+/// room set this up themselves; the lookup is exact-match so it can't
+/// race with other tests.
+const FIXTURE_ROOM_NO: &str = "TRACK-E1-RM";
+const FIXTURE_CUST_FIRSTNAME: &str = "TRACK-E1-CUST";
+
+/// Ensure at least one room and customer row exist for the test
+/// fixtures (CI's fresh DB has neither). Idempotent — re-running just
+/// finds the existing row. Returns `(cust_id, room_id)`.
+async fn ensure_fixture_room_and_customer(pool: &sqlx::PgPool) -> (i32, i32) {
+    let cust_id: i32 = sqlx::query_scalar(
+        "INSERT INTO ht_customers (cust_firstname) VALUES ($1) \
+         ON CONFLICT DO NOTHING \
+         RETURNING cust_id",
+    )
+    .bind(FIXTURE_CUST_FIRSTNAME)
+    .fetch_optional(pool)
+    .await
+    .expect("insert fixture cust")
+    .unwrap_or_else(|| {
+        // Already existed — re-fetch.
+        0
+    });
+    let cust_id = if cust_id > 0 {
+        cust_id
+    } else {
+        sqlx::query_scalar(
+            "SELECT cust_id FROM ht_customers WHERE cust_firstname = $1 LIMIT 1",
+        )
+        .bind(FIXTURE_CUST_FIRSTNAME)
+        .fetch_one(pool)
+        .await
+        .expect("fixture cust must exist post-insert")
+    };
+
+    let room_id: i32 = sqlx::query_scalar(
+        "INSERT INTO ht_rooms_new (room_no) VALUES ($1) \
+         ON CONFLICT (room_no) DO NOTHING \
+         RETURNING room_id",
+    )
+    .bind(FIXTURE_ROOM_NO)
+    .fetch_optional(pool)
+    .await
+    .expect("insert fixture room")
+    .unwrap_or(0);
+    let room_id = if room_id > 0 {
+        room_id
+    } else {
+        sqlx::query_scalar("SELECT room_id FROM ht_rooms_new WHERE room_no = $1 LIMIT 1")
+            .bind(FIXTURE_ROOM_NO)
+            .fetch_one(pool)
+            .await
+            .expect("fixture room must exist post-insert")
+    };
+
+    (cust_id, room_id)
+}
+
 /// Seed a parent check-in row so the mapper's FK lookup hits. Returns
 /// the canonical `cin_id` for assertion. Idempotent across runs (uses
 /// a fixed `legacy_cin_no` test marker).
@@ -46,17 +105,7 @@ async fn seed_parent_checkin(pool: &sqlx::PgPool, legacy_cin_no: &str) -> i32 {
         .execute(pool)
         .await
         .ok();
-    // Minimal valid row — cin_room_id NOT NULL needs a real room FK.
-    // Reuse the first room in ht_rooms_new; tests that need a fresh
-    // room set this up themselves.
-    let room_id: i32 = sqlx::query_scalar("SELECT room_id FROM ht_rooms_new LIMIT 1")
-        .fetch_one(pool)
-        .await
-        .expect("at least one room must exist for the test fixture");
-    let cust_id: i32 = sqlx::query_scalar("SELECT cust_id FROM ht_customers LIMIT 1")
-        .fetch_one(pool)
-        .await
-        .expect("at least one customer must exist for the test fixture");
+    let (cust_id, room_id) = ensure_fixture_room_and_customer(pool).await;
     let cin_id: i32 = sqlx::query_scalar(
         "INSERT INTO ht_checkins \
             (cin_cust_id, cin_room_id, cin_checkin_time, cin_expected_checkout, \
@@ -355,14 +404,7 @@ async fn high_6_back_query_resolves_cin_no_from_legacy_checkin_ds_id() {
         .await
         .ok();
 
-    let room_id: i32 = sqlx::query_scalar("SELECT room_id FROM ht_rooms_new LIMIT 1")
-        .fetch_one(&pool)
-        .await
-        .expect("at least one room must exist for the test fixture");
-    let cust_id: i32 = sqlx::query_scalar("SELECT cust_id FROM ht_customers LIMIT 1")
-        .fetch_one(&pool)
-        .await
-        .expect("at least one customer must exist for the test fixture");
+    let (cust_id, room_id) = ensure_fixture_room_and_customer(&pool).await;
     sqlx::query(
         "INSERT INTO ht_checkins \
             (cin_cust_id, cin_room_id, cin_checkin_time, cin_expected_checkout, \
