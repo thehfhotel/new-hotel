@@ -101,6 +101,12 @@ pub struct PaymentInputs<'a> {
     /// single source; the prior `Utc::now()` recompute could straddle BKK
     /// midnight between the two rows. Tests pin a fixed instant.
     pub created_at: DateTime<Utc>,
+    /// Wave 5c — VAT percentage to apply to this receipt. Plumbed in from
+    /// `ht_settings.vat_percent` by the service layer so the hotel can
+    /// toggle between 0%/7% without a code change. The prior hardcoded
+    /// [`RECEIPT_VAT_PERCENT`] constant is now only the fallback when the
+    /// settings row is missing (e.g. older queued intents).
+    pub vat_percent: i32,
 }
 
 /// Build the payment + receipt statements. PURE — no I/O.
@@ -140,18 +146,38 @@ pub fn build_statements(
         .unwrap_or(amount / nights as f64);
     let price_per_night_2dp = money_2dp(price_per_night)?;
 
-    // Tender column: cash → Cin_Pay_Cash; credit/transfer → Cin_Pay_Credit.
-    // Cin_Pay_Tran is the bank-transfer column — only filled when neither
-    // cash nor credit was tendered (e.g. PromptPay / wire). Cin_Pay_web is
-    // online-payment; today always 0.00. Verified across 24 captured rows
+    // Tender column: cash → Cin_Pay_Cash; credit → Cin_Pay_Credit;
+    // transfer → Cin_Pay_Tran (bank-transfer / PromptPay-wire).
+    // Cin_Pay_web is the online / QR / app-payment column (Wave 5c —
+    // routed via PaymentMethod::Web). Verified across 24 captured rows
     // in /tmp/legacy-events-full.log.
-    let (cash_2dp, credit_2dp, transfer_2dp) = match inputs.method {
-        PaymentMethod::Cash => (money_2dp(amount)?, money_2dp(0.0)?, money_2dp(0.0)?),
-        PaymentMethod::Credit => (money_2dp(0.0)?, money_2dp(amount)?, money_2dp(0.0)?),
-        PaymentMethod::Transfer => (money_2dp(0.0)?, money_2dp(0.0)?, money_2dp(amount)?),
+    let (cash_2dp, credit_2dp, transfer_2dp, web_2dp) = match inputs.method {
+        PaymentMethod::Cash => (
+            money_2dp(amount)?,
+            money_2dp(0.0)?,
+            money_2dp(0.0)?,
+            money_2dp(0.0)?,
+        ),
+        PaymentMethod::Credit => (
+            money_2dp(0.0)?,
+            money_2dp(amount)?,
+            money_2dp(0.0)?,
+            money_2dp(0.0)?,
+        ),
+        PaymentMethod::Transfer => (
+            money_2dp(0.0)?,
+            money_2dp(0.0)?,
+            money_2dp(amount)?,
+            money_2dp(0.0)?,
+        ),
+        PaymentMethod::Web => (
+            money_2dp(0.0)?,
+            money_2dp(0.0)?,
+            money_2dp(0.0)?,
+            money_2dp(amount)?,
+        ),
     };
     let free_2dp = money_2dp(0.0)?;
-    let web_2dp = money_2dp(0.0)?;
 
     let receipt_tax_q = sql_quote(inputs.receipt_tax);
     let stay_note = match (inputs.stay_check_in, inputs.stay_check_out) {
@@ -166,7 +192,11 @@ pub fn build_statements(
     });
     let receipt_status_q = sql_quote(RECEIPT_STATUS_NORMAL);
     let vat_in_q = sql_quote(RECEIPT_VAT_INCLUSIVE);
-    let (before_vat, vat) = vat_inclusive_split(amount, RECEIPT_VAT_PERCENT);
+    // Wave 5c: VAT percent threaded in from `ht_settings.vat_percent`
+    // (service-layer plumbing). At 0% the split degenerates to
+    // `(amount, 0)` so receipts come out VAT-free; at 7% it matches the
+    // legacy capture math `Total/1.07`.
+    let (before_vat, vat) = vat_inclusive_split(amount, inputs.vat_percent);
     let before_vat_2dp = money_2dp(before_vat)?;
     let vat_2dp = money_2dp(vat)?;
 
@@ -313,7 +343,7 @@ pub fn build_statements(
          {cust_tel_q},'',{amount_2dp},{vat_2dp},{before_vat_2dp},{vat_in_q},\
          {vat_per},{receipt_status_q},0,{cin_no_q},{cust_no_q},{amount_2dp},{stay_note_q},\
          {receipt_tax_q},{note_up_q})",
-        vat_per = RECEIPT_VAT_PERCENT,
+        vat_per = inputs.vat_percent,
     ));
 
     // 7. HT_Receipt_Ds — receipt line for the room charge. Audit H4: the
@@ -355,6 +385,7 @@ pub async fn execute(
     checkin_ds_id: Option<i32>,
     price_per_night_baht: Option<f64>,
     nights: Option<i32>,
+    vat_percent: Option<i32>,
 ) -> WritebackResult<LegacyIds> {
     if receipt.customer_name.is_empty()
         && receipt.customer_address.is_empty()
@@ -409,6 +440,10 @@ pub async fn execute(
         from_booking: false,
         receipt_tax: "",
         created_at,
+        // Wave 5c: fall back to the legacy hardcoded constant when the
+        // route didn't plumb a value through (older queued intents that
+        // pre-date the ht_settings.vat_percent lookup).
+        vat_percent: vat_percent.unwrap_or(RECEIPT_VAT_PERCENT),
     };
     let statements = build_statements(&inputs)?;
     super::execute_all(conn, &statements).await?;
@@ -451,6 +486,9 @@ mod tests {
             // T6 HIGH-1: fixed instant so Cin_Pay_Date and Receipt_Date are
             // deterministic for byte-parity assertions.
             created_at: Utc.with_ymd_and_hms(2026, 4, 25, 4, 35, 47).unwrap(),
+            // Wave 5c: hotel's standard Thai 7% VAT — matches the captured
+            // legacy rows (so byte-for-byte tests below stay green).
+            vat_percent: 7,
         }
     }
 
@@ -889,6 +927,74 @@ mod tests {
         assert!(
             pay.contains(",2,1780.00,890.00,"),
             "fallback price_per_night must be amount/nights; got:\n{pay}"
+        );
+    }
+
+    /// Wave 5c — QR / online payments must land in the `Cin_Pay_web`
+    /// column (the rightmost tender slot, after Branch). The other four
+    /// tender columns stay zero so the legacy invariant
+    /// `Cin_Pay_Ds_Price = Cash + Credit + Free + Tran + Web` still
+    /// equals the tendered amount.
+    #[test]
+    fn payment_recipe_emits_to_cin_pay_web_for_qr_method() {
+        let mut inputs = sample_inputs();
+        inputs.method = PaymentMethod::Web;
+        let s = build_statements(&inputs).unwrap();
+        let pay = s.iter().find(|s| s.contains("[HT_CheckIn_Pay]")).unwrap();
+        // Cash + Credit columns (positions 3-4 of the SELECT tuple) both 0.
+        assert!(
+            pay.contains(",801.00,'รายการ',"),
+            "Cin_Pay_Ds_Price still equals the tender amount; got:\n{pay}"
+        );
+        // Cash=0, Credit=0 immediately after the 'CH26-005236','414' prefix.
+        assert!(
+            pay.contains("SELECT 'CH26-005236','414',0.00,0.00,"),
+            "Cash + Credit must both be 0.00 for Web tender; got:\n{pay}"
+        );
+        // Branch then Cin_Pay_web — Web=801.00 lands at the tail.
+        assert!(
+            pay.contains(",0.00,0.00,'สำนักงานใหญ่',801.00 WHERE NOT EXISTS"),
+            "Web tender amount must land in Cin_Pay_web (last column before \
+             idempotency guard); got:\n{pay}"
+        );
+        // Free + Tran columns also 0 (the 17th + 18th values).
+        // The shape after PriceOne is `,'',OPERATOR,0.00,0.00,'สำนักงานใหญ่',…`
+        // — Free + Tran are the two `0.00` flanking Branch.
+        let tail = ",'Admin',0.00,0.00,'สำนักงานใหญ่',801.00";
+        assert!(
+            pay.contains(tail),
+            "Free + Tran columns must both be 0.00 when method is Web; got:\n{pay}"
+        );
+        // Confirm split-tender invariant via debug_assert (panics on mismatch
+        // in build_statements). If the build returned, the invariant held.
+    }
+
+    /// Wave 5c — VAT split is driven by `inputs.vat_percent` not the
+    /// hardcoded constant. At 0% the split degenerates to
+    /// `(amount, 0)` so the receipt header carries the gross amount as
+    /// BeforeVat with zero VAT; the legacy `Receipt_VatPer` column also
+    /// echoes the configured percent.
+    #[test]
+    fn vat_split_respects_settings_vat_percent() {
+        // 7% — matches the legacy capture (sanity).
+        let inputs_7 = sample_inputs();
+        let s_7 = build_statements(&inputs_7).unwrap();
+        let h_7 = s_7.iter().find(|s| s.contains("[HT_Receipt_H]")).unwrap();
+        // 801.00 / 1.07 → BeforeVat=748.60, Vat=52.40, VatPer=7.
+        assert!(
+            h_7.contains(",801.00,52.40,748.60,'True',7,"),
+            "at 7% VAT, Receipt_H must carry the legacy split; got:\n{h_7}"
+        );
+
+        // 0% — VAT disabled; BeforeVat == amount, Vat == 0, VatPer=0.
+        let mut inputs_0 = sample_inputs();
+        inputs_0.vat_percent = 0;
+        let s_0 = build_statements(&inputs_0).unwrap();
+        let h_0 = s_0.iter().find(|s| s.contains("[HT_Receipt_H]")).unwrap();
+        assert!(
+            h_0.contains(",801.00,0.00,801.00,'True',0,"),
+            "at 0% VAT, Receipt_H must carry (Total, 0, Total, 'True', 0); \
+             got:\n{h_0}"
         );
     }
 }

@@ -63,6 +63,12 @@ pub struct RecordPaymentCommand {
     /// pass `ht_checkins.expected_checkout - check_in_time` clamped to
     /// >=1. `None` defaults to 1 in the recipe.
     pub nights: Option<i32>,
+    /// Wave 5c — VAT percent read from `ht_settings.vat_percent` by the
+    /// route. Threads into the writeback recipe so the printed receipt
+    /// honors the hotel's configured rate (0%/7%) instead of the
+    /// hardcoded legacy constant. `None` lets the recipe fall back to
+    /// the hardcoded default — used by tests / older queue rows.
+    pub vat_percent: Option<i32>,
     pub source: EventSource,
 }
 
@@ -172,6 +178,9 @@ impl PaymentService {
             // stamp `legacy_pay_no` / `legacy_receipt_no` on after the
             // recipe allocates them.
             payment_aggregate_id: Some(payment_aggregate_id),
+            // Wave 5c: thread `ht_settings.vat_percent` through so the
+            // legacy receipt header carries the hotel-configured rate.
+            vat_percent: cmd.vat_percent,
         };
         // Use the payment id (not the check-in id) as the idempotency
         // discriminator so multiple payments against the same check-in
@@ -241,10 +250,16 @@ impl PaymentService {
 
 /// Map [`PaymentMethod`] to the lowercase string the `ht_payments.pay_method`
 /// column accepts. Mirrors the convention used by the existing route layer.
+///
+/// `Web` deliberately renders as `"qr"` (not `"web"`) so the canonical PG row
+/// keeps the wire-contract value the dashboard / SSE feed has shipped with
+/// since the QR feature landed — Wave 5c only routes the **legacy** column
+/// (`Cin_Pay_web`); the canonical name is unchanged.
 fn method_to_legacy_string(method: PaymentMethod) -> &'static str {
     match method {
         PaymentMethod::Cash => "cash",
         PaymentMethod::Credit => "credit",
         PaymentMethod::Transfer => "transfer",
+        PaymentMethod::Web => "qr",
     }
 }

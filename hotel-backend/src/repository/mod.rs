@@ -29,6 +29,7 @@ pub mod inventory;
 pub mod payment;
 pub mod room;
 pub mod session;
+pub mod settings;
 pub mod user;
 
 pub use booking::{BookingRepository, PgBookingRepository};

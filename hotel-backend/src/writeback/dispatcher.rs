@@ -349,6 +349,7 @@ pub async fn dispatch(
             price_per_night_baht,
             nights,
             payment_aggregate_id: _,
+            vat_percent,
         } => {
             let cin_no = nonempty(resolved.legacy_cin_no.as_ref()).ok_or_else(|| {
                 WritebackError::Recipe("RecordPayment requires resolved legacy_cin_no".into())
@@ -370,6 +371,7 @@ pub async fn dispatch(
                 *checkin_ds_id,
                 *price_per_night_baht,
                 *nights,
+                *vat_percent,
             )
             .await
         }

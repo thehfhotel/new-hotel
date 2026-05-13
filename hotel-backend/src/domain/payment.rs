@@ -33,6 +33,13 @@ pub enum PaymentMethod {
     Cash,
     Credit,
     Transfer,
+    /// Online / QR / PromptPay-app payment. Wave 5c — routed to the
+    /// `HT_CheckIn_Pay.Cin_Pay_web` column so iHOTEL reports surface the
+    /// tender (the legacy "web" tender bucket the .NET app already
+    /// supports for online payments). Canonical PG `ht_payments.pay_method`
+    /// continues to carry the literal `"qr"` value so the wire contract
+    /// + dashboards stay stable.
+    Web,
 }
 
 impl PaymentMethod {
@@ -40,12 +47,14 @@ impl PaymentMethod {
     ///
     /// Mirrors the recipe in `writeback::recipes::payment::build_statements`
     /// and `COMPAT_CHEATSHEET.md:515` — bank transfers (PromptPay / wire) land
-    /// in `Cin_Pay_Tran`, not `Cin_Pay_Credit`.
+    /// in `Cin_Pay_Tran`, not `Cin_Pay_Credit`. QR / online payments land in
+    /// `Cin_Pay_web` per `audit-2026-05-13.md` Wave 5c.
     pub fn legacy_column(self) -> &'static str {
         match self {
             PaymentMethod::Cash => "Cin_Pay_Cash",
             PaymentMethod::Credit => "Cin_Pay_Credit",
             PaymentMethod::Transfer => "Cin_Pay_Tran",
+            PaymentMethod::Web => "Cin_Pay_web",
         }
     }
 }
@@ -70,5 +79,13 @@ mod tests {
         // COMPAT_CHEATSHEET.md:515 — bank transfers are the third tender
         // column, distinct from credit cards.
         assert_eq!(PaymentMethod::Transfer.legacy_column(), "Cin_Pay_Tran");
+    }
+
+    #[test]
+    fn web_method_routes_to_web_column() {
+        // Wave 5c: QR / online tender routes to Cin_Pay_web so iHOTEL
+        // legacy reports include it (was previously bypassing writeback
+        // entirely via `insert_qr_payment_directly`).
+        assert_eq!(PaymentMethod::Web.legacy_column(), "Cin_Pay_web");
     }
 }

@@ -345,7 +345,11 @@ VALUES
     ('hotel.check_out_time', '12:00', 'string', 'Default check-out time'),
     ('booking.prefix', 'BK', 'string', 'Booking number prefix'),
     ('checkin.prefix', 'CI', 'string', 'Check-in number prefix'),
-    ('customer.prefix', 'CU', 'string', 'Customer code prefix')
+    ('customer.prefix', 'CU', 'string', 'Customer code prefix'),
+    -- Wave 5c (migration 038): receipt VAT percent for the legacy
+    -- HT_Receipt_H.Receipt_VatPer column. Read by
+    -- `repository::settings::get_vat_percent` at payment time.
+    ('vat_percent', '7.0', 'string', 'Receipt VAT percent (Wave 5c)')
 ON CONFLICT (setting_key) DO NOTHING;
 
 -- =============================================================================

@@ -183,6 +183,13 @@ pub enum WritebackIntent {
         /// back-population step (older queued intents won't carry it).
         #[serde(default)]
         payment_aggregate_id: Option<Uuid>,
+        /// Wave 5c — VAT percentage to apply on `HT_Receipt_H`. Read by
+        /// the service layer from `ht_settings.vat_percent` so the hotel
+        /// can flip between 0%/7% without a code change. `None` makes the
+        /// recipe fall back to the legacy hardcoded constant (defensive
+        /// for queue rows enqueued before this field landed).
+        #[serde(default)]
+        vat_percent: Option<i32>,
     },
 
     /// Spike §3j — `UPDATE HT_Rooms` (by `id`, not `room_no`!) +

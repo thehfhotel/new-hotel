@@ -5,6 +5,68 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.63.15] - 2026-05-13
+
+### Added
+
+- **Wave 5c — QR / web payment routing to `Cin_Pay_web` (`audit-2026-05-13.md`
+  Decision #1).** Closes the writeback-audit-2026-05-12 Wave 5c deferral.
+  Previously the `POST /api/new/checkins/:id/payments` endpoint short-circuited
+  `method = "qr"` through `insert_qr_payment_directly` — a direct
+  `ht_payments` insert that bypassed `record_payment` entirely, never
+  enqueued a `WritebackIntent::RecordPayment`, and consequently was
+  invisible to iHOTEL's legacy reports.
+  - `domain::payment::PaymentMethod::Web` — new variant whose
+    `legacy_column()` returns `"Cin_Pay_web"` (alongside the existing
+    Cash / Credit / Tran columns).
+  - `routes::new_payments` — `"qr"` now maps to `PaymentMethod::Web` and
+    flows through `record_payment`, so the canonical write, outbox
+    enqueue, and event publish all happen atomically.
+  - `writeback::recipes::payment` — tender-column match extended to route
+    `Web → Cin_Pay_web`; the legacy split-tender invariant
+    `Cin_Pay_Ds_Price = Cash + Credit + Free + Tran + Web` still holds
+    (asserted via `debug_assert!` in `build_statements`).
+  - `service::payment::method_to_legacy_string` — `Web` deliberately
+    renders as `"qr"` (not `"web"`) in `ht_payments.pay_method` so the
+    canonical wire contract / dashboard SSE feeds stay stable.
+  - Test: `payment_recipe_emits_to_cin_pay_web_for_qr_method`.
+
+- **Wave 5c — VAT percent read from `ht_settings.vat_percent` instead of
+  hardcoded constant (`audit-2026-05-13.md` Decision #2).** The legacy
+  `HT_Receipt_H.Receipt_VatPer` column previously stamped the value of
+  `writeback::constants::RECEIPT_VAT_PERCENT = 7` verbatim, forcing a
+  code-change-+-deploy cycle to flip between 0% and 7%.
+  - `repository::settings::get_vat_percent` — new helper that reads
+    `ht_settings.setting_value` keyed on `'vat_percent'`. Falls back to
+    `DEFAULT_VAT_PERCENT = 7` on missing row / NULL / unparseable string /
+    PG error (best-effort lookup; payment flow must not block on a
+    settings hiccup). Accepts integer (`"7"`) or decimal (`"7.0"`) shapes.
+  - `service::RecordPaymentCommand.vat_percent: Option<i32>` — threaded
+    through to `WritebackIntent::RecordPayment.vat_percent` and into the
+    writeback recipe's `PaymentInputs.vat_percent`.
+  - `writeback::recipes::payment` — `vat_inclusive_split` now consumes
+    `inputs.vat_percent`; the recipe falls back to the legacy constant
+    only for queue rows enqueued before this field landed.
+  - `migrations/pg/038_seed_vat_percent.sql` — seeds the row with
+    `setting_value='7.0'`. To flip:
+    `UPDATE ht_settings SET setting_value='0' WHERE setting_key='vat_percent'`.
+  - Test: `vat_split_respects_settings_vat_percent` — verifies that at 0%
+    Receipt_H emits `(Total, 0, Total, 'True', 0)` and at 7% it emits the
+    legacy capture split.
+
+### Changed
+
+- `routes::new_payments` — the `insert_qr_payment_directly` bypass
+  function is retired; all four tender methods (`cash` / `credit` /
+  `transfer` / `qr`) now go through `state.payments_service.record_payment`.
+- `WritebackIntent::RecordPayment` gained a `vat_percent: Option<i32>`
+  field. Older queued intents deserialize with `None` (via
+  `#[serde(default)]`) and the recipe falls back to the legacy hardcoded
+  default — no replay required.
+- `writeback::recipes::payment::execute` signature extended with a
+  trailing `vat_percent: Option<i32>` parameter (already wrapped in
+  `#[allow(clippy::too_many_arguments)]`).
+
 ## [2.63.14] - 2026-05-13
 
 ### Fixed

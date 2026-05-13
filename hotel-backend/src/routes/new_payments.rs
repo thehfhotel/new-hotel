@@ -5,14 +5,16 @@
 //! - DELETE /api/new/payments/:id - Void a payment (soft delete)
 //!
 //! Per `docs/architecture.md` §1, §6 (Phase 2.5) the create handler
-//! delegates to `state.payments_service` for the three legacy-known tender
-//! methods (cash / credit / transfer) so the canonical write, outbox
-//! enqueue, and event publish all happen atomically. The QR method has no
-//! legacy counterpart yet (and no `PaymentMethod::Qr` variant in the
-//! domain enum); that path stays on the repository so the wire contract
-//! preserves the literal `"qr"` value in `ht_payments.pay_method`. The
+//! delegates to `state.payments_service` for every legacy-known tender
+//! method (cash / credit / transfer / qr → Web column) so the canonical
+//! write, outbox enqueue, and event publish all happen atomically. The
 //! list + void handlers stay on the repository (reads + a soft-delete
 //! that has no service method yet).
+//!
+//! Wave 5c: QR / online payments map to `PaymentMethod::Web`, which the
+//! writeback recipe routes to `HT_CheckIn_Pay.Cin_Pay_web`. Canonical PG
+//! `ht_payments.pay_method` continues to carry the literal `"qr"` string
+//! so dashboards / SSE keep their existing wire contract.
 
 use axum::{
     extract::{Path, State},
@@ -27,7 +29,8 @@ use crate::domain::payment::PaymentMethod;
 use crate::error::{ApiError, ApiResult};
 use crate::outbox::event::EventSource;
 use crate::outbox::intent::RecordPaymentReceipt;
-use crate::repository::payment::{PaymentInsert, PaymentRow};
+use crate::repository::payment::PaymentRow;
+use crate::repository::settings;
 use crate::service::RecordPaymentCommand;
 
 /// Payment from HT_Payments table
@@ -147,11 +150,13 @@ pub async fn list_payments(
 
 /// POST /api/new/checkins/:id/payments - Record a payment
 ///
-/// Cash / credit / transfer flow through [`crate::service::PaymentService::record_payment`]
-/// for atomic canonical write + outbox enqueue + event publish. The legacy
-/// "qr" tender has no `PaymentMethod` variant yet, so it falls back to a
-/// direct repository insert — preserving the literal `"qr"` string value
-/// in `ht_payments.pay_method` for the wire contract.
+/// All four tender methods (cash / credit / transfer / qr) flow through
+/// [`crate::service::PaymentService::record_payment`] for atomic canonical
+/// write + outbox enqueue + event publish. The QR method maps to the
+/// `PaymentMethod::Web` variant, which the writeback recipe routes to
+/// the legacy `HT_CheckIn_Pay.Cin_Pay_web` column so iHOTEL reports surface
+/// the tender. Canonical PG `ht_payments.pay_method` continues to carry
+/// `"qr"` for wire-contract stability.
 pub async fn create_payment(
     State(state): State<AppState>,
     Path(cin_id): Path<i32>,
@@ -175,50 +180,58 @@ pub async fn create_payment(
         return Err(ApiError::NotFound("Check-in not found".to_string()));
     }
 
-    let pay_id = match parse_payment_method(&method) {
-        Some(domain_method) => {
-            let receipt = build_receipt_header(&state, cin_id).await?;
-            // Per-room apportionment: spike §3h capture line 3 fires
-            // `UPDATE HT_CheckIn_Ds SET Cin_Room_Pay_Total=<amt>, Cin_note=''`
-            // just before inserting the payment. The route currently doesn't
-            // know which room a payment maps to (single-room check-ins are
-            // unambiguous; multi-room would need an explicit body field).
-            // Until that wire-contract change lands, leave `None` so the
-            // recipe skips the per-room UPDATE — header totals still settle.
-            // TODO: thread `room_id` through `CreatePaymentRequest` for
-            // multi-room support.
-            let checkin_ds_id: Option<i32> = None;
-            // Wave 5a item 2: resolve the canonical per-night rate + nights
-            // from `ht_checkins` so the writeback recipe stamps the real
-            // values into `HT_CheckIn_Pay.Cin_Pay_Ds_PriceOne` /
-            // `Cin_Pay_Ds_Num` instead of deriving them as `amount/nights`.
-            let (price_per_night_baht, nights) = resolve_checkin_billing(&state, cin_id).await;
-            let outcome = state
-                .payments_service
-                .record_payment(RecordPaymentCommand {
-                    check_in_id: cin_id,
-                    amount_satang: baht_f64_to_satang(body.amount),
-                    method: domain_method,
-                    reference: body.reference.clone(),
-                    notes: body.notes.clone(),
-                    created_by: body.created_by.clone(),
-                    receipt,
-                    checkin_ds_id,
-                    price_per_night_baht,
-                    nights,
-                    // TODO: wire user_id from auth middleware
-                    source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
-                })
-                .await?;
-            outcome.pay_id
-        }
-        None => insert_qr_payment_directly(&state, cin_id, &body, &method).await?,
-    };
+    let domain_method = parse_payment_method(&method).ok_or_else(|| {
+        // Defensive: the `valid_methods` check above already screens unknown
+        // strings, so an unmappable method here is a programming error
+        // (a new tender added to `valid_methods` without a domain variant).
+        ApiError::BadRequest(format!("Unmapped payment method '{method}'"))
+    })?;
+
+    let receipt = build_receipt_header(&state, cin_id).await?;
+    // Per-room apportionment: spike §3h capture line 3 fires
+    // `UPDATE HT_CheckIn_Ds SET Cin_Room_Pay_Total=<amt>, Cin_note=''`
+    // just before inserting the payment. The route currently doesn't
+    // know which room a payment maps to (single-room check-ins are
+    // unambiguous; multi-room would need an explicit body field).
+    // Until that wire-contract change lands, leave `None` so the
+    // recipe skips the per-room UPDATE — header totals still settle.
+    // TODO: thread `room_id` through `CreatePaymentRequest` for
+    // multi-room support.
+    let checkin_ds_id: Option<i32> = None;
+    // Wave 5a item 2: resolve the canonical per-night rate + nights
+    // from `ht_checkins` so the writeback recipe stamps the real
+    // values into `HT_CheckIn_Pay.Cin_Pay_Ds_PriceOne` /
+    // `Cin_Pay_Ds_Num` instead of deriving them as `amount/nights`.
+    let (price_per_night_baht, nights) = resolve_checkin_billing(&state, cin_id).await;
+    // Wave 5c: read `ht_settings.vat_percent` so the writeback recipe
+    // stamps the hotel-configured rate into `HT_Receipt_H.Receipt_VatPer`
+    // instead of the hardcoded constant. Lookup is best-effort — falls
+    // back to DEFAULT_VAT_PERCENT on error so payments never block on a
+    // settings hiccup.
+    let vat_percent = Some(settings::get_vat_percent(&state.new_pool).await);
+    let outcome = state
+        .payments_service
+        .record_payment(RecordPaymentCommand {
+            check_in_id: cin_id,
+            amount_satang: baht_f64_to_satang(body.amount),
+            method: domain_method,
+            reference: body.reference.clone(),
+            notes: body.notes.clone(),
+            created_by: body.created_by.clone(),
+            receipt,
+            checkin_ds_id,
+            price_per_night_baht,
+            nights,
+            vat_percent,
+            // TODO: wire user_id from auth middleware
+            source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
+        })
+        .await?;
 
     Ok(Json(PaymentMutationResponse {
         success: true,
         message: "Payment recorded successfully".to_string(),
-        id: Some(pay_id),
+        id: Some(outcome.pay_id),
     }))
 }
 
@@ -258,6 +271,11 @@ fn parse_payment_method(method: &str) -> Option<PaymentMethod> {
         "cash" => Some(PaymentMethod::Cash),
         "credit" => Some(PaymentMethod::Credit),
         "transfer" => Some(PaymentMethod::Transfer),
+        // Wave 5c: "qr" maps to the Web tender variant. The service still
+        // persists `ht_payments.pay_method = "qr"` in canonical PG so the
+        // wire contract stays stable; the writeback recipe routes the
+        // amount to `HT_CheckIn_Pay.Cin_Pay_web` on the legacy side.
+        "qr" => Some(PaymentMethod::Web),
         _ => None,
     }
 }
@@ -325,30 +343,7 @@ async fn resolve_checkin_billing(
     }
 }
 
-/// Direct repository insert for the "qr" tender method. Preserves the
-/// literal column value (`pay_method = 'qr'`) since the domain
-/// [`PaymentMethod`] enum has no `Qr` variant today.
-async fn insert_qr_payment_directly(
-    state: &AppState,
-    cin_id: i32,
-    body: &CreatePaymentRequest,
-    method_lc: &str,
-) -> ApiResult<i32> {
-    let mut tx = state.new_pool.begin().await?;
-    let pay_id = state
-        .payments
-        .insert(
-            &mut tx,
-            PaymentInsert {
-                cin_id,
-                amount: body.amount,
-                method: method_lc,
-                reference: body.reference.as_deref(),
-                notes: body.notes.as_deref(),
-                created_by: body.created_by.as_deref(),
-            },
-        )
-        .await?;
-    tx.commit().await?;
-    Ok(pay_id)
-}
+// Wave 5c: the prior `insert_qr_payment_directly` bypass was retired —
+// QR / "qr" tender now flows through `record_payment` and reaches the
+// legacy `HT_CheckIn_Pay.Cin_Pay_web` column via the writeback recipe.
+// See `docs/coexistence/audit-2026-05-13.md` Wave 5c notes.
