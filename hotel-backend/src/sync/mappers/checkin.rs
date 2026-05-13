@@ -819,6 +819,14 @@ fn project_aggregate(
 /// Track B2 / T2 CRIT-1 (`docs/coexistence/audit-2026-05-13.md`):
 /// pre-B2 the mapper kept only the FIRST room. That bug is the head of
 /// every multi-room cardinality failure documented in audit Theme 1.
+///
+/// Missing-column probe semantics: `try_get_*` errors when a column is
+/// not present in the row. Production rows always carry the full
+/// projection from `parent_loader::load_checkin_aggregate`, but legacy
+/// fixtures (pre-B2 test rows) may omit columns the B2 widening added.
+/// The helpers below collapse "missing" and "NULL" to the same
+/// `Option::None` so fixtures using a sparse `ds_row` shape remain
+/// projectable without per-test backfill.
 fn project_rooms(rooms: &[HashMapRow]) -> Result<Vec<CanonicalRoom>, SyncError> {
     let mut out = Vec::with_capacity(rooms.len());
     for r in rooms {
@@ -844,20 +852,18 @@ fn project_rooms(rooms: &[HashMapRow]) -> Result<Vec<CanonicalRoom>, SyncError> 
             .try_get_str("Cin_Room_Status")?
             .unwrap_or_default()
             .to_string();
-        let cr_room_in = r.try_get_datetime("Cin_Room_In")?;
-        let cr_room_out = r.try_get_datetime("Cin_Room_Out")?;
-        let cr_rate_per_night = r.try_get_decimal("Cin_Room_Price")?.unwrap_or(0.0);
+        let cr_room_in = optional_datetime(r, "Cin_Room_In");
+        let cr_room_out = optional_datetime(r, "Cin_Room_Out");
+        let cr_rate_per_night = optional_decimal(r, "Cin_Room_Price").unwrap_or(0.0);
         // The legacy column is `Cin_Room_Night` (capital N on Night per
         // schema dump §3.4) — keep verbatim.
-        let cr_nights = r.try_get_i32("Cin_Room_Night")?.unwrap_or(1);
-        let cr_room_total = r
-            .try_get_decimal("Cin_Room_PriceToTal")?
-            .unwrap_or(0.0);
-        let cr_dep_amount = r.try_get_decimal("Cin_dep")?.unwrap_or(0.0);
-        let cr_dep_status = r.try_get_str("Cin_dep_status")?.map(str::to_string);
-        let cr_dep_returned_at = r.try_get_datetime("Cin_dep_returned")?;
-        let cr_dep_returned_by = r.try_get_str("Cin_dep_returned_by")?.map(str::to_string);
-        let cr_legacy_ds_id = r.try_get_i32("id")?;
+        let cr_nights = optional_i32(r, "Cin_Room_Night").unwrap_or(1);
+        let cr_room_total = optional_decimal(r, "Cin_Room_PriceToTal").unwrap_or(0.0);
+        let cr_dep_amount = optional_decimal(r, "Cin_dep").unwrap_or(0.0);
+        let cr_dep_status = optional_str(r, "Cin_dep_status");
+        let cr_dep_returned_at = optional_datetime(r, "Cin_dep_returned");
+        let cr_dep_returned_by = optional_str(r, "Cin_dep_returned_by");
+        let cr_legacy_ds_id = optional_i32(r, "id");
 
         out.push(CanonicalRoom {
             legacy_room_no,
@@ -875,6 +881,26 @@ fn project_rooms(rooms: &[HashMapRow]) -> Result<Vec<CanonicalRoom>, SyncError> 
         });
     }
     Ok(out)
+}
+
+/// Collapse "column missing" and "column NULL" to `None`. Production
+/// `parent_loader::materialise` writes every projection column (NULL
+/// when absent in MSSQL), so the missing-column branch only fires for
+/// test fixtures that pre-date a projection widening.
+fn optional_str(row: &HashMapRow, col: &str) -> Option<String> {
+    row.try_get_str(col).ok().flatten().map(str::to_string)
+}
+
+fn optional_i32(row: &HashMapRow, col: &str) -> Option<i32> {
+    row.try_get_i32(col).ok().flatten()
+}
+
+fn optional_decimal(row: &HashMapRow, col: &str) -> Option<f64> {
+    row.try_get_decimal(col).ok().flatten()
+}
+
+fn optional_datetime(row: &HashMapRow, col: &str) -> Option<NaiveDateTime> {
+    row.try_get_datetime(col).ok().flatten()
 }
 
 /// Translate the legacy `Cin_status` literal to the PG canonical

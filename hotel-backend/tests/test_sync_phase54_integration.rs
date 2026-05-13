@@ -88,7 +88,18 @@ fn ds_row(cin_no: &str, room_no: &str, status: &str) -> HashMapRow {
         .with("Cin_No", MockValue::Str(cin_no.into()))
         .with("Cin_Room_No", MockValue::Str(room_no.into()))
         .with("Cin_Room_Status", MockValue::Str(status.into()))
+        .with("Cin_Room_In", MockValue::Null)
         .with("Cin_Room_Out", MockValue::Null)
+        // Track B2 — per-room operational columns the projection now
+        // mirrors into `ht_checkin_rooms`. Defaults mirror the
+        // writeback recipe's `walkin::build_statements` payload.
+        .with("Cin_Room_Price", MockValue::Decimal(890.0))
+        .with("Cin_Room_Night", MockValue::I32(1))
+        .with("Cin_Room_PriceToTal", MockValue::Decimal(890.0))
+        .with("Cin_dep", MockValue::Decimal(0.0))
+        .with("Cin_dep_status", MockValue::Null)
+        .with("Cin_dep_returned", MockValue::Null)
+        .with("Cin_dep_returned_by", MockValue::Null)
 }
 
 fn ds_row_checked_out(cin_no: &str, room_no: &str) -> HashMapRow {
