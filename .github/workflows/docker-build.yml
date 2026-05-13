@@ -431,10 +431,21 @@ jobs:
             type=sha,prefix=
             type=raw,value=latest
 
+      # Install sccache-action on the host so its post-install step exports
+      # ACTIONS_RESULTS_URL + ACTIONS_RUNTIME_TOKEN into the job env (via
+      # `core.exportVariable()`). These are the GHA Cache v2 credentials the
+      # in-Docker sccache needs; without installing the action here they
+      # would be empty and the BuildKit secret mounts below would no-op.
+      # Same pin as the test-backend job (v0.0.10). We don't actually run
+      # sccache on the host here — we only need its env-export side effect.
+      - name: Install sccache-action (export GHA cache v2 env vars)
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696  # v0.0.10
+        continue-on-error: true
+
       # Probe runner env so we can route the GHA cache v2 endpoint into
       # BuildKit as secrets (SPIKE — chore/spike-sccache-gha-docker).
-      # These two env vars are populated by GitHub on every runner and are
-      # what mozilla-actions/sccache-action forwards on the host. The
+      # These two env vars are populated by the sccache-action above (it
+      # calls core.exportVariable() in its post-install step). The
       # Dockerfile's chef/builder RUN steps consume them via secret mounts
       # so sccache can hit the v2 cache service from inside BuildKit.
       # ACTIONS_CACHE_SERVICE_V2 must also be set to "on" for sccache to
@@ -458,6 +469,16 @@ jobs:
             echo "::warning::ACTIONS_RESULTS_URL or ACTIONS_RUNTIME_TOKEN empty — sccache GHA backend will no-op."
             echo "ready=false" >> "$GITHUB_OUTPUT"
           fi
+
+      # Fail loud if the GHA cache v2 secret files end up empty — that means
+      # the sccache-action above didn't export its env vars and the BuildKit
+      # secrets would be empty (sccache aborts with "cache url for ghac not
+      # found"). Catches future wiring breakage at the step that broke it
+      # instead of deep inside the docker build log.
+      - name: Verify GHA tokens are populated for BuildKit secrets
+        run: |
+          [ -s /tmp/actions_results_url ] || { echo "::error::actions_results_url file is empty — sccache-action didn't export ACTIONS_RESULTS_URL"; exit 1; }
+          [ -s /tmp/actions_runtime_token ] || { echo "::error::actions_runtime_token file is empty — sccache-action didn't export ACTIONS_RUNTIME_TOKEN"; exit 1; }
 
       - name: Build and push backend
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
