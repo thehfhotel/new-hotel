@@ -118,7 +118,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
     --mount=type=cache,target=/usr/src/app/target,id=hotel-backend-target \
     --mount=type=cache,target=/sccache,id=sccache-backend \
-    cargo chef cook --release --recipe-path recipe.json \
+    cargo chef cook --profile release-fast --recipe-path recipe.json \
     && sccache --show-stats
 
 # Step 2: COPY the full source. Now the deps are pre-compiled in target/
@@ -132,7 +132,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
     --mount=type=cache,target=/usr/src/app/target,id=hotel-backend-target \
     --mount=type=cache,target=/sccache,id=sccache-backend \
-    cargo build --release --locked \
+    cargo build --profile release-fast --locked \
         --bin hotel-backend \
         --bin writeback \
         --bin sync \
@@ -141,12 +141,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
         --bin create_user \
     && sccache --show-stats \
     && mkdir -p /out \
-    && cp target/release/hotel-backend /out/ \
-    && cp target/release/writeback /out/ \
-    && cp target/release/sync /out/ \
-    && cp target/release/backfill_rooms /out/ \
-    && cp target/release/migrate_legacy /out/ \
-    && cp target/release/create_user /out/
+    && cp target/release-fast/hotel-backend /out/ \
+    && cp target/release-fast/writeback /out/ \
+    && cp target/release-fast/sync /out/ \
+    && cp target/release-fast/backfill_rooms /out/ \
+    && cp target/release-fast/migrate_legacy /out/ \
+    && cp target/release-fast/create_user /out/
 
 # ---- Runtime stage --------------------------------------------------------
 # Pin to digest. Source: Docker Hub API `library/debian/tags/bookworm-slim`

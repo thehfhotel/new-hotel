@@ -133,3 +133,24 @@ rpassword = "7"
 #   under the `cookie` feature, so this adds no new compile work.
 axum-extra = { version = "0.12", features = ["cookie"] }
 cookie = "0.18"
+
+# SPIKE (chore/spike-release-fast-profile): CI build-time optimization.
+#
+# Default `release` profile uses codegen-units=16, which constrains parallelism
+# during LLVM codegen of leaf workspace crates. The CI build of `cargo build
+# --release` (Step #23 of the docker build) takes ~194s on warm cache, and
+# sccache reports 0% hit rate (see spike notes) — so cutting codegen-unit
+# count is one of the few remaining levers for that step.
+#
+# `release-fast` inherits `release` and bumps codegen-units to 256. This trades
+# a small amount of runtime perf (less inter-CU inlining) for faster compile.
+# Acceptable for an I/O-bound API server. NOT applied to release builds by
+# default — Dockerfile / workflow would need to opt in via --profile release-fast.
+#
+# Spike measurement only — do NOT merge from this branch.
+[profile.release-fast]
+inherits = "release"
+codegen-units = 256
+lto = false
+opt-level = 3
+debug = false
