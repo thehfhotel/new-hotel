@@ -293,22 +293,46 @@ async fn fetch_new_calendar_data(
         })
         .collect();
 
-    // Fetch check-ins from HotelNew database (ht_checkins + ht_customers + ht_rooms_new)
+    // Fetch check-ins from HotelNew database (ht_checkins + ht_customers
+    // + ht_checkin_rooms junction + ht_rooms_new).
+    //
+    // ## Track B3 / T3 CRIT-2 — multi-room calendar entries
+    //
+    // Pre-B3 this query did `INNER JOIN ht_rooms_new ON cin_room_id`,
+    // which (a) emitted exactly one row per folio regardless of how many
+    // rooms were under it, and (b) combined with the frontend's
+    // `seenIds` dedup, dropped rooms 2..N entirely (the dedup key was
+    // the cin_id, which is identical across all rooms of a multi-room
+    // folio). Joining through `ht_checkin_rooms` now emits one calendar
+    // row per actual room AND yields a per-room synthetic key
+    // (`new-checkin-<cin_id>-<room_id>`) so the frontend dedup keeps
+    // every room.
+    //
+    // `LEFT JOIN ht_checkin_rooms + COALESCE` gives us:
+    //   - 2 rows for a 2-room folio whose junction is populated (B2+);
+    //   - 1 row for a legacy folio whose junction is empty (pre-B2),
+    //     using header-level `cin_room_id` as the fallback per
+    //     CARDINALITY_MAP's deprecation note.
+    //
+    // The fallback path is dead code after B5 backfill; the column
+    // drops then.
     let checkin_query = format!(
         r#"
         SELECT
             ci.cin_id,
             ci.cin_no,
+            COALESCE(cr.cr_room_id, ci.cin_room_id) AS effective_room_id,
             CONCAT(c.cust_firstname, ' ', COALESCE(c.cust_lastname, '')) AS cust_name,
             r.room_no,
             ci.cin_checkin_time,
             COALESCE(ci.cin_checkout_time, ci.cin_expected_checkout) AS cin_checkout
         FROM ht_checkins ci
         INNER JOIN ht_customers c ON ci.cin_cust_id = c.cust_id
-        INNER JOIN ht_rooms_new r ON ci.cin_room_id = r.room_id
+        LEFT JOIN ht_checkin_rooms cr ON cr.cr_cin_id = ci.cin_id
+        INNER JOIN ht_rooms_new r ON r.room_id = COALESCE(cr.cr_room_id, ci.cin_room_id)
         WHERE COALESCE(ci.cin_checkout_time, ci.cin_expected_checkout) >= '{}'
           AND ci.cin_checkin_time <= '{}'
-        ORDER BY ci.cin_checkin_time
+        ORDER BY ci.cin_checkin_time, r.room_no
         "#,
         start_date.replace('\'', "''"),
         end_date.replace('\'', "''")
@@ -322,9 +346,13 @@ async fn fetch_new_calendar_data(
         .iter()
         .map(|row| {
             let id = row.try_get::<i32, _>("cin_id").unwrap_or_default();
+            let effective_room_id = row.try_get::<i32, _>("effective_room_id").unwrap_or_default();
             let cin_no = row.try_get::<String, _>("cin_no").unwrap_or_default();
             CalendarCheckin {
-                id: format!("new-checkin-{}", id),
+                // Per-(folio, room) synthetic id so the frontend
+                // `seenIds` dedup does not collapse rooms 2..N of a
+                // multi-room folio to room 1 (T3 CRIT-2).
+                id: format!("new-checkin-{}-{}", id, effective_room_id),
                 checkin_no: cin_no,
                 customer_name: row.try_get::<String, _>("cust_name").ok(),
                 room_no: row.try_get::<String, _>("room_no").ok(),
