@@ -61,6 +61,11 @@ pub(crate) const TABLE: &str = "HT_Products";
 /// Columns the poll reads from `HT_Products`. Kept in lockstep with
 /// [`project`] so a typo on either side surfaces at the row boundary
 /// rather than as silent NULLs.
+///
+/// Public so the eventual `bin/sync.rs::tick_products_reconcile`
+/// poll body can compose the SELECT projection from a single source
+/// of truth — and so the regression test below catches drift.
+#[allow(dead_code)] // wired in when the periodic-poll harness lands
 pub(crate) const POLL_COLUMNS: &[&str] = &[
     "Pro_no",
     "Pro_Name",
