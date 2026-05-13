@@ -20,8 +20,10 @@ use crate::repository::{
     PgInventoryRepository, PgPaymentRepository, PgRoomRepository, RoomRepository,
 };
 use crate::routes::auth::ProdAuthService;
+use crate::config::SiteConfig;
 use crate::service::{
     BookingService, CheckInService, CustomerService, HousekeepingService, PaymentService,
+    ShiftService,
 };
 
 /// Bundle of fully-wired Phase-2 services produced by `AppState::wire_services`.
@@ -35,6 +37,11 @@ struct WiredServices {
     checkins: Arc<CheckInService>,
     payments: Arc<PaymentService>,
     housekeeping: Arc<HousekeepingService>,
+    /// Track F2 / T1 HIGH-5 — shift service bound to this binary's
+    /// site (read from `SITE_ID` at startup). Wired into
+    /// `PaymentService::with_shifts` so `record_payment` refuses to
+    /// insert unless an `ht_shifts` row is open.
+    shifts: Arc<ShiftService>,
 }
 
 /// System operating mode
@@ -112,6 +119,11 @@ pub struct AppState {
     pub payments_service: Arc<PaymentService>,
     /// Housekeeping service — orchestrates room cleanliness flips + events.
     pub housekeeping_service: Arc<HousekeepingService>,
+    /// Shift service — owns `ht_shifts` open/close/lookup. Track F2 /
+    /// T1 HIGH-5. Bound to this binary's `SITE_ID` so per-site cashier
+    /// rounds are isolated (`hfhotel` and `hfville` each have their
+    /// own running counter).
+    pub shifts_service: Arc<ShiftService>,
 
     // ----- Auth (Phase 4 PR2) -----
     /// Cookie-session auth service — wired with PG-backed user + session
@@ -185,6 +197,7 @@ impl AppState {
             checkins_service: services.checkins,
             payments_service: services.payments,
             housekeeping_service: services.housekeeping,
+            shifts_service: services.shifts,
             auth_service: crate::routes::auth::build_auth_service(),
             auth_enabled: false,
         }
@@ -228,6 +241,7 @@ impl AppState {
             checkins_service: services.checkins,
             payments_service: services.payments,
             housekeeping_service: services.housekeeping,
+            shifts_service: services.shifts,
             auth_service: crate::routes::auth::build_auth_service(),
             auth_enabled: false,
         }
@@ -242,9 +256,14 @@ impl AppState {
         self
     }
 
-    /// Wire all five Phase-2 services from the shared repository / outbox /
+    /// Wire all Phase-2 services from the shared repository / outbox /
     /// event-bus handles. Kept as a single helper so both `new()` and
     /// `with_mode()` produce identical service graphs.
+    ///
+    /// Track F2 / T1 HIGH-5: this is also where `ShiftService` is bound
+    /// to the binary's `SITE_ID` and threaded into
+    /// `PaymentService::with_shifts(...)` so `record_payment` refuses
+    /// the cash-drawer write when no shift is open.
     #[allow(clippy::too_many_arguments)]
     fn wire_services(
         customers: Arc<dyn CustomerRepository>,
@@ -256,6 +275,8 @@ impl AppState {
         events: Arc<EventBus>,
         pg: crate::db::PgPool,
     ) -> WiredServices {
+        let site_id = SiteConfig::from_env().id;
+        let shifts = Arc::new(ShiftService::new(pg.clone(), site_id));
         WiredServices {
             customers: Arc::new(CustomerService::new(
                 customers,
@@ -275,18 +296,22 @@ impl AppState {
                 events.clone(),
                 pg.clone(),
             )),
-            payments: Arc::new(PaymentService::new(
-                payments,
-                outbox.clone(),
-                events.clone(),
-                pg.clone(),
-            )),
+            payments: Arc::new(
+                PaymentService::new(
+                    payments,
+                    outbox.clone(),
+                    events.clone(),
+                    pg.clone(),
+                )
+                .with_shifts(shifts.clone()),
+            ),
             housekeeping: Arc::new(HousekeepingService::new(
                 rooms,
                 outbox,
                 events,
                 pg,
             )),
+            shifts,
         }
     }
 
