@@ -62,10 +62,24 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
 # instead of recompiled. Local-disk mode here (no GHA backend reachable
 # inside Docker BuildKit); the SCCACHE_DIR cache mount below persists
 # the cache across image rebuilds via BuildKit's gha cache scope.
-# Pinned 0.15.0 (latest stable 2026-05-13). Bump version + verify
+#
+# Install via pre-built binary tarball from mozilla/sccache releases —
+# `cargo install sccache` compiles from source and costs ~5min on a cold
+# layer cache (regression observed on PR #68's first measurement). The
+# curl+tar path completes in seconds. Mirrors the host-side install used
+# by mozilla-actions/sccache-action in the test-backend job.
+#
+# Pinned v0.8.2 (latest stable 2026-05-13). Bump version + verify
 # `sccache --version` if upstream cuts a new release.
-RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
-    cargo install sccache --locked --version 0.15.0
+ARG SCCACHE_VERSION=v0.8.2
+ARG SCCACHE_ARCH=x86_64-unknown-linux-musl
+RUN --mount=type=cache,target=/tmp/sccache-dl,id=sccache-tarball \
+    set -eux; \
+    curl -fsSL -o /tmp/sccache-dl/sccache.tar.gz \
+      "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}.tar.gz"; \
+    tar -xzf /tmp/sccache-dl/sccache.tar.gz -C /tmp/sccache-dl --strip-components=1; \
+    install -m 755 /tmp/sccache-dl/sccache /usr/local/bin/sccache; \
+    sccache --version
 WORKDIR /usr/src/app
 
 ENV SQLX_OFFLINE=true
