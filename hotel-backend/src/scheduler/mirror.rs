@@ -38,6 +38,16 @@ pub async fn reload_mirror_dimensions(legacy_pool: &DbPool, pg_pool: &PgPool) {
     if let Err(e) = reload_rooms_price(legacy_pool, pg_pool).await {
         tracing::error!(error = %e, "[Mirror] reload HT_Rooms_Price failed");
     }
+    // Track F4 (T1 CRIT-4): canonical `ht_rate_tiers` UPSERT keyed on
+    // (Room_Type, Cust_Type). Shares the 15-min reconcile cadence
+    // because `HT_Rooms_Price` is not CT-enabled and changes on the
+    // order of weeks, not seconds. Independent TX from the
+    // legacy_mirror reload above — failures are surface-level (logged,
+    // not propagated) so one bad row does not stall the dimension
+    // reload cycle.
+    if let Err(e) = crate::sync::mappers::rate_tiers::reload_rate_tiers(legacy_pool, pg_pool).await {
+        tracing::error!(error = %e, "[Mirror] reload ht_rate_tiers failed");
+    }
     if let Err(e) = reload_order_up(legacy_pool, pg_pool).await {
         tracing::error!(error = %e, "[Mirror] reload HT_Order_Up failed");
     }

@@ -475,9 +475,12 @@ fn build_new_routes(app_state: AppState) -> Router {
         // Room types CRUD
         .route("/api/new/room-types", get(routes::new_room_types::list_room_types).post(routes::new_room_types::create_room_type))
         .route("/api/new/room-types/{id}", get(routes::new_room_types::get_room_type).put(routes::new_room_types::update_room_type).delete(routes::new_room_types::delete_room_type))
-        // Rates CRUD
+        // Rates CRUD (legacy ht_rates write path; reads post-F4 come
+        // from ht_rate_tiers — see routes/new_rates.rs module docs)
         .route("/api/new/rates", get(routes::new_rates::list_rates).post(routes::new_rates::create_rate))
         .route("/api/new/rates/{id}", get(routes::new_rates::get_rate).put(routes::new_rates::update_rate).delete(routes::new_rates::delete_rate))
+        // F4 canonical rate tiers (Room_Type × Cust_Type matrix) read path.
+        .route("/api/new/rate-tiers", get(routes::new_rates::list_rate_tiers))
         // Reports
         .route("/api/new/reports/revenue", get(routes::new_reports::get_revenue))
         .route("/api/new/reports/occupancy", get(routes::new_reports::get_occupancy))

@@ -178,6 +178,7 @@ These are automatically applied by `scripts/migrate.sh` during deployment.
 | 036 | `036_track_e2_room_columns.sql` | Track E2 / T1 HIGH-3 — widens `ht_rooms_new` with 8 legacy `HT_Rooms` columns: `room_use_count` (running nights total), `room_x` / `room_y` (drag-drop grid layout), `room_group` (floor/wing), `room_power_open` / `_close` / `_status` (electricity relay), `room_polity` (policy id). Defaults match legacy NOT NULL / DEFAULT clauses | v2.63.13 |
 | 037 | `037_scheduler_notification_state.sql` | Persisted per-(site, notification type) watermark for the scheduler polling jobs (`poll_checkins` / `poll_checkouts` / `poll_new_bookings`). Fixes the post-redeploy Slack replay storm where ~45 historical events were re-paged because the in-memory watermark reset to UTC-now on every container restart (and MSSQL stores Thai local time, so UTC-now was effectively 7h behind any real event time) | v2.63.14 |
 | 038 | `038_seed_vat_percent.sql` | Wave 5c (`audit-2026-05-13.md` Decision #2) — seed `ht_settings.vat_percent='7.0'` so the payment writeback recipe reads VAT rate from PG instead of the hardcoded `RECEIPT_VAT_PERCENT` constant. Threaded through `WritebackIntent::RecordPayment.vat_percent` and stamped into `HT_Receipt_H.Receipt_VatPer`. Flip rate at runtime with `UPDATE ht_settings SET setting_value='0' WHERE setting_key='vat_percent'` | v2.63.15 |
+| 042 | `042_create_ht_rate_tiers.sql` | Track F4 / T1 CRIT-4 (`audit-2026-05-13.md`) — introduce canonical `ht_rate_tiers` table keyed on `(rate_tier_room_type, rate_tier_cust_type)` mirroring legacy `HT_Rooms_Price`'s composite axis (per-customer-type pricing). Replaces the structurally wrong `(weekday/weekend/special)` axis in `ht_rates`. `ht_rates` is left in place (deprecated) so the existing /rates CRUD form keeps working; canonical reads now go through `ht_rate_tiers` via `sync::mappers::rate_tiers` (periodic-poll, 15-min reconcile cadence). | v2.63.16 |
 
 ## Tables Owned by This Application
 
@@ -200,7 +201,8 @@ All table and column names are **lowercase** (PostgreSQL convention). The canoni
 | `ht_booking_rooms` | Junction table linking bookings to rooms | v2.0.0 |
 | `ht_checkins` | Check-in records (replaces View_CheckIn_Ds) | v2.0.0 |
 | `ht_guest_registry` | Guest registry for TM30 compliance | v2.0.0 |
-| `ht_rates` | Room rates by type and date range | v2.0.0 |
+| `ht_rates` | Room rates by type and date range — DEPRECATED post-F4; superseded by `ht_rate_tiers` (canonical axis is `Room_Type` × `Cust_Type`, not weekday/weekend/special). Left in place so the existing /rates CRUD form does not break; removal in a follow-on once the frontend retires | v2.0.0 |
+| `ht_rate_tiers` | Canonical `(Room_Type, Cust_Type)` pricing matrix mirrored from legacy `HT_Rooms_Price` (per-night, per-hour, per-month columns). Read path for booking/check-in price resolution post-Track F4 | v2.63.16 |
 | `ht_settings` | Application settings key-value store | v2.0.0 |
 | `ht_inventory_categories` | Inventory categories (Minibar, Amenities, Linens, Equipment) | v2.1.0 |
 | `ht_inventory_items` | Inventory items with stock tracking | v2.1.0 |

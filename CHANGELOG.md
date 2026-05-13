@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [vNext]
+
+### Added
+
+- **Track F4 — `ht_rate_tiers` canonical pricing matrix
+  (`audit-2026-05-13.md` T1 CRIT-4).** Closes the structural mismatch
+  between the canonical PG rate table (which modeled
+  `weekday/weekend/special`) and legacy iHOTEL's `HT_Rooms_Price`
+  (`Room_Type × Cust_Type` composite). New canonical surface keyed on
+  `(rate_tier_room_type, rate_tier_cust_type)` with `Room_Price` /
+  `Room_Price_H` / `Room_Price_M` columns mirrored exactly.
+  - **Migration 042** (`042_create_ht_rate_tiers.sql`): create
+    `ht_rate_tiers` with UNIQUE constraint on the composite key + index
+    on `rate_tier_room_type` for the room-lookup query path.
+  - **`sync::mappers::rate_tiers::reload_rate_tiers`**: periodic-poll
+    mapper wired into the existing `scheduler::mirror::reload_mirror_dimensions`
+    (15-min reconcile cadence — `HT_Rooms_Price` is not CT-enabled and
+    changes on the order of weeks). UPSERT keyed on the composite, NOT
+    on the legacy `id`, so iHOTEL DELETE+REINSERT of a row keeps the
+    canonical row pinned.
+  - **`routes::new_rates`**: GET endpoints migrated to `ht_rate_tiers`.
+    `GET /api/new/rates` returns the legacy single-row-per-room-type
+    shape filtered by the default `ราคาปกติ` tier (frontend stays
+    compatible). New `GET /api/new/rate-tiers?roomType=X&custType=Y`
+    surfaces the full per-tier matrix. `lookup_by_room_and_cust_type`
+    helper exported for future booking/check-in price resolution paths.
+  - **`ht_rates` deprecation**: table NOT dropped. POST/PUT/DELETE
+    continue to write to it so the existing /rates form does not error;
+    canonical reads no longer touch it. Removal in a follow-on once the
+    frontend retires.
+  - **CARDINALITY_MAP.md**: `ht_rates` row updated to DEPRECATED;
+    new `ht_rate_tiers` row added with `1:1` (composite key) to
+    `HT_Rooms_Price`.
+  - **Out of F4 scope** (deferred to Track G follow-ons):
+    `HT_ContinueTime` (hourly extension master), `HT_Order_Up` /
+    `HT_Order_Down` (monthly tier multipliers). Pricing writeback into
+    iHOTEL stays one-way today.
+  - Tests: `tests/test_rate_tiers.rs` (5 integration tests covering
+    UPSERT idempotency, blank-key skip semantics, active-flag filter)
+    plus `sync::mappers::rate_tiers` unit tests on the
+    `is_acceptable_row` validator and `routes::new_rates::tests` on
+    the date-parsing helper and default-tier constant.
+
 ## [2.63.16] - 2026-05-13
 
 ### Added

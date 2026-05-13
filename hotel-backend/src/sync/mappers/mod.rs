@@ -33,6 +33,7 @@ pub mod customer;
 pub mod guest_registry;
 pub mod mirror;
 pub mod payment;
+pub mod rate_tiers;
 pub mod room;
 
 pub use booking::{
