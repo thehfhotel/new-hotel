@@ -55,8 +55,23 @@ const ROOMS_TABLE: &str = "HT_Rooms";
 /// Columns we project. `id` is the PK on the CT side and is therefore
 /// listed via [`primary_key_cols`] separately — we still re-project it
 /// into the SELECT for `apply` to read alongside the data columns.
-const ROOMS_SELECT_COLS: &str =
-    "t.id, t.Room_no, t.Room_Type, t.Room_Clean, t.Room_Use, t.Room_Manternace, t.Room_Details";
+///
+/// Track E2 (T1 HIGH-3 / `docs/coexistence/audit-2026-05-13.md`)
+/// widened the projection to cover the room-utilization counter
+/// (`Room_Use_Count`), the legacy drag-drop grid coordinates
+/// (`Room_X` / `Room_Y`), grouping (`Room_Group`), the relay-power
+/// columns (`Room_Power_OPEN` / `_CLOSE` / `_STATUS`), and `Room_Polity`.
+///
+/// **Known wrongness — NOT fixed in Track E2.** The `room_price_*`
+/// axis in `ht_rooms_new` is `weekday/weekend/special`, while legacy
+/// `HT_Rooms` uses `Room_PriceA/B/C` indexed by customer-type
+/// (`HT_SET_CusType_Main` row). Track F (canonical rate-table model)
+/// is the right place to reconcile that — we intentionally don't
+/// touch the price columns here.
+const ROOMS_SELECT_COLS: &str = "t.id, t.Room_no, t.Room_Type, t.Room_Clean, \
+     t.Room_Use, t.Room_Manternace, t.Room_Details, t.Room_Use_Count, \
+     t.Room_X, t.Room_Y, t.Room_Group, t.Room_Power_OPEN, \
+     t.Room_Power_CLOSE, t.Room_Power_STATUS, t.Room_Polity";
 
 #[async_trait]
 impl MssqlChangeMapper for RoomMasterMapper {
@@ -107,6 +122,10 @@ impl MssqlChangeMapper for RoomMasterMapper {
 /// 5.2 doesn't ferry either to PG (room_type is administered by our
 /// app's own UI; room_use is reconstructed by the 5.4 booking /
 /// checkin mappers from the per-night ledger).
+///
+/// Track E2 (T1 HIGH-3) added the bottom block: utilization counter,
+/// grid coordinates, group, relay-power columns, and policy id. These
+/// were previously dropped on every CT tick.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct RoomProjection {
@@ -121,6 +140,33 @@ struct RoomProjection {
     room_manternace_legacy: Option<String>,
     room_use_legacy: Option<String>,
     room_details: Option<String>,
+    // ------------------------------------------------------------------
+    // Track E2 (T1 HIGH-3) additions.
+    // ------------------------------------------------------------------
+    /// Running nights total (`Room_Use_Count int NOT NULL DEFAULT 0`).
+    /// Legacy `Module1.UPDATE_ROOM_USE` increments this on every
+    /// checkout. Mirrored read-only into PG for utilization reports —
+    /// writeback of the increment is owned by the existing writeback
+    /// worker (Wave 6).
+    room_use_count: Option<i32>,
+    /// Legacy drag-drop grid coordinates from the iHOTEL layout
+    /// (`Room_X` / `Room_Y`, both `int NOT NULL DEFAULT 0`). Lost on
+    /// every CT sync today; capture so a future canonical room-layout
+    /// UI (Track G) has the data.
+    room_x: Option<i32>,
+    room_y: Option<i32>,
+    /// Floor / wing grouping (`Room_Group varchar(50)`).
+    room_group: Option<String>,
+    /// Relay-power command timestamps + status. Legacy stores all three
+    /// as `varchar(50)`; we keep them as text to preserve the literal
+    /// the legacy app wrote (`Room_Power_STATUS` defaults to `'off'`).
+    room_power_open: Option<String>,
+    room_power_close: Option<String>,
+    room_power_status: Option<String>,
+    /// Room policy id (`Room_Polity int NOT NULL DEFAULT 1`). Semantics
+    /// unclear from the cheatsheet — captured for parity so reconcile
+    /// stops drifting on it.
+    room_polity: Option<i32>,
 }
 
 fn project_room(row: &dyn MappableRow) -> Result<RoomProjection, SyncError> {
@@ -144,6 +190,14 @@ fn project_room(row: &dyn MappableRow) -> Result<RoomProjection, SyncError> {
         room_manternace_legacy: row.try_get_str("Room_Manternace")?.map(str::to_string),
         room_use_legacy: row.try_get_str("Room_Use")?.map(str::to_string),
         room_details: row.try_get_str("Room_Details")?.map(str::to_string),
+        room_use_count: row.try_get_i32("Room_Use_Count")?,
+        room_x: row.try_get_i32("Room_X")?,
+        room_y: row.try_get_i32("Room_Y")?,
+        room_group: row.try_get_str("Room_Group")?.map(str::to_string),
+        room_power_open: row.try_get_str("Room_Power_OPEN")?.map(str::to_string),
+        room_power_close: row.try_get_str("Room_Power_CLOSE")?.map(str::to_string),
+        room_power_status: row.try_get_str("Room_Power_STATUS")?.map(str::to_string),
+        room_polity: row.try_get_i32("Room_Polity")?,
     })
 }
 
@@ -208,11 +262,26 @@ async fn apply_room_upsert(
             let agg_id = ex
                 .aggregate_id
                 .unwrap_or_else(|| aggregate_uuid(AggregateKind::Room, ex.room_id));
+            // Track E2 (T1 HIGH-3) — write the newly-captured legacy
+            // columns. `COALESCE(new, old)` preserves PG-side state
+            // when the legacy column is NULL so we never blank a
+            // populated row, but accepts the new value when present.
+            // `room_use_count` uses raw assignment (not COALESCE) so a
+            // legacy 0 truly resets PG to 0; the running counter is
+            // the legacy app's authoritative state.
             sqlx::query(
                 "UPDATE ht_rooms_new \
                     SET room_clean         = COALESCE($1, room_clean), \
                         room_maintenance   = COALESCE($2::bool, room_maintenance), \
                         room_notes         = COALESCE($3, room_notes), \
+                        room_use_count     = COALESCE($8, room_use_count), \
+                        room_x             = COALESCE($9, room_x), \
+                        room_y             = COALESCE($10, room_y), \
+                        room_group         = COALESCE($11, room_group), \
+                        room_power_open    = COALESCE($12, room_power_open), \
+                        room_power_close   = COALESCE($13, room_power_close), \
+                        room_power_status  = COALESCE($14, room_power_status), \
+                        room_polity        = COALESCE($15, room_polity), \
                         legacy_room_no     = COALESCE(legacy_room_no, $4), \
                         legacy_room_id_int = COALESCE(legacy_room_id_int, $5), \
                         aggregate_id       = COALESCE(aggregate_id, $6), \
@@ -226,6 +295,14 @@ async fn apply_room_upsert(
             .bind(projected.legacy_id)
             .bind(agg_id)
             .bind(ex.room_id)
+            .bind(projected.room_use_count)
+            .bind(projected.room_x)
+            .bind(projected.room_y)
+            .bind(&projected.room_group)
+            .bind(&projected.room_power_open)
+            .bind(&projected.room_power_close)
+            .bind(&projected.room_power_status)
+            .bind(projected.room_polity)
             .execute(&mut **tx)
             .await?;
             (ex.room_id, agg_id, ex.room_clean)
@@ -375,7 +452,18 @@ mod tests {
             .with("Room_no", MockValue::Str(room_no.into()))
             .with("Room_Type", MockValue::Str("Standard".into()))
             .with("Room_Use", MockValue::Str("no".into()))
-            .with("Room_Details", MockValue::Null);
+            .with("Room_Details", MockValue::Null)
+            // Track E2 additions — every column the projection reads
+            // must be present in the test row (HashMapRow returns Err
+            // on a missing cell, distinct from a Null cell).
+            .with("Room_Use_Count", MockValue::Null)
+            .with("Room_X", MockValue::Null)
+            .with("Room_Y", MockValue::Null)
+            .with("Room_Group", MockValue::Null)
+            .with("Room_Power_OPEN", MockValue::Null)
+            .with("Room_Power_CLOSE", MockValue::Null)
+            .with("Room_Power_STATUS", MockValue::Null)
+            .with("Room_Polity", MockValue::Null);
         r = match clean {
             Some(s) => r.with("Room_Clean", MockValue::Str(s.into())),
             None => r.with("Room_Clean", MockValue::Null),
@@ -430,26 +518,20 @@ mod tests {
 
     #[test]
     fn project_room_errors_when_id_missing() {
-        let row = HashMapRow::new(ROOMS_TABLE)
-            .with("id", MockValue::Null)
-            .with("Room_no", MockValue::Str("402".into()))
-            .with("Room_Type", MockValue::Null)
-            .with("Room_Clean", MockValue::Null)
-            .with("Room_Use", MockValue::Null)
-            .with("Room_Details", MockValue::Null);
+        // Project requires `id` first — it errors out before reaching
+        // any other column, so we only need to set `id` to NULL.
+        let row = HashMapRow::new(ROOMS_TABLE).with("id", MockValue::Null);
         let err = project_room(&row).expect_err("NULL id must be loud");
         assert!(err.to_string().contains("id"));
     }
 
     #[test]
     fn project_room_errors_when_room_no_missing() {
+        // Project reads `id` then `Room_no` and errors on a NULL
+        // business key. Set only those two so the test stays focused.
         let row = HashMapRow::new(ROOMS_TABLE)
             .with("id", MockValue::I32(1))
-            .with("Room_no", MockValue::Null)
-            .with("Room_Type", MockValue::Null)
-            .with("Room_Clean", MockValue::Null)
-            .with("Room_Use", MockValue::Null)
-            .with("Room_Details", MockValue::Null);
+            .with("Room_no", MockValue::Null);
         let err = project_room(&row).expect_err("NULL Room_no must be loud");
         assert!(err.to_string().contains("Room_no"));
     }
@@ -514,5 +596,93 @@ mod tests {
         // *intent* via the doc-comment + module-level constant.
         let m = RoomStatusMapper;
         let _ = m.table();
+    }
+
+    // ========================================================================
+    // Track E2 — column-expansion coverage (T1 HIGH-3)
+    //
+    // Each block locks one finding from `docs/coexistence/audit-2026-05-13.md`.
+    // ========================================================================
+
+    /// T1 HIGH-3 — running nights total (`Room_Use_Count`). Writeback
+    /// Wave 6 increments this in MSSQL; canonical PG must capture it
+    /// or utilization reports show zero.
+    #[test]
+    fn projects_room_use_count() {
+        let row = make_room_row(7, "402", Some("yes"))
+            .with("Room_Use_Count", MockValue::I32(142));
+        let p = project_room(&row).expect("project must succeed");
+        assert_eq!(p.room_use_count, Some(142));
+    }
+
+    /// T1 HIGH-3 — grid coordinates from the iHOTEL drag-drop layout.
+    /// Currently flattened to numeric order on every sync; capture so
+    /// a future canonical layout UI has the source data.
+    #[test]
+    fn projects_room_xy_grid_coordinates() {
+        let row = make_room_row(7, "402", Some("yes"))
+            .with("Room_X", MockValue::I32(120))
+            .with("Room_Y", MockValue::I32(240));
+        let p = project_room(&row).expect("project must succeed");
+        assert_eq!(p.room_x, Some(120));
+        assert_eq!(p.room_y, Some(240));
+    }
+
+    /// T1 HIGH-3 — `Room_Group` (floor / wing) preserved as opaque
+    /// string. The legacy app uses this for layout grouping.
+    #[test]
+    fn projects_room_group() {
+        let row = make_room_row(7, "402", Some("yes"))
+            .with("Room_Group", MockValue::Str("Floor 4".into()));
+        let p = project_room(&row).expect("project must succeed");
+        assert_eq!(p.room_group.as_deref(), Some("Floor 4"));
+    }
+
+    /// T1 HIGH-3 — relay-power columns. The legacy app drives a
+    /// physical power-relay; we mirror state for observability.
+    #[test]
+    fn projects_room_power_columns() {
+        let row = make_room_row(7, "402", Some("yes"))
+            .with("Room_Power_OPEN", MockValue::Str("2026-01-15 08:00".into()))
+            .with("Room_Power_CLOSE", MockValue::Str("2026-01-15 18:00".into()))
+            .with("Room_Power_STATUS", MockValue::Str("on".into()));
+        let p = project_room(&row).expect("project must succeed");
+        assert_eq!(p.room_power_open.as_deref(), Some("2026-01-15 08:00"));
+        assert_eq!(p.room_power_close.as_deref(), Some("2026-01-15 18:00"));
+        assert_eq!(p.room_power_status.as_deref(), Some("on"));
+    }
+
+    /// T1 HIGH-3 — `Room_Polity` policy id (default 1 in legacy).
+    /// Semantics unclear but reconcile would flag a divergence
+    /// indefinitely if we never read the column.
+    #[test]
+    fn projects_room_polity() {
+        let row = make_room_row(7, "402", Some("yes"))
+            .with("Room_Polity", MockValue::I32(2));
+        let p = project_room(&row).expect("project must succeed");
+        assert_eq!(p.room_polity, Some(2));
+    }
+
+    /// T1 HIGH-3 / T2 HIGH-4 — the CT SELECT must mention every new
+    /// column. Otherwise MSSQL returns NULL silently and projection
+    /// sees None on every tick.
+    #[test]
+    fn room_select_sql_mentions_track_e2_columns() {
+        let select = RoomMasterMapper.select_sql();
+        for col in [
+            "Room_Use_Count",
+            "Room_X",
+            "Room_Y",
+            "Room_Group",
+            "Room_Power_OPEN",
+            "Room_Power_CLOSE",
+            "Room_Power_STATUS",
+            "Room_Polity",
+        ] {
+            assert!(
+                select.contains(col),
+                "RoomMasterMapper SELECT clause missing '{col}'"
+            );
+        }
     }
 }

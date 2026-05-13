@@ -52,7 +52,41 @@ CREATE TABLE IF NOT EXISTS ht_customers (
     updated_at TIMESTAMP DEFAULT NOW(),
     cust_created_by VARCHAR(50),
     cust_updated_by VARCHAR(50),
-    cust_active BOOLEAN DEFAULT true
+    cust_active BOOLEAN DEFAULT true,
+    -- Track E2 (migration 035) — legacy `HT_Customers` parity.
+    -- Captures the columns the CT mapper previously dropped silently.
+    -- `cust_address` (above) continues to hold a copy of `cust_add_no`
+    -- so single-line readers still work.
+    cust_name2 VARCHAR(250),
+    cust_sex VARCHAR(50),
+    cust_price_tier VARCHAR(50),
+    cust_add_no VARCHAR(250),
+    cust_add_moo VARCHAR(50),
+    cust_add_soi VARCHAR(250),
+    cust_add_road VARCHAR(250),
+    cust_add_tambon VARCHAR(250),
+    cust_add_ampore VARCHAR(250),
+    cust_add_province VARCHAR(250),
+    cust_add_code VARCHAR(50),
+    cust_add_fax VARCHAR(250),
+    cust_work_name VARCHAR(250),
+    cust_work_no VARCHAR(250),
+    cust_work_moo VARCHAR(50),
+    cust_work_soi VARCHAR(250),
+    cust_work_road VARCHAR(250),
+    cust_work_tambon VARCHAR(250),
+    cust_work_ampore VARCHAR(250),
+    cust_work_province VARCHAR(250),
+    cust_work_code VARCHAR(50),
+    cust_work_tel VARCHAR(250),
+    cust_work_fax VARCHAR(250),
+    cust_work_tax VARCHAR(50),
+    cust_last_change TIMESTAMP,
+    cust_contry VARCHAR(50),
+    -- Running debt balance. Mirrored read-only from legacy
+    -- `Module1.UPDATE_MONEY` writes; our own writeback path stays
+    -- deferred to Track G.
+    cust_price_over DOUBLE PRECISION
 );
 CREATE INDEX IF NOT EXISTS ix_ht_customers_name ON ht_customers(cust_firstname, cust_lastname);
 CREATE INDEX IF NOT EXISTS ix_ht_customers_phone ON ht_customers(cust_phone);
@@ -91,6 +125,11 @@ CREATE TABLE IF NOT EXISTS ht_rooms_new (
     room_notes VARCHAR(500),
     room_features TEXT,
     room_active BOOLEAN DEFAULT true,
+    -- NOTE: room_price_{weekday,weekend,special} below does NOT match
+    -- the legacy `Room_PriceA/B/C` model (legacy indexes prices by
+    -- customer-type, not day-of-week). Track F (canonical rate-table
+    -- model) will reconcile this — Track E2 / migration 036
+    -- intentionally leaves these columns untouched.
     room_price_weekday DECIMAL(10,2),
     room_price_weekend DECIMAL(10,2),
     room_price_special DECIMAL(10,2),
@@ -100,6 +139,18 @@ CREATE TABLE IF NOT EXISTS ht_rooms_new (
     aggregate_id UUID,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW(),
+    -- Track E2 (migration 036) — legacy `HT_Rooms` parity. Captures
+    -- the columns the CT mapper previously dropped silently.
+    -- Defaults mirror legacy NOT NULL / DEFAULT clauses so the
+    -- canonical row stays valid even before the first CT tick lands.
+    room_use_count INTEGER NOT NULL DEFAULT 0,
+    room_x INTEGER NOT NULL DEFAULT 0,
+    room_y INTEGER NOT NULL DEFAULT 0,
+    room_group VARCHAR(50),
+    room_power_open VARCHAR(50),
+    room_power_close VARCHAR(50),
+    room_power_status VARCHAR(50) NOT NULL DEFAULT 'off',
+    room_polity INTEGER NOT NULL DEFAULT 1,
 
     CONSTRAINT fk_ht_rooms_type FOREIGN KEY (room_type_id)
         REFERENCES ht_room_types(type_id)
@@ -1234,6 +1285,25 @@ ON CONFLICT (version) DO NOTHING;
 -- marks the migration as applied for fresh deploys.
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('034', '034_ht_guest_registry_legacy_id.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 035 — Track E2 / T1 HIGH-2. Widen `ht_customers` to mirror
+-- the full legacy `HT_Customers` surface (27 new columns including
+-- `cust_price_over`, address tuple, work-address tuple, `cust_name2`,
+-- `cust_sex`, `cust_contry`, etc.). The columns are inlined into the
+-- `ht_customers` CREATE TABLE block above; this seed marks the
+-- migration as applied for fresh deploys.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('035', '035_track_e2_customer_columns.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 036 — Track E2 / T1 HIGH-3. Widen `ht_rooms_new` with 8
+-- columns from legacy `HT_Rooms` (`room_use_count`, `room_x/y`,
+-- `room_group`, `room_power_*`, `room_polity`). The columns are
+-- inlined into the `ht_rooms_new` CREATE TABLE block above; this seed
+-- marks the migration as applied for fresh deploys.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('036', '036_track_e2_room_columns.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================

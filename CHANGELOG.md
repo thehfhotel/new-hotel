@@ -5,6 +5,72 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.63.13] - 2026-05-13
+
+### Added
+
+- **Track E2 column expansion (`docs/coexistence/audit-2026-05-13.md`).**
+  Widen canonical PG schema to mirror the full legacy `HT_Customers`
+  and `HT_Rooms` surface so receptionist-visible state on our app and
+  iHOTEL agree column-for-column. Previously the CT mapper silently
+  dropped 20+ customer columns and 8 room columns; reconcile hashes
+  hid the drop because both sides computed the hash over the same
+  narrow projection.
+
+  - `migrations/pg/035_track_e2_customer_columns.sql` adds 27
+    columns to `ht_customers`: `cust_price_over` (running debt
+    balance — business-critical, mutated on every check-in/out by
+    legacy `Module1.UPDATE_MONEY`), the 8-field address tuple
+    (`cust_add_no` through `cust_add_code`), the 12-field
+    work-address tuple (`cust_work_name` / `_no` / `_moo` / `_soi` /
+    `_road` / `_tambon` / `_ampore` / `_province` / `_code` / `_tel`
+    / `_fax` / `_tax`), `cust_name2` (English/secondary name, used
+    by FrmReportRR4), `cust_sex`, `cust_price_tier` (legacy
+    `Cust_Type` rate-tier label, distinct from existing `cust_type`
+    which mirrors `Cust_Type_Main`), `cust_last_change`, and
+    `cust_contry` (preserved with the legacy spelling). All columns
+    are nullable to match legacy NULL-tolerance. The existing
+    `cust_address` column continues to receive a copy of
+    `cust_add_no` for backwards compatibility with single-line
+    address readers. [T1 HIGH-2]
+  - `migrations/pg/036_track_e2_room_columns.sql` adds 8 columns to
+    `ht_rooms_new`: `room_use_count` (running nights total),
+    `room_x` / `room_y` (drag-drop grid coordinates), `room_group`
+    (floor/wing), `room_power_open` / `_close` / `_status`
+    (electricity relay state), `room_polity` (policy id). Defaults
+    mirror legacy NOT NULL / DEFAULT clauses so the canonical row
+    stays valid before the first CT tick lands. [T1 HIGH-3]
+
+### Fixed
+
+- **Customer sync mapper drops 9+ columns — Track E2 / T2 HIGH-4.**
+  `EAGER_FETCH_COLUMNS` and the CT JOIN's `SELECT` clause in
+  `hotel-backend/src/sync/mappers/customer.rs` widened from 8 to 33
+  legacy columns. Every column the new schema (migration 035)
+  captures is now also written by the UPSERT and INSERT branches in
+  the I/U path and the eager-mirror path used by check-in. The
+  idempotency `matches()` check correspondingly compares all 33
+  mirrored columns so a debt-balance change can no longer
+  idempotency-skip on a re-applied row.
+- **Room sync mapper drops 8 columns — Track E2 / T1 HIGH-3.**
+  `RoomMasterMapper::select_sql()` widened to project
+  `Room_Use_Count`, `Room_X`, `Room_Y`, `Room_Group`,
+  `Room_Power_OPEN` / `_CLOSE` / `_STATUS`, and `Room_Polity`. The
+  `apply_room_upsert` UPDATE writes the new values with `COALESCE`
+  semantics so a NULL legacy column preserves PG-side state.
+
+### Notes
+
+- Writeback for `Cust_Price_Over` (our app mutating the running debt
+  balance during check-in/out) is intentionally NOT in Track E2 —
+  for now we read the running balance from canonical PG (sync'd
+  from legacy) but don't modify it. Track G owns the behavioural
+  change.
+- The `room_price_weekday/weekend/special` axis on `ht_rooms_new`
+  still doesn't match the legacy `Room_PriceA/B/C` model (legacy
+  indexes prices by customer-type, not day-of-week). That's a
+  Track F (canonical rate-table model) item and stays open.
+
 ## [2.63.12] - 2026-05-13
 
 ### Added

@@ -21,9 +21,9 @@ a row here.
 
 | PG table | Legacy counterpart | Cardinality | Source of truth | Sync mapper | Read path | Write path | Notes |
 |---|---|---|---|---|---|---|---|
-| `ht_customers` | `HT_Customers` | `1:1` | shared | `sync/mappers/customer.rs` | `routes/new_customers.rs` | `writeback/recipes/booking_create.rs` + walkin/checkin_to_booking | T1: verify column-for-column parity |
+| `ht_customers` | `HT_Customers` | `1:1` | shared | `sync/mappers/customer.rs` | `routes/new_customers.rs` | `writeback/recipes/booking_create.rs` + walkin/checkin_to_booking | ✅ column-for-column parity (Track E2 / migration 035 — all 33 legacy columns mirrored; `cust_price_over` writeback deferred to Track G) |
 | `ht_room_types` | none (derived) | N/A | PG canonical | none | `routes/new_rooms.rs` | manual / settings | T1: verify type literals match legacy free-text where surfaced |
-| `ht_rooms_new` | `HT_Rooms` | `1:1` | shared | `sync/mappers/room.rs` | `routes/rooms.rs` | maintenance + housekeeping | T1: `Room_Use_Count` semantics |
+| `ht_rooms_new` | `HT_Rooms` | `1:1` | shared | `sync/mappers/room.rs` | `routes/rooms.rs` | maintenance + housekeeping | ✅ column-for-column parity (Track E2 / migration 036 — `Room_Use_Count` / `Room_X/Y` / `Room_Group` / `Room_Power_*` / `Room_Polity` all mirrored); ⚠️ `room_price_*` axis (weekday/weekend/special vs legacy A/B/C per customer-type) deferred to Track F |
 | `ht_bookings` | `HT_Book_H` | `1:1` | shared | `sync/mappers/booking.rs` | `routes/new_bookings.rs` | `writeback/recipes/booking_create.rs` + modify/cancel | T1: stay-range derivation |
 | `ht_booking_rooms` | `HT_Book_Ds` | `N:1` (junction) | PG canonical | `sync/mappers/booking.rs` (per-line) | joined into `routes/new_bookings.rs` | `writeback/recipes/booking_create.rs` per-night INSERT | ✅ correctly modeled as junction |
 | **`ht_checkins`** | **`HT_CheckIn_H` (header)** | **`1:1` AT HEADER LEVEL** | shared | `sync/mappers/checkin.rs::apply_checkin_aggregate` | `routes/rooms.rs`, `routes/stats.rs`, calendar | walkin/checkin_to_booking recipes | ❌ **BUG: collapses multi-room folios into a single canonical row** (see [multi-room finding](audit-2026-05-13.md) — pending) |
