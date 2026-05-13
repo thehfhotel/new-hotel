@@ -5,6 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+<<<<<<< HEAD
 ## [vNext]
 
 ### Added
@@ -47,6 +48,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     plus `sync::mappers::rate_tiers` unit tests on the
     `is_acceptable_row` validator and `routes::new_rates::tests` on
     the date-parsing helper and default-tier constant.
+=======
+## [vNext] - 2026-05-13
+
+### Added
+
+- **Track F2 — `ht_shifts` canonical + payment gate (`audit-2026-05-13.md`
+  T1 HIGH-5).** Closes the cash-drawer-reconciliation gap that iHOTEL
+  closes via `HT_Round_Bill`. Receptionists must now open a cashier
+  shift before `record_payment` will accept a write; closing the shift
+  surfaces a payment-count + total-collected reconciliation summary.
+  - `migrations/pg/040_create_ht_shifts.sql` — new canonical table
+    with `shift_site_id` + `shift_no` (per-site running counter),
+    `shift_opening_float`, `shift_opened_by/_at`, `shift_closed_by/_at`,
+    plus a partial UNIQUE index (`WHERE shift_closed_at IS NULL`)
+    enforcing one-open-shift-per-site at the storage layer. PG is
+    source-of-truth — `shift_legacy_round_id` is reserved for the
+    Track G writeback follow-up.
+  - `hotel-backend/src/service/shifts.rs` — `ShiftService` with
+    `open_shift` / `close_shift` / `current_open_shift` /
+    `recent_shifts`. Returns `ShiftSummary` on close that aggregates
+    `ht_payments` rows between `opened_at` and `closed_at` for the
+    cashier reconciliation preview.
+  - `hotel-backend/src/service/payment.rs` — `PaymentService` gains
+    `with_shifts(...)` builder + an `Option<Arc<ShiftService>>` field.
+    `record_payment` consults `current_open_shift()` before any write
+    and returns `ServiceError::Validation("no open shift — please
+    open a cashier shift before taking payment")` when missing. The
+    gate is wired on by `AppState::wire_services`.
+  - `hotel-backend/src/routes/new_shifts.rs` — four HTTP endpoints:
+    `POST /api/new/shifts/open` (201), `POST /api/new/shifts/close`,
+    `GET /api/new/shifts/current` (404 when none), and
+    `GET /api/new/shifts?limit=N` (clamped `[1, 200]` by the service).
+  - `docs/coexistence/CARDINALITY_MAP.md` — `ht_shifts` ↔ `HT_Round_Bill`
+    row added (cardinality `1:1`, source `PG canonical`, gate at
+    `service/payment.rs`, mirror writeback / CT sync deferred to
+    Track G).
+  - HT_Round_Bill mirror writeback + CT-side sync deferred to Track G
+    ("round-bill shift discipline" feature) — F2 is the operational
+    win that stops the cash-drawer bleeding while the legacy bridge
+    is built.
+>>>>>>> 259757d (feat(coexistence): Track F2 — ht_shifts canonical + payment gate)
 
 ## [2.63.16] - 2026-05-13
 

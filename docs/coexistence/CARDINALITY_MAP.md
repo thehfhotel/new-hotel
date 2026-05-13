@@ -40,6 +40,7 @@ a row here.
 | `ht_maintenance_*` (2 tables) | none (likely PG-only)? | TBD | PG canonical? | none? | `routes/new_maintenance.rs` | PG-only? | T1: confirm policy |
 | `ht_users` | none | N/A | PG canonical | none | auth routes | manual / admin | ✅ PG-only by design |
 | `ht_sessions` | none | N/A | PG canonical | none | session middleware | auth flow | ✅ PG-only by design |
+| `ht_shifts` | `HT_Round_Bill` | `1:1` | PG canonical | none (Track G follow-up) | `routes/new_shifts.rs` | gate at `service/payment.rs::record_payment` | Track F2 / T1 HIGH-5 — migration 040 adds the canonical table + one-open-per-site partial UNIQUE index. PG is source-of-truth for now; legacy `HT_Round_Bill` mirror writeback + CT sync deferred to Track G ("round-bill shift discipline" feature). Payment gate active: `record_payment` refuses unless `current_open_shift().is_some()` |
 
 ## Legacy mirror tables (read-only snapshots, no canonical equivalent)
 

@@ -490,6 +490,11 @@ fn build_new_routes(app_state: AppState) -> Router {
         // Payments
         .route("/api/new/checkins/{id}/payments", get(routes::new_payments::list_payments).post(routes::new_payments::create_payment))
         .route("/api/new/payments/{id}", delete(routes::new_payments::void_payment))
+        // Shifts (Track F2 / T1 HIGH-5 — cashier-shift gate for payments)
+        .route("/api/new/shifts/open", post(routes::new_shifts::open_shift))
+        .route("/api/new/shifts/close", post(routes::new_shifts::close_shift))
+        .route("/api/new/shifts/current", get(routes::new_shifts::current_shift))
+        .route("/api/new/shifts", get(routes::new_shifts::list_shifts))
         // Inventory Management
         .route("/api/new/inventory/categories", get(routes::new_inventory::list_categories).post(routes::new_inventory::create_category))
         .route("/api/new/inventory/items", get(routes::new_inventory::list_items).post(routes::new_inventory::create_item))

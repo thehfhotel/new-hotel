@@ -42,6 +42,7 @@ pub mod error;
 pub mod housekeeping;
 pub mod ids;
 pub mod payment;
+pub mod shifts;
 
 pub use auth::{AuthError, AuthService, DEFAULT_SESSION_TTL};
 pub use booking::{
@@ -63,4 +64,7 @@ pub use ids::{aggregate_uuid, AggregateKind};
 pub use payment::{
     GenerateReceiptCommand, GenerateReceiptOutcome, PaymentService, RecordPaymentCommand,
     RecordPaymentOutcome,
+};
+pub use shifts::{
+    CloseShiftCommand, OpenShiftCommand, OpenShiftOutcome, Shift, ShiftService, ShiftSummary,
 };

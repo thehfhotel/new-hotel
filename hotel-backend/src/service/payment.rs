@@ -28,6 +28,7 @@ use crate::repository::payment::{PaymentInsert, PaymentRepository};
 
 use super::error::{ServiceError, ServiceResult};
 use super::ids::{aggregate_uuid, AggregateKind};
+use super::shifts::ShiftService;
 
 /// Command for [`PaymentService::record_payment`].
 #[derive(Debug, Clone)]
@@ -107,6 +108,12 @@ pub struct PaymentService {
     pub(crate) outbox: Arc<OutboxRepository>,
     pub(crate) events: Arc<EventBus>,
     pub(crate) pg: PgPool,
+    /// Optional shift gate — Track F2 / T1 HIGH-5. When wired,
+    /// `record_payment` refuses to insert unless `shifts.current_open_shift()`
+    /// returns `Some`. Stays `None` in unit tests and any deployment that
+    /// has not yet provisioned a shift workflow so existing flows keep
+    /// working until the cashier UI lands.
+    pub(crate) shifts: Option<Arc<ShiftService>>,
 }
 
 impl PaymentService {
@@ -116,7 +123,24 @@ impl PaymentService {
         events: Arc<EventBus>,
         pg: PgPool,
     ) -> Self {
-        Self { repo, outbox, events, pg }
+        Self {
+            repo,
+            outbox,
+            events,
+            pg,
+            shifts: None,
+        }
+    }
+
+    /// Builder-style attach for the shift gate.
+    ///
+    /// Wired from `AppState::wire_services` so production deployments
+    /// refuse to record a payment unless an `ht_shifts` row is open for
+    /// the site. Tests construct `PaymentService::new(...)` without a
+    /// shift service when they want to exercise the payment flow alone.
+    pub fn with_shifts(mut self, shifts: Arc<ShiftService>) -> Self {
+        self.shifts = Some(shifts);
+        self
     }
 
     /// Record a payment — inserts `ht_payments`, enqueues legacy writeback,
@@ -130,6 +154,18 @@ impl PaymentService {
                 "payment amount must be positive (got {} satang)",
                 cmd.amount_satang
             )));
+        }
+
+        // Track F2 / T1 HIGH-5: refuse the payment when a shift gate is
+        // wired and no shift is open. The gate is `Option<_>` so unit
+        // tests not exercising the shift flow stay isolated; production
+        // construction in `AppState::wire_services` always wires it on.
+        if let Some(shifts) = &self.shifts {
+            if shifts.current_open_shift().await?.is_none() {
+                return Err(ServiceError::validation(
+                    "no open shift — please open a cashier shift before taking payment",
+                ));
+            }
         }
 
         let amount_baht = (cmd.amount_satang as f64) / 100.0;
@@ -261,5 +297,154 @@ fn method_to_legacy_string(method: PaymentMethod) -> &'static str {
         PaymentMethod::Credit => "credit",
         PaymentMethod::Transfer => "transfer",
         PaymentMethod::Web => "qr",
+    }
+}
+
+// -----------------------------------------------------------------------------
+// tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    //! Track F2 / T1 HIGH-5 — exercise the shift gate. Tests use the same
+    //! skip-on-no-DB pattern as `service::shifts::tests` so a `cargo test`
+    //! without PG still passes the rest of the suite.
+    use super::*;
+    use crate::domain::payment::PaymentMethod;
+    use crate::outbox::event::EventSource;
+    use crate::outbox::intent::RecordPaymentReceipt;
+    use crate::repository::payment::PgPaymentRepository;
+    use crate::service::shifts::{OpenShiftCommand, ShiftService};
+
+    async fn try_pool() -> Option<PgPool> {
+        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgresql://postgres:REDACTED-pg-2026@localhost:5439/hotelnew".to_string()
+        });
+        PgPool::connect(&url).await.ok()
+    }
+
+    /// Build a `PaymentService` wired with a real `ShiftService` so the
+    /// gate is exercised end-to-end.
+    fn build_service_with_gate(pool: PgPool, site_id: &str) -> PaymentService {
+        let repo: Arc<dyn PaymentRepository> = Arc::new(PgPaymentRepository::new());
+        let outbox = Arc::new(crate::outbox::OutboxRepository::new());
+        let events = Arc::new(crate::outbox::EventBus::new());
+        let shifts = Arc::new(ShiftService::new(pool.clone(), site_id));
+        PaymentService::new(repo, outbox, events, pool).with_shifts(shifts)
+    }
+
+    /// Minimal command that satisfies validation but stays harmless if
+    /// the gate lets it through (it would still fail at the FK to
+    /// `ht_checkins` — the gate must intercept first).
+    fn sample_cmd() -> RecordPaymentCommand {
+        RecordPaymentCommand {
+            check_in_id: -1,
+            // 100.00 baht = 10_000 satang. `_` separator chosen
+            // unambiguously per clippy's `inconsistent_digit_grouping`.
+            amount_satang: 10_000,
+            method: PaymentMethod::Cash,
+            reference: None,
+            notes: None,
+            created_by: Some("test".into()),
+            receipt: RecordPaymentReceipt {
+                customer_name: "Test Guest".into(),
+                customer_address: String::new(),
+                customer_tel: String::new(),
+            },
+            checkin_ds_id: None,
+            price_per_night_baht: Some(100.0),
+            nights: Some(1),
+            vat_percent: Some(7),
+            source: EventSource::System {
+                reason: "F2_gate_test".into(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_payment_when_no_open_shift() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping rejects_payment_when_no_open_shift — PG not reachable");
+            return;
+        };
+        let site = "TEST_pay_gate_no_shift";
+        // Defensive cleanup — make sure no leftover open shift from a
+        // crashed previous run lets the test pass spuriously.
+        let _ = sqlx::query("DELETE FROM ht_shifts WHERE shift_site_id = $1")
+            .bind(site)
+            .execute(&pool)
+            .await;
+
+        let svc = build_service_with_gate(pool.clone(), site);
+
+        let err = svc
+            .record_payment(sample_cmd())
+            .await
+            .expect_err("must reject when no shift is open");
+
+        match err {
+            ServiceError::Validation(msg) => {
+                assert!(
+                    msg.contains("no open shift"),
+                    "expected gate message, got: {msg}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn accepts_payment_when_shift_is_open() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping accepts_payment_when_shift_is_open — PG not reachable");
+            return;
+        };
+        let site = "TEST_pay_gate_open_shift";
+        let _ = sqlx::query("DELETE FROM ht_shifts WHERE shift_site_id = $1")
+            .bind(site)
+            .execute(&pool)
+            .await;
+
+        let shifts = Arc::new(ShiftService::new(pool.clone(), site));
+        shifts
+            .open_shift(OpenShiftCommand {
+                opened_by: "alice".into(),
+                opening_float: 500.0,
+                notes: None,
+            })
+            .await
+            .expect("open shift");
+
+        let repo: Arc<dyn PaymentRepository> = Arc::new(PgPaymentRepository::new());
+        let outbox = Arc::new(crate::outbox::OutboxRepository::new());
+        let events = Arc::new(crate::outbox::EventBus::new());
+        let svc = PaymentService::new(repo, outbox, events, pool.clone())
+            .with_shifts(shifts.clone());
+
+        // The gate is now open. `record_payment` will progress past the
+        // gate and attempt to insert against `ht_checkins(cin_id=-1)` —
+        // that FK will fail (Repository error). We assert NOT a
+        // Validation/no-open-shift error to prove the gate let us
+        // through.
+        let err = svc
+            .record_payment(sample_cmd())
+            .await
+            .expect_err("FK to ht_checkins must fail for cin_id=-1");
+
+        match &err {
+            ServiceError::Validation(msg) if msg.contains("no open shift") => {
+                panic!("gate incorrectly rejected with open shift: {msg}");
+            }
+            _ => {
+                // Any other error (Repository / outbox) means the gate
+                // let the request through, which is the assertion.
+            }
+        }
+
+        // Cleanup so reruns are deterministic.
+        let _ = sqlx::query("DELETE FROM ht_shifts WHERE shift_site_id = $1")
+            .bind(site)
+            .execute(&pool)
+            .await;
     }
 }

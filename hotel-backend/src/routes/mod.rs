@@ -22,6 +22,7 @@ pub mod new_rates;
 pub mod new_reports;
 pub mod new_room_types;
 pub mod new_rooms;
+pub mod new_shifts;
 pub mod new_stats;
 pub mod new_sync;
 pub mod occupancy;

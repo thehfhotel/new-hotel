@@ -1466,5 +1466,42 @@ VALUES ('042', '042_create_ht_rate_tiers.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================
+-- Migration 040: ht_shifts canonical (Track F2 / T1 HIGH-5).
+-- iHOTEL gates payments behind an open `HT_Round_Bill` shift. Our app
+-- accepted payments anytime, blocking cash-drawer reconciliation. F2
+-- lands the PG canonical + a service-layer gate; the legacy mirror
+-- writeback + CT sync are deferred to Track G.
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS ht_shifts (
+    shift_id              BIGSERIAL PRIMARY KEY,
+    shift_site_id         VARCHAR(50) NOT NULL,
+    shift_no              INTEGER     NOT NULL,
+    shift_opening_float   NUMERIC(12,2) NOT NULL DEFAULT 0,
+    shift_opened_by       VARCHAR(50) NOT NULL,
+    shift_opened_at       TIMESTAMPTZ NOT NULL,
+    shift_closed_at       TIMESTAMPTZ,
+    shift_closed_by       VARCHAR(50),
+    shift_legacy_round_id INTEGER,
+    shift_notes           TEXT,
+    shift_created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (shift_site_id, shift_no)
+);
+
+-- Partial unique index: at most one open shift per site.
+CREATE UNIQUE INDEX IF NOT EXISTS ht_shifts_one_open_per_site
+    ON ht_shifts (shift_site_id)
+    WHERE shift_closed_at IS NULL;
+
+-- Listing recent shifts (cash-drawer review) reads
+-- "site filter + opened_at DESC" — this index covers it.
+CREATE INDEX IF NOT EXISTS ix_ht_shifts_site_opened_at
+    ON ht_shifts (shift_site_id, shift_opened_at DESC);
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('040', '040_create_ht_shifts.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
 -- Initialization complete
 -- =============================================================================
