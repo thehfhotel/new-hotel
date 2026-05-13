@@ -3,6 +3,8 @@ name: Build, Push, and Deploy new-hotel Web App
 on:
   push:
     branches: [master]
+  pull_request:
+    branches: [master]
   workflow_dispatch:
 
 env:
@@ -378,7 +380,11 @@ jobs:
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
         with:
           context: .
-          push: true
+          # PR runs MUST NOT push to GHCR — only master pushes (or a master-
+          # targeted workflow_dispatch) do. The build itself still executes
+          # (so the GHA cache + Docker layer cache measurements still apply),
+          # and on master events the image is tagged + pushed exactly as before.
+          push: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/master' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # `scope: frontend` (Batch D): isolates the GHA cache namespace
@@ -429,7 +435,10 @@ jobs:
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
         with:
           context: ./hotel-backend
-          push: true
+          # PR runs MUST NOT push to GHCR — only master pushes (or a master-
+          # targeted workflow_dispatch) do. See the equivalent comment in
+          # build-frontend; same rationale.
+          push: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/master' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # `scope: backend` per Batch D — isolates GHA cache namespace.
@@ -457,8 +466,16 @@ jobs:
     # can't accidentally leave production with a half-seeded schema.
     # `success || skipped` mirrors the test-* jobs — the check is skipped
     # when no migration / init-db / migrate.sh files changed.
+    #
+    # Deploy ONLY fires on master pushes or a master-targeted workflow_dispatch.
+    # The `pull_request` trigger (added for CI measurement) MUST NOT touch prod —
+    # the explicit event_name check below is the load-bearing guard against that.
+    # The downstream build-* jobs still run on PRs but with push:false, so a PR
+    # exercising the workflow can't end up with a half-pushed image either.
     if: |
       always() &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/master' &&
       (needs.test-frontend.result == 'success' || needs.test-frontend.result == 'skipped') &&
       (needs.test-backend.result == 'success' || needs.test-backend.result == 'skipped') &&
       (needs.init-db-migrations-drift-check.result == 'success' || needs.init-db-migrations-drift-check.result == 'skipped') &&
