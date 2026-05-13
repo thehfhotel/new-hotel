@@ -1346,6 +1346,13 @@ INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('037', '037_scheduler_notification_state.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
+-- Migration 038 — Wave 5c seed already applied above (the `vat_percent`
+-- row in the ht_settings defaults block). Record the version so the
+-- drift checker doesn't reapply on a fresh init.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('038', '038_seed_vat_percent.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
 -- =============================================================================
 -- Initialization complete
 -- =============================================================================
