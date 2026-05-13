@@ -5,6 +5,76 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [vNext] - 2026-05-13 (Track B5)
+
+### Added
+
+- **Track B5 — One-shot backfill bin for `ht_checkin_rooms`
+  (`audit-2026-05-13.md` Theme 1, T1 CRIT-1 follow-on).** Closes the
+  remaining cardinality gap left after B2: folios that haven't been
+  re-synced through the new mapper since the B2 deploy still carry
+  only the deprecated header-level `ht_checkins.cin_room_id` and NO
+  junction rows. The B3 dashboard reads correctly fall back to
+  `cin_room_id` for those, but secondary rooms of multi-room folios
+  remain invisible until the next legacy edit. The new bin sweeps
+  every still-active legacy folio once and materialises the junction
+  via the same mapper the CT watcher uses.
+  - **`hotel-backend/src/sync/backfill.rs`** (new module): testable
+    orchestration core. Exposes `backfill_one_folio_with_aggregate`
+    plus `BackfillSummary` / `FolioOutcome` types so the integration
+    suite can drive the per-folio path without a live MSSQL pool.
+    Idempotency is enforced by the canonical mapper's own
+    `existing_matches` and `rooms_match` short-circuit; the
+    orchestration re-counts junction rows pre- and post-apply inside
+    the same tx so it can report "Applied" vs "SkippedIdempotent"
+    cleanly.
+  - **`hotel-backend/src/bin/backfill_checkin_rooms.rs`** (new bin):
+    thin wrapper that wires the orchestration up to a live MSSQL
+    pool + active-folio list. The active-folio query is
+    `SELECT DISTINCT Cin_no FROM HT_CheckIn_H h WHERE
+    h.Cin_status = N'ปกติ' AND EXISTS (SELECT 1 FROM
+    HT_CheckIn_Ds d WHERE d.Cin_No = h.Cin_no
+    AND d.Cin_Room_Status <> N'Check-Out')`. Reuses `bin/sync.rs`'s
+    `SiteConfig` / `DbConfig::from_env` pattern so per-site env-var
+    routing (HF Hotel vs HF Ville) works the same way as every
+    other adapter. Processes folios under a tokio semaphore
+    (`BACKFILL_CONCURRENCY=8` default, env-overridable) so a large
+    active-folio count never overwhelms either DB. Exits cleanly
+    when done — one-shot, not a long-running watcher.
+  - **`--dry-run` flag**: when set, the bin logs what would land
+    (post-apply junction count minus pre-apply count) then rolls
+    back the tx. The summary report is identical to apply mode
+    except for the `[DRY-RUN]` banner. Helpful for the
+    receptionist-coordinated apply window.
+  - **`Cargo.toml`**: new `[[bin]] name = "backfill_checkin_rooms"`
+    entry.
+  - **`hotel-backend/tests/test_backfill_b5.rs`** (new integration
+    suite): four tests covering (1) two-room materialisation,
+    (2) idempotent re-run, (3) folio missing in PG yields warn +
+    skip, (4) `--dry-run` reports `Applied` but writes nothing. All
+    four use `TEST_B5`-marked fixture rows with exact-match cleanup
+    so they don't race the parallel B3 / phase54 suites.
+  - **`docs/coexistence/RUNBOOK-b5-backfill.md`** (new): the
+    receptionist-coordinated apply procedure modelled on
+    `RUNBOOK-mssql-022-apply.md`. Status banner, pre-flight (HF
+    Hotel + HF Ville env vars, receptionist coordination, dry-run
+    spot-check), apply (one command per site), verification queries
+    (`SELECT COUNT(*) FROM ht_checkin_rooms` post-run + dashboard
+    spot-check), rollback (the row TRUNCATE is safe because B2's
+    mapper re-creates every junction row on the next CT tick for
+    any folio that subsequently drifts).
+  - **`migrations/README.md`**: new "Companion utility bins"
+    section. Documents `backfill_rooms` (Phase 5 / `HT_Rooms`,
+    pre-existing) and `backfill_checkin_rooms` (Track B5,
+    `HT_CheckIn_Ds`, this PR) with their roles, `--dry-run` flag
+    where applicable, and the runbook pointer.
+  - **Out of B5 scope** (kept for follow-on):
+    - `ht_checkins.cin_room_id` column kept (DEPRECATED). The
+      column DROP is a separate follow-on once a verification pass
+      confirms every active folio carries junction rows AND the
+      remaining `cin_room_id` read paths (RR.4, invoice, reports —
+      tracked under B3.x follow-ups) have cut over.
+
 ## [vNext] - 2026-05-13 (Track B3)
 
 ### Fixed

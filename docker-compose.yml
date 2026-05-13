@@ -451,6 +451,40 @@ services:
       - hotel-network
     # No restart: this is a one-shot job. `--rm` cleans up the container.
 
+  # Track B5 (audit-2026-05-13.md T1 CRIT-1 follow-on) — one-shot backfill
+  # of `ht_checkin_rooms` junction for active legacy folios that haven't
+  # been re-synced through the post-B2 mapper yet. Same image / profile
+  # shape as `backfill-rooms`; runbook is `docs/coexistence/RUNBOOK-b5-
+  # backfill.md`. Idempotent — safe to re-run.
+  #     # Dry run (writes nothing, prints would-Apply count):
+  #     docker compose --profile backfill run --rm \
+  #         --entrypoint ./backfill_checkin_rooms \
+  #         backfill-checkin-rooms -- --dry-run
+  #     # Apply:
+  #     docker compose --profile backfill run --rm \
+  #         backfill-checkin-rooms
+  backfill-checkin-rooms:
+    image: ghcr.io/thehfhotel/new-hotel-backend:latest
+    command: ["./backfill_checkin_rooms"]
+    profiles:
+      - backfill
+    environment:
+      - SITE_ID=${SITE_ID:-hfhotel}
+      - DB_SERVER=${DB_SERVER}
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - MSSQL_PORT=${MSSQL_PORT:-1433}
+      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@newdb:${PGPORT:-5439}/${POSTGRES_DB}
+      - BACKFILL_CONCURRENCY=${BACKFILL_CONCURRENCY:-8}
+      - RUST_LOG=${RUST_LOG:-backfill_checkin_rooms=info,hotel_backend=info}
+    depends_on:
+      newdb:
+        condition: service_healthy
+    networks:
+      - hotel-network
+    # No restart: this is a one-shot job. `--rm` cleans up the container.
+
 volumes:
   newdb_data:
 

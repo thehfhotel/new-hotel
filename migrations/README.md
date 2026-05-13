@@ -275,3 +275,30 @@ If you need additional data or relationships:
    ```
 
 3. **Use application-level joins** - Join data in your API code instead of modifying the database
+
+## Companion utility bins
+
+A small set of one-shot bins under `hotel-backend/src/bin/` exist for
+operations that the automated `scripts/migrate.sh` pipeline cannot
+cover — typically tasks that need both legacy MSSQL READ access AND
+canonical PG WRITE access in the same process. None of these bins run
+automatically; an operator invokes them via `docker compose --profile
+backfill run --rm <bin>` (or `cargo run --bin <name>` locally) when the
+companion runbook says to.
+
+| Bin | Track | Purpose | `--dry-run`? | Runbook |
+|-----|-------|---------|--------------|---------|
+| `backfill_rooms` | Phase 5 (Ville bootstrap) | Mirror legacy `HT_Rooms` + `HT_SET_RoomType` into `ht_rooms_new` + `ht_room_types`. Run once per site at first cutover, then again only if a room is added/edited on the legacy side and the CT room mapper hasn't caught up yet. Idempotent. | No | (none — bootstrap-time only) |
+| `backfill_checkin_rooms` | Track B5 (`audit-2026-05-13.md` T1 CRIT-1 follow-on) | Materialise `ht_checkin_rooms` rows for every still-active legacy folio that hasn't been re-synced through the post-B2 mapper. Closes the cardinality gap for folios untouched since B2 deploy. Reuses `sync::mappers::checkin::apply_checkin_aggregate` so behaviour is identical to the CT watcher's per-row path. Idempotent (re-runs short-circuit via `existing_matches` + `rooms_match`). | **Yes** (`-- --dry-run` rolls back the tx and reports would-Apply count without writing) | `docs/coexistence/RUNBOOK-b5-backfill.md` |
+
+Conventions every bin in this list follows:
+
+- Reads `SITE_ID` from env (`hfhotel` / `hfville`) and picks the
+  matching MSSQL connection via `DbConfig::from_env()`. Same routing
+  as `bin/sync.rs` and `bin/writeback.rs`.
+- Connects to PG via `DATABASE_URL` (or `NEW_DATABASE_URL`).
+- Prints a stdout summary report at the end so the operator can paste
+  it into the runbook's verification step.
+- Exits cleanly (status 0) when done. NOT a long-running watcher.
+- Bounded concurrency: a tokio semaphore caps in-flight per-row work
+  so a large input set never overwhelms either DB.
