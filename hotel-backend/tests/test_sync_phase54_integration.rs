@@ -688,18 +688,48 @@ async fn checkin_cancelled_with_no_existing_row_still_defers() {
 /// column from `customer::EAGER_FETCH_COLUMNS` is present, either as a
 /// Str/Null value.
 fn stub_customers_row(cust_no: &str, name: &str) -> HashMapRow {
+    // Track E2 (T1 HIGH-2 / T2 HIGH-4) widened
+    // `customer::EAGER_FETCH_COLUMNS` from 8 to 33. Every column must
+    // be present in the stub row or the projection's `try_get_str`
+    // probe errors out at apply time.
     HashMapRow::new(HT_CUSTOMERS)
         .with("Cust_no", MockValue::Str(cust_no.into()))
         .with("Cust_name", MockValue::Str(name.into()))
+        .with("Cust_name2", MockValue::Null)
         .with("Cust_perfix", MockValue::Str("นาย".into()))
+        .with("Cust_sex", MockValue::Null)
         .with("Cust_IDcard", MockValue::Null)
+        .with("Cust_Type", MockValue::Null)
         .with(
             "Cust_Type_Main",
             MockValue::Str("บุคคลธรรมดา".into()),
         )
         .with("Cust_Email", MockValue::Null)
         .with("Cust_Add_no", MockValue::Null)
+        .with("Cust_Add_moo", MockValue::Null)
+        .with("Cust_Add_soi", MockValue::Null)
+        .with("Cust_Add_road", MockValue::Null)
+        .with("Cust_Add_tambon", MockValue::Null)
+        .with("Cust_Add_ampore", MockValue::Null)
+        .with("Cust_Add_province", MockValue::Null)
+        .with("Cust_Add_code", MockValue::Null)
         .with("Cust_Add_tel", MockValue::Str("0801112222".into()))
+        .with("Cust_Add_fax", MockValue::Null)
+        .with("Cust_Work_Name", MockValue::Null)
+        .with("Cust_Work_no", MockValue::Null)
+        .with("Cust_Work_moo", MockValue::Null)
+        .with("Cust_Work_soi", MockValue::Null)
+        .with("Cust_Work_road", MockValue::Null)
+        .with("Cust_Work_tambon", MockValue::Null)
+        .with("Cust_Work_ampore", MockValue::Null)
+        .with("Cust_Work_province", MockValue::Null)
+        .with("Cust_Work_code", MockValue::Null)
+        .with("Cust_Work_tel", MockValue::Null)
+        .with("Cust_Work_fax", MockValue::Null)
+        .with("Cust_Work_Tax", MockValue::Null)
+        .with("Cust_Last_Change", MockValue::Null)
+        .with("Cust_Contry", MockValue::Null)
+        .with("Cust_Price_Over", MockValue::Null)
 }
 
 #[tokio::test]

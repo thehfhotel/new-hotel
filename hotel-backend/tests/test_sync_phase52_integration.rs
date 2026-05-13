@@ -29,18 +29,47 @@ fn unique_cust_no() -> String {
 }
 
 fn customer_row_full(cust_no: &str, name: &str, phone: &str) -> HashMapRow {
+    // Track E2 (T1 HIGH-2) widened the projection — fill the new
+    // columns with Null so HashMapRow returns Ok(None) at probe time
+    // (HashMapRow distinguishes missing cells from explicit NULLs).
     HashMapRow::new("HT_Customers")
         .with("Cust_no", MockValue::Str(cust_no.into()))
         .with("Cust_name", MockValue::Str(name.into()))
+        .with("Cust_name2", MockValue::Null)
         .with("Cust_perfix", MockValue::Str("นาย".into()))
+        .with("Cust_sex", MockValue::Null)
         .with("Cust_IDcard", MockValue::Str("REDACTED-sa-pw90123".into()))
+        .with("Cust_Type", MockValue::Null)
         .with(
             "Cust_Type_Main",
             MockValue::Str("บุคคลธรรมดา".into()),
         )
         .with("Cust_Email", MockValue::Str("a@b.co".into()))
         .with("Cust_Add_no", MockValue::Str("123/4".into()))
+        .with("Cust_Add_moo", MockValue::Null)
+        .with("Cust_Add_soi", MockValue::Null)
+        .with("Cust_Add_road", MockValue::Null)
+        .with("Cust_Add_tambon", MockValue::Null)
+        .with("Cust_Add_ampore", MockValue::Null)
+        .with("Cust_Add_province", MockValue::Null)
+        .with("Cust_Add_code", MockValue::Null)
         .with("Cust_Add_tel", MockValue::Str(phone.into()))
+        .with("Cust_Add_fax", MockValue::Null)
+        .with("Cust_Work_Name", MockValue::Null)
+        .with("Cust_Work_no", MockValue::Null)
+        .with("Cust_Work_moo", MockValue::Null)
+        .with("Cust_Work_soi", MockValue::Null)
+        .with("Cust_Work_road", MockValue::Null)
+        .with("Cust_Work_tambon", MockValue::Null)
+        .with("Cust_Work_ampore", MockValue::Null)
+        .with("Cust_Work_province", MockValue::Null)
+        .with("Cust_Work_code", MockValue::Null)
+        .with("Cust_Work_tel", MockValue::Null)
+        .with("Cust_Work_fax", MockValue::Null)
+        .with("Cust_Work_Tax", MockValue::Null)
+        .with("Cust_Last_Change", MockValue::Null)
+        .with("Cust_Contry", MockValue::Null)
+        .with("Cust_Price_Over", MockValue::Null)
 }
 
 #[tokio::test]
@@ -310,7 +339,18 @@ async fn room_master_clean_flip_emits_marked_clean_event() {
         // `Room_Manternace` (legacy typo) became required after v2.63.0
         // extended the room mapper to project the maintenance flag.
         .with("Room_Manternace", MockValue::Str("no".into()))
-        .with("Room_Details", MockValue::Null);
+        .with("Room_Details", MockValue::Null)
+        // Track E2 (T1 HIGH-3) — HashMapRow probes by cell presence;
+        // every column the projection reads must be set to either a
+        // value or an explicit Null.
+        .with("Room_Use_Count", MockValue::Null)
+        .with("Room_X", MockValue::Null)
+        .with("Room_Y", MockValue::Null)
+        .with("Room_Group", MockValue::Null)
+        .with("Room_Power_OPEN", MockValue::Null)
+        .with("Room_Power_CLOSE", MockValue::Null)
+        .with("Room_Power_STATUS", MockValue::Null)
+        .with("Room_Polity", MockValue::Null);
 
     let mut tx = pool.begin().await.unwrap();
     let event = mapper
@@ -376,7 +416,17 @@ async fn room_master_unchanged_clean_skips_event() {
         // `Room_Manternace` (legacy typo) became required after v2.63.0
         // extended the room mapper to project the maintenance flag.
         .with("Room_Manternace", MockValue::Str("no".into()))
-        .with("Room_Details", MockValue::Null);
+        .with("Room_Details", MockValue::Null)
+        // Track E2 (T1 HIGH-3) — projection requires every column to
+        // be present in the row.
+        .with("Room_Use_Count", MockValue::Null)
+        .with("Room_X", MockValue::Null)
+        .with("Room_Y", MockValue::Null)
+        .with("Room_Group", MockValue::Null)
+        .with("Room_Power_OPEN", MockValue::Null)
+        .with("Room_Power_CLOSE", MockValue::Null)
+        .with("Room_Power_STATUS", MockValue::Null)
+        .with("Room_Polity", MockValue::Null);
 
     let mut tx = pool.begin().await.unwrap();
     let event = mapper
