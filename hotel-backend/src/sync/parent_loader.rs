@@ -125,6 +125,8 @@ pub async fn load_booking_aggregate(
             "Book_by",
             "Book_room_note",
         ],
+        // Header table — single row expected, no ORDER BY required.
+        None,
     )
     .await?;
     let header = header_rows.into_iter().next();
@@ -147,6 +149,9 @@ pub async fn load_booking_aggregate(
             "Book_Room_PriceToTal",
             "Book_status",
         ],
+        // Track B2 / T2 HIGH-1 — stable iteration order across CT ticks
+        // (legacy `id` is the IDENTITY PK; matches write order).
+        Some("id ASC"),
     )
     .await?;
 
@@ -174,6 +179,9 @@ pub async fn load_booking_aggregate(
             "Book_USE",
             "Book_ok",
         ],
+        // Stable iteration so per-night accumulations are deterministic
+        // (Track B2 / T2 HIGH-1).
+        Some("id ASC"),
     )
     .await?;
 
@@ -221,6 +229,8 @@ pub async fn load_checkin_aggregate(
             "Cin_by",
             "Cin_Room_ALL",
         ],
+        // Header table — at most one row, no ORDER BY required.
+        None,
     )
     .await?;
     let header = header_rows.into_iter().next();
@@ -233,6 +243,10 @@ pub async fn load_checkin_aggregate(
         // sync/mappers/checkin.rs guards against accidental rename.
         "Cin_No",
         cin_no,
+        // Track B2 / T2 CRIT-1 — deposit columns added so the per-room
+        // junction projection (`sync::mappers::checkin::project_rooms`)
+        // can mirror `Cin_dep`, `Cin_dep_status`, `Cin_dep_returned`,
+        // `Cin_dep_returned_by` into `ht_checkin_rooms.cr_dep_*`.
         &[
             "id",
             "Cin_No",
@@ -245,7 +259,17 @@ pub async fn load_checkin_aggregate(
             "Cin_Room_Night",
             "Cin_Room_PriceToTal",
             "Cin_Room_Pay_Total",
+            "Cin_dep",
+            "Cin_dep_status",
+            "Cin_dep_returned",
+            "Cin_dep_returned_by",
         ],
+        // Track B2 / T2 HIGH-1 (audit 2026-05-13) — deterministic
+        // iteration order. Without this, `first_room_no` flipped
+        // non-deterministically across CT ticks; the room-set diff in
+        // `apply_checkin_aggregate` relied on iteration shape too. `id`
+        // is the IDENTITY PK and matches insert order.
+        Some("id ASC"),
     )
     .await?;
 
@@ -275,6 +299,8 @@ pub async fn load_checkin_aggregate(
             "Pay_No",
             "Cin_Status",
         ],
+        // Stable iteration for payment aggregation (Track B2 / T2 HIGH-1).
+        Some("id ASC"),
     )
     .await?;
 
@@ -285,11 +311,19 @@ pub async fn load_checkin_aggregate(
     })
 }
 
-/// Generic single-table read by `<col> = <val>`.
+/// Generic single-table read by `<col> = <val>`, optionally with an
+/// `ORDER BY` clause.
 ///
 /// Returns the rows materialised through the same `MappableRow` impl
 /// the rest of the sync layer uses, so consumers (mappers, tests) only
 /// know one row shape.
+///
+/// `order_by` accepts an SQL fragment (e.g. `"id ASC"`) appended after
+/// `WHERE`. Track B2 / T2 HIGH-1 (audit 2026-05-13) — without a stable
+/// ORDER BY the `HT_CheckIn_Ds` walk yielded non-deterministic
+/// `first_room_no`, which in turn caused `existing_matches` to
+/// idempotency-skip on pure room re-orderings. Callers should always
+/// pin order on multi-row child tables.
 ///
 /// Kept generic so 5.4's `load_checkin_aggregate(cin_no)` can call into
 /// the same helper with `("HT_CheckIn_H", "Cin_no", cin_no, …)` without
@@ -300,6 +334,7 @@ async fn fetch_rows(
     where_col: &'static str,
     where_val: &str,
     projection: &[&'static str],
+    order_by: Option<&'static str>,
 ) -> Result<Vec<HashMapRow>, SyncError> {
     let mut conn = mssql.get().await?;
 
@@ -309,7 +344,13 @@ async fn fetch_rows(
     // shape that `simple_query` provides.
     let where_q = sql_quote_inline(where_val);
     let select_list = projection.join(", ");
-    let sql = format!("SELECT {select_list} FROM {table} WHERE {where_col} = {where_q}");
+    let order_clause = match order_by {
+        Some(clause) => format!(" ORDER BY {clause}"),
+        None => String::new(),
+    };
+    let sql = format!(
+        "SELECT {select_list} FROM {table} WHERE {where_col} = {where_q}{order_clause}"
+    );
 
     let stream = conn.simple_query(&sql).await?;
     let raw_rows = stream.into_first_result().await?;

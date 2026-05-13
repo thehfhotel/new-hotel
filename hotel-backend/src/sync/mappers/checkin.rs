@@ -212,6 +212,42 @@ struct CanonicalCheckIn {
     /// AND triggers a one-shot re-projection of the parent booking
     /// (per the 5.4 prep #6 side-effect).
     is_fully_checked_out: bool,
+    /// Track B2 / T2 CRIT-1 — per-room projection. Each entry mirrors
+    /// one `HT_CheckIn_Ds` row and lands as one `ht_checkin_rooms` row
+    /// keyed on `(cr_cin_id, cr_room_id)`. The legacy header is one
+    /// row per folio; the junction is one row per room. Pre-B2 the
+    /// mapper collapsed this to `legacy_room_no` only (= first room),
+    /// which lost all rooms 2..N.
+    rooms: Vec<CanonicalRoom>,
+}
+
+/// Per-room slice of the canonical projection — one entry per
+/// `HT_CheckIn_Ds` row in the legacy aggregate, mirroring
+/// `ht_checkin_rooms` cardinality (junction keyed on
+/// `(cr_cin_id, cr_room_id)`). Track B2 / T2 CRIT-1.
+#[derive(Debug, Clone, PartialEq)]
+struct CanonicalRoom {
+    /// `HT_CheckIn_Ds.Cin_Room_No` — resolved to `cr_room_id` at apply
+    /// time. Carried as a string here so projection stays pure (no PG
+    /// access). `None` is invalid for a row that landed in the
+    /// aggregate; we filter zero-room-no rows out at projection.
+    legacy_room_no: String,
+    /// `HT_CheckIn_Ds.Cin_Room_Status` — Thai/English literal preserved
+    /// verbatim per user constraint (`'เข้าพัก'` / `'Check-Out'` /
+    /// `'จอง'` / `'ยกเลิก'`).
+    cr_room_status: String,
+    cr_room_in: Option<NaiveDateTime>,
+    cr_room_out: Option<NaiveDateTime>,
+    cr_rate_per_night: f64,
+    cr_nights: i32,
+    cr_room_total: f64,
+    cr_dep_amount: f64,
+    cr_dep_status: Option<String>,
+    cr_dep_returned_at: Option<NaiveDateTime>,
+    cr_dep_returned_by: Option<String>,
+    /// `HT_CheckIn_Ds.id` (legacy IDENTITY) — partial-indexed in PG when
+    /// non-NULL so writeback can resolve back to the legacy row.
+    cr_legacy_ds_id: Option<i32>,
 }
 
 /// Re-sync one check-in aggregate. Idempotent — safe to call multiple
@@ -243,10 +279,20 @@ pub async fn apply_checkin_aggregate(
     let existing = fetch_existing(tx, cin_no).await?;
 
     // Idempotent skip — the canonical row already mirrors the legacy
-    // aggregate.
+    // aggregate. Track B2 / T2 HIGH-2 (audit 2026-05-13) widened this
+    // check to include the per-room junction set: pre-B2 a pure
+    // room-change (rooms added / dropped / swapped without touching
+    // header amounts) idempotency-skipped because `existing_matches`
+    // only compared header fields. We now also fetch the current
+    // `ht_checkin_rooms` rows for the folio and compare the
+    // `(legacy_room_no, cr_room_status)` SET against the projection's
+    // `rooms` slice. Any divergence forces a re-apply.
     if let Some(ex) = existing.as_ref() {
         if existing_matches(ex, &projection) && ex.aggregate_id.is_some() {
-            return Ok(None);
+            let existing_rooms = fetch_existing_room_set(tx, ex.cin_id).await?;
+            if rooms_match(&existing_rooms, &projection.rooms) {
+                return Ok(None);
+            }
         }
     }
 
@@ -334,6 +380,16 @@ pub async fn apply_checkin_aggregate(
         }
     };
 
+    // Track B2 / T2 CRIT-1 — resolve every per-room FK BEFORE we mutate
+    // canonical state. If any room is missing in `ht_rooms_new` the
+    // entire apply defers so the next CT tick can retry against a fully
+    // resolvable aggregate. This mirrors the customer / booking FK
+    // resolution pattern already in use above.
+    let resolved_rooms = match resolve_canonical_rooms(tx, &projection.rooms).await? {
+        Some(rs) => rs,
+        None => return Ok(None),
+    };
+
     let (cin_id_serial, agg_id, was_insert) = match existing {
         Some(ex) => {
             let agg_id = ex
@@ -354,6 +410,13 @@ pub async fn apply_checkin_aggregate(
             (new_id, agg_id, true)
         }
     };
+
+    // Track B2 / T2 CRIT-1 — fan the projection's per-room slice out
+    // into `ht_checkin_rooms`. UPSERT each row, then DELETE any
+    // junction row whose `cr_room_id` is no longer in the current
+    // aggregate (covers iHOTEL dropping a room from a multi-room
+    // folio).
+    apply_checkin_rooms(tx, cin_id_serial, &resolved_rooms).await?;
 
     let event = build_event(
         was_insert,
@@ -416,6 +479,12 @@ async fn apply_cancelled_for_present_header(
     .bind(existing.cin_id)
     .execute(&mut **tx)
     .await?;
+    // Track B2 — the legacy app deletes every `HT_CheckIn_Ds` row on
+    // cancellation. Clear the junction so canonical state mirrors that.
+    // The `ON DELETE CASCADE` from `ht_checkins` only fires when the
+    // parent `ht_checkins` row is DELETEd; here we keep the parent row
+    // (status='cancelled') and explicitly clear the junction.
+    delete_dropped_checkin_rooms(tx, existing.cin_id, &[]).await?;
     Ok(None)
 }
 
@@ -441,6 +510,11 @@ async fn apply_cancelled(
     .bind(ex.cin_id)
     .execute(&mut **tx)
     .await?;
+    // Track B2 — header gone means every Ds row has gone too. Clear
+    // the junction so canonical state mirrors that. Keeps the parent
+    // `ht_checkins` row in place so reporting / audit trails can still
+    // resolve the cancelled folio by `legacy_cin_no`.
+    delete_dropped_checkin_rooms(tx, ex.cin_id, &[]).await?;
     let agg_id = ex
         .aggregate_id
         .unwrap_or_else(|| aggregate_uuid(AggregateKind::CheckIn, ex.cin_id));
@@ -717,6 +791,10 @@ fn project_aggregate(
     // Per-room state determines status + checkout-completion.
     let room_state = derive_room_state(&agg.rooms, &legacy_status_raw)?;
 
+    // Track B2 / T2 CRIT-1 — full per-room projection. One entry per
+    // legacy `HT_CheckIn_Ds` row; lands as one `ht_checkin_rooms` row.
+    let rooms = project_rooms(&agg.rooms)?;
+
     Ok(CanonicalCheckIn {
         legacy_cin_no: cin_no.to_string(),
         legacy_book_id,
@@ -730,7 +808,73 @@ fn project_aggregate(
         paid_amount,
         legacy_checkin_ds_id: room_state.first_ds_id,
         is_fully_checked_out: room_state.is_fully_checked_out,
+        rooms,
     })
+}
+
+/// Project every `HT_CheckIn_Ds` row into a [`CanonicalRoom`]. Rows
+/// without a `Cin_Room_No` are skipped (transient mid-edit state — the
+/// junction enforces `cr_room_id NOT NULL`).
+///
+/// Track B2 / T2 CRIT-1 (`docs/coexistence/audit-2026-05-13.md`):
+/// pre-B2 the mapper kept only the FIRST room. That bug is the head of
+/// every multi-room cardinality failure documented in audit Theme 1.
+fn project_rooms(rooms: &[HashMapRow]) -> Result<Vec<CanonicalRoom>, SyncError> {
+    let mut out = Vec::with_capacity(rooms.len());
+    for r in rooms {
+        let Some(legacy_room_no) = r.try_get_str("Cin_Room_No")?.map(str::to_string) else {
+            // Pre-B2 callers tolerated this by collapsing to
+            // first_room_no; B2 just drops the row from the junction.
+            // The drift is logged so the operator can investigate.
+            tracing::debug!(
+                target: "sync::checkin",
+                "project_rooms: HT_CheckIn_Ds row carries NULL Cin_Room_No — skipping"
+            );
+            continue;
+        };
+        if legacy_room_no.is_empty() {
+            tracing::debug!(
+                target: "sync::checkin",
+                "project_rooms: HT_CheckIn_Ds row carries empty Cin_Room_No — skipping"
+            );
+            continue;
+        }
+
+        let cr_room_status = r
+            .try_get_str("Cin_Room_Status")?
+            .unwrap_or_default()
+            .to_string();
+        let cr_room_in = r.try_get_datetime("Cin_Room_In")?;
+        let cr_room_out = r.try_get_datetime("Cin_Room_Out")?;
+        let cr_rate_per_night = r.try_get_decimal("Cin_Room_Price")?.unwrap_or(0.0);
+        // The legacy column is `Cin_Room_Night` (capital N on Night per
+        // schema dump §3.4) — keep verbatim.
+        let cr_nights = r.try_get_i32("Cin_Room_Night")?.unwrap_or(1);
+        let cr_room_total = r
+            .try_get_decimal("Cin_Room_PriceToTal")?
+            .unwrap_or(0.0);
+        let cr_dep_amount = r.try_get_decimal("Cin_dep")?.unwrap_or(0.0);
+        let cr_dep_status = r.try_get_str("Cin_dep_status")?.map(str::to_string);
+        let cr_dep_returned_at = r.try_get_datetime("Cin_dep_returned")?;
+        let cr_dep_returned_by = r.try_get_str("Cin_dep_returned_by")?.map(str::to_string);
+        let cr_legacy_ds_id = r.try_get_i32("id")?;
+
+        out.push(CanonicalRoom {
+            legacy_room_no,
+            cr_room_status,
+            cr_room_in,
+            cr_room_out,
+            cr_rate_per_night,
+            cr_nights,
+            cr_room_total,
+            cr_dep_amount,
+            cr_dep_status,
+            cr_dep_returned_at,
+            cr_dep_returned_by,
+            cr_legacy_ds_id,
+        });
+    }
+    Ok(out)
 }
 
 /// Translate the legacy `Cin_status` literal to the PG canonical
@@ -1041,6 +1185,212 @@ async fn insert_new(
     Ok(row.0)
 }
 
+// -----------------------------------------------------------------------------
+// ht_checkin_rooms junction (Track B2 / T2 CRIT-1)
+//
+// Per the audit (`docs/coexistence/audit-2026-05-13.md` Theme 1) the
+// pre-B2 mapper collapsed every multi-room folio to its first room —
+// rooms 2..N never landed in canonical state. B2 fans the projection's
+// per-room slice out into `ht_checkin_rooms`, keyed on the junction's
+// `UNIQUE (cr_cin_id, cr_room_id)`. Cardinality changes (a 3-room folio
+// dropping to 2 via iHOTEL edit) are handled by an explicit DELETE of
+// the room IDs that left the set.
+// -----------------------------------------------------------------------------
+
+/// Resolved per-room slice — the projection's `CanonicalRoom` plus the
+/// canonical `room_id` FK. Returned by [`resolve_canonical_rooms`].
+#[derive(Debug, Clone)]
+struct ResolvedRoom {
+    room_id: i32,
+    canonical: CanonicalRoom,
+}
+
+/// Resolve `cr_room_id` for every projection room. Returns `None` if
+/// any room is still missing in `ht_rooms_new` — the caller defers the
+/// entire apply so the next CT tick can retry against a fully
+/// resolvable aggregate. Empty input → empty output (a folio with no
+/// `HT_CheckIn_Ds` rows is legitimate transient state).
+async fn resolve_canonical_rooms(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    projection_rooms: &[CanonicalRoom],
+) -> Result<Option<Vec<ResolvedRoom>>, SyncError> {
+    let mut out = Vec::with_capacity(projection_rooms.len());
+    for room in projection_rooms {
+        match resolve::resolve_room_id(tx, Some(room.legacy_room_no.as_str())).await? {
+            Some(id) => out.push(ResolvedRoom {
+                room_id: id,
+                canonical: room.clone(),
+            }),
+            None => {
+                tracing::warn!(
+                    legacy_room_no = %room.legacy_room_no,
+                    "ht_checkin_rooms apply deferred: room not yet mirrored \
+                     (run bin/backfill_rooms?)"
+                );
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(out))
+}
+
+/// UPSERT each resolved room into `ht_checkin_rooms`, then DELETE any
+/// stale junction row whose `cr_room_id` is no longer in the current
+/// aggregate. The DELETE scope is bound to `cr_cin_id = $1`, so other
+/// folios' rows are never touched — even if two folios coincidentally
+/// share a room number (impossible under the legacy `HT_CheckIn_Ds`
+/// uniqueness rules but enforced defensively).
+async fn apply_checkin_rooms(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    cin_id: i32,
+    resolved_rooms: &[ResolvedRoom],
+) -> Result<(), SyncError> {
+    // UPSERT keyed on `(cr_cin_id, cr_room_id)` — same shape as the
+    // junction's `UNIQUE` constraint.
+    for room in resolved_rooms {
+        upsert_checkin_room(tx, cin_id, room).await?;
+    }
+
+    // DELETE rooms that dropped from the aggregate (3-room → 2-room
+    // edit on the legacy side). Empty `resolved_rooms` means EVERY
+    // junction row for this folio leaves — a legitimate transient
+    // state during a multi-statement legacy edit, where the
+    // re-projection on the next CT tick will re-insert them.
+    let kept_room_ids: Vec<i32> = resolved_rooms.iter().map(|r| r.room_id).collect();
+    delete_dropped_checkin_rooms(tx, cin_id, &kept_room_ids).await?;
+
+    Ok(())
+}
+
+/// UPSERT one `ht_checkin_rooms` row. The `ON CONFLICT` clause keys on
+/// the junction's `UNIQUE (cr_cin_id, cr_room_id)`.
+async fn upsert_checkin_room(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    cin_id: i32,
+    room: &ResolvedRoom,
+) -> Result<(), SyncError> {
+    let c = &room.canonical;
+    sqlx::query(
+        "INSERT INTO ht_checkin_rooms ( \
+             cr_cin_id, cr_room_id, cr_room_in, cr_room_out, cr_room_status, \
+             cr_rate_per_night, cr_nights, cr_room_total, cr_dep_amount, \
+             cr_dep_status, cr_dep_returned_at, cr_dep_returned_by, \
+             cr_legacy_ds_id \
+         ) VALUES ($1, $2, $3, $4, $5, $6::float8, $7, $8::float8, $9::float8, \
+                   $10, $11, $12, $13) \
+         ON CONFLICT (cr_cin_id, cr_room_id) DO UPDATE SET \
+             cr_room_in         = EXCLUDED.cr_room_in, \
+             cr_room_out        = EXCLUDED.cr_room_out, \
+             cr_room_status     = EXCLUDED.cr_room_status, \
+             cr_rate_per_night  = EXCLUDED.cr_rate_per_night, \
+             cr_nights          = EXCLUDED.cr_nights, \
+             cr_room_total      = EXCLUDED.cr_room_total, \
+             cr_dep_amount      = EXCLUDED.cr_dep_amount, \
+             cr_dep_status      = EXCLUDED.cr_dep_status, \
+             cr_dep_returned_at = EXCLUDED.cr_dep_returned_at, \
+             cr_dep_returned_by = EXCLUDED.cr_dep_returned_by, \
+             cr_legacy_ds_id    = COALESCE(EXCLUDED.cr_legacy_ds_id, \
+                                           ht_checkin_rooms.cr_legacy_ds_id), \
+             cr_updated_at      = NOW()",
+    )
+    .bind(cin_id)
+    .bind(room.room_id)
+    .bind(c.cr_room_in)
+    .bind(c.cr_room_out)
+    .bind(&c.cr_room_status)
+    .bind(c.cr_rate_per_night)
+    .bind(c.cr_nights)
+    .bind(c.cr_room_total)
+    .bind(c.cr_dep_amount)
+    .bind(&c.cr_dep_status)
+    .bind(c.cr_dep_returned_at)
+    .bind(&c.cr_dep_returned_by)
+    .bind(c.cr_legacy_ds_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// DELETE every `ht_checkin_rooms` row for this folio whose
+/// `cr_room_id` is NOT in `kept`. Handles the 3-room → 2-room edit case
+/// (and the legitimate header-still-present-but-all-Ds-deleted case,
+/// where `kept` is empty and every junction row drops).
+async fn delete_dropped_checkin_rooms(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    cin_id: i32,
+    kept: &[i32],
+) -> Result<(), SyncError> {
+    if kept.is_empty() {
+        sqlx::query("DELETE FROM ht_checkin_rooms WHERE cr_cin_id = $1")
+            .bind(cin_id)
+            .execute(&mut **tx)
+            .await?;
+    } else {
+        sqlx::query(
+            "DELETE FROM ht_checkin_rooms \
+              WHERE cr_cin_id = $1 \
+                AND cr_room_id <> ALL($2)",
+        )
+        .bind(cin_id)
+        .bind(kept)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Existing room slice as it currently lives in `ht_checkin_rooms`.
+/// Pairs the `legacy_room_no` (looked up via the `ht_rooms_new` join)
+/// with the per-row status so [`rooms_match`] can compare against the
+/// projection's `CanonicalRoom` set.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ExistingRoom {
+    legacy_room_no: String,
+    cr_room_status: String,
+}
+
+async fn fetch_existing_room_set(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    cin_id: i32,
+) -> Result<Vec<ExistingRoom>, SyncError> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT r.room_no, cr.cr_room_status \
+           FROM ht_checkin_rooms cr \
+           JOIN ht_rooms_new r ON r.room_id = cr.cr_room_id \
+          WHERE cr.cr_cin_id = $1",
+    )
+    .bind(cin_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(legacy_room_no, cr_room_status)| ExistingRoom {
+            legacy_room_no,
+            cr_room_status,
+        })
+        .collect())
+}
+
+/// True when the projection's per-room set already matches what lives
+/// in `ht_checkin_rooms`. Compares the SET (not the sequence) of
+/// `(legacy_room_no, cr_room_status)` pairs — order-independent per
+/// Track B2 / T2 HIGH-2.
+fn rooms_match(existing: &[ExistingRoom], projection: &[CanonicalRoom]) -> bool {
+    use std::collections::HashSet;
+    if existing.len() != projection.len() {
+        return false;
+    }
+    let ex_set: HashSet<(&str, &str)> = existing
+        .iter()
+        .map(|r| (r.legacy_room_no.as_str(), r.cr_room_status.as_str()))
+        .collect();
+    let proj_set: HashSet<(&str, &str)> = projection
+        .iter()
+        .map(|r| (r.legacy_room_no.as_str(), r.cr_room_status.as_str()))
+        .collect();
+    ex_set == proj_set
+}
+
 /// Build the appropriate `CheckInCreated` / `CheckInCancelled` /
 /// `CheckOutCompleted` event.
 ///
@@ -1175,6 +1525,26 @@ mod tests {
             .with("Cin_Room_No", MockValue::Str(room_no.into()))
             .with("Cin_Room_Status", MockValue::Str(status.into()))
             .with("Cin_Room_Out", MockValue::Null)
+            // Track B2 — per-room operational columns the projection
+            // now mirrors into `ht_checkin_rooms`. Default values mirror
+            // the writeback recipe's `walkin::build_statements` payload
+            // (1 night, 890.00, no deposit).
+            .with("Cin_Room_Price", MockValue::Decimal(890.0))
+            .with("Cin_Room_Night", MockValue::I32(1))
+            .with("Cin_Room_PriceToTal", MockValue::Decimal(890.0))
+            .with("Cin_dep", MockValue::Decimal(0.0))
+            .with("Cin_dep_status", MockValue::Null)
+            .with("Cin_dep_returned", MockValue::Null)
+            .with("Cin_dep_returned_by", MockValue::Null)
+            .with("Cin_Room_In", MockValue::Null)
+    }
+
+    /// Multi-room aggregates need distinct `HT_CheckIn_Ds.id` values so
+    /// the per-room projection carries unique `cr_legacy_ds_id`s. The
+    /// default `ds_row` helper hardcodes 25001 (single-room captures);
+    /// pass a `ds_id` here to override.
+    fn ds_row_with_id(cin_no: &str, room_no: &str, status: &str, ds_id: i32) -> HashMapRow {
+        ds_row(cin_no, room_no, status).with("id", MockValue::I32(ds_id))
     }
 
     fn ds_row_checked_out(cin_no: &str, room_no: &str) -> HashMapRow {
@@ -1490,6 +1860,202 @@ mod tests {
         );
     }
 
+    // ----- project_rooms (Track B2 / T2 CRIT-1) -------------------------
+
+    /// Multi-room aggregate: projection MUST carry one `CanonicalRoom`
+    /// per `HT_CheckIn_Ds` row. Pre-B2 the mapper collapsed to first
+    /// room only — this test locks the headline correctness fix.
+    #[test]
+    fn project_rooms_emits_one_canonical_room_per_legacy_ds_row() {
+        let agg = CheckInAggregate {
+            header: Some(header_row("CH26-005228", "C21607", "ปกติ")),
+            rooms: vec![
+                ds_row_with_id("CH26-005228", "402", "เข้าพัก", 25001),
+                ds_row_with_id("CH26-005228", "403", "เข้าพัก", 25002),
+                ds_row_with_id("CH26-005228", "404", "เข้าพัก", 25003),
+            ],
+            payments: vec![],
+        };
+        let p = project_aggregate(&agg, "CH26-005228").unwrap();
+        assert_eq!(p.rooms.len(), 3, "one CanonicalRoom per HT_CheckIn_Ds row");
+        let room_nos: Vec<&str> = p.rooms.iter().map(|r| r.legacy_room_no.as_str()).collect();
+        assert_eq!(room_nos, vec!["402", "403", "404"]);
+        let ds_ids: Vec<Option<i32>> = p.rooms.iter().map(|r| r.cr_legacy_ds_id).collect();
+        assert_eq!(ds_ids, vec![Some(25001), Some(25002), Some(25003)]);
+    }
+
+    /// Thai literal `'เข้าพัก'` (in-stay) MUST round-trip verbatim — the
+    /// user constraint forbids translating per-room status into a
+    /// canonical enum.
+    #[test]
+    fn project_rooms_preserves_thai_literal_in_room_status() {
+        let agg = CheckInAggregate {
+            header: Some(header_row("CH26-005228", "C21607", "ปกติ")),
+            rooms: vec![
+                ds_row_with_id("CH26-005228", "402", "เข้าพัก", 25001),
+                ds_row_with_id("CH26-005228", "403", "Check-Out", 25002),
+                ds_row_with_id("CH26-005228", "404", "จอง", 25003),
+                ds_row_with_id("CH26-005228", "405", "ยกเลิก", 25004),
+            ],
+            payments: vec![],
+        };
+        let p = project_aggregate(&agg, "CH26-005228").unwrap();
+        let statuses: Vec<&str> = p.rooms.iter().map(|r| r.cr_room_status.as_str()).collect();
+        assert_eq!(
+            statuses,
+            vec!["เข้าพัก", "Check-Out", "จอง", "ยกเลิก"],
+            "every legacy literal must pass through unchanged"
+        );
+    }
+
+    /// Single-room flow still works — the default `ds_row` carries the
+    /// 890.00/1-night writeback recipe shape.
+    #[test]
+    fn project_rooms_carries_rate_nights_total() {
+        let agg = CheckInAggregate {
+            header: Some(header_row("CH26-005228", "C21607", "ปกติ")),
+            rooms: vec![ds_row("CH26-005228", "402", "เข้าพัก")],
+            payments: vec![],
+        };
+        let p = project_aggregate(&agg, "CH26-005228").unwrap();
+        assert_eq!(p.rooms.len(), 1);
+        let only = &p.rooms[0];
+        assert_eq!(only.cr_rate_per_night, 890.0);
+        assert_eq!(only.cr_nights, 1);
+        assert_eq!(only.cr_room_total, 890.0);
+        assert_eq!(only.cr_dep_amount, 0.0);
+    }
+
+    /// Empty `Cin_Room_No` (transient mid-edit state) must be skipped
+    /// from the projection — the junction enforces `cr_room_id NOT NULL`.
+    #[test]
+    fn project_rooms_drops_rows_with_empty_cin_room_no() {
+        let mut empty = ds_row("CH26-005228", "", "เข้าพัก");
+        empty.cells.insert("id".into(), MockValue::I32(25099));
+        let agg = CheckInAggregate {
+            header: Some(header_row("CH26-005228", "C21607", "ปกติ")),
+            rooms: vec![
+                ds_row_with_id("CH26-005228", "402", "เข้าพัก", 25001),
+                empty,
+            ],
+            payments: vec![],
+        };
+        let p = project_aggregate(&agg, "CH26-005228").unwrap();
+        assert_eq!(p.rooms.len(), 1, "empty Cin_Room_No row must drop");
+        assert_eq!(p.rooms[0].legacy_room_no, "402");
+    }
+
+    // ----- rooms_match (Track B2 / T2 HIGH-2) ----------------------------
+
+    /// Pure room-change idempotency check — pre-B2 a swap of 402→403
+    /// (same status, same amounts) was wrongly skipped because the
+    /// header-level `existing_matches` matched.
+    #[test]
+    fn rooms_match_detects_pure_room_swap() {
+        let existing = vec![ExistingRoom {
+            legacy_room_no: "402".into(),
+            cr_room_status: "เข้าพัก".into(),
+        }];
+        let projection = vec![CanonicalRoom {
+            legacy_room_no: "403".into(),
+            cr_room_status: "เข้าพัก".into(),
+            cr_room_in: None,
+            cr_room_out: None,
+            cr_rate_per_night: 890.0,
+            cr_nights: 1,
+            cr_room_total: 890.0,
+            cr_dep_amount: 0.0,
+            cr_dep_status: None,
+            cr_dep_returned_at: None,
+            cr_dep_returned_by: None,
+            cr_legacy_ds_id: Some(25001),
+        }];
+        assert!(
+            !rooms_match(&existing, &projection),
+            "room swap MUST force a re-apply (pre-B2 bug: idempotency-skipped)"
+        );
+    }
+
+    #[test]
+    fn rooms_match_is_order_independent() {
+        let existing = vec![
+            ExistingRoom {
+                legacy_room_no: "402".into(),
+                cr_room_status: "เข้าพัก".into(),
+            },
+            ExistingRoom {
+                legacy_room_no: "403".into(),
+                cr_room_status: "เข้าพัก".into(),
+            },
+        ];
+        // Same set, different order.
+        let projection = vec![
+            CanonicalRoom {
+                legacy_room_no: "403".into(),
+                cr_room_status: "เข้าพัก".into(),
+                cr_room_in: None,
+                cr_room_out: None,
+                cr_rate_per_night: 890.0,
+                cr_nights: 1,
+                cr_room_total: 890.0,
+                cr_dep_amount: 0.0,
+                cr_dep_status: None,
+                cr_dep_returned_at: None,
+                cr_dep_returned_by: None,
+                cr_legacy_ds_id: Some(25002),
+            },
+            CanonicalRoom {
+                legacy_room_no: "402".into(),
+                cr_room_status: "เข้าพัก".into(),
+                cr_room_in: None,
+                cr_room_out: None,
+                cr_rate_per_night: 890.0,
+                cr_nights: 1,
+                cr_room_total: 890.0,
+                cr_dep_amount: 0.0,
+                cr_dep_status: None,
+                cr_dep_returned_at: None,
+                cr_dep_returned_by: None,
+                cr_legacy_ds_id: Some(25001),
+            },
+        ];
+        assert!(
+            rooms_match(&existing, &projection),
+            "set semantics — order must not matter"
+        );
+    }
+
+    /// A dropped room (3→2) MUST force a re-apply so the
+    /// junction-DELETE cleanup runs.
+    #[test]
+    fn rooms_match_detects_dropped_room() {
+        let existing = vec![
+            ExistingRoom {
+                legacy_room_no: "402".into(),
+                cr_room_status: "เข้าพัก".into(),
+            },
+            ExistingRoom {
+                legacy_room_no: "403".into(),
+                cr_room_status: "เข้าพัก".into(),
+            },
+        ];
+        let projection = vec![CanonicalRoom {
+            legacy_room_no: "402".into(),
+            cr_room_status: "เข้าพัก".into(),
+            cr_room_in: None,
+            cr_room_out: None,
+            cr_rate_per_night: 890.0,
+            cr_nights: 1,
+            cr_room_total: 890.0,
+            cr_dep_amount: 0.0,
+            cr_dep_status: None,
+            cr_dep_returned_at: None,
+            cr_dep_returned_by: None,
+            cr_legacy_ds_id: Some(25001),
+        }];
+        assert!(!rooms_match(&existing, &projection));
+    }
+
     #[test]
     fn project_errors_when_checkin_dates_missing() {
         let mut header = header_row("CH26-005228", "C21607", "ปกติ");
@@ -1522,6 +2088,7 @@ mod tests {
             paid_amount: Some(0.0),
             legacy_checkin_ds_id: Some(25001),
             is_fully_checked_out: false,
+            rooms: vec![],
         }
     }
 

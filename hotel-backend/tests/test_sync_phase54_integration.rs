@@ -892,3 +892,275 @@ async fn eager_mirror_defers_when_supplier_returns_no_row() {
     .unwrap();
     assert_eq!(count, 0, "no canonical row may be inserted on the defer path");
 }
+
+// =============================================================================
+// Track B2 — multi-room sync mapper (T2 CRIT-1, audit-2026-05-13)
+//
+// The headline correctness fix: every `HT_CheckIn_Ds` row in the legacy
+// aggregate must land as its own `ht_checkin_rooms` row. Pre-B2 the
+// mapper collapsed everything to the first room — rooms 2..N were
+// invisible to canonical state.
+// =============================================================================
+
+/// Helper: read every `(room_no, cr_room_status)` pair for a folio
+/// identified by its `legacy_cin_no`. Empty when the folio is missing.
+async fn checkin_rooms_for_folio(pool: &sqlx::PgPool, cin_no: &str) -> Vec<(String, String)> {
+    sqlx::query_as::<_, (String, String)>(
+        "SELECT r.room_no, cr.cr_room_status \
+           FROM ht_checkin_rooms cr \
+           JOIN ht_rooms_new r ON r.room_id = cr.cr_room_id \
+           JOIN ht_checkins c ON c.cin_id = cr.cr_cin_id \
+          WHERE c.legacy_cin_no = $1 \
+          ORDER BY r.room_no",
+    )
+    .bind(cin_no)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+}
+
+/// Track B2 / T2 CRIT-1 — headline test. A 2-room walk-in aggregate
+/// MUST emit exactly TWO `ht_checkin_rooms` rows. Pre-B2 only the
+/// first room landed (T2 CRIT-1).
+#[tokio::test]
+async fn apply_checkin_aggregate_creates_one_ht_checkin_rooms_row_per_legacy_ds_row() {
+    let pool = common::create_test_pool().await;
+    let mssql = mssql_stub().await;
+    let cin_no = unique_cin_no();
+    let cust_no = unique_cust_no();
+    let room_no_a = unique_room_no();
+    let room_no_b = unique_room_no();
+
+    let _cust_pg_id = seed_customer(&pool, &cust_no).await;
+    let _room_a = seed_room(&pool, &room_no_a).await;
+    let _room_b = seed_room(&pool, &room_no_b).await;
+
+    let aggregate = CheckInAggregate {
+        header: Some(header_row(&cin_no, &cust_no, "ปกติ")),
+        rooms: vec![
+            ds_row(&cin_no, &room_no_a, "เข้าพัก"),
+            // Second Ds row needs a distinct legacy id so the partial
+            // index `ht_checkin_rooms_legacy_ds_id` doesn't collide
+            // with a NULL-ambiguity in re-runs.
+            ds_row(&cin_no, &room_no_b, "เข้าพัก")
+                .with("id", hotel_backend::sync::row::test_support::MockValue::I32(25002)),
+        ],
+        payments: vec![],
+    };
+
+    let mut tx = pool.begin().await.expect("begin");
+    let event = apply_checkin_aggregate(&mut tx, mssql.as_ref(), &aggregate, &cin_no)
+        .await
+        .expect("apply must succeed");
+    assert!(event.is_some(), "fresh multi-room aggregate must emit an event");
+    if let Some(e) = event {
+        hotel_backend::outbox::bus::EventBus::publish(&mut tx, &e)
+            .await
+            .expect("publish");
+    }
+    tx.commit().await.expect("commit");
+
+    let rooms = checkin_rooms_for_folio(&pool, &cin_no).await;
+    assert_eq!(
+        rooms.len(),
+        2,
+        "multi-room folio must materialise as TWO ht_checkin_rooms rows \
+         (pre-B2 only the first room landed) — got {rooms:?}"
+    );
+    let room_nos: Vec<&str> = rooms.iter().map(|(no, _)| no.as_str()).collect();
+    assert!(
+        room_nos.contains(&room_no_a.as_str()),
+        "first room must be present"
+    );
+    assert!(
+        room_nos.contains(&room_no_b.as_str()),
+        "second room must be present (pre-B2 this was the bug)"
+    );
+
+    cleanup(&pool, &cin_no, &cust_no, &room_no_a).await;
+    sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = $1")
+        .bind(&room_no_b)
+        .execute(&pool)
+        .await
+        .ok();
+}
+
+/// Re-applying the exact same multi-room aggregate must NOT change the
+/// junction state (idempotency under Track B2 / T2 HIGH-2).
+#[tokio::test]
+async fn apply_checkin_aggregate_upserts_idempotently_on_re_apply() {
+    let pool = common::create_test_pool().await;
+    let mssql = mssql_stub().await;
+    let cin_no = unique_cin_no();
+    let cust_no = unique_cust_no();
+    let room_no_a = unique_room_no();
+    let room_no_b = unique_room_no();
+
+    let _cust_pg_id = seed_customer(&pool, &cust_no).await;
+    let _room_a = seed_room(&pool, &room_no_a).await;
+    let _room_b = seed_room(&pool, &room_no_b).await;
+
+    let aggregate = CheckInAggregate {
+        header: Some(header_row(&cin_no, &cust_no, "ปกติ")),
+        rooms: vec![
+            ds_row(&cin_no, &room_no_a, "เข้าพัก"),
+            ds_row(&cin_no, &room_no_b, "เข้าพัก")
+                .with("id", hotel_backend::sync::row::test_support::MockValue::I32(25002)),
+        ],
+        payments: vec![],
+    };
+
+    // First apply lands the two rows.
+    let mut tx = pool.begin().await.unwrap();
+    let _ = apply_checkin_aggregate(&mut tx, mssql.as_ref(), &aggregate, &cin_no)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let after_first = checkin_rooms_for_folio(&pool, &cin_no).await;
+    assert_eq!(after_first.len(), 2);
+
+    // Re-apply with identical aggregate.
+    let mut tx2 = pool.begin().await.unwrap();
+    let event2 = apply_checkin_aggregate(&mut tx2, mssql.as_ref(), &aggregate, &cin_no)
+        .await
+        .unwrap();
+    tx2.commit().await.unwrap();
+    assert!(
+        event2.is_none(),
+        "idempotent re-apply must skip the event publish path"
+    );
+
+    // Junction state unchanged.
+    let after_second = checkin_rooms_for_folio(&pool, &cin_no).await;
+    assert_eq!(
+        after_second, after_first,
+        "junction state must be byte-equal across idempotent re-apply"
+    );
+
+    cleanup(&pool, &cin_no, &cust_no, &room_no_a).await;
+    sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = $1")
+        .bind(&room_no_b)
+        .execute(&pool)
+        .await
+        .ok();
+}
+
+/// Dropping a room from a multi-room folio (3 → 2) MUST DELETE the
+/// junction row for the dropped room. Track B2 dropped-room semantics.
+#[tokio::test]
+async fn apply_checkin_aggregate_removes_dropped_rooms() {
+    let pool = common::create_test_pool().await;
+    let mssql = mssql_stub().await;
+    let cin_no = unique_cin_no();
+    let cust_no = unique_cust_no();
+    let room_no_a = unique_room_no();
+    let room_no_b = unique_room_no();
+    let room_no_c = unique_room_no();
+
+    let _cust_pg_id = seed_customer(&pool, &cust_no).await;
+    let _room_a = seed_room(&pool, &room_no_a).await;
+    let _room_b = seed_room(&pool, &room_no_b).await;
+    let _room_c = seed_room(&pool, &room_no_c).await;
+
+    // Initial 3-room aggregate.
+    let three_room = CheckInAggregate {
+        header: Some(header_row(&cin_no, &cust_no, "ปกติ")),
+        rooms: vec![
+            ds_row(&cin_no, &room_no_a, "เข้าพัก"),
+            ds_row(&cin_no, &room_no_b, "เข้าพัก")
+                .with("id", hotel_backend::sync::row::test_support::MockValue::I32(25002)),
+            ds_row(&cin_no, &room_no_c, "เข้าพัก")
+                .with("id", hotel_backend::sync::row::test_support::MockValue::I32(25003)),
+        ],
+        payments: vec![],
+    };
+    let mut tx = pool.begin().await.unwrap();
+    let _ = apply_checkin_aggregate(&mut tx, mssql.as_ref(), &three_room, &cin_no)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(checkin_rooms_for_folio(&pool, &cin_no).await.len(), 3);
+
+    // iHOTEL edit removes room C from the folio. The legacy app's
+    // shape is: HT_CheckIn_Ds row for room C is hard-deleted. Re-load
+    // the aggregate and observe two rows only.
+    let two_room = CheckInAggregate {
+        header: Some(header_row(&cin_no, &cust_no, "ปกติ")),
+        rooms: vec![
+            ds_row(&cin_no, &room_no_a, "เข้าพัก"),
+            ds_row(&cin_no, &room_no_b, "เข้าพัก")
+                .with("id", hotel_backend::sync::row::test_support::MockValue::I32(25002)),
+        ],
+        payments: vec![],
+    };
+    let mut tx2 = pool.begin().await.unwrap();
+    let _ = apply_checkin_aggregate(&mut tx2, mssql.as_ref(), &two_room, &cin_no)
+        .await
+        .unwrap();
+    tx2.commit().await.unwrap();
+
+    let rooms = checkin_rooms_for_folio(&pool, &cin_no).await;
+    assert_eq!(
+        rooms.len(),
+        2,
+        "dropped-room cleanup must DELETE the room-C junction row \
+         (3-room → 2-room edit on legacy)"
+    );
+    let still_present: Vec<&str> = rooms.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(still_present.contains(&room_no_a.as_str()));
+    assert!(still_present.contains(&room_no_b.as_str()));
+    assert!(
+        !still_present.contains(&room_no_c.as_str()),
+        "room C must be gone from the junction"
+    );
+
+    cleanup(&pool, &cin_no, &cust_no, &room_no_a).await;
+    sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = ANY($1)")
+        .bind(&[room_no_b.clone(), room_no_c.clone()])
+        .execute(&pool)
+        .await
+        .ok();
+}
+
+/// Thai literals (`'เข้าพัก'`) must round-trip verbatim through the
+/// junction — locks the user's standing legacy-literal constraint
+/// against an accidental enum translation.
+#[tokio::test]
+async fn apply_checkin_aggregate_preserves_thai_literals_in_junction() {
+    let pool = common::create_test_pool().await;
+    let mssql = mssql_stub().await;
+    let cin_no = unique_cin_no();
+    let cust_no = unique_cust_no();
+    let room_no = unique_room_no();
+
+    let _cust_pg_id = seed_customer(&pool, &cust_no).await;
+    let _room_id = seed_room(&pool, &room_no).await;
+
+    let aggregate = CheckInAggregate {
+        header: Some(header_row(&cin_no, &cust_no, "ปกติ")),
+        rooms: vec![ds_row(&cin_no, &room_no, "เข้าพัก")],
+        payments: vec![],
+    };
+    let mut tx = pool.begin().await.unwrap();
+    let _ = apply_checkin_aggregate(&mut tx, mssql.as_ref(), &aggregate, &cin_no)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let status: String = sqlx::query_scalar(
+        "SELECT cr.cr_room_status \
+           FROM ht_checkin_rooms cr \
+           JOIN ht_checkins c ON c.cin_id = cr.cr_cin_id \
+          WHERE c.legacy_cin_no = $1",
+    )
+    .bind(&cin_no)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        status, "เข้าพัก",
+        "Thai literal must round-trip verbatim into ht_checkin_rooms.cr_room_status"
+    );
+
+    cleanup(&pool, &cin_no, &cust_no, &room_no).await;
+}

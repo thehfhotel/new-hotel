@@ -5,6 +5,55 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [vNext] - 2026-05-13 (Track B2)
+
+### Fixed
+
+- **Track B2 — multi-room sync mapper (`audit-2026-05-13.md` T2 CRIT-1,
+  headline correctness fix).** `sync::mappers::checkin::
+  apply_checkin_aggregate` now emits one `ht_checkin_rooms` row per
+  `HT_CheckIn_Ds` row in the legacy aggregate, instead of collapsing
+  every multi-room folio to its first room. Multi-room folios are now
+  faithfully represented in canonical PG state.
+  - **Per-room projection** (`project_rooms`): each legacy
+    `HT_CheckIn_Ds` row becomes one `CanonicalRoom` carrying
+    `legacy_room_no`, `cr_room_status` (Thai/English literal verbatim
+    per the user's standing constraint), `cr_room_in/out`,
+    `cr_rate_per_night`, `cr_nights`, `cr_room_total`, `cr_dep_amount`,
+    `cr_dep_status`, `cr_dep_returned_at`, `cr_dep_returned_by`,
+    `cr_legacy_ds_id`.
+  - **UPSERT + dropped-room DELETE** (`apply_checkin_rooms` /
+    `delete_dropped_checkin_rooms`): junction rows are upserted keyed
+    on `(cr_cin_id, cr_room_id)`. After the upsert, any junction row
+    whose `cr_room_id` is NOT in the current aggregate's room set is
+    DELETEd — handles iHOTEL editing a 3-room folio down to 2 rooms.
+    Cancellation paths (`apply_cancelled` + the present-header
+    short-circuit) also clear the junction so canonical mirrors the
+    legacy app's cascade.
+  - **Widened `existing_matches`** (Track B2 / T2 HIGH-2): the
+    idempotency check now also fetches the current
+    `ht_checkin_rooms` rows and compares the
+    `(legacy_room_no, cr_room_status)` SET against the projection's
+    `rooms` slice. Pre-B2 a pure room-change (rooms added / dropped /
+    swapped without touching header amounts) was wrongly skipped.
+  - **`sync::parent_loader::fetch_rows` now takes
+    `order_by: Option<&'static str>`** (Track B2 / T2 HIGH-1).
+    `HT_CheckIn_Ds`, `HT_Book_Ds`, `HT_Book_Date`, and `HT_CheckIn_Pay`
+    callers pass `ORDER BY id ASC` so iteration order is stable
+    across CT ticks; pre-fix the room set flipped
+    non-deterministically and could falsely trigger / suppress
+    re-applies.
+  - **`HT_CheckIn_Ds` projection widened** in `load_checkin_aggregate`
+    so the per-room slice can mirror `Cin_dep`, `Cin_dep_status`,
+    `Cin_dep_returned`, `Cin_dep_returned_by`.
+  - **`ht_checkins.cin_room_id` kept (DEPRECATED)** — still written to
+    `first_room_no` for back-compat with non-B3 readers. B3 migrates
+    dashboards onto the junction; B5 drops the column.
+  - **Walkin3 multi-room fixture un-ignored** for the sync-mapper
+    assertion (`two_room_aggregate_projects_one_canonical_room_per_legacy_ds_row`).
+    The writeback assertion remains `#[ignore]`'d, tagged as the
+    Track B4 blocker.
+
 ## [vNext] - 2026-05-13 (Track G1)
 
 ### Added
