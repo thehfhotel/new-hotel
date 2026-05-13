@@ -5,6 +5,52 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [vNext] - 2026-05-14 (Track G8)
+
+### Added
+
+- **Track G8 — RR.4 Thai immigration foreign-guest export
+  (`audit-2026-05-13.md` T4 CRIT-2, legal-CRIT).** Closes the
+  standalone-cutover blocker where receptionists had to fall back to
+  iHOTEL every month to file `Report_RR4.rpt` (RR.4 / ตม.30) with the
+  district immigration office.
+  - `migrations/pg/047_rr4_export_log.sql` — new `ht_rr4_exports`
+    audit table. One row per export attempt with `site, range_from,
+    range_to, format, row_count, exported_by, exported_at,
+    file_hash` (hex SHA-256 of emitted bytes for regulator
+    non-repudiation). CHECK constraints on `format IN ('csv',
+    'xlsx')` and `range_to >= range_from`.
+  - `hotel-backend/src/service/reports/rr4.rs` — pure read-path
+    service. Joins `ht_guest_registry` + `ht_checkins` +
+    `ht_customers` + `ht_rooms_new`, UNIONs primary + companion-guest
+    rows, filters `LOWER(nationality) NOT IN ('th','thai','thailand',
+    'ไทย')` AND non-empty. Cancelled check-ins excluded. Ordered
+    `(checkin_date, room_no, name)` so re-runs of the same window
+    produce byte-identical files (load-bearing for the audit hash).
+  - `hotel-backend/src/routes/rr4_export.rs` —
+    `GET /api/new/reports/rr4?from=…&to=…&site=…&format=xlsx|csv`.
+    Returns a binary attachment with `Content-Disposition: attachment`
+    + `X-RR4-File-Hash` (SHA-256) + `X-RR4-Row-Count` response
+    headers. Default `format=xlsx` per `REPORTS_INVENTORY.md` §3.9.
+  - Eight-column emit order matches the official RR.4 form: ลำดับ /
+    ชื่อ-นามสกุล / สัญชาติ / เลขที่หนังสือเดินทาง / วันที่เข้าพัก /
+    วันที่ออก / หมายเลขห้อง / ที่อยู่ปัจจุบัน. Pinned by
+    `rr4_column_headers_match_legacy_layout` unit test. xlsx via
+    `rust_xlsxwriter` 0.95; CSV via `csv` 1.3 (RFC 4180).
+  - Frontend: `app/reports/rr4/page.tsx` (date range + site + format
+    + Export button; browser download via `URL.createObjectURL`,
+    surfaces SHA-256 + row count from response headers).
+    `components/Sidebar.tsx` — new `รร.4 (ตม.30)` nav entry under
+    "ธุรกิจ".
+  - `docs/coexistence/CARDINALITY_MAP.md` — `ht_rr4_exports` row
+    added to the PG-only audit-tables section (no legacy
+    counterpart; `FrmReportRR4` in iHOTEL kept no equivalent log).
+  - Tests: 12 lib unit (`service::reports::rr4`), 6 lib unit
+    (`routes::rr4_export`), 5 integration
+    (`tests/test_rr4_export.rs` — foreign-filter pivot, column-order
+    contract, audit-hash match, row-shape, cancelled-exclusion), 6
+    Jest (`__tests__/components/Rr4ExportPage.test.tsx`).
+
 ## [v2.64.0] - 2026-05-14 (Track G4)
 
 ### Added

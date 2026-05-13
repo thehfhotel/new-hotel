@@ -509,6 +509,8 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route("/api/new/reports/revenue", get(routes::new_reports::get_revenue))
         .route("/api/new/reports/occupancy", get(routes::new_reports::get_occupancy))
         .route("/api/new/reports/revenue-by-room-type", get(routes::new_reports::get_revenue_by_room_type))
+        // Track G8 — RR.4 Thai immigration foreign-guest export (legal CRIT)
+        .route("/api/new/reports/rr4", get(routes::rr4_export::get_rr4_export))
         // Invoice
         .route("/api/new/checkins/{id}/invoice", get(routes::new_invoice::get_invoice))
         // Payments

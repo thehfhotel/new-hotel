@@ -82,6 +82,7 @@ them).
 | `writeback_jobs` | Outbox queue |
 | `event_log` | Event sourcing log |
 | `ht_reconcile_log` | Reconcile-job divergence findings |
+| `ht_rr4_exports` | Track G8 / T4 CRIT-2 — audit trail for every RR.4 / ตม.30 Thai immigration foreign-guest export (one row per attempt with site, range, format, row count, exporter, SHA-256 of emitted bytes for regulator non-repudiation). PG-only; no legacy counterpart (`FrmReportRR4` in iHOTEL kept no equivalent log) |
 
 ## Open questions for the audits to resolve
 

@@ -1750,5 +1750,39 @@ VALUES ('046', '046_user_roles_and_permissions.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================
+-- Migration 047 — Track G8 (RR.4 Thai immigration export) audit trail.
+-- One row per export attempt. `file_hash` is hex SHA-256 of the emitted
+-- bytes so the regulator's re-requests can be answered with byte-exact
+-- fidelity. See `migrations/pg/047_rr4_export_log.sql` for the full
+-- rationale.
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS ht_rr4_exports (
+    id           SERIAL PRIMARY KEY,
+    site         VARCHAR(50)  NOT NULL,
+    range_from   DATE         NOT NULL,
+    range_to     DATE         NOT NULL,
+    format       VARCHAR(10)  NOT NULL,
+    row_count    INTEGER      NOT NULL DEFAULT 0,
+    exported_by  VARCHAR(100) NOT NULL DEFAULT 'system',
+    exported_at  TIMESTAMP    NOT NULL DEFAULT NOW(),
+    file_hash    VARCHAR(64)  NOT NULL,
+
+    CONSTRAINT ck_ht_rr4_exports_format
+        CHECK (format IN ('csv', 'xlsx')),
+    CONSTRAINT ck_ht_rr4_exports_range
+        CHECK (range_to >= range_from)
+);
+
+CREATE INDEX IF NOT EXISTS ix_ht_rr4_exports_site_range
+    ON ht_rr4_exports (site, range_from, range_to);
+CREATE INDEX IF NOT EXISTS ix_ht_rr4_exports_exported_at
+    ON ht_rr4_exports (exported_at DESC);
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('047', '047_rr4_export_log.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
 -- Initialization complete
 -- =============================================================================
