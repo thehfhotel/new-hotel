@@ -29,6 +29,7 @@ use crate::repository::checkin::{CheckInInsert, CheckInRepository, CheckOutWrite
 
 use super::error::{ServiceError, ServiceResult};
 use super::ids::{aggregate_uuid, AggregateKind};
+use super::shifts::ShiftService;
 
 /// Common fields the writeback recipe needs to mint the legacy
 /// `HT_CheckIn_*` rows for both walk-in and linked-to-booking flows.
@@ -178,6 +179,14 @@ pub struct CheckInService {
     pub(crate) outbox: Arc<OutboxRepository>,
     pub(crate) events: Arc<EventBus>,
     pub(crate) pg: PgPool,
+    /// Optional shift gate — Track G9 / T4 HIGH-8. When wired,
+    /// `check_out` (round-bill) refuses to fold the folio unless
+    /// `shifts.current_open_shift()` returns `Some`. Same builder
+    /// pattern as `PaymentService::with_shifts` from F2 so the two
+    /// gates stay symmetric. Stays `None` in unit tests not exercising
+    /// the shift flow; production construction in
+    /// `AppState::wire_services` always wires it on.
+    pub(crate) shifts: Option<Arc<ShiftService>>,
 }
 
 impl CheckInService {
@@ -187,7 +196,20 @@ impl CheckInService {
         events: Arc<EventBus>,
         pg: PgPool,
     ) -> Self {
-        Self { repo, outbox, events, pg }
+        Self { repo, outbox, events, pg, shifts: None }
+    }
+
+    /// Builder-style attach for the round-bill shift gate.
+    ///
+    /// Wired from `AppState::wire_services` so production deployments
+    /// refuse to fold a round-bill unless an `ht_shifts` row is open
+    /// for the site. Mirrors F2's `PaymentService::with_shifts`
+    /// pattern — same `ShiftService` instance is shared by both
+    /// services so the "one open shift per site" invariant is
+    /// observed identically across both gates.
+    pub fn with_shifts(mut self, shifts: Arc<ShiftService>) -> Self {
+        self.shifts = Some(shifts);
+        self
     }
 
     /// Walk-in flow — no prior booking, single-step room occupancy.
@@ -460,6 +482,15 @@ impl CheckInService {
 
     /// Check-out flow — applies repository checkout, frees the room,
     /// completes the booking (if linked), enqueues writeback + event.
+    ///
+    /// Track G9 / T4 HIGH-8 (`docs/coexistence/audit-2026-05-13.md`):
+    /// when a shift gate is wired (production), the call refuses to
+    /// fold the folio unless `shifts.current_open_shift()` returns
+    /// `Some`. The gate uses the EXACT same helper F2 introduced for
+    /// `PaymentService::record_payment` — see `service/payment.rs:203`.
+    /// The resolved `shift_id` is stamped onto the
+    /// `ht_checkins.cin_round_bill_shift_id` column (migration 048)
+    /// so per-shift revenue attribution is possible from canonical PG.
     pub async fn check_out(&self, cmd: CheckOutCommand) -> ServiceResult<CheckInOutcome> {
         let status = self
             .repo
@@ -479,6 +510,30 @@ impl CheckInService {
             )));
         }
 
+        // Track G9 / T4 HIGH-8: refuse the round-bill when a shift gate
+        // is wired and no shift is open. Mirrors the F2 gate at
+        // `payment.rs:203`. The Thai-localized message is the one the
+        // receptionist sees on the cashier UI; the English prefix
+        // matches F2's wording so log scraping treats both gates
+        // uniformly. The shift id is captured here under the same read
+        // path the payment gate uses; if multiple open shifts somehow
+        // exist (the partial UNIQUE index `ht_shifts_one_open_per_site`
+        // prevents this — defense in depth), `current_open_shift`
+        // returns the single row that survived the index.
+        let round_bill_shift_id = if let Some(shifts) = &self.shifts {
+            match shifts.current_open_shift().await? {
+                Some(shift) => Some(shift.shift_id),
+                None => {
+                    return Err(ServiceError::validation(
+                        "no open shift — please open a cashier shift before folding the round-bill \
+                         (ไม่พบรอบเงินที่เปิดอยู่ — กรุณาเปิดรอบเงินก่อนปิดบิล)",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
         let mut tx = self.pg.begin().await?;
 
         self.repo
@@ -490,6 +545,7 @@ impl CheckInService {
                     total_amount: cmd.total_amount,
                     payment_status: &cmd.payment_status,
                     notes: cmd.notes.as_deref(),
+                    round_bill_shift_id,
                 },
             )
             .await?;
@@ -617,5 +673,372 @@ fn build_check_in_snapshot(
         stay_start: ctx.stay.start,
         stay_end: ctx.stay.end,
         total_price_net: ctx.price_total,
+    }
+}
+
+// -----------------------------------------------------------------------------
+// tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    //! Track G9 / T4 HIGH-8 — exercise the round-bill shift gate on
+    //! `check_out`. Mirrors the F2 payment-gate test layout in
+    //! `service::payment::tests`: each test uses a unique `site_id`
+    //! marker so the partial UNIQUE index `ht_shifts_one_open_per_site`
+    //! doesn't cause cross-test interference, and every test skips
+    //! cleanly when PG is not reachable so `cargo test` without a DB
+    //! still passes the rest of the suite.
+    use super::*;
+    use crate::outbox::event::EventSource;
+    use crate::outbox::{EventBus, OutboxRepository};
+    use crate::repository::checkin::PgCheckInRepository;
+    use crate::service::shifts::{CloseShiftCommand, OpenShiftCommand, ShiftService};
+
+    async fn try_pool() -> Option<PgPool> {
+        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgresql://postgres:REDACTED-pg-2026@localhost:5439/hotelnew".to_string()
+        });
+        PgPool::connect(&url).await.ok()
+    }
+
+    /// Build a `CheckInService` wired with a real `ShiftService` so the
+    /// round-bill gate is exercised end-to-end. Mirrors the
+    /// `build_service_with_gate` helper in `service::payment::tests`.
+    fn build_service_with_gate(pool: PgPool, site_id: &str) -> CheckInService {
+        let repo: Arc<dyn CheckInRepository> = Arc::new(PgCheckInRepository::new());
+        let outbox = Arc::new(OutboxRepository::new());
+        let events = Arc::new(EventBus::new());
+        let shifts = Arc::new(ShiftService::new(pool.clone(), site_id));
+        CheckInService::new(repo, outbox, events, pool).with_shifts(shifts)
+    }
+
+    /// Reset the `ht_shifts` table for a marker site so reruns of the
+    /// same test don't accumulate closed-but-undeleted rows that would
+    /// hide a regression.
+    async fn clear_shifts(pool: &PgPool, site: &str) {
+        let _ = sqlx::query("DELETE FROM ht_shifts WHERE shift_site_id = $1")
+            .bind(site)
+            .execute(pool)
+            .await;
+    }
+
+    /// Insert a temporary `ht_checkins` row in `active` status so
+    /// `check_out` can target it. Returns `None` if the underlying
+    /// `ht_customers` / `ht_rooms_new` tables are empty (fresh dev DB
+    /// without seed data — the test is then skipped via the `?` early
+    /// return at the call site).
+    async fn seed_active_checkin(pool: &PgPool, marker: &str) -> Option<i32> {
+        let cust_id: Option<i32> =
+            sqlx::query_scalar("SELECT cust_id FROM ht_customers ORDER BY cust_id LIMIT 1")
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
+        let room_id: Option<i32> =
+            sqlx::query_scalar("SELECT room_id FROM ht_rooms_new ORDER BY room_id LIMIT 1")
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
+        let (cust_id, room_id) = (cust_id?, room_id?);
+
+        // `cin_no` is UNIQUE NOT NULL — use the marker so two concurrent
+        // tests can't collide. Truncated to 20 chars (the column width).
+        let cin_no: String = format!("G9-{marker}").chars().take(20).collect();
+        let row: Option<(i32,)> = sqlx::query_as(
+            "INSERT INTO ht_checkins (cin_no, cin_cust_id, cin_room_id, cin_checkin_time, \
+             cin_expected_checkout, cin_total_amount, cin_status, cin_rate_per_night, \
+             cin_adults, cin_children) \
+             VALUES ($1, $2, $3, NOW(), (NOW() + INTERVAL '1 day')::date, 100, 'active', 100, 1, 0) \
+             RETURNING cin_id",
+        )
+        .bind(&cin_no)
+        .bind(cust_id)
+        .bind(room_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+        row.map(|(id,)| id)
+    }
+
+    async fn cleanup_checkin(pool: &PgPool, cin_id: i32) {
+        let _ = sqlx::query("DELETE FROM ht_checkins WHERE cin_id = $1")
+            .bind(cin_id)
+            .execute(pool)
+            .await;
+    }
+
+    fn sample_checkout(cin_id: i32) -> CheckOutCommand {
+        CheckOutCommand {
+            check_in_id: cin_id,
+            check_out_time: None,
+            total_amount: Some(100.0),
+            payment_status: "paid".to_string(),
+            notes: None,
+            source: EventSource::System {
+                reason: "G9_gate_test".into(),
+            },
+            nights: 1.0,
+            room_price_total: 100.0,
+            product_total: 0.0,
+            net_total: 100.0,
+            pay_total: 100.0,
+            balance: 0.0,
+        }
+    }
+
+    /// Track G9 / T4 HIGH-8 — without an open shift, `check_out`
+    /// must reject with a `Validation` error whose message carries the
+    /// "no open shift" English token (matches F2's payment-gate
+    /// wording so the cashier UI can render either gate uniformly)
+    /// AND the Thai instruction so the receptionist sees actionable
+    /// guidance.
+    #[tokio::test]
+    async fn round_bill_rejected_when_no_open_shift() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping round_bill_rejected_when_no_open_shift — PG not reachable");
+            return;
+        };
+        let site = "TEST_G9_no_shift";
+        clear_shifts(&pool, site).await;
+
+        let Some(cin_id) = seed_active_checkin(&pool, site).await else {
+            eprintln!("skipping round_bill_rejected_when_no_open_shift — seed failed");
+            return;
+        };
+        let svc = build_service_with_gate(pool.clone(), site);
+
+        let err = svc
+            .check_out(sample_checkout(cin_id))
+            .await
+            .expect_err("must reject when no shift is open");
+
+        cleanup_checkin(&pool, cin_id).await;
+        clear_shifts(&pool, site).await;
+
+        match err {
+            ServiceError::Validation(msg) => {
+                assert!(
+                    msg.contains("no open shift"),
+                    "expected English gate message, got: {msg}"
+                );
+                assert!(
+                    msg.contains("เปิดรอบเงิน"),
+                    "expected Thai-localized instruction, got: {msg}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// Track G9 / T4 HIGH-8 — once a shift is opened the round-bill
+    /// must succeed AND stamp `cin_round_bill_shift_id` on the
+    /// canonical row (per-shift attribution per migration 048).
+    #[tokio::test]
+    async fn round_bill_succeeds_when_shift_open_and_stamps_shift_id() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping round_bill_succeeds_when_shift_open — PG not reachable");
+            return;
+        };
+        let site = "TEST_G9_open_shift";
+        clear_shifts(&pool, site).await;
+
+        let Some(cin_id) = seed_active_checkin(&pool, site).await else {
+            eprintln!("skipping round_bill_succeeds_when_shift_open — seed failed");
+            return;
+        };
+
+        let shifts = Arc::new(ShiftService::new(pool.clone(), site));
+        let open_outcome = match shifts
+            .open_shift(OpenShiftCommand {
+                opened_by: "alice".into(),
+                opening_float: 500.0,
+                notes: None,
+            })
+            .await
+        {
+            Ok(o) => o,
+            Err(err) => {
+                cleanup_checkin(&pool, cin_id).await;
+                panic!("open_shift failed: {err:?}");
+            }
+        };
+
+        let repo: Arc<dyn CheckInRepository> = Arc::new(PgCheckInRepository::new());
+        let outbox = Arc::new(OutboxRepository::new());
+        let events = Arc::new(EventBus::new());
+        let svc = CheckInService::new(repo, outbox, events, pool.clone())
+            .with_shifts(shifts.clone());
+
+        let result = svc.check_out(sample_checkout(cin_id)).await;
+
+        // Read back the stamped shift_id before cleaning up so the
+        // assertion has access to the canonical state we wrote.
+        let stamped: Option<i64> = sqlx::query_scalar(
+            "SELECT cin_round_bill_shift_id FROM ht_checkins WHERE cin_id = $1",
+        )
+        .bind(cin_id)
+        .fetch_one(&pool)
+        .await
+        .ok()
+        .flatten();
+
+        cleanup_checkin(&pool, cin_id).await;
+        clear_shifts(&pool, site).await;
+
+        let outcome = result.expect("round-bill must succeed with open shift");
+        assert_eq!(outcome.check_in_id, cin_id);
+        assert_eq!(
+            stamped,
+            Some(open_outcome.shift_id),
+            "cin_round_bill_shift_id must be stamped with the open shift's id"
+        );
+    }
+
+    /// Track G9 / T4 HIGH-8 — closing the shift before the round-bill
+    /// returns the same `Validation` error as the no-shift-ever case
+    /// (`current_open_shift()` returns `None` for both, the gate can't
+    /// distinguish). Test pins the contract so a refactor that
+    /// accidentally exempts "previously open" shifts is caught.
+    #[tokio::test]
+    async fn round_bill_rejected_when_shift_already_closed() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping round_bill_rejected_when_shift_already_closed — PG not reachable");
+            return;
+        };
+        let site = "TEST_G9_closed_shift";
+        clear_shifts(&pool, site).await;
+
+        let Some(cin_id) = seed_active_checkin(&pool, site).await else {
+            eprintln!("skipping round_bill_rejected_when_shift_already_closed — seed failed");
+            return;
+        };
+
+        let shifts = Arc::new(ShiftService::new(pool.clone(), site));
+        if let Err(err) = shifts
+            .open_shift(OpenShiftCommand {
+                opened_by: "alice".into(),
+                opening_float: 0.0,
+                notes: None,
+            })
+            .await
+        {
+            cleanup_checkin(&pool, cin_id).await;
+            panic!("open_shift failed: {err:?}");
+        }
+        if let Err(err) = shifts
+            .close_shift(CloseShiftCommand {
+                closed_by: "alice".into(),
+                notes: None,
+            })
+            .await
+        {
+            cleanup_checkin(&pool, cin_id).await;
+            clear_shifts(&pool, site).await;
+            panic!("close_shift failed: {err:?}");
+        }
+
+        let repo: Arc<dyn CheckInRepository> = Arc::new(PgCheckInRepository::new());
+        let outbox = Arc::new(OutboxRepository::new());
+        let events = Arc::new(EventBus::new());
+        let svc = CheckInService::new(repo, outbox, events, pool.clone())
+            .with_shifts(shifts.clone());
+
+        let err = svc
+            .check_out(sample_checkout(cin_id))
+            .await
+            .expect_err("closed shift must be treated as no-open-shift");
+
+        cleanup_checkin(&pool, cin_id).await;
+        clear_shifts(&pool, site).await;
+
+        match err {
+            ServiceError::Validation(msg) => {
+                assert!(
+                    msg.contains("no open shift"),
+                    "expected gate message after close, got: {msg}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// Track G9 / T4 HIGH-8 — concurrency: two parallel round-bills
+    /// against the same checkin must result in exactly one success.
+    /// The second sees `cin_status='checkedout'` already (set by the
+    /// first's `apply_checkout`) and fails the precheck. Mirrors F2's
+    /// UPDLOCK pattern adapted for PG (`find_status` + status guard
+    /// before opening the TX; the actual UPDATE then targets a row
+    /// whose `cin_status` has already been demoted).
+    #[tokio::test]
+    async fn concurrent_round_bills_against_same_checkin_one_wins() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping concurrent_round_bills — PG not reachable");
+            return;
+        };
+        let site = "TEST_G9_concurrent";
+        clear_shifts(&pool, site).await;
+
+        let Some(cin_id) = seed_active_checkin(&pool, site).await else {
+            eprintln!("skipping concurrent_round_bills — seed failed");
+            return;
+        };
+
+        let shifts = Arc::new(ShiftService::new(pool.clone(), site));
+        if let Err(err) = shifts
+            .open_shift(OpenShiftCommand {
+                opened_by: "alice".into(),
+                opening_float: 0.0,
+                notes: None,
+            })
+            .await
+        {
+            cleanup_checkin(&pool, cin_id).await;
+            panic!("open_shift failed: {err:?}");
+        }
+
+        let repo: Arc<dyn CheckInRepository> = Arc::new(PgCheckInRepository::new());
+        let outbox = Arc::new(OutboxRepository::new());
+        let events = Arc::new(EventBus::new());
+        let svc = Arc::new(
+            CheckInService::new(repo, outbox, events, pool.clone())
+                .with_shifts(shifts.clone()),
+        );
+
+        let svc_a = svc.clone();
+        let svc_b = svc.clone();
+        let cmd_a = sample_checkout(cin_id);
+        let cmd_b = sample_checkout(cin_id);
+
+        let (ra, rb) = tokio::join!(
+            tokio::spawn(async move { svc_a.check_out(cmd_a).await }),
+            tokio::spawn(async move { svc_b.check_out(cmd_b).await }),
+        );
+
+        cleanup_checkin(&pool, cin_id).await;
+        clear_shifts(&pool, site).await;
+
+        let ra = ra.expect("task A must not panic");
+        let rb = rb.expect("task B must not panic");
+
+        let successes = [ra.is_ok(), rb.is_ok()].iter().filter(|x| **x).count();
+        assert_eq!(
+            successes, 1,
+            "exactly one of two concurrent round-bills must succeed; got {successes} (ra={ra:?}, rb={rb:?})"
+        );
+        // The losing call must be a `Conflict` (status != 'active'),
+        // not a `Validation` — that distinguishes the concurrency
+        // collision from a gate rejection.
+        let loser = match (ra, rb) {
+            (Err(err), Ok(_)) | (Ok(_), Err(err)) => err,
+            (Err(_), Err(_)) => panic!("both round-bills failed; exactly one should win"),
+            (Ok(_), Ok(_)) => panic!("both round-bills succeeded; exactly one should win"),
+        };
+        assert!(
+            matches!(loser, ServiceError::Conflict(_)),
+            "loser must be a Conflict (folio already folded), got: {loser:?}"
+        );
     }
 }

@@ -254,6 +254,12 @@ CREATE TABLE IF NOT EXISTS ht_checkins (
     legacy_cust_no VARCHAR(20),
     legacy_checkin_ds_id INTEGER,
     aggregate_id UUID,
+    -- Track G9 / T4 HIGH-8 (migration 048) — the cashier shift that
+    -- folded the final round-bill (check-out). NULL until the folio is
+    -- folded; FK declared after `ht_shifts` table is created below so
+    -- the column-order in the table body stays decoupled from the F2
+    -- canonical's later definition.
+    cin_round_bill_shift_id BIGINT,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW(),
     cin_created_by VARCHAR(50),
@@ -1561,6 +1567,35 @@ ON CONFLICT (version) DO NOTHING;
 -- above; this seed marks the migration as applied for fresh deploys.
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('044', '044_ht_payments_refund_columns.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 048 — Track G9 / T4 HIGH-8. Add the FK on
+-- `ht_checkins.cin_round_bill_shift_id` -> `ht_shifts.shift_id` now
+-- that `ht_shifts` exists (declared above by migration 040's inlined
+-- DDL). The column itself is declared in the `ht_checkins` CREATE
+-- TABLE block earlier in this file. Guarded by `pg_constraint`
+-- existence so re-running the init script is a no-op.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'fk_ht_checkins_round_bill_shift'
+    ) THEN
+        ALTER TABLE ht_checkins
+            ADD CONSTRAINT fk_ht_checkins_round_bill_shift
+            FOREIGN KEY (cin_round_bill_shift_id)
+            REFERENCES ht_shifts(shift_id)
+            ON DELETE SET NULL;
+    END IF;
+END
+$$;
+
+CREATE INDEX IF NOT EXISTS ix_ht_checkins_round_bill_shift_id
+    ON ht_checkins (cin_round_bill_shift_id)
+    WHERE cin_round_bill_shift_id IS NOT NULL;
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('048', '048_round_bill_shift_id.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================

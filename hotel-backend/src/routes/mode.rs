@@ -290,12 +290,21 @@ impl AppState {
                 events.clone(),
                 pg.clone(),
             )),
-            checkins: Arc::new(CheckInService::new(
-                checkins,
-                outbox.clone(),
-                events.clone(),
-                pg.clone(),
-            )),
+            checkins: Arc::new(
+                CheckInService::new(
+                    checkins,
+                    outbox.clone(),
+                    events.clone(),
+                    pg.clone(),
+                )
+                // Track G9 / T4 HIGH-8 — wire the same `ShiftService`
+                // instance the payment gate uses so `check_out`
+                // (round-bill fold) refuses to run unless a shift is
+                // open AND can stamp the resolved `shift_id` onto
+                // `ht_checkins.cin_round_bill_shift_id` for per-shift
+                // revenue attribution.
+                .with_shifts(shifts.clone()),
+            ),
             payments: Arc::new(
                 PaymentService::new(
                     payments,
