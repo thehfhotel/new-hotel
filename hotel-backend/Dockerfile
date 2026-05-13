@@ -59,19 +59,34 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     cargo install cargo-chef --locked --version 0.1.71
 # sccache (compiler cache): wraps rustc and caches build outputs keyed
 # on the exact crate inputs, so unchanged crates are linked from cache
-# instead of recompiled. Local-disk mode here (no GHA backend reachable
-# inside Docker BuildKit); the SCCACHE_DIR cache mount below persists
-# the cache across image rebuilds via BuildKit's gha cache scope.
+# instead of recompiled.
 #
+# ## GHA backend (SPIKE — chore/spike-sccache-gha-docker)
+#
+# Previous iteration used local-disk mode via SCCACHE_DIR=/sccache on a
+# BuildKit cache mount. Post-PR68 measurement showed 358 misses / 0 hits
+# across multiple runs — the cache mount's contents don't persist
+# meaningfully across CI runs in a way that pays back the workspace-scale
+# recompile, so sccache never warms up.
+#
+# Switched to GitHub Actions cache v2 backend (`SCCACHE_GHA_ENABLED=on`),
+# which the test-backend host job already uses successfully. The runner-
+# side ACTIONS_RESULTS_URL + ACTIONS_RUNTIME_TOKEN env vars are forwarded
+# into the cook + build RUN blocks via `--mount=type=secret,env=...` so
+# sccache inside BuildKit can talk to the same v2 cache service. The
+# workflow's docker/build-push-action call must pass these as secrets.
+#
+# ## sccache version
+#
+# v0.10.0 is the first release with GHA v2 cache API support (opendal
+# 0.52 bump). v0.8.2 — the prior pin — only supports the v1 API that
+# GitHub sunset on 2026-02-01, so it would silently fall back to no-op
+# caching against the v2 service. Bumped to v0.10.0 for compatibility.
 # Install via pre-built binary tarball from mozilla/sccache releases —
 # `cargo install sccache` compiles from source and costs ~5min on a cold
-# layer cache (regression observed on PR #68's first measurement). The
-# curl+tar path completes in seconds. Mirrors the host-side install used
-# by mozilla-actions/sccache-action in the test-backend job.
-#
-# Pinned v0.8.2 (latest stable 2026-05-13). Bump version + verify
-# `sccache --version` if upstream cuts a new release.
-ARG SCCACHE_VERSION=v0.8.2
+# layer cache. Mirrors the host-side install used by
+# mozilla-actions/sccache-action in the test-backend job.
+ARG SCCACHE_VERSION=v0.10.0
 ARG SCCACHE_ARCH=x86_64-unknown-linux-musl
 RUN --mount=type=cache,target=/tmp/sccache-dl,id=sccache-tarball \
     set -eux; \
@@ -87,12 +102,15 @@ ENV SQLX_OFFLINE=true
 # crates.io-index, which sccache/rustup-1.86+ defaults to anyway, but be
 # explicit so future Rust upgrades don't change behavior under us).
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
-# Wire sccache as the rustc wrapper. SCCACHE_DIR points to a BuildKit
-# cache mount path used by the cook + build RUNs below; SCCACHE_CACHE_SIZE
-# caps the on-disk cache so it can't grow without bound across CI runs.
+# Wire sccache as the rustc wrapper. SCCACHE_GHA_ENABLED switches the
+# backend from local-disk to GitHub Actions cache v2. The runner-side
+# ACTIONS_RESULTS_URL + ACTIONS_RUNTIME_TOKEN env vars are injected per-
+# RUN via secret mounts (see cook + build steps below). Without those
+# two vars set inside the RUN, sccache logs a warning and falls back
+# to a no-op cache — verifiable via `sccache --show-stats` at the end
+# of each RUN.
 ENV RUSTC_WRAPPER=sccache
-ENV SCCACHE_DIR=/sccache
-ENV SCCACHE_CACHE_SIZE=2G
+ENV SCCACHE_GHA_ENABLED=on
 # Match the workflow-level setting: skip cargo incremental in Docker too.
 # Incremental artifacts inflate the target/ cache mount without buying
 # anything in a CI build (every run starts from a known dep set).
@@ -113,11 +131,17 @@ FROM chef AS builder
 # Step 1: cook the dependency closure. This RUN is keyed on recipe.json
 # alone — when deps don't change, Docker reuses the prior layer and
 # the cook command never executes. That's the cargo-chef value prop.
+#
+# Secret mounts inject the GitHub Actions cache v2 credentials so sccache
+# inside BuildKit can talk to the same cache service the host-side test-
+# backend job already uses. `env=NAME` exposes the secret as an env var
+# only for the duration of this RUN, NOT in any image layer.
 COPY --from=planner /usr/src/app/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
     --mount=type=cache,target=/usr/src/app/target,id=hotel-backend-target \
-    --mount=type=cache,target=/sccache,id=sccache-backend \
+    --mount=type=secret,id=actions_results_url,env=ACTIONS_RESULTS_URL \
+    --mount=type=secret,id=actions_runtime_token,env=ACTIONS_RUNTIME_TOKEN \
     cargo chef cook --release --recipe-path recipe.json \
     && sccache --show-stats
 
@@ -131,7 +155,8 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
     --mount=type=cache,target=/usr/src/app/target,id=hotel-backend-target \
-    --mount=type=cache,target=/sccache,id=sccache-backend \
+    --mount=type=secret,id=actions_results_url,env=ACTIONS_RESULTS_URL \
+    --mount=type=secret,id=actions_runtime_token,env=ACTIONS_RUNTIME_TOKEN \
     cargo build --release --locked \
         --bin hotel-backend \
         --bin writeback \

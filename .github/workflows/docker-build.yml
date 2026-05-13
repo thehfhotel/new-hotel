@@ -431,6 +431,34 @@ jobs:
             type=sha,prefix=
             type=raw,value=latest
 
+      # Probe runner env so we can route the GHA cache v2 endpoint into
+      # BuildKit as secrets (SPIKE — chore/spike-sccache-gha-docker).
+      # These two env vars are populated by GitHub on every runner and are
+      # what mozilla-actions/sccache-action forwards on the host. The
+      # Dockerfile's chef/builder RUN steps consume them via secret mounts
+      # so sccache can hit the v2 cache service from inside BuildKit.
+      # ACTIONS_CACHE_SERVICE_V2 must also be set to "on" for sccache to
+      # use the v2 API rather than v1 (sunset 2026-02-01).
+      - name: Forward GHA cache v2 env to BuildKit secrets
+        id: gha_cache_env
+        env:
+          ACTIONS_RESULTS_URL_INNER: ${{ env.ACTIONS_RESULTS_URL }}
+          ACTIONS_RUNTIME_TOKEN_INNER: ${{ env.ACTIONS_RUNTIME_TOKEN }}
+        run: |
+          set -u
+          # Stash to step outputs (masked) so the next step can mount them
+          # via `secrets:` without quoting hell. The inner GH env mask still
+          # applies — these are GH-issued ephemeral tokens scoped to this run.
+          umask 077
+          printf '%s' "$ACTIONS_RESULTS_URL_INNER"   > /tmp/actions_results_url
+          printf '%s' "$ACTIONS_RUNTIME_TOKEN_INNER" > /tmp/actions_runtime_token
+          if [ -s /tmp/actions_results_url ] && [ -s /tmp/actions_runtime_token ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::ACTIONS_RESULTS_URL or ACTIONS_RUNTIME_TOKEN empty — sccache GHA backend will no-op."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and push backend
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
         with:
@@ -444,6 +472,13 @@ jobs:
           # `scope: backend` per Batch D — isolates GHA cache namespace.
           cache-from: type=gha,scope=backend
           cache-to: type=gha,mode=max,scope=backend
+          # SPIKE: forward GHA cache v2 credentials into BuildKit so the
+          # in-Docker sccache can talk to the same cache service the host
+          # sccache-action uses. Paired with the Dockerfile's
+          # `--mount=type=secret,id=...` directives in the cook + build RUNs.
+          secret-files: |
+            actions_results_url=/tmp/actions_results_url
+            actions_runtime_token=/tmp/actions_runtime_token
 
   deploy:
     runs-on: ubuntu-latest
