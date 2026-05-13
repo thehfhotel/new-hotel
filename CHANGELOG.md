@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [vNext] - 2026-05-13 (Track G3)
+
+### Added
+
+- **Track G3 — VAT invoice fields (`audit-2026-05-13.md` T4 HIGH-7).**
+  Corporate guests can now receive a proper Thai VAT invoice
+  (ใบกำกับภาษี) without the receptionist falling back to iHOTEL. Wave
+  5c plumbed `ht_settings.vat_percent` into the payment recipe; G3
+  extends that plumbing to the `/api/new/checkins/:id/invoice` route
+  and the `InvoiceTemplate` rendering.
+  - **`hotel-backend/src/routes/new_invoice.rs::Invoice`**: struct
+    extended with `inv_no` (PG-only `INV{yyMM}-{cin_id:06}`),
+    `before_vat`, `vat_amount`, `vat_per`, and `guest.tax_id`
+    (`ht_customers.cust_work_tax`). VAT split via
+    `format::vat_inclusive_split` with banker's rounding
+    (`round_ties_even`) to match `.NET Math.Round`. `vat_per` read
+    from `repository::settings::get_vat_percent`; falls back to 7%.
+  - **`components/documents/InvoiceTemplate.tsx`**: header renders
+    buyer's tax-id (hidden when blank). Summary renders
+    `มูลค่าก่อนภาษี / Before VAT:` line when backend supplies
+    `beforeVat` AND `showVat` AND `vatAmount > 0`. VAT-line %
+    sourced from `vatPercent` (falls back to 7).
+  - **`types/invoice.ts`**: `InvoiceData` extended with `guestTaxId?`,
+    `beforeVat?`, `vatPercent?` (all optional).
+  - **`app/billing/[id]/page.tsx`**: passes
+    `showVat={Boolean(guestTaxId)}`; `invoiceNumber` prefers `invNo`
+    over `cinNo`.
+  - **Tests** — 5 backend unit + 5 frontend RTL.
+  - **Deferred:** writing `HT_INVOICE` on MSSQL via writeback;
+    different templates per legal entity. G3 is pure rendering.
+
 ## [vNext] - 2026-05-14 (Track G8)
 
 ### Added

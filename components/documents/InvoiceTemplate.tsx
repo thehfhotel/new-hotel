@@ -113,6 +113,16 @@ export default function InvoiceTemplate({
             <p className="text-sm text-gray-600">
               วันที่ / Date: <span className="font-semibold">{formatThaiDate(checkInData.createdAt || today.toISOString())}</span>
             </p>
+            {/* Track G3: corporate buyer tax-id appears in the header so
+                Thai-VAT compliance is satisfied without the printer
+                having to hunt for it. Hidden when the guest is an
+                individual walk-in (cust_work_tax = NULL). */}
+            {checkInData.guestTaxId && (
+              <p className="text-sm text-gray-600">
+                เลขประจำตัวผู้เสียภาษีของผู้ซื้อ / Buyer Tax ID:{' '}
+                <span className="font-semibold">{checkInData.guestTaxId}</span>
+              </p>
+            )}
           </div>
         </div>
       </div>
@@ -215,9 +225,25 @@ export default function InvoiceTemplate({
               </div>
             )}
 
+            {/* Track G3 / T4 HIGH-7: VAT-inclusive split. Render the
+                "before VAT" line only when the API supplied a value AND
+                showVat is requested AND there is actual VAT to print.
+                Older API responses (pre-G3) ship vatAmount=0 and no
+                beforeVat — those skip the line entirely (preserved
+                behaviour for non-VAT receipts). */}
+            {showVat && checkInData.vatAmount > 0 && typeof checkInData.beforeVat === 'number' && (
+              <div className="flex justify-between py-2 text-sm">
+                <span className="text-gray-600">มูลค่าก่อนภาษี / Before VAT:</span>
+                <span className="font-medium">{formatCurrency(checkInData.beforeVat)} บาท</span>
+              </div>
+            )}
+
             {showVat && checkInData.vatAmount > 0 && (
               <div className="flex justify-between py-2 text-sm">
-                <span className="text-gray-600">ภาษีมูลค่าเพิ่ม 7% / VAT 7%:</span>
+                <span className="text-gray-600">
+                  ภาษีมูลค่าเพิ่ม {checkInData.vatPercent ?? 7}% / VAT{' '}
+                  {checkInData.vatPercent ?? 7}%:
+                </span>
                 <span className="font-medium">{formatCurrency(checkInData.vatAmount)} บาท</span>
               </div>
             )}
