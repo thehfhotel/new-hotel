@@ -29,10 +29,13 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        # v6 pinned to commit SHA — matches docker-build.yml SHA used for
+        # the equivalent `actions/checkout@v5.0.0` pin. Supply-chain hygiene.
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6 (matches docker-build.yml)
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        # v4 pinned to commit SHA (resolved from `gh api git/refs/tags/v4`).
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version: '20'
           cache: 'npm'
@@ -76,7 +79,8 @@ jobs:
 
       - name: Upload macOS artifact
         if: matrix.platform == 'macos-latest'
-        uses: actions/upload-artifact@v4
+        # v4 pinned to commit SHA.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: macos-build
           path: |
@@ -85,7 +89,8 @@ jobs:
 
       - name: Upload Windows artifact
         if: matrix.platform == 'windows-latest'
-        uses: actions/upload-artifact@v4
+        # v4 pinned to commit SHA.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: windows-build
           path: |
@@ -100,13 +105,15 @@ jobs:
       contents: write
     steps:
       - name: Download macOS artifact
-        uses: actions/download-artifact@v4
+        # v4 pinned to commit SHA.
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: macos-build
           path: dist
 
       - name: Download Windows artifact
-        uses: actions/download-artifact@v4
+        # v4 pinned to commit SHA.
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: windows-build
           path: dist

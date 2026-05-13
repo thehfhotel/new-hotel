@@ -8,12 +8,24 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  # Disable cargo incremental compilation in CI: produces large target/
+  # artifacts that bloat caches and rarely pay back, since CI runs are
+  # essentially cold (or warm via Swatinem/rust-cache + sccache) rather
+  # than dev-loop incremental. Applied at workflow scope so every job
+  # picks it up automatically. Mirrored in the chef Dockerfile stage so
+  # the in-Docker `cargo build` follows the same policy.
+  CARGO_INCREMENTAL: "0"
+
+# Workflow-level concurrency: cancel an in-flight test/build run when a
+# fresh push lands on the same ref. The `deploy` job overrides this with
+# its own group (`deploy-prod-evergreen`, cancel-in-progress: false) so
+# in-flight deploys are NEVER cancelled — a partially-rolled deploy is
+# worse than a wasted runner minute.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  # Note: no cancel-previous job. The workflow only triggers on master pushes
-  # and workflow_dispatch (no PR builds), so cancelling earlier runs only
-  # serves to orphan in-flight deploys when commits land back-to-back. We let
-  # all runs complete; the deploy step is idempotent (docker compose up -d).
   changes:
     # All jobs run on github-hosted ubuntu-latest. Briefly used self-hosted
     # runner on evergreen (v2.54.31 → v2.55.x) to dodge GH Actions billing,
@@ -202,6 +214,11 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
           workspaces: hotel-backend
+          # `cache-on-failure: true` — preserve the partially-built target/
+          # when the test step fails. Without this, a flaky test (or a
+          # transient `cargo test` panic) wipes the cache and the next
+          # run pays the full cold-compile cost. Matches middleware-build.yml.
+          cache-on-failure: true
 
       - name: Run backend tests
         working-directory: hotel-backend
@@ -323,9 +340,13 @@ jobs:
 
   build-frontend:
     runs-on: ubuntu-latest
-    # Block pushing :latest if frontend tests fail (Batch D of audit).
-    needs: [changes, test-frontend]
-    if: needs.changes.outputs.frontend == 'true' && (needs.test-frontend.result == 'success' || needs.test-frontend.result == 'skipped')
+    # Build runs in PARALLEL with test-frontend (Track F CI optimization).
+    # The deploy job still gates on `test-frontend.result == success` so a
+    # red test never reaches prod — but the build doesn't have to WAIT
+    # for tests. Worst case: tests fail, an unused :latest image lands on
+    # GHCR and gets garbage-collected by the next green build.
+    needs: [changes]
+    if: needs.changes.outputs.frontend == 'true'
     permissions:
       contents: read
       packages: write
@@ -370,9 +391,13 @@ jobs:
 
   build-backend:
     runs-on: ubuntu-latest
-    # Block pushing :latest if backend tests fail (Batch D of audit).
-    needs: [changes, test-backend]
-    if: needs.changes.outputs.backend == 'true' && (needs.test-backend.result == 'success' || needs.test-backend.result == 'skipped')
+    # Build runs in PARALLEL with test-backend (Track F CI optimization).
+    # The deploy job still gates on `test-backend.result == success` so a
+    # red test never reaches prod — but the build doesn't have to WAIT
+    # for tests. Worst case: tests fail, an unused :latest image lands on
+    # GHCR and gets garbage-collected by the next green build.
+    needs: [changes]
+    if: needs.changes.outputs.backend == 'true'
     permissions:
       contents: read
       packages: write
@@ -442,16 +467,34 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v5.0.0
 
+      - name: Cache cloudflared binary
+        id: cf-cache
+        # actions/cache v4.2.0 pinned to commit SHA.
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57  # v4.2.0
+        with:
+          path: /usr/local/bin/cloudflared
+          # Pin to a SPECIFIC release version so the cache key is stable.
+          # NEVER key on `latest` — Cloudflare cuts a new release every few
+          # weeks and the binary at /latest/ changes silently. That would
+          # mean: cache hit, but cloudflared on disk is the old release,
+          # leading to silent drift between CI runs.
+          # Bump the version below to refresh the cached binary.
+          key: cloudflared-2026.3.0-linux-amd64
+
       - name: Install cloudflared
         # GH-hosted runner needs cloudflared to reach evergreen via the same
         # asgard tunnel your daily SSH uses. No CF Access app gates evergreen,
         # so no service token / OAuth required — cloudflared just routes the
-        # connection through the tunnel.
+        # connection through the tunnel. Pinned to a specific release so the
+        # cache step above remains valid; bump both together.
+        if: steps.cf-cache.outputs.cache-hit != 'true'
         run: |
-          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/download/2026.3.0/cloudflared-linux-amd64 \
             -o /tmp/cloudflared
           sudo install -m 755 /tmp/cloudflared /usr/local/bin/cloudflared
-          cloudflared --version
+
+      - name: Verify cloudflared
+        run: cloudflared --version
 
       - name: Install SSH key + known_hosts
         # ed25519 keypair generated locally; private half is GH Secret. Public
