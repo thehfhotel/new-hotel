@@ -39,10 +39,14 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        # Pinned to commit SHA — matches docker-build.yml. Floating @v5
+        # would silently pick up new releases between runs; SHA pinning is
+        # supply-chain hygiene against a hostile tag-move.
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v5.0.0
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        # v3 pinned to commit SHA (resolved from `gh api git/refs/tags/v3`).
+        uses: github/codeql-action/init@52485aec7be33610227643b0fe83936b8b5f061a  # v3
         with:
           languages: ${{ matrix.language }}
           # `security-and-quality` is the more thorough pack;
@@ -51,9 +55,12 @@ jobs:
           queries: security-and-quality
 
       - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
+        # v3 pinned to commit SHA (same SHA as init/analyze — all three
+        # actions live in the same repo and share a release).
+        uses: github/codeql-action/autobuild@52485aec7be33610227643b0fe83936b8b5f061a  # v3
 
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@v3
+        # v3 pinned to commit SHA.
+        uses: github/codeql-action/analyze@52485aec7be33610227643b0fe83936b8b5f061a  # v3
         with:
           category: '/language:${{ matrix.language }}'

@@ -57,6 +57,29 @@ RUN apt-get update \
 # Dockerfile edits — there is no Dependabot ecosystem for this binary.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     cargo install cargo-chef --locked --version 0.1.71
+# sccache (compiler cache): wraps rustc and caches build outputs keyed
+# on the exact crate inputs, so unchanged crates are linked from cache
+# instead of recompiled. Local-disk mode here (no GHA backend reachable
+# inside Docker BuildKit); the SCCACHE_DIR cache mount below persists
+# the cache across image rebuilds via BuildKit's gha cache scope.
+#
+# Install via pre-built binary tarball from mozilla/sccache releases —
+# `cargo install sccache` compiles from source and costs ~5min on a cold
+# layer cache (regression observed on PR #68's first measurement). The
+# curl+tar path completes in seconds. Mirrors the host-side install used
+# by mozilla-actions/sccache-action in the test-backend job.
+#
+# Pinned v0.8.2 (latest stable 2026-05-13). Bump version + verify
+# `sccache --version` if upstream cuts a new release.
+ARG SCCACHE_VERSION=v0.8.2
+ARG SCCACHE_ARCH=x86_64-unknown-linux-musl
+RUN --mount=type=cache,target=/tmp/sccache-dl,id=sccache-tarball \
+    set -eux; \
+    curl -fsSL -o /tmp/sccache-dl/sccache.tar.gz \
+      "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}.tar.gz"; \
+    tar -xzf /tmp/sccache-dl/sccache.tar.gz -C /tmp/sccache-dl --strip-components=1; \
+    install -m 755 /tmp/sccache-dl/sccache /usr/local/bin/sccache; \
+    sccache --version
 WORKDIR /usr/src/app
 
 ENV SQLX_OFFLINE=true
@@ -64,6 +87,16 @@ ENV SQLX_OFFLINE=true
 # crates.io-index, which sccache/rustup-1.86+ defaults to anyway, but be
 # explicit so future Rust upgrades don't change behavior under us).
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+# Wire sccache as the rustc wrapper. SCCACHE_DIR points to a BuildKit
+# cache mount path used by the cook + build RUNs below; SCCACHE_CACHE_SIZE
+# caps the on-disk cache so it can't grow without bound across CI runs.
+ENV RUSTC_WRAPPER=sccache
+ENV SCCACHE_DIR=/sccache
+ENV SCCACHE_CACHE_SIZE=2G
+# Match the workflow-level setting: skip cargo incremental in Docker too.
+# Incremental artifacts inflate the target/ cache mount without buying
+# anything in a CI build (every run starts from a known dep set).
+ENV CARGO_INCREMENTAL=0
 
 # ---- planner: derive recipe.json (deps fingerprint) -----------------------
 # This stage's only job is to produce recipe.json. It re-runs whenever any
@@ -84,7 +117,9 @@ COPY --from=planner /usr/src/app/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
     --mount=type=cache,target=/usr/src/app/target,id=hotel-backend-target \
-    cargo chef cook --release --recipe-path recipe.json
+    --mount=type=cache,target=/sccache,id=sccache-backend \
+    cargo chef cook --release --recipe-path recipe.json \
+    && sccache --show-stats
 
 # Step 2: COPY the full source. Now the deps are pre-compiled in target/
 # (via the cache mount), so this build step only compiles workspace code.
@@ -96,6 +131,7 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
     --mount=type=cache,target=/usr/src/app/target,id=hotel-backend-target \
+    --mount=type=cache,target=/sccache,id=sccache-backend \
     cargo build --release --locked \
         --bin hotel-backend \
         --bin writeback \
@@ -103,6 +139,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
         --bin backfill_rooms \
         --bin migrate_legacy \
         --bin create_user \
+    && sccache --show-stats \
     && mkdir -p /out \
     && cp target/release/hotel-backend /out/ \
     && cp target/release/writeback /out/ \
