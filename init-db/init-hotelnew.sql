@@ -542,6 +542,43 @@ CREATE INDEX IF NOT EXISTS ix_ht_payments_legacy_pay_no
     ON ht_payments (legacy_pay_no) WHERE legacy_pay_no IS NOT NULL;
 CREATE INDEX IF NOT EXISTS ix_ht_payments_legacy_receipt_no
     ON ht_payments (legacy_receipt_no) WHERE legacy_receipt_no IS NOT NULL;
+
+-- =============================================================================
+-- Room Calendar (canonical for HT_Room_Status — Track F1 / migration 039)
+-- =============================================================================
+--
+-- Per-(room, date) booking-calendar ledger. Mirrors legacy
+-- `HT_Room_Status`; the canonical sync mapper
+-- `sync/mappers/room_calendar.rs` keeps it in lock-step. See
+-- migration 039 for the column-by-column rationale.
+
+CREATE TABLE IF NOT EXISTS ht_room_calendar (
+    rcal_id              BIGSERIAL    PRIMARY KEY,
+    rcal_room_id         INTEGER      NOT NULL,
+    rcal_date            DATE         NOT NULL,
+    rcal_status          VARCHAR(50)  NOT NULL,
+    rcal_book_id         INTEGER,
+    rcal_cin_id          INTEGER,
+    rcal_customer_label  VARCHAR(500),
+    rcal_legacy_id       INTEGER,
+    rcal_created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    rcal_updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT fk_ht_room_calendar_room    FOREIGN KEY (rcal_room_id)
+        REFERENCES ht_rooms_new(room_id),
+    CONSTRAINT fk_ht_room_calendar_booking FOREIGN KEY (rcal_book_id)
+        REFERENCES ht_bookings(book_id),
+    CONSTRAINT fk_ht_room_calendar_checkin FOREIGN KEY (rcal_cin_id)
+        REFERENCES ht_checkins(cin_id),
+    CONSTRAINT uq_ht_room_calendar_room_date UNIQUE (rcal_room_id, rcal_date)
+);
+
+CREATE INDEX IF NOT EXISTS ix_ht_room_calendar_date_status
+    ON ht_room_calendar (rcal_date, rcal_status);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ht_room_calendar_legacy_id
+    ON ht_room_calendar (rcal_legacy_id) WHERE rcal_legacy_id IS NOT NULL;
+
 CREATE UNIQUE INDEX IF NOT EXISTS ux_ht_payments_aggregate_id
     ON ht_payments (aggregate_id) WHERE aggregate_id IS NOT NULL;
 
@@ -1374,11 +1411,18 @@ INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('038', '038_seed_vat_percent.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
+-- Migration 039 — Track F1 / T1 HIGH-4. New canonical `ht_room_calendar`
+-- table mirroring legacy `HT_Room_Status`. Table DDL is inlined above;
+-- this seed marks the migration as applied for fresh deploys.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('039', '039_create_ht_room_calendar.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
 -- Migration 042 — Track F4 / T1 CRIT-4. Canonical `ht_rate_tiers`
 -- (composite key on Room_Type × Cust_Type) mirrored to legacy
 -- `HT_Rooms_Price`. The DDL is inlined into the `ht_rate_tiers` CREATE
 -- TABLE block above; this seed marks the migration as applied for
--- fresh deploys. (039-041 intentionally absent — never landed.)
+-- fresh deploys. (040-041 intentionally absent — never landed.)
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('042', '042_create_ht_rate_tiers.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
