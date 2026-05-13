@@ -1,4 +1,8 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.10
+# Bumped 1.7 -> 1.10 (SPIKE chore/spike-sccache-gha-docker): the
+# `--mount=type=secret,env=NAME` syntax used by the cook + build RUNs
+# below is only available in Dockerfile frontend >= 1.10. With 1.7
+# BuildKit errors: `unexpected key 'env' in 'env=...'`.
 #
 # Build pipeline (cargo-chef edition, restored 2026-04-26):
 #
