@@ -13,6 +13,7 @@ import {
 } from 'lucide-react'
 import { useBranch, BRANCH_LABELS } from '@/contexts/BranchContext'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { useSkin } from '@/contexts/SkinContext'
 import CheckInModal from '@/components/CheckInModal'
 import CheckOutModal from '@/components/CheckOutModal'
 import ChangeRoomModal from '@/components/ChangeRoomModal'
@@ -120,6 +121,8 @@ function getRoomStatus(room: ApiRoom, isCheckoutToday: boolean): RoomStatus {
 export default function NewDashboard() {
   const { branch } = useBranch()
   const branchFetch = useBranchFetch()
+  const { skin } = useSkin()
+  const isModernSkin = skin === 'modern'
   const [stats, setStats] = useState<Stats>({
     totalRooms: 0, occupiedRooms: 0, availableRooms: 0, bookedRooms: 0,
     checkoutRooms: 0, totalCustomers: 0, activeBookings: 0, todayCheckIns: 0, todayCheckOuts: 0,
@@ -381,8 +384,12 @@ export default function NewDashboard() {
                 {section.layout.map((row, rowIndex) => (
                   <div key={`row-${sectionIdx}-${rowIndex}`} className="contents">
                     {row.map((roomNumber, colIndex) => {
+                      // Modern skin uses a taller cell (tile + label row below) so blank/filler
+                      // slots must match for grid row alignment. Missing-room placeholder stays
+                      // 60px since it has no label below.
+                      const cellHeightClass = isModernSkin ? 'h-[76px]' : 'h-[60px]'
                       if (roomNumber === null) {
-                        return <div key={`blank-${sectionIdx}-${rowIndex}-${colIndex}`} className="h-[60px]" />
+                        return <div key={`blank-${sectionIdx}-${rowIndex}-${colIndex}`} className={cellHeightClass} />
                       }
                       const room = roomMap.get(roomNumber.toUpperCase())
                       if (!room) {
@@ -394,6 +401,29 @@ export default function NewDashboard() {
                         )
                       }
                       const config = statusConfig[room.status]
+                      if (isModernSkin) {
+                        // Legacy-iHOTEL-inspired layout: white header (room #), colour-filled
+                        // body (status label), type/details as a small grey label below the tile.
+                        return (
+                          <div key={`${sectionIdx}-${roomNumber}`} className="flex flex-col">
+                            <button
+                              onClick={() => setSelectedRoom(room)}
+                              className="border border-border hover:border-borderStrong flex flex-col overflow-hidden transition-colors h-[60px]"
+                              title={`${room.roomNumber} - ${room.type} ${room.details}`}
+                            >
+                              <div className="bg-panel border-b border-border px-1.5 py-0.5 text-left">
+                                <span className="font-semibold text-[12px] leading-tight text-text">{room.roomNumber}</span>
+                              </div>
+                              <div className={`${config.dot} flex-1 flex items-center justify-center`}>
+                                <span className="text-[11px] font-medium text-white leading-tight">{config.label}</span>
+                              </div>
+                            </button>
+                            <span className="text-[9px] leading-tight text-textMuted mt-0.5 px-0.5 truncate">
+                              {room.type}{room.details ? ` ${room.details}` : ''}
+                            </span>
+                          </div>
+                        )
+                      }
                       return (
                         <button
                           key={`${sectionIdx}-${roomNumber}`}
@@ -411,7 +441,7 @@ export default function NewDashboard() {
                       )
                     })}
                     {Array.from({ length: Math.max(...section.layout.map(r => r.length)) - row.length }).map((_, i) => (
-                      <div key={`filler-${sectionIdx}-${rowIndex}-${i}`} className="h-[60px]" />
+                      <div key={`filler-${sectionIdx}-${rowIndex}-${i}`} className={isModernSkin ? 'h-[76px]' : 'h-[60px]'} />
                     ))}
                   </div>
                 ))}
