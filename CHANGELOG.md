@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v2.65.1] - 2026-05-14 (Hotfix CI)
+
+### Fixed
+
+- **CI hotfix — `tokio = features = ["test-util"]`.** R2 (PR #93, commit
+  `d9c1690`) introduced unit tests in `hotel-backend/src/db/mssql_timeout.rs`
+  using `tokio::runtime::Builder::start_paused(true)`, which requires the
+  `test-util` feature flag. Without it, `cargo test --lib` fails with
+  `error[E0599]: no method named 'start_paused' found`, and the post-R3
+  deploy pipeline failed on master. Single-character fix to
+  `hotel-backend/Cargo.toml` adding `"test-util"` to the tokio feature
+  list. Production runtime overhead: negligible.
+
 ## [vNext] - 2026-05-14 (Resilience PR R3)
 
 ### Changed
