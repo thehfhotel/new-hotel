@@ -187,6 +187,18 @@ fn current_site_id() -> &'static str {
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     dotenvy::dotenv().ok();
 
+    // Security audit 2026-05-14: hydrate sensitive env vars (DB_PASSWORD,
+    // POSTGRES_PASSWORD, SLACK_WEBHOOK_URL) from Docker secret files at
+    // `/run/secrets/<name>` when present. Also reconstructs DATABASE_URL
+    // from POSTGRES_USER + secret-file POSTGRES_PASSWORD + NEW_DB_* parts
+    // if it isn't pre-baked. See `hotel_backend::secrets` for details.
+    let hydrated = hotel_backend::secrets::hydrate_env_from_secret_files();
+    if hydrated > 0 {
+        eprintln!(
+            "[secrets] writeback: hydrated {hydrated} env var(s) from secret files at /run/secrets/"
+        );
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

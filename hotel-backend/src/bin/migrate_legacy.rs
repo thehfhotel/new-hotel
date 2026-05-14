@@ -28,6 +28,10 @@ fn main() {
 async fn async_main() {
     dotenvy::dotenv().ok();
 
+    // Security audit 2026-05-14: hydrate Docker secret files into env vars
+    // before any consumer reads them. See `hotel_backend::secrets`.
+    hotel_backend::secrets::hydrate_env_from_secret_files();
+
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(

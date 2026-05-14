@@ -39,6 +39,10 @@ fn main() -> ExitCode {
 async fn async_main() -> ExitCode {
     dotenvy::dotenv().ok();
 
+    // Security audit 2026-05-14: hydrate Docker secret files into env vars
+    // before any consumer reads them. See `hotel_backend::secrets`.
+    hotel_backend::secrets::hydrate_env_from_secret_files();
+
     let args: Vec<String> = std::env::args().collect();
     let parsed = match parse_args(&args) {
         Ok(p) => p,

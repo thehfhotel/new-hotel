@@ -578,20 +578,46 @@ jobs:
           DB_SERVER:               ${{ secrets.DB_SERVER }}
           DB_NAME:                 ${{ secrets.DB_NAME }}
           DB_USER:                 ${{ secrets.DB_USER }}
+          # DB_PASSWORD / POSTGRES_PASSWORD / SLACK_WEBHOOK_URL are now
+          # delivered via the `secrets:` block of the JSON payload (see
+          # security-audit 2026-05-14 follow-on). The deploy script
+          # (/srv/run-deploy.sh on evergreen) writes each `.secrets[<key>]`
+          # value to /home/deploy/secrets/<key> with mode 0400, owner
+          # deploy:docker, then `docker compose up -d` bind-mounts those
+          # files into the containers at /run/secrets/<key>. The Rust
+          # binaries' startup hydrator reads them — see
+          # hotel-backend/src/secrets.rs.
           DB_PASSWORD:             ${{ secrets.DB_PASSWORD }}
           MSSQL_PORT:              ${{ secrets.MSSQL_PORT }}
           POSTGRES_DB:             ${{ secrets.POSTGRES_DB }}
           POSTGRES_USER:           ${{ secrets.POSTGRES_USER }}
           POSTGRES_PASSWORD:       ${{ secrets.POSTGRES_PASSWORD }}
+          # VILLE_DB_PASSWORD is the same value as POSTGRES_PASSWORD until
+          # ADR 0001 Phase 8 splits them — passing it as a distinct entry
+          # so a future rotation only touches the GH secret + this line.
+          VILLE_DB_PASSWORD:       ${{ secrets.POSTGRES_PASSWORD }}
           SLACK_WEBHOOK_URL:       ${{ secrets.SLACK_WEBHOOK }}
           LEGACY_SYNC_ENABLED:     ${{ secrets.LEGACY_SYNC_ENABLED }}
           LEGACY_SYNC_SHADOW_MODE: ${{ secrets.LEGACY_SYNC_SHADOW_MODE }}
           AUTH_ENABLED:            ${{ vars.AUTH_ENABLED || 'false' }}
         # Build a JSON payload the way /srv/run-deploy.sh expects:
-        #   { commit_sha, deploy_payload_b64 (tar.gz), env: {...} }
+        #   { commit_sha, deploy_payload_b64 (tar.gz), env: {...},
+        #     secrets: {...} }
         # then pipe it over SSH to deploy@evergreen. The forced-command
         # in authorized_keys runs /srv/run-deploy.sh with this payload as stdin.
         # No commands beyond that are possible — the SSH key only triggers the script.
+        #
+        # NEW (2026-05-14): `secrets` block carries the values that used
+        # to ship inside `env`. Pre-merge prerequisite — /srv/run-deploy.sh
+        # MUST be updated to write each `secrets[<key>]` value to
+        # /home/deploy/secrets/<key> before `docker compose up`. The
+        # `env` block deliberately keeps `DB_PASSWORD` / `POSTGRES_PASSWORD`
+        # / `SLACK_WEBHOOK_URL` for now so a deploy script not yet updated
+        # falls back to .env writing (and the worker's env-var fallback
+        # still loads them) — pure additive change. Remove the env-side
+        # entries in a follow-up PR ONCE the deploy script is updated
+        # AND one production deploy has confirmed the secret-file path
+        # works end to end.
         run: |
           set -euo pipefail
           tar -czf /tmp/deploy.tar.gz docker-compose.yml init-db migrations/pg scripts/migrate.sh
@@ -609,6 +635,7 @@ jobs:
             --arg POSTGRES_DB         "$POSTGRES_DB" \
             --arg POSTGRES_USER       "$POSTGRES_USER" \
             --arg POSTGRES_PASSWORD   "$POSTGRES_PASSWORD" \
+            --arg VILLE_DB_PASSWORD   "$VILLE_DB_PASSWORD" \
             --arg SLACK_WEBHOOK_URL   "$SLACK_WEBHOOK_URL" \
             --arg LEGACY_SYNC_ENABLED "$LEGACY_SYNC_ENABLED" \
             --arg LEGACY_SYNC_SHADOW_MODE "$LEGACY_SYNC_SHADOW_MODE" \
@@ -630,6 +657,12 @@ jobs:
                 LEGACY_SYNC_ENABLED:     $LEGACY_SYNC_ENABLED,
                 LEGACY_SYNC_SHADOW_MODE: $LEGACY_SYNC_SHADOW_MODE,
                 AUTH_ENABLED:            $AUTH_ENABLED,
+              },
+              secrets: {
+                db_password:        $DB_PASSWORD,
+                postgres_password:  $POSTGRES_PASSWORD,
+                ville_db_password:  $VILLE_DB_PASSWORD,
+                slack_webhook_url:  $SLACK_WEBHOOK_URL,
               }
             }' \
           | ssh -i ~/.ssh/deploy_key \

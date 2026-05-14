@@ -22,6 +22,10 @@ use std::env;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Security audit 2026-05-14: hydrate Docker secret files into env vars
+    // before any consumer reads them. See `hotel_backend::secrets`.
+    hotel_backend::secrets::hydrate_env_from_secret_files();
+
     let tables: Vec<String> = env::args().skip(1).collect();
     if tables.is_empty() {
         eprintln!(

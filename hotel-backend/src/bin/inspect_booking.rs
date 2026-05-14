@@ -10,6 +10,10 @@ use std::env;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Security audit 2026-05-14: hydrate Docker secret files into env vars
+    // before any consumer reads them. See `hotel_backend::secrets`.
+    hotel_backend::secrets::hydrate_env_from_secret_files();
+
     let book_no = env::args().nth(1).expect("Usage: inspect_booking <Book_No>");
     println!("Inspecting Book_No={book_no}");
 
