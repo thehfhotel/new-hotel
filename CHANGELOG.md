@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [vNext] - 2026-05-14 (Resilience R1)
+
+### Changed
+
+- **Resilience R1 — structured error taxonomy in `bin/sync.rs` (CT
+  watcher).** Today's 74-min HF-Hotel CT watermark stall (2026-05-14)
+  was rendered forensically opaque because the failure mode never
+  reached PG and `docker logs` rotated away on the post-incident
+  restart. R1 introduces a stable, dot-delimited `event_name`
+  (`sync.watermark_advance_fail`, `sync.load_aggregate_fail`,
+  `sync.ct_fetch_fail`, …) attached to every `tracing::error!` /
+  `tracing::warn!` in the tick path AND prepended onto the
+  `legacy_sync_status.last_error` payload, so the next incident is
+  greppable across log streams and survives a container recreate.
+  - **`hotel-backend/src/bin/sync.rs`**: 17 `EV_*` constants +
+    `KNOWN_SYNC_EVENT_NAMES` registry. Every error site in
+    `run_one_tick` / `poll_table` now emits structured
+    `event_name = EV_…`. `record_table_error` extended with an
+    `event_name` parameter; payload runs through `format_last_error`
+    (prepends event + JSON-escapes interior `"` / control chars /
+    truncates to 1 KiB chars at a char boundary — defensive against
+    multi-MB tiberius errors and prompt-injection vectors).
+  - **Watermark-advance persistence**: the previously-silent failure
+    mode (`UPDATE legacy_ct_state` returning an error after a
+    successful per-table commit) now writes
+    `EV_WATERMARK_ADVANCE_FAIL` to the table's `last_error` in its
+    own auto-TX. This is the exact symptom from the 2026-05-14
+    stall.
+  - **`record_table_error` runs in its own auto-TX** (unchanged from
+    the prior behavior; documented explicitly now). The failed-tick
+    TX is rolled back independently, so wrapping the failure-mode
+    write in that TX would lose the record.
+  - **Schema**: no migration — `legacy_sync_status.last_error`,
+    `last_error_at`, `consecutive_failures` already exist
+    (migration 017).
+  - **Tests**: 9 new unit tests in `bin/sync.rs::tests`. Cover the
+    taxonomy registry shape (`sync.` prefix, snake.case ASCII,
+    unique entries), `sanitize_last_error` edge cases (`"` /
+    newline / control char escape, multibyte-safe truncation), and
+    two source-introspection guards that assert every
+    `tracing::error!` and `record_table_error` call in the tick
+    path attaches an `EV_*` constant — so a future refactor cannot
+    silently regress to free-form strings.
+  - **Out of scope** (separate Resilience PRs): R2 bb8 / tiberius
+    timeout tuning; R3 watermark-advance logic itself. R1 only
+    instruments; it never changes WHAT the watcher does, only WHAT
+    it tells you about failures.
+
 ## [vNext] - 2026-05-14 (HOTFIX)
 
 ### Fixed
