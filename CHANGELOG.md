@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [vNext] - 2026-05-14 (Track G9)
+
+### Fixed
+
+- **Track G9 — Round-bill shift discipline (`audit-2026-05-13.md` T4
+  HIGH-8 / T5 race-safety).** Track F2 (migration 040) added a cashier
+  shift gate to `PaymentService::record_payment` but the same gate was
+  missing on the round-bill (final check-out / "fold the folio") path.
+  As a result the receptionist app would accept a check-out with no
+  shift open — breaking end-of-shift reconciliation (no way to tell
+  which cashier folded which folio) and letting a fold land in a
+  closed shift (corrupting the daily cashier report). G9 extends F2's
+  gate to `CheckInService::check_out`:
+  - **`service::checkin::check_out`**: refuses the fold with
+    `ServiceError::Validation` unless `ShiftService::current_open_shift()`
+    returns `Some`. Error carries both the English "no open shift"
+    token (matches F2's payment-gate wording for uniform log
+    scraping) and a Thai-localized receptionist instruction
+    (`ไม่พบรอบเงินที่เปิดอยู่ — กรุณาเปิดรอบเงินก่อนปิดบิล`).
+  - **`ht_checkins.cin_round_bill_shift_id`** (migration 048): new
+    nullable `BIGINT REFERENCES ht_shifts(shift_id) ON DELETE SET NULL`
+    column stamped by `check_out` with the resolved shift's id.
+  - **`CheckInService::with_shifts(...)`**: same builder pattern as
+    F2's `PaymentService::with_shifts`.
+  - **Legacy schema untouched**: shift attribution lives entirely in
+    canonical PG.
+  - **Concurrency**: two parallel round-bills against the same folio
+    still result in exactly one winner via the `cin_status` precheck.
+  - **Tests added** (4 new in `src/service/checkin.rs#tests`):
+    `round_bill_rejected_when_no_open_shift`,
+    `round_bill_succeeds_when_shift_open_and_stamps_shift_id`,
+    `round_bill_rejected_when_shift_already_closed`,
+    `concurrent_round_bills_against_same_checkin_one_wins`.
+
+### Schema
+
+- **Migration 048** — `migrations/pg/048_round_bill_shift_id.sql`. Adds
+  `ht_checkins.cin_round_bill_shift_id BIGINT` + FK to
+  `ht_shifts(shift_id)` ON DELETE SET NULL + partial index.
+
 ## [vNext] - 2026-05-14 (Track B4)
 
 ### Fixed

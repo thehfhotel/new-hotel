@@ -101,6 +101,15 @@ pub struct CheckOutWrite<'a> {
     pub total_amount: Option<f64>,
     pub payment_status: &'a str,
     pub notes: Option<&'a str>,
+    /// Track G9 / T4 HIGH-8 — `ht_shifts.shift_id` of the cashier
+    /// shift that folded this round-bill. Stamped onto
+    /// `ht_checkins.cin_round_bill_shift_id` (migration 048) so the
+    /// daily cashier report can attribute revenue per shift. `None`
+    /// preserves backward compatibility for any legacy call site that
+    /// hasn't been migrated to the shift gate yet (none exist today —
+    /// `service::checkin::check_out` always populates it from the
+    /// `ShiftService::current_open_shift()` lookup).
+    pub round_bill_shift_id: Option<i64>,
 }
 
 /// One row in `ht_guest_registry`.
@@ -670,14 +679,23 @@ impl CheckInRepository for PgCheckInRepository {
         cin_id: i32,
         write: CheckOutWrite<'_>,
     ) -> Result<(), sqlx::Error> {
+        // Track G9 / T4 HIGH-8 — `cin_round_bill_shift_id = COALESCE($5, …)`
+        // so a NULL inbound shift_id leaves the existing value alone (it
+        // stays NULL on a brand-new fold; any prior stamp is preserved on
+        // a defensive re-fold). The shift gate in
+        // `service::checkin::check_out` guarantees a `Some(_)` value is
+        // threaded through on every production code path.
         sqlx::query!(
             r#"UPDATE ht_checkins SET cin_checkout_time = COALESCE($1, NOW()::timestamp), cin_status = 'checkedout',
         cin_total_amount = COALESCE($2::float8, cin_total_amount), cin_payment_status = $3,
-        cin_notes = COALESCE($4, cin_notes), updated_at = NOW() WHERE cin_id = $5"#,
+        cin_notes = COALESCE($4, cin_notes),
+        cin_round_bill_shift_id = COALESCE($5, cin_round_bill_shift_id),
+        updated_at = NOW() WHERE cin_id = $6"#,
             write.check_out_time,
             write.total_amount,
             write.payment_status,
             write.notes,
+            write.round_bill_shift_id,
             cin_id
         )
         .execute(&mut **tx)
