@@ -340,6 +340,34 @@ CREATE INDEX IF NOT EXISTS ht_checkin_rooms_room_status
 CREATE INDEX IF NOT EXISTS ht_checkin_rooms_legacy_ds_id
     ON ht_checkin_rooms (cr_legacy_ds_id) WHERE cr_legacy_ds_id IS NOT NULL;
 
+-- ht_room_changes - Mid-stay room-move audit (Track G4 / migration 045).
+-- Mirrors legacy HT_Changed_Room cardinality (1:1 — one row per move).
+-- Receptionists call POST /api/new/checkins/:id/change-room which
+-- delegates to service::checkin::change_room, inserts here under one
+-- PG transaction (with the junction update), and emits
+-- WritebackIntent::RoomChange so writeback/recipes/room_change.rs
+-- inserts the corresponding HT_Changed_Room row in legacy MSSQL.
+-- Reverse-sync via sync/mappers/mirror.rs::RoomChangeCanonicalMirrorMapper
+-- catches moves done from iHOTEL too.
+CREATE TABLE IF NOT EXISTS ht_room_changes (
+    rc_id                BIGSERIAL    PRIMARY KEY,
+    rc_cin_id            INTEGER      NOT NULL REFERENCES ht_checkins(cin_id) ON DELETE CASCADE,
+    rc_from_room_id      INTEGER      NOT NULL REFERENCES ht_rooms_new(room_id),
+    rc_to_room_id        INTEGER      NOT NULL REFERENCES ht_rooms_new(room_id),
+    rc_reason            VARCHAR(500),
+    rc_changed_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    rc_changed_by        VARCHAR(64),
+    rc_room_before_price NUMERIC(12, 2) NOT NULL DEFAULT 0,
+    rc_to_price          VARCHAR(20),
+    rc_legacy_id         INTEGER,
+    rc_created_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    rc_updated_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS ht_room_changes_cin_id_idx
+    ON ht_room_changes (rc_cin_id);
+CREATE UNIQUE INDEX IF NOT EXISTS ht_room_changes_legacy_id_uq
+    ON ht_room_changes (rc_legacy_id) WHERE rc_legacy_id IS NOT NULL;
+
 -- ht_rates - Room rate configurations
 CREATE TABLE IF NOT EXISTS ht_rates (
     rate_id SERIAL PRIMARY KEY,
@@ -1573,6 +1601,19 @@ ON CONFLICT (version) DO NOTHING;
 -- above; this seed marks the migration as applied for fresh deploys.
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('044', '044_ht_payments_refund_columns.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 045 — Track G4 / T4 HIGH-3. Canonical `ht_room_changes`
+-- audit table mirroring legacy `HT_Changed_Room` (mid-stay room-move
+-- audit, 1:1 cardinality). Service path: POST
+-- /api/new/checkins/:id/change-room → service::checkin::change_room
+-- (insert + junction UPDATE inside one PG tx) → outbox emits
+-- WritebackIntent::RoomChange → writeback/recipes/room_change.rs
+-- INSERTs HT_Changed_Room in legacy MSSQL. Reverse-sync handled by
+-- sync/mappers/mirror.rs::RoomChangeCanonicalMirrorMapper so moves
+-- done from iHOTEL also land canonically.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('045', '045_create_ht_room_changes.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- Migration 048 — Track G9 / T4 HIGH-8. Add the FK on

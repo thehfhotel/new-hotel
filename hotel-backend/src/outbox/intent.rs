@@ -247,6 +247,35 @@ pub enum WritebackIntent {
         payment_aggregate_id: Option<Uuid>,
     },
 
+    /// Track G4 / T4 HIGH-3 (`audit-2026-05-13.md`,
+    /// `docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_Changed_Room`, 3.17).
+    ///
+    /// Mid-stay room move. The service inserts the canonical
+    /// `ht_room_changes` row and updates the junction inside ONE PG
+    /// transaction before enqueuing this intent. The recipe then
+    /// loads the row by `rc_id`, INSERTs the corresponding
+    /// `HT_Changed_Room` row in MSSQL, and back-populates the legacy
+    /// id onto the canonical row. Carries `rc_id` directly because
+    /// `HT_Changed_Room` is keyed on a server-allocated IDENTITY —
+    /// the canonical row IS the authoritative source for every
+    /// column the legacy INSERT needs (no further PG joins required
+    /// once the recipe loads it).
+    RoomChange {
+        /// Aggregate id of the parent check-in this room change is
+        /// recorded against. Required so the writeback worker
+        /// resolves the legacy `Cin_no` identically to
+        /// [`Self::ExtendStay`]. Persisted into
+        /// `writeback_jobs.aggregate_id` for index grouping.
+        check_in_id: Uuid,
+        /// `ht_room_changes.rc_id` of the canonical audit row the
+        /// service just inserted. The recipe loads its remaining
+        /// columns (`rc_from_room_id` / `rc_to_room_id` numbers,
+        /// `rc_reason`, `rc_changed_at`, `rc_changed_by`,
+        /// `rc_room_before_price`) from PG before issuing the
+        /// legacy INSERT.
+        rc_id: i64,
+    },
+
     /// Track F3 — `audit-2026-05-13.md` T1 CRIT-3
     /// (`docs/legacy-app/COMPAT_CHEATSHEET.md:560-564`).
     ///
@@ -426,6 +455,7 @@ impl WritebackIntent {
             WritebackIntent::CheckOut { .. } => "check_out",
             WritebackIntent::RecordPayment { .. } => "record_payment",
             WritebackIntent::RefundPayment { .. } => "refund_payment",
+            WritebackIntent::RoomChange { .. } => "room_change",
             WritebackIntent::MarkRoomClean { .. } => "mark_room_clean",
             WritebackIntent::AdjustProductStock { .. } => "adjust_product_stock",
         }
@@ -445,7 +475,8 @@ impl WritebackIntent {
             | WritebackIntent::ExtendStay { check_in_id, .. }
             | WritebackIntent::CheckOut { check_in_id, .. }
             | WritebackIntent::RecordPayment { check_in_id, .. }
-            | WritebackIntent::RefundPayment { check_in_id, .. } => *check_in_id,
+            | WritebackIntent::RefundPayment { check_in_id, .. }
+            | WritebackIntent::RoomChange { check_in_id, .. } => *check_in_id,
             WritebackIntent::MarkRoomClean { room_id, .. } => *room_id,
             // Track F3 — fall back to a deterministic v5 UUID derived
             // from the legacy `Pro_no` so the

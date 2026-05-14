@@ -136,6 +136,46 @@ pub struct ResolvedJob {
     /// landed yet; the recipe then falls back to a generic `REFUND`
     /// prefix in `Cin_Pay_Note`.
     pub legacy_original_pay_no: Option<String>,
+    /// Track G4 / T4 HIGH-3 — fully-loaded canonical `ht_room_changes`
+    /// row for the `RoomChange` intent. The dispatcher loads this from
+    /// PG before handing off to the recipe so the recipe stays pure /
+    /// MSSQL-only (the recipe pattern Track C established). `None` for
+    /// every other intent.
+    pub room_change: Option<ResolvedRoomChange>,
+}
+
+/// Fully-hydrated `ht_room_changes` row required by the
+/// `WritebackIntent::RoomChange` recipe. Sourced from PG by the
+/// writeback worker; the recipe consumes it as plain string + number
+/// fields and never touches sqlx.
+#[derive(Debug, Default, Clone)]
+pub struct ResolvedRoomChange {
+    /// `ht_room_changes.rc_id` — primary key. Used to back-populate
+    /// `rc_legacy_id` after the legacy INSERT returns its IDENTITY.
+    pub rc_id: i64,
+    /// `Cin_no` (legacy folio key, `CHyy-NNNNNN`). Resolved from
+    /// `ht_checkins.legacy_cin_no` via `rc_cin_id`.
+    pub legacy_cin_no: String,
+    /// `HT_Rooms.room_no` of the room the guest moved FROM. Resolved
+    /// from `ht_rooms_new.legacy_room_no` (a.k.a. `room_no`) via
+    /// `rc_from_room_id`.
+    pub from_room_no: String,
+    /// `HT_Rooms.room_no` of the room the guest moved TO.
+    pub to_room_no: String,
+    /// `HT_Changed_Room.Note` — free-form reason. Empty string when
+    /// the receptionist skipped the field.
+    pub reason: String,
+    /// `HT_Changed_Room.change_date` — wall-clock of the move.
+    pub changed_at: chrono::DateTime<chrono::Utc>,
+    /// Operator name. Empty string when unknown.
+    pub changed_by: String,
+    /// `HT_Changed_Room.room_before_price` — baht (legacy column is
+    /// `float NOT NULL DEFAULT 0`). Canonical PG column is
+    /// `NUMERIC(12, 2)`; the resolver casts to `f64` for the recipe.
+    pub room_before_price_baht: f64,
+    /// `HT_Changed_Room.ToPrice` — legacy stores this as `varchar(20)`.
+    /// Empty string when not set.
+    pub to_price: String,
 }
 
 /// Treat empty-string legacy IDs as missing (audit MED-1). PG can return
@@ -443,6 +483,35 @@ pub async fn dispatch(
             )
             .await
         }
+        // Track G4 / T4 HIGH-3 — mid-stay room change. The dispatcher
+        // hydrated `resolved.room_change` from PG before this point;
+        // the recipe consumes it as plain fields and never re-queries
+        // sqlx. Missing hydration means the worker resolver couldn't
+        // find the canonical `ht_room_changes` row — surface as a
+        // recipe error so the job lands in the retry queue rather
+        // than silently emitting an empty INSERT.
+        WritebackIntent::RoomChange { check_in_id: _, rc_id } => {
+            let resolved_rc = resolved
+                .room_change
+                .as_ref()
+                .ok_or_else(|| {
+                    WritebackError::Recipe(format!(
+                        "RoomChange requires resolved.room_change (rc_id={rc_id})"
+                    ))
+                })?;
+            if resolved_rc.legacy_cin_no.is_empty() {
+                return Err(WritebackError::Recipe(
+                    "RoomChange requires legacy_cin_no on resolved.room_change".into(),
+                ));
+            }
+            if resolved_rc.from_room_no.is_empty() || resolved_rc.to_room_no.is_empty() {
+                return Err(WritebackError::Recipe(
+                    "RoomChange requires both from_room_no and to_room_no on resolved.room_change"
+                        .into(),
+                ));
+            }
+            recipes::room_change::execute(conn, resolved_rc).await
+        }
         WritebackIntent::MarkRoomClean { room_id: _, by } => {
             let room_no = nonempty(resolved.legacy_room_no.as_ref()).ok_or_else(|| {
                 WritebackError::Recipe("MarkRoomClean requires resolved legacy_room_no".into())
@@ -548,6 +617,8 @@ mod tests {
         assert!(r.legacy_room_id_int.is_none());
         assert!(r.legacy_checkin_ds_id.is_none());
         assert!(r.legacy_original_pay_no.is_none());
+        // Track G4 — room_change is hydrated only for the RoomChange intent.
+        assert!(r.room_change.is_none());
     }
 
     /// Verifies all `WritebackIntent` variants have a matching `intent_name`
@@ -568,6 +639,7 @@ mod tests {
             "check_out",
             "record_payment",
             "refund_payment",
+            "room_change",
             "mark_room_clean",
             "adjust_product_stock",
         ];
@@ -575,7 +647,7 @@ mod tests {
         // intent name → no actual MSSQL call, just type-level coverage.
         // Counting expected variants here keeps the test cheap and
         // deterministic.
-        assert_eq!(names.len(), 11, "expected 11 WritebackIntent variants");
+        assert_eq!(names.len(), 12, "expected 12 WritebackIntent variants");
     }
 
     /// Phase 5.1 chokepoint guarantee — every recipe MUST run after

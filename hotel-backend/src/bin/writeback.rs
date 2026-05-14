@@ -902,6 +902,48 @@ async fn resolve_legacy_ids(
                 }
             }
         }
+        // Track G4 / T4 HIGH-3 — `RoomChange`. Load the full canonical
+        // `ht_room_changes` row keyed by `rc_id`, then resolve the
+        // legacy `cin_no` + both `room_no`s via FK joins. The recipe
+        // consumes the hydrated struct only.
+        RoomChange { rc_id, .. } => {
+            use hotel_backend::writeback::dispatcher::ResolvedRoomChange;
+            if let Some(row) = sqlx::query(
+                "SELECT \
+                    rc.rc_id, \
+                    COALESCE(c.legacy_cin_no, '') AS legacy_cin_no, \
+                    COALESCE(rf.room_no, '')      AS from_room_no, \
+                    COALESCE(rt.room_no, '')      AS to_room_no, \
+                    COALESCE(rc.rc_reason, '')    AS reason, \
+                    rc.rc_changed_at, \
+                    COALESCE(rc.rc_changed_by, '')AS changed_by, \
+                    rc.rc_room_before_price::float8 AS room_before_price_baht, \
+                    COALESCE(rc.rc_to_price, '')  AS to_price \
+                 FROM ht_room_changes rc \
+                 JOIN ht_checkins  c  ON c.cin_id  = rc.rc_cin_id \
+                 JOIN ht_rooms_new rf ON rf.room_id = rc.rc_from_room_id \
+                 JOIN ht_rooms_new rt ON rt.room_id = rc.rc_to_room_id \
+                 WHERE rc.rc_id = $1",
+            )
+            .bind(*rc_id)
+            .fetch_optional(pg)
+            .await?
+            {
+                resolved.room_change = Some(ResolvedRoomChange {
+                    rc_id: row.try_get("rc_id").unwrap_or(*rc_id),
+                    legacy_cin_no: row.try_get("legacy_cin_no").unwrap_or_default(),
+                    from_room_no: row.try_get("from_room_no").unwrap_or_default(),
+                    to_room_no: row.try_get("to_room_no").unwrap_or_default(),
+                    reason: row.try_get("reason").unwrap_or_default(),
+                    changed_at: row.try_get("rc_changed_at").unwrap_or_else(|_| Utc::now()),
+                    changed_by: row.try_get("changed_by").unwrap_or_default(),
+                    room_before_price_baht: row
+                        .try_get("room_before_price_baht")
+                        .unwrap_or(0.0),
+                    to_price: row.try_get("to_price").unwrap_or_default(),
+                });
+            }
+        }
         MarkRoomClean { room_id, .. } => {
             if let Some(row) = sqlx::query(
                 "SELECT legacy_room_no, legacy_room_id_int \
@@ -1586,6 +1628,49 @@ async fn back_populate_legacy_ids(
         }
         MarkRoomClean { .. } => {
             // mark_clean doesn't allocate any new legacy IDs.
+        }
+        // Track G4 / T4 HIGH-3 — RoomChange back-populates the freshly
+        // allocated HT_Changed_Room.id onto ht_room_changes.rc_legacy_id
+        // so the next read-side join can cross-reference the legacy
+        // audit row. The recipe stuffs the id into legacy_ids.extra
+        // (keys `rc_id` + `ht_changed_room_id`); we pull both out here
+        // and run the targeted UPDATE on the canonical row.
+        RoomChange { .. } => {
+            let rc_id = legacy_ids
+                .get("extra")
+                .and_then(|v| v.get("rc_id"))
+                .and_then(|v| v.as_i64());
+            let legacy_id = legacy_ids
+                .get("extra")
+                .and_then(|v| v.get("ht_changed_room_id"))
+                .and_then(|v| v.as_i64())
+                .map(|n| n as i32);
+            if let (Some(rc_id), Some(legacy_id)) = (rc_id, legacy_id) {
+                sqlx::query(
+                    "UPDATE ht_room_changes \
+                        SET rc_legacy_id = $2, rc_updated_at = NOW() \
+                      WHERE rc_id = $1 AND rc_legacy_id IS NULL",
+                )
+                .bind(rc_id)
+                .bind(legacy_id)
+                .execute(pg)
+                .await?;
+            }
+            // ht_checkins legacy_cin_no may also surface here when this is
+            // the first writeback after a fresh walkin; mirror the existing
+            // check-in branch so the cached cin_no doesn't decay.
+            if cin_no.is_some() {
+                sqlx::query(
+                    "UPDATE ht_checkins SET \
+                       legacy_cin_no = COALESCE($2, legacy_cin_no), \
+                       updated_at = NOW() \
+                     WHERE aggregate_id = $1",
+                )
+                .bind(aggregate_id)
+                .bind(cin_no)
+                .execute(pg)
+                .await?;
+            }
         }
         // Track F3 — AdjustProductStock targets an existing
         // `HT_Products` row by `Pro_no` (already in the payload). The

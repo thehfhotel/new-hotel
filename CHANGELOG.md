@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v2.64.0] - 2026-05-14 (Track G4)
+
+### Added
+
+- **Track G4 — Room-change write path (`audit-2026-05-13.md` T4 HIGH-7).**
+  Adds the missing room-swap capability to the canonical app: a
+  receptionist can move a guest mid-stay to another room, and the
+  swap propagates back to legacy `HT_Changed_Room` so iHOTEL stays
+  visually consistent.
+  - **Migration 045** — new `ht_room_changes` audit table; mirrored
+    into `init-db/init-hotelnew.sql`.
+  - **`CheckInService::change_room`** — transactional swap: validates
+    target room free, closes old `ht_checkin_rooms` row + opens new,
+    inserts audit row, emits `room_change` outbox intent. Locks both
+    rooms `FOR UPDATE`.
+  - **Writeback recipe `room_change`** — inserts legacy
+    `HT_Changed_Room` row + flips `HT_Rooms.Room_Status` on both
+    sides under `TABLOCKX+HOLDLOCK`.
+  - **Sync mapper** — picks up legacy-initiated swaps and replays
+    inverse to canonical (sub-second SLA).
+  - **HTTP** — `POST /api/new/checkins/{id}/change-room`. Gate-ready
+    for G7 (`checkin.room_change`).
+  - **Frontend** — `components/ChangeRoomModal.tsx` + page wire-up
+    + jest test.
+
+### Schema
+
+- **Migration 045** — `migrations/pg/045_create_ht_room_changes.sql`.
+
 ## [vNext] - 2026-05-14 (Track G7)
 
 ### Added

@@ -19,11 +19,13 @@ import {
   History,
   LogIn,
   LogOut,
+  ArrowRightLeft,
   CalendarPlus,
 } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import CheckInModal from '@/components/CheckInModal'
 import CheckOutModal from '@/components/CheckOutModal'
+import ChangeRoomModal from '@/components/ChangeRoomModal'
 import ExtendStayModal from '@/components/ExtendStayModal'
 
 // API response types (from /api/new/rooms)
@@ -80,6 +82,8 @@ export default function RoomsPage() {
   const [showCheckOut, setShowCheckOut] = useState(false)
   // Track G1 / T4 HIGH-2: extend-stay modal (one-more-night flow).
   const [showExtendStay, setShowExtendStay] = useState(false)
+  // Track G4 / T4 HIGH-3: change-room modal (mid-stay move).
+  const [showChangeRoom, setShowChangeRoom] = useState(false)
 
   const fetchRooms = useCallback(async () => {
     setLoading(true)
@@ -498,6 +502,14 @@ export default function RoomsPage() {
                         <CalendarPlus size={14} />
                         ขยายเวลาเข้าพัก
                       </button>
+                      {/* Track G4 / T4 HIGH-3: change-room (mid-stay move). */}
+                      <button
+                        onClick={() => setShowChangeRoom(true)}
+                        className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-amber-600 text-white text-sm font-medium rounded hover:bg-amber-700"
+                      >
+                        <ArrowRightLeft size={14} />
+                        เปลี่ยนห้อง
+                      </button>
                       <button
                         onClick={() => setShowCheckOut(true)}
                         className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-sky-600 text-white text-sm font-medium rounded hover:bg-sky-700"
@@ -551,6 +563,16 @@ export default function RoomsPage() {
         <ExtendStayModal
           room={{ id: selectedRoom.id, roomNo: selectedRoom.roomNo }}
           onClose={() => setShowExtendStay(false)}
+          onSuccess={() => {
+            fetchRooms()
+            if (selectedRoom) fetchRoomDetail(selectedRoom)
+          }}
+        />
+      )}
+      {showChangeRoom && selectedRoom && (
+        <ChangeRoomModal
+          room={{ id: selectedRoom.id, roomNo: selectedRoom.roomNo }}
+          onClose={() => setShowChangeRoom(false)}
           onSuccess={() => {
             fetchRooms()
             if (selectedRoom) fetchRoomDetail(selectedRoom)

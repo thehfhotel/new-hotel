@@ -32,8 +32,8 @@ use crate::repository::checkin::{
     CheckInDetailRow, CheckInListRow, GuestInsert, GuestRow,
 };
 use crate::service::{
-    CheckInToBookingCommand, CheckInWritebackContext, CheckOutCommand, ExtendStayCommand,
-    ServiceError, WalkInCommand,
+    ChangeRoomCommand, ChangeRoomOutcome, CheckInToBookingCommand, CheckInWritebackContext,
+    CheckOutCommand, ExtendStayCommand, ServiceError, WalkInCommand,
 };
 
 /// Check-in status enum
@@ -739,6 +739,108 @@ fn map_extend_error(err: ServiceError) -> ApiError {
 }
 
 // =============================================================================
+// Change-room endpoint — Track G4 / T4 HIGH-3
+// =============================================================================
+
+/// Request body for `POST /api/new/checkins/:id/change-room`.
+///
+/// Track G4 / T4 HIGH-3. The receptionist supplies the room they're
+/// moving from (must currently sit in the folio's junction) and the
+/// room they're moving to (must be free of any other active check-in).
+/// `reason` is an optional free-text note that lands in the audit row
+/// (`ht_room_changes.rc_reason` + legacy `HT_Changed_Room.Note`).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeRoomRequest {
+    pub from_room_id: i32,
+    pub to_room_id: i32,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Response for `POST /api/new/checkins/:id/change-room`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeRoomResponse {
+    pub success: bool,
+    pub message: String,
+    pub check_in_id: i32,
+    pub rc_id: i64,
+    pub from_room_id: i32,
+    pub to_room_id: i32,
+}
+
+/// `POST /api/new/checkins/:id/change-room` — move an active guest
+/// from one room to another mid-stay.
+///
+/// Track G4 / T4 HIGH-3 (`docs/coexistence/audit-2026-05-13.md`). The
+/// route delegates the full validation + transaction to
+/// [`crate::service::CheckInService::change_room`]. Returns the freshly
+/// allocated `rc_id` so the UI can link directly to the audit row.
+pub async fn change_room(
+    State(state): State<AppState>,
+    Path(cin_id): Path<i32>,
+    Json(body): Json<ChangeRoomRequest>,
+) -> ApiResult<Json<ChangeRoomResponse>> {
+    let command = build_change_room_command(cin_id, &body);
+    let outcome = state
+        .checkins_service
+        .change_room(command)
+        .await
+        .map_err(map_change_room_error)?;
+    Ok(Json(build_change_room_response(&body, &outcome)))
+}
+
+/// PURE — translate the path id + JSON body into a service command.
+/// Lives at module scope so the unit tests can pin the contract without
+/// spinning up an [`AppState`].
+pub(crate) fn build_change_room_command(
+    cin_id: i32,
+    body: &ChangeRoomRequest,
+) -> ChangeRoomCommand {
+    ChangeRoomCommand {
+        check_in_id: cin_id,
+        from_room_id: body.from_room_id,
+        to_room_id: body.to_room_id,
+        reason: body.reason.clone(),
+        // Operator name lands here when G7 auth middleware wires
+        // session → state. Empty string is the canonical "unknown"
+        // sentinel (mirrors how walkin handles `created_by`).
+        actor: String::new(),
+        // TODO: wire user_id from auth middleware (parity with extend/checkout).
+        source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
+    }
+}
+
+/// PURE — translate the service outcome + request body into the
+/// HTTP response shape.
+pub(crate) fn build_change_room_response(
+    body: &ChangeRoomRequest,
+    outcome: &ChangeRoomOutcome,
+) -> ChangeRoomResponse {
+    ChangeRoomResponse {
+        success: true,
+        message: "Room change recorded".to_string(),
+        check_in_id: outcome.check_in_id,
+        rc_id: outcome.rc_id,
+        from_room_id: body.from_room_id,
+        to_room_id: body.to_room_id,
+    }
+}
+
+/// Translate service outcomes to HTTP. Validation failures (same room,
+/// from-room not in folio) surface as 400; conflict (target room
+/// occupied, source check-in not active) surfaces as 400 with explicit
+/// wording so the modal can show the receptionist what went wrong.
+fn map_change_room_error(err: ServiceError) -> ApiError {
+    match err {
+        ServiceError::Conflict(msg) => ApiError::BadRequest(msg),
+        ServiceError::Validation(msg) => ApiError::BadRequest(msg),
+        other => other.into(),
+    }
+}
+
+// =============================================================================
 // Guest Registry Types and Endpoints
 //
 // Stays on the repository: no service method exists yet for guest registry
@@ -1094,6 +1196,64 @@ mod tests {
             0,
             "balance must clamp at zero for overpaid stays"
         );
+    }
+
+    /// Track G4 / T4 HIGH-3 — the change-room route's command builder is
+    /// PURE: it propagates the path id + body into a `ChangeRoomCommand`
+    /// with no DB or clock reads. This locks the wire-shape contract so
+    /// any future refactor of the body type surfaces here as a compile
+    /// or assertion failure.
+    #[test]
+    fn change_room_route_builds_service_command() {
+        let body = ChangeRoomRequest {
+            from_room_id: 11,
+            to_room_id: 22,
+            reason: Some("AC broken".into()),
+        };
+        let cmd = build_change_room_command(99, &body);
+        assert_eq!(cmd.check_in_id, 99);
+        assert_eq!(cmd.from_room_id, 11);
+        assert_eq!(cmd.to_room_id, 22);
+        assert_eq!(cmd.reason.as_deref(), Some("AC broken"));
+        // Actor stays empty until G7 auth middleware lands.
+        assert_eq!(cmd.actor, "");
+    }
+
+    /// Track G4 / T4 HIGH-3 — empty / missing reason round-trips as
+    /// `None` so the service's optional-string handling stays intact.
+    #[test]
+    fn change_room_route_passes_through_missing_reason() {
+        let body = ChangeRoomRequest {
+            from_room_id: 1,
+            to_room_id: 2,
+            reason: None,
+        };
+        let cmd = build_change_room_command(7, &body);
+        assert!(cmd.reason.is_none());
+    }
+
+    /// Track G4 / T4 HIGH-3 — response builder reflects the service
+    /// outcome verbatim (no surprise transforms). Pins the JSON shape
+    /// the frontend expects.
+    #[test]
+    fn change_room_route_builds_response_shape() {
+        let body = ChangeRoomRequest {
+            from_room_id: 303,
+            to_room_id: 403,
+            reason: Some("upgrade".into()),
+        };
+        let outcome = ChangeRoomOutcome {
+            check_in_id: 42,
+            aggregate_id: Uuid::nil(),
+            rc_id: 1234,
+        };
+        let response = build_change_room_response(&body, &outcome);
+        assert!(response.success);
+        assert_eq!(response.check_in_id, 42);
+        assert_eq!(response.rc_id, 1234);
+        assert_eq!(response.from_room_id, 303);
+        assert_eq!(response.to_room_id, 403);
+        assert!(response.message.contains("Room change"));
     }
 
     /// Missing `cin_rate_per_night` must not panic — fall back to zero so

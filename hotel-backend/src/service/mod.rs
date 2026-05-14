@@ -50,8 +50,9 @@ pub use booking::{
     BookingWritebackContext, CancelBookingCommand, CreateBookingCommand, ModifyBookingCommand,
 };
 pub use checkin::{
-    CancelCheckInCommand, CheckInOutcome, CheckInService, CheckInToBookingCommand,
-    CheckInWritebackContext, CheckOutCommand, ExtendStayCommand, WalkInCommand,
+    CancelCheckInCommand, ChangeRoomCommand, ChangeRoomOutcome, CheckInOutcome, CheckInService,
+    CheckInToBookingCommand, CheckInWritebackContext, CheckOutCommand, ExtendStayCommand,
+    WalkInCommand,
 };
 pub use customer::{
     CreateCustomerCommand, CustomerOutcome, CustomerService, UpdateCustomerCommand,
