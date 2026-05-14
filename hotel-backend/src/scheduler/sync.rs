@@ -1335,6 +1335,36 @@ async fn upsert_customer_mirror(
     Ok(())
 }
 
+/// Legacy projection for the customer reconcile hash. Must mirror the
+/// CT mapper's column semantics (see `sync::mappers::customer`) so the
+/// MSSQL-side hash and the canonical-side hash project the SAME six
+/// fields. Drift between this projection and the mapper's writes
+/// produces systematic false-positive `ht_reconcile_log` rows that the
+/// auto-resolve sweep cannot ever clear.
+///
+/// **Why `HT_Customers` and NOT `View_Customers`:** the legacy view
+/// concatenates `Cust_perfix + Cust_name + ' ' + Cust_name2` into a
+/// single `Cust_name` column and builds `C_Address` from eight address
+/// components. The CT mapper writes only the base `Cust_name` into
+/// `cust_firstname` and only the door number (`Cust_Add_no`) into
+/// `cust_address`. Hashing the view's collapsed values against the
+/// mapper's component values guarantees a mismatch on every customer
+/// that has either a prefix, a secondary name, or a multi-line
+/// address.
+///
+/// **Why `Cust_Type_Main` and NOT `Cust_Type`:** the CT mapper writes
+/// `Cust_Type_Main` (the customer-category literal, e.g.
+/// `'บุคคลธรรมดา'`) into PG `cust_type`. The view's `Cust_Type` column
+/// is actually the *rate-tier* label (e.g. `'ราคาปกติ'`) which the
+/// mapper writes into the separate `cust_price_tier` column. The two
+/// frequently differ.
+const CUSTOMERS_RECONCILE_PROJECTION: &str = "Cust_no, \
+                                              Cust_name, \
+                                              Cust_Type_Main, \
+                                              Cust_Add_tel, \
+                                              Cust_IDcard, \
+                                              Cust_Add_no";
+
 async fn sync_customers(
     legacy_pool: &DbPool,
     pg_pool: &PgPool,
@@ -1345,19 +1375,12 @@ async fn sync_customers(
 
     let mut conn = legacy_pool.get().await?;
 
+    let select_sql = format!(
+        "SELECT {projection} FROM HT_Customers",
+        projection = CUSTOMERS_RECONCILE_PROJECTION,
+    );
     let rows = conn
-        .simple_query(
-            r#"
-            SELECT
-                Cust_no,
-                Cust_name,
-                Cust_Type,
-                Cust_Add_tel,
-                Cust_IDcard,
-                C_Address
-            FROM View_Customers
-            "#,
-        )
+        .simple_query(&select_sql)
         .await?
         .into_first_result()
         .await?;
@@ -1369,10 +1392,17 @@ async fn sync_customers(
     for row in &rows {
         let cust_no = row.get::<&str, _>("Cust_no").unwrap_or_default().to_string();
         let cust_name = row.get::<&str, _>("Cust_name").map(String::from);
-        let cust_type = row.get::<&str, _>("Cust_Type").map(String::from);
+        // `Cust_Type_Main` (not `Cust_Type`) is the column the CT mapper
+        // mirrors into PG `cust_type`. See doc on
+        // `CUSTOMERS_RECONCILE_PROJECTION` for the rate-tier vs.
+        // customer-category distinction.
+        let cust_type = row.get::<&str, _>("Cust_Type_Main").map(String::from);
         let cust_phone = row.get::<&str, _>("Cust_Add_tel").map(String::from);
         let cust_idcard = row.get::<&str, _>("Cust_IDcard").map(String::from);
-        let cust_address = row.get::<&str, _>("C_Address").map(String::from);
+        // `Cust_Add_no` (the door number, not the view's concatenated
+        // `C_Address`) is what the CT mapper mirrors into PG
+        // `cust_address`. See doc on `CUSTOMERS_RECONCILE_PROJECTION`.
+        let cust_address = row.get::<&str, _>("Cust_Add_no").map(String::from);
 
         // v2.63.0: canonical-shape hash of the MSSQL projection. Same
         // field set + serialisation as `customer_canonical_hash`, so a
@@ -3014,6 +3044,64 @@ mod tests {
         let h1 = customer_canonical_hash("C001", "Anan", None, None, None, None);
         let h2 = customer_canonical_hash("C001", "Anan", Some(""), Some(""), Some(""), Some(""));
         assert_eq!(h1, h2, "None and empty-string must canonicalise the same way");
+    }
+
+    /// Locks the legacy `HT_Customers` projection used by the reconcile
+    /// hash against the CT mapper's column semantics. The six columns
+    /// here must mirror `sync::mappers::customer::CustomerMapper`
+    /// faithfully — otherwise every customer with a prefix, secondary
+    /// name, multi-line address, or distinct rate-tier-vs-category
+    /// surfaces as systematic `value` drift that the auto-resolve
+    /// sweep can never clear.
+    ///
+    /// **Forbidden columns (regression tripwires):**
+    /// - `View_Customers` concatenates `Cust_perfix + Cust_name + ' ' +
+    ///   Cust_name2`, hiding the actual `Cust_name` the CT mapper
+    ///   writes. Hash against `HT_Customers.Cust_name` only.
+    /// - `View_Customers.C_Address` is a multi-line concatenation; PG
+    ///   `cust_address` mirrors only the door number from
+    ///   `Cust_Add_no`. Hash against `Cust_Add_no` only.
+    /// - `View_Customers.Cust_Type` is the rate-tier label (mapped to
+    ///   `cust_price_tier` in PG); the CT mapper writes
+    ///   `Cust_Type_Main` into PG `cust_type`. Hash against
+    ///   `Cust_Type_Main` only.
+    #[test]
+    fn customers_reconcile_projection_locks_mapper_compatible_columns() {
+        for col in [
+            "Cust_no",
+            "Cust_name",
+            "Cust_Type_Main",
+            "Cust_Add_tel",
+            "Cust_IDcard",
+            "Cust_Add_no",
+        ] {
+            assert!(
+                CUSTOMERS_RECONCILE_PROJECTION.contains(col),
+                "CUSTOMERS_RECONCILE_PROJECTION missing required column '{col}' — \
+                 reconcile hash will diverge from CT mapper's canonical writes"
+            );
+        }
+        // Forbidden columns — these are the View_Customers collapsed
+        // surfaces that produce systematic false-positive drift.
+        for forbidden in ["C_Address", "Cust_Type "] {
+            assert!(
+                !CUSTOMERS_RECONCILE_PROJECTION.contains(forbidden),
+                "CUSTOMERS_RECONCILE_PROJECTION must not project '{forbidden}' — \
+                 hashes will not align with the CT mapper's writes"
+            );
+        }
+        // `Cust_Type` is a substring of `Cust_Type_Main`, so the
+        // contains-check above uses a trailing space. Pin the exact
+        // bare-column absence via a token split.
+        let has_bare_cust_type = CUSTOMERS_RECONCILE_PROJECTION
+            .split(',')
+            .map(str::trim)
+            .any(|tok| tok == "Cust_Type");
+        assert!(
+            !has_bare_cust_type,
+            "CUSTOMERS_RECONCILE_PROJECTION must not project bare 'Cust_Type' \
+             (rate-tier, mapped to cust_price_tier) — use Cust_Type_Main instead"
+        );
     }
 
     #[test]
