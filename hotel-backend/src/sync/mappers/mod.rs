@@ -29,6 +29,7 @@
 
 pub mod booking;
 pub mod checkin;
+pub mod coupon;
 pub mod customer;
 pub mod guest_registry;
 pub mod mirror;
@@ -45,6 +46,7 @@ pub use checkin::{
     apply_checkin_aggregate, resolve_customer_via_eager_mirror_for_test, CheckInHeaderMapper,
     CheckInRoomsMapper,
 };
+pub use coupon::apply_canonical_cupon_event;
 pub use customer::CustomerMapper;
 pub use guest_registry::GuestRegistryMapper;
 pub use mirror::{

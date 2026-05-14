@@ -312,6 +312,47 @@ pub enum WritebackIntent {
         #[serde(default)]
         product_aggregate_id: Option<Uuid>,
     },
+
+    /// Track G5 — issue a new food/breakfast/promo coupon. The service
+    /// inserts the canonical `ht_coupons` row inside a PG transaction
+    /// before enqueuing this intent. The recipe later allocates a
+    /// legacy `HT_Cupon.cupon_no` under TABLOCKX+HOLDLOCK and INSERTs
+    /// the row; the writeback worker back-populates `legacy_cupon_no`
+    /// onto the canonical row.
+    ///
+    /// `coupon_id` carries the canonical BIGSERIAL key so the recipe
+    /// loads its remaining fields (`cupon_cin_no`, `cupon_cin_room`,
+    /// `cupon_date`, `cupon_by`) from PG before issuing the legacy
+    /// INSERT — same pattern as Track G4 `RoomChange`.
+    IssueCoupon {
+        /// Aggregate id of the canonical coupon row (`ht_coupons.aggregate_id`).
+        /// Used by the worker's `back_populate_legacy_ids` step to
+        /// stamp the freshly-allocated `cupon_no` onto the canonical
+        /// row after the legacy INSERT lands.
+        coupon_aggregate_id: Uuid,
+        /// Canonical BIGSERIAL key. The recipe loads the rest of the
+        /// row from PG keyed on this column.
+        coupon_id: i64,
+    },
+
+    /// Track G5 — redeem (mark printed) an existing coupon. Mirrors
+    /// the legacy `UPDATE HT_Cupon SET cupon_print=1 WHERE
+    /// cupon_no=...` pattern fired by `Print_Report.cs:2552`.
+    ///
+    /// The service flips canonical `coupon_status='redeemed'` and
+    /// stamps `coupon_redeemed_at` / `coupon_redeemed_cin_id` before
+    /// enqueuing this intent. The recipe issues the legacy UPDATE if
+    /// `legacy_cupon_no` is resolved; otherwise the worker defers the
+    /// flip until the parent `IssueCoupon` writeback completes (the
+    /// canonical row already carries the `redeemed` status — legacy
+    /// just lags).
+    RedeemCoupon {
+        /// Aggregate id of the canonical coupon row being redeemed.
+        coupon_aggregate_id: Uuid,
+        /// Canonical BIGSERIAL key. The recipe loads the resolved
+        /// `legacy_cupon_no` from PG keyed on this column.
+        coupon_id: i64,
+    },
 }
 
 /// Payload for [`WritebackIntent::CreateBooking`].
@@ -458,6 +499,8 @@ impl WritebackIntent {
             WritebackIntent::RoomChange { .. } => "room_change",
             WritebackIntent::MarkRoomClean { .. } => "mark_room_clean",
             WritebackIntent::AdjustProductStock { .. } => "adjust_product_stock",
+            WritebackIntent::IssueCoupon { .. } => "issue_coupon",
+            WritebackIntent::RedeemCoupon { .. } => "redeem_coupon",
         }
     }
 
@@ -490,6 +533,8 @@ impl WritebackIntent {
                 ..
             } => product_aggregate_id
                 .unwrap_or_else(|| product_aggregate_fallback(prod_legacy_no)),
+            WritebackIntent::IssueCoupon { coupon_aggregate_id, .. }
+            | WritebackIntent::RedeemCoupon { coupon_aggregate_id, .. } => *coupon_aggregate_id,
         }
     }
 }

@@ -65,6 +65,11 @@ pub enum AggregateKind {
     /// from the SERIAL `prod_id` so subscribers can deduplicate
     /// stock-adjust events.
     Product,
+    /// Track G5 — `ht_coupons` canonical mirror of legacy `HT_Cupon`
+    /// (food/breakfast coupon entitlement). The service derives the
+    /// aggregate UUID from the BIGSERIAL `coupon_id` so subscribers
+    /// can deduplicate issue/redeem events across writeback retries.
+    Coupon,
 }
 
 impl AggregateKind {
@@ -77,6 +82,7 @@ impl AggregateKind {
             AggregateKind::Payment => "new-hotel.aggregate.payment",
             AggregateKind::Room => "new-hotel.aggregate.room",
             AggregateKind::Product => "new-hotel.aggregate.product",
+            AggregateKind::Coupon => "new-hotel.aggregate.coupon",
         }
     }
 
@@ -115,6 +121,7 @@ mod tests {
             AggregateKind::Payment,
             AggregateKind::Room,
             AggregateKind::Product,
+            AggregateKind::Coupon,
         ] {
             for id in [1_i32, 42, 1_000_000, i32::MAX] {
                 assert_eq!(aggregate_uuid(kind, id), aggregate_uuid(kind, id));
@@ -134,6 +141,7 @@ mod tests {
             AggregateKind::Payment,
             AggregateKind::Room,
             AggregateKind::Product,
+            AggregateKind::Coupon,
         ];
 
         for (a_index, a) in kinds.iter().enumerate() {

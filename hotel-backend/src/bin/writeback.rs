@@ -187,18 +187,6 @@ fn current_site_id() -> &'static str {
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     dotenvy::dotenv().ok();
 
-    // Security audit 2026-05-14: hydrate sensitive env vars (DB_PASSWORD,
-    // POSTGRES_PASSWORD, SLACK_WEBHOOK_URL) from Docker secret files at
-    // `/run/secrets/<name>` when present. Also reconstructs DATABASE_URL
-    // from POSTGRES_USER + secret-file POSTGRES_PASSWORD + NEW_DB_* parts
-    // if it isn't pre-baked. See `hotel_backend::secrets` for details.
-    let hydrated = hotel_backend::secrets::hydrate_env_from_secret_files();
-    if hydrated > 0 {
-        eprintln!(
-            "[secrets] writeback: hydrated {hydrated} env var(s) from secret files at /run/secrets/"
-        );
-    }
-
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -1025,6 +1013,44 @@ async fn resolve_legacy_ids(
         // on the same value on both sides). No PG lookup or self-heal
         // is required at this layer.
         AdjustProductStock { .. } => {}
+        // Track G5 — IssueCoupon / RedeemCoupon load the full
+        // canonical `ht_coupons` row keyed by `coupon_id`, then thread
+        // the legacy folio + room context through to the recipe.
+        IssueCoupon { coupon_id, .. } | RedeemCoupon { coupon_id, .. } => {
+            use hotel_backend::writeback::dispatcher::ResolvedCoupon;
+            if let Some(row) = sqlx::query(
+                "SELECT \
+                    c.coupon_id, \
+                    c.legacy_cupon_no, \
+                    COALESCE(c.coupon_for_cin_no, '') AS coupon_for_cin_no, \
+                    COALESCE(ck.legacy_room_no, '')   AS coupon_for_room_no, \
+                    c.coupon_issued_at, \
+                    COALESCE(c.coupon_issued_by, '')  AS issued_by \
+                 FROM ht_coupons c \
+                 LEFT JOIN ht_checkins ck \
+                        ON ck.legacy_cin_no = c.coupon_for_cin_no \
+                 WHERE c.coupon_id = $1",
+            )
+            .bind(*coupon_id)
+            .fetch_optional(pg)
+            .await?
+            {
+                resolved.coupon = Some(ResolvedCoupon {
+                    coupon_id: row.try_get("coupon_id").unwrap_or(*coupon_id),
+                    legacy_cupon_no: row.try_get("legacy_cupon_no").ok(),
+                    coupon_for_cin_no: row
+                        .try_get("coupon_for_cin_no")
+                        .unwrap_or_default(),
+                    coupon_for_room_no: row
+                        .try_get("coupon_for_room_no")
+                        .unwrap_or_default(),
+                    issued_at: row
+                        .try_get("coupon_issued_at")
+                        .unwrap_or_else(|_| Utc::now()),
+                    issued_by: row.try_get("issued_by").unwrap_or_default(),
+                });
+            }
+        }
     }
     Ok(resolved)
 }
@@ -1709,6 +1735,27 @@ async fn back_populate_legacy_ids(
         // `ht_products.legacy_*` fields are populated by the sync
         // mapper, not by writebacks. Nothing to back-populate here.
         AdjustProductStock { .. } => {}
+        // Track G5 — IssueCoupon back-populates the freshly allocated
+        // `HT_Cupon.cupon_no` onto `ht_coupons.legacy_cupon_no`. The
+        // canonical row is keyed by the intent's `coupon_aggregate_id`
+        // (== the row's `aggregate_id`). RedeemCoupon doesn't allocate
+        // new legacy IDs (it just flips `cupon_print`); the legacy
+        // back-pointer is already set from the prior IssueCoupon.
+        IssueCoupon { .. } | RedeemCoupon { .. } => {
+            let cupon_no = legacy_ids.get("cupon_no").and_then(|v| v.as_i64()).map(|n| n as i32);
+            if let Some(cupon_no) = cupon_no {
+                sqlx::query(
+                    "UPDATE ht_coupons SET \
+                       legacy_cupon_no = COALESCE($2, legacy_cupon_no), \
+                       updated_at = NOW() \
+                     WHERE aggregate_id = $1",
+                )
+                .bind(aggregate_id)
+                .bind(cupon_no)
+                .execute(pg)
+                .await?;
+            }
+        }
     }
     Ok(())
 }

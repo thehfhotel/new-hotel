@@ -5,6 +5,105 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [vNext] - 2026-05-14 (Track G5)
+
+### Added
+
+- **Track G5 — canonical coupon issuing (`HT_Cupon` mirror).** Promotes
+  legacy `HT_Cupon` (food/breakfast entitlement table, per
+  `docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_Cupon`) to a canonical
+  `ht_coupons` table so receptionists can issue coupons from the new
+  app without falling back to iHOTEL's `FrmCuponMain`.
+  - **`migrations/pg/051_create_ht_coupons.sql`** — new canonical
+    `ht_coupons` table mirroring `HT_Cupon`'s shape plus
+    canonical-only fields (`coupon_code` UNIQUE, `coupon_value
+    NUMERIC(10,2)`, `coupon_status` enum, `coupon_expires_at DATE`,
+    `coupon_redeemed_at`, `coupon_redeemed_cin_id`, `aggregate_id
+    UUID UNIQUE`, `source` enum). Partial UNIQUE on
+    `legacy_cupon_no WHERE NOT NULL` (back-pointer to
+    `HT_Cupon.cupon_no`) plus indexes on `coupon_status` /
+    `coupon_for_cust_id` / `coupon_for_cin_no` for the
+    "outstanding coupons" + reconcile read paths. Extends Track G7
+    permission catalog with `coupon.issue` (admin + receptionist)
+    and `coupon.redeem` (admin + cashier + receptionist).
+    `init-db/init-hotelnew.sql` mirror + migrations README updated.
+  - **`hotel-backend/src/service/coupon.rs`** —
+    `CouponService::issue_coupon` INSERTs the canonical row and
+    enqueues `WritebackIntent::IssueCoupon`;
+    `CouponService::redeem_coupon` validates the coupon is still
+    `issued` + not expired before flipping
+    `coupon_status='redeemed'` + stamping `coupon_redeemed_at` /
+    `coupon_redeemed_cin_id` and enqueuing
+    `WritebackIntent::RedeemCoupon`. Coupon codes generated as
+    `COUP-{8 hex}` from a v4 UUID's high 32 bits.
+    `legacy_print_to_pg_status` / `pg_status_to_legacy_print`
+    helpers map the legacy `cupon_print` int ↔ canonical
+    `coupon_status` enum and are exercised by the sync mapper.
+  - **`hotel-backend/src/outbox/intent.rs`** — new
+    `WritebackIntent::IssueCoupon { coupon_aggregate_id, coupon_id }`
+    and `WritebackIntent::RedeemCoupon { coupon_aggregate_id,
+    coupon_id }` variants. Aggregate id routes through the new
+    `AggregateKind::Coupon` namespace.
+  - **`hotel-backend/src/writeback/recipes/coupon.rs`** —
+    `build_issue_statements` composes the legacy `HT_Cupon` INSERT
+    (mirroring `Module1.GEN_Cupon`'s column shape:
+    `cupon_no, cupon_cin_no, cupon_cin_room, cupon_date,
+     cupon_gen_date, cupon_by, cupon_print=0`) under a fresh
+    `cupon_no` allocated via TABLOCKX+HOLDLOCK MAX+1
+    (`allocate::allocate_cupon_no`). `build_redeem_statements`
+    emits the legacy `UPDATE HT_Cupon SET cupon_print=1 WHERE
+    cupon_no=...` matching `Print_Report.cs:2552`. Both wrapped in
+    `WHERE NOT EXISTS` idempotency guards (audit-MED pattern).
+  - **`hotel-backend/src/writeback/dispatcher.rs`** — new
+    `IssueCoupon` / `RedeemCoupon` arms in `dispatch` plus a
+    `ResolvedCoupon` hydration target so the recipe loads its
+    inputs from PG once and never re-queries sqlx inside the
+    transaction. `LegacyIds.cupon_no` carries the allocated id back
+    to the worker for `back_populate_legacy_ids`.
+  - **`hotel-backend/src/bin/writeback.rs`** — resolves the
+    canonical `ht_coupons` row by `coupon_id` (joining
+    `ht_checkins` via `coupon_for_cin_no` to surface
+    `legacy_room_no`), then back-populates `legacy_cupon_no` onto
+    the canonical row after a successful `IssueCoupon` writeback.
+  - **`hotel-backend/src/sync/mappers/coupon.rs`** — projection +
+    `apply_canonical_cupon_event` helper that promotes
+    `HT_Cupon` CT events into canonical `ht_coupons` (UPSERT
+    keyed on the partial UNIQUE
+    `ux_ht_coupons_legacy_cupon_no`). Mirror mapper
+    (`super::mirror::CuponMirrorMapper`) dual-writes
+    legacy_mirror.ht_cupon + canonical via this helper —
+    matches the Track G4 `ChangedRoomMirrorMapper` pattern so
+    `bin/sync.rs::build_mappers` registry is unchanged. H1
+    projection-lock test pins the column list against the mirror
+    mapper's `select_sql`.
+  - **`hotel-backend/src/routes/new_coupons.rs`** — `POST
+    /api/new/coupons` (gated on `coupon.issue`), `POST
+    /api/new/coupons/{code}/redeem` (gated on `coupon.redeem`), and
+    unrestricted `GET /api/new/coupons?status=issued`. Request
+    bodies camelCase per project convention; service-layer
+    validation propagates through the existing `ApiError` enum.
+  - **Frontend** — `components/modals/IssueCouponModal.tsx`
+    (Thai-language modal with face-value input, optional
+    expiry date, optional `Cin_no` folio context, post-issue
+    code display + browser print).
+    `__tests__/components/modals/IssueCouponModal.test.tsx`
+    covers render-shape, permission gating (`coupon.issue` UI
+    guard), POST happy-path, and local validation rejecting
+    negative values.
+
+### Notes
+
+- Coupons issued via this canonical path land in legacy `HT_Cupon`
+  via the writeback worker (one new `cupon_no` per issue). Coupons
+  issued in iHOTEL (`Module1.GEN_Cupon` at check-in) hydrate into
+  canonical via the extended `CuponMirrorMapper` so the dashboard
+  panel surfaces both populations.
+- Standalone promo coupons (no `Cin_no` bound) stay
+  canonical-only — the recipe surfaces a `Recipe` error if a
+  legacy writeback is attempted without `coupon_for_cin_no`, so
+  the operator can either bind to a folio or accept the
+  canonical-only state.
+
 ## [v2.65.3] - 2026-05-14 (Secrets migration)
 
 ### Security

@@ -30,6 +30,7 @@
 //! | `room_change` | Track G4 / T4 HIGH-3 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_Changed_Room`, §3.17) | `RoomChange` |
 //! | `mark_clean` | §3j | `MarkRoomClean` |
 //! | `adjust_product_stock` | Track F3 / T1 CRIT-3 (`docs/legacy-app/COMPAT_CHEATSHEET.md:560-564`) | `AdjustProductStock` |
+//! | `coupon` | Track G5 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_Cupon`) | `IssueCoupon` + `RedeemCoupon` |
 
 pub mod adjust_product_stock;
 pub mod booking_cancel;
@@ -38,6 +39,7 @@ pub mod booking_modify;
 pub mod checkin_cancel;
 pub mod checkin_to_booking;
 pub mod checkout;
+pub mod coupon;
 pub mod extend_stay;
 pub mod helpers;
 pub mod mark_clean;

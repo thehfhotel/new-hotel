@@ -1833,5 +1833,83 @@ VALUES ('050', '050_legacy_ct_state_per_table.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================
+-- Migration 051: Track G5 — ht_coupons canonical (mirror of HT_Cupon)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS ht_coupons (
+    coupon_id              BIGSERIAL    PRIMARY KEY,
+    legacy_cupon_no        INTEGER,
+    coupon_code            VARCHAR(20)  NOT NULL UNIQUE,
+    coupon_value           NUMERIC(10,2) NOT NULL DEFAULT 0,
+    coupon_status          VARCHAR(20)  NOT NULL DEFAULT 'issued',
+    coupon_issued_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    coupon_expires_at      DATE,
+    coupon_issued_by       TEXT,
+    coupon_for_cin_no      VARCHAR(50),
+    coupon_for_cust_id     BIGINT       REFERENCES ht_customers(cust_id) ON DELETE SET NULL,
+    coupon_redeemed_at     TIMESTAMPTZ,
+    coupon_redeemed_cin_id BIGINT       REFERENCES ht_checkins(cin_id)   ON DELETE SET NULL,
+    aggregate_id           UUID         NOT NULL UNIQUE,
+    source                 VARCHAR(20)  NOT NULL DEFAULT 'canonical',
+    created_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT ht_coupons_status_check
+        CHECK (coupon_status IN ('issued', 'redeemed', 'expired', 'cancelled')),
+    CONSTRAINT ht_coupons_source_check
+        CHECK (source IN ('canonical', 'legacy')),
+    CONSTRAINT ht_coupons_value_nonneg
+        CHECK (coupon_value >= 0)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ht_coupons_legacy_cupon_no
+    ON ht_coupons (legacy_cupon_no)
+    WHERE legacy_cupon_no IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS ix_ht_coupons_status
+    ON ht_coupons (coupon_status);
+
+CREATE INDEX IF NOT EXISTS ix_ht_coupons_for_cust_id
+    ON ht_coupons (coupon_for_cust_id)
+    WHERE coupon_for_cust_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS ix_ht_coupons_for_cin_no
+    ON ht_coupons (coupon_for_cin_no)
+    WHERE coupon_for_cin_no IS NOT NULL;
+
+-- Track G5 permission seeds (mirror migration 051).
+INSERT INTO ht_permissions (permission_key, description)
+VALUES
+    ('coupon.issue',  'Issue a food/promo coupon to a guest (Track G5)'),
+    ('coupon.redeem', 'Mark a coupon as redeemed / printed (Track G5)')
+ON CONFLICT (permission_key) DO NOTHING;
+
+INSERT INTO ht_role_permissions (role_id, permission_id)
+SELECT r.role_id, p.permission_id
+FROM ht_roles r
+CROSS JOIN ht_permissions p
+WHERE r.role_key = 'admin'
+  AND p.permission_key IN ('coupon.issue', 'coupon.redeem')
+ON CONFLICT (role_id, permission_id) DO NOTHING;
+
+INSERT INTO ht_role_permissions (role_id, permission_id)
+SELECT r.role_id, p.permission_id
+FROM ht_roles r
+JOIN ht_permissions p ON p.permission_key IN ('coupon.issue', 'coupon.redeem')
+WHERE r.role_key = 'receptionist'
+ON CONFLICT (role_id, permission_id) DO NOTHING;
+
+INSERT INTO ht_role_permissions (role_id, permission_id)
+SELECT r.role_id, p.permission_id
+FROM ht_roles r
+JOIN ht_permissions p ON p.permission_key = 'coupon.redeem'
+WHERE r.role_key = 'cashier'
+ON CONFLICT (role_id, permission_id) DO NOTHING;
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('051', '051_create_ht_coupons.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
 -- Initialization complete
 -- =============================================================================

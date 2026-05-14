@@ -64,6 +64,13 @@ pub struct LegacyIds {
     /// edit/extend/cancel writeback can target the correct legacy row.
     #[serde(default)]
     pub checkin_ds_ids_by_room: Vec<(String, i32)>,
+    /// Track G5 — `HT_Cupon.cupon_no` minted by the issue recipe (or
+    /// re-affirmed by the redeem recipe). Stamped onto canonical
+    /// `ht_coupons.legacy_cupon_no` by the worker's
+    /// `back_populate_legacy_ids` step. `None` for every non-coupon
+    /// intent.
+    #[serde(default)]
+    pub cupon_no: Option<i32>,
     /// Free-form extras (e.g. `HT_Rooms_Cancel.id`).
     #[serde(default)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -110,6 +117,11 @@ impl LegacyIds {
         self.checkin_ds_ids_by_room.push((room_no, id));
         self
     }
+    /// Track G5 — record the freshly-allocated `HT_Cupon.cupon_no`.
+    pub fn with_cupon_no(mut self, cupon_no: i32) -> Self {
+        self.cupon_no = Some(cupon_no);
+        self
+    }
 
     pub fn into_json(self) -> serde_json::Value {
         serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
@@ -142,6 +154,41 @@ pub struct ResolvedJob {
     /// MSSQL-only (the recipe pattern Track C established). `None` for
     /// every other intent.
     pub room_change: Option<ResolvedRoomChange>,
+    /// Track G5 — fully-loaded canonical `ht_coupons` row for the
+    /// `IssueCoupon` / `RedeemCoupon` intents. The dispatcher loads
+    /// this from PG before handing off to the recipe so the recipe
+    /// stays MSSQL-only — same pattern as `room_change`. `None` for
+    /// every other intent.
+    pub coupon: Option<ResolvedCoupon>,
+}
+
+/// Fully-hydrated `ht_coupons` row required by the
+/// `WritebackIntent::IssueCoupon` / `RedeemCoupon` recipes. Sourced
+/// from PG by the writeback worker; the recipe consumes it as plain
+/// fields and never touches sqlx. Mirrors the Track G4
+/// `ResolvedRoomChange` pattern.
+#[derive(Debug, Default, Clone)]
+pub struct ResolvedCoupon {
+    /// `ht_coupons.coupon_id` — primary key. Used to back-populate
+    /// `legacy_cupon_no` after the legacy INSERT lands.
+    pub coupon_id: i64,
+    /// `ht_coupons.legacy_cupon_no` — `Some(_)` only when the writeback
+    /// worker has already back-populated it (i.e. on the redeem path
+    /// after issue). The recipe uses this to target `WHERE cupon_no=...`
+    /// on the redeem UPDATE.
+    pub legacy_cupon_no: Option<i32>,
+    /// `ht_coupons.coupon_for_cin_no` — legacy folio key the coupon is
+    /// attached to. Empty string for standalone promo coupons.
+    pub coupon_for_cin_no: String,
+    /// Legacy `Cin_room_no` resolved alongside `cupon_cin_no`. Empty
+    /// string when no room context is known.
+    pub coupon_for_room_no: String,
+    /// `ht_coupons.coupon_issued_at` — wall-clock of issue. Lands in
+    /// legacy `cupon_date` + `cupon_gen_date` per spike COMPAT
+    /// CHEATSHEET §`HT_Cupon`.
+    pub issued_at: chrono::DateTime<chrono::Utc>,
+    /// Operator name. Empty string when unknown.
+    pub issued_by: String,
 }
 
 /// Fully-hydrated `ht_room_changes` row required by the
@@ -541,6 +588,26 @@ pub async fn dispatch(
             }
             recipes::adjust_product_stock::execute(conn, prod_legacy_no, *delta).await
         }
+        // Track G5 — coupon issuing. The dispatcher hydrated
+        // `resolved.coupon` from PG (canonical `ht_coupons` row keyed
+        // on `coupon_id`) before this point. The recipe consumes it
+        // as plain fields and never re-queries sqlx.
+        WritebackIntent::IssueCoupon { coupon_aggregate_id: _, coupon_id } => {
+            let resolved_coupon = resolved.coupon.as_ref().ok_or_else(|| {
+                WritebackError::Recipe(format!(
+                    "IssueCoupon requires resolved.coupon (coupon_id={coupon_id})"
+                ))
+            })?;
+            recipes::coupon::execute_issue(conn, resolved_coupon).await
+        }
+        WritebackIntent::RedeemCoupon { coupon_aggregate_id: _, coupon_id } => {
+            let resolved_coupon = resolved.coupon.as_ref().ok_or_else(|| {
+                WritebackError::Recipe(format!(
+                    "RedeemCoupon requires resolved.coupon (coupon_id={coupon_id})"
+                ))
+            })?;
+            recipes::coupon::execute_redeem(conn, resolved_coupon).await
+        }
     }
 }
 
@@ -619,6 +686,9 @@ mod tests {
         assert!(r.legacy_original_pay_no.is_none());
         // Track G4 — room_change is hydrated only for the RoomChange intent.
         assert!(r.room_change.is_none());
+        // Track G5 — coupon is hydrated only for the IssueCoupon /
+        // RedeemCoupon intents.
+        assert!(r.coupon.is_none());
     }
 
     /// Verifies all `WritebackIntent` variants have a matching `intent_name`
@@ -626,7 +696,8 @@ mod tests {
     /// added without updating the dispatcher, the compiler will fail (match
     /// exhaustiveness), and this test catches drift in name strings.
     /// (Track F3 added `adjust_product_stock`; Track G2 added
-    /// `refund_payment` — keep the count and the names list in lock-step.)
+    /// `refund_payment`; Track G5 added `issue_coupon` + `redeem_coupon`
+    /// — keep the count and the names list in lock-step.)
     #[test]
     fn all_intent_variants_route_to_recipes() {
         let names = [
@@ -642,12 +713,14 @@ mod tests {
             "room_change",
             "mark_room_clean",
             "adjust_product_stock",
+            "issue_coupon",
+            "redeem_coupon",
         ];
         // We verify dispatch handles all by constructing one of each via the
         // intent name → no actual MSSQL call, just type-level coverage.
         // Counting expected variants here keeps the test cheap and
         // deterministic.
-        assert_eq!(names.len(), 12, "expected 12 WritebackIntent variants");
+        assert_eq!(names.len(), 14, "expected 14 WritebackIntent variants");
     }
 
     /// Phase 5.1 chokepoint guarantee — every recipe MUST run after
