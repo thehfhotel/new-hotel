@@ -5,6 +5,137 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v2.66.1] - 2026-05-14 (Track G6 — POS / sales-to-room module MVP)
+
+### Added
+
+- **Canonical POS module (`ht_pos_sales` table + write path).** iHOTEL's
+  POS form is the last must-have feature receptionists fell back to
+  the legacy app for — ringing up F&B / laundry / minibar / amenity
+  charges against a guest's open folio. G6 closes that gap with an
+  MVP that ships:
+
+  - **Migration `052_create_ht_pos_sales.sql`** introducing
+    `ht_pos_sales` mirroring legacy `HT_CheckIn_Product` cardinality
+    (1:N — one row per line item per folio). Columns:
+    `sale_cin_id` (FK + CASCADE), `sale_product_id` (FK to F3's
+    `ht_products` — soft-delete only), `sale_qty NUMERIC(10,3)`,
+    `sale_unit_price NUMERIC(12,2)`, `sale_total NUMERIC(14,2)
+    GENERATED ALWAYS AS (qty × unit_price) STORED`, `sale_sold_at`,
+    `sale_sold_by`, `sale_note`, `sale_status` (posted/voided),
+    `sale_legacy_id` (partial UNIQUE), `source`
+    (canonical/legacy), `aggregate_id UUID UNIQUE`.
+
+  - **Service `service::pos::record_sale`** validates the folio is
+    active, resolves the product (must be `prod_active=TRUE`),
+    computes effective unit price (catalog price unless override
+    supplied; rejects negative / non-finite override),
+    decrements `ht_products.prod_current_stock` additively, INSERTs
+    the canonical sale row keyed on a v5 aggregate UUID
+    (`AggregateKind::PosSale`), and emits
+    `WritebackIntent::RecordPosSale { check_in_id, sale_id }` — all
+    inside one PG transaction so the stock decrement, audit row, and
+    writeback enqueue either all land or none do.
+
+  - **Writeback recipe `writeback::recipes::pos_sale`** issues both
+    legacy writes the iHOTEL POS form fires:
+    `INSERT INTO [HT_CheckIn_Product] (11 cols) OUTPUT INSERTED.id`
+    (IDENTITY captured via OUTPUT clause — audit H12 — and stamped
+    onto `sale_legacy_id` by the worker's `back_populate_legacy_ids`
+    step), followed by the paired additive
+    `UPDATE HT_Products SET Pro_Amt = Pro_Amt + (-qty) WHERE
+    Pro_no=…`. Bundled into ONE recipe (not split as a separate
+    `AdjustProductStock` intent) because the legacy app fires both
+    statements in one transaction; splitting would let one half
+    drain while the other failed.
+
+  - **Sync mapper extension** — `CheckinProductMirrorMapper`
+    additionally reverse-syncs canonical: alongside the existing
+    `legacy_mirror.ht_checkin_product` opaque projection, it now
+    UPSERTs `ht_pos_sales` keyed on `sale_legacy_id`, resolving
+    `Cin_No` → `cin_id` and `Cin_Pro_id` → `prod_id` via FK joins.
+    Misses where the parent rows haven't been mirrored are silent
+    no-ops (the next CT tick retries). DELETEs also cascade to the
+    canonical row.
+
+  - **HTTP routes**:
+    - `POST /api/new/checkins/:id/pos-sale` — ring up one line.
+      Body `{ productId, qty, unitPriceOverride?, note? }`; response
+      includes the new `saleId`, effective `unitPriceBaht`,
+      `totalBaht`, and the wall-clock `soldAt`. Gated on new
+      `pos.sell` permission (admin + cashier — migration 052 seeds
+      the role grid).
+    - `GET /api/new/checkins/:id/pos-sales` — list the folio's
+      running tab joined with `ht_products` (so the UI gets product
+      name + unit without a second round-trip). Ungated so
+      receptionists can see the tab even when they can't ring up.
+      Returns `data: PosSaleEntry[]`, `total`, `grandTotalBaht`.
+
+  - **Frontend cashier UI** — new `components/PosSaleModal.tsx`
+    launched from the dashboard's occupied-tile action set ("เพิ่ม
+    รายการในบิล" / Add to folio, amber-orange button next to the
+    change-room button). Product picker with case-insensitive
+    search across name + legacy_no, qty + optional unit-price
+    override + optional note, and a running-tab pane on the right.
+    Modelled on `ChangeRoomModal.tsx` (G4) for visual + UX parity.
+
+  - **Permission key `pos.sell`** added to G7's grid via
+    migration 052. Admin and cashier roles receive the grant;
+    receptionists and housekeepers do NOT by default (cashier is
+    the canonical till role per iHOTEL convention).
+
+- **`AggregateKind::PosSale`** in `service::ids` so canonical sale
+  rows mint deterministic v5 UUIDs from their SERIAL `sale_id`.
+  Subscribers can dedup retries.
+
+### Deferred (NOT in this MVP — captured as TODO comments in code)
+
+These are out-of-scope follow-ups; each will land in its own PR
+when prioritised:
+
+- **Direct-pay POS** — `Cin_Pro_pay` is hard-pegged to 0.00 in the
+  recipe (line items post to folio, settle at round-bill). A
+  cashier "pay now" toggle requires adding a pay field to
+  `PosSaleInputs` and routing the cash through `RecordPayment`.
+- **Void / refund of a POS line** — schema supports
+  `sale_status='voided'` but no service method touches it yet.
+  Mirror writeback would be a `DELETE FROM HT_CheckIn_Product`
+  (matching the legacy spike capture
+  `docs/legacy-spike/findings.md:211`) plus the inverse
+  `HT_Products.Pro_Amt + qty` restore.
+- **Multi-line receipts in one call** — the route accepts one line
+  per POST; the UI loops for an N-line ticket. A bulk endpoint
+  with one writeback intent per line could halve the round-trip
+  count.
+- **Discounts / coupons on POS lines** — `sale_unit_price` is the
+  only price field. G5's discount engine (when it lands) layers
+  on top via a per-line discount column.
+- **POS receipt printing** — no `HT_Receipt_H` / `HT_Receipt_Ds`
+  rows emitted today (those are room-revenue receipts only).
+  POS-specific receipts are an iHOTEL feature we'll cover with a
+  follow-up recipe.
+- **Stock low-water alerts on POS consumption** — F3 owns the
+  stock-level dashboard; this service emits no Slack alert.
+
+### Compatibility notes
+
+- The migration is additive: existing `legacy_mirror.ht_checkin_product`
+  observability stays intact. The extended `CheckinProductMirrorMapper`
+  is backward-compatible — every existing `ChangeOp::Insert /Update`
+  path still UPSERTs the mirror row first, then attempts the
+  canonical UPSERT (failing parent-row lookups silently skip the
+  canonical step so legacy-only flows keep working).
+- `ht_inventory_transactions` is NOT written by the POS service.
+  The stock adjustment lives entirely on `ht_products.prod_current_stock`
+  (running counter) + the legacy mirror via the recipe; this matches
+  what iHOTEL's POS form does. A future `### Changed` block can add
+  a `'sale'` `trans_type` if reconcile / reports want a per-sale
+  inventory ledger.
+- Track G7 (migration 046) shipped 6 permission keys; this migration
+  bolts on a 7th (`pos.sell`). Admin's all-permissions seed-cross-
+  join from 046 only covered the 6 keys present at that migration's
+  time, so 052 adds explicit admin + cashier grants for `pos.sell`.
+
 ## [vNext] - 2026-05-14 (Track G5)
 
 ### Added

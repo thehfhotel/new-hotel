@@ -978,6 +978,50 @@ async fn resolve_legacy_ids(
             // No self-heal source for rooms — they're populated by the
             // backfill_rooms binary, not by recipe writebacks.
         }
+        // Track G6 — `RecordPosSale`. Load the canonical `ht_pos_sales`
+        // row joined with `ht_products` so the recipe consumes plain
+        // fields (no sqlx). The check-in identifiers (`cin_no`, room)
+        // come from the parent `ht_checkins` row, resolved here too
+        // because the intent only carries the parent aggregate id.
+        RecordPosSale { sale_id, .. } => {
+            use hotel_backend::writeback::dispatcher::ResolvedPosSale;
+            if let Some(row) = sqlx::query(
+                "SELECT \
+                    s.sale_id, \
+                    COALESCE(c.legacy_cin_no, '') AS legacy_cin_no, \
+                    COALESCE(c.legacy_room_no, '') AS legacy_room_no, \
+                    COALESCE(p.prod_legacy_no, '') AS prod_legacy_no, \
+                    COALESCE(p.prod_name, '')      AS prod_name, \
+                    COALESCE(p.prod_unit, '')      AS prod_unit, \
+                    s.sale_qty::float8             AS qty, \
+                    s.sale_unit_price::float8      AS unit_price_baht, \
+                    s.sale_total::float8           AS total_baht, \
+                    COALESCE(s.sale_note, '')      AS note, \
+                    s.sale_sold_at \
+                 FROM ht_pos_sales s \
+                 JOIN ht_checkins  c ON c.cin_id  = s.sale_cin_id \
+                 JOIN ht_products  p ON p.prod_id = s.sale_product_id \
+                 WHERE s.sale_id = $1",
+            )
+            .bind(*sale_id)
+            .fetch_optional(pg)
+            .await?
+            {
+                resolved.pos_sale = Some(ResolvedPosSale {
+                    sale_id: row.try_get("sale_id").unwrap_or(*sale_id),
+                    legacy_cin_no: row.try_get("legacy_cin_no").unwrap_or_default(),
+                    legacy_room_no: row.try_get("legacy_room_no").unwrap_or_default(),
+                    prod_legacy_no: row.try_get("prod_legacy_no").unwrap_or_default(),
+                    prod_name: row.try_get("prod_name").unwrap_or_default(),
+                    prod_unit: row.try_get("prod_unit").unwrap_or_default(),
+                    qty: row.try_get("qty").unwrap_or(0.0),
+                    unit_price_baht: row.try_get("unit_price_baht").unwrap_or(0.0),
+                    total_baht: row.try_get("total_baht").unwrap_or(0.0),
+                    note: row.try_get("note").unwrap_or_default(),
+                    sold_at: row.try_get("sale_sold_at").unwrap_or_else(|_| Utc::now()),
+                });
+            }
+        }
         // CreateBooking carries everything in its payload — no resolution.
         CreateBooking { .. } => {}
         // CreateCheckIn (linked-to-booking variant) needs the linked
@@ -1752,6 +1796,51 @@ async fn back_populate_legacy_ids(
                 )
                 .bind(aggregate_id)
                 .bind(cupon_no)
+                .execute(pg)
+                .await?;
+            }
+        }
+        // Track G6 — RecordPosSale back-populates the freshly-
+        // allocated `HT_CheckIn_Product.id` onto
+        // `ht_pos_sales.sale_legacy_id` so the reverse-sync mapper
+        // can match legacy-origin rows to canonical ones and so the
+        // reconcile job differentiates one-sided lines. The recipe
+        // stuffs both ids into `legacy_ids.extra` (`sale_id` +
+        // `ht_checkin_product_id`).
+        RecordPosSale { .. } => {
+            let sale_id = legacy_ids
+                .get("extra")
+                .and_then(|v| v.get("sale_id"))
+                .and_then(|v| v.as_i64());
+            let legacy_id = legacy_ids
+                .get("extra")
+                .and_then(|v| v.get("ht_checkin_product_id"))
+                .and_then(|v| v.as_i64())
+                .map(|n| n as i32);
+            if let (Some(sale_id), Some(legacy_id)) = (sale_id, legacy_id) {
+                sqlx::query(
+                    "UPDATE ht_pos_sales \
+                        SET sale_legacy_id = $2, updated_at = NOW() \
+                      WHERE sale_id = $1 AND sale_legacy_id IS NULL",
+                )
+                .bind(sale_id)
+                .bind(legacy_id)
+                .execute(pg)
+                .await?;
+            }
+            // The legacy_cin_no self-heal mirrors the RoomChange branch
+            // — a fresh walkin's first writeback may surface the
+            // cin_no here. Keeping the cached cin_no fresh avoids
+            // forcing the next intent through the resolver fallback.
+            if cin_no.is_some() {
+                sqlx::query(
+                    "UPDATE ht_checkins SET \
+                       legacy_cin_no = COALESCE($2, legacy_cin_no), \
+                       updated_at = NOW() \
+                     WHERE aggregate_id = $1",
+                )
+                .bind(aggregate_id)
+                .bind(cin_no)
                 .execute(pg)
                 .await?;
             }

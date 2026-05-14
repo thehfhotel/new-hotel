@@ -160,6 +160,13 @@ pub struct ResolvedJob {
     /// stays MSSQL-only — same pattern as `room_change`. `None` for
     /// every other intent.
     pub coupon: Option<ResolvedCoupon>,
+    /// Track G6 — fully-loaded canonical `ht_pos_sales` row for the
+    /// `RecordPosSale` intent (joined with `ht_products` so the recipe
+    /// has the legacy `Pro_no` / `Pro_name` / `Pro_Unit` without a
+    /// second query). Same pattern as `room_change`: the resolver in
+    /// the writeback worker hydrates it; the recipe consumes plain
+    /// fields only.
+    pub pos_sale: Option<ResolvedPosSale>,
 }
 
 /// Fully-hydrated `ht_coupons` row required by the
@@ -189,6 +196,46 @@ pub struct ResolvedCoupon {
     pub issued_at: chrono::DateTime<chrono::Utc>,
     /// Operator name. Empty string when unknown.
     pub issued_by: String,
+}
+
+/// Track G6 — fully-hydrated `ht_pos_sales` row (joined with
+/// `ht_products`) required by the `WritebackIntent::RecordPosSale`
+/// recipe. Sourced from PG by the writeback worker; the recipe
+/// consumes plain string + number fields only.
+#[derive(Debug, Default, Clone)]
+pub struct ResolvedPosSale {
+    /// `ht_pos_sales.sale_id` — primary key. Used to back-populate
+    /// `sale_legacy_id` after the legacy INSERT returns its IDENTITY.
+    pub sale_id: i64,
+    /// `HT_CheckIn_Product.Cin_No` — legacy folio key.
+    pub legacy_cin_no: String,
+    /// `HT_CheckIn_Product.Cin_Room_no` — the room number the line is
+    /// charged to. Resolved from `ht_checkins.legacy_room_no`.
+    /// Empty string ⇒ recipe passes through unchanged (legacy
+    /// accepts NULL on that column).
+    pub legacy_room_no: String,
+    /// `ht_products.prod_legacy_no` (a.k.a. `Pro_no`) — business key
+    /// of the product, lands in `Cin_Pro_id` AND drives the paired
+    /// stock-adjust `UPDATE HT_Products`.
+    pub prod_legacy_no: String,
+    /// `ht_products.prod_name` — lands in `Cin_Pro_name`.
+    pub prod_name: String,
+    /// `ht_products.prod_unit` — lands in `Cin_Pro_Unit`. Empty
+    /// string when the product has no unit (rare; defensive).
+    pub prod_unit: String,
+    /// `sale_qty` baseline (units sold).
+    pub qty: f64,
+    /// `sale_unit_price` in baht.
+    pub unit_price_baht: f64,
+    /// `sale_total` in baht (=`qty * unit_price`). Carried explicitly
+    /// so the recipe never has to re-multiply (any rounding drift
+    /// stays in PG's generated column, not in the legacy mirror).
+    pub total_baht: f64,
+    /// Operator note — lands in `Cin_Pro_note`. Empty string when
+    /// the cashier skipped the field.
+    pub note: String,
+    /// Wall-clock when the sale was rung up. Lands in `Cin_Ds_date`.
+    pub sold_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Fully-hydrated `ht_room_changes` row required by the
@@ -608,6 +655,32 @@ pub async fn dispatch(
             })?;
             recipes::coupon::execute_redeem(conn, resolved_coupon).await
         }
+        // Track G6 — POS / sales-to-room. The dispatcher hydrated
+        // `resolved.pos_sale` from PG before this point; the recipe
+        // consumes plain fields only. Missing hydration ⇒ recipe
+        // error so the job lands in the retry queue rather than
+        // silently emitting an empty INSERT.
+        WritebackIntent::RecordPosSale { check_in_id: _, sale_id } => {
+            let resolved_sale = resolved
+                .pos_sale
+                .as_ref()
+                .ok_or_else(|| {
+                    WritebackError::Recipe(format!(
+                        "RecordPosSale requires resolved.pos_sale (sale_id={sale_id})"
+                    ))
+                })?;
+            if resolved_sale.legacy_cin_no.is_empty() {
+                return Err(WritebackError::Recipe(
+                    "RecordPosSale requires legacy_cin_no on resolved.pos_sale".into(),
+                ));
+            }
+            if resolved_sale.prod_legacy_no.is_empty() {
+                return Err(WritebackError::Recipe(
+                    "RecordPosSale requires prod_legacy_no on resolved.pos_sale".into(),
+                ));
+            }
+            recipes::pos_sale::execute(conn, resolved_sale).await
+        }
     }
 }
 
@@ -689,6 +762,8 @@ mod tests {
         // Track G5 — coupon is hydrated only for the IssueCoupon /
         // RedeemCoupon intents.
         assert!(r.coupon.is_none());
+        // Track G6 — pos_sale is hydrated only for the RecordPosSale intent.
+        assert!(r.pos_sale.is_none());
     }
 
     /// Verifies all `WritebackIntent` variants have a matching `intent_name`
@@ -715,12 +790,13 @@ mod tests {
             "adjust_product_stock",
             "issue_coupon",
             "redeem_coupon",
+            "record_pos_sale",
         ];
         // We verify dispatch handles all by constructing one of each via the
         // intent name → no actual MSSQL call, just type-level coverage.
         // Counting expected variants here keeps the test cheap and
         // deterministic.
-        assert_eq!(names.len(), 14, "expected 14 WritebackIntent variants");
+        assert_eq!(names.len(), 15, "expected 15 WritebackIntent variants");
     }
 
     /// Phase 5.1 chokepoint guarantee — every recipe MUST run after

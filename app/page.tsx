@@ -6,6 +6,7 @@ import {
   AlertCircle,
   ArrowRightLeft,
   Clock,
+  Coffee,
   LogIn,
   LogOut,
   CalendarPlus,
@@ -16,6 +17,7 @@ import CheckInModal from '@/components/CheckInModal'
 import CheckOutModal from '@/components/CheckOutModal'
 import ChangeRoomModal from '@/components/ChangeRoomModal'
 import ExtendStayModal from '@/components/ExtendStayModal'
+import PosSaleModal from '@/components/PosSaleModal'
 
 // Domain-event variants that mutate the dashboard's tile counts or room grid.
 // Names match `DomainEvent::type_name()` in
@@ -139,6 +141,8 @@ export default function NewDashboard() {
   const [showExtendStay, setShowExtendStay] = useState(false)
   // Track G4 / T4 HIGH-3: change-room modal (move guest A → B).
   const [showChangeRoom, setShowChangeRoom] = useState(false)
+  // Track G6: POS / add-product modal (ring up a sale to folio).
+  const [showPosSale, setShowPosSale] = useState(false)
   // SSE connection status — drives the tiny header dot. Starts pessimistic
   // so the dot reads "reconnecting" until the EventSource fires `onopen`.
   const [isLiveConnected, setIsLiveConnected] = useState(false)
@@ -537,6 +541,16 @@ export default function NewDashboard() {
                     <ArrowRightLeft size={12} />
                     เปลี่ยนห้อง
                   </button>
+                  {/* Track G6: POS / charge product to folio. Sits next to
+                      change-room because both are "during-stay" actions. */}
+                  <button
+                    onClick={() => setShowPosSale(true)}
+                    disabled={!roomIdByNo.get(selectedRoom.roomNumber.toUpperCase())}
+                    className="w-full h-8 flex items-center justify-center gap-1.5 bg-orange-600 text-white hover:bg-orange-700 disabled:opacity-50 transition-colors text-[13px]"
+                  >
+                    <Coffee size={12} />
+                    เพิ่มรายการในบิล
+                  </button>
                   <button
                     onClick={() => setShowCheckOut(true)}
                     disabled={!roomIdByNo.get(selectedRoom.roomNumber.toUpperCase())}
@@ -609,6 +623,20 @@ export default function NewDashboard() {
           onSuccess={() => {
             fetchData()
             setSelectedRoom(null)
+          }}
+        />
+      )}
+      {showPosSale && selectedRoom && roomIdByNo.get(selectedRoom.roomNumber.toUpperCase()) && (
+        <PosSaleModal
+          room={{
+            id: roomIdByNo.get(selectedRoom.roomNumber.toUpperCase())!,
+            roomNo: selectedRoom.roomNumber,
+          }}
+          onClose={() => setShowPosSale(false)}
+          onSuccess={() => {
+            // Don't reset selectedRoom — cashiers often ring up several
+            // lines back-to-back, and the modal handles its own refresh.
+            fetchData()
           }}
         />
       )}

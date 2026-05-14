@@ -438,6 +438,10 @@ fn build_new_routes(app_state: AppState) -> Router {
         app_middleware::require_permission("coupon.issue", app_state.clone());
     let perm_coupon_redeem =
         app_middleware::require_permission("coupon.redeem", app_state.clone());
+    // Track G6 — POS / sales-to-room route gate. Admin + cashier
+    // hold the grant (migration 052 seeds the role grid).
+    let perm_pos_sell =
+        app_middleware::require_permission("pos.sell", app_state.clone());
 
     Router::new()
         // Rooms routes (PG-only, Phase 8 — reads `ht_rooms_legacy` mirror)
@@ -497,6 +501,18 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route(
             "/api/new/checkins/{id}/change-room",
             post(routes::new_checkins::change_room),
+        )
+        // Track G6 — POS / sales-to-room (MVP). Ring up a product line
+        // against an active folio. Gated on `pos.sell` (cashier + admin).
+        .route(
+            "/api/new/checkins/{id}/pos-sale",
+            post(routes::new_checkins::create_pos_sale).route_layer(perm_pos_sell),
+        )
+        // GET stays ungated — receptionists need to see the running tab
+        // even when they can't ring up new sales.
+        .route(
+            "/api/new/checkins/{id}/pos-sales",
+            get(routes::new_checkins::list_pos_sales),
         )
         // Guest registry
         .route("/api/new/checkins/{id}/guests", get(routes::new_checkins::list_guests).post(routes::new_checkins::create_guest))

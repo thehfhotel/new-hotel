@@ -841,6 +841,225 @@ fn map_change_room_error(err: ServiceError) -> ApiError {
 }
 
 // =============================================================================
+// POS / sales-to-room endpoints — Track G6 (MVP)
+// =============================================================================
+
+/// Request body for `POST /api/new/checkins/:id/pos-sale`.
+///
+/// Track G6. The cashier picks a product from F3's catalog
+/// (`ht_products`) and rings up `qty` units against the active
+/// folio. `unit_price_override` is optional — pass `null` to use the
+/// catalog price; pass a non-NULL value to override (e.g. happy-hour
+/// pricing). `note` is an optional free-text annotation captured in
+/// `ht_pos_sales.sale_note` and propagated to legacy
+/// `HT_CheckIn_Product.Cin_Pro_note`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PosSaleRequest {
+    pub product_id: i64,
+    pub qty: f64,
+    #[serde(default)]
+    pub unit_price_override: Option<f64>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// Response for `POST /api/new/checkins/:id/pos-sale`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PosSaleResponse {
+    pub success: bool,
+    pub message: String,
+    pub sale_id: i64,
+    pub aggregate_id: Uuid,
+    pub check_in_id: i32,
+    pub product_id: i64,
+    pub qty: f64,
+    pub unit_price_baht: f64,
+    pub total_baht: f64,
+    pub sold_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Single POS sale row surfaced by
+/// `GET /api/new/checkins/:id/pos-sales`. Joined with `ht_products`
+/// so the receptionist UI doesn't need a second round-trip to render
+/// product name / unit.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PosSaleEntry {
+    pub sale_id: i64,
+    pub product_id: i64,
+    pub product_legacy_no: String,
+    pub product_name: String,
+    pub product_unit: Option<String>,
+    pub qty: f64,
+    pub unit_price_baht: f64,
+    pub total_baht: f64,
+    pub note: Option<String>,
+    pub status: String,
+    pub source: String,
+    pub sold_at: chrono::DateTime<chrono::Utc>,
+    pub sold_by: Option<String>,
+    pub legacy_id: Option<i32>,
+    pub aggregate_id: Uuid,
+}
+
+/// Response envelope for the per-folio sales list.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PosSalesListResponse {
+    pub success: bool,
+    pub data: Vec<PosSaleEntry>,
+    pub total: i32,
+    pub grand_total_baht: f64,
+}
+
+/// `POST /api/new/checkins/:id/pos-sale` — ring up one POS line.
+///
+/// Track G6 (MVP). Delegates the full validation + PG transaction +
+/// outbox enqueue to [`crate::service::PosService::record_sale`].
+pub async fn create_pos_sale(
+    State(state): State<AppState>,
+    Path(cin_id): Path<i32>,
+    Json(body): Json<PosSaleRequest>,
+) -> ApiResult<Json<PosSaleResponse>> {
+    let command = build_pos_sale_command(cin_id, &body);
+    let outcome = state
+        .pos_service
+        .record_sale(command)
+        .await
+        .map_err(map_pos_sale_error)?;
+    Ok(Json(build_pos_sale_response(&outcome)))
+}
+
+/// `GET /api/new/checkins/:id/pos-sales` — list the folio's POS sales.
+///
+/// Read path — no service method; we stay on the repository pattern.
+/// Ordered most-recent first because the cashier UI shows the
+/// running tab in reverse-chronological order.
+pub async fn list_pos_sales(
+    State(state): State<AppState>,
+    Path(cin_id): Path<i32>,
+) -> ApiResult<Json<PosSalesListResponse>> {
+    if !state.checkins.exists(&state.new_pool, cin_id).await? {
+        return Err(ApiError::NotFound(format!("check-in {cin_id} not found")));
+    }
+    let rows = sqlx::query(
+        "SELECT s.sale_id, s.sale_product_id, s.sale_qty::float8 AS qty, \
+                s.sale_unit_price::float8 AS unit_price, \
+                s.sale_total::float8 AS total, s.sale_note, \
+                s.sale_status, s.source, s.sale_sold_at, s.sale_sold_by, \
+                s.sale_legacy_id, s.aggregate_id, \
+                p.prod_legacy_no, p.prod_name, p.prod_unit \
+           FROM ht_pos_sales s \
+           JOIN ht_products  p ON p.prod_id = s.sale_product_id \
+          WHERE s.sale_cin_id = $1 \
+       ORDER BY s.sale_sold_at DESC, s.sale_id DESC",
+    )
+    .bind(cin_id)
+    .fetch_all(&state.new_pool)
+    .await?;
+
+    let entries: Vec<PosSaleEntry> = rows
+        .into_iter()
+        .map(|row| {
+            use sqlx::Row;
+            PosSaleEntry {
+                sale_id: row.try_get::<i64, _>("sale_id").unwrap_or(0),
+                product_id: row.try_get::<i64, _>("sale_product_id").unwrap_or(0),
+                product_legacy_no: row
+                    .try_get::<String, _>("prod_legacy_no")
+                    .unwrap_or_default(),
+                product_name: row.try_get::<String, _>("prod_name").unwrap_or_default(),
+                product_unit: row.try_get::<Option<String>, _>("prod_unit").unwrap_or(None),
+                qty: row.try_get::<f64, _>("qty").unwrap_or(0.0),
+                unit_price_baht: row.try_get::<f64, _>("unit_price").unwrap_or(0.0),
+                total_baht: row.try_get::<f64, _>("total").unwrap_or(0.0),
+                note: row.try_get::<Option<String>, _>("sale_note").unwrap_or(None),
+                status: row.try_get::<String, _>("sale_status").unwrap_or_default(),
+                source: row.try_get::<String, _>("source").unwrap_or_default(),
+                sold_at: row
+                    .try_get::<chrono::DateTime<chrono::Utc>, _>("sale_sold_at")
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+                sold_by: row
+                    .try_get::<Option<String>, _>("sale_sold_by")
+                    .unwrap_or(None),
+                legacy_id: row
+                    .try_get::<Option<i32>, _>("sale_legacy_id")
+                    .unwrap_or(None),
+                aggregate_id: row
+                    .try_get::<Uuid, _>("aggregate_id")
+                    .unwrap_or_else(|_| Uuid::nil()),
+            }
+        })
+        .collect();
+
+    let grand_total_baht = entries
+        .iter()
+        .filter(|e| e.status == "posted")
+        .map(|e| e.total_baht)
+        .sum();
+    let total = i32::try_from(entries.len()).unwrap_or(i32::MAX);
+    Ok(Json(PosSalesListResponse {
+        success: true,
+        data: entries,
+        total,
+        grand_total_baht,
+    }))
+}
+
+/// PURE — translate path id + body into a service command. Module-
+/// scoped so unit tests can pin the contract without building
+/// `AppState`.
+pub(crate) fn build_pos_sale_command(
+    cin_id: i32,
+    body: &PosSaleRequest,
+) -> crate::service::RecordSaleCommand {
+    crate::service::RecordSaleCommand {
+        check_in_id: cin_id,
+        product_id: body.product_id,
+        qty: body.qty,
+        unit_price_override_baht: body.unit_price_override,
+        note: body.note.clone(),
+        // TODO: wire operator from auth middleware once Phase 4 PR3
+        //       threads the session into request extensions. Empty
+        //       string is the canonical "unknown" sentinel (mirrors
+        //       `change_room` / walkin convention).
+        actor: String::new(),
+    }
+}
+
+/// PURE — translate service outcome to HTTP response body.
+pub(crate) fn build_pos_sale_response(
+    outcome: &crate::service::RecordSaleOutcome,
+) -> PosSaleResponse {
+    PosSaleResponse {
+        success: true,
+        message: "Sale recorded".to_string(),
+        sale_id: outcome.sale_id,
+        aggregate_id: outcome.aggregate_id,
+        check_in_id: outcome.check_in_id,
+        product_id: outcome.product_id,
+        qty: outcome.qty,
+        unit_price_baht: outcome.unit_price_baht,
+        total_baht: outcome.total_baht,
+        sold_at: outcome.sold_at,
+    }
+}
+
+/// Translate service outcomes to HTTP. Validation + Conflict surface
+/// as 400 with explicit wording so the cashier UI can show
+/// receptionists what went wrong (`product not active`, `check-in
+/// not active`, `qty must be positive`, etc.).
+fn map_pos_sale_error(err: ServiceError) -> ApiError {
+    match err {
+        ServiceError::Conflict(msg) => ApiError::BadRequest(msg),
+        ServiceError::Validation(msg) => ApiError::BadRequest(msg),
+        other => other.into(),
+    }
+}
+
+// =============================================================================
 // Guest Registry Types and Endpoints
 //
 // Stays on the repository: no service method exists yet for guest registry

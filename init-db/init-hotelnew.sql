@@ -1911,5 +1911,68 @@ VALUES ('051', '051_create_ht_coupons.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================
+-- Migration 052: Track G6 — ht_pos_sales canonical (mirror of HT_CheckIn_Product)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS ht_pos_sales (
+    sale_id          BIGSERIAL    PRIMARY KEY,
+    sale_cin_id      INTEGER      NOT NULL REFERENCES ht_checkins(cin_id) ON DELETE CASCADE,
+    sale_product_id  BIGINT       NOT NULL REFERENCES ht_products(prod_id),
+    sale_qty         NUMERIC(10, 3) NOT NULL CHECK (sale_qty > 0),
+    sale_unit_price  NUMERIC(12, 2) NOT NULL CHECK (sale_unit_price >= 0),
+    -- Total is materialized inside the row: row is durable evidence of
+    -- the sale at the moment it was posted (qty × unit_price), even if
+    -- the catalog price drifts later.
+    sale_total       NUMERIC(14, 2) GENERATED ALWAYS AS (sale_qty * sale_unit_price) STORED,
+    sale_sold_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    sale_sold_by     VARCHAR(64),
+    sale_note        VARCHAR(500),
+    sale_status      VARCHAR(20)  NOT NULL DEFAULT 'posted',
+    sale_legacy_id   INTEGER,
+    source           VARCHAR(20)  NOT NULL DEFAULT 'canonical',
+    aggregate_id     UUID         NOT NULL,
+    created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CONSTRAINT ht_pos_sales_status_check
+        CHECK (sale_status IN ('posted', 'voided')),
+    CONSTRAINT ht_pos_sales_source_check
+        CHECK (source IN ('canonical', 'legacy'))
+);
+
+CREATE INDEX IF NOT EXISTS ht_pos_sales_cin_id_idx
+    ON ht_pos_sales (sale_cin_id);
+
+CREATE INDEX IF NOT EXISTS ht_pos_sales_product_id_idx
+    ON ht_pos_sales (sale_product_id);
+
+CREATE INDEX IF NOT EXISTS ht_pos_sales_sold_at_idx
+    ON ht_pos_sales (sale_sold_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ht_pos_sales_legacy_id_uq
+    ON ht_pos_sales (sale_legacy_id) WHERE sale_legacy_id IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS ht_pos_sales_aggregate_id_uq
+    ON ht_pos_sales (aggregate_id);
+
+-- Track G6 permission seed (mirror migration 052).
+INSERT INTO ht_permissions (permission_key, description)
+VALUES (
+    'pos.sell',
+    'Ring up a POS sale and charge it to a check-in folio (Track G6)'
+)
+ON CONFLICT (permission_key) DO NOTHING;
+
+INSERT INTO ht_role_permissions (role_id, permission_id)
+SELECT r.role_id, p.permission_id
+FROM ht_roles r
+JOIN ht_permissions p ON p.permission_key = 'pos.sell'
+WHERE r.role_key IN ('admin', 'cashier')
+ON CONFLICT (role_id, permission_id) DO NOTHING;
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('052', '052_create_ht_pos_sales.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
 -- Initialization complete
 -- =============================================================================
