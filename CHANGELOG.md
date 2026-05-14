@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v2.65.2] - 2026-05-14 (Reconcile alert hygiene)
+
+### Changed
+
+- **Reconcile alert hygiene — exclude pre-Track-D rows; auto-resolve
+  converged drift.** Both the edge-triggered drift alert
+  (`check_drift_and_alert`) and the level-triggered digest
+  (`check_level_drift_and_alert`) now filter `ht_reconcile_log` by
+  `divergence_kind IS NOT NULL`, so rows written before migration 032
+  (which lacked the classification column) no longer contribute to
+  threshold counts. Adds a periodic `auto_resolve_reconcile_log`
+  sweep — invoked once per reconcile tick in `run_sync`, before both
+  alert queries — that re-computes the canonical PG hash for each
+  unresolved row via `compute_current_pg_hash` (dispatches on
+  `table_name` to `customer_canonical_hash` / `booking_canonical_hash`
+  / `checkin_canonical_hash`) and stamps `resolved_at = NOW()` when
+  it matches the recorded MSSQL hash. Bounded to 500 rows per tick.
+  Two unit tests pin the pure decision helper (`should_auto_resolve`)
+  on the match / drift-persists truth table.
+
 ## [v2.65.1] - 2026-05-14 (Hotfix CI)
 
 ### Fixed
