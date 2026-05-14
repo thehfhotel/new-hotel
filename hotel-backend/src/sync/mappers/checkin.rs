@@ -859,10 +859,15 @@ fn project_rooms(rooms: &[HashMapRow]) -> Result<Vec<CanonicalRoom>, SyncError> 
         // schema dump §3.4) — keep verbatim.
         let cr_nights = optional_i32(r, "Cin_Room_Night").unwrap_or(1);
         let cr_room_total = optional_decimal(r, "Cin_Room_PriceToTal").unwrap_or(0.0);
-        let cr_dep_amount = optional_decimal(r, "Cin_dep").unwrap_or(0.0);
-        let cr_dep_status = optional_str(r, "Cin_dep_status");
-        let cr_dep_returned_at = optional_datetime(r, "Cin_dep_returned");
-        let cr_dep_returned_by = optional_str(r, "Cin_dep_returned_by");
+        // Legacy column names per the authoritative schema dump
+        // (`docs/legacy-spike/schema/01-baseline-schema.txt` cols 8 /
+        // 15 / 18 / 19). The lowercase-`dep` spelling does not exist
+        // on HF Hotel — keep these verbatim (`parent_loader::
+        // load_checkin_aggregate` writes them under these keys).
+        let cr_dep_amount = optional_decimal(r, "Cin_Room_Dep").unwrap_or(0.0);
+        let cr_dep_status = optional_str(r, "Cin_Dep_Status");
+        let cr_dep_returned_at = optional_datetime(r, "Cin_Dep_return_date");
+        let cr_dep_returned_by = optional_str(r, "Cin_Dep_return_by");
         let cr_legacy_ds_id = optional_i32(r, "id");
 
         out.push(CanonicalRoom {
@@ -1558,10 +1563,10 @@ mod tests {
             .with("Cin_Room_Price", MockValue::Decimal(890.0))
             .with("Cin_Room_Night", MockValue::I32(1))
             .with("Cin_Room_PriceToTal", MockValue::Decimal(890.0))
-            .with("Cin_dep", MockValue::Decimal(0.0))
-            .with("Cin_dep_status", MockValue::Null)
-            .with("Cin_dep_returned", MockValue::Null)
-            .with("Cin_dep_returned_by", MockValue::Null)
+            .with("Cin_Room_Dep", MockValue::Decimal(0.0))
+            .with("Cin_Dep_Status", MockValue::Null)
+            .with("Cin_Dep_return_date", MockValue::Null)
+            .with("Cin_Dep_return_by", MockValue::Null)
             .with("Cin_Room_In", MockValue::Null)
     }
 

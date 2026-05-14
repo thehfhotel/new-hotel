@@ -192,6 +192,30 @@ pub async fn load_booking_aggregate(
     })
 }
 
+/// `HT_CheckIn_Ds` projection used by `load_checkin_aggregate`.
+///
+/// Held as a module-private const so a unit test can lock the column
+/// names against the authoritative HF Hotel schema dump without needing
+/// a live MSSQL connection. See the comment on the projection's caller
+/// for the schema-dump cross-reference and the PROD-CRIT post-mortem.
+const CHECKIN_DS_PROJECTION: &[&str] = &[
+    "id",
+    "Cin_No",
+    "Cin_Room_No",
+    "Cin_Room_Type",
+    "Cin_Room_In",
+    "Cin_Room_Out",
+    "Cin_Room_Status",
+    "Cin_Room_Price",
+    "Cin_Room_Night",
+    "Cin_Room_PriceToTal",
+    "Cin_Room_Pay_Total",
+    "Cin_Room_Dep",
+    "Cin_Dep_Status",
+    "Cin_Dep_return_date",
+    "Cin_Dep_return_by",
+];
+
 /// Pull `HT_CheckIn_H` + all `HT_CheckIn_Ds` rows + all `HT_CheckIn_Pay`
 /// rows for one check-in by `Cin_no`.
 ///
@@ -243,27 +267,24 @@ pub async fn load_checkin_aggregate(
         // sync/mappers/checkin.rs guards against accidental rename.
         "Cin_No",
         cin_no,
-        // Track B2 / T2 CRIT-1 — deposit columns added so the per-room
-        // junction projection (`sync::mappers::checkin::project_rooms`)
-        // can mirror `Cin_dep`, `Cin_dep_status`, `Cin_dep_returned`,
-        // `Cin_dep_returned_by` into `ht_checkin_rooms.cr_dep_*`.
-        &[
-            "id",
-            "Cin_No",
-            "Cin_Room_No",
-            "Cin_Room_Type",
-            "Cin_Room_In",
-            "Cin_Room_Out",
-            "Cin_Room_Status",
-            "Cin_Room_Price",
-            "Cin_Room_Night",
-            "Cin_Room_PriceToTal",
-            "Cin_Room_Pay_Total",
-            "Cin_dep",
-            "Cin_dep_status",
-            "Cin_dep_returned",
-            "Cin_dep_returned_by",
-        ],
+        // Track B2 / T2 CRIT-1 — deposit columns mirrored into
+        // `ht_checkin_rooms.cr_dep_*` by `sync::mappers::checkin::
+        // project_rooms`. Legacy column names per the authoritative
+        // schema dump (`docs/legacy-spike/schema/01-baseline-schema.txt`
+        // lines 215, 222, 225, 226) and `writeback::fingerprint`
+        // SCHEMA_COLUMNS lines 192/199/202/203:
+        //   `Cin_Room_Dep`        (float,    col 8)
+        //   `Cin_Dep_Status`      (varchar,  col 15)
+        //   `Cin_Dep_return_date` (datetime, col 18)
+        //   `Cin_Dep_return_by`   (varchar,  col 19)
+        // PROD-CRIT: an earlier revision of this projection used the
+        // names `Cin_dep` / `Cin_dep_status` / `Cin_dep_returned` /
+        // `Cin_dep_returned_by`, none of which exist on the HF Hotel
+        // legacy schema. tiberius returned `Invalid column name` and
+        // every check-in CT row silently dropped on the floor (the
+        // watcher tolerates row-shape errors and advances watermark).
+        // Locked by `tests::checkin_ds_projection_names_match_legacy_schema`.
+        CHECKIN_DS_PROJECTION,
         // Track B2 / T2 HIGH-1 (audit 2026-05-13) — deterministic
         // iteration order. Without this, `first_room_no` flipped
         // non-deterministically across CT ticks; the room-set diff in
@@ -473,5 +494,83 @@ mod tests {
             payments: vec![HashMapRow::new("HT_CheckIn_Pay")],
         };
         assert!(!agg.is_present());
+    }
+
+    /// PROD-CRIT regression guard. Every column the
+    /// `HT_CheckIn_Ds` projection asks tiberius to materialise MUST
+    /// exist on the HF Hotel legacy schema; otherwise the SELECT
+    /// aborts with `Invalid column name`, the watcher tolerates the
+    /// error, advances watermark, and silently drops every check-in
+    /// CT row.
+    ///
+    /// The whitelist below is the verbatim column list from
+    /// `docs/legacy-spike/schema/01-baseline-schema.txt` rows 208-226
+    /// (table `HT_CheckIn_Ds`, columns 1-19) — the authoritative
+    /// `INFORMATION_SCHEMA.COLUMNS` dump captured against the live
+    /// HF Hotel database during the legacy spike. Any new entry in
+    /// `CHECKIN_DS_PROJECTION` that is NOT in the whitelist fails
+    /// this test at compile-time-of-test-run (well before reaching
+    /// production).
+    ///
+    /// To intentionally widen the projection: add the column to the
+    /// whitelist AFTER verifying via `01-baseline-schema.txt` (or a
+    /// fresh `INFORMATION_SCHEMA.COLUMNS` query against legacy
+    /// MSSQL) that the column truly exists.
+    #[test]
+    fn checkin_ds_projection_names_match_legacy_schema() {
+        let legacy_columns: &[&str] = &[
+            "id",
+            "Cin_No",
+            "Cin_Room_No",
+            "Cin_Room_Type",
+            "Cin_Room_In",
+            "Cin_Room_Out",
+            "Cin_Room_Status",
+            "Cin_Room_Dep",
+            "Cin_Room_Price",
+            "Cin_Room_Night",
+            "Cin_Room_PriceToTal",
+            "Cin_Room_Pay_Before",
+            "Cin_Room_Pay_Total",
+            "Cin_note",
+            "Cin_Dep_Status",
+            "Dep_by",
+            "Cin_cupon",
+            "Cin_Dep_return_date",
+            "Cin_Dep_return_by",
+        ];
+        for col in CHECKIN_DS_PROJECTION {
+            assert!(
+                legacy_columns.contains(col),
+                "projection column `{col}` is not on the HF Hotel \
+                 legacy `HT_CheckIn_Ds` schema — see \
+                 docs/legacy-spike/schema/01-baseline-schema.txt rows \
+                 208-226. Adding a nonexistent column makes the entire \
+                 SELECT fail with `Invalid column name` and silently \
+                 drops every check-in CT row."
+            );
+        }
+    }
+
+    /// The four deposit columns added by Track B2 must be present in
+    /// the projection — if anyone removes them the canonical
+    /// `ht_checkin_rooms.cr_dep_*` columns stop updating. Pairs with
+    /// the schema-name lock above so the projection can be neither
+    /// "renamed to a bogus name" nor "silently shrunk".
+    #[test]
+    fn checkin_ds_projection_carries_deposit_columns() {
+        for required in [
+            "Cin_Room_Dep",
+            "Cin_Dep_Status",
+            "Cin_Dep_return_date",
+            "Cin_Dep_return_by",
+        ] {
+            assert!(
+                CHECKIN_DS_PROJECTION.contains(&required),
+                "deposit column `{required}` missing from \
+                 CHECKIN_DS_PROJECTION — Track B2 / T2 CRIT-1 \
+                 `ht_checkin_rooms.cr_dep_*` mapping will break."
+            );
+        }
     }
 }

@@ -115,10 +115,10 @@ fn ds_row(cin_no: &str, room_no: &str, ds_id: i32) -> HashMapRow {
         .with("Cin_Room_Price", MockValue::Decimal(890.0))
         .with("Cin_Room_Night", MockValue::I32(1))
         .with("Cin_Room_PriceToTal", MockValue::Decimal(890.0))
-        .with("Cin_dep", MockValue::Decimal(0.0))
-        .with("Cin_dep_status", MockValue::Null)
-        .with("Cin_dep_returned", MockValue::Null)
-        .with("Cin_dep_returned_by", MockValue::Null)
+        .with("Cin_Room_Dep", MockValue::Decimal(0.0))
+        .with("Cin_Dep_Status", MockValue::Null)
+        .with("Cin_Dep_return_date", MockValue::Null)
+        .with("Cin_Dep_return_by", MockValue::Null)
 }
 
 /// Fixture handle returned by `seed_pre_b2_two_room_folio` — carries
