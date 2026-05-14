@@ -573,4 +573,18 @@ mod tests {
         let p = project_receipt(&row).unwrap();
         assert_eq!(p.status_name.as_deref(), Some("ยกเลิก"));
     }
+
+    // -------------------------------------------------------------------
+    // Track J1 — projection-lock guards.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn payment_select_cols_are_subset_of_legacy_schema() {
+        crate::assert_projection_subset!(PAYMENT_SELECT_COLS, "HT_CheckIn_Pay");
+    }
+
+    #[test]
+    fn receipt_select_cols_are_subset_of_legacy_schema() {
+        crate::assert_projection_subset!(RECEIPT_SELECT_COLS, "HT_Receipt_H");
+    }
 }

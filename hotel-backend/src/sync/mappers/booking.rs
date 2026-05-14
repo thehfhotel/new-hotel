@@ -1131,4 +1131,31 @@ mod tests {
         assert!(keys.contains("R014810"));
         assert!(keys.contains("R014811"));
     }
+
+    // -------------------------------------------------------------------
+    // Track J1 — projection-lock guards.
+    //
+    // tiberius does not validate column names at compile time. A typo'd
+    // `SELECT t.<col>` aborts the CT JOIN with `Invalid column name`,
+    // and the watcher tolerates the error + advances watermark, silently
+    // dropping every booking CT row until someone notices in prod (see
+    // PR #90 H1 hotfix for the symmetric `HT_CheckIn_Ds` incident on
+    // 2026-05-14). These three lock tests pin each booking projection
+    // const against the authoritative HF Hotel schema dump.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn book_h_select_cols_are_subset_of_legacy_schema() {
+        crate::assert_projection_subset!(BOOK_H_SELECT_COLS, "HT_Book_H");
+    }
+
+    #[test]
+    fn book_ds_select_cols_are_subset_of_legacy_schema() {
+        crate::assert_projection_subset!(BOOK_DS_SELECT_COLS, "HT_Book_Ds");
+    }
+
+    #[test]
+    fn book_date_select_cols_are_subset_of_legacy_schema() {
+        crate::assert_projection_subset!(BOOK_DATE_SELECT_COLS, "HT_Book_Date");
+    }
 }

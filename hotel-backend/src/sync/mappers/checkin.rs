@@ -2301,4 +2301,24 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert!(keys.contains("CH26-005228"));
     }
+
+    // -------------------------------------------------------------------
+    // Track J1 — projection-lock guards.
+    //
+    // The exact class of bug that drove PR #90 (`HT_CheckIn_Ds` typo →
+    // nine-hour silent drop of every check-in CT row). The check-in
+    // *aggregate* projection in `parent_loader::CHECKIN_DS_PROJECTION`
+    // already has its own lock test there; these two guards cover the
+    // *CT mapper* SELECT projections (the JOIN against CHANGETABLE).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn checkin_h_select_cols_are_subset_of_legacy_schema() {
+        crate::assert_projection_subset!(CHECKIN_H_SELECT_COLS, "HT_CheckIn_H");
+    }
+
+    #[test]
+    fn checkin_ds_select_cols_are_subset_of_legacy_schema() {
+        crate::assert_projection_subset!(CHECKIN_DS_SELECT_COLS, "HT_CheckIn_Ds");
+    }
 }

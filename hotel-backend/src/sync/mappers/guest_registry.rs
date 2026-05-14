@@ -61,6 +61,14 @@ use crate::sync::SyncError;
 
 const TABLE: &str = "HT_CheckIn_Other_People";
 
+/// CT JOIN projection. Lowercase `Cin_no` per the live schema (NOT
+/// `Cin_No` — the capital-N variant is `HT_CheckIn_Ds`'s column).
+/// Preserve the iHOTEL typo `Cin_contry` verbatim.
+///
+/// Held as a module-private const so Track J1's projection-lock test
+/// can pin every column against the baseline schema dump.
+const GUEST_REGISTRY_SELECT_COLS: &str = "t.id, t.Cin_no, t.Cin_name, t.Cin_contry";
+
 pub struct GuestRegistryMapper;
 
 #[async_trait]
@@ -77,10 +85,7 @@ impl MssqlChangeMapper for GuestRegistryMapper {
     }
 
     fn select_sql(&self) -> &'static str {
-        // Lowercase `Cin_no` per the live schema (NOT `Cin_No` — the
-        // capital-N variant is `HT_CheckIn_Ds`'s column). Preserve the
-        // iHOTEL typo `Cin_contry` verbatim.
-        "t.id, t.Cin_no, t.Cin_name, t.Cin_contry"
+        GUEST_REGISTRY_SELECT_COLS
     }
 
     async fn apply(
@@ -234,5 +239,14 @@ mod tests {
         let m = GuestRegistryMapper;
         let row = HashMapRow::new(TABLE);
         assert!(m.coalesce_key(&row).is_none());
+    }
+
+    /// Track J1 — projection-lock guard.
+    #[test]
+    fn guest_registry_select_cols_are_subset_of_legacy_schema() {
+        crate::assert_projection_subset!(
+            GUEST_REGISTRY_SELECT_COLS,
+            "HT_CheckIn_Other_People"
+        );
     }
 }

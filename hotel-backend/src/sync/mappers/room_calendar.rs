@@ -515,4 +515,14 @@ mod tests {
             );
         }
     }
+
+    /// Track J1 — projection-lock guard. The room-calendar CT mapper
+    /// reads from the same `HT_Room_Status` legacy table as the
+    /// retired `RoomStatusMapper`, but projects a wider column set
+    /// (room_date / room_Details). Lock against the baseline so a
+    /// rename of any of those columns trips at CI time.
+    #[test]
+    fn room_calendar_select_cols_are_subset_of_legacy_schema() {
+        crate::assert_projection_subset!(SELECT_COLS, "HT_Room_Status");
+    }
 }
