@@ -1801,7 +1801,6 @@ async fn back_populate_legacy_ids(
                 .await?;
             }
         }
-<<<<<<< Updated upstream
         // Track G6 — RecordPosSale back-populates the freshly-
         // allocated `HT_CheckIn_Product.id` onto
         // `ht_pos_sales.sale_legacy_id` so the reverse-sync mapper
@@ -1847,8 +1846,6 @@ async fn back_populate_legacy_ids(
                 .await?;
             }
         }
-=======
->>>>>>> Stashed changes
     }
     Ok(())
 }
