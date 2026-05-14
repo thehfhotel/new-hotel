@@ -1,4 +1,6 @@
 # Changelog
+<!-- This CHANGELOG is auto-maintained by release-please from v2.67+.
+     Earlier entries (v2.66.x and below) were written manually. -->
 
 All notable changes to this project will be documented in this file.
 

@@ -18,29 +18,13 @@ Summary:
 
 ## Versioning & Changelog Policy
 
-**MANDATORY**: When making changes to this project, Claude MUST:
+**As of v2.67+, versioning is automated via release-please.**
 
-1. **Update CHANGELOG.md** for every significant change:
-   - New features go under `### Added`
-   - Bug fixes go under `### Fixed`
-   - Changes to existing features go under `### Changed`
-   - Removed features go under `### Removed`
-   - Security fixes go under `### Security`
-   - Deprecations go under `### Deprecated`
-
-2. **Version Bumping** (in package.json):
-   - MAJOR version (x.0.0): Breaking changes or major new features
-   - MINOR version (0.x.0): New features, backward compatible
-   - PATCH version (0.0.x): Bug fixes, minor improvements
-
-3. **Commit Messages**: Use conventional commits format:
-   - `feat:` for new features
-   - `fix:` for bug fixes
-   - `docs:` for documentation
-   - `style:` for formatting changes
-   - `refactor:` for code refactoring
-   - `test:` for adding tests
-   - `chore:` for maintenance tasks
+1. **DO NOT edit CHANGELOG.md or package.json in feature PRs.** release-please reads conventional commits and auto-aggregates into a Release PR.
+2. **Conventional commit message** is now the load-bearing artifact. Format: `<type>(<scope>): <description>`. Types that surface in changelog: `feat:` → Added, `fix:` → Fixed, `perf:`/`refactor:` → Changed. Hidden types: `chore:`, `docs:`, `test:`, `style:`, `build:`, `ci:`.
+3. **Breaking changes**: add `!` (e.g., `feat!:`) or include `BREAKING CHANGE:` in body. Triggers MAJOR bump.
+4. **Release flow**: release-please opens a "chore(main): release X.Y.Z" PR on every push to master. Merging that PR bumps the version + writes CHANGELOG + creates a git tag.
+5. **First-time bootstrap**: the existing manually-edited CHANGELOG entries through v2.66.4 remain. release-please picks up from there.
 
 ## Deployment Policy
 
