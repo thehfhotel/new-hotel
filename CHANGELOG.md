@@ -5,6 +5,64 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [vNext] - 2026-05-14 (Track B4)
+
+### Fixed
+
+- **Track B4 — Writeback per-room apportionment (`audit-2026-05-13.md`
+  T2 CRIT-1, closes the multi-room blind spot).** The writeback-side
+  counterpart to Track B2 (sync mapper) and Track B3 (dashboard reads).
+  Until B4, every check-in writeback emitted exactly one `HT_CheckIn_Ds`
+  row using the deprecated header-level `ht_checkins.cin_room_id` —
+  meaning a multi-room folio surfaced in the legacy iHOTEL display as a
+  single room, with rooms 2..N never appearing on the legacy side at
+  all.
+  - **`outbox::intent::CreateCheckInPayload`** grew a
+    `room_lines: Vec<RoomLine>` field (serde default = empty Vec for
+    back-compat — pre-B4 queue rows deserialize cleanly and fall back
+    to the legacy single-room path). Each `RoomLine` carries one
+    junction row's `room_no`, `room_type`, `price_per_night`, `nights`,
+    `room_total`, `room_status` (Thai literal verbatim), and optional
+    `legacy_ds_id` for the edit path.
+  - **`writeback::recipes::walkin::build_statements`** (§3a) and
+    **`writeback::recipes::checkin_to_booking::build_statements`** (§3d)
+    iterate the slice and emit one `HT_CheckIn_Ds` INSERT, one
+    `HT_POWER_LOG` INSERT, one `update HT_Rooms set room_use='yes'`, and
+    N×`HT_Room_Status` rows per room. The header (`HT_CheckIn_H`) stays
+    single — `Cin_Room_ALL` concatenates every room number with the
+    legacy trailing-space pattern (`'508 509 '`).
+  - **Race-safe sequential id allocation** — `execute()` acquires the
+    FIRST `HT_CheckIn_Ds.id` under TABLOCKX+HOLDLOCK and uses
+    `base + room_idx` for the rest. The single lock acquisition keeps
+    the spike §6 proof intact: the lock is held until commit, so the
+    tail ids are guaranteed reserved before any concurrent writer can
+    read `MAX+1`.
+  - **`writeback::dispatcher::LegacyIds`** grew
+    `checkin_ds_ids_by_room: Vec<(String, i32)>` so the worker can
+    back-populate `ht_checkin_rooms.cr_legacy_ds_id` per junction row
+    after a successful write. Single-room consumers continue to read the
+    flat `checkin_ds_id` field.
+  - **`bin/writeback::back_populate_legacy_ids`** stamps each
+    `(room_no, ds_id)` pair onto the matching junction row via
+    `UPDATE ht_checkin_rooms cr SET cr_legacy_ds_id=$3 FROM ht_checkins
+    c, ht_rooms_new r WHERE cr.cr_cin_id = c.cin_id AND cr.cr_room_id =
+    r.room_id AND c.aggregate_id = $1 AND r.room_no = $2`.
+  - **Test coverage** — `tests/test_walkin3_multiroom_fixture.rs`
+    un-ignored the long-standing
+    `two_room_walkin_emits_two_checkin_ds_rows_and_one_header` blocker
+    and added `room_lines_drop_rooms_reduces_checkin_ds_emission`
+    (3-room → 2-room edit path) plus
+    `per_room_thai_status_literal_passes_through_verbatim` (Thai byte
+    parity for `Cin_Room_Status`). All 4 fixture tests pass; the
+    pre-existing 256-test writeback unit suite stays green
+    (byte-identical single-room emission preserved).
+  - **Out-of-scope follow-ons.** Track B5 (one-shot backfill bin for
+    existing folios) lands next so the `ht_checkin_rooms` junction
+    fully reflects the legacy state before `ht_checkins.cin_room_id`
+    is dropped. The service layer continues to enqueue an empty
+    `room_lines` until the multi-room walk-in route (T4 HIGH-1) lands
+    — single-room flows are byte-identical pre-B4 vs post-B4.
+
 ## [vNext] - 2026-05-13 (Track B5)
 
 ### Added

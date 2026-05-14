@@ -50,7 +50,20 @@ pub struct LegacyIds {
     /// `int NOT NULL, default=NULL`) — the recipe allocates it via
     /// `allocate_checkin_ds_id` (TABLOCKX MAX+1) and propagates that
     /// value here, so no wire-scope SCOPE_IDENTITY capture is needed.
+    ///
+    /// Multi-room (Track B4): when the recipe emits N `HT_CheckIn_Ds`
+    /// rows this carries the FIRST room's id (back-compat with single-
+    /// room consumers — ExtendStay still targets one Ds row). The full
+    /// `room_no → ds_id` mapping is in `checkin_ds_ids_by_room` below.
     pub checkin_ds_id: Option<i32>,
+    /// Track B4 — per-room `HT_CheckIn_Ds.id` mapping for multi-room
+    /// folios. Each entry is `(room_no, ds_id)`. Empty for single-room
+    /// folios (the legacy single-row behavior — `checkin_ds_id` above
+    /// is sufficient). The worker uses this to back-populate
+    /// `ht_checkin_rooms.cr_legacy_ds_id` per junction row so the next
+    /// edit/extend/cancel writeback can target the correct legacy row.
+    #[serde(default)]
+    pub checkin_ds_ids_by_room: Vec<(String, i32)>,
     /// Free-form extras (e.g. `HT_Rooms_Cancel.id`).
     #[serde(default)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -87,6 +100,14 @@ impl LegacyIds {
     }
     pub fn with_checkin_ds_id(mut self, id: i32) -> Self {
         self.checkin_ds_id = Some(id);
+        self
+    }
+    /// Track B4 — record one `(room_no, ds_id)` pair for the per-room
+    /// `ht_checkin_rooms.cr_legacy_ds_id` back-population step. Order
+    /// is preserved (folios with `Cin_Room_ALL='508 509 '` carry
+    /// `[("508", id1), ("509", id2)]`).
+    pub fn with_room_ds_id(mut self, room_no: String, id: i32) -> Self {
+        self.checkin_ds_ids_by_room.push((room_no, id));
         self
     }
 
@@ -474,6 +495,47 @@ mod tests {
         let json = LegacyIds::default().into_json();
         assert!(json["book_id"].is_null());
         assert!(json["pay_no"].is_null());
+    }
+
+    /// Track B4 — multi-room ds_id mapping must round-trip through
+    /// the JSONB column the worker reads in `back_populate_legacy_ids`.
+    /// The wire shape is `"checkin_ds_ids_by_room": [["508", 25101], ["509", 25102]]`.
+    #[test]
+    fn legacy_ids_round_trips_per_room_ds_ids() {
+        let ids = LegacyIds::new()
+            .with_cin_no("CH26-005230".into())
+            .with_checkin_ds_id(25101)
+            .with_room_ds_id("508".into(), 25101)
+            .with_room_ds_id("509".into(), 25102);
+        let json = ids.into_json();
+        let pairs = json["checkin_ds_ids_by_room"]
+            .as_array()
+            .expect("checkin_ds_ids_by_room must serialize as array");
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0][0], "508");
+        assert_eq!(pairs[0][1], 25101);
+        assert_eq!(pairs[1][0], "509");
+        assert_eq!(pairs[1][1], 25102);
+        // The single-room field still works for back-compat consumers.
+        assert_eq!(json["checkin_ds_id"], 25101);
+    }
+
+    /// Single-room folios omit the multi-room field via serde default —
+    /// the JSON shape stays an empty array so the worker's
+    /// `back_populate_legacy_ids` for-each loop is a no-op.
+    #[test]
+    fn legacy_ids_single_room_emits_empty_room_map() {
+        let ids = LegacyIds::new()
+            .with_cin_no("CH26-005228".into())
+            .with_checkin_ds_id(25001);
+        let json = ids.into_json();
+        let pairs = json["checkin_ds_ids_by_room"]
+            .as_array()
+            .expect("checkin_ds_ids_by_room must be an array (possibly empty)");
+        assert!(
+            pairs.is_empty(),
+            "single-room folio must serialize an empty room map"
+        );
     }
 
     #[test]

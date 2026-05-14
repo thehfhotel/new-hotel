@@ -1,5 +1,5 @@
 //! Multi-room walk-in fixture — PROCESS.md P3 promotion (Track H,
-//! audit-2026-05-13). **Un-ignored by Track B2** (2026-05-13).
+//! audit-2026-05-13) + **Track B4 closure (2026-05-14)**.
 //!
 //! ## Why this exists
 //!
@@ -12,54 +12,49 @@
 //! multi-room cardinality post-mortem (audit `audit-2026-05-13.md` Theme
 //! 1, T1 CRIT-1).
 //!
-//! ## Track B's incremental unblock
+//! ## Track B4 close-out
 //!
-//! Track B is decomposed into five sub-waves; each unlocks a different
-//! layer of the fixture:
+//! Track B4 (writeback per-room apportionment) lands the multi-room
+//! emission path:
+//!   1. `WalkInInputs.room_lines` carries the canonical
+//!      `ht_checkin_rooms` slice. Empty ⇒ legacy single-room shape;
+//!      non-empty ⇒ N rows.
+//!   2. `build_statements()` iterates the slice and emits one
+//!      `HT_CheckIn_Ds` + `HT_POWER_LOG` + N×`HT_Room_Status` per room.
+//!   3. The header (`HT_CheckIn_H`) stays single — `Cin_Room_ALL`
+//!      concatenates every room number with the legacy trailing-space
+//!      pattern (`'508 509 '`).
 //!
-//! | Sub-wave | Layer fixed                              | Test surface here |
-//! |----------|------------------------------------------|-------------------|
-//! | B1       | `ht_checkin_rooms` schema (junction)     | none (schema-only)|
-//! | **B2**   | **sync mapper: per-room canonical**      | **NOW asserted**  |
-//! | B3       | dashboard readers join through junction  | covered by routes |
-//! | B4       | writeback recipe emits N `HT_CheckIn_Ds` | TODO (#[ignore]'d below) |
-//! | B5       | backfill bin for legacy folios           | covered by bin    |
-//!
-//! Before B2, this file was entirely `#[ignore]`'d — there was nothing
-//! production could correctly do with a multi-room aggregate even if the
-//! sync layer had received one. After B2, the canonical projection /
-//! junction-emit path IS correct for multi-room aggregates, so we lock
-//! that behavior with a passing sync-mapper unit test (see
-//! [`two_room_aggregate_projects_one_canonical_room_per_legacy_ds_row`]).
-//! The writeback-side multi-room assertion below stays `#[ignore]`'d
-//! until B4 fans `build_statements` out across rooms.
+//! The walk-in 2-room test below is the regression guard for #2 + #3.
+//! The 3-room → 2-room "edit-down" assertion in `room_lines_drop_rooms`
+//! pins the contract that dropping a junction row reduces the emitted
+//! `HT_CheckIn_Ds` count from 3 to 2 — the orchestrator (the writeback
+//! worker's `back_populate_legacy_ds_ids` step) is responsible for the
+//! corresponding legacy DELETE; that integration sits outside this
+//! pure-`build_statements` unit fixture and is covered by the live
+//! coexistence acceptance test described in the audit doc.
 //!
 //! ## Spike capture provenance
 //!
 //! Both `walkin3-20260424-100000/writes.txt` and
 //! `booking-checkin-20260424-101838/writes.txt` show one `HT_CheckIn_Ds`
 //! INSERT per check-in. `findings.md:648` records the open question
-//! ("Whether multi-room check-ins use the same flow") that motivated this
-//! fixture. The COMPAT_CHEATSHEET (landed 2026-05-11) answered that
-//! question — `HT_CheckIn_Ds` is one row per room — but the schema
-//! re-audit that would have surfaced the gap didn't happen, hence
-//! PROCESS.md P2 (re-audit on reference-doc landing) + P3 (this file).
+//! ("Whether multi-room check-ins use the same flow"); the
+//! `COMPAT_CHEATSHEET` (landed 2026-05-11) answered it — `HT_CheckIn_Ds`
+//! is one row per room — and Track B4 finally closes the writeback gap.
 
 #![allow(clippy::needless_collect)]
 
 use chrono::{NaiveDate, TimeZone, Utc};
 
-use hotel_backend::sync::parent_loader::CheckInAggregate;
-use hotel_backend::sync::row::test_support::{HashMapRow, MockValue};
-use hotel_backend::sync::MappableRow;
+use hotel_backend::outbox::intent::RoomLine;
 use hotel_backend::writeback::recipes::walkin::{build_statements, WalkInInputs};
 
 /// Build a single-room walk-in input set that mirrors the
 /// `CH26-005230` capture in
 /// `docs/legacy-spike/raw/walkin3-20260424-100000/writes.txt` (room 508,
 /// guest "SPIKE TEST WALKIN 3", 1 night). The capture is currently the
-/// only single-room walk-in we have to anchor multi-room work against —
-/// the multi-room assertions below extrapolate from it.
+/// only single-room walk-in we have to anchor multi-room work against.
 ///
 /// `created_at` is pinned to the captured wall-clock so any byte-parity
 /// assertion stays deterministic.
@@ -86,16 +81,45 @@ fn walkin3_single_room_inputs() -> WalkInInputs<'static> {
         checkin_ds_id: 25101,
         photo_tmp_no: None,
         created_at: Utc.with_ymd_and_hms(2026, 4, 24, 3, 1, 11).unwrap(),
+        // Track B4 — legacy single-room path (empty slice).
+        room_lines: Vec::new(),
+    }
+}
+
+/// Track B4 — synthesize a 2-room walk-in by extending the single-room
+/// fixture with a 2-entry `room_lines` slice. Mirrors what the service
+/// layer will pack from `ht_checkin_rooms` once the multi-room walk-in
+/// route (T4 HIGH-1) lands.
+fn walkin3_two_room_inputs() -> WalkInInputs<'static> {
+    let base = walkin3_single_room_inputs();
+    WalkInInputs {
+        room_lines: vec![
+            RoomLine {
+                room_no: "508".to_string(),
+                room_type: "Standard".to_string(),
+                price_per_night: 890.0,
+                nights: 1,
+                room_total: 890.0,
+                room_status: String::new(),
+                legacy_ds_id: None,
+            },
+            RoomLine {
+                room_no: "509".to_string(),
+                room_type: "Standard".to_string(),
+                price_per_night: 890.0,
+                nights: 1,
+                room_total: 890.0,
+                room_status: String::new(),
+                legacy_ds_id: None,
+            },
+        ],
+        ..base
     }
 }
 
 /// Sanity test: the current single-room build produces exactly ONE
-/// `HT_CheckIn_Ds` INSERT. This is the BUG today — Track B's multi-room
-/// rewrite will fan this out to N rows. The assertion is intentionally
-/// stated as the documented single-room behavior so a future change that
-/// accidentally regresses single-room emission (e.g. emitting zero rows)
-/// still fails loud. The companion ignored test below covers the
-/// expected post-Track-B multi-room shape.
+/// `HT_CheckIn_Ds` INSERT. Track B4 preserves this byte-for-byte — the
+/// new multi-room path only activates when `room_lines` is non-empty.
 #[test]
 fn single_room_walkin_emits_exactly_one_checkin_ds_row() {
     let statements = build_statements(&walkin3_single_room_inputs());
@@ -119,155 +143,17 @@ fn single_room_walkin_emits_exactly_one_checkin_ds_row() {
     );
 }
 
-/// Build a multi-room `HT_CheckIn_H` mock row that mirrors what
-/// [`parent_loader::load_checkin_aggregate`] would materialise from the
-/// legacy MSSQL. Centralised here so the assertions below stay
-/// readable.
-fn multiroom_header_row(cin_no: &str, cust_no: &str) -> HashMapRow {
-    HashMapRow::new("HT_CheckIn_H")
-        .with("Cin_no", MockValue::Str(cin_no.into()))
-        .with("Cin_status", MockValue::Str("ปกติ".into()))
-        .with("Cin_Book_no", MockValue::Str(String::new()))
-        .with("Cin_cust_no", MockValue::Str(cust_no.into()))
-        .with(
-            "Cin_Date_in",
-            MockValue::DateTime(
-                NaiveDate::from_ymd_opt(2026, 4, 24)
-                    .unwrap()
-                    .and_hms_opt(10, 1, 11)
-                    .unwrap(),
-            ),
-        )
-        .with(
-            "Cin_Date_Out",
-            MockValue::DateTime(
-                NaiveDate::from_ymd_opt(2026, 4, 25)
-                    .unwrap()
-                    .and_hms_opt(12, 0, 0)
-                    .unwrap(),
-            ),
-        )
-        .with("Total_Price_Room", MockValue::Decimal(1780.0))
-        .with("Total_Price_Net", MockValue::Decimal(1780.0))
-        .with("Total_Price_Pay", MockValue::Decimal(0.0))
-        .with("Total_Price_Balance", MockValue::Decimal(1780.0))
-}
-
-fn multiroom_ds_row(cin_no: &str, room_no: &str, ds_id: i32) -> HashMapRow {
-    HashMapRow::new("HT_CheckIn_Ds")
-        .with("id", MockValue::I32(ds_id))
-        .with("Cin_No", MockValue::Str(cin_no.into()))
-        .with("Cin_Room_No", MockValue::Str(room_no.into()))
-        .with("Cin_Room_Status", MockValue::Str("เข้าพัก".into()))
-        .with("Cin_Room_In", MockValue::Null)
-        .with("Cin_Room_Out", MockValue::Null)
-        .with("Cin_Room_Price", MockValue::Decimal(890.0))
-        .with("Cin_Room_Night", MockValue::I32(1))
-        .with("Cin_Room_PriceToTal", MockValue::Decimal(890.0))
-        .with("Cin_dep", MockValue::Decimal(0.0))
-        .with("Cin_dep_status", MockValue::Null)
-        .with("Cin_dep_returned", MockValue::Null)
-        .with("Cin_dep_returned_by", MockValue::Null)
-}
-
-/// Track B2 / T2 CRIT-1 unblock — a 2-room aggregate (the shape legacy
-/// `HT_CheckIn_Ds` produces for a multi-room walk-in per
-/// COMPAT_CHEATSHEET lines 427-430) carries TWO `HT_CheckIn_Ds` rows
-/// under one `HT_CheckIn_H` header. The sync layer's
-/// [`CheckInAggregate`] mirrors that shape exactly — locking the
-/// canonical-side correctness without requiring a writeback B4 cutover.
-///
-/// This is the test the original `#[ignore]`'d fixture was holding
-/// open for. With B2 the canonical projection / `ht_checkin_rooms`
-/// emission is multi-room-correct; the only remaining ignored test is
-/// the writeback B4 blocker below.
-#[test]
-fn two_room_aggregate_projects_one_canonical_room_per_legacy_ds_row() {
-    let aggregate = CheckInAggregate {
-        header: Some(multiroom_header_row("CH26-005230", "C21609")),
-        rooms: vec![
-            multiroom_ds_row("CH26-005230", "508", 25101),
-            multiroom_ds_row("CH26-005230", "509", 25102),
-        ],
-        payments: vec![],
-    };
-
-    // 1) Aggregate composition mirrors legacy: ONE header, TWO Ds rows.
-    assert!(
-        aggregate.is_present(),
-        "header must be present on a normal walk-in aggregate"
-    );
-    assert_eq!(
-        aggregate.rooms.len(),
-        2,
-        "multi-room aggregate must carry one HT_CheckIn_Ds row per room"
-    );
-
-    // 2) Each Ds row carries its own room_no / id pair — the
-    // pre-B2 mapper collapsed these into `first_room_no` only.
-    let room_nos: Vec<&str> = aggregate
-        .rooms
-        .iter()
-        .filter_map(|r| r.try_get_str("Cin_Room_No").ok().flatten())
-        .collect();
-    assert_eq!(
-        room_nos,
-        vec!["508", "509"],
-        "both room numbers must be present (pre-B2 lost room 2..N)"
-    );
-
-    let ds_ids: Vec<i32> = aggregate
-        .rooms
-        .iter()
-        .filter_map(|r| r.try_get_i32("id").ok().flatten())
-        .collect();
-    assert_eq!(
-        ds_ids,
-        vec![25101, 25102],
-        "distinct HT_CheckIn_Ds.id per room — locks cr_legacy_ds_id"
-    );
-
-    // 3) Thai literal `'เข้าพัก'` round-trips verbatim per the user's
-    // standing legacy-literal constraint.
-    for r in &aggregate.rooms {
-        let status = r.try_get_str("Cin_Room_Status").unwrap().unwrap_or("");
-        assert_eq!(
-            status, "เข้าพัก",
-            "Cin_Room_Status must preserve Thai literal verbatim"
-        );
-    }
-}
-
-/// **#[ignore]'d Track B4 blocker.** The COMPAT_CHEATSHEET says
+/// **Track B4 closes T2 CRIT-1.** The COMPAT_CHEATSHEET says
 /// `HT_CheckIn_Ds` is "one row per room (a single check-in can cover
-/// multiple rooms)" (lines 427-430). Track B2 (sync mapper) has landed;
-/// Track B4 (writeback recipe) still emits exactly one
-/// `HT_CheckIn_Ds` INSERT per walk-in payload — the `WalkInInputs`
-/// struct doesn't yet carry a per-room slice.
+/// multiple rooms)" (lines 427-430). Track B4 wires
+/// `WalkInInputs.room_lines` into `build_statements` so a 2-room walk-in
+/// emits TWO `HT_CheckIn_Ds` INSERTs (one per room) plus a single
+/// `HT_CheckIn_H` header carrying both room numbers in `Cin_Room_ALL`.
 ///
-/// When Track B4 lands the writeback per-room apportionment, this test
-/// un-ignores. Until then the canonical-side multi-room coverage lives
-/// in `two_room_aggregate_projects_one_canonical_room_per_legacy_ds_row`
-/// above + `sync::mappers::checkin` unit tests.
-///
-/// TODO Track B4 — see docs/coexistence/audit-2026-05-13.md theme 1.
+/// Was `#[ignore]`'d as the Track-B blocker; un-ignored 2026-05-14.
 #[test]
-#[ignore = "Track B4 (writeback per-room apportionment) blocker — un-ignore when WalkInInputs grows a per-room slice"]
 fn two_room_walkin_emits_two_checkin_ds_rows_and_one_header() {
-    // === Placeholder: Track B4 will replace this with a 2-room input set. ===
-    //
-    // Pseudocode for the post-Track-B4 shape:
-    //
-    //     let inputs = WalkInInputs {
-    //         room_lines: vec![
-    //             RoomLine { room_no: "508", room_type: "Standard", price: 890.0, ... },
-    //             RoomLine { room_no: "509", room_type: "Standard", price: 890.0, ... },
-    //         ],
-    //         ...
-    //     };
-    let inputs = walkin3_single_room_inputs();
-
-    let statements = build_statements(&inputs);
+    let statements = build_statements(&walkin3_two_room_inputs());
 
     // Expected #1: TWO HT_CheckIn_Ds INSERTs (one per room).
     let ds_count = statements
@@ -291,7 +177,7 @@ fn two_room_walkin_emits_two_checkin_ds_rows_and_one_header() {
 
     // Expected #3: Cin_Room_ALL on the header carries BOTH room numbers,
     // legacy format is space-separated with a trailing space — e.g.
-    // `'508 509 '`. Track B4 should preserve that format.
+    // `'508 509 '`.
     let h_insert = statements
         .iter()
         .find(|s| s.contains("[HT_CheckIn_H]"))
@@ -301,9 +187,7 @@ fn two_room_walkin_emits_two_checkin_ds_rows_and_one_header() {
         "Cin_Room_ALL must enumerate all rooms (expected '508 509 '): {h_insert}"
     );
 
-    // Expected #4: per-room HT_POWER_LOG and HT_Room_Status rows scale
-    // with the room count too. Track B4 must verify both — leaving the
-    // assertion shape here as a TODO.
+    // Expected #4: per-room HT_POWER_LOG rows scale with the room count.
     let power_log_count = statements
         .iter()
         .filter(|s| s.contains("[HT_POWER_LOG]"))
@@ -311,5 +195,158 @@ fn two_room_walkin_emits_two_checkin_ds_rows_and_one_header() {
     assert_eq!(
         power_log_count, 2,
         "multi-room walk-in must emit one HT_POWER_LOG per room (got {power_log_count})"
+    );
+
+    // Expected #5: per-room HT_Rooms occupancy UPDATEs.
+    let room_use_updates = statements
+        .iter()
+        .filter(|s| s.starts_with("update HT_Rooms set room_use='yes'"))
+        .count();
+    assert_eq!(
+        room_use_updates, 2,
+        "multi-room walk-in must emit one `update HT_Rooms set room_use='yes'` per room \
+         (got {room_use_updates})"
+    );
+
+    // Expected #6: HT_Room_Status row count = rooms × nights. The
+    // 2-room × 1-night fixture should emit 2 rows.
+    let room_status_inserts = statements
+        .iter()
+        .filter(|s| s.contains("INSERT INTO [HT_Room_Status]"))
+        .count();
+    assert_eq!(
+        room_status_inserts, 2,
+        "multi-room walk-in must emit one HT_Room_Status row per (room × night) \
+         (got {room_status_inserts})"
+    );
+
+    // Expected #7: sequential ds_ids — first room's id = base, second = base+1.
+    let ds_rows: Vec<&String> = statements
+        .iter()
+        .filter(|s| s.contains("[HT_CheckIn_Ds]"))
+        .collect();
+    assert!(
+        ds_rows[0].contains("VALUES( 25101,"),
+        "first HT_CheckIn_Ds row must use the allocated id base: {}",
+        ds_rows[0]
+    );
+    assert!(
+        ds_rows[1].contains("VALUES( 25102,"),
+        "second HT_CheckIn_Ds row must use base+1 for race-safe contiguous ids: {}",
+        ds_rows[1]
+    );
+}
+
+/// Track B4 — edit-down path. A 3-room folio that gets edited to 2
+/// rooms must emit only 2 `HT_CheckIn_Ds` INSERTs from the canonical
+/// junction slice. The dropped room's legacy DELETE is the worker's
+/// responsibility (it diffs `ht_checkin_rooms.cr_legacy_ds_id` against
+/// the prior write's `LegacyIds.checkin_ds_ids_by_room` snapshot and
+/// emits a targeted `DELETE FROM HT_CheckIn_Ds WHERE id=…` per
+/// `findings.md` §3i recipe). This unit test pins the recipe-side
+/// invariant: `room_lines.len()` ALWAYS equals the emitted
+/// `HT_CheckIn_Ds` count.
+#[test]
+fn room_lines_drop_rooms_reduces_checkin_ds_emission() {
+    // Start with 3 rooms.
+    let three_room = WalkInInputs {
+        room_lines: vec![
+            RoomLine {
+                room_no: "508".to_string(),
+                room_type: "Standard".to_string(),
+                price_per_night: 890.0,
+                nights: 1,
+                room_total: 890.0,
+                room_status: String::new(),
+                legacy_ds_id: None,
+            },
+            RoomLine {
+                room_no: "509".to_string(),
+                room_type: "Standard".to_string(),
+                price_per_night: 890.0,
+                nights: 1,
+                room_total: 890.0,
+                room_status: String::new(),
+                legacy_ds_id: None,
+            },
+            RoomLine {
+                room_no: "510".to_string(),
+                room_type: "Standard".to_string(),
+                price_per_night: 890.0,
+                nights: 1,
+                room_total: 890.0,
+                room_status: String::new(),
+                legacy_ds_id: None,
+            },
+        ],
+        ..walkin3_single_room_inputs()
+    };
+    let three_ds = build_statements(&three_room)
+        .iter()
+        .filter(|s| s.contains("[HT_CheckIn_Ds]"))
+        .count();
+    assert_eq!(three_ds, 3, "3-room folio must emit 3 HT_CheckIn_Ds rows");
+
+    // After the edit, the junction holds 2 rooms (room 510 dropped).
+    let two_room_after_edit = walkin3_two_room_inputs();
+    let two_ds = build_statements(&two_room_after_edit)
+        .iter()
+        .filter(|s| s.contains("[HT_CheckIn_Ds]"))
+        .count();
+    assert_eq!(
+        two_ds, 2,
+        "after edit-down to 2 rooms the recipe emits 2 HT_CheckIn_Ds rows \
+         (the worker DELETEs the dropped legacy row outside this scope)"
+    );
+
+    // And Cin_Room_ALL on the post-edit header reflects the new room list,
+    // not the original 3-room one.
+    let post_edit_statements = build_statements(&two_room_after_edit);
+    let h_insert = post_edit_statements
+        .iter()
+        .find(|s| s.contains("[HT_CheckIn_H]"))
+        .expect("HT_CheckIn_H INSERT must exist");
+    assert!(
+        h_insert.contains("'508 509 '"),
+        "post-edit Cin_Room_ALL must list only the surviving rooms ('508 509 '), \
+         not the dropped 510: {h_insert}"
+    );
+    assert!(
+        !h_insert.contains("510"),
+        "dropped room 510 must NOT appear in the post-edit header: {h_insert}"
+    );
+}
+
+/// Track B4 — verify the Thai status literal passes through verbatim
+/// (constraint: "Preserve Thai literals in `Cin_R_Status` — pass
+/// `cr_room_status` through verbatim"). A junction row with
+/// `cr_room_status='จอง'` (Thai "reserved", e.g. a booking-linked
+/// check-in where one of N rooms hasn't been physically occupied yet)
+/// must surface that exact byte sequence in `Cin_Room_Status`.
+#[test]
+fn per_room_thai_status_literal_passes_through_verbatim() {
+    let inputs = WalkInInputs {
+        room_lines: vec![RoomLine {
+            room_no: "508".to_string(),
+            room_type: "Standard".to_string(),
+            price_per_night: 890.0,
+            nights: 1,
+            room_total: 890.0,
+            // Custom Thai status (verbatim from the legacy enum captured
+            // in `findings.md` §3a — same byte sequence the .NET app
+            // writes).
+            room_status: "จอง".to_string(),
+            legacy_ds_id: None,
+        }],
+        ..walkin3_single_room_inputs()
+    };
+    let statements = build_statements(&inputs);
+    let ds = statements
+        .iter()
+        .find(|s| s.contains("[HT_CheckIn_Ds]"))
+        .expect("HT_CheckIn_Ds INSERT must exist");
+    assert!(
+        ds.contains("'จอง'"),
+        "Thai junction status 'จอง' must pass through verbatim into Cin_Room_Status: {ds}"
     );
 }
