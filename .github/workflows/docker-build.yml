@@ -681,7 +681,20 @@ jobs:
         # works end to end.
         run: |
           set -euo pipefail
-          tar -czf /tmp/deploy.tar.gz docker-compose.yml init-db migrations/pg scripts/migrate.sh
+          # Track J5 (2026-05-14): scripts/deploy/run-deploy.sh is included
+          # in the tarball so the live /srv/run-deploy.sh on evergreen
+          # self-updates from the repo on every deploy. The repo copy at
+          # scripts/deploy/run-deploy.sh is now the source of truth.
+          # Forced-command SSH config on evergreen makes scp/rsync of
+          # arbitrary paths impossible — bundling the script in the existing
+          # payload + relying on the script's self-update tail block is the
+          # only path that doesn't require relaxing authorized_keys.
+          tar -czf /tmp/deploy.tar.gz \
+            docker-compose.yml \
+            init-db \
+            migrations/pg \
+            scripts/migrate.sh \
+            scripts/deploy/run-deploy.sh
 
           jq -n \
             --arg commit_sha          "$GITHUB_SHA" \
