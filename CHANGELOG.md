@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v2.66.3] - 2026-05-14 (HF Ville prod fix — room_calendar legacy_id rebind)
+
+### Fixed
+
+- **HF Ville drop-stream — every `HT_Room_Status` CT event was
+  silently failing with `duplicate key value violates unique
+  constraint "ux_ht_room_calendar_legacy_id"`** and the post-R1
+  watcher skipped, so Ville's canonical `ht_room_calendar`
+  projection was drifting from legacy state with no surface signal
+  beyond the structured-error event stream.
+
+  Root cause: `ht_room_calendar` carries two unique constraints —
+  `uq_ht_room_calendar_room_date` on `(rcal_room_id, rcal_date)`
+  (the mapper's ON CONFLICT target) AND
+  `ux_ht_room_calendar_legacy_id` on `rcal_legacy_id WHERE NOT
+  NULL` (a partial unique for drift detection). Legacy iHOTEL's
+  MAX+1 allocator rebinds old `HT_Room_Status.id`s to new
+  `(room, date)` slots after delete-reinsert cycles. The `(room,
+  date)` UPSERT happily lands on the new tile, but stamping
+  `rcal_legacy_id = X` on it trips the secondary unique because
+  some other tile still holds `rcal_legacy_id = X`.
+
+  Fix: `apply_upsert` now pre-clears `rcal_legacy_id` on any
+  *other* row that holds the incoming legacy_id at a different
+  `(room, date)` pair before the main UPSERT runs. The cleared
+  row keeps its tile data — only the drift-detection pointer is
+  reset. Locked by a new integration test
+  (`test_room_calendar_upsert_regression.rs`) that exercises both
+  the same-slot idempotency baseline and the rebind scenario.
+
 ## [v2.66.2] - 2026-05-14 (Hotfix — wire secrets hydrator into binaries)
 
 ### Fixed
