@@ -486,7 +486,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - B5: backfill bin populates the junction for existing folios;
       only then is `ht_checkins.cin_room_id` safe to drop.
 
-<<<<<<< HEAD
 ## [vNext]
 
 ### Added
@@ -529,10 +528,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     plus `sync::mappers::rate_tiers` unit tests on the
     `is_acceptable_row` validator and `routes::new_rates::tests` on
     the date-parsing helper and default-tier constant.
-=======
-## [vNext] - 2026-05-13
-
-### Added
 
 - **Track F2 — `ht_shifts` canonical + payment gate (`audit-2026-05-13.md`
   T1 HIGH-5).** Closes the cash-drawer-reconciliation gap that iHOTEL
@@ -569,7 +564,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     ("round-bill shift discipline" feature) — F2 is the operational
     win that stops the cash-drawer bleeding while the legacy bridge
     is built.
->>>>>>> 259757d (feat(coexistence): Track F2 — ht_shifts canonical + payment gate)
 
 ## [2.63.16] - 2026-05-13
 
@@ -621,8 +615,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **T7 MED-3 — Backup off-site.** Tracked as Track H2.
 - **T7 MED-4 — Deploy rollback workflow.** Tracked as Track H2.
 
-<<<<<<< HEAD
-## [vNext] - 2026-05-13 (Track F1)
+## [vNext] - 2026-05-13 (Tracks F1 + F3)
 
 ### Added
 
@@ -668,10 +661,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     NULL-on-required loud errors, date truncation, optional FK
     extraction, SELECT-vs-projection alignment) plus a refreshed
     wiring assertion in `bin/sync.rs` (`build_mappers_wires_room_status_to_room_calendar_mapper`).
-=======
-## [vNext] - 2026-05-13 (Track F3)
-
-### Added
 
 - **Track F3 — `ht_products` canonical table + stock writeback
   (`docs/coexistence/audit-2026-05-13.md` T1 CRIT-3).** Closes the
@@ -713,7 +702,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `stock_invariant_uses_additive_update_not_absolute_set`), route DTO
     validation (`route_emits_adjust_product_stock_intent_shape`,
     `non_finite_delta_is_rejected_at_validation`).
->>>>>>> 0df405c (feat(coexistence): Track F3 — ht_products canonical + stock writeback)
 
 ## [2.63.15] - 2026-05-13
 
