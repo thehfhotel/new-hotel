@@ -63,7 +63,9 @@ use sqlx::PgPool;
 use tokio::sync::Notify;
 
 use hotel_backend::config::{DbConfig, SiteConfig, SlackConfig};
-use hotel_backend::db::mssql_timeout::{simple_query_with_timeout_pooled, MssqlOpKind};
+use hotel_backend::db::mssql_timeout::{
+    simple_query_with_explicit_timeout, simple_query_with_timeout_pooled, MssqlOpKind,
+};
 use hotel_backend::db::{create_pool, DbPool};
 use hotel_backend::notifications::slack::{SlackClient, SlackMessage};
 use hotel_backend::outbox::bus::EventBus;
@@ -349,6 +351,13 @@ const DEFAULT_OUTAGE_ALERT_THRESHOLD: u32 = 2;
 const DEFAULT_INIT_RETRY_INITIAL_SECS: u64 = 5;
 const DEFAULT_INIT_RETRY_MAX_SECS: u64 = 60;
 const DEFAULT_INIT_RETRY_ALERT_AFTER_SECS: u64 = 300;
+
+/// Quiet-aware watchdog probe budget. The stall watchdog fires its
+/// `CHANGE_TRACKING_CURRENT_VERSION()` probe inside the alert path, so
+/// the budget MUST stay well below the 60s poll interval — 5s lets a
+/// row-locked legacy fail fast and fall through to the conservative
+/// "fire anyway" branch instead of stretching the watchdog tick.
+const WATCHDOG_CT_PROBE_TIMEOUT_MS: u64 = 5_000;
 
 /// Track D / T7 CRIT-3 — watermark-stall watchdog poll interval (60s).
 /// Reads `legacy_ct_state.last_seen_version` + `last_polled_at` once
@@ -765,12 +774,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_WATERMARK_STALL_ALERT_SECS);
     let watchdog_pg = pg.clone();
+    let watchdog_mssql = mssql.clone();
     let watchdog_slack = slack.clone();
     let watchdog_site_id = site.id.clone();
     let watchdog_shutdown = shutdown.clone();
     tokio::spawn(async move {
         run_watermark_watchdog(
             watchdog_pg,
+            watchdog_mssql,
             watchdog_slack,
             watchdog_site_id,
             stall_alert_secs,
@@ -1026,6 +1037,32 @@ async fn read_change_tracking_current_version(
     Ok(v.unwrap_or(0))
 }
 
+/// Watchdog-only probe of `CHANGE_TRACKING_CURRENT_VERSION()` with a
+/// tight explicit timeout ([`WATCHDOG_CT_PROBE_TIMEOUT_MS`], 5s). Used
+/// solely by [`run_watermark_watchdog`] to gate the stall alert on
+/// whether legacy MSSQL actually has new CT versions to offer. Distinct
+/// from [`read_change_tracking_current_version`] because the watchdog
+/// fires inside a 60s poll loop and cannot afford the default 10s read
+/// budget on a row-locked legacy — failing fast and falling through to
+/// "fire alert" (per [`should_fire_stall_alert`]) is the desired
+/// behaviour.
+async fn probe_change_tracking_current_version(
+    mssql: &DbPool,
+) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+    let mut conn = mssql.get().await?;
+    let rows = simple_query_with_explicit_timeout(
+        &mut conn,
+        "SELECT CHANGE_TRACKING_CURRENT_VERSION() AS v",
+        Duration::from_millis(WATCHDOG_CT_PROBE_TIMEOUT_MS),
+    )
+    .await?;
+    let row = rows.first().ok_or_else(|| {
+        "CHANGE_TRACKING_CURRENT_VERSION() returned no rows".to_string()
+    })?;
+    let v: Option<i64> = row.get("v");
+    Ok(v.unwrap_or(0))
+}
+
 /// Tunable knobs for [`create_pool_with_retry`]. All three default to
 /// the `DEFAULT_INIT_RETRY_*` constants and can be overridden at
 /// runtime via the matching `LEGACY_SYNC_INIT_RETRY_*` env vars.
@@ -1216,6 +1253,41 @@ fn watermark_stall_alert_eligible(
     ))
 }
 
+/// Pure decision function for the quiet-aware stall alert override.
+///
+/// After [`watermark_stall_alert_eligible`] has already concluded a stall
+/// is alert-worthy by duration, this gates the actual Slack page on
+/// whether legacy MSSQL has anything new to offer. We compare the
+/// canonical PG watermark against the live
+/// `CHANGE_TRACKING_CURRENT_VERSION()` probe.
+///
+/// Rules (conservative — uncertainty defaults to firing):
+/// 1. Probe returned `Some(v)` AND `v == watermark` → legacy CT is quiet
+///    at the same version the watermark already holds. Watcher is
+///    correctly tracking tip-of-stream — suppress alert (`false`).
+/// 2. Probe returned `Some(v)` AND `v > watermark` → legacy has changes
+///    the watcher has NOT processed. Real stall — alert (`true`).
+/// 3. Probe returned `Some(v)` AND `v < watermark` → impossible in a
+///    healthy CT instance (CT version is monotonic), but defensively
+///    treat as a real problem worth paging on (`true`).
+/// 4. Probe returned `None` (failure / timeout) → uncertainty. Don't
+///    suppress on a probe failure — fire the alert (`true`) so an
+///    operator can investigate (matches the prompt's "conservative —
+///    don't suppress on uncertainty" requirement).
+///
+/// Background: 2026-05-14 off-peak quiet periods triggered three
+/// false-positive Slack pages on hfhotel + two on hfville. The
+/// `legacy_ct_state.last_seen_version` correctly matched
+/// `CHANGE_TRACKING_CURRENT_VERSION()` (verified 17209 == 17209), so
+/// there was nothing to advance to. The original watchdog had no way
+/// to tell idle from wedged.
+fn should_fire_stall_alert(watermark: i64, ct_current_probe: Option<i64>) -> bool {
+    match ct_current_probe {
+        Some(v) if v == watermark => false,
+        _ => true,
+    }
+}
+
 /// Pure decision function for the shadow-mode-too-long alert. Returns
 /// `Some(reason)` when shadow mode has been running for longer than
 /// the hardcoded ceiling ([`SHADOW_MODE_MAX_DURATION_SECS`], 36h).
@@ -1250,8 +1322,18 @@ fn shadow_mode_pager_eligible(
 /// fires Slack alerts on either (a) version stuck >= `stall_alert_secs`
 /// in live mode, or (b) shadow mode running past the 36h ceiling.
 /// Cooldown 30min per alert kind so we don't flood.
+///
+/// 2026-05-14 quiet-aware refinement: when the duration-based stall
+/// rule fires in live mode, the watchdog now probes
+/// `CHANGE_TRACKING_CURRENT_VERSION()` on legacy MSSQL with its own
+/// 5-second timeout budget (reusing R2's
+/// `simple_query_with_explicit_timeout`) and suppresses the page when
+/// legacy is just idle at the same version our watermark already
+/// holds. Probe failures fall through to firing — see
+/// [`should_fire_stall_alert`].
 async fn run_watermark_watchdog(
     pg: PgPool,
+    mssql: DbPool,
     slack: Option<SlackClient>,
     site_id: String,
     stall_alert_secs: u64,
@@ -1304,34 +1386,64 @@ async fn run_watermark_watchdog(
             if let Some(reason) =
                 watermark_stall_alert_eligible(prior_obs, &observation, now, shadow_mode, stall_threshold)
             {
-                let cooldown_elapsed = match last_stall_alert {
-                    Some(t) => now.duration_since(t) >= cooldown,
-                    None => true,
-                };
-                if cooldown_elapsed {
-                    tracing::error!(
-                        site = %site_id,
-                        version = observation.last_seen_version,
-                        reason,
-                        "[watchdog] Watermark stall detected — paging operator"
-                    );
-                    if let Some(s) = slack.as_ref() {
-                        let payload = SlackMessage::with_site_text(
-                            &site_id,
-                            format!(
-                                ":rotating_light: *CT watermark STUCK* :rotating_light:\n\
-                                 {reason}\n\
-                                 _The CT watcher is ticking but `last_seen_version` \
-                                 hasn't advanced. Common causes: every tick failing + \
-                                 rolling back the watermark UPDATE (check \
-                                 `legacy_sync_status.last_error`), or all 16 tables \
-                                 happen to be quiet. Tighten the check via the \
-                                 dashboard at `/api/new/sync/status`._"
-                            ),
+                // 2026-05-14 quiet-aware gate. The duration rule has
+                // already concluded the watermark hasn't moved in
+                // `stall_threshold`. Probe legacy CT to distinguish
+                // "wedged" (CT current > watermark) from "idle"
+                // (CT current == watermark, nothing to advance to).
+                // Probe failure falls through to firing the alert.
+                let probe = match probe_change_tracking_current_version(&mssql).await {
+                    Ok(v) => Some(v),
+                    Err(err) => {
+                        tracing::warn!(
+                            site = %site_id,
+                            error = %err,
+                            "[watchdog] CT-current probe failed — falling through to alert (conservative)"
                         );
-                        let _ = s.send_message(&payload).await;
+                        None
                     }
-                    last_stall_alert = Some(now);
+                };
+                if !should_fire_stall_alert(observation.last_seen_version, probe) {
+                    tracing::info!(
+                        site = %site_id,
+                        watermark = observation.last_seen_version,
+                        ct_current = probe.unwrap_or_default(),
+                        "[watchdog] legacy CT quiet — watermark correctly tracking current"
+                    );
+                } else {
+                    let cooldown_elapsed = match last_stall_alert {
+                        Some(t) => now.duration_since(t) >= cooldown,
+                        None => true,
+                    };
+                    if cooldown_elapsed {
+                        tracing::error!(
+                            site = %site_id,
+                            version = observation.last_seen_version,
+                            ct_current = ?probe,
+                            reason,
+                            "[watchdog] Watermark stall detected — paging operator"
+                        );
+                        if let Some(s) = slack.as_ref() {
+                            let payload = SlackMessage::with_site_text(
+                                &site_id,
+                                format!(
+                                    ":rotating_light: *CT watermark STUCK* :rotating_light:\n\
+                                     {reason}\n\
+                                     _The CT watcher is ticking but `last_seen_version` \
+                                     hasn't advanced and `CHANGE_TRACKING_CURRENT_VERSION()` \
+                                     is AHEAD (or unreachable). Common causes: every tick \
+                                     failing + rolling back the watermark UPDATE (check \
+                                     `legacy_sync_status.last_error`). Quiet legacy is \
+                                     suppressed by the quiet-aware probe; this alert \
+                                     means real changes are not being processed. Tighten \
+                                     the check via the dashboard at \
+                                     `/api/new/sync/status`._"
+                                ),
+                            );
+                            let _ = s.send_message(&payload).await;
+                        }
+                        last_stall_alert = Some(now);
+                    }
                 }
             } else if observation.last_seen_version > prior_obs.last_seen_version {
                 tracing::debug!(
@@ -3505,6 +3617,59 @@ mod tests {
             Duration::from_secs(1800),
         );
         assert!(result.is_none(), "advancing watermark must never alert");
+    }
+
+    // -------------------------------------------------------------------
+    // Quiet-aware watchdog gate (2026-05-14 incident)
+    // -------------------------------------------------------------------
+
+    /// When legacy CT is idle at the same version the watermark holds,
+    /// the watchdog must NOT fire — the watcher is correctly tracking
+    /// tip-of-stream, there's just nothing new to advance to. This is
+    /// the canonical false-positive case from 2026-05-14 (5 pages
+    /// across hfhotel + hfville during off-peak lunch/post-checkout
+    /// lulls).
+    #[test]
+    fn watchdog_silent_when_legacy_ct_quiet() {
+        let fire = should_fire_stall_alert(17209, Some(17209));
+        assert!(
+            !fire,
+            "watermark == CT current must suppress the alert (legacy is quiet)"
+        );
+    }
+
+    /// When `CHANGE_TRACKING_CURRENT_VERSION()` is ahead of the
+    /// watermark, the watcher is failing to process — real stall.
+    #[test]
+    fn watchdog_alerts_when_legacy_ct_ahead() {
+        let fire = should_fire_stall_alert(17209, Some(17250));
+        assert!(
+            fire,
+            "CT current > watermark means the watcher is wedged — must alert"
+        );
+    }
+
+    /// Probe failure / timeout must fall through to alert — uncertainty
+    /// is paged, not suppressed. Matches the "conservative" requirement
+    /// in the post-mortem.
+    #[test]
+    fn watchdog_alerts_when_probe_fails() {
+        let fire = should_fire_stall_alert(17209, None);
+        assert!(
+            fire,
+            "probe failure must fall through to alert (don't suppress on uncertainty)"
+        );
+    }
+
+    /// Defensive: CT current < watermark is impossible in healthy CT
+    /// (versions are monotonic), but if observed we should still alert.
+    #[test]
+    fn watchdog_alerts_when_probe_below_watermark() {
+        let fire = should_fire_stall_alert(17209, Some(100));
+        assert!(
+            fire,
+            "CT current < watermark is anomalous — must alert defensively"
+        );
     }
 
     /// Track D / T7 CRIT-3 — the canonical case the watchdog exists for:

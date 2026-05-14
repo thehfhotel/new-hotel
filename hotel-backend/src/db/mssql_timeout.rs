@@ -251,6 +251,49 @@ pub async fn simple_query_with_timeout(
     }
 }
 
+/// Same wire-level guarantees as [`simple_query_with_timeout`] but with
+/// a caller-supplied explicit budget instead of the env-cached
+/// per-`MssqlOpKind` defaults. Reserved for callers that need a
+/// tighter budget than the default read window — canonical use case
+/// is the watermark-stall watchdog's `CHANGE_TRACKING_CURRENT_VERSION()`
+/// probe, which fires every 60s and MUST fail fast (≤ 5s) so the
+/// watchdog tick doesn't drift behind a row-locked legacy.
+///
+/// Floor is still [`MIN_BUDGET_MS`] — a 0ms / 5ms budget would fail
+/// every call.
+pub async fn simple_query_with_explicit_timeout(
+    conn: &mut PooledConnection<'_, ConnectionManager>,
+    sql: &str,
+    budget: Duration,
+) -> Result<Vec<Row>, tiberius::error::Error> {
+    let budget = if budget.as_millis() < MIN_BUDGET_MS as u128 {
+        Duration::from_millis(MIN_BUDGET_MS)
+    } else {
+        budget
+    };
+    let fut = async {
+        let stream = conn.simple_query(sql).await?;
+        stream.into_first_result().await
+    };
+    match tokio::time::timeout(budget, fut).await {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            tracing::error!(
+                event_name = EV_TIBERIUS_TIMEOUT,
+                op_kind = "explicit",
+                budget_ms = budget.as_millis() as u64,
+                sql_kind = sql.split_whitespace().next().unwrap_or("<empty>"),
+                sql_len = sql.len(),
+                "MSSQL query exceeded explicit timeout — likely legacy row lock held by iHOTEL"
+            );
+            // Reuse the `Read` envelope text so log consumers see one
+            // consistent error shape; the explicit budget is captured
+            // in the `budget_ms` log field above.
+            Err(timeout_error(sql, MssqlOpKind::Read, budget))
+        }
+    }
+}
+
 /// Same wire-level guarantees as [`simple_query_with_timeout`] but for
 /// statements that don't need rows back (SET, BEGIN/COMMIT/ROLLBACK,
 /// fire-and-forget DML where the recipe asserts shape via the SQL
