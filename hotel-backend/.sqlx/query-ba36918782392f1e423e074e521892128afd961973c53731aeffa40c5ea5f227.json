@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                -- Check-in info\n                ci.cin_id,\n                ci.cin_no,\n                ci.cin_book_id,\n                COALESCE(b.book_no, '') as \"book_no!\",\n\n                -- Customer/Guest info (LEFT JOIN — coalesce to satisfy NOT NULL bindings; missing customer is rare for walk-ins)\n                COALESCE(c.cust_id, 0) as \"cust_id!\",\n                COALESCE(c.cust_firstname, '') as \"cust_firstname!\",\n                c.cust_lastname,\n                c.cust_email,\n                c.cust_phone,\n                c.cust_address,\n                c.cust_idcard,\n                c.cust_passport,\n\n                -- Room info (LEFT JOIN — coalesce in case of orphaned room_id)\n                COALESCE(r.room_id, 0) as \"room_id!\",\n                COALESCE(r.room_no, '') as \"room_no!\",\n                r.room_floor,\n                COALESCE(rt.type_name, '') as \"room_type!\",\n\n                -- Stay details\n                ci.cin_checkin_time,\n                ci.cin_checkout_time,\n                ci.cin_expected_checkout,\n                ci.cin_adults,\n                ci.cin_children,\n\n                -- Rate info\n                ci.cin_rate_per_night::float8 as cin_rate_per_night,\n                (COALESCE(ci.cin_checkout_time, ci.cin_expected_checkout)::date - ci.cin_checkin_time::date) as nights,\n\n                -- Totals\n                ci.cin_total_amount::float8 as cin_total_amount,\n                ci.cin_payment_status,\n\n                -- Notes and timestamps\n                ci.cin_notes,\n                ci.created_at\n            FROM ht_checkins ci\n            LEFT JOIN ht_customers c ON ci.cin_cust_id = c.cust_id\n            LEFT JOIN ht_rooms_new r ON ci.cin_room_id = r.room_id\n            LEFT JOIN ht_room_types rt ON r.room_type_id = rt.type_id\n            LEFT JOIN ht_bookings b ON ci.cin_book_id = b.book_id\n            WHERE ci.cin_id = $1\n            ",
+  "query": "\n            SELECT\n                -- Check-in info\n                ci.cin_id,\n                ci.cin_no,\n                ci.cin_book_id,\n                COALESCE(b.book_no, '') as \"book_no!\",\n\n                -- Customer/Guest info (LEFT JOIN — coalesce to satisfy NOT NULL bindings; missing customer is rare for walk-ins)\n                COALESCE(c.cust_id, 0) as \"cust_id!\",\n                COALESCE(c.cust_firstname, '') as \"cust_firstname!\",\n                c.cust_lastname,\n                c.cust_email,\n                c.cust_phone,\n                c.cust_address,\n                c.cust_idcard,\n                c.cust_passport,\n                -- G3 / T4 HIGH-7: corporate buyer tax-id (Track E2 column).\n                c.cust_work_tax,\n\n                -- Room info (LEFT JOIN — coalesce in case of orphaned room_id)\n                COALESCE(r.room_id, 0) as \"room_id!\",\n                COALESCE(r.room_no, '') as \"room_no!\",\n                r.room_floor,\n                COALESCE(rt.type_name, '') as \"room_type!\",\n\n                -- Stay details\n                ci.cin_checkin_time,\n                ci.cin_checkout_time,\n                ci.cin_expected_checkout,\n                ci.cin_adults,\n                ci.cin_children,\n\n                -- Rate info\n                ci.cin_rate_per_night::float8 as cin_rate_per_night,\n                (COALESCE(ci.cin_checkout_time, ci.cin_expected_checkout)::date - ci.cin_checkin_time::date) as nights,\n\n                -- Totals\n                ci.cin_total_amount::float8 as cin_total_amount,\n                ci.cin_payment_status,\n\n                -- Notes and timestamps\n                ci.cin_notes,\n                ci.created_at\n            FROM ht_checkins ci\n            LEFT JOIN ht_customers c ON ci.cin_cust_id = c.cust_id\n            LEFT JOIN ht_rooms_new r ON ci.cin_room_id = r.room_id\n            LEFT JOIN ht_room_types rt ON r.room_type_id = rt.type_id\n            LEFT JOIN ht_bookings b ON ci.cin_book_id = b.book_id\n            WHERE ci.cin_id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -65,76 +65,81 @@
       },
       {
         "ordinal": 12,
+        "name": "cust_work_tax",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 13,
         "name": "room_id!",
         "type_info": "Int4"
       },
       {
-        "ordinal": 13,
+        "ordinal": 14,
         "name": "room_no!",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 14,
+        "ordinal": 15,
         "name": "room_floor",
         "type_info": "Int4"
       },
       {
-        "ordinal": 15,
+        "ordinal": 16,
         "name": "room_type!",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 16,
+        "ordinal": 17,
         "name": "cin_checkin_time",
         "type_info": "Timestamp"
       },
       {
-        "ordinal": 17,
+        "ordinal": 18,
         "name": "cin_checkout_time",
         "type_info": "Timestamp"
       },
       {
-        "ordinal": 18,
+        "ordinal": 19,
         "name": "cin_expected_checkout",
         "type_info": "Date"
       },
       {
-        "ordinal": 19,
+        "ordinal": 20,
         "name": "cin_adults",
         "type_info": "Int4"
       },
       {
-        "ordinal": 20,
+        "ordinal": 21,
         "name": "cin_children",
         "type_info": "Int4"
       },
       {
-        "ordinal": 21,
+        "ordinal": 22,
         "name": "cin_rate_per_night",
         "type_info": "Float8"
       },
       {
-        "ordinal": 22,
+        "ordinal": 23,
         "name": "nights",
         "type_info": "Int4"
       },
       {
-        "ordinal": 23,
+        "ordinal": 24,
         "name": "cin_total_amount",
         "type_info": "Float8"
       },
       {
-        "ordinal": 24,
+        "ordinal": 25,
         "name": "cin_payment_status",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 25,
+        "ordinal": 26,
         "name": "cin_notes",
         "type_info": "Text"
       },
       {
-        "ordinal": 26,
+        "ordinal": 27,
         "name": "created_at",
         "type_info": "Timestamp"
       }
@@ -151,6 +156,7 @@
       null,
       null,
       null,
+      true,
       true,
       true,
       true,
@@ -174,5 +180,5 @@
       true
     ]
   },
-  "hash": "f6f4d04c3c21228fef9c4f20fcc391d3200222efc04ebcd8c92047d8ba93bdcd"
+  "hash": "ba36918782392f1e423e074e521892128afd961973c53731aeffa40c5ea5f227"
 }

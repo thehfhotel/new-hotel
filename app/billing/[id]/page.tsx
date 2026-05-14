@@ -18,6 +18,9 @@ interface InvoiceApiResponse {
     cinNo: string
     bookingId: number | null
     bookingNo: string | null
+    /** Track G3 / T4 HIGH-7: PG-only invoice number (deferred legacy
+     *  HT_INVOICE.INV_NO alignment — see new_invoice.rs module doc). */
+    invNo: string
     guest: {
       id: number
       firstName: string
@@ -28,6 +31,8 @@ interface InvoiceApiResponse {
       address: string | null
       idCard: string | null
       passport: string | null
+      /** Track G3: corporate buyer tax-id from cust_work_tax. */
+      taxId: string | null
     }
     room: {
       roomId: number
@@ -46,6 +51,10 @@ interface InvoiceApiResponse {
       subtotal: number
     }
     totalAmount: number
+    /** Track G3: VAT-inclusive split (banker's rounding server-side). */
+    beforeVat: number
+    vatAmount: number
+    vatPer: number
     paymentStatus: string | null
     notes: string | null
     createdAt: string | null
@@ -78,12 +87,18 @@ export default function InvoiceDetailPage({
         // Transform API response to InvoiceData format
         const invoice = data.invoice
         const transformedData: InvoiceData = {
-          invoiceNumber: invoice.cinNo,
+          // Track G3: prefer the dedicated invoice number (INVyyMM-NNNNNN)
+          // when the backend supplied one; fall back to the legacy cin_no
+          // for older API responses that pre-date the G3 field.
+          invoiceNumber: invoice.invNo || invoice.cinNo,
           cinNo: invoice.cinNo,
           checkInId: invoice.checkinId,
           guestName: invoice.guest.fullName,
           guestIdCard: invoice.guest.idCard || invoice.guest.passport || '',
           guestContact: invoice.guest.phone || invoice.guest.email || '',
+          // Track G3: corporate buyer tax-id. `undefined` for individual
+          // walk-ins so the InvoiceTemplate header hides the row.
+          guestTaxId: invoice.guest.taxId || undefined,
           checkInDate: invoice.checkInTime || '',
           checkOutDate: invoice.checkOutTime || invoice.expectedCheckout || '',
           rooms: [
@@ -97,7 +112,12 @@ export default function InvoiceDetailPage({
           ],
           subtotal: invoice.rates.subtotal,
           discount: 0,
-          vatAmount: 0,
+          // Track G3: VAT-inclusive split — derived server-side via
+          // banker's rounding so the printed receipt matches the legacy
+          // .NET app's Math.Round behaviour.
+          beforeVat: invoice.beforeVat,
+          vatAmount: invoice.vatAmount ?? 0,
+          vatPercent: invoice.vatPer,
           grandTotal: invoice.totalAmount || invoice.rates.subtotal,
           paymentMethod: invoice.paymentStatus || 'pending',
           paidAmount: invoice.totalAmount || 0,
@@ -189,8 +209,14 @@ export default function InvoiceDetailPage({
         <PrintButton size="md" showPdfOption={true} />
       </div>
 
-      {/* Invoice Template */}
-      <InvoiceTemplate checkInData={invoiceData} hotelInfo={hotelInfo} showVat={false} />
+      {/* Invoice Template — Track G3: show the VAT split whenever the
+          guest is a juristic person (has a buyer tax-id). Individual
+          walk-ins still print the inclusive total only. */}
+      <InvoiceTemplate
+        checkInData={invoiceData}
+        hotelInfo={hotelInfo}
+        showVat={Boolean(invoiceData.guestTaxId)}
+      />
 
       {/* Phase 5.5e — legacy_mirror panels (coupons / minibar / room moves).
           Hidden in print so the receipt itself stays clean. */}

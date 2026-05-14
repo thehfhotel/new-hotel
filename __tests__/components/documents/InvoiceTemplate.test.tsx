@@ -511,6 +511,93 @@ describe('InvoiceTemplate Component', () => {
     })
   })
 
+  // Track G3 / T4 HIGH-7 (`audit-2026-05-13.md`): VAT-inclusive split,
+  // buyer tax-id, and PG-only invoice number. These tests pin the
+  // render-time contract — server-side math is owned by
+  // `hotel-backend/src/routes/new_invoice.rs` test module.
+  describe('Track G3 — VAT invoice fields', () => {
+    test('renders buyer tax-id in header when guestTaxId is present', () => {
+      const corporateInvoice = createMockInvoiceData({
+        guestTaxId: 'REDACTED-tax-id',
+      })
+
+      render(<InvoiceTemplate {...defaultProps} checkInData={corporateInvoice} />)
+
+      // Label appears in the header alongside the seller's tax-id.
+      expect(
+        screen.getByText(/เลขประจำตัวผู้เสียภาษีของผู้ซื้อ \/ Buyer Tax ID:/)
+      ).toBeInTheDocument()
+      expect(screen.getByText('REDACTED-tax-id')).toBeInTheDocument()
+    })
+
+    test('hides buyer tax-id row when guestTaxId is absent (individual walk-in)', () => {
+      const walkInInvoice = createMockInvoiceData({ guestTaxId: undefined })
+
+      render(<InvoiceTemplate {...defaultProps} checkInData={walkInInvoice} />)
+
+      expect(
+        screen.queryByText(/เลขประจำตัวผู้เสียภาษีของผู้ซื้อ \/ Buyer Tax ID:/)
+      ).not.toBeInTheDocument()
+    })
+
+    test('renders VAT-inclusive split (before-VAT line) when beforeVat is supplied', () => {
+      // Server-side math (banker's rounding): total=801.00 → before=748.60, vat=52.40
+      const vatInvoice = createMockInvoiceData({
+        subtotal: 801,
+        beforeVat: 748.6,
+        vatAmount: 52.4,
+        vatPercent: 7,
+        grandTotal: 801,
+      })
+
+      render(
+        <InvoiceTemplate {...defaultProps} checkInData={vatInvoice} showVat={true} />
+      )
+
+      // Before-VAT line uses the new label.
+      expect(screen.getByText('มูลค่าก่อนภาษี / Before VAT:')).toBeInTheDocument()
+      expect(screen.getByText('748.60 บาท')).toBeInTheDocument()
+      // VAT line still rendered with the dynamic percentage.
+      expect(screen.getByText('ภาษีมูลค่าเพิ่ม 7% / VAT 7%:')).toBeInTheDocument()
+      expect(screen.getByText('52.40 บาท')).toBeInTheDocument()
+    })
+
+    test('renders dynamic VAT percentage from server when not 7%', () => {
+      // Hypothetical 10% — the template MUST NOT hardcode "7%".
+      const tenPercentInvoice = createMockInvoiceData({
+        beforeVat: 1000,
+        vatAmount: 100,
+        vatPercent: 10,
+        grandTotal: 1100,
+      })
+
+      render(
+        <InvoiceTemplate {...defaultProps} checkInData={tenPercentInvoice} showVat={true} />
+      )
+
+      expect(screen.getByText('ภาษีมูลค่าเพิ่ม 10% / VAT 10%:')).toBeInTheDocument()
+    })
+
+    test('skips before-VAT line for legacy responses missing beforeVat', () => {
+      // Older API responses (pre-G3) ship vatAmount only — no beforeVat.
+      // The template must continue to render the VAT line by itself so
+      // the regression test from earlier in this file still passes.
+      const legacyInvoice = createMockInvoiceData({
+        subtotal: 7500,
+        vatAmount: 525,
+        grandTotal: 8025,
+        // beforeVat intentionally undefined.
+      })
+
+      render(
+        <InvoiceTemplate {...defaultProps} checkInData={legacyInvoice} showVat={true} />
+      )
+
+      expect(screen.queryByText('มูลค่าก่อนภาษี / Before VAT:')).not.toBeInTheDocument()
+      expect(screen.getByText('ภาษีมูลค่าเพิ่ม 7% / VAT 7%:')).toBeInTheDocument()
+    })
+  })
+
   describe('Print Styles', () => {
     test('renders invoice container with print-friendly class', () => {
       const { container } = render(<InvoiceTemplate {...defaultProps} />)
