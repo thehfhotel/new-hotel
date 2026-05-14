@@ -90,9 +90,10 @@ async fn role_permission_grid_matches_audit_t4() {
             "coupon.redeem".to_string(),
             "inventory.consume".to_string(),
             "payment.refund".to_string(),
+            "pos.sell".to_string(),
             "reports.rr4".to_string(),
         ],
-        "admin role must hold all 8 permissions (got {admin:?})"
+        "admin role must hold all 9 permissions (got {admin:?})"
     );
 
     let cashier = perms_for_role(&pool, "cashier").await;
@@ -102,6 +103,7 @@ async fn role_permission_grid_matches_audit_t4() {
             "checkin.round_bill".to_string(),
             "coupon.redeem".to_string(),
             "payment.refund".to_string(),
+            "pos.sell".to_string(),
             "reports.rr4".to_string(),
         ],
         "cashier role grid drifted (got {cashier:?})"
