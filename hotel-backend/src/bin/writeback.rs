@@ -185,6 +185,7 @@ fn current_site_id() -> &'static str {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    hotel_backend::secrets::hydrate_env_from_secret_files();
     dotenvy::dotenv().ok();
 
     tracing_subscriber::fmt()

@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v2.66.2] - 2026-05-14 (Hotfix — wire secrets hydrator into binaries)
+
+### Fixed
+
+- **Production hotfix — `hydrate_env_from_secret_files()` was implemented
+  in `secrets.rs` but never called from any binary's `main()`.** PR #89
+  (secrets migration) added the module and removed `DB_PASSWORD` /
+  `POSTGRES_PASSWORD` env-var entries from the compose blocks, but
+  forgot to actually invoke the hydrator. Result: backend container
+  crash-looped in production on `AppConfig::from_env()` panic:
+  `DB_PASSWORD environment variable is required (must be set and
+  non-empty)`. Plus the `secrets` module wasn't even exposed in
+  `lib.rs` (no `pub mod secrets;`), so the call wouldn't have compiled
+  anyway. This fix:
+  - Adds `pub mod secrets;` to `hotel-backend/src/lib.rs`.
+  - Calls `hotel_backend::secrets::hydrate_env_from_secret_files()` as
+    the FIRST statement of `fn main()` in `src/main.rs`,
+    `src/bin/sync.rs`, and `src/bin/writeback.rs` (before
+    `dotenvy::dotenv()` so file-backed secrets win on prod and
+    `.env`-backed dev keeps working).
+  - **Operator note**: `/home/deploy/secrets/*` files on evergreen were
+    also chmod'd from `0400` to `0444` (and the parent dir from
+    `0700` to `0755`) so the backend container's non-root `appuser`
+    can read them. The deploy script (`/srv/run-deploy.sh` on
+    evergreen, separate from this repo) still creates them as `0400`
+    every deploy — a permanent fix needs to update that script to
+    use `0444`/`0755` going forward, otherwise the next deploy will
+    revert and we'll need to chmod again. Tracking as a follow-up.
+
 ## [v2.66.1] - 2026-05-14 (Track G6 — POS / sales-to-room module MVP)
 
 ### Added
