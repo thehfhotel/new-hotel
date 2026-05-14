@@ -422,6 +422,7 @@ const CT_ENABLED_TABLES: &[&str] = &[
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    hotel_backend::secrets::hydrate_env_from_secret_files();
     dotenvy::dotenv().ok();
 
     // Security audit 2026-05-14: hydrate sensitive env vars (DB_PASSWORD,

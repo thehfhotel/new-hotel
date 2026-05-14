@@ -33,6 +33,13 @@ use crate::scheduler::init_scheduler;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Hydrate env vars from /run/secrets/<file> BEFORE anything reads env.
+    // Backend container has DB_PASSWORD/POSTGRES_PASSWORD/etc removed from
+    // its environment: block in favor of Docker secrets (see CLAUDE.md
+    // "Credentials & Docker secrets"). Without this call,
+    // AppConfig::from_env() panics on missing DB_PASSWORD.
+    hotel_backend::secrets::hydrate_env_from_secret_files();
+
     // Load .env file if it exists
     dotenvy::dotenv().ok();
 

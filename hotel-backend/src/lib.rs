@@ -12,6 +12,7 @@
 pub mod config;
 pub mod db;
 pub mod domain;
+pub mod secrets;
 pub mod error;
 pub mod middleware;
 pub mod models;
