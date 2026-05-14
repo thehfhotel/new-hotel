@@ -11,9 +11,14 @@
 # Reads JSON from stdin:
 # {
 #   "commit_sha": "abc123...",
-#   "deploy_payload_b64": "<base64 tarball: docker-compose.yml + init-db/ + migrations/pg/ + scripts/migrate.sh>",
+#   "deploy_payload_b64": "<base64 tarball: docker-compose.yml + init-db/ + migrations/pg/ + scripts/migrate.sh + scripts/deploy/run-deploy.sh>",
 #   "env": { "DB_SERVER": "...", "DB_PASSWORD": "...", ... }
 # }
+#
+# Self-update: the tarball ships `scripts/deploy/run-deploy.sh` so the
+# script can replace itself in /srv/run-deploy.sh on each deploy — see
+# Track J5. The repo copy at scripts/deploy/run-deploy.sh is now the
+# source of truth; edit it there, not on the host.
 #
 # Logs to /var/log/deploy/deploy-<timestamp>.log so operator can post-mortem.
 
@@ -80,13 +85,44 @@ echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin >/dev
 echo "[deploy] ghcr authenticated as $GHCR_USER"
 
 # --- extract deploy artifacts -----------------------------------------------
-# The tar contains: docker-compose.yml, init-db/, migrations/pg/, scripts/migrate.sh
+# The tar contains: docker-compose.yml, init-db/, migrations/pg/,
+# scripts/migrate.sh, scripts/deploy/run-deploy.sh (self-update payload).
 # Extract into DEPLOY_DIR, replacing prior versions.
 echo "$PAYLOAD" | jq -r '.deploy_payload_b64' | base64 -d | tar -xz -C "$DEPLOY_DIR"
 [[ -f "$DEPLOY_DIR/docker-compose.yml" && -x "$DEPLOY_DIR/scripts/migrate.sh" ]] \
   || { echo "::error::tar extract incomplete"; exit 1; }
 
 cd "$DEPLOY_DIR"
+
+# --- self-update /srv/run-deploy.sh from repo (Track J5) --------------------
+# The tarball now ships `scripts/deploy/run-deploy.sh` (the repo's
+# version-controlled copy). Compare it against the live /srv/run-deploy.sh
+# and replace if different.
+#
+# Self-update timing: the new version takes effect on the NEXT deploy — the
+# currently-running script (this one) finishes with its own code. That's
+# intentional. Mid-flight `exec` of a freshly-overwritten script breaks the
+# tail of this run (logging FD, lock FD, $PAYLOAD vars all dropped). One
+# deploy of lag is the right trade.
+#
+# Sudo NOPASSWD for `install` on /srv/run-deploy.sh is required (see
+# /etc/sudoers.d/deploy-run-deploy on evergreen). Without it, this block
+# logs a warning and skips — the deploy continues with the existing script.
+SELF_UPDATE_SRC="$DEPLOY_DIR/scripts/deploy/run-deploy.sh"
+SELF_UPDATE_DST=/srv/run-deploy.sh
+if [ -f "$SELF_UPDATE_SRC" ]; then
+  if ! cmp -s "$SELF_UPDATE_SRC" "$SELF_UPDATE_DST"; then
+    if sudo -n install -m 0755 -o root -g root "$SELF_UPDATE_SRC" "$SELF_UPDATE_DST" 2>/dev/null; then
+      echo "[deploy] self-updated $SELF_UPDATE_DST from repo (effective next deploy)"
+    else
+      echo "::warning::self-update of $SELF_UPDATE_DST skipped — sudo NOPASSWD missing or install failed"
+    fi
+  else
+    echo "[deploy] $SELF_UPDATE_DST already matches repo copy"
+  fi
+else
+  echo "::warning::no scripts/deploy/run-deploy.sh in payload — self-update skipped"
+fi
 
 # --- materialize .env from payload ------------------------------------------
 # Subshell-scoped umask so .env is born 600 with no world-readable window,
@@ -109,6 +145,47 @@ for var in "${required[@]}"; do
     || { echo "::error::env var $var missing or empty"; exit 1; }
 done
 echo "[deploy] artifacts staged at $DEPLOY_DIR, .env mode $(stat -c '%a' .env)"
+
+# --- materialize Docker secret files from payload ---------------------------
+# PR #89 (security audit 2026-05-14) moved DB_PASSWORD / POSTGRES_PASSWORD /
+# VILLE_DB_PASSWORD / SLACK_WEBHOOK_URL out of compose `environment:` blocks
+# into top-level `secrets:` that bind-mount /home/deploy/secrets/<name> at
+# /run/secrets/<name>. The Rust hydrator (hotel-backend/src/secrets.rs) reads
+# them at process start so downstream env::var(...) callers keep working.
+#
+# The workflow now ALSO ships a `.secrets` JSON object alongside `.env`
+# (`{ db_password, postgres_password, ville_db_password, slack_webhook_url }`).
+# Defensive `// {}` fallback: payloads from an OLDER workflow that lack the
+# secrets block are tolerated — the loop is a no-op and the env-var fallback
+# inside the Rust hydrator handles those (additive-migration window).
+#
+# Writes are atomic: `install` creates the destination + sets mode + owner
+# in one syscall, so a concurrent `docker compose up` can never see a
+# half-written file. Mode 0400 (read-only, owner-only) matches the same
+# tight perms `docker secret create` would use in swarm mode.
+SECRETS_DIR_HOST=/home/deploy/secrets
+mkdir -p "$SECRETS_DIR_HOST"
+chmod 0755 "$SECRETS_DIR_HOST"
+chown deploy:docker "$SECRETS_DIR_HOST"
+
+secrets_written=0
+while IFS=$'\t' read -r secret_name secret_value; do
+  [ -z "$secret_name" ] && continue
+  # `printf %s` (no trailing newline) — the Rust hydrator strips one trailing
+  # `\n` if present, but writing without one keeps `wc -c` matching the raw
+  # value length, which is the operator's quickest sanity check.
+  printf '%s' "$secret_value" \
+    | install -m 0444 -o deploy -g docker /dev/stdin "$SECRETS_DIR_HOST/$secret_name"
+  secrets_written=$((secrets_written + 1))
+done < <(echo "$PAYLOAD" | jq -r '.secrets // {} | to_entries[] | "\(.key)\t\(.value)"')
+
+if [ "$secrets_written" -eq 0 ]; then
+  echo "::warning::no .secrets block in payload — falling back to env-var path"
+else
+  echo "[deploy] wrote $secrets_written secret file(s) to $SECRETS_DIR_HOST"
+  # Print sizes only (no values) for operator confirmation.
+  wc -c "$SECRETS_DIR_HOST"/* | sed 's|^|[deploy] |'
+fi
 
 # --- helpers ----------------------------------------------------------------
 
@@ -157,6 +234,7 @@ docker compose up -d newdb
 wait_healthy new-hotel-db 120
 
 ./scripts/migrate.sh
+./scripts/migrate.sh --site hfville
 
 docker compose up -d
 wait_healthy new-hotel-production-backend-1 90

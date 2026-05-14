@@ -41,6 +41,14 @@ Summary:
 
 4. **To deploy**: Simply `git push` to master - the pipeline handles everything automatically
 
+5. **Deploy script (`run-deploy.sh`) is version-controlled** (Track J5, 2026-05-14):
+   - The repo copy at `scripts/deploy/run-deploy.sh` is the source of truth.
+   - Edit it IN THE REPO — never on the host directly.
+   - The workflow bundles it in the deploy tarball; the live `/srv/run-deploy.sh`
+     on evergreen self-updates from the repo on every deploy (effective next deploy).
+   - Forced-command SSH config on evergreen blocks scp/rsync; the self-update
+     tail block in the script itself is the sync mechanism.
+
 ## Project Structure
 
 - `/app` - Next.js App Router pages (frontend only, no API routes except /api/changelog)
