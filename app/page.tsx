@@ -401,8 +401,9 @@ export default function NewDashboard() {
                           className="bg-panel border border-border hover:border-borderStrong p-1 flex flex-col items-center justify-center h-[60px] overflow-hidden transition-colors relative"
                           title={`${room.roomNumber} - ${room.type} ${room.details}`}
                         >
-                          {/* Tiny status dot in the top-right corner — colour without flooding the tile */}
-                          <span className={`absolute top-1 right-1 w-2 h-2 rounded-full ${config.dot}`} />
+                          {/* Status indicator in the top-right corner — colour without flooding the tile.
+                              Shape (round vs square) and size are skin-driven via [data-status] in globals.css. */}
+                          <span data-status className={`absolute top-1 right-1 w-2 h-2 rounded-full ${config.dot}`} />
                           <span className="font-semibold text-[12px] leading-tight text-text">{room.roomNumber}</span>
                           <span className="text-[9px] leading-tight text-textMuted">{room.type}</span>
                           <span className="text-[9px] leading-tight text-textMuted/80">{room.details}</span>
@@ -429,7 +430,7 @@ export default function NewDashboard() {
                 onClick={() => setSelectedRoom(room)}
                 className="bg-panel hover:bg-headerBar w-full flex items-center gap-3 p-2 border border-border"
               >
-                <div className={`w-2 h-2 rounded-full ${config.dot}`} />
+                <div data-status className={`w-2 h-2 rounded-full ${config.dot}`} />
                 <span className="font-semibold text-text">{room.roomNumber}</span>
                 <span className="text-textMuted text-[12px]">{room.type}</span>
                 <span className="text-textMuted/80 text-[12px]">{room.details}</span>
@@ -442,7 +443,7 @@ export default function NewDashboard() {
         <div className="flex flex-wrap gap-3 mt-3 pt-3 border-t border-border">
           {Object.entries(statusConfig).map(([status, config]) => (
             <div key={status} className="flex items-center gap-1.5">
-              <div className={`w-2 h-2 rounded-full ${config.dot}`} />
+              <div data-status className={`w-2 h-2 rounded-full ${config.dot}`} />
               <span className="text-[11px] text-textMuted">{config.label}</span>
             </div>
           ))}
@@ -496,7 +497,7 @@ export default function NewDashboard() {
                 ห้อง {selectedRoom.roomNumber}
               </h3>
               <span className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[11px] bg-panel border border-border">
-                <span className={`w-2 h-2 rounded-full ${statusConfig[selectedRoom.status].dot}`} />
+                <span data-status className={`w-2 h-2 rounded-full ${statusConfig[selectedRoom.status].dot}`} />
                 {statusConfig[selectedRoom.status].label}
               </span>
             </div>

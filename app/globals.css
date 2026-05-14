@@ -183,6 +183,17 @@ html, body {
   min-height: 100vh;
 }
 
+/* Status indicators (room-grid tiles, mobile list, legend, room-detail pill).
+   Marked with `data-status` so the skin — not the component — controls shape
+   and size. Fiori leaves them as the original 8px circles; modern promotes
+   them to a slightly larger square with a 2px radius for a clearer at-a-glance
+   read against the airier, lower-contrast modern tile. */
+[data-skin='modern'] [data-status] {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
+
 /* Scrollbar styling for new system */
 .new-system-scrollbar ::-webkit-scrollbar {
   width: 6px;
