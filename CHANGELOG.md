@@ -7,6 +7,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.67.0](https://github.com/thehfhotel/new-hotel/compare/v2.66.4...v2.67.0) (2026-05-14)
+
+
+### Added
+
+* **sync:** J1 — projection-lock macro for all legacy-MSSQL projections ([#107](https://github.com/thehfhotel/new-hotel/issues/107)) ([e646431](https://github.com/thehfhotel/new-hotel/commit/e6464313732dc040c083b9facdc0a90aee54661e))
+
+
+### Fixed
+
+* **routes:** add Cashier + Housekeeper to domain::user::Role enum ([#111](https://github.com/thehfhotel/new-hotel/issues/111)) ([f138b22](https://github.com/thehfhotel/new-hotel/commit/f138b228f935f1267b2303ac7b1871466558414b))
+
+
+### Changed
+
+* **tests:** J4 — invariant-based permission grid tests ([#105](https://github.com/thehfhotel/new-hotel/issues/105)) ([d1b3b34](https://github.com/thehfhotel/new-hotel/commit/d1b3b347b8efdace494b9d19d6383d840471a43b))
+
 ## [v2.66.4] - 2026-05-14 (Fix — customer reconcile hash projection drift)
 
 ### Fixed
@@ -8364,4 +8381,3 @@ with operator alerting. Per `docs/architecture.md` §8 (Phase 6 row).
 - Tailwind CSS for styling
 - Recharts for data visualization
 - Jest for testing (22 tests passing)
-
