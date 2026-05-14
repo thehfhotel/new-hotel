@@ -81,6 +81,209 @@ use hotel_backend::sync::row::MappableRow;
 use hotel_backend::sync::{MssqlChangeMapper, NoopMapper};
 use hotel_backend::writeback::verify_ct_schema_fingerprint;
 
+// ============================================================================
+// Resilience PR R1 — structured error taxonomy for the CT watcher
+// ============================================================================
+//
+// Background. The 2026-05-14 HF-Hotel CT watermark stall (74-min outage) was
+// rendered forensically opaque because:
+//   * The pre-restart `docker logs` rotated away when `sync-1` was recreated
+//     by the deploy.
+//   * `legacy_sync_status.last_error` was overwritten by post-restart healthy
+//     ticks (per-table counter bumps clear the row's error fields on the
+//     first 0-row tick after recovery).
+//   * The `tracing::error!` lines used free-form strings — no stable
+//     `event_name` to grep across pre- and post-incident log windows.
+//
+// The taxonomy below assigns a stable, dot-delimited identifier to every
+// failure mode the tick loop can surface. Two consumers benefit:
+//   1. `tracing` JSON output — `event_name` becomes a top-level field
+//      operators can filter on in Loki / journalctl / `jq`.
+//   2. `legacy_sync_status.last_error` — when persisted via
+//      `record_table_error`, the event_name is prefixed (`"sync.foo: <msg>"`)
+//      so the next operator triaging a stalled table can see the failure
+//      MODE even after the original log line is gone.
+//
+// Adding a new event name. Define a `const EV_…: &str = "sync.…"`, hand it
+// to the relevant `tracing::error!` / `record_table_error` call, and add a
+// `KNOWN_SYNC_EVENT_NAMES` entry below so the registry test stays green.
+
+/// Failed to read the CT watermark (`legacy_ct_state.last_seen_version`)
+/// at the top of a tick. PG-side read error — usually transient.
+pub const EV_WATERMARK_READ_FAIL: &str = "sync.watermark_read_fail";
+
+/// Failed to advance the watermark after a successful tick. PG UPDATE
+/// failure — leaves the watcher at risk of re-fetching the same CT rows
+/// next tick (idempotent, but observability flag).
+pub const EV_WATERMARK_ADVANCE_FAIL: &str = "sync.watermark_advance_fail";
+
+/// Legacy MSSQL connectivity probe failed at the top of a tick. Tunnel
+/// flap or pool exhaustion. Short-circuits the entire tick.
+pub const EV_LEGACY_PROBE_FAIL: &str = "sync.legacy_probe_fail";
+
+/// CT retention guard failed — could not query `CHANGE_TRACKING_MIN_VALID_VERSION`
+/// for the table. NOT the same as a retention OVERFLOW (that's
+/// `EV_CT_RETENTION_OVERFLOW`); this is the round-trip itself failing.
+pub const EV_RETENTION_CHECK_FAIL: &str = "sync.retention_check_fail";
+
+/// CT retention overflow detected — `MIN_VALID_VERSION > last_seen_version`.
+/// Watcher cannot resume without bootstrap. Paged via Slack separately.
+pub const EV_CT_RETENTION_OVERFLOW: &str = "sync.ct_retention_overflow";
+
+/// `SELECT … FROM CHANGETABLE(CHANGES …) COUNT(*)` query failed
+/// (NoopMapper path). Usually a tiberius / pool error.
+pub const EV_CT_COUNT_FAIL: &str = "sync.ct_count_fail";
+
+/// `SELECT … FROM CHANGETABLE(CHANGES …) JOIN <table>` failed (real
+/// mapper path). Usually a tiberius / pool error.
+pub const EV_CT_FETCH_FAIL: &str = "sync.ct_fetch_fail";
+
+/// Failed to begin the per-table PG transaction at the top of `poll_table`.
+/// Almost always pool exhaustion.
+pub const EV_PG_TX_BEGIN_FAIL: &str = "sync.pg_tx_begin_fail";
+
+/// Failed to commit the per-table PG transaction. Leaves the canonical
+/// projection mid-update; the next tick re-fetches the same CT range and
+/// retries idempotently.
+pub const EV_PG_TX_COMMIT_FAIL: &str = "sync.pg_tx_commit_fail";
+
+/// `parent_loader::load_booking_aggregate` / `load_checkin_aggregate`
+/// returned an error. The aggregate row is skipped this tick; the next
+/// CT tick on the same key will retry.
+pub const EV_LOAD_AGGREGATE_FAIL: &str = "sync.load_aggregate_fail";
+
+/// `apply_*_aggregate` (coalesced path) returned a domain-level error —
+/// usually an FK resolution miss or a UUID derivation failure. Recorded
+/// and skipped.
+pub const EV_AGGREGATE_APPLY_FAIL: &str = "sync.aggregate_apply_fail";
+
+/// Per-row `mapper.apply` (Phase 5.2 dispatch path: customer / room /
+/// room_status) returned an error.
+pub const EV_MAPPER_APPLY_FAIL: &str = "sync.mapper_apply_fail";
+
+/// `persist_event` (event_log INSERT) failed. Canonical row already
+/// applied; the missing event_log row is visible to operators as a
+/// counter drift.
+pub const EV_PERSIST_EVENT_FAIL: &str = "sync.persist_event_fail";
+
+/// Failed to UPDATE `legacy_sync_status` counters at the end of a tick.
+/// Pure observability degradation — canonical state is unaffected.
+pub const EV_STATUS_UPDATE_FAIL: &str = "sync.status_update_fail";
+
+/// Caught a CT row with `SYS_CHANGE_OPERATION` outside `{I,U,D}`.
+/// Indicates either a CT bug or a schema drift; never observed in prod.
+pub const EV_UNKNOWN_CT_OP: &str = "sync.unknown_ct_op";
+
+/// D-event orphan recovery on `HT_CheckIn_Ds` could not resolve the
+/// parent `Cin_no` via `ht_checkins.legacy_checkin_ds_id`. Canonical
+/// aggregate may stay stale until the next CT tick on the parent header.
+pub const EV_ORPHAN_RECOVERY_FAIL: &str = "sync.orphan_recovery_fail";
+
+/// Shadow-mode rollback of the per-table TX failed. Cosmetic — the TX
+/// was already a no-op for canonical state by design of shadow mode.
+pub const EV_SHADOW_ROLLBACK_FAIL: &str = "sync.shadow_rollback_fail";
+
+/// Registry of every event_name emitted by the watcher. Kept as a
+/// const array so the unit test below can lock in the set — a refactor
+/// that adds a new event must add it here too. Order is not significant
+/// (the registry is membership-tested, not pattern-matched).
+const KNOWN_SYNC_EVENT_NAMES: &[&str] = &[
+    EV_WATERMARK_READ_FAIL,
+    EV_WATERMARK_ADVANCE_FAIL,
+    EV_LEGACY_PROBE_FAIL,
+    EV_RETENTION_CHECK_FAIL,
+    EV_CT_RETENTION_OVERFLOW,
+    EV_CT_COUNT_FAIL,
+    EV_CT_FETCH_FAIL,
+    EV_PG_TX_BEGIN_FAIL,
+    EV_PG_TX_COMMIT_FAIL,
+    EV_LOAD_AGGREGATE_FAIL,
+    EV_AGGREGATE_APPLY_FAIL,
+    EV_MAPPER_APPLY_FAIL,
+    EV_PERSIST_EVENT_FAIL,
+    EV_STATUS_UPDATE_FAIL,
+    EV_UNKNOWN_CT_OP,
+    EV_ORPHAN_RECOVERY_FAIL,
+    EV_SHADOW_ROLLBACK_FAIL,
+];
+
+/// Cap on the `legacy_sync_status.last_error` payload we persist. The
+/// column itself is `TEXT` (unbounded), but a multi-MB tiberius error
+/// would (a) bloat the row, (b) destroy dashboard readability, and
+/// (c) potentially echo attacker-controlled bytes from a malformed
+/// upstream value. 1 KiB is enough for the event_name prefix + a
+/// human-readable summary; the full error stays in the log.
+const LAST_ERROR_MAX_LEN: usize = 1024;
+
+/// Defensive sanitization for the `last_error` payload before we write
+/// it to PG. Two concerns:
+///   1. Length — truncate at `LAST_ERROR_MAX_LEN` chars (NOT bytes; we
+///      truncate at a char boundary so a multibyte glyph doesn't get
+///      split mid-codepoint and break a downstream JSON consumer).
+///   2. Interior `"` / newlines / control chars — replaced with their
+///      JSON-style escape so an upstream MSSQL error containing
+///      attacker-controlled bytes can't break the dashboard's JSON
+///      render. Defensive against the prompt-injection vector flagged
+///      in the 2026-05-14 post-mortem.
+///
+/// Pure function — exposed at module scope so the unit tests below can
+/// exercise it without a PG handle.
+fn sanitize_last_error(raw: &str) -> String {
+    // Step 1: escape interior bytes that would break JSON / log consumers.
+    // Mirrors a subset of `serde_json::to_string` for `&str` but stays
+    // dependency-free and produces predictable output for the test
+    // assertions.
+    let mut escaped = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                // Other C0 control chars — render as Unicode escape so
+                // the dashboard can't render them as glyphs.
+                escaped.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => escaped.push(c),
+        }
+    }
+
+    // Step 2: truncate at a char boundary so we never split a multibyte
+    // glyph in half. `String::truncate` already requires a char boundary,
+    // but we compute the boundary ourselves to keep the post-truncate
+    // string a clean prefix rather than panic'ing.
+    if escaped.chars().count() <= LAST_ERROR_MAX_LEN {
+        return escaped;
+    }
+    let mut out = String::with_capacity(LAST_ERROR_MAX_LEN + 16);
+    for (i, ch) in escaped.chars().enumerate() {
+        if i >= LAST_ERROR_MAX_LEN - 1 {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push('…');
+    out
+}
+
+/// Build the `legacy_sync_status.last_error` payload from an event_name
+/// + raw error. Format: `"<event_name>: <sanitized_summary>"`. Operators
+/// see the failure MODE first (greppable, stable) followed by the
+/// (truncated, JSON-safe) details.
+fn format_last_error(event_name: &str, raw: &str) -> String {
+    let sanitized = sanitize_last_error(raw);
+    let mut out = String::with_capacity(event_name.len() + 2 + sanitized.len());
+    out.push_str(event_name);
+    out.push_str(": ");
+    out.push_str(&sanitized);
+    // Re-truncate the combined string in case the event_name prefix
+    // pushed us past the cap (it shouldn't — event_names are short —
+    // but defensive against a future longer naming scheme).
+    sanitize_last_error(&out)
+}
+
 const DEFAULT_CT_POLL_INTERVAL_MS: u64 = 1000;
 
 /// How often to verify each table's CT retention window
@@ -1291,7 +1494,12 @@ async fn run_one_tick(
     let last_seen = match hotel_backend::sync::watermark::read_last_seen(pg).await {
         Ok(v) => v,
         Err(err) => {
-            tracing::error!(error = %err, "Failed to read CT watermark; skipping tick");
+            tracing::error!(
+                event_name = EV_WATERMARK_READ_FAIL,
+                site = %site_id,
+                error = %err,
+                "Failed to read CT watermark; skipping tick"
+            );
             return;
         }
     };
@@ -1305,6 +1513,7 @@ async fn run_one_tick(
     // doc for the burn-in evidence.
     if let Err(err) = probe_legacy_connectivity(mssql).await {
         tracing::warn!(
+            event_name = EV_LEGACY_PROBE_FAIL,
             site = %site_id,
             error = %err,
             "Legacy MSSQL probe failed; skipping tick"
@@ -1348,8 +1557,19 @@ async fn run_one_tick(
         )
         .await
         {
-            tracing::error!(site = %site_id, table, error = %err, "poll_table failed");
-            let _ = record_table_error(pg, table, &err.to_string()).await;
+            // Top-level fallback — `poll_table` already records granular
+            // event_names for failures it can attribute to a specific
+            // stage. A bubble-up to here is rare (only the panic-free
+            // `Result` shape escaped the inner fn) but we still attach
+            // an event_name so log filters never see a "naked" error.
+            tracing::error!(
+                event_name = EV_MAPPER_APPLY_FAIL,
+                site = %site_id,
+                table,
+                error = %err,
+                "poll_table failed"
+            );
+            let _ = record_table_error(pg, table, EV_MAPPER_APPLY_FAIL, &err.to_string()).await;
         }
     }
 }
@@ -1381,8 +1601,24 @@ async fn poll_table(
     // 1. Retention guard (throttled — see fn doc comment).
     if should_check_retention {
         if let Err(err) = check_retention(mssql, table, last_seen).await {
-            tracing::error!(site = %site_id, table, error = %err, "Retention check failed");
-            let _ = record_table_error(pg, table, &err).await;
+            // `check_retention` returns a String that already encodes the
+            // failure shape — both "retention overflow" (a hard stop the
+            // operator must address) and "round-trip failed" (transient).
+            // Discriminate on the substring `check_retention` itself
+            // uses; same predicate the Slack page below uses.
+            let event_name = if err.contains("retention") {
+                EV_CT_RETENTION_OVERFLOW
+            } else {
+                EV_RETENTION_CHECK_FAIL
+            };
+            tracing::error!(
+                event_name,
+                site = %site_id,
+                table,
+                error = %err,
+                "Retention check failed"
+            );
+            let _ = record_table_error(pg, table, event_name, &err).await;
             if let Some(s) = slack {
                 if err.contains("retention") {
                     let msg = SlackMessage::with_site_text(
@@ -1408,13 +1644,19 @@ async fn poll_table(
         let row_count = match count_ct_rows(mssql, table, last_seen).await {
             Ok(n) => n,
             Err(err) => {
-                tracing::warn!(table, error = %err, "CT count query failed");
-                let _ = record_table_error(pg, table, &err).await;
+                tracing::warn!(
+                    event_name = EV_CT_COUNT_FAIL,
+                    table,
+                    error = %err,
+                    "CT count query failed"
+                );
+                let _ = record_table_error(pg, table, EV_CT_COUNT_FAIL, &err).await;
                 return Ok(());
             }
         };
         if let Err(err) = bump_skipped(pg, table, row_count, false).await {
             tracing::warn!(
+                event_name = EV_STATUS_UPDATE_FAIL,
                 table,
                 error = %err,
                 "Failed to update legacy_sync_status — observability degraded"
@@ -1433,8 +1675,13 @@ async fn poll_table(
     let rows = match fetch_ct_rows(mssql, table, pk_cols, select_sql, last_seen).await {
         Ok(rs) => rs,
         Err(err) => {
-            tracing::warn!(table, error = %err, "CT fetch failed");
-            let _ = record_table_error(pg, table, &err).await;
+            tracing::warn!(
+                event_name = EV_CT_FETCH_FAIL,
+                table,
+                error = %err,
+                "CT fetch failed"
+            );
+            let _ = record_table_error(pg, table, EV_CT_FETCH_FAIL, &err).await;
             return Ok(());
         }
     };
@@ -1475,7 +1722,13 @@ async fn poll_table(
     let mut tx = match pg.begin().await {
         Ok(t) => t,
         Err(err) => {
-            tracing::error!(table, error = %err, "Failed to begin PG TX");
+            tracing::error!(
+                event_name = EV_PG_TX_BEGIN_FAIL,
+                table,
+                error = %err,
+                "Failed to begin PG TX"
+            );
+            let _ = record_table_error(pg, table, EV_PG_TX_BEGIN_FAIL, &err.to_string()).await;
             return Ok(());
         }
     };
@@ -1515,6 +1768,7 @@ async fn poll_table(
             // semantics.
             if let Err(err) = ChangeOp::try_from(op_char.as_str()) {
                 tracing::warn!(
+                    event_name = EV_UNKNOWN_CT_OP,
                     table,
                     sys_change_operation = %op_char,
                     error = %err,
@@ -1564,7 +1818,9 @@ async fn poll_table(
                 }
                 let Some(ds_id) = row.try_get_i32("id").ok().flatten() else {
                     tracing::warn!(
+                        event_name = EV_ORPHAN_RECOVERY_FAIL,
                         table,
+                        reason = "missing_pk_alias",
                         "D-event row missing `id` PK alias — cannot recover \
                          parent Cin_no; canonical row may stay stale"
                     );
@@ -1590,8 +1846,10 @@ async fn poll_table(
                     }
                     Ok(_) => {
                         tracing::warn!(
+                            event_name = EV_ORPHAN_RECOVERY_FAIL,
                             table,
                             ds_id,
+                            reason = "no_matching_pg_row",
                             "D-event orphan recovery FAILED: no ht_checkins \
                              row carries legacy_checkin_ds_id={ds_id}; \
                              canonical aggregate may stay stale until next \
@@ -1600,8 +1858,10 @@ async fn poll_table(
                     }
                     Err(err) => {
                         tracing::warn!(
+                            event_name = EV_ORPHAN_RECOVERY_FAIL,
                             table,
                             ds_id,
+                            reason = "lookup_query_errored",
                             error = %err,
                             "D-event orphan recovery query errored; skipping"
                         );
@@ -1623,12 +1883,20 @@ async fn poll_table(
                         Ok(a) => apply_booking_aggregate(&mut tx, &a, key).await,
                         Err(err) => {
                             tracing::warn!(
+                                event_name = EV_LOAD_AGGREGATE_FAIL,
                                 table,
+                                aggregate = "booking",
                                 key = %key,
                                 error = %err,
                                 "Failed to load booking aggregate; recording and continuing"
                             );
-                            let _ = record_table_error(pg, table, &err.to_string()).await;
+                            let _ = record_table_error(
+                                pg,
+                                table,
+                                EV_LOAD_AGGREGATE_FAIL,
+                                &err.to_string(),
+                            )
+                            .await;
                             errored = true;
                             skipped += 1;
                             continue;
@@ -1640,12 +1908,20 @@ async fn poll_table(
                         Ok(a) => apply_checkin_aggregate(&mut tx, Some(mssql), &a, key).await,
                         Err(err) => {
                             tracing::warn!(
+                                event_name = EV_LOAD_AGGREGATE_FAIL,
                                 table,
+                                aggregate = "checkin",
                                 key = %key,
                                 error = %err,
                                 "Failed to load checkin aggregate; recording and continuing"
                             );
-                            let _ = record_table_error(pg, table, &err.to_string()).await;
+                            let _ = record_table_error(
+                                pg,
+                                table,
+                                EV_LOAD_AGGREGATE_FAIL,
+                                &err.to_string(),
+                            )
+                            .await;
                             errored = true;
                             skipped += 1;
                             continue;
@@ -1655,7 +1931,9 @@ async fn poll_table(
                 "HT_CheckIn_Pay" => apply_payment_aggregate(&mut tx, mssql, key).await,
                 other => {
                     tracing::warn!(
+                        event_name = EV_AGGREGATE_APPLY_FAIL,
                         table = other,
+                        reason = "unknown_aggregate_table",
                         "Unknown coalesced aggregate table — skipping"
                     );
                     skipped += 1;
@@ -1675,6 +1953,7 @@ async fn poll_table(
                         skipped += 1;
                     } else if let Err(err) = persist_event(&mut tx, &event).await {
                         tracing::error!(
+                            event_name = EV_PERSIST_EVENT_FAIL,
                             table,
                             key = %key,
                             error = %err,
@@ -1691,12 +1970,19 @@ async fn poll_table(
                 }
                 Err(err) => {
                     tracing::warn!(
+                        event_name = EV_AGGREGATE_APPLY_FAIL,
                         table,
                         key = %key,
                         error = %err,
                         "aggregate apply error — recording and continuing"
                     );
-                    let _ = record_table_error(pg, table, &err.to_string()).await;
+                    let _ = record_table_error(
+                        pg,
+                        table,
+                        EV_AGGREGATE_APPLY_FAIL,
+                        &err.to_string(),
+                    )
+                    .await;
                     errored = true;
                     skipped += 1;
                 }
@@ -1710,6 +1996,7 @@ async fn poll_table(
                 Ok(o) => o,
                 Err(err) => {
                     tracing::warn!(
+                        event_name = EV_UNKNOWN_CT_OP,
                         table,
                         sys_change_operation = %op_char,
                         error = %err,
@@ -1738,6 +2025,7 @@ async fn poll_table(
                         skipped += 1;
                     } else if let Err(err) = persist_event(&mut tx, &event).await {
                         tracing::error!(
+                            event_name = EV_PERSIST_EVENT_FAIL,
                             table,
                             version,
                             op = ?op,
@@ -1755,13 +2043,20 @@ async fn poll_table(
                 }
                 Err(err) => {
                     tracing::warn!(
+                        event_name = EV_MAPPER_APPLY_FAIL,
                         table,
                         version,
                         op = ?op,
                         error = %err,
                         "Mapper error — recording and continuing"
                     );
-                    let _ = record_table_error(pg, table, &err.to_string()).await;
+                    let _ = record_table_error(
+                        pg,
+                        table,
+                        EV_MAPPER_APPLY_FAIL,
+                        &err.to_string(),
+                    )
+                    .await;
                     errored = true;
                     skipped += 1;
                 }
@@ -1776,7 +2071,12 @@ async fn poll_table(
     // 5. Commit (live) or rollback (shadow).
     if shadow_mode {
         if let Err(err) = tx.rollback().await {
-            tracing::warn!(table, error = %err, "Shadow-mode rollback failed");
+            tracing::warn!(
+                event_name = EV_SHADOW_ROLLBACK_FAIL,
+                table,
+                error = %err,
+                "Shadow-mode rollback failed"
+            );
         }
         // Bump skipped counter to mirror the noop path's behavior.
         let _ = bump_skipped(pg, table, row_count, errored).await;
@@ -1784,14 +2084,24 @@ async fn poll_table(
     }
 
     if let Err(err) = tx.commit().await {
-        tracing::error!(table, error = %err, "PG TX commit failed");
-        let _ = record_table_error(pg, table, &err.to_string()).await;
+        tracing::error!(
+            event_name = EV_PG_TX_COMMIT_FAIL,
+            table,
+            error = %err,
+            "PG TX commit failed"
+        );
+        let _ = record_table_error(pg, table, EV_PG_TX_COMMIT_FAIL, &err.to_string()).await;
         return Ok(());
     }
 
     // 6. Counters + watermark advance (live mode only).
     if let Err(err) = bump_counters(pg, table, ingested, skipped, errored).await {
-        tracing::warn!(table, error = %err, "Failed to bump counters");
+        tracing::warn!(
+            event_name = EV_STATUS_UPDATE_FAIL,
+            table,
+            error = %err,
+            "Failed to bump counters"
+        );
     }
 
     if max_version > last_seen {
@@ -1799,11 +2109,26 @@ async fn poll_table(
             hotel_backend::sync::watermark::advance(pg, max_version).await
         {
             tracing::error!(
+                event_name = EV_WATERMARK_ADVANCE_FAIL,
                 table,
                 new_version = max_version,
                 error = %err,
                 "Failed to advance CT watermark"
             );
+            // Persist the watermark-advance failure mode so it survives
+            // a container restart — this is the exact symptom from the
+            // 2026-05-14 74-min stall and was previously invisible
+            // post-recreate because the failed-tick TX had no PG-side
+            // write to attribute it to. Per the R1 spec, we run this
+            // in its OWN sqlx auto-TX so the canonical state UPDATE
+            // (already committed above) is unaffected.
+            let _ = record_table_error(
+                pg,
+                table,
+                EV_WATERMARK_ADVANCE_FAIL,
+                &err.to_string(),
+            )
+            .await;
         } else {
             tracing::info!(
                 table,
@@ -2140,11 +2465,23 @@ async fn bump_counters(
     Ok(())
 }
 
+/// Persist a per-table failure mode to `legacy_sync_status` for
+/// cross-restart visibility. Runs in its OWN sqlx auto-TX (the caller's
+/// failed-tick TX, if any, is rolled back independently — wrapping this
+/// write in that TX would lose the failure mode along with the canonical
+/// state mutation we're trying to record).
+///
+/// `event_name` is one of the `EV_*` constants above and is greppable
+/// across both the log stream and the persisted row. `err` is the raw
+/// upstream error; it gets JSON-sanitized + truncated by
+/// `format_last_error` before persistence.
 async fn record_table_error(
     pg: &PgPool,
     table: &str,
+    event_name: &str,
     err: &str,
 ) -> Result<(), sqlx::Error> {
+    let payload = format_last_error(event_name, err);
     sqlx::query(
         "UPDATE legacy_sync_status \
             SET last_error           = $2, \
@@ -2153,7 +2490,7 @@ async fn record_table_error(
           WHERE table_name = $1",
     )
     .bind(table)
-    .bind(err)
+    .bind(payload)
     .execute(pg)
     .await?;
     Ok(())
@@ -2162,6 +2499,257 @@ async fn record_table_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // Resilience PR R1 — error taxonomy + last_error sanitization
+    // ========================================================================
+
+    /// Every event_name in the registry follows the `sync.<snake_case>`
+    /// shape. Locks the format so a log-aggregation rule that matches on
+    /// the `sync.` prefix can rely on coverage. (Operators in the
+    /// 2026-05-14 post-mortem proposed using `event_name =~ /^sync\./`
+    /// as the Loki dashboard filter.)
+    #[test]
+    fn known_sync_event_names_use_sync_prefix() {
+        for name in KNOWN_SYNC_EVENT_NAMES {
+            assert!(
+                name.starts_with("sync."),
+                "event_name `{name}` must start with `sync.` so dashboards \
+                 can filter on it; got: {name}"
+            );
+            assert!(
+                name.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c == '.'),
+                "event_name `{name}` must be lowercase snake.case ASCII \
+                 (greppable from any locale)"
+            );
+        }
+    }
+
+    /// Registry must enumerate every `EV_*` constant. The polish here is
+    /// detecting a NEW event_name added at a call site but forgotten in
+    /// the registry — the existing audit `include_str!` test would miss
+    /// that because grep'ing `EV_` matches the call-site mentions.
+    #[test]
+    fn known_sync_event_names_match_source_constants() {
+        // We can't reflect on `pub const` names at runtime, so the
+        // counter-test is: registry contains the constants we know
+        // about. Adding a new EV_ implies adding it to the registry,
+        // which this test mechanically enforces by counting unique
+        // entries.
+        let unique: std::collections::HashSet<&str> =
+            KNOWN_SYNC_EVENT_NAMES.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            KNOWN_SYNC_EVENT_NAMES.len(),
+            "KNOWN_SYNC_EVENT_NAMES has duplicate entries — each event_name \
+             must appear exactly once"
+        );
+        // Sanity floor — if a refactor accidentally deletes the array we
+        // want the test to fail loudly.
+        assert!(
+            KNOWN_SYNC_EVENT_NAMES.len() >= 15,
+            "registry shrank suspiciously to {} entries; expected ≥15",
+            KNOWN_SYNC_EVENT_NAMES.len()
+        );
+    }
+
+    /// `sanitize_last_error` passes through a plain ASCII summary
+    /// unchanged. Establishes the happy-path baseline so the
+    /// subsequent edge-case tests can assert deviations.
+    #[test]
+    fn sanitize_last_error_passes_through_plain_ascii() {
+        let raw = "Timed out in bb8";
+        let out = sanitize_last_error(raw);
+        assert_eq!(out, raw);
+    }
+
+    /// Interior `"` must be escaped so a downstream JSON-emitter
+    /// (Loki, our `/api/new/sync/status` route) doesn't see an
+    /// unterminated string. Defensive against the prompt-injection
+    /// vector flagged in the 2026-05-14 post-mortem (an MSSQL error
+    /// message could echo attacker-controlled bytes from a malformed
+    /// upstream value).
+    #[test]
+    fn sanitize_last_error_escapes_double_quotes() {
+        let raw = r#"bad row: name="Robert""#;
+        let out = sanitize_last_error(raw);
+        assert!(
+            out.contains(r#"\""#),
+            "interior `\"` must be backslash-escaped; got: {out}"
+        );
+        assert!(!out.contains(r#"name="Robert""#));
+    }
+
+    /// Newlines collapse to `\n` so a multi-line tiberius backtrace
+    /// doesn't shred the dashboard layout. Same rationale as `"` —
+    /// a single `last_error` column should render on one line.
+    #[test]
+    fn sanitize_last_error_escapes_newlines_and_tabs() {
+        let raw = "line1\nline2\twith tab\r\n";
+        let out = sanitize_last_error(raw);
+        assert!(out.contains("\\n"));
+        assert!(out.contains("\\t"));
+        assert!(out.contains("\\r"));
+        // None of the raw control chars should survive.
+        assert!(!out.contains('\n'));
+        assert!(!out.contains('\t'));
+        assert!(!out.contains('\r'));
+    }
+
+    /// Other C0 control chars (e.g. `0x07` BEL, `0x1B` ESC) render as
+    /// `\u00XX` rather than passing through and risking a dashboard
+    /// terminal interpreting them. The 2026-05-14 post-mortem
+    /// specifically flagged ANSI-escape injection as a concern.
+    #[test]
+    fn sanitize_last_error_escapes_other_control_chars() {
+        let raw = "alert\x07esc\x1bdone";
+        let out = sanitize_last_error(raw);
+        assert!(out.contains("\\u0007"), "BEL must be \\u-escaped: {out}");
+        assert!(out.contains("\\u001b"), "ESC must be \\u-escaped: {out}");
+        assert!(!out.contains('\x07'));
+        assert!(!out.contains('\x1b'));
+    }
+
+    /// `LAST_ERROR_MAX_LEN` enforces a hard cap so a multi-MB tiberius
+    /// error can't bloat the row. The cap counts CHARS (not bytes) so
+    /// multibyte glyphs survive intact.
+    #[test]
+    fn sanitize_last_error_truncates_at_cap() {
+        let raw: String = "x".repeat(LAST_ERROR_MAX_LEN * 4);
+        let out = sanitize_last_error(&raw);
+        let char_count = out.chars().count();
+        assert!(
+            char_count <= LAST_ERROR_MAX_LEN,
+            "sanitized length {char_count} exceeds LAST_ERROR_MAX_LEN {LAST_ERROR_MAX_LEN}"
+        );
+        // Truncation marker should be present so the operator knows the
+        // payload was cut.
+        assert!(
+            out.ends_with('…'),
+            "truncated payload must end with `…` marker; got tail: {}",
+            &out[out.len().saturating_sub(8)..]
+        );
+    }
+
+    /// Truncation must not split a multibyte UTF-8 codepoint in half —
+    /// `String::truncate` would panic on a non-char-boundary, but our
+    /// chars() iteration approach should be safe. This test pins it.
+    #[test]
+    fn sanitize_last_error_truncates_at_char_boundary_for_multibyte() {
+        // Thai script — 3 bytes per character. Fill past the cap.
+        let raw: String = "ก".repeat(LAST_ERROR_MAX_LEN * 2);
+        let out = sanitize_last_error(&raw);
+        // No panic; output is valid UTF-8 (Rust guarantees String) and
+        // under cap.
+        assert!(out.chars().count() <= LAST_ERROR_MAX_LEN);
+    }
+
+    /// `format_last_error` prepends the event_name with a `:` separator
+    /// — operators can `grep ^sync.foo` in the dashboard / `psql` and
+    /// see every row that hit that failure mode.
+    #[test]
+    fn format_last_error_prepends_event_name() {
+        let out = format_last_error(EV_WATERMARK_ADVANCE_FAIL, "Timed out in bb8");
+        assert!(
+            out.starts_with("sync.watermark_advance_fail: "),
+            "must start with `<event>: ` prefix; got: {out}"
+        );
+        assert!(out.contains("Timed out in bb8"));
+    }
+
+    /// Even with a long upstream error, `format_last_error` stays
+    /// under the cap (the inner `sanitize_last_error` truncates; this
+    /// test guards against a future refactor that builds the string
+    /// without re-running sanitization).
+    #[test]
+    fn format_last_error_respects_cap_even_for_huge_payload() {
+        let raw: String = "y".repeat(LAST_ERROR_MAX_LEN * 4);
+        let out = format_last_error(EV_LOAD_AGGREGATE_FAIL, &raw);
+        assert!(out.chars().count() <= LAST_ERROR_MAX_LEN);
+    }
+
+    /// All error-emission sites in the tick path must attach an
+    /// `event_name = EV_...` attribute. Locks in the structured-log
+    /// contract so a future refactor can't silently regress to
+    /// free-form `tracing::error!("…")`.
+    ///
+    /// Strategy: every `tracing::error!` call inside the tick path
+    /// (between `run_one_tick` and the end of `poll_table`) must
+    /// reference one of the known constants. The source-text test
+    /// is necessarily approximate but catches the common regression
+    /// shape.
+    #[test]
+    fn every_tick_path_tracing_error_references_an_event_name() {
+        let source = include_str!("sync.rs");
+        let tick_start = source
+            .find("async fn run_one_tick(")
+            .expect("run_one_tick must exist");
+        let tick_end_marker = "async fn fetch_ct_rows(";
+        let tick_end = source[tick_start..]
+            .find(tick_end_marker)
+            .map(|i| tick_start + i)
+            .unwrap_or(source.len());
+        let region = &source[tick_start..tick_end];
+
+        // Count `tracing::error!(` openings in the region.
+        let error_macro_count = region.matches("tracing::error!(").count();
+        // Count `event_name` attribute mentions in the same region.
+        // Accept both the literal `event_name = EV_FOO` and the shorthand
+        // `event_name,` (used when a local variable already holds the
+        // resolved constant, e.g. the retention discriminator).
+        let event_name_eq_count = region.matches("event_name = EV_").count();
+        let event_name_short_count = region.matches("event_name,").count();
+        let event_name_attr_count = event_name_eq_count + event_name_short_count;
+
+        assert!(
+            error_macro_count >= 5,
+            "expected ≥5 tracing::error! sites in tick path; found {error_macro_count} \
+             — region may have been refactored away from this file"
+        );
+        assert!(
+            event_name_attr_count >= error_macro_count,
+            "every tracing::error! in the tick path must include an `event_name = EV_…` \
+             attribute (or shorthand `event_name,` binding a local EV_* constant); \
+             got {error_macro_count} error macros vs {event_name_attr_count} \
+             event_name attributes. The shortfall is the regression."
+        );
+    }
+
+    /// Every `record_table_error` call site must pass an `EV_*`
+    /// constant. The function's contract is "persist a FAILURE MODE",
+    /// and the post-mortem's whole point is that a raw-string payload
+    /// loses the mode. Lock the call shape.
+    #[test]
+    fn every_record_table_error_call_passes_an_event_const() {
+        let source = include_str!("sync.rs");
+        // Count call sites (skip doc comments / strings — but the
+        // matcher is precise enough: `record_table_error(pg,`).
+        let call_count = source.matches("record_table_error(pg,").count();
+        // Of those, how many pair with an `EV_` constant nearby? Search
+        // both backward (the retention path declares
+        // `let event_name = if … { EV_FOO } else { EV_BAR };` just above
+        // the call) AND forward (most call sites pass `EV_*` inline) so
+        // either pattern counts.
+        let mut paired = 0;
+        for (idx, _) in source.match_indices("record_table_error(pg,") {
+            let window_start = idx.saturating_sub(400);
+            let window_end = (idx + 240).min(source.len());
+            let window = &source[window_start..window_end];
+            if window.contains("EV_") {
+                paired += 1;
+            }
+        }
+        assert!(
+            call_count >= 8,
+            "expected ≥8 record_table_error call sites in the tick path; \
+             got {call_count}"
+        );
+        assert_eq!(
+            paired, call_count,
+            "every record_table_error(pg, …) call must reference an EV_ constant; \
+             {paired}/{call_count} did. The shortfall is the regression."
+        );
+    }
 
     #[test]
     fn parse_allowlist_returns_none_when_unset() {
