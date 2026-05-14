@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [vNext] - 2026-05-14 (HOTFIX)
+
+### Fixed
+
+- **Production hotfix: check-in CT projection drops nonexistent
+  `Cin_dep*` columns (PROD-CRIT).** The `HT_CheckIn_Ds` projection
+  introduced by Track B2 (commit `659b078`, deployed ~9h ago) listed
+  four column names — `Cin_dep`, `Cin_dep_status`, `Cin_dep_returned`,
+  `Cin_dep_returned_by` — that do not exist on the HF Hotel legacy
+  schema. The authoritative schema dump
+  (`docs/legacy-spike/schema/01-baseline-schema.txt` rows 215, 222,
+  225, 226) and `writeback::fingerprint::SCHEMA_COLUMNS` (lines 192,
+  199, 202, 203) name them `Cin_Room_Dep`, `Cin_Dep_Status`,
+  `Cin_Dep_return_date`, `Cin_Dep_return_by`. tiberius returned
+  `Invalid column name` on every SELECT, the watcher tolerated the
+  error and advanced the watermark, and **every check-in / payment CT
+  row has been silently dropped on the floor since the Track B2
+  deploy** — `ht_checkins`, `ht_checkin_rooms`, and `ht_payments`
+  drifted from legacy for ~9h of receptionist activity. Reconcile
+  drift on the `checkins` table is expected after merge.
+  - **`hotel-backend/src/sync/parent_loader.rs`**: projection rewritten
+    to the correct legacy column names. Projection extracted into
+    `CHECKIN_DS_PROJECTION` constant so the unit test
+    `checkin_ds_projection_names_match_legacy_schema` can lock every
+    column against the schema-dump whitelist (regression guard — any
+    future addition of a bogus column name fails the test before reaching
+    production).
+  - **`hotel-backend/src/sync/mappers/checkin.rs`**: `project_rooms`
+    updated to read the corrected `Cin_Room_Dep` / `Cin_Dep_Status` /
+    `Cin_Dep_return_date` / `Cin_Dep_return_by` keys. Test fixture
+    `ds_row` updated to match.
+  - **`hotel-backend/tests/test_sync_phase54_integration.rs`** and
+    **`hotel-backend/tests/test_backfill_b5.rs`**: fixture rows updated
+    to the corrected schema names so they exercise the fix.
+  - **Audit reference:** post-mortem to be filed under
+    `docs/coexistence/audit-2026-05-14-postmortem.md` (production
+    incident — silent CT row drop, ~9h blast radius).
+
 ## [vNext] - 2026-05-13 (Track G3)
 
 ### Added
