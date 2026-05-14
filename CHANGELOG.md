@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v2.65.3] - 2026-05-14 (Secrets migration)
+
+### Security
+
+- **`DB_PASSWORD` / `POSTGRES_PASSWORD` / `VILLE_DB_PASSWORD` /
+  `SLACK_WEBHOOK_URL` moved out of container env vars into Docker
+  secrets.** Audit on evergreen 2026-05-14 found these visible via
+  `docker exec <container> printenv` (the `deploy` user is in the
+  `docker` group). Migration:
+  - New module `hotel-backend/src/secrets.rs` reads files at
+    `/run/secrets/<name>` at process start and populates matching
+    env vars in-process. `DATABASE_URL` is reconstructed from
+    `POSTGRES_USER` + secret-file `POSTGRES_PASSWORD` + `NEW_DB_*`
+    parts so the compose file no longer embeds the PG password in
+    a pre-baked DSN.
+  - `docker-compose.yml` declares top-level `secrets:` block under
+    `${SECRETS_DIR:-/home/deploy/secrets}/` and mounts the subset
+    each service needs. The `newdb` service uses
+    `POSTGRES_PASSWORD_FILE` (stock postgres-image feature).
+  - `.github/workflows/docker-build.yml` deploy step ships secret
+    values under a new `.secrets` JSON block alongside `.env`. The
+    on-host `/srv/run-deploy.sh` (not in this repo) must be updated
+    to write each `.secrets[<key>]` to `/home/deploy/secrets/<key>`
+    (mode `0400`, owner `deploy:docker`) BEFORE the
+    `docker compose up` step.
+  - Reversibility: a single `git revert` of this commit restores
+    the pre-migration `environment:` blocks. No state to clean up.
+
 ## [v2.65.2] - 2026-05-14 (Reconcile alert hygiene)
 
 ### Changed

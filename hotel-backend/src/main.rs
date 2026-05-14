@@ -33,8 +33,25 @@ use crate::scheduler::init_scheduler;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Load .env file if it exists
+    // Load .env file if it exists. Runs BEFORE secret-file hydration so a
+    // local-dev `.env` (which historically set `DB_PASSWORD=...` directly)
+    // wins — the hydrator only fills in env vars that are unset or empty.
     dotenvy::dotenv().ok();
+
+    // Security audit 2026-05-14: hydrate sensitive env vars from Docker
+    // secret files at `/run/secrets/<name>` when present. See
+    // `hotel_backend::secrets` for the file → env var mapping. This is
+    // a no-op in local dev (no `/run/secrets/` directory) and falls back
+    // to the existing env-var path so the migration is reversible.
+    let hydrated = hotel_backend::secrets::hydrate_env_from_secret_files();
+    if hydrated > 0 {
+        // Tracing isn't initialised yet — use eprintln so the line still
+        // shows up in `docker logs` at boot. Never logs values, only the
+        // count, to keep `docker logs` itself free of secret material.
+        eprintln!(
+            "[secrets] hydrated {hydrated} env var(s) from secret files at /run/secrets/"
+        );
+    }
 
     // Initialize tracing
     tracing_subscriber::registry()

@@ -109,6 +109,25 @@ The HotelNew database runs in a Docker container (`newdb` service):
 
 **First-time setup**: Fully automatic. Just run `docker compose up` - PostgreSQL auto-creates the database and runs `init-db/init-hotelnew.sql`.
 
+### Credentials & Docker secrets (security audit 2026-05-14)
+
+Sensitive credentials (`DB_PASSWORD`, `POSTGRES_PASSWORD`, `VILLE_DB_PASSWORD`, `SLACK_WEBHOOK_URL`) are read from files under `/run/secrets/` inside the container, NOT from environment variables. This prevents `docker exec <container> printenv` from leaking them — the original audit finding.
+
+- **Compose**: top-level `secrets:` block declares each file under `${SECRETS_DIR:-/home/deploy/secrets}/<name>` and each service mounts the subset it needs.
+- **Rust hydration**: `hotel-backend/src/secrets.rs::hydrate_env_from_secret_files` is the FIRST call in every binary's `main()`. It reads the file (stripping a trailing newline) and populates the matching env var IN-PROCESS only. Existing `env::var(...)` call sites (`config.rs`, `bin/sync.rs`, `bin/writeback.rs`) keep working unchanged.
+- **`DATABASE_URL` reconstruction**: `sync` / `writeback` / `backfill_*` bins still read `DATABASE_URL`, but it's no longer pre-baked in the compose file. The hydrator builds it from `POSTGRES_USER` + `POSTGRES_PASSWORD` (secret) + `NEW_DB_SERVER` + `NEW_DB_PORT` + `NEW_DB_NAME` (or `POSTGRES_DB`). HF Ville workers override `NEW_DB_NAME=hotelville` to target the sibling logical DB.
+- **PostgreSQL**: `newdb` service uses the stock `POSTGRES_PASSWORD_FILE` env var (a feature of the official image's entrypoint) pointing at `/run/secrets/postgres_password`.
+- **Local dev**: set `SECRETS_DIR=$PWD/.secrets` (or any directory of your choice) and populate that directory with files matching the names in the top-level `secrets:` block. Alternatively, set `DB_PASSWORD=...` in `.env` — `dotenvy::dotenv()` runs before the hydrator, so the env var wins.
+- **Rollback**: a single `git revert` of the secret-files-migration commit restores the pre-2026-05-14 `environment:` blocks. No state to clean up.
+
+**Required secret files on evergreen** (must exist BEFORE the compose stack starts):
+- `/home/deploy/secrets/db_password` — legacy MSSQL `sa`
+- `/home/deploy/secrets/postgres_password` — newdb superuser
+- `/home/deploy/secrets/ville_db_password` — alias of `postgres_password` until ADR 0001 Phase 8
+- `/home/deploy/secrets/slack_webhook_url`
+
+The deploy script (`/srv/run-deploy.sh` on evergreen, NOT in this repo) writes these from the JSON payload's `.secrets` block on every deploy, with mode `0400` and owner `deploy:docker`.
+
 ### SQLx Offline Mode (`.sqlx/` Cache)
 
 The backend uses `sqlx::query!()` compile-time macros for ~76 static SQL queries. These macros verify queries against the PostgreSQL schema at compile time, catching typos and type mismatches before runtime.

@@ -88,6 +88,10 @@ const CIN_ROOM_STATUS_CHECKED_OUT: &str = "Check-Out";
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     dotenvy::dotenv().ok();
 
+    // Security audit 2026-05-14: hydrate Docker secret files into env vars
+    // before any consumer reads them. See `hotel_backend::secrets`.
+    hotel_backend::secrets::hydrate_env_from_secret_files();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

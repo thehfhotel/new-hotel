@@ -20,6 +20,7 @@ pub mod outbox;
 pub mod repository;
 pub mod routes;
 pub mod scheduler;
+pub mod secrets;
 pub mod service;
 pub mod sync;
 pub mod utils;

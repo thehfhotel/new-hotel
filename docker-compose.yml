@@ -6,11 +6,20 @@ services:
     # (`docker` ecosystem) will surface new digests as PRs.
     image: postgres:17-alpine@sha256:c7526c0f6c3f30260a563d7bcf8ad778effac59a44f8ffa86678c35418338609
     container_name: new-hotel-db
+    # Security audit 2026-05-14: `POSTGRES_PASSWORD` removed from env;
+    # use `POSTGRES_PASSWORD_FILE` instead (a stock feature of the
+    # `postgres:17-alpine` entrypoint — see
+    # https://hub.docker.com/_/postgres "Docker Secrets" section).
+    # The entrypoint reads the file ONCE during cluster init and never
+    # exposes the value via `printenv`. POSTGRES_DB / POSTGRES_USER /
+    # PGPORT are non-secrets and stay as env.
     environment:
       - POSTGRES_DB=${POSTGRES_DB}
       - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password
       - PGPORT=${PGPORT:-5439}
+    secrets:
+      - postgres_password
     volumes:
       - newdb_data:/var/lib/postgresql/data
       - ./init-db:/docker-entrypoint-initdb.d:ro
@@ -43,12 +52,11 @@ services:
     image: ghcr.io/thehfhotel/new-hotel:latest
     ports:
       - "3003:3003"
+    # Web container does NOT consume any DB / Slack secret directly — it
+    # proxies to `backend` via BACKEND_URL. The previous env entries
+    # (DB_*, SLACK_WEBHOOK_URL) were dead weight that leaked secrets into
+    # `docker exec printenv`. Removed wholesale (security audit 2026-05-14).
     environment:
-      - DB_SERVER=${DB_SERVER}
-      - DB_NAME=${DB_NAME}
-      - DB_USER=${DB_USER}
-      - DB_PASSWORD=${DB_PASSWORD}
-      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
       - SLACK_NOTIFICATIONS_ENABLED=false
       - BACKEND_URL=http://backend:3003
       # Phase 4 PR3: enables the AuthGuard's redirect-to-/login enforcement.
@@ -96,12 +104,20 @@ services:
 
   backend:
     image: ghcr.io/thehfhotel/new-hotel-backend:latest
+    # Security audit 2026-05-14: DB_PASSWORD / POSTGRES_PASSWORD /
+    # SLACK_WEBHOOK_URL / VILLE_DB_PASSWORD / NEW_DB_PASSWORD moved out of
+    # this `environment:` block into `secrets:` below. The Rust startup
+    # hydrator (`hotel-backend/src/secrets.rs`) reads each file at
+    # `/run/secrets/<name>` and populates the matching env var in-process,
+    # so downstream `env::var(...)` callers in `config.rs` keep working
+    # unchanged. Net effect: `docker exec ... printenv` no longer leaks
+    # any of these values.
     environment:
       # Legacy database (external server - shared with legacy application)
       - DB_SERVER=${DB_SERVER}
       - DB_NAME=${DB_NAME}
       - DB_USER=${DB_USER}
-      - DB_PASSWORD=${DB_PASSWORD}
+      # DB_PASSWORD — sourced from /run/secrets/db_password (see secrets: below)
       # TCP port. Default 1433 (HF Hotel). HF Ville's SS2025 Express
       # instance listens on 1436 — set MSSQL_PORT=1436 in that .env.
       - MSSQL_PORT=${MSSQL_PORT:-1433}
@@ -110,10 +126,16 @@ services:
       - NEW_DB_PORT=${PGPORT:-5439}
       - NEW_DB_NAME=${POSTGRES_DB}
       - NEW_DB_USER=${POSTGRES_USER}
-      - NEW_DB_PASSWORD=${POSTGRES_PASSWORD}
+      # NEW_DB_PASSWORD — sourced from /run/secrets/postgres_password.
+      # config.rs::NewDbConfig::from_env still reads `NEW_DB_PASSWORD`;
+      # the hydrator copies POSTGRES_PASSWORD → NEW_DB_PASSWORD when only
+      # the latter is set. Belt-and-suspenders: also expose POSTGRES_USER
+      # so the hydrator's DATABASE_URL reconstruction has every piece.
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_DB=${POSTGRES_DB}
       # System mode: 'legacy' or 'new' (controls which database is primary)
       - SYSTEM_MODE=new
-      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+      # SLACK_WEBHOOK_URL — sourced from /run/secrets/slack_webhook_url
       - SLACK_NOTIFICATIONS_ENABLED=true
       - HOST=0.0.0.0
       - PORT=3003
@@ -127,7 +149,7 @@ services:
       - VILLE_DB_PORT=${VILLE_DB_PORT:-5439}
       - VILLE_DB_NAME=${VILLE_DB_NAME:-hotelville}
       - VILLE_DB_USER=${VILLE_DB_USER:-${POSTGRES_USER}}
-      - VILLE_DB_PASSWORD=${VILLE_DB_PASSWORD:-${POSTGRES_PASSWORD}}
+      # VILLE_DB_PASSWORD — sourced from /run/secrets/ville_db_password
       # CORS allowlist (Phase 3 hardening). Comma-separated absolute
       # origins. Default (when unset) covers the Next.js dev server on
       # the host + the in-container `web` service — fine for the current
@@ -149,6 +171,11 @@ services:
       # Either way, `/api/auth/{login,logout,me}` and `/api/health`
       # remain public — that's how the frontend bootstraps.
       - AUTH_ENABLED=${AUTH_ENABLED:-false}
+    secrets:
+      - db_password
+      - postgres_password
+      - ville_db_password
+      - slack_webhook_url
     depends_on:
       newdb:
         condition: service_healthy
@@ -189,21 +216,35 @@ services:
     command: ["./writeback"]
     profiles:
       - legacy
+    # Security audit 2026-05-14: DB_PASSWORD + pre-baked DATABASE_URL
+    # removed from `environment:`. The writeback bin hydrates DB_PASSWORD
+    # from /run/secrets/db_password and reconstructs DATABASE_URL from
+    # POSTGRES_USER + POSTGRES_PASSWORD (also a secret file) + the
+    # NEW_DB_* parts at process start. See hotel-backend/src/secrets.rs.
     environment:
       # Legacy database (external server - shared with legacy application)
       - DB_SERVER=${DB_SERVER}
       - DB_NAME=${DB_NAME}
       - DB_USER=${DB_USER}
-      - DB_PASSWORD=${DB_PASSWORD}
+      # DB_PASSWORD — sourced from /run/secrets/db_password
       - MSSQL_PORT=${MSSQL_PORT:-1433}
-      # PostgreSQL — same DSN the backend uses, but with explicit URL form
-      # because the writeback bin reads DATABASE_URL directly (no AppConfig).
-      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@newdb:${PGPORT:-5439}/${POSTGRES_DB}
+      # PostgreSQL — pieces for DATABASE_URL reconstruction (see
+      # hotel-backend/src/secrets.rs::reconstruct_database_url). The
+      # POSTGRES_PASSWORD piece comes from /run/secrets/postgres_password.
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - NEW_DB_SERVER=newdb
+      - NEW_DB_PORT=${PGPORT:-5439}
+      # SLACK_WEBHOOK_URL — sourced from /run/secrets/slack_webhook_url
       # Worker-specific knobs (per docs/architecture.md §7)
       - WRITEBACK_ENABLED=${WRITEBACK_ENABLED:-true}
       - WRITEBACK_POLL_INTERVAL_SECS=${WRITEBACK_POLL_INTERVAL_SECS:-30}
       - WRITEBACK_MAX_ATTEMPTS=${WRITEBACK_MAX_ATTEMPTS:-3}
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,writeback=info}
+    secrets:
+      - db_password
+      - postgres_password
+      - slack_webhook_url
     depends_on:
       newdb:
         condition: service_healthy
@@ -247,19 +288,26 @@ services:
     command: ["./sync"]
     profiles:
       - legacy
+    # Security audit 2026-05-14: same secret-file migration as the
+    # writeback service — DB_PASSWORD, POSTGRES_PASSWORD (for the
+    # reconstructed DATABASE_URL), and SLACK_WEBHOOK_URL are now mounted
+    # as files under /run/secrets/.
     environment:
       # Legacy database (external server - shared with legacy application)
       - DB_SERVER=${DB_SERVER}
       - DB_NAME=${DB_NAME}
       - DB_USER=${DB_USER}
-      - DB_PASSWORD=${DB_PASSWORD}
+      # DB_PASSWORD — sourced from /run/secrets/db_password
       - MSSQL_PORT=${MSSQL_PORT:-1433}
-      # PostgreSQL — same DSN the writeback worker uses, explicit URL form
-      # because the sync bin reads DATABASE_URL directly (no AppConfig).
-      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@newdb:${PGPORT:-5439}/${POSTGRES_DB}
+      # PostgreSQL DATABASE_URL — reconstructed at startup from these
+      # pieces plus the POSTGRES_PASSWORD secret file.
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - NEW_DB_SERVER=newdb
+      - NEW_DB_PORT=${PGPORT:-5439}
       # Slack notifier — schema fingerprint drift, CT retention overflow,
       # mapper consecutive-failure threshold all alert here.
-      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+      # SLACK_WEBHOOK_URL — sourced from /run/secrets/slack_webhook_url
       - SLACK_NOTIFICATIONS_ENABLED=true
       # Phase 5.5 watcher knobs (per docs/architecture.md §3.6d, §7).
       # MUST stay default-false. Operator flip is the cutover step.
@@ -281,6 +329,10 @@ services:
       # via `--bootstrap` (preferred) or this env var (escape hatch).
       - LEGACY_SYNC_ALLOW_COLD_REPLAY=${LEGACY_SYNC_ALLOW_COLD_REPLAY:-false}
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,sync=info}
+    secrets:
+      - db_password
+      - postgres_password
+      - slack_webhook_url
     depends_on:
       newdb:
         condition: service_healthy
@@ -330,21 +382,33 @@ services:
     command: ["./sync"]
     profiles:
       - hfville
+    # Security audit 2026-05-14: same secret-file migration as the
+    # HF Hotel sync service. Note `NEW_DB_NAME=hotelville` — that's the
+    # per-service override the hydrator's DATABASE_URL reconstruction
+    # picks up to point at the sibling logical PG database (per ADR 0001
+    # per-DB topology). Replaces the pre-baked
+    # `postgres://...${POSTGRES_PASSWORD}...@newdb:.../hotelville` URL.
     environment:
       # Ville legacy MSSQL via WG path (DNAT through MikroTik).
       - DB_SERVER=192.168.11.51
       - DB_NAME=HOTEL
       - DB_USER=sa
-      # Reusing DB_PASSWORD for now — both sites' legacy MSSQL share the
-      # same `sa` credential. Split into HFVILLE_DB_PASSWORD when one site
-      # rotates ahead of the other (see ADR 0001 Phase 8 ops-hardening
-      # notes; gated on iHOTEL2025 vendor coordination).
-      - DB_PASSWORD=${DB_PASSWORD}
+      # DB_PASSWORD — sourced from /run/secrets/db_password. Reusing it
+      # for now: both sites' legacy MSSQL share the same `sa` credential.
+      # Split into a HFVILLE-specific secret file when one site rotates
+      # ahead of the other (see ADR 0001 Phase 8 ops-hardening notes;
+      # gated on iHOTEL2025 vendor coordination).
       - MSSQL_PORT=1436
-      # Canonical Ville state — separate logical DB on the same `newdb`
-      # cluster (per ADR Q1 per-DB topology).
-      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@newdb:${PGPORT:-5439}/hotelville
-      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+      # PostgreSQL DATABASE_URL — reconstructed at startup from these
+      # pieces plus the POSTGRES_PASSWORD secret file. NEW_DB_NAME wins
+      # over POSTGRES_DB so the hfhotel cluster password targets the
+      # sibling `hotelville` DB.
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - NEW_DB_NAME=hotelville
+      - NEW_DB_SERVER=newdb
+      - NEW_DB_PORT=${PGPORT:-5439}
+      # SLACK_WEBHOOK_URL — sourced from /run/secrets/slack_webhook_url
       - SLACK_NOTIFICATIONS_ENABLED=true
       # Site identity for alert prefixes + tracing spans + healthcheck JSON
       # (see hotel-backend/src/notifications/slack.rs::format_site_prefixed).
@@ -369,6 +433,10 @@ services:
       - CT_POLL_INTERVAL_MS=${HFVILLE_CT_POLL_INTERVAL_MS:-1000}
       - LEGACY_SYNC_ALLOW_COLD_REPLAY=${HFVILLE_LEGACY_SYNC_ALLOW_COLD_REPLAY:-false}
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,sync=info}
+    secrets:
+      - db_password
+      - postgres_password
+      - slack_webhook_url
     depends_on:
       newdb:
         condition: service_healthy
@@ -391,14 +459,23 @@ services:
     command: ["./writeback"]
     profiles:
       - hfville
+    # Security audit 2026-05-14: same secret-file migration as the
+    # HF Hotel writeback service. `NEW_DB_NAME=hotelville` makes the
+    # hydrator's reconstructed DATABASE_URL target the Ville logical DB.
     environment:
       - DB_SERVER=192.168.11.51
       - DB_NAME=HOTEL
       - DB_USER=sa
-      - DB_PASSWORD=${DB_PASSWORD}
+      # DB_PASSWORD — sourced from /run/secrets/db_password
       - MSSQL_PORT=1436
-      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@newdb:${PGPORT:-5439}/hotelville
-      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+      # PostgreSQL DATABASE_URL — reconstructed at startup from these
+      # pieces plus the POSTGRES_PASSWORD secret file.
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - NEW_DB_NAME=hotelville
+      - NEW_DB_SERVER=newdb
+      - NEW_DB_PORT=${PGPORT:-5439}
+      # SLACK_WEBHOOK_URL — sourced from /run/secrets/slack_webhook_url
       - SITE_ID=hfville
       # Default ON post-#76 cutover (2026-04-30): mirrors the sync-hfville
       # default flip pattern. The Ville legacy app is still active at the
@@ -410,6 +487,10 @@ services:
       - WRITEBACK_POLL_INTERVAL_SECS=${HFVILLE_WRITEBACK_POLL_INTERVAL_SECS:-30}
       - WRITEBACK_MAX_ATTEMPTS=${HFVILLE_WRITEBACK_MAX_ATTEMPTS:-3}
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,writeback=info}
+    secrets:
+      - db_password
+      - postgres_password
+      - slack_webhook_url
     depends_on:
       newdb:
         condition: service_healthy
@@ -436,14 +517,26 @@ services:
     command: ["./backfill_rooms"]
     profiles:
       - backfill
+    # Security audit 2026-05-14: DB_PASSWORD + pre-baked DATABASE_URL
+    # moved to secret-file hydration. Backfill is one-shot, so an operator
+    # running this without secrets mounted would hit the loud `require_secret`
+    # panic — same failure mode as missing GH secrets in CI today.
     environment:
       - DB_SERVER=${DB_SERVER}
       - DB_NAME=${DB_NAME}
       - DB_USER=${DB_USER}
-      - DB_PASSWORD=${DB_PASSWORD}
+      # DB_PASSWORD — sourced from /run/secrets/db_password
       - MSSQL_PORT=${MSSQL_PORT:-1433}
-      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@newdb:${PGPORT:-5439}/${POSTGRES_DB}
+      # DATABASE_URL — reconstructed by the hydrator from these pieces +
+      # the POSTGRES_PASSWORD secret file.
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - NEW_DB_SERVER=newdb
+      - NEW_DB_PORT=${PGPORT:-5439}
       - RUST_LOG=${RUST_LOG:-backfill_rooms=info}
+    secrets:
+      - db_password
+      - postgres_password
     depends_on:
       newdb:
         condition: service_healthy
@@ -468,16 +561,25 @@ services:
     command: ["./backfill_checkin_rooms"]
     profiles:
       - backfill
+    # Security audit 2026-05-14: same secret-file migration as backfill-rooms.
     environment:
       - SITE_ID=${SITE_ID:-hfhotel}
       - DB_SERVER=${DB_SERVER}
       - DB_NAME=${DB_NAME}
       - DB_USER=${DB_USER}
-      - DB_PASSWORD=${DB_PASSWORD}
+      # DB_PASSWORD — sourced from /run/secrets/db_password
       - MSSQL_PORT=${MSSQL_PORT:-1433}
-      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@newdb:${PGPORT:-5439}/${POSTGRES_DB}
+      # DATABASE_URL — reconstructed by the hydrator from these pieces +
+      # the POSTGRES_PASSWORD secret file.
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - NEW_DB_SERVER=newdb
+      - NEW_DB_PORT=${PGPORT:-5439}
       - BACKFILL_CONCURRENCY=${BACKFILL_CONCURRENCY:-8}
       - RUST_LOG=${RUST_LOG:-backfill_checkin_rooms=info,hotel_backend=info}
+    secrets:
+      - db_password
+      - postgres_password
     depends_on:
       newdb:
         condition: service_healthy
@@ -491,3 +593,47 @@ volumes:
 networks:
   hotel-network:
     driver: bridge
+
+# =============================================================================
+# Docker secrets — production credentials moved off env vars (security audit
+# 2026-05-14). Each service that previously got these via `environment:` now
+# mounts the corresponding file at `/run/secrets/<name>` (read-only).
+#
+# The Rust binaries hydrate matching env vars from these files at process
+# start (see `hotel-backend/src/secrets.rs`) — so any pre-migration code that
+# reads `std::env::var("DB_PASSWORD")` keeps working unchanged.
+#
+# DEPLOY-TIME PREREQUISITES on evergreen (must exist BEFORE merge / pipeline
+# runs `docker compose up`). The deploy script (`/srv/run-deploy.sh` on
+# evergreen, NOT in this repo) is responsible for writing these from GH
+# secrets, chmod 0400, chown deploy:docker:
+#
+#     /home/deploy/secrets/db_password
+#     /home/deploy/secrets/postgres_password
+#     /home/deploy/secrets/ville_db_password   # symlink to postgres_password
+#                                              # until ADR 0001 Phase 8 split
+#     /home/deploy/secrets/slack_webhook_url
+#
+# An entry under `secrets:` that points to a missing file fails fast with
+#     "no such file or directory" before any container starts — operators
+# see the error in CI logs, not after a half-rolled deploy.
+#
+# Reversibility: the Rust hydrator falls back to env vars when a secret
+# file is unreadable or empty. So a `git revert` of this commit (which
+# restores the `environment:` entries) is a single-step rollback, even if
+# the secret files exist on disk.
+# =============================================================================
+secrets:
+  # `${SECRETS_DIR:-/home/deploy/secrets}` lets local dev point at a
+  # different directory without editing the compose file:
+  #     SECRETS_DIR=$PWD/.secrets docker compose up
+  # The evergreen default matches what `/srv/run-deploy.sh` writes (see
+  # PR body for the deploy-time prereq checklist).
+  db_password:
+    file: ${SECRETS_DIR:-/home/deploy/secrets}/db_password
+  postgres_password:
+    file: ${SECRETS_DIR:-/home/deploy/secrets}/postgres_password
+  ville_db_password:
+    file: ${SECRETS_DIR:-/home/deploy/secrets}/ville_db_password
+  slack_webhook_url:
+    file: ${SECRETS_DIR:-/home/deploy/secrets}/slack_webhook_url
