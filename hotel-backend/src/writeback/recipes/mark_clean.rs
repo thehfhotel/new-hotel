@@ -29,6 +29,7 @@
 use chrono::{DateTime, Utc};
 use tiberius::Row;
 
+use crate::db::mssql_timeout::{simple_query_with_timeout, MssqlOpKind};
 use crate::writeback::allocate::LegacyConn;
 use crate::writeback::dispatcher::LegacyIds;
 use crate::writeback::error::WritebackResult;
@@ -115,8 +116,9 @@ pub async fn fetch_prior_occupant(
     room_no: &str,
 ) -> WritebackResult<Option<PriorOccupant>> {
     let sql = build_prior_occupant_sql(room_no);
-    let stream = conn.simple_query(sql).await?;
-    let rows: Vec<Row> = stream.into_first_result().await?;
+    // R2 (2026-05-14): same envelope as booking_modify SELECTs — runs
+    // inside the mark_clean recipe's BEGIN TRAN, write budget.
+    let rows: Vec<Row> = simple_query_with_timeout(conn, &sql, MssqlOpKind::Write).await?;
     let Some(row) = rows.first() else { return Ok(None) };
     let cin_no: &str = row.get(0).unwrap_or("");
     let name: &str = row.get(1).unwrap_or("");

@@ -63,6 +63,7 @@ use sqlx::PgPool;
 use tokio::sync::Notify;
 
 use hotel_backend::config::{DbConfig, SiteConfig, SlackConfig};
+use hotel_backend::db::mssql_timeout::{simple_query_with_timeout_pooled, MssqlOpKind};
 use hotel_backend::db::{create_pool, DbPool};
 use hotel_backend::notifications::slack::{SlackClient, SlackMessage};
 use hotel_backend::outbox::bus::EventBus;
@@ -301,14 +302,15 @@ const DEFAULT_RETENTION_CHECK_INTERVAL_SECS: u64 = 300;
 
 /// MSSQL-pool-outage circuit breaker (v2.58.4). HF Ville's WG tunnel
 /// flaps for ~2 min every couple of days; when the legacy MSSQL is
-/// unreachable, every `mssql.get().await` blocks for the full 15s
-/// `POOL_CONNECTION_TIMEOUT` and returns "Timed out in bb8". Without
-/// short-circuiting we walk the 16-table loop sequentially, each
-/// table's own `fetch_ct_rows` paying its own 15s — the burst lasts
-/// 16×15s ≈ 4 min and produces 16 identical WARNs. The breaker
-/// trips on the FIRST pool-timeout in a tick, abandons the rest of
-/// the tick, and sleeps a cooldown so the next tick gives the
-/// tunnel a chance to recover before retrying.
+/// unreachable, every `mssql.get().await` blocks for the full
+/// `POOL_CONNECTION_TIMEOUT` (5s as of R2 / 2026-05-14, was 15s)
+/// and returns "Timed out in bb8". Without short-circuiting we walk
+/// the 16-table loop sequentially, each table's own `fetch_ct_rows`
+/// paying its own pool-timeout — the burst still lasts ~16× that
+/// budget and produces 16 identical WARNs. The breaker trips on the
+/// FIRST pool-timeout in a tick, abandons the rest of the tick, and
+/// sleeps a cooldown so the next tick gives the tunnel a chance to
+/// recover before retrying.
 ///
 /// Override at runtime via `LEGACY_SYNC_OUTAGE_COOLDOWN_SECS`.
 const DEFAULT_OUTAGE_COOLDOWN_SECS: u64 = 30;
@@ -972,15 +974,24 @@ async fn run_bootstrap(site: &SiteConfig) -> Result<(), Box<dyn std::error::Erro
 /// Used at the top of `run_one_tick` to short-circuit the whole tick
 /// when the legacy tunnel is down. Without this, every CT-enabled
 /// table's fetch sequentially burns one `POOL_CONNECTION_TIMEOUT`
-/// (15s) before bb8 gives up, so a 2-minute WG flap fans out into
-/// ~16×15s = 4 minutes of WARN events before the watcher catches up.
-/// One probe up front collapses that to a single WARN per tick + the
-/// next tick (1s later) re-probes and resumes immediately on recovery.
+/// (5s as of R2 / 2026-05-14) before bb8 gives up, so a 2-minute WG
+/// flap still fans out into ~16× that budget before the watcher
+/// catches up. One probe up front collapses that to a single WARN
+/// per tick + the next tick (1s later) re-probes and resumes
+/// immediately on recovery.
 async fn probe_legacy_connectivity(
     mssql: &DbPool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut conn = mssql.get().await?;
-    let _ = conn.simple_query("SELECT 1").await?;
+    // Probe runs read-budget: detects a stuck `SELECT 1` (e.g. a
+    // global tempdb contention spike) without inheriting it for the
+    // rest of the tick.
+    let _ = simple_query_with_timeout_pooled(
+        &mut conn,
+        "SELECT 1",
+        MssqlOpKind::Read,
+    )
+    .await?;
     Ok(())
 }
 
@@ -991,10 +1002,12 @@ async fn read_change_tracking_current_version(
     mssql: &DbPool,
 ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
     let mut conn = mssql.get().await?;
-    let stream = conn
-        .simple_query("SELECT CHANGE_TRACKING_CURRENT_VERSION() AS v")
-        .await?;
-    let rows = stream.into_first_result().await?;
+    let rows = simple_query_with_timeout_pooled(
+        &mut conn,
+        "SELECT CHANGE_TRACKING_CURRENT_VERSION() AS v",
+        MssqlOpKind::Read,
+    )
+    .await?;
     let row = rows.first().ok_or_else(|| {
         "CHANGE_TRACKING_CURRENT_VERSION() returned no rows".to_string()
     })?;
@@ -2214,9 +2227,7 @@ async fn fetch_ct_rows(
           ORDER BY ct.SYS_CHANGE_VERSION ASC"
     );
 
-    let stream = conn.simple_query(&sql).await.map_err(|e| e.to_string())?;
-    let rows = stream
-        .into_first_result()
+    let rows = simple_query_with_timeout_pooled(&mut conn, &sql, MssqlOpKind::Read)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -2361,9 +2372,7 @@ async fn check_retention(
     let sql = format!(
         "SELECT CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID(N'{table}')) AS min_valid"
     );
-    let stream = conn.simple_query(&sql).await.map_err(|e| e.to_string())?;
-    let rows = stream
-        .into_first_result()
+    let rows = simple_query_with_timeout_pooled(&mut conn, &sql, MssqlOpKind::Read)
         .await
         .map_err(|e| e.to_string())?;
     let row = match rows.first() {
@@ -2392,9 +2401,7 @@ async fn count_ct_rows(
         "SELECT COUNT(*) FROM CHANGETABLE(CHANGES {table}, {last_seen}) AS ct \
          WHERE ct.SYS_CHANGE_CONTEXT IS NULL OR ct.SYS_CHANGE_CONTEXT <> 0x4E48"
     );
-    let stream = conn.simple_query(&sql).await.map_err(|e| e.to_string())?;
-    let rows = stream
-        .into_first_result()
+    let rows = simple_query_with_timeout_pooled(&mut conn, &sql, MssqlOpKind::Read)
         .await
         .map_err(|e| e.to_string())?;
     let row = rows
@@ -3334,10 +3341,11 @@ mod tests {
     async fn create_pool_with_retry_loops_instead_of_exiting() {
         let unreachable = DbConfig {
             server: "127.0.0.1".to_string(),
-            // bb8's connection_timeout is 15s — port 1 is unbound, so
-            // tiberius gets a TCP RST immediately rather than waiting
-            // the full timeout. That means we can drive two retry
-            // attempts well under the 5s test budget.
+            // bb8's connection_timeout is 5s (R2, lowered from 15s)
+            // — port 1 is unbound, so tiberius gets a TCP RST
+            // immediately rather than waiting the full timeout. That
+            // means we can drive two retry attempts well under the
+            // 5s test budget.
             port: 1,
             database: "stub".to_string(),
             user: "stub".to_string(),

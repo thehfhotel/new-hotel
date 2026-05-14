@@ -30,8 +30,8 @@
 use bb8::PooledConnection;
 use bb8_tiberius::ConnectionManager;
 use chrono::{DateTime, Datelike, Utc};
-use tiberius::Row;
 
+use crate::db::mssql_timeout::{simple_query_with_timeout, MssqlOpKind};
 use crate::writeback::error::{WritebackError, WritebackResult};
 use crate::writeback::format::bangkok_date;
 
@@ -113,8 +113,15 @@ async fn select_next_int_with_lock(
     conn: &mut LegacyConn<'_>,
     sql: &str,
 ) -> WritebackResult<i32> {
-    let stream = conn.simple_query(sql).await?;
-    let rows: Vec<Row> = stream.into_first_result().await?;
+    // R2 (2026-05-14): wrap MAX+1 TABLOCKX select in write-budget
+    // timeout. The TABLOCKX-HOLDLOCK pattern intentionally blocks
+    // concurrent writers, so it is *expected* to wait — but a wait
+    // longer than the write budget indicates the locker (iHOTEL or
+    // a stuck writeback worker) is itself wedged. Failing the
+    // allocation here is the right move: caller is inside a
+    // transaction that will ROLLBACK and the job retries on the
+    // next dispatcher pass.
+    let rows = simple_query_with_timeout(conn, sql, MssqlOpKind::Write).await?;
     let row = rows
         .first()
         .ok_or_else(|| WritebackError::Recipe(format!("MAX+1 query returned no rows: {sql}")))?;

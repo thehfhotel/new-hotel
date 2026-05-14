@@ -5,6 +5,90 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [vNext] - 2026-05-14 (Resilience R2 — MSSQL per-query timeouts)
+
+### Changed
+
+- **Resilience PR R2 — tighten bb8 connection-timeout and box every
+  legacy `simple_query` in a `tokio::time::timeout`.** Root cause
+  for the 2026-05-14 74-minute HF Hotel CT watermark stall: tiberius
+  has no built-in query timeout, so when iHOTEL held a row lock on
+  `HT_Book_H.Book_ID='R015142'` during a booking cancellation, the
+  watcher's per-table CHANGETABLE poll waited on the lock
+  indefinitely and froze the entire site's sync.
+  - **`hotel-backend/src/db/pool.rs`** — bb8 builder retuned:
+    `connection_timeout` 15s → **5s**, `idle_timeout` 10 min → **60s**,
+    `max_lifetime` 30 min → **10 min**. Tighter values rotate stale
+    or wedged connections faster without affecting hot-path latency
+    (WG-tunnelled TLS handshake p99 is ~400ms).
+  - **`hotel-backend/src/db/mssql_timeout.rs`** — new module exposing
+    `simple_query_with_timeout`, `simple_query_with_timeout_drop`,
+    and `simple_query_with_timeout_pooled`. Every helper wraps both
+    `simple_query` AND `into_first_result` in a single
+    `tokio::time::timeout` so neither the request nor the streamed
+    response can hang. On expiry the helper emits a
+    `tracing::error!(event_name = EV_TIBERIUS_TIMEOUT, ...)` event
+    (matches R1's taxonomy registry) and returns a synthetic
+    `tiberius::error::Error::Io { kind: TimedOut, .. }`. That decay
+    maps cleanly through every caller's existing `?`-from-Tiberius
+    path and is already classified retryable by
+    `WritebackError::is_retryable`.
+  - **Configurable budgets via env:**
+    - `LEGACY_QUERY_TIMEOUT_READ_MS` — read-side budget. Default
+      **10000** (10s). Covers CT polls, `parent_loader` aggregate
+      fetches, eager-customer fallback, fingerprint metadata,
+      collation probe, `SELECT 1` connectivity probe.
+    - `LEGACY_QUERY_TIMEOUT_WRITE_MS` — write-side budget. Default
+      **15000** (15s). Covers every recipe statement (via the shared
+      `recipes::execute_all`), `BEGIN/COMMIT/ROLLBACK TRAN`,
+      `SET CONTEXT_INFO`, `OUTPUT INSERTED` capture, MAX+1 TABLOCKX
+      allocator probes, and recipe-internal SELECTs that run inside
+      the surrounding BEGIN TRAN.
+    - Floor of **100ms** below which the value is rejected and the
+      default substituted (with WARN). Both budgets resolved once
+      per process at first call; restart the worker to pick up new
+      values.
+  - **Call sites wrapped:**
+    - `bin/sync.rs` — 4 sites (`probe_legacy_connectivity`,
+      `read_change_tracking_current_version`, `fetch_ct_rows`,
+      `check_retention`, `count_ct_rows`).
+    - `sync/parent_loader.rs` — 1 site (`fetch_rows` —
+      booking/check-in aggregate reloads).
+    - `sync/mappers/checkin.rs` — 1 site
+      (`fetch_customer_row_from_mssql` eager-fetch fallback).
+    - `sync/mappers/rate_tiers.rs` — 1 site (mirror reload).
+    - `bin/writeback.rs` — 4 sites (`@@TRANCOUNT` reset, `BEGIN`,
+      `COMMIT`, `ROLLBACK`).
+    - `writeback/allocate.rs` — 1 site (`select_next_int_with_lock`
+      MAX+1 TABLOCKX probe).
+    - `writeback/fingerprint.rs` — 2 sites (`fetch_live_columns`,
+      `verify_legacy_collation_safety`).
+    - `writeback/recipes/mod.rs` — 2 sites (`execute_all` per-recipe
+      statement loop, `execute_insert_with_output_id` IDENTITY
+      capture).
+    - `writeback/recipes/booking_modify.rs` — 3 sites
+      (room/customer/nights pre-write reads).
+    - `writeback/recipes/mark_clean.rs` — 1 site
+      (`fetch_prior_occupant`).
+    - `writeback/recipes/checkout.rs` — 1 site (live-payment
+      aggregate read).
+    - `db/mssql_session.rs` — 1 site (`SET CONTEXT_INFO 0x4E48`
+      loop-prevention tag).
+    - `db/pool.rs` — 1 site (boot-probe `SELECT 1`).
+    - **Total: 23 sites** (4 sync.rs + 3 sync mappers/loader +
+      4 writeback.rs + 8 writeback recipes + 1 allocate +
+      2 fingerprint + 1 mssql_session + 1 pool boot probe — minus
+      the recipe-shared `execute_all` covers many recipe variants
+      transitively).
+  - **Tests** — new unit tests in `db/mssql_timeout.rs` (budget
+    parser edge-cases, timeout-error shape, redaction, pending-future
+    elapses, ready-future passes through) and `db/pool.rs` (literal
+    R2 values pinned to lock against accidental rollback).
+  - **Watchdog & taxonomy** — R1 (error taxonomy) landed first; R2
+    uses R1's `EV_TIBERIUS_TIMEOUT` constant on every timeout-emit
+    site. R3 (per-table watermark schema) is the next PR and
+    orthogonal to this one.
+
 ## [vNext] - 2026-05-14 (Resilience R1)
 
 ### Changed
@@ -90,7 +174,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Audit reference:** post-mortem to be filed under
     `docs/coexistence/audit-2026-05-14-postmortem.md` (production
     incident — silent CT row drop, ~9h blast radius).
-
 ## [vNext] - 2026-05-13 (Track G3)
 
 ### Added

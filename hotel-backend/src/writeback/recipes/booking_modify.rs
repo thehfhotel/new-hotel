@@ -42,6 +42,7 @@
 //! Our targeted approach achieves the same end state without the data-loss
 //! window the legacy app's no-transaction implementation has (§3c warning).
 
+use crate::db::mssql_timeout::{simple_query_with_timeout, MssqlOpKind};
 use crate::outbox::intent::{BookingChanges, CustomerResave};
 use crate::writeback::allocate::{allocate_book_date_id, LegacyConn};
 use crate::writeback::dispatcher::LegacyIds;
@@ -462,9 +463,10 @@ async fn fetch_existing_room_no(
          WHERE Book_no={book_id_q} AND Book_type IS NOT NULL AND Book_type<>'' \
          ORDER BY id DESC"
     );
-    let stream = conn.simple_query(sql).await?;
-    let row = stream.into_row().await?;
-    match row {
+    // R2 (2026-05-14): SELECT runs inside the recipe's BEGIN TRAN —
+    // write budget. Same envelope as the surrounding INSERT/UPDATEs.
+    let rows = simple_query_with_timeout(conn, &sql, MssqlOpKind::Write).await?;
+    match rows.first() {
         Some(r) => Ok(r.get::<&str, _>(0).map(|s| s.to_string())),
         None => Ok(None),
     }
@@ -482,9 +484,9 @@ async fn fetch_existing_customer_name(
         "SELECT TOP 1 Book_Cust_Name FROM HT_Book_H \
          WHERE Book_ID={book_id_q}"
     );
-    let stream = conn.simple_query(sql).await?;
-    let row = stream.into_row().await?;
-    match row {
+    // R2: same envelope as fetch_existing_room_no above.
+    let rows = simple_query_with_timeout(conn, &sql, MssqlOpKind::Write).await?;
+    match rows.first() {
         Some(r) => Ok(r.get::<&str, _>(0).map(|s| s.to_string())),
         None => Ok(None),
     }
@@ -502,9 +504,9 @@ async fn fetch_existing_book_room_night(
         "SELECT TOP 1 Book_Room_Night FROM HT_Book_Ds \
          WHERE Book_No={book_id_q}"
     );
-    let stream = conn.simple_query(sql).await?;
-    let row = stream.into_row().await?;
-    match row {
+    // R2: same envelope as fetch_existing_room_no above.
+    let rows = simple_query_with_timeout(conn, &sql, MssqlOpKind::Write).await?;
+    match rows.first() {
         // HT_Book_Ds.Book_Room_Night is declared `int` in the schema dump
         // (2026-04-26); read as i32. Defensively widen None.
         Some(r) => Ok(r.get::<i32, _>(0)),

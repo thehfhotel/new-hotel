@@ -42,6 +42,7 @@
 //! sessions; we don't want a 100ms transient blank to pollute the
 //! canonical row count.
 
+use crate::db::mssql_timeout::{simple_query_with_timeout_pooled, MssqlOpKind};
 use crate::db::DbPool;
 use sqlx::PgPool;
 use std::time::Instant;
@@ -103,14 +104,16 @@ pub async fn reload_rate_tiers(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result
 /// ~32 rows in production (per `docs/legacy-app/SCHEMA.sql`).
 async fn fetch_legacy_rows(legacy_pool: &DbPool) -> Result<Vec<RateTierRow>, AnyError> {
     let mut conn = legacy_pool.get().await?;
-    let rows = conn
-        .simple_query(
-            "SELECT id, Room_Type, Room_CustType, Room_Price, Room_Price_H, Room_Price_M \
-             FROM HT_Rooms_Price",
-        )
-        .await?
-        .into_first_result()
-        .await?;
+    // R2 (2026-05-14): wrap in per-op read timeout. Table is tiny
+    // (~32 rows) and the call is mirror-job-only, but a stuck poll
+    // would otherwise pin the mirror scheduler.
+    let rows = simple_query_with_timeout_pooled(
+        &mut conn,
+        "SELECT id, Room_Type, Room_CustType, Room_Price, Room_Price_H, Room_Price_M \
+         FROM HT_Rooms_Price",
+        MssqlOpKind::Read,
+    )
+    .await?;
 
     let mut out = Vec::with_capacity(rows.len());
     for r in &rows {

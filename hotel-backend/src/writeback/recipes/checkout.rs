@@ -46,6 +46,7 @@
 use chrono::{DateTime, Utc};
 use tiberius::Row;
 
+use crate::db::mssql_timeout::{simple_query_with_timeout, MssqlOpKind};
 use crate::writeback::allocate::LegacyConn;
 use crate::writeback::constants::{
     power_log_note_check_out, CIN_ROOM_STATUS_CHECKED_OUT, DEFAULT_OPERATOR,
@@ -206,8 +207,10 @@ async fn fetch_live_pay_total(
          FROM HT_CheckIn_Pay \
          WHERE Cin_No={cin_no_q} AND ISNULL(Cin_Status,'1') <> N'ยกเลิก'"
     );
-    let stream = conn.simple_query(sql).await?;
-    let rows: Vec<Row> = stream.into_first_result().await?;
+    // R2 (2026-05-14): payment-sum SELECT inside the checkout recipe
+    // BEGIN TRAN — write budget for the consistent transaction
+    // envelope.
+    let rows: Vec<Row> = simple_query_with_timeout(conn, &sql, MssqlOpKind::Write).await?;
     let Some(row) = rows.first() else {
         return Ok(None);
     };

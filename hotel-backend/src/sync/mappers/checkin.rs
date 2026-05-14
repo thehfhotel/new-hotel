@@ -47,6 +47,7 @@ use async_trait::async_trait;
 use chrono::{NaiveDate, NaiveDateTime};
 use uuid::Uuid;
 
+use crate::db::mssql_timeout::{simple_query_with_timeout_pooled, MssqlOpKind};
 use crate::db::DbPool;
 use crate::outbox::event::{CheckInSnapshot, DomainEvent, EventSource};
 use crate::service::ids::{aggregate_uuid, AggregateKind};
@@ -699,8 +700,10 @@ async fn fetch_customer_row_from_mssql(
         "SELECT {select_list} FROM {HT_CUSTOMERS} WHERE Cust_no = {where_q}"
     );
 
-    let stream = conn.simple_query(&sql).await?;
-    let raw_rows = stream.into_first_result().await?;
+    // R2 (2026-05-14): wrap in per-op read timeout — the eager
+    // customer fetch can fan out under retry and a single stuck
+    // row-lock would otherwise serialize-block the watcher tick.
+    let raw_rows = simple_query_with_timeout_pooled(&mut conn, &sql, MssqlOpKind::Read).await?;
     let Some(raw) = raw_rows.first() else {
         return Ok(None);
     };

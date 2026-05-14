@@ -17,23 +17,42 @@ pub type DbPool = Pool<ConnectionManager>;
 /// trust), so this bb8-level cap is also our effective TCP-connect
 /// timeout: bb8 wraps `ConnectionManager::connect` in
 /// `tokio::time::timeout(connection_timeout, ...)` (see bb8 0.9
-/// `inner.rs`). 15s is short enough to fail fast on a hung MSSQL or a
-/// dropped WireGuard tunnel, long enough to ride out a one-off slow
-/// TLS handshake on the legacy server. Default was 30s.
-const POOL_CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
+/// `inner.rs`).
+///
+/// **Resilience PR R2 (2026-05-14):** lowered from 15s → 5s after the
+/// 74-minute HF Hotel CT watermark stall. With the new per-query
+/// timeout (`db::mssql_timeout`) in place, a wedged server is
+/// detected by the in-flight call within 10s — there's no reason to
+/// keep `Pool::get` waiting 15s for a fresh TCP handshake to the
+/// same wedged server. 5s is still well above WG-tunnelled TLS
+/// handshake p99 (~400ms in prod).
+const POOL_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Recycle every connection at the 30-minute mark so a long-lived
+/// Recycle every connection at the 10-minute mark so a long-lived
 /// stuck client (e.g. a connection that survived a network blip but
 /// is now wedged on a server-side lock) is force-rotated periodically
-/// instead of pinning a slot in the pool forever. Matches bb8's
-/// historical default.
-const POOL_MAX_LIFETIME: Duration = Duration::from_secs(30 * 60);
+/// instead of pinning a slot in the pool forever.
+///
+/// **Resilience PR R2 (2026-05-14):** lowered from 30min → 10min so a
+/// connection that survives a per-query timeout (drops the in-flight
+/// call but stays in the pool with a poisoned server-side lock)
+/// rotates out within the same incident window instead of pinning a
+/// slot for 30 minutes.
+const POOL_MAX_LIFETIME: Duration = Duration::from_secs(10 * 60);
 
-/// Drop idle connections after 10 minutes — keeps the pool lean
+/// Drop idle connections after 60 seconds — keeps the pool lean
 /// during quiet periods while avoiding cold-start latency on bursty
-/// traffic. Matches bb8's historical default; declared explicitly so
-/// the value is visible at the call site.
-const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// traffic.
+///
+/// **Resilience PR R2 (2026-05-14):** lowered from 10min → 60s. The
+/// watcher's tick cadence is 1s; an idle connection older than a
+/// minute is almost certainly stale relative to current server state
+/// (e.g. session-level CONTEXT_INFO drift, dropped TCP keepalive,
+/// transparent WG re-key). Aggressive recycle costs us nothing on
+/// the writeback hot path (it re-opens within the same tick) and
+/// prevents a class of "connection looked fine but was wedged"
+/// failure modes from being inherited by the next worker.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Create a new database connection pool
 ///
@@ -66,11 +85,15 @@ pub async fn create_pool(config: &DbConfig) -> Result<DbPool, Box<dyn std::error
         .max_size(config.pool_max)
         // circuit-breaker: bound bb8 acquire / TCP connect wait so a
         // dead MSSQL never produces an unbounded acquire queue.
+        // R2: 5s (was 15s).
         .connection_timeout(POOL_CONNECTION_TIMEOUT)
-        // reaper: rotate any connection older than 30 min so a wedged
-        // long-lived client eventually frees its pool slot.
+        // reaper: rotate any connection older than the configured
+        // ceiling so a wedged long-lived client eventually frees its
+        // pool slot. R2: 10 min (was 30 min).
         .max_lifetime(Some(POOL_MAX_LIFETIME))
-        // reaper: close idle connections after 10 min of disuse.
+        // reaper: close idle connections after the configured idle
+        // window so stale sessions don't linger. R2: 60s (was 10
+        // min) — see const docstring for the rationale.
         .idle_timeout(Some(POOL_IDLE_TIMEOUT))
         .build(manager)
         .await?;
@@ -78,7 +101,17 @@ pub async fn create_pool(config: &DbConfig) -> Result<DbPool, Box<dyn std::error
     // Test the connection
     {
         let mut conn = pool.get().await?;
-        let _ = conn.simple_query("SELECT 1").await?;
+        // R2: bound the boot-probe `SELECT 1` so a server that
+        // accepted the TCP handshake but is now wedged (legacy
+        // row-lock backlog, tempdb contention) fails fast on
+        // `create_pool` instead of hanging the worker's startup
+        // sequence.
+        let _ = crate::db::mssql_timeout::simple_query_with_timeout_pooled(
+            &mut conn,
+            "SELECT 1",
+            crate::db::mssql_timeout::MssqlOpKind::Read,
+        )
+        .await?;
         tracing::info!(
             "Database connection established to {}:{}",
             config.server,
@@ -166,5 +199,27 @@ mod tests {
         let pool = pool_with_timeouts(&stub_db_config());
         let pool_cfg = pool.config();
         assert_eq!(pool_cfg.max_size, 5);
+    }
+
+    // --- Resilience PR R2 (2026-05-14) ---
+    //
+    // The R2 tightening is only meaningful at the specific values
+    // chosen in the post-mortem (5s / 60s / 10min). Pin the literals
+    // so a future refactor that touches the consts without updating
+    // the post-mortem regresses on the test instead of in production.
+
+    #[tokio::test]
+    async fn r2_connection_timeout_is_five_seconds() {
+        assert_eq!(POOL_CONNECTION_TIMEOUT, Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn r2_idle_timeout_is_sixty_seconds() {
+        assert_eq!(POOL_IDLE_TIMEOUT, Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn r2_max_lifetime_is_ten_minutes() {
+        assert_eq!(POOL_MAX_LIFETIME, Duration::from_secs(600));
     }
 }

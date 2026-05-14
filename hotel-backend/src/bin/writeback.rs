@@ -43,6 +43,7 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use hotel_backend::config::{DbConfig, SiteConfig, SlackConfig};
+use hotel_backend::db::mssql_timeout::{simple_query_with_timeout_drop, MssqlOpKind};
 use hotel_backend::db::{create_pool, DbPool};
 use hotel_backend::notifications::slack::{SlackClient, SlackMessage};
 use hotel_backend::outbox::intent::WritebackIntent;
@@ -660,7 +661,14 @@ async fn process_job(
     // transactions — adding a sentinel everywhere would be overhead for no
     // benefit. Only the writeback worker opens `BEGIN TRAN` against this
     // pool, so only the writeback worker needs to clean up poisoned conns.
-    let trancount_reset = conn.simple_query(RESET_TRANCOUNT_SQL).await.map(drop);
+    // R2 (2026-05-14): wrap defensive @@TRANCOUNT reset in write-budget
+    // timeout. If the previous worker's connection returned with a
+    // poisoned tran AND the server is now wedged on the table that
+    // tran holds locks against, the bare `simple_query` here would
+    // hang the dispatcher indefinitely. The timeout converts that
+    // into a retryable failure (Tiberius::Io{TimedOut}).
+    let trancount_reset =
+        simple_query_with_timeout_drop(&mut conn, RESET_TRANCOUNT_SQL, MssqlOpKind::Write).await;
     if let Err(err) = trancount_reset {
         tracing::warn!(
             job_id,
@@ -746,24 +754,35 @@ async fn run_in_transaction(
     ctx: DispatchContext,
 ) -> Result<hotel_backend::writeback::LegacyIds, WritebackError> {
     {
-        let begin = conn.simple_query("BEGIN TRAN").await?;
-        drop(begin);
+        // R2: BEGIN TRAN itself is fast on MSSQL, but wrap it for
+        // symmetry with the rest of the writeback path so the whole
+        // transaction lives under one consistent timeout envelope.
+        simple_query_with_timeout_drop(conn, "BEGIN TRAN", MssqlOpKind::Write).await?;
     }
 
     let dispatch_result = dispatch(conn, intent, resolved, ctx).await;
 
     match dispatch_result {
         Ok(legacy_ids) => {
-            let commit = conn.simple_query("COMMIT TRAN").await?;
-            drop(commit);
+            // R2: COMMIT TRAN. A wedged commit (e.g. log-flush stall on
+            // legacy MSSQL) would leave the recipe in a "did it land or
+            // not?" twilight zone — the timeout flips that into an
+            // explicit retryable failure.
+            simple_query_with_timeout_drop(conn, "COMMIT TRAN", MssqlOpKind::Write).await?;
             Ok(legacy_ids)
         }
         Err(err) => {
             // Best-effort rollback. If ROLLBACK itself fails, the connection
             // is poisoned and bb8 will discard it on next acquire — the data
             // remains safe because nothing was committed.
-            match conn.simple_query("ROLLBACK TRAN").await {
-                Ok(stream) => drop(stream),
+            //
+            // R2: also wrap in timeout — a stuck ROLLBACK on a poisoned
+            // connection was the exact symptom of the 2026-05-14
+            // incident. We log + drop the conn; the timeout makes that
+            // path reach the drop instead of hanging forever.
+            match simple_query_with_timeout_drop(conn, "ROLLBACK TRAN", MssqlOpKind::Write).await
+            {
+                Ok(()) => {}
                 Err(rb_err) => tracing::warn!(
                     rollback_error = %rb_err,
                     "ROLLBACK TRAN failed — connection will be dropped from pool"

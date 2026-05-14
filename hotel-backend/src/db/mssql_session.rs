@@ -27,6 +27,8 @@
 use bb8::PooledConnection;
 use bb8_tiberius::ConnectionManager;
 
+use crate::db::mssql_timeout::{simple_query_with_timeout_drop, MssqlOpKind};
+
 /// Convenience alias matching `writeback::allocate::LegacyConn`.
 type LegacyConn<'a> = PooledConnection<'a, ConnectionManager>;
 
@@ -44,7 +46,10 @@ type LegacyConn<'a> = PooledConnection<'a, ConnectionManager>;
 pub async fn set_context_info(
     conn: &mut LegacyConn<'_>,
 ) -> Result<(), tiberius::error::Error> {
-    let stream = conn.simple_query("SET CONTEXT_INFO 0x4E48").await?;
-    drop(stream);
-    Ok(())
+    // R2 (2026-05-14): wrap in per-op timeout. The SET runs at the
+    // top of every writeback transaction — a stuck session here
+    // would block the entire writeback worker indefinitely. Write
+    // budget is appropriate: the call belongs to the surrounding
+    // recipe's BEGIN TRAN envelope.
+    simple_query_with_timeout_drop(conn, "SET CONTEXT_INFO 0x4E48", MssqlOpKind::Write).await
 }
