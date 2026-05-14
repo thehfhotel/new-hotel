@@ -160,9 +160,33 @@ async fn apply_upsert(
         .await?
         .map(|(cin_id, _agg_id)| cin_id);
 
+    // Active prod fix (HF Ville, 2026-05-14) — the partial unique
+    // index `ux_ht_room_calendar_legacy_id` (on `rcal_legacy_id`
+    // WHERE NOT NULL) fires when the legacy MAX+1 allocator rebinds
+    // an old id to a new (room, date) slot: the UPSERT lands on a
+    // new business-key row but trips the secondary unique on
+    // `rcal_legacy_id`. We pre-emptively NULL the legacy_id on any
+    // stale row that holds this id at a DIFFERENT (room, date) pair
+    // so the UPSERT below can stamp it on the correct row without
+    // colliding. The cleared row keeps its tile data — only the
+    // drift-detection pointer is reset.
+    sqlx::query(
+        "UPDATE ht_room_calendar \
+            SET rcal_legacy_id = NULL, rcal_updated_at = NOW() \
+          WHERE rcal_legacy_id = $1 \
+            AND NOT (rcal_room_id = $2 AND rcal_date = $3)",
+    )
+    .bind(legacy_id)
+    .bind(room_id)
+    .bind(projection.room_date)
+    .execute(&mut **tx)
+    .await?;
+
     // UPSERT keyed on the business pair (room_id, date) — the legacy
     // table's logical PK. `rcal_legacy_id` is captured but not the
-    // conflict target (would race with allocator MAX+1 reassignments).
+    // conflict target (would race with allocator MAX+1 reassignments;
+    // the pre-clear above keeps the secondary unique partial index
+    // satisfied).
     sqlx::query(
         "INSERT INTO ht_room_calendar \
             (rcal_room_id, rcal_date, rcal_status, rcal_book_id, \
