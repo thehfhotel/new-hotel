@@ -28,6 +28,7 @@ import {
 } from 'lucide-react'
 import { useBranch, BRANCH_LABELS, type Branch } from '@/contexts/BranchContext'
 import { useAuth } from '@/contexts/AuthContext'
+import SkinToggle from '@/components/SkinToggle'
 
 export const SIDEBAR_WIDTH = 240
 export const SIDEBAR_COLLAPSED_WIDTH = 64
@@ -264,6 +265,7 @@ export default function Sidebar() {
             </button>
           </div>
         )}
+        <SkinToggle collapsed={collapsed} />
         <button
           onClick={toggleCollapse}
           className={`flex items-center gap-2 px-3 py-1.5 text-[13px] text-textMuted hover:bg-headerBar hover:text-text transition-colors w-full ${

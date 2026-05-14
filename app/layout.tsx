@@ -19,13 +19,22 @@ export const metadata: Metadata = {
   description: 'Hotel Management Visualization System',
 }
 
+// Read the persisted skin from localStorage and apply it to <html> BEFORE
+// React hydrates. Without this, the page paints with the default skin first
+// and then snaps to the user's choice — a visible flash. Falls back silently
+// to 'fiori' if storage is denied (private mode, etc).
+const SKIN_BOOTSTRAP = `(function(){try{var s=localStorage.getItem('hotel-skin');if(s!=='fiori'&&s!=='modern')s='fiori';document.documentElement.setAttribute('data-skin',s);}catch(e){document.documentElement.setAttribute('data-skin','fiori');}})();`
+
 export default function RootLayout({
   children,
 }: {
   children: React.ReactNode
 }) {
   return (
-    <html lang="th" className={sarabun.variable}>
+    <html lang="th" className={sarabun.variable} data-skin="fiori">
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: SKIN_BOOTSTRAP }} />
+      </head>
       <body className="font-sans bg-shell text-text">
         <Providers>
           <AppShell>
