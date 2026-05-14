@@ -576,9 +576,17 @@ impl CheckInRepository for PgCheckInRepository {
         tx: &mut Transaction<'_, Postgres>,
         write: CheckInInsert<'_>,
     ) -> Result<i32, sqlx::Error> {
+        // `cin_checkin_time` is stored as a naive timestamp interpreted as
+        // Thai local time — that's the legacy convention preserved across the
+        // PG cutover so old (migrated) rows and new rows sort consistently.
+        // The PG container's session TZ is UTC, so `NOW()::timestamp` would
+        // produce a UTC-naive value 7h behind any Thai-local row entered the
+        // same day; the new check-in would then sink BELOW today's older
+        // rows in `ORDER BY cin_checkin_time DESC`, hiding it from "Recent
+        // Activity". `NOW() AT TIME ZONE 'Asia/Bangkok'` fixes the wall clock.
         let rec = sqlx::query!(
             r#"INSERT INTO ht_checkins (cin_no, cin_book_id, cin_cust_id, cin_room_id, cin_checkin_time, cin_expected_checkout, cin_adults, cin_children, cin_status, cin_rate_per_night, cin_notes)
-        VALUES ($1, $2, $3, $4, COALESCE($5, NOW()::timestamp), $6, $7, $8, 'active', $9::float8, $10)
+        VALUES ($1, $2, $3, $4, COALESCE($5, (NOW() AT TIME ZONE 'Asia/Bangkok')::timestamp), $6, $7, $8, 'active', $9::float8, $10)
         RETURNING cin_id"#,
             write.cin_no,
             write.booking_id,
@@ -685,8 +693,10 @@ impl CheckInRepository for PgCheckInRepository {
         // a defensive re-fold). The shift gate in
         // `service::checkin::check_out` guarantees a `Some(_)` value is
         // threaded through on every production code path.
+        // Same Thai-local convention as the INSERT above — keep checkout
+        // timestamps aligned with check-in timestamps.
         sqlx::query!(
-            r#"UPDATE ht_checkins SET cin_checkout_time = COALESCE($1, NOW()::timestamp), cin_status = 'checkedout',
+            r#"UPDATE ht_checkins SET cin_checkout_time = COALESCE($1, (NOW() AT TIME ZONE 'Asia/Bangkok')::timestamp), cin_status = 'checkedout',
         cin_total_amount = COALESCE($2::float8, cin_total_amount), cin_payment_status = $3,
         cin_notes = COALESCE($4, cin_notes),
         cin_round_bill_shift_id = COALESCE($5, cin_round_bill_shift_id),
