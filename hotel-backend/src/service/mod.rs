@@ -43,6 +43,7 @@ pub mod error;
 pub mod housekeeping;
 pub mod ids;
 pub mod payment;
+pub mod pos;
 pub mod reports;
 pub mod shifts;
 
@@ -72,6 +73,7 @@ pub use payment::{
     GenerateReceiptCommand, GenerateReceiptOutcome, PaymentService, RecordPaymentCommand,
     RecordPaymentOutcome, RefundPaymentCommand, RefundPaymentOutcome,
 };
+pub use pos::{PosService, RecordSaleCommand, RecordSaleOutcome};
 pub use shifts::{
     CloseShiftCommand, OpenShiftCommand, OpenShiftOutcome, Shift, ShiftService, ShiftSummary,
 };

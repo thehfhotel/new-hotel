@@ -353,6 +353,42 @@ pub enum WritebackIntent {
         /// `legacy_cupon_no` from PG keyed on this column.
         coupon_id: i64,
     },
+
+    /// Track G6 — POS / sales-to-room (migration 052).
+    ///
+    /// One line item rung up against a check-in folio. The service has
+    /// already inserted the canonical `ht_pos_sales` row, decremented
+    /// `ht_products.prod_current_stock`, and is now asking the writeback
+    /// worker to mirror the sale into legacy MSSQL:
+    ///
+    /// 1. INSERT INTO `HT_CheckIn_Product` (12 cols) OUTPUT INSERTED.id
+    /// 2. UPDATE `HT_Products` SET `Pro_Amt = Pro_Amt + (-qty)`
+    ///    WHERE `Pro_no = <legacy_no>` (additive — never absolute SET —
+    ///    so concurrent iHOTEL sales never get clobbered)
+    ///
+    /// Carries `sale_id` directly (canonical PK) so the recipe loads the
+    /// row's remaining columns from PG via the resolver before issuing
+    /// the legacy INSERT. The PK back-link lands on `sale_legacy_id`
+    /// after the OUTPUT clause returns the IDENTITY.
+    ///
+    /// Stock-adjust is bundled into the SAME recipe rather than
+    /// emitting a separate `AdjustProductStock` intent: the legacy
+    /// app's POS form fires both writes inside one transaction
+    /// (`docs/legacy-app/COMPAT_CHEATSHEET.md:560-564`); splitting the
+    /// pair into two jobs would let one succeed while the other
+    /// failed, breaking the stock invariant the legacy app expects.
+    RecordPosSale {
+        /// Aggregate id of the parent check-in this sale is recorded
+        /// against. Drives the writeback worker's `legacy_cin_no`
+        /// + `legacy_room_no` resolution (same resolver branch as
+        /// `RecordPayment`).
+        check_in_id: Uuid,
+        /// `ht_pos_sales.sale_id` of the canonical row the service
+        /// just inserted. The recipe loads `sale_qty`, `sale_unit_price`,
+        /// `sale_note`, the joined `prod_legacy_no` + `prod_name` +
+        /// `prod_unit` from PG before issuing the legacy INSERT.
+        sale_id: i64,
+    },
 }
 
 /// Payload for [`WritebackIntent::CreateBooking`].
@@ -501,6 +537,7 @@ impl WritebackIntent {
             WritebackIntent::AdjustProductStock { .. } => "adjust_product_stock",
             WritebackIntent::IssueCoupon { .. } => "issue_coupon",
             WritebackIntent::RedeemCoupon { .. } => "redeem_coupon",
+            WritebackIntent::RecordPosSale { .. } => "record_pos_sale",
         }
     }
 
@@ -519,7 +556,8 @@ impl WritebackIntent {
             | WritebackIntent::CheckOut { check_in_id, .. }
             | WritebackIntent::RecordPayment { check_in_id, .. }
             | WritebackIntent::RefundPayment { check_in_id, .. }
-            | WritebackIntent::RoomChange { check_in_id, .. } => *check_in_id,
+            | WritebackIntent::RoomChange { check_in_id, .. }
+            | WritebackIntent::RecordPosSale { check_in_id, .. } => *check_in_id,
             WritebackIntent::MarkRoomClean { room_id, .. } => *room_id,
             // Track F3 — fall back to a deterministic v5 UUID derived
             // from the legacy `Pro_no` so the

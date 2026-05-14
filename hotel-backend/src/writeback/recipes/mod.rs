@@ -31,6 +31,7 @@
 //! | `mark_clean` | §3j | `MarkRoomClean` |
 //! | `adjust_product_stock` | Track F3 / T1 CRIT-3 (`docs/legacy-app/COMPAT_CHEATSHEET.md:560-564`) | `AdjustProductStock` |
 //! | `coupon` | Track G5 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_Cupon`) | `IssueCoupon` + `RedeemCoupon` |
+//! | `pos_sale` | Track G6 / POS module (MVP) — `HT_CheckIn_Product` INSERT + paired `HT_Products.Pro_Amt` additive decrement | `RecordPosSale` |
 
 pub mod adjust_product_stock;
 pub mod booking_cancel;
@@ -44,6 +45,7 @@ pub mod extend_stay;
 pub mod helpers;
 pub mod mark_clean;
 pub mod payment;
+pub mod pos_sale;
 pub mod refund_payment;
 pub mod room_change;
 pub mod walkin;

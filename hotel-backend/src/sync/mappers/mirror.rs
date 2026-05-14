@@ -160,8 +160,27 @@ impl MssqlChangeMapper for CheckinProductMirrorMapper {
                     .bind(id)
                     .execute(&mut **tx)
                     .await?;
+                // Track G6 — cascade the canonical row delete keyed
+                // on the legacy back-link. Idempotent: legacy-origin
+                // races where no canonical row exists yet are no-ops.
+                sqlx::query("DELETE FROM ht_pos_sales WHERE sale_legacy_id = $1")
+                    .bind(id)
+                    .execute(&mut **tx)
+                    .await?;
             }
             ChangeOp::Insert | ChangeOp::Update => {
+                let cin_no = row.try_get_str("Cin_No")?;
+                let room_no = row.try_get_str("Cin_Room_no")?;
+                let ds_date = row.try_get_datetime("Cin_Ds_date")?;
+                let pro_id = row.try_get_str("Cin_Pro_id")?;
+                let pro_name = row.try_get_str("Cin_Pro_name")?;
+                let pro_unit = row.try_get_str("Cin_Pro_Unit")?;
+                let pro_num = row.try_get_f64("Cin_Pro_num")?;
+                let pro_price = row.try_get_f64("Cin_Pro_price")?;
+                let pro_pricetotal = row.try_get_f64("Cin_Pro_priceTotal")?;
+                let pro_pay = row.try_get_f64("Cin_Pro_pay")?;
+                let pro_note = row.try_get_str("Cin_Pro_note")?;
+
                 sqlx::query(
                     "INSERT INTO legacy_mirror.ht_checkin_product \
                         (id, cin_no, cin_room_no, cin_ds_date, cin_pro_id, \
@@ -185,23 +204,149 @@ impl MssqlChangeMapper for CheckinProductMirrorMapper {
                         mirror_source      = 'ct'",
                 )
                 .bind(id)
-                .bind(row.try_get_str("Cin_No")?)
-                .bind(row.try_get_str("Cin_Room_no")?)
-                .bind(row.try_get_datetime("Cin_Ds_date")?)
-                .bind(row.try_get_str("Cin_Pro_id")?)
-                .bind(row.try_get_str("Cin_Pro_name")?)
-                .bind(row.try_get_str("Cin_Pro_Unit")?)
-                .bind(row.try_get_f64("Cin_Pro_num")?)
-                .bind(row.try_get_f64("Cin_Pro_price")?)
-                .bind(row.try_get_f64("Cin_Pro_priceTotal")?)
-                .bind(row.try_get_f64("Cin_Pro_pay")?)
-                .bind(row.try_get_str("Cin_Pro_note")?)
+                .bind(cin_no)
+                .bind(room_no)
+                .bind(ds_date)
+                .bind(pro_id)
+                .bind(pro_name)
+                .bind(pro_unit)
+                .bind(pro_num)
+                .bind(pro_price)
+                .bind(pro_pricetotal)
+                .bind(pro_pay)
+                .bind(pro_note)
                 .execute(&mut **tx)
+                .await?;
+
+                // Track G6 — reverse-sync into the canonical
+                // `ht_pos_sales` table so sales rung up via iHOTEL
+                // also land canonically. The mapper resolves
+                // `Cin_No` → `cin_id` and `Cin_Pro_id` → `prod_id`
+                // via FK joins; misses (parent rows haven't been
+                // mirrored yet) are silently skipped. The next CT
+                // tick on the same row re-fires the mapper after
+                // the parent rows land.
+                upsert_canonical_pos_sale(
+                    tx, id, cin_no, pro_id, pro_num, pro_price, pro_note, ds_date,
+                )
                 .await?;
             }
         }
         Ok(None)
     }
+}
+
+/// Track G6 — UPSERT a canonical `ht_pos_sales` row from the legacy
+/// `HT_CheckIn_Product` projection. Resolves `Cin_No` →
+/// `ht_checkins.cin_id`, `Cin_Pro_id` → `ht_products.prod_id`. If
+/// either lookup misses (the parent row hasn't been mirrored yet)
+/// this is a NO-OP — next CT tick re-runs the mapper after the
+/// parents land. The mirror-table UPSERT above always completes so
+/// `legacy_mirror.ht_checkin_product` readers see the row immediately.
+#[allow(clippy::too_many_arguments)]
+async fn upsert_canonical_pos_sale(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    legacy_id: i32,
+    cin_no: Option<&str>,
+    pro_id: Option<&str>,
+    pro_num: Option<f64>,
+    pro_price: Option<f64>,
+    pro_note: Option<&str>,
+    ds_date: Option<chrono::NaiveDateTime>,
+) -> Result<(), sqlx::Error> {
+    let Some(cin_no) = cin_no else { return Ok(()) };
+    let Some(pro_id) = pro_id else { return Ok(()) };
+
+    // Resolve cin_id + prod_id in one round trip. Any NULL means the
+    // parent rows aren't yet mirrored — bail out so the canonical
+    // table stays consistent (the next tick will retry).
+    let resolved: Option<(i32, i64)> = sqlx::query_as(
+        "SELECT c.cin_id, p.prod_id \
+           FROM ht_checkins c \
+           JOIN ht_products p ON p.prod_legacy_no = $2 \
+          WHERE c.legacy_cin_no = $1 \
+          LIMIT 1",
+    )
+    .bind(cin_no)
+    .bind(pro_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((cin_id, prod_id)) = resolved else {
+        return Ok(());
+    };
+
+    // Two-step UPSERT keyed on `sale_legacy_id`. The partial UNIQUE
+    // index `WHERE sale_legacy_id IS NOT NULL` means standard
+    // `ON CONFLICT (sale_legacy_id)` needs the predicate inlined,
+    // which sqlx-dynamic can't bind cleanly. Manual UPDATE-then-
+    // INSERT is just as idempotent under the serialized CT-tick
+    // driver and reads cleanly.
+    //
+    // Rows our app originated carry `sale_legacy_id IS NULL` until
+    // the writeback worker back-populates it. This mapper only
+    // touches rows whose `sale_legacy_id` is already set (legacy-
+    // origin) OR creates a fresh legacy-origin row when no
+    // canonical row exists yet for this legacy id.
+    let qty = pro_num.unwrap_or(0.0);
+    let unit_price = pro_price.unwrap_or(0.0);
+
+    let updated = sqlx::query(
+        "UPDATE ht_pos_sales SET \
+             sale_cin_id     = $1, \
+             sale_product_id = $2, \
+             sale_qty        = $3::numeric, \
+             sale_unit_price = $4::numeric, \
+             sale_note       = $5, \
+             sale_sold_at    = COALESCE($6::timestamp AT TIME ZONE 'Asia/Bangkok', sale_sold_at), \
+             source          = 'legacy', \
+             updated_at      = NOW() \
+           WHERE sale_legacy_id = $7",
+    )
+    .bind(cin_id)
+    .bind(prod_id)
+    .bind(qty)
+    .bind(unit_price)
+    .bind(pro_note)
+    .bind(ds_date)
+    .bind(legacy_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+
+    if updated == 0 {
+        // Legacy-origin INSERT (no canonical row yet for this id).
+        // Aggregate id derived via UUID v5 over the legacy id under
+        // a stable namespace so retries from a duplicate CT row
+        // converge to the same UUID — matching the
+        // `product_aggregate_fallback` shape from F3.
+        let namespace = uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_OID,
+            b"new-hotel.aggregate.pos_sale.legacy_id",
+        );
+        let agg = uuid::Uuid::new_v5(&namespace, &legacy_id.to_be_bytes());
+        sqlx::query(
+            "INSERT INTO ht_pos_sales ( \
+                 sale_cin_id, sale_product_id, sale_qty, sale_unit_price, \
+                 sale_note, sale_sold_at, source, aggregate_id, sale_legacy_id \
+             ) VALUES ( \
+                 $1, $2, $3::numeric, $4::numeric, $5, \
+                 COALESCE($6::timestamp AT TIME ZONE 'Asia/Bangkok', NOW()), \
+                 'legacy', $7, $8 \
+             ) \
+             ON CONFLICT (aggregate_id) DO NOTHING",
+        )
+        .bind(cin_id)
+        .bind(prod_id)
+        .bind(qty)
+        .bind(unit_price)
+        .bind(pro_note)
+        .bind(ds_date)
+        .bind(agg)
+        .bind(legacy_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
 }
 
 // ─── HT_Deposit ──────────────────────────────────────────────────────

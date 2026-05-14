@@ -23,7 +23,7 @@ use crate::routes::auth::ProdAuthService;
 use crate::config::SiteConfig;
 use crate::service::{
     BookingService, CheckInService, CouponService, CustomerService, HousekeepingService,
-    PaymentService, ShiftService,
+    PaymentService, PosService, ShiftService,
 };
 
 /// Bundle of fully-wired Phase-2 services produced by `AppState::wire_services`.
@@ -44,6 +44,10 @@ struct WiredServices {
     shifts: Arc<ShiftService>,
     /// Track G5 — coupon issuing canonical service.
     coupons: Arc<CouponService>,
+    /// Track G6 — POS / sales-to-room service. Stateless once
+    /// constructed; reads `ht_products` + `ht_checkins`, writes
+    /// `ht_pos_sales` + outbox intent.
+    pos: Arc<PosService>,
 }
 
 /// System operating mode
@@ -130,6 +134,9 @@ pub struct AppState {
     /// redeem against the canonical table plus outbox enqueues so the
     /// writeback worker can mirror onto legacy `HT_Cupon`.
     pub coupons_service: Arc<CouponService>,
+    /// POS service — orchestrates `ht_pos_sales` writes + stock
+    /// decrement + outbox `RecordPosSale` intent. Track G6.
+    pub pos_service: Arc<PosService>,
 
     // ----- Auth (Phase 4 PR2) -----
     /// Cookie-session auth service — wired with PG-backed user + session
@@ -205,6 +212,7 @@ impl AppState {
             housekeeping_service: services.housekeeping,
             shifts_service: services.shifts,
             coupons_service: services.coupons,
+            pos_service: services.pos,
             auth_service: crate::routes::auth::build_auth_service(),
             auth_enabled: false,
         }
@@ -250,6 +258,7 @@ impl AppState {
             housekeeping_service: services.housekeeping,
             shifts_service: services.shifts,
             coupons_service: services.coupons,
+            pos_service: services.pos,
             auth_service: crate::routes::auth::build_auth_service(),
             auth_enabled: false,
         }
@@ -329,7 +338,9 @@ impl AppState {
                 pg.clone(),
             )),
             shifts,
-            coupons: Arc::new(CouponService::new(outbox, events, pg)),
+            coupons: Arc::new(CouponService::new(outbox.clone(), events.clone(), pg.clone())),
+            // Track G6 — POS / sales-to-room service.
+            pos: Arc::new(PosService::new(outbox, events, pg)),
         }
     }
 

@@ -70,6 +70,14 @@ pub enum AggregateKind {
     /// aggregate UUID from the BIGSERIAL `coupon_id` so subscribers
     /// can deduplicate issue/redeem events across writeback retries.
     Coupon,
+    /// Track G6 — `ht_pos_sales` line items. The service mints a v5
+    /// UUID from the SERIAL `sale_id` so downstream subscribers can
+    /// dedup retries of a `RecordPosSale` intent. Note: the intent
+    /// itself uses the parent check-in UUID for the `aggregate_id`
+    /// field so the writeback resolver picks up the same
+    /// `legacy_cin_no` self-heal path; this kind is for the canonical
+    /// row's own `aggregate_id` column (unique per sale line).
+    PosSale,
 }
 
 impl AggregateKind {
@@ -83,6 +91,7 @@ impl AggregateKind {
             AggregateKind::Room => "new-hotel.aggregate.room",
             AggregateKind::Product => "new-hotel.aggregate.product",
             AggregateKind::Coupon => "new-hotel.aggregate.coupon",
+            AggregateKind::PosSale => "new-hotel.aggregate.pos_sale",
         }
     }
 
@@ -122,6 +131,7 @@ mod tests {
             AggregateKind::Room,
             AggregateKind::Product,
             AggregateKind::Coupon,
+            AggregateKind::PosSale,
         ] {
             for id in [1_i32, 42, 1_000_000, i32::MAX] {
                 assert_eq!(aggregate_uuid(kind, id), aggregate_uuid(kind, id));
@@ -142,6 +152,7 @@ mod tests {
             AggregateKind::Room,
             AggregateKind::Product,
             AggregateKind::Coupon,
+            AggregateKind::PosSale,
         ];
 
         for (a_index, a) in kinds.iter().enumerate() {
