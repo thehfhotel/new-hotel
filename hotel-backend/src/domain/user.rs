@@ -40,6 +40,8 @@ pub struct User {
 pub enum Role {
     Admin,
     Receptionist,
+    Cashier,
+    Housekeeper,
 }
 
 impl Role {
@@ -49,6 +51,8 @@ impl Role {
         match self {
             Role::Admin => "admin",
             Role::Receptionist => "receptionist",
+            Role::Cashier => "cashier",
+            Role::Housekeeper => "housekeeper",
         }
     }
 }
@@ -70,7 +74,7 @@ impl std::fmt::Display for ParseRoleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "invalid role '{}' (expected 'admin' or 'receptionist')",
+            "invalid role '{}' (expected 'admin', 'receptionist', 'cashier', or 'housekeeper')",
             self.0
         )
     }
@@ -85,6 +89,8 @@ impl TryFrom<&str> for Role {
         match value {
             "admin" => Ok(Role::Admin),
             "receptionist" => Ok(Role::Receptionist),
+            "cashier" => Ok(Role::Cashier),
+            "housekeeper" => Ok(Role::Housekeeper),
             other => Err(ParseRoleError(other.to_string())),
         }
     }
@@ -106,8 +112,12 @@ mod tests {
     fn role_round_trips_via_as_str_and_try_from() {
         assert_eq!(Role::try_from("admin"), Ok(Role::Admin));
         assert_eq!(Role::try_from("receptionist"), Ok(Role::Receptionist));
+        assert_eq!(Role::try_from("cashier"), Ok(Role::Cashier));
+        assert_eq!(Role::try_from("housekeeper"), Ok(Role::Housekeeper));
         assert_eq!(Role::Admin.as_str(), "admin");
         assert_eq!(Role::Receptionist.as_str(), "receptionist");
+        assert_eq!(Role::Cashier.as_str(), "cashier");
+        assert_eq!(Role::Housekeeper.as_str(), "housekeeper");
     }
 
     #[test]
