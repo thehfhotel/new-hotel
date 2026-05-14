@@ -1784,5 +1784,54 @@ VALUES ('047', '047_rr4_export_log.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================
+-- Migration 050 — Resilience PR R3. Per-table Change Tracking watermark
+-- (`legacy_ct_state_per_table`) so a wedge on one hot legacy MSSQL table
+-- (canonical: HT_Book_H row lock, observed 2026-05-14) freezes only that
+-- row instead of gating every CT-enabled table. Sibling to the existing
+-- single-row `legacy_ct_state`; only consulted when the watcher runs
+-- with `SYNC_PER_TABLE_WATERMARK=true`. Full rationale in
+-- `migrations/pg/050_legacy_ct_state_per_table.sql`.
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS legacy_ct_state_per_table (
+    table_name        TEXT         PRIMARY KEY,
+    last_seen_version BIGINT       NOT NULL DEFAULT 0,
+    last_polled_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    last_error        TEXT,
+    last_error_at     TIMESTAMPTZ
+);
+
+INSERT INTO legacy_ct_state_per_table (table_name, last_seen_version)
+SELECT t.name, COALESCE((SELECT last_seen_version FROM legacy_ct_state WHERE id = 1), 0)
+FROM (VALUES
+    ('HT_Customers'),
+    ('HT_Rooms'),
+    ('HT_Room_Status'),
+    ('HT_Book_H'),
+    ('HT_Book_Ds'),
+    ('HT_Book_Date'),
+    ('HT_CheckIn_H'),
+    ('HT_CheckIn_Ds'),
+    ('HT_CheckIn_Pay'),
+    ('HT_Receipt_H'),
+    ('HT_Cupon'),
+    ('HT_CheckIn_Product'),
+    ('HT_Deposit'),
+    ('HT_Changed_Room'),
+    ('HT_Bill_Debt_H'),
+    ('HT_Bill_Debt_Ds'),
+    ('HT_CheckIn_Other_People'),
+    ('HT_Rooms_Cancel')
+) AS t(name)
+ON CONFLICT (table_name) DO NOTHING;
+
+CREATE INDEX IF NOT EXISTS ix_legacy_ct_state_per_table_polled_at
+    ON legacy_ct_state_per_table (last_polled_at);
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('050', '050_legacy_ct_state_per_table.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
 -- Initialization complete
 -- =============================================================================
