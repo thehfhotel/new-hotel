@@ -56,7 +56,7 @@ use std::collections::HashSet;
 /// `==== Columns ====` section in `dbo.<TABLE>|<ord>|<col>|<type>|…`
 /// format.
 pub const LEGACY_BASELINE_SCHEMA: &str =
-    include_str!("../../../docs/legacy-spike/schema/01-baseline-schema.txt");
+    include_str!("../../schema-baseline.txt");
 
 /// Parse the `==== Columns ====` section of the baseline schema for a
 /// single table and return the set of legal column names.
