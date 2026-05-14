@@ -158,6 +158,7 @@ pub async fn apply_canonical_cupon_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::mapper::MssqlChangeMapper;
     use crate::sync::row::test_support::{HashMapRow, MockValue};
 
     /// H1 pattern — lock the canonical projection's column list
@@ -194,11 +195,11 @@ mod tests {
             .with("cupon_no", MockValue::I32(17_895))
             .with("cupon_cin_no", MockValue::Str("CH26-005228".into()))
             .with("cupon_cin_room", MockValue::Str("508".into()))
-            .with("cupon_date", MockValue::Datetime(
+            .with("cupon_date", MockValue::DateTime(
                 chrono::NaiveDate::from_ymd_opt(2026, 5, 14).unwrap()
                     .and_hms_opt(3, 1, 11).unwrap(),
             ))
-            .with("cupon_gen_date", MockValue::Datetime(
+            .with("cupon_gen_date", MockValue::DateTime(
                 chrono::NaiveDate::from_ymd_opt(2026, 5, 14).unwrap()
                     .and_hms_opt(3, 1, 11).unwrap(),
             ))

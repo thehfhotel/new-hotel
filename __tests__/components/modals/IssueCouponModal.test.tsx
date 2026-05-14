@@ -151,14 +151,17 @@ describe('IssueCouponModal Component', () => {
         }),
       })
 
-      render(<IssueCouponModal {...defaultProps} defaultValue={-1} />)
+      // `defaultValue={0}` keeps the input HTML5-valid (`min="0"`)
+      // so the click reaches the JS handler; the failure surfaces
+      // from the mocked fetch response, exercising the server-error
+      // code path the test name advertises.
+      render(<IssueCouponModal {...defaultProps} defaultValue={0} />)
 
-      // Local validation catches negative — fetch never fires.
       fireEvent.click(screen.getByRole('button', { name: /ยืนยันการออกคูปอง/ }))
       expect(
-        await screen.findByText(/มูลค่าคูปอง/),
+        await screen.findByText('value must be a finite non-negative number'),
       ).toBeInTheDocument()
-      expect(global.fetch).not.toHaveBeenCalled()
+      expect(global.fetch).toHaveBeenCalledTimes(1)
     })
   })
 })
