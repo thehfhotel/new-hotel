@@ -1698,6 +1698,29 @@ async fn upsert_room_mirror(
     Ok(())
 }
 
+/// Legacy `HT_Rooms` projection for the room reconcile hash. Held as a
+/// module-private const so Track J1's projection-lock test can pin
+/// every column against the authoritative HF Hotel schema dump.
+///
+/// `Room_Manternace` is the legacy schema's verbatim spelling (sic —
+/// typo for "Maintenance"). Renaming it client-side would break the
+/// SELECT.
+const ROOMS_RECONCILE_PROJECTION: &[&str] = &[
+    "Room_no",
+    "Room_Type",
+    "Room_Details",
+    "Room_Clean",
+    "Room_Use",
+    "Room_Book",
+    "Room_Manternace",
+    "Room_PriceA",
+    "Room_PriceB",
+    "Room_PriceC",
+    "Room_Group",
+    "Room_Book_Name",
+    "Room_Book_Time",
+];
+
 async fn sync_rooms(
     legacy_pool: &DbPool,
     pg_pool: &PgPool,
@@ -1708,27 +1731,12 @@ async fn sync_rooms(
 
     let mut conn = legacy_pool.get().await?;
 
+    let rooms_select_sql = format!(
+        "SELECT {projection} FROM HT_Rooms ORDER BY Room_no",
+        projection = ROOMS_RECONCILE_PROJECTION.join(", "),
+    );
     let rows = conn
-        .simple_query(
-            r#"
-            SELECT
-                Room_no,
-                Room_Type,
-                Room_Details,
-                Room_Clean,
-                Room_Use,
-                Room_Book,
-                Room_Manternace,
-                Room_PriceA,
-                Room_PriceB,
-                Room_PriceC,
-                Room_Group,
-                Room_Book_Name,
-                Room_Book_Time
-            FROM HT_Rooms
-            ORDER BY Room_no
-            "#,
-        )
+        .simple_query(&rooms_select_sql)
         .await?
         .into_first_result()
         .await?;
@@ -1893,6 +1901,24 @@ async fn sync_rooms(
 // Booking Sync
 // =============================================================================
 
+/// Legacy `View_Booking_Ds` projection for the booking reconcile hash.
+/// Held as a module-private const so Track J1's projection-lock test
+/// can pin every column.
+///
+/// `View_Booking_Ds` joins `HT_Book_H` (header) with `HT_Book_Ds`
+/// (per-room detail), so every column in this projection must exist on
+/// one of those two base tables.
+const BOOKINGS_RECONCILE_PROJECTION: &[&str] = &[
+    "Book_No",
+    "Book_Date",
+    "Book_Date_in",
+    "Book_Date_out",
+    "Book_Cust_Name",
+    "Book_Cust_ID",
+    "Book_Status",
+    "Book_Room_Type",
+];
+
 async fn sync_bookings(
     legacy_pool: &DbPool,
     pg_pool: &PgPool,
@@ -1903,21 +1929,12 @@ async fn sync_bookings(
 
     let mut conn = legacy_pool.get().await?;
 
+    let bookings_select_sql = format!(
+        "SELECT {projection} FROM View_Booking_Ds",
+        projection = BOOKINGS_RECONCILE_PROJECTION.join(", "),
+    );
     let rows = conn
-        .simple_query(
-            r#"
-            SELECT
-                Book_No,
-                Book_Date,
-                Book_Date_in,
-                Book_Date_out,
-                Book_Cust_Name,
-                Book_Cust_ID,
-                Book_Status,
-                Book_Room_Type
-            FROM View_Booking_Ds
-            "#,
-        )
+        .simple_query(&bookings_select_sql)
         .await?
         .into_first_result()
         .await?;
@@ -2260,6 +2277,27 @@ async fn upsert_booking_mirror(
 // Check-in Sync
 // =============================================================================
 
+/// Legacy `View_CheckIn_Ds` projection for the check-in reconcile hash.
+/// Held as a module-private const so Track J1's projection-lock test
+/// can pin every column.
+///
+/// `View_CheckIn_Ds` joins `HT_CheckIn_H` (header) with `HT_CheckIn_Ds`
+/// (per-room detail), so every column in this projection must exist on
+/// one of those two base tables. Mixed casing — `Cin_no` /
+/// `Cin_cust_name` / `Cin_cust_no` / `Cin_status` are lowercase on
+/// `HT_CheckIn_H`; `Cin_Room_No` / `Cin_Room_In` / `Cin_Room_Out` are
+/// capital-N on `HT_CheckIn_Ds`. The view preserves both casings
+/// verbatim per the live schema dump.
+const CHECKINS_RECONCILE_PROJECTION: &[&str] = &[
+    "Cin_no",
+    "Cin_Room_No",
+    "Cin_Room_In",
+    "Cin_Room_Out",
+    "Cin_cust_name",
+    "Cin_cust_no",
+    "Cin_status",
+];
+
 async fn sync_checkins(
     legacy_pool: &DbPool,
     pg_pool: &PgPool,
@@ -2270,20 +2308,12 @@ async fn sync_checkins(
 
     let mut conn = legacy_pool.get().await?;
 
+    let checkins_select_sql = format!(
+        "SELECT {projection} FROM View_CheckIn_Ds",
+        projection = CHECKINS_RECONCILE_PROJECTION.join(", "),
+    );
     let rows = conn
-        .simple_query(
-            r#"
-            SELECT
-                Cin_no,
-                Cin_Room_No,
-                Cin_Room_In,
-                Cin_Room_Out,
-                Cin_cust_name,
-                Cin_cust_no,
-                Cin_status
-            FROM View_CheckIn_Ds
-            "#,
-        )
+        .simple_query(&checkins_select_sql)
         .await?
         .into_first_result()
         .await?;
@@ -3101,6 +3131,59 @@ mod tests {
             !has_bare_cust_type,
             "CUSTOMERS_RECONCILE_PROJECTION must not project bare 'Cust_Type' \
              (rate-tier, mapped to cust_price_tier) — use Cust_Type_Main instead"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Track J1 — projection-lock guards for the remaining reconcile
+    // projections. `CUSTOMERS_RECONCILE_PROJECTION` keeps its hand-rolled
+    // lock test above because that test additionally pins forbidden-
+    // column tripwires (View_Customers's `Cust_Type` rate-tier label).
+    // The three projections below have no such forbidden columns —
+    // a baseline-subset check is the right granularity.
+    //
+    // PR #90 (`HT_CheckIn_Ds` 9h drop) and PR #101 (`Cust_Type` vs
+    // `Cust_Type_Main` reconcile drift) were both single typos that
+    // shipped because tiberius validates column names only at runtime.
+    // A baseline-subset lock test catches that class at CI time before
+    // it can ever reach the watcher / reconcile loop.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn rooms_reconcile_projection_is_subset_of_legacy_schema() {
+        crate::assert_projection_slice_subset!(ROOMS_RECONCILE_PROJECTION, "HT_Rooms");
+    }
+
+    #[test]
+    fn bookings_reconcile_projection_is_subset_of_legacy_schema() {
+        // `View_Booking_Ds` joins HT_Book_H (header) with HT_Book_Ds
+        // (per-room detail). Every projected column must appear on
+        // one of the two underlying base tables.
+        crate::assert_projection_slice_subset_of_two_tables!(
+            BOOKINGS_RECONCILE_PROJECTION,
+            "HT_Book_H",
+            "HT_Book_Ds",
+            "View_Booking_Ds"
+        );
+    }
+
+    #[test]
+    fn checkins_reconcile_projection_is_subset_of_legacy_schema() {
+        // `View_CheckIn_Ds` joins HT_CheckIn_H (header — lowercase
+        // `Cin_no`, `Cin_cust_*`, `Cin_status`) with HT_CheckIn_Ds
+        // (per-room detail — capital-N `Cin_Room_*`). The view ALSO
+        // joins `View_Customers` to expose a computed `Cin_cust_name`
+        // alias — that aliased column isn't on either base table and
+        // is whitelisted explicitly.
+        crate::assert_projection_slice_subset_of_two_tables!(
+            CHECKINS_RECONCILE_PROJECTION,
+            "HT_CheckIn_H",
+            "HT_CheckIn_Ds",
+            "View_CheckIn_Ds",
+            // View-computed alias: `View_Customers.Cust_name` exposed
+            // as `Cin_cust_name` after the join. Not present as a bare
+            // column on either base table.
+            &["Cin_cust_name"]
         );
     }
 

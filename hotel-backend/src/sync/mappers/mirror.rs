@@ -45,6 +45,13 @@ use crate::sync::SyncError;
 
 pub struct CuponMirrorMapper;
 
+/// CT JOIN projection for `HT_Cupon`. Held as a module-private const so
+/// Track J1's projection-lock test can pin every column against the
+/// authoritative HF Hotel schema dump.
+const CUPON_SELECT_COLS: &str =
+    "t.cupon_no, t.cupon_cin_no, t.cupon_cin_room, t.cupon_date, \
+     t.cupon_gen_date, t.cupon_by, t.cupon_print";
+
 #[async_trait]
 impl MssqlChangeMapper for CuponMirrorMapper {
     fn table(&self) -> &'static str {
@@ -56,8 +63,7 @@ impl MssqlChangeMapper for CuponMirrorMapper {
     }
 
     fn select_sql(&self) -> &'static str {
-        "t.cupon_no, t.cupon_cin_no, t.cupon_cin_room, t.cupon_date, \
-         t.cupon_gen_date, t.cupon_by, t.cupon_print"
+        CUPON_SELECT_COLS
     }
 
     async fn apply(
@@ -124,6 +130,13 @@ impl MssqlChangeMapper for CuponMirrorMapper {
 
 pub struct CheckinProductMirrorMapper;
 
+/// CT JOIN projection for `HT_CheckIn_Product`. Held as a module-private
+/// const so Track J1's projection-lock test can pin every column.
+const CHECKIN_PRODUCT_SELECT_COLS: &str =
+    "t.id, t.Cin_No, t.Cin_Room_no, t.Cin_Ds_date, t.Cin_Pro_id, \
+     t.Cin_Pro_name, t.Cin_Pro_Unit, t.Cin_Pro_num, t.Cin_Pro_price, \
+     t.Cin_Pro_priceTotal, t.Cin_Pro_pay, t.Cin_Pro_note";
+
 #[async_trait]
 impl MssqlChangeMapper for CheckinProductMirrorMapper {
     fn table(&self) -> &'static str {
@@ -135,9 +148,7 @@ impl MssqlChangeMapper for CheckinProductMirrorMapper {
     }
 
     fn select_sql(&self) -> &'static str {
-        "t.id, t.Cin_No, t.Cin_Room_no, t.Cin_Ds_date, t.Cin_Pro_id, \
-         t.Cin_Pro_name, t.Cin_Pro_Unit, t.Cin_Pro_num, t.Cin_Pro_price, \
-         t.Cin_Pro_priceTotal, t.Cin_Pro_pay, t.Cin_Pro_note"
+        CHECKIN_PRODUCT_SELECT_COLS
     }
 
     async fn apply(
@@ -353,6 +364,12 @@ async fn upsert_canonical_pos_sale(
 
 pub struct DepositMirrorMapper;
 
+/// CT JOIN projection for `HT_Deposit`. Held as a module-private const
+/// so Track J1's projection-lock test can pin every column.
+const DEPOSIT_SELECT_COLS: &str =
+    "t.id, t.Dep_no, t.Dep_Date, t.Dep_Room, t.Dep_Name, \
+     t.Dep_Price, t.Dep_Status, t.Dep_ref";
+
 #[async_trait]
 impl MssqlChangeMapper for DepositMirrorMapper {
     fn table(&self) -> &'static str {
@@ -364,8 +381,7 @@ impl MssqlChangeMapper for DepositMirrorMapper {
     }
 
     fn select_sql(&self) -> &'static str {
-        "t.id, t.Dep_no, t.Dep_Date, t.Dep_Room, t.Dep_Name, \
-         t.Dep_Price, t.Dep_Status, t.Dep_ref"
+        DEPOSIT_SELECT_COLS
     }
 
     async fn apply(
@@ -426,6 +442,12 @@ impl MssqlChangeMapper for DepositMirrorMapper {
 
 pub struct ChangedRoomMirrorMapper;
 
+/// CT JOIN projection for `HT_Changed_Room`. Held as a module-private
+/// const so Track J1's projection-lock test can pin every column.
+const CHANGED_ROOM_SELECT_COLS: &str =
+    "t.id, t.cin_no, t.room_before, t.room_after, t.change_date, \
+     t.room_before_price, t.Note, t.ToPrice";
+
 #[async_trait]
 impl MssqlChangeMapper for ChangedRoomMirrorMapper {
     fn table(&self) -> &'static str {
@@ -437,8 +459,7 @@ impl MssqlChangeMapper for ChangedRoomMirrorMapper {
     }
 
     fn select_sql(&self) -> &'static str {
-        "t.id, t.cin_no, t.room_before, t.room_after, t.change_date, \
-         t.room_before_price, t.Note, t.ToPrice"
+        CHANGED_ROOM_SELECT_COLS
     }
 
     async fn apply(
@@ -642,6 +663,15 @@ async fn upsert_canonical_room_change(
 
 pub struct BillDebtHMirrorMapper;
 
+/// CT JOIN projection for `HT_Bill_Debt_H`. Held as a module-private
+/// const so Track J1's projection-lock test can pin every column.
+const BILL_DEBT_H_SELECT_COLS: &str =
+    "t.Bill_No, t.Bill_Cust_ID, t.Bill_Cust_Name, t.Bill_Cust_Address, \
+     t.Bill_Cust_Tel, t.Bill_Cust_Fax, t.Bill_Date, t.Bill_Ref, \
+     t.Bill_Price_Type, t.Bill_Type, t.Bill_Total, t.Bill_Pay, \
+     t.Bill_Debt, t.Bill_Pay_CASH, t.Bill_Pay_CREDIT, t.Bill_Status, \
+     t.Bill_by, t.Bill_Note";
+
 #[async_trait]
 impl MssqlChangeMapper for BillDebtHMirrorMapper {
     fn table(&self) -> &'static str {
@@ -653,11 +683,7 @@ impl MssqlChangeMapper for BillDebtHMirrorMapper {
     }
 
     fn select_sql(&self) -> &'static str {
-        "t.Bill_No, t.Bill_Cust_ID, t.Bill_Cust_Name, t.Bill_Cust_Address, \
-         t.Bill_Cust_Tel, t.Bill_Cust_Fax, t.Bill_Date, t.Bill_Ref, \
-         t.Bill_Price_Type, t.Bill_Type, t.Bill_Total, t.Bill_Pay, \
-         t.Bill_Debt, t.Bill_Pay_CASH, t.Bill_Pay_CREDIT, t.Bill_Status, \
-         t.Bill_by, t.Bill_Note"
+        BILL_DEBT_H_SELECT_COLS
     }
 
     async fn apply(
@@ -745,6 +771,12 @@ impl MssqlChangeMapper for BillDebtHMirrorMapper {
 
 pub struct BillDebtDsMirrorMapper;
 
+/// CT JOIN projection for `HT_Bill_Debt_Ds`. Held as a module-private
+/// const so Track J1's projection-lock test can pin every column.
+const BILL_DEBT_DS_SELECT_COLS: &str =
+    "t.id, t.Bill_No, t.DS_ID, t.DS_NO, t.DS_NAME, \
+     t.DS_UNIT, t.DS_NUM, t.DS_PRICE, t.DS_PRICE_TOTAL";
+
 #[async_trait]
 impl MssqlChangeMapper for BillDebtDsMirrorMapper {
     fn table(&self) -> &'static str {
@@ -756,8 +788,7 @@ impl MssqlChangeMapper for BillDebtDsMirrorMapper {
     }
 
     fn select_sql(&self) -> &'static str {
-        "t.id, t.Bill_No, t.DS_ID, t.DS_NO, t.DS_NAME, \
-         t.DS_UNIT, t.DS_NUM, t.DS_PRICE, t.DS_PRICE_TOTAL"
+        BILL_DEBT_DS_SELECT_COLS
     }
 
     async fn apply(
@@ -827,6 +858,11 @@ impl MssqlChangeMapper for BillDebtDsMirrorMapper {
 
 pub struct RoomsCancelMirrorMapper;
 
+/// CT JOIN projection for `HT_Rooms_Cancel`. Held as a module-private
+/// const so Track J1's projection-lock test can pin every column.
+const ROOMS_CANCEL_SELECT_COLS: &str =
+    "t.id, t.room_no, t.cin_no, t.cancel_date, t.cancel_by, t.cancel_note";
+
 #[async_trait]
 impl MssqlChangeMapper for RoomsCancelMirrorMapper {
     fn table(&self) -> &'static str {
@@ -841,7 +877,7 @@ impl MssqlChangeMapper for RoomsCancelMirrorMapper {
     }
 
     fn select_sql(&self) -> &'static str {
-        "t.id, t.room_no, t.cin_no, t.cancel_date, t.cancel_by, t.cancel_note"
+        ROOMS_CANCEL_SELECT_COLS
     }
 
     async fn apply(
@@ -966,5 +1002,51 @@ mod tests {
 
     fn dummy_row() -> crate::sync::row::test_support::HashMapRow {
         crate::sync::row::test_support::HashMapRow::new("HT_Cupon")
+    }
+
+    // -------------------------------------------------------------------
+    // Track J1 — projection-lock guards for every mirror mapper.
+    //
+    // Each test pins the per-mapper SELECT projection const against the
+    // baseline schema dump for the underlying legacy table. A typo'd
+    // column name fails the test at CI time, never reaching the watcher.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn cupon_select_cols_are_subset_of_legacy_schema() {
+        crate::assert_projection_subset!(CUPON_SELECT_COLS, "HT_Cupon");
+    }
+
+    #[test]
+    fn checkin_product_select_cols_are_subset_of_legacy_schema() {
+        crate::assert_projection_subset!(
+            CHECKIN_PRODUCT_SELECT_COLS,
+            "HT_CheckIn_Product"
+        );
+    }
+
+    #[test]
+    fn deposit_select_cols_are_subset_of_legacy_schema() {
+        crate::assert_projection_subset!(DEPOSIT_SELECT_COLS, "HT_Deposit");
+    }
+
+    #[test]
+    fn changed_room_select_cols_are_subset_of_legacy_schema() {
+        crate::assert_projection_subset!(CHANGED_ROOM_SELECT_COLS, "HT_Changed_Room");
+    }
+
+    #[test]
+    fn bill_debt_h_select_cols_are_subset_of_legacy_schema() {
+        crate::assert_projection_subset!(BILL_DEBT_H_SELECT_COLS, "HT_Bill_Debt_H");
+    }
+
+    #[test]
+    fn bill_debt_ds_select_cols_are_subset_of_legacy_schema() {
+        crate::assert_projection_subset!(BILL_DEBT_DS_SELECT_COLS, "HT_Bill_Debt_Ds");
+    }
+
+    #[test]
+    fn rooms_cancel_select_cols_are_subset_of_legacy_schema() {
+        crate::assert_projection_subset!(ROOMS_CANCEL_SELECT_COLS, "HT_Rooms_Cancel");
     }
 }

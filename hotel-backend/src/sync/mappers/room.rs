@@ -685,4 +685,18 @@ mod tests {
             );
         }
     }
+
+    // -------------------------------------------------------------------
+    // Track J1 — projection-lock guards.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn rooms_select_cols_are_subset_of_legacy_schema() {
+        crate::assert_projection_subset!(ROOMS_SELECT_COLS, "HT_Rooms");
+    }
+
+    #[test]
+    fn room_status_select_cols_are_subset_of_legacy_schema() {
+        crate::assert_projection_subset!(ROOM_STATUS_SELECT_COLS, "HT_Room_Status");
+    }
 }

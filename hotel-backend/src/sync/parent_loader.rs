@@ -89,6 +89,55 @@ impl CheckInAggregate {
     }
 }
 
+/// `HT_Book_H` projection for the booking aggregate loader.
+///
+/// Track J1 — held as a module-private const so the projection-lock
+/// test can pin every column against the authoritative HF Hotel schema
+/// dump. Mirrors what the booking_create recipe writes (cheatsheet §3.3
+/// + writeback/recipes/booking_create.rs). The watcher does NOT need to
+/// project EVERY column — only the ones the canonical PG row mirrors.
+const BOOK_H_PROJECTION: &[&str] = &[
+    "Book_ID",
+    "Book_Date",
+    "Book_Cust_ID",
+    "Book_Cust_Name",
+    "Book_Cust_Tel",
+    "Book_Price_Total",
+    "Book_Price_Pay",
+    "Book_Status",
+    "Book_Date_in",
+    "Book_Date_out",
+    "Book_by",
+    "Book_room_note",
+];
+
+/// `HT_Book_Ds` projection. `Book_Room_Type` stores the room NUMBER per
+/// cheatsheet §3.4. Track J1 projection-lock test pins every column.
+const BOOK_DS_PROJECTION: &[&str] = &[
+    "id",
+    "Book_No",
+    "Book_Room_Type",
+    "Book_Room_Start",
+    "Book_Room_End",
+    "Book_Room_Price",
+    "Book_Room_Night",
+    "Book_Room_Num",
+    "Book_Room_PriceToTal",
+    "Book_status",
+];
+
+/// `HT_Book_Date` projection. Track J1 projection-lock test pins every
+/// column.
+const BOOK_DATE_PROJECTION: &[&str] = &[
+    "id",
+    "Book_no",
+    "Book_type",
+    "Book_date_ds",
+    "Book_Num",
+    "Book_USE",
+    "Book_ok",
+];
+
 /// Pull `HT_Book_H` + all `HT_Book_Ds` rows + all `HT_Book_Date` rows
 /// for one booking by `Book_no`.
 ///
@@ -108,24 +157,7 @@ pub async fn load_booking_aggregate(
         "HT_Book_H",
         "Book_ID",
         book_no,
-        // Mirror what the booking_create recipe writes (cheatsheet §3.3 +
-        // writeback/recipes/booking_create.rs). The watcher does NOT need
-        // to project EVERY column — only the ones the canonical PG row
-        // mirrors. Add columns here as the canonical projection grows.
-        &[
-            "Book_ID",
-            "Book_Date",
-            "Book_Cust_ID",
-            "Book_Cust_Name",
-            "Book_Cust_Tel",
-            "Book_Price_Total",
-            "Book_Price_Pay",
-            "Book_Status",
-            "Book_Date_in",
-            "Book_Date_out",
-            "Book_by",
-            "Book_room_note",
-        ],
+        BOOK_H_PROJECTION,
         // Header table — single row expected, no ORDER BY required.
         None,
     )
@@ -137,19 +169,7 @@ pub async fn load_booking_aggregate(
         "HT_Book_Ds",
         "Book_No",
         book_no,
-        // `Book_Room_Type` stores the room NUMBER per cheatsheet §3.4.
-        &[
-            "id",
-            "Book_No",
-            "Book_Room_Type",
-            "Book_Room_Start",
-            "Book_Room_End",
-            "Book_Room_Price",
-            "Book_Room_Night",
-            "Book_Room_Num",
-            "Book_Room_PriceToTal",
-            "Book_status",
-        ],
+        BOOK_DS_PROJECTION,
         // Track B2 / T2 HIGH-1 — stable iteration order across CT ticks
         // (legacy `id` is the IDENTITY PK; matches write order).
         Some("id ASC"),
@@ -171,15 +191,7 @@ pub async fn load_booking_aggregate(
         "HT_Book_Date",
         "Book_no",
         book_no,
-        &[
-            "id",
-            "Book_no",
-            "Book_type",
-            "Book_date_ds",
-            "Book_Num",
-            "Book_USE",
-            "Book_ok",
-        ],
+        BOOK_DATE_PROJECTION,
         // Stable iteration so per-night accumulations are deterministic
         // (Track B2 / T2 HIGH-1).
         Some("id ASC"),
@@ -217,6 +229,48 @@ const CHECKIN_DS_PROJECTION: &[&str] = &[
     "Cin_Dep_return_by",
 ];
 
+/// `HT_CheckIn_H` projection used by `load_checkin_aggregate`. Mirrors
+/// what walkin / checkin_to_booking recipes write (cheatsheet §3.6,
+/// walkin/writes.txt). Track J1 projection-lock test pins every column.
+const CHECKIN_H_PROJECTION: &[&str] = &[
+    "Cin_no",
+    "Cin_Date",
+    "Cin_Book_no",
+    "Cin_cust_no",
+    "Cin_status",
+    "Total_Price_Room",
+    "Total_Price_Net",
+    "Total_Price_Pay",
+    "Total_Price_Balance",
+    "Cin_Date_in",
+    "Cin_Date_Out",
+    "Cin_by",
+    "Cin_Room_ALL",
+];
+
+/// `HT_CheckIn_Pay` projection used by `load_checkin_aggregate`.
+///
+/// Track C — T2 CRIT-2 (`docs/coexistence/audit-2026-05-13.md`):
+/// `Cin_Status` projected so the check-in aggregate sweep can exclude
+/// cancelled payment rows (`'ยกเลิก'`) from `cin_paid_amount`. Before
+/// this fix, a folio cancelled in iHOTEL kept the cascade-marked
+/// payment rows visible in our canonical `ht_payments` aggregation —
+/// `cin_paid_amount` diverged from the legacy view.
+///
+/// Track J1 projection-lock test pins every column.
+const CHECKIN_PAY_PROJECTION: &[&str] = &[
+    "id",
+    "Cin_No",
+    "Cin_Pay_Date",
+    "Cin_Pay_Cash",
+    "Cin_Pay_Credit",
+    "Cin_Pay_Tran",
+    "Cin_Pay_Free",
+    "Cin_Pay_web",
+    "Pay_No",
+    "Cin_Status",
+];
+
 /// Pull `HT_CheckIn_H` + all `HT_CheckIn_Ds` rows + all `HT_CheckIn_Pay`
 /// rows for one check-in by `Cin_no`.
 ///
@@ -236,24 +290,7 @@ pub async fn load_checkin_aggregate(
         "HT_CheckIn_H",
         "Cin_no",
         cin_no,
-        // Mirror what walkin / checkin_to_booking recipes write
-        // (cheatsheet §3.6, walkin/writes.txt). Add columns here as the
-        // canonical PG projection grows.
-        &[
-            "Cin_no",
-            "Cin_Date",
-            "Cin_Book_no",
-            "Cin_cust_no",
-            "Cin_status",
-            "Total_Price_Room",
-            "Total_Price_Net",
-            "Total_Price_Pay",
-            "Total_Price_Balance",
-            "Cin_Date_in",
-            "Cin_Date_Out",
-            "Cin_by",
-            "Cin_Room_ALL",
-        ],
+        CHECKIN_H_PROJECTION,
         // Header table — at most one row, no ORDER BY required.
         None,
     )
@@ -300,27 +337,7 @@ pub async fn load_checkin_aggregate(
         "HT_CheckIn_Pay",
         "Cin_No",
         cin_no,
-        // Track C — T2 CRIT-2 (`docs/coexistence/audit-2026-05-13.md`):
-        // `Cin_Status` projected so the check-in aggregate sweep can
-        // exclude cancelled payment rows (`'ยกเลิก'`) from
-        // `cin_paid_amount`. Before this fix, a folio cancelled in
-        // iHOTEL kept the cascade-marked payment rows visible in our
-        // canonical `ht_payments` aggregation — `cin_paid_amount`
-        // diverged from the legacy view. Column is `Cin_Status varchar(50)
-        // NOT NULL DEFAULT '1'` per COMPAT_CHEATSHEET line 492 (the
-        // semantically-`Cin_Pay_Status` value referenced at line 106).
-        &[
-            "id",
-            "Cin_No",
-            "Cin_Pay_Date",
-            "Cin_Pay_Cash",
-            "Cin_Pay_Credit",
-            "Cin_Pay_Tran",
-            "Cin_Pay_Free",
-            "Cin_Pay_web",
-            "Pay_No",
-            "Cin_Status",
-        ],
+        CHECKIN_PAY_PROJECTION,
         // Stable iteration for payment aggregation (Track B2 / T2 HIGH-1).
         Some("id ASC"),
     )
@@ -577,5 +594,38 @@ mod tests {
                  `ht_checkin_rooms.cr_dep_*` mapping will break."
             );
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Track J1 — projection-lock guards for the remaining parent_loader
+    // projections. The existing `CHECKIN_DS_PROJECTION` lock test above
+    // is the hand-rolled prototype this batch generalises; we leave it
+    // as-is so its PROD-CRIT post-mortem documentation stays attached
+    // to the exact projection it guards.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn book_h_projection_is_subset_of_legacy_schema() {
+        crate::assert_projection_slice_subset!(BOOK_H_PROJECTION, "HT_Book_H");
+    }
+
+    #[test]
+    fn book_ds_projection_is_subset_of_legacy_schema() {
+        crate::assert_projection_slice_subset!(BOOK_DS_PROJECTION, "HT_Book_Ds");
+    }
+
+    #[test]
+    fn book_date_projection_is_subset_of_legacy_schema() {
+        crate::assert_projection_slice_subset!(BOOK_DATE_PROJECTION, "HT_Book_Date");
+    }
+
+    #[test]
+    fn checkin_h_projection_is_subset_of_legacy_schema() {
+        crate::assert_projection_slice_subset!(CHECKIN_H_PROJECTION, "HT_CheckIn_H");
+    }
+
+    #[test]
+    fn checkin_pay_projection_is_subset_of_legacy_schema() {
+        crate::assert_projection_slice_subset!(CHECKIN_PAY_PROJECTION, "HT_CheckIn_Pay");
     }
 }

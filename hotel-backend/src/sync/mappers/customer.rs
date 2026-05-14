@@ -1272,4 +1272,14 @@ mod tests {
             );
         }
     }
+
+    /// Track J1 — projection-lock guard. Every column the customer CT
+    /// mapper SELECTs must exist on the live HF Hotel `HT_Customers`
+    /// schema. A typo here (e.g. the PR #101-class `Cust_Type` vs
+    /// `Cust_Type_Main` confusion) silently breaks the JOIN at runtime
+    /// and drops every customer CT row.
+    #[test]
+    fn select_cols_are_subset_of_legacy_schema() {
+        crate::assert_projection_subset!(SELECT_COLS, "HT_Customers");
+    }
 }
