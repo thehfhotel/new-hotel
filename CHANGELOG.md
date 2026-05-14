@@ -5,6 +5,65 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [vNext] - 2026-05-14 (Resilience PR R3)
+
+### Changed
+
+- **Resilience PR R3 — per-table CT watermark.** Decouples each
+  CT-enabled legacy MSSQL table's `SYS_CHANGE_VERSION` horizon so
+  a wedge on one hot table (canonical: `HT_Book_H` row lock on
+  `Book_ID='R015142'`, 74-min global stall observed 2026-05-14)
+  freezes only that table's progress instead of gating every
+  table's advance.
+  - **`migrations/pg/050_legacy_ct_state_per_table.sql`** — adds
+    sibling table `legacy_ct_state_per_table (table_name PK,
+    last_seen_version, last_polled_at, last_error, last_error_at)`
+    with `ix_legacy_ct_state_per_table_polled_at` for the
+    per-table watchdog. Backfills one row per CT-tracked table
+    seeded from the current global watermark. Migration is
+    reversible (UP/DOWN documented in-file) and applies to both
+    `hotelnew` and `hotelville` via `scripts/migrate.sh --site`.
+  - **`hotel-backend/src/sync/watermark.rs`** — adds
+    `read_per_table` (returns `HashMap<String, i64>`),
+    `advance_per_table` (UPSERT with `last_seen_version <=
+    EXCLUDED.last_seen_version` monotonic guard, clears
+    `last_error` on success), `touch_per_table` (refreshes
+    `last_polled_at` on empty-fetch ticks), and
+    `record_per_table_error` (per-table failure write so a
+    watchdog can age stuck rows by `last_polled_at` without
+    joining `legacy_sync_status`).
+  - **`hotel-backend/src/bin/sync.rs`** — `run_one_tick` reads
+    per-table watermarks once, hands each mapper its own resume
+    point, and advances per-table rows independently. Per-row
+    failures continue to skip the watermark advance for THAT
+    table only; sibling tables in the same tick keep their
+    forward progress. Empty-fetch ticks call `touch_per_table`
+    so the watchdog can distinguish "healthy but quiet" from
+    "wedged".
+  - **Soft rollout via feature flag** —
+    `SYNC_PER_TABLE_WATERMARK=true` selects the new path. Default
+    `false` keeps the pre-R3 single-row `legacy_ct_state`
+    operational, so the migration and code can land without
+    changing behaviour. Flip per-site after migration 050 has
+    deployed.
+  - **Tests** — `tests/test_sync_watermark.rs` extended with
+    backfill coverage (asserts hot tables `HT_Book_H` /
+    `HT_Book_Ds` / `HT_Book_Date` / `HT_CheckIn_H` /
+    `HT_Receipt_H` are seeded), monotonic forward + rejected
+    backward advance round-trip, and per-table error
+    set-then-cleared on recovery.
+  - **Watchdog scope unchanged.** The existing global
+    "no table advanced in N minutes" Slack alert (Track D / T7
+    CRIT-3 in `bin/sync.rs::run_watermark_watchdog`) stays live
+    in both modes; a per-table watchdog ("this specific table's
+    watermark hasn't advanced in M minutes" with M > current
+    threshold) lands in a follow-up PR to avoid alert-channel
+    noise during the R3 cutover.
+  - **Stacks on R1 + R2.** R1 (error taxonomy) and R2 (MSSQL
+    per-query timeouts) landed earlier today; R3 reuses R1's
+    `EV_*` constants in its new per-table error sites and
+    inherits R2's timeout helpers for every legacy fetch.
+
 ## [vNext] - 2026-05-14 (Resilience R2 — MSSQL per-query timeouts)
 
 ### Changed

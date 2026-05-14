@@ -532,6 +532,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .map(|v| v == "true")
         .unwrap_or(false);
 
+    // Resilience PR R3 (2026-05-14) — per-table CT watermark feature
+    // flag. OFF by default to keep the current global-watermark path
+    // operational; flip to `true` per-site after migration 050 has
+    // landed to decouple per-table progress. See module docs in
+    // `crate::sync::watermark` for the dual-mode contract.
+    let per_table_watermark = env::var("SYNC_PER_TABLE_WATERMARK")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
     let allowlist = parse_allowlist(env::var("LEGACY_SYNC_TABLE_ALLOWLIST").ok());
 
     tracing::info!(
@@ -540,6 +549,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         outage_cooldown_secs = outage_cooldown.as_secs(),
         outage_alert_threshold,
         shadow_mode,
+        per_table_watermark,
         allowlist = ?allowlist,
         "Starting CT watcher"
     );
@@ -792,6 +802,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             &mappers,
             &slack,
             shadow_mode,
+            per_table_watermark,
             &mut retention_last_checked,
             retention_check_interval,
             &site.id,
@@ -1493,6 +1504,12 @@ fn build_mappers(allowlist: &Option<HashSet<String>>) -> Vec<Box<dyn MssqlChange
 
 /// Process one watcher tick. Per-mapper failures are logged but don't
 /// abort the tick — one bad table never blocks the others.
+///
+/// `per_table_watermark` selects between the legacy single-row
+/// `legacy_ct_state` (false, default) and the per-table
+/// `legacy_ct_state_per_table` (true, Resilience PR R3). Per-table
+/// mode lets a row-lock wedge on one table freeze only that row
+/// rather than gating every CT-enabled table's advance.
 #[allow(clippy::too_many_arguments)]
 async fn run_one_tick(
     pg: &PgPool,
@@ -1500,11 +1517,32 @@ async fn run_one_tick(
     mappers: &[Box<dyn MssqlChangeMapper>],
     slack: &Option<SlackClient>,
     shadow_mode: bool,
+    per_table_watermark: bool,
     retention_last_checked: &mut HashMap<String, Instant>,
     retention_check_interval: Duration,
     site_id: &str,
 ) {
-    let last_seen = match hotel_backend::sync::watermark::read_last_seen(pg).await {
+    // Two paths converge on a `HashMap<&str, i64>` of per-table
+    // resume points. Global path: every table sees the same single
+    // `last_seen_version`. Per-table path: each table reads its own
+    // row from `legacy_ct_state_per_table` (default 0 for an
+    // unseeded table — same semantics as a fresh global install).
+    let per_table_resume: HashMap<String, i64> = if per_table_watermark {
+        match hotel_backend::sync::watermark::read_per_table(pg).await {
+            Ok(m) => m,
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "Failed to read per-table CT watermarks; skipping tick"
+                );
+                return;
+            }
+        }
+    } else {
+        HashMap::new()
+    };
+
+    let global_last_seen = match hotel_backend::sync::watermark::read_last_seen(pg).await {
         Ok(v) => v,
         Err(err) => {
             tracing::error!(
@@ -1540,6 +1578,15 @@ async fn run_one_tick(
         let pk_cols = mapper.primary_key_cols();
         let select_sql = mapper.select_sql();
 
+        // Resolve this table's resume point. Per-table mode looks up
+        // the row from `legacy_ct_state_per_table` (default 0 if
+        // unseeded). Global mode passes the shared `last_seen`.
+        let table_last_seen = if per_table_watermark {
+            per_table_resume.get(table).copied().unwrap_or(0)
+        } else {
+            global_last_seen
+        };
+
         // Gate the retention guard to once per
         // `retention_check_interval` per table. The first tick (no
         // recorded timestamp) always checks; subsequent ticks within
@@ -1563,8 +1610,9 @@ async fn run_one_tick(
             table,
             pk_cols,
             select_sql,
-            last_seen,
+            table_last_seen,
             shadow_mode,
+            per_table_watermark,
             should_check_retention,
             site_id,
         )
@@ -1583,6 +1631,18 @@ async fn run_one_tick(
                 "poll_table failed"
             );
             let _ = record_table_error(pg, table, EV_MAPPER_APPLY_FAIL, &err.to_string()).await;
+            if per_table_watermark {
+                // R3 mirror: keep the per-table sibling row in sync so a
+                // per-table watchdog can age the `last_polled_at` on
+                // this specific table. Prefix with the R1 event_name so
+                // operators grepping per-table errors get the same
+                // taxonomy as `legacy_sync_status.last_error`.
+                let payload = format!("[{EV_MAPPER_APPLY_FAIL}] {err}");
+                let _ = hotel_backend::sync::watermark::record_per_table_error(
+                    pg, table, &payload,
+                )
+                .await;
+            }
         }
     }
 }
@@ -1608,6 +1668,7 @@ async fn poll_table(
     select_sql: &str,
     last_seen: i64,
     shadow_mode: bool,
+    per_table_watermark: bool,
     should_check_retention: bool,
     site_id: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1715,6 +1776,12 @@ async fn poll_table(
         // 0-row count. Fixes the 5-stuck-table observability bug
         // (v2.58.3, fix/hfville-stuck-ct-tables).
         let _ = bump_skipped(pg, table, 0, false).await;
+        if per_table_watermark {
+            // R3 — touch `last_polled_at` so the per-table watchdog
+            // can distinguish "healthy but quiet" from "wedged" by
+            // comparing now() - last_polled_at across rows.
+            let _ = hotel_backend::sync::watermark::touch_per_table(pg, table).await;
+        }
         return Ok(());
     }
 
@@ -2118,40 +2185,66 @@ async fn poll_table(
     }
 
     if max_version > last_seen {
-        if let Err(err) =
-            hotel_backend::sync::watermark::advance(pg, max_version).await
-        {
-            tracing::error!(
-                event_name = EV_WATERMARK_ADVANCE_FAIL,
-                table,
-                new_version = max_version,
-                error = %err,
-                "Failed to advance CT watermark"
-            );
-            // Persist the watermark-advance failure mode so it survives
-            // a container restart — this is the exact symptom from the
-            // 2026-05-14 74-min stall and was previously invisible
-            // post-recreate because the failed-tick TX had no PG-side
-            // write to attribute it to. Per the R1 spec, we run this
-            // in its OWN sqlx auto-TX so the canonical state UPDATE
-            // (already committed above) is unaffected.
-            let _ = record_table_error(
-                pg,
-                table,
-                EV_WATERMARK_ADVANCE_FAIL,
-                &err.to_string(),
-            )
-            .await;
+        // R3 — feature-flagged dual-write contract. Per-table mode
+        // advances ONLY the per-table row so a stuck sibling
+        // doesn't pin the global down; global mode advances ONLY
+        // the single-row state, preserving the pre-R3 behaviour.
+        let advance_result = if per_table_watermark {
+            hotel_backend::sync::watermark::advance_per_table(pg, table, max_version).await
         } else {
-            tracing::info!(
-                table,
-                from = last_seen,
-                to = max_version,
-                ingested,
-                skipped,
-                "Advanced CT watermark"
-            );
+            hotel_backend::sync::watermark::advance(pg, max_version).await
+        };
+        match advance_result {
+            Err(err) => {
+                // R1: structured event + persisted failure mode so the
+                // 2026-05-14 symptom (UPDATE failure post-commit, no
+                // PG-side breadcrumb) survives a container restart.
+                tracing::error!(
+                    event_name = EV_WATERMARK_ADVANCE_FAIL,
+                    table,
+                    new_version = max_version,
+                    per_table = per_table_watermark,
+                    error = %err,
+                    "Failed to advance CT watermark"
+                );
+                // Persist into legacy_sync_status (global single row) in
+                // its OWN sqlx auto-TX — the canonical state UPDATE
+                // already committed above is unaffected.
+                let _ = record_table_error(
+                    pg,
+                    table,
+                    EV_WATERMARK_ADVANCE_FAIL,
+                    &err.to_string(),
+                )
+                .await;
+                // R3 mirror: when per-table mode is active, also persist
+                // into the per-table row so a per-table watchdog can
+                // attribute the wedge to this specific table.
+                if per_table_watermark {
+                    let payload = format!("[{EV_WATERMARK_ADVANCE_FAIL}] {err}");
+                    let _ = hotel_backend::sync::watermark::record_per_table_error(
+                        pg, table, &payload,
+                    )
+                    .await;
+                }
+            }
+            Ok(()) => {
+                tracing::info!(
+                    table,
+                    from = last_seen,
+                    to = max_version,
+                    ingested,
+                    skipped,
+                    per_table = per_table_watermark,
+                    "Advanced CT watermark"
+                );
+            }
         }
+    } else if per_table_watermark {
+        // Live tick with no new CT version (rows were all stale /
+        // coalesced away). Still touch `last_polled_at` so the
+        // per-table watchdog doesn't flag the row as wedged.
+        let _ = hotel_backend::sync::watermark::touch_per_table(pg, table).await;
     }
 
     Ok(())
