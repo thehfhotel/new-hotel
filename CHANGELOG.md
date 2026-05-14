@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [vNext] - 2026-05-14 (Resilience PR R3)
 
+### Fixed
+
+- **Watermark-stall watchdog is now quiet-aware.** The Track D / T7
+  CRIT-3 watchdog in `hotel-backend/src/bin/sync.rs` previously
+  decided "stuck" purely from the duration `legacy_ct_state.last_seen_version`
+  hadn't advanced. When legacy MSSQL was simply idle at off-peak
+  (lunch break, post-checkout lull), `CHANGE_TRACKING_CURRENT_VERSION()`
+  stayed put at the same version the watermark already held — the
+  watchdog read this as a stall and paged on-call. Five false-positive
+  Slack alerts fired on 2026-05-14 (hfhotel 10:14 / 10:44 / 12:36,
+  hfville 10:20 / 12:57). The verified probe at 12:36 showed
+  `CHANGE_TRACKING_CURRENT_VERSION() = 17209` exactly matching the
+  "stuck" `last_seen_version = 17209` — nothing was actually wrong.
+  - **`hotel-backend/src/bin/sync.rs`** — added pure helper
+    `should_fire_stall_alert(watermark, ct_current_probe) -> bool`
+    that suppresses the alert when the legacy CT probe reports the
+    same version as the watermark, fires when the probe is ahead,
+    and falls through to firing (conservative) on probe failure or
+    timeout. The watchdog now calls
+    `probe_change_tracking_current_version` (5s explicit timeout,
+    reusing R2's `mssql_timeout` helper) inside the alert path
+    before paging. Quiet legacy logs `[watchdog] legacy CT quiet
+    — watermark correctly tracking current` at INFO instead.
+  - **`hotel-backend/src/db/mssql_timeout.rs`** — new
+    `simple_query_with_explicit_timeout(conn, sql, budget)` for the
+    watchdog's 5s probe (default `MssqlOpKind::Read` budget is 10s,
+    too loose for a 60s poll loop). Floors at `MIN_BUDGET_MS` like
+    the env-cached variants. Emits the existing
+    `sync.tiberius_timeout` event_name on expiry so dashboards keep
+    working unchanged.
+  - **Tests** — `watchdog_silent_when_legacy_ct_quiet` (probe ==
+    watermark → no alert), `watchdog_alerts_when_legacy_ct_ahead`
+    (probe > watermark → alert), `watchdog_alerts_when_probe_fails`
+    (probe failure → alert, uncertainty doesn't suppress),
+    `watchdog_alerts_when_probe_below_watermark` (defensive:
+    anomalous CT regression also pages).
+  - **Slack message refined** — the false-positive "all 16 tables
+    happen to be quiet" line is removed (the probe handles that
+    case now). The alert text now affirms the probe found legacy
+    ahead so operators know the page is real.
+  - **No new module.** The 5s timeout lives in the existing R2
+    helper file `hotel-backend/src/db/mssql_timeout.rs` per the
+    PR brief's "ADD a small reusable function THERE rather than
+    inventing a new module" guidance.
+
 ### Changed
 
 - **Resilience PR R3 — per-table CT watermark.** Decouples each
