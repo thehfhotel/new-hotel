@@ -163,6 +163,19 @@ pub async fn run_sync(
     // interact with ReconcileMode (always full-reload).
     crate::scheduler::mirror::reload_mirror_dimensions(legacy_pool, pg_pool).await;
 
+    // Track D / T7 follow-up — auto-resolve previously-recorded
+    // divergences whose canonical PG hash now matches the recorded
+    // legacy hash. Runs before the alert queries so the alerts only
+    // surface drift that still persists. Best-effort: a PG failure
+    // logs a warning and the alerts proceed with stale state.
+    if let Err(e) = auto_resolve_reconcile_log(pg_pool).await {
+        tracing::warn!(
+            site = %site_id,
+            error = %e,
+            "[Sync] Auto-resolve sweep failed — alerts may include rows that have since converged"
+        );
+    }
+
     // Phase 6: drift-alert tripwire. Best-effort — degraded observability
     // never aborts the reconcile loop.
     check_drift_and_alert(pg_pool, slack, site_id).await;
@@ -252,6 +265,7 @@ async fn check_drift_and_alert(
         "SELECT table_name, count(*) \
            FROM ht_reconcile_log \
           WHERE resolved_at IS NULL \
+            AND divergence_kind IS NOT NULL \
             AND detected_at > now() - interval '1 hour' \
           GROUP BY table_name",
     )
@@ -387,6 +401,7 @@ async fn check_level_drift_and_alert(
             "SELECT table_name, count(*) \
                FROM ht_reconcile_log \
               WHERE resolved_at IS NULL \
+                AND divergence_kind IS NOT NULL \
                 AND detected_at < now() - interval '{LEVEL_DRIFT_STALE_INTERVAL_HOURS} hours' \
               GROUP BY table_name"
         ),
@@ -949,6 +964,171 @@ async fn record_divergence(
             "[Sync] Failed to record divergence in ht_reconcile_log — observability degraded"
         );
     }
+}
+
+/// Pure decision helper for the auto-resolve sweep. A row in
+/// `ht_reconcile_log` may be auto-resolved iff the recorded legacy
+/// (MSSQL) hash matches a freshly-computed canonical PG hash. Both
+/// inputs must be present non-empty strings — a `None` on either side
+/// is an intentional skip (missing-PG cases must persist until
+/// canonical actually catches up; missing-MSSQL cases need operator
+/// review).
+///
+/// Pulled into a free function so the unit tests can exercise the
+/// truth table without a live PG pool.
+fn should_auto_resolve(
+    recorded_legacy_hash: Option<&str>,
+    current_pg_hash: Option<&str>,
+) -> bool {
+    match (recorded_legacy_hash, current_pg_hash) {
+        (Some(legacy), Some(pg)) if !legacy.is_empty() && !pg.is_empty() => legacy == pg,
+        _ => false,
+    }
+}
+
+/// Re-compute the canonical PG hash for a single `ht_reconcile_log`
+/// row's `(table_name, legacy_pk)` pair. Returns `Ok(None)` if no
+/// canonical row exists today (still drifted), or `Ok(Some(hash))`
+/// when canonical has converged.
+///
+/// Dispatches on the same table-name vocabulary the reconcile loop
+/// writes into `ht_reconcile_log.table_name` ("customers", "bookings",
+/// "checkins"). Other table names (e.g. "rooms") are not currently
+/// auto-resolvable — they return `Ok(None)` so the row stays in the
+/// queue for operator review.
+async fn compute_current_pg_hash(
+    pg_pool: &PgPool,
+    table_name: &str,
+    legacy_pk: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    match table_name {
+        "customers" => {
+            let canonical = fetch_canonical_customer(pg_pool, legacy_pk).await?;
+            Ok(canonical.map(|c| {
+                customer_canonical_hash(
+                    legacy_pk,
+                    &c.cust_firstname,
+                    c.cust_type.as_deref(),
+                    c.cust_phone.as_deref(),
+                    c.cust_idcard.as_deref(),
+                    c.cust_address.as_deref(),
+                )
+            }))
+        }
+        "bookings" => {
+            // Composite PK serialised as "{book_no}|{room_type_key}";
+            // canonical hash is keyed by `book_no` (the legacy_book_id)
+            // — matches `sync_bookings`' canonical-side hash inputs.
+            let book_no = legacy_pk.split_once('|').map(|(b, _)| b).unwrap_or(legacy_pk);
+            let canonical = fetch_canonical_booking(pg_pool, book_no).await?;
+            Ok(canonical.map(|c| {
+                let checkin_str = c.book_checkin.map(|d| d.to_string());
+                let checkout_str = c.book_checkout.map(|d| d.to_string());
+                booking_canonical_hash(
+                    book_no,
+                    checkin_str.as_deref(),
+                    checkout_str.as_deref(),
+                    c.legacy_cust_no.as_deref(),
+                )
+            }))
+        }
+        "checkins" => {
+            let canonical = fetch_canonical_checkin(pg_pool, legacy_pk).await?;
+            Ok(canonical.map(|c| {
+                checkin_canonical_hash(
+                    legacy_pk,
+                    c.legacy_room_no.as_deref(),
+                    c.cin_checkin_time.map(|t| t.to_string()).as_deref(),
+                    c.cin_checkout_time.map(|t| t.to_string()).as_deref(),
+                    c.legacy_cust_no.as_deref(),
+                )
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Track D / T7 follow-up — auto-resolve sweep. Walks unresolved
+/// `ht_reconcile_log` rows whose `divergence_kind` was classified by
+/// the post-migration-032 reconcile loop, re-computes the canonical
+/// PG hash for each, and marks rows resolved when the new hash equals
+/// the recorded MSSQL hash. Returns the number of rows resolved.
+///
+/// Rationale: alerts should fire only on drift that still persists.
+/// Without this sweep, transient lag between MSSQL reconcile and the
+/// CT mapper catching up would leave stale rows in the log forever,
+/// drowning the level-triggered digest.
+///
+/// Bounded to 500 rows per tick so a backlog can't stall the
+/// reconcile loop. Best-effort per row — a single failure logs and
+/// continues to the next.
+async fn auto_resolve_reconcile_log(pg_pool: &PgPool) -> Result<usize, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (i64, String, String, Option<String>)>(
+        "SELECT id, table_name, legacy_pk, mssql_hash \
+           FROM ht_reconcile_log \
+          WHERE resolved_at IS NULL \
+            AND divergence_kind IS NOT NULL \
+          LIMIT 500",
+    )
+    .fetch_all(pg_pool)
+    .await?;
+
+    let mut resolved = 0usize;
+    for (id, table_name, legacy_pk, recorded_legacy_hash) in rows {
+        let current_pg_hash =
+            match compute_current_pg_hash(pg_pool, &table_name, &legacy_pk).await {
+                Ok(opt) => opt,
+                Err(e) => {
+                    tracing::warn!(
+                        id,
+                        table_name = %table_name,
+                        legacy_pk = %legacy_pk,
+                        error = %e,
+                        "[Sync] Auto-resolve sweep: failed to re-fetch canonical hash, skipping row"
+                    );
+                    continue;
+                }
+            };
+
+        if !should_auto_resolve(recorded_legacy_hash.as_deref(), current_pg_hash.as_deref()) {
+            continue;
+        }
+
+        let update = sqlx::query(
+            "UPDATE ht_reconcile_log SET resolved_at = NOW() \
+              WHERE id = $1 AND resolved_at IS NULL",
+        )
+        .bind(id)
+        .execute(pg_pool)
+        .await;
+
+        match update {
+            Ok(r) if r.rows_affected() == 1 => {
+                resolved += 1;
+                tracing::debug!(
+                    id,
+                    table_name = %table_name,
+                    legacy_pk = %legacy_pk,
+                    "[Sync] Auto-resolve sweep: hashes converged, marked resolved"
+                );
+            }
+            Ok(_) => {
+                // Row was already resolved by a concurrent path — fine.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    id,
+                    error = %e,
+                    "[Sync] Auto-resolve sweep: UPDATE failed, leaving row unresolved"
+                );
+            }
+        }
+    }
+
+    if resolved > 0 {
+        tracing::info!(resolved, "[Sync] Auto-resolve sweep: rows reconciled");
+    }
+    Ok(resolved)
 }
 
 /// Record a sync error in the sync_status table.
@@ -3113,6 +3293,31 @@ mod tests {
             now,
             cooldown
         ));
+    }
+
+    // -------------------------------------------------------------------
+    // Auto-resolve sweep — pure decision helper
+    // -------------------------------------------------------------------
+
+    /// The sweep MUST mark a row resolved when the freshly-computed
+    /// canonical PG hash equals the recorded legacy hash. Pre-condition
+    /// for the auto-resolve UPDATE — if this regresses, the sweep
+    /// silently stops draining the queue.
+    #[test]
+    fn auto_resolve_sweep_marks_resolved_when_hashes_match() {
+        let recorded_legacy_hash = Some("hash-X");
+        let current_pg_hash = Some("hash-X");
+        assert!(should_auto_resolve(recorded_legacy_hash, current_pg_hash));
+    }
+
+    /// The sweep MUST leave the row untouched when canonical still
+    /// diverges from the recorded legacy hash. Drift that persists is
+    /// exactly what the alerts are supposed to surface.
+    #[test]
+    fn auto_resolve_sweep_skips_when_drift_persists() {
+        let recorded_legacy_hash = Some("hash-X");
+        let current_pg_hash = Some("hash-Y");
+        assert!(!should_auto_resolve(recorded_legacy_hash, current_pg_hash));
     }
 
     #[test]
