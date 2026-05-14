@@ -5,6 +5,7 @@
 
 mod dual_pool;
 pub mod mssql_session;
+pub mod mssql_timeout;
 mod pg_pool;
 mod pool;
 

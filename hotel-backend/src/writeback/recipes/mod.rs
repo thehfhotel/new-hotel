@@ -46,6 +46,7 @@ pub mod refund_payment;
 pub mod room_change;
 pub mod walkin;
 
+use crate::db::mssql_timeout::{simple_query_with_timeout, MssqlOpKind};
 use crate::writeback::allocate::LegacyConn;
 use crate::writeback::error::WritebackResult;
 
@@ -76,7 +77,15 @@ pub(crate) async fn execute_all(
             stmt_len = stmt.len(),
             "writeback statement"
         );
-        let _ = conn.simple_query(stmt.as_str()).await?;
+        // R2 (2026-05-14): the recipe-shared statement executor — by
+        // wrapping HERE every recipe variant (booking_create,
+        // booking_modify, walkin, checkin_to_booking, …) inherits the
+        // per-statement write-budget timeout for free. A stuck
+        // statement inside the recipe's BEGIN TRAN will surface as a
+        // retryable `Tiberius::Io { TimedOut }`, the outer
+        // `run_in_transaction` will run ROLLBACK (itself timed), and
+        // the job is retried on the next dispatcher claim.
+        let _ = simple_query_with_timeout(conn, stmt.as_str(), MssqlOpKind::Write).await?;
     }
     Ok(())
 }
@@ -115,9 +124,12 @@ pub(crate) async fn execute_insert_with_output_id(
         insert_sql.to_ascii_uppercase().contains("OUTPUT INSERTED."),
         "execute_insert_with_output_id requires an OUTPUT INSERTED.<col> clause"
     );
-    let stream = conn.simple_query(insert_sql).await?;
-    let row = stream.into_row().await?;
-    let row = row.ok_or_else(|| {
+    // R2 (2026-05-14): wrap in write-budget timeout. The OUTPUT
+    // INSERTED INSERT runs inside the recipe's BEGIN TRAN; a stuck
+    // server-side trigger or row-lock backlog gets converted into a
+    // retryable failure here instead of hanging the worker.
+    let rows = simple_query_with_timeout(conn, insert_sql, MssqlOpKind::Write).await?;
+    let row = rows.into_iter().next().ok_or_else(|| {
         crate::writeback::error::WritebackError::Recipe(
             "OUTPUT INSERTED.id returned no row — INSERT did not affect any rows".into(),
         )

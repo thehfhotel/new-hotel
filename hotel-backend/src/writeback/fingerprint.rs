@@ -22,6 +22,7 @@
 use sha2::{Digest, Sha256};
 use tiberius::{Query, Row};
 
+use crate::db::mssql_timeout::{simple_query_with_timeout_pooled, MssqlOpKind};
 use crate::db::DbPool;
 use crate::writeback::error::{WritebackError, WritebackResult};
 
@@ -583,8 +584,12 @@ async fn fetch_live_columns(
          ORDER BY TABLE_NAME, ORDINAL_POSITION",
     );
 
-    let stream = conn.simple_query(sql).await?;
-    let rows: Vec<Row> = stream.into_first_result().await?;
+    // R2 (2026-05-14): wrap fingerprint metadata read in per-op
+    // timeout — runs at writeback worker startup, so a wedged catalog
+    // (rare but possible during a sys metadata rebuild) would
+    // otherwise block worker boot indefinitely.
+    let rows: Vec<Row> =
+        simple_query_with_timeout_pooled(&mut conn, &sql, MssqlOpKind::Read).await?;
 
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -641,10 +646,14 @@ fn collation_safety_check(collation: &str) -> WritebackResult<()> {
 /// distinction is the one that breaks recipes byte-for-byte.
 pub async fn verify_legacy_collation_safety(pool: &DbPool) -> WritebackResult<()> {
     let mut conn = pool.get().await?;
-    let stream = conn
-        .simple_query("SELECT CAST(SERVERPROPERTY('Collation') AS NVARCHAR(128)) AS c")
-        .await?;
-    let rows: Vec<Row> = stream.into_first_result().await?;
+    // R2: per-op timeout — SERVERPROPERTY is a single round-trip but
+    // runs at startup, same blocking concern as `fetch_live_columns`.
+    let rows: Vec<Row> = simple_query_with_timeout_pooled(
+        &mut conn,
+        "SELECT CAST(SERVERPROPERTY('Collation') AS NVARCHAR(128)) AS c",
+        MssqlOpKind::Read,
+    )
+    .await?;
     let row = rows.first().ok_or_else(|| {
         WritebackError::Config("SERVERPROPERTY('Collation') returned no rows".into())
     })?;

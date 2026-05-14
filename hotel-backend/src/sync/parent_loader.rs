@@ -25,6 +25,7 @@
 //! names — they coincidentally share the word "booking" but otherwise
 //! have nothing in common.
 
+use crate::db::mssql_timeout::{simple_query_with_timeout_pooled, MssqlOpKind};
 use crate::db::DbPool;
 use crate::sync::row::test_support::{HashMapRow, MockValue};
 use crate::sync::SyncError;
@@ -373,8 +374,12 @@ async fn fetch_rows(
         "SELECT {select_list} FROM {table} WHERE {where_col} = {where_q}{order_clause}"
     );
 
-    let stream = conn.simple_query(&sql).await?;
-    let raw_rows = stream.into_first_result().await?;
+    // R2 (2026-05-14): wrap in per-op read timeout so a row-locked
+    // legacy table (e.g. `HT_Book_H` during an iHOTEL cancel) can't
+    // freeze the parent-aggregate fetch indefinitely. The CT watcher
+    // re-polls on the next tick, so a transient timeout costs at
+    // most one tick of latency.
+    let raw_rows = simple_query_with_timeout_pooled(&mut conn, &sql, MssqlOpKind::Read).await?;
 
     let mut out = Vec::with_capacity(raw_rows.len());
     for r in &raw_rows {
