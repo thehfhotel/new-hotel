@@ -417,6 +417,23 @@ fn build_new_routes(app_state: AppState) -> Router {
         app_state.clone(),
         app_middleware::require_auth,
     );
+
+    // Track G7 — permission gates layered on top of `require_auth`. Each
+    // gate is a no-op when `AUTH_ENABLED=false`, so this stays free until
+    // an operator flips the flag. Mounted via `route_layer` on the
+    // individual routes that need them so we don't have to split this
+    // router into per-permission subrouters.
+    let perm_payment_refund =
+        app_middleware::require_permission("payment.refund", app_state.clone());
+    let perm_inventory_consume_check =
+        app_middleware::require_permission("inventory.consume", app_state.clone());
+    let perm_inventory_consume_replenish =
+        app_middleware::require_permission("inventory.consume", app_state.clone());
+    let perm_inventory_consume_adjustments =
+        app_middleware::require_permission("inventory.consume", app_state.clone());
+    let perm_inventory_consume_product =
+        app_middleware::require_permission("inventory.consume", app_state.clone());
+
     Router::new()
         // Rooms routes (PG-only, Phase 8 — reads `ht_rooms_legacy` mirror)
         .route("/api/rooms", get(routes::rooms::list_rooms))
@@ -492,8 +509,12 @@ fn build_new_routes(app_state: AppState) -> Router {
         // Payments
         .route("/api/new/checkins/{id}/payments", get(routes::new_payments::list_payments).post(routes::new_payments::create_payment))
         .route("/api/new/payments/{id}", delete(routes::new_payments::void_payment))
-        // Track G2 / T4 CRIT-1 — refund (negative payment) against an existing payment row
-        .route("/api/new/payments/{id}/refund", post(routes::new_payments::refund_payment))
+        // Track G2 / T4 CRIT-1 — refund (negative payment) against an existing payment row.
+        // Track G7 gates this on `payment.refund` (cashier + admin only).
+        .route(
+            "/api/new/payments/{id}/refund",
+            post(routes::new_payments::refund_payment).route_layer(perm_payment_refund),
+        )
         // Shifts (Track F2 / T1 HIGH-5 — cashier-shift gate for payments)
         .route("/api/new/shifts/open", post(routes::new_shifts::open_shift))
         .route("/api/new/shifts/close", post(routes::new_shifts::close_shift))
@@ -505,16 +526,33 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route("/api/new/inventory/items/{id}", get(routes::new_inventory::get_item).put(routes::new_inventory::update_item).delete(routes::new_inventory::delete_item))
         .route("/api/new/inventory/rooms", get(routes::new_inventory::list_inventory_rooms))
         .route("/api/new/inventory/rooms/{room_id}", get(routes::new_inventory::get_room_inventory).put(routes::new_inventory::update_room_inventory))
-        .route("/api/new/inventory/rooms/{room_id}/check", axum::routing::post(routes::new_inventory::check_room_inventory))
-        .route("/api/new/inventory/rooms/{room_id}/replenish", axum::routing::post(routes::new_inventory::replenish_room_inventory))
-        .route("/api/new/inventory/adjustments", axum::routing::post(routes::new_inventory::create_stock_adjustment))
+        // Track G7 gates housekeeping/POS stock mutations on `inventory.consume`.
+        .route(
+            "/api/new/inventory/rooms/{room_id}/check",
+            axum::routing::post(routes::new_inventory::check_room_inventory)
+                .route_layer(perm_inventory_consume_check),
+        )
+        .route(
+            "/api/new/inventory/rooms/{room_id}/replenish",
+            axum::routing::post(routes::new_inventory::replenish_room_inventory)
+                .route_layer(perm_inventory_consume_replenish),
+        )
+        .route(
+            "/api/new/inventory/adjustments",
+            axum::routing::post(routes::new_inventory::create_stock_adjustment)
+                .route_layer(perm_inventory_consume_adjustments),
+        )
         .route("/api/new/inventory/transactions", get(routes::new_inventory::list_transactions).post(routes::new_inventory::create_transaction))
         .route("/api/new/inventory/stats", get(routes::new_inventory::get_stats))
         .route("/api/new/inventory/low-stock", get(routes::new_inventory::get_low_stock))
         // Products (Track F3 — `audit-2026-05-13.md` T1 CRIT-3)
         .route("/api/new/products", get(routes::new_products::list_products))
         .route("/api/new/products/{id}", get(routes::new_products::get_product))
-        .route("/api/new/products/{id}/stock-adjust", axum::routing::post(routes::new_products::adjust_stock))
+        .route(
+            "/api/new/products/{id}/stock-adjust",
+            axum::routing::post(routes::new_products::adjust_stock)
+                .route_layer(perm_inventory_consume_product),
+        )
         // Maintenance Management
         .route("/api/new/maintenance/categories", get(routes::new_maintenance::list_categories))
         .route("/api/new/maintenance/requests", get(routes::new_maintenance::list_requests).post(routes::new_maintenance::create_request))

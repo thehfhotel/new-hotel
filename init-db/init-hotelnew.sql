@@ -1331,14 +1331,20 @@ ON CONFLICT (version) DO NOTHING;
 -- service layer; PR2 wires HTTP routes + Axum middleware on top.
 -- =============================================================================
 
+-- Migration 046 (Track G7) widens the legacy single-role CHECK to also
+-- accept 'cashier' and 'housekeeper', and adds the display_name column.
+-- Both are baked inline here for fresh deployments.
 CREATE TABLE IF NOT EXISTS ht_users (
     user_id        BIGSERIAL    PRIMARY KEY,
     username       VARCHAR(64)  NOT NULL UNIQUE,
     password_hash  TEXT         NOT NULL,
-    role           VARCHAR(16)  NOT NULL CHECK (role IN ('admin', 'receptionist')),
+    role           VARCHAR(16)  NOT NULL
+                   CONSTRAINT ht_users_role_check
+                   CHECK (role IN ('admin', 'cashier', 'housekeeper', 'receptionist')),
     active         BOOLEAN      NOT NULL DEFAULT TRUE,
     created_at     TIMESTAMP    NOT NULL DEFAULT NOW(),
-    last_login_at  TIMESTAMP
+    last_login_at  TIMESTAMP,
+    display_name   VARCHAR(128)
 );
 
 INSERT INTO schema_migrations (version, filename, applied_by)
@@ -1596,6 +1602,110 @@ CREATE INDEX IF NOT EXISTS ix_ht_checkins_round_bill_shift_id
 
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('048', '048_round_bill_shift_id.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
+-- Migration 046: ht_roles + ht_permissions + junctions (Track G7 / T4 HIGH-9)
+-- iHOTEL has Admin / Cashier / Housekeeper / Receptionist roles with
+-- per-feature gating. Migration 046 introduces canonical roles +
+-- permission grid so Track G features (refunds, room change, round-bill,
+-- inventory consume, RR.4 reports) can be gated per-role. Mirrors
+-- migrations/pg/046_user_roles_and_permissions.sql one-for-one.
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS ht_roles (
+    role_id        BIGSERIAL    PRIMARY KEY,
+    role_key       VARCHAR(64)  NOT NULL UNIQUE,
+    display_name   VARCHAR(128) NOT NULL,
+    created_at     TIMESTAMP    NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS ht_permissions (
+    permission_id   BIGSERIAL    PRIMARY KEY,
+    permission_key  VARCHAR(128) NOT NULL UNIQUE,
+    description     VARCHAR(255),
+    created_at      TIMESTAMP    NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS ht_role_permissions (
+    role_id       BIGINT NOT NULL REFERENCES ht_roles(role_id)       ON DELETE CASCADE,
+    permission_id BIGINT NOT NULL REFERENCES ht_permissions(permission_id) ON DELETE CASCADE,
+    PRIMARY KEY (role_id, permission_id)
+);
+
+CREATE TABLE IF NOT EXISTS ht_user_roles (
+    user_id    BIGINT NOT NULL REFERENCES ht_users(user_id) ON DELETE CASCADE,
+    role_id    BIGINT NOT NULL REFERENCES ht_roles(role_id) ON DELETE CASCADE,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, role_id)
+);
+
+CREATE INDEX IF NOT EXISTS ht_user_roles_role_idx ON ht_user_roles(role_id);
+
+-- Seed: roles, permissions, role→permission grid.
+INSERT INTO ht_roles (role_key, display_name) VALUES
+    ('admin',         'Administrator'),
+    ('cashier',       'Cashier'),
+    ('housekeeper',   'Housekeeper'),
+    ('receptionist',  'Receptionist')
+ON CONFLICT (role_key) DO NOTHING;
+
+INSERT INTO ht_permissions (permission_key, description) VALUES
+    ('payment.refund',       'Refund (negative payment) against a recorded receipt (Track G2)'),
+    ('checkin.room_change',  'Move an active check-in to a different room (Track G4)'),
+    ('checkin.round_bill',   'Open/close a cashier round-bill (cash-drawer reconciliation; Track G9)'),
+    ('inventory.consume',    'Consume / replenish stock against a room or shift (Track F3)'),
+    ('reports.rr4',          'Generate RR.4 daily revenue export (Track G8)'),
+    ('admin.users',          'Manage users / roles via /api/admin/users (Phase 4 PR4)')
+ON CONFLICT (permission_key) DO NOTHING;
+
+INSERT INTO ht_role_permissions (role_id, permission_id)
+SELECT r.role_id, p.permission_id FROM ht_roles r CROSS JOIN ht_permissions p
+WHERE r.role_key = 'admin'
+ON CONFLICT (role_id, permission_id) DO NOTHING;
+
+INSERT INTO ht_role_permissions (role_id, permission_id)
+SELECT r.role_id, p.permission_id FROM ht_roles r
+JOIN ht_permissions p ON p.permission_key IN ('payment.refund','checkin.round_bill','reports.rr4')
+WHERE r.role_key = 'cashier'
+ON CONFLICT (role_id, permission_id) DO NOTHING;
+
+INSERT INTO ht_role_permissions (role_id, permission_id)
+SELECT r.role_id, p.permission_id FROM ht_roles r
+JOIN ht_permissions p ON p.permission_key IN ('inventory.consume','checkin.room_change')
+WHERE r.role_key = 'housekeeper'
+ON CONFLICT (role_id, permission_id) DO NOTHING;
+
+INSERT INTO ht_role_permissions (role_id, permission_id)
+SELECT r.role_id, p.permission_id FROM ht_roles r
+JOIN ht_permissions p ON p.permission_key IN ('checkin.room_change','inventory.consume')
+WHERE r.role_key = 'receptionist'
+ON CONFLICT (role_id, permission_id) DO NOTHING;
+
+-- Seed test accounts (temp_password_2026, Argon2id PHC strings matching
+-- the runtime hash params — see migrations/pg/046_*.sql for rationale).
+INSERT INTO ht_users (username, password_hash, role, display_name, active) VALUES
+    ('housekeeper_test',
+     '$argon2id$v=19$m=19456,t=2,p=1$MPd9QPLV/Hk/ZCw93x7bjg$4jEMySdhT0/AdK+Ww4qWO1cUZfNuoDDhoFVH7C1HShw',
+     'housekeeper', 'Test Housekeeper', TRUE),
+    ('cashier_test',
+     '$argon2id$v=19$m=19456,t=2,p=1$zbFz6agSu3CFK+DWG1yVPA$WEp9hv+/gDOL+NmC4RvO88ptPtJKyD+o6/Hk60nH94I',
+     'cashier', 'Test Cashier', TRUE),
+    ('receptionist_test',
+     '$argon2id$v=19$m=19456,t=2,p=1$6agusFrTSWNC4dxANU2qLA$RDcPxK1jBnQWINIHt7eoMkmZn3BHkzDQkGCU4sDYDS0',
+     'receptionist', 'Test Receptionist', TRUE)
+ON CONFLICT (username) DO NOTHING;
+
+-- Wire seed accounts to their primary roles + backfill any pre-existing
+-- users into the junction so legacy admin accounts stay functional.
+INSERT INTO ht_user_roles (user_id, role_id)
+SELECT u.user_id, r.role_id FROM ht_users u
+JOIN ht_roles r ON r.role_key = u.role
+WHERE u.role IN ('admin', 'cashier', 'housekeeper', 'receptionist')
+ON CONFLICT (user_id, role_id) DO NOTHING;
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('046', '046_user_roles_and_permissions.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================

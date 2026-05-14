@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [vNext] - 2026-05-14 (Track G7)
+
+### Added
+
+- **Track G7 — Permission expansion (Housekeeper + Cashier roles)
+  (`audit-2026-05-13.md` T4 HIGH-9).** Replaces the binary
+  `admin`/`receptionist` enum with a full role + permission grid
+  mirroring iHOTEL's Admin / Cashier / Housekeeper / Receptionist
+  split.
+  - **Migration 046** (`migrations/pg/046_user_roles_and_permissions.sql`)
+    — extends `ht_users` with `display_name`; relaxes the legacy
+    single-role CHECK to accept `'cashier'` and `'housekeeper'`;
+    adds `ht_roles`, `ht_permissions`, `ht_role_permissions`,
+    `ht_user_roles`. Seeds 4 roles, 6 permission keys, T4 grant grid,
+    plus 3 QA test accounts. Mirrored into `init-db/init-hotelnew.sql`.
+  - **`middleware::permissions::require_permission(key, state)`** —
+    Axum `FromFnLayer` that 403s when the auth'd user lacks the key.
+    In-process cache with `invalidate(user_id)` + `invalidate_all()`.
+    No-op when `AUTH_ENABLED=false`.
+  - **Route gates landed:** `POST /api/new/payments/{id}/refund` →
+    `payment.refund`. Inventory-consume routes → `inventory.consume`.
+  - **`/api/auth/me` and `/api/auth/login`** ship a
+    `permissions: Vec<String>` so the UI is gate-aware from first
+    render. Lookup failures degrade to an empty list.
+  - **Frontend** — `contexts/AuthContext.tsx` widens its `Role` type,
+    exposes `permissions: string[]` + `hasPermission(key)`.
+    `components/modals/RefundPaymentModal.tsx` hides itself when
+    permission absent.
+  - **Default seed credentials (QA only — rotate before production):**
+    - `housekeeper_test` / `temp_password_2026` → housekeeper
+    - `cashier_test` / `temp_password_2026` → cashier
+    - `receptionist_test` / `temp_password_2026` → receptionist
+  - **TODO — route gates to apply post-merge:** G4 room-change →
+    `checkin.room_change`; G8 RR.4 report → `reports.rr4`; G9
+    round-bill → `checkin.round_bill`; Phase 4 PR4 admin-users →
+    `admin.users`.
+
 ## [vNext] - 2026-05-14 (Track G9)
 
 ### Fixed

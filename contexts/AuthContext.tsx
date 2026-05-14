@@ -11,7 +11,12 @@ import {
 import { usePathname, useRouter } from 'next/navigation'
 import { ApiError, apiFetch } from '@/lib/api'
 
-export type Role = 'admin' | 'receptionist'
+// Track G7 widened the role set from binary (admin/receptionist) to the
+// four iHOTEL-aligned roles. Existing `Role`-typed call sites still
+// accept the legacy union; new code branching on cashier/housekeeper
+// should pivot on `hasPermission(...)` instead so we don't have to
+// audit every role check when more roles land.
+export type Role = 'admin' | 'cashier' | 'housekeeper' | 'receptionist'
 
 export interface UserDto {
   user_id: number
@@ -24,6 +29,14 @@ export interface UserDto {
 
 export interface AuthState {
   user: UserDto | null
+  /**
+   * Permission keys (e.g. "payment.refund") granted to `user` via the
+   * role grid in `ht_role_permissions`. Empty when logged out OR when
+   * the backend permission lookup transiently fails — components that
+   * rely on a permission MUST handle the empty case as "no access"
+   * rather than "everyone has access".
+   */
+  permissions: string[]
   loading: boolean
   error: string | null
 }
@@ -32,6 +45,13 @@ export interface AuthContextValue extends AuthState {
   login: (username: string, password: string) => Promise<void>
   logout: () => Promise<void>
   refresh: () => Promise<void>
+  /**
+   * Convenience predicate: does the current user hold the given
+   * permission key? Returns `false` when logged out. Components
+   * SHOULD call this rather than indexing `permissions` directly so
+   * the contract stays explicit at every call site.
+   */
+  hasPermission: (key: string) => boolean
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null)
@@ -50,10 +70,26 @@ const AUTH_REQUIRED = process.env.NEXT_PUBLIC_AUTH_REQUIRED === 'true'
 
 interface LoginResponse {
   user: UserDto
+  /**
+   * Track G7: backend now ships permissions alongside the user on
+   * login too, so the UI is gate-aware from the very first render
+   * after authentication (no follow-up /me round-trip required).
+   * Optional on the wire for backward compatibility with older
+   * backends; treat missing as "empty list".
+   */
+  permissions?: string[]
 }
 
 interface MeResponse {
   user: UserDto
+  /**
+   * Track G7: backend ships the user's granted permission keys here so
+   * the frontend can hide buttons the user cannot exercise. The field
+   * is optional on the wire — older backends predate the column and
+   * omit it; treat missing as "empty list" (all gated UI hidden, which
+   * is the safe default).
+   */
+  permissions?: string[]
 }
 
 /**
@@ -64,6 +100,7 @@ interface MeResponse {
  */
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<UserDto | null>(null)
+  const [permissions, setPermissions] = useState<string[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
@@ -71,17 +108,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     try {
       const data = await apiFetch<MeResponse>('/api/auth/me')
       setUser(data?.user ?? null)
+      setPermissions(data?.permissions ?? [])
       setError(null)
     } catch (err) {
       // 401 simply means "no session" (or auth disabled) — not a UI error.
       if (err instanceof ApiError && err.status === 401) {
         setUser(null)
+        setPermissions([])
         setError(null)
         return
       }
       // Anything else (network, 500) is worth surfacing for diagnosis but
       // shouldn't trap the user — leave them logged-out so they can retry.
       setUser(null)
+      setPermissions([])
       setError(err instanceof Error ? err.message : 'auth_check_failed')
     } finally {
       setLoading(false)
@@ -96,6 +136,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         json: { username, password },
       })
       setUser(data?.user ?? null)
+      setPermissions(data?.permissions ?? [])
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         const message = 'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง'
@@ -115,9 +156,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // Logout is idempotent — clear local state regardless of network result.
     } finally {
       setUser(null)
+      setPermissions([])
       setError(null)
     }
   }, [])
+
+  const hasPermission = useCallback(
+    (key: string) => permissions.includes(key),
+    [permissions],
+  )
 
   useEffect(() => {
     refresh()
@@ -125,11 +172,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const value: AuthContextValue = {
     user,
+    permissions,
     loading,
     error,
     login,
     logout,
     refresh,
+    hasPermission,
   }
 
   return (
