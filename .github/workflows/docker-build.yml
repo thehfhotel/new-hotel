@@ -138,6 +138,47 @@ jobs:
       - name: Enforce CARDINALITY_MAP coverage for ht_* tables in migrations
         run: ./scripts/check-cardinality-map.sh
 
+  # Track J2 guard (audit-2026-05-14 follow-on to PR #99).
+  #
+  # PR #89 added `hotel-backend/src/secrets.rs::hydrate_env_from_secret_files`
+  # — the in-process hydrator that reads /run/secrets/<name> files and
+  # populates the matching env vars BEFORE any `env::var(...)` call site
+  # fires. It was unit-tested well but only wired into 2 of 5 binaries'
+  # main(); the other 3 (src/main.rs, bin/sync.rs, bin/writeback.rs)
+  # silently crashed in prod because they never called it. PR #99 fixed it.
+  # This step catches the next "I forgot to wire the call" regression
+  # cheaply (single grep, no cargo build) so a future binary added to
+  # src/bin/ can't ship without the hydrator.
+  #
+  # Cheap enough to always run; no `needs:` paths-filter gate (unlike the
+  # backend test/build jobs) — the cost of a grep over ~9 files is
+  # negligible, and a workflow_dispatch with no file changes still wants
+  # the assertion.
+  lint-bin-hydrate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v5.0.0
+
+      - name: Verify every binary main() calls hydrate_env_from_secret_files
+        run: |
+          set -e
+          BIN_FILES=$(ls hotel-backend/src/main.rs hotel-backend/src/bin/*.rs)
+          MISSING=""
+          for f in $BIN_FILES; do
+            if ! grep -q 'hydrate_env_from_secret_files' "$f"; then
+              MISSING="$MISSING $f"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::These binaries don't call hydrate_env_from_secret_files() — they will crash in prod with empty DB_PASSWORD:"
+            for f in $MISSING; do echo "  - $f"; done
+            exit 1
+          fi
+          echo "OK: all $(echo $BIN_FILES | wc -w) binaries call the hydrator"
+
   test-frontend:
     runs-on: ubuntu-latest
     needs: changes
