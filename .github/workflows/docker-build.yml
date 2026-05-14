@@ -105,6 +105,123 @@ jobs:
               - 'scripts/migrate.sh'
               - 'scripts/backup-db.sh'
 
+  # Track J8 guard (audit-2026-05-14 follow-on to PR #102 + #108).
+  #
+  # release-please's Release PR (wired in PR #102) is generated automatically:
+  # it only edits CHANGELOG.md, package.json, and .release-please-manifest.json
+  # — no Rust, TypeScript, schema, or deploy-script changes. When that PR
+  # merges to master, the existing pipeline would rebuild identical images
+  # and redeploy them: ~5 min of CI runner time + a container cycle on
+  # evergreen for zero behaviour change. This job short-circuits that.
+  #
+  # ## Logic
+  #
+  # Computes whether the push diff (HEAD~1..HEAD) consists EXCLUSIVELY of
+  # release-please-managed files. If so, sets `skip=true` and downstream
+  # heavy jobs (build-frontend, build-backend, deploy) gate on it.
+  #
+  # ## What still runs when skip=true
+  #
+  # - test-frontend / test-backend — cheap, keep the green-CI signal honest
+  #   even on a release-merge commit.
+  # - lint-cardinality-map, lint-bin-hydrate, lint-no-changelog-version-edits,
+  #   init-db-migrations-drift-check — same rationale (lints are seconds).
+  # - The `should-deploy` check itself.
+  #
+  # Only the docker build + push and the evergreen SSH deploy step are
+  # skipped, which is where ~95% of the wall-clock cost lives.
+  #
+  # ## PR + workflow_dispatch behaviour
+  #
+  # - On `pull_request`: `skip=false` unconditionally. PRs must still build
+  #   to keep the green-CI signal honest before merge, and they don't deploy
+  #   anyway (the deploy job's `event_name == 'push'` guard handles that).
+  # - On `workflow_dispatch`: `skip=false` unconditionally. An operator
+  #   manually firing the workflow always wants a fresh build + deploy
+  #   regardless of which files moved on master.
+  # - On `push` to master with no parent commit (impossible in practice
+  #   but defensively handled): `skip=false`.
+  #
+  # ## Failure mode if the matcher is wrong
+  #
+  # The matcher is a tight allow-list of three exact filenames. If a future
+  # release-please config adds more managed files (e.g. a Cargo.toml bump),
+  # this job would NOT mistakenly set skip=true — any extra file would fall
+  # through to the catch-all `*) ONLY_RP=false`. The opposite failure (an
+  # actual code change that happens to ALSO touch one of the three files in
+  # the same push) would also keep ONLY_RP=false because the code file
+  # wouldn't match any of the three cases. So the worst the matcher can do
+  # is fail-open (deploy when it could have skipped) — never fail-closed.
+  should-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v5.0.0
+        with:
+          # Need HEAD and HEAD~1 locally to compute the diff. fetch-depth: 2
+          # is the minimum: 1 commit gives us no parent to diff against.
+          fetch-depth: 2
+
+      - name: Decide whether to deploy
+        id: check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          # Non-push events always deploy/build as usual. The deploy job's
+          # own `event_name == 'push'` guard handles workflow_dispatch + PR
+          # safety separately; this job just doesn't intervene.
+          if [ "$EVENT_NAME" != "push" ]; then
+            echo "Event is $EVENT_NAME, not push — skip=false"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # If HEAD has no parent (first commit on a fresh repo), fall through
+          # to the deploy path. `git rev-parse HEAD~1` exits non-zero in that
+          # case; we treat any rev-parse failure as "can't determine, deploy
+          # to be safe".
+          if ! git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+            echo "No parent commit available — skip=false"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
+          echo "Changed files in HEAD~1..HEAD:"
+          echo "$CHANGED_FILES"
+
+          # Empty diff (shouldn't happen on a push event but defensively
+          # handled): treat as a real change and deploy.
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "Empty diff — skip=false"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Allow-list of files release-please manages. Any path outside this
+          # list flips ONLY_RP=false and the deploy proceeds.
+          ONLY_RP=true
+          while IFS= read -r f; do
+            case "$f" in
+              CHANGELOG.md|package.json|.release-please-manifest.json) ;;
+              *) ONLY_RP=false; break ;;
+            esac
+          done <<< "$CHANGED_FILES"
+
+          if [ "$ONLY_RP" = "true" ]; then
+            echo "::notice::All changed files are release-please-managed — skipping build + deploy"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Non-release-please file(s) present — skip=false"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
   # PROCESS.md P1 enforcement (Track H, audit-2026-05-13).
   #
   # Every `CREATE TABLE ht_*` in migrations/pg/ must have a matching row in
@@ -502,8 +619,12 @@ jobs:
     # red test never reaches prod — but the build doesn't have to WAIT
     # for tests. Worst case: tests fail, an unused :latest image lands on
     # GHCR and gets garbage-collected by the next green build.
-    needs: [changes]
-    if: needs.changes.outputs.frontend == 'true'
+    #
+    # `should-deploy` (Track J8) is in `needs:` so a release-please-only
+    # push skips the build entirely. `skip != 'true'` keeps the original
+    # change-filter semantics intact for every other push.
+    needs: [changes, should-deploy]
+    if: needs.changes.outputs.frontend == 'true' && needs.should-deploy.outputs.skip != 'true'
     permissions:
       contents: read
       packages: write
@@ -561,8 +682,11 @@ jobs:
     # `lint-cardinality-map` is added to needs so a P1 violation blocks the
     # backend image build too — pairs with the same dependency on
     # test-backend so the gate fires on both build and test paths.
-    needs: [changes, lint-cardinality-map]
-    if: needs.changes.outputs.backend == 'true'
+    #
+    # `should-deploy` (Track J8) skips backend image rebuild on release-please-
+    # only pushes — see comment block at the `should-deploy` job for rationale.
+    needs: [changes, lint-cardinality-map, should-deploy]
+    if: needs.changes.outputs.backend == 'true' && needs.should-deploy.outputs.skip != 'true'
     permissions:
       contents: read
       packages: write
@@ -606,7 +730,7 @@ jobs:
 
   deploy:
     runs-on: ubuntu-latest
-    needs: [changes, lint-cardinality-map, test-frontend, test-backend, init-db-migrations-drift-check, build-frontend, build-backend]
+    needs: [changes, lint-cardinality-map, test-frontend, test-backend, init-db-migrations-drift-check, build-frontend, build-backend, should-deploy]
     # Least-privilege: the deploy step only needs to pull images from GHCR
     # (read on packages) and read the working tree.
     permissions:
@@ -631,10 +755,15 @@ jobs:
     # the explicit event_name check below is the load-bearing guard against that.
     # The downstream build-* jobs still run on PRs but with push:false, so a PR
     # exercising the workflow can't end up with a half-pushed image either.
+    #
+    # Track J8: `needs.should-deploy.outputs.skip != 'true'` short-circuits the
+    # deploy step on release-please-only pushes. See the `should-deploy` job's
+    # comment block for the matcher's behaviour and failure modes.
     if: |
       always() &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/master' &&
+      needs.should-deploy.outputs.skip != 'true' &&
       needs.lint-cardinality-map.result == 'success' &&
       (needs.test-frontend.result == 'success' || needs.test-frontend.result == 'skipped') &&
       (needs.test-backend.result == 'success' || needs.test-backend.result == 'skipped') &&
