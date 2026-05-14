@@ -18,6 +18,7 @@ import {
   DollarSign,
   ChevronLeft,
   ChevronRight,
+  FileSpreadsheet,
   MapPin,
   Users,
   CreditCard,
@@ -69,6 +70,8 @@ const sections: NavSection[] = [
     items: [
       { href: '/billing', label: 'ใบแจ้งหนี้', icon: <Receipt size={20} /> },
       { href: '/reports', label: 'รายงาน', icon: <BarChart3 size={20} /> },
+      // Track G8 — legal-critical RR.4 / ตม.30 Thai immigration foreign-guest export.
+      { href: '/reports/rr4', label: 'รร.4 (ตม.30)', icon: <FileSpreadsheet size={20} /> },
     ],
   },
   {
