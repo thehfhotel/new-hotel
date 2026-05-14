@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v2.66.4] - 2026-05-14 (Fix — customer reconcile hash projection drift)
+
+### Fixed
+
+- **HF Hotel `customers` reconcile firing 4-hourly level-drift alerts on
+  ~54 PKs with no actionable drift.** The diff-only reconcile job in
+  `scheduler::sync::sync_customers` was projecting the MSSQL side from
+  `View_Customers` columns that don't match what the CT mapper
+  (`sync::mappers::customer::CustomerMapper`) writes into canonical PG:
+  - `View_Customers.Cust_name` is `Cust_perfix + Cust_name + ' ' +
+    Cust_name2` (concatenated). PG `cust_firstname` mirrors only the
+    base `Cust_name`. Every customer with a prefix or secondary name
+    produced systematic hash divergence.
+  - `View_Customers.C_Address` is a multi-line concatenation of eight
+    `Cust_Add_*` columns. PG `cust_address` mirrors only the door
+    number from `Cust_Add_no`. Almost every customer with any address
+    captured at all produced systematic divergence.
+  - `View_Customers.Cust_Type` is the *rate-tier* label (mapped to
+    `cust_price_tier`). The CT mapper writes `Cust_Type_Main` (the
+    *customer-category* literal) into PG `cust_type`. When a customer's
+    tier and category differ (common — every walk-in customer captured
+    with `Cust_Type_Main='บุคคลธรรมดา'` but default rate tier
+    `'ราคาปกติ'`), the hash diverged.
+
+  Fix mirrors H1's pattern: extracts the legacy SELECT list into a
+  `CUSTOMERS_RECONCILE_PROJECTION` const that queries `HT_Customers`
+  directly with the CT-mapper-compatible columns (`Cust_name`,
+  `Cust_Type_Main`, `Cust_Add_no`). Adds
+  `customers_reconcile_projection_locks_mapper_compatible_columns`
+  unit test that pins both required columns AND forbidden columns
+  (`C_Address`, bare `Cust_Type`) to prevent regression.
+
+  Operator action: cleared the stale post-CT-lag `missing_pg` rows in
+  `ht_reconcile_log` for `customers` (these were detected before the
+  CT mapper had landed the recently-created customers and never
+  auto-resolved because the recorded `mssql_hash` was computed from
+  the broken projection). Once the fix deploys, the next reconcile
+  tick will compute matching hashes for all stably-mirrored PKs and
+  the alert quiets.
+
 ## [v2.66.3] - 2026-05-14 (HF Ville prod fix — room_calendar legacy_id rebind)
 
 ### Fixed
