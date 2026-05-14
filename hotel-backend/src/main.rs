@@ -33,25 +33,8 @@ use crate::scheduler::init_scheduler;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Load .env file if it exists. Runs BEFORE secret-file hydration so a
-    // local-dev `.env` (which historically set `DB_PASSWORD=...` directly)
-    // wins — the hydrator only fills in env vars that are unset or empty.
+    // Load .env file if it exists
     dotenvy::dotenv().ok();
-
-    // Security audit 2026-05-14: hydrate sensitive env vars from Docker
-    // secret files at `/run/secrets/<name>` when present. See
-    // `hotel_backend::secrets` for the file → env var mapping. This is
-    // a no-op in local dev (no `/run/secrets/` directory) and falls back
-    // to the existing env-var path so the migration is reversible.
-    let hydrated = hotel_backend::secrets::hydrate_env_from_secret_files();
-    if hydrated > 0 {
-        // Tracing isn't initialised yet — use eprintln so the line still
-        // shows up in `docker logs` at boot. Never logs values, only the
-        // count, to keep `docker logs` itself free of secret material.
-        eprintln!(
-            "[secrets] hydrated {hydrated} env var(s) from secret files at /run/secrets/"
-        );
-    }
 
     // Initialize tracing
     tracing_subscriber::registry()
@@ -450,6 +433,11 @@ fn build_new_routes(app_state: AppState) -> Router {
         app_middleware::require_permission("inventory.consume", app_state.clone());
     let perm_inventory_consume_product =
         app_middleware::require_permission("inventory.consume", app_state.clone());
+    // Track G5 — coupon issuing / redeeming.
+    let perm_coupon_issue =
+        app_middleware::require_permission("coupon.issue", app_state.clone());
+    let perm_coupon_redeem =
+        app_middleware::require_permission("coupon.redeem", app_state.clone());
 
     Router::new()
         // Rooms routes (PG-only, Phase 8 — reads `ht_rooms_legacy` mirror)
@@ -538,6 +526,19 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route(
             "/api/new/payments/{id}/refund",
             post(routes::new_payments::refund_payment).route_layer(perm_payment_refund),
+        )
+        // Track G5 — canonical coupon issuing (HT_Cupon mirror).
+        // `coupon.issue` gates admin + receptionist (migration 051).
+        // `coupon.redeem` gates admin + cashier + receptionist.
+        // List endpoint is unrestricted (read-only operational view).
+        .route("/api/new/coupons", get(routes::new_coupons::list_coupons))
+        .route(
+            "/api/new/coupons",
+            post(routes::new_coupons::issue_coupon).route_layer(perm_coupon_issue),
+        )
+        .route(
+            "/api/new/coupons/{code}/redeem",
+            post(routes::new_coupons::redeem_coupon).route_layer(perm_coupon_redeem),
         )
         // Shifts (Track F2 / T1 HIGH-5 — cashier-shift gate for payments)
         .route("/api/new/shifts/open", post(routes::new_shifts::open_shift))

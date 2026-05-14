@@ -37,6 +37,7 @@
 pub mod auth;
 pub mod booking;
 pub mod checkin;
+pub mod coupon;
 pub mod customer;
 pub mod error;
 pub mod housekeeping;
@@ -54,6 +55,10 @@ pub use checkin::{
     CancelCheckInCommand, ChangeRoomCommand, ChangeRoomOutcome, CheckInOutcome, CheckInService,
     CheckInToBookingCommand, CheckInWritebackContext, CheckOutCommand, ExtendStayCommand,
     WalkInCommand,
+};
+pub use coupon::{
+    CouponService, IssueCouponCommand, IssueCouponOutcome, RedeemCouponCommand,
+    RedeemCouponOutcome,
 };
 pub use customer::{
     CreateCustomerCommand, CustomerOutcome, CustomerService, UpdateCustomerCommand,

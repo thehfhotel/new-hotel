@@ -22,8 +22,8 @@ use crate::repository::{
 use crate::routes::auth::ProdAuthService;
 use crate::config::SiteConfig;
 use crate::service::{
-    BookingService, CheckInService, CustomerService, HousekeepingService, PaymentService,
-    ShiftService,
+    BookingService, CheckInService, CouponService, CustomerService, HousekeepingService,
+    PaymentService, ShiftService,
 };
 
 /// Bundle of fully-wired Phase-2 services produced by `AppState::wire_services`.
@@ -42,6 +42,8 @@ struct WiredServices {
     /// `PaymentService::with_shifts` so `record_payment` refuses to
     /// insert unless an `ht_shifts` row is open.
     shifts: Arc<ShiftService>,
+    /// Track G5 — coupon issuing canonical service.
+    coupons: Arc<CouponService>,
 }
 
 /// System operating mode
@@ -124,6 +126,10 @@ pub struct AppState {
     /// rounds are isolated (`hfhotel` and `hfville` each have their
     /// own running counter).
     pub shifts_service: Arc<ShiftService>,
+    /// Coupon service — Track G5 (`ht_coupons`). Orchestrates issue +
+    /// redeem against the canonical table plus outbox enqueues so the
+    /// writeback worker can mirror onto legacy `HT_Cupon`.
+    pub coupons_service: Arc<CouponService>,
 
     // ----- Auth (Phase 4 PR2) -----
     /// Cookie-session auth service — wired with PG-backed user + session
@@ -198,6 +204,7 @@ impl AppState {
             payments_service: services.payments,
             housekeeping_service: services.housekeeping,
             shifts_service: services.shifts,
+            coupons_service: services.coupons,
             auth_service: crate::routes::auth::build_auth_service(),
             auth_enabled: false,
         }
@@ -242,6 +249,7 @@ impl AppState {
             payments_service: services.payments,
             housekeeping_service: services.housekeeping,
             shifts_service: services.shifts,
+            coupons_service: services.coupons,
             auth_service: crate::routes::auth::build_auth_service(),
             auth_enabled: false,
         }
@@ -316,11 +324,12 @@ impl AppState {
             ),
             housekeeping: Arc::new(HousekeepingService::new(
                 rooms,
-                outbox,
-                events,
-                pg,
+                outbox.clone(),
+                events.clone(),
+                pg.clone(),
             )),
             shifts,
+            coupons: Arc::new(CouponService::new(outbox, events, pg)),
         }
     }
 

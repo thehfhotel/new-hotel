@@ -109,6 +109,13 @@ impl MssqlChangeMapper for CuponMirrorMapper {
                 .await?;
             }
         }
+        // Track G5 — dual-write into canonical `ht_coupons` so
+        // iHOTEL-issued coupons are visible to the new app's
+        // dashboards. Mirrors the Track G4 `ChangedRoomMirrorMapper`
+        // dual-write pattern; both writes run in the same TX so a PG
+        // failure rolls back the mirror AND the canonical state
+        // atomically.
+        super::coupon::apply_canonical_cupon_event(tx, op, row).await?;
         Ok(None)
     }
 }
