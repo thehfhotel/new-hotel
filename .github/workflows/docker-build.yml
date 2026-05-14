@@ -138,6 +138,26 @@ jobs:
       - name: Enforce CARDINALITY_MAP coverage for ht_* tables in migrations
         run: ./scripts/check-cardinality-map.sh
 
+      - name: Reject committed conflict markers
+        # Backstop for the .husky/pre-commit hook (Track J6). Catches unresolved
+        # git conflict markers leaking into the tree when a contributor skips
+        # local hooks. The regex matches whole-line marker tokens only, so
+        # legitimate `===== heading =====` style banners in docs/code are safe.
+        run: |
+          if grep -rnE '^(<<<<<<<|=======|>>>>>>>)( |$)' \
+              --include='*.rs' --include='*.ts' --include='*.tsx' \
+              --include='*.js' --include='*.yml' --include='*.toml' \
+              --include='*.sql' --include='*.md' \
+              --exclude-dir=.git \
+              --exclude-dir=node_modules \
+              --exclude-dir=target \
+              hotel-backend app components scripts migrations init-db \
+              2>/dev/null; then
+            echo "::error::Committed git conflict markers detected. Resolve them before merging."
+            exit 1
+          fi
+          echo "OK: no conflict markers in source tree"
+
   # Track J2 guard (audit-2026-05-14 follow-on to PR #99).
   #
   # PR #89 added `hotel-backend/src/secrets.rs::hydrate_env_from_secret_files`
