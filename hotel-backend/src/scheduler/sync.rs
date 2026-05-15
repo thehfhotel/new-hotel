@@ -49,6 +49,8 @@ use std::env;
 use std::sync::Mutex;
 use std::time::Instant;
 
+use tiberius::Query;
+
 use crate::db::{DbPool, PgPool};
 use crate::notifications::slack::{SlackClient, SlackMessage};
 
@@ -164,11 +166,16 @@ pub async fn run_sync(
     crate::scheduler::mirror::reload_mirror_dimensions(legacy_pool, pg_pool).await;
 
     // Track D / T7 follow-up — auto-resolve previously-recorded
-    // divergences whose canonical PG hash now matches the recorded
-    // legacy hash. Runs before the alert queries so the alerts only
-    // surface drift that still persists. Best-effort: a PG failure
-    // logs a warning and the alerts proceed with stale state.
-    if let Err(e) = auto_resolve_reconcile_log(pg_pool).await {
+    // divergences whose freshly-projected legacy hash matches the
+    // freshly-projected canonical PG hash. BOTH sides are re-hashed
+    // under the CURRENT projection so a change to a
+    // `*_RECONCILE_PROJECTION` constant self-heals: the next sweep
+    // tick re-evaluates rows whose stored `mssql_hash` was computed
+    // under the now-superseded projection. Runs before the alert
+    // queries so the alerts only surface drift that still persists.
+    // Best-effort: a PG failure logs a warning and the alerts
+    // proceed with stale state.
+    if let Err(e) = auto_resolve_reconcile_log(legacy_pool, pg_pool).await {
         tracing::warn!(
             site = %site_id,
             error = %e,
@@ -967,23 +974,32 @@ async fn record_divergence(
 }
 
 /// Pure decision helper for the auto-resolve sweep. A row in
-/// `ht_reconcile_log` may be auto-resolved iff the recorded legacy
-/// (MSSQL) hash matches a freshly-computed canonical PG hash. Both
-/// inputs must be present non-empty strings — a `None` on either side
-/// is an intentional skip (missing-PG cases must persist until
+/// `ht_reconcile_log` may be auto-resolved iff a freshly-projected
+/// legacy (MSSQL) hash matches a freshly-computed canonical PG hash.
+/// Both inputs must be present non-empty strings — a `None` on either
+/// side is an intentional skip (missing-PG cases must persist until
 /// canonical actually catches up; missing-MSSQL cases need operator
 /// review).
 ///
 /// Pulled into a free function so the unit tests can exercise the
 /// truth table without a live PG pool.
 fn should_auto_resolve(
-    recorded_legacy_hash: Option<&str>,
+    current_legacy_hash: Option<&str>,
     current_pg_hash: Option<&str>,
 ) -> bool {
-    match (recorded_legacy_hash, current_pg_hash) {
+    match (current_legacy_hash, current_pg_hash) {
         (Some(legacy), Some(pg)) if !legacy.is_empty() && !pg.is_empty() => legacy == pg,
         _ => false,
     }
+}
+
+/// Parse the composite booking PK as stored in `ht_reconcile_log.legacy_pk`.
+/// Bookings serialise as `"{book_no}|{room_type_key}"`; pre-Phase-6-hotfix
+/// rows lack the separator and are interpreted as `(legacy_pk, "")`. Pure
+/// so the booking-fetch dispatch + the canonical-fetch dispatch agree on
+/// the parse rule.
+fn parse_booking_legacy_pk(legacy_pk: &str) -> (&str, &str) {
+    legacy_pk.split_once('|').unwrap_or((legacy_pk, ""))
 }
 
 /// Re-compute the canonical PG hash for a single `ht_reconcile_log`
@@ -1019,7 +1035,7 @@ async fn compute_current_pg_hash(
             // Composite PK serialised as "{book_no}|{room_type_key}";
             // canonical hash is keyed by `book_no` (the legacy_book_id)
             // — matches `sync_bookings`' canonical-side hash inputs.
-            let book_no = legacy_pk.split_once('|').map(|(b, _)| b).unwrap_or(legacy_pk);
+            let (book_no, _room_type_key) = parse_booking_legacy_pk(legacy_pk);
             let canonical = fetch_canonical_booking(pg_pool, book_no).await?;
             Ok(canonical.map(|c| {
                 let checkin_str = c.book_checkin.map(|d| d.to_string());
@@ -1048,23 +1064,189 @@ async fn compute_current_pg_hash(
     }
 }
 
+/// Re-project a single MSSQL row/group by PK under the CURRENT
+/// `*_RECONCILE_PROJECTION` constants and produce a fresh `mssql_hash`.
+/// Returns `Ok(None)` when the row no longer exists on the legacy side
+/// (treated as "still drifted — leave for operator review"), or when
+/// `table_name` is outside the dispatched set ("rooms" / future entities
+/// that don't yet have a legacy-side fetch path).
+///
+/// Mirrors `compute_current_pg_hash` so the auto-resolve sweep can
+/// compare like-for-like under the current projection. The whole point
+/// of re-fetching MSSQL — rather than trusting `ht_reconcile_log.mssql_hash`
+/// — is that a projection change invalidates every pre-fix stored hash.
+async fn compute_current_legacy_hash(
+    legacy_pool: &DbPool,
+    table_name: &str,
+    legacy_pk: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    match table_name {
+        "customers" => fetch_legacy_customer_hash(legacy_pool, legacy_pk).await,
+        "bookings" => {
+            let (book_no, room_type_key) = parse_booking_legacy_pk(legacy_pk);
+            fetch_legacy_booking_hash(legacy_pool, book_no, room_type_key).await
+        }
+        "checkins" => fetch_legacy_checkin_hash(legacy_pool, legacy_pk).await,
+        _ => Ok(None),
+    }
+}
+
+/// Single-PK MSSQL re-projection for customers. Mirrors `sync_customers`'
+/// per-row hash construction so a projection change in
+/// `CUSTOMERS_RECONCILE_PROJECTION` self-heals on the next sweep tick.
+async fn fetch_legacy_customer_hash(
+    legacy_pool: &DbPool,
+    cust_no: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut conn = legacy_pool.get().await?;
+    let sql = format!(
+        "SELECT {projection} FROM HT_Customers WHERE Cust_no = @P1",
+        projection = CUSTOMERS_RECONCILE_PROJECTION,
+    );
+    let mut q = Query::new(sql);
+    q.bind(cust_no);
+    let rows = q.query(&mut conn).await?.into_first_result().await?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let row_cust_no = row.get::<&str, _>("Cust_no").unwrap_or_default().to_string();
+    let cust_name = row.get::<&str, _>("Cust_name").map(String::from);
+    let cust_type = row.get::<&str, _>("Cust_Type_Main").map(String::from);
+    let cust_phone = row.get::<&str, _>("Cust_Add_tel").map(String::from);
+    let cust_idcard = row.get::<&str, _>("Cust_IDcard").map(String::from);
+    let cust_address = row.get::<&str, _>("Cust_Add_no").map(String::from);
+    Ok(Some(customer_canonical_hash(
+        &row_cust_no,
+        cust_name.as_deref().unwrap_or(""),
+        cust_type.as_deref(),
+        cust_phone.as_deref(),
+        cust_idcard.as_deref(),
+        cust_address.as_deref(),
+    )))
+}
+
+/// Single-composite-PK MSSQL re-projection for bookings. `View_Booking_Ds`
+/// returns up to 3 rows per `(Book_No, Book_Room_Type)`; we group exactly
+/// the same way `sync_bookings` does and take the deterministic
+/// representative so the hash inputs match. `Ok(None)` when no matching
+/// group exists today (legacy-side deletion since detection).
+async fn fetch_legacy_booking_hash(
+    legacy_pool: &DbPool,
+    book_no: &str,
+    room_type_key: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut conn = legacy_pool.get().await?;
+    let sql = format!(
+        "SELECT {projection} FROM View_Booking_Ds WHERE Book_No = @P1",
+        projection = BOOKINGS_RECONCILE_PROJECTION.join(", "),
+    );
+    let mut q = Query::new(sql);
+    q.bind(book_no);
+    let rows = q.query(&mut conn).await?.into_first_result().await?;
+
+    let mut groups: BTreeMap<(String, String), Vec<BookingDetail>> = BTreeMap::new();
+    for row in &rows {
+        let row_book_no = row.get::<&str, _>("Book_No").unwrap_or_default().to_string();
+        let row_room_type = row.get::<&str, _>("Book_Room_Type").map(String::from);
+        let detail = BookingDetail {
+            book_date: row.try_get("Book_Date").unwrap_or(None),
+            book_date_in: row.try_get("Book_Date_in").unwrap_or(None),
+            book_date_out: row.try_get("Book_Date_out").unwrap_or(None),
+            book_cust_name: row.get::<&str, _>("Book_Cust_Name").map(String::from),
+            book_cust_id: row.get::<&str, _>("Book_Cust_ID").map(String::from),
+            book_status: row.get::<i32, _>("Book_Status"),
+            book_room_type: row_room_type.clone(),
+        };
+        let key = row_room_type.unwrap_or_default();
+        groups.entry((row_book_no, key)).or_default().push(detail);
+    }
+
+    let Some(mut details) = groups.remove(&(book_no.to_string(), room_type_key.to_string()))
+    else {
+        return Ok(None);
+    };
+    sort_booking_details(&mut details);
+    let representative = details.first();
+    let book_checkin_date = representative
+        .and_then(|d| d.book_date_in.map(|dt| dt.date().to_string()));
+    let book_checkout_date = representative
+        .and_then(|d| d.book_date_out.map(|dt| dt.date().to_string()));
+    let book_cust_id_owned = representative.and_then(|d| d.book_cust_id.clone());
+    Ok(Some(booking_canonical_hash(
+        book_no,
+        book_checkin_date.as_deref(),
+        book_checkout_date.as_deref(),
+        book_cust_id_owned.as_deref(),
+    )))
+}
+
+/// Single-PK MSSQL re-projection for check-ins. `View_CheckIn_Ds` returns
+/// 41-45 rows per `Cin_no`; same aggregation contract as `sync_checkins`.
+/// `Ok(None)` when the check-in no longer exists on the legacy side.
+async fn fetch_legacy_checkin_hash(
+    legacy_pool: &DbPool,
+    cin_no: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut conn = legacy_pool.get().await?;
+    let sql = format!(
+        "SELECT {projection} FROM View_CheckIn_Ds WHERE Cin_no = @P1",
+        projection = CHECKINS_RECONCILE_PROJECTION.join(", "),
+    );
+    let mut q = Query::new(sql);
+    q.bind(cin_no);
+    let rows = q.query(&mut conn).await?.into_first_result().await?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let mut details: Vec<CheckinDetail> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        details.push(CheckinDetail {
+            room_no: row.get::<&str, _>("Cin_Room_No").map(String::from),
+            room_in: row.try_get("Cin_Room_In").unwrap_or(None),
+            room_out: row.try_get("Cin_Room_Out").unwrap_or(None),
+            cust_name: row.get::<&str, _>("Cin_cust_name").map(String::from),
+            cust_no: row.get::<&str, _>("Cin_cust_no").map(String::from),
+            status: row.get::<&str, _>("Cin_status").map(String::from),
+        });
+    }
+    sort_checkin_details(&mut details);
+    let representative = details.first();
+    let room_in_str = representative.and_then(|d| d.room_in.map(|t| t.to_string()));
+    let room_out_str = representative.and_then(|d| d.room_out.map(|t| t.to_string()));
+    Ok(Some(checkin_canonical_hash(
+        cin_no,
+        representative.and_then(|d| d.room_no.as_deref()),
+        room_in_str.as_deref(),
+        room_out_str.as_deref(),
+        representative.and_then(|d| d.cust_no.as_deref()),
+    )))
+}
+
 /// Track D / T7 follow-up — auto-resolve sweep. Walks unresolved
 /// `ht_reconcile_log` rows whose `divergence_kind` was classified by
-/// the post-migration-032 reconcile loop, re-computes the canonical
-/// PG hash for each, and marks rows resolved when the new hash equals
-/// the recorded MSSQL hash. Returns the number of rows resolved.
+/// the post-migration-032 reconcile loop, re-projects BOTH the legacy
+/// MSSQL row and the canonical PG row under the CURRENT projections,
+/// and marks the row resolved when the two fresh hashes converge.
+/// Returns the number of rows resolved.
 ///
 /// Rationale: alerts should fire only on drift that still persists.
-/// Without this sweep, transient lag between MSSQL reconcile and the
-/// CT mapper catching up would leave stale rows in the log forever,
-/// drowning the level-triggered digest.
+/// Re-projecting the legacy side (rather than trusting the row's
+/// stored `mssql_hash`) is what makes this sweep robust to changes
+/// in a `*_RECONCILE_PROJECTION` constant — a fix that renames or
+/// re-sources a hashed column would otherwise leave every pre-fix
+/// row permanently unresolvable, since the stored hash was computed
+/// over a now-defunct field set.
 ///
 /// Bounded to 500 rows per tick so a backlog can't stall the
-/// reconcile loop. Best-effort per row — a single failure logs and
-/// continues to the next.
-async fn auto_resolve_reconcile_log(pg_pool: &PgPool) -> Result<usize, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (i64, String, String, Option<String>)>(
-        "SELECT id, table_name, legacy_pk, mssql_hash \
+/// reconcile loop. Best-effort per row — a single MSSQL or PG
+/// failure logs and continues to the next.
+async fn auto_resolve_reconcile_log(
+    legacy_pool: &DbPool,
+    pg_pool: &PgPool,
+) -> Result<usize, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (i64, String, String)>(
+        "SELECT id, table_name, legacy_pk \
            FROM ht_reconcile_log \
           WHERE resolved_at IS NULL \
             AND divergence_kind IS NOT NULL \
@@ -1074,7 +1256,22 @@ async fn auto_resolve_reconcile_log(pg_pool: &PgPool) -> Result<usize, sqlx::Err
     .await?;
 
     let mut resolved = 0usize;
-    for (id, table_name, legacy_pk, recorded_legacy_hash) in rows {
+    for (id, table_name, legacy_pk) in rows {
+        let current_legacy_hash =
+            match compute_current_legacy_hash(legacy_pool, &table_name, &legacy_pk).await {
+                Ok(opt) => opt,
+                Err(e) => {
+                    tracing::warn!(
+                        id,
+                        table_name = %table_name,
+                        legacy_pk = %legacy_pk,
+                        error = %e,
+                        "[Sync] Auto-resolve sweep: failed to re-fetch legacy hash, skipping row"
+                    );
+                    continue;
+                }
+            };
+
         let current_pg_hash =
             match compute_current_pg_hash(pg_pool, &table_name, &legacy_pk).await {
                 Ok(opt) => opt,
@@ -1090,7 +1287,7 @@ async fn auto_resolve_reconcile_log(pg_pool: &PgPool) -> Result<usize, sqlx::Err
                 }
             };
 
-        if !should_auto_resolve(recorded_legacy_hash.as_deref(), current_pg_hash.as_deref()) {
+        if !should_auto_resolve(current_legacy_hash.as_deref(), current_pg_hash.as_deref()) {
             continue;
         }
 
@@ -3489,6 +3686,32 @@ mod tests {
         let recorded_legacy_hash = Some("hash-X");
         let current_pg_hash = Some("hash-Y");
         assert!(!should_auto_resolve(recorded_legacy_hash, current_pg_hash));
+    }
+
+    /// Composite-PK parse contract: a `"book_no|room_type"` PK splits
+    /// on the first `|`. The booking-fetch dispatch + the
+    /// canonical-fetch dispatch must agree on this shape or the
+    /// auto-resolve sweep compares hashes from different groups.
+    #[test]
+    fn parse_booking_legacy_pk_splits_composite() {
+        assert_eq!(parse_booking_legacy_pk("B12345|A"), ("B12345", "A"));
+    }
+
+    /// Empty `room_type_key` (the `unwrap_or_default()` case in
+    /// `sync_bookings`) round-trips through the PK serialisation as
+    /// `"{book_no}|"`. Must still parse cleanly so an empty-key group
+    /// can be re-fetched and resolved.
+    #[test]
+    fn parse_booking_legacy_pk_handles_empty_room_type() {
+        assert_eq!(parse_booking_legacy_pk("B12345|"), ("B12345", ""));
+    }
+
+    /// Pre-Phase-6-hotfix `ht_reconcile_log` rows lack the `|` separator
+    /// (older format stored just `book_no`). Treat those as
+    /// `(legacy_pk, "")` so the sweep doesn't error on legacy data.
+    #[test]
+    fn parse_booking_legacy_pk_legacy_format_has_no_separator() {
+        assert_eq!(parse_booking_legacy_pk("B12345"), ("B12345", ""));
     }
 
     #[test]
