@@ -107,6 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let start = Instant::now();
     let mut applied = 0usize;
     let mut skipped_no_mssql = 0usize;
+    let mut deferred = 0usize;
     let mut errored = 0usize;
     let total = pks.len();
 
@@ -117,6 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 applied,
                 errored,
                 skipped_no_mssql,
+                deferred,
                 elapsed_ms = start.elapsed().as_millis() as u64,
                 "in-flight summary"
             );
@@ -157,6 +159,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         match apply_checkin_aggregate(&mut tx, Some(&mssql), &aggregate, cin_no).await {
             Ok(_event) => {
+                // `Ok` is ambiguous: it covers both real INSERT/UPDATE
+                // success AND defer-on-missing-FK (the mapper logs a
+                // warning + returns `Ok(None)` when a parent booking or
+                // room isn't mirrored yet — see `apply_checkin_aggregate`
+                // line ~341 and ~362). Mark the reconcile_log row
+                // resolved ONLY if a canonical `ht_checkins` row exists
+                // for this PK after the apply. Otherwise the canonical
+                // row is still missing and the next reconcile tick will
+                // correctly re-flag it as missing_pg.
+                let canonical_present: bool = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM ht_checkins WHERE legacy_cin_no = $1)",
+                )
+                .bind(cin_no)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap_or(false);
+
+                if !canonical_present {
+                    tracing::info!(
+                        cin_no,
+                        "apply returned Ok but canonical row still missing — likely deferred \
+                         on a missing parent booking/room FK. Skipping resolve update; \
+                         re-run after backfill_legacy_bookings completes."
+                    );
+                    let _ = tx.rollback().await;
+                    deferred += 1;
+                    continue;
+                }
+
                 // Mark every unresolved reconcile_log row for this PK
                 // resolved. We do this inside the same TX as the apply
                 // so a rollback below also rolls back the resolution.
@@ -200,6 +231,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         candidate_pks = total,
         applied,
         skipped_no_mssql,
+        deferred,
         errored,
         duration_secs = duration.as_secs(),
         "backfill_legacy_checkins — done"
@@ -212,6 +244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("Candidate PKs:         {total}");
     println!("Applied:               {applied}");
     println!("Skipped (no MSSQL):    {skipped_no_mssql}");
+    println!("Deferred (FK missing): {deferred}");
     println!("Errored:               {errored}");
     println!("Duration:              {:?}", duration);
 
