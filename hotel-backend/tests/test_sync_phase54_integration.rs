@@ -1064,9 +1064,21 @@ async fn apply_checkin_aggregate_removes_dropped_rooms() {
     let mssql = mssql_stub().await;
     let cin_no = unique_cin_no();
     let cust_no = unique_cust_no();
+    // `unique_room_no` draws from `rand::random::<u8>()` (0-255 range) so
+    // three independent calls have ~1% chance of pairwise collision. Retry
+    // each draw until the running set is unique — flaky CI run otherwise
+    // (room_b == room_a → seed_room ON CONFLICT silently coalesces → only
+    // 2 distinct rooms exist → 3-room aggregate fails the post-apply
+    // junction count assertion at line ~1093).
     let room_no_a = unique_room_no();
-    let room_no_b = unique_room_no();
-    let room_no_c = unique_room_no();
+    let mut room_no_b = unique_room_no();
+    while room_no_b == room_no_a {
+        room_no_b = unique_room_no();
+    }
+    let mut room_no_c = unique_room_no();
+    while room_no_c == room_no_a || room_no_c == room_no_b {
+        room_no_c = unique_room_no();
+    }
 
     let _cust_pg_id = seed_customer(&pool, &cust_no).await;
     let _room_a = seed_room(&pool, &room_no_a).await;
