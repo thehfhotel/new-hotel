@@ -137,6 +137,13 @@ services:
       - SYSTEM_MODE=new
       # SLACK_WEBHOOK_URL — sourced from /run/secrets/slack_webhook_url
       - SLACK_NOTIFICATIONS_ENABLED=true
+      # Per-job slack notification kill-switches (2026-05-15).
+      # Default `true` preserves prior behavior — only set `false` when
+      # actively running a CT-watcher backfill window and the operator
+      # wants to silence the cron-driven noise. Registered in
+      # `scheduler::jobs::init_scheduler`.
+      - HOURLY_REPORT_ENABLED=${HOURLY_REPORT_ENABLED:-true}
+      - CHECKIN_NOTIFICATIONS_ENABLED=${CHECKIN_NOTIFICATIONS_ENABLED:-true}
       - HOST=0.0.0.0
       - PORT=3003
       # HF Ville — Phase 5 Ville cutover (#76, 2026-04-30): ville_pool

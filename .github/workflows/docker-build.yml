@@ -848,6 +848,12 @@ jobs:
           LEGACY_SYNC_ENABLED:     ${{ secrets.LEGACY_SYNC_ENABLED }}
           LEGACY_SYNC_SHADOW_MODE: ${{ secrets.LEGACY_SYNC_SHADOW_MODE }}
           AUTH_ENABLED:            ${{ vars.AUTH_ENABLED || 'false' }}
+          # Per-job slack notification kill-switches (2026-05-15).
+          # Default 'true' preserves prior behavior. Operators flip to
+          # 'false' via `gh variable set HOURLY_REPORT_ENABLED -b false`
+          # during a CT-watcher backfill window to silence the cron noise.
+          HOURLY_REPORT_ENABLED:         ${{ vars.HOURLY_REPORT_ENABLED || 'true' }}
+          CHECKIN_NOTIFICATIONS_ENABLED: ${{ vars.CHECKIN_NOTIFICATIONS_ENABLED || 'true' }}
         # Build a JSON payload the way /srv/run-deploy.sh expects:
         #   { commit_sha, deploy_payload_b64 (tar.gz), env: {...},
         #     secrets: {...} }
@@ -901,23 +907,27 @@ jobs:
             --arg LEGACY_SYNC_ENABLED "$LEGACY_SYNC_ENABLED" \
             --arg LEGACY_SYNC_SHADOW_MODE "$LEGACY_SYNC_SHADOW_MODE" \
             --arg AUTH_ENABLED        "$AUTH_ENABLED" \
+            --arg HOURLY_REPORT_ENABLED         "${HOURLY_REPORT_ENABLED:-true}" \
+            --arg CHECKIN_NOTIFICATIONS_ENABLED "${CHECKIN_NOTIFICATIONS_ENABLED:-true}" \
             '{
               commit_sha: $commit_sha,
               deploy_payload_b64: $deploy_payload_b64,
               ghcr: { user: $ghcr_user, token: $ghcr_token },
               env: {
-                DB_SERVER:               $DB_SERVER,
-                DB_NAME:                 $DB_NAME,
-                DB_USER:                 $DB_USER,
-                DB_PASSWORD:             $DB_PASSWORD,
-                MSSQL_PORT:              $MSSQL_PORT,
-                POSTGRES_DB:             $POSTGRES_DB,
-                POSTGRES_USER:           $POSTGRES_USER,
-                POSTGRES_PASSWORD:       $POSTGRES_PASSWORD,
-                SLACK_WEBHOOK_URL:       $SLACK_WEBHOOK_URL,
-                LEGACY_SYNC_ENABLED:     $LEGACY_SYNC_ENABLED,
-                LEGACY_SYNC_SHADOW_MODE: $LEGACY_SYNC_SHADOW_MODE,
-                AUTH_ENABLED:            $AUTH_ENABLED,
+                DB_SERVER:                    $DB_SERVER,
+                DB_NAME:                      $DB_NAME,
+                DB_USER:                      $DB_USER,
+                DB_PASSWORD:                  $DB_PASSWORD,
+                MSSQL_PORT:                   $MSSQL_PORT,
+                POSTGRES_DB:                  $POSTGRES_DB,
+                POSTGRES_USER:                $POSTGRES_USER,
+                POSTGRES_PASSWORD:            $POSTGRES_PASSWORD,
+                SLACK_WEBHOOK_URL:            $SLACK_WEBHOOK_URL,
+                LEGACY_SYNC_ENABLED:          $LEGACY_SYNC_ENABLED,
+                LEGACY_SYNC_SHADOW_MODE:      $LEGACY_SYNC_SHADOW_MODE,
+                AUTH_ENABLED:                 $AUTH_ENABLED,
+                HOURLY_REPORT_ENABLED:        $HOURLY_REPORT_ENABLED,
+                CHECKIN_NOTIFICATIONS_ENABLED: $CHECKIN_NOTIFICATIONS_ENABLED,
               },
               secrets: {
                 db_password:        $DB_PASSWORD,
