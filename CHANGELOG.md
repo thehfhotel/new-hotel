@@ -7,6 +7,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.68.1](https://github.com/thehfhotel/new-hotel/compare/v2.68.0...v2.68.1) (2026-05-15)
+
+
+### Fixed
+
+* **sync:** denormalised ht_checkins.legacy_room_no tracks room changes ([88fa62d](https://github.com/thehfhotel/new-hotel/commit/88fa62d37854666f1189549ebb41d5e2c1b7b7db))
+* **sync:** reconcile hash compares cin_expected_checkout, not cin_checkout_time ([de30859](https://github.com/thehfhotel/new-hotel/commit/de3085983b4c347757d771fbf8889f9185aa5de1))
+
 ## [2.68.0](https://github.com/thehfhotel/new-hotel/compare/v2.67.0...v2.68.0) (2026-05-15)
 
 
