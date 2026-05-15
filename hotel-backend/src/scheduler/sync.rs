@@ -670,7 +670,11 @@ fn checkin_group_json(cin_no: &str, details: &[CheckinDetail]) -> serde_json::Va
         .map(|d| {
             json!({
                 "Cin_Room_No": d.room_no,
-                "Cin_Room_In": d.room_in.map(|t| t.to_string()),
+                // JSON key reflects the projection's actual source column
+                // (Bug C fix 2026-05-15) so operators investigating drift
+                // see what was hashed, not what they might assume from the
+                // schema name.
+                "Cin_Date_in": d.room_in.map(|t| t.to_string()),
                 "Cin_Room_Out": d.room_out.map(|t| t.to_string()),
                 "Cin_cust_name": d.cust_name,
                 "Cin_cust_no": d.cust_no,
@@ -1203,7 +1207,12 @@ async fn fetch_legacy_checkin_hash(
     for row in &rows {
         details.push(CheckinDetail {
             room_no: row.get::<&str, _>("Cin_Room_No").map(String::from),
-            room_in: row.try_get("Cin_Room_In").unwrap_or(None),
+            // Bug C fix (2026-05-15): read header `Cin_Date_in` (the
+            // value canonical mirrors via `derive_stay_range`), not
+            // detail `Cin_Room_In` (when guest physically entered THIS
+            // room). The struct field name `room_in` is preserved for
+            // call-site minimality; renaming is a separate cleanup.
+            room_in: row.try_get("Cin_Date_in").unwrap_or(None),
             room_out: row.try_get("Cin_Room_Out").unwrap_or(None),
             cust_name: row.get::<&str, _>("Cin_cust_name").map(String::from),
             cust_no: row.get::<&str, _>("Cin_cust_no").map(String::from),
@@ -1212,7 +1221,7 @@ async fn fetch_legacy_checkin_hash(
     }
     sort_checkin_details(&mut details);
     let representative = details.first();
-    let room_in_str = representative.and_then(|d| d.room_in.map(|t| t.to_string()));
+    let checkin_time_str = representative.and_then(|d| d.room_in.map(|t| t.to_string()));
     // Drop the time component to align with canonical `cin_expected_checkout`
     // (a `DATE`, not a `TIMESTAMP`). See `CanonicalCheckinRow` doc comment
     // for the field-semantic rationale.
@@ -1220,7 +1229,7 @@ async fn fetch_legacy_checkin_hash(
     Ok(Some(checkin_canonical_hash(
         cin_no,
         representative.and_then(|d| d.room_no.as_deref()),
-        room_in_str.as_deref(),
+        checkin_time_str.as_deref(),
         room_out_date_str.as_deref(),
         representative.and_then(|d| d.cust_no.as_deref()),
     )))
@@ -2483,15 +2492,30 @@ async fn upsert_booking_mirror(
 ///
 /// `View_CheckIn_Ds` joins `HT_CheckIn_H` (header) with `HT_CheckIn_Ds`
 /// (per-room detail), so every column in this projection must exist on
-/// one of those two base tables. Mixed casing — `Cin_no` /
-/// `Cin_cust_name` / `Cin_cust_no` / `Cin_status` are lowercase on
-/// `HT_CheckIn_H`; `Cin_Room_No` / `Cin_Room_In` / `Cin_Room_Out` are
-/// capital-N on `HT_CheckIn_Ds`. The view preserves both casings
-/// verbatim per the live schema dump.
+/// one of those two base tables. Mixed casing — `Cin_no` / `Cin_Date_in`
+/// / `Cin_cust_name` / `Cin_cust_no` / `Cin_status` are lowercase on
+/// `HT_CheckIn_H`; `Cin_Room_No` / `Cin_Room_Out` are capital-N on
+/// `HT_CheckIn_Ds`. The view preserves both casings verbatim per the
+/// live schema dump.
+///
+/// **Why `Cin_Date_in` and NOT `Cin_Room_In`:** canonical
+/// `cin_checkin_time` is sourced from header `HT_CheckIn_H.Cin_Date_in`
+/// (via `derive_stay_range` in the CT checkin mapper). Detail
+/// `Cin_Room_In` is when the guest physically moved into that
+/// specific room — usually equal to `Cin_Date_in` for single-room
+/// flows but lags when a room is assigned/added later (we observed
+/// ~50min gaps in production audit 2026-05-15). Hashing the detail
+/// timestamp against the canonical header timestamp produced
+/// systematic false-positive value drift for every check-in with a
+/// late room assignment.
+///
+/// Counterpart of the Bug B fix that swapped `Cin_Room_Out` → date-only
+/// to align with canonical `cin_expected_checkout`. Both projections
+/// now read header columns for the timestamps the CT mapper mirrors.
 const CHECKINS_RECONCILE_PROJECTION: &[&str] = &[
     "Cin_no",
     "Cin_Room_No",
-    "Cin_Room_In",
+    "Cin_Date_in",
     "Cin_Room_Out",
     "Cin_cust_name",
     "Cin_cust_no",
@@ -2531,7 +2555,12 @@ async fn sync_checkins(
         let cin_no = row.get::<&str, _>("Cin_no").unwrap_or_default().to_string();
         let detail = CheckinDetail {
             room_no: row.get::<&str, _>("Cin_Room_No").map(String::from),
-            room_in: row.try_get("Cin_Room_In").unwrap_or(None),
+            // Bug C fix (2026-05-15): read header `Cin_Date_in` — see
+            // doc comment on `CHECKINS_RECONCILE_PROJECTION` for the
+            // detail-vs-header projection-alignment rationale. The
+            // struct field stays `room_in` for now; renaming is a
+            // separate cleanup.
+            room_in: row.try_get("Cin_Date_in").unwrap_or(None),
             room_out: row.try_get("Cin_Room_Out").unwrap_or(None),
             cust_name: row.get::<&str, _>("Cin_cust_name").map(String::from),
             cust_no: row.get::<&str, _>("Cin_cust_no").map(String::from),
