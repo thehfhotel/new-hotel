@@ -1140,6 +1140,21 @@ async fn update_existing(
     p: &CanonicalCheckIn,
     agg_id: Uuid,
 ) -> Result<(), SyncError> {
+    // COALESCE argument order matters:
+    //   * `legacy_cin_no` (PK) and `aggregate_id` (write-once UUID) keep
+    //     `COALESCE(existing, new)` semantics — once set, never overwritten.
+    //   * `legacy_room_no`, `legacy_cust_no`, `legacy_checkin_ds_id` are
+    //     denormalised pointers that MUST track the current MSSQL state.
+    //     Pre-fix they used `COALESCE(existing, new)` which made them
+    //     write-once, so a room change (legacy_app inserts HT_Changed_Room
+    //     and rewrites HT_CheckIn_Ds.Cin_Room_No) updated the junction
+    //     `ht_checkin_rooms` correctly but left `ht_checkins.legacy_room_no`
+    //     pinned to the original room forever. `COALESCE(new, existing)`
+    //     restores write-through semantics. The transient `first_room_no=None`
+    //     scenario that the old COALESCE was guarding is already caught
+    //     upstream by the `resolve_room_id` defer at line ~332 — if no room
+    //     can be resolved, apply returns Ok(None) and never reaches this
+    //     UPDATE, so the guard here was load-bearing only on dead code.
     sqlx::query(
         "UPDATE ht_checkins \
             SET cin_cust_id            = $1, \
@@ -1152,9 +1167,9 @@ async fn update_existing(
                 cin_total_amount       = $8::float8, \
                 cin_paid_amount        = $9::float8, \
                 legacy_cin_no          = COALESCE(legacy_cin_no, $10), \
-                legacy_room_no         = COALESCE(legacy_room_no, $11), \
-                legacy_cust_no         = COALESCE(legacy_cust_no, $12), \
-                legacy_checkin_ds_id   = COALESCE(legacy_checkin_ds_id, $13), \
+                legacy_room_no         = COALESCE($11, legacy_room_no), \
+                legacy_cust_no         = COALESCE($12, legacy_cust_no), \
+                legacy_checkin_ds_id   = COALESCE($13, legacy_checkin_ds_id), \
                 aggregate_id           = COALESCE(aggregate_id, $14), \
                 updated_at             = NOW() \
           WHERE cin_id = $15",

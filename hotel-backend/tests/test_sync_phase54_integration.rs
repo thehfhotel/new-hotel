@@ -1175,3 +1175,95 @@ async fn apply_checkin_aggregate_preserves_thai_literals_in_junction() {
 
     cleanup(&pool, &cin_no, &cust_no, &room_no).await;
 }
+
+/// Bug A regression guard (production incident 2026-05-15, CH26-005540):
+/// when a receptionist moves a guest from room X to room Y, the legacy app
+/// inserts an `HT_Changed_Room` event AND rewrites `HT_CheckIn_Ds.Cin_Room_No`.
+/// The CT mapper sees the updated Ds row, recomputes `first_room_no=Y`,
+/// updates the junction `ht_checkin_rooms` correctly, but pre-fix it left
+/// `ht_checkins.legacy_room_no` pinned to X forever because `update_existing`
+/// used `COALESCE(legacy_room_no, $11)` write-once semantics. Reconcile then
+/// flagged value drift on this checkin every tick.
+///
+/// The fix flips the COALESCE order to `COALESCE($11, legacy_room_no)` so a
+/// non-NULL new value overwrites. This test simulates the room change and
+/// asserts the denormalised header tracks the new room.
+#[tokio::test]
+async fn checkin_room_change_updates_denormalised_legacy_room_no() {
+    let pool = common::create_test_pool().await;
+    let mssql = mssql_stub().await;
+    let cin_no = unique_cin_no();
+    let cust_no = unique_cust_no();
+    let room_a = unique_room_no();
+    // Ensure the two synthetic rooms differ; `unique_room_no` is random
+    // so retry until they don't collide.
+    let mut room_b = unique_room_no();
+    while room_b == room_a {
+        room_b = unique_room_no();
+    }
+
+    let _cust_pg_id = seed_customer(&pool, &cust_no).await;
+    let _room_a_id = seed_room(&pool, &room_a).await;
+    let _room_b_id = seed_room(&pool, &room_b).await;
+
+    // First apply: guest is in room A.
+    let agg_a = CheckInAggregate {
+        header: Some(header_row(&cin_no, &cust_no, "ปกติ")),
+        rooms: vec![ds_row(&cin_no, &room_a, "เข้าพัก")],
+        payments: vec![],
+    };
+    let mut tx = pool.begin().await.unwrap();
+    apply_checkin_aggregate(&mut tx, mssql.as_ref(), &agg_a, &cin_no)
+        .await
+        .expect("first apply");
+    tx.commit().await.unwrap();
+
+    let legacy_room_after_first: Option<String> = sqlx::query_scalar(
+        "SELECT legacy_room_no FROM ht_checkins WHERE legacy_cin_no = $1",
+    )
+    .bind(&cin_no)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        legacy_room_after_first.as_deref(),
+        Some(room_a.as_str()),
+        "first apply must denormalise the only room into ht_checkins.legacy_room_no"
+    );
+
+    // Second apply: receptionist moved the guest to room B. The legacy app
+    // rewrote HT_CheckIn_Ds.Cin_Room_No to room B (same `id`); the CT mapper
+    // re-runs apply_checkin_aggregate with the new Ds row shape.
+    let agg_b = CheckInAggregate {
+        header: Some(header_row(&cin_no, &cust_no, "ปกติ")),
+        rooms: vec![ds_row(&cin_no, &room_b, "เข้าพัก")],
+        payments: vec![],
+    };
+    let mut tx = pool.begin().await.unwrap();
+    apply_checkin_aggregate(&mut tx, mssql.as_ref(), &agg_b, &cin_no)
+        .await
+        .expect("second apply");
+    tx.commit().await.unwrap();
+
+    let legacy_room_after_change: Option<String> = sqlx::query_scalar(
+        "SELECT legacy_room_no FROM ht_checkins WHERE legacy_cin_no = $1",
+    )
+    .bind(&cin_no)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        legacy_room_after_change.as_deref(),
+        Some(room_b.as_str()),
+        "Bug A: post-room-change, ht_checkins.legacy_room_no MUST track the \
+         new room (was stuck on the first room under the pre-fix \
+         COALESCE(legacy_room_no, $11) semantics)"
+    );
+
+    cleanup(&pool, &cin_no, &cust_no, &room_a).await;
+    sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = $1")
+        .bind(&room_b)
+        .execute(&pool)
+        .await
+        .ok();
+}
