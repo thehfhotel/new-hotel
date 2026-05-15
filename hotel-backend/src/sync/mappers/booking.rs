@@ -537,6 +537,19 @@ async fn update_existing(
     p: &CanonicalProjection,
     agg_id: Uuid,
 ) -> Result<(), SyncError> {
+    // COALESCE argument order mirrors `sync::mappers::checkin::update_existing`:
+    //   * `legacy_book_id` (PK) and `aggregate_id` (write-once UUID) keep
+    //     `COALESCE(existing, new)` — set once, never overwritten.
+    //   * `legacy_cust_no` is a denormalised pointer that MUST track the
+    //     current MSSQL state. Pre-fix it used `COALESCE(existing, new)`,
+    //     freezing on first apply: if a receptionist changed the customer
+    //     associated with a booking (legacy `HT_Book_H.Book_Cust_ID`
+    //     rewrites in place), the canonical `book_cust_id` FK updated via
+    //     `$1` but the denormalised legacy_cust_no stayed pinned to the
+    //     original customer — same shape as the CH26-005540 room-change
+    //     incident on the checkin mapper (Bug A). `COALESCE($9, legacy_cust_no)`
+    //     restores write-through: a NULL `$9` (transient mid-edit) keeps
+    //     the existing value; a non-NULL `$9` overwrites.
     sqlx::query(
         "UPDATE ht_bookings \
             SET book_cust_id        = $1, \
@@ -547,7 +560,7 @@ async fn update_existing(
                 book_deposit_amount = $6::float8, \
                 book_notes          = COALESCE($7, book_notes), \
                 legacy_book_id      = COALESCE(legacy_book_id, $8), \
-                legacy_cust_no      = COALESCE(legacy_cust_no, $9), \
+                legacy_cust_no      = COALESCE($9, legacy_cust_no), \
                 aggregate_id        = COALESCE(aggregate_id, $10), \
                 updated_at          = NOW() \
           WHERE book_id = $11",

@@ -269,6 +269,21 @@ async fn apply_room_upsert(
             // `room_use_count` uses raw assignment (not COALESCE) so a
             // legacy 0 truly resets PG to 0; the running counter is
             // the legacy app's authoritative state.
+            // COALESCE argument order: see Bug A rationale in
+            // `sync::mappers::checkin::update_existing` and
+            // `sync::mappers::booking::update_existing`.
+            //   * `legacy_room_no` and `legacy_room_id_int` are denormalised
+            //     legacy pointers — must track the current MSSQL key. If
+            //     the legacy app renumbered a room (rare but possible
+            //     vendor maintenance), the pre-fix `COALESCE(existing, new)`
+            //     would freeze the canonical denormalised values forever
+            //     while the writeback path silently used the new legacy
+            //     key. Flipped to `COALESCE($N, existing)` so a non-NULL
+            //     new value overwrites; a transient NULL keeps the
+            //     existing value (the projection-builder upstream never
+            //     emits NULL for these unless the legacy column is
+            //     genuinely missing).
+            //   * `aggregate_id` stays write-once.
             sqlx::query(
                 "UPDATE ht_rooms_new \
                     SET room_clean         = COALESCE($1, room_clean), \
@@ -282,8 +297,8 @@ async fn apply_room_upsert(
                         room_power_close   = COALESCE($13, room_power_close), \
                         room_power_status  = COALESCE($14, room_power_status), \
                         room_polity        = COALESCE($15, room_polity), \
-                        legacy_room_no     = COALESCE(legacy_room_no, $4), \
-                        legacy_room_id_int = COALESCE(legacy_room_id_int, $5), \
+                        legacy_room_no     = COALESCE($4, legacy_room_no), \
+                        legacy_room_id_int = COALESCE($5, legacy_room_id_int), \
                         aggregate_id       = COALESCE(aggregate_id, $6), \
                         updated_at         = NOW() \
                   WHERE room_id = $7",
