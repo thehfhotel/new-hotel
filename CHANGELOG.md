@@ -7,6 +7,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.68.0](https://github.com/thehfhotel/new-hotel/compare/v2.67.0...v2.68.0) (2026-05-15)
+
+
+### Added
+
+* **ui:** add modern skin with token-based skin swap ([84e768b](https://github.com/thehfhotel/new-hotel/commit/84e768be041b0eb70401b51cc5a2f9475a103911))
+* **ui:** full-colour room tiles with type label below in modern skin ([7e917ba](https://github.com/thehfhotel/new-hotel/commit/7e917ba295c9bee5cc2f22d4d7674c081700b723))
+* **ui:** square status indicator on room tiles in modern skin ([5532cd8](https://github.com/thehfhotel/new-hotel/commit/5532cd89dbc103a3b272cc3f7a7f6763e9af1a18))
+
+
+### Fixed
+
+* **checkin:** write cin_checkin_time/cin_checkout_time in Asia/Bangkok ([949484b](https://github.com/thehfhotel/new-hotel/commit/949484b8a3f32dd9ee7c217e4b319468e384d1e5))
+* **sync:** make ht_reconcile_log auto-resolve self-heal projection changes ([284f12d](https://github.com/thehfhotel/new-hotel/commit/284f12dfc31be5ae8851897532d345eb6687c120))
+
 ## [2.67.0](https://github.com/thehfhotel/new-hotel/compare/v2.66.4...v2.67.0) (2026-05-14)
 
 
