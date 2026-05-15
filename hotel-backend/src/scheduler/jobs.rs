@@ -164,33 +164,67 @@ pub async fn init_scheduler(
     let checkout_site = site.id.clone();
     let booking_site = site.id.clone();
 
-    // Hourly report at minute 0 of every hour
-    let hourly_job = Job::new_async("0 0 * * * *", move |_uuid, _l| {
-        let pool = pool_hourly.clone();
-        let slack = slack_hourly.clone();
-        let site_id = hourly_site.clone();
-        Box::pin(async move {
-            if let Err(e) = send_hourly_report(&pool, &slack, &site_id).await {
-                tracing::error!(site = %site_id, "[Scheduler] Error in hourly report: {}", e);
-            }
-        })
-    })?;
-    scheduler.add(hourly_job).await?;
+    // Hourly report at minute 0 of every hour.
+    //
+    // Feature flag (2026-05-15): `HOURLY_REPORT_ENABLED=false` skips
+    // registration entirely so the cron never fires. Set during the
+    // CT-watcher backfill window (`backfill_legacy_checkins` +
+    // `backfill_legacy_bookings`) to suppress the hourly occupancy
+    // summary while we're churning canonical state and the numbers
+    // would mislead the receptionist channel. Default: enabled.
+    let hourly_enabled = std::env::var("HOURLY_REPORT_ENABLED")
+        .map(|v| v != "false")
+        .unwrap_or(true);
+    if hourly_enabled {
+        let hourly_job = Job::new_async("0 0 * * * *", move |_uuid, _l| {
+            let pool = pool_hourly.clone();
+            let slack = slack_hourly.clone();
+            let site_id = hourly_site.clone();
+            Box::pin(async move {
+                if let Err(e) = send_hourly_report(&pool, &slack, &site_id).await {
+                    tracing::error!(site = %site_id, "[Scheduler] Error in hourly report: {}", e);
+                }
+            })
+        })?;
+        scheduler.add(hourly_job).await?;
+    } else {
+        tracing::info!(
+            "[Scheduler] - Hourly report: DISABLED (HOURLY_REPORT_ENABLED=false)"
+        );
+    }
 
-    // Poll for check-ins every 2 minutes
-    let checkin_job = Job::new_async("0 */2 * * * *", move |_uuid, _l| {
-        let pool = pool_checkins.clone();
-        let slack = slack_checkins.clone();
-        let state = state_checkins.clone();
-        let site_id = checkin_site.clone();
-        let pg = pg_checkins.clone();
-        Box::pin(async move {
-            if let Err(e) = poll_checkins(&pool, pg.as_ref(), &slack, &state, &site_id).await {
-                tracing::error!(site = %site_id, "[Scheduler] Error polling check-ins: {}", e);
-            }
-        })
-    })?;
-    scheduler.add(checkin_job).await?;
+    // Poll for check-ins every 2 minutes.
+    //
+    // Feature flag (2026-05-15): `CHECKIN_NOTIFICATIONS_ENABLED=false`
+    // skips registration entirely so the new-checkin Slack alert
+    // doesn't fire. Set during the CT-watcher backfill window — the
+    // backfill binaries deliberately do not publish DomainEvents, but
+    // operators may still want a hard kill-switch on the poll-based
+    // alert path while batch-importing historical state. Default:
+    // enabled.
+    let checkin_notifications_enabled = std::env::var("CHECKIN_NOTIFICATIONS_ENABLED")
+        .map(|v| v != "false")
+        .unwrap_or(true);
+    if checkin_notifications_enabled {
+        let checkin_job = Job::new_async("0 */2 * * * *", move |_uuid, _l| {
+            let pool = pool_checkins.clone();
+            let slack = slack_checkins.clone();
+            let state = state_checkins.clone();
+            let site_id = checkin_site.clone();
+            let pg = pg_checkins.clone();
+            Box::pin(async move {
+                if let Err(e) = poll_checkins(&pool, pg.as_ref(), &slack, &state, &site_id).await
+                {
+                    tracing::error!(site = %site_id, "[Scheduler] Error polling check-ins: {}", e);
+                }
+            })
+        })?;
+        scheduler.add(checkin_job).await?;
+    } else {
+        tracing::info!(
+            "[Scheduler] - Check-in polling: DISABLED (CHECKIN_NOTIFICATIONS_ENABLED=false)"
+        );
+    }
 
     // Poll for checkouts every 2 minutes
     let checkout_job = Job::new_async("0 */2 * * * *", move |_uuid, _l| {
@@ -225,8 +259,12 @@ pub async fn init_scheduler(
     scheduler.start().await?;
 
     tracing::info!("[Scheduler] Cron jobs started");
-    tracing::info!("[Scheduler] - Hourly report: minute 0 of every hour");
-    tracing::info!("[Scheduler] - Check-in polling: every 2 minutes");
+    if hourly_enabled {
+        tracing::info!("[Scheduler] - Hourly report: minute 0 of every hour");
+    }
+    if checkin_notifications_enabled {
+        tracing::info!("[Scheduler] - Check-in polling: every 2 minutes");
+    }
     tracing::info!("[Scheduler] - Checkout polling: every 2 minutes");
     tracing::info!("[Scheduler] - Booking polling: every 2 minutes");
 
