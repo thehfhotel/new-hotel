@@ -97,7 +97,13 @@ export default function CalendarPage() {
           bookDate: b.checkIn, // Use checkIn as fallback for bookDate
           checkIn: b.checkIn,
           checkOut: b.checkOut,
-          status: b.status === 'confirmed' ? 'จอง' : b.status,
+          // Backend (2026-05-16) now ships only `confirmed` / `pending`
+          // bookings — both should render as the "incoming booking"
+          // (จอง) state on the calendar bar chart. Pre-fix the page
+          // narrowed to `confirmed`-only via the equality check, which
+          // dropped the 9 `pending` bookings (legacy catch-all status)
+          // from the upcoming-reservations view.
+          status: (b.status === 'confirmed' || b.status === 'pending') ? 'จอง' : b.status,
           customer: { name: b.customerName || '' },
           roomCount: 1,
           source: b.source,

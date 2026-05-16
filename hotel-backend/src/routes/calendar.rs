@@ -261,6 +261,21 @@ async fn fetch_new_calendar_data(
     end_date: &str,
 ) -> ApiResult<(Vec<CalendarBooking>, Vec<CalendarCheckin>)> {
     // Fetch bookings from HotelNew database (ht_bookings + ht_customers + ht_booking_rooms + ht_rooms_new)
+    //
+    // Calendar accuracy fix (2026-05-16): tightened the status filter
+    // from `!= 'cancelled'` to `IN ('confirmed', 'pending')`. Pre-fix:
+    //   * `'checked_in'` bookings (11k+ rows on HF Hotel) shipped to
+    //     the frontend even though their guest is already in
+    //     `ht_checkins`. The page-side name+date dedup paper-overed
+    //     most cases but was fragile — duplicate-name customers (e.g.
+    //     two "John Smith"s with overlapping booking windows) flipped
+    //     each other off the chart.
+    //   * `'completed'` bookings would never reach the chart because
+    //     they're historical (booking lifecycle ended), but the old
+    //     `!= 'cancelled'` filter kept them in the payload anyway.
+    // The "future booking" bar specifically wants UPCOMING reservations,
+    // which are exactly `confirmed` / `pending` status. The check-in
+    // bar covers the past via `ht_checkins`.
     let booking_query = format!(
         r#"
         SELECT
@@ -277,7 +292,7 @@ async fn fetch_new_calendar_data(
         LEFT JOIN ht_rooms_new r ON br.br_room_id = r.room_id
         WHERE b.book_checkout >= '{}'
           AND b.book_checkin <= '{}'
-          AND b.book_status != 'cancelled'
+          AND b.book_status IN ('confirmed', 'pending')
         ORDER BY b.book_checkin
         "#,
         start_date.replace('\'', "''"),
@@ -329,6 +344,12 @@ async fn fetch_new_calendar_data(
     //
     // The fallback path is dead code after B5 backfill; the column
     // drops then.
+    // Calendar accuracy fix (2026-05-16): exclude cancelled check-ins
+    // from the occupancy count. `derive_room_state` writes
+    // `cin_status='cancelled'` when the legacy header reads `'ยกเลิก'`
+    // (per `legacy_status_to_pg`). Pre-fix those rows were rendered as
+    // occupied days on the chart even though the room was never
+    // actually used.
     let checkin_query = format!(
         r#"
         SELECT
@@ -345,6 +366,7 @@ async fn fetch_new_calendar_data(
         INNER JOIN ht_rooms_new r ON r.room_id = COALESCE(cr.cr_room_id, ci.cin_room_id)
         WHERE COALESCE(ci.cin_checkout_time, ci.cin_expected_checkout) >= '{}'
           AND ci.cin_checkin_time <= '{}'
+          AND ci.cin_status != 'cancelled'
         ORDER BY ci.cin_checkin_time, r.room_no
         "#,
         start_date.replace('\'', "''"),
