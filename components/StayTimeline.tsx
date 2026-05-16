@@ -141,12 +141,17 @@ export default function StayTimeline({
     })
   }, [days, stays])
 
-  // Find max for scaling — max across all checkedIn and booked values
+  // Find max for scaling. Past and today use raw checkedIn / booked
+  // individually (single bar or side-by-side); future stacks
+  // checkedIn + booked, so its scaling needs the sum. Take the max of
+  // all three so the tallest bar across the visible range fits.
   const maxCount = useMemo(() => {
     let max = 1
     for (const d of dayData) {
       if (d.checkedIn > max) max = d.checkedIn
       if (d.booked > max) max = d.booked
+      const stacked = d.checkedIn + d.booked
+      if (stacked > max) max = stacked
     }
     return max
   }, [dayData])
@@ -243,8 +248,13 @@ export default function StayTimeline({
               const checkedInHeight = (d.checkedIn / maxCount) * barHeight
               const bookedHeight = (d.booked / maxCount) * barHeight
 
-              // Determine what to display
-              const displayCount = isPast ? d.checkedIn : isFuture ? d.booked : (d.checkedIn + d.booked)
+              // Total label below the bar. Past = check-ins only
+              // (data-driven: future bookings are reflected as
+              // check-ins once the guest arrives). Today + Future =
+              // combined occupancy (current stays spanning the day
+              // PLUS incoming bookings). The stacked-bar rendering
+              // for future days makes both contributions visible.
+              const displayCount = isPast ? d.checkedIn : (d.checkedIn + d.booked)
 
               return (
                 <div
@@ -253,11 +263,15 @@ export default function StayTimeline({
                   onMouseEnter={() => setHoveredDay(format(d.date, 'yyyy-MM-dd'))}
                   onMouseLeave={() => setHoveredDay(null)}
                 >
-                  {/* Tooltip */}
+                  {/* Tooltip — past shows check-ins only (the only
+                      data we have for past days); today + future show
+                      BOTH spanning check-ins and incoming bookings so
+                      the operator sees the full occupancy story for
+                      that day. */}
                   {isHovered && (
                     <div className="absolute -mt-16 bg-gray-800 text-white text-xs px-3 py-2 rounded shadow-lg whitespace-nowrap z-20">
                       <div className="font-medium mb-1">{format(d.date, 'd MMM yyyy')}</div>
-                      {(isPast || isDayToday) && d.checkedIn > 0 && (
+                      {d.checkedIn > 0 && (
                         <div className="flex items-center gap-2">
                           <span className="w-2 h-2 bg-sky-500 rounded-sm"></span>
                           <span>เข้าพัก: {d.checkedIn} ห้อง</span>
@@ -336,18 +350,42 @@ export default function StayTimeline({
                         )}
                       </div>
                     ) : (
-                      /* Future: single amber bar for booked */
+                      /* Future: stacked. Sky segment (bottom) for
+                         rooms still occupied by spanning check-ins
+                         that bleed into this future day; amber segment
+                         (top) for new bookings starting later. An
+                         operator planning capacity needs to see both
+                         contributions to the day's total occupancy —
+                         pre-stack-fix the chart hid the spanning
+                         check-ins on future days, undercounting peak
+                         days where a guest checked in for 5 nights.
+                         Audit 2026-05-16. */
                       <div className="w-full h-full flex flex-col justify-end">
-                        {d.booked > 0 ? (
-                          <div
-                            className="w-full bg-amber-400 flex items-center justify-center cursor-pointer hover:bg-amber-500 rounded-t"
-                            style={{ height: bookedHeight }}
-                            onClick={() => setSelectedSegment({ date: d.date, type: 'booking', stays: d.bookingStays })}
-                          >
-                            {viewMode === 'week' && bookedHeight > 16 && (
-                              <span className="text-white text-xs font-medium">{d.booked}</span>
+                        {(d.checkedIn > 0 || d.booked > 0) ? (
+                          <>
+                            {d.booked > 0 && (
+                              <div
+                                className={`w-full bg-amber-400 flex items-center justify-center cursor-pointer hover:bg-amber-500 ${d.checkedIn === 0 ? 'rounded-t' : 'rounded-t'}`}
+                                style={{ height: bookedHeight }}
+                                onClick={() => setSelectedSegment({ date: d.date, type: 'booking', stays: d.bookingStays })}
+                              >
+                                {viewMode === 'week' && bookedHeight > 16 && (
+                                  <span className="text-white text-xs font-medium">{d.booked}</span>
+                                )}
+                              </div>
                             )}
-                          </div>
+                            {d.checkedIn > 0 && (
+                              <div
+                                className={`w-full bg-sky-500 flex items-center justify-center cursor-pointer hover:bg-sky-600 ${d.booked === 0 ? 'rounded-t' : ''}`}
+                                style={{ height: checkedInHeight }}
+                                onClick={() => setSelectedSegment({ date: d.date, type: 'checkin', stays: d.checkinStays })}
+                              >
+                                {viewMode === 'week' && checkedInHeight > 16 && (
+                                  <span className="text-white text-xs font-medium">{d.checkedIn}</span>
+                                )}
+                              </div>
+                            )}
+                          </>
                         ) : (
                           <div className="w-full h-1 bg-gray-100"></div>
                         )}
