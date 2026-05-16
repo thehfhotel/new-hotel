@@ -1055,11 +1055,12 @@ async fn compute_current_pg_hash(
         "checkins" => {
             let canonical = fetch_canonical_checkin(pg_pool, legacy_pk).await?;
             Ok(canonical.map(|c| {
+                let effective_checkout = c.effective_checkout_date().map(|d| d.to_string());
                 checkin_canonical_hash(
                     legacy_pk,
                     c.legacy_room_no.as_deref(),
                     c.cin_checkin_time.map(|t| t.to_string()).as_deref(),
-                    c.cin_expected_checkout.map(|d| d.to_string()).as_deref(),
+                    effective_checkout.as_deref(),
                     c.legacy_cust_no.as_deref(),
                 )
             }))
@@ -2622,13 +2623,13 @@ async fn sync_checkins(
                 let canonical = fetch_canonical_checkin(pg_pool, &cin_no).await?;
                 let canonical_hash = canonical.as_ref().map(|c| {
                     let checkin_str = c.cin_checkin_time.map(|t| t.to_string());
-                    let expected_checkout_str =
-                        c.cin_expected_checkout.map(|d| d.to_string());
+                    let effective_checkout_str =
+                        c.effective_checkout_date().map(|d| d.to_string());
                     checkin_canonical_hash(
                         &cin_no,
                         c.legacy_room_no.as_deref(),
                         checkin_str.as_deref(),
-                        expected_checkout_str.as_deref(),
+                        effective_checkout_str.as_deref(),
                         c.legacy_cust_no.as_deref(),
                     )
                 });
@@ -2644,6 +2645,13 @@ async fn sync_checkins(
                     json!({
                         "legacy_room_no": c.legacy_room_no,
                         "cin_checkin_time": c.cin_checkin_time.map(|t| t.to_string()),
+                        // Bug D fix (2026-05-16) — surface BOTH the actual and
+                        // expected checkout dates for operator triage. Hash uses
+                        // `effective_checkout_date()` (actual if set, else
+                        // expected); JSON exposes both so the operator can see
+                        // which one matched / mismatched the legacy
+                        // `Cin_Room_Out` shown in mssql_row_json.
+                        "cin_checkout_time": c.cin_checkout_time.map(|t| t.to_string()),
                         "cin_expected_checkout": c.cin_expected_checkout.map(|d| d.to_string()),
                         "legacy_cust_no": c.legacy_cust_no,
                     })
@@ -2724,28 +2732,59 @@ fn sort_checkin_details(details: &mut [CheckinDetail]) {
 /// denormalised FIRST room (matches the CT mapper's `first_room_no`
 /// denormalisation in `derive_room_state`).
 ///
-/// **Why `cin_expected_checkout` and NOT `cin_checkout_time`:** canonical
-/// `cin_checkout_time` is the ACTUAL departure timestamp, only populated
-/// once `all_checked_out=true` in `derive_room_state`. For an active stay
-/// it is NULL. Legacy `Cin_Room_Out`, by contrast, is the BOOKED checkout
-/// — populated as soon as the room is reserved. Hashing those two against
-/// each other produced systematic false-positive value drift for every
-/// active stay with a future checkout (i.e. nearly every active checkin).
-/// `cin_expected_checkout` is the canonical projection of `Cin_Room_Out`
-/// (see `derive_stay_range`) — same semantic on both sides.
+/// **Checkout-date projection** is two-phase to mirror legacy
+/// `Cin_Room_Out`'s dual semantic:
+/// * Active stay: `cin_checkout_time IS NULL`, `cin_expected_checkout`
+///   = max(Cin_Room_Out among non-checked-out rooms) per
+///   `derive_stay_range`. Legacy `Cin_Room_Out` carries the booked
+///   future date.
+/// * Checked-out stay: `cin_checkout_time` = max(Cin_Room_Out across
+///   all rooms) per `derive_room_state` (the actual departure time).
+///   Legacy `Cin_Room_Out` is now the actual departure too — extended
+///   then completed stays land here.
+///
+/// Hashing on `cin_expected_checkout` ALONE (Bug B fix 2026-05-15)
+/// matches active stays but produces systematic false-positive value
+/// drift for the 3,382 completed-extended stays in the HF Hotel
+/// audit 2026-05-16: canonical's `cin_expected_checkout` froze at
+/// the original booked date while legacy's `Cin_Room_Out` advanced
+/// to the actual departure. Bug D fix: hash on
+/// `COALESCE(cin_checkout_time::date, cin_expected_checkout)` so
+/// the canonical side mirrors legacy's "best-known checkout date"
+/// for the stay regardless of status.
 struct CanonicalCheckinRow {
     legacy_room_no: Option<String>,
     cin_checkin_time: Option<NaiveDateTime>,
     cin_expected_checkout: Option<chrono::NaiveDate>,
+    cin_checkout_time: Option<NaiveDateTime>,
     legacy_cust_no: Option<String>,
+}
+
+impl CanonicalCheckinRow {
+    /// Effective checkout date used in the reconcile hash. Mirrors
+    /// MSSQL `Cin_Room_Out.date()`: prefers actual departure
+    /// (`cin_checkout_time`) when set, else falls back to expected
+    /// (`cin_expected_checkout`).
+    fn effective_checkout_date(&self) -> Option<chrono::NaiveDate> {
+        self.cin_checkout_time
+            .map(|dt| dt.date())
+            .or(self.cin_expected_checkout)
+    }
 }
 
 async fn fetch_canonical_checkin(
     pg_pool: &PgPool,
     legacy_cin_no: &str,
 ) -> Result<Option<CanonicalCheckinRow>, sqlx::Error> {
-    sqlx::query_as::<_, (Option<String>, Option<NaiveDateTime>, Option<chrono::NaiveDate>, Option<String>)>(
-        "SELECT legacy_room_no, cin_checkin_time, cin_expected_checkout, legacy_cust_no \
+    sqlx::query_as::<_, (
+        Option<String>,
+        Option<NaiveDateTime>,
+        Option<chrono::NaiveDate>,
+        Option<NaiveDateTime>,
+        Option<String>,
+    )>(
+        "SELECT legacy_room_no, cin_checkin_time, cin_expected_checkout, \
+                cin_checkout_time, legacy_cust_no \
            FROM ht_checkins \
           WHERE legacy_cin_no = $1 \
           LIMIT 1",
@@ -2754,11 +2793,14 @@ async fn fetch_canonical_checkin(
     .fetch_optional(pg_pool)
     .await
     .map(|opt| {
-        opt.map(|(room, checkin, expected_checkout, cust)| CanonicalCheckinRow {
-            legacy_room_no: room,
-            cin_checkin_time: checkin,
-            cin_expected_checkout: expected_checkout,
-            legacy_cust_no: cust,
+        opt.map(|(room, checkin, expected_checkout, actual_checkout, cust)| {
+            CanonicalCheckinRow {
+                legacy_room_no: room,
+                cin_checkin_time: checkin,
+                cin_expected_checkout: expected_checkout,
+                cin_checkout_time: actual_checkout,
+                legacy_cust_no: cust,
+            }
         })
     })
 }
@@ -3633,6 +3675,70 @@ mod tests {
             pre_fix_mssql_datetime, pre_fix_canonical_null_checkout,
             "pre-Bug-B inputs MUST diverge — this is the bug the fix addresses"
         );
+    }
+
+    /// Bug D fix (2026-05-16): `effective_checkout_date()` prefers
+    /// `cin_checkout_time::date()` over `cin_expected_checkout`. Pre-fix
+    /// the hash always used `cin_expected_checkout`, which froze at the
+    /// original booked date for completed-extended stays — 3,382
+    /// false-positive value-drift rows on HF Hotel as of audit
+    /// 2026-05-16 (e.g. CH26-005335 was booked checkout 2026-05-08 but
+    /// the guest actually departed 2026-05-10; reconcile flagged
+    /// canonical 2026-05-08 vs MSSQL 2026-05-10 forever).
+    #[test]
+    fn effective_checkout_prefers_actual_when_present() {
+        use chrono::NaiveDate;
+        let row = CanonicalCheckinRow {
+            legacy_room_no: Some("518".into()),
+            cin_checkin_time: None,
+            cin_expected_checkout: Some(NaiveDate::from_ymd_opt(2026, 5, 8).unwrap()),
+            cin_checkout_time: Some(
+                NaiveDate::from_ymd_opt(2026, 5, 10).unwrap().and_hms_opt(12, 8, 0).unwrap(),
+            ),
+            legacy_cust_no: None,
+        };
+        // Completed-extended stay: actual departure date wins over original
+        // booking. Matches the legacy `Cin_Room_Out` value the MSSQL side
+        // of the reconcile hashes.
+        assert_eq!(
+            row.effective_checkout_date(),
+            Some(NaiveDate::from_ymd_opt(2026, 5, 10).unwrap())
+        );
+    }
+
+    /// Active stay: `cin_checkout_time IS NULL`, fall back to
+    /// `cin_expected_checkout` so the hash matches legacy
+    /// `Cin_Room_Out` (which holds the booked-future date until
+    /// checkout).
+    #[test]
+    fn effective_checkout_falls_back_to_expected_when_not_yet_checked_out() {
+        use chrono::NaiveDate;
+        let row = CanonicalCheckinRow {
+            legacy_room_no: Some("404".into()),
+            cin_checkin_time: None,
+            cin_expected_checkout: Some(NaiveDate::from_ymd_opt(2026, 5, 18).unwrap()),
+            cin_checkout_time: None,
+            legacy_cust_no: None,
+        };
+        assert_eq!(
+            row.effective_checkout_date(),
+            Some(NaiveDate::from_ymd_opt(2026, 5, 18).unwrap())
+        );
+    }
+
+    /// Edge case: row exists but no checkout dates yet (transient
+    /// mid-edit state) — None passes through to the hash function's
+    /// "" sentinel.
+    #[test]
+    fn effective_checkout_returns_none_when_neither_set() {
+        let row = CanonicalCheckinRow {
+            legacy_room_no: None,
+            cin_checkin_time: None,
+            cin_expected_checkout: None,
+            cin_checkout_time: None,
+            legacy_cust_no: None,
+        };
+        assert_eq!(row.effective_checkout_date(), None);
     }
 
     // -------------------------------------------------------------------
