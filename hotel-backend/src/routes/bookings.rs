@@ -1,7 +1,8 @@
 //! Booking API routes
 //!
-//! - GET /api/bookings - List bookings (paginated). Reads from PG (`ht_bookings_legacy` cache, fed by drift-reconcile + CT mappers).
-//! - GET /api/bookings/:id - Get booking details. Reads from PG (`ht_bookings_legacy` cache, fed by drift-reconcile + CT mappers).
+//! - GET /api/bookings - List bookings (paginated). Reads canonical `ht_bookings` +
+//!   `ht_customers` + `ht_booking_rooms` (junction) + `ht_rooms_new` / `ht_room_types`.
+//! - GET /api/bookings/:id - Get booking details. Same canonical sources.
 //! - GET /api/bookings/:id/notes - Get booking notes - uses HotelNew DB
 //! - POST /api/bookings/:id/notes - Add booking note - uses HotelNew DB
 //! - DELETE /api/bookings/:id/notes - Delete booking note - uses HotelNew DB
@@ -22,9 +23,10 @@ use sqlx::Row;
 use crate::db::PgPool;
 use crate::error::{ApiError, ApiResult};
 use crate::models::{
-    get_status_code, map_status, Booking, BookingCustomer, BookingCustomerDetail, BookingDetail,
-    BookingDetailResponse, BookingRoom, BookingRoomDetail, BookingsResponse,
-    CreateNoteRequest, CreateNoteResponse, DeleteNoteResponse, Note, NotesResponse, Pagination,
+    get_canonical_status_from_thai, map_canonical_status_to_thai, Booking, BookingCustomer,
+    BookingCustomerDetail, BookingDetail, BookingDetailResponse, BookingRoom, BookingRoomDetail,
+    BookingsResponse, CreateNoteRequest, CreateNoteResponse, DeleteNoteResponse, Note,
+    NotesResponse, Pagination,
 };
 use crate::routes::mode::{AppState, Branch};
 
@@ -82,45 +84,62 @@ pub async fn list_bookings(
     }
 }
 
-/// List bookings from PostgreSQL `ht_bookings_legacy` table
+/// List bookings from canonical `ht_bookings` + `ht_customers` + the
+/// `ht_booking_rooms` junction.
+///
+/// Track J-style canonical rewrite (2026-05-16): the pre-rewrite path
+/// read from `ht_bookings_legacy` (a cache mirror) which the v2.63.0
+/// reconcile-mode demotion stopped populating with data columns — new
+/// bookings landed in cache as ack-only rows (`sync_hash` + `synced_at`
+/// only, all data columns NULL), so the dashboard rendered them as
+/// empty rows. Canonical is the authoritative source and is populated
+/// by the CT booking mapper for every event.
+///
+/// SQL-level pagination + sort + filter (the pre-rewrite path loaded
+/// every matching row into memory and sorted in Rust). The aux query
+/// `fetch_rooms_for_bookings` resolves the rooms array per book_id.
 async fn list_bookings_pg(
     pool: &PgPool,
     params: &BookingsQuery,
 ) -> ApiResult<Json<BookingsResponse>> {
-    // Build WHERE conditions with parameterized queries
+    // WHERE conditions — all parameterized to avoid injection.
     let mut conditions: Vec<String> = Vec::new();
     let mut bind_idx: usize = 0;
-    // We'll collect bind values and apply them later
-    // Since we're using dynamic SQL, track parameter indices
     let mut search_pattern: Option<String> = None;
-    let mut status_code: Option<i32> = None;
+    let mut canonical_status: Option<&'static str> = None;
     let mut start_date_val: Option<String> = None;
     let mut end_date_val: Option<String> = None;
 
     if let Some(ref search) = params.search {
         if !search.is_empty() {
             bind_idx += 1;
-            let search_idx = bind_idx;
+            let i = bind_idx;
+            // Match book_no OR the constructed customer full name.
+            // ILIKE is case-insensitive — matches the prior behavior of
+            // hitting `book_cust_name` (Thai text where case folding is
+            // a no-op but stays compatible with mixed-case Latin names).
             conditions.push(format!(
-                "(book_no LIKE ${} OR book_cust_name LIKE ${})",
-                search_idx, search_idx
+                "(b.book_no ILIKE ${i} OR \
+                  COALESCE(c.cust_firstname, '') || ' ' || COALESCE(c.cust_lastname, '') ILIKE ${i})"
             ));
             search_pattern = Some(format!("%{}%", search));
         }
     }
 
     if let Some(ref status) = params.status {
-        if let Some(code) = get_status_code(status) {
+        if let Some(canonical) = get_canonical_status_from_thai(status) {
             bind_idx += 1;
-            conditions.push(format!("book_status = ${}", bind_idx));
-            status_code = Some(code);
+            conditions.push(format!("b.book_status = ${}", bind_idx));
+            canonical_status = Some(canonical);
         }
     }
 
     if let Some(ref start_date) = params.start_date {
         if !start_date.is_empty() {
             bind_idx += 1;
-            conditions.push(format!("book_date_out::date >= ${}", bind_idx));
+            // Canonical `book_checkout` is a DATE column — direct
+            // comparison without casting.
+            conditions.push(format!("b.book_checkout >= ${}::date", bind_idx));
             start_date_val = Some(start_date.clone());
         }
     }
@@ -128,7 +147,7 @@ async fn list_bookings_pg(
     if let Some(ref end_date) = params.end_date {
         if !end_date.is_empty() {
             bind_idx += 1;
-            conditions.push(format!("book_date_in::date <= ${}", bind_idx));
+            conditions.push(format!("b.book_checkin <= ${}::date", bind_idx));
             end_date_val = Some(end_date.clone());
         }
     }
@@ -139,19 +158,38 @@ async fn list_bookings_pg(
         format!("WHERE {}", conditions.join(" AND "))
     };
 
-    // Count distinct bookings
+    // sort_by → fixed ORDER BY fragment. Whitelist style: arbitrary
+    // sort_by input never reaches the SQL — only the keys this match
+    // accepts can produce a column reference.
+    let order_clause = match params.sort_by.as_str() {
+        "bookNo" => "b.book_no",
+        "status" => "b.book_status",
+        "customer" => {
+            "LOWER(COALESCE(c.cust_firstname, '') || ' ' || COALESCE(c.cust_lastname, ''))"
+        }
+        "checkIn" => "b.book_checkin",
+        "checkOut" => "b.book_checkout",
+        "roomCount" => "room_count",
+        _ => "b.book_date", // default
+    };
+    let order_direction = if params.sort_order.to_lowercase() == "asc" { "ASC" } else { "DESC" };
+
+    // Count — distinct book_ids (canonical has 1 row per book_no so
+    // the DISTINCT is conservative — works whether we LEFT JOIN
+    // junction rows in the future or not).
     let count_query = format!(
-        "SELECT COUNT(DISTINCT book_no)::int as total FROM ht_bookings_legacy {}",
-        where_clause
+        "SELECT COUNT(*)::int AS total \
+         FROM ht_bookings b \
+         LEFT JOIN ht_customers c ON c.cust_id = b.book_cust_id \
+         {where_clause}"
     );
 
-    // Build count query with binds
     let mut count_q = sqlx::query(&count_query);
     if let Some(ref pat) = search_pattern {
         count_q = count_q.bind(pat);
     }
-    if let Some(code) = status_code {
-        count_q = count_q.bind(code);
+    if let Some(canon) = canonical_status {
+        count_q = count_q.bind(canon);
     }
     if let Some(ref sd) = start_date_val {
         count_q = count_q.bind(sd);
@@ -166,30 +204,39 @@ async fn list_bookings_pg(
         .map(|r| r.try_get::<i32, _>("total").unwrap_or(0))
         .unwrap_or(0);
 
-    // Get all data (group and paginate in Rust like the Node.js version)
+    // Data — paginated at the SQL level. `room_count` subquery is a
+    // correlated count against the junction; with LIMIT 20 the overhead
+    // is ~20 trivial index lookups per page.
+    let offset = ((params.page - 1) * params.limit).max(0);
     let data_query = format!(
         r#"
         SELECT
-            book_no,
-            book_date,
-            book_date_in,
-            book_date_out,
-            book_cust_name,
-            book_status,
-            book_room_type
-        FROM ht_bookings_legacy
-        {}
-        ORDER BY book_date DESC
+            b.book_id,
+            b.book_no,
+            b.book_date,
+            b.book_checkin                                              AS book_checkin,
+            b.book_checkout                                             AS book_checkout,
+            b.book_status                                               AS book_status_canonical,
+            NULLIF(TRIM(BOTH ' ' FROM
+                COALESCE(c.cust_firstname, '') || ' ' || COALESCE(c.cust_lastname, '')
+            ), '')                                                      AS cust_full_name,
+            (SELECT COUNT(*) FROM ht_booking_rooms br WHERE br.br_book_id = b.book_id)::int
+                                                                        AS room_count
+        FROM ht_bookings b
+        LEFT JOIN ht_customers c ON c.cust_id = b.book_cust_id
+        {where_clause}
+        ORDER BY {order_clause} {order_direction} NULLS LAST, b.book_id {order_direction}
+        OFFSET {offset} LIMIT {limit}
         "#,
-        where_clause
+        limit = params.limit
     );
 
     let mut data_q = sqlx::query(&data_query);
     if let Some(ref pat) = search_pattern {
         data_q = data_q.bind(pat);
     }
-    if let Some(code) = status_code {
-        data_q = data_q.bind(code);
+    if let Some(canon) = canonical_status {
+        data_q = data_q.bind(canon);
     }
     if let Some(ref sd) = start_date_val {
         data_q = data_q.bind(sd);
@@ -200,74 +247,91 @@ async fn list_bookings_pg(
 
     let rows = data_q.fetch_all(pool).await?;
 
-    // Group records by book_no
-    let mut grouped: HashMap<String, Booking> = HashMap::new();
+    let mut bookings: Vec<Booking> = Vec::with_capacity(rows.len());
+    let mut book_ids_for_rooms: Vec<i32> = Vec::with_capacity(rows.len());
+    let mut book_no_by_id: HashMap<i32, String> = HashMap::with_capacity(rows.len());
 
     for row in &rows {
+        let book_id: i32 = row.try_get("book_id").unwrap_or(0);
         let book_no: String = row.try_get("book_no").unwrap_or_default();
+        let book_date: Option<NaiveDateTime> = row.try_get("book_date").ok();
+        let check_in_date: Option<chrono::NaiveDate> = row.try_get("book_checkin").ok();
+        let check_out_date: Option<chrono::NaiveDate> = row.try_get("book_checkout").ok();
+        let status_canonical: Option<String> = row.try_get("book_status_canonical").ok();
+        let cust_full_name: String = row.try_get("cust_full_name").unwrap_or_default();
+        let room_count: i32 = row.try_get("room_count").unwrap_or(0);
 
-        let entry = grouped.entry(book_no.clone()).or_insert_with(|| {
-            let book_date: Option<NaiveDateTime> = row.try_get("book_date").ok();
-            let check_in: Option<NaiveDateTime> = row.try_get("book_date_in").ok();
-            let check_out: Option<NaiveDateTime> = row.try_get("book_date_out").ok();
-            let cust_name: String = row.try_get("book_cust_name").unwrap_or_default();
-            let status: Option<i32> = row.try_get("book_status").ok();
-
-            Booking {
-                book_no: book_no.clone(),
-                book_date: book_date.map(|dt| dt.and_utc()),
-                check_in: check_in.map(|dt| dt.and_utc()),
-                check_out: check_out.map(|dt| dt.and_utc()),
-                customer: BookingCustomer {
-                    name: cust_name,
-                },
-                status: map_status(status),
-                rooms: Vec::new(),
-                room_count: 0,
-            }
+        bookings.push(Booking {
+            book_no: book_no.clone(),
+            book_date: book_date.map(|dt| dt.and_utc()),
+            check_in: check_in_date.map(|d| d.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc()),
+            check_out: check_out_date.map(|d| d.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc()),
+            customer: BookingCustomer { name: cust_full_name },
+            status: map_canonical_status_to_thai(status_canonical.as_deref()),
+            rooms: Vec::new(),
+            room_count: room_count as usize,
         });
-
-        let room_type: String = row
-            .try_get("book_room_type")
-            .unwrap_or_else(|_| "-".to_string());
-
-        entry.rooms.push(BookingRoom {
-            room_no: "-".to_string(),
-            room_type,
-        });
-        entry.room_count = entry.rooms.len();
+        book_ids_for_rooms.push(book_id);
+        book_no_by_id.insert(book_id, book_no);
     }
 
-    let mut all_grouped: Vec<Booking> = grouped.into_values().collect();
-
-    // Sort by requested field
-    let sort_asc = params.sort_order.to_lowercase() == "asc";
-    all_grouped.sort_by(|a, b| {
-        let cmp = match params.sort_by.as_str() {
-            "bookNo" => a.book_no.cmp(&b.book_no),
-            "status" => a.status.cmp(&b.status),
-            "customer" => a.customer.name.to_lowercase().cmp(&b.customer.name.to_lowercase()),
-            "checkIn" => a.check_in.cmp(&b.check_in),
-            "checkOut" => a.check_out.cmp(&b.check_out),
-            "roomCount" => a.room_count.cmp(&b.room_count),
-            _ => a.book_date.cmp(&b.book_date), // bookDate default
-        };
-        if sort_asc { cmp } else { cmp.reverse() }
-    });
-
-    // Paginate
-    let start_idx = ((params.page - 1) * params.limit) as usize;
-    let paginated_data: Vec<Booking> = all_grouped
-        .into_iter()
-        .skip(start_idx)
-        .take(params.limit as usize)
-        .collect();
+    // Aux query — populate rooms[] for the page.
+    if !book_ids_for_rooms.is_empty() {
+        let mut rooms_by_book_no =
+            fetch_rooms_for_bookings(pool, &book_ids_for_rooms, &book_no_by_id).await?;
+        for b in bookings.iter_mut() {
+            if let Some(rs) = rooms_by_book_no.remove(&b.book_no) {
+                b.rooms = rs;
+            }
+        }
+    }
 
     Ok(Json(BookingsResponse {
         success: true,
-        data: paginated_data,
+        data: bookings,
         pagination: Pagination::new(params.page, params.limit, total),
     }))
+}
+
+/// Aux query for [`list_bookings_pg`]: fetch the `ht_booking_rooms`
+/// rows for a page's `book_id` set in one round-trip. Returns
+/// `book_no → Vec<BookingRoom>` so the caller doesn't have to keep the
+/// book_id mapping around. Bookings with no junction rows simply don't
+/// appear in the map (caller leaves `rooms` empty).
+async fn fetch_rooms_for_bookings(
+    pool: &PgPool,
+    book_ids: &[i32],
+    book_no_by_id: &HashMap<i32, String>,
+) -> ApiResult<HashMap<String, Vec<BookingRoom>>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT br.br_book_id, r.legacy_room_no AS room_no, COALESCE(rt.type_name, '-') AS room_type
+          FROM ht_booking_rooms br
+          JOIN ht_rooms_new r ON r.room_id = br.br_room_id
+          LEFT JOIN ht_room_types rt ON rt.type_id = br.br_room_type_id
+         WHERE br.br_book_id = ANY($1)
+         ORDER BY br.br_book_id, r.legacy_room_no
+        "#,
+    )
+    .bind(book_ids)
+    .fetch_all(pool)
+    .await?;
+
+    let mut out: HashMap<String, Vec<BookingRoom>> = HashMap::new();
+    for row in &rows {
+        let book_id: i32 = row.try_get("br_book_id").unwrap_or(0);
+        let room_no: String = row.try_get::<Option<String>, _>("room_no")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "-".to_string());
+        let room_type: String = row.try_get("room_type").unwrap_or_else(|_| "-".to_string());
+        if let Some(book_no) = book_no_by_id.get(&book_id) {
+            out.entry(book_no.clone())
+                .or_default()
+                .push(BookingRoom { room_no, room_type });
+        }
+    }
+    Ok(out)
 }
 
 /// GET /api/bookings/:id - Get booking details
@@ -319,52 +383,96 @@ pub async fn get_booking(
     }))
 }
 
-/// Get booking details from PostgreSQL mirror tables
+/// Get booking details from canonical `ht_bookings` + JOINs.
+/// Canonical rewrite — see `list_bookings_pg` for the rationale.
+///
+/// `status_code` in the response is a legacy-INT artefact kept for
+/// frontend compatibility. We map canonical English back to the legacy
+/// 1/2/3/4 the frontend may key off of, so existing UI logic keeps
+/// working.
 async fn get_booking_pg(
     pool: &crate::db::PgPool,
     book_no: &str,
 ) -> ApiResult<BookingDetail> {
-    let rows = sqlx::query(
+    let header = sqlx::query(
         r#"
-        SELECT book_no, book_date, book_date_in, book_date_out,
-               book_cust_name, book_status, book_room_type,
-               COALESCE(book_total, 0)::float8 AS book_total
-        FROM ht_bookings_legacy
-        WHERE book_no = $1
-        ORDER BY book_room_type
+        SELECT
+            b.book_id,
+            b.book_no,
+            b.book_date,
+            b.book_checkin,
+            b.book_checkout,
+            b.book_status                                                AS book_status_canonical,
+            COALESCE(b.book_total_amount, 0)::float8                    AS book_total_amount,
+            NULLIF(TRIM(BOTH ' ' FROM
+                COALESCE(c.cust_firstname, '') || ' ' || COALESCE(c.cust_lastname, '')
+            ), '')                                                       AS cust_full_name
+        FROM ht_bookings b
+        LEFT JOIN ht_customers c ON c.cust_id = b.book_cust_id
+        WHERE b.book_no = $1 OR b.legacy_book_id = $1
+        LIMIT 1
         "#,
     )
     .bind(book_no)
+    .fetch_optional(pool)
+    .await?;
+
+    let header = header.ok_or_else(|| ApiError::NotFound("Booking not found".to_string()))?;
+
+    let book_id: i32 = header.try_get("book_id").unwrap_or(0);
+    let book_no_canonical: String = header.try_get("book_no").unwrap_or_default();
+    let book_date: Option<NaiveDateTime> = header.try_get("book_date").ok();
+    let check_in_date: Option<chrono::NaiveDate> = header.try_get("book_checkin").ok();
+    let check_out_date: Option<chrono::NaiveDate> = header.try_get("book_checkout").ok();
+    let status_canonical: Option<String> = header.try_get("book_status_canonical").ok();
+    let total_amount: f64 = header.try_get("book_total_amount").unwrap_or(0.0);
+    let cust_full_name: String = header.try_get("cust_full_name").unwrap_or_default();
+
+    let room_rows = sqlx::query(
+        r#"
+        SELECT r.legacy_room_no                          AS room_no,
+               COALESCE(rt.type_name, '-')               AS room_type,
+               COALESCE(br.br_price_per_night, 0)::float8 AS price_per_night
+          FROM ht_booking_rooms br
+          JOIN ht_rooms_new r ON r.room_id = br.br_room_id
+          LEFT JOIN ht_room_types rt ON rt.type_id = br.br_room_type_id
+         WHERE br.br_book_id = $1
+         ORDER BY r.legacy_room_no
+        "#,
+    )
+    .bind(book_id)
     .fetch_all(pool)
     .await?;
 
-    if rows.is_empty() {
-        return Err(ApiError::NotFound("Booking not found".to_string()));
-    }
-
-    let first = &rows[0];
-
-    let rooms: Vec<BookingRoomDetail> = rows
+    let rooms: Vec<BookingRoomDetail> = room_rows
         .iter()
         .map(|r| BookingRoomDetail {
-            room_no: "-".to_string(),
-            room_type: r.try_get::<String, _>("book_room_type").unwrap_or_else(|_| "-".to_string()),
-            total: r.try_get::<f64, _>("book_total").unwrap_or(0.0),
+            room_no: r.try_get::<Option<String>, _>("room_no").ok().flatten()
+                .unwrap_or_else(|| "-".to_string()),
+            room_type: r.try_get::<String, _>("room_type").unwrap_or_else(|_| "-".to_string()),
+            total: r.try_get::<f64, _>("price_per_night").unwrap_or(0.0),
         })
         .collect();
 
-    let status_code = first.try_get::<i32, _>("book_status").ok();
-    let total_amount: f64 = rooms.iter().map(|r| r.total).sum();
+    // Frontend keys some logic off the legacy INT status code. Map
+    // canonical English → legacy INT to preserve compatibility.
+    let status_code: Option<i32> = match status_canonical.as_deref() {
+        Some("confirmed") => Some(1),
+        Some("checked_in") => Some(2),
+        Some("completed") => Some(3),
+        Some("cancelled") => Some(4),
+        _ => None,
+    };
 
     Ok(BookingDetail {
-        book_no: first.try_get::<String, _>("book_no").unwrap_or_default(),
-        book_date: first.try_get::<NaiveDateTime, _>("book_date").ok().map(|dt| dt.and_utc()),
-        check_in: first.try_get::<NaiveDateTime, _>("book_date_in").ok().map(|dt| dt.and_utc()),
-        check_out: first.try_get::<NaiveDateTime, _>("book_date_out").ok().map(|dt| dt.and_utc()),
-        status: map_status(status_code),
+        book_no: book_no_canonical,
+        book_date: book_date.map(|dt| dt.and_utc()),
+        check_in: check_in_date.map(|d| d.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc()),
+        check_out: check_out_date.map(|d| d.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc()),
+        status: map_canonical_status_to_thai(status_canonical.as_deref()),
         status_code,
         customer: BookingCustomerDetail {
-            full_name: first.try_get::<String, _>("book_cust_name").unwrap_or_default(),
+            full_name: cust_full_name,
         },
         room_count: rooms.len(),
         rooms,
