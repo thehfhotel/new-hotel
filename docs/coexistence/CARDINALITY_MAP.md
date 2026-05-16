@@ -85,6 +85,7 @@ them).
 | `event_log` | Event sourcing log |
 | `ht_reconcile_log` | Reconcile-job divergence findings |
 | `ht_rr4_exports` | Track G8 / T4 CRIT-2 — audit trail for every RR.4 / ตม.30 Thai immigration foreign-guest export (one row per attempt with site, range, format, row count, exporter, SHA-256 of emitted bytes for regulator non-repudiation). PG-only; no legacy counterpart (`FrmReportRR4` in iHOTEL kept no equivalent log) |
+| `ht_level_drift_alert_cooldowns` | Per-(site, table) last-alerted-at for the level-triggered reconcile-drift digest (migration 053, 2026-05-16). Replaces the process-local `Mutex<HashMap>` that was wiped on every backend restart, producing duplicate Slack alerts. PG-only — same purpose as `scheduler_notification_state` but for the drift digest instead of the per-event poller. |
 
 ## Open questions for the audits to resolve
 
