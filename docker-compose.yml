@@ -178,6 +178,12 @@ services:
       # Either way, `/api/auth/{login,logout,me}` and `/api/health`
       # remain public — that's how the frontend bootstraps.
       - AUTH_ENABLED=${AUTH_ENABLED:-false}
+      # Tracing log level. Default `hotel_backend=info,tower_http=info`
+      # matches `main.rs::tracing_subscriber::EnvFilter::try_from_default_env`'s
+      # fallback. Override at deploy time to crank up debug logging
+      # (e.g. `hotel_backend::scheduler::sync=debug`) for diagnostic
+      # windows. Set via GH variable `RUST_LOG`.
+      - RUST_LOG=${RUST_LOG:-hotel_backend=info,tower_http=info}
     secrets:
       - db_password
       - postgres_password

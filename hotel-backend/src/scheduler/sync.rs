@@ -44,9 +44,8 @@
 use chrono::NaiveDateTime;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::env;
-use std::sync::Mutex;
 use std::time::Instant;
 
 use tiberius::Query;
@@ -340,48 +339,103 @@ async fn check_drift_and_alert(
     slack.send_message(&msg).await;
 }
 
-/// Track D / T7 HIGH-1 — per-(site, table) cooldown for the
-/// level-triggered drift digest. Keyed by `"{site_id}::{table_name}"`
-/// so HF Hotel and HF Ville don't share state. Held as a process-global
-/// Mutex because reconcile is serial per process and one watcher per
-/// container — contention is zero in practice.
-fn level_alert_cooldowns() -> &'static Mutex<HashMap<String, Instant>> {
-    static COOLDOWNS: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> =
-        std::sync::OnceLock::new();
-    COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 /// Track D / T7 HIGH-1 — pure decision function for the level-triggered
-/// cooldown gate. Returns true iff the given table on the given site is
-/// eligible to alert (cooldown elapsed or never alerted). On true, the
-/// caller MUST call `mark_level_alert_sent` to start the next cooldown.
+/// cooldown gate. Returns true iff the cooldown has elapsed (or there
+/// is no prior alert record).
 ///
-/// Pulled into a free function with explicit args so the unit test can
-/// inject a `now` instead of relying on `Instant::now()`.
-fn level_alert_eligible(
-    state: &mut HashMap<String, Instant>,
-    site_id: &str,
-    table: &str,
-    now: Instant,
+/// **Persistence (2026-05-16):** the cooldown state was migrated from
+/// a process-local `Mutex<HashMap>` to the PG table
+/// `ht_level_drift_alert_cooldowns` (migration 053). The in-memory
+/// version was wiped on every backend restart — typical 2-5x/day during
+/// active deploy cycles — and the next reconcile tick re-fired the
+/// `:warning:` alert despite the documented 24h cooldown. The Slack
+/// channel got the same alert repeatedly for the same unchanged
+/// backlog. Production incident 2026-05-16.
+///
+/// This function stays pure (no PG dependency) so the unit tests can
+/// inject `now` and `last_alerted_at` directly. The PG layer is in
+/// `level_alert_eligible_pg` / `mark_level_alert_sent_pg`.
+fn cooldown_elapsed(
+    last_alerted_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
     cooldown: std::time::Duration,
 ) -> bool {
-    let key = format!("{site_id}::{table}");
-    match state.get(&key) {
-        Some(last_sent) => now.duration_since(*last_sent) >= cooldown,
+    match last_alerted_at {
         None => true,
+        // `signed_duration_since.to_std()` errors when `now < last` — a
+        // clock-skew edge case. Treat as "eligible to alert" so we
+        // don't get stuck refusing forever on a clock anomaly.
+        Some(t) => now
+            .signed_duration_since(t)
+            .to_std()
+            .map_or(true, |elapsed| elapsed >= cooldown),
     }
 }
 
-/// Record the time of the most recent level-triggered alert for
-/// `(site_id, table)`. Pairs with [`level_alert_eligible`].
-fn mark_level_alert_sent(
-    state: &mut HashMap<String, Instant>,
+/// PG-backed eligibility check. Reads `last_alerted_at` for
+/// `(site_id, table_name)` from `ht_level_drift_alert_cooldowns`,
+/// applies the [`cooldown_elapsed`] decision. Returns `true` on PG
+/// error so a transient DB blip doesn't silence a legitimate alert.
+async fn level_alert_eligible_pg(
+    pg_pool: &PgPool,
     site_id: &str,
-    table: &str,
-    now: Instant,
+    table_name: &str,
+    cooldown: std::time::Duration,
+) -> bool {
+    let last = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+        "SELECT last_alerted_at FROM ht_level_drift_alert_cooldowns \
+          WHERE site_id = $1 AND table_name = $2",
+    )
+    .bind(site_id)
+    .bind(table_name)
+    .fetch_optional(pg_pool)
+    .await;
+
+    match last {
+        Ok(opt) => cooldown_elapsed(opt, chrono::Utc::now(), cooldown),
+        Err(e) => {
+            tracing::warn!(
+                site = %site_id,
+                table = %table_name,
+                error = %e,
+                "[Sync] Failed to read level-drift cooldown row — \
+                 defaulting to eligible to avoid silencing real alerts"
+            );
+            true
+        }
+    }
+}
+
+/// PG-backed cooldown mark. UPSERTs `(site_id, table_name) → NOW()`
+/// in `ht_level_drift_alert_cooldowns`. Best-effort: a PG failure logs
+/// a warning but doesn't block the alert from going out — the worst
+/// case is one extra refire in 15 minutes.
+async fn mark_level_alert_sent_pg(
+    pg_pool: &PgPool,
+    site_id: &str,
+    table_name: &str,
 ) {
-    let key = format!("{site_id}::{table}");
-    state.insert(key, now);
+    let result = sqlx::query(
+        "INSERT INTO ht_level_drift_alert_cooldowns \
+            (site_id, table_name, last_alerted_at) \
+         VALUES ($1, $2, NOW()) \
+         ON CONFLICT (site_id, table_name) \
+         DO UPDATE SET last_alerted_at = EXCLUDED.last_alerted_at",
+    )
+    .bind(site_id)
+    .bind(table_name)
+    .execute(pg_pool)
+    .await;
+
+    if let Err(e) = result {
+        tracing::warn!(
+            site = %site_id,
+            table = %table_name,
+            error = %e,
+            "[Sync] Failed to persist level-drift cooldown — \
+             next tick may refire the alert"
+        );
+    }
 }
 
 /// Track D / T7 HIGH-1 — level-triggered drift digest. Complements the
@@ -437,25 +491,18 @@ async fn check_level_drift_and_alert(
     }
 
     let cooldown = std::time::Duration::from_secs((LEVEL_DRIFT_COOLDOWN_HOURS * 3600) as u64);
-    let now = Instant::now();
     let mut to_alert: Vec<(String, i64)> = Vec::new();
-    {
-        let mut state = match level_alert_cooldowns().lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        for (table, count) in &counts {
-            if level_alert_eligible(&mut state, site_id, table, now, cooldown) {
-                to_alert.push((table.clone(), *count));
-                mark_level_alert_sent(&mut state, site_id, table, now);
-            } else {
-                tracing::debug!(
-                    site = %site_id,
-                    table,
-                    count,
-                    "[Sync] Level drift alert suppressed by cooldown"
-                );
-            }
+    for (table, count) in &counts {
+        if level_alert_eligible_pg(pg_pool, site_id, table, cooldown).await {
+            to_alert.push((table.clone(), *count));
+            mark_level_alert_sent_pg(pg_pool, site_id, table).await;
+        } else {
+            tracing::debug!(
+                site = %site_id,
+                table,
+                count,
+                "[Sync] Level drift alert suppressed by cooldown"
+            );
         }
     }
 
@@ -3830,49 +3877,42 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
-    fn level_alert_eligible_returns_true_for_fresh_table() {
-        let mut state: HashMap<String, Instant> = HashMap::new();
-        let now = Instant::now();
+    fn cooldown_elapsed_returns_true_when_no_prior_alert() {
+        let now = chrono::Utc::now();
         let cooldown = std::time::Duration::from_secs(86_400);
-        assert!(level_alert_eligible(
-            &mut state,
-            "hfhotel",
-            "checkins",
-            now,
-            cooldown
-        ));
+        assert!(cooldown_elapsed(None, now, cooldown));
     }
 
     #[test]
-    fn level_alert_eligible_returns_false_inside_cooldown_window() {
-        let mut state: HashMap<String, Instant> = HashMap::new();
-        let now = Instant::now();
+    fn cooldown_elapsed_returns_false_inside_window() {
+        let now = chrono::Utc::now();
         let cooldown = std::time::Duration::from_secs(86_400);
-        mark_level_alert_sent(&mut state, "hfhotel", "checkins", now);
-        // Same instant → cooldown not yet elapsed.
-        assert!(!level_alert_eligible(
-            &mut state,
-            "hfhotel",
-            "checkins",
-            now,
-            cooldown
-        ));
+        // Just fired → 0 seconds elapsed → not eligible.
+        assert!(!cooldown_elapsed(Some(now), now, cooldown));
     }
 
     #[test]
-    fn level_alert_eligible_does_not_leak_across_sites() {
-        let mut state: HashMap<String, Instant> = HashMap::new();
-        let now = Instant::now();
+    fn cooldown_elapsed_returns_true_after_window() {
+        let now = chrono::Utc::now();
+        let cooldown = std::time::Duration::from_secs(86_400); // 24h
+        // Fired 25 hours ago — window elapsed.
+        let last = now - chrono::Duration::hours(25);
+        assert!(cooldown_elapsed(Some(last), now, cooldown));
+    }
+
+    /// Edge case: clock-skew anomaly where `last_alerted_at` is
+    /// somehow in the future relative to `now`. The `to_std()` cast
+    /// errors; we treat it as eligible so we don't get stuck refusing
+    /// alerts forever on a clock anomaly. Per-site/per-table
+    /// uniqueness is enforced by the PG primary key, so the
+    /// in-memory key-construction tests from the pre-2026-05-16
+    /// implementation are no longer needed.
+    #[test]
+    fn cooldown_elapsed_handles_future_last_alerted_via_clock_skew() {
+        let now = chrono::Utc::now();
         let cooldown = std::time::Duration::from_secs(86_400);
-        mark_level_alert_sent(&mut state, "hfhotel", "checkins", now);
-        // HF Hotel cooldown active — HF Ville must still be eligible.
-        assert!(level_alert_eligible(
-            &mut state,
-            "hfville",
-            "checkins",
-            now,
-            cooldown
-        ));
+        let future = now + chrono::Duration::hours(1);
+        assert!(cooldown_elapsed(Some(future), now, cooldown));
     }
 
     // -------------------------------------------------------------------
@@ -3926,19 +3966,4 @@ mod tests {
         assert_eq!(parse_booking_legacy_pk("B12345"), ("B12345", ""));
     }
 
-    #[test]
-    fn level_alert_eligible_does_not_leak_across_tables() {
-        let mut state: HashMap<String, Instant> = HashMap::new();
-        let now = Instant::now();
-        let cooldown = std::time::Duration::from_secs(86_400);
-        mark_level_alert_sent(&mut state, "hfhotel", "checkins", now);
-        // Different table on same site → still eligible.
-        assert!(level_alert_eligible(
-            &mut state,
-            "hfhotel",
-            "customers",
-            now,
-            cooldown
-        ));
-    }
 }

@@ -1973,6 +1973,37 @@ INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('052', '052_create_ht_pos_sales.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
+-- Migration 053: persistent cooldown for the level-triggered reconcile-drift
+-- digest. Replaces the process-local Mutex<HashMap> in scheduler::sync that
+-- was zeroed on every backend restart (refire incident 2026-05-16).
+CREATE TABLE IF NOT EXISTS ht_level_drift_alert_cooldowns (
+    site_id          TEXT        NOT NULL,
+    table_name       TEXT        NOT NULL,
+    last_alerted_at  TIMESTAMPTZ NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (site_id, table_name)
+);
+
+CREATE OR REPLACE FUNCTION ht_level_drift_alert_cooldowns_touch_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_ht_level_drift_alert_cooldowns_touch_updated_at
+    ON ht_level_drift_alert_cooldowns;
+
+CREATE TRIGGER trg_ht_level_drift_alert_cooldowns_touch_updated_at
+    BEFORE UPDATE ON ht_level_drift_alert_cooldowns
+    FOR EACH ROW
+    EXECUTE FUNCTION ht_level_drift_alert_cooldowns_touch_updated_at();
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('053', '053_level_drift_alert_cooldowns.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
 -- =============================================================================
 -- Initialization complete
 -- =============================================================================

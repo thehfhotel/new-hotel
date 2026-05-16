@@ -854,6 +854,12 @@ jobs:
           # during a CT-watcher backfill window to silence the cron noise.
           HOURLY_REPORT_ENABLED:         ${{ vars.HOURLY_REPORT_ENABLED || 'true' }}
           CHECKIN_NOTIFICATIONS_ENABLED: ${{ vars.CHECKIN_NOTIFICATIONS_ENABLED || 'true' }}
+          # Tracing log level (2026-05-16). Default falls back to the
+          # info-level filter compiled into `main.rs`. Override with
+          # `gh variable set RUST_LOG -b "hotel_backend::scheduler::sync=debug,hotel_backend=info"`
+          # for diagnostic windows. Remember to revert after the window
+          # closes — debug-level reconcile logs are noisy.
+          RUST_LOG:                      ${{ vars.RUST_LOG || 'hotel_backend=info,tower_http=info' }}
         # Build a JSON payload the way /srv/run-deploy.sh expects:
         #   { commit_sha, deploy_payload_b64 (tar.gz), env: {...},
         #     secrets: {...} }
@@ -909,6 +915,7 @@ jobs:
             --arg AUTH_ENABLED        "$AUTH_ENABLED" \
             --arg HOURLY_REPORT_ENABLED         "${HOURLY_REPORT_ENABLED:-true}" \
             --arg CHECKIN_NOTIFICATIONS_ENABLED "${CHECKIN_NOTIFICATIONS_ENABLED:-true}" \
+            --arg RUST_LOG                      "${RUST_LOG:-hotel_backend=info,tower_http=info}" \
             '{
               commit_sha: $commit_sha,
               deploy_payload_b64: $deploy_payload_b64,
@@ -928,6 +935,7 @@ jobs:
                 AUTH_ENABLED:                 $AUTH_ENABLED,
                 HOURLY_REPORT_ENABLED:        $HOURLY_REPORT_ENABLED,
                 CHECKIN_NOTIFICATIONS_ENABLED: $CHECKIN_NOTIFICATIONS_ENABLED,
+                RUST_LOG:                     $RUST_LOG,
               },
               secrets: {
                 db_password:        $DB_PASSWORD,
