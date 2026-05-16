@@ -1080,6 +1080,20 @@ async fn compute_current_pg_hash(
 /// compare like-for-like under the current projection. The whole point
 /// of re-fetching MSSQL — rather than trusting `ht_reconcile_log.mssql_hash`
 /// — is that a projection change invalidates every pre-fix stored hash.
+///
+/// **Checkins (2026-05-16):** uses the CT mapper's `project_aggregate`
+/// directly — loads the full MSSQL aggregate via `load_checkin_aggregate`
+/// then projects through `crate::sync::mappers::project_checkin_aggregate`,
+/// producing a `CanonicalCheckIn` whose hash inputs are identical to what
+/// the mapper would write into PG. By construction, the resulting hash is
+/// what canonical SHOULD be, so a mismatch with the actual canonical row
+/// can only signal real exogenous drift (CT miss, hand-edited PG), not
+/// parallel-projection-pipeline divergence. Bug B / C / D class becomes
+/// impossible at this layer.
+///
+/// Customers + bookings still use their light-weight per-PK projections
+/// (`fetch_legacy_customer_hash`, `fetch_legacy_booking_hash`) — the
+/// same unification is a follow-on for those entities.
 async fn compute_current_legacy_hash(
     legacy_pool: &DbPool,
     table_name: &str,
@@ -1091,9 +1105,49 @@ async fn compute_current_legacy_hash(
             let (book_no, room_type_key) = parse_booking_legacy_pk(legacy_pk);
             fetch_legacy_booking_hash(legacy_pool, book_no, room_type_key).await
         }
-        "checkins" => fetch_legacy_checkin_hash(legacy_pool, legacy_pk).await,
+        "checkins" => compute_legacy_checkin_hash_via_mapper(legacy_pool, legacy_pk).await,
         _ => Ok(None),
     }
+}
+
+/// Unified-projection MSSQL hash for a single check-in PK. Loads the
+/// full legacy aggregate (header + Ds + Pay) and runs it through the
+/// CT mapper's `project_aggregate`, then hashes from the resulting
+/// `CanonicalCheckIn` using the same `effective_checkout_date` rule
+/// the canonical-side projection uses (see
+/// `CanonicalCheckinRow::effective_checkout_date`).
+///
+/// Cost: 3 MSSQL queries per call (header / Ds / Pay), versus 1 for
+/// the old `fetch_legacy_checkin_hash`. The sweep is bounded to 500
+/// rows per 15-min tick, so the steady-state load is ~1.7 MSSQL
+/// queries/sec — well below saturation on the same-LAN legacy DB.
+/// The architectural correctness payoff (no parallel projection
+/// pipeline) outweighs the per-call cost.
+async fn compute_legacy_checkin_hash_via_mapper(
+    legacy_pool: &DbPool,
+    cin_no: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let aggregate =
+        crate::sync::parent_loader::load_checkin_aggregate(legacy_pool, cin_no).await?;
+    if !aggregate.is_present() {
+        return Ok(None);
+    }
+    let canonical = crate::sync::mappers::project_checkin_aggregate(&aggregate, cin_no)?;
+    // Effective checkout: prefer actual departure when set (Bug D
+    // alignment with canonical-side `effective_checkout_date()`).
+    let effective_checkout = canonical
+        .cin_checkout_time
+        .map(|dt| dt.date())
+        .unwrap_or(canonical.cin_expected_checkout)
+        .to_string();
+    let hash = checkin_canonical_hash(
+        &canonical.legacy_cin_no,
+        canonical.legacy_room_no.as_deref(),
+        Some(canonical.cin_checkin_time.to_string()).as_deref(),
+        Some(effective_checkout).as_deref(),
+        canonical.legacy_cust_no.as_deref(),
+    );
+    Ok(Some(hash))
 }
 
 /// Single-PK MSSQL re-projection for customers. Mirrors `sync_customers`'
@@ -1182,57 +1236,6 @@ async fn fetch_legacy_booking_hash(
         book_checkin_date.as_deref(),
         book_checkout_date.as_deref(),
         book_cust_id_owned.as_deref(),
-    )))
-}
-
-/// Single-PK MSSQL re-projection for check-ins. `View_CheckIn_Ds` returns
-/// 41-45 rows per `Cin_no`; same aggregation contract as `sync_checkins`.
-/// `Ok(None)` when the check-in no longer exists on the legacy side.
-async fn fetch_legacy_checkin_hash(
-    legacy_pool: &DbPool,
-    cin_no: &str,
-) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut conn = legacy_pool.get().await?;
-    let sql = format!(
-        "SELECT {projection} FROM View_CheckIn_Ds WHERE Cin_no = @P1",
-        projection = CHECKINS_RECONCILE_PROJECTION.join(", "),
-    );
-    let mut q = Query::new(sql);
-    q.bind(cin_no);
-    let rows = q.query(&mut conn).await?.into_first_result().await?;
-    if rows.is_empty() {
-        return Ok(None);
-    }
-
-    let mut details: Vec<CheckinDetail> = Vec::with_capacity(rows.len());
-    for row in &rows {
-        details.push(CheckinDetail {
-            room_no: row.get::<&str, _>("Cin_Room_No").map(String::from),
-            // Bug C fix (2026-05-15): read header `Cin_Date_in` (the
-            // value canonical mirrors via `derive_stay_range`), not
-            // detail `Cin_Room_In` (when guest physically entered THIS
-            // room). The struct field name `room_in` is preserved for
-            // call-site minimality; renaming is a separate cleanup.
-            room_in: row.try_get("Cin_Date_in").unwrap_or(None),
-            room_out: row.try_get("Cin_Room_Out").unwrap_or(None),
-            cust_name: row.get::<&str, _>("Cin_cust_name").map(String::from),
-            cust_no: row.get::<&str, _>("Cin_cust_no").map(String::from),
-            status: row.get::<&str, _>("Cin_status").map(String::from),
-        });
-    }
-    sort_checkin_details(&mut details);
-    let representative = details.first();
-    let checkin_time_str = representative.and_then(|d| d.room_in.map(|t| t.to_string()));
-    // Drop the time component to align with canonical `cin_expected_checkout`
-    // (a `DATE`, not a `TIMESTAMP`). See `CanonicalCheckinRow` doc comment
-    // for the field-semantic rationale.
-    let room_out_date_str = representative.and_then(|d| d.room_out.map(|t| t.date().to_string()));
-    Ok(Some(checkin_canonical_hash(
-        cin_no,
-        representative.and_then(|d| d.room_no.as_deref()),
-        checkin_time_str.as_deref(),
-        room_out_date_str.as_deref(),
-        representative.and_then(|d| d.cust_no.as_deref()),
     )))
 }
 

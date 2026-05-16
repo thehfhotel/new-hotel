@@ -46,6 +46,7 @@ pub use checkin::{
     apply_checkin_aggregate, resolve_customer_via_eager_mirror_for_test, CheckInHeaderMapper,
     CheckInRoomsMapper,
 };
+pub(crate) use checkin::{project_aggregate as project_checkin_aggregate, CanonicalCheckIn};
 pub use coupon::apply_canonical_cupon_event;
 pub use customer::CustomerMapper;
 pub use guest_registry::GuestRegistryMapper;

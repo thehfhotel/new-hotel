@@ -187,21 +187,31 @@ struct ExistingCheckIn {
 
 /// Canonical PG-shape projection of the legacy aggregate. This is what
 /// we UPSERT.
+///
+/// Exposed to `crate::scheduler::sync` (via `pub(crate)`) so the
+/// reconcile auto-resolve sweep can call the SAME projection function
+/// the mapper uses for canonical writes — eliminating the parallel
+/// projection pipeline that was the root cause of Bug B / C / D
+/// (2026-05-15..16). The sweep no longer maintains its own
+/// "MSSQL → hash inputs" projection; it loads the aggregate and runs
+/// `project_aggregate` exactly once. Mismatch with the canonical row
+/// can then only signal real exogenous drift (CT miss, hand-edited
+/// PG), not parallel-projection-pipeline divergence.
 #[derive(Debug, Clone, PartialEq)]
-struct CanonicalCheckIn {
-    legacy_cin_no: String,
-    legacy_book_id: Option<String>,
-    legacy_cust_no: Option<String>,
-    legacy_room_no: Option<String>,
+pub(crate) struct CanonicalCheckIn {
+    pub(crate) legacy_cin_no: String,
+    pub(crate) legacy_book_id: Option<String>,
+    pub(crate) legacy_cust_no: Option<String>,
+    pub(crate) legacy_room_no: Option<String>,
     /// Legacy literal verbatim (per user constraint) translated to our
     /// PG enum literal (`'active'`/`'checkedout'`/`'cancelled'`). The
     /// translation sits in [`legacy_status_to_pg`].
-    cin_status: String,
-    cin_checkin_time: NaiveDateTime,
+    pub(crate) cin_status: String,
+    pub(crate) cin_checkin_time: NaiveDateTime,
     /// Set on checkout (the moment the last room flips to `'Check-Out'`).
     /// `None` for active stays.
-    cin_checkout_time: Option<NaiveDateTime>,
-    cin_expected_checkout: NaiveDate,
+    pub(crate) cin_checkout_time: Option<NaiveDateTime>,
+    pub(crate) cin_expected_checkout: NaiveDate,
     total_amount: Option<f64>,
     paid_amount: Option<f64>,
     /// `HT_CheckIn_Ds.id` for the first room — kept so the writeback
@@ -759,7 +769,12 @@ fn read_cell(row: &tiberius::Row, col: &str) -> Option<MockValue> {
 // Projection helpers
 // -----------------------------------------------------------------------------
 
-fn project_aggregate(
+/// Project a legacy aggregate into its canonical PG shape.
+///
+/// Exposed `pub(crate)` so the reconcile auto-resolve sweep can call
+/// the SAME projection function the mapper uses for canonical writes.
+/// See [`CanonicalCheckIn`] doc for the architectural rationale.
+pub(crate) fn project_aggregate(
     agg: &CheckInAggregate,
     cin_no: &str,
 ) -> Result<CanonicalCheckIn, SyncError> {
