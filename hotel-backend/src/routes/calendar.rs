@@ -136,19 +136,32 @@ pub async fn get_calendar(
 
     if fetch_hfville {
         if let Ok(vp) = state.ville_pool() {
-            let (ville_bookings, ville_checkins) = fetch_legacy_calendar_data_pg(
+            // HF Ville canonical (`hotelville` PG database — see
+            // `canonical_pg_split` memory) has the same schema as
+            // `hotelnew`. The pre-rewrite path called
+            // `fetch_legacy_calendar_data_pg` against Ville's pool,
+            // which read `ht_bookings_legacy` + `ht_checkins_legacy`.
+            // Ville's cache is missing ~16% of bookings and ~13% of
+            // check-ins that exist in canonical (audit 2026-05-16), so
+            // the calendar silently rendered an incomplete view for
+            // operators. Use the canonical fetcher instead — same
+            // shape, complete data.
+            let (ville_bookings, ville_checkins) = fetch_new_calendar_data(
                 vp,
                 &params.start_date,
                 &params.end_date,
             ).await?;
 
-            // Remap IDs to avoid collisions with HF Hotel
+            // Remap IDs to avoid collisions with HF Hotel. The
+            // canonical fetcher emits `new-booking-<id>` /
+            // `new-checkin-<id>-<room>`; rewrite the `new-` prefix to
+            // `ville-` so the frontend's per-site dedup still works.
             let ville_bookings: Vec<CalendarBooking> = ville_bookings.into_iter().map(|mut b| {
-                b.id = b.id.replace("legacy-booking-", "ville-booking-");
+                b.id = b.id.replace("new-booking-", "ville-booking-");
                 b
             }).collect();
             let ville_checkins: Vec<CalendarCheckin> = ville_checkins.into_iter().map(|mut c| {
-                c.id = c.id.replace("legacy-checkin-", "ville-checkin-");
+                c.id = c.id.replace("new-checkin-", "ville-checkin-");
                 c
             }).collect();
 
