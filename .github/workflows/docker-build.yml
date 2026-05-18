@@ -863,7 +863,7 @@ jobs:
           # divergence). Override per-deploy via the GH variable when
           # quiet-mode is needed (e.g. major version cutovers); unset
           # restores the debug-pinned default.
-          RUST_LOG:                      ${{ vars.RUST_LOG || 'hotel_backend::scheduler::sync=debug,hotel_backend::scheduler::jobs=debug,hotel_backend=info,tower_http=info' }}
+          RUST_LOG:                      ${{ vars.RUST_LOG || 'hotel_backend::scheduler::sync=debug,hotel_backend::scheduler::jobs=debug,hotel_backend=info,writeback=info,sync=info,tower_http=info' }}
         # Build a JSON payload the way /srv/run-deploy.sh expects:
         #   { commit_sha, deploy_payload_b64 (tar.gz), env: {...},
         #     secrets: {...} }
@@ -925,7 +925,7 @@ jobs:
             --arg AUTH_ENABLED        "$AUTH_ENABLED" \
             --arg HOURLY_REPORT_ENABLED         "${HOURLY_REPORT_ENABLED:-true}" \
             --arg CHECKIN_NOTIFICATIONS_ENABLED "${CHECKIN_NOTIFICATIONS_ENABLED:-true}" \
-            --arg RUST_LOG                      "${RUST_LOG:-hotel_backend::scheduler::sync=debug,hotel_backend::scheduler::jobs=debug,hotel_backend=info,tower_http=info}" \
+            --arg RUST_LOG                      "${RUST_LOG:-hotel_backend::scheduler::sync=debug,hotel_backend::scheduler::jobs=debug,hotel_backend=info,writeback=info,sync=info,tower_http=info}" \
             '{
               commit_sha: $commit_sha,
               deploy_payload_b64: $deploy_payload_b64,
