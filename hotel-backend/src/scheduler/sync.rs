@@ -1236,6 +1236,29 @@ pub fn classify_divergence(
 /// multi-room folio collapsed by the CT mapper) is distinguishable
 /// from value drift, and the ack-cache (`ht_*_legacy.sync_hash`)
 /// silencing rule can refuse to silence non-`value` kinds.
+/// Insert a fresh `ht_reconcile_log` row UNLESS an unresolved row
+/// already exists for the same `(table_name, legacy_pk, divergence_kind,
+/// mssql_hash)` tuple. This dedupe prevents unbounded log growth for
+/// kinds that re-fire every tick (most notably `cardinality`, which by
+/// design never silences via the cache-ack path — see
+/// `DivergenceKind::is_silenceable`).
+///
+/// **Why mssql_hash is part of the dedupe key:** for `value` drift, a
+/// new MSSQL UPDATE produces a new `mssql_hash`, so a fresh row IS
+/// recorded (new state worth investigating) — that's the intended
+/// semantic. For `cardinality`, the MSSQL hash is stable across ticks
+/// while the asymmetry persists, so only one unresolved row per PK
+/// accumulates. For `missing_pg`, the canonical-missing predicate
+/// produces a stable mssql_hash (the actual legacy hash for the PK),
+/// same dedupe behavior.
+///
+/// 2026-05-18 incident driver: after PR #128 restored sync_checkins,
+/// HF Hotel was inserting ~766 cardinality rows per 15-min tick (one
+/// per multi-room folio in `HT_CheckIn_Ds`), projecting `ht_reconcile_log`
+/// past 100k unresolved rows within 18-24 hours and degrading the
+/// partial-index `idx_ht_reconcile_log_table_unresolved` query plan.
+/// Cardinality is real drift but it doesn't get materially more drifted
+/// with every re-detection — one row per (PK, hash) is enough.
 #[allow(clippy::too_many_arguments)]
 async fn record_divergence(
     pg_pool: &PgPool,
@@ -1249,12 +1272,25 @@ async fn record_divergence(
     legacy_row_count: i32,
     pg_row_count: i32,
 ) {
+    // Conditional INSERT: skip when an unresolved row with the same
+    // (table_name, legacy_pk, divergence_kind, mssql_hash) already
+    // exists. NULL-safe comparison via IS NOT DISTINCT FROM so
+    // missing_pg rows (mssql_hash = legacy hash) and missing_mssql
+    // (mssql_hash NULL) both dedupe correctly.
     let result = sqlx::query(
         "INSERT INTO ht_reconcile_log \
             (table_name, legacy_pk, pg_hash, mssql_hash, \
              mssql_row_json, pg_row_json, \
              divergence_kind, legacy_row_count, pg_row_count) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9 \
+         WHERE NOT EXISTS ( \
+             SELECT 1 FROM ht_reconcile_log \
+              WHERE table_name = $1 \
+                AND legacy_pk = $2 \
+                AND divergence_kind = $7 \
+                AND mssql_hash IS NOT DISTINCT FROM $4 \
+                AND resolved_at IS NULL \
+         )",
     )
     .bind(table_name)
     .bind(legacy_pk)
