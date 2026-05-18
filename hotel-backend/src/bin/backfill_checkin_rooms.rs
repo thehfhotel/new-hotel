@@ -34,7 +34,20 @@
 //! DATABASE_URL=postgres://… DB_SERVER=… DB_USER=sa DB_PASSWORD=… DB_NAME=db \
 //!   SITE_ID=hfhotel \
 //!   cargo run --release --bin backfill_checkin_rooms
+//!
+//! # One-shot historical backfill — include already-checked-out folios.
+//! # Used 2026-05-18 to drain the residual cardinality-drift PKs that
+//! # checked out before Track B5's junction-write path landed.
+//! cargo run --release --bin backfill_checkin_rooms -- --include-inactive
 //! ```
+//!
+//! ## Flags
+//!
+//! * `--dry-run`          — load aggregates but don't write to PG.
+//! * `--include-inactive` — drop the active-folio filter. Scans every
+//!                          non-cancelled `HT_CheckIn_H` header,
+//!                          including already-checked-out folios. Use
+//!                          for one-shot historical backfills only.
 //!
 //! See `docs/coexistence/RUNBOOK-b5-backfill.md` for the full
 //! receptionist-coordinated apply procedure.
@@ -77,6 +90,12 @@ const MSSQL_POOL_MAX: u32 = 8;
 /// `sync::mappers::checkin` inversely.
 const CIN_STATUS_ACTIVE: &str = "ปกติ";
 
+/// `HT_CheckIn_H.Cin_status` literal for a cancelled folio. Mirrors the
+/// private const in `sync::mappers::checkin`. Used only by the
+/// `--include-inactive` path to exclude folios that `apply_cancelled`
+/// would just delete anyway.
+const CIN_STATUS_CANCELLED: &str = "ยกเลิก";
+
 /// `HT_CheckIn_Ds.Cin_Room_Status` literal for a room that has
 /// already checked out. Per-room — an active folio can carry a mix of
 /// `'เข้าพัก'` (still occupying) and `'Check-Out'` (departed) rows.
@@ -100,20 +119,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .init();
 
     let dry_run = env::args().any(|a| a == "--dry-run");
+    let include_inactive = env::args().any(|a| a == "--include-inactive");
     let site = SiteConfig::from_env();
     let concurrency = parse_concurrency();
 
     tracing::info!(
         site = %site.id,
         dry_run,
+        include_inactive,
         concurrency,
-        "Track B5 backfill — starting one-shot sweep over active legacy folios"
+        "Track B5 backfill — starting one-shot sweep over legacy folios"
     );
 
     let pg = connect_pg().await?;
     let mssql = connect_legacy().await?;
 
-    let cin_nos = fetch_active_cin_nos(&mssql).await?;
+    let cin_nos = fetch_candidate_cin_nos(&mssql, include_inactive).await?;
     tracing::info!(
         site = %site.id,
         active_folios = cin_nos.len(),
@@ -216,26 +237,54 @@ async fn backfill_one_folio(
 /// are excluded — backfilling them adds rows the receptionist never
 /// sees (no in-flight stay) and the dashboard read-path correctly
 /// ignores them anyway.
-async fn fetch_active_cin_nos(
+/// Fetch candidate Cin_no values from legacy `HT_CheckIn_H`.
+///
+/// Default (`include_inactive=false`): the original active-folio filter
+/// — status = active AND at least one room not yet checked-out. This is
+/// what the receptionist sees in iHOTEL as "in-flight stays".
+///
+/// `include_inactive=true`: drop both predicates and return EVERY
+/// non-cancelled header. Used for one-shot historical backfills of
+/// already-checked-out folios that flagged as `divergence_kind=cardinality`
+/// because no per-room CT events were emitted before Track B's
+/// junction-write path landed. 2026-05-18 incident remediation —
+/// without this flag the residual 4 PKs (CH26-005340/5350/5377/5430)
+/// stay flagged forever. Cancellation status is still excluded because
+/// `apply_cancelled` would just delete the canonical row anyway.
+async fn fetch_candidate_cin_nos(
     mssql: &DbPool,
+    include_inactive: bool,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
     let mut conn = mssql.get().await?;
-    let sql = format!(
-        r#"
-        SELECT DISTINCT h.Cin_no
-          FROM HT_CheckIn_H h
-         WHERE h.Cin_status = N'{active}'
-           AND EXISTS (
-               SELECT 1
-                 FROM HT_CheckIn_Ds d
-                WHERE d.Cin_No = h.Cin_no
-                  AND d.Cin_Room_Status <> N'{checked_out}'
-           )
-         ORDER BY h.Cin_no
-        "#,
-        active = CIN_STATUS_ACTIVE,
-        checked_out = CIN_ROOM_STATUS_CHECKED_OUT,
-    );
+    let sql = if include_inactive {
+        format!(
+            r#"
+            SELECT DISTINCT h.Cin_no
+              FROM HT_CheckIn_H h
+             WHERE h.Cin_status <> N'{cancelled}'
+               AND EXISTS (SELECT 1 FROM HT_CheckIn_Ds d WHERE d.Cin_No = h.Cin_no)
+             ORDER BY h.Cin_no
+            "#,
+            cancelled = CIN_STATUS_CANCELLED,
+        )
+    } else {
+        format!(
+            r#"
+            SELECT DISTINCT h.Cin_no
+              FROM HT_CheckIn_H h
+             WHERE h.Cin_status = N'{active}'
+               AND EXISTS (
+                   SELECT 1
+                     FROM HT_CheckIn_Ds d
+                    WHERE d.Cin_No = h.Cin_no
+                      AND d.Cin_Room_Status <> N'{checked_out}'
+               )
+             ORDER BY h.Cin_no
+            "#,
+            active = CIN_STATUS_ACTIVE,
+            checked_out = CIN_ROOM_STATUS_CHECKED_OUT,
+        )
+    };
 
     let rows = conn.simple_query(&sql).await?.into_first_result().await?;
 
