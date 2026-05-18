@@ -287,6 +287,19 @@ pub fn tables_breaching_threshold(
 ///
 /// Uses `idx_ht_reconcile_log_table_unresolved` (migration 019) for
 /// the partial-index group-by.
+///
+/// **Cardinality excluded** (2026-05-18, post-incident #128): the
+/// `cardinality` divergence kind is unack-able by design (see
+/// `DivergenceKind::Cardinality` docstring + Track D / T7 CRIT-1) and
+/// re-fires from `sync_checkins` every 15-min tick for every multi-room
+/// folio that still exists in legacy MSSQL. On HF Hotel that's currently
+/// ~766 unique PKs producing ~3000 inserts/hour, drowning any genuine
+/// silenceable-drift signal under fixed-volume noise. Cardinality is
+/// already covered by `check_level_drift_and_alert` (4h window, 24h
+/// per-table cooldown — won't spam), so dropping it from the hourly
+/// edge-trigger loses no observability. The hourly alert is now scoped
+/// to kinds where re-detection actually means something changed:
+/// `value`, `missing_pg`, `missing_mssql`.
 async fn check_drift_and_alert(
     pg_pool: &PgPool,
     slack: Option<&SlackClient>,
@@ -299,6 +312,7 @@ async fn check_drift_and_alert(
            FROM ht_reconcile_log \
           WHERE resolved_at IS NULL \
             AND divergence_kind IS NOT NULL \
+            AND divergence_kind <> 'cardinality' \
             AND detected_at > now() - interval '1 hour' \
           GROUP BY table_name",
     )
