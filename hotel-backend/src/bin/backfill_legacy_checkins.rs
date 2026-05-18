@@ -49,11 +49,16 @@
 //!
 //! ## Flags
 //!
-//! * `--dry-run`     — load aggregates but don't write to PG. Reports
-//!                     what would be applied.
-//! * `--limit=N`     — process at most N distinct PKs. Default: all.
-//! * `--site-id=ID`  — informational tag in log output. Defaults to
-//!                     `SITE_ID` env var or `"hfhotel"`.
+//! * `--dry-run`       — load aggregates but don't write to PG. Reports
+//!                       what would be applied.
+//! * `--limit=N`       — process at most N distinct PKs. Default: all.
+//! * `--site-id=ID`    — informational tag in log output. Defaults to
+//!                       `SITE_ID` env var or `"hfhotel"`.
+//! * `--include-value` — also drain `divergence_kind = 'value'` rows
+//!                       (CT-watcher missed-UPDATE remediation). Default
+//!                       off: only `missing_pg`. The same idempotent
+//!                       `apply_checkin_aggregate` UPSERT path
+//!                       re-projects canonical from current MSSQL state.
 //!
 //! ## Failure handling
 //!
@@ -88,6 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .init();
 
     let dry_run = env::args().any(|a| a == "--dry-run");
+    let include_value = env::args().any(|a| a == "--include-value");
     let limit: i64 = env::args()
         .find_map(|a| a.strip_prefix("--limit=").map(|n| n.parse::<i64>().ok()).flatten())
         .unwrap_or(i64::MAX);
@@ -96,12 +102,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .or_else(|| env::var("SITE_ID").ok())
         .unwrap_or_else(|| "hfhotel".to_string());
 
-    tracing::info!(site = %site_id, dry_run, limit, "backfill_legacy_checkins — starting");
+    tracing::info!(
+        site = %site_id, dry_run, include_value, limit,
+        "backfill_legacy_checkins — starting"
+    );
 
     let pg = connect_pg().await?;
     let mssql = connect_legacy().await?;
 
-    let pks = fetch_missing_pks(&pg, limit).await?;
+    let pks = fetch_candidate_pks(&pg, limit, include_value).await?;
     tracing::info!(site = %site_id, candidate_pks = pks.len(), "fetched candidate PKs");
 
     let start = Instant::now();
@@ -251,19 +260,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
-async fn fetch_missing_pks(pg: &PgPool, limit: i64) -> Result<Vec<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, String>(
+/// Read distinct PKs from `ht_reconcile_log` for the bin to backfill.
+///
+/// Default: only `missing_pg` (the original missing-canonical-row drain).
+/// With `include_value=true`: also includes `value` drift — for cases
+/// where the CT watcher missed an UPDATE and canonical PG holds stale
+/// state. The same `apply_checkin_aggregate` path is idempotent: it
+/// UPSERTs based on existing canonical state, so re-applying for a value
+/// drift updates canonical to match MSSQL. Used 2026-05-18 to drain 24
+/// stuck value drifts from the CT-silent-drop incident (see PR #128).
+async fn fetch_candidate_pks(
+    pg: &PgPool,
+    limit: i64,
+    include_value: bool,
+) -> Result<Vec<String>, sqlx::Error> {
+    let kind_filter = if include_value {
+        "AND divergence_kind IN ('missing_pg', 'value')"
+    } else {
+        "AND divergence_kind = 'missing_pg'"
+    };
+    let sql = format!(
         "SELECT DISTINCT legacy_pk \
            FROM ht_reconcile_log \
           WHERE table_name = 'checkins' \
-            AND divergence_kind = 'missing_pg' \
+            {kind_filter} \
             AND resolved_at IS NULL \
           ORDER BY legacy_pk \
-          LIMIT $1",
-    )
-    .bind(limit)
-    .fetch_all(pg)
-    .await
+          LIMIT $1"
+    );
+    sqlx::query_scalar::<_, String>(&sql)
+        .bind(limit)
+        .fetch_all(pg)
+        .await
 }
 
 async fn connect_pg() -> Result<PgPool, Box<dyn std::error::Error + Send + Sync>> {
