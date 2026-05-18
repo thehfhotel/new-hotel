@@ -72,6 +72,25 @@ pub const DEFAULT_DRIFT_ALERT_THRESHOLD: i64 = 50;
 pub const LEVEL_DRIFT_STALE_INTERVAL_HOURS: i64 = 4;
 pub const LEVEL_DRIFT_COOLDOWN_HOURS: i64 = 24;
 
+/// Default per-tick CT watcher lag thresholds. Resolved at runtime via
+/// [`ct_lag_thresholds_from_env`]. The version threshold catches a
+/// watcher that's fallen behind the legacy CT stream (each MSSQL row
+/// update bumps `CHANGE_TRACKING_CURRENT_VERSION()` by 1; 100 versions
+/// is well above steady-state idle noise and well below a "the watcher
+/// is wedged" scenario). The seconds threshold catches a watcher whose
+/// `last_polled_at` row hasn't refreshed in a while — orthogonal to
+/// version lag because a silent CT-stream gap also leaves
+/// `last_polled_at` advancing while no new versions arrive.
+///
+/// Background: production incident 2026-05-18 — the CT watcher missed
+/// 28+ UPDATEs to `HT_CheckIn_H` / `HT_CheckIn_Ds` between 2026-05-11
+/// and 2026-05-15. The only detector was the reconcile sweep itself
+/// (which was also broken at the time). This per-tick observation
+/// closes the gap: a stuck watermark surfaces as a `[Sync] CT watcher
+/// lag detected` log line every 15 minutes.
+pub const DEFAULT_CT_LAG_WARN_VERSIONS: i64 = 100;
+pub const DEFAULT_CT_LAG_WARN_SECONDS: i64 = 300;
+
 /// Reconcile mode selected by env var `LEGACY_SYNC_RECONCILE_MODE`.
 /// Default is `DiffOnly` per Phase 5.5 cutover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,6 +211,14 @@ pub async fn run_sync(
     // Slack from drowning during a known-bad cardinality migration
     // window.
     check_level_drift_and_alert(pg_pool, slack, site_id).await;
+
+    // Incident 2026-05-18 follow-up — per-tick CT watcher health
+    // observation. Compares the PG-side `legacy_ct_state.last_seen_version`
+    // against MSSQL's `CHANGE_TRACKING_CURRENT_VERSION()` and warns on
+    // lag. Log-only for now (no Slack); operators grep for the warning
+    // text. Best-effort: any MSSQL/PG failure logs a warning and returns
+    // without aborting the reconcile loop.
+    check_ct_watcher_lag(legacy_pool, pg_pool, site_id).await;
 
     tracing::info!(site = %site_id, "[Sync] Sync cycle complete");
 }
@@ -548,6 +575,208 @@ async fn check_level_drift_and_alert(
         ),
     );
     slack.send_message(&msg).await;
+}
+
+/// Resolved CT-lag thresholds (versions + seconds) for a reconcile tick.
+/// Produced by [`ct_lag_thresholds_from_env`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CtLagThresholds {
+    /// `current_version - last_seen_version` greater than this triggers
+    /// a warn-level log instead of debug.
+    version_lag: i64,
+    /// `now() - last_polled_at` (in seconds) greater than this triggers
+    /// a warn-level log instead of debug.
+    poll_age_seconds: i64,
+}
+
+/// Resolve the per-tick CT lag thresholds from env. Mirrors the per-site
+/// override pattern used by [`drift_alert_threshold_from_env`]:
+/// `LEGACY_CT_LAG_WARN_VERSIONS_<SITE_ID_UPPER>` and
+/// `LEGACY_CT_LAG_WARN_SECONDS_<SITE_ID_UPPER>` take precedence over the
+/// global `LEGACY_CT_LAG_WARN_VERSIONS` / `LEGACY_CT_LAG_WARN_SECONDS`,
+/// which in turn fall back to the compiled-in defaults
+/// ([`DEFAULT_CT_LAG_WARN_VERSIONS`] / [`DEFAULT_CT_LAG_WARN_SECONDS`]).
+fn ct_lag_thresholds_from_env(site_id: &str) -> CtLagThresholds {
+    let site_upper = site_id.to_uppercase();
+    let per_site_version = format!("LEGACY_CT_LAG_WARN_VERSIONS_{site_upper}");
+    let per_site_seconds = format!("LEGACY_CT_LAG_WARN_SECONDS_{site_upper}");
+    let version_lag = parse_threshold_env(&per_site_version)
+        .or_else(|| parse_threshold_env("LEGACY_CT_LAG_WARN_VERSIONS"))
+        .unwrap_or(DEFAULT_CT_LAG_WARN_VERSIONS);
+    let poll_age_seconds = parse_threshold_env(&per_site_seconds)
+        .or_else(|| parse_threshold_env("LEGACY_CT_LAG_WARN_SECONDS"))
+        .unwrap_or(DEFAULT_CT_LAG_WARN_SECONDS);
+    CtLagThresholds {
+        version_lag,
+        poll_age_seconds,
+    }
+}
+
+/// Pure decision function for [`check_ct_watcher_lag`]. Returns `true`
+/// when the observed lag breaches either threshold (strictly greater
+/// than) — i.e. the operator should see a `warn` log instead of `debug`.
+///
+/// Inputs are kept explicit (no env reads, no clock) so the unit tests
+/// can drive the truth table without spinning a tokio runtime or mocking
+/// PG/MSSQL.
+fn ct_lag_is_warning(
+    version_lag: i64,
+    poll_age_seconds: i64,
+    thresholds: CtLagThresholds,
+) -> bool {
+    version_lag > thresholds.version_lag || poll_age_seconds > thresholds.poll_age_seconds
+}
+
+/// Snapshot of the PG-side CT watermark for the per-tick health check.
+#[derive(Debug, Clone, Copy)]
+struct PgCtWatermark {
+    last_seen_version: i64,
+    last_polled_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Read `legacy_ct_state.last_seen_version` + `last_polled_at` from PG.
+/// Single-row table (`WHERE id = 1`). A missing row (pre-bootstrap) is
+/// surfaced as a `sqlx::Error::RowNotFound` for the caller to log and
+/// skip — the watcher hasn't started yet so there's nothing to compare.
+async fn read_pg_ct_watermark(pg_pool: &PgPool) -> Result<PgCtWatermark, sqlx::Error> {
+    let row = sqlx::query_as::<_, (i64, Option<chrono::DateTime<chrono::Utc>>)>(
+        "SELECT last_seen_version, last_polled_at FROM legacy_ct_state WHERE id = 1",
+    )
+    .fetch_one(pg_pool)
+    .await?;
+    Ok(PgCtWatermark {
+        last_seen_version: row.0,
+        last_polled_at: row.1,
+    })
+}
+
+/// Read `SELECT CHANGE_TRACKING_CURRENT_VERSION()` from legacy MSSQL.
+/// Returns `Ok(None)` when CT is not enabled on the database (the
+/// function returns NULL in that case); returns `Err` for connection /
+/// query failures. The caller logs both as a warning and skips the
+/// comparison — neither is fatal to the reconcile tick.
+async fn read_mssql_ct_current_version(
+    legacy_pool: &DbPool,
+) -> Result<Option<i64>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut conn = legacy_pool.get().await?;
+    let rows = Query::new("SELECT CHANGE_TRACKING_CURRENT_VERSION() AS v")
+        .query(&mut conn)
+        .await?
+        .into_first_result()
+        .await?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    Ok(row.get::<i64, _>("v"))
+}
+
+/// Incident 2026-05-18 follow-up — per-reconcile-tick CT watcher health
+/// observation. Compares the PG-side `legacy_ct_state.last_seen_version`
+/// against MSSQL's `CHANGE_TRACKING_CURRENT_VERSION()` and emits a
+/// `warn`-level log line if either the version lag or the poll-age
+/// exceeds the configured thresholds.
+///
+/// Log-only by design — no Slack alert. The CT-watcher binary
+/// (`bin/sync.rs`) already pages on stuck watermarks via the
+/// `watermark_stall_alert_eligible` path; this reconcile-tick check is
+/// the SECOND line of defence for the case where the watcher process
+/// itself is silent (no logs, no alerts) yet falling behind. Operators
+/// grep the backend logs for `[Sync] CT watcher lag detected` to find
+/// it. If repeated warns become a pattern we can layer a Slack alert
+/// on top later.
+///
+/// Best-effort: a failed MSSQL or PG query logs a warning and returns
+/// without aborting the reconcile loop. Same posture as
+/// [`check_drift_and_alert`] / [`check_level_drift_and_alert`] —
+/// degraded observability must never take down the rest of the tick.
+async fn check_ct_watcher_lag(
+    legacy_pool: &DbPool,
+    pg_pool: &PgPool,
+    site_id: &str,
+) {
+    let watermark = match read_pg_ct_watermark(pg_pool).await {
+        Ok(w) => w,
+        Err(sqlx::Error::RowNotFound) => {
+            tracing::debug!(
+                site = %site_id,
+                "[Sync] CT watcher health: legacy_ct_state has no row yet — \
+                 watcher pre-bootstrap, skipping lag check"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                site = %site_id,
+                error = %e,
+                "[Sync] CT watcher health: failed to read legacy_ct_state — \
+                 observability degraded for this tick"
+            );
+            return;
+        }
+    };
+
+    let current_version = match read_mssql_ct_current_version(legacy_pool).await {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            tracing::warn!(
+                site = %site_id,
+                "[Sync] CT watcher health: CHANGE_TRACKING_CURRENT_VERSION() \
+                 returned NULL — CT not enabled on legacy DB?"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                site = %site_id,
+                error = %e,
+                "[Sync] CT watcher health: failed to probe \
+                 CHANGE_TRACKING_CURRENT_VERSION() on legacy MSSQL — \
+                 observability degraded for this tick"
+            );
+            return;
+        }
+    };
+
+    let last_seen_version = watermark.last_seen_version;
+    // Saturating sub: a watermark ahead of `current_version` is a CT
+    // anomaly (the version is monotonic) but a defensive zero-lag here
+    // is better than a panic on underflow.
+    let version_lag = current_version.saturating_sub(last_seen_version);
+    let poll_age_seconds = watermark
+        .last_polled_at
+        .map(|polled| {
+            chrono::Utc::now()
+                .signed_duration_since(polled)
+                .num_seconds()
+                .max(0)
+        })
+        // No `last_polled_at` row yet → watcher hasn't ticked. Treat as
+        // "infinitely old" (i64::MAX) so the warn branch fires and the
+        // operator sees the never-polled state in the logs.
+        .unwrap_or(i64::MAX);
+
+    let thresholds = ct_lag_thresholds_from_env(site_id);
+    if ct_lag_is_warning(version_lag, poll_age_seconds, thresholds) {
+        tracing::warn!(
+            site = %site_id,
+            current_version,
+            last_seen_version,
+            version_lag,
+            poll_age_seconds,
+            version_threshold = thresholds.version_lag,
+            seconds_threshold = thresholds.poll_age_seconds,
+            "[Sync] CT watcher lag detected"
+        );
+    } else {
+        tracing::debug!(
+            site = %site_id,
+            current_version,
+            last_seen_version,
+            version_lag,
+            poll_age_seconds,
+            "[Sync] CT watcher healthy"
+        );
+    }
 }
 
 /// Compute SHA256 hash of a string
@@ -4130,6 +4359,217 @@ mod tests {
     #[test]
     fn parse_booking_legacy_pk_legacy_format_has_no_separator() {
         assert_eq!(parse_booking_legacy_pk("B12345"), ("B12345", ""));
+    }
+
+    // -------------------------------------------------------------------
+    // Incident 2026-05-18 follow-up — per-tick CT watcher lag observation
+    // -------------------------------------------------------------------
+    //
+    // `check_ct_watcher_lag` is the live MSSQL+PG observation; the
+    // tests below cover only the pure decision helper
+    // (`ct_lag_is_warning`) and the env-resolution helper
+    // (`ct_lag_thresholds_from_env`). The plumbing through the
+    // best-effort PG/MSSQL queries is exercised by integration tests
+    // when the legacy spike harness is wired up — out of scope here.
+
+    fn default_ct_thresholds() -> CtLagThresholds {
+        CtLagThresholds {
+            version_lag: DEFAULT_CT_LAG_WARN_VERSIONS,
+            poll_age_seconds: DEFAULT_CT_LAG_WARN_SECONDS,
+        }
+    }
+
+    /// Both lag dimensions below threshold → debug-level log (warning
+    /// branch must NOT fire). The hot path: a healthy watcher in the
+    /// steady-state idle period between CT bumps.
+    #[test]
+    fn ct_lag_under_both_thresholds_does_not_warn() {
+        let t = default_ct_thresholds();
+        assert!(!ct_lag_is_warning(0, 0, t));
+        assert!(!ct_lag_is_warning(50, 60, t));
+        // Exactly at threshold ⇒ debug (strict greater-than, mirrors
+        // `tables_breaching_threshold`).
+        assert!(!ct_lag_is_warning(
+            DEFAULT_CT_LAG_WARN_VERSIONS,
+            DEFAULT_CT_LAG_WARN_SECONDS,
+            t,
+        ));
+    }
+
+    /// Version lag breaches alone are sufficient to warn — a CT-watcher
+    /// that's behind on rows is the actionable case even if it's still
+    /// polling fast enough to keep `last_polled_at` fresh.
+    #[test]
+    fn ct_lag_warns_when_only_version_lag_breaches() {
+        let t = default_ct_thresholds();
+        assert!(ct_lag_is_warning(
+            DEFAULT_CT_LAG_WARN_VERSIONS + 1,
+            0,
+            t
+        ));
+    }
+
+    /// Poll-age breaches alone are sufficient to warn — a watcher whose
+    /// poll-loop is wedged still keeps `last_seen_version` advancing
+    /// from the in-flight transaction, but `last_polled_at` stops
+    /// refreshing (incident-2026-05-18 root-cause shape).
+    #[test]
+    fn ct_lag_warns_when_only_poll_age_breaches() {
+        let t = default_ct_thresholds();
+        assert!(ct_lag_is_warning(
+            0,
+            DEFAULT_CT_LAG_WARN_SECONDS + 1,
+            t
+        ));
+    }
+
+    /// Both dimensions breached → warn. Defensive smoke test — if either
+    /// arm of the `||` regresses to `&&`, this catches it together with
+    /// the two "only X breaches" tests above.
+    #[test]
+    fn ct_lag_warns_when_both_dimensions_breach() {
+        let t = default_ct_thresholds();
+        assert!(ct_lag_is_warning(
+            DEFAULT_CT_LAG_WARN_VERSIONS + 1,
+            DEFAULT_CT_LAG_WARN_SECONDS + 1,
+            t
+        ));
+    }
+
+    /// Custom thresholds are honored — proves the helper doesn't
+    /// hardwire the defaults. Matches the runtime behaviour where
+    /// `LEGACY_CT_LAG_WARN_VERSIONS` / `LEGACY_CT_LAG_WARN_SECONDS`
+    /// override the compiled-in constants.
+    #[test]
+    fn ct_lag_respects_custom_thresholds() {
+        let tight = CtLagThresholds {
+            version_lag: 10,
+            poll_age_seconds: 30,
+        };
+        assert!(!ct_lag_is_warning(10, 30, tight));
+        assert!(ct_lag_is_warning(11, 0, tight));
+        assert!(ct_lag_is_warning(0, 31, tight));
+    }
+
+    /// Env-isolation helper for CT-lag threshold tests. Same shape as
+    /// `with_threshold_envs` above. Tracks BOTH the global vars and the
+    /// per-site overrides so the fallback chain can be exercised
+    /// without leaking state across tests.
+    fn with_ct_lag_envs<F: FnOnce() -> CtLagThresholds>(
+        global_versions: Option<&str>,
+        global_seconds: Option<&str>,
+        per_site_versions: Option<(&str, &str)>,
+        per_site_seconds: Option<(&str, &str)>,
+        f: F,
+    ) -> CtLagThresholds {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _g = LOCK.lock().unwrap();
+
+        let prior_gv = env::var("LEGACY_CT_LAG_WARN_VERSIONS").ok();
+        let prior_gs = env::var("LEGACY_CT_LAG_WARN_SECONDS").ok();
+        let prior_psv = per_site_versions.map(|(n, _)| (n.to_string(), env::var(n).ok()));
+        let prior_pss = per_site_seconds.map(|(n, _)| (n.to_string(), env::var(n).ok()));
+
+        match global_versions {
+            Some(v) => env::set_var("LEGACY_CT_LAG_WARN_VERSIONS", v),
+            None => env::remove_var("LEGACY_CT_LAG_WARN_VERSIONS"),
+        }
+        match global_seconds {
+            Some(v) => env::set_var("LEGACY_CT_LAG_WARN_SECONDS", v),
+            None => env::remove_var("LEGACY_CT_LAG_WARN_SECONDS"),
+        }
+        if let Some((name, value)) = per_site_versions {
+            env::set_var(name, value);
+        }
+        if let Some((name, value)) = per_site_seconds {
+            env::set_var(name, value);
+        }
+
+        let out = f();
+
+        match prior_gv {
+            Some(v) => env::set_var("LEGACY_CT_LAG_WARN_VERSIONS", v),
+            None => env::remove_var("LEGACY_CT_LAG_WARN_VERSIONS"),
+        }
+        match prior_gs {
+            Some(v) => env::set_var("LEGACY_CT_LAG_WARN_SECONDS", v),
+            None => env::remove_var("LEGACY_CT_LAG_WARN_SECONDS"),
+        }
+        if let Some((name, prior)) = prior_psv {
+            match prior {
+                Some(v) => env::set_var(&name, v),
+                None => env::remove_var(&name),
+            }
+        }
+        if let Some((name, prior)) = prior_pss {
+            match prior {
+                Some(v) => env::set_var(&name, v),
+                None => env::remove_var(&name),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn ct_lag_thresholds_default_when_envs_unset() {
+        let t = with_ct_lag_envs(None, None, None, None, || {
+            ct_lag_thresholds_from_env("hfhotel")
+        });
+        assert_eq!(t.version_lag, DEFAULT_CT_LAG_WARN_VERSIONS);
+        assert_eq!(t.poll_age_seconds, DEFAULT_CT_LAG_WARN_SECONDS);
+    }
+
+    #[test]
+    fn ct_lag_thresholds_use_global_envs_when_set() {
+        let t = with_ct_lag_envs(Some("250"), Some("900"), None, None, || {
+            ct_lag_thresholds_from_env("hfhotel")
+        });
+        assert_eq!(t.version_lag, 250);
+        assert_eq!(t.poll_age_seconds, 900);
+    }
+
+    /// Per-site override wins when both are set — same pattern as the
+    /// drift-alert threshold per-site override (task #69).
+    #[test]
+    fn ct_lag_thresholds_per_site_override_wins() {
+        let t = with_ct_lag_envs(
+            Some("250"),
+            Some("900"),
+            Some(("LEGACY_CT_LAG_WARN_VERSIONS_HFVILLE", "20")),
+            Some(("LEGACY_CT_LAG_WARN_SECONDS_HFVILLE", "60")),
+            || ct_lag_thresholds_from_env("hfville"),
+        );
+        assert_eq!(t.version_lag, 20);
+        assert_eq!(t.poll_age_seconds, 60);
+    }
+
+    /// Per-site override is namespaced by site id — an HF Hotel tick
+    /// must NOT pick up `..._HFVILLE` (mirrors the
+    /// `threshold_per_site_does_not_leak_across_sites` invariant).
+    #[test]
+    fn ct_lag_thresholds_per_site_does_not_leak_across_sites() {
+        let t = with_ct_lag_envs(
+            Some("250"),
+            Some("900"),
+            Some(("LEGACY_CT_LAG_WARN_VERSIONS_HFVILLE", "20")),
+            Some(("LEGACY_CT_LAG_WARN_SECONDS_HFVILLE", "60")),
+            || ct_lag_thresholds_from_env("hfhotel"),
+        );
+        assert_eq!(t.version_lag, 250);
+        assert_eq!(t.poll_age_seconds, 900);
+    }
+
+    /// Garbage in any env falls through to the next layer (per-site →
+    /// global → default). Operator typo on the override must not
+    /// silence the observation.
+    #[test]
+    fn ct_lag_thresholds_garbage_falls_through_to_default() {
+        let t = with_ct_lag_envs(Some("abc"), Some("-1"), None, None, || {
+            ct_lag_thresholds_from_env("hfhotel")
+        });
+        assert_eq!(t.version_lag, DEFAULT_CT_LAG_WARN_VERSIONS);
+        assert_eq!(t.poll_age_seconds, DEFAULT_CT_LAG_WARN_SECONDS);
     }
 
 }
