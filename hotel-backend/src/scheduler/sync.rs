@@ -2923,9 +2923,24 @@ async fn sync_checkins(
     //    rows per tick on HF Hotel (2026-05-18 audit). Unifying on the
     //    mapper eliminates the bug class — see
     //    `compute_legacy_checkin_hash_via_mapper`'s doc comment.
+    // The EXISTS filter restores the row-set semantics of the pre-#134
+    // bulk JOIN query (`FROM HT_CheckIn_Ds INNER JOIN HT_CheckIn_H`),
+    // which implicitly excluded Ds-less header rows. 2026-05-18 prod
+    // audit found 201 such rows on HF Hotel — iHOTEL "ghosts" from
+    // failed walk-ins / cancelled-before-room-assignment / test data
+    // that aren't representable in canonical (`ht_checkins.cin_room_id`
+    // is NOT NULL). Without this filter the reconcile sweep flags every
+    // ghost as `missing_pg`, producing 200+ false-positive drift rows
+    // per tick.
     let mut conn = legacy_pool.get().await?;
     let pk_rows = conn
-        .simple_query("SELECT DISTINCT Cin_no FROM HT_CheckIn_H ORDER BY Cin_no")
+        .simple_query(
+            "SELECT DISTINCT h.Cin_no FROM HT_CheckIn_H h \
+              WHERE EXISTS ( \
+                  SELECT 1 FROM HT_CheckIn_Ds d WHERE d.Cin_No = h.Cin_no \
+              ) \
+              ORDER BY h.Cin_no",
+        )
         .await?
         .into_first_result()
         .await?;
