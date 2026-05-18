@@ -29,6 +29,7 @@
 //! | `refund_payment` | Track G2 / T4 CRIT-1 (`docs/legacy-app/COMPAT_CHEATSHEET.md:513`) | `RefundPayment` |
 //! | `room_change` | Track G4 / T4 HIGH-3 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_Changed_Room`, §3.17) | `RoomChange` |
 //! | `mark_clean` | §3j | `MarkRoomClean` |
+//! | `update_room` | Admin room master-data edit — closes the `PUT /api/new/rooms/:id` writeback gap | `UpdateRoom` |
 //! | `adjust_product_stock` | Track F3 / T1 CRIT-3 (`docs/legacy-app/COMPAT_CHEATSHEET.md:560-564`) | `AdjustProductStock` |
 //! | `coupon` | Track G5 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_Cupon`) | `IssueCoupon` + `RedeemCoupon` |
 //! | `pos_sale` | Track G6 / POS module (MVP) — `HT_CheckIn_Product` INSERT + paired `HT_Products.Pro_Amt` additive decrement | `RecordPosSale` |
@@ -48,6 +49,7 @@ pub mod payment;
 pub mod pos_sale;
 pub mod refund_payment;
 pub mod room_change;
+pub mod update_room;
 pub mod walkin;
 
 use crate::db::mssql_timeout::{simple_query_with_timeout, MssqlOpKind};

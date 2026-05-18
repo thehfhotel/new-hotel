@@ -197,6 +197,29 @@ pub enum WritebackIntent {
     /// non-cancelled check-in for this room.
     MarkRoomClean { room_id: Uuid, by: String },
 
+    /// Admin / staff edit of room master data (price, type, notes).
+    /// Mirrors a PG `ht_rooms_new` UPDATE → legacy `HT_Rooms` UPDATE
+    /// keyed by `Room_no`. PG fields that have no MSSQL counterpart
+    /// (`room_features`, `room_floor`, `room_view`) are NOT propagated —
+    /// they are canonical-only. The legacy `Room_Use` column is also
+    /// NOT propagated: it is the legacy *occupancy* flag (`'yes'`/`'no'`)
+    /// driven by check-in / check-out flows, not by admin edits.
+    /// Keeping the admin-edit / occupancy split keeps housekeeping +
+    /// walk-in writebacks authoritative over `Room_Use`.
+    ///
+    /// Emitted by `routes::new_rooms::update_room`. The payload is the
+    /// resolved PG row AFTER the UPDATE; the writeback recipe replays
+    /// the full field set on MSSQL. `None` fields are skipped (preserves
+    /// any iHOTEL-side value the operator did not touch — narrow update).
+    UpdateRoom {
+        /// Canonical aggregate UUID derived from `room_id` via
+        /// [`crate::service::ids::aggregate_uuid`]. Persisted into
+        /// `writeback_jobs.aggregate_id` so jobs for the same room
+        /// group together in the index.
+        room_id: Uuid,
+        payload: UpdateRoomPayload,
+    },
+
     /// Track G2 — `audit-2026-05-13.md` T4 CRIT-1. Refund / negative
     /// payment. The recipe inserts a `HT_CheckIn_Pay` row with a
     /// negative tender amount (per `docs/legacy-app/COMPAT_CHEATSHEET.md:513`
@@ -418,6 +441,57 @@ pub struct CreateBookingPayload {
     pub notes: Option<String>,
 }
 
+/// Payload for [`WritebackIntent::UpdateRoom`].
+///
+/// Carries the writeback-relevant slice of `ht_rooms_new` AFTER the PG
+/// UPDATE has committed. Every field except `room_no` is `Option<_>` —
+/// `None` means "the operator did not touch this column, leave the
+/// iHOTEL-side value alone" (narrow UPDATE). `room_no` is the legacy
+/// `HT_Rooms.Room_no` business key used to locate the row; it is the
+/// canonical `ht_rooms_new.room_no` (which we mirror 1:1).
+///
+/// Field → legacy column mapping (`docs/legacy-app/SCHEMA.sql` +
+/// `bin/backfill_rooms.rs`):
+/// * `room_type_name` → `HT_Rooms.Room_Type` (Thai literal, e.g.
+///   `'ห้องแฟมิลี่ 2'`). Routes resolve this from `ht_room_types.type_name`
+///   keyed on the FK `room_type_id` before enqueuing.
+/// * `price_weekday`  → `Room_PriceA`
+/// * `price_weekend`  → `Room_PriceB`
+/// * `price_special`  → `Room_PriceC`
+/// * `notes`          → `Room_Details`
+///
+/// Columns intentionally NOT mirrored:
+/// * `Room_Use` — occupancy state, owned by `walkin` / `checkin_to_booking`
+///   / `checkin_cancel` / `checkout` recipes.
+/// * `Room_Clean` / `Room_Manternace` — owned by `mark_clean` (housekeeping
+///   flow) and the canonical maintenance request flow respectively.
+/// * `Room_Group`, `room_floor`, `room_features`, `room_view` — canonical-only
+///   or vendor-managed metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateRoomPayload {
+    /// `HT_Rooms.Room_no` — business key of the row to UPDATE.
+    /// Required; the recipe's `WHERE` clause targets this column.
+    pub room_no: String,
+    /// Thai literal for `HT_Rooms.Room_Type`. `None` ⇒ recipe skips the
+    /// `Room_Type=` fragment (keeps the iHOTEL-side value).
+    #[serde(default)]
+    pub room_type_name: Option<String>,
+    /// → `HT_Rooms.Room_PriceA`. `None` ⇒ skip.
+    #[serde(default)]
+    pub price_weekday: Option<f64>,
+    /// → `HT_Rooms.Room_PriceB`. `None` ⇒ skip.
+    #[serde(default)]
+    pub price_weekend: Option<f64>,
+    /// → `HT_Rooms.Room_PriceC`. `None` ⇒ skip.
+    #[serde(default)]
+    pub price_special: Option<f64>,
+    /// → `HT_Rooms.Room_Details`. `None` ⇒ skip. Empty string is
+    /// preferred over NULL for legacy `varchar` (the .NET WinForms
+    /// controls misbehave on NULL — see spike §3k).
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
 /// Payload for [`WritebackIntent::CreateCheckIn`].
 ///
 /// Discriminates between walk-in and linked-to-booking via `linked_booking_id`
@@ -534,6 +608,7 @@ impl WritebackIntent {
             WritebackIntent::RefundPayment { .. } => "refund_payment",
             WritebackIntent::RoomChange { .. } => "room_change",
             WritebackIntent::MarkRoomClean { .. } => "mark_room_clean",
+            WritebackIntent::UpdateRoom { .. } => "update_room",
             WritebackIntent::AdjustProductStock { .. } => "adjust_product_stock",
             WritebackIntent::IssueCoupon { .. } => "issue_coupon",
             WritebackIntent::RedeemCoupon { .. } => "redeem_coupon",
@@ -558,7 +633,8 @@ impl WritebackIntent {
             | WritebackIntent::RefundPayment { check_in_id, .. }
             | WritebackIntent::RoomChange { check_in_id, .. }
             | WritebackIntent::RecordPosSale { check_in_id, .. } => *check_in_id,
-            WritebackIntent::MarkRoomClean { room_id, .. } => *room_id,
+            WritebackIntent::MarkRoomClean { room_id, .. }
+            | WritebackIntent::UpdateRoom { room_id, .. } => *room_id,
             // Track F3 — fall back to a deterministic v5 UUID derived
             // from the legacy `Pro_no` so the
             // `writeback_jobs.aggregate_id` index always groups
@@ -755,6 +831,92 @@ mod tests {
             }
             other => panic!("expected CheckOut variant, got {other:?}"),
         }
+    }
+
+    /// `UpdateRoom` must expose the snake_case discriminant
+    /// `"update_room"` and report the carried room aggregate id so the
+    /// writeback worker indexes / back-populates against the same row.
+    #[test]
+    fn update_room_intent_name_and_aggregate_id() {
+        let room_id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let intent = WritebackIntent::UpdateRoom {
+            room_id,
+            payload: UpdateRoomPayload {
+                room_no: "A2-1".into(),
+                room_type_name: Some("ห้องแฟมิลี่ 2".into()),
+                price_weekday: Some(890.0),
+                price_weekend: None,
+                price_special: None,
+                notes: None,
+            },
+        };
+        assert_eq!(intent.intent_name(), "update_room");
+        assert_eq!(intent.aggregate_id(), room_id);
+    }
+
+    /// Idempotency key is derived from `(intent_name, aggregate_id)` only —
+    /// two `UpdateRoom` intents for the same room collapse to the same key
+    /// regardless of which fields the operator changed, which is exactly
+    /// what we want: the writeback worker should never queue two parallel
+    /// `HT_Rooms` UPDATEs against the same row. The route's PG UPDATE +
+    /// outbox enqueue commit atomically, so the "latest commit wins"
+    /// invariant is preserved.
+    #[test]
+    fn update_room_idempotency_key_is_deterministic_for_same_room() {
+        use crate::outbox::generate_idempotency_key;
+        let room_id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let intent_a = WritebackIntent::UpdateRoom {
+            room_id,
+            payload: UpdateRoomPayload {
+                room_no: "A2-1".into(),
+                room_type_name: Some("ห้องแฟมิลี่ 2".into()),
+                price_weekday: Some(890.0),
+                price_weekend: None,
+                price_special: None,
+                notes: None,
+            },
+        };
+        let intent_b = WritebackIntent::UpdateRoom {
+            room_id,
+            // Different payload (operator-touched fields differ) — but the
+            // key is payload-independent so it must still match.
+            payload: UpdateRoomPayload {
+                room_no: "A2-1".into(),
+                room_type_name: None,
+                price_weekday: None,
+                price_weekend: Some(1090.0),
+                price_special: None,
+                notes: Some("renovated 2026-05".into()),
+            },
+        };
+        assert_eq!(
+            generate_idempotency_key(&intent_a, room_id),
+            generate_idempotency_key(&intent_b, room_id),
+        );
+    }
+
+    /// Round-trip an `UpdateRoom` payload through serde — partial
+    /// payloads (only price_weekday set) must serialize / deserialize
+    /// without the `#[serde(default)]` annotations dropping the explicit
+    /// `Some(_)` value.
+    #[test]
+    fn update_room_payload_roundtrips_partial_update() {
+        let payload = UpdateRoomPayload {
+            room_no: "A2-1".into(),
+            room_type_name: None,
+            price_weekday: Some(890.0),
+            price_weekend: None,
+            price_special: None,
+            notes: None,
+        };
+        let json = serde_json::to_string(&payload).expect("must serialize");
+        let parsed: UpdateRoomPayload =
+            serde_json::from_str(&json).expect("must round-trip");
+        assert_eq!(parsed.room_no, "A2-1");
+        assert_eq!(parsed.price_weekday, Some(890.0));
+        assert!(parsed.room_type_name.is_none());
+        assert!(parsed.price_weekend.is_none());
+        assert!(parsed.notes.is_none());
     }
 }
 

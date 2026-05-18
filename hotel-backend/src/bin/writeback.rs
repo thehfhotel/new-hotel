@@ -979,6 +979,11 @@ async fn resolve_legacy_ids(
             // No self-heal source for rooms — they're populated by the
             // backfill_rooms binary, not by recipe writebacks.
         }
+        // Admin room master-data edit. The payload carries the legacy
+        // `Room_no` business key directly (resolved by the route layer
+        // before enqueue), so no PG lookup or self-heal is required at
+        // this layer. Mirrors the `AdjustProductStock` resolution shape.
+        UpdateRoom { .. } => {}
         // Track G6 — `RecordPosSale`. Load the canonical `ht_pos_sales`
         // row joined with `ht_products` so the recipe consumes plain
         // fields (no sqlx). The check-in identifiers (`cin_no`, room)
@@ -1730,6 +1735,13 @@ async fn back_populate_legacy_ids(
         }
         MarkRoomClean { .. } => {
             // mark_clean doesn't allocate any new legacy IDs.
+        }
+        UpdateRoom { .. } => {
+            // update_room doesn't allocate any new legacy IDs — the
+            // legacy `HT_Rooms` row already exists and we only shift its
+            // column values. The canonical `ht_rooms_new.legacy_*`
+            // back-link columns are populated by `backfill_rooms`, not
+            // by recipe writebacks, so nothing to back-populate here.
         }
         // Track G4 / T4 HIGH-3 — RoomChange back-populates the freshly
         // allocated HT_Changed_Room.id onto ht_room_changes.rc_legacy_id
