@@ -131,6 +131,24 @@ fi
 ( umask 077 && echo "$PAYLOAD" | jq -r '.env | to_entries[] | "\(.key)=\(.value | @sh)"' > .env )
 chmod 600 .env
 
+# RUST_LOG defensive fallback. Pinned to debug for scheduler::sync +
+# scheduler::jobs until Track B junction-table migration ships and
+# reconcile noise drops to a steady-state baseline (incident 2026-05-18
+# — sync_checkins broke silently for 2+ days). The workflow's jq
+# fallback already injects the same default, but an older workflow
+# version (mid-rolling-deploy) or a hand-crafted payload could ship an
+# empty RUST_LOG; this catches both cases so operators never lose
+# per-row sweep visibility on the next deploy.
+if ! grep -q "^RUST_LOG='..*'$" .env; then
+  # Strip any pre-existing empty / missing entry, then append the default.
+  ( umask 077 && {
+      grep -v '^RUST_LOG=' .env || true
+      printf "RUST_LOG=%s\n" "'hotel_backend::scheduler::sync=debug,hotel_backend::scheduler::jobs=debug,hotel_backend=info,tower_http=info'"
+    } > .env.new && mv .env.new .env )
+  chmod 600 .env
+  echo "[deploy] RUST_LOG was unset/empty in payload — pinned to scheduler::sync,jobs=debug default"
+fi
+
 # Required-env validation — fail loud if any expected key is empty.
 # LEGACY_SYNC_* are included because compose's ${VAR:-default} fallback would
 # silently mask a missing secret; explicit validation matches the prior workflow's
