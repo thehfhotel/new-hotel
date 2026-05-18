@@ -854,12 +854,16 @@ jobs:
           # during a CT-watcher backfill window to silence the cron noise.
           HOURLY_REPORT_ENABLED:         ${{ vars.HOURLY_REPORT_ENABLED || 'true' }}
           CHECKIN_NOTIFICATIONS_ENABLED: ${{ vars.CHECKIN_NOTIFICATIONS_ENABLED || 'true' }}
-          # Tracing log level (2026-05-16). Default falls back to the
-          # info-level filter compiled into `main.rs`. Override with
-          # `gh variable set RUST_LOG -b "hotel_backend::scheduler::sync=debug,hotel_backend=info"`
-          # for diagnostic windows. Remember to revert after the window
-          # closes — debug-level reconcile logs are noisy.
-          RUST_LOG:                      ${{ vars.RUST_LOG || 'hotel_backend=info,tower_http=info' }}
+          # Tracing log level. Pinned to debug for scheduler::sync +
+          # scheduler::jobs until Track B junction-table migration ships
+          # and reconcile noise drops to a steady-state baseline (incident
+          # 2026-05-18 — sync_checkins broke silently for 2+ days, the
+          # CT watcher missed 28+ UPDATEs to HT_CheckIn_H/Ds with no
+          # observable signal until the reconcile sweep flagged the
+          # divergence). Override per-deploy via the GH variable when
+          # quiet-mode is needed (e.g. major version cutovers); unset
+          # restores the debug-pinned default.
+          RUST_LOG:                      ${{ vars.RUST_LOG || 'hotel_backend::scheduler::sync=debug,hotel_backend::scheduler::jobs=debug,hotel_backend=info,tower_http=info' }}
         # Build a JSON payload the way /srv/run-deploy.sh expects:
         #   { commit_sha, deploy_payload_b64 (tar.gz), env: {...},
         #     secrets: {...} }
@@ -895,6 +899,12 @@ jobs:
             scripts/migrate.sh \
             scripts/deploy/run-deploy.sh
 
+          # RUST_LOG default below is pinned to debug for scheduler::sync
+          # + scheduler::jobs until Track B junction-table migration ships
+          # and reconcile noise drops to a steady-state baseline (incident
+          # 2026-05-18 — sync_checkins broke silently for 2+ days). Keep
+          # in sync with the vars.RUST_LOG default in the `env:` block
+          # above.
           jq -n \
             --arg commit_sha          "$GITHUB_SHA" \
             --arg deploy_payload_b64  "$(base64 -w0 < /tmp/deploy.tar.gz)" \
@@ -915,7 +925,7 @@ jobs:
             --arg AUTH_ENABLED        "$AUTH_ENABLED" \
             --arg HOURLY_REPORT_ENABLED         "${HOURLY_REPORT_ENABLED:-true}" \
             --arg CHECKIN_NOTIFICATIONS_ENABLED "${CHECKIN_NOTIFICATIONS_ENABLED:-true}" \
-            --arg RUST_LOG                      "${RUST_LOG:-hotel_backend=info,tower_http=info}" \
+            --arg RUST_LOG                      "${RUST_LOG:-hotel_backend::scheduler::sync=debug,hotel_backend::scheduler::jobs=debug,hotel_backend=info,tower_http=info}" \
             '{
               commit_sha: $commit_sha,
               deploy_payload_b64: $deploy_payload_b64,

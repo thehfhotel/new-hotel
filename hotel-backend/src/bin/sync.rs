@@ -2165,6 +2165,13 @@ async fn poll_table(
                             "Failed to persist event_log row"
                         );
                         skipped += 1;
+                        // Same silent-drop class as a failed apply: the
+                        // canonical row is already in `tx` and will commit,
+                        // but the LISTEN/NOTIFY event never fires. Holding
+                        // the watermark lets the next tick re-run the
+                        // aggregate (idempotent — returns Ok(None) on
+                        // already-applied state) and re-attempt persist_event.
+                        errored = true;
                     } else {
                         ingested += 1;
                     }
@@ -2238,6 +2245,10 @@ async fn poll_table(
                             "Failed to persist event_log row"
                         );
                         skipped += 1;
+                        // See sibling path: persist_event failure is a
+                        // silent-drop class (canonical commits, event never
+                        // fires). Hold watermark to retry next tick.
+                        errored = true;
                     } else {
                         ingested += 1;
                     }
@@ -2309,15 +2320,38 @@ async fn poll_table(
         );
     }
 
-    if max_version > last_seen {
+    // Gate the watermark advance on whether ANY per-key apply failed
+    // this tick. When `errored` is true, hold at `last_seen` so the
+    // next tick re-fetches the same CT rows — UPSERT semantics make
+    // already-succeeded keys idempotent on retry. Closes the
+    // silent-drop bug where a transient per-key failure (deploy
+    // mid-tick, MSSQL hiccup) advanced the watermark past the failed
+    // key's CT version, losing the event after CT's 2-day retention.
+    if errored {
+        tracing::warn!(
+            table,
+            last_seen,
+            max_version,
+            applied = ingested,
+            skipped,
+            per_table = per_table_watermark,
+            "[CT] Tick had per-key failures — holding watermark at last_seen for retry next tick"
+        );
+        // Still touch `last_polled_at` in per-table mode so the
+        // watchdog distinguishes "actively retrying" from "wedged".
+        if per_table_watermark {
+            let _ = hotel_backend::sync::watermark::touch_per_table(pg, table).await;
+        }
+    } else if let Some(target_version) = next_watermark_after_tick(max_version, last_seen, errored)
+    {
         // R3 — feature-flagged dual-write contract. Per-table mode
         // advances ONLY the per-table row so a stuck sibling
         // doesn't pin the global down; global mode advances ONLY
         // the single-row state, preserving the pre-R3 behaviour.
         let advance_result = if per_table_watermark {
-            hotel_backend::sync::watermark::advance_per_table(pg, table, max_version).await
+            hotel_backend::sync::watermark::advance_per_table(pg, table, target_version).await
         } else {
-            hotel_backend::sync::watermark::advance(pg, max_version).await
+            hotel_backend::sync::watermark::advance(pg, target_version).await
         };
         match advance_result {
             Err(err) => {
@@ -2327,7 +2361,7 @@ async fn poll_table(
                 tracing::error!(
                     event_name = EV_WATERMARK_ADVANCE_FAIL,
                     table,
-                    new_version = max_version,
+                    new_version = target_version,
                     per_table = per_table_watermark,
                     error = %err,
                     "Failed to advance CT watermark"
@@ -2357,7 +2391,7 @@ async fn poll_table(
                 tracing::info!(
                     table,
                     from = last_seen,
-                    to = max_version,
+                    to = target_version,
                     ingested,
                     skipped,
                     per_table = per_table_watermark,
@@ -2690,6 +2724,46 @@ async fn bump_counters(
     Ok(())
 }
 
+/// Decide whether (and to what version) the CT watermark should advance
+/// at the end of a per-table tick.
+///
+/// Returns `Some(target_version)` when the caller should advance, or
+/// `None` when the watermark must stay pinned at `last_seen` so the
+/// next tick re-fetches the same CT rows.
+///
+/// Rules:
+/// * If `errored` is true, hold the watermark at `last_seen` regardless
+///   of how far `max_version` advanced this tick. UPSERT semantics in the
+///   aggregate/per-row appliers make re-applying the already-succeeded
+///   keys idempotent, so it's safe to re-process the whole batch; the
+///   alternative — advancing past the failed key's CT version — silently
+///   drops the failed event after MSSQL's 2-day CT retention expires.
+/// * If no error occurred AND `max_version > last_seen`, advance to
+///   `max_version`. This is the original pre-fix happy path.
+/// * Otherwise (success but no version progress), return `None` — no
+///   work to do.
+///
+/// Closes the silent-drop bug observed on HF Hotel 2026-05-11..15: 30+
+/// `new-hotel-production-sync-1` container kills landed mid-tick after
+/// some keys had committed; the watermark advanced past the failed
+/// keys' versions and the corresponding `ht_reconcile_log` divergences
+/// (28 rows, `divergence_kind='value'`) were stuck until manual
+/// intervention.
+fn next_watermark_after_tick(
+    max_version: i64,
+    last_seen: i64,
+    errored: bool,
+) -> Option<i64> {
+    if errored {
+        return None;
+    }
+    if max_version > last_seen {
+        Some(max_version)
+    } else {
+        None
+    }
+}
+
 /// Persist a per-table failure mode to `legacy_sync_status` for
 /// cross-restart visibility. Runs in its OWN sqlx auto-TX (the caller's
 /// failed-tick TX, if any, is rolled back independently — wrapping this
@@ -2974,6 +3048,89 @@ mod tests {
             "every record_table_error(pg, …) call must reference an EV_ constant; \
              {paired}/{call_count} did. The shortfall is the regression."
         );
+    }
+
+    // ========================================================================
+    // Silent-drop fix — CT watermark decision after a per-table tick.
+    //
+    // The 2026-05-11..15 production incident: `new-hotel-production-sync-1`
+    // was killed 30+ times mid-tick during deploys; per-key aggregate
+    // applies failed transiently; the watermark advanced past the failed
+    // keys' SYS_CHANGE_VERSION; the CT row aged out of MSSQL's 2-day
+    // retention; canonical PG silently lagged. These tests pin the
+    // hold-on-error contract so the regression can't sneak back.
+    // ========================================================================
+
+    /// Happy path: all keys applied cleanly, batch saw a new
+    /// `max_version`. Advance to `max_version`.
+    #[test]
+    fn next_watermark_after_tick_advances_to_max_when_no_error() {
+        assert_eq!(
+            next_watermark_after_tick(100, 90, false),
+            Some(100),
+            "successful tick with progress must advance to max_version"
+        );
+    }
+
+    /// The bug fix: ANY per-key failure pins the watermark at
+    /// `last_seen` so the next tick re-fetches the same CT rows. This
+    /// is the exact case the 28 stuck `ht_reconcile_log` rows on HF
+    /// Hotel were created by — fixing this one assertion is the whole
+    /// point of the PR.
+    #[test]
+    fn next_watermark_after_tick_holds_at_last_seen_on_error() {
+        assert_eq!(
+            next_watermark_after_tick(100, 90, true),
+            None,
+            "errored tick MUST hold watermark — re-fetch is the retry mechanism"
+        );
+    }
+
+    /// Even a wildly-advanced `max_version` must not leak past the
+    /// hold when `errored` is true. Defends against a future
+    /// "optimization" that tries to advance to `max_version - 1` on
+    /// error (which would still drop the failed key's event).
+    #[test]
+    fn next_watermark_after_tick_holds_even_when_max_version_is_far_ahead() {
+        assert_eq!(
+            next_watermark_after_tick(10_000, 5, true),
+            None,
+            "no advance permitted on error regardless of how far max_version moved"
+        );
+    }
+
+    /// Success but no version progress (all rows were stale /
+    /// coalesced away with no key delta) — no advance. Mirrors the
+    /// pre-fix `max_version > last_seen` guard.
+    #[test]
+    fn next_watermark_after_tick_no_advance_when_no_progress() {
+        assert_eq!(
+            next_watermark_after_tick(90, 90, false),
+            None,
+            "max_version == last_seen → no advance"
+        );
+    }
+
+    /// Defensive: `max_version < last_seen` shouldn't happen in
+    /// practice (the per-table loop only ratchets `max_version`
+    /// upward), but if it does — e.g. a future refactor accidentally
+    /// reset the local — we must NOT regress the watermark. The
+    /// previous gate (`max_version > last_seen`) already covered this;
+    /// the helper preserves the semantic.
+    #[test]
+    fn next_watermark_after_tick_no_advance_when_max_below_last_seen() {
+        assert_eq!(
+            next_watermark_after_tick(50, 100, false),
+            None,
+            "max_version < last_seen must not advance (no regression of watermark)"
+        );
+    }
+
+    /// Combined: error + no progress — still hold. Trivially follows
+    /// from the rules but worth a test so the truth table is complete.
+    #[test]
+    fn next_watermark_after_tick_holds_on_error_with_no_progress() {
+        assert_eq!(next_watermark_after_tick(90, 90, true), None);
     }
 
     #[test]
