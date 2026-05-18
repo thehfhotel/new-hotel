@@ -828,18 +828,6 @@ fn sha256(input: &str) -> String {
 // Helpers below are pure (no PG, no env, no time) so they're
 // unit-testable in `mod tests`.
 
-/// One detail-row of a check-in. `View_CheckIn_Ds` returns 41-45 of
-/// these per `Cin_no` (one per booked room).
-#[derive(Debug, Clone)]
-struct CheckinDetail {
-    room_no: Option<String>,
-    room_in: Option<NaiveDateTime>,
-    room_out: Option<NaiveDateTime>,
-    cust_name: Option<String>,
-    cust_no: Option<String>,
-    status: Option<String>,
-}
-
 /// One detail-row of a booking. `View_Booking_Ds` returns up to 3 of
 /// these per composite PK `(Book_No, Book_Room_Type)`.
 #[derive(Debug, Clone)]
@@ -867,56 +855,18 @@ fn fmt_str(s: &Option<String>) -> String {
     s.clone().unwrap_or_default()
 }
 
-/// Aggregate all detail rows for one `Cin_no` into a single
-/// deterministic SHA256 hash. Sorts `details` in place by
-/// `(room_no, room_in, room_out)` so the hash is independent of the
-/// order MSSQL returned the rows.
-///
-/// **Retired in v2.63.0** — the multi-row aggregate hash is no longer
-/// used by either reconcile mode. Kept for the unit tests in
-/// `mod tests` which still pin the determinism contract (useful if
-/// the helper is ever resurrected, and useful as a reference for the
-/// post-v2.63.0 `sort_checkin_details` extraction).
-#[allow(dead_code)]
-fn aggregate_checkin_hash(cin_no: &str, details: &mut Vec<CheckinDetail>) -> String {
-    details.sort_by(|a, b| {
-        (
-            fmt_str(&a.room_no),
-            fmt_dt(&a.room_in),
-            fmt_dt(&a.room_out),
-        )
-            .cmp(&(
-                fmt_str(&b.room_no),
-                fmt_dt(&b.room_in),
-                fmt_dt(&b.room_out),
-            ))
-    });
-
-    let body = details
-        .iter()
-        .map(|d| {
-            format!(
-                "{}|{}|{}|{}|{}|{}",
-                fmt_str(&d.room_no),
-                fmt_dt(&d.room_in),
-                fmt_dt(&d.room_out),
-                fmt_str(&d.cust_name),
-                fmt_str(&d.cust_no),
-                fmt_str(&d.status),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    sha256(&format!("{cin_no}|{body}"))
-}
-
 /// Aggregate all detail rows for one `(Book_No, Book_Room_Type)` PK
 /// into a single deterministic SHA256 hash. Sorts `details` in place
 /// by `(book_date, book_date_in, book_date_out, book_cust_name,
 /// book_cust_id, book_status)` — every non-key field — so the hash is
 /// independent of the order MSSQL returned the rows.
 ///
-/// **Retired in v2.63.0** — see [`aggregate_checkin_hash`] for context.
+/// **Retired in v2.63.0** — the multi-row aggregate hash is no longer
+/// used by either reconcile mode (the bookings sweep takes a single
+/// representative row per composite PK). Kept for the unit tests in
+/// `mod tests` which still pin the determinism contract, useful both
+/// if the helper is ever resurrected and as a reference for the
+/// post-v2.63.0 `sort_booking_details` extraction.
 #[allow(dead_code)]
 fn aggregate_booking_hash(
     book_no: &str,
@@ -961,24 +911,69 @@ fn aggregate_booking_hash(
     sha256(&format!("{book_no}|{room_type_key}|{body}"))
 }
 
-/// Build the `mssql_row_json` payload for a check-in PK group. Includes
-/// the full sorted details array so an operator can see what changed
-/// across all rooms on the booking — not just one row.
-fn checkin_group_json(cin_no: &str, details: &[CheckinDetail]) -> serde_json::Value {
-    let rows: Vec<serde_json::Value> = details
+/// Build the `mssql_row_json` payload for a check-in PK aggregate.
+/// Reads the legacy header (`HT_CheckIn_H`) once for the cross-row
+/// fields (`Cin_Date_in`, `Cin_cust_no`, `Cin_status`) and pairs them
+/// with each `HT_CheckIn_Ds` row's `Cin_Room_No` / `Cin_Room_Out` so
+/// an operator triaging the divergence sees what changed across every
+/// booked room — not just the first.
+///
+/// JSON shape is preserved across the 2026-05-18 unification refactor
+/// (v2.63.x → mapper-backed) so dashboards that parse the column keys
+/// continue to work. Every detail row repeats the header-derived
+/// fields verbatim (same redundancy the per-row JOIN projection used
+/// to produce), and `Cin_cust_name` is left `null` because the
+/// column was always populated from a view-derived alias that the
+/// parent loader does not project (kept under the same key for shape
+/// stability — see the original `CheckinDetail.cust_name = None`
+/// rationale in the prior projection's doc comment).
+fn checkin_aggregate_json(
+    cin_no: &str,
+    aggregate: &crate::sync::parent_loader::CheckInAggregate,
+) -> serde_json::Value {
+    use crate::sync::row::MappableRow;
+
+    let header_date_in = aggregate
+        .header
+        .as_ref()
+        .and_then(|h| h.try_get_datetime("Cin_Date_in").ok().flatten())
+        .map(|dt| dt.to_string());
+    let header_cust_no = aggregate
+        .header
+        .as_ref()
+        .and_then(|h| h.try_get_str("Cin_cust_no").ok().flatten())
+        .map(str::to_string);
+    let header_status = aggregate
+        .header
+        .as_ref()
+        .and_then(|h| h.try_get_str("Cin_status").ok().flatten())
+        .map(str::to_string);
+
+    let rows: Vec<serde_json::Value> = aggregate
+        .rooms
         .iter()
-        .map(|d| {
+        .map(|r| {
+            let room_no = r
+                .try_get_str("Cin_Room_No")
+                .ok()
+                .flatten()
+                .map(str::to_string);
+            let room_out = r
+                .try_get_datetime("Cin_Room_Out")
+                .ok()
+                .flatten()
+                .map(|dt| dt.to_string());
             json!({
-                "Cin_Room_No": d.room_no,
-                // JSON key reflects the projection's actual source column
-                // (Bug C fix 2026-05-15) so operators investigating drift
-                // see what was hashed, not what they might assume from the
-                // schema name.
-                "Cin_Date_in": d.room_in.map(|t| t.to_string()),
-                "Cin_Room_Out": d.room_out.map(|t| t.to_string()),
-                "Cin_cust_name": d.cust_name,
-                "Cin_cust_no": d.cust_no,
-                "Cin_status": d.status,
+                "Cin_Room_No": room_no,
+                // JSON key reflects the hashed source column
+                // (`HT_CheckIn_H.Cin_Date_in`, not the per-room
+                // `HT_CheckIn_Ds.Cin_Room_In`) so operators see what
+                // actually fed the hash.
+                "Cin_Date_in": header_date_in,
+                "Cin_Room_Out": room_out,
+                "Cin_cust_name": serde_json::Value::Null,
+                "Cin_cust_no": header_cust_no,
+                "Cin_status": header_status,
             })
         })
         .collect();
@@ -2847,95 +2842,66 @@ async fn upsert_booking_mirror(
 // Check-in Sync
 // =============================================================================
 
-/// Base-table-qualified projection for the check-in reconcile hash.
-/// Held as a module-private const so Track J1's projection-lock test
-/// can pin every column to its source table.
+/// Compute the MSSQL-side reconcile hash for a check-in aggregate via
+/// the CT mapper's authoritative projection. Mirrors
+/// [`compute_legacy_checkin_hash_via_mapper`] (auto-resolve sweep path)
+/// so the bulk reconcile loop and the per-PK auto-resolver agree on
+/// `(legacy_room_no, cin_checkin_time, effective_checkout_date,
+/// legacy_cust_no)` to the byte.
 ///
-/// **Why qualified columns + direct JOIN instead of `View_CheckIn_Ds`:**
-/// Prod incident 2026-05-15 (242 consecutive `sync_checkins` failures,
-/// `Token error: 'Invalid column name 'Cin_Date_in''`). The view's
-/// SELECT-list happens to expose `HT_CheckIn_H.Cin_Date` (record-created
-/// timestamp) but NOT `HT_CheckIn_H.Cin_Date_in` (guest-arrival
-/// timestamp), even though both columns exist on the base header table.
-/// The previous projection added `Cin_Date_in` to a `FROM View_CheckIn_Ds`
-/// query and every reconcile tick failed at the driver. Reading directly
-/// from `HT_CheckIn_H h INNER JOIN HT_CheckIn_Ds d ON h.Cin_no = d.Cin_No`
-/// bypasses the view's projection choices entirely — every column on
-/// either base table is reachable, and the projection-lock test
-/// (`checkins_reconcile_projection_columns_resolve_on_their_tables`)
-/// pins each entry to its declared table at CI time.
-///
-/// Mixed casing is verbatim from the base-table schema dump
-/// (`docs/legacy-spike/schema/01-baseline-schema.txt`, lines 208-248):
-/// header `HT_CheckIn_H` exposes lowercase `Cin_no` / `Cin_cust_no` /
-/// `Cin_status` / `Cin_Date_in`; detail `HT_CheckIn_Ds` exposes
-/// capital-N `Cin_No` / `Cin_Room_No` / `Cin_Room_Out`. The JOIN's
-/// `ON` clause uses both casings deliberately — SQL Server's default
-/// CI collation resolves them to the same identity at runtime but the
-/// projection-lock test reads them as literals.
-///
-/// **Why `Cin_Date_in` and NOT `Cin_Room_In`:** canonical
-/// `cin_checkin_time` is sourced from header `HT_CheckIn_H.Cin_Date_in`
-/// (via `derive_stay_range` in the CT checkin mapper). Detail
-/// `Cin_Room_In` is when the guest physically moved into that
-/// specific room — usually equal to `Cin_Date_in` for single-room
-/// flows but lags when a room is assigned/added later (we observed
-/// ~50min gaps in production audit 2026-05-15). Hashing the detail
-/// timestamp against the canonical header timestamp produced
-/// systematic false-positive value drift for every check-in with a
-/// late room assignment.
-///
-/// **Why no `Cin_cust_name`:** that column was a view-derived alias
-/// from `View_CheckIn_Ds`'s join with `View_Customers` — not a bare
-/// column on either base table. It was never part of
-/// `checkin_canonical_hash`'s inputs (the hash uses only legacy_pk +
-/// legacy_room_no + cin_checkin_time + cin_checkout_time +
-/// legacy_cust_no), so dropping it from the projection eliminates the
-/// view-only-column dependency without changing the hash. The
-/// `CheckinDetail.cust_name` field is preserved as `None` so the
-/// upsert-mode mirror's `cin_cust_name` column keeps NULLing rather
-/// than disappearing — DiffOnly is the hot path; Upsert is the
-/// bootstrap fallback and a NULL there is acceptable.
-///
-/// Counterpart of the Bug B fix that swapped `Cin_Room_Out` → date-only
-/// to align with canonical `cin_expected_checkout`. Both projections
-/// now read header columns for the timestamps the CT mapper mirrors.
-const CHECKINS_RECONCILE_PROJECTION: &[(&str, &str)] = &[
-    ("h", "Cin_no"),
-    ("d", "Cin_Room_No"),
-    ("h", "Cin_Date_in"),
-    ("d", "Cin_Room_Out"),
-    ("h", "Cin_cust_no"),
-    ("h", "Cin_status"),
-];
+/// **Why factored out:** the bulk sweep and the auto-resolver used to
+/// project the legacy aggregate independently — the auto-resolver via
+/// the mapper, the sweep via an in-Rust group/sort/representative pick
+/// over a `HT_CheckIn_H ⋈ HT_CheckIn_Ds` join. The two pipelines
+/// disagreed on multi-room folios (mapper picks the lowest-`Cin_Ds.id`
+/// row per `derive_room_state`; the sweep picked the alphabetical-first
+/// `Cin_Room_No`). Production audit 2026-05-18: 4 of 5 sampled
+/// multi-room PKs picked different first rooms, producing ~545 spurious
+/// `value` drifts on HF Hotel per tick. Unifying on the mapper here
+/// makes "Bug B / C / D class" structurally impossible in the bulk
+/// path too (cf. `compute_legacy_checkin_hash_via_mapper`'s doc).
+fn checkin_hash_from_canonical(
+    canonical: &crate::sync::mappers::checkin::CanonicalCheckIn,
+) -> String {
+    let effective_checkout: chrono::NaiveDate = canonical
+        .cin_checkout_time
+        .map(|dt: NaiveDateTime| dt.date())
+        .unwrap_or(canonical.cin_expected_checkout);
+    let effective_checkout_str = effective_checkout.to_string();
+    checkin_canonical_hash(
+        &canonical.legacy_cin_no,
+        canonical.legacy_room_no.as_deref(),
+        Some(canonical.cin_checkin_time.to_string()).as_deref(),
+        Some(effective_checkout_str).as_deref(),
+        canonical.legacy_cust_no.as_deref(),
+    )
+}
 
-/// Base-table FROM clause for the check-in reconcile SELECT. Pulled out
-/// as a const so the projection-lock test can introspect the JOIN
-/// shape without re-parsing the SQL string.
+/// Pure decision helper for the bulk reconcile loop: given the legacy
+/// (MSSQL) hash freshly projected via the mapper, the canonical PG
+/// hash, and the legacy/canonical row counts, classify the drift kind
+/// (or return `None` if the two hashes match and there's nothing to
+/// record).
 ///
-/// Note the WHERE-column casing per cheatsheet §3.4 / schema dump:
-/// `HT_CheckIn_H.Cin_no` (lowercase n) joins `HT_CheckIn_Ds.Cin_No`
-/// (capital N — the discrepancy is verbatim from the legacy schema).
-/// `parent_loader::load_checkin_aggregate` documents the same
-/// case-asymmetry contract.
-const CHECKINS_RECONCILE_FROM_CLAUSE: &str =
-    "HT_CheckIn_H h INNER JOIN HT_CheckIn_Ds d ON h.Cin_no = d.Cin_No";
-
-/// Build the `(select_sql, from_clause, projection)` triple for the
-/// check-in reconcile read. Pure helper so the projection-lock test
-/// can assert the same SQL the production path runs, without
-/// duplicating the string-format template.
-fn build_checkins_reconcile_select() -> (String, &'static str, &'static [(&'static str, &'static str)]) {
-    let projection = CHECKINS_RECONCILE_PROJECTION
-        .iter()
-        .map(|(alias, col)| format!("{alias}.{col}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT {projection} FROM {from}",
-        from = CHECKINS_RECONCILE_FROM_CLAUSE,
-    );
-    (sql, CHECKINS_RECONCILE_FROM_CLAUSE, CHECKINS_RECONCILE_PROJECTION)
+/// Pulled out as a free function so the unit tests can pin the
+/// "multi-room folio whose mapper-projected hash matches canonical
+/// must NOT report value drift" contract without standing up a PG
+/// pool or running the full async loop.
+fn classify_checkin_drift(
+    canonical_hash: Option<&str>,
+    mssql_hash: &str,
+    legacy_row_count: i32,
+    pg_row_count: i32,
+) -> Option<DivergenceKind> {
+    if canonical_hash == Some(mssql_hash) && legacy_row_count == pg_row_count {
+        return None;
+    }
+    Some(classify_divergence(
+        canonical_hash,
+        Some(mssql_hash),
+        legacy_row_count,
+        pg_row_count,
+    ))
 }
 
 async fn sync_checkins(
@@ -2946,81 +2912,104 @@ async fn sync_checkins(
     let mode = ReconcileMode::from_env();
     tracing::info!(?mode, "[Sync] Syncing check-ins...");
 
+    // 1. Pull the PK list with a cheap single-column scan. The
+    //    previous shape did one bulk JOIN that brought 41-45 rows back
+    //    per folio (~800k rows on HF Hotel), then re-implemented the
+    //    mapper's first-room projection in Rust. That parallel
+    //    projection disagreed with the CT mapper on multi-room folios
+    //    (the CT mapper picks the lowest-`Cin_Ds.id` row via
+    //    `derive_room_state`; the bulk loop picked the alphabetical-
+    //    first `Cin_Room_No`), producing ~545 spurious `value` drift
+    //    rows per tick on HF Hotel (2026-05-18 audit). Unifying on the
+    //    mapper eliminates the bug class — see
+    //    `compute_legacy_checkin_hash_via_mapper`'s doc comment.
     let mut conn = legacy_pool.get().await?;
-
-    let (checkins_select_sql, _, _) = build_checkins_reconcile_select();
-    let rows = conn
-        .simple_query(&checkins_select_sql)
+    let pk_rows = conn
+        .simple_query("SELECT DISTINCT Cin_no FROM HT_CheckIn_H ORDER BY Cin_no")
         .await?
         .into_first_result()
         .await?;
+    let cin_nos: Vec<String> = pk_rows
+        .iter()
+        .filter_map(|r| r.get::<&str, _>("Cin_no").map(String::from))
+        .collect();
+    // Free the pool slot before per-PK loads grab their own connection.
+    drop(conn);
 
     let mut added = 0i32;
     let mut updated = 0i32;
     let mut unchanged = 0i32;
+    let mut load_errors = 0i32;
+    let mut project_errors = 0i32;
 
-    // Phase 6 hotfix (2026-04-29): the `HT_CheckIn_H ⋈ HT_CheckIn_Ds`
-    // join returns 41-45 rows per `Cin_no` (one per booked room/detail).
-    // Aggregate by PK first, then compute one deterministic hash per
-    // PK, so we record one divergence + one cache UPDATE per PK instead
-    // of per-row.
+    // 2. For each PK: load the legacy aggregate (header + Ds + Pay)
+    //    and run it through the CT mapper's projection function. The
+    //    resulting `CanonicalCheckIn` is what canonical PG SHOULD look
+    //    like for this PK, so a hash mismatch with the actual canonical
+    //    row can only signal real exogenous drift (CT miss, hand-edited
+    //    PG) — never parallel-projection-pipeline divergence.
     //
-    // tiberius returns each column under its unqualified name (the
-    // alias prefix `h.` / `d.` only scopes resolution at parse time);
-    // `row.get("Cin_no")` reaches the JOIN output without re-prefixing.
-    let mut groups: BTreeMap<String, Vec<CheckinDetail>> = BTreeMap::new();
-    for row in &rows {
-        let cin_no = row.get::<&str, _>("Cin_no").unwrap_or_default().to_string();
-        let detail = CheckinDetail {
-            room_no: row.get::<&str, _>("Cin_Room_No").map(String::from),
-            // Bug C fix (2026-05-15) + prod hotfix (2026-05-18): read
-            // header `Cin_Date_in` directly from `HT_CheckIn_H` — see
-            // doc comment on `CHECKINS_RECONCILE_PROJECTION` for the
-            // why-not-the-view rationale. The struct field stays
-            // `room_in` for now; renaming is a separate cleanup.
-            room_in: row.try_get("Cin_Date_in").unwrap_or(None),
-            room_out: row.try_get("Cin_Room_Out").unwrap_or(None),
-            // `Cin_cust_name` was a view-derived alias and is no longer
-            // projected. The field stays so upsert-mode keeps writing
-            // `ht_checkins_legacy.cin_cust_name` (as NULL) and the
-            // JSON dump shape is unchanged.
-            cust_name: None,
-            cust_no: row.get::<&str, _>("Cin_cust_no").map(String::from),
-            status: row.get::<&str, _>("Cin_status").map(String::from),
+    //    Cost: ~3 MSSQL queries per PK × 19k PKs (HF Hotel) ≈ 57k
+    //    queries per tick, vs 1 bulk query previously. Still well
+    //    within the 15-min cron cadence (steady-state ~63 q/s, well
+    //    below same-LAN saturation).
+    for cin_no in &cin_nos {
+        let aggregate = match crate::sync::parent_loader::load_checkin_aggregate(
+            legacy_pool,
+            cin_no,
+        )
+        .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                load_errors += 1;
+                tracing::warn!(
+                    cin_no = %cin_no,
+                    error = %e,
+                    "[Sync] sync_checkins: load_checkin_aggregate failed; skipping PK"
+                );
+                continue;
+            }
         };
-        groups.entry(cin_no).or_default().push(detail);
-    }
+        // Cancelled / deleted folio — the CT watcher emits
+        // `CheckInCancelled` on its own; nothing for the sweep to do.
+        if !aggregate.is_present() {
+            continue;
+        }
+        let canonical_proj = match crate::sync::mappers::project_checkin_aggregate(
+            &aggregate, cin_no,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                project_errors += 1;
+                tracing::warn!(
+                    cin_no = %cin_no,
+                    error = %e,
+                    "[Sync] sync_checkins: project_checkin_aggregate failed; skipping PK"
+                );
+                continue;
+            }
+        };
 
-    for (cin_no, mut details) in groups {
-        // Same single-row-representative collapse as bookings — see
-        // `sort_checkin_details` for the determinism contract.
-        sort_checkin_details(&mut details);
-        let representative = details.first();
-
-        // v2.63.0: canonical-shape hash of the legacy projection.
-        // `cin_status` intentionally omitted (see `checkin_canonical_hash`
-        // docs). `cin_checkin_time` keeps `NaiveDateTime::to_string()`
-        // (`YYYY-MM-DD HH:MM:SS`) on both sides. `Cin_Room_Out` drops the
-        // time component to align with canonical `cin_expected_checkout`
-        // (a `DATE` — see `CanonicalCheckinRow` doc comment for the
-        // field-semantic rationale).
-        let room_in_str = representative.and_then(|d| d.room_in.map(|t| t.to_string()));
-        let room_out_date_str =
-            representative.and_then(|d| d.room_out.map(|t| t.date().to_string()));
-        let mssql_hash = checkin_canonical_hash(
-            &cin_no,
-            representative.and_then(|d| d.room_no.as_deref()),
-            room_in_str.as_deref(),
-            room_out_date_str.as_deref(),
-            representative.and_then(|d| d.cust_no.as_deref()),
-        );
+        // Hash inputs are byte-identical to
+        // `compute_legacy_checkin_hash_via_mapper` (auto-resolve sweep)
+        // so the two paths produce the same string for the same
+        // aggregate. The ack-cache (`ht_checkins_legacy.sync_hash`)
+        // was stamped under the prior per-row projection, but the
+        // chosen first-room row is determined by the mapper's
+        // `derive_room_state` (lowest `Cin_Ds.id`) — which is also
+        // what canonical-side `ht_checkins.legacy_room_no` holds. So
+        // for any folio where canonical is correct, the new hash
+        // equals what canonical hashes to today, and the ack cache
+        // converges on the next tick.
+        let mssql_hash = checkin_hash_from_canonical(&canonical_proj);
 
         match mode {
             ReconcileMode::Upsert => {
                 upsert_checkin_mirror(
                     pg_pool,
-                    &cin_no,
-                    representative,
+                    cin_no,
+                    &canonical_proj,
                     &mssql_hash,
                     &mut added,
                     &mut updated,
@@ -3032,7 +3021,7 @@ async fn sync_checkins(
                 let last_ack = sqlx::query_scalar::<_, Option<String>>(
                     "SELECT sync_hash FROM ht_checkins_legacy WHERE cin_no = $1",
                 )
-                .bind(&cin_no)
+                .bind(cin_no)
                 .fetch_optional(pg_pool)
                 .await?;
 
@@ -3041,13 +3030,13 @@ async fn sync_checkins(
                     continue;
                 }
 
-                let canonical = fetch_canonical_checkin(pg_pool, &cin_no).await?;
+                let canonical = fetch_canonical_checkin(pg_pool, cin_no).await?;
                 let canonical_hash = canonical.as_ref().map(|c| {
                     let checkin_str = c.cin_checkin_time.map(|t| t.to_string());
                     let effective_checkout_str =
                         c.effective_checkout_date().map(|d| d.to_string());
                     checkin_canonical_hash(
-                        &cin_no,
+                        cin_no,
                         c.legacy_room_no.as_deref(),
                         checkin_str.as_deref(),
                         effective_checkout_str.as_deref(),
@@ -3055,49 +3044,15 @@ async fn sync_checkins(
                     )
                 });
 
-                if canonical_hash.as_deref() == Some(mssql_hash.as_str()) {
-                    ack_checkin_mirror(pg_pool, &cin_no, &mssql_hash).await;
-                    unchanged += 1;
-                    continue;
-                }
-
-                let mssql_json = checkin_group_json(&cin_no, &details);
-                let pg_json = canonical.as_ref().map(|c| {
-                    json!({
-                        "legacy_room_no": c.legacy_room_no,
-                        "cin_checkin_time": c.cin_checkin_time.map(|t| t.to_string()),
-                        // Bug D fix (2026-05-16) — surface BOTH the actual and
-                        // expected checkout dates for operator triage. Hash uses
-                        // `effective_checkout_date()` (actual if set, else
-                        // expected); JSON exposes both so the operator can see
-                        // which one matched / mismatched the legacy
-                        // `Cin_Room_Out` shown in mssql_row_json.
-                        "cin_checkout_time": c.cin_checkout_time.map(|t| t.to_string()),
-                        "cin_expected_checkout": c.cin_expected_checkout.map(|d| d.to_string()),
-                        "legacy_cust_no": c.legacy_cust_no,
-                    })
-                });
-                // Track D / T7 CRIT-1: check-ins are the headline
-                // cardinality-drift case. `View_CheckIn_Ds` returns
-                // 41-45 rows per `Cin_no` (one per booked room) but
-                // canonical `ht_checkins` denormalises only the first
-                // room into a single row.
-                //
-                // 2026-05-18 wire-up (Track B last mile): after the
-                // junction table `ht_checkin_rooms` shipped and the CT
-                // mapper + backfill bin populated it, `pg_row_count`
-                // now reads the ACTUAL per-room count instead of the
-                // pre-Track-B hardcoded `1`. Multi-room folios whose
-                // junction is fully populated collapse from
-                // `Cardinality` to `Value` (and, with matching first-
-                // room data, get silently acked via
-                // `is_silenceable()`). On a query failure we fall back
-                // to `1` (the pre-Track-B observation) rather than `0`
-                // — degraded observability beats spurious "missing_pg"
-                // misclassification — and emit a warn log.
-                let legacy_row_count: i32 = details.len() as i32;
+                // Track D / T7 CRIT-1 / Track B last-mile (2026-05-18):
+                // `pg_row_count` reads the ACTUAL per-room junction
+                // count (`ht_checkin_rooms`). On a query failure fall
+                // back to `1` (pre-Track-B observation) rather than
+                // `0` — degraded observability beats spurious
+                // `missing_pg` misclassification — and warn-log.
+                let legacy_row_count: i32 = aggregate.rooms.len() as i32;
                 let pg_row_count: i32 = if canonical.is_some() {
-                    match count_canonical_checkin_rooms(pg_pool, &cin_no).await {
+                    match count_canonical_checkin_rooms(pg_pool, cin_no).await {
                         Ok(n) => n,
                         Err(e) => {
                             tracing::warn!(
@@ -3113,16 +3068,43 @@ async fn sync_checkins(
                 } else {
                     0
                 };
-                let kind = classify_divergence(
+
+                let drift_kind = classify_checkin_drift(
                     canonical_hash.as_deref(),
-                    Some(&mssql_hash),
+                    &mssql_hash,
                     legacy_row_count,
                     pg_row_count,
                 );
+
+                let Some(kind) = drift_kind else {
+                    // Hashes match AND row counts agree — converged.
+                    // Ack the cache so the next tick short-circuits at
+                    // the `last_ack` compare above.
+                    ack_checkin_mirror(pg_pool, cin_no, &mssql_hash).await;
+                    unchanged += 1;
+                    continue;
+                };
+
+                let mssql_json = checkin_aggregate_json(cin_no, &aggregate);
+                let pg_json = canonical.as_ref().map(|c| {
+                    json!({
+                        "legacy_room_no": c.legacy_room_no,
+                        "cin_checkin_time": c.cin_checkin_time.map(|t| t.to_string()),
+                        // Bug D fix (2026-05-16) — surface BOTH the actual
+                        // and expected checkout dates for operator triage.
+                        // Hash uses `effective_checkout_date()` (actual if
+                        // set, else expected); JSON exposes both so the
+                        // operator can see which one matched / mismatched
+                        // the legacy `Cin_Room_Out` shown in mssql_row_json.
+                        "cin_checkout_time": c.cin_checkout_time.map(|t| t.to_string()),
+                        "cin_expected_checkout": c.cin_expected_checkout.map(|d| d.to_string()),
+                        "legacy_cust_no": c.legacy_cust_no,
+                    })
+                });
                 record_divergence(
                     pg_pool,
                     "checkins",
-                    &cin_no,
+                    cin_no,
                     canonical_hash.as_deref(),
                     Some(&mssql_hash),
                     mssql_json,
@@ -3133,7 +3115,7 @@ async fn sync_checkins(
                 )
                 .await;
                 if kind.is_silenceable() {
-                    ack_checkin_mirror(pg_pool, &cin_no, &mssql_hash).await;
+                    ack_checkin_mirror(pg_pool, cin_no, &mssql_hash).await;
                 }
                 if canonical.is_none() {
                     added += 1;
@@ -3144,6 +3126,16 @@ async fn sync_checkins(
         }
     }
 
+    if load_errors > 0 || project_errors > 0 {
+        tracing::warn!(
+            load_errors,
+            project_errors,
+            "[Sync] sync_checkins: {} aggregate loads / {} projections failed (per-PK skipped, see warn logs)",
+            load_errors,
+            project_errors,
+        );
+    }
+
     let duration_ms = start.elapsed().as_millis() as i32;
     tracing::info!(
         "[Sync] Check-ins ({:?}): {} added, {} updated, {} unchanged in {}ms",
@@ -3152,24 +3144,6 @@ async fn sync_checkins(
     record_success(pg_pool, "checkins", added, updated, unchanged, duration_ms).await;
 
     Ok(())
-}
-
-/// Sort a check-in PK group's detail rows deterministically. Mirrors
-/// the sort contract in [`aggregate_checkin_hash`] so the "first" row
-/// is stable across reconcile ticks regardless of MSSQL row order.
-fn sort_checkin_details(details: &mut [CheckinDetail]) {
-    details.sort_by(|a, b| {
-        (
-            fmt_str(&a.room_no),
-            fmt_dt(&a.room_in),
-            fmt_dt(&a.room_out),
-        )
-            .cmp(&(
-                fmt_str(&b.room_no),
-                fmt_dt(&b.room_in),
-                fmt_dt(&b.room_out),
-            ))
-    });
 }
 
 /// Canonical-side projection of a check-in row for hashing. Resolved
@@ -3269,8 +3243,9 @@ async fn fetch_canonical_checkin(
 /// FIRST room (see `checkin_canonical_hash`). Once row counts match,
 /// drift on a SECONDARY room would still be invisible to the hash. A
 /// future PR that rotates the canonical hash format to hash ALL
-/// junction rows (mirroring `aggregate_checkin_hash`) would close that
-/// blind spot, but is out of scope here because rotating the hash
+/// junction rows (mirroring `aggregate_booking_hash`'s shape) would
+/// close that blind spot, but is out of scope here because rotating
+/// the hash
 /// invalidates every `ht_checkins_legacy.sync_hash` entry and would
 /// trigger a deploy-time alert flood (cf. 2026-05-15).
 async fn count_canonical_checkin_rooms(
@@ -3314,11 +3289,32 @@ async fn ack_checkin_mirror(pg_pool: &PgPool, cin_no: &str, mssql_hash: &str) {
     }
 }
 
+/// Pre-Phase-5.5 escape-hatch path: UPSERT the `ht_checkins_legacy`
+/// mirror's data columns from the CT mapper's canonical projection.
+/// Not exercised in production after v2.63.0 — preserved for forensic
+/// rollback flexibility only.
+///
+/// Field mapping mirrors the prior per-row `CheckinDetail`-backed
+/// shape so the mirror schema is unchanged:
+/// * `cin_room_no`  ← `canonical.legacy_room_no` (mapper's first-room
+///                     denormalisation per `derive_room_state`)
+/// * `cin_room_in`  ← `canonical.cin_checkin_time` (header `Cin_Date_in`)
+/// * `cin_room_out` ← `canonical.cin_checkout_time` when set,
+///                     else midnight of `cin_expected_checkout`
+///                     (preserves the `NaiveDateTime` column type — the
+///                     mapper's date-only `cin_expected_checkout`
+///                     would require a column-type change otherwise).
+/// * `cin_cust_name` ← `NULL` (this column was always populated from
+///                     a view-derived alias the parent loader does
+///                     not project; left NULL pre-2026-05-18 too).
+/// * `cin_cust_no`  ← `canonical.legacy_cust_no`
+/// * `cin_status`   ← `canonical.cin_status` (mapper's translated
+///                     literal — `active` / `checkedout` / `cancelled`).
 #[allow(clippy::too_many_arguments)]
 async fn upsert_checkin_mirror(
     pg_pool: &PgPool,
     cin_no: &str,
-    representative: Option<&CheckinDetail>,
+    canonical: &crate::sync::mappers::checkin::CanonicalCheckIn,
     mssql_hash: &str,
     added: &mut i32,
     updated: &mut i32,
@@ -3331,9 +3327,12 @@ async fn upsert_checkin_mirror(
     .fetch_optional(pg_pool)
     .await?;
 
-    let Some(rep) = representative else {
-        return Ok(());
-    };
+    let room_in: Option<NaiveDateTime> = Some(canonical.cin_checkin_time);
+    let room_out: Option<NaiveDateTime> = canonical.cin_checkout_time.or_else(|| {
+        chrono::NaiveTime::from_hms_opt(0, 0, 0)
+            .map(|t| canonical.cin_expected_checkout.and_time(t))
+    });
+    let cust_name: Option<&str> = None;
 
     match existing {
         Some(Some(existing_hash)) if existing_hash == mssql_hash => {
@@ -3349,12 +3348,12 @@ async fn upsert_checkin_mirror(
                 WHERE cin_no = $8
                 "#,
             )
-            .bind(&rep.room_no)
-            .bind(rep.room_in)
-            .bind(rep.room_out)
-            .bind(&rep.cust_name)
-            .bind(&rep.cust_no)
-            .bind(&rep.status)
+            .bind(&canonical.legacy_room_no)
+            .bind(room_in)
+            .bind(room_out)
+            .bind(cust_name)
+            .bind(&canonical.legacy_cust_no)
+            .bind(&canonical.cin_status)
             .bind(mssql_hash)
             .bind(cin_no)
             .execute(pg_pool)
@@ -3371,12 +3370,12 @@ async fn upsert_checkin_mirror(
                 "#,
             )
             .bind(cin_no)
-            .bind(&rep.room_no)
-            .bind(rep.room_in)
-            .bind(rep.room_out)
-            .bind(&rep.cust_name)
-            .bind(&rep.cust_no)
-            .bind(&rep.status)
+            .bind(&canonical.legacy_room_no)
+            .bind(room_in)
+            .bind(room_out)
+            .bind(cust_name)
+            .bind(&canonical.legacy_cust_no)
+            .bind(&canonical.cin_status)
             .bind(mssql_hash)
             .execute(pg_pool)
             .await?;
@@ -3639,73 +3638,182 @@ mod tests {
         )
     }
 
-    fn checkin_detail(
-        room: &str,
-        in_dt: Option<NaiveDateTime>,
-        out_dt: Option<NaiveDateTime>,
-    ) -> CheckinDetail {
-        CheckinDetail {
-            room_no: Some(room.to_string()),
-            room_in: in_dt,
-            room_out: out_dt,
-            cust_name: Some("Somchai".to_string()),
-            cust_no: Some("C001".to_string()),
-            status: Some("OPEN".to_string()),
-        }
+    // -------------------------------------------------------------------
+    // sync_checkins mapper-unification (2026-05-18)
+    // -------------------------------------------------------------------
+    //
+    // The pre-2026-05-18 bulk sweep grouped `HT_CheckIn_H ⋈ HT_CheckIn_Ds`
+    // rows in Rust and picked the alphabetical-first `Cin_Room_No` as
+    // the representative. The CT mapper picks the lowest-`Cin_Ds.id`
+    // row (via `derive_room_state`). On multi-room folios where those
+    // pick different rooms, every reconcile tick inserted a spurious
+    // `value` drift. The pinned tests below cover the unified shape:
+    // `classify_checkin_drift` returns `None` when the mapper-projected
+    // legacy hash matches canonical, regardless of room ordering.
+
+    /// Build the hash inputs a single-folio check-in produces when its
+    /// canonical PG projection picks `legacy_room_no` as the
+    /// representative room. Mirrors the byte-shape of
+    /// [`checkin_hash_from_canonical`] for the given inputs without
+    /// requiring a full `CanonicalCheckIn` construction (which has
+    /// private fields the mapper guards). Hash inputs are stable
+    /// across both the bulk sweep and the auto-resolve sweep — what
+    /// this test fixture pins is the cross-pipeline equality, not a
+    /// new format.
+    fn projected_hash(
+        cin_no: &str,
+        legacy_room_no: &str,
+        cust_no: &str,
+    ) -> String {
+        let checkin_dt = NaiveDate::from_ymd_opt(2026, 4, 1)
+            .unwrap()
+            .and_hms_opt(14, 0, 0)
+            .unwrap();
+        let expected_out = NaiveDate::from_ymd_opt(2026, 4, 3).unwrap();
+        checkin_canonical_hash(
+            cin_no,
+            Some(legacy_room_no),
+            Some(checkin_dt.to_string()).as_deref(),
+            Some(expected_out.to_string()).as_deref(),
+            Some(cust_no),
+        )
     }
 
+    /// Regression guard for the headline bug class
+    /// (`docs/coexistence/data-hygiene-ch25-002081.md`): a multi-room
+    /// folio whose canonical `legacy_room_no` matches the mapper's
+    /// `derive_room_state` first-room pick MUST classify as "no drift".
+    /// Pre-fix the bulk sweep re-implemented the projection in Rust
+    /// and picked the alphabetical-first `Cin_Room_No` instead of the
+    /// lowest-`Cin_Ds.id` row the CT mapper picks, disagreeing with
+    /// canonical on every multi-room folio whose lowest-id row wasn't
+    /// also alphabetically first — ~545 spurious `value` drift rows
+    /// per tick on HF Hotel (2026-05-18 audit).
+    ///
+    /// Post-fix: both the bulk sweep and canonical resolve via the
+    /// same `project_checkin_aggregate`, so the representative pick
+    /// agrees by construction and no drift fires.
     #[test]
-    fn aggregate_checkin_hash_is_order_independent() {
-        let a = checkin_detail("101", dt(2026, 4, 1, 14, 0), dt(2026, 4, 3, 12, 0));
-        let b = checkin_detail("102", dt(2026, 4, 1, 14, 0), dt(2026, 4, 3, 12, 0));
-        let c = checkin_detail("103", dt(2026, 4, 1, 14, 0), dt(2026, 4, 3, 12, 0));
+    fn multi_room_pk_with_matching_first_room_reports_no_drift() {
+        // Both sides project the same first room (the mapper's pick).
+        let mapper_hash = projected_hash("CIN-1", "203", "C001");
+        let canonical_hash = projected_hash("CIN-1", "203", "C001");
 
-        let mut forward = vec![a.clone(), b.clone(), c.clone()];
-        let mut reversed = vec![c, b, a];
+        let drift = classify_checkin_drift(
+            Some(&canonical_hash),
+            &mapper_hash,
+            3, // legacy rooms
+            3, // pg junction rooms
+        );
 
-        let h1 = aggregate_checkin_hash("CIN-1", &mut forward);
-        let h2 = aggregate_checkin_hash("CIN-1", &mut reversed);
-        assert_eq!(h1, h2, "row order must not affect the aggregate hash");
+        assert!(
+            drift.is_none(),
+            "mapper-projected hash for the first room MUST equal canonical's \
+             stored first room (both are the lowest-Cin_Ds.id row); the \
+             bulk sweep no longer disagrees on which room is representative — \
+             pre-fix this returned DivergenceKind::Value on every multi-room \
+             folio where alphabetical-first ≠ lowest-id"
+        );
     }
 
+    /// The exact bug class we eliminated: pre-fix the bulk sweep
+    /// picked the alphabetical-first room ("101") while canonical PG
+    /// stored "203" (the mapper's lowest-id pick). The hash mismatch
+    /// re-fired `DivergenceKind::Value` on every tick. This test
+    /// pins the pre-fix behaviour AS A REGRESSION SHAPE and asserts
+    /// the post-fix shape (both sides project via the mapper)
+    /// converges.
     #[test]
-    fn aggregate_checkin_hash_changes_when_a_field_changes() {
-        let a = checkin_detail("101", dt(2026, 4, 1, 14, 0), dt(2026, 4, 3, 12, 0));
-        let mut original = vec![a.clone()];
-        let mut mutated = vec![CheckinDetail {
-            status: Some("CLOSED".to_string()),
-            ..a
-        }];
+    fn pre_fix_alphabetical_vs_lowest_id_pick_diverges_but_unified_converges() {
+        let alpha_first_hash = projected_hash("CIN-1", "101", "C001");
+        let mapper_pick_hash = projected_hash("CIN-1", "203", "C001");
 
-        let h1 = aggregate_checkin_hash("CIN-1", &mut original);
-        let h2 = aggregate_checkin_hash("CIN-1", &mut mutated);
-        assert_ne!(h1, h2, "field change must produce a different hash");
+        // Pre-fix shape: sweep hashed "101", canonical stored "203" →
+        // spurious value drift every tick.
+        let pre_fix_drift =
+            classify_checkin_drift(Some(&mapper_pick_hash), &alpha_first_hash, 3, 3);
+        assert_eq!(
+            pre_fix_drift,
+            Some(DivergenceKind::Value),
+            "pre-fix sweep picked '101' alphabetically, canonical PG stored \
+             '203' from the mapper — this hash mismatch was the spurious \
+             drift signal the unification eliminates"
+        );
+
+        // Post-fix shape: both sides project via the mapper → same
+        // first room → no drift.
+        let post_fix_drift =
+            classify_checkin_drift(Some(&mapper_pick_hash), &mapper_pick_hash, 3, 3);
+        assert!(
+            post_fix_drift.is_none(),
+            "unifying the sweep on the CT mapper eliminates the parallel- \
+             projection mismatch by construction"
+        );
     }
 
+    /// Negative guard: real value drift (e.g. CT-watcher missed the
+    /// update, canonical stuck on an old cust_no) must still classify
+    /// as `Value`. The fix narrows false positives, not signal.
     #[test]
-    fn aggregate_checkin_hash_handles_single_row_pk() {
-        // Smoke test for the common case: 1:1 PKs (which `Cin_no`
-        // technically is for the older customer subset). Helper must
-        // not panic and must return a stable hash.
-        let a = checkin_detail("101", dt(2026, 4, 1, 14, 0), dt(2026, 4, 3, 12, 0));
-        let mut once = vec![a.clone()];
-        let mut twice = vec![a];
+    fn genuine_value_drift_still_classifies_as_value() {
+        // Mapper sees new cust_no in legacy; canonical PG is stale.
+        let mapper_hash = projected_hash("CIN-1", "203", "C001-NEW");
+        let canonical_stale_hash = projected_hash("CIN-1", "203", "C001-OLD");
 
-        let h1 = aggregate_checkin_hash("CIN-1", &mut once);
-        let h2 = aggregate_checkin_hash("CIN-1", &mut twice);
-        assert_eq!(h1, h2);
-        assert!(!h1.is_empty());
+        let drift = classify_checkin_drift(
+            Some(&canonical_stale_hash),
+            &mapper_hash,
+            3,
+            3,
+        );
+
+        assert_eq!(
+            drift,
+            Some(DivergenceKind::Value),
+            "hash mismatch with matching cardinality must remain Value drift"
+        );
     }
 
+    /// Cardinality drift (junction row count short of legacy) MUST
+    /// keep classifying as `Cardinality` regardless of hash match.
     #[test]
-    fn aggregate_checkin_hash_distinguishes_pk() {
-        let a = checkin_detail("101", dt(2026, 4, 1, 14, 0), dt(2026, 4, 3, 12, 0));
-        let mut g1 = vec![a.clone()];
-        let mut g2 = vec![a];
+    fn cardinality_drift_classifies_even_when_hashes_match() {
+        let hash = projected_hash("CIN-1", "203", "C001");
 
-        let h1 = aggregate_checkin_hash("CIN-1", &mut g1);
-        let h2 = aggregate_checkin_hash("CIN-2", &mut g2);
-        assert_ne!(h1, h2, "PK must be part of the hashed material");
+        let drift = classify_checkin_drift(
+            Some(&hash),
+            &hash,
+            3, // legacy rooms
+            2, // pg junction rooms short
+        );
+
+        assert_eq!(
+            drift,
+            Some(DivergenceKind::Cardinality),
+            "row-count asymmetry must surface as Cardinality drift, \
+             even when first-room hashes converge"
+        );
+    }
+
+    /// `missing_pg` drift (canonical has nothing for this PK) must
+    /// surface even when the mapper produces a valid hash.
+    #[test]
+    fn missing_canonical_classifies_as_missing_pg() {
+        let mapper_hash = projected_hash("CIN-1", "203", "C001");
+
+        let drift = classify_checkin_drift(
+            None,           // canonical absent
+            &mapper_hash,
+            3,              // legacy rooms
+            0,              // no canonical rooms
+        );
+
+        assert_eq!(
+            drift,
+            Some(DivergenceKind::MissingPg),
+            "canonical-absent must remain a MissingPg signal — the highest- \
+             priority drift kind operators page on"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -3978,115 +4086,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn checkins_reconcile_projection_columns_resolve_on_their_tables() {
-        // Prod hotfix 2026-05-18 — the precursor test only asserted
-        // "this column is on one of the two base tables", which the
-        // failing `Cin_Date_in` projection passed (it's on
-        // `HT_CheckIn_H`) even though it was being SELECTed from
-        // `View_CheckIn_Ds`, which doesn't expose it. The new
-        // contract: every projection entry is a `(alias, column)`
-        // pair, and the column MUST exist on the table the alias
-        // resolves to per the FROM clause. An unqualified column or
-        // a mis-aliased column fails CI.
-
-        use crate::sync::projection_guard::parse_baseline_columns;
-
-        // 1. Extract the alias-to-table mapping from the canonical
-        //    FROM clause. Format is
-        //    `HT_CheckIn_H h INNER JOIN HT_CheckIn_Ds d ON …` — split
-        //    on whitespace, every `<TABLE> <alias>` pair is two
-        //    consecutive tokens immediately after the
-        //    `(FROM|JOIN)` keyword.
-        let from_clause = CHECKINS_RECONCILE_FROM_CLAUSE;
-        let tokens: Vec<&str> = from_clause.split_whitespace().collect();
-        let mut alias_to_table: std::collections::HashMap<&str, &str> =
-            std::collections::HashMap::new();
-        // First two tokens after the implicit FROM: `HT_CheckIn_H h`.
-        if tokens.len() >= 2 {
-            alias_to_table.insert(tokens[1], tokens[0]);
-        }
-        // Any `JOIN <TABLE> <alias>` triple later in the clause.
-        for window in tokens.windows(3) {
-            if window[0].eq_ignore_ascii_case("JOIN") {
-                alias_to_table.insert(window[2], window[1]);
-            }
-        }
-        assert!(
-            alias_to_table.contains_key("h"),
-            "alias `h` not found in FROM clause `{from_clause}`",
-        );
-        assert!(
-            alias_to_table.contains_key("d"),
-            "alias `d` not found in FROM clause `{from_clause}`",
-        );
-
-        // 2. For each projection entry, look up the declared alias
-        //    and assert the column exists on that specific table per
-        //    the baseline schema dump.
-        for (alias, col) in CHECKINS_RECONCILE_PROJECTION.iter() {
-            assert!(
-                !alias.is_empty(),
-                "projection entry `{col}` has empty alias — every column \
-                 MUST declare which base table it lives on (prod hotfix \
-                 2026-05-18: an unqualified `Cin_Date_in` resolved at the \
-                 wrong table caused 242 consecutive reconcile failures)",
-            );
-            let table = alias_to_table.get(alias).unwrap_or_else(|| {
-                panic!(
-                    "projection entry `{alias}.{col}` references unknown \
-                     alias `{alias}` — declared aliases in FROM clause: {:?}",
-                    alias_to_table.keys().collect::<Vec<_>>(),
-                )
-            });
-            let allowed = parse_baseline_columns(table);
-            assert!(
-                !allowed.is_empty(),
-                "no baseline columns found for `{table}` — schema dump \
-                 may be missing it",
-            );
-            assert!(
-                allowed.contains(&col.to_lowercase()),
-                "projection entry `{alias}.{col}` references column `{col}` \
-                 which is NOT on `{table}` per the HF Hotel legacy schema \
-                 baseline (docs/legacy-spike/schema/01-baseline-schema.txt). \
-                 Either the alias is wrong or the column doesn't exist. \
-                 Prod hotfix 2026-05-18: this is the exact bug class \
-                 `edc600a` shipped — `Cin_Date_in` was added to a \
-                 projection that targeted the wrong table (the view), \
-                 and every reconcile tick failed at the driver.",
-            );
-        }
-
-        // 3. The production code path MUST use the same projection +
-        //    FROM clause this test introspects. Assert the helper
-        //    returns the lock-tested values verbatim.
-        let (sql, from, projection) = build_checkins_reconcile_select();
-        assert_eq!(from, CHECKINS_RECONCILE_FROM_CLAUSE);
-        assert_eq!(
-            projection.len(),
-            CHECKINS_RECONCILE_PROJECTION.len(),
-            "helper must return the same projection slice the lock test pins",
-        );
-        for (returned, expected) in
-            projection.iter().zip(CHECKINS_RECONCILE_PROJECTION.iter())
-        {
-            assert_eq!(
-                returned, expected,
-                "helper projection drift — expected {expected:?}, got {returned:?}",
-            );
-        }
-        assert!(
-            sql.contains(CHECKINS_RECONCILE_FROM_CLAUSE),
-            "built SQL must include the locked FROM clause: {sql}",
-        );
-        for (alias, col) in CHECKINS_RECONCILE_PROJECTION.iter() {
-            assert!(
-                sql.contains(&format!("{alias}.{col}")),
-                "built SQL must include qualified column `{alias}.{col}`: {sql}",
-            );
-        }
-    }
+    // sync_checkins no longer maintains its own MSSQL projection — it
+    // delegates per-PK to `parent_loader::load_checkin_aggregate` +
+    // `mappers::project_checkin_aggregate` (the CT mapper's own
+    // pipeline). The Track J1 projection-lock test for those columns
+    // lives at `sync::parent_loader::tests::checkin_h_projection_*`
+    // and `sync::mappers::checkin::tests::checkin_ds_projection_*`
+    // respectively. Nothing in this module owns a parallel projection
+    // any more, so the local lock test is retired.
 
     #[test]
     fn bool_to_yesno_round_trip_via_legacy_yesno_canonical() {
