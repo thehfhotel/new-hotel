@@ -227,6 +227,15 @@ struct ExistingBooking {
     book_deposit_amount: Option<f64>,
     book_checkin: NaiveDate,
     book_checkout: NaiveDate,
+    /// Current `ht_booking_rooms` row count for this booking. Needed by
+    /// `existing_matches` so a header-unchanged + rooms-changed transition
+    /// (notably N→0 from iHOTEL's §3.7 delete-then-reinsert or §3.6
+    /// cancel-on-room flows) is NOT treated as idempotent. Without this
+    /// the early-return skips `replace_rooms` and leaves stale junction
+    /// rows behind — regression caught by
+    /// `re_apply_with_zero_rooms_clears_stale_booking_rooms` in CI on
+    /// 2026-05-18.
+    rooms_count: i64,
 }
 
 /// In-memory projection of the legacy aggregate, in canonical PG shape.
@@ -556,27 +565,38 @@ async fn fetch_existing(
     .fetch_optional(&mut **tx)
     .await?;
 
-    Ok(row.map(
-        |(
-            book_id_serial,
-            aggregate_id,
-            book_status,
-            book_cust_id,
-            book_total_amount,
-            book_deposit_amount,
-            book_checkin,
-            book_checkout,
-        )| ExistingBooking {
-            book_id_serial,
-            aggregate_id,
-            book_status,
-            book_cust_id,
-            book_total_amount,
-            book_deposit_amount,
-            book_checkin,
-            book_checkout,
-        },
-    ))
+    let Some((
+        book_id_serial,
+        aggregate_id,
+        book_status,
+        book_cust_id,
+        book_total_amount,
+        book_deposit_amount,
+        book_checkin,
+        book_checkout,
+    )) = row
+    else {
+        return Ok(None);
+    };
+
+    let rooms_count: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM ht_booking_rooms WHERE br_book_id = $1",
+    )
+    .bind(book_id_serial)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    Ok(Some(ExistingBooking {
+        book_id_serial,
+        aggregate_id,
+        book_status,
+        book_cust_id,
+        book_total_amount,
+        book_deposit_amount,
+        book_checkin,
+        book_checkout,
+        rooms_count,
+    }))
 }
 
 /// Compare the existing canonical row to the freshly projected legacy
@@ -587,6 +607,7 @@ fn existing_matches(ex: &ExistingBooking, p: &CanonicalProjection) -> bool {
         && ex.book_deposit_amount == p.deposit_amount
         && ex.book_checkin == p.book_checkin
         && ex.book_checkout == p.book_checkout
+        && ex.rooms_count == p.rooms.len() as i64
 }
 
 async fn update_existing(
@@ -1065,6 +1086,7 @@ mod tests {
             book_deposit_amount: Some(0.0),
             book_checkin: p.book_checkin,
             book_checkout: p.book_checkout,
+            rooms_count: p.rooms.len() as i64,
         };
         assert!(existing_matches(&ex, &p));
     }
@@ -1081,6 +1103,7 @@ mod tests {
             book_deposit_amount: Some(0.0),
             book_checkin: p.book_checkin,
             book_checkout: p.book_checkout,
+            rooms_count: p.rooms.len() as i64,
         };
         assert!(!existing_matches(&ex, &p));
     }
@@ -1097,6 +1120,24 @@ mod tests {
             book_deposit_amount: Some(0.0),
             book_checkin: p.book_checkin,
             book_checkout: p.book_checkout,
+            rooms_count: p.rooms.len() as i64,
+        };
+        assert!(!existing_matches(&ex, &p));
+    }
+
+    #[test]
+    fn existing_matches_returns_false_when_rooms_count_differs() {
+        let p = sample_projection();
+        let ex = ExistingBooking {
+            book_id_serial: 1,
+            aggregate_id: Some(uuid::Uuid::nil()),
+            book_status: Some("confirmed".into()),
+            book_cust_id: 100,
+            book_total_amount: Some(890.0),
+            book_deposit_amount: Some(0.0),
+            book_checkin: p.book_checkin,
+            book_checkout: p.book_checkout,
+            rooms_count: (p.rooms.len() + 1) as i64,
         };
         assert!(!existing_matches(&ex, &p));
     }
