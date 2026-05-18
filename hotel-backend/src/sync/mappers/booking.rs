@@ -261,6 +261,39 @@ struct RoomLine {
 ///   (or a new one was inserted, or the booking was cancelled).
 /// * `Ok(None)` when the canonical row already mirrors the legacy
 ///   aggregate (idempotent skip).
+///
+/// ## Header-only bookings (iHOTEL coexistence)
+///
+/// `aggregate.rooms.is_empty()` is a **legitimate, persistable state** —
+/// it mirrors the legacy `HT_Book_H` row existing with zero matching
+/// `HT_Book_Ds` lines. Several iHOTEL flows leave the aggregate in this
+/// shape:
+///
+/// 1. **ClickBook cancel-on-room** (cheatsheet §3.6) deletes every
+///    `HT_Book_Ds` for the booking but does NOT delete the `HT_Book_H`
+///    header — the header lingers (often with `Book_Status='ยกเลิก'` or
+///    `'จอง'`) while the per-room lines are gone.
+/// 2. **FrmAddBook2.SAVE_EDIT delete-then-reinsert** (cheatsheet §3.7)
+///    transiently deletes every `HT_Book_Ds` before re-inserting the
+///    edited set. CT can surface a snapshot mid-edit.
+/// 3. **Pre-bootstrap / pre-CT data**: bookings that completed before
+///    Phase 5.x CT bootstrap may have lost their Ds rows to the
+///    `frmMain1` 60-day startup prune (cheatsheet §3.7 "Startup prune")
+///    while the legacy app retains the header for receipt / audit
+///    lookups via `HT_CheckIn_H.Cin_Book_no`.
+///
+/// We MUST mirror these faithfully so downstream FKs that point at the
+/// header (most importantly `HT_CheckIn_H.Cin_Book_no` →
+/// `ht_checkins.cin_book_id`) can resolve. Otherwise check-ins
+/// referencing such a booking stay deferred forever (the 2026-05-18
+/// "18 stuck check-ins" PROD-CRIT incident — see
+/// `docs/coexistence/`).
+///
+/// Header-only bookings produce a canonical `ht_bookings` row with ZERO
+/// matching `ht_booking_rooms` rows. The "is this a header-only / walk-in
+/// shaped booking?" predicate is therefore the existence query
+/// `SELECT count(*) = 0 FROM ht_booking_rooms WHERE br_book_id = ?` —
+/// no schema column required.
 pub async fn apply_booking_aggregate(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     aggregate: &BookingAggregate,
@@ -297,6 +330,21 @@ pub async fn apply_booking_aggregate(
         }
     };
 
+    // Trace the header-only / walk-in-shaped applies so operators can
+    // see them in production logs without grepping for the absence of
+    // a `ht_booking_rooms` count. See the doc comment above for the
+    // legitimate iHOTEL flows that produce this shape.
+    if projection.rooms.is_empty() {
+        tracing::debug!(
+            target: "sync::booking",
+            book_id,
+            legacy_cust_no = ?projection.legacy_cust_no,
+            book_status = %projection.book_status,
+            "applying header-only booking (no HT_Book_Ds lines) — \
+             unblocks downstream HT_CheckIn_H.Cin_Book_no FK resolution"
+        );
+    }
+
     let (book_id_serial, agg_id, was_insert) = match existing {
         Some(ex) => {
             let agg_id = ex
@@ -317,6 +365,11 @@ pub async fn apply_booking_aggregate(
         }
     };
 
+    // `replace_rooms` is the single mutation point for `ht_booking_rooms`.
+    // It must be called even when `projection.rooms` is empty so that an
+    // edit transitioning a booking from N-rooms → 0-rooms (a legitimate
+    // mid-edit state per the §3.7 delete-then-reinsert pattern) drops
+    // the stale junction rows.
     replace_rooms(tx, book_id_serial, &projection.rooms).await?;
 
     let event = build_event(was_insert, agg_id, cust_id, &projection);
@@ -367,6 +420,12 @@ async fn apply_cancelled(
 
 /// Project the legacy booking aggregate (`HT_Book_H` + `HT_Book_Ds` +
 /// `HT_Book_Date`) onto our canonical PG row shape.
+///
+/// **Header-only is legal:** when `agg.rooms` is empty the returned
+/// `CanonicalProjection.rooms` is also empty. The caller
+/// (`apply_booking_aggregate`) creates the `ht_bookings` row with zero
+/// matching `ht_booking_rooms` rows — see that function's doc comment
+/// for the iHOTEL flows that legitimately produce this shape.
 ///
 /// **Intentional drop (Track E1 / T2 MED-1, audit 2026-05-13):** the
 /// per-night `agg.nights` collection (loaded from `HT_Book_Date`) is
@@ -889,6 +948,93 @@ mod tests {
         };
         let p = project_aggregate(&agg, "R014810").unwrap();
         assert!(p.notes.is_none());
+    }
+
+    // ----- header-only / walk-in-shaped projection ------------------------
+    //
+    // Regression guard for the 2026-05-18 "18 stuck check-ins" PROD-CRIT:
+    // iHOTEL leaves several legitimate bookings as a header-only aggregate
+    // (HT_Book_H present, zero matching HT_Book_Ds) — most notably the
+    // ClickBook cancel-on-room path (cheatsheet §3.6) and the
+    // FrmAddBook2.SAVE_EDIT delete-then-reinsert pattern (cheatsheet §3.7).
+    // `project_aggregate` must produce a `CanonicalProjection` with
+    // `rooms: vec![]` (not an error, not a drop) so the caller can persist
+    // the canonical booking row and unblock downstream `Cin_Book_no` FK
+    // resolution. See `apply_booking_aggregate` doc comment for the full
+    // context.
+
+    #[test]
+    fn project_aggregate_header_only_yields_empty_rooms_not_error() {
+        let agg = BookingAggregate {
+            header: Some(header_row("R001329", "C21610", "จอง")),
+            rooms: vec![],
+            nights: vec![],
+        };
+        let p = project_aggregate(&agg, "R001329").expect("header-only must project");
+        assert!(p.rooms.is_empty(), "header-only aggregate yields zero room lines");
+        assert_eq!(p.legacy_book_id, "R001329");
+        assert_eq!(p.book_status, "confirmed");
+    }
+
+    #[test]
+    fn project_aggregate_header_only_with_all_ds_cancelled_yields_empty_rooms() {
+        // Mirrors §3.5 FrmShowBookNotify cancel: Book_status=3 on every
+        // line. Projection drops them — same canonical shape as a true
+        // header-only aggregate.
+        let mut cancelled1 = ds_row("R001388", "402");
+        cancelled1.cells.insert("Book_status".into(), MockValue::I32(3));
+        let mut cancelled2 = ds_row("R001388", "414");
+        cancelled2.cells.insert("Book_status".into(), MockValue::I32(3));
+        let agg = BookingAggregate {
+            header: Some(header_row("R001388", "C21611", "ยกเลิก")),
+            rooms: vec![cancelled1, cancelled2],
+            nights: vec![],
+        };
+        let p = project_aggregate(&agg, "R001388").unwrap();
+        assert!(p.rooms.is_empty());
+        assert_eq!(p.book_status, "cancelled");
+    }
+
+    #[test]
+    fn project_aggregate_header_only_preserves_dates_and_amounts() {
+        // The booking is still a real booking — every header field
+        // (dates, amounts, customer pointer) must survive even when no
+        // Ds line exists. This guards against a "treat header-only as
+        // partial" regression.
+        let agg = BookingAggregate {
+            header: Some(header_row("R001633", "C99001", "จอง")),
+            rooms: vec![],
+            nights: vec![],
+        };
+        let p = project_aggregate(&agg, "R001633").unwrap();
+        assert_eq!(
+            p.book_checkin,
+            chrono::NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()
+        );
+        assert_eq!(
+            p.book_checkout,
+            chrono::NaiveDate::from_ymd_opt(2026, 4, 26).unwrap()
+        );
+        assert_eq!(p.total_amount, Some(890.0));
+        assert_eq!(p.legacy_cust_no.as_deref(), Some("C99001"));
+    }
+
+    #[test]
+    fn build_event_emits_booking_created_when_no_rooms() {
+        // Header-only canonical projection → BookingCreated with no
+        // `room_no` in the snapshot. The event still carries the legacy
+        // book_id so downstream subscribers can correlate.
+        let mut p = sample_projection();
+        p.rooms = vec![];
+        let agg = aggregate_uuid(AggregateKind::Booking, 42);
+        let ev = build_event(true, agg, 100, &p);
+        assert_eq!(ev.type_name(), "BookingCreated");
+        let json = serde_json::to_value(&ev).unwrap();
+        assert!(json["data"]["snapshot"]["room_no"].is_null());
+        assert_eq!(
+            json["data"]["snapshot"]["legacy_book_id"],
+            serde_json::Value::String("R014810".into())
+        );
     }
 
     // ----- existing_matches ---------------------------------------------

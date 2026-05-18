@@ -371,6 +371,134 @@ async fn booking_delete_marks_status_cancelled_and_emits_booking_cancelled() {
     cleanup(&pool, &book_id, &cust_no, &room_no).await;
 }
 
+/// Regression: a header-only legacy aggregate (HT_Book_H present, zero
+/// HT_Book_Ds lines) MUST insert a canonical `ht_bookings` row with zero
+/// `ht_booking_rooms` rows. iHOTEL's ClickBook cancel-on-room flow
+/// (cheatsheet §3.6) and the FrmAddBook2.SAVE_EDIT delete-then-reinsert
+/// pattern (§3.7) both leave the aggregate in this shape. Without
+/// header-only support, `HT_CheckIn_H.Cin_Book_no` FKs can never resolve
+/// for these bookings — the 2026-05-18 "18 stuck check-ins" PROD-CRIT.
+#[tokio::test]
+async fn header_only_booking_creates_canonical_row_with_zero_booking_rooms() {
+    let pool = common::create_test_pool().await;
+    let book_id = unique_book_id();
+    let cust_no = unique_cust_no();
+    let room_no = unique_room_no(); // seeded for cleanup symmetry only
+
+    let _cust_pg_id = seed_customer(&pool, &cust_no).await;
+
+    let aggregate = BookingAggregate {
+        header: Some(header_row(&book_id, &cust_no, "จอง", 890.0)),
+        rooms: vec![],
+        nights: vec![],
+    };
+
+    let mut tx = pool.begin().await.expect("begin");
+    let event = apply_booking_aggregate(&mut tx, &aggregate, &book_id)
+        .await
+        .expect("apply must succeed for header-only aggregate");
+    assert!(event.is_some(), "header-only insert must emit an event");
+    let event = event.unwrap();
+    assert_eq!(event.type_name(), "BookingCreated");
+
+    hotel_backend::outbox::bus::EventBus::publish(&mut tx, &event)
+        .await
+        .expect("publish");
+    tx.commit().await.expect("commit");
+
+    let (book_pg_id, status): (i32, String) = sqlx::query_as(
+        "SELECT book_id, book_status FROM ht_bookings WHERE legacy_book_id = $1",
+    )
+    .bind(&book_id)
+    .fetch_one(&pool)
+    .await
+    .expect("canonical row must land for header-only booking");
+    assert_eq!(status, "confirmed");
+
+    let room_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM ht_booking_rooms WHERE br_book_id = $1",
+    )
+    .bind(book_pg_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        room_count, 0,
+        "header-only booking must have zero ht_booking_rooms rows"
+    );
+
+    cleanup(&pool, &book_id, &cust_no, &room_no).await;
+}
+
+/// Regression: an edit that drops every room from a booking (the legacy
+/// app's §3.7 delete-then-reinsert pattern can transiently surface this
+/// state) MUST remove the stale `ht_booking_rooms` rows. Without the
+/// unconditional `replace_rooms` call the junction would keep pointing
+/// at rooms that no longer exist in the legacy aggregate.
+#[tokio::test]
+async fn re_apply_with_zero_rooms_clears_stale_booking_rooms() {
+    let pool = common::create_test_pool().await;
+    let book_id = unique_book_id();
+    let cust_no = unique_cust_no();
+    let room_no = unique_room_no();
+
+    let _cust_pg_id = seed_customer(&pool, &cust_no).await;
+    let _room_id = seed_room(&pool, &room_no).await;
+
+    // Seed with one room.
+    let initial = BookingAggregate {
+        header: Some(header_row(&book_id, &cust_no, "จอง", 890.0)),
+        rooms: vec![ds_row(&book_id, &room_no, 890.0)],
+        nights: vec![date_row(&book_id, &room_no)],
+    };
+    let mut tx = pool.begin().await.unwrap();
+    let _ = apply_booking_aggregate(&mut tx, &initial, &book_id)
+        .await
+        .expect("seed apply");
+    tx.commit().await.unwrap();
+
+    let book_pg_id: i32 =
+        sqlx::query_scalar("SELECT book_id FROM ht_bookings WHERE legacy_book_id = $1")
+            .bind(&book_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let seeded_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM ht_booking_rooms WHERE br_book_id = $1",
+    )
+    .bind(book_pg_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(seeded_count, 1, "seed should land one booking_rooms row");
+
+    // Re-apply with empty rooms (header-only transient state).
+    let header_only = BookingAggregate {
+        header: Some(header_row(&book_id, &cust_no, "จอง", 890.0)),
+        rooms: vec![],
+        nights: vec![],
+    };
+    let mut tx2 = pool.begin().await.unwrap();
+    apply_booking_aggregate(&mut tx2, &header_only, &book_id)
+        .await
+        .expect("header-only re-apply");
+    tx2.commit().await.unwrap();
+
+    let after_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM ht_booking_rooms WHERE br_book_id = $1",
+    )
+    .bind(book_pg_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        after_count, 0,
+        "header-only re-apply must drop stale booking_rooms rows"
+    );
+
+    cleanup(&pool, &book_id, &cust_no, &room_no).await;
+}
+
 /// One H + 2 Ds + 5 Date CT rows in the same tick must result in
 /// exactly ONE `apply_booking_aggregate` call (per the watcher's
 /// coalescing pre-pass) — and exactly ONE `event_log` row for the
