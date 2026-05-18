@@ -1351,6 +1351,21 @@ async fn auto_resolve_reconcile_log(
             };
 
         if !should_auto_resolve(current_legacy_hash.as_deref(), current_pg_hash.as_deref()) {
+            // Per-row visibility into stuck rows (prod debug 2026-05-18):
+            // operators need to see WHY each persistent reconcile_log
+            // row isn't converging — (a) legacy hash missing, (b)
+            // canonical hash missing, or (c) hashes computed but
+            // genuinely don't match. Kept at debug level so it doesn't
+            // flood at info; the same field-style as the converged-row
+            // debug! below for grep symmetry.
+            tracing::debug!(
+                id,
+                table_name = %table_name,
+                legacy_pk = %legacy_pk,
+                current_legacy_hash = ?current_legacy_hash,
+                current_pg_hash = ?current_pg_hash,
+                "[Sync] Auto-resolve sweep: hashes did not converge, leaving row open"
+            );
             continue;
         }
 
@@ -2537,17 +2552,32 @@ async fn upsert_booking_mirror(
 // Check-in Sync
 // =============================================================================
 
-/// Legacy `View_CheckIn_Ds` projection for the check-in reconcile hash.
+/// Base-table-qualified projection for the check-in reconcile hash.
 /// Held as a module-private const so Track J1's projection-lock test
-/// can pin every column.
+/// can pin every column to its source table.
 ///
-/// `View_CheckIn_Ds` joins `HT_CheckIn_H` (header) with `HT_CheckIn_Ds`
-/// (per-room detail), so every column in this projection must exist on
-/// one of those two base tables. Mixed casing — `Cin_no` / `Cin_Date_in`
-/// / `Cin_cust_name` / `Cin_cust_no` / `Cin_status` are lowercase on
-/// `HT_CheckIn_H`; `Cin_Room_No` / `Cin_Room_Out` are capital-N on
-/// `HT_CheckIn_Ds`. The view preserves both casings verbatim per the
-/// live schema dump.
+/// **Why qualified columns + direct JOIN instead of `View_CheckIn_Ds`:**
+/// Prod incident 2026-05-15 (242 consecutive `sync_checkins` failures,
+/// `Token error: 'Invalid column name 'Cin_Date_in''`). The view's
+/// SELECT-list happens to expose `HT_CheckIn_H.Cin_Date` (record-created
+/// timestamp) but NOT `HT_CheckIn_H.Cin_Date_in` (guest-arrival
+/// timestamp), even though both columns exist on the base header table.
+/// The previous projection added `Cin_Date_in` to a `FROM View_CheckIn_Ds`
+/// query and every reconcile tick failed at the driver. Reading directly
+/// from `HT_CheckIn_H h INNER JOIN HT_CheckIn_Ds d ON h.Cin_no = d.Cin_No`
+/// bypasses the view's projection choices entirely — every column on
+/// either base table is reachable, and the projection-lock test
+/// (`checkins_reconcile_projection_columns_resolve_on_their_tables`)
+/// pins each entry to its declared table at CI time.
+///
+/// Mixed casing is verbatim from the base-table schema dump
+/// (`docs/legacy-spike/schema/01-baseline-schema.txt`, lines 208-248):
+/// header `HT_CheckIn_H` exposes lowercase `Cin_no` / `Cin_cust_no` /
+/// `Cin_status` / `Cin_Date_in`; detail `HT_CheckIn_Ds` exposes
+/// capital-N `Cin_No` / `Cin_Room_No` / `Cin_Room_Out`. The JOIN's
+/// `ON` clause uses both casings deliberately — SQL Server's default
+/// CI collation resolves them to the same identity at runtime but the
+/// projection-lock test reads them as literals.
 ///
 /// **Why `Cin_Date_in` and NOT `Cin_Room_In`:** canonical
 /// `cin_checkin_time` is sourced from header `HT_CheckIn_H.Cin_Date_in`
@@ -2560,18 +2590,58 @@ async fn upsert_booking_mirror(
 /// systematic false-positive value drift for every check-in with a
 /// late room assignment.
 ///
+/// **Why no `Cin_cust_name`:** that column was a view-derived alias
+/// from `View_CheckIn_Ds`'s join with `View_Customers` — not a bare
+/// column on either base table. It was never part of
+/// `checkin_canonical_hash`'s inputs (the hash uses only legacy_pk +
+/// legacy_room_no + cin_checkin_time + cin_checkout_time +
+/// legacy_cust_no), so dropping it from the projection eliminates the
+/// view-only-column dependency without changing the hash. The
+/// `CheckinDetail.cust_name` field is preserved as `None` so the
+/// upsert-mode mirror's `cin_cust_name` column keeps NULLing rather
+/// than disappearing — DiffOnly is the hot path; Upsert is the
+/// bootstrap fallback and a NULL there is acceptable.
+///
 /// Counterpart of the Bug B fix that swapped `Cin_Room_Out` → date-only
 /// to align with canonical `cin_expected_checkout`. Both projections
 /// now read header columns for the timestamps the CT mapper mirrors.
-const CHECKINS_RECONCILE_PROJECTION: &[&str] = &[
-    "Cin_no",
-    "Cin_Room_No",
-    "Cin_Date_in",
-    "Cin_Room_Out",
-    "Cin_cust_name",
-    "Cin_cust_no",
-    "Cin_status",
+const CHECKINS_RECONCILE_PROJECTION: &[(&str, &str)] = &[
+    ("h", "Cin_no"),
+    ("d", "Cin_Room_No"),
+    ("h", "Cin_Date_in"),
+    ("d", "Cin_Room_Out"),
+    ("h", "Cin_cust_no"),
+    ("h", "Cin_status"),
 ];
+
+/// Base-table FROM clause for the check-in reconcile SELECT. Pulled out
+/// as a const so the projection-lock test can introspect the JOIN
+/// shape without re-parsing the SQL string.
+///
+/// Note the WHERE-column casing per cheatsheet §3.4 / schema dump:
+/// `HT_CheckIn_H.Cin_no` (lowercase n) joins `HT_CheckIn_Ds.Cin_No`
+/// (capital N — the discrepancy is verbatim from the legacy schema).
+/// `parent_loader::load_checkin_aggregate` documents the same
+/// case-asymmetry contract.
+const CHECKINS_RECONCILE_FROM_CLAUSE: &str =
+    "HT_CheckIn_H h INNER JOIN HT_CheckIn_Ds d ON h.Cin_no = d.Cin_No";
+
+/// Build the `(select_sql, from_clause, projection)` triple for the
+/// check-in reconcile read. Pure helper so the projection-lock test
+/// can assert the same SQL the production path runs, without
+/// duplicating the string-format template.
+fn build_checkins_reconcile_select() -> (String, &'static str, &'static [(&'static str, &'static str)]) {
+    let projection = CHECKINS_RECONCILE_PROJECTION
+        .iter()
+        .map(|(alias, col)| format!("{alias}.{col}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT {projection} FROM {from}",
+        from = CHECKINS_RECONCILE_FROM_CLAUSE,
+    );
+    (sql, CHECKINS_RECONCILE_FROM_CLAUSE, CHECKINS_RECONCILE_PROJECTION)
+}
 
 async fn sync_checkins(
     legacy_pool: &DbPool,
@@ -2583,10 +2653,7 @@ async fn sync_checkins(
 
     let mut conn = legacy_pool.get().await?;
 
-    let checkins_select_sql = format!(
-        "SELECT {projection} FROM View_CheckIn_Ds",
-        projection = CHECKINS_RECONCILE_PROJECTION.join(", "),
-    );
+    let (checkins_select_sql, _, _) = build_checkins_reconcile_select();
     let rows = conn
         .simple_query(&checkins_select_sql)
         .await?
@@ -2597,23 +2664,32 @@ async fn sync_checkins(
     let mut updated = 0i32;
     let mut unchanged = 0i32;
 
-    // Phase 6 hotfix (2026-04-29): `View_CheckIn_Ds` returns 41-45 rows
-    // per `Cin_no` (one per booked room/detail). Aggregate by PK first,
-    // then compute one deterministic hash per PK, so we record one
-    // divergence + one cache UPDATE per PK instead of per-row.
+    // Phase 6 hotfix (2026-04-29): the `HT_CheckIn_H ⋈ HT_CheckIn_Ds`
+    // join returns 41-45 rows per `Cin_no` (one per booked room/detail).
+    // Aggregate by PK first, then compute one deterministic hash per
+    // PK, so we record one divergence + one cache UPDATE per PK instead
+    // of per-row.
+    //
+    // tiberius returns each column under its unqualified name (the
+    // alias prefix `h.` / `d.` only scopes resolution at parse time);
+    // `row.get("Cin_no")` reaches the JOIN output without re-prefixing.
     let mut groups: BTreeMap<String, Vec<CheckinDetail>> = BTreeMap::new();
     for row in &rows {
         let cin_no = row.get::<&str, _>("Cin_no").unwrap_or_default().to_string();
         let detail = CheckinDetail {
             room_no: row.get::<&str, _>("Cin_Room_No").map(String::from),
-            // Bug C fix (2026-05-15): read header `Cin_Date_in` — see
+            // Bug C fix (2026-05-15) + prod hotfix (2026-05-18): read
+            // header `Cin_Date_in` directly from `HT_CheckIn_H` — see
             // doc comment on `CHECKINS_RECONCILE_PROJECTION` for the
-            // detail-vs-header projection-alignment rationale. The
-            // struct field stays `room_in` for now; renaming is a
-            // separate cleanup.
+            // why-not-the-view rationale. The struct field stays
+            // `room_in` for now; renaming is a separate cleanup.
             room_in: row.try_get("Cin_Date_in").unwrap_or(None),
             room_out: row.try_get("Cin_Room_Out").unwrap_or(None),
-            cust_name: row.get::<&str, _>("Cin_cust_name").map(String::from),
+            // `Cin_cust_name` was a view-derived alias and is no longer
+            // projected. The field stays so upsert-mode keeps writing
+            // `ht_checkins_legacy.cin_cust_name` (as NULL) and the
+            // JSON dump shape is unchanged.
+            cust_name: None,
             cust_no: row.get::<&str, _>("Cin_cust_no").map(String::from),
             status: row.get::<&str, _>("Cin_status").map(String::from),
         };
@@ -3504,23 +3580,113 @@ mod tests {
     }
 
     #[test]
-    fn checkins_reconcile_projection_is_subset_of_legacy_schema() {
-        // `View_CheckIn_Ds` joins HT_CheckIn_H (header — lowercase
-        // `Cin_no`, `Cin_cust_*`, `Cin_status`) with HT_CheckIn_Ds
-        // (per-room detail — capital-N `Cin_Room_*`). The view ALSO
-        // joins `View_Customers` to expose a computed `Cin_cust_name`
-        // alias — that aliased column isn't on either base table and
-        // is whitelisted explicitly.
-        crate::assert_projection_slice_subset_of_two_tables!(
-            CHECKINS_RECONCILE_PROJECTION,
-            "HT_CheckIn_H",
-            "HT_CheckIn_Ds",
-            "View_CheckIn_Ds",
-            // View-computed alias: `View_Customers.Cust_name` exposed
-            // as `Cin_cust_name` after the join. Not present as a bare
-            // column on either base table.
-            &["Cin_cust_name"]
+    fn checkins_reconcile_projection_columns_resolve_on_their_tables() {
+        // Prod hotfix 2026-05-18 — the precursor test only asserted
+        // "this column is on one of the two base tables", which the
+        // failing `Cin_Date_in` projection passed (it's on
+        // `HT_CheckIn_H`) even though it was being SELECTed from
+        // `View_CheckIn_Ds`, which doesn't expose it. The new
+        // contract: every projection entry is a `(alias, column)`
+        // pair, and the column MUST exist on the table the alias
+        // resolves to per the FROM clause. An unqualified column or
+        // a mis-aliased column fails CI.
+
+        use crate::sync::projection_guard::parse_baseline_columns;
+
+        // 1. Extract the alias-to-table mapping from the canonical
+        //    FROM clause. Format is
+        //    `HT_CheckIn_H h INNER JOIN HT_CheckIn_Ds d ON …` — split
+        //    on whitespace, every `<TABLE> <alias>` pair is two
+        //    consecutive tokens immediately after the
+        //    `(FROM|JOIN)` keyword.
+        let from_clause = CHECKINS_RECONCILE_FROM_CLAUSE;
+        let tokens: Vec<&str> = from_clause.split_whitespace().collect();
+        let mut alias_to_table: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::new();
+        // First two tokens after the implicit FROM: `HT_CheckIn_H h`.
+        if tokens.len() >= 2 {
+            alias_to_table.insert(tokens[1], tokens[0]);
+        }
+        // Any `JOIN <TABLE> <alias>` triple later in the clause.
+        for window in tokens.windows(3) {
+            if window[0].eq_ignore_ascii_case("JOIN") {
+                alias_to_table.insert(window[2], window[1]);
+            }
+        }
+        assert!(
+            alias_to_table.contains_key("h"),
+            "alias `h` not found in FROM clause `{from_clause}`",
         );
+        assert!(
+            alias_to_table.contains_key("d"),
+            "alias `d` not found in FROM clause `{from_clause}`",
+        );
+
+        // 2. For each projection entry, look up the declared alias
+        //    and assert the column exists on that specific table per
+        //    the baseline schema dump.
+        for (alias, col) in CHECKINS_RECONCILE_PROJECTION.iter() {
+            assert!(
+                !alias.is_empty(),
+                "projection entry `{col}` has empty alias — every column \
+                 MUST declare which base table it lives on (prod hotfix \
+                 2026-05-18: an unqualified `Cin_Date_in` resolved at the \
+                 wrong table caused 242 consecutive reconcile failures)",
+            );
+            let table = alias_to_table.get(alias).unwrap_or_else(|| {
+                panic!(
+                    "projection entry `{alias}.{col}` references unknown \
+                     alias `{alias}` — declared aliases in FROM clause: {:?}",
+                    alias_to_table.keys().collect::<Vec<_>>(),
+                )
+            });
+            let allowed = parse_baseline_columns(table);
+            assert!(
+                !allowed.is_empty(),
+                "no baseline columns found for `{table}` — schema dump \
+                 may be missing it",
+            );
+            assert!(
+                allowed.contains(&col.to_lowercase()),
+                "projection entry `{alias}.{col}` references column `{col}` \
+                 which is NOT on `{table}` per the HF Hotel legacy schema \
+                 baseline (docs/legacy-spike/schema/01-baseline-schema.txt). \
+                 Either the alias is wrong or the column doesn't exist. \
+                 Prod hotfix 2026-05-18: this is the exact bug class \
+                 `edc600a` shipped — `Cin_Date_in` was added to a \
+                 projection that targeted the wrong table (the view), \
+                 and every reconcile tick failed at the driver.",
+            );
+        }
+
+        // 3. The production code path MUST use the same projection +
+        //    FROM clause this test introspects. Assert the helper
+        //    returns the lock-tested values verbatim.
+        let (sql, from, projection) = build_checkins_reconcile_select();
+        assert_eq!(from, CHECKINS_RECONCILE_FROM_CLAUSE);
+        assert_eq!(
+            projection.len(),
+            CHECKINS_RECONCILE_PROJECTION.len(),
+            "helper must return the same projection slice the lock test pins",
+        );
+        for (returned, expected) in
+            projection.iter().zip(CHECKINS_RECONCILE_PROJECTION.iter())
+        {
+            assert_eq!(
+                returned, expected,
+                "helper projection drift — expected {expected:?}, got {returned:?}",
+            );
+        }
+        assert!(
+            sql.contains(CHECKINS_RECONCILE_FROM_CLAUSE),
+            "built SQL must include the locked FROM clause: {sql}",
+        );
+        for (alias, col) in CHECKINS_RECONCILE_PROJECTION.iter() {
+            assert!(
+                sql.contains(&format!("{alias}.{col}")),
+                "built SQL must include qualified column `{alias}.{col}`: {sql}",
+            );
+        }
     }
 
     #[test]
