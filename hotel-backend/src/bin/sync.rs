@@ -2165,6 +2165,13 @@ async fn poll_table(
                             "Failed to persist event_log row"
                         );
                         skipped += 1;
+                        // Same silent-drop class as a failed apply: the
+                        // canonical row is already in `tx` and will commit,
+                        // but the LISTEN/NOTIFY event never fires. Holding
+                        // the watermark lets the next tick re-run the
+                        // aggregate (idempotent — returns Ok(None) on
+                        // already-applied state) and re-attempt persist_event.
+                        errored = true;
                     } else {
                         ingested += 1;
                     }
@@ -2238,6 +2245,10 @@ async fn poll_table(
                             "Failed to persist event_log row"
                         );
                         skipped += 1;
+                        // See sibling path: persist_event failure is a
+                        // silent-drop class (canonical commits, event never
+                        // fires). Hold watermark to retry next tick.
+                        errored = true;
                     } else {
                         ingested += 1;
                     }

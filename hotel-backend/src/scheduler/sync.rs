@@ -193,7 +193,7 @@ pub async fn run_sync(
     // queries so the alerts only surface drift that still persists.
     // Best-effort: a PG failure logs a warning and the alerts
     // proceed with stale state.
-    if let Err(e) = auto_resolve_reconcile_log(legacy_pool, pg_pool).await {
+    if let Err(e) = auto_resolve_reconcile_log(legacy_pool, pg_pool, site_id).await {
         tracing::warn!(
             site = %site_id,
             error = %e,
@@ -689,6 +689,16 @@ async fn read_mssql_ct_current_version(
 /// without aborting the reconcile loop. Same posture as
 /// [`check_drift_and_alert`] / [`check_level_drift_and_alert`] —
 /// degraded observability must never take down the rest of the tick.
+///
+/// **TODO (R3 per-table watermark cutover):** this check reads only the
+/// global `legacy_ct_state WHERE id = 1` row. When `SYNC_PER_TABLE_WATERMARK`
+/// is enabled (per-table mode, planned for R3), the global row stops
+/// advancing and per-table watermarks live in `legacy_ct_state_per_table`.
+/// In that mode this check will produce a stuck `version_lag` warning every
+/// tick (`last_seen_version` frozen at bootstrap value), masking the real
+/// per-table lag. When the per-table flag is flipped, fan this comparison
+/// out per tracked table. The watchdog in `bin/sync.rs::watermark_stall_alert_eligible`
+/// has the same gap — track both in one follow-up.
 async fn check_ct_watcher_lag(
     legacy_pool: &DbPool,
     pg_pool: &PgPool,
@@ -1536,6 +1546,7 @@ async fn fetch_legacy_booking_hash(
 async fn auto_resolve_reconcile_log(
     legacy_pool: &DbPool,
     pg_pool: &PgPool,
+    site_id: &str,
 ) -> Result<usize, sqlx::Error> {
     let rows = sqlx::query_as::<_, (i64, String, String)>(
         "SELECT id, table_name, legacy_pk \
@@ -1554,6 +1565,7 @@ async fn auto_resolve_reconcile_log(
                 Ok(opt) => opt,
                 Err(e) => {
                     tracing::warn!(
+                        site = %site_id,
                         id,
                         table_name = %table_name,
                         legacy_pk = %legacy_pk,
@@ -1569,6 +1581,7 @@ async fn auto_resolve_reconcile_log(
                 Ok(opt) => opt,
                 Err(e) => {
                     tracing::warn!(
+                        site = %site_id,
                         id,
                         table_name = %table_name,
                         legacy_pk = %legacy_pk,
@@ -1588,6 +1601,7 @@ async fn auto_resolve_reconcile_log(
             // flood at info; the same field-style as the converged-row
             // debug! below for grep symmetry.
             tracing::debug!(
+                site = %site_id,
                 id,
                 table_name = %table_name,
                 legacy_pk = %legacy_pk,
@@ -1610,6 +1624,7 @@ async fn auto_resolve_reconcile_log(
             Ok(r) if r.rows_affected() == 1 => {
                 resolved += 1;
                 tracing::debug!(
+                    site = %site_id,
                     id,
                     table_name = %table_name,
                     legacy_pk = %legacy_pk,
@@ -1621,6 +1636,7 @@ async fn auto_resolve_reconcile_log(
             }
             Err(e) => {
                 tracing::warn!(
+                    site = %site_id,
                     id,
                     error = %e,
                     "[Sync] Auto-resolve sweep: UPDATE failed, leaving row unresolved"
@@ -1630,7 +1646,7 @@ async fn auto_resolve_reconcile_log(
     }
 
     if resolved > 0 {
-        tracing::info!(resolved, "[Sync] Auto-resolve sweep: rows reconciled");
+        tracing::info!(site = %site_id, resolved, "[Sync] Auto-resolve sweep: rows reconciled");
     }
     Ok(resolved)
 }
