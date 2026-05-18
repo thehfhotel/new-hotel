@@ -104,6 +104,16 @@ jobs:
               - 'migrations/pg/**'
               - 'scripts/migrate.sh'
               - 'scripts/backup-db.sh'
+              # The deploy script self-updates from the tarball on every
+              # deploy (Track J5, 2026-05-14), so a change here is only
+              # visible to evergreen if a deploy actually fires. Likewise
+              # the workflow file carries the RUST_LOG default + jq payload
+              # template — a change to either is operationally meaningless
+              # until a deploy ships them. Without these entries the
+              # 2026-05-18 RUST_LOG visibility fix needed a manual
+              # workflow_dispatch to take effect.
+              - 'scripts/deploy/**'
+              - '.github/workflows/docker-build.yml'
 
   # Track J8 guard (audit-2026-05-14 follow-on to PR #102 + #108).
   #
