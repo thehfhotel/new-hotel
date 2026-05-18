@@ -3081,14 +3081,38 @@ async fn sync_checkins(
                 // cardinality-drift case. `View_CheckIn_Ds` returns
                 // 41-45 rows per `Cin_no` (one per booked room) but
                 // canonical `ht_checkins` denormalises only the first
-                // room into a single row — Track B is the schema fix
-                // (junction table) but until then the row-count delta
-                // is the actionable signal. legacy_row_count =
-                // details.len() exposes "this folio has N rooms";
-                // pg_row_count = 0 or 1 reflects today's denormalised
-                // canonical.
+                // room into a single row.
+                //
+                // 2026-05-18 wire-up (Track B last mile): after the
+                // junction table `ht_checkin_rooms` shipped and the CT
+                // mapper + backfill bin populated it, `pg_row_count`
+                // now reads the ACTUAL per-room count instead of the
+                // pre-Track-B hardcoded `1`. Multi-room folios whose
+                // junction is fully populated collapse from
+                // `Cardinality` to `Value` (and, with matching first-
+                // room data, get silently acked via
+                // `is_silenceable()`). On a query failure we fall back
+                // to `1` (the pre-Track-B observation) rather than `0`
+                // — degraded observability beats spurious "missing_pg"
+                // misclassification — and emit a warn log.
                 let legacy_row_count: i32 = details.len() as i32;
-                let pg_row_count: i32 = if canonical.is_some() { 1 } else { 0 };
+                let pg_row_count: i32 = if canonical.is_some() {
+                    match count_canonical_checkin_rooms(pg_pool, &cin_no).await {
+                        Ok(n) => n,
+                        Err(e) => {
+                            tracing::warn!(
+                                cin_no = %cin_no,
+                                error = %e,
+                                "[Sync] count_canonical_checkin_rooms failed; \
+                                 falling back to pre-Track-B pg_row_count=1 \
+                                 to avoid spurious missing_pg classification"
+                            );
+                            1
+                        }
+                    }
+                } else {
+                    0
+                };
                 let kind = classify_divergence(
                     canonical_hash.as_deref(),
                     Some(&mssql_hash),
@@ -3224,6 +3248,44 @@ async fn fetch_canonical_checkin(
             }
         })
     })
+}
+
+/// Count canonical check-in room rows for a given `legacy_cin_no`,
+/// joining `ht_checkin_rooms` (the Track B junction table created in
+/// migration `043_create_ht_checkin_rooms.sql`) against `ht_checkins`.
+///
+/// **Why this exists:** the reconcile sweep historically hardcoded
+/// `pg_row_count = 1` whenever `ht_checkins` had a row (since canonical
+/// only stored the first room denormalised). After Track B landed the
+/// per-room junction, the CT mapper (`mappers/checkin.rs`) and the
+/// `backfill_checkin_rooms` bin populate `ht_checkin_rooms` with one
+/// row per booked room. This helper reads that actual count so
+/// `classify_divergence` can compare like-for-like with
+/// `View_CheckIn_Ds.details.len()`, collapsing the 756 multi-room
+/// cardinality drifts observed on HF Hotel on 2026-05-18 from
+/// "always Cardinality" to "Value (matching) ⇒ silent ack".
+///
+/// Follow-up (deferred): the canonical-side hash still hashes only the
+/// FIRST room (see `checkin_canonical_hash`). Once row counts match,
+/// drift on a SECONDARY room would still be invisible to the hash. A
+/// future PR that rotates the canonical hash format to hash ALL
+/// junction rows (mirroring `aggregate_checkin_hash`) would close that
+/// blind spot, but is out of scope here because rotating the hash
+/// invalidates every `ht_checkins_legacy.sync_hash` entry and would
+/// trigger a deploy-time alert flood (cf. 2026-05-15).
+async fn count_canonical_checkin_rooms(
+    pg_pool: &PgPool,
+    legacy_cin_no: &str,
+) -> Result<i32, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM ht_checkin_rooms cr \
+           JOIN ht_checkins c ON c.cin_id = cr.cr_cin_id \
+          WHERE c.legacy_cin_no = $1",
+    )
+    .bind(legacy_cin_no)
+    .fetch_one(pg_pool)
+    .await
+    .map(|n| n as i32)
 }
 
 async fn ack_checkin_mirror(pg_pool: &PgPool, cin_no: &str, mssql_hash: &str) {
@@ -3644,6 +3706,48 @@ mod tests {
         let h1 = aggregate_checkin_hash("CIN-1", &mut g1);
         let h2 = aggregate_checkin_hash("CIN-2", &mut g2);
         assert_ne!(h1, h2, "PK must be part of the hashed material");
+    }
+
+    // -------------------------------------------------------------------
+    // Track B last-mile (2026-05-18) — junction-aware pg_row_count
+    // -------------------------------------------------------------------
+    //
+    // These exercise the `classify_divergence` decision the reconcile
+    // loop now feeds with the actual `ht_checkin_rooms` row count
+    // (instead of the pre-Track-B hardcoded 1). The wire-up itself is
+    // an `await` in the loop body — the testable surface is the pure
+    // classifier and its truth-table response to the new inputs.
+
+    /// Regression guard: post-Track-B, a multi-room folio whose
+    /// junction-room count matches legacy `View_CheckIn_Ds.details.len()`
+    /// must classify as `Value` (and become silenceable via
+    /// `is_silenceable()` once hashes align too). Pre-fix this case
+    /// returned `Cardinality` for every multi-room folio because
+    /// `pg_row_count` was hardcoded to 1.
+    #[test]
+    fn cardinality_kind_when_junction_count_matches_legacy_returns_value_not_cardinality() {
+        let kind = classify_divergence(Some("pg-hash"), Some("mssql-hash"), 3, 3);
+        assert_eq!(
+            kind,
+            DivergenceKind::Value,
+            "matching junction count must drop the kind to Value so the \
+             ack-cache can silence it once the first-room hashes align"
+        );
+    }
+
+    /// Regression guard against an over-eager fix: if the junction
+    /// has FEWER rows than legacy (e.g. backfill skipped an inactive
+    /// folio), we must still classify as `Cardinality` so the
+    /// operator-visible signal is preserved.
+    #[test]
+    fn cardinality_kind_when_junction_count_differs_returns_cardinality() {
+        let kind = classify_divergence(Some("pg-hash"), Some("mssql-hash"), 3, 2);
+        assert_eq!(
+            kind,
+            DivergenceKind::Cardinality,
+            "junction count short of legacy must remain Cardinality so \
+             the gap surfaces in ht_reconcile_log instead of being silenced"
+        );
     }
 
     fn booking_detail(room_type: &str, status: i32) -> BookingDetail {
