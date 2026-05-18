@@ -76,8 +76,9 @@ use sqlx::PgPool;
 
 use hotel_backend::config::DbConfig;
 use hotel_backend::db::{create_pool, DbPool};
-use hotel_backend::sync::mappers::apply_checkin_aggregate;
-use hotel_backend::sync::parent_loader::load_checkin_aggregate;
+use hotel_backend::sync::mappers::{apply_booking_aggregate, apply_checkin_aggregate};
+use hotel_backend::sync::parent_loader::{load_booking_aggregate, load_checkin_aggregate};
+use hotel_backend::sync::MappableRow;
 
 const PG_POOL_MAX: u32 = 4;
 
@@ -186,15 +187,99 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .unwrap_or(false);
 
                 if !canonical_present {
-                    tracing::info!(
-                        cin_no,
-                        "apply returned Ok but canonical row still missing — likely deferred \
-                         on a missing parent booking/room FK. Skipping resolve update; \
-                         re-run after backfill_legacy_bookings completes."
-                    );
-                    let _ = tx.rollback().await;
-                    deferred += 1;
-                    continue;
+                    // Cascade attempt (2026-05-18 root-cause fix for the 18 stuck
+                    // missing_pg orphan-booking-header check-ins). When the apply
+                    // defers on a missing parent booking FK, extract Cin_Book_no
+                    // from the loaded MSSQL header, load + apply the parent
+                    // booking aggregate (header-only is now an accepted shape per
+                    // `apply_booking_aggregate` doc contract), then retry the
+                    // checkin apply. Idempotent: if the parent is already in
+                    // canonical or MSSQL has no row, the cascade is a no-op and
+                    // we still fall through to the original defer-and-skip path.
+                    let parent_book_no = aggregate.header.as_ref().and_then(|h| {
+                        h.try_get_str("Cin_Book_no")
+                            .ok()
+                            .flatten()
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string())
+                    });
+                    let mut cascade_applied = false;
+                    if let Some(book_no) = parent_book_no.as_deref() {
+                        match load_booking_aggregate(&mssql, book_no).await {
+                            Ok(book_agg) if book_agg.is_present() => {
+                                if let Err(err) =
+                                    apply_booking_aggregate(&mut tx, &book_agg, book_no).await
+                                {
+                                    tracing::warn!(
+                                        cin_no,
+                                        book_no,
+                                        error = %err,
+                                        "cascade: apply_booking_aggregate failed"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        cin_no,
+                                        book_no,
+                                        "cascade: applied parent booking; retrying checkin"
+                                    );
+                                    cascade_applied = true;
+                                }
+                            }
+                            Ok(_) => {
+                                tracing::info!(
+                                    cin_no,
+                                    book_no,
+                                    "cascade: parent booking has no MSSQL header; cannot mirror"
+                                );
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    cin_no,
+                                    book_no,
+                                    error = %err,
+                                    "cascade: load_booking_aggregate failed"
+                                );
+                            }
+                        }
+                    }
+
+                    if cascade_applied {
+                        if let Err(err) = apply_checkin_aggregate(
+                            &mut tx, Some(&mssql), &aggregate, cin_no,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                cin_no,
+                                error = %err,
+                                "cascade-retry: apply_checkin_aggregate failed"
+                            );
+                        }
+                    }
+
+                    let canonical_present_after: bool = sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS(SELECT 1 FROM ht_checkins WHERE legacy_cin_no = $1)",
+                    )
+                    .bind(cin_no)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap_or(false);
+
+                    if !canonical_present_after {
+                        tracing::info!(
+                            cin_no,
+                            parent_book_no,
+                            "apply returned Ok but canonical row still missing — \
+                             cascade did not resolve; leaving reconcile_log unresolved \
+                             for operator review"
+                        );
+                        let _ = tx.rollback().await;
+                        deferred += 1;
+                        continue;
+                    }
+                    // Fall through to the resolve-update path: cascade
+                    // succeeded, canonical row now exists, commit + mark
+                    // reconcile_log resolved as if the apply had worked first try.
                 }
 
                 // Mark every unresolved reconcile_log row for this PK
