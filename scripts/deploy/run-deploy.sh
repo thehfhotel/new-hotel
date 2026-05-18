@@ -143,7 +143,7 @@ if ! grep -q "^RUST_LOG='..*'$" .env; then
   # Strip any pre-existing empty / missing entry, then append the default.
   ( umask 077 && {
       grep -v '^RUST_LOG=' .env || true
-      printf "RUST_LOG=%s\n" "'hotel_backend::scheduler::sync=debug,hotel_backend::scheduler::jobs=debug,hotel_backend=info,tower_http=info'"
+      printf "RUST_LOG=%s\n" "'hotel_backend::scheduler::sync=debug,hotel_backend::scheduler::jobs=debug,hotel_backend=info,writeback=info,sync=info,tower_http=info'"
     } > .env.new && mv .env.new .env )
   chmod 600 .env
   echo "[deploy] RUST_LOG was unset/empty in payload — pinned to scheduler::sync,jobs=debug default"
