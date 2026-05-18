@@ -618,6 +618,21 @@ pub async fn dispatch(
             })?;
             recipes::mark_clean::execute(conn, room_no, room_id_int, by).await
         }
+        // Admin room master-data edit (price / type / notes). The
+        // payload carries the legacy `Room_no` business key directly
+        // (resolved by the route from `ht_rooms_new.room_no` which
+        // mirrors `HT_Rooms.Room_no` 1:1), so no `ResolvedJob` lookup
+        // is needed. The recipe emits one targeted UPDATE; columns
+        // whose payload field is `None` are omitted from the SET list,
+        // preserving any iHOTEL-side value the operator did not touch.
+        WritebackIntent::UpdateRoom { room_id: _, payload } => {
+            if payload.room_no.is_empty() {
+                return Err(WritebackError::Recipe(
+                    "UpdateRoom requires non-empty payload.room_no".into(),
+                ));
+            }
+            recipes::update_room::execute(conn, payload).await
+        }
         // Track F3 — `audit-2026-05-13.md` T1 CRIT-3. The intent
         // already carries the legacy `Pro_no` business key directly
         // (no `ResolvedJob` lookup needed — product master is keyed
@@ -771,8 +786,9 @@ mod tests {
     /// added without updating the dispatcher, the compiler will fail (match
     /// exhaustiveness), and this test catches drift in name strings.
     /// (Track F3 added `adjust_product_stock`; Track G2 added
-    /// `refund_payment`; Track G5 added `issue_coupon` + `redeem_coupon`
-    /// — keep the count and the names list in lock-step.)
+    /// `refund_payment`; Track G5 added `issue_coupon` + `redeem_coupon`;
+    /// the admin-room-edit gap-close added `update_room` —
+    /// keep the count and the names list in lock-step.)
     #[test]
     fn all_intent_variants_route_to_recipes() {
         let names = [
@@ -787,6 +803,7 @@ mod tests {
             "refund_payment",
             "room_change",
             "mark_room_clean",
+            "update_room",
             "adjust_product_stock",
             "issue_coupon",
             "redeem_coupon",
@@ -796,7 +813,7 @@ mod tests {
         // intent name → no actual MSSQL call, just type-level coverage.
         // Counting expected variants here keeps the test cheap and
         // deterministic.
-        assert_eq!(names.len(), 15, "expected 15 WritebackIntent variants");
+        assert_eq!(names.len(), 16, "expected 16 WritebackIntent variants");
     }
 
     /// Phase 5.1 chokepoint guarantee — every recipe MUST run after

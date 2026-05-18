@@ -15,11 +15,15 @@ use axum::{
 };
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
+use sqlx::{Postgres, Row, Transaction};
 
 use super::mode::{AppState, Branch};
 use crate::error::{ApiError, ApiResult};
 use crate::models::Pagination;
+use crate::outbox::intent::{UpdateRoomPayload, WritebackIntent};
+use crate::outbox::{generate_idempotency_key, OutboxRepository};
 use crate::repository::room::{RoomRow, RoomWrite};
+use crate::service::ids::{aggregate_uuid, AggregateKind};
 
 /// Room from HT_Rooms_New table
 #[derive(Debug, Serialize)]
@@ -221,6 +225,23 @@ pub async fn create_room(
 }
 
 /// PUT /api/new/rooms/:id - Update room
+///
+/// Inside one PG transaction:
+/// 1. UPDATE `ht_rooms_new` with the request body (existing behavior).
+/// 2. Enqueue [`WritebackIntent::UpdateRoom`] so the writeback worker
+///    mirrors price / type / notes onto legacy `HT_Rooms`. Closes the
+///    admin-edit divergence between canonical PG and the legacy mirror
+///    that previously left rows like room A2-1 stuck with
+///    `Room_PriceA = 0.00` on MSSQL while PG showed `price_weekday = 890.00`.
+///
+/// The writeback targets `HT_Rooms.Room_no` of the row BEFORE the rename
+/// (captured via [`load_legacy_room_no`]) so a price-and-rename edit
+/// still lands the price update. Renaming `Room_no` itself is out of
+/// scope for this recipe — see the recipe's module-level doc comment.
+///
+/// The PG UPDATE and outbox enqueue commit atomically — either both
+/// land or neither does, preserving the "writeback queued ⇔ canonical
+/// state mutated" invariant from `architecture.md` §3.6c.
 pub async fn update_room(
     State(state): State<AppState>,
     Path(room_id): Path<i32>,
@@ -243,7 +264,23 @@ pub async fn update_room(
     let is_clean = body.is_clean.unwrap_or(true);
     let is_maintenance = body.is_maintenance.unwrap_or(false);
 
+    // Resolve the legacy `room_type_name` (Thai literal) BEFORE opening
+    // the TX — the lookup is read-only and a missing FK should surface
+    // as a 400 immediately rather than rollback a half-applied edit.
+    // `None` is propagated as `None` so the recipe skips the
+    // `Room_Type=` SET fragment (preserves the iHOTEL-side value).
+    let resolved_type_name =
+        load_room_type_name(&state.new_pool, body.room_type_id).await?;
+
     let mut tx = state.new_pool.begin().await?;
+
+    // Capture the legacy `Room_no` BEFORE the UPDATE so the writeback
+    // recipe targets the existing MSSQL row even when the operator is
+    // renaming the room in the same edit (the new room_no won't exist
+    // on the legacy side until a separate `Room_no` mirror lands —
+    // tracked separately).
+    let legacy_room_no = load_legacy_room_no(&mut tx, room_id).await?;
+
     let rows_affected = state
         .rooms
         .update(
@@ -268,6 +305,30 @@ pub async fn update_room(
         tx.rollback().await?;
         return Err(ApiError::NotFound("Room not found".to_string()));
     }
+
+    // Enqueue the writeback intent inside the SAME TX as the PG UPDATE
+    // (architecture.md §3.6c — atomic-with-canonical-write invariant).
+    // Aggregate UUID is the deterministic v5 derivation from `room_id`
+    // (matches the value stamped onto `ht_rooms_new.aggregate_id` by
+    // `backfill_rooms`); the writeback resolver no-ops for `UpdateRoom`
+    // because the payload carries `room_no` directly.
+    let aggregate_id = aggregate_uuid(AggregateKind::Room, room_id);
+    let intent = WritebackIntent::UpdateRoom {
+        room_id: aggregate_id,
+        payload: UpdateRoomPayload {
+            room_no: legacy_room_no,
+            room_type_name: resolved_type_name,
+            price_weekday: body.price_weekday,
+            price_weekend: body.price_weekend,
+            price_special: body.price_special,
+            notes: body.notes.clone(),
+        },
+    };
+    let idempotency_key = generate_idempotency_key(&intent, aggregate_id);
+    OutboxRepository::enqueue(&mut tx, &intent, idempotency_key)
+        .await
+        .map_err(ApiError::from)?;
+
     tx.commit().await?;
 
     Ok(Json(MutationResponse {
@@ -275,6 +336,60 @@ pub async fn update_room(
         message: "Room updated successfully".to_string(),
         id: Some(room_id),
     }))
+}
+
+/// Resolve the legacy `HT_Rooms.Room_no` business key for `room_id` from
+/// PG. The canonical `ht_rooms_new.room_no` mirrors the legacy column
+/// 1:1 (per `bin/backfill_rooms.rs:370`), so the canonical value IS the
+/// legacy key.
+///
+/// Returns `NotFound` when the row does not exist — surfaces the same
+/// failure as the PG UPDATE's `rows_affected==0` branch but earlier
+/// (before the recipe goes to allocate the outbox row).
+///
+/// Uses dynamic `sqlx::query` (not the compile-time macro) to keep the
+/// crate buildable without regenerating the `.sqlx/` cache.
+async fn load_legacy_room_no(
+    tx: &mut Transaction<'_, Postgres>,
+    room_id: i32,
+) -> ApiResult<String> {
+    let row = sqlx::query("SELECT room_no FROM ht_rooms_new WHERE room_id = $1")
+        .bind(room_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Room not found".to_string()))?;
+    let room_no: String = row
+        .try_get("room_no")
+        .map_err(|err| ApiError::Internal(format!("room_no column missing: {err}")))?;
+    Ok(room_no)
+}
+
+/// Resolve `ht_room_types.type_name` for the given `room_type_id`.
+/// Returns `None` when `room_type_id` is `None` (so the writeback recipe
+/// skips the `Room_Type=` fragment) and a `BadRequest` when the FK
+/// points at a non-existent type (surfaces the FK violation to the
+/// operator instead of failing the writeback later).
+///
+/// Uses dynamic `sqlx::query` (not the compile-time macro) to keep the
+/// crate buildable without regenerating the `.sqlx/` cache.
+async fn load_room_type_name(
+    pool: &sqlx::PgPool,
+    room_type_id: Option<i32>,
+) -> ApiResult<Option<String>> {
+    let Some(type_id) = room_type_id else {
+        return Ok(None);
+    };
+    let row = sqlx::query("SELECT type_name FROM ht_room_types WHERE type_id = $1")
+        .bind(type_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!("Room type {type_id} does not exist"))
+        })?;
+    let type_name: String = row
+        .try_get("type_name")
+        .map_err(|err| ApiError::Internal(format!("type_name column missing: {err}")))?;
+    Ok(Some(type_name))
 }
 
 /// Request body for updating room status only
@@ -285,6 +400,21 @@ pub struct UpdateRoomStatusRequest {
 }
 
 /// PATCH /api/new/rooms/:id/status - Update room status only
+///
+/// **Intentionally does NOT emit a `WritebackIntent::UpdateRoom`** —
+/// this endpoint mutates canonical `ht_rooms_new.room_status` (one of
+/// `available`/`occupied`/`maintenance`/`cleaning`), which has no
+/// direct counterpart on legacy `HT_Rooms`. The legacy `Room_Use`
+/// column is the *occupancy* flag (`'yes'`/`'no'`) and is owned by
+/// the walk-in / check-in-to-booking / cancel / check-out recipes;
+/// `Room_Clean` / `Room_Manternace` are owned by `mark_clean` and the
+/// maintenance request flow. Mirroring `room_status` here would race
+/// those flows and corrupt the legacy occupancy state.
+///
+/// If a future requirement needs to push admin-style status overrides
+/// to legacy, model it as a new dedicated intent (e.g.
+/// `MarkRoomMaintenance { reason }`) so the column-ownership split is
+/// preserved.
 pub async fn update_room_status(
     State(state): State<AppState>,
     Path(room_id): Path<i32>,
