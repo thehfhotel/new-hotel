@@ -911,6 +911,54 @@ fn aggregate_booking_hash(
     sha256(&format!("{book_no}|{room_type_key}|{body}"))
 }
 
+/// Count DISTINCT non-empty `Cin_Room_No` values across a check-in's
+/// `HT_CheckIn_Ds` rows.
+///
+/// Why: `ht_checkin_rooms` carries a `UNIQUE (cr_cin_id, cr_room_id)`
+/// constraint, so "distinct rooms in folio" IS the canonical truth.
+/// Raw `aggregate.rooms.len()` overcounts whenever iHOTEL records
+/// multiple HT_CheckIn_Ds detail rows for the same room (extends,
+/// re-keys, deposit returns), which then surfaces as spurious
+/// `cardinality` drift in `ht_reconcile_log`.
+///
+/// Concrete trigger (CH22-000722, 2026-05-19): 3 HT_CheckIn_Ds rows,
+/// all `Cin_Room_No='417'`, same `Cin_cust_no`, only `Cin_Room_Out`
+/// differs across rows. Raw len → 3, junction count → 1, classifier
+/// → `cardinality` (false positive). With this helper: distinct → 1,
+/// matches the junction.
+///
+/// Skip semantics mirror [`crate::sync::mappers::checkin::project_rooms`]
+/// (file `mappers/checkin.rs`, around the `Cin_Room_No` guards) —
+/// rows whose `Cin_Room_No` is NULL or empty are dropped from the
+/// junction projection, so they must also be dropped here so the two
+/// counts compare apples-to-apples.
+///
+/// Errors from `try_get_str` are swallowed (the row is treated as
+/// having no room number) rather than bubbled. Rationale: this helper
+/// runs inside the reconcile loop where a hard error on a single
+/// malformed row would abort the entire tick. The mapper-side
+/// projection (`project_rooms`) propagates the same errors loudly so
+/// real schema regressions still surface; here, conservative
+/// "skip-on-probe-failure" beats blocking the tick.
+fn count_distinct_legacy_checkin_rooms(
+    rooms: &[crate::sync::row::test_support::HashMapRow],
+) -> i32 {
+    use crate::sync::row::MappableRow;
+    use std::collections::HashSet;
+
+    let mut distinct: HashSet<String> = HashSet::new();
+    for r in rooms {
+        let Ok(Some(room_no)) = r.try_get_str("Cin_Room_No") else {
+            continue;
+        };
+        if room_no.is_empty() {
+            continue;
+        }
+        distinct.insert(room_no.to_string());
+    }
+    distinct.len() as i32
+}
+
 /// Build the `mssql_row_json` payload for a check-in PK aggregate.
 /// Reads the legacy header (`HT_CheckIn_H`) once for the cross-row
 /// fields (`Cin_Date_in`, `Cin_cust_no`, `Cin_status`) and pairs them
@@ -3065,7 +3113,19 @@ async fn sync_checkins(
                 // back to `1` (pre-Track-B observation) rather than
                 // `0` — degraded observability beats spurious
                 // `missing_pg` misclassification — and warn-log.
-                let legacy_row_count: i32 = aggregate.rooms.len() as i32;
+                //
+                // 2026-05-19 dedup fix: count DISTINCT `Cin_Room_No`
+                // values instead of raw `aggregate.rooms.len()`.
+                // iHOTEL routinely writes >1 HT_CheckIn_Ds row per
+                // room (extends / re-keys / deposit returns) — see
+                // CH22-000722 trigger documented on
+                // [`count_distinct_legacy_checkin_rooms`]. The
+                // `ht_checkin_rooms` junction enforces
+                // `UNIQUE (cr_cin_id, cr_room_id)`, so "distinct
+                // rooms" IS the canonical truth that `pg_row_count`
+                // already reflects.
+                let legacy_row_count: i32 =
+                    count_distinct_legacy_checkin_rooms(&aggregate.rooms);
                 let pg_row_count: i32 = if canonical.is_some() {
                     match count_canonical_checkin_rooms(pg_pool, cin_no).await {
                         Ok(n) => n,
@@ -4764,4 +4824,56 @@ mod tests {
         assert_eq!(t.poll_age_seconds, DEFAULT_CT_LAG_WARN_SECONDS);
     }
 
+    // -------------------------------------------------------------------
+    // 2026-05-19 — `count_distinct_legacy_checkin_rooms` dedup invariants.
+    //
+    // Backs the CH22-000722 cardinality false-positive fix: iHOTEL's
+    // HT_CheckIn_Ds table commonly carries multiple detail rows for the
+    // same room (extends, re-keys, deposit returns). The
+    // `ht_checkin_rooms` junction's `UNIQUE (cr_cin_id, cr_room_id)`
+    // already collapses them; the cardinality check has to as well or
+    // every such folio shows up as drift.
+    // -------------------------------------------------------------------
+    use crate::sync::row::test_support::{HashMapRow as TestHashMapRow, MockValue as TestMockValue};
+
+    fn ds_row_with_room(room_no: TestMockValue) -> TestHashMapRow {
+        TestHashMapRow::new("HT_CheckIn_Ds").with("Cin_Room_No", room_no)
+    }
+
+    #[test]
+    fn cardinality_dedups_duplicate_room_in_legacy_ds() {
+        // CH22-000722 shape: three Ds rows, all room 417. Distinct
+        // count must collapse to 1 to match the junction.
+        let rooms = vec![
+            ds_row_with_room(TestMockValue::Str("417".into())),
+            ds_row_with_room(TestMockValue::Str("417".into())),
+            ds_row_with_room(TestMockValue::Str("417".into())),
+        ];
+        assert_eq!(count_distinct_legacy_checkin_rooms(&rooms), 1);
+    }
+
+    #[test]
+    fn cardinality_preserves_distinct_multi_room() {
+        // A real multi-room folio (rooms 417 + 418) still surfaces as
+        // distinct = 2, so a short junction (only one room mirrored)
+        // still flags `cardinality` drift correctly.
+        let rooms = vec![
+            ds_row_with_room(TestMockValue::Str("417".into())),
+            ds_row_with_room(TestMockValue::Str("418".into())),
+        ];
+        assert_eq!(count_distinct_legacy_checkin_rooms(&rooms), 2);
+    }
+
+    #[test]
+    fn cardinality_skips_null_and_empty_room_no() {
+        // Mirrors `project_rooms` skip semantic: NULL and empty
+        // `Cin_Room_No` are dropped from the junction projection, so
+        // they must also be dropped from the legacy cardinality count.
+        let rooms = vec![
+            ds_row_with_room(TestMockValue::Null),
+            ds_row_with_room(TestMockValue::Str("".into())),
+            ds_row_with_room(TestMockValue::Str("417".into())),
+        ];
+        assert_eq!(count_distinct_legacy_checkin_rooms(&rooms), 1);
+    }
 }
