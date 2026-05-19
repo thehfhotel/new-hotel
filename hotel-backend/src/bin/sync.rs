@@ -1301,6 +1301,179 @@ fn should_fire_stall_alert(watermark: i64, ct_current_probe: Option<i64>) -> boo
     }
 }
 
+/// Tone-aware Slack message for a watermark stall page. Severity is
+/// derived from the probe outcome:
+///
+/// * `probe = None` (timeout / DB failure) → `:warning:` —
+///   uncertainty, NOT a confirmed backlog. The 2026-05-19 false
+///   positives (3 pages on hfhotel) all fell in this bucket: iHOTEL
+///   was busy/slow, probe timed out, every alert self-recovered
+///   within minutes. The previous wording said "real changes are not
+///   being processed" which overstated severity for this case.
+/// * `probe = Some(c)` AND `c > watermark` → `:rotating_light:` —
+///   legacy CT is ahead of the watermark by `c - w` versions.
+///   Confirmed backlog. Real stall.
+/// * `probe = Some(c)` AND `c < watermark` → `:rotating_light:` —
+///   monotonicity violation. Impossible in healthy CT.
+///
+/// `probe = Some(c)` where `c == watermark` is already suppressed
+/// upstream by [`should_fire_stall_alert`] — this function should
+/// never be called in that case, but if it is we fall through to the
+/// monotonicity branch's wording (defensive).
+fn format_stall_alert_message(
+    watermark: i64,
+    probe: Option<i64>,
+    stuck_for: Duration,
+    threshold: Duration,
+) -> String {
+    let stuck_secs = stuck_for.as_secs();
+    let threshold_secs = threshold.as_secs();
+    let dashboard_hint =
+        "Check `legacy_sync_status.last_error` or the dashboard at `/api/new/sync/status`.";
+
+    match probe {
+        None => format!(
+            ":warning: *CT watermark check incomplete* :warning:\n\
+             Watermark at v{watermark} for {stuck_secs}s (threshold {threshold_secs}s); \
+             legacy probe timed out so we cannot confirm a real backlog. Often means \
+             iHOTEL is busy/slow — no confirmed data loss. Will auto-recover or \
+             escalate.\n\
+             _{dashboard_hint}_"
+        ),
+        Some(ct_current) if ct_current > watermark => {
+            let delta = ct_current - watermark;
+            format!(
+                ":rotating_light: *CT watermark STUCK* :rotating_light:\n\
+                 Watermark at v{watermark} but legacy current is v{ct_current} \
+                 ({delta} versions unprocessed, stuck {stuck_secs}s, threshold \
+                 {threshold_secs}s). Real changes are not being processed.\n\
+                 _{dashboard_hint}_"
+            )
+        }
+        Some(ct_current) => format!(
+            ":rotating_light: *CT watermark anomaly* :rotating_light:\n\
+             Watermark v{watermark} exceeds legacy current v{ct_current} (stuck \
+             {stuck_secs}s, threshold {threshold_secs}s). Monotonicity violated \
+             — investigate immediately.\n\
+             _{dashboard_hint}_"
+        ),
+    }
+}
+
+/// Why the recovery message should fire. Carries enough context for
+/// the caller to format the Slack message without re-deriving state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecoveryDecision {
+    /// The watermark version at the time the original stall was paged.
+    paged_version: i64,
+    /// When the original stall alert was paged.
+    paged_at: Instant,
+    /// The watermark version observed right now (post-recovery).
+    current_version: i64,
+    /// Which condition triggered recovery — useful for the log line.
+    reason: RecoveryReason,
+}
+
+/// Discriminator on which of the two recovery rules triggered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryReason {
+    /// Watermark advanced past the version we paged on.
+    WatermarkAdvanced,
+    /// Watermark didn't advance, but the legacy probe now confirms
+    /// legacy CT is idle at our watermark (so there's nothing to
+    /// process, which means the stall was really an idle window).
+    ProbeConfirmsQuiet,
+}
+
+/// Pure decision function for the recovery notification. Mirrors the
+/// pattern of [`watermark_stall_alert_eligible`] /
+/// [`should_fire_stall_alert`] so the watchdog loop body stays small
+/// and the rules stay unit-testable without a tokio runtime.
+///
+/// Inputs:
+/// * `pending` — the open-alert state (`Some((paged_at, paged_version))`
+///   set by the caller after a successful page, `None` otherwise).
+/// * `current_version` — `observation.last_seen_version`.
+/// * `probe` — the result of a fresh
+///   [`probe_change_tracking_current_version`] call this iteration.
+///   `None` means the probe failed or wasn't attempted.
+///
+/// Returns `Some(RecoveryDecision)` when the watchdog should fire ONE
+/// recovery message and clear the pending state.
+///
+/// Recovery fires when there's an open alert AND **either**:
+/// 1. The watermark has advanced past `paged_version` (the watcher
+///    caught up).
+/// 2. The probe returned `Some(v)` where `v == current_version` —
+///    legacy CT is idle at our watermark (same condition
+///    [`should_fire_stall_alert`] uses to suppress new alerts). This
+///    covers the "iHOTEL was just quiet, the watermark was already
+///    correct" case from 2026-05-19.
+///
+/// Recovery does NOT fire on a probe failure during the recovery
+/// check — that's uncertainty, and we'd rather hold the open alert
+/// than declare a premature all-clear.
+fn recovery_alert_eligible(
+    pending: Option<(Instant, i64)>,
+    current_version: i64,
+    probe: Option<i64>,
+) -> Option<RecoveryDecision> {
+    let (paged_at, paged_version) = pending?;
+
+    if current_version > paged_version {
+        return Some(RecoveryDecision {
+            paged_version,
+            paged_at,
+            current_version,
+            reason: RecoveryReason::WatermarkAdvanced,
+        });
+    }
+    if matches!(probe, Some(v) if v == current_version) {
+        return Some(RecoveryDecision {
+            paged_version,
+            paged_at,
+            current_version,
+            reason: RecoveryReason::ProbeConfirmsQuiet,
+        });
+    }
+    None
+}
+
+/// Format the human-readable "alert duration" for the recovery
+/// message. No `humantime` dep in the project, so we round to the
+/// coarsest sensible unit (`s` / `min` / `h`) — simplicity over
+/// polish, as the prompt directs.
+fn format_alert_duration(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}min ago", secs / 60)
+    } else {
+        let hours = secs / 3600;
+        let mins = (secs % 3600) / 60;
+        if mins == 0 {
+            format!("{hours}h ago")
+        } else {
+            format!("{hours}h{mins}min ago")
+        }
+    }
+}
+
+/// Format the Slack recovery message body. Pulled into a helper for
+/// the same testability reason as [`format_stall_alert_message`].
+fn format_recovery_message(decision: &RecoveryDecision, now: Instant) -> String {
+    let elapsed = now.duration_since(decision.paged_at);
+    let duration_ago = format_alert_duration(elapsed);
+    format!(
+        ":white_check_mark: *CT watermark RECOVERED*\n\
+         Watermark resumed advancing (now at v{}). Prior alert from {duration_ago} \
+         cleared.\n\
+         _Dashboard: `/api/new/sync/status`._",
+        decision.current_version,
+    )
+}
+
 /// Pure decision function for the shadow-mode-too-long alert. Returns
 /// `Some(reason)` when shadow mode has been running for longer than
 /// the hardcoded ceiling ([`SHADOW_MODE_MAX_DURATION_SECS`], 36h).
@@ -1358,6 +1531,12 @@ async fn run_watermark_watchdog(
     let mut prior: Option<WatermarkObservation> = None;
     let mut last_stall_alert: Option<Instant> = None;
     let mut last_shadow_alert: Option<Instant> = None;
+    // Open-alert tracking for the recovery notification (PR D,
+    // 2026-05-19). Parallel to `last_stall_alert` — that one encodes
+    // cooldown, this one encodes "we paged and haven't yet declared
+    // all-clear". Cleared after firing the recovery message. Tuple:
+    // `(paged_at, watermark_at_page_time)`.
+    let mut pending_stall_alert: Option<(Instant, i64)> = None;
 
     let shadow_mode = env::var("LEGACY_SYNC_SHADOW_MODE")
         .map(|v| v == "true")
@@ -1394,6 +1573,58 @@ async fn run_watermark_watchdog(
             }
         };
 
+        // Recovery check (PR D, 2026-05-19). If we have an open stall
+        // alert, decide whether to fire the all-clear THIS iteration.
+        // Recovery short-circuits on the cheap "watermark advanced"
+        // rule and only spends a probe call on the "still stuck but
+        // legacy might be idle now" path — we don't want to burn a
+        // 5s probe budget on every idle loop iteration.
+        if let Some((paged_at, paged_version)) = pending_stall_alert {
+            let mut recovery_probe: Option<i64> = None;
+            // Cheap branch first — if the watermark moved past the
+            // paged version we don't need to probe at all.
+            let advanced = observation.last_seen_version > paged_version;
+            if !advanced {
+                // Watermark didn't advance — legacy might be idle and
+                // matching us now. Spend one probe to find out. On
+                // failure we DON'T declare recovery (uncertainty
+                // holds the open alert).
+                recovery_probe = match probe_change_tracking_current_version(&mssql).await {
+                    Ok(v) => Some(v),
+                    Err(err) => {
+                        tracing::warn!(
+                            site = %site_id,
+                            error = %err,
+                            "[watchdog] CT-current probe failed during recovery check \
+                             — holding open alert"
+                        );
+                        None
+                    }
+                };
+            }
+            if let Some(decision) = recovery_alert_eligible(
+                Some((paged_at, paged_version)),
+                observation.last_seen_version,
+                recovery_probe,
+            ) {
+                tracing::info!(
+                    site = %site_id,
+                    paged_version = decision.paged_version,
+                    current_version = decision.current_version,
+                    reason = ?decision.reason,
+                    "[watchdog] Watermark recovered — firing all-clear"
+                );
+                if let Some(s) = slack.as_ref() {
+                    let payload = SlackMessage::with_site_text(
+                        &site_id,
+                        format_recovery_message(&decision, now),
+                    );
+                    let _ = s.send_message(&payload).await;
+                }
+                pending_stall_alert = None;
+            }
+        }
+
         // Watermark stall check (live mode only).
         if let Some(prior_obs) = prior.as_ref() {
             if let Some(reason) =
@@ -1429,6 +1660,7 @@ async fn run_watermark_watchdog(
                         None => true,
                     };
                     if cooldown_elapsed {
+                        let stuck_for = now.duration_since(prior_obs.observed_at);
                         tracing::error!(
                             site = %site_id,
                             version = observation.last_seen_version,
@@ -1439,23 +1671,22 @@ async fn run_watermark_watchdog(
                         if let Some(s) = slack.as_ref() {
                             let payload = SlackMessage::with_site_text(
                                 &site_id,
-                                format!(
-                                    ":rotating_light: *CT watermark STUCK* :rotating_light:\n\
-                                     {reason}\n\
-                                     _The CT watcher is ticking but `last_seen_version` \
-                                     hasn't advanced and `CHANGE_TRACKING_CURRENT_VERSION()` \
-                                     is AHEAD (or unreachable). Common causes: every tick \
-                                     failing + rolling back the watermark UPDATE (check \
-                                     `legacy_sync_status.last_error`). Quiet legacy is \
-                                     suppressed by the quiet-aware probe; this alert \
-                                     means real changes are not being processed. Tighten \
-                                     the check via the dashboard at \
-                                     `/api/new/sync/status`._"
+                                format_stall_alert_message(
+                                    observation.last_seen_version,
+                                    probe,
+                                    stuck_for,
+                                    stall_threshold,
                                 ),
                             );
                             let _ = s.send_message(&payload).await;
                         }
                         last_stall_alert = Some(now);
+                        // Open-alert state for the recovery notification
+                        // (PR D, 2026-05-19). Always set after a page,
+                        // regardless of severity — recovery applies to
+                        // all three severities equally.
+                        pending_stall_alert =
+                            Some((now, observation.last_seen_version));
                     }
                 }
             } else if observation.last_seen_version > prior_obs.last_seen_version {
@@ -3943,6 +4174,182 @@ mod tests {
         assert!(
             CT_RETENTION_CLIFF_SECS - SHADOW_MODE_MAX_DURATION_SECS >= 12 * 3600,
             "must leave >=12h cushion before the cliff"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // PR D — tone-aware stall alerts + recovery notification
+    // (2026-05-19 false-positive incident: 3 self-recovering pages at
+    // 10:16, 12:01, 13:27 Thailand time, all probe-timeout cases).
+    // -------------------------------------------------------------------
+
+    /// Probe timeout / failure should yield the warning-tier message,
+    /// NOT the critical-tier "real changes are not being processed"
+    /// wording. This is the specific regression today's incident hit.
+    #[test]
+    fn format_stall_alert_message_uses_warning_when_probe_is_none() {
+        let msg = format_stall_alert_message(
+            17209,
+            None,
+            Duration::from_secs(1801),
+            Duration::from_secs(1800),
+        );
+        assert!(
+            msg.contains(":warning:"),
+            "probe-failure path must use the :warning: tier; got: {msg}"
+        );
+        assert!(
+            !msg.contains(":rotating_light:"),
+            "probe-failure path must NOT use :rotating_light:; got: {msg}"
+        );
+        assert!(
+            msg.contains("cannot confirm a real backlog"),
+            "warning text must clarify there's no confirmed backlog; got: {msg}"
+        );
+        assert!(
+            msg.contains("v17209"),
+            "warning text must include the watermark version; got: {msg}"
+        );
+    }
+
+    /// Probe ahead of the watermark is the canonical "wedged" case.
+    /// Must use the critical tier AND surface the delta so operators
+    /// can size the backlog at a glance.
+    #[test]
+    fn format_stall_alert_message_uses_critical_with_delta_when_probe_ahead() {
+        let msg = format_stall_alert_message(
+            17209,
+            Some(17250),
+            Duration::from_secs(1800),
+            Duration::from_secs(1800),
+        );
+        assert!(
+            msg.contains(":rotating_light:"),
+            "probe-ahead path must use :rotating_light:; got: {msg}"
+        );
+        assert!(
+            msg.contains("v17209"),
+            "must include the watermark version; got: {msg}"
+        );
+        assert!(
+            msg.contains("v17250"),
+            "must include the legacy current version; got: {msg}"
+        );
+        assert!(
+            msg.contains("41 versions unprocessed"),
+            "must surface the {{c - w}} delta (17250 - 17209 = 41); got: {msg}"
+        );
+        assert!(
+            msg.contains("Real changes are not being processed"),
+            "critical wording must reflect confirmed backlog; got: {msg}"
+        );
+    }
+
+    /// Probe below the watermark is an anomaly — monotonicity is
+    /// guaranteed by SQL Server CT. Must still alert critically.
+    #[test]
+    fn format_stall_alert_message_uses_critical_for_monotonicity_violation() {
+        let msg = format_stall_alert_message(
+            17209,
+            Some(100),
+            Duration::from_secs(1800),
+            Duration::from_secs(1800),
+        );
+        assert!(
+            msg.contains(":rotating_light:"),
+            "monotonicity-violation path must use :rotating_light:; got: {msg}"
+        );
+        assert!(
+            msg.contains("anomaly"),
+            "wording must call out the anomaly; got: {msg}"
+        );
+        assert!(
+            msg.contains("Monotonicity"),
+            "wording must mention monotonicity for operator clarity; got: {msg}"
+        );
+        assert!(
+            msg.contains("v17209") && msg.contains("v100"),
+            "must include both versions; got: {msg}"
+        );
+    }
+
+    /// Idle-loop case: no open alert, no recovery decision.
+    #[test]
+    fn recovery_alert_eligible_returns_none_when_no_pending_alert() {
+        let decision = recovery_alert_eligible(None, 17209, Some(17209));
+        assert!(
+            decision.is_none(),
+            "no open alert means no recovery to declare"
+        );
+    }
+
+    /// Watermark advanced past the paged version → fire recovery,
+    /// regardless of probe outcome (the cheap branch).
+    #[test]
+    fn recovery_alert_eligible_fires_when_watermark_advanced_past_paged_version() {
+        let paged_at = Instant::now();
+        let decision = recovery_alert_eligible(
+            Some((paged_at, 17209)),
+            17220, // advanced 11 versions
+            None,  // probe not even attempted on the cheap branch
+        )
+        .expect("watermark advance must trigger recovery");
+        assert_eq!(decision.paged_version, 17209);
+        assert_eq!(decision.current_version, 17220);
+        assert_eq!(decision.reason, RecoveryReason::WatermarkAdvanced);
+    }
+
+    /// Watermark didn't advance, but the recovery-check probe now
+    /// confirms legacy CT is idle at our watermark — fire recovery.
+    /// This is the 2026-05-19 case (iHOTEL idle, probe timed out
+    /// during stall window but succeeded a few minutes later).
+    #[test]
+    fn recovery_alert_eligible_fires_when_probe_confirms_quiet_at_watermark() {
+        let paged_at = Instant::now();
+        let decision = recovery_alert_eligible(
+            Some((paged_at, 17209)),
+            17209,        // watermark unchanged
+            Some(17209),  // legacy idle at our version
+        )
+        .expect("probe == watermark must trigger recovery");
+        assert_eq!(decision.paged_version, 17209);
+        assert_eq!(decision.current_version, 17209);
+        assert_eq!(decision.reason, RecoveryReason::ProbeConfirmsQuiet);
+    }
+
+    /// Defensive: probe failure during recovery check must NOT
+    /// declare recovery. We'd rather hold the open alert than fire a
+    /// premature all-clear on uncertainty.
+    #[test]
+    fn recovery_alert_eligible_returns_none_when_probe_failed_during_recovery_check() {
+        let paged_at = Instant::now();
+        let decision = recovery_alert_eligible(
+            Some((paged_at, 17209)),
+            17209,
+            None, // probe failed
+        );
+        assert!(
+            decision.is_none(),
+            "probe failure during recovery check must hold the open alert"
+        );
+    }
+
+    /// Idle stall persists: watermark unchanged AND probe still
+    /// shows legacy is ahead (or unreachable in a different way).
+    /// Recovery must not fire.
+    #[test]
+    fn recovery_alert_eligible_returns_none_when_state_unchanged_and_probe_still_silent() {
+        let paged_at = Instant::now();
+        // Probe says legacy is still ahead — stall is real and
+        // continuing. Recovery should NOT declare all-clear.
+        let decision = recovery_alert_eligible(
+            Some((paged_at, 17209)),
+            17209,
+            Some(17250), // legacy still ahead
+        );
+        assert!(
+            decision.is_none(),
+            "ongoing stall (probe still ahead) must not fire recovery"
         );
     }
 }
