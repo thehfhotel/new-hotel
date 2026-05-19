@@ -1418,9 +1418,8 @@ fn parse_booking_legacy_pk(legacy_pk: &str) -> (&str, &str) {
 ///
 /// Dispatches on the same table-name vocabulary the reconcile loop
 /// writes into `ht_reconcile_log.table_name` ("customers", "bookings",
-/// "checkins"). Other table names (e.g. "rooms") are not currently
-/// auto-resolvable — they return `Ok(None)` so the row stays in the
-/// queue for operator review.
+/// "checkins", "rooms"). Other table names return `Ok(None)` so the
+/// row stays in the queue for operator review.
 async fn compute_current_pg_hash(
     pg_pool: &PgPool,
     table_name: &str,
@@ -1472,6 +1471,24 @@ async fn compute_current_pg_hash(
                 )
             }))
         }
+        "rooms" => {
+            // Canonical-side re-hash from `ht_rooms_new` under the SAME
+            // narrowed projection `sync_rooms` uses on the legacy side
+            // (room_no + clean + maintenance + notes). Without this arm
+            // every rooms drift row sat open forever — the post-detection
+            // sweep fell through to `_ => Ok(None)` even after the
+            // underlying state had converged (live A2-1 evidence,
+            // 2026-05-18: current_legacy_hash=None current_pg_hash=None).
+            let canonical = fetch_canonical_room(pg_pool, legacy_pk).await?;
+            Ok(canonical.map(|c| {
+                room_canonical_hash(
+                    legacy_pk,
+                    bool_to_yesno(c.room_clean),
+                    bool_to_yesno(c.room_maintenance),
+                    c.room_notes.as_deref(),
+                )
+            }))
+        }
         _ => Ok(None),
     }
 }
@@ -1480,8 +1497,8 @@ async fn compute_current_pg_hash(
 /// `*_RECONCILE_PROJECTION` constants and produce a fresh `mssql_hash`.
 /// Returns `Ok(None)` when the row no longer exists on the legacy side
 /// (treated as "still drifted — leave for operator review"), or when
-/// `table_name` is outside the dispatched set ("rooms" / future entities
-/// that don't yet have a legacy-side fetch path).
+/// `table_name` is outside the dispatched set (future entities that
+/// don't yet have a legacy-side fetch path).
 ///
 /// Mirrors `compute_current_pg_hash` so the auto-resolve sweep can
 /// compare like-for-like under the current projection. The whole point
@@ -1498,9 +1515,10 @@ async fn compute_current_pg_hash(
 /// parallel-projection-pipeline divergence. Bug B / C / D class becomes
 /// impossible at this layer.
 ///
-/// Customers + bookings still use their light-weight per-PK projections
-/// (`fetch_legacy_customer_hash`, `fetch_legacy_booking_hash`) — the
-/// same unification is a follow-on for those entities.
+/// Customers + bookings + rooms still use their light-weight per-PK
+/// projections (`fetch_legacy_customer_hash`, `fetch_legacy_booking_hash`,
+/// `fetch_legacy_room_hash`) — the same unification is a follow-on for
+/// those entities.
 async fn compute_current_legacy_hash(
     legacy_pool: &DbPool,
     table_name: &str,
@@ -1513,6 +1531,7 @@ async fn compute_current_legacy_hash(
             fetch_legacy_booking_hash(legacy_pool, book_no, room_type_key).await
         }
         "checkins" => compute_legacy_checkin_hash_via_mapper(legacy_pool, legacy_pk).await,
+        "rooms" => fetch_legacy_room_hash(legacy_pool, legacy_pk).await,
         _ => Ok(None),
     }
 }
@@ -1644,6 +1663,40 @@ async fn fetch_legacy_booking_hash(
         book_checkin_date.as_deref(),
         book_checkout_date.as_deref(),
         book_cust_id_owned.as_deref(),
+    )))
+}
+
+/// Single-PK MSSQL re-projection for rooms. Mirrors `sync_rooms`'
+/// per-row hash construction (room_no + clean + maintenance + notes,
+/// with `legacy_yesno_canonical` collapsing legacy literals) so the
+/// auto-resolve sweep can re-fetch a room's CURRENT legacy hash and
+/// compare against canonical. `Ok(None)` when the row no longer
+/// exists on the legacy side (treated as "still drifted — leave for
+/// operator review").
+async fn fetch_legacy_room_hash(
+    legacy_pool: &DbPool,
+    room_no: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut conn = legacy_pool.get().await?;
+    let sql = format!(
+        "SELECT {projection} FROM HT_Rooms WHERE Room_no = @P1",
+        projection = ROOMS_RECONCILE_PROJECTION.join(", "),
+    );
+    let mut q = Query::new(sql);
+    q.bind(room_no);
+    let rows = q.query(&mut conn).await?.into_first_result().await?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let row_room_no = row.get::<&str, _>("Room_no").unwrap_or_default().to_string();
+    let room_clean = row.get::<&str, _>("Room_Clean").map(String::from);
+    let room_manternace = row.get::<&str, _>("Room_Manternace").map(String::from);
+    let room_details = row.get::<&str, _>("Room_Details").map(String::from);
+    Ok(Some(room_canonical_hash(
+        &row_room_no,
+        legacy_yesno_canonical(room_clean.as_deref()),
+        legacy_yesno_canonical(room_manternace.as_deref()),
+        room_details.as_deref(),
     )))
 }
 
@@ -4268,6 +4321,132 @@ mod tests {
             None,
         );
         assert_ne!(mssql, canonical);
+    }
+
+    // -------------------------------------------------------------------
+    // PR C (2026-05-19) — auto-resolve sweep wires rooms into both
+    // dispatch tables (`compute_current_pg_hash` and
+    // `compute_current_legacy_hash`). The dispatch arms are 1-liners
+    // that delegate to `fetch_canonical_room → room_canonical_hash`
+    // and `fetch_legacy_room_hash` respectively; the substantive
+    // behaviour lives in those helpers. The composition tests below
+    // pin the hash-input contract that both arms construct, mirroring
+    // the customer/booking pattern (the live A2-1 evidence of
+    // 2026-05-18 was `current_legacy_hash=None current_pg_hash=None`
+    // — the `_ => Ok(None)` arm firing on both sides).
+    // -------------------------------------------------------------------
+
+    /// Pinpoints the canonical-side arm's composition: a `CanonicalRoomRow`
+    /// projects through `bool_to_yesno + room_canonical_hash` into
+    /// exactly the same byte string the legacy-side projection emits
+    /// for the converged equivalent. When the dispatch arm runs against
+    /// a real PG row, this is the hash the sweep compares against
+    /// `fetch_legacy_room_hash`'s output.
+    #[test]
+    fn rooms_pg_dispatch_composition_converges_with_legacy_projection() {
+        // A canonical row the CT mapper would have written after the
+        // legacy state converged (clean=yes, maintenance=no, no notes).
+        let canonical_row = CanonicalRoomRow {
+            room_clean: Some(true),
+            room_maintenance: Some(false),
+            room_notes: None,
+        };
+        let pg_hash = room_canonical_hash(
+            "A2-1",
+            bool_to_yesno(canonical_row.room_clean),
+            bool_to_yesno(canonical_row.room_maintenance),
+            canonical_row.room_notes.as_deref(),
+        );
+
+        // The legacy side runs `legacy_yesno_canonical` over the raw
+        // MSSQL literal ("yes"/"no"/NULL). After convergence those
+        // collapse to the same `'yes' | 'no' | ""` tokens used above.
+        let legacy_hash = room_canonical_hash(
+            "A2-1",
+            legacy_yesno_canonical(Some("yes")),
+            legacy_yesno_canonical(Some("no")),
+            None,
+        );
+
+        assert_eq!(
+            pg_hash, legacy_hash,
+            "auto-resolve sweep relies on both arms producing byte-identical \
+             hashes when the underlying state has converged"
+        );
+    }
+
+    /// Round-trips every legal `(canonical bool, legacy literal)` pair.
+    /// Lock test that catches a future regression in either
+    /// `bool_to_yesno` or `legacy_yesno_canonical` — both arms of the
+    /// auto-resolve sweep depend on these being exact inverses for
+    /// the rooms arm to ever converge.
+    #[test]
+    fn rooms_dispatch_yesno_round_trip_is_total() {
+        for (canonical, legacy_literal) in [
+            (Some(true), Some("yes")),
+            (Some(false), Some("no")),
+            (None, None),
+        ] {
+            assert_eq!(
+                bool_to_yesno(canonical),
+                legacy_yesno_canonical(legacy_literal),
+                "rooms dispatch loses parity when canonical {:?} ↔ legacy {:?}",
+                canonical,
+                legacy_literal,
+            );
+        }
+    }
+
+    /// Operator-edited the notes in legacy but the CT mapper hasn't
+    /// caught up → both dispatch arms produce different hashes and the
+    /// reconcile_log row stays open. Mirrors the
+    /// `room_canonical_hash_diverges_when_canonical_clean_lags_behind`
+    /// pattern for the notes field, which is the third hash input.
+    #[test]
+    fn rooms_pg_dispatch_composition_diverges_when_canonical_notes_lag() {
+        let canonical_row = CanonicalRoomRow {
+            room_clean: Some(true),
+            room_maintenance: Some(false),
+            room_notes: Some("old note".to_string()),
+        };
+        let pg_hash = room_canonical_hash(
+            "A2-1",
+            bool_to_yesno(canonical_row.room_clean),
+            bool_to_yesno(canonical_row.room_maintenance),
+            canonical_row.room_notes.as_deref(),
+        );
+        let legacy_hash = room_canonical_hash(
+            "A2-1",
+            legacy_yesno_canonical(Some("yes")),
+            legacy_yesno_canonical(Some("no")),
+            Some("new note"),
+        );
+        assert_ne!(
+            pg_hash, legacy_hash,
+            "post-detection sweep must NOT auto-resolve while canonical \
+             notes still trail the legacy state"
+        );
+    }
+
+    /// `fetch_legacy_room_hash` returns `Ok(None)` when the legacy
+    /// row has been deleted since the drift was detected. This pure
+    /// test pins the convention used by every `fetch_legacy_*_hash`
+    /// helper: a missing row is "still drifted — leave for operator
+    /// review" rather than "converged to absent". The dispatch arm
+    /// therefore must NOT auto-resolve (`should_auto_resolve` rejects
+    /// the `None` half of the pair).
+    #[test]
+    fn rooms_dispatch_missing_legacy_row_does_not_auto_resolve() {
+        // Simulate `fetch_legacy_room_hash` returning Ok(None) for a
+        // legacy-deleted row, alongside a still-present canonical hash.
+        let legacy_hash: Option<String> = None;
+        let pg_hash: Option<String> = Some(room_canonical_hash("A2-1", "yes", "no", None));
+
+        assert!(
+            !should_auto_resolve(legacy_hash.as_deref(), pg_hash.as_deref()),
+            "a None legacy hash (row deleted) must keep the reconcile_log \
+             row open for operator review, never auto-resolve"
+        );
     }
 
     #[test]
