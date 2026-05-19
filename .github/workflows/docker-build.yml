@@ -862,9 +862,10 @@ jobs:
           # Default 'true' preserves prior behavior. Operators flip to
           # 'false' via `gh variable set HOURLY_REPORT_ENABLED -b false`
           # during a CT-watcher backfill window to silence the cron noise.
-          HOURLY_REPORT_ENABLED:         ${{ vars.HOURLY_REPORT_ENABLED || 'true' }}
-          CHECKIN_NOTIFICATIONS_ENABLED: ${{ vars.CHECKIN_NOTIFICATIONS_ENABLED || 'true' }}
-          BOOKING_NOTIFICATIONS_ENABLED: ${{ vars.BOOKING_NOTIFICATIONS_ENABLED || 'true' }}
+          HOURLY_REPORT_ENABLED:          ${{ vars.HOURLY_REPORT_ENABLED || 'true' }}
+          CHECKIN_NOTIFICATIONS_ENABLED:  ${{ vars.CHECKIN_NOTIFICATIONS_ENABLED || 'true' }}
+          CHECKOUT_NOTIFICATIONS_ENABLED: ${{ vars.CHECKOUT_NOTIFICATIONS_ENABLED || 'true' }}
+          BOOKING_NOTIFICATIONS_ENABLED:  ${{ vars.BOOKING_NOTIFICATIONS_ENABLED || 'true' }}
           # Tracing log level. Pinned to debug for scheduler::sync +
           # scheduler::jobs until Track B junction-table migration ships
           # and reconcile noise drops to a steady-state baseline (incident
@@ -934,9 +935,10 @@ jobs:
             --arg LEGACY_SYNC_ENABLED "$LEGACY_SYNC_ENABLED" \
             --arg LEGACY_SYNC_SHADOW_MODE "$LEGACY_SYNC_SHADOW_MODE" \
             --arg AUTH_ENABLED        "$AUTH_ENABLED" \
-            --arg HOURLY_REPORT_ENABLED         "${HOURLY_REPORT_ENABLED:-true}" \
-            --arg CHECKIN_NOTIFICATIONS_ENABLED "${CHECKIN_NOTIFICATIONS_ENABLED:-true}" \
-            --arg BOOKING_NOTIFICATIONS_ENABLED "${BOOKING_NOTIFICATIONS_ENABLED:-true}" \
+            --arg HOURLY_REPORT_ENABLED          "${HOURLY_REPORT_ENABLED:-true}" \
+            --arg CHECKIN_NOTIFICATIONS_ENABLED  "${CHECKIN_NOTIFICATIONS_ENABLED:-true}" \
+            --arg CHECKOUT_NOTIFICATIONS_ENABLED "${CHECKOUT_NOTIFICATIONS_ENABLED:-true}" \
+            --arg BOOKING_NOTIFICATIONS_ENABLED  "${BOOKING_NOTIFICATIONS_ENABLED:-true}" \
             --arg RUST_LOG                      "${RUST_LOG:-hotel_backend::scheduler::sync=debug,hotel_backend::scheduler::jobs=debug,hotel_backend=info,writeback=info,sync=info,tower_http=info}" \
             '{
               commit_sha: $commit_sha,
@@ -955,9 +957,10 @@ jobs:
                 LEGACY_SYNC_ENABLED:          $LEGACY_SYNC_ENABLED,
                 LEGACY_SYNC_SHADOW_MODE:      $LEGACY_SYNC_SHADOW_MODE,
                 AUTH_ENABLED:                 $AUTH_ENABLED,
-                HOURLY_REPORT_ENABLED:        $HOURLY_REPORT_ENABLED,
-                CHECKIN_NOTIFICATIONS_ENABLED: $CHECKIN_NOTIFICATIONS_ENABLED,
-                BOOKING_NOTIFICATIONS_ENABLED: $BOOKING_NOTIFICATIONS_ENABLED,
+                HOURLY_REPORT_ENABLED:          $HOURLY_REPORT_ENABLED,
+                CHECKIN_NOTIFICATIONS_ENABLED:  $CHECKIN_NOTIFICATIONS_ENABLED,
+                CHECKOUT_NOTIFICATIONS_ENABLED: $CHECKOUT_NOTIFICATIONS_ENABLED,
+                BOOKING_NOTIFICATIONS_ENABLED:  $BOOKING_NOTIFICATIONS_ENABLED,
                 RUST_LOG:                     $RUST_LOG,
               },
               secrets: {
