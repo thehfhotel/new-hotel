@@ -226,20 +226,35 @@ pub async fn init_scheduler(
         );
     }
 
-    // Poll for checkouts every 2 minutes
-    let checkout_job = Job::new_async("0 */2 * * * *", move |_uuid, _l| {
-        let pool = pool_checkouts.clone();
-        let slack = slack_checkouts.clone();
-        let state = state_checkouts.clone();
-        let site_id = checkout_site.clone();
-        let pg = pg_checkouts.clone();
-        Box::pin(async move {
-            if let Err(e) = poll_checkouts(&pool, pg.as_ref(), &slack, &state, &site_id).await {
-                tracing::error!(site = %site_id, "[Scheduler] Error polling checkouts: {}", e);
-            }
-        })
-    })?;
-    scheduler.add(checkout_job).await?;
+    // Poll for checkouts every 2 minutes.
+    //
+    // Feature flag: `CHECKOUT_NOTIFICATIONS_ENABLED=false` skips
+    // registration entirely so the checkout Slack alert doesn't fire.
+    // Same shape as `CHECKIN_NOTIFICATIONS_ENABLED` /
+    // `BOOKING_NOTIFICATIONS_ENABLED`. Default: enabled.
+    let checkout_notifications_enabled = std::env::var("CHECKOUT_NOTIFICATIONS_ENABLED")
+        .map(|v| v != "false")
+        .unwrap_or(true);
+    if checkout_notifications_enabled {
+        let checkout_job = Job::new_async("0 */2 * * * *", move |_uuid, _l| {
+            let pool = pool_checkouts.clone();
+            let slack = slack_checkouts.clone();
+            let state = state_checkouts.clone();
+            let site_id = checkout_site.clone();
+            let pg = pg_checkouts.clone();
+            Box::pin(async move {
+                if let Err(e) = poll_checkouts(&pool, pg.as_ref(), &slack, &state, &site_id).await
+                {
+                    tracing::error!(site = %site_id, "[Scheduler] Error polling checkouts: {}", e);
+                }
+            })
+        })?;
+        scheduler.add(checkout_job).await?;
+    } else {
+        tracing::info!(
+            "[Scheduler] - Checkout polling: DISABLED (CHECKOUT_NOTIFICATIONS_ENABLED=false)"
+        );
+    }
 
     // Poll for new bookings every 2 minutes.
     //
@@ -282,7 +297,9 @@ pub async fn init_scheduler(
     if checkin_notifications_enabled {
         tracing::info!("[Scheduler] - Check-in polling: every 2 minutes");
     }
-    tracing::info!("[Scheduler] - Checkout polling: every 2 minutes");
+    if checkout_notifications_enabled {
+        tracing::info!("[Scheduler] - Checkout polling: every 2 minutes");
+    }
     if booking_notifications_enabled {
         tracing::info!("[Scheduler] - Booking polling: every 2 minutes");
     }
