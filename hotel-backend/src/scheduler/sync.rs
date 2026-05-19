@@ -1116,16 +1116,42 @@ fn booking_canonical_hash(
 /// mapper denormalises only the FIRST room (`legacy_room_no`) into
 /// `ht_checkins`, so we hash that single representative row here too.
 ///
-/// `cin_status` is deliberately excluded: `View_CheckIn_Ds.Cin_status`
-/// is a per-room ledger state, whereas canonical `ht_checkins.cin_status`
-/// is the header-derived aggregate — different fields.
+/// `cin_status` is deliberately excluded from the active-stay hash
+/// shape: `View_CheckIn_Ds.Cin_status` is a per-room ledger state,
+/// whereas canonical `ht_checkins.cin_status` is the header-derived
+/// aggregate — different fields.
+///
+/// **Cancelled folios (2026-05-19 — reconcile cleanup PR B).** When
+/// iHOTEL cancels a check-in (`HT_CheckIn_H.Cin_status='ยกเลิก'`) it
+/// also deletes the per-room `HT_CheckIn_Ds` rows. The CT mapper's
+/// `derive_room_state` honours that by emitting
+/// `canonical_status='cancelled'` with `first_room_no=None`.
+/// Canonical PG, however, retains the original `legacy_room_no` on
+/// the existing `ht_checkins` row so operators can still see WHICH
+/// room was cancelled. Hashing room context on both sides therefore
+/// diverges forever: legacy emits `""`, PG emits `Some("301")`. Six
+/// stuck `value` drifts in production (CH26-005252, CH26-005270,
+/// CH26-005487, CH26-005524, CH26-005527, CH26-005543) are the
+/// live manifestation as of the 2026-05-19 audit.
+///
+/// When `cancelled = true`, this function returns a sentinel
+/// `sha256("CANCELLED|{legacy_cin_no}")` and IGNORES every other
+/// input. Both the legacy and canonical reconcile paths call with
+/// the same `cancelled` decision (`cin_status == "cancelled"`), so
+/// the sentinel collapses the parity gap deterministically. When
+/// `cancelled = false`, the active-stay 5-field shape is unchanged
+/// — pre-2026-05-19 hash bytes are preserved bit-for-bit.
 fn checkin_canonical_hash(
     legacy_cin_no: &str,
     legacy_room_no: Option<&str>,
     cin_checkin_time: Option<&str>,
     cin_checkout_time: Option<&str>,
     legacy_cust_no: Option<&str>,
+    cancelled: bool,
 ) -> String {
+    if cancelled {
+        return sha256(&format!("CANCELLED|{}", legacy_cin_no));
+    }
     sha256(&format!(
         "{}|{}|{}|{}|{}",
         legacy_cin_no,
@@ -1387,12 +1413,14 @@ async fn compute_current_pg_hash(
             let canonical = fetch_canonical_checkin(pg_pool, legacy_pk).await?;
             Ok(canonical.map(|c| {
                 let effective_checkout = c.effective_checkout_date().map(|d| d.to_string());
+                let cancelled = c.is_cancelled();
                 checkin_canonical_hash(
                     legacy_pk,
                     c.legacy_room_no.as_deref(),
                     c.cin_checkin_time.map(|t| t.to_string()).as_deref(),
                     effective_checkout.as_deref(),
                     c.legacy_cust_no.as_deref(),
+                    cancelled,
                 )
             }))
         }
@@ -1477,6 +1505,7 @@ async fn compute_legacy_checkin_hash_via_mapper(
         Some(canonical.cin_checkin_time.to_string()).as_deref(),
         Some(effective_checkout).as_deref(),
         canonical.legacy_cust_no.as_deref(),
+        canonical.cin_status == "cancelled",
     );
     Ok(Some(hash))
 }
@@ -2874,6 +2903,7 @@ fn checkin_hash_from_canonical(
         Some(canonical.cin_checkin_time.to_string()).as_deref(),
         Some(effective_checkout_str).as_deref(),
         canonical.legacy_cust_no.as_deref(),
+        canonical.cin_status == "cancelled",
     )
 }
 
@@ -3056,6 +3086,7 @@ async fn sync_checkins(
                         checkin_str.as_deref(),
                         effective_checkout_str.as_deref(),
                         c.legacy_cust_no.as_deref(),
+                        c.is_cancelled(),
                     )
                 });
 
@@ -3192,6 +3223,17 @@ struct CanonicalCheckinRow {
     cin_expected_checkout: Option<chrono::NaiveDate>,
     cin_checkout_time: Option<NaiveDateTime>,
     legacy_cust_no: Option<String>,
+    /// Header-derived aggregate status. PG enum literals
+    /// (`'active'` / `'checkedout'` / `'cancelled'`) — see
+    /// `crate::sync::mappers::checkin::legacy_status_to_pg`.
+    ///
+    /// Used as the gate for the `cancelled` sentinel branch of
+    /// `checkin_canonical_hash` so the legacy and canonical hashes
+    /// converge on cancelled folios (whose per-room `HT_CheckIn_Ds`
+    /// rows iHOTEL deletes — see the function-level docs on
+    /// `checkin_canonical_hash` for the six stuck CH26-* PKs that
+    /// motivated this).
+    cin_status: Option<String>,
 }
 
 impl CanonicalCheckinRow {
@@ -3203,6 +3245,15 @@ impl CanonicalCheckinRow {
         self.cin_checkout_time
             .map(|dt| dt.date())
             .or(self.cin_expected_checkout)
+    }
+
+    /// `true` when the header-derived aggregate status is `'cancelled'`
+    /// — gate for the `checkin_canonical_hash` cancelled sentinel.
+    /// Treats NULL/missing as not cancelled (the active-stay 5-field
+    /// hash path is strictly safer than the sentinel path: it
+    /// preserves all the existing field-by-field drift detection).
+    fn is_cancelled(&self) -> bool {
+        self.cin_status.as_deref() == Some("cancelled")
     }
 }
 
@@ -3216,9 +3267,10 @@ async fn fetch_canonical_checkin(
         Option<chrono::NaiveDate>,
         Option<NaiveDateTime>,
         Option<String>,
+        Option<String>,
     )>(
         "SELECT legacy_room_no, cin_checkin_time, cin_expected_checkout, \
-                cin_checkout_time, legacy_cust_no \
+                cin_checkout_time, legacy_cust_no, cin_status \
            FROM ht_checkins \
           WHERE legacy_cin_no = $1 \
           LIMIT 1",
@@ -3227,15 +3279,18 @@ async fn fetch_canonical_checkin(
     .fetch_optional(pg_pool)
     .await
     .map(|opt| {
-        opt.map(|(room, checkin, expected_checkout, actual_checkout, cust)| {
-            CanonicalCheckinRow {
-                legacy_room_no: room,
-                cin_checkin_time: checkin,
-                cin_expected_checkout: expected_checkout,
-                cin_checkout_time: actual_checkout,
-                legacy_cust_no: cust,
-            }
-        })
+        opt.map(
+            |(room, checkin, expected_checkout, actual_checkout, cust, status)| {
+                CanonicalCheckinRow {
+                    legacy_room_no: room,
+                    cin_checkin_time: checkin,
+                    cin_expected_checkout: expected_checkout,
+                    cin_checkout_time: actual_checkout,
+                    legacy_cust_no: cust,
+                    cin_status: status,
+                }
+            },
+        )
     })
 }
 
@@ -3691,6 +3746,7 @@ mod tests {
             Some(checkin_dt.to_string()).as_deref(),
             Some(expected_out.to_string()).as_deref(),
             Some(cust_no),
+            false,
         )
     }
 
@@ -4204,6 +4260,7 @@ mod tests {
             Some("2026-04-01 14:00:00"),
             None,
             Some("C001"),
+            false,
         );
         let canonical = checkin_canonical_hash(
             "CIN001",
@@ -4211,6 +4268,7 @@ mod tests {
             Some("2026-04-01 14:00:00"),
             None,
             Some("C001"),
+            false,
         );
         assert_eq!(mssql, canonical);
     }
@@ -4223,6 +4281,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         // CT mapper resolved the wrong room — drift the operator
         // should investigate via `ht_reconcile_log`.
@@ -4232,6 +4291,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_ne!(mssql, canonical);
     }
@@ -4249,6 +4309,7 @@ mod tests {
             Some("2026-04-01 14:00:00"),
             None,
             Some("C001"),
+            false,
         );
         let canonical = checkin_canonical_hash(
             "CIN001",
@@ -4256,6 +4317,7 @@ mod tests {
             Some("2026-04-01 14:00:00"),
             None,
             Some("C001"),
+            false,
         );
         assert_eq!(mssql, canonical);
     }
@@ -4276,6 +4338,7 @@ mod tests {
             Some("2026-04-01 14:00:00"),
             Some("2026-05-18"), // MSSQL caller now drops time via .date().to_string()
             Some("C001"),
+            false,
         );
         let canonical = checkin_canonical_hash(
             "CIN001",
@@ -4283,6 +4346,7 @@ mod tests {
             Some("2026-04-01 14:00:00"),
             Some("2026-05-18"), // canonical cin_expected_checkout.to_string()
             Some("C001"),
+            false,
         );
         assert_eq!(mssql, canonical);
     }
@@ -4300,6 +4364,7 @@ mod tests {
             Some("2026-04-01 14:00:00"),
             Some("2026-05-18 11:59:59"),
             Some("C001"),
+            false,
         );
         let pre_fix_canonical_null_checkout = checkin_canonical_hash(
             "CIN001",
@@ -4307,6 +4372,7 @@ mod tests {
             Some("2026-04-01 14:00:00"),
             None,
             Some("C001"),
+            false,
         );
         assert_ne!(
             pre_fix_mssql_datetime, pre_fix_canonical_null_checkout,
@@ -4333,6 +4399,7 @@ mod tests {
                 NaiveDate::from_ymd_opt(2026, 5, 10).unwrap().and_hms_opt(12, 8, 0).unwrap(),
             ),
             legacy_cust_no: None,
+            cin_status: None,
         };
         // Completed-extended stay: actual departure date wins over original
         // booking. Matches the legacy `Cin_Room_Out` value the MSSQL side
@@ -4356,6 +4423,7 @@ mod tests {
             cin_expected_checkout: Some(NaiveDate::from_ymd_opt(2026, 5, 18).unwrap()),
             cin_checkout_time: None,
             legacy_cust_no: None,
+            cin_status: None,
         };
         assert_eq!(
             row.effective_checkout_date(),
@@ -4374,8 +4442,132 @@ mod tests {
             cin_expected_checkout: None,
             cin_checkout_time: None,
             legacy_cust_no: None,
+            cin_status: None,
         };
         assert_eq!(row.effective_checkout_date(), None);
+    }
+
+    // -------------------------------------------------------------------
+    // Cancelled-folio sentinel (2026-05-19 — reconcile cleanup PR B)
+    // -------------------------------------------------------------------
+    //
+    // When iHOTEL cancels a check-in it deletes the per-room
+    // `HT_CheckIn_Ds` rows, so the CT mapper's `derive_room_state`
+    // emits `canonical_status='cancelled'` with `first_room_no=None`.
+    // Canonical PG keeps the original `legacy_room_no` on the
+    // existing `ht_checkins` row. Hashing room context on both sides
+    // therefore diverges forever; the live audit on 2026-05-19 found
+    // six stuck `value` drifts on HF Hotel (CH26-005252, CH26-005270,
+    // CH26-005487, CH26-005524, CH26-005527, CH26-005543) all of
+    // which share that exact shape.
+    //
+    // The `cancelled` flag on `checkin_canonical_hash` collapses both
+    // sides onto a sentinel that ignores room/time/customer context.
+    // These tests pin (a) the sentinel format, (b) the cross-side
+    // equality the production fix delivers, and (c) the regression
+    // guarantee that the active-stay path keeps its existing
+    // 5-field-shape semantics.
+
+    #[test]
+    fn checkin_canonical_hash_returns_cancelled_sentinel_independent_of_room() {
+        // With `cancelled = true` the function must IGNORE every input
+        // except `legacy_cin_no` — garbage in any other slot must not
+        // change the bytes. Pin the exact sentinel format so a future
+        // refactor that drops the `CANCELLED|` prefix or swaps the
+        // PK position trips this test.
+        let expected = sha256("CANCELLED|CH26-005252");
+
+        let with_room_and_dates = checkin_canonical_hash(
+            "CH26-005252",
+            Some("301"),
+            Some("2026-04-01 14:00:00"),
+            Some("2026-04-03"),
+            Some("C001"),
+            true,
+        );
+        assert_eq!(with_room_and_dates, expected);
+
+        // Same PK, completely different room/time/customer garbage —
+        // sentinel still wins.
+        let with_other_garbage = checkin_canonical_hash(
+            "CH26-005252",
+            Some("999"),
+            Some("1999-01-01 00:00:00"),
+            Some("2099-12-31"),
+            Some("CXXXX"),
+            true,
+        );
+        assert_eq!(with_other_garbage, expected);
+
+        // All-None on the ignored slots still produces the same hash.
+        let with_all_none = checkin_canonical_hash(
+            "CH26-005252", None, None, None, None, true,
+        );
+        assert_eq!(with_all_none, expected);
+    }
+
+    #[test]
+    fn cancelled_folio_hashes_match_across_legacy_and_pg_sides() {
+        // Models the exact production scenario for the six stuck
+        // CH26-* PKs: iHOTEL has deleted the per-room
+        // `HT_CheckIn_Ds`, so the legacy projection lands with
+        // `legacy_room_no = None`; canonical PG retains
+        // `legacy_room_no = Some("301")` on the original
+        // `ht_checkins` row. Pre-fix the two hashes differed on the
+        // empty-vs-room slot forever. With `cancelled = true` both
+        // sides collapse onto the sentinel and converge.
+        let legacy_side = checkin_canonical_hash(
+            "CH26-005252",
+            None, // post-cancel: HT_CheckIn_Ds deleted, no first_room_no
+            Some("2026-04-01 14:00:00"),
+            Some("2026-04-03"),
+            Some("C001"),
+            true,
+        );
+        let pg_side = checkin_canonical_hash(
+            "CH26-005252",
+            Some("301"), // canonical kept the original room for triage
+            Some("2026-04-01 14:00:00"),
+            Some("2026-04-03"),
+            Some("C001"),
+            true,
+        );
+        assert_eq!(
+            legacy_side, pg_side,
+            "cancelled sentinel must collapse the legacy/PG room-context gap"
+        );
+        // Pin the exact sentinel bytes — a future refactor that
+        // breaks the format will trip this assertion alongside the
+        // cross-side equality.
+        assert_eq!(legacy_side, sha256("CANCELLED|CH26-005252"));
+    }
+
+    #[test]
+    fn active_folio_hash_unaffected_by_cancelled_flag_being_false() {
+        // Regression guard: with `cancelled = false` the function
+        // must keep its existing pre-2026-05-19 5-field hash shape
+        // bit-for-bit. Recomputed here from the legacy `format!`
+        // string the implementation uses so the test fails loudly if
+        // the active-stay path is ever refactored to a different
+        // shape.
+        let actual = checkin_canonical_hash(
+            "CIN001",
+            Some("101"),
+            Some("2026-04-01 14:00:00"),
+            Some("2026-04-03"),
+            Some("C001"),
+            false,
+        );
+        let expected = sha256("CIN001|101|2026-04-01 14:00:00|2026-04-03|C001");
+        assert_eq!(
+            actual, expected,
+            "active-stay 5-field hash shape must be preserved when cancelled=false"
+        );
+        // And the active hash MUST NOT equal the cancelled sentinel
+        // for the same PK — otherwise the cancelled-vs-active
+        // distinction collapses and we lose state-change drift
+        // detection on the transition itself.
+        assert_ne!(actual, sha256("CANCELLED|CIN001"));
     }
 
     // -------------------------------------------------------------------
