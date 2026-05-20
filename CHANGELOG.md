@@ -7,6 +7,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.69.1](https://github.com/thehfhotel/new-hotel/compare/v2.69.0...v2.69.1) (2026-05-20)
+
+
+### Fixed
+
+* **routes:** align rates API field names with frontend ([#147](https://github.com/thehfhotel/new-hotel/issues/147)) ([22e2212](https://github.com/thehfhotel/new-hotel/commit/22e2212f0897d445f3057fc20d3627bc34ede44a))
+
 ## [2.69.0](https://github.com/thehfhotel/new-hotel/compare/v2.68.1...v2.69.0) (2026-05-20)
 
 
