@@ -160,8 +160,11 @@ export default function RatesPage() {
       roomTypeId: rate.roomTypeId,
       rateType: rate.rateType,
       rateValue: rate.rateValue,
-      validFrom: rate.validFrom.split('T')[0],
-      validTo: rate.validTo.split('T')[0],
+      // F4: ht_rate_tiers rows have no per-rate date range, so the API
+      // returns validFrom/validTo as null. The form treats empty string
+      // as "no range" — guard before calling split() on null.
+      validFrom: rate.validFrom?.split('T')[0] ?? '',
+      validTo: rate.validTo?.split('T')[0] ?? '',
       daysOfWeek: rate.daysOfWeek,
       active: rate.active,
     })
