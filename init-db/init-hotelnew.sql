@@ -1130,6 +1130,20 @@ INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('019', '019_ht_reconcile_log.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
+-- Migration 054: clarify the table semantic for future operators.
+-- Mirrors migrations/pg/054_comment_ht_reconcile_log_semantic.sql.
+COMMENT ON TABLE ht_reconcile_log IS
+  'Sync-lag observations. Not durable divergence. Rows are logged when '
+  'the diff-only reconcile sweep notices the legacy and canonical hashes '
+  'do not yet match; the auto-resolve sweep re-hashes both sides every '
+  'tick and closes rows where they have converged. Only rows that resist '
+  'multiple sweep cycles (>4h unresolved) represent actual durable '
+  'divergence requiring operator action. See docs/architecture.md §3.6d.';
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('054', '054_comment_ht_reconcile_log_semantic.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
 -- =============================================================================
 -- Migration 020: legacy_mirror schema (Phase 5.5a)
 --

@@ -370,9 +370,11 @@ async fn check_drift_and_alert(
     let msg = SlackMessage::with_site_text(
         site_id,
         format!(
-            ":rotating_light: *Reconcile drift threshold exceeded* :rotating_light:\n\
-             The drift-reconcile job recorded more than {threshold} unresolved \
-             `ht_reconcile_log` rows for the following table(s) in the last hour:\n\
+            ":rotating_light: *Sync lag burst — threshold exceeded* :rotating_light:\n\
+             The reconcile sweep observed more than {threshold} unconverged \
+             `ht_reconcile_log` row(s) for the following table(s) in the last hour. \
+             Most clear on their own as the CT watcher / writeback catch up; this \
+             alert surfaces a burst that may indicate a real backlog:\n\
              {body}\n\
              _Investigate via `docs/runbook-sync.md` §9 (Phase 6 drift alert)._"
         ),
@@ -578,14 +580,15 @@ async fn check_level_drift_and_alert(
     let msg = SlackMessage::with_site_text(
         site_id,
         format!(
-            ":warning: *Reconcile drift unresolved >{LEVEL_DRIFT_STALE_INTERVAL_HOURS}h* :warning:\n\
-             One or more tables have `ht_reconcile_log` rows that have been \
-             unresolved for over {LEVEL_DRIFT_STALE_INTERVAL_HOURS} hours:\n\
+            ":warning: *Sync lag unconverged >{LEVEL_DRIFT_STALE_INTERVAL_HOURS}h* :warning:\n\
+             One or more tables have `ht_reconcile_log` row(s) the auto-resolve \
+             sweep has failed to converge for over {LEVEL_DRIFT_STALE_INTERVAL_HOURS} hours \
+             — past this threshold the lag is no longer a transient and likely \
+             indicates real divergence:\n\
              {body}\n\
-             _Single-row divergences don't trip the volume threshold but still \
-             represent stuck canonical state. Investigate + set \
-             `resolved_at = now()` after fixing. Per-table cooldown \
-             {LEVEL_DRIFT_COOLDOWN_HOURS}h._"
+             _Single-row lag doesn't trip the burst threshold but still represents \
+             stuck canonical state. Investigate + set `resolved_at = now()` after \
+             fixing. Per-table cooldown {LEVEL_DRIFT_COOLDOWN_HOURS}h._"
         ),
     );
     slack.send_message(&msg).await;
