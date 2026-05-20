@@ -19,6 +19,16 @@ use crate::error::{ApiError, ApiResult};
 use crate::models::Pagination;
 
 /// Room type from HT_Room_Types table
+///
+/// JSON field naming: `rename_all = "camelCase"` is the default, but
+/// the frontend (`app/room-types/page.tsx`, `app/rates/page.tsx`,
+/// `components/forms/RoomTypeForm.tsx`) drops the `type_` SQL-column
+/// prefix on most fields (`basePrice`, `description`, `maxGuests`,
+/// `bedType`, `sizeSqm`, `active`) while keeping it on the identifier
+/// triple (`typeCode`, `typeName`, `typeNameEn`). Per-field `rename`
+/// pins the API contract to match that convention; without it the
+/// camelCase default produces `typeBasePrice` etc. and every consumer
+/// reads `undefined`, crashing `.toLocaleString()` in the table render.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RoomType {
@@ -26,13 +36,21 @@ pub struct RoomType {
     pub type_code: String,
     pub type_name: String,
     pub type_name_en: Option<String>,
+    #[serde(rename = "description")]
     pub type_description: Option<String>,
+    #[serde(rename = "basePrice")]
     pub type_base_price: Option<f64>,
+    #[serde(rename = "maxGuests")]
     pub type_max_guests: Option<i32>,
+    #[serde(rename = "bedType")]
     pub type_bed_type: Option<String>,
+    #[serde(rename = "sizeSqm")]
     pub type_size_sqm: Option<f64>,
+    #[serde(rename = "amenities")]
     pub type_amenities: Option<String>,
+    #[serde(rename = "sortOrder")]
     pub type_sort_order: Option<i32>,
+    #[serde(rename = "active")]
     pub type_active: bool,
     pub created_at: Option<NaiveDateTime>,
     pub updated_at: Option<NaiveDateTime>,
@@ -71,20 +89,29 @@ pub struct RoomTypeResponse {
     pub room_type: RoomType,
 }
 
-/// Request body for creating/updating room type
+/// Request body for creating/updating room type. Field names mirror
+/// the response shape — see [`RoomType`] for the rationale.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateUpdateRoomTypeRequest {
     pub type_code: String,
     pub type_name: String,
     pub type_name_en: Option<String>,
+    #[serde(rename = "description")]
     pub type_description: Option<String>,
+    #[serde(rename = "basePrice")]
     pub type_base_price: Option<f64>,
+    #[serde(rename = "maxGuests")]
     pub type_max_guests: Option<i32>,
+    #[serde(rename = "bedType")]
     pub type_bed_type: Option<String>,
+    #[serde(rename = "sizeSqm")]
     pub type_size_sqm: Option<f64>,
+    #[serde(rename = "amenities")]
     pub type_amenities: Option<String>,
+    #[serde(rename = "sortOrder")]
     pub type_sort_order: Option<i32>,
+    #[serde(rename = "active")]
     pub type_active: Option<bool>,
 }
 
