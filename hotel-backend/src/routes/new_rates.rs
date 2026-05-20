@@ -108,7 +108,13 @@ pub struct Rate {
     pub value: f64,
     pub valid_from: Option<NaiveDate>,
     pub valid_to: Option<NaiveDate>,
-    pub days_of_week: Option<String>,
+    /// Day-of-week filter as `[0..=6]` (Sun=0..Sat=6). Always a JSON
+    /// array, never `null`, so the frontend's `formatDaysOfWeek(days)`
+    /// which calls `days.length` / `days.includes(...)` never trips a
+    /// null/string-shape crash. Stored in legacy SQL as a comma-
+    /// separated VARCHAR(50); converted at the rate-from-row boundary.
+    /// Empty array means "every day applies" (legacy: NULL).
+    pub days_of_week: Vec<i32>,
     pub active: bool,
     pub created_at: Option<chrono::NaiveDateTime>,
     pub updated_at: Option<chrono::NaiveDateTime>,
@@ -189,8 +195,28 @@ pub struct CreateUpdateRateRequest {
     pub value: f64,
     pub valid_from: Option<String>,
     pub valid_to: Option<String>,
-    pub days_of_week: Option<String>,
+    /// Day-of-week filter from the form (`[0..=6]`). Joined to a
+    /// comma-separated string before binding to the SQL VARCHAR(50)
+    /// column. Empty array → NULL (legacy "every day").
+    #[serde(default)]
+    pub days_of_week: Vec<i32>,
     pub active: Option<bool>,
+}
+
+/// Join a `Vec<i32>` day-of-week filter into the comma-separated
+/// VARCHAR(50) the legacy `ht_rates.rate_days_of_week` column expects.
+/// Returns `None` for an empty vec (legacy NULL convention = "every
+/// day"), matching what `ht_rates`'s pre-F4 form has always written.
+fn days_of_week_to_csv(days: &[i32]) -> Option<String> {
+    if days.is_empty() {
+        return None;
+    }
+    Some(
+        days.iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+    )
 }
 
 /// Response for mutation operations.
@@ -452,13 +478,14 @@ pub async fn create_rate(
     let valid_from = parse_optional_date(&body.valid_from, "valid_from")?;
     let valid_to = parse_optional_date(&body.valid_to, "valid_to")?;
 
+    let days_of_week_csv = days_of_week_to_csv(&body.days_of_week);
     let rec = sqlx::query!(
         r#"INSERT INTO ht_rates (rate_name, rate_room_type_id, rate_type, rate_value, rate_valid_from, rate_valid_to, rate_days_of_week, rate_active)
         VALUES ($1, $2, $3, $4::float8, $5, $6, $7, $8)
         RETURNING rate_id"#,
         name, body.room_type_id, rate_type.as_str(), body.value,
         valid_from, valid_to,
-        body.days_of_week.as_deref(), active
+        days_of_week_csv.as_deref(), active
     )
     .fetch_one(pool)
     .await?;
@@ -500,13 +527,14 @@ pub async fn update_rate(
     let valid_from = parse_optional_date(&body.valid_from, "valid_from")?;
     let valid_to = parse_optional_date(&body.valid_to, "valid_to")?;
 
+    let days_of_week_csv = days_of_week_to_csv(&body.days_of_week);
     sqlx::query!(
         r#"UPDATE ht_rates SET rate_name = $1, rate_room_type_id = $2, rate_type = $3, rate_value = $4::float8,
         rate_valid_from = $5, rate_valid_to = $6, rate_days_of_week = $7, rate_active = $8, rate_updated = NOW()
         WHERE rate_id = $9"#,
         name, body.room_type_id, rate_type.as_str(), body.value,
         valid_from, valid_to,
-        body.days_of_week.as_deref(), active, rate_id
+        days_of_week_csv.as_deref(), active, rate_id
     )
     .execute(pool)
     .await?;
@@ -579,7 +607,10 @@ fn rate_from_row(row: &sqlx::postgres::PgRow) -> Rate {
         value: row.try_get::<f64, _>("rate_tier_price").unwrap_or(0.0),
         valid_from: None,
         valid_to: None,
-        days_of_week: None,
+        // rate_tiers don't track per-day filters — empty array means
+        // "applies every day" on both the frontend and the legacy
+        // CSV-NULL convention.
+        days_of_week: Vec::new(),
         active: row.try_get::<bool, _>("rate_tier_active").unwrap_or(true),
         created_at: row
             .try_get::<chrono::DateTime<chrono::Utc>, _>("rate_tier_created_at")
