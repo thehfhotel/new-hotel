@@ -88,10 +88,23 @@ impl RateType {
 #[serde(rename_all = "camelCase")]
 pub struct Rate {
     pub id: i32,
+    /// JSON field name pinned to `rateName` to match the frontend's
+    /// `RateRecord` contract (`app/rates/page.tsx`). Without the
+    /// rename the API ships `name`, the frontend reads
+    /// `rate.rateName` → `undefined`, and downstream displays of the
+    /// rate name read as blank or trip optional-chain fallbacks.
+    #[serde(rename = "rateName")]
     pub name: String,
     pub room_type_id: Option<i32>,
     pub room_type_name: Option<String>,
     pub rate_type: String,
+    /// JSON field name pinned to `rateValue` to match the frontend's
+    /// `RateRecord` contract. Without the rename the API ships
+    /// `value`, the frontend reads `rate.rateValue` → `undefined`,
+    /// and `.toLocaleString()` on undefined crashes the rates page
+    /// table render (Array.map → TypeError, 2026-05-20 production
+    /// incident).
+    #[serde(rename = "rateValue")]
     pub value: f64,
     pub valid_from: Option<NaiveDate>,
     pub valid_to: Option<NaiveDate>,
@@ -168,9 +181,11 @@ pub struct RateTiersResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateUpdateRateRequest {
+    #[serde(rename = "rateName")]
     pub name: String,
     pub room_type_id: Option<i32>,
     pub rate_type: String,
+    #[serde(rename = "rateValue")]
     pub value: f64,
     pub valid_from: Option<String>,
     pub valid_to: Option<String>,
