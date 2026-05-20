@@ -7,6 +7,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.69.0](https://github.com/thehfhotel/new-hotel/compare/v2.68.1...v2.69.0) (2026-05-20)
+
+
+### Added
+
+* **api:** rewrite /api/bookings list + detail to read canonical ht_bookings ([ba31517](https://github.com/thehfhotel/new-hotel/commit/ba31517ea1e8ac06a7fd476c05ed4f0b6fba0afb))
+* **deploy:** wire HOURLY_REPORT_ENABLED + CHECKIN_NOTIFICATIONS_ENABLED through deploy ([f88f40e](https://github.com/thehfhotel/new-hotel/commit/f88f40e87290d9544bce49cad4ad36ba1a519aaa))
+* **scheduler:** add BOOKING_NOTIFICATIONS_ENABLED toggle ([#143](https://github.com/thehfhotel/new-hotel/issues/143)) ([4f6205b](https://github.com/thehfhotel/new-hotel/commit/4f6205be558199f902a4dc55cd69f8f766a8122b))
+* **scheduler:** add CHECKOUT_NOTIFICATIONS_ENABLED toggle ([#144](https://github.com/thehfhotel/new-hotel/issues/144)) ([e5eb6b0](https://github.com/thehfhotel/new-hotel/commit/e5eb6b0ad05c75a76542c54977fad60274f04516))
+* **scheduler:** env flags to disable hourly + checkin slack notifications ([664965c](https://github.com/thehfhotel/new-hotel/commit/664965c86e20aecfa781400b952f288667ef5d0d))
+* **sync:** --include-inactive flag on backfill_checkin_rooms ([#133](https://github.com/thehfhotel/new-hotel/issues/133)) ([205d838](https://github.com/thehfhotel/new-hotel/commit/205d838efb27fba7696ed901e791c629d1bb37ef))
+* **sync:** bin/backfill_legacy_bookings for cache-only bookings ([ae03a75](https://github.com/thehfhotel/new-hotel/commit/ae03a755c7bad0528c912c77a5aa102c1f642563))
+* **sync:** bin/backfill_legacy_checkins for missing_pg drain ([031cbe0](https://github.com/thehfhotel/new-hotel/commit/031cbe0a4761cca7b3199a51982c45f99de40929))
+* **sync:** tone-aware watchdog alerts + recovery notification ([#142](https://github.com/thehfhotel/new-hotel/issues/142)) ([5410577](https://github.com/thehfhotel/new-hotel/commit/5410577477a783068c3e1cb7245c04aefe53bcbd))
+* **writeback:** UpdateRoom intent + recipe — close admin room-edit MSSQL writeback gap ([#136](https://github.com/thehfhotel/new-hotel/issues/136)) ([9bdac4c](https://github.com/thehfhotel/new-hotel/commit/9bdac4cd4224f7c81c31fe0bd65cb7d0241f4afe))
+
+
+### Fixed
+
+* **api,ui:** calendar bar chart accuracy — cancelled excluded, pending shown ([9125773](https://github.com/thehfhotel/new-hotel/commit/9125773e05f3ed881ccf771a427a6acb20251eff))
+* **api:** /api/calendar HF Ville reads canonical not the demoted cache ([056e290](https://github.com/thehfhotel/new-hotel/commit/056e290829f4dd809131398519ab1c330ceb68cd))
+* **deploy:** expose writeback + sync bin INFO logs via RUST_LOG override ([#137](https://github.com/thehfhotel/new-hotel/issues/137)) ([f0382cd](https://github.com/thehfhotel/new-hotel/commit/f0382cdfb56079d2345364810920565a715a549f))
+* **routes:** align room-types API field names with frontend ([#146](https://github.com/thehfhotel/new-hotel/issues/146)) ([c36c6f3](https://github.com/thehfhotel/new-hotel/commit/c36c6f31f56e3056fdf9c5be7d18ca527b039b47))
+* **sync,deploy:** persist level-drift cooldown across restarts; expose RUST_LOG ([0ba0898](https://github.com/thehfhotel/new-hotel/commit/0ba089880f9ea28ba75a8bbefc1b87835368da6c))
+* **sync:** backfill_legacy_checkins only resolves reconcile_log on real INSERT ([06e6ab7](https://github.com/thehfhotel/new-hotel/commit/06e6ab704253e638efdd024ace185f8c83bc4034))
+* **sync:** booking + room mappers overwrite denormalised legacy pointers ([5f55756](https://github.com/thehfhotel/new-hotel/commit/5f55756050dff79830b4220facf4c7e910282563))
+* **sync:** dedup duplicate-room HT_CheckIn_Ds rows in cardinality reconcile ([#139](https://github.com/thehfhotel/new-hotel/issues/139)) ([2102ab9](https://github.com/thehfhotel/new-hotel/commit/2102ab945f45444f46f5144d6dcc8284627c036a))
+* **sync:** dedupe reconcile_log inserts + add --include-value backfill flag ([#130](https://github.com/thehfhotel/new-hotel/issues/130)) ([9da9f3e](https://github.com/thehfhotel/new-hotel/commit/9da9f3edcb0caabfb403a2764951919bf08a1354))
+* **sync:** emit sentinel hash for cancelled check-ins to close mapper parity gap ([#140](https://github.com/thehfhotel/new-hotel/issues/140)) ([e9c9cb7](https://github.com/thehfhotel/new-hotel/commit/e9c9cb747836c2784186caa158904062f2290f85))
+* **sync:** exclude cardinality from hourly drift alert to stop flood ([#129](https://github.com/thehfhotel/new-hotel/issues/129)) ([07c9f7c](https://github.com/thehfhotel/new-hotel/commit/07c9f7c60f09d3985b96d5de5a61c7da7d02ba24))
+* **sync:** exclude Ds-less iHOTEL checkin headers from reconcile ([#134](https://github.com/thehfhotel/new-hotel/issues/134) regression) ([#135](https://github.com/thehfhotel/new-hotel/issues/135)) ([a33f4ee](https://github.com/thehfhotel/new-hotel/commit/a33f4eeac7cad220fb1dd58f12998f8bf5097768))
+* **sync:** include ht_booking_rooms count in apply_booking_aggregate's idempotent-skip check ([#132](https://github.com/thehfhotel/new-hotel/issues/132)) ([82aa0e4](https://github.com/thehfhotel/new-hotel/commit/82aa0e45eb51fe5b635676ace8135ecc5efc51c8))
+* **sync:** reconcile hash uses actual checkout for completed stays ([f3e397b](https://github.com/thehfhotel/new-hotel/commit/f3e397b4cd72232c0f7f00eb9f0fc3ad81022f9b))
+* **sync:** reconcile hash uses header Cin_Date_in not detail Cin_Room_In ([edc600a](https://github.com/thehfhotel/new-hotel/commit/edc600a9921168431da15405ca434512ad15100f))
+* **sync:** restore sync_checkins + close CT-watcher silent drops + observability ([#128](https://github.com/thehfhotel/new-hotel/issues/128)) ([d6a1df1](https://github.com/thehfhotel/new-hotel/commit/d6a1df19be05529c8f84a37a190c41cc3f3f4913))
+* **sync:** Track B reconcile-hash uses junction + orphan-booking cascade ([#131](https://github.com/thehfhotel/new-hotel/issues/131)) ([debf4cb](https://github.com/thehfhotel/new-hotel/commit/debf4cbda42f9b2c4be8533bb7044f909bc28cbf))
+* **sync:** wire rooms into auto-resolve sweep dispatch so converged rows self-heal ([#141](https://github.com/thehfhotel/new-hotel/issues/141)) ([aad132d](https://github.com/thehfhotel/new-hotel/commit/aad132dfbf87acb95bc31de115f24fa1170e8e9a))
+* **ui:** future-day bars stack spanning check-ins + incoming bookings ([f3b4663](https://github.com/thehfhotel/new-hotel/commit/f3b466384ae7f172dd8d21002ba77c49fa9c8976))
+
+
+### Changed
+
+* **sync:** reconcile sweep reuses CT mapper's project_aggregate (checkins) ([6965c8d](https://github.com/thehfhotel/new-hotel/commit/6965c8d6a4ea8f73575687ca85b8d092cb70cbdb))
+* **sync:** unify sync_checkins on CT mapper to eliminate parallel projection ([#134](https://github.com/thehfhotel/new-hotel/issues/134)) ([307f4ac](https://github.com/thehfhotel/new-hotel/commit/307f4acf161143f586426346fac8ed321ba8f4bc))
+
 ## [2.68.1](https://github.com/thehfhotel/new-hotel/compare/v2.68.0...v2.68.1) (2026-05-15)
 
 
