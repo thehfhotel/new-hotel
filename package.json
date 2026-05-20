@@ -15,7 +15,7 @@
   },
   "dependencies": {
     "date-fns": "^3.6.0",
-    "lucide-react": "^1.14.0",
+    "lucide-react": "^1.16.0",
     "next": "16.2.6",
     "react": "^19.2.5",
     "react-datepicker": "^9.1.0",
@@ -23,12 +23,12 @@
     "recharts": "^3.8.1"
   },
   "devDependencies": {
-    "@playwright/test": "^1.58.2",
+    "@playwright/test": "^1.60.0",
     "@tailwindcss/postcss": "^4.2.4",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@types/jest": "^30.0.0",
-    "@types/node": "^20.17.12",
+    "@types/node": "^25.8.0",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "dotenv": "^17.2.3",
@@ -38,7 +38,7 @@
     "jest": "^30.4.2",
     "jest-environment-jsdom": "^30.4.1",
     "postcss": "^8.5.14",
-    "tailwindcss": "^4.2.4",
+    "tailwindcss": "^4.3.0",
     "ts-jest": "^29.4.6",
     "typescript": "^5.7.2"
   },
