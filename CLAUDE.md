@@ -215,6 +215,14 @@ Migrations are **automated** via `scripts/migrate.sh`, which runs during CI/CD d
 
 The pipeline will automatically: create a backup, apply pending migrations in transactions, and track them in the `schema_migrations` table. See `migrations/README.md` for details.
 
+### Vocabulary note: "drift" vs. "sync lag"
+
+The table `ht_reconcile_log` reads as a divergence ledger, but the actual semantic is a **sync-lag observation queue**. Rows are snapshots of moments when the diff-only sweep noticed two hashes had not yet converged; the auto-resolve sweep at every reconcile tick re-hashes both sides and closes converged rows. The CT watcher and writeback worker do the real reconciliation; the sweep is just an auditor that notices when those engines are temporarily behind.
+
+When discussing this table in code comments, runbooks, or alert templates, prefer **"sync lag" / "unconverged"** over "drift" / "divergence" — the latter implies a durable state that needs operator action, when in practice most rows clear on their own within one tick. The Slack templates in `scheduler::sync` and the `COMMENT ON TABLE` in migration 054 capture this framing. The table itself is not renamed because the blast radius (queries, alerts, dashboards, runbooks, incident links) was disproportionate to the one-time conceptual-clarity benefit.
+
+The only rows that represent actual durable divergence are those that resist multiple sweep cycles. The 4h-unconverged Slack alert (`level_drift_alert`) is calibrated for exactly that case.
+
 ### Timezone Handling
 - SQL Server stores datetime values in **local Thai time (GMT+7)** without timezone information
 - The `mssql` library returns datetime fields as ISO strings with `Z` suffix (e.g., `2026-01-22T11:59:00.000Z`)
