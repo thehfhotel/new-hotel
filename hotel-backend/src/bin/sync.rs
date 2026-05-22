@@ -381,6 +381,18 @@ const SHADOW_MODE_MAX_DURATION_SECS: u64 = 36 * 3600;
 /// operator just needs to know it's happening.
 const WATCHDOG_ALERT_COOLDOWN_SECS: u64 = 1800;
 
+/// 2026-05-22 — number of CONSECUTIVE probe failures required before
+/// the watchdog pages the `:warning:` (probe-timeout) class. A single
+/// 5s `CHANGE_TRACKING_CURRENT_VERSION()` timeout inside the 60s tick
+/// is dominated by transient iHOTEL lock contention (`TABLOCKX,
+/// HOLDLOCK` on `HT_CheckIn_Ds.get_id` cascades and report runs — see
+/// `docs/legacy-app/COMPAT_CHEATSHEET.md` §4) and self-clears on the
+/// next tick. Requiring 3 in a row means ~3 minutes of sustained
+/// uncertainty before a page, while keeping the confirmed-backlog
+/// (`:rotating_light:`) and confirmed-quiet branches at single-tick
+/// reaction speed. Override via `LEGACY_SYNC_PROBE_TIMEOUT_STREAK`.
+const DEFAULT_PROBE_TIMEOUT_STREAK_THRESHOLD: u32 = 3;
+
 /// All CT-enabled MSSQL tables — must stay in sync with the seed in
 /// migrations 017 (canonical sync, 10 tables) + 022 (legacy_mirror, 6
 /// tables) and the `legacy_sync_status` rows. Adding a new mapper
@@ -1301,6 +1313,42 @@ fn should_fire_stall_alert(watermark: i64, ct_current_probe: Option<i64>) -> boo
     }
 }
 
+/// Streak gate for the probe-timeout (`:warning:`) class. When the
+/// watchdog probe fails (`None`), a single observation is noise — a 5s
+/// timeout inside a 60s tick is usually transient iHOTEL lock
+/// contention that clears on the next tick. This function suppresses
+/// the page until N consecutive failures have been observed
+/// (`consecutive_failures >= threshold`), giving the signal time to
+/// stabilise.
+///
+/// Probe successes (`Some(_)`) bypass the gate entirely — the
+/// confirmed-backlog and confirmed-quiet branches in
+/// [`should_fire_stall_alert`] still fire / suppress on the first
+/// observation. The gate only changes behaviour for the uncertainty
+/// class.
+///
+/// Returns `true` when the streak has crossed the threshold (or the
+/// probe succeeded — caller is then expected to defer to
+/// [`should_fire_stall_alert`] for the actual decision). Returns
+/// `false` when the page should be suppressed this tick.
+///
+/// Background: 2026-05-22 four self-recovering `:warning:` pages on
+/// hfhotel within ~8h, all from single 5s probe timeouts during
+/// overnight quiet periods. With threshold=3, the same workload would
+/// have produced zero pages because the next tick's probe succeeded
+/// each time (verified by the `:white_check_mark: RECOVERED` message
+/// firing within 1-3 min on every alert).
+fn probe_failure_streak_passes_gate(
+    probe: Option<i64>,
+    consecutive_failures: u32,
+    threshold: u32,
+) -> bool {
+    match probe {
+        Some(_) => true,
+        None => consecutive_failures >= threshold,
+    }
+}
+
 /// Tone-aware Slack message for a watermark stall page. Severity is
 /// derived from the probe outcome:
 ///
@@ -1537,15 +1585,26 @@ async fn run_watermark_watchdog(
     // all-clear". Cleared after firing the recovery message. Tuple:
     // `(paged_at, watermark_at_page_time)`.
     let mut pending_stall_alert: Option<(Instant, i64)> = None;
+    // 2026-05-22 — streak gate for the probe-timeout (`:warning:`)
+    // class. Counts CONSECUTIVE probe failures in the stall branch.
+    // Reset on probe success, watermark advance, or any tick that
+    // doesn't run a probe (no stall this tick).
+    let mut probe_failure_streak: u32 = 0;
 
     let shadow_mode = env::var("LEGACY_SYNC_SHADOW_MODE")
         .map(|v| v == "true")
         .unwrap_or(false);
 
+    let probe_timeout_streak_threshold = env::var("LEGACY_SYNC_PROBE_TIMEOUT_STREAK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_PROBE_TIMEOUT_STREAK_THRESHOLD);
+
     tracing::info!(
         site = %site_id,
         stall_alert_secs,
         shadow_mode,
+        probe_timeout_streak_threshold,
         "[watchdog] Watermark-stall watchdog starting"
     );
 
@@ -1635,14 +1694,23 @@ async fn run_watermark_watchdog(
                 // `stall_threshold`. Probe legacy CT to distinguish
                 // "wedged" (CT current > watermark) from "idle"
                 // (CT current == watermark, nothing to advance to).
-                // Probe failure falls through to firing the alert.
+                // 2026-05-22: probe failures are gated by a consecutive-
+                // failure streak (see `probe_failure_streak_passes_gate`)
+                // — a single 5s timeout is dominated by transient iHOTEL
+                // lock contention and self-clears on the next tick.
                 let probe = match probe_change_tracking_current_version(&mssql).await {
-                    Ok(v) => Some(v),
+                    Ok(v) => {
+                        probe_failure_streak = 0;
+                        Some(v)
+                    }
                     Err(err) => {
+                        probe_failure_streak = probe_failure_streak.saturating_add(1);
                         tracing::warn!(
                             site = %site_id,
                             error = %err,
-                            "[watchdog] CT-current probe failed — falling through to alert (conservative)"
+                            streak = probe_failure_streak,
+                            threshold = probe_timeout_streak_threshold,
+                            "[watchdog] CT-current probe failed — streak incremented"
                         );
                         None
                     }
@@ -1653,6 +1721,18 @@ async fn run_watermark_watchdog(
                         watermark = observation.last_seen_version,
                         ct_current = probe.unwrap_or_default(),
                         "[watchdog] legacy CT quiet — watermark correctly tracking current"
+                    );
+                } else if !probe_failure_streak_passes_gate(
+                    probe,
+                    probe_failure_streak,
+                    probe_timeout_streak_threshold,
+                ) {
+                    tracing::info!(
+                        site = %site_id,
+                        watermark = observation.last_seen_version,
+                        streak = probe_failure_streak,
+                        threshold = probe_timeout_streak_threshold,
+                        "[watchdog] probe timeout — suppressing :warning: page until streak crosses threshold"
                     );
                 } else {
                     let cooldown_elapsed = match last_stall_alert {
@@ -1689,13 +1769,20 @@ async fn run_watermark_watchdog(
                             Some((now, observation.last_seen_version));
                     }
                 }
-            } else if observation.last_seen_version > prior_obs.last_seen_version {
-                tracing::debug!(
-                    site = %site_id,
-                    from = prior_obs.last_seen_version,
-                    to = observation.last_seen_version,
-                    "[watchdog] Watermark advanced"
-                );
+            } else {
+                // No stall this tick — no probe ran, so the streak's
+                // "consecutive failures during the current stall" reading
+                // is no longer meaningful. Reset so the next stall starts
+                // with a fresh observation budget.
+                probe_failure_streak = 0;
+                if observation.last_seen_version > prior_obs.last_seen_version {
+                    tracing::debug!(
+                        site = %site_id,
+                        from = prior_obs.last_seen_version,
+                        to = observation.last_seen_version,
+                        "[watchdog] Watermark advanced"
+                    );
+                }
             }
         }
 
@@ -4070,6 +4157,96 @@ mod tests {
         assert!(
             fire,
             "CT current < watermark is anomalous — must alert defensively"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Probe-failure streak gate (2026-05-22 — 4 self-recovering
+    // `:warning:` pages on hfhotel within 8h overnight, all single-tick
+    // probe timeouts during quiet periods).
+    // -------------------------------------------------------------------
+
+    /// One probe failure inside the watchdog tick is dominated by
+    /// transient iHOTEL lock contention — must NOT page until the
+    /// signal stabilises across the threshold.
+    #[test]
+    fn probe_failure_streak_below_threshold_suppresses() {
+        let pass = probe_failure_streak_passes_gate(None, 1, 3);
+        assert!(
+            !pass,
+            "single probe failure must be suppressed; threshold protects against transient locks"
+        );
+        let pass = probe_failure_streak_passes_gate(None, 2, 3);
+        assert!(!pass, "two consecutive failures still below threshold");
+    }
+
+    /// Once the streak crosses the threshold, the `:warning:` page
+    /// fires. This is the canonical "real legacy outage" case (probe
+    /// keeps timing out across multiple ticks).
+    #[test]
+    fn probe_failure_streak_at_threshold_fires() {
+        let pass = probe_failure_streak_passes_gate(None, 3, 3);
+        assert!(
+            pass,
+            "streak == threshold must page; that's the contract"
+        );
+    }
+
+    /// Defensive: streaks above the threshold (e.g., between the page
+    /// firing and the cooldown clearing) keep returning true so the
+    /// cooldown-gated re-page logic upstream still works.
+    #[test]
+    fn probe_failure_streak_above_threshold_keeps_firing() {
+        let pass = probe_failure_streak_passes_gate(None, 99, 3);
+        assert!(
+            pass,
+            "streaks above threshold must keep returning true; upstream cooldown controls re-page spacing"
+        );
+    }
+
+    /// A successful probe bypasses the gate entirely — the
+    /// confirmed-backlog (`:rotating_light:`) branch in
+    /// `should_fire_stall_alert` must fire on a single observation.
+    /// The streak gate only changes behaviour for the uncertainty
+    /// class.
+    #[test]
+    fn probe_success_bypasses_streak_gate() {
+        let pass = probe_failure_streak_passes_gate(Some(17250), 0, 3);
+        assert!(
+            pass,
+            "Some(v) must bypass the gate — confirmed backlog fires immediately"
+        );
+        // Even with a non-zero residual streak (shouldn't happen, but
+        // defensive), a probe success should still pass.
+        let pass = probe_failure_streak_passes_gate(Some(17250), 5, 3);
+        assert!(pass, "Some(v) bypasses gate regardless of residual streak");
+    }
+
+    /// Setting `threshold = 1` recovers the pre-2026-05-22 hair-trigger
+    /// behaviour (page on the first probe timeout). This is the escape
+    /// hatch for operators who want the old behaviour and the
+    /// regression test that confirms the gate doesn't accidentally
+    /// suppress when configured to be permissive.
+    #[test]
+    fn probe_failure_streak_threshold_one_fires_immediately() {
+        let pass = probe_failure_streak_passes_gate(None, 1, 1);
+        assert!(
+            pass,
+            "threshold=1 must reproduce the pre-streak-gate hair-trigger"
+        );
+    }
+
+    /// Lock the default threshold against accidental regression — the
+    /// 3-tick choice is documented at the constant site and matches
+    /// the 2026-05-22 incident's self-recovery window (alerts cleared
+    /// in 1-3 min, so 3 ticks × 60s ≈ 3 min of patience eliminates
+    /// the false-positive class entirely).
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn default_probe_timeout_streak_threshold_matches_incident_window() {
+        assert_eq!(
+            DEFAULT_PROBE_TIMEOUT_STREAK_THRESHOLD, 3,
+            "default streak threshold should be 3 ticks (~3 min) — matches the 2026-05-22 self-recovery window"
         );
     }
 
