@@ -3,8 +3,7 @@
  */
 
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
-import userEvent from '@testing-library/user-event'
-import RoomCleaningCard, { HousekeepingRoom, HousekeepingStatus } from '@/components/housekeeping/RoomCleaningCard'
+import RoomCleaningCard, { HousekeepingRoom } from '@/components/housekeeping/RoomCleaningCard'
 
 // Mock lucide-react icons
 jest.mock('lucide-react', () => ({
@@ -404,7 +403,7 @@ describe('RoomCleaningCard Component', () => {
           })
       )
 
-      const { container } = render(
+      render(
         <RoomCleaningCard room={createMockRoom({ status: 'dirty' })} onStatusChange={slowOnStatusChange} />
       )
 

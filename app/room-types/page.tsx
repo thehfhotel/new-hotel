@@ -7,7 +7,6 @@ import {
   Search,
   X,
   Edit3,
-  Trash2,
   Users,
   Bed,
   DollarSign,

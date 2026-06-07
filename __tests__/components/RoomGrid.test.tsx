@@ -3,7 +3,7 @@
  */
 
 import { render, screen, fireEvent } from '@testing-library/react'
-import RoomGrid, { Room, RoomStatus } from '@/components/RoomGrid'
+import RoomGrid, { Room } from '@/components/RoomGrid'
 
 // Mock lucide-react icons
 jest.mock('lucide-react', () => ({

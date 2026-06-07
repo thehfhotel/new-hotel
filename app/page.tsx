@@ -289,9 +289,6 @@ export default function NewDashboard() {
   const roomLayouts = branch === 'all'
     ? [{ label: 'HF Hotel', layout: hfHotelRoomLayout }, { label: 'HF Ville', layout: hfVilleRoomLayout }]
     : [{ label: '', layout: branch === 'hfville' ? hfVilleRoomLayout : hfHotelRoomLayout }]
-  const roomLayout = roomLayouts[0].layout
-  const maxColumns = Math.max(...roomLayouts.flatMap(l => l.layout.map(row => row.length)))
-
   if (loading) {
     return (
       <div className="flex items-center justify-center min-h-[50vh]">

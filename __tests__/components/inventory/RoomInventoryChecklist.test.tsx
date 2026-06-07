@@ -2,8 +2,7 @@
  * @jest-environment jsdom
  */
 
-import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
-import userEvent from '@testing-library/user-event'
+import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import RoomInventoryChecklist from '@/components/inventory/RoomInventoryChecklist'
 import { RoomInventory, RoomInventoryItem } from '@/types/inventory'
 
@@ -326,7 +325,7 @@ describe('RoomInventoryChecklist Component', () => {
         json: () => Promise.resolve({ success: true, data: mockRoomInventory }),
       })
 
-      const { container } = render(
+      render(
         <RoomInventoryChecklist
           isOpen={true}
           onClose={mockOnClose}
@@ -452,7 +451,7 @@ describe('RoomInventoryChecklist Component', () => {
       })
 
       // Uncheck first item
-      const { container } = render(
+      render(
         <RoomInventoryChecklist
           isOpen={true}
           onClose={mockOnClose}
