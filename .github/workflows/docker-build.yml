@@ -666,7 +666,7 @@ jobs:
             type=raw,value=latest
 
       - name: Build and push
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
         with:
           context: .
           # PR runs MUST NOT push to GHCR — only master pushes (or a master-
@@ -728,7 +728,7 @@ jobs:
             type=raw,value=latest
 
       - name: Build and push backend
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
         with:
           context: ./hotel-backend
           # PR runs MUST NOT push to GHCR — only master pushes (or a master-
