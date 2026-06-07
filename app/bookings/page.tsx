@@ -18,7 +18,6 @@ import {
 import DatePicker from 'react-datepicker'
 import 'react-datepicker/dist/react-datepicker.css'
 import BookingForm, { BookingFormState } from '@/components/forms/BookingForm'
-import { RoomOption } from '@/components/pickers/RoomPicker'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 
 // Types

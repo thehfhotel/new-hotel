@@ -14,7 +14,6 @@ import {
   isSameDay,
   isToday,
 } from 'date-fns'
-import { th } from 'date-fns/locale'
 import { ChevronLeft, ChevronRight } from 'lucide-react'
 
 export interface Booking {

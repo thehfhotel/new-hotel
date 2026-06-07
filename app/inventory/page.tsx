@@ -19,7 +19,6 @@ import {
 import {
   InventoryItem,
   InventoryTransaction,
-  INVENTORY_CATEGORIES,
   TRANSACTION_TYPES,
   getStockStatus,
   getStockStatusColor,

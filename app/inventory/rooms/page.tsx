@@ -3,7 +3,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import {
   DoorOpen,
-  Package,
   Search,
   X,
   Loader2,
@@ -11,10 +10,8 @@ import {
   CheckCircle,
   AlertTriangle,
   ClipboardCheck,
-  RefreshCw,
   Filter,
 } from 'lucide-react'
-import { RoomInventory, INVENTORY_CATEGORIES } from '@/types/inventory'
 import RoomInventoryChecklist from '@/components/inventory/RoomInventoryChecklist'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 

@@ -3,7 +3,6 @@
  */
 
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
-import userEvent from '@testing-library/user-event'
 import StockAdjustmentModal from '@/components/modals/StockAdjustmentModal'
 import { InventoryItem } from '@/types/inventory'
 

@@ -16,7 +16,6 @@ import {
   CheckCircle,
   XCircle,
   Clock,
-  History,
   LogIn,
   LogOut,
   ArrowRightLeft,

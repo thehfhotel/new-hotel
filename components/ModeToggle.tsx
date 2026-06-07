@@ -4,7 +4,7 @@ import { Building2, Sparkles } from 'lucide-react'
 import { useMode } from '@/contexts/ModeContext'
 
 export default function ModeToggle() {
-  const { mode, setMode, isLegacy } = useMode()
+  const { setMode, isLegacy } = useMode()
 
   const toggleMode = () => {
     setMode(isLegacy ? 'new' : 'legacy')

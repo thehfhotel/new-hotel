@@ -15,7 +15,6 @@ import {
 } from 'lucide-react'
 import {
   InventoryItemFormData,
-  InventoryCategory,
   INVENTORY_CATEGORIES,
 } from '@/types/inventory'
 

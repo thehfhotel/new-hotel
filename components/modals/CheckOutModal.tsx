@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useEffect } from 'react'
-import { X, Loader2, User, Calendar, DollarSign, FileText, CreditCard } from 'lucide-react'
+import { X, Loader2, User, Calendar, FileText, CreditCard } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 
 interface CheckInDetails {
