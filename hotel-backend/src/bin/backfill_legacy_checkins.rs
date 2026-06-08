@@ -373,7 +373,7 @@ async fn fetch_candidate_pks(
           ORDER BY legacy_pk \
           LIMIT $1"
     );
-    sqlx::query_scalar::<_, String>(&sql)
+    sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(&*sql))
         .bind(limit)
         .fetch_all(pg)
         .await

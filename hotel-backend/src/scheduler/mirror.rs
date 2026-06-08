@@ -249,7 +249,7 @@ async fn reload_order_table(
 
     let mut tx = pg_pool.begin().await?;
     let delete_sql = format!("DELETE FROM {pg_table}");
-    sqlx::query(&delete_sql).execute(&mut *tx).await?;
+    sqlx::query(sqlx::AssertSqlSafe(&*delete_sql)).execute(&mut *tx).await?;
 
     let insert_sql = format!(
         "INSERT INTO {pg_table} (id, cust_type, cust_month, cast_type, mirror_source) \
@@ -265,7 +265,7 @@ async fn reload_order_table(
         let cust_type: Option<&str> = r.try_get(1).ok().flatten();
         let cust_month: Option<i32> = r.try_get(2).ok().flatten();
         let cast_type: Option<&str> = r.try_get(3).ok().flatten();
-        sqlx::query(&insert_sql)
+        sqlx::query(sqlx::AssertSqlSafe(&*insert_sql))
             .bind(id)
             .bind(cust_type)
             .bind(cust_month)

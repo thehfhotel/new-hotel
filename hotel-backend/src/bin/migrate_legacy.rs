@@ -663,7 +663,7 @@ async fn bump_sequences(
     .await?;
 
     if let Some(max_id) = max_book {
-        sqlx::query(&format!("SELECT setval('ht_bookings_book_id_seq', {})", max_id + 1))
+        sqlx::query(sqlx::AssertSqlSafe(format!("SELECT setval('ht_bookings_book_id_seq', {})", max_id + 1)))
             .execute(&mut *tx)
             .await?;
         tracing::info!("  Booking sequence bumped to {}", max_id + 1);
@@ -677,7 +677,7 @@ async fn bump_sequences(
     .await?;
 
     if let Some(max_id) = max_cin {
-        sqlx::query(&format!("SELECT setval('ht_checkins_cin_id_seq', {})", max_id + 1))
+        sqlx::query(sqlx::AssertSqlSafe(format!("SELECT setval('ht_checkins_cin_id_seq', {})", max_id + 1)))
             .execute(&mut *tx)
             .await?;
         tracing::info!("  Check-in sequence bumped to {}", max_id + 1);
@@ -691,7 +691,7 @@ async fn bump_sequences(
     .await?;
 
     if let Some(max_id) = max_cust {
-        sqlx::query(&format!("SELECT setval('ht_customers_cust_id_seq', {})", max_id + 1))
+        sqlx::query(sqlx::AssertSqlSafe(format!("SELECT setval('ht_customers_cust_id_seq', {})", max_id + 1)))
             .execute(&mut *tx)
             .await?;
         tracing::info!("  Customer sequence bumped to {}", max_id + 1);
@@ -705,7 +705,7 @@ async fn bump_sequences(
     .await?;
 
     if let Some(max_id) = max_room {
-        sqlx::query(&format!("SELECT setval('ht_rooms_new_room_id_seq', {})", max_id + 1))
+        sqlx::query(sqlx::AssertSqlSafe(format!("SELECT setval('ht_rooms_new_room_id_seq', {})", max_id + 1)))
             .execute(&mut *tx)
             .await?;
         tracing::info!("  Room sequence bumped to {}", max_id + 1);

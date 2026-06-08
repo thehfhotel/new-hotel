@@ -299,7 +299,7 @@ async fn fetch_new_calendar_data(
         end_date.replace('\'', "''")
     );
 
-    let booking_rows = sqlx::query(&booking_query)
+    let booking_rows = sqlx::query(sqlx::AssertSqlSafe(&*booking_query))
         .fetch_all(pool)
         .await?;
 
@@ -373,7 +373,7 @@ async fn fetch_new_calendar_data(
         end_date.replace('\'', "''")
     );
 
-    let checkin_rows = sqlx::query(&checkin_query)
+    let checkin_rows = sqlx::query(sqlx::AssertSqlSafe(&*checkin_query))
         .fetch_all(pool)
         .await?;
 

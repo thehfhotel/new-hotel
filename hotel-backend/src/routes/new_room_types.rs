@@ -161,7 +161,7 @@ pub async fn list_room_types(
         where_clause
     );
 
-    let count_rows = sqlx::query(&count_query).fetch_all(pool).await?;
+    let count_rows = sqlx::query(sqlx::AssertSqlSafe(&*count_query)).fetch_all(pool).await?;
 
     let total: i32 = count_rows
         .first()
@@ -194,7 +194,7 @@ pub async fn list_room_types(
         where_clause, order_by_column, sort_order, params.limit, offset
     );
 
-    let rows = sqlx::query(&data_query).fetch_all(pool).await?;
+    let rows = sqlx::query(sqlx::AssertSqlSafe(&*data_query)).fetch_all(pool).await?;
 
     let room_types: Vec<RoomType> = rows
         .iter()

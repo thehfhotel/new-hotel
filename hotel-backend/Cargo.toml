@@ -69,7 +69,7 @@ tokio-util = { version = "0.7", features = ["compat"] }
 # Database - New (PostgreSQL via sqlx for HotelNew DB)
 # Note: "bigdecimal" feature dropped — no NUMERIC columns are read into BigDecimal;
 # all DECIMAL columns are cast to ::float8 (f64) at the SQL level (see CLAUDE.md).
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "macros", "uuid"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "macros", "uuid"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

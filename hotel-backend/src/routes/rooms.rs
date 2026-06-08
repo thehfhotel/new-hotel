@@ -140,7 +140,7 @@ async fn list_rooms_pg(pool: &crate::db::PgPool) -> ApiResult<Vec<Room>> {
         projection = ROOM_PROJECTION,
     );
 
-    let rows = sqlx::query(&sql).fetch_all(pool).await?;
+    let rows = sqlx::query(sqlx::AssertSqlSafe(&*sql)).fetch_all(pool).await?;
     Ok(rows.iter().map(row_to_room).collect())
 }
 
@@ -166,7 +166,7 @@ async fn get_room_pg(pool: &crate::db::PgPool, room_no: &str) -> ApiResult<RoomD
         projection = ROOM_PROJECTION,
     );
 
-    let room_row = sqlx::query(&sql)
+    let room_row = sqlx::query(sqlx::AssertSqlSafe(&*sql))
         .bind(room_no)
         .fetch_optional(pool)
         .await?
@@ -254,7 +254,7 @@ async fn get_room_legacy_only(pool: &crate::db::PgPool, room_no: &str) -> ApiRes
 /// `ht_checkins.cin_room_id` DEPRECATED note. After B5's backfill the
 /// fallback becomes dead code and the column drops.
 async fn get_checkouts_today_pg(pool: &crate::db::PgPool) -> ApiResult<Vec<String>> {
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         r#"
         SELECT DISTINCT r.room_no AS room_no
         FROM ht_checkins c
@@ -268,7 +268,7 @@ async fn get_checkouts_today_pg(pool: &crate::db::PgPool) -> ApiResult<Vec<Strin
         "#,
         today = crate::routes::stats::BANGKOK_TODAY_SQL,
         hour = crate::routes::stats::BANGKOK_HOUR_SQL,
-    ))
+    )))
     .fetch_all(pool)
     .await?;
 

@@ -248,7 +248,7 @@ pub async fn list_requests(
         where_clause
     );
 
-    let count_q = sqlx::query(&count_query);
+    let count_q = sqlx::query(sqlx::AssertSqlSafe(&*count_query));
     let count_q = match &params.status { Some(s) => count_q.bind(s), None => count_q };
     let count_rows = count_q.fetch_all(pool).await?;
 
@@ -296,7 +296,7 @@ pub async fn list_requests(
         where_clause, params.limit, offset
     );
 
-    let data_q = sqlx::query(&data_query);
+    let data_q = sqlx::query(sqlx::AssertSqlSafe(&*data_query));
     let data_q = match &params.status { Some(s) => data_q.bind(s), None => data_q };
     let rows = data_q.fetch_all(pool).await?;
 
@@ -536,7 +536,7 @@ pub async fn update_request(
 
     // Bind values in the same order the placeholders were assigned above, then
     // bind `request_id` last to match the WHERE-clause `$id_param_index`.
-    let q = sqlx::query(&update_query);
+    let q = sqlx::query(sqlx::AssertSqlSafe(&*update_query));
     let q = match &body.title { Some(v) => q.bind(v), None => q };
     let q = match &body.description { Some(v) => q.bind(v), None => q };
     let q = match &body.status { Some(v) => q.bind(v), None => q };
@@ -594,7 +594,7 @@ pub async fn update_request_status(
         ),
     };
 
-    let result = sqlx::query(&update_query).execute(pool).await?;
+    let result = sqlx::query(sqlx::AssertSqlSafe(&*update_query)).execute(pool).await?;
 
     if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("Maintenance request not found".to_string()));

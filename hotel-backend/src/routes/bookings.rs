@@ -184,7 +184,7 @@ async fn list_bookings_pg(
          {where_clause}"
     );
 
-    let mut count_q = sqlx::query(&count_query);
+    let mut count_q = sqlx::query(sqlx::AssertSqlSafe(&*count_query));
     if let Some(ref pat) = search_pattern {
         count_q = count_q.bind(pat);
     }
@@ -231,7 +231,7 @@ async fn list_bookings_pg(
         limit = params.limit
     );
 
-    let mut data_q = sqlx::query(&data_query);
+    let mut data_q = sqlx::query(sqlx::AssertSqlSafe(&*data_query));
     if let Some(ref pat) = search_pattern {
         data_q = data_q.bind(pat);
     }
