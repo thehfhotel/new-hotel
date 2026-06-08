@@ -7,6 +7,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.69.2](https://github.com/thehfhotel/new-hotel/compare/v2.69.1...v2.69.2) (2026-06-07)
+
+
+### Fixed
+
+* **ci:** unblock Dependabot backend PRs + clear CodeQL unused-variable notes ([#173](https://github.com/thehfhotel/new-hotel/issues/173)) ([4a960b5](https://github.com/thehfhotel/new-hotel/commit/4a960b5338ffb24bcace9d5ad99f00365a7a9f35))
+* **rates:** guard null validFrom/validTo in edit handler ([#154](https://github.com/thehfhotel/new-hotel/issues/154)) ([e1094e5](https://github.com/thehfhotel/new-hotel/commit/e1094e59946f5ac3e6b279008364abe90e53a581))
+* **routes:** emit daysOfWeek as JSON array, never null ([#152](https://github.com/thehfhotel/new-hotel/issues/152)) ([75c46ed](https://github.com/thehfhotel/new-hotel/commit/75c46ed988d610764733167801f9c64cccf56018))
+* **sync:** gate :warning: watchdog page on consecutive probe failures ([4265301](https://github.com/thehfhotel/new-hotel/commit/426530139dd5173cec5601c84d4ed1510e49af81))
+
 ## [2.69.1](https://github.com/thehfhotel/new-hotel/compare/v2.69.0...v2.69.1) (2026-05-20)
 
 
