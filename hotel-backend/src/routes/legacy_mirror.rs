@@ -316,7 +316,7 @@ async fn pricing_tier(pool: &crate::db::PgPool, table: &str) -> ApiResult<Vec<Pr
         "SELECT id, cust_type, cust_month, cast_type FROM {table} ORDER BY id"
     );
     let rows =
-        sqlx::query_as::<_, (i32, Option<String>, Option<i32>, Option<String>)>(&sql)
+        sqlx::query_as::<_, (i32, Option<String>, Option<i32>, Option<String>)>(sqlx::AssertSqlSafe(&*sql))
             .fetch_all(pool)
             .await?;
     Ok(rows

@@ -128,7 +128,7 @@ async fn get_stats_pg(pool: &PgPool) -> ApiResult<DashboardStats> {
     // `cin_room_id` for pre-B2 folios that haven't been re-synced through
     // the B2 mapper. After B5 backfill the fallback is dead code and the
     // column drops.
-    let occupied_rooms: i64 = sqlx::query(&format!(
+    let occupied_rooms: i64 = sqlx::query(sqlx::AssertSqlSafe(format!(
         r#"
         SELECT COUNT(DISTINCT COALESCE(cr.cr_room_id, c.cin_room_id)) AS count
         FROM ht_checkins c
@@ -142,7 +142,7 @@ async fn get_stats_pg(pool: &PgPool) -> ApiResult<DashboardStats> {
         "#,
         today = BANGKOK_TODAY_SQL,
         hour = BANGKOK_HOUR_SQL,
-    ))
+    )))
     .fetch_one(pool)
     .await?
     .try_get("count")
@@ -154,7 +154,7 @@ async fn get_stats_pg(pool: &PgPool) -> ApiResult<DashboardStats> {
     // Track B3 / T3 HIGH-3: same junction-walk pattern as `occupied_rooms`
     // — the morning checkout tile must enumerate every room of a
     // multi-room folio, not just the first.
-    let checkout_rooms: i64 = sqlx::query(&format!(
+    let checkout_rooms: i64 = sqlx::query(sqlx::AssertSqlSafe(format!(
         r#"
         SELECT COUNT(DISTINCT COALESCE(cr.cr_room_id, c.cin_room_id)) AS count
         FROM ht_checkins c
@@ -166,7 +166,7 @@ async fn get_stats_pg(pool: &PgPool) -> ApiResult<DashboardStats> {
         "#,
         today = BANGKOK_TODAY_SQL,
         hour = BANGKOK_HOUR_SQL,
-    ))
+    )))
     .fetch_one(pool)
     .await?
     .try_get("count")
@@ -179,7 +179,7 @@ async fn get_stats_pg(pool: &PgPool) -> ApiResult<DashboardStats> {
     // now also walks `ht_checkin_rooms` so a 2-room folio doesn't
     // inadvertently leak rooms 2..N back into the "booked" bucket while
     // the folio is checked in.
-    let booked_rooms: i64 = sqlx::query(&format!(
+    let booked_rooms: i64 = sqlx::query(sqlx::AssertSqlSafe(format!(
         r#"
         SELECT COUNT(DISTINCT br.br_room_id) AS count
         FROM ht_booking_rooms br
@@ -202,7 +202,7 @@ async fn get_stats_pg(pool: &PgPool) -> ApiResult<DashboardStats> {
           )
         "#,
         today = BANGKOK_TODAY_SQL,
-    ))
+    )))
     .fetch_one(pool)
     .await?
     .try_get("count")
@@ -214,14 +214,14 @@ async fn get_stats_pg(pool: &PgPool) -> ApiResult<DashboardStats> {
     // compare its `::date` directly against `BANGKOK_TODAY_SQL`. Do NOT
     // also `AT TIME ZONE 'Asia/Bangkok'` the value (that would treat it
     // as UTC and shift it forward by 7h, giving the next-day date).
-    let today_check_ins: i64 = sqlx::query(&format!(
+    let today_check_ins: i64 = sqlx::query(sqlx::AssertSqlSafe(format!(
         r#"
         SELECT COUNT(*) AS count
         FROM ht_checkins
         WHERE cin_checkin_time::date = {today}
         "#,
         today = BANGKOK_TODAY_SQL,
-    ))
+    )))
     .fetch_one(pool)
     .await?
     .try_get("count")
@@ -230,14 +230,14 @@ async fn get_stats_pg(pool: &PgPool) -> ApiResult<DashboardStats> {
     // Today's check-outs (rows that were actually checked out today in
     // Bangkok local time). Same reasoning: `cin_checkout_time` is naive
     // BKK wall-clock, compare directly.
-    let today_check_outs: i64 = sqlx::query(&format!(
+    let today_check_outs: i64 = sqlx::query(sqlx::AssertSqlSafe(format!(
         r#"
         SELECT COUNT(*) AS count
         FROM ht_checkins
         WHERE cin_checkout_time::date = {today}
         "#,
         today = BANGKOK_TODAY_SQL,
-    ))
+    )))
     .fetch_one(pool)
     .await?
     .try_get("count")

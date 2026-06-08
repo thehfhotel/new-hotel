@@ -459,12 +459,13 @@ jobs:
         run: psql -h localhost -p 5439 -U postgres -d hotelnew -f init-db/init-hotelnew.sql
 
       - name: Install Rust toolchain
-        # Pinned to a `1.89` branch SHA (per Batch D). The `@stable` ref the
-        # action publishes is a moving target — pinning it caps the toolchain
-        # at the version used to generate `.sqlx/` cache files.
-        uses: dtolnay/rust-toolchain@193d6aa1dbbc28bd2c0a6b0e327cfdce68baaf6e  # 1.89
+        # Toolchain bumped 1.89 -> 1.96 to match the runtime Dockerfile
+        # (rust:1.96-bookworm) and satisfy sqlx 0.9's MSRV of 1.94. The action
+        # SHA is still pinned (the published `@stable` ref is a moving target);
+        # only the `toolchain` input changed.
+        uses: dtolnay/rust-toolchain@193d6aa1dbbc28bd2c0a6b0e327cfdce68baaf6e  # pinned action code
         with:
-          toolchain: "1.89"
+          toolchain: "1.96"
 
       # sccache wraps every rustc invocation and caches its output keyed on the
       # exact crate inputs. It complements Swatinem/rust-cache (which caches

@@ -165,16 +165,16 @@ pub async fn list_products(
     let search_like = params.search.as_ref().map(|s| format!("%{s}%"));
 
     let count_row = if let Some(ref like) = search_like {
-        sqlx::query(&count_sql).bind(like).fetch_one(pool).await?
+        sqlx::query(sqlx::AssertSqlSafe(&*count_sql)).bind(like).fetch_one(pool).await?
     } else {
-        sqlx::query(&count_sql).fetch_one(pool).await?
+        sqlx::query(sqlx::AssertSqlSafe(&*count_sql)).fetch_one(pool).await?
     };
     let total: i64 = count_row.try_get("total").unwrap_or(0);
 
     let data_rows = if let Some(ref like) = search_like {
-        sqlx::query(&data_sql).bind(like).fetch_all(pool).await?
+        sqlx::query(sqlx::AssertSqlSafe(&*data_sql)).bind(like).fetch_all(pool).await?
     } else {
-        sqlx::query(&data_sql).fetch_all(pool).await?
+        sqlx::query(sqlx::AssertSqlSafe(&*data_sql)).fetch_all(pool).await?
     };
 
     let data: Vec<Product> = data_rows.into_iter().map(row_to_product).collect();

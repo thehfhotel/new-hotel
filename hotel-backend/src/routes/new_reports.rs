@@ -147,7 +147,7 @@ pub async fn get_revenue(
         date_format, from_escaped, to_escaped
     );
 
-    let rows = sqlx::query(&query)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(&*query))
         .fetch_all(pool)
         .await?;
 
@@ -212,7 +212,7 @@ pub async fn get_occupancy(
         "SELECT ('{}'::date - '{}'::date) + 1 as total_days",
         to_escaped, from_escaped
     );
-    let days_rows = sqlx::query(&days_query)
+    let days_rows = sqlx::query(sqlx::AssertSqlSafe(&*days_query))
         .fetch_all(pool)
         .await?;
 
@@ -250,7 +250,7 @@ pub async fn get_occupancy(
         to_escaped, to_escaped, from_escaped, from_escaped, to_escaped, from_escaped
     );
 
-    let occupancy_rows = sqlx::query(&occupancy_query)
+    let occupancy_rows = sqlx::query(sqlx::AssertSqlSafe(&*occupancy_query))
         .fetch_all(pool)
         .await?;
 
@@ -334,7 +334,7 @@ pub async fn get_revenue_by_room_type(
         from_escaped, to_escaped
     );
 
-    let rows = sqlx::query(&query)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(&*query))
         .fetch_all(pool)
         .await?;
 

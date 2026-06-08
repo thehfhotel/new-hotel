@@ -290,7 +290,7 @@ pub async fn list_rates(
         where_clause
     );
 
-    let rows = sqlx::query(&query).fetch_all(pool).await?;
+    let rows = sqlx::query(sqlx::AssertSqlSafe(&*query)).fetch_all(pool).await?;
     let rates: Vec<Rate> = rows.iter().map(rate_from_row).collect();
     let total = rates.len() as i32;
 
@@ -391,7 +391,7 @@ pub async fn list_rate_tiers(
     }
     sql.push_str(" ORDER BY rate_tier_room_type, rate_tier_cust_type");
 
-    let mut q = sqlx::query(&sql);
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(&*sql));
     if let Some(rt) = bind_room_type {
         q = q.bind(rt);
     }

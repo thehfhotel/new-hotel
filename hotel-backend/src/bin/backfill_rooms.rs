@@ -479,7 +479,7 @@ async fn bump_sequence_to_max(
     let sql = format!(
         "SELECT setval('{sequence}', COALESCE((SELECT MAX({pk_col}) FROM {table}), 1))"
     );
-    sqlx::query(&sql).execute(pg).await?;
+    sqlx::query(sqlx::AssertSqlSafe(&*sql)).execute(pg).await?;
     tracing::info!("  Bumped sequence {} past max({}.{})", sequence, table, pk_col);
     Ok(())
 }

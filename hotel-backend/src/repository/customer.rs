@@ -171,7 +171,7 @@ impl CustomerRepository for PgCustomerRepository {
             where_clause
         );
 
-        let mut count_q = sqlx::query(&count_query);
+        let mut count_q = sqlx::query(sqlx::AssertSqlSafe(&*count_query));
         if let Some(ref pattern) = like_pattern {
             count_q = count_q.bind(pattern);
         }
@@ -205,7 +205,7 @@ impl CustomerRepository for PgCustomerRepository {
             where_clause, order_by_column, sort_order, params.limit, offset
         );
 
-        let mut data_q = sqlx::query(&data_query);
+        let mut data_q = sqlx::query(sqlx::AssertSqlSafe(&*data_query));
         if let Some(ref pattern) = like_pattern {
             data_q = data_q.bind(pattern);
         }

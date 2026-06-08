@@ -57,7 +57,7 @@ async fn all_expected_tables_exist() {
             table
         );
 
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(&*sql))
             .fetch_one(&pool)
             .await
             .unwrap_or_else(|e| panic!("Query failed for table '{}': {}", table, e));

@@ -500,16 +500,14 @@ async fn check_level_drift_and_alert(
     slack: Option<&SlackClient>,
     site_id: &str,
 ) {
-    let rows = sqlx::query_as::<_, (String, i64)>(
-        &format!(
-            "SELECT table_name, count(*) \
-               FROM ht_reconcile_log \
-              WHERE resolved_at IS NULL \
-                AND divergence_kind IS NOT NULL \
-                AND detected_at < now() - interval '{LEVEL_DRIFT_STALE_INTERVAL_HOURS} hours' \
-              GROUP BY table_name"
-        ),
-    )
+    let rows = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(format!(
+        "SELECT table_name, count(*) \
+           FROM ht_reconcile_log \
+          WHERE resolved_at IS NULL \
+            AND divergence_kind IS NOT NULL \
+            AND detected_at < now() - interval '{LEVEL_DRIFT_STALE_INTERVAL_HOURS} hours' \
+          GROUP BY table_name"
+    )))
     .fetch_all(pg_pool)
     .await;
 

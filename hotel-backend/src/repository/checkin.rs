@@ -366,7 +366,7 @@ impl CheckInRepository for PgCheckInRepository {
             where_clause
         );
 
-        let count_q = sqlx::query(&count_query);
+        let count_q = sqlx::query(sqlx::AssertSqlSafe(&*count_query));
         let count_q = match &params.status {
             Some(v) => count_q.bind(v),
             None => count_q,
@@ -414,7 +414,7 @@ impl CheckInRepository for PgCheckInRepository {
             where_clause, order_by_column, sort_order, params.limit, offset
         );
 
-        let data_q = sqlx::query(&data_query);
+        let data_q = sqlx::query(sqlx::AssertSqlSafe(&*data_query));
         let data_q = match &params.status {
             Some(v) => data_q.bind(v),
             None => data_q,

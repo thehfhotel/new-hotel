@@ -111,7 +111,7 @@ async fn list_checkins_pg(
         where_clause
     );
 
-    let count_q = sqlx::query(&count_query);
+    let count_q = sqlx::query(sqlx::AssertSqlSafe(&*count_query));
     let count_q = match &params.status { Some(s) => count_q.bind(s), None => count_q };
     let count_q = match &params.start_date { Some(s) => count_q.bind(s), None => count_q };
     let count_q = match &params.end_date { Some(s) => count_q.bind(s), None => count_q };
@@ -146,7 +146,7 @@ async fn list_checkins_pg(
         where_clause, offset, params.limit
     );
 
-    let data_q = sqlx::query(&data_query);
+    let data_q = sqlx::query(sqlx::AssertSqlSafe(&*data_query));
     let data_q = match &params.status { Some(s) => data_q.bind(s), None => data_q };
     let data_q = match &params.start_date { Some(s) => data_q.bind(s), None => data_q };
     let data_q = match &params.end_date { Some(s) => data_q.bind(s), None => data_q };

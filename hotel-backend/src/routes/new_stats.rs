@@ -80,7 +80,7 @@ pub async fn get_stats(State(state): State<AppState>) -> ApiResult<Json<StatsRes
         today = crate::routes::stats::BANGKOK_TODAY_SQL,
     );
 
-    let checkin_stats_rows = sqlx::query(&checkin_stats_sql).fetch_all(pool).await?;
+    let checkin_stats_rows = sqlx::query(sqlx::AssertSqlSafe(&*checkin_stats_sql)).fetch_all(pool).await?;
 
     let (today_check_ins, today_check_outs) = checkin_stats_rows
         .first()

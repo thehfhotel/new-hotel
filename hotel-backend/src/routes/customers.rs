@@ -205,13 +205,13 @@ async fn list_customers_pg(
 
     let total: i32 = if let Some(ref search) = params.search {
         let search_pattern = format!("%{}%", search);
-        sqlx::query(&count_query)
+        sqlx::query(sqlx::AssertSqlSafe(&*count_query))
             .bind(&search_pattern)
             .fetch_one(pool)
             .await?
             .get("total")
     } else {
-        sqlx::query(&count_query).fetch_one(pool).await?.get("total")
+        sqlx::query(sqlx::AssertSqlSafe(&*count_query)).fetch_one(pool).await?.get("total")
     };
 
     let data_query = build_list_customers_sql(
@@ -222,14 +222,14 @@ async fn list_customers_pg(
 
     let rows = if let Some(ref search) = params.search {
         let search_pattern = format!("%{}%", search);
-        sqlx::query(&data_query)
+        sqlx::query(sqlx::AssertSqlSafe(&*data_query))
             .bind(&search_pattern)
             .bind(params.limit)
             .bind(offset)
             .fetch_all(pool)
             .await?
     } else {
-        sqlx::query(&data_query)
+        sqlx::query(sqlx::AssertSqlSafe(&*data_query))
             .bind(params.limit)
             .bind(offset)
             .fetch_all(pool)

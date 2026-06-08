@@ -300,7 +300,7 @@ impl BookingRepository for PgBookingRepository {
         // status, start_date, end_date, customer_id. sqlx binds positionally
         // by call order, not by `$N` literal — so the order must match the
         // `next_idx` increments above.
-        let mut count_q = sqlx::query(&count_query);
+        let mut count_q = sqlx::query(sqlx::AssertSqlSafe(&*count_query));
         if let Some(ref pattern) = search_pattern {
             count_q = count_q.bind(pattern);
         }
@@ -353,7 +353,7 @@ impl BookingRepository for PgBookingRepository {
             where_clause, order_by_column, sort_order, params.limit, offset
         );
 
-        let mut data_q = sqlx::query(&data_query);
+        let mut data_q = sqlx::query(sqlx::AssertSqlSafe(&*data_query));
         if let Some(ref pattern) = search_pattern {
             data_q = data_q.bind(pattern);
         }

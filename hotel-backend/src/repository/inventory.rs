@@ -408,7 +408,7 @@ impl InventoryRepository for PgInventoryRepository {
             where_clause
         );
 
-        let count_q = sqlx::query(&count_query);
+        let count_q = sqlx::query(sqlx::AssertSqlSafe(&*count_query));
         let count_q = match &like_pattern {
             Some(v) => count_q.bind(v),
             None => count_q,
@@ -444,7 +444,7 @@ impl InventoryRepository for PgInventoryRepository {
             where_clause, params.limit, offset
         );
 
-        let data_q = sqlx::query(&data_query);
+        let data_q = sqlx::query(sqlx::AssertSqlSafe(&*data_query));
         let data_q = match &like_pattern {
             Some(v) => data_q.bind(v),
             None => data_q,
@@ -730,7 +730,7 @@ impl InventoryRepository for PgInventoryRepository {
             where_clause
         );
 
-        let data_q = sqlx::query(&data_query);
+        let data_q = sqlx::query(sqlx::AssertSqlSafe(&*data_query));
         let data_q = match &like_pattern {
             Some(v) => data_q.bind(v),
             None => data_q,
@@ -897,7 +897,7 @@ impl InventoryRepository for PgInventoryRepository {
             where_clause
         );
 
-        let count_q = sqlx::query(&count_query);
+        let count_q = sqlx::query(sqlx::AssertSqlSafe(&*count_query));
         let count_q = match &trans_type_bind {
             Some(v) => count_q.bind(v),
             None => count_q,
@@ -939,7 +939,7 @@ impl InventoryRepository for PgInventoryRepository {
             where_clause, params.limit, offset
         );
 
-        let data_q = sqlx::query(&data_query);
+        let data_q = sqlx::query(sqlx::AssertSqlSafe(&*data_query));
         let data_q = match &trans_type_bind {
             Some(v) => data_q.bind(v),
             None => data_q,
