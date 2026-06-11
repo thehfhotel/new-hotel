@@ -1093,6 +1093,28 @@ VALUES ('018', '018_ht_customers_aggregate_keys.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================
+-- Migration 055: ht_customers.legacy_id (customer hard-delete handling)
+-- Mirrors migrations/pg/055_add_legacy_id_to_ht_customers.sql. CT D-rows
+-- for HT_Customers carry only the legacy SERIAL `id`; persisting it on the
+-- canonical row lets apply_soft_delete resolve iHOTEL hard-deletes (audit
+-- 2026-06-11 P1 #6 — every FrmManageCustomersNew delete was a silent no-op).
+-- =============================================================================
+
+ALTER TABLE ht_customers ADD COLUMN IF NOT EXISTS legacy_id INTEGER;
+
+CREATE INDEX IF NOT EXISTS idx_ht_customers_legacy_id
+    ON ht_customers (legacy_id) WHERE legacy_id IS NOT NULL;
+
+COMMENT ON COLUMN ht_customers.legacy_id IS
+  'Legacy HT_Customers.id (MSSQL SERIAL PK). CT D-rows carry only this '
+  'key, so customer hard-deletes resolve by it. NULL for rows mirrored '
+  'before migration 055 that have not been re-touched by CT since.';
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('055', '055_add_legacy_id_to_ht_customers.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
 -- Migration 019: ht_reconcile_log (Phase 5.5 — drift-detection tripwire)
 -- Per docs/architecture.md §3.6d. CT watcher is now authoritative for
 -- canonical PG state; the legacy 5-min reconcile job is demoted to a

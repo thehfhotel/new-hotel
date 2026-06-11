@@ -186,7 +186,7 @@ async fn booking_insert_upserts_pg_row_and_writes_event_log() {
     };
 
     let mut tx = pool.begin().await.expect("begin");
-    let event = apply_booking_aggregate(&mut tx, &aggregate, &book_id)
+    let event = apply_booking_aggregate(&mut tx, None, &aggregate, &book_id)
         .await
         .expect("apply must succeed");
     assert!(event.is_some(), "fresh aggregate must emit an event");
@@ -258,7 +258,7 @@ async fn booking_re_apply_with_identical_aggregate_skips_event() {
 
     // First apply — emits BookingCreated.
     let mut tx = pool.begin().await.unwrap();
-    let event = apply_booking_aggregate(&mut tx, &aggregate, &book_id)
+    let event = apply_booking_aggregate(&mut tx, None, &aggregate, &book_id)
         .await
         .expect("first apply");
     assert!(event.is_some());
@@ -271,7 +271,7 @@ async fn booking_re_apply_with_identical_aggregate_skips_event() {
 
     // Second apply with identical aggregate — must NOT emit.
     let mut tx2 = pool.begin().await.unwrap();
-    let event2 = apply_booking_aggregate(&mut tx2, &aggregate, &book_id)
+    let event2 = apply_booking_aggregate(&mut tx2, None, &aggregate, &book_id)
         .await
         .expect("second apply");
     tx2.commit().await.unwrap();
@@ -300,7 +300,7 @@ async fn booking_modify_emits_booking_modified_event() {
         nights: vec![date_row(&book_id, &room_no)],
     };
     let mut tx = pool.begin().await.unwrap();
-    let _ = apply_booking_aggregate(&mut tx, &initial, &book_id)
+    let _ = apply_booking_aggregate(&mut tx, None, &initial, &book_id)
         .await
         .expect("seed apply");
     tx.commit().await.unwrap();
@@ -312,7 +312,7 @@ async fn booking_modify_emits_booking_modified_event() {
         nights: vec![date_row(&book_id, &room_no)],
     };
     let mut tx2 = pool.begin().await.unwrap();
-    let event = apply_booking_aggregate(&mut tx2, &modified, &book_id)
+    let event = apply_booking_aggregate(&mut tx2, None, &modified, &book_id)
         .await
         .expect("modify apply");
     tx2.commit().await.unwrap();
@@ -339,7 +339,7 @@ async fn booking_delete_marks_status_cancelled_and_emits_booking_cancelled() {
         nights: vec![date_row(&book_id, &room_no)],
     };
     let mut tx = pool.begin().await.unwrap();
-    let _ = apply_booking_aggregate(&mut tx, &initial, &book_id)
+    let _ = apply_booking_aggregate(&mut tx, None, &initial, &book_id)
         .await
         .expect("seed");
     tx.commit().await.unwrap();
@@ -351,7 +351,7 @@ async fn booking_delete_marks_status_cancelled_and_emits_booking_cancelled() {
         nights: vec![],
     };
     let mut tx2 = pool.begin().await.unwrap();
-    let event = apply_booking_aggregate(&mut tx2, &cancelled, &book_id)
+    let event = apply_booking_aggregate(&mut tx2, None, &cancelled, &book_id)
         .await
         .expect("cancel apply");
     tx2.commit().await.unwrap();
@@ -394,7 +394,7 @@ async fn header_only_booking_creates_canonical_row_with_zero_booking_rooms() {
     };
 
     let mut tx = pool.begin().await.expect("begin");
-    let event = apply_booking_aggregate(&mut tx, &aggregate, &book_id)
+    let event = apply_booking_aggregate(&mut tx, None, &aggregate, &book_id)
         .await
         .expect("apply must succeed for header-only aggregate");
     assert!(event.is_some(), "header-only insert must emit an event");
@@ -452,7 +452,7 @@ async fn re_apply_with_zero_rooms_clears_stale_booking_rooms() {
         nights: vec![date_row(&book_id, &room_no)],
     };
     let mut tx = pool.begin().await.unwrap();
-    let _ = apply_booking_aggregate(&mut tx, &initial, &book_id)
+    let _ = apply_booking_aggregate(&mut tx, None, &initial, &book_id)
         .await
         .expect("seed apply");
     tx.commit().await.unwrap();
@@ -479,7 +479,7 @@ async fn re_apply_with_zero_rooms_clears_stale_booking_rooms() {
         nights: vec![],
     };
     let mut tx2 = pool.begin().await.unwrap();
-    apply_booking_aggregate(&mut tx2, &header_only, &book_id)
+    apply_booking_aggregate(&mut tx2, None, &header_only, &book_id)
         .await
         .expect("header-only re-apply");
     tx2.commit().await.unwrap();
@@ -520,7 +520,7 @@ async fn coalescing_yields_exactly_one_event_per_aggregate_per_tick() {
         nights: vec![date_row(&book_id, &room_no)],
     };
     let mut tx0 = pool.begin().await.unwrap();
-    if let Some(e) = apply_booking_aggregate(&mut tx0, &initial, &book_id)
+    if let Some(e) = apply_booking_aggregate(&mut tx0, None, &initial, &book_id)
         .await
         .unwrap()
     {
@@ -540,7 +540,7 @@ async fn coalescing_yields_exactly_one_event_per_aggregate_per_tick() {
         nights: vec![date_row(&book_id, &room_no)],
     };
     let mut tx = pool.begin().await.unwrap();
-    let event = apply_booking_aggregate(&mut tx, &modified, &book_id)
+    let event = apply_booking_aggregate(&mut tx, None, &modified, &book_id)
         .await
         .expect("apply");
     if let Some(e) = event {
@@ -573,4 +573,203 @@ async fn coalescing_yields_exactly_one_event_per_aggregate_per_tick() {
     );
 
     cleanup(&pool, &book_id, &cust_no, &room_no).await;
+}
+
+// =============================================================================
+// 2026-06-11 — June-3 silent-drop regression suite (audit P0 #1).
+//
+// On 2026-06-03 a customer+booking created in iHOTEL (C22209 / R015290)
+// was permanently lost: the booking apply returned Ok(None) when the
+// customer FK missed, the watcher counted it `skipped` (not `errored`),
+// and the watermark advanced past the CT row. These tests lock the new
+// contract: an unresolvable customer FK is an ERROR (watermark hold),
+// and the eager-mirror path makes the miss self-healing when MSSQL is
+// reachable (covered by the shared
+// `checkin::resolve_customer_via_eager_mirror_for_test` seam — the
+// booking mapper routes through the exact same helper).
+// =============================================================================
+
+#[tokio::test]
+async fn booking_apply_errors_when_customer_unresolvable() {
+    let pool = common::create_test_pool().await;
+    let book_id = unique_book_id();
+    let cust_no = unique_cust_no(); // intentionally NOT seeded
+    let room_no = unique_room_no();
+
+    let _room_id = seed_room(&pool, &room_no).await;
+
+    let aggregate = BookingAggregate {
+        header: Some(header_row(&book_id, &cust_no, "จอง", 890.0)),
+        rooms: vec![ds_row(&book_id, &room_no, 890.0)],
+        nights: vec![date_row(&book_id, &room_no)],
+    };
+
+    let mut tx = pool.begin().await.expect("begin");
+    // `mssql=None` -> eager-mirror impossible -> MUST error so the
+    // watcher's per-key handler sets errored=true and HOLDS the
+    // watermark. Pre-fix this returned Ok(None) ("skipped") and the
+    // booking was unrecoverable after the 2-day CT retention.
+    let result = apply_booking_aggregate(&mut tx, None, &aggregate, &book_id).await;
+    tx.rollback().await.ok();
+    let err = result.expect_err(
+        "unresolvable customer FK must error (June-3 regression) — \
+         Ok(None) here is the silent-drop class",
+    );
+    assert!(
+        err.to_string().contains("customer FK unresolvable"),
+        "error must name the unresolvable FK: {err}"
+    );
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM ht_bookings WHERE legacy_book_id = $1",
+    )
+    .bind(&book_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 0, "no row must be inserted on the error path");
+
+    sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = $1")
+        .bind(&room_no)
+        .execute(&pool)
+        .await
+        .ok();
+}
+
+/// iHOTEL customer-delete cascade end-to-end (cheatsheet §3.24): the
+/// cascade rewrites `Book_Cust_ID='C0000'` — a sentinel with NO real
+/// `HT_Customers` row. The apply must (a) NOT idempotency-skip the
+/// cust_no-only change, and (b) resolve `C0000` to the canonical
+/// tombstone placeholder instead of erroring/wedging.
+#[tokio::test]
+async fn booking_reapply_after_c0000_cascade_repoints_to_sentinel() {
+    let pool = common::create_test_pool().await;
+    let book_id = unique_book_id();
+    let cust_no = unique_cust_no();
+    let room_no = unique_room_no();
+
+    let original_cust_id = seed_customer(&pool, &cust_no).await;
+    let _room_id = seed_room(&pool, &room_no).await;
+
+    // 1. Normal apply against the real customer.
+    let initial = BookingAggregate {
+        header: Some(header_row(&book_id, &cust_no, "จอง", 890.0)),
+        rooms: vec![ds_row(&book_id, &room_no, 890.0)],
+        nights: vec![date_row(&book_id, &room_no)],
+    };
+    let mut tx = pool.begin().await.unwrap();
+    apply_booking_aggregate(&mut tx, None, &initial, &book_id)
+        .await
+        .expect("initial apply")
+        .expect("fresh aggregate emits an event");
+    tx.commit().await.unwrap();
+
+    // 2. iHOTEL deletes the customer: header now carries C0000. Status
+    //    and amounts are UNCHANGED — pre-fix `existing_matches` skipped
+    //    this entirely.
+    let cascaded = BookingAggregate {
+        header: Some(header_row(&book_id, "C0000", "จอง", 890.0)),
+        rooms: vec![ds_row(&book_id, &room_no, 890.0)],
+        nights: vec![date_row(&book_id, &room_no)],
+    };
+    let mut tx2 = pool.begin().await.unwrap();
+    apply_booking_aggregate(&mut tx2, None, &cascaded, &book_id)
+        .await
+        .expect("cascade re-apply must succeed (sentinel path, no MSSQL needed)");
+    tx2.commit().await.unwrap();
+
+    let (book_cust_id, legacy_cust_no): (i32, Option<String>) = sqlx::query_as(
+        "SELECT book_cust_id, legacy_cust_no FROM ht_bookings WHERE legacy_book_id = $1",
+    )
+    .bind(&book_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_ne!(
+        book_cust_id, original_cust_id,
+        "booking must be re-pointed away from the deleted customer"
+    );
+    assert_eq!(
+        legacy_cust_no.as_deref(),
+        Some("C0000"),
+        "denormalised pointer must mirror the cascade sentinel"
+    );
+    let sentinel_no: Option<String> = sqlx::query_scalar(
+        "SELECT legacy_cust_no FROM ht_customers WHERE cust_id = $1",
+    )
+    .bind(book_cust_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        sentinel_no.as_deref(),
+        Some("C0000"),
+        "FK must land on the canonical C0000 tombstone placeholder"
+    );
+
+    cleanup(&pool, &book_id, &cust_no, &room_no).await;
+    // The sentinel row is shared global state — leave it in place
+    // (other tests / production rows may reference it).
+}
+
+// =============================================================================
+// Book_room_type=1 idempotency (audit P2 / task 7c).
+//
+// Type-1 bookings ("ระบุประเภทห้อง", cheatsheet §3.3) carry room-TYPE
+// codes in HT_Book_Ds.Book_Room_Type. Pre-fix each line failed the
+// room_no lookup, warn-skipped, and the rooms_count mismatch re-emitted
+// BookingModified on EVERY CT touch forever.
+// =============================================================================
+
+#[tokio::test]
+async fn type1_booking_applies_header_only_and_reapply_is_idempotent() {
+    let pool = common::create_test_pool().await;
+    let book_id = unique_book_id();
+    let cust_no = unique_cust_no();
+
+    let _cust_id = seed_customer(&pool, &cust_no).await;
+
+    let header = header_row(&book_id, &cust_no, "จอง", 890.0)
+        .with("Book_room_type", MockValue::I32(1));
+    // Ds line carries a room-TYPE code, not a room number.
+    let aggregate = BookingAggregate {
+        header: Some(header),
+        rooms: vec![ds_row(&book_id, "4", 890.0)],
+        nights: vec![],
+    };
+
+    let mut tx = pool.begin().await.unwrap();
+    let event = apply_booking_aggregate(&mut tx, None, &aggregate, &book_id)
+        .await
+        .expect("type-1 apply must succeed");
+    assert!(event.is_some(), "fresh aggregate emits BookingCreated");
+    tx.commit().await.unwrap();
+
+    // Zero room assignments — the type code must NOT be treated as a
+    // room number.
+    let rooms_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM ht_booking_rooms WHERE br_book_id IN \
+         (SELECT book_id FROM ht_bookings WHERE legacy_book_id = $1)",
+    )
+    .bind(&book_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rooms_count, 0, "type-1 Ds lines must not become room rows");
+
+    // Re-apply with the identical aggregate: MUST be the idempotent
+    // skip. Pre-fix the unresolvable-line count mismatch made this
+    // emit BookingModified forever.
+    let mut tx2 = pool.begin().await.unwrap();
+    let event2 = apply_booking_aggregate(&mut tx2, None, &aggregate, &book_id)
+        .await
+        .expect("re-apply must succeed");
+    tx2.commit().await.unwrap();
+    assert!(
+        event2.is_none(),
+        "identical type-1 aggregate must idempotency-skip (no \
+         BookingModified re-emission loop)"
+    );
+
+    cleanup(&pool, &book_id, &cust_no, "no-room-seeded").await;
 }

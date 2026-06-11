@@ -269,6 +269,12 @@ async fn apply_room_upsert(
             // `room_use_count` uses raw assignment (not COALESCE) so a
             // legacy 0 truly resets PG to 0; the running counter is
             // the legacy app's authoritative state.
+            // `room_notes` ($3) also uses raw assignment (2026-06-11,
+            // audit P2): the CT projection always carries the current
+            // `Room_Details` value, so a legacy NULL is a genuine
+            // "notes cleared" transition — the old COALESCE could
+            // never converge it and the reconcile sweep flagged the
+            // row forever.
             // COALESCE argument order: see Bug A rationale in
             // `sync::mappers::checkin::update_existing` and
             // `sync::mappers::booking::update_existing`.
@@ -288,7 +294,7 @@ async fn apply_room_upsert(
                 "UPDATE ht_rooms_new \
                     SET room_clean         = COALESCE($1, room_clean), \
                         room_maintenance   = COALESCE($2::bool, room_maintenance), \
-                        room_notes         = COALESCE($3, room_notes), \
+                        room_notes         = $3, \
                         room_use_count     = COALESCE($8, room_use_count), \
                         room_x             = COALESCE($9, room_x), \
                         room_y             = COALESCE($10, room_y), \

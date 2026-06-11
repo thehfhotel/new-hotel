@@ -233,10 +233,13 @@ impl MssqlChangeMapper for CheckinProductMirrorMapper {
                 // `ht_pos_sales` table so sales rung up via iHOTEL
                 // also land canonically. The mapper resolves
                 // `Cin_No` → `cin_id` and `Cin_Pro_id` → `prod_id`
-                // via FK joins; misses (parent rows haven't been
-                // mirrored yet) are silently skipped. The next CT
-                // tick on the same row re-fires the mapper after
-                // the parent rows land.
+                // via FK joins; a resolution miss ERRORS so the
+                // watcher holds the watermark (the mirror UPSERT
+                // above still commits — the tick TX is not rolled
+                // back on a per-row error — and the retry re-applies
+                // both writes idempotently). Pre-2026-06-11 misses
+                // were silently skipped under the false "next CT tick
+                // re-fires" belief — the June-3 silent-drop class.
                 upsert_canonical_pos_sale(
                     tx, id, cin_no, pro_id, pro_num, pro_price, pro_note, ds_date,
                 )
@@ -249,11 +252,17 @@ impl MssqlChangeMapper for CheckinProductMirrorMapper {
 
 /// Track G6 — UPSERT a canonical `ht_pos_sales` row from the legacy
 /// `HT_CheckIn_Product` projection. Resolves `Cin_No` →
-/// `ht_checkins.cin_id`, `Cin_Pro_id` → `ht_products.prod_id`. If
-/// either lookup misses (the parent row hasn't been mirrored yet)
-/// this is a NO-OP — next CT tick re-runs the mapper after the
-/// parents land. The mirror-table UPSERT above always completes so
-/// `legacy_mirror.ht_checkin_product` readers see the row immediately.
+/// `ht_checkins.cin_id`, `Cin_Pro_id` → `ht_products.prod_id`.
+///
+/// A NULL `Cin_No` / `Cin_Pro_id` on the legacy row is a deliberate
+/// skip (the row genuinely references nothing — retrying can't change
+/// its shape). A RESOLUTION miss, however, ERRORS (2026-06-11): the
+/// parent rows simply haven't been mirrored yet, and nothing ever
+/// re-fires a consumed CT row — the pre-fix silent skip permanently
+/// dropped the canonical sale (June-3 class). The error holds the
+/// watermark; the mirror-table UPSERT above still commits (per-row
+/// errors don't roll back the tick TX) so `legacy_mirror` readers see
+/// the row immediately, and the retried apply is idempotent.
 #[allow(clippy::too_many_arguments)]
 async fn upsert_canonical_pos_sale(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -264,13 +273,13 @@ async fn upsert_canonical_pos_sale(
     pro_price: Option<f64>,
     pro_note: Option<&str>,
     ds_date: Option<chrono::NaiveDateTime>,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), SyncError> {
     let Some(cin_no) = cin_no else { return Ok(()) };
     let Some(pro_id) = pro_id else { return Ok(()) };
 
     // Resolve cin_id + prod_id in one round trip. Any NULL means the
-    // parent rows aren't yet mirrored — bail out so the canonical
-    // table stays consistent (the next tick will retry).
+    // parent rows aren't yet mirrored — error so the watermark holds
+    // and the retry runs against mirrored parents.
     let resolved: Option<(i32, i64)> = sqlx::query_as(
         "SELECT c.cin_id, p.prod_id \
            FROM ht_checkins c \
@@ -283,7 +292,14 @@ async fn upsert_canonical_pos_sale(
     .fetch_optional(&mut **tx)
     .await?;
     let Some((cin_id, prod_id)) = resolved else {
-        return Ok(());
+        return Err(SyncError::Mapper {
+            table: "HT_CheckIn_Product",
+            message: format!(
+                "canonical pos-sale FK unresolvable for legacy id={legacy_id} \
+                 cin_no={cin_no} pro_id={pro_id} — parent checkin/product not \
+                 yet mirrored; holding watermark for loud retry"
+            ),
+        });
     };
 
     // Two-step UPSERT keyed on `sale_legacy_id`. The partial UNIQUE
@@ -536,10 +552,10 @@ impl MssqlChangeMapper for ChangedRoomMirrorMapper {
                 // performed via iHOTEL lands canonically. The legacy
                 // row carries `cin_no` + room_no strings; we resolve
                 // them to canonical ids via the existing junctions.
-                // Skip silently when the parent rows haven't yet been
-                // mirrored (race with CT order) — the next tick will
-                // catch up via the `legacy_mirror.ht_changed_room`
-                // mirror table.
+                // A resolution miss ERRORS so the watcher holds the
+                // watermark (2026-06-11; the pre-fix silent skip never
+                // retried — nothing re-fires a consumed CT row — so
+                // the canonical room change was dropped forever).
                 upsert_canonical_room_change(
                     tx, id, cin_no, room_before, room_after, change_date, price, note, toprice,
                 )
@@ -553,11 +569,17 @@ impl MssqlChangeMapper for ChangedRoomMirrorMapper {
 /// Track G4 / T4 HIGH-3 — UPSERT a canonical `ht_room_changes` row from
 /// the legacy `HT_Changed_Room` projection. Resolves `cin_no` →
 /// `ht_checkins.cin_id`, `room_before` / `room_after` →
-/// `ht_rooms_new.room_id`. If any of the three lookups misses (the
-/// parent row hasn't been mirrored yet), this is a NO-OP — the next CT
-/// tick on the same row re-fires the mapper after the parent rows
-/// land. The mirror-table UPSERT still completes so `legacy_mirror`
-/// readers see the row immediately.
+/// `ht_rooms_new.room_id`.
+///
+/// NULL `room_before` / `room_after` on the legacy row is a deliberate
+/// skip (the row genuinely lacks the data; retrying can't change it).
+/// A RESOLUTION miss ERRORS (2026-06-11) so the watcher holds the
+/// watermark — nothing ever re-fires a consumed CT row, and the
+/// pre-fix silent skip dropped the canonical room change forever
+/// (June-3 class). The mirror-table UPSERT above still commits
+/// (per-row errors don't roll back the tick TX) so `legacy_mirror`
+/// readers see the row immediately, and the retried apply is
+/// idempotent.
 #[allow(clippy::too_many_arguments)]
 async fn upsert_canonical_room_change(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -569,13 +591,13 @@ async fn upsert_canonical_room_change(
     price: Option<f64>,
     note: Option<&str>,
     toprice: Option<&str>,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), SyncError> {
     let Some(room_before) = room_before else { return Ok(()) };
     let Some(room_after) = room_after else { return Ok(()) };
 
     // Resolve cin_id + both room_ids in a single round-trip. Any NULL
-    // means the parent rows aren't yet mirrored — we bail out so the
-    // canonical state stays consistent (next tick will retry).
+    // means the parent rows aren't yet mirrored — error so the
+    // watermark holds and the retry runs against mirrored parents.
     let resolved: Option<(i32, i32, i32)> = sqlx::query_as(
         "SELECT c.cin_id, rf.room_id, rt.room_id \
            FROM ht_checkins  c \
@@ -591,11 +613,14 @@ async fn upsert_canonical_room_change(
     .await?;
 
     let Some((cin_id, from_room_id, to_room_id)) = resolved else {
-        // Parent rows missing — leave the canonical table alone. The
-        // legacy_mirror row still gives observability into the audit
-        // entry. The legacy_id back-link will be filled on a
-        // subsequent CT tick when the parent rows have mirrored.
-        return Ok(());
+        return Err(SyncError::Mapper {
+            table: "HT_Changed_Room",
+            message: format!(
+                "canonical room-change FK unresolvable for legacy id={legacy_id} \
+                 cin_no={cin_no} rooms {room_before}->{room_after} — parent \
+                 checkin/rooms not yet mirrored; holding watermark for loud retry"
+            ),
+        });
     };
 
     // Two-step UPSERT keyed on the legacy back-link. The partial

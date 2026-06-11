@@ -258,22 +258,41 @@ async fn apply_receipt_upsert(
 ) -> Result<Option<DomainEvent>, SyncError> {
     let p = project_receipt(row)?;
 
-    // Resolve the parent check-in. Defer when:
-    // - no `Receipt_ref` (sale without check-in — out of scope today;
-    //   we don't have a place to land it in `ht_payments` since
-    //   `pay_cin_id` is NOT NULL).
-    // - `ht_checkins` doesn't yet have the row (next CT tick will
-    //   surface the receipt again via its own watermark).
+    // No `Receipt_ref` → a sale without a check-in. Out of scope today
+    // (`ht_payments.pay_cin_id` is NOT NULL, there's nowhere to land
+    // it) — a deliberate, logged skip, NOT an FK-defer: no amount of
+    // retrying changes the receipt's shape.
+    let Some(legacy_cin_no) = p.legacy_cin_no.as_deref() else {
+        tracing::info!(
+            receipt_no = %p.receipt_no,
+            "ht_payments apply skipped: receipt carries no Receipt_ref \
+             (sale without check-in — out of scope, deliberate)"
+        );
+        return Ok(None);
+    };
+
+    // Resolve the parent check-in. A miss MUST error — receipts have NO
+    // re-fire source: `HT_Receipt_H` rows are written once and never
+    // touched again (append-only per cheatsheet §3.9, except the cancel
+    // status flip), so once this CT row is consumed with the watermark
+    // advancing, the payment is silently lost forever. Erroring makes
+    // the watcher hold the watermark and retry loudly until the parent
+    // check-in lands (its own table poll usually catches up within a
+    // tick). Pre-2026-06-11 this path returned `Ok(None)` — the
+    // June-3 silent-drop class.
     let (cin_id, cin_aggregate_id) =
-        match resolve::resolve_checkin_id(tx, p.legacy_cin_no.as_deref()).await? {
+        match resolve::resolve_checkin_id(tx, Some(legacy_cin_no)).await? {
             Some((cid, agg)) => (cid, agg),
             None => {
-                tracing::info!(
-                    receipt_no = %p.receipt_no,
-                    legacy_cin_no = ?p.legacy_cin_no,
-                    "ht_payments apply deferred: parent check-in not yet mirrored"
-                );
-                return Ok(None);
+                return Err(SyncError::Mapper {
+                    table: HT_RECEIPT_H,
+                    message: format!(
+                        "parent check-in FK unresolvable for receipt_no={} \
+                         legacy_cin_no={legacy_cin_no} — holding watermark for \
+                         loud retry (receipts have no re-fire source)",
+                        p.receipt_no
+                    ),
+                });
             }
         };
 

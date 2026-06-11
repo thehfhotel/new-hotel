@@ -1,23 +1,38 @@
-//! MSSQL session-scoped tagging for loop-prevention.
+//! MSSQL session-scoped tagging — observability marker, NOT a CT
+//! filter input (corrected 2026-06-11, audit P1 #5).
 //!
-//! Per `docs/architecture.md` §3.6c / §3.6d and the Phase 5 plan:
-//! every writeback session starts by tagging itself with a 2-byte
-//! `CONTEXT_INFO` value (`0x4E48` = ASCII `"NH"` for *New Hotel*).
-//! SQL Server Change Tracking surfaces that value as
-//! `SYS_CHANGE_CONTEXT` on every row mutated by the session.
+//! Every writeback session tags itself with a 2-byte `CONTEXT_INFO`
+//! value (`0x4E48` = ASCII `"NH"` for *New Hotel*).
 //!
-//! The CT watcher (`bin/sync.rs`) filters those rows out:
-//! ```sql
-//! WHERE ct.SYS_CHANGE_CONTEXT IS NULL
-//!    OR ct.SYS_CHANGE_CONTEXT <> 0x4E48
-//! ```
-//! preventing a feedback loop where our writeback fires CT, the watcher
-//! re-detects it, re-publishes the event, and the writeback fires again.
+//! ## What this does NOT do
 //!
-//! Belt-and-suspenders: the mappers in 5.2+ are written as idempotent
-//! UPSERTs against PG, so a missed tag costs at most one extra cycle of
-//! work — never an infinite loop. This call is the cheap first line of
-//! defence; the UPSERTs are the safety net.
+//! The original Phase 5 design assumed SQL Server Change Tracking
+//! surfaces this value as `SYS_CHANGE_CONTEXT`, and the CT watcher
+//! filtered on it for loop-prevention. That assumption was WRONG:
+//! `SET CONTEXT_INFO` never populates `SYS_CHANGE_CONTEXT` — only the
+//! per-statement `WITH CHANGE_TRACKING_CONTEXT (@ctx)` table hint
+//! does, and nothing in this codebase uses it. Every writeback CT row
+//! always arrived with `SYS_CHANGE_CONTEXT IS NULL` and passed the
+//! filter; the predicate was inert and has been removed from the
+//! watcher's queries (`bin/sync.rs::build_ct_changes_sql`).
+//!
+//! **Loop-prevention actually lives in the mappers**: every 5.2+ mapper
+//! is an idempotent UPSERT against PG, so re-detecting our own write
+//! converges to a no-op and emits no event. That was always the
+//! load-bearing mechanism — the "belt-and-suspenders safety net" was
+//! the only belt.
+//!
+//! Do NOT adopt `WITH CHANGE_TRACKING_CONTEXT` + a filter to "restore"
+//! SQL-layer suppression: CT coalesces per-PK to the LATEST change's
+//! context, so a genuine iHOTEL edit racing a writeback touch on the
+//! same row would inherit our tag and be silently filtered — the exact
+//! June-3 loss class, manufactured at the SQL layer.
+//!
+//! ## Why the tag is kept
+//!
+//! `sys.dm_exec_sessions.context_info` shows the human-readable `NH`
+//! marker, letting operators distinguish our writeback sessions from
+//! iHOTEL clients during incident triage on the shared server.
 //!
 //! The chokepoint that calls this is `writeback::dispatcher::dispatch`
 //! — it is the *single* entry point through which every recipe runs, so
@@ -35,8 +50,9 @@ type LegacyConn<'a> = PooledConnection<'a, ConnectionManager>;
 /// Issue `SET CONTEXT_INFO 0x4E48` on the supplied connection.
 ///
 /// Two bytes — `0x4E` = `'N'`, `0x48` = `'H'` — chosen to be human-
-/// readable in `sys.dm_exec_sessions.context_info` and trivial to filter
-/// from `CHANGETABLE(CHANGES …).SYS_CHANGE_CONTEXT`.
+/// readable in `sys.dm_exec_sessions.context_info`. (It does NOT reach
+/// `CHANGETABLE(CHANGES …).SYS_CHANGE_CONTEXT` — see the module doc;
+/// the tag is an operator-triage marker only.)
 ///
 /// The value is session-scoped: it persists on the bb8 connection until
 /// the connection is reset / dropped or another `SET CONTEXT_INFO` runs.

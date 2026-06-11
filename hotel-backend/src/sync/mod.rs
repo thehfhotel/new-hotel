@@ -24,13 +24,17 @@
 //!   `crate::scheduler::sync` and lands in 5.5.
 //! - No mirror-schema writes — Phase 5.5 (`legacy_mirror`).
 //!
-//! ## Loop-prevention companion
+//! ## Loop-prevention companion (corrected 2026-06-11)
 //!
-//! The watcher's MSSQL `SELECT … FROM CHANGETABLE(CHANGES …)` filters
-//! out rows whose `SYS_CHANGE_CONTEXT = 0x4E48` — the tag stamped by
-//! `crate::db::mssql_session::set_context_info` at the top of the
-//! writeback dispatcher. Together they prevent a feedback loop between
-//! the writeback worker and the CT watcher.
+//! Echo absorption — preventing a feedback loop between the writeback
+//! worker and the CT watcher — comes from **mapper idempotency**: every
+//! mapper is an idempotent UPSERT, so re-detecting our own writeback's
+//! CT row converges to a no-op and emits no event. The historical
+//! `SYS_CHANGE_CONTEXT <> 0x4E48` filter in the watcher's CHANGETABLE
+//! queries was inert (`SET CONTEXT_INFO` never populates
+//! `SYS_CHANGE_CONTEXT`) and has been removed — see
+//! `crate::db::mssql_session` for the full correction and why a
+//! "proper" SQL-layer filter must NOT be added.
 
 pub mod backfill;
 pub mod change_op;

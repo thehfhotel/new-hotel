@@ -34,13 +34,16 @@
 //! ## Checkout side-effect on the parent booking
 //!
 //! When *every* `HT_CheckIn_Ds` row carries `Cin_Room_Status='Check-Out'`,
-//! the legacy app also flips `HT_Book_H.Book_Status='ออกแล้ว'` on the
-//! parent booking. Our PG-side `book_status` mirrors that via the
-//! booking mapper's `legacy_status_to_pg('ออกแล้ว')` → `'completed'`.
-//! To pick the change up promptly (instead of waiting for the next CT
-//! tick that surfaces `HT_Book_H`), the check-in mapper triggers a
-//! one-shot re-projection of the parent booking after publishing the
-//! `CheckOutCompleted` event. The call uses the same TX so the two
+//! the parent booking should read `'completed'` on our side. NOTE
+//! (corrected 2026-06-11): iHOTEL's own checkout flow NEVER touches
+//! `HT_Book_H` — the `Book_Status='ออกแล้ว'` literal is written only by
+//! OUR writeback checkout recipe (`writeback/recipes/checkout.rs`), so
+//! a checkout performed inside iHOTEL leaves `HT_Book_H.Book_Status`
+//! at its pre-checkout value. The one-shot re-projection of the parent
+//! booking below simply re-mirrors whatever `HT_Book_H` currently says
+//! (it picks up `'ออกแล้ว'` promptly when our own writeback stamped it;
+//! for a pure-iHOTEL checkout the header keeps its prior status and the
+//! re-projection is a no-op). The call uses the same TX so the two
 //! UPSERTs commit atomically.
 
 use async_trait::async_trait;
@@ -55,8 +58,8 @@ use crate::sync::change_op::ChangeOp;
 use crate::sync::mapper::MssqlChangeMapper;
 use crate::sync::mappers::booking::apply_booking_aggregate;
 use crate::sync::mappers::customer::{
-    upsert_customer_from_row, EAGER_FETCH_COLUMNS as CUSTOMER_EAGER_FETCH_COLUMNS,
-    TABLE as HT_CUSTOMERS,
+    ensure_deleted_customer_sentinel, upsert_customer_from_row, DELETED_CUSTOMER_SENTINEL,
+    EAGER_FETCH_COLUMNS as CUSTOMER_EAGER_FETCH_COLUMNS, TABLE as HT_CUSTOMERS,
 };
 use crate::sync::parent_loader::{load_booking_aggregate, CheckInAggregate};
 use crate::sync::resolve;
@@ -183,6 +186,13 @@ struct ExistingCheckIn {
     cin_total_amount: Option<f64>,
     cin_paid_amount: Option<f64>,
     cin_checkout_time: Option<NaiveDateTime>,
+    /// Denormalised customer pointer — compared by `existing_matches`
+    /// since 2026-06-11 (audit P1 #6): iHOTEL's customer-delete cascade
+    /// rewrites `HT_CheckIn_H.Cin_cust_no` to `'C0000'` WITHOUT touching
+    /// status or amounts, so a status/amount-only comparison silently
+    /// skipped the re-point and the canonical row kept referencing the
+    /// deleted customer forever.
+    legacy_cust_no: Option<String>,
 }
 
 /// Canonical PG-shape projection of the legacy aggregate. This is what
@@ -272,10 +282,14 @@ struct CanonicalRoom {
 ///
 /// Returns:
 /// * `Ok(Some(DomainEvent))` when the canonical row genuinely changed.
-/// * `Ok(None)` when the canonical row already mirrors the legacy
-///   aggregate (idempotent skip), OR when an FK resolver deferred the
-///   apply (caller's `legacy_sync_status` counters reflect this as a
-///   skipped row, not a failure).
+/// * `Ok(None)` ONLY for genuine idempotent skips (the canonical row
+///   already mirrors the legacy aggregate).
+/// * `Err(SyncError::Mapper)` when an FK cannot be resolved even after
+///   the eager-mirror fallback. The watcher's per-key handler records
+///   the error and HOLDS the watermark so the row is loudly retried —
+///   never silently dropped. (Pre-2026-06-11 these paths returned
+///   `Ok(None)`, which the watcher counted as `skipped` while the
+///   watermark advanced: the June-3 silent-drop class.)
 pub async fn apply_checkin_aggregate(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     mssql: Option<&DbPool>,
@@ -316,46 +330,85 @@ pub async fn apply_checkin_aggregate(
     // row — there's nothing else to mirror.
     //
     // Guard: only short-circuit when the canonical row already exists.
-    // If it doesn't, the cancellation is legitimately deferred (we need
-    // to wait for the original INSERT CT row to land first).
+    // When it does NOT exist, this is a cancellation of a folio we never
+    // mirrored. We cannot INSERT a cancelled canonical row (the legacy
+    // cancel cascade deletes every Ds row, so there is no room FK to
+    // satisfy `cin_room_id NOT NULL`), and erroring would wedge the
+    // watermark forever on a folio that carries no recoverable state.
+    // This is a deliberate, logged skip — NOT the silent FK-defer class:
+    // there is nothing to converge (legacy says cancelled, PG has no
+    // row; absence ≙ cancelled for every reader). Under the 2026-06-11
+    // error-on-defer regime the original INSERT can no longer be
+    // silently dropped, so this branch only fires for folios created and
+    // cancelled before their first successful mirror (e.g. within one
+    // tick window, or pre-CT-bootstrap history).
     if projection.cin_status == "cancelled" {
         if let Some(ex) = existing.as_ref() {
             return apply_cancelled_for_present_header(tx, ex, cin_no).await;
         }
+        if projection.legacy_room_no.is_none() {
+            tracing::info!(
+                cin_no,
+                "ht_checkins apply: cancelled folio was never mirrored and \
+                 carries no HT_CheckIn_Ds rows — skipping (no canonical row \
+                 to cancel, no room FK left to mirror one)"
+            );
+            return Ok(None);
+        }
+        // Cancelled, never mirrored, but Ds rows still present (header
+        // cancel with stale Ds rows) — fall through to FK resolution so
+        // the cancelled canonical row is inserted for audit completeness.
     }
 
-    // Resolve FKs. Defer-on-missing per `sync::resolve` contract — with
-    // one targeted exception for customers (see
-    // `resolve_customer_or_eager_mirror` rationale): a deferred customer
-    // FK previously stranded the checkin row forever because the
-    // watermark advanced past the deferred row and never re-read it.
-    // The eager-mirror path pulls the matching `HT_Customers` row from
-    // MSSQL synchronously, INSERTs it into canonical `ht_customers` in
-    // the same TX, then retries the FK lookup.
+    // Resolve FKs. A miss MUST NOT fall through to `Ok(None)` — the
+    // watcher counts that as `skipped` and advances the watermark, so
+    // the row would be permanently dropped once CT retention (2 days)
+    // ages it out (the 2026-06-03 incident class). Strategy per FK:
+    //
+    // * customer — eager-mirror from `HT_Customers` via MSSQL in the
+    //   same TX, retry the lookup; error only if the customer is
+    //   genuinely absent in MSSQL too (or no pool is available).
+    // * room — no eager-mirror path exists (room creation is an
+    //   operator action); error so the watermark holds until the
+    //   operator runs `bin/backfill_rooms`.
+    // * booking — eager-mirror the parent booking aggregate from MSSQL
+    //   (it may itself eager-mirror its customer); error on miss.
     let cust_id =
         match resolve_customer_or_eager_mirror(tx, mssql, projection.legacy_cust_no.as_deref())
             .await?
         {
             Some(id) => id,
-            None => return Ok(None),
+            None => {
+                return Err(SyncError::Mapper {
+                    table: HT_CHECKIN_H,
+                    message: format!(
+                        "customer FK unresolvable for cin_no={cin_no} \
+                         legacy_cust_no={:?} — eager-mirror failed or no MSSQL \
+                         pool; holding watermark for loud retry",
+                        projection.legacy_cust_no
+                    ),
+                });
+            }
         };
     let room_id = match resolve::resolve_room_id(tx, projection.legacy_room_no.as_deref())
         .await?
     {
         Some(id) => id,
         None => {
-            tracing::warn!(
-                cin_no,
-                legacy_room_no = ?projection.legacy_room_no,
-                "ht_checkins apply deferred: room not yet mirrored \
-                 (run bin/backfill_rooms?)"
-            );
-            return Ok(None);
+            return Err(SyncError::Mapper {
+                table: HT_CHECKIN_H,
+                message: format!(
+                    "room FK unresolvable for cin_no={cin_no} \
+                     legacy_room_no={:?} — run bin/backfill_rooms; holding \
+                     watermark for loud retry",
+                    projection.legacy_room_no
+                ),
+            });
         }
     };
-    // Booking is OPTIONAL — walk-ins write `Cin_Book_no=''`. Only defer
-    // when the legacy carries a non-empty `Cin_Book_no` AND the parent
-    // booking row hasn't landed yet.
+    // Booking is OPTIONAL — walk-ins write `Cin_Book_no=''`. Only the
+    // case where the legacy carries a non-empty `Cin_Book_no` AND the
+    // parent booking row hasn't landed yet needs resolution work.
     //
     // Track E1 / T2 MED-4 (audit 2026-05-13) — the walk-in short-circuit
     // matches BOTH `Some("")` (legitimate walk-in) AND `None` (the
@@ -366,15 +419,17 @@ pub async fn apply_checkin_aggregate(
     // distinguish the two cases in production trace output.
     let book_id_opt = match projection.legacy_book_id.as_deref() {
         Some(id) if !id.is_empty() => {
-            match resolve::resolve_booking_id(tx, Some(id)).await? {
+            match resolve_booking_or_eager_mirror(tx, mssql, cin_no, id).await? {
                 Some(found) => Some(found),
                 None => {
-                    tracing::warn!(
-                        cin_no,
-                        legacy_book_id = id,
-                        "ht_checkins apply deferred: parent booking not yet mirrored"
-                    );
-                    return Ok(None);
+                    return Err(SyncError::Mapper {
+                        table: HT_CHECKIN_H,
+                        message: format!(
+                            "parent booking FK unresolvable for cin_no={cin_no} \
+                             legacy_book_id={id} — eager-mirror failed or no \
+                             MSSQL pool; holding watermark for loud retry"
+                        ),
+                    });
                 }
             }
         }
@@ -393,12 +448,21 @@ pub async fn apply_checkin_aggregate(
 
     // Track B2 / T2 CRIT-1 — resolve every per-room FK BEFORE we mutate
     // canonical state. If any room is missing in `ht_rooms_new` the
-    // entire apply defers so the next CT tick can retry against a fully
-    // resolvable aggregate. This mirrors the customer / booking FK
-    // resolution pattern already in use above.
+    // entire apply errors so the watermark holds and the next tick
+    // retries against a fully resolvable aggregate (rooms have no
+    // eager-mirror path — operator must run `bin/backfill_rooms`).
     let resolved_rooms = match resolve_canonical_rooms(tx, &projection.rooms).await? {
         Some(rs) => rs,
-        None => return Ok(None),
+        None => {
+            return Err(SyncError::Mapper {
+                table: HT_CHECKIN_DS,
+                message: format!(
+                    "per-room FK unresolvable for cin_no={cin_no} — at least \
+                     one HT_CheckIn_Ds room is missing in ht_rooms_new (run \
+                     bin/backfill_rooms); holding watermark for loud retry"
+                ),
+            });
+        }
     };
 
     let (cin_id_serial, agg_id, was_insert) = match existing {
@@ -540,8 +604,11 @@ async fn apply_cancelled(
 }
 
 /// Re-project the parent booking aggregate. Best-effort: failures here
-/// are logged but don't roll back the check-in apply (the next CT tick
-/// will pick up the booking change anyway).
+/// are logged but don't roll back the check-in apply. Unlike an FK
+/// defer, a failure here is NOT a lost row — the canonical booking row
+/// already exists (the check-in resolved its FK against it); only its
+/// status convergence is delayed until any future `HT_Book_H` CT touch
+/// or reconcile sweep.
 async fn reproject_parent_booking(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     mssql: &DbPool,
@@ -553,18 +620,21 @@ async fn reproject_parent_booking(
             tracing::warn!(
                 book_id,
                 error = %err,
-                "checkout side-effect: failed to reload parent booking; \
-                 next CT tick will catch it"
+                "checkout side-effect: failed to reload parent booking \
+                 (best-effort; canonical booking row already exists — only \
+                 status convergence is delayed)"
             );
             return Ok(());
         }
     };
-    if let Err(err) = apply_booking_aggregate(tx, &agg, book_id).await {
+    if let Err(err) = apply_booking_aggregate(tx, Some(mssql), &agg, book_id).await {
         tracing::warn!(
             book_id,
             error = %err,
-            "checkout side-effect: failed to re-project parent booking; \
-             next CT tick will catch it"
+            "checkout side-effect: failed to re-project parent booking \
+             (best-effort only — the canonical booking row already exists, \
+             so this is a stale-status window, not a lost row; any future \
+             HT_Book_H CT touch re-converges it)"
         );
     }
     Ok(())
@@ -596,26 +666,31 @@ pub enum CustomerSource<'a> {
     Stub(Box<dyn Fn(&str) -> Option<HashMapRow> + Send + Sync + 'a>),
 }
 
-/// Resolve `cin_cust_id` via the standard canonical lookup; on miss,
+/// Resolve a customer FK via the standard canonical lookup; on miss,
 /// eagerly mirror the referenced `HT_Customers` row from MSSQL into
 /// `ht_customers` and retry. Returns `Ok(Some(id))` on success and
-/// `Ok(None)` only for legitimate defers (no `legacy_cust_no` on the
-/// projection, no MSSQL pool available, or the customer is truly
-/// missing in MSSQL too).
+/// `Ok(None)` when no resolution is possible (no `legacy_cust_no`, no
+/// MSSQL pool available, or the customer is truly missing in MSSQL
+/// too). **Callers must convert that `None` into an error** so the
+/// watcher holds the watermark — see `sync::resolve` module doc.
+///
+/// Shared by the check-in AND booking aggregate appliers (`pub(crate)`
+/// since 2026-06-11 — the booking mapper's bare defer was the June-3
+/// silent-drop root cause).
 ///
 /// ## Why eager-mirror instead of defer
 ///
 /// The CT watermark advances past a deferred row, so a `legacy_cust_no`
 /// that hasn't been mirrored yet would never trigger a re-read of the
-/// checkin row. Recovery was accidental — it depended on a later CT
-/// update for the same checkin re-firing the aggregate load. Production
+/// dependent row. Recovery was accidental — it depended on a later CT
+/// update for the same aggregate re-firing the load. Production
 /// log lines like `ht_checkins apply deferred: customer not yet
 /// mirrored cin_no="CH26-001061" legacy_cust_no=Some("C1951")` are the
 /// observable form of that bug. The eager-mirror path closes the
-/// window: if the checkin references a customer, that customer MUST
-/// exist in MSSQL (the legacy app inserts it before pointing the
-/// checkin at it), so a synchronous fetch is always safe.
-async fn resolve_customer_or_eager_mirror(
+/// window: if the checkin/booking references a customer, that customer
+/// MUST exist in MSSQL (the legacy app inserts it before pointing the
+/// dependent row at it), so a synchronous fetch is always safe.
+pub(crate) async fn resolve_customer_or_eager_mirror(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     mssql: Option<&DbPool>,
     legacy_cust_no: Option<&str>,
@@ -625,12 +700,23 @@ async fn resolve_customer_or_eager_mirror(
         return Ok(Some(id));
     }
 
+    // iHOTEL's customer-delete cascade rewrites dependent rows to the
+    // reserved `'C0000'` sentinel, which has NO real `HT_Customers` row
+    // (cheatsheet §3.24) — an eager MSSQL fetch can never satisfy it
+    // and erroring would wedge the watermark on every delete cascade.
+    // Materialise the canonical tombstone placeholder instead.
+    if legacy_cust_no == Some(DELETED_CUSTOMER_SENTINEL) {
+        let id = ensure_deleted_customer_sentinel(tx).await?;
+        return Ok(Some(id));
+    }
+
     // Need a Cust_no AND an MSSQL pool to attempt the eager fetch.
     let (Some(cust_no), Some(pool)) = (legacy_cust_no, mssql) else {
         tracing::warn!(
             legacy_cust_no = ?legacy_cust_no,
-            "ht_checkins apply deferred: customer not yet mirrored \
-             (no legacy_cust_no or no MSSQL pool available)"
+            "customer FK unresolvable: not yet mirrored and eager-mirror \
+             impossible (no legacy_cust_no or no MSSQL pool) — caller will \
+             error to hold the watermark"
         );
         return Ok(None);
     };
@@ -654,11 +740,12 @@ async fn resolve_customer_via_eager_mirror(
     let Some(row) = fetched else {
         // Truly missing in MSSQL — should not happen under the legacy
         // app's own ordering invariant, but be defensive. Distinct log
-        // message so production can tell the two cases apart.
+        // message so production can tell the two cases apart. The
+        // caller converts this `None` into an error (watermark hold).
         tracing::warn!(
             legacy_cust_no = cust_no,
-            "ht_checkins apply deferred: customer not in MSSQL \
-             — leaving checkin deferred"
+            "customer FK unresolvable: not in MSSQL either — caller will \
+             error to hold the watermark"
         );
         return Ok(None);
     };
@@ -667,9 +754,77 @@ async fn resolve_customer_via_eager_mirror(
     tracing::debug!(
         legacy_cust_no = cust_no,
         cust_id,
-        "ht_checkins apply: eagerly mirrored referenced customer from MSSQL"
+        "eagerly mirrored referenced customer from MSSQL"
     );
     Ok(Some(cust_id))
+}
+
+/// Resolve a check-in's parent-booking FK; on miss, eagerly mirror the
+/// whole booking aggregate from MSSQL (header + Ds + Date) in the same
+/// TX via [`apply_booking_aggregate`] and retry the lookup. The booking
+/// apply may in turn eager-mirror ITS customer — the full dependency
+/// chain materialises in one watcher tick instead of silently dropping.
+///
+/// Returns `Ok(None)` when the booking cannot be resolved even after
+/// the eager attempt (no MSSQL pool, the booking is genuinely absent in
+/// MSSQL, or its own FK chain is unresolvable). **Callers must convert
+/// that `None` into an error** so the watermark holds (see
+/// `sync::resolve` module doc — the pre-2026-06-11 `Ok(None)` defer
+/// here was a member of the June-3 silent-drop class).
+async fn resolve_booking_or_eager_mirror(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    mssql: Option<&DbPool>,
+    cin_no: &str,
+    legacy_book_id: &str,
+) -> Result<Option<i32>, SyncError> {
+    // Fast path — canonical row already there.
+    if let Some(id) = resolve::resolve_booking_id(tx, Some(legacy_book_id)).await? {
+        return Ok(Some(id));
+    }
+
+    let Some(pool) = mssql else {
+        tracing::warn!(
+            cin_no,
+            legacy_book_id,
+            "parent booking FK unresolvable: not yet mirrored and no MSSQL \
+             pool for eager-mirror — caller will error to hold the watermark"
+        );
+        return Ok(None);
+    };
+
+    let agg = match load_booking_aggregate(pool, legacy_book_id).await {
+        Ok(a) => a,
+        Err(err) => {
+            tracing::warn!(
+                cin_no,
+                legacy_book_id,
+                error = %err,
+                "parent booking eager-mirror: aggregate load from MSSQL \
+                 failed — caller will error to hold the watermark"
+            );
+            return Ok(None);
+        }
+    };
+    if let Err(err) = apply_booking_aggregate(tx, Some(pool), &agg, legacy_book_id).await {
+        tracing::warn!(
+            cin_no,
+            legacy_book_id,
+            error = %err,
+            "parent booking eager-mirror: apply failed — caller will error \
+             to hold the watermark"
+        );
+        return Ok(None);
+    }
+
+    let resolved = resolve::resolve_booking_id(tx, Some(legacy_book_id)).await?;
+    if resolved.is_some() {
+        tracing::debug!(
+            cin_no,
+            legacy_book_id,
+            "eagerly mirrored parent booking aggregate from MSSQL"
+        );
+    }
+    Ok(resolved)
 }
 
 /// Test seam for integration tests: lets the integration suite exercise
@@ -1057,6 +1212,20 @@ fn derive_room_state(
 ///    - the still-active Ds rows have no `Cin_Room_Out` populated yet
 ///      (the legacy app sets `Cin_Room_Out` only after the user picks
 ///      a checkout time — until then it's NULL).
+///
+/// NULL-tolerance on `Cin_Date_Out` (2026-06-11, audit P2): a single
+/// malformed legacy folio with `Cin_Date_Out IS NULL` used to hard-error
+/// here. Under the error-on-defer regime a hard error holds the
+/// HT_CheckIn_* watermark, so ONE bad folio would wedge ALL check-in
+/// sync permanently. Fall back instead — loudly — through:
+///
+/// 1. max `Cin_Room_Out` across still-active Ds rows (normal path),
+/// 2. max `Cin_Room_Out` across ALL Ds rows (even checked-out ones),
+/// 3. `Cin_Date_in`'s date (zero-night shape — the row stays visible
+///    and the reconcile sweep flags it if iHOTEL later repairs it).
+///
+/// Only a NULL `Cin_Date_in` (truly unusable — no stay start) still
+/// errors.
 fn derive_stay_range(
     header: &dyn MappableRow,
     rooms: &[HashMapRow],
@@ -1067,16 +1236,25 @@ fn derive_stay_range(
             table: HT_CHECKIN_H,
             message: "Cin_Date_in is NULL on header".into(),
         })?;
-    let header_date_out: NaiveDateTime = header
-        .try_get_datetime("Cin_Date_Out")?
-        .ok_or_else(|| SyncError::Mapper {
-            table: HT_CHECKIN_H,
-            message: "Cin_Date_Out is NULL on header".into(),
-        })?;
+    let header_date_out: Option<NaiveDateTime> = header.try_get_datetime("Cin_Date_Out")?;
 
-    let expected_checkout = max_room_out_among_active(rooms)?
-        .map(|dt| dt.date())
-        .unwrap_or_else(|| header_date_out.date());
+    let expected_checkout = match (max_room_out_among_active(rooms)?, header_date_out) {
+        (Some(active_max), _) => active_max.date(),
+        (None, Some(h)) => h.date(),
+        (None, None) => {
+            // Malformed legacy folio — keep it loud but never wedge the
+            // watermark over one bad row.
+            let any_room_out = max_room_out_any(rooms)?;
+            tracing::warn!(
+                fallback = ?any_room_out,
+                "HT_CheckIn_H.Cin_Date_Out is NULL — falling back to max \
+                 Cin_Room_Out across all Ds rows, else Cin_Date_in (malformed \
+                 legacy folio; pre-2026-06-11 this hard-errored and would now \
+                 wedge the checkin watermark)"
+            );
+            any_room_out.map(|dt| dt.date()).unwrap_or_else(|| date_in.date())
+        }
+    };
 
     Ok((date_in, expected_checkout))
 }
@@ -1100,6 +1278,20 @@ fn max_room_out_among_active(
     Ok(latest)
 }
 
+/// Largest `Cin_Room_Out` across ALL Ds rows regardless of status. Last
+/// resort for the NULL-`Cin_Date_Out` malformed-folio fallback in
+/// [`derive_stay_range`] — checked-out rows carry the actual departure
+/// timestamp, which beats inventing a date.
+fn max_room_out_any(rooms: &[HashMapRow]) -> Result<Option<NaiveDateTime>, SyncError> {
+    let mut latest: Option<NaiveDateTime> = None;
+    for r in rooms {
+        if let Some(out) = r.try_get_datetime("Cin_Room_Out")? {
+            latest = Some(latest.map_or(out, |existing| existing.max(out)));
+        }
+    }
+    Ok(latest)
+}
+
 // -----------------------------------------------------------------------------
 // PG access
 // -----------------------------------------------------------------------------
@@ -1115,9 +1307,11 @@ async fn fetch_existing(
         Option<f64>,
         Option<f64>,
         Option<NaiveDateTime>,
+        Option<String>,
     )>(
         "SELECT cin_id, aggregate_id, cin_status, \
-                cin_total_amount::float8, cin_paid_amount::float8, cin_checkout_time \
+                cin_total_amount::float8, cin_paid_amount::float8, cin_checkout_time, \
+                legacy_cust_no \
            FROM ht_checkins \
           WHERE legacy_cin_no = $1 \
           LIMIT 1",
@@ -1127,22 +1321,33 @@ async fn fetch_existing(
     .await?;
 
     Ok(row.map(
-        |(cin_id, aggregate_id, cin_status, total, paid, checkout)| ExistingCheckIn {
-            cin_id,
-            aggregate_id,
-            cin_status,
-            cin_total_amount: total,
-            cin_paid_amount: paid,
-            cin_checkout_time: checkout,
+        |(cin_id, aggregate_id, cin_status, total, paid, checkout, legacy_cust_no)| {
+            ExistingCheckIn {
+                cin_id,
+                aggregate_id,
+                cin_status,
+                cin_total_amount: total,
+                cin_paid_amount: paid,
+                cin_checkout_time: checkout,
+                legacy_cust_no,
+            }
         },
     ))
 }
 
 fn existing_matches(ex: &ExistingCheckIn, p: &CanonicalCheckIn) -> bool {
+    // `legacy_cust_no` comparison is guarded on the projection carrying a
+    // value: `update_existing` writes it through `COALESCE($12,
+    // legacy_cust_no)`, so a transient NULL on the legacy side never
+    // overwrites — comparing a None projection against a Some canonical
+    // value would force a re-apply every tick without ever converging.
+    // A Some projection (including the `'C0000'` delete-cascade sentinel)
+    // MUST match, or the apply re-runs and re-points the FK.
     ex.cin_status.as_deref() == Some(p.cin_status.as_str())
         && ex.cin_total_amount == p.total_amount
         && ex.cin_paid_amount == p.paid_amount
         && ex.cin_checkout_time == p.cin_checkout_time
+        && (p.legacy_cust_no.is_none() || ex.legacy_cust_no == p.legacy_cust_no)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1270,10 +1475,12 @@ struct ResolvedRoom {
 }
 
 /// Resolve `cr_room_id` for every projection room. Returns `None` if
-/// any room is still missing in `ht_rooms_new` — the caller defers the
-/// entire apply so the next CT tick can retry against a fully
-/// resolvable aggregate. Empty input → empty output (a folio with no
-/// `HT_CheckIn_Ds` rows is legitimate transient state).
+/// any room is still missing in `ht_rooms_new` — the caller converts
+/// that into an error so the watermark holds and the next tick retries
+/// against a fully resolvable aggregate (rooms have no eager-mirror
+/// path; the operator must run `bin/backfill_rooms`). Empty input →
+/// empty output (a folio with no `HT_CheckIn_Ds` rows is legitimate
+/// transient state).
 async fn resolve_canonical_rooms(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     projection_rooms: &[CanonicalRoom],
@@ -1288,8 +1495,9 @@ async fn resolve_canonical_rooms(
             None => {
                 tracing::warn!(
                     legacy_room_no = %room.legacy_room_no,
-                    "ht_checkin_rooms apply deferred: room not yet mirrored \
-                     (run bin/backfill_rooms?)"
+                    "ht_checkin_rooms room not mirrored (run \
+                     bin/backfill_rooms) — caller will error to hold the \
+                     watermark"
                 );
                 return Ok(None);
             }
@@ -1532,15 +1740,33 @@ fn build_event(
     }
 }
 
+/// Convert a legacy MSSQL datetime — Bangkok wall-clock stored without
+/// timezone info — to a real UTC instant for `DomainEvent` snapshots.
+///
+/// Fixed 2026-06-11 (audit P2 "timezone mislabels"): the previous
+/// implementation stamped the Bangkok wall-clock digits as UTC
+/// (`Utc.from_utc_datetime`), so every event snapshot was 7 hours in
+/// the future. Subscribers re-fetch canonical rows for display, so no
+/// stored data was wrong — but anything comparing snapshot instants
+/// against real `Utc::now()` (e.g. event-lag dashboards) saw phantom
+/// skew. `+07:00` is a fixed offset (Thailand has no DST), so
+/// `single()` is always `Some`; the `expect` documents that invariant.
 fn naive_dt_to_utc(dt: NaiveDateTime) -> chrono::DateTime<chrono::Utc> {
     use chrono::TimeZone;
-    chrono::Utc.from_utc_datetime(&dt)
+    let bangkok = chrono::FixedOffset::east_opt(7 * 3600).expect("+07:00 is a valid offset");
+    bangkok
+        .from_local_datetime(&dt)
+        .single()
+        .expect("fixed offsets have no DST gaps/folds")
+        .with_timezone(&chrono::Utc)
 }
 
+/// Date-only variant of [`naive_dt_to_utc`]: midnight Bangkok → UTC
+/// (= 17:00 the previous day). See that function for the 2026-06-11
+/// mislabel fix rationale.
 fn naive_date_to_utc(date: NaiveDate) -> chrono::DateTime<chrono::Utc> {
-    use chrono::TimeZone;
     let midnight = chrono::NaiveTime::from_hms_opt(0, 0, 0).expect("hardcoded midnight");
-    chrono::Utc.from_utc_datetime(&date.and_time(midnight))
+    naive_dt_to_utc(date.and_time(midnight))
 }
 
 // =============================================================================
@@ -1902,6 +2128,83 @@ mod tests {
         );
     }
 
+    // ----- NULL Cin_Date_Out tolerance (2026-06-11, audit P2) -------------
+
+    /// A malformed legacy folio with `Cin_Date_Out IS NULL` used to
+    /// hard-error projection. Under error-on-defer that would wedge the
+    /// HT_CheckIn_* watermark on ONE bad folio forever. Fallback chain:
+    /// max Ds `Cin_Room_Out` first…
+    #[test]
+    fn derive_stay_range_null_header_out_falls_back_to_ds_room_out() {
+        let mut header = header_row("CH26-009999", "C21607", "ปกติ");
+        header.cells.insert("Cin_Date_Out".into(), MockValue::Null);
+        let rooms = vec![ds_row_with_room_out(
+            "CH26-009999",
+            "402",
+            CIN_ROOM_STATUS_CHECKED_OUT,
+            dt(2026, 6, 2, 11, 0),
+        )];
+        let (_, expected_out) =
+            derive_stay_range(&header, &rooms).expect("NULL Cin_Date_Out must not error");
+        assert_eq!(
+            expected_out,
+            chrono::NaiveDate::from_ymd_opt(2026, 6, 2).unwrap(),
+            "checked-out Ds Cin_Room_Out is the best available fallback"
+        );
+    }
+
+    /// …then `Cin_Date_in` when no Ds row carries a date either
+    /// (zero-night shape — row stays mirrored and visible).
+    #[test]
+    fn derive_stay_range_null_header_out_falls_back_to_date_in() {
+        let mut header = header_row("CH26-009998", "C21607", "ปกติ");
+        header.cells.insert("Cin_Date_Out".into(), MockValue::Null);
+        let rooms = vec![ds_row("CH26-009998", "402", "เข้าพัก")]; // Cin_Room_Out NULL
+        let (date_in, expected_out) =
+            derive_stay_range(&header, &rooms).expect("NULL Cin_Date_Out must not error");
+        assert_eq!(expected_out, date_in.date());
+    }
+
+    /// NULL `Cin_Date_in` is still a hard error — there is genuinely no
+    /// stay start to mirror.
+    #[test]
+    fn derive_stay_range_null_date_in_still_errors() {
+        let mut header = header_row("CH26-009997", "C21607", "ปกติ");
+        header.cells.insert("Cin_Date_in".into(), MockValue::Null);
+        let err = derive_stay_range(&header, &[]).expect_err("no stay start → unusable");
+        assert!(err.to_string().contains("Cin_Date_in"));
+    }
+
+    // ----- DomainEvent snapshot timezone (2026-06-11, audit P2) -----------
+
+    /// Legacy datetimes are Bangkok wall-clock. The snapshot conversion
+    /// must shift them −7h to a real UTC instant (pre-fix the digits
+    /// were stamped as UTC verbatim, putting every snapshot 7h in the
+    /// future).
+    #[test]
+    fn naive_dt_to_utc_shifts_bangkok_wall_clock_minus_seven_hours() {
+        let wall = dt(2026, 6, 11, 14, 30); // 14:30 Bangkok
+        let utc = naive_dt_to_utc(wall);
+        assert_eq!(
+            utc,
+            chrono::DateTime::parse_from_rfc3339("2026-06-11T07:30:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        );
+    }
+
+    /// Midnight Bangkok = 17:00 UTC the previous day.
+    #[test]
+    fn naive_date_to_utc_is_previous_day_seventeen_hundred_utc() {
+        let utc = naive_date_to_utc(chrono::NaiveDate::from_ymd_opt(2026, 6, 11).unwrap());
+        assert_eq!(
+            utc,
+            chrono::DateTime::parse_from_rfc3339("2026-06-10T17:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        );
+    }
+
     /// End-to-end through `project_aggregate`: the extension date must
     /// land on the canonical projection's `cin_expected_checkout`.
     #[test]
@@ -2156,46 +2459,69 @@ mod tests {
         }
     }
 
+    /// Existing canonical row exactly mirroring `p` — tests mutate one
+    /// field at a time.
+    fn make_existing(p: &CanonicalCheckIn) -> ExistingCheckIn {
+        ExistingCheckIn {
+            cin_id: 1,
+            aggregate_id: Some(uuid::Uuid::nil()),
+            cin_status: Some(p.cin_status.clone()),
+            cin_total_amount: p.total_amount,
+            cin_paid_amount: p.paid_amount,
+            cin_checkout_time: p.cin_checkout_time,
+            legacy_cust_no: p.legacy_cust_no.clone(),
+        }
+    }
+
     #[test]
     fn existing_matches_is_true_for_unchanged_row() {
         let p = sample_canonical();
-        let ex = ExistingCheckIn {
-            cin_id: 1,
-            aggregate_id: Some(uuid::Uuid::nil()),
-            cin_status: Some("active".into()),
-            cin_total_amount: Some(890.0),
-            cin_paid_amount: Some(0.0),
-            cin_checkout_time: None,
-        };
+        let ex = make_existing(&p);
         assert!(existing_matches(&ex, &p));
     }
 
     #[test]
     fn existing_matches_is_false_when_status_differs() {
         let p = sample_canonical();
-        let ex = ExistingCheckIn {
-            cin_id: 1,
-            aggregate_id: Some(uuid::Uuid::nil()),
-            cin_status: Some("checkedout".into()),
-            cin_total_amount: Some(890.0),
-            cin_paid_amount: Some(0.0),
-            cin_checkout_time: None,
-        };
+        let mut ex = make_existing(&p);
+        ex.cin_status = Some("checkedout".into());
         assert!(!existing_matches(&ex, &p));
     }
 
     #[test]
     fn existing_matches_is_false_when_paid_amount_differs() {
         let p = sample_canonical();
-        let ex = ExistingCheckIn {
-            cin_id: 1,
-            aggregate_id: Some(uuid::Uuid::nil()),
-            cin_status: Some("active".into()),
-            cin_total_amount: Some(890.0),
-            cin_paid_amount: Some(100.0),
-            cin_checkout_time: None,
-        };
+        let mut ex = make_existing(&p);
+        ex.cin_paid_amount = Some(100.0);
         assert!(!existing_matches(&ex, &p));
+    }
+
+    /// Audit 2026-06-11 P1 #6 — iHOTEL's customer-delete cascade
+    /// (`UPDATE HT_CheckIn_H SET Cin_cust_no='C0000'`, cheatsheet
+    /// §3.24) changes ONLY the customer pointer; pre-fix the
+    /// status/amount-only comparison silently idempotency-skipped it.
+    #[test]
+    fn existing_matches_is_false_when_only_cust_no_changed() {
+        let p = sample_canonical(); // legacy_cust_no = Some("C21607")
+        let mut ex = make_existing(&p);
+        ex.legacy_cust_no = Some("C0000".into());
+        assert!(
+            !existing_matches(&ex, &p),
+            "a cust_no-only change MUST force a re-apply (C0000 cascade)"
+        );
+    }
+
+    /// Guard: a None-cust_no projection against a populated canonical
+    /// value stays idempotent — the UPDATE writes it through
+    /// `COALESCE($12, legacy_cust_no)`, so it could never converge and
+    /// would re-apply every tick.
+    #[test]
+    fn existing_matches_guards_none_cust_no_projection() {
+        let mut p = sample_canonical();
+        p.legacy_cust_no = None;
+        let mut ex = make_existing(&p);
+        ex.legacy_cust_no = Some("C21607".into());
+        assert!(existing_matches(&ex, &p));
     }
 
     // ----- coalesce_key --------------------------------------------------

@@ -19,8 +19,9 @@
 //!    b. For each mapper, in panic-isolated tasks:
 //!       - Verify `MIN_VALID_VERSION(<table>) <= last_seen_version`
 //!         (else → CT retention overflow → Slack alert + skip).
-//!       - Query `CHANGETABLE(CHANGES <table>, @last) JOIN <table>`
-//!         filtering `SYS_CHANGE_CONTEXT <> 0x4E48` (loop-prevention).
+//!       - Query `CHANGETABLE(CHANGES <table>, @last) JOIN <table>`.
+//!         (No `SYS_CHANGE_CONTEXT` filter — writeback echoes are
+//!         absorbed by mapper idempotency; see `build_ct_changes_sql`.)
 //!       - For each row: `mapper.apply(&mut tx, op, Some(&row)).await`
 //!         (or `None` for D operations). On success, INSERT into
 //!         `event_log` (live mode) or log "would publish" (shadow mode).
@@ -2456,7 +2457,7 @@ async fn poll_table(
             let result = match table {
                 "HT_Book_H" | "HT_Book_Ds" | "HT_Book_Date" => {
                     match load_booking_aggregate(mssql, key).await {
-                        Ok(a) => apply_booking_aggregate(&mut tx, &a, key).await,
+                        Ok(a) => apply_booking_aggregate(&mut tx, Some(mssql), &a, key).await,
                         Err(err) => {
                             tracing::warn!(
                                 event_name = EV_LOAD_AGGREGATE_FAIL,
@@ -2549,6 +2550,11 @@ async fn poll_table(
                 }
                 Ok(None) => {
                     // Idempotent skip — canonical row already matches.
+                    // Since 2026-06-11 mappers MUST NOT return Ok(None)
+                    // for an unresolved FK (they eager-mirror or Err so
+                    // the watermark holds) — `skipped` therefore counts
+                    // only genuine no-ops, never deferred rows. See
+                    // sync::resolve module doc (June-3 incident).
                     skipped += 1;
                 }
                 Err(err) => {
@@ -2626,6 +2632,9 @@ async fn poll_table(
                 }
                 Ok(None) => {
                     // Idempotent skip / D-event with no event payload.
+                    // Same 2026-06-11 contract as the aggregate path:
+                    // mappers Err on unresolved FKs, so this never
+                    // counts a silently-deferred row.
                     skipped += 1;
                 }
                 Err(err) => {
@@ -2803,18 +2812,33 @@ mod sync_row_alias_compile_check {
     fn _assert_send(_v: CtRow) {}
 }
 
-/// Fetch CT rows joined with the table, filtered by loop-prevention
-/// `SYS_CHANGE_CONTEXT <> 0x4E48`, ordered by `SYS_CHANGE_VERSION` for
-/// monotonic processing.
-async fn fetch_ct_rows(
-    mssql: &DbPool,
+/// Build the CT polling query.
+///
+/// ## No `SYS_CHANGE_CONTEXT` filter — deliberately (2026-06-11)
+///
+/// Until 2026-06-11 both this query and [`build_ct_count_sql`] carried
+/// `WHERE ct.SYS_CHANGE_CONTEXT IS NULL OR ct.SYS_CHANGE_CONTEXT <>
+/// 0x4E48`, believed to filter out echoes of our own writeback (which
+/// issues `SET CONTEXT_INFO 0x4E48` per session). That predicate was
+/// INERT: `SET CONTEXT_INFO` never populates `SYS_CHANGE_CONTEXT` —
+/// only the per-statement `WITH CHANGE_TRACKING_CONTEXT (...)` table
+/// hint does, and nothing in the codebase uses it. Every writeback CT
+/// row arrived with `SYS_CHANGE_CONTEXT IS NULL` and sailed through;
+/// echo absorption has always come from the mappers' idempotent
+/// UPSERTs (re-applying our own write converges to a no-op and emits
+/// no event).
+///
+/// Do NOT "fix" this by adding `WITH CHANGE_TRACKING_CONTEXT` to the
+/// writeback and re-instating the filter: CT coalesces per-PK to the
+/// LATEST change's context, so a genuine iHOTEL edit racing a writeback
+/// touch on the same row would inherit our tag and be filtered out —
+/// recreating the June-3 silent-loss class at the SQL layer.
+fn build_ct_changes_sql(
     table: &str,
     pk_cols: &[&str],
     select_sql: &str,
     last_seen: i64,
-) -> Result<Vec<CtRow>, String> {
-    let mut conn = mssql.get().await.map_err(|e| e.to_string())?;
-
+) -> Result<String, String> {
     // Build the JOIN condition: `t.pk1 = ct.pk1 AND t.pk2 = ct.pk2 …`.
     // For a single-PK table (our 5.2 mappers) this is trivial.
     let join_clause = if pk_cols.is_empty() {
@@ -2838,17 +2862,38 @@ async fn fetch_ct_rows(
         .collect::<Vec<_>>()
         .join(", ");
 
-    let sql = format!(
+    Ok(format!(
         "SELECT ct.SYS_CHANGE_VERSION AS sys_change_version, \
                 ct.SYS_CHANGE_OPERATION AS sys_change_operation, \
                 {pk_projection}, \
                 {select_sql} \
            FROM CHANGETABLE(CHANGES {table}, {last_seen}) AS ct \
            LEFT JOIN {table} AS t ON {join_clause} \
-          WHERE ct.SYS_CHANGE_CONTEXT IS NULL \
-             OR ct.SYS_CHANGE_CONTEXT <> 0x4E48 \
           ORDER BY ct.SYS_CHANGE_VERSION ASC"
-    );
+    ))
+}
+
+/// Companion COUNT query for [`build_ct_changes_sql`] — same CHANGETABLE
+/// window, no filter (see that function's doc for why the historical
+/// `SYS_CHANGE_CONTEXT` predicate was removed).
+fn build_ct_count_sql(table: &str, last_seen: i64) -> String {
+    format!("SELECT COUNT(*) FROM CHANGETABLE(CHANGES {table}, {last_seen}) AS ct")
+}
+
+/// Fetch CT rows joined with the table, ordered by `SYS_CHANGE_VERSION`
+/// for monotonic processing. Echo absorption for our own writeback's CT
+/// rows happens in the idempotent mappers, NOT here — see
+/// [`build_ct_changes_sql`].
+async fn fetch_ct_rows(
+    mssql: &DbPool,
+    table: &str,
+    pk_cols: &[&str],
+    select_sql: &str,
+    last_seen: i64,
+) -> Result<Vec<CtRow>, String> {
+    let mut conn = mssql.get().await.map_err(|e| e.to_string())?;
+
+    let sql = build_ct_changes_sql(table, pk_cols, select_sql, last_seen)?;
 
     let rows = simple_query_with_timeout_pooled(&mut conn, &sql, MssqlOpKind::Read)
         .await
@@ -3020,10 +3065,7 @@ async fn count_ct_rows(
     last_seen: i64,
 ) -> Result<i64, String> {
     let mut conn = mssql.get().await.map_err(|e| e.to_string())?;
-    let sql = format!(
-        "SELECT COUNT(*) FROM CHANGETABLE(CHANGES {table}, {last_seen}) AS ct \
-         WHERE ct.SYS_CHANGE_CONTEXT IS NULL OR ct.SYS_CHANGE_CONTEXT <> 0x4E48"
-    );
+    let sql = build_ct_count_sql(table, last_seen);
     let rows = simple_query_with_timeout_pooled(&mut conn, &sql, MssqlOpKind::Read)
         .await
         .map_err(|e| e.to_string())?;
@@ -3818,39 +3860,64 @@ mod tests {
         }
     }
 
-    /// CHANGETABLE filter must include the SYS_CHANGE_CONTEXT clause
-    /// matching the `SET CONTEXT_INFO 0x4E48` value the writeback
-    /// dispatcher stamps. Locks the byte literal so a refactor can't
-    /// silently break loop-prevention. The check is a substring match
-    /// on `0x4E48` near `SYS_CHANGE_CONTEXT` — both fetch_ct_rows and
-    /// count_ct_rows compose the clause across multiple source lines,
-    /// so an exact-string match would be fragile.
+    /// The CT polling queries must NOT filter on `SYS_CHANGE_CONTEXT`
+    /// (2026-06-11, audit P1 #5). The historical predicate
+    /// `SYS_CHANGE_CONTEXT <> 0x4E48` was inert — `SET CONTEXT_INFO`
+    /// never populates `SYS_CHANGE_CONTEXT` (only the per-statement
+    /// `WITH CHANGE_TRACKING_CONTEXT` hint does, which nothing uses) —
+    /// and re-instating it alongside that hint would CREATE June-3-style
+    /// loss, because CT coalesces per-PK to the latest change's context
+    /// and would eat genuine iHOTEL edits racing a writeback touch.
+    /// Echo absorption is mapper idempotency; this test keeps the SQL
+    /// honest about that.
     #[test]
-    fn fetch_ct_rows_uses_loop_prevention_filter() {
-        let source = include_str!("sync.rs");
-        // Both occurrences of the literal must be paired with the
-        // SYS_CHANGE_CONTEXT predicate — this guards both the JOIN
-        // SELECT and the COUNT SELECT.
-        let ctx_count = source.matches("SYS_CHANGE_CONTEXT").count();
-        let tag_count = source.matches("0x4E48").count();
+    fn ct_queries_carry_no_sys_change_context_filter() {
+        let changes = build_ct_changes_sql(
+            "HT_Customers",
+            &["id"],
+            "t.Cust_no, t.Cust_name",
+            42,
+        )
+        .expect("valid mapper config must build");
         assert!(
-            ctx_count >= 2 && tag_count >= 2,
-            "expected ≥2 occurrences of SYS_CHANGE_CONTEXT + 0x4E48 (JOIN + COUNT paths)"
+            !changes.contains("SYS_CHANGE_CONTEXT"),
+            "CHANGES query must not filter on SYS_CHANGE_CONTEXT: {changes}"
         );
+        assert!(
+            changes.contains("ORDER BY ct.SYS_CHANGE_VERSION ASC"),
+            "monotonic ordering must survive the filter removal: {changes}"
+        );
+        assert!(changes.contains("CHANGETABLE(CHANGES HT_Customers, 42)"));
+
+        let count = build_ct_count_sql("HT_Customers", 42);
+        assert!(
+            !count.contains("SYS_CHANGE_CONTEXT"),
+            "COUNT query must not filter on SYS_CHANGE_CONTEXT: {count}"
+        );
+        assert!(count.contains("CHANGETABLE(CHANGES HT_Customers, 42)"));
     }
 
-    /// The CONTEXT_INFO value used by writeback's dispatcher and the
-    /// CT watcher's filter must be the same byte sequence — otherwise
-    /// every writeback re-fires through the watcher.
+    /// Empty PK list must refuse to build (NoopMapper short-circuits
+    /// upstream; reaching here without PKs is a config bug).
     #[test]
-    fn loop_prevention_tag_matches_writeback_dispatcher() {
+    fn ct_changes_sql_requires_primary_keys() {
+        assert!(build_ct_changes_sql("HT_Customers", &[], "t.Cust_no", 0).is_err());
+    }
+
+    /// The writeback session tag survives as a session-observability
+    /// marker (`sys.dm_exec_sessions.context_info`), NOT as a CT
+    /// filter input. This test pins that the dispatcher still sets it
+    /// (operators rely on it for session triage) while the watcher no
+    /// longer pretends to consume it.
+    #[test]
+    fn writeback_session_tag_still_set_for_observability() {
         let dispatcher_src = include_str!("../writeback/dispatcher.rs");
         let mssql_session_src = include_str!("../db/mssql_session.rs");
         assert!(dispatcher_src.contains("set_context_info(conn)"));
         assert!(
             mssql_session_src.contains("SET CONTEXT_INFO 0x4E48"),
-            "mssql_session::set_context_info must issue 0x4E48 \
-             so the watcher's CHANGETABLE filter can match it"
+            "mssql_session::set_context_info must keep issuing the 0x4E48 \
+             session tag (observability via sys.dm_exec_sessions)"
         );
     }
 

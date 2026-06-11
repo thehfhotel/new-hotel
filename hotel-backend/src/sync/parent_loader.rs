@@ -109,10 +109,18 @@ const BOOK_H_PROJECTION: &[&str] = &[
     "Book_Date_out",
     "Book_by",
     "Book_room_note",
+    // 2026-06-11 — disambiguates HT_Book_Ds.Book_Room_Type semantics:
+    // 1 = Ds lines carry a room-TYPE code (FrmAddBook, cheatsheet §3.3),
+    // 2 = Ds lines carry the room NUMBER (FrmAddBook2, §3.4). The
+    // booking projection drops Ds lines from the room-assignment set
+    // when this is 1.
+    "Book_room_type",
 ];
 
-/// `HT_Book_Ds` projection. `Book_Room_Type` stores the room NUMBER per
-/// cheatsheet §3.4. Track J1 projection-lock test pins every column.
+/// `HT_Book_Ds` projection. `Book_Room_Type` stores the room NUMBER
+/// when `HT_Book_H.Book_room_type=2` (cheatsheet §3.4) and a room-TYPE
+/// code when it is 1 (§3.3). Track J1 projection-lock test pins every
+/// column.
 const BOOK_DS_PROJECTION: &[&str] = &[
     "id",
     "Book_No",

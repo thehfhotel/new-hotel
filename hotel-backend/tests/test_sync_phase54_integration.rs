@@ -486,13 +486,13 @@ async fn full_checkout_flips_status_to_checked_out_and_emits_checkout_completed(
     cleanup(&pool, &cin_no, &cust_no, &room_no).await;
 }
 
+/// 2026-06-11 (June-3 incident class): an unresolvable customer FK must
+/// now be an ERROR — not an `Ok(None)` "defer" — so the watcher sets
+/// `errored=true` and HOLDS the watermark. Pre-fix this test asserted
+/// the silent-defer behaviour that lost C22209/R015290.
 #[tokio::test]
-async fn checkin_apply_defers_when_customer_not_yet_mirrored() {
-    if std::env::var("MSSQL_HOST").is_err() {
-        return;
-    }
+async fn checkin_apply_errors_when_customer_unresolvable() {
     let pool = common::create_test_pool().await;
-    let mssql = mssql_stub().await;
     let cin_no = unique_cin_no();
     let cust_no = unique_cust_no(); // intentionally NOT seeded
     let room_no = unique_room_no();
@@ -505,13 +505,18 @@ async fn checkin_apply_defers_when_customer_not_yet_mirrored() {
         payments: vec![],
     };
     let mut tx = pool.begin().await.unwrap();
-    let event = apply_checkin_aggregate(&mut tx, mssql.as_ref(), &aggregate, &cin_no)
-        .await
-        .unwrap();
+    // `mssql=None` -> eager-mirror impossible -> MUST error (watermark
+    // hold), never Ok(None).
+    let result = apply_checkin_aggregate(&mut tx, None, &aggregate, &cin_no).await;
     tx.rollback().await.ok();
+    let err = result.expect_err(
+        "unresolvable customer FK must error so the watcher holds the \
+         watermark (pre-2026-06-11 it deferred with Ok(None) -- the \
+         June-3 silent-drop class)",
+    );
     assert!(
-        event.is_none(),
-        "apply must defer (Ok(None)) when customer FK isn't resolvable yet"
+        err.to_string().contains("customer FK unresolvable"),
+        "error must name the unresolvable FK: {err}"
     );
 
     let count: i64 = sqlx::query_scalar(
@@ -521,7 +526,7 @@ async fn checkin_apply_defers_when_customer_not_yet_mirrored() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(count, 0, "no row must be inserted on defer");
+    assert_eq!(count, 0, "no row must be inserted on the error path");
 
     sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = $1")
         .bind(&room_no)
@@ -627,9 +632,12 @@ async fn checkin_cancelled_with_deleted_ds_rows_lands_via_short_circuit() {
 }
 
 /// Companion regression: when NO canonical row exists yet, a cancelled
-/// header (with deleted Ds rows) must still defer — the original INSERT
-/// CT row hasn't landed yet, so there's nothing to update. The
-/// short-circuit is guarded by `existing.is_some()`.
+/// header (with deleted Ds rows) is a deliberate, logged skip — there
+/// is no canonical row to cancel and no room FK left to mirror one
+/// (`cin_room_id` is NOT NULL). Crucially it must stay `Ok(None)`, not
+/// become an error: erroring would wedge the watermark forever on a
+/// folio that carries no recoverable state (2026-06-11 error-on-defer
+/// regime).
 #[tokio::test]
 async fn checkin_cancelled_with_no_existing_row_still_defers() {
     // Same MSSQL exemption as the sibling test above.
@@ -1278,4 +1286,62 @@ async fn checkin_room_change_updates_denormalised_legacy_room_no() {
         .execute(&pool)
         .await
         .ok();
+}
+
+// =============================================================================
+// Receipt defer-gates-watermark (audit 2026-06-11 P0 #1, payment leg).
+//
+// Receipts have NO re-fire source: HT_Receipt_H rows are written once
+// (append-only, cheatsheet §3.9). Pre-fix a receipt whose parent
+// check-in wasn't mirrored yet returned Ok(None) ("skipped") and the
+// watermark advanced — the payment was silently lost forever.
+// =============================================================================
+
+#[tokio::test]
+async fn receipt_apply_errors_when_parent_checkin_missing() {
+    use hotel_backend::sync::change_op::ChangeOp;
+    use hotel_backend::sync::mapper::MssqlChangeMapper;
+    use hotel_backend::sync::mappers::ReceiptMapper;
+
+    let pool = common::create_test_pool().await;
+    let missing_cin_no = unique_cin_no(); // never mirrored
+
+    let row = HashMapRow::new("HT_Receipt_H")
+        .with("id", MockValue::I32(987654))
+        .with("Receipt_no", MockValue::Str("B2606-9999".into()))
+        .with(
+            "Receipt_Date",
+            MockValue::DateTime(
+                chrono::NaiveDate::from_ymd_opt(2026, 6, 11)
+                    .unwrap()
+                    .and_hms_opt(15, 0, 0)
+                    .unwrap(),
+            ),
+        )
+        .with("Receipt_Total", MockValue::Decimal(890.0))
+        .with("Receipt_ref", MockValue::Str(missing_cin_no.clone()))
+        .with("Receipt_c_no", MockValue::Str("C21607".into()))
+        .with("status_name", MockValue::Str("ปกติ".into()));
+
+    let mut tx = pool.begin().await.unwrap();
+    let err = ReceiptMapper
+        .apply(&mut tx, ChangeOp::Insert, Some(&row))
+        .await
+        .expect_err(
+            "missing parent check-in must error (watermark hold) — \
+             receipts have no re-fire source",
+        );
+    tx.rollback().await.ok();
+    assert!(
+        err.to_string().contains("parent check-in FK unresolvable"),
+        "error must name the unresolvable FK: {err}"
+    );
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM ht_payments WHERE pay_reference = 'B2606-9999'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 0, "no payment row may land on the error path");
 }
