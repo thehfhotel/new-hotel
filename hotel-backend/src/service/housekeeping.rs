@@ -89,7 +89,7 @@ impl HousekeepingService {
         let key = generate_idempotency_key(&intent, aggregate_id);
         OutboxRepository::enqueue(&mut tx, &intent, key)
             .await
-            .map_err(|err| ServiceError::outbox(err.to_string()))?;
+            .map_err(ServiceError::from_enqueue_error)?;
 
         let event = DomainEvent::RoomMarkedClean {
             room_id: aggregate_id,

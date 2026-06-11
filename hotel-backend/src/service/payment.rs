@@ -264,7 +264,7 @@ impl PaymentService {
         let key = generate_idempotency_key(&intent, payment_aggregate_id);
         OutboxRepository::enqueue(&mut tx, &intent, key)
             .await
-            .map_err(|err| ServiceError::outbox(err.to_string()))?;
+            .map_err(ServiceError::from_enqueue_error)?;
 
         let event = DomainEvent::PaymentReceived {
             check_in_id: check_in_aggregate_id,
@@ -405,7 +405,7 @@ impl PaymentService {
         let key = generate_idempotency_key(&intent, refund_aggregate_id);
         OutboxRepository::enqueue(&mut tx, &intent, key)
             .await
-            .map_err(|err| ServiceError::outbox(err.to_string()))?;
+            .map_err(ServiceError::from_enqueue_error)?;
 
         let event = DomainEvent::PaymentRefunded {
             check_in_id: check_in_aggregate_id,

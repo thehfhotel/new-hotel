@@ -440,7 +440,7 @@ impl CheckInService {
         let key = generate_idempotency_key(&intent, aggregate_id);
         OutboxRepository::enqueue(&mut tx, &intent, key)
             .await
-            .map_err(|err| ServiceError::outbox(err.to_string()))?;
+            .map_err(ServiceError::from_enqueue_error)?;
 
         let event = DomainEvent::CheckInCancelled {
             id: aggregate_id,
@@ -499,7 +499,7 @@ impl CheckInService {
         let key = generate_idempotency_key(&intent, aggregate_id);
         OutboxRepository::enqueue(&mut tx, &intent, key)
             .await
-            .map_err(|err| ServiceError::outbox(err.to_string()))?;
+            .map_err(ServiceError::from_enqueue_error)?;
 
         // Extend has no dedicated DomainEvent variant today (architecture.md
         // §3.6b lists only Created / Cancelled / CheckOutCompleted for
@@ -727,7 +727,7 @@ impl CheckInService {
         let key = generate_idempotency_key(&intent, aggregate_id);
         OutboxRepository::enqueue(&mut tx, &intent, key)
             .await
-            .map_err(|err| ServiceError::outbox(err.to_string()))?;
+            .map_err(ServiceError::from_enqueue_error)?;
 
         // No dedicated DomainEvent variant for room-change today (mirrors
         // the extend-stay pattern — subscribers learn via writeback row
@@ -837,7 +837,7 @@ impl CheckInService {
         let key = generate_idempotency_key(&intent, aggregate_id);
         OutboxRepository::enqueue(&mut tx, &intent, key)
             .await
-            .map_err(|err| ServiceError::outbox(err.to_string()))?;
+            .map_err(ServiceError::from_enqueue_error)?;
 
         let event = DomainEvent::CheckOutCompleted {
             id: aggregate_id,
@@ -901,7 +901,7 @@ impl CheckInService {
         let key = generate_idempotency_key(&intent, aggregate_id);
         OutboxRepository::enqueue(tx, &intent, key)
             .await
-            .map_err(|err| ServiceError::outbox(err.to_string()))?;
+            .map_err(ServiceError::from_enqueue_error)?;
         Ok(())
     }
 }

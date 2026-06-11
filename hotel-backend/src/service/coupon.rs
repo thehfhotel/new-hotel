@@ -137,7 +137,7 @@ impl CouponService {
         let key = generate_idempotency_key(&intent, aggregate_id);
         OutboxRepository::enqueue(&mut tx, &intent, key)
             .await
-            .map_err(|err| ServiceError::outbox(err.to_string()))?;
+            .map_err(ServiceError::from_enqueue_error)?;
 
         // Touch the held EventBus / outbox handles so the field-usage
         // lints stay green (we don't publish a DomainEvent variant for
@@ -232,7 +232,7 @@ impl CouponService {
         let key = generate_idempotency_key(&intent, aggregate_id);
         OutboxRepository::enqueue(&mut tx, &intent, key)
             .await
-            .map_err(|err| ServiceError::outbox(err.to_string()))?;
+            .map_err(ServiceError::from_enqueue_error)?;
 
         let _ = (&self.outbox, &cmd.source);
 

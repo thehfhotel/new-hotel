@@ -103,6 +103,29 @@ pub async fn apply_canonical_cupon_event(
                 // WHERE NOT NULL` is what enables the ON CONFLICT
                 // target here.
                 let synthetic_code = format!("LEGACY-{cupon_no}");
+
+                // 2026-06-11 — legacy-id-reuse poison pill (same class
+                // as the v2.66.3 `ht_room_calendar` rebind fix). The
+                // Delete arm above clears `legacy_cupon_no` but KEEPS
+                // the canonical row (audit trail), so its
+                // `coupon_code = 'LEGACY-{n}'` survives. iHOTEL
+                // allocates `cupon_no = MAX+1`, which REUSES n after a
+                // delete — the re-insert then misses the
+                // ON CONFLICT (legacy_cupon_no) arbiter (the orphan's
+                // pointer is NULL) and trips `ht_coupons_coupon_code_key`
+                // instead, erroring every retry and holding the
+                // watermark. Re-attach the orphan first: same synthetic
+                // code ⇒ same legacy slot, so adopting the new pointer
+                // is semantically a re-issue of that slot.
+                sqlx::query(
+                    "UPDATE ht_coupons \
+                        SET legacy_cupon_no = $1, updated_at = NOW() \
+                      WHERE coupon_code = $2 AND legacy_cupon_no IS NULL",
+                )
+                .bind(cupon_no)
+                .bind(&synthetic_code)
+                .execute(&mut **tx)
+                .await?;
                 // ON CONFLICT targets the partial UNIQUE index
                 // `ux_ht_coupons_legacy_cupon_no WHERE
                 //  legacy_cupon_no IS NOT NULL`. PostgreSQL infers

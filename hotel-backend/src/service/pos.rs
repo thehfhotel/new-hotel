@@ -273,7 +273,7 @@ impl PosService {
         let idem = generate_idempotency_key(&intent, aggregate_id);
         OutboxRepository::enqueue(&mut tx, &intent, idem)
             .await
-            .map_err(|err| ServiceError::outbox(err.to_string()))?;
+            .map_err(ServiceError::from_enqueue_error)?;
 
         tx.commit().await?;
 

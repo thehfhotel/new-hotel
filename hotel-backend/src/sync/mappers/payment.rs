@@ -301,7 +301,14 @@ async fn apply_receipt_upsert(
 
     // UPSERT on (pay_cin_id, pay_reference) — pay_reference carries the
     // legacy Receipt_no and is unique per legacy receipt sequence.
-    let now = chrono::Utc::now().naive_utc();
+    //
+    // Fallback timestamp must be Bangkok WALL-CLOCK, not UTC: every other
+    // value in this column comes from legacy `Receipt_Date`, which is Thai
+    // local time without timezone (CLAUDE.md "Timezone Handling"). A
+    // `naive_utc()` fallback here landed 7h early (2026-06-11 audit).
+    let now = chrono::Utc::now()
+        .with_timezone(&chrono::FixedOffset::east_opt(7 * 3600).expect("+07:00 is valid"))
+        .naive_local();
     let pay_date = p.receipt_date.unwrap_or(now);
 
     // Look up by (cin_id, receipt_no) — the receipt_no is unique

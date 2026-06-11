@@ -82,6 +82,29 @@ impl ServiceError {
         ServiceError::Outbox(msg.into())
     }
 
+    /// Map an outbox-enqueue failure to the semantically correct variant.
+    ///
+    /// A unique violation on `writeback_jobs.idempotency_key` means an
+    /// identical intent for the same aggregate is ALREADY queued — i.e. a
+    /// concurrent caller won the race. That is a precondition conflict
+    /// (409), not infrastructure failure: the idempotency key is the
+    /// designed last-line guard for exactly this interleaving (two
+    /// concurrent transitions both passing the pre-TX status gate; the
+    /// loser's TX rolls back here). Surfacing it as `Conflict` keeps the
+    /// loser's contract identical whether the status-guard UPDATE or the
+    /// idempotency key catches it. Everything else stays `Outbox` so
+    /// observability can alarm on real enqueue failures (migration drift).
+    pub fn from_enqueue_error(err: sqlx::Error) -> Self {
+        if let sqlx::Error::Database(ref db) = err {
+            if db.constraint() == Some("writeback_jobs_idempotency_key_key") {
+                return ServiceError::Conflict(format!(
+                    "identical writeback intent already enqueued (concurrent duplicate): {db}"
+                ));
+            }
+        }
+        ServiceError::Outbox(err.to_string())
+    }
+
     /// Construct an internal error from any `Display`-able message.
     pub fn internal(msg: impl Into<String>) -> Self {
         ServiceError::Internal(msg.into())

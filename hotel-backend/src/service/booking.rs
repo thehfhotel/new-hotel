@@ -233,7 +233,7 @@ impl BookingService {
         let key = generate_idempotency_key(&intent, aggregate_id);
         OutboxRepository::enqueue(&mut tx, &intent, key)
             .await
-            .map_err(|err| ServiceError::outbox(err.to_string()))?;
+            .map_err(ServiceError::from_enqueue_error)?;
 
         let snapshot = BookingSnapshot {
             id: aggregate_id,
@@ -320,7 +320,7 @@ impl BookingService {
         let key = generate_idempotency_key(&intent, aggregate_id);
         OutboxRepository::enqueue(&mut tx, &intent, key)
             .await
-            .map_err(|err| ServiceError::outbox(err.to_string()))?;
+            .map_err(ServiceError::from_enqueue_error)?;
 
         let after = build_snapshot(aggregate_id, cmd.customer_id, &cmd.after_snapshot);
         let before = cmd
@@ -368,7 +368,7 @@ impl BookingService {
         let key = generate_idempotency_key(&intent, aggregate_id);
         OutboxRepository::enqueue(&mut tx, &intent, key)
             .await
-            .map_err(|err| ServiceError::outbox(err.to_string()))?;
+            .map_err(ServiceError::from_enqueue_error)?;
 
         let event = DomainEvent::BookingCancelled {
             id: aggregate_id,
