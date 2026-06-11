@@ -1,9 +1,11 @@
 //! Schema fingerprint guard.
 //!
 //! Per `docs/architecture.md` §4e — the writeback worker queries MSSQL on
-//! startup for the column shapes of the 10 tables it writes to, hashes the
-//! `(table, ord, column, type)` tuples, and refuses to start if the hash
-//! differs from a hardcoded baseline.
+//! startup for the column shapes of every table it writes to
+//! ([`WRITEBACK_FINGERPRINTED_TABLES`] — 20 tables as of the 2026-06-11
+//! audit), hashes the `(table, ord, column, type)` tuples, and refuses to
+//! start if the hash differs from a hardcoded baseline. The CT watcher
+//! verifies the same set PLUS [`CT_EXTRA_FINGERPRINTED_TABLES`].
 //!
 //! ## Why
 //!
@@ -14,10 +16,12 @@
 //!
 //! ## Source of truth
 //!
-//! [`EXPECTED_SCHEMA_BASELINE`] mirrors `docs/legacy-spike/schema/01-baseline-schema.txt`
-//! lines 119–529 (the `==== Columns ====` block, filtered to the 10 tables we
-//! touch). Any vendor change forces a re-capture and an update to this constant
-//! — see `scripts/writeback-fingerprint.sh` for the regeneration recipe.
+//! [`EXPECTED_SCHEMA_BASELINE`] mirrors `hotel-backend/schema-baseline.txt`
+//! (the live `INFORMATION_SCHEMA.COLUMNS` capture; also mirrored in
+//! `docs/legacy-spike/schema/01-baseline-schema.txt`), filtered to the
+//! tables we touch. Any vendor change forces a re-capture and an update to
+//! this constant — see `scripts/writeback-fingerprint.sh` for the
+//! regeneration recipe.
 
 use sha2::{Digest, Sha256};
 use tiberius::{Query, Row};
@@ -30,17 +34,30 @@ use crate::writeback::error::{WritebackError, WritebackResult};
 /// these — adding a recipe that writes to a new table requires extending this
 /// list AND regenerating [`EXPECTED_FINGERPRINT`].
 ///
-/// Wave 5a item 5 added the trailing five: `HT_Cupon` (mark-printed UPDATE
+/// Wave 5a item 5 added five: `HT_Cupon` (mark-printed UPDATE
 /// from walkin / checkin_to_booking), `HT_CheckIn_Pay` (payment INSERT),
 /// `HT_Receipt_Ds` (receipt line INSERT), `HT_POWER_LOG` (lights on/off
 /// audit from walkin / checkin_to_booking / checkout / checkin_cancel),
-/// `HT_Changed_Room` (room-move audit — not yet touched by a recipe but
-/// the audit doc flagged it as in-scope for the next wave; fingerprinting
-/// up-front avoids a separate baseline bump later).
+/// `HT_Changed_Room` (room-move audit).
+///
+/// The 2026-06-11 coexistence audit (P1-8) closed the remaining coverage
+/// gap — five more tables the recipes write but the startup check never
+/// verified:
+/// - `HT_CheckIn_Other_People` — TM.30 registry INSERT (walkin /
+///   checkin_to_booking). Moved here from the CT-extra set: it was only
+///   verified on the CT watcher's startup, not the writeback worker's.
+/// - `HT_CheckIn_Product` — product-line INSERT/DELETE (pos_sale /
+///   adjust_product_stock / refund flows). Also moved from CT-extra.
+/// - `HT_Products` — `Pro_Amt` stock mutations (cheatsheet §6.3 pairing).
+///   Previously verified NOWHERE.
+/// - `HT_Housewife` — housekeeping log INSERT (mark_clean / checkout).
+///   Previously verified NOWHERE.
+/// - `Tb_Save_Image` — photo-link UPDATE (walkin / checkin_to_booking).
+///   Previously verified NOWHERE.
 ///
 /// Track D / T7 HIGH-3 (2026-05-13) renamed this list to
 /// `WRITEBACK_FINGERPRINTED_TABLES` (was [`FINGERPRINTED_TABLES`]) to
-/// disambiguate it from the new CT-side fingerprint
+/// disambiguate it from the CT-side fingerprint
 /// ([`CT_EXTRA_FINGERPRINTED_TABLES`]). The legacy alias is preserved
 /// below for any out-of-tree consumer.
 pub const WRITEBACK_FINGERPRINTED_TABLES: &[&str] = &[
@@ -50,6 +67,8 @@ pub const WRITEBACK_FINGERPRINTED_TABLES: &[&str] = &[
     "HT_Book_Date",
     "HT_CheckIn_H",
     "HT_CheckIn_Ds",
+    "HT_CheckIn_Other_People",
+    "HT_CheckIn_Product",
     "HT_Receipt_H",
     "HT_Rooms",
     "HT_Room_Status",
@@ -59,6 +78,9 @@ pub const WRITEBACK_FINGERPRINTED_TABLES: &[&str] = &[
     "HT_Receipt_Ds",
     "HT_POWER_LOG",
     "HT_Changed_Room",
+    "HT_Products",
+    "HT_Housewife",
+    "Tb_Save_Image",
 ];
 
 /// Back-compat alias for the writeback fingerprint list. Deprecated in
@@ -68,25 +90,25 @@ pub const WRITEBACK_FINGERPRINTED_TABLES: &[&str] = &[
 pub const FINGERPRINTED_TABLES: &[&str] = WRITEBACK_FINGERPRINTED_TABLES;
 
 /// Track D / T7 HIGH-3 — additional CT-watched tables the CT-side
-/// fingerprint must cover but the writeback worker never touches.
-/// Four mirror tables (`HT_CheckIn_Product`, `HT_Deposit`,
-/// `HT_Bill_Debt_H`, `HT_Bill_Debt_Ds`) PLUS one user-impact table
-/// (`HT_CheckIn_Other_People` — TM.30 immigration registry).
+/// fingerprint must cover. The writeback worker genuinely never writes
+/// these three mirror tables (`HT_Deposit`, `HT_Bill_Debt_H`,
+/// `HT_Bill_Debt_Ds`).
 ///
-/// Track E1 (audit 2026-05-13 T2 HIGH-3) wired `HT_CheckIn_Other_People`
-/// to a real `GuestRegistryMapper` — the table was already fingerprinted
-/// here by Track D so no baseline bump was needed when the mapper
-/// landed.
+/// 2026-06-11 audit (P1-8): `HT_CheckIn_Product` and
+/// `HT_CheckIn_Other_People` were moved OUT of this list into
+/// [`WRITEBACK_FINGERPRINTED_TABLES`] — the recipes DO write them, so the
+/// earlier doc claim that this list held "tables the writeback worker
+/// never touches" was false, and the writeback startup check was blind to
+/// vendor drift on them. CT coverage is unchanged because the CT check
+/// verifies the union of both sets.
 ///
 /// The full CT-side fingerprint set is the union of
 /// [`WRITEBACK_FINGERPRINTED_TABLES`] + [`CT_EXTRA_FINGERPRINTED_TABLES`];
 /// see [`ct_fingerprinted_tables`] for the convenience accessor.
 pub const CT_EXTRA_FINGERPRINTED_TABLES: &[&str] = &[
-    "HT_CheckIn_Product",
     "HT_Deposit",
     "HT_Bill_Debt_H",
     "HT_Bill_Debt_Ds",
-    "HT_CheckIn_Other_People",
 ];
 
 /// Union of the writeback + CT-extra fingerprint sets. Returned as
@@ -225,6 +247,13 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_CheckIn_H", 20, "Cin_note", "varchar"),
     ("HT_CheckIn_H", 21, "Cin_foreign", "varchar"),
     ("HT_CheckIn_H", 22, "Cin_Work_number", "int"),
+    // HT_CheckIn_Other_People — 2026-06-11 audit P1-8 (moved from the
+    // CT-extra baseline). schema-baseline.txt lines 249-252, 4 columns.
+    // TM.30 registry INSERT from walkin / checkin_to_booking.
+    ("HT_CheckIn_Other_People", 1, "id", "int"),
+    ("HT_CheckIn_Other_People", 2, "Cin_no", "varchar"),
+    ("HT_CheckIn_Other_People", 3, "Cin_name", "varchar"),
+    ("HT_CheckIn_Other_People", 4, "Cin_contry", "varchar"),
     // HT_CheckIn_Pay — Wave 5a item 5. Spike baseline lines 253-274.
     // 22 columns. Payment recipe `INSERT INTO [HT_CheckIn_Pay] (...)`.
     ("HT_CheckIn_Pay", 1, "id", "int"),
@@ -249,6 +278,21 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_CheckIn_Pay", 20, "Cin_Pay_Tran", "float"),
     ("HT_CheckIn_Pay", 21, "Branch", "varchar"),
     ("HT_CheckIn_Pay", 22, "Cin_Pay_web", "float"),
+    // HT_CheckIn_Product — 2026-06-11 audit P1-8 (moved from the CT-extra
+    // baseline). schema-baseline.txt lines 275-286, 12 columns.
+    // Product-line writes from the POS / stock-adjust / refund flows.
+    ("HT_CheckIn_Product", 1, "id", "int"),
+    ("HT_CheckIn_Product", 2, "Cin_No", "varchar"),
+    ("HT_CheckIn_Product", 3, "Cin_Room_no", "varchar"),
+    ("HT_CheckIn_Product", 4, "Cin_Ds_date", "datetime"),
+    ("HT_CheckIn_Product", 5, "Cin_Pro_id", "varchar"),
+    ("HT_CheckIn_Product", 6, "Cin_Pro_name", "varchar"),
+    ("HT_CheckIn_Product", 7, "Cin_Pro_Unit", "varchar"),
+    ("HT_CheckIn_Product", 8, "Cin_Pro_num", "float"),
+    ("HT_CheckIn_Product", 9, "Cin_Pro_price", "float"),
+    ("HT_CheckIn_Product", 10, "Cin_Pro_priceTotal", "float"),
+    ("HT_CheckIn_Product", 11, "Cin_Pro_pay", "float"),
+    ("HT_CheckIn_Product", 12, "Cin_Pro_note", "varchar"),
     // HT_Cupon — Wave 5a item 5. Spike baseline lines 292-298.
     // 7 columns. Walkin / checkin_to_booking emit the mark-printed
     // UPDATE via helpers::mark_cupon_printed.
@@ -295,6 +339,16 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_Customers", 33, "Cust_Price_Over", "float"),
     ("HT_Customers", 34, "Cust_Contry", "varchar"),
     ("HT_Customers", 35, "Cust_Work_Tax", "varchar"),
+    // HT_Housewife — 2026-06-11 audit P1-8 (previously verified NOWHERE).
+    // schema-baseline.txt lines 347-353, 7 columns. Housekeeping log
+    // INSERT from mark_clean / checkout.
+    ("HT_Housewife", 1, "id", "int"),
+    ("HT_Housewife", 2, "h_name", "varchar"),
+    ("HT_Housewife", 3, "h_room", "varchar"),
+    ("HT_Housewife", 4, "h_date", "datetime"),
+    ("HT_Housewife", 5, "h_note", "text"),
+    ("HT_Housewife", 6, "h_cin", "varchar"),
+    ("HT_Housewife", 7, "h_cin_name", "varchar"),
     // HT_POWER_LOG — Wave 5a item 5. Spike baseline lines 422-429.
     // 8 columns. Walkin / checkin_to_booking INSERT (lights on);
     // checkin_cancel / checkout UPDATE (lights off).
@@ -306,6 +360,20 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_POWER_LOG", 6, "ROOM_POWER_END_BY", "varchar"),
     ("HT_POWER_LOG", 7, "ROOM_POWER_NOTE", "varchar"),
     ("HT_POWER_LOG", 8, "ROOM_POWER_NOTE2", "varchar"),
+    // HT_Products — 2026-06-11 audit P1-8 (previously verified NOWHERE).
+    // schema-baseline.txt lines 430-440, 11 columns. `Pro_Amt` stock
+    // mutations (cheatsheet §6.3 pairing) from the POS / stock flows.
+    ("HT_Products", 1, "id", "int"),
+    ("HT_Products", 2, "Pro_no", "varchar"),
+    ("HT_Products", 3, "Pro_Type", "varchar"),
+    ("HT_Products", 4, "Pro_Name", "varchar"),
+    ("HT_Products", 5, "Pro_PriceA", "float"),
+    ("HT_Products", 6, "Pro_PriceB", "float"),
+    ("HT_Products", 7, "Pro_PriceC", "float"),
+    ("HT_Products", 8, "Pro_Amt", "float"),
+    ("HT_Products", 9, "Pro_Unit", "varchar"),
+    ("HT_Products", 10, "Pro_cap", "float"),
+    ("HT_Products", 11, "Pro_Barcode", "varchar"),
     // HT_Receipt_Ds — Wave 5a item 5. Spike baseline lines 445-454.
     // 10 columns. Payment recipe INSERT (receipt line for room charge).
     ("HT_Receipt_Ds", 1, "id", "int"),
@@ -379,6 +447,17 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_Rooms_Cancel", 4, "cancel_date", "datetime"),
     ("HT_Rooms_Cancel", 5, "cancel_by", "varchar"),
     ("HT_Rooms_Cancel", 6, "cancel_note", "text"),
+    // Tb_Save_Image — 2026-06-11 audit P1-8 (previously verified
+    // NOWHERE). schema-baseline.txt lines 601-607, 7 columns. Photo-link
+    // UPDATE from walkin / checkin_to_booking. Sorts after every HT_*
+    // table under the server's case-insensitive collation.
+    ("Tb_Save_Image", 1, "id", "int"),
+    ("Tb_Save_Image", 2, "cin_no", "varchar"),
+    ("Tb_Save_Image", 3, "ttype", "varchar"),
+    ("Tb_Save_Image", 4, "pic", "varbinary"),
+    ("Tb_Save_Image", 5, "cust_no", "varchar"),
+    ("Tb_Save_Image", 6, "tmp_no", "varchar"),
+    ("Tb_Save_Image", 7, "pic_date", "datetime"),
 ];
 
 /// SHA-256 hex of [`EXPECTED_SCHEMA_BASELINE`] joined as
@@ -389,15 +468,16 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
 /// committed alongside `01-baseline-schema.txt` so the worker can refuse to
 /// start without re-running the test.
 pub const EXPECTED_FINGERPRINT: &str =
-    "8e076342babe5394b149c6e5aea5801348329e4a6a227118b31714e5e5d504b0";
+    "6b44ff897cee7a5d7982552c1ae230761663a593db6a102c09fdc42f7ade833f";
 
-/// Track D / T7 HIGH-3 — schema baseline for the 5 additional
+/// Track D / T7 HIGH-3 — schema baseline for the 3 additional
 /// CT-watched tables not covered by [`EXPECTED_SCHEMA_BASELINE`].
 /// Format identical: `(table, ordinal, column, data_type)` — derived
 /// from `docs/legacy-spike/schema/01-baseline-schema.txt` lines for
 /// each table (Bill_Debt_Ds: 92-100, Bill_Debt_H: 101-118,
-/// CheckIn_Other_People: 249-252, CheckIn_Product: 275-286,
-/// Deposit: 334-341).
+/// Deposit: 334-341). `HT_CheckIn_Other_People` (249-252) and
+/// `HT_CheckIn_Product` (275-286) moved into the writeback baseline —
+/// 2026-06-11 audit P1-8.
 ///
 /// Hashed independently of the writeback baseline so the writeback
 /// startup check stays orthogonal to the CT startup check.
@@ -432,25 +512,6 @@ const CT_EXTRA_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_Bill_Debt_H", 16, "Bill_Status", "varchar"),
     ("HT_Bill_Debt_H", 17, "Bill_by", "varchar"),
     ("HT_Bill_Debt_H", 18, "Bill_Note", "varchar"),
-    // HT_CheckIn_Other_People — baseline lines 249-252, 4 columns
-    // (TM.30 immigration registry — Track E HIGH-3 will add a mapper)
-    ("HT_CheckIn_Other_People", 1, "id", "int"),
-    ("HT_CheckIn_Other_People", 2, "Cin_no", "varchar"),
-    ("HT_CheckIn_Other_People", 3, "Cin_name", "varchar"),
-    ("HT_CheckIn_Other_People", 4, "Cin_contry", "varchar"),
-    // HT_CheckIn_Product — baseline lines 275-286, 12 columns
-    ("HT_CheckIn_Product", 1, "id", "int"),
-    ("HT_CheckIn_Product", 2, "Cin_No", "varchar"),
-    ("HT_CheckIn_Product", 3, "Cin_Room_no", "varchar"),
-    ("HT_CheckIn_Product", 4, "Cin_Ds_date", "datetime"),
-    ("HT_CheckIn_Product", 5, "Cin_Pro_id", "varchar"),
-    ("HT_CheckIn_Product", 6, "Cin_Pro_name", "varchar"),
-    ("HT_CheckIn_Product", 7, "Cin_Pro_Unit", "varchar"),
-    ("HT_CheckIn_Product", 8, "Cin_Pro_num", "float"),
-    ("HT_CheckIn_Product", 9, "Cin_Pro_price", "float"),
-    ("HT_CheckIn_Product", 10, "Cin_Pro_priceTotal", "float"),
-    ("HT_CheckIn_Product", 11, "Cin_Pro_pay", "float"),
-    ("HT_CheckIn_Product", 12, "Cin_Pro_note", "varchar"),
     // HT_Deposit — baseline lines 334-341, 8 columns
     ("HT_Deposit", 1, "id", "int"),
     ("HT_Deposit", 2, "Dep_no", "varchar"),
@@ -467,7 +528,7 @@ const CT_EXTRA_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
 /// [`EXPECTED_FINGERPRINT`]). Verified by the
 /// [`tests::ct_extra_fingerprint_constant_matches_baseline`] test.
 pub const CT_EXTRA_EXPECTED_FINGERPRINT: &str =
-    "6def7fd6b56a24cc9d29fcce32086ead827a1a8f1c48306a3972cb84b8549f56";
+    "74f5cade6be923ff82c39f4033630e05801954f4fd243af30b2b93580d013260";
 
 /// Compute the fingerprint of a column-tuple slice.
 ///
@@ -531,7 +592,7 @@ pub async fn verify_ct_schema_fingerprint(pool: &DbPool) -> WritebackResult<()> 
     //    pages BOTH workers, which is what we want (correlated outage).
     verify_schema_fingerprint(pool).await?;
 
-    // 2. CT-extra baseline — 5 tables the writeback never touches but
+    // 2. CT-extra baseline — 3 tables the writeback never touches but
     //    the CT watcher mirrors / will mirror.
     let live_rows = fetch_live_columns(pool, CT_EXTRA_FINGERPRINTED_TABLES).await?;
     let live_refs: Vec<(&str, i32, &str, &str)> = live_rows
@@ -545,9 +606,9 @@ pub async fn verify_ct_schema_fingerprint(pool: &DbPool) -> WritebackResult<()> 
             expected = CT_EXTRA_EXPECTED_FINGERPRINT,
             actual = %actual,
             "CT-extra fingerprint mismatch — refusing to start the CT watcher. \
-             A vendor change on HT_CheckIn_Product / HT_Deposit / HT_Bill_Debt_* \
-             / HT_CheckIn_Other_People would silently corrupt CT-mapped \
-             legacy_mirror.* rows. Re-audit + regenerate the baseline before retrying."
+             A vendor change on HT_Deposit / HT_Bill_Debt_* would silently \
+             corrupt CT-mapped legacy_mirror.* rows. Re-audit + regenerate \
+             the baseline before retrying."
         );
         return Err(WritebackError::SchemaDrift {
             expected: CT_EXTRA_EXPECTED_FINGERPRINT.to_string(),
@@ -707,7 +768,8 @@ mod tests {
     }
 
     /// Track D / T7 HIGH-3 — ct_fingerprinted_tables() returns the
-    /// union of writeback + CT-extra tables (20 tables today).
+    /// union of writeback + CT-extra tables (23 tables today: 20
+    /// writeback-verified + 3 CT-only mirrors).
     #[test]
     fn ct_fingerprinted_tables_returns_union_of_writeback_and_ct_extra() {
         let union = ct_fingerprinted_tables();
@@ -723,21 +785,33 @@ mod tests {
         }
     }
 
-    /// Track D / T7 HIGH-3 — the 5 CT-extra tables are exactly the
-    /// ones the audit named. Locking the list so a future refactor
-    /// can't silently drop one (`HT_CheckIn_Other_People` gained its
-    /// mapper in Track E1 but stays in this list — the fingerprint
-    /// guard is independent of mapper presence).
+    /// Track D / T7 HIGH-3, narrowed by the 2026-06-11 audit (P1-8) —
+    /// the CT-extra set is exactly the 3 mirror tables the writeback
+    /// worker never writes. `HT_CheckIn_Product` and
+    /// `HT_CheckIn_Other_People` moved into the writeback set because
+    /// recipes DO write them.
     #[test]
     fn ct_extra_fingerprinted_tables_matches_audit_set() {
-        let expected = [
-            "HT_CheckIn_Product",
-            "HT_Deposit",
-            "HT_Bill_Debt_H",
-            "HT_Bill_Debt_Ds",
-            "HT_CheckIn_Other_People",
-        ];
+        let expected = ["HT_Deposit", "HT_Bill_Debt_H", "HT_Bill_Debt_Ds"];
         assert_eq!(CT_EXTRA_FINGERPRINTED_TABLES, &expected);
+    }
+
+    /// 2026-06-11 audit P1-8 — the two moved tables must live in the
+    /// WRITEBACK set (so the writeback worker's startup verifies them),
+    /// and must NOT be double-listed in the CT-extra set (the CT union
+    /// would query them twice and the extra hash would drift).
+    #[test]
+    fn moved_ct_tables_are_writeback_verified_and_not_duplicated() {
+        for t in ["HT_CheckIn_Product", "HT_CheckIn_Other_People"] {
+            assert!(
+                WRITEBACK_FINGERPRINTED_TABLES.contains(&t),
+                "{t} must be writeback-verified"
+            );
+            assert!(
+                !CT_EXTRA_FINGERPRINTED_TABLES.contains(&t),
+                "{t} must not remain in the CT-extra set"
+            );
+        }
     }
 
     /// Track D / T7 HIGH-3 — baseline row counts per table. Locks the
@@ -748,8 +822,6 @@ mod tests {
         let cases: &[(&str, usize)] = &[
             ("HT_Bill_Debt_Ds", 9),
             ("HT_Bill_Debt_H", 18),
-            ("HT_CheckIn_Other_People", 4),
-            ("HT_CheckIn_Product", 12),
             ("HT_Deposit", 8),
         ];
         for (table, expected_count) in cases {
@@ -877,6 +949,58 @@ mod tests {
         assert_eq!(rows.len(), 8);
         assert!(rows.iter().any(|(_, _, c, _)| *c == "room_before"));
         assert!(rows.iter().any(|(_, _, c, _)| *c == "room_after"));
+    }
+
+    /// 2026-06-11 audit P1-8 — the five coverage-gap tables are now in the
+    /// writeback baseline with the column counts from
+    /// `hotel-backend/schema-baseline.txt`.
+    #[test]
+    fn audit_p1_8_tables_are_fingerprinted_with_schema_column_counts() {
+        let cases: &[(&str, usize, &str)] = &[
+            ("HT_CheckIn_Other_People", 4, "Cin_contry"),
+            ("HT_CheckIn_Product", 12, "Cin_Pro_num"),
+            ("HT_Products", 11, "Pro_Amt"),
+            ("HT_Housewife", 7, "h_cin_name"),
+            ("Tb_Save_Image", 7, "tmp_no"),
+        ];
+        for (table, expected_count, sentinel_col) in cases {
+            assert!(
+                WRITEBACK_FINGERPRINTED_TABLES.contains(table),
+                "{table} must be writeback-fingerprinted"
+            );
+            let rows: Vec<_> = EXPECTED_SCHEMA_BASELINE
+                .iter()
+                .filter(|(t, _, _, _)| *t == *table)
+                .collect();
+            assert_eq!(
+                rows.len(),
+                *expected_count,
+                "expected {expected_count} columns for {table}, got {}",
+                rows.len(),
+            );
+            assert!(
+                rows.iter().any(|(_, _, c, _)| c == sentinel_col),
+                "{table} baseline must include {sentinel_col}"
+            );
+        }
+    }
+
+    /// P1-8 — the writeback baseline must stay in the live server's
+    /// `ORDER BY TABLE_NAME, ORDINAL_POSITION` order (case-insensitive
+    /// collation; ordering verified against `schema-baseline.txt`),
+    /// otherwise the live hash can never match the constant.
+    #[test]
+    fn writeback_baseline_rows_are_in_table_then_ordinal_order() {
+        let keys: Vec<(String, i32)> = EXPECTED_SCHEMA_BASELINE
+            .iter()
+            .map(|(t, o, _, _)| (t.to_ascii_lowercase(), *o))
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(
+            keys, sorted,
+            "EXPECTED_SCHEMA_BASELINE must be sorted by (table, ordinal)"
+        );
     }
 
     // --- Wave 6 LOW item 8 — collation safety check ---

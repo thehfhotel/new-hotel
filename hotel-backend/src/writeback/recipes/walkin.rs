@@ -37,7 +37,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::outbox::intent::{CreateCheckInPayload, RoomLine};
 use crate::writeback::allocate::{
-    allocate_checkin_ds_id, allocate_cin_no, allocate_cust_no, allocate_customer_id,
+    allocate_checkin_ds_id, allocate_cin_no, allocate_customer_id, cust_no_from_customer_id,
     allocate_room_status_id, LegacyConn,
 };
 use crate::writeback::constants::{
@@ -361,11 +361,17 @@ pub async fn execute(
     }
 
     // Allocate IDs under TABLOCKX, in dependency order.
+    //
+    // 2026-06-11 audit: Cust_no derives from the SAME `MAX(id)+1` value as
+    // the `id` column, matching iHOTEL's convention (cheatsheet §1.6 #3 —
+    // `Cust_no = 'C' + (id)`). The earlier separate suffix-parsing
+    // allocator was numerically aligned today but would fork from iHOTEL
+    // under any id/Cust_no divergence.
+    let cust_id_int = allocate_customer_id(conn).await?;
     let cust_no = match payload.legacy_cust_no.as_deref() {
         Some(existing) => existing.to_string(),
-        None => allocate_cust_no(conn).await?,
+        None => cust_no_from_customer_id(cust_id_int),
     };
-    let cust_id_int = allocate_customer_id(conn).await?;
     let cin_no = allocate_cin_no(conn).await?;
     let room_status_id_base = allocate_room_status_id(conn).await?;
     // Track B4 — allocate the FIRST `HT_CheckIn_Ds.id` under TABLOCKX

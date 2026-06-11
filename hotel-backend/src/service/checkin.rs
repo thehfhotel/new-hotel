@@ -694,10 +694,13 @@ impl CheckInService {
         }
 
         // 7. Flip room-grid status so the dashboard tile colours update
-        //    on the next refresh. The recipe's MSSQL writeback will
-        //    propagate equivalent `HT_Rooms.Room_Use` flips via the
-        //    sync mapper round-trip — this PG write keeps the local
-        //    view consistent until then.
+        //    on the next refresh. The RoomChange writeback recipe emits
+        //    the matching legacy-side statements (`HT_CheckIn_Ds.Cin_Room_No`
+        //    move + `HT_Rooms.Room_Use` flips for both rooms, cheatsheet
+        //    §3.17) in its own MSSQL transaction — this PG write keeps the
+        //    local view consistent in the meantime. (An earlier comment
+        //    claimed the "sync mappers" would converge MSSQL; they run
+        //    legacy→PG, the wrong direction — corrected 2026-06-11.)
         self.repo
             .mark_room_available_dirty(&mut tx, cmd.from_room_id)
             .await?;

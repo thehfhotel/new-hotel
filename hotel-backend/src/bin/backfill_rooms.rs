@@ -156,7 +156,7 @@ async fn load_default_prices(
             r#"
             SELECT Room_Type, Room_Price
             FROM HT_Rooms_Price
-            WHERE Room_CustType = N'ราคาปกติ'
+            WHERE Room_CustType = 'ราคาปกติ'
               AND Room_Price > 0
             "#,
         )

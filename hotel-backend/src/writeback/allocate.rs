@@ -153,22 +153,22 @@ pub async fn allocate_customer_id(conn: &mut LegacyConn<'_>) -> WritebackResult<
     .await
 }
 
-/// Allocate the next `HT_Customers.Cust_no` — `'C' + integer`.
+/// Derive a `HT_Customers.Cust_no` (`'C' + integer`, no zero padding —
+/// spike §2) from a freshly-allocated `HT_Customers.id`.
 ///
-/// Per spike §2: format is `C\d+` (no zero padding observed). Allocated by
-/// parsing the highest existing `Cust_no` integer suffix and adding one.
-pub async fn allocate_cust_no(conn: &mut LegacyConn<'_>) -> WritebackResult<String> {
-    // Strip leading 'C', cast to int, take MAX, add 1. Cust_no values that
-    // somehow lack the prefix or aren't numeric are excluded — the legacy app
-    // never emits any.
-    let next = select_next_int_with_lock(
-        conn,
-        "SELECT ISNULL(MAX(TRY_CAST(SUBSTRING(Cust_no, 2, 50) AS INT)), 0) + 1 \
-         FROM HT_Customers WITH (TABLOCKX, HOLDLOCK) \
-         WHERE Cust_no LIKE 'C%'",
-    )
-    .await?;
-    Ok(format!("C{next}"))
+/// 2026-06-11 coexistence audit: iHOTEL derives Cust_no from `MAX(id)+1`
+/// (cheatsheet §1.6 #3 — `FrmCheckIn.SAVE_CUST` reads
+/// `SELECT TOP 1 * FROM HT_Customers ORDER BY id DESC`, takes `id+1`),
+/// NOT from the highest existing Cust_no suffix. An earlier allocator here
+/// parsed `MAX(parse(Cust_no))+1` — numerically identical today because
+/// the two sequences have never diverged, but any one-off divergence
+/// (manual row, restore artifact) would fork our sequence away from
+/// iHOTEL's forever. Deriving from the SAME `MAX(id)+1` value that
+/// [`allocate_customer_id`] fetches under TABLOCKX keeps the pair atomic
+/// and convention-identical: callers allocate the id once and feed it
+/// here, so `Cust_no == 'C' + id` exactly like the .NET app.
+pub fn cust_no_from_customer_id(customer_id: i32) -> String {
+    format!("C{customer_id}")
 }
 
 /// Allocate the next `HT_Book_H.Book_ID` — `'R' + zero-padded 6-digit integer`.
@@ -427,8 +427,20 @@ mod tests {
     #[test]
     fn cust_no_format_padding_lookup() {
         // Format invariant: 'C' + integer (no zero-pad)
-        let formatted = format!("C{}", 21607);
-        assert_eq!(formatted, "C21607");
+        assert_eq!(cust_no_from_customer_id(21607), "C21607");
+        assert_eq!(cust_no_from_customer_id(1), "C1");
+    }
+
+    /// 2026-06-11 audit — Cust_no derives from the customer `id` itself
+    /// (cheatsheet §1.6 #3: iHOTEL reads `MAX(id)`, takes +1, and uses the
+    /// same number for both columns). The pairing `Cust_no == 'C' + id`
+    /// must hold for every id our allocator can produce.
+    #[test]
+    fn cust_no_is_always_c_plus_the_allocated_id() {
+        for id in [1, 42, 21607, 21_624, i32::MAX] {
+            let cust_no = cust_no_from_customer_id(id);
+            assert_eq!(cust_no, format!("C{id}"));
+        }
     }
 
     #[test]

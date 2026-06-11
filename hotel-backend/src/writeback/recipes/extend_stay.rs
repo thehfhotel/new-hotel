@@ -4,9 +4,13 @@
 //! Targeted UPDATEs — we **skip the legacy app's destructive Phase B**
 //! (DELETE+REINSERT) per spike §3f recommendation.
 //!
-//! Reference SQL (verbatim from `extend-20260424-101350/writes.txt` lines 3-9):
+//! Reference SQL (verbatim from `extend-20260424-101350/writes.txt`,
+//! findings.md §3f Phase A — 7 statements):
 //!
 //! ```text
+//! 0. UPDATE HT_CheckIn_H SET Cin_Work_number=539215 WHERE Cin_No='CH26-005230'
+//!    -- ONE leading TM.30 touch (findings.md:276)
+//!
 //! 1. update HT_Rooms set room_use='no'
 //!    where room_no in (select Cin_Room_No from HT_CheckIn_Ds
 //!                       where Cin_no='CH26-005230' and Cin_Room_Status<>'Check-Out')
@@ -14,10 +18,10 @@
 //! 2. delete from HT_Room_Status where room_CheckIn_No='CH26-005230'
 //!
 //! 3. UPDATE [HT_CheckIn_H] SET
-//!      [Total_Price_Room]=1780.00, [Total_Price_Product]=0.00,
-//!      [Total_Price_Net]=1780.00, [Total_Price_Pay]=0.00,
-//!      [Total_Price_Balance]=1780.00
+//!      [Total_Price_Room]=1780, [Total_Price_Net]=1780, [Total_Price_Balance]=1780
 //!    where [Cin_no]='CH26-005230'
+//!    -- ONLY Room / Net / Balance (findings.md:279-281). The capture does
+//!    -- NOT touch Total_Price_Product or Total_Price_Pay.
 //!
 //! 4. update [HT_CheckIn_Ds] SET
 //!      [Cin_Room_night]=2, [Cin_Room_PriceTotal]=1780, [Cin_note]='',
@@ -41,6 +45,20 @@
 //!   functionally a no-op. We preserve it for parity.
 //! - `Cin_Room_Out` is the canonical departure time the user picked. Format
 //!   matches the legacy app's `12:00:00 PM` convention.
+//!
+//! ## Deliberate departures (2026-06-11 coexistence audit, P0-3)
+//!
+//! - **`Total_Price_Product` and `Total_Price_Pay` are NOT written.** An
+//!   earlier revision set both — with `product_total` hardcoded `0.0` —
+//!   which zeroed iHOTEL-entered product revenue on every extend and raced
+//!   concurrent payment writebacks on `Total_Price_Pay`. The §3f capture
+//!   never touches those columns; neither do we.
+//! - **`Total_Price_Balance` is re-aggregated live**, not taken from the
+//!   intent payload: `Balance = Net - SUM(active HT_CheckIn_Pay tender)`
+//!   under UPDLOCK+HOLDLOCK held through COMMIT — the same discipline
+//!   `checkout.rs` / `payment.rs` use (Track C T5). The capture's literal
+//!   Balance is only correct because Pay was 0 at capture time; a literal
+//!   would clobber concurrent payments.
 
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 
@@ -67,9 +85,6 @@ pub struct ExtendStayInputs<'a> {
     /// New total room price (`Cin_Room_Price * new_nights`).
     pub new_room_price_total: f64,
     pub new_net_total: f64,
-    pub new_balance: f64,
-    pub product_total: f64,
-    pub pay_total: f64,
     /// Customer name to display in `HT_Room_Status.room_Details` (mirrors the
     /// legacy app's behavior of showing the guest name on the calendar grid).
     pub guest_label: &'a str,
@@ -81,21 +96,23 @@ pub struct ExtendStayInputs<'a> {
     /// First `HT_Room_Status.id` to use. Recipe assigns
     /// `room_status_id_base + i` for the i-th night.
     pub room_status_id_base: i32,
-    /// Random TM.30 batch numbers — spike §3a + §3f capture lines 1-2.
-    /// The .NET app emits two `UPDATE HT_CheckIn_H SET Cin_Work_number=<rand>`
-    /// before every save. Each is a non-sequential i32. The caller generates
-    /// these via `rand::random::<i32>()` so `build_statements` stays pure.
-    /// An empty Vec emits zero touches (useful for tests that focus on the
-    /// downstream statements).
-    pub tm30_touch_ids: Vec<i32>,
+    /// Random TM.30 batch number — spike §3a + §3f capture line 1
+    /// (`findings.md:276`). The .NET app emits ONE
+    /// `UPDATE HT_CheckIn_H SET Cin_Work_number=<rand>` at the start of the
+    /// extend flow. It is a non-sequential i32; the caller generates it via
+    /// `rand::random::<i32>()` so `build_statements` stays pure. `None`
+    /// emits no touch (useful for tests that focus on the downstream
+    /// statements).
+    pub tm30_touch_id: Option<i32>,
 }
 
 /// Build all statements for an extend-stay. PURE — no I/O.
 ///
-/// `tm30_touch_ids` injects the two leading TM.30 touches (spike §3a + §3f
-/// `extend/writes.txt:1,2`). Each is a random `i32` per spike §3a — the
-/// caller (`execute()`) generates two via `rand::random()` so this function
-/// stays pure and trivially unit-testable.
+/// `tm30_touch_id` injects the single leading TM.30 touch (spike §3a + §3f
+/// `extend/writes.txt:1`, findings.md:276 — the capture shows exactly ONE).
+/// It is a random `i32` per spike §3a — the caller (`execute()`) generates
+/// it via `rand::random()` so this function stays pure and trivially
+/// unit-testable.
 pub fn build_statements(inputs: &ExtendStayInputs<'_>) -> Vec<String> {
     let cin_no_q = sql_quote(inputs.cin_no);
     let room_no_q = sql_quote(inputs.room_no);
@@ -106,11 +123,12 @@ pub fn build_statements(inputs: &ExtendStayInputs<'_>) -> Vec<String> {
 
     let mut statements: Vec<String> = Vec::new();
 
-    // 0a/0b. TM.30 touches — spike §3a (`Cin_Work_number` is random + async)
-    //        and §3f extend capture lines 1-2: the .NET app fires two such
-    //        UPDATEs at the start of every Save action that touches a
-    //        check-in. Random i32 per touch, supplied by caller.
-    for tm30_id in &inputs.tm30_touch_ids {
+    // 0. TM.30 touch — spike §3a (`Cin_Work_number` is random + async) and
+    //    §3f extend capture line 1 (findings.md:276): the .NET app fires
+    //    exactly ONE such UPDATE at the start of the extend flow. Random
+    //    i32, supplied by caller. (An earlier revision emitted two —
+    //    corrected per the 2026-06-11 coexistence audit.)
+    if let Some(tm30_id) = inputs.tm30_touch_id {
         statements.push(format!(
             "update HT_CheckIn_H set Cin_Work_number={tm30_id} where Cin_No={cin_no_q}"
         ));
@@ -124,21 +142,32 @@ pub fn build_statements(inputs: &ExtendStayInputs<'_>) -> Vec<String> {
     statements.push(format!(
         "delete from HT_Room_Status where room_CheckIn_No={cin_no_q}"
     ));
-    // 3. Update HT_CheckIn_H totals
-    // Wave 6 LOW item 4: 2dp for consistency with the HT_CheckIn_H create
-    // path (`walkin::build_statements`).
+    // 3. Update HT_CheckIn_H totals — ONLY Room / Net / Balance, matching
+    //    the §3f capture (findings.md:279-281). Total_Price_Product and
+    //    Total_Price_Pay are deliberately untouched (see module docs —
+    //    2026-06-11 audit P0-3).
+    //
+    //    Balance is `Net - SUM(active tender rows)` re-aggregated live from
+    //    `HT_CheckIn_Pay` under UPDLOCK+HOLDLOCK held through COMMIT, the
+    //    same race-safe pattern as `checkout.rs` / `payment.rs` (Track C
+    //    T5): a Balance literal computed from PG state at intent-emit time
+    //    would clobber any payment that committed in between. The
+    //    `Cin_Status <> 'ยกเลิก'` filter excludes cancelled tender rows
+    //    (T2 CRIT-2).
+    //
+    //    Wave 6 LOW item 4: 2dp for consistency with the HT_CheckIn_H
+    //    create path (`walkin::build_statements`).
     statements.push(format!(
-        "UPDATE [HT_CheckIn_H] SET  [Total_Price_Room]={room_price:.2},\
-         [Total_Price_Product]={product:.2},\
+        "UPDATE [HT_CheckIn_H] WITH (UPDLOCK, HOLDLOCK) SET \
+         [Total_Price_Room]={room_price:.2},\
          [Total_Price_Net]={net:.2},\
-         [Total_Price_Pay]={pay:.2},\
-         [Total_Price_Balance]={balance:.2} \
+         [Total_Price_Balance]={net:.2}-(SELECT ISNULL(SUM(ISNULL(Cin_Pay_Cash,0)\
+         +ISNULL(Cin_Pay_Credit,0)+ISNULL(Cin_Pay_Tran,0)+ISNULL(Cin_Pay_Free,0)\
+         +ISNULL(Cin_Pay_web,0)),0) FROM HT_CheckIn_Pay WITH (UPDLOCK, HOLDLOCK) \
+         WHERE Cin_No={cin_no_q} AND ISNULL(Cin_Status,'1') <> 'ยกเลิก') \
          where [Cin_no]={cin_no_q}",
         room_price = inputs.new_room_price_total,
-        product = inputs.product_total,
         net = inputs.new_net_total,
-        pay = inputs.pay_total,
-        balance = inputs.new_balance,
     ));
     // 4. Update HT_CheckIn_Ds (by id) with new nights + price + departure
     statements.push(format!(
@@ -173,16 +202,20 @@ pub fn build_statements(inputs: &ExtendStayInputs<'_>) -> Vec<String> {
 
 /// Execute the extend-stay recipe.
 ///
-/// Now consumes the full payload (spike §3f) — `stay_start`, `guest_label`,
-/// and the four totals (`new_room_price_total`, `new_net_total`, `new_pay`,
-/// `new_balance`) come from the [`WritebackIntent::ExtendStay`] variant the
-/// service layer enriches before enqueuing. Calendar nights span the full
-/// `[stay_start, new_end)` range so `HT_Room_Status` rows cover the entire
-/// stay (not just `[today, new_end)` as the prior implementation did).
+/// Consumes the [`WritebackIntent::ExtendStay`] payload (spike §3f) —
+/// `stay_start`, `guest_label`, and the totals the service layer enriches
+/// before enqueuing. Calendar nights span the full `[stay_start, new_end)`
+/// range so `HT_Room_Status` rows cover the entire stay (not just
+/// `[today, new_end)` as the prior implementation did).
 ///
-/// The two leading TM.30 touches (capture lines 1-2) are generated via
-/// `rand::random::<i32>()` per spike §3a — `Cin_Work_number` is a
-/// non-sequential random i32 the .NET app assigns ~5s after each save.
+/// `new_pay_total` / `new_balance_total` are still accepted (older queued
+/// intents carry them, and we validate finiteness) but are NOT written to
+/// MSSQL — the §3f capture never touches `Total_Price_Pay`, and Balance is
+/// re-aggregated live inside the UPDATE (2026-06-11 audit P0-3).
+///
+/// The single leading TM.30 touch (capture line 1, findings.md:276) is
+/// generated via `rand::random::<i32>()` per spike §3a — `Cin_Work_number`
+/// is a non-sequential random i32 the .NET app assigns after each save.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute(
     conn: &mut LegacyConn<'_>,
@@ -222,19 +255,17 @@ pub async fn execute(
         new_nights: nights.len() as i32,
         new_room_price_total: money_to_baht_f64(new_room_price_total),
         new_net_total: money_to_baht_f64(new_net_total),
-        new_balance: money_to_baht_f64(new_balance_total),
-        product_total: 0.0,
-        pay_total: money_to_baht_f64(new_pay_total),
         guest_label,
         nights,
         room_status_id_base: id_base,
         // Spike §3a: TM.30 batch numbers are non-sequential random i32
-        // assigned by the .NET app's async post-save job. We mirror two
-        // touches per the extend capture (lines 1-2). MED-3: clamp to the
-        // positive i32 range — the .NET app's Cin_Work_number column is
-        // signed but no spike capture has ever observed a negative value,
-        // and a negative number may trip the WinForms grid control.
-        tm30_touch_ids: vec![positive_i32(), positive_i32()],
+        // assigned by the .NET app's async post-save job. We mirror ONE
+        // touch per the extend capture (line 1, findings.md:276). MED-3:
+        // clamp to the positive i32 range — the .NET app's Cin_Work_number
+        // column is signed but no spike capture has ever observed a
+        // negative value, and a negative number may trip the WinForms grid
+        // control.
+        tm30_touch_id: Some(positive_i32()),
     };
     let statements = build_statements(&inputs);
     super::execute_all(conn, &statements).await?;
@@ -256,7 +287,7 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
-    /// Verifies the structure against the spike capture's first 9 statements.
+    /// Verifies the structure against the spike capture's statements.
     #[test]
     fn build_statements_matches_spike_structure() {
         let inputs = ExtendStayInputs {
@@ -268,16 +299,13 @@ mod tests {
             new_nights: 2,
             new_room_price_total: 1780.0,
             new_net_total: 1780.0,
-            new_balance: 1780.0,
-            product_total: 0.0,
-            pay_total: 0.0,
             guest_label: "SPIKE TEST WALKIN 3",
             nights: vec![
                 NaiveDate::from_ymd_opt(2026, 4, 24).unwrap(),
                 NaiveDate::from_ymd_opt(2026, 4, 25).unwrap(),
             ],
             room_status_id_base: 50235,
-            tm30_touch_ids: vec![],
+            tm30_touch_id: None,
         };
         let statements = build_statements(&inputs);
         // 5 fixed + 2 night rows
@@ -291,10 +319,12 @@ mod tests {
             statements[1],
             "delete from HT_Room_Status where room_CheckIn_No='CH26-005230'"
         );
-        // 3: totals on HT_CheckIn_H
+        // 3: totals on HT_CheckIn_H — Room + Net literal, Balance live
+        //    re-aggregate (byte-pinned in
+        //    `totals_update_matches_capture_columns_with_live_balance`).
         assert!(statements[2].contains("[Total_Price_Room]=1780"));
         assert!(statements[2].contains("[Total_Price_Net]=1780"));
-        assert!(statements[2].contains("[Total_Price_Balance]=1780"));
+        assert!(statements[2].contains("[Total_Price_Balance]=1780.00-(SELECT"));
         // 4: HT_CheckIn_Ds (by id)
         assert!(statements[3].contains("[Cin_Room_night]=2"));
         assert!(statements[3].contains("[Cin_Room_PriceTotal]=1780"));
@@ -315,9 +345,10 @@ mod tests {
     }
 
     #[test]
-    fn tm30_touches_lead_when_provided() {
-        // Spike §3f capture lines 1-2: two leading TM.30 UPDATEs before any
-        // other statement.
+    fn single_tm30_touch_leads_when_provided() {
+        // Spike §3f capture line 1 (findings.md:276): exactly ONE leading
+        // TM.30 UPDATE before any other statement. (An earlier revision
+        // emitted two — corrected per the 2026-06-11 coexistence audit.)
         let inputs = ExtendStayInputs {
             cin_no: "CH26-005230",
             room_no: "508",
@@ -326,20 +357,70 @@ mod tests {
             new_nights: 2,
             new_room_price_total: 1780.0,
             new_net_total: 1780.0,
-            new_balance: 1780.0,
-            product_total: 0.0,
-            pay_total: 0.0,
             guest_label: "SPIKE TEST WALKIN 3",
             nights: vec![],
             room_status_id_base: 50235,
-            tm30_touch_ids: vec![539215, 539216],
+            tm30_touch_id: Some(539215),
         };
         let statements = build_statements(&inputs);
-        // First two statements must be TM.30 touches in order.
-        assert!(statements[0].contains("Cin_Work_number=539215"));
-        assert!(statements[0].contains("Cin_No='CH26-005230'"));
-        assert!(statements[1].contains("Cin_Work_number=539216"));
-        assert!(statements[1].contains("Cin_No='CH26-005230'"));
+        // First statement is the TM.30 touch — byte-pinned to the capture
+        // shape (modulo the random batch number).
+        assert_eq!(
+            statements[0],
+            "update HT_CheckIn_H set Cin_Work_number=539215 where Cin_No='CH26-005230'"
+        );
+        // And exactly one touch in the whole recipe.
+        let touches = statements
+            .iter()
+            .filter(|s| s.contains("Cin_Work_number="))
+            .count();
+        assert_eq!(touches, 1, "extend must emit exactly one TM.30 touch");
+    }
+
+    /// 2026-06-11 audit P0-3 — byte-pin the HT_CheckIn_H totals UPDATE:
+    /// only Room / Net / Balance (the §3f capture's column set,
+    /// findings.md:279-281); Balance is the live re-aggregate; Product and
+    /// Pay are never written.
+    #[test]
+    fn totals_update_matches_capture_columns_with_live_balance() {
+        let inputs = ExtendStayInputs {
+            cin_no: "CH26-005230",
+            room_no: "508",
+            checkin_ds_id: 25009,
+            new_end: Utc.with_ymd_and_hms(2026, 4, 26, 5, 0, 0).unwrap(),
+            new_nights: 2,
+            new_room_price_total: 1780.0,
+            new_net_total: 1780.0,
+            guest_label: "SPIKE TEST WALKIN 3",
+            nights: vec![],
+            room_status_id_base: 50235,
+            tm30_touch_id: None,
+        };
+        let statements = build_statements(&inputs);
+        let totals = statements
+            .iter()
+            .find(|s| s.contains("[Total_Price_Room]"))
+            .expect("totals UPDATE must be emitted");
+        assert_eq!(
+            *totals,
+            "UPDATE [HT_CheckIn_H] WITH (UPDLOCK, HOLDLOCK) SET \
+             [Total_Price_Room]=1780.00,\
+             [Total_Price_Net]=1780.00,\
+             [Total_Price_Balance]=1780.00-(SELECT ISNULL(SUM(ISNULL(Cin_Pay_Cash,0)\
+             +ISNULL(Cin_Pay_Credit,0)+ISNULL(Cin_Pay_Tran,0)+ISNULL(Cin_Pay_Free,0)\
+             +ISNULL(Cin_Pay_web,0)),0) FROM HT_CheckIn_Pay WITH (UPDLOCK, HOLDLOCK) \
+             WHERE Cin_No='CH26-005230' AND ISNULL(Cin_Status,'1') <> 'ยกเลิก') \
+             where [Cin_no]='CH26-005230'"
+        );
+        // The two columns the capture never touches must NOT appear.
+        assert!(
+            !totals.contains("[Total_Price_Product]"),
+            "extend must not clobber Total_Price_Product: {totals}"
+        );
+        assert!(
+            !totals.contains("[Total_Price_Pay]"),
+            "extend must not clobber Total_Price_Pay: {totals}"
+        );
     }
 
     /// Wave 6: enumerate_calendar_nights now lives in `writeback::format`
@@ -378,13 +459,10 @@ mod tests {
             new_nights: 2,
             new_room_price_total: 1780.0,
             new_net_total: 1780.0,
-            new_balance: 1780.0,
-            product_total: 0.0,
-            pay_total: 0.0,
             guest_label: "MULTI",
             nights: vec![],
             room_status_id_base: 50235,
-            tm30_touch_ids: vec![],
+            tm30_touch_id: None,
         };
         let statements = build_statements(&inputs);
         let step5 = statements
@@ -416,13 +494,10 @@ mod tests {
             new_nights: 1,
             new_room_price_total: 890.0,
             new_net_total: 890.0,
-            new_balance: 890.0,
-            product_total: 0.0,
-            pay_total: 0.0,
             guest_label: "SOLO",
             nights: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],
             room_status_id_base: 50235,
-            tm30_touch_ids: vec![],
+            tm30_touch_id: None,
         };
         let statements = build_statements(&inputs);
         // Step-1 and step-5 must share the EXACT same subquery / WHERE shape
@@ -456,13 +531,10 @@ mod tests {
             new_nights: 2,
             new_room_price_total: 1780.0,
             new_net_total: 1780.0,
-            new_balance: 1780.0,
-            product_total: 0.0,
-            pay_total: 0.0,
             guest_label: "",
             nights: vec![],
             room_status_id_base: 50235,
-            tm30_touch_ids: vec![],
+            tm30_touch_id: None,
         };
         let statements = build_statements(&inputs);
         for s in &statements {

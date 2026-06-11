@@ -206,18 +206,18 @@ pub fn build_statements(
     //    negative refund row is naturally included in the SUM, so the
     //    header totals settle to `prior_pay_total - refund` without an
     //    additive UPDATE. Cancelled tender rows excluded via the
-    //    `ISNULL(Cin_Status,'1') <> N'ยกเลิก'` filter (T2 CRIT-2).
+    //    `ISNULL(Cin_Status,'1') <> 'ยกเลิก'` filter (T2 CRIT-2).
     statements.push(format!(
         "UPDATE [HT_CheckIn_H] WITH (UPDLOCK, HOLDLOCK) SET \
          [Total_Price_Pay]=(SELECT ISNULL(SUM(ISNULL(Cin_Pay_Cash,0)+ISNULL(Cin_Pay_Credit,0)\
          +ISNULL(Cin_Pay_Tran,0)+ISNULL(Cin_Pay_Free,0)+ISNULL(Cin_Pay_web,0)),0) \
          FROM HT_CheckIn_Pay WITH (UPDLOCK, HOLDLOCK) \
-         WHERE Cin_No={cin_no_q} AND ISNULL(Cin_Status,'1') <> N'ยกเลิก'),\
+         WHERE Cin_No={cin_no_q} AND ISNULL(Cin_Status,'1') <> 'ยกเลิก'),\
          [Total_Price_Balance]=ISNULL([Total_Price_Net],0)-(SELECT ISNULL(SUM(\
          ISNULL(Cin_Pay_Cash,0)+ISNULL(Cin_Pay_Credit,0)+ISNULL(Cin_Pay_Tran,0)\
          +ISNULL(Cin_Pay_Free,0)+ISNULL(Cin_Pay_web,0)),0) \
          FROM HT_CheckIn_Pay WITH (UPDLOCK, HOLDLOCK) \
-         WHERE Cin_No={cin_no_q} AND ISNULL(Cin_Status,'1') <> N'ยกเลิก') \
+         WHERE Cin_No={cin_no_q} AND ISNULL(Cin_Status,'1') <> 'ยกเลิก') \
          where [Cin_no]={cin_no_q}"
     ));
 
@@ -229,7 +229,7 @@ pub fn build_statements(
          Total_Price_vat=(SELECT ISNULL(SUM(ISNULL(Cin_Pay_Cash,0)+ISNULL(Cin_Pay_Credit,0)\
          +ISNULL(Cin_Pay_Tran,0)+ISNULL(Cin_Pay_Free,0)+ISNULL(Cin_Pay_web,0)),0) \
          FROM HT_CheckIn_Pay WITH (UPDLOCK, HOLDLOCK) \
-         WHERE Cin_No={cin_no_q} AND ISNULL(Cin_Status,'1') <> N'ยกเลิก') \
+         WHERE Cin_No={cin_no_q} AND ISNULL(Cin_Status,'1') <> 'ยกเลิก') \
          where Cin_no={cin_no_q}"
     ));
 
@@ -448,7 +448,7 @@ mod tests {
             "Total_Price_Pay must be absolute re-aggregate, not additive; got:\n{totals}"
         );
         assert!(
-            totals.contains("ISNULL(Cin_Status,'1') <> N'ยกเลิก'"),
+            totals.contains("ISNULL(Cin_Status,'1') <> 'ยกเลิก'"),
             "aggregate must exclude cancelled tender rows; got:\n{totals}"
         );
     }

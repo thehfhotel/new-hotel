@@ -41,8 +41,8 @@ use crate::writeback::allocate::{
 };
 use crate::writeback::constants::{
     power_log_note_check_in, BOOK_STATUS_OCCUPYING, CIN_DEP_STATUS_NONE,
-    CIN_ROOM_STATUS_OCCUPYING, CIN_STATUS_NORMAL, CUST_TYPE_MAIN_INDIVIDUAL, CUST_TYPE_NORMAL,
-    DEFAULT_OPERATOR, ROOM_STATUS_OCCUPYING,
+    CIN_ROOM_STATUS_OCCUPYING, CIN_STATUS_NORMAL, CUST_TYPE_NORMAL, DEFAULT_OPERATOR,
+    ROOM_STATUS_OCCUPYING,
 };
 use crate::writeback::dispatcher::LegacyIds;
 use crate::writeback::error::{WritebackError, WritebackResult};
@@ -101,8 +101,6 @@ pub fn build_statements(inputs: &CheckInToBookingInputs<'_>) -> Vec<String> {
     let by_q = sql_quote(inputs.created_by);
     let cust_name_q = sql_quote(inputs.customer_name);
     let cust_phone_q = sql_quote(inputs.customer_phone.unwrap_or(""));
-    let cust_type_q = sql_quote(CUST_TYPE_NORMAL);
-    let cust_type_main_q = sql_quote(CUST_TYPE_MAIN_INDIVIDUAL);
     let stay_start_q = sql_quote(&format_legacy_datetime(inputs.stay_start));
     let stay_end_q = sql_quote(&format_legacy_datetime(inputs.stay_end));
     let now_q = sql_quote(&format_legacy_datetime(inputs.created_at));
@@ -136,25 +134,34 @@ pub fn build_statements(inputs: &CheckInToBookingInputs<'_>) -> Vec<String> {
         9 + inputs.nights_calendar.len() * lines.len() + lines.len(),
     );
 
-    // 1. UPDATE HT_Customers — full 31-field re-save (verified from
-    //    /tmp/legacy-events-full.log capture for Cust_no C21624 line
-    //    3988). Field order: name, name2, Type, Type_main, Email,
-    //    Add_*, Work_*, Work_tax, perfix, sex, IDcard, Contry. Most
-    //    fields blank by default; payload extension to surface them
-    //    is a separate task. `[Cust_Type_main]` lowercase m matches
-    //    the .NET app's UPDATE form (distinct from the INSERT form's
-    //    `[Cust_Type_Main]` capital M).
+    // 1. UPDATE HT_Customers — narrow re-save (2026-06-11 audit P1-9).
+    //
+    //    iHOTEL's re-save writes back the values it LOADED from the row,
+    //    so its end state preserves every profile field. Our payload only
+    //    carries name / phone / country — an earlier revision mirrored the
+    //    .NET app's 31-field UPDATE shape but filled the ~25 fields the
+    //    payload doesn't carry with `''` (email, addresses, ID-card,
+    //    prefix, sex, …), erasing receptionist-entered iHOTEL data on
+    //    every booking-linked check-in. It also force-reset the
+    //    Cust_Type / Cust_Type_main tier columns to hardcoded defaults.
+    //
+    //    Fix: SET only what the payload actually carries. Fields the
+    //    payload doesn't carry are simply absent from the SET list — the
+    //    existing MSSQL values survive, which is exactly the end state
+    //    iHOTEL's load-then-resave produces. Phone is skipped when the
+    //    payload has none (None ⇒ preserve, not blank); country is
+    //    skipped when empty for the same reason. Capture conventions kept:
+    //    two spaces after `SET`, lowercase `where`.
+    let mut cust_sets = vec![format!("[Cust_name]={cust_name_q}")];
+    if inputs.customer_phone.is_some() {
+        cust_sets.push(format!("[Cust_Add_tel]={cust_phone_q}"));
+    }
+    if !inputs.guest_country.is_empty() {
+        cust_sets.push(format!("[Cust_Contry]={country_q}"));
+    }
     statements.push(format!(
-        "UPDATE [HT_Customers] SET  [Cust_name]={cust_name_q},[Cust_name2]='',\
-         [Cust_Type]={cust_type_q},[Cust_Type_main]={cust_type_main_q},[Cust_Email]='',\
-         [Cust_Add_no]='',[Cust_Add_moo]='',[Cust_Add_soi]='',[Cust_Add_road]='',\
-         [Cust_Add_tambon]='',[Cust_Add_ampore]='',[Cust_Add_province]='',\
-         [Cust_Add_code]='',[Cust_Add_tel]={cust_phone_q},[Cust_Add_fax]='',\
-         [Cust_Work_Name]='',[Cust_Work_no]='',[Cust_Work_moo]='',[Cust_Work_soi]='',\
-         [Cust_Work_road]='',[Cust_Work_tambon]='',[Cust_Work_ampore]='',\
-         [Cust_Work_province]='',[Cust_Work_code]='',[Cust_Work_tel]='',[Cust_Work_fax]='',\
-         [Cust_Work_tax]='',[Cust_perfix]='',[Cust_sex]='',[Cust_IDcard]='',\
-         [Cust_Contry]={country_q} where Cust_no={cust_no_q}"
+        "UPDATE [HT_Customers] SET  {sets} where Cust_no={cust_no_q}",
+        sets = cust_sets.join(","),
     ));
 
     // 1b. Tb_Save_Image — link uploaded photo to the new check-in.
@@ -750,37 +757,65 @@ mod tests {
         assert!(cupon.contains("cupon_cin_no='CH26-005231'"));
     }
 
+    /// 2026-06-11 audit P1-9 — the re-save SETs ONLY the fields the
+    /// payload carries. The sample payload has no phone and an empty
+    /// country, so the UPDATE is name-only — byte-pinned. iHOTEL's own
+    /// re-save preserves loaded values; blanking the ~25 uncarried
+    /// fields (email, addresses, ID-card, prefix, sex, tier) erased
+    /// receptionist-entered data.
     #[test]
-    fn ht_customers_update_spans_full_field_set_with_perfix_sex_idcard_contry() {
-        // Verified from /tmp/legacy-events-full.log capture for
-        // Cust_no C21624 (line 3988): the .NET app's UPDATE includes
-        // the trailing 5 fields Cust_Work_tax, Cust_perfix, Cust_sex,
-        // Cust_IDcard, Cust_Contry — and uses [Cust_Type_main]
-        // (lowercase m), distinct from the INSERT path's
-        // [Cust_Type_Main].
+    fn ht_customers_update_sets_only_payload_carried_fields() {
         let s = build_statements(&sample_inputs());
         let upd = s
             .iter()
             .find(|s| s.starts_with("UPDATE [HT_Customers]"))
             .unwrap();
+        // Byte-pinned narrow shape (capture conventions: two spaces after
+        // SET, lowercase `where`).
+        assert_eq!(
+            upd,
+            "UPDATE [HT_Customers] SET  [Cust_name]='SPIKE TEST WALKIN' \
+             where Cust_no='C21610'"
+        );
+        // None of the previously-blanked fields may appear.
         for field in [
-            "[Cust_Email]=''",
-            "[Cust_Add_no]=''",
-            "[Cust_Add_moo]=''",
-            "[Cust_Work_Name]=''",
-            "[Cust_Work_no]=''",
-            "[Cust_Work_road]=''",
-            "[Cust_Type_main]='บุคคลธรรมดา'",
-            "[Cust_Work_tax]=''",
-            "[Cust_perfix]=''",
-            "[Cust_sex]=''",
-            "[Cust_IDcard]=''",
-            "[Cust_Contry]=''",
+            "[Cust_name2]",
+            "[Cust_Type]",
+            "[Cust_Type_main]",
+            "[Cust_Email]",
+            "[Cust_Add_no]",
+            "[Cust_Add_moo]",
+            "[Cust_Add_soi]",
+            "[Cust_Add_road]",
+            "[Cust_Work_Name]",
+            "[Cust_Work_tax]",
+            "[Cust_perfix]",
+            "[Cust_sex]",
+            "[Cust_IDcard]",
         ] {
-            assert!(upd.contains(field), "missing field in UPDATE: {field}");
+            assert!(
+                !upd.contains(field),
+                "field {field} must NOT be blanked by the re-save: {upd}"
+            );
         }
-        // Lowercase "where" — matches the legacy capture form.
-        assert!(upd.contains(" where Cust_no='C21610'"));
+    }
+
+    /// P1-9 — a non-empty country in the payload still lands in
+    /// `Cust_Contry`; an empty one is omitted (preserve, don't blank).
+    #[test]
+    fn ht_customers_update_carries_country_only_when_non_empty() {
+        let mut inputs = sample_inputs();
+        inputs.guest_country = "Spain";
+        let s = build_statements(&inputs);
+        let upd = s
+            .iter()
+            .find(|s| s.starts_with("UPDATE [HT_Customers]"))
+            .unwrap();
+        assert_eq!(
+            upd,
+            "UPDATE [HT_Customers] SET  [Cust_name]='SPIKE TEST WALKIN',\
+             [Cust_Contry]='Spain' where Cust_no='C21610'"
+        );
     }
 
     /// Audit H13: linked-to-booking `execute()` must reject NaN before any
@@ -834,18 +869,21 @@ mod tests {
         );
     }
 
-    /// Wave 5a item 1: an absent phone (`None`) must continue to emit
-    /// `[Cust_Add_tel]=''` — the prior behavior for the no-data path
-    /// is preserved so booking-linked check-ins without a phone don't
-    /// regress to writing `NULL` (the legacy WinForms downstream
-    /// crashes on `NULL` per the booking_create recipe convention).
+    /// 2026-06-11 audit P1-9: an absent phone (`None`) must OMIT
+    /// `Cust_Add_tel` from the SET list entirely — preserving whatever
+    /// phone iHOTEL has on file. (The pre-audit behavior wrote
+    /// `[Cust_Add_tel]=''`, wiping the booking-time phone whenever the
+    /// payload carried none.)
     #[test]
-    fn customer_phone_renders_empty_string_when_none() {
+    fn customer_phone_omitted_when_none() {
         let s = build_statements(&sample_inputs());
         let upd = s
             .iter()
             .find(|s| s.starts_with("UPDATE [HT_Customers]"))
             .unwrap();
-        assert!(upd.contains("[Cust_Add_tel]=''"));
+        assert!(
+            !upd.contains("[Cust_Add_tel]"),
+            "absent phone must not blank Cust_Add_tel: {upd}"
+        );
     }
 }

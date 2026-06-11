@@ -202,15 +202,18 @@ pub fn build_statements(
 
     let mut statements: Vec<String> = Vec::with_capacity(8);
 
-    // 1. Defensive cart clear — spike §3h `invoice/writes.txt:2`. The .NET app
-    //    drops any in-progress `HT_CheckIn_Product` rows before settling. We
-    //    don't write that table today, so this is almost always a no-op, but
-    //    we emit it for byte-level parity with the legacy capture.
-    statements.push(format!(
-        "delete from HT_CheckIn_Product where Cin_no={cin_no_q}"
-    ));
+    // NOTE (2026-06-11 coexistence audit, P0-2): earlier revisions emitted a
+    // `delete from HT_CheckIn_Product where Cin_no=…` "cart clear" here,
+    // attributed to the §3h capture. The §3h capture contains NO such
+    // statement (it is 4 statements: pay INSERT, totals UPDATE, receipt
+    // header, receipt line) — the delete was a Phase-1 artifact. Worse, it
+    // erased iHOTEL-entered minibar/product lines WITHOUT the mandatory
+    // `HT_Products.Pro_Amt` stock-restore pairing (COMPAT_CHEATSHEET §6.3),
+    // corrupting both the folio and product stock on every payment against a
+    // folio with product charges. Removed — do not reintroduce without a
+    // fresh capture showing iHOTEL doing it.
 
-    // 2. Per-room apportionment — spike §3h `invoice/writes.txt:3`. Fires
+    // 1. Per-room apportionment — spike §3h `invoice/writes.txt:3`. Fires
     //    immediately before the HT_CheckIn_Pay INSERT. Only emitted when the
     //    route resolved a specific `HT_CheckIn_Ds.id`.
     // Wave 6 LOW item 4: 2dp for consistency with the HT_CheckIn_Pay /
@@ -221,7 +224,7 @@ pub fn build_statements(
         ));
     }
 
-    // 3. HT_CheckIn_Pay — payment row. 20 columns in the legacy app's
+    // 2. HT_CheckIn_Pay — payment row. 20 columns in the legacy app's
     //    canonical order (verified from 24 captures in
     //    /tmp/legacy-events-full.log; every row uses this exact column
     //    sequence). Note `[Cin_Pay_Ds_PriceTotal]` precedes
@@ -267,7 +270,7 @@ pub fn build_statements(
          WHERE NOT EXISTS (SELECT 1 FROM HT_CheckIn_Pay WHERE Pay_no={pay_no_q})"
     ));
 
-    // 4. HT_CheckIn_H — Total_Price_Pay + Total_Price_Balance re-aggregated
+    // 3. HT_CheckIn_H — Total_Price_Pay + Total_Price_Balance re-aggregated
     //    from `HT_CheckIn_Pay` rows under UPDLOCK+HOLDLOCK
     //    (Track C — T5 CRIT-1, `docs/coexistence/audit-2026-05-13.md`).
     //
@@ -285,7 +288,7 @@ pub fn build_statements(
     //    promotes to serializable-range), blocking iHOTEL's read-modify-write
     //    until we finish. The absolute SET we then write is correct by
     //    re-aggregation, so we no longer race the iHOTEL absolute SET. The
-    //    `cin_status <> N'ยกเลิก'` filter excludes cancelled tender rows
+    //    `cin_status <> 'ยกเลิก'` filter excludes cancelled tender rows
     //    per T2 CRIT-2 (`Cin_Status` column on HT_CheckIn_Pay carries
     //    `'1'` for active or `'ยกเลิก'` for cancelled — COMPAT_CHEATSHEET
     //    line 106 / 498-500).
@@ -297,16 +300,16 @@ pub fn build_statements(
          [Total_Price_Pay]=(SELECT ISNULL(SUM(ISNULL(Cin_Pay_Cash,0)+ISNULL(Cin_Pay_Credit,0)\
          +ISNULL(Cin_Pay_Tran,0)+ISNULL(Cin_Pay_Free,0)+ISNULL(Cin_Pay_web,0)),0) \
          FROM HT_CheckIn_Pay WITH (UPDLOCK, HOLDLOCK) \
-         WHERE Cin_No={cin_no_q} AND ISNULL(Cin_Status,'1') <> N'ยกเลิก'),\
+         WHERE Cin_No={cin_no_q} AND ISNULL(Cin_Status,'1') <> 'ยกเลิก'),\
          [Total_Price_Balance]=ISNULL([Total_Price_Net],0)-(SELECT ISNULL(SUM(\
          ISNULL(Cin_Pay_Cash,0)+ISNULL(Cin_Pay_Credit,0)+ISNULL(Cin_Pay_Tran,0)\
          +ISNULL(Cin_Pay_Free,0)+ISNULL(Cin_Pay_web,0)),0) \
          FROM HT_CheckIn_Pay WITH (UPDLOCK, HOLDLOCK) \
-         WHERE Cin_No={cin_no_q} AND ISNULL(Cin_Status,'1') <> N'ยกเลิก') \
+         WHERE Cin_No={cin_no_q} AND ISNULL(Cin_Status,'1') <> 'ยกเลิก') \
          where [Cin_no]={cin_no_q}"
     ));
 
-    // 5. VAT accumulator — spike §3h `invoice/writes.txt:6`. This hotel uses
+    // 4. VAT accumulator — spike §3h `invoice/writes.txt:6`. This hotel uses
     //    no VAT (the captured value is the gross amount), but the .NET app
     //    still increments `Total_Price_vat` by the payment amount on every
     //    invoice. Emit it for parity so reports that aggregate this column
@@ -322,11 +325,11 @@ pub fn build_statements(
          Total_Price_vat=(SELECT ISNULL(SUM(ISNULL(Cin_Pay_Cash,0)+ISNULL(Cin_Pay_Credit,0)\
          +ISNULL(Cin_Pay_Tran,0)+ISNULL(Cin_Pay_Free,0)+ISNULL(Cin_Pay_web,0)),0) \
          FROM HT_CheckIn_Pay WITH (UPDLOCK, HOLDLOCK) \
-         WHERE Cin_No={cin_no_q} AND ISNULL(Cin_Status,'1') <> N'ยกเลิก') \
+         WHERE Cin_No={cin_no_q} AND ISNULL(Cin_Status,'1') <> 'ยกเลิก') \
          where Cin_no={cin_no_q}"
     ));
 
-    // 6. HT_Receipt_H — receipt header. 20-column canonical order
+    // 5. HT_Receipt_H — receipt header. 20-column canonical order
     //    matching all captured rows in /tmp/legacy-events-full.log
     //    (e.g. Receipt_H 20663). VAT-inclusive math via
     //    [`vat_inclusive_split`]. `[Receipt_ref]` (lowercase r) carries
@@ -346,7 +349,7 @@ pub fn build_statements(
         vat_per = inputs.vat_percent,
     ));
 
-    // 7. HT_Receipt_Ds — receipt line for the room charge. Audit H4: the
+    // 6. HT_Receipt_Ds — receipt line for the room charge. Audit H4: the
     //    legacy capture (`invoice-20260424-100827/writes.txt:8`) emits
     //    `S_Unit=1.00, S_Price=711.00, S_Total=711.00, S_PriceDiscount=0.00`
     //    — every numeric column rendered with two decimals. The prior code
@@ -572,11 +575,11 @@ mod tests {
     }
 
     #[test]
-    fn produces_seven_statements_when_per_room_apportionment_set() {
-        // 1 cart-clear + 1 per-room update + 1 HT_CheckIn_Pay + 1 HT_CheckIn_H
-        // totals + 1 VAT accumulator + 1 HT_Receipt_H + 1 HT_Receipt_Ds = 7
+    fn produces_six_statements_when_per_room_apportionment_set() {
+        // 1 per-room update + 1 HT_CheckIn_Pay + 1 HT_CheckIn_H totals
+        // + 1 VAT accumulator + 1 HT_Receipt_H + 1 HT_Receipt_Ds = 6
         let s = build_statements(&sample_inputs()).unwrap();
-        assert_eq!(s.len(), 7);
+        assert_eq!(s.len(), 6);
     }
 
     #[test]
@@ -584,18 +587,22 @@ mod tests {
         let mut inputs = sample_inputs();
         inputs.checkin_ds_id = None;
         let s = build_statements(&inputs).unwrap();
-        assert_eq!(s.len(), 6);
+        assert_eq!(s.len(), 5);
         assert!(!s.iter().any(|s| s.contains("[Cin_Room_Pay_Total]=")));
     }
 
+    /// 2026-06-11 coexistence audit P0-2: the recipe must NOT delete
+    /// `HT_CheckIn_Product` rows. The §3h capture has no cart-clear, and a
+    /// bare DELETE would erase iHOTEL-entered product lines without the
+    /// mandatory `Pro_Amt` stock-restore pairing (cheatsheet §6.3).
     #[test]
-    fn includes_defensive_cart_clear_per_spike_capture_line_2() {
+    fn never_deletes_checkin_product_rows() {
         let s = build_statements(&sample_inputs()).unwrap();
-        let clear = s
-            .iter()
-            .find(|s| s.starts_with("delete from HT_CheckIn_Product"))
-            .expect("cart clear must be emitted");
-        assert!(clear.contains("Cin_no='CH26-005236'"));
+        assert!(
+            !s.iter()
+                .any(|s| s.to_ascii_lowercase().contains("delete from ht_checkin_product")),
+            "payment recipe must not touch HT_CheckIn_Product; got: {s:#?}"
+        );
     }
 
     #[test]
@@ -668,8 +675,8 @@ mod tests {
         );
         // Must filter cancelled rows (T2 CRIT-2).
         assert!(
-            vat.contains("ISNULL(Cin_Status,'1') <> N'ยกเลิก'"),
-            "VAT aggregate must exclude cancelled (Cin_Status=N'ยกเลิก') tender rows; got:\n{vat}"
+            vat.contains("ISNULL(Cin_Status,'1') <> 'ยกเลิก'"),
+            "VAT aggregate must exclude cancelled (Cin_Status='ยกเลิก') tender rows; got:\n{vat}"
         );
         // Must filter by current Cin_No.
         assert!(vat.contains("WHERE Cin_No='CH26-005236'"));
@@ -717,8 +724,8 @@ mod tests {
         }
         // Cancelled tender rows excluded (T2 CRIT-2).
         assert!(
-            upd.contains("ISNULL(Cin_Status,'1') <> N'ยกเลิก'"),
-            "aggregate must exclude cancelled (Cin_Status=N'ยกเลิก') tender rows; got:\n{upd}"
+            upd.contains("ISNULL(Cin_Status,'1') <> 'ยกเลิก'"),
+            "aggregate must exclude cancelled (Cin_Status='ยกเลิก') tender rows; got:\n{upd}"
         );
         // Balance = Net - aggregate (relative to canonical aggregate).
         assert!(
