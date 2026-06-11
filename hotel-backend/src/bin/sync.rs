@@ -382,7 +382,8 @@ const SHADOW_MODE_MAX_DURATION_SECS: u64 = 36 * 3600;
 const WATCHDOG_ALERT_COOLDOWN_SECS: u64 = 1800;
 
 /// 2026-05-22 — number of CONSECUTIVE probe failures required before
-/// the watchdog pages the `:warning:` (probe-timeout) class. A single
+/// the watchdog pages the `:information_source:` (probe-timeout,
+/// informational since 2026-06-11) class. A single
 /// 5s `CHANGE_TRACKING_CURRENT_VERSION()` timeout inside the 60s tick
 /// is dominated by transient iHOTEL lock contention (`TABLOCKX,
 /// HOLDLOCK` on `HT_CheckIn_Ds.get_id` cascades and report runs — see
@@ -1313,7 +1314,7 @@ fn should_fire_stall_alert(watermark: i64, ct_current_probe: Option<i64>) -> boo
     }
 }
 
-/// Streak gate for the probe-timeout (`:warning:`) class. When the
+/// Streak gate for the probe-timeout (`:information_source:`) class. When the
 /// watchdog probe fails (`None`), a single observation is noise — a 5s
 /// timeout inside a 60s tick is usually transient iHOTEL lock
 /// contention that clears on the next tick. This function suppresses
@@ -1349,15 +1350,50 @@ fn probe_failure_streak_passes_gate(
     }
 }
 
+/// Severity-aware cooldown gate for stall pages (2026-06-11, paired
+/// with the probe-timeout demotion to `:information_source:`).
+///
+/// `last` is the previous page as `(when, was_critical)`;
+/// `is_critical` describes the page being considered now (critical =
+/// the probe SUCCEEDED and confirmed a backlog or monotonicity
+/// violation; non-critical = the probe-timeout informational class).
+///
+/// Rules:
+/// 1. No prior page → pass.
+/// 2. Cooldown elapsed → pass.
+/// 3. Inside cooldown, but the new page is CRITICAL and the prior page
+///    was only informational → pass (escalation bypass). Without this,
+///    a probe-timeout info note would shadow a confirmed-backlog
+///    `:rotating_light:` for up to [`WATCHDOG_ALERT_COOLDOWN_SECS`].
+/// 4. Otherwise → suppress.
+fn stall_page_passes_cooldown(
+    last: Option<(Instant, bool)>,
+    now: Instant,
+    cooldown: Duration,
+    is_critical: bool,
+) -> bool {
+    match last {
+        None => true,
+        Some((paged_at, was_critical)) => {
+            now.duration_since(paged_at) >= cooldown || (is_critical && !was_critical)
+        }
+    }
+}
+
 /// Tone-aware Slack message for a watermark stall page. Severity is
 /// derived from the probe outcome:
 ///
-/// * `probe = None` (timeout / DB failure) → `:warning:` —
+/// * `probe = None` (timeout / DB failure) → `:information_source:` —
 ///   uncertainty, NOT a confirmed backlog. The 2026-05-19 false
 ///   positives (3 pages on hfhotel) all fell in this bucket: iHOTEL
 ///   was busy/slow, probe timed out, every alert self-recovered
-///   within minutes. The previous wording said "real changes are not
-///   being processed" which overstated severity for this case.
+///   within minutes. Originally paged as `:warning:`; demoted to
+///   informational on 2026-06-11 after three more self-recovering
+///   pages in one day (hfhotel ×2, hfville ×1) confirmed the
+///   quiet-period + slow-probe combination is the expected overnight
+///   pattern, not an operator signal. A later probe that confirms a
+///   real backlog escalates to `:rotating_light:` and bypasses the
+///   cooldown (see [`stall_page_passes_cooldown`]).
 /// * `probe = Some(c)` AND `c > watermark` → `:rotating_light:` —
 ///   legacy CT is ahead of the watermark by `c - w` versions.
 ///   Confirmed backlog. Real stall.
@@ -1381,11 +1417,12 @@ fn format_stall_alert_message(
 
     match probe {
         None => format!(
-            ":warning: *CT watermark check incomplete* :warning:\n\
+            ":information_source: *CT watermark idle — probe timed out* (informational)\n\
              Watermark at v{watermark} for {stuck_secs}s (threshold {threshold_secs}s); \
-             legacy probe timed out so we cannot confirm a real backlog. Often means \
-             iHOTEL is busy/slow — no confirmed data loss. Will auto-recover or \
-             escalate.\n\
+             legacy probe timed out so we cannot confirm a real backlog. This is the \
+             expected quiet-period pattern (iHOTEL busy/slow while nothing changes) — \
+             no action needed. Escalates to a critical page automatically if a later \
+             probe confirms a real backlog.\n\
              _{dashboard_hint}_"
         ),
         Some(ct_current) if ct_current > watermark => {
@@ -1513,12 +1550,25 @@ fn format_alert_duration(elapsed: Duration) -> String {
 fn format_recovery_message(decision: &RecoveryDecision, now: Instant) -> String {
     let elapsed = now.duration_since(decision.paged_at);
     let duration_ago = format_alert_duration(elapsed);
+    // Wording must match the actual reason. Before 2026-06-11 both
+    // branches claimed "resumed advancing", which read as nonsense
+    // when the version in the recovery equalled the paged version
+    // (the ProbeConfirmsQuiet case — nothing ever advanced).
+    let detail = match decision.reason {
+        RecoveryReason::WatermarkAdvanced => format!(
+            "Watermark resumed advancing (now at v{}).",
+            decision.current_version
+        ),
+        RecoveryReason::ProbeConfirmsQuiet => format!(
+            "Legacy CT confirmed idle at v{} — no backlog existed; the watermark \
+             was already at tip-of-stream.",
+            decision.current_version
+        ),
+    };
     format!(
         ":white_check_mark: *CT watermark RECOVERED*\n\
-         Watermark resumed advancing (now at v{}). Prior alert from {duration_ago} \
-         cleared.\n\
-         _Dashboard: `/api/new/sync/status`._",
-        decision.current_version,
+         {detail} Prior alert from {duration_ago} cleared.\n\
+         _Dashboard: `/api/new/sync/status`._"
     )
 }
 
@@ -1577,7 +1627,10 @@ async fn run_watermark_watchdog(
     let stall_threshold = Duration::from_secs(stall_alert_secs);
     let cooldown = Duration::from_secs(WATCHDOG_ALERT_COOLDOWN_SECS);
     let mut prior: Option<WatermarkObservation> = None;
-    let mut last_stall_alert: Option<Instant> = None;
+    // `(when, was_critical)` — severity travels with the timestamp so
+    // a confirmed-backlog page can bypass the cooldown left by a mere
+    // probe-timeout informational note (see `stall_page_passes_cooldown`).
+    let mut last_stall_alert: Option<(Instant, bool)> = None;
     let mut last_shadow_alert: Option<Instant> = None;
     // Open-alert tracking for the recovery notification (PR D,
     // 2026-05-19). Parallel to `last_stall_alert` — that one encodes
@@ -1585,7 +1638,7 @@ async fn run_watermark_watchdog(
     // all-clear". Cleared after firing the recovery message. Tuple:
     // `(paged_at, watermark_at_page_time)`.
     let mut pending_stall_alert: Option<(Instant, i64)> = None;
-    // 2026-05-22 — streak gate for the probe-timeout (`:warning:`)
+    // 2026-05-22 — streak gate for the probe-timeout (informational)
     // class. Counts CONSECUTIVE probe failures in the stall branch.
     // Reset on probe success, watermark advance, or any tick that
     // doesn't run a probe (no stall this tick).
@@ -1732,14 +1785,14 @@ async fn run_watermark_watchdog(
                         watermark = observation.last_seen_version,
                         streak = probe_failure_streak,
                         threshold = probe_timeout_streak_threshold,
-                        "[watchdog] probe timeout — suppressing :warning: page until streak crosses threshold"
+                        "[watchdog] probe timeout — suppressing informational page until streak crosses threshold"
                     );
                 } else {
-                    let cooldown_elapsed = match last_stall_alert {
-                        Some(t) => now.duration_since(t) >= cooldown,
-                        None => true,
-                    };
-                    if cooldown_elapsed {
+                    // Critical = probe SUCCEEDED and disagreed with the
+                    // watermark (the == case was suppressed above).
+                    // Probe timeout (None) is the informational class.
+                    let is_critical = probe.is_some();
+                    if stall_page_passes_cooldown(last_stall_alert, now, cooldown, is_critical) {
                         let stuck_for = now.duration_since(prior_obs.observed_at);
                         tracing::error!(
                             site = %site_id,
@@ -1760,7 +1813,7 @@ async fn run_watermark_watchdog(
                             );
                             let _ = s.send_message(&payload).await;
                         }
-                        last_stall_alert = Some(now);
+                        last_stall_alert = Some((now, is_critical));
                         // Open-alert state for the recovery notification
                         // (PR D, 2026-05-19). Always set after a page,
                         // regardless of severity — recovery applies to
@@ -4180,7 +4233,7 @@ mod tests {
         assert!(!pass, "two consecutive failures still below threshold");
     }
 
-    /// Once the streak crosses the threshold, the `:warning:` page
+    /// Once the streak crosses the threshold, the informational page
     /// fires. This is the canonical "real legacy outage" case (probe
     /// keeps timing out across multiple ticks).
     #[test]
@@ -4247,6 +4300,101 @@ mod tests {
         assert_eq!(
             DEFAULT_PROBE_TIMEOUT_STREAK_THRESHOLD, 3,
             "default streak threshold should be 3 ticks (~3 min) — matches the 2026-05-22 self-recovery window"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // 2026-06-11 — severity-aware cooldown (paired with the probe-timeout
+    // demotion to `:information_source:`).
+    // -------------------------------------------------------------------
+
+    /// No prior page → any page passes.
+    #[test]
+    fn stall_cooldown_passes_with_no_prior_page() {
+        let now = Instant::now();
+        let cd = Duration::from_secs(1800);
+        assert!(stall_page_passes_cooldown(None, now, cd, false));
+        assert!(stall_page_passes_cooldown(None, now, cd, true));
+    }
+
+    /// Inside the cooldown window, a same-or-lower-severity page is
+    /// suppressed: info after info, info after critical, critical
+    /// after critical.
+    #[test]
+    fn stall_cooldown_suppresses_non_escalating_pages_inside_window() {
+        let paged_at = Instant::now();
+        let now = paged_at + Duration::from_secs(60);
+        let cd = Duration::from_secs(1800);
+        assert!(!stall_page_passes_cooldown(Some((paged_at, false)), now, cd, false));
+        assert!(!stall_page_passes_cooldown(Some((paged_at, true)), now, cd, false));
+        assert!(!stall_page_passes_cooldown(Some((paged_at, true)), now, cd, true));
+    }
+
+    /// THE point of the helper: a confirmed-backlog critical page must
+    /// bypass the cooldown left by a probe-timeout informational note.
+    /// Otherwise the info demotion could shadow a real stall for up to
+    /// 30 minutes.
+    #[test]
+    fn stall_cooldown_lets_critical_escalate_past_info_page() {
+        let paged_at = Instant::now();
+        let now = paged_at + Duration::from_secs(60);
+        let cd = Duration::from_secs(1800);
+        assert!(
+            stall_page_passes_cooldown(Some((paged_at, false)), now, cd, true),
+            "critical page must bypass the cooldown set by an informational page"
+        );
+    }
+
+    /// After the cooldown elapses any severity re-pages.
+    #[test]
+    fn stall_cooldown_passes_after_window_elapses() {
+        let paged_at = Instant::now();
+        let now = paged_at + Duration::from_secs(1800);
+        let cd = Duration::from_secs(1800);
+        assert!(stall_page_passes_cooldown(Some((paged_at, true)), now, cd, false));
+        assert!(stall_page_passes_cooldown(Some((paged_at, false)), now, cd, false));
+    }
+
+    /// Recovery wording must match the actual reason — the
+    /// ProbeConfirmsQuiet case previously claimed the watermark
+    /// "resumed advancing" at the very version it was paged on
+    /// (observed 2026-06-11: "resumed advancing (now at v35775)"
+    /// after paging on v35775).
+    #[test]
+    fn recovery_message_wording_matches_reason() {
+        let now = Instant::now();
+        let paged_at = now - Duration::from_secs(120);
+
+        let advanced = format_recovery_message(
+            &RecoveryDecision {
+                paged_version: 35775,
+                paged_at,
+                current_version: 35800,
+                reason: RecoveryReason::WatermarkAdvanced,
+            },
+            now,
+        );
+        assert!(
+            advanced.contains("resumed advancing") && advanced.contains("v35800"),
+            "advanced case must say so; got: {advanced}"
+        );
+
+        let quiet = format_recovery_message(
+            &RecoveryDecision {
+                paged_version: 35775,
+                paged_at,
+                current_version: 35775,
+                reason: RecoveryReason::ProbeConfirmsQuiet,
+            },
+            now,
+        );
+        assert!(
+            quiet.contains("confirmed idle") && quiet.contains("v35775"),
+            "quiet case must say legacy was idle, not 'resumed advancing'; got: {quiet}"
+        );
+        assert!(
+            !quiet.contains("resumed advancing"),
+            "quiet case must NOT claim the watermark advanced; got: {quiet}"
         );
     }
 
@@ -4360,11 +4508,12 @@ mod tests {
     // 10:16, 12:01, 13:27 Thailand time, all probe-timeout cases).
     // -------------------------------------------------------------------
 
-    /// Probe timeout / failure should yield the warning-tier message,
-    /// NOT the critical-tier "real changes are not being processed"
-    /// wording. This is the specific regression today's incident hit.
+    /// Probe timeout / failure should yield the informational-tier
+    /// message (demoted from `:warning:` on 2026-06-11 — the quiet-
+    /// period + slow-probe combination is expected behavior), NOT the
+    /// critical-tier "real changes are not being processed" wording.
     #[test]
-    fn format_stall_alert_message_uses_warning_when_probe_is_none() {
+    fn format_stall_alert_message_uses_info_tier_when_probe_is_none() {
         let msg = format_stall_alert_message(
             17209,
             None,
@@ -4372,12 +4521,12 @@ mod tests {
             Duration::from_secs(1800),
         );
         assert!(
-            msg.contains(":warning:"),
-            "probe-failure path must use the :warning: tier; got: {msg}"
+            msg.contains(":information_source:"),
+            "probe-failure path must use the informational tier; got: {msg}"
         );
         assert!(
-            !msg.contains(":rotating_light:"),
-            "probe-failure path must NOT use :rotating_light:; got: {msg}"
+            !msg.contains(":warning:") && !msg.contains(":rotating_light:"),
+            "probe-failure path must NOT use :warning: or :rotating_light:; got: {msg}"
         );
         assert!(
             msg.contains("cannot confirm a real backlog"),
