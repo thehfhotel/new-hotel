@@ -159,6 +159,15 @@ The backend uses `sqlx::query!()` compile-time macros for ~76 static SQL queries
 - `DROP TABLE` / `DROP VIEW` - Do not delete
 - `CREATE INDEX` on legacy tables - May affect legacy app
 
+**Sole standing exception (2026-06-11 audit carve-out):** the Change Tracking
+prerequisite DDL in `migrations/legacy-mssql/` (020/021/022) — `ALTER COLUMN … NOT
+NULL` + `ADD CONSTRAINT … PRIMARY KEY CLUSTERED` on the CT-enabled tables, applied
+2026-04..05 in Sch-M maintenance windows with pre-flight NULL/duplicate checks. CT
+requires a PK; no other legacy DDL is permitted. Residual hazard to remember: iHOTEL
+allocates ids app-side (MAX+1, race-prone) — a duplicate-id race that used to succeed
+silently now hard-fails iHOTEL's INSERT on the PK. If a receptionist reports a save
+error in iHOTEL, check for a concurrent same-table save first.
+
 ### HotelNew Tables (owned by this app, PostgreSQL - all lowercase)
 
 All tables in the HotelNew database are owned by this application:
