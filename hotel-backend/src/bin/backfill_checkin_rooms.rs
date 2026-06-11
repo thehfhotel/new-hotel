@@ -261,7 +261,7 @@ async fn fetch_candidate_cin_nos(
             r#"
             SELECT DISTINCT h.Cin_no
               FROM HT_CheckIn_H h
-             WHERE h.Cin_status <> N'{cancelled}'
+             WHERE h.Cin_status <> '{cancelled}'
                AND EXISTS (SELECT 1 FROM HT_CheckIn_Ds d WHERE d.Cin_No = h.Cin_no)
              ORDER BY h.Cin_no
             "#,
@@ -272,12 +272,12 @@ async fn fetch_candidate_cin_nos(
             r#"
             SELECT DISTINCT h.Cin_no
               FROM HT_CheckIn_H h
-             WHERE h.Cin_status = N'{active}'
+             WHERE h.Cin_status = '{active}'
                AND EXISTS (
                    SELECT 1
                      FROM HT_CheckIn_Ds d
                     WHERE d.Cin_No = h.Cin_no
-                      AND d.Cin_Room_Status <> N'{checked_out}'
+                      AND d.Cin_Room_Status <> '{checked_out}'
                )
              ORDER BY h.Cin_no
             "#,

@@ -69,6 +69,34 @@ pub const ROOM_STATUS_RESERVED: &str = "จอง";
 
 /// `HT_Room_Status.room_status` value after check-out — **English with a
 /// space**. Spike §3e + §4c.
+///
+/// ## Documented decision: `'Check Out'` (space) vs `'Check-Out'` (hyphen)
+///
+/// The decompile cheatsheet (`COMPAT_CHEATSHEET.md` §8.11) shows MOST
+/// iHOTEL code paths read/write the hyphen form on this table and argues
+/// a new app "should write 'Check-Out' consistently" — the space form is
+/// a bug in `FrmCheckOut.cs:6246` whose rows escape frmMain1's
+/// startup `DELETE ... WHERE room_status='Check-Out'` until the next
+/// startup's `Room_Use='no'` fix-up converts them.
+///
+/// We deliberately follow the **capture** (`'Check Out'`, findings §3e —
+/// `checkout-20260424-100323/writes.txt`), NOT the cheatsheet's
+/// recommendation, because the capture is observed production behavior:
+/// it is the exact byte sequence the live iHOTEL emits on every real
+/// check-out, and 14 years of production data carry it. Matching it makes
+/// our rows indistinguishable from iHOTEL's own — including inheriting
+/// the same (benign, self-healing) startup-cleanup timing iHOTEL's rows
+/// get. Writing the hyphen instead would make our checkout rows behave
+/// DIFFERENTLY from iHOTEL's (deleted at next startup rather than after
+/// the fix-up pass), a divergence nobody has observed or tested.
+///
+/// Re-affirmed by the 2026-06-11 coexistence audit. To switch to the
+/// hyphen form, you would need: (a) a fresh capture showing iHOTEL itself
+/// emitting `'Check-Out'` on this table (e.g. after a vendor patch), or
+/// (b) a receptionist-verified live test on HF Ville demonstrating that
+/// hyphen rows render/clean up at least as well as space rows across an
+/// iHOTEL restart. Update the byte-parity tests in `checkout.rs` in the
+/// same change.
 pub const ROOM_STATUS_CHECKED_OUT: &str = "Check Out";
 
 /// `HT_Customers.Cust_Type` default. Spike §3a (and elsewhere).

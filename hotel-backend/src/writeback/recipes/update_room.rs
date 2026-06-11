@@ -10,17 +10,25 @@
 //! Exactly one statement is built. Columns whose payload field is `None`
 //! are omitted from the `SET` list — preserves any iHOTEL-side value the
 //! operator did not touch (narrow update). The `WHERE` clause always
-//! targets `Room_no = N'...'`.
+//! targets `Room_no = '...'`.
 //!
 //! ```text
 //! UPDATE HT_Rooms SET
-//!     Room_Type    = N'<ห้องแฟมิลี่ 2>',
+//!     Room_Type    = '<ห้องแฟมิลี่ 2>',
 //!     Room_PriceA  = 890,
 //!     Room_PriceB  = 1090,
 //!     Room_PriceC  = 0,
-//!     Room_Details = N'<notes>'
-//!   WHERE Room_no = N'<A2-1>'
+//!     Room_Details = '<notes>'
+//!   WHERE Room_no = '<A2-1>'
 //! ```
+//!
+//! Plain `'…'` literals, never `N'…'` — every `HT_Rooms` text column is
+//! `varchar` with `Thai_CI_AS` collation, and cheatsheet §1.8 explicitly
+//! forbids `N'…'` against varchar (nvarchar→varchar conversion can corrupt
+//! characters outside TIS-620). This matches the entire recipe corpus
+//! (`sql_quote` everywhere). Fixed per the 2026-06-11 coexistence audit —
+//! an earlier comment here misattributed an `N'…'` convention to
+//! `booking_create` / `mark_clean`, which never used one.
 //!
 //! ## Skipped columns (NOT propagated)
 //!
@@ -59,11 +67,11 @@ pub fn build_statements(payload: &UpdateRoomPayload) -> WritebackResult<Vec<Stri
     let mut set_fragments: Vec<String> = Vec::new();
 
     if let Some(type_name) = payload.room_type_name.as_deref() {
+        // Plain '…' literal (cheatsheet §1.8) — `Room_Type` is varchar;
+        // `N'…'` would trigger an nvarchar→varchar conversion that corrupts
+        // characters outside TIS-620.
         let quoted = sql_quote(type_name);
-        // `N'...'` prefix preserves the Thai literal verbatim — same
-        // convention `booking_create` / `mark_clean` use for Thai-text
-        // legacy columns.
-        set_fragments.push(format!("Room_Type = N{quoted}"));
+        set_fragments.push(format!("Room_Type = {quoted}"));
     }
     if let Some(price) = payload.price_weekday {
         let value = f64_sql(price)?;
@@ -79,7 +87,7 @@ pub fn build_statements(payload: &UpdateRoomPayload) -> WritebackResult<Vec<Stri
     }
     if let Some(notes) = payload.notes.as_deref() {
         let quoted = sql_quote(notes);
-        set_fragments.push(format!("Room_Details = N{quoted}"));
+        set_fragments.push(format!("Room_Details = {quoted}"));
     }
 
     if set_fragments.is_empty() {
@@ -89,7 +97,7 @@ pub fn build_statements(payload: &UpdateRoomPayload) -> WritebackResult<Vec<Stri
     let where_room_no = sql_quote(&payload.room_no);
     let set_clause = set_fragments.join(", ");
     Ok(vec![format!(
-        "UPDATE HT_Rooms SET {set_clause} WHERE Room_no = N{where_room_no}"
+        "UPDATE HT_Rooms SET {set_clause} WHERE Room_no = {where_room_no}"
     )])
 }
 
@@ -141,10 +149,10 @@ mod tests {
         assert_eq!(statements.len(), 1, "exactly one UPDATE statement");
         assert_eq!(
             statements[0],
-            "UPDATE HT_Rooms SET Room_Type = N'ห้องแฟมิลี่ 2', \
+            "UPDATE HT_Rooms SET Room_Type = 'ห้องแฟมิลี่ 2', \
              Room_PriceA = 890, Room_PriceB = 1090, Room_PriceC = 0, \
-             Room_Details = N'ห้องริมน้ำ' \
-             WHERE Room_no = N'A2-1'"
+             Room_Details = 'ห้องริมน้ำ' \
+             WHERE Room_no = 'A2-1'"
         );
     }
 
@@ -160,7 +168,7 @@ mod tests {
         assert_eq!(statements.len(), 1);
         assert_eq!(
             statements[0],
-            "UPDATE HT_Rooms SET Room_PriceA = 890 WHERE Room_no = N'A2-1'"
+            "UPDATE HT_Rooms SET Room_PriceA = 890 WHERE Room_no = 'A2-1'"
         );
     }
 
@@ -186,7 +194,7 @@ mod tests {
         payload.notes = Some("O'Brien suite".into());
         let statements = build_statements(&payload).expect("notes-only payload must build");
         assert!(
-            statements[0].contains("Room_Details = N'O''Brien suite'"),
+            statements[0].contains("Room_Details = 'O''Brien suite'"),
             "embedded single-quote must be doubled, got: {}",
             statements[0]
         );
@@ -202,7 +210,7 @@ mod tests {
         payload.price_weekday = Some(800.0);
         let statements = build_statements(&payload).expect("partial payload must build");
         assert!(
-            statements[0].contains("WHERE Room_no = N'A''1'"),
+            statements[0].contains("WHERE Room_no = 'A''1'"),
             "embedded single-quote in room_no must be doubled, got: {}",
             statements[0]
         );
@@ -227,7 +235,7 @@ mod tests {
     }
 
     /// `room_type_name` set, every other field `None` — recipe emits a
-    /// single `Room_Type = N'...'` fragment, no extra commas, no stray
+    /// single `Room_Type = '...'` fragment, no extra commas, no stray
     /// `WHERE` artifacts.
     #[test]
     fn build_statements_room_type_only_emits_single_fragment() {
@@ -236,8 +244,8 @@ mod tests {
         let statements = build_statements(&payload).expect("type-only payload must build");
         assert_eq!(
             statements[0],
-            "UPDATE HT_Rooms SET Room_Type = N'ห้องสแตนดาร์ด' \
-             WHERE Room_no = N'306'"
+            "UPDATE HT_Rooms SET Room_Type = 'ห้องสแตนดาร์ด' \
+             WHERE Room_no = '306'"
         );
     }
 

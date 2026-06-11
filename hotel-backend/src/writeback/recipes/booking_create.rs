@@ -53,7 +53,7 @@ use chrono::{DateTime, Datelike, NaiveDate, Utc};
 
 use crate::outbox::intent::CreateBookingPayload;
 use crate::writeback::allocate::{
-    allocate_book_date_id, allocate_book_id, allocate_cust_no, allocate_customer_id,
+    allocate_book_date_id, allocate_book_id, allocate_customer_id, cust_no_from_customer_id,
     allocate_room_status_id, LegacyConn,
 };
 use crate::writeback::constants::{
@@ -319,14 +319,23 @@ pub async fn execute(
     }
 
     // Allocate IDs under TABLOCKX, in dependency order.
-    let cust_no = match payload.legacy_cust_no.as_deref() {
-        Some(existing) => existing.to_string(),
-        None => allocate_cust_no(conn).await?,
-    };
+    //
+    // 2026-06-11 audit: Cust_no derives from the SAME `MAX(id)+1` value as
+    // the `id` column, matching iHOTEL's convention (cheatsheet §1.6 #3 —
+    // `Cust_no = 'C' + (id)`). The earlier separate suffix-parsing
+    // allocator was numerically aligned today but would fork from iHOTEL
+    // under any id/Cust_no divergence.
     let cust_id_int = if payload.legacy_cust_no.is_none() {
         Some(allocate_customer_id(conn).await?)
     } else {
         None
+    };
+    let cust_no = match (payload.legacy_cust_no.as_deref(), cust_id_int) {
+        (Some(existing), _) => existing.to_string(),
+        (None, Some(id)) => cust_no_from_customer_id(id),
+        // Unreachable: cust_id_int is Some exactly when legacy_cust_no is
+        // None — kept explicit so the compiler enforces the pairing.
+        (None, None) => unreachable!("customer id allocated whenever legacy_cust_no is None"),
     };
     let book_id = allocate_book_id(conn).await?;
     let book_date_id_base = allocate_book_date_id(conn).await?;

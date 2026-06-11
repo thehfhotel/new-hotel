@@ -179,8 +179,8 @@ fn build_prior_occupant_sql(room_no: &str) -> String {
          JOIN HT_CheckIn_H h ON h.Cin_no = d.Cin_No \
          JOIN HT_Customers c ON c.Cust_no = h.Cin_cust_no \
          WHERE d.Cin_Room_No = {room_no_q} \
-           AND d.Cin_Room_Status = N{checked_out_q} \
-           AND h.cin_status NOT IN (N{cancelled_q}) \
+           AND d.Cin_Room_Status = {checked_out_q} \
+           AND h.cin_status NOT IN ({cancelled_q}) \
          ORDER BY CASE WHEN d.Cin_Room_Out IS NULL THEN 1 ELSE 0 END, d.Cin_Room_Out DESC"
     )
 }
@@ -258,7 +258,7 @@ mod tests {
     fn filters_by_per_room_status_not_whole_checkin() {
         let sql = build_prior_occupant_sql("306");
         assert!(
-            sql.contains("d.Cin_Room_Status = N'Check-Out'"),
+            sql.contains("d.Cin_Room_Status = 'Check-Out'"),
             "per-room status filter missing: {sql}"
         );
     }
@@ -271,7 +271,7 @@ mod tests {
     fn keeps_cancellation_guard_on_whole_checkin_status() {
         let sql = build_prior_occupant_sql("306");
         assert!(
-            sql.contains("h.cin_status NOT IN (N'ยกเลิก')"),
+            sql.contains("h.cin_status NOT IN ('ยกเลิก')"),
             "whole-check-in cancellation guard missing: {sql}"
         );
     }
