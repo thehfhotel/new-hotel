@@ -38,6 +38,14 @@
 //! | `'ออกแล้ว'`             | `'completed'`                 |
 //! | (anything else)         | `'pending'`                   |
 //!
+//! NOTE on `'ออกแล้ว'` (corrected 2026-06-11): iHOTEL itself NEVER
+//! writes this literal — its checkout flow does not touch `HT_Book_H`
+//! at all. The value is written exclusively by OUR writeback checkout
+//! recipe (`writeback/recipes/checkout.rs`), so seeing it here means
+//! the CT row is an echo of our own writeback (absorbed by mapper
+//! idempotency). The mapping is kept so the echo converges instead of
+//! flapping.
+//!
 //! The PG-side string is what the existing booking routes (`routes/new_bookings`)
 //! and the writeback recipes already round-trip; we don't introduce a
 //! new enum.
@@ -46,12 +54,13 @@ use async_trait::async_trait;
 use chrono::{NaiveDate, NaiveDateTime};
 use uuid::Uuid;
 
+use crate::db::DbPool;
 use crate::outbox::event::{BookingSnapshot, DomainEvent, EventSource};
 use crate::service::ids::{aggregate_uuid, AggregateKind};
 use crate::sync::change_op::ChangeOp;
 use crate::sync::mapper::MssqlChangeMapper;
+use crate::sync::mappers::checkin::resolve_customer_or_eager_mirror;
 use crate::sync::parent_loader::BookingAggregate;
-use crate::sync::resolve;
 use crate::sync::row::MappableRow;
 use crate::sync::SyncError;
 
@@ -235,7 +244,25 @@ struct ExistingBooking {
     /// rows behind — regression caught by
     /// `re_apply_with_zero_rooms_clears_stale_booking_rooms` in CI on
     /// 2026-05-18.
+    ///
+    /// Compared against the count of RESOLVABLE projection lines (not
+    /// raw `projection.rooms.len()`) since 2026-06-11: a line whose
+    /// room can't be found in `ht_rooms_new` is warn-skipped by
+    /// `replace_rooms`, so comparing against the raw count made
+    /// `existing_matches` permanently false and every CT touch on the
+    /// booking re-emitted `BookingModified` forever.
     rooms_count: i64,
+    /// Denormalised customer pointer — compared by `existing_matches`
+    /// since 2026-06-11 (audit P1 #6): iHOTEL's customer-delete cascade
+    /// (`UPDATE HT_Book_H SET Book_Cust_ID='C0000'`, cheatsheet §3.24)
+    /// changes ONLY this column, so a status/amount/date comparison
+    /// silently skipped the re-point.
+    legacy_cust_no: Option<String>,
+    /// Booking notes — included in the idempotency comparison (guarded
+    /// on the projection carrying a value, mirroring the
+    /// `COALESCE($7, book_notes)` write semantics) so a notes-only
+    /// iHOTEL edit re-applies instead of silently skipping.
+    book_notes: Option<String>,
 }
 
 /// In-memory projection of the legacy aggregate, in canonical PG shape.
@@ -265,11 +292,34 @@ struct RoomLine {
 /// Re-sync one booking aggregate. Idempotent — safe to call any number
 /// of times for the same `book_id` per tick.
 ///
+/// `mssql` is borrowed for the customer eager-mirror fallback: when the
+/// booking references a `Cust_no` not yet in PG, the matching
+/// `HT_Customers` row is fetched from MSSQL and mirrored in the same TX
+/// (the June-3 2026 fix — see below). Pass `Some(&pool)` from the
+/// watcher; `None` only from contexts without legacy access (tests),
+/// where an unresolvable customer becomes an error instead.
+///
 /// Returns:
 /// * `Ok(Some(DomainEvent))` when the canonical row genuinely changed
 ///   (or a new one was inserted, or the booking was cancelled).
-/// * `Ok(None)` when the canonical row already mirrors the legacy
+/// * `Ok(None)` ONLY when the canonical row already mirrors the legacy
 ///   aggregate (idempotent skip).
+/// * `Err(SyncError::Mapper)` when the customer FK cannot be resolved
+///   even after the eager-mirror attempt. The watcher records the error
+///   and HOLDS the watermark (loud retry).
+///
+/// ## The 2026-06-03 silent drop (C22209 / R015290)
+///
+/// Pre-fix, a customer-FK miss here returned `Ok(None)`. The watcher
+/// counted that as `skipped` — not `errored` — so the watermark
+/// advanced past the booking's CT version. Nothing ever re-fired the
+/// aggregate (the `resolve.rs` "next CT tick re-surfaces it" contract
+/// was false), and after the 2-day CT retention both the customer and
+/// the booking were unrecoverable. The fix is the same eager-mirror
+/// pattern the check-in mapper already had
+/// (`checkin::resolve_customer_or_eager_mirror`): pull the customer
+/// from MSSQL synchronously inside this TX, and error (never skip) if
+/// that is impossible.
 ///
 /// ## Header-only bookings (iHOTEL coexistence)
 ///
@@ -305,6 +355,7 @@ struct RoomLine {
 /// no schema column required.
 pub async fn apply_booking_aggregate(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    mssql: Option<&DbPool>,
     aggregate: &BookingAggregate,
     book_id: &str,
 ) -> Result<Option<DomainEvent>, SyncError> {
@@ -315,29 +366,44 @@ pub async fn apply_booking_aggregate(
     let projection = project_aggregate(aggregate, book_id)?;
     let existing = fetch_existing(tx, book_id).await?;
 
+    // Resolve the per-line room FKs BEFORE the idempotency check so the
+    // junction count comparison only counts RESOLVABLE lines (2026-06-11
+    // fix — see `ExistingBooking::rooms_count`). Unresolvable lines are
+    // warn-skipped, matching `replace_rooms`'s historical behaviour.
+    let resolved_rooms = resolve_room_lines(tx, book_id, &projection.rooms).await?;
+
     // Idempotent skip — every projected field matches the canonical row.
     if let Some(ex) = existing.as_ref() {
-        if existing_matches(ex, &projection) && ex.aggregate_id.is_some() {
+        if existing_matches(ex, &projection, resolved_rooms.len() as i64)
+            && ex.aggregate_id.is_some()
+        {
             return Ok(None);
         }
     }
 
     // Resolve the customer FK before the UPSERT — `ht_bookings.book_cust_id`
-    // is `NOT NULL` and references `ht_customers(cust_id)`. Defer-on-
-    // missing per `sync::resolve` contract.
-    let cust_id = match resolve::resolve_customer_id(tx, projection.legacy_cust_no.as_deref())
-        .await?
-    {
-        Some(id) => id,
-        None => {
-            // Customer hasn't been mirrored yet (the customer mapper
-            // hasn't seen its own CT row, OR the booking references a
-            // legacy customer never added to PG). Defer — the next
-            // tick that brings the customer in will surface the
-            // booking again via this same code path.
-            return Ok(None);
-        }
-    };
+    // is `NOT NULL` and references `ht_customers(cust_id)`. On miss,
+    // eager-mirror the customer from MSSQL inside this TX (June-3 2026
+    // fix); if even that fails, ERROR so the watermark holds — never
+    // return Ok(None) for an FK miss (the watcher would count it
+    // `skipped` and advance the watermark: permanent silent drop).
+    let cust_id =
+        match resolve_customer_or_eager_mirror(tx, mssql, projection.legacy_cust_no.as_deref())
+            .await?
+        {
+            Some(id) => id,
+            None => {
+                return Err(SyncError::Mapper {
+                    table: BOOK_H_TABLE,
+                    message: format!(
+                        "customer FK unresolvable for book_id={book_id} \
+                         legacy_cust_no={:?} — eager-mirror failed or no MSSQL \
+                         pool; holding watermark for loud retry",
+                        projection.legacy_cust_no
+                    ),
+                });
+            }
+        };
 
     // Trace the header-only / walk-in-shaped applies so operators can
     // see them in production logs without grepping for the absence of
@@ -375,11 +441,11 @@ pub async fn apply_booking_aggregate(
     };
 
     // `replace_rooms` is the single mutation point for `ht_booking_rooms`.
-    // It must be called even when `projection.rooms` is empty so that an
+    // It must be called even when the resolved set is empty so that an
     // edit transitioning a booking from N-rooms → 0-rooms (a legitimate
     // mid-edit state per the §3.7 delete-then-reinsert pattern) drops
     // the stale junction rows.
-    replace_rooms(tx, book_id_serial, &projection.rooms).await?;
+    replace_rooms(tx, book_id_serial, &resolved_rooms).await?;
 
     let event = build_event(was_insert, agg_id, cust_id, &projection);
     Ok(Some(event))
@@ -472,23 +538,49 @@ fn project_aggregate(
         .map(str::to_string)
         .filter(|s| !s.is_empty());
 
+    // `HT_Book_H.Book_room_type` disambiguates what `HT_Book_Ds.
+    // Book_Room_Type` holds (cheatsheet §1.5 / §3.3 / §3.4):
+    //   * 1 — booking "ระบุประเภทห้อง" (FrmAddBook, no specific rooms):
+    //         Ds lines carry a room-TYPE code, NOT a room number.
+    //   * 2 — booking with specific rooms (FrmAddBook2): Ds lines carry
+    //         the room NUMBER.
+    // Pre-2026-06-11 the mapper treated every Ds line as a room number;
+    // for type-1 bookings each line failed the `ht_rooms_new.room_no`
+    // lookup, warn-skipped, and the `rooms_count` mismatch made every CT
+    // touch re-emit `BookingModified` forever. Type-1 bookings now
+    // project as header-only (zero room assignments — there ARE no
+    // specific rooms to assign). `.ok().flatten()` tolerates fixtures /
+    // pre-widening loads that don't carry the column; absent defaults to
+    // the room-number interpretation (type-2 behaviour, the historical
+    // path).
+    let book_room_type = header.try_get_i32("Book_room_type").ok().flatten();
     let mut rooms = Vec::with_capacity(agg.rooms.len());
-    for r in &agg.rooms {
-        // Skip cancelled lines (Book_status=3 per cheatsheet §3.4).
-        let line_status = r.try_get_i32("Book_status").ok().flatten();
-        if line_status == Some(3) {
-            continue;
+    if book_room_type != Some(1) {
+        for r in &agg.rooms {
+            // Skip cancelled lines (Book_status=3 per cheatsheet §3.4).
+            let line_status = r.try_get_i32("Book_status").ok().flatten();
+            if line_status == Some(3) {
+                continue;
+            }
+            // Misleading column name — stores room NUMBER per spike §3b /
+            // cheatsheet §3.4 (when Book_room_type=2; see above).
+            let Some(room_no) = r.try_get_str("Book_Room_Type")?.map(str::to_string) else {
+                continue;
+            };
+            let price_per_night = r.try_get_decimal("Book_Room_Price")?;
+            rooms.push(RoomLine {
+                room_no,
+                price_per_night,
+            });
         }
-        // Misleading column name — stores room NUMBER per spike §3b /
-        // cheatsheet §3.4.
-        let Some(room_no) = r.try_get_str("Book_Room_Type")?.map(str::to_string) else {
-            continue;
-        };
-        let price_per_night = r.try_get_decimal("Book_Room_Price")?;
-        rooms.push(RoomLine {
-            room_no,
-            price_per_night,
-        });
+    } else if !agg.rooms.is_empty() {
+        tracing::debug!(
+            target: "sync::booking",
+            book_id,
+            ds_lines = agg.rooms.len(),
+            "Book_room_type=1 (no specific rooms): Ds lines carry room-TYPE \
+             codes — projecting header-only, no ht_booking_rooms assignments"
+        );
     }
 
     Ok(CanonicalProjection {
@@ -553,10 +645,12 @@ async fn fetch_existing(
         Option<f64>,
         NaiveDate,
         NaiveDate,
+        Option<String>,
+        Option<String>,
     )>(
         "SELECT book_id, aggregate_id, book_status, book_cust_id, \
                 book_total_amount::float8, book_deposit_amount::float8, \
-                book_checkin, book_checkout \
+                book_checkin, book_checkout, legacy_cust_no, book_notes \
            FROM ht_bookings \
           WHERE legacy_book_id = $1 \
           LIMIT 1",
@@ -574,6 +668,8 @@ async fn fetch_existing(
         book_deposit_amount,
         book_checkin,
         book_checkout,
+        legacy_cust_no,
+        book_notes,
     )) = row
     else {
         return Ok(None);
@@ -596,18 +692,40 @@ async fn fetch_existing(
         book_checkin,
         book_checkout,
         rooms_count,
+        legacy_cust_no,
+        book_notes,
     }))
 }
 
 /// Compare the existing canonical row to the freshly projected legacy
 /// one. Skip publication when every mirrored field matches.
-fn existing_matches(ex: &ExistingBooking, p: &CanonicalProjection) -> bool {
+///
+/// `resolvable_rooms_count` is the number of projection lines whose room
+/// actually resolves in `ht_rooms_new` — NOT `p.rooms.len()`. Lines that
+/// don't resolve are warn-skipped by `replace_rooms`, so comparing
+/// against the raw count could never converge (every CT touch would
+/// re-emit `BookingModified`).
+///
+/// `legacy_cust_no` and `notes` comparisons are guarded on the
+/// projection carrying a value, mirroring their `COALESCE($n, existing)`
+/// write-semantics: a transient NULL on the legacy side never overwrites
+/// the canonical value, so treating it as a mismatch would also force a
+/// non-converging re-apply every tick. A Some-valued change — including
+/// the `'C0000'` customer-delete-cascade re-point (cheatsheet §3.24) and
+/// a notes-only edit — MUST mismatch so the apply re-runs.
+fn existing_matches(
+    ex: &ExistingBooking,
+    p: &CanonicalProjection,
+    resolvable_rooms_count: i64,
+) -> bool {
     ex.book_status.as_deref() == Some(p.book_status.as_str())
         && ex.book_total_amount == p.total_amount
         && ex.book_deposit_amount == p.deposit_amount
         && ex.book_checkin == p.book_checkin
         && ex.book_checkout == p.book_checkout
-        && ex.rooms_count == p.rooms.len() as i64
+        && ex.rooms_count == resolvable_rooms_count
+        && (p.legacy_cust_no.is_none() || ex.legacy_cust_no == p.legacy_cust_no)
+        && (p.notes.is_none() || ex.book_notes == p.notes)
 }
 
 async fn update_existing(
@@ -694,13 +812,61 @@ async fn insert_new(
     Ok(row.0)
 }
 
+/// A projection room line whose `room_no` resolved to a canonical
+/// `ht_rooms_new.room_id`. Produced by [`resolve_room_lines`], consumed
+/// by [`replace_rooms`].
+#[derive(Debug, Clone)]
+struct ResolvedRoomLine {
+    room_id: i32,
+    price_per_night: Option<f64>,
+}
+
+/// Resolve every projection room line against `ht_rooms_new`. Lines
+/// whose room is missing are warn-skipped (the room backfill is an
+/// operator action) — the RESOLVED set is what both `existing_matches`
+/// (count) and `replace_rooms` (content) operate on, so the idempotency
+/// comparison and the junction mutation can never disagree (2026-06-11
+/// fix for the forever-re-emitting `BookingModified` loop on
+/// unresolvable lines).
+async fn resolve_room_lines(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    book_id: &str,
+    rooms: &[RoomLine],
+) -> Result<Vec<ResolvedRoomLine>, SyncError> {
+    let mut out = Vec::with_capacity(rooms.len());
+    for r in rooms {
+        let room_id_row: Option<(i32,)> = sqlx::query_as(
+            "SELECT room_id FROM ht_rooms_new WHERE room_no = $1 LIMIT 1",
+        )
+        .bind(&r.room_no)
+        .fetch_optional(&mut **tx)
+        .await?;
+        match room_id_row {
+            Some((room_id,)) => out.push(ResolvedRoomLine {
+                room_id,
+                price_per_night: r.price_per_night,
+            }),
+            None => {
+                tracing::warn!(
+                    book_id,
+                    room_no = %r.room_no,
+                    "ht_booking_rooms line skipped: room_no not found in \
+                     ht_rooms_new (run bin/backfill_rooms); line excluded \
+                     from both the junction and the idempotency count"
+                );
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Replace `ht_booking_rooms` for this booking. Conservative: drop and
 /// re-insert. The set is small (typically 1 row, rarely >5) so the
 /// extra delete is cheaper than diffing.
 async fn replace_rooms(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     book_id_serial: i32,
-    rooms: &[RoomLine],
+    rooms: &[ResolvedRoomLine],
 ) -> Result<(), SyncError> {
     sqlx::query("DELETE FROM ht_booking_rooms WHERE br_book_id = $1")
         .bind(book_id_serial)
@@ -708,23 +874,6 @@ async fn replace_rooms(
         .await?;
 
     for r in rooms {
-        // Resolve room_id by room_no. Skip rows where the room hasn't
-        // been backfilled — same defer pattern as the customer
-        // resolver.
-        let room_id_row: Option<(i32,)> = sqlx::query_as(
-            "SELECT room_id FROM ht_rooms_new WHERE room_no = $1 LIMIT 1",
-        )
-        .bind(&r.room_no)
-        .fetch_optional(&mut **tx)
-        .await?;
-        let Some((room_id,)) = room_id_row else {
-            tracing::warn!(
-                book_id = book_id_serial,
-                room_no = %r.room_no,
-                "ht_booking_rooms skipped: room_no not found in ht_rooms_new"
-            );
-            continue;
-        };
         // ON CONFLICT keeps us idempotent if a duplicate (book_id,
         // room_id) somehow slipped through (shouldn't, the DELETE
         // above empties the set first — but the unique index on
@@ -736,7 +885,7 @@ async fn replace_rooms(
              ON CONFLICT (br_book_id, br_room_id) DO NOTHING",
         )
         .bind(book_id_serial)
-        .bind(room_id)
+        .bind(r.room_id)
         .bind(r.price_per_night)
         .execute(&mut **tx)
         .await?;
@@ -802,10 +951,24 @@ fn build_event(
     }
 }
 
+/// Convert a legacy stay-boundary date — Bangkok wall-clock midnight
+/// stored without timezone info — to a real UTC instant for the
+/// `DomainEvent` snapshot.
+///
+/// Fixed 2026-06-11 (audit P2 "timezone mislabels"): the previous
+/// implementation stamped Bangkok midnight as UTC midnight, putting
+/// every snapshot instant 7 hours in the future. Midnight Bangkok is
+/// 17:00 UTC the previous day. `+07:00` is a fixed offset (no DST), so
+/// `single()` always yields exactly one instant.
 fn naive_date_to_utc(date: NaiveDate) -> chrono::DateTime<chrono::Utc> {
     use chrono::TimeZone;
     let midnight = chrono::NaiveTime::from_hms_opt(0, 0, 0).expect("hardcoded midnight");
-    chrono::Utc.from_utc_datetime(&date.and_time(midnight))
+    let bangkok = chrono::FixedOffset::east_opt(7 * 3600).expect("+07:00 is a valid offset");
+    bangkok
+        .from_local_datetime(&date.and_time(midnight))
+        .single()
+        .expect("fixed offsets have no DST gaps/folds")
+        .with_timezone(&chrono::Utc)
 }
 
 // =============================================================================
@@ -971,6 +1134,66 @@ mod tests {
         assert!(p.notes.is_none());
     }
 
+    // ----- Book_room_type=1 (room-TYPE-code Ds lines, cheatsheet §3.3) ----
+
+    /// `Book_room_type=1` means the Ds lines carry a room-TYPE code in
+    /// `Book_Room_Type` (e.g. a rate-category id), NOT a room number.
+    /// Pre-2026-06-11 those lines were projected as room assignments,
+    /// failed the `ht_rooms_new.room_no` lookup, warn-skipped, and the
+    /// `rooms_count` mismatch re-emitted `BookingModified` on every CT
+    /// touch forever. Type-1 must project header-only.
+    #[test]
+    fn project_aggregate_type1_booking_projects_no_room_assignments() {
+        let header = header_row("R015301", "C21610", "จอง")
+            .with("Book_room_type", MockValue::I32(1));
+        let agg = BookingAggregate {
+            header: Some(header),
+            // Ds line carries a TYPE code ("4" = some room category),
+            // not a room number.
+            rooms: vec![ds_row("R015301", "4")],
+            nights: vec![],
+        };
+        let p = project_aggregate(&agg, "R015301").unwrap();
+        assert!(
+            p.rooms.is_empty(),
+            "type-1 Ds lines are room-TYPE codes and must not become \
+             room assignments"
+        );
+        // Header fields still mirror normally.
+        assert_eq!(p.book_status, "confirmed");
+        assert_eq!(p.total_amount, Some(890.0));
+    }
+
+    /// `Book_room_type=2` (specific rooms) keeps the historical
+    /// room-number interpretation.
+    #[test]
+    fn project_aggregate_type2_booking_projects_room_assignments() {
+        let header = header_row("R015302", "C21610", "จอง")
+            .with("Book_room_type", MockValue::I32(2));
+        let agg = BookingAggregate {
+            header: Some(header),
+            rooms: vec![ds_row("R015302", "402")],
+            nights: vec![],
+        };
+        let p = project_aggregate(&agg, "R015302").unwrap();
+        assert_eq!(p.rooms.len(), 1);
+        assert_eq!(p.rooms[0].room_no, "402");
+    }
+
+    /// Missing `Book_room_type` (sparse fixture / pre-widening load)
+    /// defaults to the historical room-number path so existing
+    /// aggregates keep projecting identically.
+    #[test]
+    fn project_aggregate_missing_book_room_type_defaults_to_room_numbers() {
+        let agg = BookingAggregate {
+            header: Some(header_row("R015303", "C21610", "จอง")),
+            rooms: vec![ds_row("R015303", "402")],
+            nights: vec![],
+        };
+        let p = project_aggregate(&agg, "R015303").unwrap();
+        assert_eq!(p.rooms.len(), 1);
+    }
+
     // ----- header-only / walk-in-shaped projection ------------------------
     //
     // Regression guard for the 2026-05-18 "18 stuck check-ins" PROD-CRIT:
@@ -1074,72 +1297,99 @@ mod tests {
         }
     }
 
-    #[test]
-    fn existing_matches_returns_true_for_unchanged_row() {
-        let p = sample_projection();
-        let ex = ExistingBooking {
+    /// Existing canonical row that exactly mirrors `p` — tests mutate
+    /// one field at a time.
+    fn make_existing(p: &CanonicalProjection) -> ExistingBooking {
+        ExistingBooking {
             book_id_serial: 1,
             aggregate_id: Some(uuid::Uuid::nil()),
-            book_status: Some("confirmed".into()),
+            book_status: Some(p.book_status.clone()),
             book_cust_id: 100,
-            book_total_amount: Some(890.0),
-            book_deposit_amount: Some(0.0),
+            book_total_amount: p.total_amount,
+            book_deposit_amount: p.deposit_amount,
             book_checkin: p.book_checkin,
             book_checkout: p.book_checkout,
             rooms_count: p.rooms.len() as i64,
-        };
-        assert!(existing_matches(&ex, &p));
+            legacy_cust_no: p.legacy_cust_no.clone(),
+            book_notes: p.notes.clone(),
+        }
+    }
+
+    #[test]
+    fn existing_matches_returns_true_for_unchanged_row() {
+        let p = sample_projection();
+        let ex = make_existing(&p);
+        assert!(existing_matches(&ex, &p, p.rooms.len() as i64));
     }
 
     #[test]
     fn existing_matches_returns_false_when_status_differs() {
         let p = sample_projection();
-        let ex = ExistingBooking {
-            book_id_serial: 1,
-            aggregate_id: Some(uuid::Uuid::nil()),
-            book_status: Some("cancelled".into()),
-            book_cust_id: 100,
-            book_total_amount: Some(890.0),
-            book_deposit_amount: Some(0.0),
-            book_checkin: p.book_checkin,
-            book_checkout: p.book_checkout,
-            rooms_count: p.rooms.len() as i64,
-        };
-        assert!(!existing_matches(&ex, &p));
+        let mut ex = make_existing(&p);
+        ex.book_status = Some("cancelled".into());
+        assert!(!existing_matches(&ex, &p, p.rooms.len() as i64));
     }
 
     #[test]
     fn existing_matches_returns_false_when_total_differs() {
         let p = sample_projection();
-        let ex = ExistingBooking {
-            book_id_serial: 1,
-            aggregate_id: Some(uuid::Uuid::nil()),
-            book_status: Some("confirmed".into()),
-            book_cust_id: 100,
-            book_total_amount: Some(900.0),
-            book_deposit_amount: Some(0.0),
-            book_checkin: p.book_checkin,
-            book_checkout: p.book_checkout,
-            rooms_count: p.rooms.len() as i64,
-        };
-        assert!(!existing_matches(&ex, &p));
+        let mut ex = make_existing(&p);
+        ex.book_total_amount = Some(900.0);
+        assert!(!existing_matches(&ex, &p, p.rooms.len() as i64));
     }
 
     #[test]
     fn existing_matches_returns_false_when_rooms_count_differs() {
         let p = sample_projection();
-        let ex = ExistingBooking {
-            book_id_serial: 1,
-            aggregate_id: Some(uuid::Uuid::nil()),
-            book_status: Some("confirmed".into()),
-            book_cust_id: 100,
-            book_total_amount: Some(890.0),
-            book_deposit_amount: Some(0.0),
-            book_checkin: p.book_checkin,
-            book_checkout: p.book_checkout,
-            rooms_count: (p.rooms.len() + 1) as i64,
-        };
-        assert!(!existing_matches(&ex, &p));
+        let ex = make_existing(&p);
+        assert!(!existing_matches(&ex, &p, (p.rooms.len() + 1) as i64));
+    }
+
+    /// Audit 2026-06-11 P1 #6 — iHOTEL's customer-delete cascade
+    /// (`UPDATE HT_Book_H SET Book_Cust_ID='C0000'`, cheatsheet §3.24)
+    /// changes ONLY the customer pointer. Pre-fix, `existing_matches`
+    /// compared status/amounts/dates/rooms only, so the cascade was
+    /// silently idempotency-skipped and the canonical booking kept
+    /// referencing the deleted customer forever.
+    #[test]
+    fn existing_matches_returns_false_when_only_cust_no_changed() {
+        let p = sample_projection(); // legacy_cust_no = Some("C21610")
+        let mut ex = make_existing(&p);
+        ex.legacy_cust_no = Some("C0000".into()); // canonical lags the cascade
+        assert!(
+            !existing_matches(&ex, &p, p.rooms.len() as i64),
+            "a cust_no-only change MUST force a re-apply (C0000 cascade)"
+        );
+    }
+
+    /// Notes-only edits must also force a re-apply…
+    #[test]
+    fn existing_matches_returns_false_when_only_notes_changed() {
+        let mut p = sample_projection();
+        p.notes = Some("late arrival".into());
+        let mut ex = make_existing(&p);
+        ex.book_notes = None;
+        assert!(!existing_matches(&ex, &p, p.rooms.len() as i64));
+    }
+
+    /// …but a None-notes projection against a populated canonical value
+    /// must NOT mismatch: `update_existing` writes notes through
+    /// `COALESCE($7, book_notes)`, so the canonical value would never
+    /// converge to NULL and the mismatch would re-emit BookingModified
+    /// every tick forever. Same guard pattern for legacy_cust_no.
+    #[test]
+    fn existing_matches_guards_none_projection_against_populated_canonical() {
+        let mut p = sample_projection();
+        p.notes = None;
+        p.legacy_cust_no = None;
+        let mut ex = make_existing(&p);
+        ex.book_notes = Some("kept".into());
+        ex.legacy_cust_no = Some("C21610".into());
+        assert!(
+            existing_matches(&ex, &p, p.rooms.len() as i64),
+            "None projection vs Some canonical must stay idempotent \
+             (COALESCE write semantics can never converge it)"
+        );
     }
 
     // ----- coalesce_key --------------------------------------------------

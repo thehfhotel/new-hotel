@@ -445,3 +445,94 @@ async fn room_master_unchanged_clean_skips_event() {
         .await
         .ok();
 }
+
+// =============================================================================
+// Customer hard-delete resolution by legacy_id (migration 055, audit
+// 2026-06-11 P1 #6).
+//
+// Real CT D-rows for HT_Customers carry ONLY the legacy SERIAL `id` —
+// the LEFT JOIN against the deleted row nulls Cust_no. Pre-055 the
+// soft-delete branch resolved exclusively by Cust_no, so every iHOTEL
+// customer delete (FrmManageCustomersNew) was a silent no-op.
+// =============================================================================
+
+#[tokio::test]
+async fn customer_delete_resolves_by_legacy_id_alone() {
+    let pool = common::create_test_pool().await;
+    let mapper = CustomerMapper;
+    let cust_no = unique_cust_no();
+    // Unique-ish legacy id for this run (avoid cross-run collisions on
+    // the shared test DB).
+    let legacy_id: i32 = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        9_000_000 + (nanos % 900_000) as i32
+    };
+
+    // Create — the I-row carries the `id` PK alias the watcher always
+    // materialises in; the UPSERT must persist it as legacy_id.
+    let row = customer_row_full(&cust_no, "Del Tester 055", "0807776666")
+        .with("id", MockValue::I32(legacy_id));
+    let mut tx = pool.begin().await.unwrap();
+    mapper
+        .apply(&mut tx, ChangeOp::Insert, Some(&row))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let stored: Option<i32> = sqlx::query_scalar(
+        "SELECT legacy_id FROM ht_customers WHERE legacy_cust_no = $1",
+    )
+    .bind(&cust_no)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, Some(legacy_id), "I/U apply must persist legacy_id");
+
+    // Delete — faithful CT D-row shape: ONLY the pk `id`; the joined
+    // Cust_no is NULL because the MSSQL row is gone.
+    let del_row = HashMapRow::new("HT_Customers")
+        .with("id", MockValue::I32(legacy_id))
+        .with("Cust_no", MockValue::Null);
+    let mut tx2 = pool.begin().await.unwrap();
+    let event = mapper
+        .apply(&mut tx2, ChangeOp::Delete, Some(&del_row))
+        .await
+        .expect("Delete must succeed");
+    tx2.commit().await.unwrap();
+    assert!(event.is_none(), "D events emit no DomainEvent");
+
+    let deleted_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+        "SELECT cust_deleted_at FROM ht_customers WHERE legacy_cust_no = $1",
+    )
+    .bind(&cust_no)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        deleted_at.is_some(),
+        "pre-055 this was a silent no-op: a Cust_no-less D-row must now \
+         resolve via legacy_id and set cust_deleted_at"
+    );
+
+    // Cleanup.
+    let agg: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT aggregate_id FROM ht_customers WHERE legacy_cust_no = $1",
+    )
+    .bind(&cust_no)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    if let Some(a) = agg {
+        sqlx::query("DELETE FROM event_log WHERE aggregate_id = $1")
+            .bind(a)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+    sqlx::query("DELETE FROM ht_customers WHERE legacy_cust_no = $1")
+        .bind(&cust_no)
+        .execute(&pool)
+        .await
+        .ok();
+}

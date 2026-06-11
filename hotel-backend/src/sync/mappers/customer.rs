@@ -18,6 +18,7 @@
 //!
 //! | MSSQL `HT_Customers`    | PG `ht_customers`            |
 //! |-------------------------|-------------------------------|
+//! | `id`                    | `legacy_id` (migration 055 — CT D-rows carry ONLY this key, so hard-deletes resolve by it) |
 //! | `Cust_no`               | `legacy_cust_no` (also derives `aggregate_id`) |
 //! | `Cust_name`             | `cust_firstname` (NOT NULL — empty string fallback) |
 //! | `Cust_name2`            | `cust_name2` (English/secondary name; FrmReportRR4) |
@@ -58,8 +59,11 @@
 //! Before publishing an event, the mapper compares the canonical PG row
 //! to the projected legacy row. If every mirrored column already matches,
 //! the UPSERT runs (cheap NO-OP) but `Ok(None)` is returned so no
-//! `event_log` row is written. This belt-and-suspenders us against a
-//! missed `0x4E48` CONTEXT_INFO tag.
+//! `event_log` row is written. This idempotency IS the echo-absorption
+//! mechanism: CT rows produced by our own writeback re-enter here and
+//! converge to a no-op. (`SET CONTEXT_INFO` never populated
+//! `SYS_CHANGE_CONTEXT`, so there was never a SQL-layer filter — see
+//! `db/mssql_session.rs`.)
 //!
 //! ## Aggregate UUID
 //!
@@ -89,6 +93,10 @@ pub(crate) const TABLE: &str = "HT_Customers";
 /// (see [`project`]) and the eager fetcher always reach for the same
 /// set of columns.
 pub(crate) const EAGER_FETCH_COLUMNS: &[&str] = &[
+    // Legacy SERIAL PK — persisted as ht_customers.legacy_id (migration
+    // 055) so CT D-rows, which carry ONLY this key, can resolve the
+    // canonical row for the soft delete.
+    "id",
     "Cust_no",
     "Cust_name",
     "Cust_name2",
@@ -186,6 +194,13 @@ impl MssqlChangeMapper for CustomerMapper {
 /// to cover the full legacy `HT_Customers` surface (T1 HIGH-2 / T2 HIGH-4).
 #[derive(Debug, Clone, PartialEq)]
 struct CustomerProjection {
+    /// Legacy `HT_Customers.id` (SERIAL PK). Persisted as
+    /// `ht_customers.legacy_id` (migration 055) so CT D-rows — which
+    /// carry ONLY this key — can resolve the canonical row. `None` for
+    /// fixture rows that pre-date the widening; the UPSERT writes it
+    /// through `COALESCE` so a transient `None` never blanks a stored
+    /// value.
+    legacy_id: Option<i32>,
     cust_no: String,
     cust_name: String,
     cust_name2: Option<String>,
@@ -244,6 +259,11 @@ fn project(row: &dyn MappableRow) -> Result<CustomerProjection, SyncError> {
     let cust_name = row.try_get_str("Cust_name")?.unwrap_or("").to_string();
 
     Ok(CustomerProjection {
+        // `.ok().flatten()` — fixture rows / pre-055 loads may not carry
+        // the `id` cell at all; treat "missing column" like NULL. The
+        // watcher's CT projection always aliases the PK in (see
+        // `bin/sync.rs::build_materialised_row`).
+        legacy_id: row.try_get_i32("id").ok().flatten(),
         cust_no,
         cust_name,
         cust_name2: row.try_get_str("Cust_name2")?.map(str::to_string),
@@ -291,6 +311,11 @@ fn project(row: &dyn MappableRow) -> Result<CustomerProjection, SyncError> {
 struct ExistingRow {
     cust_id: i32,
     aggregate_id: Option<Uuid>,
+    /// Stored `legacy_id` (migration 055). Outside `keys` because the
+    /// comparison is guarded (see [`matches`]): a `None` projection
+    /// must not force a re-apply, but a row whose stored value is still
+    /// NULL must re-apply once so the backfill lands.
+    legacy_id: Option<i32>,
     keys: ExistingEqualityKeys,
 }
 
@@ -386,7 +411,7 @@ async fn fetch_existing(
     // 35 columns we read mirror everything the UPSERT writes, plus
     // (cust_id, aggregate_id) for FK resolution.
     let opt = sqlx::query(
-        "SELECT cust_id, aggregate_id, cust_firstname, cust_name2, \
+        "SELECT cust_id, aggregate_id, legacy_id, cust_firstname, cust_name2, \
                 cust_title, cust_sex, cust_idcard, cust_price_tier, \
                 cust_type, cust_email, cust_add_no, cust_add_moo, \
                 cust_add_soi, cust_add_road, cust_add_tambon, cust_add_ampore, \
@@ -410,6 +435,7 @@ async fn fetch_existing(
     Ok(Some(ExistingRow {
         cust_id: row.try_get("cust_id")?,
         aggregate_id: row.try_get("aggregate_id")?,
+        legacy_id: row.try_get("legacy_id")?,
         keys: ExistingEqualityKeys {
             cust_name: row.try_get("cust_firstname")?,
             cust_name2: row.try_get("cust_name2")?,
@@ -450,8 +476,14 @@ async fn fetch_existing(
 
 /// Returns true when every mirrored column already matches the legacy
 /// projection. Used to skip event publication on a re-applied row.
+///
+/// `legacy_id` (migration 055) is compared with a guard: a `None`
+/// projection (fixture / pre-widening load) must not force a re-apply,
+/// but a `Some` projection against a still-NULL stored value MUST
+/// mismatch once so the UPSERT backfills the column.
 fn matches(existing: &ExistingRow, projected: &CustomerProjection) -> bool {
     existing.keys == projection_equality_keys(projected)
+        && (projected.legacy_id.is_none() || existing.legacy_id == projected.legacy_id)
 }
 
 async fn apply_upsert(
@@ -483,9 +515,10 @@ async fn apply_upsert(
                 sqlx::query(UPDATE_SQL),
                 &projected,
             )
-            .bind(&projected.cust_no) // $34
-            .bind(agg_id)             // $35
-            .bind(ex.cust_id)         // $36
+            .bind(&projected.cust_no)   // $34
+            .bind(agg_id)               // $35
+            .bind(ex.cust_id)           // $36
+            .bind(projected.legacy_id)  // $37
             .execute(&mut **tx)
             .await?;
             (ex.cust_id, agg_id, false)
@@ -497,7 +530,8 @@ async fn apply_upsert(
                 sqlx::query_as::<_, (i32,)>(INSERT_SQL),
                 &projected,
             )
-            .bind(&projected.cust_no) // $34
+            .bind(&projected.cust_no)   // $34
+            .bind(projected.legacy_id)  // $35
             .fetch_one(&mut **tx)
             .await?;
 
@@ -519,8 +553,11 @@ async fn apply_upsert(
 
 /// SQL for the UPDATE branch — column list mirrors [`bind_projected_columns`]
 /// in $1..$33 order, with $34 = legacy_cust_no, $35 = aggregate_id,
-/// $36 = cust_id WHERE-key. `cust_address` is kept in lock-step with
-/// `cust_add_no` so legacy single-line readers keep working.
+/// $36 = cust_id WHERE-key, $37 = legacy_id (migration 055; COALESCE'd
+/// new-over-old: the legacy id of a Cust_no never changes, but a `None`
+/// projection from a sparse fixture must not blank a stored value).
+/// `cust_address` is kept in lock-step with `cust_add_no` so legacy
+/// single-line readers keep working.
 const UPDATE_SQL: &str =
     "UPDATE ht_customers \
         SET cust_firstname     = $1, \
@@ -559,12 +596,13 @@ const UPDATE_SQL: &str =
             cust_address       = $9, \
             legacy_cust_no     = COALESCE(legacy_cust_no, $34), \
             aggregate_id       = COALESCE(aggregate_id, $35), \
+            legacy_id          = COALESCE($37, legacy_id), \
             cust_deleted_at    = NULL, \
             updated_at         = NOW() \
       WHERE cust_id = $36";
 
 /// SQL for the INSERT branch — same $1..$33 column order as
-/// [`bind_projected_columns`], $34 = legacy_cust_no.
+/// [`bind_projected_columns`], $34 = legacy_cust_no, $35 = legacy_id.
 const INSERT_SQL: &str =
     "INSERT INTO ht_customers \
          (cust_firstname, cust_name2, cust_title, cust_sex, cust_idcard, \
@@ -575,10 +613,10 @@ const INSERT_SQL: &str =
           cust_work_road, cust_work_tambon, cust_work_ampore, \
           cust_work_province, cust_work_code, cust_work_tel, cust_work_fax, \
           cust_work_tax, cust_last_change, cust_contry, cust_price_over, \
-          cust_address, legacy_cust_no) \
+          cust_address, legacy_cust_no, legacy_id) \
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
              $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, \
-             $27, $28, $29, $30, $31, $32, $33, $9, $34) \
+             $27, $28, $29, $30, $31, $32, $33, $9, $34, $35) \
      RETURNING cust_id";
 
 /// Binds the 33 projected columns to a sqlx query in $1..$33 order.
@@ -672,26 +710,52 @@ async fn apply_soft_delete(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     row: &dyn MappableRow,
 ) -> Result<Option<DomainEvent>, SyncError> {
-    // For D, CT only carries the PK columns from the projection (no
-    // joined row data). The watcher embeds the legacy SERIAL `id` PK
-    // and, when available, the unique business key `Cust_no` so we can
-    // resolve the canonical row even if the I-event-driven UPSERT had
-    // not yet populated `legacy_cust_no` (a benign race window of one
-    // tick).
+    // For D, CT only carries the PK columns (no joined row data) — for
+    // `HT_Customers` that is the legacy SERIAL `id` ALONE; the joined
+    // `Cust_no` is NULL because the row no longer exists. Pre-migration
+    // 055 this function resolved exclusively by `Cust_no`, so EVERY
+    // iHOTEL customer delete (FrmManageCustomersNew, cheatsheet §3.24)
+    // was a silent no-op and the canonical row stayed live forever
+    // (audit 2026-06-11 P1 #6).
     //
     // Resolution order:
-    //   1. Try `Cust_no` if the D-row carries it (preferred — matches
-    //      the partial unique index on `legacy_cust_no`).
-    //   2. Fall back to the legacy `id` (numeric); the row may not yet
-    //      have a column on our side that mirrors it, in which case
-    //      this is a no-op tombstone and the next mapper tick will
-    //      reconcile via the I/U path.
+    //   1. `legacy_id` (migration 055) — the only key a D-row reliably
+    //      carries. Populated by every I/U apply since 2026-06-11.
+    //   2. `Cust_no` fallback — fires only when the materialised row
+    //      somehow carries it (it never does for real CT D-rows, but
+    //      fixtures and a hypothetical future projection might).
+    //   3. Neither resolves → loud WARN, not an error: the MSSQL row is
+    //      already gone, so a retry can never learn more — erroring
+    //      would wedge the watermark permanently on deletes of rows
+    //      mirrored before migration 055 backfilled their legacy_id.
+    //      This is a deliberate, logged residual gap (see migration 055
+    //      header).
     //
     // Per spec: emit no DomainEvent for D in 5.2 (no UI subscriber yet).
-    let _ = row.try_get_i32("id"); // surface the column existence; not used for resolution today.
+    let legacy_id = row.try_get_i32("id").unwrap_or(None);
+    if let Some(id) = legacy_id {
+        let affected = sqlx::query(
+            "UPDATE ht_customers \
+                SET cust_deleted_at = NOW(), \
+                    updated_at      = NOW() \
+              WHERE legacy_id = $1",
+        )
+        .bind(id)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+        if affected > 0 {
+            tracing::info!(
+                legacy_id = id,
+                "ht_customers soft-deleted via legacy_id (iHOTEL hard delete)"
+            );
+            return Ok(None);
+        }
+    }
+
     let cust_no_opt = row.try_get_str("Cust_no").unwrap_or(None);
     if let Some(cust_no) = cust_no_opt {
-        sqlx::query(
+        let affected = sqlx::query(
             "UPDATE ht_customers \
                 SET cust_deleted_at = NOW(), \
                     updated_at      = NOW() \
@@ -699,11 +763,21 @@ async fn apply_soft_delete(
         )
         .bind(cust_no)
         .execute(&mut **tx)
-        .await?;
+        .await?
+        .rows_affected();
+        if affected > 0 {
+            return Ok(None);
+        }
     }
-    // No Cust_no on the D row → silent no-op; the row never existed in
-    // canonical PG, or its legacy_cust_no will land on the next I/U
-    // tick and a subsequent D will succeed.
+
+    tracing::warn!(
+        legacy_id = ?legacy_id,
+        "HT_Customers D-row could not be resolved to a canonical row \
+         (legacy_id not yet backfilled on rows mirrored before migration \
+         055, or the customer was never mirrored) — soft delete skipped; \
+         deliberate no-op because the MSSQL row is gone and retrying can \
+         never learn more"
+    );
     Ok(None)
 }
 
@@ -763,10 +837,11 @@ fn build_event(
 
 /// Eager-mirror a single `HT_Customers` row into canonical `ht_customers`.
 ///
-/// Used by the check-in mapper when a CT-driven checkin references a
-/// `Cust_no` that hasn't been mirrored yet — fetching the customer
-/// in-band (rather than deferring to the next CT tick on `HT_Customers`)
-/// prevents the "defer-forever" strand class of bug. See
+/// Used by the check-in AND booking mappers when a CT-driven row
+/// references a `Cust_no` that hasn't been mirrored yet — fetching the
+/// customer in-band (rather than "deferring", which silently drops the
+/// dependent row once the watermark advances — the June-3 2026 class)
+/// is the only self-healing path. See
 /// `sync::mappers::checkin::resolve_customer_or_eager_mirror`.
 ///
 /// Semantics:
@@ -816,10 +891,10 @@ pub(crate) async fn upsert_customer_from_row(
               cust_work_road, cust_work_tambon, cust_work_ampore, \
               cust_work_province, cust_work_code, cust_work_tel, cust_work_fax, \
               cust_work_tax, cust_last_change, cust_contry, cust_price_over, \
-              cust_address, legacy_cust_no) \
+              cust_address, legacy_cust_no, legacy_id) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
                  $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, \
-                 $27, $28, $29, $30, $31, $32, $33, $9, $34) \
+                 $27, $28, $29, $30, $31, $32, $33, $9, $34, $35) \
          ON CONFLICT (legacy_cust_no) WHERE legacy_cust_no IS NOT NULL \
              DO NOTHING \
          RETURNING cust_id";
@@ -828,7 +903,8 @@ pub(crate) async fn upsert_customer_from_row(
         sqlx::query_as::<_, (i32,)>(EAGER_INSERT_SQL),
         &projected,
     )
-    .bind(&projected.cust_no) // $34
+    .bind(&projected.cust_no)   // $34
+    .bind(projected.legacy_id)  // $35
     .fetch_optional(&mut **tx)
     .await?;
 
@@ -857,6 +933,63 @@ pub(crate) async fn upsert_customer_from_row(
         }
     };
 
+    Ok(cust_id)
+}
+
+/// iHOTEL's reserved "deleted customer" sentinel (cheatsheet §3.24 /
+/// §HT_Customers invariants). The delete cascade rewrites every FK-style
+/// reference (`Cin_cust_no`, `Book_Cust_ID`, …) to `'C0000'`, and NO
+/// real `HT_Customers` row with that `Cust_no` exists — so the
+/// eager-mirror fetch can never satisfy it.
+pub(crate) const DELETED_CUSTOMER_SENTINEL: &str = "C0000";
+
+/// Ensure a canonical placeholder row exists for the `'C0000'` sentinel
+/// and return its `cust_id`.
+///
+/// Added 2026-06-11 (audit P1 #6): when iHOTEL deletes a customer, its
+/// cascade re-points dependent rows at `'C0000'`. Mirroring that
+/// re-point requires `cin_cust_id` / `book_cust_id` (both `NOT NULL`)
+/// to have somewhere to land. Per the cheatsheet, `'C0000'` "should be
+/// treated as a sentinel and not as a valid customer reference" — the
+/// canonical placeholder mirrors exactly that: a tombstone target, not
+/// a customer anyone created.
+///
+/// Idempotent: `ON CONFLICT (legacy_cust_no) DO NOTHING` + follow-up
+/// SELECT, same race-safe shape as [`upsert_customer_from_row`].
+pub(crate) async fn ensure_deleted_customer_sentinel(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<i32, SyncError> {
+    let inserted: Option<(i32,)> = sqlx::query_as(
+        "INSERT INTO ht_customers (cust_firstname, legacy_cust_no) \
+         VALUES ('(deleted customer)', $1) \
+         ON CONFLICT (legacy_cust_no) WHERE legacy_cust_no IS NOT NULL \
+             DO NOTHING \
+         RETURNING cust_id",
+    )
+    .bind(DELETED_CUSTOMER_SENTINEL)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    let cust_id = match inserted {
+        Some((id,)) => {
+            let agg_id = aggregate_uuid(AggregateKind::Customer, id);
+            sqlx::query("UPDATE ht_customers SET aggregate_id = $1 WHERE cust_id = $2")
+                .bind(agg_id)
+                .bind(id)
+                .execute(&mut **tx)
+                .await?;
+            id
+        }
+        None => {
+            let existing: (i32,) = sqlx::query_as(
+                "SELECT cust_id FROM ht_customers WHERE legacy_cust_no = $1 LIMIT 1",
+            )
+            .bind(DELETED_CUSTOMER_SENTINEL)
+            .fetch_one(&mut **tx)
+            .await?;
+            existing.0
+        }
+    };
     Ok(cust_id)
 }
 
@@ -900,6 +1033,7 @@ mod tests {
     /// loses a field. Used by the equality / event tests.
     fn make_projection_all_set() -> CustomerProjection {
         CustomerProjection {
+            legacy_id: Some(21607),
             cust_no: "C00001".into(),
             cust_name: "Alice".into(),
             cust_name2: Some("Alice EN".into()),
@@ -948,6 +1082,7 @@ mod tests {
         ExistingRow {
             cust_id: 1,
             aggregate_id: Some(uuid::Uuid::nil()),
+            legacy_id: p.legacy_id,
             keys: projection_equality_keys(p),
         }
     }
@@ -1020,6 +1155,51 @@ mod tests {
         let mut ex = make_existing_matching(&p);
         ex.keys.cust_price_over = Some(0.0);
         assert!(!matches(&ex, &p));
+    }
+
+    // ----- legacy_id (migration 055, customer hard-delete handling) ------
+
+    /// The projection must capture the legacy SERIAL `id` so the UPSERT
+    /// can persist it — CT D-rows carry ONLY this key.
+    #[test]
+    fn project_captures_legacy_id_from_pk_alias() {
+        let row = make_row_with_nulls("C21607")
+            .with("Cust_name", MockValue::Str("x".into()))
+            .with("id", MockValue::I32(21607));
+        let p = project(&row).expect("project must succeed");
+        assert_eq!(p.legacy_id, Some(21607));
+    }
+
+    /// Sparse fixtures without an `id` cell must still project (None).
+    #[test]
+    fn project_tolerates_missing_legacy_id() {
+        let row = make_row_with_nulls("C21607").with("Cust_name", MockValue::Str("x".into()));
+        let p = project(&row).expect("missing id cell must not abort");
+        // make_row_with_nulls seeds `id` (it's in EAGER_FETCH_COLUMNS)
+        // as Null → None.
+        assert!(p.legacy_id.is_none());
+    }
+
+    /// A row mirrored before migration 055 carries NULL legacy_id; the
+    /// first CT touch after the migration must mismatch ONCE so the
+    /// UPSERT backfills the column.
+    #[test]
+    fn matches_returns_false_when_stored_legacy_id_still_null() {
+        let p = make_projection_all_set(); // legacy_id = Some(21607)
+        let mut ex = make_existing_matching(&p);
+        ex.legacy_id = None;
+        assert!(!matches(&ex, &p), "must re-apply once to backfill legacy_id");
+    }
+
+    /// A None-projection legacy_id (sparse fixture) must not force a
+    /// re-apply against a populated stored value.
+    #[test]
+    fn matches_guards_none_legacy_id_projection() {
+        let mut p = make_projection_all_set();
+        p.legacy_id = None;
+        let mut ex = make_existing_matching(&p);
+        ex.legacy_id = Some(21607);
+        assert!(matches(&ex, &p));
     }
 
     #[test]

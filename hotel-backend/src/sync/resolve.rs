@@ -4,13 +4,32 @@
 //! check-in mapper, which resolves three FKs (booking, room, customer)
 //! against the same `legacy_*` lookup pattern.
 //!
-//! ## Defer-on-missing semantics
+//! ## Defer-on-missing semantics (REVISED 2026-06-11)
 //!
 //! Every resolver returns `Ok(None)` when the legacy identifier hasn't
-//! been mirrored into PG yet. Callers MUST treat that as "skip this
-//! aggregate apply for now" rather than a hard failure — the next CT
-//! tick that brings the missing parent in will surface the dependent
-//! aggregate via its own watcher pass.
+//! been mirrored into PG yet. **A miss is NOT self-healing.** The old
+//! contract claimed "the next CT tick that brings the missing parent in
+//! will surface the dependent aggregate" — that was FALSE. CT delivers
+//! each row change exactly once per watermark window; once the watcher
+//! consumes the dependent row and advances the watermark past it,
+//! NOTHING ever re-fires the dependent aggregate. A parent arriving
+//! later only fires the parent's own mapper. This was the proven root
+//! cause of the 2026-06-03 silent loss of customer C22209 + booking
+//! R015290 (booking deferred with `Ok(None)`, counted `skipped`,
+//! watermark advanced, CT retention aged the rows out after 2 days).
+//!
+//! Callers MUST therefore handle a miss in one of exactly two ways:
+//!
+//! 1. **Eager-mirror the missing parent** from MSSQL in the same TX and
+//!    retry the lookup (see
+//!    `mappers::checkin::resolve_customer_or_eager_mirror`), or
+//! 2. **Return an error** so the watcher's per-key handler sets
+//!    `errored=true` and the watermark HOLDS — the row is loudly
+//!    retried on the next tick (the 2026-05-18 lesson: per-key
+//!    failures must ALL gate the watermark).
+//!
+//! Returning `Ok(None)` to the watcher for an FK miss is a silent,
+//! permanent drop once the watermark advances. Never do that.
 //!
 //! ## Why a module instead of a trait
 //!
@@ -25,7 +44,9 @@ use crate::sync::SyncError;
 /// Resolve an `ht_customers.cust_id` from the legacy `Cust_no` business key.
 ///
 /// Returns `None` when the customer hasn't been mirrored into PG yet
-/// (the CustomerMapper hasn't seen the corresponding CT row).
+/// (the CustomerMapper hasn't seen the corresponding CT row). Callers
+/// must eager-mirror or error on a miss — see the module doc; a plain
+/// `Ok(None)` pass-through to the watcher silently drops the row.
 pub async fn resolve_customer_id(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     legacy_cust_no: Option<&str>,
@@ -43,7 +64,8 @@ pub async fn resolve_customer_id(
 
 /// Resolve an `ht_bookings.book_id` from the legacy `Book_ID` (the
 /// `R\d{6}` business key). Returns `None` when the booking hasn't been
-/// mirrored — caller defers the dependent apply.
+/// mirrored — caller must eager-mirror the booking aggregate or return
+/// an error to hold the watermark (see module doc).
 pub async fn resolve_booking_id(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     legacy_book_id: Option<&str>,
@@ -65,8 +87,10 @@ pub async fn resolve_booking_id(
 }
 
 /// Resolve an `ht_rooms_new.room_id` from the legacy `Room_no` business
-/// key. Returns `None` when the room hasn't been mirrored — caller
-/// logs a warning and skips (operator must run `bin/backfill_rooms`).
+/// key. Returns `None` when the room hasn't been mirrored — rooms have
+/// no eager-mirror path (room creation is an operator action via
+/// `bin/backfill_rooms`), so callers must return an error to hold the
+/// watermark until the operator backfills (see module doc).
 pub async fn resolve_room_id(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     legacy_room_no: Option<&str>,
@@ -84,8 +108,9 @@ pub async fn resolve_room_id(
 
 /// Resolve `ht_checkins.cin_id` and `aggregate_id` from the legacy
 /// `Cin_no`. Returns `None` when the check-in hasn't been mirrored —
-/// caller defers (the payment apply re-fires on the next tick after the
-/// check-in lands).
+/// callers must return an error to hold the watermark (receipts in
+/// particular have NO re-fire source: a consumed `HT_Receipt_H` CT row
+/// is gone forever once the watermark advances). See module doc.
 pub async fn resolve_checkin_id(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     legacy_cin_no: Option<&str>,

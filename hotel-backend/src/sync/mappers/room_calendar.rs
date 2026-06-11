@@ -54,8 +54,11 @@
 //! resolve when present and silently keep the FK NULL otherwise.
 //! Crucially we do **NOT** defer the entire row when the booking /
 //! check-in hasn't landed yet: the calendar tile is more important
-//! than the FK precision, and the next CT tick on the booking or
-//! check-in will retrigger the matching `HT_Room_Status` row.
+//! than the FK precision. (Honesty note 2026-06-11: nothing
+//! automatically re-fires this row to backfill the NULL FK later —
+//! CT rows fire once. The tile lands immediately and the FK stays
+//! NULL until the next genuine `HT_Room_Status` edit; an accepted
+//! trade-off, NOT the silent-drop class — no row is lost.)
 //!
 //! ## Read path
 //!

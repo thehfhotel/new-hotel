@@ -223,8 +223,13 @@ async fn guest_registry_apply_delete_removes_canonical_row() {
         .ok();
 }
 
+/// 2026-06-11 (June-3 incident class): a missing parent check-in must
+/// be an ERROR — not an `Ok(None)` defer — so the watcher holds the
+/// watermark and retries loudly. Nothing ever re-fires a consumed
+/// companion CT row; the pre-fix silent skip under-counted the TM.30
+/// immigration registry.
 #[tokio::test]
-async fn guest_registry_apply_defers_when_parent_checkin_missing() {
+async fn guest_registry_apply_errors_when_parent_checkin_missing() {
     let pool = common::create_test_pool().await;
     cleanup_guest(&pool).await;
 
@@ -238,12 +243,15 @@ async fn guest_registry_apply_defers_when_parent_checkin_missing() {
         .with("Cin_contry", MockValue::Str("XX".into()));
 
     let mut tx = pool.begin().await.expect("begin tx");
-    let event = GuestRegistryMapper
+    let err = GuestRegistryMapper
         .apply(&mut tx, ChangeOp::Insert, Some(&row))
         .await
-        .expect("apply must not error on missing parent — defers via Ok(None)");
-    assert!(event.is_none(), "defer returns Ok(None)");
-    tx.commit().await.expect("commit (no-op)");
+        .expect_err("missing parent check-in must error (watermark hold)");
+    assert!(
+        err.to_string().contains("parent check-in FK unresolvable"),
+        "error must name the unresolvable FK: {err}"
+    );
+    tx.rollback().await.ok();
 
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)::bigint FROM ht_guest_registry WHERE guest_legacy_id = $1",
@@ -254,7 +262,7 @@ async fn guest_registry_apply_defers_when_parent_checkin_missing() {
     .expect("count");
     assert_eq!(
         count, 0,
-        "deferred apply must not insert a canonical row pointing nowhere"
+        "errored apply must not insert a canonical row pointing nowhere"
     );
 
     cleanup_guest(&pool).await;

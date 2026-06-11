@@ -66,11 +66,18 @@ pub trait MssqlChangeMapper: Send + Sync {
     /// Mappers must handle both shapes — D events typically resolve the
     /// PG aggregate by the PK columns extracted from the CT side.
     ///
-    /// Returns `Ok(Some(event))` to publish on the bus, `Ok(None)` to
-    /// silently skip (e.g. the change came from our own writeback and
-    /// would be a no-op — though the `SET CONTEXT_INFO 0x4E48` filter
-    /// already covers that case at the SQL layer; mappers also self-skip
-    /// when the canonical row already matches the legacy row).
+    /// Returns `Ok(Some(event))` to publish on the bus. `Ok(None)`
+    /// means "nothing to publish AND nothing left to do" — the
+    /// idempotent skip (canonical row already matches the legacy row,
+    /// which is also how echoes of our own writeback are absorbed:
+    /// there is NO SQL-layer echo filter; see `db::mssql_session`).
+    ///
+    /// **`Ok(None)` must NEVER be used for an unresolved FK / missing
+    /// parent** (2026-06-11, June-3 incident class): the watcher counts
+    /// it as `skipped` and advances the watermark, permanently dropping
+    /// the row. Eager-mirror the parent or return `Err` so the watcher
+    /// sets `errored=true` and HOLDS the watermark for a loud retry —
+    /// see `sync::resolve` module doc.
     async fn apply(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,

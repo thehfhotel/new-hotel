@@ -207,8 +207,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     if let Some(book_no) = parent_book_no.as_deref() {
                         match load_booking_aggregate(&mssql, book_no).await {
                             Ok(book_agg) if book_agg.is_present() => {
-                                if let Err(err) =
-                                    apply_booking_aggregate(&mut tx, &book_agg, book_no).await
+                                if let Err(err) = apply_booking_aggregate(
+                                    &mut tx,
+                                    Some(&mssql),
+                                    &book_agg,
+                                    book_no,
+                                )
+                                .await
                                 {
                                     tracing::warn!(
                                         cin_no,

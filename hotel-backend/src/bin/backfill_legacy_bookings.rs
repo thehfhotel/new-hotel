@@ -29,7 +29,7 @@
 //!                       WHERE b.legacy_book_id = bl.book_no)`.
 //! 2. For each PK, `parent_loader::load_booking_aggregate(mssql, book_no)`
 //!    fetches the legacy aggregate.
-//! 3. `sync::mappers::apply_booking_aggregate(tx, &agg, book_no)` projects
+//! 3. `sync::mappers::apply_booking_aggregate(tx, Some(&mssql), &agg, book_no)` projects
 //!    + INSERTs into canonical `ht_bookings`.
 //!
 //! Domain events (`BookingCreated`/`BookingModified`/`BookingCancelled`)
@@ -155,7 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         };
 
-        match apply_booking_aggregate(&mut tx, &aggregate, book_no).await {
+        match apply_booking_aggregate(&mut tx, Some(&mssql), &aggregate, book_no).await {
             Ok(_event) => {
                 if let Err(err) = tx.commit().await {
                     tracing::warn!(book_no, error = %err, "commit failed");

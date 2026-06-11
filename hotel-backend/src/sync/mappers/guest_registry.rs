@@ -28,8 +28,13 @@
 //!
 //! * `guest_cin_id` — resolved from the legacy `Cin_no` (a varchar)
 //!   via canonical `ht_checkins.legacy_cin_no`. When the parent
-//!   check-in hasn't landed yet we defer (return `Ok(None)`); the
-//!   next CT tick on the parent re-fires this row.
+//!   check-in hasn't landed yet the apply returns an ERROR so the
+//!   watcher holds the watermark and retries loudly. (Pre-2026-06-11
+//!   this deferred with `Ok(None)` under the false belief that "the
+//!   next CT tick on the parent re-fires this row" — it never does;
+//!   the consumed companion CT row was silently dropped and the TM.30
+//!   immigration registry under-counted. Same class as the June-3
+//!   booking loss.)
 //!
 //! ## Schema mapping
 //!
@@ -135,9 +140,11 @@ impl MssqlChangeMapper for GuestRegistryMapper {
                     return Ok(None);
                 };
 
-                // Resolve via canonical PG lookup (defer if the parent
-                // checkin hasn't been mirrored yet — the next CT tick
-                // on the parent will re-fire this aggregate).
+                // Resolve via canonical PG lookup. A miss MUST error so
+                // the watcher holds the watermark — nothing ever
+                // re-fires a consumed companion CT row, and a silent
+                // skip permanently under-counts the TM.30 registry
+                // (June-3 silent-drop class; see `sync::resolve` doc).
                 let cin_id_opt: Option<i32> = sqlx::query_scalar(
                     "SELECT cin_id FROM ht_checkins WHERE legacy_cin_no = $1 LIMIT 1",
                 )
@@ -146,12 +153,14 @@ impl MssqlChangeMapper for GuestRegistryMapper {
                 .await?;
 
                 let Some(cin_id) = cin_id_opt else {
-                    tracing::warn!(
-                        legacy_id,
-                        legacy_cin_no = cin_no_str,
-                        "ht_guest_registry apply deferred: parent check-in not yet mirrored"
-                    );
-                    return Ok(None);
+                    return Err(SyncError::Mapper {
+                        table: TABLE,
+                        message: format!(
+                            "parent check-in FK unresolvable for companion \
+                             legacy_id={legacy_id} legacy_cin_no={cin_no_str} \
+                             — holding watermark for loud retry"
+                        ),
+                    });
                 };
 
                 // Default firstname to empty string — `NOT NULL` per
