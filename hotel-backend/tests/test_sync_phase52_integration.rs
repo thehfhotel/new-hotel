@@ -18,14 +18,26 @@ use hotel_backend::sync::row::test_support::{HashMapRow, MockValue};
 /// Helper — generate a unique-ish Cust_no so re-runs don't clash with
 /// each other (the mapper UPSERTs by `legacy_cust_no` so re-using the
 /// same value across runs would just re-update the same row).
-fn unique_cust_no() -> String {
+/// Process-unique residue (2026-06-11): bare `nanos % N` slices collide
+/// for parallel tests in the same residue window; atomic counter + pid
+/// make this unique per process and de-correlated across runs.
+fn unique_residue() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_nanos();
+        .as_nanos() as u32;
+    nanos
+        .wrapping_add(std::process::id())
+        .wrapping_add(seq.wrapping_mul(7919))
+}
+
+fn unique_cust_no() -> String {
     // Truncate to 6 digits — Cust_no in legacy fits 'C\d+' anyway.
-    format!("CT{:06}", (nanos % 1_000_000) as u32)
+    format!("CT{:06}", unique_residue() % 1_000_000)
 }
 
 fn customer_row_full(cust_no: &str, name: &str, phone: &str) -> HashMapRow {
@@ -463,11 +475,7 @@ async fn customer_delete_resolves_by_legacy_id_alone() {
     let cust_no = unique_cust_no();
     // Unique-ish legacy id for this run (avoid cross-run collisions on
     // the shared test DB).
-    let legacy_id: i32 = {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        9_000_000 + (nanos % 900_000) as i32
-    };
+    let legacy_id: i32 = 9_000_000 + (unique_residue() % 900_000) as i32;
 
     // Create — the I-row carries the `id` PK alias the watcher always
     // materialises in; the UPSERT must persist it as legacy_id.

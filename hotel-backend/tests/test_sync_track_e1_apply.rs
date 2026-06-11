@@ -20,6 +20,13 @@ use hotel_backend::sync::row::test_support::{HashMapRow, MockValue};
 
 const GUEST_LEGACY_ID: i32 = 1_999_999_701;
 
+/// Tests in each fixture family share a fixed legacy id and cargo runs
+/// them in parallel — serialize per family so one test's cleanup can't
+/// race a sibling's seed/assert (2026-06-11, same pattern as
+/// `test_sync_phase55_bootstrap`).
+static GUEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static ROOMS_CANCEL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn cleanup_guest(pool: &sqlx::PgPool) {
     sqlx::query("DELETE FROM ht_guest_registry WHERE guest_legacy_id = $1")
         .bind(GUEST_LEGACY_ID)
@@ -125,6 +132,7 @@ async fn seed_parent_checkin(pool: &sqlx::PgPool, legacy_cin_no: &str) -> i32 {
 
 #[tokio::test]
 async fn guest_registry_apply_insert_upserts_canonical_row() {
+    let _guard = GUEST_LOCK.lock().await;
     let pool = common::create_test_pool().await;
     let legacy_cin_no = "CT26-E1-OP-INS";
     let expected_cin_id = seed_parent_checkin(&pool, legacy_cin_no).await;
@@ -170,6 +178,7 @@ async fn guest_registry_apply_insert_upserts_canonical_row() {
 
 #[tokio::test]
 async fn guest_registry_apply_delete_removes_canonical_row() {
+    let _guard = GUEST_LOCK.lock().await;
     let pool = common::create_test_pool().await;
     let legacy_cin_no = "CT26-E1-OP-DEL";
     seed_parent_checkin(&pool, legacy_cin_no).await;
@@ -230,6 +239,7 @@ async fn guest_registry_apply_delete_removes_canonical_row() {
 /// immigration registry.
 #[tokio::test]
 async fn guest_registry_apply_errors_when_parent_checkin_missing() {
+    let _guard = GUEST_LOCK.lock().await;
     let pool = common::create_test_pool().await;
     cleanup_guest(&pool).await;
 
@@ -284,6 +294,7 @@ async fn cleanup_rooms_cancel(pool: &sqlx::PgPool) {
 
 #[tokio::test]
 async fn rooms_cancel_mirror_apply_insert_lands_row_with_ct_source() {
+    let _guard = ROOMS_CANCEL_LOCK.lock().await;
     let pool = common::create_test_pool().await;
     cleanup_rooms_cancel(&pool).await;
 
@@ -346,6 +357,7 @@ async fn rooms_cancel_mirror_apply_insert_lands_row_with_ct_source() {
 
 #[tokio::test]
 async fn rooms_cancel_mirror_apply_delete_removes_row_on_d_row_shape() {
+    let _guard = ROOMS_CANCEL_LOCK.lock().await;
     let pool = common::create_test_pool().await;
     cleanup_rooms_cancel(&pool).await;
 

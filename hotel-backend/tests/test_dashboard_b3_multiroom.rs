@@ -75,15 +75,28 @@ fn today_bkk_date() -> chrono::NaiveDate {
 
 /// Generate suffixes unique enough to allow parallel test runs against
 /// the same DB without colliding `room_no` / `cin_no` values.
+///
+/// 2026-06-11: same fix as `test_backfill_b5::unique_suffix` — the bare
+/// `nanos % 100_000` residue collided for tests starting within the same
+/// 100µs (and across runs against a persistent dev DB). Atomic counter
+/// guarantees intra-process uniqueness; the seeder pre-deletes same-key
+/// leftovers so cross-run/cross-file residue (b5 shares the TA/TB room
+/// prefixes) self-heals.
 fn unique_suffix(tag: &str) -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_nanos();
-    // Use a 5-digit slice so the resulting room_no stays under
-    // VARCHAR(10) and cin_no under VARCHAR(20).
-    format!("{}{:05}", tag, (nanos % 100_000) as u32)
+        .as_nanos() as u32;
+    // 5-digit slice so room_no stays under VARCHAR(10) and cin_no under
+    // VARCHAR(20). 7919 (prime) spreads the counter across the residue.
+    let mixed = nanos
+        .wrapping_add(std::process::id())
+        .wrapping_add(seq.wrapping_mul(7919));
+    format!("{}{:05}", tag, mixed % 100_000)
 }
 
 /// Seed a multi-room fixture: 1 customer, 2 rooms, 1 active checkin
@@ -102,6 +115,36 @@ async fn seed_multi_room_folio(
     let room_no_b = format!("TB{}", &suffix[2..]);
     let cin_no = format!("CB3-{}", &suffix[..]);
     let legacy_cust_no = format!("CB3{}", &suffix[..]);
+
+    // Self-heal leftovers from aborted prior runs / sibling test files
+    // sharing the TA/TB prefixes (see unique_suffix doc). FK order:
+    // junction → checkin → customer/rooms.
+    let _ = sqlx::query(
+        "DELETE FROM ht_checkin_rooms WHERE cin_id IN \
+         (SELECT cin_id FROM ht_checkins WHERE cin_no = $1) \
+         OR room_id IN (SELECT room_id FROM ht_rooms_new WHERE room_no IN ($2, $3))",
+    )
+    .bind(&cin_no)
+    .bind(&room_no_a)
+    .bind(&room_no_b)
+    .execute(pool)
+    .await;
+    let _ = sqlx::query("DELETE FROM ht_checkins WHERE cin_no = $1")
+        .bind(&cin_no)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM ht_customers WHERE legacy_cust_no = $1")
+        .bind(&legacy_cust_no)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query(
+        "DELETE FROM ht_rooms_new WHERE room_no IN ($1, $2) \
+         AND room_id NOT IN (SELECT room_id FROM ht_checkin_rooms)",
+    )
+    .bind(&room_no_a)
+    .bind(&room_no_b)
+    .execute(pool)
+    .await;
 
     let cust_id: i32 = sqlx::query_scalar(
         "INSERT INTO ht_customers (cust_firstname, legacy_cust_no, cust_notes) \

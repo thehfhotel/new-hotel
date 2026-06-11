@@ -17,6 +17,13 @@ use hotel_backend::service::reports::{
 };
 use sqlx::PgPool;
 
+/// `cleanup_g8` sweeps EVERY row carrying the shared TEST marker, and
+/// each test calls it on entry — so two tests running in parallel race:
+/// one's cleanup deletes the room a sibling just seeded (observed
+/// 2026-06-11 as an FK violation on `fk_ht_checkins_room`). Serialize
+/// the suite with one lock (same pattern as test_sync_phase55_bootstrap).
+static G8_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const ROOM_MARKER: &str = "TEST_rr4_g8_room";
 const CUST_MARKER: &str = "TEST_rr4_g8_cust";
 const CIN_MARKER: &str = "TEST_rr4_g8_cin";
@@ -127,6 +134,7 @@ async fn seed_checkin(
 /// count = 2 (Thai filtered out). This is the spec's pivot test.
 #[tokio::test]
 async fn rr4_filters_thai_nationals_out_of_export() {
+    let _guard = G8_LOCK.lock().await;
     let pool = common::create_test_pool().await;
     cleanup_g8(&pool).await;
 
@@ -213,6 +221,7 @@ async fn rr4_csv_header_row_pins_column_order() {
 /// an audit row with the same SHA-256 the caller receives.
 #[tokio::test]
 async fn rr4_export_writes_audit_row_with_matching_hash() {
+    let _guard = G8_LOCK.lock().await;
     let pool = common::create_test_pool().await;
     cleanup_g8(&pool).await;
 
@@ -249,6 +258,7 @@ async fn rr4_export_writes_audit_row_with_matching_hash() {
 /// guest, all eight columns are populated from the right tables.
 #[tokio::test]
 async fn rr4_row_assembles_columns_from_canonical_join() {
+    let _guard = G8_LOCK.lock().await;
     let pool = common::create_test_pool().await;
     cleanup_g8(&pool).await;
 
@@ -293,6 +303,7 @@ async fn rr4_row_assembles_columns_from_canonical_join() {
 /// arrivals that actually happened.
 #[tokio::test]
 async fn rr4_excludes_cancelled_checkins() {
+    let _guard = G8_LOCK.lock().await;
     let pool = common::create_test_pool().await;
     cleanup_g8(&pool).await;
 

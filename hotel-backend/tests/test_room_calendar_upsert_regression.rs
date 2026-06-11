@@ -54,17 +54,25 @@ use hotel_backend::sync::mapper::MssqlChangeMapper;
 use hotel_backend::sync::mappers::RoomCalendarMapper;
 use hotel_backend::sync::row::test_support::{HashMapRow, MockValue};
 
-// `room_no VARCHAR(10)` — keep under 10 chars. Two fixture rooms so
-// we can exercise the legacy-id rebind scenario.
-const FIXTURE_ROOM_A_NO: &str = "RCAL-A";
-const FIXTURE_ROOM_B_NO: &str = "RCAL-B";
-const LEGACY_ID: i32 = 1_999_999_801;
+// `room_no VARCHAR(10)` — keep under 10 chars. Two fixture rooms PER
+// TEST so we can exercise the legacy-id rebind scenario.
+//
+// 2026-06-11: each test gets a DISJOINT (legacy_id, rooms) namespace.
+// The tests previously shared one LEGACY_ID + room pair; cargo runs
+// them in parallel within this binary, so one test's cleanup raced the
+// other's insert and fired `ux_ht_room_calendar_legacy_id` flakily.
+const DOUBLE_ROOM_A_NO: &str = "RCALD-A";
+const DOUBLE_ROOM_B_NO: &str = "RCALD-B";
+const DOUBLE_LEGACY_ID: i32 = 1_999_999_801;
+const REBIND_ROOM_A_NO: &str = "RCALR-A";
+const REBIND_ROOM_B_NO: &str = "RCALR-B";
+const REBIND_LEGACY_ID: i32 = 1_999_999_802;
 const FIXTURE_DATE_YMD: (i32, u32, u32) = (2026, 5, 14);
 
 /// Idempotent fixture seed. Returns `(room_a_id, room_b_id)`.
-async fn ensure_fixture_rooms(pool: &sqlx::PgPool) -> (i32, i32) {
+async fn ensure_fixture_rooms(pool: &sqlx::PgPool, room_a: &str, room_b: &str) -> (i32, i32) {
     let mut ids = [0_i32; 2];
-    for (idx, no) in [FIXTURE_ROOM_A_NO, FIXTURE_ROOM_B_NO].into_iter().enumerate() {
+    for (idx, no) in [room_a, room_b].into_iter().enumerate() {
         let inserted: Option<i32> = sqlx::query_scalar(
             "INSERT INTO ht_rooms_new (room_no) VALUES ($1) \
              ON CONFLICT (room_no) DO NOTHING \
@@ -88,9 +96,14 @@ async fn ensure_fixture_rooms(pool: &sqlx::PgPool) -> (i32, i32) {
     (ids[0], ids[1])
 }
 
-async fn cleanup_calendar_fixture(pool: &sqlx::PgPool) {
+async fn cleanup_calendar_fixture(
+    pool: &sqlx::PgPool,
+    legacy_id: i32,
+    room_a: &str,
+    room_b: &str,
+) {
     sqlx::query("DELETE FROM ht_room_calendar WHERE rcal_legacy_id = $1")
-        .bind(LEGACY_ID)
+        .bind(legacy_id)
         .execute(pool)
         .await
         .expect("cleanup by legacy_id");
@@ -98,8 +111,8 @@ async fn cleanup_calendar_fixture(pool: &sqlx::PgPool) {
         "DELETE FROM ht_room_calendar WHERE rcal_room_id IN \
             (SELECT room_id FROM ht_rooms_new WHERE room_no IN ($1, $2))",
     )
-    .bind(FIXTURE_ROOM_A_NO)
-    .bind(FIXTURE_ROOM_B_NO)
+    .bind(room_a)
+    .bind(room_b)
     .execute(pool)
     .await
     .expect("cleanup by fixture room");
@@ -133,10 +146,11 @@ fn make_row(legacy_id: i32, room_no: &str, status: &str) -> HashMapRow {
 #[tokio::test]
 async fn room_calendar_double_apply_same_event_is_idempotent() {
     let pool = common::create_test_pool().await;
-    let (_room_a_id, _room_b_id) = ensure_fixture_rooms(&pool).await;
-    cleanup_calendar_fixture(&pool).await;
+    let (_room_a_id, _room_b_id) =
+        ensure_fixture_rooms(&pool, DOUBLE_ROOM_A_NO, DOUBLE_ROOM_B_NO).await;
+    cleanup_calendar_fixture(&pool, DOUBLE_LEGACY_ID, DOUBLE_ROOM_A_NO, DOUBLE_ROOM_B_NO).await;
 
-    let row = make_row(LEGACY_ID, FIXTURE_ROOM_A_NO, "เข้าพัก");
+    let row = make_row(DOUBLE_LEGACY_ID, DOUBLE_ROOM_A_NO, "เข้าพัก");
 
     let mut tx = pool.begin().await.expect("begin tx 1");
     RoomCalendarMapper
@@ -155,7 +169,7 @@ async fn room_calendar_double_apply_same_event_is_idempotent() {
     let row_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM ht_room_calendar WHERE rcal_legacy_id = $1",
     )
-    .bind(LEGACY_ID)
+    .bind(DOUBLE_LEGACY_ID)
     .fetch_one(&pool)
     .await
     .expect("count");
@@ -164,7 +178,7 @@ async fn room_calendar_double_apply_same_event_is_idempotent() {
         "double-apply must yield exactly one canonical row"
     );
 
-    cleanup_calendar_fixture(&pool).await;
+    cleanup_calendar_fixture(&pool, DOUBLE_LEGACY_ID, DOUBLE_ROOM_A_NO, DOUBLE_ROOM_B_NO).await;
 }
 
 /// The Ville prod fix: legacy MAX+1 allocator can rebind an old
@@ -175,11 +189,12 @@ async fn room_calendar_double_apply_same_event_is_idempotent() {
 #[tokio::test]
 async fn room_calendar_legacy_id_rebind_to_new_slot_does_not_error() {
     let pool = common::create_test_pool().await;
-    let (_room_a_id, _room_b_id) = ensure_fixture_rooms(&pool).await;
-    cleanup_calendar_fixture(&pool).await;
+    let (_room_a_id, _room_b_id) =
+        ensure_fixture_rooms(&pool, REBIND_ROOM_A_NO, REBIND_ROOM_B_NO).await;
+    cleanup_calendar_fixture(&pool, REBIND_LEGACY_ID, REBIND_ROOM_A_NO, REBIND_ROOM_B_NO).await;
 
     // First apply: legacy_id stamps Room A.
-    let row_a = make_row(LEGACY_ID, FIXTURE_ROOM_A_NO, "เข้าพัก");
+    let row_a = make_row(REBIND_LEGACY_ID, REBIND_ROOM_A_NO, "เข้าพัก");
     let mut tx = pool.begin().await.expect("begin tx A");
     RoomCalendarMapper
         .apply(&mut tx, ChangeOp::Insert, Some(&row_a))
@@ -190,7 +205,7 @@ async fn room_calendar_legacy_id_rebind_to_new_slot_does_not_error() {
     // Second apply: SAME legacy_id, DIFFERENT room. Pre-fix this is
     // the exact scenario that fires `ux_ht_room_calendar_legacy_id`
     // and gets captured by R1 as `sync.mapper_apply_fail`.
-    let row_b = make_row(LEGACY_ID, FIXTURE_ROOM_B_NO, "จอง");
+    let row_b = make_row(REBIND_LEGACY_ID, REBIND_ROOM_B_NO, "จอง");
     let mut tx = pool.begin().await.expect("begin tx B");
     RoomCalendarMapper
         .apply(&mut tx, ChangeOp::Update, Some(&row_b))
@@ -209,12 +224,12 @@ async fn room_calendar_legacy_id_rebind_to_new_slot_does_not_error() {
            JOIN ht_rooms_new r ON r.room_id = c.rcal_room_id \
           WHERE c.rcal_legacy_id = $1",
     )
-    .bind(LEGACY_ID)
+    .bind(REBIND_LEGACY_ID)
     .fetch_one(&pool)
     .await
     .expect("exactly one row must hold the legacy_id post-rebind");
     assert_eq!(
-        winning_room_no, FIXTURE_ROOM_B_NO,
+        winning_room_no, REBIND_ROOM_B_NO,
         "rebind must move the legacy_id pointer to the new slot"
     );
 
@@ -223,7 +238,7 @@ async fn room_calendar_legacy_id_rebind_to_new_slot_does_not_error() {
            JOIN ht_rooms_new r ON r.room_id = c.rcal_room_id \
           WHERE r.room_no = $1 AND c.rcal_legacy_id IS NOT NULL",
     )
-    .bind(FIXTURE_ROOM_A_NO)
+    .bind(REBIND_ROOM_A_NO)
     .fetch_one(&pool)
     .await
     .expect("stale count");
@@ -232,5 +247,5 @@ async fn room_calendar_legacy_id_rebind_to_new_slot_does_not_error() {
         "Room A's tile must keep its data but lose its drift-pointer"
     );
 
-    cleanup_calendar_fixture(&pool).await;
+    cleanup_calendar_fixture(&pool, REBIND_LEGACY_ID, REBIND_ROOM_A_NO, REBIND_ROOM_B_NO).await;
 }

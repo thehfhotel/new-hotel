@@ -20,24 +20,31 @@ const HT_BOOK_H: &str = "HT_Book_H";
 const HT_BOOK_DS: &str = "HT_Book_Ds";
 const HT_BOOK_DATE: &str = "HT_Book_Date";
 
-/// Helper — generate a unique-ish Book_ID so re-runs don't clash.
-fn unique_book_id() -> String {
+/// Process-unique residue (2026-06-11): bare `nanos % N` slices collide
+/// for parallel tests in the same residue window; atomic counter + pid
+/// make this unique per process and de-correlated across runs.
+fn unique_residue() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_nanos();
-    format!("RT{:06}", (nanos % 1_000_000) as u32)
+        .as_nanos() as u32;
+    nanos
+        .wrapping_add(std::process::id())
+        .wrapping_add(seq.wrapping_mul(7919))
+}
+
+/// Helper — generate a unique-ish Book_ID so re-runs don't clash.
+fn unique_book_id() -> String {
+    format!("RT{:06}", unique_residue() % 1_000_000)
 }
 
 fn unique_cust_no() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
     // Slightly different bucket so we don't collide with the booking id.
-    format!("CT{:06}", (nanos % 1_000_000) as u32 + 1)
+    format!("CT{:06}", unique_residue() % 1_000_000 + 1)
 }
 
 fn unique_room_no() -> String {

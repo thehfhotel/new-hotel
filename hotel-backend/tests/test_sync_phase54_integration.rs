@@ -29,27 +29,37 @@ const HT_CHECKIN_H: &str = "HT_CheckIn_H";
 const HT_CHECKIN_DS: &str = "HT_CheckIn_Ds";
 const HT_CUSTOMERS: &str = "HT_Customers";
 
-/// Helper — generate a unique `Cin_no` so re-runs don't clash.
-fn unique_cin_no() -> String {
+/// Process-unique residue for fixture keys. 2026-06-11: the bare
+/// `nanos % 1e6` slices collided when parallel tests started within the
+/// same residue window (observed: `eager_mirror_defers_when_supplier_returns_no_row`
+/// counting a sibling test's customer row). The atomic counter
+/// guarantees intra-process uniqueness; pid + nanos de-correlate
+/// consecutive runs against a persistent dev DB.
+fn unique_residue() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_nanos();
-    format!("CT26-{:06}", (nanos % 1_000_000) as u32)
+        .as_nanos() as u32;
+    nanos
+        .wrapping_add(std::process::id())
+        .wrapping_add(seq.wrapping_mul(7919))
+}
+
+/// Helper — generate a unique `Cin_no` so re-runs don't clash.
+fn unique_cin_no() -> String {
+    format!("CT26-{:06}", unique_residue() % 1_000_000)
 }
 
 fn unique_cust_no() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("CIT{:06}", (nanos % 1_000_000) as u32 + 1)
+    format!("CIT{:06}", unique_residue() % 1_000_000 + 1)
 }
 
 fn unique_room_no() -> String {
-    format!("Y{:03}", (rand::random::<u8>() as u16) % 999 + 1)
+    format!("Y{:03}", unique_residue() % 999 + 1)
 }
 
 fn header_row(cin_no: &str, cust_no: &str, status: &str) -> HashMapRow {
@@ -1072,12 +1082,12 @@ async fn apply_checkin_aggregate_removes_dropped_rooms() {
     let mssql = mssql_stub().await;
     let cin_no = unique_cin_no();
     let cust_no = unique_cust_no();
-    // `unique_room_no` draws from `rand::random::<u8>()` (0-255 range) so
-    // three independent calls have ~1% chance of pairwise collision. Retry
-    // each draw until the running set is unique — flaky CI run otherwise
-    // (room_b == room_a → seed_room ON CONFLICT silently coalesces → only
-    // 2 distinct rooms exist → 3-room aggregate fails the post-apply
-    // junction count assertion at line ~1093).
+    // `unique_room_no` has a 3-digit (mod 999) namespace, so independent
+    // calls can in principle collide pairwise. Retry each draw until the
+    // running set is unique — flaky CI run otherwise (room_b == room_a →
+    // seed_room ON CONFLICT silently coalesces → only 2 distinct rooms
+    // exist → 3-room aggregate fails the post-apply junction count
+    // assertion below).
     let room_no_a = unique_room_no();
     let mut room_no_b = unique_room_no();
     while room_no_b == room_no_a {

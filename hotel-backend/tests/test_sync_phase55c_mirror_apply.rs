@@ -33,16 +33,34 @@ use hotel_backend::sync::row::test_support::{HashMapRow, MockValue};
 
 const TEST_PK: i32 = 1_999_999_999;
 
+/// All tests share `TEST_PK` and cargo runs them in parallel — one
+/// shared lock keeps the shared-fixture mutations deterministic
+/// (2026-06-11, same pattern as `test_sync_phase55_bootstrap`).
+static CUPON_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn cleanup(pool: &sqlx::PgPool) {
     sqlx::query("DELETE FROM legacy_mirror.ht_cupon WHERE cupon_no = $1")
         .bind(TEST_PK)
         .execute(pool)
         .await
         .expect("cleanup");
+    // The G5 dual-write also lands a canonical `ht_coupons` row, and
+    // the Delete arm deliberately ORPHANS it (clears legacy_cupon_no,
+    // keeps the row + its synthetic code). Sweep both shapes so reruns
+    // against a persistent dev DB stay idempotent (2026-06-11: a
+    // leftover orphan made the insert test fail deterministically on
+    // ht_coupons_coupon_code_key).
+    sqlx::query("DELETE FROM ht_coupons WHERE legacy_cupon_no = $1 OR coupon_code = $2")
+        .bind(TEST_PK)
+        .bind(format!("LEGACY-{TEST_PK}"))
+        .execute(pool)
+        .await
+        .expect("cleanup canonical");
 }
 
 #[tokio::test]
 async fn cupon_mirror_apply_insert_lands_row_with_ct_source() {
+    let _guard = CUPON_LOCK.lock().await;
     let pool = common::create_test_pool().await;
     cleanup(&pool).await;
 
@@ -122,6 +140,7 @@ async fn cupon_mirror_apply_delete_removes_row_using_ct_pk_alias_only() {
     // post-materialisation shape: cupon_no holds the real PK, every
     // other projected column is Null.
 
+    let _guard = CUPON_LOCK.lock().await;
     let pool = common::create_test_pool().await;
     cleanup(&pool).await;
 
@@ -178,6 +197,7 @@ async fn cupon_mirror_apply_delete_removes_row_using_ct_pk_alias_only() {
 async fn cupon_mirror_apply_delete_is_idempotent_on_already_gone_row() {
     // CT can deliver the same Delete event twice (e.g. on watcher
     // restart mid-batch) — the second apply must not error.
+    let _guard = CUPON_LOCK.lock().await;
     let pool = common::create_test_pool().await;
     cleanup(&pool).await;
 
@@ -192,4 +212,93 @@ async fn cupon_mirror_apply_delete_is_idempotent_on_already_gone_row() {
         .expect("Delete on missing row must be idempotent");
     assert!(event.is_none());
     tx.commit().await.expect("commit");
+}
+
+/// 2026-06-11 — legacy-id-reuse poison pill (same class as the v2.66.3
+/// `ht_room_calendar` rebind fix). iHOTEL allocates `cupon_no = MAX+1`,
+/// so after a coupon DELETE the next issue REUSES the id. The canonical
+/// Delete arm orphans the old row (clears `legacy_cupon_no`, keeps the
+/// synthetic `coupon_code`), so pre-fix the re-insert missed the
+/// ON CONFLICT (legacy_cupon_no) arbiter and errored on
+/// `ht_coupons_coupon_code_key` — every retry, holding the watermark.
+/// Post-fix the orphan is re-attached and the apply succeeds.
+#[tokio::test]
+async fn cupon_canonical_insert_after_delete_reuses_legacy_id_without_error() {
+    let _guard = CUPON_LOCK.lock().await;
+    let pool = common::create_test_pool().await;
+    cleanup(&pool).await;
+
+    let row = HashMapRow::new("HT_Cupon")
+        .with("cupon_no", MockValue::I32(TEST_PK))
+        .with("cupon_cin_no", MockValue::Str("CH26-TEST-0002".into()))
+        .with("cupon_cin_room", MockValue::Str("302".into()))
+        .with(
+            "cupon_date",
+            MockValue::DateTime(
+                NaiveDate::from_ymd_opt(2026, 6, 11)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap(),
+            ),
+        )
+        .with(
+            "cupon_gen_date",
+            MockValue::DateTime(
+                NaiveDate::from_ymd_opt(2026, 6, 11)
+                    .unwrap()
+                    .and_hms_opt(9, 0, 0)
+                    .unwrap(),
+            ),
+        )
+        .with("cupon_by", MockValue::Str("TestRunner".into()))
+        .with("cupon_print", MockValue::I32(0));
+
+    // Issue → canonical row lands with the back-pointer.
+    let mut tx = pool.begin().await.expect("begin tx 1");
+    CuponMirrorMapper
+        .apply(&mut tx, ChangeOp::Insert, Some(&row))
+        .await
+        .expect("first insert");
+    tx.commit().await.expect("commit 1");
+
+    // iHOTEL deletes the coupon → canonical row orphaned (pointer NULL,
+    // code kept for the audit trail). Row shape mirrors the post-N4-fix
+    // materialised D row: PK populated, projected columns NULL.
+    let del = HashMapRow::new("HT_Cupon")
+        .with("cupon_no", MockValue::I32(TEST_PK))
+        .with("cupon_cin_no", MockValue::Null)
+        .with("cupon_cin_room", MockValue::Null)
+        .with("cupon_date", MockValue::Null)
+        .with("cupon_gen_date", MockValue::Null)
+        .with("cupon_by", MockValue::Null)
+        .with("cupon_print", MockValue::Null);
+    let mut tx = pool.begin().await.expect("begin tx 2");
+    CuponMirrorMapper
+        .apply(&mut tx, ChangeOp::Delete, Some(&del))
+        .await
+        .expect("delete");
+    tx.commit().await.expect("commit 2");
+
+    // MAX+1 reuses the id → the re-insert must re-attach the orphan,
+    // not error on the coupon_code unique.
+    let mut tx = pool.begin().await.expect("begin tx 3");
+    CuponMirrorMapper
+        .apply(&mut tx, ChangeOp::Insert, Some(&row))
+        .await
+        .expect("re-insert with reused legacy id must succeed (pre-fix: duplicate key on ht_coupons_coupon_code_key)");
+    tx.commit().await.expect("commit 3");
+
+    // Exactly one canonical row, re-attached.
+    let (count, attached): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*)::bigint, COUNT(legacy_cupon_no)::bigint \
+           FROM ht_coupons WHERE coupon_code = $1",
+    )
+    .bind(format!("LEGACY-{TEST_PK}"))
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(count, 1, "reuse must converge on ONE canonical row");
+    assert_eq!(attached, 1, "the orphan must be re-attached to the reused legacy id");
+
+    cleanup(&pool).await;
 }
