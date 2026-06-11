@@ -131,3 +131,38 @@ intents, POS/refund `HT_Receipt_*` emission (VAT scope), `HT_Book_Pro`
 mapper, `Total_Price_vat` capture verification, round-bill gate warning,
 `SYNC_PER_TABLE_WATERMARK` enablement (env flip at next deploy), one-shot
 `legacy_id` backfill for pre-055 customer rows.
+
+### Adversarial re-verification (independent reviewer, same day)
+
+An independent adversarial review of the merged diff confirmed every
+P0/P1 fix against the raw captures (`docs/legacy-spike/raw/`),
+cheatsheet, and `schema-baseline.txt` — including the suspicious-looking
+`Cin_note=''` in extend-stay, which IS in the raw capture (findings.md
+abridged it). **No new violations introduced by the fixes.** It refuted
+one absolute claim and surfaced residuals:
+
+- ~~`bin/sync.rs` D-event orphan-recovery `lookup_query_errored` arm
+  advanced the watermark on a TRANSIENT PG error~~ — fixed same day
+  (sets `errored=true`; `no_matching_pg_row` stays warn-only since a
+  retry can never learn more).
+- **Room-FK family still silently skips** (bounded, rooms are
+  operator-managed, but it's a coherent loss scenario when a room is
+  created in iHOTEL and immediately sold): `room.rs:342` (unknown room
+  warn-skip), `room_calendar.rs:157` (tile dropped), `booking.rs:849`
+  (room line excluded from idempotency count — converges to the dropped
+  state; checkin errors on the same condition). Decision needed: error
+  symmetrically (one new room wedges sync loudly until `backfill_rooms`)
+  vs today's quiet skip. Leaning loud, but legacy data quality
+  (orphan room_no strings in old rows) needs a check first.
+- **Extend-stay `Total_Price_Net` value source**: `new_checkins.rs:706`
+  sets Net = room total only (no product plumbing) — on a folio carrying
+  iHOTEL product charges an extend understates Net (and thus Balance).
+  Same "needs a fresh capture on a product-bearing folio" status as
+  `Total_Price_vat`.
+- Pure-D-only batches on `HT_Book_Ds`/`HT_Book_Date`/`HT_CheckIn_Pay`
+  rely on sibling-table CT rows re-firing the aggregate (every known
+  iHOTEL flow does emit one) — cross-table reliance, not a guarantee;
+  `force_coalesce_for_orphan_recovery` covers only `HT_CheckIn_Ds`.
+- Migration 055 `legacy_id` index is non-UNIQUE; legacy id-reuse could
+  pair two rows (bounded: the older is already soft-deleted in every
+  reachable sequence).

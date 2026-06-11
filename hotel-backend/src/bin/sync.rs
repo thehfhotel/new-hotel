@@ -2434,14 +2434,25 @@ async fn poll_table(
                         );
                     }
                     Err(err) => {
+                        // 2026-06-11 adversarial review: a TRANSIENT PG
+                        // error here must hold the watermark — otherwise
+                        // a momentary hiccup during the recovery lookup
+                        // consumes the D row permanently (the exact
+                        // silent-drop class the per-key `errored` gating
+                        // exists to prevent). Contrast `no_matching_pg_row`
+                        // above: there the canonical row genuinely doesn't
+                        // exist, so a retry can never learn more and
+                        // warn-skip is correct.
                         tracing::warn!(
                             event_name = EV_ORPHAN_RECOVERY_FAIL,
                             table,
                             ds_id,
                             reason = "lookup_query_errored",
                             error = %err,
-                            "D-event orphan recovery query errored; skipping"
+                            "D-event orphan recovery query errored — holding \
+                             watermark for retry"
                         );
+                        errored = true;
                     }
                 }
             }
