@@ -136,66 +136,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auth_enabled = auth_enabled_from_env();
     tracing::info!("Auth middleware: enabled={}", auth_enabled);
 
-    // Create AppState based on available pools
-    // Note: Pool types differ now (legacy=DbPool/tiberius, new=PgPool/sqlx)
-    // so we can't clone one for the other.
-    let (app_state, legacy_available, new_available) = match (&legacy_pool, new_pool) {
-        (Some(legacy), Some(new_hotel)) => {
-            tracing::info!("Dual database mode: Both databases available");
-            let mut state = AppState::with_mode(legacy.clone(), new_hotel, system_mode)
+    // Create AppState — canonical PG only. As of the 2026-06-11 coexistence
+    // audit AppState carries no MSSQL handle: routes/repositories never touch
+    // the legacy DB (docs/architecture.md "critical rule"); MSSQL is reserved
+    // for the adapter workers (sync/writeback bins) and the scheduler's
+    // reconcile backstop, which receives the tiberius pool directly below.
+    let legacy_available = legacy_pool.is_some();
+    let (final_app_state, new_available) = match new_pool {
+        Some(new_hotel) => {
+            let mut state = AppState::with_mode(new_hotel, system_mode)
                 .with_auth_enabled(auth_enabled);
             if let Some(vp) = ville_pool {
                 state = state.with_ville(vp);
             }
-            (Some(state), true, true)
+            (Some(state), true)
         }
-        (Some(_legacy), None) => {
-            tracing::warn!("Legacy-only mode: HotelNew database unavailable, new routes will not work");
-            // Cannot create AppState without PgPool - new routes will be disabled
-            (None, true, false)
+        None if legacy_available => {
+            tracing::warn!(
+                "Legacy-only mode: HotelNew database unavailable, new routes will not work"
+            );
+            (None, false)
         }
-        (None, Some(_new_hotel)) => {
-            tracing::info!("New-only mode: Legacy database unavailable, running with HotelNew only");
-            // Legacy routes will be disabled (no legacy pool)
-            // For AppState, we need a legacy pool placeholder - but we don't have one.
-            // We'll handle this by not creating legacy routes.
-            (None, false, true)
-        }
-        (None, None) => {
+        None => {
             return Err("No database connections available".into());
         }
-    };
-
-    // In new-only mode, we still need an AppState for the new routes
-    // We need a dummy legacy pool or we restructure. Let's create AppState only when we have both,
-    // or when we have just new_pool (with a dummy legacy pool that will never be used).
-    let (final_app_state, new_pool_for_newonly) = if let Some(state) = app_state {
-        (Some(state), None)
-    } else if legacy_pool.is_none() && new_available {
-        // New-only mode: create AppState with a placeholder.
-        // Since legacy routes are disabled, the legacy_pool in AppState will never be accessed.
-        // But we need to create a dummy connection. Instead, let's try to connect legacy and if it fails,
-        // create a minimal pool. Actually, simpler: just don't mount new_routes if we don't have AppState.
-        // But that defeats the purpose. Let's restructure: create legacy pool attempt again.
-        // Simplest approach: require legacy pool as placeholder even if unused, OR just skip.
-        // The current deployment uses SYSTEM_MODE=new with both DBs available.
-        // For robustness, let's skip new_routes in legacy-only mode and legacy_routes in new-only mode.
-        // For new-only mode, we still need AppState. Let's store the PgPool separately.
-        // Actually the simplest fix: try to create legacy pool, if it fails, the legacy_pool field will
-        // never be used (new-only mode). We can't create a dummy DbPool easily.
-        // Instead, let's store the PgPool for new-only routing.
-        (None, Some(create_pg_pool(&config.new_db).await?))
-    } else {
-        (None, None)
     };
 
     // Initialize scheduler for background jobs (only if legacy pool is available)
     // Pass PgPool if available for legacy-to-PG sync job
     if let Some(ref pool) = legacy_pool {
-        let pg_for_scheduler = match &final_app_state {
-            Some(state) => Some(state.new_pool.clone()),
-            None => new_pool_for_newonly.as_ref().map(|p| p.clone()),
-        };
+        let pg_for_scheduler = final_app_state.as_ref().map(|s| s.new_pool.clone());
         if let Err(e) = init_scheduler(
             pool.clone(),
             pg_for_scheduler,
@@ -237,24 +207,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (writeback worker) for the legacy .NET app.
     let new_routes = if let Some(ref app_state) = final_app_state {
         build_new_routes(app_state.clone())
-    } else if let Some(ref pg_pool) = new_pool_for_newonly {
-        // New-only mode: create a placeholder AppState
-        // Legacy pool won't be used since legacy routes are disabled
-        // We need a DbPool though... Let's try creating one that will fail gracefully
-        // Clone the pg_pool here so the original stays available for the
-        // /health route's HealthState construction below (task #78).
-        match create_pool(&config.db).await {
-            Ok(legacy) => build_new_routes(
-                AppState::with_mode(legacy, pg_pool.clone(), SystemMode::New)
-                    .with_auth_enabled(auth_enabled),
-            ),
-            Err(_) => {
-                // Can't get legacy pool at all - create routes with just the PG pool
-                // We'll need to handle this differently
-                tracing::warn!("Cannot create AppState for new routes without legacy pool placeholder");
-                Router::new()
-            }
-        }
     } else {
         Router::new()
     };
@@ -267,10 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The PG pool is optional: legacy-only mode (no PG configured) is
     // still supported, and the handler renders `null` for the
     // watermark fields in that case.
-    let health_pg_pool = match &final_app_state {
-        Some(state) => Some(state.new_pool.clone()),
-        None => new_pool_for_newonly.as_ref().cloned(),
-    };
+    let health_pg_pool = final_app_state.as_ref().map(|s| s.new_pool.clone());
     let health_state = routes::health::HealthState {
         site_id: config.site.id.clone(),
         pg_pool: health_pg_pool,

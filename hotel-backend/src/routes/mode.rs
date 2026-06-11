@@ -91,8 +91,12 @@ pub enum Branch {
 /// `docs/architecture.md` §1).
 #[derive(Clone)]
 pub struct AppState {
-    /// Connection pool for legacy database (SQL Server via tiberius)
-    pub legacy_pool: crate::db::DbPool,
+    // NOTE: deliberately NO legacy MSSQL pool here. Routes/repositories never
+    // touch the legacy DB (docs/architecture.md "critical rule"); MSSQL is
+    // reserved for the adapter workers (sync/writeback bins) and the
+    // scheduler's reconcile backstop, which get their own pool in main.rs.
+    // The former `legacy_pool` field was held-but-never-queried — removed by
+    // the 2026-06-11 coexistence audit to make the boundary structural.
     /// Connection pool for new_hotel database (PostgreSQL via sqlx)
     pub new_pool: crate::db::PgPool,
     /// Connection pool for HF Ville mirror database (PostgreSQL via sqlx, optional)
@@ -172,12 +176,12 @@ impl AppState {
         )
     }
 
-    /// Create new AppState with both pools and default legacy mode.
+    /// Create new AppState with the canonical PG pool and default legacy mode.
     ///
     /// Auth is wired with PG-backed repositories but disabled by
     /// default (`auth_enabled = false`). Callers that want auth on
     /// chain `.with_auth_enabled(true)` after construction.
-    pub fn new(legacy_pool: crate::db::DbPool, new_pool: crate::db::PgPool) -> Self {
+    pub fn new(new_pool: crate::db::PgPool) -> Self {
         let (customers, bookings, checkins, rooms, payments, inventory) =
             Self::default_repositories();
         let outbox = Arc::new(OutboxRepository::new());
@@ -193,7 +197,6 @@ impl AppState {
             new_pool.clone(),
         );
         Self {
-            legacy_pool,
             new_pool,
             ville_pool: None,
             mode: Arc::new(std::sync::RwLock::new(SystemMode::Legacy)),
@@ -223,7 +226,7 @@ impl AppState {
     /// Auth is wired but disabled by default — see [`Self::new`] for
     /// the full rationale. Use [`Self::with_auth_enabled`] to flip the
     /// middleware on.
-    pub fn with_mode(legacy_pool: crate::db::DbPool, new_pool: crate::db::PgPool, mode: SystemMode) -> Self {
+    pub fn with_mode(new_pool: crate::db::PgPool, mode: SystemMode) -> Self {
         let (customers, bookings, checkins, rooms, payments, inventory) =
             Self::default_repositories();
         let outbox = Arc::new(OutboxRepository::new());
@@ -239,7 +242,6 @@ impl AppState {
             new_pool.clone(),
         );
         Self {
-            legacy_pool,
             new_pool,
             ville_pool: None,
             mode: Arc::new(std::sync::RwLock::new(mode)),
