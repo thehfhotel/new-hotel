@@ -93,3 +93,41 @@ guest-registry, and mirror dual-write call sites never received it.
 3. P0-4 (room change) — operational double-assignment risk.
 4. P1-5 (echo suppression) — make the de-facto mechanism honest before anyone "fixes" it naively.
 5. P1-6..10, then P2 as a planned track with receptionist-coordinated verification on HF Ville.
+
+---
+
+## Remediation status (same day, 2026-06-11)
+
+**All P0 and P1 items above are FIXED and merged to master**, verified by
+5/5 consecutive full-suite runs (1106 tests) against a live PG:
+
+- P0-1 → merge `ac4fda4` (`fix(sync)`): booking eager-mirror (June 3 fix),
+  ALL FK-defer paths now eager-mirror or hold the watermark, `resolve.rs`
+  contract corrected, customer hard-deletes via migration 055 `legacy_id`,
+  C0000-cascade idempotency, type-1 bookings, NULL-date poison pill,
+  inert echo filter removed honestly, Bangkok-as-UTC event labels.
+- P0-2/3/4 + P1-7/8/9/10 → merge `90bef62` (`fix(writeback)`): payment
+  cart-clear deleted, extend-stay matches the §3f capture with live
+  Balance re-aggregation, room-change emits the full §3.17 companion set
+  (+ HT_Room_Status re-point), all N'…' stripped, fingerprint baseline
+  extended to all 20 written tables, checkin-to-booking re-save narrowed
+  to payload-carried fields, booking-modify caption + MAX(id) Room_Book,
+  Cust_no derived from MAX(id)+1.
+- Boundary hardening → `a558d82`: `AppState.legacy_pool` removed.
+- Docs → `7fc8b59`: SCHEMA.sql regenerated complete from live prod;
+  CLAUDE.md CT-DDL carve-out.
+- Follow-ups found while verifying → `3a8d358`: **NEW finding** — coupon
+  legacy-id-reuse poison pill (Delete orphans the canonical row; MAX+1
+  reuse then errors on `ht_coupons_coupon_code_key` every retry; same
+  class as the v2.66.3 room-calendar rebind). Fixed by re-attaching the
+  orphan pre-INSERT. Plus Bangkok `pay_date` fallback and
+  Conflict-on-concurrent-enqueue mapping.
+- Test determinism → `d96a4ed`: weak fixture suffixes + shared-fixture
+  races across 8 integration files.
+
+**Still open (deliberate decisions, not defects)** — P2 items requiring
+product/ops choices: customer-edit + mark-dirty + maintenance writeback
+intents, POS/refund `HT_Receipt_*` emission (VAT scope), `HT_Book_Pro`
+mapper, `Total_Price_vat` capture verification, round-bill gate warning,
+`SYNC_PER_TABLE_WATERMARK` enablement (env flip at next deploy), one-shot
+`legacy_id` backfill for pre-055 customer rows.
