@@ -197,6 +197,75 @@ pub enum WritebackIntent {
     /// non-cancelled check-in for this room.
     MarkRoomClean { room_id: Uuid, by: String },
 
+    /// Coexistence audit 2026-06-11 P2 — standalone mark-dirty writeback
+    /// (`docs/legacy-app/COMPAT_CHEATSHEET.md` §3.13, ClickClean.cs:493-540).
+    ///
+    /// Mirrors [`Self::MarkRoomClean`]: `UPDATE HT_Rooms` (by numeric `id`,
+    /// not `room_no` — same critical finding as spike §3j) + an
+    /// `INSERT HT_Housewife` "start cleaning" audit row referencing the
+    /// prior checked-out occupant. Before this intent existed,
+    /// `service::housekeeping::mark_dirty` was PG-only and iHOTEL's room
+    /// grid kept showing the room clean.
+    MarkRoomDirty { room_id: Uuid, by: String },
+
+    /// Coexistence audit 2026-06-11 P2 — room maintenance flag writeback
+    /// (`docs/legacy-app/COMPAT_CHEATSHEET.md` §3.15/§3.16).
+    ///
+    /// `UPDATE HT_Rooms SET Room_Manternace='yes'|'no' WHERE id=<id>` —
+    /// the column name is the verbatim legacy typo (`Room_Manternace`,
+    /// `hotel-backend/schema-baseline.txt:510`), values are the lowercase
+    /// `'yes'` / `'no'` vocabulary the CT room mapper reads back via
+    /// `legacy_yesno_to_bool`. Before this intent existed a room taken
+    /// out of service in the new app still looked rentable in iHOTEL
+    /// (its grid requires `Room_Manternace='no'` for the rentable state).
+    ///
+    /// Emitted by `routes::new_rooms::update_room` only when the
+    /// canonical `room_maintenance` flag actually CHANGES in the edit.
+    SetRoomMaintenance {
+        /// Canonical aggregate UUID derived from `room_id` via
+        /// [`crate::service::ids::aggregate_uuid`]. The writeback worker
+        /// resolves `HT_Rooms.id` (numeric internal PK) from
+        /// `ht_rooms_new.legacy_room_id_int` keyed on this — same
+        /// resolution as [`Self::MarkRoomClean`].
+        room_id: Uuid,
+        /// `true` ⇒ `Room_Manternace='yes'` (under repair, not rentable);
+        /// `false` ⇒ `'no'`.
+        maintenance: bool,
+    },
+
+    /// Coexistence audit 2026-06-11 P2 — standalone customer-edit
+    /// writeback. Before this intent existed, edits made through
+    /// `PUT /api/new/customers/:id` never reached `HT_Customers` (only
+    /// the `CustomerResave` folded into [`Self::ModifyBooking`] did) and
+    /// iHOTEL showed stale phone / address.
+    ///
+    /// The payload is the full [`CustomerResave`] field set — the same
+    /// 31-column `UPDATE HT_Customers ... where Cust_no=...` an iHOTEL
+    /// re-save fires (spike §3c capture line 28) — hydrated by
+    /// `service::customer::update` from the canonical `ht_customers` row
+    /// AFTER the PG UPDATE commits its values. Columns the new-app edit
+    /// doesn't touch are hydrated from the CT-mirrored columns
+    /// (`cust_add_moo`, `cust_work_*`, …) so the re-save never blanks
+    /// iHOTEL-entered values.
+    ///
+    /// **Customer DELETEs are deliberately NOT written back** — see the
+    /// `recipes/update_customer.rs` module doc (iHOTEL's delete is a
+    /// destructive hard-DELETE + `'C0000'` cascade, cheatsheet §3.24;
+    /// our canonical soft-delete is reversible).
+    UpdateCustomer {
+        /// Canonical aggregate UUID derived from `cust_id` via
+        /// [`crate::service::ids::aggregate_uuid`]. Persisted into
+        /// `writeback_jobs.aggregate_id` so jobs for the same customer
+        /// group together in the index.
+        customer_id: Uuid,
+        /// Full re-save payload. `resave.legacy_cust_no` carries the
+        /// `HT_Customers.Cust_no` business key directly (resolved by the
+        /// service before enqueue — the intent is only emitted for
+        /// customers that already exist on the legacy side), so the
+        /// writeback resolver no-ops, mirroring [`Self::UpdateRoom`].
+        resave: CustomerResave,
+    },
+
     /// Admin / staff edit of room master data (price, type, notes).
     /// Mirrors a PG `ht_rooms_new` UPDATE → legacy `HT_Rooms` UPDATE
     /// keyed by `Room_no`. PG fields that have no MSSQL counterpart
@@ -608,7 +677,10 @@ impl WritebackIntent {
             WritebackIntent::RefundPayment { .. } => "refund_payment",
             WritebackIntent::RoomChange { .. } => "room_change",
             WritebackIntent::MarkRoomClean { .. } => "mark_room_clean",
+            WritebackIntent::MarkRoomDirty { .. } => "mark_room_dirty",
+            WritebackIntent::SetRoomMaintenance { .. } => "set_room_maintenance",
             WritebackIntent::UpdateRoom { .. } => "update_room",
+            WritebackIntent::UpdateCustomer { .. } => "update_customer",
             WritebackIntent::AdjustProductStock { .. } => "adjust_product_stock",
             WritebackIntent::IssueCoupon { .. } => "issue_coupon",
             WritebackIntent::RedeemCoupon { .. } => "redeem_coupon",
@@ -634,7 +706,10 @@ impl WritebackIntent {
             | WritebackIntent::RoomChange { check_in_id, .. }
             | WritebackIntent::RecordPosSale { check_in_id, .. } => *check_in_id,
             WritebackIntent::MarkRoomClean { room_id, .. }
+            | WritebackIntent::MarkRoomDirty { room_id, .. }
+            | WritebackIntent::SetRoomMaintenance { room_id, .. }
             | WritebackIntent::UpdateRoom { room_id, .. } => *room_id,
+            WritebackIntent::UpdateCustomer { customer_id, .. } => *customer_id,
             // Track F3 — fall back to a deterministic v5 UUID derived
             // from the legacy `Pro_no` so the
             // `writeback_jobs.aggregate_id` index always groups
@@ -893,6 +968,78 @@ mod tests {
             generate_idempotency_key(&intent_a, room_id),
             generate_idempotency_key(&intent_b, room_id),
         );
+    }
+
+    /// `MarkRoomDirty` must expose the snake_case discriminant
+    /// `"mark_room_dirty"` and report the carried room aggregate id —
+    /// mirrors `MarkRoomClean` exactly.
+    #[test]
+    fn mark_room_dirty_intent_name_and_aggregate_id() {
+        let room_id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let intent = WritebackIntent::MarkRoomDirty {
+            room_id,
+            by: "Admin".into(),
+        };
+        assert_eq!(intent.intent_name(), "mark_room_dirty");
+        assert_eq!(intent.aggregate_id(), room_id);
+    }
+
+    /// `SetRoomMaintenance` must expose the snake_case discriminant
+    /// `"set_room_maintenance"`, report the room aggregate id, and
+    /// round-trip the boolean through serde in both directions.
+    #[test]
+    fn set_room_maintenance_intent_roundtrips_both_directions() {
+        let room_id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        for maintenance in [true, false] {
+            let intent = WritebackIntent::SetRoomMaintenance { room_id, maintenance };
+            assert_eq!(intent.intent_name(), "set_room_maintenance");
+            assert_eq!(intent.aggregate_id(), room_id);
+            let json = serde_json::to_string(&intent).expect("must serialize");
+            let parsed: WritebackIntent =
+                serde_json::from_str(&json).expect("must round-trip");
+            match parsed {
+                WritebackIntent::SetRoomMaintenance { room_id: r, maintenance: m } => {
+                    assert_eq!(r, room_id);
+                    assert_eq!(m, maintenance);
+                }
+                other => panic!("expected SetRoomMaintenance, got {other:?}"),
+            }
+        }
+    }
+
+    /// `UpdateCustomer` must expose the snake_case discriminant
+    /// `"update_customer"`, report the customer aggregate id, and carry
+    /// the full `CustomerResave` payload through serde unchanged.
+    #[test]
+    fn update_customer_intent_roundtrips_resave_payload() {
+        let customer_id = Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap();
+        let intent = WritebackIntent::UpdateCustomer {
+            customer_id,
+            resave: CustomerResave {
+                legacy_cust_no: "C21624".into(),
+                cust_name: "Alberto Calvo Alvarez".into(),
+                cust_add_tel: "0900000088".into(),
+                cust_idcard: "1234567890123".into(),
+                ..CustomerResave::default()
+            },
+        };
+        assert_eq!(intent.intent_name(), "update_customer");
+        assert_eq!(intent.aggregate_id(), customer_id);
+        let json = serde_json::to_string(&intent).expect("must serialize");
+        let parsed: WritebackIntent =
+            serde_json::from_str(&json).expect("must round-trip");
+        match parsed {
+            WritebackIntent::UpdateCustomer { customer_id: c, resave } => {
+                assert_eq!(c, customer_id);
+                assert_eq!(resave.legacy_cust_no, "C21624");
+                assert_eq!(resave.cust_name, "Alberto Calvo Alvarez");
+                assert_eq!(resave.cust_add_tel, "0900000088");
+                assert_eq!(resave.cust_idcard, "1234567890123");
+                // Untouched fields stay empty strings (legacy '' convention).
+                assert_eq!(resave.cust_work_name, "");
+            }
+            other => panic!("expected UpdateCustomer, got {other:?}"),
+        }
     }
 
     /// Round-trip an `UpdateRoom` payload through serde — partial

@@ -9,10 +9,10 @@
 //! Per `docs/architecture.md` §1, §6 (Phase 2.5) writes delegate through
 //! `state.customers_service`. Reads keep calling `state.customers` (the
 //! repository) directly — the service layer's value is in writes (TX +
-//! outbox + events), not in reads. The soft-delete handler also stays on
-//! the repository today: there is no `delete` recipe in the service yet
-//! (only `create` / `update` are wired). When that lands, the same
-//! delegation pattern applies.
+//! outbox + events), not in reads. The soft-delete handler stays on the
+//! repository **by design**: customer deletes deliberately have no legacy
+//! writeback (iHOTEL's delete is a destructive hard-DELETE + `'C0000'`
+//! cascade, cheatsheet §3.24 — see `delete_customer` below).
 
 use axum::{
     extract::{Path, Query, State},
@@ -231,11 +231,21 @@ pub async fn update_customer(
     }))
 }
 
-/// DELETE /api/new/customers/:id - Soft delete (set Cust_Active=0)
+/// DELETE /api/new/customers/:id - Soft delete (set `cust_active=false`)
 ///
-/// Stays on the repository: the service layer does not yet expose a `delete`
-/// method (no writeback recipe for soft-deleting a customer). When that
-/// lands, this delegates via `state.customers_service.soft_delete(...)`.
+/// **Deliberately has NO legacy writeback** (decision recorded with the
+/// 2026-06-11 audit P2 `UpdateCustomer` gap-close): iHOTEL's only delete
+/// shape is a destructive hard-DELETE of the `HT_Customers` row +
+/// `Tb_Save_Image` photos plus a 6-statement `'C0000'` cascade across
+/// every FK-like reference (cheatsheet §3.24) — irreversible by
+/// construction, while our soft-delete is a reversible flag. Mirroring it
+/// would let a mis-click here permanently destroy legacy data. The
+/// soft-deleted customer therefore remains visible in iHOTEL; see the
+/// fuller rationale in `writeback/recipes/update_customer.rs`.
+///
+/// Stays on the repository (not the service): with the writeback
+/// deliberately out of scope there is nothing for a service method to
+/// compose beyond the single UPDATE.
 pub async fn delete_customer(
     State(state): State<AppState>,
     Path(cust_id): Path<i32>,

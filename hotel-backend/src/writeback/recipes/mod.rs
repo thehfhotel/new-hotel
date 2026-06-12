@@ -29,7 +29,10 @@
 //! | `refund_payment` | Track G2 / T4 CRIT-1 (`docs/legacy-app/COMPAT_CHEATSHEET.md:513`) | `RefundPayment` |
 //! | `room_change` | Track G4 / T4 HIGH-3 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_Changed_Room`, §3.17) | `RoomChange` |
 //! | `mark_clean` | §3j | `MarkRoomClean` |
+//! | `mark_dirty` | Audit 2026-06-11 P2 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §3.13) | `MarkRoomDirty` |
+//! | `set_maintenance` | Audit 2026-06-11 P2 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §3.15/§3.16) | `SetRoomMaintenance` |
 //! | `update_room` | Admin room master-data edit — closes the `PUT /api/new/rooms/:id` writeback gap | `UpdateRoom` |
+//! | `update_customer` | Audit 2026-06-11 P2 — standalone customer-edit re-save (spike §3c line 28 shape) | `UpdateCustomer` |
 //! | `adjust_product_stock` | Track F3 / T1 CRIT-3 (`docs/legacy-app/COMPAT_CHEATSHEET.md:560-564`) | `AdjustProductStock` |
 //! | `coupon` | Track G5 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_Cupon`) | `IssueCoupon` + `RedeemCoupon` |
 //! | `pos_sale` | Track G6 / POS module (MVP) — `HT_CheckIn_Product` INSERT + paired `HT_Products.Pro_Amt` additive decrement | `RecordPosSale` |
@@ -45,10 +48,13 @@ pub mod coupon;
 pub mod extend_stay;
 pub mod helpers;
 pub mod mark_clean;
+pub mod mark_dirty;
 pub mod payment;
 pub mod pos_sale;
 pub mod refund_payment;
 pub mod room_change;
+pub mod set_maintenance;
+pub mod update_customer;
 pub mod update_room;
 pub mod walkin;
 

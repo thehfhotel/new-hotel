@@ -20,6 +20,7 @@
 
 use uuid::Uuid;
 
+use crate::db::mssql_timeout::{simple_query_with_timeout, MssqlOpKind};
 use crate::outbox::intent::WritebackIntent;
 use crate::writeback::allocate::LegacyConn;
 use crate::writeback::error::{WritebackError, WritebackResult};
@@ -288,6 +289,80 @@ pub struct DispatchContext {
     pub aggregate_id: Uuid,
 }
 
+/// Round-bill gate probe — `docs/legacy-app/COMPAT_CHEATSHEET.md` §1.9.
+/// Table / column names verified against `docs/legacy-app/SCHEMA.sql`
+/// (`HT_Round_Bill`: `id, round_no, round_price, round_by, round_start,
+/// round_end`); iHOTEL's own gate is
+/// `Module1.check_round_bill(): SELECT id FROM HT_Round_Bill WHERE
+/// round_end IS NULL`.
+const ROUND_BILL_GATE_SQL: &str =
+    "SELECT COUNT(*) FROM HT_Round_Bill WHERE round_end IS NULL";
+
+/// True for the intents whose recipes write money rows iHOTEL attributes
+/// to the open cashier round (`HT_CheckIn_Pay` tenders, `HT_CheckIn_H`
+/// totals, `HT_CheckIn_Product` POS lines, `HT_Receipt_*`): walk-in /
+/// linked check-in, check-out settle, payment, refund, POS sale.
+/// iHOTEL refuses these operations entirely when no `HT_Round_Bill` row
+/// has `round_end IS NULL` (cheatsheet §1.9) — we deliberately do NOT
+/// block (canonical PG already committed; the writeback must land), we
+/// only surface that the rows will be missing from iHOTEL's shift /
+/// cash-drawer reports for the current round.
+fn intent_requires_open_round(intent: &WritebackIntent) -> bool {
+    matches!(
+        intent,
+        WritebackIntent::CreateCheckIn { .. }
+            | WritebackIntent::CheckOut { .. }
+            | WritebackIntent::RecordPayment { .. }
+            | WritebackIntent::RefundPayment { .. }
+            | WritebackIntent::RecordPosSale { .. }
+    )
+}
+
+/// Best-effort round-bill gate warning (cheatsheet §1.9). NEVER blocks or
+/// fails the writeback:
+/// * 0 open rounds ⇒ one `tracing::warn!` with the distinct event name
+///   `writeback_no_open_round` (grep / log-alert anchor). Log-only by
+///   design — the worker's existing throttled Slack path
+///   (`bin/writeback.rs::record_self_heal`) is a process-global counter
+///   bound to self-heal salvage semantics, and this chokepoint lives in
+///   the lib where no `SlackClient` handle exists; piping one through
+///   `dispatch` for a soft warning isn't worth the signature churn.
+/// * a probe error ⇒ `tracing::debug!` only (e.g. transient MSSQL
+///   hiccup — the recipe's own statements will surface real failures).
+async fn warn_if_no_open_round(conn: &mut LegacyConn<'_>, ctx: DispatchContext, intent_name: &str) {
+    // Same envelope as other in-recipe SELECTs: runs inside the worker's
+    // BEGIN TRAN, write budget (R2 2026-05-14 convention).
+    match simple_query_with_timeout(conn, ROUND_BILL_GATE_SQL, MssqlOpKind::Write).await {
+        Ok(rows) => {
+            let open_rounds: i32 = rows
+                .first()
+                .and_then(|row| row.get::<i32, _>(0))
+                .unwrap_or(0);
+            if open_rounds == 0 {
+                tracing::warn!(
+                    event = "writeback_no_open_round",
+                    job_id = ctx.job_id,
+                    aggregate_id = %ctx.aggregate_id,
+                    intent = intent_name,
+                    "No open HT_Round_Bill round (round_end IS NULL) — this \
+                     money-writing writeback will land outside iHOTEL's \
+                     cashier shift and be missing from its round/cash-drawer \
+                     reports (cheatsheet §1.9). Writing anyway."
+                );
+            }
+        }
+        Err(err) => {
+            // Best-effort probe — a failure here must never fail the job.
+            tracing::debug!(
+                job_id = ctx.job_id,
+                intent = intent_name,
+                error = %err,
+                "Round-bill gate probe failed; skipping the §1.9 warning"
+            );
+        }
+    }
+}
+
 /// Apply the intent's recipe inside the **caller's already-open** MSSQL
 /// connection. The worker is responsible for the surrounding transaction
 /// (`BEGIN TRAN ... COMMIT/ROLLBACK`).
@@ -362,6 +437,11 @@ pub async fn dispatch(
     // 5.2+ mappers are idempotent UPSERTs, so a missed tag costs at
     // most one extra cycle.
     crate::db::mssql_session::set_context_info(conn).await?;
+    // Cheatsheet §1.9 round-bill gate — best-effort WARN (never blocks)
+    // before any money-writing recipe runs. See `warn_if_no_open_round`.
+    if intent_requires_open_round(intent) {
+        warn_if_no_open_round(conn, ctx, intent.intent_name()).await;
+    }
     match intent {
         WritebackIntent::CreateBooking { booking_id: _, payload } => {
             recipes::booking_create::execute(conn, payload).await
@@ -618,6 +698,50 @@ pub async fn dispatch(
             })?;
             recipes::mark_clean::execute(conn, room_no, room_id_int, by).await
         }
+        // Audit 2026-06-11 P2 — standalone mark-dirty. Same resolution
+        // contract as MarkRoomClean: the recipe needs both the display
+        // `room_no` (HT_Housewife.h_room + prior-occupant lookup) and
+        // the numeric `HT_Rooms.id` (the flag UPDATE's key — spike §3j).
+        WritebackIntent::MarkRoomDirty { room_id: _, by } => {
+            let room_no = nonempty(resolved.legacy_room_no.as_ref()).ok_or_else(|| {
+                WritebackError::Recipe("MarkRoomDirty requires resolved legacy_room_no".into())
+            })?;
+            let room_id_int = resolved.legacy_room_id_int.ok_or_else(|| {
+                WritebackError::Recipe(
+                    "MarkRoomDirty requires resolved legacy_room_id_int (HT_Rooms.id)"
+                        .into(),
+                )
+            })?;
+            recipes::mark_dirty::execute(conn, room_no, room_id_int, by).await
+        }
+        // Audit 2026-06-11 P2 — maintenance-flag mirror. The single
+        // UPDATE is keyed by numeric `HT_Rooms.id` only (cheatsheet
+        // §3.15/§3.16 `where id=<id>` form), so `legacy_room_no` is not
+        // required here.
+        WritebackIntent::SetRoomMaintenance { room_id: _, maintenance } => {
+            let room_id_int = resolved.legacy_room_id_int.ok_or_else(|| {
+                WritebackError::Recipe(
+                    "SetRoomMaintenance requires resolved legacy_room_id_int (HT_Rooms.id)"
+                        .into(),
+                )
+            })?;
+            recipes::set_maintenance::execute(conn, room_id_int, *maintenance).await
+        }
+        // Audit 2026-06-11 P2 — standalone customer-edit re-save. The
+        // payload carries the legacy `Cust_no` business key directly
+        // (hydrated by the service from `ht_customers.legacy_cust_no`
+        // before enqueue — the intent is only emitted for customers that
+        // already exist on the legacy side), so no `ResolvedJob` lookup
+        // is needed. Mirrors the `UpdateRoom` payload-carries-the-key
+        // shape.
+        WritebackIntent::UpdateCustomer { customer_id: _, resave } => {
+            if resave.legacy_cust_no.is_empty() {
+                return Err(WritebackError::Recipe(
+                    "UpdateCustomer requires non-empty resave.legacy_cust_no".into(),
+                ));
+            }
+            recipes::update_customer::execute(conn, resave).await
+        }
         // Admin room master-data edit (price / type / notes). The
         // payload carries the legacy `Room_no` business key directly
         // (resolved by the route from `ht_rooms_new.room_no` which
@@ -787,7 +911,9 @@ mod tests {
     /// exhaustiveness), and this test catches drift in name strings.
     /// (Track F3 added `adjust_product_stock`; Track G2 added
     /// `refund_payment`; Track G5 added `issue_coupon` + `redeem_coupon`;
-    /// the admin-room-edit gap-close added `update_room` —
+    /// the admin-room-edit gap-close added `update_room`; the 2026-06-11
+    /// coexistence audit P2 track added `mark_room_dirty`,
+    /// `set_room_maintenance` and `update_customer` —
     /// keep the count and the names list in lock-step.)
     #[test]
     fn all_intent_variants_route_to_recipes() {
@@ -803,7 +929,10 @@ mod tests {
             "refund_payment",
             "room_change",
             "mark_room_clean",
+            "mark_room_dirty",
+            "set_room_maintenance",
             "update_room",
+            "update_customer",
             "adjust_product_stock",
             "issue_coupon",
             "redeem_coupon",
@@ -813,7 +942,110 @@ mod tests {
         // intent name → no actual MSSQL call, just type-level coverage.
         // Counting expected variants here keeps the test cheap and
         // deterministic.
-        assert_eq!(names.len(), 16, "expected 16 WritebackIntent variants");
+        assert_eq!(names.len(), 19, "expected 19 WritebackIntent variants");
+    }
+
+    /// Cheatsheet §1.9 — byte-pin the round-bill gate probe. iHOTEL's own
+    /// gate is `SELECT id FROM HT_Round_Bill WHERE round_end IS NULL`
+    /// (`Module1.check_round_bill()`); ours counts the same predicate.
+    /// Table + column names verified against `docs/legacy-app/SCHEMA.sql`.
+    #[test]
+    fn round_bill_gate_sql_is_byte_pinned() {
+        assert_eq!(
+            ROUND_BILL_GATE_SQL,
+            "SELECT COUNT(*) FROM HT_Round_Bill WHERE round_end IS NULL"
+        );
+    }
+
+    /// The gate covers exactly the money-writing recipe paths (walk-in /
+    /// linked check-in, checkout, payment, refund, POS sale) and nothing
+    /// else — room/customer/booking master-data flows are not attributed
+    /// to a cashier round by iHOTEL.
+    #[test]
+    fn round_bill_gate_classifies_money_writing_intents_only() {
+        use crate::domain::payment::PaymentMethod;
+        use crate::domain::shared::Money;
+        use crate::outbox::intent::RecordPaymentReceipt;
+
+        let id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let gated = [
+            WritebackIntent::CheckOut {
+                check_in_id: id,
+                nights: None,
+                room_price_total: None,
+                product_total: None,
+                net_total: None,
+                pay_total: None,
+                balance: None,
+            },
+            WritebackIntent::RecordPayment {
+                check_in_id: id,
+                amount: Money::from_satang(89000),
+                method: PaymentMethod::Cash,
+                receipt: RecordPaymentReceipt::default(),
+                checkin_ds_id: None,
+                price_per_night_baht: None,
+                nights: None,
+                payment_aggregate_id: None,
+                vat_percent: None,
+            },
+            WritebackIntent::RefundPayment {
+                check_in_id: id,
+                original_payment_aggregate_id: None,
+                amount: Money::from_satang(89000),
+                method: PaymentMethod::Cash,
+                refund_reason: String::new(),
+                payment_aggregate_id: None,
+            },
+            WritebackIntent::RecordPosSale { check_in_id: id, sale_id: 1 },
+        ];
+        for intent in &gated {
+            assert!(
+                intent_requires_open_round(intent),
+                "{} must be round-bill gated",
+                intent.intent_name()
+            );
+        }
+
+        let ungated = [
+            WritebackIntent::CancelBooking { booking_id: id },
+            WritebackIntent::MarkRoomClean { room_id: id, by: "Admin".into() },
+            WritebackIntent::MarkRoomDirty { room_id: id, by: "Admin".into() },
+            WritebackIntent::SetRoomMaintenance { room_id: id, maintenance: true },
+            WritebackIntent::UpdateCustomer {
+                customer_id: id,
+                resave: crate::outbox::intent::CustomerResave::default(),
+            },
+        ];
+        for intent in &ungated {
+            assert!(
+                !intent_requires_open_round(intent),
+                "{} must NOT be round-bill gated",
+                intent.intent_name()
+            );
+        }
+    }
+
+    /// The gate must run AFTER the loop-prevention tag and BEFORE any
+    /// recipe SQL — textual pin in the same spirit as
+    /// `dispatch_calls_set_context_info_before_recipes`.
+    #[test]
+    fn round_bill_gate_runs_between_context_info_and_recipes() {
+        let source = include_str!("dispatcher.rs");
+        let context_pos = source
+            .find("set_context_info(conn)")
+            .expect("dispatch() must call set_context_info(conn)");
+        let gate_pos = source
+            .find("warn_if_no_open_round(conn, ctx, intent.intent_name())")
+            .expect("dispatch() must call warn_if_no_open_round");
+        let match_pos = source
+            .find("match intent {")
+            .expect("dispatch() must contain `match intent {`");
+        assert!(
+            context_pos < gate_pos && gate_pos < match_pos,
+            "round-bill gate must sit between set_context_info and the \
+             recipe match"
+        );
     }
 
     /// Phase 5.1 chokepoint guarantee — every recipe MUST run after

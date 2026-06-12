@@ -16,6 +16,7 @@ use axum::{
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 use sqlx::{Postgres, Row, Transaction};
+use uuid::Uuid;
 
 use super::mode::{AppState, Branch};
 use crate::error::{ApiError, ApiResult};
@@ -278,8 +279,11 @@ pub async fn update_room(
     // recipe targets the existing MSSQL row even when the operator is
     // renaming the room in the same edit (the new room_no won't exist
     // on the legacy side until a separate `Room_no` mirror lands —
-    // tracked separately).
-    let legacy_room_no = load_legacy_room_no(&mut tx, room_id).await?;
+    // tracked separately). Also capture the prior maintenance flag so
+    // the `SetRoomMaintenance` mirror below only fires on an actual
+    // state CHANGE (audit 2026-06-11 P2).
+    let (legacy_room_no, was_maintenance) =
+        load_room_writeback_context(&mut tx, room_id).await?;
 
     let rows_affected = state
         .rooms
@@ -329,6 +333,33 @@ pub async fn update_room(
         .await
         .map_err(ApiError::from)?;
 
+    // Audit 2026-06-11 P2 — mirror the maintenance flag onto legacy
+    // `HT_Rooms.Room_Manternace` (sic) when the edit actually CHANGES it,
+    // so a room taken out of service here stops looking rentable in
+    // iHOTEL (cheatsheet §3.15/§3.16). Deliberately NOT folded into the
+    // `UpdateRoom` payload: that recipe owns master data (price / type /
+    // notes) and documents `Room_Manternace` as owned by the maintenance
+    // flow — this dedicated intent IS that flow (the shape the
+    // `update_room_status` doc comment below anticipated).
+    if was_maintenance != is_maintenance {
+        let maintenance_intent = WritebackIntent::SetRoomMaintenance {
+            room_id: aggregate_id,
+            maintenance: is_maintenance,
+        };
+        // Per-event discriminator key: the same room legitimately goes
+        // in and out of maintenance over its lifetime, and
+        // `writeback_jobs.idempotency_key` is permanently UNIQUE — a
+        // payload-independent `(intent, aggregate)` key would hard-fail
+        // the second flip after the first job completed. The enqueue is
+        // atomic with the PG UPDATE in this TX (see the discriminator
+        // note in `outbox::idempotency`).
+        let maintenance_key =
+            generate_idempotency_key(&maintenance_intent, Uuid::new_v4());
+        OutboxRepository::enqueue(&mut tx, &maintenance_intent, maintenance_key)
+            .await
+            .map_err(ApiError::from)?;
+    }
+
     tx.commit().await?;
 
     Ok(Json(MutationResponse {
@@ -338,10 +369,17 @@ pub async fn update_room(
     }))
 }
 
-/// Resolve the legacy `HT_Rooms.Room_no` business key for `room_id` from
-/// PG. The canonical `ht_rooms_new.room_no` mirrors the legacy column
-/// 1:1 (per `bin/backfill_rooms.rs:370`), so the canonical value IS the
-/// legacy key.
+/// Resolve the pre-UPDATE writeback context for `room_id` from PG:
+///
+/// * the legacy `HT_Rooms.Room_no` business key — the canonical
+///   `ht_rooms_new.room_no` mirrors the legacy column 1:1 (per
+///   `bin/backfill_rooms.rs:370`), so the canonical value IS the legacy
+///   key;
+/// * the prior `room_maintenance` flag, so the caller can detect an
+///   actual maintenance-state CHANGE and emit
+///   [`WritebackIntent::SetRoomMaintenance`] only then (audit 2026-06-11
+///   P2). A `NULL` flag is treated as `false` (matches the read DTO's
+///   `unwrap_or(false)`).
 ///
 /// Returns `NotFound` when the row does not exist — surfaces the same
 /// failure as the PG UPDATE's `rows_affected==0` branch but earlier
@@ -349,19 +387,27 @@ pub async fn update_room(
 ///
 /// Uses dynamic `sqlx::query` (not the compile-time macro) to keep the
 /// crate buildable without regenerating the `.sqlx/` cache.
-async fn load_legacy_room_no(
+async fn load_room_writeback_context(
     tx: &mut Transaction<'_, Postgres>,
     room_id: i32,
-) -> ApiResult<String> {
-    let row = sqlx::query("SELECT room_no FROM ht_rooms_new WHERE room_id = $1")
-        .bind(room_id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .ok_or_else(|| ApiError::NotFound("Room not found".to_string()))?;
+) -> ApiResult<(String, bool)> {
+    let row = sqlx::query(
+        "SELECT room_no, room_maintenance FROM ht_rooms_new WHERE room_id = $1",
+    )
+    .bind(room_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Room not found".to_string()))?;
     let room_no: String = row
         .try_get("room_no")
         .map_err(|err| ApiError::Internal(format!("room_no column missing: {err}")))?;
-    Ok(room_no)
+    let was_maintenance: bool = row
+        .try_get::<Option<bool>, _>("room_maintenance")
+        .map_err(|err| {
+            ApiError::Internal(format!("room_maintenance column missing: {err}"))
+        })?
+        .unwrap_or(false);
+    Ok((room_no, was_maintenance))
 }
 
 /// Resolve `ht_room_types.type_name` for the given `room_type_id`.
@@ -411,10 +457,10 @@ pub struct UpdateRoomStatusRequest {
 /// maintenance request flow. Mirroring `room_status` here would race
 /// those flows and corrupt the legacy occupancy state.
 ///
-/// If a future requirement needs to push admin-style status overrides
-/// to legacy, model it as a new dedicated intent (e.g.
-/// `MarkRoomMaintenance { reason }`) so the column-ownership split is
-/// preserved.
+/// The dedicated-intent shape this comment anticipated now exists for
+/// the maintenance flag: [`WritebackIntent::SetRoomMaintenance`],
+/// emitted by `update_room` above when the canonical `room_maintenance`
+/// boolean actually changes — the column-ownership split is preserved.
 pub async fn update_room_status(
     State(state): State<AppState>,
     Path(room_id): Path<i32>,
