@@ -44,7 +44,7 @@ jobs:
       - name: Install Rust
         # Pinned to a `1.89` branch SHA per Batch D — matches the backend
         # toolchain in docker-build.yml so both pipelines use the same Rust.
-        uses: dtolnay/rust-toolchain@193d6aa1dbbc28bd2c0a6b0e327cfdce68baaf6e  # 1.89
+        uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e  # 1.89
 
       - name: Install Rust targets (macOS)
         if: matrix.platform == 'macos-latest'
