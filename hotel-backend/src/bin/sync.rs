@@ -74,11 +74,11 @@ use hotel_backend::outbox::event::DomainEvent;
 use hotel_backend::sync::change_op::ChangeOp;
 use hotel_backend::sync::mappers::{
     apply_booking_aggregate, apply_checkin_aggregate, apply_payment_aggregate,
-    BillDebtDsMirrorMapper, BillDebtHMirrorMapper, BookingDatesMapper, BookingHeaderMapper,
-    BookingRoomsMapper, ChangedRoomMirrorMapper, CheckInHeaderMapper, CheckInRoomsMapper,
-    CheckinProductMirrorMapper, CuponMirrorMapper, CustomerMapper, DepositMirrorMapper,
-    GuestRegistryMapper, PaymentMapper, ReceiptMapper, RoomCalendarMapper, RoomMasterMapper,
-    RoomsCancelMirrorMapper,
+    BillDebtDsMirrorMapper, BillDebtHMirrorMapper, BookProMirrorMapper, BookingDatesMapper,
+    BookingHeaderMapper, BookingRoomsMapper, ChangedRoomMirrorMapper, CheckInHeaderMapper,
+    CheckInRoomsMapper, CheckinProductMirrorMapper, CuponMirrorMapper, CustomerMapper,
+    DepositMirrorMapper, GuestRegistryMapper, PaymentMapper, ReceiptMapper, RoomCalendarMapper,
+    RoomMasterMapper, RoomsCancelMirrorMapper,
 };
 use hotel_backend::sync::parent_loader::{load_booking_aggregate, load_checkin_aggregate};
 use hotel_backend::sync::row::MappableRow;
@@ -395,11 +395,14 @@ const WATCHDOG_ALERT_COOLDOWN_SECS: u64 = 1800;
 /// reaction speed. Override via `LEGACY_SYNC_PROBE_TIMEOUT_STREAK`.
 const DEFAULT_PROBE_TIMEOUT_STREAK_THRESHOLD: u32 = 3;
 
-/// All CT-enabled MSSQL tables — must stay in sync with the seed in
+/// All CT-enabled MSSQL tables — must stay in sync with the seeds in
 /// migrations 017 (canonical sync, 10 tables) + 022 (legacy_mirror, 6
-/// tables) and the `legacy_sync_status` rows. Adding a new mapper
-/// means inserting a row in the relevant seed migration, adding the
-/// table here, and wiring its mapper in `build_mappers`.
+/// tables) + 033 (Track E1, 2 tables) + 056 (HT_Book_Pro) and the
+/// `legacy_sync_status` rows. Adding a new mapper means inserting a
+/// row in the relevant seed migration (BOTH `legacy_sync_status` and a
+/// `legacy_ct_state_per_table` row seeded from the current global
+/// watermark — see migration 056 for the canonical example), adding
+/// the table here, and wiring its mapper in `build_mappers`.
 const CT_ENABLED_TABLES: &[&str] = &[
     // Phase 5 — canonical sync (10 tables, CT enabled 2026-04-25)
     "HT_Customers",
@@ -432,6 +435,13 @@ const CT_ENABLED_TABLES: &[&str] = &[
     // mirror mapper.
     "HT_CheckIn_Other_People",
     "HT_Rooms_Cancel",
+    // Phase 5/E2 — coexistence audit 2026-06-11 P2 gap closure.
+    // `HT_Book_Pro` (pre-booked products attached to a booking by
+    // FrmAddBook2): CT enabled by legacy-mssql migration 023, mirrored
+    // into `legacy_mirror.ht_book_pro` (migration pg/056) by the new
+    // `BookProMirrorMapper` so iHOTEL-entered booking products are
+    // visible to the new app.
+    "HT_Book_Pro",
 ];
 
 #[tokio::main]
@@ -1951,8 +1961,9 @@ fn parse_allowlist(raw: Option<String>) -> Option<HashSet<String>> {
 /// Build the per-table mapper list, filtered by the allowlist. Phase
 /// 5.4 finished the 10-table canonical sync (every CT-enabled table
 /// has a real mapper or an intentional retired stub `HT_Room_Status`).
-/// Phase 5.5c adds the 6 legacy_mirror.* mappers, bringing total
-/// mapper coverage to 16 tables.
+/// Phase 5.5c added the 6 legacy_mirror.* mappers, Track E1 the two
+/// sync-gap closures, and Phase 5/E2 the `HT_Book_Pro` mirror —
+/// bringing total mapper coverage to 19 tables.
 fn build_mappers(allowlist: &Option<HashSet<String>>) -> Vec<Box<dyn MssqlChangeMapper>> {
     let allowed = |t: &str| allowlist.as_ref().map(|a| a.contains(t)).unwrap_or(true);
 
@@ -1992,6 +2003,9 @@ fn build_mappers(allowlist: &Option<HashSet<String>>) -> Vec<Box<dyn MssqlChange
             // cancelled-room mirror (legacy_mirror pass-through).
             "HT_CheckIn_Other_People" => Box::new(GuestRegistryMapper),
             "HT_Rooms_Cancel" => Box::new(RoomsCancelMirrorMapper),
+            // Phase 5/E2 — pre-booked products mirror (legacy_mirror
+            // pass-through; coexistence audit 2026-06-11 P2).
+            "HT_Book_Pro" => Box::new(BookProMirrorMapper),
             other => Box::new(NoopMapper { table_name: other }),
         };
         out.push(mapper);
@@ -3585,9 +3599,10 @@ mod tests {
         assert_eq!(mappers.len(), CT_ENABLED_TABLES.len());
         assert_eq!(
             mappers.len(),
-            18,
-            "18 CT-enabled tables expected (10 canonical + 6 legacy_mirror \
-             + 2 Track-E1: HT_CheckIn_Other_People + HT_Rooms_Cancel)"
+            19,
+            "19 CT-enabled tables expected (10 canonical + 6 legacy_mirror \
+             + 2 Track-E1: HT_CheckIn_Other_People + HT_Rooms_Cancel \
+             + 1 Phase 5/E2: HT_Book_Pro)"
         );
     }
 
@@ -3750,8 +3765,30 @@ mod tests {
         }
     }
 
+    /// Phase 5/E2 (coexistence audit 2026-06-11 P2) — `HT_Book_Pro`
+    /// gets a real mirror mapper. Locks the wiring so a refactor can't
+    /// silently regress it to NoopMapper (which would re-open the
+    /// invisible-booking-products gap).
     #[test]
-    fn ct_enabled_tables_match_migration_017_022_and_033_seed() {
+    fn build_mappers_wires_book_pro_to_mirror_mapper() {
+        let mut allow = HashSet::new();
+        allow.insert("HT_Book_Pro".to_string());
+        let mappers = build_mappers(&Some(allow));
+        assert_eq!(mappers.len(), 1, "HT_Book_Pro: expected one mapper");
+        assert_eq!(
+            mappers[0].primary_key_cols(),
+            &["id"],
+            "HT_Book_Pro must be wired to BookProMirrorMapper, not NoopMapper"
+        );
+        assert!(
+            mappers[0].select_sql().contains("B_PRICE_TOTAL"),
+            "HT_Book_Pro projection must include B_PRICE_TOTAL; got: {}",
+            mappers[0].select_sql()
+        );
+    }
+
+    #[test]
+    fn ct_enabled_tables_match_migration_017_022_033_and_056_seed() {
         let expected = [
             // Phase 5 — canonical sync (migration 017)
             "HT_Customers",
@@ -3774,6 +3811,8 @@ mod tests {
             // Phase 5/E1 — Track E1 sync-gap closure (migration 033)
             "HT_CheckIn_Other_People",
             "HT_Rooms_Cancel",
+            // Phase 5/E2 — pre-booked products mirror (migration 056)
+            "HT_Book_Pro",
         ];
         assert_eq!(CT_ENABLED_TABLES, &expected);
     }

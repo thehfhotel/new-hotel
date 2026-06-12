@@ -21,6 +21,14 @@
 -- next CT touch backfills it — a delete of such a row still falls back
 -- to the (usually NULL on D) Cust_no and is logged loudly as
 -- unresolvable rather than silently skipped.
+--
+-- One-shot backfill for those pre-055 rows: run
+-- `hotel-backend/src/bin/backfill_customer_legacy_ids.rs`
+-- (`cargo run --release --bin backfill_customer_legacy_ids -- --dry-run`
+-- first) once per site after this migration deploys. It reads
+-- `(id, Cust_no)` from legacy HT_Customers (read-only) and stamps
+-- `legacy_id` onto canonical rows where it is still NULL — idempotent,
+-- chunked, never overwrites a CT-mapper-stamped value.
 
 -- UP MIGRATION
 ALTER TABLE ht_customers ADD COLUMN IF NOT EXISTS legacy_id INTEGER;

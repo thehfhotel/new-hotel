@@ -26,12 +26,18 @@
 //! | `HT_Bill_Debt_H`     | `legacy_mirror.ht_bill_debt_h`   | `Bill_No`  |
 //! | `HT_Bill_Debt_Ds`    | `legacy_mirror.ht_bill_debt_ds`  | `id`       |
 //! | `HT_Rooms_Cancel`    | `legacy_mirror.ht_rooms_cancel`  | `id`       |
+//! | `HT_Book_Pro`        | `legacy_mirror.ht_book_pro`      | `id`       |
 //!
 //! Track E1 (audit 2026-05-13 T2 HIGH-5) added `HT_Rooms_Cancel` — CT
 //! was enabled back in Phase 5 (migration 020) but no mapper consumed
 //! the rows; the mirror table sat empty while CT retention silently
 //! accumulated row history forever. The new
 //! `RoomsCancelMirrorMapper` closes the dangling subscription.
+//!
+//! Phase 5/E2 (coexistence audit 2026-06-11 P2) added `HT_Book_Pro`
+//! (pre-booked products attached to a booking) — see
+//! [`BookProMirrorMapper`] for the iHOTEL semantics and the
+//! booking→check-in conversion gap it surfaces.
 
 use async_trait::async_trait;
 
@@ -955,6 +961,155 @@ impl MssqlChangeMapper for RoomsCancelMirrorMapper {
     }
 }
 
+// ─── HT_Book_Pro ─────────────────────────────────────────────────────
+// Phase 5/E2 — coexistence audit 2026-06-11 P2 gap closure.
+//
+// ## What `HT_Book_Pro` rows mean in iHOTEL
+//
+// Pre-booked products (food / drinks pre-ordered) attached to a
+// booking. `COMPAT_CHEATSHEET.md` lines 711-716 ("Table: `HT_Book_Pro`
+// (A) — pre-booked products"):
+//
+//   * PK `id int IDENTITY` — inserts omit `[id]` (FrmAddBook2.cs:3638).
+//   * 9 columns: `id, B_NO (Book_ID), B_ROOM, B_NAME, B_UNIT, B_NUM,
+//     B_PRICE, B_PRICE_TOTAL, B_PRO_ID`.
+//   * Insert in a loop on FrmAddBook2 save (§3.4 step 3.5, cheatsheet
+//     line 1222: `INSERT HT_Book_Pro (B_NO=Book_ID, B_ROOM, B_NAME,
+//     B_UNIT, B_NUM, B_PRICE, B_PRICE_TOTAL, B_PRO_ID)`).
+//   * Delete-on-edit `delete from HT_Book_Pro where [B_NO]='<id>'` —
+//     part of FrmAddBook2.SAVE_EDIT's delete-then-reinsert rewrite
+//     (§3.7 step 5, cheatsheet line 1260; same pattern as HT_Book_Date
+//     / HT_Book_Ds per line 650). Expect D-rows followed by fresh
+//     I-rows with NEW ids on every booking edit.
+//   * `B_NO` joins to `HT_Book_H.Book_ID` (manual cascade, cheatsheet
+//     line 1536). Read by FrmCheckIn (booking→check-in conversion) and
+//     FormBookingInvoice (FEATURE_MAP lines 247, 507, 543).
+//
+// ## TODO — booking→check-in conversion writeback gap (do NOT fix here)
+//
+// iHOTEL's FrmCheckIn, when converting a booking ("เปลี่ยนเป็น
+// Check-In", FEATURE_MAP §J3 lines 676-682), READS the booking's
+// `HT_Book_Pro` lines into its product grid (FEATURE_MAP line 543:
+// FrmCheckIn touches `HT_Book_Pro(R)` + `HT_CheckIn_Product(RW)`) and
+// on save runs §3.1 Step 3 (cheatsheet lines 1124-1127) for each
+// product row:
+//
+//   1. `INSERT HT_CheckIn_Product (Cin_No, Cin_Room_no, Cin_Pro_id,
+//      …)` — omitting `[id]` (IDENTITY, cheatsheet lines 539-547);
+//   2. the MANDATORY stock pairing `UPDATE HT_Products SET
+//      Pro_Amt=Pro_Amt-<num> WHERE Pro_no='<p>'` (cheatsheet lines
+//      560-566, "The new app MUST replicate this pairing");
+//   3. `Insert_Pay(...)` when a payment amount accompanies the line.
+//
+// Our `writeback/recipes/checkin_to_booking.rs` emits NO
+// `HT_CheckIn_Product` statements (it is owned by another track — see
+// its `build_statements`), so a booking carrying `HT_Book_Pro` lines
+// that is checked in via the NEW app still drops those charges on the
+// iHOTEL side: the folio shows no product lines and stock is never
+// decremented. What `checkin_to_booking.rs` would need to add, in the
+// same recipe transaction:
+//
+//   * Load the booking's product lines (now available canonically from
+//     `legacy_mirror.ht_book_pro WHERE b_no = <Book_ID>` — this
+//     mapper's output — or directly from `HT_Book_Pro` inside the
+//     recipe's MSSQL TX);
+//   * Per line, emit the `HT_CheckIn_Product` INSERT (cheatsheet §3.1
+//     Step 3 shape) + the paired `HT_Products.Pro_Amt` decrement;
+//   * VERIFY FIRST against the FrmCheckIn decompile / a fresh capture
+//     how `B_PRO_ID` (int) maps onto `HT_CheckIn_Product.Cin_Pro_id`
+//     (varchar(250)) and `HT_Products.Pro_no` (varchar(50)) — the
+//     cheatsheet does not pin that conversion, and guessing it would
+//     corrupt the stock pairing key.
+//
+// Until that lands, this mapper at least makes iHOTEL-entered booking
+// products VISIBLE to the new app so the conversion UI can warn.
+
+pub struct BookProMirrorMapper;
+
+/// CT JOIN projection for `HT_Book_Pro`. Held as a module-private
+/// const so Track J1's projection-lock test can pin every column
+/// against the authoritative HF Hotel schema dump
+/// (`schema-baseline.txt` lines 179-187).
+const BOOK_PRO_SELECT_COLS: &str =
+    "t.id, t.B_NO, t.B_ROOM, t.B_NAME, t.B_UNIT, t.B_NUM, \
+     t.B_PRICE, t.B_PRICE_TOTAL, t.B_PRO_ID";
+
+#[async_trait]
+impl MssqlChangeMapper for BookProMirrorMapper {
+    fn table(&self) -> &'static str {
+        "HT_Book_Pro"
+    }
+
+    fn primary_key_cols(&self) -> &'static [&'static str] {
+        // Migration legacy-mssql/023 added PK_HT_Book_Pro on the
+        // IDENTITY `id` (already NOT NULL per the live baseline).
+        &["id"]
+    }
+
+    fn select_sql(&self) -> &'static str {
+        BOOK_PRO_SELECT_COLS
+    }
+
+    async fn apply(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        op: ChangeOp,
+        row: Option<&dyn MappableRow>,
+    ) -> Result<Option<DomainEvent>, SyncError> {
+        let row = row.ok_or_else(|| SyncError::Mapper {
+            table: "HT_Book_Pro",
+            message: "row required for both I/U and D".into(),
+        })?;
+        let id = row.try_get_i32("id")?.ok_or_else(|| SyncError::Mapper {
+            table: "HT_Book_Pro",
+            message: "id NULL — identity column should never be NULL".into(),
+        })?;
+        match op {
+            ChangeOp::Delete => {
+                // Fired on every FrmAddBook2 edit (delete-then-reinsert,
+                // §3.7 step 5) as well as genuine removals — plain
+                // mirror delete, idempotent on already-gone rows.
+                sqlx::query("DELETE FROM legacy_mirror.ht_book_pro WHERE id = $1")
+                    .bind(id)
+                    .execute(&mut **tx)
+                    .await?;
+            }
+            ChangeOp::Insert | ChangeOp::Update => {
+                sqlx::query(
+                    "INSERT INTO legacy_mirror.ht_book_pro \
+                        (id, b_no, b_room, b_name, b_unit, b_num, \
+                         b_price, b_price_total, b_pro_id, \
+                         mirrored_at, mirror_source) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), 'ct') \
+                     ON CONFLICT (id) DO UPDATE SET \
+                        b_no          = EXCLUDED.b_no, \
+                        b_room        = EXCLUDED.b_room, \
+                        b_name        = EXCLUDED.b_name, \
+                        b_unit        = EXCLUDED.b_unit, \
+                        b_num         = EXCLUDED.b_num, \
+                        b_price       = EXCLUDED.b_price, \
+                        b_price_total = EXCLUDED.b_price_total, \
+                        b_pro_id      = EXCLUDED.b_pro_id, \
+                        mirrored_at   = now(), \
+                        mirror_source = 'ct'",
+                )
+                .bind(id)
+                .bind(row.try_get_str("B_NO")?)
+                .bind(row.try_get_str("B_ROOM")?)
+                .bind(row.try_get_str("B_NAME")?)
+                .bind(row.try_get_str("B_UNIT")?)
+                .bind(row.try_get_f64("B_NUM")?)
+                .bind(row.try_get_f64("B_PRICE")?)
+                .bind(row.try_get_f64("B_PRICE_TOTAL")?)
+                .bind(row.try_get_i32("B_PRO_ID")?)
+                .execute(&mut **tx)
+                .await?;
+            }
+        }
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -974,6 +1129,7 @@ mod tests {
             (&BillDebtHMirrorMapper, "HT_Bill_Debt_H", &["Bill_No"]),
             (&BillDebtDsMirrorMapper, "HT_Bill_Debt_Ds", &["id"]),
             (&RoomsCancelMirrorMapper, "HT_Rooms_Cancel", &["id"]),
+            (&BookProMirrorMapper, "HT_Book_Pro", &["id"]),
         ];
         for (mapper, table, pk) in cases {
             assert_eq!(mapper.table(), *table, "table() mismatch");
@@ -1073,5 +1229,34 @@ mod tests {
     #[test]
     fn rooms_cancel_select_cols_are_subset_of_legacy_schema() {
         crate::assert_projection_subset!(ROOMS_CANCEL_SELECT_COLS, "HT_Rooms_Cancel");
+    }
+
+    #[test]
+    fn book_pro_select_cols_are_subset_of_legacy_schema() {
+        crate::assert_projection_subset!(BOOK_PRO_SELECT_COLS, "HT_Book_Pro");
+    }
+
+    /// Phase 5/E2 — lock the projection columns for `HT_Book_Pro` so a
+    /// refactor can't silently drop one. The mirror PG table has 9
+    /// source columns + 2 bookkeeping columns (migration pg/056).
+    #[test]
+    fn book_pro_mapper_projects_nine_source_columns() {
+        let select = BookProMirrorMapper.select_sql();
+        for col in &[
+            "id",
+            "B_NO",
+            "B_ROOM",
+            "B_NAME",
+            "B_UNIT",
+            "B_NUM",
+            "B_PRICE",
+            "B_PRICE_TOTAL",
+            "B_PRO_ID",
+        ] {
+            assert!(
+                select.contains(col),
+                "select_sql must project {col}; got: {select}"
+            );
+        }
     }
 }
