@@ -59,7 +59,10 @@ fn unique_cust_no() -> String {
 }
 
 fn unique_room_no() -> String {
-    format!("Y{:03}", unique_residue() % 999 + 1)
+    // 6-digit namespace + a prefix disjoint from phase53's Y-rooms:
+    // mod-999 spaces produced cross-test birthday collisions (one
+    // test's cleanup deleting a room a sibling had co-seeded).
+    format!("W{:06}", unique_residue() % 1_000_000)
 }
 
 fn header_row(cin_no: &str, cust_no: &str, status: &str) -> HashMapRow {
@@ -1082,7 +1085,7 @@ async fn apply_checkin_aggregate_removes_dropped_rooms() {
     let mssql = mssql_stub().await;
     let cin_no = unique_cin_no();
     let cust_no = unique_cust_no();
-    // `unique_room_no` has a 3-digit (mod 999) namespace, so independent
+    // `unique_room_no` draws from a finite namespace, so independent
     // calls can in principle collide pairwise. Retry each draw until the
     // running set is unique — flaky CI run otherwise (room_b == room_a →
     // seed_room ON CONFLICT silently coalesces → only 2 distinct rooms

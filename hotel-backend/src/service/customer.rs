@@ -415,6 +415,13 @@ mod tests {
     use super::*;
     use crate::repository::customer::PgCustomerRepository;
 
+    /// The three DB-backed tests below share the `TEST_UC_%` marker
+    /// family and `cleanup()` sweeps by `LIKE 'TEST_UC_%'` — running them
+    /// in parallel lets one test's cleanup delete a sibling's seeded
+    /// customer mid-flight (observed 2026-06-12: `NotFound("customer N
+    /// does not exist")`). One lock keeps them deterministic.
+    static UC_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     async fn try_pool() -> Option<PgPool> {
         let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
             "postgresql://postgres:REDACTED-pg-2026@localhost:5439/hotelnew".to_string()
@@ -476,6 +483,7 @@ mod tests {
     /// CT-mirrored columns the edit form doesn't expose.
     #[tokio::test]
     async fn update_enqueues_resave_hydrated_from_canonical_row() {
+        let _guard = UC_TEST_LOCK.lock().await;
         let Some(pool) = try_pool().await else {
             eprintln!("skipping update_enqueues_resave — PG not reachable");
             return;
@@ -540,6 +548,7 @@ mod tests {
     /// first booking / check-in writeback carries current values.
     #[tokio::test]
     async fn update_skips_writeback_for_never_mirrored_customer() {
+        let _guard = UC_TEST_LOCK.lock().await;
         let Some(pool) = try_pool().await else {
             eprintln!("skipping update_skips_writeback — PG not reachable");
             return;
@@ -589,6 +598,7 @@ mod tests {
     /// `writeback_jobs.idempotency_key` of the first.
     #[tokio::test]
     async fn repeated_updates_enqueue_distinct_jobs() {
+        let _guard = UC_TEST_LOCK.lock().await;
         let Some(pool) = try_pool().await else {
             eprintln!("skipping repeated_updates — PG not reachable");
             return;

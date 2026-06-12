@@ -48,7 +48,11 @@ fn unique_cust_no() -> String {
 }
 
 fn unique_room_no() -> String {
-    format!("X{:03}", (rand::random::<u8>() as u16) % 999 + 1)
+    // 6-digit namespace (room_no is VARCHAR(10)): the old mod-999 space
+    // produced birthday collisions between parallel tests — two tests
+    // sharing one seeded room, then one's cleanup deleting it under the
+    // other (observed 2026-06-12 as fk_ht_br_room violations).
+    format!("X{:06}", unique_residue() % 1_000_000)
 }
 
 fn header_row(book_id: &str, cust_no: &str, status: &str, total: f64) -> HashMapRow {
@@ -791,7 +795,7 @@ async fn booking_apply_errors_when_room_unresolvable() {
     let pool = common::create_test_pool().await;
     let book_id = unique_book_id();
     let cust_no = unique_cust_no();
-    let missing_room = format!("M{:03}", unique_residue() % 999 + 1);
+    let missing_room = format!("M{:06}", unique_residue() % 1_000_000);
     sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = $1")
         .bind(&missing_room)
         .execute(&pool)

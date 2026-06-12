@@ -318,7 +318,7 @@ async fn room_master_clean_flip_emits_marked_clean_event() {
 
     // Create a real room (with a unique room_no) so the mapper has
     // something to UPSERT against.
-    let room_no = format!("Z{:03}", (rand::random::<u8>() as u16) % 999 + 1);
+    let room_no = format!("Z{:06}", unique_residue() % 1_000_000);
     let room_id: i32 = sqlx::query_scalar(
         "INSERT INTO ht_rooms_new (room_no, room_clean, room_notes) \
          VALUES ($1, false, 'TEST_phase52_room') \
@@ -396,7 +396,7 @@ async fn room_master_unchanged_clean_skips_event() {
     let pool = common::create_test_pool().await;
     let mapper = RoomMasterMapper;
 
-    let room_no = format!("Y{:03}", (rand::random::<u8>() as u16) % 999 + 1);
+    let room_no = format!("Y{:06}", unique_residue() % 1_000_000);
     let room_id: i32 = sqlx::query_scalar(
         "INSERT INTO ht_rooms_new (room_no, room_clean, room_notes) \
          VALUES ($1, true, 'TEST_phase52_room_idem') \
@@ -554,7 +554,7 @@ async fn room_master_auto_creates_unknown_room() {
     let pool = common::create_test_pool().await;
     let mapper = RoomMasterMapper;
 
-    let room_no = format!("Q{:03}", unique_residue() % 999 + 1);
+    let room_no = format!("Q{:06}", unique_residue() % 1_000_000);
     // Make sure the room genuinely doesn't exist.
     sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = $1")
         .bind(&room_no)
