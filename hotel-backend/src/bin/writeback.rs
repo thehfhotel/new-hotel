@@ -964,7 +964,14 @@ async fn resolve_legacy_ids(
                 });
             }
         }
-        MarkRoomClean { room_id, .. } => {
+        // MarkRoomDirty (audit 2026-06-11 P2) and SetRoomMaintenance share
+        // MarkRoomClean's resolution: both recipes key `HT_Rooms` by the
+        // numeric internal `id` (spike §3j critical finding), and the
+        // housekeeping recipes additionally need the display `room_no`
+        // for the `HT_Housewife` audit row + prior-occupant lookup.
+        MarkRoomClean { room_id, .. }
+        | MarkRoomDirty { room_id, .. }
+        | SetRoomMaintenance { room_id, .. } => {
             if let Some(row) = sqlx::query(
                 "SELECT legacy_room_no, legacy_room_id_int \
                  FROM ht_rooms_new WHERE aggregate_id = $1",
@@ -984,6 +991,12 @@ async fn resolve_legacy_ids(
         // before enqueue), so no PG lookup or self-heal is required at
         // this layer. Mirrors the `AdjustProductStock` resolution shape.
         UpdateRoom { .. } => {}
+        // Audit 2026-06-11 P2 — standalone customer-edit re-save. The
+        // payload's `resave.legacy_cust_no` carries the `Cust_no`
+        // business key directly (hydrated by `service::customer::update`
+        // before enqueue — the intent is only emitted for customers that
+        // already exist on the legacy side). Mirrors `UpdateRoom`.
+        UpdateCustomer { .. } => {}
         // Track G6 — `RecordPosSale`. Load the canonical `ht_pos_sales`
         // row joined with `ht_products` so the recipe consumes plain
         // fields (no sqlx). The check-in identifiers (`cin_no`, room)
@@ -1733,8 +1746,9 @@ async fn back_populate_legacy_ids(
                 .await?;
             }
         }
-        MarkRoomClean { .. } => {
-            // mark_clean doesn't allocate any new legacy IDs.
+        MarkRoomClean { .. } | MarkRoomDirty { .. } | SetRoomMaintenance { .. } => {
+            // The housekeeping / maintenance flag recipes don't allocate
+            // any new legacy IDs.
         }
         UpdateRoom { .. } => {
             // update_room doesn't allocate any new legacy IDs — the
@@ -1742,6 +1756,12 @@ async fn back_populate_legacy_ids(
             // column values. The canonical `ht_rooms_new.legacy_*`
             // back-link columns are populated by `backfill_rooms`, not
             // by recipe writebacks, so nothing to back-populate here.
+        }
+        UpdateCustomer { .. } => {
+            // update_customer doesn't allocate any new legacy IDs — the
+            // legacy `HT_Customers` row already exists (the intent is
+            // only emitted when `legacy_cust_no` is already known) and
+            // the recipe only shifts its column values.
         }
         // Track G4 / T4 HIGH-3 — RoomChange back-populates the freshly
         // allocated HT_Changed_Room.id onto ht_room_changes.rc_legacy_id

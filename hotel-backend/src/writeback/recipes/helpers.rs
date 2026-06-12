@@ -7,6 +7,7 @@
 //! literal in lock-step (drift across recipes would surface as parity
 //! errors against the legacy DB only after deployment).
 
+use crate::outbox::intent::CustomerResave;
 use crate::writeback::error::{WritebackError, WritebackResult};
 use crate::writeback::format::sql_quote;
 
@@ -66,6 +67,74 @@ pub fn guest_prefix_for_country(country: &str) -> &'static str {
     } else {
         "Mr."
     }
+}
+
+/// Build the `UPDATE [HT_Customers] SET ... where Cust_no=…` statement that
+/// re-saves the customer record exactly like the legacy .NET app does.
+///
+/// 31 SET fields in the canonical legacy order — verified from
+/// `/tmp/legacy-events-full.log` capture for `C21624` (line 3988):
+/// name, name2, Type, Type_main, Email, Add_*, Work_*, Work_tax,
+/// perfix, sex, IDcard, Contry. `[Cust_Type_main]` is lowercase m
+/// (distinct from the INSERT path's `[Cust_Type_Main]`); the WHERE
+/// clause uses lowercase `where`. Empty strings are written for fields
+/// the payload doesn't supply (legacy `''`-over-NULL convention,
+/// spike §3k).
+///
+/// Fired from two flows — extracted here per this module's charter so the
+/// SQL literal stays byte-identical at both call sites:
+/// * `booking_modify` (spike §3c lines 5/16/28 — the .NET app re-saves the
+///   customer on every booking modify);
+/// * `update_customer` (coexistence audit 2026-06-11 P2 — standalone
+///   customer-edit writeback).
+pub fn build_customer_resave_update(r: &CustomerResave) -> String {
+    let cust_no_q = sql_quote(&r.legacy_cust_no);
+    format!(
+        "UPDATE [HT_Customers] SET  [Cust_name]={name},[Cust_name2]={name2},\
+         [Cust_Type]={ctype},[Cust_Type_main]={ctype_main},[Cust_Email]={email},\
+         [Cust_Add_no]={add_no},[Cust_Add_moo]={add_moo},[Cust_Add_soi]={add_soi},\
+         [Cust_Add_road]={add_road},[Cust_Add_tambon]={add_tambon},\
+         [Cust_Add_ampore]={add_ampore},[Cust_Add_province]={add_province},\
+         [Cust_Add_code]={add_code},[Cust_Add_tel]={add_tel},[Cust_Add_fax]={add_fax},\
+         [Cust_Work_Name]={work_name},[Cust_Work_no]={work_no},[Cust_Work_moo]={work_moo},\
+         [Cust_Work_soi]={work_soi},[Cust_Work_road]={work_road},\
+         [Cust_Work_tambon]={work_tambon},[Cust_Work_ampore]={work_ampore},\
+         [Cust_Work_province]={work_province},[Cust_Work_code]={work_code},\
+         [Cust_Work_tel]={work_tel},[Cust_Work_fax]={work_fax},[Cust_Work_tax]={work_tax},\
+         [Cust_perfix]={perfix},[Cust_sex]={sex},[Cust_IDcard]={idcard},\
+         [Cust_Contry]={contry} where Cust_no={cust_no_q}",
+        name = sql_quote(&r.cust_name),
+        name2 = sql_quote(&r.cust_name2),
+        ctype = sql_quote(&r.cust_type),
+        ctype_main = sql_quote(&r.cust_type_main),
+        email = sql_quote(&r.cust_email),
+        add_no = sql_quote(&r.cust_add_no),
+        add_moo = sql_quote(&r.cust_add_moo),
+        add_soi = sql_quote(&r.cust_add_soi),
+        add_road = sql_quote(&r.cust_add_road),
+        add_tambon = sql_quote(&r.cust_add_tambon),
+        add_ampore = sql_quote(&r.cust_add_ampore),
+        add_province = sql_quote(&r.cust_add_province),
+        add_code = sql_quote(&r.cust_add_code),
+        add_tel = sql_quote(&r.cust_add_tel),
+        add_fax = sql_quote(&r.cust_add_fax),
+        work_name = sql_quote(&r.cust_work_name),
+        work_no = sql_quote(&r.cust_work_no),
+        work_moo = sql_quote(&r.cust_work_moo),
+        work_soi = sql_quote(&r.cust_work_soi),
+        work_road = sql_quote(&r.cust_work_road),
+        work_tambon = sql_quote(&r.cust_work_tambon),
+        work_ampore = sql_quote(&r.cust_work_ampore),
+        work_province = sql_quote(&r.cust_work_province),
+        work_code = sql_quote(&r.cust_work_code),
+        work_tel = sql_quote(&r.cust_work_tel),
+        work_fax = sql_quote(&r.cust_work_fax),
+        work_tax = sql_quote(&r.cust_work_tax),
+        perfix = sql_quote(&r.cust_perfix),
+        sex = sql_quote(&r.cust_sex),
+        idcard = sql_quote(&r.cust_idcard),
+        contry = sql_quote(&r.cust_contry),
+    )
 }
 
 #[cfg(test)]
