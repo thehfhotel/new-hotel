@@ -38,6 +38,10 @@ name = "backfill_legacy_bookings"
 path = "src/bin/backfill_legacy_bookings.rs"
 
 [[bin]]
+name = "backfill_customer_legacy_ids"
+path = "src/bin/backfill_customer_legacy_ids.rs"
+
+[[bin]]
 name = "create_user"
 path = "src/bin/create_user.rs"
 

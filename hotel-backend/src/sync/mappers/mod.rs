@@ -51,7 +51,7 @@ pub use coupon::apply_canonical_cupon_event;
 pub use customer::CustomerMapper;
 pub use guest_registry::GuestRegistryMapper;
 pub use mirror::{
-    BillDebtDsMirrorMapper, BillDebtHMirrorMapper, ChangedRoomMirrorMapper,
+    BillDebtDsMirrorMapper, BillDebtHMirrorMapper, BookProMirrorMapper, ChangedRoomMirrorMapper,
     CheckinProductMirrorMapper, CuponMirrorMapper, DepositMirrorMapper, RoomsCancelMirrorMapper,
 };
 pub use payment::{apply_payment_aggregate, PaymentMapper, ReceiptMapper};

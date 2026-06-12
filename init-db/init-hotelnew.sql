@@ -2041,5 +2041,45 @@ VALUES ('053', '053_level_drift_alert_cooldowns.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================
+-- Migration 056: legacy_mirror.ht_book_pro (Phase 5/E2)
+-- Mirrors migrations/pg/056_legacy_mirror_ht_book_pro.sql. Opaque
+-- pass-through mirror of `HT_Book_Pro` (pre-booked products attached to
+-- a booking by FrmAddBook2) — coexistence audit 2026-06-11 P2 gap; the
+-- new `BookProMirrorMapper` (sync/mappers/mirror.rs) populates it from
+-- CT once migrations/legacy-mssql/023 enables tracking. Also seeds the
+-- watcher's `legacy_sync_status` row and the per-table watermark from
+-- the current global watermark (0 on a fresh install).
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS legacy_mirror.ht_book_pro (
+    id            INTEGER          PRIMARY KEY,
+    b_no          TEXT,
+    b_room        TEXT,
+    b_name        TEXT,
+    b_unit        TEXT,
+    b_num         DOUBLE PRECISION,
+    b_price       DOUBLE PRECISION,
+    b_price_total DOUBLE PRECISION,
+    b_pro_id      INTEGER,
+    mirrored_at   TIMESTAMPTZ      NOT NULL DEFAULT now(),
+    mirror_source TEXT             NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ht_book_pro_b_no_idx
+    ON legacy_mirror.ht_book_pro (b_no);
+
+INSERT INTO legacy_sync_status (table_name)
+VALUES ('HT_Book_Pro')
+ON CONFLICT (table_name) DO NOTHING;
+
+INSERT INTO legacy_ct_state_per_table (table_name, last_seen_version)
+SELECT 'HT_Book_Pro',
+       COALESCE((SELECT last_seen_version FROM legacy_ct_state WHERE id = 1), 0)
+ON CONFLICT (table_name) DO NOTHING;
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('056', '056_legacy_mirror_ht_book_pro.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
 -- Initialization complete
 -- =============================================================================

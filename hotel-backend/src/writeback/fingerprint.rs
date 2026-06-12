@@ -91,8 +91,8 @@ pub const FINGERPRINTED_TABLES: &[&str] = WRITEBACK_FINGERPRINTED_TABLES;
 
 /// Track D / T7 HIGH-3 — additional CT-watched tables the CT-side
 /// fingerprint must cover. The writeback worker genuinely never writes
-/// these three mirror tables (`HT_Deposit`, `HT_Bill_Debt_H`,
-/// `HT_Bill_Debt_Ds`).
+/// these four mirror tables (`HT_Deposit`, `HT_Bill_Debt_H`,
+/// `HT_Bill_Debt_Ds`, `HT_Book_Pro`).
 ///
 /// 2026-06-11 audit (P1-8): `HT_CheckIn_Product` and
 /// `HT_CheckIn_Other_People` were moved OUT of this list into
@@ -102,6 +102,11 @@ pub const FINGERPRINTED_TABLES: &[&str] = WRITEBACK_FINGERPRINTED_TABLES;
 /// vendor drift on them. CT coverage is unchanged because the CT check
 /// verifies the union of both sets.
 ///
+/// Phase 5/E2 (2026-06-12) added `HT_Book_Pro` — newly CT-enabled
+/// (legacy-mssql migration 023) and mirrored by `BookProMirrorMapper`;
+/// read-only on the writeback side, so it belongs here, not in the
+/// writeback set.
+///
 /// The full CT-side fingerprint set is the union of
 /// [`WRITEBACK_FINGERPRINTED_TABLES`] + [`CT_EXTRA_FINGERPRINTED_TABLES`];
 /// see [`ct_fingerprinted_tables`] for the convenience accessor.
@@ -109,6 +114,7 @@ pub const CT_EXTRA_FINGERPRINTED_TABLES: &[&str] = &[
     "HT_Deposit",
     "HT_Bill_Debt_H",
     "HT_Bill_Debt_Ds",
+    "HT_Book_Pro",
 ];
 
 /// Union of the writeback + CT-extra fingerprint sets. Returned as
@@ -470,14 +476,19 @@ const EXPECTED_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
 pub const EXPECTED_FINGERPRINT: &str =
     "6b44ff897cee7a5d7982552c1ae230761663a593db6a102c09fdc42f7ade833f";
 
-/// Track D / T7 HIGH-3 — schema baseline for the 3 additional
+/// Track D / T7 HIGH-3 — schema baseline for the 4 additional
 /// CT-watched tables not covered by [`EXPECTED_SCHEMA_BASELINE`].
 /// Format identical: `(table, ordinal, column, data_type)` — derived
 /// from `docs/legacy-spike/schema/01-baseline-schema.txt` lines for
 /// each table (Bill_Debt_Ds: 92-100, Bill_Debt_H: 101-118,
-/// Deposit: 334-341). `HT_CheckIn_Other_People` (249-252) and
-/// `HT_CheckIn_Product` (275-286) moved into the writeback baseline —
-/// 2026-06-11 audit P1-8.
+/// Deposit: 334-341) and `hotel-backend/schema-baseline.txt` lines
+/// 179-187 for Book_Pro (Phase 5/E2, 2026-06-12).
+/// `HT_CheckIn_Other_People` (249-252) and `HT_CheckIn_Product`
+/// (275-286) moved into the writeback baseline — 2026-06-11 audit P1-8.
+///
+/// Tuple order MUST match the live `ORDER BY TABLE_NAME,
+/// ORDINAL_POSITION` of [`fetch_live_columns`]: Bill_Debt_Ds <
+/// Bill_Debt_H < Book_Pro < Deposit.
 ///
 /// Hashed independently of the writeback baseline so the writeback
 /// startup check stays orthogonal to the CT startup check.
@@ -512,6 +523,17 @@ const CT_EXTRA_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
     ("HT_Bill_Debt_H", 16, "Bill_Status", "varchar"),
     ("HT_Bill_Debt_H", 17, "Bill_by", "varchar"),
     ("HT_Bill_Debt_H", 18, "Bill_Note", "varchar"),
+    // HT_Book_Pro — schema-baseline.txt lines 179-187, 9 columns.
+    // Pre-booked products attached to a booking (Phase 5/E2).
+    ("HT_Book_Pro", 1, "id", "int"),
+    ("HT_Book_Pro", 2, "B_NO", "varchar"),
+    ("HT_Book_Pro", 3, "B_ROOM", "varchar"),
+    ("HT_Book_Pro", 4, "B_NAME", "varchar"),
+    ("HT_Book_Pro", 5, "B_UNIT", "varchar"),
+    ("HT_Book_Pro", 6, "B_NUM", "float"),
+    ("HT_Book_Pro", 7, "B_PRICE", "float"),
+    ("HT_Book_Pro", 8, "B_PRICE_TOTAL", "float"),
+    ("HT_Book_Pro", 9, "B_PRO_ID", "int"),
     // HT_Deposit — baseline lines 334-341, 8 columns
     ("HT_Deposit", 1, "id", "int"),
     ("HT_Deposit", 2, "Dep_no", "varchar"),
@@ -528,7 +550,7 @@ const CT_EXTRA_SCHEMA_BASELINE: &[(&str, i32, &str, &str)] = &[
 /// [`EXPECTED_FINGERPRINT`]). Verified by the
 /// [`tests::ct_extra_fingerprint_constant_matches_baseline`] test.
 pub const CT_EXTRA_EXPECTED_FINGERPRINT: &str =
-    "74f5cade6be923ff82c39f4033630e05801954f4fd243af30b2b93580d013260";
+    "78fb5d130ac1840f1b6dbe442b153a317128b148f6268d22303155af2e7406f1";
 
 /// Compute the fingerprint of a column-tuple slice.
 ///
@@ -579,7 +601,7 @@ pub async fn verify_schema_fingerprint(pool: &DbPool) -> WritebackResult<()> {
 ///
 /// Verifies BOTH the writeback baseline AND the CT-extra baseline,
 /// because the CT watcher pulls CT rows from every table the writeback
-/// touches PLUS the 5 additional mirror / TM.30 tables. The two
+/// touches PLUS the 4 additional CT-only mirror tables. The two
 /// fingerprints are hashed independently so a vendor drift on a CT-only
 /// table doesn't force a writeback baseline bump (and vice versa).
 ///
@@ -592,7 +614,7 @@ pub async fn verify_ct_schema_fingerprint(pool: &DbPool) -> WritebackResult<()> 
     //    pages BOTH workers, which is what we want (correlated outage).
     verify_schema_fingerprint(pool).await?;
 
-    // 2. CT-extra baseline — 3 tables the writeback never touches but
+    // 2. CT-extra baseline — 4 tables the writeback never touches but
     //    the CT watcher mirrors / will mirror.
     let live_rows = fetch_live_columns(pool, CT_EXTRA_FINGERPRINTED_TABLES).await?;
     let live_refs: Vec<(&str, i32, &str, &str)> = live_rows
@@ -606,9 +628,9 @@ pub async fn verify_ct_schema_fingerprint(pool: &DbPool) -> WritebackResult<()> 
             expected = CT_EXTRA_EXPECTED_FINGERPRINT,
             actual = %actual,
             "CT-extra fingerprint mismatch — refusing to start the CT watcher. \
-             A vendor change on HT_Deposit / HT_Bill_Debt_* would silently \
-             corrupt CT-mapped legacy_mirror.* rows. Re-audit + regenerate \
-             the baseline before retrying."
+             A vendor change on HT_Deposit / HT_Bill_Debt_* / HT_Book_Pro \
+             would silently corrupt CT-mapped legacy_mirror.* rows. Re-audit \
+             + regenerate the baseline before retrying."
         );
         return Err(WritebackError::SchemaDrift {
             expected: CT_EXTRA_EXPECTED_FINGERPRINT.to_string(),
@@ -768,8 +790,8 @@ mod tests {
     }
 
     /// Track D / T7 HIGH-3 — ct_fingerprinted_tables() returns the
-    /// union of writeback + CT-extra tables (23 tables today: 20
-    /// writeback-verified + 3 CT-only mirrors).
+    /// union of writeback + CT-extra tables (24 tables today: 20
+    /// writeback-verified + 4 CT-only mirrors).
     #[test]
     fn ct_fingerprinted_tables_returns_union_of_writeback_and_ct_extra() {
         let union = ct_fingerprinted_tables();
@@ -786,13 +808,14 @@ mod tests {
     }
 
     /// Track D / T7 HIGH-3, narrowed by the 2026-06-11 audit (P1-8) —
-    /// the CT-extra set is exactly the 3 mirror tables the writeback
+    /// the CT-extra set is exactly the 4 mirror tables the writeback
     /// worker never writes. `HT_CheckIn_Product` and
     /// `HT_CheckIn_Other_People` moved into the writeback set because
-    /// recipes DO write them.
+    /// recipes DO write them; `HT_Book_Pro` joined with Phase 5/E2
+    /// (read-only on the writeback side).
     #[test]
     fn ct_extra_fingerprinted_tables_matches_audit_set() {
-        let expected = ["HT_Deposit", "HT_Bill_Debt_H", "HT_Bill_Debt_Ds"];
+        let expected = ["HT_Deposit", "HT_Bill_Debt_H", "HT_Bill_Debt_Ds", "HT_Book_Pro"];
         assert_eq!(CT_EXTRA_FINGERPRINTED_TABLES, &expected);
     }
 
@@ -822,6 +845,7 @@ mod tests {
         let cases: &[(&str, usize)] = &[
             ("HT_Bill_Debt_Ds", 9),
             ("HT_Bill_Debt_H", 18),
+            ("HT_Book_Pro", 9),
             ("HT_Deposit", 8),
         ];
         for (table, expected_count) in cases {
