@@ -31,7 +31,7 @@ jobs:
       - name: Checkout
         # v6 pinned to commit SHA — matches docker-build.yml SHA used for
         # the equivalent `actions/checkout@v5.0.0` pin. Supply-chain hygiene.
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6 (matches docker-build.yml)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6 (matches docker-build.yml)
 
       - name: Setup Node.js
         # v4 pinned to commit SHA (resolved from `gh api git/refs/tags/v4`).
