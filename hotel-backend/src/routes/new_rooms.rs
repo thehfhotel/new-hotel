@@ -328,7 +328,12 @@ pub async fn update_room(
             notes: body.notes.clone(),
         },
     };
-    let idempotency_key = generate_idempotency_key(&intent, aggregate_id);
+    // Per-event discriminator key (2026-06-12 audit follow-up): rooms are
+    // edited repeatedly over their lifetime and completed jobs persist as
+    // status='done' rows, so the deterministic (intent, aggregate) key
+    // would hard-fail the SECOND edit of the same room with a unique
+    // violation on `writeback_jobs.idempotency_key`.
+    let idempotency_key = generate_idempotency_key(&intent, Uuid::new_v4());
     OutboxRepository::enqueue(&mut tx, &intent, idempotency_key)
         .await
         .map_err(ApiError::from)?;

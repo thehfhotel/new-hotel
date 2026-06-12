@@ -91,7 +91,14 @@ impl HousekeepingService {
             room_id: aggregate_id,
             by: cmd.by.clone(),
         };
-        let key = generate_idempotency_key(&intent, aggregate_id);
+        // Repeatable-per-aggregate intent: the SECOND occurrence for the
+        // same aggregate would collide on the permanently-retained
+        // `writeback_jobs.idempotency_key` UNIQUE if we used the
+        // deterministic (intent, aggregate) key — completed jobs stay as
+        // status='done' rows. Per-event v4 discriminator instead (same
+        // precedent as payment/customer-update; see outbox/idempotency.rs
+        // "caller adds a discriminator"). 2026-06-12 audit follow-up.
+        let key = generate_idempotency_key(&intent, uuid::Uuid::new_v4());
         OutboxRepository::enqueue(&mut tx, &intent, key)
             .await
             .map_err(ServiceError::from_enqueue_error)?;
