@@ -329,17 +329,79 @@ async fn apply_room_upsert(
             (ex.room_id, agg_id, ex.room_clean)
         }
         None => {
-            // Don't auto-create rooms here. Room creation in our app is
-            // an operator action (admin UI or `bin/backfill_rooms`). A
-            // CT row for a room we've never seen probably means the
-            // backfill hasn't run yet — log and skip.
+            // 2026-06-12 (audit follow-up): AUTO-CREATE. The previous
+            // skip-and-advance here was the root of a coherent silent-
+            // loss family — a room created in iHOTEL's FrmManageRoom
+            // and sold before `backfill_rooms` ran never reached PG, so
+            // every downstream `HT_Room_Status` tile and booking room
+            // line referencing it was dropped too (adversarial review,
+            // `docs/audits/2026-06-11-ihotel-coexistence-audit.md`).
+            // Both production sites verified clean of orphan room
+            // references (2026-06-12), so a minimal row is always
+            // creatable: `room_no` is the only required column;
+            // `room_type_id` / prices stay NULL until the rate-tier
+            // poll or an operator enriches them (`fk_ht_rooms_type`
+            // tolerates NULL). ON CONFLICT guards the room_no race.
+            // `HT_Rooms` polls before `HT_Room_Status`/booking tables
+            // inside a tick, so dependents resolve in the same tick.
             tracing::info!(
                 table = ROOMS_TABLE,
                 legacy_id = projected.legacy_id,
                 room_no = %projected.room_no,
-                "HT_Rooms CT row for unknown room — skipping (run backfill_rooms first)"
+                "HT_Rooms CT row for unknown room — auto-creating canonical row \
+                 (room_type/prices pending rate sync or operator enrichment)"
             );
-            return Ok(None);
+            let (room_id,): (i32,) = sqlx::query_as(
+                "INSERT INTO ht_rooms_new ( \
+                    room_no, room_clean, room_maintenance, room_notes, \
+                    legacy_room_no, legacy_room_id_int, \
+                    room_use_count, room_x, room_y, room_group, \
+                    room_power_open, room_power_close, room_power_status, \
+                    room_polity \
+                 ) VALUES ( \
+                    $1, COALESCE($2, true), COALESCE($3, false), $4, \
+                    $1, $5, \
+                    COALESCE($6, 0), COALESCE($7, 0), COALESCE($8, 0), $9, \
+                    $10, $11, COALESCE($12, 'off'), \
+                    COALESCE($13, 1) \
+                 ) \
+                 ON CONFLICT (room_no) DO UPDATE SET \
+                    legacy_room_id_int = EXCLUDED.legacy_room_id_int, \
+                    updated_at         = NOW() \
+                 RETURNING room_id",
+            )
+            .bind(&projected.room_no)
+            .bind(new_clean)
+            .bind(new_maintenance)
+            .bind(&projected.room_details)
+            .bind(projected.legacy_id)
+            .bind(projected.room_use_count)
+            .bind(projected.room_x)
+            .bind(projected.room_y)
+            .bind(&projected.room_group)
+            .bind(&projected.room_power_open)
+            .bind(&projected.room_power_close)
+            .bind(&projected.room_power_status)
+            .bind(projected.room_polity)
+            .fetch_one(&mut **tx)
+            .await?;
+
+            // aggregate_id derives from the SERIAL room_id, so it can
+            // only be stamped post-INSERT (write-once, same as the
+            // customer eager-mirror).
+            let agg_id = aggregate_uuid(AggregateKind::Room, room_id);
+            sqlx::query(
+                "UPDATE ht_rooms_new SET aggregate_id = $1 \
+                  WHERE room_id = $2 AND aggregate_id IS NULL",
+            )
+            .bind(agg_id)
+            .bind(room_id)
+            .execute(&mut **tx)
+            .await?;
+
+            // prior_clean = None: a freshly-created room never emits a
+            // clean/dirty flip event below.
+            (room_id, agg_id, None)
         }
     };
     let _ = room_id;

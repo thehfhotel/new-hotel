@@ -821,13 +821,23 @@ struct ResolvedRoomLine {
     price_per_night: Option<f64>,
 }
 
-/// Resolve every projection room line against `ht_rooms_new`. Lines
-/// whose room is missing are warn-skipped (the room backfill is an
-/// operator action) — the RESOLVED set is what both `existing_matches`
-/// (count) and `replace_rooms` (content) operate on, so the idempotency
-/// comparison and the junction mutation can never disagree (2026-06-11
-/// fix for the forever-re-emitting `BookingModified` loop on
-/// unresolvable lines).
+/// Resolve every projection room line against `ht_rooms_new`. The
+/// RESOLVED set is what both `existing_matches` (count) and
+/// `replace_rooms` (content) operate on, so the idempotency comparison
+/// and the junction mutation can never disagree (2026-06-11 fix for the
+/// forever-re-emitting `BookingModified` loop on unresolvable lines).
+///
+/// Miss handling (2026-06-12, audit follow-up — matches the checkin
+/// mapper's posture):
+/// - BLANK `room_no` → debug-skip. Observed in production on cancelled
+///   lines (e.g. R014826 carries `Book_Room_Type=''`); a retry can never
+///   learn more, and erroring would be a data-quality poison pill.
+/// - NON-BLANK miss → error (watermark hold + retry). The room master
+///   mapper auto-creates unknown rooms from their own `HT_Rooms` CT row
+///   (polled earlier in the same tick), so a persistent miss means the
+///   room genuinely doesn't exist in `HT_Rooms` — operator-page
+///   territory, not silent-drop territory. Both sites verified clean of
+///   orphan room references (2026-06-12).
 async fn resolve_room_lines(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     book_id: &str,
@@ -835,6 +845,14 @@ async fn resolve_room_lines(
 ) -> Result<Vec<ResolvedRoomLine>, SyncError> {
     let mut out = Vec::with_capacity(rooms.len());
     for r in rooms {
+        if r.room_no.trim().is_empty() {
+            tracing::debug!(
+                book_id,
+                "ht_booking_rooms line skipped: blank room_no (cancelled-line \
+                 data shape); excluded from junction + idempotency count"
+            );
+            continue;
+        }
         let room_id_row: Option<(i32,)> = sqlx::query_as(
             "SELECT room_id FROM ht_rooms_new WHERE room_no = $1 LIMIT 1",
         )
@@ -847,13 +865,16 @@ async fn resolve_room_lines(
                 price_per_night: r.price_per_night,
             }),
             None => {
-                tracing::warn!(
-                    book_id,
-                    room_no = %r.room_no,
-                    "ht_booking_rooms line skipped: room_no not found in \
-                     ht_rooms_new (run bin/backfill_rooms); line excluded \
-                     from both the junction and the idempotency count"
-                );
+                return Err(SyncError::Mapper {
+                    table: BOOK_DS_TABLE,
+                    message: format!(
+                        "booking {book_id}: room '{}' not in ht_rooms_new — \
+                         holding watermark for retry (room mapper auto-creates \
+                         on the room's own CT row; persistent recurrence means \
+                         the room is missing from HT_Rooms itself)",
+                        r.room_no
+                    ),
+                });
             }
         }
     }

@@ -141,20 +141,29 @@ async fn apply_upsert(
 ) -> Result<Option<DomainEvent>, SyncError> {
     let projection = project_row(row, legacy_id)?;
 
-    // Resolve the FKs. Room is required (defer-then-skip on miss);
-    // booking + checkin are optional best-effort lookups so a slow
-    // parent doesn't strand the calendar tile.
+    // Resolve the FKs. Room is REQUIRED and a miss is an error
+    // (watermark hold + retry) as of 2026-06-12: the room master
+    // mapper now auto-creates unknown rooms, and `HT_Rooms` polls
+    // before `HT_Room_Status` within a tick, so a miss here is either
+    // a transient ordering race (next tick resolves it) or genuine
+    // corruption worth an operator page. The previous warn-skip
+    // dropped the tile permanently (adversarial review,
+    // `docs/audits/2026-06-11-ihotel-coexistence-audit.md`). Booking +
+    // checkin stay optional best-effort lookups so a slow parent
+    // doesn't strand the calendar tile.
     let Some(room_id) =
         resolve::resolve_room_id(tx, Some(projection.room_no.as_str())).await?
     else {
-        tracing::warn!(
-            table = TABLE,
-            legacy_id,
-            room_no = %projection.room_no,
-            "ht_room_calendar apply skipped: unknown room \
-             (run bin/backfill_rooms?)"
-        );
-        return Ok(None);
+        return Err(SyncError::Mapper {
+            table: TABLE,
+            message: format!(
+                "unknown room '{}' for calendar tile legacy_id={legacy_id} — \
+                 holding watermark for retry (room mapper auto-creates on the \
+                 room's own CT row; persistent recurrence means the room is \
+                 missing from HT_Rooms itself)",
+                projection.room_no
+            ),
+        });
     };
 
     let book_id_opt =

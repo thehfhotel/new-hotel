@@ -544,3 +544,92 @@ async fn customer_delete_resolves_by_legacy_id_alone() {
         .await
         .ok();
 }
+
+/// 2026-06-12 (audit follow-up) — a `HT_Rooms` CT row for a room PG has
+/// never seen must AUTO-CREATE the canonical row (pre-fix: info-skip,
+/// which silently dropped every downstream calendar tile / booking line
+/// for a room created in iHOTEL and sold before `backfill_rooms` ran).
+#[tokio::test]
+async fn room_master_auto_creates_unknown_room() {
+    let pool = common::create_test_pool().await;
+    let mapper = RoomMasterMapper;
+
+    let room_no = format!("Q{:03}", unique_residue() % 999 + 1);
+    // Make sure the room genuinely doesn't exist.
+    sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = $1")
+        .bind(&room_no)
+        .execute(&pool)
+        .await
+        .ok();
+    let legacy_id: i32 = 9_000_000 + (unique_residue() % 900_000) as i32;
+
+    let row = HashMapRow::new("HT_Rooms")
+        .with("id", MockValue::I32(legacy_id))
+        .with("Room_no", MockValue::Str(room_no.clone()))
+        .with("Room_Type", MockValue::Str("Standard".into()))
+        .with("Room_Clean", MockValue::Str("yes".into()))
+        .with("Room_Use", MockValue::Str("no".into()))
+        .with("Room_Manternace", MockValue::Str("no".into()))
+        .with("Room_Details", MockValue::Str("TEST_autocreate".into()))
+        .with("Room_Use_Count", MockValue::Null)
+        .with("Room_X", MockValue::Null)
+        .with("Room_Y", MockValue::Null)
+        .with("Room_Group", MockValue::Null)
+        .with("Room_Power_OPEN", MockValue::Null)
+        .with("Room_Power_CLOSE", MockValue::Null)
+        .with("Room_Power_STATUS", MockValue::Null)
+        .with("Room_Polity", MockValue::Null);
+
+    let mut tx = pool.begin().await.unwrap();
+    mapper
+        .apply(&mut tx, ChangeOp::Insert, Some(&row))
+        .await
+        .expect("unknown room must auto-create, not skip/error");
+    tx.commit().await.unwrap();
+
+    let (room_id, clean, notes): (i32, Option<bool>, Option<String>) = sqlx::query_as(
+        "SELECT room_id, room_clean, room_notes \
+           FROM ht_rooms_new WHERE room_no = $1",
+    )
+    .bind(&room_no)
+    .fetch_one(&pool)
+    .await
+    .expect("auto-created room row must exist");
+    assert_eq!(clean, Some(true));
+    assert_eq!(notes.as_deref(), Some("TEST_autocreate"));
+
+    let (legacy_no, legacy_int, agg_id): (Option<String>, Option<i32>, Option<uuid::Uuid>) =
+        sqlx::query_as(
+            "SELECT legacy_room_no, legacy_room_id_int, aggregate_id \
+               FROM ht_rooms_new WHERE room_id = $1",
+        )
+        .bind(room_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(legacy_no.as_deref(), Some(room_no.as_str()));
+    assert_eq!(legacy_int, Some(legacy_id));
+    assert!(agg_id.is_some(), "aggregate_id must be stamped post-INSERT");
+
+    // Idempotent re-apply: must route through the UPDATE arm now.
+    let mut tx = pool.begin().await.unwrap();
+    mapper
+        .apply(&mut tx, ChangeOp::Update, Some(&row))
+        .await
+        .expect("re-apply must hit the existing-row arm");
+    tx.commit().await.unwrap();
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM ht_rooms_new WHERE room_no = $1",
+    )
+    .bind(&room_no)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1, "re-apply must not duplicate the room");
+
+    sqlx::query("DELETE FROM ht_rooms_new WHERE room_id = $1")
+        .bind(room_id)
+        .execute(&pool)
+        .await
+        .ok();
+}

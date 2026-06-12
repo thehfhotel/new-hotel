@@ -780,3 +780,79 @@ async fn type1_booking_applies_header_only_and_reapply_is_idempotent() {
 
     cleanup(&pool, &book_id, &cust_no, "no-room-seeded").await;
 }
+
+/// 2026-06-12 (audit follow-up) — a booking room line whose room_no is
+/// NOT in `ht_rooms_new` must ERROR (watermark hold) instead of the old
+/// warn-skip that converged the junction to the dropped state. The room
+/// master mapper auto-creates rooms from their own CT row, so this only
+/// fires for genuinely-missing rooms.
+#[tokio::test]
+async fn booking_apply_errors_when_room_unresolvable() {
+    let pool = common::create_test_pool().await;
+    let book_id = unique_book_id();
+    let cust_no = unique_cust_no();
+    let missing_room = format!("M{:03}", unique_residue() % 999 + 1);
+    sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = $1")
+        .bind(&missing_room)
+        .execute(&pool)
+        .await
+        .ok();
+    let _cust = seed_customer(&pool, &cust_no).await;
+
+    let aggregate = BookingAggregate {
+        header: Some(header_row(&book_id, &cust_no, "จอง", 500.0)),
+        rooms: vec![ds_row(&book_id, &missing_room, 500.0)],
+        nights: vec![],
+    };
+
+    let mut tx = pool.begin().await.expect("begin");
+    let result = apply_booking_aggregate(&mut tx, None, &aggregate, &book_id).await;
+    tx.rollback().await.ok();
+    assert!(
+        result.is_err(),
+        "non-blank unresolvable room line must error (watermark hold), got {result:?}"
+    );
+
+    cleanup(&pool, &book_id, &cust_no, &missing_room).await;
+}
+
+/// Companion: a BLANK room_no line (observed on cancelled legacy lines,
+/// e.g. R014826 with Book_Room_Type='') is a data-quality skip — the
+/// apply succeeds and the blank line is simply excluded.
+#[tokio::test]
+async fn booking_blank_room_line_is_skipped_not_errored() {
+    let pool = common::create_test_pool().await;
+    let book_id = unique_book_id();
+    let cust_no = unique_cust_no();
+    let room_no = unique_room_no();
+    let _cust = seed_customer(&pool, &cust_no).await;
+    let _room = seed_room(&pool, &room_no).await;
+
+    let aggregate = BookingAggregate {
+        header: Some(header_row(&book_id, &cust_no, "จอง", 700.0)),
+        rooms: vec![
+            ds_row(&book_id, &room_no, 700.0),
+            ds_row(&book_id, "", 0.0), // blank line — must be skipped
+        ],
+        nights: vec![],
+    };
+
+    let mut tx = pool.begin().await.expect("begin");
+    apply_booking_aggregate(&mut tx, None, &aggregate, &book_id)
+        .await
+        .expect("blank room line must be skipped, not errored");
+    tx.commit().await.expect("commit");
+
+    let junction: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM ht_booking_rooms br \
+          JOIN ht_bookings b ON b.book_id = br.br_book_id \
+         WHERE b.legacy_book_id = $1",
+    )
+    .bind(&book_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(junction, 1, "only the resolvable line lands in the junction");
+
+    cleanup(&pool, &book_id, &cust_no, &room_no).await;
+}

@@ -249,3 +249,31 @@ async fn room_calendar_legacy_id_rebind_to_new_slot_does_not_error() {
 
     cleanup_calendar_fixture(&pool, REBIND_LEGACY_ID, REBIND_ROOM_A_NO, REBIND_ROOM_B_NO).await;
 }
+
+/// 2026-06-12 (audit follow-up) — a calendar tile referencing a room PG
+/// doesn't know must ERROR (watermark hold + retry) instead of the old
+/// warn-skip that dropped the tile permanently. The room master mapper
+/// auto-creates unknown rooms from their own `HT_Rooms` CT row, which
+/// polls earlier in the same tick — so this only fires on genuine
+/// corruption.
+#[tokio::test]
+async fn room_calendar_unknown_room_errors_instead_of_skipping() {
+    let pool = common::create_test_pool().await;
+    let missing_room = "RCAL-GONE";
+    sqlx::query("DELETE FROM ht_rooms_new WHERE room_no = $1")
+        .bind(missing_room)
+        .execute(&pool)
+        .await
+        .ok();
+
+    let row = make_row(1_999_999_803, missing_room, "เข้าพัก");
+    let mut tx = pool.begin().await.expect("begin");
+    let result = RoomCalendarMapper
+        .apply(&mut tx, ChangeOp::Insert, Some(&row))
+        .await;
+    tx.rollback().await.ok();
+    assert!(
+        result.is_err(),
+        "unknown room must hold the watermark, got {result:?}"
+    );
+}
