@@ -125,12 +125,46 @@ guest-registry, and mirror dual-write call sites never received it.
 - Test determinism → `d96a4ed`: weak fixture suffixes + shared-fixture
   races across 8 integration files.
 
-**Still open (deliberate decisions, not defects)** — P2 items requiring
-product/ops choices: customer-edit + mark-dirty + maintenance writeback
-intents, POS/refund `HT_Receipt_*` emission (VAT scope), `HT_Book_Pro`
-mapper, `Total_Price_vat` capture verification, round-bill gate warning,
-`SYNC_PER_TABLE_WATERMARK` enablement (env flip at next deploy), one-shot
-`legacy_id` backfill for pre-055 customer rows.
+**P2 implementation wave (2026-06-12, user-approved):**
+
+- ~~Customer-edit + mark-dirty + maintenance writeback intents~~ — DONE
+  (`6ed2018`): `UpdateCustomer` (31-field re-save hydrated from canonical
+  so iHOTEL-entered fields are never blanked; deletes deliberately NOT
+  written back — iHOTEL's delete is a destructive C0000 cascade),
+  `MarkRoomDirty` (§3.13 + HT_Housewife start row), `SetRoomMaintenance`
+  (`Room_Manternace` flip only, on actual change), plus the round-bill
+  gate warning (`writeback_no_open_round`, log-only, never blocks).
+- ~~`HT_Book_Pro` ingestion~~ — DONE (`7c8a5d8`): legacy migration 023
+  (PK + CT enable, apply at the next maintenance window per the
+  established mapper-ships-with-DDL pattern), PG migration 056
+  (`legacy_mirror.ht_book_pro`), `BookProMirrorMapper`, watcher seeds
+  following the 033/050 new-table pattern. The booking→check-in product
+  TRANSFER (Book_Pro → HT_CheckIn_Product at conversion) is documented
+  as a TODO in the mapper module doc — the `B_PRO_ID`→`Pro_no` mapping
+  needs decompile/capture verification first.
+- ~~`legacy_id` backfill~~ — DONE (`7c8a5d8`):
+  `bin/backfill_customer_legacy_ids` (chunked, idempotent, `--dry-run`;
+  run per site post-deploy).
+- ~~Room-FK silent-loss family~~ — DONE (`7e76e9b`): room master mapper
+  auto-creates unknown rooms; calendar + booking-line misses now hold
+  the watermark. Gated on a production data-quality check (2026-06-12,
+  both sites: zero orphan room references; PG mirrors 58/58 + 34/34).
+- ~~Repeatable-intent idempotency keys~~ — DONE (`2453776`, found during
+  this wave): ModifyBooking/ExtendStay/RoomChange/MarkRoomClean/
+  UpdateRoom switched to per-event discriminator keys; the deterministic
+  key + permanently-retained done jobs would have 409'd the second
+  occurrence per aggregate.
+
+**Still open (genuinely needs a human decision / external action):**
+- POS/refund `HT_Receipt_*` emission (VAT scope — decide with finance).
+- `Total_Price_vat` + extend-stay `Total_Price_Net` semantics — need ONE
+  fresh capture on a product-bearing folio (receptionist-coordinated).
+- `SYNC_PER_TABLE_WATERMARK=true` env flip — defense-in-depth only now;
+  flip at a monitored deploy window (suggest hfville first).
+- Apply `migrations/legacy-mssql/023` at both sites (Sch-M window), then
+  run `backfill_customer_legacy_ids --dry-run` → live, per site.
+- `HT_Products_Price` / `HT_Receipt_Ds` ingestion (023/056 pair is the
+  template).
 
 ### Adversarial re-verification (independent reviewer, same day)
 
