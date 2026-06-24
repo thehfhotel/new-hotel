@@ -468,11 +468,17 @@ fn build_ledger_insert_sql(
     aggregate_id: Uuid,
     legacy_ids_json: &str,
 ) -> String {
-    let json = legacy_ids_json.replace('\'', "''");
+    // Route the JSON literal through the writeback layer's shared quoter (the
+    // same single-quote-doubling the recipes use) instead of hand-rolling it.
+    // `sql_quote` returns the value WRAPPED in single quotes, so the NVARCHAR
+    // literal is `N` + the quoted value. idempotency_key / aggregate_id are
+    // UUIDs and intent_name is a static identifier literal — none can carry a
+    // quote — so they stay as plain quoted interpolations.
+    let json = crate::writeback::format::sql_quote(legacy_ids_json);
     format!(
         "INSERT INTO dbo.ht_writeback_ledger \
             (idempotency_key, intent_name, aggregate_id, legacy_ids, applied_at) \
-         VALUES ('{idempotency_key}', '{intent_name}', '{aggregate_id}', N'{json}', GETDATE())"
+         VALUES ('{idempotency_key}', '{intent_name}', '{aggregate_id}', N{json}, GETDATE())"
     )
 }
 

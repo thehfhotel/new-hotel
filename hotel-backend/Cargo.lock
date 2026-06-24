@@ -876,7 +876,6 @@ dependencies = [
  "tiberius",
  "tokio",
  "tokio-cron-scheduler",
- "tokio-util",
  "tower-http",
  "tracing",
  "tracing-subscriber",
