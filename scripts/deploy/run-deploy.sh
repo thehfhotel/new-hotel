@@ -254,6 +254,33 @@ wait_healthy new-hotel-db 120
 ./scripts/migrate.sh
 ./scripts/migrate.sh --site hfville
 
+# --- legacy SQL Server migrations (Change-Tracking prerequisite DDL) ---------
+# Auto-applied on every deploy, same as PG migrations. Incident 2026-06-24: a
+# binary that added HT_Book_Pro to the CT watch list shipped BEFORE its
+# 023_book_pro_ct.sql prerequisite was applied, so the watcher spammed "Change
+# tracking is not enabled" ~1/sec per site. The runner is idempotent (only
+# PENDING migrations in dbo.ht_legacy_migrations run) and sets a bounded
+# LOCK_TIMEOUT so a busy table fails fast (error 1222) instead of holding a
+# Sch-M lock that would block the live iHOTEL app.
+./scripts/migrate-legacy-mssql.sh --site hfhotel
+./scripts/migrate-legacy-mssql.sh --site hfville
+
+# --- pre-worker CT gate ------------------------------------------------------
+# Confirm every table THIS binary expects Change Tracking on is actually
+# CT-enabled on BOTH legacy servers before the CT watcher starts. Single source
+# of truth: the table list comes from the freshly-pulled backend image itself
+# (`sync --print-ct-tables`), so there is no Rust-vs-shell list drift. A miss
+# fails the deploy HERE rather than letting the watcher error ~1/sec post-start.
+BACKEND_IMAGE="ghcr.io/thehfhotel/new-hotel-backend:latest"
+EXPECTED_CT=$(docker run --rm --entrypoint ./sync "$BACKEND_IMAGE" --print-ct-tables)
+if [ -z "$EXPECTED_CT" ]; then
+  echo "::error::could not read expected CT tables from $BACKEND_IMAGE (--print-ct-tables empty)"
+  exit 1
+fi
+echo "$EXPECTED_CT" | ./scripts/migrate-legacy-mssql.sh --site hfhotel --verify-ct
+echo "$EXPECTED_CT" | ./scripts/migrate-legacy-mssql.sh --site hfville --verify-ct
+echo "[deploy] legacy migrations applied + CT verified on both sites"
+
 docker compose up -d
 wait_healthy new-hotel-production-backend-1 90
 wait_healthy new-hotel-production-web-1 60
@@ -293,15 +320,51 @@ else
   docker logs new-hotel-production-writeback-1 --tail 50 2>&1 || true
 fi
 
-# CT-watcher: "running" or "exited" are both expected (controlled by LEGACY_SYNC_ENABLED).
-SYNC_STATUS=$(docker inspect --format='{{.State.Status}}' new-hotel-production-sync-1 2>/dev/null || echo "not_found")
-case "$SYNC_STATUS" in
-  running) echo "[deploy] CT-watcher running (LEGACY_SYNC_ENABLED=true)" ;;
-  exited)  echo "[deploy] CT-watcher exited cleanly (LEGACY_SYNC_ENABLED=false — expected default)" ;;
-  not_found) echo "::warning::CT-watcher container missing — verify docker-compose.yml sync service block" ;;
-  *) echo "::warning::CT-watcher unexpected state: $SYNC_STATUS"
-     docker logs new-hotel-production-sync-1 --tail 50 2>&1 || true ;;
-esac
+# CT-watcher: "running" is healthy; "exited" is OK ONLY with exit code 0
+# (LEGACY_SYNC_ENABLED=false exits Ok(0)). A NON-ZERO exit means the watcher
+# REFUSED to start — the CT-enablement self-guard (incident 2026-06-24),
+# retention overflow, or a crash — and must fail the deploy, not be mistaken
+# for a clean disable (the pre-2026-06-24 check silently accepted any "exited").
+# Both sites are checked (the old check only covered HF Hotel).
+check_ct_watcher() {
+  local c=$1 status exitcode
+  status=$(docker inspect --format='{{.State.Status}}' "$c" 2>/dev/null || echo "not_found")
+  case "$status" in
+    running) echo "[deploy] $c running" ;;
+    exited)
+      exitcode=$(docker inspect --format='{{.State.ExitCode}}' "$c" 2>/dev/null || echo "?")
+      if [ "$exitcode" = "0" ]; then
+        echo "[deploy] $c exited cleanly (code 0 — LEGACY_SYNC_ENABLED=false)"
+      else
+        echo "::error::$c exited code $exitcode — watcher REFUSED to start (CT gap / retention / crash)"
+        docker logs "$c" --tail 60 2>&1 || true
+        return 1
+      fi ;;
+    not_found) echo "::warning::$c container missing — verify docker-compose.yml" ;;
+    *) echo "::warning::$c unexpected state: $status"; docker logs "$c" --tail 50 2>&1 || true ;;
+  esac
+  return 0
+}
+check_ct_watcher new-hotel-production-sync-1 || exit 1
+check_ct_watcher new-hotel-production-sync-hfville-1 || exit 1
+
+# Per-table sync health (warning, not hard-fail — a transient MSSQL blip during
+# the deploy window can momentarily bump a counter that the next successful poll
+# resets; hard-failing on that would be flaky). The CT gate above is the
+# deploy-blocking check; this surfaces residual issues (e.g. a mapper erroring)
+# loudly so the operator sees them. consecutive_failures lives in PG and resets
+# to 0 on the next successful per-table poll.
+for sdb in hotelnew hotelville; do
+  fails=$(docker exec new-hotel-db psql -U postgres -d "$sdb" -At \
+    -c "SELECT COALESCE(SUM(consecutive_failures),0) FROM legacy_sync_status" 2>/dev/null || echo "?")
+  if [ "$fails" = "0" ]; then
+    echo "[deploy] $sdb: legacy_sync_status clean (0 consecutive_failures)"
+  else
+    echo "::warning::$sdb has legacy_sync_status consecutive_failures=$fails — investigate"
+    docker exec new-hotel-db psql -U postgres -d "$sdb" \
+      -c "SELECT table_name, consecutive_failures, LEFT(last_error,80) AS last_error FROM legacy_sync_status WHERE consecutive_failures > 0 ORDER BY consecutive_failures DESC" 2>&1 || true
+  fi
+done
 
 echo "[deploy] done $(date -Iseconds) commit=$COMMIT_SHA log=$LOG_FILE"
 

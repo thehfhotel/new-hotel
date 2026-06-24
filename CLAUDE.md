@@ -224,6 +224,30 @@ Migrations are **automated** via `scripts/migrate.sh`, which runs during CI/CD d
 
 The pipeline will automatically: create a backup, apply pending migrations in transactions, and track them in the `schema_migrations` table. See `migrations/README.md` for details.
 
+### Legacy-MSSQL migrations are also automated (since 2026-06-24)
+
+`migrations/legacy-mssql/` (Change-Tracking prerequisite DDL on the shared
+legacy SQL Server) is **no longer applied by hand**. The deploy
+(`scripts/deploy/run-deploy.sh`) runs `scripts/migrate-legacy-mssql.sh` for both
+sites, then a **pre-worker CT gate** verifies every table the binary expects CT
+on (from `sync --print-ct-tables` — single source of truth) is actually
+CT-enabled on both servers, failing the deploy otherwise. Tracking is
+`dbo.ht_legacy_migrations` on each server (analog of `schema_migrations`).
+
+When adding a CT-enabled table:
+1. Add the `NNN_*.sql` to `migrations/legacy-mssql/` — **idempotent** (`IF NOT
+   EXISTS` guards); `GO` between `ALTER COLUMN NOT NULL` and `ADD CONSTRAINT PK`.
+   The runner sets a bounded `LOCK_TIMEOUT` so a busy table fails fast instead of
+   blocking the live iHOTEL app.
+2. Add the table to `CT_ENABLED_TABLES` in `hotel-backend/src/bin/sync.rs` (the
+   `--print-ct-tables` / CT-gate contract) **and** wire its mapper.
+3. The deploy applies the migration before starting workers; the binary also
+   self-guards at startup (refuses to start with one alert, not 1/sec spam, if a
+   table lacks CT — override `LEGACY_SYNC_ALLOW_CT_GAP=true`).
+
+This closed the 2026-06-24 incident where a binary shipped ahead of its
+`023_book_pro_ct.sql` prerequisite. See `migrations/legacy-mssql/README.md`.
+
 ### Vocabulary note: "drift" vs. "sync lag"
 
 The table `ht_reconcile_log` reads as a divergence ledger, but the actual semantic is a **sync-lag observation queue**. Rows are snapshots of moments when the diff-only sweep noticed two hashes had not yet converged; the auto-resolve sweep at every reconcile tick re-hashes both sides and closes converged rows. The CT watcher and writeback worker do the real reconciliation; the sweep is just an auditor that notices when those engines are temporarily behind.

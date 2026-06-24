@@ -449,6 +449,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     hotel_backend::secrets::hydrate_env_from_secret_files();
     dotenvy::dotenv().ok();
 
+    // Single source of truth for the deploy-time CT gate
+    // (scripts/deploy/run-deploy.sh): emit the tables this binary expects
+    // Change Tracking on, one per line, then exit. Kept dependency-free (no
+    // DB connection, no SITE_ID parse) so the deploy can run it straight from
+    // the backend image to learn EXACTLY what this build requires — no
+    // Rust-vs-shell list drift. Added after the 2026-06-24 HT_Book_Pro
+    // incident (binary shipped ahead of its CT-enable migration).
+    if env::args().any(|a| a == "--print-ct-tables") {
+        for t in CT_ENABLED_TABLES {
+            println!("{t}");
+        }
+        return Ok(());
+    }
+
     // Security audit 2026-05-14: hydrate sensitive env vars (DB_PASSWORD,
     // POSTGRES_PASSWORD, SLACK_WEBHOOK_URL) from Docker secret files at
     // `/run/secrets/<name>` when present. Also reconstructs DATABASE_URL
@@ -765,6 +779,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 &site.id,
                 format!(
                     ":no_entry: *CT watcher REFUSED TO START — retention overflow* :no_entry:\n{msg}"
+                ),
+            );
+            let _ = s.send_message(&payload).await;
+        }
+        // Sleep before exit so Docker `restart: unless-stopped` doesn't
+        // turn this into a tight loop + alert flood.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        return Err(msg.into());
+    }
+
+    // CT-enablement gate (incident 2026-06-24). A table in CT_ENABLED_TABLES
+    // whose legacy CT subscription is missing makes the per-tick CHANGETABLE
+    // query error ~1/sec forever — isolated (other tables keep syncing) but
+    // noisy, and that table never syncs. `check_retention` can't catch it:
+    // CHANGE_TRACKING_MIN_VALID_VERSION returns NULL when CT is off and the
+    // function treats NULL as healthy. So probe enablement explicitly and
+    // refuse to start, naming the tables — almost always a
+    // migrations/legacy-mssql/ prerequisite that wasn't applied before this
+    // binary shipped. The deploy now runs scripts/migrate-legacy-mssql.sh
+    // before starting workers, so in the normal flow CT is already enabled by
+    // the time we get here; this is the backstop for runtime CT loss
+    // (server failover, manual DISABLE). A failed probe (connectivity) is
+    // transient — only an explicit Ok(false) refuses.
+    let allow_ct_gap = env::var("LEGACY_SYNC_ALLOW_CT_GAP")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    let mut ct_probes: Vec<(&'static str, Option<bool>)> = Vec::new();
+    for table in &allowed_tables {
+        match check_ct_enabled(&mssql, table).await {
+            Ok(on) => ct_probes.push((*table, Some(on))),
+            Err(err) => {
+                tracing::warn!(
+                    table,
+                    error = %err,
+                    "Pre-flight CT-enablement probe failed; treating as transient"
+                );
+                ct_probes.push((*table, None));
+            }
+        }
+    }
+    let ct_missing: Vec<&'static str> = ct_tables_definitely_missing(&ct_probes);
+    if !ct_missing.is_empty() && !allow_ct_gap {
+        let msg = format!(
+            "Change Tracking NOT enabled on {} expected table(s) — refusing to start.\n  \
+             Affected:\n    - {}\n  \
+             The watcher would error ~1/sec on each and never sync them. Almost \
+             always a migrations/legacy-mssql/ prerequisite that did not get \
+             applied before this binary shipped. The deploy runs \
+             scripts/migrate-legacy-mssql.sh automatically — check its output for \
+             a failed/ skipped migration, apply the matching CT-enable DDL, then \
+             restart this binary. Set LEGACY_SYNC_ALLOW_CT_GAP=true ONLY to run \
+             with those tables intentionally unsynced (the per-tick errors will \
+             resume). See docs/runbook-sync.md.",
+            ct_missing.len(),
+            ct_missing.join("\n    - "),
+        );
+        tracing::error!(site = %site.id, "{msg}");
+        if let Some(s) = &slack {
+            let payload = SlackMessage::with_site_text(
+                &site.id,
+                format!(
+                    ":no_entry: *CT watcher REFUSED TO START — Change Tracking not enabled* :no_entry:\n{msg}"
                 ),
             );
             let _ = s.send_message(&payload).await;
@@ -3084,6 +3160,46 @@ async fn check_retention(
     Ok(())
 }
 
+/// Pure helper for the startup CT-enablement gate: from per-table probe
+/// outcomes, return the tables that are DEFINITIVELY missing Change Tracking.
+/// `Some(true)` = CT on, `Some(false)` = CT confirmed off (refuse),
+/// `None` = probe errored (transient — must NOT count as missing, or a
+/// connectivity blip would refuse startup). Pulled out so the
+/// "transient errors never refuse" invariant is unit-testable without MSSQL.
+fn ct_tables_definitely_missing<'a>(probes: &[(&'a str, Option<bool>)]) -> Vec<&'a str> {
+    probes
+        .iter()
+        .filter_map(|(t, outcome)| match outcome {
+            Some(false) => Some(*t),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Probe whether Change Tracking is enabled on `table`.
+/// `CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID(N'...'))` returns NULL exactly
+/// when CT is not enabled (or the object doesn't exist), and a version number
+/// otherwise — so `Ok(false)` is a definitive "CT is off" answer while `Err`
+/// is a connectivity/query failure. The caller MUST keep these distinct: a
+/// transient probe failure must never be mistaken for a missing migration
+/// (that would refuse startup on a blip). Mirrors `check_retention`'s pooled
+/// read path. Added 2026-06-24 as the startup CT-enablement gate.
+async fn check_ct_enabled(mssql: &DbPool, table: &str) -> Result<bool, String> {
+    let mut conn = mssql.get().await.map_err(|e| e.to_string())?;
+    let sql = format!(
+        "SELECT CASE WHEN CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID(N'{table}')) IS NULL \
+         THEN 0 ELSE 1 END AS ct_on"
+    );
+    let rows = simple_query_with_timeout_pooled(&mut conn, &sql, MssqlOpKind::Read)
+        .await
+        .map_err(|e| e.to_string())?;
+    let row = rows
+        .first()
+        .ok_or_else(|| "ct-enablement probe returned no rows".to_string())?;
+    let on: i32 = row.get(0).unwrap_or(0);
+    Ok(on == 1)
+}
+
 async fn count_ct_rows(
     mssql: &DbPool,
     table: &str,
@@ -3815,6 +3931,32 @@ mod tests {
             "HT_Book_Pro",
         ];
         assert_eq!(CT_ENABLED_TABLES, &expected);
+    }
+
+    #[test]
+    fn ct_gate_flags_only_confirmed_off_tables() {
+        // Some(false) → missing; Some(true) → fine; None (probe errored) →
+        // transient, must NOT be flagged (a connectivity blip can't refuse
+        // startup). Order preserved.
+        let probes = [
+            ("HT_Customers", Some(true)),
+            ("HT_Book_Pro", Some(false)),
+            ("HT_Rooms", None),
+            ("HT_Deposit", Some(false)),
+        ];
+        assert_eq!(
+            ct_tables_definitely_missing(&probes),
+            vec!["HT_Book_Pro", "HT_Deposit"]
+        );
+    }
+
+    #[test]
+    fn ct_gate_all_healthy_or_transient_flags_nothing() {
+        let probes = [
+            ("HT_Customers", Some(true)),
+            ("HT_Rooms", None), // transient probe failure — not a refusal
+        ];
+        assert!(ct_tables_definitely_missing(&probes).is_empty());
     }
 
     #[test]

@@ -102,7 +102,12 @@ jobs:
               - 'docker-compose.yml'
               - 'init-db/**'
               - 'migrations/pg/**'
+              # Legacy-MSSQL CT migrations are auto-applied + verified by
+              # run-deploy.sh (incident 2026-06-24); a new one must trigger a
+              # deploy so it actually lands on the legacy servers.
+              - 'migrations/legacy-mssql/**'
               - 'scripts/migrate.sh'
+              - 'scripts/migrate-legacy-mssql.sh'
               - 'scripts/backup-db.sh'
               # The deploy script self-updates from the tarball on every
               # deploy (Track J5, 2026-05-14), so a change here is only
@@ -908,11 +913,17 @@ jobs:
           # arbitrary paths impossible — bundling the script in the existing
           # payload + relying on the script's self-update tail block is the
           # only path that doesn't require relaxing authorized_keys.
+          # migrations/legacy-mssql + scripts/migrate-legacy-mssql.sh ride the
+          # tarball so run-deploy.sh can auto-apply + verify CT-prerequisite DDL
+          # on the legacy servers, same as it does PG migrations (incident
+          # 2026-06-24: binary shipped ahead of its CT-enable migration).
           tar -czf /tmp/deploy.tar.gz \
             docker-compose.yml \
             init-db \
             migrations/pg \
+            migrations/legacy-mssql \
             scripts/migrate.sh \
+            scripts/migrate-legacy-mssql.sh \
             scripts/deploy/run-deploy.sh
 
           # RUST_LOG default below is pinned to debug for scheduler::sync

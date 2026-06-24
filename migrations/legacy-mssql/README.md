@@ -26,10 +26,38 @@ NNN_phaseX_short-description.rollback.sql   -- revert
   the PK against pre-ALTER metadata in the same batch and fails with
   Msg 8111. Learned 2026-04-28; applied throughout.
 
-## Application
+## Application (automated — since 2026-06-24)
 
-Both apply and rollback run via `sqlcmd` in a one-shot Docker
-container on the deploy host (no need to install MSSQL tools locally):
+These migrations are now **auto-applied by the CI/CD deploy**, the same
+way `migrations/pg/` are. `scripts/deploy/run-deploy.sh` runs
+`scripts/migrate-legacy-mssql.sh --site hfhotel` and `--site hfville` on
+every deploy, then a **pre-worker CT gate** (`--verify-ct`, fed
+`sync --print-ct-tables`) confirms every table the binary expects CT on
+is actually CT-enabled on both servers before the watcher starts. A miss
+fails the deploy.
+
+* **Tracking:** `dbo.ht_legacy_migrations` (version, filename, checksum,
+  applied_at, applied_by) on each legacy server — the MSSQL analog of
+  PG's `schema_migrations`. Only PENDING migrations (not already in the
+  table) run, so re-deploys are no-ops. Servers already at the current
+  level were seeded once via `--adopt-baseline` (020–023 recorded
+  `baseline-adopt`, 2026-06-24).
+* **Safety:** the runner sets a bounded `SET LOCK_TIMEOUT`
+  (`LEGACY_LOCK_TIMEOUT_MS`, default 5000) so a migration that hits a
+  busy table fails fast (error 1222) and halts the deploy instead of
+  holding a Sch-M lock that would block the live iHOTEL app.
+* **NEW migrations MUST be idempotent** (`IF NOT EXISTS` / `IF COL_LENGTH(...)
+  IS NULL` guards), the same discipline `CLAUDE.md` mandates for
+  `migrations/pg/` — the tracking row is written only after the body
+  succeeds, so a partial failure is retried on the next deploy.
+* **Defense in depth:** the sync binary itself probes CT enablement at
+  startup and refuses to start (one Slack alert, no 1/sec spam) if an
+  expected table lacks CT — overridable with `LEGACY_SYNC_ALLOW_CT_GAP=true`.
+
+### Manual application (fallback / one-off)
+
+Still possible via `sqlcmd` in a one-shot Docker container on the deploy
+host (no MSSQL tools needed locally):
 
 ```bash
 ssh evergreen "cat <path-to-sql> | docker run --rm -i --network host \
@@ -41,15 +69,18 @@ ssh evergreen "cat <path-to-sql> | docker run --rm -i --network host \
 For HF Ville: same command, swap the `-S` server address for Ville's
 MSSQL — `<ville-mssql-host>,1436` over the WireGuard `hfville` interface
 (after the 2026-04-29 cutover; see `ville_constraint.md` for the
-network path). Database is `HOTEL`, not `db`.
+network path). Database is `HOTEL`, not `db`. A manual apply should be
+followed by recording the row in `dbo.ht_legacy_migrations` (or just let
+the next deploy's runner skip it — it keys on `version`).
 
 ## Coordination
 
-These changes take Sch-M locks on the target tables. While the lock
-is held, the legacy .NET app blocks on every transaction touching
-those tables. Coordinate a maintenance window with receptionists at
-**both sites** before applying. Memory: `legacy_db_state.md` in the
-auto-memory tracks current state across runs.
+These changes take Sch-M locks on the target tables. The runner's bounded
+`LOCK_TIMEOUT` keeps that wait short (fails fast rather than blocking the
+.NET app), but a large/long DDL still belongs in a maintenance window —
+prefer landing such a migration in a deploy timed for a quiet period, and
+coordinate with receptionists at **both sites**. Memory: `legacy_db_state.md`
+in the auto-memory tracks current state across runs.
 
 ## Files
 
