@@ -22,6 +22,7 @@ import {
   CalendarPlus,
 } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { formatStoredDayMonthYear } from '@/lib/format'
 import CheckInModal from '@/components/CheckInModal'
 import CheckOutModal from '@/components/CheckOutModal'
 import ChangeRoomModal from '@/components/ChangeRoomModal'
@@ -158,13 +159,7 @@ export default function RoomsPage() {
 
   const formatDate = (dateString: string) => {
     try {
-      const date = new Date(dateString)
-      return date.toLocaleDateString('th-TH', {
-        day: 'numeric',
-        month: 'short',
-        year: 'numeric',
-        timeZone: 'UTC',
-      })
+      return formatStoredDayMonthYear(dateString)
     } catch {
       return dateString
     }

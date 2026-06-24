@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import { Loader2, AlertCircle, Ticket, ShoppingBag, ArrowLeftRight, Info } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { formatStoredDateTime } from '@/lib/format'
 
 /**
  * Phase 5.5e — read-only panels surfacing the `legacy_mirror.*`
@@ -148,14 +149,7 @@ function formatThaiDateTime(s: string | null): string {
   if (!s) return '—'
   // Backend returns NaiveDateTime (no TZ) — values are already Thai local
   // per CLAUDE.md. Render as-is without any TZ conversion.
-  return new Date(s).toLocaleString('th-TH', {
-    year: 'numeric',
-    month: 'short',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-    timeZone: 'UTC', // see CLAUDE.md timezone-handling note
-  })
+  return formatStoredDateTime(s)
 }
 
 function CouponsPanel({ cinNo }: { cinNo: string }) {

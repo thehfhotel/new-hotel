@@ -19,6 +19,7 @@ import {
 } from 'lucide-react'
 import DataTable, { Column, PaginationInfo } from '@/components/DataTable'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { formatStoredDate } from '@/lib/format'
 
 interface Customer {
   id: string
@@ -253,7 +254,7 @@ export default function CustomersPage() {
       render: (item) => (
         <div className="flex items-center gap-2">
           <Calendar className="w-4 h-4 text-gray-400" />
-          <span>{item.lastVisit ? new Date(item.lastVisit).toLocaleDateString('th-TH', { day: '2-digit', month: '2-digit', year: 'numeric', timeZone: 'UTC' }) : '-'}</span>
+          <span>{item.lastVisit ? formatStoredDate(item.lastVisit) : '-'}</span>
         </div>
       ),
     },
@@ -442,7 +443,7 @@ export default function CustomersPage() {
                       </div>
                       <p className="text-lg font-bold text-purple-800">
                         {customerStats?.firstVisit
-                          ? new Date(customerStats.firstVisit).toLocaleDateString('th-TH', { day: '2-digit', month: '2-digit', year: 'numeric', timeZone: 'UTC' })
+                          ? formatStoredDate(customerStats.firstVisit)
                           : '-'}
                       </p>
                     </div>
@@ -455,7 +456,7 @@ export default function CustomersPage() {
                       </div>
                       <p className="text-lg font-bold text-indigo-800">
                         {customerStats?.lastVisit
-                          ? new Date(customerStats.lastVisit).toLocaleDateString('th-TH', { day: '2-digit', month: '2-digit', year: 'numeric', timeZone: 'UTC' })
+                          ? formatStoredDate(customerStats.lastVisit)
                           : '-'}
                       </p>
                     </div>
@@ -524,8 +525,8 @@ export default function CustomersPage() {
                             </div>
                             <div className="flex items-center gap-1 text-sm text-gray-600">
                               <Calendar className="w-4 h-4" />
-                              {new Date(booking.checkInDate).toLocaleDateString('th-TH', { day: '2-digit', month: '2-digit', year: 'numeric', timeZone: 'UTC' })} -{' '}
-                              {new Date(booking.checkOutDate).toLocaleDateString('th-TH', { day: '2-digit', month: '2-digit', year: 'numeric', timeZone: 'UTC' })}
+                              {formatStoredDate(booking.checkInDate)} -{' '}
+                              {formatStoredDate(booking.checkOutDate)}
                             </div>
                             {booking.totalAmount > 0 && (
                               <p className="text-sm text-gray-600 mt-1">

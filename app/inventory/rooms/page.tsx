@@ -14,6 +14,7 @@ import {
 } from 'lucide-react'
 import RoomInventoryChecklist from '@/components/inventory/RoomInventoryChecklist'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { formatStoredDayMonthYearTime } from '@/lib/format'
 
 interface Room {
   id: number
@@ -98,15 +99,7 @@ export default function RoomInventoryPage() {
   // Format date
   const formatDate = (dateString: string | null) => {
     if (!dateString) return 'ยังไม่เคยตรวจ'
-    const date = new Date(dateString)
-    return date.toLocaleDateString('th-TH', {
-      day: 'numeric',
-      month: 'short',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-      timeZone: 'UTC',
-    })
+    return formatStoredDayMonthYearTime(dateString)
   }
 
   // Get room status color

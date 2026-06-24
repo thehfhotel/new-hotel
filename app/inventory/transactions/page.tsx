@@ -20,6 +20,7 @@ import {
   TRANSACTION_TYPES,
 } from '@/types/inventory'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { formatStoredDayMonthYearTime } from '@/lib/format'
 
 function escapeHtml(str: string | null | undefined): string {
   if (!str) return ''
@@ -129,17 +130,7 @@ export default function TransactionHistoryPage() {
   }
 
   // Format date
-  const formatDate = (dateString: string) => {
-    const date = new Date(dateString)
-    return date.toLocaleDateString('th-TH', {
-      day: 'numeric',
-      month: 'short',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-      timeZone: 'UTC',
-    })
-  }
+  const formatDate = (dateString: string) => formatStoredDayMonthYearTime(dateString)
 
   // Handle print
   const handlePrint = () => {

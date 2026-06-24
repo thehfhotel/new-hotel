@@ -71,6 +71,90 @@ export function formatThaiDateShort(dateStr: string | null): string {
   return formatBuddhistDate(dateStr, 'short')
 }
 
+/**
+ * Stored-datetime display helpers (the "Thai time stored as UTC" rule).
+ *
+ * SQL Server stores datetimes in Thai local time (GMT+7) but the driver returns
+ * them with a `Z` suffix, so JS would misinterpret them as UTC. We therefore
+ * format with `timeZone: 'UTC'` to render the stored value AS-IS. Using
+ * 'Asia/Bangkok' would WRONGLY add 7 hours. See CLAUDE.md timezone-handling note.
+ *
+ * Each helper reproduces a distinct option-shape that was previously copy-pasted
+ * inline across the frontend. Output is byte-identical to the original inline call.
+ *
+ * NOTE: distinct from `formatThaiDate`/`formatThaiDateShort` above, which render
+ * Buddhist-Era dates WITHOUT the UTC rule — do not conflate them.
+ */
+type StoredDateInput = string | number | Date | null | undefined
+
+function toStoredDate(value: StoredDateInput): Date | null {
+  if (value === null || value === undefined) return null
+  return new Date(value)
+}
+
+/** Stored date as DD/MM/YYYY (Gregorian, 2-digit day/month, numeric year). */
+export function formatStoredDate(value: StoredDateInput): string {
+  const date = toStoredDate(value)
+  if (!date) return '-'
+  return date.toLocaleDateString('th-TH', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    timeZone: 'UTC',
+  })
+}
+
+/** Stored date as "D MON" (day numeric, short month, no year). */
+export function formatStoredDayMonth(value: StoredDateInput): string {
+  const date = toStoredDate(value)
+  if (!date) return '-'
+  return date.toLocaleDateString('th-TH', {
+    day: 'numeric',
+    month: 'short',
+    timeZone: 'UTC',
+  })
+}
+
+/** Stored date as "D MON YYYY" (day numeric, short month, numeric year). */
+export function formatStoredDayMonthYear(value: StoredDateInput): string {
+  const date = toStoredDate(value)
+  if (!date) return '-'
+  return date.toLocaleDateString('th-TH', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+    timeZone: 'UTC',
+  })
+}
+
+/** Stored datetime as "D MON YYYY, HH:MM" (numeric day/year, short month, 2-digit time). */
+export function formatStoredDateTime(value: StoredDateInput): string {
+  const date = toStoredDate(value)
+  if (!date) return '-'
+  return date.toLocaleString('th-TH', {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    timeZone: 'UTC',
+  })
+}
+
+/** Stored datetime as "D MON YYYY HH:MM" (date-string form: numeric day/year, short month, 2-digit time). */
+export function formatStoredDayMonthYearTime(value: StoredDateInput): string {
+  const date = toStoredDate(value)
+  if (!date) return '-'
+  return date.toLocaleDateString('th-TH', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    timeZone: 'UTC',
+  })
+}
+
 /** Calculate nights between two date strings */
 export function calculateNights(checkIn: string, checkOut: string): number {
   if (!checkIn || !checkOut) return 0

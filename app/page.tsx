@@ -13,6 +13,7 @@ import {
 } from 'lucide-react'
 import { useBranch, BRANCH_LABELS } from '@/contexts/BranchContext'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { formatStoredDayMonth } from '@/lib/format'
 import { useSkin } from '@/contexts/SkinContext'
 import CheckInModal from '@/components/CheckInModal'
 import CheckOutModal from '@/components/CheckOutModal'
@@ -499,9 +500,9 @@ export default function NewDashboard() {
                 </div>
                 <div className="text-right">
                   <p className="text-[11px] text-textMuted">
-                    {new Date(checkin.checkInDate).toLocaleDateString('th-TH', { day: 'numeric', month: 'short', timeZone: 'UTC' })}
+                    {formatStoredDayMonth(checkin.checkInDate)}
                     {' - '}
-                    {new Date(checkin.checkOutDate).toLocaleDateString('th-TH', { day: 'numeric', month: 'short', timeZone: 'UTC' })}
+                    {formatStoredDayMonth(checkin.checkOutDate)}
                   </p>
                 </div>
               </div>

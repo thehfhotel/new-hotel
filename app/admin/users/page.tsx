@@ -17,6 +17,7 @@ import {
 } from 'lucide-react'
 import { useAuth, type Role, type UserDto } from '@/contexts/AuthContext'
 import { ApiError, apiFetch } from '@/lib/api'
+import { formatStoredDateTime } from '@/lib/format'
 import CreateUserModal from './CreateUserModal'
 import ResetPasswordModal from './ResetPasswordModal'
 
@@ -425,16 +426,8 @@ function ForbiddenView() {
 
 function formatDate(value: string | null): string {
   if (!value) return '—'
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return value
-  return date.toLocaleString('th-TH', {
-    year: 'numeric',
-    month: 'short',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-    timeZone: 'UTC',
-  })
+  if (Number.isNaN(new Date(value).getTime())) return value
+  return formatStoredDateTime(value)
 }
 
 function messageForActionError(err: unknown): string {

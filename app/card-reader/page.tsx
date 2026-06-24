@@ -2,6 +2,7 @@
 
 import { useState, useCallback, useEffect, useRef } from 'react'
 import { CreditCard, RefreshCw, CheckCircle2, XCircle, User, AlertCircle, Server, Terminal, Download } from 'lucide-react'
+import { formatStoredDayMonthYear } from '@/lib/format'
 
 type ConnectionStatus = 'disconnected' | 'connecting' | 'connected'
 type ReadStatus = 'idle' | 'reading' | 'success' | 'error'
@@ -33,12 +34,7 @@ function formatThaiDate(dateStr: string): string {
   try {
     const date = new Date(dateStr)
     const buddhistYear = date.getFullYear() + 543
-    return date.toLocaleDateString('th-TH', {
-      day: 'numeric',
-      month: 'short',
-      year: 'numeric',
-      timeZone: 'UTC',
-    }).replace(/\d{4}/, buddhistYear.toString())
+    return formatStoredDayMonthYear(dateStr).replace(/\d{4}/, buddhistYear.toString())
   } catch {
     return dateStr
   }
