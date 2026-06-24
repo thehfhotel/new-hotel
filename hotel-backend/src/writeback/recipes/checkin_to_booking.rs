@@ -44,6 +44,9 @@ use crate::writeback::constants::{
     CIN_ROOM_STATUS_OCCUPYING, CIN_STATUS_NORMAL, CUST_TYPE_NORMAL, DEFAULT_OPERATOR,
     ROOM_STATUS_OCCUPYING,
 };
+use std::collections::HashMap;
+
+use crate::db::mssql_timeout::{simple_query_with_timeout, MssqlOpKind};
 use crate::writeback::dispatcher::LegacyIds;
 use crate::writeback::error::{WritebackError, WritebackResult};
 use crate::writeback::format::{
@@ -91,6 +94,29 @@ pub struct CheckInToBookingInputs<'a> {
     /// [`crate::writeback::recipes::walkin::WalkInInputs::room_lines`]
     /// for the full back-compat / cardinality contract.
     pub room_lines: Vec<RoomLine>,
+    /// Phase 5/E2 — the booking's pre-booked products (`HT_Book_Pro`), resolved
+    /// for transfer onto the check-in folio (`HT_CheckIn_Product` + the paired
+    /// `HT_Products.Pro_Amt` decrement), exactly as iHOTEL's FrmCheckIn does on
+    /// booking→check-in conversion. Populated by `execute()` via
+    /// [`load_book_pro_transfer_lines`]; empty ⇒ no product statements emitted.
+    /// The non-idempotent stock decrement is safe under retry because the whole
+    /// recipe is gated by the writeback idempotency ledger (Phase A).
+    pub book_pro_lines: Vec<BookProTransferLine>,
+}
+
+/// A booking's pre-booked product line, resolved for transfer onto the folio.
+/// `pro_no` is the resolved `HT_Products.Pro_no` business key — `"-1"` when
+/// `B_PRO_ID` matches no product row (iHOTEL's own fallback,
+/// `FrmCheckIn.cs:10466` `value3 = "-1"`).
+#[derive(Debug, Clone)]
+pub struct BookProTransferLine {
+    pub room_no: String,
+    pub pro_no: String,
+    pub name: String,
+    pub unit: String,
+    pub num: f64,
+    pub price: f64,
+    pub price_total: f64,
 }
 
 /// Build statements for a check-in linked to a booking. PURE — no I/O.
@@ -318,6 +344,38 @@ pub fn build_statements(inputs: &CheckInToBookingInputs<'_>) -> Vec<String> {
          {stay_start_q},{stay_end_q},0,'False')",
     ));
 
+    // 10b. HT_CheckIn_Product (+ paired HT_Products stock decrement) — transfer
+    //      the booking's pre-booked products onto the new folio, exactly as
+    //      iHOTEL's FrmCheckIn does on booking→check-in conversion (decompile
+    //      §3.1 Step 3, FrmCheckIn.cs:9446-9477): per product line, INSERT the
+    //      HT_CheckIn_Product row then `Pro_Amt = Pro_Amt - num` keyed on
+    //      Pro_no. `pro_no` was resolved from B_PRO_ID (HT_Products.id→Pro_no)
+    //      in execute(). Placed after the HT_CheckIn_H header so the folio
+    //      exists first. Idempotency is the writeback ledger's job (the whole
+    //      recipe runs at most once), so the non-idempotent decrement needs no
+    //      per-statement guard. Single-room only (multi-room rejected upstream).
+    //      Numbers use the recipe's standard shapes (f64 to_string for qty,
+    //      2dp for money); finiteness is checked in execute() so this stays pure.
+    for line in &inputs.book_pro_lines {
+        let room_no_q = sql_quote(&line.room_no);
+        let pro_no_q = sql_quote(&line.pro_no);
+        let name_q = sql_quote(&line.name);
+        let unit_q = sql_quote(&line.unit);
+        let num = format_qty(line.num);
+        let price = format!("{:.2}", line.price);
+        let price_total = format!("{:.2}", line.price_total);
+        statements.push(format!(
+            "INSERT INTO [HT_CheckIn_Product]([Cin_No],[Cin_Room_no],[Cin_Ds_date],\
+             [Cin_Pro_id],[Cin_Pro_name],[Cin_Pro_Unit],[Cin_Pro_num],[Cin_Pro_price],\
+             [Cin_Pro_priceTotal],[Cin_Pro_pay],[Cin_Pro_note])\
+             VALUES({cin_no_q},{room_no_q},{now_q},{pro_no_q},{name_q},{unit_q},\
+             {num},{price},{price_total},0,'')"
+        ));
+        statements.push(format!(
+            "update HT_Products set Pro_Amt=Pro_Amt-{num} where Pro_no={pro_no_q}"
+        ));
+    }
+
     // 11. HT_Cupon — mark loyalty coupon as printed (spike §3d,
     //     booking-checkin/writes.txt:39). Shared helper with `walkin` so the
     //     literal SQL stays identical.
@@ -343,6 +401,104 @@ fn effective_room_lines(inputs: &CheckInToBookingInputs<'_>) -> Vec<RoomLine> {
         room_status: String::new(),
         legacy_ds_id: None,
     }]
+}
+
+/// Default-ON kill switch for the booking→check-in product transfer
+/// (Phase 5/E2). Set `WRITEBACK_BOOK_PRO_TRANSFER_ENABLED=false` (or `0`) and
+/// restart the worker to disable it without a code revert/CI cycle — a
+/// safety lever for a non-idempotent, format-reconstructed financial write on
+/// a shared production table. Off ⇒ no products loaded ⇒ no HT_CheckIn_Product
+/// rows and no Pro_Amt decrement (the rest of the check-in still writes back).
+fn book_pro_transfer_enabled() -> bool {
+    !matches!(
+        std::env::var("WRITEBACK_BOOK_PRO_TRANSFER_ENABLED").as_deref(),
+        Ok("false") | Ok("0")
+    )
+}
+
+/// Render a product quantity for SQL: trim to ≤3dp, dropping trailing zeros, so
+/// a whole count renders `"2"` and a clean fraction `"2.5"`, while a
+/// precision-noisy f64 (e.g. `0.30000000000000004`) renders `"0.3"` instead of
+/// leaking full f64 precision into both the INSERT and the `Pro_Amt-{n}`
+/// decrement. SQL Server parses any of these to the same numeric; this is
+/// precision/parity hygiene for a future fractional-qty product.
+fn format_qty(n: f64) -> String {
+    let s = format!("{n:.3}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// Load the booking's `HT_Book_Pro` lines and resolve each `B_PRO_ID` (an
+/// `HT_Products.id`) to its `Pro_no` business key — exactly as iHOTEL's
+/// FrmCheckIn does on booking→check-in conversion: it runs
+/// `select id,pro_no from HT_Products`, matches `HT_Products.id ==
+/// HT_Book_Pro.B_PRO_ID`, and falls back to `"-1"` on no match
+/// (FrmCheckIn.cs:10455-10475, verified in the decompile). Reads run on the
+/// recipe's MSSQL connection, INSIDE the worker's open `BEGIN TRAN`, so the
+/// products + the folio + the stock decrement + the ledger row all commit
+/// atomically. Returns an empty Vec when the booking carries no products.
+async fn load_book_pro_transfer_lines(
+    conn: &mut LegacyConn<'_>,
+    book_id: &str,
+) -> WritebackResult<Vec<BookProTransferLine>> {
+    let book_id_q = sql_quote(book_id);
+    let rows = simple_query_with_timeout(
+        conn,
+        &format!(
+            "SELECT B_ROOM, B_NAME, B_UNIT, B_NUM, B_PRICE, B_PRICE_TOTAL, B_PRO_ID \
+             FROM HT_Book_Pro WHERE B_NO = {book_id_q} ORDER BY id"
+        ),
+        MssqlOpKind::Read,
+    )
+    .await?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Resolve B_PRO_ID (HT_Products.id) → Pro_no, mirroring FrmCheckIn's
+    // id→pro_no lookup. Scope the read to the booking's distinct B_PRO_IDs
+    // (ints, injection-safe) rather than the full HT_Products table, to keep
+    // the in-TX footprint small on a table iHOTEL writes on every POS sale.
+    // First match wins (entry/or_insert) to match iHOTEL's break-on-first.
+    let mut pro_ids: Vec<i32> = rows.iter().filter_map(|r| r.get::<i32, _>("B_PRO_ID")).collect();
+    pro_ids.sort_unstable();
+    pro_ids.dedup();
+    let mut id_to_pro_no: HashMap<i32, String> = HashMap::with_capacity(pro_ids.len());
+    if !pro_ids.is_empty() {
+        let in_list = pro_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let prod_rows = simple_query_with_timeout(
+            conn,
+            &format!("SELECT id, Pro_no FROM HT_Products WHERE id IN ({in_list}) ORDER BY id"),
+            MssqlOpKind::Read,
+        )
+        .await?;
+        for r in &prod_rows {
+            if let (Some(id), Some(pro_no)) = (r.get::<i32, _>("id"), r.get::<&str, _>("Pro_no")) {
+                id_to_pro_no.entry(id).or_insert_with(|| pro_no.to_string());
+            }
+        }
+    }
+
+    let mut lines = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let pro_no = r
+            .get::<i32, _>("B_PRO_ID")
+            .and_then(|id| id_to_pro_no.get(&id).cloned())
+            .unwrap_or_else(|| "-1".to_string());
+        lines.push(BookProTransferLine {
+            room_no: r.get::<&str, _>("B_ROOM").unwrap_or_default().to_string(),
+            pro_no,
+            name: r.get::<&str, _>("B_NAME").unwrap_or_default().to_string(),
+            unit: r.get::<&str, _>("B_UNIT").unwrap_or_default().to_string(),
+            num: r.get::<f64, _>("B_NUM").unwrap_or(0.0),
+            price: r.get::<f64, _>("B_PRICE").unwrap_or(0.0),
+            price_total: r.get::<f64, _>("B_PRICE_TOTAL").unwrap_or(0.0),
+        });
+    }
+    Ok(lines)
 }
 
 /// Execute the check-in-to-booking recipe.
@@ -378,6 +534,29 @@ pub async fn execute(
                 .into(),
         )
     })?;
+    // Phase 5/E2 — load + resolve the booking's pre-booked products for transfer
+    // onto the folio (HT_CheckIn_Product + the paired HT_Products.Pro_Amt
+    // decrement). Done BEFORE the TABLOCKX/HOLDLOCK allocations below so the
+    // HT_Book_Pro/HT_Products reads don't run while we hold the HT_CheckIn_H
+    // lock (smaller lock window, no deadlock surface vs iHOTEL's concurrent
+    // HT_Products writes). Gated by a default-ON kill switch so an operator can
+    // disable this non-idempotent, format-reconstructed financial write by
+    // restarting the worker with WRITEBACK_BOOK_PRO_TRANSFER_ENABLED=false —
+    // off behaves exactly as pre-change (no product rows, no Pro_Amt decrement).
+    // Validate finiteness here so build_statements stays pure/infallible.
+    let book_pro_lines = if book_pro_transfer_enabled() {
+        load_book_pro_transfer_lines(conn, book_id).await?
+    } else {
+        Vec::new()
+    };
+    for l in &book_pro_lines {
+        super::helpers::validate_finite(&[
+            ("book_pro num", l.num),
+            ("book_pro price", l.price),
+            ("book_pro price_total", l.price_total),
+        ])?;
+    }
+
     let cin_no = allocate_cin_no(conn).await?;
     let room_status_id_base = allocate_room_status_id(conn).await?;
     // Track B4 — first ds id under TABLOCKX. The lock is held for the
@@ -419,6 +598,7 @@ pub async fn execute(
         photo_tmp_no: payload.photo_tmp_no.as_deref(),
         created_at,
         room_lines: payload.room_lines.clone(),
+        book_pro_lines,
     };
     let statements = build_statements(&inputs);
     super::execute_all(conn, &statements).await?;
@@ -474,9 +654,80 @@ mod tests {
             photo_tmp_no: None,
             // Track B4 — empty slice ⇒ legacy single-room path.
             room_lines: Vec::new(),
+            book_pro_lines: Vec::new(),
             // Wave 5b item 4: fixed instant for deterministic tests.
             created_at: Utc.with_ymd_and_hms(2026, 4, 24, 10, 23, 2).unwrap(),
         }
+    }
+
+    #[test]
+    fn build_statements_transfers_book_pro_products_and_decrements_stock() {
+        let mut inputs = sample_inputs();
+        inputs.book_pro_lines = vec![
+            BookProTransferLine {
+                room_no: "402".into(),
+                pro_no: "01-001".into(),
+                name: "น้ำดื่ม".into(), // Thai product name must survive verbatim
+                unit: "ขวด".into(),
+                num: 2.0,
+                price: 15.0,
+                price_total: 30.0,
+            },
+            BookProTransferLine {
+                // B_PRO_ID matched no HT_Products row → iHOTEL's "-1" fallback
+                room_no: "402".into(),
+                pro_no: "-1".into(),
+                name: "x".into(),
+                unit: "ea".into(),
+                num: 1.0,
+                price: 0.0,
+                price_total: 0.0,
+            },
+        ];
+        let s = build_statements(&inputs);
+        let inserts: Vec<&String> =
+            s.iter().filter(|x| x.contains("[HT_CheckIn_Product]")).collect();
+        let decs: Vec<&String> = s
+            .iter()
+            .filter(|x| x.contains("update HT_Products set Pro_Amt=Pro_Amt-"))
+            .collect();
+        assert_eq!(inserts.len(), 2, "one HT_CheckIn_Product INSERT per product line");
+        assert_eq!(decs.len(), 2, "one paired Pro_Amt decrement per product line");
+
+        let i0 = inserts[0];
+        assert!(i0.contains(
+            "[HT_CheckIn_Product]([Cin_No],[Cin_Room_no],[Cin_Ds_date],[Cin_Pro_id],\
+             [Cin_Pro_name],[Cin_Pro_Unit],[Cin_Pro_num],[Cin_Pro_price],[Cin_Pro_priceTotal],\
+             [Cin_Pro_pay],[Cin_Pro_note])"
+        ));
+        assert!(i0.contains("'01-001'"), "Cin_Pro_id = resolved Pro_no"); // resolved key
+        assert!(i0.contains("'น้ำดื่ม'"), "Thai name preserved");
+        // qty=f64 to_string ("2"), price/total 2dp, pay=0, note='' — value tail.
+        assert!(i0.contains(",2,15.00,30.00,0,'')"));
+        assert!(decs[0].contains("Pro_Amt=Pro_Amt-2 where Pro_no='01-001'"));
+
+        // The "-1" fallback line still emits a (no-op) decrement on Pro_no='-1',
+        // byte-faithful to iHOTEL rather than silently dropping the line.
+        assert!(inserts[1].contains("'-1'"));
+        assert!(decs[1].contains("where Pro_no='-1'"));
+    }
+
+    #[test]
+    fn format_qty_trims_zeros_and_caps_precision() {
+        assert_eq!(format_qty(2.0), "2");
+        assert_eq!(format_qty(2.5), "2.5");
+        assert_eq!(format_qty(10.0), "10");
+        assert_eq!(format_qty(100.0), "100");
+        // precision-noisy f64 must not leak full precision into the decrement
+        assert_eq!(format_qty(0.1 + 0.2), "0.3");
+    }
+
+    #[test]
+    fn build_statements_emits_no_product_statements_without_book_pro() {
+        let inputs = sample_inputs(); // book_pro_lines empty
+        let s = build_statements(&inputs);
+        assert!(!s.iter().any(|x| x.contains("[HT_CheckIn_Product]")));
+        assert!(!s.iter().any(|x| x.contains("update HT_Products set Pro_Amt")));
     }
 
     /// Inputs that mirror the captured legacy check-in for
@@ -506,6 +757,7 @@ mod tests {
             photo_tmp_no: None,
             // Track B4 — empty slice ⇒ legacy single-room path.
             room_lines: Vec::new(),
+            book_pro_lines: Vec::new(),
             // Wave 5b item 4: pin `Cin_Date` to the captured wall-clock
             // (4/25/2026 11:32:02 AM Bangkok = 04:32:02 UTC) for exact
             // byte-parity below.

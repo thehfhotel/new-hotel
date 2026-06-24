@@ -282,6 +282,18 @@ async fn upsert_canonical_pos_sale(
 ) -> Result<(), SyncError> {
     let Some(cin_no) = cin_no else { return Ok(()) };
     let Some(pro_id) = pro_id else { return Ok(()) };
+    // "-1" is iHOTEL's "no product" sentinel for a folio line whose product id
+    // resolved to nothing (FrmCheckIn's `value3 = "-1"` fallback; the new
+    // booking→check-in product transfer emits it too). It can NEVER satisfy the
+    // `prod_legacy_no` FK join below, so treat it exactly like a NULL pro_id and
+    // SKIP — a folio line referencing no real product has no canonical pos-sale
+    // to mirror. Without this, a "-1" row falls through to the watermark-holding
+    // Err and PERMANENTLY jams all HT_CheckIn_Product CT sync (both apps). Genuine
+    // not-yet-mirrored products (a real Pro_no) still hit the Err below and hold
+    // the watermark for retry, preserving the eager-mirror-or-Err guarantee.
+    if pro_id == "-1" {
+        return Ok(());
+    }
 
     // Resolve cin_id + prod_id in one round trip. Any NULL means the
     // parent rows aren't yet mirrored — error so the watermark holds
