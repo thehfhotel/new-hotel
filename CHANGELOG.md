@@ -7,6 +7,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.70.0](https://github.com/thehfhotel/new-hotel/compare/v2.69.2...v2.70.0) (2026-06-24)
+
+
+### Added
+
+* **deploy:** auto-apply + verify legacy-MSSQL migrations in CI/CD ([258375e](https://github.com/thehfhotel/new-hotel/commit/258375e8b995005883c6ba00e4342e4cfa279a49))
+* **sync:** HT_Book_Pro CT ingestion + customer legacy_id backfill bin ([7057705](https://github.com/thehfhotel/new-hotel/commit/7057705bf81467352bf7bb8c18197f35309ed1bc))
+* **writeback:** customer-edit, mark-dirty, maintenance intents + round-bill gate warning ([3fd3205](https://github.com/thehfhotel/new-hotel/commit/3fd3205674192892debdba207f35c837d84f9326))
+
+
+### Fixed
+
+* **sync:** auto-resolve booking reconcile rows whose legacy room-type key churned ([fa51437](https://github.com/thehfhotel/new-hotel/commit/fa51437253f0226cc1bd881dc500dcca5a3ca1e4))
+* **sync:** close CT-watcher FK-defer silent-drop class + customer delete handling ([30d2d72](https://github.com/thehfhotel/new-hotel/commit/30d2d72301b413d32692828c732cf3cfe4dde813))
+* **sync:** close the room-FK silent-loss family — auto-create + loud misses ([7e76e9b](https://github.com/thehfhotel/new-hotel/commit/7e76e9bbe0304417bdb5925ad7a1fc09a0f2e84f))
+* **sync:** coupon legacy-id-reuse poison pill + Bangkok pay_date fallback + Conflict mapping on concurrent enqueue ([3a8d358](https://github.com/thehfhotel/new-hotel/commit/3a8d358d5cecf5c242d8fc39ba9618344b32da26))
+* **sync:** demote probe-timeout watermark page to informational tone ([ad1efa8](https://github.com/thehfhotel/new-hotel/commit/ad1efa80f00ded4e9f845b73d6af014f6329325f))
+* **sync:** hold watermark on transient orphan-recovery lookup errors ([2b3a9d6](https://github.com/thehfhotel/new-hotel/commit/2b3a9d6f2f4ae17f6727228bd343737111ba9484))
+* **writeback:** align recipes with captured iHOTEL flows — payment cart-clear, extend-stay totals, room-change §3.17, N-literal strips, fingerprint coverage ([70914fd](https://github.com/thehfhotel/new-hotel/commit/70914fd0c6a0774aed97bd8f9f7cc484f2cf7e9e))
+* **writeback:** per-event idempotency keys for repeatable-per-aggregate intents ([2453776](https://github.com/thehfhotel/new-hotel/commit/24537766b6bb346c9bcf6c291f3c6ce8fb696a13))
+
+
+### Changed
+
+* **backend:** drop vestigial legacy MSSQL pool from AppState ([a558d82](https://github.com/thehfhotel/new-hotel/commit/a558d827829c6fb0d37afb3b2f5c1795cabc57ee))
+
 ## [2.69.2](https://github.com/thehfhotel/new-hotel/compare/v2.69.1...v2.69.2) (2026-06-07)
 
 
