@@ -7,6 +7,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.71.0](https://github.com/thehfhotel/new-hotel/compare/v2.70.0...v2.71.0) (2026-06-24)
+
+
+### Added
+
+* **sync:** real --bootstrap --dry-run preview + reject unknown CLI flags ([e943853](https://github.com/thehfhotel/new-hotel/commit/e943853eb9c847f120c4829da18c8336ac096eb7))
+* **writeback:** ledger retention prune + runtime missing-table hardening ([797a8c9](https://github.com/thehfhotel/new-hotel/commit/797a8c9cc5d2050f8e29e33994709c2f62a6ad2c))
+* **writeback:** transfer HT_Book_Pro products to HT_CheckIn_Product on check-in ([d7d865b](https://github.com/thehfhotel/new-hotel/commit/d7d865b664ba6dc520ae624bdb76724eab97e7cb))
+
+
+### Fixed
+
+* **checkin:** reject multi-room booking check-in in the single-room new-app flow ([0e5ec48](https://github.com/thehfhotel/new-hotel/commit/0e5ec489df7cd8ac9f0a57b48122bacc73dafddc))
+* **deps:** match react-dom to react, bump lucide-react, clear js-yaml/[@babel](https://github.com/babel) security alerts ([0d66b1e](https://github.com/thehfhotel/new-hotel/commit/0d66b1e4e0c141bc0cd4a6d7aa3b47df34de42fd))
+* **frontend:** collapse duplicate SSE connections + fix Invalid Date on sync page ([e2b9169](https://github.com/thehfhotel/new-hotel/commit/e2b9169387bf454d9de9205f0118e574c7504d51))
+* **sync:** snapshot HT_Book_Pro during --bootstrap (close pre-CT backfill gap) ([d7981eb](https://github.com/thehfhotel/new-hotel/commit/d7981ebd3e4df25debd8ec9a27e376eb1463250e))
+* **writeback:** legacy idempotency ledger — no duplicate create-writebacks on retry ([a1c1883](https://github.com/thehfhotel/new-hotel/commit/a1c1883da75cd014f7bb39389bdb5cff9e489dbb))
+
+
+### Changed
+
+* **frontend:** centralize the stored-Thai-time UTC display rule ([e39a3e8](https://github.com/thehfhotel/new-hotel/commit/e39a3e8478c71f59ff713614dbd90fd89f86f828))
+* **writeback:** collapse intent classifiers into one exhaustive intent_facts ([2de3762](https://github.com/thehfhotel/new-hotel/commit/2de3762506ae56d4d12065d999116ca986c036f3))
+
 ## [2.70.0](https://github.com/thehfhotel/new-hotel/compare/v2.69.2...v2.70.0) (2026-06-24)
 
 
