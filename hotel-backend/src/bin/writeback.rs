@@ -397,10 +397,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     //   pending > 500, failed > 100, stuck in_progress > 5
     // Per-condition cooldown so a known-bad MSSQL outage doesn't flood.
     let janitor_pg = pg.clone();
+    let janitor_mssql = mssql.clone();
     let janitor_slack = slack.clone();
     let janitor_shutdown = shutdown.clone();
     tokio::spawn(async move {
-        run_queue_depth_janitor(janitor_pg, janitor_slack, janitor_shutdown).await;
+        run_queue_depth_janitor(janitor_pg, janitor_mssql, janitor_slack, janitor_shutdown).await;
     });
 
     // Task #69: wrap the main loop in a tracing span so every log line
@@ -2362,12 +2363,15 @@ pub fn queue_depth_breaches(snapshot: &QueueDepthSnapshot) -> Vec<String> {
 /// flooding. Best-effort: a failed PG query only logs a warning.
 async fn run_queue_depth_janitor(
     pg: PgPool,
+    mssql: DbPool,
     slack: Option<SlackClient>,
     shutdown: Arc<Notify>,
 ) {
     let mut last_alerted_pending: Option<Instant> = None;
     let mut last_alerted_failed: Option<Instant> = None;
     let mut last_alerted_stuck: Option<Instant> = None;
+    // Ledger retention prune cadence (~6h); None ⇒ prune on the first tick.
+    let mut last_pruned: Option<Instant> = None;
     let cooldown = Duration::from_secs(QUEUE_DEPTH_ALERT_COOLDOWN_SECS);
 
     tracing::info!(
@@ -2384,6 +2388,33 @@ async fn run_queue_depth_janitor(
             _ = shutdown.notified() => {
                 tracing::info!("[janitor] Shutdown — exiting");
                 return;
+            }
+        }
+
+        // Ledger retention prune (~6h cadence). Placed BEFORE the breach-driven
+        // early-returns below so quiet ticks don't skip it. Trims
+        // dbo.ht_writeback_ledger rows older than 90 days — idempotency markers
+        // far outlive a retry (which happens within the minutes-long lease).
+        // Best-effort + per-site (this worker's mssql pool targets its own
+        // legacy server); on failure we just wait for the next ~6h window.
+        if last_pruned.map_or(true, |t| t.elapsed() >= Duration::from_secs(6 * 3600)) {
+            match mssql.get().await {
+                Ok(mut conn) => {
+                    if let Err(e) = simple_query_with_timeout_drop(
+                        &mut conn,
+                        "DELETE FROM dbo.ht_writeback_ledger \
+                         WHERE applied_at < DATEADD(day, -90, GETDATE())",
+                        MssqlOpKind::Write,
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %e, "[janitor] ledger prune failed; next ~6h window");
+                    } else {
+                        tracing::debug!("[janitor] ledger prune ran (rows older than 90d removed)");
+                    }
+                    last_pruned = Some(Instant::now());
+                }
+                Err(e) => tracing::warn!(error = %e, "[janitor] ledger prune: no MSSQL conn this tick"),
             }
         }
 

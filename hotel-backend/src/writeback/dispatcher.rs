@@ -400,7 +400,9 @@ async fn ledger_lookup(
     // Read budget: this is a pure SELECT (the write that commits the row is
     // `ledger_record`). Runs inside the worker's open BEGIN TRAN; READ COMMITTED
     // still sees rows committed by the original attempt's separate TX.
-    let rows = simple_query_with_timeout(conn, &sql, MssqlOpKind::Read).await?;
+    let rows = simple_query_with_timeout(conn, &sql, MssqlOpKind::Read)
+        .await
+        .map_err(ledger_table_err)?;
     let Some(row) = rows.first() else {
         return Ok(None);
     };
@@ -445,8 +447,36 @@ async fn ledger_record(
     let json = serde_json::to_string(ids)
         .map_err(|e| WritebackError::Recipe(format!("ledger legacy_ids serialize: {e}")))?;
     let sql = build_ledger_insert_sql(idempotency_key, intent_name, aggregate_id, &json);
-    simple_query_with_timeout(conn, &sql, MssqlOpKind::Write).await?;
+    simple_query_with_timeout(conn, &sql, MssqlOpKind::Write)
+        .await
+        .map_err(ledger_table_err)?;
     Ok(())
+}
+
+/// True if an MSSQL error names the idempotency-ledger table — i.e. it is
+/// missing/unavailable (e.g. dropped mid-run by a backup-restore or admin wipe
+/// of the shared DB). The table name is distinctive, so a substring match is
+/// reliable. Pulled out so the classification is unit-testable.
+fn is_ledger_missing(err_msg: &str) -> bool {
+    err_msg.contains("ht_writeback_ledger")
+}
+
+/// Map a "ledger table missing mid-run" MSSQL error to a NON-retryable
+/// `WritebackError::Config`, so the job fails loud and exhausts immediately
+/// instead of burning retries that re-run the recipe UNGUARDED — which could
+/// create duplicate create-writebacks / double the `Pro_Amt` decrement, the
+/// exact class the ledger exists to prevent. The startup probe
+/// (`verify_writeback_ledger_exists`) catches a boot-time absence; this covers a
+/// drop while the worker is running. Any other error stays retryable.
+fn ledger_table_err(e: tiberius::error::Error) -> WritebackError {
+    if is_ledger_missing(&e.to_string()) {
+        WritebackError::Config(format!(
+            "dbo.ht_writeback_ledger unavailable mid-run — restore it; refusing to \
+             re-run the recipe unguarded ({e})"
+        ))
+    } else {
+        WritebackError::Tiberius(e)
+    }
 }
 
 /// Pure builder for the ledger lookup SQL (testable without MSSQL).
@@ -1024,6 +1054,16 @@ mod tests {
                 .expect("partial JSON must deserialize");
         assert_eq!(partial.cin_no.as_deref(), Some("CH26-000001"));
         assert_eq!(partial.book_id.as_deref(), Some("R014810"));
+    }
+
+    #[test]
+    fn is_ledger_missing_flags_only_the_ledger_table_error() {
+        assert!(is_ledger_missing("Invalid object name 'dbo.ht_writeback_ledger'."));
+        assert!(is_ledger_missing(
+            "... ht_writeback_ledger ... (code: 208, state: 1, class: 16)"
+        ));
+        assert!(!is_ledger_missing("Invalid object name 'dbo.ht_other_table'."));
+        assert!(!is_ledger_missing("connection reset by peer"));
     }
 
     #[test]
