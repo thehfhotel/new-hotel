@@ -312,14 +312,54 @@ const ROUND_BILL_GATE_SQL: &str =
 /// only surface that the rows will be missing from iHOTEL's shift /
 /// cash-drawer reports for the current round.
 fn intent_requires_open_round(intent: &WritebackIntent) -> bool {
-    matches!(
-        intent,
-        WritebackIntent::CreateCheckIn { .. }
-            | WritebackIntent::CheckOut { .. }
-            | WritebackIntent::RecordPayment { .. }
-            | WritebackIntent::RefundPayment { .. }
-            | WritebackIntent::RecordPosSale { .. }
-    )
+    intent_facts(intent).requires_open_round
+}
+
+/// Per-intent classification facts, derived in ONE EXHAUSTIVE match (no wildcard
+/// arm) so adding a `WritebackIntent` variant is a COMPILE error until it is
+/// classified here. This replaces the prior independent `matches!(...)`
+/// classifiers — `intent_requires_open_round` and `intent_is_ledgered` — which
+/// each silently returned `false` for an unlisted new intent (the drift hazard
+/// the architecture review flagged: a new money-writing or sequential-allocator
+/// intent would quietly skip the round-bill warning / the idempotency ledger).
+/// The big `dispatch` routing match and the legacy-id resolve/back-populate
+/// matches stay as-is: they are already compiler-exhaustive and carry
+/// irreducible per-intent logic.
+struct IntentFacts {
+    /// Gated by the legacy idempotency ledger — the sequential-allocator CREATE
+    /// recipes whose re-run would mint a duplicate id (see `ledger_lookup`).
+    ledgered: bool,
+    /// Writes money rows iHOTEL attributes to the open cashier round
+    /// (`HT_CheckIn_Pay` / `HT_CheckIn_H` totals / `HT_CheckIn_Product` /
+    /// `HT_Receipt_*`) — triggers the §1.9 round-bill warning.
+    requires_open_round: bool,
+}
+
+fn intent_facts(intent: &WritebackIntent) -> IntentFacts {
+    use WritebackIntent::*;
+    // (ledgered, requires_open_round). Exhaustive — do NOT add a `_` arm.
+    let (ledgered, requires_open_round) = match intent {
+        CreateBooking { .. } => (true, false),
+        CreateCheckIn { .. } => (true, true),
+        RecordPayment { .. } => (true, true),
+        IssueCoupon { .. } => (true, false),
+        RecordPosSale { .. } => (true, true),
+        CheckOut { .. } => (false, true),
+        RefundPayment { .. } => (false, true),
+        ModifyBooking { .. }
+        | CancelBooking { .. }
+        | CancelCheckIn { .. }
+        | ExtendStay { .. }
+        | RoomChange { .. }
+        | MarkRoomClean { .. }
+        | MarkRoomDirty { .. }
+        | SetRoomMaintenance { .. }
+        | UpdateRoom { .. }
+        | UpdateCustomer { .. }
+        | AdjustProductStock { .. }
+        | RedeemCoupon { .. } => (false, false),
+    };
+    IntentFacts { ledgered, requires_open_round }
 }
 
 /// Best-effort round-bill gate warning (cheatsheet §1.9). NEVER blocks or
@@ -378,14 +418,7 @@ async fn warn_if_no_open_round(conn: &mut LegacyConn<'_>, ctx: DispatchContext, 
 /// duplicate-protection benefit. `CreateCheckIn` covers both walk-in and
 /// booking-conversion. Keep in sync with the ledger chokepoint in `dispatch`.
 fn intent_is_ledgered(intent: &WritebackIntent) -> bool {
-    matches!(
-        intent,
-        WritebackIntent::CreateBooking { .. }
-            | WritebackIntent::CreateCheckIn { .. }
-            | WritebackIntent::RecordPayment { .. }
-            | WritebackIntent::IssueCoupon { .. }
-            | WritebackIntent::RecordPosSale { .. }
-    )
+    intent_facts(intent).ledgered
 }
 
 /// Ledger ENTRY check: has this job's `idempotency_key` already been applied?
@@ -1108,42 +1141,23 @@ mod tests {
     /// create payloads are awkward to construct) + functionally on the cheap
     /// intents below. Keep in sync with `intent_is_ledgered`'s `matches!`.
     #[test]
-    fn intent_is_ledgered_allowlist_is_complete_and_create_only() {
+    fn intent_facts_is_exhaustive_with_no_wildcard_arm() {
+        // Drift guard (the point of consolidating the classifiers): intent_facts
+        // MUST stay an EXHAUSTIVE match with NO `_` arm, so adding a
+        // WritebackIntent variant is a COMPILE error until it is classified —
+        // not the silent (false, false) default the old per-classifier
+        // matches!() gave. Adding a `_ =>` here reintroduces that hazard.
         let src = include_str!("dispatcher.rs");
-        let start = src
-            .find("fn intent_is_ledgered")
-            .expect("intent_is_ledgered must exist");
+        let start = src.find("fn intent_facts(").expect("intent_facts must exist");
         let rest = &src[start..];
-        // Bound to the function body (its first `\n}`), ASCII-safe.
         let body = &rest[..rest.find("\n}").map(|i| i + 2).unwrap_or(rest.len())];
-        for v in [
-            "CreateBooking",
-            "CreateCheckIn",
-            "RecordPayment",
-            "IssueCoupon",
-            "RecordPosSale",
-        ] {
-            assert!(
-                body.contains(&format!("WritebackIntent::{v}")),
-                "ledger allowlist must include create intent {v}"
-            );
-        }
-        for v in [
-            "CheckOut",
-            "CancelCheckIn",
-            "CancelBooking",
-            "ModifyBooking",
-            "ExtendStay",
-            "RoomChange",
-            "RedeemCoupon",
-            "MarkRoomClean",
-            "AdjustProductStock",
-            "UpdateCustomer",
-        ] {
-            assert!(
-                !body.contains(&format!("WritebackIntent::{v}")),
-                "mutate-only intent {v} must NOT be ledgered (idempotent convergence)"
-            );
+        assert!(
+            !body.contains("_ =>"),
+            "intent_facts must have NO wildcard arm (it would reintroduce silent drift)"
+        );
+        // The 5 sequential-allocator CREATE intents must be classified in the table.
+        for v in ["CreateBooking", "CreateCheckIn", "RecordPayment", "IssueCoupon", "RecordPosSale"] {
+            assert!(body.contains(v), "intent_facts must classify {v}");
         }
     }
 
@@ -1419,8 +1433,8 @@ mod tests {
             .find("warn_if_no_open_round(conn, ctx, intent.intent_name())")
             .expect("dispatch() must call warn_if_no_open_round");
         let match_pos = source
-            .find("match intent {")
-            .expect("dispatch() must contain `match intent {`");
+            .find("let result = match intent {")
+            .expect("dispatch() must contain the recipe match `let result = match intent {`");
         assert!(
             context_pos < gate_pos && gate_pos < match_pos,
             "round-bill gate must sit between set_context_info and the \
@@ -1452,8 +1466,8 @@ mod tests {
             .find("set_context_info(conn)")
             .expect("dispatch() must call set_context_info(conn)");
         let match_pos = source
-            .find("match intent {")
-            .expect("dispatch() must contain `match intent {`");
+            .find("let result = match intent {")
+            .expect("dispatch() must contain the recipe match `let result = match intent {`");
         assert!(
             context_pos < match_pos,
             "set_context_info must be called BEFORE the match on intent — \
