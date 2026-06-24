@@ -1384,21 +1384,50 @@ async fn record_divergence(
 }
 
 /// Pure decision helper for the auto-resolve sweep. A row in
-/// `ht_reconcile_log` may be auto-resolved iff a freshly-projected
-/// legacy (MSSQL) hash matches a freshly-computed canonical PG hash.
-/// Both inputs must be present non-empty strings — a `None` on either
-/// side is an intentional skip (missing-PG cases must persist until
-/// canonical actually catches up; missing-MSSQL cases need operator
-/// review).
+/// `ht_reconcile_log` may be auto-resolved when:
+///
+/// 1. **Primary convergence** — a freshly-projected legacy (MSSQL) hash
+///    and a freshly-computed canonical PG hash are both present, non-empty,
+///    and equal. A `None` on either side is normally an intentional skip
+///    (missing-PG cases must persist until canonical actually catches up;
+///    missing-MSSQL cases need operator review).
+///
+/// 2. **Stale-ghost convergence (bookings only)** — the legacy composite
+///    key has since *disappeared* (`current_legacy_hash == None`) yet
+///    canonical PG now exists and matches the legacy state recorded at
+///    detection time (`recorded_mssql_hash`). A booking's legacy PK is
+///    `{book_no}|{room_type}`, and the room-type half churns routinely
+///    over a booking's life (room reassignment, multi-room edits). A row
+///    first logged as `missing_pg` during the brief window before a
+///    NEW-app booking links its `legacy_book_id` becomes permanently
+///    unresolvable once that initial room-type line is swapped out: the
+///    legacy detail row for that exact key is gone, so the primary arm —
+///    which needs BOTH sides present — can never fire. Because the
+///    booking-level hash is room-type-independent, a match against the
+///    recorded `mssql_hash` proves the booking itself is fully reconciled;
+///    the per-room-type key simply churned away. This arm is restricted
+///    to bookings: a vanished legacy key for rooms / customers / checkins
+///    is a genuine anomaly that must stay open for operator review.
+///    (Live evidence 2026-06-24: bookings row `R015423|501`.)
+///
+/// The auto-resolve sweep only reaches this helper with a `None`
+/// `current_legacy_hash` when the legacy re-fetch returned `Ok(None)`
+/// (row genuinely absent) — a re-fetch *error* skips the row earlier, so
+/// a transient MSSQL outage can never be mistaken for a churned key.
 ///
 /// Pulled into a free function so the unit tests can exercise the
 /// truth table without a live PG pool.
 fn should_auto_resolve(
+    table_name: &str,
     current_legacy_hash: Option<&str>,
     current_pg_hash: Option<&str>,
+    recorded_mssql_hash: Option<&str>,
 ) -> bool {
     match (current_legacy_hash, current_pg_hash) {
         (Some(legacy), Some(pg)) if !legacy.is_empty() && !pg.is_empty() => legacy == pg,
+        (None, Some(pg)) if table_name == "bookings" && !pg.is_empty() => {
+            matches!(recorded_mssql_hash, Some(rec) if !rec.is_empty() && rec == pg)
+        }
         _ => false,
     }
 }
@@ -1724,8 +1753,8 @@ async fn auto_resolve_reconcile_log(
     pg_pool: &PgPool,
     site_id: &str,
 ) -> Result<usize, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (i64, String, String)>(
-        "SELECT id, table_name, legacy_pk \
+    let rows = sqlx::query_as::<_, (i64, String, String, Option<String>)>(
+        "SELECT id, table_name, legacy_pk, mssql_hash \
            FROM ht_reconcile_log \
           WHERE resolved_at IS NULL \
             AND divergence_kind IS NOT NULL \
@@ -1735,7 +1764,7 @@ async fn auto_resolve_reconcile_log(
     .await?;
 
     let mut resolved = 0usize;
-    for (id, table_name, legacy_pk) in rows {
+    for (id, table_name, legacy_pk, recorded_mssql_hash) in rows {
         let current_legacy_hash =
             match compute_current_legacy_hash(legacy_pool, &table_name, &legacy_pk).await {
                 Ok(opt) => opt,
@@ -1768,7 +1797,12 @@ async fn auto_resolve_reconcile_log(
                 }
             };
 
-        if !should_auto_resolve(current_legacy_hash.as_deref(), current_pg_hash.as_deref()) {
+        if !should_auto_resolve(
+            &table_name,
+            current_legacy_hash.as_deref(),
+            current_pg_hash.as_deref(),
+            recorded_mssql_hash.as_deref(),
+        ) {
             // Per-row visibility into stuck rows (prod debug 2026-05-18):
             // operators need to see WHY each persistent reconcile_log
             // row isn't converging — (a) legacy hash missing, (b)
@@ -1783,6 +1817,7 @@ async fn auto_resolve_reconcile_log(
                 legacy_pk = %legacy_pk,
                 current_legacy_hash = ?current_legacy_hash,
                 current_pg_hash = ?current_pg_hash,
+                recorded_mssql_hash = ?recorded_mssql_hash,
                 "[Sync] Auto-resolve sweep: hashes did not converge, leaving row open"
             );
             continue;
@@ -4433,20 +4468,31 @@ mod tests {
     /// row has been deleted since the drift was detected. This pure
     /// test pins the convention used by every `fetch_legacy_*_hash`
     /// helper: a missing row is "still drifted — leave for operator
-    /// review" rather than "converged to absent". The dispatch arm
-    /// therefore must NOT auto-resolve (`should_auto_resolve` rejects
-    /// the `None` half of the pair).
+    /// review" rather than "converged to absent". For non-booking
+    /// entities the dispatch arm must NOT auto-resolve a vanished
+    /// legacy key — even when canonical matches the recorded legacy
+    /// state — because a deleted room/customer/checkin is a genuine
+    /// anomaly. The stale-ghost arm is bookings-only.
     #[test]
     fn rooms_dispatch_missing_legacy_row_does_not_auto_resolve() {
         // Simulate `fetch_legacy_room_hash` returning Ok(None) for a
-        // legacy-deleted row, alongside a still-present canonical hash.
+        // legacy-deleted row, alongside a still-present canonical hash
+        // that EQUALS the recorded legacy hash. For bookings this would
+        // trip the stale-ghost arm; for rooms it must stay open.
+        let recorded = room_canonical_hash("A2-1", "yes", "no", None);
         let legacy_hash: Option<String> = None;
-        let pg_hash: Option<String> = Some(room_canonical_hash("A2-1", "yes", "no", None));
+        let pg_hash: Option<String> = Some(recorded.clone());
 
         assert!(
-            !should_auto_resolve(legacy_hash.as_deref(), pg_hash.as_deref()),
-            "a None legacy hash (row deleted) must keep the reconcile_log \
-             row open for operator review, never auto-resolve"
+            !should_auto_resolve(
+                "rooms",
+                legacy_hash.as_deref(),
+                pg_hash.as_deref(),
+                Some(recorded.as_str()),
+            ),
+            "a None legacy hash (room deleted) must keep the reconcile_log \
+             row open for operator review, never auto-resolve — the \
+             stale-ghost arm is restricted to bookings"
         );
     }
 
@@ -4939,24 +4985,88 @@ mod tests {
     // -------------------------------------------------------------------
 
     /// The sweep MUST mark a row resolved when the freshly-computed
-    /// canonical PG hash equals the recorded legacy hash. Pre-condition
-    /// for the auto-resolve UPDATE — if this regresses, the sweep
-    /// silently stops draining the queue.
+    /// canonical PG hash equals the freshly-projected legacy hash.
+    /// Pre-condition for the auto-resolve UPDATE — if this regresses,
+    /// the sweep silently stops draining the queue.
     #[test]
     fn auto_resolve_sweep_marks_resolved_when_hashes_match() {
-        let recorded_legacy_hash = Some("hash-X");
+        let current_legacy_hash = Some("hash-X");
         let current_pg_hash = Some("hash-X");
-        assert!(should_auto_resolve(recorded_legacy_hash, current_pg_hash));
+        assert!(should_auto_resolve(
+            "bookings",
+            current_legacy_hash,
+            current_pg_hash,
+            None,
+        ));
     }
 
     /// The sweep MUST leave the row untouched when canonical still
-    /// diverges from the recorded legacy hash. Drift that persists is
-    /// exactly what the alerts are supposed to surface.
+    /// diverges from the freshly-projected legacy hash. Drift that
+    /// persists is exactly what the alerts are supposed to surface.
     #[test]
     fn auto_resolve_sweep_skips_when_drift_persists() {
-        let recorded_legacy_hash = Some("hash-X");
+        let current_legacy_hash = Some("hash-X");
         let current_pg_hash = Some("hash-Y");
-        assert!(!should_auto_resolve(recorded_legacy_hash, current_pg_hash));
+        assert!(!should_auto_resolve(
+            "bookings",
+            current_legacy_hash,
+            current_pg_hash,
+            None,
+        ));
+    }
+
+    /// Stale-ghost convergence: a `bookings` row whose legacy composite
+    /// key has vanished (`current_legacy_hash == None`) but whose
+    /// canonical PG hash now matches the legacy state recorded at
+    /// detection (`recorded_mssql_hash`) MUST auto-resolve. This is the
+    /// `R015423|501` class — a `missing_pg` row logged before the
+    /// new-app booking linked `legacy_book_id`, stranded once its
+    /// initial room-type line was swapped out. Without this it sits
+    /// open forever and trips the >4h `level_drift_alert`.
+    #[test]
+    fn auto_resolve_sweep_resolves_booking_stale_ghost() {
+        let recorded = booking_canonical_hash(
+            "R015423",
+            Some("2026-07-04"),
+            Some("2026-07-05"),
+            Some("C22381"),
+        );
+        let current_pg_hash = recorded.clone();
+        assert!(should_auto_resolve(
+            "bookings",
+            None,                       // legacy room-type line is gone
+            Some(current_pg_hash.as_str()),
+            Some(recorded.as_str()),
+        ));
+    }
+
+    /// Negative: a genuine, persistent `missing_pg` booking (canonical
+    /// still absent today) MUST NOT be swept closed by the stale-ghost
+    /// arm. The legacy side recorded a hash, but PG never caught up —
+    /// this is real, un-reconciled drift.
+    #[test]
+    fn auto_resolve_sweep_keeps_open_persistent_missing_pg_booking() {
+        assert!(!should_auto_resolve(
+            "bookings",
+            None,            // legacy key gone
+            None,            // canonical still missing
+            Some("hash-X"),  // legacy recorded a hash at detection
+        ));
+    }
+
+    /// Negative: the stale-ghost arm fires only when canonical matches
+    /// the RECORDED legacy state. A `bookings` row where the legacy key
+    /// vanished but canonical PG diverges from what legacy had recorded
+    /// is real drift (the booking's dates/customer changed in PG
+    /// independently) and must stay open.
+    #[test]
+    fn auto_resolve_sweep_keeps_open_booking_ghost_with_mismatched_canonical() {
+        assert!(!should_auto_resolve(
+            "bookings",
+            None,
+            Some("hash-current-pg"),
+            Some("hash-recorded-legacy"),
+        ));
     }
 
     /// Composite-PK parse contract: a `"book_no|room_type"` PK splits
