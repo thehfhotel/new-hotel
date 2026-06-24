@@ -926,6 +926,16 @@ jobs:
             scripts/migrate-legacy-mssql.sh \
             scripts/deploy/run-deploy.sh
 
+          # The tarball base64 is passed to jq via --rawfile (reads from a
+          # file), NOT --arg "$(base64 ...)". A single command-line argument is
+          # capped at MAX_ARG_STRLEN (128 KB on Linux); the payload crossed that
+          # when migrations/legacy-mssql + the legacy runner were bundled
+          # (2026-06-24 deploy failure: "jq: Argument list too long" → empty
+          # payload → "malformed payload"). --rawfile has no length limit and
+          # future-proofs further tarball growth. tr -d '\n' drops base64's
+          # trailing newline so the string is exactly the encoded bytes.
+          base64 -w0 < /tmp/deploy.tar.gz | tr -d '\n' > /tmp/deploy.b64
+
           # RUST_LOG default below is pinned to debug for scheduler::sync
           # + scheduler::jobs until Track B junction-table migration ships
           # and reconcile noise drops to a steady-state baseline (incident
@@ -934,7 +944,7 @@ jobs:
           # above.
           jq -n \
             --arg commit_sha          "$GITHUB_SHA" \
-            --arg deploy_payload_b64  "$(base64 -w0 < /tmp/deploy.tar.gz)" \
+            --rawfile deploy_payload_b64 /tmp/deploy.b64 \
             --arg ghcr_user           "$GHCR_USER" \
             --arg ghcr_token          "$GHCR_TOKEN" \
             --arg DB_SERVER           "$DB_SERVER" \
