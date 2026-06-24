@@ -61,9 +61,9 @@ pub async fn reload_mirror_dimensions(legacy_pool: &DbPool, pg_pool: &PgPool) {
     );
 }
 
-/// **Bootstrap-only** snapshot of the 6 transactional legacy_mirror
+/// **Bootstrap-only** snapshot of the 7 transactional legacy_mirror
 /// tables (HT_Cupon, HT_CheckIn_Product, HT_Deposit, HT_Changed_Room,
-/// HT_Bill_Debt_H, HT_Bill_Debt_Ds).
+/// HT_Bill_Debt_H, HT_Bill_Debt_Ds, HT_Book_Pro).
 ///
 /// Why bootstrap-only: these tables are CT-tracked (Phase 5.5b) and
 /// the CT mappers (Phase 5.5c) handle every change that lands AFTER
@@ -99,6 +99,9 @@ pub async fn snapshot_mirror_transactional_tables(legacy_pool: &DbPool, pg_pool:
     }
     if let Err(e) = snapshot_bill_debt_ds(legacy_pool, pg_pool).await {
         tracing::error!(error = %e, "[Mirror] snapshot HT_Bill_Debt_Ds failed");
+    }
+    if let Err(e) = snapshot_book_pro(legacy_pool, pg_pool).await {
+        tracing::error!(error = %e, "[Mirror] snapshot HT_Book_Pro failed");
     }
 
     tracing::info!(
@@ -632,4 +635,127 @@ async fn snapshot_bill_debt_ds(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result
         "[Mirror] snapshot complete"
     );
     Ok(())
+}
+
+// Track P2 (coexistence audit 2026-06) — HT_Book_Pro joined the CT set in
+// Phase 5/E2 (`BookProMirrorMapper`, migrations legacy-mssql/023 + pg/056) but
+// was never added to the bootstrap snapshot set above, so rows that predate CT
+// enablement (~39 at HF Ville) are invisible to the watcher (CT history starts
+// at MIN_VALID_VERSION) AND never snapshotted — they simply never reach
+// `legacy_mirror.ht_book_pro`. This closes that gap: same DELETE+INSERT
+// `mirror_source='reconcile'` pattern as the other 6, column-for-column aligned
+// with the CT mapper's INSERT so 'reconcile' and 'ct' rows are interchangeable.
+// The 9-column projection matches `BOOK_PRO_SELECT_COLS` in sync/mappers/mirror.rs.
+async fn snapshot_book_pro(legacy_pool: &DbPool, pg_pool: &PgPool) -> Result<(), AnyError> {
+    let mut conn = legacy_pool.get().await?;
+    let rows = conn
+        .simple_query(
+            "SELECT id, B_NO, B_ROOM, B_NAME, B_UNIT, B_NUM, \
+                    B_PRICE, B_PRICE_TOTAL, B_PRO_ID FROM HT_Book_Pro",
+        )
+        .await?
+        .into_first_result()
+        .await?;
+
+    let mut tx = pg_pool.begin().await?;
+    sqlx::query("DELETE FROM legacy_mirror.ht_book_pro")
+        .execute(&mut *tx)
+        .await?;
+
+    let (mut inserted, mut skipped) = (0i64, 0i64);
+    for r in &rows {
+        // `id` is the IDENTITY PK (NOT NULL on the live baseline); a NULL here
+        // would be a schema violation, so skip + count rather than insert junk.
+        let Some(id): Option<i32> = r.get(0) else {
+            skipped += 1;
+            continue;
+        };
+        sqlx::query(
+            "INSERT INTO legacy_mirror.ht_book_pro \
+                (id, b_no, b_room, b_name, b_unit, b_num, \
+                 b_price, b_price_total, b_pro_id, mirror_source) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'reconcile')",
+        )
+        .bind(id)
+        .bind(r.try_get::<&str, _>(1).ok().flatten())
+        .bind(r.try_get::<&str, _>(2).ok().flatten())
+        .bind(r.try_get::<&str, _>(3).ok().flatten())
+        .bind(r.try_get::<&str, _>(4).ok().flatten())
+        .bind(r.try_get::<f64, _>(5).ok().flatten())
+        .bind(r.try_get::<f64, _>(6).ok().flatten())
+        .bind(r.try_get::<f64, _>(7).ok().flatten())
+        .bind(r.try_get::<i32, _>(8).ok().flatten())
+        .execute(&mut *tx)
+        .await?;
+        inserted += 1;
+    }
+    tx.commit().await?;
+    tracing::info!(
+        table = "HT_Book_Pro",
+        inserted,
+        skipped_null_pk = skipped,
+        "[Mirror] snapshot complete"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// Drift guard for the class that left HT_Book_Pro out of the bootstrap for
+    /// a full release (a `snapshot_*` helper existed but was never wired into
+    /// `snapshot_mirror_transactional_tables`, so its rows never reached PG).
+    /// Every `async fn snapshot_<table>` defined in this file MUST be invoked by
+    /// the bootstrap dispatcher. The snapshots are a one-shot path with no live
+    /// integration coverage (they need both MSSQL + PG), so this textual guard
+    /// is the only mechanical signal that a new snapshot is actually reachable.
+    #[test]
+    fn every_snapshot_helper_is_wired_into_the_bootstrap_dispatcher() {
+        // Scan only the code BEFORE this test module — otherwise the
+        // `include_str!` self-reference matches the `"async fn snapshot_"`
+        // literals in this very test and pollutes the helper list.
+        let full = include_str!("mirror.rs");
+        let src = &full[..full
+            .find("#[cfg(test)]")
+            .expect("test module marker must exist")];
+
+        // Body of snapshot_mirror_transactional_tables (up to its first `\n}`).
+        let disp_start = src
+            .find("pub async fn snapshot_mirror_transactional_tables(")
+            .expect("dispatcher fn must exist");
+        let disp_rest = &src[disp_start..];
+        let dispatcher = &disp_rest[..disp_rest
+            .find("\n}")
+            .map(|i| i + 2)
+            .unwrap_or(disp_rest.len())];
+
+        // Collect every `async fn snapshot_<name>(` helper definition.
+        let mut helpers: Vec<&str> = Vec::new();
+        for (i, _) in src.match_indices("async fn snapshot_") {
+            let after = &src[i + "async fn ".len()..];
+            let name_end = after.find('(').expect("fn def has `(`");
+            let name = &after[..name_end];
+            // Exclude the dispatcher itself (snapshot_mirror_transactional_tables).
+            if name != "snapshot_mirror_transactional_tables" {
+                helpers.push(name);
+            }
+        }
+        assert!(
+            helpers.len() >= 7,
+            "expected the 7 transactional snapshots, found {}: {helpers:?}",
+            helpers.len()
+        );
+        assert!(
+            helpers.contains(&"snapshot_book_pro"),
+            "snapshot_book_pro must be defined"
+        );
+
+        for name in &helpers {
+            assert!(
+                dispatcher.contains(&format!("{name}(legacy_pool")),
+                "snapshot helper `{name}` is defined but NOT called by \
+                 snapshot_mirror_transactional_tables — its rows would never \
+                 reach legacy_mirror during --bootstrap"
+            );
+        }
+    }
 }
