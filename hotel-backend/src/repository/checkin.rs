@@ -172,6 +172,16 @@ pub trait CheckInRepository: Send + Sync {
         room_id: i32,
     ) -> Result<i32, sqlx::Error>;
 
+    /// Count the rooms assigned to a booking (`ht_booking_rooms`). Used to
+    /// reject multi-room check-in: the new-app flow is single-room (one
+    /// `room_id` per POST), so a booking spanning >1 room cannot be checked in
+    /// correctly here yet.
+    async fn count_booking_rooms(
+        &self,
+        pool: &PgPool,
+        booking_id: i32,
+    ) -> Result<i64, sqlx::Error>;
+
     /// Latest `cin_no` for today (for sequence generation).
     async fn latest_cin_no_today(
         &self,
@@ -548,6 +558,21 @@ impl CheckInRepository for PgCheckInRepository {
         .fetch_one(pool)
         .await?;
         Ok(rec.active_count.unwrap_or(0))
+    }
+
+    async fn count_booking_rooms(
+        &self,
+        pool: &PgPool,
+        booking_id: i32,
+    ) -> Result<i64, sqlx::Error> {
+        // Runtime query (not the `query!` macro) so this guard-only count needs
+        // no `.sqlx` offline-cache entry. COUNT(*) is int8 -> i64.
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM ht_booking_rooms WHERE br_book_id = $1",
+        )
+        .bind(booking_id)
+        .fetch_one(pool)
+        .await
     }
 
     async fn latest_cin_no_today(

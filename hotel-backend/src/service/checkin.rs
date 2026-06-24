@@ -335,6 +335,15 @@ impl CheckInService {
                 ServiceError::not_found(format!("booking {} does not exist", cmd.booking_id))
             })?;
 
+        // Single-room-only guard (interim): reject a multi-room booking rather
+        // than silently check in one room and leave the rest vacant. See
+        // `reject_multi_room_checkin`.
+        let booking_room_count = self
+            .repo
+            .count_booking_rooms(&self.pg, cmd.booking_id)
+            .await?;
+        reject_multi_room_checkin(booking_room_count)?;
+
         let active_count = self
             .repo
             .count_active_for_room(&self.pg, cmd.room_id)
@@ -920,6 +929,26 @@ impl CheckInService {
     }
 }
 
+/// Guard: the new-app check-in flow is SINGLE-ROOM (one `room_id` per POST —
+/// routes/new_checkins.rs + the single-room UI). A booking spanning multiple
+/// rooms (`ht_booking_rooms`) cannot be checked in correctly here yet: checking
+/// in one room would leave the rest showing vacant (overbooking footgun), and
+/// the full multi-room writeback (one `HT_CheckIn_H` folio + N `HT_CheckIn_Ds`
+/// — the `room_lines` fan-out in checkin_to_booking, built+tested but unfed) is
+/// not wired into the service/route/UI. Reject loudly until that lands;
+/// multi-room bookings are checked in via iHOTEL (it owns the one-folio model).
+/// `0`/`1` pass: 1 = the normal single-room flow; 0 = a booking with no
+/// `ht_booking_rooms` rows yet (data gap) — neither is the unsupported case.
+fn reject_multi_room_checkin(booking_room_count: i64) -> ServiceResult<()> {
+    if booking_room_count > 1 {
+        return Err(ServiceError::validation(format!(
+            "this booking spans {booking_room_count} rooms; multi-room check-in \
+             is not yet supported in the new app — check it in via iHOTEL"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_party_size(adults: i32, children: i32) -> ServiceResult<()> {
     if adults < 0 || children < 0 {
         return Err(ServiceError::validation(format!(
@@ -972,6 +1001,21 @@ mod tests {
     use crate::outbox::{EventBus, OutboxRepository};
     use crate::repository::checkin::PgCheckInRepository;
     use crate::service::shifts::{CloseShiftCommand, OpenShiftCommand, ShiftService};
+
+    // Pure guard tests (no DB) — the single-room-only interim guard.
+    #[test]
+    fn reject_multi_room_checkin_blocks_multi_room_bookings() {
+        assert!(reject_multi_room_checkin(2).is_err());
+        assert!(reject_multi_room_checkin(45).is_err()); // group bookings exist in prod
+    }
+
+    #[test]
+    fn reject_multi_room_checkin_allows_single_or_zero_room_bookings() {
+        // 1 = the normal single-room flow; 0 = a booking with no ht_booking_rooms
+        // rows yet (data gap). Only >1 is the unsupported multi-room case.
+        assert!(reject_multi_room_checkin(1).is_ok());
+        assert!(reject_multi_room_checkin(0).is_ok());
+    }
 
     async fn try_pool() -> Option<PgPool> {
         let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
