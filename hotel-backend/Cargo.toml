@@ -57,7 +57,7 @@ axum = "0.8"
 # - time: tokio::time::sleep used by scheduler + sync/writeback workers
 # - sync: tokio::sync::Mutex used by scheduler state
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal", "test-util"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
 
 # Database - Legacy (SQL Server via tiberius for read-only legacy DB)
 # - Drop `rustls` feature: legacy MSSQL connection is plaintext over WireGuard;
