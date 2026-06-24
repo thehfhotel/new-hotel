@@ -88,7 +88,13 @@ function HealthBadge({ health }: { health: string }) {
 
 function formatDateTime(dateStr: string | null): string {
   if (!dateStr) return '-'
-  const date = new Date(dateStr + 'Z')
+  // `last_error_at` / `last_processed_at` are PostgreSQL timestamptz values,
+  // serialized by the backend as genuine UTC (RFC3339 with a trailing `Z`).
+  // They are NOT the SQL-Server "Thai-local stored without tz" case, so the
+  // CLAUDE.md `timeZone:'UTC'` rule does NOT apply here — `Asia/Bangkok` is the
+  // correct target zone for showing a true UTC instant to a Thai operator.
+  // The string already carries `Z`; appending another produced an invalid date.
+  const date = new Date(dateStr)
   return date.toLocaleString('th-TH', {
     year: 'numeric',
     month: 'short',
