@@ -444,10 +444,78 @@ const CT_ENABLED_TABLES: &[&str] = &[
     "HT_Book_Pro",
 ];
 
+/// What the `sync` binary was asked to do, parsed from argv.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliMode {
+    /// `--print-ct-tables`: dump the CT-enabled table list and exit (deploy gate).
+    PrintCtTables,
+    /// `--bootstrap [--dry-run]`: one-shot cold-seed. `dry_run` previews
+    /// (read-only) instead of writing.
+    Bootstrap { dry_run: bool },
+    /// No flags: run the steady-state CT watcher.
+    Watcher,
+}
+
+/// Parse the `sync` CLI mode from argv (pure; argv[0] is skipped).
+///
+/// Rejects any unrecognized argument with an error rather than ignoring it.
+/// This is deliberate: before this guard, `sync --bootstrap --dry-run` (or any
+/// typo'd flag) was SILENTLY IGNORED, so an operator expecting a no-op preview
+/// would instead run a full destructive bootstrap (DELETE+reinsert of every
+/// mirror table + a watermark stamp). `--dry-run` only means something for
+/// `--bootstrap` (the watcher and `--print-ct-tables` never write), so it is an
+/// error to pass it alone. `--print-ct-tables` is exclusive (it is the
+/// dependency-free deploy probe).
+fn parse_cli_mode<I: IntoIterator<Item = String>>(args: I) -> Result<CliMode, String> {
+    let (mut bootstrap, mut dry_run, mut print_ct) = (false, false, false);
+    for a in args.into_iter().skip(1) {
+        match a.as_str() {
+            "--bootstrap" => bootstrap = true,
+            "--dry-run" => dry_run = true,
+            "--print-ct-tables" => print_ct = true,
+            other => {
+                return Err(format!(
+                    "unrecognized argument `{other}`. Supported: \
+                     `--bootstrap [--dry-run]`, `--print-ct-tables`, or no args (watcher)"
+                ));
+            }
+        }
+    }
+    if print_ct {
+        if bootstrap || dry_run {
+            return Err(
+                "--print-ct-tables is exclusive and cannot be combined with other flags".into(),
+            );
+        }
+        return Ok(CliMode::PrintCtTables);
+    }
+    if dry_run && !bootstrap {
+        return Err(
+            "--dry-run only applies to --bootstrap (the watcher and --print-ct-tables never \
+             write). Did you mean `--bootstrap --dry-run`?"
+                .into(),
+        );
+    }
+    if bootstrap {
+        return Ok(CliMode::Bootstrap { dry_run });
+    }
+    Ok(CliMode::Watcher)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     hotel_backend::secrets::hydrate_env_from_secret_files();
     dotenvy::dotenv().ok();
+
+    // Parse argv up front so an unrecognized flag fails LOUD (see
+    // parse_cli_mode) instead of silently falling through to a write.
+    let mode = match parse_cli_mode(env::args().collect::<Vec<_>>()) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("[sync] argument error: {e}");
+            return Err(e.into());
+        }
+    };
 
     // Single source of truth for the deploy-time CT gate
     // (scripts/deploy/run-deploy.sh): emit the tables this binary expects
@@ -456,7 +524,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // the backend image to learn EXACTLY what this build requires — no
     // Rust-vs-shell list drift. Added after the 2026-06-24 HT_Book_Pro
     // incident (binary shipped ahead of its CT-enable migration).
-    if env::args().any(|a| a == "--print-ct-tables") {
+    if mode == CliMode::PrintCtTables {
         for t in CT_ENABLED_TABLES {
             println!("{t}");
         }
@@ -488,7 +556,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let site = SiteConfig::from_env();
     tracing::info!(site = %site.id, "CT watcher: site identity resolved");
 
-    let bootstrap_requested = env::args().any(|a| a == "--bootstrap");
+    let (bootstrap_requested, bootstrap_dry_run) = match mode {
+        CliMode::Bootstrap { dry_run } => (true, dry_run),
+        _ => (false, false),
+    };
 
     let enabled = env::var("LEGACY_SYNC_ENABLED")
         .map(|v| v == "true")
@@ -514,7 +585,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // live deployment, set `LEGACY_SYNC_ALLOW_LIVE_BOOTSTRAP=true`
     // (matches the cold-replay / overflow override pattern below).
     if bootstrap_requested {
-        if enabled {
+        // A dry run writes NOTHING (read-only preview), so it is always safe
+        // against a live watcher — skip the live-bootstrap refusal entirely.
+        if enabled && !bootstrap_dry_run {
             let allow_live_bootstrap = env::var("LEGACY_SYNC_ALLOW_LIVE_BOOTSTRAP")
                 .map(|v| v == "true")
                 .unwrap_or(false);
@@ -552,7 +625,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                  window may be clobbered by the snapshot DELETE."
             );
         }
-        return run_bootstrap(&site).await;
+        return run_bootstrap(&site, bootstrap_dry_run).await;
     }
 
     if !enabled {
@@ -961,9 +1034,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 /// Bootstrap is intentionally NOT idempotent in shape (the reconcile
 /// it invokes IS idempotent — UPSERT-by-hash). Re-running just re-runs
 /// the reconcile and re-stamps the watermark to the new tip.
-async fn run_bootstrap(site: &SiteConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn run_bootstrap(
+    site: &SiteConfig,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!(
         site = %site.id,
+        dry_run,
         "Phase 5.5 bootstrap — cold-seeding canonical PG + CT watermark"
     );
 
@@ -1039,6 +1116,70 @@ async fn run_bootstrap(site: &SiteConfig) -> Result<(), Box<dyn std::error::Erro
         snapshot_version,
         "[bootstrap] Captured CHANGE_TRACKING_CURRENT_VERSION() before snapshot"
     );
+
+    // `--dry-run`: everything above is read-only (connect, fingerprint, version
+    // capture). STOP HERE and report what the real run WOULD write — never
+    // touch PG or MSSQL. This is the safe preview an operator reaches for; it
+    // works against a live watcher (no writes to race) and is the reason
+    // `--dry-run` bypasses the live-bootstrap refusal in `main`.
+    if dry_run {
+        tracing::info!(
+            "[bootstrap:dry-run] read-only preview — NO writes will be performed"
+        );
+
+        // The global watermark the live bootstrap would OVERWRITE (unguarded)
+        // with `snapshot_version`. Surfacing both makes the rewind/advance
+        // explicit before the operator commits to a real run.
+        let current_watermark: i64 =
+            sqlx::query_scalar("SELECT last_seen_version FROM legacy_ct_state WHERE id = 1")
+                .fetch_one(&pg)
+                .await
+                .unwrap_or(-1);
+        tracing::info!(
+            current_watermark,
+            would_stamp_watermark = snapshot_version,
+            "[bootstrap:dry-run] watermark: a real bootstrap would overwrite the global watermark"
+        );
+
+        // Per transactional mirror table: legacy source count vs current PG
+        // mirror count. The real snapshot would DELETE the PG side and
+        // re-INSERT every source row as mirror_source='reconcile'.
+        for (mssql_table, pg_table) in hotel_backend::scheduler::mirror::MIRROR_TRANSACTIONAL_TABLES
+        {
+            let legacy_source_rows: i64 = {
+                let mut conn = mssql.get().await?;
+                let rows = conn
+                    .simple_query(format!("SELECT COUNT_BIG(*) FROM {mssql_table}"))
+                    .await?
+                    .into_first_result()
+                    .await?;
+                rows.first().and_then(|r| r.get::<i64, _>(0)).unwrap_or(-1)
+            };
+            // `pg_table` is a compile-time constant from
+            // MIRROR_TRANSACTIONAL_TABLES (never user input); AssertSqlSafe
+            // documents the audited interpolation sqlx 0.9 otherwise rejects.
+            let pg_mirror_rows: i64 = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM {pg_table}"
+            )))
+            .fetch_one(&pg)
+            .await
+            .unwrap_or(-1);
+            tracing::info!(
+                table = %mssql_table,
+                legacy_source_rows,
+                pg_mirror_rows,
+                delta = legacy_source_rows - pg_mirror_rows,
+                "[bootstrap:dry-run] snapshot would replace the PG mirror with the legacy source"
+            );
+        }
+
+        tracing::info!(
+            "[bootstrap:dry-run] preview complete. The canonical reconcile \
+             (run_sync, UPSERT-by-hash) was NOT executed — it converges canonical \
+             tables idempotently and is not enumerated here. No writes performed."
+        );
+        return Ok(());
+    }
 
     // Phase 1: run the existing reconcile path ONCE to bring canonical
     // PG state up to date with MSSQL. The legacy `scheduler::sync::run_sync`
@@ -3352,6 +3493,75 @@ async fn record_table_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // CLI mode parsing (parse_cli_mode) — the --dry-run / unknown-flag guard
+    // ========================================================================
+
+    fn argv(rest: &[&str]) -> Vec<String> {
+        // parse_cli_mode skips argv[0]; supply a realistic program name.
+        std::iter::once("./sync")
+            .chain(rest.iter().copied())
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn parse_cli_mode_no_args_is_watcher() {
+        assert_eq!(parse_cli_mode(argv(&[])), Ok(CliMode::Watcher));
+    }
+
+    #[test]
+    fn parse_cli_mode_bootstrap_plain() {
+        assert_eq!(
+            parse_cli_mode(argv(&["--bootstrap"])),
+            Ok(CliMode::Bootstrap { dry_run: false })
+        );
+    }
+
+    #[test]
+    fn parse_cli_mode_bootstrap_dry_run_either_order() {
+        assert_eq!(
+            parse_cli_mode(argv(&["--bootstrap", "--dry-run"])),
+            Ok(CliMode::Bootstrap { dry_run: true })
+        );
+        assert_eq!(
+            parse_cli_mode(argv(&["--dry-run", "--bootstrap"])),
+            Ok(CliMode::Bootstrap { dry_run: true })
+        );
+    }
+
+    #[test]
+    fn parse_cli_mode_print_ct_tables() {
+        assert_eq!(
+            parse_cli_mode(argv(&["--print-ct-tables"])),
+            Ok(CliMode::PrintCtTables)
+        );
+    }
+
+    #[test]
+    fn parse_cli_mode_dry_run_alone_is_rejected() {
+        // The regression that motivated this: --dry-run without --bootstrap
+        // must NOT silently become a watcher (or worse, be ignored on a write
+        // path). It is a hard error.
+        let err = parse_cli_mode(argv(&["--dry-run"])).unwrap_err();
+        assert!(err.contains("--dry-run only applies to --bootstrap"), "{err}");
+    }
+
+    #[test]
+    fn parse_cli_mode_unknown_flag_is_rejected() {
+        // The footgun: a typo'd or unsupported flag must fail loud, never be
+        // ignored (which previously let `--bootstrap --dyr-run` run a full write).
+        let err = parse_cli_mode(argv(&["--bootstrap", "--dyr-run"])).unwrap_err();
+        assert!(err.contains("unrecognized argument"), "{err}");
+        assert!(err.contains("--dyr-run"), "{err}");
+    }
+
+    #[test]
+    fn parse_cli_mode_print_ct_tables_is_exclusive() {
+        assert!(parse_cli_mode(argv(&["--print-ct-tables", "--bootstrap"])).is_err());
+        assert!(parse_cli_mode(argv(&["--print-ct-tables", "--dry-run"])).is_err());
+    }
 
     // ========================================================================
     // Resilience PR R1 — error taxonomy + last_error sanitization

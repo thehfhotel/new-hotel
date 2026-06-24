@@ -61,6 +61,24 @@ pub async fn reload_mirror_dimensions(legacy_pool: &DbPool, pg_pool: &PgPool) {
     );
 }
 
+/// The 7 transactional legacy_mirror tables the bootstrap snapshot covers,
+/// as `(legacy MSSQL table, canonical PG mirror table)` pairs. Single source
+/// of truth for read-only consumers that need the set without running the
+/// snapshot — e.g. the `sync --bootstrap --dry-run` preview, which reports
+/// source-vs-mirror row counts per table. The actual snapshot
+/// (`snapshot_mirror_transactional_tables`) still calls one bespoke function
+/// per table (each carries table-specific projection/skip logic); a test pins
+/// this list's length to that helper count so the two can't drift.
+pub const MIRROR_TRANSACTIONAL_TABLES: &[(&str, &str)] = &[
+    ("HT_Cupon", "legacy_mirror.ht_cupon"),
+    ("HT_CheckIn_Product", "legacy_mirror.ht_checkin_product"),
+    ("HT_Deposit", "legacy_mirror.ht_deposit"),
+    ("HT_Changed_Room", "legacy_mirror.ht_changed_room"),
+    ("HT_Bill_Debt_H", "legacy_mirror.ht_bill_debt_h"),
+    ("HT_Bill_Debt_Ds", "legacy_mirror.ht_bill_debt_ds"),
+    ("HT_Book_Pro", "legacy_mirror.ht_book_pro"),
+];
+
 /// **Bootstrap-only** snapshot of the 7 transactional legacy_mirror
 /// tables (HT_Cupon, HT_CheckIn_Product, HT_Deposit, HT_Changed_Room,
 /// HT_Bill_Debt_H, HT_Bill_Debt_Ds, HT_Book_Pro).
@@ -757,5 +775,16 @@ mod tests {
                  reach legacy_mirror during --bootstrap"
             );
         }
+
+        // MIRROR_TRANSACTIONAL_TABLES (used by the dry-run preview) must list
+        // exactly one (mssql, pg) pair per snapshot helper — else the preview
+        // silently omits a table the real snapshot writes (the book_pro class).
+        assert_eq!(
+            super::MIRROR_TRANSACTIONAL_TABLES.len(),
+            helpers.len(),
+            "MIRROR_TRANSACTIONAL_TABLES ({}) must have one entry per snapshot_* helper ({})",
+            super::MIRROR_TRANSACTIONAL_TABLES.len(),
+            helpers.len()
+        );
     }
 }
