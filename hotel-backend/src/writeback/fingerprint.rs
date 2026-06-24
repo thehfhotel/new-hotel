@@ -748,6 +748,42 @@ pub async fn verify_legacy_collation_safety(pool: &DbPool) -> WritebackResult<()
     Ok(())
 }
 
+/// Fail-loud at startup if the legacy idempotency ledger table
+/// (`dbo.ht_writeback_ledger`, migration legacy-mssql/024) is absent.
+///
+/// The crash-after-commit duplicate protection for the sequential-allocator
+/// CREATE recipes (booking_create / walkin / checkin_to_booking / payment /
+/// coupon-issue / pos_sale) is ENTIRELY ABSENT without this table. A missing
+/// table would otherwise surface only as a per-job Tiberius error, which
+/// `WritebackError::is_retryable()` treats as retryable — so the worker would
+/// silently retry-storm with ZERO protection (worst case: a backup/restore or
+/// admin wipe of the SHARED legacy DB drops the table out from under a running
+/// worker). The deploy's `--verify-ct` gate only checks Change Tracking, not
+/// arbitrary `dbo.*` existence, so this startup probe is the real guard. A
+/// clean deploy always passes (run-deploy.sh applies 024 before recreating the
+/// worker); this catches drift / out-of-order rollout.
+pub async fn verify_writeback_ledger_exists(pool: &DbPool) -> WritebackResult<()> {
+    let mut conn = pool.get().await?;
+    let rows: Vec<Row> = simple_query_with_timeout_pooled(
+        &mut conn,
+        "SELECT OBJECT_ID('dbo.ht_writeback_ledger', 'U') AS oid",
+        MssqlOpKind::Read,
+    )
+    .await?;
+    // OBJECT_ID returns NULL (-> get::<i32>() == None) when the object is absent.
+    let present = rows.first().and_then(|row| row.get::<i32, _>(0)).is_some();
+    if !present {
+        return Err(WritebackError::Config(
+            "dbo.ht_writeback_ledger missing — apply migrations/legacy-mssql/024_writeback_ledger.sql \
+             (the deploy runs scripts/migrate-legacy-mssql.sh automatically; check its output). It is \
+             the crash-after-commit duplicate guard for the create recipes; refusing to start without it."
+                .into(),
+        ));
+    }
+    tracing::info!("Legacy writeback idempotency ledger present (dbo.ht_writeback_ledger)");
+    Ok(())
+}
+
 /// Suppress the unused-import warning on `Query` — kept for the future
 /// CT-watcher bin that lives in the same crate.
 #[allow(dead_code)]

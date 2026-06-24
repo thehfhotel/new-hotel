@@ -287,6 +287,10 @@ fn nonempty<'a>(opt: Option<&'a String>) -> Option<&'a str> {
 pub struct DispatchContext {
     pub job_id: i64,
     pub aggregate_id: Uuid,
+    /// The job's frozen `writeback_jobs.idempotency_key` — the key the legacy
+    /// idempotency ledger (`dbo.ht_writeback_ledger`) is keyed on. Stored value,
+    /// never recomputed (see `ClaimedJob::idempotency_key`).
+    pub idempotency_key: Uuid,
 }
 
 /// Round-bill gate probe — `docs/legacy-app/COMPAT_CHEATSHEET.md` §1.9.
@@ -363,6 +367,115 @@ async fn warn_if_no_open_round(conn: &mut LegacyConn<'_>, ctx: DispatchContext, 
     }
 }
 
+/// Intents whose recipes ALLOCATE a fresh sequential legacy id (Book_ID /
+/// Cin_no / pay_no / cupon_no / receipt no) and are therefore NON-idempotent
+/// on a crash-after-commit retry. These — and only these — are gated by the
+/// legacy idempotency ledger (`dbo.ht_writeback_ledger`). Mutate-only intents
+/// (CheckOut, Cancel*, ModifyBooking, ExtendStay, RoomChange, MarkRoom*,
+/// Update*, AdjustProductStock, RedeemCoupon) are absolute-SET / idempotent
+/// UPSERT recipes whose correct second-run behaviour is to CONVERGE — ledgering
+/// them would add rows and could block a wanted convergence re-run for zero
+/// duplicate-protection benefit. `CreateCheckIn` covers both walk-in and
+/// booking-conversion. Keep in sync with the ledger chokepoint in `dispatch`.
+fn intent_is_ledgered(intent: &WritebackIntent) -> bool {
+    matches!(
+        intent,
+        WritebackIntent::CreateBooking { .. }
+            | WritebackIntent::CreateCheckIn { .. }
+            | WritebackIntent::RecordPayment { .. }
+            | WritebackIntent::IssueCoupon { .. }
+            | WritebackIntent::RecordPosSale { .. }
+    )
+}
+
+/// Ledger ENTRY check: has this job's `idempotency_key` already been applied?
+/// Returns the stored `LegacyIds` when the recipe committed on an earlier
+/// attempt (the crash-after-commit replay), so the caller short-circuits to an
+/// idempotent no-op. `Ok(None)` ⇒ first application; proceed.
+async fn ledger_lookup(
+    conn: &mut LegacyConn<'_>,
+    idempotency_key: Uuid,
+) -> WritebackResult<Option<LegacyIds>> {
+    let sql = build_ledger_lookup_sql(idempotency_key);
+    // Read budget: this is a pure SELECT (the write that commits the row is
+    // `ledger_record`). Runs inside the worker's open BEGIN TRAN; READ COMMITTED
+    // still sees rows committed by the original attempt's separate TX.
+    let rows = simple_query_with_timeout(conn, &sql, MssqlOpKind::Read).await?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    // legacy_ids is NVARCHAR(MAX). A NULL/undeserializable payload is treated as
+    // a HIT returning empty LegacyIds (mark_done's COALESCE back-population then
+    // re-derives from PG harmlessly) — but we LOG it: today every LegacyIds field
+    // is Option / #[serde(default)] so this can't happen, but a future field
+    // added without a default would otherwise silently drop ids on replay.
+    match row.get::<&str, _>(0) {
+        Some(json) => match serde_json::from_str::<LegacyIds>(json) {
+            Ok(ids) => Ok(Some(ids)),
+            Err(e) => {
+                tracing::error!(
+                    idempotency_key = %idempotency_key,
+                    error = %e,
+                    raw = %json,
+                    "Ledger hit but legacy_ids failed to deserialize — replaying as \
+                     empty LegacyIds (mark_done will re-derive from PG). Check for a \
+                     LegacyIds field added without #[serde(default)]."
+                );
+                Ok(Some(LegacyIds::default()))
+            }
+        },
+        None => Ok(Some(LegacyIds::default())),
+    }
+}
+
+/// Ledger RECORD: the LAST write before the worker's COMMIT, on the recipe's
+/// OWN connection, so it commits atomically with the recipe's legacy writes
+/// (and the future `Pro_Amt` decrement). The PRIMARY KEY on `idempotency_key`
+/// is the concurrency serializer of last resort: if two workers race across the
+/// lease window, the loser's INSERT hits the PK violation, its whole TX rolls
+/// back, and its retry no-ops on the winner's row. MUST remain the final
+/// statement `dispatch` emits — appending any write after it re-opens the gap.
+async fn ledger_record(
+    conn: &mut LegacyConn<'_>,
+    idempotency_key: Uuid,
+    intent_name: &str,
+    aggregate_id: Uuid,
+    ids: &LegacyIds,
+) -> WritebackResult<()> {
+    let json = serde_json::to_string(ids)
+        .map_err(|e| WritebackError::Recipe(format!("ledger legacy_ids serialize: {e}")))?;
+    let sql = build_ledger_insert_sql(idempotency_key, intent_name, aggregate_id, &json);
+    simple_query_with_timeout(conn, &sql, MssqlOpKind::Write).await?;
+    Ok(())
+}
+
+/// Pure builder for the ledger lookup SQL (testable without MSSQL).
+fn build_ledger_lookup_sql(idempotency_key: Uuid) -> String {
+    format!(
+        "SELECT legacy_ids FROM dbo.ht_writeback_ledger WHERE idempotency_key = '{idempotency_key}'"
+    )
+}
+
+/// Pure builder for the ledger INSERT SQL (testable without MSSQL).
+/// `idempotency_key` / `aggregate_id` are UUIDs and `intent_name` is a static
+/// identifier literal from `WritebackIntent::intent_name()` — none can carry a
+/// quote — so only the serialized `legacy_ids` JSON is single-quote-escaped.
+/// The `N'...'` prefix keeps the NVARCHAR(MAX) literal Unicode-safe (LegacyIds
+/// can carry Thai room/customer text).
+fn build_ledger_insert_sql(
+    idempotency_key: Uuid,
+    intent_name: &str,
+    aggregate_id: Uuid,
+    legacy_ids_json: &str,
+) -> String {
+    let json = legacy_ids_json.replace('\'', "''");
+    format!(
+        "INSERT INTO dbo.ht_writeback_ledger \
+            (idempotency_key, intent_name, aggregate_id, legacy_ids, applied_at) \
+         VALUES ('{idempotency_key}', '{intent_name}', '{aggregate_id}', N'{json}', GETDATE())"
+    )
+}
+
 /// Apply the intent's recipe inside the **caller's already-open** MSSQL
 /// connection. The worker is responsible for the surrounding transaction
 /// (`BEGIN TRAN ... COMMIT/ROLLBACK`).
@@ -437,12 +550,43 @@ pub async fn dispatch(
     // 5.2+ mappers are idempotent UPSERTs, so a missed tag costs at
     // most one extra cycle.
     crate::db::mssql_session::set_context_info(conn).await?;
-    // Cheatsheet §1.9 round-bill gate — best-effort WARN (never blocks)
-    // before any money-writing recipe runs. See `warn_if_no_open_round`.
+
+    // Legacy idempotency ledger (dbo.ht_writeback_ledger) — gates the
+    // sequential-allocator CREATE recipes against crash-after-commit retries.
+    // The worker COMMITs MSSQL (writeback.rs run_in_transaction) then marks the
+    // PG job done; a crash / lease-expiry BETWEEN those re-claims and re-runs
+    // this recipe, which would allocate a FRESH legacy id + duplicate the row
+    // (and, for CreateCheckIn, double-decrement HT_Products.Pro_Amt in Phase B).
+    // The only durable proof-of-write observable by the retry is a row written
+    // INSIDE the same BEGIN TRAN..COMMIT — hence a legacy-side ledger. It keys
+    // on the FROZEN per-job idempotency_key (NOT Cin_Book_no), so a true retry
+    // no-ops while N genuinely-distinct jobs (e.g. each room of a multi-room
+    // booking — single-room-per-POST, each its own aggregate) all land.
+    //
+    // The lookup short-circuits BEFORE the round-bill probe so a replay makes
+    // no further writes / emits no spurious `writeback_no_open_round` WARN.
+    let ledgered = intent_is_ledgered(intent);
+    if ledgered {
+        if let Some(ids) = ledger_lookup(conn, ctx.idempotency_key).await? {
+            tracing::info!(
+                job_id = ctx.job_id,
+                aggregate_id = %ctx.aggregate_id,
+                idempotency_key = %ctx.idempotency_key,
+                intent = intent.intent_name(),
+                "Writeback ledger hit — idempotent no-op replay (recipe already committed)"
+            );
+            return Ok(ids);
+        }
+    }
+
+    // Cheatsheet §1.9 round-bill gate — best-effort WARN (never blocks) before
+    // a money-writing recipe actually runs (after the ledger short-circuit so
+    // replays stay silent). See `warn_if_no_open_round`.
     if intent_requires_open_round(intent) {
         warn_if_no_open_round(conn, ctx, intent.intent_name()).await;
     }
-    match intent {
+
+    let result = match intent {
         WritebackIntent::CreateBooking { booking_id: _, payload } => {
             recipes::booking_create::execute(conn, payload).await
         }
@@ -820,7 +964,27 @@ pub async fn dispatch(
             }
             recipes::pos_sale::execute(conn, resolved_sale).await
         }
+    };
+
+    // Ledger RECORD — the LAST write before the worker's COMMIT, on the SAME
+    // conn, committing atomically with everything the recipe just wrote. Only
+    // on success (Ok): a recipe error propagates so the TX rolls back and the
+    // retry re-runs cleanly. A concurrent worker's INSERT here hits the PK and
+    // its `?` rolls back its whole TX (serializer of last resort). DO NOT add
+    // any write after this point — that would re-open the crash window.
+    if ledgered {
+        if let Ok(ref ids) = result {
+            ledger_record(
+                conn,
+                ctx.idempotency_key,
+                intent.intent_name(),
+                ctx.aggregate_id,
+                ids,
+            )
+            .await?;
+        }
     }
+    result
 }
 
 #[cfg(test)]
@@ -836,6 +1000,176 @@ mod tests {
         assert_eq!(json["book_id"], "R014810");
         assert_eq!(json["cust_no"], "C21610");
         assert!(json["cin_no"].is_null());
+    }
+
+    // ── Idempotency ledger (dbo.ht_writeback_ledger) ─────────────────────────
+
+    #[test]
+    fn legacy_ids_deserializes_from_minimal_and_partial_json() {
+        // Locks the ledger-replay deser contract: a row written by an OLDER
+        // binary (fewer fields) must still deserialize on replay — every
+        // LegacyIds field is Option / #[serde(default)]. If a future field is
+        // ever added WITHOUT a default this test breaks (and the live replay
+        // path logs + falls back to empty ids rather than silently dropping).
+        let empty: LegacyIds = serde_json::from_str("{}").expect("empty JSON must deserialize");
+        assert!(empty.cin_no.is_none() && empty.book_id.is_none());
+        let partial: LegacyIds =
+            serde_json::from_str(r#"{"cin_no":"CH26-000001","book_id":"R014810"}"#)
+                .expect("partial JSON must deserialize");
+        assert_eq!(partial.cin_no.as_deref(), Some("CH26-000001"));
+        assert_eq!(partial.book_id.as_deref(), Some("R014810"));
+    }
+
+    #[test]
+    fn build_ledger_lookup_sql_pins_table_and_key() {
+        let k = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let sql = build_ledger_lookup_sql(k);
+        assert_eq!(
+            sql,
+            "SELECT legacy_ids FROM dbo.ht_writeback_ledger WHERE idempotency_key = \
+             '550e8400-e29b-41d4-a716-446655440000'"
+        );
+    }
+
+    #[test]
+    fn build_ledger_insert_sql_shape_and_escaping() {
+        let k = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let agg = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        // A room_no carrying a single quote forces the JSON to contain a `'`,
+        // which the SQL literal MUST double-escape — else the INSERT breaks /
+        // is injectable. (LegacyIds can carry free-text fields.)
+        let json = serde_json::to_string(&LegacyIds::new().with_room_no("4'02".into())).unwrap();
+        assert!(json.contains("4'02"), "fixture JSON must contain the raw quote");
+        let sql = build_ledger_insert_sql(k, "create_check_in", agg, &json);
+
+        // Column order is load-bearing (matches migration 024 + the SELECT).
+        assert!(sql.contains(
+            "INSERT INTO dbo.ht_writeback_ledger (idempotency_key, intent_name, \
+             aggregate_id, legacy_ids, applied_at) VALUES ("
+        ));
+        // Keys placed positionally, intent literal, Unicode-safe N'' prefix, GETDATE().
+        assert!(sql.contains("'550e8400-e29b-41d4-a716-446655440000'"));
+        assert!(sql.contains("'create_check_in'"));
+        assert!(sql.contains("'11111111-2222-3333-4444-555555555555'"));
+        assert!(sql.contains("N'"), "legacy_ids literal must be NVARCHAR (N'')");
+        assert!(sql.contains("4''02"), "embedded single quote must be doubled");
+        assert!(!sql.contains("4'02'"), "raw unescaped quote must not survive");
+        assert!(sql.trim_end().ends_with("GETDATE())"));
+    }
+
+    /// The allowlist must cover exactly the sequential-allocator CREATE recipes
+    /// and NONE of the idempotent mutate-only ones. Pinned textually (the heavy
+    /// create payloads are awkward to construct) + functionally on the cheap
+    /// intents below. Keep in sync with `intent_is_ledgered`'s `matches!`.
+    #[test]
+    fn intent_is_ledgered_allowlist_is_complete_and_create_only() {
+        let src = include_str!("dispatcher.rs");
+        let start = src
+            .find("fn intent_is_ledgered")
+            .expect("intent_is_ledgered must exist");
+        let rest = &src[start..];
+        // Bound to the function body (its first `\n}`), ASCII-safe.
+        let body = &rest[..rest.find("\n}").map(|i| i + 2).unwrap_or(rest.len())];
+        for v in [
+            "CreateBooking",
+            "CreateCheckIn",
+            "RecordPayment",
+            "IssueCoupon",
+            "RecordPosSale",
+        ] {
+            assert!(
+                body.contains(&format!("WritebackIntent::{v}")),
+                "ledger allowlist must include create intent {v}"
+            );
+        }
+        for v in [
+            "CheckOut",
+            "CancelCheckIn",
+            "CancelBooking",
+            "ModifyBooking",
+            "ExtendStay",
+            "RoomChange",
+            "RedeemCoupon",
+            "MarkRoomClean",
+            "AdjustProductStock",
+            "UpdateCustomer",
+        ] {
+            assert!(
+                !body.contains(&format!("WritebackIntent::{v}")),
+                "mutate-only intent {v} must NOT be ledgered (idempotent convergence)"
+            );
+        }
+    }
+
+    #[test]
+    fn intent_is_ledgered_functional_on_cheap_intents() {
+        use crate::domain::payment::PaymentMethod;
+        use crate::domain::shared::Money;
+        use crate::outbox::intent::RecordPaymentReceipt;
+        let id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        // create / sequential-allocator → ledgered
+        assert!(intent_is_ledgered(&WritebackIntent::RecordPosSale {
+            check_in_id: id,
+            sale_id: 1,
+        }));
+        assert!(intent_is_ledgered(&WritebackIntent::RecordPayment {
+            check_in_id: id,
+            amount: Money::from_satang(1),
+            method: PaymentMethod::Cash,
+            receipt: RecordPaymentReceipt::default(),
+            checkin_ds_id: None,
+            price_per_night_baht: None,
+            nights: None,
+            payment_aggregate_id: None,
+            vat_percent: None,
+        }));
+        // mutate-only → NOT ledgered
+        assert!(!intent_is_ledgered(&WritebackIntent::CancelBooking { booking_id: id }));
+        assert!(!intent_is_ledgered(&WritebackIntent::MarkRoomClean {
+            room_id: id,
+            by: "Admin".into(),
+        }));
+        assert!(!intent_is_ledgered(&WritebackIntent::CheckOut {
+            check_in_id: id,
+            nights: None,
+            room_price_total: None,
+            product_total: None,
+            net_total: None,
+            pay_total: None,
+            balance: None,
+        }));
+    }
+
+    /// Load-bearing ordering invariant (the verifiers rated this high): the
+    /// ledger lookup MUST precede the recipe match, and the ledger record MUST
+    /// be the LAST write `dispatch` emits (after the match, before `result`).
+    /// Appending any write after `ledger_record` re-opens the crash window.
+    /// Pinned textually in the spirit of
+    /// `round_bill_gate_runs_between_context_info_and_recipes`.
+    #[test]
+    fn ledger_lookup_precedes_match_and_record_is_last_write() {
+        let src = include_str!("dispatcher.rs");
+        let lookup = src
+            .find("ledger_lookup(conn, ctx.idempotency_key)")
+            .expect("dispatch() must call ledger_lookup before the match");
+        let match_pos = src
+            .find("let result = match intent {")
+            .expect("dispatch() must assign `let result = match intent {`");
+        // Anchor on the post-match record BLOCK (unique to dispatch) rather than
+        // "ledger_record(" — the latter's first match is the fn definition, which
+        // precedes the match.
+        let record = src
+            .find("if let Ok(ref ids) = result {")
+            .expect("dispatch() must record the ledger after the match");
+        let result_tail = src
+            .find("\n    result\n}")
+            .expect("dispatch() must end by returning `result`");
+        assert!(lookup < match_pos, "ledger_lookup must run before the recipe match");
+        assert!(match_pos < record, "ledger_record must run AFTER the recipe match");
+        assert!(
+            record < result_tail,
+            "ledger_record must be the last write before `result` is returned"
+        );
     }
 
     #[test]

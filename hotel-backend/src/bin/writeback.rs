@@ -48,8 +48,8 @@ use hotel_backend::db::{create_pool, DbPool};
 use hotel_backend::notifications::slack::{SlackClient, SlackMessage};
 use hotel_backend::outbox::intent::WritebackIntent;
 use hotel_backend::writeback::{
-    dispatch, verify_legacy_collation_safety, verify_schema_fingerprint, DispatchContext,
-    ResolvedJob, WritebackError,
+    dispatch, verify_legacy_collation_safety, verify_schema_fingerprint,
+    verify_writeback_ledger_exists, DispatchContext, ResolvedJob, WritebackError,
 };
 
 /// PG channel name the service layer NOTIFYs after enqueueing a writeback job.
@@ -327,6 +327,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Err(format!("Schema fingerprint check failed: {e}").into());
     }
 
+    // 4c. Idempotency-ledger guard — refuse to start if dbo.ht_writeback_ledger
+    //     is absent. Without it, the crash-after-commit duplicate protection for
+    //     the create recipes is silently gone (a missing table reads as a
+    //     retryable Tiberius error -> retry-storm with zero protection). Same
+    //     fail-loud + Slack + throttle-sleep envelope as the fingerprint guard.
+    if let Err(e) = verify_writeback_ledger_exists(&mssql).await {
+        tracing::error!(
+            site = %site.id,
+            error = %e,
+            "Writeback idempotency ledger missing — refusing to start"
+        );
+        if let Some(slack) = &slack {
+            let msg = SlackMessage::with_site_text(
+                &site.id,
+                format!(
+                    ":warning: *Writeback worker REFUSED TO START* :warning:\n\
+                     Legacy idempotency ledger `dbo.ht_writeback_ledger` is missing.\n\
+                     *Error:* `{e}`\n\
+                     _Apply_ `migrations/legacy-mssql/024_writeback_ledger.sql` _(the deploy runs_ \
+                     `scripts/migrate-legacy-mssql.sh` _automatically — check its output / \
+                     `dbo.ht_legacy_migrations`). It is the crash-after-commit duplicate guard for \
+                     create recipes; the worker will not run without it._"
+                ),
+            );
+            let _ = slack.send_message(&msg).await;
+        }
+        tracing::warn!(
+            site = %site.id,
+            "Sleeping 60s before exit to throttle Docker restart cadence \
+             and avoid Slack alert flood"
+        );
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        return Err(format!("Writeback idempotency ledger missing: {e}").into());
+    }
+
     // 5. NOTIFY listener + poll fallback. The listener is wrapped in a
     //    supervisor (audit LOW-3) so a transient PG conn drop respawns
     //    automatically; without this the worker would silently degrade
@@ -487,6 +522,14 @@ struct ClaimedJob {
     id: i64,
     intent: WritebackIntent,
     aggregate_id: Uuid,
+    /// Frozen at enqueue (`writeback_jobs.idempotency_key`, immutable —
+    /// `claim_next_job` mutates only status/attempts/claimed_at). This is the
+    /// key the legacy idempotency ledger (`dbo.ht_writeback_ledger`) is keyed
+    /// on. MUST be the STORED value, never a recomputed `uuid5(intent,
+    /// aggregate_id)`: ExtendStay/RoomChange enqueue a per-event RANDOM
+    /// discriminator key, so recomputing would false-skip distinct events that
+    /// share an aggregate.
+    idempotency_key: Uuid,
     attempts: i32,
     claimed_at: DateTime<Utc>,
 }
@@ -532,7 +575,7 @@ async fn claim_next_job(
               FOR UPDATE SKIP LOCKED
               LIMIT 1
          )
-        RETURNING id, intent, payload, aggregate_id, attempts, claimed_at
+        RETURNING id, intent, payload, aggregate_id, idempotency_key, attempts, claimed_at
         "#,
     )
     .bind(max_attempts)
@@ -546,6 +589,7 @@ async fn claim_next_job(
     let intent_name: String = row.try_get("intent")?;
     let payload: serde_json::Value = row.try_get("payload")?;
     let aggregate_id: Uuid = row.try_get("aggregate_id")?;
+    let idempotency_key: Uuid = row.try_get("idempotency_key")?;
     let attempts: i32 = row.try_get("attempts")?;
     // claimed_at is set by this very UPDATE (NOW()); guaranteed NOT NULL
     // on the returned row. Used downstream to gate mark_done / mark_failed
@@ -566,6 +610,7 @@ async fn claim_next_job(
         id,
         intent,
         aggregate_id,
+        idempotency_key,
         attempts,
         claimed_at,
     }))
@@ -693,6 +738,7 @@ async fn process_job(
     let ctx = DispatchContext {
         job_id,
         aggregate_id: job.aggregate_id,
+        idempotency_key: job.idempotency_key,
     };
 
     let outcome = run_in_transaction(&mut conn, &job.intent, &resolved, ctx).await;
@@ -2733,6 +2779,7 @@ mod tests {
                 balance: None,
             },
             aggregate_id: Uuid::nil(),
+            idempotency_key: Uuid::nil(),
             attempts: 1,
             claimed_at,
         };
