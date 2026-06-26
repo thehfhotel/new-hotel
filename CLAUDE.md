@@ -6,11 +6,11 @@
 
 Summary:
 - Stay-current stack: Rust+Axum backend, Next.js 16 frontend, PostgreSQL, legacy MSSQL.
-- PostgreSQL is the source of truth from day one. Legacy MSSQL is an external sink.
-- Layered architecture inside the decommission boundary: `domain/` → `repository/` (PG-only) → `service/` (business logic + outbox emission) → thin `routes/`.
+- PostgreSQL is the source of truth from day one. iHOTEL/legacy MSSQL **coexists indefinitely — no planned decommission (ADR 0002)**; we mirror to/from it both ways. Both apps write both sites, kept consistent by the sync.
+- Layered architecture inside the decommission boundary (the same clean seam that makes durable coexistence safe): `domain/` → `repository/` (PG-only) → `service/` (business logic + outbox emission) → thin `routes/`.
 - Adapter workers OUTSIDE the boundary: `bin/writeback.rs` (LISTEN'er → MSSQL via tiberius), `bin/sync.rs` (Change Tracking watcher → publishes events; serves both HF Hotel and HF Ville via per-site env).
-- Event-driven sync via PG `LISTEN/NOTIFY` + SQL Server Change Tracking. Sub-second latency target.
-- Three operational states (today / transition / decommissioned) controlled by env vars only — no code changes between states.
+- Event-driven sync via PG `LISTEN/NOTIFY` + SQL Server Change Tracking. Sub-second latency target. Runs **permanently** (coexistence), not "until decommission".
+- Operational states are `.env` toggles: **State B (both apps coexist) is the permanent target**; State A (legacy-primary) is historical; **State C (our app only) is a dormant, unplanned capability** — iHOTEL is not being decommissioned (ADR 0002). No code changes between states.
 
 **Companion docs:**
 - `docs/legacy-spike/findings.md` — validated SQL recipes for every writeback flow. Don't re-derive.
@@ -115,7 +115,7 @@ Sensitive credentials (`DB_PASSWORD`, `POSTGRES_PASSWORD`, `VILLE_DB_PASSWORD`, 
 **Required secret files on evergreen** (must exist BEFORE the compose stack starts):
 - `/home/deploy/secrets/db_password` — legacy MSSQL `sa`
 - `/home/deploy/secrets/postgres_password` — newdb superuser
-- `/home/deploy/secrets/ville_db_password` — alias of `postgres_password` until ADR 0001 Phase 8
+- `/home/deploy/secrets/ville_db_password` — alias of `postgres_password` until HF Ville gets a distinct DB credential (coexistence hardening — ADR 0002; formerly tied to the now-superseded "ADR 0001 Phase 8")
 - `/home/deploy/secrets/slack_webhook_url`
 
 The deploy script (`/srv/run-deploy.sh` on evergreen, NOT in this repo) writes these from the JSON payload's `.secrets` block on every deploy, with mode `0400` and owner `deploy:docker`.

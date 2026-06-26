@@ -83,7 +83,7 @@ All of the schema-shaped concerns dissolve under the per-DB topology choice. The
 ## What this ADR does NOT decide
 
 - **Phase 5.5 (Ville mirror feature)** roll-out timing is intentionally deferred. Phase 5 (Ville) gives canonical-sync parity. Phase 5.5 (Ville) adds the 6 mirror tables and view-only history panels. Splitting them lets us validate the multi-site infrastructure against the more battle-tested Phase 5 scope first. Tracked as tasks #80-#82.
-- **Phase 8 / 9 (transition / decommission)** of the legacy MSSQL — this ADR doesn't pre-judge them, but every Q1 / Q2 choice is deliberately compatible with both eventual states.
+- **Phase 8 / 9 (transition / decommission)** of the legacy MSSQL — this ADR doesn't pre-judge them, but every Q1 / Q2 choice is deliberately compatible with both eventual states. **(Superseded by ADR 0002, 2026-06-26: there is no decommission — iHOTEL and our app coexist indefinitely; "Phase 8" is reframed as completing HF Ville co-equal writes, and there is no Phase 9.)**
 - **HF Hotel SS2022 → SS2025 upgrade** for version parity — defer 30+ days post-Phase 7 cutover. No functional gap today.
 - **Move MSSQL off the network segment (an internal segment) at Ville** — out of scope here. Isolation is enforced at the edge router forward chain + WG `/32` AllowedIPs scope. Worth scheduling separately as ops hardening.
 - **`sa / REDACTED-sa-pw` password rotation** at both sites — out of scope. Audit flagged it; schedule when next maintenance window opens.

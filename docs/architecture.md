@@ -10,14 +10,23 @@
 > The chosen path: layered architecture inside the existing Rust backend + event-driven sync. See §1 for the layout, §3.6 for the event bus, §8 for the migration roadmap.
 
 **Core principle:** PostgreSQL is the **single source of truth** from day one.
-The legacy MSSQL is treated as an **external system we currently mirror to/from** for backward-compatibility with the 3rd-party Windows app. When the 3rd-party app is decommissioned, we turn off the sync + writeback workers; everything else keeps working unchanged.
+The legacy MSSQL is an **external system we mirror to/from** so iHOTEL and our
+app can run side by side.
 
-The architecture must support **three operational states** without code changes — only `.env` toggles:
+> **Target end-state — permanent co-existence (ADR 0002, 2026-06-26).** iHOTEL is
+> **not** scheduled for decommission. iHOTEL and our app coexist *indefinitely*,
+> both writing both sites (HF Hotel + HF Ville), kept consistent by the
+> bidirectional CT-watcher + writeback sync. "State C (decommissioned)" below is
+> retained as a **dormant capability** the architecture supports for free (a
+> single env flip) — **not a roadmap goal.** See `docs/adr/0002-indefinite-coexistence.md`.
+
+The architecture supports these operational states without code changes — only
+`.env` toggles:
 
 ```
-State A (today):     Legacy app is primary UI       — sync + writeback both ON
-State B (transition): Both apps coexist               — sync + writeback both ON
-State C (decommissioned): Only our app                — sync + writeback both OFF
+State A:  Legacy app primary               — sync + writeback ON   (historical)
+State B:  Both apps coexist  ← TARGET       — sync + writeback ON   (permanent steady state)
+State C:  Only our app  (dormant/unplanned) — sync + writeback OFF  (capability, not a goal)
 ```
 
 ---
@@ -1256,6 +1265,12 @@ When the writeback worker is disabled:
 
 ## 8. Migration roadmap (stay-current stack, decommission-ready, event-driven)
 
+> **Status (2026-06): Phases 0–7 are complete and live.** Per **ADR 0002** the
+> end-state is **permanent co-existence**, not decommission — the "∞" row below
+> is a *dormant capability*, not a target. The one open item is completing
+> **HF Ville co-equal writes** (branch-route the write endpoints + verify Ville
+> writeback), which lifts the interim `/v2` Ville view-only gate.
+
 | Phase | Time | What | Independently shippable? |
 |---|---|---|---|
 | **0** | 3 days | Frontend collapse — delete `app/(legacy)`, single tree | ✅ |
@@ -1268,9 +1283,9 @@ When the writeback worker is disabled:
 | **5.5** | 1 week | Read-only mirror tables for legacy-only features. CT watcher imports `HT_Cupon`, `HT_Deposit`, `HT_ContinueTime`, `HT_Changed_Room`, `HT_Bill_Debt_*`, `HT_CheckIn_Product`, `HT_Rooms_Cancel` into PG read-only schema. Our UI can SHOW these entities (coupons attached, deposits taken, products charged, room changes) even though our app can't EDIT them. Dramatically improves UX during co-existence — receptionists see the full picture in our app instead of switching to the .NET app for legacy-only features. | ✅ |
 | **6** | 3 days | Drift-reconcile job (15-min cron) as safety net for missed CT events. Drop polling-sync (replaced by event-driven). | ✅ |
 | **7** | 1 week | Multi-site full deploy at HF Ville (after Phase 4 proven 1 month). Same image, different `.env`. **Goals #2 + #3 ✓** | ✅ |
-| **∞** | 1 day | Decommission. Set `WRITEBACK_ENABLED=false`, `LEGACY_SYNC_ENABLED=false`. Stop sync + writeback workers. SSE broadcaster keeps running for in-app real-time. Drop `legacy_mirror` schema. | ✅ |
+| **∞ (dormant)** | 1 day | **Decommission — NOT planned (ADR 0002).** Capability only: an env flip (`WRITEBACK_ENABLED=false`, `LEGACY_SYNC_ENABLED=false`) stops the workers and `legacy_mirror` can be dropped. Retained as insurance; iHOTEL stays. SSE broadcaster keeps running for in-app real-time regardless. | n/a |
 
-**Total: ~6-7 weeks to production-ready writeback + event-driven sync** + **1 day to decommission**.
+**Total: ~6-7 weeks to production-ready writeback + event-driven sync** (all shipped). Decommission stays a ~1-day env flip **if ever needed — not planned (ADR 0002); permanent coexistence is the target**.
 
 Phases 0-3 are pure refactoring + scaffolding. Phase 4a ships real-time UI updates for our own writes (immediately useful even without writeback). Phase 4b unlocks Goal #1. Phase 5 closes the loop with .NET-app-side detection.
 
