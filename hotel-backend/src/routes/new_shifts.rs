@@ -643,6 +643,10 @@ pub struct RoundSummaryRow {
     /// PG `shift_id` — lets the UI open the single-round report
     /// (`GET /api/shifts/{shift_id}/report`) on row click.
     pub shift_id: i64,
+    /// Site this round belongs to ("hfhotel" | "hfville"). Required for the
+    /// drill-down: `shift_id` is a per-database sequence, so the two sites'
+    /// ids can collide — the report fetch must target the right site.
+    pub branch: String,
     pub shift_no: i32,
     pub legacy_round_id: Option<i32>,
     pub opened_at: DateTime<Utc>,
@@ -700,26 +704,15 @@ pub struct RoundSummaryResponse {
     pub by_cashier: Vec<CashierTally>,
 }
 
-/// `GET /api/shifts/summary` — closed rounds over a date range, each with the
-/// iHOTEL `View_RBill_H` per-round breakdown, plus period totals + a
-/// by-cashier roll-up. Branch-aware (per-site pool), same as the report.
-pub async fn round_summary(
-    State(state): State<AppState>,
-    Query(query): Query<RoundSummaryQuery>,
-) -> ApiResult<Json<RoundSummaryResponse>> {
-    let pool = match query.branch.unwrap_or_default() {
-        Branch::Hfville => state.ville_pool()?,
-        Branch::Hfhotel | Branch::All => &state.new_pool,
-    };
-
-    let to = query.to.unwrap_or_else(Utc::now);
-    let mut from = query.from.unwrap_or_else(|| to - chrono::Duration::days(30));
-    // Cap the span so the per-round deposit subqueries stay bounded.
-    let max_from = to - chrono::Duration::days(92);
-    if from < max_from {
-        from = max_from;
-    }
-
+/// Per-site round rows for [`round_summary`], tagged with `branch_label` so the
+/// merged All view (and the drill-down) knows each round's site — `shift_id` is
+/// a per-database sequence and the two sites' ids can collide.
+async fn round_summary_rows(
+    pool: &crate::db::PgPool,
+    branch_label: &str,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> ApiResult<Vec<RoundSummaryRow>> {
     // One pass: per closed round, the ledger tender splits (FILTER) + deposit
     // received/returned (correlated subqueries scoped to that round's window).
     let rows = sqlx::query(
@@ -755,10 +748,7 @@ pub async fn round_summary(
     .map_err(|e| ApiError::Internal(format!("failed to build round summary: {e}")))?;
 
     let round2 = |v: f64| (v * 100.0).round() / 100.0;
-    let mut rounds = Vec::with_capacity(rows.len());
-    let mut totals = RoundSummaryTotals::default();
-    let mut tally: std::collections::HashMap<String, (i64, f64)> = std::collections::HashMap::new();
-
+    let mut out = Vec::with_capacity(rows.len());
     for r in rows {
         let opening: f64 = r.try_get("opening").map_err(map_shift_row_err)?;
         let cash_received: f64 = r.try_get("cash_received").map_err(map_shift_row_err)?;
@@ -771,31 +761,16 @@ pub async fn round_summary(
         let dep_returned: f64 = r.try_get("dep_returned").map_err(map_shift_row_err)?;
         let cash_net = cash_received - cash_paid;
         let grand_total = round2(opening + cash_net + credit + transfer);
-        let closed_by: Option<String> = r.try_get("shift_closed_by").map_err(map_shift_row_err)?;
 
-        totals.round_count += 1;
-        totals.cash_received += cash_received;
-        totals.cash_paid += cash_paid;
-        totals.credit += credit;
-        totals.transfer += transfer;
-        totals.free += free;
-        totals.web += web;
-        totals.deposits_received += dep_received;
-        totals.deposits_returned += dep_returned;
-        totals.grand_total += grand_total;
-
-        let e = tally.entry(closed_by.clone().unwrap_or_else(|| "—".into())).or_insert((0, 0.0));
-        e.0 += 1;
-        e.1 += grand_total;
-
-        rounds.push(RoundSummaryRow {
+        out.push(RoundSummaryRow {
             shift_id: r.try_get("shift_id").map_err(map_shift_row_err)?,
+            branch: branch_label.to_string(),
             shift_no: r.try_get("shift_no").map_err(map_shift_row_err)?,
             legacy_round_id: r.try_get("shift_legacy_round_id").map_err(map_shift_row_err)?,
             opened_at: r.try_get("shift_opened_at").map_err(map_shift_row_err)?,
             closed_at: r.try_get("shift_closed_at").map_err(map_shift_row_err)?,
             opened_by: r.try_get("shift_opened_by").map_err(map_shift_row_err)?,
-            closed_by,
+            closed_by: r.try_get("shift_closed_by").map_err(map_shift_row_err)?,
             opening,
             cash_received,
             cash_paid,
@@ -808,6 +783,71 @@ pub async fn round_summary(
             deposits_returned: dep_returned,
             grand_total,
         });
+    }
+    Ok(out)
+}
+
+/// `GET /api/shifts/summary` — closed rounds over a date range, each with the
+/// iHOTEL `View_RBill_H` per-round breakdown, plus period totals + a
+/// by-cashier roll-up. Branch-aware: `All` ("ทั้งหมด") aggregates BOTH sites'
+/// rounds (HF Hotel + HF Ville), mirroring how bookings/checkins/calendar treat
+/// `Branch::All` — a cashier round is per-site, so "all" means both, merged.
+pub async fn round_summary(
+    State(state): State<AppState>,
+    Query(query): Query<RoundSummaryQuery>,
+) -> ApiResult<Json<RoundSummaryResponse>> {
+    let to = query.to.unwrap_or_else(Utc::now);
+    let mut from = query.from.unwrap_or_else(|| to - chrono::Duration::days(30));
+    // Cap the span so the per-round deposit subqueries stay bounded.
+    let max_from = to - chrono::Duration::days(92);
+    if from < max_from {
+        from = max_from;
+    }
+
+    // Resolve which site(s) to scan. HF Ville is included for `All` only when
+    // its DB is wired up (graceful degrade to HF-only otherwise, like
+    // calendar.rs); an explicit Hfville request with no Ville DB is an error.
+    let branch = query.branch.unwrap_or_default();
+    let mut pools: Vec<(&str, &crate::db::PgPool)> = Vec::new();
+    if branch == Branch::Hfhotel || branch == Branch::All {
+        pools.push(("hfhotel", &state.new_pool));
+    }
+    if branch == Branch::Hfville || branch == Branch::All {
+        match state.ville_pool() {
+            Ok(vp) => pools.push(("hfville", vp)),
+            Err(e) if branch == Branch::Hfville => return Err(e),
+            Err(_) => {} // All + no Ville DB → HF Hotel only.
+        }
+    }
+
+    let mut rounds: Vec<RoundSummaryRow> = Vec::new();
+    for (label, pool) in pools {
+        rounds.extend(round_summary_rows(pool, label, from, to).await?);
+    }
+    // Merge the per-site lists into one newest-first stream.
+    rounds.sort_by(|a, b| b.opened_at.cmp(&a.opened_at));
+
+    // Period totals + by-cashier roll-up computed from the merged rounds.
+    let round2 = |v: f64| (v * 100.0).round() / 100.0;
+    let mut totals = RoundSummaryTotals::default();
+    let mut tally: std::collections::HashMap<String, (i64, f64)> = std::collections::HashMap::new();
+    for r in &rounds {
+        totals.round_count += 1;
+        totals.cash_received += r.cash_received;
+        totals.cash_paid += r.cash_paid;
+        totals.credit += r.credit;
+        totals.transfer += r.transfer;
+        totals.free += r.free;
+        totals.web += r.web;
+        totals.deposits_received += r.deposits_received;
+        totals.deposits_returned += r.deposits_returned;
+        totals.grand_total += r.grand_total;
+
+        let e = tally
+            .entry(r.closed_by.clone().unwrap_or_else(|| "—".into()))
+            .or_insert((0, 0.0));
+        e.0 += 1;
+        e.1 += r.grand_total;
     }
 
     // Round period totals; sort cashiers by total desc.

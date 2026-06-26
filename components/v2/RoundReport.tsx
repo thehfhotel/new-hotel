@@ -237,14 +237,29 @@ export default function RoundReport({ data }: { data: RoundReportData }) {
  * [`RoundReport`] in a v2 sheet. Used by the "view round report" action — no
  * write capability required (purely informational).
  */
-export function RoundReportSheet({ shiftId, onClose }: { shiftId: number; onClose: () => void }) {
+export function RoundReportSheet({
+  shiftId,
+  branch,
+  onClose,
+}: {
+  shiftId: number
+  /** Site to fetch from. When the caller already knows the round's site (e.g.
+   *  the All summary, where shift_id is ambiguous across sites), pass it so the
+   *  report targets the right database; otherwise the globally-selected branch
+   *  is used. */
+  branch?: string
+  onClose: () => void
+}) {
   const branchFetch = useBranchFetch()
   const [data, setData] = useState<RoundReportData | null>(null)
   const [loaded, setLoaded] = useState(false)
 
   useEffect(() => {
     let alive = true
-    branchFetch(`/api/shifts/${shiftId}/report`)
+    const req = branch
+      ? fetch(`/api/shifts/${shiftId}/report?branch=${encodeURIComponent(branch)}`)
+      : branchFetch(`/api/shifts/${shiftId}/report`)
+    req
       .then(async (r) => {
         if (alive && r.ok) setData(await r.json())
       })
@@ -255,7 +270,7 @@ export function RoundReportSheet({ shiftId, onClose }: { shiftId: number; onClos
     return () => {
       alive = false
     }
-  }, [branchFetch, shiftId])
+  }, [branchFetch, shiftId, branch])
 
   return (
     <div className="v2-sheet-backdrop" onClick={onClose} role="dialog" aria-modal="true">

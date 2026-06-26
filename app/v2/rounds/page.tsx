@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Printer, Users } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { useBranch } from '@/contexts/BranchContext'
 import { formatCurrency } from '@/lib/format'
 import { printRegion } from '@/lib/print'
 import { V2PageHeader, V2Spinner, V2Empty } from '@/components/v2/primitives'
@@ -17,6 +18,9 @@ import { formatThai, RoundReportSheet } from '@/components/v2/RoundReport'
 
 interface SummaryRound {
   shiftId: number
+  /** Site this round is from ("hfhotel" | "hfville") — set on every row so the
+   *  "ทั้งหมด" (All) view can show + drill into the correct site. */
+  branch: string
   shiftNo: number
   legacyRoundId: number | null
   openedAt: string
@@ -103,11 +107,14 @@ const COLS: { key: keyof SummaryRound | 'dates'; label: string; num?: boolean }[
 
 export default function V2Rounds() {
   const branchFetch = useBranchFetch()
+  const { branch } = useBranch()
   const [from, setFrom] = useState(() => bkkDate(30))
   const [to, setTo] = useState(() => bkkDate(0))
   const [data, setData] = useState<SummaryData | null>(null)
   const [loading, setLoading] = useState(true)
-  const [reportShiftId, setReportShiftId] = useState<number | null>(null)
+  // Drill-down carries the site too: shift_id is per-database, so an "All" view
+  // mixes both sites' rounds and the report must be fetched from the right one.
+  const [report, setReport] = useState<{ shiftId: number; branch: string } | null>(null)
 
   const fetchSummary = useCallback(async () => {
     setLoading(true)
@@ -220,12 +227,22 @@ export default function V2Rounds() {
                 <tbody>
                   {data!.rounds.map((r) => (
                     <tr
-                      key={r.shiftId}
-                      onClick={() => setReportShiftId(r.shiftId)}
+                      key={`${r.branch}-${r.shiftId}`}
+                      onClick={() => setReport({ shiftId: r.shiftId, branch: r.branch })}
                       className="cursor-pointer transition-colors hover:bg-[var(--v2-surface-2)]"
                       style={{ borderBottom: '1px solid var(--v2-line)' }}
                     >
-                      <td className="px-3 py-2.5 v2-num whitespace-nowrap">#{r.shiftNo}</td>
+                      <td className="px-3 py-2.5 v2-num whitespace-nowrap">
+                        {branch === 'all' && (
+                          <span
+                            className="mr-1.5 text-[10px] px-1.5 py-0.5 rounded align-middle"
+                            style={{ background: 'var(--v2-surface-2)', color: 'var(--v2-ink-3)' }}
+                          >
+                            {r.branch === 'hfville' ? 'Ville' : 'HF'}
+                          </span>
+                        )}
+                        #{r.shiftNo}
+                      </td>
                       <td className="px-3 py-2.5 v2-num whitespace-nowrap" style={{ color: 'var(--v2-ink-3)' }}>
                         {formatThai(r.openedAt)}
                         {r.closedAt ? ` → ${formatThai(r.closedAt)}` : ''}
@@ -270,8 +287,8 @@ export default function V2Rounds() {
         </div>
       )}
 
-      {reportShiftId != null && (
-        <RoundReportSheet shiftId={reportShiftId} onClose={() => setReportShiftId(null)} />
+      {report != null && (
+        <RoundReportSheet shiftId={report.shiftId} branch={report.branch} onClose={() => setReport(null)} />
       )}
     </div>
   )
