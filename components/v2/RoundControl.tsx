@@ -1,11 +1,13 @@
 'use client'
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import Link from 'next/link'
-import { AlertTriangle, Clock, Loader2, Lock, Unlock, X } from 'lucide-react'
+import { AlertTriangle, Clock, FileText, Loader2, Lock, Unlock, X } from 'lucide-react'
 import { useBranch } from '@/contexts/BranchContext'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { useAuth } from '@/contexts/AuthContext'
+import RoundCloseSheet from './RoundCloseSheet'
+import { RoundReportSheet } from './RoundReport'
 
 /**
  * Cashier-round (HT_Round_Bill / รอบบิล) control for the v2 home screen.
@@ -21,6 +23,7 @@ import { useAuth } from '@/contexts/AuthContext'
  */
 
 interface ShiftDto {
+  shiftId: number
   shiftNo: number
   openedBy: string
   openedAt: string
@@ -50,11 +53,15 @@ export default function RoundControl({ onChanged }: { onChanged?: () => void }) 
 
   const [shift, setShift] = useState<ShiftDto | null>(null)
   const [loaded, setLoaded] = useState(false)
-  const [mode, setMode] = useState<'idle' | 'opening' | 'closing'>('idle')
+  const [mode, setMode] = useState<'idle' | 'opening'>('idle')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [openingFloat, setOpeningFloat] = useState('3000')
   const [actor, setActor] = useState('')
+  // Close/report sheets carry the shiftId so they survive `shift` going null
+  // after a successful close (the close sheet shows the final report).
+  const [closingShiftId, setClosingShiftId] = useState<number | null>(null)
+  const [viewingShiftId, setViewingShiftId] = useState<number | null>(null)
 
   // Latest-wins guard: branch can flip (hfhotel default → stored value) mid-flight.
   const reqRef = useRef(0)
@@ -125,39 +132,27 @@ export default function RoundControl({ onChanged }: { onChanged?: () => void }) 
     }
   }
 
-  const submitClose = async () => {
-    if (!actor.trim()) return setError('กรุณาระบุชื่อผู้ปิดรอบ')
-    setBusy(true)
-    setError(null)
-    try {
-      const res = await branchFetch('/api/shifts/close', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ closedBy: actor.trim() }),
-      })
-      if (!res.ok) {
-        setError(await readError(res))
-        return
-      }
-      setMode('idle')
-      await fetchCurrent()
-      onChanged?.()
-    } catch {
-      setError('เชื่อมต่อไม่สำเร็จ')
-    } finally {
-      setBusy(false)
-    }
-  }
-
   if (!loaded) return null
 
-  // --- OPEN round ---
+  let body: ReactNode
   if (shift) {
+    // --- OPEN round ---
     const meta = `รอบ #${shift.shiftNo} · เปิดโดย ${shift.openedBy} · ${formatThai(shift.openedAt)}`
+    const viewBtn = (
+      <button className="v2-btn v2-btn-ghost v2-btn-sm" onClick={() => setViewingShiftId(shift.shiftId)}>
+        <FileText size={15} /> ดูรายงานรอบ
+      </button>
+    )
     if (!canManage) {
-      // Read-only: a calm one-line status. iHOTEL (or HF Hotel) owns the round.
-      return (
-        <div className="v2-inset flex items-center gap-2.5 px-4 py-2.5">
+      // Read-only: calm one-line status. iHOTEL owns the round. The round
+      // report is intentionally NOT surfaced here yet: the ht_payment_ledger
+      // it reads is a forward-only CT mirror, so until a backfill (J7e) lands
+      // it would show incomplete income vs iHOTEL. The whole reconciliation UI
+      // (report + close) therefore stays gated on `canManage` (dark) so a
+      // cashier never sees misleading numbers; it lights up together when
+      // ROUND_WRITEBACK_ENABLED flips (by which point the ledger has filled).
+      body = (
+        <div className="v2-inset flex flex-wrap items-center gap-2.5 px-4 py-2.5">
           <Clock size={15} style={{ color: 'var(--v2-ink-3)' }} />
           <span className="text-[13px]" style={{ color: 'var(--v2-ink-2)' }}>รอบขายเปิดอยู่</span>
           <span className="text-[12.5px] v2-num" style={{ color: 'var(--v2-ink-3)' }}>{meta}</span>
@@ -165,33 +160,63 @@ export default function RoundControl({ onChanged }: { onChanged?: () => void }) 
           <span className="text-[11.5px]" style={{ color: 'var(--v2-ink-3)' }}>จัดการผ่าน iHOTEL</span>
         </div>
       )
-    }
-    return (
-      <div className="v2-card px-4 py-3" style={{ borderColor: 'var(--v2-line)' }}>
-        <div className="flex items-center gap-3">
-          <span className="v2-dot d-ok" style={{ width: 9, height: 9 }} />
-          <div className="flex-1 min-w-0">
-            <div className="text-[14px] font-semibold">รอบขายเปิดอยู่</div>
-            <div className="text-[12.5px] v2-num truncate" style={{ color: 'var(--v2-ink-3)' }}>{meta}</div>
-          </div>
-          {mode !== 'closing' && (
-            <button className="v2-btn v2-btn-ghost v2-btn-sm" onClick={() => { setError(null); setMode('closing') }}>
+    } else {
+      body = (
+        <div className="v2-card px-4 py-3" style={{ borderColor: 'var(--v2-line)' }}>
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="v2-dot d-ok" style={{ width: 9, height: 9 }} />
+            <div className="flex-1 min-w-0">
+              <div className="text-[14px] font-semibold">รอบขายเปิดอยู่</div>
+              <div className="text-[12.5px] v2-num truncate" style={{ color: 'var(--v2-ink-3)' }}>{meta}</div>
+            </div>
+            {viewBtn}
+            <button className="v2-btn v2-btn-ghost v2-btn-sm" onClick={() => setClosingShiftId(shift.shiftId)}>
               <Lock size={15} /> ปิดรอบ
             </button>
+          </div>
+        </div>
+      )
+    }
+  } else {
+    // --- CLOSED (no open round): gate warning ---
+    body = (
+      <div className="v2-card px-4 py-3" style={{ borderColor: 'var(--v2-arr)', background: 'var(--v2-arr-bg)' }}>
+        <div className="flex items-center gap-3">
+          <AlertTriangle size={18} style={{ color: 'var(--v2-arr)' }} />
+          <p className="text-[13.5px] flex-1" style={{ color: 'var(--v2-ink)' }}>
+            ยังไม่ได้เปิดรอบขาย — การเช็คอิน/เช็คเอาท์จะถูกระงับจนกว่าจะเปิดรอบ
+          </p>
+          {canManage ? (
+            mode !== 'opening' && (
+              <button className="v2-btn v2-btn-soft v2-btn-sm" onClick={() => { setError(null); setMode('opening') }}>
+                <Unlock size={15} /> เปิดรอบ
+              </button>
+            )
+          ) : (
+            <Link href="/billing" className="v2-btn v2-btn-soft v2-btn-sm">เปิดรอบ</Link>
           )}
         </div>
-        {mode === 'closing' && (
-          <div className="mt-3 pt-3 flex flex-wrap items-end gap-2" style={{ borderTop: '1px solid var(--v2-line)' }}>
-            <Field label="ผู้ปิดรอบ">
+        {canManage && mode === 'opening' && (
+          <div className="mt-3 pt-3 flex flex-wrap items-end gap-2" style={{ borderTop: '1px solid var(--v2-arr)' }}>
+            <Field label="ผู้เปิดรอบ">
               <input
                 value={actor}
                 onChange={(e) => setActor(e.target.value)}
-                className="v2-num h-9 px-3 rounded-[10px] text-[14px] outline-none w-44"
+                className="v2-num h-9 px-3 rounded-[10px] text-[14px] outline-none w-40"
                 style={{ background: 'var(--v2-surface)', border: '1px solid var(--v2-line-2)' }}
               />
             </Field>
-            <button className="v2-btn v2-btn-primary v2-btn-sm" disabled={busy} onClick={submitClose}>
-              {busy ? <Loader2 size={15} className="animate-spin" /> : <Lock size={15} />} ยืนยันปิดรอบ
+            <Field label="เงินทอนตั้งต้น (บาท)">
+              <input
+                value={openingFloat}
+                onChange={(e) => setOpeningFloat(e.target.value)}
+                inputMode="numeric"
+                className="v2-num h-9 px-3 rounded-[10px] text-[14px] outline-none w-32"
+                style={{ background: 'var(--v2-surface)', border: '1px solid var(--v2-line-2)' }}
+              />
+            </Field>
+            <button className="v2-btn v2-btn-primary v2-btn-sm" disabled={busy} onClick={submitOpen}>
+              {busy ? <Loader2 size={15} className="animate-spin" /> : <Unlock size={15} />} ยืนยันเปิดรอบ
             </button>
             <button className="v2-btn v2-btn-ghost v2-btn-sm" disabled={busy} onClick={() => { setMode('idle'); setError(null) }}>
               <X size={15} /> ยกเลิก
@@ -203,53 +228,25 @@ export default function RoundControl({ onChanged }: { onChanged?: () => void }) 
     )
   }
 
-  // --- CLOSED (no open round): gate warning, always shown ---
   return (
-    <div className="v2-card px-4 py-3" style={{ borderColor: 'var(--v2-arr)', background: 'var(--v2-arr-bg)' }}>
-      <div className="flex items-center gap-3">
-        <AlertTriangle size={18} style={{ color: 'var(--v2-arr)' }} />
-        <p className="text-[13.5px] flex-1" style={{ color: 'var(--v2-ink)' }}>
-          ยังไม่ได้เปิดรอบขาย — การเช็คอิน/เช็คเอาท์จะถูกระงับจนกว่าจะเปิดรอบ
-        </p>
-        {canManage ? (
-          mode !== 'opening' && (
-            <button className="v2-btn v2-btn-soft v2-btn-sm" onClick={() => { setError(null); setMode('opening') }}>
-              <Unlock size={15} /> เปิดรอบ
-            </button>
-          )
-        ) : (
-          <Link href="/billing" className="v2-btn v2-btn-soft v2-btn-sm">เปิดรอบ</Link>
-        )}
-      </div>
-      {canManage && mode === 'opening' && (
-        <div className="mt-3 pt-3 flex flex-wrap items-end gap-2" style={{ borderTop: '1px solid var(--v2-arr)' }}>
-          <Field label="ผู้เปิดรอบ">
-            <input
-              value={actor}
-              onChange={(e) => setActor(e.target.value)}
-              className="v2-num h-9 px-3 rounded-[10px] text-[14px] outline-none w-40"
-              style={{ background: 'var(--v2-surface)', border: '1px solid var(--v2-line-2)' }}
-            />
-          </Field>
-          <Field label="เงินทอนตั้งต้น (บาท)">
-            <input
-              value={openingFloat}
-              onChange={(e) => setOpeningFloat(e.target.value)}
-              inputMode="numeric"
-              className="v2-num h-9 px-3 rounded-[10px] text-[14px] outline-none w-32"
-              style={{ background: 'var(--v2-surface)', border: '1px solid var(--v2-line-2)' }}
-            />
-          </Field>
-          <button className="v2-btn v2-btn-primary v2-btn-sm" disabled={busy} onClick={submitOpen}>
-            {busy ? <Loader2 size={15} className="animate-spin" /> : <Unlock size={15} />} ยืนยันเปิดรอบ
-          </button>
-          <button className="v2-btn v2-btn-ghost v2-btn-sm" disabled={busy} onClick={() => { setMode('idle'); setError(null) }}>
-            <X size={15} /> ยกเลิก
-          </button>
-        </div>
+    <>
+      {body}
+      {/* Sheets are gated on their own shiftId (not `shift`) so the close sheet
+          stays mounted to show the final report after the round goes closed. */}
+      {closingShiftId != null && (
+        <RoundCloseSheet
+          shiftId={closingShiftId}
+          onClose={() => setClosingShiftId(null)}
+          onClosed={() => {
+            fetchCurrent()
+            onChanged?.()
+          }}
+        />
       )}
-      {error && <ErrorLine msg={error} />}
-    </div>
+      {viewingShiftId != null && (
+        <RoundReportSheet shiftId={viewingShiftId} onClose={() => setViewingShiftId(null)} />
+      )}
+    </>
   )
 }
 
