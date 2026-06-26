@@ -893,7 +893,10 @@ mod tests {
             .execute(&pool)
             .await;
 
-        let shifts = Arc::new(ShiftService::new(pool.clone(), site));
+        // round_writeback ON so `open_shift` is permitted (Track J6 guard);
+        // it enqueues an `open_round` job we clear in cleanup below.
+        let shifts =
+            Arc::new(ShiftService::new(pool.clone(), site).with_round_writeback(true));
         shifts
             .open_shift(OpenShiftCommand {
                 opened_by: "alice".into(),
@@ -934,5 +937,15 @@ mod tests {
             .bind(site)
             .execute(&pool)
             .await;
+        // Track J6 — also clear the open_round job the gate-open emitted, so a
+        // rerun's `MAX(shift_no)+1=1` doesn't collide on the idempotency key.
+        let _ = sqlx::query(
+            "DELETE FROM writeback_jobs \
+             WHERE intent IN ('open_round','close_round') \
+               AND payload->'payload'->>'site_id' = $1",
+        )
+        .bind(site)
+        .execute(&pool)
+        .await;
     }
 }

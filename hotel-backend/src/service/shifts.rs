@@ -35,6 +35,8 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, Transaction};
 
 use super::error::{ServiceError, ServiceResult};
+use crate::outbox::intent::{round_aggregate, CloseRoundPayload, OpenRoundPayload, WritebackIntent};
+use crate::outbox::{generate_idempotency_key, OutboxRepository};
 
 /// Command for [`ShiftService::open_shift`].
 #[derive(Debug, Clone)]
@@ -110,6 +112,15 @@ pub struct ShiftSummary {
 pub struct ShiftService {
     pg: PgPool,
     site_id: String,
+    /// When `true`, [`open_shift`](Self::open_shift) /
+    /// [`close_shift`](Self::close_shift) additionally enqueue an
+    /// [`WritebackIntent::OpenRound`] / [`CloseRound`] so the round is
+    /// mirrored into iHOTEL's `HT_Round_Bill` (Track J6, round coexistence
+    /// step 2). Default `false`: the app only *reads* iHOTEL's rounds (via
+    /// the `sync_round_bills` mirror) and **must not open/close them** — the
+    /// open/close routes are not mounted in that mode, and this flag is the
+    /// belt-and-suspenders guard if one is ever called directly.
+    round_writeback: bool,
 }
 
 impl ShiftService {
@@ -118,7 +129,23 @@ impl ShiftService {
         Self {
             pg,
             site_id: site_id.into(),
+            round_writeback: false,
         }
+    }
+
+    /// Enable round-bill writeback (Track J6). Call this only for a service
+    /// whose `pg` pool + `site_id` target the same logical DB the matching
+    /// `writeback` worker drains — i.e. the hotel bundle on `new_pool`
+    /// (`hfhotel`) or the ville bundle on `ville_pool` (`hfville`). A mismatch
+    /// would enqueue an `OpenRound` into the wrong site's `writeback_jobs`.
+    pub fn with_round_writeback(mut self, enabled: bool) -> Self {
+        self.round_writeback = enabled;
+        self
+    }
+
+    /// Whether this service emits round-bill writebacks.
+    pub fn round_writeback_enabled(&self) -> bool {
+        self.round_writeback
     }
 
     /// The site this service was constructed for.
@@ -143,12 +170,26 @@ impl ShiftService {
                 "opening_float must be >= 0",
             ));
         }
+        // Belt-and-suspenders: opening a round our side without mirroring it
+        // into `HT_Round_Bill` would let iHOTEL open a *second* round for the
+        // same id space (it can't see our canonical-only row), so this path is
+        // refused unless writeback is wired. In production the open/close
+        // routes are only mounted when the flag is on, so this never trips.
+        if !self.round_writeback {
+            return Err(ServiceError::conflict(
+                "round open/close is not enabled at this site \
+                 (ROUND_WRITEBACK_ENABLED is off — iHOTEL owns the round)",
+            ));
+        }
 
         let mut tx = self.pg.begin().await?;
 
         // Defensive pre-check so callers get a clear "already open"
         // message instead of a raw UNIQUE-violation error. The partial
-        // index still enforces correctness under concurrent inserts.
+        // index still enforces correctness under concurrent inserts. Because
+        // `sync_round_bills` mirrors iHOTEL's open round into `ht_shifts`,
+        // this also blocks our app from opening when iHOTEL already has one
+        // open (co-equal mutual exclusion via the shared canonical row).
         if let Some(open) = fetch_open_shift(&mut tx, &self.site_id).await? {
             return Err(ServiceError::conflict(format!(
                 "site {} already has an open shift (shift_no={}, opened_by={})",
@@ -156,14 +197,20 @@ impl ShiftService {
             )));
         }
 
+        // `shift_no` doubles as the legacy `HT_Round_Bill.id` (the read-only
+        // mirror keys `ht_shifts` on `shift_no = legacy id`, and the two id
+        // spaces coincide today). Allocating `MAX(shift_no)+1` is exactly
+        // iHOTEL's `get_id` (`MAX(id)+1`) computed from our sub-second-fresh
+        // mirror; we stamp it into `shift_legacy_round_id` and pass it
+        // explicitly to the writeback so canonical + legacy stay on one id.
         let next_no = next_shift_no(&mut tx, &self.site_id).await?;
 
-        let row: (i64, i32) = sqlx::query_as(
+        let row: (i64, i32, DateTime<Utc>) = sqlx::query_as(
             "INSERT INTO ht_shifts ( \
-                 shift_site_id, shift_no, shift_opening_float, \
+                 shift_site_id, shift_no, shift_legacy_round_id, shift_opening_float, \
                  shift_opened_by, shift_opened_at, shift_notes \
-             ) VALUES ($1, $2, $3::numeric, $4, NOW(), $5) \
-             RETURNING shift_id, shift_no",
+             ) VALUES ($1, $2, $2, $3::numeric, $4, NOW(), $5) \
+             RETURNING shift_id, shift_no, shift_opened_at",
         )
         .bind(&self.site_id)
         .bind(next_no)
@@ -173,6 +220,23 @@ impl ShiftService {
         .fetch_one(&mut *tx)
         .await
         .map_err(map_unique_violation_to_conflict)?;
+
+        // Mirror into iHOTEL's HT_Round_Bill (Track J6). Same tx as the
+        // canonical INSERT → the job is queued iff the shift row commits.
+        let intent = WritebackIntent::OpenRound {
+            round_aggregate_id: round_aggregate(&self.site_id, next_no),
+            payload: OpenRoundPayload {
+                site_id: self.site_id.clone(),
+                legacy_round_id: next_no,
+                round_price: cmd.opening_float,
+                round_by: cmd.opened_by.trim().to_string(),
+                round_start: row.2,
+            },
+        };
+        let key = generate_idempotency_key(&intent, intent.aggregate_id());
+        OutboxRepository::enqueue(&mut tx, &intent, key)
+            .await
+            .map_err(ServiceError::from_enqueue_error)?;
 
         tx.commit().await?;
 
@@ -190,6 +254,12 @@ impl ShiftService {
         cmd: CloseShiftCommand,
     ) -> ServiceResult<ShiftSummary> {
         validate_closed_by(&cmd.closed_by)?;
+        if !self.round_writeback {
+            return Err(ServiceError::conflict(
+                "round open/close is not enabled at this site \
+                 (ROUND_WRITEBACK_ENABLED is off — iHOTEL owns the round)",
+            ));
+        }
 
         let mut tx = self.pg.begin().await?;
 
@@ -201,6 +271,17 @@ impl ShiftService {
                     self.site_id
                 ))
             })?;
+
+        // The legacy id is set on open (by us) or by `sync_round_bills` (for
+        // iHOTEL-opened rounds) — so our app can co-equally close a round
+        // iHOTEL opened. A NULL here would mean an unsynced canonical row;
+        // refuse rather than fire a blind `WHERE round_end IS NULL` UPDATE.
+        let legacy_round_id = open.legacy_round_id.ok_or_else(|| {
+            ServiceError::conflict(format!(
+                "open shift {} for site {} has no legacy round id to write back",
+                open.shift_no, self.site_id
+            ))
+        })?;
 
         let closed_row: (DateTime<Utc>,) = sqlx::query_as(
             "UPDATE ht_shifts \
@@ -215,6 +296,21 @@ impl ShiftService {
         .bind(cmd.notes.as_deref())
         .fetch_one(&mut *tx)
         .await?;
+
+        // Mirror the close into HT_Round_Bill (Track J6), same tx.
+        let intent = WritebackIntent::CloseRound {
+            round_aggregate_id: round_aggregate(&self.site_id, legacy_round_id),
+            payload: CloseRoundPayload {
+                site_id: self.site_id.clone(),
+                legacy_round_id,
+                round_by: cmd.closed_by.trim().to_string(),
+                round_end: closed_row.0,
+            },
+        };
+        let key = generate_idempotency_key(&intent, intent.aggregate_id());
+        OutboxRepository::enqueue(&mut tx, &intent, key)
+            .await
+            .map_err(ServiceError::from_enqueue_error)?;
 
         let summary_row: (i64, Option<f64>) = sqlx::query_as(
             "SELECT \
@@ -432,6 +528,18 @@ mod tests {
             .bind(site_id)
             .execute(pool)
             .await;
+        // Round-bill writeback (Track J6) enqueues open_round/close_round jobs
+        // whose idempotency_key is a pure function of (intent, site, legacy
+        // id) — clear them so a re-run of the test doesn't collide on the
+        // unique key.
+        let _ = sqlx::query(
+            "DELETE FROM writeback_jobs \
+             WHERE intent IN ('open_round','close_round') \
+               AND payload->'payload'->>'site_id' = $1",
+        )
+        .bind(site_id)
+        .execute(pool)
+        .await;
     }
 
     #[tokio::test]
@@ -443,7 +551,7 @@ mod tests {
         let site = "TEST_open_close_RT";
         cleanup_site(&pool, site).await;
 
-        let svc = ShiftService::new(pool.clone(), site);
+        let svc = ShiftService::new(pool.clone(), site).with_round_writeback(true);
 
         // Start: no open shift.
         assert!(
@@ -505,7 +613,7 @@ mod tests {
         let site = "TEST_one_open_only";
         cleanup_site(&pool, site).await;
 
-        let svc = ShiftService::new(pool.clone(), site);
+        let svc = ShiftService::new(pool.clone(), site).with_round_writeback(true);
 
         svc.open_shift(OpenShiftCommand {
             opened_by: "alice".into(),
@@ -541,7 +649,7 @@ mod tests {
         let site = "TEST_close_no_open";
         cleanup_site(&pool, site).await;
 
-        let svc = ShiftService::new(pool.clone(), site);
+        let svc = ShiftService::new(pool.clone(), site).with_round_writeback(true);
 
         let err = svc
             .close_shift(CloseShiftCommand {

@@ -36,6 +36,7 @@
 //! | `adjust_product_stock` | Track F3 / T1 CRIT-3 (`docs/legacy-app/COMPAT_CHEATSHEET.md:560-564`) | `AdjustProductStock` |
 //! | `coupon` | Track G5 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_Cupon`) | `IssueCoupon` + `RedeemCoupon` |
 //! | `pos_sale` | Track G6 / POS module (MVP) — `HT_CheckIn_Product` INSERT + paired `HT_Products.Pro_Amt` additive decrement | `RecordPosSale` |
+//! | `round_bill` | Track J6 (round coexistence step 2) — `HT_Round_Bill` open (`INSERT`) / close (`UPDATE`), `COMPAT_CHEATSHEET.md` §946-956 / §3.20-3.21 (`FrmDueBill.cs:1653/1670`) | `OpenRound` + `CloseRound` |
 
 pub mod adjust_product_stock;
 pub mod booking_cancel;
@@ -52,6 +53,7 @@ pub mod mark_dirty;
 pub mod payment;
 pub mod pos_sale;
 pub mod refund_payment;
+pub mod round_bill;
 pub mod room_change;
 pub mod set_maintenance;
 pub mod update_customer;

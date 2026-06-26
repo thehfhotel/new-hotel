@@ -346,6 +346,14 @@ fn intent_facts(intent: &WritebackIntent) -> IntentFacts {
         RecordPosSale { .. } => (true, true),
         CheckOut { .. } => (false, true),
         RefundPayment { .. } => (false, true),
+        // OpenRound INSERTs an explicit `HT_Round_Bill.id` → ledger it so a
+        // crash-after-commit retry is a no-op (the legacy PK is the second
+        // line of defence). It *creates* the round, so the §1.9 "no open
+        // round" warning is moot (requires_open_round = false).
+        OpenRound { .. } => (true, false),
+        // CloseRound is an idempotent `UPDATE … WHERE round_end IS NULL` — a
+        // second apply matches 0 rows. No ledger, no open-round warning.
+        CloseRound { .. } => (false, false),
         ModifyBooking { .. }
         | CancelBooking { .. }
         | CancelCheckIn { .. }
@@ -1032,6 +1040,12 @@ pub async fn dispatch(
                 ));
             }
             recipes::pos_sale::execute(conn, resolved_sale).await
+        }
+        WritebackIntent::OpenRound { round_aggregate_id: _, payload } => {
+            recipes::round_bill::execute_open(conn, payload).await
+        }
+        WritebackIntent::CloseRound { round_aggregate_id: _, payload } => {
+            recipes::round_bill::execute_close(conn, payload).await
         }
     };
 

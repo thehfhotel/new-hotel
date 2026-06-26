@@ -481,6 +481,88 @@ pub enum WritebackIntent {
         /// `prod_unit` from PG before issuing the legacy INSERT.
         sale_id: i64,
     },
+
+    /// Track J6 (round-bill coexistence step 2) — our app **opens** a
+    /// cashier round, mirroring iHOTEL's `FrmDueBill.cs:1653`
+    /// (`COMPAT_CHEATSHEET.md` §946 / §3.20):
+    /// `INSERT HT_Round_Bill (id, round_start, round_price, round_by)`
+    /// with `round_end` NULL. The legacy `id` is **explicit** in the
+    /// payload (allocated by `ShiftService::open_shift` as
+    /// `MAX(shift_no)+1`, the same value mirrored into
+    /// `ht_shifts.shift_legacy_round_id`) — NOT re-derived in the recipe.
+    /// This keeps the canonical row and the legacy row on the same id and
+    /// stays consistent with the read-only `sync_round_bills` mirror
+    /// (which keys `ht_shifts` on `shift_no = legacy id`). The legacy PK on
+    /// `HT_Round_Bill.id` is the collision backstop against iHOTEL's own
+    /// `MAX+1` allocation — a same-instant double-open hard-fails one
+    /// INSERT instead of minting a duplicate round.
+    OpenRound {
+        /// Deterministic per-round aggregate id (see [`round_aggregate`]).
+        round_aggregate_id: Uuid,
+        payload: OpenRoundPayload,
+    },
+
+    /// Track J6 (round-bill coexistence step 2) — our app **closes** the
+    /// open cashier round, mirroring iHOTEL's `FrmDueBill.cs:1670`:
+    /// `UPDATE HT_Round_Bill SET round_end=<now>, round_by=<emp> WHERE
+    /// round_end IS NULL`. We additionally pin `id=<legacy_round_id>` (we
+    /// know it) so the UPDATE is precise and naturally idempotent — a
+    /// second apply (or one racing iHOTEL's own close) matches 0 rows and
+    /// is a no-op.
+    CloseRound {
+        round_aggregate_id: Uuid,
+        payload: CloseRoundPayload,
+    },
+}
+
+/// Payload for [`WritebackIntent::OpenRound`].
+///
+/// Self-contained — the recipe needs no PG re-query. `legacy_round_id` is the
+/// explicit `HT_Round_Bill.id` (allocated by `ShiftService::open_shift`).
+/// `round_start` is the canonical `ht_shifts.shift_opened_at` (UTC); the recipe
+/// converts it to a Bangkok wall-clock naive literal (the legacy column is
+/// tz-naive Thai local — see CLAUDE.md "Timezone Handling").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenRoundPayload {
+    /// Site this round belongs to (`hfhotel` / `hfville`). Diagnostic only —
+    /// the writeback worker already targets the correct MSSQL server per its
+    /// `SITE_ID`; this makes the queued row self-describing.
+    pub site_id: String,
+    /// Explicit `HT_Round_Bill.id` to INSERT (== `ht_shifts.shift_legacy_round_id`).
+    pub legacy_round_id: i32,
+    /// `HT_Round_Bill.round_price` (float) — the opening float. iHOTEL always
+    /// writes `3000`; our cashier may supply a different value.
+    pub round_price: f64,
+    /// `HT_Round_Bill.round_by` — the cashier opening the round.
+    pub round_by: String,
+    /// Canonical `shift_opened_at` (UTC). Recipe → Bangkok naive `round_start`.
+    pub round_start: DateTime<Utc>,
+}
+
+/// Payload for [`WritebackIntent::CloseRound`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloseRoundPayload {
+    pub site_id: String,
+    /// Which `HT_Round_Bill.id` to close — pins the UPDATE to the exact row.
+    pub legacy_round_id: i32,
+    /// `HT_Round_Bill.round_by` re-stamped on close (mirrors iHOTEL, which
+    /// overwrites `round_by` with the closing cashier).
+    pub round_by: String,
+    /// Canonical `shift_closed_at` (UTC). Recipe → Bangkok naive `round_end`.
+    pub round_end: DateTime<Utc>,
+}
+
+/// Deterministic per-round aggregate id for [`WritebackIntent::OpenRound`] /
+/// [`CloseRound`]. Derived as a v5 UUID over `"{site}:{legacy_round_id}"` so
+/// that (a) open and close on the *same* round share an aggregate id (their
+/// distinct `intent_name`s still yield distinct idempotency keys), and (b) a
+/// different round gets a different aggregate. `ht_shifts.shift_id` is a
+/// PG-only `BIGSERIAL` and not portable across the two logical DBs, so it is
+/// unsuitable as the cross-site aggregate key — the `(site, legacy id)` pair
+/// is the stable identity iHOTEL and our app agree on.
+pub fn round_aggregate(site_id: &str, legacy_round_id: i32) -> Uuid {
+    let namespace = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"new-hotel.aggregate.round_bill");
+    Uuid::new_v5(&namespace, format!("{site_id}:{legacy_round_id}").as_bytes())
 }
 
 /// Payload for [`WritebackIntent::CreateBooking`].
@@ -685,6 +767,8 @@ impl WritebackIntent {
             WritebackIntent::IssueCoupon { .. } => "issue_coupon",
             WritebackIntent::RedeemCoupon { .. } => "redeem_coupon",
             WritebackIntent::RecordPosSale { .. } => "record_pos_sale",
+            WritebackIntent::OpenRound { .. } => "open_round",
+            WritebackIntent::CloseRound { .. } => "close_round",
         }
     }
 
@@ -724,6 +808,8 @@ impl WritebackIntent {
                 .unwrap_or_else(|| product_aggregate_fallback(prod_legacy_no)),
             WritebackIntent::IssueCoupon { coupon_aggregate_id, .. }
             | WritebackIntent::RedeemCoupon { coupon_aggregate_id, .. } => *coupon_aggregate_id,
+            WritebackIntent::OpenRound { round_aggregate_id, .. }
+            | WritebackIntent::CloseRound { round_aggregate_id, .. } => *round_aggregate_id,
         }
     }
 }

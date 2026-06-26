@@ -514,6 +514,15 @@ fn build_new_routes(app_state: AppState) -> Router {
         )
         // Shifts (Track F2 / T1 HIGH-5 — cashier-shift gate for payments)
         .route("/api/shifts/current", get(routes::new_shifts::current_shift))
+        // Track J6 — open/close a cashier round (mirrored to iHOTEL's
+        // HT_Round_Bill via the writeback worker). Mounted unconditionally;
+        // the `ShiftService.round_writeback` flag (from ROUND_WRITEBACK_ENABLED)
+        // gates behaviour — both reject with 409 when off, so iHOTEL stays the
+        // sole round-opener until an operator flips the flag. `branch=hfville`
+        // open/close is additionally blocked by the Ship-A ville_write_guard
+        // until HF Ville gets its own write bundle (Ship B).
+        .route("/api/shifts/open", post(routes::new_shifts::open_shift))
+        .route("/api/shifts/close", post(routes::new_shifts::close_shift))
         // Inventory Management
         .route("/api/inventory/items", get(routes::new_inventory::list_items).post(routes::new_inventory::create_item))
         .route("/api/inventory/items/{id}", get(routes::new_inventory::get_item).put(routes::new_inventory::update_item).delete(routes::new_inventory::delete_item))

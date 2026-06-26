@@ -161,6 +161,12 @@ pub struct AppState {
     /// HF Hotel pool. When true, Ville writes are routed to `ville_pool`
     /// (co-equal coexistence — ADR 0002).
     pub hfville_writes_enabled: bool,
+    /// Whether our app opens/closes iHOTEL's cashier rounds (Track J6, round
+    /// coexistence step 2). Mirror of `shifts_service.round_writeback_enabled()`
+    /// — read from `ROUND_WRITEBACK_ENABLED` inside `wire_services`. Surfaced in
+    /// `/api/mode` so the UI shows the open/close-round controls only when the
+    /// `POST /api/shifts/open|close` routes are actually mounted. Default false.
+    pub round_writeback_enabled: bool,
 }
 
 impl AppState {
@@ -203,6 +209,9 @@ impl AppState {
             events.clone(),
             new_pool.clone(),
         );
+        // Track J6 — mirror the wired ShiftService's flag onto AppState so
+        // `/api/mode` can surface it (and main.rs can gate route mounting).
+        let round_writeback_enabled = services.shifts.round_writeback_enabled();
         Self {
             new_pool,
             ville_pool: None,
@@ -226,6 +235,7 @@ impl AppState {
             auth_service: crate::routes::auth::build_auth_service(),
             auth_enabled: false,
             hfville_writes_enabled: false,
+            round_writeback_enabled,
         }
     }
 
@@ -249,6 +259,9 @@ impl AppState {
             events.clone(),
             new_pool.clone(),
         );
+        // Track J6 — mirror the wired ShiftService's flag onto AppState so
+        // `/api/mode` can surface it (and main.rs can gate route mounting).
+        let round_writeback_enabled = services.shifts.round_writeback_enabled();
         Self {
             new_pool,
             ville_pool: None,
@@ -272,6 +285,7 @@ impl AppState {
             auth_service: crate::routes::auth::build_auth_service(),
             auth_enabled: false,
             hfville_writes_enabled: false,
+            round_writeback_enabled,
         }
     }
 
@@ -313,7 +327,16 @@ impl AppState {
         pg: crate::db::PgPool,
     ) -> WiredServices {
         let site_id = SiteConfig::from_env().id;
-        let shifts = Arc::new(ShiftService::new(pg.clone(), site_id));
+        // Track J6 — round-bill writeback (our app opens/closes iHOTEL's
+        // HT_Round_Bill). Read here, alongside `SiteConfig::from_env()`, so the
+        // flag reaches the `ShiftService` *before* it is cloned into the
+        // payment / check-in gates. Default off → open/close refuse and the
+        // routes stay unmounted (iHOTEL owns the round; we only mirror it in).
+        let round_writeback = std::env::var("ROUND_WRITEBACK_ENABLED")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        let shifts =
+            Arc::new(ShiftService::new(pg.clone(), site_id).with_round_writeback(round_writeback));
         WiredServices {
             customers: Arc::new(CustomerService::new(
                 customers,
@@ -398,6 +421,11 @@ pub struct ModeResponse {
     /// Whether the new app may WRITE HF Ville (HFVILLE_WRITES_ENABLED). The
     /// frontend uses this to decide if HF Ville is interactive or view-only.
     pub ville_writes_enabled: bool,
+    /// Whether our app may open/close iHOTEL's cashier rounds
+    /// (ROUND_WRITEBACK_ENABLED, Track J6). The frontend shows the
+    /// open/close-round controls only when this is true; otherwise rounds are
+    /// read-only (iHOTEL opens/closes them and we mirror in).
+    pub round_writeback_enabled: bool,
 }
 
 /// GET /api/mode - Returns current system mode
@@ -409,6 +437,7 @@ pub async fn get_mode(State(state): State<AppState>) -> ApiResult<Json<ModeRespo
         mode,
         ville_available: state.ville_pool.is_some(),
         ville_writes_enabled: state.hfville_writes_enabled,
+        round_writeback_enabled: state.round_writeback_enabled,
     }))
 }
 
@@ -483,12 +512,19 @@ mod tests {
             mode: SystemMode::New,
             ville_available: true,
             ville_writes_enabled: false,
+            round_writeback_enabled: false,
         };
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(
             v.get("villeAvailable").and_then(|x| x.as_bool()),
             Some(true),
             "frontend depends on camelCase `villeAvailable`"
+        );
+        // Round-bill writeback flag must also be camelCase (UI reads it to
+        // show the open/close-round controls).
+        assert!(
+            v.get("roundWritebackEnabled").is_some(),
+            "frontend depends on camelCase `roundWritebackEnabled`"
         );
         assert!(
             v.get("ville_available").is_none(),

@@ -1043,6 +1043,18 @@ mod tests {
             .bind(site)
             .execute(pool)
             .await;
+        // Track J6 — the open/close tests run with round_writeback ON, which
+        // enqueues open_round/close_round jobs keyed on (intent, site, legacy
+        // id). Clear them so a rerun (next_no resets to 1) doesn't collide on
+        // the idempotency unique key.
+        let _ = sqlx::query(
+            "DELETE FROM writeback_jobs \
+             WHERE intent IN ('open_round','close_round') \
+               AND payload->'payload'->>'site_id' = $1",
+        )
+        .bind(site)
+        .execute(pool)
+        .await;
     }
 
     /// Insert a temporary `ht_checkins` row in `active` status so
@@ -1172,7 +1184,7 @@ mod tests {
             return;
         };
 
-        let shifts = Arc::new(ShiftService::new(pool.clone(), site));
+        let shifts = Arc::new(ShiftService::new(pool.clone(), site).with_round_writeback(true));
         let open_outcome = match shifts
             .open_shift(OpenShiftCommand {
                 opened_by: "alice".into(),
@@ -1238,7 +1250,7 @@ mod tests {
             return;
         };
 
-        let shifts = Arc::new(ShiftService::new(pool.clone(), site));
+        let shifts = Arc::new(ShiftService::new(pool.clone(), site).with_round_writeback(true));
         if let Err(err) = shifts
             .open_shift(OpenShiftCommand {
                 opened_by: "alice".into(),
@@ -1308,7 +1320,7 @@ mod tests {
             return;
         };
 
-        let shifts = Arc::new(ShiftService::new(pool.clone(), site));
+        let shifts = Arc::new(ShiftService::new(pool.clone(), site).with_round_writeback(true));
         if let Err(err) = shifts
             .open_shift(OpenShiftCommand {
                 opened_by: "alice".into(),

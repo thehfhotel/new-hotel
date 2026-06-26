@@ -1161,6 +1161,10 @@ async fn resolve_legacy_ids(
                 });
             }
         }
+        // Track J6 — OpenRound / CloseRound carry the full `HT_Round_Bill`
+        // shape in their payload (explicit legacy id, price, cashier,
+        // timestamp). No canonical `legacy_*` cache to resolve or self-heal.
+        OpenRound { .. } | CloseRound { .. } => {}
     }
     Ok(resolved)
 }
@@ -1925,6 +1929,11 @@ async fn back_populate_legacy_ids(
                 .await?;
             }
         }
+        // Track J6 — OpenRound allocates its legacy id app-side (in
+        // `open_shift`, already stamped onto `ht_shifts.shift_legacy_round_id`)
+        // and CloseRound allocates nothing. Neither returns a legacy id to
+        // back-populate.
+        OpenRound { .. } | CloseRound { .. } => {}
     }
     Ok(())
 }
