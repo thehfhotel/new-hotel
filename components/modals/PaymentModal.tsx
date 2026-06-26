@@ -81,7 +81,7 @@ export default function PaymentModal({
     setError(null)
 
     try {
-      const res = await branchFetch(`/api/new/checkins/${checkinId}/payments`, {
+      const res = await branchFetch(`/api/checkins/${checkinId}/payments`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

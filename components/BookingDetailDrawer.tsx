@@ -119,7 +119,7 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
     setError(null)
 
     try {
-      const res = await fetch(`/api/bookings/${encodeURIComponent(bookNo)}`)
+      const res = await fetch(`/api/bookings/by-number/${encodeURIComponent(bookNo)}`)
       const data = await res.json()
 
       if (!data.success) {
@@ -147,7 +147,7 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
     setNoteError(null)
 
     try {
-      const res = await fetch(`/api/bookings/${encodeURIComponent(bookNo)}/notes`, {
+      const res = await fetch(`/api/bookings/by-number/${encodeURIComponent(bookNo)}/notes`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text: newNote.trim() }),
@@ -179,7 +179,7 @@ export default function BookingDetailDrawer({ bookNo, onClose, inline = false }:
     setNoteError(null)
 
     try {
-      const res = await fetch(`/api/bookings/${encodeURIComponent(bookNo)}/notes?noteId=${noteId}`, {
+      const res = await fetch(`/api/bookings/by-number/${encodeURIComponent(bookNo)}/notes?noteId=${noteId}`, {
         method: 'DELETE',
       })
 

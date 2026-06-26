@@ -104,7 +104,7 @@ export default function MaintenancePage() {
       try {
         const [catRes, roomsRes] = await Promise.all([
           branchFetch('/api/maintenance/categories'),
-          branchFetch('/api/new/rooms?limit=200'),
+          branchFetch('/api/rooms?limit=200'),
         ])
 
         if (catRes.ok) {

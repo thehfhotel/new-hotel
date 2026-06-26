@@ -58,7 +58,7 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
 
   // Type-ahead lookup for existing customers by phone — avoids creating a
   // duplicate customer for repeat guests. If a match is picked, we skip the
-  // POST /api/new/customers step.
+  // POST /api/customers step.
   const [phoneMatches, setPhoneMatches] = useState<ExistingCustomer[]>([])
   const [pickedCustomerId, setPickedCustomerId] = useState<number | null>(null)
 
@@ -68,7 +68,7 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
       return
     }
     try {
-      const res = await branchFetch(`/api/new/customers?search=${encodeURIComponent(q)}&limit=5`)
+      const res = await branchFetch(`/api/customers/search?search=${encodeURIComponent(q)}&limit=5`)
       if (!res.ok) return
       const data = await res.json()
       setPhoneMatches(data.data || [])
@@ -111,7 +111,7 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
       // POST a new walk-in customer.
       let customerId = pickedCustomerId
       if (customerId === null) {
-        const custRes = await branchFetch('/api/new/customers', {
+        const custRes = await branchFetch('/api/customers', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -129,7 +129,7 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
       }
 
       // Step 2: create the check-in.
-      const checkinRes = await branchFetch('/api/new/checkins', {
+      const checkinRes = await branchFetch('/api/checkins', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

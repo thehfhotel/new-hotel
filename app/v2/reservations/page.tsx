@@ -39,7 +39,7 @@ export default function V2Reservations() {
       const params = new URLSearchParams({ page: String(page), limit: '20' })
       if (status) params.set('status', status)
       if (search.trim()) params.set('search', search.trim())
-      const res = await branchFetch(`/api/new/bookings?${params.toString()}`)
+      const res = await branchFetch(`/api/bookings?${params.toString()}`)
       if (res.ok) {
         const data = await res.json()
         setBookings((data.data || []) as Booking[])
@@ -73,7 +73,7 @@ export default function V2Reservations() {
 
   const openEdit = async (b: Booking) => {
     try {
-      const res = await branchFetch(`/api/new/bookings/${b.id}`)
+      const res = await branchFetch(`/api/bookings/${b.id}`)
       if (!res.ok) return
       const data = await res.json()
       if (!data.success) return
@@ -101,7 +101,7 @@ export default function V2Reservations() {
   }
 
   const handleSave = async (data: BookingFormState) => {
-    const endpoint = data.id ? `/api/new/bookings/${data.id}` : '/api/new/bookings'
+    const endpoint = data.id ? `/api/bookings/${data.id}` : '/api/bookings'
     const res = await branchFetch(endpoint, {
       method: data.id ? 'PUT' : 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -125,7 +125,7 @@ export default function V2Reservations() {
   }
 
   const handleCancel = async (id: number) => {
-    const res = await branchFetch(`/api/new/bookings/${id}/cancel`, { method: 'PUT' })
+    const res = await branchFetch(`/api/bookings/${id}/cancel`, { method: 'PUT' })
     const result = await res.json()
     if (!res.ok || !result.success) throw new Error(result.message || 'ยกเลิกการจองไม่สำเร็จ')
     fetchBookings()

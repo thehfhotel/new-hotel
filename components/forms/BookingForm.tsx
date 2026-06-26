@@ -262,7 +262,7 @@ export default function BookingForm({
   }
 
   const handleSaveNewCustomer = async (data: CustomerFormData) => {
-    const response = await branchFetch('/api/new/customers', {
+    const response = await branchFetch('/api/customers', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({

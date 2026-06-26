@@ -7,7 +7,7 @@
  * - Looks up the active check-in for the source room on mount.
  * - Lists available rooms (excluding the source room itself).
  * - Posts `{ fromRoomId, toRoomId, reason }` to
- *   `/api/new/checkins/:cinId/change-room` on submit.
+ *   `/api/checkins/:cinId/change-room` on submit.
  * - Calls `onSuccess` + `onClose` on a 200 response.
  */
 
@@ -106,7 +106,7 @@ describe('ChangeRoomModal — Track G4 / T4 HIGH-3', () => {
     expect(options).toContain('403 (Deluxe)')
   })
 
-  it('posts {fromRoomId, toRoomId, reason} to /api/new/checkins/:id/change-room on submit', async () => {
+  it('posts {fromRoomId, toRoomId, reason} to /api/checkins/:id/change-room on submit', async () => {
     const onSuccess = jest.fn()
     const onClose = jest.fn()
     const { calls } = setupFetch([
@@ -166,7 +166,7 @@ describe('ChangeRoomModal — Track G4 / T4 HIGH-3', () => {
         (c) => c.init?.method === 'POST' && c.url.includes('/change-room'),
       )
       expect(postCall).toBeDefined()
-      expect(postCall!.url).toContain('/api/new/checkins/99/change-room')
+      expect(postCall!.url).toContain('/api/checkins/99/change-room')
       const body = JSON.parse(postCall!.init!.body as string)
       expect(body).toEqual({
         fromRoomId: 5,

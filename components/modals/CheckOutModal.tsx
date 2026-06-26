@@ -114,7 +114,7 @@ export default function CheckOutModal({
     setError(null)
 
     try {
-      const res = await branchFetch(`/api/new/checkins/${checkIn.id}/checkout`, {
+      const res = await branchFetch(`/api/checkins/${checkIn.id}/checkout`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

@@ -166,7 +166,7 @@ export default function NewBookingsPage() {
       if (endDate) params.append('endDate', formatDateForApi(endDate))
       if (debouncedSearch) params.append('search', debouncedSearch)
 
-      const response = await branchFetch(`/api/new/bookings?${params.toString()}`)
+      const response = await branchFetch(`/api/bookings?${params.toString()}`)
 
       if (!response.ok) {
         throw new Error('ไม่สามารถดึงข้อมูลการจองได้')
@@ -218,7 +218,7 @@ export default function NewBookingsPage() {
   const handleEditBooking = async (booking: Booking) => {
     setLoadingDetail(true)
     try {
-      const response = await branchFetch(`/api/new/bookings/${booking.id}`)
+      const response = await branchFetch(`/api/bookings/${booking.id}`)
       if (!response.ok) {
         throw new Error('ไม่สามารถดึงข้อมูลการจองได้')
       }
@@ -259,8 +259,8 @@ export default function NewBookingsPage() {
   // Handle save booking
   const handleSaveBooking = async (data: BookingFormState) => {
     const endpoint = data.id
-      ? `/api/new/bookings/${data.id}`
-      : '/api/new/bookings'
+      ? `/api/bookings/${data.id}`
+      : '/api/bookings'
     const method = data.id ? 'PUT' : 'POST'
 
     const response = await branchFetch(endpoint, {
@@ -293,7 +293,7 @@ export default function NewBookingsPage() {
 
   // Handle cancel booking
   const handleCancelBooking = async (id: number) => {
-    const response = await branchFetch(`/api/new/bookings/${id}/cancel`, {
+    const response = await branchFetch(`/api/bookings/${id}/cancel`, {
       method: 'PUT',
     })
 

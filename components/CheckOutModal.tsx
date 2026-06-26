@@ -9,7 +9,7 @@ import { useBranchFetch } from '@/lib/use-branch-fetch'
  *
  * Looks up the active check-in for `roomId` (filter:
  * `?roomId=X&status=active`), then submits PUT
- * `/api/new/checkins/:cinId/checkout`. The PUT triggers the `CheckOut`
+ * `/api/checkins/:cinId/checkout`. The PUT triggers the `CheckOut`
  * writeback recipe which mirrors `HT_CheckIn_Ds.Cin_Room_Status='Check-Out'`,
  * `HT_Room_Status.room_status='Check Out'`, etc to legacy MSSQL.
  *
@@ -59,7 +59,7 @@ export default function CheckOutModal({ room, onClose, onSuccess }: CheckOutModa
     const find = async () => {
       try {
         const res = await branchFetch(
-          `/api/new/checkins?roomId=${room.id}&status=active&limit=1`,
+          `/api/checkins?roomId=${room.id}&status=active&limit=1`,
         )
         const data = await res.json()
         if (cancelled) return
@@ -91,7 +91,7 @@ export default function CheckOutModal({ room, onClose, onSuccess }: CheckOutModa
     setError(null)
     try {
       const res = await branchFetch(
-        `/api/new/checkins/${activeCheckin.id}/checkout`,
+        `/api/checkins/${activeCheckin.id}/checkout`,
         {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },

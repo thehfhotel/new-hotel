@@ -7,7 +7,7 @@ import type { Branch } from '@/contexts/BranchContext'
 
 /**
  * Honest notice for the HF Ville data gap. The new ("/v2") screens read the
- * canonical `/api/new/*` endpoints, which currently serve HF Hotel only and
+ * canonical `/api/*` endpoints, which currently serve HF Hotel only and
  * return empty for branch=hfville (see hotel-backend new_rooms/new_checkins/
  * new_bookings: `if branch == Hfville { return empty }`). Rather than show a
  * blank screen, tell the user where the data lives. Renders nothing for the

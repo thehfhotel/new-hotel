@@ -134,9 +134,9 @@ export default function NewDashboard() {
   const [error, setError] = useState<string | null>(null)
   const [selectedRoom, setSelectedRoom] = useState<Room | null>(null)
   // PG room_id by uppercase Room_no — populated once on mount from
-  // /api/new/rooms (the new app's room table). The dashboard's main data
+  // /api/rooms (the new app's room table). The dashboard's main data
   // source (/api/rooms, legacy) only exposes the string Room_no, but
-  // POST /api/new/checkins requires the integer room_id. Built once
+  // POST /api/checkins requires the integer room_id. Built once
   // because room inventory rarely changes.
   const [roomIdByNo, setRoomIdByNo] = useState<Map<string, number>>(new Map())
   const [showCheckIn, setShowCheckIn] = useState(false)
@@ -162,7 +162,7 @@ export default function NewDashboard() {
     let cancelled = false
     const loadIds = async () => {
       try {
-        const res = await branchFetch('/api/new/rooms?limit=200')
+        const res = await branchFetch('/api/rooms?limit=200')
         if (!res.ok) return
         const data = await res.json()
         if (cancelled) return
@@ -183,9 +183,9 @@ export default function NewDashboard() {
     try {
       const [statsRes, roomsRes, checkoutsRes, checkInsRes] = await Promise.all([
         branchFetch('/api/stats'),
-        branchFetch('/api/rooms'),
+        branchFetch('/api/rooms/board'),
         branchFetch('/api/rooms/checkouts-today'),
-        branchFetch('/api/checkins?limit=10'),
+        branchFetch('/api/checkins/board?limit=10'),
       ])
 
       if (statsRes.ok) {
@@ -534,7 +534,7 @@ export default function NewDashboard() {
                 {selectedRoom.type} {selectedRoom.details}
               </p>
               {/* Action buttons — gated on resolved PG room_id. If the
-                  /api/new/rooms lookup hasn't landed yet (or this room
+                  /api/rooms lookup hasn't landed yet (or this room
                   isn't in PG), buttons stay disabled. */}
               {selectedRoom.status === 'available' && (
                 <button

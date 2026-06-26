@@ -11,7 +11,7 @@ import { useBranchFetch } from '@/lib/use-branch-fetch'
  * Looks up the active check-in for `roomId` (the current room the
  * guest is in), lists the currently-available rooms the receptionist
  * can move the guest TO, then submits
- * `POST /api/new/checkins/:cinId/change-room` with
+ * `POST /api/checkins/:cinId/change-room` with
  * `{ fromRoomId, toRoomId, reason? }`.
  *
  * The route delegates to `CheckInService::change_room` which validates
@@ -87,9 +87,9 @@ export default function ChangeRoomModal({
       try {
         const [checkinRes, roomsRes] = await Promise.all([
           branchFetch(
-            `/api/new/checkins?roomId=${room.id}&status=active&limit=1`,
+            `/api/checkins?roomId=${room.id}&status=active&limit=1`,
           ),
-          branchFetch('/api/new/rooms?status=available&limit=200'),
+          branchFetch('/api/rooms?status=available&limit=200'),
         ])
         const [checkinData, roomsData] = await Promise.all([
           checkinRes.json(),
@@ -143,7 +143,7 @@ export default function ChangeRoomModal({
     try {
       const trimmedReason = reason.trim()
       const res = await branchFetch(
-        `/api/new/checkins/${activeCheckin.id}/change-room`,
+        `/api/checkins/${activeCheckin.id}/change-room`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },

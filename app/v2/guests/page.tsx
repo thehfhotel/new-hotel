@@ -76,7 +76,7 @@ export default function V2Guests() {
         const data = await res.json()
         setGuests((data.customers || data.data || []) as Guest[])
         // /api/customers returns pagination fields at the TOP LEVEL
-        // ({total, page, totalPages}), unlike /api/new/* which nest them under
+        // ({total, page, totalPages}), unlike /api/* which nest them under
         // `pagination`. Read top-level first so paging past page 1 works.
         setTotalPages(data.totalPages || data.pagination?.totalPages || 1)
       }

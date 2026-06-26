@@ -70,7 +70,7 @@ export default function RoomPicker({
         }
       }
 
-      const response = await fetch(`/api/new/rooms?${params}`)
+      const response = await fetch(`/api/rooms?${params}`)
       if (!response.ok) {
         throw new Error('ไม่สามารถดึงข้อมูลห้องพักได้')
       }

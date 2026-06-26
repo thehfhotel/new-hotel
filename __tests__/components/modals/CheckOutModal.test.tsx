@@ -243,7 +243,7 @@ describe('CheckOutModal Component', () => {
       fireEvent.click(submitButton)
 
       await waitFor(() => {
-        expect(global.fetch).toHaveBeenCalledWith('/api/new/checkins/1/checkout?branch=hfhotel', {
+        expect(global.fetch).toHaveBeenCalledWith('/api/checkins/1/checkout?branch=hfhotel', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: expect.any(String),

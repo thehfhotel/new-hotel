@@ -9,12 +9,12 @@ import { useBranchFetch } from '@/lib/use-branch-fetch'
  *
  * Lets the cashier search the F3 product catalog, pick a line, set
  * quantity (and optionally override the unit price), then POST it
- * against the open folio at `POST /api/new/checkins/:id/pos-sale`.
+ * against the open folio at `POST /api/checkins/:id/pos-sale`.
  *
  * The backend service decrements `ht_products.prod_current_stock`
  * and emits the legacy-mirror writeback. The modal lists the
  * folio's existing sales (read from
- * `GET /api/new/checkins/:id/pos-sales`) so the cashier can see the
+ * `GET /api/checkins/:id/pos-sales`) so the cashier can see the
  * running tab in reverse-chronological order, mirroring the iHOTEL
  * POS screen.
  *
@@ -61,7 +61,7 @@ interface ActiveCheckInLite {
 
 interface PosSaleModalProps {
   /** The room whose active folio is being charged. The modal resolves
-   *  the check-in id internally via `GET /api/new/checkins?roomId=…`,
+   *  the check-in id internally via `GET /api/checkins?roomId=…`,
    *  matching the `ChangeRoomModal` pattern so receptionists always
    *  see the same surface area. */
   room: RoomLite
@@ -136,7 +136,7 @@ export default function PosSaleModal({
       setError(null)
       try {
         const cinRes = await branchFetch(
-          `/api/new/checkins?roomId=${room.id}&status=active&limit=1`,
+          `/api/checkins?roomId=${room.id}&status=active&limit=1`,
         )
         if (cancelled) return
         if (!cinRes.ok) {
@@ -152,7 +152,7 @@ export default function PosSaleModal({
 
         const [productsRes, salesRes] = await Promise.all([
           branchFetch('/api/products?active_only=true&limit=200'),
-          branchFetch(`/api/new/checkins/${cin.id}/pos-sales`),
+          branchFetch(`/api/checkins/${cin.id}/pos-sales`),
         ])
         if (cancelled) return
         if (!productsRes.ok) {
@@ -235,7 +235,7 @@ export default function PosSaleModal({
     setSubmitting(true)
     try {
       const res = await branchFetch(
-        `/api/new/checkins/${checkInId}/pos-sale`,
+        `/api/checkins/${checkInId}/pos-sale`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -258,7 +258,7 @@ export default function PosSaleModal({
       // Refresh the folio's sales list so the new line + new total
       // are reflected before the next sale.
       const salesRes = await branchFetch(
-        `/api/new/checkins/${checkInId}/pos-sales`,
+        `/api/checkins/${checkInId}/pos-sales`,
       )
       if (salesRes.ok) {
         const body = await salesRes.json()

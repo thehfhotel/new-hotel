@@ -76,8 +76,8 @@ export default function V2Today() {
     try {
       const [statsRes, cinRes, bookRes, shiftRes] = await Promise.all([
         branchFetch('/api/stats'),
-        branchFetch('/api/new/checkins?limit=100'),
-        branchFetch('/api/new/bookings?limit=100'),
+        branchFetch('/api/checkins?limit=100'),
+        branchFetch('/api/bookings?limit=100'),
         branchFetch('/api/shifts/current').catch(() => null),
       ])
 

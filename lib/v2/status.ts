@@ -16,7 +16,7 @@ function view(label: string, tone: V2Tone): V2StatusView {
   return { label, tone, cls: `s-${tone}`, dot: `d-${tone}` }
 }
 
-/** Room status from /api/new/rooms (`status` + isClean/isMaintenance). */
+/** Room status from /api/rooms (`status` + isClean/isMaintenance). */
 export function roomStatusView(
   status: string,
   opts?: { isClean?: boolean; isMaintenance?: boolean },
@@ -36,7 +36,7 @@ export function roomStatusView(
   }
 }
 
-/** Booking status from /api/new/bookings. */
+/** Booking status from /api/bookings. */
 export function bookingStatusView(status: string): V2StatusView {
   switch (status) {
     case 'pending':
@@ -56,7 +56,7 @@ export function bookingStatusView(status: string): V2StatusView {
   }
 }
 
-/** Check-in / folio status from /api/new/checkins. */
+/** Check-in / folio status from /api/checkins. */
 export function checkinStatusView(status: string): V2StatusView {
   switch (status) {
     case 'active':
@@ -75,7 +75,7 @@ export function checkinStatusView(status: string): V2StatusView {
 /** True if a stored date string falls on the same calendar day as `ref`
  *  (default: today).
  *
- *  The canonical `/api/new/*` endpoints serialize naive datetimes WITHOUT a
+ *  The canonical `/api/*` endpoints serialize naive datetimes WITHOUT a
  *  timezone suffix (e.g. "2026-06-26T00:00:00"), while others append "Z". Both
  *  carry Thai-local clock values (see CLAUDE.md timezone rule), so the only safe
  *  comparison is on the literal Y-M-D prefix of the string vs. today's Thai

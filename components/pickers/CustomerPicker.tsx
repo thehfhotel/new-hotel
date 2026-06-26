@@ -76,7 +76,7 @@ export default function CustomerPicker({
         params.append('search', debouncedSearch.trim())
       }
 
-      const response = await fetch(`/api/new/customers?${params}`)
+      const response = await fetch(`/api/customers/search?${params}`)
       if (response.ok) {
         const data = await response.json()
         const customers: CustomerOption[] = (data.data || []).map(

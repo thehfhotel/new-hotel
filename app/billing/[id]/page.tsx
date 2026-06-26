@@ -80,7 +80,7 @@ export default function InvoiceDetailPage({
     setError(null)
 
     try {
-      const response = await branchFetch(`/api/new/checkins/${resolvedParams.id}/invoice`)
+      const response = await branchFetch(`/api/checkins/${resolvedParams.id}/invoice`)
       const data: InvoiceApiResponse = await response.json()
 
       if (data.success && data.invoice) {

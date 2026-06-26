@@ -97,7 +97,7 @@ export default function GuestRegistryModal({
     setLoading(true)
     setError(null)
     try {
-      const response = await branchFetch(`/api/new/checkins/${checkIn.id}/guests`)
+      const response = await branchFetch(`/api/checkins/${checkIn.id}/guests`)
       if (!response.ok) {
         throw new Error('Failed to fetch guests')
       }
@@ -161,7 +161,7 @@ export default function GuestRegistryModal({
 
     setSaving(true)
     try {
-      const response = await branchFetch(`/api/new/checkins/${checkIn.id}/guests`, {
+      const response = await branchFetch(`/api/checkins/${checkIn.id}/guests`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -197,7 +197,7 @@ export default function GuestRegistryModal({
     setDeleting(guestId)
     setError(null)
     try {
-      const response = await branchFetch(`/api/new/checkins/${checkIn.id}/guests/${guestId}`, {
+      const response = await branchFetch(`/api/checkins/${checkIn.id}/guests/${guestId}`, {
         method: 'DELETE',
       })
 

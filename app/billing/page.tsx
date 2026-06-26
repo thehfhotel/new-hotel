@@ -74,7 +74,7 @@ export default function BillingPage() {
         params.set('endDate', endDate)
       }
 
-      const response = await branchFetch(`/api/new/checkins?${params.toString()}`)
+      const response = await branchFetch(`/api/checkins?${params.toString()}`)
       const data = await response.json()
 
       if (data.success) {

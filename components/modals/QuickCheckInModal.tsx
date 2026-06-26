@@ -86,7 +86,7 @@ export default function QuickCheckInModal({
 
     setIsSearching(true)
     try {
-      const res = await branchFetch(`/api/new/customers?search=${encodeURIComponent(query)}&limit=10`)
+      const res = await branchFetch(`/api/customers/search?search=${encodeURIComponent(query)}&limit=10`)
       const data = await res.json()
       if (data.success) {
         setCustomers(data.data)
@@ -161,7 +161,7 @@ export default function QuickCheckInModal({
     setError(null)
 
     try {
-      const res = await branchFetch('/api/new/checkins', {
+      const res = await branchFetch('/api/checkins', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

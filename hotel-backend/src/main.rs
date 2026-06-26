@@ -260,7 +260,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Phase 4 PR4: mount the protected `/api/admin/*` endpoints. The
     // subrouter is wrapped with the same `require_auth` middleware
-    // PR2 added to `/api/new/*` so an authenticated `User` extension
+    // PR2 added to the canonical routes so an authenticated `User` extension
     // is injected on every request. Each handler then performs an
     // explicit role check (admin vs receptionist) — see
     // `routes::admin_users::require_admin`.
@@ -396,23 +396,25 @@ fn build_new_routes(app_state: AppState) -> Router {
         app_middleware::require_permission("pos.sell", app_state.clone());
 
     Router::new()
-        // ── Collision nouns (rooms / customers / checkins / bookings) ──
-        // These keep BOTH a branch-aware legacy reader (the only HF Ville-capable
-        // read today) AND the canonical "/api/new/*" CRUD path until the superset
-        // merge lands. Do not collapse their list URLs yet.
+        // ── One /api/* suite (no "/new" prefix anywhere) ──
+        // The branch-aware legacy reads (the only HF Ville-capable reads today)
+        // and the canonical CRUD now share the single suite on distinct paths:
+        //   reads   -> /api/rooms/board, /api/checkins/board, /api/customers,
+        //              /api/bookings/by-number/{book_no}
+        //   canonical -> /api/rooms, /api/checkins, /api/bookings, /api/customers/search
         //
         // Branch-aware legacy reads (PG; serve HF Hotel + HF Ville via ville_pool).
-        .route("/api/rooms", get(routes::rooms::list_rooms))
+        .route("/api/rooms/board", get(routes::rooms::list_rooms))
         .route("/api/rooms/checkouts-today", get(routes::rooms::get_checkouts_today))
-        .route("/api/bookings/{id}", get(routes::bookings::get_booking))
+        .route("/api/bookings/by-number/{book_no}", get(routes::bookings::get_booking))
         .route(
-            "/api/bookings/{id}/notes",
+            "/api/bookings/by-number/{book_no}/notes",
             get(routes::bookings::get_notes)
                 .post(routes::bookings::create_note)
                 .delete(routes::bookings::delete_note),
         )
-        .route("/api/checkins", get(routes::checkins::list_checkins))
-        .route("/api/customers", get(routes::customers::list_customers))
+        .route("/api/checkins/board", get(routes::checkins::list_checkins))
+        .route("/api/customers", get(routes::customers::list_customers).post(routes::new_customers::create_customer))
         .route("/api/customers/{id}/bookings", get(routes::customers::get_customer_bookings))
         .route("/api/customers/{id}/stats", get(routes::customers::get_customer_stats))
         // Branch-aware stats (HF Hotel + HF Ville) — the sole stats path.
@@ -429,46 +431,45 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route("/api/legacy-mirror/coupons", get(routes::legacy_mirror::list_coupons))
         .route("/api/legacy-mirror/products", get(routes::legacy_mirror::list_products))
         .route("/api/legacy-mirror/room-changes", get(routes::legacy_mirror::list_room_changes))
-        // Customers (canonical CRUD — create/search). Detail GET/PUT/DELETE were
-        // unused and removed; list+create stay on the canonical path pending merge.
-        .route("/api/new/customers", get(routes::new_customers::list_customers).post(routes::new_customers::create_customer))
+        // Customers canonical search (create is a POST on /api/customers above).
+        .route("/api/customers/search", get(routes::new_customers::list_customers))
         // Rooms CRUD (canonical)
-        .route("/api/new/rooms", get(routes::new_rooms::list_rooms).post(routes::new_rooms::create_room))
-        .route("/api/new/rooms/{id}", get(routes::new_rooms::get_room).put(routes::new_rooms::update_room))
-        .route("/api/new/rooms/{id}/status", patch(routes::new_rooms::update_room_status))
+        .route("/api/rooms", get(routes::new_rooms::list_rooms).post(routes::new_rooms::create_room))
+        .route("/api/rooms/{id}", get(routes::new_rooms::get_room).put(routes::new_rooms::update_room))
+        .route("/api/rooms/{id}/status", patch(routes::new_rooms::update_room_status))
         // Bookings CRUD (canonical)
-        .route("/api/new/bookings", get(routes::new_bookings::list_bookings).post(routes::new_bookings::create_booking))
-        .route("/api/new/bookings/{id}", get(routes::new_bookings::get_booking).put(routes::new_bookings::update_booking))
-        .route("/api/new/bookings/{id}/cancel", put(routes::new_bookings::cancel_booking))
+        .route("/api/bookings", get(routes::new_bookings::list_bookings).post(routes::new_bookings::create_booking))
+        .route("/api/bookings/{id}", get(routes::new_bookings::get_booking).put(routes::new_bookings::update_booking))
+        .route("/api/bookings/{id}/cancel", put(routes::new_bookings::cancel_booking))
         // Check-ins CRUD (canonical)
-        .route("/api/new/checkins", get(routes::new_checkins::list_checkins).post(routes::new_checkins::create_checkin))
-        .route("/api/new/checkins/{id}/checkout", put(routes::new_checkins::checkout))
+        .route("/api/checkins", get(routes::new_checkins::list_checkins).post(routes::new_checkins::create_checkin))
+        .route("/api/checkins/{id}/checkout", put(routes::new_checkins::checkout))
         // Track G1 / T4 HIGH-2: extend an active stay (one-more-night flow).
-        .route("/api/new/checkins/{id}/extend", put(routes::new_checkins::extend))
+        .route("/api/checkins/{id}/extend", put(routes::new_checkins::extend))
         // Track G4 / T4 HIGH-3: mid-stay room change (move guest A → B).
         .route(
-            "/api/new/checkins/{id}/change-room",
+            "/api/checkins/{id}/change-room",
             post(routes::new_checkins::change_room),
         )
         // Track G6 — POS / sales-to-room (MVP). Ring up a product line
         // against an active folio. Gated on `pos.sell` (cashier + admin).
         .route(
-            "/api/new/checkins/{id}/pos-sale",
+            "/api/checkins/{id}/pos-sale",
             post(routes::new_checkins::create_pos_sale).route_layer(perm_pos_sell),
         )
         // GET stays ungated — receptionists need to see the running tab
         // even when they can't ring up new sales.
         .route(
-            "/api/new/checkins/{id}/pos-sales",
+            "/api/checkins/{id}/pos-sales",
             get(routes::new_checkins::list_pos_sales),
         )
         // Guest registry
-        .route("/api/new/checkins/{id}/guests", get(routes::new_checkins::list_guests).post(routes::new_checkins::create_guest))
-        .route("/api/new/checkins/{id}/guests/{guest_id}", delete(routes::new_checkins::delete_guest))
+        .route("/api/checkins/{id}/guests", get(routes::new_checkins::list_guests).post(routes::new_checkins::create_guest))
+        .route("/api/checkins/{id}/guests/{guest_id}", delete(routes::new_checkins::delete_guest))
         // Invoice
-        .route("/api/new/checkins/{id}/invoice", get(routes::new_invoice::get_invoice))
+        .route("/api/checkins/{id}/invoice", get(routes::new_invoice::get_invoice))
         // Payments
-        .route("/api/new/checkins/{id}/payments", get(routes::new_payments::list_payments).post(routes::new_payments::create_payment))
+        .route("/api/checkins/{id}/payments", get(routes::new_payments::list_payments).post(routes::new_payments::create_payment))
         // ── Single /api/* suite (no "/new" prefix) for non-colliding families ──
         // Room types CRUD
         .route("/api/room-types", get(routes::new_room_types::list_room_types).post(routes::new_room_types::create_room_type))

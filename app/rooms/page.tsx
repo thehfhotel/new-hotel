@@ -28,7 +28,7 @@ import CheckOutModal from '@/components/CheckOutModal'
 import ChangeRoomModal from '@/components/ChangeRoomModal'
 import ExtendStayModal from '@/components/ExtendStayModal'
 
-// API response types (from /api/new/rooms)
+// API response types (from /api/rooms)
 interface RoomApiItem {
   id: number
   roomNo: string
@@ -89,7 +89,7 @@ export default function RoomsPage() {
     setLoading(true)
     setError(null)
     try {
-      const response = await branchFetch('/api/new/rooms?limit=200')
+      const response = await branchFetch('/api/rooms?limit=200')
       if (!response.ok) throw new Error('ไม่สามารถดึงข้อมูลห้องพักได้')
       const data = await response.json()
       const roomsData: RoomApiItem[] = data.data || data || []
@@ -111,7 +111,7 @@ export default function RoomsPage() {
     setSelectedRoom(room)
     setLoadingDetail(true)
     try {
-      const response = await branchFetch(`/api/new/rooms/${room.id}`)
+      const response = await branchFetch(`/api/rooms/${room.id}`)
       if (response.ok) {
         const data = await response.json()
         setRoomDetail(data.data || data)

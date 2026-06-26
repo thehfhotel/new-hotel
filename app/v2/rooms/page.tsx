@@ -59,7 +59,7 @@ export default function V2Rooms() {
 
   const fetchRooms = useCallback(async () => {
     try {
-      const res = await branchFetch('/api/new/rooms?limit=300')
+      const res = await branchFetch('/api/rooms?limit=300')
       if (res.ok) {
         const data = await res.json()
         setRooms((data.data || data || []) as RoomItem[])
@@ -145,7 +145,7 @@ export default function V2Rooms() {
       else if (a === 'dirty') status = 'available'
       else if (a === 'maintenance') status = 'maintenance'
       else if (a === 'ready') status = 'available'
-      await branchFetch(`/api/new/rooms/${selected.id}/status`, {
+      await branchFetch(`/api/rooms/${selected.id}/status`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status }),

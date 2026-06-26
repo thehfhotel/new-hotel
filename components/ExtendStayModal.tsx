@@ -9,7 +9,7 @@ import { useBranchFetch } from '@/lib/use-branch-fetch'
  *
  * Looks up the active check-in for `roomId` (filter:
  * `?roomId=X&status=active`), then submits
- * PUT `/api/new/checkins/:cinId/extend` with `{ newCheckoutDate, reason? }`.
+ * PUT `/api/checkins/:cinId/extend` with `{ newCheckoutDate, reason? }`.
  *
  * The route validates that `newCheckoutDate > existingExpectedCheckout`
  * (shortening a stay is a separate refund / partial-stay flow, Track G2)
@@ -82,7 +82,7 @@ export default function ExtendStayModal({ room, onClose, onSuccess }: ExtendStay
     const find = async () => {
       try {
         const res = await branchFetch(
-          `/api/new/checkins?roomId=${room.id}&status=active&limit=1`,
+          `/api/checkins?roomId=${room.id}&status=active&limit=1`,
         )
         const data = await res.json()
         if (cancelled) return
@@ -130,7 +130,7 @@ export default function ExtendStayModal({ room, onClose, onSuccess }: ExtendStay
     try {
       const trimmedReason = reason.trim()
       const res = await branchFetch(
-        `/api/new/checkins/${activeCheckin.id}/extend`,
+        `/api/checkins/${activeCheckin.id}/extend`,
         {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
