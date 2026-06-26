@@ -256,7 +256,11 @@ fn naive_thai_to_utc(dt: NaiveDateTime) -> chrono::DateTime<chrono::Utc> {
 /// `ON CONFLICT (ledger_legacy_id)` arm additionally absorbs the theoretical
 /// `Cin_No`-reassignment edge (a row whose old `Cin_No` wasn't in this
 /// delete's scope) without tripping the UNIQUE constraint.
-async fn mirror_payment_ledger(
+/// `pub` so the one-shot `backfill_payment_ledger` bin can reuse the exact
+/// projection + upsert (single source of truth) — it loads each `Cin_No`'s
+/// lines via `load_checkin_aggregate` and calls this, identical to the live
+/// coalesced path.
+pub async fn mirror_payment_ledger(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     cin_no: &str,
     payments: &[HashMapRow],

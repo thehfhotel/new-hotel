@@ -42,6 +42,10 @@ name = "backfill_customer_legacy_ids"
 path = "src/bin/backfill_customer_legacy_ids.rs"
 
 [[bin]]
+name = "backfill_payment_ledger"
+path = "src/bin/backfill_payment_ledger.rs"
+
+[[bin]]
 name = "create_user"
 path = "src/bin/create_user.rs"
 
