@@ -57,6 +57,33 @@ pub struct CloseShiftCommand {
     pub closed_by: String,
     /// Optional closing-time notes (variance explanation, etc.).
     pub notes: Option<String>,
+    /// Track J7c — optional physical cash-drawer count: a
+    /// `{denomination: count}` map (e.g. `{"1000": 5, "100": 12, "1": 30}`).
+    /// `close_shift` server-computes the counted total (Σ denom×count) and
+    /// stores both for the round report's counted-vs-expected variance. `None`
+    /// ⇒ the cashier skipped the count (report shows expected only).
+    pub cash_count: Option<serde_json::Value>,
+}
+
+/// Sum a `{denomination: count}` cash-count map to a baht total. Skips entries
+/// whose key isn't a positive finite number or whose value isn't a
+/// non-negative finite number (defensive against a malformed client map) so a
+/// bad cell can never wedge a close. Returns `None` for `None`/non-object.
+fn sum_cash_count(map: Option<&serde_json::Value>) -> Option<f64> {
+    let obj = map?.as_object()?;
+    let mut total = 0.0_f64;
+    for (denom, count) in obj {
+        let d = match denom.parse::<f64>() {
+            Ok(v) if v.is_finite() && v > 0.0 => v,
+            _ => continue, // skip a malformed denomination key
+        };
+        let c = match count.as_f64() {
+            Some(v) if v.is_finite() && v >= 0.0 => v,
+            _ => continue, // skip a malformed count
+        };
+        total += d * c;
+    }
+    Some((total * 100.0).round() / 100.0)
 }
 
 /// Row representation returned to callers.
@@ -283,17 +310,26 @@ impl ShiftService {
             ))
         })?;
 
+        // Track J7c — server-compute the counted cash from the denomination
+        // map (never trust a client total) and store both the total and the
+        // raw map for the report's counted-vs-expected variance.
+        let counted_cash = sum_cash_count(cmd.cash_count.as_ref());
+
         let closed_row: (DateTime<Utc>,) = sqlx::query_as(
             "UPDATE ht_shifts \
-                SET shift_closed_at = NOW(), \
-                    shift_closed_by = $2, \
-                    shift_notes = COALESCE($3, shift_notes) \
+                SET shift_closed_at    = NOW(), \
+                    shift_closed_by    = $2, \
+                    shift_notes        = COALESCE($3, shift_notes), \
+                    shift_counted_cash = $4::numeric, \
+                    shift_cash_count   = $5 \
               WHERE shift_id = $1 \
               RETURNING shift_closed_at",
         )
         .bind(open.shift_id)
         .bind(cmd.closed_by.trim())
         .bind(cmd.notes.as_deref())
+        .bind(counted_cash)
+        .bind(cmd.cash_count.as_ref())
         .fetch_one(&mut *tx)
         .await?;
 
@@ -542,6 +578,32 @@ mod tests {
         .await;
     }
 
+    // ----- Track J7c — cash-count summation (pure, no DB) -----------------
+
+    #[test]
+    fn sum_cash_count_totals_denominations() {
+        use serde_json::json;
+        // 5×1000 + 12×100 + 30×1 = 6230
+        let m = json!({"1000": 5, "100": 12, "1": 30});
+        assert_eq!(sum_cash_count(Some(&m)), Some(6230.0));
+    }
+
+    #[test]
+    fn sum_cash_count_handles_coins_and_skips_garbage_cells() {
+        use serde_json::json;
+        // 2×1000 + 4×0.25 = 2001.0; the bad key and bad value are skipped.
+        let m = json!({"1000": 2, "0.25": 4, "abc": 9, "100": "x"});
+        assert_eq!(sum_cash_count(Some(&m)), Some(2001.0));
+    }
+
+    #[test]
+    fn sum_cash_count_edge_cases() {
+        use serde_json::json;
+        assert_eq!(sum_cash_count(None), None, "no count → None");
+        assert_eq!(sum_cash_count(Some(&json!({}))), Some(0.0), "empty map → 0");
+        assert_eq!(sum_cash_count(Some(&json!("nope"))), None, "non-object → None");
+    }
+
     #[tokio::test]
     async fn open_close_roundtrip() {
         let Some(pool) = try_pool().await else {
@@ -585,6 +647,7 @@ mod tests {
             .close_shift(CloseShiftCommand {
                 closed_by: "alice".into(),
                 notes: None,
+                cash_count: None,
             })
             .await
             .expect("close_shift");
@@ -655,6 +718,7 @@ mod tests {
             .close_shift(CloseShiftCommand {
                 closed_by: "alice".into(),
                 notes: None,
+                cash_count: None,
             })
             .await
             .expect_err("close without open must fail");

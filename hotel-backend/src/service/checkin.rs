@@ -1266,6 +1266,7 @@ mod tests {
             .close_shift(CloseShiftCommand {
                 closed_by: "alice".into(),
                 notes: None,
+                cash_count: None,
             })
             .await
         {

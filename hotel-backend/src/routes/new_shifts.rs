@@ -49,6 +49,11 @@ pub struct CloseShiftRequest {
     pub closed_by: String,
     #[serde(default)]
     pub notes: Option<String>,
+    /// Track J7c — optional physical cash-drawer count: a
+    /// `{denomination: count}` map (e.g. `{"1000": 5, "100": 12}`). The
+    /// service computes the counted total; the report shows the variance.
+    #[serde(default)]
+    pub cash_count: Option<serde_json::Value>,
 }
 
 /// `GET /api/new/shifts?limit=N` query string.
@@ -201,6 +206,7 @@ pub async fn close_shift(
         .close_shift(CloseShiftCommand {
             closed_by: body.closed_by,
             notes: body.notes,
+            cash_count: body.cash_count,
         })
         .await?;
 
@@ -348,6 +354,14 @@ pub struct RoundReportResponse {
     pub open: bool,
     pub income: TenderBreakdown,
     pub sales: Vec<SalesCategory>,
+    /// Cash the drawer SHOULD hold: `shift_opening_float + cash tenders` over
+    /// the window (only the cash tender touches the drawer).
+    pub expected_cash: f64,
+    /// Physical cash the cashier counted at close (server-computed from the
+    /// denomination map). `None` until a close supplies a count.
+    pub counted_cash: Option<f64>,
+    /// `counted_cash - expected_cash` (over/short). `None` when uncounted.
+    pub cash_variance: Option<f64>,
 }
 
 /// `GET /api/shifts/{shift_id}/report` — income-by-tender + sales summary for
@@ -368,7 +382,8 @@ pub async fn round_report(
         "SELECT shift_id, shift_site_id, shift_no, \
                 shift_opening_float::float8 AS shift_opening_float, \
                 shift_opened_by, shift_opened_at, shift_closed_at, \
-                shift_closed_by, shift_legacy_round_id, shift_notes \
+                shift_closed_by, shift_legacy_round_id, shift_notes, \
+                shift_counted_cash::float8 AS counted_cash \
            FROM ht_shifts WHERE shift_id = $1",
     )
     .bind(shift_id)
@@ -376,6 +391,8 @@ pub async fn round_report(
     .await
     .map_err(|e| ApiError::Internal(format!("failed to read shift: {e}")))?
     .ok_or_else(|| ApiError::NotFound(format!("shift {shift_id} not found")))?;
+
+    let counted_cash: Option<f64> = row.try_get("counted_cash").map_err(map_shift_row_err)?;
 
     let shift = ShiftDto {
         shift_id: row.try_get("shift_id").map_err(map_shift_row_err)?,
@@ -453,6 +470,11 @@ pub async fn round_report(
         });
     }
 
+    // Cash reconciliation: only the cash tender touches the drawer.
+    let round2 = |v: f64| (v * 100.0).round() / 100.0;
+    let expected_cash = round2(shift.opening_float + income.cash);
+    let cash_variance = counted_cash.map(|c| round2(c - expected_cash));
+
     Ok(Json(RoundReportResponse {
         success: true,
         shift,
@@ -461,5 +483,8 @@ pub async fn round_report(
         open,
         income,
         sales,
+        expected_cash,
+        counted_cash,
+        cash_variance,
     }))
 }

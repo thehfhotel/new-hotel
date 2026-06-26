@@ -1602,6 +1602,9 @@ CREATE TABLE IF NOT EXISTS ht_shifts (
     shift_legacy_round_id INTEGER,
     shift_notes           TEXT,
     shift_created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- Migration 058 (Track J7c) — cash-drawer reconciliation at close.
+    shift_counted_cash    NUMERIC(14,2),
+    shift_cash_count      JSONB,
     UNIQUE (shift_site_id, shift_no)
 );
 
@@ -2117,6 +2120,13 @@ CREATE INDEX IF NOT EXISTS ix_ht_payment_ledger_cin_no
 
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('057', '057_create_ht_payment_ledger.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 058 — Track J7c. Cash-drawer reconciliation columns on ht_shifts
+-- (counted cash + raw denomination map), inlined into the ht_shifts CREATE
+-- above for fresh DBs. See migrations/pg/058_add_shift_cash_count.sql.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('058', '058_add_shift_cash_count.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================
