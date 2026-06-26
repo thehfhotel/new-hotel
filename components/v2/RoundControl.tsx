@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import Link from 'next/link'
-import { AlertTriangle, Clock, FileText, Loader2, Lock, Unlock, X } from 'lucide-react'
+import { AlertTriangle, BarChart3, Clock, FileText, Loader2, Lock, Unlock, X } from 'lucide-react'
 import { useBranch } from '@/contexts/BranchContext'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { useAuth } from '@/contexts/AuthContext'
@@ -230,6 +230,16 @@ export default function RoundControl({ onChanged }: { onChanged?: () => void }) 
   return (
     <>
       {body}
+      {/* Round summary / analytics (closed rounds over a date range). */}
+      <div className="flex justify-end mt-1.5">
+        <Link
+          href="/v2/rounds"
+          className="text-[12px] inline-flex items-center gap-1 hover:underline"
+          style={{ color: 'var(--v2-ink-3)' }}
+        >
+          <BarChart3 size={13} /> สรุปรอบบิล
+        </Link>
+      </div>
       {/* Sheets are gated on their own shiftId (not `shift`) so the close sheet
           stays mounted to show the final report after the round goes closed. */}
       {closingShiftId != null && (

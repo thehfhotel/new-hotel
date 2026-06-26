@@ -526,6 +526,9 @@ fn build_new_routes(app_state: AppState) -> Router {
         // Track J7b — round reconciliation report (income by tender + sales
         // summary) from canonical ht_payment_ledger. Read-only; branch-aware.
         .route("/api/shifts/{shift_id}/report", get(routes::new_shifts::round_report))
+        // Track J7f — round summary/analytics: closed rounds over a date range
+        // (iHOTEL FrmDueBill history) + period totals + by-cashier. Read-only.
+        .route("/api/shifts/summary", get(routes::new_shifts::round_summary))
         // Inventory Management
         .route("/api/inventory/items", get(routes::new_inventory::list_items).post(routes::new_inventory::create_item))
         .route("/api/inventory/items/{id}", get(routes::new_inventory::get_item).put(routes::new_inventory::update_item).delete(routes::new_inventory::delete_item))

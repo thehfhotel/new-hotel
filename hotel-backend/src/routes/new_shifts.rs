@@ -555,3 +555,229 @@ pub async fn round_report(
         cash_variance,
     }))
 }
+
+// =============================================================================
+// Track J7f — round SUMMARY / analytics (multi-round, over a date range).
+//
+// iHOTEL equivalent: the `FrmDueBill` history list — `SELECT TOP 100 * FROM
+// View_RBill_H WHERE round_end IS NOT NULL AND round_start BETWEEN <from> AND
+// <to>` — a table of closed rounds, each with the full per-round breakdown.
+// We add the aggregate roll-up (period totals + by-cashier) for analytics.
+// =============================================================================
+
+/// `GET /api/shifts/summary?branch=&from=&to=` query string. `from`/`to` are
+/// RFC3339; default to the last 30 days. Range capped at 92 days (the deposit
+/// per-round subqueries scan `ht_checkin_rooms`).
+#[derive(Debug, Deserialize)]
+pub struct RoundSummaryQuery {
+    pub branch: Option<Branch>,
+    pub from: Option<DateTime<Utc>>,
+    pub to: Option<DateTime<Utc>>,
+}
+
+/// One closed round in the summary — the same per-round breakdown as the
+/// single-round report (iHOTEL `View_RBill_H` columns).
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RoundSummaryRow {
+    /// PG `shift_id` — lets the UI open the single-round report
+    /// (`GET /api/shifts/{shift_id}/report`) on row click.
+    pub shift_id: i64,
+    pub shift_no: i32,
+    pub legacy_round_id: Option<i32>,
+    pub opened_at: DateTime<Utc>,
+    pub closed_at: Option<DateTime<Utc>>,
+    pub opened_by: String,
+    pub closed_by: Option<String>,
+    pub opening: f64,
+    pub cash_received: f64,
+    pub cash_paid: f64,
+    pub cash_net: f64,
+    pub credit: f64,
+    pub transfer: f64,
+    pub free: f64,
+    pub web: f64,
+    pub deposits_received: f64,
+    pub deposits_returned: f64,
+    pub grand_total: f64,
+}
+
+/// Period roll-up across the rounds (the analytics layer).
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RoundSummaryTotals {
+    pub round_count: i64,
+    pub cash_received: f64,
+    pub cash_paid: f64,
+    pub cash_net: f64,
+    pub credit: f64,
+    pub transfer: f64,
+    pub free: f64,
+    pub web: f64,
+    pub deposits_received: f64,
+    pub deposits_returned: f64,
+    pub grand_total: f64,
+}
+
+/// Per-cashier tally (by `closed_by`) — analytics dimension.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CashierTally {
+    pub cashier: String,
+    pub round_count: i64,
+    pub grand_total: f64,
+}
+
+/// `200` body for the round summary.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoundSummaryResponse {
+    pub success: bool,
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+    pub rounds: Vec<RoundSummaryRow>,
+    pub totals: RoundSummaryTotals,
+    pub by_cashier: Vec<CashierTally>,
+}
+
+/// `GET /api/shifts/summary` — closed rounds over a date range, each with the
+/// iHOTEL `View_RBill_H` per-round breakdown, plus period totals + a
+/// by-cashier roll-up. Branch-aware (per-site pool), same as the report.
+pub async fn round_summary(
+    State(state): State<AppState>,
+    Query(query): Query<RoundSummaryQuery>,
+) -> ApiResult<Json<RoundSummaryResponse>> {
+    let pool = match query.branch.unwrap_or_default() {
+        Branch::Hfville => state.ville_pool()?,
+        Branch::Hfhotel | Branch::All => &state.new_pool,
+    };
+
+    let to = query.to.unwrap_or_else(Utc::now);
+    let mut from = query.from.unwrap_or_else(|| to - chrono::Duration::days(30));
+    // Cap the span so the per-round deposit subqueries stay bounded.
+    let max_from = to - chrono::Duration::days(92);
+    if from < max_from {
+        from = max_from;
+    }
+
+    // One pass: per closed round, the ledger tender splits (FILTER) + deposit
+    // received/returned (correlated subqueries scoped to that round's window).
+    let rows = sqlx::query(
+        "SELECT s.shift_id, s.shift_no, s.shift_legacy_round_id, s.shift_opened_at, s.shift_closed_at, \
+                s.shift_opened_by, s.shift_closed_by, s.shift_opening_float::float8 AS opening, \
+                COALESCE(SUM(l.ledger_cash) FILTER (WHERE l.ledger_cash > 0),0)::float8     AS cash_received, \
+                COALESCE(-SUM(l.ledger_cash) FILTER (WHERE l.ledger_cash < 0),0)::float8    AS cash_paid, \
+                COALESCE(SUM(l.ledger_credit) FILTER (WHERE l.ledger_credit > 0),0)::float8 AS credit, \
+                COALESCE(SUM(l.ledger_tran) FILTER (WHERE l.ledger_tran > 0),0)::float8     AS transfer, \
+                COALESCE(SUM(l.ledger_free),0)::float8 AS free, \
+                COALESCE(SUM(l.ledger_web),0)::float8  AS web, \
+                (SELECT COALESCE(SUM(cr.cr_dep_amount),0)::float8 FROM ht_checkin_rooms cr \
+                    JOIN ht_checkins c ON c.cin_id = cr.cr_cin_id \
+                   WHERE cr.cr_dep_amount > 0 AND c.cin_status <> 'cancelled' \
+                     AND cr.cr_room_in >= s.shift_opened_at AND cr.cr_room_in < s.shift_closed_at) AS dep_received, \
+                (SELECT COALESCE(SUM(cr.cr_dep_amount),0)::float8 FROM ht_checkin_rooms cr \
+                    JOIN ht_checkins c ON c.cin_id = cr.cr_cin_id \
+                   WHERE cr.cr_dep_amount > 0 AND c.cin_status <> 'cancelled' \
+                     AND cr.cr_dep_returned_at >= s.shift_opened_at AND cr.cr_dep_returned_at < s.shift_closed_at) AS dep_returned \
+           FROM ht_shifts s \
+           LEFT JOIN ht_payment_ledger l \
+             ON l.ledger_status = '1' \
+            AND l.ledger_pay_date >= s.shift_opened_at AND l.ledger_pay_date < s.shift_closed_at \
+          WHERE s.shift_closed_at IS NOT NULL \
+            AND s.shift_opened_at >= $1 AND s.shift_opened_at < $2 \
+          GROUP BY s.shift_id \
+          ORDER BY s.shift_opened_at DESC",
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::Internal(format!("failed to build round summary: {e}")))?;
+
+    let round2 = |v: f64| (v * 100.0).round() / 100.0;
+    let mut rounds = Vec::with_capacity(rows.len());
+    let mut totals = RoundSummaryTotals::default();
+    let mut tally: std::collections::HashMap<String, (i64, f64)> = std::collections::HashMap::new();
+
+    for r in rows {
+        let opening: f64 = r.try_get("opening").map_err(map_shift_row_err)?;
+        let cash_received: f64 = r.try_get("cash_received").map_err(map_shift_row_err)?;
+        let cash_paid: f64 = r.try_get("cash_paid").map_err(map_shift_row_err)?;
+        let credit: f64 = r.try_get("credit").map_err(map_shift_row_err)?;
+        let transfer: f64 = r.try_get("transfer").map_err(map_shift_row_err)?;
+        let free: f64 = r.try_get("free").map_err(map_shift_row_err)?;
+        let web: f64 = r.try_get("web").map_err(map_shift_row_err)?;
+        let dep_received: f64 = r.try_get("dep_received").map_err(map_shift_row_err)?;
+        let dep_returned: f64 = r.try_get("dep_returned").map_err(map_shift_row_err)?;
+        let cash_net = cash_received - cash_paid;
+        let grand_total = round2(opening + cash_net + credit + transfer);
+        let closed_by: Option<String> = r.try_get("shift_closed_by").map_err(map_shift_row_err)?;
+
+        totals.round_count += 1;
+        totals.cash_received += cash_received;
+        totals.cash_paid += cash_paid;
+        totals.credit += credit;
+        totals.transfer += transfer;
+        totals.free += free;
+        totals.web += web;
+        totals.deposits_received += dep_received;
+        totals.deposits_returned += dep_returned;
+        totals.grand_total += grand_total;
+
+        let e = tally.entry(closed_by.clone().unwrap_or_else(|| "—".into())).or_insert((0, 0.0));
+        e.0 += 1;
+        e.1 += grand_total;
+
+        rounds.push(RoundSummaryRow {
+            shift_id: r.try_get("shift_id").map_err(map_shift_row_err)?,
+            shift_no: r.try_get("shift_no").map_err(map_shift_row_err)?,
+            legacy_round_id: r.try_get("shift_legacy_round_id").map_err(map_shift_row_err)?,
+            opened_at: r.try_get("shift_opened_at").map_err(map_shift_row_err)?,
+            closed_at: r.try_get("shift_closed_at").map_err(map_shift_row_err)?,
+            opened_by: r.try_get("shift_opened_by").map_err(map_shift_row_err)?,
+            closed_by,
+            opening,
+            cash_received,
+            cash_paid,
+            cash_net,
+            credit,
+            transfer,
+            free,
+            web,
+            deposits_received: dep_received,
+            deposits_returned: dep_returned,
+            grand_total,
+        });
+    }
+
+    // Round period totals; sort cashiers by total desc.
+    totals.cash_received = round2(totals.cash_received);
+    totals.cash_paid = round2(totals.cash_paid);
+    totals.cash_net = round2(totals.cash_received - totals.cash_paid);
+    totals.credit = round2(totals.credit);
+    totals.transfer = round2(totals.transfer);
+    totals.free = round2(totals.free);
+    totals.web = round2(totals.web);
+    totals.deposits_received = round2(totals.deposits_received);
+    totals.deposits_returned = round2(totals.deposits_returned);
+    totals.grand_total = round2(totals.grand_total);
+
+    let mut by_cashier: Vec<CashierTally> = tally
+        .into_iter()
+        .map(|(cashier, (round_count, gt))| CashierTally {
+            cashier,
+            round_count,
+            grand_total: round2(gt),
+        })
+        .collect();
+    by_cashier.sort_by(|a, b| b.grand_total.partial_cmp(&a.grand_total).unwrap_or(std::cmp::Ordering::Equal));
+
+    Ok(Json(RoundSummaryResponse {
+        success: true,
+        from,
+        to,
+        rounds,
+        totals,
+        by_cashier,
+    }))
+}
