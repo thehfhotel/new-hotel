@@ -27,19 +27,23 @@
 # turns the cook step into a hit and we skip the ~800-crate dep
 # recompile. Source-only changes drop from ~5min to ~1min.
 #
-# ## Cache mounts (kept)
+# ## Layer caching — the actual cargo-chef win (fixed 2026-06-27)
 #
-# `--mount=type=cache,target=...` mounts persist across runs via the
-# gha cache backend on docker/build-push-action. Used here for:
-#   - /usr/local/cargo/registry — sparse-protocol crate index + .crate downloads
-#   - /usr/local/cargo/git      — git deps (none today, future-proofing)
-#   - /usr/src/app/target       — incremental compile artifacts
-# These complement the layer cache; cargo-chef + mounts are additive
-# (chef makes the COOK layer cacheable; mounts make incremental compiles
-# inside any RUN faster).
+# CRITICAL: target/ and the crate registry are NOT `--mount=type=cache`. They
+# live in the cook IMAGE LAYER, which is exported/restored via
+# `cache-to/from: type=gha,mode=max` (build-backend job). So a cache hit on the
+# cook layer carries the COMPILED ~800-crate dep closure with it, and the build
+# step only recompiles workspace code (~4.5min → ~1min on source-only changes).
 #
-# Cache-mount contents are NOT included in the image layer, so the build
-# step `cp`s the binaries to /out/ before they get unmounted.
+# This is the whole point of cargo-chef — but it was previously DEFEATED by
+# mounting target/ as a cache mount: BuildKit excludes mount contents from image
+# layers and `cache-to: gha` does not export them, so the cook-layer cache hit
+# restored an EMPTY target/ and the build recompiled every crate on EVERY run.
+# (Build-log proof + root-cause in commit that removed the mounts.)
+#
+# Only /sccache stays a cache mount (compiler cache; excluded from the layer so
+# it can't bloat it). The build step `cp`s the binaries to /out/ so the runtime
+# stage can COPY them without dragging in the whole target/ tree.
 #
 # mold linker shaves a large chunk off link time vs the default GNU ld.
 
@@ -126,16 +130,14 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 
 # Step 1: cook the dependency closure. This RUN is keyed on recipe.json
-# alone — when deps don't change, Docker reuses the prior layer and
-# the cook command never executes. That's the cargo-chef value prop.
+# alone — when deps don't change, the cook LAYER is a gha cache hit and the
+# command never executes, and (because target/ + the registry live in the
+# layer now, not a mount) that hit carries the compiled deps with it. That's
+# the cargo-chef value prop, finally working.
 COPY --from=planner /usr/src/app/recipe.json recipe.json
-# Cook re-fetches the dep closure; retry it through transient crate-download
-# blips (re-runs are mostly cache hits via target/ + sccache, so a retry just
-# re-pulls the crate that failed and relinks).
-RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
-    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
-    --mount=type=cache,target=/usr/src/app/target,id=hotel-backend-target \
-    --mount=type=cache,target=/sccache,id=sccache-backend \
+# Cook fetches + compiles the whole dep closure; retry it through transient
+# crate-download blips (a retry re-pulls the crate that failed and relinks).
+RUN --mount=type=cache,target=/sccache,id=sccache-backend \
     set -eu; \
     n=0; until cargo chef cook --release --recipe-path recipe.json; do \
         n=$((n+1)); \
@@ -144,22 +146,20 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     done; \
     sccache --show-stats
 
-# Step 2: COPY the full source. Now the deps are pre-compiled in target/
-# (via the cache mount), so this build step only compiles workspace code.
+# Step 2: COPY the full source. The deps are already compiled in target/ — it
+# came in with the cook layer (target/ is dockerignored, so this COPY can't
+# clobber it) — so this build step only compiles workspace code.
 # Build ONLY the production binaries. The `inspect_*` debug bins are
 # explicitly excluded from the runtime image (Batch C of audit) — they
 # remain available via `cargo run --bin inspect_*` locally for ops use,
 # but never ship to production.
 COPY . .
-# Isolate the only network step (crate download) and retry it with linear
-# backoff; then compile OFFLINE so a transient "curl failed" can NEVER fail the
-# build itself. This is the core fix for the recurring CI flake — when the cook
-# layer is a cache hit but the registry cache mount is cold, the build would
-# otherwise re-download every crate and die on the first blip.
-RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
-    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
-    --mount=type=cache,target=/usr/src/app/target,id=hotel-backend-target \
-    --mount=type=cache,target=/sccache,id=sccache-backend \
+# On a warm cook layer the registry is already present, so `cargo fetch` is a
+# no-op and the compile is fully OFFLINE. On a COLD layer (recipe.json changed)
+# fetch downloads the closure — retried with linear backoff so a transient
+# "curl failed" self-heals, and the compile stays OFFLINE so a CDN blip can
+# never fail the build itself.
+RUN --mount=type=cache,target=/sccache,id=sccache-backend \
     set -eu; \
     n=0; until cargo fetch --locked; do \
         n=$((n+1)); \
