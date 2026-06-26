@@ -72,7 +72,7 @@ export default function Rr4ExportPage() {
       const from = formatDateForApi(startDate)
       const to = formatDateForApi(endDate)
       const params = new URLSearchParams({ from, to, site, format })
-      const response = await branchFetch(`/api/new/reports/rr4?${params.toString()}`)
+      const response = await branchFetch(`/api/reports/rr4?${params.toString()}`)
 
       if (!response.ok) {
         const text = await response.text()

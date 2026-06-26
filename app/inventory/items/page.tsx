@@ -93,7 +93,7 @@ function InventoryItemsContent() {
         params.append('lowStock', 'true')
       }
 
-      const response = await branchFetch(`/api/new/inventory/items?${params}`)
+      const response = await branchFetch(`/api/inventory/items?${params}`)
       if (!response.ok) {
         throw new Error('Failed to fetch items')
       }
@@ -158,8 +158,8 @@ function InventoryItemsContent() {
   // Handle save item
   const handleSaveItem = async (data: InventoryItemFormData) => {
     const endpoint = data.id
-      ? `/api/new/inventory/items/${data.id}`
-      : '/api/new/inventory/items'
+      ? `/api/inventory/items/${data.id}`
+      : '/api/inventory/items'
     const method = data.id ? 'PUT' : 'POST'
 
     const response = await branchFetch(endpoint, {
@@ -189,7 +189,7 @@ function InventoryItemsContent() {
 
   // Handle delete item
   const handleDeleteItem = async (id: number) => {
-    const response = await branchFetch(`/api/new/inventory/items/${id}`, {
+    const response = await branchFetch(`/api/inventory/items/${id}`, {
       method: 'DELETE',
     })
 

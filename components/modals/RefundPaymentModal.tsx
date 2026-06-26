@@ -17,7 +17,7 @@ const REFUND_PERMISSION = 'payment.refund'
  *
  * Mirrors `PaymentModal`'s shape but the receptionist enters a refund
  * (positive magnitude — the backend negates) against an existing
- * payment row. POSTs `/api/new/payments/:id/refund` and refreshes the
+ * payment row. POSTs `/api/payments/:id/refund` and refreshes the
  * caller via `onSuccess`.
  *
  * Validation client-side mirrors the service layer:
@@ -111,7 +111,7 @@ export default function RefundPaymentModal({
     setError(null)
 
     try {
-      const res = await branchFetch(`/api/new/payments/${paymentId}/refund`, {
+      const res = await branchFetch(`/api/payments/${paymentId}/refund`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

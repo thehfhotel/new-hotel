@@ -387,26 +387,23 @@ fn build_new_routes(app_state: AppState) -> Router {
         app_middleware::require_permission("inventory.consume", app_state.clone());
     let perm_inventory_consume_adjustments =
         app_middleware::require_permission("inventory.consume", app_state.clone());
-    let perm_inventory_consume_product =
-        app_middleware::require_permission("inventory.consume", app_state.clone());
-    // Track G5 — coupon issuing / redeeming.
+    // Track G5 — coupon issuing.
     let perm_coupon_issue =
         app_middleware::require_permission("coupon.issue", app_state.clone());
-    let perm_coupon_redeem =
-        app_middleware::require_permission("coupon.redeem", app_state.clone());
     // Track G6 — POS / sales-to-room route gate. Admin + cashier
     // hold the grant (migration 052 seeds the role grid).
     let perm_pos_sell =
         app_middleware::require_permission("pos.sell", app_state.clone());
 
     Router::new()
-        // Rooms routes (PG-only, Phase 8 — reads `ht_rooms_legacy` mirror)
+        // ── Collision nouns (rooms / customers / checkins / bookings) ──
+        // These keep BOTH a branch-aware legacy reader (the only HF Ville-capable
+        // read today) AND the canonical "/api/new/*" CRUD path until the superset
+        // merge lands. Do not collapse their list URLs yet.
+        //
+        // Branch-aware legacy reads (PG; serve HF Hotel + HF Ville via ville_pool).
         .route("/api/rooms", get(routes::rooms::list_rooms))
-        .route("/api/rooms/status", get(routes::rooms::get_room_status))
         .route("/api/rooms/checkouts-today", get(routes::rooms::get_checkouts_today))
-        .route("/api/rooms/{id}", get(routes::rooms::get_room))
-        // Legacy booking routes (PG-only, Phase 8 — reads `ht_bookings_legacy` mirror)
-        .route("/api/bookings", get(routes::bookings::list_bookings))
         .route("/api/bookings/{id}", get(routes::bookings::get_booking))
         .route(
             "/api/bookings/{id}/notes",
@@ -414,16 +411,12 @@ fn build_new_routes(app_state: AppState) -> Router {
                 .post(routes::bookings::create_note)
                 .delete(routes::bookings::delete_note),
         )
-        // Check-ins route (PG-only, Phase 8 — reads `ht_checkins_legacy` mirror)
         .route("/api/checkins", get(routes::checkins::list_checkins))
-        // Legacy customers routes (PG-only, Phase 8 — reads `ht_customers_legacy` mirror)
         .route("/api/customers", get(routes::customers::list_customers))
         .route("/api/customers/{id}/bookings", get(routes::customers::get_customer_bookings))
         .route("/api/customers/{id}/stats", get(routes::customers::get_customer_stats))
-        // Stats route (PG-only, Phase 8 — reads `ht_*_legacy` mirrors)
+        // Branch-aware stats (HF Hotel + HF Ville) — the sole stats path.
         .route("/api/stats", get(routes::stats::get_stats))
-        // Occupancy route (PG-only, Phase 8 — reads `ht_checkins_legacy` mirror)
-        .route("/api/occupancy", get(routes::occupancy::get_occupancy))
         // Mode and calendar routes
         .route("/api/mode", get(routes::mode::get_mode))
         // Active HF Ville connectivity probe (pings the ville pool with SELECT 1)
@@ -431,28 +424,24 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route("/api/health/ville", get(routes::mode::get_ville_health))
         .route("/api/calendar", get(routes::calendar::get_calendar))
         // Phase 5.5d — legacy_mirror.* read-only endpoints (coupons,
-        // minibar, room moves, pricing reference). Surfaces legacy-
-        // only features so receptionists don't switch to the .NET app.
+        // minibar, room moves). Surfaces legacy-only features so
+        // receptionists don't switch to the .NET app.
         .route("/api/legacy-mirror/coupons", get(routes::legacy_mirror::list_coupons))
         .route("/api/legacy-mirror/products", get(routes::legacy_mirror::list_products))
         .route("/api/legacy-mirror/room-changes", get(routes::legacy_mirror::list_room_changes))
-        .route("/api/legacy-mirror/pricing", get(routes::legacy_mirror::get_pricing_reference))
-        // New stats
-        .route("/api/new/stats", get(routes::new_stats::get_stats))
-        // New customers CRUD
+        // Customers (canonical CRUD — create/search). Detail GET/PUT/DELETE were
+        // unused and removed; list+create stay on the canonical path pending merge.
         .route("/api/new/customers", get(routes::new_customers::list_customers).post(routes::new_customers::create_customer))
-        .route("/api/new/customers/{id}", get(routes::new_customers::get_customer).put(routes::new_customers::update_customer).delete(routes::new_customers::delete_customer))
-        // New rooms CRUD
+        // Rooms CRUD (canonical)
         .route("/api/new/rooms", get(routes::new_rooms::list_rooms).post(routes::new_rooms::create_room))
         .route("/api/new/rooms/{id}", get(routes::new_rooms::get_room).put(routes::new_rooms::update_room))
         .route("/api/new/rooms/{id}/status", patch(routes::new_rooms::update_room_status))
-        // New bookings CRUD
+        // Bookings CRUD (canonical)
         .route("/api/new/bookings", get(routes::new_bookings::list_bookings).post(routes::new_bookings::create_booking))
         .route("/api/new/bookings/{id}", get(routes::new_bookings::get_booking).put(routes::new_bookings::update_booking))
         .route("/api/new/bookings/{id}/cancel", put(routes::new_bookings::cancel_booking))
-        // New check-ins CRUD
+        // Check-ins CRUD (canonical)
         .route("/api/new/checkins", get(routes::new_checkins::list_checkins).post(routes::new_checkins::create_checkin))
-        .route("/api/new/checkins/{id}", get(routes::new_checkins::get_checkin))
         .route("/api/new/checkins/{id}/checkout", put(routes::new_checkins::checkout))
         // Track G1 / T4 HIGH-2: extend an active stay (one-more-night flow).
         .route("/api/new/checkins/{id}/extend", put(routes::new_checkins::extend))
@@ -476,90 +465,69 @@ fn build_new_routes(app_state: AppState) -> Router {
         // Guest registry
         .route("/api/new/checkins/{id}/guests", get(routes::new_checkins::list_guests).post(routes::new_checkins::create_guest))
         .route("/api/new/checkins/{id}/guests/{guest_id}", delete(routes::new_checkins::delete_guest))
-        // Room types CRUD
-        .route("/api/new/room-types", get(routes::new_room_types::list_room_types).post(routes::new_room_types::create_room_type))
-        .route("/api/new/room-types/{id}", get(routes::new_room_types::get_room_type).put(routes::new_room_types::update_room_type).delete(routes::new_room_types::delete_room_type))
-        // Rates CRUD (legacy ht_rates write path; reads post-F4 come
-        // from ht_rate_tiers — see routes/new_rates.rs module docs)
-        .route("/api/new/rates", get(routes::new_rates::list_rates).post(routes::new_rates::create_rate))
-        .route("/api/new/rates/{id}", get(routes::new_rates::get_rate).put(routes::new_rates::update_rate).delete(routes::new_rates::delete_rate))
-        // F4 canonical rate tiers (Room_Type × Cust_Type matrix) read path.
-        .route("/api/new/rate-tiers", get(routes::new_rates::list_rate_tiers))
-        // Reports
-        .route("/api/new/reports/revenue", get(routes::new_reports::get_revenue))
-        .route("/api/new/reports/occupancy", get(routes::new_reports::get_occupancy))
-        .route("/api/new/reports/revenue-by-room-type", get(routes::new_reports::get_revenue_by_room_type))
-        // Track G8 — RR.4 Thai immigration foreign-guest export (legal CRIT)
-        .route("/api/new/reports/rr4", get(routes::rr4_export::get_rr4_export))
         // Invoice
         .route("/api/new/checkins/{id}/invoice", get(routes::new_invoice::get_invoice))
         // Payments
         .route("/api/new/checkins/{id}/payments", get(routes::new_payments::list_payments).post(routes::new_payments::create_payment))
-        .route("/api/new/payments/{id}", delete(routes::new_payments::void_payment))
+        // ── Single /api/* suite (no "/new" prefix) for non-colliding families ──
+        // Room types CRUD
+        .route("/api/room-types", get(routes::new_room_types::list_room_types).post(routes::new_room_types::create_room_type))
+        .route("/api/room-types/{id}", get(routes::new_room_types::get_room_type).put(routes::new_room_types::update_room_type).delete(routes::new_room_types::delete_room_type))
+        // Rates CRUD
+        .route("/api/rates", get(routes::new_rates::list_rates).post(routes::new_rates::create_rate))
+        .route("/api/rates/{id}", get(routes::new_rates::get_rate).put(routes::new_rates::update_rate).delete(routes::new_rates::delete_rate))
+        // Reports
+        .route("/api/reports/revenue", get(routes::new_reports::get_revenue))
+        .route("/api/reports/occupancy", get(routes::new_reports::get_occupancy))
+        .route("/api/reports/revenue-by-room-type", get(routes::new_reports::get_revenue_by_room_type))
+        // Track G8 — RR.4 Thai immigration foreign-guest export (legal CRIT)
+        .route("/api/reports/rr4", get(routes::rr4_export::get_rr4_export))
         // Track G2 / T4 CRIT-1 — refund (negative payment) against an existing payment row.
         // Track G7 gates this on `payment.refund` (cashier + admin only).
         .route(
-            "/api/new/payments/{id}/refund",
+            "/api/payments/{id}/refund",
             post(routes::new_payments::refund_payment).route_layer(perm_payment_refund),
         )
         // Track G5 — canonical coupon issuing (HT_Cupon mirror).
         // `coupon.issue` gates admin + receptionist (migration 051).
-        // `coupon.redeem` gates admin + cashier + receptionist.
-        // List endpoint is unrestricted (read-only operational view).
-        .route("/api/new/coupons", get(routes::new_coupons::list_coupons))
         .route(
-            "/api/new/coupons",
+            "/api/coupons",
             post(routes::new_coupons::issue_coupon).route_layer(perm_coupon_issue),
         )
-        .route(
-            "/api/new/coupons/{code}/redeem",
-            post(routes::new_coupons::redeem_coupon).route_layer(perm_coupon_redeem),
-        )
         // Shifts (Track F2 / T1 HIGH-5 — cashier-shift gate for payments)
-        .route("/api/new/shifts/open", post(routes::new_shifts::open_shift))
-        .route("/api/new/shifts/close", post(routes::new_shifts::close_shift))
-        .route("/api/new/shifts/current", get(routes::new_shifts::current_shift))
-        .route("/api/new/shifts", get(routes::new_shifts::list_shifts))
+        .route("/api/shifts/current", get(routes::new_shifts::current_shift))
         // Inventory Management
-        .route("/api/new/inventory/categories", get(routes::new_inventory::list_categories).post(routes::new_inventory::create_category))
-        .route("/api/new/inventory/items", get(routes::new_inventory::list_items).post(routes::new_inventory::create_item))
-        .route("/api/new/inventory/items/{id}", get(routes::new_inventory::get_item).put(routes::new_inventory::update_item).delete(routes::new_inventory::delete_item))
-        .route("/api/new/inventory/rooms", get(routes::new_inventory::list_inventory_rooms))
-        .route("/api/new/inventory/rooms/{room_id}", get(routes::new_inventory::get_room_inventory).put(routes::new_inventory::update_room_inventory))
+        .route("/api/inventory/items", get(routes::new_inventory::list_items).post(routes::new_inventory::create_item))
+        .route("/api/inventory/items/{id}", get(routes::new_inventory::get_item).put(routes::new_inventory::update_item).delete(routes::new_inventory::delete_item))
+        .route("/api/inventory/rooms", get(routes::new_inventory::list_inventory_rooms))
+        .route("/api/inventory/rooms/{room_id}", get(routes::new_inventory::get_room_inventory).put(routes::new_inventory::update_room_inventory))
         // Track G7 gates housekeeping/POS stock mutations on `inventory.consume`.
         .route(
-            "/api/new/inventory/rooms/{room_id}/check",
+            "/api/inventory/rooms/{room_id}/check",
             axum::routing::post(routes::new_inventory::check_room_inventory)
                 .route_layer(perm_inventory_consume_check),
         )
         .route(
-            "/api/new/inventory/rooms/{room_id}/replenish",
+            "/api/inventory/rooms/{room_id}/replenish",
             axum::routing::post(routes::new_inventory::replenish_room_inventory)
                 .route_layer(perm_inventory_consume_replenish),
         )
         .route(
-            "/api/new/inventory/adjustments",
+            "/api/inventory/adjustments",
             axum::routing::post(routes::new_inventory::create_stock_adjustment)
                 .route_layer(perm_inventory_consume_adjustments),
         )
-        .route("/api/new/inventory/transactions", get(routes::new_inventory::list_transactions).post(routes::new_inventory::create_transaction))
-        .route("/api/new/inventory/stats", get(routes::new_inventory::get_stats))
-        .route("/api/new/inventory/low-stock", get(routes::new_inventory::get_low_stock))
+        .route("/api/inventory/transactions", get(routes::new_inventory::list_transactions))
+        .route("/api/inventory/stats", get(routes::new_inventory::get_stats))
         // Products (Track F3 — `audit-2026-05-13.md` T1 CRIT-3)
-        .route("/api/new/products", get(routes::new_products::list_products))
-        .route("/api/new/products/{id}", get(routes::new_products::get_product))
-        .route(
-            "/api/new/products/{id}/stock-adjust",
-            axum::routing::post(routes::new_products::adjust_stock)
-                .route_layer(perm_inventory_consume_product),
-        )
+        .route("/api/products", get(routes::new_products::list_products))
         // Maintenance Management
-        .route("/api/new/maintenance/categories", get(routes::new_maintenance::list_categories))
-        .route("/api/new/maintenance/requests", get(routes::new_maintenance::list_requests).post(routes::new_maintenance::create_request))
-        .route("/api/new/maintenance/requests/{id}", get(routes::new_maintenance::get_request).put(routes::new_maintenance::update_request))
-        .route("/api/new/maintenance/requests/{id}/status", put(routes::new_maintenance::update_request_status))
+        .route("/api/maintenance/categories", get(routes::new_maintenance::list_categories))
+        .route("/api/maintenance/requests", get(routes::new_maintenance::list_requests).post(routes::new_maintenance::create_request))
+        .route("/api/maintenance/requests/{id}", get(routes::new_maintenance::get_request).put(routes::new_maintenance::update_request))
+        .route("/api/maintenance/requests/{id}/status", put(routes::new_maintenance::update_request_status))
         // Sync status
-        .route("/api/new/sync/status", get(routes::new_sync::get_sync_status))
+        .route("/api/sync/status", get(routes::new_sync::get_sync_status))
         // Real-time domain-event stream (Phase 4a per architecture.md §3.6e).
         // Long-lived SSE connection; one PgListener per client.
         .route("/api/events", get(routes::events::stream))

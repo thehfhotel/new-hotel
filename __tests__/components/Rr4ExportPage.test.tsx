@@ -4,7 +4,7 @@
  * Track G8 — frontend test for the RR.4 export page.
  *
  * Covers the load-bearing behaviour:
- * 1. Clicking the Export button issues a `GET /api/new/reports/rr4`
+ * 1. Clicking the Export button issues a `GET /api/reports/rr4`
  *    with the form's `from`, `to`, `site`, and `format` query params.
  * 2. The mocked branchFetch is invoked exactly once per click.
  * 3. The default format is `xlsx` (regulator delivery format).
@@ -102,7 +102,7 @@ describe('Rr4ExportPage', () => {
     expect(formatSelect.value).toBe('xlsx')
   })
 
-  test('clicking Export fires GET /api/new/reports/rr4 with the form params', async () => {
+  test('clicking Export fires GET /api/reports/rr4 with the form params', async () => {
     mockSuccessfulXlsxResponse()
     render(<Rr4ExportPage />)
 
@@ -118,7 +118,7 @@ describe('Rr4ExportPage', () => {
     })
 
     const calledUrl = mockFetch.mock.calls[0][0] as string
-    expect(calledUrl.startsWith('/api/new/reports/rr4?')).toBe(true)
+    expect(calledUrl.startsWith('/api/reports/rr4?')).toBe(true)
     expect(calledUrl).toContain('from=2026-05-01')
     expect(calledUrl).toContain('to=2026-05-13')
     expect(calledUrl).toContain('site=hfhotel')

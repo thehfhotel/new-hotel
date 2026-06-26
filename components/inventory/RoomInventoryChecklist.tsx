@@ -55,7 +55,7 @@ export default function RoomInventoryChecklist({
     setLoading(true)
     setError(null)
     try {
-      const res = await fetch(`/api/new/inventory/rooms/${roomId}`)
+      const res = await fetch(`/api/inventory/rooms/${roomId}`)
       const data = await res.json()
 
       if (data.success && data.data) {
@@ -107,7 +107,7 @@ export default function RoomInventoryChecklist({
     setError(null)
 
     try {
-      const res = await fetch(`/api/new/inventory/rooms/${roomId}/check`, {
+      const res = await fetch(`/api/inventory/rooms/${roomId}/check`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -150,7 +150,7 @@ export default function RoomInventoryChecklist({
         return
       }
 
-      const res = await fetch(`/api/new/inventory/rooms/${roomId}/replenish`, {
+      const res = await fetch(`/api/inventory/rooms/${roomId}/replenish`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

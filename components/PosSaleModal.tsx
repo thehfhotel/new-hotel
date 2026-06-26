@@ -151,7 +151,7 @@ export default function PosSaleModal({
         setActiveCheckin(cin)
 
         const [productsRes, salesRes] = await Promise.all([
-          branchFetch('/api/new/products?active_only=true&limit=200'),
+          branchFetch('/api/products?active_only=true&limit=200'),
           branchFetch(`/api/new/checkins/${cin.id}/pos-sales`),
         ])
         if (cancelled) return

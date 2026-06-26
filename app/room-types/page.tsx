@@ -74,7 +74,7 @@ export default function RoomTypesPage() {
         params.append('search', debouncedSearch)
       }
 
-      const response = await branchFetch(`/api/new/room-types?${params}`)
+      const response = await branchFetch(`/api/room-types?${params}`)
       if (!response.ok) {
         throw new Error('Failed to fetch room types')
       }
@@ -134,8 +134,8 @@ export default function RoomTypesPage() {
   // Handle save room type
   const handleSaveRoomType = async (data: RoomTypeFormData) => {
     const endpoint = data.id
-      ? `/api/new/room-types/${data.id}`
-      : '/api/new/room-types'
+      ? `/api/room-types/${data.id}`
+      : '/api/room-types'
     const method = data.id ? 'PUT' : 'POST'
 
     const response = await branchFetch(endpoint, {
@@ -166,7 +166,7 @@ export default function RoomTypesPage() {
 
   // Handle delete room type
   const handleDeleteRoomType = async (id: number) => {
-    const response = await branchFetch(`/api/new/room-types/${id}`, {
+    const response = await branchFetch(`/api/room-types/${id}`, {
       method: 'DELETE',
     })
 

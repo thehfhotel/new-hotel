@@ -72,7 +72,7 @@ export default function TransactionHistoryPage() {
         params.append('dateTo', dateTo)
       }
 
-      const response = await branchFetch(`/api/new/inventory/transactions?${params}`)
+      const response = await branchFetch(`/api/inventory/transactions?${params}`)
       if (!response.ok) {
         throw new Error('Failed to fetch transactions')
       }

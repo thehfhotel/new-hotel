@@ -75,7 +75,7 @@ export default function StockAdjustmentModal({
 
     setIsSearching(true)
     try {
-      const res = await branchFetch(`/api/new/inventory/items?search=${encodeURIComponent(query)}&limit=10`)
+      const res = await branchFetch(`/api/inventory/items?search=${encodeURIComponent(query)}&limit=10`)
       const data = await res.json()
       if (data.success) {
         setItems(data.data || [])
@@ -165,7 +165,7 @@ export default function StockAdjustmentModal({
     setError(null)
 
     try {
-      const res = await branchFetch('/api/new/inventory/adjustments', {
+      const res = await branchFetch('/api/inventory/adjustments', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

@@ -136,7 +136,7 @@ describe('RefundPaymentModal Component', () => {
   })
 
   describe('API Submission', () => {
-    test('POSTs to /api/new/payments/:id/refund with amount and reason', async () => {
+    test('POSTs to /api/payments/:id/refund with amount and reason', async () => {
       ;(global.fetch as jest.Mock).mockResolvedValue({
         ok: true,
         json: () => Promise.resolve({ success: true }),
@@ -155,7 +155,7 @@ describe('RefundPaymentModal Component', () => {
 
       await waitFor(() => {
         expect(global.fetch).toHaveBeenCalledWith(
-          '/api/new/payments/42/refund?branch=hfhotel',
+          '/api/payments/42/refund?branch=hfhotel',
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },

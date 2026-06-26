@@ -17,7 +17,7 @@ const ISSUE_PERMISSION = 'coupon.issue'
  *
  * Mirrors iHOTEL's `FrmCuponMain` flow: the receptionist issues a
  * food/breakfast coupon entitlement (or a stand-alone promo voucher)
- * to a guest. POSTs `/api/new/coupons` and refreshes the caller via
+ * to a guest. POSTs `/api/coupons` and refreshes the caller via
  * `onSuccess`.
  *
  * Validation client-side mirrors the service layer:
@@ -105,7 +105,7 @@ export default function IssueCouponModal({
     setError(null)
 
     try {
-      const res = await branchFetch(`/api/new/coupons`, {
+      const res = await branchFetch(`/api/coupons`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

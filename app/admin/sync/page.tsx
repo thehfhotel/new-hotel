@@ -119,7 +119,7 @@ export default function SyncStatusPage() {
 
   const fetchStatus = useCallback(async () => {
     try {
-      const res = await branchFetch('/api/new/sync/status')
+      const res = await branchFetch('/api/sync/status')
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const json = await res.json()
       setData(json)

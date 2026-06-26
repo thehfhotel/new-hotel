@@ -253,7 +253,7 @@ describe('MaintenanceRequestModal Component', () => {
       fireEvent.click(screen.getByText('แจ้งซ่อม'))
 
       await waitFor(() => {
-        expect(global.fetch).toHaveBeenCalledWith('/api/new/maintenance/requests?branch=hfhotel', {
+        expect(global.fetch).toHaveBeenCalledWith('/api/maintenance/requests?branch=hfhotel', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -315,7 +315,7 @@ describe('MaintenanceRequestModal Component', () => {
       fireEvent.click(screen.getByText('บันทึกการแก้ไข'))
 
       await waitFor(() => {
-        expect(global.fetch).toHaveBeenCalledWith('/api/new/maintenance/requests/1?branch=hfhotel', {
+        expect(global.fetch).toHaveBeenCalledWith('/api/maintenance/requests/1?branch=hfhotel', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: expect.stringContaining('แอร์ไม่เย็นและมีเสียงดัง'),

@@ -585,7 +585,7 @@ describe('RoomInventoryChecklist Component', () => {
       fireEvent.click(screen.getByText('เติมสินค้าที่ขาด'))
 
       await waitFor(() => {
-        expect(global.fetch).toHaveBeenCalledWith('/api/new/inventory/rooms/301/replenish', {
+        expect(global.fetch).toHaveBeenCalledWith('/api/inventory/rooms/301/replenish', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -686,7 +686,7 @@ describe('RoomInventoryChecklist Component', () => {
       fireEvent.click(screen.getByText('บันทึกการตรวจสอบ'))
 
       await waitFor(() => {
-        expect(global.fetch).toHaveBeenCalledWith('/api/new/inventory/rooms/301/check', {
+        expect(global.fetch).toHaveBeenCalledWith('/api/inventory/rooms/301/check', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: expect.stringContaining('"notes":"ตรวจเรียบร้อย"'),
@@ -723,7 +723,7 @@ describe('RoomInventoryChecklist Component', () => {
       fireEvent.click(screen.getByText('บันทึกการตรวจสอบ'))
 
       await waitFor(() => {
-        expect(global.fetch).toHaveBeenCalledWith('/api/new/inventory/rooms/301/check', {
+        expect(global.fetch).toHaveBeenCalledWith('/api/inventory/rooms/301/check', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -987,7 +987,7 @@ describe('RoomInventoryChecklist Component', () => {
       )
 
       await waitFor(() => {
-        expect(global.fetch).toHaveBeenCalledWith('/api/new/inventory/rooms/301')
+        expect(global.fetch).toHaveBeenCalledWith('/api/inventory/rooms/301')
       })
     })
   })

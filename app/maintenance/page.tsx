@@ -103,7 +103,7 @@ export default function MaintenancePage() {
     const fetchMetadata = async () => {
       try {
         const [catRes, roomsRes] = await Promise.all([
-          branchFetch('/api/new/maintenance/categories'),
+          branchFetch('/api/maintenance/categories'),
           branchFetch('/api/new/rooms?limit=200'),
         ])
 
@@ -137,7 +137,7 @@ export default function MaintenancePage() {
       if (categoryFilter) params.set('categoryId', categoryFilter.toString())
       if (priorityFilter) params.set('priority', priorityFilter.toString())
 
-      const response = await branchFetch(`/api/new/maintenance/requests?${params.toString()}`)
+      const response = await branchFetch(`/api/maintenance/requests?${params.toString()}`)
       if (!response.ok) {
         throw new Error('ไม่สามารถดึงข้อมูลได้')
       }
@@ -171,7 +171,7 @@ export default function MaintenancePage() {
   // Handle status change
   const handleStatusChange = async (requestId: number, newStatus: MaintenanceStatus) => {
     try {
-      const response = await branchFetch(`/api/new/maintenance/requests/${requestId}/status`, {
+      const response = await branchFetch(`/api/maintenance/requests/${requestId}/status`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status: newStatus }),

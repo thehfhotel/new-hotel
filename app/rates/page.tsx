@@ -102,7 +102,7 @@ export default function RatesPage() {
   // Fetch room types
   const fetchRoomTypes = useCallback(async () => {
     try {
-      const response = await branchFetch('/api/new/room-types')
+      const response = await branchFetch('/api/room-types')
       if (!response.ok) throw new Error('Failed to fetch room types')
       const data = await response.json()
       if (data.success) {
@@ -123,7 +123,7 @@ export default function RatesPage() {
       if (roomTypeFilter) params.append('roomTypeId', roomTypeFilter.toString())
       if (activeOnlyFilter) params.append('activeOnly', 'true')
 
-      const response = await branchFetch(`/api/new/rates?${params}`)
+      const response = await branchFetch(`/api/rates?${params}`)
       if (!response.ok) throw new Error('Failed to fetch rates')
       const data = await response.json()
       if (data.success) {
@@ -173,7 +173,7 @@ export default function RatesPage() {
 
   // Handle save rate
   const handleSaveRate = async (data: RateFormData) => {
-    const endpoint = data.id ? `/api/new/rates/${data.id}` : '/api/new/rates'
+    const endpoint = data.id ? `/api/rates/${data.id}` : '/api/rates'
     const method = data.id ? 'PUT' : 'POST'
 
     const response = await branchFetch(endpoint, {
@@ -204,7 +204,7 @@ export default function RatesPage() {
   const handleDeleteRate = async (id: number) => {
     setDeleting(true)
     try {
-      const response = await branchFetch(`/api/new/rates/${id}`, {
+      const response = await branchFetch(`/api/rates/${id}`, {
         method: 'DELETE',
       })
 

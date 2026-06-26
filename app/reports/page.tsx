@@ -107,9 +107,9 @@ export default function ReportsPage() {
 
       // Fetch all data in parallel
       const [revenueRes, occupancyRes, roomTypeRes] = await Promise.all([
-        branchFetch(`/api/new/reports/revenue?from=${fromDate}&to=${toDate}&groupBy=${groupBy}`),
-        branchFetch(`/api/new/reports/occupancy?from=${fromDate}&to=${toDate}`),
-        branchFetch(`/api/new/reports/revenue-by-room-type?from=${fromDate}&to=${toDate}`),
+        branchFetch(`/api/reports/revenue?from=${fromDate}&to=${toDate}&groupBy=${groupBy}`),
+        branchFetch(`/api/reports/occupancy?from=${fromDate}&to=${toDate}`),
+        branchFetch(`/api/reports/revenue-by-room-type?from=${fromDate}&to=${toDate}`),
       ])
 
       const [revenueJson, occupancyJson, roomTypeJson] = await Promise.all([

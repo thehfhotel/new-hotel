@@ -63,7 +63,7 @@ export default function RoomInventoryPage() {
         params.append('filter', filterStatus)
       }
 
-      const response = await branchFetch(`/api/new/inventory/rooms?${params}`)
+      const response = await branchFetch(`/api/inventory/rooms?${params}`)
       if (!response.ok) {
         throw new Error('Failed to fetch rooms')
       }

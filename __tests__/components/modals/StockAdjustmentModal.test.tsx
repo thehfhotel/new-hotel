@@ -122,7 +122,7 @@ describe('StockAdjustmentModal Component', () => {
       })
 
       await waitFor(() => {
-        expect(global.fetch).toHaveBeenCalledWith('/api/new/inventory/items?search=%E0%B8%99%E0%B9%89%E0%B8%B3&limit=10&branch=hfhotel', undefined)
+        expect(global.fetch).toHaveBeenCalledWith('/api/inventory/items?search=%E0%B8%99%E0%B9%89%E0%B8%B3&limit=10&branch=hfhotel', undefined)
       })
     })
 
@@ -448,7 +448,7 @@ describe('StockAdjustmentModal Component', () => {
       fireEvent.click(submitButton)
 
       await waitFor(() => {
-        expect(global.fetch).toHaveBeenCalledWith('/api/new/inventory/adjustments?branch=hfhotel', expect.any(Object))
+        expect(global.fetch).toHaveBeenCalledWith('/api/inventory/adjustments?branch=hfhotel', expect.any(Object))
       })
     })
   })
@@ -479,7 +479,7 @@ describe('StockAdjustmentModal Component', () => {
       fireEvent.click(submitButton)
 
       await waitFor(() => {
-        expect(global.fetch).toHaveBeenCalledWith('/api/new/inventory/adjustments?branch=hfhotel', {
+        expect(global.fetch).toHaveBeenCalledWith('/api/inventory/adjustments?branch=hfhotel', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -516,7 +516,7 @@ describe('StockAdjustmentModal Component', () => {
       fireEvent.click(submitButton)
 
       await waitFor(() => {
-        expect(global.fetch).toHaveBeenCalledWith('/api/new/inventory/adjustments?branch=hfhotel', {
+        expect(global.fetch).toHaveBeenCalledWith('/api/inventory/adjustments?branch=hfhotel', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -553,7 +553,7 @@ describe('StockAdjustmentModal Component', () => {
       fireEvent.click(submitButton)
 
       await waitFor(() => {
-        expect(global.fetch).toHaveBeenCalledWith('/api/new/inventory/adjustments?branch=hfhotel', {
+        expect(global.fetch).toHaveBeenCalledWith('/api/inventory/adjustments?branch=hfhotel', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

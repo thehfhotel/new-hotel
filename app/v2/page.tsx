@@ -78,7 +78,7 @@ export default function V2Today() {
         branchFetch('/api/stats'),
         branchFetch('/api/new/checkins?limit=100'),
         branchFetch('/api/new/bookings?limit=100'),
-        branchFetch('/api/new/shifts/current').catch(() => null),
+        branchFetch('/api/shifts/current').catch(() => null),
       ])
 
       if (statsRes.ok) {
@@ -97,7 +97,7 @@ export default function V2Today() {
         const d = await shiftRes.json()
         setShiftOpen(Boolean(d?.data || d?.shift))
       } else if (shiftRes && shiftRes.status === 404) {
-        // /api/new/shifts/current returns 404 when no shift is open — that's
+        // /api/shifts/current returns 404 when no shift is open — that's
         // the "round not open" state the banner exists to warn about.
         setShiftOpen(false)
       } else {

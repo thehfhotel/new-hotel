@@ -54,9 +54,9 @@ export default function InventoryDashboardPage() {
     try {
       // Fetch all data in parallel
       const [statsRes, lowStockRes, transactionsRes] = await Promise.all([
-        branchFetch('/api/new/inventory/stats'),
-        branchFetch('/api/new/inventory/items?lowStock=true&limit=5'),
-        branchFetch('/api/new/inventory/transactions?limit=10'),
+        branchFetch('/api/inventory/stats'),
+        branchFetch('/api/inventory/items?lowStock=true&limit=5'),
+        branchFetch('/api/inventory/transactions?limit=10'),
       ])
 
       const [statsData, lowStockData, transactionsData] = await Promise.all([

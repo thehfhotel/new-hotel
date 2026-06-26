@@ -134,7 +134,7 @@ export default function MaintenanceRequestModal({
           return
         }
 
-        const res = await branchFetch(`/api/new/maintenance/requests/${editRequest.id}`, {
+        const res = await branchFetch(`/api/maintenance/requests/${editRequest.id}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(updateBody),
@@ -147,7 +147,7 @@ export default function MaintenanceRequestModal({
         }
       } else {
         // Create new request
-        const res = await branchFetch('/api/new/maintenance/requests', {
+        const res = await branchFetch('/api/maintenance/requests', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

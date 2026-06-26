@@ -101,7 +101,7 @@ describe('IssueCouponModal Component', () => {
   })
 
   describe('Submission', () => {
-    test('POSTs to /api/new/coupons and shows the issued code on success', async () => {
+    test('POSTs to /api/coupons and shows the issued code on success', async () => {
       ;(global.fetch as jest.Mock).mockResolvedValueOnce({
         ok: true,
         json: async () => ({
@@ -125,7 +125,7 @@ describe('IssueCouponModal Component', () => {
 
       await waitFor(() => {
         expect(global.fetch).toHaveBeenCalledWith(
-          '/api/new/coupons',
+          '/api/coupons',
           expect.objectContaining({
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
