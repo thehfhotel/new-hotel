@@ -31,15 +31,18 @@ export interface RoundReportData {
   windowTo: string
   open: boolean
   income: {
-    cash: number
+    cashReceived: number
+    cashPaid: number
+    cashNet: number
     credit: number
     transfer: number
     free: number
     web: number
-    total: number
     lineCount: number
     paymentCount: number
   }
+  deposits: { received: number; returned: number }
+  grandTotal: number
   sales: { category: string; amount: number; lines: number }[]
   expectedCash: number
   countedCash: number | null
@@ -61,14 +64,6 @@ export function formatThai(iso: string): string {
   }
 }
 
-// Tender display order mirrors the legacy line invariant (cash first).
-const TENDERS: { key: keyof RoundReportData['income']; label: string }[] = [
-  { key: 'cash', label: 'เงินสด' },
-  { key: 'transfer', label: 'เงินโอน' },
-  { key: 'credit', label: 'บัตรเครดิต' },
-  { key: 'web', label: 'ออนไลน์' },
-  { key: 'free', label: 'ส่วนลด / ฟรี' },
-]
 const CATEGORY_LABEL: Record<string, string> = { room: 'ค่าห้อง', product: 'สินค้า / บริการ' }
 
 function Row({
@@ -76,11 +71,14 @@ function Row({
   value,
   sub,
   strong,
+  negative,
 }: {
   label: string
   value: number
   sub?: string
   strong?: boolean
+  /** Render as an outflow: muted "−" prefix (cash paid out, deposit returned). */
+  negative?: boolean
 }) {
   return (
     <div className="flex items-baseline gap-3 px-4 py-2.5">
@@ -89,18 +87,22 @@ function Row({
       </span>
       {sub && <span className="text-[11.5px]" style={{ color: 'var(--v2-ink-3)' }}>{sub}</span>}
       <span className="flex-1" />
-      <span className={`v2-num text-[14px] ${strong ? 'font-bold' : ''}`} style={{ color: 'var(--v2-ink)' }}>
-        {formatCurrency(value, 2)}
+      <span
+        className={`v2-num text-[14px] ${strong ? 'font-bold' : ''}`}
+        style={{ color: negative && value !== 0 ? 'var(--v2-ink-2)' : 'var(--v2-ink)' }}
+      >
+        {negative && value !== 0 ? '−' : ''}{formatCurrency(value, 2)}
       </span>
     </div>
   )
 }
 
 export default function RoundReport({ data }: { data: RoundReportData }) {
-  const { shift, income, sales, expectedCash, countedCash, cashVariance } = data
+  const { shift, income, deposits, grandTotal, sales, expectedCash, countedCash, cashVariance } = data
   // Variance tone: balanced → ok (green); short (negative) → occ (wine);
   // over (positive) → arr (amber).
   const tone = cashVariance == null ? null : cashVariance === 0 ? 'ok' : cashVariance < 0 ? 'occ' : 'arr'
+  const hasDeposits = deposits.received !== 0 || deposits.returned !== 0
 
   return (
     <div className="space-y-4">
@@ -119,19 +121,34 @@ export default function RoundReport({ data }: { data: RoundReportData }) {
         </span>
       </div>
 
-      {/* Income by tender */}
+      {/* Income by tender — mirrors iHOTEL View_RBill_H: cash received vs
+          paid-out, credit, transfer (+ our free/web extras), grand total. */}
       <div>
         <div className="v2-eyebrow mb-2">รายได้แยกตามประเภทการชำระ</div>
         <div className="v2-card overflow-hidden divide-y" style={{ borderColor: 'var(--v2-line)' }}>
-          {TENDERS.map((t) => (
-            <Row key={t.key} label={t.label} value={income[t.key] as number} />
-          ))}
-          <Row label="รวมทั้งสิ้น" value={income.total} strong />
+          <Row label="เงินสดรับเข้า" value={income.cashReceived} />
+          <Row label="เงินสดจ่ายออก / คืน" value={income.cashPaid} negative />
+          <Row label="เงินโอน" value={income.transfer} />
+          <Row label="บัตรเครดิต" value={income.credit} />
+          {income.web !== 0 && <Row label="ออนไลน์" value={income.web} />}
+          {income.free !== 0 && <Row label="ส่วนลด / ฟรี" value={income.free} />}
+          <Row label="รวมทั้งสิ้น (เงินทอนตั้งต้น + สุทธิ)" value={grandTotal} strong />
         </div>
         <div className="text-[11.5px] mt-1.5 v2-num" style={{ color: 'var(--v2-ink-3)' }}>
           {income.paymentCount} ใบเสร็จ · {income.lineCount} รายการ
         </div>
       </div>
+
+      {/* Deposits — iHOTEL Dep_Rec / Dep_pay */}
+      {hasDeposits && (
+        <div>
+          <div className="v2-eyebrow mb-2">เงินมัดจำ</div>
+          <div className="v2-card overflow-hidden divide-y" style={{ borderColor: 'var(--v2-line)' }}>
+            <Row label="รับเข้า" value={deposits.received} />
+            <Row label="คืนให้ลูกค้า" value={deposits.returned} negative />
+          </div>
+        </div>
+      )}
 
       {/* Sales by category */}
       {sales.length > 0 && (
@@ -155,7 +172,7 @@ export default function RoundReport({ data }: { data: RoundReportData }) {
         <div className="v2-eyebrow mb-2">กระทบยอดเงินสด</div>
         <div className="v2-card overflow-hidden divide-y" style={{ borderColor: 'var(--v2-line)' }}>
           <Row label="เงินทอนตั้งต้น" value={shift.openingFloat} />
-          <Row label="เงินสดรับเข้า (รอบนี้)" value={income.cash} />
+          <Row label="เงินสดสุทธิ (รับ − จ่าย)" value={income.cashNet} />
           <Row label="เงินสดที่ควรมีในลิ้นชัก" value={expectedCash} strong />
           {countedCash != null && <Row label="นับได้จริง" value={countedCash} />}
           {cashVariance != null && tone && (

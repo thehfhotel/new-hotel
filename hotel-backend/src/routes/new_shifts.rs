@@ -320,16 +320,38 @@ pub struct RoundReportQuery {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TenderBreakdown {
-    pub cash: f64,
+    /// `round_price_rec` — cash RECEIVED (`ledger_cash` where `> 0`).
+    pub cash_received: f64,
+    /// `round_price_pay` — cash PAID OUT / refunds (`-SUM(ledger_cash)` where
+    /// `< 0`, as a positive number). iHOTEL splits cash this way.
+    pub cash_paid: f64,
+    /// `cash_received - cash_paid` (net cash that actually entered the drawer).
+    pub cash_net: f64,
+    /// `round_price_credit` — credit-card (`ledger_credit` where `> 0`, matching
+    /// iHOTEL's positive-only filter).
     pub credit: f64,
+    /// `round_price_tran` — bank transfer (`ledger_tran` where `> 0`).
     pub transfer: f64,
+    /// Discount/comp tender (`ledger_free`). Extra vs iHOTEL's round screen
+    /// (it folds these into the line total); surfaced here so no info is lost.
     pub free: f64,
+    /// Online/web tender (`ledger_web`). Extra vs iHOTEL's round screen.
     pub web: f64,
-    pub total: f64,
     /// Active ledger lines counted in the window.
     pub line_count: i64,
     /// Distinct `Pay_no` values (≈ number of payment receipts) in the window.
     pub payment_count: i64,
+}
+
+/// Room deposits over the round window — iHOTEL's `Dep_Rec` / `Dep_pay`
+/// (from `HT_CheckIn_Ds.Cin_room_dep`; our `ht_checkin_rooms.cr_dep_amount`).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DepositSummary {
+    /// `Dep_Rec` — deposits TAKEN this round (room checked in within the window).
+    pub received: f64,
+    /// `Dep_pay` — deposits RETURNED this round (`cr_dep_returned_at` in window).
+    pub returned: f64,
 }
 
 /// One sales-summary row — `room` (legacy `Cin_Pay_Ds_ID='P001'`) vs `product`.
@@ -353,9 +375,14 @@ pub struct RoundReportResponse {
     /// True when the round is still open (upper bound = `now()`, a live preview).
     pub open: bool,
     pub income: TenderBreakdown,
+    /// Room deposits received / returned this round (iHOTEL `Dep_Rec`/`Dep_pay`).
+    pub deposits: DepositSummary,
+    /// iHOTEL's round "total" (`FrmDueBill` Labeltotal): opening float +
+    /// cash_received - cash_paid + credit + transfer.
+    pub grand_total: f64,
     pub sales: Vec<SalesCategory>,
-    /// Cash the drawer SHOULD hold: `shift_opening_float + cash tenders` over
-    /// the window (only the cash tender touches the drawer).
+    /// Cash the drawer SHOULD hold: `shift_opening_float + net cash` over the
+    /// window (only the cash tender touches the drawer).
     pub expected_cash: f64,
     /// Physical cash the cashier counted at close (server-computed from the
     /// denomination map). `None` until a close supplies a count.
@@ -416,13 +443,17 @@ pub async fn round_report(
     // Cin_Pay_Date the same way ht_shifts converts round_start/end, so the
     // comparison is apples-to-apples. Active lines only ('1'); cancelled
     // ('ยกเลิก') excluded — matching iHOTEL's shift report.
+    // Cash is split RECEIVED (>0) vs PAID-OUT (<0, negated) exactly like
+    // iHOTEL's `View_RBill_H` (`round_price_rec` / `round_price_pay`);
+    // credit/transfer use iHOTEL's positive-only filter (`round_price_credit`
+    // / `round_price_tran`). free/web are summed net as our extras.
     let inc = sqlx::query(
-        "SELECT COALESCE(SUM(ledger_cash),0)::float8   AS cash, \
-                COALESCE(SUM(ledger_credit),0)::float8 AS credit, \
-                COALESCE(SUM(ledger_tran),0)::float8   AS transfer, \
+        "SELECT COALESCE(SUM(ledger_cash) FILTER (WHERE ledger_cash > 0),0)::float8     AS cash_received, \
+                COALESCE(-SUM(ledger_cash) FILTER (WHERE ledger_cash < 0),0)::float8    AS cash_paid, \
+                COALESCE(SUM(ledger_credit) FILTER (WHERE ledger_credit > 0),0)::float8 AS credit, \
+                COALESCE(SUM(ledger_tran) FILTER (WHERE ledger_tran > 0),0)::float8     AS transfer, \
                 COALESCE(SUM(ledger_free),0)::float8   AS free, \
                 COALESCE(SUM(ledger_web),0)::float8    AS web, \
-                COALESCE(SUM(ledger_amount),0)::float8 AS total, \
                 COUNT(*)::bigint                       AS line_count, \
                 COUNT(DISTINCT ledger_pay_no)::bigint  AS payment_count \
            FROM ht_payment_ledger \
@@ -435,15 +466,45 @@ pub async fn round_report(
     .await
     .map_err(|e| ApiError::Internal(format!("failed to sum round income: {e}")))?;
 
+    let cash_received: f64 = inc.try_get("cash_received").map_err(map_shift_row_err)?;
+    let cash_paid: f64 = inc.try_get("cash_paid").map_err(map_shift_row_err)?;
+    let credit: f64 = inc.try_get("credit").map_err(map_shift_row_err)?;
+    let transfer: f64 = inc.try_get("transfer").map_err(map_shift_row_err)?;
     let income = TenderBreakdown {
-        cash: inc.try_get("cash").map_err(map_shift_row_err)?,
-        credit: inc.try_get("credit").map_err(map_shift_row_err)?,
-        transfer: inc.try_get("transfer").map_err(map_shift_row_err)?,
+        cash_received,
+        cash_paid,
+        cash_net: cash_received - cash_paid,
+        credit,
+        transfer,
         free: inc.try_get("free").map_err(map_shift_row_err)?,
         web: inc.try_get("web").map_err(map_shift_row_err)?,
-        total: inc.try_get("total").map_err(map_shift_row_err)?,
         line_count: inc.try_get("line_count").map_err(map_shift_row_err)?,
         payment_count: inc.try_get("payment_count").map_err(map_shift_row_err)?,
+    };
+
+    // Room deposits (iHOTEL `Dep_Rec`/`Dep_pay`): from `ht_checkin_rooms`
+    // (mirror of `HT_CheckIn_Ds.Cin_room_dep`), not the payment ledger.
+    // Received = room checked in within the window; returned = deposit returned
+    // within the window. Active folios only (`cin_status <> 'cancelled'` =
+    // iHOTEL's `Cin_status='ปกติ'`).
+    let dep = sqlx::query(
+        "SELECT COALESCE(SUM(cr.cr_dep_amount) FILTER \
+                    (WHERE cr.cr_room_in >= $1 AND cr.cr_room_in < $2),0)::float8 AS dep_received, \
+                COALESCE(SUM(cr.cr_dep_amount) FILTER \
+                    (WHERE cr.cr_dep_returned_at >= $1 AND cr.cr_dep_returned_at < $2),0)::float8 AS dep_returned \
+           FROM ht_checkin_rooms cr \
+           JOIN ht_checkins c ON c.cin_id = cr.cr_cin_id \
+          WHERE cr.cr_dep_amount > 0 AND c.cin_status <> 'cancelled'",
+    )
+    .bind(window_from)
+    .bind(window_to)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::Internal(format!("failed to sum round deposits: {e}")))?;
+
+    let deposits = DepositSummary {
+        received: dep.try_get("dep_received").map_err(map_shift_row_err)?,
+        returned: dep.try_get("dep_returned").map_err(map_shift_row_err)?,
     };
 
     let sales_rows = sqlx::query(
@@ -470,9 +531,13 @@ pub async fn round_report(
         });
     }
 
-    // Cash reconciliation: only the cash tender touches the drawer.
     let round2 = |v: f64| (v * 100.0).round() / 100.0;
-    let expected_cash = round2(shift.opening_float + income.cash);
+    // iHOTEL's round "total" (FrmDueBill Labeltotal): opening + net cash +
+    // credit + transfer. Deposits are reported separately (as iHOTEL does).
+    let grand_total =
+        round2(shift.opening_float + income.cash_net + income.credit + income.transfer);
+    // Cash reconciliation: only cash touches the drawer → opening + net cash.
+    let expected_cash = round2(shift.opening_float + income.cash_net);
     let cash_variance = counted_cash.map(|c| round2(c - expected_cash));
 
     Ok(Json(RoundReportResponse {
@@ -482,6 +547,8 @@ pub async fn round_report(
         window_to,
         open,
         income,
+        deposits,
+        grand_total,
         sales,
         expected_cash,
         counted_cash,
