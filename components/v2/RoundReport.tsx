@@ -43,6 +43,7 @@ export interface RoundReportData {
     paymentCount: number
   }
   deposits: { received: number; returned: number }
+  occupancy: { roomsIn: number; roomsOut: number; guestsIn: number }
   grandTotal: number
   sales: { category: string; amount: number; lines: number }[]
   expectedCash: number
@@ -98,8 +99,21 @@ function Row({
   )
 }
 
+/** A single count in the room/guest activity strip. */
+function Stat({ label, value, divider }: { label: string; value: number; divider?: boolean }) {
+  return (
+    <div
+      className="flex-1 px-4 py-3 text-center"
+      style={divider ? { borderLeft: '1px solid var(--v2-line)' } : undefined}
+    >
+      <div className="v2-num text-[20px] font-bold leading-none">{value}</div>
+      <div className="text-[11.5px] mt-1" style={{ color: 'var(--v2-ink-3)' }}>{label}</div>
+    </div>
+  )
+}
+
 export default function RoundReport({ data }: { data: RoundReportData }) {
-  const { shift, income, deposits, grandTotal, sales, expectedCash, countedCash, cashVariance } = data
+  const { shift, income, deposits, occupancy, grandTotal, sales, expectedCash, countedCash, cashVariance } = data
   // Variance tone: balanced → ok (green); short (negative) → occ (wine);
   // over (positive) → arr (amber).
   const tone = cashVariance == null ? null : cashVariance === 0 ? 'ok' : cashVariance < 0 ? 'occ' : 'arr'
@@ -129,6 +143,17 @@ export default function RoundReport({ data }: { data: RoundReportData }) {
         >
           <Printer size={15} /> พิมพ์
         </button>
+      </div>
+
+      {/* Room / guest activity this round — simple counts (our addition;
+          iHOTEL's round report is money-only). */}
+      <div>
+        <div className="v2-eyebrow mb-2">ห้องพักและผู้เข้าพัก</div>
+        <div className="v2-card flex overflow-hidden">
+          <Stat label="เช็คอิน (ห้อง)" value={occupancy.roomsIn} />
+          <Stat label="เช็คเอาท์ (ห้อง)" value={occupancy.roomsOut} divider />
+          <Stat label="ผู้เข้าพัก (คน)" value={occupancy.guestsIn} divider />
+        </div>
       </div>
 
       {/* Income by tender — mirrors iHOTEL View_RBill_H: cash received vs

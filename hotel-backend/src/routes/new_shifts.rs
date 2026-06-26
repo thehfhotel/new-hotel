@@ -363,6 +363,23 @@ pub struct SalesCategory {
     pub lines: i64,
 }
 
+/// Simple room/guest activity over the round window (counts only — our
+/// addition; iHOTEL's round report is money-only). Rooms are anchored on
+/// `cr_room_in`/`cr_room_out` (TIMESTAMPTZ, the same basis as the deposit
+/// window) rather than `ht_checkins.cin_checkin_time` (a naive TIMESTAMP).
+/// `guests_in` sums `cin_adults + cin_children` once per folio that had a room
+/// checked in within the window. Active folios only (`cin_status <> 'cancelled'`).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OccupancySummary {
+    /// Rooms checked IN during the round.
+    pub rooms_in: i64,
+    /// Rooms checked OUT during the round.
+    pub rooms_out: i64,
+    /// Guests (adults + children) of the folios checked in this round.
+    pub guests_in: i64,
+}
+
 /// `200` body for the round report.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -377,6 +394,8 @@ pub struct RoundReportResponse {
     pub income: TenderBreakdown,
     /// Room deposits received / returned this round (iHOTEL `Dep_Rec`/`Dep_pay`).
     pub deposits: DepositSummary,
+    /// Simple room/guest activity counts for the round (our addition).
+    pub occupancy: OccupancySummary,
     /// iHOTEL's round "total" (`FrmDueBill` Labeltotal): opening float +
     /// cash_received - cash_paid + credit + transfer.
     pub grand_total: f64,
@@ -507,6 +526,44 @@ pub async fn round_report(
         returned: dep.try_get("dep_returned").map_err(map_shift_row_err)?,
     };
 
+    // Simple room/guest activity (counts). Rooms anchored on the same
+    // TIMESTAMPTZ window basis as deposits (cr_room_in / cr_room_out); guests
+    // summed once per folio that had a room checked in this round. No money,
+    // no complex aggregation — just the activity stats reception asked for.
+    let occ = sqlx::query(
+        "SELECT \
+                COUNT(*) FILTER (WHERE cr.cr_room_in  >= $1 AND cr.cr_room_in  < $2)::bigint AS rooms_in, \
+                COUNT(*) FILTER (WHERE cr.cr_room_out >= $1 AND cr.cr_room_out < $2)::bigint AS rooms_out \
+           FROM ht_checkin_rooms cr \
+           JOIN ht_checkins c ON c.cin_id = cr.cr_cin_id \
+          WHERE c.cin_status <> 'cancelled'",
+    )
+    .bind(window_from)
+    .bind(window_to)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::Internal(format!("failed to count round occupancy: {e}")))?;
+
+    let guests = sqlx::query(
+        "SELECT COALESCE(SUM(c.cin_adults + c.cin_children),0)::bigint AS guests_in \
+           FROM ht_checkins c \
+          WHERE c.cin_status <> 'cancelled' \
+            AND c.cin_id IN ( \
+                SELECT DISTINCT cr.cr_cin_id FROM ht_checkin_rooms cr \
+                 WHERE cr.cr_room_in >= $1 AND cr.cr_room_in < $2)",
+    )
+    .bind(window_from)
+    .bind(window_to)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::Internal(format!("failed to count round guests: {e}")))?;
+
+    let occupancy = OccupancySummary {
+        rooms_in: occ.try_get("rooms_in").map_err(map_shift_row_err)?,
+        rooms_out: occ.try_get("rooms_out").map_err(map_shift_row_err)?,
+        guests_in: guests.try_get("guests_in").map_err(map_shift_row_err)?,
+    };
+
     let sales_rows = sqlx::query(
         "SELECT CASE WHEN ledger_ds_id = 'P001' THEN 'room' ELSE 'product' END AS category, \
                 COALESCE(SUM(ledger_amount),0)::float8 AS amount, \
@@ -548,6 +605,7 @@ pub async fn round_report(
         open,
         income,
         deposits,
+        occupancy,
         grand_total,
         sales,
         expected_cash,
