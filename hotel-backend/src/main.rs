@@ -426,6 +426,9 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route("/api/occupancy", get(routes::occupancy::get_occupancy))
         // Mode and calendar routes
         .route("/api/mode", get(routes::mode::get_mode))
+        // Active HF Ville connectivity probe (pings the ville pool with SELECT 1)
+        // so post-startup outages are detectable — see scripts/smoke-ville.sh.
+        .route("/api/health/ville", get(routes::mode::get_ville_health))
         .route("/api/calendar", get(routes::calendar::get_calendar))
         // Phase 5.5d — legacy_mirror.* read-only endpoints (coupons,
         // minibar, room moves, pricing reference). Surfaces legacy-

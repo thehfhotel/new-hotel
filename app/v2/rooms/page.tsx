@@ -5,7 +5,7 @@ import { Search } from 'lucide-react'
 import { useBranch } from '@/contexts/BranchContext'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { roomStatusView } from '@/lib/v2/status'
-import { V2Spinner, LiveDot, V2PageHeader } from '@/components/v2/primitives'
+import { V2Spinner, LiveDot, V2PageHeader, VilleNotice } from '@/components/v2/primitives'
 import RoomActionSheet, { type RoomItem, type RoomAction } from '@/components/v2/RoomActionSheet'
 import CheckInModal from '@/components/CheckInModal'
 import CheckOutModal from '@/components/CheckOutModal'
@@ -164,6 +164,8 @@ export default function V2Rooms() {
   return (
     <div className="space-y-5">
       <V2PageHeader eyebrow="ผังห้องพัก" title="ห้องพัก" right={<LiveDot connected={live} />} />
+
+      <VilleNotice branch={branch} />
 
       {/* Search */}
       <div

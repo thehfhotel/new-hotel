@@ -389,3 +389,124 @@ pub async fn get_mode(State(state): State<AppState>) -> ApiResult<Json<ModeRespo
         ville_available: state.ville_pool.is_some(),
     }))
 }
+
+/// HF Ville connectivity report.
+///
+/// `/api/mode`'s `villeAvailable` only reflects whether the pool was built at
+/// *startup* (`main.rs` fail-soft: a Ville DB that was unreachable when the
+/// backend last booted leaves `ville_pool = None` until the next restart, which
+/// is exactly the "HF Ville is not loading" symptom). This struct backs an
+/// endpoint that ACTIVELY pings the Ville DB so a post-startup outage — or a
+/// recovery that needs a restart — is detectable by monitors and post-deploy
+/// smoke checks.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VilleHealth {
+    /// The pool exists: `VILLE_DB_ENABLED=true` AND the startup connect succeeded.
+    pub enabled: bool,
+    /// A live `SELECT 1` against the Ville pool just succeeded.
+    pub connected: bool,
+    /// Human-readable cause when not connected (omitted when healthy).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Active connectivity probe, split out from the handler so the pool-missing
+/// branch is unit-testable without a database. The `Some` branch is exercised
+/// by the post-deploy smoke check (`scripts/smoke-ville.sh`).
+pub async fn ville_health_status(pool: Option<&crate::db::PgPool>) -> VilleHealth {
+    match pool {
+        None => VilleHealth {
+            enabled: false,
+            connected: false,
+            detail: Some(
+                "HF Ville pool not initialized — VILLE_DB_ENABLED is off, or the connection \
+                 failed at backend startup (check VILLE_DB_* and the ville tunnel, then restart \
+                 the backend)"
+                    .to_string(),
+            ),
+        },
+        Some(pool) => match sqlx::query("SELECT 1").execute(pool).await {
+            Ok(_) => VilleHealth {
+                enabled: true,
+                connected: true,
+                detail: None,
+            },
+            Err(e) => VilleHealth {
+                enabled: true,
+                connected: false,
+                detail: Some(format!("HF Ville pool exists but SELECT 1 failed: {e}")),
+            },
+        },
+    }
+}
+
+/// GET /api/health/ville — active HF Ville connectivity probe.
+pub async fn get_ville_health(State(state): State<AppState>) -> Json<VilleHealth> {
+    Json(ville_health_status(state.ville_pool.as_ref()).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The frontend (BranchContext) reads `data.villeAvailable` (camelCase).
+    /// If this serialization ever regressed to snake_case, HF Ville would
+    /// silently stay disabled in BOTH UIs even with a healthy Ville DB — the
+    /// exact "HF Ville is not loading" class. Lock the wire contract here.
+    #[test]
+    fn mode_response_serializes_ville_available_as_camel_case() {
+        let resp = ModeResponse {
+            success: true,
+            mode: SystemMode::New,
+            ville_available: true,
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            v.get("villeAvailable").and_then(|x| x.as_bool()),
+            Some(true),
+            "frontend depends on camelCase `villeAvailable`"
+        );
+        assert!(
+            v.get("ville_available").is_none(),
+            "snake_case must NOT be emitted — it would break the frontend gate"
+        );
+    }
+
+    /// With no Ville pool (disabled, or startup connect failed), the probe must
+    /// report enabled=false, connected=false, and a non-empty diagnostic.
+    #[tokio::test]
+    async fn ville_health_reports_unavailable_when_pool_missing() {
+        let health = ville_health_status(None).await;
+        assert!(!health.enabled);
+        assert!(!health.connected);
+        assert!(
+            health.detail.as_deref().unwrap_or("").contains("VILLE_DB_ENABLED"),
+            "diagnostic should point the operator at the likely cause"
+        );
+    }
+
+    /// Connectivity report serializes camelCase and omits `detail` when healthy
+    /// so monitors can key on `connected`.
+    #[test]
+    fn ville_health_serializes_camel_case_and_omits_detail_when_healthy() {
+        let healthy = VilleHealth {
+            enabled: true,
+            connected: true,
+            detail: None,
+        };
+        let v = serde_json::to_value(&healthy).unwrap();
+        assert_eq!(v.get("connected").and_then(|x| x.as_bool()), Some(true));
+        assert_eq!(v.get("enabled").and_then(|x| x.as_bool()), Some(true));
+        assert!(v.get("detail").is_none(), "detail omitted when healthy");
+
+        let down = VilleHealth {
+            enabled: true,
+            connected: false,
+            detail: Some("SELECT 1 failed".to_string()),
+        };
+        let v = serde_json::to_value(&down).unwrap();
+        assert_eq!(v.get("connected").and_then(|x| x.as_bool()), Some(false));
+        assert_eq!(v.get("detail").and_then(|x| x.as_str()), Some("SELECT 1 failed"));
+    }
+}

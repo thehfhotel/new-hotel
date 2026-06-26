@@ -557,6 +557,64 @@ mod tests {
         let _ = SiteConfig::parse("hfvilel");
     }
 
+    // -------------------------------------------------------------------
+    // VilleDbConfig — the HF Ville mirror pool is built from this. A
+    // malformed connection string or a wrong enabled-default is one root
+    // cause of "HF Ville is not loading" (ville_pool fails → villeAvailable
+    // false → branch disabled in both UIs).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn ville_db_connection_string_is_well_formed() {
+        // Pure (no env) — locks the exact postgres URL the startup pool dials.
+        let cfg = VilleDbConfig {
+            server: "ville-tunnel".to_string(),
+            port: 5440,
+            database: "hfville".to_string(),
+            user: "postgres".to_string(),
+            password: "pw".to_string(),
+            pool_max: 5,
+            enabled: true,
+        };
+        assert_eq!(
+            cfg.connection_string(),
+            "postgres://postgres:pw@ville-tunnel:5440/hfville"
+        );
+    }
+
+    #[test]
+    fn ville_db_disabled_by_default_and_needs_no_secret() {
+        // `unwrap_or_else(|p| p.into_inner())`: recover a poisoned guard so a
+        // sibling #[should_panic] test can't break this one.
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(&["VILLE_DB_ENABLED", "VILLE_DB_PASSWORD"]);
+
+        // HF Hotel deploys never set VILLE_DB_ENABLED: the mirror is off and
+        // the backend boots without VILLE_DB_PASSWORD. In that topology
+        // villeAvailable=false is EXPECTED, not a bug.
+        env::remove_var("VILLE_DB_ENABLED");
+        env::remove_var("VILLE_DB_PASSWORD");
+        let cfg = VilleDbConfig::from_env();
+        assert!(!cfg.enabled, "Ville mirror must default to disabled");
+    }
+
+    #[test]
+    fn ville_db_enabled_flag_parses_true_and_one() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard::new(&["VILLE_DB_ENABLED", "VILLE_DB_PASSWORD"]);
+
+        // Enabling the mirror requires the secret; provide it so from_env()
+        // doesn't panic via require_secret.
+        env::set_var("VILLE_DB_PASSWORD", "ville-secret");
+        for truthy in ["true", "TRUE", "1"] {
+            env::set_var("VILLE_DB_ENABLED", truthy);
+            assert!(
+                VilleDbConfig::from_env().enabled,
+                "VILLE_DB_ENABLED={truthy} should enable the mirror"
+            );
+        }
+    }
+
     #[test]
     fn site_config_id_upper_for_env_suffix() {
         // Used by `LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_<SITE>` lookup.

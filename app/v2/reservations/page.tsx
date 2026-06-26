@@ -7,7 +7,7 @@ import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { formatStoredDayMonth } from '@/lib/format'
 import type { Booking, BookingDetail } from '@/types/booking'
 import { bookingStatusView } from '@/lib/v2/status'
-import { V2Spinner, V2PageHeader, StatusPill } from '@/components/v2/primitives'
+import { V2Spinner, V2PageHeader, StatusPill, VilleNotice } from '@/components/v2/primitives'
 import BookingForm, { type BookingFormState } from '@/components/forms/BookingForm'
 
 const STATUS_FILTERS = [
@@ -142,6 +142,8 @@ export default function V2Reservations() {
           </button>
         }
       />
+
+      <VilleNotice branch={branch} />
 
       {/* Search */}
       <div

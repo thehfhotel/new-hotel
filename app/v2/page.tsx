@@ -16,12 +16,14 @@ import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { formatStoredDayMonth, formatStoredDateTime } from '@/lib/format'
 import type { Booking } from '@/types/booking'
 import { isSameStoredDay } from '@/lib/v2/status'
-import { V2Spinner, LiveDot } from '@/components/v2/primitives'
+import { V2Spinner, LiveDot, VilleNotice } from '@/components/v2/primitives'
 
+// Mirrors the /api/stats payload. NOTE: there is no `availableRooms` field —
+// it is derived client-side (totalRooms - occupied - checkout - booked), the
+// same way the classic dashboard does it (app/page.tsx).
 interface Stats {
   totalRooms: number
   occupiedRooms: number
-  availableRooms: number
   bookedRooms: number
   checkoutRooms: number
   totalCustomers: number
@@ -94,6 +96,10 @@ export default function V2Today() {
       if (shiftRes && shiftRes.ok) {
         const d = await shiftRes.json()
         setShiftOpen(Boolean(d?.data || d?.shift))
+      } else if (shiftRes && shiftRes.status === 404) {
+        // /api/new/shifts/current returns 404 when no shift is open — that's
+        // the "round not open" state the banner exists to warn about.
+        setShiftOpen(false)
       } else {
         setShiftOpen(null)
       }
@@ -145,6 +151,12 @@ export default function V2Today() {
   const total = stats?.totalRooms ?? 0
   const occupied = stats?.occupiedRooms ?? 0
   const pct = total > 0 ? Math.round((occupied / total) * 100) : 0
+  // /api/stats has no availableRooms field — derive it exactly like the classic
+  // dashboard (app/page.tsx) so the two UIs agree.
+  const available = Math.max(
+    0,
+    total - occupied - (stats?.checkoutRooms ?? 0) - (stats?.bookedRooms ?? 0),
+  )
 
   const today = new Date()
   const dateLabel = today.toLocaleDateString('th-TH', {
@@ -174,6 +186,8 @@ export default function V2Today() {
           </Link>
         </div>
       </div>
+
+      <VilleNotice branch={branch} />
 
       {/* Shift gate banner */}
       {shiftOpen === false && (
@@ -209,7 +223,7 @@ export default function V2Today() {
               <span className="text-[13px]" style={{ color: 'var(--v2-ink-3)' }}>/ {total} ห้อง</span>
             </div>
             <div className="grid grid-cols-2 gap-2 pt-1">
-              <MiniStat label="ว่าง" value={stats?.availableRooms ?? 0} dot="d-ok" />
+              <MiniStat label="ว่าง" value={available} dot="d-ok" />
               <MiniStat label="จองแล้ว" value={stats?.bookedRooms ?? 0} dot="d-arr" />
             </div>
           </div>

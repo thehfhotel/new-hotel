@@ -75,7 +75,10 @@ export default function V2Guests() {
       if (res.ok) {
         const data = await res.json()
         setGuests((data.customers || data.data || []) as Guest[])
-        setTotalPages(data.pagination?.totalPages || 1)
+        // /api/customers returns pagination fields at the TOP LEVEL
+        // ({total, page, totalPages}), unlike /api/new/* which nest them under
+        // `pagination`. Read top-level first so paging past page 1 works.
+        setTotalPages(data.totalPages || data.pagination?.totalPages || 1)
       }
     } catch {
       /* empty state */
@@ -138,8 +141,11 @@ export default function V2Guests() {
                   {g.phone || 'ไม่มีเบอร์โทร'}
                 </div>
               </div>
+              {/* The list endpoint doesn't return last-visit, so we don't claim
+                  "never stayed" (it would be wrong for returning guests). Show
+                  it only when present; the profile panel has full history. */}
               <div className="hidden sm:block text-right text-[12px]" style={{ color: 'var(--v2-ink-3)' }}>
-                {g.lastVisit ? `ล่าสุด ${formatStoredDate(g.lastVisit)}` : 'ยังไม่เคยเข้าพัก'}
+                {g.lastVisit ? `ล่าสุด ${formatStoredDate(g.lastVisit)}` : '—'}
               </div>
               <ChevronRight size={16} style={{ color: 'var(--v2-ink-3)' }} />
             </button>

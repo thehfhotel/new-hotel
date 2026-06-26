@@ -72,15 +72,30 @@ export function checkinStatusView(status: string): V2StatusView {
   }
 }
 
-/** True if an ISO/stored date string falls on the same calendar day as `ref`
- *  (default: today), comparing in the stored-as-UTC convention used app-wide. */
+/** True if a stored date string falls on the same calendar day as `ref`
+ *  (default: today).
+ *
+ *  The canonical `/api/new/*` endpoints serialize naive datetimes WITHOUT a
+ *  timezone suffix (e.g. "2026-06-26T00:00:00"), while others append "Z". Both
+ *  carry Thai-local clock values (see CLAUDE.md timezone rule), so the only safe
+ *  comparison is on the literal Y-M-D prefix of the string vs. today's Thai
+ *  date — NOT Date parsing, which would shift a no-Z midnight to the previous
+ *  day in a UTC+7 browser and under-count arrivals/departures by one day. */
 export function isSameStoredDay(value: string | null | undefined, ref = new Date()): boolean {
   if (!value) return false
-  const d = new Date(value)
-  if (Number.isNaN(d.getTime())) return false
-  return (
-    d.getUTCFullYear() === ref.getFullYear() &&
-    d.getUTCMonth() === ref.getMonth() &&
-    d.getUTCDate() === ref.getDate()
-  )
+  const datePart = String(value).slice(0, 10) // "YYYY-MM-DD"
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(datePart)) {
+    // Fallback for non-ISO inputs: compare via local date components.
+    const d = new Date(value)
+    if (Number.isNaN(d.getTime())) return false
+    return (
+      d.getFullYear() === ref.getFullYear() &&
+      d.getMonth() === ref.getMonth() &&
+      d.getDate() === ref.getDate()
+    )
+  }
+  const refPart = `${ref.getFullYear()}-${String(ref.getMonth() + 1).padStart(2, '0')}-${String(
+    ref.getDate(),
+  ).padStart(2, '0')}`
+  return datePart === refPart
 }

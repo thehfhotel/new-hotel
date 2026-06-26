@@ -1,8 +1,36 @@
 'use client'
 
 import type { ReactNode } from 'react'
-import { Loader2 } from 'lucide-react'
+import { Loader2, Info } from 'lucide-react'
 import type { V2StatusView } from '@/lib/v2/status'
+import type { Branch } from '@/contexts/BranchContext'
+
+/**
+ * Honest notice for the HF Ville data gap. The new ("/v2") screens read the
+ * canonical `/api/new/*` endpoints, which currently serve HF Hotel only and
+ * return empty for branch=hfville (see hotel-backend new_rooms/new_checkins/
+ * new_bookings: `if branch == Hfville { return empty }`). Rather than show a
+ * blank screen, tell the user where the data lives. Renders nothing for the
+ * fully-supported HF Hotel branch.
+ */
+export function VilleNotice({ branch }: { branch: Branch }) {
+  if (branch === 'hfhotel') return null
+  const message =
+    branch === 'hfville'
+      ? 'ดีไซน์ใหม่ยังไม่รองรับข้อมูล HF Ville — โปรดใช้หน้าจอเดิมสำหรับสาขานี้'
+      : 'ดีไซน์ใหม่แสดงเฉพาะข้อมูล HF Hotel ในขณะนี้ (ยังไม่รวม HF Ville)'
+  return (
+    <div
+      className="v2-card flex items-center gap-3 px-4 py-3"
+      style={{ borderColor: 'var(--v2-dep)', background: 'var(--v2-dep-bg)' }}
+      role="status"
+    >
+      <Info size={18} style={{ color: 'var(--v2-dep)' }} />
+      <p className="text-[13.5px] flex-1" style={{ color: 'var(--v2-ink)' }}>{message}</p>
+      <a href="/" className="v2-btn v2-btn-soft v2-btn-sm">หน้าจอเดิม</a>
+    </div>
+  )
+}
 
 export function V2Spinner({ label }: { label?: string }) {
   return (
