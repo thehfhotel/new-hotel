@@ -188,7 +188,15 @@ RUN --mount=type=cache,target=/sccache,id=sccache-backend \
     cp target/release/backfill_legacy_bookings /out/; \
     cp target/release/backfill_payment_ledger /out/; \
     cp target/release/migrate_legacy /out/; \
-    cp target/release/create_user /out/
+    cp target/release/create_user /out/; \
+    rm -rf target
+# `rm -rf target` keeps THIS layer tiny (just /out, ~70MB). target/ — the full
+# compiled closure (GBs) — already lives in the cached COOK layer below us; the
+# binaries are in /out. Without the rm, the build layer would carry the whole
+# target/ into the gha cache export on EVERY commit: slow (~40s extra) and, worse,
+# it bloats the cache toward the 10GB limit and can evict the cook layer →
+# random cold builds. The cook layer (deps) is unaffected; only this build layer
+# shrinks. (Perf pass 2026-06-27.)
 
 # ---- Runtime stage --------------------------------------------------------
 # Pin to digest. Source: Docker Hub API `library/debian/tags/bookworm-slim`
