@@ -55,6 +55,20 @@ The API backend is one process holding `new_pool` + `Option<ville_pool>`. Each s
 
 **Flip prerequisites for (2)** (all required before `ROUND_WRITEBACK_ENABLED=true`):
 - [ ] **HF Ville** needs the Ship-B per-site write bundle (task 20) — today only the single `from_env` (`hfhotel`) `ShiftService` exists, so open/close serve HF Hotel only; `branch=hfville` open/close is additionally blocked by Ship A's `ville_write_guard`.
-- [ ] **UI controls** (v1 + v2) gated on `roundWritebackEnabled` — open/close-round buttons. (Backend-only this pass.)
-- [ ] **P2 hardening:** map a `HT_Round_Bill` PK collision (SQL Server 2627/2601, the rare same-instant double-open vs iHOTEL's `MAX+1`) to a non-retryable error in `round_bill::execute_open` so it dead-letters immediately instead of burning the retry budget. Fail-safe today (no duplicate row; `sync_round_bills` self-heals), just noisy — see the inline note in `round_bill.rs`.
+- [x] **UI controls (v2)** gated on `roundWritebackEnabled` — `components/v2/RoundControl.tsx` open/close + `RoundCloseSheet`/`RoundReport`. (v1 classic control deferred — different design system; clean follow-up.)
+- [x] **P2 hardening** — `round_bill::execute_open` maps SQL Server 2627/2601 (PK/unique collision vs iHOTEL's `MAX+1`) to a non-retryable `WritebackError::Recipe` (immediate fail-loud dead-letter; still fail-safe).
 - [ ] One **receptionist-coordinated live round test**: flip flag in a window, open a round in our app, verify it lands in `HT_Round_Bill` (id, round_start, round_price=float, round_by) and that iHOTEL's gate then sees it open; close it from iHOTEL and confirm `sync_round_bills` reconciles our `ht_shifts` row; then the reverse (open in iHOTEL → close in our app). Avoid a same-instant double-open (the documented `get_id` PK race).
+
+---
+
+## Round reconciliation (Track J7) — income-by-tender + iHOTEL-equivalent report (2026-06-27)
+
+User requirement: round close must show **income by tender (cash/transfer/credit/…)** + a report **like iHOTEL's `ReportShipCash`**. Crux finding: iHOTEL splits each payment across tender columns in `HT_CheckIn_Pay` (`Cin_Pay_Cash/Credit/Tran/Free/web`); our `ht_payments` is single-method + only carries the check-in *total* (receipt-mirror hardcodes `'cash'`). So summing `ht_payments` would miss every iHOTEL payment + mislabel receipts — we must mirror the per-tender ledger.
+
+- **J7a (migration 057) — SHIPPED + live-verified.** Canonical `ht_payment_ledger`: per-line mirror of `HT_CheckIn_Pay` (all tenders + category `ledger_ds_id` P001=room + `Cin_Status`), via `sync/mappers/payment.rs::mirror_payment_ledger` in the `PaymentMapper` coalesced path (re-mirrors all lines of a changed `Cin_No`). Holds BOTH apps' payments. Adversarially reviewed (no P0/P1); non-finite tenders coerced→0; cols `NUMERIC(14,2)`. Live-verified: a real HF Ville payment flowed CT→ledger 2026-06-27.
+- **J7b — SHIPPED.** `GET /api/shifts/{id}/report` (branch-aware): income by tender + room/product sales over the round window; open (live preview) or closed.
+- **J7c (migration 058) — SHIPPED.** Cash-drawer denomination count + counted-vs-expected variance at close (`ht_shifts.shift_counted_cash`/`shift_cash_count`; `ShiftService::close_shift` server-computes via `sum_cash_count`).
+- **J7d — SHIPPED DARK.** v2 close reconciliation UI (`RoundCloseSheet` denomination grid + live variance) + `RoundReport` view. Gated on `canManage` (incl. the read-only report view) so a forward-only/sparse ledger can't show misleading ~zero income.
+- **J7e — SHIPPED.** `backfill_payment_ledger` bin (+ compose `backfill-payment-ledger[-hfville]`) — one-shot read-only sweep of `HT_CheckIn_Pay` → ledger so reports are accurate for current/recent rounds, not just forward.
+
+**J7 remaining (no live coordination needed):** un-gate the **read-only** report view (the `ดูรายงานรอบ` button) once the backfill has run, so reception gets income-by-tender **without** enabling round writes. (The close/denomination flow stays gated on `canManage` = the write flag.) HF Ville historical accuracy + co-equal writes still ride the Ship-B bundle (task 20) + the coordinated live test above.

@@ -144,19 +144,18 @@ export default function RoundControl({ onChanged }: { onChanged?: () => void }) 
       </button>
     )
     if (!canManage) {
-      // Read-only: calm one-line status. iHOTEL owns the round. The round
-      // report is intentionally NOT surfaced here yet: the ht_payment_ledger
-      // it reads is a forward-only CT mirror, so until a backfill (J7e) lands
-      // it would show incomplete income vs iHOTEL. The whole reconciliation UI
-      // (report + close) therefore stays gated on `canManage` (dark) so a
-      // cashier never sees misleading numbers; it lights up together when
-      // ROUND_WRITEBACK_ENABLED flips (by which point the ledger has filled).
+      // Read-only: calm status + the (informational) report view. iHOTEL owns
+      // the round (open/close stays gated on canManage), but the income-by-tender
+      // REPORT is read-only and safe to surface even with writes off — it reads
+      // ht_payment_ledger, which the J7e backfill populated for both sites
+      // (HF Hotel + Ville), so the numbers match iHOTEL's View_RBill_H.
       body = (
         <div className="v2-inset flex flex-wrap items-center gap-2.5 px-4 py-2.5">
           <Clock size={15} style={{ color: 'var(--v2-ink-3)' }} />
           <span className="text-[13px]" style={{ color: 'var(--v2-ink-2)' }}>รอบขายเปิดอยู่</span>
           <span className="text-[12.5px] v2-num" style={{ color: 'var(--v2-ink-3)' }}>{meta}</span>
           <span className="flex-1" />
+          {viewBtn}
           <span className="text-[11.5px]" style={{ color: 'var(--v2-ink-3)' }}>จัดการผ่าน iHOTEL</span>
         </div>
       )
