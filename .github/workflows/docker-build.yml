@@ -795,7 +795,7 @@ jobs:
       - name: Cache cloudflared binary
         id: cf-cache
         # actions/cache v4.2.0 pinned to commit SHA.
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8  # v6.0.0
         with:
           path: /usr/local/bin/cloudflared
           # Pin to a SPECIFIC release version so the cache key is stable.
