@@ -394,7 +394,9 @@ pub struct RoundReportResponse {
     pub income: TenderBreakdown,
     /// Room deposits received / returned this round (iHOTEL `Dep_Rec`/`Dep_pay`).
     pub deposits: DepositSummary,
-    /// Simple room/guest activity counts for the round (our addition).
+    /// Simple room/guest activity counts for the round (our addition; iHOTEL's
+    /// round report is money-only, so these are reported alongside and are
+    /// never folded into `grand_total` / `expected_cash`).
     pub occupancy: OccupancySummary,
     /// iHOTEL's round "total" (`FrmDueBill` Labeltotal): opening float +
     /// cash_received - cash_paid + credit + transfer.

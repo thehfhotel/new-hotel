@@ -1,8 +1,15 @@
 # syntax=docker/dockerfile:1.7
 #
-# Frontend image — Next.js standalone build with BuildKit cache mounts on
-# pnpm's content-addressed store and Next.js's webpack cache. Both persist
-# across CI runs via `cache-to: type=gha,mode=max` on the build-push-action.
+# Frontend image — Next.js standalone build.
+#
+# What actually persists across CI runs: the pnpm-install LAYER, via
+# `cache-to: type=gha,mode=max` keyed on pnpm-lock.yaml — so installs are
+# skipped when deps are unchanged. The `--mount=type=cache` mounts below
+# (pnpm store, .next/cache) only speed a COLD build; they do NOT persist across
+# runs (BuildKit excludes mount contents from image layers and gha doesn't
+# export them — the same gotcha that silently defeated the backend cook cache,
+# see hotel-backend/Dockerfile). That's fine here: the Next.js compile is only
+# ~8s, so there's nothing worth persisting .next/cache for.
 
 # Pin to digest (Batch C of post-Phase-5.5 audit). Source: Docker Hub API
 # `hub.docker.com/v2/repositories/library/node/tags/20-alpine` on 2026-04-26.
