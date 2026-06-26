@@ -180,6 +180,22 @@ services:
       # Either way, `/api/auth/{login,logout,me}` and `/api/health`
       # remain public — that's how the frontend bootstraps.
       - AUTH_ENABLED=${AUTH_ENABLED:-false}
+      # Round-bill writeback (Track J6). Defaults to `false` so iHOTEL stays
+      # the sole opener of cashier rounds (`HT_Round_Bill`); our app only
+      # MIRRORS rounds in via the read-only `sync_round_bills` poll. When
+      # false, `POST /api/shifts/open|close` reject with HTTP 400
+      # (`ServiceError::Conflict`) and no legacy write is ever attempted.
+      # FLIP CHECKLIST before setting `true`:
+      #   1. HF Hotel ONLY — HF Ville needs the Ship-B per-site write bundle
+      #      first (Ville open/close is still blocked by the ville_write_guard).
+      #   2. A reception-coordinated live round test (open in our app at a real
+      #      shift boundary, verify it lands in HT_Round_Bill + iHOTEL sees it;
+      #      one person/one app at a time — the get_id MAX+1 race is rated Low).
+      #      See docs/coexistence/ville-coequal-writes-plan.md.
+      #   3. Set `ROUND_WRITEBACK_ENABLED=true` in `.env` (or GH variable) +
+      #      redeploy. Rollback = set back to false + redeploy (no state to undo;
+      #      the legacy PK prevents duplicates and the mirror self-heals).
+      - ROUND_WRITEBACK_ENABLED=${ROUND_WRITEBACK_ENABLED:-false}
       # Tracing log level. Default `hotel_backend=info,tower_http=info`
       # matches `main.rs::tracing_subscriber::EnvFilter::try_from_default_env`'s
       # fallback. Override at deploy time to crank up debug logging

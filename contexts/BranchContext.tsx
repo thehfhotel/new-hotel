@@ -16,6 +16,10 @@ interface BranchContextType {
   villeAvailable: boolean
   /** Whether the backend permits HF Ville WRITES (HFVILLE_WRITES_ENABLED). */
   villeWritesEnabled: boolean
+  /** Whether the backend lets our app open/close iHOTEL cashier rounds
+   *  (ROUND_WRITEBACK_ENABLED). When false, round controls are read-only
+   *  ("managed in iHOTEL") and POST /api/shifts/open|close return 400. */
+  roundWritebackEnabled: boolean
   /** True when the current branch is writable: HF Hotel always, HF Ville only
    *  when villeWritesEnabled. UIs gate mutating actions on this. */
   canWrite: boolean
@@ -26,6 +30,7 @@ const BranchContext = createContext<BranchContextType>({
   setBranch: () => {},
   villeAvailable: false,
   villeWritesEnabled: false,
+  roundWritebackEnabled: false,
   canWrite: true,
 })
 
@@ -33,6 +38,7 @@ export function BranchProvider({ children }: { children: ReactNode }) {
   const [branch, setBranchState] = useState<Branch>('hfhotel')
   const [villeAvailable, setVilleAvailable] = useState(false)
   const [villeWritesEnabled, setVilleWritesEnabled] = useState(false)
+  const [roundWritebackEnabled, setRoundWritebackEnabled] = useState(false)
   const [mounted, setMounted] = useState(false)
 
   useEffect(() => {
@@ -52,6 +58,9 @@ export function BranchProvider({ children }: { children: ReactNode }) {
         if (data.success && data.villeWritesEnabled) {
           setVilleWritesEnabled(true)
         }
+        if (data.success && data.roundWritebackEnabled) {
+          setRoundWritebackEnabled(true)
+        }
       })
       .catch((err) => console.error('Failed to check ville availability:', err))
   }, [])
@@ -68,14 +77,14 @@ export function BranchProvider({ children }: { children: ReactNode }) {
 
   if (!mounted) {
     return (
-      <BranchContext.Provider value={{ branch, setBranch, villeAvailable, villeWritesEnabled, canWrite }}>
+      <BranchContext.Provider value={{ branch, setBranch, villeAvailable, villeWritesEnabled, roundWritebackEnabled, canWrite }}>
         {children}
       </BranchContext.Provider>
     )
   }
 
   return (
-    <BranchContext.Provider value={{ branch, setBranch, villeAvailable, villeWritesEnabled, canWrite }}>
+    <BranchContext.Provider value={{ branch, setBranch, villeAvailable, villeWritesEnabled, roundWritebackEnabled, canWrite }}>
       {children}
     </BranchContext.Provider>
   )

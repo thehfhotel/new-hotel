@@ -1,0 +1,269 @@
+'use client'
+
+import { useCallback, useEffect, useRef, useState } from 'react'
+import Link from 'next/link'
+import { AlertTriangle, Clock, Loader2, Lock, Unlock, X } from 'lucide-react'
+import { useBranch } from '@/contexts/BranchContext'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { useAuth } from '@/contexts/AuthContext'
+
+/**
+ * Cashier-round (HT_Round_Bill / รอบบิล) control for the v2 home screen.
+ *
+ * Reads the current open round per-branch from GET /api/shifts/current
+ * (mirrored from iHOTEL by `sync_round_bills`). When the backend enables
+ * co-equal round writeback (`roundWritebackEnabled`, from /api/mode) AND the
+ * branch is writable (`canWrite` — HF Hotel only today), it exposes Open/Close
+ * actions that POST /api/shifts/open|close. When writeback is OFF the control
+ * is read-only: it still surfaces the "no open round" gate warning (check-in /
+ * check-out are suspended) and points at the classic screen, where iHOTEL owns
+ * the round. Subsumes the inline shift-gate banner the home page used to render.
+ */
+
+interface ShiftDto {
+  shiftNo: number
+  openedBy: string
+  openedAt: string
+  legacyRoundId: number | null
+}
+
+/** ht_shifts timestamps are real UTC instants (TIMESTAMPTZ), unlike the
+ *  legacy fake-Z values — so render them in Bangkok wall-clock time. */
+function formatThai(iso: string): string {
+  try {
+    return new Date(iso).toLocaleString('th-TH', {
+      day: 'numeric',
+      month: 'short',
+      hour: '2-digit',
+      minute: '2-digit',
+      timeZone: 'Asia/Bangkok',
+    })
+  } catch {
+    return iso
+  }
+}
+
+export default function RoundControl({ onChanged }: { onChanged?: () => void }) {
+  const { branch, canWrite, roundWritebackEnabled } = useBranch()
+  const branchFetch = useBranchFetch()
+  const { user } = useAuth()
+
+  const [shift, setShift] = useState<ShiftDto | null>(null)
+  const [loaded, setLoaded] = useState(false)
+  const [mode, setMode] = useState<'idle' | 'opening' | 'closing'>('idle')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [openingFloat, setOpeningFloat] = useState('3000')
+  const [actor, setActor] = useState('')
+
+  // Latest-wins guard: branch can flip (hfhotel default → stored value) mid-flight.
+  const reqRef = useRef(0)
+
+  const canManage = roundWritebackEnabled && canWrite
+
+  const fetchCurrent = useCallback(async () => {
+    const token = ++reqRef.current
+    try {
+      const res = await branchFetch('/api/shifts/current')
+      if (token !== reqRef.current) return
+      if (res.ok) {
+        const d = await res.json()
+        setShift((d?.shift ?? null) as ShiftDto | null)
+      } else {
+        // 404 = no open round for this site (the gate-warning state).
+        setShift(null)
+      }
+    } catch {
+      setShift(null)
+    } finally {
+      if (token === reqRef.current) setLoaded(true)
+    }
+  }, [branchFetch])
+
+  useEffect(() => {
+    setLoaded(false)
+    fetchCurrent()
+  }, [fetchCurrent])
+
+  // Prefill the cashier name from the signed-in user whenever a form opens.
+  useEffect(() => {
+    if (mode !== 'idle') setActor((a) => a || user?.username || '')
+  }, [mode, user])
+
+  const readError = async (res: Response): Promise<string> => {
+    try {
+      const d = await res.json()
+      return d?.error || d?.message || `เกิดข้อผิดพลาด (${res.status})`
+    } catch {
+      return `เกิดข้อผิดพลาด (${res.status})`
+    }
+  }
+
+  const submitOpen = async () => {
+    const floatVal = Number(openingFloat)
+    if (!actor.trim()) return setError('กรุณาระบุชื่อผู้เปิดรอบ')
+    if (!Number.isFinite(floatVal) || floatVal < 0) return setError('เงินทอนตั้งต้นไม่ถูกต้อง')
+    setBusy(true)
+    setError(null)
+    try {
+      const res = await branchFetch('/api/shifts/open', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ openedBy: actor.trim(), openingFloat: floatVal }),
+      })
+      if (!res.ok) {
+        setError(await readError(res))
+        return
+      }
+      setMode('idle')
+      await fetchCurrent()
+      onChanged?.()
+    } catch {
+      setError('เชื่อมต่อไม่สำเร็จ')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const submitClose = async () => {
+    if (!actor.trim()) return setError('กรุณาระบุชื่อผู้ปิดรอบ')
+    setBusy(true)
+    setError(null)
+    try {
+      const res = await branchFetch('/api/shifts/close', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ closedBy: actor.trim() }),
+      })
+      if (!res.ok) {
+        setError(await readError(res))
+        return
+      }
+      setMode('idle')
+      await fetchCurrent()
+      onChanged?.()
+    } catch {
+      setError('เชื่อมต่อไม่สำเร็จ')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (!loaded) return null
+
+  // --- OPEN round ---
+  if (shift) {
+    const meta = `รอบ #${shift.shiftNo} · เปิดโดย ${shift.openedBy} · ${formatThai(shift.openedAt)}`
+    if (!canManage) {
+      // Read-only: a calm one-line status. iHOTEL (or HF Hotel) owns the round.
+      return (
+        <div className="v2-inset flex items-center gap-2.5 px-4 py-2.5">
+          <Clock size={15} style={{ color: 'var(--v2-ink-3)' }} />
+          <span className="text-[13px]" style={{ color: 'var(--v2-ink-2)' }}>รอบขายเปิดอยู่</span>
+          <span className="text-[12.5px] v2-num" style={{ color: 'var(--v2-ink-3)' }}>{meta}</span>
+          <span className="flex-1" />
+          <span className="text-[11.5px]" style={{ color: 'var(--v2-ink-3)' }}>จัดการผ่าน iHOTEL</span>
+        </div>
+      )
+    }
+    return (
+      <div className="v2-card px-4 py-3" style={{ borderColor: 'var(--v2-line)' }}>
+        <div className="flex items-center gap-3">
+          <span className="v2-dot d-ok" style={{ width: 9, height: 9 }} />
+          <div className="flex-1 min-w-0">
+            <div className="text-[14px] font-semibold">รอบขายเปิดอยู่</div>
+            <div className="text-[12.5px] v2-num truncate" style={{ color: 'var(--v2-ink-3)' }}>{meta}</div>
+          </div>
+          {mode !== 'closing' && (
+            <button className="v2-btn v2-btn-ghost v2-btn-sm" onClick={() => { setError(null); setMode('closing') }}>
+              <Lock size={15} /> ปิดรอบ
+            </button>
+          )}
+        </div>
+        {mode === 'closing' && (
+          <div className="mt-3 pt-3 flex flex-wrap items-end gap-2" style={{ borderTop: '1px solid var(--v2-line)' }}>
+            <Field label="ผู้ปิดรอบ">
+              <input
+                value={actor}
+                onChange={(e) => setActor(e.target.value)}
+                className="v2-num h-9 px-3 rounded-[10px] text-[14px] outline-none w-44"
+                style={{ background: 'var(--v2-surface)', border: '1px solid var(--v2-line-2)' }}
+              />
+            </Field>
+            <button className="v2-btn v2-btn-primary v2-btn-sm" disabled={busy} onClick={submitClose}>
+              {busy ? <Loader2 size={15} className="animate-spin" /> : <Lock size={15} />} ยืนยันปิดรอบ
+            </button>
+            <button className="v2-btn v2-btn-ghost v2-btn-sm" disabled={busy} onClick={() => { setMode('idle'); setError(null) }}>
+              <X size={15} /> ยกเลิก
+            </button>
+          </div>
+        )}
+        {error && <ErrorLine msg={error} />}
+      </div>
+    )
+  }
+
+  // --- CLOSED (no open round): gate warning, always shown ---
+  return (
+    <div className="v2-card px-4 py-3" style={{ borderColor: 'var(--v2-arr)', background: 'var(--v2-arr-bg)' }}>
+      <div className="flex items-center gap-3">
+        <AlertTriangle size={18} style={{ color: 'var(--v2-arr)' }} />
+        <p className="text-[13.5px] flex-1" style={{ color: 'var(--v2-ink)' }}>
+          ยังไม่ได้เปิดรอบขาย — การเช็คอิน/เช็คเอาท์จะถูกระงับจนกว่าจะเปิดรอบ
+        </p>
+        {canManage ? (
+          mode !== 'opening' && (
+            <button className="v2-btn v2-btn-soft v2-btn-sm" onClick={() => { setError(null); setMode('opening') }}>
+              <Unlock size={15} /> เปิดรอบ
+            </button>
+          )
+        ) : (
+          <Link href="/billing" className="v2-btn v2-btn-soft v2-btn-sm">เปิดรอบ</Link>
+        )}
+      </div>
+      {canManage && mode === 'opening' && (
+        <div className="mt-3 pt-3 flex flex-wrap items-end gap-2" style={{ borderTop: '1px solid var(--v2-arr)' }}>
+          <Field label="ผู้เปิดรอบ">
+            <input
+              value={actor}
+              onChange={(e) => setActor(e.target.value)}
+              className="v2-num h-9 px-3 rounded-[10px] text-[14px] outline-none w-40"
+              style={{ background: 'var(--v2-surface)', border: '1px solid var(--v2-line-2)' }}
+            />
+          </Field>
+          <Field label="เงินทอนตั้งต้น (บาท)">
+            <input
+              value={openingFloat}
+              onChange={(e) => setOpeningFloat(e.target.value)}
+              inputMode="numeric"
+              className="v2-num h-9 px-3 rounded-[10px] text-[14px] outline-none w-32"
+              style={{ background: 'var(--v2-surface)', border: '1px solid var(--v2-line-2)' }}
+            />
+          </Field>
+          <button className="v2-btn v2-btn-primary v2-btn-sm" disabled={busy} onClick={submitOpen}>
+            {busy ? <Loader2 size={15} className="animate-spin" /> : <Unlock size={15} />} ยืนยันเปิดรอบ
+          </button>
+          <button className="v2-btn v2-btn-ghost v2-btn-sm" disabled={busy} onClick={() => { setMode('idle'); setError(null) }}>
+            <X size={15} /> ยกเลิก
+          </button>
+        </div>
+      )}
+      {error && <ErrorLine msg={error} />}
+    </div>
+  )
+}
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <label className="flex flex-col gap-1">
+      <span className="text-[11px] font-medium" style={{ color: 'var(--v2-ink-3)' }}>{label}</span>
+      {children}
+    </label>
+  )
+}
+
+function ErrorLine({ msg }: { msg: string }) {
+  return (
+    <p className="text-[12.5px] mt-2" style={{ color: 'var(--v2-wine-600)' }}>{msg}</p>
+  )
+}

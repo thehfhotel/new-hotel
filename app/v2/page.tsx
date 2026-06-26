@@ -7,7 +7,6 @@ import {
   LogIn,
   LogOut,
   ArrowRight,
-  AlertTriangle,
   ChevronRight,
   Moon,
 } from 'lucide-react'
@@ -17,6 +16,7 @@ import { formatStoredDayMonth, formatStoredDateTime } from '@/lib/format'
 import type { Booking } from '@/types/booking'
 import { isSameStoredDay } from '@/lib/v2/status'
 import { V2Spinner, LiveDot, VilleNotice } from '@/components/v2/primitives'
+import RoundControl from '@/components/v2/RoundControl'
 
 // Mirrors the /api/stats payload. NOTE: there is no `availableRooms` field —
 // it is derived client-side (totalRooms - occupied - checkout - booked), the
@@ -65,7 +65,6 @@ export default function V2Today() {
   const [stats, setStats] = useState<Stats | null>(null)
   const [checkins, setCheckins] = useState<CheckInRow[]>([])
   const [bookings, setBookings] = useState<Booking[]>([])
-  const [shiftOpen, setShiftOpen] = useState<boolean | null>(null)
   const [loading, setLoading] = useState(true)
   const [live, setLive] = useState(false)
 
@@ -78,11 +77,10 @@ export default function V2Today() {
   const fetchData = useCallback(async () => {
     const token = ++reqRef.current
     try {
-      const [statsRes, cinRes, bookRes, shiftRes] = await Promise.all([
+      const [statsRes, cinRes, bookRes] = await Promise.all([
         branchFetch('/api/stats'),
         branchFetch('/api/checkins?limit=100'),
         branchFetch('/api/bookings?limit=100'),
-        branchFetch('/api/shifts/current').catch(() => null),
       ])
 
       if (token !== reqRef.current) return // superseded by a newer branch fetch
@@ -99,16 +97,9 @@ export default function V2Today() {
         const d = await bookRes.json()
         setBookings((d.data || []) as Booking[])
       }
-      if (shiftRes && shiftRes.ok) {
-        const d = await shiftRes.json()
-        setShiftOpen(Boolean(d?.data || d?.shift))
-      } else if (shiftRes && shiftRes.status === 404) {
-        // /api/shifts/current returns 404 when no shift is open — that's
-        // the "round not open" state the banner exists to warn about.
-        setShiftOpen(false)
-      } else {
-        setShiftOpen(null)
-      }
+      // The cashier round (status + open/close gate) is owned by <RoundControl>,
+      // which fetches /api/shifts/current itself and refreshes the dashboard via
+      // onChanged after an open/close.
     } catch {
       /* surfaces as empty states */
     } finally {
@@ -199,19 +190,10 @@ export default function V2Today() {
 
       <VilleNotice branch={branch} />
 
-      {/* Shift gate banner */}
-      {shiftOpen === false && (
-        <div
-          className="v2-card flex items-center gap-3 px-4 py-3"
-          style={{ borderColor: 'var(--v2-arr)', background: 'var(--v2-arr-bg)' }}
-        >
-          <AlertTriangle size={18} style={{ color: 'var(--v2-arr)' }} />
-          <p className="text-[13.5px] flex-1" style={{ color: 'var(--v2-ink)' }}>
-            ยังไม่ได้เปิดรอบขาย — การเช็คอิน/เช็คเอาท์จะถูกระงับจนกว่าจะเปิดรอบ
-          </p>
-          <Link href="/billing" className="v2-btn v2-btn-soft v2-btn-sm">เปิดรอบ</Link>
-        </div>
-      )}
+      {/* Cashier round: status + open/close. Open/close actions appear only
+          when ROUND_WRITEBACK_ENABLED && the branch is writable; otherwise the
+          control is read-only and the round is managed in iHOTEL. */}
+      <RoundControl onChanged={fetchData} />
 
       {/* Hero: occupancy pulse + day flow */}
       <div className="grid lg:grid-cols-[360px_1fr] gap-4">

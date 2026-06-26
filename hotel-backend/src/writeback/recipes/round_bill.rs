@@ -48,9 +48,42 @@
 use crate::outbox::intent::{CloseRoundPayload, OpenRoundPayload};
 use crate::writeback::allocate::LegacyConn;
 use crate::writeback::dispatcher::LegacyIds;
-use crate::writeback::error::WritebackResult;
+use crate::writeback::error::{WritebackError, WritebackResult};
 use crate::writeback::format::{format_legacy_datetime, sql_quote};
 use crate::writeback::recipes::helpers::validate_finite;
+
+/// SQL Server error numbers for a key collision on the `INSERT`:
+/// `2627` = PRIMARY KEY / UNIQUE constraint violation, `2601` = unique
+/// index violation. Either means iHOTEL grabbed our allocated
+/// `HT_Round_Bill.id` first (the same-instant double-open race). Pure
+/// helper mirroring `error::is_transient_pg_sqlstate` so the
+/// classification is unit-testable without constructing a tiberius error.
+fn is_round_id_collision(code: Option<u32>) -> bool {
+    matches!(code, Some(2627) | Some(2601))
+}
+
+/// Map an open-INSERT failure: a `HT_Round_Bill.id` PK/unique collision
+/// (iHOTEL won the same-instant open race) is **deterministic** — the id is
+/// fixed in the payload, so every retry re-collides. Convert it to a
+/// non-retryable [`WritebackError::Recipe`] so the job dead-letters at once
+/// (fail-loud) instead of burning the retry budget. The outcome is still
+/// fail-SAFE — the PK already prevented a duplicate round, and
+/// `sync_round_bills` reconciles `ht_shifts` to iHOTEL's row on the next
+/// tick. Any other error passes through unchanged (real transient I/O stays
+/// retryable).
+fn map_open_collision(err: WritebackError, legacy_round_id: i32) -> WritebackError {
+    if let WritebackError::Tiberius(ref tib) = err {
+        if is_round_id_collision(tib.code()) {
+            return WritebackError::Recipe(format!(
+                "HT_Round_Bill id {legacy_round_id} already exists (SQL Server error {} — \
+                 iHOTEL won the same-instant open race); not retryable. sync_round_bills \
+                 will reconcile ht_shifts to iHOTEL's open round on the next tick.",
+                tib.code().unwrap_or(0),
+            ));
+        }
+    }
+    err
+}
 
 /// Build the single `INSERT HT_Round_Bill` statement that opens a round. PURE.
 ///
@@ -90,18 +123,16 @@ pub async fn execute_open(
 ) -> WritebackResult<LegacyIds> {
     validate_finite(&[("round_price", payload.round_price)])?;
     let statements = build_open_statement(payload);
-    // Collision note (pre-flip hardening, P2): if iHOTEL grabbed our allocated
-    // `id` in a same-instant double-open, this INSERT hits the legacy PK
-    // (SQL Server 2627/2601). That surfaces as `WritebackError::Tiberius`,
-    // which `is_retryable()` currently treats as retryable — so the fixed-id
-    // job re-fails identically until it dead-letters. The outcome is
-    // fail-SAFE (the PK prevents a duplicate round, and `sync_round_bills`
-    // reconciles `ht_shifts` to iHOTEL's row on the next tick), just noisy.
-    // Before flipping `ROUND_WRITEBACK_ENABLED` on, map 2627/2601 here to a
-    // non-retryable `WritebackError::Recipe` for an immediate fail-loud
-    // dead-letter. Left as-is while the feature ships dark + the race is rated
-    // Low (one open round per site; the close→open is a deliberate human step).
-    super::execute_all(conn, &statements).await?;
+    // A `HT_Round_Bill.id` PK/unique collision means iHOTEL grabbed our
+    // allocated id first (the same-instant double-open race). The id is fixed
+    // in the payload, so a retry would re-collide forever — map it to a
+    // non-retryable Recipe error for an immediate fail-loud dead-letter
+    // (fail-SAFE: no duplicate round, and sync_round_bills self-heals
+    // ht_shifts to iHOTEL's round). Real transient I/O passes through
+    // retryable. The race is rated Low (one open round per site).
+    super::execute_all(conn, &statements)
+        .await
+        .map_err(|e| map_open_collision(e, payload.legacy_round_id))?;
     Ok(LegacyIds::new())
 }
 
@@ -187,5 +218,25 @@ mod tests {
         // build_statement is pure (no validation); execute_open validates.
         // Assert the guard the recipe uses rejects NaN.
         assert!(validate_finite(&[("round_price", p.round_price)]).is_err());
+    }
+
+    #[test]
+    fn pk_unique_collision_codes_are_classified() {
+        // 2627 = PK/UNIQUE constraint violation, 2601 = unique index violation
+        // — both mean iHOTEL won the same-instant open race.
+        assert!(is_round_id_collision(Some(2627)));
+        assert!(is_round_id_collision(Some(2601)));
+        // Anything else (transient I/O, other server errors, no code) is NOT a
+        // collision and must stay retryable.
+        assert!(!is_round_id_collision(Some(1205))); // deadlock victim — retry
+        assert!(!is_round_id_collision(Some(0)));
+        assert!(!is_round_id_collision(None));
+    }
+
+    #[test]
+    fn map_open_collision_only_rewrites_round_id_collisions() {
+        // A non-tiberius error (e.g. a Recipe error) passes through untouched.
+        let recipe = WritebackError::Recipe("boom".into());
+        assert!(matches!(map_open_collision(recipe, 4778), WritebackError::Recipe(m) if m == "boom"));
     }
 }
