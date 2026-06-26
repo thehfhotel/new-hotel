@@ -23,7 +23,12 @@ const CHROMELESS_PATHS = new Set<string>(['/login'])
  */
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname()
-  const isChromeless = pathname ? CHROMELESS_PATHS.has(pathname) : false
+  // The new "/v2" front-desk experience ships its own shell (rail + bottom nav
+  // + its own BranchProvider) and must render WITHOUT the classic sidebar.
+  // Treat the whole /v2 subtree as chromeless, like /login.
+  const isChromeless = pathname
+    ? CHROMELESS_PATHS.has(pathname) || pathname === '/v2' || pathname.startsWith('/v2/')
+    : false
 
   if (isChromeless) {
     return <>{children}</>

@@ -1,0 +1,247 @@
+/* ──────────────────────────────────────────────────────────────────────────
+   v2.css — design system for the new ("/v2") front desk experience.
+
+   FULLY SCOPED under `.v2`. None of these tokens or classes leak into the
+   existing app: the classic UI (fiori/modern skins) reads its own tokens from
+   globals.css and never sees `.v2`. This file is imported once, by
+   app/v2/layout.tsx, and every selector below is prefixed `.v2`.
+
+   Aesthetic: "front desk of a heritage hotel" — warm paper surfaces, a refined
+   bordeaux that descends from the brand's deep red, a single brass accent used
+   with restraint, soft radii, and a precise Space Grotesk numeral face for the
+   data that receptionists read at a glance.
+   ────────────────────────────────────────────────────────────────────────── */
+
+.v2 {
+  /* Brand — heritage bordeaux (a calmer descendant of #8B0000). */
+  --v2-wine-900: #43141d;
+  --v2-wine-700: #6e2230;
+  --v2-wine-600: #86303e;
+  --v2-wine-500: #a8424f;
+  --v2-wine-300: #cf8f97;
+  --v2-wine-100: #efd9dc;
+  --v2-wine-50:  #faf1f2;
+
+  /* Brass — the one accent. Used for the occupancy pulse and nothing loud. */
+  --v2-brass: #ad8741;
+  --v2-brass-soft: #e7d4a6;
+
+  /* Surfaces — warm paper, never stark. */
+  --v2-bg:        #f6f3ef;
+  --v2-surface:   #ffffff;
+  --v2-surface-2: #fbf9f6;
+  --v2-line:      #ebe5de;
+  --v2-line-2:    #dcd3c9;
+
+  /* Ink — warm near-black through to soft greys. */
+  --v2-ink:   #241f1d;
+  --v2-ink-2: #6f655f;
+  --v2-ink-3: #9c938c;
+
+  /* Operational status palette (text + faint tint per state). */
+  --v2-ok: #2c8a57;        --v2-ok-bg: #e6f2ea;       /* available / clean   */
+  --v2-occ: #a8424f;       --v2-occ-bg: #f6e7e9;      /* in-house (brand)    */
+  --v2-arr: #b67d12;       --v2-arr-bg: #faf0d8;      /* arriving / booked   */
+  --v2-dep: #2a7585;       --v2-dep-bg: #e2eff1;      /* departing / out     */
+  --v2-fix: #b1542e;       --v2-fix-bg: #f7e8e1;      /* maintenance / dirty */
+  --v2-mut: #877e77;       --v2-mut-bg: #ede9e3;      /* neutral / unknown   */
+
+  --v2-radius:    14px;
+  --v2-radius-sm: 10px;
+  --v2-radius-xs: 8px;
+  --v2-radius-lg: 22px;
+
+  --v2-shadow-sm: 0 1px 2px rgba(36, 31, 29, 0.05), 0 1px 3px rgba(36, 31, 29, 0.04);
+  --v2-shadow-md: 0 6px 20px -6px rgba(36, 31, 29, 0.14);
+  --v2-shadow-lg: 0 22px 54px -16px rgba(36, 31, 29, 0.26);
+
+  background: var(--v2-bg);
+  color: var(--v2-ink);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Space Grotesk for numerals + short Latin labels; --font-v2-display is set on
+   the wrapper by next/font. Tabular figures so columns of numbers line up. */
+.v2 .v2-num {
+  font-family: var(--font-v2-display), "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  font-feature-settings: "tnum" 1, "cv01" 1;
+  letter-spacing: -0.01em;
+}
+.v2 .v2-display {
+  font-family: var(--font-v2-display), "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  letter-spacing: -0.02em;
+  font-weight: 600;
+}
+.v2 .v2-eyebrow {
+  font-family: var(--font-v2-display), "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--v2-ink-3);
+}
+
+/* ── Surfaces ─────────────────────────────────────────────────────────── */
+.v2 .v2-card {
+  background: var(--v2-surface);
+  border: 1px solid var(--v2-line);
+  border-radius: var(--v2-radius);
+  box-shadow: var(--v2-shadow-sm);
+}
+.v2 .v2-card-flush { background: var(--v2-surface); border: 1px solid var(--v2-line); border-radius: var(--v2-radius); }
+.v2 .v2-inset { background: var(--v2-surface-2); border: 1px solid var(--v2-line); border-radius: var(--v2-radius-sm); }
+
+/* ── Buttons ──────────────────────────────────────────────────────────── */
+.v2 .v2-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  font-weight: 600; font-size: 14px; line-height: 1;
+  padding: 0 16px; height: 42px; border-radius: var(--v2-radius-sm);
+  border: 1px solid transparent; cursor: pointer;
+  transition: background .15s ease, border-color .15s ease, color .15s ease, transform .06s ease, box-shadow .15s ease;
+  white-space: nowrap;
+}
+.v2 .v2-btn:active { transform: translateY(1px); }
+.v2 .v2-btn:disabled { opacity: .5; cursor: not-allowed; }
+.v2 .v2-btn-primary { background: var(--v2-wine-600); color: #fff; box-shadow: var(--v2-shadow-sm); }
+.v2 .v2-btn-primary:hover:not(:disabled) { background: var(--v2-wine-700); }
+.v2 .v2-btn-ghost { background: var(--v2-surface); color: var(--v2-ink); border-color: var(--v2-line-2); }
+.v2 .v2-btn-ghost:hover:not(:disabled) { background: var(--v2-surface-2); border-color: var(--v2-ink-3); }
+.v2 .v2-btn-soft { background: var(--v2-wine-50); color: var(--v2-wine-700); }
+.v2 .v2-btn-soft:hover:not(:disabled) { background: var(--v2-wine-100); }
+.v2 .v2-btn-sm { height: 34px; font-size: 13px; padding: 0 12px; border-radius: var(--v2-radius-xs); }
+
+/* ── Chips & status pills ─────────────────────────────────────────────── */
+.v2 .v2-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 30px; padding: 0 12px; border-radius: 999px;
+  font-size: 13px; font-weight: 500; color: var(--v2-ink-2);
+  background: var(--v2-surface); border: 1px solid var(--v2-line-2);
+  cursor: pointer; transition: all .15s ease; white-space: nowrap;
+}
+.v2 .v2-chip:hover { border-color: var(--v2-ink-3); }
+.v2 .v2-chip[data-active="true"] { background: var(--v2-wine-600); border-color: var(--v2-wine-600); color: #fff; }
+
+.v2 .v2-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 9px; border-radius: 999px;
+  font-size: 12px; font-weight: 600; line-height: 1.3;
+}
+.v2 .v2-dot { width: 8px; height: 8px; border-radius: 999px; flex: none; }
+
+/* status helpers — set both text and tint from the same family */
+.v2 .s-ok   { color: var(--v2-ok);  background: var(--v2-ok-bg); }
+.v2 .s-occ  { color: var(--v2-occ); background: var(--v2-occ-bg); }
+.v2 .s-arr  { color: var(--v2-arr); background: var(--v2-arr-bg); }
+.v2 .s-dep  { color: var(--v2-dep); background: var(--v2-dep-bg); }
+.v2 .s-fix  { color: var(--v2-fix); background: var(--v2-fix-bg); }
+.v2 .s-mut  { color: var(--v2-mut); background: var(--v2-mut-bg); }
+.v2 .d-ok   { background: var(--v2-ok); }
+.v2 .d-occ  { background: var(--v2-occ); }
+.v2 .d-arr  { background: var(--v2-arr); }
+.v2 .d-dep  { background: var(--v2-dep); }
+.v2 .d-fix  { background: var(--v2-fix); }
+.v2 .d-mut  { background: var(--v2-mut); }
+
+/* ── Navigation (desktop rail + mobile tab bar) ───────────────────────── */
+.v2 .v2-rail-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 12px; border-radius: var(--v2-radius-sm);
+  color: var(--v2-ink-2); font-weight: 500; font-size: 14px;
+  transition: background .15s ease, color .15s ease; position: relative;
+}
+.v2 .v2-rail-item:hover { background: var(--v2-surface-2); color: var(--v2-ink); }
+.v2 .v2-rail-item[data-active="true"] { background: var(--v2-wine-50); color: var(--v2-wine-700); font-weight: 600; }
+.v2 .v2-rail-item[data-active="true"]::before {
+  content: ""; position: absolute; left: -10px; top: 50%; transform: translateY(-50%);
+  width: 4px; height: 22px; border-radius: 4px; background: var(--v2-wine-600);
+}
+
+.v2 .v2-tab {
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
+  flex: 1; padding: 7px 0 6px; color: var(--v2-ink-3); font-size: 11px; font-weight: 600;
+  transition: color .12s ease; min-height: 56px;
+}
+.v2 .v2-tab[data-active="true"] { color: var(--v2-wine-600); }
+.v2 .v2-tab[data-active="true"] .v2-tab-ico {
+  background: var(--v2-wine-50); color: var(--v2-wine-600);
+}
+.v2 .v2-tab-ico {
+  display: flex; align-items: center; justify-content: center;
+  width: 40px; height: 26px; border-radius: 999px; transition: all .12s ease;
+}
+
+/* ── Occupancy gauge (signature element) ──────────────────────────────── */
+.v2 .v2-gauge {
+  --pct: 0;
+  width: 152px; height: 152px; border-radius: 999px; flex: none;
+  background:
+    radial-gradient(closest-side, var(--v2-surface) 70%, transparent 71% 100%),
+    conic-gradient(
+      var(--v2-wine-600) 0,
+      var(--v2-wine-500) calc(var(--pct) * 0.7%),
+      var(--v2-brass) calc(var(--pct) * 1%),
+      var(--v2-line) calc(var(--pct) * 1%) 100%
+    );
+  display: grid; place-items: center; position: relative;
+  box-shadow: inset 0 0 0 1px var(--v2-line);
+}
+
+/* ── Day-flow connector (Arrivals → In-house → Departures) ────────────── */
+.v2 .v2-flow-line { width: 2px; background: var(--v2-line-2); flex: none; }
+
+/* ── Command palette ──────────────────────────────────────────────────── */
+.v2-cmdk-backdrop {
+  position: fixed; inset: 0; z-index: 80;
+  background: rgba(36, 31, 29, 0.38);
+  backdrop-filter: blur(2px);
+  display: flex; align-items: flex-start; justify-content: center;
+  padding: 12vh 16px 16px;
+}
+.v2-cmdk {
+  width: 100%; max-width: 600px;
+  background: var(--v2-surface); border: 1px solid var(--v2-line);
+  border-radius: var(--v2-radius); box-shadow: var(--v2-shadow-lg);
+  overflow: hidden;
+}
+.v2-cmdk-row {
+  display: flex; align-items: center; gap: 12px; padding: 11px 16px; cursor: pointer;
+  color: var(--v2-ink); font-size: 14px;
+}
+.v2-cmdk-row[data-active="true"] { background: var(--v2-wine-50); }
+.v2-cmdk-row[data-active="true"] .v2-cmdk-ico { color: var(--v2-wine-600); }
+.v2-cmdk-ico { color: var(--v2-ink-3); display: flex; }
+
+/* ── Bottom sheet / side panel for room actions ───────────────────────── */
+.v2-sheet-backdrop {
+  position: fixed; inset: 0; z-index: 70; background: rgba(36, 31, 29, 0.4);
+  display: flex; animation: v2-fade .18s ease;
+}
+
+/* ── scrollbar ────────────────────────────────────────────────────────── */
+.v2 ::-webkit-scrollbar { width: 9px; height: 9px; }
+.v2 ::-webkit-scrollbar-thumb { background: var(--v2-line-2); border-radius: 999px; border: 2px solid var(--v2-bg); }
+.v2 ::-webkit-scrollbar-thumb:hover { background: var(--v2-ink-3); }
+
+/* ── focus visibility (quality floor) ─────────────────────────────────── */
+.v2 :focus-visible { outline: 2px solid var(--v2-wine-500); outline-offset: 2px; border-radius: 4px; }
+
+/* ── motion ───────────────────────────────────────────────────────────── */
+@keyframes v2-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes v2-up { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes v2-sheet-up { from { transform: translateY(100%); } to { transform: translateY(0); } }
+@keyframes v2-panel-in { from { transform: translateX(24px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+@keyframes v2-pulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: .45; transform: scale(.82); } }
+
+.v2 .v2-rise { animation: v2-up .4s cubic-bezier(.2,.7,.3,1) both; }
+.v2 .v2-rise-1 { animation-delay: .04s; }
+.v2 .v2-rise-2 { animation-delay: .09s; }
+.v2 .v2-rise-3 { animation-delay: .14s; }
+.v2 .v2-rise-4 { animation-delay: .19s; }
+.v2 .v2-live-dot { animation: v2-pulse 2s ease-in-out infinite; }
+.v2-sheet-up { animation: v2-sheet-up .26s cubic-bezier(.2,.8,.2,1); }
+.v2-panel-in { animation: v2-panel-in .24s cubic-bezier(.2,.8,.2,1); }
+
+@media (prefers-reduced-motion: reduce) {
+  .v2 *, .v2-sheet-up, .v2-panel-in { animation: none !important; transition: none !important; }
+}

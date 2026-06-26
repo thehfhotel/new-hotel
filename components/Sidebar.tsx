@@ -195,6 +195,21 @@ export default function Sidebar() {
         )}
       </div>
 
+      {/* Entry point into the new "/v2" front-desk experience. Additive: the
+          classic UI stays the default; this is an opt-in doorway. */}
+      <div className="px-2 py-1.5 border-b border-border shrink-0">
+        <Link
+          href="/v2"
+          title="ดีไซน์ใหม่ (Front Desk)"
+          className={`flex items-center gap-2 px-2 py-1.5 text-[12.5px] font-semibold text-brand-700 bg-brand-50 border border-brand-100 hover:bg-brand-100 transition-colors ${
+            collapsed ? 'justify-center' : ''
+          }`}
+        >
+          <Sparkles size={16} className="shrink-0" />
+          {!collapsed && <span>ดีไซน์ใหม่ (Front Desk)</span>}
+        </Link>
+      </div>
+
       {/* Navigation. Admin-only items are filtered out unless the
           current user has the admin role — see PR4. When the user is
           null (not logged in OR auth disabled) admin items stay
