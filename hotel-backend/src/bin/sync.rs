@@ -2373,6 +2373,17 @@ async fn run_one_tick(
             }
         }
     }
+
+    // Round-bill (cashier-session) sync — read-only poll of the legacy
+    // `HT_Round_Bill` ledger into canonical `ht_shifts`. This is
+    // deliberately OUTSIDE the CT-mapper loop: `HT_Round_Bill` has no
+    // Change Tracking (and adding it would be legacy DDL we don't own —
+    // see CLAUDE.md), so it can't ride the watermark path. It runs LAST
+    // because the CT mappers are the load-bearing sync; a round-bill
+    // failure must never abort the tick (`sync_round_bills` logs at WARN
+    // and returns instead of propagating). Shadow mode skips the
+    // canonical write, mirroring the CT mappers.
+    sync_round_bills(pg, mssql, shadow_mode, site_id).await;
 }
 
 /// Poll one table for CT changes since `last_seen`. Per the lifecycle:
@@ -3260,6 +3271,204 @@ fn read_cell(
         return Some(MockValue::DateTime(d));
     }
     None
+}
+
+/// Convert a legacy MSSQL `datetime` — Bangkok wall-clock stored
+/// without timezone info — to a true UTC instant for the canonical
+/// `TIMESTAMPTZ` columns on `ht_shifts`.
+///
+/// Mirrors `sync::mappers::checkin::naive_dt_to_utc` and
+/// `booking::naive_date_to_utc` (the 2026-06-11 audit-P2 convention):
+/// canonical timestamptz columns hold the real instant, so Bangkok
+/// 08:00 is stored as 01:00 UTC. `+07:00` is a fixed offset (no DST),
+/// so `single()` always yields exactly one instant. Keeping the same
+/// convention as the CT mappers means `/api/shifts/current` lines up
+/// with the rest of the canonical timeline (and with native shifts
+/// opened via `ShiftService`, which stamps `NOW()` on a timestamptz
+/// column).
+fn naive_thai_to_utc(dt: chrono::NaiveDateTime) -> chrono::DateTime<chrono::Utc> {
+    use chrono::TimeZone;
+    let bangkok = chrono::FixedOffset::east_opt(7 * 3600).expect("+07:00 is a valid offset");
+    bangkok
+        .from_local_datetime(&dt)
+        .single()
+        .expect("fixed offsets have no DST gaps/folds")
+        .with_timezone(&chrono::Utc)
+}
+
+/// Read-only sync of the legacy cashier-session ledger
+/// (`HT_Round_Bill`) into the canonical `ht_shifts` table.
+///
+/// **Why**: co-existence (ADR 0002) means a receptionist may open or
+/// close the cashier round in EITHER iHOTEL or our app. iHOTEL records
+/// the round in `HT_Round_Bill`; our checkout/payment gate consults
+/// canonical `ht_shifts`. Without this poll, a round opened in iHOTEL
+/// would be invisible to our app, so our gate would wrongly report "no
+/// open shift". This makes iHOTEL the source of truth that our
+/// canonical state follows (read-only), so both apps agree on "is a
+/// round open?".
+///
+/// **Shape**: every tick we SELECT the currently-open row
+/// (`round_end IS NULL`) plus any row touched in the last 2 days, and
+/// UPSERT each into `ht_shifts` keyed on `(shift_site_id, shift_no)`
+/// where `shift_no` = the legacy app-allocated `id`. The 2-day window
+/// keeps a just-closed round converging (its `round_end` lands on a
+/// later tick) without scanning the full history every second.
+///
+/// **Ordering**: closed rows are applied before the (at most one) open
+/// row. iHOTEL's invariant is "≤1 row with `round_end IS NULL`", and PG
+/// enforces the same via the partial unique index
+/// `ht_shifts_one_open_per_site`. Applying the prior round's closure
+/// before the new round's open avoids transiently tripping that index.
+///
+/// **Resilience**: a failure here must NEVER abort the tick — every
+/// error path logs at WARN and returns/continues. In shadow mode the
+/// canonical UPSERT is skipped (read-and-log only).
+async fn sync_round_bills(pg: &PgPool, mssql: &DbPool, shadow_mode: bool, site_id: &str) {
+    // Closed rows first (CASE … = 0), the single open row last (= 1), so
+    // a round-rollover tick lands the prior closure before the new open
+    // and never trips the one-open-per-site partial unique index.
+    const ROUND_BILL_SELECT: &str = "SELECT id, round_no, round_price, round_by, round_start, round_end \
+         FROM HT_Round_Bill \
+         WHERE round_end IS NULL OR round_start >= DATEADD(DAY, -2, GETDATE()) \
+         ORDER BY CASE WHEN round_end IS NULL THEN 1 ELSE 0 END, id";
+
+    let mut conn = match mssql.get().await {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::warn!(
+                event_name = "round_bill_sync_conn_fail",
+                site = %site_id,
+                error = %err,
+                "round-bill sync: could not acquire MSSQL connection; skipping"
+            );
+            return;
+        }
+    };
+    let rows = match simple_query_with_timeout_pooled(&mut conn, ROUND_BILL_SELECT, MssqlOpKind::Read)
+        .await
+    {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!(
+                event_name = "round_bill_sync_query_fail",
+                site = %site_id,
+                error = %err,
+                "round-bill sync: SELECT failed; skipping"
+            );
+            return;
+        }
+    };
+    drop(conn); // release the pooled MSSQL connection before PG work
+
+    let mut upserted = 0usize;
+    for row in &rows {
+        let Some(legacy_id) = tiberius::Row::try_get::<i32, _>(row, "id").ok().flatten() else {
+            tracing::warn!(
+                event_name = "round_bill_sync_row_skip",
+                site = %site_id,
+                "round-bill sync: row missing id; skipping"
+            );
+            continue;
+        };
+        let Some(round_start) =
+            tiberius::Row::try_get::<chrono::NaiveDateTime, _>(row, "round_start")
+                .ok()
+                .flatten()
+        else {
+            tracing::warn!(
+                event_name = "round_bill_sync_row_skip",
+                site = %site_id,
+                legacy_id,
+                "round-bill sync: row missing round_start; skipping"
+            );
+            continue;
+        };
+        let round_price = tiberius::Row::try_get::<f64, _>(row, "round_price")
+            .ok()
+            .flatten()
+            .unwrap_or(0.0);
+        let round_by = tiberius::Row::try_get::<&str, _>(row, "round_by")
+            .ok()
+            .flatten()
+            .map(|s| s.to_string());
+        let round_end = tiberius::Row::try_get::<chrono::NaiveDateTime, _>(row, "round_end")
+            .ok()
+            .flatten();
+
+        let opened_at = naive_thai_to_utc(round_start);
+        let closed_at = round_end.map(naive_thai_to_utc);
+        // `round_by` names the cashier; on close iHOTEL overwrites it
+        // with the closing employee. A single-row snapshot can't separate
+        // opener from closer, so we use it for `shift_opened_by` and —
+        // only when the round is closed — `shift_closed_by` too.
+        let opened_by = round_by.clone().unwrap_or_else(|| "ihotel".to_string());
+        let closed_by = if closed_at.is_some() { round_by } else { None };
+
+        if shadow_mode {
+            tracing::info!(
+                event_name = "round_bill_sync_shadow",
+                site = %site_id,
+                legacy_id,
+                open = closed_at.is_none(),
+                "round-bill sync (shadow): would upsert canonical shift"
+            );
+            continue;
+        }
+
+        // Runtime `sqlx::query` (not the compile-time `query!` macro) so
+        // this adds nothing to the `.sqlx/` offline cache. `$3::numeric`
+        // mirrors `ShiftService::open_shift` (binds f64, server casts to
+        // NUMERIC). Conflict target is the `(shift_site_id, shift_no)`
+        // unique constraint — re-running a tick is idempotent.
+        let res = sqlx::query(
+            "INSERT INTO ht_shifts ( \
+                 shift_site_id, shift_no, shift_opening_float, shift_opened_by, \
+                 shift_opened_at, shift_closed_at, shift_closed_by, shift_legacy_round_id \
+             ) VALUES ($1, $2, $3::numeric, $4, $5, $6, $7, $8) \
+             ON CONFLICT (shift_site_id, shift_no) DO UPDATE SET \
+                 shift_opening_float   = EXCLUDED.shift_opening_float, \
+                 shift_opened_by       = EXCLUDED.shift_opened_by, \
+                 shift_opened_at       = EXCLUDED.shift_opened_at, \
+                 shift_closed_at       = EXCLUDED.shift_closed_at, \
+                 shift_closed_by       = EXCLUDED.shift_closed_by, \
+                 shift_legacy_round_id = EXCLUDED.shift_legacy_round_id",
+        )
+        .bind(site_id)
+        .bind(legacy_id)
+        .bind(round_price)
+        .bind(&opened_by)
+        .bind(opened_at)
+        .bind(closed_at)
+        .bind(&closed_by)
+        .bind(legacy_id)
+        .execute(pg)
+        .await;
+
+        match res {
+            Ok(_) => upserted += 1,
+            Err(err) => {
+                // Most likely a partial-index trip during a rollover the
+                // closure hasn't caught up on yet — self-heals next tick.
+                tracing::warn!(
+                    event_name = "round_bill_sync_upsert_fail",
+                    site = %site_id,
+                    legacy_id,
+                    error = %err,
+                    "round-bill sync: UPSERT into ht_shifts failed; continuing"
+                );
+            }
+        }
+    }
+
+    if upserted > 0 {
+        tracing::debug!(
+            event_name = "round_bill_sync_ok",
+            site = %site_id,
+            upserted,
+            "round-bill sync: upserted canonical shifts from HT_Round_Bill"
+        );
+    }
 }
 
 /// Persist a `DomainEvent` into `event_log` inside the caller's TX.

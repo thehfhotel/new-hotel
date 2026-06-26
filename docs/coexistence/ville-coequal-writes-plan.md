@@ -33,3 +33,18 @@ The API backend is one process holding `new_pool` + `Option<ville_pool>`. Each s
 - **R2** conversion completeness (mitigated by CI grep-gate + flag stays off until verified).
 - **R3** writeback prerequisite on hotelville (pre-flip checklist).
 - **R4** `branch=all` writes — resolver rejects with 400; UI never sends it.
+
+---
+
+## Cashier rounds (shifts) — coexistence (2026-06-26)
+
+**Live `HT_Round_Bill` investigation (read-only, via evergreen):** both sites run **active, disciplined rounds** — HF Hotel 4,777 rounds since 2021-12 (3 `round_by`), HF Ville 813 since 2024-12 (1 `round_by`); **~3 rounds/day** (~06:00/12:00/22:00 shift boundaries), durations ~6–10h, and **exactly one open round per site at all times** (`open_now=1` both). So: mimic iHOTEL strictly — **no gate leniency**; one-open-per-site matches `ht_shifts`. `round_no` is unused (NULL) → key on legacy `id`; `round_by` is a shared "Admin" account (coarse attribution).
+
+**Captured write shapes** (`COMPAT_CHEATSHEET.md` §946-956, §3.20-3.21, from `FrmDueBill.cs:1653/1670`):
+- Open: `INSERT HT_Round_Bill (id=get_id [MAX+1], round_start=now, round_price=<float>, round_by=loginName)` (round_end NULL)
+- Close: `UPDATE HT_Round_Bill SET round_end=now, round_by=<emp> WHERE round_end IS NULL`
+- Gate: `SELECT id FROM HT_Round_Bill WHERE round_end IS NULL`; `get_id` collision risk rated **Low** (only one open at a time).
+
+**(1)+(3) — SHIPPED (read-only on iHOTEL):** `bin/sync.rs::sync_round_bills` polls `HT_Round_Bill` (open + last-2-days) and upserts `ht_shifts` per-site (`shift_no = shift_legacy_round_id = legacy id`, Thai→UTC, runtime sqlx so no `.sqlx` churn, closed-before-open ordering, shadow-aware, never aborts the tick). `GET /api/shifts/current` is now branch-aware. iHOTEL is the source of truth; our gate follows. This unblocks our-app checkout/payment at both sites.
+
+**(2) — TODO (writes iHOTEL's live shared table):** writeback recipe for round open/close (shapes above) + mount open/close routes + per-site routing (needs the Ship-B bundle for Ville). **Open design point:** our open must allocate `id` without colliding with iHOTEL's `MAX+1` (mitigated by one-open-at-a-time + check-then-write against the synced open round). Gated + a one-time coordinated round test before enabling.

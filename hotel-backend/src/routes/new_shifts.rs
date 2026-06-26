@@ -18,8 +18,9 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::Row as _;
 
-use super::mode::AppState;
+use super::mode::{AppState, Branch};
 use crate::error::{ApiError, ApiResult};
 use crate::service::{CloseShiftCommand, OpenShiftCommand, Shift, ShiftSummary};
 
@@ -55,6 +56,13 @@ pub struct CloseShiftRequest {
 pub struct ListShiftsQuery {
     /// Cap on rows returned. Clamped to `[1, 200]` by the service.
     pub limit: Option<i64>,
+}
+
+/// `GET /api/new/shifts/current?branch=<hfhotel|hfville|all>` query string.
+#[derive(Debug, Deserialize)]
+pub struct CurrentShiftQuery {
+    /// Which site's open round to read. Defaults to HF Hotel.
+    pub branch: Option<Branch>,
 }
 
 /// 201 body for a successful `open_shift`.
@@ -199,24 +207,69 @@ pub async fn close_shift(
     Ok(Json(CloseShiftResponse::from(summary)))
 }
 
-/// `GET /api/new/shifts/current` — return the currently-open shift.
+/// `GET /api/new/shifts/current?branch=<…>` — return the currently-open shift.
 ///
 /// Returns `404 Not Found` when no shift is open (rather than `200`
 /// with a null body) so the cashier UI can branch on the HTTP status
 /// without parsing the response.
+///
+/// Branch-aware: HF Ville's open round lives in the `hotelville`
+/// canonical pool, HF Hotel's in the primary pool. Site-scoping is
+/// connection-level (each logical DB holds exactly one site's shifts —
+/// see the `canonical_pg_split` design), so the pool selection *is* the
+/// site filter and `WHERE shift_closed_at IS NULL` returns that site's
+/// open round (the `ht_shifts_one_open_per_site` partial unique index
+/// guarantees at most one). Reads run as a runtime `sqlx::query` on the
+/// resolved pool rather than via `shifts_service` (which is hardwired to
+/// the primary pool at startup), so the same handler serves both sites.
 pub async fn current_shift(
     State(state): State<AppState>,
+    Query(query): Query<CurrentShiftQuery>,
 ) -> ApiResult<Json<CurrentShiftResponse>> {
-    let open = state
-        .shifts_service
-        .current_open_shift()
-        .await?
-        .ok_or_else(|| ApiError::NotFound("no open shift for this site".to_string()))?;
+    let pool = match query.branch.unwrap_or_default() {
+        Branch::Hfville => state.ville_pool()?,
+        Branch::Hfhotel | Branch::All => &state.new_pool,
+    };
+
+    let row = sqlx::query(
+        "SELECT shift_id, shift_site_id, shift_no, \
+                shift_opening_float::float8 AS shift_opening_float, \
+                shift_opened_by, shift_opened_at, shift_closed_at, \
+                shift_closed_by, shift_legacy_round_id, shift_notes \
+           FROM ht_shifts \
+          WHERE shift_closed_at IS NULL \
+          ORDER BY shift_opened_at DESC \
+          LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ApiError::Internal(format!("failed to read current shift: {e}")))?
+    .ok_or_else(|| ApiError::NotFound("no open shift for this site".to_string()))?;
+
+    let shift = ShiftDto {
+        shift_id: row.try_get("shift_id").map_err(map_shift_row_err)?,
+        site_id: row.try_get("shift_site_id").map_err(map_shift_row_err)?,
+        shift_no: row.try_get("shift_no").map_err(map_shift_row_err)?,
+        opening_float: row.try_get("shift_opening_float").map_err(map_shift_row_err)?,
+        opened_by: row.try_get("shift_opened_by").map_err(map_shift_row_err)?,
+        opened_at: row.try_get("shift_opened_at").map_err(map_shift_row_err)?,
+        closed_at: row.try_get("shift_closed_at").map_err(map_shift_row_err)?,
+        closed_by: row.try_get("shift_closed_by").map_err(map_shift_row_err)?,
+        legacy_round_id: row.try_get("shift_legacy_round_id").map_err(map_shift_row_err)?,
+        notes: row.try_get("shift_notes").map_err(map_shift_row_err)?,
+    };
 
     Ok(Json(CurrentShiftResponse {
         success: true,
-        shift: ShiftDto::from(open),
+        shift,
     }))
+}
+
+/// Map a column-decode failure on the `ht_shifts` read to a 500. A
+/// decode error here means the schema drifted from `ShiftDto`, not a
+/// client mistake — surface it as an internal error.
+fn map_shift_row_err(e: sqlx::Error) -> ApiError {
+    ApiError::Internal(format!("failed to map shift row: {e}"))
 }
 
 /// `GET /api/new/shifts?limit=N` — most-recent shifts, newest first.
