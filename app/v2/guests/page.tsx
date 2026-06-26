@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Search,
   ChevronLeft,
@@ -57,6 +57,8 @@ export default function V2Guests() {
   const [page, setPage] = useState(1)
   const [totalPages, setTotalPages] = useState(1)
   const [selected, setSelected] = useState<Guest | null>(null)
+  // Latest-wins guard: branch can flip mid-flight (hfhotel default → stored hfville).
+  const reqRef = useRef(0)
 
   useEffect(() => {
     const t = setTimeout(() => {
@@ -67,11 +69,13 @@ export default function V2Guests() {
   }, [search])
 
   const fetchGuests = useCallback(async () => {
+    const token = ++reqRef.current
     setLoading(true)
     try {
       const params = new URLSearchParams({ page: String(page), limit: '20' })
       if (debounced.trim()) params.append('search', debounced.trim())
       const res = await branchFetch(`/api/customers?${params}`)
+      if (token !== reqRef.current) return // superseded by a newer branch fetch
       if (res.ok) {
         const data = await res.json()
         setGuests((data.customers || data.data || []) as Guest[])

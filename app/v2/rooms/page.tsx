@@ -56,10 +56,14 @@ export default function V2Rooms() {
 
   const fetchRef = useRef<() => void>(() => {})
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Latest-wins guard: branch can flip mid-flight (hfhotel default → stored hfville).
+  const reqRef = useRef(0)
 
   const fetchRooms = useCallback(async () => {
+    const token = ++reqRef.current
     try {
       const res = await branchFetch('/api/rooms?limit=300')
+      if (token !== reqRef.current) return // superseded by a newer branch fetch
       if (res.ok) {
         const data = await res.json()
         setRooms((data.data || data || []) as RoomItem[])

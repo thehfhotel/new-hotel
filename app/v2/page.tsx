@@ -71,8 +71,12 @@ export default function V2Today() {
 
   const fetchRef = useRef<() => void>(() => {})
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Monotonic request token: branch can flip (hfhotel default → stored hfville)
+  // mid-flight, so a stale response must not overwrite the latest one.
+  const reqRef = useRef(0)
 
   const fetchData = useCallback(async () => {
+    const token = ++reqRef.current
     try {
       const [statsRes, cinRes, bookRes, shiftRes] = await Promise.all([
         branchFetch('/api/stats'),
@@ -80,6 +84,8 @@ export default function V2Today() {
         branchFetch('/api/bookings?limit=100'),
         branchFetch('/api/shifts/current').catch(() => null),
       ])
+
+      if (token !== reqRef.current) return // superseded by a newer branch fetch
 
       if (statsRes.ok) {
         const d = await statsRes.json()

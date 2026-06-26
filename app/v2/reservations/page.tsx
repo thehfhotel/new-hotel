@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { CalendarPlus, Search, ChevronLeft, ChevronRight, Moon, BedDouble } from 'lucide-react'
 import { useBranch } from '@/contexts/BranchContext'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
@@ -32,14 +32,18 @@ export default function V2Reservations() {
   const [showForm, setShowForm] = useState(false)
   const [mode, setMode] = useState<'create' | 'edit'>('create')
   const [editing, setEditing] = useState<BookingFormState | null>(null)
+  // Latest-wins guard: branch can flip mid-flight (hfhotel default → stored hfville).
+  const reqRef = useRef(0)
 
   const fetchBookings = useCallback(async () => {
+    const token = ++reqRef.current
     setLoading(true)
     try {
       const params = new URLSearchParams({ page: String(page), limit: '20' })
       if (status) params.set('status', status)
       if (search.trim()) params.set('search', search.trim())
       const res = await branchFetch(`/api/bookings?${params.toString()}`)
+      if (token !== reqRef.current) return // superseded by a newer branch fetch
       if (res.ok) {
         const data = await res.json()
         setBookings((data.data || []) as Booking[])
