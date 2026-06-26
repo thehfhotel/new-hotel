@@ -355,10 +355,30 @@ const DEFAULT_INIT_RETRY_ALERT_AFTER_SECS: u64 = 300;
 
 /// Quiet-aware watchdog probe budget. The stall watchdog fires its
 /// `CHANGE_TRACKING_CURRENT_VERSION()` probe inside the alert path, so
-/// the budget MUST stay well below the 60s poll interval — 5s lets a
-/// row-locked legacy fail fast and fall through to the conservative
-/// "fire anyway" branch instead of stretching the watchdog tick.
-const WATCHDOG_CT_PROBE_TIMEOUT_MS: u64 = 5_000;
+/// the budget MUST stay well below the 60s poll interval — but it must
+/// also be generous enough to ride out an overnight-quiescent legacy
+/// (slow WireGuard tunnel re-key, sluggish-but-reachable iHOTEL).
+///
+/// 2026-06-26: raised 5s → 12s. The old 5s was tighter than the main
+/// watcher's own connectivity probe (`SELECT 1` runs on the 10s
+/// `MssqlOpKind::Read` budget), so during slow-but-reachable overnight
+/// windows the watcher stayed healthy while THIS probe timed out, fired
+/// a self-recovering `:information_source:` page, and recovered the next
+/// tick once legacy answered. 12s clears the 10s read budget with a
+/// margin and still leaves ~48s of headroom in the 60s tick. A genuinely
+/// unreachable legacy still fails fast (TCP/handshake errors don't wait
+/// the full budget) and falls through to the conservative "fire anyway"
+/// branch. Override via `LEGACY_SYNC_PROBE_TIMEOUT_MS`.
+const DEFAULT_WATCHDOG_CT_PROBE_TIMEOUT_MS: u64 = 12_000;
+
+/// 2026-06-26 — once a probe-timeout (`:information_source:`) alert has
+/// been open this long WITHOUT self-recovering, it stops being the benign
+/// overnight-quiet pattern and becomes a real "we cannot reach legacy to
+/// confirm whether changes are backing up" signal. Escalate it to a
+/// `:rotating_light:` page (one-time per outage). Default 1h = 2× the
+/// alert cooldown, so a genuine outage escalates within two info-page
+/// cycles. Override via `LEGACY_SYNC_PROBE_OUTAGE_ESCALATION_SECS`.
+const DEFAULT_PROBE_OUTAGE_ESCALATION_SECS: u64 = 3600;
 
 /// Track D / T7 CRIT-3 — watermark-stall watchdog poll interval (60s).
 /// Reads `legacy_ct_state.last_seen_version` + `last_polled_at` once
@@ -385,7 +405,7 @@ const WATCHDOG_ALERT_COOLDOWN_SECS: u64 = 1800;
 /// 2026-05-22 — number of CONSECUTIVE probe failures required before
 /// the watchdog pages the `:information_source:` (probe-timeout,
 /// informational since 2026-06-11) class. A single
-/// 5s `CHANGE_TRACKING_CURRENT_VERSION()` timeout inside the 60s tick
+/// `CHANGE_TRACKING_CURRENT_VERSION()` timeout inside the 60s tick
 /// is dominated by transient iHOTEL lock contention (`TABLOCKX,
 /// HOLDLOCK` on `HT_CheckIn_Ds.get_id` cascades and report runs — see
 /// `docs/legacy-app/COMPAT_CHEATSHEET.md` §4) and self-clears on the
@@ -1291,23 +1311,25 @@ async fn read_change_tracking_current_version(
     Ok(v.unwrap_or(0))
 }
 
-/// Watchdog-only probe of `CHANGE_TRACKING_CURRENT_VERSION()` with a
-/// tight explicit timeout ([`WATCHDOG_CT_PROBE_TIMEOUT_MS`], 5s). Used
-/// solely by [`run_watermark_watchdog`] to gate the stall alert on
-/// whether legacy MSSQL actually has new CT versions to offer. Distinct
-/// from [`read_change_tracking_current_version`] because the watchdog
-/// fires inside a 60s poll loop and cannot afford the default 10s read
-/// budget on a row-locked legacy — failing fast and falling through to
+/// Watchdog-only probe of `CHANGE_TRACKING_CURRENT_VERSION()` with an
+/// explicit `timeout` (default [`DEFAULT_WATCHDOG_CT_PROBE_TIMEOUT_MS`],
+/// 12s; tunable via `LEGACY_SYNC_PROBE_TIMEOUT_MS`). Used solely by
+/// [`run_watermark_watchdog`] to gate the stall alert on whether legacy
+/// MSSQL actually has new CT versions to offer. The budget is passed in
+/// (rather than read from the const directly) so the watchdog resolves
+/// the env override once at startup and both the stall-branch and
+/// recovery-branch probes share it. Failing fast and falling through to
 /// "fire alert" (per [`should_fire_stall_alert`]) is the desired
-/// behaviour.
+/// behaviour on a genuinely unreachable legacy.
 async fn probe_change_tracking_current_version(
     mssql: &DbPool,
+    timeout: Duration,
 ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
     let mut conn = mssql.get().await?;
     let rows = simple_query_with_explicit_timeout(
         &mut conn,
         "SELECT CHANGE_TRACKING_CURRENT_VERSION() AS v",
-        Duration::from_millis(WATCHDOG_CT_PROBE_TIMEOUT_MS),
+        timeout,
     )
     .await?;
     let row = rows.first().ok_or_else(|| {
@@ -1477,8 +1499,12 @@ struct WatermarkObservation {
 ///    the stuck duration is below the threshold → no alert (steady-state
 ///    idle is normal).
 /// 3. If the version is stuck for `>= stall_alert_secs` AND shadow_mode
-///    is FALSE AND `last_polled_at` is recent → ALERT (the watcher is
-///    ticking but not advancing — the canonical CT-watermark-stall trap).
+///    is FALSE → ALERT (the watcher is alive — this watchdog tick is the
+///    liveness proof — but the watermark isn't advancing; the canonical
+///    CT-watermark-stall trap). NOTE: this function does NOT read
+///    `last_polled_at`; only the version and `prior.observed_at` matter.
+///    Whether legacy is genuinely idle vs. wedged is decided downstream
+///    by the CT probe in [`should_fire_stall_alert`].
 /// 4. Shadow mode stalls don't fire from this rule — they're caught by
 ///    [`shadow_mode_pager_eligible`] separately.
 fn watermark_stall_alert_eligible(
@@ -1543,7 +1569,7 @@ fn should_fire_stall_alert(watermark: i64, ct_current_probe: Option<i64>) -> boo
 }
 
 /// Streak gate for the probe-timeout (`:information_source:`) class. When the
-/// watchdog probe fails (`None`), a single observation is noise — a 5s
+/// watchdog probe fails (`None`), a single observation is noise — a
 /// timeout inside a 60s tick is usually transient iHOTEL lock
 /// contention that clears on the next tick. This function suppresses
 /// the page until N consecutive failures have been observed
@@ -1575,6 +1601,37 @@ fn probe_failure_streak_passes_gate(
     match probe {
         Some(_) => true,
         None => consecutive_failures >= threshold,
+    }
+}
+
+/// Pure decision for the probe-timeout-outage escalation (2026-06-26).
+///
+/// The `:information_source:` probe-timeout page is benign WHEN it
+/// self-recovers within a tick or two (legacy was just briefly slow).
+/// But if the probe keeps timing out and the alert never recovers, the
+/// info class becomes a blind spot: a real legacy outage (or a genuine
+/// backlog we can't see because the probe can't reach legacy) would keep
+/// re-firing `:information_source: …no action needed` forever and never
+/// escalate to `:rotating_light:` — because the critical branch requires
+/// a SUCCESSFUL probe returning `v > watermark`.
+///
+/// This closes that gap: once an info-class alert has been open for
+/// `threshold` without recovering, escalate ONCE (the caller flips
+/// `already_escalated` so we don't spam).
+///
+/// * `info_outage_since` — when the current unrecovered info-outage run
+///   began (set on the first info page, cleared on recovery / probe
+///   success / no-stall).
+/// * `already_escalated` — whether this outage run has already escalated.
+fn probe_outage_escalation_eligible(
+    info_outage_since: Option<Instant>,
+    now: Instant,
+    threshold: Duration,
+    already_escalated: bool,
+) -> bool {
+    match info_outage_since {
+        Some(since) if !already_escalated => now.duration_since(since) >= threshold,
+        _ => false,
     }
 }
 
@@ -1671,6 +1728,32 @@ fn format_stall_alert_message(
              _{dashboard_hint}_"
         ),
     }
+}
+
+/// Slack message for an ESCALATED probe-timeout outage (2026-06-26).
+/// Fired when the benign `:information_source:` info page has stayed open
+/// past [`probe_outage_escalation_eligible`]'s threshold without
+/// recovering — at which point "no action needed" is no longer true: we
+/// have been unable to reach legacy CT for an extended window and cannot
+/// rule out a real backlog.
+fn format_probe_outage_escalation_message(
+    watermark: i64,
+    outage_for: Duration,
+    threshold: Duration,
+) -> String {
+    let outage_mins = outage_for.as_secs() / 60;
+    let threshold_mins = threshold.as_secs() / 60;
+    format!(
+        ":rotating_light: *CT watermark — legacy probe unreachable {outage_mins}min* \
+         :rotating_light:\n\
+         Watermark stuck at v{watermark} and the legacy CT probe has been timing out \
+         for {outage_mins}min (escalation threshold {threshold_mins}min). This is NO \
+         LONGER the benign quiet-period pattern — we cannot confirm whether real \
+         changes are backing up toward the CT retention cliff. Investigate legacy \
+         MSSQL reachability now (WireGuard tunnel, iHOTEL load).\n\
+         _Check `legacy_sync_status.last_error` or the dashboard at \
+         `/api/new/sync/status`._"
+    )
 }
 
 /// Why the recovery message should fire. Carries enough context for
@@ -1871,6 +1954,12 @@ async fn run_watermark_watchdog(
     // Reset on probe success, watermark advance, or any tick that
     // doesn't run a probe (no stall this tick).
     let mut probe_failure_streak: u32 = 0;
+    // 2026-06-26 — probe-timeout-outage escalation state. `since` anchors
+    // the first info page of the current unrecovered outage; `escalated`
+    // makes the escalation one-time per outage. Both clear on recovery,
+    // probe success, or a no-stall tick (same lifecycle as the streak).
+    let mut info_outage_since: Option<Instant> = None;
+    let mut info_outage_escalated: bool = false;
 
     let shadow_mode = env::var("LEGACY_SYNC_SHADOW_MODE")
         .map(|v| v == "true")
@@ -1881,11 +1970,27 @@ async fn run_watermark_watchdog(
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_PROBE_TIMEOUT_STREAK_THRESHOLD);
 
+    let probe_timeout = Duration::from_millis(
+        env::var("LEGACY_SYNC_PROBE_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_WATCHDOG_CT_PROBE_TIMEOUT_MS),
+    );
+
+    let probe_outage_escalation = Duration::from_secs(
+        env::var("LEGACY_SYNC_PROBE_OUTAGE_ESCALATION_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_PROBE_OUTAGE_ESCALATION_SECS),
+    );
+
     tracing::info!(
         site = %site_id,
         stall_alert_secs,
         shadow_mode,
         probe_timeout_streak_threshold,
+        probe_timeout_ms = probe_timeout.as_millis() as u64,
+        probe_outage_escalation_secs = probe_outage_escalation.as_secs(),
         "[watchdog] Watermark-stall watchdog starting"
     );
 
@@ -1917,8 +2022,8 @@ async fn run_watermark_watchdog(
         // alert, decide whether to fire the all-clear THIS iteration.
         // Recovery short-circuits on the cheap "watermark advanced"
         // rule and only spends a probe call on the "still stuck but
-        // legacy might be idle now" path — we don't want to burn a
-        // 5s probe budget on every idle loop iteration.
+        // legacy might be idle now" path — we don't want to burn the
+        // probe budget on every idle loop iteration.
         if let Some((paged_at, paged_version)) = pending_stall_alert {
             let mut recovery_probe: Option<i64> = None;
             // Cheap branch first — if the watermark moved past the
@@ -1929,7 +2034,7 @@ async fn run_watermark_watchdog(
                 // matching us now. Spend one probe to find out. On
                 // failure we DON'T declare recovery (uncertainty
                 // holds the open alert).
-                recovery_probe = match probe_change_tracking_current_version(&mssql).await {
+                recovery_probe = match probe_change_tracking_current_version(&mssql, probe_timeout).await {
                     Ok(v) => Some(v),
                     Err(err) => {
                         tracing::warn!(
@@ -1962,6 +2067,10 @@ async fn run_watermark_watchdog(
                     let _ = s.send_message(&payload).await;
                 }
                 pending_stall_alert = None;
+                // Outage is over — reset the escalation anchor so the
+                // next unrecovered run starts fresh.
+                info_outage_since = None;
+                info_outage_escalated = false;
             }
         }
 
@@ -1977,11 +2086,15 @@ async fn run_watermark_watchdog(
                 // (CT current == watermark, nothing to advance to).
                 // 2026-05-22: probe failures are gated by a consecutive-
                 // failure streak (see `probe_failure_streak_passes_gate`)
-                // — a single 5s timeout is dominated by transient iHOTEL
+                // — a single timeout is dominated by transient iHOTEL
                 // lock contention and self-clears on the next tick.
-                let probe = match probe_change_tracking_current_version(&mssql).await {
+                let probe = match probe_change_tracking_current_version(&mssql, probe_timeout).await {
                     Ok(v) => {
                         probe_failure_streak = 0;
+                        // Probe reachable → any in-flight probe-timeout
+                        // outage is over; clear the escalation anchor.
+                        info_outage_since = None;
+                        info_outage_escalated = false;
                         Some(v)
                     }
                     Err(err) => {
@@ -2015,12 +2128,81 @@ async fn run_watermark_watchdog(
                         threshold = probe_timeout_streak_threshold,
                         "[watchdog] probe timeout — suppressing informational page until streak crosses threshold"
                     );
+                } else if probe.is_none() {
+                    // Probe TIMED OUT — the informational class. Anchor the
+                    // outage on the first info page so a sustained
+                    // probe-unreachable window can escalate (2026-06-26).
+                    if info_outage_since.is_none() {
+                        info_outage_since = Some(now);
+                    }
+                    let stuck_for = now.duration_since(prior_obs.observed_at);
+                    if probe_outage_escalation_eligible(
+                        info_outage_since,
+                        now,
+                        probe_outage_escalation,
+                        info_outage_escalated,
+                    ) {
+                        // Open too long without recovering — this is no
+                        // longer benign. Escalate ONCE, bypassing cooldown.
+                        let outage_for = info_outage_since
+                            .map(|t| now.duration_since(t))
+                            .unwrap_or_default();
+                        tracing::error!(
+                            site = %site_id,
+                            version = observation.last_seen_version,
+                            outage_secs = outage_for.as_secs(),
+                            "[watchdog] probe-timeout outage exceeded escalation threshold — paging operator"
+                        );
+                        if let Some(s) = slack.as_ref() {
+                            let payload = SlackMessage::with_site_text(
+                                &site_id,
+                                format_probe_outage_escalation_message(
+                                    observation.last_seen_version,
+                                    outage_for,
+                                    probe_outage_escalation,
+                                ),
+                            );
+                            let _ = s.send_message(&payload).await;
+                        }
+                        info_outage_escalated = true;
+                        // Record the cooldown anchor as NON-critical so a
+                        // later *confirmed-backlog* critical (probe succeeds,
+                        // v > watermark) can still bypass this cooldown via
+                        // the `is_critical && !was_critical` rule — we don't
+                        // want an escalation to shadow a precise backlog page
+                        // for up to a full cooldown. Subsequent *info* pages
+                        // are still cooldown-suppressed (info vs false → no
+                        // bypass), so this doesn't reintroduce spam.
+                        last_stall_alert = Some((now, false));
+                        pending_stall_alert = Some((now, observation.last_seen_version));
+                    } else if stall_page_passes_cooldown(last_stall_alert, now, cooldown, false) {
+                        tracing::warn!(
+                            site = %site_id,
+                            version = observation.last_seen_version,
+                            reason,
+                            "[watchdog] Watermark idle, probe timed out — informational page"
+                        );
+                        if let Some(s) = slack.as_ref() {
+                            let payload = SlackMessage::with_site_text(
+                                &site_id,
+                                format_stall_alert_message(
+                                    observation.last_seen_version,
+                                    probe,
+                                    stuck_for,
+                                    stall_threshold,
+                                ),
+                            );
+                            let _ = s.send_message(&payload).await;
+                        }
+                        last_stall_alert = Some((now, false));
+                        pending_stall_alert = Some((now, observation.last_seen_version));
+                    }
                 } else {
-                    // Critical = probe SUCCEEDED and disagreed with the
-                    // watermark (the == case was suppressed above).
-                    // Probe timeout (None) is the informational class.
-                    let is_critical = probe.is_some();
-                    if stall_page_passes_cooldown(last_stall_alert, now, cooldown, is_critical) {
+                    // Probe SUCCEEDED and disagreed with the watermark (the
+                    // == case was suppressed above) — confirmed backlog or
+                    // monotonicity violation. The critical class; bypasses
+                    // the cooldown left by a prior informational page.
+                    if stall_page_passes_cooldown(last_stall_alert, now, cooldown, true) {
                         let stuck_for = now.duration_since(prior_obs.observed_at);
                         tracing::error!(
                             site = %site_id,
@@ -2041,11 +2223,9 @@ async fn run_watermark_watchdog(
                             );
                             let _ = s.send_message(&payload).await;
                         }
-                        last_stall_alert = Some((now, is_critical));
+                        last_stall_alert = Some((now, true));
                         // Open-alert state for the recovery notification
-                        // (PR D, 2026-05-19). Always set after a page,
-                        // regardless of severity — recovery applies to
-                        // all three severities equally.
+                        // (PR D, 2026-05-19). Always set after a page.
                         pending_stall_alert =
                             Some((now, observation.last_seen_version));
                     }
@@ -2054,8 +2234,11 @@ async fn run_watermark_watchdog(
                 // No stall this tick — no probe ran, so the streak's
                 // "consecutive failures during the current stall" reading
                 // is no longer meaningful. Reset so the next stall starts
-                // with a fresh observation budget.
+                // with a fresh observation budget. The outage anchor clears
+                // too — a non-stalling tick means the watermark is fine.
                 probe_failure_streak = 0;
+                info_outage_since = None;
+                info_outage_escalated = false;
                 if observation.last_seen_version > prior_obs.last_seen_version {
                     tracing::debug!(
                         site = %site_id,
@@ -4978,6 +5161,103 @@ mod tests {
         assert_eq!(
             DEFAULT_PROBE_TIMEOUT_STREAK_THRESHOLD, 3,
             "default streak threshold should be 3 ticks (~3 min) — matches the 2026-05-22 self-recovery window"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // 2026-06-26 — probe budget widened past the watcher's own read budget
+    // so a slow-but-reachable overnight legacy stops producing
+    // self-recovering false-positive info pages.
+    // -------------------------------------------------------------------
+
+    /// The watchdog probe budget MUST exceed the main watcher's 10s
+    /// `MssqlOpKind::Read` budget — otherwise the watcher rides out a slow
+    /// legacy while THIS probe times out and pages. Also must stay well
+    /// under the 60s poll interval.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn watchdog_probe_budget_exceeds_read_budget_and_fits_tick() {
+        assert_eq!(DEFAULT_WATCHDOG_CT_PROBE_TIMEOUT_MS, 12_000);
+        assert!(
+            DEFAULT_WATCHDOG_CT_PROBE_TIMEOUT_MS > 10_000,
+            "probe budget must exceed the watcher's 10s read budget"
+        );
+        assert!(
+            DEFAULT_WATCHDOG_CT_PROBE_TIMEOUT_MS
+                < WATERMARK_WATCHDOG_POLL_INTERVAL_SECS * 1000,
+            "probe budget must stay under the 60s poll interval"
+        );
+    }
+
+    /// The escalation default is 2× the alert cooldown, so a genuine
+    /// probe-unreachable outage escalates within two info-page cycles.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn probe_outage_escalation_default_is_two_cooldowns() {
+        assert_eq!(DEFAULT_PROBE_OUTAGE_ESCALATION_SECS, 3600);
+        assert_eq!(
+            DEFAULT_PROBE_OUTAGE_ESCALATION_SECS,
+            2 * WATCHDOG_ALERT_COOLDOWN_SECS,
+            "escalation threshold should be 2× the alert cooldown"
+        );
+    }
+
+    /// No open outage → never escalate (the benign path: probe succeeds,
+    /// or no stall at all).
+    #[test]
+    fn probe_outage_escalation_none_when_no_open_outage() {
+        let now = Instant::now();
+        let thr = Duration::from_secs(3600);
+        assert!(!probe_outage_escalation_eligible(None, now, thr, false));
+    }
+
+    /// Open but not yet past the threshold → hold (this is the normal
+    /// self-recovering flap window — info page, recover in 2-3 min).
+    #[test]
+    fn probe_outage_escalation_holds_inside_threshold() {
+        let since = Instant::now();
+        let now = since + Duration::from_secs(600); // 10 min < 1h
+        let thr = Duration::from_secs(3600);
+        assert!(!probe_outage_escalation_eligible(Some(since), now, thr, false));
+    }
+
+    /// Open past the threshold and not yet escalated → escalate.
+    #[test]
+    fn probe_outage_escalation_fires_past_threshold() {
+        let since = Instant::now();
+        let now = since + Duration::from_secs(3600);
+        let thr = Duration::from_secs(3600);
+        assert!(probe_outage_escalation_eligible(Some(since), now, thr, false));
+    }
+
+    /// Already escalated → never escalate again (one-time per outage; the
+    /// caller flips the flag so we don't spam `:rotating_light:`).
+    #[test]
+    fn probe_outage_escalation_is_one_time() {
+        let since = Instant::now();
+        let now = since + Duration::from_secs(7200); // way past threshold
+        let thr = Duration::from_secs(3600);
+        assert!(
+            !probe_outage_escalation_eligible(Some(since), now, thr, true),
+            "an already-escalated outage must not re-escalate"
+        );
+    }
+
+    /// The escalation message must read as a real alert, not the benign
+    /// "no action needed" info note, and must carry the version + duration.
+    #[test]
+    fn probe_outage_escalation_message_is_actionable() {
+        let msg = format_probe_outage_escalation_message(
+            44660,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        assert!(msg.contains("v44660"), "must name the stuck version; got: {msg}");
+        assert!(msg.contains(":rotating_light:"), "must be a critical page; got: {msg}");
+        assert!(msg.contains("60min"), "must state the outage duration; got: {msg}");
+        assert!(
+            !msg.contains("no action needed"),
+            "escalation must NOT reuse the benign info wording; got: {msg}"
         );
     }
 
