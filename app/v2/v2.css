@@ -245,3 +245,46 @@
 @media (prefers-reduced-motion: reduce) {
   .v2 *, .v2-sheet-up, .v2-panel-in { animation: none !important; transition: none !important; }
 }
+
+/* Print — render only the marked report region (`.v2-print`) as a clean A4
+   sheet, hiding all app chrome (nav, sheet backdrop, buttons). The round
+   report (RoundReport) and the /v2/rounds summary both mark their printable
+   area with `.v2-print`; interactive controls inside it carry `.v2-no-print`.
+   Standard print-a-region technique (visibility, not display, to preserve the
+   region's own layout). iHOTEL's "พิมพ์" equivalent. */
+@media print {
+  body * { visibility: hidden !important; }
+  .v2-print, .v2-print * { visibility: visible !important; }
+  .v2-print {
+    position: absolute !important;
+    left: 0 !important;
+    top: 0 !important;
+    width: 100% !important;
+    max-height: none !important;
+    overflow: visible !important;
+    margin: 0 !important;
+    padding: 8mm !important;
+    background: #fff !important;
+    color: #000 !important;
+    box-shadow: none !important;
+  }
+  .v2-no-print { display: none !important; }
+  /* `.v2-print-only` blocks (e.g. the summary's print header) appear only on paper. */
+  .v2-print-only { display: block !important; }
+  /* Flatten the v2 cards/insets to ink-light boxes for the printout. */
+  .v2-print .v2-card,
+  .v2-print .v2-inset {
+    box-shadow: none !important;
+    border: 1px solid #999 !important;
+    background: #fff !important;
+  }
+  /* Unclip the summary's horizontally-scrolled table + shrink it so the wide
+     per-round table fits A4 portrait. */
+  .v2-print .overflow-x-auto { overflow: visible !important; }
+  .v2-print table { font-size: 9.5px !important; }
+  .v2-print th, .v2-print td { padding: 2px 4px !important; }
+  @page { size: A4 portrait; margin: 12mm; }
+}
+
+/* Hidden on screen; shown only when printing (paired with @media print above). */
+.v2-print-only { display: none; }

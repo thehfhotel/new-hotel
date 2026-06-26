@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { X } from 'lucide-react'
+import { Printer, X } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { formatCurrency } from '@/lib/format'
 import { V2Spinner, V2Empty } from './primitives'
@@ -105,7 +105,9 @@ export default function RoundReport({ data }: { data: RoundReportData }) {
   const hasDeposits = deposits.received !== 0 || deposits.returned !== 0
 
   return (
-    <div className="space-y-4">
+    // `v2-print` marks the printable region; the @media print rules in v2.css
+    // render just this as a clean A4 sheet (iHOTEL's "พิมพ์" equivalent).
+    <div className="space-y-4 v2-print">
       {/* Header / window */}
       <div className="v2-inset px-4 py-3 flex items-center gap-3">
         <div className="flex-1 min-w-0">
@@ -119,6 +121,13 @@ export default function RoundReport({ data }: { data: RoundReportData }) {
           <span className={`v2-dot ${data.open ? 'd-ok' : 'd-mut'}`} />
           {data.open ? 'เปิดอยู่' : 'ปิดแล้ว'}
         </span>
+        <button
+          onClick={() => window.print()}
+          className="v2-btn v2-btn-ghost v2-btn-sm v2-no-print"
+          aria-label="พิมพ์รายงาน"
+        >
+          <Printer size={15} /> พิมพ์
+        </button>
       </div>
 
       {/* Income by tender — mirrors iHOTEL View_RBill_H: cash received vs

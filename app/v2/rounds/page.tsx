@@ -1,7 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useState } from 'react'
-import { Users } from 'lucide-react'
+import { Printer, Users } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { formatCurrency } from '@/lib/format'
 import { V2PageHeader, V2Spinner, V2Empty } from '@/components/v2/primitives'
@@ -131,7 +131,21 @@ export default function V2Rounds() {
 
   return (
     <div className="space-y-5">
-      <V2PageHeader eyebrow="รายงาน" title="สรุปรอบบิล" />
+      <V2PageHeader
+        eyebrow="รายงาน"
+        title="สรุปรอบบิล"
+        right={
+          t && t.roundCount > 0 ? (
+            <button
+              onClick={() => window.print()}
+              className="v2-btn v2-btn-ghost v2-btn-sm v2-no-print"
+              aria-label="พิมพ์รายงาน"
+            >
+              <Printer size={15} /> พิมพ์
+            </button>
+          ) : undefined
+        }
+      />
 
       {/* Date range */}
       <div className="flex flex-wrap items-end gap-3">
@@ -165,7 +179,15 @@ export default function V2Rounds() {
       ) : !t || t.roundCount === 0 ? (
         <V2Empty title="ไม่มีรอบบิลที่ปิดแล้วในช่วงนี้" hint="ลองขยายช่วงวันที่" />
       ) : (
-        <>
+        <div className="v2-print space-y-5">
+          {/* Print-only header (the on-screen page header + date pickers
+              don't print; this gives the printout title + range context). */}
+          <div className="v2-print-only" style={{ marginBottom: '10px' }}>
+            <div style={{ fontSize: '15px', fontWeight: 700 }}>สรุปรอบบิล</div>
+            <div style={{ fontSize: '11px', color: '#555' }}>
+              {formatThai(data!.from)} – {formatThai(data!.to)}
+            </div>
+          </div>
           {/* Analytics roll-up */}
           <div className="grid gap-3 grid-cols-2 lg:grid-cols-3">
             <StatCard label="รวมทั้งหมด" value={formatCurrency(t.grandTotal, 0)} sub={`${t.roundCount} รอบ`} accent />
@@ -244,7 +266,7 @@ export default function V2Rounds() {
               </div>
             </div>
           )}
-        </>
+        </div>
       )}
 
       {reportShiftId != null && (
