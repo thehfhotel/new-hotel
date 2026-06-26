@@ -38,6 +38,7 @@ use crate::sync::mapper::MssqlChangeMapper;
 use crate::sync::mappers::checkin::apply_checkin_aggregate;
 use crate::sync::parent_loader::load_checkin_aggregate;
 use crate::sync::resolve;
+use crate::sync::row::test_support::HashMapRow;
 use crate::sync::row::MappableRow;
 use crate::sync::SyncError;
 
@@ -124,7 +125,200 @@ pub async fn apply_payment_aggregate(
     cin_no: &str,
 ) -> Result<Option<DomainEvent>, SyncError> {
     let aggregate = load_checkin_aggregate(mssql, cin_no).await?;
+    // Track J7a — mirror this Cin_No's per-line tender ledger into the
+    // canonical `ht_payment_ledger` for the round-close reconciliation +
+    // shift report. Rides the same MSSQL read `load_checkin_aggregate`
+    // already issued (no extra query). `?` so a mirror failure HOLDS the
+    // watermark (the silent-drop class — sync_silent_drop_class memory):
+    // the whole coalesced apply rolls back and retries next tick rather than
+    // advancing past a half-mirrored payment.
+    mirror_payment_ledger(tx, cin_no, &aggregate.payments).await?;
     apply_checkin_aggregate(tx, Some(mssql), &aggregate, cin_no).await
+}
+
+/// One `HT_CheckIn_Pay` line projected for the canonical mirror. PURE —
+/// extracted from [`mirror_payment_ledger`] so the cell-reading / tender
+/// defaulting is unit-testable without a PG transaction.
+#[derive(Debug, Clone, PartialEq)]
+struct PaymentLine {
+    legacy_id: i32,
+    pay_no: Option<String>,
+    cust_no: Option<String>,
+    ds_label: Option<String>,
+    ds_name: Option<String>,
+    ds_id: Option<String>,
+    ds_num: Option<f64>,
+    cash: f64,
+    credit: f64,
+    free: f64,
+    tran: f64,
+    web: f64,
+    amount: f64,
+    status: String,
+    branch: Option<String>,
+    pay_by: Option<String>,
+    note: Option<String>,
+    pay_date: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Project a materialised `HT_CheckIn_Pay` row into a [`PaymentLine`].
+/// Tenders default to 0 when NULL/missing; `amount` falls back to the
+/// tender sum when `Cin_Pay_Ds_Price` is absent (preserving the legacy
+/// invariant `Ds_Price = cash+credit+free+tran+web`). `Cin_Status` defaults
+/// to `'1'` (active) — the legacy INSERT omits it and relies on that default.
+fn project_payment_line(row: &dyn MappableRow) -> Result<PaymentLine, SyncError> {
+    let legacy_id = row.try_get_i32("id")?.ok_or_else(|| SyncError::Mapper {
+        table: HT_CHECKIN_PAY,
+        message: "ledger mirror: HT_CheckIn_Pay.id is NULL (required PK)".into(),
+    })?;
+    // Review J7a P2: a non-finite legacy tender (NaN/±Inf) must NOT reach the
+    // INSERT. ±Inf would error the NUMERIC cast and POISON the shared batch tx
+    // (wedging the whole payment tick on every retry); NaN is silently stored
+    // by PG `numeric` and then poisons the round-window SUM. A non-finite money
+    // value is garbage, so coerce to 0 and WARN (observable, never silent).
+    let read_tender = |col: &str| -> Result<f64, SyncError> {
+        let v = row.try_get_decimal(col)?.unwrap_or(0.0);
+        if v.is_finite() {
+            Ok(v)
+        } else {
+            tracing::warn!(
+                event_name = "payment_ledger_nonfinite",
+                table = HT_CHECKIN_PAY,
+                legacy_id,
+                column = col,
+                "non-finite tender in HT_CheckIn_Pay — coercing to 0 for ht_payment_ledger"
+            );
+            Ok(0.0)
+        }
+    };
+    let cash = read_tender("Cin_Pay_Cash")?;
+    let credit = read_tender("Cin_Pay_Credit")?;
+    let free = read_tender("Cin_Pay_Free")?;
+    let tran = read_tender("Cin_Pay_Tran")?;
+    let web = read_tender("Cin_Pay_web")?;
+    let amount = match row.try_get_decimal("Cin_Pay_Ds_Price")? {
+        Some(v) if v.is_finite() => v,
+        Some(_) => {
+            tracing::warn!(
+                event_name = "payment_ledger_nonfinite",
+                table = HT_CHECKIN_PAY,
+                legacy_id,
+                column = "Cin_Pay_Ds_Price",
+                "non-finite line total — falling back to the (finite) tender sum"
+            );
+            cash + credit + free + tran + web
+        }
+        None => cash + credit + free + tran + web,
+    };
+    Ok(PaymentLine {
+        legacy_id,
+        pay_no: row.try_get_str("Pay_No")?.map(str::to_string),
+        cust_no: row.try_get_str("Cin_Cust_no")?.map(str::to_string),
+        ds_label: row.try_get_str("Cin_Pay_Ds")?.map(str::to_string),
+        ds_name: row.try_get_str("Cin_Pay_Ds_Name")?.map(str::to_string),
+        ds_id: row.try_get_str("Cin_Pay_Ds_ID")?.map(str::to_string),
+        ds_num: row.try_get_decimal("Cin_Pay_Ds_Num")?,
+        cash,
+        credit,
+        free,
+        tran,
+        web,
+        amount,
+        status: row.try_get_str("Cin_Status")?.unwrap_or("1").to_string(),
+        branch: row.try_get_str("Branch")?.map(str::to_string),
+        pay_by: row.try_get_str("Pay_by")?.map(str::to_string),
+        note: row.try_get_str("Cin_Pay_Note")?.map(str::to_string),
+        pay_date: row.try_get_datetime("Cin_Pay_Date")?.map(naive_thai_to_utc),
+    })
+}
+
+/// Convert a legacy `HT_CheckIn_Pay.Cin_Pay_Date` (Thai-local, tz-naive) to a
+/// true UTC instant for the canonical `TIMESTAMPTZ`. Same `+07:00` convention
+/// as `sync::mappers::checkin::naive_dt_to_utc` and `ht_shifts`, so round-window
+/// comparisons against `shift_opened_at..shift_closed_at` line up.
+fn naive_thai_to_utc(dt: NaiveDateTime) -> chrono::DateTime<chrono::Utc> {
+    use chrono::TimeZone;
+    chrono::FixedOffset::east_opt(7 * 3600)
+        .expect("+07:00 is a valid offset")
+        .from_local_datetime(&dt)
+        .single()
+        .map(|d| d.with_timezone(&chrono::Utc))
+        // FixedOffset never yields an ambiguous/none local time; the fallback
+        // is purely to avoid an unwrap (treat the naive value as UTC).
+        .unwrap_or_else(|| chrono::DateTime::from_naive_utc_and_offset(dt, chrono::Utc))
+}
+
+/// Replace this `Cin_No`'s lines in `ht_payment_ledger` with the current
+/// legacy set. The loader returns the full as-of-now line set for the
+/// `Cin_No`, so a delete-then-insert keeps the mirror exact through line
+/// adds, edits, status flips (`Cin_Status='ยกเลิก'`), AND the rare hard
+/// delete (legacy normally cancels via the status flip, which we carry). The
+/// `ON CONFLICT (ledger_legacy_id)` arm additionally absorbs the theoretical
+/// `Cin_No`-reassignment edge (a row whose old `Cin_No` wasn't in this
+/// delete's scope) without tripping the UNIQUE constraint.
+async fn mirror_payment_ledger(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    cin_no: &str,
+    payments: &[HashMapRow],
+) -> Result<(), SyncError> {
+    let map_err = |what: &str, e: sqlx::Error| SyncError::Mapper {
+        table: HT_CHECKIN_PAY,
+        message: format!("ht_payment_ledger {what}: {e}"),
+    };
+
+    sqlx::query("DELETE FROM ht_payment_ledger WHERE ledger_cin_no = $1")
+        .bind(cin_no)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| map_err("delete", e))?;
+
+    for row in payments {
+        let line = project_payment_line(row)?;
+        sqlx::query(
+            "INSERT INTO ht_payment_ledger ( \
+                 ledger_legacy_id, ledger_pay_no, ledger_cin_no, ledger_cust_no, \
+                 ledger_ds_label, ledger_ds_name, ledger_ds_id, ledger_ds_num, \
+                 ledger_cash, ledger_credit, ledger_free, ledger_tran, ledger_web, \
+                 ledger_amount, ledger_status, ledger_branch, ledger_pay_by, \
+                 ledger_note, ledger_pay_date \
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::numeric,$9::numeric,$10::numeric, \
+                 $11::numeric,$12::numeric,$13::numeric,$14::numeric,$15,$16,$17,$18,$19) \
+             ON CONFLICT (ledger_legacy_id) DO UPDATE SET \
+                 ledger_pay_no = EXCLUDED.ledger_pay_no, ledger_cin_no = EXCLUDED.ledger_cin_no, \
+                 ledger_cust_no = EXCLUDED.ledger_cust_no, ledger_ds_label = EXCLUDED.ledger_ds_label, \
+                 ledger_ds_name = EXCLUDED.ledger_ds_name, ledger_ds_id = EXCLUDED.ledger_ds_id, \
+                 ledger_ds_num = EXCLUDED.ledger_ds_num, ledger_cash = EXCLUDED.ledger_cash, \
+                 ledger_credit = EXCLUDED.ledger_credit, ledger_free = EXCLUDED.ledger_free, \
+                 ledger_tran = EXCLUDED.ledger_tran, ledger_web = EXCLUDED.ledger_web, \
+                 ledger_amount = EXCLUDED.ledger_amount, ledger_status = EXCLUDED.ledger_status, \
+                 ledger_branch = EXCLUDED.ledger_branch, ledger_pay_by = EXCLUDED.ledger_pay_by, \
+                 ledger_note = EXCLUDED.ledger_note, ledger_pay_date = EXCLUDED.ledger_pay_date, \
+                 ledger_synced_at = NOW()",
+        )
+        .bind(line.legacy_id)
+        .bind(&line.pay_no)
+        .bind(cin_no)
+        .bind(&line.cust_no)
+        .bind(&line.ds_label)
+        .bind(&line.ds_name)
+        .bind(&line.ds_id)
+        .bind(line.ds_num)
+        .bind(line.cash)
+        .bind(line.credit)
+        .bind(line.free)
+        .bind(line.tran)
+        .bind(line.web)
+        .bind(line.amount)
+        .bind(&line.status)
+        .bind(&line.branch)
+        .bind(&line.pay_by)
+        .bind(&line.note)
+        .bind(line.pay_date)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| map_err(&format!("upsert id={}", line.legacy_id), e))?;
+    }
+    Ok(())
 }
 
 // =============================================================================
@@ -519,6 +713,97 @@ mod tests {
             .with("id", MockValue::I32(50001))
             .with("Cin_No", MockValue::Null);
         assert!(m.coalesce_key(&row).is_none());
+    }
+
+    // ----- Track J7a — ht_payment_ledger line projection -----------------
+
+    /// A materialised `HT_CheckIn_Pay` row carries EVERY projected column
+    /// (the loader inserts `MockValue::Null` for SQL NULLs, never omits) —
+    /// so tests start from a complete NULL row and override specific cells,
+    /// matching production shape. A *missing* column would (correctly) error.
+    fn pay_line_row(id: i32) -> HashMapRow {
+        let mut r = HashMapRow::new(HT_CHECKIN_PAY).with("id", MockValue::I32(id));
+        for col in [
+            "Cin_No", "Pay_No", "Cin_Cust_no", "Cin_Pay_Ds", "Cin_Pay_Ds_Name",
+            "Cin_Pay_Ds_ID", "Cin_Pay_Ds_Num", "Cin_Pay_Cash", "Cin_Pay_Credit",
+            "Cin_Pay_Free", "Cin_Pay_Tran", "Cin_Pay_web", "Cin_Pay_Ds_Price",
+            "Cin_Status", "Branch", "Pay_by", "Cin_Pay_Note", "Cin_Pay_Date",
+        ] {
+            r = r.with(col, MockValue::Null);
+        }
+        r
+    }
+
+    #[test]
+    fn project_payment_line_defaults_tenders_and_amount_and_status() {
+        // NULL free/web/Ds_Price/Cin_Status: tenders default 0, amount falls
+        // back to the tender sum, status defaults to active '1'.
+        let row = pay_line_row(50123)
+            .with("Cin_No", MockValue::Str("CH26-005228".into()))
+            .with("Pay_No", MockValue::Str("R2606-0042".into()))
+            .with("Cin_Pay_Cash", MockValue::Decimal(500.0))
+            .with("Cin_Pay_Tran", MockValue::Decimal(300.0))
+            .with("Cin_Pay_Credit", MockValue::Decimal(0.0))
+            .with("Cin_Pay_Ds_ID", MockValue::Str("P001".into()))
+            .with("Cin_Pay_Ds_Name", MockValue::Str("ค่าห้อง".into()));
+        let line = project_payment_line(&row).unwrap();
+        assert_eq!(line.legacy_id, 50123);
+        assert_eq!(line.cash, 500.0);
+        assert_eq!(line.tran, 300.0);
+        assert_eq!(line.free, 0.0);
+        assert_eq!(line.web, 0.0);
+        assert_eq!(line.amount, 800.0, "amount = tender sum when Ds_Price NULL");
+        assert_eq!(line.status, "1", "Cin_Status defaults to active '1'");
+        assert_eq!(line.ds_id.as_deref(), Some("P001"));
+        assert_eq!(line.pay_no.as_deref(), Some("R2606-0042"));
+    }
+
+    #[test]
+    fn project_payment_line_honours_explicit_ds_price_and_cancel_status() {
+        let row = pay_line_row(7)
+            .with("Cin_Pay_Cash", MockValue::Decimal(100.0))
+            .with("Cin_Pay_Ds_Price", MockValue::Decimal(100.0))
+            .with("Cin_Status", MockValue::Str("ยกเลิก".into()));
+        let line = project_payment_line(&row).unwrap();
+        assert_eq!(line.amount, 100.0);
+        assert_eq!(line.status, "ยกเลิก", "cancelled lines carry the cancel marker");
+    }
+
+    #[test]
+    fn project_payment_line_carries_negative_refund_tenders() {
+        // Refunds use tender negation (COMPAT_CHEATSHEET line 513).
+        let row = pay_line_row(9)
+            .with("Cin_Pay_Cash", MockValue::Decimal(-450.0))
+            .with("Cin_Pay_Ds_Price", MockValue::Decimal(-450.0));
+        let line = project_payment_line(&row).unwrap();
+        assert_eq!(line.cash, -450.0);
+        assert_eq!(line.amount, -450.0);
+    }
+
+    #[test]
+    fn project_payment_line_errors_on_null_id() {
+        let row = pay_line_row(0).with("id", MockValue::Null);
+        let err = project_payment_line(&row).expect_err("NULL id must error (required PK)");
+        assert!(err.to_string().contains("id"));
+    }
+
+    /// Review J7a P2: a non-finite tender (NaN/±Inf) is coerced to 0 (never
+    /// reaches the NUMERIC INSERT to poison the tx / the round SUM). The line
+    /// still projects — it is NOT dropped or errored (no wedge).
+    #[test]
+    fn project_payment_line_coerces_nonfinite_tenders_to_zero() {
+        let row = pay_line_row(11)
+            .with("Cin_Pay_Cash", MockValue::Decimal(f64::NAN))
+            .with("Cin_Pay_Tran", MockValue::Decimal(f64::INFINITY))
+            .with("Cin_Pay_Credit", MockValue::Decimal(250.0))
+            // Non-finite line total falls back to the finite tender sum.
+            .with("Cin_Pay_Ds_Price", MockValue::Decimal(f64::NAN));
+        let line = project_payment_line(&row).expect("non-finite must not error");
+        assert_eq!(line.cash, 0.0, "NaN cash coerced to 0");
+        assert_eq!(line.tran, 0.0, "Inf transfer coerced to 0");
+        assert_eq!(line.credit, 250.0);
+        assert!(line.amount.is_finite(), "amount must be finite");
+        assert_eq!(line.amount, 250.0, "amount = finite tender sum");
     }
 
     #[test]

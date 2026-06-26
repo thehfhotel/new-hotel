@@ -12,7 +12,7 @@
 //! locks the cash drawer to subsequent payment attempts.
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
@@ -288,5 +288,178 @@ pub async fn list_shifts(
     Ok(Json(ListShiftsResponse {
         success: true,
         data,
+    }))
+}
+
+// =============================================================================
+// Track J7b — round report (income by tender + sales-by-category).
+//
+// Computed from canonical `ht_payment_ledger` (the per-line mirror of legacy
+// `HT_CheckIn_Pay`, populated by the sync worker's PaymentMapper) over the
+// round's window. Mirrors the NUMBERS in iHOTEL's `ReportShipCash` /
+// `ReportIncome2` (tender split + sales summary) in a clean layout — the
+// ledger holds BOTH apps' payments, so the totals match what iHOTEL reports.
+// =============================================================================
+
+/// `GET /api/shifts/{shift_id}/report?branch=<…>` query string.
+#[derive(Debug, Deserialize)]
+pub struct RoundReportQuery {
+    pub branch: Option<Branch>,
+}
+
+/// Income split by payment tender over the round window. Amounts in baht;
+/// refunds net via negative tenders (legacy negation convention). `total` is
+/// `SUM(ledger_amount)` = `cash+credit+free+transfer+web` (the legacy
+/// per-line invariant) so it reconciles against the tender sum.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TenderBreakdown {
+    pub cash: f64,
+    pub credit: f64,
+    pub transfer: f64,
+    pub free: f64,
+    pub web: f64,
+    pub total: f64,
+    /// Active ledger lines counted in the window.
+    pub line_count: i64,
+    /// Distinct `Pay_no` values (≈ number of payment receipts) in the window.
+    pub payment_count: i64,
+}
+
+/// One sales-summary row — `room` (legacy `Cin_Pay_Ds_ID='P001'`) vs `product`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SalesCategory {
+    pub category: String,
+    pub amount: f64,
+    pub lines: i64,
+}
+
+/// `200` body for the round report.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoundReportResponse {
+    pub success: bool,
+    pub shift: ShiftDto,
+    /// Window actually summed: `[opened_at, closed_at or now)`.
+    pub window_from: DateTime<Utc>,
+    pub window_to: DateTime<Utc>,
+    /// True when the round is still open (upper bound = `now()`, a live preview).
+    pub open: bool,
+    pub income: TenderBreakdown,
+    pub sales: Vec<SalesCategory>,
+}
+
+/// `GET /api/shifts/{shift_id}/report` — income-by-tender + sales summary for
+/// a round, computed from canonical `ht_payment_ledger` over the shift's
+/// window. Works for an open round (preview to `now()`) or a closed one.
+/// Branch-aware (per-site pool), same as [`current_shift`].
+pub async fn round_report(
+    State(state): State<AppState>,
+    Path(shift_id): Path<i64>,
+    Query(query): Query<RoundReportQuery>,
+) -> ApiResult<Json<RoundReportResponse>> {
+    let pool = match query.branch.unwrap_or_default() {
+        Branch::Hfville => state.ville_pool()?,
+        Branch::Hfhotel | Branch::All => &state.new_pool,
+    };
+
+    let row = sqlx::query(
+        "SELECT shift_id, shift_site_id, shift_no, \
+                shift_opening_float::float8 AS shift_opening_float, \
+                shift_opened_by, shift_opened_at, shift_closed_at, \
+                shift_closed_by, shift_legacy_round_id, shift_notes \
+           FROM ht_shifts WHERE shift_id = $1",
+    )
+    .bind(shift_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ApiError::Internal(format!("failed to read shift: {e}")))?
+    .ok_or_else(|| ApiError::NotFound(format!("shift {shift_id} not found")))?;
+
+    let shift = ShiftDto {
+        shift_id: row.try_get("shift_id").map_err(map_shift_row_err)?,
+        site_id: row.try_get("shift_site_id").map_err(map_shift_row_err)?,
+        shift_no: row.try_get("shift_no").map_err(map_shift_row_err)?,
+        opening_float: row.try_get("shift_opening_float").map_err(map_shift_row_err)?,
+        opened_by: row.try_get("shift_opened_by").map_err(map_shift_row_err)?,
+        opened_at: row.try_get("shift_opened_at").map_err(map_shift_row_err)?,
+        closed_at: row.try_get("shift_closed_at").map_err(map_shift_row_err)?,
+        closed_by: row.try_get("shift_closed_by").map_err(map_shift_row_err)?,
+        legacy_round_id: row.try_get("shift_legacy_round_id").map_err(map_shift_row_err)?,
+        notes: row.try_get("shift_notes").map_err(map_shift_row_err)?,
+    };
+
+    let window_from = shift.opened_at;
+    let open = shift.closed_at.is_none();
+    let window_to = shift.closed_at.unwrap_or_else(Utc::now);
+
+    // Income by tender. `ledger_pay_date` and the window bounds are all
+    // TIMESTAMPTZ (UTC) — the ledger mapper converts the legacy Thai-naive
+    // Cin_Pay_Date the same way ht_shifts converts round_start/end, so the
+    // comparison is apples-to-apples. Active lines only ('1'); cancelled
+    // ('ยกเลิก') excluded — matching iHOTEL's shift report.
+    let inc = sqlx::query(
+        "SELECT COALESCE(SUM(ledger_cash),0)::float8   AS cash, \
+                COALESCE(SUM(ledger_credit),0)::float8 AS credit, \
+                COALESCE(SUM(ledger_tran),0)::float8   AS transfer, \
+                COALESCE(SUM(ledger_free),0)::float8   AS free, \
+                COALESCE(SUM(ledger_web),0)::float8    AS web, \
+                COALESCE(SUM(ledger_amount),0)::float8 AS total, \
+                COUNT(*)::bigint                       AS line_count, \
+                COUNT(DISTINCT ledger_pay_no)::bigint  AS payment_count \
+           FROM ht_payment_ledger \
+          WHERE ledger_status = '1' \
+            AND ledger_pay_date >= $1 AND ledger_pay_date < $2",
+    )
+    .bind(window_from)
+    .bind(window_to)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::Internal(format!("failed to sum round income: {e}")))?;
+
+    let income = TenderBreakdown {
+        cash: inc.try_get("cash").map_err(map_shift_row_err)?,
+        credit: inc.try_get("credit").map_err(map_shift_row_err)?,
+        transfer: inc.try_get("transfer").map_err(map_shift_row_err)?,
+        free: inc.try_get("free").map_err(map_shift_row_err)?,
+        web: inc.try_get("web").map_err(map_shift_row_err)?,
+        total: inc.try_get("total").map_err(map_shift_row_err)?,
+        line_count: inc.try_get("line_count").map_err(map_shift_row_err)?,
+        payment_count: inc.try_get("payment_count").map_err(map_shift_row_err)?,
+    };
+
+    let sales_rows = sqlx::query(
+        "SELECT CASE WHEN ledger_ds_id = 'P001' THEN 'room' ELSE 'product' END AS category, \
+                COALESCE(SUM(ledger_amount),0)::float8 AS amount, \
+                COUNT(*)::bigint AS lines \
+           FROM ht_payment_ledger \
+          WHERE ledger_status = '1' \
+            AND ledger_pay_date >= $1 AND ledger_pay_date < $2 \
+          GROUP BY 1 ORDER BY 1",
+    )
+    .bind(window_from)
+    .bind(window_to)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::Internal(format!("failed to summarise round sales: {e}")))?;
+
+    let mut sales = Vec::with_capacity(sales_rows.len());
+    for r in sales_rows {
+        sales.push(SalesCategory {
+            category: r.try_get("category").map_err(map_shift_row_err)?,
+            amount: r.try_get("amount").map_err(map_shift_row_err)?,
+            lines: r.try_get("lines").map_err(map_shift_row_err)?,
+        });
+    }
+
+    Ok(Json(RoundReportResponse {
+        success: true,
+        shift,
+        window_from,
+        window_to,
+        open,
+        income,
+        sales,
     }))
 }

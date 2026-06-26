@@ -2080,6 +2080,45 @@ INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('056', '056_legacy_mirror_ht_book_pro.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
+-- Migration 057 — Track J7a. Canonical per-line mirror of legacy
+-- `HT_CheckIn_Pay` (all tender splits + category + status) so the
+-- round-close income-by-tender reconciliation + the iHOTEL-equivalent
+-- shift report compute from canonical PG. Populated by the sync worker's
+-- PaymentMapper coalesced path. Per-site (connection-level scoping, like
+-- ht_shifts). See migrations/pg/057_create_ht_payment_ledger.sql.
+CREATE TABLE IF NOT EXISTS ht_payment_ledger (
+    ledger_id        BIGSERIAL PRIMARY KEY,
+    ledger_legacy_id INTEGER     NOT NULL,
+    ledger_pay_no    VARCHAR(50),
+    ledger_cin_no    VARCHAR(50),
+    ledger_cust_no   VARCHAR(50),
+    ledger_ds_label  VARCHAR(500),
+    ledger_ds_name   VARCHAR(500),
+    ledger_ds_id     VARCHAR(50),
+    ledger_ds_num    NUMERIC(12,2),
+    ledger_cash      NUMERIC(14,2) NOT NULL DEFAULT 0,
+    ledger_credit    NUMERIC(14,2) NOT NULL DEFAULT 0,
+    ledger_free      NUMERIC(14,2) NOT NULL DEFAULT 0,
+    ledger_tran      NUMERIC(14,2) NOT NULL DEFAULT 0,
+    ledger_web       NUMERIC(14,2) NOT NULL DEFAULT 0,
+    ledger_amount    NUMERIC(14,2) NOT NULL DEFAULT 0,
+    ledger_status    VARCHAR(50)   NOT NULL DEFAULT '1',
+    ledger_branch    VARCHAR(50),
+    ledger_pay_by    VARCHAR(100),
+    ledger_note      VARCHAR(500),
+    ledger_pay_date  TIMESTAMPTZ,
+    ledger_synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ht_payment_ledger_legacy_id_key UNIQUE (ledger_legacy_id)
+);
+CREATE INDEX IF NOT EXISTS ix_ht_payment_ledger_pay_date
+    ON ht_payment_ledger (ledger_pay_date);
+CREATE INDEX IF NOT EXISTS ix_ht_payment_ledger_cin_no
+    ON ht_payment_ledger (ledger_cin_no);
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('057', '057_create_ht_payment_ledger.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
 -- =============================================================================
 -- Initialization complete
 -- =============================================================================

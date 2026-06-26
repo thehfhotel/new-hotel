@@ -277,6 +277,21 @@ const CHECKIN_PAY_PROJECTION: &[&str] = &[
     "Cin_Pay_web",
     "Pay_No",
     "Cin_Status",
+    // Track J7a — line-detail columns for the canonical `ht_payment_ledger`
+    // mirror (income-by-tender reconciliation + iHOTEL-equivalent shift
+    // report). All exist on the legacy `HT_CheckIn_Pay` schema
+    // (COMPAT_CHEATSHEET §`HT_CheckIn_Pay` lines 485-497). Pulled on the same
+    // read `apply_payment_aggregate` already issues — no extra query. The
+    // check-in aggregate sweep ignores them; only the ledger mirror reads them.
+    "Cin_Pay_Ds_Price", // line total (= sum of the 5 tenders)
+    "Cin_Pay_Ds_ID",    // category code (P001 = room-rent line)
+    "Cin_Pay_Ds_Name",  // human description (ค่าห้อง, น้ำดื่ม, …)
+    "Cin_Pay_Ds",       // short label (often room no)
+    "Cin_Pay_Ds_Num",   // qty / nights
+    "Cin_Cust_no",
+    "Branch",
+    "Pay_by",
+    "Cin_Pay_Note",
 ];
 
 /// Pull `HT_CheckIn_H` + all `HT_CheckIn_Ds` rows + all `HT_CheckIn_Pay`

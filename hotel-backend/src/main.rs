@@ -523,6 +523,9 @@ fn build_new_routes(app_state: AppState) -> Router {
         // until HF Ville gets its own write bundle (Ship B).
         .route("/api/shifts/open", post(routes::new_shifts::open_shift))
         .route("/api/shifts/close", post(routes::new_shifts::close_shift))
+        // Track J7b — round reconciliation report (income by tender + sales
+        // summary) from canonical ht_payment_ledger. Read-only; branch-aware.
+        .route("/api/shifts/{shift_id}/report", get(routes::new_shifts::round_report))
         // Inventory Management
         .route("/api/inventory/items", get(routes::new_inventory::list_items).post(routes::new_inventory::create_item))
         .route("/api/inventory/items/{id}", get(routes::new_inventory::get_item).put(routes::new_inventory::update_item).delete(routes::new_inventory::delete_item))
