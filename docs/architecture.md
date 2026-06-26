@@ -693,6 +693,8 @@ loop {
 
 CT polling is **incremental** — we only pull rows changed since `@last_version`. Even on a busy day (~100 receptionist actions/hour), this is a few hundred rows/day total, queried once per second. Legacy DB load is negligible.
 
+**Not every legacy entity is detected via CT — one is polled.** `HT_Round_Bill` (the cashier "รอบบิล" round ledger: one open round per site at a time, ~3/day) is **not** Change-Tracking-enabled and is **not** in `CT_ENABLED_TABLES`. A separate plain `SELECT` poll inside `bin/sync.rs` (`sync_round_bills`, run once per tick **outside** the CT-mapper loop, no legacy schema change) mirrors it into canonical `public.ht_shifts`, upserting on `(shift_site_id, shift_no)` with `shift_no = HT_Round_Bill.id`; `GET /api/shifts/current` reads it per-site. **Live since 2026-06-26.** The inverse — our app co-equally opening/closing a round — ships **dark** behind `ROUND_WRITEBACK_ENABLED` (default off, zero legacy writes): `WritebackIntent::OpenRound`/`CloseRound` → `writeback/recipes/round_bill.rs` emit the exact `FrmDueBill` INSERT/UPDATE (Bangkok-naive datetimes), with the `HT_Round_Bill.id` PRIMARY KEY as the collision backstop against iHOTEL's app-side `MAX(id)+1`. Not yet enabled anywhere; see `docs/coexistence/ville-coequal-writes-plan.md`.
+
 ### 3.6e. Subscription path (real-time UI)
 
 Browsers subscribe via Server-Sent Events (SSE):

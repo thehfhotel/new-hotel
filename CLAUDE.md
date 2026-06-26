@@ -248,6 +248,17 @@ When adding a CT-enabled table:
 This closed the 2026-06-24 incident where a binary shipped ahead of its
 `023_book_pro_ct.sql` prerequisite. See `migrations/legacy-mssql/README.md`.
 
+**Not all legacy sync rides Change Tracking.** Low-volume ledgers can instead be
+mirrored by a plain per-tick read-only poll. `HT_Round_Bill` (iHOTEL cashier
+rounds / รอบบิล → canonical `public.ht_shifts`) is the first such case:
+`sync.rs::sync_round_bills` SELECTs it each tick and runs outside the CT-mapper
+loop — it is **deliberately NOT in `CT_ENABLED_TABLES`** (no PK/CT prerequisite
+DDL on the legacy table, so nothing in `migrations/legacy-mssql/`). Co-equal
+open/close write-back to `HT_Round_Bill` is **shipped dark** behind
+`ROUND_WRITEBACK_ENABLED` (default off — zero legacy writes pending a
+reception-coordinated live test); recipe in `writeback/recipes/round_bill.rs`,
+design in `docs/coexistence/ville-coequal-writes-plan.md`.
+
 ### Vocabulary note: "drift" vs. "sync lag"
 
 The table `ht_reconcile_log` reads as a divergence ledger, but the actual semantic is a **sync-lag observation queue**. Rows are snapshots of moments when the diff-only sweep noticed two hashes had not yet converged; the auto-resolve sweep at every reconcile tick re-hashes both sides and closes converged rows. The CT watcher and writeback worker do the real reconciliation; the sweep is just an auditor that notices when those engines are temporarily behind.

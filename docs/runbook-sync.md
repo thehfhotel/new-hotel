@@ -3,6 +3,13 @@
 Operator-facing reference for `bin/sync` (the Change Tracking watcher).
 Companion to `docs/architecture.md` §3.6d, §3.7, §11.
 
+This binary also runs one **non-CT** job: a read-only per-tick *poll* of
+the legacy `HT_Round_Bill` cashier-round ledger into canonical
+`ht_shifts` (shipped 2026-06-26). Because it is a plain poll and not
+Change Tracking, it has no watermark and never appears in
+`legacy_sync_status` / `legacy_ct_state` — don't triage it via the CT
+observability below. See Section 10.
+
 This runbook assumes the reader is the on-call operator for HF Hotel.
 Receptionist test plan (Section 7) can be handed to the receptionist
 team verbatim once the operator is ready to verify.
@@ -593,5 +600,59 @@ control-flow critical to the diff-only path but observability still
 depends on them. Do not delete without first updating any dashboards
 that read `sync_status`. The doc-comments in those functions carry
 this contract.
+
+---
+
+## 10. Round-bill poll (cashier sessions, non-CT)
+
+Shipped 2026-06-26. The `sync` binary polls the legacy `HT_Round_Bill`
+cashier-round ledger into canonical `ht_shifts` so a round opened or
+closed in iHOTEL is visible to our app's checkout/payment gate.
+Coexistence (ADR 0002) means a receptionist may open/close the round in
+EITHER app, so canonical state has to follow iHOTEL.
+
+**Not Change Tracking.** This is a plain per-tick `SELECT`
+(`sync_round_bills` in `bin/sync.rs`), deliberately OUTSIDE the CT-mapper
+loop. `HT_Round_Bill` is **not** in `CT_ENABLED_TABLES`, carries no
+watermark, and does not appear in `legacy_sync_status` or
+`legacy_ct_state` — adding CT to it would be legacy DDL we don't own
+(CLAUDE.md). Don't triage it via the CT observability in Section 8.
+
+**When it runs.** Last in every `run_one_tick`, so only while
+`LEGACY_SYNC_ENABLED=true` and at the `CT_POLL_INTERVAL_MS` cadence. It
+honours `LEGACY_SYNC_SHADOW_MODE` (shadow = read-and-log "would upsert",
+no canonical write) and ignores `LEGACY_SYNC_TABLE_ALLOWLIST` (not a CT
+table). Each tick it SELECTs the one open row (`round_end IS NULL`) plus
+any round touched in the last 2 days and UPSERTs into `ht_shifts` keyed
+on `(shift_site_id, shift_no)`, where `shift_no` = the legacy
+app-allocated `HT_Round_Bill.id`.
+
+**Direction today.** Read-only iHOTEL → canonical only. The reverse path
+(our app co-equally opening/closing `HT_Round_Bill`) is shipped DARK
+behind `ROUND_WRITEBACK_ENABLED` (default false) and is NOT enabled —
+see `docs/coexistence/ville-coequal-writes-plan.md`.
+
+**Resilience.** A failure here never aborts the tick — every error path
+logs at WARN and returns/continues, so the load-bearing CT mappers are
+unaffected. Triage via the structured log `event_name`s:
+`round_bill_sync_conn_fail`, `round_bill_sync_query_fail`,
+`round_bill_sync_row_skip`, `round_bill_sync_upsert_fail`. A transient
+`round_bill_sync_upsert_fail` during a round rollover self-heals next
+tick — usually the one-open-per-site partial index catching up.
+
+**Verify it's working.**
+
+```sql
+SELECT shift_site_id, shift_no, shift_legacy_round_id,
+       shift_opened_at, shift_closed_at
+  FROM ht_shifts
+ WHERE shift_closed_at IS NULL
+ ORDER BY shift_site_id;
+```
+
+Exactly one open (`shift_closed_at IS NULL`) row per site is the healthy
+steady state — the same "≤1 open round per site" invariant iHOTEL holds,
+enforced canonically by the partial unique index
+`ht_shifts_one_open_per_site`.
 
 ---

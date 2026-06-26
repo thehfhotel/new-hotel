@@ -56,6 +56,9 @@ High-performance Rust backend for the Hotel Management System, replacing the Nex
 | GET/POST/PUT | `/api/new/maintenance/*` | Maintenance requests |
 | GET | `/api/new/reports/*` | Revenue/occupancy reports |
 | GET | `/api/new/stats` | New system dashboard stats |
+| GET | `/api/shifts/current` | Current open cashier round (branch-aware; mirrored from iHOTEL `HT_Round_Bill`) |
+| POST | `/api/shifts/open` | Open cashier round (gated by `ROUND_WRITEBACK_ENABLED`; rejects with HTTP 400 when off) |
+| POST | `/api/shifts/close` | Close cashier round (gated by `ROUND_WRITEBACK_ENABLED`; rejects with HTTP 400 when off) |
 | GET | `/api/mode` | System mode |
 
 ## Development
@@ -95,6 +98,7 @@ cargo build --release
 | `PORT` | `3003` | Server port |
 | `SLACK_WEBHOOK_URL` | - | Slack webhook URL |
 | `SLACK_NOTIFICATIONS_ENABLED` | `true` | Enable Slack notifications |
+| `ROUND_WRITEBACK_ENABLED` | `false` | Co-equally open/close iHOTEL `HT_Round_Bill` cashier rounds from this app. Off → `/api/shifts/open\|close` reject (conflict-semantic, served as HTTP 400 today via `ServiceError::Conflict`); iHOTEL stays sole round-opener and we only mirror rounds in. |
 
 ## Docker
 
