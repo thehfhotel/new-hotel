@@ -49,6 +49,16 @@
 FROM rust:1.96-bookworm@sha256:19817ead3289c8c631c73df281e18b59b172f6a31f4f563290f69cddd06c30e9 AS chef
 LABEL org.opencontainers.image.source=https://github.com/thehfhotel/new-hotel
 LABEL org.opencontainers.image.licenses=Proprietary
+# Crate-download resilience (set EARLY so it covers cargo-chef install + cook +
+# build). The crates.io CDN intermittently resets an HTTP/2 connection mid-
+# transfer, which cargo surfaces as an opaque "curl failed" — and with
+# multiplexing a single reset can kill several concurrent downloads at once.
+# One connection per download (multiplexing off) + more retries lets those
+# transient blips self-heal. Complemented by the `cargo fetch` retry loops
+# below (which isolate the network step from the offline compile). Recurring
+# CI flake root-caused 2026-06-27.
+ENV CARGO_NET_RETRY=10
+ENV CARGO_HTTP_MULTIPLEXING=false
 RUN apt-get update \
     && apt-get install -y --no-install-recommends mold clang \
     && rm -rf /var/lib/apt/lists/*
@@ -56,7 +66,12 @@ RUN apt-get update \
 # 0.1.71 = latest stable as of 2026-04-26. Bumps surface as ordinary
 # Dockerfile edits — there is no Dependabot ecosystem for this binary.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
-    cargo install cargo-chef --locked --version 0.1.71
+    set -eu; \
+    n=0; until cargo install cargo-chef --locked --version 0.1.71; do \
+        n=$((n+1)); \
+        if [ "$n" -ge 4 ]; then echo "cargo-chef install failed after $n attempts" >&2; exit 1; fi; \
+        echo "cargo-chef install attempt $n failed; retrying in $((n*10))s" >&2; sleep "$((n*10))"; \
+    done
 # sccache (compiler cache): wraps rustc and caches build outputs keyed
 # on the exact crate inputs, so unchanged crates are linked from cache
 # instead of recompiled. Local-disk mode here (no GHA backend reachable
@@ -75,7 +90,7 @@ ARG SCCACHE_VERSION=v0.8.2
 ARG SCCACHE_ARCH=x86_64-unknown-linux-musl
 RUN --mount=type=cache,target=/tmp/sccache-dl,id=sccache-tarball \
     set -eux; \
-    curl -fsSL -o /tmp/sccache-dl/sccache.tar.gz \
+    curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors -o /tmp/sccache-dl/sccache.tar.gz \
       "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}.tar.gz"; \
     tar -xzf /tmp/sccache-dl/sccache.tar.gz -C /tmp/sccache-dl --strip-components=1; \
     install -m 755 /tmp/sccache-dl/sccache /usr/local/bin/sccache; \
@@ -114,12 +129,20 @@ FROM chef AS builder
 # alone — when deps don't change, Docker reuses the prior layer and
 # the cook command never executes. That's the cargo-chef value prop.
 COPY --from=planner /usr/src/app/recipe.json recipe.json
+# Cook re-fetches the dep closure; retry it through transient crate-download
+# blips (re-runs are mostly cache hits via target/ + sccache, so a retry just
+# re-pulls the crate that failed and relinks).
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
     --mount=type=cache,target=/usr/src/app/target,id=hotel-backend-target \
     --mount=type=cache,target=/sccache,id=sccache-backend \
-    cargo chef cook --release --recipe-path recipe.json \
-    && sccache --show-stats
+    set -eu; \
+    n=0; until cargo chef cook --release --recipe-path recipe.json; do \
+        n=$((n+1)); \
+        if [ "$n" -ge 4 ]; then echo "cargo chef cook failed after $n attempts" >&2; exit 1; fi; \
+        echo "cargo chef cook attempt $n failed; retrying in $((n*15))s" >&2; sleep "$((n*15))"; \
+    done; \
+    sccache --show-stats
 
 # Step 2: COPY the full source. Now the deps are pre-compiled in target/
 # (via the cache mount), so this build step only compiles workspace code.
@@ -128,11 +151,22 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
 # remain available via `cargo run --bin inspect_*` locally for ops use,
 # but never ship to production.
 COPY . .
+# Isolate the only network step (crate download) and retry it with linear
+# backoff; then compile OFFLINE so a transient "curl failed" can NEVER fail the
+# build itself. This is the core fix for the recurring CI flake — when the cook
+# layer is a cache hit but the registry cache mount is cold, the build would
+# otherwise re-download every crate and die on the first blip.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
     --mount=type=cache,target=/usr/src/app/target,id=hotel-backend-target \
     --mount=type=cache,target=/sccache,id=sccache-backend \
-    cargo build --release --locked \
+    set -eu; \
+    n=0; until cargo fetch --locked; do \
+        n=$((n+1)); \
+        if [ "$n" -ge 5 ]; then echo "cargo fetch failed after $n attempts" >&2; exit 1; fi; \
+        echo "cargo fetch attempt $n failed; retrying in $((n*10))s" >&2; sleep "$((n*10))"; \
+    done; \
+    cargo build --release --locked --offline \
         --bin hotel-backend \
         --bin writeback \
         --bin sync \
@@ -142,19 +176,19 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
         --bin backfill_legacy_bookings \
         --bin backfill_payment_ledger \
         --bin migrate_legacy \
-        --bin create_user \
-    && sccache --show-stats \
-    && mkdir -p /out \
-    && cp target/release/hotel-backend /out/ \
-    && cp target/release/writeback /out/ \
-    && cp target/release/sync /out/ \
-    && cp target/release/backfill_rooms /out/ \
-    && cp target/release/backfill_checkin_rooms /out/ \
-    && cp target/release/backfill_legacy_checkins /out/ \
-    && cp target/release/backfill_legacy_bookings /out/ \
-    && cp target/release/backfill_payment_ledger /out/ \
-    && cp target/release/migrate_legacy /out/ \
-    && cp target/release/create_user /out/
+        --bin create_user; \
+    sccache --show-stats; \
+    mkdir -p /out; \
+    cp target/release/hotel-backend /out/; \
+    cp target/release/writeback /out/; \
+    cp target/release/sync /out/; \
+    cp target/release/backfill_rooms /out/; \
+    cp target/release/backfill_checkin_rooms /out/; \
+    cp target/release/backfill_legacy_checkins /out/; \
+    cp target/release/backfill_legacy_bookings /out/; \
+    cp target/release/backfill_payment_ledger /out/; \
+    cp target/release/migrate_legacy /out/; \
+    cp target/release/create_user /out/
 
 # ---- Runtime stage --------------------------------------------------------
 # Pin to digest. Source: Docker Hub API `library/debian/tags/bookworm-slim`
