@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react'
 import { Printer, X } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { formatCurrency } from '@/lib/format'
+import { printRegion } from '@/lib/print'
 import { V2Spinner, V2Empty } from './primitives'
 
 /**
@@ -122,7 +123,7 @@ export default function RoundReport({ data }: { data: RoundReportData }) {
           {data.open ? 'เปิดอยู่' : 'ปิดแล้ว'}
         </span>
         <button
-          onClick={() => window.print()}
+          onClick={(e) => printRegion((e.currentTarget as HTMLElement).closest('.v2-print'))}
           className="v2-btn v2-btn-ghost v2-btn-sm v2-no-print"
           aria-label="พิมพ์รายงาน"
         >

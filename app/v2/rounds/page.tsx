@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { Printer, Users } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { formatCurrency } from '@/lib/format'
+import { printRegion } from '@/lib/print'
 import { V2PageHeader, V2Spinner, V2Empty } from '@/components/v2/primitives'
 import { formatThai, RoundReportSheet } from '@/components/v2/RoundReport'
 
@@ -137,7 +138,7 @@ export default function V2Rounds() {
         right={
           t && t.roundCount > 0 ? (
             <button
-              onClick={() => window.print()}
+              onClick={() => printRegion(document.getElementById('round-summary-print'))}
               className="v2-btn v2-btn-ghost v2-btn-sm v2-no-print"
               aria-label="พิมพ์รายงาน"
             >
@@ -179,7 +180,7 @@ export default function V2Rounds() {
       ) : !t || t.roundCount === 0 ? (
         <V2Empty title="ไม่มีรอบบิลที่ปิดแล้วในช่วงนี้" hint="ลองขยายช่วงวันที่" />
       ) : (
-        <div className="v2-print space-y-5">
+        <div id="round-summary-print" className="v2-print space-y-5">
           {/* Print-only header (the on-screen page header + date pickers
               don't print; this gives the printout title + range context). */}
           <div className="v2-print-only" style={{ marginBottom: '10px' }}>
