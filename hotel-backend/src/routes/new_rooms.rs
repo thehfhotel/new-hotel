@@ -16,6 +16,7 @@ use axum::{
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 use sqlx::{Postgres, Row, Transaction};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use super::mode::{AppState, Branch};
@@ -132,6 +133,95 @@ pub struct MutationResponse {
     pub id: Option<i32>,
 }
 
+/// Live occupancy/booking/checkout flags per `room_id`, derived from active
+/// check-ins + bookings the SAME way the legacy `/api/rooms/board`
+/// (`routes/rooms.rs`) does. The stored `ht_rooms_new.room_status` column is NOT
+/// kept in sync with check-in/out, so reading it produced statuses that didn't
+/// match iHOTEL or the classic grid (2026-06-27 fix). Tuple = (occupied,
+/// booked, checkout_due).
+async fn live_room_flags(pool: &crate::db::PgPool) -> ApiResult<HashMap<i32, (bool, bool, bool)>> {
+    let rows = sqlx::query(
+        "SELECT r.room_id, \
+            EXISTS(SELECT 1 FROM ht_checkins c \
+                    WHERE c.cin_status='active' AND c.cin_checkout_time IS NULL \
+                      AND (c.cin_room_id=r.room_id OR EXISTS( \
+                          SELECT 1 FROM ht_checkin_rooms cr \
+                           WHERE cr.cr_cin_id=c.cin_id AND cr.cr_room_id=r.room_id))) AS occupied, \
+            EXISTS(SELECT 1 FROM ht_booking_rooms br \
+                     JOIN ht_bookings b ON b.book_id=br.br_book_id \
+                    WHERE br.br_room_id=r.room_id \
+                      AND b.book_status IN ('confirmed','pending') \
+                      AND b.book_checkin <= CURRENT_DATE AND b.book_checkout > CURRENT_DATE) AS booked, \
+            EXISTS(SELECT 1 FROM ht_checkins c \
+                    WHERE c.cin_status='active' AND c.cin_checkout_time IS NULL \
+                      AND c.cin_expected_checkout = (now() AT TIME ZONE 'Asia/Bangkok')::date \
+                      AND EXTRACT(hour FROM now() AT TIME ZONE 'Asia/Bangkok') >= 6 \
+                      AND (c.cin_room_id=r.room_id OR EXISTS( \
+                          SELECT 1 FROM ht_checkin_rooms cr \
+                           WHERE cr.cr_cin_id=c.cin_id AND cr.cr_room_id=r.room_id))) AS checkout_due \
+           FROM ht_rooms_new r WHERE r.room_active",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::Internal(format!("failed to derive live room status: {e}")))?;
+
+    let mut map = HashMap::with_capacity(rows.len());
+    for row in &rows {
+        let id: i32 = row
+            .try_get("room_id")
+            .map_err(|e| ApiError::Internal(format!("room_id: {e}")))?;
+        map.insert(
+            id,
+            (
+                row.try_get("occupied").unwrap_or(false),
+                row.try_get("booked").unwrap_or(false),
+                row.try_get("checkout_due").unwrap_or(false),
+            ),
+        );
+    }
+    Ok(map)
+}
+
+/// List one pool's rooms with the LIVE display status overlaid (matching iHOTEL
+/// and the classic grid) instead of the stale stored `room_status` column.
+async fn list_rooms_live(
+    repo: &dyn crate::repository::room::RoomRepository,
+    pool: &crate::db::PgPool,
+    params: &NewRoomsQuery,
+) -> ApiResult<(Vec<NewRoom>, i32)> {
+    let (rows, total) = repo.list_with_count(pool, params).await?;
+    let live = live_room_flags(pool).await?;
+    let rooms = rows
+        .into_iter()
+        .map(|row| {
+            let mut nr = NewRoom::from_row(row);
+            // `from_row` set status from the stored column; capture the
+            // maintenance flag it carried so the v2 maintenance toggle (which
+            // PATCHes room_status) keeps working alongside the synced
+            // `room_maintenance` column (which the classic grid uses).
+            let stored_maintenance = nr.status == "maintenance";
+            let (occupied, booked, checkout_due) =
+                live.get(&nr.id).copied().unwrap_or((false, false, false));
+            // iHOTEL/classic precedence: checkout > maintenance > occupied >
+            // booked > available. `is_clean` / `is_maintenance` stay as flags.
+            nr.status = if checkout_due {
+                "checkout_pending"
+            } else if nr.is_maintenance || stored_maintenance {
+                "maintenance"
+            } else if occupied {
+                "occupied"
+            } else if booked {
+                "booked"
+            } else {
+                "available"
+            }
+            .to_string();
+            nr
+        })
+        .collect();
+    Ok((rooms, total))
+}
+
 /// GET /api/new/rooms - List rooms from HT_Rooms_New
 pub async fn list_rooms(
     State(state): State<AppState>,
@@ -139,22 +229,21 @@ pub async fn list_rooms(
 ) -> ApiResult<Json<NewRoomsResponse>> {
     // Branch-aware: HF Hotel reads new_pool, HF Ville reads ville_pool
     // (hotelville's canonical ht_rooms_new is populated), All unions both —
-    // mirroring routes/rooms.rs::list_rooms.
-    let (rows, total) = match params.branch.unwrap_or_default() {
-        Branch::Hfhotel => state.rooms.list_with_count(&state.new_pool, &params).await?,
-        Branch::Hfville => state.rooms.list_with_count(state.ville_pool()?, &params).await?,
+    // mirroring routes/rooms.rs::list_rooms. Status is derived live per pool.
+    let repo = state.rooms.as_ref();
+    let (rooms, total) = match params.branch.unwrap_or_default() {
+        Branch::Hfhotel => list_rooms_live(repo, &state.new_pool, &params).await?,
+        Branch::Hfville => list_rooms_live(repo, state.ville_pool()?, &params).await?,
         Branch::All => {
-            let (mut r, mut t) = state.rooms.list_with_count(&state.new_pool, &params).await?;
+            let (mut r, mut t) = list_rooms_live(repo, &state.new_pool, &params).await?;
             if let Ok(vp) = state.ville_pool() {
-                let (vr, vt) = state.rooms.list_with_count(vp, &params).await?;
+                let (vr, vt) = list_rooms_live(repo, vp, &params).await?;
                 r.extend(vr);
                 t += vt;
             }
             (r, t)
         }
     };
-
-    let rooms: Vec<NewRoom> = rows.into_iter().map(NewRoom::from_row).collect();
 
     Ok(Json(NewRoomsResponse {
         success: true,

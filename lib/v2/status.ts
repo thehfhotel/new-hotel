@@ -30,7 +30,13 @@ export function roomStatusView(
     case 'checkout_pending':
       return view('รอเช็คเอาท์', 'dep')
     case 'available':
-      return opts?.isClean === false ? view('รอทำความสะอาด', 'fix') : view('ว่าง', 'ok')
+      // iHOTEL shows vacant rooms as available (ว่าง) regardless of the
+      // housekeeping clean flag: `Room_Clean` defaults to 'no' and the
+      // mark-clean feature isn't used here, so deriving "dirty" from it
+      // mislabelled every free room. Clean/dirty is managed on /housekeeping,
+      // not surfaced as a grid status — keeping the v2 grid in step with iHOTEL
+      // and the classic dashboard. `opts.isClean` is intentionally ignored here.
+      return view('ว่าง', 'ok')
     default:
       return view(status || 'ไม่ทราบ', 'mut')
   }

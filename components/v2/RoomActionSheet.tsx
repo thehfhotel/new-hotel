@@ -7,7 +7,6 @@ import {
   CalendarPlus,
   ArrowRightLeft,
   Coffee,
-  Sparkles,
   Wrench,
   CheckCircle2,
   User,
@@ -35,8 +34,6 @@ export type RoomAction =
   | 'extend'
   | 'change'
   | 'pos'
-  | 'clean'
-  | 'dirty'
   | 'maintenance'
   | 'ready'
 
@@ -81,7 +78,6 @@ export default function RoomActionSheet({
   readOnly?: boolean
 }) {
   const view = roomStatusView(room.status, { isClean: room.isClean, isMaintenance: room.isMaintenance })
-  const isDirty = room.status === 'available' && room.isClean === false
 
   return (
     <div className="v2-sheet-backdrop" onClick={onClose} role="dialog" aria-modal="true">
@@ -136,8 +132,9 @@ export default function RoomActionSheet({
             </div>
           ) : (
           <div className="space-y-2">
-            {/* Available & clean → check in */}
-            {room.status === 'available' && room.isClean !== false && (
+            {/* Available → check in. iHOTEL doesn't gate check-in on the
+                housekeeping clean flag, so neither do we. */}
+            {room.status === 'available' && (
               <ActionButton variant="primary" icon={<LogIn size={17} />} label="เช็คอิน" onClick={() => onAction('checkin')} />
             )}
 
@@ -156,15 +153,10 @@ export default function RoomActionSheet({
               <ActionButton variant="primary" icon={<LogOut size={17} />} label="เช็คเอาท์" onClick={() => onAction('checkout')} />
             )}
 
-            {/* Dirty → mark clean */}
-            {isDirty && (
-              <ActionButton variant="primary" icon={<CheckCircle2 size={17} />} label="ทำความสะอาดเสร็จ" onClick={() => onAction('clean')} />
-            )}
-
-            {/* Housekeeping / maintenance — available to most states */}
-            {!isDirty && room.status === 'available' && (
-              <ActionButton icon={<Sparkles size={17} />} label="แจ้งทำความสะอาด" onClick={() => onAction('dirty')} />
-            )}
+            {/* Maintenance toggle. Clean/dirty housekeeping is managed on the
+                dedicated /housekeeping screen, not here (the old clean/dirty
+                actions wrote the stale room_status — broken/no-op — and iHOTEL
+                doesn't surface clean state in the room grid). */}
             {room.status === 'maintenance' ? (
               <ActionButton icon={<CheckCircle2 size={17} />} label="พร้อมใช้งาน (เลิกแจ้งซ่อม)" onClick={() => onAction('ready')} />
             ) : (

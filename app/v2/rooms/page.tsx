@@ -34,11 +34,10 @@ interface FilterOption {
 
 const FILTERS: FilterOption[] = [
   { value: 'all', label: 'ทั้งหมด', match: () => true },
-  { value: 'available', label: 'ว่าง', match: (r) => r.status === 'available' && r.isClean !== false },
+  { value: 'available', label: 'ว่าง', match: (r) => r.status === 'available' },
   { value: 'occupied', label: 'เข้าพัก', match: (r) => r.status === 'occupied' },
   { value: 'booked', label: 'จองแล้ว', match: (r) => r.status === 'booked' },
   { value: 'checkout_pending', label: 'รอเช็คเอาท์', match: (r) => r.status === 'checkout_pending' },
-  { value: 'dirty', label: 'รอทำความสะอาด', match: (r) => r.status === 'available' && r.isClean === false },
   { value: 'maintenance', label: 'ซ่อมบำรุง', match: (r) => r.status === 'maintenance' || r.isMaintenance },
 ]
 
@@ -144,10 +143,11 @@ export default function V2Rooms() {
     // Housekeeping / maintenance — mirror the classic housekeeping handler exactly.
     setBusy(true)
     try {
+      // Maintenance toggle only — clean/dirty is managed on /housekeeping, not
+      // in the room grid (matches iHOTEL; the old 'clean'/'dirty' actions wrote
+      // the stale room_status and were no-ops/broken).
       let status = 'available'
-      if (a === 'clean') status = 'cleaned'
-      else if (a === 'dirty') status = 'available'
-      else if (a === 'maintenance') status = 'maintenance'
+      if (a === 'maintenance') status = 'maintenance'
       else if (a === 'ready') status = 'available'
       await branchFetch(`/api/rooms/${selected.id}/status`, {
         method: 'PATCH',
