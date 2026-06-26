@@ -7,6 +7,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.72.0](https://github.com/thehfhotel/new-hotel/compare/v2.71.0...v2.72.0) (2026-06-26)
+
+
+### Added
+
+* **coexistence:** backfill_payment_ledger bin + compose services (J7e) ([286adb0](https://github.com/thehfhotel/new-hotel/commit/286adb048a9c6f913409b67627ee9515578e301d))
+* **coexistence:** cash-drawer count + variance in round report (J7c) ([51641ec](https://github.com/thehfhotel/new-hotel/commit/51641ecb4f1b600a8402e826d906e575ec8eb3ea))
+* **coexistence:** HF Ville write safety gate (default-off) + capability flag ([353652b](https://github.com/thehfhotel/new-hotel/commit/353652b2f8b5ecd2ed1f7bf82f113bc0782aecc3))
+* **coexistence:** open/close iHOTEL HT_Round_Bill from our app (dark, flag-gated) ([6b0a1e6](https://github.com/thehfhotel/new-hotel/commit/6b0a1e6a6831394dd46016d3ece64d44396a1b78))
+* **coexistence:** payment-tender ledger mirror + round report (J7a/J7b) ([b062ecc](https://github.com/thehfhotel/new-hotel/commit/b062ecce37eaf948b4cc9fbb47b4e382df3b35da))
+* **coexistence:** round open/close UI + flag wiring + collision hardening (dark) ([19ed7ef](https://github.com/thehfhotel/new-hotel/commit/19ed7efe515a630eeb994c82ad7cd9cadca78fb3))
+* **coexistence:** surface read-only round report (post-backfill) + flip runbook ([9ef9421](https://github.com/thehfhotel/new-hotel/commit/9ef94211f29997be759f316f5ee70565087ed82b))
+* **coexistence:** sync iHOTEL HT_Round_Bill -&gt; ht_shifts; branch-aware current_shift ([5102a89](https://github.com/thehfhotel/new-hotel/commit/5102a89394af3b764c9c40c397754fd69b5e653f))
+* **coexistence:** v2 round reconciliation UI — close flow + report (J7d) ([be5e88c](https://github.com/thehfhotel/new-hotel/commit/be5e88cd5c0c90ff2bcd762ecddcd6c479bdb8c1))
+* **v2:** add modern mobile-friendly front-desk UI alongside classic app ([c74d63c](https://github.com/thehfhotel/new-hotel/commit/c74d63c9b5c8312fa2bf47131cfb0b6e78bda0a6))
+
+
+### Fixed
+
+* **sync:** widen watchdog CT probe budget and escalate sustained probe outages ([41cb700](https://github.com/thehfhotel/new-hotel/commit/41cb700a9e954e5b96fa5e7c27dda2d62ecacebd))
+* **v2:** correct HF Hotel data parity and add HF Ville connectivity detection ([522f5f6](https://github.com/thehfhotel/new-hotel/commit/522f5f693ad866e7583f0408223c059a2828ffee))
+* **v2:** load HF Ville data in the new UI (branch-aware canonical reads) ([296cda8](https://github.com/thehfhotel/new-hotel/commit/296cda8286ae5b0648f12267b26faa70480920b5))
+* **v2:** stop stale HF Hotel fetch from overwriting HF Ville on load ([f177ab7](https://github.com/thehfhotel/new-hotel/commit/f177ab70beb05c1fabc2ce6f254aa14e2b32f12c))
+
+
+### Changed
+
+* **api:** flatten the 4 collision nouns into the single /api/* suite ([134b1a4](https://github.com/thehfhotel/new-hotel/commit/134b1a4fa08e4e6ab867355493fd1223bd99f1e0))
+* **api:** unify non-colliding endpoints into one /api/* suite; drop dead routes ([a387e99](https://github.com/thehfhotel/new-hotel/commit/a387e99bea26afe7c38697af564ad3ee75acd5a9))
+
 ## [2.71.0](https://github.com/thehfhotel/new-hotel/compare/v2.70.0...v2.71.0) (2026-06-24)
 
 
