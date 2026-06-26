@@ -109,7 +109,7 @@ export default function RoundReport({ data }: { data: RoundReportData }) {
       {/* Header / window */}
       <div className="v2-inset px-4 py-3 flex items-center gap-3">
         <div className="flex-1 min-w-0">
-          <div className="v2-eyebrow mb-0.5">รายงานรอบขาย</div>
+          <div className="v2-eyebrow mb-0.5">รายงานรอบบิล</div>
           <div className="text-[15px] font-semibold">รอบ #{shift.shiftNo}</div>
           <div className="text-[12px] v2-num mt-0.5 truncate" style={{ color: 'var(--v2-ink-3)' }}>
             {formatThai(data.windowFrom)} → {data.open ? 'ปัจจุบัน' : formatThai(data.windowTo)} · {shift.openedBy}
@@ -126,13 +126,13 @@ export default function RoundReport({ data }: { data: RoundReportData }) {
       <div>
         <div className="v2-eyebrow mb-2">รายได้แยกตามประเภทการชำระ</div>
         <div className="v2-card overflow-hidden divide-y" style={{ borderColor: 'var(--v2-line)' }}>
-          <Row label="เงินสดรับเข้า" value={income.cashReceived} />
-          <Row label="เงินสดจ่ายออก / คืน" value={income.cashPaid} negative />
-          <Row label="เงินโอน" value={income.transfer} />
+          <Row label="เงินสด" value={income.cashReceived} />
+          <Row label="ยอดจ่าย" value={income.cashPaid} negative />
+          <Row label="โอนเงิน" value={income.transfer} />
           <Row label="บัตรเครดิต" value={income.credit} />
           {income.web !== 0 && <Row label="ออนไลน์" value={income.web} />}
           {income.free !== 0 && <Row label="ส่วนลด / ฟรี" value={income.free} />}
-          <Row label="รวมทั้งสิ้น (เงินทอนตั้งต้น + สุทธิ)" value={grandTotal} strong />
+          <Row label="รวมทั้งหมด" value={grandTotal} strong />
         </div>
         <div className="text-[11.5px] mt-1.5 v2-num" style={{ color: 'var(--v2-ink-3)' }}>
           {income.paymentCount} ใบเสร็จ · {income.lineCount} รายการ
@@ -144,8 +144,8 @@ export default function RoundReport({ data }: { data: RoundReportData }) {
         <div>
           <div className="v2-eyebrow mb-2">เงินมัดจำ</div>
           <div className="v2-card overflow-hidden divide-y" style={{ borderColor: 'var(--v2-line)' }}>
-            <Row label="รับเข้า" value={deposits.received} />
-            <Row label="คืนให้ลูกค้า" value={deposits.returned} negative />
+            <Row label="รับเงินมัดจำ" value={deposits.received} />
+            <Row label="จ่ายเงินมัดจำ" value={deposits.returned} negative />
           </div>
         </div>
       )}
@@ -171,9 +171,9 @@ export default function RoundReport({ data }: { data: RoundReportData }) {
       <div>
         <div className="v2-eyebrow mb-2">กระทบยอดเงินสด</div>
         <div className="v2-card overflow-hidden divide-y" style={{ borderColor: 'var(--v2-line)' }}>
-          <Row label="เงินทอนตั้งต้น" value={shift.openingFloat} />
-          <Row label="เงินสดสุทธิ (รับ − จ่าย)" value={income.cashNet} />
-          <Row label="เงินสดที่ควรมีในลิ้นชัก" value={expectedCash} strong />
+          <Row label="เงินในลิ้นชัก (ตั้งต้น)" value={shift.openingFloat} />
+          <Row label="รวมเงินสดคงเหลือ" value={income.cashNet} />
+          <Row label="จำนวนเงินในลิ้นชัก" value={expectedCash} strong />
           {countedCash != null && <Row label="นับได้จริง" value={countedCash} />}
           {cashVariance != null && tone && (
             <div className="flex items-baseline gap-3 px-4 py-2.5" style={{ background: `var(--v2-${tone}-bg)` }}>
@@ -230,7 +230,7 @@ export function RoundReportSheet({ shiftId, onClose }: { shiftId: number; onClos
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center gap-3 px-5 py-4" style={{ borderBottom: '1px solid var(--v2-line)' }}>
-          <div className="v2-eyebrow flex-1">รายงานรอบขาย</div>
+          <div className="v2-eyebrow flex-1">รายงานรอบบิล</div>
           <button onClick={onClose} className="p-2 rounded-full" style={{ color: 'var(--v2-ink-3)' }} aria-label="ปิด">
             <X size={20} />
           </button>

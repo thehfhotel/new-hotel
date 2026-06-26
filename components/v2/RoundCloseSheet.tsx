@@ -121,7 +121,7 @@ export default function RoundCloseSheet({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center gap-3 px-5 py-4" style={{ borderBottom: '1px solid var(--v2-line)' }}>
-          <div className="v2-eyebrow flex-1">{final ? 'ปิดรอบเรียบร้อย' : 'ปิดรอบ — กระทบยอด'}</div>
+          <div className="v2-eyebrow flex-1">{final ? 'ปิดรอบบิลเรียบร้อย' : 'ปิดรอบบิล — กระทบยอด'}</div>
           <button onClick={onClose} className="p-2 rounded-full" style={{ color: 'var(--v2-ink-3)' }} aria-label="ปิด">
             <X size={20} />
           </button>
@@ -135,7 +135,7 @@ export default function RoundCloseSheet({
                 style={{ background: 'var(--v2-ok-bg)', color: 'var(--v2-ok)' }}
               >
                 <CheckCircle2 size={18} />
-                <span className="text-[13.5px] font-semibold">ปิดรอบ #{final.shift.shiftNo} เรียบร้อยแล้ว</span>
+                <span className="text-[13.5px] font-semibold">ปิดรอบบิล #{final.shift.shiftNo} เรียบร้อยแล้ว</span>
               </div>
               <RoundReport data={final} />
               <button className="v2-btn v2-btn-primary w-full" onClick={onClose}>
@@ -143,7 +143,7 @@ export default function RoundCloseSheet({
               </button>
             </div>
           ) : !loaded ? (
-            <V2Spinner label="กำลังโหลดสรุปรอบ…" />
+            <V2Spinner label="กำลังโหลดสรุปรอบบิล…" />
           ) : (
             <div className="space-y-5">
               {preview && <RoundReport data={preview} />}
@@ -183,7 +183,7 @@ export default function RoundCloseSheet({
                 {/* Live counted + variance */}
                 <div className="v2-inset mt-3 divide-y" style={{ borderColor: 'var(--v2-line)' }}>
                   <div className="flex items-baseline gap-3 px-4 py-2.5">
-                    <span className="text-[13.5px]" style={{ color: 'var(--v2-ink-2)' }}>เงินสดที่ควรมี</span>
+                    <span className="text-[13.5px]" style={{ color: 'var(--v2-ink-2)' }}>จำนวนเงินในลิ้นชัก</span>
                     <span className="flex-1" />
                     <span className="v2-num text-[14px]">{formatCurrency(expected, 2)}</span>
                   </div>
@@ -219,7 +219,7 @@ export default function RoundCloseSheet({
                   />
                 </label>
                 <button className="v2-btn v2-btn-primary v2-btn-sm" disabled={busy} onClick={submit}>
-                  {busy ? <Loader2 size={15} className="animate-spin" /> : <Lock size={15} />} ยืนยันปิดรอบ
+                  {busy ? <Loader2 size={15} className="animate-spin" /> : <Lock size={15} />} ยืนยันปิดรอบบิล
                 </button>
                 <button className="v2-btn v2-btn-ghost v2-btn-sm" disabled={busy} onClick={onClose}>
                   ยกเลิก

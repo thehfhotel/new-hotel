@@ -109,7 +109,7 @@ export default function RoundControl({ onChanged }: { onChanged?: () => void }) 
   const submitOpen = async () => {
     const floatVal = Number(openingFloat)
     if (!actor.trim()) return setError('กรุณาระบุชื่อผู้เปิดรอบ')
-    if (!Number.isFinite(floatVal) || floatVal < 0) return setError('เงินทอนตั้งต้นไม่ถูกต้อง')
+    if (!Number.isFinite(floatVal) || floatVal < 0) return setError('เงินในลิ้นชักไม่ถูกต้อง')
     setBusy(true)
     setError(null)
     try {
@@ -140,7 +140,7 @@ export default function RoundControl({ onChanged }: { onChanged?: () => void }) 
     const meta = `รอบ #${shift.shiftNo} · เปิดโดย ${shift.openedBy} · ${formatThai(shift.openedAt)}`
     const viewBtn = (
       <button className="v2-btn v2-btn-ghost v2-btn-sm" onClick={() => setViewingShiftId(shift.shiftId)}>
-        <FileText size={15} /> ดูรายงานรอบ
+        <FileText size={15} /> ดูรายงานรอบบิล
       </button>
     )
     if (!canManage) {
@@ -152,7 +152,7 @@ export default function RoundControl({ onChanged }: { onChanged?: () => void }) 
       body = (
         <div className="v2-inset flex flex-wrap items-center gap-2.5 px-4 py-2.5">
           <Clock size={15} style={{ color: 'var(--v2-ink-3)' }} />
-          <span className="text-[13px]" style={{ color: 'var(--v2-ink-2)' }}>รอบขายเปิดอยู่</span>
+          <span className="text-[13px]" style={{ color: 'var(--v2-ink-2)' }}>รอบบิลเปิดอยู่</span>
           <span className="text-[12.5px] v2-num" style={{ color: 'var(--v2-ink-3)' }}>{meta}</span>
           <span className="flex-1" />
           {viewBtn}
@@ -165,12 +165,12 @@ export default function RoundControl({ onChanged }: { onChanged?: () => void }) 
           <div className="flex flex-wrap items-center gap-3">
             <span className="v2-dot d-ok" style={{ width: 9, height: 9 }} />
             <div className="flex-1 min-w-0">
-              <div className="text-[14px] font-semibold">รอบขายเปิดอยู่</div>
+              <div className="text-[14px] font-semibold">รอบบิลเปิดอยู่</div>
               <div className="text-[12.5px] v2-num truncate" style={{ color: 'var(--v2-ink-3)' }}>{meta}</div>
             </div>
             {viewBtn}
             <button className="v2-btn v2-btn-ghost v2-btn-sm" onClick={() => setClosingShiftId(shift.shiftId)}>
-              <Lock size={15} /> ปิดรอบ
+              <Lock size={15} /> ปิดรอบบิล
             </button>
           </div>
         </div>
@@ -183,16 +183,16 @@ export default function RoundControl({ onChanged }: { onChanged?: () => void }) 
         <div className="flex items-center gap-3">
           <AlertTriangle size={18} style={{ color: 'var(--v2-arr)' }} />
           <p className="text-[13.5px] flex-1" style={{ color: 'var(--v2-ink)' }}>
-            ยังไม่ได้เปิดรอบขาย — การเช็คอิน/เช็คเอาท์จะถูกระงับจนกว่าจะเปิดรอบ
+            ยังไม่ได้เปิดรอบบิล — การเช็คอิน/เช็คเอาท์จะถูกระงับจนกว่าจะเปิดรอบบิล
           </p>
           {canManage ? (
             mode !== 'opening' && (
               <button className="v2-btn v2-btn-soft v2-btn-sm" onClick={() => { setError(null); setMode('opening') }}>
-                <Unlock size={15} /> เปิดรอบ
+                <Unlock size={15} /> เปิดรอบบิล
               </button>
             )
           ) : (
-            <Link href="/billing" className="v2-btn v2-btn-soft v2-btn-sm">เปิดรอบ</Link>
+            <Link href="/billing" className="v2-btn v2-btn-soft v2-btn-sm">เปิดรอบบิล</Link>
           )}
         </div>
         {canManage && mode === 'opening' && (
@@ -205,7 +205,7 @@ export default function RoundControl({ onChanged }: { onChanged?: () => void }) 
                 style={{ background: 'var(--v2-surface)', border: '1px solid var(--v2-line-2)' }}
               />
             </Field>
-            <Field label="เงินทอนตั้งต้น (บาท)">
+            <Field label="เงินในลิ้นชัก (บาท)">
               <input
                 value={openingFloat}
                 onChange={(e) => setOpeningFloat(e.target.value)}
@@ -215,7 +215,7 @@ export default function RoundControl({ onChanged }: { onChanged?: () => void }) 
               />
             </Field>
             <button className="v2-btn v2-btn-primary v2-btn-sm" disabled={busy} onClick={submitOpen}>
-              {busy ? <Loader2 size={15} className="animate-spin" /> : <Unlock size={15} />} ยืนยันเปิดรอบ
+              {busy ? <Loader2 size={15} className="animate-spin" /> : <Unlock size={15} />} ยืนยันเปิดรอบบิล
             </button>
             <button className="v2-btn v2-btn-ghost v2-btn-sm" disabled={busy} onClick={() => { setMode('idle'); setError(null) }}>
               <X size={15} /> ยกเลิก
