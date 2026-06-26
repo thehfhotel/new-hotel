@@ -54,14 +54,16 @@ interface Stats {
   todayCheckOuts: number
 }
 
+// Canonical room shape from /api/rooms (new_rooms). `status` is now derived
+// server-side (live occupancy/booking/checkout) — the dashboard no longer
+// computes it. See docs/spikes/2026-06-27-frontend-backend-encapsulation.md.
 interface ApiRoom {
-  Room_no: string
-  Room_Type: string
-  Room_Details: string
-  Room_Clean: string
-  Room_Use: string
-  Room_Book: string
-  Room_Manternace: string
+  id: number
+  roomNo: string
+  roomTypeName: string | null
+  status: string
+  isMaintenance: boolean
+  notes: string | null
 }
 
 type RoomStatus = 'available' | 'occupied' | 'booked' | 'maintenance' | 'cleaning' | 'checkout'
@@ -109,14 +111,23 @@ const hfVilleRoomLayout: (string | null)[][] = [
   ['202', '204', '206', '208', '210', '212', '214', '216', null, null],
 ]
 
-function getRoomStatus(room: ApiRoom, isCheckoutToday: boolean): RoomStatus {
-  const hour = new Date().getHours()
-  if (isCheckoutToday && hour >= 6) return 'checkout'
-  if (room.Room_Manternace === 'yes') return 'maintenance'
-  if (room.Room_Use === 'yes') return 'occupied'
-  if (room.Room_Book && room.Room_Book !== '') return 'booked'
-  if (room.Room_Clean === 'yes') return 'cleaning'
-  return 'available'
+// Map the backend-resolved room status to the dashboard's RoomStatus. The
+// derivation (occupancy/booking/checkout-today/maintenance precedence, incl. the
+// 6am window) now lives in the backend (/api/rooms), so the same status feeds
+// both the classic dashboard and the v2 grid — they can't drift apart again
+// (the divergence that caused the 2026-06-27 room-status bug).
+function mapRoomStatus(status: string, isMaintenance: boolean): RoomStatus {
+  if (isMaintenance || status === 'maintenance') return 'maintenance'
+  switch (status) {
+    case 'occupied':
+      return 'occupied'
+    case 'booked':
+      return 'booked'
+    case 'checkout_pending':
+      return 'checkout'
+    default:
+      return 'available'
+  }
 }
 
 export default function NewDashboard() {
@@ -181,10 +192,9 @@ export default function NewDashboard() {
 
   const fetchData = useCallback(async () => {
     try {
-      const [statsRes, roomsRes, checkoutsRes, checkInsRes] = await Promise.all([
+      const [statsRes, roomsRes, checkInsRes] = await Promise.all([
         branchFetch('/api/stats'),
-        branchFetch('/api/rooms/board'),
-        branchFetch('/api/rooms/checkouts-today'),
+        branchFetch('/api/rooms?limit=300'),
         branchFetch('/api/checkins/board?limit=10'),
       ])
 
@@ -199,22 +209,17 @@ export default function NewDashboard() {
         }
       }
 
-      let checkoutSet = new Set<string>()
-      if (checkoutsRes.ok) {
-        const data = await checkoutsRes.json()
-        if (data.success && data.data) checkoutSet = new Set(data.data)
-      }
-
       if (roomsRes.ok) {
         const data = await roomsRes.json()
-        if (data.success && data.data) {
-          setRooms(data.data.map((r: ApiRoom) => ({
-            roomNumber: r.Room_no,
-            type: r.Room_Type?.trim() || '',
-            details: r.Room_Details?.trim() || '',
-            status: getRoomStatus(r, checkoutSet.has(r.Room_no)),
-          })))
-        }
+        const list = (data.data || data || []) as ApiRoom[]
+        setRooms(
+          list.map((r) => ({
+            roomNumber: r.roomNo,
+            type: r.roomTypeName?.trim() || '',
+            details: r.notes?.trim() || '',
+            status: mapRoomStatus(r.status, r.isMaintenance),
+          })),
+        )
       }
 
       if (checkInsRes.ok) {

@@ -17,10 +17,8 @@ High-performance Rust backend for the Hotel Management System, replacing the Nex
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/api/rooms` | List all rooms |
+| GET | `/api/rooms` | List all rooms (status derived live: occupancy/booking/checkout/maintenance) |
 | GET | `/api/rooms/:id` | Room details with current guest |
-| GET | `/api/rooms/status` | Room status history |
-| GET | `/api/rooms/checkouts-today` | Today's checkouts |
 | GET | `/api/bookings` | Bookings (paginated) |
 | GET | `/api/bookings/:id` | Booking details |
 | GET | `/api/bookings/:id/notes` | Get booking notes |

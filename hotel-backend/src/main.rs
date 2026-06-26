@@ -414,15 +414,15 @@ fn build_new_routes(app_state: AppState) -> Router {
 
     Router::new()
         // ── One /api/* suite (no "/new" prefix anywhere) ──
-        // The branch-aware legacy reads (the only HF Ville-capable reads today)
-        // and the canonical CRUD now share the single suite on distinct paths:
-        //   reads   -> /api/rooms/board, /api/checkins/board, /api/customers,
-        //              /api/bookings/by-number/{book_no}
-        //   canonical -> /api/rooms, /api/checkins, /api/bookings, /api/customers/search
+        // Canonical CRUD on /api/rooms, /api/checkins, /api/bookings,
+        // /api/customers/search; a few branch-aware legacy reads remain on
+        // distinct paths (/api/checkins/board, /api/bookings/by-number).
         //
-        // Branch-aware legacy reads (PG; serve HF Hotel + HF Ville via ville_pool).
-        .route("/api/rooms/board", get(routes::rooms::list_rooms))
-        .route("/api/rooms/checkouts-today", get(routes::rooms::get_checkouts_today))
+        // /api/rooms now derives live room status server-side (occupancy/booking/
+        // checkout/maintenance) — the legacy /api/rooms/board +
+        // /api/rooms/checkouts-today were removed 2026-06-27 once both the
+        // dashboard and the v2 grid consumed the canonical status. See
+        // docs/spikes/2026-06-27-frontend-backend-encapsulation.md.
         .route("/api/bookings/by-number/{book_no}", get(routes::bookings::get_booking))
         .route(
             "/api/bookings/by-number/{book_no}/notes",

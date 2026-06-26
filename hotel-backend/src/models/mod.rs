@@ -4,13 +4,11 @@ mod booking;
 mod checkin;
 mod customer;
 mod note;
-mod room;
 
 pub use booking::*;
 pub use checkin::*;
 pub use customer::*;
 pub use note::*;
-pub use room::*;
 
 use serde::Serialize;
 

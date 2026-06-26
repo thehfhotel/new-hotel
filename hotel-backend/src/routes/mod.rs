@@ -27,6 +27,5 @@ pub mod new_shifts;
 pub mod new_stats;
 pub mod new_sync;
 pub mod occupancy;
-pub mod rooms;
 pub mod rr4_export;
 pub mod stats;
