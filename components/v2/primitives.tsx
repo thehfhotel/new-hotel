@@ -6,19 +6,19 @@ import type { V2StatusView } from '@/lib/v2/status'
 import type { Branch } from '@/contexts/BranchContext'
 
 /**
- * Honest notice for the HF Ville data gap. The new ("/v2") screens read the
- * canonical `/api/*` endpoints, which currently serve HF Hotel only and
- * return empty for branch=hfville (see hotel-backend new_rooms/new_checkins/
- * new_bookings: `if branch == Hfville { return empty }`). Rather than show a
- * blank screen, tell the user where the data lives. Renders nothing for the
- * fully-supported HF Hotel branch.
+ * View-only banner for non-HF-Hotel branches. The canonical `/api/*` list
+ * endpoints are now branch-aware (HF Ville reads ville_pool), so `/v2` DISPLAYS
+ * HF Ville data. But the write endpoints still target the HF Hotel pool, and
+ * HF Ville isn't cut over (iHOTEL is primary there), so `/v2` gates write
+ * actions to HF Hotel only — this banner tells the user the other branches are
+ * view-only. Renders nothing for the fully-supported HF Hotel branch.
  */
 export function VilleNotice({ branch }: { branch: Branch }) {
   if (branch === 'hfhotel') return null
   const message =
     branch === 'hfville'
-      ? 'ดีไซน์ใหม่ยังไม่รองรับข้อมูล HF Ville — โปรดใช้หน้าจอเดิมสำหรับสาขานี้'
-      : 'ดีไซน์ใหม่แสดงเฉพาะข้อมูล HF Hotel ในขณะนี้ (ยังไม่รวม HF Ville)'
+      ? 'HF Ville: โหมดดูอย่างเดียวในดีไซน์ใหม่ — ทำรายการผ่าน iHOTEL / หน้าจอเดิม'
+      : 'มุมมองรวม (ทั้งหมด): โหมดดูอย่างเดียว — เลือกสาขา HF Hotel เพื่อทำรายการ'
   return (
     <div
       className="v2-card flex items-center gap-3 px-4 py-3"

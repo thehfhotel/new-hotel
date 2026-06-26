@@ -137,20 +137,22 @@ pub async fn list_rooms(
     State(state): State<AppState>,
     Query(params): Query<NewRoomsQuery>,
 ) -> ApiResult<Json<NewRoomsResponse>> {
-    // The HotelNew database only contains HF Hotel data; for HF Ville return an empty
-    // result so the UI shows "no rooms" rather than mixing HF Hotel rooms in.
-    if params.branch == Some(Branch::Hfville) {
-        return Ok(Json(NewRoomsResponse {
-            success: true,
-            data: vec![],
-            pagination: Pagination::new(params.page, params.limit, 0),
-        }));
-    }
-
-    let (rows, total) = state
-        .rooms
-        .list_with_count(&state.new_pool, &params)
-        .await?;
+    // Branch-aware: HF Hotel reads new_pool, HF Ville reads ville_pool
+    // (hotelville's canonical ht_rooms_new is populated), All unions both —
+    // mirroring routes/rooms.rs::list_rooms.
+    let (rows, total) = match params.branch.unwrap_or_default() {
+        Branch::Hfhotel => state.rooms.list_with_count(&state.new_pool, &params).await?,
+        Branch::Hfville => state.rooms.list_with_count(state.ville_pool()?, &params).await?,
+        Branch::All => {
+            let (mut r, mut t) = state.rooms.list_with_count(&state.new_pool, &params).await?;
+            if let Ok(vp) = state.ville_pool() {
+                let (vr, vt) = state.rooms.list_with_count(vp, &params).await?;
+                r.extend(vr);
+                t += vt;
+            }
+            (r, t)
+        }
+    };
 
     let rooms: Vec<NewRoom> = rows.into_iter().map(NewRoom::from_row).collect();
 

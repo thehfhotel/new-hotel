@@ -177,14 +177,18 @@ export default function V2Today() {
           </div>
           <h1 className="v2-display text-[26px] lg:text-[32px] leading-none">{dateLabel}</h1>
         </div>
-        <div className="flex items-center gap-2">
-          <Link href="/v2/reservations?new=1" className="v2-btn v2-btn-primary">
-            <CalendarPlus size={17} /> จองใหม่
-          </Link>
-          <Link href="/v2/rooms" className="v2-btn v2-btn-ghost">
-            <LogIn size={17} /> เช็คอิน
-          </Link>
-        </div>
+        {/* Write actions only for HF Hotel; Ville/all are view-only (writes
+            would otherwise misroute to the HF Hotel pool). */}
+        {branch === 'hfhotel' && (
+          <div className="flex items-center gap-2">
+            <Link href="/v2/reservations?new=1" className="v2-btn v2-btn-primary">
+              <CalendarPlus size={17} /> จองใหม่
+            </Link>
+            <Link href="/v2/rooms" className="v2-btn v2-btn-ghost">
+              <LogIn size={17} /> เช็คอิน
+            </Link>
+          </div>
+        )}
       </div>
 
       <VilleNotice branch={branch} />

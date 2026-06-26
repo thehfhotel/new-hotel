@@ -70,11 +70,15 @@ export default function RoomActionSheet({
   onClose,
   onAction,
   busy,
+  readOnly,
 }: {
   room: RoomItem
   onClose: () => void
   onAction: (a: RoomAction) => void
   busy?: boolean
+  /** When true (non-HF-Hotel branch), show room info but no mutating actions —
+   *  writes would otherwise misroute to the HF Hotel pool. */
+  readOnly?: boolean
 }) {
   const view = roomStatusView(room.status, { isClean: room.isClean, isMaintenance: room.isMaintenance })
   const isDirty = room.status === 'available' && room.isClean === false
@@ -126,6 +130,11 @@ export default function RoomActionSheet({
             </div>
           )}
 
+          {readOnly ? (
+            <div className="v2-inset px-4 py-3 text-[13px]" style={{ color: 'var(--v2-ink-3)' }}>
+              โหมดดูอย่างเดียว — จัดการห้องพักผ่าน iHOTEL / หน้าจอเดิม
+            </div>
+          ) : (
           <div className="space-y-2">
             {/* Available & clean → check in */}
             {room.status === 'available' && room.isClean !== false && (
@@ -162,6 +171,7 @@ export default function RoomActionSheet({
               <ActionButton icon={<Wrench size={17} />} label="แจ้งซ่อม" onClick={() => onAction('maintenance')} />
             )}
           </div>
+          )}
         </div>
       </div>
     </div>

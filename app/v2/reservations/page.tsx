@@ -137,9 +137,11 @@ export default function V2Reservations() {
         eyebrow="การจอง"
         title="รายการจอง"
         right={
-          <button onClick={openCreate} className="v2-btn v2-btn-primary">
-            <CalendarPlus size={17} /> จองใหม่
-          </button>
+          branch === 'hfhotel' ? (
+            <button onClick={openCreate} className="v2-btn v2-btn-primary">
+              <CalendarPlus size={17} /> จองใหม่
+            </button>
+          ) : undefined
         }
       />
 
@@ -191,7 +193,7 @@ export default function V2Reservations() {
           {bookings.map((b) => (
             <button
               key={b.id}
-              onClick={() => openEdit(b)}
+              onClick={() => { if (branch === 'hfhotel') openEdit(b) }}
               className="w-full flex items-center gap-4 px-4 lg:px-5 py-3.5 text-left transition-colors hover:bg-[var(--v2-surface-2)]"
               style={{ borderColor: 'var(--v2-line)' }}
             >

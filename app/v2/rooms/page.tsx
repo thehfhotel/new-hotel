@@ -249,7 +249,7 @@ export default function V2Rooms() {
 
       {/* Action sheet — hidden while a transactional modal is open */}
       {selected && !modal && (
-        <RoomActionSheet room={selected} onClose={() => setSelected(null)} onAction={handleAction} busy={busy} />
+        <RoomActionSheet room={selected} onClose={() => setSelected(null)} onAction={handleAction} busy={busy} readOnly={branch !== 'hfhotel'} />
       )}
 
       {/* Transactional modals (reused from the classic app for contract safety) */}
