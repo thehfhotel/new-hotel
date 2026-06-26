@@ -20,7 +20,7 @@ const STATUS_FILTERS = [
 ]
 
 export default function V2Reservations() {
-  const { branch } = useBranch()
+  const { branch, canWrite } = useBranch()
   const branchFetch = useBranchFetch()
   const [bookings, setBookings] = useState<Booking[]>([])
   const [loading, setLoading] = useState(true)
@@ -141,7 +141,7 @@ export default function V2Reservations() {
         eyebrow="การจอง"
         title="รายการจอง"
         right={
-          branch === 'hfhotel' ? (
+          canWrite ? (
             <button onClick={openCreate} className="v2-btn v2-btn-primary">
               <CalendarPlus size={17} /> จองใหม่
             </button>
@@ -197,7 +197,7 @@ export default function V2Reservations() {
           {bookings.map((b) => (
             <button
               key={b.id}
-              onClick={() => { if (branch === 'hfhotel') openEdit(b) }}
+              onClick={() => { if (canWrite) openEdit(b) }}
               className="w-full flex items-center gap-4 px-4 lg:px-5 py-3.5 text-left transition-colors hover:bg-[var(--v2-surface-2)]"
               style={{ borderColor: 'var(--v2-line)' }}
             >

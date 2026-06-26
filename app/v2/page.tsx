@@ -60,7 +60,7 @@ function flowTone(n: number, tone: string) {
 }
 
 export default function V2Today() {
-  const { branch } = useBranch()
+  const { branch, canWrite } = useBranch()
   const branchFetch = useBranchFetch()
   const [stats, setStats] = useState<Stats | null>(null)
   const [checkins, setCheckins] = useState<CheckInRow[]>([])
@@ -185,7 +185,7 @@ export default function V2Today() {
         </div>
         {/* Write actions only for HF Hotel; Ville/all are view-only (writes
             would otherwise misroute to the HF Hotel pool). */}
-        {branch === 'hfhotel' && (
+        {canWrite && (
           <div className="flex items-center gap-2">
             <Link href="/v2/reservations?new=1" className="v2-btn v2-btn-primary">
               <CalendarPlus size={17} /> จองใหม่

@@ -154,6 +154,13 @@ pub struct AppState {
     /// flag. The `/api/auth/*` endpoints REMAIN reachable in either
     /// state — only the gate on `/api/new/*` is toggled.
     pub auth_enabled: bool,
+    /// Master switch for HF Ville writes from the new app. Read from
+    /// `HFVILLE_WRITES_ENABLED` in `main.rs`; defaults to `false`. When false,
+    /// every `branch=hfville` mutation is rejected (guard middleware +
+    /// `resolve_write_services`) so a Ville write can never misroute into the
+    /// HF Hotel pool. When true, Ville writes are routed to `ville_pool`
+    /// (co-equal coexistence — ADR 0002).
+    pub hfville_writes_enabled: bool,
 }
 
 impl AppState {
@@ -218,6 +225,7 @@ impl AppState {
             pos_service: services.pos,
             auth_service: crate::routes::auth::build_auth_service(),
             auth_enabled: false,
+            hfville_writes_enabled: false,
         }
     }
 
@@ -263,6 +271,7 @@ impl AppState {
             pos_service: services.pos,
             auth_service: crate::routes::auth::build_auth_service(),
             auth_enabled: false,
+            hfville_writes_enabled: false,
         }
     }
 
@@ -272,6 +281,15 @@ impl AppState {
     /// regardless so the frontend can probe the auth state.
     pub fn with_auth_enabled(mut self, enabled: bool) -> Self {
         self.auth_enabled = enabled;
+        self
+    }
+
+    /// Builder-style toggle for HF Ville writes. Called from `main.rs` once it
+    /// has read `HFVILLE_WRITES_ENABLED`. Defaults to `false` (writes rejected)
+    /// so production is safe until the per-site write path (Ship B) is verified
+    /// and an operator flips the flag under coordination — ADR 0002.
+    pub fn with_hfville_writes(mut self, enabled: bool) -> Self {
+        self.hfville_writes_enabled = enabled;
         self
     }
 
@@ -377,6 +395,9 @@ pub struct ModeResponse {
     pub success: bool,
     pub mode: SystemMode,
     pub ville_available: bool,
+    /// Whether the new app may WRITE HF Ville (HFVILLE_WRITES_ENABLED). The
+    /// frontend uses this to decide if HF Ville is interactive or view-only.
+    pub ville_writes_enabled: bool,
 }
 
 /// GET /api/mode - Returns current system mode
@@ -387,6 +408,7 @@ pub async fn get_mode(State(state): State<AppState>) -> ApiResult<Json<ModeRespo
         success: true,
         mode,
         ville_available: state.ville_pool.is_some(),
+        ville_writes_enabled: state.hfville_writes_enabled,
     }))
 }
 
@@ -460,6 +482,7 @@ mod tests {
             success: true,
             mode: SystemMode::New,
             ville_available: true,
+            ville_writes_enabled: false,
         };
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(
@@ -471,6 +494,14 @@ mod tests {
             v.get("ville_available").is_none(),
             "snake_case must NOT be emitted — it would break the frontend gate"
         );
+        // villeWritesEnabled must be present (camelCase) and default false — the
+        // frontend keys HF Ville interactivity on it.
+        assert_eq!(
+            v.get("villeWritesEnabled").and_then(|x| x.as_bool()),
+            Some(false),
+            "frontend depends on camelCase `villeWritesEnabled`"
+        );
+        assert!(v.get("ville_writes_enabled").is_none(), "must be camelCase only");
     }
 
     /// With no Ville pool (disabled, or startup connect failed), the probe must

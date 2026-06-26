@@ -136,6 +136,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auth_enabled = auth_enabled_from_env();
     tracing::info!("Auth middleware: enabled={}", auth_enabled);
 
+    // ADR 0002 coexistence: HF Ville writes from the new app are OFF by default.
+    // When false, the ville-write guard middleware 403s every `branch=hfville`
+    // mutation so a Ville write can never misroute into the HF Hotel pool.
+    let hfville_writes = std::env::var("HFVILLE_WRITES_ENABLED")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    tracing::info!("HF Ville writes: enabled={}", hfville_writes);
+
     // Create AppState — canonical PG only. As of the 2026-06-11 coexistence
     // audit AppState carries no MSSQL handle: routes/repositories never touch
     // the legacy DB (docs/architecture.md "critical rule"); MSSQL is reserved
@@ -145,7 +153,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (final_app_state, new_available) = match new_pool {
         Some(new_hotel) => {
             let mut state = AppState::with_mode(new_hotel, system_mode)
-                .with_auth_enabled(auth_enabled);
+                .with_auth_enabled(auth_enabled)
+                .with_hfville_writes(hfville_writes);
             if let Some(vp) = ville_pool {
                 state = state.with_ville(vp);
             }
@@ -374,6 +383,14 @@ fn build_new_routes(app_state: AppState) -> Router {
         app_middleware::require_auth,
     );
 
+    // ADR 0002: reject HF Ville mutations while the new app isn't a Ville writer.
+    // Default-off safety net so a `branch=hfville` write can never reach a handler
+    // (and thus never misroute into the HF Hotel pool). No-op once the flag is on.
+    let ville_write_guard_layer = axum_middleware::from_fn_with_state(
+        app_state.clone(),
+        ville_write_guard,
+    );
+
     // Track G7 — permission gates layered on top of `require_auth`. Each
     // gate is a no-op when `AUTH_ENABLED=false`, so this stays free until
     // an operator flips the flag. Mounted via `route_layer` on the
@@ -540,4 +557,42 @@ fn build_new_routes(app_state: AppState) -> Router {
         // so the inner routes already have their state attached when
         // the layer wraps them.
         .layer(auth_layer)
+        // Outermost: runs before auth so a disabled-Ville mutation is rejected
+        // up front. Inspects only method + query string (never the body).
+        .layer(ville_write_guard_layer)
+}
+
+/// Guard: when `HFVILLE_WRITES_ENABLED` is off, reject any mutating
+/// (POST/PUT/PATCH/DELETE) request carrying `?branch=hfville` with 403 — before
+/// it can reach a handler that would write the HF Hotel pool. Robustly parses
+/// the `branch` query param (URL-decoded) rather than substring-matching.
+async fn ville_write_guard(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let mutating = matches!(
+        *req.method(),
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    );
+    if mutating && !state.hfville_writes_enabled {
+        let targets_ville = req
+            .uri()
+            .query()
+            .map(|q| {
+                form_urlencoded::parse(q.as_bytes())
+                    .any(|(k, v)| k == "branch" && v == "hfville")
+            })
+            .unwrap_or(false);
+        if targets_ville {
+            return hotel_backend::error::ApiError::Forbidden(
+                "HF Ville writes are disabled (HFVILLE_WRITES_ENABLED=false); manage HF Ville via iHOTEL"
+                    .to_string(),
+            )
+            .into_response();
+        }
+    }
+    next.run(req).await
 }

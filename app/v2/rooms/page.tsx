@@ -43,7 +43,7 @@ const FILTERS: FilterOption[] = [
 ]
 
 export default function V2Rooms() {
-  const { branch } = useBranch()
+  const { branch, canWrite } = useBranch()
   const branchFetch = useBranchFetch()
   const [rooms, setRooms] = useState<RoomItem[]>([])
   const [loading, setLoading] = useState(true)
@@ -253,7 +253,7 @@ export default function V2Rooms() {
 
       {/* Action sheet — hidden while a transactional modal is open */}
       {selected && !modal && (
-        <RoomActionSheet room={selected} onClose={() => setSelected(null)} onAction={handleAction} busy={busy} readOnly={branch !== 'hfhotel'} />
+        <RoomActionSheet room={selected} onClose={() => setSelected(null)} onAction={handleAction} busy={busy} readOnly={!canWrite} />
       )}
 
       {/* Transactional modals (reused from the classic app for contract safety) */}

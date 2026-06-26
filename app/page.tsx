@@ -120,7 +120,7 @@ function getRoomStatus(room: ApiRoom, isCheckoutToday: boolean): RoomStatus {
 }
 
 export default function NewDashboard() {
-  const { branch } = useBranch()
+  const { branch, canWrite } = useBranch()
   const branchFetch = useBranchFetch()
   const { skin } = useSkin()
   const isModernSkin = skin === 'modern'
@@ -539,7 +539,7 @@ export default function NewDashboard() {
               {selectedRoom.status === 'available' && (
                 <button
                   onClick={() => setShowCheckIn(true)}
-                  disabled={!roomIdByNo.get(selectedRoom.roomNumber.toUpperCase())}
+                  disabled={!canWrite || !roomIdByNo.get(selectedRoom.roomNumber.toUpperCase())}
                   className="w-full h-8 flex items-center justify-center gap-1.5 bg-brand-600 text-white hover:bg-brand-700 disabled:opacity-50 transition-colors text-[13px]"
                 >
                   <LogIn size={12} />
@@ -553,7 +553,7 @@ export default function NewDashboard() {
                       the same moment a guest asks for either. */}
                   <button
                     onClick={() => setShowExtendStay(true)}
-                    disabled={!roomIdByNo.get(selectedRoom.roomNumber.toUpperCase())}
+                    disabled={!canWrite || !roomIdByNo.get(selectedRoom.roomNumber.toUpperCase())}
                     className="w-full h-8 flex items-center justify-center gap-1.5 bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50 transition-colors text-[13px]"
                   >
                     <CalendarPlus size={12} />
@@ -564,7 +564,7 @@ export default function NewDashboard() {
                       full lifecycle action set on an occupied tile. */}
                   <button
                     onClick={() => setShowChangeRoom(true)}
-                    disabled={!roomIdByNo.get(selectedRoom.roomNumber.toUpperCase())}
+                    disabled={!canWrite || !roomIdByNo.get(selectedRoom.roomNumber.toUpperCase())}
                     className="w-full h-8 flex items-center justify-center gap-1.5 bg-amber-600 text-white hover:bg-amber-700 disabled:opacity-50 transition-colors text-[13px]"
                   >
                     <ArrowRightLeft size={12} />
@@ -574,7 +574,7 @@ export default function NewDashboard() {
                       change-room because both are "during-stay" actions. */}
                   <button
                     onClick={() => setShowPosSale(true)}
-                    disabled={!roomIdByNo.get(selectedRoom.roomNumber.toUpperCase())}
+                    disabled={!canWrite || !roomIdByNo.get(selectedRoom.roomNumber.toUpperCase())}
                     className="w-full h-8 flex items-center justify-center gap-1.5 bg-orange-600 text-white hover:bg-orange-700 disabled:opacity-50 transition-colors text-[13px]"
                   >
                     <Coffee size={12} />
@@ -582,7 +582,7 @@ export default function NewDashboard() {
                   </button>
                   <button
                     onClick={() => setShowCheckOut(true)}
-                    disabled={!roomIdByNo.get(selectedRoom.roomNumber.toUpperCase())}
+                    disabled={!canWrite || !roomIdByNo.get(selectedRoom.roomNumber.toUpperCase())}
                     className="w-full h-8 flex items-center justify-center gap-1.5 bg-info text-white hover:opacity-90 disabled:opacity-50 transition-colors text-[13px]"
                   >
                     <LogOut size={12} />

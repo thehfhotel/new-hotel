@@ -38,13 +38,18 @@ function brokenModeResponse(): Response {
 // Mirrors exactly how the classic Sidebar and the new V2Shell gate the control:
 //   disabled = b === 'hfville' && !villeAvailable
 function BranchConsumer() {
-  const { branch, setBranch, villeAvailable } = useBranch()
+  const { branch, setBranch, villeAvailable, villeWritesEnabled, canWrite } = useBranch()
   return (
     <div>
       <div data-testid="branch">{branch}</div>
       <div data-testid="ville-available">{String(villeAvailable)}</div>
+      <div data-testid="ville-writes">{String(villeWritesEnabled)}</div>
+      <div data-testid="can-write">{String(canWrite)}</div>
       <button data-testid="ville-btn" disabled={!villeAvailable} onClick={() => setBranch('hfville')}>
         {BRANCH_LABELS.hfville}
+      </button>
+      <button data-testid="hotel-btn" onClick={() => setBranch('hfhotel')}>
+        {BRANCH_LABELS.hfhotel}
       </button>
     </div>
   )
@@ -157,5 +162,76 @@ describe('BranchContext — HF Ville availability gating', () => {
       </BranchProvider>,
     )
     await waitFor(() => expect(screen.getByTestId('branch')).toHaveTextContent('hfville'))
+  })
+})
+
+describe('BranchContext — HF Ville WRITE gating (canWrite / villeWritesEnabled)', () => {
+  let fetchMock: jest.Mock
+
+  beforeEach(() => {
+    fetchMock = jest.fn()
+    global.fetch = fetchMock as unknown as typeof fetch
+    localStorage.clear()
+  })
+
+  test('HF Hotel is always writable regardless of villeWritesEnabled', async () => {
+    fetchMock.mockResolvedValue(modeResponse({ success: true, villeAvailable: true, villeWritesEnabled: false }))
+    render(
+      <BranchProvider>
+        <BranchConsumer />
+      </BranchProvider>,
+    )
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/mode'))
+    expect(screen.getByTestId('branch')).toHaveTextContent('hfhotel')
+    expect(screen.getByTestId('can-write')).toHaveTextContent('true')
+  })
+
+  test('HF Ville is NOT writable when villeWritesEnabled:false (view-only)', async () => {
+    fetchMock.mockResolvedValue(modeResponse({ success: true, villeAvailable: true, villeWritesEnabled: false }))
+    render(
+      <BranchProvider>
+        <BranchConsumer />
+      </BranchProvider>,
+    )
+    await waitFor(() => expect(screen.getByTestId('ville-btn')).not.toBeDisabled())
+    act(() => {
+      fireEvent.click(screen.getByTestId('ville-btn'))
+    })
+    expect(screen.getByTestId('branch')).toHaveTextContent('hfville')
+    expect(screen.getByTestId('ville-writes')).toHaveTextContent('false')
+    expect(screen.getByTestId('can-write')).toHaveTextContent('false')
+  })
+
+  test('HF Ville becomes writable when villeWritesEnabled:true', async () => {
+    fetchMock.mockResolvedValue(modeResponse({ success: true, villeAvailable: true, villeWritesEnabled: true }))
+    render(
+      <BranchProvider>
+        <BranchConsumer />
+      </BranchProvider>,
+    )
+    await waitFor(() => expect(screen.getByTestId('ville-writes')).toHaveTextContent('true'))
+    act(() => {
+      fireEvent.click(screen.getByTestId('ville-btn'))
+    })
+    expect(screen.getByTestId('branch')).toHaveTextContent('hfville')
+    expect(screen.getByTestId('can-write')).toHaveTextContent('true')
+  })
+
+  test('villeWritesEnabled must be camelCase — snake_case must not enable writes', async () => {
+    fetchMock.mockResolvedValue(modeResponse({ success: true, villeAvailable: true, ville_writes_enabled: true }))
+    render(
+      <BranchProvider>
+        <BranchConsumer />
+      </BranchProvider>,
+    )
+    // Wait for villeAvailable to resolve so the branch button is clickable;
+    // villeWritesEnabled must stay false (snake_case ignored).
+    await waitFor(() => expect(screen.getByTestId('ville-btn')).not.toBeDisabled())
+    expect(screen.getByTestId('ville-writes')).toHaveTextContent('false')
+    act(() => {
+      fireEvent.click(screen.getByTestId('ville-btn'))
+    })
+    expect(screen.getByTestId('branch')).toHaveTextContent('hfville')
+    expect(screen.getByTestId('can-write')).toHaveTextContent('false')
   })
 })
