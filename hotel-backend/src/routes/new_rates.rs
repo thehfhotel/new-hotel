@@ -41,9 +41,12 @@ use axum::{
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use uuid::Uuid;
 
-use super::mode::AppState;
+use super::mode::{AppState, Branch};
 use crate::error::{ApiError, ApiResult};
+use crate::outbox::intent::{rate_price_aggregate, RatePricePayload, WritebackIntent};
+use crate::outbox::{generate_idempotency_key, OutboxRepository};
 
 /// `Cust_Type` literal that selects the "standard" pricing tier in
 /// legacy iHOTEL. Used as the implicit default when callers query the
@@ -550,6 +553,317 @@ fn rate_tier_from_row(row: &sqlx::postgres::PgRow) -> RateTier {
         legacy_id: row.try_get::<i32, _>("rate_tier_legacy_id").ok(),
         active: row.try_get::<bool, _>("rate_tier_active").unwrap_or(true),
     }
+}
+
+// ============================================================================
+// Task #51 — canonical ht_rate_tiers WRITE path (replaces the dead ht_rates
+// writes) + legacy HT_Rooms_Price writeback.
+// ============================================================================
+//
+// The pre-#51 POST/PUT/DELETE above write the DEPRECATED `ht_rates` table,
+// which no canonical reader consumes and which never reaches iHOTEL. The
+// endpoints below write the LIVE `ht_rate_tiers` matrix (the mirror of legacy
+// `HT_Rooms_Price`) and enqueue a `WritebackIntent::UpsertRatePrice` so the
+// edit lands on iHOTEL's pricing matrix too. Branch-aware: the canonical write
+// and the outbox enqueue both target the per-branch pool (HF Ville mutations
+// are gated upstream by `ville_write_guard`).
+
+/// Resolve the canonical pool + the diagnostic site string for a branch.
+/// `Branch::All` is not meaningful for a write → treated as HF Hotel.
+fn pool_and_site(state: &AppState, branch: Branch) -> ApiResult<(&crate::db::PgPool, &'static str)> {
+    match branch {
+        Branch::Hfville => Ok((state.ville_pool()?, "hfville")),
+        Branch::Hfhotel | Branch::All => Ok((&state.new_pool, "hfhotel")),
+    }
+}
+
+/// Query parameters for `GET /api/rate-tiers`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateTiersQuery {
+    pub branch: Option<Branch>,
+    /// Filter to a single `rate_tier_room_type` (Thai literal).
+    pub room_type: Option<String>,
+    /// `false` (default) returns every tier; `true` only active ones.
+    #[serde(default)]
+    pub active_only: bool,
+}
+
+/// Response for `GET /api/rate-tiers`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateTiersResponse {
+    pub success: bool,
+    pub data: Vec<RateTier>,
+    pub total: i32,
+}
+
+/// Request body for `POST /api/rate-tiers`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateRateTierRequest {
+    pub branch: Option<Branch>,
+    pub room_type: String,
+    pub cust_type: String,
+    pub price: f64,
+    #[serde(default)]
+    pub price_hourly: Option<f64>,
+    #[serde(default)]
+    pub price_monthly: Option<f64>,
+    #[serde(default = "default_true")]
+    pub active: bool,
+}
+
+/// Request body for `PUT /api/rate-tiers/:id`. The composite key
+/// `(room_type, cust_type)` is the tier's identity and is NOT editable here —
+/// only the prices + active flag. Read back from the existing row.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateRateTierRequest {
+    pub branch: Option<Branch>,
+    pub price: f64,
+    #[serde(default)]
+    pub price_hourly: Option<f64>,
+    #[serde(default)]
+    pub price_monthly: Option<f64>,
+    #[serde(default = "default_true")]
+    pub active: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// GET /api/rate-tiers — the full canonical `(room_type, cust_type)` pricing
+/// matrix (every customer-type tier, not just the default). Branch-aware.
+pub async fn list_rate_tiers(
+    State(state): State<AppState>,
+    Query(params): Query<RateTiersQuery>,
+) -> ApiResult<Json<RateTiersResponse>> {
+    let (pool, _site) = pool_and_site(&state, params.branch.unwrap_or_default())?;
+
+    let mut conditions: Vec<String> = Vec::new();
+    if params.active_only {
+        conditions.push("rate_tier_active = true".to_string());
+    }
+    if let Some(rt) = params.room_type.as_deref() {
+        conditions.push(format!("rate_tier_room_type = '{}'", rt.replace('\'', "''")));
+    }
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conditions.join(" AND "))
+    };
+
+    let query = format!(
+        r#"
+        SELECT
+            rate_tier_id,
+            rate_tier_room_type,
+            rate_tier_cust_type,
+            rate_tier_price::float8         AS rate_tier_price,
+            rate_tier_price_hourly::float8  AS rate_tier_price_hourly,
+            rate_tier_price_monthly::float8 AS rate_tier_price_monthly,
+            rate_tier_legacy_id,
+            rate_tier_active
+        FROM ht_rate_tiers
+        {where_clause}
+        ORDER BY rate_tier_room_type ASC, rate_tier_cust_type ASC
+        "#
+    );
+
+    let rows = sqlx::query(sqlx::AssertSqlSafe(&*query)).fetch_all(pool).await?;
+    let data: Vec<RateTier> = rows.iter().map(rate_tier_from_row).collect();
+    let total = data.len() as i32;
+
+    Ok(Json(RateTiersResponse {
+        success: true,
+        data,
+        total,
+    }))
+}
+
+/// POST /api/rate-tiers — create a new `(room_type, cust_type)` tier in
+/// canonical PG and enqueue the legacy `HT_Rooms_Price` UPSERT.
+pub async fn create_rate_tier(
+    State(state): State<AppState>,
+    Json(body): Json<CreateRateTierRequest>,
+) -> ApiResult<Json<MutationResponse>> {
+    let room_type = body.room_type.trim();
+    let cust_type = body.cust_type.trim();
+    if room_type.is_empty() {
+        return Err(ApiError::BadRequest("Room type is required".to_string()));
+    }
+    if cust_type.is_empty() {
+        return Err(ApiError::BadRequest("Customer type is required".to_string()));
+    }
+    if !body.price.is_finite() || body.price < 0.0 {
+        return Err(ApiError::BadRequest("Price must be a non-negative number".to_string()));
+    }
+
+    let (pool, site) = pool_and_site(&state, body.branch.unwrap_or_default())?;
+    let mut tx = pool.begin().await?;
+
+    // Reject a duplicate composite key with a 400 rather than letting the
+    // UNIQUE constraint surface as a 500.
+    let existing = sqlx::query(
+        "SELECT 1 FROM ht_rate_tiers WHERE rate_tier_room_type = $1 AND rate_tier_cust_type = $2",
+    )
+    .bind(room_type)
+    .bind(cust_type)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if existing.is_some() {
+        return Err(ApiError::BadRequest(
+            "A rate tier already exists for this room type / customer type".to_string(),
+        ));
+    }
+
+    let rec = sqlx::query(
+        "INSERT INTO ht_rate_tiers \
+             (rate_tier_room_type, rate_tier_cust_type, rate_tier_price, \
+              rate_tier_price_hourly, rate_tier_price_monthly, rate_tier_active) \
+         VALUES ($1, $2, $3::numeric, $4::numeric, $5::numeric, $6) \
+         RETURNING rate_tier_id",
+    )
+    .bind(room_type)
+    .bind(cust_type)
+    .bind(body.price)
+    .bind(body.price_hourly)
+    .bind(body.price_monthly)
+    .bind(body.active)
+    .fetch_one(&mut *tx)
+    .await?;
+    let rate_tier_id: i64 = rec.try_get("rate_tier_id")?;
+
+    enqueue_rate_writeback(
+        &mut tx,
+        site,
+        room_type,
+        cust_type,
+        body.price,
+        body.price_hourly,
+        body.price_monthly,
+        body.active,
+    )
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(Json(MutationResponse {
+        success: true,
+        message: "Rate tier created successfully".to_string(),
+        id: Some(rate_tier_id as i32),
+    }))
+}
+
+/// PUT /api/rate-tiers/:id — update a tier's prices (+ active flag) in
+/// canonical PG and enqueue the legacy `HT_Rooms_Price` UPSERT.
+pub async fn update_rate_tier(
+    State(state): State<AppState>,
+    Path(rate_tier_id): Path<i64>,
+    Json(body): Json<UpdateRateTierRequest>,
+) -> ApiResult<Json<MutationResponse>> {
+    if !body.price.is_finite() || body.price < 0.0 {
+        return Err(ApiError::BadRequest("Price must be a non-negative number".to_string()));
+    }
+
+    let (pool, site) = pool_and_site(&state, body.branch.unwrap_or_default())?;
+    let mut tx = pool.begin().await?;
+
+    // Capture the composite key from the existing row — it is the tier's
+    // immutable identity and the legacy `HT_Rooms_Price` UPSERT key.
+    let existing = sqlx::query(
+        "SELECT rate_tier_room_type, rate_tier_cust_type FROM ht_rate_tiers WHERE rate_tier_id = $1",
+    )
+    .bind(rate_tier_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Rate tier not found".to_string()))?;
+    let room_type: String = existing.try_get("rate_tier_room_type")?;
+    let cust_type: String = existing.try_get("rate_tier_cust_type")?;
+
+    sqlx::query(
+        "UPDATE ht_rate_tiers SET \
+             rate_tier_price         = $2::numeric, \
+             rate_tier_price_hourly  = $3::numeric, \
+             rate_tier_price_monthly = $4::numeric, \
+             rate_tier_active        = $5, \
+             rate_tier_updated_at    = NOW() \
+         WHERE rate_tier_id = $1",
+    )
+    .bind(rate_tier_id)
+    .bind(body.price)
+    .bind(body.price_hourly)
+    .bind(body.price_monthly)
+    .bind(body.active)
+    .execute(&mut *tx)
+    .await?;
+
+    enqueue_rate_writeback(
+        &mut tx,
+        site,
+        &room_type,
+        &cust_type,
+        body.price,
+        body.price_hourly,
+        body.price_monthly,
+        body.active,
+    )
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(Json(MutationResponse {
+        success: true,
+        message: "Rate tier updated successfully".to_string(),
+        id: Some(rate_tier_id as i32),
+    }))
+}
+
+/// Enqueue the `HT_Rooms_Price` writeback inside the caller's TX (atomic with
+/// the canonical `ht_rate_tiers` write — architecture.md §3.6c).
+///
+/// Only fires when `active` is true: a disabled tier has no representation in
+/// legacy `HT_Rooms_Price` (the legacy matrix has no active flag), and pushing
+/// the price of a just-disabled tier would mis-mirror it. Deactivation stays
+/// canonical-only — iHOTEL keeps its own row until an operator edits it there
+/// (delete-then-reinsert is iHOTEL's job, not ours; cheatsheet §`HT_Rooms_Price`).
+#[allow(clippy::too_many_arguments)]
+async fn enqueue_rate_writeback(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    site: &str,
+    room_type: &str,
+    cust_type: &str,
+    price: f64,
+    price_hourly: Option<f64>,
+    price_monthly: Option<f64>,
+    active: bool,
+) -> ApiResult<()> {
+    if !active {
+        return Ok(());
+    }
+    let intent = WritebackIntent::UpsertRatePrice {
+        rate_aggregate_id: rate_price_aggregate(site, room_type, cust_type),
+        payload: RatePricePayload {
+            site_id: site.to_string(),
+            room_type: room_type.to_string(),
+            cust_type: cust_type.to_string(),
+            price,
+            price_hourly,
+            price_monthly,
+        },
+    };
+    // Per-event discriminator key: a tier's price is edited repeatedly over its
+    // lifetime and completed jobs persist as status='done' rows, so a
+    // deterministic (intent, aggregate) key would hard-fail the second edit on
+    // the UNIQUE `writeback_jobs.idempotency_key`. (Same rationale as the
+    // room-edit writeback in `new_rooms::update_room`.)
+    let idempotency_key = generate_idempotency_key(&intent, Uuid::new_v4());
+    OutboxRepository::enqueue(tx, &intent, idempotency_key)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(())
 }
 
 #[cfg(test)]

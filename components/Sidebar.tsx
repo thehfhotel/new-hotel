@@ -16,6 +16,8 @@ import {
   BarChart3,
   LayoutGrid,
   DollarSign,
+  Coins,
+  ShoppingBag,
   ChevronLeft,
   ChevronRight,
   FileSpreadsheet,
@@ -80,6 +82,8 @@ const sections: NavSection[] = [
     items: [
       { href: '/room-types', label: 'ประเภทห้อง', icon: <LayoutGrid size={20} /> },
       { href: '/rates', label: 'ราคา', icon: <DollarSign size={20} /> },
+      { href: '/pricing', label: 'เมทริกซ์ราคา', icon: <Coins size={20} /> },
+      { href: '/products', label: 'สินค้า/มินิบาร์', icon: <ShoppingBag size={20} /> },
       // Phase 4 PR4: admin-only — hidden when there's no logged-in
       // user OR when role !== 'admin'. The page itself enforces the
       // same gate server-side; this is just a nav-discoverability hint.

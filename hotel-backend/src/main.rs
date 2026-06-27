@@ -470,6 +470,9 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route("/api/legacy-mirror/coupons", get(routes::legacy_mirror::list_coupons))
         .route("/api/legacy-mirror/products", get(routes::legacy_mirror::list_products))
         .route("/api/legacy-mirror/room-changes", get(routes::legacy_mirror::list_room_changes))
+        // Task #51 — consolidated read-only pricing reference (HT_Rooms_Price /
+        // HT_ContinueTime / HT_Order_Up / HT_Order_Down) for the pricing page.
+        .route("/api/legacy-mirror/pricing", get(routes::legacy_mirror::get_pricing_reference))
         // Customers canonical search (create is a POST on /api/customers above).
         .route("/api/customers/search", get(routes::new_customers::list_customers))
         // Rooms CRUD (canonical)
@@ -562,9 +565,21 @@ fn build_new_routes(app_state: AppState) -> Router {
         // Room types CRUD
         .route("/api/room-types", get(routes::new_room_types::list_room_types).post(routes::new_room_types::create_room_type))
         .route("/api/room-types/{id}", get(routes::new_room_types::get_room_type).put(routes::new_room_types::update_room_type).delete(routes::new_room_types::delete_room_type))
-        // Rates CRUD
+        // Rates CRUD (DEPRECATED ht_rates write path — kept for back-compat).
         .route("/api/rates", get(routes::new_rates::list_rates).post(routes::new_rates::create_rate))
         .route("/api/rates/{id}", get(routes::new_rates::get_rate).put(routes::new_rates::update_rate).delete(routes::new_rates::delete_rate))
+        // Task #51 — canonical (Room_Type, Cust_Type) pricing matrix on
+        // ht_rate_tiers (the live mirror of legacy HT_Rooms_Price). Writes
+        // enqueue a HT_Rooms_Price writeback. Branch-aware (HF Ville mutations
+        // gated by ville_write_guard).
+        .route(
+            "/api/rate-tiers",
+            get(routes::new_rates::list_rate_tiers).post(routes::new_rates::create_rate_tier),
+        )
+        .route(
+            "/api/rate-tiers/{id}",
+            put(routes::new_rates::update_rate_tier),
+        )
         // Reports
         .route("/api/reports/revenue", get(routes::new_reports::get_revenue))
         .route("/api/reports/occupancy", get(routes::new_reports::get_occupancy))
@@ -661,8 +676,20 @@ fn build_new_routes(app_state: AppState) -> Router {
         )
         .route("/api/inventory/transactions", get(routes::new_inventory::list_transactions))
         .route("/api/inventory/stats", get(routes::new_inventory::get_stats))
-        // Products (Track F3 — `audit-2026-05-13.md` T1 CRIT-3)
-        .route("/api/products", get(routes::new_products::list_products))
+        // Products (Track F3 — `audit-2026-05-13.md` T1 CRIT-3; Task #51
+        // added master CRUD + detail + the stock-adjust route mount).
+        .route(
+            "/api/products",
+            get(routes::new_products::list_products).post(routes::new_products::create_product),
+        )
+        .route(
+            "/api/products/{id}",
+            get(routes::new_products::get_product).put(routes::new_products::update_product),
+        )
+        .route(
+            "/api/products/{id}/stock-adjust",
+            post(routes::new_products::adjust_stock),
+        )
         // Maintenance Management
         .route("/api/maintenance/categories", get(routes::new_maintenance::list_categories))
         .route("/api/maintenance/requests", get(routes::new_maintenance::list_requests).post(routes::new_maintenance::create_request))

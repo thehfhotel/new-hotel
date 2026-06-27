@@ -20,6 +20,8 @@ import {
   LogOut,
   ArrowRightLeft,
   CalendarPlus,
+  Plus,
+  Edit3,
 } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { useBranch } from '@/contexts/BranchContext'
@@ -28,6 +30,7 @@ import CheckInModal from '@/components/CheckInModal'
 import CheckOutModal from '@/components/CheckOutModal'
 import ChangeRoomModal from '@/components/ChangeRoomModal'
 import ExtendStayModal from '@/components/ExtendStayModal'
+import RoomForm, { RoomFormData, RoomTypeOption } from '@/components/forms/RoomForm'
 
 // API response types (from /api/rooms)
 interface RoomApiItem {
@@ -88,6 +91,25 @@ export default function RoomsPage() {
   const [showExtendStay, setShowExtendStay] = useState(false)
   // Track G4 / T4 HIGH-3: change-room modal (mid-stay move).
   const [showChangeRoom, setShowChangeRoom] = useState(false)
+  // Task #51: room create/edit form.
+  const [showRoomForm, setShowRoomForm] = useState(false)
+  const [roomFormMode, setRoomFormMode] = useState<'create' | 'edit'>('create')
+  const [roomFormData, setRoomFormData] = useState<RoomFormData | null>(null)
+  const [roomTypeOptions, setRoomTypeOptions] = useState<RoomTypeOption[]>([])
+
+  const fetchRoomTypeOptions = useCallback(async () => {
+    try {
+      const response = await branchFetch('/api/room-types?limit=200')
+      if (!response.ok) return
+      const data = await response.json()
+      const opts: RoomTypeOption[] = (data.data || []).map(
+        (rt: { id: number; typeName: string }) => ({ id: rt.id, typeName: rt.typeName })
+      )
+      setRoomTypeOptions(opts)
+    } catch {
+      // Non-fatal — the form falls back to "ไม่ระบุ" only.
+    }
+  }, [branchFetch])
 
   const fetchRooms = useCallback(async () => {
     setLoading(true)
@@ -109,7 +131,73 @@ export default function RoomsPage() {
 
   useEffect(() => {
     fetchRooms()
-  }, [fetchRooms])
+    fetchRoomTypeOptions()
+  }, [fetchRooms, fetchRoomTypeOptions])
+
+  // Open the create form (blank).
+  const handleAddRoom = () => {
+    setRoomFormMode('create')
+    setRoomFormData(null)
+    setShowRoomForm(true)
+  }
+
+  // Open the edit form, pre-filled from the room's full detail (which carries
+  // the price columns the list payload omits).
+  const handleEditRoom = useCallback(async (room: RoomApiItem) => {
+    let detail: Record<string, unknown> = room as unknown as Record<string, unknown>
+    try {
+      const response = await branchFetch(`/api/rooms/${room.id}`)
+      if (response.ok) {
+        const data = await response.json()
+        detail = (data.room || data.data || data) as Record<string, unknown>
+      }
+    } catch {
+      // Fall back to the list row (no prices) if the detail fetch fails.
+    }
+    setRoomFormData({
+      id: room.id,
+      roomNo: (detail.roomNo as string) ?? room.roomNo,
+      roomTypeId: (detail.roomTypeId as number | null) ?? null,
+      floor: (detail.floor as number | null) ?? null,
+      status: (detail.status as string) ?? 'available',
+      isClean: (detail.isClean as boolean) ?? true,
+      isMaintenance: (detail.isMaintenance as boolean) ?? false,
+      priceWeekday: (detail.priceWeekday as number | null) ?? null,
+      priceWeekend: (detail.priceWeekend as number | null) ?? null,
+      priceSpecial: (detail.priceSpecial as number | null) ?? null,
+      notes: (detail.notes as string) ?? '',
+    })
+    setRoomFormMode('edit')
+    setShowRoomForm(true)
+  }, [branchFetch])
+
+  // POST (create) / PUT (edit) to /api/rooms. Throws on failure so the form
+  // surfaces the message inline.
+  const handleSaveRoom = async (data: RoomFormData) => {
+    const endpoint = data.id ? `/api/rooms/${data.id}` : '/api/rooms'
+    const method = data.id ? 'PUT' : 'POST'
+    const response = await branchFetch(endpoint, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        roomNo: data.roomNo,
+        roomTypeId: data.roomTypeId,
+        floor: data.floor,
+        status: data.status,
+        isClean: data.isClean,
+        isMaintenance: data.isMaintenance,
+        priceWeekday: data.priceWeekday,
+        priceWeekend: data.priceWeekend,
+        priceSpecial: data.priceSpecial,
+        notes: data.notes,
+      }),
+    })
+    const result = await response.json().catch(() => ({}))
+    if (!response.ok || result.success === false) {
+      throw new Error(result.message || 'ไม่สามารถบันทึกห้องพักได้')
+    }
+    fetchRooms()
+  }
 
   const fetchRoomDetail = useCallback(async (room: RoomApiItem) => {
     setSelectedRoom(room)
@@ -277,6 +365,16 @@ export default function RoomsPage() {
               <RefreshCw className="h-4 w-4" />
               <span>รีเฟรช</span>
             </button>
+            {/* Task #51 — room create. Gated on canWrite (HF Ville is
+                read-only by default; backend additionally guards writes). */}
+            <button
+              onClick={handleAddRoom}
+              disabled={!canWrite}
+              className="flex items-center space-x-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            >
+              <Plus className="h-4 w-4" />
+              <span>เพิ่มห้อง</span>
+            </button>
           </div>
         </div>
 
@@ -421,6 +519,16 @@ export default function RoomsPage() {
                     )}
                   </div>
                 </div>
+
+                {/* Task #51 — edit master data (type / price / notes). */}
+                <button
+                  onClick={() => handleEditRoom(selectedRoom)}
+                  disabled={!canWrite}
+                  className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-gray-100 hover:bg-gray-200 text-gray-800 text-sm font-medium rounded disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <Edit3 size={14} />
+                  แก้ไขข้อมูลห้อง
+                </button>
 
                 {/* Flags */}
                 <div>
@@ -587,6 +695,16 @@ export default function RoomsPage() {
           }}
         />
       )}
+
+      {/* Task #51 — room create / edit form. */}
+      <RoomForm
+        isOpen={showRoomForm}
+        onClose={() => setShowRoomForm(false)}
+        onSave={handleSaveRoom}
+        initialData={roomFormData}
+        roomTypes={roomTypeOptions}
+        mode={roomFormMode}
+      />
     </div>
   )
 }

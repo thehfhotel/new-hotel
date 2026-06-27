@@ -403,6 +403,11 @@ fn intent_facts(intent: &WritebackIntent) -> IntentFacts {
         // writes no `HT_CheckIn_Pay` / `HT_CheckIn_H` money row the cashier
         // round attributes (no open-round warning).
         | RefundDeposit { .. }
+        // Task #51 — UpsertRatePrice is an idempotent `IF EXISTS UPDATE ELSE
+        // INSERT` on the `(Room_Type, Room_CustType)` composite key. A second
+        // apply CONVERGES (re-UPDATEs the same row) — not ledgered. It writes
+        // no `HT_CheckIn_Pay` / `HT_CheckIn_H` money row → no §1.9 warning.
+        | UpsertRatePrice { .. }
         | RedeemCoupon { .. } => (false, false),
     };
     IntentFacts { ledgered, requires_open_round }
@@ -1131,6 +1136,12 @@ pub async fn dispatch(
             })?;
             recipes::sticky_note::execute_mark_read(conn, *target_kind, sms_id).await
         }
+        // Task #51 — rate-price matrix UPSERT. The intent carries the full
+        // `HT_Rooms_Price` row in its payload (composite key + prices), so no
+        // ResolvedJob lookup is needed (UpdateRoom / AdjustProductStock shape).
+        WritebackIntent::UpsertRatePrice { rate_aggregate_id: _, payload } => {
+            recipes::rate_price::execute(conn, payload).await
+        }
     };
 
     // Ledger RECORD — the LAST write before the worker's COMMIT, on the SAME
@@ -1434,12 +1445,13 @@ mod tests {
             "close_round",
             "create_note",
             "mark_note_read",
+            "upsert_rate_price",
         ];
         // We verify dispatch handles all by constructing one of each via the
         // intent name → no actual MSSQL call, just type-level coverage.
         // Counting expected variants here keeps the test cheap and
         // deterministic.
-        assert_eq!(names.len(), 24, "expected 24 WritebackIntent variants");
+        assert_eq!(names.len(), 25, "expected 25 WritebackIntent variants");
     }
 
     /// Cheatsheet §1.9 — byte-pin the round-bill gate probe. iHOTEL's own

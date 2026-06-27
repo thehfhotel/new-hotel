@@ -288,6 +288,17 @@ pub async fn get_room(
 }
 
 /// POST /api/new/rooms - Create room
+///
+/// **Canonical-only — legacy `HT_Rooms` INSERT writeback is a deliberate TODO
+/// (Task #51).** Unlike `update_room` (which UPDATEs an existing legacy row by
+/// `Room_no` — safe, no id allocation), creating a room would require INSERTing
+/// into `HT_Rooms`, whose `id` iHOTEL allocates app-side (MAX+1, race-prone —
+/// see CLAUDE.md "Sole standing exception"). A blind INSERT here risks a
+/// duplicate-id race with a concurrent iHOTEL save and has no back-population
+/// anchor. New rooms are rare; create them in iHOTEL (the 15-minute room mirror
+/// + `backfill_rooms` reconcile them inbound), or add the room here and let an
+/// operator mirror it. Editing an existing room's price/type/notes DOES write
+/// back (`update_room`).
 pub async fn create_room(
     State(state): State<AppState>,
     Json(body): Json<CreateUpdateRoomRequest>,

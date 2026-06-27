@@ -614,6 +614,73 @@ pub enum WritebackIntent {
         /// Which legacy SMS table to target.
         target_kind: NoteTargetKind,
     },
+
+    /// Task #51 — admin edit of the `(Room_Type, Cust_Type)` pricing matrix.
+    /// Mirrors a PG `ht_rate_tiers` UPSERT → legacy `HT_Rooms_Price` UPSERT
+    /// keyed by the composite natural key `(Room_Type, Room_CustType)`.
+    ///
+    /// `ht_rate_tiers` is the canonical mirror of `HT_Rooms_Price`
+    /// (`sync/mappers/rate_tiers.rs`); before this intent existed the rate
+    /// CRUD form wrote the DEAD `ht_rates` table and never reached iHOTEL.
+    ///
+    /// The recipe builds a single `IF EXISTS … UPDATE … ELSE INSERT …`
+    /// statement (the legacy `id` is server-allocated IDENTITY, so an
+    /// INSERT is collision-free — no app-side id race). We deliberately key
+    /// on the composite `(Room_Type, Room_CustType)` rather than the legacy
+    /// `id` so the write survives iHOTEL's delete-then-reinsert edit pattern
+    /// (cheatsheet §`HT_Rooms_Price`). The 15-minute mirror poll re-pins
+    /// `rate_tier_legacy_id` afterward. See `writeback/recipes/rate_price.rs`.
+    UpsertRatePrice {
+        /// Deterministic per-tier aggregate id (see [`rate_price_aggregate`]).
+        rate_aggregate_id: Uuid,
+        payload: RatePricePayload,
+    },
+}
+
+/// Payload for [`WritebackIntent::UpsertRatePrice`].
+///
+/// Carries the full `HT_Rooms_Price` row shape the recipe needs to UPSERT —
+/// no PG re-query. Field → legacy column mapping (`docs/legacy-app/SCHEMA.sql`
+/// + `sync/mappers/rate_tiers.rs`):
+/// * `room_type`     → `HT_Rooms_Price.Room_Type` (Thai literal)
+/// * `cust_type`     → `HT_Rooms_Price.Room_CustType` (Thai literal)
+/// * `price`         → `Room_Price`
+/// * `price_hourly`  → `Room_Price_H`
+/// * `price_monthly` → `Room_Price_M`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RatePricePayload {
+    /// Site this tier belongs to (`hfhotel` / `hfville`). Diagnostic only —
+    /// the writeback worker targets the correct MSSQL server per its
+    /// `SITE_ID`; this makes the queued row self-describing.
+    pub site_id: String,
+    /// `HT_Rooms_Price.Room_Type` — composite-key half (Thai literal).
+    pub room_type: String,
+    /// `HT_Rooms_Price.Room_CustType` — composite-key half (Thai literal).
+    pub cust_type: String,
+    /// `HT_Rooms_Price.Room_Price` — per-night price (baht).
+    pub price: f64,
+    /// `HT_Rooms_Price.Room_Price_H` — per-hour extension price. `None` ⇒
+    /// recipe writes `NULL` (matches the legacy nullable column).
+    #[serde(default)]
+    pub price_hourly: Option<f64>,
+    /// `HT_Rooms_Price.Room_Price_M` — monthly price. `None` ⇒ `NULL`.
+    #[serde(default)]
+    pub price_monthly: Option<f64>,
+}
+
+/// Deterministic per-tier aggregate id for [`WritebackIntent::UpsertRatePrice`].
+/// Derived as a v5 UUID over `"{site}:{room_type}:{cust_type}"` so repeated
+/// edits to the same `(room_type, cust_type)` tier share one aggregate id (and
+/// thus group in the `writeback_jobs` index), while a different tier gets a
+/// different aggregate. `ht_rate_tiers.rate_tier_id` is a PG-only `BIGSERIAL`
+/// not portable across the two logical DBs, so the composite natural key is the
+/// stable cross-site identity — same rationale as [`round_aggregate`].
+pub fn rate_price_aggregate(site_id: &str, room_type: &str, cust_type: &str) -> Uuid {
+    let namespace = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"new-hotel.aggregate.rate_price");
+    Uuid::new_v5(
+        &namespace,
+        format!("{site_id}:{room_type}:{cust_type}").as_bytes(),
+    )
 }
 
 /// Payload for [`WritebackIntent::OpenRound`].
@@ -881,6 +948,7 @@ impl WritebackIntent {
             WritebackIntent::RefundDeposit { .. } => "refund_deposit",
             WritebackIntent::CreateNote { .. } => "create_note",
             WritebackIntent::MarkNoteRead { .. } => "mark_note_read",
+            WritebackIntent::UpsertRatePrice { .. } => "upsert_rate_price",
         }
     }
 
@@ -925,6 +993,7 @@ impl WritebackIntent {
             | WritebackIntent::CloseRound { round_aggregate_id, .. } => *round_aggregate_id,
             WritebackIntent::CreateNote { note_aggregate_id, .. }
             | WritebackIntent::MarkNoteRead { note_aggregate_id, .. } => *note_aggregate_id,
+            WritebackIntent::UpsertRatePrice { rate_aggregate_id, .. } => *rate_aggregate_id,
         }
     }
 }

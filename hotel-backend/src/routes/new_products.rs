@@ -112,6 +112,57 @@ pub struct StockAdjustResponse {
     pub writeback_job_id: i64,
 }
 
+/// Single-product response (detail + after create/update).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProductResponse {
+    pub success: bool,
+    pub product: Product,
+}
+
+/// Request body for `POST /api/products` (create) — Task #51.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateProductRequest {
+    /// `prod_legacy_no` (== legacy `HT_Products.Pro_no`). Required + unique;
+    /// the operator supplies the business key (matches iHOTEL's own Pro_no
+    /// allocation convention).
+    pub legacy_no: String,
+    pub name: String,
+    #[serde(default)]
+    pub unit: Option<String>,
+    #[serde(default)]
+    pub price: f64,
+    /// Opening stock. Defaults to zero; subsequent changes go through the
+    /// additive `/stock-adjust` path (which mirrors the delta to legacy).
+    #[serde(default)]
+    pub current_stock: f64,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default = "default_true")]
+    pub active: bool,
+}
+
+/// Request body for `PUT /api/products/:id` (update master fields). Stock is
+/// NOT editable here — use `/stock-adjust` (additive, legacy-mirrored).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateProductRequest {
+    pub name: String,
+    #[serde(default)]
+    pub unit: Option<String>,
+    #[serde(default)]
+    pub price: f64,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default = "default_true")]
+    pub active: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 // ============================================================================
 // Handlers
 // ============================================================================
@@ -180,6 +231,151 @@ pub async fn list_products(
             params.limit.max(1),
             i32::try_from(total).unwrap_or(i32::MAX),
         ),
+    }))
+}
+
+/// GET /api/products/:id — single product by canonical `prod_id`.
+pub async fn get_product(
+    State(state): State<AppState>,
+    Path(prod_id): Path<i64>,
+) -> ApiResult<Json<ProductResponse>> {
+    let row = sqlx::query(
+        "SELECT prod_id, prod_legacy_no, prod_name, prod_unit, \
+                prod_price::float8 AS prod_price, \
+                prod_current_stock::float8 AS prod_current_stock, \
+                prod_category, prod_active, aggregate_id, \
+                prod_created_at, prod_updated_at \
+           FROM ht_products WHERE prod_id = $1",
+    )
+    .bind(prod_id)
+    .fetch_optional(&state.new_pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Product not found".into()))?;
+
+    Ok(Json(ProductResponse {
+        success: true,
+        product: row_to_product(row),
+    }))
+}
+
+/// POST /api/products — create a canonical product (Task #51).
+///
+/// ## Legacy writeback — deliberate TODO
+///
+/// Product CREATE is **canonical-only**. Mirroring an INSERT into legacy
+/// `HT_Products` would have to allocate the row's `id`/`Pro_no` app-side, but
+/// iHOTEL allocates those MAX+1 app-side itself and edits the table with a
+/// destructive delete-then-reinsert (cheatsheet §`HT_Products`, §1471) — a
+/// blind INSERT risks a duplicate-key race with a concurrent iHOTEL save and
+/// has no back-population anchor. Stock changes (the high-frequency mutation)
+/// DO mirror, via the additive `/stock-adjust` → `AdjustProductStock`
+/// writeback. New-product master rows are reconciled inbound by the 15-minute
+/// `sync/mappers/products.rs` poll once created in iHOTEL.
+pub async fn create_product(
+    State(state): State<AppState>,
+    Json(body): Json<CreateProductRequest>,
+) -> ApiResult<Json<ProductResponse>> {
+    let legacy_no = body.legacy_no.trim();
+    let name = body.name.trim();
+    if legacy_no.is_empty() {
+        return Err(ApiError::BadRequest("Product code (legacy_no) is required".into()));
+    }
+    if name.is_empty() {
+        return Err(ApiError::BadRequest("Product name is required".into()));
+    }
+    if !body.price.is_finite() || body.price < 0.0 {
+        return Err(ApiError::BadRequest("Price must be a non-negative number".into()));
+    }
+    if !body.current_stock.is_finite() {
+        return Err(ApiError::BadRequest("Opening stock must be a finite number".into()));
+    }
+
+    let pool = &state.new_pool;
+
+    let existing = sqlx::query("SELECT 1 FROM ht_products WHERE prod_legacy_no = $1")
+        .bind(legacy_no)
+        .fetch_optional(pool)
+        .await?;
+    if existing.is_some() {
+        return Err(ApiError::BadRequest("Product code already exists".into()));
+    }
+
+    let row = sqlx::query(
+        "INSERT INTO ht_products \
+             (prod_legacy_no, prod_name, prod_unit, prod_price, \
+              prod_current_stock, prod_category, prod_active) \
+         VALUES ($1, $2, $3, $4::numeric, $5::numeric, $6, $7) \
+         RETURNING prod_id, prod_legacy_no, prod_name, prod_unit, \
+                   prod_price::float8 AS prod_price, \
+                   prod_current_stock::float8 AS prod_current_stock, \
+                   prod_category, prod_active, aggregate_id, \
+                   prod_created_at, prod_updated_at",
+    )
+    .bind(legacy_no)
+    .bind(name)
+    .bind(body.unit.as_deref())
+    .bind(body.price)
+    .bind(body.current_stock)
+    .bind(body.category.as_deref())
+    .bind(body.active)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(Json(ProductResponse {
+        success: true,
+        product: row_to_product(row),
+    }))
+}
+
+/// PUT /api/products/:id — update product master fields (Task #51).
+///
+/// Canonical-only — same legacy-writeback TODO as [`create_product`]. A
+/// price/name edit could in principle UPDATE `HT_Products` by `Pro_no` (no id
+/// allocation, so safer than create), but iHOTEL's delete-then-reinsert edit
+/// pattern means our UPDATE could race a concurrent iHOTEL re-save; this is
+/// left as a follow-on once the byte-shape (and which of `Pro_PriceA/B/C` the
+/// new app's single `price` maps to) is verified against a live capture.
+pub async fn update_product(
+    State(state): State<AppState>,
+    Path(prod_id): Path<i64>,
+    Json(body): Json<UpdateProductRequest>,
+) -> ApiResult<Json<ProductResponse>> {
+    let name = body.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::BadRequest("Product name is required".into()));
+    }
+    if !body.price.is_finite() || body.price < 0.0 {
+        return Err(ApiError::BadRequest("Price must be a non-negative number".into()));
+    }
+
+    let row = sqlx::query(
+        "UPDATE ht_products SET \
+             prod_name     = $2, \
+             prod_unit     = $3, \
+             prod_price    = $4::numeric, \
+             prod_category = $5, \
+             prod_active   = $6, \
+             prod_updated_at = NOW() \
+         WHERE prod_id = $1 \
+         RETURNING prod_id, prod_legacy_no, prod_name, prod_unit, \
+                   prod_price::float8 AS prod_price, \
+                   prod_current_stock::float8 AS prod_current_stock, \
+                   prod_category, prod_active, aggregate_id, \
+                   prod_created_at, prod_updated_at",
+    )
+    .bind(prod_id)
+    .bind(name)
+    .bind(body.unit.as_deref())
+    .bind(body.price)
+    .bind(body.category.as_deref())
+    .bind(body.active)
+    .fetch_optional(&state.new_pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Product not found".into()))?;
+
+    Ok(Json(ProductResponse {
+        success: true,
+        product: row_to_product(row),
     }))
 }
 

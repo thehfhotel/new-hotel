@@ -14,9 +14,41 @@ use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
-use super::mode::AppState;
+use super::mode::{AppState, Branch};
 use crate::error::{ApiError, ApiResult};
 use crate::models::Pagination;
+
+/// Resolve the canonical pool for a branch. HF Hotel reads/writes `new_pool`,
+/// HF Ville reads/writes `ville_pool`; `All` is not meaningful for room-type
+/// master ops (a per-database SERIAL `type_id` collides across the two logical
+/// DBs) so it defaults to HF Hotel. HF Ville mutations are gated upstream by
+/// `ville_write_guard`.
+///
+/// ## Legacy writeback — deliberately a TODO (Task #51)
+///
+/// Room-type master edits are **canonical-only** for now. The nearest legacy
+/// table is `HT_SET_RoomType` (`id, id_full, name, Room_PriceA/B/C` — cheatsheet
+/// §`HT_SET_RoomType`), but (a) iHOTEL edits it with a destructive
+/// delete-then-reinsert (cheatsheet §1471 "master-data edit"), (b) our
+/// `ht_room_types` shape (type_code / name_en / max_guests / bed_type / size)
+/// does not map 1:1 onto it, and (c) nothing in `sync/mappers/` mirrors it
+/// inbound, so there is no back-population anchor. Wiring a writeback would
+/// require byte-shape verification we can't derive from the docs. The
+/// price-bearing dimension iHOTEL actually consumes (`HT_Rooms_Price`) IS
+/// mirrored — edit it via the rate-tier endpoints, which DO write back.
+fn room_type_pool(state: &AppState, branch: Branch) -> ApiResult<&crate::db::PgPool> {
+    match branch {
+        Branch::Hfville => state.ville_pool(),
+        Branch::Hfhotel | Branch::All => Ok(&state.new_pool),
+    }
+}
+
+/// Branch selector for the single-room-type ops (get/create/update/delete).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomTypeBranchQuery {
+    pub branch: Option<Branch>,
+}
 
 /// Room type from HT_Room_Types table
 ///
@@ -67,6 +99,9 @@ pub struct RoomTypesQuery {
     pub limit: i32,
     pub sort_by: Option<String>,
     pub sort_order: Option<String>,
+    /// Branch selector: 'hfhotel' (default) | 'hfville'. Selects which logical
+    /// PG database the room-type list is read from.
+    pub branch: Option<Branch>,
 }
 
 fn default_page() -> i32 { 1 }
@@ -130,7 +165,7 @@ pub async fn list_room_types(
     State(state): State<AppState>,
     Query(params): Query<RoomTypesQuery>,
 ) -> ApiResult<Json<RoomTypesResponse>> {
-    let pool = &state.new_pool;
+    let pool = room_type_pool(&state, params.branch.unwrap_or_default())?;
 
     let offset = (params.page - 1) * params.limit;
     let sort_order = params
@@ -227,8 +262,9 @@ pub async fn list_room_types(
 pub async fn get_room_type(
     State(state): State<AppState>,
     Path(type_id): Path<i32>,
+    Query(bq): Query<RoomTypeBranchQuery>,
 ) -> ApiResult<Json<RoomTypeResponse>> {
-    let pool = &state.new_pool;
+    let pool = room_type_pool(&state, bq.branch.unwrap_or_default())?;
 
     let rec = sqlx::query!(
         r#"SELECT type_id, type_code, type_name, type_name_en, type_description,
@@ -268,6 +304,7 @@ pub async fn get_room_type(
 /// POST /api/new/room-types - Create room type
 pub async fn create_room_type(
     State(state): State<AppState>,
+    Query(bq): Query<RoomTypeBranchQuery>,
     Json(body): Json<CreateUpdateRoomTypeRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
     let type_code = body.type_code.trim();
@@ -280,7 +317,9 @@ pub async fn create_room_type(
         return Err(ApiError::BadRequest("Type name is required".to_string()));
     }
 
-    let pool = &state.new_pool;
+    // Canonical-only (see `room_type_pool` doc — legacy HT_SET_RoomType
+    // writeback is a deliberate TODO pending byte-shape verification).
+    let pool = room_type_pool(&state, bq.branch.unwrap_or_default())?;
 
     // Check for duplicate type code
     let existing = sqlx::query!(
@@ -330,6 +369,7 @@ pub async fn create_room_type(
 pub async fn update_room_type(
     State(state): State<AppState>,
     Path(type_id): Path<i32>,
+    Query(bq): Query<RoomTypeBranchQuery>,
     Json(body): Json<CreateUpdateRoomTypeRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
     let type_code = body.type_code.trim();
@@ -342,7 +382,10 @@ pub async fn update_room_type(
         return Err(ApiError::BadRequest("Type name is required".to_string()));
     }
 
-    let pool = &state.new_pool;
+    // Canonical-only (legacy HT_SET_RoomType writeback is a TODO — see
+    // `room_type_pool`). The price dimension iHOTEL reads lives in
+    // HT_Rooms_Price; edit that via the rate-tier endpoints.
+    let pool = room_type_pool(&state, bq.branch.unwrap_or_default())?;
 
     // Check for duplicate type code (excluding current type)
     let existing = sqlx::query!(
@@ -395,8 +438,9 @@ pub async fn update_room_type(
 pub async fn delete_room_type(
     State(state): State<AppState>,
     Path(type_id): Path<i32>,
+    Query(bq): Query<RoomTypeBranchQuery>,
 ) -> ApiResult<Json<MutationResponse>> {
-    let pool = &state.new_pool;
+    let pool = room_type_pool(&state, bq.branch.unwrap_or_default())?;
 
     // Check if room type is in use by any rooms
     let rec = sqlx::query!(

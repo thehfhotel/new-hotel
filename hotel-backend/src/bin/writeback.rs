@@ -1197,6 +1197,10 @@ async fn resolve_legacy_ids(
                 resolved.note_legacy_id = row.try_get("note_legacy_id").ok();
             }
         }
+        // Task #51 — UpsertRatePrice carries the full `HT_Rooms_Price` row
+        // (composite key + prices) in its payload; nothing to resolve from PG.
+        // Mirrors the `UpdateRoom` / `AdjustProductStock` resolution shape.
+        UpsertRatePrice { .. } => {}
     }
     Ok(resolved)
 }
@@ -1991,6 +1995,12 @@ async fn back_populate_legacy_ids(
             }
         }
         MarkNoteRead { .. } => {}
+        // Task #51 — UpsertRatePrice targets `HT_Rooms_Price` by the composite
+        // `(Room_Type, Room_CustType)` key and allocates no new legacy id (the
+        // INSERT branch's IDENTITY is re-pinned onto `rate_tier_legacy_id` by
+        // the 15-minute mirror poll, not by this writeback). Nothing to
+        // back-populate here.
+        UpsertRatePrice { .. } => {}
     }
     Ok(())
 }
