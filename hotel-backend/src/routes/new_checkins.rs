@@ -316,6 +316,12 @@ pub async fn list_checkins(
 /// whether a `booking_id` was provided.
 pub async fn create_checkin(
     State(state): State<AppState>,
+    // Task #40: the authenticated operator, when present (auth ships dark →
+    // `None`). Stamped into the writeback context's `created_by` so the legacy
+    // mirror records who created the check-in. There is no body fallback for
+    // this field, so when auth is off it stays the empty sentinel (unchanged).
+    // Must precede the `Json` body extractor.
+    actor: Option<Extension<User>>,
     Json(body): Json<CreateCheckInRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
     let cin_no = generate_cin_no(&state).await?;
@@ -332,9 +338,14 @@ pub async fn create_checkin(
             .await?,
         None => body.customer_id,
     };
-    let writeback_context =
+    let mut writeback_context =
         build_check_in_writeback_context(&state, &body, expected_checkout, resolved_customer_id)
             .await?;
+    // Stamp the authenticated operator (if any) over the default empty
+    // `created_by`. No body field carries this, so auth-off leaves it empty.
+    if let Some(actor) = super::resolve_actor(actor.as_deref(), None) {
+        writeback_context.created_by = actor;
+    }
     let adults = body.adults.unwrap_or(1);
     let children = body.children.unwrap_or(0);
     // TODO: wire user_id from auth middleware
@@ -1052,11 +1063,16 @@ pub struct ChangeRoomResponse {
 /// allocated `rc_id` so the UI can link directly to the audit row.
 pub async fn change_room(
     State(state): State<AppState>,
+    // Task #40: the authenticated operator, when present (auth dark → `None`).
+    // Stamped into `ht_room_changes.rc_changed_by` / legacy `HT_Changed_Room`.
+    actor: Option<Extension<User>>,
     Path(cin_id): Path<i32>,
     Query(query): Query<BranchQuery>,
     Json(body): Json<ChangeRoomRequest>,
 ) -> ApiResult<Json<ChangeRoomResponse>> {
-    let command = build_change_room_command(cin_id, &body);
+    // No body fallback for this field; auth-off resolves to the empty sentinel.
+    let actor = super::resolve_actor(actor.as_deref(), None).unwrap_or_default();
+    let command = build_change_room_command(cin_id, &body, actor);
     // Branch-aware (item 5): a HF Ville move recomputes the destination rate
     // and writes the audit row against the Ville pool. HF Ville writes stay
     // gated by `ville_write_guard` until HFVILLE_WRITES_ENABLED.
@@ -1073,16 +1089,17 @@ pub async fn change_room(
 pub(crate) fn build_change_room_command(
     cin_id: i32,
     body: &ChangeRoomRequest,
+    actor: String,
 ) -> ChangeRoomCommand {
     ChangeRoomCommand {
         check_in_id: cin_id,
         from_room_id: body.from_room_id,
         to_room_id: body.to_room_id,
         reason: body.reason.clone(),
-        // Operator name lands here when G7 auth middleware wires
-        // session → state. Empty string is the canonical "unknown"
-        // sentinel (mirrors how walkin handles `created_by`).
-        actor: String::new(),
+        // Task #40 — resolved by the route from `Extension<User>` (auth).
+        // Empty string is the canonical "unknown" sentinel when auth is off
+        // (mirrors how walkin handles `created_by`).
+        actor,
         // TODO: wire user_id from auth middleware (parity with extend/checkout).
         source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
     }
@@ -1361,15 +1378,15 @@ pub async fn list_deposits(
 /// validation + transaction to [`CheckInService::refund_deposit`].
 pub async fn deposit_refund(
     State(state): State<AppState>,
+    // Task #40: prefer the authenticated operator over the body `by`, then the
+    // [`DEPOSIT_REFUND_DEFAULT_BY`] sentinel. Auth dark → `None` → body wins.
+    actor: Option<Extension<User>>,
     Path(cin_id): Path<i32>,
     Query(query): Query<DepositQuery>,
     Json(body): Json<DepositRefundRequest>,
 ) -> ApiResult<Json<DepositRefundResponse>> {
     let svc = checkin_service_for(&state, query.branch)?;
-    let by = body
-        .by
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    let by = super::resolve_actor(actor.as_deref(), body.by.as_deref())
         .unwrap_or_else(|| DEPOSIT_REFUND_DEFAULT_BY.to_string());
     let outcome = svc
         .refund_deposit(RefundDepositCommand {
@@ -2034,13 +2051,16 @@ mod tests {
             to_room_id: 22,
             reason: Some("AC broken".into()),
         };
-        let cmd = build_change_room_command(99, &body);
+        let cmd = build_change_room_command(99, &body, String::new());
         assert_eq!(cmd.check_in_id, 99);
         assert_eq!(cmd.from_room_id, 11);
         assert_eq!(cmd.to_room_id, 22);
         assert_eq!(cmd.reason.as_deref(), Some("AC broken"));
-        // Actor stays empty until G7 auth middleware lands.
+        // Auth-off resolves to the empty sentinel.
         assert_eq!(cmd.actor, "");
+        // Task #40 — an authenticated operator is threaded straight through.
+        let cmd_with_actor = build_change_room_command(99, &body, "alice".to_string());
+        assert_eq!(cmd_with_actor.actor, "alice");
     }
 
     /// Track G4 / T4 HIGH-3 — empty / missing reason round-trips as
@@ -2052,7 +2072,7 @@ mod tests {
             to_room_id: 2,
             reason: None,
         };
-        let cmd = build_change_room_command(7, &body);
+        let cmd = build_change_room_command(7, &body, String::new());
         assert!(cmd.reason.is_none());
     }
 

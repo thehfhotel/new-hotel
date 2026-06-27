@@ -26,7 +26,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
+    Extension, Json,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,7 @@ use sqlx::Row as _;
 use uuid::Uuid;
 
 use super::mode::{AppState, Branch};
+use crate::domain::user::User;
 use crate::error::{ApiError, ApiResult};
 use crate::outbox::{generate_idempotency_key, NoteTargetKind, OutboxRepository, WritebackIntent};
 
@@ -231,6 +232,10 @@ pub async fn list_notes(
 pub async fn create_note(
     State(state): State<AppState>,
     Query(query): Query<NoteBranchQuery>,
+    // Task #40: prefer the authenticated author over the body `createdBy`.
+    // Auth ships dark, so this is `Option<_>` and the body value is the
+    // fallback. Must precede the `Json` body extractor.
+    actor: Option<Extension<User>>,
     Json(body): Json<CreateNoteRequest>,
 ) -> ApiResult<(StatusCode, Json<NoteMutationResponse>)> {
     let pool = resolve_pool(&state, query.branch)?;
@@ -243,7 +248,8 @@ pub async fn create_note(
     if note_body.is_empty() {
         return Err(ApiError::BadRequest("body is required".to_string()));
     }
-    let created_by = body.created_by.clone().unwrap_or_default();
+    let created_by =
+        super::resolve_actor(actor.as_deref(), body.created_by.as_deref()).unwrap_or_default();
     let aggregate_id = Uuid::new_v4();
 
     let mut tx = pool

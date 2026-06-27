@@ -8,13 +8,14 @@
 
 use axum::{
     extract::{Path, State},
-    Json,
+    Extension, Json,
 };
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::mode::AppState;
+use crate::domain::user::User;
 use crate::error::{ApiError, ApiResult};
 use crate::outbox::event::EventSource;
 use crate::service::{IssueCouponCommand, RedeemCouponCommand};
@@ -64,6 +65,10 @@ pub struct CouponMutationResponse {
 /// `POST /api/new/coupons` — issue a new coupon.
 pub async fn issue_coupon(
     State(state): State<AppState>,
+    // Task #40: the authenticated operator, when present. Auth ships dark, so
+    // this is `Option<_>` (absent → `None`) and the body `issuedBy` remains the
+    // fallback. Must precede the `Json` body extractor.
+    actor: Option<Extension<User>>,
     Json(body): Json<IssueCouponRequest>,
 ) -> ApiResult<Json<CouponMutationResponse>> {
     if !body.value.is_finite() || body.value < 0.0 {
@@ -72,13 +77,15 @@ pub async fn issue_coupon(
         ));
     }
 
+    let issued_by =
+        super::resolve_actor(actor.as_deref(), body.issued_by.as_deref()).unwrap_or_default();
     let outcome = state
         .coupons_service
         .issue_coupon(IssueCouponCommand {
             customer_id: body.customer_id,
             value_baht: body.value,
             expires_at: body.expires_at,
-            issued_by: body.issued_by.clone().unwrap_or_default(),
+            issued_by,
             for_cin_no: body.for_cin_no.clone(),
             // TODO: thread user_id from auth middleware once the route
             // is mounted behind `require_auth`.

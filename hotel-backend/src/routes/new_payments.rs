@@ -308,6 +308,10 @@ pub async fn void_payment(
 /// - sum of refunds ≤ original amount
 pub async fn refund_payment(
     State(state): State<AppState>,
+    // M1 task #40: prefer the authenticated cashier over the body `createdBy`
+    // for the refund's `created_by`, mirroring `create_payment`. Auth ships
+    // dark, so this is `Option<_>` and the body value remains the fallback.
+    actor: Option<Extension<User>>,
     Path(pay_id): Path<i32>,
     Json(body): Json<RefundPaymentRequest>,
 ) -> ApiResult<Json<PaymentMutationResponse>> {
@@ -317,13 +321,14 @@ pub async fn refund_payment(
         ));
     }
 
+    let created_by = super::resolve_actor(actor.as_deref(), body.created_by.as_deref());
     let outcome = state
         .payments_service
         .refund_payment(RefundPaymentCommand {
             original_payment_id: pay_id,
             amount_satang: baht_f64_to_satang(body.amount),
             reason: body.reason.clone(),
-            created_by: body.created_by.clone(),
+            created_by,
             // TODO: wire user_id from auth middleware
             source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
         })

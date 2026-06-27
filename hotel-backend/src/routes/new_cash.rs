@@ -27,7 +27,7 @@
 use axum::{
     extract::{Query, State},
     http::StatusCode,
-    Json,
+    Extension, Json,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,7 @@ use sqlx::Row as _;
 use sqlx::AssertSqlSafe;
 
 use super::mode::{AppState, Branch};
+use crate::domain::user::User;
 use crate::error::{ApiError, ApiResult};
 
 /// Hard cap on the list window so the date-range scan stays bounded.
@@ -352,18 +353,23 @@ pub async fn list_categories(
 pub async fn create_income(
     State(state): State<AppState>,
     Query(query): Query<CashBranchQuery>,
+    // Task #40: prefer the authenticated operator over the body `createdBy`.
+    actor: Option<Extension<User>>,
     Json(body): Json<CreateCashEntryRequest>,
 ) -> ApiResult<(StatusCode, Json<CreateCashEntryResponse>)> {
-    create_entry(state, query.branch, body, "income").await
+    let created_by = super::resolve_actor(actor.as_deref(), body.created_by.as_deref());
+    create_entry(state, query.branch, body, "income", created_by).await
 }
 
 /// `POST /api/cash/expense` — record an expense entry.
 pub async fn create_expense(
     State(state): State<AppState>,
     Query(query): Query<CashBranchQuery>,
+    actor: Option<Extension<User>>,
     Json(body): Json<CreateCashEntryRequest>,
 ) -> ApiResult<(StatusCode, Json<CreateCashEntryResponse>)> {
-    create_entry(state, query.branch, body, "expense").await
+    let created_by = super::resolve_actor(actor.as_deref(), body.created_by.as_deref());
+    create_entry(state, query.branch, body, "expense", created_by).await
 }
 
 /// Shared create path for income + expense. Inserts a canonical
@@ -381,6 +387,10 @@ async fn create_entry(
     branch: Option<Branch>,
     body: CreateCashEntryRequest,
     kind: &str,
+    // Task #40: resolved by the caller from `Extension<User>` (auth) with the
+    // body `createdBy` as the fallback. `None` ⇒ stored as SQL NULL (unchanged
+    // behavior when neither auth nor body supplies a value).
+    created_by: Option<String>,
 ) -> ApiResult<(StatusCode, Json<CreateCashEntryResponse>)> {
     let pool = resolve_pool(&state, branch)?;
 
@@ -416,7 +426,7 @@ async fn create_entry(
         .bind(&body.note)
         .bind(&body.group)
         .bind(&body.account)
-        .bind(&body.created_by)
+        .bind(&created_by)
         .fetch_one(pool)
         .await
         .map_err(|e| ApiError::Internal(format!("failed to create cash entry: {e}")))?;

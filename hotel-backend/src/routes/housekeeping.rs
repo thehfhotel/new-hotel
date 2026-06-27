@@ -25,12 +25,13 @@
 
 use axum::{
     extract::{Path, Query, State},
-    Json,
+    Extension, Json,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::mode::{AppState, Branch};
+use crate::domain::user::User;
 use crate::error::ApiResult;
 use crate::outbox::event::EventSource;
 use crate::service::{
@@ -93,11 +94,12 @@ fn service_for(state: &AppState, branch: Option<Branch>) -> ApiResult<Housekeepi
     ))
 }
 
-/// Resolve the operator label, defaulting blank/missing input to [`DEFAULT_BY`].
-fn resolve_by(by: Option<String>) -> String {
-    by.map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_BY.to_string())
+/// Resolve the operator label: prefer the authenticated session user
+/// (Task #40), then the body-supplied value, then [`DEFAULT_BY`]. Auth
+/// ships dark, so `actor` is `None` and the body value wins exactly as
+/// before; once auth is on the housekeeper's login is recorded instead.
+fn resolve_by(actor: Option<&User>, by: Option<String>) -> String {
+    super::resolve_actor(actor, by.as_deref()).unwrap_or_else(|| DEFAULT_BY.to_string())
 }
 
 /// `EventSource` for an HTTP-originated housekeeping mutation. Mirrors
@@ -111,10 +113,11 @@ pub async fn mark_clean(
     State(state): State<AppState>,
     Path(room_id): Path<i32>,
     Query(query): Query<HousekeepingQuery>,
+    actor: Option<Extension<User>>,
     body: Option<Json<HousekeepingActionBody>>,
 ) -> ApiResult<Json<HousekeepingResponse>> {
     let svc = service_for(&state, query.branch)?;
-    let by = resolve_by(body.and_then(|Json(b)| b.by));
+    let by = resolve_by(actor.as_deref(), body.and_then(|Json(b)| b.by));
     let outcome = svc
         .mark_clean(MarkCleanCommand {
             room_id,
@@ -134,10 +137,11 @@ pub async fn mark_dirty(
     State(state): State<AppState>,
     Path(room_id): Path<i32>,
     Query(query): Query<HousekeepingQuery>,
+    actor: Option<Extension<User>>,
     body: Option<Json<HousekeepingActionBody>>,
 ) -> ApiResult<Json<HousekeepingResponse>> {
     let svc = service_for(&state, query.branch)?;
-    let by = resolve_by(body.and_then(|Json(b)| b.by));
+    let by = resolve_by(actor.as_deref(), body.and_then(|Json(b)| b.by));
     let outcome = svc
         .mark_dirty(MarkDirtyCommand {
             room_id,
@@ -185,10 +189,31 @@ mod tests {
 
     #[test]
     fn resolve_by_defaults_blank_and_missing() {
-        assert_eq!(resolve_by(None), DEFAULT_BY);
-        assert_eq!(resolve_by(Some("   ".to_string())), DEFAULT_BY);
-        assert_eq!(resolve_by(Some("Nok".to_string())), "Nok");
-        assert_eq!(resolve_by(Some("  Nok  ".to_string())), "Nok");
+        // Auth off (`actor = None`): body value wins, blank/missing → sentinel.
+        assert_eq!(resolve_by(None, None), DEFAULT_BY);
+        assert_eq!(resolve_by(None, Some("   ".to_string())), DEFAULT_BY);
+        assert_eq!(resolve_by(None, Some("Nok".to_string())), "Nok");
+        assert_eq!(resolve_by(None, Some("  Nok  ".to_string())), "Nok");
+    }
+
+    #[test]
+    fn resolve_by_prefers_authenticated_user() {
+        use crate::domain::user::{Role, User};
+        use chrono::NaiveDate;
+        let u = User {
+            user_id: 9,
+            username: "housekeeper_a".to_string(),
+            password_hash: String::new(),
+            role: Role::Housekeeper,
+            active: true,
+            created_at: NaiveDate::from_ymd_opt(2026, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            last_login_at: None,
+        };
+        // Authenticated user overrides the body value.
+        assert_eq!(resolve_by(Some(&u), Some("Nok".to_string())), "housekeeper_a");
     }
 
     /// The clean/dirty body must accept an empty object (`{}`) — the frontend

@@ -14,13 +14,14 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
+    Extension, Json,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Row as _;
 
 use super::mode::{AppState, Branch};
+use crate::domain::user::User;
 use crate::error::{ApiError, ApiResult};
 use crate::service::{CloseShiftCommand, OpenShiftCommand, Shift, ShiftSummary};
 
@@ -157,12 +158,18 @@ pub struct CurrentShiftResponse {
 /// already open for this site.
 pub async fn open_shift(
     State(state): State<AppState>,
+    // Task #40: the authenticated cashier, when present. Auth ships dark, so
+    // this is `Option<_>` (absent → `None`) and the body `openedBy` remains the
+    // fallback; the service still rejects a blank result with a 400.
+    actor: Option<Extension<User>>,
     Json(body): Json<OpenShiftRequest>,
 ) -> ApiResult<(StatusCode, Json<OpenShiftResponse>)> {
+    let opened_by = super::resolve_actor(actor.as_deref(), Some(&body.opened_by))
+        .unwrap_or(body.opened_by);
     let outcome = state
         .shifts_service
         .open_shift(OpenShiftCommand {
-            opened_by: body.opened_by,
+            opened_by,
             opening_float: body.opening_float,
             notes: body.notes,
         })
@@ -184,12 +191,16 @@ pub async fn open_shift(
 /// when no shift is currently open for this site.
 pub async fn close_shift(
     State(state): State<AppState>,
+    // Task #40: prefer the authenticated cashier over the body `closedBy`.
+    actor: Option<Extension<User>>,
     Json(body): Json<CloseShiftRequest>,
 ) -> ApiResult<Json<CloseShiftResponse>> {
+    let closed_by = super::resolve_actor(actor.as_deref(), Some(&body.closed_by))
+        .unwrap_or(body.closed_by);
     let summary = state
         .shifts_service
         .close_shift(CloseShiftCommand {
-            closed_by: body.closed_by,
+            closed_by,
             notes: body.notes,
             cash_count: body.cash_count,
         })
