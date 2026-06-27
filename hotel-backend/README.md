@@ -29,7 +29,6 @@ High-performance Rust backend for the Hotel Management System, replacing the Nex
 | GET | `/api/customers/:id/bookings` | Customer booking history |
 | GET | `/api/customers/:id/stats` | Customer statistics |
 | GET | `/api/stats` | Dashboard statistics |
-| GET | `/api/occupancy` | Occupancy trends |
 | GET | `/api/calendar` | Calendar data (hybrid) |
 
 ### New System Endpoints (PostgreSQL - HotelNew)
@@ -53,7 +52,6 @@ High-performance Rust backend for the Hotel Management System, replacing the Nex
 | GET/POST | `/api/new/inventory/*` | Inventory management |
 | GET/POST/PUT | `/api/new/maintenance/*` | Maintenance requests |
 | GET | `/api/new/reports/*` | Revenue/occupancy reports |
-| GET | `/api/new/stats` | New system dashboard stats |
 | GET | `/api/shifts/current` | Current open cashier round (branch-aware; mirrored from iHOTEL `HT_Round_Bill`) |
 | POST | `/api/shifts/open` | Open cashier round (gated by `ROUND_WRITEBACK_ENABLED`; rejects with HTTP 400 when off) |
 | POST | `/api/shifts/close` | Close cashier round (gated by `ROUND_WRITEBACK_ENABLED`; rejects with HTTP 400 when off) |
@@ -161,12 +159,10 @@ hotel-backend/
 │   │   └── dual_pool.rs     # AppState with both pools
 │   ├── routes/
 │   │   ├── mod.rs
-│   │   ├── rooms.rs         # Legacy room routes
-│   │   ├── bookings.rs      # Legacy booking routes
+│   │   ├── bookings.rs      # Legacy booking notes + by-number detail routes
 │   │   ├── checkins.rs      # Legacy check-in routes
 │   │   ├── customers.rs     # Legacy customer routes
 │   │   ├── stats.rs         # Legacy stats routes
-│   │   ├── occupancy.rs     # Legacy occupancy routes
 │   │   ├── calendar.rs      # Hybrid calendar route
 │   │   ├── mode.rs          # System mode route
 │   │   ├── new_bookings.rs  # New booking CRUD
@@ -175,7 +171,6 @@ hotel-backend/
 │   │   ├── new_rooms.rs     # New room CRUD
 │   │   ├── new_room_types.rs# Room type management
 │   │   ├── new_rates.rs     # Rate management
-│   │   ├── new_stats.rs     # New system stats
 │   │   ├── new_inventory.rs # Inventory management
 │   │   ├── new_invoice.rs   # Invoice data
 │   │   ├── new_payments.rs  # Payment tracking
@@ -183,7 +178,6 @@ hotel-backend/
 │   │   └── new_maintenance.rs # Maintenance requests
 │   ├── models/
 │   │   ├── mod.rs
-│   │   ├── room.rs
 │   │   ├── booking.rs
 │   │   ├── checkin.rs
 │   │   ├── customer.rs
