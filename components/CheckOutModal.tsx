@@ -1,20 +1,24 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { X, AlertCircle, Loader2, LogOut } from 'lucide-react'
+import { X, AlertCircle, Loader2, LogOut, CreditCard } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 
 /**
- * Check-out confirmation modal.
+ * Check-out & settle modal (M1 task #37).
  *
  * Looks up the active check-in for `roomId` (filter:
- * `?roomId=X&status=active`), then submits PUT
- * `/api/checkins/:cinId/checkout`. The PUT triggers the `CheckOut`
- * writeback recipe which mirrors `HT_CheckIn_Ds.Cin_Room_Status='Check-Out'`,
- * `HT_Room_Status.room_status='Check Out'`, etc to legacy MSSQL.
+ * `?roomId=X&status=active`), shows the server-authoritative folio
+ * (`GET /api/checkins/:id/checkout-quote` — room / products / paid / balance),
+ * then on confirm:
+ *   1. captures any outstanding balance as a payment via the payment flow
+ *      (`POST /api/checkins/:id/payments`, the same path PaymentModal uses), and
+ *   2. completes the check-out (`PUT /api/checkins/:id/checkout`).
  *
- * Payment is handled separately via the payment flow — this modal does NOT
- * record a payment.
+ * The checkout PUT body stays `{}` on purpose: `CHECKOUT_SERVER_TOTAL_ENABLED`
+ * ships dark and we must not change the command/writeback total when it is off.
+ * Money is captured through the payment row above, not the checkout total. The
+ * folio is DISPLAYED regardless of the flag (read-only quote endpoint).
  */
 
 interface RoomLite {
@@ -30,11 +34,34 @@ interface ActiveCheckIn {
   expectedCheckout?: string | null
 }
 
+// Server-authoritative folio from /api/checkins/:id/checkout-quote.
+interface Folio {
+  nights: number
+  ratePerNight: number
+  roomTotal: number
+  productTotal: number
+  vatPercent: number
+  vat: number
+  deposit: number
+  netTotal: number
+  payTotal: number
+  balance: number
+}
+
 interface CheckOutModalProps {
   room: RoomLite
   onClose: () => void
   onSuccess: () => void
 }
+
+type PaymentMethod = 'cash' | 'credit' | 'transfer' | 'qr'
+
+const paymentMethods: { value: PaymentMethod; label: string }[] = [
+  { value: 'cash', label: 'เงินสด / Cash' },
+  { value: 'credit', label: 'บัตรเครดิต / Credit Card' },
+  { value: 'transfer', label: 'โอนเงิน / Transfer' },
+  { value: 'qr', label: 'QR Code' },
+]
 
 function formatThaiDate(s: string | null | undefined): string {
   if (!s) return '-'
@@ -46,12 +73,26 @@ function formatThaiDate(s: string | null | undefined): string {
   }
 }
 
+function formatCurrency(amount: number): string {
+  return new Intl.NumberFormat('th-TH', {
+    style: 'currency',
+    currency: 'THB',
+    minimumFractionDigits: 0,
+  }).format(amount)
+}
+
 export default function CheckOutModal({ room, onClose, onSuccess }: CheckOutModalProps) {
   const branchFetch = useBranchFetch()
   const [loading, setLoading] = useState(true)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [activeCheckin, setActiveCheckin] = useState<ActiveCheckIn | null>(null)
+  const [folio, setFolio] = useState<Folio | null>(null)
+  const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>('cash')
+  // Guards against a double-charge if the payment POST succeeds but the
+  // checkout PUT fails and the receptionist retries: we never re-record the
+  // balance once it has been captured in this modal session.
+  const [paymentCaptured, setPaymentCaptured] = useState(false)
 
   // Find the currently active check-in for this room.
   useEffect(() => {
@@ -85,11 +126,68 @@ export default function CheckOutModal({ room, onClose, onSuccess }: CheckOutModa
     return () => { cancelled = true }
   }, [room.id, branchFetch])
 
+  // Once the active check-in is known, pull the server folio for display +
+  // the outstanding-balance amount we settle on checkout. Read-only quote, so
+  // it is fetched regardless of CHECKOUT_SERVER_TOTAL_ENABLED.
+  useEffect(() => {
+    if (!activeCheckin) return
+    let cancelled = false
+    branchFetch(`/api/checkins/${activeCheckin.id}/checkout-quote`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (cancelled || !d?.success) return
+        setFolio({
+          nights: d.nights,
+          ratePerNight: d.ratePerNight,
+          roomTotal: d.roomTotal,
+          productTotal: d.productTotal,
+          vatPercent: d.vatPercent,
+          vat: d.vat,
+          deposit: d.deposit,
+          netTotal: d.netTotal,
+          payTotal: d.payTotal,
+          balance: d.balance,
+        })
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [activeCheckin, branchFetch])
+
+  const balanceDue = folio && folio.balance > 0.005 ? folio.balance : 0
+
   const submit = async () => {
     if (!activeCheckin) return
     setSubmitting(true)
     setError(null)
     try {
+      // 1) Capture any outstanding balance as a payment first (reuse the #36
+      //    payment path). Skipped when nothing is due, the folio failed to load
+      //    (then checkout behaves like the legacy money-less flow), or the
+      //    balance was already captured on a prior attempt in this session.
+      if (balanceDue > 0 && !paymentCaptured) {
+        const payRes = await branchFetch(
+          `/api/checkins/${activeCheckin.id}/payments`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              amount: balanceDue,
+              method: paymentMethod,
+              notes: 'เช็คเอ้าท์',
+            }),
+          },
+        )
+        const payData = await payRes.json()
+        if (!payRes.ok || !payData.success) {
+          throw new Error(
+            payData.error || payData.message || 'บันทึกการชำระเงินไม่สำเร็จ',
+          )
+        }
+        setPaymentCaptured(true)
+      }
+
+      // 2) Complete the check-out. Body stays `{}` so the command/writeback
+      //    total is unchanged while CHECKOUT_SERVER_TOTAL_ENABLED is off.
       const res = await branchFetch(
         `/api/checkins/${activeCheckin.id}/checkout`,
         {
@@ -117,7 +215,7 @@ export default function CheckOutModal({ room, onClose, onSuccess }: CheckOutModa
       onClick={onClose}
     >
       <div
-        className="bg-white rounded-lg shadow-xl w-full max-w-md"
+        className="bg-white rounded-lg shadow-xl w-full max-w-md max-h-[90vh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between p-4 border-b border-gray-200">
@@ -159,8 +257,66 @@ export default function CheckOutModal({ room, onClose, onSuccess }: CheckOutModa
                   <span>{formatThaiDate(activeCheckin.expectedCheckout)}</span>
                 </div>
               </div>
+
+              {/* Folio breakdown (server-authoritative; display regardless of
+                  the CHECKOUT_SERVER_TOTAL_ENABLED flag). */}
+              {folio && (
+                <div className="border border-gray-200 rounded p-3 space-y-2 text-sm">
+                  <div className="flex justify-between">
+                    <span className="text-gray-600">ค่าห้อง ({folio.nights} คืน)</span>
+                    <span className="font-medium">{formatCurrency(folio.roomTotal)}</span>
+                  </div>
+                  {folio.productTotal > 0 && (
+                    <div className="flex justify-between">
+                      <span className="text-gray-600">ค่าสินค้า / บริการ</span>
+                      <span className="font-medium">{formatCurrency(folio.productTotal)}</span>
+                    </div>
+                  )}
+                  <div className="flex justify-between pt-2 border-t border-gray-200">
+                    <span className="font-semibold text-gray-800">รวมทั้งหมด</span>
+                    <span className="font-bold">{formatCurrency(folio.netTotal)}</span>
+                  </div>
+                  {folio.payTotal > 0 && (
+                    <div className="flex justify-between">
+                      <span className="text-gray-600">ชำระแล้ว</span>
+                      <span className="font-medium">−{formatCurrency(folio.payTotal)}</span>
+                    </div>
+                  )}
+                  <div className="flex justify-between pt-2 border-t border-gray-200">
+                    <span className="font-semibold text-gray-800">คงเหลือ</span>
+                    <span className={`font-bold ${balanceDue > 0 ? 'text-red-600' : 'text-green-600'}`}>
+                      {formatCurrency(folio.balance)}
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              {/* Tender select — only meaningful when there is a balance to
+                  settle. The selection drives the payment recorded on confirm. */}
+              {balanceDue > 0 && (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    <CreditCard size={16} className="inline mr-1" />
+                    วิธีการชำระเงิน (ยอดคงเหลือ {formatCurrency(balanceDue)})
+                  </label>
+                  <select
+                    value={paymentMethod}
+                    onChange={(e) => setPaymentMethod(e.target.value as PaymentMethod)}
+                    className="w-full px-3 py-2 bg-gray-50 border border-gray-300 text-gray-800 rounded focus:ring-2 focus:ring-sky-500 focus:border-sky-500"
+                  >
+                    {paymentMethods.map((m) => (
+                      <option key={m.value} value={m.value}>
+                        {m.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+
               <div className="text-xs text-gray-500">
-                หมายเหตุ: การชำระเงินทำผ่านเมนู Payment แยก เช็คเอ้าท์นี้จะไม่บันทึกยอดเงิน
+                {balanceDue > 0
+                  ? 'ยอดคงเหลือจะถูกบันทึกเป็นการชำระเงินก่อนเช็คเอ้าท์'
+                  : 'ไม่มียอดค้างชำระ เช็คเอ้าท์ได้ทันที'}
               </div>
             </>
           ) : null}
@@ -191,7 +347,7 @@ export default function CheckOutModal({ room, onClose, onSuccess }: CheckOutModa
             ) : (
               <LogOut size={14} className="mr-2" />
             )}
-            ยืนยันเช็คเอ้าท์
+            {balanceDue > 0 ? 'ชำระเงินและเช็คเอ้าท์' : 'ยืนยันเช็คเอ้าท์'}
           </button>
         </div>
       </div>

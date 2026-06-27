@@ -5,10 +5,11 @@ import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { useBranch } from '@/contexts/BranchContext'
 import { hotelInfoForBranch } from '@/lib/hotel-info'
 import Link from 'next/link'
-import { ArrowLeft, Loader2, AlertCircle, Receipt } from 'lucide-react'
+import { ArrowLeft, Loader2, AlertCircle, Receipt, CreditCard } from 'lucide-react'
 import InvoiceTemplate from '@/components/documents/InvoiceTemplate'
 import LegacyMirrorPanels from '@/components/LegacyMirrorPanels'
 import PrintButton from '@/components/ui/PrintButton'
+import PaymentModal from '@/components/modals/PaymentModal'
 import { InvoiceData } from '@/types/invoice'
 
 interface InvoiceApiResponse {
@@ -74,6 +75,29 @@ export default function InvoiceDetailPage({
   const [invoiceData, setInvoiceData] = useState<InvoiceData | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  // M1 task #36: make PaymentModal reachable from the folio/billing page.
+  const [showPayment, setShowPayment] = useState(false)
+  const [paySummary, setPaySummary] = useState<{ totalAmount: number; totalPaid: number } | null>(
+    null,
+  )
+
+  // Best-effort folio summary (total billed + already paid) so the payment
+  // modal pre-fills the outstanding balance. Falls back to the invoice grand
+  // total when the endpoint is unavailable.
+  const fetchPaySummary = useCallback(async () => {
+    try {
+      const res = await branchFetch(`/api/checkins/${resolvedParams.id}/payments`)
+      const data = await res.json()
+      if (data.success) {
+        setPaySummary({
+          totalAmount: data.totalAmount ?? 0,
+          totalPaid: data.totalPaid ?? 0,
+        })
+      }
+    } catch {
+      // ignore — modal still opens with the invoice grand-total fallback
+    }
+  }, [resolvedParams.id, branchFetch])
 
   const fetchInvoice = useCallback(async () => {
     setLoading(true)
@@ -136,7 +160,8 @@ export default function InvoiceDetailPage({
 
   useEffect(() => {
     fetchInvoice()
-  }, [fetchInvoice])
+    fetchPaySummary()
+  }, [fetchInvoice, fetchPaySummary])
 
   if (loading) {
     return (
@@ -206,7 +231,16 @@ export default function InvoiceDetailPage({
           กลับไปหน้ารายการ
         </Link>
 
-        <PrintButton size="md" showPdfOption={true} />
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowPayment(true)}
+            className="inline-flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 text-sm font-medium"
+          >
+            <CreditCard className="w-4 h-4" />
+            บันทึกการชำระเงิน
+          </button>
+          <PrintButton size="md" showPdfOption={true} />
+        </div>
       </div>
 
       {/* Invoice Template — Track G3: show the VAT split whenever the
@@ -225,6 +259,20 @@ export default function InvoiceDetailPage({
           <LegacyMirrorPanels cinNo={invoiceData.cinNo} />
         </div>
       )}
+
+      {/* M1 task #36: record a payment against this folio. Reuses the same
+          POST /api/checkins/:id/payments path as the checkout settle flow. */}
+      <PaymentModal
+        isOpen={showPayment}
+        onClose={() => setShowPayment(false)}
+        checkinId={invoiceData.checkInId}
+        totalAmount={paySummary?.totalAmount ?? invoiceData.grandTotal}
+        totalPaid={paySummary?.totalPaid ?? 0}
+        onSuccess={() => {
+          fetchPaySummary()
+          fetchInvoice()
+        }}
+      />
     </div>
   )
 }

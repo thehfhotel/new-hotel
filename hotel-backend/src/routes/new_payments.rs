@@ -17,7 +17,7 @@
 //! so dashboards / SSE keep their existing wire contract.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     Json,
 };
 use chrono::NaiveDateTime;
@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use super::mode::AppState;
 use crate::domain::payment::PaymentMethod;
+use crate::domain::user::User;
 use crate::error::{ApiError, ApiResult};
 use crate::outbox::event::EventSource;
 use crate::outbox::intent::RecordPaymentReceipt;
@@ -173,6 +174,12 @@ pub async fn list_payments(
 /// `"qr"` for wire-contract stability.
 pub async fn create_payment(
     State(state): State<AppState>,
+    // M1 task #36: the authenticated cashier, when present. Auth ships dark
+    // today, so this extractor is `Option<_>` — it resolves to `None` until
+    // the auth middleware is enabled, at which point the session user becomes
+    // the canonical `pay_created_by` (see resolution below). Must precede the
+    // `Json` body extractor (which consumes the request).
+    actor: Option<Extension<User>>,
     Path(cin_id): Path<i32>,
     Json(body): Json<CreatePaymentRequest>,
 ) -> ApiResult<Json<PaymentMutationResponse>> {
@@ -223,6 +230,14 @@ pub async fn create_payment(
     // back to DEFAULT_VAT_PERCENT on error so payments never block on a
     // settings hiccup.
     let vat_percent = Some(settings::get_vat_percent(&state.new_pool).await);
+    // M1 task #36: prefer the authenticated cashier's username over the
+    // body-supplied `created_by` so we stop blindly trusting client input for
+    // cashier identity. Auth is dark today (`actor` is `None`), so the body
+    // value remains the fallback and the current flow is unchanged.
+    let created_by = actor
+        .as_deref()
+        .map(|u| u.username.clone())
+        .or_else(|| body.created_by.clone());
     let outcome = state
         .payments_service
         .record_payment(RecordPaymentCommand {
@@ -231,7 +246,7 @@ pub async fn create_payment(
             method: domain_method,
             reference: body.reference.clone(),
             notes: body.notes.clone(),
-            created_by: body.created_by.clone(),
+            created_by,
             receipt,
             checkin_ds_id,
             price_per_night_baht,

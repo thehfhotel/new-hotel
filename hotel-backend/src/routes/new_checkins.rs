@@ -400,7 +400,22 @@ async fn folio_breakdown(state: &AppState, cin_id: i32) -> ApiResult<CheckoutQuo
         .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
     let nights = billing.nights.unwrap_or(1).max(1);
     let rate = billing.cin_rate_per_night.unwrap_or(0.0);
-    let room_total = rate * nights as f64;
+    // M1 task #34: `cin_rate_per_night` is 0/NULL for ~100% of live check-ins;
+    // the real stay revenue lives in `cin_total_amount`. Fall back to it when
+    // the per-night rate is unusable so the folio room line is not silently
+    // zero. When the fallback fires, derive the displayed per-night rate from
+    // the resulting room total so the receipt still shows a sensible "x/night".
+    let rate_fallback_used = rate <= 0.0;
+    let room_total = if rate > 0.0 {
+        rate * nights as f64
+    } else {
+        billing.cin_total_amount.unwrap_or(0.0)
+    };
+    let display_rate = if rate_fallback_used {
+        room_total / nights as f64
+    } else {
+        rate
+    };
 
     let sums = sqlx::query(
         "SELECT \
@@ -438,7 +453,7 @@ async fn folio_breakdown(state: &AppState, cin_id: i32) -> ApiResult<CheckoutQuo
     Ok(CheckoutQuote {
         success: true,
         nights,
-        rate_per_night: rate,
+        rate_per_night: display_rate,
         room_total: round2(room_total),
         product_total: round2(product_total),
         vat_percent,
@@ -488,7 +503,16 @@ pub async fn checkout(
         .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
     let nights = billing.nights.unwrap_or(1).max(1) as f64;
     let rate = billing.cin_rate_per_night.unwrap_or(0.0);
-    let room_price_total = rate * nights;
+    // M1 task #34: same `cin_rate_per_night` 0/NULL fallback as
+    // `folio_breakdown` — use `cin_total_amount` for the room basis when the
+    // per-night rate is unusable so the writeback's `Total_Price_*` carries the
+    // real revenue (Audit H1) instead of zero (the flag-on path recomputes from
+    // the full folio below; this is the off-path / fallback basis).
+    let room_price_total = if rate > 0.0 {
+        rate * nights
+    } else {
+        billing.cin_total_amount.unwrap_or(0.0)
+    };
     let pay_total = body.total_amount.or(billing.cin_total_amount).unwrap_or(0.0);
     let net_total = room_price_total; // No product/extras plumbing yet.
     let balance = (net_total - pay_total).max(0.0);

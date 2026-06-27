@@ -44,6 +44,7 @@ export default function PaymentModal({
   const balance = totalAmount - totalPaid
 
   const [amount, setAmount] = useState<string>('')
+  const [tendered, setTendered] = useState<string>('')
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>('cash')
   const [reference, setReference] = useState('')
   const [notes, setNotes] = useState('')
@@ -55,6 +56,7 @@ export default function PaymentModal({
   useEffect(() => {
     if (isOpen && !prevIsOpenRef.current) {
       setAmount(balance > 0 ? balance.toString() : '')
+      setTendered('')
       setPaymentMethod('cash')
       setReference('')
       setNotes('')
@@ -62,6 +64,16 @@ export default function PaymentModal({
     }
     prevIsOpenRef.current = isOpen
   }, [isOpen, balance])
+
+  // Cash-tender helper: change due = tendered − amount. Display-only — the
+  // POST body carries `amount` only (the backend has no tendered/change
+  // columns), so this just helps the cashier count out change at the desk.
+  const parsedAmount = parseFloat(amount)
+  const parsedTendered = parseFloat(tendered)
+  const change =
+    paymentMethod === 'cash' && !isNaN(parsedTendered) && !isNaN(parsedAmount)
+      ? parsedTendered - parsedAmount
+      : null
 
   const handleClose = () => {
     setError(null)
@@ -214,6 +226,37 @@ export default function PaymentModal({
               ))}
             </div>
           </div>
+
+          {/* Tendered cash + change (cash only) */}
+          {paymentMethod === 'cash' && (
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                <Banknote size={16} className="inline mr-1" />
+                รับเงินมา (บาท)
+              </label>
+              <input
+                type="number"
+                value={tendered}
+                onChange={(e) => setTendered(e.target.value)}
+                placeholder="0.00"
+                min="0"
+                step="0.01"
+                className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500"
+              />
+              {change !== null && (
+                <div className="mt-2 flex justify-between items-center text-sm">
+                  <span className="text-gray-500">เงินทอน</span>
+                  <span
+                    className={`font-semibold ${change < 0 ? 'text-amber-500' : 'text-green-600'}`}
+                  >
+                    {change < 0
+                      ? `ขาด ${formatCurrency(Math.abs(change))}`
+                      : formatCurrency(change)}
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Reference (for card/transfer) */}
           {showReferenceField && (
