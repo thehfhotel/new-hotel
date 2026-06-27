@@ -4,6 +4,8 @@ import { useState, useEffect, useRef } from 'react'
 import { X, Loader2, Ticket, Calendar, User, Printer } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { useAuth } from '@/contexts/AuthContext'
+import CouponTemplate from '@/components/documents/CouponTemplate'
+import { printCoupon } from '@/lib/print'
 
 /**
  * Track G7 permission key required to open the issue modal. Centralised
@@ -36,15 +38,11 @@ interface IssueCouponModalProps {
   forCinNo?: string
   /** Defaults `0` so legacy-style entitlement coupons land without UI fuss. */
   defaultValue?: number
+  /** Hotel name printed on the coupon header (folio passes the branch name). */
+  hotelName?: string
+  /** Room number, when the caller has it (printed on the coupon). */
+  room?: string
   onSuccess: (issuedCode: string) => void
-}
-
-function formatCurrency(amount: number): string {
-  return new Intl.NumberFormat('th-TH', {
-    style: 'currency',
-    currency: 'THB',
-    minimumFractionDigits: 2,
-  }).format(amount)
 }
 
 export default function IssueCouponModal({
@@ -53,6 +51,8 @@ export default function IssueCouponModal({
   customerId,
   forCinNo,
   defaultValue = 0,
+  hotelName,
+  room,
   onSuccess,
 }: IssueCouponModalProps) {
   const branchFetch = useBranchFetch()
@@ -72,6 +72,7 @@ export default function IssueCouponModal({
   const [error, setError] = useState<string | null>(null)
 
   const prevIsOpenRef = useRef(false)
+  const couponRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     if (isOpen && !prevIsOpenRef.current) {
@@ -134,9 +135,9 @@ export default function IssueCouponModal({
   }
 
   const handlePrint = () => {
-    if (typeof window !== 'undefined') {
-      window.print()
-    }
+    // Print only the coupon region (58/80mm) via the isolation class on the
+    // CouponTemplate root — replaces the old full-page `window.print()`.
+    printCoupon(couponRef.current)
   }
 
   if (!isOpen) return null
@@ -172,22 +173,23 @@ export default function IssueCouponModal({
           </button>
         </div>
 
-        {/* Success state — show the issued coupon code + print button */}
+        {/* Success state — show a print-ready barcoded coupon + print button */}
         {issuedCode ? (
           <div className="p-6 space-y-4">
-            <div className="text-center space-y-2">
-              <p className="text-sm text-gray-500">ออกคูปองเรียบร้อย</p>
-              <p className="text-3xl font-mono font-bold text-emerald-700 tracking-wider">
-                {issuedCode}
-              </p>
-              {parseFloat(value) > 0 ? (
-                <p className="text-lg text-gray-700">
-                  มูลค่า {formatCurrency(parseFloat(value))}
-                </p>
-              ) : null}
-              {expiresAt ? (
-                <p className="text-sm text-gray-500">หมดอายุ {expiresAt}</p>
-              ) : null}
+            <p className="text-center text-sm text-gray-500">ออกคูปองเรียบร้อย</p>
+            <div className="flex justify-center">
+              <div className="border border-gray-200 rounded-lg shadow-xs">
+                <CouponTemplate
+                  ref={couponRef}
+                  code={issuedCode}
+                  hotelName={hotelName}
+                  value={parseFloat(value) || 0}
+                  expiresAt={expiresAt || undefined}
+                  issuedBy={issuedBy || undefined}
+                  forCinNo={forCinNo}
+                  room={room}
+                />
+              </div>
             </div>
             <div className="flex gap-3 pt-2">
               <button

@@ -24,3 +24,29 @@ export function printRegion(root: HTMLElement | null): void {
   // `afterprint` is unreliable on some browsers; ensure the tag is dropped.
   window.setTimeout(cleanup, 1500)
 }
+
+/**
+ * Print exactly one coupon (`components/documents/CouponTemplate.tsx`).
+ *
+ * Same isolation strategy as {@link printRegion} but keyed on the
+ * coupon-specific `coupon-print-active` class so a single coupon prints
+ * cleanly on a 58/80mm roll even when the template is opened over a busy
+ * folio page (the `@media print` block in CouponTemplate hides everything
+ * else while this class is set). The tag is removed after printing.
+ */
+export function printCoupon(root: HTMLElement | null): void {
+  if (!root) {
+    window.print()
+    return
+  }
+  const ACTIVE = 'coupon-print-active'
+  root.classList.add(ACTIVE)
+  const cleanup = () => {
+    root.classList.remove(ACTIVE)
+    window.removeEventListener('afterprint', cleanup)
+  }
+  window.addEventListener('afterprint', cleanup)
+  window.print()
+  // `afterprint` is unreliable on some browsers; ensure the tag is dropped.
+  window.setTimeout(cleanup, 1500)
+}

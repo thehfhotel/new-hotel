@@ -5,11 +5,13 @@ import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { useBranch } from '@/contexts/BranchContext'
 import { hotelInfoForBranch } from '@/lib/hotel-info'
 import Link from 'next/link'
-import { ArrowLeft, Loader2, AlertCircle, Receipt, CreditCard } from 'lucide-react'
+import { ArrowLeft, Loader2, AlertCircle, Receipt, CreditCard, Ticket } from 'lucide-react'
 import InvoiceTemplate from '@/components/documents/InvoiceTemplate'
 import LegacyMirrorPanels from '@/components/LegacyMirrorPanels'
 import PrintButton from '@/components/ui/PrintButton'
 import PaymentModal from '@/components/modals/PaymentModal'
+import IssueCouponModal from '@/components/modals/IssueCouponModal'
+import { useAuth } from '@/contexts/AuthContext'
 import { InvoiceData } from '@/types/invoice'
 
 interface InvoiceApiResponse {
@@ -71,12 +73,17 @@ export default function InvoiceDetailPage({
   const resolvedParams = use(params)
   const branchFetch = useBranchFetch()
   const { branch } = useBranch()
+  const { hasPermission } = useAuth()
   const hotelInfo = hotelInfoForBranch(branch)
   const [invoiceData, setInvoiceData] = useState<InvoiceData | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   // M1 task #36: make PaymentModal reachable from the folio/billing page.
   const [showPayment, setShowPayment] = useState(false)
+  // Task #48: issue a food/breakfast coupon (คูปองอาหาร) from the folio.
+  // Gated on `coupon.issue` (Track G7) so the launcher mirrors the modal's
+  // own permission gate — both stay hidden until an operator holds the grant.
+  const [showIssueCoupon, setShowIssueCoupon] = useState(false)
   const [paySummary, setPaySummary] = useState<{ totalAmount: number; totalPaid: number } | null>(
     null,
   )
@@ -232,6 +239,15 @@ export default function InvoiceDetailPage({
         </Link>
 
         <div className="flex items-center gap-2">
+          {hasPermission('coupon.issue') && (
+            <button
+              onClick={() => setShowIssueCoupon(true)}
+              className="inline-flex items-center gap-2 px-4 py-2 border border-emerald-600 text-emerald-700 rounded-lg hover:bg-emerald-50 text-sm font-medium"
+            >
+              <Ticket className="w-4 h-4" />
+              ออกคูปอง
+            </button>
+          )}
           <button
             onClick={() => setShowPayment(true)}
             className="inline-flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 text-sm font-medium"
@@ -272,6 +288,20 @@ export default function InvoiceDetailPage({
           fetchPaySummary()
           fetchInvoice()
         }}
+      />
+
+      {/* Task #48: issue a coupon bound to this folio. The modal handles its
+          own success state (shows a print-ready barcoded coupon); the issued
+          row surfaces in the legacy panel above after the writeback + sync
+          round-trip, so no local refetch is needed here. */}
+      <IssueCouponModal
+        isOpen={showIssueCoupon}
+        onClose={() => setShowIssueCoupon(false)}
+        forCinNo={invoiceData.cinNo}
+        hotelName={hotelInfo.name}
+        room={invoiceData.rooms[0]?.roomNumber}
+        defaultValue={0}
+        onSuccess={() => {}}
       />
     </div>
   )
