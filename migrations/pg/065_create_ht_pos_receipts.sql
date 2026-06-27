@@ -120,10 +120,6 @@ CREATE INDEX IF NOT EXISTS ht_pos_receipt_lines_receipt_id_idx
 CREATE INDEX IF NOT EXISTS ht_pos_receipt_lines_product_id_idx
     ON ht_pos_receipt_lines (line_product_id);
 
-INSERT INTO schema_migrations (version, filename, applied_by)
-VALUES ('065', '065_create_ht_pos_receipts.sql', 'migration-script')
-ON CONFLICT (version) DO NOTHING;
-
 -- DOWN MIGRATION (commented)
 -- DROP TABLE IF EXISTS ht_pos_receipt_lines;
 -- DROP TABLE IF EXISTS ht_pos_receipts;
