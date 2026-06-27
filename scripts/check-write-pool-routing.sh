@@ -29,9 +29,10 @@
 # pre-wired `state.*_service` (bound to `new_pool` at startup) are a SEPARATE R2
 # surface — they don't textually mention `new_pool`, so this gate can't see them.
 # The fix for those is `AppState::resolve_write_services(branch)` (rebuilds the
-# service graph on the branch pool); converting the remaining service-bound
-# handlers (bookings/payments/coupons/shifts create paths) is tracked as
-# TODO(ville-bundle) and is out of this gate's matching scope.
+# service graph on the branch pool). The bookings/payments/checkins create +
+# checkout + refund flows have now been converted that way (Ville bundle) and are
+# no longer allowlisted; any still-service-bound handler that doesn't reference
+# `new_pool` (e.g. `cancel_booking`) remains out of this gate's matching scope.
 #
 # ## Behavior
 #
@@ -62,8 +63,9 @@ MAIN_RS="${MAIN_RS:-${MAIN_RS_DEFAULT}}"
 #   (A) HF-Hotel-only-by-design / global handlers with no per-site Ville
 #       variant (Ville is guarded anyway), and
 #   (B) service-bound core flows whose proper Ville support needs
-#       `resolve_write_services` + a `?branch=` param — deferred to the flip
-#       task and marked `// TODO(ville-bundle)` at the call site.
+#       `resolve_write_services` + a `?branch=` param. The bookings/payments/
+#       checkins create + checkout + refund flows have now been converted that
+#       way (Ville bundle) and removed from this list; no (B) entries remain.
 # ----------------------------------------------------------------------
 is_allowlisted() {
     case "$1" in
@@ -101,21 +103,12 @@ is_allowlisted() {
         new_maintenance::create_request) return 0 ;;
         new_maintenance::update_request) return 0 ;;
         new_maintenance::update_request_status) return 0 ;;
-        # (B) Service-bound core flows — write via the pre-wired
-        # `state.bookings_service` / `state.payments_service` (bound to new_pool
-        # at startup) AND read new_pool directly. Proper Ville support needs
-        # `resolve_write_services(branch)` + a `?branch=` param threaded through
-        # the command path; deferred to the flip task. TODO(ville-bundle).
-        new_bookings::create_booking) return 0 ;;
-        new_bookings::update_booking) return 0 ;;
-        new_payments::create_payment) return 0 ;;
-        new_payments::refund_payment) return 0 ;;
-        # (B) Same class — write via the pre-wired `state.checkins_service`
-        # (bound to new_pool + the shift gate at startup) AND read new_pool.
-        # `checkout` additionally touches live charges. Deferred to the flip
-        # task (resolve_write_services + ?branch=). TODO(ville-bundle).
-        new_checkins::create_checkin) return 0 ;;
-        new_checkins::checkout) return 0 ;;
+        # (B) — the former service-bound core flows (bookings create/update,
+        # payments create/refund, checkins create/checkout) have been CONVERTED
+        # to resolve their service graph + pool per-site via
+        # `AppState::resolve_write_services(branch)` + `state.write_pool(branch)`
+        # (Ville bundle). They no longer reference `state.new_pool` directly, so
+        # they pass this gate on their own merits and are no longer allowlisted.
         *) return 1 ;;
     esac
 }

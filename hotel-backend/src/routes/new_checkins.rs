@@ -322,14 +322,16 @@ pub async fn create_checkin(
     // this field, so when auth is off it stays the empty sentinel (unchanged).
     // Must precede the `Json` body extractor.
     actor: Option<Extension<User>>,
+    Query(query): Query<BranchQuery>,
     Json(body): Json<CreateCheckInRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
-    // TODO(ville-bundle): writes via the pre-wired `state.checkins_service`
-    // (bound to new_pool + the shift gate at startup) + reads new_pool. Per-site
-    // Ville support needs `state.resolve_write_services(branch)?.checkins` + a
-    // `?branch=` param. Allowlisted in scripts/check-write-pool-routing.sh;
-    // HF Ville mutations stay 403'd by `ville_write_guard` until then.
-    let cin_no = generate_cin_no(&state).await?;
+    // Ville bundle: resolve the per-site service graph + pool through the unified
+    // write chokepoint. HF Hotel / `All` returns the pre-wired Arcs unchanged
+    // (byte-identical); HF Ville rebuilds the graph on the `hotelville` pool. HF
+    // Ville mutations stay 403'd by `ville_write_guard` until HFVILLE_WRITES_ENABLED.
+    let ws = state.resolve_write_services(query.branch)?;
+    let pool = state.write_pool(query.branch)?;
+    let cin_no = generate_cin_no(&state, pool).await?;
     let expected_checkout = parse_expected_checkout(&body.expected_checkout)?;
     let check_in_time = parse_check_in_time(body.check_in_time.as_deref())?;
     // Walk-ins use `body.customer_id`; booking-linked check-ins resolve the
@@ -339,12 +341,12 @@ pub async fn create_checkin(
     let resolved_customer_id = match body.booking_id {
         Some(booking_id) => state
             .checkins
-            .get_booking_customer_id(&state.new_pool, booking_id)
+            .get_booking_customer_id(pool, booking_id)
             .await?,
         None => body.customer_id,
     };
     let mut writeback_context =
-        build_check_in_writeback_context(&state, &body, expected_checkout, resolved_customer_id)
+        build_check_in_writeback_context(&state, pool, &body, expected_checkout, resolved_customer_id)
             .await?;
     // Stamp the authenticated operator (if any) over the default empty
     // `created_by`. No body field carries this, so auth-off leaves it empty.
@@ -357,8 +359,8 @@ pub async fn create_checkin(
     let source = EventSource::our_app(Uuid::nil(), Uuid::new_v4());
 
     let outcome = match body.booking_id {
-        Some(booking_id) => state
-            .checkins_service
+        Some(booking_id) => ws
+            .checkins
             .check_in_to_booking(CheckInToBookingCommand {
                 cin_no: cin_no.clone(),
                 booking_id,
@@ -378,8 +380,8 @@ pub async fn create_checkin(
             let customer_id = body.customer_id.ok_or_else(|| {
                 ApiError::BadRequest("Customer ID is required for walk-ins".to_string())
             })?;
-            state
-                .checkins_service
+            ws
+                .checkins
                 .walk_in(WalkInCommand {
                     cin_no: cin_no.clone(),
                     customer_id,
@@ -439,10 +441,10 @@ pub struct CheckoutQuote {
 /// single source for the quote endpoint AND the flag-on checkout path. Reuses
 /// `check_in_billing` (room) + per-cin sums of POS products (`ht_pos_sales`,
 /// posted), payments (`ht_payments`, not voided), and deposits.
-async fn folio_breakdown(state: &AppState, cin_id: i32) -> ApiResult<CheckoutQuote> {
+async fn folio_breakdown(state: &AppState, pool: &PgPool, cin_id: i32) -> ApiResult<CheckoutQuote> {
     let billing = state
         .payments
-        .check_in_billing(&state.new_pool, cin_id)
+        .check_in_billing(pool, cin_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
     let nights = billing.nights.unwrap_or(1).max(1);
@@ -474,7 +476,7 @@ async fn folio_breakdown(state: &AppState, cin_id: i32) -> ApiResult<CheckoutQuo
               WHERE cr_cin_id = $1 AND cr_dep_amount > 0) AS deposit",
     )
     .bind(cin_id)
-    .fetch_one(&state.new_pool)
+    .fetch_one(pool)
     .await
     .map_err(|e| ApiError::Internal(format!("failed to sum folio: {e}")))?;
 
@@ -490,7 +492,7 @@ async fn folio_breakdown(state: &AppState, cin_id: i32) -> ApiResult<CheckoutQuo
 
     let round2 = |v: f64| (v * 100.0).round() / 100.0;
     let net_total = round2(room_total + product_total);
-    let vat_percent = crate::repository::settings::get_vat_percent(&state.new_pool).await;
+    let vat_percent = crate::repository::settings::get_vat_percent(pool).await;
     let vat = if vat_percent > 0 {
         round2(net_total * vat_percent as f64 / (100.0 + vat_percent as f64))
     } else {
@@ -519,23 +521,30 @@ pub async fn checkout_quote(
     State(state): State<AppState>,
     Path(cin_id): Path<i32>,
 ) -> ApiResult<Json<CheckoutQuote>> {
-    Ok(Json(folio_breakdown(&state, cin_id).await?))
+    Ok(Json(folio_breakdown(&state, &state.new_pool, cin_id).await?))
 }
 
 /// PUT /api/new/checkins/:id/checkout - Process check-out
 pub async fn checkout(
     State(state): State<AppState>,
     Path(cin_id): Path<i32>,
+    Query(query): Query<BranchQuery>,
     Json(body): Json<CheckOutRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
-    // TODO(ville-bundle): service-bound (state.checkins_service) + reads
-    // new_pool, and touches live charges. Allowlisted in the write-pool-routing
-    // gate pending resolve_write_services + a ?branch= param.
+    // Ville bundle: resolve the per-site check-in service + pool through the
+    // unified write chokepoint. HF Hotel / `All` returns the pre-wired (shift-
+    // gated) service Arc unchanged; HF Ville rebuilds the graph (incl. the shift
+    // gate) on the `hotelville` pool. HF Ville mutations stay 403'd by
+    // `ville_write_guard` until HFVILLE_WRITES_ENABLED. The pre-write reads below
+    // (status / billing / folio) also use the resolved pool so a Ville checkout
+    // validates + totals against Ville data.
+    let ws = state.resolve_write_services(query.branch)?;
+    let pool = state.write_pool(query.branch)?;
     // The service runs the same status/active check, but we still need
     // `cin_no` for the response (the service outcome only carries the id).
     let status_snap = state
         .checkins
-        .find_status(&state.new_pool, cin_id)
+        .find_status(pool, cin_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
     let cin_no = status_snap.cin_no;
@@ -548,7 +557,7 @@ pub async fn checkout(
     // query that backs the receipt totals API).
     let billing = state
         .payments
-        .check_in_billing(&state.new_pool, cin_id)
+        .check_in_billing(pool, cin_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
     let nights = billing.nights.unwrap_or(1).max(1) as f64;
@@ -597,14 +606,14 @@ pub async fn checkout(
         .unwrap_or(false);
     let (cmd_total_amount, cmd_product_total, cmd_net_total, cmd_pay_total, cmd_balance) =
         if server_total_on {
-            let f = folio_breakdown(&state, cin_id).await?;
+            let f = folio_breakdown(&state, pool, cin_id).await?;
             (Some(f.net_total), f.product_total, f.net_total, f.pay_total, f.balance)
         } else {
             (body.total_amount, 0.0_f64, net_total, pay_total, balance)
         };
 
-    let outcome = state
-        .checkins_service
+    let outcome = ws
+        .checkins
         .check_out(CheckOutCommand {
             check_in_id: cin_id,
             check_out_time,
@@ -754,15 +763,15 @@ pub async fn change_dates(
 
 // ---------- create/checkout helpers ----------
 
-async fn generate_cin_no(state: &AppState) -> ApiResult<String> {
-    let last_cin_no = state.checkins.latest_cin_no_today(&state.new_pool).await?;
+async fn generate_cin_no(state: &AppState, pool: &PgPool) -> ApiResult<String> {
+    let last_cin_no = state.checkins.latest_cin_no_today(pool).await?;
     let next_seq = last_cin_no
         .as_deref()
         .and_then(|s| s.split('-').nth(2))
         .and_then(|n| n.parse::<i32>().ok())
         .map(|n| n + 1)
         .unwrap_or(1);
-    let today = state.checkins.today_yyyymmdd(&state.new_pool).await?;
+    let today = state.checkins.today_yyyymmdd(pool).await?;
     Ok(format!("CIN-{}-{:04}", today, next_seq))
 }
 
@@ -807,6 +816,7 @@ fn parse_check_out_time(raw: Option<&str>) -> ApiResult<Option<NaiveDateTime>> {
 /// and `price_per_night` (`HT_CheckIn_Ds.Cin_Room_Price`).
 async fn build_check_in_writeback_context(
     state: &AppState,
+    pool: &PgPool,
     body: &CreateCheckInRequest,
     expected_checkout: NaiveDate,
     resolved_customer_id: Option<i32>,
@@ -822,7 +832,7 @@ async fn build_check_in_writeback_context(
     // Look up the room first — its weekday price is the fallback when the
     // request omits `rate_per_night`. Ditto for room_no / room_type which
     // the recipe inserts verbatim into HT_CheckIn_Ds.
-    let room = state.rooms.get(&state.new_pool, body.room_id).await?;
+    let room = state.rooms.get(pool, body.room_id).await?;
     let (room_no, room_type, default_weekday) = match room {
         Some(r) => (
             r.room_no,
@@ -851,7 +861,7 @@ async fn build_check_in_writeback_context(
     // check-in (the prior code passed `None` unconditionally to
     // `checkin_to_booking::execute`).
     let (guest_name, customer_phone) = match resolved_customer_id {
-        Some(cust_id) => match state.customers.get(&state.new_pool, cust_id).await? {
+        Some(cust_id) => match state.customers.get(pool, cust_id).await? {
             Some(c) => (
                 full_customer_name(&c.cust_firstname, c.cust_lastname.as_deref()),
                 c.cust_phone,

@@ -221,6 +221,16 @@ pub struct NewBookingResponse {
     pub booking: NewBookingDetail,
 }
 
+/// Branch selector for the booking mutation routes (create / update).
+/// `branchFetch` (frontend) appends `?branch=…`; absent ⇒ HF Hotel. Routes the
+/// canonical write + pre-write reads to the per-site pool via the unified write
+/// chokepoint (Ville bundle).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchQuery {
+    pub branch: Option<Branch>,
+}
+
 /// Room in create/update request
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -340,18 +350,23 @@ pub async fn get_booking(
 /// then constructs the [`CreateBookingCommand`] from the request body.
 pub async fn create_booking(
     State(state): State<AppState>,
+    Query(query): Query<BranchQuery>,
     Json(body): Json<CreateUpdateBookingRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
-    // TODO(ville-bundle): writes via the pre-wired `state.bookings_service`
-    // (bound to new_pool at startup) + reads new_pool directly. Per-site Ville
-    // support needs `state.resolve_write_services(branch)?.bookings` + a
-    // `?branch=` param. Allowlisted in scripts/check-write-pool-routing.sh;
-    // HF Ville mutations stay 403'd by `ville_write_guard` until then.
+    // Ville bundle: resolve the per-site booking service + pool through the
+    // unified write chokepoint. HF Hotel / `All` returns the pre-wired Arc
+    // unchanged; HF Ville rebuilds the graph on the `hotelville` pool. The
+    // book-no generation, availability shadow, and writeback-context lookups
+    // below also use the resolved pool so a Ville booking numbers + validates
+    // against Ville data. HF Ville mutations stay 403'd by `ville_write_guard`
+    // until HFVILLE_WRITES_ENABLED.
     // Task #52: zero rooms is allowed — a waitlist / unassigned reservation.
     // The service persists it canonically and skips the legacy mirror (no room
     // number to write back); a room is assigned later via the edit flow.
+    let ws = state.resolve_write_services(query.branch)?;
+    let pool = state.write_pool(query.branch)?;
 
-    let book_no = generate_book_no(&state).await?;
+    let book_no = generate_book_no(&state, pool).await?;
     let (check_in_date, check_out_date) = parse_stay_range(&body.check_in, &body.check_out)?;
 
     // Spike Phase 3 SHADOW (BOOKING_VALIDATION_ENABLED ships dark): evaluate the
@@ -363,7 +378,7 @@ pub async fn create_booking(
         let ci = check_in_date.format("%Y-%m-%d").to_string();
         let co = check_out_date.format("%Y-%m-%d").to_string();
         for r in &body.rooms {
-            match room_is_available(&state.new_pool, r.room_id, &ci, &co, None).await {
+            match room_is_available(pool, r.room_id, &ci, &co, None).await {
                 Ok(false) => tracing::info!(
                     target: "shadow.booking_validation",
                     book_no = %book_no, room_id = r.room_id, check_in = %ci, check_out = %co,
@@ -383,7 +398,7 @@ pub async fn create_booking(
     // (otherwise the .NET booking list shows blank Book_Cust_Name +
     // Book_Room_Type + Book_Room_Price — see the [2.28.0] CHANGELOG entry).
     let writeback_context =
-        build_writeback_context(&state, &body, check_in_date, check_out_date).await?;
+        build_writeback_context(&state, pool, &body, check_in_date, check_out_date).await?;
 
     let cmd = CreateBookingCommand {
         book_no: book_no.clone(),
@@ -404,7 +419,7 @@ pub async fn create_booking(
         source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
     };
 
-    let outcome = state.bookings_service.create(cmd).await?;
+    let outcome = ws.bookings.create(cmd).await?;
 
     Ok(Json(MutationResponse {
         success: true,
@@ -418,18 +433,23 @@ pub async fn create_booking(
 pub async fn update_booking(
     State(state): State<AppState>,
     Path(book_id): Path<i32>,
+    Query(query): Query<BranchQuery>,
     Json(body): Json<CreateUpdateBookingRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
-    // TODO(ville-bundle): service-bound (state.bookings_service) + reads
-    // new_pool — see create_booking. Allowlisted in the write-pool-routing gate
-    // pending resolve_write_services + a ?branch= param.
+    // Ville bundle: resolve the per-site booking service + pool through the
+    // unified write chokepoint. HF Hotel / `All` returns the pre-wired Arc
+    // unchanged; HF Ville rebuilds the graph on the `hotelville` pool. The
+    // existence/book-no lookup below also uses the resolved pool. HF Ville
+    // mutations stay 403'd by `ville_write_guard` until HFVILLE_WRITES_ENABLED.
     // Task #52: an edit may clear all rooms (back to waitlist) or assign the
     // first room to a previously-unassigned booking — both are valid.
+    let ws = state.resolve_write_services(query.branch)?;
+    let pool = state.write_pool(query.branch)?;
 
     // Verify the booking exists (404 vs 400) and grab book_no for the response.
     let book_no = state
         .bookings
-        .get_book_no(&state.new_pool, book_id)
+        .get_book_no(pool, book_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Booking not found".to_string()))?;
 
@@ -476,7 +496,7 @@ pub async fn update_booking(
         source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
     };
 
-    let outcome = state.bookings_service.modify(cmd).await?;
+    let outcome = ws.bookings.modify(cmd).await?;
 
     Ok(Json(MutationResponse {
         success: true,
@@ -713,8 +733,8 @@ pub async fn validate_booking(
 // ---------- helpers (presentation glue) ----------
 
 /// Generate `YYYYMMDD-NNNN` booking number from the latest sequence today.
-async fn generate_book_no(state: &AppState) -> ApiResult<String> {
-    let last_book_no = state.bookings.latest_book_no_today(&state.new_pool).await?;
+async fn generate_book_no(state: &AppState, pool: &crate::db::PgPool) -> ApiResult<String> {
+    let last_book_no = state.bookings.latest_book_no_today(pool).await?;
     let next_seq = last_book_no
         .as_deref()
         .and_then(|s| s.split('-').nth(1))
@@ -722,7 +742,7 @@ async fn generate_book_no(state: &AppState) -> ApiResult<String> {
         .map(|n| n + 1)
         .unwrap_or(1);
 
-    let today = state.bookings.today_yyyymmdd(&state.new_pool).await?;
+    let today = state.bookings.today_yyyymmdd(pool).await?;
     Ok(format!("{}-{:04}", today, next_seq))
 }
 
@@ -770,6 +790,7 @@ fn product_request_to_command(req: &BookingProductRequest) -> BookingProductComm
 /// surfaces them as one HT_Book_Ds row).
 async fn build_writeback_context(
     state: &AppState,
+    pool: &crate::db::PgPool,
     body: &CreateUpdateBookingRequest,
     check_in: NaiveDate,
     check_out: NaiveDate,
@@ -778,7 +799,7 @@ async fn build_writeback_context(
 
     let stay = DateRange::new(naive_date_to_utc(check_in), naive_date_to_utc(check_out));
 
-    let customer = state.customers.get(&state.new_pool, body.customer_id).await?;
+    let customer = state.customers.get(pool, body.customer_id).await?;
     let (customer_name, customer_phone) = match customer {
         Some(c) => (
             full_customer_name(&c.cust_firstname, c.cust_lastname.as_deref()),
@@ -793,7 +814,7 @@ async fn build_writeback_context(
     let primary_room = body.rooms.first();
     let (room_no, room_type, room_price_baht) = match primary_room {
         Some(req) => {
-            let room = state.rooms.get(&state.new_pool, req.room_id).await?;
+            let room = state.rooms.get(pool, req.room_id).await?;
             let (room_no, room_type, default_weekday) = match room {
                 Some(r) => (
                     r.room_no,

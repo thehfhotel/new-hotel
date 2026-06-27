@@ -17,14 +17,14 @@
 //! so dashboards / SSE keep their existing wire contract.
 
 use axum::{
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, Query, State},
     Json,
 };
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::mode::AppState;
+use super::mode::{AppState, Branch};
 use crate::domain::payment::PaymentMethod;
 use crate::domain::user::User;
 use crate::error::{ApiError, ApiResult};
@@ -88,6 +88,16 @@ pub struct PaymentsResponse {
 pub struct PaymentResponse {
     pub success: bool,
     pub payment: Payment,
+}
+
+/// Branch selector for the payment mutation routes (create / refund).
+/// `branchFetch` (frontend) appends `?branch=…`; absent ⇒ HF Hotel. Routes the
+/// canonical write + pre-write reads to the per-site pool via the unified write
+/// chokepoint (Ville bundle).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchQuery {
+    pub branch: Option<Branch>,
 }
 
 /// Request body for creating a payment
@@ -181,14 +191,18 @@ pub async fn create_payment(
     // `Json` body extractor (which consumes the request).
     actor: Option<Extension<User>>,
     Path(cin_id): Path<i32>,
+    Query(query): Query<BranchQuery>,
     Json(body): Json<CreatePaymentRequest>,
 ) -> ApiResult<Json<PaymentMutationResponse>> {
-    // TODO(ville-bundle): writes via the pre-wired `state.payments_service`
-    // (bound to new_pool + the shift gate at startup) + reads new_pool, and
-    // touches live charges. Per-site Ville support needs
-    // `state.resolve_write_services(branch)?.payments` + a `?branch=` param.
-    // Allowlisted in scripts/check-write-pool-routing.sh; HF Ville mutations
-    // stay 403'd by `ville_write_guard` until then.
+    // Ville bundle: resolve the per-site payment service + pool through the
+    // unified write chokepoint. HF Hotel / `All` returns the pre-wired (shift-
+    // gated) service Arc unchanged; HF Ville rebuilds the graph on the
+    // `hotelville` pool. The pre-write reads below (existence check, receipt
+    // header, billing, VAT) also use the resolved pool so a Ville payment
+    // validates + receipts against Ville data. HF Ville mutations stay 403'd by
+    // `ville_write_guard` until HFVILLE_WRITES_ENABLED.
+    let ws = state.resolve_write_services(query.branch)?;
+    let pool = state.write_pool(query.branch)?;
     if body.amount <= 0.0 {
         return Err(ApiError::BadRequest("Payment amount must be greater than 0".to_string()));
     }
@@ -203,7 +217,7 @@ pub async fn create_payment(
     }
 
     // Verify check-in exists. Mirrors the route's prior `find_status` check.
-    if state.checkins.find_status(&state.new_pool, cin_id).await?.is_none() {
+    if state.checkins.find_status(pool, cin_id).await?.is_none() {
         return Err(ApiError::NotFound("Check-in not found".to_string()));
     }
 
@@ -214,7 +228,7 @@ pub async fn create_payment(
         ApiError::BadRequest(format!("Unmapped payment method '{method}'"))
     })?;
 
-    let receipt = build_receipt_header(&state, cin_id).await?;
+    let receipt = build_receipt_header(&state, pool, cin_id).await?;
     // Per-room apportionment: spike §3h capture line 3 fires
     // `UPDATE HT_CheckIn_Ds SET Cin_Room_Pay_Total=<amt>, Cin_note=''`
     // just before inserting the payment. The route currently doesn't
@@ -229,13 +243,13 @@ pub async fn create_payment(
     // from `ht_checkins` so the writeback recipe stamps the real
     // values into `HT_CheckIn_Pay.Cin_Pay_Ds_PriceOne` /
     // `Cin_Pay_Ds_Num` instead of deriving them as `amount/nights`.
-    let (price_per_night_baht, nights) = resolve_checkin_billing(&state, cin_id).await;
+    let (price_per_night_baht, nights) = resolve_checkin_billing(&state, pool, cin_id).await;
     // Wave 5c: read `ht_settings.vat_percent` so the writeback recipe
     // stamps the hotel-configured rate into `HT_Receipt_H.Receipt_VatPer`
     // instead of the hardcoded constant. Lookup is best-effort — falls
     // back to DEFAULT_VAT_PERCENT on error so payments never block on a
     // settings hiccup.
-    let vat_percent = Some(settings::get_vat_percent(&state.new_pool).await);
+    let vat_percent = Some(settings::get_vat_percent(pool).await);
     // M1 task #36: prefer the authenticated cashier's username over the
     // body-supplied `created_by` so we stop blindly trusting client input for
     // cashier identity. Auth is dark today (`actor` is `None`), so the body
@@ -244,8 +258,8 @@ pub async fn create_payment(
         .as_deref()
         .map(|u| u.username.clone())
         .or_else(|| body.created_by.clone());
-    let outcome = state
-        .payments_service
+    let outcome = ws
+        .payments
         .record_payment(RecordPaymentCommand {
             check_in_id: cin_id,
             amount_satang: baht_f64_to_satang(body.amount),
@@ -319,11 +333,16 @@ pub async fn refund_payment(
     // dark, so this is `Option<_>` and the body value remains the fallback.
     actor: Option<Extension<User>>,
     Path(pay_id): Path<i32>,
+    Query(query): Query<BranchQuery>,
     Json(body): Json<RefundPaymentRequest>,
 ) -> ApiResult<Json<PaymentMutationResponse>> {
-    // TODO(ville-bundle): service-bound (state.payments_service) + reads
-    // new_pool — see create_payment. Allowlisted in the write-pool-routing gate
-    // pending resolve_write_services + a ?branch= param.
+    // Ville bundle: resolve the per-site payment service through the unified
+    // write chokepoint. HF Hotel / `All` returns the pre-wired Arc unchanged; HF
+    // Ville rebuilds the graph on the `hotelville` pool. The refund's lookups
+    // (original payment, refund-sum guard) run inside the service against that
+    // pool. HF Ville mutations stay 403'd by `ville_write_guard` until
+    // HFVILLE_WRITES_ENABLED.
+    let ws = state.resolve_write_services(query.branch)?;
     if !body.amount.is_finite() || body.amount <= 0.0 {
         return Err(ApiError::BadRequest(
             "Refund amount must be a positive finite number".to_string(),
@@ -331,8 +350,8 @@ pub async fn refund_payment(
     }
 
     let created_by = super::resolve_actor(actor.as_deref(), body.created_by.as_deref());
-    let outcome = state
-        .payments_service
+    let outcome = ws
+        .payments
         .refund_payment(RefundPaymentCommand {
             original_payment_id: pay_id,
             amount_satang: baht_f64_to_satang(body.amount),
@@ -378,14 +397,15 @@ fn parse_payment_method(method: &str) -> Option<PaymentMethod> {
 /// `NULL` in these columns, so empty strings preserve compatibility.
 async fn build_receipt_header(
     state: &AppState,
+    pool: &crate::db::PgPool,
     cin_id: i32,
 ) -> ApiResult<RecordPaymentReceipt> {
-    let Some(check_in) = state.checkins.get(&state.new_pool, cin_id).await? else {
+    let Some(check_in) = state.checkins.get(pool, cin_id).await? else {
         return Ok(RecordPaymentReceipt::default());
     };
     let Some(customer) = state
         .customers
-        .get(&state.new_pool, check_in.cin_cust_id)
+        .get(pool, check_in.cin_cust_id)
         .await?
     else {
         return Ok(RecordPaymentReceipt::default());
@@ -424,9 +444,10 @@ fn baht_f64_to_satang(baht: f64) -> i64 {
 /// real per-night price (cosmetic, not data loss).
 async fn resolve_checkin_billing(
     state: &AppState,
+    pool: &crate::db::PgPool,
     cin_id: i32,
 ) -> (Option<f64>, Option<i32>) {
-    match state.payments.check_in_billing(&state.new_pool, cin_id).await {
+    match state.payments.check_in_billing(pool, cin_id).await {
         Ok(Some(b)) => (b.cin_rate_per_night, b.nights.map(|n| n.max(1))),
         _ => (None, None),
     }
