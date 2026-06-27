@@ -446,6 +446,27 @@ pub async fn checkout(
     let net_total = room_price_total; // No product/extras plumbing yet.
     let balance = (net_total - pay_total).max(0.0);
 
+    // Spike Phase 2 SHADOW (CHECKOUT_SERVER_TOTAL_ENABLED ships dark): log when
+    // the client-submitted total diverges from the server-authoritative room
+    // total, so the delta (mostly the actual- vs expected-nights basis) can be
+    // sized on real folios before flipping the flag. The client value is still
+    // what's charged here; this is observation only.
+    if let Some(client_total) = body.total_amount {
+        if (client_total - room_price_total).abs() > 0.01 {
+            tracing::info!(
+                target: "shadow.checkout_total",
+                cin_id,
+                cin_no = %cin_no,
+                nights,
+                rate,
+                client_total,
+                server_room_total = room_price_total,
+                delta = client_total - room_price_total,
+                "checkout-total shadow: client vs server-authoritative total diverge (charged client value — flag off)"
+            );
+        }
+    }
+
     let outcome = state
         .checkins_service
         .check_out(CheckOutCommand {

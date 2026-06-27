@@ -325,6 +325,31 @@ pub async fn create_booking(
     let book_no = generate_book_no(&state).await?;
     let (check_in_date, check_out_date) = parse_stay_range(&body.check_in, &body.check_out)?;
 
+    // Spike Phase 3 SHADOW (BOOKING_VALIDATION_ENABLED ships dark): evaluate the
+    // requested rooms' availability against the pre-create state and LOG any
+    // would-be conflict — but never block. This sizes the validator against real
+    // bookings (false-rejection rate) before the flag is flipped. Observation
+    // only; the booking is created exactly as before regardless.
+    {
+        let ci = check_in_date.format("%Y-%m-%d").to_string();
+        let co = check_out_date.format("%Y-%m-%d").to_string();
+        for r in &body.rooms {
+            match room_is_available(&state.new_pool, r.room_id, &ci, &co, None).await {
+                Ok(false) => tracing::info!(
+                    target: "shadow.booking_validation",
+                    book_no = %book_no, room_id = r.room_id, check_in = %ci, check_out = %co,
+                    "booking-validation shadow: room would be flagged UNAVAILABLE (created anyway — flag off)"
+                ),
+                Ok(true) => {}
+                Err(e) => tracing::debug!(
+                    target: "shadow.booking_validation",
+                    room_id = r.room_id, error = %e,
+                    "booking-validation shadow check errored (ignored)"
+                ),
+            }
+        }
+    }
+
     // Fetch customer + first room so the writeback context lands populated
     // (otherwise the .NET booking list shows blank Book_Cust_Name +
     // Book_Room_Type + Book_Room_Price — see the [2.28.0] CHANGELOG entry).
@@ -520,6 +545,54 @@ pub struct ValidateBookingResponse {
 ///
 /// Branch-aware (`new_pool` / `ville_pool`), mirroring `list_bookings`.
 /// Read-only; uses runtime `sqlx::query` (no `.sqlx/` cache churn).
+///
+/// Single source for the availability check used by both [`validate_booking`]
+/// and the create-path shadow log. `true` ⟺ `room_id` has NO overlapping
+/// confirmed/pending booking or non-cancelled check-in over the half-open
+/// `[check_in, check_out)` range (`YYYY-MM-DD`). `exclude_booking_id` skips a
+/// booking being edited. Booking overlap mirrors `live_room_flags`; check-in
+/// overlap mirrors `calendar.rs`.
+async fn room_is_available(
+    pool: &crate::db::PgPool,
+    room_id: i32,
+    check_in: &str,
+    check_out: &str,
+    exclude_booking_id: Option<i32>,
+) -> ApiResult<bool> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+          EXISTS(
+            SELECT 1 FROM ht_booking_rooms br
+              JOIN ht_bookings b ON b.book_id = br.br_book_id
+             WHERE br.br_room_id = $1
+               AND b.book_status IN ('confirmed','pending')
+               AND b.book_checkin::date  < $3::date
+               AND b.book_checkout::date > $2::date
+               AND ($4::int IS NULL OR b.book_id <> $4::int)
+          ) AS booking_conflict,
+          EXISTS(
+            SELECT 1 FROM ht_checkins c
+             WHERE c.cin_status <> 'cancelled'
+               AND (c.cin_room_id = $1 OR EXISTS(
+                     SELECT 1 FROM ht_checkin_rooms cr
+                      WHERE cr.cr_cin_id = c.cin_id AND cr.cr_room_id = $1))
+               AND c.cin_checkin_time::date < $3::date
+               AND COALESCE(c.cin_checkout_time, c.cin_expected_checkout)::date > $2::date
+          ) AS checkin_conflict
+        "#,
+    )
+    .bind(room_id)
+    .bind(check_in)
+    .bind(check_out)
+    .bind(exclude_booking_id)
+    .fetch_one(pool)
+    .await?;
+    let booking_conflict: bool = row.try_get("booking_conflict").unwrap_or(false);
+    let checkin_conflict: bool = row.try_get("checkin_conflict").unwrap_or(false);
+    Ok(!(booking_conflict || checkin_conflict))
+}
+
 pub async fn validate_booking(
     State(state): State<AppState>,
     Json(body): Json<ValidateBookingRequest>,
@@ -577,44 +650,14 @@ pub async fn validate_booking(
 
     let available = match (room_id, check_in, check_out) {
         (Some(rid), Some(_), Some(_)) => {
-            // Both halves run in one round-trip. Booking overlap mirrors
-            // `live_room_flags` ('confirmed'/'pending', half-open day range);
-            // check-in overlap mirrors `calendar.rs` (COALESCE expected
-            // checkout, exclude cancelled) + the `cin_room_id` OR
-            // `ht_checkin_rooms` room match from `live_room_flags`.
-            let row = sqlx::query(
-                r#"
-                SELECT
-                  EXISTS(
-                    SELECT 1 FROM ht_booking_rooms br
-                      JOIN ht_bookings b ON b.book_id = br.br_book_id
-                     WHERE br.br_room_id = $1
-                       AND b.book_status IN ('confirmed','pending')
-                       AND b.book_checkin::date  < $3::date
-                       AND b.book_checkout::date > $2::date
-                       AND ($4::int IS NULL OR b.book_id <> $4::int)
-                  ) AS booking_conflict,
-                  EXISTS(
-                    SELECT 1 FROM ht_checkins c
-                     WHERE c.cin_status <> 'cancelled'
-                       AND (c.cin_room_id = $1 OR EXISTS(
-                             SELECT 1 FROM ht_checkin_rooms cr
-                              WHERE cr.cr_cin_id = c.cin_id AND cr.cr_room_id = $1))
-                       AND c.cin_checkin_time::date < $3::date
-                       AND COALESCE(c.cin_checkout_time, c.cin_expected_checkout)::date > $2::date
-                  ) AS checkin_conflict
-                "#,
+            let free = room_is_available(
+                pool,
+                rid,
+                body.check_in.trim(),
+                body.check_out.trim(),
+                body.exclude_booking_id,
             )
-            .bind(rid)
-            .bind(body.check_in.trim())
-            .bind(body.check_out.trim())
-            .bind(body.exclude_booking_id)
-            .fetch_one(pool)
             .await?;
-
-            let booking_conflict: bool = row.try_get("booking_conflict").unwrap_or(false);
-            let checkin_conflict: bool = row.try_get("checkin_conflict").unwrap_or(false);
-            let free = !(booking_conflict || checkin_conflict);
             if !free {
                 reasons.push("ห้องนี้ถูกจองหรือมีผู้เข้าพักในช่วงวันที่เลือกแล้ว".to_string());
             }
