@@ -37,6 +37,8 @@
 //! | `adjust_product_stock` | Track F3 / T1 CRIT-3 (`docs/legacy-app/COMPAT_CHEATSHEET.md:560-564`) | `AdjustProductStock` |
 //! | `coupon` | Track G5 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_Cupon`) | `IssueCoupon` + `RedeemCoupon` |
 //! | `pos_sale` | Track G6 / POS module (MVP) — `HT_CheckIn_Product` INSERT + paired `HT_Products.Pro_Amt` additive decrement | `RecordPosSale` |
+//! | `receipt` | Task #45 / POS walk-up (roomless) sale — `HT_Receipt_H` INSERT + N `HT_Receipt_Ds` + paired `HT_Products.Pro_Amt` decrement per line (NO `HT_CheckIn_Product`; `Receipt_ref=''`) | `RecordReceipt` |
+//! | `pos_void` | Task #45 / POS void — guarded `DELETE HT_CheckIn_Product` (by `sale_legacy_id`) + additive `Pro_Amt` restore | `VoidPosSale` |
 //! | `round_bill` | Track J6 (round coexistence step 2) — `HT_Round_Bill` open (`INSERT`) / close (`UPDATE`), `COMPAT_CHEATSHEET.md` §946-956 / §3.20-3.21 (`FrmDueBill.cs:1653/1670`) | `OpenRound` + `CloseRound` |
 //! | `sticky_note` | Task #47 — room/staff notes `HT_Room_SMS` / `HT_EMP_SMS` INSERT (`OUTPUT INSERTED.SMS_ID`) + mark-read UPDATE, `COMPAT_CHEATSHEET.md` §932-942 / §3.22. **SHIPPED DARK** behind `NOTES_WRITEBACK_ENABLED` | `CreateNote` + `MarkNoteRead` |
 //! | `cash_entry` | Migration 059 — petty-cash `TB_Pay_History` positional INSERT (`COMPAT_CHEATSHEET.md` §1051 / `FrmAddPay.cs:638`). **PURE-but-UNWIRED** — no intent/dispatcher arm yet; awaiting `Pay_Type`/`Pay_Group`/`Pay_Account`/`Pay_Program` byte-shape verification | _(none yet — TODO)_ |
@@ -59,6 +61,8 @@ pub mod mark_dirty;
 pub mod payment;
 pub mod pos_sale;
 pub mod rate_price;
+pub mod pos_void;
+pub mod receipt;
 pub mod refund_payment;
 pub mod round_bill;
 pub mod room_change;

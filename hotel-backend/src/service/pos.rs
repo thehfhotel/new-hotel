@@ -52,6 +52,7 @@ use crate::outbox::intent::WritebackIntent;
 use crate::outbox::{generate_idempotency_key, EventBus, OutboxRepository};
 use crate::service::error::{ServiceError, ServiceResult};
 use crate::service::ids::{aggregate_uuid, AggregateKind};
+use crate::writeback::format::vat_inclusive_split;
 
 /// Command for [`PosService::record_sale`].
 ///
@@ -80,6 +81,96 @@ pub struct RecordSaleOutcome {
     pub unit_price_baht: f64,
     pub total_baht: f64,
     pub sold_at: DateTime<Utc>,
+}
+
+/// One line of a walk-up (roomless) sale — see [`RecordWalkupSaleCommand`].
+#[derive(Debug, Clone)]
+pub struct WalkupSaleLine {
+    pub product_id: i64,
+    pub qty: f64,
+    /// Optional cashier price override (>= 0). `None` ⇒ catalog price.
+    pub unit_price_override_baht: Option<f64>,
+    /// Per-line discount in baht (>= 0). Subtracted from `qty × unit_price`.
+    pub discount_baht: f64,
+}
+
+/// Command for [`PosService::record_walkup_sale`].
+///
+/// Task #45 — a walk-up / roomless sale: the cashier sells N product lines
+/// to a customer who is NOT staying. There is no check-in folio; the sale
+/// is persisted as a standalone receipt (`ht_pos_receipts` +
+/// `ht_pos_receipt_lines`) and mirrored to legacy `HT_Receipt_H`/`Ds`.
+#[derive(Debug, Clone)]
+pub struct RecordWalkupSaleCommand {
+    pub lines: Vec<WalkupSaleLine>,
+    /// Legacy `Cust_no`. Empty ⇒ the anonymous walk-up sentinel `C0000`.
+    pub customer_no: String,
+    pub customer_name: String,
+    pub customer_address: String,
+    pub customer_tel: String,
+    /// Buyer tax / customer ID (→ `HT_Receipt_H.Receipt_Tax`). Empty allowed.
+    pub tax_id: String,
+    pub note: String,
+    /// VAT percentage to record (e.g. 0 or 7). Drives the inclusive split.
+    pub vat_percent: i32,
+    /// Header-level discount in baht (>= 0), on top of any per-line discounts.
+    pub discount_baht: f64,
+    /// Tender method (`cash`/`credit`/`transfer`/`qr`).
+    pub payment_method: String,
+    /// Direct-pay amount. `None` ⇒ settled in full (defaults to the total).
+    pub paid_baht: Option<f64>,
+    /// Operator (cashier) — `sold_by`. Empty ⇒ unknown sentinel.
+    pub actor: String,
+}
+
+/// One persisted line of a walk-up sale outcome.
+#[derive(Debug, Clone)]
+pub struct WalkupSaleLineOutcome {
+    pub line_id: i64,
+    pub product_id: i64,
+    pub product_legacy_no: String,
+    pub product_name: String,
+    pub unit_name: String,
+    pub qty: f64,
+    pub unit_price_baht: f64,
+    pub discount_baht: f64,
+    pub total_baht: f64,
+}
+
+/// Outcome of a successful `record_walkup_sale` operation.
+#[derive(Debug, Clone)]
+pub struct RecordWalkupSaleOutcome {
+    pub receipt_id: i64,
+    pub aggregate_id: Uuid,
+    pub customer_no: String,
+    pub subtotal_baht: f64,
+    pub discount_baht: f64,
+    pub before_vat_baht: f64,
+    pub vat_baht: f64,
+    pub vat_percent: i32,
+    pub total_baht: f64,
+    pub paid_baht: f64,
+    pub payment_method: String,
+    pub sold_at: DateTime<Utc>,
+    pub lines: Vec<WalkupSaleLineOutcome>,
+}
+
+/// Command for [`PosService::void_sale`].
+#[derive(Debug, Clone)]
+pub struct VoidSaleCommand {
+    pub sale_id: i64,
+    /// Operator performing the void (logged; no canonical column today).
+    pub by: String,
+    pub reason: Option<String>,
+}
+
+/// Outcome of a successful `void_sale` operation.
+#[derive(Debug, Clone)]
+pub struct VoidSaleOutcome {
+    pub sale_id: i64,
+    pub check_in_id: i32,
+    pub product_id: i64,
+    pub qty_restored: f64,
 }
 
 /// Service handle for the POS aggregate.
@@ -286,6 +377,343 @@ impl PosService {
             unit_price_baht,
             total_baht,
             sold_at,
+        })
+    }
+
+    /// Ring up a walk-up (roomless) sale → standalone receipt. Task #45.
+    ///
+    /// Validates → opens PG TX → per line: reads the product master,
+    /// computes the effective unit price + line total, decrements stock
+    /// additively → INSERTs the `ht_pos_receipts` header + N
+    /// `ht_pos_receipt_lines` → enqueues `WritebackIntent::RecordReceipt`
+    /// → commits. There is NO check-in folio: the sale lands in legacy as
+    /// a standalone `HT_Receipt_H`/`Ds` pair (`Receipt_ref=''`).
+    pub async fn record_walkup_sale(
+        &self,
+        cmd: RecordWalkupSaleCommand,
+    ) -> ServiceResult<RecordWalkupSaleOutcome> {
+        // 1. Pre-flight validation (no I/O yet).
+        if cmd.lines.is_empty() {
+            return Err(ServiceError::validation(
+                "a walk-up sale must have at least one line".to_string(),
+            ));
+        }
+        for (i, line) in cmd.lines.iter().enumerate() {
+            if !line.qty.is_finite() || line.qty <= 0.0 {
+                return Err(ServiceError::validation(format!(
+                    "line {i}: qty must be positive and finite (got {})",
+                    line.qty
+                )));
+            }
+            if let Some(p) = line.unit_price_override_baht {
+                if !p.is_finite() || p < 0.0 {
+                    return Err(ServiceError::validation(format!(
+                        "line {i}: unit_price_override must be non-negative and finite (got {p})"
+                    )));
+                }
+            }
+            if !line.discount_baht.is_finite() || line.discount_baht < 0.0 {
+                return Err(ServiceError::validation(format!(
+                    "line {i}: discount must be non-negative and finite (got {})",
+                    line.discount_baht
+                )));
+            }
+        }
+        if !cmd.discount_baht.is_finite() || cmd.discount_baht < 0.0 {
+            return Err(ServiceError::validation(format!(
+                "header discount must be non-negative and finite (got {})",
+                cmd.discount_baht
+            )));
+        }
+        if let Some(p) = cmd.paid_baht {
+            if !p.is_finite() || p < 0.0 {
+                return Err(ServiceError::validation(format!(
+                    "paid amount must be non-negative and finite (got {p})"
+                )));
+            }
+        }
+
+        let mut tx = self.pg.begin().await?;
+
+        // 2. Per line: read product, compute price + total, decrement stock.
+        let mut subtotal = 0.0_f64;
+        let mut line_discount_total = 0.0_f64;
+        struct StagedLine {
+            product_id: i64,
+            prod_legacy_no: String,
+            prod_name: String,
+            unit_name: String,
+            qty: f64,
+            unit_price_baht: f64,
+            discount_baht: f64,
+            total_baht: f64,
+        }
+        let mut staged: Vec<StagedLine> = Vec::with_capacity(cmd.lines.len());
+        for (i, line) in cmd.lines.iter().enumerate() {
+            let product_row = sqlx::query(
+                "SELECT prod_id, prod_legacy_no, prod_name, prod_unit, \
+                        prod_price::float8 AS prod_price, prod_active \
+                   FROM ht_products WHERE prod_id = $1",
+            )
+            .bind(line.product_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::not_found(format!(
+                    "line {i}: product {} does not exist",
+                    line.product_id
+                ))
+            })?;
+            let prod_active: bool = product_row.try_get("prod_active").unwrap_or(true);
+            if !prod_active {
+                return Err(ServiceError::conflict(format!(
+                    "line {i}: product {} is archived (prod_active=FALSE)",
+                    line.product_id
+                )));
+            }
+            let catalog_price: f64 = product_row.try_get("prod_price").unwrap_or(0.0);
+            let unit_price = line.unit_price_override_baht.unwrap_or(catalog_price);
+            let gross = line.qty * unit_price;
+            let line_total = round_baht(gross - line.discount_baht);
+            subtotal += gross;
+            line_discount_total += line.discount_baht;
+
+            // Additive stock decrement (never absolute SET — race-safe with a
+            // concurrent CT poll; same rule as `record_sale`).
+            sqlx::query(
+                "UPDATE ht_products \
+                    SET prod_current_stock = prod_current_stock - $1::float8, \
+                        prod_updated_at    = NOW() \
+                  WHERE prod_id = $2",
+            )
+            .bind(line.qty)
+            .bind(line.product_id)
+            .execute(&mut *tx)
+            .await?;
+
+            staged.push(StagedLine {
+                product_id: line.product_id,
+                prod_legacy_no: product_row.try_get("prod_legacy_no").unwrap_or_default(),
+                prod_name: product_row.try_get("prod_name").unwrap_or_default(),
+                unit_name: product_row
+                    .try_get::<Option<String>, _>("prod_unit")
+                    .unwrap_or(None)
+                    .unwrap_or_default(),
+                qty: line.qty,
+                unit_price_baht: unit_price,
+                discount_baht: line.discount_baht,
+                total_baht: line_total,
+            });
+        }
+
+        let subtotal = round_baht(subtotal);
+        let discount_total = round_baht(line_discount_total + cmd.discount_baht);
+        let total = round_baht(subtotal - discount_total).max(0.0);
+        let (before_vat, vat) = vat_inclusive_split(total, cmd.vat_percent);
+        let paid = cmd.paid_baht.unwrap_or(total);
+
+        let customer_no = if cmd.customer_no.trim().is_empty() {
+            "C0000".to_string()
+        } else {
+            cmd.customer_no.trim().to_string()
+        };
+        let sold_by_opt = if cmd.actor.trim().is_empty() {
+            None
+        } else {
+            Some(cmd.actor.trim())
+        };
+
+        // 3. INSERT the receipt header (placeholder aggregate UUID), then pin
+        //    the deterministic v5 aggregate id keyed on the BIGSERIAL.
+        let header = sqlx::query(
+            "INSERT INTO ht_pos_receipts ( \
+                receipt_customer_no, receipt_customer_name, receipt_customer_addr, \
+                receipt_customer_tel, receipt_tax_id, receipt_subtotal, receipt_discount, \
+                receipt_total, receipt_before_vat, receipt_vat, receipt_vat_percent, \
+                receipt_paid, receipt_payment_method, receipt_note, receipt_sold_by, \
+                source, aggregate_id \
+             ) VALUES ($1, $2, $3, $4, $5, $6::numeric, $7::numeric, $8::numeric, \
+                       $9::numeric, $10::numeric, $11, $12::numeric, $13, $14, $15, \
+                       'canonical', $16) \
+             RETURNING receipt_id, receipt_sold_at",
+        )
+        .bind(&customer_no)
+        .bind(cmd.customer_name.trim())
+        .bind(cmd.customer_address.trim())
+        .bind(cmd.customer_tel.trim())
+        .bind(cmd.tax_id.trim())
+        .bind(subtotal)
+        .bind(discount_total)
+        .bind(total)
+        .bind(before_vat)
+        .bind(vat)
+        .bind(cmd.vat_percent)
+        .bind(paid)
+        .bind(cmd.payment_method.trim())
+        .bind(cmd.note.trim())
+        .bind(sold_by_opt)
+        .bind(Uuid::new_v4())
+        .fetch_one(&mut *tx)
+        .await?;
+        let receipt_id: i64 = header.try_get("receipt_id")?;
+        let sold_at: DateTime<Utc> = header.try_get("receipt_sold_at")?;
+        let aggregate_id =
+            aggregate_uuid(AggregateKind::Receipt, i32::try_from(receipt_id).unwrap_or(i32::MAX));
+        sqlx::query(
+            "UPDATE ht_pos_receipts SET aggregate_id = $2, updated_at = NOW() \
+              WHERE receipt_id = $1",
+        )
+        .bind(receipt_id)
+        .bind(aggregate_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // 4. INSERT the lines.
+        let mut line_outcomes: Vec<WalkupSaleLineOutcome> = Vec::with_capacity(staged.len());
+        for s in &staged {
+            let line_row = sqlx::query(
+                "INSERT INTO ht_pos_receipt_lines ( \
+                    line_receipt_id, line_product_id, line_product_no, line_product_name, \
+                    line_unit_name, line_qty, line_unit_price, line_discount, line_total \
+                 ) VALUES ($1, $2, $3, $4, $5, $6::numeric, $7::numeric, $8::numeric, $9::numeric) \
+                 RETURNING line_id",
+            )
+            .bind(receipt_id)
+            .bind(s.product_id)
+            .bind(&s.prod_legacy_no)
+            .bind(&s.prod_name)
+            .bind(&s.unit_name)
+            .bind(s.qty)
+            .bind(s.unit_price_baht)
+            .bind(s.discount_baht)
+            .bind(s.total_baht)
+            .fetch_one(&mut *tx)
+            .await?;
+            line_outcomes.push(WalkupSaleLineOutcome {
+                line_id: line_row.try_get("line_id")?,
+                product_id: s.product_id,
+                product_legacy_no: s.prod_legacy_no.clone(),
+                product_name: s.prod_name.clone(),
+                unit_name: s.unit_name.clone(),
+                qty: s.qty,
+                unit_price_baht: s.unit_price_baht,
+                discount_baht: s.discount_baht,
+                total_baht: s.total_baht,
+            });
+        }
+
+        // 5. Enqueue the writeback intent (keyed on the receipt's own UUID).
+        let intent = WritebackIntent::RecordReceipt {
+            receipt_aggregate_id: aggregate_id,
+            receipt_id,
+        };
+        let idem = generate_idempotency_key(&intent, aggregate_id);
+        OutboxRepository::enqueue(&mut tx, &intent, idem)
+            .await
+            .map_err(ServiceError::from_enqueue_error)?;
+
+        tx.commit().await?;
+
+        Ok(RecordWalkupSaleOutcome {
+            receipt_id,
+            aggregate_id,
+            customer_no,
+            subtotal_baht: subtotal,
+            discount_baht: discount_total,
+            before_vat_baht: before_vat,
+            vat_baht: vat,
+            vat_percent: cmd.vat_percent,
+            total_baht: total,
+            paid_baht: round_baht(paid),
+            payment_method: cmd.payment_method,
+            sold_at,
+            lines: line_outcomes,
+        })
+    }
+
+    /// Void a folio POS sale line. Task #45.
+    ///
+    /// Flips canonical `ht_pos_sales.sale_status='voided'`, restores the
+    /// product stock (additive `+qty`), and enqueues
+    /// `WritebackIntent::VoidPosSale` so the legacy `HT_CheckIn_Product`
+    /// line is removed + `Pro_Amt` restored — all in one PG transaction.
+    pub async fn void_sale(&self, cmd: VoidSaleCommand) -> ServiceResult<VoidSaleOutcome> {
+        let mut tx = self.pg.begin().await?;
+
+        // Read + lock the sale row.
+        let sale_row = sqlx::query(
+            "SELECT sale_cin_id, sale_product_id, sale_qty::float8 AS qty, sale_status \
+               FROM ht_pos_sales WHERE sale_id = $1 FOR UPDATE",
+        )
+        .bind(cmd.sale_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            ServiceError::not_found(format!("sale {} does not exist", cmd.sale_id))
+        })?;
+        let status: String = sale_row.try_get("sale_status").unwrap_or_default();
+        if status == "voided" {
+            return Err(ServiceError::conflict(format!(
+                "sale {} is already voided",
+                cmd.sale_id
+            )));
+        }
+        let check_in_id: i32 = sale_row.try_get("sale_cin_id").unwrap_or(0);
+        let product_id: i64 = sale_row.try_get("sale_product_id").unwrap_or(0);
+        let qty: f64 = sale_row.try_get("qty").unwrap_or(0.0);
+
+        // Flip status.
+        sqlx::query(
+            "UPDATE ht_pos_sales SET sale_status = 'voided', updated_at = NOW() \
+              WHERE sale_id = $1",
+        )
+        .bind(cmd.sale_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Restore stock (additive — inverse of the original decrement).
+        sqlx::query(
+            "UPDATE ht_products \
+                SET prod_current_stock = prod_current_stock + $1::float8, \
+                    prod_updated_at    = NOW() \
+              WHERE prod_id = $2",
+        )
+        .bind(qty)
+        .bind(product_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Enqueue the legacy reversal (parent check-in UUID, like RecordPosSale).
+        let cin_aggregate_id = aggregate_uuid(AggregateKind::CheckIn, check_in_id);
+        let intent = WritebackIntent::VoidPosSale {
+            check_in_id: cin_aggregate_id,
+            sale_id: cmd.sale_id,
+        };
+        // The void aggregate is the SALE's own UUID so the idempotency key is
+        // distinct from the original RecordPosSale (which keyed on the sale's
+        // aggregate too) — voids and creates never collide on the outbox
+        // UNIQUE because their intent names differ.
+        let sale_aggregate_id =
+            aggregate_uuid(AggregateKind::PosSale, i32::try_from(cmd.sale_id).unwrap_or(i32::MAX));
+        let idem = generate_idempotency_key(&intent, sale_aggregate_id);
+        OutboxRepository::enqueue(&mut tx, &intent, idem)
+            .await
+            .map_err(ServiceError::from_enqueue_error)?;
+
+        tx.commit().await?;
+
+        tracing::info!(
+            sale_id = cmd.sale_id,
+            by = %cmd.by,
+            reason = cmd.reason.as_deref().unwrap_or(""),
+            "POS sale voided (canonical + legacy reversal enqueued)"
+        );
+
+        Ok(VoidSaleOutcome {
+            sale_id: cmd.sale_id,
+            check_in_id,
+            product_id,
+            qty_restored: qty,
         })
     }
 }

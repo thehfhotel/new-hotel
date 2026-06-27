@@ -186,6 +186,13 @@ pub struct ResolvedJob {
     /// the writeback worker hydrates it; the recipe consumes plain
     /// fields only.
     pub pos_sale: Option<ResolvedPosSale>,
+    /// Task #45 — fully-loaded canonical `ht_pos_receipts` header (+ its
+    /// lines) for the `RecordReceipt` intent. `None` for every other
+    /// intent. Same hydration pattern as `pos_sale`.
+    pub receipt: Option<ResolvedReceipt>,
+    /// Task #45 — resolved void facts (`sale_legacy_id` + `prod_legacy_no`)
+    /// for a `VoidPosSale` intent. `None` for every other intent.
+    pub pos_void: Option<ResolvedPosVoid>,
     /// Task #47 — resolved `ht_notes.note_legacy_id` (`SMS_ID`) for a
     /// `MarkNoteRead` intent. `Some(_)` only when the note already has a
     /// legacy back-pointer (mirrored from iHOTEL, or after its `CreateNote`
@@ -261,6 +268,81 @@ pub struct ResolvedPosSale {
     pub note: String,
     /// Wall-clock when the sale was rung up. Lands in `Cin_Ds_date`.
     pub sold_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Task #45 — fully-hydrated `ht_pos_receipts` header (+ its
+/// `ht_pos_receipt_lines`) required by the `WritebackIntent::RecordReceipt`
+/// recipe. Sourced from PG by the writeback worker; the recipe consumes
+/// plain fields + a `Vec<ResolvedReceiptLine>` only. Same pattern as
+/// `ResolvedPosSale`.
+#[derive(Debug, Default, Clone)]
+pub struct ResolvedReceipt {
+    /// `ht_pos_receipts.receipt_id` — primary key. Used to back-populate
+    /// `receipt_legacy_id` / `receipt_legacy_no` after the legacy INSERT.
+    pub receipt_id: i64,
+    /// Legacy `HT_Receipt_H.Receipt_c_no` — customer business key.
+    /// `'C0000'` for an anonymous walk-up.
+    pub customer_no: String,
+    pub customer_name: String,
+    pub customer_address: String,
+    pub customer_tel: String,
+    /// `HT_Receipt_H.Receipt_Tax` — buyer tax / customer ID. Empty when
+    /// unknown.
+    pub tax_id: String,
+    /// VAT-inclusive grand total → `HT_Receipt_H.Receipt_Total`.
+    pub total_baht: f64,
+    /// Header discount → `HT_Receipt_H.Receipt_Discount`.
+    pub discount_baht: f64,
+    /// VAT percentage (0 / 7) → `HT_Receipt_H.Receipt_VatPer`. Drives the
+    /// inclusive split for `Receipt_BeforeVat` / `Receipt_Vat`.
+    pub vat_percent: i32,
+    /// Free-text note → `HT_Receipt_H.Receipt_note`. Empty when blank.
+    pub note: String,
+    /// Wall-clock the sale was rung up → `HT_Receipt_H.Receipt_Date`.
+    pub sold_at: chrono::DateTime<chrono::Utc>,
+    /// One entry per `ht_pos_receipt_lines` row → one `HT_Receipt_Ds`
+    /// INSERT + one paired `Pro_Amt` decrement. Ordered by `line_id`.
+    pub lines: Vec<ResolvedReceiptLine>,
+}
+
+/// One line of a [`ResolvedReceipt`] — mirror of an `ht_pos_receipt_lines`
+/// row joined for the legacy `HT_Receipt_Ds` INSERT.
+#[derive(Debug, Default, Clone)]
+pub struct ResolvedReceiptLine {
+    /// `HT_Receipt_Ds.S_Product_no` (legacy `Pro_no`) — also drives the
+    /// paired `UPDATE HT_Products … WHERE Pro_no=…` stock decrement.
+    /// Empty string ⇒ the stock decrement is skipped (ad-hoc line).
+    pub prod_legacy_no: String,
+    /// `HT_Receipt_Ds.S_Product_name`.
+    pub prod_name: String,
+    /// `HT_Receipt_Ds.S_UnitName` (e.g. `ขวด` / `ชิ้น`). Empty allowed.
+    pub unit_name: String,
+    /// `HT_Receipt_Ds.S_Unit` — quantity sold.
+    pub qty: f64,
+    /// `HT_Receipt_Ds.S_Price` — unit price in baht.
+    pub unit_price_baht: f64,
+    /// `HT_Receipt_Ds.S_Total` — line total (qty × unit_price − discount).
+    pub total_baht: f64,
+    /// `HT_Receipt_Ds.S_PriceDiscount` — per-line discount in baht.
+    pub discount_baht: f64,
+}
+
+/// Task #45 — resolved facts needed to void a folio POS line in legacy.
+/// Sourced from PG (`ht_pos_sales` joined `ht_products`) by the writeback
+/// worker before dispatching `WritebackIntent::VoidPosSale`.
+#[derive(Debug, Default, Clone)]
+pub struct ResolvedPosVoid {
+    /// `ht_pos_sales.sale_id` — primary key (for diagnostics).
+    pub sale_id: i64,
+    /// `ht_pos_sales.sale_legacy_id` (== `HT_CheckIn_Product.id`).
+    /// `None` ⇒ the original `RecordPosSale` writeback hasn't
+    /// back-populated the legacy id yet; the dispatcher DEFERS the void
+    /// with a retryable error (same pattern as RedeemCoupon waiting on
+    /// IssueCoupon).
+    pub legacy_id: Option<i32>,
+    /// `ht_products.prod_legacy_no` — fallback `Pro_no` for the stock
+    /// restore (the recipe prefers the value stored on the legacy row).
+    pub prod_legacy_no: String,
 }
 
 /// Fully-hydrated `ht_room_changes` row required by the
@@ -368,6 +450,19 @@ fn intent_facts(intent: &WritebackIntent) -> IntentFacts {
         RecordPayment { .. } => (true, true),
         IssueCoupon { .. } => (true, false),
         RecordPosSale { .. } => (true, true),
+        // Task #45 — RecordReceipt allocates a sequential `HT_Receipt_H.id`
+        // (TABLOCKX MAX+1) + `Receipt_no`, so a crash-after-commit retry
+        // would mint a DUPLICATE receipt → ledger it (same class as
+        // RecordPayment, which also allocates a receipt). It writes
+        // `HT_Receipt_*` money rows iHOTEL attributes to the cashier round
+        // → §1.9 open-round warning applies.
+        RecordReceipt { .. } => (true, true),
+        // Task #45 — VoidPosSale is an idempotent guarded `DELETE … WHERE
+        // id=…` + additive `Pro_Amt` restore — a second apply matches 0
+        // rows. Allocates no sequential id (not ledgered) and removes a
+        // money row rather than creating a round-attributed one
+        // (no open-round warning).
+        VoidPosSale { .. } => (false, false),
         CheckOut { .. } => (false, true),
         RefundPayment { .. } => (false, true),
         // OpenRound INSERTs an explicit `HT_Round_Bill.id` → ledger it so a
@@ -1084,6 +1179,43 @@ pub async fn dispatch(
             }
             recipes::pos_sale::execute(conn, resolved_sale).await
         }
+        // Task #45 — POS walk-up standalone receipt. The dispatcher
+        // hydrated `resolved.receipt` (header + lines) from PG before this
+        // point; the recipe consumes plain fields only. Missing hydration
+        // ⇒ recipe error so the job retries rather than emitting an empty
+        // receipt.
+        WritebackIntent::RecordReceipt { receipt_aggregate_id: _, receipt_id } => {
+            let resolved_receipt = resolved.receipt.as_ref().ok_or_else(|| {
+                WritebackError::Recipe(format!(
+                    "RecordReceipt requires resolved.receipt (receipt_id={receipt_id})"
+                ))
+            })?;
+            if resolved_receipt.lines.is_empty() {
+                return Err(WritebackError::Recipe(format!(
+                    "RecordReceipt requires at least one line (receipt_id={receipt_id})"
+                )));
+            }
+            recipes::receipt::execute(conn, resolved_receipt).await
+        }
+        // Task #45 — void a folio POS line. The resolver loaded the
+        // `sale_legacy_id` from PG keyed on `sale_id`. If it's still
+        // unresolved (the original RecordPosSale writeback hasn't
+        // back-populated it yet), DEFER with a recipe error so the job
+        // retries — same pattern as RedeemCoupon waiting on IssueCoupon.
+        WritebackIntent::VoidPosSale { check_in_id: _, sale_id } => {
+            let resolved_void = resolved.pos_void.as_ref().ok_or_else(|| {
+                WritebackError::Recipe(format!(
+                    "VoidPosSale requires resolved.pos_void (sale_id={sale_id})"
+                ))
+            })?;
+            let legacy_id = resolved_void.legacy_id.ok_or_else(|| {
+                WritebackError::Recipe(format!(
+                    "VoidPosSale waiting on RecordPosSale back-population \
+                     (sale_legacy_id unresolved for sale_id={sale_id})"
+                ))
+            })?;
+            recipes::pos_void::execute(conn, legacy_id, &resolved_void.prod_legacy_no).await
+        }
         WritebackIntent::OpenRound { round_aggregate_id: _, payload } => {
             recipes::round_bill::execute_open(conn, payload).await
         }
@@ -1440,6 +1572,8 @@ mod tests {
             "issue_coupon",
             "redeem_coupon",
             "record_pos_sale",
+            "record_receipt",
+            "void_pos_sale",
             "refund_deposit",
             "open_round",
             "close_round",
@@ -1451,7 +1585,7 @@ mod tests {
         // intent name → no actual MSSQL call, just type-level coverage.
         // Counting expected variants here keeps the test cheap and
         // deterministic.
-        assert_eq!(names.len(), 25, "expected 25 WritebackIntent variants");
+        assert_eq!(names.len(), 27, "expected 27 WritebackIntent variants");
     }
 
     /// Cheatsheet §1.9 — byte-pin the round-bill gate probe. iHOTEL's own

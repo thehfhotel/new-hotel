@@ -2266,6 +2266,72 @@ INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('064', '064_booking_reminders.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
+-- Migration 065: Task #45 — POS walk-up (roomless) sale + standalone receipt.
+-- Canonical mirror of legacy HT_Receipt_H (header) + HT_Receipt_Ds (lines).
+CREATE TABLE IF NOT EXISTS ht_pos_receipts (
+    receipt_id            BIGSERIAL    PRIMARY KEY,
+    receipt_customer_no   VARCHAR(50)  NOT NULL DEFAULT 'C0000',
+    receipt_customer_name VARCHAR(500) NOT NULL DEFAULT '',
+    receipt_customer_addr VARCHAR(500) NOT NULL DEFAULT '',
+    receipt_customer_tel  VARCHAR(50)  NOT NULL DEFAULT '',
+    receipt_tax_id        VARCHAR(50)  NOT NULL DEFAULT '',
+    receipt_subtotal      NUMERIC(14, 2) NOT NULL DEFAULT 0,
+    receipt_discount      NUMERIC(14, 2) NOT NULL DEFAULT 0,
+    receipt_total         NUMERIC(14, 2) NOT NULL DEFAULT 0,
+    receipt_before_vat    NUMERIC(14, 2) NOT NULL DEFAULT 0,
+    receipt_vat           NUMERIC(14, 2) NOT NULL DEFAULT 0,
+    receipt_vat_percent   INTEGER        NOT NULL DEFAULT 0,
+    receipt_paid          NUMERIC(14, 2) NOT NULL DEFAULT 0,
+    receipt_payment_method VARCHAR(20)   NOT NULL DEFAULT 'cash',
+    receipt_note          VARCHAR(500)   NOT NULL DEFAULT '',
+    receipt_status        VARCHAR(20)    NOT NULL DEFAULT 'posted',
+    receipt_sold_by       VARCHAR(64),
+    receipt_sold_at       TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+    receipt_legacy_id     INTEGER,
+    receipt_legacy_no     VARCHAR(50),
+    source                VARCHAR(20)    NOT NULL DEFAULT 'canonical',
+    aggregate_id          UUID           NOT NULL,
+    created_at            TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+    updated_at            TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+    CONSTRAINT ht_pos_receipts_status_check
+        CHECK (receipt_status IN ('posted', 'voided')),
+    CONSTRAINT ht_pos_receipts_source_check
+        CHECK (source IN ('canonical', 'legacy'))
+);
+
+CREATE INDEX IF NOT EXISTS ht_pos_receipts_sold_at_idx
+    ON ht_pos_receipts (receipt_sold_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ht_pos_receipts_legacy_id_uq
+    ON ht_pos_receipts (receipt_legacy_id) WHERE receipt_legacy_id IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS ht_pos_receipts_aggregate_id_uq
+    ON ht_pos_receipts (aggregate_id);
+
+CREATE TABLE IF NOT EXISTS ht_pos_receipt_lines (
+    line_id          BIGSERIAL    PRIMARY KEY,
+    line_receipt_id  BIGINT       NOT NULL REFERENCES ht_pos_receipts(receipt_id) ON DELETE CASCADE,
+    line_product_id  BIGINT       REFERENCES ht_products(prod_id),
+    line_product_no  VARCHAR(50)  NOT NULL DEFAULT '',
+    line_product_name VARCHAR(255) NOT NULL DEFAULT '',
+    line_unit_name   VARCHAR(50)  NOT NULL DEFAULT '',
+    line_qty         NUMERIC(10, 3) NOT NULL CHECK (line_qty > 0),
+    line_unit_price  NUMERIC(12, 2) NOT NULL CHECK (line_unit_price >= 0),
+    line_discount    NUMERIC(12, 2) NOT NULL DEFAULT 0,
+    line_total       NUMERIC(14, 2) NOT NULL DEFAULT 0,
+    created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS ht_pos_receipt_lines_receipt_id_idx
+    ON ht_pos_receipt_lines (line_receipt_id);
+
+CREATE INDEX IF NOT EXISTS ht_pos_receipt_lines_product_id_idx
+    ON ht_pos_receipt_lines (line_product_id);
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('065', '065_create_ht_pos_receipts.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
 -- =============================================================================
 -- Initialization complete
 -- =============================================================================

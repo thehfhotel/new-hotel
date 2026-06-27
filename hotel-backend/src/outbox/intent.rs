@@ -508,6 +508,57 @@ pub enum WritebackIntent {
         sale_id: i64,
     },
 
+    /// Task #45 — POS walk-up (roomless) sale → standalone receipt
+    /// (migration 065).
+    ///
+    /// The service has already inserted the canonical `ht_pos_receipts`
+    /// header + N `ht_pos_receipt_lines` rows and decremented
+    /// `ht_products.prod_current_stock` per line. This intent asks the
+    /// writeback worker to mirror the sale into legacy MSSQL as a
+    /// standalone receipt (NO `HT_CheckIn_Product` — walk-up sales read
+    /// from `HT_Receipt_*`, `COMPAT_CHEATSHEET.md` §3.8):
+    ///
+    /// 1. allocate `HT_Receipt_H.id` (TABLOCKX MAX+1) + `Receipt_no`
+    /// 2. INSERT INTO `HT_Receipt_H` (`Receipt_ref=''` — no folio)
+    /// 3. INSERT INTO `HT_Receipt_Ds` × N lines (`S_Sale_id=<receipt id>`)
+    /// 4. paired additive `UPDATE HT_Products SET Pro_Amt = Pro_Amt + (-qty)`
+    ///    per line so the legacy stock invariant holds.
+    ///
+    /// Carries `receipt_id` directly (canonical PK) so the recipe loads
+    /// the header + lines from PG via the resolver. The allocated
+    /// `HT_Receipt_H.id` / `Receipt_no` land on
+    /// `ht_pos_receipts.receipt_legacy_id` / `receipt_legacy_no`.
+    RecordReceipt {
+        /// Aggregate id of the canonical receipt row
+        /// (`ht_pos_receipts.aggregate_id`, minted from `receipt_id` via
+        /// [`AggregateKind::Receipt`]). Drives back-population.
+        receipt_aggregate_id: Uuid,
+        /// `ht_pos_receipts.receipt_id` BIGSERIAL key. The recipe loads
+        /// the remaining header columns + the line items from PG keyed
+        /// on this column.
+        receipt_id: i64,
+    },
+
+    /// Task #45 — void a folio POS sale line.
+    ///
+    /// The service has already flipped canonical
+    /// `ht_pos_sales.sale_status='voided'` and restored
+    /// `ht_products.prod_current_stock` (additive `+qty`). This intent
+    /// reverses the legacy mirror: a guarded DELETE of the
+    /// `HT_CheckIn_Product` row keyed on `sale_legacy_id` plus a paired
+    /// `Pro_Amt` restore (read from the legacy row itself so a retry is
+    /// idempotent — see `writeback/recipes/pos_void.rs`).
+    VoidPosSale {
+        /// Aggregate id of the PARENT check-in (same convention as
+        /// `RecordPosSale`) so the writeback resolver picks up
+        /// `legacy_cin_no` via the shared code path.
+        check_in_id: Uuid,
+        /// `ht_pos_sales.sale_id` of the line being voided. The recipe
+        /// loads the resolved `sale_legacy_id` + `prod_legacy_no` from PG
+        /// keyed on this column.
+        sale_id: i64,
+    },
+
     /// Track J6 (round-bill coexistence step 2) — our app **opens** a
     /// cashier round, mirroring iHOTEL's `FrmDueBill.cs:1653`
     /// (`COMPAT_CHEATSHEET.md` §946 / §3.20):
@@ -943,6 +994,8 @@ impl WritebackIntent {
             WritebackIntent::IssueCoupon { .. } => "issue_coupon",
             WritebackIntent::RedeemCoupon { .. } => "redeem_coupon",
             WritebackIntent::RecordPosSale { .. } => "record_pos_sale",
+            WritebackIntent::RecordReceipt { .. } => "record_receipt",
+            WritebackIntent::VoidPosSale { .. } => "void_pos_sale",
             WritebackIntent::OpenRound { .. } => "open_round",
             WritebackIntent::CloseRound { .. } => "close_round",
             WritebackIntent::RefundDeposit { .. } => "refund_deposit",
@@ -969,6 +1022,7 @@ impl WritebackIntent {
             | WritebackIntent::RefundPayment { check_in_id, .. }
             | WritebackIntent::RoomChange { check_in_id, .. }
             | WritebackIntent::RecordPosSale { check_in_id, .. }
+            | WritebackIntent::VoidPosSale { check_in_id, .. }
             | WritebackIntent::RefundDeposit { check_in_id, .. } => *check_in_id,
             WritebackIntent::MarkRoomClean { room_id, .. }
             | WritebackIntent::MarkRoomDirty { room_id, .. }
@@ -989,6 +1043,7 @@ impl WritebackIntent {
                 .unwrap_or_else(|| product_aggregate_fallback(prod_legacy_no)),
             WritebackIntent::IssueCoupon { coupon_aggregate_id, .. }
             | WritebackIntent::RedeemCoupon { coupon_aggregate_id, .. } => *coupon_aggregate_id,
+            WritebackIntent::RecordReceipt { receipt_aggregate_id, .. } => *receipt_aggregate_id,
             WritebackIntent::OpenRound { round_aggregate_id, .. }
             | WritebackIntent::CloseRound { round_aggregate_id, .. } => *round_aggregate_id,
             WritebackIntent::CreateNote { note_aggregate_id, .. }

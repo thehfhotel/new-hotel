@@ -1088,6 +1088,101 @@ async fn resolve_legacy_ids(
                 });
             }
         }
+        // Task #45 — RecordReceipt. Load the canonical `ht_pos_receipts`
+        // header + its `ht_pos_receipt_lines` (the line snapshot already
+        // carries `line_product_no`/`name`/`unit_name`, so no join to
+        // `ht_products` is needed). The recipe consumes plain fields only.
+        RecordReceipt { receipt_id, .. } => {
+            use hotel_backend::writeback::dispatcher::{ResolvedReceipt, ResolvedReceiptLine};
+            if let Some(h) = sqlx::query(
+                "SELECT \
+                    receipt_id, \
+                    COALESCE(receipt_customer_no, 'C0000') AS customer_no, \
+                    COALESCE(receipt_customer_name, '')    AS customer_name, \
+                    COALESCE(receipt_customer_addr, '')    AS customer_addr, \
+                    COALESCE(receipt_customer_tel, '')     AS customer_tel, \
+                    COALESCE(receipt_tax_id, '')           AS tax_id, \
+                    receipt_total::float8                  AS total_baht, \
+                    receipt_discount::float8               AS discount_baht, \
+                    receipt_vat_percent                    AS vat_percent, \
+                    COALESCE(receipt_note, '')             AS note, \
+                    receipt_sold_at \
+                 FROM ht_pos_receipts WHERE receipt_id = $1",
+            )
+            .bind(*receipt_id)
+            .fetch_optional(pg)
+            .await?
+            {
+                let line_rows = sqlx::query(
+                    "SELECT \
+                        COALESCE(line_product_no, '')   AS prod_legacy_no, \
+                        COALESCE(line_product_name, '') AS prod_name, \
+                        COALESCE(line_unit_name, '')    AS unit_name, \
+                        line_qty::float8                AS qty, \
+                        line_unit_price::float8         AS unit_price_baht, \
+                        line_total::float8              AS total_baht, \
+                        line_discount::float8           AS discount_baht \
+                     FROM ht_pos_receipt_lines \
+                     WHERE line_receipt_id = $1 \
+                     ORDER BY line_id",
+                )
+                .bind(*receipt_id)
+                .fetch_all(pg)
+                .await?;
+                let lines: Vec<ResolvedReceiptLine> = line_rows
+                    .into_iter()
+                    .map(|r| ResolvedReceiptLine {
+                        prod_legacy_no: r.try_get("prod_legacy_no").unwrap_or_default(),
+                        prod_name: r.try_get("prod_name").unwrap_or_default(),
+                        unit_name: r.try_get("unit_name").unwrap_or_default(),
+                        qty: r.try_get("qty").unwrap_or(0.0),
+                        unit_price_baht: r.try_get("unit_price_baht").unwrap_or(0.0),
+                        total_baht: r.try_get("total_baht").unwrap_or(0.0),
+                        discount_baht: r.try_get("discount_baht").unwrap_or(0.0),
+                    })
+                    .collect();
+                resolved.receipt = Some(ResolvedReceipt {
+                    receipt_id: h.try_get("receipt_id").unwrap_or(*receipt_id),
+                    customer_no: h.try_get("customer_no").unwrap_or_default(),
+                    customer_name: h.try_get("customer_name").unwrap_or_default(),
+                    customer_address: h.try_get("customer_addr").unwrap_or_default(),
+                    customer_tel: h.try_get("customer_tel").unwrap_or_default(),
+                    tax_id: h.try_get("tax_id").unwrap_or_default(),
+                    total_baht: h.try_get("total_baht").unwrap_or(0.0),
+                    discount_baht: h.try_get("discount_baht").unwrap_or(0.0),
+                    vat_percent: h.try_get("vat_percent").unwrap_or(0),
+                    note: h.try_get("note").unwrap_or_default(),
+                    sold_at: h.try_get("receipt_sold_at").unwrap_or_else(|_| Utc::now()),
+                    lines,
+                });
+            }
+        }
+        // Task #45 — VoidPosSale. Load the sale's back-populated
+        // `sale_legacy_id` (== `HT_CheckIn_Product.id`) + the joined
+        // `prod_legacy_no` fallback. `legacy_id = None` ⇒ the dispatcher
+        // defers the void until the original RecordPosSale back-populated it.
+        VoidPosSale { sale_id, .. } => {
+            use hotel_backend::writeback::dispatcher::ResolvedPosVoid;
+            if let Some(row) = sqlx::query(
+                "SELECT \
+                    s.sale_id, \
+                    s.sale_legacy_id, \
+                    COALESCE(p.prod_legacy_no, '') AS prod_legacy_no \
+                 FROM ht_pos_sales s \
+                 JOIN ht_products  p ON p.prod_id = s.sale_product_id \
+                 WHERE s.sale_id = $1",
+            )
+            .bind(*sale_id)
+            .fetch_optional(pg)
+            .await?
+            {
+                resolved.pos_void = Some(ResolvedPosVoid {
+                    sale_id: row.try_get("sale_id").unwrap_or(*sale_id),
+                    legacy_id: row.try_get::<Option<i32>, _>("sale_legacy_id").unwrap_or(None),
+                    prod_legacy_no: row.try_get("prod_legacy_no").unwrap_or_default(),
+                });
+            }
+        }
         // CreateBooking carries everything in its payload — no resolution.
         CreateBooking { .. } => {}
         // CreateCheckIn (linked-to-booking variant) needs the linked
@@ -1965,6 +2060,37 @@ async fn back_populate_legacy_ids(
                 .await?;
             }
         }
+        // Task #45 — RecordReceipt back-populates the freshly-allocated
+        // `HT_Receipt_H.id` + `Receipt_no` onto
+        // `ht_pos_receipts.receipt_legacy_id` / `receipt_legacy_no`, keyed
+        // by the receipt's aggregate id (== the intent's
+        // `receipt_aggregate_id`). The recipe stuffs `receipt_h_id` into
+        // `legacy_ids.extra` and the `Receipt_no` into `receipt_no`.
+        RecordReceipt { .. } => {
+            let receipt_h_id = legacy_ids
+                .get("extra")
+                .and_then(|v| v.get("receipt_h_id"))
+                .and_then(|v| v.as_i64())
+                .map(|n| n as i32);
+            if receipt_h_id.is_some() || receipt_no.is_some() {
+                sqlx::query(
+                    "UPDATE ht_pos_receipts SET \
+                       receipt_legacy_id = COALESCE($2, receipt_legacy_id), \
+                       receipt_legacy_no = COALESCE($3, receipt_legacy_no), \
+                       updated_at = NOW() \
+                     WHERE aggregate_id = $1",
+                )
+                .bind(aggregate_id)
+                .bind(receipt_h_id)
+                .bind(receipt_no)
+                .execute(pg)
+                .await?;
+            }
+        }
+        // Task #45 — VoidPosSale removes a legacy line by its existing
+        // `sale_legacy_id` and allocates no new legacy id. The canonical
+        // row is already `sale_status='voided'`. Nothing to back-populate.
+        VoidPosSale { .. } => {}
         // Track J6 — OpenRound allocates its legacy id app-side (in
         // `open_shift`, already stamped onto `ht_shifts.shift_legacy_round_id`)
         // and CloseRound allocates nothing. Neither returns a legacy id to

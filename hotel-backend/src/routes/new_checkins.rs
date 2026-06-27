@@ -17,7 +17,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    Json,
+    Extension, Json,
 };
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use super::mode::{AppState, Branch};
 use crate::domain::shared::{DateRange, Money};
+use crate::domain::user::User;
 use crate::error::{ApiError, ApiResult};
 use crate::models::Pagination;
 use crate::outbox::event::EventSource;
@@ -1410,6 +1411,10 @@ pub struct PosSaleRequest {
     pub unit_price_override: Option<f64>,
     #[serde(default)]
     pub note: Option<String>,
+    /// Task #45 — cashier fallback when auth is dark. The authenticated
+    /// `Extension<User>` (when present) takes precedence over this value.
+    #[serde(default)]
+    pub sold_by: Option<String>,
 }
 
 /// Response for `POST /api/new/checkins/:id/pos-sale`.
@@ -1468,10 +1473,24 @@ pub struct PosSalesListResponse {
 /// outbox enqueue to [`crate::service::PosService::record_sale`].
 pub async fn create_pos_sale(
     State(state): State<AppState>,
+    // Task #45: the authenticated cashier, when present. Auth ships dark, so
+    // this is `Option<_>` — it resolves to `None` until the auth middleware
+    // is enabled, at which point the session user becomes the canonical
+    // `sold_by` (body `soldBy` is the fallback). Must precede the `Json`
+    // body extractor (which consumes the request).
+    actor: Option<Extension<User>>,
     Path(cin_id): Path<i32>,
     Json(body): Json<PosSaleRequest>,
 ) -> ApiResult<Json<PosSaleResponse>> {
-    let command = build_pos_sale_command(cin_id, &body);
+    // Prefer the authenticated cashier's username over the body-supplied
+    // `soldBy` so we stop blindly trusting client input for cashier
+    // identity (mirrors `new_payments::create_payment`).
+    let sold_by = actor
+        .as_deref()
+        .map(|u| u.username.clone())
+        .or_else(|| body.sold_by.clone())
+        .unwrap_or_default();
+    let command = build_pos_sale_command(cin_id, &body, sold_by);
     let outcome = state
         .pos_service
         .record_sale(command)
@@ -1562,6 +1581,7 @@ pub async fn list_pos_sales(
 pub(crate) fn build_pos_sale_command(
     cin_id: i32,
     body: &PosSaleRequest,
+    actor: String,
 ) -> crate::service::RecordSaleCommand {
     crate::service::RecordSaleCommand {
         check_in_id: cin_id,
@@ -1569,11 +1589,10 @@ pub(crate) fn build_pos_sale_command(
         qty: body.qty,
         unit_price_override_baht: body.unit_price_override,
         note: body.note.clone(),
-        // TODO: wire operator from auth middleware once Phase 4 PR3
-        //       threads the session into request extensions. Empty
-        //       string is the canonical "unknown" sentinel (mirrors
-        //       `change_room` / walkin convention).
-        actor: String::new(),
+        // Task #45 — resolved by the route from `Extension<User>` (auth)
+        // with a body `soldBy` fallback. Empty string is the canonical
+        // "unknown" sentinel (mirrors `change_room` / walkin convention).
+        actor,
     }
 }
 

@@ -12,6 +12,7 @@ import CheckOutModal from '@/components/CheckOutModal'
 import ExtendStayModal from '@/components/ExtendStayModal'
 import ChangeRoomModal from '@/components/ChangeRoomModal'
 import PosSaleModal from '@/components/PosSaleModal'
+import WalkupPosModal from '@/components/WalkupPosModal'
 
 const ROOM_EVENTS = [
   'RoomMarkedClean',
@@ -23,7 +24,7 @@ const ROOM_EVENTS = [
   'BookingCancelled',
 ]
 
-type ModalKind = 'checkin' | 'checkout' | 'extend' | 'change' | 'pos'
+type ModalKind = 'checkin' | 'checkout' | 'extend' | 'change' | 'pos' | 'walkup'
 const MODAL_ACTIONS: RoomAction[] = ['checkin', 'checkout', 'extend', 'change', 'pos']
 
 interface FilterOption {
@@ -168,7 +169,24 @@ export default function V2Rooms() {
 
   return (
     <div className="space-y-5">
-      <V2PageHeader eyebrow="ผังห้องพัก" title="ห้องพัก" right={<LiveDot connected={live} />} />
+      <V2PageHeader
+        eyebrow="ผังห้องพัก"
+        title="ห้องพัก"
+        right={
+          <div className="flex items-center gap-3">
+            {canWrite && (
+              <button
+                type="button"
+                onClick={() => setModal('walkup')}
+                className="rounded-md bg-amber-600 px-3 py-1.5 text-[13px] font-medium text-white hover:bg-amber-700"
+              >
+                ขายสินค้า / Walk-up sale
+              </button>
+            )}
+            <LiveDot connected={live} />
+          </div>
+        }
+      />
 
       <VilleNotice branch={branch} />
 
@@ -276,6 +294,10 @@ export default function V2Rooms() {
       )}
       {modal === 'pos' && selected && (
         <PosSaleModal room={{ id: selected.id, roomNo: selected.roomNo }} onClose={() => setModal(null)} onSuccess={() => fetchRooms()} />
+      )}
+      {/* Walk-up sale — not room-bound, so it opens without a `selected` room. */}
+      {modal === 'walkup' && (
+        <WalkupPosModal onClose={() => setModal(null)} onSuccess={() => fetchRooms()} />
       )}
     </div>
   )

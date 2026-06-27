@@ -78,6 +78,13 @@ pub enum AggregateKind {
     /// `legacy_cin_no` self-heal path; this kind is for the canonical
     /// row's own `aggregate_id` column (unique per sale line).
     PosSale,
+    /// Task #45 — `ht_pos_receipts` walk-up / standalone receipt
+    /// headers. The service mints a v5 UUID from the BIGSERIAL
+    /// `receipt_id` so the writeback worker's resolver + back-population
+    /// can correlate the canonical row with its `RecordReceipt` intent
+    /// (the intent's `aggregate_id` IS this UUID, unlike `PosSale` which
+    /// reuses the parent check-in UUID — a walk-up sale has no folio).
+    Receipt,
 }
 
 impl AggregateKind {
@@ -92,6 +99,7 @@ impl AggregateKind {
             AggregateKind::Product => "new-hotel.aggregate.product",
             AggregateKind::Coupon => "new-hotel.aggregate.coupon",
             AggregateKind::PosSale => "new-hotel.aggregate.pos_sale",
+            AggregateKind::Receipt => "new-hotel.aggregate.receipt",
         }
     }
 
@@ -132,6 +140,7 @@ mod tests {
             AggregateKind::Product,
             AggregateKind::Coupon,
             AggregateKind::PosSale,
+            AggregateKind::Receipt,
         ] {
             for id in [1_i32, 42, 1_000_000, i32::MAX] {
                 assert_eq!(aggregate_uuid(kind, id), aggregate_uuid(kind, id));
@@ -153,6 +162,7 @@ mod tests {
             AggregateKind::Product,
             AggregateKind::Coupon,
             AggregateKind::PosSale,
+            AggregateKind::Receipt,
         ];
 
         for (a_index, a) in kinds.iter().enumerate() {

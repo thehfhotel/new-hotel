@@ -75,7 +75,11 @@ pub use payment::{
     GenerateReceiptCommand, GenerateReceiptOutcome, PaymentService, RecordPaymentCommand,
     RecordPaymentOutcome, RefundPaymentCommand, RefundPaymentOutcome,
 };
-pub use pos::{PosService, RecordSaleCommand, RecordSaleOutcome};
+pub use pos::{
+    PosService, RecordSaleCommand, RecordSaleOutcome, RecordWalkupSaleCommand,
+    RecordWalkupSaleOutcome, VoidSaleCommand, VoidSaleOutcome, WalkupSaleLine,
+    WalkupSaleLineOutcome,
+};
 pub use shifts::{
     CloseShiftCommand, OpenShiftCommand, OpenShiftOutcome, Shift, ShiftService, ShiftSummary,
 };

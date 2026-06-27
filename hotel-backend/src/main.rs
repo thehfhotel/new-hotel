@@ -410,8 +410,14 @@ fn build_new_routes(app_state: AppState) -> Router {
     let perm_coupon_redeem =
         app_middleware::require_permission("coupon.redeem", app_state.clone());
     // Track G6 — POS / sales-to-room route gate. Admin + cashier
-    // hold the grant (migration 052 seeds the role grid).
+    // hold the grant (migration 052 seeds the role grid). Each route gets
+    // its own layer instance because `route_layer` consumes the layer by
+    // value (Task #45 added the walk-up sale + void routes — same grant).
     let perm_pos_sell =
+        app_middleware::require_permission("pos.sell", app_state.clone());
+    let perm_pos_sell_walkup =
+        app_middleware::require_permission("pos.sell", app_state.clone());
+    let perm_pos_sell_void =
         app_middleware::require_permission("pos.sell", app_state.clone());
 
     Router::new()
@@ -553,6 +559,17 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route(
             "/api/checkins/{id}/pos-sales",
             get(routes::new_checkins::list_pos_sales),
+        )
+        // Task #45 — POS walk-up (roomless) sale → standalone receipt.
+        // Same `pos.sell` grant as folio POS; branch-aware via ?branch=.
+        .route(
+            "/api/new/pos/walkup-sale",
+            post(routes::new_pos::create_walkup_sale).route_layer(perm_pos_sell_walkup),
+        )
+        // Task #45 — void a folio POS line (canonical + legacy reversal).
+        .route(
+            "/api/new/pos/sales/{id}/void",
+            post(routes::new_pos::void_sale).route_layer(perm_pos_sell_void),
         )
         // Guest registry
         .route("/api/checkins/{id}/guests", get(routes::new_checkins::list_guests).post(routes::new_checkins::create_guest))
