@@ -527,6 +527,7 @@ mod tests {
             ville_available: true,
             ville_writes_enabled: false,
             round_writeback_enabled: false,
+            checkout_server_total_enabled: false,
         };
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(
