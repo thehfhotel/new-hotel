@@ -33,8 +33,9 @@ use crate::repository::checkin::{
     CheckInDetailRow, CheckInListRow, GuestInsert, GuestRow,
 };
 use crate::service::{
-    ChangeRoomCommand, ChangeRoomOutcome, CheckInToBookingCommand, CheckInWritebackContext,
-    CheckOutCommand, ExtendStayCommand, ServiceError, WalkInCommand,
+    ChangeRoomCommand, ChangeRoomOutcome, CheckInService, CheckInToBookingCommand,
+    CheckInWritebackContext, CheckOutCommand, ExtendStayCommand, RefundDepositCommand,
+    ServiceError, WalkInCommand,
 };
 
 /// Check-in status enum
@@ -997,6 +998,178 @@ fn map_change_room_error(err: ServiceError) -> ApiError {
         ServiceError::Validation(msg) => ApiError::BadRequest(msg),
         other => other.into(),
     }
+}
+
+// =============================================================================
+// Deposit refund — Task #49 (คืนเงินมัดจำ)
+// =============================================================================
+
+/// Operator label stamped into the canonical `cr_dep_returned_by` + legacy
+/// `HT_CheckIn_Ds.Cin_Dep_return_by` when the caller doesn't supply one. Auth
+/// context isn't wired into these routes yet (`AUTH_ENABLED` off in
+/// production), so we fall back to a stable sentinel — mirrors
+/// `routes::housekeeping::DEFAULT_BY`.
+const DEPOSIT_REFUND_DEFAULT_BY: &str = "Front Desk";
+
+/// Branch selector for the deposit read / refund routes. `branchFetch`
+/// (frontend) appends `?branch=…`; absent ⇒ HF Hotel.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DepositQuery {
+    pub branch: Option<Branch>,
+}
+
+/// Body for `POST /api/checkins/{id}/deposit-refund`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DepositRefundRequest {
+    /// `ht_checkin_rooms.cr_id` of the room whose deposit is refunded.
+    pub cr_id: i64,
+    /// Operator issuing the refund. Optional — defaults to
+    /// [`DEPOSIT_REFUND_DEFAULT_BY`] when blank / missing.
+    #[serde(default)]
+    pub by: Option<String>,
+}
+
+/// One per-room deposit line for the folio (`GET .../deposits`).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DepositRow {
+    pub cr_id: i64,
+    pub room_no: String,
+    pub amount: f64,
+    /// Raw `cr_dep_status` Thai literal (collected / refunded / none).
+    pub status: Option<String>,
+    /// Convenience flag — `status == 'คืนเงินแล้ว'`. The folio shows the refund
+    /// button only when this is `false`.
+    pub refunded: bool,
+    pub returned_at: Option<String>,
+    pub returned_by: Option<String>,
+}
+
+/// Response for `GET /api/checkins/{id}/deposits`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DepositsResponse {
+    pub success: bool,
+    pub deposits: Vec<DepositRow>,
+}
+
+/// Response for `POST /api/checkins/{id}/deposit-refund`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DepositRefundResponse {
+    pub success: bool,
+    pub message: String,
+    pub check_in_id: i32,
+    pub cr_id: i64,
+    pub amount: f64,
+}
+
+/// Thai literal marking a deposit as refunded — mirrors the service /
+/// recipe (`docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_CheckIn_Ds`).
+const DEP_STATUS_REFUNDED: &str = "คืนเงินแล้ว";
+
+/// Build a [`CheckInService`] bound to the branch's pool. Mirrors
+/// `routes::housekeeping::service_for` — the AppState-wired instance is
+/// hardwired to the primary pool at startup, so a fresh service (cheap Arc
+/// clones + pool handle) is built per request to target HF Ville. HF Ville
+/// mutations stay gated by the `ville_write_guard` middleware in `main.rs`
+/// until `HFVILLE_WRITES_ENABLED` is flipped — this route relies on that
+/// existing safety net. The refund flow doesn't touch the shift gate, so the
+/// service is constructed without `with_shifts`.
+fn deposit_service_for(state: &AppState, branch: Option<Branch>) -> ApiResult<CheckInService> {
+    let pool = match branch.unwrap_or_default() {
+        Branch::Hfville => state.ville_pool()?.clone(),
+        Branch::Hfhotel | Branch::All => state.new_pool.clone(),
+    };
+    Ok(CheckInService::new(
+        state.checkins.clone(),
+        state.outbox.clone(),
+        state.events.clone(),
+        pool,
+    ))
+}
+
+/// `GET /api/checkins/{id}/deposits` — list per-room deposit lines for a folio
+/// (amount + refund state). Backs the folio's refund button. Branch-aware.
+pub async fn list_deposits(
+    State(state): State<AppState>,
+    Path(cin_id): Path<i32>,
+    Query(query): Query<DepositQuery>,
+) -> ApiResult<Json<DepositsResponse>> {
+    let pool = match query.branch.unwrap_or_default() {
+        Branch::Hfville => state.ville_pool()?,
+        Branch::Hfhotel | Branch::All => &state.new_pool,
+    };
+    let rows = sqlx::query(
+        "SELECT cr.cr_id, \
+                COALESCE(r.room_no, '') AS room_no, \
+                cr.cr_dep_amount::float8 AS amount, \
+                cr.cr_dep_status AS status, \
+                cr.cr_dep_returned_at::text AS returned_at, \
+                cr.cr_dep_returned_by AS returned_by \
+           FROM ht_checkin_rooms cr \
+           JOIN ht_rooms_new r ON r.room_id = cr.cr_room_id \
+          WHERE cr.cr_cin_id = $1 AND cr.cr_dep_amount > 0 \
+          ORDER BY cr.cr_id",
+    )
+    .bind(cin_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| ApiError::Database(e.to_string()))?;
+
+    let deposits = rows
+        .into_iter()
+        .map(|row| {
+            let status: Option<String> = row.try_get("status").ok();
+            let refunded = status.as_deref() == Some(DEP_STATUS_REFUNDED);
+            DepositRow {
+                cr_id: row.try_get("cr_id").unwrap_or_default(),
+                room_no: row.try_get("room_no").unwrap_or_default(),
+                amount: row.try_get("amount").unwrap_or(0.0),
+                status,
+                refunded,
+                returned_at: row.try_get("returned_at").ok(),
+                returned_by: row.try_get("returned_by").ok(),
+            }
+        })
+        .collect();
+
+    Ok(Json(DepositsResponse { success: true, deposits }))
+}
+
+/// `POST /api/checkins/{id}/deposit-refund` — mark a per-room deposit refunded
+/// (Task #49 / iHOTEL `FormShowDEPBack`). Branch-aware; delegates the full
+/// validation + transaction to [`CheckInService::refund_deposit`].
+pub async fn deposit_refund(
+    State(state): State<AppState>,
+    Path(cin_id): Path<i32>,
+    Query(query): Query<DepositQuery>,
+    Json(body): Json<DepositRefundRequest>,
+) -> ApiResult<Json<DepositRefundResponse>> {
+    let svc = deposit_service_for(&state, query.branch)?;
+    let by = body
+        .by
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEPOSIT_REFUND_DEFAULT_BY.to_string());
+    let outcome = svc
+        .refund_deposit(RefundDepositCommand {
+            check_in_id: cin_id,
+            cr_id: body.cr_id,
+            by,
+            // TODO: wire user_id from auth middleware (parity with change-room).
+            source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
+        })
+        .await?;
+    Ok(Json(DepositRefundResponse {
+        success: true,
+        message: "Deposit refunded".to_string(),
+        check_in_id: outcome.check_in_id,
+        cr_id: outcome.cr_id,
+        amount: outcome.amount_baht,
+    }))
 }
 
 // =============================================================================

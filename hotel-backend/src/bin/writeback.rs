@@ -1165,6 +1165,21 @@ async fn resolve_legacy_ids(
         // shape in their payload (explicit legacy id, price, cashier,
         // timestamp). No canonical `legacy_*` cache to resolve or self-heal.
         OpenRound { .. } | CloseRound { .. } => {}
+        // Task #49 — RefundDeposit. Resolve the specific per-room folio
+        // line's legacy `HT_CheckIn_Ds.id` (back-populated onto
+        // `ht_checkin_rooms.cr_legacy_ds_id` by the room's CreateCheckIn
+        // writeback) keyed on the intent's `cr_id`. None ⇒ not yet
+        // back-populated; the recipe no-ops with a WARN.
+        RefundDeposit { cr_id, .. } => {
+            if let Some(row) =
+                sqlx::query("SELECT cr_legacy_ds_id FROM ht_checkin_rooms WHERE cr_id = $1")
+                    .bind(*cr_id)
+                    .fetch_optional(pg)
+                    .await?
+            {
+                resolved.legacy_dep_ds_id = row.try_get("cr_legacy_ds_id").ok();
+            }
+        }
     }
     Ok(resolved)
 }
@@ -1934,6 +1949,11 @@ async fn back_populate_legacy_ids(
         // and CloseRound allocates nothing. Neither returns a legacy id to
         // back-populate.
         OpenRound { .. } | CloseRound { .. } => {}
+        // Task #49 — RefundDeposit targets an existing `HT_CheckIn_Ds` row by
+        // its already-resolved `cr_legacy_ds_id` and only flips the deposit
+        // status flag. It allocates no new legacy id — nothing to
+        // back-populate.
+        RefundDeposit { .. } => {}
     }
     Ok(())
 }

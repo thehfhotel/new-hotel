@@ -508,6 +508,17 @@ fn build_new_routes(app_state: AppState) -> Router {
             "/api/checkins/{id}/change-room",
             post(routes::new_checkins::change_room),
         )
+        // Task #49 — deposit refund (คืนเงินมัดจำ / iHOTEL FormShowDEPBack).
+        // GET lists per-room deposit lines (backs the folio refund button);
+        // POST marks a room's deposit refunded. Both branch-aware.
+        .route(
+            "/api/checkins/{id}/deposits",
+            get(routes::new_checkins::list_deposits),
+        )
+        .route(
+            "/api/checkins/{id}/deposit-refund",
+            post(routes::new_checkins::deposit_refund),
+        )
         // Track G6 — POS / sales-to-room (MVP). Ring up a product line
         // against an active folio. Gated on `pos.sell` (cashier + admin).
         .route(

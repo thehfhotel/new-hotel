@@ -513,6 +513,40 @@ pub enum WritebackIntent {
         round_aggregate_id: Uuid,
         payload: CloseRoundPayload,
     },
+
+    /// Task #49 — deposit refund (คืนเงินมัดจำ). Mirrors iHOTEL
+    /// `FormShowDEPBack.cs:536` (`docs/legacy-app/COMPAT_CHEATSHEET.md`
+    /// §`HT_CheckIn_Ds` "Refund deposit", lines 466-467):
+    ///
+    /// ```text
+    /// update HT_CheckIn_Ds
+    ///    set Cin_Dep_return_date=getdate(),
+    ///        Cin_Dep_Status='คืนเงินแล้ว',
+    ///        Cin_Dep_return_by='<emp>'
+    ///  where id=<HT_CheckIn_Ds.id>
+    /// ```
+    ///
+    /// The service flips the canonical `ht_checkin_rooms.cr_dep_status` to the
+    /// same `'คืนเงินแล้ว'` literal (+ `cr_dep_returned_at` / `cr_dep_returned_by`)
+    /// inside one PG transaction before enqueuing this intent. The recipe keys
+    /// the legacy UPDATE on the room's `cr_legacy_ds_id` (== `HT_CheckIn_Ds.id`),
+    /// which the writeback worker back-populated when the check-in's own
+    /// `CreateCheckIn` writeback landed. The dispatcher resolves it from PG by
+    /// `cr_id`; when still absent (the check-in's writeback hasn't completed)
+    /// the recipe no-ops with a WARN — the canonical refund already committed
+    /// and the next CT round-trip reconciles iHOTEL.
+    RefundDeposit {
+        /// Aggregate id of the parent check-in (== `aggregate_uuid(CheckIn, …)`).
+        /// Drives the `writeback_jobs.aggregate_id` index grouping and the
+        /// resolver's self-heal path (same as the other check-in intents).
+        check_in_id: Uuid,
+        /// `ht_checkin_rooms.cr_id` of the room whose deposit is refunded. The
+        /// dispatcher loads `cr_legacy_ds_id` from PG keyed on this column.
+        cr_id: i64,
+        /// Operator who issued the refund — lands verbatim in legacy
+        /// `HT_CheckIn_Ds.Cin_Dep_return_by` (varchar(50)).
+        by: String,
+    },
 }
 
 /// Payload for [`WritebackIntent::OpenRound`].
@@ -777,6 +811,7 @@ impl WritebackIntent {
             WritebackIntent::RecordPosSale { .. } => "record_pos_sale",
             WritebackIntent::OpenRound { .. } => "open_round",
             WritebackIntent::CloseRound { .. } => "close_round",
+            WritebackIntent::RefundDeposit { .. } => "refund_deposit",
         }
     }
 
@@ -796,7 +831,8 @@ impl WritebackIntent {
             | WritebackIntent::RecordPayment { check_in_id, .. }
             | WritebackIntent::RefundPayment { check_in_id, .. }
             | WritebackIntent::RoomChange { check_in_id, .. }
-            | WritebackIntent::RecordPosSale { check_in_id, .. } => *check_in_id,
+            | WritebackIntent::RecordPosSale { check_in_id, .. }
+            | WritebackIntent::RefundDeposit { check_in_id, .. } => *check_in_id,
             WritebackIntent::MarkRoomClean { room_id, .. }
             | WritebackIntent::MarkRoomDirty { room_id, .. }
             | WritebackIntent::SetRoomMaintenance { room_id, .. }
@@ -1159,6 +1195,33 @@ mod tests {
         assert!(parsed.room_type_name.is_none());
         assert!(parsed.price_weekend.is_none());
         assert!(parsed.notes.is_none());
+    }
+
+    /// Task #49 — `RefundDeposit` must expose the snake_case discriminant
+    /// `"refund_deposit"`, report the parent check-in aggregate id (so the
+    /// resolver's check-in self-heal path applies), and round-trip its
+    /// `cr_id` / `by` payload through serde unchanged.
+    #[test]
+    fn refund_deposit_intent_name_aggregate_id_and_roundtrip() {
+        let check_in_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let intent = WritebackIntent::RefundDeposit {
+            check_in_id,
+            cr_id: 4231,
+            by: "Front Desk".into(),
+        };
+        assert_eq!(intent.intent_name(), "refund_deposit");
+        assert_eq!(intent.aggregate_id(), check_in_id);
+        let json = serde_json::to_string(&intent).expect("must serialize");
+        let parsed: WritebackIntent =
+            serde_json::from_str(&json).expect("must round-trip");
+        match parsed {
+            WritebackIntent::RefundDeposit { check_in_id: c, cr_id, by } => {
+                assert_eq!(c, check_in_id);
+                assert_eq!(cr_id, 4231);
+                assert_eq!(by, "Front Desk");
+            }
+            other => panic!("expected RefundDeposit, got {other:?}"),
+        }
     }
 }
 

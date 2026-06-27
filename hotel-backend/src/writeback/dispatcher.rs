@@ -142,6 +142,13 @@ pub struct ResolvedJob {
     pub legacy_room_id_int: Option<i32>,
     /// `HT_CheckIn_Ds.id` for the row to update (CheckOut, ExtendStay).
     pub legacy_checkin_ds_id: Option<i32>,
+    /// Task #49 — `HT_CheckIn_Ds.id` of the specific per-room folio line a
+    /// `RefundDeposit` intent targets. Resolved from `ht_checkin_rooms.cr_legacy_ds_id`
+    /// keyed on the intent's `cr_id` (distinct from `legacy_checkin_ds_id`,
+    /// which is the folio-level id cached on `ht_checkins`). `None` ⇒ the
+    /// room's create-check-in writeback hasn't back-populated the id yet; the
+    /// recipe no-ops with a WARN.
+    pub legacy_dep_ds_id: Option<i32>,
     /// Track G2 / T4 CRIT-1 — `HT_CheckIn_Pay.Pay_no` of the original
     /// payment row a `RefundPayment` intent refunds. Resolved by the
     /// worker from `ht_payments.legacy_pay_no` keyed on the original
@@ -365,6 +372,11 @@ fn intent_facts(intent: &WritebackIntent) -> IntentFacts {
         | UpdateRoom { .. }
         | UpdateCustomer { .. }
         | AdjustProductStock { .. }
+        // RefundDeposit is an idempotent flag UPDATE on an existing
+        // `HT_CheckIn_Ds` row — allocates no sequential id (not ledgered) and
+        // writes no `HT_CheckIn_Pay` / `HT_CheckIn_H` money row the cashier
+        // round attributes (no open-round warning).
+        | RefundDeposit { .. }
         | RedeemCoupon { .. } => (false, false),
     };
     IntentFacts { ledgered, requires_open_round }
@@ -1047,6 +1059,13 @@ pub async fn dispatch(
         WritebackIntent::CloseRound { round_aggregate_id: _, payload } => {
             recipes::round_bill::execute_close(conn, payload).await
         }
+        // Task #49 — deposit refund. The resolver loaded the room's
+        // `cr_legacy_ds_id` (== `HT_CheckIn_Ds.id`) from PG keyed on `cr_id`;
+        // the recipe no-ops with a WARN if it's still unresolved (the
+        // check-in's own writeback hasn't back-populated it yet).
+        WritebackIntent::RefundDeposit { check_in_id: _, cr_id: _, by } => {
+            recipes::deposit_refund::execute(conn, resolved.legacy_dep_ds_id, by).await
+        }
     };
 
     // Ledger RECORD — the LAST write before the worker's COMMIT, on the SAME
@@ -1345,12 +1364,13 @@ mod tests {
             "issue_coupon",
             "redeem_coupon",
             "record_pos_sale",
+            "refund_deposit",
         ];
         // We verify dispatch handles all by constructing one of each via the
         // intent name → no actual MSSQL call, just type-level coverage.
         // Counting expected variants here keeps the test cheap and
         // deterministic.
-        assert_eq!(names.len(), 19, "expected 19 WritebackIntent variants");
+        assert_eq!(names.len(), 20, "expected 20 WritebackIntent variants");
     }
 
     /// Cheatsheet §1.9 — byte-pin the round-bill gate probe. iHOTEL's own

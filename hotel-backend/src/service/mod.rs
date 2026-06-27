@@ -56,7 +56,7 @@ pub use booking::{
 pub use checkin::{
     CancelCheckInCommand, ChangeRoomCommand, ChangeRoomOutcome, CheckInOutcome, CheckInService,
     CheckInToBookingCommand, CheckInWritebackContext, CheckOutCommand, ExtendStayCommand,
-    WalkInCommand,
+    RefundDepositCommand, RefundDepositOutcome, WalkInCommand,
 };
 pub use coupon::{
     CouponService, IssueCouponCommand, IssueCouponOutcome, RedeemCouponCommand,

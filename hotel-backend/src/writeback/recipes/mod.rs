@@ -28,6 +28,7 @@
 //! | `payment` | §3h | `RecordPayment` (+ receipt) |
 //! | `refund_payment` | Track G2 / T4 CRIT-1 (`docs/legacy-app/COMPAT_CHEATSHEET.md:513`) | `RefundPayment` |
 //! | `room_change` | Track G4 / T4 HIGH-3 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_Changed_Room`, §3.17) | `RoomChange` |
+//! | `deposit_refund` | Task #49 — deposit refund (`docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_CheckIn_Ds` "Refund deposit", FormShowDEPBack.cs:536) | `RefundDeposit` |
 //! | `mark_clean` | §3j | `MarkRoomClean` |
 //! | `mark_dirty` | Audit 2026-06-11 P2 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §3.13) | `MarkRoomDirty` |
 //! | `set_maintenance` | Audit 2026-06-11 P2 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §3.15/§3.16) | `SetRoomMaintenance` |
@@ -48,6 +49,7 @@ pub mod checkin_cancel;
 pub mod checkin_to_booking;
 pub mod checkout;
 pub mod coupon;
+pub mod deposit_refund;
 pub mod extend_stay;
 pub mod helpers;
 pub mod mark_clean;

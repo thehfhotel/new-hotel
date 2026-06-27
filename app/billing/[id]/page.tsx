@@ -5,7 +5,7 @@ import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { useBranch } from '@/contexts/BranchContext'
 import { hotelInfoForBranch } from '@/lib/hotel-info'
 import Link from 'next/link'
-import { ArrowLeft, Loader2, AlertCircle, Receipt, CreditCard, Ticket } from 'lucide-react'
+import { ArrowLeft, Loader2, AlertCircle, Receipt, CreditCard, Ticket, Banknote } from 'lucide-react'
 import InvoiceTemplate from '@/components/documents/InvoiceTemplate'
 import LegacyMirrorPanels from '@/components/LegacyMirrorPanels'
 import PrintButton from '@/components/ui/PrintButton'
@@ -65,6 +65,24 @@ interface InvoiceApiResponse {
   error?: string
 }
 
+/** Task #49 — one per-room deposit line from
+ *  `GET /api/checkins/:id/deposits`. `refunded` drives whether the folio
+ *  shows the คืนเงินมัดจำ button or a "refunded" badge. */
+interface DepositRow {
+  crId: number
+  roomNo: string
+  amount: number
+  status: string | null
+  refunded: boolean
+  returnedAt: string | null
+  returnedBy: string | null
+}
+
+interface DepositsApiResponse {
+  success: boolean
+  deposits: DepositRow[]
+}
+
 export default function InvoiceDetailPage({
   params,
 }: {
@@ -87,6 +105,10 @@ export default function InvoiceDetailPage({
   const [paySummary, setPaySummary] = useState<{ totalAmount: number; totalPaid: number } | null>(
     null,
   )
+  // Task #49: per-room deposits + the cr_id currently being refunded (so the
+  // button can show a spinner / disable itself during the POST).
+  const [deposits, setDeposits] = useState<DepositRow[]>([])
+  const [refundingCrId, setRefundingCrId] = useState<number | null>(null)
 
   // Best-effort folio summary (total billed + already paid) so the payment
   // modal pre-fills the outstanding balance. Falls back to the invoice grand
@@ -105,6 +127,44 @@ export default function InvoiceDetailPage({
       // ignore — modal still opens with the invoice grand-total fallback
     }
   }, [resolvedParams.id, branchFetch])
+
+  // Task #49: load the folio's per-room deposit lines so the page can offer a
+  // refund (คืนเงินมัดจำ) on any room still holding an unrefunded deposit.
+  const fetchDeposits = useCallback(async () => {
+    try {
+      const res = await branchFetch(`/api/checkins/${resolvedParams.id}/deposits`)
+      const data: DepositsApiResponse = await res.json()
+      setDeposits(data.success ? data.deposits : [])
+    } catch {
+      // ignore — the deposit panel simply stays hidden on failure
+      setDeposits([])
+    }
+  }, [resolvedParams.id, branchFetch])
+
+  // Task #49: mark one room's deposit refunded, then refetch so the row flips
+  // to the "refunded" badge. Mirrors iHOTEL FormShowDEPBack.
+  const handleRefundDeposit = useCallback(
+    async (crId: number) => {
+      setRefundingCrId(crId)
+      try {
+        const res = await branchFetch(`/api/checkins/${resolvedParams.id}/deposit-refund`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ crId }),
+        })
+        const data = await res.json()
+        if (!res.ok || !data.success) {
+          throw new Error(data.error || data.message || 'คืนเงินมัดจำไม่สำเร็จ')
+        }
+        await fetchDeposits()
+      } catch (err) {
+        alert(err instanceof Error ? err.message : 'เกิดข้อผิดพลาดในการคืนเงินมัดจำ')
+      } finally {
+        setRefundingCrId(null)
+      }
+    },
+    [resolvedParams.id, branchFetch, fetchDeposits],
+  )
 
   const fetchInvoice = useCallback(async () => {
     setLoading(true)
@@ -168,7 +228,8 @@ export default function InvoiceDetailPage({
   useEffect(() => {
     fetchInvoice()
     fetchPaySummary()
-  }, [fetchInvoice, fetchPaySummary])
+    fetchDeposits()
+  }, [fetchInvoice, fetchPaySummary, fetchDeposits])
 
   if (loading) {
     return (
@@ -267,6 +328,59 @@ export default function InvoiceDetailPage({
         hotelInfo={hotelInfo}
         showVat={Boolean(invoiceData.guestTaxId)}
       />
+
+      {/* Task #49 — deposit refund (คืนเงินมัดจำ). One row per room that took
+          a deposit; an unrefunded room shows the refund button, a refunded one
+          shows a badge. Mirrors iHOTEL FormShowDEPBack. Hidden in print. */}
+      {deposits.length > 0 && (
+        <div className="no-print bg-white border border-gray-200 rounded-lg p-4 space-y-3">
+          <div className="flex items-center gap-2 text-gray-900 font-medium">
+            <Banknote className="w-5 h-5 text-amber-600" />
+            ค่ามัดจำ
+          </div>
+          <div className="divide-y divide-gray-100">
+            {deposits.map((dep) => (
+              <div
+                key={dep.crId}
+                className="flex items-center justify-between gap-4 py-2"
+              >
+                <div className="text-sm">
+                  <span className="font-medium text-gray-900">ห้อง {dep.roomNo}</span>
+                  <span className="ml-3 text-gray-600">
+                    {dep.amount.toLocaleString('th-TH', {
+                      style: 'currency',
+                      currency: 'THB',
+                    })}
+                  </span>
+                  {dep.refunded && dep.returnedBy && (
+                    <span className="ml-3 text-xs text-gray-400">
+                      โดย {dep.returnedBy}
+                    </span>
+                  )}
+                </div>
+                {dep.refunded ? (
+                  <span className="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium bg-green-50 text-green-700 border border-green-200">
+                    คืนเงินแล้ว
+                  </span>
+                ) : (
+                  <button
+                    onClick={() => handleRefundDeposit(dep.crId)}
+                    disabled={refundingCrId === dep.crId}
+                    className="inline-flex items-center gap-2 px-3 py-1.5 border border-amber-500 text-amber-700 rounded-lg hover:bg-amber-50 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {refundingCrId === dep.crId ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Banknote className="w-4 h-4" />
+                    )}
+                    คืนเงินมัดจำ
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Phase 5.5e — legacy_mirror panels (coupons / minibar / room moves).
           Hidden in print so the receipt itself stays clean. */}

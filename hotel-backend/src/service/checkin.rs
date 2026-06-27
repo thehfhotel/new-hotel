@@ -149,6 +149,40 @@ pub struct ChangeRoomOutcome {
     pub rc_id: i64,
 }
 
+/// Command for [`CheckInService::refund_deposit`] — Task #49 (คืนเงินมัดจำ).
+///
+/// Marks a single per-room folio line's deposit as refunded. The service:
+///
+/// 1. Validates the targeted `ht_checkin_rooms` row belongs to `check_in_id`,
+///    carries a deposit (`cr_dep_amount > 0`), and is not already refunded.
+/// 2. Inside one PG transaction: flips `cr_dep_status` to the `'คืนเงินแล้ว'`
+///    literal (+ stamps `cr_dep_returned_at` / `cr_dep_returned_by`) and emits
+///    [`WritebackIntent::RefundDeposit`] for the legacy `HT_CheckIn_Ds` mirror.
+///
+/// Mirrors iHOTEL `FormShowDEPBack` (`docs/legacy-app/COMPAT_CHEATSHEET.md`
+/// §`HT_CheckIn_Ds` "Refund deposit").
+#[derive(Debug, Clone)]
+pub struct RefundDepositCommand {
+    /// Parent `ht_checkins.cin_id` — the folio the room belongs to.
+    pub check_in_id: i32,
+    /// `ht_checkin_rooms.cr_id` of the room whose deposit is being refunded.
+    pub cr_id: i64,
+    /// Operator issuing the refund — lands in canonical `cr_dep_returned_by`
+    /// and legacy `HT_CheckIn_Ds.Cin_Dep_return_by`. Must be non-empty.
+    pub by: String,
+    pub source: EventSource,
+}
+
+/// Outcome of a successful `refund_deposit` operation.
+#[derive(Debug, Clone)]
+pub struct RefundDepositOutcome {
+    pub check_in_id: i32,
+    pub cr_id: i64,
+    pub aggregate_id: Uuid,
+    /// The refunded deposit amount in baht (for the route's response / receipt).
+    pub amount_baht: f64,
+}
+
 /// Command for [`CheckInService::extend`].
 #[derive(Debug, Clone)]
 pub struct ExtendStayCommand {
@@ -776,6 +810,110 @@ impl CheckInService {
             check_in_id: cmd.check_in_id,
             aggregate_id,
             rc_id,
+        })
+    }
+
+    /// Refund a per-room deposit — Task #49 (คืนเงินมัดจำ).
+    ///
+    /// Flips the canonical `ht_checkin_rooms.cr_dep_status` to `'คืนเงินแล้ว'`
+    /// (+ `cr_dep_returned_at` / `cr_dep_returned_by`) and enqueues
+    /// [`WritebackIntent::RefundDeposit`] so the legacy `HT_CheckIn_Ds` row is
+    /// mirrored (`FormShowDEPBack`) — all in one transaction. Rejects rooms
+    /// that don't belong to the folio, carry no deposit, or are already
+    /// refunded so the caller gets a precise 4xx instead of a silent no-op.
+    pub async fn refund_deposit(
+        &self,
+        cmd: RefundDepositCommand,
+    ) -> ServiceResult<RefundDepositOutcome> {
+        if cmd.by.trim().is_empty() {
+            return Err(ServiceError::validation(
+                "refund_deposit requires a non-empty `by` operator identifier",
+            ));
+        }
+
+        let mut tx = self.pg.begin().await?;
+
+        // Load the targeted junction row scoped to the folio so a mismatched
+        // (cr_id, check_in_id) pair fails as not-found rather than refunding
+        // an unrelated room.
+        let row = sqlx::query(
+            "SELECT cr_dep_amount::float8 AS amount, cr_dep_status AS status \
+               FROM ht_checkin_rooms \
+              WHERE cr_id = $1 AND cr_cin_id = $2",
+        )
+        .bind(cmd.cr_id)
+        .bind(cmd.check_in_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            ServiceError::not_found(format!(
+                "checkin-room {} is not part of check-in {}",
+                cmd.cr_id, cmd.check_in_id
+            ))
+        })?;
+
+        let amount_baht: f64 = row.try_get("amount").unwrap_or(0.0);
+        let status: Option<String> = row.try_get("status").ok();
+        if amount_baht <= 0.0 {
+            return Err(ServiceError::validation(format!(
+                "checkin-room {} has no deposit to refund",
+                cmd.cr_id
+            )));
+        }
+        if status.as_deref() == Some("คืนเงินแล้ว") {
+            return Err(ServiceError::conflict(format!(
+                "deposit for checkin-room {} is already refunded",
+                cmd.cr_id
+            )));
+        }
+
+        // Flip the canonical deposit lifecycle flag — same `'คืนเงินแล้ว'`
+        // literal the B2 sync mapper reads back from legacy, so the later CT
+        // round-trip is a no-op rather than flapping the row.
+        sqlx::query(
+            "UPDATE ht_checkin_rooms \
+                SET cr_dep_status = 'คืนเงินแล้ว', \
+                    cr_dep_returned_at = NOW(), \
+                    cr_dep_returned_by = $2, \
+                    cr_updated_at = NOW() \
+              WHERE cr_id = $1",
+        )
+        .bind(cmd.cr_id)
+        .bind(cmd.by.as_str())
+        .execute(&mut *tx)
+        .await?;
+
+        // Enqueue the legacy mirror. Aggregate id is the check-in's so the
+        // writeback resolver reuses the check-in self-heal path.
+        let aggregate_id = aggregate_uuid(AggregateKind::CheckIn, cmd.check_in_id);
+        let intent = WritebackIntent::RefundDeposit {
+            check_in_id: aggregate_id,
+            cr_id: cmd.cr_id,
+            by: cmd.by.clone(),
+        };
+        // Per-event v4 discriminator key: a multi-room folio refunds each
+        // room's deposit separately (same aggregate, distinct jobs), and the
+        // `writeback_jobs.idempotency_key` UNIQUE is permanently retained —
+        // a payload-independent (intent, aggregate) key would collide across
+        // rooms. Same precedent as room_change / mark_dirty. The enqueue
+        // commits atomically with the flag flip in this TX.
+        let key = generate_idempotency_key(&intent, Uuid::new_v4());
+        OutboxRepository::enqueue(&mut tx, &intent, key)
+            .await
+            .map_err(ServiceError::from_enqueue_error)?;
+
+        // No dedicated DomainEvent variant for deposit refund today (mirrors
+        // change_room / extend — subscribers learn via the writeback row + UI
+        // poll). Touch the held handle for symmetry with the other methods.
+        let _ = &self.events;
+
+        tx.commit().await?;
+
+        Ok(RefundDepositOutcome {
+            check_in_id: cmd.check_in_id,
+            cr_id: cmd.cr_id,
+            aggregate_id,
+            amount_baht,
         })
     }
 
@@ -1476,6 +1614,28 @@ mod change_room_tests {
         let outbox = Arc::new(OutboxRepository::new());
         let events = Arc::new(EventBus::new());
         CheckInService::new(repo, outbox, events, pool)
+    }
+
+    /// Task #49 — `refund_deposit` rejects a blank operator before any I/O,
+    /// so a lazy (never-connected) pool is sufficient: this test runs even
+    /// without a local PG. Mirrors `housekeeping::mark_dirty_rejects_empty_by`.
+    #[tokio::test]
+    async fn refund_deposit_rejects_empty_by() {
+        let pool = PgPool::connect_lazy("postgresql://invalid:invalid@127.0.0.1:1/never")
+            .expect("lazy pool needs no live server");
+        let svc = build_service(pool);
+        let err = svc
+            .refund_deposit(RefundDepositCommand {
+                check_in_id: 1,
+                cr_id: 1,
+                by: "   ".into(),
+                source: EventSource::System {
+                    reason: "task49".into(),
+                },
+            })
+            .await
+            .expect_err("blank `by` must be rejected");
+        assert!(matches!(err, ServiceError::Validation(_)), "got {err:?}");
     }
 
     /// Pure validation: from == to must be rejected before any DB work.
