@@ -426,11 +426,24 @@ pub struct ModeResponse {
     /// open/close-round controls only when this is true; otherwise rounds are
     /// read-only (iHOTEL opens/closes them and we mirror in).
     pub round_writeback_enabled: bool,
+    /// Spike Phase 2 (server-authoritative checkout total, ship-dark). When true
+    /// the checkout UI displays + submits the backend-computed folio total
+    /// (nights × rate from `check_in_billing` — the same numbers the receipt +
+    /// iHOTEL writeback use) instead of computing `ceil(now − checkin) × rate`
+    /// client-side. Read from `CHECKOUT_SERVER_TOTAL_ENABLED`; default false so
+    /// live charges are unchanged until validated on real folios. See
+    /// docs/spikes/2026-06-27-frontend-backend-encapsulation.md.
+    pub checkout_server_total_enabled: bool,
 }
 
 /// GET /api/mode - Returns current system mode
 pub async fn get_mode(State(state): State<AppState>) -> ApiResult<Json<ModeResponse>> {
     let mode = state.current_mode();
+    // Read at request time (env, not AppState) — cheap, and keeps this ship-dark
+    // Phase 2 flag out of every AppState constructor. Default false.
+    let checkout_server_total_enabled = std::env::var("CHECKOUT_SERVER_TOTAL_ENABLED")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
 
     Ok(Json(ModeResponse {
         success: true,
@@ -438,6 +451,7 @@ pub async fn get_mode(State(state): State<AppState>) -> ApiResult<Json<ModeRespo
         ville_available: state.ville_pool.is_some(),
         ville_writes_enabled: state.hfville_writes_enabled,
         round_writeback_enabled: state.round_writeback_enabled,
+        checkout_server_total_enabled,
     }))
 }
 

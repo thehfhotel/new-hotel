@@ -20,6 +20,10 @@ interface BranchContextType {
    *  (ROUND_WRITEBACK_ENABLED). When false, round controls are read-only
    *  ("managed in iHOTEL") and POST /api/shifts/open|close return 400. */
   roundWritebackEnabled: boolean
+  /** Spike Phase 2 (ship-dark): when true, the checkout UI uses the backend-
+   *  computed folio total (CHECKOUT_SERVER_TOTAL_ENABLED) instead of computing
+   *  nights × rate client-side. Default false → current behavior. */
+  checkoutServerTotalEnabled: boolean
   /** True when the current branch is writable: HF Hotel always, HF Ville only
    *  when villeWritesEnabled. UIs gate mutating actions on this. */
   canWrite: boolean
@@ -31,6 +35,7 @@ const BranchContext = createContext<BranchContextType>({
   villeAvailable: false,
   villeWritesEnabled: false,
   roundWritebackEnabled: false,
+  checkoutServerTotalEnabled: false,
   canWrite: true,
 })
 
@@ -39,6 +44,7 @@ export function BranchProvider({ children }: { children: ReactNode }) {
   const [villeAvailable, setVilleAvailable] = useState(false)
   const [villeWritesEnabled, setVilleWritesEnabled] = useState(false)
   const [roundWritebackEnabled, setRoundWritebackEnabled] = useState(false)
+  const [checkoutServerTotalEnabled, setCheckoutServerTotalEnabled] = useState(false)
   const [mounted, setMounted] = useState(false)
 
   useEffect(() => {
@@ -61,6 +67,9 @@ export function BranchProvider({ children }: { children: ReactNode }) {
         if (data.success && data.roundWritebackEnabled) {
           setRoundWritebackEnabled(true)
         }
+        if (data.success && data.checkoutServerTotalEnabled) {
+          setCheckoutServerTotalEnabled(true)
+        }
       })
       .catch((err) => console.error('Failed to check ville availability:', err))
   }, [])
@@ -77,14 +86,14 @@ export function BranchProvider({ children }: { children: ReactNode }) {
 
   if (!mounted) {
     return (
-      <BranchContext.Provider value={{ branch, setBranch, villeAvailable, villeWritesEnabled, roundWritebackEnabled, canWrite }}>
+      <BranchContext.Provider value={{ branch, setBranch, villeAvailable, villeWritesEnabled, roundWritebackEnabled, checkoutServerTotalEnabled, canWrite }}>
         {children}
       </BranchContext.Provider>
     )
   }
 
   return (
-    <BranchContext.Provider value={{ branch, setBranch, villeAvailable, villeWritesEnabled, roundWritebackEnabled, canWrite }}>
+    <BranchContext.Provider value={{ branch, setBranch, villeAvailable, villeWritesEnabled, roundWritebackEnabled, checkoutServerTotalEnabled, canWrite }}>
       {children}
     </BranchContext.Provider>
   )

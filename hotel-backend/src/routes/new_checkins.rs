@@ -375,6 +375,44 @@ pub async fn create_checkin(
     }))
 }
 
+/// `200` body for the checkout quote (spike Phase 2).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutQuote {
+    pub success: bool,
+    /// Nights billed = `(COALESCE(checkout, expected_checkout)::date − checkin::date)`,
+    /// min 1 — the canonical server computation that backs the receipt + writeback.
+    pub nights: i32,
+    pub rate_per_night: f64,
+    /// `nights × rate` (room charge). Products/VAT/deposits are not yet plumbed
+    /// server-side — an iHOTEL `FrmCheckOut` parity follow-up.
+    pub room_total: f64,
+}
+
+/// GET /api/checkins/{id}/checkout-quote — the server-authoritative checkout
+/// total (read-only). Returns the same `check_in_billing` numbers the receipt
+/// and the iHOTEL writeback already use, so the UI can DISPLAY the canonical
+/// total instead of computing `ceil(now − checkin) × rate` client-side. Gated
+/// on `CHECKOUT_SERVER_TOTAL_ENABLED` at the UI layer (spike Phase 2, ship-dark).
+pub async fn checkout_quote(
+    State(state): State<AppState>,
+    Path(cin_id): Path<i32>,
+) -> ApiResult<Json<CheckoutQuote>> {
+    let billing = state
+        .payments
+        .check_in_billing(&state.new_pool, cin_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
+    let nights = billing.nights.unwrap_or(1).max(1);
+    let rate = billing.cin_rate_per_night.unwrap_or(0.0);
+    Ok(Json(CheckoutQuote {
+        success: true,
+        nights,
+        rate_per_night: rate,
+        room_total: rate * nights as f64,
+    }))
+}
+
 /// PUT /api/new/checkins/:id/checkout - Process check-out
 pub async fn checkout(
     State(state): State<AppState>,

@@ -461,6 +461,10 @@ fn build_new_routes(app_state: AppState) -> Router {
         // Check-ins CRUD (canonical)
         .route("/api/checkins", get(routes::new_checkins::list_checkins).post(routes::new_checkins::create_checkin))
         .route("/api/checkins/{id}/checkout", put(routes::new_checkins::checkout))
+        // Spike Phase 2: read-only server-authoritative checkout total (the UI
+        // displays this instead of computing nights × rate client-side when
+        // CHECKOUT_SERVER_TOTAL_ENABLED is on).
+        .route("/api/checkins/{id}/checkout-quote", get(routes::new_checkins::checkout_quote))
         // Track G1 / T4 HIGH-2: extend an active stay (one-more-night flow).
         .route("/api/checkins/{id}/extend", put(routes::new_checkins::extend))
         // Track G4 / T4 HIGH-3: mid-stay room change (move guest A → B).

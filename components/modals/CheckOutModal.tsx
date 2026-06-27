@@ -3,6 +3,7 @@
 import { useState, useEffect } from 'react'
 import { X, Loader2, User, Calendar, FileText, CreditCard } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { useBranch } from '@/contexts/BranchContext'
 
 interface CheckInDetails {
   id: number
@@ -80,16 +81,24 @@ export default function CheckOutModal({
   onSuccess,
 }: CheckOutModalProps) {
   const branchFetch = useBranchFetch()
+  const { checkoutServerTotalEnabled } = useBranch()
 
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>('cash')
   const [notes, setNotes] = useState('')
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // Spike Phase 2 (ship-dark): backend-computed checkout total. Populated only
+  // when CHECKOUT_SERVER_TOTAL_ENABLED is on; otherwise the legacy client-side
+  // nights × rate is used, so live charges are unchanged.
+  const [quote, setQuote] = useState<{ nights: number; ratePerNight: number; roomTotal: number } | null>(null)
 
-  // Calculate totals
-  const nights = checkIn ? calculateNights(checkIn.checkInTime, null) : 0
-  const ratePerNight = checkIn?.ratePerNight || 0
-  const totalAmount = nights * ratePerNight
+  // Totals: the server quote when the flag is on + loaded, else the client calc.
+  const clientNights = checkIn ? calculateNights(checkIn.checkInTime, null) : 0
+  const clientRate = checkIn?.ratePerNight || 0
+  const useServerTotal = checkoutServerTotalEnabled && quote != null
+  const nights = useServerTotal ? quote!.nights : clientNights
+  const ratePerNight = useServerTotal ? quote!.ratePerNight : clientRate
+  const totalAmount = useServerTotal ? quote!.roomTotal : clientNights * clientRate
 
   // Reset form when modal opens
   useEffect(() => {
@@ -99,6 +108,27 @@ export default function CheckOutModal({
       setError(null)
     }
   }, [isOpen])
+
+  // Fetch the server-authoritative quote when enabled (ship-dark Phase 2). When
+  // off, the quote stays null and the client computation above is used.
+  useEffect(() => {
+    if (!isOpen || !checkoutServerTotalEnabled || !checkIn) {
+      setQuote(null)
+      return
+    }
+    let alive = true
+    branchFetch(`/api/checkins/${checkIn.id}/checkout-quote`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (alive && d?.success) {
+          setQuote({ nights: d.nights, ratePerNight: d.ratePerNight, roomTotal: d.roomTotal })
+        }
+      })
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+  }, [isOpen, checkoutServerTotalEnabled, checkIn, branchFetch])
 
   const handleClose = () => {
     setError(null)
