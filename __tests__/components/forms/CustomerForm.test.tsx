@@ -18,6 +18,7 @@ jest.mock('lucide-react', () => ({
   AlertCircle: () => <span data-testid="icon-alert">Alert</span>,
   Save: () => <span data-testid="icon-save">Save</span>,
   Trash2: () => <span data-testid="icon-trash">Trash</span>,
+  Tag: () => <span data-testid="icon-tag">Tag</span>,
 }))
 
 const mockCustomerData: CustomerFormData = {
@@ -28,6 +29,7 @@ const mockCustomerData: CustomerFormData = {
   email: 'john@example.com',
   idCard: 'REDACTED-sa-pw90123',
   address: '123 Main Street',
+  customerType: 'บุคคลธรรมดา',
   notes: 'VIP customer',
 }
 

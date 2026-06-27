@@ -1,18 +1,32 @@
 //! New Customer API routes for HotelNew database
 //!
-//! - GET /api/new/customers - List customers from HT_Customers
-//! - GET /api/new/customers/:id - Get single customer
-//! - POST /api/new/customers - Create customer
-//! - PUT /api/new/customers/:id - Update customer
-//! - DELETE /api/new/customers/:id - Soft delete (set Cust_Active=0)
+//! - GET    /api/customers/{id}   - Get single customer (full record)
+//! - POST   /api/customers        - Create customer
+//! - PUT    /api/customers/{id}   - Update customer
+//! - DELETE /api/customers/{id}   - Soft delete (set `cust_active=false`)
+//! - GET    /api/customers/search - List customers from `ht_customers`
 //!
-//! Per `docs/architecture.md` §1, §6 (Phase 2.5) writes delegate through
-//! `state.customers_service`. Reads keep calling `state.customers` (the
-//! repository) directly — the service layer's value is in writes (TX +
-//! outbox + events), not in reads. The soft-delete handler stays on the
-//! repository **by design**: customer deletes deliberately have no legacy
-//! writeback (iHOTEL's delete is a destructive hard-DELETE + `'C0000'`
-//! cascade, cheatsheet §3.24 — see `delete_customer` below).
+//! Per `docs/architecture.md` §1, §6 (Phase 2.5) writes delegate through the
+//! customer service. `create` keeps using the AppState-wired
+//! `state.customers_service` (bound to the primary HF Hotel pool — its legacy
+//! writeback is folded into the booking/check-in recipes). The `update`,
+//! `delete` and single-`get` handlers are **branch-aware**: `?branch=hfville`
+//! targets the `hotelville` canonical pool, everything else the HF Hotel pool —
+//! mirroring `routes::housekeeping` / `routes::new_shifts`. A fresh
+//! `CustomerService` is built per request bound to the resolved pool
+//! (construction is cheap: Arc clones + a pool-handle clone). HF Ville
+//! mutations stay gated by the `ville_write_guard` middleware in `main.rs`
+//! until `HFVILLE_WRITES_ENABLED` is flipped — these handlers rely on that
+//! existing safety net rather than re-checking the flag.
+//!
+//! The soft-delete handler stays on the repository **by design**: customer
+//! deletes deliberately have no legacy writeback (iHOTEL's delete is a
+//! destructive hard-DELETE + `'C0000'` cascade, cheatsheet §3.24 — see
+//! `delete_customer` below).
+//!
+//! Path ids accept either the canonical integer `cust_id` or the legacy
+//! `cust_no` (`C\d+`) the list endpoint emits — both resolve via
+//! [`resolve_customer_id_int`](crate::routes::customers::resolve_customer_id_int).
 
 use axum::{
     extract::{Path, Query, State},
@@ -23,11 +37,13 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::mode::{AppState, Branch};
+use crate::db::PgPool;
 use crate::error::{ApiError, ApiResult};
 use crate::models::Pagination;
 use crate::outbox::event::EventSource;
 use crate::repository::customer::CustomerRow;
-use crate::service::{CreateCustomerCommand, UpdateCustomerCommand};
+use crate::routes::customers::resolve_customer_id_int;
+use crate::service::{CreateCustomerCommand, CustomerService, UpdateCustomerCommand};
 
 /// Customer from HT_Customers table
 #[derive(Debug, Serialize)]
@@ -120,6 +136,39 @@ pub struct MutationResponse {
     pub id: Option<i32>,
 }
 
+/// Branch selector for the single-customer CRUD handlers (`get` / `update` /
+/// `delete`). Branch-only — the path id scopes the row, the branch scopes the
+/// pool. Mirrors `routes::housekeeping::HousekeepingQuery`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomerMutationQuery {
+    pub branch: Option<Branch>,
+}
+
+/// Resolve the canonical PG pool for a single-customer request. `All` is not
+/// meaningful for one customer → default to HF Hotel. Returns an owned handle
+/// (cheap `PgPool` clone) so the caller can both resolve the id and build a
+/// per-request [`CustomerService`] bound to it.
+fn customer_pool_for(state: &AppState, branch: Option<Branch>) -> ApiResult<PgPool> {
+    Ok(match branch.unwrap_or_default() {
+        Branch::Hfville => state.ville_pool()?.clone(),
+        Branch::Hfhotel | Branch::All => state.new_pool.clone(),
+    })
+}
+
+/// Build a [`CustomerService`] bound to `pool`, reusing the AppState
+/// repository / outbox / event-bus handles (cheap Arc clones) — same
+/// construction shape as `AppState::wire_services` and
+/// `routes::housekeeping::service_for`.
+fn customer_service_for(state: &AppState, pool: PgPool) -> CustomerService {
+    CustomerService::new(
+        state.customers.clone(),
+        state.outbox.clone(),
+        state.events.clone(),
+        pool,
+    )
+}
+
 /// GET /api/new/customers - List customers from HT_Customers
 pub async fn list_customers(
     State(state): State<AppState>,
@@ -176,14 +225,49 @@ pub async fn create_customer(
     }))
 }
 
-/// PUT /api/new/customers/:id - Update customer
+/// GET /api/customers/{id} - Fetch a single customer's full record.
+///
+/// Branch-aware via `?branch=`. Returns every editable column (first/last
+/// name, phone, email, id card, address, customer type, notes) so the edit
+/// form loads the complete row — the canonical UPDATE overwrites all of these
+/// columns, so the form must round-trip the un-edited ones (the list endpoint
+/// only carries the display subset).
+pub async fn get_customer(
+    State(state): State<AppState>,
+    Path(path_id): Path<String>,
+    Query(query): Query<CustomerMutationQuery>,
+) -> ApiResult<Json<NewCustomer>> {
+    let pool = customer_pool_for(&state, query.branch)?;
+    let cust_id = resolve_customer_id_int(&pool, &path_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Customer not found".to_string()))?;
+
+    let row = state
+        .customers
+        .get(&pool, cust_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Customer not found".to_string()))?;
+
+    Ok(Json(NewCustomer::from_row(row)))
+}
+
+/// PUT /api/customers/{id} - Update customer.
+///
+/// Branch-aware: builds a per-request [`CustomerService`] bound to the branch
+/// pool so the canonical UPDATE + the legacy `UpdateCustomer` re-save enqueue
+/// (audit 2026-06-11 P2) commit in one transaction on the right site.
 pub async fn update_customer(
     State(state): State<AppState>,
-    Path(cust_id): Path<i32>,
+    Path(path_id): Path<String>,
+    Query(query): Query<CustomerMutationQuery>,
     Json(body): Json<CreateUpdateCustomerRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
-    let outcome = state
-        .customers_service
+    let pool = customer_pool_for(&state, query.branch)?;
+    let cust_id = resolve_customer_id_int(&pool, &path_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Customer not found".to_string()))?;
+
+    let outcome = customer_service_for(&state, pool)
         .update(UpdateCustomerCommand {
             customer_id: cust_id,
             first_name: body.first_name,
@@ -221,11 +305,21 @@ pub async fn update_customer(
 /// Stays on the repository (not the service): with the writeback
 /// deliberately out of scope there is nothing for a service method to
 /// compose beyond the single UPDATE.
+///
+/// Branch-aware via `?branch=` — the soft-delete runs against the branch
+/// pool. (It is a canonical-only write, so HF Ville's lack of a writeback is
+/// moot; ville mutations stay blocked by the `ville_write_guard` regardless.)
 pub async fn delete_customer(
     State(state): State<AppState>,
-    Path(cust_id): Path<i32>,
+    Path(path_id): Path<String>,
+    Query(query): Query<CustomerMutationQuery>,
 ) -> ApiResult<Json<MutationResponse>> {
-    let mut tx = state.new_pool.begin().await?;
+    let pool = customer_pool_for(&state, query.branch)?;
+    let cust_id = resolve_customer_id_int(&pool, &path_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Customer not found".to_string()))?;
+
+    let mut tx = pool.begin().await?;
     let rows_affected = state.customers.soft_delete(&mut tx, cust_id).await?;
 
     if rows_affected == 0 {

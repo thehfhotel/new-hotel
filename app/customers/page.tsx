@@ -16,8 +16,11 @@ import {
   Clock,
   Star,
   AlertCircle,
+  Plus,
+  Pencil,
 } from 'lucide-react'
 import DataTable, { Column, PaginationInfo } from '@/components/DataTable'
+import CustomerForm, { CustomerFormData } from '@/components/forms/CustomerForm'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { formatStoredDate } from '@/lib/format'
 
@@ -75,6 +78,12 @@ export default function CustomersPage() {
   const [customerStats, setCustomerStats] = useState<CustomerStats | null>(null)
   const [loadingStats, setLoadingStats] = useState(false)
   const [showModal, setShowModal] = useState(false)
+
+  // Create / edit form state
+  const [showForm, setShowForm] = useState(false)
+  const [formMode, setFormMode] = useState<'create' | 'edit'>('create')
+  const [editingCustomer, setEditingCustomer] = useState<CustomerFormData | null>(null)
+  const [loadingEdit, setLoadingEdit] = useState(false)
 
   // Debounce search input
   useEffect(() => {
@@ -188,6 +197,90 @@ export default function CustomersPage() {
     setPagination((prev) => ({ ...prev, currentPage: 1 }))
   }
 
+  // Open the create form (the form pulls in any pending Thai-ID card prefill).
+  const handleAddCustomer = () => {
+    setFormMode('create')
+    setEditingCustomer(null)
+    setShowForm(true)
+  }
+
+  // Load the full record for the selected customer, then open the edit form.
+  // The list payload only carries a display subset, but the canonical UPDATE
+  // overwrites every column — so we fetch the complete row first.
+  const handleEditCustomer = async () => {
+    if (!selectedCustomer) return
+    setLoadingEdit(true)
+    try {
+      const response = await branchFetch(`/api/customers/${selectedCustomer.id}`)
+      if (!response.ok) {
+        throw new Error('ไม่สามารถโหลดข้อมูลลูกค้าได้')
+      }
+      const data = await response.json()
+      setEditingCustomer({
+        id: data.id,
+        firstName: data.firstName ?? '',
+        lastName: data.lastName ?? '',
+        phone: data.phone ?? '',
+        email: data.email ?? '',
+        idCard: data.idCard ?? '',
+        address: data.address ?? '',
+        customerType: data.customerType ?? '',
+        notes: data.notes ?? '',
+      })
+      setFormMode('edit')
+      setShowForm(true)
+    } catch (error) {
+      console.error('Error loading customer for edit:', error)
+      setFetchError(
+        error instanceof Error ? error.message : 'ไม่สามารถโหลดข้อมูลลูกค้าได้'
+      )
+    } finally {
+      setLoadingEdit(false)
+    }
+  }
+
+  // Create (POST) or update (PUT) — branchFetch appends the active ?branch=.
+  const handleSaveCustomer = async (data: CustomerFormData) => {
+    const isEdit = formMode === 'edit' && data.id != null
+    const url = isEdit ? `/api/customers/${data.id}` : '/api/customers'
+    const response = await branchFetch(url, {
+      method: isEdit ? 'PUT' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        firstName: data.firstName,
+        lastName: data.lastName || null,
+        phone: data.phone || null,
+        email: data.email || null,
+        idCard: data.idCard || null,
+        address: data.address || null,
+        customerType: data.customerType || null,
+        notes: data.notes || null,
+      }),
+    })
+
+    const result = await response.json().catch(() => ({}))
+    if (!response.ok || !result.success) {
+      throw new Error(result.message || 'ไม่สามารถบันทึกข้อมูลลูกค้าได้')
+    }
+
+    // Refresh the list and dismiss the detail modal (its data is now stale).
+    closeModal()
+    fetchCustomers()
+  }
+
+  // Soft-delete (DELETE) the customer, then refresh.
+  const handleDeleteCustomer = async (id: number) => {
+    const response = await branchFetch(`/api/customers/${id}`, {
+      method: 'DELETE',
+    })
+    const result = await response.json().catch(() => ({}))
+    if (!response.ok || !result.success) {
+      throw new Error(result.message || 'ไม่สามารถลบข้อมูลลูกค้าได้')
+    }
+    closeModal()
+    fetchCustomers()
+  }
+
   // Table columns
   const columns: Column<Customer>[] = [
     {
@@ -273,14 +366,23 @@ export default function CustomersPage() {
   return (
     <div className="space-y-6">
       {/* Page Header */}
-      <div className="flex items-center gap-3">
-        <Users className="w-8 h-8 text-blue-600" />
-        <div>
-          <h1 className="text-2xl font-bold text-gray-800">รายชื่อลูกค้า</h1>
-          <p className="text-gray-600">
-            จำนวนลูกค้าทั้งหมด {pagination.totalItems.toLocaleString()} คน
-          </p>
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <Users className="w-8 h-8 text-blue-600" />
+          <div>
+            <h1 className="text-2xl font-bold text-gray-800">รายชื่อลูกค้า</h1>
+            <p className="text-gray-600">
+              จำนวนลูกค้าทั้งหมด {pagination.totalItems.toLocaleString()} คน
+            </p>
+          </div>
         </div>
+        <button
+          onClick={handleAddCustomer}
+          className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors"
+        >
+          <Plus className="w-5 h-5" />
+          เพิ่มลูกค้า
+        </button>
       </div>
 
       {/* Search Bar */}
@@ -358,13 +460,27 @@ export default function CustomersPage() {
                   </span>
                 </div>
               </div>
-              <button
-                onClick={closeModal}
-                className="p-2 hover:bg-gray-200 rounded-full transition-colors"
-                aria-label="ปิด"
-              >
-                <X className="w-5 h-5" />
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleEditCustomer}
+                  disabled={loadingEdit}
+                  className="flex items-center gap-2 px-3 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-lg transition-colors"
+                >
+                  {loadingEdit ? (
+                    <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                  ) : (
+                    <Pencil className="w-4 h-4" />
+                  )}
+                  แก้ไข
+                </button>
+                <button
+                  onClick={closeModal}
+                  className="p-2 hover:bg-gray-200 rounded-full transition-colors"
+                  aria-label="ปิด"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
             </div>
 
             {/* Modal Content */}
@@ -574,6 +690,15 @@ export default function CustomersPage() {
         </div>
       )}
 
+      {/* Create / Edit Customer Form */}
+      <CustomerForm
+        isOpen={showForm}
+        onClose={() => setShowForm(false)}
+        onSave={handleSaveCustomer}
+        onDelete={formMode === 'edit' ? handleDeleteCustomer : undefined}
+        initialData={editingCustomer}
+        mode={formMode}
+      />
     </div>
   )
 }

@@ -303,7 +303,12 @@ async fn list_customers_pg(
 /// `Ok(None)` when no canonical row matches — the caller renders an empty
 /// payload (preserves the prior legacy-mirror behaviour where a missing
 /// customer produced an empty bookings/stats response, not a 404).
-async fn resolve_customer_id_int(
+///
+/// `pub(crate)` so the canonical CRUD handlers in
+/// [`crate::routes::new_customers`] (GET single / PUT / DELETE) resolve the
+/// same legacy-or-canonical id shapes the list endpoint emits, instead of
+/// re-deriving the lookup.
+pub(crate) async fn resolve_customer_id_int(
     pool: &PgPool,
     path_id: &str,
 ) -> ApiResult<Option<i32>> {

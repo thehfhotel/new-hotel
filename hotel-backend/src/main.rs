@@ -432,6 +432,17 @@ fn build_new_routes(app_state: AppState) -> Router {
         )
         .route("/api/checkins/board", get(routes::checkins::list_checkins))
         .route("/api/customers", get(routes::customers::list_customers).post(routes::new_customers::create_customer))
+        // Canonical single-customer CRUD — branch-aware (`?branch=`). GET
+        // returns the full editable record for the edit form; PUT delegates to
+        // the customer service (canonical UPDATE + legacy re-save enqueue);
+        // DELETE soft-deletes (`cust_active=false`, no legacy writeback by
+        // design). HF Ville mutations stay gated by `ville_write_guard`.
+        .route(
+            "/api/customers/{id}",
+            get(routes::new_customers::get_customer)
+                .put(routes::new_customers::update_customer)
+                .delete(routes::new_customers::delete_customer),
+        )
         .route("/api/customers/{id}/bookings", get(routes::customers::get_customer_bookings))
         .route("/api/customers/{id}/stats", get(routes::customers::get_customer_stats))
         // Branch-aware stats (HF Hotel + HF Ville) — the sole stats path.

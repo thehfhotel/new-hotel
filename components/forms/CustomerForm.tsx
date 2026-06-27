@@ -13,7 +13,9 @@ import {
   AlertCircle,
   Save,
   Trash2,
+  Tag,
 } from 'lucide-react'
+import { consumeCheckInPrefill } from '@/lib/checkin-prefill'
 
 export interface CustomerFormData {
   id?: number
@@ -23,8 +25,23 @@ export interface CustomerFormData {
   email: string
   idCard: string
   address: string
+  /** Customer category / price tier — stored verbatim in `ht_customers.cust_type`. */
+  customerType: string
   notes: string
 }
+
+/**
+ * Standard customer-category options. Values are the legacy Thai literals
+ * stored verbatim in `ht_customers.cust_type` (mirrors the backend
+ * `CustomerType::legacy_literal`). An out-of-list existing value is preserved
+ * by injecting it as an extra option at render time.
+ */
+const CUSTOMER_TYPE_OPTIONS = [
+  'บุคคลธรรมดา',
+  'บริษัท',
+  'หน่วยงานราชการ',
+  'อื่นๆ',
+] as const
 
 interface CustomerFormProps {
   isOpen: boolean
@@ -42,6 +59,7 @@ const emptyFormData: CustomerFormData = {
   email: '',
   idCard: '',
   address: '',
+  customerType: '',
   notes: '',
 }
 
@@ -65,15 +83,26 @@ export default function CustomerForm({
       if (initialData) {
         setFormData(initialData)
       } else {
-        setFormData(emptyFormData)
+        // Create mode: pull in any pending Thai-ID card-reader hand-off
+        // (single-use sessionStorage slot shared with the check-in forms).
+        // Empty when no card was scanned, so the form is otherwise blank.
+        const prefill = mode === 'create' ? consumeCheckInPrefill() : null
+        setFormData({
+          ...emptyFormData,
+          firstName: prefill?.firstName ?? '',
+          lastName: prefill?.lastName ?? '',
+          idCard: prefill?.idCard ?? '',
+        })
       }
       setError(null)
       setShowDeleteConfirm(false)
     }
-  }, [isOpen, initialData])
+  }, [isOpen, initialData, mode])
 
   const handleInputChange = (
-    e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>
+    e: React.ChangeEvent<
+      HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement
+    >
   ) => {
     const { name, value } = e.target
     setFormData((prev) => ({
@@ -241,6 +270,37 @@ export default function CustomerForm({
                   placeholder="กรอกเลขบัตรประชาชน"
                   className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors font-mono"
                 />
+              </div>
+
+              {/* Customer Type / Price Tier */}
+              <div>
+                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                  <Tag className="w-4 h-4" />
+                  ประเภทลูกค้า
+                </label>
+                <select
+                  name="customerType"
+                  value={formData.customerType}
+                  onChange={handleInputChange}
+                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
+                >
+                  <option value="">- ไม่ระบุ -</option>
+                  {/* Preserve any existing value that isn't one of the
+                      standard options so editing never silently drops it. */}
+                  {formData.customerType &&
+                    !CUSTOMER_TYPE_OPTIONS.includes(
+                      formData.customerType as (typeof CUSTOMER_TYPE_OPTIONS)[number]
+                    ) && (
+                      <option value={formData.customerType}>
+                        {formData.customerType}
+                      </option>
+                    )}
+                  {CUSTOMER_TYPE_OPTIONS.map((opt) => (
+                    <option key={opt} value={opt}>
+                      {opt}
+                    </option>
+                  ))}
+                </select>
               </div>
 
               {/* Address */}
