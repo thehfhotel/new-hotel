@@ -49,8 +49,9 @@ pub mod shifts;
 
 pub use auth::{AuthError, AuthService, DEFAULT_SESSION_TTL};
 pub use booking::{
-    BookingOutcome, BookingRoomCommand, BookingService, BookingSnapshotInputs,
-    BookingWritebackContext, CancelBookingCommand, CreateBookingCommand, ModifyBookingCommand,
+    BookingOutcome, BookingProductCommand, BookingRoomCommand, BookingService,
+    BookingSnapshotInputs, BookingWritebackContext, CancelBookingCommand, CreateBookingCommand,
+    ModifyBookingCommand,
 };
 pub use checkin::{
     CancelCheckInCommand, ChangeRoomCommand, ChangeRoomOutcome, CheckInOutcome, CheckInService,

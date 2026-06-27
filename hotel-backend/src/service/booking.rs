@@ -23,7 +23,9 @@ use crate::domain::shared::{DateRange, Money};
 use crate::outbox::event::{BookingSnapshot, DomainEvent, EventSource};
 use crate::outbox::intent::{BookingChanges, CreateBookingPayload, WritebackIntent};
 use crate::outbox::{generate_idempotency_key, EventBus, OutboxRepository};
-use crate::repository::booking::{BookingRepository, BookingRoomAssignment, BookingWrite};
+use crate::repository::booking::{
+    BookingProductAssignment, BookingRepository, BookingRoomAssignment, BookingWrite,
+};
 
 use super::error::{ServiceError, ServiceResult};
 use super::ids::{aggregate_uuid, AggregateKind};
@@ -33,6 +35,19 @@ use super::ids::{aggregate_uuid, AggregateKind};
 pub struct BookingRoomCommand {
     pub room_id: i32,
     pub price_per_night: Option<f64>,
+}
+
+/// One pre-ordered product line within a create-booking command (task #52).
+/// Persisted canonically in `ht_booking_products`; the legacy `HT_Book_Pro`
+/// write-back is deferred (shape unverified), so these never enqueue a
+/// writeback intent today.
+#[derive(Debug, Clone)]
+pub struct BookingProductCommand {
+    pub product_id: i64,
+    pub qty: f64,
+    /// `None` ⇒ default from the product's catalog price at INSERT time.
+    pub unit_price: Option<f64>,
+    pub note: Option<String>,
 }
 
 /// Command for [`BookingService::create`].
@@ -54,6 +69,10 @@ pub struct CreateBookingCommand {
     pub deposit_amount: Option<f64>,
     pub notes: Option<String>,
     pub rooms: Vec<BookingRoomCommand>,
+
+    /// Pre-ordered product lines (task #52). Optional — empty for the common
+    /// case. Persisted canonically; no legacy write-back today.
+    pub products: Vec<BookingProductCommand>,
 
     /// Snapshot context used to build the [`CreateBookingPayload`] sent to
     /// the writeback worker. Populated from the request DTO at the route
@@ -204,6 +223,25 @@ impl BookingService {
                 .await?;
         }
 
+        // Pre-ordered products (task #52) — canonical-only. Each line gets a
+        // stable v4 aggregate id so a future legacy write-back / event path can
+        // correlate without a back-link round-trip.
+        for product in &cmd.products {
+            self.repo
+                .insert_booking_product(
+                    &mut tx,
+                    book_id,
+                    BookingProductAssignment {
+                        product_id: product.product_id,
+                        qty: product.qty,
+                        unit_price: product.unit_price,
+                        note: product.note.clone(),
+                        aggregate_id: Uuid::new_v4(),
+                    },
+                )
+                .await?;
+        }
+
         let aggregate_id = aggregate_uuid(AggregateKind::Booking, book_id);
         // Stamp the deterministic UUID onto the row so the writeback worker's
         // resolver can map `writeback_jobs.aggregate_id` → `ht_bookings`
@@ -211,29 +249,45 @@ impl BookingService {
         // enqueue fails, the row never becomes visible.
         self.repo.set_aggregate_id(&mut tx, book_id, aggregate_id).await?;
         let nights = nights_between(cmd.check_in, cmd.check_out);
-        let payload = CreateBookingPayload {
-            customer_id: cmd.writeback_context.customer_aggregate_id,
-            legacy_cust_no: cmd.writeback_context.legacy_cust_no,
-            customer_name: cmd.writeback_context.customer_name,
-            customer_phone: cmd.writeback_context.customer_phone,
-            stay: cmd.writeback_context.stay.clone(),
-            room_no: cmd.writeback_context.room_no.clone(),
-            room_type: cmd.writeback_context.room_type,
-            price: cmd.writeback_context.price,
-            nights,
-            deposit: cmd.writeback_context.deposit,
-            created_by: cmd.writeback_context.created_by,
-            notes: cmd.writeback_context.notes,
-        };
 
-        let intent = WritebackIntent::CreateBooking {
-            booking_id: aggregate_id,
-            payload,
-        };
-        let key = generate_idempotency_key(&intent, aggregate_id);
-        OutboxRepository::enqueue(&mut tx, &intent, key)
-            .await
-            .map_err(ServiceError::from_enqueue_error)?;
+        // Waitlist / unassigned booking (task #52): a zero-room booking has no
+        // room number to mirror, and the `CreateBooking` recipe keys every
+        // `HT_Book_Ds` / `HT_Book_Date` / `HT_Room_Status` row on the room
+        // number — emitting them with an empty room number would write
+        // malformed rows into the SHARED legacy DB. The legacy shape of a
+        // roomless booking is unverified, so we skip the legacy mirror for
+        // these and keep the booking canonical-only. The domain event below
+        // still fires (drives the dashboard/SSE), and once a room is assigned
+        // via a later edit the normal write path takes over.
+        //
+        // TODO(task#52 follow-up): if iHOTEL's no-room placeholder shape is
+        // ever captured in `docs/legacy-spike/findings.md`, enqueue a tailored
+        // intent here so waitlist bookings also surface in the .NET app.
+        if !cmd.rooms.is_empty() {
+            let payload = CreateBookingPayload {
+                customer_id: cmd.writeback_context.customer_aggregate_id,
+                legacy_cust_no: cmd.writeback_context.legacy_cust_no,
+                customer_name: cmd.writeback_context.customer_name.clone(),
+                customer_phone: cmd.writeback_context.customer_phone.clone(),
+                stay: cmd.writeback_context.stay.clone(),
+                room_no: cmd.writeback_context.room_no.clone(),
+                room_type: cmd.writeback_context.room_type.clone(),
+                price: cmd.writeback_context.price,
+                nights,
+                deposit: cmd.writeback_context.deposit,
+                created_by: cmd.writeback_context.created_by.clone(),
+                notes: cmd.writeback_context.notes.clone(),
+            };
+
+            let intent = WritebackIntent::CreateBooking {
+                booking_id: aggregate_id,
+                payload,
+            };
+            let key = generate_idempotency_key(&intent, aggregate_id);
+            OutboxRepository::enqueue(&mut tx, &intent, key)
+                .await
+                .map_err(ServiceError::from_enqueue_error)?;
+        }
 
         let snapshot = BookingSnapshot {
             id: aggregate_id,

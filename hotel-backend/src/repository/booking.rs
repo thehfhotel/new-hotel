@@ -101,6 +101,21 @@ pub struct BookingRoomAssignment {
     pub price_per_night: Option<f64>,
 }
 
+/// One pre-ordered product line attached to a booking (task #52 / migration
+/// 061 — canonical `ht_booking_products`). `unit_price` is optional: when
+/// `None` the INSERT defaults it from the product's catalog price
+/// (`ht_products.prod_price`) so the form can omit the price for a product it
+/// hasn't looked up. The legacy `HT_Book_Pro` write-back is deferred (shape
+/// unverified), so these rows are canonical-only for now.
+#[derive(Debug, Clone)]
+pub struct BookingProductAssignment {
+    pub product_id: i64,
+    pub qty: f64,
+    pub unit_price: Option<f64>,
+    pub note: Option<String>,
+    pub aggregate_id: uuid::Uuid,
+}
+
 /// PostgreSQL data operations for the booking aggregate.
 #[async_trait]
 pub trait BookingRepository: Send + Sync {
@@ -150,6 +165,18 @@ pub trait BookingRepository: Send + Sync {
         tx: &mut Transaction<'_, Postgres>,
         book_id: i32,
         assignment: BookingRoomAssignment,
+    ) -> Result<(), sqlx::Error>;
+
+    /// Insert one pre-ordered product line into `ht_booking_products` (task #52
+    /// / migration 061). Uses a runtime `sqlx::query` (no `query!` macro, so no
+    /// `.sqlx` cache entry) — the table is newer than the offline schema
+    /// snapshot. `unit_price` defaults from `ht_products.prod_price` when the
+    /// caller passes `None`.
+    async fn insert_booking_product(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        book_id: i32,
+        product: BookingProductAssignment,
     ) -> Result<(), sqlx::Error>;
 
     /// Look up booking_no for an existing booking; used by update flow to
@@ -549,6 +576,38 @@ impl BookingRepository for PgBookingRepository {
             assignment.room_id,
             assignment.price_per_night
         )
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    async fn insert_booking_product(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        book_id: i32,
+        product: BookingProductAssignment,
+    ) -> Result<(), sqlx::Error> {
+        // Runtime query (not `query!`): `ht_booking_products` postdates the
+        // committed `.sqlx` offline snapshot, so a compile-time-checked macro
+        // would fail the offline build. `COALESCE($4, prod_price)` defaults the
+        // unit price from the catalog when the form omits it.
+        sqlx::query(
+            r#"
+            INSERT INTO ht_booking_products
+                (bp_book_id, bp_product_id, bp_qty, bp_unit_price, bp_note, source, aggregate_id)
+            VALUES (
+                $1, $2, $3,
+                COALESCE($4, (SELECT prod_price FROM ht_products WHERE prod_id = $2)),
+                $5, 'canonical', $6
+            )
+            "#,
+        )
+        .bind(book_id)
+        .bind(product.product_id)
+        .bind(product.qty)
+        .bind(product.unit_price)
+        .bind(product.note)
+        .bind(product.aggregate_id)
         .execute(&mut **tx)
         .await?;
         Ok(())

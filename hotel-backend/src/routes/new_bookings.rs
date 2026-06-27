@@ -28,8 +28,8 @@ use crate::outbox::event::EventSource;
 use crate::outbox::intent::BookingChanges;
 use crate::repository::booking::{BookingDetailRow, BookingListRow, BookingRoomRow};
 use crate::service::{
-    BookingRoomCommand, BookingWritebackContext, CancelBookingCommand, CreateBookingCommand,
-    ModifyBookingCommand,
+    BookingProductCommand, BookingRoomCommand, BookingWritebackContext, CancelBookingCommand,
+    CreateBookingCommand, ModifyBookingCommand,
 };
 
 /// Booking status enum
@@ -225,6 +225,20 @@ pub struct BookingRoomRequest {
     pub price_per_night: Option<f64>,
 }
 
+/// Pre-ordered product line in a create request (task #52). Optional — the
+/// receptionist may attach products a guest reserves up-front (the canonical
+/// analog of iHOTEL's FrmAddBook2 / `HT_Book_Pro`). Persisted in
+/// `ht_booking_products`; the legacy write-back is deferred (shape unverified).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BookingProductRequest {
+    pub product_id: i64,
+    pub qty: f64,
+    /// `None` ⇒ default from the product's catalog price.
+    pub unit_price: Option<f64>,
+    pub note: Option<String>,
+}
+
 /// Request body for creating/updating booking
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -239,7 +253,13 @@ pub struct CreateUpdateBookingRequest {
     pub total_amount: Option<f64>,
     pub deposit_amount: Option<f64>,
     pub notes: Option<String>,
+    /// Assigned rooms. MAY be empty (task #52) — a zero-room booking is a
+    /// waitlist / unassigned reservation; a room is assigned later via edit.
+    #[serde(default)]
     pub rooms: Vec<BookingRoomRequest>,
+    /// Pre-ordered products. Optional; defaults to empty.
+    #[serde(default)]
+    pub products: Vec<BookingProductRequest>,
 }
 
 /// Response for create/update/cancel operations
@@ -318,9 +338,9 @@ pub async fn create_booking(
     State(state): State<AppState>,
     Json(body): Json<CreateUpdateBookingRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
-    if body.rooms.is_empty() {
-        return Err(ApiError::BadRequest("At least one room is required".to_string()));
-    }
+    // Task #52: zero rooms is allowed — a waitlist / unassigned reservation.
+    // The service persists it canonically and skips the legacy mirror (no room
+    // number to write back); a room is assigned later via the edit flow.
 
     let book_no = generate_book_no(&state).await?;
     let (check_in_date, check_out_date) = parse_stay_range(&body.check_in, &body.check_out)?;
@@ -369,6 +389,7 @@ pub async fn create_booking(
         deposit_amount: body.deposit_amount,
         notes: body.notes.clone(),
         rooms: body.rooms.iter().map(room_request_to_command).collect(),
+        products: body.products.iter().map(product_request_to_command).collect(),
         writeback_context,
         // TODO: wire user_id from auth middleware
         source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
@@ -390,9 +411,8 @@ pub async fn update_booking(
     Path(book_id): Path<i32>,
     Json(body): Json<CreateUpdateBookingRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
-    if body.rooms.is_empty() {
-        return Err(ApiError::BadRequest("At least one room is required".to_string()));
-    }
+    // Task #52: an edit may clear all rooms (back to waitlist) or assign the
+    // first room to a previously-unassigned booking — both are valid.
 
     // Verify the booking exists (404 vs 400) and grab book_no for the response.
     let book_no = state
@@ -711,6 +731,15 @@ fn room_request_to_command(req: &BookingRoomRequest) -> BookingRoomCommand {
     BookingRoomCommand {
         room_id: req.room_id,
         price_per_night: req.price_per_night,
+    }
+}
+
+fn product_request_to_command(req: &BookingProductRequest) -> BookingProductCommand {
+    BookingProductCommand {
+        product_id: req.product_id,
+        qty: req.qty,
+        unit_price: req.unit_price,
+        note: req.note.clone(),
     }
 }
 

@@ -1993,6 +1993,40 @@ CREATE UNIQUE INDEX IF NOT EXISTS ht_pos_sales_legacy_id_uq
 CREATE UNIQUE INDEX IF NOT EXISTS ht_pos_sales_aggregate_id_uq
     ON ht_pos_sales (aggregate_id);
 
+-- ht_booking_products — pre-ordered products attached to a booking (task #52 /
+-- migration 061). Canonical analog of legacy HT_Book_Pro (mirrored read-only
+-- in migration 056). Keyed on the booking instead of the check-in folio
+-- because a pre-order is taken before check-in. Legacy write-back deferred —
+-- HT_Book_Pro INSERT shape is unverified, so this is canonical-only for now.
+CREATE TABLE IF NOT EXISTS ht_booking_products (
+    bp_id           BIGSERIAL    PRIMARY KEY,
+    bp_book_id      INTEGER      NOT NULL REFERENCES ht_bookings(book_id) ON DELETE CASCADE,
+    bp_product_id   BIGINT       NOT NULL REFERENCES ht_products(prod_id),
+    bp_qty          NUMERIC(10, 3) NOT NULL CHECK (bp_qty > 0),
+    bp_unit_price   NUMERIC(12, 2) NOT NULL CHECK (bp_unit_price >= 0),
+    bp_total        NUMERIC(14, 2) GENERATED ALWAYS AS (bp_qty * bp_unit_price) STORED,
+    bp_note         VARCHAR(500),
+    bp_legacy_id    INTEGER,
+    source          VARCHAR(20)  NOT NULL DEFAULT 'canonical',
+    aggregate_id    UUID,
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CONSTRAINT ht_booking_products_source_check
+        CHECK (source IN ('canonical', 'legacy'))
+);
+
+CREATE INDEX IF NOT EXISTS ht_booking_products_book_id_idx
+    ON ht_booking_products (bp_book_id);
+
+CREATE INDEX IF NOT EXISTS ht_booking_products_product_id_idx
+    ON ht_booking_products (bp_product_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ht_booking_products_legacy_id_uq
+    ON ht_booking_products (bp_legacy_id) WHERE bp_legacy_id IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS ht_booking_products_aggregate_id_uq
+    ON ht_booking_products (aggregate_id) WHERE aggregate_id IS NOT NULL;
+
 -- Track G6 permission seed (mirror migration 052).
 INSERT INTO ht_permissions (permission_key, description)
 VALUES (
