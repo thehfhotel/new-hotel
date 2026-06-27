@@ -434,6 +434,14 @@ pub struct ModeResponse {
     /// live charges are unchanged until validated on real folios. See
     /// docs/spikes/2026-06-27-frontend-backend-encapsulation.md.
     pub checkout_server_total_enabled: bool,
+    /// Spike Phase 3 (server-side booking validation/availability, ship-dark).
+    /// When true the booking form calls `POST /api/bookings/validate` and
+    /// surfaces the backend's date + availability verdict (the same overlap
+    /// semantics the calendar / live room-status derive) instead of relying
+    /// only on the client-side checks. Read from `BOOKING_VALIDATION_ENABLED`;
+    /// default false so booking acceptance is unchanged until validated. See
+    /// docs/spikes/2026-06-27-frontend-backend-encapsulation.md.
+    pub booking_validation_enabled: bool,
 }
 
 /// GET /api/mode - Returns current system mode
@@ -444,6 +452,12 @@ pub async fn get_mode(State(state): State<AppState>) -> ApiResult<Json<ModeRespo
     let checkout_server_total_enabled = std::env::var("CHECKOUT_SERVER_TOTAL_ENABLED")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
+    // Spike Phase 3 (ship-dark) — same request-time read pattern as the Phase 2
+    // flag above. Default false → the booking form keeps its current
+    // client-only validation.
+    let booking_validation_enabled = std::env::var("BOOKING_VALIDATION_ENABLED")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
 
     Ok(Json(ModeResponse {
         success: true,
@@ -452,6 +466,7 @@ pub async fn get_mode(State(state): State<AppState>) -> ApiResult<Json<ModeRespo
         ville_writes_enabled: state.hfville_writes_enabled,
         round_writeback_enabled: state.round_writeback_enabled,
         checkout_server_total_enabled,
+        booking_validation_enabled,
     }))
 }
 
@@ -528,6 +543,7 @@ mod tests {
             ville_writes_enabled: false,
             round_writeback_enabled: false,
             checkout_server_total_enabled: false,
+            booking_validation_enabled: false,
         };
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(

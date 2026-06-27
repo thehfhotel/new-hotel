@@ -17,6 +17,7 @@ use axum::{
 };
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 use uuid::Uuid;
 
 use super::mode::{AppState, Branch};
@@ -449,6 +450,191 @@ pub async fn cancel_booking(
         message: "Booking cancelled successfully".to_string(),
         id: Some(outcome.book_id),
         book_no: None,
+    }))
+}
+
+// ---------- POST /api/bookings/validate (spike Phase 3, ship-dark) ----------
+
+/// Request body for `POST /api/bookings/validate`.
+///
+/// A *proposed* booking the form is about to submit. Either `room_id` or
+/// `room_no` identifies the room (the form has `room_id`; `room_no` is accepted
+/// so the endpoint is usable from contexts that only know the number).
+/// `exclude_booking_id` lets the edit flow skip the booking's OWN rows so a
+/// date-unchanged edit doesn't self-conflict (mirrors `RoomPicker`'s
+/// `excludeBookingId`).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidateBookingRequest {
+    pub room_id: Option<i32>,
+    pub room_no: Option<String>,
+    pub check_in: String,
+    pub check_out: String,
+    pub branch: Option<Branch>,
+    pub exclude_booking_id: Option<i32>,
+}
+
+/// `200` body for the booking validation verdict (spike Phase 3).
+///
+/// `valid` = date rules pass; `available` = no overlapping active
+/// booking/check-in for the room over `[checkIn, checkOut)`; `reasons` =
+/// human-readable (Thai, matching the form) explanations for every failed
+/// check. The frontend surfaces these only when `BOOKING_VALIDATION_ENABLED`
+/// is on; default off → behavior unchanged.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidateBookingResponse {
+    pub success: bool,
+    pub valid: bool,
+    pub available: bool,
+    pub reasons: Vec<String>,
+}
+
+/// POST /api/bookings/validate — server-side booking date + availability check.
+///
+/// ## Rules (match the current `BookingForm.tsx` + iHOTEL where relevant)
+///
+/// **Date validity** (`valid`):
+/// - both dates parse as `YYYY-MM-DD` (the shape the form sends);
+/// - `check_out > check_in` — the exact rule `BookingForm` enforces via
+///   `nights <= 0` (same Thai message reused here);
+/// - `check_in` is not before today (Asia/Bangkok). `BookingForm` does not
+///   enforce this client-side, so the frontend only invokes validation in
+///   `create` mode (a fresh reservation should not start in the past); edits of
+///   past stays are therefore never wrongly blocked. iHOTEL's booking grid
+///   enumerates one `HT_Room_Status`/`HT_Book_Date` row per stay *date*, so a
+///   new reservation is forward-looking by construction (COMPAT_CHEATSHEET §
+///   `HT_Room_Status`).
+///
+/// **Availability** (`available`): no overlapping ACTIVE booking
+/// (`book_status IN ('confirmed','pending')`) or non-cancelled check-in for the
+/// room over the half-open interval `[check_in, check_out)`. This reuses the
+/// exact overlap semantics already in the codebase:
+/// `new_rooms.rs::live_room_flags` (booking `book_checkin <= today AND
+/// book_checkout > today`; check-in match via `cin_room_id` OR
+/// `ht_checkin_rooms`) and `calendar.rs` (check-in window over
+/// `COALESCE(cin_checkout_time, cin_expected_checkout)`, `cin_status !=
+/// 'cancelled'`), generalized from "today" to the requested range. Half-open
+/// matches iHOTEL: the checkout day is not enumerated as occupied, so a room
+/// freeing up on day X is bookable for a new check-in on day X.
+///
+/// Branch-aware (`new_pool` / `ville_pool`), mirroring `list_bookings`.
+/// Read-only; uses runtime `sqlx::query` (no `.sqlx/` cache churn).
+pub async fn validate_booking(
+    State(state): State<AppState>,
+    Json(body): Json<ValidateBookingRequest>,
+) -> ApiResult<Json<ValidateBookingResponse>> {
+    let mut reasons: Vec<String> = Vec::new();
+
+    // ----- date validity (mirrors BookingForm) -----
+    let check_in = NaiveDate::parse_from_str(body.check_in.trim(), "%Y-%m-%d").ok();
+    let check_out = NaiveDate::parse_from_str(body.check_out.trim(), "%Y-%m-%d").ok();
+
+    let mut valid = true;
+    match (check_in, check_out) {
+        (Some(ci), Some(co)) => {
+            // `nights <= 0` in BookingForm → checkout must be strictly after checkin.
+            if co <= ci {
+                reasons.push("วันเช็คเอาท์ต้องหลังวันเช็คอิน".to_string());
+                valid = false;
+            }
+            // Today in Asia/Bangkok (GMT+7) — the hotel's local day.
+            let today_bkk = (Utc::now() + chrono::Duration::hours(7)).date_naive();
+            if ci < today_bkk {
+                reasons.push("ไม่สามารถจองย้อนหลังได้ (วันเช็คอินอยู่ในอดีต)".to_string());
+                valid = false;
+            }
+        }
+        _ => {
+            reasons.push("รูปแบบวันที่ไม่ถูกต้อง".to_string());
+            valid = false;
+        }
+    }
+
+    // ----- availability (overlap over [check_in, check_out)) -----
+    // Branch-aware pool selection, mirroring `list_bookings`. `All` is not a
+    // meaningful target for a single-room booking → default to the HF Hotel pool.
+    let pool = match body.branch.unwrap_or_default() {
+        Branch::Hfville => state.ville_pool()?,
+        Branch::Hfhotel | Branch::All => &state.new_pool,
+    };
+
+    // Resolve the room. `room_id` wins; else look up `room_no`. A missing room
+    // is an availability failure (cannot book a room that doesn't exist).
+    let room_id = match body.room_id {
+        Some(id) => Some(id),
+        None => match body.room_no.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(room_no) => {
+                sqlx::query("SELECT room_id FROM ht_rooms_new WHERE room_no = $1")
+                    .bind(room_no)
+                    .fetch_optional(pool)
+                    .await?
+                    .map(|r| r.get::<i32, _>("room_id"))
+            }
+            None => None,
+        },
+    };
+
+    let available = match (room_id, check_in, check_out) {
+        (Some(rid), Some(_), Some(_)) => {
+            // Both halves run in one round-trip. Booking overlap mirrors
+            // `live_room_flags` ('confirmed'/'pending', half-open day range);
+            // check-in overlap mirrors `calendar.rs` (COALESCE expected
+            // checkout, exclude cancelled) + the `cin_room_id` OR
+            // `ht_checkin_rooms` room match from `live_room_flags`.
+            let row = sqlx::query(
+                r#"
+                SELECT
+                  EXISTS(
+                    SELECT 1 FROM ht_booking_rooms br
+                      JOIN ht_bookings b ON b.book_id = br.br_book_id
+                     WHERE br.br_room_id = $1
+                       AND b.book_status IN ('confirmed','pending')
+                       AND b.book_checkin::date  < $3::date
+                       AND b.book_checkout::date > $2::date
+                       AND ($4::int IS NULL OR b.book_id <> $4::int)
+                  ) AS booking_conflict,
+                  EXISTS(
+                    SELECT 1 FROM ht_checkins c
+                     WHERE c.cin_status <> 'cancelled'
+                       AND (c.cin_room_id = $1 OR EXISTS(
+                             SELECT 1 FROM ht_checkin_rooms cr
+                              WHERE cr.cr_cin_id = c.cin_id AND cr.cr_room_id = $1))
+                       AND c.cin_checkin_time::date < $3::date
+                       AND COALESCE(c.cin_checkout_time, c.cin_expected_checkout)::date > $2::date
+                  ) AS checkin_conflict
+                "#,
+            )
+            .bind(rid)
+            .bind(body.check_in.trim())
+            .bind(body.check_out.trim())
+            .bind(body.exclude_booking_id)
+            .fetch_one(pool)
+            .await?;
+
+            let booking_conflict: bool = row.try_get("booking_conflict").unwrap_or(false);
+            let checkin_conflict: bool = row.try_get("checkin_conflict").unwrap_or(false);
+            let free = !(booking_conflict || checkin_conflict);
+            if !free {
+                reasons.push("ห้องนี้ถูกจองหรือมีผู้เข้าพักในช่วงวันที่เลือกแล้ว".to_string());
+            }
+            free
+        }
+        (None, _, _) => {
+            // No resolvable room → cannot assert availability.
+            reasons.push("ไม่พบห้องพัก".to_string());
+            false
+        }
+        // Unparseable dates already recorded a `valid` failure; availability is
+        // indeterminate, so report not-available without a duplicate reason.
+        _ => false,
+    };
+
+    Ok(Json(ValidateBookingResponse {
+        success: true,
+        valid,
+        available,
+        reasons,
     }))
 }
 

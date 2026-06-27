@@ -18,6 +18,7 @@ import CustomerPicker, { CustomerOption } from '@/components/pickers/CustomerPic
 import CustomerForm, { CustomerFormData } from '@/components/forms/CustomerForm'
 import RoomPicker, { RoomOption } from '@/components/pickers/RoomPicker'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { useBranch } from '@/contexts/BranchContext'
 
 export interface BookingFormState {
   id?: number
@@ -114,6 +115,10 @@ export default function BookingForm({
   mode,
 }: BookingFormProps) {
   const branchFetch = useBranchFetch()
+  // Spike Phase 3 (ship-dark): when BOOKING_VALIDATION_ENABLED is on the form
+  // also runs the server-side date + availability check. `branch` is sent in
+  // the request body so the backend validates against the right pool.
+  const { branch, bookingValidationEnabled } = useBranch()
   const [formData, setFormData] = useState<BookingFormState>(emptyFormData)
   const [selectedCustomer, setSelectedCustomer] = useState<CustomerOption | null>(null)
   const [selectedRooms, setSelectedRooms] = useState<RoomOption[]>([])
@@ -228,6 +233,45 @@ export default function BookingForm({
     if (formData.rooms.length === 0) {
       setError('กรุณาเลือกห้องพักอย่างน้อย 1 ห้อง')
       return
+    }
+
+    // Spike Phase 3 (ship-dark): server-side date + availability validation.
+    // Only runs when BOOKING_VALIDATION_ENABLED is on AND we're creating a new
+    // booking — edits of existing/past stays are left to the unchanged flow so
+    // the new "not in the past" rule never wrongly blocks them. When the flag is
+    // off this entire block is skipped → behavior is byte-for-byte unchanged.
+    // The check FAILS OPEN: if the call errors we fall through to the normal
+    // save rather than block a booking the current flow would accept.
+    if (bookingValidationEnabled && mode === 'create') {
+      try {
+        const results = await Promise.all(
+          formData.rooms.map((r) =>
+            fetch('/api/bookings/validate', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                roomId: r.roomId,
+                checkIn: formData.checkIn,
+                checkOut: formData.checkOut,
+                branch,
+                excludeBookingId: initialData?.id ?? null,
+              }),
+            }).then((res) => (res.ok ? res.json() : null))
+          )
+        )
+        const reasons = new Set<string>()
+        for (const d of results) {
+          if (d && d.success && (!d.valid || !d.available)) {
+            for (const reason of (d.reasons as string[]) ?? []) reasons.add(reason)
+          }
+        }
+        if (reasons.size > 0) {
+          setError(Array.from(reasons).join(' • '))
+          return
+        }
+      } catch {
+        // Network/parse failure → ship-dark fail-open: proceed with save.
+      }
     }
 
     setSaving(true)

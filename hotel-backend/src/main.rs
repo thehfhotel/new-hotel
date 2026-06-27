@@ -456,6 +456,10 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route("/api/rooms/{id}/status", patch(routes::new_rooms::update_room_status))
         // Bookings CRUD (canonical)
         .route("/api/bookings", get(routes::new_bookings::list_bookings).post(routes::new_bookings::create_booking))
+        // Spike Phase 3: read-only server-side booking date + availability check
+        // (the form surfaces this verdict when BOOKING_VALIDATION_ENABLED is on).
+        // Static `/validate` is matched ahead of the `/{id}` param route.
+        .route("/api/bookings/validate", post(routes::new_bookings::validate_booking))
         .route("/api/bookings/{id}", get(routes::new_bookings::get_booking).put(routes::new_bookings::update_booking))
         .route("/api/bookings/{id}/cancel", put(routes::new_bookings::cancel_booking))
         // Check-ins CRUD (canonical)
