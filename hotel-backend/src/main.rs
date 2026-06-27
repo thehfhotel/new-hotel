@@ -540,6 +540,13 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route("/api/reports/revenue-by-room-type", get(routes::new_reports::get_revenue_by_room_type))
         // Track G8 — RR.4 Thai immigration foreign-guest export (legal CRIT)
         .route("/api/reports/rr4", get(routes::rr4_export::get_rr4_export))
+        // Daily guest rosters / desk paperwork (task #43). FULL lists (no silent
+        // cap, unlike the limit=100 dashboard glances), branch-aware. Read-only.
+        .route("/api/rosters/summary", get(routes::new_rosters::roster_summary))
+        .route("/api/rosters/in-house", get(routes::new_rosters::in_house_roster))
+        .route("/api/rosters/arrivals", get(routes::new_rosters::arrivals_roster))
+        .route("/api/rosters/departures", get(routes::new_rosters::departures_roster))
+        .route("/api/rosters/continuing", get(routes::new_rosters::continuing_roster))
         // Track G2 / T4 CRIT-1 — refund (negative payment) against an existing payment row.
         // Track G7 gates this on `payment.refund` (cashier + admin only).
         .route(

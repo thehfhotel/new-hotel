@@ -9,6 +9,7 @@ import {
   CreditCard,
   Receipt,
   BarChart3,
+  ClipboardList,
   Coins,
   FileSpreadsheet,
   LayoutGrid,
@@ -52,6 +53,7 @@ const SECTIONS: HubSection[] = [
     items: [
       { href: '/billing', label: 'ใบแจ้งหนี้ / โฟลิโอ', desc: 'บิลและการชำระเงิน', icon: Receipt },
       { href: '/v2/cash', label: 'รายรับ-รายจ่าย', desc: 'บันทึกเงินสดเข้า-ออก', icon: Coins },
+      { href: '/v2/rosters', label: 'รายชื่อผู้เข้าพัก', desc: 'มาถึง / พักอยู่ / ออก ประจำวัน — พิมพ์ A4', icon: ClipboardList },
       { href: '/reports', label: 'รายงาน', desc: 'รายได้ การเข้าพัก ADR', icon: BarChart3 },
       { href: '/reports/rr4', label: 'รร.4 (ตม.30)', desc: 'รายงานคนต่างชาติ', icon: FileSpreadsheet },
     ],
