@@ -8,6 +8,7 @@ import {
   Package,
   CreditCard,
   Receipt,
+  FileText,
   BarChart3,
   ClipboardList,
   Coins,
@@ -54,6 +55,7 @@ const SECTIONS: HubSection[] = [
     title: 'ธุรกิจและรายงาน',
     items: [
       { href: '/billing', label: 'ใบแจ้งหนี้ / โฟลิโอ', desc: 'บิลและการชำระเงิน', icon: Receipt },
+      { href: '/v2/invoice', label: 'ใบกำกับภาษี', desc: 'ออก/พิมพ์ใบกำกับภาษี A4', icon: FileText },
       { href: '/v2/cash', label: 'รายรับ-รายจ่าย', desc: 'บันทึกเงินสดเข้า-ออก', icon: Coins },
       { href: '/v2/rosters', label: 'รายชื่อผู้เข้าพัก', desc: 'มาถึง / พักอยู่ / ออก ประจำวัน — พิมพ์ A4', icon: ClipboardList },
       { href: '/reports', label: 'รายงาน', desc: 'รายได้ การเข้าพัก ADR', icon: BarChart3 },

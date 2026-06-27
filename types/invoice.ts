@@ -10,6 +10,16 @@ export interface InvoiceRoom {
   subtotal: number;
 }
 
+/** Task #44: one POS / product / other-charge line on a tax invoice
+ *  (ใบกำกับภาษี). Sourced from the folio's `ht_pos_sales` (posted rows). */
+export interface InvoiceProductLine {
+  name: string;
+  unit?: string;
+  qty: number;
+  unitPrice: number;
+  total: number;
+}
+
 export interface InvoiceData {
   invoiceNumber: string;
   /** Legacy check-in number (e.g. "CH26-005258"). Used by the
@@ -28,7 +38,13 @@ export interface InvoiceData {
   checkInDate: string;
   checkOutDate: string;
   rooms: InvoiceRoom[];
+  /** Task #44: POS / product / other-charge lines from the folio. Absent
+   *  or empty for a room-only stay — the template hides the section. */
+  products?: InvoiceProductLine[];
   subtotal: number;
+  /** Task #44: sum of `products[].total`. Drives the "products subtotal"
+   *  line; absent on room-only callers. */
+  productsSubtotal?: number;
   discount: number;
   /** Track G3: VAT-inclusive split — subtotal before VAT (banker's rounding). */
   beforeVat?: number;

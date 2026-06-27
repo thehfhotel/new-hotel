@@ -11,6 +11,23 @@
 //! `InvoiceTemplate` had a `vatAmount` field but the API never set it. G3
 //! plumbs the four missing fields through.
 //!
+//! ## Tax invoice (task #44) — POS lines + reconciling document total
+//!
+//! A Thai ใบกำกับภาษี must itemise *every* charge and have its line items
+//! reconcile to the printed grand total. The G3 shape was room-only, so a
+//! folio with minibar / restaurant / other POS charges printed an invoice
+//! that under-stated the bill. Task #44 adds the folio's `ht_pos_sales`
+//! (posted) lines alongside the room line and bases the document total +
+//! VAT split on the sum of the lines (`room_total + products_total`) rather
+//! than the stored `cin_total_amount`. This is deliberate:
+//! `cin_total_amount` is the *room* total before checkout (POS sales accrue
+//! separately in `ht_pos_sales`) and only folds in products at checkout, so
+//! summing the lines is the one figure that reconciles in BOTH the
+//! in-house and checked-out states without double-counting. `total_amount`
+//! still reports the stored `cin_total_amount` unchanged for any consumer
+//! that wants the persisted figure. Branch-aware: POS lines are read from
+//! the same pool the check-in came from.
+//!
 //! - `vat_per` — read from `ht_settings.vat_percent` via
 //!   [`crate::repository::settings::get_vat_percent`] (Wave 5c plumbing).
 //!   Falls back to 7% (Thai standard VAT) on any lookup failure.
@@ -33,6 +50,7 @@ use axum::{
 use chrono::{Datelike, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Asia::Bangkok;
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 
 use super::mode::{AppState, Branch};
 use crate::error::{ApiError, ApiResult};
@@ -77,6 +95,23 @@ pub struct InvoiceRates {
     pub subtotal: f64,
 }
 
+/// One POS / product / other-charge line on the tax invoice (task #44).
+///
+/// Sourced from `ht_pos_sales` (posted rows only) joined to `ht_products`
+/// for the display name + unit. Mirrors the legacy `HT_Invoice_Ds`
+/// shape (S_Product_name / S_Unit / S_Price / S_Total) so the printed
+/// ใบกำกับภาษี itemises minibar / restaurant / other charges next to the
+/// room line.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InvoiceProduct {
+    pub name: String,
+    pub unit: Option<String>,
+    pub qty: f64,
+    pub unit_price: f64,
+    pub total: f64,
+}
+
 /// Complete invoice data
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -106,8 +141,26 @@ pub struct Invoice {
     // Rate calculations
     pub rates: InvoiceRates,
 
+    // POS / other charges (task #44 — tax invoice itemisation)
+    /// Posted `ht_pos_sales` lines for this folio (minibar / restaurant /
+    /// other). Empty for a room-only stay. Branch-aware.
+    pub products: Vec<InvoiceProduct>,
+    /// Sum of the room line(s) — equals `rates.subtotal`. Surfaced
+    /// explicitly so the document's "room subtotal" reconciles against the
+    /// products subtotal and the grand total.
+    pub room_total: f64,
+    /// Sum of `products[].total` (posted POS lines only).
+    pub products_total: f64,
+
     // Totals (G3: VAT-inclusive split)
+    /// Stored `cin_total_amount` (room total before checkout; room+product
+    /// after). Reported unchanged for consumers wanting the persisted
+    /// figure — the *document* total is `grand_total`. See module docs.
     pub total_amount: f64,
+    /// Task #44: the reconciling document total = `room_total +
+    /// products_total`. This is the figure the VAT split is taken over and
+    /// the one the printed ใบกำกับภาษี shows as ยอดรวมทั้งสิ้น.
+    pub grand_total: f64,
     /// G3 / T4 HIGH-7: subtotal before VAT, derived via banker's rounding.
     pub before_vat: f64,
     /// G3 / T4 HIGH-7: VAT amount, derived via banker's rounding such that
@@ -257,12 +310,49 @@ pub async fn get_invoice(
         subtotal,
     };
 
-    // Get total amount (use calculated if not stored)
+    // Get stored total amount (use calculated if not stored). Reported
+    // as `total_amount`; the *document* total is `grand_total` below.
     let total_amount = rec.cin_total_amount.unwrap_or(subtotal);
 
-    // G3 / T4 HIGH-7: VAT split + invoice number.
+    // Task #44: itemise the folio's POS / other charges. Posted rows only
+    // (voided lines never appear on the printed invoice). Runtime query
+    // (literal string + bind) so no `.sqlx` cache entry is needed. Read
+    // from the branch-aware `pool` selected above.
+    let product_rows = sqlx::query(
+        "SELECT p.prod_name, p.prod_unit, \
+                s.sale_qty::float8        AS qty, \
+                s.sale_unit_price::float8 AS unit_price, \
+                s.sale_total::float8      AS total \
+           FROM ht_pos_sales s \
+           JOIN ht_products  p ON p.prod_id = s.sale_product_id \
+          WHERE s.sale_cin_id = $1 AND s.sale_status = 'posted' \
+       ORDER BY s.sale_sold_at ASC, s.sale_id ASC",
+    )
+    .bind(rec.cin_id)
+    .fetch_all(pool)
+    .await?;
+
+    let products: Vec<InvoiceProduct> = product_rows
+        .into_iter()
+        .map(|row| InvoiceProduct {
+            name: row.try_get::<String, _>("prod_name").unwrap_or_default(),
+            unit: row.try_get::<Option<String>, _>("prod_unit").unwrap_or(None),
+            qty: row.try_get::<f64, _>("qty").unwrap_or(0.0),
+            unit_price: row.try_get::<f64, _>("unit_price").unwrap_or(0.0),
+            total: row.try_get::<f64, _>("total").unwrap_or(0.0),
+        })
+        .collect();
+    let products_total = products.iter().map(|p| p.total).sum::<f64>();
+
+    // Document total = sum of the lines (room + products). See module docs
+    // for why this is preferred over the stored `cin_total_amount`.
+    let room_total = subtotal;
+    let grand_total = room_total + products_total;
+
+    // G3 / T4 HIGH-7: VAT split (over the reconciling document total) +
+    // invoice number. HF Hotel runs vat_per=0 → split is (grand_total, 0).
     let vat_per = settings::get_vat_percent(pool).await;
-    let (before_vat, vat_amount) = vat_inclusive_split(total_amount, vat_per);
+    let (before_vat, vat_amount) = vat_inclusive_split(grand_total, vat_per);
     let inv_no = format_invoice_number(rec.cin_id, rec.created_at);
 
     let invoice = Invoice {
@@ -279,7 +369,11 @@ pub async fn get_invoice(
         adults: rec.cin_adults.unwrap_or(1),
         children: rec.cin_children.unwrap_or(0),
         rates,
+        products,
+        room_total,
+        products_total,
         total_amount,
+        grand_total,
         before_vat,
         vat_amount,
         vat_per,
@@ -318,13 +412,21 @@ fn normalize_tax_id(raw: Option<String>) -> Option<String> {
 /// fall back to the current UTC instant — preserves call-site behaviour
 /// without requiring the caller to thread `Utc::now()` in.
 ///
-/// **TODO (deferred):** the legacy `HT_INVOICE.INV_NO` column is
-/// `int NOT NULL` allocated via `MAX+1` by the .NET app. A follow-on
-/// Track G wave can plumb `allocate_inv_no` through the writeback adapter
-/// so the PG-emitted number matches a real legacy slot. Until then this
-/// format keeps the printed invoice stable per check-in but does NOT
-/// reserve a number in the legacy sequence — printing the same invoice
-/// twice yields the same string.
+/// **TODO (deferred — re-confirmed task #44):** the legacy
+/// `HT_INVOICE.INV_NO` column is `int NOT NULL` allocated via `MAX+1` by
+/// the .NET app, but the *INSERT shape* is NOT validated in the spike
+/// captures. `docs/legacy-spike/findings.md` §3h ("take payment + print
+/// invoice") is actually a `HT_Receipt_H`/`HT_Receipt_Ds` write, not
+/// `HT_INVOICE`; the real `HT_INVOICE` writer is `FormBookingInvoice`
+/// (per-booking, prepaid rooms — `docs/legacy-app/FEATURE_MAP.md` J6),
+/// for which no write-capture exists. The 16-column row semantics
+/// (`INV_STAY`, `INV_TITLE`, `INV_NIGHT` as varchar, etc.) and the
+/// allocation lifecycle are unverified, so per the task's safer-default
+/// rule we do NOT guess the legacy INSERT. A follow-on wave can plumb
+/// `allocate_inv_no` through the writeback adapter once a `FormBookingInvoice`
+/// write is captured. Until then this format keeps the printed invoice
+/// stable per check-in but does NOT reserve a number in the legacy
+/// sequence — printing the same invoice twice yields the same string.
 fn format_invoice_number(cin_id: i32, created_at: Option<NaiveDateTime>) -> String {
     let stamp = created_at
         .and_then(|naive| Utc.from_local_datetime(&naive).single())

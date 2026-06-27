@@ -6,6 +6,10 @@ interface InvoiceTemplateProps {
   checkInData: InvoiceData;
   hotelInfo: HotelInfo;
   showVat?: boolean;
+  /** Task #44: render the document as a Thai tax invoice (ใบกำกับภาษี /
+   *  Tax Invoice) rather than a plain invoice (ใบแจ้งหนี้ / Invoice).
+   *  Defaults to `false` so existing callers keep the plain-invoice title. */
+  taxInvoice?: boolean;
 }
 
 /**
@@ -60,8 +64,19 @@ export default function InvoiceTemplate({
   checkInData,
   hotelInfo,
   showVat = false,
+  taxInvoice = false,
 }: InvoiceTemplateProps) {
   const today = new Date()
+
+  // Task #44: ใบกำกับภาษี (tax invoice) vs ใบแจ้งหนี้ (plain invoice). The
+  // title flips on the prop; the body (POS lines + VAT split) is the same.
+  const docTitle = taxInvoice ? 'ใบกำกับภาษี / Tax Invoice' : 'ใบแจ้งหนี้ / Invoice'
+
+  // Task #44: POS / product / other-charge lines from the folio. Hidden
+  // entirely for a room-only stay so the room-only layout is preserved.
+  const products = checkInData.products ?? []
+  const productsSubtotal =
+    checkInData.productsSubtotal ?? products.reduce((sum, p) => sum + p.total, 0)
 
   return (
     <div className="invoice-container bg-white p-8 max-w-[210mm] mx-auto font-sans text-gray-900">
@@ -106,7 +121,7 @@ export default function InvoiceTemplate({
             </div>
           </div>
           <div className="text-right">
-            <h2 className="text-xl font-bold text-gray-900">ใบแจ้งหนี้ / Invoice</h2>
+            <h2 className="text-xl font-bold text-gray-900">{docTitle}</h2>
             <p className="text-sm text-gray-600 mt-2">
               เลขที่ / No: <span className="font-semibold">{checkInData.invoiceNumber}</span>
             </p>
@@ -209,6 +224,54 @@ export default function InvoiceTemplate({
         </table>
       </div>
 
+      {/* Products / Other Charges Table (task #44) — minibar / restaurant /
+          other POS lines from the folio. Rendered only when present so a
+          room-only stay keeps the original room-only layout. */}
+      {products.length > 0 && (
+        <div className="mb-6">
+          <h3 className="text-sm font-semibold text-gray-700 uppercase mb-3">
+            สินค้าและบริการ / Products &amp; Services
+          </h3>
+          <table className="w-full border-collapse">
+            <thead>
+              <tr className="bg-gray-100">
+                <th className="border border-gray-300 px-3 py-2 text-left text-sm font-semibold">
+                  รายการ / Item
+                </th>
+                <th className="border border-gray-300 px-3 py-2 text-center text-sm font-semibold">
+                  จำนวน / Qty
+                </th>
+                <th className="border border-gray-300 px-3 py-2 text-right text-sm font-semibold">
+                  ราคา/หน่วย / Unit Price
+                </th>
+                <th className="border border-gray-300 px-3 py-2 text-right text-sm font-semibold">
+                  รวม / Subtotal
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {products.map((product, index) => (
+                <tr key={index} className="hover:bg-gray-50">
+                  <td className="border border-gray-300 px-3 py-2 text-sm">
+                    {product.name}
+                  </td>
+                  <td className="border border-gray-300 px-3 py-2 text-sm text-center">
+                    {product.qty}
+                    {product.unit ? ` ${product.unit}` : ''}
+                  </td>
+                  <td className="border border-gray-300 px-3 py-2 text-sm text-right">
+                    {formatCurrency(product.unitPrice)}
+                  </td>
+                  <td className="border border-gray-300 px-3 py-2 text-sm text-right font-medium">
+                    {formatCurrency(product.total)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
       {/* Summary */}
       <div className="mb-8">
         <div className="flex justify-end">
@@ -217,6 +280,15 @@ export default function InvoiceTemplate({
               <span className="text-gray-600">ยอดรวมค่าห้อง / Subtotal:</span>
               <span className="font-medium">{formatCurrency(checkInData.subtotal)} บาท</span>
             </div>
+
+            {/* Task #44: products / other-charges subtotal — only when the
+                folio carries POS lines. */}
+            {productsSubtotal > 0 && (
+              <div className="flex justify-between py-2 text-sm">
+                <span className="text-gray-600">ยอดรวมสินค้าและบริการ / Products Subtotal:</span>
+                <span className="font-medium">{formatCurrency(productsSubtotal)} บาท</span>
+              </div>
+            )}
 
             {checkInData.discount > 0 && (
               <div className="flex justify-between py-2 text-sm text-green-600">

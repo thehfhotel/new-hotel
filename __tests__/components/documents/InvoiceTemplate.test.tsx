@@ -598,6 +598,54 @@ describe('InvoiceTemplate Component', () => {
     })
   })
 
+  // Task #44 (ใบกำกับภาษี): tax-invoice title relabel + POS / other-charge
+  // line itemisation. The server math (VAT split over room+products) is
+  // owned by `hotel-backend/src/routes/new_invoice.rs`; these pin the
+  // render-time contract.
+  describe('Task #44 — tax invoice title + product lines', () => {
+    test('defaults to plain-invoice title when taxInvoice is not set', () => {
+      render(<InvoiceTemplate {...defaultProps} />)
+      expect(screen.getByText('ใบแจ้งหนี้ / Invoice')).toBeInTheDocument()
+      expect(screen.queryByText('ใบกำกับภาษี / Tax Invoice')).not.toBeInTheDocument()
+    })
+
+    test('renders tax-invoice title when taxInvoice is true', () => {
+      render(<InvoiceTemplate {...defaultProps} taxInvoice={true} />)
+      expect(screen.getByText('ใบกำกับภาษี / Tax Invoice')).toBeInTheDocument()
+      expect(screen.queryByText('ใบแจ้งหนี้ / Invoice')).not.toBeInTheDocument()
+    })
+
+    test('hides the products section for a room-only stay', () => {
+      render(<InvoiceTemplate {...defaultProps} />)
+      expect(screen.queryByText('สินค้าและบริการ / Products & Services')).not.toBeInTheDocument()
+      expect(
+        screen.queryByText('ยอดรวมสินค้าและบริการ / Products Subtotal:'),
+      ).not.toBeInTheDocument()
+    })
+
+    test('renders product lines + products subtotal when present', () => {
+      const withProducts = createMockInvoiceData({
+        subtotal: 7500,
+        products: [
+          { name: 'น้ำดื่ม', unit: 'ขวด', qty: 2, unitPrice: 20, total: 40 },
+          { name: 'เบียร์', unit: 'กระป๋อง', qty: 3, unitPrice: 60, total: 180 },
+        ],
+        productsSubtotal: 220,
+        grandTotal: 7720,
+      })
+
+      render(<InvoiceTemplate {...defaultProps} checkInData={withProducts} taxInvoice={true} />)
+
+      expect(screen.getByText('สินค้าและบริการ / Products & Services')).toBeInTheDocument()
+      expect(screen.getByText('น้ำดื่ม')).toBeInTheDocument()
+      expect(screen.getByText('เบียร์')).toBeInTheDocument()
+      // Products subtotal line + the reconciling grand total.
+      expect(screen.getByText('ยอดรวมสินค้าและบริการ / Products Subtotal:')).toBeInTheDocument()
+      expect(screen.getByText('220.00 บาท')).toBeInTheDocument()
+      expect(screen.getByText('7,720.00 บาท')).toBeInTheDocument()
+    })
+  })
+
   describe('Print Styles', () => {
     test('renders invoice container with print-friendly class', () => {
       const { container } = render(<InvoiceTemplate {...defaultProps} />)
