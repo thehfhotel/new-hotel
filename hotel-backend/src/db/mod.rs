@@ -3,7 +3,6 @@
 //! - Legacy DB: SQL Server via tiberius/bb8 (read-only)
 //! - HotelNew DB: PostgreSQL via sqlx
 
-mod dual_pool;
 pub mod mssql_session;
 pub mod mssql_timeout;
 mod pg_pool;

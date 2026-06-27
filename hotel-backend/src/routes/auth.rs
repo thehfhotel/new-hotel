@@ -40,8 +40,7 @@ use std::sync::Arc;
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
-    routing::{get, post},
-    Json, Router,
+    Json,
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use chrono::NaiveDateTime;
@@ -142,23 +141,9 @@ impl ErrorResponse {
     }
 }
 
-// =============================================================================
-// Router
-// =============================================================================
-
-/// Build the `/api/auth/*` subrouter.
-///
-/// Mount with `app.merge(routes::auth::router(state.clone()))` from
-/// `main.rs`. The middleware in `middleware::auth` deliberately does NOT
-/// gate these paths — they are how unauthenticated callers acquire a
-/// session in the first place.
-pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/api/auth/login", post(login))
-        .route("/api/auth/logout", post(logout))
-        .route("/api/auth/me", get(me))
-        .with_state(state)
-}
+// Note: the `/api/auth/login|logout|me` routes are mounted INLINE in main.rs
+// (login carries its own rate-limit layer and the group stays outside the auth
+// gate); there is no `router()` builder here.
 
 // =============================================================================
 // Handlers
