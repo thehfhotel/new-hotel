@@ -137,7 +137,7 @@ sqlcmd_in() {
         -e SQLCMDPASSWORD="$PW" \
         --entrypoint /opt/mssql-tools18/bin/sqlcmd \
         "$MSSQL_IMAGE" \
-        -C -S "$SERVER,$PORT" -U "$DB_USER" -d "$DB" -b -W "$@"
+        -C -S "$SERVER,$PORT" -U "$DB_USER" -d "$DB" -b -W -l "${SQLCMD_LOGIN_TIMEOUT:-8}" "$@"
 }
 # One-shot query returning bare rows (no headers/footers).
 sqlcmd_query() {  # $1 = SQL
@@ -146,9 +146,33 @@ sqlcmd_query() {  # $1 = SQL
 
 log_info "Target: site=$SITE server=$SERVER,$PORT db=$DB (lock_timeout=${LOCK_TIMEOUT_MS}ms)"
 
-# ─── Connectivity + tracking table ────────────────────────────────────────────
-if ! sqlcmd_query "SELECT 1;" >/dev/null 2>&1; then
-    log_error "Cannot connect to $SERVER,$PORT (db=$DB). Check WireGuard / credentials."
+# ─── Connectivity (retry — tolerate transient WireGuard/site blips) ───────────
+# HF Ville's MSSQL rides a WireGuard tunnel to a site PC that can briefly drop
+# (asleep, NAT keepalive gap, a slow handshake). A SINGLE failed probe used to
+# abort the WHOLE deploy — including HF-Hotel-only changes — whenever Ville was
+# momentarily unreachable (observed 2026-06-28: an 8s blip failed the deploy;
+# the port was open again seconds later). Retry with linear backoff so a
+# transient drop self-heals instead of halting the pipeline. Tunable via
+# LEGACY_MSSQL_CONNECT_ATTEMPTS (default 5 → ~6+12+18+24s ≈ 60s of patience)
+# and SQLCMD_LOGIN_TIMEOUT (per-attempt login bound, default 8s).
+conn_attempts="${LEGACY_MSSQL_CONNECT_ATTEMPTS:-5}"
+conn_ok=false
+for attempt in $(seq 1 "$conn_attempts"); do
+    if sqlcmd_query "SELECT 1;" >/dev/null 2>&1; then
+        conn_ok=true
+        [[ "$attempt" -gt 1 ]] && \
+            log_info "Connected to $SERVER,$PORT on attempt ${attempt}/${conn_attempts}."
+        break
+    fi
+    if [[ "$attempt" -lt "$conn_attempts" ]]; then
+        backoff=$(( attempt * 6 ))
+        log_info "Cannot reach $SERVER,$PORT yet (attempt ${attempt}/${conn_attempts}) — retrying in ${backoff}s..."
+        sleep "$backoff"
+    fi
+done
+if [[ "$conn_ok" != true ]]; then
+    log_error "Cannot connect to $SERVER,$PORT (db=$DB) after ${conn_attempts} attempts."
+    log_error "Check WireGuard, credentials, and that the ${SITE} site server is powered on."
     exit 1
 fi
 
