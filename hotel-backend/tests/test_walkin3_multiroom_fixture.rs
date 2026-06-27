@@ -76,6 +76,7 @@ fn walkin3_single_room_inputs() -> WalkInInputs<'static> {
         price_per_night_baht: 890.0,
         nights: 1,
         price_total_baht: 890.0,
+        deposit_baht: 0.0,
         room_status_id_base: 50232,
         nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 24).unwrap()],
         checkin_ds_id: 25101,

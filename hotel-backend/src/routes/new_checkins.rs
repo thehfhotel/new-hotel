@@ -202,6 +202,10 @@ pub struct CreateCheckInRequest {
     pub children: Option<i32>,
     pub rate_per_night: Option<f64>,
     pub notes: Option<String>,
+    /// Optional room deposit (`เงินมัดจำ`, baht) collected at check-in.
+    /// Persists to `ht_checkin_rooms.cr_dep_amount` and is mirrored to legacy
+    /// `HT_CheckIn_Ds.Cin_Room_Dep`. Omitted / `null` ⇒ no deposit.
+    pub deposit_amount: Option<f64>,
 }
 
 /// Request body for checkout
@@ -763,6 +767,13 @@ async fn build_check_in_writeback_context(
         guest_name_for_registry: guest_name,
         guest_country: String::new(),
         customer_phone,
+        // Deposit capture — baht → satang. None / non-positive ⇒ Money::ZERO
+        // (no deposit), which keeps the legacy no-deposit byte-shape.
+        deposit: body
+            .deposit_amount
+            .filter(|d| *d > 0.0)
+            .map(money_from_baht_f64)
+            .unwrap_or(Money::ZERO),
     })
 }
 

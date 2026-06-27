@@ -1,8 +1,15 @@
 'use client'
 
 import { useState, useEffect, useCallback } from 'react'
-import { X, User, Calendar, AlertCircle, Loader2 } from 'lucide-react'
+import { X, User, Calendar, AlertCircle, Loader2, DollarSign, CheckCircle2 } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { useBranch } from '@/contexts/BranchContext'
+import { consumeCheckInPrefill } from '@/lib/checkin-prefill'
+import { hotelInfoForBranch } from '@/lib/hotel-info'
+import PrintButton from '@/components/ui/PrintButton'
+import RegistrationSlipTemplate, {
+  RegistrationSlipData,
+} from '@/components/documents/RegistrationSlipTemplate'
 
 /**
  * Minimal walk-in check-in modal.
@@ -44,17 +51,41 @@ function tomorrowYmd(): string {
   return d.toISOString().slice(0, 10)
 }
 
+/** Nights from today until an ISO `YYYY-MM-DD` checkout date (min 1). */
+function nightsUntil(checkoutYmd: string): number {
+  const out = new Date(checkoutYmd)
+  if (Number.isNaN(out.getTime())) return 1
+  const today = new Date()
+  const ms = out.getTime() - today.getTime()
+  return Math.max(1, Math.round(ms / 86_400_000))
+}
+
 export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalProps) {
   const branchFetch = useBranchFetch()
+  const { branch } = useBranch()
   const [firstName, setFirstName] = useState('')
   const [lastName, setLastName] = useState('')
   const [phone, setPhone] = useState('')
   const [idCard, setIdCard] = useState('')
+  const [deposit, setDeposit] = useState('')
   const [adults, setAdults] = useState(1)
   const [children, setChildren] = useState(0)
   const [expectedCheckout, setExpectedCheckout] = useState(tomorrowYmd())
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // After a successful check-in we switch the modal to a "print the
+  // registration slip" panel instead of closing immediately.
+  const [created, setCreated] = useState<{ cinNo: string; id: number } | null>(null)
+
+  // ID-card prefill hand-off: the card reader stashes the parsed Thai-ID
+  // fields and routes here; consume them once on open.
+  useEffect(() => {
+    const p = consumeCheckInPrefill()
+    if (!p) return
+    if (p.firstName) setFirstName(p.firstName)
+    if (p.lastName) setLastName(p.lastName)
+    if (p.idCard) setIdCard(p.idCard)
+  }, [])
 
   // Type-ahead lookup for existing customers by phone — avoids creating a
   // duplicate customer for repeat guests. If a match is picked, we skip the
@@ -129,6 +160,7 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
       }
 
       // Step 2: create the check-in.
+      const depositAmount = parseFloat(deposit)
       const checkinRes = await branchFetch('/api/checkins', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -138,6 +170,7 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
           expectedCheckout,
           adults,
           children,
+          depositAmount: Number.isFinite(depositAmount) && depositAmount > 0 ? depositAmount : undefined,
         }),
       })
       const checkinData = await checkinRes.json()
@@ -145,8 +178,11 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
         throw new Error(checkinData.message || 'เช็คอินไม่สำเร็จ')
       }
 
+      // Refresh the room grid behind the modal, then offer the registration
+      // slip print. The modal stays open (showing the success panel) until
+      // the receptionist clicks "เสร็จสิ้น".
       onSuccess()
-      onClose()
+      setCreated({ cinNo: checkinData.cinNo || '', id: checkinData.id })
     } catch (err) {
       setError(err instanceof Error ? err.message : 'เกิดข้อผิดพลาด')
     } finally {
@@ -176,6 +212,54 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
           </button>
         </div>
 
+        {created ? (
+          <div className="p-4 space-y-4">
+            <div className="flex items-start p-3 bg-emerald-50 border border-emerald-200 rounded text-sm text-emerald-800">
+              <CheckCircle2 size={18} className="mr-2 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-medium">เช็คอินสำเร็จ</p>
+                {created.cinNo && <p className="text-xs mt-0.5">เลขที่: {created.cinNo}</p>}
+              </div>
+            </div>
+
+            <p className="text-sm text-gray-600">
+              พิมพ์ใบลงทะเบียนเข้าพักให้ผู้เข้าพัก หรือกด &quot;เสร็จสิ้น&quot; เพื่อปิด
+            </p>
+
+            <RegistrationSlipTemplate
+              hotelInfo={hotelInfoForBranch(branch)}
+              data={
+                {
+                  registrationNo: created.cinNo,
+                  checkInId: created.id,
+                  guestName: `${firstName} ${lastName}`.trim(),
+                  guestIdCard: idCard.trim() || undefined,
+                  guestContact: phone.trim() || undefined,
+                  roomNumber: room.roomNo,
+                  roomType: room.roomTypeName || undefined,
+                  checkInDate: new Date().toISOString(),
+                  checkOutDate: expectedCheckout,
+                  nights: nightsUntil(expectedCheckout),
+                  ratePerNight: room.rate ?? undefined,
+                  deposit: parseFloat(deposit) > 0 ? parseFloat(deposit) : undefined,
+                  adults,
+                  children,
+                } satisfies RegistrationSlipData
+              }
+            />
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-gray-200">
+              <PrintButton size="sm" showPdfOption={false} />
+              <button
+                type="button"
+                onClick={onClose}
+                className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded hover:bg-gray-50"
+              >
+                เสร็จสิ้น
+              </button>
+            </div>
+          </div>
+        ) : (
         <form onSubmit={submit} className="p-4 space-y-4">
           {/* Picked-existing pill */}
           {pickedCustomerId !== null && (
@@ -299,6 +383,22 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
             />
           </div>
 
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              <DollarSign size={14} className="inline mr-1" />
+              เงินมัดจำ (บาท)
+            </label>
+            <input
+              type="number"
+              min={0}
+              step="0.01"
+              value={deposit}
+              onChange={(e) => setDeposit(e.target.value)}
+              placeholder="0"
+              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-hidden focus:ring-2 focus:ring-red-500"
+            />
+          </div>
+
           {error && (
             <div className="flex items-start p-3 bg-red-50 border border-red-200 rounded text-sm text-red-700">
               <AlertCircle size={16} className="mr-2 shrink-0 mt-0.5" />
@@ -325,6 +425,7 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
             </button>
           </div>
         </form>
+        )}
       </div>
     </div>
   )

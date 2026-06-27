@@ -16,6 +16,18 @@ jest.mock('lucide-react', () => ({
   Calendar: () => <span data-testid="calendar-icon">Calendar</span>,
   DollarSign: () => <span data-testid="dollar-icon">$</span>,
   FileText: () => <span data-testid="filetext-icon">File</span>,
+  CheckCircle2: () => <span data-testid="check-icon">✓</span>,
+}))
+
+// The registration-slip print panel is exercised in its own context; stub the
+// heavy print children so these tests stay focused on the check-in flow.
+jest.mock('@/components/ui/PrintButton', () => ({
+  __esModule: true,
+  default: () => <button type="button">พิมพ์</button>,
+}))
+jest.mock('@/components/documents/RegistrationSlipTemplate', () => ({
+  __esModule: true,
+  default: () => null,
 }))
 
 // Mock customer data
@@ -419,14 +431,14 @@ describe('QuickCheckInModal Component', () => {
       })
     })
 
-    test('calls onSuccess and onClose after successful submission', async () => {
+    test('on success shows the registration-slip panel; onSuccess fires, onClose only on done', async () => {
       ;(global.fetch as jest.Mock)
         .mockResolvedValueOnce({
           json: () => Promise.resolve({ success: true, data: mockCustomers }),
         })
         .mockResolvedValueOnce({
           ok: true,
-          json: () => Promise.resolve({ success: true, data: { id: 1 } }),
+          json: () => Promise.resolve({ success: true, id: 1, cinNo: 'CIN-20260627-0001' }),
         })
 
       render(<QuickCheckInModal {...defaultProps} />)
@@ -448,10 +460,17 @@ describe('QuickCheckInModal Component', () => {
       const submitButton = screen.getByText('เช็คอิน')
       fireEvent.click(submitButton)
 
+      // onSuccess refreshes the grid behind the modal; the modal switches to
+      // the success panel (does NOT auto-close).
       await waitFor(() => {
         expect(defaultProps.onSuccess).toHaveBeenCalled()
-        expect(defaultProps.onClose).toHaveBeenCalled()
+        expect(screen.getByText('เช็คอินสำเร็จ')).toBeInTheDocument()
       })
+      expect(defaultProps.onClose).not.toHaveBeenCalled()
+
+      // Clicking "เสร็จสิ้น" closes the modal.
+      fireEvent.click(screen.getByText('เสร็จสิ้น'))
+      expect(defaultProps.onClose).toHaveBeenCalled()
     })
 
     test('shows error message on API failure', async () => {

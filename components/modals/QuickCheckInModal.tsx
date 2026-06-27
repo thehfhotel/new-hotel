@@ -1,8 +1,15 @@
 'use client'
 
 import { useState, useEffect, useCallback } from 'react'
-import { X, Search, Loader2, User, Calendar, DollarSign, FileText } from 'lucide-react'
+import { X, Search, Loader2, User, Calendar, DollarSign, FileText, CheckCircle2 } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { useBranch } from '@/contexts/BranchContext'
+import { consumeCheckInPrefill } from '@/lib/checkin-prefill'
+import { hotelInfoForBranch } from '@/lib/hotel-info'
+import PrintButton from '@/components/ui/PrintButton'
+import RegistrationSlipTemplate, {
+  RegistrationSlipData,
+} from '@/components/documents/RegistrationSlipTemplate'
 
 interface Customer {
   id: number
@@ -42,6 +49,14 @@ function formatDateForApi(date: Date): string {
   return `${year}-${month}-${day}`
 }
 
+/** Nights from today until an ISO `YYYY-MM-DD` checkout date (min 1). */
+function nightsUntil(checkoutYmd: string): number {
+  const out = new Date(checkoutYmd)
+  if (Number.isNaN(out.getTime())) return 1
+  const ms = out.getTime() - new Date().getTime()
+  return Math.max(1, Math.round(ms / 86_400_000))
+}
+
 export default function QuickCheckInModal({
   isOpen,
   onClose,
@@ -49,6 +64,7 @@ export default function QuickCheckInModal({
   onSuccess,
 }: QuickCheckInModalProps) {
   const branchFetch = useBranchFetch()
+  const { branch } = useBranch()
 
   // Customer search state
   const [searchQuery, setSearchQuery] = useState('')
@@ -60,6 +76,7 @@ export default function QuickCheckInModal({
   // Form state
   const [expectedCheckout, setExpectedCheckout] = useState('')
   const [ratePerNight, setRatePerNight] = useState('')
+  const [deposit, setDeposit] = useState('')
   const [adults, setAdults] = useState('1')
   const [children, setChildren] = useState('0')
   const [notes, setNotes] = useState('')
@@ -67,13 +84,22 @@ export default function QuickCheckInModal({
   // Submission state
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // After success: switch to the registration-slip print panel.
+  const [created, setCreated] = useState<{ cinNo: string; id: number } | null>(null)
 
-  // Set default expected checkout to tomorrow
+  // Set default expected checkout to tomorrow + consume any pending ID-card
+  // prefill (seed the customer search with the scanned ID / name).
   useEffect(() => {
     if (isOpen) {
       const tomorrow = new Date()
       tomorrow.setDate(tomorrow.getDate() + 1)
       setExpectedCheckout(formatDateForApi(tomorrow))
+
+      const p = consumeCheckInPrefill()
+      if (p) {
+        const seed = p.idCard || `${p.firstName || ''} ${p.lastName || ''}`.trim()
+        if (seed) setSearchQuery(seed)
+      }
     }
   }, [isOpen])
 
@@ -131,10 +157,12 @@ export default function QuickCheckInModal({
     setCustomers([])
     setExpectedCheckout('')
     setRatePerNight('')
+    setDeposit('')
     setAdults('1')
     setChildren('0')
     setNotes('')
     setError(null)
+    setCreated(null)
   }
 
   // Handle close
@@ -161,6 +189,7 @@ export default function QuickCheckInModal({
     setError(null)
 
     try {
+      const depositAmount = parseFloat(deposit)
       const res = await branchFetch('/api/checkins', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -171,6 +200,7 @@ export default function QuickCheckInModal({
           adults: parseInt(adults) || 1,
           children: parseInt(children) || 0,
           ratePerNight: parseFloat(ratePerNight) || undefined,
+          depositAmount: Number.isFinite(depositAmount) && depositAmount > 0 ? depositAmount : undefined,
           notes: notes || undefined,
         }),
       })
@@ -181,8 +211,9 @@ export default function QuickCheckInModal({
         throw new Error(data.error || data.message || 'เกิดข้อผิดพลาดในการเช็คอิน')
       }
 
+      // Refresh behind the modal, then show the registration-slip print panel.
       onSuccess()
-      handleClose()
+      setCreated({ cinNo: data.cinNo || '', id: data.id })
     } catch (err) {
       setError(err instanceof Error ? err.message : 'เกิดข้อผิดพลาดในการเช็คอิน')
     } finally {
@@ -217,7 +248,55 @@ export default function QuickCheckInModal({
           </button>
         </div>
 
-        {/* Form */}
+        {/* Success → registration-slip print panel */}
+        {created ? (
+          <div className="p-4 space-y-4">
+            <div className="flex items-start p-3 bg-emerald-50 border border-emerald-200 rounded-lg text-sm text-emerald-800">
+              <CheckCircle2 size={18} className="mr-2 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-medium">เช็คอินสำเร็จ</p>
+                {created.cinNo && <p className="text-xs mt-0.5">เลขที่: {created.cinNo}</p>}
+              </div>
+            </div>
+
+            <p className="text-sm text-gray-600">
+              พิมพ์ใบลงทะเบียนเข้าพักให้ผู้เข้าพัก หรือกด &quot;เสร็จสิ้น&quot; เพื่อปิด
+            </p>
+
+            <RegistrationSlipTemplate
+              hotelInfo={hotelInfoForBranch(branch)}
+              data={
+                {
+                  registrationNo: created.cinNo,
+                  checkInId: created.id,
+                  guestName: `${selectedCustomer?.firstName || ''} ${selectedCustomer?.lastName || ''}`.trim(),
+                  guestIdCard: selectedCustomer?.idCard || undefined,
+                  guestContact: selectedCustomer?.phone || undefined,
+                  roomNumber: room.roomNumber,
+                  roomType: room.type || undefined,
+                  checkInDate: new Date().toISOString(),
+                  checkOutDate: expectedCheckout,
+                  nights: nightsUntil(expectedCheckout),
+                  ratePerNight: parseFloat(ratePerNight) > 0 ? parseFloat(ratePerNight) : undefined,
+                  deposit: parseFloat(deposit) > 0 ? parseFloat(deposit) : undefined,
+                  adults: parseInt(adults) || 1,
+                  children: parseInt(children) || 0,
+                } satisfies RegistrationSlipData
+              }
+            />
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-gray-200">
+              <PrintButton size="sm" showPdfOption={false} />
+              <button
+                type="button"
+                onClick={handleClose}
+                className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-100"
+              >
+                เสร็จสิ้น
+              </button>
+            </div>
+          </div>
+        ) : (
         <form onSubmit={handleSubmit} className="p-4 space-y-4">
           {/* Error Message */}
           {error && (
@@ -338,6 +417,23 @@ export default function QuickCheckInModal({
             />
           </div>
 
+          {/* Deposit */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              <DollarSign size={16} className="inline mr-1" />
+              เงินมัดจำ (บาท)
+            </label>
+            <input
+              type="number"
+              value={deposit}
+              onChange={(e) => setDeposit(e.target.value)}
+              placeholder="0"
+              min="0"
+              step="0.01"
+              className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500"
+            />
+          </div>
+
           {/* Adults and Children */}
           <div className="grid grid-cols-2 gap-4">
             <div>
@@ -407,6 +503,7 @@ export default function QuickCheckInModal({
             </button>
           </div>
         </form>
+        )}
       </div>
     </div>
   )

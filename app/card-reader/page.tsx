@@ -1,8 +1,10 @@
 'use client'
 
 import { useState, useCallback, useEffect, useRef } from 'react'
+import { useRouter } from 'next/navigation'
 import { CreditCard, RefreshCw, CheckCircle2, XCircle, User, AlertCircle, Server, Terminal, Download } from 'lucide-react'
 import { formatStoredDayMonthYear } from '@/lib/format'
+import { setCheckInPrefill } from '@/lib/checkin-prefill'
 
 type ConnectionStatus = 'disconnected' | 'connecting' | 'connected'
 type ReadStatus = 'idle' | 'reading' | 'success' | 'error'
@@ -41,6 +43,7 @@ function formatThaiDate(dateStr: string): string {
 }
 
 export default function CardReaderPage() {
+  const router = useRouter()
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('disconnected')
   const [readStatus, setReadStatus] = useState<ReadStatus>('idle')
   const [cardData, setCardData] = useState<ThaiIdCardData | null>(null)
@@ -120,9 +123,19 @@ export default function CardReaderPage() {
   }
 
   const handleUseData = () => {
-    if (cardData) {
-      alert(`ข้อมูลบัตรประชาชน:\n\nเลขบัตร: ${cardData.cid}\nชื่อ: ${cardData.thaiTitle}${cardData.thaiFirstName} ${cardData.thaiLastName}\n\n(ฟังก์ชันนี้จะเชื่อมต่อกับระบบ check-in ในอนาคต)`)
-    }
+    if (!cardData) return
+    // Stash the parsed Thai-ID fields for the check-in form to consume, then
+    // hand off to the rooms screen where the receptionist picks a room and
+    // opens the check-in modal (which prefills from this slot).
+    // NOTE: photo capture/persistence is intentionally out of scope
+    // (docs/architecture.md:1385) — only name + ID are carried over.
+    setCheckInPrefill({
+      firstName: cardData.thaiFirstName,
+      lastName: cardData.thaiLastName,
+      idCard: cardData.cid,
+      nationality: 'ไทย',
+    })
+    router.push('/rooms')
   }
 
   return (

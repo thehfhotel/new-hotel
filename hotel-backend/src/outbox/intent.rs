@@ -680,6 +680,14 @@ pub struct CreateCheckInPayload {
     #[serde(default)]
     pub customer_phone: Option<String>,
 
+    /// Room deposit (`เงินมัดจำ`, baht) collected at check-in. Lands in
+    /// `HT_CheckIn_Ds.Cin_Room_Dep` and flips `Cin_dep_status` to
+    /// "collected" (`'ยังไม่คืนค่ามัดจำ'`) when `> 0`; zero keeps the legacy
+    /// no-deposit byte-shape (`0` + `'ไม่เก็บค่ามัดจำ'`). Defaults to zero;
+    /// `serde(default)` keeps older queue rows (pre-deposit) deserializable.
+    #[serde(default)]
+    pub deposit: Money,
+
     /// Optional `Tb_Save_Image.tmp_no` for the temporary photo upload
     /// associated with this check-in. The legacy app fires
     /// `update Tb_Save_Image set cin_no=…, cust_no=…, tmp_no=''
@@ -932,6 +940,7 @@ mod tests {
             guest_name_for_registry: "MULTI ROOM GUEST".into(),
             guest_country: "".into(),
             customer_phone: None,
+            deposit: Money::ZERO,
             photo_tmp_no: None,
             room_lines: vec![
                 RoomLine {

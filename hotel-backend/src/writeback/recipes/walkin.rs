@@ -41,8 +41,9 @@ use crate::writeback::allocate::{
     allocate_room_status_id, LegacyConn,
 };
 use crate::writeback::constants::{
-    power_log_note_check_in, CIN_DEP_STATUS_NONE, CIN_ROOM_STATUS_OCCUPYING, CIN_STATUS_NORMAL,
-    CUST_TYPE_MAIN_NORMAL, CUST_TYPE_NORMAL, DEFAULT_OPERATOR, ROOM_STATUS_OCCUPYING,
+    power_log_note_check_in, CIN_DEP_STATUS_COLLECTED, CIN_DEP_STATUS_NONE,
+    CIN_ROOM_STATUS_OCCUPYING, CIN_STATUS_NORMAL, CUST_TYPE_MAIN_NORMAL, CUST_TYPE_NORMAL,
+    DEFAULT_OPERATOR, ROOM_STATUS_OCCUPYING,
 };
 use crate::writeback::dispatcher::LegacyIds;
 use crate::writeback::error::{WritebackError, WritebackResult};
@@ -71,6 +72,11 @@ pub struct WalkInInputs<'a> {
     pub price_per_night_baht: f64,
     pub nights: i32,
     pub price_total_baht: f64,
+    /// Room deposit in baht (`HT_CheckIn_Ds.Cin_Room_Dep`). `> 0` flips
+    /// `Cin_dep_status` to `'ยังไม่คืนค่ามัดจำ'`; `0.0` keeps the legacy
+    /// no-deposit shape (`0` + `'ไม่เก็บค่ามัดจำ'`). Single-room folios put
+    /// the whole deposit on the one room. See `build_statements`.
+    pub deposit_baht: f64,
     /// First `HT_Room_Status.id` to use for night INSERTs.
     pub room_status_id_base: i32,
     /// Pre-allocated `HT_CheckIn_Ds.id`. Despite the spike's earlier note,
@@ -232,13 +238,26 @@ pub fn build_statements(inputs: &WalkInInputs<'_>) -> Vec<String> {
         } else {
             sql_quote(&line.room_status)
         };
+        // Deposit capture: the folio-level deposit lands on the FIRST room's
+        // `Cin_Room_Dep`; when `> 0`, `Cin_dep_status` flips to "collected"
+        // (`'ยังไม่คืนค่ามัดจำ'`) per iHOTEL (COMPAT_CHEATSHEET §HT_CheckIn_Ds).
+        // Zero keeps the legacy byte-shape (`0` literal + `'ไม่เก็บค่ามัดจำ'`)
+        // so existing capture/byte-parity tests are unaffected.
+        // TODO(multi-room): apportion the deposit per-room once `room_lines`
+        // carry a per-room deposit (the create flow is single-room today).
+        let line_dep = if room_idx == 0 { inputs.deposit_baht } else { 0.0 };
+        let (line_dep_sql, line_dep_status_q) = if line_dep > 0.0 {
+            (format!("{:.2}", line_dep), sql_quote(CIN_DEP_STATUS_COLLECTED))
+        } else {
+            ("0".to_string(), dep_status_q.clone())
+        };
         statements.push(format!(
             "INSERT INTO [HT_CheckIn_Ds]([id],[Cin_No],[Cin_Room_No],[Cin_Room_Type],[Cin_Room_In],\
              [Cin_Room_Out],[Cin_Room_Status],[Cin_Room_Dep],[Cin_Room_Price],[Cin_Room_Night],\
              [Cin_Room_PriceToTal],[Cin_Room_Pay_Before],[Cin_Room_Pay_Total],[Cin_note],\
              [Cin_dep_status],[Cin_cupon])\
              VALUES( {ds_id},{cin_no_q},{line_room_no_q},{line_room_type_q},{stay_start_q},{stay_end_q},\
-             {line_status_q},0,{line_price},{line_nights},{line_total},0,0,'',{dep_status_q},0)"
+             {line_status_q},{line_dep_sql},{line_price},{line_nights},{line_total},0,0,'',{line_dep_status_q},0)"
         ));
     }
 
@@ -344,9 +363,11 @@ pub async fn execute(
     // introducing a non-Money f64 source.
     let price_per_night_baht = (payload.price_per_night.as_satang() as f64) / 100.0;
     let price_total_baht = (payload.price_total.as_satang() as f64) / 100.0;
+    let deposit_baht = (payload.deposit.as_satang() as f64) / 100.0;
     super::helpers::validate_finite(&[
         ("price_per_night_baht", price_per_night_baht),
         ("price_total_baht", price_total_baht),
+        ("deposit_baht", deposit_baht),
     ])?;
 
     // Wave 6 LOW item 5: hard-validate `nights >= 1` instead of silently
@@ -410,6 +431,7 @@ pub async fn execute(
         price_per_night_baht,
         nights: payload.nights,
         price_total_baht,
+        deposit_baht,
         room_status_id_base,
         nights_calendar,
         checkin_ds_id: checkin_ds_id_base,
@@ -469,6 +491,7 @@ mod tests {
             price_per_night_baht: 890.0,
             nights: 1,
             price_total_baht: 890.0,
+            deposit_baht: 0.0,
             room_status_id_base: 50230,
             nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 24).unwrap()],
             checkin_ds_id: 25001,
@@ -506,6 +529,7 @@ mod tests {
             price_per_night_baht: 890.0,
             nights: 1,
             price_total_baht: 890.0,
+            deposit_baht: 0.0,
             room_status_id_base: 50300,
             nights_calendar: vec![NaiveDate::from_ymd_opt(2026, 4, 25).unwrap()],
             checkin_ds_id: 25025,
@@ -618,6 +642,31 @@ mod tests {
         assert!(ds.contains("[Cin_dep_status]"));
         assert!(!ds.contains("[Cin_Dep_Status]"));
         assert!(!ds.contains("[Dep_by]"));
+        assert!(ds.contains("'ไม่เก็บค่ามัดจำ'"));
+    }
+
+    /// Deposit capture: a non-zero `deposit_baht` lands on `Cin_Room_Dep`
+    /// (2dp) and flips `Cin_dep_status` to the "collected" literal.
+    #[test]
+    fn checkin_ds_carries_deposit_when_collected() {
+        let mut inputs = sample_inputs();
+        inputs.deposit_baht = 500.0;
+        let s = build_statements(&inputs);
+        let ds = s.iter().find(|s| s.contains("HT_CheckIn_Ds")).unwrap();
+        // …Cin_Room_Status,Cin_Room_Dep,Cin_Room_Price… → '…,'เข้าพัก',500.00,890.00,…'
+        assert!(ds.contains(",500.00,890.00,"), "deposit must be on Cin_Room_Dep: {ds}");
+        assert!(ds.contains("'ยังไม่คืนค่ามัดจำ'"), "collected status: {ds}");
+        assert!(!ds.contains("'ไม่เก็บค่ามัดจำ'"));
+    }
+
+    /// No deposit ⇒ legacy byte-shape preserved (`0` literal, not `0.00`,
+    /// plus the no-deposit status literal).
+    #[test]
+    fn checkin_ds_no_deposit_keeps_legacy_zero_shape() {
+        let s = build_statements(&sample_inputs()); // deposit_baht = 0.0
+        let ds = s.iter().find(|s| s.contains("HT_CheckIn_Ds")).unwrap();
+        // Cin_Room_Status,Cin_Room_Dep,Cin_Room_Price = …'เข้าพัก',0,890.00…
+        assert!(ds.contains(",0,890.00,"), "no-deposit must keep `0` literal: {ds}");
         assert!(ds.contains("'ไม่เก็บค่ามัดจำ'"));
     }
 

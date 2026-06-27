@@ -51,6 +51,12 @@ pub struct CheckInWritebackContext {
     /// check-in's `UPDATE HT_Customers SET [Cust_Add_tel]=…` preserves
     /// the booking-time phone instead of wiping it (Wave 5a item 1).
     pub customer_phone: Option<String>,
+    /// Room deposit (`เงินมัดจำ`) collected at check-in. Persisted canonically
+    /// to `ht_checkin_rooms.cr_dep_amount` (+ `cr_dep_status`) and threaded
+    /// into [`CreateCheckInPayload::deposit`] so the legacy
+    /// `HT_CheckIn_Ds.Cin_Room_Dep` mirror stays consistent through the sync
+    /// round-trip. `Money::ZERO` ⇒ no deposit (the common walk-in).
+    pub deposit: Money,
 }
 
 /// Command for [`CheckInService::walk_in`] — no prior booking exists.
@@ -286,6 +292,9 @@ impl CheckInService {
 
         self.repo.mark_room_occupied(&mut tx, cmd.room_id).await?;
 
+        self.persist_deposit_junction(&mut tx, cin_id, cmd.room_id, &cmd.writeback_context)
+            .await?;
+
         self.enqueue_create_check_in(
             &mut tx,
             cin_id,
@@ -379,6 +388,9 @@ impl CheckInService {
         self.repo.mark_room_occupied(&mut tx, cmd.room_id).await?;
         self.repo
             .set_booking_checkedin(&mut tx, cmd.booking_id)
+            .await?;
+
+        self.persist_deposit_junction(&mut tx, cin_id, cmd.room_id, &cmd.writeback_context)
             .await?;
 
         self.enqueue_create_check_in(
@@ -880,6 +892,60 @@ impl CheckInService {
 
     // ---------- private helpers ----------
 
+    /// Persist a collected room deposit onto the canonical
+    /// `ht_checkin_rooms` junction so the folio/cashier reads
+    /// (`folio_breakdown`, `new_shifts`) and the room-grid see it
+    /// immediately — before the legacy→PG sync round-trip would refresh it.
+    ///
+    /// The create flow is single-room, so a deposit applies to the one
+    /// room being checked in. When no deposit is taken (`Money::ZERO`) we
+    /// write nothing: non-deposit walk-ins keep their pre-junction shape
+    /// (dashboard readers COALESCE-fall back to `ht_checkins.cin_room_id`),
+    /// so this only adds a junction row in the deposit case.
+    ///
+    /// `cr_room_status` (`'เข้าพัก'`) and `cr_dep_status`
+    /// (`'ยังไม่คืนค่ามัดจำ'`) are the exact Thai literals the B2 sync mapper
+    /// writes from legacy, so the later `ON CONFLICT … DO UPDATE` round-trip
+    /// is a no-op rather than flapping the row. `ON CONFLICT DO UPDATE`
+    /// guards against a pre-existing junction row (defensive; none exists at
+    /// create time today).
+    async fn persist_deposit_junction(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        cin_id: i32,
+        room_id: i32,
+        ctx: &CheckInWritebackContext,
+    ) -> ServiceResult<()> {
+        if ctx.deposit.as_satang() <= 0 {
+            return Ok(());
+        }
+        let deposit_baht = ctx.deposit.as_satang() as f64 / 100.0;
+        let rate_baht = ctx.price_per_night.as_satang() as f64 / 100.0;
+        let total_baht = ctx.price_total.as_satang() as f64 / 100.0;
+        sqlx::query(
+            "INSERT INTO ht_checkin_rooms ( \
+                 cr_cin_id, cr_room_id, cr_room_in, cr_room_out, cr_room_status, \
+                 cr_rate_per_night, cr_nights, cr_room_total, cr_dep_amount, cr_dep_status \
+             ) VALUES ($1, $2, $3, $4, 'เข้าพัก', $5::numeric, $6, $7::numeric, \
+                       $8::numeric, 'ยังไม่คืนค่ามัดจำ') \
+             ON CONFLICT (cr_cin_id, cr_room_id) DO UPDATE SET \
+                 cr_dep_amount = EXCLUDED.cr_dep_amount, \
+                 cr_dep_status = EXCLUDED.cr_dep_status, \
+                 cr_updated_at = NOW()",
+        )
+        .bind(cin_id)
+        .bind(room_id)
+        .bind(ctx.stay.start)
+        .bind(ctx.stay.end)
+        .bind(rate_baht)
+        .bind(ctx.nights)
+        .bind(total_baht)
+        .bind(deposit_baht)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
     async fn enqueue_create_check_in(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -907,7 +973,13 @@ impl CheckInService {
             // Wave 5a item 1 — preserve booking-time phone instead of
             // wiping `HT_Customers.Cust_Add_tel` on every check-in.
             customer_phone: ctx.customer_phone.clone(),
+            // Deposit capture — the legacy `HT_CheckIn_Ds.Cin_Room_Dep` mirror
+            // (+ `Cin_dep_status`) is written by the walkin/checkin_to_booking
+            // recipes; `Money::ZERO` keeps the no-deposit byte-shape.
+            deposit: ctx.deposit,
             // photo plumbing arrives in a follow-up — see audit HIGH-3.
+            // TODO(out of scope): guest photo capture/persistence
+            // (`photo_tmp_no`, `Tb_Save_Image`) — see docs/architecture.md:1385.
             photo_tmp_no: None,
             // Track B4 — multi-room slice. Empty for now; populated by
             // the multi-room walk-in route (T4 HIGH-1) when it lands.
