@@ -2129,6 +2129,50 @@ INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('058', '058_add_shift_cash_count.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
+-- Migration 059 — Cash in/out petty-cash ledger (รายรับ-รายจ่าย). Canonical
+-- mirror of legacy TB_Pay_History + its 3-level account taxonomy
+-- (TB_SET_MyType2 / _2_2 / 3). Populated by the sync worker's sync_cash_history
+-- + sync_cash_categories per-tick polls and by POST /api/cash/{income,expense}.
+-- Per-site (connection-level scoping). See migrations/pg/059_create_ht_cash_ledger.sql.
+CREATE TABLE IF NOT EXISTS ht_cash_categories (
+    cash_cat_id   BIGSERIAL PRIMARY KEY,
+    cat_level     VARCHAR(8)   NOT NULL,
+    cat_legacy_id INTEGER      NOT NULL,
+    cat_id_full   VARCHAR(50),
+    cat_name      VARCHAR(100),
+    cat_synced_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CONSTRAINT ht_cash_categories_level_legacy_id_key UNIQUE (cat_level, cat_legacy_id)
+);
+CREATE INDEX IF NOT EXISTS ix_ht_cash_categories_level
+    ON ht_cash_categories (cat_level);
+
+CREATE TABLE IF NOT EXISTS ht_cash_ledger (
+    cash_id          BIGSERIAL PRIMARY KEY,
+    cash_legacy_id   INTEGER,
+    cash_kind        VARCHAR(20)  NOT NULL DEFAULT 'unknown'
+                     CHECK (cash_kind IN ('income', 'expense', 'unknown')),
+    cash_legacy_type VARCHAR(50),
+    cash_entry_date  TIMESTAMPTZ,
+    cash_bill_no     VARCHAR(255),
+    cash_payee       VARCHAR(500),
+    cash_amount      NUMERIC(14,2) NOT NULL DEFAULT 0,
+    cash_note        VARCHAR(500),
+    cash_program_date TIMESTAMPTZ,
+    cash_group       VARCHAR(50),
+    cash_account     VARCHAR(50),
+    cash_source      VARCHAR(20)  NOT NULL DEFAULT 'legacy'
+                     CHECK (cash_source IN ('legacy', 'app')),
+    cash_created_by  VARCHAR(100),
+    cash_synced_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CONSTRAINT ht_cash_ledger_legacy_id_key UNIQUE (cash_legacy_id)
+);
+CREATE INDEX IF NOT EXISTS ix_ht_cash_ledger_entry_date
+    ON ht_cash_ledger (cash_entry_date);
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('059', '059_create_ht_cash_ledger.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
 -- =============================================================================
 -- Initialization complete
 -- =============================================================================

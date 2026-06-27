@@ -12,6 +12,7 @@ pub mod housekeeping;
 pub mod legacy_mirror;
 pub mod mode;
 pub mod new_bookings;
+pub mod new_cash;
 pub mod new_checkins;
 pub mod new_coupons;
 pub mod new_customers;

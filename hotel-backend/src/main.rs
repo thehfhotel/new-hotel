@@ -567,6 +567,21 @@ fn build_new_routes(app_state: AppState) -> Router {
         // Track J7f — round summary/analytics: closed rounds over a date range
         // (iHOTEL FrmDueBill history) + period totals + by-cashier. Read-only.
         .route("/api/shifts/summary", get(routes::new_shifts::round_summary))
+        // Cash in/out petty-cash ledger (รายรับ-รายจ่าย) — migration 059.
+        // Branch-aware list + create (income/expense) + the account taxonomy
+        // dropdown source. Inbound mirror of legacy TB_Pay_History rides the
+        // sync poll (bin/sync.rs::sync_cash_history); writeback to TB_Pay_History
+        // is pending byte-shape verification (writeback::recipes::cash_entry).
+        .route(
+            "/api/cash",
+            get(routes::new_cash::list_cash),
+        )
+        .route("/api/cash/income", post(routes::new_cash::create_income))
+        .route("/api/cash/expense", post(routes::new_cash::create_expense))
+        .route(
+            "/api/cash/categories",
+            get(routes::new_cash::list_categories),
+        )
         // Inventory Management
         .route("/api/inventory/items", get(routes::new_inventory::list_items).post(routes::new_inventory::create_item))
         .route("/api/inventory/items/{id}", get(routes::new_inventory::get_item).put(routes::new_inventory::update_item).delete(routes::new_inventory::delete_item))

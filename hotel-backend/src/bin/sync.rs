@@ -2567,6 +2567,16 @@ async fn run_one_tick(
     // and returns instead of propagating). Shadow mode skips the
     // canonical write, mirroring the CT mappers.
     sync_round_bills(pg, mssql, shadow_mode, site_id).await;
+
+    // Cash in/out petty-cash ledger (รายรับ-รายจ่าย) sync — same read-only
+    // per-tick poll pattern as `sync_round_bills` (low-volume legacy ledger
+    // + config trees, NOT Change-Tracking, so no legacy DDL). Mirrors
+    // `TB_Pay_History` → `ht_cash_ledger` and the account taxonomy
+    // (`TB_SET_MyType2`/`_2_2`/`3`) → `ht_cash_categories`. Both functions
+    // log at WARN and return on any error — a failure here must never abort
+    // the tick, and shadow mode skips the canonical writes.
+    sync_cash_categories(pg, mssql, shadow_mode, site_id).await;
+    sync_cash_history(pg, mssql, shadow_mode, site_id).await;
 }
 
 /// Poll one table for CT changes since `last_seen`. Per the lifecycle:
@@ -3651,6 +3661,398 @@ async fn sync_round_bills(pg: &PgPool, mssql: &DbPool, shadow_mode: bool, site_i
             upserted,
             "round-bill sync: upserted canonical shifts from HT_Round_Bill"
         );
+    }
+}
+
+/// How many days back the cash-ledger poll scans `TB_Pay_History` each tick.
+/// Petty-cash entries are low-volume and almost always dated "today"; bounding
+/// the scan to a recent window keeps the per-tick cost ~constant as the legacy
+/// ledger grows over the years (parity with `sync_round_bills`' 2-day window,
+/// just wider because cash entries can be back-dated a little).
+const CASH_WINDOW_DAYS: i64 = 120;
+
+/// Convert a legacy OLE-Automation date serial (`TB_Pay_History.Pay_Date` /
+/// `Pay_Program` are `float` OADates — `DateTime.ToOADate()`, days since
+/// 1899-12-30 with the fractional part = fraction of a 24h day) into a true UTC
+/// instant. The serial encodes a **Thai-local wall clock** (the legacy app is
+/// tz-naive), so we attach +07:00 before converting — same convention as
+/// `naive_thai_to_utc` everywhere else.
+///
+/// Returns `None` for non-finite / non-positive / absurd serials (garbage or a
+/// genuine "no date" zero) so the caller can store NULL rather than a bogus
+/// 1899 timestamp. PURE.
+fn ole_serial_to_utc(serial: f64) -> Option<chrono::DateTime<chrono::Utc>> {
+    if !serial.is_finite() || serial <= 0.0 || serial > 400_000.0 {
+        return None; // garbage, "no date", or implausibly far future (>~2994)
+    }
+    let epoch = chrono::NaiveDate::from_ymd_opt(1899, 12, 30)?;
+    let whole_days = serial.trunc();
+    let date = epoch.checked_add_days(chrono::Days::new(whole_days as u64))?;
+    let frac = serial - whole_days; // [0, 1)
+    let secs = ((frac * 86_400.0).round() as i64).clamp(0, 86_399);
+    let naive = date.and_hms_opt(0, 0, 0)? + chrono::Duration::seconds(secs);
+    Some(naive_thai_to_utc(naive))
+}
+
+/// Normalize the raw legacy `TB_Pay_History.Pay_Type` marker into our
+/// canonical `cash_kind`. BEST-EFFORT: the income/expense screen is
+/// "รายรับ-รายจ่าย", so the marker almost always contains the Thai word
+/// "รับ" (receive → income) or "จ่าย" (pay → expense). Anything we can't
+/// classify is stored as `'unknown'` — the RAW `Pay_Type` is always preserved
+/// verbatim in `ht_cash_ledger.cash_legacy_type`, which stays authoritative.
+/// PURE.
+fn cash_kind_from_pay_type(pay_type: &str) -> &'static str {
+    if pay_type.contains("รับ") {
+        "income"
+    } else if pay_type.contains("จ่าย") {
+        "expense"
+    } else {
+        "unknown"
+    }
+}
+
+/// Read-only sync of the legacy account taxonomy (`TB_SET_MyType2` /
+/// `TB_SET_MyType2_2` / `TB_SET_MyType3`) into canonical `ht_cash_categories`.
+///
+/// These three legacy tables share the same `(id IDENTITY, id_full, name)`
+/// shape and classify cash-ledger entries; we mirror all three in one
+/// `UNION ALL` round-trip, tagging each row with its `cat_level`
+/// ('2' | '2_2' | '3'). They are essentially static config (≤~40 rows total),
+/// so a full poll each tick is cheap. Same resilience contract as
+/// `sync_round_bills`: every error path logs at WARN and returns; shadow mode
+/// skips the canonical write.
+async fn sync_cash_categories(pg: &PgPool, mssql: &DbPool, shadow_mode: bool, site_id: &str) {
+    const CATEGORY_SELECT: &str = "\
+         SELECT '2' AS lvl, id, id_full, name FROM TB_SET_MyType2 \
+         UNION ALL SELECT '2_2' AS lvl, id, id_full, name FROM TB_SET_MyType2_2 \
+         UNION ALL SELECT '3' AS lvl, id, id_full, name FROM TB_SET_MyType3";
+
+    let mut conn = match mssql.get().await {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::warn!(
+                event_name = "cash_category_sync_conn_fail",
+                site = %site_id,
+                error = %err,
+                "cash-category sync: could not acquire MSSQL connection; skipping"
+            );
+            return;
+        }
+    };
+    let rows =
+        match simple_query_with_timeout_pooled(&mut conn, CATEGORY_SELECT, MssqlOpKind::Read).await {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::warn!(
+                    event_name = "cash_category_sync_query_fail",
+                    site = %site_id,
+                    error = %err,
+                    "cash-category sync: SELECT failed; skipping"
+                );
+                return;
+            }
+        };
+    drop(conn); // release the pooled MSSQL connection before PG work
+
+    let mut upserted = 0usize;
+    for row in &rows {
+        let Some(level) = tiberius::Row::try_get::<&str, _>(row, "lvl").ok().flatten() else {
+            continue;
+        };
+        let Some(legacy_id) = tiberius::Row::try_get::<i32, _>(row, "id").ok().flatten() else {
+            continue;
+        };
+        let id_full = tiberius::Row::try_get::<&str, _>(row, "id_full")
+            .ok()
+            .flatten()
+            .map(|s| s.to_string());
+        let name = tiberius::Row::try_get::<&str, _>(row, "name")
+            .ok()
+            .flatten()
+            .map(|s| s.to_string());
+
+        if shadow_mode {
+            continue;
+        }
+
+        // Runtime `sqlx::query` (NOT the `query!` macro) so this adds nothing
+        // to the `.sqlx/` offline cache. Idempotent UPSERT keyed on the
+        // (level, legacy id) unique constraint.
+        let res = sqlx::query(
+            "INSERT INTO ht_cash_categories \
+                 (cat_level, cat_legacy_id, cat_id_full, cat_name) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (cat_level, cat_legacy_id) DO UPDATE SET \
+                 cat_id_full   = EXCLUDED.cat_id_full, \
+                 cat_name      = EXCLUDED.cat_name, \
+                 cat_synced_at = NOW()",
+        )
+        .bind(level)
+        .bind(legacy_id)
+        .bind(&id_full)
+        .bind(&name)
+        .execute(pg)
+        .await;
+
+        match res {
+            Ok(_) => upserted += 1,
+            Err(err) => {
+                tracing::warn!(
+                    event_name = "cash_category_sync_upsert_fail",
+                    site = %site_id,
+                    level,
+                    legacy_id,
+                    error = %err,
+                    "cash-category sync: UPSERT into ht_cash_categories failed; continuing"
+                );
+            }
+        }
+    }
+
+    if upserted > 0 {
+        tracing::debug!(
+            event_name = "cash_category_sync_ok",
+            site = %site_id,
+            upserted,
+            "cash-category sync: upserted canonical cash categories"
+        );
+    }
+}
+
+/// Read-only sync of the legacy petty-cash ledger (`TB_Pay_History`) into
+/// canonical `ht_cash_ledger`.
+///
+/// **Why**: coexistence (ADR 0002) means a receptionist may record a cash
+/// in/out entry in EITHER iHOTEL or our app. iHOTEL writes `TB_Pay_History`;
+/// our income/expense page reads canonical `ht_cash_ledger`. Without this poll,
+/// entries made in iHOTEL would be invisible to our app.
+///
+/// **Shape**: each tick we SELECT rows dated within the last
+/// [`CASH_WINDOW_DAYS`] (the `Pay_Date` OADate float compared against a
+/// pre-computed cutoff serial) plus any null-dated rows, and UPSERT each into
+/// `ht_cash_ledger` keyed on `cash_legacy_id` = `TB_Pay_History.id`. The
+/// `Pay_Date` / `Pay_Program` OADate floats are converted to UTC instants and
+/// the raw `Pay_Type` is preserved verbatim alongside the normalized
+/// `cash_kind`.
+///
+/// **Resilience**: identical to `sync_round_bills` — every error path logs at
+/// WARN and returns/continues; shadow mode skips the canonical write.
+async fn sync_cash_history(pg: &PgPool, mssql: &DbPool, shadow_mode: bool, site_id: &str) {
+    // Pre-compute the OADate cutoff serial for (today − CASH_WINDOW_DAYS) in
+    // Bangkok local time, so the legacy comparison stays a cheap float >=.
+    let epoch = match chrono::NaiveDate::from_ymd_opt(1899, 12, 30) {
+        Some(d) => d,
+        None => return,
+    };
+    let today_bkk = chrono::Utc::now()
+        .with_timezone(
+            &chrono::FixedOffset::east_opt(7 * 3600).expect("+07:00 is a valid offset"),
+        )
+        .date_naive();
+    let cutoff_date = today_bkk - chrono::Duration::days(CASH_WINDOW_DAYS);
+    let cutoff_serial = (cutoff_date - epoch).num_days();
+
+    // Note the explicit column list (the legacy table is positional but we read
+    // by name) and the recent-window filter. `Pay_Date IS NULL` rows are always
+    // included (cheap; never lose an undated entry).
+    let select_sql = format!(
+        "SELECT id, Pay_Date, Pay_Bill, Pay_Cust, Pay_Type, Pay_Total, \
+                Pay_Note, Pay_Program, Pay_Group, Pay_Account \
+           FROM TB_Pay_History \
+          WHERE Pay_Date >= {cutoff_serial} OR Pay_Date IS NULL"
+    );
+
+    let mut conn = match mssql.get().await {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::warn!(
+                event_name = "cash_history_sync_conn_fail",
+                site = %site_id,
+                error = %err,
+                "cash-history sync: could not acquire MSSQL connection; skipping"
+            );
+            return;
+        }
+    };
+    let rows =
+        match simple_query_with_timeout_pooled(&mut conn, &select_sql, MssqlOpKind::Read).await {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::warn!(
+                    event_name = "cash_history_sync_query_fail",
+                    site = %site_id,
+                    error = %err,
+                    "cash-history sync: SELECT failed; skipping"
+                );
+                return;
+            }
+        };
+    drop(conn); // release the pooled MSSQL connection before PG work
+
+    let mut upserted = 0usize;
+    for row in &rows {
+        let Some(legacy_id) = tiberius::Row::try_get::<i32, _>(row, "id").ok().flatten() else {
+            tracing::warn!(
+                event_name = "cash_history_sync_row_skip",
+                site = %site_id,
+                "cash-history sync: row missing id; skipping"
+            );
+            continue;
+        };
+
+        let entry_date = tiberius::Row::try_get::<f64, _>(row, "Pay_Date")
+            .ok()
+            .flatten()
+            .and_then(ole_serial_to_utc);
+        let program_date = tiberius::Row::try_get::<f64, _>(row, "Pay_Program")
+            .ok()
+            .flatten()
+            .and_then(ole_serial_to_utc);
+        let pay_type = tiberius::Row::try_get::<&str, _>(row, "Pay_Type")
+            .ok()
+            .flatten()
+            .map(|s| s.to_string());
+        let kind = cash_kind_from_pay_type(pay_type.as_deref().unwrap_or(""));
+        let amount_raw = tiberius::Row::try_get::<f64, _>(row, "Pay_Total")
+            .ok()
+            .flatten()
+            .unwrap_or(0.0);
+        // Coerce a non-finite legacy float to 0 so the ::numeric cast can't
+        // poison the batch (mirrors the ht_payment_ledger projection).
+        let amount = if amount_raw.is_finite() { amount_raw } else { 0.0 };
+        let bill_no = tiberius::Row::try_get::<&str, _>(row, "Pay_Bill")
+            .ok()
+            .flatten()
+            .map(|s| s.to_string());
+        let payee = tiberius::Row::try_get::<&str, _>(row, "Pay_Cust")
+            .ok()
+            .flatten()
+            .map(|s| s.to_string());
+        let note = tiberius::Row::try_get::<&str, _>(row, "Pay_Note")
+            .ok()
+            .flatten()
+            .map(|s| s.to_string());
+        let group = tiberius::Row::try_get::<&str, _>(row, "Pay_Group")
+            .ok()
+            .flatten()
+            .map(|s| s.to_string());
+        let account = tiberius::Row::try_get::<&str, _>(row, "Pay_Account")
+            .ok()
+            .flatten()
+            .map(|s| s.to_string());
+
+        if shadow_mode {
+            tracing::info!(
+                event_name = "cash_history_sync_shadow",
+                site = %site_id,
+                legacy_id,
+                kind,
+                "cash-history sync (shadow): would upsert canonical cash entry"
+            );
+            continue;
+        }
+
+        // Runtime `sqlx::query` (NOT the `query!` macro) so this adds nothing
+        // to the `.sqlx/` offline cache. `$6::numeric` mirrors the f64→NUMERIC
+        // convention used by sync_round_bills. Idempotent UPSERT keyed on
+        // cash_legacy_id; cash_source is forced to 'legacy' (this is the
+        // legacy mirror path).
+        let res = sqlx::query(
+            "INSERT INTO ht_cash_ledger ( \
+                 cash_legacy_id, cash_kind, cash_legacy_type, cash_entry_date, \
+                 cash_bill_no, cash_payee, cash_amount, cash_note, \
+                 cash_program_date, cash_group, cash_account, cash_source \
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7::numeric, $8, $9, $10, $11, 'legacy') \
+             ON CONFLICT (cash_legacy_id) DO UPDATE SET \
+                 cash_kind         = EXCLUDED.cash_kind, \
+                 cash_legacy_type  = EXCLUDED.cash_legacy_type, \
+                 cash_entry_date   = EXCLUDED.cash_entry_date, \
+                 cash_bill_no      = EXCLUDED.cash_bill_no, \
+                 cash_payee        = EXCLUDED.cash_payee, \
+                 cash_amount       = EXCLUDED.cash_amount, \
+                 cash_note         = EXCLUDED.cash_note, \
+                 cash_program_date = EXCLUDED.cash_program_date, \
+                 cash_group        = EXCLUDED.cash_group, \
+                 cash_account      = EXCLUDED.cash_account, \
+                 cash_source       = 'legacy', \
+                 cash_synced_at    = NOW()",
+        )
+        .bind(legacy_id)
+        .bind(kind)
+        .bind(&pay_type)
+        .bind(entry_date)
+        .bind(&bill_no)
+        .bind(&payee)
+        .bind(amount)
+        .bind(&note)
+        .bind(program_date)
+        .bind(&group)
+        .bind(&account)
+        .execute(pg)
+        .await;
+
+        match res {
+            Ok(_) => upserted += 1,
+            Err(err) => {
+                tracing::warn!(
+                    event_name = "cash_history_sync_upsert_fail",
+                    site = %site_id,
+                    legacy_id,
+                    error = %err,
+                    "cash-history sync: UPSERT into ht_cash_ledger failed; continuing"
+                );
+            }
+        }
+    }
+
+    if upserted > 0 {
+        tracing::debug!(
+            event_name = "cash_history_sync_ok",
+            site = %site_id,
+            upserted,
+            "cash-history sync: upserted canonical cash entries from TB_Pay_History"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cash_sync_tests {
+    use super::{cash_kind_from_pay_type, ole_serial_to_utc};
+    use chrono::{TimeZone, Utc};
+
+    #[test]
+    fn ole_serial_round_trips_a_known_date() {
+        // 46136 = 2026-04-24 (matches writeback::format::date_to_ole_serial's
+        // spike-verified value). Integer serial = midnight Bangkok = 17:00 UTC
+        // the previous day.
+        let dt = ole_serial_to_utc(46136.0).expect("valid serial");
+        assert_eq!(dt, Utc.with_ymd_and_hms(2026, 4, 23, 17, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn ole_serial_decodes_the_time_fraction() {
+        // 0.5 of a day = 12:00 Bangkok = 05:00 UTC.
+        let dt = ole_serial_to_utc(46136.5).expect("valid serial");
+        assert_eq!(dt, Utc.with_ymd_and_hms(2026, 4, 24, 5, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn ole_serial_rejects_garbage_and_zero() {
+        assert!(ole_serial_to_utc(0.0).is_none(), "zero = no date");
+        assert!(ole_serial_to_utc(-5.0).is_none(), "negative");
+        assert!(ole_serial_to_utc(f64::NAN).is_none(), "NaN");
+        assert!(ole_serial_to_utc(f64::INFINITY).is_none(), "Inf");
+        assert!(ole_serial_to_utc(9_000_000.0).is_none(), "absurd future");
+    }
+
+    #[test]
+    fn pay_type_classifies_income_expense_unknown() {
+        assert_eq!(cash_kind_from_pay_type("รายรับ"), "income");
+        assert_eq!(cash_kind_from_pay_type("รับเงิน"), "income");
+        assert_eq!(cash_kind_from_pay_type("รายจ่าย"), "expense");
+        assert_eq!(cash_kind_from_pay_type("จ่ายค่าน้ำ"), "expense");
+        assert_eq!(cash_kind_from_pay_type(""), "unknown");
+        assert_eq!(cash_kind_from_pay_type("misc"), "unknown");
     }
 }
 

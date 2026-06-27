@@ -1,0 +1,196 @@
+//! `CreateCashEntry` recipe — petty-cash income/expense writeback to legacy
+//! `TB_Pay_History` (migration 059).
+//!
+//! ## STATUS: PURE, BUT DELIBERATELY UNWIRED (TODO)
+//!
+//! This module captures the *known* shape of iHOTEL's `TB_Pay_History` INSERT
+//! so a future dev has a head start, but it is **not** referenced by any
+//! `WritebackIntent` / dispatcher arm / service emission. The
+//! `POST /api/cash/{income,expense}` handlers write canonical PG only (see
+//! `routes/new_cash.rs`). Inbound mirroring (iHOTEL → us) is live via
+//! `bin/sync.rs::sync_cash_history`; only the outbound half waits.
+//!
+//! **Why unwired:** coexistence writebacks fire a REAL write to the shared
+//! legacy DB the moment the feature is used, so they must be byte-exact. What
+//! we can verify from `docs/legacy-app/` is the column ORDER, types, the
+//! positional (no-column-list) INSERT form, the OADate `float` date encoding,
+//! and the app-side `get_id` (MAX+1) id allocation
+//! (`SCHEMA.sql:777`, `COMPAT_CHEATSHEET.md` §1051 / line 84-86 / line 1506).
+//! What we CANNOT yet verify (the off-repo `FrmAddPay.cs` decompile is needed —
+//! `docs/legacy-app/EVERGREEN_ARTIFACTS.md`):
+//!
+//!   * the exact `Pay_Type` strings iHOTEL writes for income vs expense
+//!     (this recipe takes them as an explicit payload field rather than
+//!     guessing);
+//!   * the semantics of `Pay_Program` (a SECOND `float` OADate — posting date?
+//!     `0`? a copy of `Pay_Date`?) — defaulted here to the entry date;
+//!   * which tree level (`MyType2` / `2_2` / `3`) maps to `Pay_Group` vs
+//!     `Pay_Account`.
+//!
+//! Before wiring: confirm the three points above against `FrmAddPay.cs:638`,
+//! add a `WritebackIntent::CreateCashEntry` + dispatcher arm + the MAX+1
+//! `allocate::*` id step + outbox emission in `create_entry`, and re-validate
+//! the emitted SQL against a live capture.
+//!
+//! ## Legacy reference (positional INSERT, `FrmAddPay.cs:638`)
+//!
+//! ```text
+//! -- id allocated app-side via get_id (MAX+1); Pay_Date / Pay_Program are
+//! -- DateTime.ToOADate() floats (days since 1899-12-30).
+//! INSERT INTO TB_Pay_History
+//!   VALUES (<id>, <Pay_Date OADate>, '<Pay_Bill>', '<Pay_Cust>', '<Pay_Type>',
+//!           <Pay_Total>, '<Pay_Note>', <Pay_Program OADate>, '<Pay_Group>',
+//!           '<Pay_Account>')
+//! ```
+//!
+//! ## Timezone
+//!
+//! `entry_date` / `program_date` are real UTC instants in canonical PG; the
+//! legacy OADate encodes a tz-naive Thai-local date, so we take the **Bangkok
+//! calendar day** ([`bangkok_date`]) before serializing — same convention as
+//! every other recipe.
+
+use chrono::{DateTime, Utc};
+
+use crate::writeback::error::WritebackResult;
+use crate::writeback::format::{
+    bangkok_date, date_to_ole_serial, money_2dp, sql_quote, sql_quote_or_empty,
+};
+use crate::writeback::recipes::helpers::validate_finite;
+
+/// Everything needed to mirror one cash-ledger entry into `TB_Pay_History`.
+/// Mirrors the canonical `ht_cash_ledger` row (migration 059). `legacy_pay_type`
+/// is the RAW `Pay_Type` string to write — supplied explicitly because the
+/// income/expense markers are not yet verified (see the module TODO).
+#[derive(Debug, Clone)]
+pub struct CashEntryPayload {
+    /// Which site this entry belongs to ("hfhotel" | "hfville").
+    pub site_id: String,
+    /// `Pay_Date` — the entry date (rendered as a Bangkok-calendar OADate).
+    pub entry_date: DateTime<Utc>,
+    /// `Pay_Program` — a second legacy OADate of uncertain semantics; when
+    /// `None` we default it to the entry date (documented guess — verify).
+    pub program_date: Option<DateTime<Utc>>,
+    /// `Pay_Total` — amount in baht (must be finite; sign per iHOTEL convention).
+    pub amount: f64,
+    /// `Pay_Type` — raw legacy income/expense marker (verbatim).
+    pub legacy_pay_type: String,
+    /// `Pay_Bill`.
+    pub bill_no: Option<String>,
+    /// `Pay_Cust`.
+    pub payee: Option<String>,
+    /// `Pay_Note`.
+    pub note: Option<String>,
+    /// `Pay_Group` — account-tree id_full.
+    pub group: Option<String>,
+    /// `Pay_Account` — account-tree id_full.
+    pub account: Option<String>,
+}
+
+/// Build the single positional `INSERT INTO TB_Pay_History` statement. PURE.
+///
+/// `legacy_id` is the `get_id`-style MAX+1 id; a real caller would allocate it
+/// under the `allocate::*` TABLOCKX lock and pass it in here (the same pattern
+/// the other MAX+1 recipes use). The 10 VALUES are emitted in the exact legacy
+/// column order: `id, Pay_Date, Pay_Bill, Pay_Cust, Pay_Type, Pay_Total,
+/// Pay_Note, Pay_Program, Pay_Group, Pay_Account`.
+pub fn build_statements(payload: &CashEntryPayload, legacy_id: i32) -> WritebackResult<Vec<String>> {
+    validate_finite(&[("amount", payload.amount)])?;
+
+    let pay_date = date_to_ole_serial(bangkok_date(payload.entry_date));
+    // Pay_Program semantics unverified — default to the entry date's OADate.
+    let pay_program = payload
+        .program_date
+        .map(|d| date_to_ole_serial(bangkok_date(d)))
+        .unwrap_or(pay_date);
+    let total = money_2dp(payload.amount)?;
+
+    let stmt = format!(
+        "INSERT INTO TB_Pay_History VALUES ({id}, {pay_date}, {bill}, {cust}, {ptype}, \
+         {total}, {note}, {program}, {group}, {account})",
+        id = legacy_id,
+        pay_date = pay_date,
+        bill = sql_quote_or_empty(payload.bill_no.as_deref()),
+        cust = sql_quote_or_empty(payload.payee.as_deref()),
+        ptype = sql_quote(&payload.legacy_pay_type),
+        total = total,
+        note = sql_quote_or_empty(payload.note.as_deref()),
+        program = pay_program,
+        group = sql_quote_or_empty(payload.group.as_deref()),
+        account = sql_quote_or_empty(payload.account.as_deref()),
+    );
+    Ok(vec![stmt])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn payload() -> CashEntryPayload {
+        CashEntryPayload {
+            site_id: "hfhotel".into(),
+            // 07:00 UTC == 14:00 Bangkok on 4/24 → Bangkok calendar day 4/24
+            // → OADate 46136 (matches format::date_to_ole_serial spike value).
+            entry_date: Utc.with_ymd_and_hms(2026, 4, 24, 7, 0, 0).unwrap(),
+            program_date: None,
+            amount: 1500.0,
+            legacy_pay_type: "รายจ่าย".into(),
+            bill_no: Some("B-001".into()),
+            payee: Some("ค่าน้ำ".into()),
+            note: Some("note".into()),
+            group: Some("G1".into()),
+            account: Some("A1".into()),
+        }
+    }
+
+    #[test]
+    fn build_matches_positional_shape() {
+        let stmts = build_statements(&payload(), 42).unwrap();
+        assert_eq!(stmts.len(), 1);
+        let s = &stmts[0];
+        // Positional INSERT (no column list) — exactly as FrmAddPay emits.
+        assert!(s.starts_with("INSERT INTO TB_Pay_History VALUES ("), "{s}");
+        assert!(s.contains("(42, 46136,"), "explicit id + Pay_Date OADate: {s}");
+        assert!(s.contains("'รายจ่าย'"), "raw Pay_Type verbatim: {s}");
+        assert!(s.contains("1500.00"), "Pay_Total 2dp: {s}");
+        assert!(s.contains("'B-001'") && s.contains("'ค่าน้ำ'"), "bill + cust: {s}");
+        assert!(s.contains("'G1'") && s.contains("'A1'"), "group + account: {s}");
+    }
+
+    #[test]
+    fn program_date_defaults_to_entry_date_oadate() {
+        // No program_date → Pay_Program OADate equals Pay_Date OADate (46136),
+        // so the serial appears twice in the VALUES list.
+        let s = &build_statements(&payload(), 1).unwrap()[0];
+        assert_eq!(s.matches("46136").count(), 2, "Pay_Date + Pay_Program both 46136: {s}");
+    }
+
+    #[test]
+    fn null_optionals_render_as_empty_string() {
+        let mut p = payload();
+        p.bill_no = None;
+        p.payee = None;
+        p.note = None;
+        p.group = None;
+        p.account = None;
+        let s = &build_statements(&p, 7).unwrap()[0];
+        // sql_quote_or_empty(None) → '' (spike §3k convention).
+        assert!(s.contains("''"), "None optionals become '': {s}");
+    }
+
+    #[test]
+    fn apostrophes_are_escaped() {
+        let mut p = payload();
+        p.payee = Some("O'Brien".into());
+        let s = &build_statements(&p, 9).unwrap()[0];
+        assert!(s.contains("'O''Brien'"), "apostrophe doubled: {s}");
+    }
+
+    #[test]
+    fn non_finite_amount_is_rejected() {
+        let mut p = payload();
+        p.amount = f64::NAN;
+        assert!(build_statements(&p, 1).is_err());
+    }
+}
