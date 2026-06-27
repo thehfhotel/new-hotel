@@ -2332,6 +2332,28 @@ INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('065', '065_create_ht_pos_receipts.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
+-- Migration 066: Task #58 — in-app reception verification form. Online
+-- equivalent of docs/coexistence/reception-verification-TH.html; answers land in
+-- the vr_answers JSONB column keyed by question id. PG-CANONICAL ONLY (no legacy
+-- counterpart, no sync, no writeback). Per-site (connection-level scoping).
+-- See migrations/pg/066_create_ht_verification_responses.sql.
+CREATE TABLE IF NOT EXISTS ht_verification_responses (
+    vr_id           BIGSERIAL    PRIMARY KEY,
+    vr_submitted_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    vr_site         TEXT,
+    vr_inspector    TEXT,
+    vr_answers      JSONB        NOT NULL,
+    vr_overall      TEXT,
+    created_at      TIMESTAMPTZ  DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS ix_ht_verification_responses_submitted_at
+    ON ht_verification_responses (vr_submitted_at DESC);
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('066', '066_create_ht_verification_responses.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
 -- =============================================================================
 -- Initialization complete
 -- =============================================================================

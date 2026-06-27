@@ -674,6 +674,16 @@ fn build_new_routes(app_state: AppState) -> Router {
             get(routes::new_notes::list_notes).post(routes::new_notes::create_note),
         )
         .route("/api/notes/{id}/read", post(routes::new_notes::mark_read))
+        // In-app reception verification form (คู่มือตรวจสอบระบบใหม่) — task #58 /
+        // migration 066. Online equivalent of
+        // docs/coexistence/reception-verification-TH.html. Branch-aware submit +
+        // recent-list for IT review. PG-CANONICAL ONLY (no legacy counterpart, no
+        // sync, no writeback); answers stored in the vr_answers JSONB column.
+        .route(
+            "/api/verification",
+            get(routes::new_verification::list_verifications)
+                .post(routes::new_verification::create_verification),
+        )
         // Inventory Management
         .route("/api/inventory/items", get(routes::new_inventory::list_items).post(routes::new_inventory::create_item))
         .route("/api/inventory/items/{id}", get(routes::new_inventory::get_item).put(routes::new_inventory::update_item).delete(routes::new_inventory::delete_item))

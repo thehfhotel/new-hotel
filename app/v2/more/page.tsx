@@ -20,6 +20,7 @@ import {
   RefreshCw,
   ScrollText,
   StickyNote,
+  ClipboardCheck,
   ArrowLeft,
   LogOut,
   ExternalLink,
@@ -51,6 +52,7 @@ const SECTIONS: HubSection[] = [
       { href: '/maintenance', label: 'แจ้งซ่อม', desc: 'งานซ่อมบำรุงและอุปกรณ์', icon: Wrench },
       { href: '/inventory', label: 'คลังสินค้า', desc: 'สต๊อกและการเบิกจ่าย', icon: Package },
       { href: '/card-reader', label: 'อ่านบัตรประชาชน', desc: 'ดึงข้อมูลจากบัตรไทย', icon: CreditCard },
+      { href: '/v2/verification', label: 'ตรวจสอบระบบใหม่', desc: 'เทียบระบบใหม่กับ iHOTEL แล้วส่งให้ทีมไอที', icon: ClipboardCheck },
     ],
   },
   {

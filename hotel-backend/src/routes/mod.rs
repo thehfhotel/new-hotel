@@ -103,5 +103,6 @@ pub mod new_rooms;
 pub mod new_rosters;
 pub mod new_shifts;
 pub mod new_sync;
+pub mod new_verification;
 pub mod rr4_export;
 pub mod stats;
