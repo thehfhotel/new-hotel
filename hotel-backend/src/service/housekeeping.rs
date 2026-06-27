@@ -42,6 +42,20 @@ pub struct MarkDirtyCommand {
     pub source: EventSource,
 }
 
+/// Command for [`HousekeepingService::set_maintenance`].
+#[derive(Debug, Clone)]
+pub struct MarkMaintenanceCommand {
+    pub room_id: i32,
+    /// `true` ⇒ take the room out of service (legacy `Room_Manternace='yes'`);
+    /// `false` ⇒ return it to service.
+    pub maintenance: bool,
+    /// Carried for symmetry with the clean/dirty commands and forward-compat
+    /// (a maintenance `DomainEvent` may be added later). Not currently
+    /// published — `update_room` likewise enqueues the maintenance writeback
+    /// without a domain event.
+    pub source: EventSource,
+}
+
 /// Outcome of a housekeeping mutation.
 #[derive(Debug, Clone)]
 pub struct HousekeepingOutcome {
@@ -180,6 +194,53 @@ impl HousekeepingService {
             aggregate_id,
         })
     }
+
+    /// Toggle a room's maintenance (out-of-service) flag — flip
+    /// `ht_rooms_new.room_maintenance` (and the canonical `room_status`
+    /// projection so the two never disagree) and enqueue the
+    /// [`WritebackIntent::SetRoomMaintenance`] mirror (cheatsheet §3.15/§3.16),
+    /// all in one transaction.
+    ///
+    /// Mirrors the maintenance block in `routes::new_rooms::update_room`, but
+    /// exposed as a standalone toggle the room grid can call without re-PUTting
+    /// the whole room record (which would risk blanking the room type / prices).
+    /// Before this method, the front-desk "out of service" toggle hit
+    /// `PATCH /api/rooms/:id/status` (canonical `room_status` only, no
+    /// writeback) so iHOTEL never saw the flag and kept renting the room.
+    pub async fn set_maintenance(
+        &self,
+        cmd: MarkMaintenanceCommand,
+    ) -> ServiceResult<HousekeepingOutcome> {
+        let mut tx = self.pg.begin().await?;
+
+        set_room_maintenance_flag(&mut tx, cmd.room_id, cmd.maintenance).await?;
+
+        let aggregate_id = aggregate_uuid(AggregateKind::Room, cmd.room_id);
+        let intent = WritebackIntent::SetRoomMaintenance {
+            room_id: aggregate_id,
+            maintenance: cmd.maintenance,
+        };
+        // Per-event discriminator key: a room legitimately goes in and out of
+        // maintenance over its lifetime and `writeback_jobs.idempotency_key` is
+        // permanently UNIQUE — same rationale as `mark_dirty` above. The
+        // enqueue commits atomically with the flag flip in this TX.
+        let key = generate_idempotency_key(&intent, Uuid::new_v4());
+        OutboxRepository::enqueue(&mut tx, &intent, key)
+            .await
+            .map_err(|err| ServiceError::outbox(err.to_string()))?;
+
+        // No `DomainEvent` for maintenance (none exists; `update_room` likewise
+        // emits the writeback without one). `source` is carried for forward
+        // compat; touch the held handles for symmetry with the other methods.
+        let _ = (&self.repo, &self.outbox, &self.events, &cmd.source);
+
+        tx.commit().await?;
+
+        Ok(HousekeepingOutcome {
+            room_id: cmd.room_id,
+            aggregate_id,
+        })
+    }
 }
 
 /// Set `ht_rooms_new.room_clean` directly via dynamic SQL.
@@ -198,6 +259,41 @@ async fn set_room_clean_flag(
         .bind(room_id)
         .execute(&mut **tx)
         .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(ServiceError::not_found(format!(
+            "room {room_id} does not exist"
+        )));
+    }
+    Ok(())
+}
+
+/// Flip `ht_rooms_new.room_maintenance` and keep the canonical `room_status`
+/// projection consistent with it via dynamic SQL.
+///
+/// Both columns are written so the live room-status derivation
+/// (`routes::new_rooms::list_rooms_live`, which treats either
+/// `room_maintenance=true` OR `room_status='maintenance'` as out-of-service)
+/// can never read a stale `room_status='maintenance'` left behind by the older
+/// `PATCH /status` toggle once the flag is cleared. When returning to service
+/// the stored status is reset to `available`; the live derivation re-overlays
+/// occupancy / booking / checkout, so this is a safe neutral value.
+async fn set_room_maintenance_flag(
+    tx: &mut Transaction<'_, Postgres>,
+    room_id: i32,
+    maintenance: bool,
+) -> ServiceResult<()> {
+    let result = sqlx::query(
+        "UPDATE ht_rooms_new \
+            SET room_maintenance = $1, \
+                room_status = CASE WHEN $1 THEN 'maintenance' ELSE 'available' END, \
+                updated_at = NOW() \
+          WHERE room_id = $2",
+    )
+    .bind(maintenance)
+    .bind(room_id)
+    .execute(&mut **tx)
+    .await?;
 
     if result.rows_affected() == 0 {
         return Err(ServiceError::not_found(format!(

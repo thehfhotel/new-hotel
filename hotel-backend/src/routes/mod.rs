@@ -8,6 +8,7 @@ pub mod checkins;
 pub mod customers;
 pub mod events;
 pub mod health;
+pub mod housekeeping;
 pub mod legacy_mirror;
 pub mod mode;
 pub mod new_bookings;

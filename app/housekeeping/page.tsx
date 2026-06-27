@@ -139,21 +139,45 @@ export default function HousekeepingPage() {
     return () => clearInterval(interval)
   }, [fetchRooms])
 
-  // Handle room status change
+  // Handle room status change.
+  //
+  // 'dirty' / 'available' go through the housekeeping endpoints, which flip the
+  // canonical `room_clean` flag AND mirror to legacy HT_Rooms.Room_Clean +
+  // HT_Housewife. The old code PATCHed `/api/rooms/:id/status` with
+  // 'available' for BOTH (the "dirty maps to available" hack) — a no-op that
+  // never changed cleanliness and never reached iHOTEL.
+  //
+  // 'cleaning' is a transient in-progress state with no legacy counterpart
+  // (iHOTEL's Room_Clean is a boolean) and no persistent backing (/api/rooms
+  // derives status live and never returns 'cleaning'), so it stays a plain
+  // canonical room_status change — the dirty writeback already fired when the
+  // room entered the dirty state.
   const handleStatusChange = async (
     roomId: number,
     newStatus: HousekeepingStatus,
     notes?: string
   ) => {
     try {
-      // Map housekeeping status to API status
-      const apiStatus = newStatus === 'dirty' ? 'available' : newStatus // 'dirty' maps to available with isClean=false
-
-      const response = await branchFetch(`/api/rooms/${roomId}/status`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status: apiStatus }),
-      })
+      let response: Response
+      if (newStatus === 'dirty') {
+        response = await branchFetch(`/api/housekeeping/rooms/${roomId}/dirty`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ by: 'แม่บ้าน' }),
+        })
+      } else if (newStatus === 'available') {
+        response = await branchFetch(`/api/housekeeping/rooms/${roomId}/clean`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ by: 'แม่บ้าน' }),
+        })
+      } else {
+        response = await branchFetch(`/api/rooms/${roomId}/status`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: 'cleaning' }),
+        })
+      }
 
       if (!response.ok) {
         throw new Error('ไม่สามารถอัพเดทสถานะได้')

@@ -67,6 +67,7 @@ pub use customer::{
 pub use error::{ServiceError, ServiceResult};
 pub use housekeeping::{
     HousekeepingOutcome, HousekeepingService, MarkCleanCommand, MarkDirtyCommand,
+    MarkMaintenanceCommand,
 };
 pub use ids::{aggregate_uuid, AggregateKind};
 pub use payment::{

@@ -140,19 +140,20 @@ export default function V2Rooms() {
       setModal(a as ModalKind)
       return // keep `selected`; sheet is replaced by the modal overlay
     }
-    // Housekeeping / maintenance — mirror the classic housekeeping handler exactly.
+    // Maintenance toggle only (clean/dirty is managed on /housekeeping, not in
+    // the room grid — matches iHOTEL). Routes through the housekeeping
+    // maintenance endpoint, which flips canonical `room_maintenance` AND mirrors
+    // to legacy HT_Rooms.Room_Manternace so iHOTEL stops renting an out-of-
+    // service room. The old PATCH /status path set only the canonical
+    // room_status string and never reached iHOTEL — a coexistence hazard.
+    // `a` is 'maintenance' or 'ready' here (modal actions returned above).
     setBusy(true)
     try {
-      // Maintenance toggle only — clean/dirty is managed on /housekeeping, not
-      // in the room grid (matches iHOTEL; the old 'clean'/'dirty' actions wrote
-      // the stale room_status and were no-ops/broken).
-      let status = 'available'
-      if (a === 'maintenance') status = 'maintenance'
-      else if (a === 'ready') status = 'available'
-      await branchFetch(`/api/rooms/${selected.id}/status`, {
-        method: 'PATCH',
+      const maintenance = a === 'maintenance'
+      await branchFetch(`/api/housekeeping/rooms/${selected.id}/maintenance`, {
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status }),
+        body: JSON.stringify({ maintenance }),
       })
       await fetchRooms()
       setSelected(null)

@@ -454,6 +454,25 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route("/api/rooms", get(routes::new_rooms::list_rooms).post(routes::new_rooms::create_room))
         .route("/api/rooms/{id}", get(routes::new_rooms::get_room).put(routes::new_rooms::update_room))
         .route("/api/rooms/{id}/status", patch(routes::new_rooms::update_room_status))
+        // Housekeeping — clean / dirty / maintenance toggles. Route the
+        // previously-unwired HousekeepingService so "mark clean" / "mark dirty"
+        // actually flip canonical `room_clean` AND mirror to legacy HT_Rooms +
+        // HT_Housewife (was a no-op via PATCH /status), and the out-of-service
+        // toggle mirrors to HT_Rooms.Room_Manternace so iHOTEL stops renting
+        // the room. Branch-aware via `?branch=`; HF Ville stays gated by the
+        // ville_write_guard layer below until HFVILLE_WRITES_ENABLED is on.
+        .route(
+            "/api/housekeeping/rooms/{id}/clean",
+            post(routes::housekeeping::mark_clean),
+        )
+        .route(
+            "/api/housekeeping/rooms/{id}/dirty",
+            post(routes::housekeeping::mark_dirty),
+        )
+        .route(
+            "/api/housekeeping/rooms/{id}/maintenance",
+            post(routes::housekeeping::set_maintenance),
+        )
         // Bookings CRUD (canonical)
         .route("/api/bookings", get(routes::new_bookings::list_bookings).post(routes::new_bookings::create_booking))
         // Spike Phase 3: read-only server-side booking date + availability check
