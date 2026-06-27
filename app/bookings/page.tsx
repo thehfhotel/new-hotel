@@ -257,7 +257,9 @@ export default function NewBookingsPage() {
   }
 
   // Handle save booking
-  const handleSaveBooking = async (data: BookingFormState) => {
+  const handleSaveBooking = async (
+    data: BookingFormState
+  ): Promise<{ id: number; bookNo: string }> => {
     const endpoint = data.id
       ? `/api/bookings/${data.id}`
       : '/api/bookings'
@@ -278,6 +280,11 @@ export default function NewBookingsPage() {
         depositAmount: data.depositAmount,
         notes: data.notes,
         rooms: data.rooms,
+        products: (data.products ?? []).map((p) => ({
+          productId: p.productId,
+          qty: p.qty,
+          unitPrice: p.unitPrice,
+        })),
       }),
     })
 
@@ -287,8 +294,10 @@ export default function NewBookingsPage() {
       throw new Error(result.message || 'Failed to save booking')
     }
 
-    // Refresh the list
+    // Refresh the list (behind the confirmation slip the form now shows)
     fetchBookings()
+
+    return { id: result.id, bookNo: result.book_no }
   }
 
   // Handle cancel booking

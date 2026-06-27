@@ -13,12 +13,29 @@ import {
   Save,
   Trash2,
   Moon,
+  ShoppingCart,
+  Plus,
+  CheckCircle2,
 } from 'lucide-react'
 import CustomerPicker, { CustomerOption } from '@/components/pickers/CustomerPicker'
 import CustomerForm, { CustomerFormData } from '@/components/forms/CustomerForm'
 import RoomPicker, { RoomOption } from '@/components/pickers/RoomPicker'
+import BookingConfirmationSlip from '@/components/documents/BookingConfirmationSlip'
+import PrintButton from '@/components/ui/PrintButton'
+import { hotelInfoForBranch } from '@/lib/hotel-info'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { useBranch } from '@/contexts/BranchContext'
+
+/** A pre-ordered product line attached to a booking (task #52 — the canonical
+ *  analog of iHOTEL's FrmAddBook2 / `HT_Book_Pro`). `name`/`unitPrice` are
+ *  carried so the confirmation slip can render without a second lookup. */
+export interface BookingProductLine {
+  productId: number
+  name: string
+  qty: number
+  /** Baht/unit. `null` ⇒ default from the product's catalog price. */
+  unitPrice: number | null
+}
 
 export interface BookingFormState {
   id?: number
@@ -34,15 +51,32 @@ export interface BookingFormState {
   depositAmount: number | null
   notes: string | null
   rooms: { roomId: number; pricePerNight: number | null }[]
+  /** Pre-ordered products. Optional — absent on legacy callers / waitlist. */
+  products?: BookingProductLine[]
+}
+
+/** Product as surfaced by `GET /api/products` (camelCase, see new_products.rs). */
+interface ProductLite {
+  id: number
+  legacyNo: string
+  name: string
+  unit: string | null
+  price: number
+  currentStock: number
+  active: boolean
 }
 
 interface BookingFormProps {
   isOpen: boolean
   onClose: () => void
-  onSave: (data: BookingFormState) => Promise<void>
+  /** On create, returns the new booking's id + bookNo so the form can render
+   *  the confirmation slip. Edit/cancel callers may resolve to void. */
+  onSave: (data: BookingFormState) => Promise<{ id: number; bookNo: string } | void>
   onCancel?: (id: number) => Promise<void>
   initialData?: BookingFormState | null
   mode: 'create' | 'edit'
+  /** Optional create-mode prefill (e.g. reserve-from-cell on the room board). */
+  prefill?: { room?: RoomOption; checkIn?: string; checkOut?: string }
 }
 
 const sourceOptions = [
@@ -104,6 +138,7 @@ const emptyFormData: BookingFormState = {
   depositAmount: null,
   notes: null,
   rooms: [],
+  products: [],
 }
 
 export default function BookingForm({
@@ -113,6 +148,7 @@ export default function BookingForm({
   onCancel,
   initialData,
   mode,
+  prefill,
 }: BookingFormProps) {
   const branchFetch = useBranchFetch()
   // Spike Phase 3 (ship-dark): when BOOKING_VALIDATION_ENABLED is on the form
@@ -128,7 +164,18 @@ export default function BookingForm({
   const [showCancelConfirm, setShowCancelConfirm] = useState(false)
   const [showCustomerForm, setShowCustomerForm] = useState(false)
 
-  // Set default dates for new booking
+  // Pre-order product picker state (task #52).
+  const [productCatalog, setProductCatalog] = useState<ProductLite[]>([])
+  const [selectedProductId, setSelectedProductId] = useState<number | null>(null)
+  const [productQty, setProductQty] = useState<string>('1')
+
+  // After a successful CREATE: switch to the confirmation-slip print panel
+  // instead of auto-closing (parity with QuickCheckInModal's success flow).
+  const [created, setCreated] = useState<{ id: number; bookNo: string } | null>(null)
+
+  const productLines = formData.products ?? []
+
+  // Set default dates for new booking (prefill-aware).
   useEffect(() => {
     if (isOpen && mode === 'create' && !initialData) {
       const today = new Date()
@@ -136,17 +183,39 @@ export default function BookingForm({
       tomorrow.setDate(tomorrow.getDate() + 1)
       setFormData({
         ...emptyFormData,
-        checkIn: formatDateForApi(today),
-        checkOut: formatDateForApi(tomorrow),
+        checkIn: prefill?.checkIn ?? formatDateForApi(today),
+        checkOut: prefill?.checkOut ?? formatDateForApi(tomorrow),
       })
+      // TODO(reserve-from-cell): when launched from the room board, `prefill.room`
+      // should preselect that room in the RoomPicker (and seed selectedRooms).
+      // The board diverged on master; the coordinator is wiring reserve-from-cell
+      // separately, so we accept the prop here but do not yet consume prefill.room.
     }
-  }, [isOpen, mode, initialData])
+  }, [isOpen, mode, initialData, prefill])
+
+  // Load the active product catalog for the pre-order picker (task #52).
+  useEffect(() => {
+    if (!isOpen) return
+    let cancelled = false
+    branchFetch('/api/products?active_only=true&limit=200')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((body) => {
+        if (cancelled || !body) return
+        setProductCatalog((body.data ?? []) as ProductLite[])
+      })
+      .catch(() => {
+        /* picker is optional — a load failure just yields an empty list */
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [isOpen, branchFetch])
 
   // Reset form when modal opens/closes or initialData changes
   useEffect(() => {
     if (isOpen) {
       if (initialData) {
-        setFormData(initialData)
+        setFormData({ ...initialData, products: initialData.products ?? [] })
         // Reconstruct customer from initialData
         if (initialData.customerId) {
           // The customer will need to be fetched or passed in
@@ -167,6 +236,9 @@ export default function BookingForm({
       }
       setError(null)
       setShowCancelConfirm(false)
+      setCreated(null)
+      setSelectedProductId(null)
+      setProductQty('1')
     }
   }, [isOpen, initialData])
 
@@ -205,6 +277,41 @@ export default function BookingForm({
     }))
   }
 
+  const handleAddProduct = () => {
+    if (!selectedProductId) return
+    const product = productCatalog.find((p) => p.id === selectedProductId)
+    if (!product) return
+    const qtyNum = Number(productQty)
+    if (!Number.isFinite(qtyNum) || qtyNum <= 0) return
+
+    setFormData((prev) => {
+      const lines = prev.products ?? []
+      const idx = lines.findIndex((l) => l.productId === product.id)
+      const next =
+        idx >= 0
+          ? lines.map((l, i) => (i === idx ? { ...l, qty: l.qty + qtyNum } : l))
+          : [
+              ...lines,
+              {
+                productId: product.id,
+                name: product.name,
+                qty: qtyNum,
+                unitPrice: product.price,
+              },
+            ]
+      return { ...prev, products: next }
+    })
+    setSelectedProductId(null)
+    setProductQty('1')
+  }
+
+  const handleRemoveProduct = (productId: number) => {
+    setFormData((prev) => ({
+      ...prev,
+      products: (prev.products ?? []).filter((l) => l.productId !== productId),
+    }))
+  }
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     setError(null)
@@ -230,19 +337,19 @@ export default function BookingForm({
       return
     }
 
-    if (formData.rooms.length === 0) {
-      setError('กรุณาเลือกห้องพักอย่างน้อย 1 ห้อง')
-      return
-    }
+    // Rooms are OPTIONAL (task #52): a zero-room booking is a valid
+    // waitlist / unassigned reservation; a room is assigned later via edit.
 
     // Spike Phase 3 (ship-dark): server-side date + availability validation.
-    // Only runs when BOOKING_VALIDATION_ENABLED is on AND we're creating a new
-    // booking — edits of existing/past stays are left to the unchanged flow so
-    // the new "not in the past" rule never wrongly blocks them. When the flag is
-    // off this entire block is skipped → behavior is byte-for-byte unchanged.
-    // The check FAILS OPEN: if the call errors we fall through to the normal
-    // save rather than block a booking the current flow would accept.
-    if (bookingValidationEnabled && mode === 'create') {
+    // Only runs when BOOKING_VALIDATION_ENABLED is on, we're creating a new
+    // booking, AND at least one room is selected (a waitlist booking has no
+    // room to validate availability against) — edits of existing/past stays are
+    // left to the unchanged flow so the new "not in the past" rule never wrongly
+    // blocks them. When the flag is off this entire block is skipped → behavior
+    // is byte-for-byte unchanged. The check FAILS OPEN: if the call errors we
+    // fall through to the normal save rather than block a booking the current
+    // flow would accept.
+    if (bookingValidationEnabled && mode === 'create' && formData.rooms.length > 0) {
       try {
         const results = await Promise.all(
           formData.rooms.map((r) =>
@@ -276,8 +383,14 @@ export default function BookingForm({
 
     setSaving(true)
     try {
-      await onSave(formData)
-      onClose()
+      const result = await onSave(formData)
+      // On create, switch to the confirmation-slip print panel (don't auto-close).
+      // Edits — and create callers that don't return ids — close as before.
+      if (mode === 'create' && result && 'bookNo' in result) {
+        setCreated({ id: result.id, bookNo: result.bookNo })
+      } else {
+        onClose()
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'เกิดข้อผิดพลาดในการบันทึก')
     } finally {
@@ -384,7 +497,62 @@ export default function BookingForm({
             </button>
           </div>
 
-          {/* Form */}
+          {/* Success → booking-confirmation print panel */}
+          {created ? (
+            <div className="p-4 space-y-4">
+              <div className="flex items-start gap-2 p-3 bg-emerald-50 border border-emerald-200 rounded-lg text-sm text-emerald-800">
+                <CheckCircle2 className="w-5 h-5 shrink-0 mt-0.5" />
+                <div>
+                  <p className="font-medium">สร้างการจองสำเร็จ</p>
+                  <p className="text-xs mt-0.5">เลขที่จอง: {created.bookNo}</p>
+                </div>
+              </div>
+
+              <p className="text-sm text-gray-600">
+                พิมพ์ใบยืนยันการจองให้ลูกค้า หรือกด &quot;เสร็จสิ้น&quot; เพื่อปิด
+              </p>
+
+              <BookingConfirmationSlip
+                hotelInfo={hotelInfoForBranch(branch)}
+                data={{
+                  bookingNo: created.bookNo,
+                  guestName: selectedCustomer
+                    ? `${selectedCustomer.firstName || ''} ${selectedCustomer.lastName || ''}`.trim()
+                    : formData.customerName || '',
+                  guestContact: selectedCustomer?.phone || undefined,
+                  checkInDate: formData.checkIn,
+                  checkOutDate: formData.checkOut,
+                  nights,
+                  adults: formData.adults,
+                  children: formData.children,
+                  rooms: selectedRooms.map((r) => ({
+                    roomNumber: r.roomNo,
+                    roomType: r.roomTypeName || undefined,
+                    ratePerNight: r.priceWeekday ?? undefined,
+                  })),
+                  products: productLines.map((p) => ({
+                    name: p.name,
+                    qty: p.qty,
+                    unitPrice: p.unitPrice ?? undefined,
+                  })),
+                  deposit: formData.depositAmount ?? undefined,
+                  notes: formData.notes ?? undefined,
+                }}
+              />
+
+              <div className="flex justify-end gap-2 pt-2 border-t border-gray-200">
+                <PrintButton size="sm" showPdfOption={false} />
+                <button
+                  type="button"
+                  onClick={onClose}
+                  className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-100"
+                >
+                  เสร็จสิ้น
+                </button>
+              </div>
+            </div>
+          ) : (
+          /* Form */
           <form onSubmit={handleSubmit}>
             <div className="p-4 space-y-4 overflow-y-auto max-h-[60vh]">
               {/* Error Message */}
@@ -498,11 +666,12 @@ export default function BookingForm({
                 </div>
               </div>
 
-              {/* Room Selection */}
+              {/* Room Selection — optional (task #52: waitlist booking) */}
               <div>
                 <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-2">
                   <Bed className="w-4 h-4" />
-                  เลือกห้องพัก <span className="text-red-500">*</span>
+                  เลือกห้องพัก
+                  <span className="text-xs font-normal text-gray-400">(ไม่บังคับ)</span>
                 </label>
                 <RoomPicker
                   value={selectedRooms}
@@ -512,6 +681,94 @@ export default function BookingForm({
                   excludeBookingId={initialData?.id}
                   disabled={saving}
                 />
+                {selectedRooms.length === 0 && (
+                  <p className="mt-2 flex items-center gap-1.5 text-xs text-amber-600">
+                    <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                    ยังไม่ระบุห้องพัก (จะบันทึกเป็นรายการรอจัดห้อง)
+                  </p>
+                )}
+              </div>
+
+              {/* Pre-order products — optional (task #52) */}
+              <div>
+                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-2">
+                  <ShoppingCart className="w-4 h-4" />
+                  สินค้าสั่งล่วงหน้า
+                  <span className="text-xs font-normal text-gray-400">(ไม่บังคับ)</span>
+                </label>
+
+                {productLines.length > 0 && (
+                  <ul className="mb-2 divide-y divide-gray-200 border border-gray-200 rounded-lg">
+                    {productLines.map((line) => (
+                      <li
+                        key={line.productId}
+                        className="flex items-center justify-between px-3 py-2 text-sm"
+                      >
+                        <span>
+                          <span className="font-medium text-gray-800">{line.name}</span>
+                          <span className="ml-2 text-xs text-gray-500">× {line.qty}</span>
+                        </span>
+                        <span className="flex items-center gap-3">
+                          <span className="text-gray-700">
+                            {line.unitPrice != null
+                              ? `${(line.unitPrice * line.qty).toLocaleString('th-TH', {
+                                  minimumFractionDigits: 2,
+                                  maximumFractionDigits: 2,
+                                })} บาท`
+                              : '-'}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveProduct(line.productId)}
+                            className="text-gray-400 hover:text-red-600"
+                            aria-label="ลบสินค้า"
+                            disabled={saving}
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+
+                <div className="flex gap-2">
+                  <select
+                    aria-label="เลือกสินค้าสั่งล่วงหน้า"
+                    value={selectedProductId ?? ''}
+                    onChange={(e) =>
+                      setSelectedProductId(e.target.value ? Number(e.target.value) : null)
+                    }
+                    className="flex-1 px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
+                    disabled={saving}
+                  >
+                    <option value="">-- เลือกสินค้า --</option>
+                    {productCatalog.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.name} ({p.price.toLocaleString('th-TH')} บาท)
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    type="number"
+                    aria-label="จำนวนสินค้า"
+                    min="1"
+                    step="1"
+                    value={productQty}
+                    onChange={(e) => setProductQty(e.target.value)}
+                    className="w-20 px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
+                    disabled={saving}
+                  />
+                  <button
+                    type="button"
+                    onClick={handleAddProduct}
+                    disabled={!selectedProductId || saving}
+                    className="flex items-center gap-1 px-3 py-2 bg-gray-800 text-white rounded-lg hover:bg-gray-700 disabled:opacity-50 transition-colors"
+                  >
+                    <Plus className="w-4 h-4" />
+                    เพิ่ม
+                  </button>
+                </div>
               </div>
 
               {/* Source / Status */}
@@ -664,6 +921,7 @@ export default function BookingForm({
               </div>
             </div>
           </form>
+          )}
         </div>
       </div>
 
