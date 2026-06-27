@@ -307,6 +307,14 @@ impl BookingRepository for PgBookingRepository {
             conditions.push(format!("b.book_cust_id = ${}", next_idx));
         }
 
+        // Task #53 — balance-due filter. Column-vs-column comparison (no bound
+        // value), so it adds no `$N` slot and the bind order below is unchanged.
+        if params.balance_due == Some(true) {
+            conditions.push(
+                "COALESCE(b.book_total_amount, 0) > COALESCE(b.book_deposit_amount, 0)".to_string(),
+            );
+        }
+
         let where_clause = if conditions.is_empty() {
             String::new()
         } else {

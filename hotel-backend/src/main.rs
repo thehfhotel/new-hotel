@@ -455,6 +455,15 @@ fn build_new_routes(app_state: AppState) -> Router {
         // so post-startup outages are detectable — see scripts/smoke-ville.sh.
         .route("/api/health/ville", get(routes::mode::get_ville_health))
         .route("/api/calendar", get(routes::calendar::get_calendar))
+        // Booking reminders (task #53 / migration 064) — feed for the in-shell
+        // notification bell: upcoming arrivals + balance-due bookings, branch-
+        // aware. Dismiss suppresses a booking's reminder (PG-canonical only, no
+        // legacy writeback). Static `/reminders` is matched ahead of any param.
+        .route("/api/calendar/reminders", get(routes::new_calendar::list_reminders))
+        .route(
+            "/api/calendar/reminders/{id}/dismiss",
+            post(routes::new_calendar::dismiss_reminder),
+        )
         // Phase 5.5d — legacy_mirror.* read-only endpoints (coupons,
         // minibar, room moves). Surfaces legacy-only features so
         // receptionists don't switch to the .NET app.

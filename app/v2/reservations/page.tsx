@@ -1,10 +1,10 @@
 'use client'
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { CalendarPlus, Search, ChevronLeft, ChevronRight, Moon, BedDouble } from 'lucide-react'
+import { CalendarPlus, Search, ChevronLeft, ChevronRight, Moon, BedDouble, Wallet } from 'lucide-react'
 import { useBranch } from '@/contexts/BranchContext'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
-import { formatStoredDayMonth } from '@/lib/format'
+import { formatStoredDayMonth, formatCurrency } from '@/lib/format'
 import type { Booking, BookingDetail } from '@/types/booking'
 import { bookingStatusView } from '@/lib/v2/status'
 import { V2Spinner, V2PageHeader, StatusPill, VilleNotice } from '@/components/v2/primitives'
@@ -26,6 +26,9 @@ export default function V2Reservations() {
   const [loading, setLoading] = useState(true)
   const [status, setStatus] = useState('')
   const [search, setSearch] = useState('')
+  // Task #53 — balance-due filter (also the notification-bell deep-link target,
+  // /v2/reservations?balanceDue=1). Initial value is read from the URL below.
+  const [balanceDue, setBalanceDue] = useState(false)
   const [page, setPage] = useState(1)
   const [totalPages, setTotalPages] = useState(1)
 
@@ -42,6 +45,7 @@ export default function V2Reservations() {
       const params = new URLSearchParams({ page: String(page), limit: '20' })
       if (status) params.set('status', status)
       if (search.trim()) params.set('search', search.trim())
+      if (balanceDue) params.set('balanceDue', 'true')
       const res = await branchFetch(`/api/bookings?${params.toString()}`)
       if (token !== reqRef.current) return // superseded by a newer branch fetch
       if (res.ok) {
@@ -54,18 +58,24 @@ export default function V2Reservations() {
     } finally {
       setLoading(false)
     }
-  }, [branchFetch, page, status, search])
+  }, [branchFetch, page, status, search, balanceDue])
 
   useEffect(() => {
     fetchBookings()
   }, [fetchBookings])
 
-  // Open the create form when arriving via "จองใหม่" (?new=1) or ⌘K command.
+  // Open the create form when arriving via "จองใหม่" (?new=1) or ⌘K command,
+  // and pre-apply the balance-due filter when deep-linked from the bell.
   useEffect(() => {
-    if (typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('new') === '1') {
+    if (typeof window === 'undefined') return
+    const qs = new URLSearchParams(window.location.search)
+    if (qs.get('new') === '1') {
       setMode('create')
       setEditing(null)
       setShowForm(true)
+    }
+    if (qs.get('balanceDue') === '1' || qs.get('balanceDue') === 'true') {
+      setBalanceDue(true)
     }
   }, [])
 
@@ -168,7 +178,7 @@ export default function V2Reservations() {
         />
       </div>
 
-      {/* Status chips */}
+      {/* Status chips + balance-due toggle */}
       <div className="flex gap-2 overflow-x-auto pb-1 -mx-1 px-1">
         {STATUS_FILTERS.map((f) => (
           <button
@@ -183,6 +193,16 @@ export default function V2Reservations() {
             {f.label}
           </button>
         ))}
+        <button
+          className="v2-chip whitespace-nowrap"
+          data-active={balanceDue}
+          onClick={() => {
+            setPage(1)
+            setBalanceDue((v) => !v)
+          }}
+        >
+          <Wallet size={13} /> ค้างชำระ
+        </button>
       </div>
 
       {/* List */}
@@ -202,9 +222,20 @@ export default function V2Reservations() {
               style={{ borderColor: 'var(--v2-line)' }}
             >
               <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
                   <span className="text-[15px] font-semibold truncate">{b.customerName || 'ไม่ระบุชื่อ'}</span>
                   <StatusPill view={bookingStatusView(b.status)} />
+                  {(() => {
+                    const bal = (b.totalAmount ?? 0) - (b.depositAmount ?? 0)
+                    return bal > 0 ? (
+                      <span
+                        className="inline-flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded"
+                        style={{ background: 'var(--v2-occ-bg)', color: 'var(--v2-occ)' }}
+                      >
+                        <Wallet size={11} /> ค้าง {formatCurrency(bal)}
+                      </span>
+                    ) : null
+                  })()}
                 </div>
                 <div className="text-[12.5px] mt-0.5 v2-num" style={{ color: 'var(--v2-ink-3)' }}>
                   {b.bookNo}

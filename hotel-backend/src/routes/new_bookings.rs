@@ -187,6 +187,10 @@ pub struct NewBookingsQuery {
     pub start_date: Option<String>,
     pub end_date: Option<String>,
     pub customer_id: Option<i32>,
+    /// Task #53 — when `true`, return only bookings with an outstanding balance
+    /// (`book_total_amount > book_deposit_amount`). Backs the balance-due filter
+    /// on the reservations list and the notification bell deep-link.
+    pub balance_due: Option<bool>,
     #[serde(default = "default_page")]
     pub page: i32,
     #[serde(default = "default_limit")]

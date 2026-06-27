@@ -4,6 +4,7 @@ import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import {
   Sparkles,
+  CalendarRange,
   Wrench,
   Package,
   CreditCard,
@@ -44,6 +45,7 @@ const SECTIONS: HubSection[] = [
   {
     title: 'ปฏิบัติการ',
     items: [
+      { href: '/v2/calendar', label: 'ปฏิทินห้องว่าง', desc: 'ผังห้องว่างตามวันที่ (ห้อง × วัน)', icon: CalendarRange },
       { href: '/housekeeping', label: 'งานแม่บ้าน', desc: 'สถานะความสะอาดของห้อง', icon: Sparkles },
       { href: '/v2/notes', label: 'โน้ตห้อง / พนักงาน', desc: 'ฝากข้อความถึงห้องและพนักงาน', icon: StickyNote },
       { href: '/maintenance', label: 'แจ้งซ่อม', desc: 'งานซ่อมบำรุงและอุปกรณ์', icon: Wrench },

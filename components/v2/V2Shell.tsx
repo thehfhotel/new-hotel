@@ -8,6 +8,7 @@ import { useBranch, BRANCH_LABELS, type Branch } from '@/contexts/BranchContext'
 import { useAuth } from '@/contexts/AuthContext'
 import { V2_NAV, isV2Active } from '@/lib/v2/nav'
 import CommandPalette from '@/components/v2/CommandPalette'
+import ReminderBell from '@/components/v2/ReminderBell'
 
 function BranchSwitch({ compact = false }: { compact?: boolean }) {
   const { branch, setBranch, villeAvailable } = useBranch()
@@ -72,13 +73,14 @@ export default function V2Shell({ children }: { children: ReactNode }) {
         className="hidden lg:flex flex-col fixed inset-y-0 left-0 w-[248px] z-30"
         style={{ background: 'var(--v2-surface)', borderRight: '1px solid var(--v2-line)' }}
       >
-        <div className="px-5 pt-6 pb-5">
+        <div className="px-5 pt-6 pb-5 flex items-start justify-between gap-2">
           <Link href="/v2" className="block">
             <div className="v2-eyebrow" style={{ color: 'var(--v2-brass)' }}>Saichon Heritage</div>
             <div className="v2-display text-[19px] leading-tight mt-1" style={{ color: 'var(--v2-ink)' }}>
               Front&nbsp;Desk
             </div>
           </Link>
+          <ReminderBell align="left" />
         </div>
 
         <div className="px-4 pb-4">
@@ -153,6 +155,7 @@ export default function V2Shell({ children }: { children: ReactNode }) {
         </Link>
         <div className="flex-1" />
         <BranchSwitch compact />
+        <ReminderBell />
         <button
           onClick={() => setCmdkOpen(true)}
           className="p-2 rounded-full"

@@ -182,6 +182,12 @@ CREATE TABLE IF NOT EXISTS ht_bookings (
     book_special_requests TEXT,
     book_internal_notes TEXT,
     book_notes TEXT,
+    -- Migration 064 (task #53) — booking-reminder state for the in-shell
+    -- notification bell. PG-CANONICAL ONLY (iHOTEL has no equivalent stored
+    -- reminder/dismiss flag). See migrations/pg/064_booking_reminders.sql.
+    book_notify_day INTEGER,
+    book_notify_note TEXT,
+    book_notify_dismissed_at TIMESTAMPTZ,
     book_cancelled_at TIMESTAMP,
     book_cancel_reason VARCHAR(500),
     -- Writeback resolver back-populates these (migration 014).
@@ -206,6 +212,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_ht_bookings_aggregate_id
     ON ht_bookings (aggregate_id) WHERE aggregate_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS ix_ht_bookings_legacy_book_id
     ON ht_bookings (legacy_book_id) WHERE legacy_book_id IS NOT NULL;
+-- Migration 064 (task #53) — active-reminder lookup for the notification bell.
+CREATE INDEX IF NOT EXISTS ix_ht_bookings_active_reminders
+    ON ht_bookings (book_checkin) WHERE book_notify_dismissed_at IS NULL;
 
 -- ht_booking_rooms - Junction table for booking-room assignments
 CREATE TABLE IF NOT EXISTS ht_booking_rooms (
@@ -2246,6 +2255,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS ix_ht_notes_aggregate_id
 
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('062', '062_create_ht_notes.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 064 — task #53. Booking-reminder state columns on ht_bookings
+-- (book_notify_day / book_notify_note / book_notify_dismissed_at) created inline
+-- in the ht_bookings CREATE TABLE above for fresh DBs, plus the
+-- ix_ht_bookings_active_reminders partial index. PG-canonical only (no legacy
+-- writeback). See migrations/pg/064_booking_reminders.sql.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('064', '064_booking_reminders.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================
