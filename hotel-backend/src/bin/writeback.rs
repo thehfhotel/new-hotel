@@ -1180,6 +1180,23 @@ async fn resolve_legacy_ids(
                 resolved.legacy_dep_ds_id = row.try_get("cr_legacy_ds_id").ok();
             }
         }
+        // Task #47 — CreateNote carries the legacy target key (room_no /
+        // username) directly in its payload; nothing to resolve. MarkNoteRead
+        // needs the legacy `SMS_ID`, cached on `ht_notes.note_legacy_id` and
+        // resolved here by the note's aggregate id. NULL ⇒ the dispatcher
+        // defers (CreateNote back-population still pending).
+        CreateNote { .. } => {}
+        MarkNoteRead { note_aggregate_id, .. } => {
+            if let Some(row) = sqlx::query(
+                "SELECT note_legacy_id FROM ht_notes WHERE aggregate_id = $1",
+            )
+            .bind(note_aggregate_id)
+            .fetch_optional(pg)
+            .await?
+            {
+                resolved.note_legacy_id = row.try_get("note_legacy_id").ok();
+            }
+        }
     }
     Ok(resolved)
 }
@@ -1954,6 +1971,26 @@ async fn back_populate_legacy_ids(
         // status flag. It allocates no new legacy id — nothing to
         // back-populate.
         RefundDeposit { .. } => {}
+        // Task #47 — CreateNote back-populates the freshly-allocated
+        // `HT_Room_SMS`/`HT_EMP_SMS.SMS_ID` (IDENTITY, captured via the recipe's
+        // `OUTPUT INSERTED.SMS_ID`) onto `ht_notes.note_legacy_id`, keyed by the
+        // note's aggregate id. MarkNoteRead flips a flag and allocates nothing.
+        CreateNote { .. } => {
+            let sms_id = legacy_ids.get("sms_id").and_then(|v| v.as_i64()).map(|n| n as i32);
+            if let Some(sms_id) = sms_id {
+                sqlx::query(
+                    "UPDATE ht_notes SET \
+                       note_legacy_id = COALESCE($2, note_legacy_id), \
+                       note_updated_at = NOW() \
+                     WHERE aggregate_id = $1",
+                )
+                .bind(aggregate_id)
+                .bind(sms_id)
+                .execute(pg)
+                .await?;
+            }
+        }
+        MarkNoteRead { .. } => {}
     }
     Ok(())
 }

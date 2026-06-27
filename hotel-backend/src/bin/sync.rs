@@ -2577,6 +2577,14 @@ async fn run_one_tick(
     // the tick, and shadow mode skips the canonical writes.
     sync_cash_categories(pg, mssql, shadow_mode, site_id).await;
     sync_cash_history(pg, mssql, shadow_mode, site_id).await;
+
+    // Room & staff sticky-notes sync (task #47) — read-only poll of the legacy
+    // `HT_Room_SMS` + `HT_EMP_SMS` SMS tables into canonical `ht_notes`. Same
+    // NON-CT poll pattern as the cash sync (the tables have no PK/CT
+    // prerequisite, so no `migrations/legacy-mssql/` DDL). Captures both new
+    // notes AND read-flag (`SMS_Readed`) flips made in iHOTEL. Logs at WARN and
+    // returns on any error; shadow mode skips the canonical write.
+    sync_sticky_notes(pg, mssql, shadow_mode, site_id).await;
 }
 
 /// Poll one table for CT changes since `last_seen`. Per the lifecycle:
@@ -4012,6 +4020,182 @@ async fn sync_cash_history(pg: &PgPool, mssql: &DbPool, shadow_mode: bool, site_
             upserted,
             "cash-history sync: upserted canonical cash entries from TB_Pay_History"
         );
+    }
+}
+
+/// Normalize the legacy `SMS_Readed` varchar marker ('yes' / 'no', lowercase
+/// per `docs/legacy-app/COMPAT_CHEATSHEET.md:98`) into the canonical
+/// `note_is_read` bool. Anything other than a case-insensitive "yes" is treated
+/// as unread (the legacy default on insert is 'no'). PURE.
+fn sms_readed_to_bool(readed: &str) -> bool {
+    readed.trim().eq_ignore_ascii_case("yes")
+}
+
+/// Read-only sync of the legacy sticky-note tables (`HT_Room_SMS` +
+/// `HT_EMP_SMS`) into canonical `ht_notes` (task #47).
+///
+/// **Why**: coexistence (ADR 0002) means a note may be added — or marked read —
+/// in EITHER iHOTEL or our app. iHOTEL writes the SMS tables; our board reads
+/// canonical `ht_notes`. Without this poll, notes/read-flips made in iHOTEL
+/// would be invisible to our app.
+///
+/// **Shape**: both legacy tables share the same columns (differing only in the
+/// target-key column — `SMS_Room` vs `SMS_TO`), so one `UNION ALL` round-trip
+/// mirrors both, tagging each row with `note_target_kind` ('room' | 'staff').
+/// Each row UPSERTs into `ht_notes` keyed on `(note_target_kind, note_legacy_id)`
+/// = the per-table IDENTITY `SMS_ID` (the two tables have independent IDENTITY
+/// sequences, so the pair is the key). `note_source` is forced to 'legacy'. The
+/// DO UPDATE carries a `WHERE … IS DISTINCT FROM …` guard so a steady-state
+/// tick (nothing changed) performs ZERO row writes — only genuinely-changed
+/// notes (new body / author / read-flip) cost a write.
+///
+/// **Resilience**: identical to `sync_cash_history` — every error path logs at
+/// WARN and returns/continues; shadow mode skips the canonical write.
+async fn sync_sticky_notes(pg: &PgPool, mssql: &DbPool, shadow_mode: bool, site_id: &str) {
+    // Both SMS tables, one round-trip. The target-key column is aliased to a
+    // common name so the row reader is uniform.
+    const NOTES_SELECT: &str = "\
+         SELECT 'room' AS kind, SMS_ID, SMS_Room AS target_key, SMS_Details, SMS_By, SMS_Readed \
+           FROM HT_Room_SMS \
+         UNION ALL \
+         SELECT 'staff' AS kind, SMS_ID, SMS_TO AS target_key, SMS_Details, SMS_By, SMS_Readed \
+           FROM HT_EMP_SMS";
+
+    let mut conn = match mssql.get().await {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::warn!(
+                event_name = "sticky_note_sync_conn_fail",
+                site = %site_id,
+                error = %err,
+                "sticky-note sync: could not acquire MSSQL connection; skipping"
+            );
+            return;
+        }
+    };
+    let rows =
+        match simple_query_with_timeout_pooled(&mut conn, NOTES_SELECT, MssqlOpKind::Read).await {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::warn!(
+                    event_name = "sticky_note_sync_query_fail",
+                    site = %site_id,
+                    error = %err,
+                    "sticky-note sync: SELECT failed; skipping"
+                );
+                return;
+            }
+        };
+    drop(conn); // release the pooled MSSQL connection before PG work
+
+    let mut upserted = 0usize;
+    for row in &rows {
+        let Some(kind) = tiberius::Row::try_get::<&str, _>(row, "kind").ok().flatten() else {
+            continue;
+        };
+        let Some(legacy_id) = tiberius::Row::try_get::<i32, _>(row, "SMS_ID").ok().flatten() else {
+            tracing::warn!(
+                event_name = "sticky_note_sync_row_skip",
+                site = %site_id,
+                "sticky-note sync: row missing SMS_ID; skipping"
+            );
+            continue;
+        };
+        let target_key = tiberius::Row::try_get::<&str, _>(row, "target_key")
+            .ok()
+            .flatten()
+            .unwrap_or("")
+            .to_string();
+        let body = tiberius::Row::try_get::<&str, _>(row, "SMS_Details")
+            .ok()
+            .flatten()
+            .unwrap_or("")
+            .to_string();
+        let created_by = tiberius::Row::try_get::<&str, _>(row, "SMS_By")
+            .ok()
+            .flatten()
+            .map(|s| s.to_string());
+        let is_read = sms_readed_to_bool(
+            tiberius::Row::try_get::<&str, _>(row, "SMS_Readed")
+                .ok()
+                .flatten()
+                .unwrap_or(""),
+        );
+
+        if shadow_mode {
+            continue;
+        }
+
+        // Runtime `sqlx::query` (NOT the `query!` macro) so this adds nothing to
+        // the `.sqlx/` offline cache. Idempotent UPSERT keyed on
+        // (note_target_kind, note_legacy_id); the DO UPDATE `WHERE` guard makes
+        // an unchanged row a no-op (zero steady-state writes).
+        let res = sqlx::query(
+            "INSERT INTO ht_notes ( \
+                 note_target_kind, note_target_key, note_body, note_created_by, \
+                 note_is_read, note_legacy_id, note_source \
+             ) VALUES ($1, $2, $3, $4, $5, $6, 'legacy') \
+             ON CONFLICT (note_target_kind, note_legacy_id) DO UPDATE SET \
+                 note_target_key = EXCLUDED.note_target_key, \
+                 note_body       = EXCLUDED.note_body, \
+                 note_created_by = EXCLUDED.note_created_by, \
+                 note_is_read    = EXCLUDED.note_is_read, \
+                 note_source     = 'legacy', \
+                 note_updated_at = NOW(), \
+                 note_synced_at  = NOW() \
+             WHERE ht_notes.note_target_key IS DISTINCT FROM EXCLUDED.note_target_key \
+                OR ht_notes.note_body       IS DISTINCT FROM EXCLUDED.note_body \
+                OR ht_notes.note_created_by IS DISTINCT FROM EXCLUDED.note_created_by \
+                OR ht_notes.note_is_read    IS DISTINCT FROM EXCLUDED.note_is_read",
+        )
+        .bind(kind)
+        .bind(&target_key)
+        .bind(&body)
+        .bind(&created_by)
+        .bind(is_read)
+        .bind(legacy_id)
+        .execute(pg)
+        .await;
+
+        match res {
+            Ok(_) => upserted += 1,
+            Err(err) => {
+                tracing::warn!(
+                    event_name = "sticky_note_sync_upsert_fail",
+                    site = %site_id,
+                    kind,
+                    legacy_id,
+                    error = %err,
+                    "sticky-note sync: UPSERT into ht_notes failed; continuing"
+                );
+            }
+        }
+    }
+
+    if upserted > 0 {
+        tracing::debug!(
+            event_name = "sticky_note_sync_ok",
+            site = %site_id,
+            upserted,
+            "sticky-note sync: upserted canonical notes from HT_Room_SMS/HT_EMP_SMS"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sticky_note_sync_tests {
+    use super::sms_readed_to_bool;
+
+    /// `SMS_Readed` normalization: only a case-insensitive "yes" is read; the
+    /// legacy 'no' default + any garbage is unread.
+    #[test]
+    fn sms_readed_normalizes_yes_no() {
+        assert!(sms_readed_to_bool("yes"));
+        assert!(sms_readed_to_bool("YES"));
+        assert!(sms_readed_to_bool(" Yes "));
+        assert!(!sms_readed_to_bool("no"));
+        assert!(!sms_readed_to_bool(""));
+        assert!(!sms_readed_to_bool("maybe"));
     }
 }
 

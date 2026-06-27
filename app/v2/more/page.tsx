@@ -17,6 +17,7 @@ import {
   Users,
   RefreshCw,
   ScrollText,
+  StickyNote,
   ArrowLeft,
   LogOut,
   ExternalLink,
@@ -43,6 +44,7 @@ const SECTIONS: HubSection[] = [
     title: 'ปฏิบัติการ',
     items: [
       { href: '/housekeeping', label: 'งานแม่บ้าน', desc: 'สถานะความสะอาดของห้อง', icon: Sparkles },
+      { href: '/v2/notes', label: 'โน้ตห้อง / พนักงาน', desc: 'ฝากข้อความถึงห้องและพนักงาน', icon: StickyNote },
       { href: '/maintenance', label: 'แจ้งซ่อม', desc: 'งานซ่อมบำรุงและอุปกรณ์', icon: Wrench },
       { href: '/inventory', label: 'คลังสินค้า', desc: 'สต๊อกและการเบิกจ่าย', icon: Package },
       { href: '/card-reader', label: 'อ่านบัตรประชาชน', desc: 'ดึงข้อมูลจากบัตรไทย', icon: CreditCard },

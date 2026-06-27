@@ -72,6 +72,12 @@ pub struct LegacyIds {
     /// intent.
     #[serde(default)]
     pub cupon_no: Option<i32>,
+    /// Task #47 — `HT_Room_SMS.SMS_ID` / `HT_EMP_SMS.SMS_ID` (IDENTITY) minted
+    /// by the `CreateNote` recipe via `OUTPUT INSERTED.SMS_ID`. Stamped onto
+    /// canonical `ht_notes.note_legacy_id` by the worker's
+    /// `back_populate_legacy_ids` step. `None` for every non-note intent.
+    #[serde(default)]
+    pub sms_id: Option<i32>,
     /// Free-form extras (e.g. `HT_Rooms_Cancel.id`).
     #[serde(default)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -121,6 +127,11 @@ impl LegacyIds {
     /// Track G5 — record the freshly-allocated `HT_Cupon.cupon_no`.
     pub fn with_cupon_no(mut self, cupon_no: i32) -> Self {
         self.cupon_no = Some(cupon_no);
+        self
+    }
+    /// Task #47 — record the freshly-allocated `HT_Room_SMS`/`HT_EMP_SMS.SMS_ID`.
+    pub fn with_sms_id(mut self, sms_id: i32) -> Self {
+        self.sms_id = Some(sms_id);
         self
     }
 
@@ -175,6 +186,12 @@ pub struct ResolvedJob {
     /// the writeback worker hydrates it; the recipe consumes plain
     /// fields only.
     pub pos_sale: Option<ResolvedPosSale>,
+    /// Task #47 — resolved `ht_notes.note_legacy_id` (`SMS_ID`) for a
+    /// `MarkNoteRead` intent. `Some(_)` only when the note already has a
+    /// legacy back-pointer (mirrored from iHOTEL, or after its `CreateNote`
+    /// writeback back-populated it). `None` ⇒ the dispatcher defers the
+    /// mark-read (same pattern as `RedeemCoupon` waiting on `IssueCoupon`).
+    pub note_legacy_id: Option<i32>,
 }
 
 /// Fully-hydrated `ht_coupons` row required by the
@@ -361,6 +378,15 @@ fn intent_facts(intent: &WritebackIntent) -> IntentFacts {
         // CloseRound is an idempotent `UPDATE … WHERE round_end IS NULL` — a
         // second apply matches 0 rows. No ledger, no open-round warning.
         CloseRound { .. } => (false, false),
+        // Task #47 — CreateNote INSERTs into the IDENTITY-keyed HT_Room_SMS /
+        // HT_EMP_SMS, so a crash-after-commit retry would mint a DUPLICATE
+        // note (fresh IDENTITY). Ledger it (same class as RecordPosSale, the
+        // other OUTPUT-INSERTED create). It writes no cashier-round money rows
+        // → no §1.9 open-round warning.
+        CreateNote { .. } => (true, false),
+        // MarkNoteRead is an idempotent `UPDATE … SET SMS_Readed='yes' WHERE
+        // SMS_ID=…` — a second apply is a no-op. No ledger, no open-round warning.
+        MarkNoteRead { .. } => (false, false),
         ModifyBooking { .. }
         | CancelBooking { .. }
         | CancelCheckIn { .. }
@@ -1066,6 +1092,45 @@ pub async fn dispatch(
         WritebackIntent::RefundDeposit { check_in_id: _, cr_id: _, by } => {
             recipes::deposit_refund::execute(conn, resolved.legacy_dep_ds_id, by).await
         }
+        // Task #47 — sticky-note create. The intent carries the legacy target
+        // key (room_no / username) directly, so no ResolvedJob lookup is
+        // needed (UpdateRoom shape). The recipe INSERTs the SMS row and
+        // captures its IDENTITY `SMS_ID` for back-population.
+        WritebackIntent::CreateNote {
+            note_aggregate_id: _,
+            target_kind,
+            target_key,
+            body,
+            created_by,
+        } => {
+            if target_key.is_empty() {
+                return Err(WritebackError::Recipe(
+                    "CreateNote requires a non-empty target_key (room_no / username)".into(),
+                ));
+            }
+            recipes::sticky_note::execute_create(
+                conn,
+                *target_kind,
+                target_key,
+                body,
+                created_by,
+            )
+            .await
+        }
+        // Task #47 — sticky-note mark-read. The legacy `SMS_ID` was resolved
+        // from `ht_notes.note_legacy_id` by the writeback worker. If it's not
+        // yet known (app-created note whose CreateNote back-population is
+        // pending), defer with a recipe error so the job retries — same
+        // pattern as RedeemCoupon waiting on IssueCoupon.
+        WritebackIntent::MarkNoteRead { note_aggregate_id, target_kind } => {
+            let sms_id = resolved.note_legacy_id.ok_or_else(|| {
+                WritebackError::Recipe(format!(
+                    "MarkNoteRead waiting on CreateNote back-population \
+                     (note_legacy_id unresolved for aggregate {note_aggregate_id})"
+                ))
+            })?;
+            recipes::sticky_note::execute_mark_read(conn, *target_kind, sms_id).await
+        }
     };
 
     // Ledger RECORD — the LAST write before the worker's COMMIT, on the SAME
@@ -1365,12 +1430,16 @@ mod tests {
             "redeem_coupon",
             "record_pos_sale",
             "refund_deposit",
+            "open_round",
+            "close_round",
+            "create_note",
+            "mark_note_read",
         ];
         // We verify dispatch handles all by constructing one of each via the
         // intent name → no actual MSSQL call, just type-level coverage.
         // Counting expected variants here keeps the test cheap and
         // deterministic.
-        assert_eq!(names.len(), 20, "expected 20 WritebackIntent variants");
+        assert_eq!(names.len(), 24, "expected 24 WritebackIntent variants");
     }
 
     /// Cheatsheet §1.9 — byte-pin the round-bill gate probe. iHOTEL's own

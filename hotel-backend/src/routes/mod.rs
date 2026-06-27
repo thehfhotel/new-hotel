@@ -19,6 +19,7 @@ pub mod new_customers;
 pub mod new_inventory;
 pub mod new_invoice;
 pub mod new_maintenance;
+pub mod new_notes;
 pub mod new_payments;
 pub mod new_products;
 pub mod new_rates;

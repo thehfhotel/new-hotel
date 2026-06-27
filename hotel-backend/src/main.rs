@@ -608,6 +608,16 @@ fn build_new_routes(app_state: AppState) -> Router {
             "/api/cash/categories",
             get(routes::new_cash::list_categories),
         )
+        // Room & staff sticky notes (โน้ตห้อง / โน้ตพนักงาน) — task #47 /
+        // migration 062. Branch-aware list + add + mark-read. Inbound mirror of
+        // legacy HT_Room_SMS / HT_EMP_SMS rides the sync poll
+        // (bin/sync.rs::sync_sticky_notes); writeback to the SMS tables is
+        // SHIPPED DARK behind NOTES_WRITEBACK_ENABLED (writeback::recipes::sticky_note).
+        .route(
+            "/api/notes",
+            get(routes::new_notes::list_notes).post(routes::new_notes::create_note),
+        )
+        .route("/api/notes/{id}/read", post(routes::new_notes::mark_read))
         // Inventory Management
         .route("/api/inventory/items", get(routes::new_inventory::list_items).post(routes::new_inventory::create_item))
         .route("/api/inventory/items/{id}", get(routes::new_inventory::get_item).put(routes::new_inventory::update_item).delete(routes::new_inventory::delete_item))

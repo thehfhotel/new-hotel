@@ -38,6 +38,7 @@
 //! | `coupon` | Track G5 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_Cupon`) | `IssueCoupon` + `RedeemCoupon` |
 //! | `pos_sale` | Track G6 / POS module (MVP) — `HT_CheckIn_Product` INSERT + paired `HT_Products.Pro_Amt` additive decrement | `RecordPosSale` |
 //! | `round_bill` | Track J6 (round coexistence step 2) — `HT_Round_Bill` open (`INSERT`) / close (`UPDATE`), `COMPAT_CHEATSHEET.md` §946-956 / §3.20-3.21 (`FrmDueBill.cs:1653/1670`) | `OpenRound` + `CloseRound` |
+//! | `sticky_note` | Task #47 — room/staff notes `HT_Room_SMS` / `HT_EMP_SMS` INSERT (`OUTPUT INSERTED.SMS_ID`) + mark-read UPDATE, `COMPAT_CHEATSHEET.md` §932-942 / §3.22. **SHIPPED DARK** behind `NOTES_WRITEBACK_ENABLED` | `CreateNote` + `MarkNoteRead` |
 //! | `cash_entry` | Migration 059 — petty-cash `TB_Pay_History` positional INSERT (`COMPAT_CHEATSHEET.md` §1051 / `FrmAddPay.cs:638`). **PURE-but-UNWIRED** — no intent/dispatcher arm yet; awaiting `Pay_Type`/`Pay_Group`/`Pay_Account`/`Pay_Program` byte-shape verification | _(none yet — TODO)_ |
 
 pub mod adjust_product_stock;
@@ -60,6 +61,7 @@ pub mod refund_payment;
 pub mod round_bill;
 pub mod room_change;
 pub mod set_maintenance;
+pub mod sticky_note;
 pub mod update_customer;
 pub mod update_room;
 pub mod walkin;

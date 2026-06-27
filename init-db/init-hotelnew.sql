@@ -2211,6 +2211,43 @@ INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('061', '061_create_ht_booking_products.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
+-- -----------------------------------------------------------------------------
+-- ht_notes — room & staff sticky notes (task #47 / migration 062). Canonical
+-- mirror of legacy HT_Room_SMS + HT_EMP_SMS collapsed via note_target_kind.
+-- Per-site (connection-level scoping). See migrations/pg/062_create_ht_notes.sql.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ht_notes (
+    note_id          BIGSERIAL    PRIMARY KEY,
+    note_target_kind VARCHAR(10)  NOT NULL
+                     CHECK (note_target_kind IN ('room', 'staff')),
+    note_target_key  VARCHAR(50)  NOT NULL,
+    note_body        TEXT         NOT NULL,
+    note_created_by  VARCHAR(250),
+    note_is_read     BOOLEAN      NOT NULL DEFAULT FALSE,
+    note_legacy_id   INTEGER,
+    note_source      VARCHAR(20)  NOT NULL DEFAULT 'legacy'
+                     CHECK (note_source IN ('legacy', 'app')),
+    aggregate_id     UUID,
+    note_created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    note_updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    note_synced_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CONSTRAINT ht_notes_kind_legacy_id_key UNIQUE (note_target_kind, note_legacy_id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_ht_notes_target
+    ON ht_notes (note_target_kind, note_target_key);
+
+CREATE INDEX IF NOT EXISTS ix_ht_notes_unread
+    ON ht_notes (note_target_kind, note_target_key)
+    WHERE note_is_read = FALSE;
+
+CREATE UNIQUE INDEX IF NOT EXISTS ix_ht_notes_aggregate_id
+    ON ht_notes (aggregate_id) WHERE aggregate_id IS NOT NULL;
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('062', '062_create_ht_notes.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
 -- =============================================================================
 -- Initialization complete
 -- =============================================================================

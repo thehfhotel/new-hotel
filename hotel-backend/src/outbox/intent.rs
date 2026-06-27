@@ -16,6 +16,32 @@ use crate::domain::{
     booking::BookingState, payment::PaymentMethod, shared::DateRange, shared::Money,
 };
 
+/// Which legacy sticky-note table a [`WritebackIntent::CreateNote`] /
+/// [`WritebackIntent::MarkNoteRead`] targets (task #47, migration 062).
+///
+/// `Room` → `HT_Room_SMS` (keyed `SMS_Room` = room number); `Staff` →
+/// `HT_EMP_SMS` (keyed `SMS_TO` = staff username). The two legacy tables share
+/// an identical shape (`SMS_ID IDENTITY, <key>, SMS_Details, SMS_By,
+/// SMS_Readed`), so one enum + one recipe covers both — see
+/// `writeback/recipes/sticky_note.rs`. Serialized lowercase to match the
+/// canonical `ht_notes.note_target_kind` CHECK domain ('room' | 'staff').
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteTargetKind {
+    Room,
+    Staff,
+}
+
+impl NoteTargetKind {
+    /// Canonical string value stored in `ht_notes.note_target_kind`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NoteTargetKind::Room => "room",
+            NoteTargetKind::Staff => "staff",
+        }
+    }
+}
+
 /// A single durable command queued in the `writeback_jobs` outbox.
 ///
 /// Variants intentionally cover only the 11 spike-validated flows. New legacy
@@ -547,6 +573,47 @@ pub enum WritebackIntent {
         /// `HT_CheckIn_Ds.Cin_Dep_return_by` (varchar(50)).
         by: String,
     },
+
+    /// Task #47 — our app adds a sticky note to a ROOM or a STAFF member,
+    /// mirroring iHOTEL's `Room_Note.cs` / `EMP_Note.cs`
+    /// (`docs/legacy-app/COMPAT_CHEATSHEET.md` §3.22):
+    /// `INSERT HT_Room_SMS (SMS_Room, SMS_Details, SMS_By, SMS_Readed='no')`
+    /// — or `HT_EMP_SMS (SMS_TO, …)` for a staff note. `SMS_ID` is IDENTITY, so
+    /// the recipe captures it via `OUTPUT INSERTED.SMS_ID` and the writeback
+    /// worker back-populates `ht_notes.note_legacy_id`. Carries the canonical
+    /// target key directly (room_no / username) — no `ResolvedJob` lookup,
+    /// mirroring `UpdateRoom`'s payload-carries-the-key shape. **Shipped dark**
+    /// behind `NOTES_WRITEBACK_ENABLED` (the emitter is gated; this variant +
+    /// recipe are always compiled/routable).
+    CreateNote {
+        /// Canonical `ht_notes.aggregate_id` — the back-population key.
+        note_aggregate_id: Uuid,
+        /// Which legacy SMS table to target.
+        target_kind: NoteTargetKind,
+        /// Legacy target key VERBATIM: room number (`SMS_Room`) or staff
+        /// username (`SMS_TO`).
+        target_key: String,
+        /// `SMS_Details` — the note body.
+        body: String,
+        /// `SMS_By` — the author login.
+        created_by: String,
+    },
+
+    /// Task #47 — our app marks a sticky note read, mirroring iHOTEL's
+    /// `Room_Note_Read.cs` / `EMP_Note_Read.cs`:
+    /// `UPDATE HT_Room_SMS SET SMS_Readed='yes' WHERE SMS_ID=<id>` (or
+    /// `HT_EMP_SMS`). The legacy `SMS_ID` is resolved by the writeback worker
+    /// from `ht_notes.note_legacy_id` (keyed on `note_aggregate_id`); the
+    /// recipe is a no-op-safe idempotent UPDATE. If the note was created in
+    /// our app and its `CreateNote` back-population hasn't landed yet, the
+    /// dispatcher defers (same pattern as `RedeemCoupon`).
+    MarkNoteRead {
+        /// Canonical `ht_notes.aggregate_id` — drives the `note_legacy_id`
+        /// resolution.
+        note_aggregate_id: Uuid,
+        /// Which legacy SMS table to target.
+        target_kind: NoteTargetKind,
+    },
 }
 
 /// Payload for [`WritebackIntent::OpenRound`].
@@ -812,6 +879,8 @@ impl WritebackIntent {
             WritebackIntent::OpenRound { .. } => "open_round",
             WritebackIntent::CloseRound { .. } => "close_round",
             WritebackIntent::RefundDeposit { .. } => "refund_deposit",
+            WritebackIntent::CreateNote { .. } => "create_note",
+            WritebackIntent::MarkNoteRead { .. } => "mark_note_read",
         }
     }
 
@@ -854,6 +923,8 @@ impl WritebackIntent {
             | WritebackIntent::RedeemCoupon { coupon_aggregate_id, .. } => *coupon_aggregate_id,
             WritebackIntent::OpenRound { round_aggregate_id, .. }
             | WritebackIntent::CloseRound { round_aggregate_id, .. } => *round_aggregate_id,
+            WritebackIntent::CreateNote { note_aggregate_id, .. }
+            | WritebackIntent::MarkNoteRead { note_aggregate_id, .. } => *note_aggregate_id,
         }
     }
 }
