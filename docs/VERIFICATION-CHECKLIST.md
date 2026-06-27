@@ -4,6 +4,41 @@
 verification across every recent effort. Everything below is **implemented and
 deployed**; this is the verification + flag-flip checklist, not a build list.
 
+## ⚠ Reframing (2026-06-27): app is verification-only, not live for reception
+
+Established this session: the new app is **not deployed to reception** — it is
+**verification/shadow-only and not feature-complete** for day-to-day use. Daily
+ops (bookings, check-ins, check-outs, invoices, housekeeping) still run entirely
+in **iHOTEL**; real data flows iHOTEL → sync → canonical PG. Two consequences
+reprioritize everything below:
+
+1. **Flag flips are the LAST mile, not the next step.** The coexistence
+   write-back flags only matter once reception actually operates the app and
+   dual-writes. Until the app is feature-complete *and adopted*, they stay dark.
+   **Priority shifts from "flip flags" → "reach feature-completeness."**
+2. **Shadow-log validation is unreliable here.** The app's own mutating paths are
+   barely exercised (checkouts/bookings ride iHOTEL), so `shadow.*` logs accrue
+   almost nothing. Validate via the **read-only quote/validate endpoints + direct
+   canonical-PG↔iHOTEL diff** (as done for the folio on 2026-06-27), not by
+   waiting on shadow data.
+
+**Revised track order:**
+- **A. Correctness of what exists** — fix what verification surfaces: folio basis
+  (#34), `cin_rate_per_night = 0` data-completeness, read-only feature eyeball
+  (#29). Cheap, no reception scheduling.
+- **B. Feature-completeness for reception adoption** *(new core work, #35)* — audit
+  new app vs iHOTEL (`docs/legacy-app/FEATURE_MAP.md`) + daily reception
+  workflows → gap list → close by daily-ops frequency. This is the real gate.
+- **C. Coexistence write-back (DEFERRED)** — the flags below (#20/#30/#31 + round
+  writeback) wait until B is done and reception is using the app. Re-validate via
+  read-only diff, not shadow logs. The Jul-6 "flip BOOKING_VALIDATION after
+  shadow review" reminder rests on a false premise (no shadow data accrues) —
+  revise or cancel.
+
+The original sections A (live) / B (dark flags) / C (implementation) below are
+unchanged in content; only their **priority** is now A-correctness → B-features →
+C-flags.
+
 How to read the shadow logs (prod):
 ```
 docker logs new-hotel-production-backend-1 | grep 'shadow.checkout_total'
@@ -33,15 +68,21 @@ docker logs new-hotel-production-backend-1 | grep 'shadow.booking_validation'
 
 ## B. DARK — collect shadow data → decide → flip
 
-- [ ] **Checkout total — `CHECKOUT_SERVER_TOTAL_ENABLED` (spike Phase 2).**
-      Folio parity DONE (2026-06-27): the quote + flag-on checkout now compute the
-      full folio — room + POS products + VAT (inclusive, from settings) + deposit
-      line; net = room+product, balance = net−pay (matches iHOTEL HT_CheckIn_H).
-      1. Collect `shadow.checkout_total` over ~1–2 weeks of real checkouts; size
-         the client-vs-server delta (driven by actual- vs expected-nights basis).
-      2. **Decide the nights policy** with reception (match iHOTEL `FrmCheckOut`).
-      3. Flip `CHECKOUT_SERVER_TOTAL_ENABLED=true` once the delta is understood +
-         validated against real folios. (Implementation gap closed.)
+- [ ] **Checkout total — `CHECKOUT_SERVER_TOTAL_ENABLED` (spike Phase 2). ⛔ BLOCKED.**
+      **2026-06-27 live-data check (via PG on evergreen): the folio is broken — DO
+      NOT FLIP.** Room = `cin_rate_per_night × nights`, but `cin_rate_per_night = 0`
+      for 100% of check-ins (hotelnew 19,827 zero/2 null/0 positive; hotelville
+      1,873 zero/0 positive) and there's no fallback. `ht_pos_sales` is empty (no
+      POS data). Flipping would record/writeback **room=0, net=0, balance=−paid**,
+      zeroing room revenue + corrupting legacy `Total_Price_*`. Real amount lives
+      in `cin_total_amount` (= `cin_paid_amount`, synced from iHOTEL); `ht_payments`
+      populated (706 rows). Evidence + worked table:
+      `docs/coexistence/checkout-folio-comparison.md` (top).
+      **Fix first:** base room/net on `cin_total_amount` (`rate>0 ? rate×nights :
+      cin_total_amount`; derive display rate = total÷nights), re-run comparison.
+      Then: 1) collect `shadow.checkout_total`; 2) decide nights policy w/ reception;
+      3) flip. (Note: shadow log fires only on new-app checkouts — rare, since
+      checkouts still ride iHOTEL and sync in, so little shadow data accrues.)
 - [ ] **Booking validation — `BOOKING_VALIDATION_ENABLED` (spike Phase 3).**
       1. Collect `shadow.booking_validation` over real bookings; confirm it never
          flags a booking reception actually wants to make (zero false-rejects).
