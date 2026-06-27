@@ -5,6 +5,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useRef,
   useState,
   type ReactNode,
 } from 'react'
@@ -67,6 +68,66 @@ const PUBLIC_PATHS = new Set<string>(['/login'])
  * at cutover.
  */
 const AUTH_REQUIRED = process.env.NEXT_PUBLIC_AUTH_REQUIRED === 'true'
+
+/**
+ * Default inactivity window before auto-logout (30 minutes). Exported so the
+ * provider and tests share a single source of truth.
+ */
+export const IDLE_TIMEOUT_MS = 30 * 60 * 1000
+
+/** User-activity events that reset the idle countdown. */
+const IDLE_ACTIVITY_EVENTS = ['click', 'keydown', 'scroll'] as const
+
+/**
+ * Inactivity auto-logout timer.
+ *
+ * Arms a countdown that fires `onIdle` after `timeoutMs` of no user activity;
+ * any click / keydown / scroll resets it. Returns the cleanup that removes the
+ * listeners and clears the pending timer.
+ *
+ * **No-op when `enabled` is false** (the auth-dark default, or no session): no
+ * listeners are attached and no timer is armed, so a build with auth off
+ * behaves exactly as before. The provider passes
+ * `enabled = AUTH_REQUIRED && user !== null`, so the timer only runs once a
+ * real session exists under enforced auth.
+ *
+ * `onIdle` is read through a ref so a fresh callback identity each render does
+ * not tear down and re-arm the timer (which would never let it elapse).
+ */
+export function useIdleLogout({
+  enabled,
+  onIdle,
+  timeoutMs = IDLE_TIMEOUT_MS,
+}: {
+  enabled: boolean
+  onIdle: () => void
+  timeoutMs?: number
+}): void {
+  const onIdleRef = useRef(onIdle)
+  onIdleRef.current = onIdle
+
+  useEffect(() => {
+    if (!enabled || typeof window === 'undefined') return
+
+    let timer: ReturnType<typeof setTimeout>
+    const reset = () => {
+      clearTimeout(timer)
+      timer = setTimeout(() => onIdleRef.current(), timeoutMs)
+    }
+
+    IDLE_ACTIVITY_EVENTS.forEach((evt) =>
+      window.addEventListener(evt, reset, { passive: true }),
+    )
+    reset() // arm the initial countdown
+
+    return () => {
+      clearTimeout(timer)
+      IDLE_ACTIVITY_EVENTS.forEach((evt) =>
+        window.removeEventListener(evt, reset),
+      )
+    }
+  }, [enabled, timeoutMs])
+}
 
 interface LoginResponse {
   user: UserDto
@@ -183,9 +244,40 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   return (
     <AuthContext.Provider value={value}>
+      <IdleLogout />
       <AuthGuard>{children}</AuthGuard>
     </AuthContext.Provider>
   )
+}
+
+/**
+ * Idle-timeout auto-logout wiring. Active ONLY when auth is enforced
+ * (`NEXT_PUBLIC_AUTH_REQUIRED=true`) AND a user is logged in. On timeout it
+ * logs the user out and redirects to /login (preserving a return path). When
+ * auth is dark this renders nothing and arms no timer — a complete no-op, so
+ * the pre-cutover build is unaffected.
+ */
+function IdleLogout() {
+  const { user, logout } = useContext(AuthContext) as AuthContextValue
+  const router = useRouter()
+  const pathname = usePathname()
+
+  const handleIdle = useCallback(() => {
+    // Clear the session, then send them to /login with a return path. The
+    // AuthGuard would also redirect once `user` becomes null; doing it here
+    // makes the redirect immediate and explicit.
+    void logout().finally(() => {
+      const target = pathname ?? '/'
+      router.replace(`/login?redirect=${encodeURIComponent(target)}`)
+    })
+  }, [logout, router, pathname])
+
+  useIdleLogout({
+    enabled: AUTH_REQUIRED && user !== null,
+    onIdle: handleIdle,
+  })
+
+  return null
 }
 
 /**

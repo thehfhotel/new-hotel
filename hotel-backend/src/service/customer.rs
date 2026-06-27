@@ -57,6 +57,11 @@ pub struct UpdateCustomerCommand {
     pub address: Option<String>,
     pub customer_type: Option<String>,
     pub notes: Option<String>,
+    /// Auth-residual (task #56) editing operator → `cust_updated_by`. The
+    /// route resolves this from the authenticated `Extension<User>` (preferred)
+    /// or the body `updatedBy` fallback. `None` (auth dark, no body) ⇒ the
+    /// column is left untouched — behavior is identical to before this field.
+    pub updated_by: Option<String>,
     pub source: EventSource,
 }
 
@@ -306,6 +311,20 @@ impl CustomerService {
             )));
         }
 
+        // Auth residual (task #56): stamp the editing operator into
+        // `cust_updated_by`. Additive + conditional — only runs when an actor
+        // was resolved (authenticated user, or the body `updatedBy` fallback),
+        // so with auth dark and no body value this is a zero-write no-op and the
+        // prior behavior is unchanged. Runs inside this same TX so the audit
+        // stamp commits atomically with the canonical UPDATE + writeback enqueue.
+        if let Some(by) = cmd.updated_by.as_deref() {
+            sqlx::query("UPDATE ht_customers SET cust_updated_by = $1 WHERE cust_id = $2")
+                .bind(by)
+                .bind(cmd.customer_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
         let aggregate_id = aggregate_uuid(AggregateKind::Customer, cmd.customer_id);
 
         // Coexistence audit 2026-06-11 P2 — mirror the edit onto legacy
@@ -449,6 +468,7 @@ mod tests {
             address: Some("88/8".into()),
             customer_type: Some("บุคคลธรรมดา".into()),
             notes: None,
+            updated_by: None,
             source: EventSource::System { reason: "test".into() },
         }
     }
@@ -636,5 +656,60 @@ mod tests {
         assert_eq!(count, 2, "each edit must enqueue its own job");
 
         cleanup(&pool, marker_cust_no).await;
+    }
+
+    /// Auth residual (task #56): an edit carrying a resolved actor stamps
+    /// `cust_updated_by`; an edit with `updated_by = None` (auth dark) leaves
+    /// the column untouched.
+    #[tokio::test]
+    async fn update_stamps_cust_updated_by_when_actor_present() {
+        let _guard = UC_TEST_LOCK.lock().await;
+        let Some(pool) = try_pool().await else {
+            eprintln!("skipping update_stamps_cust_updated_by — PG not reachable");
+            return;
+        };
+        let _ = sqlx::query("DELETE FROM ht_customers WHERE cust_firstname LIKE 'TEST_UCBY_%'")
+            .execute(&pool)
+            .await;
+
+        let row = sqlx::query(
+            "INSERT INTO ht_customers (cust_firstname) \
+             VALUES ('TEST_UCBY_BEFORE') RETURNING cust_id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("seed insert must succeed");
+        let cust_id: i32 = row.try_get("cust_id").unwrap();
+
+        let svc = build_service(pool.clone());
+
+        // Auth dark: None ⇒ column stays NULL.
+        svc.update(update_cmd(cust_id, "TEST_UCBY_NOAUTH", "0900000000"))
+            .await
+            .expect("update without actor must succeed");
+        let by: Option<String> =
+            sqlx::query_scalar("SELECT cust_updated_by FROM ht_customers WHERE cust_id = $1")
+                .bind(cust_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(by, None, "no actor ⇒ cust_updated_by untouched (NULL)");
+
+        // Auth on: the resolved actor lands in cust_updated_by.
+        let mut cmd = update_cmd(cust_id, "TEST_UCBY_AUTH", "0900000001");
+        cmd.updated_by = Some("alice".into());
+        svc.update(cmd).await.expect("update with actor must succeed");
+        let by: Option<String> =
+            sqlx::query_scalar("SELECT cust_updated_by FROM ht_customers WHERE cust_id = $1")
+                .bind(cust_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(by.as_deref(), Some("alice"));
+
+        let _ = sqlx::query("DELETE FROM ht_customers WHERE cust_id = $1")
+            .bind(cust_id)
+            .execute(&pool)
+            .await;
     }
 }

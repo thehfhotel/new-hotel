@@ -29,7 +29,7 @@
 //! [`resolve_customer_id_int`](crate::routes::customers::resolve_customer_id_int).
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     Json,
 };
 use chrono::NaiveDateTime;
@@ -38,6 +38,7 @@ use uuid::Uuid;
 
 use super::mode::{AppState, Branch};
 use crate::db::PgPool;
+use crate::domain::user::User;
 use crate::error::{ApiError, ApiResult};
 use crate::models::Pagination;
 use crate::outbox::event::EventSource;
@@ -124,6 +125,13 @@ pub struct CreateUpdateCustomerRequest {
     pub address: Option<String>,
     pub customer_type: Option<String>,
     pub notes: Option<String>,
+    /// Auth-residual (task #56) actor fallback for `cust_updated_by`. The
+    /// authenticated session user (injected as `Extension<User>`) is preferred;
+    /// this body field is only used when auth is dark. Optional + `serde`
+    /// default so existing clients that omit it are unaffected; `create_customer`
+    /// ignores it (its actor is folded into the booking/check-in writeback).
+    #[serde(default)]
+    pub updated_by: Option<String>,
 }
 
 /// Response for create/update/delete operations
@@ -258,12 +266,19 @@ pub async fn update_customer(
     State(state): State<AppState>,
     Path(path_id): Path<String>,
     Query(query): Query<CustomerMutationQuery>,
+    // Auth residual (task #56): prefer the authenticated operator over the body
+    // `updatedBy` fallback for `cust_updated_by`. Auth ships dark, so this is
+    // `Option<_>` (extractor absent → `None`) and behavior is unchanged when
+    // off. Must precede the `Json` body extractor (which consumes the request).
+    actor: Option<Extension<User>>,
     Json(body): Json<CreateUpdateCustomerRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
     let pool = customer_pool_for(&state, query.branch)?;
     let cust_id = resolve_customer_id_int(&pool, &path_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Customer not found".to_string()))?;
+
+    let updated_by = super::resolve_actor(actor.as_deref(), body.updated_by.as_deref());
 
     let outcome = customer_service_for(&state, pool)
         .update(UpdateCustomerCommand {
@@ -276,6 +291,7 @@ pub async fn update_customer(
             address: body.address,
             customer_type: body.customer_type,
             notes: body.notes,
+            updated_by,
             // TODO: wire user_id from auth middleware
             source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
         })
@@ -309,6 +325,11 @@ pub async fn update_customer(
 /// moot; ville mutations stay blocked by the `ville_write_guard` regardless.)
 pub async fn delete_customer(
     State(state): State<AppState>,
+    // Auth residual (task #56): the authenticated operator, when present. A
+    // soft-delete is an UPDATE, so we stamp the actor into `cust_updated_by`
+    // (same column as `update_customer`). DELETE carries no body, so there is
+    // no fallback value — auth dark ⇒ `None` ⇒ no stamp ⇒ unchanged behavior.
+    actor: Option<Extension<User>>,
     Path(path_id): Path<String>,
     Query(query): Query<CustomerMutationQuery>,
 ) -> ApiResult<Json<MutationResponse>> {
@@ -317,6 +338,8 @@ pub async fn delete_customer(
         .await?
         .ok_or_else(|| ApiError::NotFound("Customer not found".to_string()))?;
 
+    let updated_by = super::resolve_actor(actor.as_deref(), None);
+
     let mut tx = pool.begin().await?;
     let rows_affected = state.customers.soft_delete(&mut tx, cust_id).await?;
 
@@ -324,6 +347,19 @@ pub async fn delete_customer(
         tx.rollback().await?;
         return Err(ApiError::NotFound("Customer not found".to_string()));
     }
+
+    // Additive, conditional audit stamp — only runs when an actor is resolved
+    // (auth on). Kept inside the same TX as the soft-delete so the flag flip
+    // and the `cust_updated_by` stamp commit atomically. No-op when auth is
+    // dark (`updated_by` is `None`).
+    if let Some(by) = updated_by.as_deref() {
+        sqlx::query("UPDATE ht_customers SET cust_updated_by = $1 WHERE cust_id = $2")
+            .bind(by)
+            .bind(cust_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+
     tx.commit().await?;
 
     Ok(Json(MutationResponse {

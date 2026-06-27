@@ -35,7 +35,7 @@
 //! [`lookup_by_room_and_cust_type`] helper.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     Json,
 };
 use chrono::NaiveDate;
@@ -44,6 +44,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use super::mode::{AppState, Branch};
+use crate::domain::user::User;
 use crate::error::{ApiError, ApiResult};
 use crate::outbox::intent::{rate_price_aggregate, RatePricePayload, WritebackIntent};
 use crate::outbox::{generate_idempotency_key, OutboxRepository};
@@ -612,6 +613,12 @@ pub struct CreateRateTierRequest {
     pub price_monthly: Option<f64>,
     #[serde(default = "default_true")]
     pub active: bool,
+    /// Auth-residual (task #56) operator fallback for the audit trail. Used
+    /// only when auth is dark; the authenticated `Extension<User>` wins. The
+    /// rate matrix has no `*_by` column and we add no migration, so the actor
+    /// is recorded in the structured audit log rather than persisted.
+    #[serde(default)]
+    pub by: Option<String>,
 }
 
 /// Request body for `PUT /api/rate-tiers/:id`. The composite key
@@ -628,6 +635,10 @@ pub struct UpdateRateTierRequest {
     pub price_monthly: Option<f64>,
     #[serde(default = "default_true")]
     pub active: bool,
+    /// Auth-residual (task #56) operator fallback — see
+    /// [`CreateRateTierRequest::by`]. Audit-log only (no `*_by` column).
+    #[serde(default)]
+    pub by: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -687,8 +698,16 @@ pub async fn list_rate_tiers(
 /// canonical PG and enqueue the legacy `HT_Rooms_Price` UPSERT.
 pub async fn create_rate_tier(
     State(state): State<AppState>,
+    // Auth residual (task #56): the authenticated operator, when present. Auth
+    // ships dark, so this is `Option<_>` and resolves to `None`. The rate matrix
+    // (canonical `ht_rate_tiers`, deprecated `ht_rates`, and legacy
+    // `HT_Rooms_Price`) has no `*_by` column and we add no migration, so the
+    // resolved actor is captured in the structured audit log below rather than
+    // persisted. Must precede the `Json` body extractor.
+    actor: Option<Extension<User>>,
     Json(body): Json<CreateRateTierRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
+    let edited_by = super::resolve_actor(actor.as_deref(), body.by.as_deref());
     let room_type = body.room_type.trim();
     let cust_type = body.cust_type.trim();
     if room_type.is_empty() {
@@ -750,6 +769,20 @@ pub async fn create_rate_tier(
 
     tx.commit().await?;
 
+    // Auth residual (task #56): audit who created the tier. Gated on a resolved
+    // actor, so with auth dark and no body `by` this never logs — a true no-op.
+    if let Some(actor) = edited_by.as_deref() {
+        tracing::info!(
+            target: "audit",
+            actor,
+            site,
+            room_type,
+            cust_type,
+            rate_tier_id,
+            "rate tier created"
+        );
+    }
+
     Ok(Json(MutationResponse {
         success: true,
         message: "Rate tier created successfully".to_string(),
@@ -762,8 +795,13 @@ pub async fn create_rate_tier(
 pub async fn update_rate_tier(
     State(state): State<AppState>,
     Path(rate_tier_id): Path<i64>,
+    // Auth residual (task #56): authenticated operator, when present. See
+    // `create_rate_tier` — audit-log only (no `*_by` column, no migration).
+    // Must precede the `Json` body extractor.
+    actor: Option<Extension<User>>,
     Json(body): Json<UpdateRateTierRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
+    let edited_by = super::resolve_actor(actor.as_deref(), body.by.as_deref());
     if !body.price.is_finite() || body.price < 0.0 {
         return Err(ApiError::BadRequest("Price must be a non-negative number".to_string()));
     }
@@ -813,6 +851,20 @@ pub async fn update_rate_tier(
     .await?;
 
     tx.commit().await?;
+
+    // Auth residual (task #56): audit who edited the tier. Gated on a resolved
+    // actor, so auth dark + no body `by` is a true no-op (never logs).
+    if let Some(actor) = edited_by.as_deref() {
+        tracing::info!(
+            target: "audit",
+            actor,
+            site,
+            room_type = room_type.as_str(),
+            cust_type = cust_type.as_str(),
+            rate_tier_id,
+            "rate tier updated"
+        );
+    }
 
     Ok(Json(MutationResponse {
         success: true,
