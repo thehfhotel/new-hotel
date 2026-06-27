@@ -52,10 +52,8 @@ pub struct PosQuery {
 /// outbox / event-bus handles (cheap Arc clones) and the resolved pool —
 /// same construction shape as `routes::housekeeping::service_for`.
 fn service_for(state: &AppState, branch: Option<Branch>) -> ApiResult<PosService> {
-    let pool = match branch.unwrap_or_default() {
-        Branch::Hfville => state.ville_pool()?.clone(),
-        Branch::Hfhotel | Branch::All => state.new_pool.clone(),
-    };
+    // Delegate the Hfville→ville_pool decision to the unified write chokepoint.
+    let pool = state.write_pool(branch)?.clone();
     Ok(PosService::new(
         state.outbox.clone(),
         state.events.clone(),

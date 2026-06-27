@@ -150,10 +150,8 @@ pub struct CustomerMutationQuery {
 /// (cheap `PgPool` clone) so the caller can both resolve the id and build a
 /// per-request [`CustomerService`] bound to it.
 fn customer_pool_for(state: &AppState, branch: Option<Branch>) -> ApiResult<PgPool> {
-    Ok(match branch.unwrap_or_default() {
-        Branch::Hfville => state.ville_pool()?.clone(),
-        Branch::Hfhotel | Branch::All => state.new_pool.clone(),
-    })
+    // Delegate the Hfville→ville_pool decision to the unified write chokepoint.
+    Ok(state.write_pool(branch)?.clone())
 }
 
 /// Build a [`CustomerService`] bound to `pool`, reusing the AppState

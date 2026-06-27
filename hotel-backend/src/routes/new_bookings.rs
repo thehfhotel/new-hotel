@@ -342,6 +342,11 @@ pub async fn create_booking(
     State(state): State<AppState>,
     Json(body): Json<CreateUpdateBookingRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
+    // TODO(ville-bundle): writes via the pre-wired `state.bookings_service`
+    // (bound to new_pool at startup) + reads new_pool directly. Per-site Ville
+    // support needs `state.resolve_write_services(branch)?.bookings` + a
+    // `?branch=` param. Allowlisted in scripts/check-write-pool-routing.sh;
+    // HF Ville mutations stay 403'd by `ville_write_guard` until then.
     // Task #52: zero rooms is allowed — a waitlist / unassigned reservation.
     // The service persists it canonically and skips the legacy mirror (no room
     // number to write back); a room is assigned later via the edit flow.
@@ -415,6 +420,9 @@ pub async fn update_booking(
     Path(book_id): Path<i32>,
     Json(body): Json<CreateUpdateBookingRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
+    // TODO(ville-bundle): service-bound (state.bookings_service) + reads
+    // new_pool — see create_booking. Allowlisted in the write-pool-routing gate
+    // pending resolve_write_services + a ?branch= param.
     // Task #52: an edit may clear all rooms (back to waitlist) or assign the
     // first room to a previously-unassigned booking — both are valid.
 
@@ -649,12 +657,9 @@ pub async fn validate_booking(
     }
 
     // ----- availability (overlap over [check_in, check_out)) -----
-    // Branch-aware pool selection, mirroring `list_bookings`. `All` is not a
-    // meaningful target for a single-room booking → default to the HF Hotel pool.
-    let pool = match body.branch.unwrap_or_default() {
-        Branch::Hfville => state.ville_pool()?,
-        Branch::Hfhotel | Branch::All => &state.new_pool,
-    };
+    // Per-site pool via the unified write chokepoint. `All` is not a meaningful
+    // target for a single-room booking → it collapses to the HF Hotel pool.
+    let pool = state.write_pool(body.branch)?;
 
     // Resolve the room. `room_id` wins; else look up `room_no`. A missing room
     // is an availability failure (cannot book a room that doesn't exist).

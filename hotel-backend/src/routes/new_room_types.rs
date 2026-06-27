@@ -37,10 +37,8 @@ use crate::models::Pagination;
 /// price-bearing dimension iHOTEL actually consumes (`HT_Rooms_Price`) IS
 /// mirrored — edit it via the rate-tier endpoints, which DO write back.
 fn room_type_pool(state: &AppState, branch: Branch) -> ApiResult<&crate::db::PgPool> {
-    match branch {
-        Branch::Hfville => state.ville_pool(),
-        Branch::Hfhotel | Branch::All => Ok(&state.new_pool),
-    }
+    // Delegate to the unified per-site write chokepoint.
+    state.write_pool(Some(branch))
 }
 
 /// Branch selector for the single-room-type ops (get/create/update/delete).

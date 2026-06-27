@@ -269,12 +269,9 @@ pub async fn get_room(
     Path(room_id): Path<i32>,
     Query(params): Query<NewRoomQuery>,
 ) -> ApiResult<Json<NewRoomResponse>> {
-    // Branch-aware: HF Hotel reads new_pool, HF Ville reads ville_pool. `All`
-    // is not meaningful for a single id → default to HF Hotel.
-    let pool = match params.branch.unwrap_or_default() {
-        Branch::Hfville => state.ville_pool()?,
-        Branch::Hfhotel | Branch::All => &state.new_pool,
-    };
+    // Per-site pool via the unified write chokepoint. `All` is not meaningful
+    // for a single id → it collapses to the HF Hotel pool.
+    let pool = state.write_pool(params.branch)?;
     let row = state
         .rooms
         .get(pool, room_id)
@@ -301,14 +298,19 @@ pub async fn get_room(
 /// back (`update_room`).
 pub async fn create_room(
     State(state): State<AppState>,
+    Query(params): Query<NewRoomQuery>,
     Json(body): Json<CreateUpdateRoomRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
+    // Per-site pool via the unified write chokepoint (Ship-B). HF Ville
+    // mutations stay gated by `ville_write_guard` until HFVILLE_WRITES_ENABLED.
+    let pool = state.write_pool(params.branch)?;
+
     let room_no = body.room_no.trim();
     if room_no.is_empty() {
         return Err(ApiError::BadRequest("Room number is required".to_string()));
     }
 
-    let existing = state.rooms.find_by_room_no(&state.new_pool, room_no).await?;
+    let existing = state.rooms.find_by_room_no(pool, room_no).await?;
     if existing.is_some() {
         return Err(ApiError::BadRequest("Room number already exists".to_string()));
     }
@@ -317,7 +319,7 @@ pub async fn create_room(
     let is_clean = body.is_clean.unwrap_or(true);
     let is_maintenance = body.is_maintenance.unwrap_or(false);
 
-    let mut tx = state.new_pool.begin().await?;
+    let mut tx = pool.begin().await?;
     let id = state
         .rooms
         .insert(
@@ -366,8 +368,13 @@ pub async fn create_room(
 pub async fn update_room(
     State(state): State<AppState>,
     Path(room_id): Path<i32>,
+    Query(params): Query<NewRoomQuery>,
     Json(body): Json<CreateUpdateRoomRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
+    // Per-site pool via the unified write chokepoint (Ship-B). HF Ville
+    // mutations stay gated by `ville_write_guard` until HFVILLE_WRITES_ENABLED.
+    let pool = state.write_pool(params.branch)?;
+
     let room_no = body.room_no.trim();
     if room_no.is_empty() {
         return Err(ApiError::BadRequest("Room number is required".to_string()));
@@ -375,7 +382,7 @@ pub async fn update_room(
 
     let existing = state
         .rooms
-        .find_by_room_no_excluding(&state.new_pool, room_no, room_id)
+        .find_by_room_no_excluding(pool, room_no, room_id)
         .await?;
     if existing.is_some() {
         return Err(ApiError::BadRequest("Room number already exists".to_string()));
@@ -391,9 +398,9 @@ pub async fn update_room(
     // `None` is propagated as `None` so the recipe skips the
     // `Room_Type=` SET fragment (preserves the iHOTEL-side value).
     let resolved_type_name =
-        load_room_type_name(&state.new_pool, body.room_type_id).await?;
+        load_room_type_name(pool, body.room_type_id).await?;
 
-    let mut tx = state.new_pool.begin().await?;
+    let mut tx = pool.begin().await?;
 
     // Capture the legacy `Room_no` BEFORE the UPDATE so the writeback
     // recipe targets the existing MSSQL row even when the operator is
@@ -589,8 +596,13 @@ pub struct UpdateRoomStatusRequest {
 pub async fn update_room_status(
     State(state): State<AppState>,
     Path(room_id): Path<i32>,
+    Query(params): Query<NewRoomQuery>,
     Json(body): Json<UpdateRoomStatusRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
+    // Per-site pool via the unified write chokepoint (Ship-B). HF Ville
+    // mutations stay gated by `ville_write_guard` until HFVILLE_WRITES_ENABLED.
+    let pool = state.write_pool(params.branch)?;
+
     let status = body.status.trim().to_lowercase();
 
     let valid_statuses = ["available", "occupied", "maintenance", "cleaning"];
@@ -602,7 +614,7 @@ pub async fn update_room_status(
         )));
     }
 
-    let mut tx = state.new_pool.begin().await?;
+    let mut tx = pool.begin().await?;
     let rows_affected = state
         .rooms
         .update_status(&mut tx, room_id, status.as_str())

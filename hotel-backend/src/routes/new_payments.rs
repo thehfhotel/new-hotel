@@ -183,6 +183,12 @@ pub async fn create_payment(
     Path(cin_id): Path<i32>,
     Json(body): Json<CreatePaymentRequest>,
 ) -> ApiResult<Json<PaymentMutationResponse>> {
+    // TODO(ville-bundle): writes via the pre-wired `state.payments_service`
+    // (bound to new_pool + the shift gate at startup) + reads new_pool, and
+    // touches live charges. Per-site Ville support needs
+    // `state.resolve_write_services(branch)?.payments` + a `?branch=` param.
+    // Allowlisted in scripts/check-write-pool-routing.sh; HF Ville mutations
+    // stay 403'd by `ville_write_guard` until then.
     if body.amount <= 0.0 {
         return Err(ApiError::BadRequest("Payment amount must be greater than 0".to_string()));
     }
@@ -315,6 +321,9 @@ pub async fn refund_payment(
     Path(pay_id): Path<i32>,
     Json(body): Json<RefundPaymentRequest>,
 ) -> ApiResult<Json<PaymentMutationResponse>> {
+    // TODO(ville-bundle): service-bound (state.payments_service) + reads
+    // new_pool — see create_payment. Allowlisted in the write-pool-routing gate
+    // pending resolve_write_services + a ?branch= param.
     if !body.amount.is_finite() || body.amount <= 0.0 {
         return Err(ApiError::BadRequest(
             "Refund amount must be a positive finite number".to_string(),

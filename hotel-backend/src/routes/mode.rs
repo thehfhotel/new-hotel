@@ -30,24 +30,26 @@ use crate::service::{
 ///
 /// Returned by the helper so the two public constructors (`new` and
 /// `with_mode`) can spread the fields into [`AppState`] without repeating the
-/// service graph wiring twice.
-struct WiredServices {
-    customers: Arc<CustomerService>,
-    bookings: Arc<BookingService>,
-    checkins: Arc<CheckInService>,
-    payments: Arc<PaymentService>,
-    housekeeping: Arc<HousekeepingService>,
+/// service graph wiring twice. Also the return type of
+/// [`AppState::resolve_write_services`] — the per-site write chokepoint hands
+/// back a bundle bound to the branch's pool (Ship-B), so the fields are `pub`.
+pub struct WiredServices {
+    pub customers: Arc<CustomerService>,
+    pub bookings: Arc<BookingService>,
+    pub checkins: Arc<CheckInService>,
+    pub payments: Arc<PaymentService>,
+    pub housekeeping: Arc<HousekeepingService>,
     /// Track F2 / T1 HIGH-5 — shift service bound to this binary's
     /// site (read from `SITE_ID` at startup). Wired into
     /// `PaymentService::with_shifts` so `record_payment` refuses to
     /// insert unless an `ht_shifts` row is open.
-    shifts: Arc<ShiftService>,
+    pub shifts: Arc<ShiftService>,
     /// Track G5 — coupon issuing canonical service.
-    coupons: Arc<CouponService>,
+    pub coupons: Arc<CouponService>,
     /// Track G6 — POS / sales-to-room service. Stateless once
     /// constructed; reads `ht_products` + `ht_checkins`, writes
     /// `ht_pos_sales` + outbox intent.
-    pos: Arc<PosService>,
+    pub pos: Arc<PosService>,
 }
 
 /// System operating mode
@@ -408,6 +410,68 @@ impl AppState {
         self.ville_pool
             .as_ref()
             .ok_or_else(|| ApiError::Internal("HF Ville database is not available".to_string()))
+    }
+
+    /// THE unified per-site write chokepoint (Ship-B, ADR 0002).
+    ///
+    /// Resolves the PostgreSQL pool a request must use, from its `?branch=`:
+    /// - `Branch::Hfville` → the `hotelville` logical pool ([`ville_pool`](Self::ville_pool)),
+    /// - everything else (`Hfhotel`, `All`, unset) → the primary `new_pool`.
+    ///
+    /// Every per-site pool/service helper in `routes/` delegates here
+    /// (`housekeeping::service_for`, `new_cash::resolve_pool`,
+    /// `new_customers::customer_pool_for`, `new_checkins::checkin_pool_for`,
+    /// `new_pos::service_for`, `new_notes::resolve_pool`, …) so the
+    /// `Hfville → ville_pool` decision lives in exactly ONE place. That closes
+    /// risk R2 — a `branch=hfville` *write* silently landing in the HF Hotel
+    /// pool. Enforced in CI by `scripts/check-write-pool-routing.sh`.
+    ///
+    /// SAFETY: while `HFVILLE_WRITES_ENABLED` is off the `ville_write_guard`
+    /// middleware (`main.rs`) 403s every `branch=hfville` mutation *before* it
+    /// reaches a handler, so this routing is dormant until an operator flips the
+    /// flag. Returns `ApiError::Internal` if Ville is requested but its pool was
+    /// unavailable at startup (same contract as [`ville_pool`](Self::ville_pool)).
+    pub fn write_pool(&self, branch: Option<Branch>) -> ApiResult<&crate::db::PgPool> {
+        match branch.unwrap_or_default() {
+            Branch::Hfville => self.ville_pool(),
+            Branch::Hfhotel | Branch::All => Ok(&self.new_pool),
+        }
+    }
+
+    /// Per-site service bundle bound to [`write_pool`](Self::write_pool) for
+    /// `branch`. The HF Hotel / `All` path returns AppState's pre-wired service
+    /// Arcs unchanged (byte-identical behavior — zero allocation beyond Arc
+    /// clones); the HF Ville path rebuilds the service graph bound to the
+    /// `hotelville` pool via the same [`wire_services`](Self::wire_services)
+    /// used at startup, so a Ville write can never reach an HF-Hotel-pool-bound
+    /// service. Use this (instead of the pre-wired `state.*_service` fields)
+    /// from any mutating handler that must honor `?branch=`.
+    pub fn resolve_write_services(&self, branch: Option<Branch>) -> ApiResult<WiredServices> {
+        match branch.unwrap_or_default() {
+            Branch::Hfhotel | Branch::All => Ok(WiredServices {
+                customers: self.customers_service.clone(),
+                bookings: self.bookings_service.clone(),
+                checkins: self.checkins_service.clone(),
+                payments: self.payments_service.clone(),
+                housekeeping: self.housekeeping_service.clone(),
+                shifts: self.shifts_service.clone(),
+                coupons: self.coupons_service.clone(),
+                pos: self.pos_service.clone(),
+            }),
+            Branch::Hfville => {
+                let pool = self.ville_pool()?.clone();
+                Ok(Self::wire_services(
+                    self.customers.clone(),
+                    self.bookings.clone(),
+                    self.checkins.clone(),
+                    self.rooms.clone(),
+                    self.payments.clone(),
+                    self.outbox.clone(),
+                    self.events.clone(),
+                    pool,
+                ))
+            }
+        }
     }
 }
 

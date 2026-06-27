@@ -571,10 +571,10 @@ fn rate_tier_from_row(row: &sqlx::postgres::PgRow) -> RateTier {
 /// Resolve the canonical pool + the diagnostic site string for a branch.
 /// `Branch::All` is not meaningful for a write → treated as HF Hotel.
 fn pool_and_site(state: &AppState, branch: Branch) -> ApiResult<(&crate::db::PgPool, &'static str)> {
-    match branch {
-        Branch::Hfville => Ok((state.ville_pool()?, "hfville")),
-        Branch::Hfhotel | Branch::All => Ok((&state.new_pool, "hfhotel")),
-    }
+    // Pool selection delegates to the unified per-site write chokepoint; the
+    // diagnostic site string stays local (only `Hfville` is distinct).
+    let site = if matches!(branch, Branch::Hfville) { "hfville" } else { "hfhotel" };
+    Ok((state.write_pool(Some(branch))?, site))
 }
 
 /// Query parameters for `GET /api/rate-tiers`.

@@ -324,6 +324,11 @@ pub async fn create_checkin(
     actor: Option<Extension<User>>,
     Json(body): Json<CreateCheckInRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
+    // TODO(ville-bundle): writes via the pre-wired `state.checkins_service`
+    // (bound to new_pool + the shift gate at startup) + reads new_pool. Per-site
+    // Ville support needs `state.resolve_write_services(branch)?.checkins` + a
+    // `?branch=` param. Allowlisted in scripts/check-write-pool-routing.sh;
+    // HF Ville mutations stay 403'd by `ville_write_guard` until then.
     let cin_no = generate_cin_no(&state).await?;
     let expected_checkout = parse_expected_checkout(&body.expected_checkout)?;
     let check_in_time = parse_check_in_time(body.check_in_time.as_deref())?;
@@ -523,6 +528,9 @@ pub async fn checkout(
     Path(cin_id): Path<i32>,
     Json(body): Json<CheckOutRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
+    // TODO(ville-bundle): service-bound (state.checkins_service) + reads
+    // new_pool, and touches live charges. Allowlisted in the write-pool-routing
+    // gate pending resolve_write_services + a ?branch= param.
     // The service runs the same status/active check, but we still need
     // `cin_no` for the response (the service outcome only carries the id).
     let status_snap = state
@@ -1297,10 +1305,8 @@ const DEP_STATUS_REFUNDED: &str = "คืนเงินแล้ว";
 /// check-in mutation so it falls back to HF Hotel. Shared by extend /
 /// change-dates / room-change-receipt.
 fn checkin_pool_for(state: &AppState, branch: Option<Branch>) -> ApiResult<&PgPool> {
-    Ok(match branch.unwrap_or_default() {
-        Branch::Hfville => state.ville_pool()?,
-        Branch::Hfhotel | Branch::All => &state.new_pool,
-    })
+    // Delegate to the unified per-site write chokepoint.
+    state.write_pool(branch)
 }
 
 /// Build a [`CheckInService`] bound to the branch's pool. Mirrors
@@ -1313,10 +1319,8 @@ fn checkin_pool_for(state: &AppState, branch: Option<Branch>) -> ApiResult<&PgPo
 /// change-dates / change-room) touch the round-bill shift gate, so the
 /// service is constructed without `with_shifts`.
 fn checkin_service_for(state: &AppState, branch: Option<Branch>) -> ApiResult<CheckInService> {
-    let pool = match branch.unwrap_or_default() {
-        Branch::Hfville => state.ville_pool()?.clone(),
-        Branch::Hfhotel | Branch::All => state.new_pool.clone(),
-    };
+    // Delegate the Hfville→ville_pool decision to the unified write chokepoint.
+    let pool = state.write_pool(branch)?.clone();
     Ok(CheckInService::new(
         state.checkins.clone(),
         state.outbox.clone(),
@@ -1748,8 +1752,13 @@ pub async fn list_guests(
 pub async fn create_guest(
     State(state): State<AppState>,
     Path(cin_id): Path<i32>,
+    Query(query): Query<BranchQuery>,
     Json(body): Json<CreateGuestRequest>,
 ) -> ApiResult<Json<GuestMutationResponse>> {
+    // Per-site pool via the unified write chokepoint (Ship-B). HF Ville
+    // mutations stay gated by `ville_write_guard` until HFVILLE_WRITES_ENABLED.
+    let pool = state.write_pool(query.branch)?;
+
     let first_name = body.first_name.trim();
     if first_name.is_empty() {
         return Err(ApiError::BadRequest("Guest first name is required".to_string()));
@@ -1757,7 +1766,7 @@ pub async fn create_guest(
 
     let status_snap = state
         .checkins
-        .find_status(&state.new_pool, cin_id)
+        .find_status(pool, cin_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
 
@@ -1768,7 +1777,7 @@ pub async fn create_guest(
 
     let is_primary = body.is_primary.unwrap_or(false);
 
-    let mut tx = state.new_pool.begin().await?;
+    let mut tx = pool.begin().await?;
 
     // If this guest is marked as primary, unset any existing primary guest
     if is_primary {
@@ -1812,10 +1821,15 @@ pub struct GuestPath {
 pub async fn delete_guest(
     State(state): State<AppState>,
     Path(path): Path<GuestPath>,
+    Query(query): Query<BranchQuery>,
 ) -> ApiResult<Json<GuestMutationResponse>> {
+    // Per-site pool via the unified write chokepoint (Ship-B). HF Ville
+    // mutations stay gated by `ville_write_guard` until HFVILLE_WRITES_ENABLED.
+    let pool = state.write_pool(query.branch)?;
+
     let status_snap = state
         .checkins
-        .find_status(&state.new_pool, path.id)
+        .find_status(pool, path.id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
 
@@ -1826,13 +1840,13 @@ pub async fn delete_guest(
 
     let exists = state
         .checkins
-        .find_guest_in_checkin(&state.new_pool, path.id, path.guest_id)
+        .find_guest_in_checkin(pool, path.id, path.guest_id)
         .await?;
     if exists.is_none() {
         return Err(ApiError::NotFound("Guest not found for this check-in".to_string()));
     }
 
-    let mut tx = state.new_pool.begin().await?;
+    let mut tx = pool.begin().await?;
     state
         .checkins
         .delete_guest(&mut tx, path.id, path.guest_id)

@@ -82,10 +82,8 @@ pub struct HousekeepingResponse {
 /// AppState repository / outbox / event-bus handles (cheap Arc clones) and the
 /// resolved pool handle — same construction shape as `AppState::wire_services`.
 fn service_for(state: &AppState, branch: Option<Branch>) -> ApiResult<HousekeepingService> {
-    let pool = match branch.unwrap_or_default() {
-        Branch::Hfville => state.ville_pool()?.clone(),
-        Branch::Hfhotel | Branch::All => state.new_pool.clone(),
-    };
+    // Delegate the Hfville→ville_pool decision to the unified write chokepoint.
+    let pool = state.write_pool(branch)?.clone();
     Ok(HousekeepingService::new(
         state.rooms.clone(),
         state.outbox.clone(),

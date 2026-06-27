@@ -290,6 +290,35 @@ jobs:
           fi
           echo "OK: no conflict markers in source tree"
 
+  # Per-site write chokepoint gate (Ship-B / ADR 0002 — task #20).
+  #
+  # Every MUTATING route handler must resolve its PostgreSQL pool through the
+  # unified chokepoint (`AppState::write_pool` / a delegating helper), never via
+  # `state.new_pool` directly — otherwise, once `HFVILLE_WRITES_ENABLED` flips, a
+  # `branch=hfville` write would silently land in the HF Hotel pool (risk R2,
+  # cross-site corruption). This script makes that a CI failure so the next
+  # mutating handler can't reintroduce the footgun. Legitimate exceptions
+  # (HF-Hotel-only/global handlers, plus service-bound flows deferred to the flip
+  # task) are on an explicit, reasoned allowlist inside the script.
+  #
+  # Same shape as lint-cardinality-map: self-tested (`--self-test` runs the PASS
+  # and FAIL branches in a scratch dir) and added to test-backend / build-backend
+  # `needs:` so a violation blocks backend work.
+  lint-write-pool-routing:
+    runs-on: ubuntu-latest
+    needs: changes
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
+
+      - name: Self-test the check script
+        run: ./scripts/check-write-pool-routing.sh --self-test
+
+      - name: Enforce per-site write-pool routing for mutating handlers
+        run: ./scripts/check-write-pool-routing.sh
+
   # Track J2 guard (audit-2026-05-14 follow-on to PR #99).
   #
   # PR #89 added `hotel-backend/src/secrets.rs::hydrate_env_from_secret_files`
@@ -419,10 +448,11 @@ jobs:
 
   test-backend:
     runs-on: ubuntu-latest
-    # `lint-cardinality-map` added as a dependency so a P1 violation blocks
-    # backend work before sqlx/test cycles burn runner minutes. The lint job
-    # is cheap (~1s) so the serialisation cost is negligible.
-    needs: [changes, lint-cardinality-map]
+    # `lint-cardinality-map` + `lint-write-pool-routing` added as dependencies so
+    # a P1 / write-routing violation blocks backend work before sqlx/test cycles
+    # burn runner minutes. Both lint jobs are cheap (~1s) so the serialisation
+    # cost is negligible.
+    needs: [changes, lint-cardinality-map, lint-write-pool-routing]
     if: needs.changes.outputs.backend == 'true'
     permissions:
       contents: read
@@ -704,7 +734,7 @@ jobs:
     #
     # `should-deploy` (Track J8) skips backend image rebuild on release-please-
     # only pushes — see comment block at the `should-deploy` job for rationale.
-    needs: [changes, lint-cardinality-map, should-deploy]
+    needs: [changes, lint-cardinality-map, lint-write-pool-routing, should-deploy]
     if: needs.changes.outputs.backend == 'true' && needs.should-deploy.outputs.skip != 'true'
     permissions:
       contents: read
@@ -749,7 +779,7 @@ jobs:
 
   deploy:
     runs-on: ubuntu-latest
-    needs: [changes, lint-cardinality-map, test-frontend, test-backend, init-db-migrations-drift-check, build-frontend, build-backend, should-deploy]
+    needs: [changes, lint-cardinality-map, lint-write-pool-routing, test-frontend, test-backend, init-db-migrations-drift-check, build-frontend, build-backend, should-deploy]
     # Least-privilege: the deploy step only needs to pull images from GHCR
     # (read on packages) and read the working tree.
     permissions:
@@ -784,6 +814,7 @@ jobs:
       github.ref == 'refs/heads/master' &&
       needs.should-deploy.outputs.skip != 'true' &&
       needs.lint-cardinality-map.result == 'success' &&
+      needs.lint-write-pool-routing.result == 'success' &&
       (needs.test-frontend.result == 'success' || needs.test-frontend.result == 'skipped') &&
       (needs.test-backend.result == 'success' || needs.test-backend.result == 'skipped') &&
       (needs.init-db-migrations-drift-check.result == 'success' || needs.init-db-migrations-drift-check.result == 'skipped') &&

@@ -227,10 +227,8 @@ pub async fn dismiss_reminder(
     Path(book_id): Path<i32>,
     Query(query): Query<DismissQuery>,
 ) -> ApiResult<Json<DismissResponse>> {
-    let pool = match query.branch.unwrap_or_default() {
-        Branch::Hfville => state.ville_pool()?,
-        Branch::Hfhotel | Branch::All => &state.new_pool,
-    };
+    // Per-site pool via the unified write chokepoint (Ship-B).
+    let pool = state.write_pool(query.branch)?;
 
     let result = sqlx::query(
         "UPDATE ht_bookings \

@@ -125,10 +125,8 @@ fn notes_writeback_enabled() -> bool {
 /// `All` collapses to the primary pool — notes are per-site and the board picks
 /// one branch at a time.
 fn resolve_pool<'a>(state: &'a AppState, branch: Option<Branch>) -> ApiResult<&'a crate::db::PgPool> {
-    match branch.unwrap_or_default() {
-        Branch::Hfville => state.ville_pool(),
-        Branch::Hfhotel | Branch::All => Ok(&state.new_pool),
-    }
+    // Delegate to the unified per-site write chokepoint.
+    state.write_pool(branch)
 }
 
 /// Map a decode failure on a note read to a 500 (schema drift, not a client bug).
