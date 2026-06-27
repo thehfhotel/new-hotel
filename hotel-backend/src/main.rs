@@ -407,6 +407,8 @@ fn build_new_routes(app_state: AppState) -> Router {
     // Track G5 — coupon issuing.
     let perm_coupon_issue =
         app_middleware::require_permission("coupon.issue", app_state.clone());
+    let perm_coupon_redeem =
+        app_middleware::require_permission("coupon.redeem", app_state.clone());
     // Track G6 — POS / sales-to-room route gate. Admin + cashier
     // hold the grant (migration 052 seeds the role grid).
     let perm_pos_sell =
@@ -549,6 +551,12 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route(
             "/api/coupons",
             post(routes::new_coupons::issue_coupon).route_layer(perm_coupon_issue),
+        )
+        // Mark a coupon redeemed/printed. `coupon.redeem` gates admin +
+        // cashier + receptionist (migration 051).
+        .route(
+            "/api/coupons/{code}/redeem",
+            post(routes::new_coupons::redeem_coupon).route_layer(perm_coupon_redeem),
         )
         // Shifts (Track F2 / T1 HIGH-5 — cashier-shift gate for payments)
         .route("/api/shifts/current", get(routes::new_shifts::current_shift))
