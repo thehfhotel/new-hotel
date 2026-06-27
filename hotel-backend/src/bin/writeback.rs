@@ -298,25 +298,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     //     `restart: unless-stopped` policy backs off (without the sleep,
     //     the worker exits in ms, restarts, fingerprint fails again, fires
     //     another Slack — operator gets paged 6×/min until they intervene).
-    if let Err(e) = verify_schema_fingerprint(&mssql).await {
+    // Retry transient read failures before refusing. A timed-out / I/O-failed
+    // catalog SELECT (legacy MSSQL slow or unreachable — e.g. HF Ville over
+    // WireGuard at a quiet hour) is NOT confirmed schema drift: only a real
+    // `SchemaDrift` (read succeeded, hash differs) should tell the operator to
+    // run `writeback-fingerprint.sh`. Mis-firing that on a timeout could lead to
+    // updating the baseline against a bad read and corrupting it (incident
+    // 2026-06-28). Attempts tunable via WRITEBACK_FINGERPRINT_ATTEMPTS.
+    let fp_attempts: u32 = std::env::var("WRITEBACK_FINGERPRINT_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(4);
+    let mut fp_outcome: Result<(), WritebackError> = Ok(());
+    for attempt in 1..=fp_attempts {
+        match verify_schema_fingerprint(&mssql).await {
+            Ok(()) => {
+                fp_outcome = Ok(());
+                break;
+            }
+            // Real drift — the read succeeded but the hash differs. Don't retry.
+            Err(e @ WritebackError::SchemaDrift { .. }) => {
+                fp_outcome = Err(e);
+                break;
+            }
+            // Transient (timeout / I/O / pool) — retry with backoff.
+            Err(e) => {
+                fp_outcome = Err(e);
+                if attempt < fp_attempts {
+                    let backoff = Duration::from_secs((attempt as u64) * 6);
+                    tracing::warn!(
+                        site = %site.id,
+                        attempt,
+                        attempts = fp_attempts,
+                        backoff_secs = backoff.as_secs(),
+                        "Schema fingerprint read failed (transient) — retrying before refusing"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
+    }
+    if let Err(e) = fp_outcome {
+        let is_drift = matches!(e, WritebackError::SchemaDrift { .. });
         tracing::error!(
             site = %site.id,
             error = %e,
+            is_drift,
             "Schema fingerprint check failed — refusing to start"
         );
         if let Some(slack) = &slack {
-            let msg = SlackMessage::with_site_text(
-                &site.id,
+            let body = if is_drift {
                 format!(
                     ":warning: *Writeback worker REFUSED TO START* :warning:\n\
-                     Legacy MSSQL schema fingerprint mismatch.\n\
+                     Legacy MSSQL schema fingerprint MISMATCH (real drift).\n\
                      *Error:* `{e}`\n\
                      _The legacy DB columns drifted from the captured baseline. \
                      Run_ `./scripts/writeback-fingerprint.sh` _and follow the \
                      README to update the baseline before restarting the worker._"
-                ),
-            );
-            let _ = slack.send_message(&msg).await;
+                )
+            } else {
+                format!(
+                    ":warning: *Writeback worker could not start* :warning:\n\
+                     Could NOT read the legacy schema after {fp_attempts} attempts \
+                     (legacy MSSQL slow/unreachable — e.g. HF Ville over WireGuard).\n\
+                     *Error:* `{e}`\n\
+                     _This is a connectivity/timeout problem, NOT confirmed schema \
+                     drift — do NOT run `writeback-fingerprint.sh`. The worker retries \
+                     on restart; check the site server / WireGuard if it persists._"
+                )
+            };
+            let _ = slack
+                .send_message(&SlackMessage::with_site_text(&site.id, body))
+                .await;
         }
         tracing::warn!(
             site = %site.id,
