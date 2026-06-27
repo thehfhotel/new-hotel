@@ -34,13 +34,14 @@ docker logs new-hotel-production-backend-1 | grep 'shadow.booking_validation'
 ## B. DARK — collect shadow data → decide → flip
 
 - [ ] **Checkout total — `CHECKOUT_SERVER_TOTAL_ENABLED` (spike Phase 2).**
+      Folio parity DONE (2026-06-27): the quote + flag-on checkout now compute the
+      full folio — room + POS products + VAT (inclusive, from settings) + deposit
+      line; net = room+product, balance = net−pay (matches iHOTEL HT_CheckIn_H).
       1. Collect `shadow.checkout_total` over ~1–2 weeks of real checkouts; size
          the client-vs-server delta (driven by actual- vs expected-nights basis).
       2. **Decide the nights policy** with reception (match iHOTEL `FrmCheckOut`).
-      3. **Implementation gap:** server total is room-only — products/VAT/deposits
-         not yet plumbed (see Section C). Don't flip for "full folio" until done.
-      4. Flip `CHECKOUT_SERVER_TOTAL_ENABLED=true` once the delta is understood +
-         validated against real folios.
+      3. Flip `CHECKOUT_SERVER_TOTAL_ENABLED=true` once the delta is understood +
+         validated against real folios. (Implementation gap closed.)
 - [ ] **Booking validation — `BOOKING_VALIDATION_ENABLED` (spike Phase 3).**
       1. Collect `shadow.booking_validation` over real bookings; confirm it never
          flags a booking reception actually wants to make (zero false-rejects).
@@ -54,9 +55,8 @@ docker logs new-hotel-production-backend-1 | grep 'shadow.booking_validation'
 
 ## C. Remaining IMPLEMENTATION (large, separately scoped — not yet built)
 
-- [ ] **Phase 2 folio parity** — plumb products + VAT + deposits into the
-      server-authoritative checkout total to truly match iHOTEL `FrmCheckOut`
-      (currently room-only). Gates the Section B Phase-2 flip for full folios.
+- [x] **Phase 2 folio parity** — DONE 2026-06-27 (products/VAT/deposits plumbed,
+      ship-dark). See Section B Phase-2.
 - [ ] **HF Ville Ship-B** — per-site write bundle so open/close/round/checkout
       writes route to `ville_pool` co-equally (task #20; gates Ville round
       writeback + co-equal Ville writes generally).
