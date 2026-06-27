@@ -50,6 +50,25 @@ pub struct CustomersQuery {
 fn default_page() -> i32 { 1 }
 fn default_limit() -> i32 { 20 }
 
+/// Query parameters for the per-customer sub-resource endpoints
+/// (`/bookings`, `/stats`). Branch selector only — mirrors `CustomersQuery`.
+/// The path id is a per-database SERIAL (or legacy `cust_no`), so the pool
+/// selection is what scopes the lookup to the right site.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomerScopeQuery {
+    pub branch: Option<Branch>,
+}
+
+/// Resolve the canonical PG pool for a per-customer sub-resource request.
+/// `All` is not meaningful for a single customer → default to HF Hotel.
+fn customer_pool<'a>(state: &'a AppState, branch: Option<Branch>) -> ApiResult<&'a PgPool> {
+    match branch.unwrap_or_default() {
+        Branch::Hfville => state.ville_pool(),
+        Branch::Hfhotel | Branch::All => Ok(&state.new_pool),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/customers
 // ---------------------------------------------------------------------------
@@ -325,8 +344,9 @@ async fn resolve_customer_id_int(
 pub async fn get_customer_bookings(
     State(state): State<AppState>,
     Path(cust_id): Path<String>,
+    Query(params): Query<CustomerScopeQuery>,
 ) -> ApiResult<Json<CustomerBookingsResponse>> {
-    get_customer_bookings_pg(&state.new_pool, &cust_id).await
+    get_customer_bookings_pg(customer_pool(&state, params.branch)?, &cust_id).await
 }
 
 /// Canonical SELECT for a customer's booking history. Exposed so unit tests
@@ -424,8 +444,9 @@ async fn get_customer_bookings_pg(
 pub async fn get_customer_stats(
     State(state): State<AppState>,
     Path(cust_id): Path<String>,
+    Query(params): Query<CustomerScopeQuery>,
 ) -> ApiResult<Json<CustomerStatsResponse>> {
-    get_customer_stats_pg(&state.new_pool, &cust_id).await
+    get_customer_stats_pg(customer_pool(&state, params.branch)?, &cust_id).await
 }
 
 /// Canonical SQL for the per-customer booking aggregates. Cancelled bookings

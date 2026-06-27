@@ -22,6 +22,7 @@ import {
   CalendarPlus,
 } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { useBranch } from '@/contexts/BranchContext'
 import { formatStoredDayMonthYear } from '@/lib/format'
 import CheckInModal from '@/components/CheckInModal'
 import CheckOutModal from '@/components/CheckOutModal'
@@ -67,6 +68,9 @@ const statusFilterOptions = [
 
 export default function RoomsPage() {
   const branchFetch = useBranchFetch()
+  // HF Ville is write-blocked by default (HFVILLE_WRITES_ENABLED off). Gate
+  // every mutating action on canWrite, mirroring the dashboard + v2 pages.
+  const { canWrite } = useBranch()
 
   const [rooms, setRooms] = useState<RoomApiItem[]>([])
   const [loading, setLoading] = useState(true)
@@ -478,7 +482,8 @@ export default function RoomsPage() {
                   {selectedRoom.status === 'available' && (
                     <button
                       onClick={() => setShowCheckIn(true)}
-                      className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-red-600 text-white text-sm font-medium rounded hover:bg-red-700"
+                      disabled={!canWrite}
+                      className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-red-600 text-white text-sm font-medium rounded hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       <LogIn size={14} />
                       เช็คอิน
@@ -491,7 +496,8 @@ export default function RoomsPage() {
                           options the moment a guest asks for either. */}
                       <button
                         onClick={() => setShowExtendStay(true)}
-                        className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-emerald-600 text-white text-sm font-medium rounded hover:bg-emerald-700"
+                        disabled={!canWrite}
+                        className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-emerald-600 text-white text-sm font-medium rounded hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         <CalendarPlus size={14} />
                         ขยายเวลาเข้าพัก
@@ -499,14 +505,16 @@ export default function RoomsPage() {
                       {/* Track G4 / T4 HIGH-3: change-room (mid-stay move). */}
                       <button
                         onClick={() => setShowChangeRoom(true)}
-                        className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-amber-600 text-white text-sm font-medium rounded hover:bg-amber-700"
+                        disabled={!canWrite}
+                        className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-amber-600 text-white text-sm font-medium rounded hover:bg-amber-700 disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         <ArrowRightLeft size={14} />
                         เปลี่ยนห้อง
                       </button>
                       <button
                         onClick={() => setShowCheckOut(true)}
-                        className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-sky-600 text-white text-sm font-medium rounded hover:bg-sky-700"
+                        disabled={!canWrite}
+                        className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-sky-600 text-white text-sm font-medium rounded hover:bg-sky-700 disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         <LogOut size={14} />
                         เช็คเอ้าท์
@@ -514,6 +522,12 @@ export default function RoomsPage() {
                     </>
                   )}
                 </div>
+                {/* HF Ville is read-only until backend writes are enabled. */}
+                {!canWrite && (selectedRoom.status === 'available' || selectedRoom.status === 'occupied') && (
+                  <p className="text-xs text-gray-400 pt-1">
+                    โหมดอ่านอย่างเดียว (จัดการใน iHOTEL)
+                  </p>
+                )}
 
                 {/* Updated at */}
                 {selectedRoom.updatedAt && (

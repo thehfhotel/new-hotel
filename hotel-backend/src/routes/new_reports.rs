@@ -11,7 +11,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
-use super::mode::AppState;
+use super::mode::{AppState, Branch};
 use crate::error::{ApiError, ApiResult};
 
 /// Group by period for revenue report
@@ -41,6 +41,9 @@ pub struct RevenueQuery {
     pub to: String,
     #[serde(default = "default_group_by")]
     pub group_by: GroupBy,
+    /// Branch selector: 'hfhotel' (default) | 'hfville'. Site data lives in
+    /// separate logical PG databases, so the pool selection is the site filter.
+    pub branch: Option<Branch>,
 }
 
 fn default_group_by() -> GroupBy {
@@ -70,6 +73,9 @@ pub struct RevenueResponse {
 pub struct OccupancyQuery {
     pub from: String,
     pub to: String,
+    /// Branch selector: 'hfhotel' (default) | 'hfville'. Site data lives in
+    /// separate logical PG databases, so the pool selection is the site filter.
+    pub branch: Option<Branch>,
 }
 
 /// Response for occupancy report
@@ -110,7 +116,12 @@ pub async fn get_revenue(
     State(state): State<AppState>,
     Query(params): Query<RevenueQuery>,
 ) -> ApiResult<Json<RevenueResponse>> {
-    let pool = &state.new_pool;
+    // Branch-aware: HF Ville reads ville_pool. `All` → HF Hotel (the report
+    // is single-site; cross-site aggregation is out of scope here).
+    let pool = match params.branch.unwrap_or_default() {
+        Branch::Hfville => state.ville_pool()?,
+        Branch::Hfhotel | Branch::All => &state.new_pool,
+    };
 
     // Validate date parameters
     if params.from.is_empty() || params.to.is_empty() {
@@ -173,7 +184,11 @@ pub async fn get_occupancy(
     State(state): State<AppState>,
     Query(params): Query<OccupancyQuery>,
 ) -> ApiResult<Json<OccupancyResponse>> {
-    let pool = &state.new_pool;
+    // Branch-aware: HF Ville reads ville_pool. `All` → HF Hotel (single-site).
+    let pool = match params.branch.unwrap_or_default() {
+        Branch::Hfville => state.ville_pool()?,
+        Branch::Hfhotel | Branch::All => &state.new_pool,
+    };
 
     // Validate date parameters
     if params.from.is_empty() || params.to.is_empty() {
@@ -305,7 +320,11 @@ pub async fn get_revenue_by_room_type(
     State(state): State<AppState>,
     Query(params): Query<OccupancyQuery>,
 ) -> ApiResult<Json<RevenueByRoomTypeResponse>> {
-    let pool = &state.new_pool;
+    // Branch-aware: HF Ville reads ville_pool. `All` → HF Hotel (single-site).
+    let pool = match params.branch.unwrap_or_default() {
+        Branch::Hfville => state.ville_pool()?,
+        Branch::Hfhotel | Branch::All => &state.new_pool,
+    };
 
     // Validate date parameters
     if params.from.is_empty() || params.to.is_empty() {

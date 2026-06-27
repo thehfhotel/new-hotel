@@ -113,10 +113,12 @@ impl Rr4ExportFormat {
 /// Input for an export run.
 ///
 /// `site` is operator-selected (`hfhotel` / `hfville`) and appears in
-/// the filename + audit row. The canonical PG database is shared
-/// across sites today (one row per stay regardless of property), so
-/// `site` is currently a label, not a filter clause. When Track G3
-/// adds per-site partitioning we'll thread it into the WHERE.
+/// the filename + audit row. Site-scoping is connection-level: each
+/// site's canonical rows live in its own logical PG database, so the
+/// caller (`routes::rr4_export`) hands this service the matching pool
+/// and the SQL needs no `site` WHERE predicate (there is no per-row
+/// site column). The `site` field therefore drives the filename + audit
+/// row and must agree with the pool the service was constructed with.
 #[derive(Debug, Clone)]
 pub struct Rr4ExportRequest {
     pub site: String,

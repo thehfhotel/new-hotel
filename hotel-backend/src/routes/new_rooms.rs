@@ -252,14 +252,32 @@ pub async fn list_rooms(
     }))
 }
 
+/// Query parameters for single-room fetch (branch selector only).
+///
+/// `room_id` is a per-database SERIAL, so the id collides across the two
+/// logical DBs — selecting the right pool is what makes the right record come
+/// back. Mirrors `list_rooms`'s branch handling.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewRoomQuery {
+    pub branch: Option<Branch>,
+}
+
 /// GET /api/new/rooms/:id - Get single room
 pub async fn get_room(
     State(state): State<AppState>,
     Path(room_id): Path<i32>,
+    Query(params): Query<NewRoomQuery>,
 ) -> ApiResult<Json<NewRoomResponse>> {
+    // Branch-aware: HF Hotel reads new_pool, HF Ville reads ville_pool. `All`
+    // is not meaningful for a single id → default to HF Hotel.
+    let pool = match params.branch.unwrap_or_default() {
+        Branch::Hfville => state.ville_pool()?,
+        Branch::Hfhotel | Branch::All => &state.new_pool,
+    };
     let row = state
         .rooms
-        .get(&state.new_pool, room_id)
+        .get(pool, room_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Room not found".to_string()))?;
 

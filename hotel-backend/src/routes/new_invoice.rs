@@ -27,14 +27,14 @@
 //!   the legacy sequence.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     Json,
 };
 use chrono::{Datelike, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Asia::Bangkok;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use super::mode::AppState;
+use super::mode::{AppState, Branch};
 use crate::error::{ApiError, ApiResult};
 use crate::repository::settings;
 use crate::writeback::format::vat_inclusive_split;
@@ -134,12 +134,29 @@ pub struct InvoiceResponse {
     pub invoice: Invoice,
 }
 
+/// Query parameters for the invoice fetch (branch selector only).
+///
+/// `cin_id` is a per-database SERIAL — it collides across the two logical DBs,
+/// so the pool selection is what returns the correct check-in. Mirrors the
+/// branch handling in `routes/checkins.rs`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InvoiceQuery {
+    pub branch: Option<Branch>,
+}
+
 /// GET /api/new/checkins/:id/invoice - Get complete invoice data
 pub async fn get_invoice(
     State(state): State<AppState>,
     Path(cin_id): Path<i32>,
+    Query(params): Query<InvoiceQuery>,
 ) -> ApiResult<Json<InvoiceResponse>> {
-    let pool = &state.new_pool;
+    // Branch-aware: HF Hotel reads new_pool, HF Ville reads ville_pool. `All`
+    // is not meaningful for a single check-in → default to HF Hotel.
+    let pool = match params.branch.unwrap_or_default() {
+        Branch::Hfville => state.ville_pool()?,
+        Branch::Hfhotel | Branch::All => &state.new_pool,
+    };
 
     // Get check-in with all related data
     let rec = sqlx::query!(

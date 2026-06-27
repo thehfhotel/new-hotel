@@ -51,7 +51,17 @@ pub async fn get_rr4_export(
         .to_string();
     let exported_by = exported_by_from_headers(&headers);
 
-    let service = Rr4Service::new(state.new_pool.clone());
+    // Site-aware pool selection. Each site's canonical rows live in its own
+    // logical PG database (connection-level scoping — see canonical_pg_split),
+    // so picking the pool IS the site filter. Before this, every export ran on
+    // `new_pool`, so an HF Ville export emitted HF Hotel guests under a Ville
+    // filename. `Rr4ExportRequest.site` still feeds the filename + audit row.
+    let pool = match site.as_str() {
+        "hfville" => state.ville_pool()?.clone(),
+        _ => state.new_pool.clone(),
+    };
+
+    let service = Rr4Service::new(pool);
     let result = service
         .export(Rr4ExportRequest {
             site,
