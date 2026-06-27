@@ -174,10 +174,31 @@ function Section({ no, title, hint, children }: { no: string; title: string; hin
   )
 }
 
-function Question({ title, children }: { title: string; children?: ReactNode }) {
+function Question({
+  title,
+  link,
+  children,
+}: {
+  title: string
+  link?: { href: string; label?: string }
+  children?: ReactNode
+}) {
   return (
     <div className="space-y-2">
-      <p className="text-[14px] font-semibold leading-snug">{title}</p>
+      <p className="text-[14px] font-semibold leading-snug">
+        {title}
+        {link && (
+          <a
+            href={link.href}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="ml-2 inline-block text-[12.5px] font-normal underline whitespace-nowrap"
+            style={{ color: 'var(--v2-wine-600)' }}
+          >
+            {link.label ?? 'เปิดหน้านี้ ↗'}
+          </a>
+        )}
+      </p>
       {children}
     </div>
   )
@@ -301,7 +322,7 @@ export default function V2Verification() {
         title="เทียบหน้าจอกับ iHOTEL (ทำได้เลย ไม่กระทบข้อมูล)"
         hint="เปิดระบบใหม่ที่ hotel.thehfhotel.org/v2 แล้วเปิด iHOTEL คู่กัน เทียบทีละข้อ"
       >
-        <Question title="1.1 สถานะห้องพัก — เทียบห้องว่าง / ไม่ว่าง / จอง / รอเช็คเอาท์">
+        <Question title="1.1 สถานะห้องพัก — เทียบห้องว่าง / ไม่ว่าง / จอง / รอเช็คเอาท์" link={{ href: '/v2/rooms' }}>
           <RadioGroup
             name="q1_1"
             value={form.q1_1}
@@ -316,7 +337,7 @@ export default function V2Verification() {
           )}
         </Question>
 
-        <Question title="1.2 รายงานรอบบิล — เทียบยอดเงินแต่ละประเภท (เงินสด / โอน / บัตร)">
+        <Question title="1.2 รายงานรอบบิล — เทียบยอดเงินแต่ละประเภท (เงินสด / โอน / บัตร)" link={{ href: '/v2/rounds' }}>
           <RadioGroup name="q1_2" value={form.q1_2} onChange={(v) => set('q1_2', v)} options={MATCH} />
           {form.q1_2 === 'mismatch' && (
             <CheckboxGroup
@@ -332,7 +353,7 @@ export default function V2Verification() {
           )}
         </Question>
 
-        <Question title="1.3 รายชื่อผู้เข้าพักวันนี้ — เทียบจำนวน เข้า / ออก / พักต่อ">
+        <Question title="1.3 รายชื่อผู้เข้าพักวันนี้ — เทียบจำนวน เข้า / ออก / พักต่อ" link={{ href: '/v2/rosters' }}>
           <RadioGroup name="q1_3" value={form.q1_3} onChange={(v) => set('q1_3', v)} options={MATCH} />
           {form.q1_3 === 'mismatch' && (
             <CheckboxGroup
@@ -347,14 +368,14 @@ export default function V2Verification() {
           )}
         </Question>
 
-        <Question title="1.4 ปฏิทินห้องว่าง — ห้องที่มีคนพัก/จอง แสดงถูกช่องวันที่">
+        <Question title="1.4 ปฏิทินห้องว่าง — ห้องที่มีคนพัก/จอง แสดงถูกช่องวันที่" link={{ href: '/v2/calendar' }}>
           <RadioGroup name="q1_4" value={form.q1_4} onChange={(v) => set('q1_4', v)} options={OK} />
           {form.q1_4 === 'mismatch' && (
             <TextInput value={form.q1_4_note} onChange={(v) => set('q1_4_note', v)} placeholder="จดเลขห้อง/วันที่ที่ผิด" />
           )}
         </Question>
 
-        <Question title="1.5 ใบกำกับภาษี / ใบเสร็จ — เปิดบิล 1 ราย ดูชื่อ-ยอดเงิน-ภาษี">
+        <Question title="1.5 ใบกำกับภาษี / ใบเสร็จ — เปิดบิล 1 ราย ดูชื่อ-ยอดเงิน-ภาษี" link={{ href: '/v2/invoice' }}>
           <RadioGroup
             name="q1_5"
             value={form.q1_5}
