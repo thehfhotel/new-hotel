@@ -601,6 +601,10 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route("/api/reports/revenue", get(routes::new_reports::get_revenue))
         .route("/api/reports/occupancy", get(routes::new_reports::get_occupancy))
         .route("/api/reports/revenue-by-room-type", get(routes::new_reports::get_revenue_by_room_type))
+        // Financial reports (task #55) — output-tax (VAT) period summary +
+        // revenue grouped by customer. Read-only, branch-aware.
+        .route("/api/reports/vat-summary", get(routes::new_reports::get_vat_summary))
+        .route("/api/reports/sales-by-customer", get(routes::new_reports::get_sales_by_customer))
         // Track G8 — RR.4 Thai immigration foreign-guest export (legal CRIT)
         .route("/api/reports/rr4", get(routes::rr4_export::get_rr4_export))
         // Daily guest rosters / desk paperwork (task #43). FULL lists (no silent

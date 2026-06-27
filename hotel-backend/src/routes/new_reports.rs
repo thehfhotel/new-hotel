@@ -1,8 +1,15 @@
 //! New Report API routes for HotelNew database
 //!
-//! - GET /api/new/reports/revenue - Revenue report with period grouping
-//! - GET /api/new/reports/occupancy - Occupancy statistics
-//! - GET /api/new/reports/revenue-by-room-type - Revenue breakdown by room type
+//! - GET /api/reports/revenue - Revenue report with period grouping
+//! - GET /api/reports/occupancy - Occupancy statistics
+//! - GET /api/reports/revenue-by-room-type - Revenue breakdown by room type
+//! - GET /api/reports/vat-summary - Output-tax (VAT) period summary
+//! - GET /api/reports/sales-by-customer - Revenue grouped by customer
+//!
+//! All handlers are branch-aware: HF Ville reads its own logical PG database
+//! (`ville_pool`); HF Hotel (and the `all` dashboard view) read `new_pool`.
+//! The site-scoping is connection-level, not row-level — see the canonical
+//! PG split note in CLAUDE.md.
 
 use axum::{
     extract::{Query, State},
@@ -13,6 +20,17 @@ use sqlx::Row;
 
 use super::mode::{AppState, Branch};
 use crate::error::{ApiError, ApiResult};
+
+/// SQL fragment computing a check-in's attributed revenue: the recorded folio
+/// total when present, otherwise `rate × nights` derived from the stay dates.
+/// Shared verbatim across every report so the revenue, room-type, VAT and
+/// sales-by-customer figures always agree. The fragment references the
+/// `ht_checkins` alias `ci`, so every query that interpolates it must alias the
+/// table `ci`. It is a compile-time constant (no user input) — the call sites
+/// inject it via `format!` and wrap the result in [`sqlx::AssertSqlSafe`].
+const CHECKIN_REVENUE_EXPR: &str = "COALESCE(ci.cin_total_amount, \
+    ci.cin_rate_per_night * (COALESCE(ci.cin_checkout_time, ci.cin_expected_checkout)::date \
+    - ci.cin_checkin_time::date))";
 
 /// Group by period for revenue report
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -382,4 +400,310 @@ pub async fn get_revenue_by_room_type(
         success: true,
         data,
     }))
+}
+
+fn default_group_by_month() -> GroupBy {
+    GroupBy::Month
+}
+
+/// Query parameters for the VAT / output-tax summary.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VatSummaryQuery {
+    pub from: String,
+    pub to: String,
+    /// Period grouping for the breakdown table. Defaults to `month` because the
+    /// Thai output-tax filing (ภ.พ.30 / PP30) is monthly — the common case for
+    /// this report — but `day`/`week` are accepted for ad-hoc views.
+    #[serde(default = "default_group_by_month")]
+    pub group_by: GroupBy,
+    /// Branch selector: 'hfhotel' (default) | 'hfville'. Site data lives in
+    /// separate logical PG databases, so the pool selection is the site filter.
+    pub branch: Option<Branch>,
+}
+
+/// One period row of the VAT summary. `gross` is the VAT-inclusive revenue;
+/// `before_vat` is the net (ex-VAT) base; `vat` is the output tax.
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct VatPeriodRow {
+    pub period: String,
+    pub gross: f64,
+    pub before_vat: f64,
+    pub vat: f64,
+    pub bookings: i32,
+}
+
+/// Response for the VAT / output-tax summary.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VatSummaryResponse {
+    pub success: bool,
+    /// The branch-scoped VAT percent applied (from `ht_settings.vat_percent`).
+    /// HF Hotel runs 0; HF Ville may differ.
+    pub vat_percent: i32,
+    /// Period totals across the whole range.
+    pub gross: f64,
+    pub before_vat: f64,
+    pub vat: f64,
+    pub data: Vec<VatPeriodRow>,
+}
+
+/// Split each period's gross (VAT-inclusive) revenue into the net base and the
+/// output tax, reusing the exact inclusive-split math the receipt + iHOTEL
+/// writeback use (`writeback::format::vat_inclusive_split`) so the report ties
+/// out to the printed receipts to the satang. Returns the per-period rows plus
+/// the `(gross, before_vat, vat)` grand totals. Pure — unit-tested below.
+fn aggregate_vat_periods(
+    rows: Vec<(String, f64, i32)>,
+    vat_percent: i32,
+) -> (Vec<VatPeriodRow>, f64, f64, f64) {
+    let mut data = Vec::with_capacity(rows.len());
+    let (mut total_gross, mut total_before, mut total_vat) = (0.0_f64, 0.0_f64, 0.0_f64);
+    for (period, gross, bookings) in rows {
+        let (before_vat, vat) = crate::writeback::format::vat_inclusive_split(gross, vat_percent);
+        total_gross += gross;
+        total_before += before_vat;
+        total_vat += vat;
+        data.push(VatPeriodRow {
+            period,
+            gross,
+            before_vat,
+            vat,
+            bookings,
+        });
+    }
+    (data, total_gross, total_before, total_vat)
+}
+
+/// GET /api/reports/vat-summary - Output-tax (VAT) period summary.
+///
+/// VAT is treated as inclusive in the headline revenue: `before = gross / (1 +
+/// vat%/100)`, `vat = gross - before` (per period, then rounded). When
+/// `vat_percent = 0` (HF Hotel today) the split is a no-op: `before == gross`
+/// and `vat == 0`. Branch-aware — the rate is read from `ht_settings` on the
+/// SELECTED site's pool, so HF Ville can run a different percent than HF Hotel.
+pub async fn get_vat_summary(
+    State(state): State<AppState>,
+    Query(params): Query<VatSummaryQuery>,
+) -> ApiResult<Json<VatSummaryResponse>> {
+    let pool = match params.branch.unwrap_or_default() {
+        Branch::Hfville => state.ville_pool()?,
+        Branch::Hfhotel | Branch::All => &state.new_pool,
+    };
+
+    if params.from.is_empty() || params.to.is_empty() {
+        return Err(ApiError::BadRequest(
+            "Both 'from' and 'to' dates are required".to_string(),
+        ));
+    }
+
+    // Branch-scoped VAT rate from `ht_settings` on the resolved pool.
+    let vat_percent = crate::repository::settings::get_vat_percent(pool).await;
+
+    let date_format = params.group_by.as_sql_format();
+    // Controlled fragments only (the GroupBy enum's fixed format string + the
+    // CHECKIN_REVENUE_EXPR constant); the date range is bound, not interpolated.
+    let query = format!(
+        r#"
+        SELECT
+            TO_CHAR(ci.cin_checkin_time, '{fmt}') AS period,
+            COALESCE(SUM({rev}), 0)::float8 AS gross,
+            COUNT(*)::int AS bookings
+        FROM ht_checkins ci
+        WHERE ci.cin_status = 'checkedout'
+          AND ci.cin_checkin_time::date >= $1::date
+          AND ci.cin_checkin_time::date <= $2::date
+        GROUP BY period
+        ORDER BY period ASC
+        "#,
+        fmt = date_format,
+        rev = CHECKIN_REVENUE_EXPR,
+    );
+
+    let rows = sqlx::query(sqlx::AssertSqlSafe(&*query))
+        .bind(&params.from)
+        .bind(&params.to)
+        .fetch_all(pool)
+        .await?;
+
+    let period_rows: Vec<(String, f64, i32)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.try_get::<String, _>("period").unwrap_or_default(),
+                row.try_get::<f64, _>("gross").unwrap_or(0.0),
+                row.try_get::<i32, _>("bookings").unwrap_or(0),
+            )
+        })
+        .collect();
+
+    let (data, gross, before_vat, vat) = aggregate_vat_periods(period_rows, vat_percent);
+
+    Ok(Json(VatSummaryResponse {
+        success: true,
+        vat_percent,
+        gross,
+        before_vat,
+        vat,
+        data,
+    }))
+}
+
+/// Query parameters for the sales-by-customer report.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SalesByCustomerQuery {
+    pub from: String,
+    pub to: String,
+    /// Cap on the number of customers returned (top spenders first). Defaults
+    /// to 50 and is clamped to 1..=1000 so the report can't be turned into an
+    /// unbounded scan via the query string.
+    pub limit: Option<i64>,
+    /// Branch selector: 'hfhotel' (default) | 'hfville'.
+    pub branch: Option<Branch>,
+}
+
+/// One customer's spend over the requested range.
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomerSales {
+    pub customer_id: i32,
+    pub customer_name: String,
+    pub phone: Option<String>,
+    pub checkins: i32,
+    pub revenue: f64,
+}
+
+/// Response for the sales-by-customer report.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SalesByCustomerResponse {
+    pub success: bool,
+    /// Sum of `revenue` across the returned rows (the displayed total).
+    pub total_revenue: f64,
+    pub data: Vec<CustomerSales>,
+}
+
+/// GET /api/reports/sales-by-customer - Revenue grouped by customer.
+///
+/// Sums the same attributed revenue used elsewhere (`CHECKIN_REVENUE_EXPR`) per
+/// customer over the date range, ordered by spend descending. Branch-aware.
+pub async fn get_sales_by_customer(
+    State(state): State<AppState>,
+    Query(params): Query<SalesByCustomerQuery>,
+) -> ApiResult<Json<SalesByCustomerResponse>> {
+    let pool = match params.branch.unwrap_or_default() {
+        Branch::Hfville => state.ville_pool()?,
+        Branch::Hfhotel | Branch::All => &state.new_pool,
+    };
+
+    if params.from.is_empty() || params.to.is_empty() {
+        return Err(ApiError::BadRequest(
+            "Both 'from' and 'to' dates are required".to_string(),
+        ));
+    }
+
+    let limit = params.limit.unwrap_or(50).clamp(1, 1000);
+
+    // Only CHECKIN_REVENUE_EXPR (a constant) is interpolated; the date range and
+    // limit are bound. Wrapped in AssertSqlSafe per the audited-fragment rule.
+    let query = format!(
+        r#"
+        SELECT
+            c.cust_id AS customer_id,
+            COALESCE(
+                NULLIF(BTRIM(CONCAT_WS(' ', c.cust_firstname, c.cust_lastname)), ''),
+                'ไม่ระบุชื่อ'
+            ) AS customer_name,
+            c.cust_phone AS phone,
+            COUNT(*)::int AS checkins,
+            COALESCE(SUM({rev}), 0)::float8 AS revenue
+        FROM ht_checkins ci
+        LEFT JOIN ht_customers c ON ci.cin_cust_id = c.cust_id
+        WHERE ci.cin_status = 'checkedout'
+          AND ci.cin_checkin_time::date >= $1::date
+          AND ci.cin_checkin_time::date <= $2::date
+        GROUP BY c.cust_id, c.cust_firstname, c.cust_lastname, c.cust_phone
+        ORDER BY revenue DESC, checkins DESC
+        LIMIT $3
+        "#,
+        rev = CHECKIN_REVENUE_EXPR,
+    );
+
+    let rows = sqlx::query(sqlx::AssertSqlSafe(&*query))
+        .bind(&params.from)
+        .bind(&params.to)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+
+    let data: Vec<CustomerSales> = rows
+        .iter()
+        .map(|row| CustomerSales {
+            customer_id: row.try_get::<i32, _>("customer_id").unwrap_or(0),
+            customer_name: row
+                .try_get::<String, _>("customer_name")
+                .unwrap_or_else(|_| "ไม่ระบุชื่อ".to_string()),
+            phone: row.try_get::<Option<String>, _>("phone").unwrap_or(None),
+            checkins: row.try_get::<i32, _>("checkins").unwrap_or(0),
+            revenue: row.try_get::<f64, _>("revenue").unwrap_or(0.0),
+        })
+        .collect();
+
+    let total_revenue: f64 = data.iter().map(|d| d.revenue).sum();
+
+    Ok(Json(SalesByCustomerResponse {
+        success: true,
+        total_revenue,
+        data,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// At 7% the inclusive split must tie out to the captured legacy receipt
+    /// math (Total 801.00 → BeforeVat 748.60, Vat 52.40) and the per-period
+    /// totals must accumulate.
+    #[test]
+    fn aggregate_vat_periods_splits_inclusive_at_7pct() {
+        let rows = vec![
+            ("2026-05".to_string(), 801.00, 3),
+            ("2026-06".to_string(), 107.00, 1),
+        ];
+        let (data, gross, before, vat) = aggregate_vat_periods(rows, 7);
+
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0].before_vat, 748.60);
+        assert_eq!(data[0].vat, 52.40);
+        // 107.00 @ 7% inclusive → 100.00 + 7.00
+        assert_eq!(data[1].before_vat, 100.00);
+        assert_eq!(data[1].vat, 7.00);
+
+        assert_eq!(gross, 908.00);
+        assert_eq!(before, 848.60);
+        assert_eq!(vat, 59.40);
+    }
+
+    /// At 0% (HF Hotel today) the split is a no-op: net == gross, output tax 0.
+    #[test]
+    fn aggregate_vat_periods_zero_percent_is_noop() {
+        let rows = vec![("2026-06".to_string(), 1000.0, 2)];
+        let (data, gross, before, vat) = aggregate_vat_periods(rows, 0);
+
+        assert_eq!(data[0].gross, 1000.0);
+        assert_eq!(data[0].before_vat, 1000.0);
+        assert_eq!(data[0].vat, 0.0);
+        assert_eq!((gross, before, vat), (1000.0, 1000.0, 0.0));
+    }
+
+    /// Empty input yields zero totals and no rows (clean empty-range render).
+    #[test]
+    fn aggregate_vat_periods_empty() {
+        let (data, gross, before, vat) = aggregate_vat_periods(vec![], 7);
+        assert!(data.is_empty());
+        assert_eq!((gross, before, vat), (0.0, 0.0, 0.0));
+    }
 }

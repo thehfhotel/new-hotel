@@ -41,6 +41,39 @@ export interface RevenueByRoomTypeResponse {
 // Group by options for revenue report
 export type GroupBy = 'day' | 'week' | 'month';
 
+// VAT / output-tax report (task #55)
+export interface VatPeriodRow {
+  period: string;
+  gross: number; // VAT-inclusive revenue
+  beforeVat: number; // net (ex-VAT) base
+  vat: number; // output tax
+  bookings: number;
+}
+
+export interface VatSummaryResponse {
+  success: boolean;
+  vatPercent: number;
+  gross: number;
+  beforeVat: number;
+  vat: number;
+  data: VatPeriodRow[];
+}
+
+// Sales-by-customer report (task #55)
+export interface CustomerSales {
+  customerId: number;
+  customerName: string;
+  phone: string | null;
+  checkins: number;
+  revenue: number;
+}
+
+export interface SalesByCustomerResponse {
+  success: boolean;
+  totalRevenue: number;
+  data: CustomerSales[];
+}
+
 // Maintenance types
 export type MaintenanceStatus = 'open' | 'in_progress' | 'completed' | 'cancelled';
 export type MaintenancePriority = 1 | 2 | 3; // 1=low, 2=medium, 3=high
