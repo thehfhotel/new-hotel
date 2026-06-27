@@ -56,13 +56,6 @@ pub struct CloseShiftRequest {
     pub cash_count: Option<serde_json::Value>,
 }
 
-/// `GET /api/new/shifts?limit=N` query string.
-#[derive(Debug, Deserialize)]
-pub struct ListShiftsQuery {
-    /// Cap on rows returned. Clamped to `[1, 200]` by the service.
-    pub limit: Option<i64>,
-}
-
 /// `GET /api/new/shifts/current?branch=<hfhotel|hfville|all>` query string.
 #[derive(Debug, Deserialize)]
 pub struct CurrentShiftQuery {
@@ -149,14 +142,6 @@ impl From<Shift> for ShiftDto {
 pub struct CurrentShiftResponse {
     pub success: bool,
     pub shift: ShiftDto,
-}
-
-/// 200 body for `GET /api/new/shifts`.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ListShiftsResponse {
-    pub success: bool,
-    pub data: Vec<ShiftDto>,
 }
 
 // =============================================================================
@@ -276,25 +261,6 @@ pub async fn current_shift(
 /// client mistake — surface it as an internal error.
 fn map_shift_row_err(e: sqlx::Error) -> ApiError {
     ApiError::Internal(format!("failed to map shift row: {e}"))
-}
-
-/// `GET /api/new/shifts?limit=N` — most-recent shifts, newest first.
-///
-/// Defaults `limit` to 50 when unspecified. The service clamps the
-/// effective limit to `[1, 200]` so a runaway client cannot DoS the
-/// dashboard.
-pub async fn list_shifts(
-    State(state): State<AppState>,
-    Query(query): Query<ListShiftsQuery>,
-) -> ApiResult<Json<ListShiftsResponse>> {
-    let limit = query.limit.unwrap_or(50);
-    let rows = state.shifts_service.recent_shifts(limit).await?;
-    let data = rows.into_iter().map(ShiftDto::from).collect();
-
-    Ok(Json(ListShiftsResponse {
-        success: true,
-        data,
-    }))
 }
 
 // =============================================================================

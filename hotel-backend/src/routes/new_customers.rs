@@ -96,14 +96,6 @@ pub struct NewCustomersResponse {
     pub pagination: Pagination,
 }
 
-/// Response for single customer
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NewCustomerResponse {
-    pub success: bool,
-    pub customer: NewCustomer,
-}
-
 /// Request body for creating/updating customer
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -153,23 +145,6 @@ pub async fn list_customers(
         success: true,
         data: customers,
         pagination: Pagination::new(params.page, params.limit, total),
-    }))
-}
-
-/// GET /api/new/customers/:id - Get single customer
-pub async fn get_customer(
-    State(state): State<AppState>,
-    Path(cust_id): Path<i32>,
-) -> ApiResult<Json<NewCustomerResponse>> {
-    let row = state
-        .customers
-        .get(&state.new_pool, cust_id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound("Customer not found".to_string()))?;
-
-    Ok(Json(NewCustomerResponse {
-        success: true,
-        customer: NewCustomer::from_row(row),
     }))
 }
 

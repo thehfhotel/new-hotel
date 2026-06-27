@@ -278,23 +278,6 @@ pub async fn list_checkins(
     }))
 }
 
-/// GET /api/new/checkins/:id - Get single check-in
-pub async fn get_checkin(
-    State(state): State<AppState>,
-    Path(cin_id): Path<i32>,
-) -> ApiResult<Json<NewCheckInResponse>> {
-    let row = state
-        .checkins
-        .get(&state.new_pool, cin_id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
-
-    Ok(Json(NewCheckInResponse {
-        success: true,
-        checkin: NewCheckIn::from_detail_row(row),
-    }))
-}
-
 /// POST /api/new/checkins - Create check-in (walk-in or from booking)
 ///
 /// Delegates to either [`crate::service::CheckInService::walk_in`] or

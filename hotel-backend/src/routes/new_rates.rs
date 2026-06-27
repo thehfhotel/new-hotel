@@ -6,8 +6,8 @@
 //! * **Canonical pricing matrix** — `ht_rate_tiers`, keyed on
 //!   `(Room_Type, Cust_Type)`, mirrored from legacy `HT_Rooms_Price`
 //!   by the periodic-poll mapper in
-//!   `sync/mappers/rate_tiers.rs`. The read path (`GET /api/new/rates`
-//!   and `GET /api/new/rate-tiers`) projects from this table.
+//!   `sync/mappers/rate_tiers.rs`. The read path (`GET /api/new/rates`)
+//!   projects from this table.
 //!
 //! * **Legacy `ht_rates` table** — DEPRECATED. Its `(weekday / weekend /
 //!   special)` axis is structurally wrong (legacy iHOTEL prices by
@@ -23,7 +23,6 @@
 //! |---------------------------------------|-------------------|------------|
 //! | `GET    /api/new/rates`               | `ht_rate_tiers`   | F4-migrated |
 //! | `GET    /api/new/rates/:id`           | `ht_rate_tiers`   | F4-migrated |
-//! | `GET    /api/new/rate-tiers`          | `ht_rate_tiers`   | F4 (new)    |
 //! | `POST   /api/new/rates`               | `ht_rates`        | deprecated  |
 //! | `PUT    /api/new/rates/:id`           | `ht_rates`        | deprecated  |
 //! | `DELETE /api/new/rates/:id`           | `ht_rates`        | deprecated  |
@@ -32,8 +31,8 @@
 //! response shape so the existing `app/rates/page.tsx` continues to
 //! render. It picks the "default" customer-type tier (`ราคาปกติ`) so the
 //! single-row-per-room-type list shape stays intact. Callers that need
-//! per-tier pricing (e.g. corporate vs walk-in) hit
-//! `GET /api/new/rate-tiers` instead.
+//! per-tier pricing (e.g. corporate vs walk-in) use the service-layer
+//! [`lookup_by_room_and_cust_type`] helper.
 
 use axum::{
     extract::{Path, Query, State},
@@ -120,8 +119,8 @@ pub struct Rate {
     pub updated_at: Option<chrono::NaiveDateTime>,
 }
 
-/// One row from the F4 canonical `ht_rate_tiers` table — exposed
-/// verbatim via `GET /api/new/rate-tiers`.
+/// One row from the F4 canonical `ht_rate_tiers` table — returned by
+/// the [`lookup_by_room_and_cust_type`] service-layer helper.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RateTier {
@@ -143,15 +142,6 @@ pub struct RatesQuery {
     pub active: Option<bool>,
 }
 
-/// Query parameters for `GET /api/new/rate-tiers` (F4 — the canonical
-/// composite-key lookup).
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RateTierQuery {
-    pub room_type: Option<String>,
-    pub cust_type: Option<String>,
-}
-
 /// Response for `GET /api/new/rates`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -167,15 +157,6 @@ pub struct RatesResponse {
 pub struct RateResponse {
     pub success: bool,
     pub rate: Rate,
-}
-
-/// Response for `GET /api/new/rate-tiers`.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RateTiersResponse {
-    pub success: bool,
-    pub data: Vec<RateTier>,
-    pub total: i32,
 }
 
 /// Request body for creating/updating a deprecated `ht_rates` row.
@@ -339,73 +320,6 @@ pub async fn get_rate(
     Ok(Json(RateResponse {
         success: true,
         rate,
-    }))
-}
-
-/// GET /api/new/rate-tiers — F4 canonical composite-key lookup.
-///
-/// Query params (all optional):
-/// * `roomType` — filter to one room-type label
-/// * `custType` — filter to one customer-type tier
-///
-/// Returns one `RateTier` per matched row. Use this when the caller
-/// needs full per-customer-type pricing (corporate vs walk-in, hourly
-/// extension, monthly). For the simpler one-row-per-room-type list
-/// shape the legacy frontend renders, hit `GET /api/new/rates`.
-pub async fn list_rate_tiers(
-    State(state): State<AppState>,
-    Query(params): Query<RateTierQuery>,
-) -> ApiResult<Json<RateTiersResponse>> {
-    let pool = &state.new_pool;
-
-    let mut sql = String::from(
-        r#"
-        SELECT
-            rate_tier_id,
-            rate_tier_room_type,
-            rate_tier_cust_type,
-            rate_tier_price::float8         AS rate_tier_price,
-            rate_tier_price_hourly::float8  AS rate_tier_price_hourly,
-            rate_tier_price_monthly::float8 AS rate_tier_price_monthly,
-            rate_tier_legacy_id,
-            rate_tier_active
-        FROM ht_rate_tiers
-        WHERE rate_tier_active = true
-        "#,
-    );
-
-    let mut bind_room_type: Option<String> = None;
-    let mut bind_cust_type: Option<String> = None;
-    if let Some(rt) = params.room_type.as_deref() {
-        if !rt.trim().is_empty() {
-            sql.push_str(" AND rate_tier_room_type = $1");
-            bind_room_type = Some(rt.to_string());
-        }
-    }
-    if let Some(ct) = params.cust_type.as_deref() {
-        if !ct.trim().is_empty() {
-            let placeholder = if bind_room_type.is_some() { "$2" } else { "$1" };
-            sql.push_str(&format!(" AND rate_tier_cust_type = {}", placeholder));
-            bind_cust_type = Some(ct.to_string());
-        }
-    }
-    sql.push_str(" ORDER BY rate_tier_room_type, rate_tier_cust_type");
-
-    let mut q = sqlx::query(sqlx::AssertSqlSafe(&*sql));
-    if let Some(rt) = bind_room_type {
-        q = q.bind(rt);
-    }
-    if let Some(ct) = bind_cust_type {
-        q = q.bind(ct);
-    }
-    let rows = q.fetch_all(pool).await?;
-    let data: Vec<RateTier> = rows.iter().map(rate_tier_from_row).collect();
-    let total = data.len() as i32;
-
-    Ok(Json(RateTiersResponse {
-        success: true,
-        data,
-        total,
     }))
 }
 

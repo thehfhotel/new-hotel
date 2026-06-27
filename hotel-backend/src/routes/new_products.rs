@@ -92,13 +92,6 @@ pub struct ListProductsResponse {
     pub pagination: Pagination,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProductResponse {
-    pub success: bool,
-    pub product: Product,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StockAdjustRequest {
@@ -187,31 +180,6 @@ pub async fn list_products(
             params.limit.max(1),
             i32::try_from(total).unwrap_or(i32::MAX),
         ),
-    }))
-}
-
-/// GET /api/new/products/:id — single product detail.
-pub async fn get_product(
-    State(state): State<AppState>,
-    Path(prod_id): Path<i64>,
-) -> ApiResult<Json<ProductResponse>> {
-    let pool = &state.new_pool;
-    let row = sqlx::query(
-        "SELECT prod_id, prod_legacy_no, prod_name, prod_unit, \
-                prod_price::float8 AS prod_price, \
-                prod_current_stock::float8 AS prod_current_stock, \
-                prod_category, prod_active, aggregate_id, \
-                prod_created_at, prod_updated_at \
-           FROM ht_products WHERE prod_id = $1",
-    )
-    .bind(prod_id)
-    .fetch_optional(pool)
-    .await?
-    .ok_or_else(|| ApiError::NotFound("Product not found".into()))?;
-
-    Ok(Json(ProductResponse {
-        success: true,
-        product: row_to_product(row),
     }))
 }
 

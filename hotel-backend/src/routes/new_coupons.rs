@@ -5,41 +5,19 @@
 //! - `POST /api/new/coupons/{code}/redeem` — mark a coupon as
 //!   redeemed / printed. Gated on `coupon.redeem` (admin + cashier +
 //!   receptionist per migration 051).
-//! - `GET /api/new/coupons` — list coupons with optional `status`
-//!   query parameter (defaults to `issued` for the
-//!   "outstanding coupons" dashboard panel). Unrestricted.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     Json,
 };
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
 use uuid::Uuid;
 
 use super::mode::AppState;
 use crate::error::{ApiError, ApiResult};
 use crate::outbox::event::EventSource;
 use crate::service::{IssueCouponCommand, RedeemCouponCommand};
-
-/// Coupon DTO surfaced on the wire. Field naming follows the
-/// project's camelCase convention (`#[serde(rename_all = "camelCase")]`).
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CouponView {
-    pub id: i64,
-    pub code: String,
-    pub status: String,
-    pub value: f64,
-    pub issued_at: DateTime<Utc>,
-    pub expires_at: Option<NaiveDate>,
-    pub issued_by: Option<String>,
-    pub for_cin_no: Option<String>,
-    pub redeemed_at: Option<DateTime<Utc>>,
-    pub redeemed_cin_id: Option<i64>,
-    pub legacy_cupon_no: Option<i32>,
-}
 
 /// Request body for `POST /api/new/coupons`.
 #[derive(Debug, Deserialize)]
@@ -71,15 +49,6 @@ pub struct RedeemCouponRequest {
     pub cin_id: Option<i32>,
 }
 
-/// Query parameters for `GET /api/new/coupons`.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ListCouponsQuery {
-    /// Filter by status. Defaults to `issued` (the "outstanding
-    /// coupons" view used by the dashboard panel).
-    pub status: Option<String>,
-}
-
 /// Mutation response carrying the new/updated row's id + aggregate id.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -90,14 +59,6 @@ pub struct CouponMutationResponse {
     pub aggregate_id: Uuid,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
-}
-
-/// Wrapped response for `GET` queries.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CouponsResponse {
-    pub success: bool,
-    pub data: Vec<CouponView>,
 }
 
 /// `POST /api/new/coupons` — issue a new coupon.
@@ -161,51 +122,6 @@ pub async fn redeem_coupon(
     }))
 }
 
-/// `GET /api/new/coupons?status=issued` — list coupons.
-pub async fn list_coupons(
-    State(state): State<AppState>,
-    Query(params): Query<ListCouponsQuery>,
-) -> ApiResult<Json<CouponsResponse>> {
-    let status_filter = params.status.unwrap_or_else(|| "issued".to_string());
-    let rows = sqlx::query(
-        "SELECT \
-            coupon_id, coupon_code, coupon_status, coupon_value::float8 AS coupon_value, \
-            coupon_issued_at, coupon_expires_at, coupon_issued_by, coupon_for_cin_no, \
-            coupon_redeemed_at, coupon_redeemed_cin_id, legacy_cupon_no \
-         FROM ht_coupons \
-         WHERE coupon_status = $1 \
-         ORDER BY coupon_issued_at DESC \
-         LIMIT 500",
-    )
-    .bind(&status_filter)
-    .fetch_all(&state.new_pool)
-    .await?;
-
-    let data: Vec<CouponView> = rows
-        .into_iter()
-        .map(|row| CouponView {
-            id: row.try_get("coupon_id").unwrap_or(0),
-            code: row.try_get("coupon_code").unwrap_or_default(),
-            status: row.try_get("coupon_status").unwrap_or_default(),
-            value: row.try_get("coupon_value").unwrap_or(0.0),
-            issued_at: row
-                .try_get("coupon_issued_at")
-                .unwrap_or_else(|_| Utc::now()),
-            expires_at: row.try_get("coupon_expires_at").ok(),
-            issued_by: row.try_get("coupon_issued_by").ok(),
-            for_cin_no: row.try_get("coupon_for_cin_no").ok(),
-            redeemed_at: row.try_get("coupon_redeemed_at").ok(),
-            redeemed_cin_id: row.try_get("coupon_redeemed_cin_id").ok(),
-            legacy_cupon_no: row.try_get("legacy_cupon_no").ok(),
-        })
-        .collect();
-
-    Ok(Json(CouponsResponse {
-        success: true,
-        data,
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     //! Track G5 — input-validation tests for the coupon routes. These
@@ -258,19 +174,5 @@ mod tests {
         let parsed_empty: RedeemCouponRequest =
             serde_json::from_str(body_empty).expect("must parse");
         assert!(parsed_empty.cin_id.is_none());
-    }
-
-    /// The list query's `status` defaults to `issued` at the handler
-    /// level. The deserialized query treats a missing param as None;
-    /// the handler applies the default.
-    #[test]
-    fn list_query_status_optional() {
-        let no_status: ListCouponsQuery =
-            serde_json::from_str("{}").expect("must parse empty");
-        assert!(no_status.status.is_none());
-
-        let redeemed: ListCouponsQuery =
-            serde_json::from_str(r#"{"status":"redeemed"}"#).expect("must parse");
-        assert_eq!(redeemed.status.as_deref(), Some("redeemed"));
     }
 }
