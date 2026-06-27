@@ -2207,6 +2207,10 @@ INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('059', '059_create_ht_cash_ledger.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('061', '061_create_ht_booking_products.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
 -- =============================================================================
 -- Initialization complete
 -- =============================================================================

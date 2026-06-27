@@ -32,6 +32,12 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Row as _;
+// The list/category/insert SQL is assembled from literal fragments only (the
+// optional WHERE clauses + the `ENTRY_COLUMNS` constant); every user value goes
+// through `.bind()`, never string interpolation. sqlx 0.9's `SqlSafeStr` bound
+// rejects `&String` at compile time in release builds, so wrap the audited
+// dynamic strings with `AssertSqlSafe`.
+use sqlx::AssertSqlSafe;
 
 use super::mode::{AppState, Branch};
 use crate::error::{ApiError, ApiResult};
@@ -254,7 +260,7 @@ pub async fn list_cash(
     }
     sql.push_str(" ORDER BY cash_entry_date DESC NULLS LAST, cash_id DESC");
 
-    let mut q = sqlx::query(&sql).bind(from).bind(to);
+    let mut q = sqlx::query(AssertSqlSafe(sql)).bind(from).bind(to);
     if let Some(ref k) = kind {
         q = q.bind(k);
     }
@@ -316,7 +322,7 @@ pub async fn list_categories(
     }
     sql.push_str(" ORDER BY cat_level, cat_name NULLS LAST, cat_legacy_id");
 
-    let mut q = sqlx::query(&sql);
+    let mut q = sqlx::query(AssertSqlSafe(sql));
     if let Some(ref l) = level {
         q = q.bind(l);
     }
@@ -400,7 +406,7 @@ async fn create_entry(
          RETURNING {ENTRY_COLUMNS}"
     );
 
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(AssertSqlSafe(sql))
         .bind(kind)
         .bind(legacy_type)
         .bind(entry_date)
