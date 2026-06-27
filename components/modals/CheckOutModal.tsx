@@ -74,6 +74,21 @@ function formatCurrency(amount: number): string {
   }).format(amount)
 }
 
+// Full server-authoritative folio from /api/checkins/:id/checkout-quote
+// (spike Phase 2 folio parity). net = room + product; balance = net − pay.
+interface Folio {
+  nights: number
+  ratePerNight: number
+  roomTotal: number
+  productTotal: number
+  vatPercent: number
+  vat: number
+  deposit: number
+  netTotal: number
+  payTotal: number
+  balance: number
+}
+
 export default function CheckOutModal({
   isOpen,
   onClose,
@@ -90,15 +105,16 @@ export default function CheckOutModal({
   // Spike Phase 2 (ship-dark): backend-computed checkout total. Populated only
   // when CHECKOUT_SERVER_TOTAL_ENABLED is on; otherwise the legacy client-side
   // nights × rate is used, so live charges are unchanged.
-  const [quote, setQuote] = useState<{ nights: number; ratePerNight: number; roomTotal: number } | null>(null)
+  const [quote, setQuote] = useState<Folio | null>(null)
 
-  // Totals: the server quote when the flag is on + loaded, else the client calc.
+  // Totals: the server folio when the flag is on + loaded, else the client calc.
   const clientNights = checkIn ? calculateNights(checkIn.checkInTime, null) : 0
   const clientRate = checkIn?.ratePerNight || 0
   const useServerTotal = checkoutServerTotalEnabled && quote != null
   const nights = useServerTotal ? quote!.nights : clientNights
   const ratePerNight = useServerTotal ? quote!.ratePerNight : clientRate
-  const totalAmount = useServerTotal ? quote!.roomTotal : clientNights * clientRate
+  // Server folio total = net (room + products); client fallback = nights × rate.
+  const totalAmount = useServerTotal ? quote!.netTotal : clientNights * clientRate
 
   // Reset form when modal opens
   useEffect(() => {
@@ -121,7 +137,18 @@ export default function CheckOutModal({
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => {
         if (alive && d?.success) {
-          setQuote({ nights: d.nights, ratePerNight: d.ratePerNight, roomTotal: d.roomTotal })
+          setQuote({
+            nights: d.nights,
+            ratePerNight: d.ratePerNight,
+            roomTotal: d.roomTotal,
+            productTotal: d.productTotal,
+            vatPercent: d.vatPercent,
+            vat: d.vat,
+            deposit: d.deposit,
+            netTotal: d.netTotal,
+            payTotal: d.payTotal,
+            balance: d.balance,
+          })
         }
       })
       .catch(() => {})
@@ -237,24 +264,68 @@ export default function CheckOutModal({
             </div>
           </div>
 
-          {/* Summary Box */}
+          {/* Summary Box. With the server folio (flag on) it shows the full
+              iHOTEL-style breakdown; otherwise the legacy nights × rate. */}
           <div className="bg-white rounded-lg border border-gray-300 p-4 mt-4">
-            <div className="flex justify-between items-center mb-2">
-              <span className="text-gray-500">จำนวนคืน</span>
-              <span className="font-medium">{nights} คืน</span>
-            </div>
-            <div className="flex justify-between items-center mb-2">
-              <span className="text-gray-500">ราคาต่อคืน</span>
-              <span className="font-medium">
-                {ratePerNight > 0 ? formatCurrency(ratePerNight) : 'ไม่ระบุ'}
-              </span>
-            </div>
-            <div className="flex justify-between items-center pt-2 border-t border-gray-300">
-              <span className="text-lg font-semibold text-gray-800">รวมทั้งหมด</span>
-              <span className="text-lg font-bold text-red-600">
-                {totalAmount > 0 ? formatCurrency(totalAmount) : 'ไม่ระบุ'}
-              </span>
-            </div>
+            {useServerTotal && quote ? (
+              <>
+                <div className="flex justify-between items-center mb-2">
+                  <span className="text-gray-500">ค่าห้อง ({quote.nights} คืน)</span>
+                  <span className="font-medium">{formatCurrency(quote.roomTotal)}</span>
+                </div>
+                {quote.productTotal > 0 && (
+                  <div className="flex justify-between items-center mb-2">
+                    <span className="text-gray-500">ค่าสินค้า / บริการ</span>
+                    <span className="font-medium">{formatCurrency(quote.productTotal)}</span>
+                  </div>
+                )}
+                {quote.vat > 0 && (
+                  <div className="flex justify-between items-center mb-2 text-xs text-gray-400">
+                    <span>รวมภาษี {quote.vatPercent}% (ในราคา)</span>
+                    <span>{formatCurrency(quote.vat)}</span>
+                  </div>
+                )}
+                <div className="flex justify-between items-center pt-2 border-t border-gray-300">
+                  <span className="text-lg font-semibold text-gray-800">รวมทั้งหมด</span>
+                  <span className="text-lg font-bold text-red-600">{formatCurrency(quote.netTotal)}</span>
+                </div>
+                {quote.payTotal > 0 && (
+                  <div className="flex justify-between items-center mt-2">
+                    <span className="text-gray-500">ชำระแล้ว</span>
+                    <span className="font-medium">−{formatCurrency(quote.payTotal)}</span>
+                  </div>
+                )}
+                {quote.deposit > 0 && (
+                  <div className="flex justify-between items-center text-xs text-gray-400">
+                    <span>เงินมัดจำ</span>
+                    <span>{formatCurrency(quote.deposit)}</span>
+                  </div>
+                )}
+                <div className="flex justify-between items-center pt-2 mt-1 border-t border-gray-300">
+                  <span className="font-semibold text-gray-800">คงเหลือ</span>
+                  <span className="font-bold text-red-600">{formatCurrency(quote.balance)}</span>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="flex justify-between items-center mb-2">
+                  <span className="text-gray-500">จำนวนคืน</span>
+                  <span className="font-medium">{nights} คืน</span>
+                </div>
+                <div className="flex justify-between items-center mb-2">
+                  <span className="text-gray-500">ราคาต่อคืน</span>
+                  <span className="font-medium">
+                    {ratePerNight > 0 ? formatCurrency(ratePerNight) : 'ไม่ระบุ'}
+                  </span>
+                </div>
+                <div className="flex justify-between items-center pt-2 border-t border-gray-300">
+                  <span className="text-lg font-semibold text-gray-800">รวมทั้งหมด</span>
+                  <span className="text-lg font-bold text-red-600">
+                    {totalAmount > 0 ? formatCurrency(totalAmount) : 'ไม่ระบุ'}
+                  </span>
+                </div>
+              </>
+            )}
           </div>
         </div>
 

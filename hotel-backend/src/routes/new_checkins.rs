@@ -21,6 +21,7 @@ use axum::{
 };
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 use uuid::Uuid;
 
 use super::mode::{AppState, Branch};
@@ -375,29 +376,40 @@ pub async fn create_checkin(
     }))
 }
 
-/// `200` body for the checkout quote (spike Phase 2).
+/// `200` body for the checkout quote — the full server-authoritative folio
+/// (spike Phase 2 folio parity). Mirrors iHOTEL `HT_CheckIn_H` Total_Price_*:
+/// `net = room + product`, `balance = net − pay`. `vat` is the VAT-inclusive
+/// portion of net (a receipt detail per `ht_settings.vat_percent` — 0 in
+/// practice for this hotel — NOT added on top of net). `deposit` is its own
+/// line (`HT_CheckIn_Ds.Cin_room_dep`), not folded into net/balance.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckoutQuote {
     pub success: bool,
-    /// Nights billed = `(COALESCE(checkout, expected_checkout)::date − checkin::date)`,
-    /// min 1 — the canonical server computation that backs the receipt + writeback.
+    /// Nights billed = `(COALESCE(checkout, expected_checkout)::date − checkin::date)`, min 1.
     pub nights: i32,
     pub rate_per_night: f64,
-    /// `nights × rate` (room charge). Products/VAT/deposits are not yet plumbed
-    /// server-side — an iHOTEL `FrmCheckOut` parity follow-up.
     pub room_total: f64,
+    /// POS charges to this folio (`ht_pos_sales`, posted).
+    pub product_total: f64,
+    pub vat_percent: i32,
+    /// VAT-inclusive portion of net (informational; net is not grossed up).
+    pub vat: f64,
+    /// Room deposit taken (`ht_checkin_rooms.cr_dep_amount`) — separate line.
+    pub deposit: f64,
+    /// `room_total + product_total`.
+    pub net_total: f64,
+    /// Payments already recorded (`ht_payments`, not voided).
+    pub pay_total: f64,
+    /// `net_total − pay_total` (outstanding at checkout).
+    pub balance: f64,
 }
 
-/// GET /api/checkins/{id}/checkout-quote — the server-authoritative checkout
-/// total (read-only). Returns the same `check_in_billing` numbers the receipt
-/// and the iHOTEL writeback already use, so the UI can DISPLAY the canonical
-/// total instead of computing `ceil(now − checkin) × rate` client-side. Gated
-/// on `CHECKOUT_SERVER_TOTAL_ENABLED` at the UI layer (spike Phase 2, ship-dark).
-pub async fn checkout_quote(
-    State(state): State<AppState>,
-    Path(cin_id): Path<i32>,
-) -> ApiResult<Json<CheckoutQuote>> {
+/// Compute the full server-authoritative checkout folio for a check-in — the
+/// single source for the quote endpoint AND the flag-on checkout path. Reuses
+/// `check_in_billing` (room) + per-cin sums of POS products (`ht_pos_sales`,
+/// posted), payments (`ht_payments`, not voided), and deposits.
+async fn folio_breakdown(state: &AppState, cin_id: i32) -> ApiResult<CheckoutQuote> {
     let billing = state
         .payments
         .check_in_billing(&state.new_pool, cin_id)
@@ -405,12 +417,64 @@ pub async fn checkout_quote(
         .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
     let nights = billing.nights.unwrap_or(1).max(1);
     let rate = billing.cin_rate_per_night.unwrap_or(0.0);
-    Ok(Json(CheckoutQuote {
+    let room_total = rate * nights as f64;
+
+    let sums = sqlx::query(
+        "SELECT \
+            (SELECT COALESCE(SUM(sale_total),0)::float8 FROM ht_pos_sales \
+              WHERE sale_cin_id = $1 AND sale_status <> 'voided') AS product_total, \
+            (SELECT COALESCE(SUM(pay_amount),0)::float8 FROM ht_payments \
+              WHERE pay_cin_id = $1 AND NOT pay_voided) AS pay_total, \
+            (SELECT COALESCE(SUM(cr_dep_amount),0)::float8 FROM ht_checkin_rooms \
+              WHERE cr_cin_id = $1 AND cr_dep_amount > 0) AS deposit",
+    )
+    .bind(cin_id)
+    .fetch_one(&state.new_pool)
+    .await
+    .map_err(|e| ApiError::Internal(format!("failed to sum folio: {e}")))?;
+
+    let product_total: f64 = sums
+        .try_get("product_total")
+        .map_err(|e| ApiError::Internal(format!("product_total: {e}")))?;
+    let pay_total: f64 = sums
+        .try_get("pay_total")
+        .map_err(|e| ApiError::Internal(format!("pay_total: {e}")))?;
+    let deposit: f64 = sums
+        .try_get("deposit")
+        .map_err(|e| ApiError::Internal(format!("deposit: {e}")))?;
+
+    let round2 = |v: f64| (v * 100.0).round() / 100.0;
+    let net_total = round2(room_total + product_total);
+    let vat_percent = crate::repository::settings::get_vat_percent(&state.new_pool).await;
+    let vat = if vat_percent > 0 {
+        round2(net_total * vat_percent as f64 / (100.0 + vat_percent as f64))
+    } else {
+        0.0
+    };
+
+    Ok(CheckoutQuote {
         success: true,
         nights,
         rate_per_night: rate,
-        room_total: rate * nights as f64,
-    }))
+        room_total: round2(room_total),
+        product_total: round2(product_total),
+        vat_percent,
+        vat,
+        deposit: round2(deposit),
+        net_total,
+        pay_total: round2(pay_total),
+        balance: round2(net_total - pay_total),
+    })
+}
+
+/// GET /api/checkins/{id}/checkout-quote — the full server-authoritative folio
+/// (read-only). The UI DISPLAYS this instead of computing client-side; gated on
+/// `CHECKOUT_SERVER_TOTAL_ENABLED` at the UI layer (spike Phase 2, ship-dark).
+pub async fn checkout_quote(
+    State(state): State<AppState>,
+    Path(cin_id): Path<i32>,
+) -> ApiResult<Json<CheckoutQuote>> {
+    Ok(Json(folio_breakdown(&state, cin_id).await?))
 }
 
 /// PUT /api/new/checkins/:id/checkout - Process check-out
@@ -467,12 +531,27 @@ pub async fn checkout(
         }
     }
 
+    // Phase 2 folio parity (ship-dark): when CHECKOUT_SERVER_TOTAL_ENABLED is on,
+    // the recorded totals + the MSSQL writeback use the FULL server folio (room +
+    // POS products, actual payments, net/balance) instead of room-only + the
+    // client-submitted total. Off → current behavior (live charges unchanged).
+    let server_total_on = std::env::var("CHECKOUT_SERVER_TOTAL_ENABLED")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    let (cmd_total_amount, cmd_product_total, cmd_net_total, cmd_pay_total, cmd_balance) =
+        if server_total_on {
+            let f = folio_breakdown(&state, cin_id).await?;
+            (Some(f.net_total), f.product_total, f.net_total, f.pay_total, f.balance)
+        } else {
+            (body.total_amount, 0.0_f64, net_total, pay_total, balance)
+        };
+
     let outcome = state
         .checkins_service
         .check_out(CheckOutCommand {
             check_in_id: cin_id,
             check_out_time,
-            total_amount: body.total_amount,
+            total_amount: cmd_total_amount,
             payment_status: body
                 .payment_status
                 .clone()
@@ -482,10 +561,10 @@ pub async fn checkout(
             source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
             nights,
             room_price_total,
-            product_total: 0.0,
-            net_total,
-            pay_total,
-            balance,
+            product_total: cmd_product_total,
+            net_total: cmd_net_total,
+            pay_total: cmd_pay_total,
+            balance: cmd_balance,
         })
         .await
         .map_err(map_checkout_error)?;
