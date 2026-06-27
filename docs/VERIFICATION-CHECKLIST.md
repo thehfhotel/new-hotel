@@ -60,10 +60,14 @@ docker logs new-hotel-production-backend-1 | grep 'shadow.booking_validation'
 - [ ] **HF Ville Ship-B** — per-site write bundle so open/close/round/checkout
       writes route to `ville_pool` co-equally (task #20; gates Ville round
       writeback + co-equal Ville writes generally).
-- [ ] **Phase 4 second pass** — reviewed removal of the ~12 unmounted handlers in
-      sensitive domains (booking/customer/coupon/inventory/payment/rates/shift
-      CRUD) + `db/dual_pool.rs` + `auth::router` flagged dead-but-risky. Remove
-      one domain at a time with proof of no consumers.
+- [x] **Phase 4 second pass** — DONE 2026-06-27. Removed (proven zero-consumer):
+      `db/dual_pool.rs`, `auth::router()`, and 6 unmounted read/list handlers
+      (`list_shifts`, `get_checkin`, `get_customer`, `get_product`, `list_coupons`,
+      `list_rate_tiers`) — ~357 lines. **Kept** (review verdict: intended/partial
+      features with services or writeback recipes — not dead, just unwired):
+      `update_customer`/`delete_customer`, `redeem_coupon`, `void_payment`,
+      `adjust_stock`, inventory `create_*`/`get_low_stock`, legacy
+      `bookings::list_bookings`. `KNOWN_SYNC_EVENT_NAMES` kept (used by tests).
 
 ---
 
