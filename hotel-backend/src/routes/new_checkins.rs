@@ -21,7 +21,7 @@ use axum::{
 };
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
+use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use super::mode::{AppState, Branch};
@@ -238,6 +238,31 @@ pub struct ExtendStayRequest {
     /// column); reserved for future audit-trail surface.
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+/// Request body for `PUT /api/checkins/:id/change-dates` (Task #54 item 3 /
+/// Track G2). Same shape as [`ExtendStayRequest`] but semantically allows the
+/// new checkout date to be EARLIER (shorten) as well as later (general
+/// date-edit). Kept as a distinct type so the route's intent reads clearly and
+/// the two endpoints can diverge later (e.g. a future check-in-date field).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeDatesRequest {
+    /// New checkout date, ISO `YYYY-MM-DD`. May be earlier OR later than the
+    /// current `cin_expected_checkout`; must be after the check-in date and
+    /// must differ from the current checkout (no-op rejected).
+    pub new_checkout_date: NaiveDate,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Branch selector for the check-in mutation routes (extend / change-dates /
+/// change-room / room-change-receipt). `branchFetch` (frontend) appends
+/// `?branch=…`; absent ⇒ HF Hotel. Mirrors [`DepositQuery`].
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchQuery {
+    pub branch: Option<Branch>,
 }
 
 /// Response for create/checkout operations
@@ -606,14 +631,20 @@ pub async fn checkout(
 pub async fn extend(
     State(state): State<AppState>,
     Path(cin_id): Path<i32>,
+    Query(query): Query<BranchQuery>,
     Json(body): Json<ExtendStayRequest>,
 ) -> ApiResult<Json<NewCheckInResponse>> {
+    // Branch-aware (item 5): HF Ville reads/writes its own pool. `branchFetch`
+    // appends `?branch=…`; absent ⇒ HF Hotel. HF Ville writes stay gated by
+    // the `ville_write_guard` middleware in main.rs until HFVILLE_WRITES_ENABLED.
+    let pool = checkin_pool_for(&state, query.branch)?;
+
     // Pull the detail row up front so we can (a) validate the date,
     // (b) compute the recipe inputs (stay_start / rate / nights /
     // guest_label), and (c) return the post-extend payload.
     let detail = state
         .checkins
-        .get(&state.new_pool, cin_id)
+        .get(pool, cin_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
 
@@ -623,20 +654,75 @@ pub async fn extend(
     )?;
 
     let command = build_extend_stay_command(&detail, &body);
-    state
-        .checkins_service
+    checkin_service_for(&state, query.branch)?
         .extend(command)
         .await
         .map_err(map_extend_error)?;
 
-    // Re-fetch so the response carries any state the service may have
-    // updated (today the service emits a writeback only and does not touch
-    // PG `cin_expected_checkout` — that lives on the worker side via the
-    // recipe. A follow-up wave will land a PG `apply_extend` so the
-    // canonical state and the response stay in lock-step).
+    // Re-fetch so the response carries the canonical state the service just
+    // updated (item 1: the service now lands `cin_expected_checkout` + the
+    // per-room nights/total in the same tx as the writeback, so this read
+    // reflects the new checkout date immediately — no sync round-trip lag).
     let updated = state
         .checkins
-        .get(&state.new_pool, cin_id)
+        .get(pool, cin_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
+
+    Ok(Json(NewCheckInResponse {
+        success: true,
+        checkin: NewCheckIn::from_detail_row(updated),
+    }))
+}
+
+/// `PUT /api/checkins/:id/change-dates` — general checkout date-edit
+/// (Task #54 item 3 / Track G2). Unlike `extend` (later-only "one more
+/// night"), this accepts an EARLIER date (shorten) as well as a later one.
+///
+/// Reuses the exact same canonical-update + [`WritebackIntent::ExtendStay`]
+/// path as `extend`: the recipe re-writes `HT_CheckIn_H` / `HT_CheckIn_Ds` /
+/// `HT_Room_Status` for the full `[stay_start, new_end)` range in either
+/// direction, and `build_extend_stay_command` recomputes the totals
+/// (rate × nights) for any new date. Branch-aware (item 5).
+///
+/// Note: this edits the CHECKOUT date only. Editing the check-in date is out
+/// of scope — the day-based extend recipe does not rewrite
+/// `HT_CheckIn_Ds.Cin_Room_In`, so a check-in-date edit would leave the
+/// legacy room-in stale. (TODO: a dedicated recipe extension for that.)
+pub async fn change_dates(
+    State(state): State<AppState>,
+    Path(cin_id): Path<i32>,
+    Query(query): Query<BranchQuery>,
+    Json(body): Json<ChangeDatesRequest>,
+) -> ApiResult<Json<NewCheckInResponse>> {
+    let pool = checkin_pool_for(&state, query.branch)?;
+
+    let detail = state
+        .checkins
+        .get(pool, cin_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
+
+    validate_checkout_date_editable(
+        body.new_checkout_date,
+        detail.cin_checkin_time.date(),
+        detail.cin_expected_checkout,
+    )?;
+
+    // The extend command builder is direction-agnostic — feed it through.
+    let extend_body = ExtendStayRequest {
+        new_checkout_date: body.new_checkout_date,
+        reason: body.reason.clone(),
+    };
+    let command = build_extend_stay_command(&detail, &extend_body);
+    checkin_service_for(&state, query.branch)?
+        .extend(command)
+        .await
+        .map_err(map_extend_error)?;
+
+    let updated = state
+        .checkins
+        .get(pool, cin_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
 
@@ -830,6 +916,32 @@ fn validate_new_checkout_after_existing(
     Ok(())
 }
 
+/// Validator for the general checkout date-edit (`change_dates`, Task #54
+/// item 3). Unlike [`validate_new_checkout_after_existing`], an EARLIER date
+/// is allowed (shorten). Two guards remain:
+/// - the new date must leave at least one night (strictly after the check-in
+///   date), and
+/// - it must differ from the current checkout (a no-op edit is rejected so the
+///   receptionist gets explicit feedback rather than a silent success).
+fn validate_checkout_date_editable(
+    new_checkout_date: NaiveDate,
+    checkin_date: NaiveDate,
+    existing_expected_checkout: NaiveDate,
+) -> ApiResult<()> {
+    if new_checkout_date == existing_expected_checkout {
+        return Err(ApiError::BadRequest(format!(
+            "New checkout date ({new_checkout_date}) is unchanged — nothing to edit."
+        )));
+    }
+    if new_checkout_date <= checkin_date {
+        return Err(ApiError::BadRequest(format!(
+            "New checkout date ({new_checkout_date}) must be after the check-in \
+             date ({checkin_date}) — a stay needs at least one night."
+        )));
+    }
+    Ok(())
+}
+
 /// Build the [`ExtendStayCommand`] from the canonical PG detail row + the
 /// HTTP body. Pure (no IO, no clock reads) so the test suite can pin the
 /// translation contract without spinning up an `AppState`.
@@ -940,11 +1052,14 @@ pub struct ChangeRoomResponse {
 pub async fn change_room(
     State(state): State<AppState>,
     Path(cin_id): Path<i32>,
+    Query(query): Query<BranchQuery>,
     Json(body): Json<ChangeRoomRequest>,
 ) -> ApiResult<Json<ChangeRoomResponse>> {
     let command = build_change_room_command(cin_id, &body);
-    let outcome = state
-        .checkins_service
+    // Branch-aware (item 5): a HF Ville move recomputes the destination rate
+    // and writes the audit row against the Ville pool. HF Ville writes stay
+    // gated by `ville_write_guard` until HFVILLE_WRITES_ENABLED.
+    let outcome = checkin_service_for(&state, query.branch)?
         .change_room(command)
         .await
         .map_err(map_change_room_error)?;
@@ -998,6 +1113,95 @@ fn map_change_room_error(err: ServiceError) -> ApiError {
         ServiceError::Validation(msg) => ApiError::BadRequest(msg),
         other => other.into(),
     }
+}
+
+// =============================================================================
+// Room-change receipt — Task #54 item 5
+// =============================================================================
+
+/// Query for `GET /api/checkins/:id/room-change-receipt`. `branch` selects the
+/// pool; `rcId` optionally targets a specific `ht_room_changes` row (defaults
+/// to the most recent move for the folio).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomChangeReceiptQuery {
+    pub branch: Option<Branch>,
+    pub rc_id: Option<i64>,
+}
+
+/// Printable room-change slip — the data the front-desk hands the guest after
+/// a mid-stay move. Sourced from the canonical `ht_room_changes` audit row
+/// joined to the folio + both rooms. `to_price` is the destination room's
+/// recomputed rate (item 2); `room_before_price` is the rate the guest was on
+/// before the move.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomChangeReceipt {
+    pub success: bool,
+    pub rc_id: i64,
+    pub cin_no: String,
+    pub customer_name: Option<String>,
+    pub from_room_no: String,
+    pub to_room_no: String,
+    pub room_before_price: f64,
+    pub to_price: Option<String>,
+    pub reason: Option<String>,
+    pub changed_at: Option<String>,
+    pub changed_by: Option<String>,
+}
+
+/// `GET /api/checkins/:id/room-change-receipt` — fetch the printable
+/// room-change slip for a folio (most recent move, or a specific `rcId`).
+/// Branch-aware (item 5).
+pub async fn room_change_receipt(
+    State(state): State<AppState>,
+    Path(cin_id): Path<i32>,
+    Query(query): Query<RoomChangeReceiptQuery>,
+) -> ApiResult<Json<RoomChangeReceipt>> {
+    let pool = checkin_pool_for(&state, query.branch)?;
+    let row = sqlx::query(
+        "SELECT rc.rc_id, \
+                ci.cin_no, \
+                CONCAT(c.cust_firstname, ' ', COALESCE(c.cust_lastname, '')) AS customer_name, \
+                rf.room_no AS from_room_no, \
+                rt.room_no AS to_room_no, \
+                rc.rc_room_before_price::float8 AS room_before_price, \
+                rc.rc_to_price AS to_price, \
+                rc.rc_reason AS reason, \
+                rc.rc_changed_at::text AS changed_at, \
+                rc.rc_changed_by AS changed_by \
+           FROM ht_room_changes rc \
+           JOIN ht_checkins ci ON ci.cin_id = rc.rc_cin_id \
+           LEFT JOIN ht_customers c ON c.cust_id = ci.cin_cust_id \
+           JOIN ht_rooms_new rf ON rf.room_id = rc.rc_from_room_id \
+           JOIN ht_rooms_new rt ON rt.room_id = rc.rc_to_room_id \
+          WHERE rc.rc_cin_id = $1 \
+            AND ($2::bigint IS NULL OR rc.rc_id = $2) \
+          ORDER BY rc.rc_id DESC \
+          LIMIT 1",
+    )
+    .bind(cin_id)
+    .bind(query.rc_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ApiError::Database(e.to_string()))?
+    .ok_or_else(|| {
+        ApiError::NotFound(format!("no room change found for check-in {cin_id}"))
+    })?;
+
+    Ok(Json(RoomChangeReceipt {
+        success: true,
+        rc_id: row.try_get("rc_id").unwrap_or_default(),
+        cin_no: row.try_get("cin_no").unwrap_or_default(),
+        customer_name: row.try_get("customer_name").ok(),
+        from_room_no: row.try_get("from_room_no").unwrap_or_default(),
+        to_room_no: row.try_get("to_room_no").unwrap_or_default(),
+        room_before_price: row.try_get("room_before_price").unwrap_or(0.0),
+        to_price: row.try_get("to_price").ok(),
+        reason: row.try_get("reason").ok(),
+        changed_at: row.try_get("changed_at").ok(),
+        changed_by: row.try_get("changed_by").ok(),
+    }))
 }
 
 // =============================================================================
@@ -1070,15 +1274,27 @@ pub struct DepositRefundResponse {
 /// recipe (`docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_CheckIn_Ds`).
 const DEP_STATUS_REFUNDED: &str = "คืนเงินแล้ว";
 
+/// Resolve the read pool for the given branch. `branchFetch` appends
+/// `?branch=…`; absent ⇒ HF Hotel. `All` is not meaningful for a single
+/// check-in mutation so it falls back to HF Hotel. Shared by extend /
+/// change-dates / room-change-receipt.
+fn checkin_pool_for(state: &AppState, branch: Option<Branch>) -> ApiResult<&PgPool> {
+    Ok(match branch.unwrap_or_default() {
+        Branch::Hfville => state.ville_pool()?,
+        Branch::Hfhotel | Branch::All => &state.new_pool,
+    })
+}
+
 /// Build a [`CheckInService`] bound to the branch's pool. Mirrors
 /// `routes::housekeeping::service_for` — the AppState-wired instance is
 /// hardwired to the primary pool at startup, so a fresh service (cheap Arc
 /// clones + pool handle) is built per request to target HF Ville. HF Ville
 /// mutations stay gated by the `ville_write_guard` middleware in `main.rs`
-/// until `HFVILLE_WRITES_ENABLED` is flipped — this route relies on that
-/// existing safety net. The refund flow doesn't touch the shift gate, so the
+/// until `HFVILLE_WRITES_ENABLED` is flipped — this relies on that existing
+/// safety net. None of the callers here (deposit-refund / extend /
+/// change-dates / change-room) touch the round-bill shift gate, so the
 /// service is constructed without `with_shifts`.
-fn deposit_service_for(state: &AppState, branch: Option<Branch>) -> ApiResult<CheckInService> {
+fn checkin_service_for(state: &AppState, branch: Option<Branch>) -> ApiResult<CheckInService> {
     let pool = match branch.unwrap_or_default() {
         Branch::Hfville => state.ville_pool()?.clone(),
         Branch::Hfhotel | Branch::All => state.new_pool.clone(),
@@ -1148,7 +1364,7 @@ pub async fn deposit_refund(
     Query(query): Query<DepositQuery>,
     Json(body): Json<DepositRefundRequest>,
 ) -> ApiResult<Json<DepositRefundResponse>> {
-    let svc = deposit_service_for(&state, query.branch)?;
+    let svc = checkin_service_for(&state, query.branch)?;
     let by = body
         .by
         .map(|s| s.trim().to_string())
@@ -1663,6 +1879,44 @@ mod tests {
         let later = NaiveDate::from_ymd_opt(2026, 5, 16).expect("valid date");
         validate_new_checkout_after_existing(later, existing)
             .expect("a strictly later date must be accepted");
+    }
+
+    /// Task #54 item 3 — the general date-edit validator allows BOTH earlier
+    /// and later checkouts, but still rejects a no-op and any date that
+    /// wouldn't leave at least one night.
+    #[test]
+    fn change_dates_validator_allows_shorten_and_extend() {
+        let checkin = NaiveDate::from_ymd_opt(2026, 5, 13).expect("valid date");
+        let existing = NaiveDate::from_ymd_opt(2026, 5, 17).expect("valid date");
+
+        // Earlier-but-still-≥1-night (shorten) — accepted (this is the Track
+        // G2 gap the old `extend` validator rejected).
+        let shorter = NaiveDate::from_ymd_opt(2026, 5, 15).expect("valid date");
+        validate_checkout_date_editable(shorter, checkin, existing)
+            .expect("shortening to a still-valid date must be accepted");
+
+        // Later (extend) — accepted.
+        let longer = NaiveDate::from_ymd_opt(2026, 5, 20).expect("valid date");
+        validate_checkout_date_editable(longer, checkin, existing)
+            .expect("extending must be accepted");
+
+        // No-op (same as existing) — rejected.
+        let err = validate_checkout_date_editable(existing, checkin, existing)
+            .expect_err("unchanged date must reject");
+        match err {
+            ApiError::BadRequest(msg) => assert!(msg.contains("unchanged"), "got: {msg}"),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+
+        // On/before the check-in date (< 1 night) — rejected.
+        let err = validate_checkout_date_editable(checkin, checkin, existing)
+            .expect_err("zero-night stay must reject");
+        match err {
+            ApiError::BadRequest(msg) => {
+                assert!(msg.contains("at least one night"), "got: {msg}")
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
     }
 
     /// Track G1 / T4 HIGH-2: happy path — the route's command builder must

@@ -1,8 +1,17 @@
 'use client'
 
-import { useEffect, useState } from 'react'
-import { AlertCircle, ArrowRightLeft, Loader2, X } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import {
+  AlertCircle,
+  ArrowRightLeft,
+  CheckCircle2,
+  Loader2,
+  Printer,
+  X,
+} from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { printRoomChange } from '@/lib/print'
+import RoomChangeSlip from '@/components/documents/RoomChangeSlip'
 
 /**
  * Change-room modal — Track G4 / T4 HIGH-3
@@ -15,9 +24,14 @@ import { useBranchFetch } from '@/lib/use-branch-fetch'
  * `{ fromRoomId, toRoomId, reason? }`.
  *
  * The route delegates to `CheckInService::change_room` which validates
- * the move, INSERTs the audit row in `ht_room_changes`, UPDATEs the
+ * the move, recomputes the rate against the destination room (Task #54
+ * item 2), INSERTs the audit row in `ht_room_changes`, UPDATEs the
  * `ht_checkin_rooms` junction, and emits the legacy-mirror writeback.
- * Modelled on `ExtendStayModal.tsx` for visual + behavioural consistency.
+ *
+ * On success the modal switches to a confirmation step offering a printable
+ * room-change slip (Task #54 item 5,
+ * `GET /api/checkins/:id/room-change-receipt`). Modelled on
+ * `ExtendStayModal.tsx` for visual consistency.
  */
 
 interface RoomLite {
@@ -37,6 +51,27 @@ interface AvailableRoom {
   id: number
   roomNo: string
   typeName?: string | null
+}
+
+/** Shape returned by `GET /api/checkins/:id/room-change-receipt`. */
+interface RoomChangeReceipt {
+  success: boolean
+  rcId: number
+  cinNo: string
+  customerName?: string | null
+  fromRoomNo: string
+  toRoomNo: string
+  roomBeforePrice: number
+  toPrice?: string | null
+  reason?: string | null
+  changedAt?: string | null
+  changedBy?: string | null
+}
+
+/** Local record of the just-completed move (for the confirmation view). */
+interface ChangeDone {
+  rcId: number
+  toRoomNo: string
 }
 
 interface ChangeRoomModalProps {
@@ -77,6 +112,11 @@ export default function ChangeRoomModal({
     null,
   )
   const [reason, setReason] = useState<string>('')
+  // After a successful move: the confirmation/print step.
+  const [done, setDone] = useState<ChangeDone | null>(null)
+  const [printing, setPrinting] = useState(false)
+  const [receipt, setReceipt] = useState<RoomChangeReceipt | null>(null)
+  const slipRef = useRef<HTMLDivElement>(null)
 
   // Find the currently active check-in for this room + the list of
   // rooms the receptionist can move TO. We run both in parallel so
@@ -128,6 +168,13 @@ export default function ChangeRoomModal({
     }
   }, [room.id, branchFetch])
 
+  // Print once the receipt has been fetched + the slip has rendered.
+  useEffect(() => {
+    if (receipt) {
+      printRoomChange(slipRef.current)
+    }
+  }, [receipt])
+
   const submit = async () => {
     if (!activeCheckin) return
     if (!selectedToRoomId) {
@@ -158,12 +205,39 @@ export default function ChangeRoomModal({
       if (!res.ok || !data.success) {
         throw new Error(data.message || 'เปลี่ยนห้องไม่สำเร็จ')
       }
+      // Refresh the parent grid immediately, then switch to the
+      // confirmation/print step (modal stays open until the receptionist
+      // closes it or prints the slip).
       onSuccess()
-      onClose()
+      const toRoom = availableRooms.find((r) => r.id === selectedToRoomId)
+      setDone({
+        rcId: data.rcId,
+        toRoomNo: toRoom?.roomNo ?? String(selectedToRoomId),
+      })
     } catch (err) {
       setError(err instanceof Error ? err.message : 'เกิดข้อผิดพลาด')
     } finally {
       setSubmitting(false)
+    }
+  }
+
+  const printSlip = async () => {
+    if (!activeCheckin || !done) return
+    setPrinting(true)
+    setError(null)
+    try {
+      const res = await branchFetch(
+        `/api/checkins/${activeCheckin.id}/room-change-receipt?rcId=${done.rcId}`,
+      )
+      const data = await res.json()
+      if (!res.ok || !data.success) {
+        throw new Error(data.message || 'ไม่สามารถพิมพ์ใบเปลี่ยนห้องได้')
+      }
+      setReceipt(data as RoomChangeReceipt)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'เกิดข้อผิดพลาด')
+    } finally {
+      setPrinting(false)
     }
   }
 
@@ -190,7 +264,25 @@ export default function ChangeRoomModal({
         </div>
 
         <div className="p-4 space-y-4">
-          {loading ? (
+          {done ? (
+            <div className="bg-emerald-50 border border-emerald-200 rounded p-3 space-y-2 text-sm">
+              <div className="flex items-center text-emerald-700 font-medium">
+                <CheckCircle2 size={18} className="mr-2" />
+                เปลี่ยนห้องสำเร็จ
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-600">ย้ายจากห้อง:</span>
+                <span className="font-medium">{room.roomNo}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-600">ไปยังห้อง:</span>
+                <span className="font-medium">{done.toRoomNo}</span>
+              </div>
+              <div className="text-xs text-gray-500">
+                พิมพ์ใบแจ้งเปลี่ยนห้องให้ลูกค้า หรือกดเสร็จสิ้นเพื่อปิด
+              </div>
+            </div>
+          ) : loading ? (
             <div className="flex items-center justify-center py-8 text-gray-500">
               <Loader2 size={20} className="animate-spin mr-2" />
               กำลังค้นหาข้อมูล...
@@ -272,6 +364,7 @@ export default function ChangeRoomModal({
               <div className="text-xs text-gray-500">
                 หมายเหตุ:
                 ข้อมูลการเปลี่ยนห้องจะถูกบันทึกในประวัติการเข้าพักของลูกค้า
+                ราคาห้องจะถูกคำนวณใหม่ตามห้องปลายทาง
                 และจะส่งไปยังระบบเก่าโดยอัตโนมัติ
               </div>
             </>
@@ -286,29 +379,73 @@ export default function ChangeRoomModal({
         </div>
 
         <div className="flex justify-end gap-2 p-4 border-t border-gray-200">
-          <button
-            onClick={onClose}
-            disabled={submitting}
-            className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50"
-          >
-            ยกเลิก
-          </button>
-          <button
-            onClick={submit}
-            disabled={
-              submitting || loading || !activeCheckin || !selectedToRoomId
-            }
-            className="px-4 py-2 text-sm font-medium text-white bg-amber-600 rounded hover:bg-amber-700 disabled:opacity-50 flex items-center"
-          >
-            {submitting ? (
-              <Loader2 size={14} className="mr-2 animate-spin" />
-            ) : (
-              <ArrowRightLeft size={14} className="mr-2" />
-            )}
-            ยืนยันเปลี่ยนห้อง
-          </button>
+          {done ? (
+            <>
+              <button
+                onClick={printSlip}
+                disabled={printing}
+                className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50 flex items-center"
+              >
+                {printing ? (
+                  <Loader2 size={14} className="mr-2 animate-spin" />
+                ) : (
+                  <Printer size={14} className="mr-2" />
+                )}
+                พิมพ์ใบเปลี่ยนห้อง
+              </button>
+              <button
+                onClick={onClose}
+                className="px-4 py-2 text-sm font-medium text-white bg-amber-600 rounded hover:bg-amber-700"
+              >
+                เสร็จสิ้น
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                onClick={onClose}
+                disabled={submitting}
+                className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50"
+              >
+                ยกเลิก
+              </button>
+              <button
+                onClick={submit}
+                disabled={
+                  submitting || loading || !activeCheckin || !selectedToRoomId
+                }
+                className="px-4 py-2 text-sm font-medium text-white bg-amber-600 rounded hover:bg-amber-700 disabled:opacity-50 flex items-center"
+              >
+                {submitting ? (
+                  <Loader2 size={14} className="mr-2 animate-spin" />
+                ) : (
+                  <ArrowRightLeft size={14} className="mr-2" />
+                )}
+                ยืนยันเปลี่ยนห้อง
+              </button>
+            </>
+          )}
         </div>
       </div>
+
+      {/* Off-screen printable slip — only present once the receipt loads. The
+          @media print rules in RoomChangeSlip reposition + reveal it. */}
+      {receipt && (
+        <div style={{ position: 'absolute', left: '-9999px', top: 0 }} aria-hidden>
+          <RoomChangeSlip
+            ref={slipRef}
+            cinNo={receipt.cinNo}
+            customerName={receipt.customerName}
+            fromRoomNo={receipt.fromRoomNo}
+            toRoomNo={receipt.toRoomNo}
+            roomBeforePrice={receipt.roomBeforePrice}
+            toPrice={receipt.toPrice}
+            reason={receipt.reason}
+            changedAt={receipt.changedAt}
+            changedBy={receipt.changedBy}
+          />
+        </div>
+      )}
     </div>
   )
 }

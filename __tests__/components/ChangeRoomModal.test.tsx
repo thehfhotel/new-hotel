@@ -18,7 +18,9 @@ import ChangeRoomModal from '@/components/ChangeRoomModal'
 jest.mock('lucide-react', () => ({
   AlertCircle: () => <span data-testid="alert-icon" />,
   ArrowRightLeft: () => <span data-testid="swap-icon" />,
+  CheckCircle2: () => <span data-testid="check-icon" />,
   Loader2: () => <span data-testid="loader-icon" />,
+  Printer: () => <span data-testid="printer-icon" />,
   X: () => <span data-testid="x-icon" />,
 }))
 
@@ -174,7 +176,21 @@ describe('ChangeRoomModal — Track G4 / T4 HIGH-3', () => {
         reason: 'AC broken',
       })
     })
+
+    // On success the modal switches to the confirmation/print step:
+    // onSuccess refreshes the parent grid immediately, but the modal stays
+    // open (onClose NOT called yet) so the receptionist can print the slip.
+    await waitFor(() => {
+      expect(screen.getByText('เปลี่ยนห้องสำเร็จ')).toBeInTheDocument()
+    })
     expect(onSuccess).toHaveBeenCalledTimes(1)
+    expect(onClose).not.toHaveBeenCalled()
+
+    // A print button is offered (Task #54 item 5 — room-change receipt).
+    expect(screen.getByText('พิมพ์ใบเปลี่ยนห้อง')).toBeInTheDocument()
+
+    // Clicking "เสร็จสิ้น" closes the modal.
+    fireEvent.click(screen.getByText('เสร็จสิ้น').closest('button')!)
     expect(onClose).toHaveBeenCalledTimes(1)
   })
 

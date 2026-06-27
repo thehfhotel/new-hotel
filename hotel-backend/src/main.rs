@@ -512,10 +512,21 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route("/api/checkins/{id}/checkout-quote", get(routes::new_checkins::checkout_quote))
         // Track G1 / T4 HIGH-2: extend an active stay (one-more-night flow).
         .route("/api/checkins/{id}/extend", put(routes::new_checkins::extend))
+        // Task #54 item 3 / Track G2: general checkout date-edit (shorten OR
+        // extend) — reuses the ExtendStay canonical-update + writeback path.
+        .route(
+            "/api/checkins/{id}/change-dates",
+            put(routes::new_checkins::change_dates),
+        )
         // Track G4 / T4 HIGH-3: mid-stay room change (move guest A → B).
         .route(
             "/api/checkins/{id}/change-room",
             post(routes::new_checkins::change_room),
+        )
+        // Task #54 item 5: printable room-change receipt for a folio.
+        .route(
+            "/api/checkins/{id}/room-change-receipt",
+            get(routes::new_checkins::room_change_receipt),
         )
         // Task #49 — deposit refund (คืนเงินมัดจำ / iHOTEL FormShowDEPBack).
         // GET lists per-room deposit lines (backs the folio refund button);

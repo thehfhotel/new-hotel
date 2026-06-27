@@ -514,11 +514,36 @@ impl CheckInService {
         })
     }
 
-    /// Extend an active stay — emits the writeback intent + a synthetic
-    /// `CheckInCreated`-shaped event is NOT used. Today this flow only
-    /// publishes the writeback so the worker can re-write `HT_Book_Date` /
-    /// `HT_CheckIn_Ds` per spike §3f. UI refreshes via React Query
-    /// invalidation on the next bookings/check-ins poll.
+    /// Extend (or, since Task #54 / Track G2, shorten / re-date) an active
+    /// stay — lands the canonical PG change AND the legacy writeback in ONE
+    /// transaction:
+    ///
+    /// 1. `ht_checkins.cin_expected_checkout` ← the new departure date so the
+    ///    folio / dashboard stop showing a stale checkout (item 1 — the prior
+    ///    implementation was writeback-only and the UI lagged until the
+    ///    legacy→PG sync round-trip eventually refreshed it).
+    /// 2. Per-room `ht_checkin_rooms` nights / total / `cr_room_out` are
+    ///    re-derived (multi-room safe: each room keeps its own
+    ///    `cr_rate_per_night` × the new nights). Best-effort — pre-junction
+    ///    folios have no row and the dashboard COALESCE-falls back to
+    ///    `ht_checkins`.
+    /// 3. The existing [`WritebackIntent::ExtendStay`] is enqueued so the
+    ///    worker re-writes `HT_CheckIn_H` / `HT_CheckIn_Ds` / `HT_Room_Status`
+    ///    per spike §3f. The recipe re-writes the full `[stay_start, new_end)`
+    ///    range in EITHER direction, so the same path handles a forward
+    ///    extend, a shorten, and a general checkout date-edit.
+    ///
+    /// The service intentionally does NOT enforce a direction (later-only) —
+    /// that policy lives in the route layer (`extend` keeps rejecting earlier
+    /// dates for the "one more night" button; `change_dates` allows both).
+    /// UI refreshes via the next poll.
+    ///
+    /// TODO(hourly): the iHOTEL hourly path (`Cin_type=1`; pricing rules in
+    /// `HT_ContinueTime`) is NOT mirrored here — there is no continue-time
+    /// writeback recipe (`writeback::recipes` ships only the day-based
+    /// `extend_stay`). An hourly extension must still be done in iHOTEL until
+    /// a `HT_ContinueTime` recipe lands; wire it through this method once it
+    /// exists (do not add a new `WritebackIntent` variant — extend the recipe).
     pub async fn extend(&self, cmd: ExtendStayCommand) -> ServiceResult<CheckInOutcome> {
         let status = self
             .repo
@@ -540,6 +565,41 @@ impl CheckInService {
 
         let mut tx = self.pg.begin().await?;
         let aggregate_id = aggregate_uuid(AggregateKind::CheckIn, cmd.check_in_id);
+
+        // Item 1 / Track G2 — land the canonical PG change in the SAME tx as
+        // the writeback. `new_end` carries the new departure boundary (UTC
+        // midnight of the new checkout date); calendar nights span
+        // `[stay_start, new_end)`, matching the recipe's enumeration.
+        let new_checkout_date = cmd.new_end.date_naive();
+        let new_nights = (new_checkout_date - cmd.stay_start.date_naive())
+            .num_days()
+            .max(1) as i32;
+        sqlx::query(
+            "UPDATE ht_checkins \
+                SET cin_expected_checkout = $2, updated_at = NOW() \
+              WHERE cin_id = $1",
+        )
+        .bind(cmd.check_in_id)
+        .bind(new_checkout_date)
+        .execute(&mut *tx)
+        .await?;
+        // Re-derive per-room nights / total / departure on the junction. Each
+        // room keeps its own rate so a multi-room folio recomputes correctly;
+        // 0 rows for a pre-junction folio is fine (dashboard COALESCE-falls
+        // back to `ht_checkins`).
+        sqlx::query(
+            "UPDATE ht_checkin_rooms \
+                SET cr_room_out = $2, \
+                    cr_nights = $3, \
+                    cr_room_total = cr_rate_per_night * $3, \
+                    cr_updated_at = NOW() \
+              WHERE cr_cin_id = $1",
+        )
+        .bind(cmd.check_in_id)
+        .bind(cmd.new_end)
+        .bind(new_nights)
+        .execute(&mut *tx)
+        .await?;
 
         let intent = WritebackIntent::ExtendStay {
             check_in_id: aggregate_id,
@@ -699,7 +759,50 @@ impl CheckInService {
         .try_get("price")
         .unwrap_or(0.0);
 
-        // 5. INSERT the canonical audit row.
+        // 4b. Item 2 — recompute the rate against the DESTINATION room's
+        //     price so the move stops inheriting the source room's rate. The
+        //     room's weekday price is the rate source (same column the
+        //     walk-in flow reads for its default rate). A NULL/0 destination
+        //     price falls back to the pre-move rate so a mis-priced room can
+        //     never zero out the folio.
+        let to_room_price: f64 = sqlx::query(
+            "SELECT COALESCE(room_price_weekday, 0)::float8 AS price \
+               FROM ht_rooms_new WHERE room_id = $1",
+        )
+        .bind(cmd.to_room_id)
+        .fetch_one(&mut *tx)
+        .await?
+        .try_get("price")
+        .unwrap_or(0.0);
+        let new_rate = if to_room_price > 0.0 {
+            to_room_price
+        } else {
+            room_before_price
+        };
+        // Remaining nights from the move date (today, Bangkok wall-clock)
+        // through the expected checkout — the destination rate applies to the
+        // nights still to be stayed. Min 1 so a same-day move still books a
+        // night. Single-rate folio: past nights are not re-priced separately
+        // (the canonical model carries one per-night rate per room line).
+        let remaining_nights: i32 = sqlx::query(
+            "SELECT GREATEST( \
+                cin_expected_checkout - (NOW() AT TIME ZONE 'Asia/Bangkok')::date, \
+                1)::int AS n \
+               FROM ht_checkins WHERE cin_id = $1",
+        )
+        .bind(cmd.check_in_id)
+        .fetch_one(&mut *tx)
+        .await?
+        .try_get("n")
+        .unwrap_or(1);
+        // Legacy `HT_Changed_Room.ToPrice` is varchar(20); the §3.17 capture
+        // stored the bare baht figure (e.g. '890'). Match that shape.
+        let to_price = format!("{:.0}", new_rate);
+
+        // 5. INSERT the canonical audit row. `rc_to_price` records the
+        //    destination room's rate so the legacy `HT_Changed_Room.ToPrice`
+        //    mirror (written by the RoomChange recipe from this column)
+        //    reflects the recomputed charge.
         let reason_trimmed = cmd
             .reason
             .as_deref()
@@ -708,8 +811,8 @@ impl CheckInService {
         let rc_id: i64 = sqlx::query(
             "INSERT INTO ht_room_changes ( \
                 rc_cin_id, rc_from_room_id, rc_to_room_id, rc_reason, \
-                rc_changed_at, rc_changed_by, rc_room_before_price \
-             ) VALUES ($1, $2, $3, $4, NOW(), $5, $6::numeric) \
+                rc_changed_at, rc_changed_by, rc_room_before_price, rc_to_price \
+             ) VALUES ($1, $2, $3, $4, NOW(), $5, $6::numeric, $7) \
              RETURNING rc_id",
         )
         .bind(cmd.check_in_id)
@@ -718,6 +821,7 @@ impl CheckInService {
         .bind(reason_trimmed)
         .bind(if cmd.actor.is_empty() { None } else { Some(cmd.actor.as_str()) })
         .bind(room_before_price)
+        .bind(&to_price)
         .fetch_one(&mut *tx)
         .await?
         .try_get("rc_id")?;
@@ -728,12 +832,18 @@ impl CheckInService {
         //    UPSERT shape).
         let junction_updated = sqlx::query(
             "UPDATE ht_checkin_rooms \
-                SET cr_room_id = $3, cr_updated_at = NOW() \
+                SET cr_room_id = $3, \
+                    cr_rate_per_night = $4::numeric, \
+                    cr_nights = $5, \
+                    cr_room_total = $4::numeric * $5, \
+                    cr_updated_at = NOW() \
               WHERE cr_cin_id = $1 AND cr_room_id = $2",
         )
         .bind(cmd.check_in_id)
         .bind(cmd.from_room_id)
         .bind(cmd.to_room_id)
+        .bind(new_rate)
+        .bind(remaining_nights)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -741,16 +851,19 @@ impl CheckInService {
             // Pre-B5 fallback: insert a junction row keyed on the
             // to-room so the dashboard's B3 reader sees the new
             // occupancy. cr_room_status mirrors the active-stay
-            // literal the B2 mapper writes.
+            // literal the B2 mapper writes. Item 2: the new line carries
+            // the destination room's recomputed rate / nights / total.
             sqlx::query(
                 "INSERT INTO ht_checkin_rooms ( \
-                    cr_cin_id, cr_room_id, cr_room_status, cr_rate_per_night \
-                 ) VALUES ($1, $2, 'active', $3::numeric) \
+                    cr_cin_id, cr_room_id, cr_room_status, cr_rate_per_night, \
+                    cr_nights, cr_room_total \
+                 ) VALUES ($1, $2, 'active', $3::numeric, $4, $3::numeric * $4) \
                  ON CONFLICT (cr_cin_id, cr_room_id) DO NOTHING",
             )
             .bind(cmd.check_in_id)
             .bind(cmd.to_room_id)
-            .bind(room_before_price)
+            .bind(new_rate)
+            .bind(remaining_nights)
             .execute(&mut *tx)
             .await?;
         }
@@ -771,12 +884,22 @@ impl CheckInService {
         // ht_checkins still carries the deprecated single-room column.
         // Update it as a fallback for legacy-reader code paths so the
         // existing dashboard rendering doesn't surface stale data
-        // between now and Track B5's column drop.
-        sqlx::query("UPDATE ht_checkins SET cin_room_id = $2, updated_at = NOW() WHERE cin_id = $1")
-            .bind(cmd.check_in_id)
-            .bind(cmd.to_room_id)
-            .execute(&mut *tx)
-            .await?;
+        // between now and Track B5's column drop. Item 2: also re-stamp
+        // `cin_rate_per_night` with the destination room's rate so the
+        // single-rate folio (`folio_breakdown` / checkout) bills the new
+        // room's price rather than the room the guest left.
+        sqlx::query(
+            "UPDATE ht_checkins \
+                SET cin_room_id = $2, \
+                    cin_rate_per_night = $3::numeric, \
+                    updated_at = NOW() \
+              WHERE cin_id = $1",
+        )
+        .bind(cmd.check_in_id)
+        .bind(cmd.to_room_id)
+        .bind(new_rate)
+        .execute(&mut *tx)
+        .await?;
 
         // 8. Enqueue the writeback intent + commit. The aggregate id is
         //    the check-in's so the writeback worker's resolver picks
