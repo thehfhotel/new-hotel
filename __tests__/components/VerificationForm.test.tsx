@@ -41,7 +41,7 @@ describe('V2Verification — reception verification form', () => {
     render(<V2Verification />)
     expect(screen.getByRole('heading', { name: /เทียบหน้าจอกับ iHOTEL/ })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: /คำถามเรื่องนโยบาย/ })).toBeInTheDocument()
-    expect(screen.getByRole('heading', { name: /ตรวจยอดบิล 5 รายการล่าสุด/ })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: /ตรวจยอดบิลเช็คเอาท์/ })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: /ทดสอบสด/ })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: /ความพร้อมโดยรวม/ })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /บันทึกผลการตรวจสอบ/ })).toBeInTheDocument()
