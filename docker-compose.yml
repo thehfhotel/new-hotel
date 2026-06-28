@@ -454,6 +454,13 @@ services:
       # re-soak (e.g. for rollback) and that will win over this default.
       - LEGACY_SYNC_ENABLED=${HFVILLE_LEGACY_SYNC_ENABLED:-true}
       - LEGACY_SYNC_SHADOW_MODE=${HFVILLE_LEGACY_SYNC_SHADOW_MODE:-false}
+      # Task #67 — per-site reconcile safety net. The backend scheduler's
+      # 15-min diff-only reconcile runs ONLY for HF Hotel (against hotelnew);
+      # HF Ville had no drift backstop, so a dropped CT event went undetected
+      # (2026-06-28 room-114 / cin 19906). This worker holds Ville's MSSQL +
+      # hotelville pools, so it runs Ville's reconcile here. ON for sync-hfville
+      # only; HF Hotel keeps its single backend-side reconcile (no double-run).
+      - WORKER_RECONCILE_ENABLED=${HFVILLE_WORKER_RECONCILE_ENABLED:-true}
       # Phase 5.5b Ville cutover (#80, 2026-04-30): allowlist cleared
       # post-021. Empty = poll every CT-enabled table (all 16 now). The
       # explicit 11-table list was Phase 5 only; with mirror tables CT-

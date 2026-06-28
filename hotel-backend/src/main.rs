@@ -175,9 +175,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Pass PgPool if available for legacy-to-PG sync job
     if let Some(ref pool) = legacy_pool {
         let pg_for_scheduler = final_app_state.as_ref().map(|s| s.new_pool.clone());
+        // Ville canonical pool for the pure-PG stale-checkin tripwire (task #66) —
+        // the backend is the only place both canonical pools are co-resident.
+        let ville_pg_for_scheduler = final_app_state
+            .as_ref()
+            .and_then(|s| s.ville_pool.clone());
         if let Err(e) = init_scheduler(
             pool.clone(),
             pg_for_scheduler,
+            ville_pg_for_scheduler,
             config.slack.clone(),
             config.site.clone(),
         )

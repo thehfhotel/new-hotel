@@ -592,6 +592,146 @@ async fn check_level_drift_and_alert(
     slack.send_message(&msg).await;
 }
 
+/// Default days-past-expected-checkout before an `active` check-in is
+/// flagged stale. Overridable via `STALE_CHECKIN_ALERT_DAYS`.
+const STALE_CHECKIN_ALERT_DAYS_DEFAULT: i32 = 2;
+
+/// Cooldown key (in `ht_level_drift_alert_cooldowns`, the `table_name`
+/// column) for the stale-checkin tripwire — reuses the level-drift cooldown
+/// table so the alert fires at most once per `LEVEL_DRIFT_COOLDOWN_HOURS`
+/// (default 24h) per site, even while a backlog persists.
+const STALE_CHECKIN_COOLDOWN_KEY: &str = "stale_active_checkin";
+
+/// Resolve the stale-checkin threshold (days) from `STALE_CHECKIN_ALERT_DAYS`,
+/// clamped to a sane floor of 1 day. Falls back to the default on a missing
+/// or unparseable value.
+fn stale_checkin_alert_days() -> i32 {
+    std::env::var("STALE_CHECKIN_ALERT_DAYS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .filter(|d| *d >= 1)
+        .unwrap_or(STALE_CHECKIN_ALERT_DAYS_DEFAULT)
+}
+
+/// P0 stale-checkin tripwire (task #66). A pure-PG safety net, INDEPENDENT
+/// of the MSSQL-backed reconcile sweep: a dropped checkout leaves the
+/// canonical check-in `active` with `cin_expected_checkout` in the past
+/// indefinitely (the CT event that would flip it is gone after retention,
+/// and the reconcile hash historically didn't cover the per-room checkout
+/// flip — the 2026-06-28 room-114 / cin 19906 incident, see
+/// [`checkin_canonical_hash`]). This catches that class on ANY site, even
+/// one whose reconcile sweep doesn't run or whose legacy MSSQL is
+/// unreachable — because it only reads canonical PG.
+///
+/// Flags `cin_status='active'` rows whose `cin_expected_checkout` is more
+/// than `STALE_CHECKIN_ALERT_DAYS` (default 2) days in the past, fires ONE
+/// Slack alert per site gated by the shared 24h level-drift cooldown, and is
+/// best-effort throughout (a PG or Slack failure only logs a warning).
+pub async fn check_stale_active_checkins_and_alert(
+    pg_pool: &PgPool,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+) {
+    let days = stale_checkin_alert_days();
+
+    let rows = sqlx::query_as::<_, (String, chrono::DateTime<chrono::Utc>)>(
+        "SELECT cin_no, cin_expected_checkout \
+           FROM ht_checkins \
+          WHERE cin_status = 'active' \
+            AND cin_expected_checkout IS NOT NULL \
+            AND cin_expected_checkout < now() - make_interval(days => $1) \
+          ORDER BY cin_expected_checkout \
+          LIMIT 100",
+    )
+    .bind(days)
+    .fetch_all(pg_pool)
+    .await;
+
+    let stale = match rows {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                site = %site_id,
+                error = %e,
+                "[Sync] Failed to query ht_checkins for stale-checkin tripwire — observability degraded"
+            );
+            return;
+        }
+    };
+
+    if stale.is_empty() {
+        tracing::debug!(
+            site = %site_id,
+            threshold_days = days,
+            "[Sync] Stale-checkin tripwire: no active check-ins past expected checkout"
+        );
+        return;
+    }
+
+    tracing::warn!(
+        site = %site_id,
+        count = stale.len(),
+        threshold_days = days,
+        "[Sync] Stale-checkin tripwire: active check-ins long past expected checkout (likely dropped checkout)"
+    );
+
+    // Cooldown-gate the Slack alert (reuse the level-drift cooldown table so
+    // a persistent backlog doesn't refire every tick). Check eligibility AND
+    // mark in the same branch — if we're going to alert, we mark.
+    let cooldown = std::time::Duration::from_secs((LEVEL_DRIFT_COOLDOWN_HOURS * 3600) as u64);
+    if !level_alert_eligible_pg(pg_pool, site_id, STALE_CHECKIN_COOLDOWN_KEY, cooldown).await {
+        tracing::debug!(
+            site = %site_id,
+            "[Sync] Stale-checkin alert suppressed by cooldown"
+        );
+        return;
+    }
+
+    let Some(slack) = slack else {
+        tracing::info!(
+            site = %site_id,
+            "[Sync] Slack not configured; stale-checkin tripwire logged only ({} row(s))",
+            stale.len()
+        );
+        return;
+    };
+
+    let now = chrono::Utc::now();
+    let shown = stale.len().min(15);
+    let body = stale
+        .iter()
+        .take(shown)
+        .map(|(cin_no, exp)| {
+            let overdue_days = (now - *exp).num_days();
+            format!("• `{cin_no}` — {overdue_days}d past expected checkout")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let more = if stale.len() > shown {
+        format!("\n…and {} more", stale.len() - shown)
+    } else {
+        String::new()
+    };
+
+    let msg = SlackMessage::with_site_text(
+        site_id,
+        format!(
+            ":hourglass_flowing_sand: *Stale active check-in(s) — likely dropped checkout* :hourglass_flowing_sand:\n\
+             {count} canonical check-in(s) are still `active` more than {days} day(s) past their \
+             expected checkout. This usually means a checkout CT event was dropped (past MSSQL \
+             retention, so it won't self-heal) — the room shows occupied in the new app while \
+             iHOTEL has it checked out:\n\
+             {body}{more}\n\
+             _Reconcile the row(s) to match iHOTEL (see the 2026-06-28 cin 19906 / room 114 \
+             playbook). Pure-PG tripwire; per-site cooldown {cooldown_h}h._",
+            count = stale.len(),
+            cooldown_h = LEVEL_DRIFT_COOLDOWN_HOURS,
+        ),
+    );
+    slack.send_message(&msg).await;
+    mark_level_alert_sent_pg(pg_pool, site_id, STALE_CHECKIN_COOLDOWN_KEY).await;
+}
+
 /// Resolved CT-lag thresholds (versions + seconds) for a reconcile tick.
 /// Produced by [`ct_lag_thresholds_from_env`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1165,10 +1305,25 @@ fn booking_canonical_hash(
 /// mapper denormalises only the FIRST room (`legacy_room_no`) into
 /// `ht_checkins`, so we hash that single representative row here too.
 ///
-/// `cin_status` is deliberately excluded from the active-stay hash
+/// Full `cin_status` is deliberately excluded from the active-stay hash
 /// shape: `View_CheckIn_Ds.Cin_status` is a per-room ledger state,
 /// whereas canonical `ht_checkins.cin_status` is the header-derived
-/// aggregate — different fields.
+/// aggregate — different fields. The `checked_out` boolean below is the
+/// ONE status bit we DO hash (see next paragraph).
+///
+/// **Checked-out flag (task #68, 2026-06-28).** `cin_checkout_time` alone
+/// does NOT distinguish active-from-checked-out, because the hash feeds it
+/// the *effective* checkout date — `actual` when checked out, else
+/// `expected` — and the two coincide whenever a guest departs on the
+/// booked date. A dropped checkout then leaves canonical `active`
+/// (effective = expected) while legacy is checked-out (effective = actual)
+/// with IDENTICAL dates → identical hashes → invisible drift. That is
+/// exactly the 2026-06-28 room-114 / cin 19906 incident (out 05-16 =
+/// expected 05-16). The `checked_out` bit — `cin_checkout_time.is_some()`
+/// on BOTH sides — makes the active↔checked-out transition a first-class
+/// hash input without importing the non-comparable full `cin_status`.
+/// Agreeing rows still match (both `true` or both `false`); only a genuine
+/// status divergence (dropped checkout/checkin) flips it.
 ///
 /// **Cancelled folios (2026-05-19 — reconcile cleanup PR B).** When
 /// iHOTEL cancels a check-in (`HT_CheckIn_H.Cin_status='ยกเลิก'`) it
@@ -1196,18 +1351,20 @@ fn checkin_canonical_hash(
     cin_checkin_time: Option<&str>,
     cin_checkout_time: Option<&str>,
     legacy_cust_no: Option<&str>,
+    checked_out: bool,
     cancelled: bool,
 ) -> String {
     if cancelled {
         return sha256(&format!("CANCELLED|{}", legacy_cin_no));
     }
     sha256(&format!(
-        "{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|co={}",
         legacy_cin_no,
         legacy_room_no.unwrap_or(""),
         cin_checkin_time.unwrap_or(""),
         cin_checkout_time.unwrap_or(""),
         legacy_cust_no.unwrap_or(""),
+        checked_out,
     ))
 }
 
@@ -1491,12 +1648,14 @@ async fn compute_current_pg_hash(
             Ok(canonical.map(|c| {
                 let effective_checkout = c.effective_checkout_date().map(|d| d.to_string());
                 let cancelled = c.is_cancelled();
+                let checked_out = c.is_checked_out();
                 checkin_canonical_hash(
                     legacy_pk,
                     c.legacy_room_no.as_deref(),
                     c.cin_checkin_time.map(|t| t.to_string()).as_deref(),
                     effective_checkout.as_deref(),
                     c.legacy_cust_no.as_deref(),
+                    checked_out,
                     cancelled,
                 )
             }))
@@ -1602,6 +1761,7 @@ async fn compute_legacy_checkin_hash_via_mapper(
         Some(canonical.cin_checkin_time.to_string()).as_deref(),
         Some(effective_checkout).as_deref(),
         canonical.legacy_cust_no.as_deref(),
+        canonical.cin_checkout_time.is_some(),
         canonical.cin_status == "cancelled",
     );
     Ok(Some(hash))
@@ -3040,6 +3200,7 @@ fn checkin_hash_from_canonical(
         Some(canonical.cin_checkin_time.to_string()).as_deref(),
         Some(effective_checkout_str).as_deref(),
         canonical.legacy_cust_no.as_deref(),
+        canonical.cin_checkout_time.is_some(),
         canonical.cin_status == "cancelled",
     )
 }
@@ -3223,6 +3384,7 @@ async fn sync_checkins(
                         checkin_str.as_deref(),
                         effective_checkout_str.as_deref(),
                         c.legacy_cust_no.as_deref(),
+                        c.is_checked_out(),
                         c.is_cancelled(),
                     )
                 });
@@ -3403,6 +3565,15 @@ impl CanonicalCheckinRow {
     /// preserves all the existing field-by-field drift detection).
     fn is_cancelled(&self) -> bool {
         self.cin_status.as_deref() == Some("cancelled")
+    }
+
+    /// `true` when an ACTUAL checkout has been recorded (`cin_checkout_time`
+    /// is set) — the `checked_out` bit hashed by [`checkin_canonical_hash`].
+    /// Mirrors the legacy side's `cin_checkout_time.is_some()` so a dropped
+    /// checkout (canonical still active, legacy checked-out) diverges even
+    /// when the actual/expected dates coincide (task #68).
+    fn is_checked_out(&self) -> bool {
+        self.cin_checkout_time.is_some()
     }
 }
 
@@ -3895,6 +4066,7 @@ mod tests {
             Some(checkin_dt.to_string()).as_deref(),
             Some(expected_out.to_string()).as_deref(),
             Some(cust_no),
+            false,
             false,
         )
     }
@@ -4547,6 +4719,7 @@ mod tests {
             None,
             Some("C001"),
             false,
+            false,
         );
         let canonical = checkin_canonical_hash(
             "CIN001",
@@ -4554,6 +4727,7 @@ mod tests {
             Some("2026-04-01 14:00:00"),
             None,
             Some("C001"),
+            false,
             false,
         );
         assert_eq!(mssql, canonical);
@@ -4568,6 +4742,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         );
         // CT mapper resolved the wrong room — drift the operator
         // should investigate via `ht_reconcile_log`.
@@ -4577,6 +4752,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             false,
         );
         assert_ne!(mssql, canonical);
@@ -4596,6 +4772,7 @@ mod tests {
             None,
             Some("C001"),
             false,
+            false,
         );
         let canonical = checkin_canonical_hash(
             "CIN001",
@@ -4603,6 +4780,7 @@ mod tests {
             Some("2026-04-01 14:00:00"),
             None,
             Some("C001"),
+            false,
             false,
         );
         assert_eq!(mssql, canonical);
@@ -4625,6 +4803,7 @@ mod tests {
             Some("2026-05-18"), // MSSQL caller now drops time via .date().to_string()
             Some("C001"),
             false,
+            false,
         );
         let canonical = checkin_canonical_hash(
             "CIN001",
@@ -4632,6 +4811,7 @@ mod tests {
             Some("2026-04-01 14:00:00"),
             Some("2026-05-18"), // canonical cin_expected_checkout.to_string()
             Some("C001"),
+            false,
             false,
         );
         assert_eq!(mssql, canonical);
@@ -4651,6 +4831,7 @@ mod tests {
             Some("2026-05-18 11:59:59"),
             Some("C001"),
             false,
+            false,
         );
         let pre_fix_canonical_null_checkout = checkin_canonical_hash(
             "CIN001",
@@ -4659,10 +4840,44 @@ mod tests {
             None,
             Some("C001"),
             false,
+            false,
         );
         assert_ne!(
             pre_fix_mssql_datetime, pre_fix_canonical_null_checkout,
             "pre-Bug-B inputs MUST diverge — this is the bug the fix addresses"
+        );
+    }
+
+    /// Task #68 regression guard for the 2026-06-28 room-114 / cin 19906
+    /// dropped-checkout class. A guest who departs ON the expected date leaves
+    /// `effective_checkout` IDENTICAL on both sides (actual == expected), so the
+    /// only signal of the dropped checkout is the `checked_out` bit. Canonical
+    /// still `active` (checked_out=false) vs legacy checked-out
+    /// (checked_out=true) MUST diverge despite every OTHER field matching —
+    /// otherwise the sweep is blind to this exact incident.
+    #[test]
+    fn checkin_canonical_hash_diverges_on_checked_out_flag_when_dates_coincide() {
+        let canonical_active = checkin_canonical_hash(
+            "CH26-001158",
+            Some("114"),
+            Some("2026-05-15 15:00:00"),
+            Some("2026-05-16"), // effective = expected (active, no actual checkout)
+            Some("C019906"),
+            false, // checked_out: canonical still active (the dropped checkout)
+            false,
+        );
+        let legacy_checked_out = checkin_canonical_hash(
+            "CH26-001158",
+            Some("114"),
+            Some("2026-05-15 15:00:00"),
+            Some("2026-05-16"), // effective = actual = SAME date as expected
+            Some("C019906"),
+            true, // checked_out: legacy departed on the expected date
+            false,
+        );
+        assert_ne!(
+            canonical_active, legacy_checked_out,
+            "a dropped checkout (active vs checked-out) MUST diverge even when actual==expected"
         );
     }
 
@@ -4769,12 +4984,13 @@ mod tests {
             Some("2026-04-01 14:00:00"),
             Some("2026-04-03"),
             Some("C001"),
+            false,
             true,
         );
         assert_eq!(with_room_and_dates, expected);
 
         // Same PK, completely different room/time/customer garbage —
-        // sentinel still wins.
+        // sentinel still wins (checked_out flag is ignored too).
         let with_other_garbage = checkin_canonical_hash(
             "CH26-005252",
             Some("999"),
@@ -4782,12 +4998,13 @@ mod tests {
             Some("2099-12-31"),
             Some("CXXXX"),
             true,
+            true,
         );
         assert_eq!(with_other_garbage, expected);
 
         // All-None on the ignored slots still produces the same hash.
         let with_all_none = checkin_canonical_hash(
-            "CH26-005252", None, None, None, None, true,
+            "CH26-005252", None, None, None, None, false, true,
         );
         assert_eq!(with_all_none, expected);
     }
@@ -4808,6 +5025,7 @@ mod tests {
             Some("2026-04-01 14:00:00"),
             Some("2026-04-03"),
             Some("C001"),
+            false,
             true,
         );
         let pg_side = checkin_canonical_hash(
@@ -4816,6 +5034,7 @@ mod tests {
             Some("2026-04-01 14:00:00"),
             Some("2026-04-03"),
             Some("C001"),
+            false,
             true,
         );
         assert_eq!(
@@ -4843,11 +5062,12 @@ mod tests {
             Some("2026-04-03"),
             Some("C001"),
             false,
+            false,
         );
-        let expected = sha256("CIN001|101|2026-04-01 14:00:00|2026-04-03|C001");
+        let expected = sha256("CIN001|101|2026-04-01 14:00:00|2026-04-03|C001|co=false");
         assert_eq!(
             actual, expected,
-            "active-stay 5-field hash shape must be preserved when cancelled=false"
+            "active-stay hash shape must be preserved (5 fields + co= checked_out flag) when cancelled=false"
         );
         // And the active hash MUST NOT equal the cancelled sentinel
         // for the same PK — otherwise the cancelled-vs-active

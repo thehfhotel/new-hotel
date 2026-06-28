@@ -996,6 +996,77 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .await;
     });
 
+    // P1 (task #67) — per-site reconcile safety net. The backend's
+    // `init_scheduler` runs the 15-min diff-only reconcile ONLY for the
+    // primary site (HF Hotel, against `hotelnew`); HF Ville had NO reconcile
+    // backstop at all, so a dropped CT event there went undetected for weeks
+    // (the 2026-06-28 room-114 / cin 19906 incident). This worker already
+    // holds ITS OWN site's MSSQL + canonical PG pools, so it is the natural
+    // home for that site's reconcile. Gated by `WORKER_RECONCILE_ENABLED`
+    // (default off) and set true ONLY on the sync-hfville container, so HF
+    // Hotel keeps its single backend-side reconcile — no double-run / double
+    // drift-alerting. Runs in whatever `LEGACY_SYNC_RECONCILE_MODE` resolves
+    // to (default `diff_only`: logs to `ht_reconcile_log`, never mutates —
+    // the CT watcher above owns canonical writes).
+    if env::var("WORKER_RECONCILE_ENABLED")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+    {
+        let interval_secs = env::var("WORKER_RECONCILE_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|s| *s >= 60)
+            .unwrap_or(900);
+        let reconcile_pg = pg.clone();
+        let reconcile_mssql = mssql.clone();
+        let reconcile_slack = slack.clone();
+        let reconcile_site_id = site.id.clone();
+        let reconcile_shutdown = shutdown.clone();
+        tracing::info!(
+            site = %site.id,
+            interval_secs,
+            "[Sync] Worker reconcile ENABLED — per-site diff-only safety net"
+        );
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+            // Consume the immediate first tick: startup already converged
+            // canonical, and we don't want a full sweep racing the CT watcher
+            // before it settles (or hammering MSSQL on every worker restart).
+            ticker.tick().await;
+            let notified = reconcile_shutdown.notified();
+            tokio::pin!(notified);
+            loop {
+                tokio::select! {
+                    _ = &mut notified => {
+                        tracing::info!(
+                            site = %reconcile_site_id,
+                            "[Sync] Worker reconcile task exiting (SIGTERM)"
+                        );
+                        break;
+                    }
+                    _ = ticker.tick() => {
+                        let span = tracing::info_span!(
+                            "worker_reconcile_tick", site = %reconcile_site_id
+                        );
+                        let _enter = span.enter();
+                        hotel_backend::scheduler::sync::run_sync(
+                            &reconcile_mssql,
+                            &reconcile_pg,
+                            reconcile_slack.as_ref(),
+                            &reconcile_site_id,
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+    } else {
+        tracing::debug!(
+            site = %site.id,
+            "[Sync] Worker reconcile disabled (set WORKER_RECONCILE_ENABLED=true to enable)"
+        );
+    }
+
     // Per-table retention check timestamps. The first tick after
     // startup runs the check unconditionally (no prior `Instant`); after
     // that, each table re-checks at most once per

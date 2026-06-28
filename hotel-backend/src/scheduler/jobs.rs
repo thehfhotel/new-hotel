@@ -57,6 +57,7 @@ impl Default for SchedulerState {
 pub async fn init_scheduler(
     pool: DbPool,
     pg_pool: Option<PgPool>,
+    ville_pg_pool: Option<PgPool>,
     slack_config: SlackConfig,
     site: SiteConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -124,6 +125,48 @@ pub async fn init_scheduler(
         } else {
             tracing::info!("[Scheduler] - Legacy reconcile: DISABLED (SYNC_ENABLED=false)");
         }
+
+        // P0 stale-checkin tripwire (task #66). Pure-PG safety net,
+        // INDEPENDENT of the MSSQL reconcile above — so it runs regardless of
+        // SYNC_ENABLED and catches dropped-checkouts even on a site whose
+        // reconcile sweep doesn't run (HF Ville has no backend reconcile) or
+        // whose legacy MSSQL is unreachable. Runs against the primary pool
+        // (this backend's site) AND, when present, the Ville pool — the only
+        // place both canonical pools are co-resident, so one job covers both
+        // sites. Hourly at :07 (offset from the :00/:15/:30/:45 reconcile);
+        // the 24h per-site cooldown inside the check prevents spam.
+        let stale_pg = pg.clone();
+        let stale_ville = ville_pg_pool.clone();
+        let stale_slack: Option<SlackClient> = if slack_config.is_configured() {
+            Some(SlackClient::new(slack_config.clone()))
+        } else {
+            None
+        };
+        let stale_site = site.id.clone();
+        let stale_job = Job::new_async("0 7 * * * *", move |_uuid, _l| {
+            let pg = stale_pg.clone();
+            let ville = stale_ville.clone();
+            let slack = stale_slack.clone();
+            let site_id = stale_site.clone();
+            Box::pin(async move {
+                sync::check_stale_active_checkins_and_alert(&pg, slack.as_ref(), &site_id).await;
+                // The backend is always the primary (HF Hotel) instance, so
+                // the Ville pool maps to "hfville". Guard against an unexpected
+                // hfville-primary config double-counting the same DB.
+                if let Some(ref vp) = ville {
+                    if site_id != "hfville" {
+                        sync::check_stale_active_checkins_and_alert(vp, slack.as_ref(), "hfville")
+                            .await;
+                    }
+                }
+            })
+        })?;
+        scheduler.add(stale_job).await?;
+        tracing::info!(
+            site = %site.id,
+            ville_covered = ville_pg_pool.is_some(),
+            "[Scheduler] - Stale-checkin tripwire: hourly (pure-PG dropped-checkout safety net)"
+        );
     }
 
     // Slack notification jobs only run if Slack is configured
