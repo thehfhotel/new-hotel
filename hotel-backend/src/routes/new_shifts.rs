@@ -291,9 +291,16 @@ pub struct RoundReportQuery {
 }
 
 /// Income split by payment tender over the round window. Amounts in baht;
-/// refunds net via negative tenders (legacy negation convention). `total` is
-/// `SUM(ledger_amount)` = `cash+credit+free+transfer+web` (the legacy
-/// per-line invariant) so it reconciles against the tender sum.
+/// refunds net via negative tenders (legacy negation convention).
+///
+/// DEDUPED PER RECEIPT (task #63): the legacy `HT_CheckIn_Pay` tender columns
+/// (`cash/credit/tran/free/web`) are REPLICATED on every line of a multi-line
+/// receipt (one line per room for a multi-room stay, plus a line per product),
+/// so the tender sum is taken over one representative line per `ledger_pay_no`
+/// to match iHOTEL's per-receipt income report. (Only the tenders are
+/// replicated; `ledger_amount` — the sales-by-category basis — is genuinely
+/// itemized per line, so it is summed across all lines, not deduped. Both bases
+/// reconcile to the same receipt total after dedup.)
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TenderBreakdown {
@@ -389,6 +396,33 @@ pub struct RoundReportResponse {
     pub cash_variance: Option<f64>,
 }
 
+/// Round income-by-tender SQL (task #63: dedup-by-receipt). Bound with
+/// `$1`/`$2` = window `[from, to)`. Public so the integration test
+/// (`tests/test_round_report_dedup.rs`) exercises the EXACT handler query and
+/// can't silently drift from it.
+///
+/// See [`TenderBreakdown`] for why the tenders are deduped per `ledger_pay_no`
+/// while `line_count` stays the raw line count.
+pub const ROUND_INCOME_BY_TENDER_SQL: &str = "WITH receipts AS ( \
+         SELECT DISTINCT ON (COALESCE(NULLIF(ledger_pay_no, ''), 'lid:' || ledger_id::text)) \
+                ledger_cash, ledger_credit, ledger_tran, ledger_free, ledger_web \
+           FROM ht_payment_ledger \
+          WHERE ledger_status = '1' \
+            AND ledger_pay_date >= $1 AND ledger_pay_date < $2 \
+          ORDER BY COALESCE(NULLIF(ledger_pay_no, ''), 'lid:' || ledger_id::text), ledger_id \
+     ) \
+     SELECT COALESCE(SUM(ledger_cash) FILTER (WHERE ledger_cash > 0),0)::float8     AS cash_received, \
+            COALESCE(-SUM(ledger_cash) FILTER (WHERE ledger_cash < 0),0)::float8    AS cash_paid, \
+            COALESCE(SUM(ledger_credit) FILTER (WHERE ledger_credit > 0),0)::float8 AS credit, \
+            COALESCE(SUM(ledger_tran) FILTER (WHERE ledger_tran > 0),0)::float8     AS transfer, \
+            COALESCE(SUM(ledger_free),0)::float8   AS free, \
+            COALESCE(SUM(ledger_web),0)::float8    AS web, \
+            (SELECT COUNT(*)::bigint FROM ht_payment_ledger \
+              WHERE ledger_status = '1' \
+                AND ledger_pay_date >= $1 AND ledger_pay_date < $2) AS line_count, \
+            COUNT(*)::bigint                       AS payment_count \
+       FROM receipts";
+
 /// `GET /api/shifts/{shift_id}/report` — income-by-tender + sales summary for
 /// a round, computed from canonical `ht_payment_ledger` over the shift's
 /// window. Works for an open round (preview to `now()`) or a closed one.
@@ -441,25 +475,28 @@ pub async fn round_report(
     // Cin_Pay_Date the same way ht_shifts converts round_start/end, so the
     // comparison is apples-to-apples. Active lines only ('1'); cancelled
     // ('ยกเลิก') excluded — matching iHOTEL's shift report.
+    //
+    // DEDUP-BY-RECEIPT (task #63): iHOTEL stores the tender split REPLICATED on
+    // every line of a multi-line receipt — one line per room for a multi-room
+    // stay, plus a line per product — so SUMming all lines double/triple-counts
+    // the money a receipt actually took. (Ville round 816: raw-sum transfer
+    // 17,255 vs iHOTEL 11,005; deduped 11,005 — exact to the baht.) The legacy
+    // income report counts each RECEIPT once, so we collapse to one
+    // representative line per `ledger_pay_no` (the R-number) before summing — the
+    // tenders are identical across a receipt's lines, so any line is lossless.
+    // Only the tenders are replicated; `ledger_amount` (sales-by-category, below)
+    // is itemized and is NOT deduped. The `COALESCE(NULLIF(pay_no,''), 'lid:'||
+    // ledger_id)` key keeps a blank/NULL pay_no line as its own receipt rather
+    // than collapsing all such lines into one. `line_count` stays the raw line
+    // count (transparency); `payment_count` is now the deduped receipt count.
+    //
     // Cash is split RECEIVED (>0) vs PAID-OUT (<0, negated) exactly like
     // iHOTEL's `View_RBill_H` (`round_price_rec` / `round_price_pay`);
     // credit/transfer use iHOTEL's positive-only filter (`round_price_credit`
     // / `round_price_tran`). free/web are summed net as our extras.
-    let inc = sqlx::query(
-        "SELECT COALESCE(SUM(ledger_cash) FILTER (WHERE ledger_cash > 0),0)::float8     AS cash_received, \
-                COALESCE(-SUM(ledger_cash) FILTER (WHERE ledger_cash < 0),0)::float8    AS cash_paid, \
-                COALESCE(SUM(ledger_credit) FILTER (WHERE ledger_credit > 0),0)::float8 AS credit, \
-                COALESCE(SUM(ledger_tran) FILTER (WHERE ledger_tran > 0),0)::float8     AS transfer, \
-                COALESCE(SUM(ledger_free),0)::float8   AS free, \
-                COALESCE(SUM(ledger_web),0)::float8    AS web, \
-                COUNT(*)::bigint                       AS line_count, \
-                COUNT(DISTINCT ledger_pay_no)::bigint  AS payment_count \
-           FROM ht_payment_ledger \
-          WHERE ledger_status = '1' \
-            AND ledger_pay_date >= $1 AND ledger_pay_date < $2",
-    )
-    .bind(window_from)
-    .bind(window_to)
+    let inc = sqlx::query(ROUND_INCOME_BY_TENDER_SQL)
+        .bind(window_from)
+        .bind(window_to)
     .fetch_one(pool)
     .await
     .map_err(|e| ApiError::Internal(format!("failed to sum round income: {e}")))?;
