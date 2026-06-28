@@ -95,6 +95,25 @@ pub struct InvoiceRates {
     pub subtotal: f64,
 }
 
+/// One itemised room line on the invoice (task #62 — per-room bills).
+///
+/// Sourced from the `ht_checkin_rooms` junction (one row per room per
+/// folio) joined to `ht_rooms_new` (+ `ht_room_types`). A multi-room stay
+/// yields one line per room so the printed invoice matches iHOTEL's
+/// per-room `HT_CheckIn_Ds` view; the document's room subtotal is the sum
+/// of every line's `subtotal` (`cr_room_total`). Empty only for
+/// pre-junction folios (the B5 backfill), where the route falls back to
+/// the legacy single `room` / `rates` fields.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InvoiceRoomLine {
+    pub room_no: String,
+    pub room_type: Option<String>,
+    pub nights: i32,
+    pub rate_per_night: f64,
+    pub subtotal: f64,
+}
+
 /// One POS / product / other-charge line on the tax invoice (task #44).
 ///
 /// Sourced from `ht_pos_sales` (posted rows only) joined to `ht_products`
@@ -128,8 +147,14 @@ pub struct Invoice {
     // Guest details
     pub guest: InvoiceGuest,
 
-    // Room assignment
+    // Room assignment (legacy single-room — kept for existing consumers
+    // that read `room`/`rates`; mirrors the deprecated `cin_room_id` join).
     pub room: InvoiceRoom,
+    /// Task #62: itemised per-room lines from the `ht_checkin_rooms`
+    /// junction (one entry per room — multi-room bills). Ordered by room
+    /// number. Empty for pre-junction folios; consumers then fall back to
+    /// the single `room` / `rates` fields above.
+    pub rooms: Vec<InvoiceRoomLine>,
 
     // Stay details
     pub check_in_time: Option<NaiveDateTime>,
@@ -310,6 +335,39 @@ pub async fn get_invoice(
         subtotal,
     };
 
+    // Task #62: itemise every room of the stay from the `ht_checkin_rooms`
+    // junction so a multi-room folio lists one line per room (matching
+    // iHOTEL's per-room `HT_CheckIn_Ds` view). Runtime query (literal
+    // string + bind) so no `.sqlx` cache entry is needed — mirrors the POS
+    // line query below. Read from the branch-aware `pool` selected above.
+    // `room_type` is a LEFT JOIN (orphaned `room_type_id` → NULL line).
+    let room_rows = sqlx::query(
+        "SELECT r.room_no, \
+                rt.type_name, \
+                cr.cr_nights                 AS nights, \
+                cr.cr_rate_per_night::float8 AS rate_per_night, \
+                cr.cr_room_total::float8     AS subtotal \
+           FROM ht_checkin_rooms cr \
+           JOIN ht_rooms_new   r  ON r.room_id  = cr.cr_room_id \
+      LEFT JOIN ht_room_types  rt ON rt.type_id = r.room_type_id \
+          WHERE cr.cr_cin_id = $1 \
+       ORDER BY r.room_no ASC",
+    )
+    .bind(rec.cin_id)
+    .fetch_all(pool)
+    .await?;
+
+    let rooms: Vec<InvoiceRoomLine> = room_rows
+        .into_iter()
+        .map(|row| InvoiceRoomLine {
+            room_no: row.try_get::<String, _>("room_no").unwrap_or_default(),
+            room_type: row.try_get::<Option<String>, _>("type_name").unwrap_or(None),
+            nights: row.try_get::<i32, _>("nights").unwrap_or(0),
+            rate_per_night: row.try_get::<f64, _>("rate_per_night").unwrap_or(0.0),
+            subtotal: row.try_get::<f64, _>("subtotal").unwrap_or(0.0),
+        })
+        .collect();
+
     // Get stored total amount (use calculated if not stored). Reported
     // as `total_amount`; the *document* total is `grand_total` below.
     let total_amount = rec.cin_total_amount.unwrap_or(subtotal);
@@ -346,7 +404,17 @@ pub async fn get_invoice(
 
     // Document total = sum of the lines (room + products). See module docs
     // for why this is preferred over the stored `cin_total_amount`.
-    let room_total = subtotal;
+    //
+    // Task #62: the room subtotal is the SUM of the per-room
+    // `cr_room_total` from the junction (authoritative for multi-room
+    // bills). Falls back to the legacy single-room `subtotal`
+    // (rate × nights) only when the junction has no rows — i.e. a
+    // pre-B5-backfill folio.
+    let room_total = if rooms.is_empty() {
+        subtotal
+    } else {
+        rooms.iter().map(|r| r.subtotal).sum::<f64>()
+    };
     let grand_total = room_total + products_total;
 
     // G3 / T4 HIGH-7: VAT split (over the reconciling document total) +
@@ -363,6 +431,7 @@ pub async fn get_invoice(
         inv_no,
         guest,
         room,
+        rooms,
         check_in_time: Some(rec.cin_checkin_time),
         check_out_time: rec.cin_checkout_time,
         expected_checkout: Some(rec.cin_expected_checkout.and_hms_opt(0, 0, 0).unwrap()),

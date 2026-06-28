@@ -177,7 +177,12 @@ export default function InvoiceTemplate({
         </div>
       </div>
 
-      {/* Room Charges Table */}
+      {/* Room Charges Table — task #62: one itemised row per room of the
+          stay (multi-room bills, sourced from the ht_checkin_rooms junction
+          via mapInvoiceResponse). A single-room stay (or a pre-junction
+          folio falling back to the single room field) renders exactly one
+          row, preserving the original layout. The room subtotal in the
+          summary below is the sum of every line. */}
       <div className="mb-6">
         <h3 className="text-sm font-semibold text-gray-700 uppercase mb-3">รายละเอียดค่าห้องพัก / Room Charges</h3>
         <table className="w-full border-collapse">

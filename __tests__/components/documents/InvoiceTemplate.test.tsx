@@ -646,6 +646,53 @@ describe('InvoiceTemplate Component', () => {
     })
   })
 
+  // Task #62 (itemise the tax invoice per room): a multi-room stay must
+  // list one line per room (matching iHOTEL's per-room HT_CheckIn_Ds view)
+  // with the room subtotal = sum of the per-room totals. The per-room data
+  // is sourced from the ht_checkin_rooms junction server-side and mapped to
+  // InvoiceData.rooms[] by mapInvoiceResponse; these pin the render-time
+  // contract (single-room folios still fall back to one row).
+  describe('Task #62 — per-room itemisation (multi-room bills)', () => {
+    test('renders one line item per room with the summed subtotal (INV2606-019832 case)', () => {
+      // Real reception case: cin 19832 (CH26-005923) = 2-room stay
+      // (rooms 5 & 6), 890/night × 2 nights = 1,780 each → 3,560 total.
+      const twoRoomInvoice = createMockInvoiceData({
+        rooms: [
+          { roomNumber: '5', roomType: 'Standard', ratePerNight: 890, nights: 2, subtotal: 1780 },
+          { roomNumber: '6', roomType: 'Standard', ratePerNight: 890, nights: 2, subtotal: 1780 },
+        ],
+        subtotal: 3560,
+        grandTotal: 3560,
+      })
+
+      render(<InvoiceTemplate {...defaultProps} checkInData={twoRoomInvoice} taxInvoice={true} />)
+
+      // Two itemised room rows (one per room).
+      expect(screen.getByText('5')).toBeInTheDocument()
+      expect(screen.getByText('6')).toBeInTheDocument()
+      // Each room line carries its own 1,780.00 subtotal (one per room).
+      expect(screen.getAllByText('1,780.00')).toHaveLength(2)
+      // The summary room subtotal is the SUM of both rooms (3,560), which
+      // also equals the grand total here (no products) — appears on both
+      // the subtotal and grand-total lines.
+      expect(screen.getByText('ยอดรวมค่าห้อง / Subtotal:')).toBeInTheDocument()
+      expect(screen.getAllByText('3,560.00 บาท').length).toBeGreaterThanOrEqual(2)
+    })
+
+    test('falls back to a single room row for a single-room stay', () => {
+      // Single-room folio (or a pre-junction folio whose mapper fallback
+      // produced one room): exactly one data row in the room-charges table.
+      render(<InvoiceTemplate {...defaultProps} />)
+
+      // Default mock = room 301 only.
+      expect(screen.getByText('301')).toBeInTheDocument()
+      const roomChargesSection =
+        screen.getByText('รายละเอียดค่าห้องพัก / Room Charges').parentElement
+      const roomRows = roomChargesSection!.querySelectorAll('tbody tr')
+      expect(roomRows).toHaveLength(1)
+    })
+  })
+
   describe('Print Styles', () => {
     test('renders invoice container with print-friendly class', () => {
       const { container } = render(<InvoiceTemplate {...defaultProps} />)

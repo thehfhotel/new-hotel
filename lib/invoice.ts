@@ -34,6 +34,17 @@ export interface InvoiceApiInvoice {
     roomType: string | null
     floor: number | null
   }
+  /** Task #62: itemised per-room lines from the `ht_checkin_rooms`
+   *  junction (multi-room bills). One entry per room, ordered by room
+   *  number. Absent/empty for pre-junction folios — the mapper then falls
+   *  back to the single `room` field above. */
+  rooms?: Array<{
+    roomNo: string
+    roomType: string | null
+    nights: number
+    ratePerNight: number
+    subtotal: number
+  }>
   checkInTime: string | null
   checkOutTime: string | null
   expectedCheckout: string | null
@@ -94,8 +105,39 @@ export function mapInvoiceResponse(invoice: InvoiceApiInvoice): InvoiceData {
   }))
   const productsSubtotal =
     invoice.productsTotal ?? products.reduce((sum, p) => sum + p.total, 0)
+
+  // Task #62: itemise every room of the stay. Prefer the backend's
+  // per-room `rooms[]` (from the `ht_checkin_rooms` junction — one line per
+  // room, multi-room bills); fall back to the single `room`/`rates` fields
+  // for pre-junction folios or older API responses that pre-date task #62.
+  const itemizedRooms = invoice.rooms ?? []
+  const rooms =
+    itemizedRooms.length > 0
+      ? itemizedRooms.map((rm) => ({
+          roomNumber: rm.roomNo,
+          roomType: rm.roomType || 'Standard',
+          ratePerNight: rm.ratePerNight,
+          nights: rm.nights,
+          subtotal: rm.subtotal,
+        }))
+      : [
+          {
+            roomNumber: invoice.room.roomNo,
+            roomType: invoice.room.roomType || 'Standard',
+            ratePerNight: invoice.rates.ratePerNight,
+            nights: invoice.rates.nights,
+            subtotal: invoice.rates.subtotal,
+          },
+        ]
+  // Room subtotal = backend `roomTotal` (sum of per-room cr_room_total) when
+  // present; else sum the itemised lines; else the single-room subtotal.
+  const roomSubtotal =
+    invoice.roomTotal ??
+    (itemizedRooms.length > 0
+      ? itemizedRooms.reduce((sum, rm) => sum + rm.subtotal, 0)
+      : invoice.rates.subtotal)
   const grandTotal =
-    invoice.grandTotal ?? invoice.totalAmount ?? invoice.rates.subtotal
+    invoice.grandTotal ?? invoice.totalAmount ?? roomSubtotal
 
   return {
     // Track G3: prefer the dedicated invoice number (INVyyMM-NNNNNN) when
@@ -112,17 +154,9 @@ export function mapInvoiceResponse(invoice: InvoiceApiInvoice): InvoiceData {
     guestTaxId: invoice.guest.taxId || undefined,
     checkInDate: invoice.checkInTime || '',
     checkOutDate: invoice.checkOutTime || invoice.expectedCheckout || '',
-    rooms: [
-      {
-        roomNumber: invoice.room.roomNo,
-        roomType: invoice.room.roomType || 'Standard',
-        ratePerNight: invoice.rates.ratePerNight,
-        nights: invoice.rates.nights,
-        subtotal: invoice.rates.subtotal,
-      },
-    ],
+    rooms,
     products,
-    subtotal: invoice.roomTotal ?? invoice.rates.subtotal,
+    subtotal: roomSubtotal,
     productsSubtotal,
     discount: 0,
     // Track G3: VAT-inclusive split — derived server-side via banker's
