@@ -729,6 +729,15 @@ async fn round_summary_rows(
 ) -> ApiResult<Vec<RoundSummaryRow>> {
     // One pass: per closed round, the ledger tender splits (FILTER) + deposit
     // received/returned (correlated subqueries scoped to that round's window).
+    //
+    // DEDUP-BY-RECEIPT (task #63 sibling — this is the round-LIST screen, §1.2):
+    // the legacy tender columns are REPLICATED on every line of a multi-line
+    // receipt (one per room + per product), so summing the raw join double-counts
+    // multi-room rounds (e.g. Ville round 816 summary read 17,255 vs 11,005). The
+    // LATERAL collapses to one representative line per `ledger_pay_no` within each
+    // round's window before the tenders are summed — same fix as `round_report`'s
+    // ROUND_INCOME_BY_TENDER_SQL, scoped per-shift here. `ledger_amount`-based
+    // numbers are unaffected (itemised); only these tender FILTER sums needed it.
     let rows = sqlx::query(
         "SELECT s.shift_id, s.shift_no, s.shift_legacy_round_id, s.shift_opened_at, s.shift_closed_at, \
                 s.shift_opened_by, s.shift_closed_by, s.shift_opening_float::float8 AS opening, \
@@ -747,9 +756,14 @@ async fn round_summary_rows(
                    WHERE cr.cr_dep_amount > 0 AND c.cin_status <> 'cancelled' \
                      AND cr.cr_dep_returned_at >= s.shift_opened_at AND cr.cr_dep_returned_at < s.shift_closed_at) AS dep_returned \
            FROM ht_shifts s \
-           LEFT JOIN ht_payment_ledger l \
-             ON l.ledger_status = '1' \
-            AND l.ledger_pay_date >= s.shift_opened_at AND l.ledger_pay_date < s.shift_closed_at \
+           LEFT JOIN LATERAL ( \
+               SELECT DISTINCT ON (COALESCE(NULLIF(ledger_pay_no, ''), 'lid:' || ledger_id::text)) \
+                      ledger_cash, ledger_credit, ledger_tran, ledger_free, ledger_web \
+                 FROM ht_payment_ledger \
+                WHERE ledger_status = '1' \
+                  AND ledger_pay_date >= s.shift_opened_at AND ledger_pay_date < s.shift_closed_at \
+                ORDER BY COALESCE(NULLIF(ledger_pay_no, ''), 'lid:' || ledger_id::text), ledger_id \
+           ) l ON true \
           WHERE s.shift_closed_at IS NOT NULL \
             AND s.shift_opened_at >= $1 AND s.shift_opened_at < $2 \
           GROUP BY s.shift_id \
