@@ -2,10 +2,9 @@
 
 import { useState, type ReactNode } from 'react'
 import { ClipboardCheck, CheckCircle2, Loader2, Send, AlertTriangle } from 'lucide-react'
-import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { useBranch } from '@/contexts/BranchContext'
 import { useAuth } from '@/contexts/AuthContext'
-import { V2PageHeader, VilleNotice } from '@/components/v2/primitives'
+import { V2PageHeader } from '@/components/v2/primitives'
 
 /**
  * In-app reception verification form (คู่มือตรวจสอบระบบใหม่ สำหรับฝ่ายต้อนรับ) —
@@ -216,8 +215,7 @@ const OK = [
 ]
 
 export default function V2Verification() {
-  const branchFetch = useBranchFetch()
-  const { branch, canWrite } = useBranch()
+  const { branch } = useBranch()
   const { user } = useAuth()
 
   const [form, setForm] = useState<FormState>(EMPTY_FORM)
@@ -237,10 +235,6 @@ export default function V2Verification() {
   const submit = async (e: React.FormEvent) => {
     e.preventDefault()
     setError(null)
-    if (!canWrite) {
-      setError('สาขานี้เป็นโหมดดูอย่างเดียวในระบบใหม่ — เลือกสาขา HF Hotel เพื่อบันทึก')
-      return
-    }
     if (!form.q5) {
       setError('กรุณาเลือกความพร้อมโดยรวม (ส่วนที่ 5) ก่อนส่ง')
       return
@@ -248,13 +242,19 @@ export default function V2Verification() {
     setSubmitting(true)
     try {
       const { inspector, ...answers } = form
-      const res = await branchFetch('/api/verification', {
+      // Plain fetch (NOT branchFetch): verification is internal feedback stored in
+      // the primary DB, so we must NOT append ?branch=hfville (that would trip
+      // ville_write_guard). The selected branch is sent as `site` data instead, so
+      // the form submits from any branch (incl. HF Ville / ทั้งหมด). Same-origin
+      // fetch still sends the auth session cookie.
+      const res = await fetch('/api/verification', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           inspector: inspector.trim() || user?.username || null,
           answers,
           overall: form.q5,
+          site: branch,
         }),
       })
       if (!res.ok) {
@@ -304,7 +304,6 @@ export default function V2Verification() {
         ควบคู่กับ iHOTEL การตรวจสอบนี้เพื่อยืนยันว่าระบบใหม่แสดงข้อมูลตรงกันก่อนเริ่มใช้จริง
       </p>
 
-      <VilleNotice branch={branch} />
 
       {/* ผู้ตรวจ */}
       <div className="v2-card p-4">
@@ -557,7 +556,7 @@ export default function V2Verification() {
       )}
 
       <div className="flex items-center gap-3">
-        <button type="submit" disabled={submitting || !canWrite} className="v2-btn v2-btn-primary">
+        <button type="submit" disabled={submitting} className="v2-btn v2-btn-primary">
           {submitting ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}
           บันทึกผลการตรวจสอบ
         </button>

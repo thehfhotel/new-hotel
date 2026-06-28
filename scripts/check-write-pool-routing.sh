@@ -103,6 +103,12 @@ is_allowlisted() {
         new_maintenance::create_request) return 0 ;;
         new_maintenance::update_request) return 0 ;;
         new_maintenance::update_request_status) return 0 ;;
+        # (C) Internal reception-verification feedback — NOT a coexistence write.
+        # Stored in the primary DB regardless of branch (the branch is recorded as
+        # `vr_site` data, not a routing key) so reception can submit from ANY branch
+        # incl. HF Ville without `ville_write_guard` blocking it. Deliberately uses
+        # state.new_pool directly.
+        new_verification::create_verification) return 0 ;;
         # (B) — the former service-bound core flows (bookings create/update,
         # payments create/refund, checkins create/checkout) have been CONVERTED
         # to resolve their service graph + pool per-site via

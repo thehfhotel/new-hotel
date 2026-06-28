@@ -63,6 +63,12 @@ pub struct CreateVerificationRequest {
     /// §5 overall readiness verdict ('a' | 'b' | 'c'). Optional.
     #[serde(default)]
     pub overall: Option<String>,
+    /// The branch the checklist is ABOUT ('hfhotel' | 'hfville' | 'all'). Recorded
+    /// as `vr_site`; it does NOT route storage (all feedback lands in the primary
+    /// DB) so the form submits from ANY branch without `ville_write_guard`
+    /// blocking it — this is internal feedback, not a coexistence write.
+    #[serde(default)]
+    pub site: Option<String>,
 }
 
 /// One stored response in `GET /api/verification`.
@@ -98,15 +104,9 @@ pub struct CreateVerificationResponse {
 // Helpers
 // =============================================================================
 
-/// Resolve the per-site pool for a branch via the unified write chokepoint
-/// (HF Ville → ville pool, else primary). Used by BOTH the read and the write
-/// handler so the `Hfville → ville_pool` decision lives in exactly one place —
-/// the same delegation pattern as [`crate::routes::new_notes::resolve_pool`].
-fn resolve_pool(state: &AppState, branch: Option<Branch>) -> ApiResult<&crate::db::PgPool> {
-    state.write_pool(branch)
-}
-
-/// Stable site string for `vr_site` (also the per-site routing key).
+/// Stable site string for `vr_site` — the branch the checklist is ABOUT.
+/// (NOT a storage-routing key: verification feedback always lands in the primary
+/// DB, see `create_verification`.)
 fn branch_site(branch: Option<Branch>) -> &'static str {
     match branch.unwrap_or_default() {
         Branch::Hfville => "hfville",
@@ -147,7 +147,11 @@ pub async fn create_verification(
     actor: Option<Extension<User>>,
     Json(body): Json<CreateVerificationRequest>,
 ) -> ApiResult<(StatusCode, Json<CreateVerificationResponse>)> {
-    let pool = resolve_pool(&state, query.branch)?;
+    // Internal feedback — always store in the primary DB; the branch is recorded
+    // as data (`vr_site`), not a storage/routing key. This keeps the form usable
+    // from ANY branch (incl. HF Ville / "ทั้งหมด") without `ville_write_guard`
+    // blocking it — it is not a coexistence write.
+    let pool = &state.new_pool;
 
     // Reject an empty submission so we never store a meaningless row. The column
     // is NOT NULL; require a non-empty JSON object of answers.
@@ -168,7 +172,12 @@ pub async fn create_verification(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let site = branch_site(query.branch);
+    let site: &str = match body.site.as_deref() {
+        Some("hfville") => "hfville",
+        Some("all") => "all",
+        Some("hfhotel") => "hfhotel",
+        _ => branch_site(query.branch),
+    };
 
     // LITERAL string; every value bound. `vr_answers` (JSONB) takes a
     // `serde_json::Value` directly — same bind shape as `ht_shifts.shift_cash_count`
@@ -206,7 +215,8 @@ pub async fn list_verifications(
     State(state): State<AppState>,
     Query(query): Query<VerificationQuery>,
 ) -> ApiResult<Json<VerificationListResponse>> {
-    let pool = resolve_pool(&state, query.branch)?;
+    // All verification feedback lives in the primary DB (see create_verification).
+    let pool = &state.new_pool;
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
 
     let rows = sqlx::query(

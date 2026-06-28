@@ -30,6 +30,9 @@ jest.mock('@/contexts/AuthContext', () => ({
 describe('V2Verification — reception verification form', () => {
   beforeEach(() => {
     fetchMock.mockReset()
+    // The page now calls the global `fetch` directly (plain fetch, no ?branch —
+    // verification is internal feedback, submittable from any branch).
+    global.fetch = fetchMock as unknown as typeof fetch
     // jsdom has no real scroll; the success path calls window.scrollTo.
     window.scrollTo = jest.fn()
   })
@@ -73,6 +76,8 @@ describe('V2Verification — reception verification form', () => {
     expect(body.answers.q5).toBe('a')
     // inspector falls back to the session username when the field is blank.
     expect(body.inspector).toBe('reception_a')
+    // The selected branch is sent as `site` data (so HF Ville can submit too).
+    expect(body.site).toBe('hfhotel')
 
     // Success confirmation replaces the form.
     expect(await screen.findByText(/บันทึกผลการตรวจสอบเรียบร้อยแล้ว/)).toBeInTheDocument()
