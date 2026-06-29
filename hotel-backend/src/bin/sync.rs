@@ -364,12 +364,20 @@ const DEFAULT_INIT_RETRY_ALERT_AFTER_SECS: u64 = 300;
 /// `MssqlOpKind::Read` budget), so during slow-but-reachable overnight
 /// windows the watcher stayed healthy while THIS probe timed out, fired
 /// a self-recovering `:information_source:` page, and recovered the next
-/// tick once legacy answered. 12s clears the 10s read budget with a
-/// margin and still leaves ~48s of headroom in the 60s tick. A genuinely
-/// unreachable legacy still fails fast (TCP/handshake errors don't wait
-/// the full budget) and falls through to the conservative "fire anyway"
-/// branch. Override via `LEGACY_SYNC_PROBE_TIMEOUT_MS`.
-const DEFAULT_WATCHDOG_CT_PROBE_TIMEOUT_MS: u64 = 12_000;
+/// tick once legacy answered.
+///
+/// 2026-06-29: raised 12s → 30s. Even at 12s the probe kept timing out
+/// during deep overnight-quiet windows (info pages with the watermark
+/// idle 6171s/8113s on 2026-06-29) — iHOTEL was simply answering
+/// `CHANGE_TRACKING_CURRENT_VERSION()` slower than 12s while quiescent,
+/// not unreachable. 30s rides out that sluggishness and still leaves
+/// ~30s of headroom in the 60s tick. A genuinely unreachable legacy
+/// still fails fast (TCP/handshake errors don't wait the full budget)
+/// and falls through to the conservative "fire anyway" branch; and a
+/// real, sustained probe outage is still caught by the 1h
+/// [`DEFAULT_PROBE_OUTAGE_ESCALATION_SECS`] escalation. Override via
+/// `LEGACY_SYNC_PROBE_TIMEOUT_MS`.
+const DEFAULT_WATCHDOG_CT_PROBE_TIMEOUT_MS: u64 = 30_000;
 
 /// 2026-06-26 — once a probe-timeout (`:information_source:`) alert has
 /// been open this long WITHOUT self-recovering, it stops being the benign
@@ -6021,11 +6029,12 @@ mod tests {
     /// The watchdog probe budget MUST exceed the main watcher's 10s
     /// `MssqlOpKind::Read` budget — otherwise the watcher rides out a slow
     /// legacy while THIS probe times out and pages. Also must stay well
-    /// under the 60s poll interval.
+    /// under the 60s poll interval. Raised 12s → 30s on 2026-06-29 after
+    /// info pages kept firing at 12s during deep overnight-quiet windows.
     #[test]
     #[allow(clippy::assertions_on_constants)]
     fn watchdog_probe_budget_exceeds_read_budget_and_fits_tick() {
-        assert_eq!(DEFAULT_WATCHDOG_CT_PROBE_TIMEOUT_MS, 12_000);
+        assert_eq!(DEFAULT_WATCHDOG_CT_PROBE_TIMEOUT_MS, 30_000);
         assert!(
             DEFAULT_WATCHDOG_CT_PROBE_TIMEOUT_MS > 10_000,
             "probe budget must exceed the watcher's 10s read budget"
