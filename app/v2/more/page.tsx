@@ -52,8 +52,7 @@ const SECTIONS: HubSection[] = [
       { href: '/maintenance', label: 'แจ้งซ่อม', desc: 'งานซ่อมบำรุงและอุปกรณ์', icon: Wrench },
       { href: '/inventory', label: 'คลังสินค้า', desc: 'สต๊อกและการเบิกจ่าย', icon: Package },
       { href: '/card-reader', label: 'อ่านบัตรประชาชน', desc: 'ดึงข้อมูลจากบัตรไทย', icon: CreditCard },
-      { href: '/v2/verification', label: 'ตรวจสอบระบบใหม่', desc: 'เทียบระบบใหม่กับ iHOTEL แล้วส่งให้ทีมไอที', icon: ClipboardCheck },
-      { href: '/v2/verification/results', label: 'ผลตรวจสอบ & ตรวจซ้ำ', desc: 'รวมผลการตรวจทั้งหมด + ฟอร์มตรวจซ้ำแยกตามสาขา', icon: ClipboardList },
+      { href: '/v2/verification/results', label: 'ตรวจสอบระบบใหม่', desc: 'ฟอร์มตรวจซ้ำแยกสาขา + ผลตรวจทั้งหมด (เทียบกับ iHOTEL)', icon: ClipboardCheck },
     ],
   },
   {
