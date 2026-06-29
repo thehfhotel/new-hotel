@@ -491,7 +491,13 @@ jobs:
       - name: Initialize database
         env:
           PGPASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD || 'citestpw' }}
-        run: psql -h localhost -p 5439 -U postgres -d hotelnew -f init-db/init-hotelnew.sql
+        run: |
+          psql -h localhost -p 5439 -U postgres -d hotelnew -f init-db/init-hotelnew.sql
+          # Second logical DB (same schema) so the HF Ville write-routing test
+          # (tests/test_ville_write_routing.rs) can prove branch=hfville writes
+          # land in hotelville, not hotelnew. Skips itself if VILLE_DATABASE_URL is unset.
+          createdb -h localhost -p 5439 -U postgres hotelville
+          psql -h localhost -p 5439 -U postgres -d hotelville -f init-db/init-hotelnew.sql
 
       - name: Install Rust toolchain
         # This action derives the toolchain from the pinned ref itself — the SHA
@@ -547,6 +553,7 @@ jobs:
         working-directory: hotel-backend
         env:
           DATABASE_URL: postgres://postgres:${{ secrets.TEST_POSTGRES_PASSWORD || 'citestpw' }}@localhost:5439/hotelnew
+          VILLE_DATABASE_URL: postgres://postgres:${{ secrets.TEST_POSTGRES_PASSWORD || 'citestpw' }}@localhost:5439/hotelville
           SQLX_OFFLINE: "true"
           SCCACHE_GHA_ENABLED: ${{ steps.sccache_probe.outcome == 'success' && 'true' || 'false' }}
           RUSTC_WRAPPER: ${{ steps.sccache_probe.outcome == 'success' && 'sccache' || '' }}
