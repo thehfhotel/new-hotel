@@ -690,6 +690,18 @@ fn build_new_routes(app_state: AppState) -> Router {
             get(routes::new_verification::list_verifications)
                 .post(routes::new_verification::create_verification),
         )
+        // Data-driven feedback/re-verification form definitions (Tier 1 / migration
+        // 067). Generic renderer fetches a form's schema from here, so question
+        // edits are a DB write — no frontend rebuild. Read-only; answers still POST
+        // to /api/verification. PG-CANONICAL ONLY (primary pool).
+        .route(
+            "/api/feedback/forms",
+            get(routes::new_feedback::list_feedback_forms),
+        )
+        .route(
+            "/api/feedback/forms/{key}",
+            get(routes::new_feedback::get_feedback_form),
+        )
         // Inventory Management
         .route("/api/inventory/items", get(routes::new_inventory::list_items).post(routes::new_inventory::create_item))
         .route("/api/inventory/items/{id}", get(routes::new_inventory::get_item).put(routes::new_inventory::update_item).delete(routes::new_inventory::delete_item))

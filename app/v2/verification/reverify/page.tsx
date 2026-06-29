@@ -1,27 +1,53 @@
 'use client'
 
-import { Suspense, useState, type ReactNode } from 'react'
+import { Suspense, useCallback, useEffect, useState, type ReactNode } from 'react'
 import { useSearchParams } from 'next/navigation'
-import { CheckCircle2, Loader2, Send, ClipboardCheck, ArrowLeft } from 'lucide-react'
+import { CheckCircle2, Loader2, Send, ClipboardCheck, ArrowLeft, AlertTriangle, RefreshCcw } from 'lucide-react'
 import { useBranch } from '@/contexts/BranchContext'
 import { useAuth } from '@/contexts/AuthContext'
 import { V2PageHeader } from '@/components/v2/primitives'
 
 /**
- * Per-site RE-VERIFICATION form (ตรวจสอบซ้ำ) — the focused follow-up to the
- * full #58 checklist (`app/v2/verification/page.tsx`). Each item here was a
- * point that IT already fixed; reception just re-confirms it now reads correctly
- * in the new system vs iHOTEL.
+ * Per-site RE-VERIFICATION form (ตรวจสอบซ้ำ) — DATA-DRIVEN (Tier 1).
  *
- * The target site comes from `?site=hfhotel|hfville` (so IT can hand a receptionist
- * a direct link), falling back to the globally-selected branch. We render ONLY the
- * active site's re-verify items plus the shared live-test / note / inspector, then
- * POST to /api/verification with answers tagged `{ kind:'reverify', site }`.
+ * The question list is no longer hardcoded here: this page fetches the form
+ * definition from `GET /api/feedback/forms/reverify_{site}` and renders whatever
+ * the `schema` says, so IT can edit/add questions with a DB write (no frontend
+ * rebuild). The target site comes from `?site=hfhotel|hfville` (so IT can hand a
+ * receptionist a direct link), falling back to the globally-selected branch.
  *
- * Plain fetch (NOT branchFetch): verification is internal feedback stored in the
- * primary DB tagged by `site`, so we must NOT append ?branch=hfville (that would
- * trip ville_write_guard). The form submits fine from any selected branch.
+ * Answers POST to /api/verification tagged `{ kind: form.kind, site, ... }`.
+ * Plain fetch (NOT branchFetch): verification feedback is stored in the primary
+ * DB tagged by `site`, so we must NOT append ?branch=hfville (that would trip
+ * ville_write_guard). The form submits fine from any selected branch.
  */
+
+// ── schema types (mirrors the backend ht_feedback_forms.form_schema shape) ──
+
+interface SchemaOption {
+  value: string
+  label: string
+}
+interface SchemaQuestion {
+  id: string
+  type: string // 'radio' | 'text' (unknown types render nothing)
+  label: string
+  required?: boolean
+  placeholder?: string
+  options?: SchemaOption[]
+  showIf?: { field: string; equals: string }
+}
+interface FeedbackForm {
+  key: string
+  site: string | null
+  kind: string
+  title: string
+  intro: string | null
+  schema: { questions?: SchemaQuestion[] }
+  sort: number
+}
+
+type Site = 'hfhotel' | 'hfville'
 
 // ── small presentational primitives (replicated from the #58 form) ─────────
 
@@ -57,7 +83,7 @@ function RadioGroup({
 }: {
   name: string
   value: string
-  options: { value: string; label: string }[]
+  options: SchemaOption[]
   onChange: (v: string) => void
 }) {
   return (
@@ -79,22 +105,6 @@ function RadioGroup({
   )
 }
 
-function Section({ title, hint, children }: { title: string; hint?: string; children: ReactNode }) {
-  return (
-    <section className="v2-card p-4 lg:p-5 space-y-4">
-      <div>
-        <h2 className="text-[16px] font-semibold">{title}</h2>
-        {hint && (
-          <p className="text-[12px] mt-1" style={{ color: 'var(--v2-ink-3)' }}>
-            {hint}
-          </p>
-        )}
-      </div>
-      {children}
-    </section>
-  )
-}
-
 function Question({ title, children }: { title: string; children?: ReactNode }) {
   return (
     <div className="space-y-2">
@@ -104,53 +114,22 @@ function Question({ title, children }: { title: string; children?: ReactNode }) 
   )
 }
 
-// ── option dictionaries (verbatim Thai) ────────────────────────────────────
+// ── visibility helper for conditional (showIf) questions ────────────────────
 
-const MATCH = [
-  { value: 'match', label: 'ตรง' },
-  { value: 'mismatch', label: 'ไม่ตรง' },
-]
-const ROOM114 = [
-  { value: 'vacant', label: 'ว่างแล้ว' },
-  { value: 'occupied', label: 'ยังมีคนพัก' },
-]
-const ARRIVALS = [
-  { value: 'a', label: 'ลูกค้าที่เช็คอินเข้าจริงวันนี้' },
-  { value: 'b', label: 'ลูกค้าที่จองไว้และยังรอเช็คอินวันนี้ (ยังไม่เข้า)' },
-]
-type Site = 'hfhotel' | 'hfville'
-
-interface FormState {
-  inspector: string
-  // HF Hotel
-  rv_invoice: string
-  rv_invoice_note: string
-  rv_round_summary: string
-  rv_round_summary_note: string
-  // HF Ville
-  rv_round816: string
-  rv_round816_note: string
-  rv_room114: string
-  rv_arrivals: string
-  rv_arrivals_screen: string
-}
-
-const EMPTY_FORM: FormState = {
-  inspector: '',
-  rv_invoice: '',
-  rv_invoice_note: '',
-  rv_round_summary: '',
-  rv_round_summary_note: '',
-  rv_round816: '',
-  rv_round816_note: '',
-  rv_room114: '',
-  rv_arrivals: '',
-  rv_arrivals_screen: '',
+function isVisible(q: SchemaQuestion, answers: Record<string, string>): boolean {
+  if (!q.showIf) return true
+  return answers[q.showIf.field] === q.showIf.equals
 }
 
 export default function V2Reverify() {
   return (
-    <Suspense fallback={<div className="v2-card p-8 flex justify-center"><Loader2 size={22} className="animate-spin" style={{ color: 'var(--v2-ink-3)' }} /></div>}>
+    <Suspense
+      fallback={
+        <div className="v2-card p-8 flex justify-center">
+          <Loader2 size={22} className="animate-spin" style={{ color: 'var(--v2-ink-3)' }} />
+        </div>
+      }
+    >
       <ReverifyInner />
     </Suspense>
   )
@@ -172,45 +151,68 @@ function ReverifyInner() {
         : 'hfhotel'
   const siteLabel = site === 'hfhotel' ? 'HF Hotel' : 'HF Ville'
 
-  const [form, setForm] = useState<FormState>(EMPTY_FORM)
+  const [formDef, setFormDef] = useState<FeedbackForm | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
+
+  const [answers, setAnswers] = useState<Record<string, string>>({})
+  const [inspector, setInspector] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [submittedId, setSubmittedId] = useState<number | null>(null)
 
-  const set = <K extends keyof FormState>(key: K, value: FormState[K]) =>
-    setForm((f) => ({ ...f, [key]: value }))
+  const loadForm = useCallback(async () => {
+    setLoading(true)
+    setLoadError(null)
+    try {
+      const res = await fetch(`/api/feedback/forms/reverify_${site}`)
+      if (res.status === 404) {
+        setFormDef(null)
+        setLoadError('notfound')
+        return
+      }
+      if (!res.ok) {
+        setLoadError('โหลดแบบฟอร์มไม่สำเร็จ')
+        return
+      }
+      const body = (await res.json()) as FeedbackForm
+      setFormDef(body)
+      setAnswers({})
+    } catch {
+      setLoadError('เกิดข้อผิดพลาดในการเชื่อมต่อ')
+    } finally {
+      setLoading(false)
+    }
+  }, [site])
 
-  // Only the active site's primary radio decisions gate submit.
-  const primaryComplete =
-    site === 'hfhotel'
-      ? !!form.rv_invoice && !!form.rv_round_summary
-      : !!form.rv_round816 && !!form.rv_room114 && !!form.rv_arrivals
+  useEffect(() => {
+    loadForm()
+  }, [loadForm])
+
+  const questions = formDef?.schema?.questions ?? []
+  const visibleQuestions = questions.filter((q) => isVisible(q, answers))
+
+  const setAnswer = (id: string, value: string) => setAnswers((a) => ({ ...a, [id]: value }))
+
+  // Submit-gate: every required, currently-visible question must be answered.
+  const primaryComplete = visibleQuestions
+    .filter((q) => q.required)
+    .every((q) => !!(answers[q.id] ?? '').trim())
 
   const buildAnswers = (): Record<string, string> => {
-    const a: Record<string, string> = { kind: 'reverify', site }
-    if (site === 'hfhotel') {
-      a.rv_invoice = form.rv_invoice
-      if (form.rv_invoice === 'mismatch' && form.rv_invoice_note.trim())
-        a.rv_invoice_note = form.rv_invoice_note.trim()
-      a.rv_round_summary = form.rv_round_summary
-      if (form.rv_round_summary === 'mismatch' && form.rv_round_summary_note.trim())
-        a.rv_round_summary_note = form.rv_round_summary_note.trim()
-    } else {
-      a.rv_round816 = form.rv_round816
-      if (form.rv_round816 === 'mismatch' && form.rv_round816_note.trim())
-        a.rv_round816_note = form.rv_round816_note.trim()
-      a.rv_room114 = form.rv_room114
-      a.rv_arrivals = form.rv_arrivals
-      if (form.rv_arrivals_screen.trim()) a.rv_arrivals_screen = form.rv_arrivals_screen.trim()
+    const out: Record<string, string> = { kind: formDef?.kind || 'reverify', site }
+    for (const q of visibleQuestions) {
+      const v = (answers[q.id] ?? '').trim()
+      if (v) out[q.id] = v
     }
-    return a
+    return out
   }
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault()
     setError(null)
     if (!primaryComplete) {
-      setError('กรุณาตอบข้อหลักของสาขานี้ให้ครบก่อนส่งนะครับ/ค่ะ 🙏')
+      setError('กรุณาตอบข้อที่จำเป็นให้ครบก่อนส่งนะครับ/ค่ะ 🙏')
       return
     }
     setSubmitting(true)
@@ -219,7 +221,7 @@ function ReverifyInner() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          inspector: form.inspector.trim() || user?.username || null,
+          inspector: inspector.trim() || user?.username || null,
           answers: buildAnswers(),
           overall: null,
           site,
@@ -232,7 +234,7 @@ function ReverifyInner() {
       }
       const body = await res.json()
       setSubmittedId(typeof body?.id === 'number' ? body.id : 0)
-      setForm(EMPTY_FORM)
+      setAnswers({})
       window.scrollTo({ top: 0, behavior: 'smooth' })
     } catch {
       setError('เกิดข้อผิดพลาดในการเชื่อมต่อ')
@@ -241,6 +243,7 @@ function ReverifyInner() {
     }
   }
 
+  // ── success ──
   if (submittedId !== null) {
     return (
       <div className="space-y-6">
@@ -252,11 +255,7 @@ function ReverifyInner() {
             ทีมไอทีจะนำคำตอบของคุณไปตรวจสอบต่อ {submittedId ? `(หมายเลขอ้างอิง #${submittedId})` : ''}
           </p>
           <div className="flex flex-wrap items-center justify-center gap-2 mt-2">
-            <button
-              type="button"
-              onClick={() => setSubmittedId(null)}
-              className="v2-btn v2-btn-soft v2-btn-sm"
-            >
+            <button type="button" onClick={() => setSubmittedId(null)} className="v2-btn v2-btn-soft v2-btn-sm">
               <ClipboardCheck size={15} /> ตรวจสอบอีกครั้ง
             </button>
             <a href="/v2/verification/results" className="v2-btn v2-btn-soft v2-btn-sm">
@@ -268,14 +267,52 @@ function ReverifyInner() {
     )
   }
 
+  // ── loading ──
+  if (loading) {
+    return (
+      <div className="space-y-6">
+        <V2PageHeader eyebrow="ตรวจสอบซ้ำ" title={`ยืนยันการแก้ไข — ${siteLabel}`} />
+        <div className="v2-card p-8 flex justify-center">
+          <Loader2 size={22} className="animate-spin" style={{ color: 'var(--v2-ink-3)' }} />
+        </div>
+      </div>
+    )
+  }
+
+  // ── not found / load error ──
+  if (loadError) {
+    const notFound = loadError === 'notfound'
+    return (
+      <div className="space-y-6">
+        <V2PageHeader eyebrow="ตรวจสอบซ้ำ" title={`ยืนยันการแก้ไข — ${siteLabel}`} />
+        <div className="v2-card p-8 flex flex-col items-center text-center gap-3">
+          <AlertTriangle size={36} style={{ color: 'var(--v2-ink-3)' }} />
+          <p className="text-[15px] font-semibold">
+            {notFound ? `ยังไม่มีแบบฟอร์มตรวจสอบซ้ำสำหรับ ${siteLabel}` : 'โหลดแบบฟอร์มไม่สำเร็จ'}
+          </p>
+          {!notFound && (
+            <button type="button" onClick={loadForm} className="v2-btn v2-btn-soft v2-btn-sm mt-1">
+              <RefreshCcw size={15} /> ลองใหม่
+            </button>
+          )}
+          <a href="/v2/verification/results" className="v2-btn v2-btn-soft v2-btn-sm">
+            <ArrowLeft size={15} /> กลับไปหน้าผลตรวจสอบ
+          </a>
+        </div>
+      </div>
+    )
+  }
+
+  // ── the data-driven form ──
   return (
     <form onSubmit={submit} className="space-y-5 pb-8">
-      <V2PageHeader eyebrow="ตรวจสอบซ้ำ" title={`ยืนยันการแก้ไข — ${siteLabel}`} />
+      <V2PageHeader eyebrow="ตรวจสอบซ้ำ" title={formDef?.title || `ยืนยันการแก้ไข — ${siteLabel}`} />
 
-      <p className="text-[13px] -mt-2" style={{ color: 'var(--v2-ink-3)' }}>
-        แต่ละข้อด้านล่างคือจุดที่ทีมไอทีแก้ไขแล้ว รบกวนช่วยเปิดดูในระบบใหม่อีกครั้งว่าตรงกับ iHOTEL แล้วหรือยัง
-        แล้วเลือกคำตอบ — เฉพาะรายการของสาขา <b>{siteLabel}</b> เท่านั้น
-      </p>
+      {formDef?.intro && (
+        <p className="text-[13px] -mt-2" style={{ color: 'var(--v2-ink-3)' }}>
+          {formDef.intro}
+        </p>
+      )}
 
       {/* ผู้ตรวจ */}
       <div className="v2-card p-4">
@@ -283,62 +320,46 @@ function ReverifyInner() {
           <span className="text-[11px] font-medium" style={{ color: 'var(--v2-ink-3)' }}>
             ผู้ตรวจ {user?.username ? `(ค่าเริ่มต้น: ${user.username})` : ''}
           </span>
-          <TextInput value={form.inspector} onChange={(v) => set('inspector', v)} placeholder="ชื่อผู้ตรวจ" />
+          <TextInput value={inspector} onChange={setInspector} placeholder="ชื่อผู้ตรวจ" />
         </label>
       </div>
 
-      {/* ── HF Hotel items ── */}
-      {site === 'hfhotel' && (
-        <Section title="รายการตรวจสอบซ้ำ — HF Hotel">
-          <Question title="เปิดบิล INV2606-019832 ในระบบใหม่ — แสดงแยกเป็น 2 ห้อง ห้องละ 1,780 รวม 3,560 (เท่ากับบิล iHOTEL 2 ใบรวมกัน) หรือไม่?">
-            <RadioGroup name="rv_invoice" value={form.rv_invoice} onChange={(v) => set('rv_invoice', v)} options={MATCH} />
-            {form.rv_invoice === 'mismatch' && (
-              <TextInput value={form.rv_invoice_note} onChange={(v) => set('rv_invoice_note', v)} placeholder="เห็นเป็นยอดเท่าไร" />
-            )}
-          </Question>
-
-          <Question title="เปิดหน้า 'สรุปรอบบิล / รายการรอบ' — ยอด (โอน/รวม) ตรงกับ iHOTEL แล้วหรือไม่?">
-            <RadioGroup
-              name="rv_round_summary"
-              value={form.rv_round_summary}
-              onChange={(v) => set('rv_round_summary', v)}
-              options={MATCH}
-            />
-            {form.rv_round_summary === 'mismatch' && (
-              <TextInput
-                value={form.rv_round_summary_note}
-                onChange={(v) => set('rv_round_summary_note', v)}
-                placeholder="เห็นเป็นยอดเท่าไร"
-              />
-            )}
-          </Question>
-        </Section>
-      )}
-
-      {/* ── HF Ville items ── */}
-      {site === 'hfville' && (
-        <Section title="รายการตรวจสอบซ้ำ — HF Ville">
-          <Question title="รายงานรอบบิล รอบ 816 (กะบ่าย 27/06) ยอดรวม = 14,280 หรือไม่?">
-            <RadioGroup name="rv_round816" value={form.rv_round816} onChange={(v) => set('rv_round816', v)} options={MATCH} />
-            {form.rv_round816 === 'mismatch' && (
-              <TextInput value={form.rv_round816_note} onChange={(v) => set('rv_round816_note', v)} placeholder="เห็นเป็นยอดเท่าไร" />
-            )}
-          </Question>
-
-          <Question title="สถานะห้อง 114 ขึ้นว่า 'ว่าง' แล้วหรือไม่?">
-            <RadioGroup name="rv_room114" value={form.rv_room114} onChange={(v) => set('rv_room114', v)} options={ROOM114} />
-          </Question>
-
-          <Question title="คำว่า 'เข้า' ในรายชื่อผู้เข้าพัก (ที่เคยแจ้งว่าไม่ตรง) หมายถึงข้อใด?">
-            <RadioGroup name="rv_arrivals" value={form.rv_arrivals} onChange={(v) => set('rv_arrivals', v)} options={ARRIVALS} />
-            <TextInput
-              value={form.rv_arrivals_screen}
-              onChange={(v) => set('rv_arrivals_screen', v)}
-              placeholder="ดูจากหน้าจอไหนของ iHOTEL"
-            />
-          </Question>
-        </Section>
-      )}
+      {/* schema-driven questions */}
+      <section className="v2-card p-4 lg:p-5 space-y-4">
+        <h2 className="text-[16px] font-semibold">รายการตรวจสอบซ้ำ — {siteLabel}</h2>
+        {visibleQuestions.length === 0 && (
+          <p className="text-[13px]" style={{ color: 'var(--v2-ink-3)' }}>
+            แบบฟอร์มนี้ยังไม่มีคำถาม
+          </p>
+        )}
+        {visibleQuestions.map((q) => {
+          if (q.type === 'radio') {
+            return (
+              <Question key={q.id} title={`${q.label}${q.required ? ' *' : ''}`}>
+                <RadioGroup
+                  name={q.id}
+                  value={answers[q.id] ?? ''}
+                  options={q.options ?? []}
+                  onChange={(v) => setAnswer(q.id, v)}
+                />
+              </Question>
+            )
+          }
+          if (q.type === 'text') {
+            return (
+              <Question key={q.id} title={`${q.label}${q.required ? ' *' : ''}`}>
+                <TextInput
+                  value={answers[q.id] ?? ''}
+                  onChange={(v) => setAnswer(q.id, v)}
+                  placeholder={q.placeholder}
+                />
+              </Question>
+            )
+          }
+          // unknown type — render nothing (defensive)
+          return null
+        })}
+      </section>
 
       {error && (
         <p className="text-[13px] font-medium" style={{ color: '#b91c1c' }}>
@@ -351,15 +372,9 @@ function ReverifyInner() {
           {submitting ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}
           ส่งผลตรวจสอบซ้ำ
         </button>
-        {!primaryComplete ? (
-          <span className="text-[12px]" style={{ color: 'var(--v2-ink-3)' }}>
-            กรุณาตอบข้อหลักของสาขา {siteLabel} ให้ครบก่อนส่ง
-          </span>
-        ) : (
-          <span className="text-[12px]" style={{ color: 'var(--v2-ink-3)' }}>
-            คำตอบจะถูกบันทึกในระบบให้ทีมไอทีตรวจสอบ
-          </span>
-        )}
+        <span className="text-[12px]" style={{ color: 'var(--v2-ink-3)' }}>
+          {!primaryComplete ? `กรุณาตอบข้อที่จำเป็น (*) ให้ครบก่อนส่ง` : 'คำตอบจะถูกบันทึกในระบบให้ทีมไอทีตรวจสอบ'}
+        </span>
       </div>
     </form>
   )

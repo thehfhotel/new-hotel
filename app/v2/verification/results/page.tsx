@@ -18,23 +18,23 @@ import { formatThai } from '@/components/v2/RoundReport'
 
 /**
  * Re-verification RESULTS / HUB page (companion to the #58 form at
- * /v2/verification and the lightweight re-verify forms at
- * /v2/verification/reverify). Read-only: it GETs every submission from
- * /api/verification and renders (1) hub links to the forms, (2) client-side
- * summary tallies, and (3) a table of all submissions. PG-canonical only — no
- * writes here.
+ * /v2/verification and the DATA-DRIVEN re-verify forms at
+ * /v2/verification/reverify). Read-only.
  *
- * The `answers` JSONB is an arbitrary object, so EVERY key is read defensively
- * with `asStr()` (returns undefined for missing / non-string values). Reverify
- * submissions carry `answers.kind === 'reverify'`; the original full checklist
- * has no `kind` and is summarised from its `overall` (= q5) verdict.
+ * Schema-aware (Tier 1): it additionally GETs the form definitions from
+ * /api/feedback/forms and derives the per-question labels, option labels, and the
+ * radio-question set FROM the schema — so when IT edits a question (a DB write),
+ * the tags / tallies / detail labels here update with no code change. The ORIGINAL
+ * full checklist (q1_x + q5, no `kind`) is NOT data-driven and keeps its hardcoded
+ * handling.
  *
- * vr_id 1 is a known misclick test row (inspector starts with '[misclick]') —
- * such rows are visually de-emphasised in the table AND excluded from the
- * reverify per-item tallies so they don't skew the stats.
+ * The `answers` JSONB is arbitrary, so EVERY key is read defensively with
+ * `asStr()`. Reverify submissions carry `answers.kind === 'reverify'`. vr_id 1 is a
+ * known misclick row (inspector starts with '[misclick]') — de-emphasised in the
+ * table AND excluded from the per-item tallies.
  */
 
-// ── data shape ─────────────────────────────────────────────────────────────
+// ── data shapes ──────────────────────────────────────────────────────────────
 
 interface VerificationResponse {
   id: number
@@ -43,6 +43,26 @@ interface VerificationResponse {
   inspector: string | null
   answers: Record<string, unknown>
   overall: string | null
+}
+
+interface SchemaOption {
+  value: string
+  label: string
+}
+interface SchemaQuestion {
+  id: string
+  type: string
+  label: string
+  options?: SchemaOption[]
+}
+interface FeedbackForm {
+  key: string
+  site: string | null
+  kind: string
+  title: string
+  intro: string | null
+  schema: { questions?: SchemaQuestion[] }
+  sort: number
 }
 
 // ── defensive readers ───────────────────────────────────────────────────────
@@ -71,23 +91,22 @@ function siteLabel(site: string | null): string {
   return site ?? '—'
 }
 
-const matchLabel = (v?: string): string | undefined =>
-  v === 'match' ? 'ตรง' : v === 'mismatch' ? 'ไม่ตรง' : undefined
+function shortLabel(label: string, n = 22): string {
+  const s = label.trim()
+  return s.length > n ? `${s.slice(0, n)}…` : s
+}
 
-// known answer-key labels (for the expanded raw detail view) ─────────────────
+/** Tone for an answer value, derived generically (the schema carries no tone). */
+function valueTone(v: string): Tone {
+  if (['match', 'vacant', 'ready', 'pass', 'yes', 'ok', 'all_match'].includes(v)) return 'ok'
+  if (['mismatch', 'occupied', 'fail', 'no', 'issue', 'has_mismatch'].includes(v)) return 'bad'
+  if (['notyet', 'pending'].includes(v)) return 'warn'
+  return 'mut'
+}
+
+// HARDCODED labels for the ORIGINAL full checklist only (not data-driven). Schema
+// labels (for rv_*/data-driven questions) take precedence via `labelFor`.
 const KEY_LABELS: Record<string, string> = {
-  kind: 'ประเภท',
-  site: 'สาขา',
-  rv_invoice: 'บิล INV2606-019832',
-  rv_invoice_note: 'หมายเหตุบิล',
-  rv_round_summary: 'สรุปรอบบิล',
-  rv_round_summary_note: 'หมายเหตุสรุปรอบบิล',
-  rv_round816: 'รอบบิล 816',
-  rv_round816_note: 'หมายเหตุรอบ 816',
-  rv_room114: 'สถานะห้อง 114',
-  rv_arrivals: 'ความหมายของคำว่า "เข้า"',
-  rv_arrivals_screen: 'หน้าจอ iHOTEL ที่ดู',
-  // original full checklist
   q1_1: '1.1 สถานะห้องพัก',
   q1_1_rooms: '1.1 ห้องที่ไม่ตรง',
   q1_2: '1.2 รายงานรอบบิล',
@@ -102,6 +121,8 @@ const KEY_LABELS: Record<string, string> = {
   q5: '5. ความพร้อมโดยรวม',
 }
 
+// Fallback value labels for the original checklist + overall verdict (data-driven
+// option labels come from the schema via `optLabelFor`).
 const VALUE_LABELS: Record<string, string> = {
   match: 'ตรง',
   mismatch: 'ไม่ตรง',
@@ -165,32 +186,56 @@ function Th({ cols }: { cols: string[] }) {
   )
 }
 
-// ── compact inline summary builders ──────────────────────────────────────────
+// ── schema-derived helpers (built once per render from the fetched forms) ─────
 
-function reverifyTags(a: Record<string, unknown>): { tone: Tone; text: string }[] {
+interface SchemaIndex {
+  /** question id → label */
+  labelOf: Record<string, string>
+  /** question id → { option value → option label } */
+  optionOf: Record<string, Record<string, string>>
+  /** radio questions, deduped by id, in form order (drives tags + tallies) */
+  radios: SchemaQuestion[]
+}
+
+function buildSchemaIndex(forms: FeedbackForm[]): SchemaIndex {
+  const labelOf: Record<string, string> = {}
+  const optionOf: Record<string, Record<string, string>> = {}
+  const radios: SchemaQuestion[] = []
+  const seen = new Set<string>()
+  for (const f of forms) {
+    for (const q of f.schema?.questions ?? []) {
+      if (!q?.id) continue
+      if (!(q.id in labelOf)) labelOf[q.id] = q.label
+      if (Array.isArray(q.options)) {
+        optionOf[q.id] = optionOf[q.id] ?? {}
+        for (const o of q.options) optionOf[q.id][o.value] = o.label
+      }
+      if (q.type === 'radio' && !seen.has(q.id)) {
+        seen.add(q.id)
+        radios.push(q)
+      }
+    }
+  }
+  return { labelOf, optionOf, radios }
+}
+
+const labelFor = (idx: SchemaIndex, key: string): string => idx.labelOf[key] ?? KEY_LABELS[key] ?? key
+const optLabelFor = (idx: SchemaIndex, qid: string, value: string): string =>
+  idx.optionOf[qid]?.[value] ?? VALUE_LABELS[value] ?? value
+
+// Compact per-row tags for a reverify submission, driven by the schema's radios.
+function reverifyTags(idx: SchemaIndex, a: Record<string, unknown>): { tone: Tone; text: string }[] {
   const out: { tone: Tone; text: string }[] = []
-  const inv = asStr(a.rv_invoice)
-  if (inv) out.push({ tone: inv === 'match' ? 'ok' : 'bad', text: `บิล: ${matchLabel(inv)}` })
-  const rs = asStr(a.rv_round_summary)
-  if (rs) out.push({ tone: rs === 'match' ? 'ok' : 'bad', text: `สรุปรอบบิล: ${matchLabel(rs)}` })
-  const r816 = asStr(a.rv_round816)
-  if (r816) out.push({ tone: r816 === 'match' ? 'ok' : 'bad', text: `รอบ 816: ${matchLabel(r816)}` })
-  const rm = asStr(a.rv_room114)
-  if (rm)
-    out.push({
-      tone: rm === 'vacant' ? 'ok' : 'warn',
-      text: `ห้อง 114: ${rm === 'vacant' ? 'ว่างแล้ว' : 'ยังมีคนพัก'}`,
-    })
-  const arr = asStr(a.rv_arrivals)
-  if (arr)
-    out.push({
-      tone: 'mut',
-      text: `เข้า = ${arr === 'a' ? 'ก (เข้าจริงวันนี้)' : arr === 'b' ? 'ข (รอเช็คอิน)' : arr}`,
-    })
+  for (const q of idx.radios) {
+    const v = asStr(a[q.id])
+    if (!v) continue
+    out.push({ tone: valueTone(v), text: `${shortLabel(q.label, 14)}: ${optLabelFor(idx, q.id, v)}` })
+  }
   return out
 }
 
-/** Original full-checklist verdict from the top-level `overall` (= q5). */
+// ── original full-checklist summary (NOT data-driven) ─────────────────────────
+
 function overallVerdict(overall: string | null): { tone: Tone; text: string } {
   if (overall === 'a') return { tone: 'ok', text: 'ภาพรวม: ดี พร้อมทดลองใช้' }
   if (overall === 'b') return { tone: 'warn', text: 'ภาพรวม: มีจุดเล็กน้อย' }
@@ -209,39 +254,11 @@ function fullChecklistTags(r: VerificationResponse): { tone: Tone; text: string 
   return out
 }
 
-// ── tally widget ─────────────────────────────────────────────────────────────
-
-function TwoCount({
-  aLabel,
-  a,
-  aTone,
-  bLabel,
-  b,
-  bTone,
-}: {
-  aLabel: string
-  a: number
-  aTone: Tone
-  bLabel: string
-  b: number
-  bTone: Tone
-}) {
-  return (
-    <span className="flex items-center gap-1.5 flex-wrap">
-      <Tag tone={aTone}>
-        {aLabel} <span className="v2-num ml-1">{a}</span>
-      </Tag>
-      <Tag tone={bTone}>
-        {bLabel} <span className="v2-num ml-1">{b}</span>
-      </Tag>
-    </span>
-  )
-}
-
 // ── page ─────────────────────────────────────────────────────────────────────
 
 export default function VerificationResults() {
   const [responses, setResponses] = useState<VerificationResponse[] | null>(null)
+  const [forms, setForms] = useState<FeedbackForm[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
@@ -250,11 +267,20 @@ export default function VerificationResults() {
     setLoading(true)
     setError(null)
     try {
-      const res = await fetch('/api/verification?limit=200', { headers: { Accept: 'application/json' } })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const body = await res.json()
+      // Responses drive the page; form schemas drive the labels/tallies. A forms
+      // failure degrades gracefully (falls back to KEY_LABELS/VALUE_LABELS).
+      const [respRes, formsRes] = await Promise.all([
+        fetch('/api/verification?limit=200', { headers: { Accept: 'application/json' } }),
+        fetch('/api/feedback/forms', { headers: { Accept: 'application/json' } }).catch(() => null),
+      ])
+      if (!respRes.ok) throw new Error(`HTTP ${respRes.status}`)
+      const body = await respRes.json()
       const list = Array.isArray(body?.responses) ? (body.responses as VerificationResponse[]) : []
       setResponses(list)
+      if (formsRes && formsRes.ok) {
+        const fb = await formsRes.json().catch(() => null)
+        setForms(Array.isArray(fb?.forms) ? (fb.forms as FeedbackForm[]) : [])
+      }
     } catch {
       setError('โหลดข้อมูลไม่สำเร็จ กรุณาลองใหม่อีกครั้ง')
     } finally {
@@ -273,6 +299,8 @@ export default function VerificationResults() {
       else next.add(id)
       return next
     })
+
+  const idx = buildSchemaIndex(forms)
 
   // ── HUB section (always shown) — per-site re-verify status ─────────────────
   // Pending = no non-misclick reverify submission for that site yet → shown
@@ -364,25 +392,23 @@ export default function VerificationResults() {
 
     // per-item tallies exclude misclick rows so the stats stay clean
     const rv = reverifyAll.filter((r) => !isMisclick(r))
-    const tally = (key: string, av: string, bv: string) => {
-      let a = 0
-      let b = 0
-      for (const r of rv) {
-        const v = asStr(r.answers?.[key])
-        if (v === av) a++
-        else if (v === bv) b++
-      }
-      return { a, b }
-    }
-    const inv = tally('rv_invoice', 'match', 'mismatch')
-    const roundSummary = tally('rv_round_summary', 'match', 'mismatch')
-    const r816 = tally('rv_round816', 'match', 'mismatch')
-    const room114 = tally('rv_room114', 'vacant', 'occupied')
-    const arrivals = tally('rv_arrivals', 'a', 'b')
 
-    const hasReverifyData =
-      inv.a + inv.b + roundSummary.a + roundSummary.b + r816.a + r816.b + room114.a + room114.b + arrivals.a + arrivals.b >
-      0
+    // Schema-driven: one tally per radio question, counting each option's answers.
+    const questionTallies = idx.radios.map((q) => {
+      const counts: { value: string; label: string; n: number }[] = (q.options ?? []).map((o) => ({
+        value: o.value,
+        label: o.label,
+        n: 0,
+      }))
+      const byValue = new Map(counts.map((c) => [c.value, c]))
+      for (const r of rv) {
+        const v = asStr(r.answers?.[q.id])
+        if (v && byValue.has(v)) byValue.get(v)!.n += 1
+      }
+      const answered = counts.reduce((s, c) => s + c.n, 0)
+      return { q, counts, answered }
+    })
+    const hasReverifyData = questionTallies.some((t) => t.answered > 0)
 
     summary = (
       <section className="space-y-3">
@@ -410,24 +436,22 @@ export default function VerificationResults() {
           </StatChip>
         </div>
 
-        {/* reverify per-item tallies */}
+        {/* reverify per-question tallies (schema-driven) */}
         {hasReverifyData ? (
           <div className="grid gap-2.5 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3">
-            <StatChip label="บิล INV2606-019832">
-              <TwoCount aLabel="ตรง" a={inv.a} aTone="ok" bLabel="ไม่ตรง" b={inv.b} bTone="bad" />
-            </StatChip>
-            <StatChip label="สรุปรอบบิล (HF Hotel)">
-              <TwoCount aLabel="ตรง" a={roundSummary.a} aTone="ok" bLabel="ไม่ตรง" b={roundSummary.b} bTone="bad" />
-            </StatChip>
-            <StatChip label="รอบบิล 816 (HF Ville)">
-              <TwoCount aLabel="ตรง" a={r816.a} aTone="ok" bLabel="ไม่ตรง" b={r816.b} bTone="bad" />
-            </StatChip>
-            <StatChip label="ห้อง 114">
-              <TwoCount aLabel="ว่างแล้ว" a={room114.a} aTone="ok" bLabel="ยังมีคนพัก" b={room114.b} bTone="warn" />
-            </StatChip>
-            <StatChip label='ความหมาย "เข้า"'>
-              <TwoCount aLabel="ก เข้าจริง" a={arrivals.a} aTone="mut" bLabel="ข รอเช็คอิน" b={arrivals.b} bTone="mut" />
-            </StatChip>
+            {questionTallies
+              .filter((t) => t.answered > 0)
+              .map((t) => (
+                <StatChip key={t.q.id} label={shortLabel(t.q.label, 30)}>
+                  <span className="flex items-center gap-1.5 flex-wrap">
+                    {t.counts.map((c) => (
+                      <Tag key={c.value} tone={valueTone(c.value)}>
+                        {c.label} <span className="v2-num ml-1">{c.n}</span>
+                      </Tag>
+                    ))}
+                  </span>
+                </StatChip>
+              ))}
           </div>
         ) : (
           <p className="text-[12.5px]" style={{ color: 'var(--v2-ink-3)' }}>
@@ -452,11 +476,7 @@ export default function VerificationResults() {
             <div className="v2-eyebrow">รายการ</div>
             <h2 className="text-[16px] font-semibold mt-0.5">การส่งทั้งหมด</h2>
           </div>
-          <button
-            type="button"
-            onClick={() => void load()}
-            className="v2-btn v2-btn-soft v2-btn-sm"
-          >
+          <button type="button" onClick={() => void load()} className="v2-btn v2-btn-soft v2-btn-sm">
             <RefreshCcw size={14} /> รีเฟรช
           </button>
         </div>
@@ -476,7 +496,7 @@ export default function VerificationResults() {
                   const open = expanded.has(r.id)
                   const misclick = isMisclick(r)
                   const reverify = isReverify(r)
-                  const tags = reverify ? reverifyTags(r.answers ?? {}) : fullChecklistTags(r)
+                  const tags = reverify ? reverifyTags(idx, r.answers ?? {}) : fullChecklistTags(r)
                   return (
                     <Fragment key={r.id}>
                       <tr
@@ -518,7 +538,7 @@ export default function VerificationResults() {
                       {open && (
                         <tr style={{ borderBottom: '1px solid var(--v2-line)' }}>
                           <td colSpan={6} className="px-3 pb-4 pt-1" style={{ background: 'var(--v2-surface-2)' }}>
-                            <AnswerDetail answers={r.answers ?? {}} overall={r.overall} id={r.id} />
+                            <AnswerDetail idx={idx} answers={r.answers ?? {}} overall={r.overall} id={r.id} />
                           </td>
                         </tr>
                       )}
@@ -573,13 +593,15 @@ export default function VerificationResults() {
   )
 }
 
-// ── expanded raw answer detail ───────────────────────────────────────────────
+// ── expanded raw answer detail (schema-aware labels) ─────────────────────────
 
 function AnswerDetail({
+  idx,
   answers,
   overall,
   id,
 }: {
+  idx: SchemaIndex
   answers: Record<string, unknown>
   overall: string | null
   id: number
@@ -599,9 +621,9 @@ function AnswerDetail({
           {entries.map(([k, v]) => (
             <div key={k} className="flex gap-2 text-[12.5px]">
               <dt className="shrink-0 font-medium" style={{ color: 'var(--v2-ink-2)' }}>
-                {KEY_LABELS[k] ?? k}:
+                {labelFor(idx, k)}:
               </dt>
-              <dd className="min-w-0 break-words">{renderValue(v)}</dd>
+              <dd className="min-w-0 break-words">{renderValue(idx, k, v)}</dd>
             </div>
           ))}
         </dl>
@@ -615,9 +637,9 @@ function AnswerDetail({
   )
 }
 
-function renderValue(v: unknown): ReactNode {
+function renderValue(idx: SchemaIndex, key: string, v: unknown): ReactNode {
   if (v === null || v === undefined || v === '') return <span style={{ color: 'var(--v2-ink-3)' }}>—</span>
-  if (typeof v === 'string') return VALUE_LABELS[v] ?? v
+  if (typeof v === 'string') return optLabelFor(idx, key, v)
   if (typeof v === 'number' || typeof v === 'boolean') return String(v)
   if (Array.isArray(v)) {
     if (v.length === 0) return <span style={{ color: 'var(--v2-ink-3)' }}>—</span>

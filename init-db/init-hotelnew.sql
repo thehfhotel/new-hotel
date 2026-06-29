@@ -2354,6 +2354,72 @@ INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('066', '066_create_ht_verification_responses.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
+-- ht_feedback_forms — data-driven reception feedback / re-verification form
+-- definitions (Tier 1). form_schema JSONB drives a generic renderer so question
+-- edits are a DB write, not a frontend rebuild. PG-CANONICAL ONLY (no legacy, no
+-- sync, no writeback). Answers land in ht_verification_responses.vr_answers.
+-- See migrations/pg/067_create_ht_feedback_forms.sql.
+CREATE TABLE IF NOT EXISTS ht_feedback_forms (
+    form_id      BIGSERIAL   PRIMARY KEY,
+    form_key     TEXT        NOT NULL UNIQUE,
+    form_site    TEXT,
+    form_kind    TEXT        NOT NULL DEFAULT 'reverify',
+    form_title   TEXT        NOT NULL,
+    form_intro   TEXT,
+    form_schema  JSONB       NOT NULL,
+    form_active  BOOLEAN     NOT NULL DEFAULT TRUE,
+    form_sort    INTEGER     NOT NULL DEFAULT 0,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS ix_ht_feedback_forms_active
+    ON ht_feedback_forms (form_active, form_sort);
+
+INSERT INTO ht_feedback_forms (form_key, form_site, form_kind, form_title, form_intro, form_schema, form_sort)
+VALUES
+(
+  'reverify_hfhotel', 'hfhotel', 'reverify', 'ตรวจสอบซ้ำ — HF Hotel',
+  'ทีมไอทีแก้จุดที่แจ้งมาแล้ว รบกวนช่วยเปิดดูซ้ำแล้วเลือกคำตอบครับ/ค่ะ (แค่เปิดดู ไม่กระทบข้อมูลจริง)',
+  '{"questions":[
+     {"id":"rv_invoice","type":"radio","required":true,
+      "label":"เปิดบิล INV2606-019832 ในระบบใหม่ — แสดงแยกเป็น 2 ห้อง ห้องละ 1,780 รวม 3,560 (เท่ากับบิล iHOTEL 2 ใบรวมกัน) หรือไม่?",
+      "options":[{"value":"match","label":"ตรง"},{"value":"mismatch","label":"ไม่ตรง"}]},
+     {"id":"rv_invoice_note","type":"text","label":"ระบุยอดที่เห็น","placeholder":"เช่น เห็นเป็น …",
+      "showIf":{"field":"rv_invoice","equals":"mismatch"}},
+     {"id":"rv_round_summary","type":"radio","required":true,
+      "label":"เปิดหน้า ''สรุปรอบบิล / รายการรอบ'' — ยอด (โอน/รวม) ตรงกับ iHOTEL แล้วหรือไม่?",
+      "options":[{"value":"match","label":"ตรง"},{"value":"mismatch","label":"ไม่ตรง"}]},
+     {"id":"rv_round_summary_note","type":"text","label":"ระบุที่เห็น","placeholder":"เช่น รอบ/ยอดที่ไม่ตรง",
+      "showIf":{"field":"rv_round_summary","equals":"mismatch"}}
+   ]}'::jsonb,
+  10
+),
+(
+  'reverify_hfville', 'hfville', 'reverify', 'ตรวจสอบซ้ำ — HF Ville',
+  'ทีมไอทีแก้จุดที่แจ้งมาแล้ว รบกวนช่วยเปิดดูซ้ำแล้วเลือกคำตอบครับ/ค่ะ (แค่เปิดดู ไม่กระทบข้อมูลจริง)',
+  '{"questions":[
+     {"id":"rv_round816","type":"radio","required":true,
+      "label":"รายงานรอบบิล รอบ 816 (กะบ่าย 27/06) ยอดรวม = 14,280 หรือไม่?",
+      "options":[{"value":"match","label":"ตรง"},{"value":"mismatch","label":"ไม่ตรง"}]},
+     {"id":"rv_round816_note","type":"text","label":"ระบุยอดที่เห็น","placeholder":"เช่น เห็นเป็น …",
+      "showIf":{"field":"rv_round816","equals":"mismatch"}},
+     {"id":"rv_room114","type":"radio","required":true,
+      "label":"สถานะห้อง 114 ขึ้นว่า ''ว่าง'' แล้วหรือไม่?",
+      "options":[{"value":"vacant","label":"ว่างแล้ว"},{"value":"occupied","label":"ยังมีคนพัก"}]},
+     {"id":"rv_arrivals","type":"radio","required":true,
+      "label":"คำว่า ''เข้า'' ในรายชื่อผู้เข้าพัก (ที่เคยแจ้งว่าไม่ตรง) หมายถึงข้อใด?",
+      "options":[{"value":"a","label":"ลูกค้าที่เช็คอินเข้าจริงวันนี้"},{"value":"b","label":"ลูกค้าที่จองไว้และยังรอเช็คอินวันนี้ (ยังไม่เข้า)"}]},
+     {"id":"rv_arrivals_screen","type":"text","label":"ดูจากหน้าจอไหนของ iHOTEL","placeholder":"ชื่อหน้าจอ / เมนู"}
+   ]}'::jsonb,
+  20
+)
+ON CONFLICT (form_key) DO NOTHING;
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('067', '067_create_ht_feedback_forms.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
 -- =============================================================================
 -- Initialization complete
 -- =============================================================================

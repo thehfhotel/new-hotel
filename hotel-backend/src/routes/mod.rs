@@ -101,6 +101,7 @@ pub mod new_reports;
 pub mod new_room_types;
 pub mod new_rooms;
 pub mod new_rosters;
+pub mod new_feedback;
 pub mod new_shifts;
 pub mod new_sync;
 pub mod new_verification;
