@@ -1,42 +1,66 @@
 # Checkout receipt comparison — iHOTEL (old) vs new server folio
 
 **For reception verification before flipping `CHECKOUT_SERVER_TOTAL_ENABLED`.**
-Updated 2026-06-27.
+Re-verified 2026-06-30 (post-#34).
 
 ---
 
-## ⛔ VERIFICATION RESULT (2026-06-27): DO NOT FLIP — folio is broken
+## ✅ RE-VERIFICATION (2026-06-30): folio now matches iHOTEL — flippable, one caveat
 
-Ran the comparison against live canonical PG. The server folio computes the room
-charge as `cin_rate_per_night × nights`, but **`cin_rate_per_night = 0` for 100%
-of check-ins** (hotelnew: 19,827 zero + 2 null, **0 positive**; hotelville:
-1,873 zero, **0 positive**). There is **no fallback** to `cin_total_amount`.
-Also, **`ht_pos_sales` is empty (0 rows)** — this hotel has no POS/product data,
-so the entire "products" half of Phase 2 parity is moot.
+The 2026-06-27 ⛔ result (folio room/net = 0, would corrupt `Total_Price_*`) is
+**superseded**. Task #34 added the fallback `room_total = rate>0 ? rate×nights :
+cin_total_amount`. Re-ran the comparison against live canonical PG **and** the HF
+Hotel legacy MSSQL (`192.168.100.222,1433`, db `db`):
 
-Net effect of flipping the flag: every checkout would record/writeback
-**room = 0, net = 0, balance = −(amount paid)** — i.e. it would **zero out the
-room revenue and corrupt the legacy `Total_Price_*` columns**. Sample of 12 real
-recent checkouts (folio replica vs reality):
+- `cin_rate_per_night` is still 0 for ~100% of check-ins → the fallback fires →
+  `room_total = cin_total_amount`. `ht_pos_sales` is still empty (0 rows both
+  sites) → `product_total = 0` → `net_total = cin_total_amount`.
+- **Folio `net_total` == iHOTEL `Total_Price_Net` to the cent** on 5 spot-checked
+  real bills, and the 12-row replica reconciles (`SUM(ht_payments) == cin_total_amount`
+  → `balance = 0` every row):
 
-| cin_no | nights | ACTUAL total | folio room | folio NET | folio balance |
-|--------|--------|--------------|-----------|-----------|---------------|
-| CH26-005900 | 1 | 490.00  | **0.00** | **0.00** | **−490.00** |
-| CH26-005901 | 1 | 828.00  | **0.00** | **0.00** | **−828.00** |
-| CH26-005907 | 1 | 890.00  | **0.00** | **0.00** | **−890.00** |
-| CH26-005895 | 2 | 1,656.00| **0.00** | **0.00** | **−1,656.00** |
-| CH26-005892 | 2 | 3,070.00| **0.00** | **0.00** | **−3,070.00** |
-| …(all 12 identical pattern) | | | | | |
+| cin_no | folio net (PG) | iHOTEL Net | iHOTEL Room | iHOTEL Product | balance |
+|--------|----------------|------------|-------------|----------------|---------|
+| CH26-005886 | 3,560.00  | 3,560.00  | 3,560.00  | 0 | 0 |
+| CH26-005899 | 1,780.00  | 1,780.00  | 1,780.00  | 0 | 0 |
+| CH26-005902 | 1,547.78  | 1,547.78  | 1,547.78  | 0 | 0 |
+| CH26-005908 | 2,797.20  | 2,797.20  | 2,797.20  | 0 | 0 |
+| CH26-005931 |   890.00  |   890.00  |   890.00  | 0 | 0 |
 
-The real charged amount lives in `cin_total_amount` (= `cin_paid_amount`, synced
-from iHOTEL). `ht_payments` is populated (706 rows), so the pay side is fine.
+Note iHOTEL itself stores `Total_Price_Room == Total_Price_Net` (whole bill in the
+room bucket, Product=0) — exactly what the `cin_total_amount` fallback reproduces.
 
-**Required fix before flip:** base room/net on `cin_total_amount` (e.g.
-`room_total = rate>0 ? rate×nights : cin_total_amount`; derive display rate =
-total ÷ nights). Then re-run this comparison. Until then `#30` is **BLOCKED**.
+**Difference A (nights basis) is now MOOT.** Because `room_total` comes from
+`cin_total_amount`, not `nights × rate`, the late-checkout "+1 night?" policy
+question no longer affects the total. (`nights` only drives the cosmetic
+displayed per-night rate `= total ÷ nights`.)
 
-Everything below was the as-designed comparison plan; it stands, but the §3/§4
-worked numbers assume a non-zero rate that does not exist in the data yet.
+**Live impact of flipping today ≈ none.** `shadow.checkout_total` = 0 events and
+no new-app checkouts occur (checkouts ride iHOTEL), so the flag's writeback path
+is essentially unexercised; flipping writes back the same value already present.
+
+### ⚠ One landmine to resolve BEFORE new-app POS is used at checkout
+
+`net_total = cin_total_amount + product_total`. While the rate-fallback fires
+(rate=0) AND `ht_pos_sales` is empty, this is exactly `cin_total_amount` — safe.
+But once new-app POS lands rows in `ht_pos_sales` for a stay whose
+`cin_total_amount` (synced from iHOTEL's net) **already includes** those items,
+`net_total` would **double-count** them. This is dormant today (POS unused) but
+must be addressed (e.g. base room on `cin_total_amount − pos`, or only add
+`product_total` when the rate path is used) before the new-app folio is the
+source of truth for stays with POS. Until then, flipping is safe **only because
+POS is empty**.
+
+**Verdict:** the #30 blocker is cleared and parity is exact. Flipping is safe now
+(near-no-op) — recommended to flip as part of go-live alongside the POS
+double-count fix, rather than in isolation, since its value materializes only when
+new-app checkouts actually happen. The flip itself is a prod money-path config
+change (set `CHECKOUT_SERVER_TOTAL_ENABLED=true` for the backend via the pipeline)
+and should be made with reception aware.
+
+Everything below is the original as-designed comparison plan + worksheet; it
+stands (the §3/§4 worked examples assume a non-zero rate, which the live data does
+not have — the fallback path above is what actually runs).
 
 ---
 
