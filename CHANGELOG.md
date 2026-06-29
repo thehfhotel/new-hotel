@@ -7,6 +7,82 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.73.0](https://github.com/thehfhotel/new-hotel/compare/v2.72.0...v2.73.0) (2026-06-29)
+
+
+### Added
+
+* **auth:** idle-timeout logout + actor-stamp pos/customers/rates (auth dark — no-op when off) ([00c5848](https://github.com/thehfhotel/new-hotel/commit/00c584890c7e0592a231c10ade0d0df896ccb515))
+* **auth:** stamp actor from session in write handlers (partial sweep) ([a3e7eb3](https://github.com/thehfhotel/new-hotel/commit/a3e7eb38bd9b7286dd1fc1245b5eca16156babcd))
+* **billing:** Phase 2 folio parity — products/VAT/deposits (ship-dark) ([1145504](https://github.com/thehfhotel/new-hotel/commit/1145504a4cc8a402a017362e6853d2261e10a3d8))
+* **billing:** server-authoritative checkout total, ship-dark (spike Phase 2) ([b16e509](https://github.com/thehfhotel/new-hotel/commit/b16e509cb6a9eb9d22b6a4dea426b4a1d9a1e56f))
+* **bookings:** server-side booking validation/availability, ship-dark (spike Phase 3) ([27c58b4](https://github.com/thehfhotel/new-hotel/commit/27c58b4ccd6ee60fc78ca1b3a0a1a9355661561d))
+* **bookings:** waitlist + pre-order backend, migration 061, confirmation slip ([0b5ad2e](https://github.com/thehfhotel/new-hotel/commit/0b5ad2e8cccd2d421be270aac5dc5bccd8f9d13b))
+* **bookings:** waitlist + pre-order booking form, confirmation print ([66244af](https://github.com/thehfhotel/new-hotel/commit/66244af9dcd9e4104b02a6fee2a5f5fe4b92a022))
+* **calendar:** room×date availability grid + booking reminders (notify cols, balance-due) ([ee23ad6](https://github.com/thehfhotel/new-hotel/commit/ee23ad608243fe1451bcad0753ba982d20f436fc))
+* **cash:** petty-cash ledger backend — migration 059, poll sync, /api/cash, writeback recipe ([85ed79d](https://github.com/thehfhotel/new-hotel/commit/85ed79d5693cd095ccbdf5fa7e462777a0b511ed))
+* **cash:** v2 cash ledger page + hub link ([800db0a](https://github.com/thehfhotel/new-hotel/commit/800db0ab288c4f5f07c2c397226f1bd15af4f20b))
+* **checkin:** deposit capture, ID-card prefill, registration slip ([7a2df1d](https://github.com/thehfhotel/new-hotel/commit/7a2df1d0431649535c22d3eccb804db1617f6508))
+* **checkout:** folio basis fix, reachable payment capture, settle on checkout ([b50c527](https://github.com/thehfhotel/new-hotel/commit/b50c527f5d24e9ccf6cfe737332dc81e17811777))
+* **coexistence:** add room/guest activity counts to round report ([4dabafb](https://github.com/thehfhotel/new-hotel/commit/4dabafb7f783cf9debb5315f0484e524e7836c3d))
+* **coexistence:** printable round report + summary (พิมพ์ → A4) ([d0c05a7](https://github.com/thehfhotel/new-hotel/commit/d0c05a728e9bde314abbb5fc4758cf728f1db8d8))
+* **coexistence:** round report mirrors iHOTEL View_RBill_H (every field intact) ([9dd44c0](https://github.com/thehfhotel/new-hotel/commit/9dd44c02a480d6f525b9ff963d45a6a0ea85752c))
+* **coexistence:** round report uses iHOTEL's exact Thai wording ([ddeac0f](https://github.com/thehfhotel/new-hotel/commit/ddeac0f2d7047fe6b1b458061994219111e42a9b))
+* **coexistence:** round summary / analytics report (J7f) ([b150e46](https://github.com/thehfhotel/new-hotel/commit/b150e46c51e0bbaab5ce56bd9eda5bd441837831))
+* **coexistence:** route checkin/checkout/payment/booking writes per-site (Ville bundle, dark) ([9a4e945](https://github.com/thehfhotel/new-hotel/commit/9a4e945c1b9b866e2940f0e5a5c5fc74fa0a68b3))
+* **coexistence:** unified per-site write chokepoint + CI write-pool-routing gate (Ship-B, dark) ([edc67a5](https://github.com/thehfhotel/new-hotel/commit/edc67a5e6252e58a66eb40894c21e56617c0b31f))
+* **coupons:** Code39 barcode lib + coupon template + issue modal wiring ([06a4513](https://github.com/thehfhotel/new-hotel/commit/06a45130325b42b39d9e3ff11d2ac1fc7db0652a))
+* **coupons:** mount redeem route (POST /api/coupons/{code}/redeem) ([171939e](https://github.com/thehfhotel/new-hotel/commit/171939eb7b7f898d66a1e9b5e3a57224393d7bc9))
+* **customers:** mount update/delete routes, edit UI, customer_type, card prefill ([5a0b15a](https://github.com/thehfhotel/new-hotel/commit/5a0b15af3b7841979183df55e19c013ea9a771ea))
+* **deposit:** deposit-refund service + writeback recipe + folio refund button ([69a2239](https://github.com/thehfhotel/new-hotel/commit/69a2239a520b0567b38859fd97e5ccae188de4f7))
+* **housekeeping:** route clean/dirty service + maintenance writeback; fix board no-op ([811f280](https://github.com/thehfhotel/new-hotel/commit/811f280a960788cddbc975f44ddbec882159743a))
+* **invoice:** itemize rooms per check-in from ht_checkin_rooms (multi-room bills) ([a025406](https://github.com/thehfhotel/new-hotel/commit/a02540664b4eec121952ce49c4fc22b88a97ca72))
+* **invoice:** tax invoice (ใบกำกับภาษี) — POS+VAT breakdown, tax-id, v2 page ([edae87b](https://github.com/thehfhotel/new-hotel/commit/edae87b6a7291b8f0998aadf472341d028e3ea23))
+* **masters:** room form, room-type/rate/product CRUD + branch-aware writes, pricing overrides ([c4803ab](https://github.com/thehfhotel/new-hotel/commit/c4803ab6e8e94a127f8c56c4501d79ec30ef264a))
+* **notes:** room/staff sticky notes — table 062, poll sync, api, writeback, ui ([c7067f5](https://github.com/thehfhotel/new-hotel/commit/c7067f595556831ccddf9bcd3d5d541e03c567d2))
+* **observability:** shadow-log the Phase 2/3 dark flags (no behavior change) ([8ff9f68](https://github.com/thehfhotel/new-hotel/commit/8ff9f68e71b8ff482c85daf3cdeebe675ce6050e))
+* **pos:** walk-up sale + standalone receipt, void/refund, actor, Ville pool ([a683a37](https://github.com/thehfhotel/new-hotel/commit/a683a371a8ca31c2eeab387e97043944a8bc8909))
+* **reports:** full daily guest rosters (in-house/arrivals/departures/continuing) + print ([f22b4c2](https://github.com/thehfhotel/new-hotel/commit/f22b4c29f97b78d6b3a5e3e0371d129ce073b1d8))
+* **reports:** VAT/output-tax + sales-by-customer + printable period income (branch-aware) ([d07046d](https://github.com/thehfhotel/new-hotel/commit/d07046d09718a452b776e421c548975e22e02127))
+* **rounds:** surface 'รวมเงินรับ' (income, excludes opening float) on the round summary ([8873e48](https://github.com/thehfhotel/new-hotel/commit/8873e48b0f4ef82b656b4ca95f38c29be1c3f84b))
+* **verification:** consolidate menu to one entry + surface pending re-verify status ([fa0cc30](https://github.com/thehfhotel/new-hotel/commit/fa0cc309cf96f7a32bcea03731bbbbac1ffe2a6b))
+* **verification:** data-driven feedback forms (Tier 1) — questions in DB, generic renderer ([7d5ca34](https://github.com/thehfhotel/new-hotel/commit/7d5ca34e84479e3a4ba7823c9f53501b8f981285))
+* **verification:** direct page links per item (form + Thai guide) ([54d912f](https://github.com/thehfhotel/new-hotel/commit/54d912f92a10c045b965bf08772e3d2c0e93d11d))
+* **verification:** drop live-test + notes from the re-verify form (coordinate separately) ([5b02c33](https://github.com/thehfhotel/new-hotel/commit/5b02c33a39f57d1e00258722384ee9f94dbf9261))
+* **verification:** in-app reception verification form → ht_verification_responses (PG, queryable) ([c996fec](https://github.com/thehfhotel/new-hotel/commit/c996fec6993268d1a467ed2ec86290e00e9ac2b4))
+* **verification:** per-site re-verification forms + feedback results/hub page ([2ee61c3](https://github.com/thehfhotel/new-hotel/commit/2ee61c3606a4b4c10fc1cf9985cdfe5132b267bc))
+
+
+### Fixed
+
+* **api:** honor ?branch= in read handlers + rr4 export; gate /rooms writes on canWrite ([2d883a1](https://github.com/thehfhotel/new-hotel/commit/2d883a159f450b8a57e4c549bd56512c63f3000a))
+* **cash:** AssertSqlSafe on audited dynamic SQL; seed migration 061 in init-db ([097814b](https://github.com/thehfhotel/new-hotel/commit/097814b39cf3688f9f7f13d0be0384eafe61f96d))
+* **checkin:** extend updates canonical PG, move-room recomputes rate, shorten/date-edit, room-change receipt ([f605847](https://github.com/thehfhotel/new-hotel/commit/f605847b96cb4d1af63ca94538f9dcd44ed52506))
+* **coexistence:** print only the clicked round report (no overlap/cut text) ([acf3678](https://github.com/thehfhotel/new-hotel/commit/acf36782d23c86da48d4416305923193ad89f844))
+* **coexistence:** round summary shows both sites for "ทั้งหมด" (All) ([7204aab](https://github.com/thehfhotel/new-hotel/commit/7204aab448ac1bfe0b90ecf2b85b6a01f55e024d))
+* **deploy:** retry HF Ville legacy-MSSQL connectivity with backoff ([5bec4f4](https://github.com/thehfhotel/new-hotel/commit/5bec4f48082d72425f657178b1b2466b559a0c58))
+* **migrations:** drop stray schema_migrations INSERT from 065 ([1f5ce05](https://github.com/thehfhotel/new-hotel/commit/1f5ce0575fa44d9caebc4ec06d6e8506f334edcf))
+* **rooms:** v2 room grid status from live occupancy, not stale stored column ([12d72ad](https://github.com/thehfhotel/new-hotel/commit/12d72ad62de3d519ced573a2f996ca47f6da13f6))
+* **rounds:** round-report income total excludes the opening float (showed float+income) ([9dd7378](https://github.com/thehfhotel/new-hotel/commit/9dd737872d8d6a7a6981e691d857d968fcdf73f9))
+* **shifts:** dedup round-report income by receipt (multi-room over-count) ([2b7d543](https://github.com/thehfhotel/new-hotel/commit/2b7d5430b87af2c5c7882531ecf6af9b2d82c0df))
+* **shifts:** dedup round-summary tenders too (round-list screen, sibling of round_report) ([8e4d42b](https://github.com/thehfhotel/new-hotel/commit/8e4d42bc0001603ffaedd448bd05d0d1eb4ee00b))
+* **sync:** harden dropped-checkout detection (stale tripwire + Ville reconcile + checkout hash bit) ([6a09e23](https://github.com/thehfhotel/new-hotel/commit/6a09e238138a4810f18350bbb5bff0062363aeae))
+* **sync:** persistence-gate the CT watermark STUCK page + report backlog age ([9c3d257](https://github.com/thehfhotel/new-hotel/commit/9c3d257952c96b7e671a78663b9d3f97e1c718d7))
+* **sync:** widen watchdog CT probe budget 12s → 30s ([c89ced2](https://github.com/thehfhotel/new-hotel/commit/c89ced24870572e5cd29037551201163f89411f2))
+* **test:** add checkout_server_total_enabled to ModeResponse test constructor ([125a8db](https://github.com/thehfhotel/new-hotel/commit/125a8dbda1337815412bfbbf85d92e3d3a8ec6ce))
+* **verification:** allow feedback submit from any branch (incl HF Ville) ([c6135b4](https://github.com/thehfhotel/new-hotel/commit/c6135b41b09e63f96647560e37f94cce2e033b4a))
+* **writeback:** retry transient fingerprint reads; don't mis-report timeout as drift ([e6e975b](https://github.com/thehfhotel/new-hotel/commit/e6e975bca336006b86e96fd8bf10060d953ef076))
+
+
+### Changed
+
+* **backend:** drop target/ from the build layer (smaller cache export) ([8c9ba8b](https://github.com/thehfhotel/new-hotel/commit/8c9ba8bab145676ca2cb3fbfb7712351fe4394ea))
+* **backend:** fix cargo-chef layer cache — deps recompiled every build ([4ee8e19](https://github.com/thehfhotel/new-hotel/commit/4ee8e1930538bfa2960d6008b5b75670145e45c6))
+* remove dead infra — db/dual_pool.rs + auth::router() (Phase 4 pass 2) ([6a930c3](https://github.com/thehfhotel/new-hotel/commit/6a930c3519ca424be05e9e3e8662e9c2221a31d9))
+* remove dead unmounted read handlers (Phase 4 pass 2) ([f301e5b](https://github.com/thehfhotel/new-hotel/commit/f301e5b8c8359dc947617e2473324ca8dbc92828))
+* remove dead/legacy endpoints (spike Phase 4) ([ad10193](https://github.com/thehfhotel/new-hotel/commit/ad101935b026545a0d0fbb94a2d59560cd265a26))
+* **rooms:** single source of truth for room status (spike Phase 1) ([feb081d](https://github.com/thehfhotel/new-hotel/commit/feb081df9ba7b96f27ddd945048ddb92acda658c))
+
 ## [2.72.0](https://github.com/thehfhotel/new-hotel/compare/v2.71.0...v2.72.0) (2026-06-26)
 
 
