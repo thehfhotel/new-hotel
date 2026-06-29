@@ -186,16 +186,35 @@ services:
       # false, `POST /api/shifts/open|close` reject with HTTP 400
       # (`ServiceError::Conflict`) and no legacy write is ever attempted.
       # FLIP CHECKLIST before setting `true`:
-      #   1. HF Hotel ONLY — HF Ville needs the Ship-B per-site write bundle
-      #      first (Ville open/close is still blocked by the ville_write_guard).
+      #   1. Ship-B per-site write bundle has LANDED (55f4ec8) — HF Ville
+      #      open/close is now code-ready (the Ville ShiftService binds
+      #      site_id='hfville'); a Ville round additionally needs
+      #      HFVILLE_WRITES_ENABLED=true (below).
       #   2. A reception-coordinated live round test (open in our app at a real
       #      shift boundary, verify it lands in HT_Round_Bill + iHOTEL sees it;
       #      one person/one app at a time — the get_id MAX+1 race is rated Low).
-      #      See docs/coexistence/ville-coequal-writes-plan.md.
-      #   3. Set `ROUND_WRITEBACK_ENABLED=true` in `.env` (or GH variable) +
-      #      redeploy. Rollback = set back to false + redeploy (no state to undo;
-      #      the legacy PK prevents duplicates and the mirror self-heals).
+      #      See docs/coexistence/RUNBOOK-round-writeback-flip.md.
+      #   3. `gh variable set ROUND_WRITEBACK_ENABLED -b true` + redeploy (now
+      #      plumbed through the deploy payload). Rollback = set back to false +
+      #      redeploy (no state to undo; the legacy PK prevents duplicates and
+      #      the mirror self-heals).
       - ROUND_WRITEBACK_ENABLED=${ROUND_WRITEBACK_ENABLED:-false}
+      # Ship-dark coexistence flags — default false. Flip each via the GH Actions
+      # repo variable of the same name (`gh variable set <NAME> -b true`) + redeploy;
+      # all are plumbed through the workflow deploy payload (env block + jq) and
+      # written to .env generically by run-deploy.sh.
+      #   - CHECKOUT_SERVER_TOTAL_ENABLED (#30): new-app checkout writes back the
+      #     server folio total. Folio parity verified 2026-06-30
+      #     (docs/coexistence/checkout-folio-comparison.md); resolve the POS
+      #     double-count before new-app POS is used at checkout.
+      #   - BOOKING_VALIDATION_ENABLED (#31): the booking form surfaces the server
+      #     availability verdict (fails open; advisory — backend acceptance unchanged).
+      #   - HFVILLE_WRITES_ENABLED (#42): lifts the ville_write_guard so
+      #     ?branch=hfville mutations execute (per-site routing hardened 55f4ec8;
+      #     run docs/coexistence/ville-write-e2e-runbook.md live test first).
+      - CHECKOUT_SERVER_TOTAL_ENABLED=${CHECKOUT_SERVER_TOTAL_ENABLED:-false}
+      - BOOKING_VALIDATION_ENABLED=${BOOKING_VALIDATION_ENABLED:-false}
+      - HFVILLE_WRITES_ENABLED=${HFVILLE_WRITES_ENABLED:-false}
       # Tracing log level. Default `hotel_backend=info,tower_http=info`
       # matches `main.rs::tracing_subscriber::EnvFilter::try_from_default_env`'s
       # fallback. Override at deploy time to crank up debug logging

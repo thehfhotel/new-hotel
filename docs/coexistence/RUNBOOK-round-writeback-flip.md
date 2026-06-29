@@ -82,12 +82,25 @@ while reception is taking payments. Phase 2 (reception driving the buttons) is
 then **workflow/UX confidence**, not a correctness gate.
 
 ### Prerequisites
-- HF **Hotel only** until the Ship-B per-site write bundle (task 20) lands —
-  `branch=hfville` open/close is still blocked by the `ville_write_guard`.
+- **Per-site status (updated 2026-06-30):** the Ship-B per-site write bundle +
+  branch-safety hardening have LANDED (commit `55f4ec8`). `open_shift`/`close_shift`
+  now resolve the per-site service via `resolve_write_services(branch)`, and the HF
+  Ville bundle binds `site_id='hfville'` (so a Ville round allocates its `shift_no`/
+  `legacy_round_id` and runs the open-round mutual-exclusion check scoped to Ville,
+  not HF Hotel's series). HF Ville round open/close is therefore **code-ready**.
+  - **HF Hotel:** flip `ROUND_WRITEBACK_ENABLED` only.
+  - **HF Ville:** needs BOTH `ROUND_WRITEBACK_ENABLED=true` AND
+    `HFVILLE_WRITES_ENABLED=true` (the latter lifts the `ville_write_guard`; run
+    `docs/coexistence/ville-write-e2e-runbook.md` first). The `writeback-hfville`
+    worker already drains the hotelville outbox → Ville legacy `HT_Round_Bill`.
+  - Do **HF Hotel first**, then HF Ville as a **separate** coordinated step.
 - §1 backfill done so the close report is accurate.
-- The flag is wired in `docker-compose.yml` (`ROUND_WRITEBACK_ENABLED`, default
-  false); enable by setting it `true` via the same mechanism as `AUTH_ENABLED`
-  (GH Actions variable / evergreen `.env`) + redeploy.
+- **Flip mechanism (now wired end-to-end):** `ROUND_WRITEBACK_ENABLED` is plumbed
+  through the compose backend env **and** the workflow deploy payload (env block +
+  jq), same as `AUTH_ENABLED`. Flip with `gh variable set ROUND_WRITEBACK_ENABLED -b
+  true` then redeploy (push to master, or re-run the deploy job). Rollback =
+  `gh variable set ROUND_WRITEBACK_ENABLED -b false` + redeploy. (Direct evergreen
+  `.env` edit still works as a break-glass path.)
 
 ### Phase 1 — operator smoke test (no reception, dead-of-night)
 Pick a window with no transactions (~03:00). Flag on → confirm current iHOTEL
