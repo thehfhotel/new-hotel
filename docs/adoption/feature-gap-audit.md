@@ -35,7 +35,7 @@ Coverage = current verified state. "Was" = 2026-06-27 verdict (shows the delta).
 | Capability | Freq | Coverage (now) | Was 6-27 | Sites (today) | Key remaining gap | Effort |
 |---|---|---|---|---|---|---|
 | Take Payment / Settle (ชำระเงิน) | high | **full** | broken | hfhotel | Hard shift-gate: `record_payment` 409s without an open `ht_shifts` round (`service/payment.rs:203-208`), fed only by iHOTEL sync. Ville dark + 0 rows. (Actor IS stamped — backend auth live.) | S(doc)/M(Ville) |
-| Check-out & Settle (เช็คเอาท์) | high | **full** | partial | hfhotel | `checkout_quote` is `new_pool`-only (`new_checkins.rs:520-525`) → Ville quote shows HF Hotel numbers. Full server-folio writeback dark behind `CHECKOUT_SERVER_TOTAL_ENABLED`. | S + M |
+| Check-out & Settle (เช็คเอาท์) | high | **full** | partial | hfhotel | Server-folio writeback now LIVE (`CHECKOUT_SERVER_TOTAL_ENABLED` flipped, #30); `checkout_quote` branch-aware (#74); **per-room/partial checkout added (#75)** — release a subset of a multi-room stay, matching iHOTEL's per-row checkboxes. | — |
 | In-house Room Actions / Folio (จัดการห้องที่เข้าพัก) | high | **full** | partial | hfhotel | Folio-POS (`create/list_pos_sale`) + `checkout_quote` not Ville-routed (`new_checkins.rs:1505,1538,520`). | S each |
 | Room Status Board / Rack (รายการห้องพัก) | high | **full** (display+edit) | partial | both display / hfhotel write | No reserve-from-cell / ClickBook (`RoomActionSheet.tsx:138-163`). Classic board IS data-driven now (prior concern resolved). | S |
 | Walk-in / Check-in (เช็คอิน) | high | partial (↑) | partial | hfhotel | Deposit + ID-prefill + registration slip CLOSED for HF Hotel (`7a2df1d`). Multi-room deposit lands on room idx 0; photo no-op (out of scope); Ville dark. | S–M |
