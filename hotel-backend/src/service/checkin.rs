@@ -1235,7 +1235,7 @@ impl CheckInService {
             // One CheckOut intent per room: folio totals stay whole-stay (so
             // HT_CheckIn_H isn't shrunk); room_ds_* carry THIS room's values
             // for the per-room HT_CheckIn_Ds UPDATE. Per-event v4 key.
-            for (cr_id, _, room_total, nights) in &selected {
+            for (cr_id, _, room_total, _cr_nights) in &selected {
                 let intent = WritebackIntent::CheckOut {
                     check_in_id: aggregate_id,
                     nights: Some(cmd.nights),
@@ -1246,10 +1246,19 @@ impl CheckInService {
                     balance: Some(cmd.balance),
                     cr_id: Some(*cr_id),
                     room_ds_price_total: Some(*room_total),
-                    room_ds_nights: Some(*nights),
+                    // Cin_Room_night: use the header date-diff nights (cmd.nights),
+                    // NOT ht_checkin_rooms.cr_nights — verified live (cin 19832,
+                    // room 305) that cr_nights can be STALE (1) while legacy
+                    // Cin_Room_night is correct (3); writing cr_nights would
+                    // clobber legacy's value + under-bump Room_Use_Count. None →
+                    // the recipe falls back to `nights` (= cmd.nights). For a
+                    // same-dates multi-room stay this equals each room's nights.
+                    room_ds_nights: None,
                     // No per-room payment attribution in PG (payments are
                     // cin-scoped); treat the room's charge as settled for the
-                    // per-room Ds Pay_Total — the header re-aggregates Pay live.
+                    // per-room Ds Pay_Total — verified live the legacy writes the
+                    // room total too (Cin_Room_Pay_Total=2670 for a 2670 room).
+                    // The header re-aggregates Pay live from HT_CheckIn_Pay.
                     room_ds_pay_total: Some(*room_total),
                 };
                 let key = generate_idempotency_key(&intent, Uuid::new_v4());
