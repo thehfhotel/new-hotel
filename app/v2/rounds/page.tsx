@@ -91,7 +91,7 @@ function StatCard({ label, value, sub, accent }: { label: string; value: string;
 }
 
 // iHOTEL FrmDueBill history columns, in order. `num` right-aligns money.
-const COLS: { key: keyof SummaryRound | 'dates'; label: string; num?: boolean }[] = [
+const COLS: { key: keyof SummaryRound | 'dates' | 'income'; label: string; num?: boolean }[] = [
   { key: 'shiftNo', label: 'หมายเลข' },
   { key: 'dates', label: 'วันที่เปิด / ปิด' },
   { key: 'opening', label: 'เงินในลิ้นชัก', num: true },
@@ -101,7 +101,8 @@ const COLS: { key: keyof SummaryRound | 'dates'; label: string; num?: boolean }[
   { key: 'depositsReturned', label: 'จ่ายเงินมัดจำ', num: true },
   { key: 'credit', label: 'บัตรเครดิต', num: true },
   { key: 'transfer', label: 'โอนเงิน', num: true },
-  { key: 'grandTotal', label: 'รวมทั้งหมด', num: true },
+  { key: 'income', label: 'รวมเงินรับ', num: true },
+  { key: 'grandTotal', label: 'รวมทั้งหมด (รวมเงินทอน)', num: true },
   { key: 'closedBy', label: 'ผู้ปิดรอบ' },
 ]
 
@@ -198,7 +199,8 @@ export default function V2Rounds() {
           </div>
           {/* Analytics roll-up */}
           <div className="grid gap-3 grid-cols-2 lg:grid-cols-3">
-            <StatCard label="รวมทั้งหมด" value={formatCurrency(t.grandTotal, 0)} sub={`${t.roundCount} รอบ`} accent />
+            <StatCard label="รวมเงินรับ (เทียบ iHOTEL)" value={formatCurrency(t.cashNet + t.credit + t.transfer, 0)} sub="เงินสด + บัตร + โอน · ไม่รวมเงินทอนตั้งต้น" accent />
+            <StatCard label="รวมทั้งหมด (รวมเงินทอน)" value={formatCurrency(t.grandTotal, 0)} sub={`รวมเงินทอนตั้งต้น · ${t.roundCount} รอบ`} />
             <StatCard label="รวมเงินสดคงเหลือ" value={formatCurrency(t.cashNet, 0)} sub={`รับ ${formatCurrency(t.cashReceived, 0)} · จ่าย ${formatCurrency(t.cashPaid, 0)}`} />
             <StatCard label="บัตรเครดิต" value={formatCurrency(t.credit, 0)} />
             <StatCard label="โอนเงิน" value={formatCurrency(t.transfer, 0)} />
@@ -258,7 +260,10 @@ export default function V2Rounds() {
                       </td>
                       <td className="px-3 py-2.5 v2-num text-right">{formatCurrency(r.credit, 2)}</td>
                       <td className="px-3 py-2.5 v2-num text-right">{formatCurrency(r.transfer, 2)}</td>
-                      <td className="px-3 py-2.5 v2-num text-right font-semibold">{formatCurrency(r.grandTotal, 2)}</td>
+                      <td className="px-3 py-2.5 v2-num text-right font-semibold" style={{ color: 'var(--v2-wine-600)' }}>
+                        {formatCurrency(r.cashNet + r.credit + r.transfer, 2)}
+                      </td>
+                      <td className="px-3 py-2.5 v2-num text-right" style={{ color: 'var(--v2-ink-3)' }}>{formatCurrency(r.grandTotal, 2)}</td>
                       <td className="px-3 py-2.5 whitespace-nowrap" style={{ color: 'var(--v2-ink-2)' }}>{r.closedBy || '—'}</td>
                     </tr>
                   ))}
