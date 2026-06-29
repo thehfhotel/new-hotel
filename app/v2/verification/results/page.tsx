@@ -87,9 +87,6 @@ const KEY_LABELS: Record<string, string> = {
   rv_room114: 'สถานะห้อง 114',
   rv_arrivals: 'ความหมายของคำว่า "เข้า"',
   rv_arrivals_screen: 'หน้าจอ iHOTEL ที่ดู',
-  rv_livetest: 'พร้อมทดสอบสด',
-  rv_livetest_slot: 'วัน/เวลาที่สะดวก',
-  rv_note: 'หมายเหตุเพิ่มเติม',
   // original full checklist
   q1_1: '1.1 สถานะห้องพัก',
   q1_1_rooms: '1.1 ห้องที่ไม่ตรง',
@@ -189,12 +186,6 @@ function reverifyTags(a: Record<string, unknown>): { tone: Tone; text: string }[
     out.push({
       tone: 'mut',
       text: `เข้า = ${arr === 'a' ? 'ก (เข้าจริงวันนี้)' : arr === 'b' ? 'ข (รอเช็คอิน)' : arr}`,
-    })
-  const lt = asStr(a.rv_livetest)
-  if (lt)
-    out.push({
-      tone: lt === 'ready' ? 'ok' : 'warn',
-      text: `ทดสอบสด: ${lt === 'ready' ? 'พร้อมนัด' : 'ยังไม่พร้อม'}`,
     })
   return out
 }
@@ -388,10 +379,9 @@ export default function VerificationResults() {
     const r816 = tally('rv_round816', 'match', 'mismatch')
     const room114 = tally('rv_room114', 'vacant', 'occupied')
     const arrivals = tally('rv_arrivals', 'a', 'b')
-    const livetest = tally('rv_livetest', 'ready', 'notyet')
 
     const hasReverifyData =
-      inv.a + inv.b + roundSummary.a + roundSummary.b + r816.a + r816.b + room114.a + room114.b + arrivals.a + arrivals.b + livetest.a + livetest.b >
+      inv.a + inv.b + roundSummary.a + roundSummary.b + r816.a + r816.b + room114.a + room114.b + arrivals.a + arrivals.b >
       0
 
     summary = (
@@ -437,9 +427,6 @@ export default function VerificationResults() {
             </StatChip>
             <StatChip label='ความหมาย "เข้า"'>
               <TwoCount aLabel="ก เข้าจริง" a={arrivals.a} aTone="mut" bLabel="ข รอเช็คอิน" b={arrivals.b} bTone="mut" />
-            </StatChip>
-            <StatChip label="พร้อมทดสอบสด">
-              <TwoCount aLabel="พร้อมนัด" a={livetest.a} aTone="ok" bLabel="ยังไม่พร้อม" b={livetest.b} bTone="warn" />
             </StatChip>
           </div>
         ) : (
@@ -490,7 +477,6 @@ export default function VerificationResults() {
                   const misclick = isMisclick(r)
                   const reverify = isReverify(r)
                   const tags = reverify ? reverifyTags(r.answers ?? {}) : fullChecklistTags(r)
-                  const note = asStr(r.answers?.rv_note) ?? asStr(r.answers?.rv_livetest_slot)
                   return (
                     <Fragment key={r.id}>
                       <tr
@@ -526,11 +512,6 @@ export default function VerificationResults() {
                                 {t.text}
                               </Tag>
                             ))}
-                            {note && (
-                              <span className="text-[11.5px]" style={{ color: 'var(--v2-ink-3)' }}>
-                                · {note}
-                              </span>
-                            )}
                           </div>
                         </td>
                       </tr>

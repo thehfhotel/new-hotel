@@ -118,11 +118,6 @@ const ARRIVALS = [
   { value: 'a', label: 'ลูกค้าที่เช็คอินเข้าจริงวันนี้' },
   { value: 'b', label: 'ลูกค้าที่จองไว้และยังรอเช็คอินวันนี้ (ยังไม่เข้า)' },
 ]
-const LIVETEST = [
-  { value: 'ready', label: 'พร้อมนัด' },
-  { value: 'notyet', label: 'ยังไม่พร้อม' },
-]
-
 type Site = 'hfhotel' | 'hfville'
 
 interface FormState {
@@ -138,10 +133,6 @@ interface FormState {
   rv_room114: string
   rv_arrivals: string
   rv_arrivals_screen: string
-  // both sites
-  rv_livetest: string
-  rv_livetest_slot: string
-  rv_note: string
 }
 
 const EMPTY_FORM: FormState = {
@@ -155,9 +146,6 @@ const EMPTY_FORM: FormState = {
   rv_room114: '',
   rv_arrivals: '',
   rv_arrivals_screen: '',
-  rv_livetest: '',
-  rv_livetest_slot: '',
-  rv_note: '',
 }
 
 export default function V2Reverify() {
@@ -215,10 +203,6 @@ function ReverifyInner() {
       a.rv_arrivals = form.rv_arrivals
       if (form.rv_arrivals_screen.trim()) a.rv_arrivals_screen = form.rv_arrivals_screen.trim()
     }
-    // shared keys (omit empties, consistent with the other optional keys)
-    if (form.rv_livetest) a.rv_livetest = form.rv_livetest
-    if (form.rv_livetest_slot.trim()) a.rv_livetest_slot = form.rv_livetest_slot.trim()
-    if (form.rv_note.trim()) a.rv_note = form.rv_note.trim()
     return a
   }
 
@@ -237,7 +221,7 @@ function ReverifyInner() {
         body: JSON.stringify({
           inspector: form.inspector.trim() || user?.username || null,
           answers: buildAnswers(),
-          overall: form.rv_livetest || null,
+          overall: null,
           site,
         }),
       })
@@ -355,18 +339,6 @@ function ReverifyInner() {
           </Question>
         </Section>
       )}
-
-      {/* ── shared: live test + note ── */}
-      <Section title="ทดสอบสด + หมายเหตุ (ทั้งสองสาขา)">
-        <Question title="พร้อมนัด 'ทดสอบสด' 1 รอบ (เช็คอิน→รับเงิน→เช็คเอาท์ และเปิด/ปิดรอบบิล) หรือยัง?">
-          <RadioGroup name="rv_livetest" value={form.rv_livetest} onChange={(v) => set('rv_livetest', v)} options={LIVETEST} />
-          <TextInput value={form.rv_livetest_slot} onChange={(v) => set('rv_livetest_slot', v)} placeholder="สะดวกวัน/เวลาไหน" />
-        </Question>
-
-        <Question title="หมายเหตุเพิ่มเติม (ถ้ามี)">
-          <TextInput value={form.rv_note} onChange={(v) => set('rv_note', v)} placeholder="หมายเหตุเพิ่มเติม" />
-        </Question>
-      </Section>
 
       {error && (
         <p className="text-[13px] font-medium" style={{ color: '#b91c1c' }}>
