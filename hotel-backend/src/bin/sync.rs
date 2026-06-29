@@ -410,10 +410,37 @@ const WATCHDOG_ALERT_COOLDOWN_SECS: u64 = 1800;
 /// HOLDLOCK` on `HT_CheckIn_Ds.get_id` cascades and report runs — see
 /// `docs/legacy-app/COMPAT_CHEATSHEET.md` §4) and self-clears on the
 /// next tick. Requiring 3 in a row means ~3 minutes of sustained
-/// uncertainty before a page, while keeping the confirmed-backlog
-/// (`:rotating_light:`) and confirmed-quiet branches at single-tick
-/// reaction speed. Override via `LEGACY_SYNC_PROBE_TIMEOUT_STREAK`.
+/// uncertainty before a page, while keeping the confirmed-quiet branch at
+/// single-tick reaction speed. (The confirmed-backlog `:rotating_light:`
+/// branch has its own, separate persistence gate — see
+/// [`DEFAULT_BACKLOG_PERSIST_STREAK_THRESHOLD`].) Override via
+/// `LEGACY_SYNC_PROBE_TIMEOUT_STREAK`.
 const DEFAULT_PROBE_TIMEOUT_STREAK_THRESHOLD: u32 = 3;
+
+/// 2026-06-29 — number of CONSECUTIVE watchdog ticks a CONFIRMED backlog
+/// (probe `Some(v)` with `v > watermark`) must persist before the
+/// `:rotating_light:` *CT watermark STUCK* page fires.
+///
+/// The stuck-eligibility gate ([`watermark_stall_alert_eligible`]) only
+/// measures how long the watermark has been *frozen* — which, during a
+/// genuine quiet period, is just how long it's been idle at tip-of-stream
+/// (correctly suppressed by [`should_fire_stall_alert`] while the probe
+/// reads `== watermark`). The instant a SINGLE new change lands on legacy,
+/// the very next 60s watchdog tick can observe `ct_current > watermark`
+/// *before* the CT watcher (which polls on its own cadence) has consumed
+/// it. Pre-2026-06-29 that paged a critical "STUCK" on the FIRST
+/// observation and inherited the whole idle duration as the "stuck"
+/// figure — producing absurd self-recovering pages like
+/// "stuck 7807s, 1 version unprocessed" that cleared the next tick.
+///
+/// A backlog the watcher drains within its own poll cycle is normal lag,
+/// not a stall. Requiring it to survive >= 2 consecutive 60s ticks (~60s
+/// of genuinely-unconsumed changes) suppresses that race while still
+/// paging a truly wedged watcher within ~60s. The monotonicity-violation
+/// case (`v < watermark`) is NOT gated — it's a corruption signal and
+/// fires on first observation. Override via
+/// `LEGACY_SYNC_BACKLOG_PERSIST_STREAK` (1 reproduces the old hair-trigger).
+const DEFAULT_BACKLOG_PERSIST_STREAK_THRESHOLD: u32 = 2;
 
 /// All CT-enabled MSSQL tables — must stay in sync with the seeds in
 /// migrations 017 (canonical sync, 10 tables) + 022 (legacy_mirror, 6
@@ -1675,6 +1702,27 @@ fn probe_failure_streak_passes_gate(
     }
 }
 
+/// Persistence gate for the confirmed-backlog (`:rotating_light:` *STUCK*)
+/// class (2026-06-29). A backlog (`ct_current > watermark`) the CT watcher
+/// drains within its own poll cycle is normal lag, not a stall — so the
+/// critical page is suppressed until the backlog has been observed on
+/// `consecutive_observations >= threshold` consecutive watchdog ticks.
+///
+/// Returns `true` once the streak crosses the threshold (page allowed),
+/// `false` while it's still below (suppress this tick). Mirrors
+/// [`probe_failure_streak_passes_gate`] so the loop body stays small and
+/// the rule stays unit-testable.
+///
+/// Background: a long quiet window followed by a single new change let the
+/// watchdog observe `ct_current > watermark` for one tick before the
+/// watcher consumed it, paging a self-recovering critical "STUCK" that
+/// inherited the idle duration as its "stuck" figure (e.g. "stuck 7807s,
+/// 1 version unprocessed" → RECOVERED 60s later). See
+/// [`DEFAULT_BACKLOG_PERSIST_STREAK_THRESHOLD`].
+fn backlog_persist_passes_gate(consecutive_observations: u32, threshold: u32) -> bool {
+    consecutive_observations >= threshold
+}
+
 /// Pure decision for the probe-timeout-outage escalation (2026-06-26).
 ///
 /// The `:information_source:` probe-timeout page is benign WHEN it
@@ -2025,6 +2073,15 @@ async fn run_watermark_watchdog(
     // Reset on probe success, watermark advance, or any tick that
     // doesn't run a probe (no stall this tick).
     let mut probe_failure_streak: u32 = 0;
+    // 2026-06-29 — persistence gate for the confirmed-backlog
+    // (`:rotating_light:` STUCK) class. `backlog_streak` counts
+    // CONSECUTIVE ticks where the probe confirmed `ct_current > watermark`;
+    // `backlog_since` anchors when the backlog was first observed so the
+    // critical page reports the BACKLOG age, not the (potentially huge,
+    // idle-dominated) watermark-freeze age. Both reset on a caught-up
+    // probe (`== watermark`), a watermark advance, or a no-stall tick.
+    let mut backlog_streak: u32 = 0;
+    let mut backlog_since: Option<Instant> = None;
     // 2026-06-26 — probe-timeout-outage escalation state. `since` anchors
     // the first info page of the current unrecovered outage; `escalated`
     // makes the escalation one-time per outage. Both clear on recovery,
@@ -2040,6 +2097,11 @@ async fn run_watermark_watchdog(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_PROBE_TIMEOUT_STREAK_THRESHOLD);
+
+    let backlog_persist_threshold = env::var("LEGACY_SYNC_BACKLOG_PERSIST_STREAK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_BACKLOG_PERSIST_STREAK_THRESHOLD);
 
     let probe_timeout = Duration::from_millis(
         env::var("LEGACY_SYNC_PROBE_TIMEOUT_MS")
@@ -2060,6 +2122,7 @@ async fn run_watermark_watchdog(
         stall_alert_secs,
         shadow_mode,
         probe_timeout_streak_threshold,
+        backlog_persist_threshold,
         probe_timeout_ms = probe_timeout.as_millis() as u64,
         probe_outage_escalation_secs = probe_outage_escalation.as_secs(),
         "[watchdog] Watermark-stall watchdog starting"
@@ -2181,6 +2244,10 @@ async fn run_watermark_watchdog(
                     }
                 };
                 if !should_fire_stall_alert(observation.last_seen_version, probe) {
+                    // Probe confirms legacy CT is idle at our watermark —
+                    // caught up. Any backlog we were tracking is drained.
+                    backlog_streak = 0;
+                    backlog_since = None;
                     tracing::info!(
                         site = %site_id,
                         watermark = observation.last_seen_version,
@@ -2268,37 +2335,94 @@ async fn run_watermark_watchdog(
                         last_stall_alert = Some((now, false));
                         pending_stall_alert = Some((now, observation.last_seen_version));
                     }
-                } else {
+                } else if let Some(ct_current) = probe {
                     // Probe SUCCEEDED and disagreed with the watermark (the
-                    // == case was suppressed above) — confirmed backlog or
-                    // monotonicity violation. The critical class; bypasses
-                    // the cooldown left by a prior informational page.
-                    if stall_page_passes_cooldown(last_stall_alert, now, cooldown, true) {
-                        let stuck_for = now.duration_since(prior_obs.observed_at);
-                        tracing::error!(
-                            site = %site_id,
-                            version = observation.last_seen_version,
-                            ct_current = ?probe,
-                            reason,
-                            "[watchdog] Watermark stall detected — paging operator"
-                        );
-                        if let Some(s) = slack.as_ref() {
-                            let payload = SlackMessage::with_site_text(
-                                &site_id,
-                                format_stall_alert_message(
-                                    observation.last_seen_version,
-                                    probe,
-                                    stuck_for,
-                                    stall_threshold,
-                                ),
+                    // `== watermark` case was suppressed above). Two sub-cases,
+                    // both the critical class — bypasses the cooldown left by a
+                    // prior informational page.
+                    if ct_current < observation.last_seen_version {
+                        // Monotonicity violation (watermark > legacy current):
+                        // impossible in healthy CT — a corruption / CT-reset
+                        // signal. Fire on FIRST observation; NOT streak-gated.
+                        backlog_streak = 0;
+                        backlog_since = None;
+                        if stall_page_passes_cooldown(last_stall_alert, now, cooldown, true) {
+                            let stuck_for = now.duration_since(prior_obs.observed_at);
+                            tracing::error!(
+                                site = %site_id,
+                                version = observation.last_seen_version,
+                                ct_current,
+                                reason,
+                                "[watchdog] Watermark monotonicity violation — paging operator"
                             );
-                            let _ = s.send_message(&payload).await;
+                            if let Some(s) = slack.as_ref() {
+                                let payload = SlackMessage::with_site_text(
+                                    &site_id,
+                                    format_stall_alert_message(
+                                        observation.last_seen_version,
+                                        probe,
+                                        stuck_for,
+                                        stall_threshold,
+                                    ),
+                                );
+                                let _ = s.send_message(&payload).await;
+                            }
+                            last_stall_alert = Some((now, true));
+                            pending_stall_alert = Some((now, observation.last_seen_version));
                         }
-                        last_stall_alert = Some((now, true));
-                        // Open-alert state for the recovery notification
-                        // (PR D, 2026-05-19). Always set after a page.
-                        pending_stall_alert =
-                            Some((now, observation.last_seen_version));
+                    } else {
+                        // `ct_current > watermark` — confirmed backlog.
+                        // Persistence gate (2026-06-29): a backlog the watcher
+                        // drains within its own poll cycle is normal lag, not a
+                        // stall. Require it to survive >= N consecutive ticks,
+                        // and report the BACKLOG age (since first observed), not
+                        // the idle-dominated watermark-freeze age — that's the
+                        // fix for the self-recovering "stuck 7807s, 1 version"
+                        // pages.
+                        backlog_streak = backlog_streak.saturating_add(1);
+                        if backlog_since.is_none() {
+                            backlog_since = Some(now);
+                        }
+                        let backlog_for = backlog_since
+                            .map(|t| now.duration_since(t))
+                            .unwrap_or_default();
+                        if !backlog_persist_passes_gate(backlog_streak, backlog_persist_threshold) {
+                            tracing::info!(
+                                site = %site_id,
+                                watermark = observation.last_seen_version,
+                                ct_current,
+                                delta = ct_current - observation.last_seen_version,
+                                streak = backlog_streak,
+                                threshold = backlog_persist_threshold,
+                                "[watchdog] backlog observed — suppressing critical page until it persists past the streak gate"
+                            );
+                        } else if stall_page_passes_cooldown(last_stall_alert, now, cooldown, true) {
+                            tracing::error!(
+                                site = %site_id,
+                                version = observation.last_seen_version,
+                                ct_current,
+                                backlog_secs = backlog_for.as_secs(),
+                                streak = backlog_streak,
+                                reason,
+                                "[watchdog] Watermark stall detected (backlog persisted) — paging operator"
+                            );
+                            if let Some(s) = slack.as_ref() {
+                                let payload = SlackMessage::with_site_text(
+                                    &site_id,
+                                    format_stall_alert_message(
+                                        observation.last_seen_version,
+                                        probe,
+                                        backlog_for,
+                                        stall_threshold,
+                                    ),
+                                );
+                                let _ = s.send_message(&payload).await;
+                            }
+                            last_stall_alert = Some((now, true));
+                            // Open-alert state for the recovery notification
+                            // (PR D, 2026-05-19). Always set after a page.
+                            pending_stall_alert = Some((now, observation.last_seen_version));
+                        }
                     }
                 }
             } else {
@@ -2307,7 +2431,12 @@ async fn run_watermark_watchdog(
                 // is no longer meaningful. Reset so the next stall starts
                 // with a fresh observation budget. The outage anchor clears
                 // too — a non-stalling tick means the watermark is fine.
+                // The backlog-persistence gate resets for the same reason:
+                // the watermark is advancing again, so any prior backlog
+                // streak no longer reflects a wedged watcher.
                 probe_failure_streak = 0;
+                backlog_streak = 0;
+                backlog_since = None;
                 info_outage_since = None;
                 info_outage_escalated = false;
                 if observation.last_seen_version > prior_obs.last_seen_version {
@@ -5818,6 +5947,68 @@ mod tests {
         assert_eq!(
             DEFAULT_PROBE_TIMEOUT_STREAK_THRESHOLD, 3,
             "default streak threshold should be 3 ticks (~3 min) — matches the 2026-05-22 self-recovery window"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Backlog-persistence gate (2026-06-29 — self-recovering critical
+    // "STUCK" pages: a long quiet window followed by a single new change
+    // paged ":rotating_light: 1 version unprocessed, stuck 7807s" and
+    // RECOVERED the next tick because the watcher consumed it within its
+    // own poll cycle).
+    // -------------------------------------------------------------------
+
+    /// The first observation of a backlog must NOT page — the watcher
+    /// very likely consumes it on its next poll. This is the exact
+    /// 10:42 hfville / 3:35 hfhotel false-positive shape.
+    #[test]
+    fn backlog_persist_first_observation_suppresses() {
+        assert!(
+            !backlog_persist_passes_gate(1, DEFAULT_BACKLOG_PERSIST_STREAK_THRESHOLD),
+            "a single-tick backlog must be suppressed — it's normal lag, not a stall"
+        );
+    }
+
+    /// Once the backlog survives the threshold number of consecutive
+    /// ticks, the watcher is genuinely wedged — page critically.
+    #[test]
+    fn backlog_persist_at_threshold_fires() {
+        assert!(
+            backlog_persist_passes_gate(2, DEFAULT_BACKLOG_PERSIST_STREAK_THRESHOLD),
+            "a backlog persisting past the threshold is a real stall — must page"
+        );
+    }
+
+    /// Streaks beyond the threshold keep returning true so the upstream
+    /// cooldown (not the gate) controls re-page spacing.
+    #[test]
+    fn backlog_persist_above_threshold_keeps_firing() {
+        assert!(
+            backlog_persist_passes_gate(99, DEFAULT_BACKLOG_PERSIST_STREAK_THRESHOLD),
+            "streaks above threshold must keep firing; cooldown controls spacing"
+        );
+    }
+
+    /// `threshold = 1` recovers the pre-2026-06-29 hair-trigger (page on
+    /// first backlog observation) — the operator escape hatch and a
+    /// regression guard that the gate doesn't over-suppress.
+    #[test]
+    fn backlog_persist_threshold_one_fires_immediately() {
+        assert!(
+            backlog_persist_passes_gate(1, 1),
+            "threshold=1 must reproduce the pre-gate first-observation page"
+        );
+    }
+
+    /// Lock the default: 2 ticks (~60s) is the minimum that outlasts the
+    /// CT watcher's own poll cycle, so a backlog the watcher would have
+    /// drained never pages.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn default_backlog_persist_threshold_is_two() {
+        assert_eq!(
+            DEFAULT_BACKLOG_PERSIST_STREAK_THRESHOLD, 2,
+            "default backlog-persistence threshold should be 2 ticks (~60s) — outlasts the watcher's poll cycle"
         );
     }
 
