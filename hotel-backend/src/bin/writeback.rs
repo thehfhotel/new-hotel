@@ -976,6 +976,32 @@ async fn resolve_legacy_ids(
                 resolved.legacy_checkin_ds_id =
                     resolved.legacy_checkin_ds_id.or(salvaged.checkin_ds_id);
             }
+            // #75 — PER-ROOM (partial) checkout: a CheckOut intent carrying a
+            // `cr_id` releases ONE room of a multi-room stay. Override the
+            // header's single room_no + HT_CheckIn_Ds.id with THAT room's values
+            // (cin_no stays the header's). Mirrors the RefundDeposit per-cr
+            // resolution. We RESET both first so a lookup miss OR a NULL
+            // cr_legacy_ds_id (the room's CreateCheckIn writeback hasn't
+            // back-populated it yet) leaves them None — the dispatcher's
+            // `ok_or_else` then EXHAUSTS the job (Recipe error is non-retryable
+            // → dead-letter + Slack "manual intervention"), the correct
+            // fail-loud, and never falls back to mis-writing the header's room.
+            if let CheckOut { cr_id: Some(cr_id), .. } = &job.intent {
+                resolved.legacy_room_no = None;
+                resolved.legacy_checkin_ds_id = None;
+                if let Some(row) = sqlx::query(
+                    "SELECT cr.cr_legacy_ds_id, r.room_no \
+                     FROM ht_checkin_rooms cr JOIN ht_rooms_new r ON r.room_id = cr.cr_room_id \
+                     WHERE cr.cr_id = $1",
+                )
+                .bind(*cr_id)
+                .fetch_optional(pg)
+                .await?
+                {
+                    resolved.legacy_room_no = row.try_get("room_no").ok();
+                    resolved.legacy_checkin_ds_id = row.try_get("cr_legacy_ds_id").ok();
+                }
+            }
         }
         // Track G2 / T4 CRIT-1 — `RefundPayment` resolves the same
         // check-in identifiers as `RecordPayment` plus the original
@@ -3064,6 +3090,10 @@ mod tests {
                 net_total: None,
                 pay_total: None,
                 balance: None,
+                cr_id: None,
+                room_ds_price_total: None,
+                room_ds_nights: None,
+                room_ds_pay_total: None,
             },
             aggregate_id: Uuid::nil(),
             idempotency_key: Uuid::nil(),

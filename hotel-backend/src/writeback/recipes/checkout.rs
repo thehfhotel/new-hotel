@@ -70,6 +70,16 @@ pub struct CheckOutInputs<'a> {
     pub pay_total: f64,
     pub balance: f64,
     pub nights: f64,
+    /// Per-room (partial) checkout (#75): when checking out ONE room of a
+    /// multi-room stay, stmt 2 (the `HT_CheckIn_Ds` row) + stmt 3
+    /// (`HT_Rooms.Room_Use_Count`) must use THIS room's values, while stmt 5
+    /// (the `HT_CheckIn_H` header) keeps the FOLIO totals above — else a
+    /// partial checkout would shrink the legacy folio to one room's revenue.
+    /// `None` ⇒ fall back to the folio totals (single-room whole-stay checkout
+    /// ⇒ byte-identical to before).
+    pub ds_price_total: Option<f64>,
+    pub ds_nights: Option<f64>,
+    pub ds_pay_total: Option<f64>,
     /// "Now" timestamp threaded in by `execute()` so `build_statements`
     /// stays PURE — coexistence audit T6 HIGH-1. Drives
     /// `HT_CheckIn_Ds.Cin_Room_Out` (the per-room checkout stamp).
@@ -93,23 +103,23 @@ pub fn build_statements(inputs: &CheckOutInputs<'_>) -> Vec<String> {
     let room_price = format!("{:.2}", inputs.room_price_total);
     let product_total = format!("{:.2}", inputs.product_total);
     let net = format!("{:.2}", inputs.net_total);
-    // `pay` is still used on the HT_CheckIn_Ds per-room totals UPDATE
-    // (the per-room column reflects the snapshot at checkout time; only
-    // the header HT_CheckIn_H Total_Price_Pay is re-aggregated live —
-    // see the §5 statement in this function for the rationale).
-    let pay = format!("{:.2}", inputs.pay_total);
     // Track C — T5 HIGH-4: `inputs.balance` is no longer emitted as a
     // SQL literal — the `[Total_Price_Balance]` value in the
     // HT_CheckIn_H UPDATE is now `Net - (live aggregate)`. The input
     // remains in `CheckOutInputs` for the legacy-event sanity-check
     // surface and is referenced by `validate_finite` in `execute()`.
     let _balance_unused = inputs.balance;
-    let nights = inputs.nights;
-    // Audit H2: Room_Use_Count must be bumped by the real nights count
-    // (COMPAT_CHEATSHEET.md:289 / 1164), not always +1. Cast to i64 — the
-    // legacy column is INT; floor to integer nights (the payload may carry
-    // fractional values from rate math, but the usage counter is whole).
-    let nights_int = nights.max(0.0) as i64;
+    // Per-room (#75): stmt 2 (the HT_CheckIn_Ds row) + stmt 3 (that room's
+    // HT_Rooms usage counter) use THIS ROOM's values; the header (stmt 5)
+    // keeps the FOLIO totals (room_price/product/net) so a partial checkout
+    // never shrinks HT_CheckIn_H. `ds_*` fall back to the folio values when
+    // not a per-room intent (single-room whole-stay ⇒ identical bytes).
+    let ds_price = format!("{:.2}", inputs.ds_price_total.unwrap_or(inputs.room_price_total));
+    let ds_pay = format!("{:.2}", inputs.ds_pay_total.unwrap_or(inputs.pay_total));
+    let ds_nights = inputs.ds_nights.unwrap_or(inputs.nights);
+    // Audit H2: Room_Use_Count bumps by whole nights (legacy INT column),
+    // for THIS room only.
+    let ds_nights_int = ds_nights.max(0.0) as i64;
 
     vec![
         // 1. Lights off — finds the in-progress entry by ROOM_POWER_END_BY=''
@@ -120,13 +130,13 @@ pub fn build_statements(inputs: &CheckOutInputs<'_>) -> Vec<String> {
         // 2. Stamp check-out on HT_CheckIn_Ds (by id) — Cin_Room_Status='Check-Out' (HYPHEN)
         format!(
             "update [HT_CheckIn_Ds] SET  [Cin_Room_Out]={now_q},[Cin_Room_Status]={cin_status_q},\
-             [Cin_Room_Pay_Total]={pay},[Cin_Room_night]={nights},\
-             [Cin_Room_PriceTotal]={room_price},[Cin_note]='' where id={ds_id}"
+             [Cin_Room_Pay_Total]={ds_pay},[Cin_Room_night]={ds_nights},\
+             [Cin_Room_PriceTotal]={ds_price},[Cin_note]='' where id={ds_id}"
         ),
         // 3. Free the room + flag dirty + bump usage counter by nights (audit H2)
         format!(
             "update HT_Rooms set room_use='no',Room_Clean='yes',\
-             Room_Use_Count=Room_Use_Count+{nights_int} where room_no={room_no_q}"
+             Room_Use_Count=Room_Use_Count+{ds_nights_int} where room_no={room_no_q}"
         ),
         // 4. Stamp check-out on HT_Room_Status — room_status='Check Out' (SPACE)
         format!(
@@ -239,6 +249,11 @@ pub async fn execute(
     net_total: f64,
     pay_total: f64,
     balance: f64,
+    // Per-room (#75): THIS room's Ds-row values for a partial checkout. All
+    // `None` ⇒ whole-stay checkout (the folio totals above drive stmt 2 too).
+    ds_price_total: Option<f64>,
+    ds_nights: Option<f64>,
+    ds_pay_total: Option<f64>,
 ) -> WritebackResult<LegacyIds> {
     // Audit H13: reject NaN/Infinity for every monetary input before any SQL
     // formatting. `format!("{}", f64::NAN)` emits literal `"NaN"`, which
@@ -247,14 +262,26 @@ pub async fn execute(
     // never overwritten). Unlike walkin/checkin_to_booking these values flow
     // straight from the caller as f64 — there is no Money type to guarantee
     // finiteness — so the check is necessary, not just defense-in-depth.
-    super::helpers::validate_finite(&[
+    let mut finite_checks: Vec<(&str, f64)> = vec![
         ("nights", nights),
         ("room_price_total", room_price_total),
         ("product_total", product_total),
         ("net_total", net_total),
         ("pay_total", pay_total),
         ("balance", balance),
-    ])?;
+    ];
+    // #75: the per-room overrides feed `format!` literals in stmt 2 too, so give
+    // them the same Audit-H13 NaN/Inf guard as the folio fields above.
+    if let Some(v) = ds_price_total {
+        finite_checks.push(("ds_price_total", v));
+    }
+    if let Some(v) = ds_nights {
+        finite_checks.push(("ds_nights", v));
+    }
+    if let Some(v) = ds_pay_total {
+        finite_checks.push(("ds_pay_total", v));
+    }
+    super::helpers::validate_finite(&finite_checks)?;
 
     // Coexistence audit T6 HIGH-1: capture `Utc::now()` once at the entry to
     // `execute()` so `build_statements` is purely a function of its inputs.
@@ -288,6 +315,9 @@ pub async fn execute(
         pay_total,
         balance,
         nights,
+        ds_price_total,
+        ds_nights,
+        ds_pay_total,
         created_at,
     };
     let statements = build_statements(&inputs);
@@ -319,6 +349,9 @@ mod tests {
             pay_total: 0.0,
             balance: 0.0,
             nights: 1.0,
+            ds_price_total: None,
+            ds_nights: None,
+            ds_pay_total: None,
             created_at: pinned_now(),
         };
         let statements = build_statements(&inputs);
@@ -347,6 +380,42 @@ mod tests {
     }
 
     #[test]
+    fn per_room_checkout_keeps_whole_stay_header_and_uses_room_ds_values() {
+        // #75 — partial checkout of ONE room of a multi-room stay. The folio
+        // totals (room/net) are WHOLE-STAY (e.g. 2 rooms = 5000); the per-room
+        // ds_* are just THIS released room (1780). The no-shrink invariant: the
+        // HT_CheckIn_H header (stmt 5) MUST keep the whole-stay 5000 while the
+        // HT_CheckIn_Ds row (stmt 2) gets the room's 1780.
+        let inputs = CheckOutInputs {
+            cin_no: "CH26-099999",
+            room_no: "305",
+            checkin_ds_id: 25007,
+            room_price_total: 5000.0, // folio (whole stay)
+            product_total: 0.0,
+            net_total: 5000.0, // folio
+            pay_total: 5000.0,
+            balance: 0.0,
+            nights: 2.0,
+            ds_price_total: Some(1780.0), // this room only
+            ds_nights: Some(2.0),
+            ds_pay_total: Some(1780.0),
+            created_at: pinned_now(),
+        };
+        let s = build_statements(&inputs);
+        // stmt 2 (HT_CheckIn_Ds, this room) gets the ROOM's values.
+        assert!(s[1].contains("[Cin_Room_PriceTotal]=1780.00"), "Ds price = room: {}", s[1]);
+        assert!(s[1].contains("[Cin_Room_Pay_Total]=1780.00"), "Ds pay = room: {}", s[1]);
+        assert!(s[1].contains("[Cin_Room_night]=2"), "Ds nights = room: {}", s[1]);
+        // stmt 3 (HT_Rooms) bumps usage by the ROOM's nights.
+        assert!(s[2].contains("Room_Use_Count=Room_Use_Count+2"), "usage +room nights: {}", s[2]);
+        // stmt 5 (HT_CheckIn_H header) keeps the WHOLE-STAY folio — never shrunk
+        // to the released room's value. This is the money invariant of #75.
+        assert!(s[4].contains("[Total_Price_Room]=5000.00"), "header keeps folio room: {}", s[4]);
+        assert!(s[4].contains("[Total_Price_Net]=5000.00"), "header keeps folio net: {}", s[4]);
+        assert!(!s[4].contains("1780"), "header must NOT shrink to one room: {}", s[4]);
+    }
+
+    #[test]
     fn check_out_status_uses_hyphen_not_space_on_checkin_ds() {
         let inputs = CheckOutInputs {
             cin_no: "CH26-005228",
@@ -358,6 +427,9 @@ mod tests {
             pay_total: 0.0,
             balance: 0.0,
             nights: 1.0,
+            ds_price_total: None,
+            ds_nights: None,
+            ds_pay_total: None,
             created_at: pinned_now(),
         };
         let statements = build_statements(&inputs);
@@ -377,6 +449,9 @@ mod tests {
             pay_total: 0.0,
             balance: 0.0,
             nights: 1.0,
+            ds_price_total: None,
+            ds_nights: None,
+            ds_pay_total: None,
             created_at: pinned_now(),
         };
         let statements = build_statements(&inputs);
@@ -401,6 +476,9 @@ mod tests {
             pay_total: 1780.0,
             balance: 0.0,
             nights: 2.0,
+            ds_price_total: None,
+            ds_nights: None,
+            ds_pay_total: None,
             created_at: pinned_now(),
         };
         let statements = build_statements(&inputs);
@@ -436,6 +514,9 @@ mod tests {
             pay_total: 0.0,
             balance: 0.0,
             nights: 1.0,
+            ds_price_total: None,
+            ds_nights: None,
+            ds_pay_total: None,
             created_at: pinned_now(),
         };
         let first = build_statements(&inputs);
@@ -459,6 +540,9 @@ mod tests {
             pay_total: 2670.0,
             balance: 0.0,
             nights: 3.0,
+            ds_price_total: None,
+            ds_nights: None,
+            ds_pay_total: None,
             created_at: pinned_now(),
         };
         let statements = build_statements(&inputs);
@@ -516,6 +600,9 @@ mod tests {
             pay_total: 9999.0, // intent-payload value — must NOT appear in SQL
             balance: -7329.0,  // intent-payload balance — also must NOT appear
             nights: 3.0,
+            ds_price_total: None,
+            ds_nights: None,
+            ds_pay_total: None,
             created_at: pinned_now(),
         };
         let statements = build_statements(&inputs);
@@ -623,6 +710,9 @@ mod tests {
             pay_total: 2670.0,
             balance: 0.0,
             nights: 3.0,
+            ds_price_total: None,
+            ds_nights: None,
+            ds_pay_total: None,
             created_at: pinned_now(),
         };
         let statements = build_statements(&inputs);

@@ -48,6 +48,18 @@ interface Folio {
   balance: number
 }
 
+// One room of the stay, from GET /api/checkins/:id/rooms (#75 per-room checkout).
+interface RoomLine {
+  crId: number
+  roomId: number
+  roomNo: string
+  status: 'active' | 'checked_out'
+  nights: number
+  ratePerNight: number
+  roomSubtotal: number
+  deposit: number
+}
+
 interface CheckOutModalProps {
   room: RoomLite
   onClose: () => void
@@ -93,6 +105,10 @@ export default function CheckOutModal({ room, onClose, onSuccess }: CheckOutModa
   // checkout PUT fails and the receptionist retries: we never re-record the
   // balance once it has been captured in this modal session.
   const [paymentCaptured, setPaymentCaptured] = useState(false)
+  // #75 per-room checkout: all rooms of the stay + the cr_ids selected to
+  // release. Seeded with the clicked room once the room list loads.
+  const [rooms, setRooms] = useState<RoomLine[]>([])
+  const [selectedCrIds, setSelectedCrIds] = useState<Set<number>>(new Set())
 
   // Find the currently active check-in for this room.
   useEffect(() => {
@@ -153,10 +169,53 @@ export default function CheckOutModal({ room, onClose, onSuccess }: CheckOutModa
     return () => { cancelled = true }
   }, [activeCheckin, branchFetch])
 
-  const balanceDue = folio && folio.balance > 0.005 ? folio.balance : 0
+  // #75 — load all rooms of the stay so a multi-room guest can release one,
+  // some, or all rooms. Seed the selection with the room the user clicked.
+  useEffect(() => {
+    if (!activeCheckin) return
+    let cancelled = false
+    branchFetch(`/api/checkins/${activeCheckin.id}/rooms`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (cancelled || !d?.success) return
+        const list = (d.data || []) as RoomLine[]
+        setRooms(list)
+        const clicked = list.find((r) => r.roomId === room.id && r.status === 'active')
+        setSelectedCrIds(new Set(clicked ? [clicked.crId] : []))
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [activeCheckin, room.id, branchFetch])
+
+  const activeRooms = rooms.filter((r) => r.status === 'active')
+  // Multi-room is keyed on the TOTAL room count, not just active rooms: a stay
+  // partially checked out down to one active room is still a multi-room stay, so
+  // its last room must go through the per-room (crIds) path — not the legacy
+  // whole-stay {} body. (The backend defends this too, but keep the client correct.)
+  const isMultiRoom = rooms.length > 1
+  const allActiveSelected =
+    activeRooms.length > 0 && activeRooms.every((r) => selectedCrIds.has(r.crId))
+  // Checking out every active room completes the stay → settle the whole-stay
+  // balance now. A partial subset leaves the stay in-house, so the balance
+  // settles when the LAST room checks out (avoids over-collecting the folio).
+  const finalCheckout = !isMultiRoom || allActiveSelected
+  const balanceDue =
+    finalCheckout && folio && folio.balance > 0.005 ? folio.balance : 0
+  const toggleCr = (crId: number) =>
+    setSelectedCrIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(crId)) next.delete(crId)
+      else next.add(crId)
+      return next
+    })
+  const toggleAll = () =>
+    setSelectedCrIds(
+      allActiveSelected ? new Set() : new Set(activeRooms.map((r) => r.crId)),
+    )
 
   const submit = async () => {
     if (!activeCheckin) return
+    if (isMultiRoom && selectedCrIds.size === 0) return
     setSubmitting(true)
     setError(null)
     try {
@@ -186,14 +245,17 @@ export default function CheckOutModal({ room, onClose, onSuccess }: CheckOutModa
         setPaymentCaptured(true)
       }
 
-      // 2) Complete the check-out. Body stays `{}` so the command/writeback
-      //    total is unchanged while CHECKOUT_SERVER_TOTAL_ENABLED is off.
+      // 2) Complete the check-out. Multi-room stays send the selected
+      //    `crIds` (per-room/partial checkout, #75); single-room stays send
+      //    `{}` (the legacy whole-stay path — byte-identical to before).
       const res = await branchFetch(
         `/api/checkins/${activeCheckin.id}/checkout`,
         {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({}),
+          body: JSON.stringify(
+            isMultiRoom ? { crIds: Array.from(selectedCrIds) } : {},
+          ),
         },
       )
       const data = await res.json()
@@ -220,7 +282,9 @@ export default function CheckOutModal({ room, onClose, onSuccess }: CheckOutModa
       >
         <div className="flex items-center justify-between p-4 border-b border-gray-200">
           <h2 className="text-lg font-bold text-gray-900">
-            เช็คเอ้าท์ ห้อง {room.roomNo}
+            {rooms.length > 1
+              ? `เช็คเอาท์ — ${activeCheckin?.customerName || activeCheckin?.cinNo || ''}`
+              : `เช็คเอ้าท์ ห้อง ${room.roomNo}`}
           </h2>
           <button
             onClick={onClose}
@@ -257,6 +321,47 @@ export default function CheckOutModal({ room, onClose, onSuccess }: CheckOutModa
                   <span>{formatThaiDate(activeCheckin.expectedCheckout)}</span>
                 </div>
               </div>
+
+              {/* #75 per-room checkout — pick which rooms to release. Only
+                  shown for multi-room stays; single-room behaves as before. */}
+              {rooms.length > 1 && (
+                <div className="border border-gray-200 rounded">
+                  <div className="flex items-center justify-between px-3 py-2 border-b border-gray-200 bg-gray-50">
+                    <span className="text-sm font-semibold text-gray-800">เลือกห้องที่จะเช็คเอาท์</span>
+                    <label className="flex items-center gap-1.5 text-xs text-gray-600 cursor-pointer">
+                      <input type="checkbox" checked={allActiveSelected} onChange={toggleAll} />
+                      เลือกทั้งหมด
+                    </label>
+                  </div>
+                  <div className="divide-y divide-gray-100">
+                    {rooms.map((r) => {
+                      const out = r.status === 'checked_out'
+                      return (
+                        <label
+                          key={r.crId}
+                          className={`flex items-center gap-2 px-3 py-2 text-sm ${out ? 'opacity-50' : 'cursor-pointer hover:bg-sky-50'}`}
+                        >
+                          <input
+                            type="checkbox"
+                            disabled={out}
+                            checked={!out && selectedCrIds.has(r.crId)}
+                            onChange={() => toggleCr(r.crId)}
+                          />
+                          <span className="font-medium">ห้อง {r.roomNo}</span>
+                          <span className="text-gray-500">· {r.nights} คืน</span>
+                          <span className="ml-auto font-medium">{formatCurrency(r.roomSubtotal)}</span>
+                          {out && <span className="text-xs text-green-600">เช็คเอาท์แล้ว</span>}
+                        </label>
+                      )
+                    })}
+                  </div>
+                  {!finalCheckout && (
+                    <div className="px-3 py-2 text-xs text-amber-700 bg-amber-50 border-t border-amber-200">
+                      เช็คเอาท์เฉพาะห้องที่เลือก — ห้องที่เหลือยังเข้าพักอยู่ ยอดคงเหลือทั้งบิลจะเรียกเก็บเมื่อเช็คเอาท์ห้องสุดท้าย
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Folio breakdown (server-authoritative; display regardless of
                   the CHECKOUT_SERVER_TOTAL_ENABLED flag). */}
@@ -339,7 +444,12 @@ export default function CheckOutModal({ room, onClose, onSuccess }: CheckOutModa
           </button>
           <button
             onClick={submit}
-            disabled={submitting || loading || !activeCheckin}
+            disabled={
+              submitting ||
+              loading ||
+              !activeCheckin ||
+              (isMultiRoom && selectedCrIds.size === 0)
+            }
             className="px-4 py-2 text-sm font-medium text-white bg-sky-600 rounded hover:bg-sky-700 disabled:opacity-50 flex items-center"
           >
             {submitting ? (
@@ -347,7 +457,11 @@ export default function CheckOutModal({ room, onClose, onSuccess }: CheckOutModa
             ) : (
               <LogOut size={14} className="mr-2" />
             )}
-            {balanceDue > 0 ? 'ชำระเงินและเช็คเอ้าท์' : 'ยืนยันเช็คเอ้าท์'}
+            {balanceDue > 0
+              ? 'ชำระเงินและเช็คเอ้าท์'
+              : isMultiRoom && !allActiveSelected
+                ? `เช็คเอาท์ห้องที่เลือก (${selectedCrIds.size})`
+                : 'ยืนยันเช็คเอ้าท์'}
           </button>
         </div>
       </div>

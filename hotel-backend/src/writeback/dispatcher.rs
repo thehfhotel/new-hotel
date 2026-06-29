@@ -903,6 +903,12 @@ pub async fn dispatch(
             net_total,
             pay_total,
             balance,
+            // #75: cr_id steers the RESOLVER (room's ds_id/room_no), consumed
+            // there; the dispatcher only needs the per-room Ds totals.
+            cr_id: _,
+            room_ds_price_total,
+            room_ds_nights,
+            room_ds_pay_total,
         } => {
             let cin_no = nonempty(resolved.legacy_cin_no.as_ref()).ok_or_else(|| {
                 WritebackError::Recipe("CheckOut requires resolved legacy_cin_no".into())
@@ -938,6 +944,9 @@ pub async fn dispatch(
                 net_total.unwrap_or(0.0),
                 pay_total.unwrap_or(0.0),
                 balance.unwrap_or(0.0),
+                *room_ds_price_total,
+                *room_ds_nights,
+                *room_ds_pay_total,
             )
             .await
         }
@@ -1438,6 +1447,10 @@ mod tests {
             net_total: None,
             pay_total: None,
             balance: None,
+            cr_id: None,
+            room_ds_price_total: None,
+            room_ds_nights: None,
+            room_ds_pay_total: None,
         }));
     }
 
@@ -1620,6 +1633,10 @@ mod tests {
                 net_total: None,
                 pay_total: None,
                 balance: None,
+                cr_id: None,
+                room_ds_price_total: None,
+                room_ds_nights: None,
+                room_ds_pay_total: None,
             },
             WritebackIntent::RecordPayment {
                 check_in_id: id,

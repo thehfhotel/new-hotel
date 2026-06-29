@@ -167,6 +167,29 @@ pub enum WritebackIntent {
         /// `HT_CheckIn_H.Total_Price_Balance`.
         #[serde(default)]
         balance: Option<f64>,
+        // --- Per-room (partial) checkout (#75) ---
+        // When `cr_id` is set this intent checks out exactly ONE room of a
+        // multi-room stay (one intent is emitted per selected room). The
+        // resolver swaps in THAT room's `legacy_room_no` + `HT_CheckIn_Ds.id`;
+        // the room/product/net/pay/balance fields above stay the WHOLE-STAY
+        // (folio) totals so the `HT_CheckIn_H` header is never clobbered to a
+        // single room's value (matches iHOTEL — header is the full-stay
+        // aggregate). The `room_ds_*` fields below carry THIS room's values for
+        // the per-room `HT_CheckIn_Ds` UPDATE (stmt 2). All `None` ⇒ legacy
+        // whole-stay checkout (the room_price_total etc. drive both stmts, as
+        // before).
+        #[serde(default)]
+        cr_id: Option<i64>,
+        /// This room's `Cin_Room_PriceTotal` (NOT the folio total). Falls back
+        /// to `room_price_total` when `None`.
+        #[serde(default)]
+        room_ds_price_total: Option<f64>,
+        /// This room's `Cin_Room_night`. Falls back to `nights` when `None`.
+        #[serde(default)]
+        room_ds_nights: Option<f64>,
+        /// This room's `Cin_Room_Pay_Total`. Falls back to `pay_total` when `None`.
+        #[serde(default)]
+        room_ds_pay_total: Option<f64>,
     },
 
     /// Spike §3h — `INSERT HT_CheckIn_Pay` + `UPDATE HT_CheckIn_H` totals.
@@ -1100,6 +1123,7 @@ mod tests {
                 net_total,
                 pay_total,
                 balance,
+                ..
             } => {
                 assert_eq!(
                     check_in_id,
@@ -1215,6 +1239,10 @@ mod tests {
             net_total: Some(2670.0),
             pay_total: Some(2670.0),
             balance: Some(0.0),
+            cr_id: None,
+            room_ds_price_total: None,
+            room_ds_nights: None,
+            room_ds_pay_total: None,
         };
         let json = serde_json::to_string(&intent).expect("must serialize");
         let parsed: WritebackIntent =

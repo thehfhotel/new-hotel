@@ -236,6 +236,12 @@ pub struct CheckOutCommand {
     pub pay_total: f64,
     /// Outstanding balance in baht (net − pay).
     pub balance: f64,
+    /// Per-room (partial) checkout (#75): when `Some(non-empty)`, check out
+    /// ONLY these `ht_checkin_rooms.cr_id`s of a multi-room stay (the header
+    /// stays in-house until the last room leaves). `None`/empty ⇒ whole-stay
+    /// checkout (the existing path). The `room_price_total`/`net_total`/etc.
+    /// above stay the FOLIO totals in both modes.
+    pub cr_ids: Option<Vec<i64>>,
 }
 
 /// Outcome of a successful check-in mutation.
@@ -1096,6 +1102,178 @@ impl CheckInService {
 
         let mut tx = self.pg.begin().await?;
 
+        // ── #75 Per-room (partial) checkout ───────────────────────────────
+        // When specific rooms are released, flip ONLY those `ht_checkin_rooms`
+        // rows; the stay stays in-house until the last room leaves (mirrors
+        // iHOTEL — the header is "done" iff no Ds row is still 'เข้าพัก'). One
+        // CheckOut intent is emitted PER room with a per-event idempotency key so
+        // a partial-then-full sequence can't collide on the retained
+        // `writeback_jobs.idempotency_key`.
+        //
+        // Resolve the effective room set. Explicit `cr_ids` win. Otherwise, for
+        // a MULTI-room stay even a whole-stay ({}) checkout MUST release every
+        // still-active room PER-ROOM — the header's single `cin_room_id` can't
+        // represent N rooms, and after a partial checkout it may name an
+        // already-released room (so the legacy whole-stay path would free the
+        // wrong room + never flip the remaining junction row → PG/legacy
+        // divergence). A genuine single-room stay (≤1 junction row) keeps the
+        // legacy whole-stay path below, byte-identical to before.
+        let effective_cr_ids: Option<Vec<i64>> =
+            match cmd.cr_ids.clone().filter(|v| !v.is_empty()) {
+                Some(ids) => Some(ids),
+                None => {
+                    let total: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM ht_checkin_rooms WHERE cr_cin_id = $1",
+                    )
+                    .bind(cmd.check_in_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if total > 1 {
+                        let active: Vec<i64> = sqlx::query_scalar(
+                            "SELECT cr_id FROM ht_checkin_rooms \
+                              WHERE cr_cin_id = $1 AND cr_room_status = 'เข้าพัก' \
+                           ORDER BY cr_id",
+                        )
+                        .bind(cmd.check_in_id)
+                        .fetch_all(&mut *tx)
+                        .await?;
+                        (!active.is_empty()).then_some(active)
+                    } else {
+                        None
+                    }
+                }
+            };
+
+        if let Some(cr_ids) = effective_cr_ids.as_ref() {
+            let aggregate_id = aggregate_uuid(AggregateKind::CheckIn, cmd.check_in_id);
+
+            // Selected rooms, scoped to the folio AND still active, so a wrong
+            // cr_id / already-out room fails 4xx rather than mis-checking-out.
+            // Tuple: (cr_id, room_id, room_total, nights).
+            let selected: Vec<(i64, i32, f64, f64)> = sqlx::query(
+                "SELECT cr_id, cr_room_id, cr_room_total::float8 AS total, \
+                        cr_nights::float8 AS nights \
+                   FROM ht_checkin_rooms \
+                  WHERE cr_cin_id = $1 AND cr_id = ANY($2) AND cr_room_status = 'เข้าพัก'",
+            )
+            .bind(cmd.check_in_id)
+            .bind(&cr_ids[..])
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .map(|r| {
+                (
+                    r.try_get::<i64, _>("cr_id").unwrap_or(0),
+                    r.try_get::<i32, _>("cr_room_id").unwrap_or(0),
+                    r.try_get::<f64, _>("total").unwrap_or(0.0),
+                    r.try_get::<f64, _>("nights").unwrap_or(1.0),
+                )
+            })
+            .collect();
+
+            if selected.len() != cr_ids.len() {
+                return Err(ServiceError::conflict(format!(
+                    "one or more selected rooms are not active or not part of check-in {}",
+                    cmd.check_in_id
+                )));
+            }
+
+            // Flip only the selected rooms to 'Check-Out' (the literal the B2
+            // sync mapper reads back, so the CT round-trip is a no-op). The
+            // `cr_room_status = 'เข้าพัก'` predicate + rows_affected check is a
+            // concurrency guard: a parallel checkout that already flipped one of
+            // these rows updates fewer than we selected → roll back + 409 rather
+            // than double-emit a per-room writeback.
+            let flipped = sqlx::query(
+                "UPDATE ht_checkin_rooms \
+                    SET cr_room_status = 'Check-Out', cr_room_out = NOW(), cr_updated_at = NOW() \
+                  WHERE cr_cin_id = $1 AND cr_id = ANY($2) AND cr_room_status = 'เข้าพัก'",
+            )
+            .bind(cmd.check_in_id)
+            .bind(&cr_ids[..])
+            .execute(&mut *tx)
+            .await?;
+            if flipped.rows_affected() != cr_ids.len() as u64 {
+                return Err(ServiceError::conflict(format!(
+                    "a concurrent checkout changed one of the selected rooms of check-in {}",
+                    cmd.check_in_id
+                )));
+            }
+
+            for (_, room_id, _, _) in &selected {
+                self.repo.mark_room_available_dirty(&mut tx, *room_id).await?;
+            }
+
+            // Header completes ONLY when no room is still in-house.
+            let remaining_active: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM ht_checkin_rooms \
+                  WHERE cr_cin_id = $1 AND cr_room_status = 'เข้าพัก'",
+            )
+            .bind(cmd.check_in_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+            if remaining_active == 0 {
+                self.repo
+                    .apply_checkout(
+                        &mut tx,
+                        cmd.check_in_id,
+                        CheckOutWrite {
+                            check_out_time: cmd.check_out_time,
+                            total_amount: cmd.total_amount,
+                            payment_status: &cmd.payment_status,
+                            notes: cmd.notes.as_deref(),
+                            round_bill_shift_id,
+                        },
+                    )
+                    .await?;
+                if let Some(booking_id) = status.cin_book_id {
+                    self.repo.set_booking_completed(&mut tx, booking_id).await?;
+                }
+            }
+
+            // One CheckOut intent per room: folio totals stay whole-stay (so
+            // HT_CheckIn_H isn't shrunk); room_ds_* carry THIS room's values
+            // for the per-room HT_CheckIn_Ds UPDATE. Per-event v4 key.
+            for (cr_id, _, room_total, nights) in &selected {
+                let intent = WritebackIntent::CheckOut {
+                    check_in_id: aggregate_id,
+                    nights: Some(cmd.nights),
+                    room_price_total: Some(cmd.room_price_total),
+                    product_total: Some(cmd.product_total),
+                    net_total: Some(cmd.net_total),
+                    pay_total: Some(cmd.pay_total),
+                    balance: Some(cmd.balance),
+                    cr_id: Some(*cr_id),
+                    room_ds_price_total: Some(*room_total),
+                    room_ds_nights: Some(*nights),
+                    // No per-room payment attribution in PG (payments are
+                    // cin-scoped); treat the room's charge as settled for the
+                    // per-room Ds Pay_Total — the header re-aggregates Pay live.
+                    room_ds_pay_total: Some(*room_total),
+                };
+                let key = generate_idempotency_key(&intent, Uuid::new_v4());
+                OutboxRepository::enqueue(&mut tx, &intent, key)
+                    .await
+                    .map_err(ServiceError::from_enqueue_error)?;
+            }
+
+            let event = DomainEvent::CheckOutCompleted {
+                id: aggregate_id,
+                source: cmd.source.clone(),
+            };
+            EventBus::publish(&mut tx, &event)
+                .await
+                .map_err(|err| ServiceError::outbox(err.to_string()))?;
+
+            tx.commit().await?;
+            return Ok(CheckInOutcome {
+                check_in_id: cmd.check_in_id,
+                aggregate_id,
+            });
+        }
+        // ── whole-stay checkout (unchanged) ───────────────────────────────
+
         self.repo
             .apply_checkout(
                 &mut tx,
@@ -1129,6 +1307,12 @@ impl CheckInService {
             net_total: Some(cmd.net_total),
             pay_total: Some(cmd.pay_total),
             balance: Some(cmd.balance),
+            // Whole-stay checkout — not per-room (#75); the folio totals above
+            // drive both the per-room Ds row and the HT_CheckIn_H header.
+            cr_id: None,
+            room_ds_price_total: None,
+            room_ds_nights: None,
+            room_ds_pay_total: None,
         };
         let key = generate_idempotency_key(&intent, aggregate_id);
         OutboxRepository::enqueue(&mut tx, &intent, key)
@@ -1453,6 +1637,7 @@ mod tests {
             net_total: 100.0,
             pay_total: 100.0,
             balance: 0.0,
+            cr_ids: None,
         }
     }
 

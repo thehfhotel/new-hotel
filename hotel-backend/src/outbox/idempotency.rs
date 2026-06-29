@@ -129,6 +129,10 @@ mod tests {
             net_total: None,
             pay_total: None,
             balance: None,
+            cr_id: None,
+            room_ds_price_total: None,
+            room_ds_nights: None,
+            room_ds_pay_total: None,
         };
 
         assert_ne!(

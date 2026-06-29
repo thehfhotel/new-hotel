@@ -525,6 +525,8 @@ fn build_new_routes(app_state: AppState) -> Router {
         // displays this instead of computing nights × rate client-side when
         // CHECKOUT_SERVER_TOTAL_ENABLED is on).
         .route("/api/checkins/{id}/checkout-quote", get(routes::new_checkins::checkout_quote))
+        // #75 — per-room (partial) checkout picker: all rooms of a multi-room stay.
+        .route("/api/checkins/{id}/rooms", get(routes::new_checkins::list_checkin_rooms))
         // Track G1 / T4 HIGH-2: extend an active stay (one-more-night flow).
         .route("/api/checkins/{id}/extend", put(routes::new_checkins::extend))
         // Task #54 item 3 / Track G2: general checkout date-edit (shorten OR

@@ -218,6 +218,11 @@ pub struct CheckOutRequest {
     pub total_amount: Option<f64>,
     pub payment_status: Option<String>,
     pub notes: Option<String>,
+    /// Per-room (partial) checkout (#75): the `ht_checkin_rooms.cr_id`s to
+    /// release. Absent/empty ⇒ whole-stay checkout (back-compat — the empty
+    /// `{}` body the old modal sent still flips the whole stay).
+    #[serde(default)]
+    pub cr_ids: Option<Vec<i64>>,
 }
 
 /// Request body for extend stay.
@@ -529,6 +534,81 @@ pub async fn checkout_quote(
     Ok(Json(folio_breakdown(&state, pool, cin_id).await?))
 }
 
+/// One room of a multi-room stay, for the per-room checkout picker (#75).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckinRoomRow {
+    /// `ht_checkin_rooms.cr_id` — the per-room key the checkout submit sends back.
+    pub cr_id: i64,
+    pub room_id: i32,
+    pub room_no: String,
+    /// `'active'` (still in-house, `cr_room_status='เข้าพัก'`) or `'checked_out'`.
+    pub status: String,
+    pub nights: f64,
+    pub rate_per_night: f64,
+    pub room_subtotal: f64,
+    pub deposit: f64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckinRoomsResponse {
+    pub success: bool,
+    pub data: Vec<CheckinRoomRow>,
+}
+
+/// GET /api/checkins/{id}/rooms — every room of a check-in (the per-room
+/// checkout picker, #75). Branch-aware read. Unlike `/deposits` this returns
+/// ALL rooms (active + already-checked-out) so the modal can show the full
+/// stay and grey out rooms already released.
+pub async fn list_checkin_rooms(
+    State(state): State<AppState>,
+    Path(cin_id): Path<i32>,
+    Query(query): Query<BranchQuery>,
+) -> ApiResult<Json<CheckinRoomsResponse>> {
+    use sqlx::Row;
+    let pool = checkin_pool_for(&state, query.branch)?;
+    if !state.checkins.exists(pool, cin_id).await? {
+        return Err(ApiError::NotFound(format!("check-in {cin_id} not found")));
+    }
+    let rows = sqlx::query(
+        "SELECT cr.cr_id, cr.cr_room_id, r.room_no, cr.cr_room_status, \
+                cr.cr_nights::float8 AS nights, cr.cr_room_total::float8 AS subtotal, \
+                COALESCE(cr.cr_dep_amount, 0)::float8 AS deposit \
+           FROM ht_checkin_rooms cr \
+           JOIN ht_rooms_new r ON r.room_id = cr.cr_room_id \
+          WHERE cr.cr_cin_id = $1 \
+       ORDER BY r.room_no",
+    )
+    .bind(cin_id)
+    .fetch_all(pool)
+    .await?;
+
+    let data = rows
+        .into_iter()
+        .map(|row| {
+            let st: String = row.try_get("cr_room_status").unwrap_or_default();
+            // 'เข้าพัก' = in-house; 'Check-Out' = already released.
+            let status = if st == "Check-Out" { "checked_out" } else { "active" }.to_string();
+            let nights: f64 = row.try_get("nights").unwrap_or(1.0);
+            let subtotal: f64 = row.try_get("subtotal").unwrap_or(0.0);
+            let rate_per_night = if nights > 0.0 { subtotal / nights } else { subtotal };
+            CheckinRoomRow {
+                cr_id: row.try_get("cr_id").unwrap_or(0),
+                room_id: row.try_get("cr_room_id").unwrap_or(0),
+                room_no: row.try_get("room_no").unwrap_or_default(),
+                status,
+                nights,
+                rate_per_night,
+                room_subtotal: subtotal,
+                deposit: row.try_get("deposit").unwrap_or(0.0),
+            }
+        })
+        .collect();
+
+    Ok(Json(CheckinRoomsResponse { success: true, data }))
+}
+
 /// PUT /api/new/checkins/:id/checkout - Process check-out
 pub async fn checkout(
     State(state): State<AppState>,
@@ -636,6 +716,7 @@ pub async fn checkout(
             net_total: cmd_net_total,
             pay_total: cmd_pay_total,
             balance: cmd_balance,
+            cr_ids: body.cr_ids.clone(),
         })
         .await
         .map_err(map_checkout_error)?;
