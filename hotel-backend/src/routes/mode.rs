@@ -210,6 +210,7 @@ impl AppState {
             outbox.clone(),
             events.clone(),
             new_pool.clone(),
+            &SiteConfig::from_env().id,
         );
         // Track J6 — mirror the wired ShiftService's flag onto AppState so
         // `/api/mode` can surface it (and main.rs can gate route mounting).
@@ -260,6 +261,7 @@ impl AppState {
             outbox.clone(),
             events.clone(),
             new_pool.clone(),
+            &SiteConfig::from_env().id,
         );
         // Track J6 — mirror the wired ShiftService's flag onto AppState so
         // `/api/mode` can surface it (and main.rs can gate route mounting).
@@ -314,9 +316,15 @@ impl AppState {
     /// `with_mode()` produce identical service graphs.
     ///
     /// Track F2 / T1 HIGH-5: this is also where `ShiftService` is bound
-    /// to the binary's `SITE_ID` and threaded into
-    /// `PaymentService::with_shifts(...)` so `record_payment` refuses
-    /// the cash-drawer write when no shift is open.
+    /// to `site_id` and threaded into `PaymentService::with_shifts(...)`
+    /// so `record_payment` refuses the cash-drawer write when no shift is
+    /// open. `site_id` is a PARAMETER (not read from env here) so the
+    /// per-site write bundle can bind the HF Ville graph to `"hfville"`
+    /// while the startup constructors pass the binary's `SITE_ID`
+    /// (`SiteConfig::from_env().id`). A Ville round MUST carry
+    /// `shift_site_id='hfville'` so its `shift_no` / `legacy_round_id`
+    /// allocation and the open-round mutual-exclusion check are scoped to
+    /// the right site — see [`resolve_write_services`](Self::resolve_write_services).
     #[allow(clippy::too_many_arguments)]
     fn wire_services(
         customers: Arc<dyn CustomerRepository>,
@@ -327,13 +335,13 @@ impl AppState {
         outbox: Arc<OutboxRepository>,
         events: Arc<EventBus>,
         pg: crate::db::PgPool,
+        site_id: &str,
     ) -> WiredServices {
-        let site_id = SiteConfig::from_env().id;
         // Track J6 — round-bill writeback (our app opens/closes iHOTEL's
-        // HT_Round_Bill). Read here, alongside `SiteConfig::from_env()`, so the
-        // flag reaches the `ShiftService` *before* it is cloned into the
-        // payment / check-in gates. Default off → open/close refuse and the
-        // routes stay unmounted (iHOTEL owns the round; we only mirror it in).
+        // HT_Round_Bill). Read here so the flag reaches the `ShiftService`
+        // *before* it is cloned into the payment / check-in gates. Default
+        // off → open/close refuse and the routes stay unmounted (iHOTEL owns
+        // the round; we only mirror it in).
         let round_writeback = std::env::var("ROUND_WRITEBACK_ENABLED")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
@@ -460,6 +468,12 @@ impl AppState {
             }),
             Branch::Hfville => {
                 let pool = self.ville_pool()?.clone();
+                // Bind the Ville bundle's ShiftService to `site_id='hfville'`
+                // (NOT the binary's SITE_ID): a Ville round must allocate
+                // `shift_no`/`legacy_round_id` and run the open-round
+                // mutual-exclusion check scoped to 'hfville', else it collides
+                // with HF Hotel's series and can't see iHOTEL's mirrored Ville
+                // round.
                 Ok(Self::wire_services(
                     self.customers.clone(),
                     self.bookings.clone(),
@@ -469,6 +483,7 @@ impl AppState {
                     self.outbox.clone(),
                     self.events.clone(),
                     pool,
+                    "hfville",
                 ))
             }
         }

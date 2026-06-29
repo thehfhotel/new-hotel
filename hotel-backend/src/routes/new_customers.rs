@@ -7,17 +7,16 @@
 //! - GET    /api/customers/search - List customers from `ht_customers`
 //!
 //! Per `docs/architecture.md` §1, §6 (Phase 2.5) writes delegate through the
-//! customer service. `create` keeps using the AppState-wired
-//! `state.customers_service` (bound to the primary HF Hotel pool — its legacy
-//! writeback is folded into the booking/check-in recipes). The `update`,
-//! `delete` and single-`get` handlers are **branch-aware**: `?branch=hfville`
-//! targets the `hotelville` canonical pool, everything else the HF Hotel pool —
-//! mirroring `routes::housekeeping` / `routes::new_shifts`. A fresh
-//! `CustomerService` is built per request bound to the resolved pool
-//! (construction is cheap: Arc clones + a pool-handle clone). HF Ville
-//! mutations stay gated by the `ville_write_guard` middleware in `main.rs`
-//! until `HFVILLE_WRITES_ENABLED` is flipped — these handlers rely on that
-//! existing safety net rather than re-checking the flag.
+//! customer service. `create`, `update`, `delete`, single-`get` and the
+//! `search` list are all **branch-aware**: `?branch=hfville` targets the
+//! `hotelville` canonical pool, everything else the HF Hotel pool — mirroring
+//! `routes::housekeeping` / `routes::new_shifts`. A fresh `CustomerService` is
+//! built per request bound to the resolved pool (construction is cheap: Arc
+//! clones + a pool-handle clone); `create`'s legacy writeback is still folded
+//! into the booking/check-in recipes. HF Ville mutations stay gated by the
+//! `ville_write_guard` middleware in `main.rs` until `HFVILLE_WRITES_ENABLED`
+//! is flipped — these handlers rely on that existing safety net rather than
+//! re-checking the flag.
 //!
 //! The soft-delete handler stays on the repository **by design**: customer
 //! deletes deliberately have no legacy writeback (iHOTEL's delete is a
@@ -96,7 +95,8 @@ pub struct NewCustomersQuery {
     pub sort_order: Option<String>,
     #[serde(default = "default_active_only")]
     pub active_only: bool,
-    /// Branch selector: 'hfhotel' | 'hfville' | 'all' (HotelNew only contains hfhotel data)
+    /// Branch selector: 'hfhotel' | 'hfville' | 'all'. Resolves the per-site
+    /// canonical pool via `customer_pool_for`.
     pub branch: Option<Branch>,
 }
 
@@ -180,18 +180,13 @@ pub async fn list_customers(
     State(state): State<AppState>,
     Query(params): Query<NewCustomersQuery>,
 ) -> ApiResult<Json<NewCustomersResponse>> {
-    // HotelNew DB only contains hfhotel data; hfville selector returns empty.
-    if params.branch == Some(Branch::Hfville) {
-        return Ok(Json(NewCustomersResponse {
-            success: true,
-            data: vec![],
-            pagination: Pagination::new(params.page, params.limit, 0),
-        }));
-    }
-
+    // Branch-aware READ: resolve the per-site pool (Hfville → hotelville) so the
+    // customer search/typeahead returns the selected site's guests. (Replaces a
+    // stale hard-return-empty short-circuit — `hotelville` is a real pool now.)
+    let pool = customer_pool_for(&state, params.branch)?;
     let (rows, total) = state
         .customers
-        .list_with_count(&state.new_pool, &params)
+        .list_with_count(&pool, &params)
         .await?;
 
     let customers: Vec<NewCustomer> = rows.into_iter().map(NewCustomer::from_row).collect();
@@ -206,10 +201,15 @@ pub async fn list_customers(
 /// POST /api/new/customers - Create customer
 pub async fn create_customer(
     State(state): State<AppState>,
+    // Branch selector: must precede the `Json` body extractor.
+    Query(query): Query<CustomerMutationQuery>,
     Json(body): Json<CreateUpdateCustomerRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
-    let outcome = state
-        .customers_service
+    // Branch-aware WRITE: build the CustomerService on the per-site pool so a
+    // Ville customer's canonical INSERT (and any future standalone writeback)
+    // lands in hotelville — mirrors update_customer/delete_customer.
+    let pool = customer_pool_for(&state, query.branch)?;
+    let outcome = customer_service_for(&state, pool)
         .create(CreateCustomerCommand {
             first_name: body.first_name,
             last_name: body.last_name,

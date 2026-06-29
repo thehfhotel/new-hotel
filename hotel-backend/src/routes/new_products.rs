@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
 
-use super::mode::AppState;
+use super::mode::{AppState, Branch};
 use crate::error::{ApiError, ApiResult};
 use crate::models::Pagination;
 use crate::outbox::intent::WritebackIntent;
@@ -75,6 +75,8 @@ pub struct ListProductsQuery {
     pub active_only: Option<bool>,
     /// Free-text contains-search against `prod_name`.
     pub search: Option<String>,
+    /// Branch selector: 'hfhotel' | 'hfville' | 'all'. Resolves the per-site pool.
+    pub branch: Option<Branch>,
 }
 
 fn default_page() -> i32 {
@@ -163,6 +165,20 @@ fn default_true() -> bool {
     true
 }
 
+/// Branch selector for product handlers without a list query. `branchFetch`
+/// appends `?branch=`; absent ⇒ HF Hotel.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProductBranchQuery {
+    pub branch: Option<Branch>,
+}
+
+/// Resolve the per-site canonical pool via the unified write chokepoint
+/// (`Branch::Hfville` → hotelville, else the primary pool).
+fn resolve_pool(state: &AppState, branch: Option<Branch>) -> ApiResult<&crate::db::PgPool> {
+    state.write_pool(branch)
+}
+
 // ============================================================================
 // Handlers
 // ============================================================================
@@ -172,7 +188,9 @@ pub async fn list_products(
     State(state): State<AppState>,
     Query(params): Query<ListProductsQuery>,
 ) -> ApiResult<Json<ListProductsResponse>> {
-    let pool = &state.new_pool;
+    // Branch-aware READ: a `?branch=hfville` product list must read hotelville,
+    // not silently return HF Hotel's catalog.
+    let pool = resolve_pool(&state, params.branch)?;
     let offset = (params.page.max(1) - 1) * params.limit.max(1);
 
     // Build WHERE — dynamic, parameterized via `bind` so we avoid the
@@ -238,6 +256,7 @@ pub async fn list_products(
 pub async fn get_product(
     State(state): State<AppState>,
     Path(prod_id): Path<i64>,
+    Query(q): Query<ProductBranchQuery>,
 ) -> ApiResult<Json<ProductResponse>> {
     let row = sqlx::query(
         "SELECT prod_id, prod_legacy_no, prod_name, prod_unit, \
@@ -248,7 +267,7 @@ pub async fn get_product(
            FROM ht_products WHERE prod_id = $1",
     )
     .bind(prod_id)
-    .fetch_optional(&state.new_pool)
+    .fetch_optional(resolve_pool(&state, q.branch)?)
     .await?
     .ok_or_else(|| ApiError::NotFound("Product not found".into()))?;
 
@@ -273,6 +292,8 @@ pub async fn get_product(
 /// `sync/mappers/products.rs` poll once created in iHOTEL.
 pub async fn create_product(
     State(state): State<AppState>,
+    // Branch selector: must precede the `Json` body extractor.
+    Query(q): Query<ProductBranchQuery>,
     Json(body): Json<CreateProductRequest>,
 ) -> ApiResult<Json<ProductResponse>> {
     let legacy_no = body.legacy_no.trim();
@@ -290,7 +311,7 @@ pub async fn create_product(
         return Err(ApiError::BadRequest("Opening stock must be a finite number".into()));
     }
 
-    let pool = &state.new_pool;
+    let pool = resolve_pool(&state, q.branch)?;
 
     let existing = sqlx::query("SELECT 1 FROM ht_products WHERE prod_legacy_no = $1")
         .bind(legacy_no)
@@ -338,6 +359,7 @@ pub async fn create_product(
 pub async fn update_product(
     State(state): State<AppState>,
     Path(prod_id): Path<i64>,
+    Query(q): Query<ProductBranchQuery>,
     Json(body): Json<UpdateProductRequest>,
 ) -> ApiResult<Json<ProductResponse>> {
     let name = body.name.trim();
@@ -369,7 +391,7 @@ pub async fn update_product(
     .bind(body.price)
     .bind(body.category.as_deref())
     .bind(body.active)
-    .fetch_optional(&state.new_pool)
+    .fetch_optional(resolve_pool(&state, q.branch)?)
     .await?
     .ok_or_else(|| ApiError::NotFound("Product not found".into()))?;
 
@@ -383,6 +405,7 @@ pub async fn update_product(
 pub async fn adjust_stock(
     State(state): State<AppState>,
     Path(prod_id): Path<i64>,
+    Query(q): Query<ProductBranchQuery>,
     Json(body): Json<StockAdjustRequest>,
 ) -> ApiResult<Json<StockAdjustResponse>> {
     if body.delta == 0.0 {
@@ -396,7 +419,7 @@ pub async fn adjust_stock(
         ));
     }
 
-    let pool = &state.new_pool;
+    let pool = resolve_pool(&state, q.branch)?;
     let mut tx = pool.begin().await?;
 
     // 1. Apply the additive update + read back the new state.

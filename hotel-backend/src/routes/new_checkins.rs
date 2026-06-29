@@ -520,8 +520,13 @@ async fn folio_breakdown(state: &AppState, pool: &PgPool, cin_id: i32) -> ApiRes
 pub async fn checkout_quote(
     State(state): State<AppState>,
     Path(cin_id): Path<i32>,
+    Query(query): Query<BranchQuery>,
 ) -> ApiResult<Json<CheckoutQuote>> {
-    Ok(Json(folio_breakdown(&state, &state.new_pool, cin_id).await?))
+    // Branch-aware READ: `cin_id` is a per-DB SERIAL, so a `?branch=hfville`
+    // quote MUST read the Ville pool — otherwise the same id resolves to a
+    // different HF Hotel folio and the displayed balance is a wrong-guest read.
+    let pool = checkin_pool_for(&state, query.branch)?;
+    Ok(Json(folio_breakdown(&state, pool, cin_id).await?))
 }
 
 /// PUT /api/new/checkins/:id/checkout - Process check-out
@@ -1511,6 +1516,9 @@ pub async fn create_pos_sale(
     // body extractor (which consumes the request).
     actor: Option<Extension<User>>,
     Path(cin_id): Path<i32>,
+    // Branch selector: must precede the `Json` body extractor (which consumes
+    // the request). `branchFetch` already appends `?branch=`.
+    Query(query): Query<BranchQuery>,
     Json(body): Json<PosSaleRequest>,
 ) -> ApiResult<Json<PosSaleResponse>> {
     // Prefer the authenticated cashier's username over the body-supplied
@@ -1522,8 +1530,13 @@ pub async fn create_pos_sale(
         .or_else(|| body.sold_by.clone())
         .unwrap_or_default();
     let command = build_pos_sale_command(cin_id, &body, sold_by);
-    let outcome = state
-        .pos_service
+    // Branch-aware WRITE: resolve the per-site PosService so a Ville charge
+    // (canonical INSERT + stock decrement + outbox enqueue) lands in the
+    // hotelville pool and mirrors to Ville's legacy product table — never the
+    // HF Hotel folio. HF Hotel / `All` returns the pre-wired Arc unchanged.
+    let ws = state.resolve_write_services(query.branch)?;
+    let outcome = ws
+        .pos
         .record_sale(command)
         .await
         .map_err(map_pos_sale_error)?;
@@ -1538,8 +1551,12 @@ pub async fn create_pos_sale(
 pub async fn list_pos_sales(
     State(state): State<AppState>,
     Path(cin_id): Path<i32>,
+    Query(query): Query<BranchQuery>,
 ) -> ApiResult<Json<PosSalesListResponse>> {
-    if !state.checkins.exists(&state.new_pool, cin_id).await? {
+    // Branch-aware READ: per-DB SERIAL `cin_id` — a Ville folio's running tab
+    // must read the Ville pool, not silently return HF Hotel rows.
+    let pool = checkin_pool_for(&state, query.branch)?;
+    if !state.checkins.exists(pool, cin_id).await? {
         return Err(ApiError::NotFound(format!("check-in {cin_id} not found")));
     }
     let rows = sqlx::query(
@@ -1555,7 +1572,7 @@ pub async fn list_pos_sales(
        ORDER BY s.sale_sold_at DESC, s.sale_id DESC",
     )
     .bind(cin_id)
-    .fetch_all(&state.new_pool)
+    .fetch_all(pool)
     .await?;
 
     let entries: Vec<PosSaleEntry> = rows
@@ -1742,12 +1759,18 @@ pub struct GuestMutationResponse {
 pub async fn list_guests(
     State(state): State<AppState>,
     Path(cin_id): Path<i32>,
+    Query(query): Query<BranchQuery>,
 ) -> ApiResult<Json<GuestsResponse>> {
-    if !state.checkins.exists(&state.new_pool, cin_id).await? {
+    // Branch-aware READ: per-DB SERIAL `cin_id`. Without this a `?branch=hfville`
+    // request reads the HF Hotel pool and either 404s or leaks a different
+    // HF Hotel check-in's guest PII under a Ville folio (companion guests feed
+    // RR.4). Mirror the already-branch-aware create_guest/delete_guest siblings.
+    let pool = checkin_pool_for(&state, query.branch)?;
+    if !state.checkins.exists(pool, cin_id).await? {
         return Err(ApiError::NotFound("Check-in not found".to_string()));
     }
 
-    let rows = state.checkins.list_guests(&state.new_pool, cin_id).await?;
+    let rows = state.checkins.list_guests(pool, cin_id).await?;
     let guests: Vec<Guest> = rows.into_iter().map(Guest::from_row).collect();
     let total = guests.len() as i32;
 

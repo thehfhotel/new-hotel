@@ -18,7 +18,7 @@ use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
-use super::mode::AppState;
+use super::mode::{AppState, Branch};
 use crate::error::{ApiError, ApiResult};
 use crate::models::Pagination;
 
@@ -85,10 +85,26 @@ pub struct RequestsQuery {
     pub page: i32,
     #[serde(default = "default_limit")]
     pub limit: i32,
+    /// Branch selector: 'hfhotel' | 'hfville' | 'all'. Resolves the per-site pool.
+    pub branch: Option<Branch>,
 }
 
 fn default_page() -> i32 { 1 }
 fn default_limit() -> i32 { 50 }
+
+/// Branch selector for maintenance handlers without a list query. `branchFetch`
+/// appends `?branch=`; absent ⇒ HF Hotel.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchQuery {
+    pub branch: Option<Branch>,
+}
+
+/// Resolve the per-site canonical pool via the unified write chokepoint
+/// (`Branch::Hfville` → hotelville, else the primary pool).
+fn resolve_pool(state: &AppState, branch: Option<Branch>) -> ApiResult<&crate::db::PgPool> {
+    state.write_pool(branch)
+}
 
 /// Response for requests list
 #[derive(Debug, Serialize)]
@@ -158,8 +174,9 @@ pub struct MutationResponse {
 /// GET /api/new/maintenance/categories - List all categories
 pub async fn list_categories(
     State(state): State<AppState>,
+    Query(query): Query<BranchQuery>,
 ) -> ApiResult<Json<CategoriesResponse>> {
-    let pool = &state.new_pool;
+    let pool = resolve_pool(&state, query.branch)?;
 
     let rows = sqlx::query(
             r#"
@@ -206,7 +223,7 @@ pub async fn list_requests(
     State(state): State<AppState>,
     Query(params): Query<RequestsQuery>,
 ) -> ApiResult<Json<RequestsResponse>> {
-    let pool = &state.new_pool;
+    let pool = resolve_pool(&state, params.branch)?;
 
     let offset = (params.page - 1) * params.limit;
 
@@ -333,6 +350,7 @@ pub async fn list_requests(
 /// POST /api/new/maintenance/requests - Create a new maintenance request
 pub async fn create_request(
     State(state): State<AppState>,
+    Query(query): Query<BranchQuery>,
     Json(body): Json<CreateRequestInput>,
 ) -> ApiResult<Json<MutationResponse>> {
     let title = body.title.trim();
@@ -340,7 +358,7 @@ pub async fn create_request(
         return Err(ApiError::BadRequest("Title is required".to_string()));
     }
 
-    let pool = &state.new_pool;
+    let pool = resolve_pool(&state, query.branch)?;
 
     // Generate request number: MR-YYMM-NNNN
     let seq_rows = sqlx::query("SELECT nextval('sq_maintenance_no')::int AS seq_num")
@@ -399,8 +417,9 @@ pub async fn create_request(
 pub async fn get_request(
     State(state): State<AppState>,
     Path(request_id): Path<i32>,
+    Query(query): Query<BranchQuery>,
 ) -> ApiResult<Json<RequestResponse>> {
-    let pool = &state.new_pool;
+    let pool = resolve_pool(&state, query.branch)?;
 
     let rows = sqlx::query(
             r#"
@@ -466,9 +485,10 @@ pub async fn get_request(
 pub async fn update_request(
     State(state): State<AppState>,
     Path(request_id): Path<i32>,
+    Query(query): Query<BranchQuery>,
     Json(body): Json<UpdateRequestInput>,
 ) -> ApiResult<Json<MutationResponse>> {
-    let pool = &state.new_pool;
+    let pool = resolve_pool(&state, query.branch)?;
 
     // Build dynamic UPDATE query with parameterized placeholders. Each text/
     // numeric column that takes a user-supplied value reserves the next `$N`
@@ -562,6 +582,7 @@ pub async fn update_request(
 pub async fn update_request_status(
     State(state): State<AppState>,
     Path(request_id): Path<i32>,
+    Query(query): Query<BranchQuery>,
     Json(body): Json<StatusUpdateInput>,
 ) -> ApiResult<Json<MutationResponse>> {
     let status = body.status.trim().to_lowercase();
@@ -576,7 +597,7 @@ pub async fn update_request_status(
         )));
     }
 
-    let pool = &state.new_pool;
+    let pool = resolve_pool(&state, query.branch)?;
 
     // Build update query with automatic timestamp handling
     let update_query = match status.as_str() {

@@ -94,15 +94,11 @@ is_allowlisted() {
         new_inventory::check_room_inventory) return 0 ;;
         new_inventory::replenish_room_inventory) return 0 ;;
         new_inventory::create_stock_adjustment) return 0 ;;
-        # (A) Product master is HF-Hotel canonical — no Ville exposure.
-        new_products::create_product) return 0 ;;
-        new_products::update_product) return 0 ;;
-        new_products::adjust_stock) return 0 ;;
-        # (A) Maintenance requests are an HF-Hotel canonical feature — no Ville
-        # variant.
-        new_maintenance::create_request) return 0 ;;
-        new_maintenance::update_request) return 0 ;;
-        new_maintenance::update_request_status) return 0 ;;
+        # (Product master + maintenance-request writers were (A) entries here.
+        # They are now branch-aware — routed through `resolve_pool` →
+        # `state.write_pool(branch)` (the Ville pool when `?branch=hfville`) — so
+        # they pass this gate on their own merits and were removed from the
+        # allowlist, pre-flip hardening for HFVILLE_WRITES_ENABLED.)
         # (C) Internal reception-verification feedback — NOT a coexistence write.
         # Stored in the primary DB regardless of branch (the branch is recorded as
         # `vr_site` data, not a routing key) so reception can submit from ANY branch

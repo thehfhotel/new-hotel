@@ -643,8 +643,9 @@ fn build_new_routes(app_state: AppState) -> Router {
         // Track J6 — open/close a cashier round (mirrored to iHOTEL's
         // HT_Round_Bill via the writeback worker). Mounted unconditionally;
         // the `ShiftService.round_writeback` flag (from ROUND_WRITEBACK_ENABLED)
-        // gates behaviour — both reject with 409 when off, so iHOTEL stays the
-        // sole round-opener until an operator flips the flag. `branch=hfville`
+        // gates behaviour — both reject when off (ServiceError::Conflict → HTTP
+        // 400, see error.rs), so iHOTEL stays the sole round-opener until an
+        // operator flips the flag. `branch=hfville`
         // open/close is additionally blocked by the Ship-A ville_write_guard
         // until HF Ville gets its own write bundle (Ship B).
         .route("/api/shifts/open", post(routes::new_shifts::open_shift))

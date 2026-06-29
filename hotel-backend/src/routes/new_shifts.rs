@@ -162,12 +162,19 @@ pub async fn open_shift(
     // this is `Option<_>` (absent → `None`) and the body `openedBy` remains the
     // fallback; the service still rejects a blank result with a 400.
     actor: Option<Extension<User>>,
+    // Branch selector: must precede the `Json` body extractor. The Ville bundle
+    // binds its ShiftService to site_id='hfville', so a Ville round allocates
+    // shift_no/legacy_round_id and runs the open-round mutual-exclusion check
+    // scoped to 'hfville' (not HF Hotel's series). HF Hotel returns the
+    // pre-wired Arc unchanged.
+    Query(query): Query<CurrentShiftQuery>,
     Json(body): Json<OpenShiftRequest>,
 ) -> ApiResult<(StatusCode, Json<OpenShiftResponse>)> {
     let opened_by = super::resolve_actor(actor.as_deref(), Some(&body.opened_by))
         .unwrap_or(body.opened_by);
-    let outcome = state
-        .shifts_service
+    let ws = state.resolve_write_services(query.branch)?;
+    let outcome = ws
+        .shifts
         .open_shift(OpenShiftCommand {
             opened_by,
             opening_float: body.opening_float,
@@ -193,12 +200,16 @@ pub async fn close_shift(
     State(state): State<AppState>,
     // Task #40: prefer the authenticated cashier over the body `closedBy`.
     actor: Option<Extension<User>>,
+    // Branch selector (must precede `Json`). Closes the open round on the
+    // resolved per-site ShiftService — Ville closes Ville's round, not HF Hotel's.
+    Query(query): Query<CurrentShiftQuery>,
     Json(body): Json<CloseShiftRequest>,
 ) -> ApiResult<Json<CloseShiftResponse>> {
     let closed_by = super::resolve_actor(actor.as_deref(), Some(&body.closed_by))
         .unwrap_or(body.closed_by);
-    let summary = state
-        .shifts_service
+    let ws = state.resolve_write_services(query.branch)?;
+    let summary = ws
+        .shifts
         .close_shift(CloseShiftCommand {
             closed_by,
             notes: body.notes,
