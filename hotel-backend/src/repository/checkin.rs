@@ -476,7 +476,7 @@ impl CheckInRepository for PgCheckInRepository {
             ci.cin_id,
             ci.cin_no,
             ci.cin_book_id,
-            b.book_no,
+            COALESCE(b.book_no, '') AS book_no,
             ci.cin_cust_id,
             CONCAT(c.cust_firstname, ' ', COALESCE(c.cust_lastname, '')) as customer_name,
             ci.cin_room_id,

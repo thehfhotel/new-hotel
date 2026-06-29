@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            ci.cin_id,\n            ci.cin_no,\n            ci.cin_book_id,\n            b.book_no,\n            ci.cin_cust_id,\n            CONCAT(c.cust_firstname, ' ', COALESCE(c.cust_lastname, '')) as customer_name,\n            ci.cin_room_id,\n            r.room_no,\n            rt.type_name,\n            ci.cin_checkin_time,\n            ci.cin_checkout_time,\n            ci.cin_expected_checkout,\n            ci.cin_adults,\n            ci.cin_children,\n            ci.cin_status,\n            ci.cin_rate_per_night::float8 as cin_rate_per_night,\n            ci.cin_total_amount::float8 as cin_total_amount,\n            ci.cin_payment_status,\n            ci.cin_notes,\n            ci.created_at,\n            ci.updated_at\n        FROM ht_checkins ci\n        LEFT JOIN ht_customers c ON ci.cin_cust_id = c.cust_id\n        LEFT JOIN ht_rooms_new r ON ci.cin_room_id = r.room_id\n        LEFT JOIN ht_room_types rt ON r.room_type_id = rt.type_id\n        LEFT JOIN ht_bookings b ON ci.cin_book_id = b.book_id\n        WHERE ci.cin_id = $1\n        ",
+  "query": "\n        SELECT\n            ci.cin_id,\n            ci.cin_no,\n            ci.cin_book_id,\n            COALESCE(b.book_no, '') AS book_no,\n            ci.cin_cust_id,\n            CONCAT(c.cust_firstname, ' ', COALESCE(c.cust_lastname, '')) as customer_name,\n            ci.cin_room_id,\n            r.room_no,\n            rt.type_name,\n            ci.cin_checkin_time,\n            ci.cin_checkout_time,\n            ci.cin_expected_checkout,\n            ci.cin_adults,\n            ci.cin_children,\n            ci.cin_status,\n            ci.cin_rate_per_night::float8 as cin_rate_per_night,\n            ci.cin_total_amount::float8 as cin_total_amount,\n            ci.cin_payment_status,\n            ci.cin_notes,\n            ci.created_at,\n            ci.updated_at\n        FROM ht_checkins ci\n        LEFT JOIN ht_customers c ON ci.cin_cust_id = c.cust_id\n        LEFT JOIN ht_rooms_new r ON ci.cin_room_id = r.room_id\n        LEFT JOIN ht_room_types rt ON r.room_type_id = rt.type_id\n        LEFT JOIN ht_bookings b ON ci.cin_book_id = b.book_id\n        WHERE ci.cin_id = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -138,5 +138,5 @@
       true
     ]
   },
-  "hash": "7c8d2cd049ed34754026ead4f1ba6c9b1ba8ab86f797a97fef8e58b026c0e232"
+  "hash": "3642a6e581f97051fed87e5e8aa0684ac4c4c6d3a8cbc092e65b18072c912392"
 }
