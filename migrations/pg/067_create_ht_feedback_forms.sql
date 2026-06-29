@@ -68,6 +68,12 @@ COMMENT ON TABLE ht_feedback_forms IS
 -- Seed the two per-site re-verification forms (idempotent). These mirror the
 -- questions the hardcoded /v2/verification/reverify page used to carry; editing
 -- them from here on is just an UPDATE to form_schema.
+--
+-- NB: this migration is immutable history — its wording has since been refined.
+-- The CURRENT, version-controlled form content lives in
+-- scripts/seed-feedback-forms.sql (and mirrored in init-db/init-hotelnew.sql).
+-- That seed UPSERTs over whatever this block created, so live content can drift
+-- ahead of this snapshot without a new migration. Edit the seed, not this file.
 INSERT INTO ht_feedback_forms (form_key, form_site, form_kind, form_title, form_intro, form_schema, form_sort)
 VALUES
 (
