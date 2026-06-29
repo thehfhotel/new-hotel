@@ -113,7 +113,11 @@ function Stat({ label, value, divider }: { label: string; value: number; divider
 }
 
 export default function RoundReport({ data }: { data: RoundReportData }) {
-  const { shift, income, deposits, occupancy, grandTotal, sales, expectedCash, countedCash, cashVariance } = data
+  const { shift, income, deposits, occupancy, sales, expectedCash, countedCash, cashVariance } = data
+  // Income total = sum of the tender rows ONLY (NOT the backend `grandTotal`, which
+  // folds in the opening float — that belongs in กระทบยอดเงินสด below, not here).
+  // This matches iHOTEL's รวมเงินรับ.
+  const incomeTotal = income.cashNet + income.credit + income.transfer + income.web + income.free
   // Variance tone: balanced → ok (green); short (negative) → occ (wine);
   // over (positive) → arr (amber).
   const tone = cashVariance == null ? null : cashVariance === 0 ? 'ok' : cashVariance < 0 ? 'occ' : 'arr'
@@ -167,7 +171,7 @@ export default function RoundReport({ data }: { data: RoundReportData }) {
           <Row label="บัตรเครดิต" value={income.credit} />
           {income.web !== 0 && <Row label="ออนไลน์" value={income.web} />}
           {income.free !== 0 && <Row label="ส่วนลด / ฟรี" value={income.free} />}
-          <Row label="รวมทั้งหมด" value={grandTotal} strong />
+          <Row label="รวมเงินรับ" value={incomeTotal} strong />
         </div>
         <div className="text-[11.5px] mt-1.5 v2-num" style={{ color: 'var(--v2-ink-3)' }}>
           {income.paymentCount} ใบเสร็จ · {income.lineCount} รายการ
