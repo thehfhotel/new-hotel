@@ -56,13 +56,13 @@ function formatCurrency(amount: number): string {
   }).format(amount)
 }
 
-/** "29/06/2026 21:08" — Gregorian DD/MM/YYYY HH:MM, stored value as-is. */
-function formatDateTime(dateStr?: string): string {
+/** "29/06/2026" — Gregorian DD/MM/YYYY (no time), stored value as-is. */
+function formatDate(dateStr?: string): string {
   if (!dateStr) return ''
   const d = new Date(dateStr)
   if (Number.isNaN(d.getTime())) return ''
   const p = (n: number) => String(n).padStart(2, '0')
-  return `${p(d.getDate())}/${p(d.getMonth() + 1)}/${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`
+  return `${p(d.getDate())}/${p(d.getMonth() + 1)}/${d.getFullYear()}`
 }
 
 /** A labelled fill-in field: value sits on a ruled line; Thai over English. */
@@ -229,8 +229,8 @@ export default function RegistrationSlipTemplate({
           </thead>
           <tbody>
             <tr className="text-center">
-              <td className="border border-gray-600 px-2 py-1">{formatDateTime(data.checkInDate)}</td>
-              <td className="border border-gray-600 px-2 py-1">{formatDateTime(data.checkOutDate)}</td>
+              <td className="border border-gray-600 px-2 py-1">{formatDate(data.checkInDate)}</td>
+              <td className="border border-gray-600 px-2 py-1">{formatDate(data.checkOutDate)}</td>
               <td className="border border-gray-600 px-2 py-1">{data.roomNumber}</td>
               <td className="border border-gray-600 px-2 py-1 text-right">{formatCurrency(rate)}</td>
               <td className="border border-gray-600 px-2 py-1 text-right">{formatCurrency(other)}</td>
