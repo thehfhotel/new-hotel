@@ -446,8 +446,13 @@ impl CheckInRepository for PgCheckInRepository {
                 cin_checkin_time: row.try_get::<NaiveDateTime, _>("cin_checkin_time").ok(),
                 cin_checkout_time: row.try_get::<NaiveDateTime, _>("cin_checkout_time").ok(),
                 cin_expected_checkout: row
-                    .try_get::<NaiveDateTime, _>("cin_expected_checkout")
-                    .ok(),
+                    // `cin_expected_checkout` is a DATE column — decoding it as
+                    // NaiveDateTime always failed, so `.ok()` silently yielded
+                    // None and the UI showed a blank checkout date. Decode as
+                    // NaiveDate and widen to midnight.
+                    .try_get::<chrono::NaiveDate, _>("cin_expected_checkout")
+                    .ok()
+                    .and_then(|d| d.and_hms_opt(0, 0, 0)),
                 cin_adults: row.try_get::<i32, _>("cin_adults").ok(),
                 cin_children: row.try_get::<i32, _>("cin_children").ok(),
                 cin_status: row

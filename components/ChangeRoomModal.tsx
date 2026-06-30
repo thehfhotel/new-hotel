@@ -43,7 +43,7 @@ interface ActiveCheckIn {
   id: number
   cinNo: string
   customerName?: string | null
-  checkinTime?: string | null
+  checkInTime?: string | null
   expectedCheckout?: string | null
 }
 
@@ -304,7 +304,7 @@ export default function ChangeRoomModal({
                 </div>
                 <div className="flex justify-between">
                   <span className="text-gray-600">วันเข้าพัก:</span>
-                  <span>{formatThaiDate(activeCheckin.checkinTime)}</span>
+                  <span>{formatThaiDate(activeCheckin.checkInTime)}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-gray-600">วันที่จะออก:</span>
