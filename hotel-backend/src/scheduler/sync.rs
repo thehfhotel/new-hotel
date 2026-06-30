@@ -51,6 +51,14 @@ use std::time::Instant;
 use tiberius::Query;
 
 use crate::db::{DbPool, PgPool};
+// Issue #204 (bug #2): the durable self-healing arm of the auto-resolve
+// sweep re-drives the EXISTING CT upsert path, so it reaches for the same
+// mappers / row-abstraction / op-enum the watcher uses rather than writing
+// canonical fields by hand.
+use crate::sync::change_op::ChangeOp;
+use crate::sync::mapper::MssqlChangeMapper;
+use crate::sync::mappers::{CustomerMapper, RoomMasterMapper};
+use crate::sync::row::MappableRow;
 use crate::notifications::slack::{SlackClient, SlackMessage};
 
 /// Default per-table drift-count threshold above which a Slack alert is
@@ -1904,6 +1912,130 @@ async fn fetch_legacy_room_hash(
     )))
 }
 
+/// Issue #204 (bug #2) — is the durable self-healing arm of the
+/// auto-resolve sweep enabled?
+///
+/// Default **OFF** (ship dark). When unset / not `"true"`, the sweep stays
+/// observational-only and performs ZERO canonical writes — behaviour is
+/// byte-for-byte identical to its pre-#204 form. Flip to `"true"` only after
+/// reception-coordinated verification (see MEMORY: flag flips are never "just
+/// config").
+fn reconcile_force_converge_enabled() -> bool {
+    env::var("RECONCILE_FORCE_CONVERGE_ENABLED")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+/// Issue #204 (bug #2) — minimum age (seconds) an unresolved
+/// `ht_reconcile_log` row must have before the force-converge arm will touch
+/// it. A younger row is likely just waiting on an in-flight CT event, so we
+/// leave it for the normal converge-on-its-own path. 3600s ≈ 4 sweep ticks
+/// at the default 15-min cadence, i.e. only rows that have resisted several
+/// observational sweeps qualify ("seen across 2+ sweeps").
+const FORCE_CONVERGE_MIN_AGE_SECS: f64 = 3600.0;
+
+/// Issue #204 (bug #2) — re-fetch a single `HT_Customers` base row by its
+/// business key (`Cust_no`, which is what the reconcile loop stores as
+/// `ht_reconcile_log.legacy_pk` for customers). The projection is the full
+/// CT eager-fetch column set so the returned `tiberius::Row` carries every
+/// column `CustomerMapper`'s `project` / `apply_upsert` reads. `Ok(None)`
+/// when the legacy row no longer exists.
+async fn fetch_legacy_customer_base_row(
+    legacy_pool: &DbPool,
+    cust_no: &str,
+) -> Result<Option<tiberius::Row>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut conn = legacy_pool.get().await?;
+    let sql = format!(
+        "SELECT {projection} FROM HT_Customers WHERE Cust_no = @P1",
+        projection = crate::sync::mappers::customer::EAGER_FETCH_COLUMNS.join(", "),
+    );
+    let mut q = Query::new(sql);
+    q.bind(cust_no);
+    let rows = q.query(&mut conn).await?.into_first_result().await?;
+    Ok(rows.into_iter().next())
+}
+
+/// Issue #204 (bug #2) — re-fetch a single `HT_Rooms` base row by `Room_no`
+/// (the reconcile loop's `legacy_pk` for rooms). The column set mirrors
+/// `room.rs`'s `ROOMS_SELECT_COLS` minus the CT-JOIN `t.` alias and MUST
+/// cover every field `RoomMasterMapper::project_room` reads — `id` is the CT
+/// PK but is also a real `HT_Rooms` column, re-projected here. `Ok(None)`
+/// when the legacy row no longer exists.
+async fn fetch_legacy_room_base_row(
+    legacy_pool: &DbPool,
+    room_no: &str,
+) -> Result<Option<tiberius::Row>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut conn = legacy_pool.get().await?;
+    let sql = "SELECT id, Room_no, Room_Type, Room_Clean, Room_Use, \
+               Room_Manternace, Room_Details, Room_Use_Count, Room_X, Room_Y, \
+               Room_Group, Room_Power_OPEN, Room_Power_CLOSE, Room_Power_STATUS, \
+               Room_Polity FROM HT_Rooms WHERE Room_no = @P1"
+        .to_string();
+    let mut q = Query::new(sql);
+    q.bind(room_no);
+    let rows = q.query(&mut conn).await?.into_first_result().await?;
+    Ok(rows.into_iter().next())
+}
+
+/// Issue #204 (bug #2) — durable self-heal for a single `customers` / `rooms`
+/// reconcile row that has resisted observational convergence.
+///
+/// Re-fetches the CURRENT legacy base row by its PK and re-projects it
+/// through the EXISTING CT upsert path — the very same `mapper.apply(...)`
+/// the watcher uses — INSIDE a fresh PG transaction. Canonical fields are
+/// therefore written by the mapper, never by hand here. The mapper's I/U
+/// branch is an UPSERT that updates the existing canonical row in place
+/// (verified: `customer::apply_upsert` / `room::apply_room_upsert`), and its
+/// own idempotency guard collapses a no-op to no write — so this is safe to
+/// re-drive.
+///
+/// The returned `DomainEvent` is intentionally DROPPED: the value we just
+/// wrote came FROM legacy, so there is nothing to write back — emitting an
+/// outbox event would only produce a converging no-op echo against MSSQL.
+/// The sweep is a silent backstop; a genuine subsequent CT edit re-emits the
+/// normal `CustomerModified` / room event.
+///
+/// Returns `Ok(true)` when a re-projection was attempted and committed,
+/// `Ok(false)` when the legacy row no longer exists (or the table is outside
+/// the supported set) so there is nothing to project from.
+async fn force_converge_reconcile_row(
+    legacy_pool: &DbPool,
+    pg_pool: &PgPool,
+    table_name: &str,
+    legacy_pk: &str,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    match table_name {
+        "customers" => {
+            let Some(row) = fetch_legacy_customer_base_row(legacy_pool, legacy_pk).await? else {
+                return Ok(false);
+            };
+            let mut tx = pg_pool.begin().await?;
+            // `ChangeOp::Update`: the canonical row already exists (this is a
+            // value drift, not a miss). apply runs the full UPSERT + the
+            // mapper's idempotency check.
+            let _evt = CustomerMapper
+                .apply(&mut tx, ChangeOp::Update, Some(&row as &dyn MappableRow))
+                .await?;
+            tx.commit().await?;
+            Ok(true)
+        }
+        "rooms" => {
+            let Some(row) = fetch_legacy_room_base_row(legacy_pool, legacy_pk).await? else {
+                return Ok(false);
+            };
+            let mut tx = pg_pool.begin().await?;
+            let _evt = RoomMasterMapper
+                .apply(&mut tx, ChangeOp::Update, Some(&row as &dyn MappableRow))
+                .await?;
+            tx.commit().await?;
+            Ok(true)
+        }
+        // bookings / checkins are multi-row aggregates whose self-heal is out
+        // of scope for #204 — leave them to the normal paths / operator review.
+        _ => Ok(false),
+    }
+}
+
 /// Track D / T7 follow-up — auto-resolve sweep. Walks unresolved
 /// `ht_reconcile_log` rows whose `divergence_kind` was classified by
 /// the post-migration-032 reconcile loop, re-projects BOTH the legacy
@@ -1922,13 +2054,27 @@ async fn fetch_legacy_room_hash(
 /// Bounded to 500 rows per tick so a backlog can't stall the
 /// reconcile loop. Best-effort per row — a single MSSQL or PG
 /// failure logs and continues to the next.
+///
+/// **Issue #204 (bug #2) — durable self-healing arm (ship dark).** By
+/// default this sweep is observational-only: it resolves a row ONLY when
+/// legacy and canonical ALREADY agree, so a durable value drift that will
+/// never get a CT event (migration-born, or a hand-edit) is observed
+/// forever but never repaired. When `RECONCILE_FORCE_CONVERGE_ENABLED` is
+/// `"true"`, a long-lived `customers` / `rooms` value-drift row is repaired
+/// by re-projecting the CURRENT legacy row through the EXISTING CT upsert
+/// path (`force_converge_reconcile_row`) before the convergence re-test.
+/// With the flag OFF the behaviour is identical to the pre-#204 sweep — no
+/// canonical writes.
 async fn auto_resolve_reconcile_log(
     legacy_pool: &DbPool,
     pg_pool: &PgPool,
     site_id: &str,
 ) -> Result<usize, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (i64, String, String, Option<String>)>(
-        "SELECT id, table_name, legacy_pk, mssql_hash \
+    // `age_secs` (issue #204 bug #2) gates the durable force-converge arm —
+    // only rows that have resisted convergence for a while qualify.
+    let rows = sqlx::query_as::<_, (i64, String, String, Option<String>, f64)>(
+        "SELECT id, table_name, legacy_pk, mssql_hash, \
+                EXTRACT(EPOCH FROM (NOW() - detected_at))::float8 AS age_secs \
            FROM ht_reconcile_log \
           WHERE resolved_at IS NULL \
             AND divergence_kind IS NOT NULL \
@@ -1937,8 +2083,12 @@ async fn auto_resolve_reconcile_log(
     .fetch_all(pg_pool)
     .await?;
 
+    // Read the #204 force-converge flag ONCE per sweep. Default OFF ⇒ the
+    // sweep stays observational-only and never writes canonical state.
+    let force_converge_enabled = reconcile_force_converge_enabled();
+
     let mut resolved = 0usize;
-    for (id, table_name, legacy_pk, recorded_mssql_hash) in rows {
+    for (id, table_name, legacy_pk, recorded_mssql_hash, age_secs) in rows {
         let current_legacy_hash =
             match compute_current_legacy_hash(legacy_pool, &table_name, &legacy_pk).await {
                 Ok(opt) => opt,
@@ -1977,24 +2127,138 @@ async fn auto_resolve_reconcile_log(
             current_pg_hash.as_deref(),
             recorded_mssql_hash.as_deref(),
         ) {
-            // Per-row visibility into stuck rows (prod debug 2026-05-18):
-            // operators need to see WHY each persistent reconcile_log
-            // row isn't converging — (a) legacy hash missing, (b)
-            // canonical hash missing, or (c) hashes computed but
-            // genuinely don't match. Kept at debug level so it doesn't
-            // flood at info; the same field-style as the converged-row
-            // debug! below for grep symmetry.
-            tracing::debug!(
-                site = %site_id,
-                id,
-                table_name = %table_name,
-                legacy_pk = %legacy_pk,
-                current_legacy_hash = ?current_legacy_hash,
-                current_pg_hash = ?current_pg_hash,
-                recorded_mssql_hash = ?recorded_mssql_hash,
-                "[Sync] Auto-resolve sweep: hashes did not converge, leaving row open"
-            );
-            continue;
+            // ---------------------------------------------------------------
+            // Issue #204 (bug #2) — durable self-healing arm.
+            //
+            // The convergence test above is observational-only: it resolves a
+            // row ONLY when legacy and canonical ALREADY agree. A value drift
+            // that will never receive a CT event (migration-born, or a
+            // hand-edit on one side) is therefore observed forever but never
+            // repaired. When the flag is ON and the row is a long-lived
+            // `customers` / `rooms` *value* drift (both sides present, just
+            // unequal), re-project the CURRENT legacy row through the EXISTING
+            // CT upsert path, then re-hash; if it now converges, fall through
+            // to mark it resolved.
+            //
+            // Conservative guards:
+            //   * flag OFF → branch never taken; the `else` below logs and
+            //     leaves the row open exactly as before — ZERO canonical writes.
+            //   * customers/rooms only — single-PK mappers whose apply is safe
+            //     to re-drive idempotently. bookings/checkins are multi-row
+            //     aggregates, out of scope for #204.
+            //   * row older than FORCE_CONVERGE_MIN_AGE_SECS so we don't race
+            //     an in-flight CT event for a fresh divergence.
+            //   * BOTH hashes present — a genuine value drift, not a
+            //     missing_pg / missing_mssql case (those stay open for the
+            //     normal paths / operator review).
+            let is_value_drift = current_legacy_hash.is_some() && current_pg_hash.is_some();
+            let eligible_table = table_name == "customers" || table_name == "rooms";
+            if force_converge_enabled
+                && eligible_table
+                && is_value_drift
+                && age_secs >= FORCE_CONVERGE_MIN_AGE_SECS
+            {
+                match force_converge_reconcile_row(legacy_pool, pg_pool, &table_name, &legacy_pk)
+                    .await
+                {
+                    Ok(true) => {
+                        // The mapper re-projected the current legacy row into
+                        // canonical. The legacy hash is unchanged (we projected
+                        // FROM it), so only the canonical hash can have moved —
+                        // re-fetch it and re-test convergence.
+                        let reprojected_pg_hash =
+                            match compute_current_pg_hash(pg_pool, &table_name, &legacy_pk).await {
+                                Ok(opt) => opt,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        site = %site_id,
+                                        id,
+                                        table_name = %table_name,
+                                        legacy_pk = %legacy_pk,
+                                        error = %e,
+                                        "[Sync] Force-converge (#204): re-hash of canonical \
+                                         failed after re-projection, leaving row open"
+                                    );
+                                    continue;
+                                }
+                            };
+                        if should_auto_resolve(
+                            &table_name,
+                            current_legacy_hash.as_deref(),
+                            reprojected_pg_hash.as_deref(),
+                            recorded_mssql_hash.as_deref(),
+                        ) {
+                            tracing::info!(
+                                site = %site_id,
+                                id,
+                                table_name = %table_name,
+                                legacy_pk = %legacy_pk,
+                                "[Sync] Force-converge (#204): re-projected current legacy \
+                                 row into canonical; hashes now converge — marking resolved"
+                            );
+                            // Fall through (no `continue`) to the resolved UPDATE.
+                        } else {
+                            tracing::warn!(
+                                site = %site_id,
+                                id,
+                                table_name = %table_name,
+                                legacy_pk = %legacy_pk,
+                                current_legacy_hash = ?current_legacy_hash,
+                                reprojected_pg_hash = ?reprojected_pg_hash,
+                                "[Sync] Force-converge (#204): canonical re-projected but \
+                                 hashes still diverge — leaving row open for operator review"
+                            );
+                            continue;
+                        }
+                    }
+                    Ok(false) => {
+                        // Legacy row no longer exists (or unsupported table) —
+                        // nothing to project from.
+                        tracing::debug!(
+                            site = %site_id,
+                            id,
+                            table_name = %table_name,
+                            legacy_pk = %legacy_pk,
+                            "[Sync] Force-converge (#204): skipped (legacy row absent), \
+                             leaving row open"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            site = %site_id,
+                            id,
+                            table_name = %table_name,
+                            legacy_pk = %legacy_pk,
+                            error = %e,
+                            "[Sync] Force-converge (#204): re-projection failed, leaving \
+                             row open"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                // Observational-only behaviour (also the flag-OFF path).
+                //
+                // Per-row visibility into stuck rows (prod debug 2026-05-18):
+                // operators need to see WHY each persistent reconcile_log
+                // row isn't converging — (a) legacy hash missing, (b)
+                // canonical hash missing, or (c) hashes computed but
+                // genuinely don't match. Kept at debug level so it doesn't
+                // flood at info; the same field-style as the converged-row
+                // debug! below for grep symmetry.
+                tracing::debug!(
+                    site = %site_id,
+                    id,
+                    table_name = %table_name,
+                    legacy_pk = %legacy_pk,
+                    current_legacy_hash = ?current_legacy_hash,
+                    current_pg_hash = ?current_pg_hash,
+                    recorded_mssql_hash = ?recorded_mssql_hash,
+                    "[Sync] Auto-resolve sweep: hashes did not converge, leaving row open"
+                );
+                continue;
+            }
         }
 
         let update = sqlx::query(
