@@ -32,8 +32,9 @@ export interface RegistrationSlipData {
   nights: number
   ratePerNight?: number
   totalAmount?: number
-  /** Amount prepaid (จ่ายล่วงหน้า). */
-  paidAmount?: number
+  /** Advance paid against the booking (จ่ายล่วงหน้า) — booking deposit, not the
+   *  total paid at check-in. Undefined/0 for walk-ins. */
+  bookingAdvance?: number
   /** Originating booking number (จากการจองเลขที่ …). */
   bookingNo?: string
   /** Room deposit collected (เงินมัดจำ), baht. 0 / undefined ⇒ none. */
@@ -273,15 +274,13 @@ export default function RegistrationSlipTemplate({
           </div>
         </div>
 
-        {/* Prepayment against a reservation. We don't track advance-from-booking
-            (cin_paid_amount is the total paid at check-in, NOT a reservation
-            advance), so the amount stays 0.00 — matching iHOTEL's default when
-            nothing was prepaid. The booking ref shows only when this stay came
-            from one (blank for walk-ins). */}
+        {/* Advance paid against the reservation (booking deposit), matching
+            iHOTEL. Booking ref + advance show when the stay came from a booking;
+            blank ref / 0.00 for walk-ins. */}
         <div className="mt-2">
           จ่ายล่วงหน้า จากการจองเลขที่{' '}
           <span className="font-medium">{data.bookingNo || '—'}</span> จำนวนเงิน{' '}
-          <span className="font-medium">0.00</span> บาท
+          <span className="font-medium">{formatCurrency(data.bookingAdvance ?? 0)}</span> บาท
         </div>
 
         {/* Signatures */}

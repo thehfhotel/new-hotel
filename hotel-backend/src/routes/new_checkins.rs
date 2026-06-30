@@ -1349,8 +1349,10 @@ pub struct RegistrationSlip {
     pub nights: i32,
     pub rate_per_night: Option<f64>,
     pub total_amount: Option<f64>,
-    /// Amount already paid / prepaid (จ่ายล่วงหน้า on the card).
-    pub paid_amount: Option<f64>,
+    /// Advance paid against the originating booking (จ่ายล่วงหน้า on the card) —
+    /// legacy HT_Book_H.Book_Price_Pay, mirrored to ht_bookings.book_deposit_amount.
+    /// Distinct from the total paid at check-in; absent for walk-ins.
+    pub booking_advance: Option<f64>,
     /// Originating booking number (จากการจองเลขที่ …), if this stay came from one.
     pub booking_no: Option<String>,
     pub deposit: Option<f64>,
@@ -1387,7 +1389,7 @@ pub async fn registration_slip(
             GREATEST(1, (ci.cin_expected_checkout - ci.cin_checkin_time::date))::int AS nights, \
             ci.cin_rate_per_night::float8 AS rate_per_night, \
             ci.cin_total_amount::float8 AS total_amount, \
-            ci.cin_paid_amount::float8 AS paid_amount, \
+            b.book_deposit_amount::float8 AS booking_advance, \
             NULLIF(b.book_no, '') AS booking_no, \
             (SELECT COALESCE(SUM(cr.cr_dep_amount), 0)::float8 \
                FROM ht_checkin_rooms cr WHERE cr.cr_cin_id = ci.cin_id) AS deposit, \
@@ -1423,7 +1425,7 @@ pub async fn registration_slip(
         nights: row.try_get("nights").unwrap_or(1),
         rate_per_night: row.try_get("rate_per_night").ok(),
         total_amount: row.try_get("total_amount").ok(),
-        paid_amount: row.try_get("paid_amount").ok(),
+        booking_advance: row.try_get("booking_advance").ok(),
         booking_no: row.try_get("booking_no").ok(),
         deposit: row.try_get("deposit").ok(),
         adults: row.try_get("adults").ok(),
