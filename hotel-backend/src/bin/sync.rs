@@ -303,34 +303,25 @@ const DEFAULT_CT_POLL_INTERVAL_MS: u64 = 1000;
 /// Override at runtime via `LEGACY_SYNC_RETENTION_CHECK_INTERVAL_SECS`.
 const DEFAULT_RETENTION_CHECK_INTERVAL_SECS: u64 = 300;
 
-/// MSSQL-pool-outage circuit breaker (v2.58.4). HF Ville's WG tunnel
-/// flaps for ~2 min every couple of days; when the legacy MSSQL is
+/// Mid-run pool-outage handling (v2.58.4). HF Ville's WG tunnel flaps
+/// for ~2 min every couple of days; when the legacy MSSQL is
 /// unreachable, every `mssql.get().await` blocks for the full
-/// `POOL_CONNECTION_TIMEOUT` (5s as of R2 / 2026-05-14, was 15s)
-/// and returns "Timed out in bb8". Without short-circuiting we walk
-/// the 16-table loop sequentially, each table's own `fetch_ct_rows`
-/// paying its own pool-timeout — the burst still lasts ~16× that
-/// budget and produces 16 identical WARNs. The breaker trips on the
-/// FIRST pool-timeout in a tick, abandons the rest of the tick, and
-/// sleeps a cooldown so the next tick gives the tunnel a chance to
-/// recover before retrying.
-///
-/// Override at runtime via `LEGACY_SYNC_OUTAGE_COOLDOWN_SECS`.
-const DEFAULT_OUTAGE_COOLDOWN_SECS: u64 = 30;
-
-/// Number of consecutive ticks that must trip the pool-outage breaker
-/// before the watcher pages an operator. A single tick failure is
-/// almost always a 1s WG keepalive miss + immediate recovery — paging
-/// on it would be pure noise. Two consecutive failed ticks (separated
-/// by the cooldown above ≈ 30s minimum) only happen when the tunnel
-/// has stayed dead for >30s, which is the operationally interesting
-/// case.
-///
-/// Override at runtime via `LEGACY_SYNC_OUTAGE_ALERT_THRESHOLD`.
-const DEFAULT_OUTAGE_ALERT_THRESHOLD: u32 = 2;
+/// `POOL_CONNECTION_TIMEOUT` and returns "Timed out in bb8". Without
+/// short-circuiting we'd walk the 16-table loop sequentially, each
+/// table's own `fetch_ct_rows` paying its own pool-timeout. The
+/// up-front `probe_legacy_connectivity` call in `run_one_tick` is the
+/// short-circuit: the FIRST pool-timeout abandons the rest of the tick
+/// (a WARN, not a page), and the next 1s tick re-probes and resumes the
+/// moment the tunnel returns. NOTE (2026-06-30): the former
+/// `LEGACY_SYNC_OUTAGE_COOLDOWN_SECS` / `LEGACY_SYNC_OUTAGE_ALERT_THRESHOLD`
+/// knobs were removed — their consecutive-tick *paging* path had been
+/// refactored out long ago, leaving the env vars parsed-but-dead and
+/// falsely implying a paging breaker. A sustained unreachable legacy is
+/// now paged solely by the watchdog's probe-outage escalation (see
+/// `DEFAULT_PROBE_OUTAGE_ESCALATION_SECS`).
 
 /// MSSQL-pool-init retry knobs (v2.63.0). Same root cause as the
-/// mid-run outage breaker above — HF Ville's WG tunnel can be down at
+/// mid-run pool-timeout short-circuit above — HF Ville's WG tunnel can be down at
 /// container startup, in which case the initial `create_pool` call
 /// returns a "Timed out in bb8" / TCP-refused error and the watcher
 /// historically exited with code 1. Docker's `restart: on-failure:5`
@@ -379,14 +370,21 @@ const DEFAULT_INIT_RETRY_ALERT_AFTER_SECS: u64 = 300;
 /// `LEGACY_SYNC_PROBE_TIMEOUT_MS`.
 const DEFAULT_WATCHDOG_CT_PROBE_TIMEOUT_MS: u64 = 30_000;
 
-/// 2026-06-26 — once a probe-timeout (`:information_source:`) alert has
+/// 2026-06-26 — once a probe-timeout (`:information_source:`) outage has
 /// been open this long WITHOUT self-recovering, it stops being the benign
 /// overnight-quiet pattern and becomes a real "we cannot reach legacy to
 /// confirm whether changes are backing up" signal. Escalate it to a
-/// `:rotating_light:` page (one-time per outage). Default 1h = 2× the
-/// alert cooldown, so a genuine outage escalates within two info-page
-/// cycles. Override via `LEGACY_SYNC_PROBE_OUTAGE_ESCALATION_SECS`.
-const DEFAULT_PROBE_OUTAGE_ESCALATION_SECS: u64 = 3600;
+/// `:rotating_light:` page (one-time per outage). This escalation is now
+/// the SOLE Slack signal for a sustained probe-unreachable condition
+/// (the benign informational note is Slack-suppressed as of 2026-06-30,
+/// and the never-wired pool-outage breaker knobs were removed the same
+/// day), so it carries the whole "self-healing failed" contract.
+/// 2026-06-30 — lowered 1h → 20min (operator request): a transient slow
+/// probe self-clears within 1–3 watchdog ticks (≤3min), far below this
+/// window, so 20min stays noise-free while surfacing a genuinely stuck/
+/// unreachable legacy ~40min sooner. Override via
+/// `LEGACY_SYNC_PROBE_OUTAGE_ESCALATION_SECS`.
+const DEFAULT_PROBE_OUTAGE_ESCALATION_SECS: u64 = 1200;
 
 /// 2026-06-30 — CT-machinery keep-warm interval. The watcher's per-tick
 /// `SELECT 1` connectivity probe already keeps the bb8 pool + WireGuard
@@ -719,20 +717,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .unwrap_or(DEFAULT_RETENTION_CHECK_INTERVAL_SECS),
     );
 
-    // Phase 5.5/2.58.4 — MSSQL-pool-outage breaker knobs. Both are
-    // operator-visible env vars so a noisy WG tunnel can be tuned
-    // without a redeploy.
-    let outage_cooldown = Duration::from_secs(
-        env::var("LEGACY_SYNC_OUTAGE_COOLDOWN_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_OUTAGE_COOLDOWN_SECS),
-    );
-    let outage_alert_threshold = env::var("LEGACY_SYNC_OUTAGE_ALERT_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_OUTAGE_ALERT_THRESHOLD);
-
     let shadow_mode = env::var("LEGACY_SYNC_SHADOW_MODE")
         .map(|v| v == "true")
         .unwrap_or(false);
@@ -751,8 +735,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!(
         poll_interval_ms,
         retention_check_interval_secs = retention_check_interval.as_secs(),
-        outage_cooldown_secs = outage_cooldown.as_secs(),
-        outage_alert_threshold,
         shadow_mode,
         per_table_watermark,
         allowlist = ?allowlist,
@@ -6129,16 +6111,22 @@ mod tests {
         );
     }
 
-    /// The escalation default is 2× the alert cooldown, so a genuine
-    /// probe-unreachable outage escalates within two info-page cycles.
+    /// The escalation default is 20 min — several watchdog ticks above a
+    /// self-recovering flap, so a genuine probe-unreachable outage pages
+    /// promptly while transient blips stay silent.
     #[test]
     #[allow(clippy::assertions_on_constants)]
-    fn probe_outage_escalation_default_is_two_cooldowns() {
-        assert_eq!(DEFAULT_PROBE_OUTAGE_ESCALATION_SECS, 3600);
-        assert_eq!(
-            DEFAULT_PROBE_OUTAGE_ESCALATION_SECS,
-            2 * WATCHDOG_ALERT_COOLDOWN_SECS,
-            "escalation threshold should be 2× the alert cooldown"
+    fn probe_outage_escalation_default_is_twenty_minutes() {
+        // 2026-06-30 — lowered 1h → 20min. This escalation is the SOLE
+        // Slack signal for a sustained probe-unreachable legacy (the
+        // informational note is suppressed), so it must surface a real
+        // outage promptly without paging on a self-recovering flap.
+        assert_eq!(DEFAULT_PROBE_OUTAGE_ESCALATION_SECS, 1200);
+        assert!(
+            DEFAULT_PROBE_OUTAGE_ESCALATION_SECS
+                >= 4 * WATERMARK_WATCHDOG_POLL_INTERVAL_SECS,
+            "escalation must sit several watchdog ticks above a transient flap, \
+             so a 1–3 tick self-recovering blip never pages"
         );
     }
 

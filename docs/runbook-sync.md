@@ -103,7 +103,7 @@ and was pure overnight noise. It is still logged (`tracing::info`,
 on `/api/new/sync/status`. The watchdog STILL pages for the actionable
 cases, each of which keeps its all-clear: a **sustained** probe outage
 (`:rotating_light: legacy probe unreachable Nmin`, after
-`LEGACY_SYNC_PROBE_OUTAGE_ESCALATION_SECS`, default 1h), a **confirmed
+`LEGACY_SYNC_PROBE_OUTAGE_ESCALATION_SECS`, default 20 min), a **confirmed
 backlog** (`:rotating_light: CT watermark STUCK`, probe shows
 `ct_current > watermark`), and a **monotonicity violation**
 (`:rotating_light: CT watermark anomaly`, `ct_current < watermark`). To
