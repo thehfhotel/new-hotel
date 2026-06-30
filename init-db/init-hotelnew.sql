@@ -696,6 +696,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_ht_room_calendar_legacy_id
 CREATE UNIQUE INDEX IF NOT EXISTS ux_ht_payments_aggregate_id
     ON ht_payments (aggregate_id) WHERE aggregate_id IS NOT NULL;
 
+-- Payment-dedup hardening (migration 068 / issue #203): one legacy receipt maps
+-- to one canonical payment per check-in. Partial UNIQUE blocks retried-sync /
+-- replay double-counts. See migrations/pg/068_ht_payments_legacy_receipt_unique.sql.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ht_payments_cin_legacy_receipt_no
+    ON ht_payments (pay_cin_id, legacy_receipt_no) WHERE legacy_receipt_no IS NOT NULL;
+
 -- =============================================================================
 -- Maintenance System
 -- =============================================================================
@@ -2399,6 +2405,14 @@ ON CONFLICT (form_key) DO UPDATE SET
 
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('067', '067_create_ht_feedback_forms.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 068 — ht_payments per-check-in legacy-receipt dedup hardening
+-- (issue #203). The partial UNIQUE index ux_ht_payments_cin_legacy_receipt_no
+-- is inlined into the ht_payments index block above; this seed row records the
+-- migration as already applied so the drift check sees zero pending migrations.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('068', '068_ht_payments_legacy_receipt_unique.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================
