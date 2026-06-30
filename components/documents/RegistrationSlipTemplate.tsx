@@ -274,14 +274,16 @@ export default function RegistrationSlipTemplate({
           </div>
         </div>
 
-        {/* Advance paid against the reservation (booking deposit), matching
-            iHOTEL. Booking ref + advance show when the stay came from a booking;
-            blank ref / 0.00 for walk-ins. */}
-        <div className="mt-2">
-          จ่ายล่วงหน้า จากการจองเลขที่{' '}
-          <span className="font-medium">{data.bookingNo || '—'}</span> จำนวนเงิน{' '}
-          <span className="font-medium">{formatCurrency(data.bookingAdvance ?? 0)}</span> บาท
-        </div>
+        {/* Advance paid against the reservation (booking deposit). iHOTEL only
+            prints this line when the stay came from a booking (Print_Report.cs:
+            `if Cin_book_no != ''`), so we omit it entirely for walk-ins. */}
+        {data.bookingNo && (
+          <div className="mt-2">
+            จ่ายล่วงหน้า จากการจองเลขที่{' '}
+            <span className="font-medium">{data.bookingNo}</span> จำนวนเงิน{' '}
+            <span className="font-medium">{formatCurrency(data.bookingAdvance ?? 0)}</span> บาท
+          </div>
+        )}
 
         {/* Signatures */}
         <div className="flex justify-between mt-12">
