@@ -194,7 +194,7 @@ export default function RegistrationSlipTemplate({
           <div className="grid grid-cols-4 gap-4">
             <Field thai="วัน เดือน ปี เกิด" eng="DATE OF BIRTH" />
             <Field thai="อายุ ปี" eng="AGE / YEAR" />
-            <Field thai="สัญชาติ" eng="NATIONALITY" value={data.nationality || 'ไทย'} />
+            <Field thai="สัญชาติ" eng="NATIONALITY" value={data.nationality} />
             <Field thai="อาชีพ" eng="OCCUPATION" />
           </div>
           <div className="grid grid-cols-[3fr_1fr] gap-4">
@@ -251,19 +251,21 @@ export default function RegistrationSlipTemplate({
           </div>
           <div className="grid grid-cols-2 gap-x-8 gap-y-1 mt-1">
             <Box label="เงินสด" eng="CASH" />
-            <div className="flex items-center gap-1">
+            {/* fill blanks use items-end + a sized span so the border sits on
+                the baseline (underscore), not the line centre (strikethrough). */}
+            <div className="flex items-end gap-1">
               <Box label="บัตรเครดิต" eng="CREDIT CARD" />
-              <span className="border-b border-gray-500 flex-1" />
+              <span className="border-b border-gray-500 flex-1 min-h-[1.1em]">&nbsp;</span>
               <span className="text-[9px] text-gray-500">EXP. DATE</span>
-              <span className="border-b border-gray-500 w-12" />
+              <span className="border-b border-gray-500 w-12 min-h-[1.1em]">&nbsp;</span>
             </div>
-            <div className="flex items-center gap-1">
+            <div className="flex items-end gap-1">
               <Box label="บัญชี" eng="ACCOUNT" />
-              <span className="border-b border-gray-500 flex-1" />
+              <span className="border-b border-gray-500 flex-1 min-h-[1.1em]">&nbsp;</span>
             </div>
-            <div className="flex items-center gap-1">
+            <div className="flex items-end gap-1">
               <Box label="ใบเสร็จรับเงิน" eng="VOUCHER" />
-              <span className="border-b border-gray-500 flex-1" />
+              <span className="border-b border-gray-500 flex-1 min-h-[1.1em]">&nbsp;</span>
             </div>
             <Box label="รับรอง" eng="COMPLIMENTARY" />
             <Box label="ใบ Folio" />
