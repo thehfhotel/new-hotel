@@ -1226,6 +1226,20 @@ fn bool_to_yesno(b: Option<bool>) -> &'static str {
     }
 }
 
+/// Project canonical `room_clean` (true = IS clean) back to the legacy
+/// `Room_Clean` NEEDS-CLEANING literal for drift hashing. Legacy semantics are
+/// inverted from canonical: 'no' = clean, 'yes' = dirty (needs cleaning). MUST
+/// match the CT room mapper's `new_clean` inversion or every checked-out /
+/// cleaned room would hash as drifted. Maintenance/use keep `bool_to_yesno`
+/// ('yes' = the named state).
+fn clean_bool_to_legacy_yesno(b: Option<bool>) -> &'static str {
+    match b {
+        Some(true) => "no",   // canonical clean -> legacy "no cleaning needed"
+        Some(false) => "yes", // canonical dirty -> legacy "needs cleaning"
+        None => "",
+    }
+}
+
 /// Map an MSSQL legacy `Room_Clean`/`Room_Manternace` literal to the
 /// canonical-shape `'yes' | 'no' | ""` token. Mirrors the CT room
 /// mapper's `legacy_yesno_to_bool`: anything other than the two known
@@ -1672,7 +1686,7 @@ async fn compute_current_pg_hash(
             Ok(canonical.map(|c| {
                 room_canonical_hash(
                     legacy_pk,
-                    bool_to_yesno(c.room_clean),
+                    clean_bool_to_legacy_yesno(c.room_clean),
                     bool_to_yesno(c.room_maintenance),
                     c.room_notes.as_deref(),
                 )
