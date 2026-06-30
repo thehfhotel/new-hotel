@@ -3,18 +3,20 @@
 import type { ReactNode } from 'react'
 import { Loader2, Info } from 'lucide-react'
 import type { V2StatusView } from '@/lib/v2/status'
-import type { Branch } from '@/contexts/BranchContext'
+import { useBranch, type Branch } from '@/contexts/BranchContext'
 
 /**
- * View-only banner for non-HF-Hotel branches. The canonical `/api/*` list
- * endpoints are now branch-aware (HF Ville reads ville_pool), so `/v2` DISPLAYS
- * HF Ville data. But the write endpoints still target the HF Hotel pool, and
- * HF Ville isn't cut over (iHOTEL is primary there), so `/v2` gates write
- * actions to HF Hotel only — this banner tells the user the other branches are
- * view-only. Renders nothing for the fully-supported HF Hotel branch.
+ * View-only banner for branches the new UI can't WRITE to. `/v2` reads are
+ * branch-aware (HF Ville reads ville_pool) so data always DISPLAYS; write
+ * capability is driven by `canWrite` (HF Hotel always; HF Ville only when
+ * `HFVILLE_WRITES_ENABLED`, surfaced via `/api/mode`). The banner now keys off
+ * `canWrite` — NOT the branch — so it disappears the moment HF Ville writes are
+ * enabled (it previously lied, hard-coded to every non-HF-Hotel branch). Renders
+ * nothing whenever the active branch is writable.
  */
 export function VilleNotice({ branch }: { branch: Branch }) {
-  if (branch === 'hfhotel') return null
+  const { canWrite } = useBranch()
+  if (canWrite) return null
   const message =
     branch === 'hfville'
       ? 'HF Ville: โหมดดูอย่างเดียวในดีไซน์ใหม่ — ทำรายการผ่าน iHOTEL / หน้าจอเดิม'
