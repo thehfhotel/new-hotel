@@ -128,7 +128,7 @@ async fn list_checkins_pg(
     let data_query = format!(
         r#"
         SELECT
-            c.cin_no                                AS cin_no,
+            COALESCE(NULLIF(c.legacy_cin_no, ''), c.cin_no) AS cin_no,
             COALESCE(r.room_no, c.legacy_room_no)   AS cin_room_no,
             c.cin_checkin_time                      AS cin_room_in,
             COALESCE(c.cin_checkout_time, c.cin_expected_checkout::timestamp) AS cin_room_out,

@@ -145,7 +145,7 @@ pub struct RosterSummaryResponse {
 /// compile-time literals (no user value interpolated — the as-of date is bound
 /// as `$1`), so the assembled string is wrapped in [`sqlx::AssertSqlSafe`].
 const STAY_SELECT: &str = "SELECT \
-    ci.cin_id, ci.cin_no, b.book_no, \
+    ci.cin_id, COALESCE(NULLIF(ci.legacy_cin_no, ''), ci.cin_no) AS cin_no, b.book_no, \
     CONCAT(c.cust_firstname, ' ', COALESCE(c.cust_lastname, '')) AS customer_name, \
     c.cust_phone, r.room_no, rt.type_name, \
     ci.cin_checkin_time, ci.cin_checkout_time, ci.cin_expected_checkout, \

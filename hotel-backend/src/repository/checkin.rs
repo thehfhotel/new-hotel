@@ -392,7 +392,7 @@ impl CheckInRepository for PgCheckInRepository {
             r#"
         SELECT
             ci.cin_id,
-            ci.cin_no,
+            COALESCE(NULLIF(ci.legacy_cin_no, ''), ci.cin_no) AS cin_no,
             ci.cin_book_id,
             b.book_no,
             ci.cin_cust_id,

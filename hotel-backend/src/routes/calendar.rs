@@ -354,7 +354,7 @@ async fn fetch_new_calendar_data(
         r#"
         SELECT
             ci.cin_id,
-            ci.cin_no,
+            COALESCE(NULLIF(ci.legacy_cin_no, ''), ci.cin_no) AS cin_no,
             COALESCE(cr.cr_room_id, ci.cin_room_id) AS effective_room_id,
             CONCAT(c.cust_firstname, ' ', COALESCE(c.cust_lastname, '')) AS cust_name,
             r.room_no,

@@ -242,7 +242,7 @@ pub async fn get_invoice(
             SELECT
                 -- Check-in info
                 ci.cin_id,
-                ci.cin_no,
+                COALESCE(NULLIF(ci.legacy_cin_no, ''), ci.cin_no) AS cin_no,
                 ci.cin_book_id,
                 COALESCE(b.book_no, '') as "book_no!",
 
