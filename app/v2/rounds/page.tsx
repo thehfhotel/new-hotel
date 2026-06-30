@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Printer, Users } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { useLiveRefresh } from '@/lib/v2/use-live-refresh'
 import { useBranch } from '@/contexts/BranchContext'
 import { formatCurrency } from '@/lib/format'
 import { printRegion } from '@/lib/print'
@@ -134,6 +135,14 @@ export default function V2Rounds() {
   useEffect(() => {
     fetchSummary()
   }, [fetchSummary])
+
+  // Live-refresh when a payment/check-out happens in iHOTEL or the other app —
+  // round income is computed from the payment ledger over the window.
+  useLiveRefresh(
+    branch,
+    ['PaymentReceived', 'PaymentRefunded', 'CheckOutCompleted', 'CheckInCreated'],
+    fetchSummary,
+  )
 
   const t = data?.totals
   const depNet = t ? t.depositsReceived - t.depositsReturned : 0

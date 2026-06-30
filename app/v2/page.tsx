@@ -12,6 +12,7 @@ import {
 } from 'lucide-react'
 import { useBranch } from '@/contexts/BranchContext'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { useLiveRefresh } from '@/lib/v2/use-live-refresh'
 import { formatStoredDayMonth, formatStoredDateTime } from '@/lib/format'
 import type { Booking } from '@/types/booking'
 import { isSameStoredDay } from '@/lib/v2/status'
@@ -66,10 +67,7 @@ export default function V2Today() {
   const [checkins, setCheckins] = useState<CheckInRow[]>([])
   const [bookings, setBookings] = useState<Booking[]>([])
   const [loading, setLoading] = useState(true)
-  const [live, setLive] = useState(false)
 
-  const fetchRef = useRef<() => void>(() => {})
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Monotonic request token: branch can flip (hfhotel default → stored hfville)
   // mid-flight, so a stale response must not overwrite the latest one.
   const reqRef = useRef(0)
@@ -114,28 +112,8 @@ export default function V2Today() {
     fetchData()
   }, [fetchData])
 
-  useEffect(() => {
-    fetchRef.current = fetchData
-  }, [fetchData])
-
-  useEffect(() => {
-    const schedule = () => {
-      if (timer.current) clearTimeout(timer.current)
-      timer.current = setTimeout(() => fetchRef.current(), 500)
-    }
-    const es = new EventSource(`/api/events?branch=${encodeURIComponent(branch)}`)
-    es.onopen = () => setLive(true)
-    es.onerror = () => setLive(false)
-    REFRESH_EVENTS.forEach((e) => es.addEventListener(e, schedule))
-    const onVis = () => document.visibilityState === 'visible' && fetchRef.current()
-    document.addEventListener('visibilitychange', onVis)
-    return () => {
-      document.removeEventListener('visibilitychange', onVis)
-      if (timer.current) clearTimeout(timer.current)
-      es.close()
-      setLive(false)
-    }
-  }, [branch])
+  // Live-refresh on iHOTEL/other-app changes mirrored through the event stream.
+  const live = useLiveRefresh(branch, REFRESH_EVENTS, fetchData)
 
   if (loading) return <V2Spinner label="กำลังโหลดข้อมูลหน้าบ้าน…" />
 

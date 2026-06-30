@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Search } from 'lucide-react'
 import { useBranch } from '@/contexts/BranchContext'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { useLiveRefresh } from '@/lib/v2/use-live-refresh'
 import { roomStatusView } from '@/lib/v2/status'
 import { V2Spinner, LiveDot, V2PageHeader, VilleNotice } from '@/components/v2/primitives'
 import RoomActionSheet, { type RoomItem, type RoomAction } from '@/components/v2/RoomActionSheet'
@@ -21,6 +22,7 @@ const ROOM_EVENTS = [
   'CheckOutCompleted',
   'CheckInCancelled',
   'BookingCreated',
+  'BookingModified',
   'BookingCancelled',
 ]
 
@@ -47,15 +49,12 @@ export default function V2Rooms() {
   const branchFetch = useBranchFetch()
   const [rooms, setRooms] = useState<RoomItem[]>([])
   const [loading, setLoading] = useState(true)
-  const [live, setLive] = useState(false)
   const [filter, setFilter] = useState('all')
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState<RoomItem | null>(null)
   const [modal, setModal] = useState<ModalKind | null>(null)
   const [busy, setBusy] = useState(false)
 
-  const fetchRef = useRef<() => void>(() => {})
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Latest-wins guard: branch can flip mid-flight (hfhotel default → stored hfville).
   const reqRef = useRef(0)
 
@@ -81,25 +80,8 @@ export default function V2Rooms() {
     fetchRooms()
   }, [fetchRooms])
 
-  useEffect(() => {
-    fetchRef.current = fetchRooms
-  }, [fetchRooms])
-
-  useEffect(() => {
-    const schedule = () => {
-      if (timer.current) clearTimeout(timer.current)
-      timer.current = setTimeout(() => fetchRef.current(), 500)
-    }
-    const es = new EventSource(`/api/events?branch=${encodeURIComponent(branch)}`)
-    es.onopen = () => setLive(true)
-    es.onerror = () => setLive(false)
-    ROOM_EVENTS.forEach((e) => es.addEventListener(e, schedule))
-    return () => {
-      if (timer.current) clearTimeout(timer.current)
-      es.close()
-      setLive(false)
-    }
-  }, [branch])
+  // Live-refresh on iHOTEL/other-app changes mirrored through the event stream.
+  const live = useLiveRefresh(branch, ROOM_EVENTS, fetchRooms)
 
   const filtered = useMemo(() => {
     const f = FILTERS.find((x) => x.value === filter) || FILTERS[0]

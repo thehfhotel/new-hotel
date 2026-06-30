@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { Printer, LogIn, LogOut, Moon, CalendarClock, type LucideIcon } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { useLiveRefresh } from '@/lib/v2/use-live-refresh'
 import { useBranch, BRANCH_LABELS } from '@/contexts/BranchContext'
 import { printRegion } from '@/lib/print'
 import { formatStoredDayMonth, formatStoredDateTime, formatStoredDayMonthYear } from '@/lib/format'
@@ -122,6 +123,13 @@ export default function V2Rosters() {
   useEffect(() => {
     fetchAll()
   }, [fetchAll])
+
+  // Live-refresh when a check-in/booking changes in iHOTEL or the other app.
+  useLiveRefresh(
+    branch,
+    ['CheckInCreated', 'CheckOutCompleted', 'CheckInCancelled', 'BookingCreated', 'BookingModified'],
+    fetchAll,
+  )
 
   const dateLabel = formatStoredDayMonthYear(summary?.date ?? date)
   const branchLabel = branch === 'all' ? BRANCH_LABELS.all : BRANCH_LABELS[branch]

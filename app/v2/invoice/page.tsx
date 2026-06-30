@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation'
 import { FileText, Search } from 'lucide-react'
 import { useBranch, BRANCH_LABELS } from '@/contexts/BranchContext'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { useLiveRefresh } from '@/lib/v2/use-live-refresh'
 import { formatStoredDateTime, formatStoredDayMonth, formatCurrency } from '@/lib/format'
 import { V2PageHeader, V2Spinner, V2Empty } from '@/components/v2/primitives'
 
@@ -72,6 +73,13 @@ export default function V2InvoicePicker() {
   useEffect(() => {
     fetchStays()
   }, [fetchStays])
+
+  // Live-refresh when a payment/check-out happens in iHOTEL or the other app.
+  useLiveRefresh(
+    branch,
+    ['PaymentReceived', 'PaymentRefunded', 'CheckOutCompleted', 'CheckInCreated'],
+    fetchStays,
+  )
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase()

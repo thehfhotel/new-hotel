@@ -4,6 +4,7 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'rea
 import { ChevronLeft, ChevronRight, CalendarRange } from 'lucide-react'
 import { useBranch } from '@/contexts/BranchContext'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { useLiveRefresh } from '@/lib/v2/use-live-refresh'
 import { V2PageHeader, V2Spinner, V2Empty } from '@/components/v2/primitives'
 import {
   buildGrid,
@@ -109,6 +110,13 @@ export default function V2Calendar() {
   useEffect(() => {
     load()
   }, [load])
+
+  // Live-refresh when a booking/check-in changes in iHOTEL or the other app.
+  useLiveRefresh(
+    branch,
+    ['BookingCreated', 'BookingModified', 'BookingCancelled', 'CheckInCreated', 'CheckOutCompleted', 'CheckInCancelled'],
+    load,
+  )
 
   const roomNos = useMemo(() => rooms.map((r) => r.roomNo), [rooms])
   const grid = useMemo(

@@ -15,6 +15,7 @@ import {
 } from 'lucide-react'
 import { useBranch } from '@/contexts/BranchContext'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { useLiveRefresh } from '@/lib/v2/use-live-refresh'
 import { formatStoredDate, formatStoredDayMonth, formatCurrency } from '@/lib/format'
 import { V2Spinner, V2PageHeader } from '@/components/v2/primitives'
 
@@ -94,6 +95,13 @@ export default function V2Guests() {
   useEffect(() => {
     fetchGuests()
   }, [fetchGuests])
+
+  // Live-refresh when a check-in or customer changes in iHOTEL or the other app.
+  useLiveRefresh(
+    branch,
+    ['CheckInCreated', 'CheckOutCompleted', 'CheckInCancelled', 'CustomerCreated', 'CustomerModified'],
+    fetchGuests,
+  )
 
   return (
     <div className="space-y-5">

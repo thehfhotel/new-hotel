@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Printer, Plus, TrendingUp, TrendingDown, Wallet, X, Loader2 } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { useLiveRefresh } from '@/lib/v2/use-live-refresh'
 import { useBranch } from '@/contexts/BranchContext'
 import { useAuth } from '@/contexts/AuthContext'
 import { formatCurrency } from '@/lib/format'
@@ -156,6 +157,10 @@ export default function V2Cash() {
   useEffect(() => {
     fetchCategories()
   }, [fetchCategories])
+
+  // Live-refresh when a payment/check-out happens in iHOTEL or the other app
+  // (petty-cash entries are made here, so those refresh on their own action).
+  useLiveRefresh(branch, ['PaymentReceived', 'PaymentRefunded', 'CheckOutCompleted'], fetchList)
 
   // group = the higher tree levels (2 / 2_2); account = the leaf level (3).
   const groupOptions = useMemo(

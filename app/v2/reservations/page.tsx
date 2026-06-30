@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { CalendarPlus, Search, ChevronLeft, ChevronRight, Moon, BedDouble, Wallet } from 'lucide-react'
 import { useBranch } from '@/contexts/BranchContext'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
+import { useLiveRefresh } from '@/lib/v2/use-live-refresh'
 import { formatStoredDayMonth, formatCurrency } from '@/lib/format'
 import type { Booking, BookingDetail } from '@/types/booking'
 import { bookingStatusView } from '@/lib/v2/status'
@@ -63,6 +64,13 @@ export default function V2Reservations() {
   useEffect(() => {
     fetchBookings()
   }, [fetchBookings])
+
+  // Live-refresh when a booking/check-in changes in iHOTEL or the other app.
+  useLiveRefresh(
+    branch,
+    ['BookingCreated', 'BookingModified', 'BookingCancelled', 'CheckInCreated', 'CheckOutCompleted', 'CheckInCancelled'],
+    fetchBookings,
+  )
 
   // Open the create form when arriving via "จองใหม่" (?new=1) or ⌘K command,
   // and pre-apply the balance-due filter when deep-linked from the bell.
