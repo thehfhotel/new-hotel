@@ -273,11 +273,15 @@ export default function RegistrationSlipTemplate({
           </div>
         </div>
 
-        {/* Prepayment from booking */}
+        {/* Prepayment against a reservation. We don't track advance-from-booking
+            (cin_paid_amount is the total paid at check-in, NOT a reservation
+            advance), so the amount stays 0.00 — matching iHOTEL's default when
+            nothing was prepaid. The booking ref shows only when this stay came
+            from one (blank for walk-ins). */}
         <div className="mt-2">
           จ่ายล่วงหน้า จากการจองเลขที่{' '}
           <span className="font-medium">{data.bookingNo || '—'}</span> จำนวนเงิน{' '}
-          <span className="font-medium">{formatCurrency(data.paidAmount ?? 0)}</span> บาท
+          <span className="font-medium">0.00</span> บาท
         </div>
 
         {/* Signatures */}
