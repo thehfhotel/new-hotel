@@ -253,7 +253,17 @@ async fn apply_room_upsert(
     let projected = project_room(row)?;
     let existing = fetch_existing_room(tx, projected.legacy_id, &projected.room_no).await?;
 
-    let new_clean = legacy_yesno_to_bool(&projected.room_clean_legacy);
+    // Legacy `HT_Rooms.Room_Clean` is a NEEDS-CLEANING flag: 'yes' = needs
+    // cleaning (DIRTY), 'no' = already clean (see writeback recipes/mark_clean.rs
+    // "Room_Clean='no' means no cleaning needed" + checkout sets 'yes' to flag
+    // dirty). Canonical `room_clean` has the INVERSE polarity — true = IS clean
+    // (housekeeping::mark_clean → true, mark_dirty/mark_room_available_dirty →
+    // false, v2 `is_clean = room_clean`). The generic yes→true mapping (correct
+    // for maintenance/use, where 'yes' = the-named-state) silently INVERTED clean
+    // for every room, so a just-checked-out room flipped back to "clean" on the
+    // next sync (found 2026-06-30 via the HF Ville e2e). Invert it.
+    let new_clean =
+        legacy_yesno_to_bool(&projected.room_clean_legacy).map(|needs_cleaning| !needs_cleaning);
     let new_maintenance = legacy_yesno_to_bool(&projected.room_manternace_legacy);
     let new_use = legacy_yesno_to_bool(&projected.room_use_legacy);
 
