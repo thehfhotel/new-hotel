@@ -4238,6 +4238,19 @@ async fn sync_cash_history(pg: &PgPool, mssql: &DbPool, shadow_mode: bool, site_
         // convention used by sync_round_bills. Idempotent UPSERT keyed on
         // cash_legacy_id; cash_source is forced to 'legacy' (this is the
         // legacy mirror path).
+        //
+        // ECHO-SAFETY (issue #202): this UPSERT dedups on `cash_legacy_id`, so it
+        // is echo-safe ONLY if an app-originated cash entry already carries its
+        // allocated legacy id in `cash_legacy_id` by the time this mirror re-reads
+        // it. Cash-OUTBOUND writeback (`writeback/recipes/cash_entry.rs`) is
+        // currently DARK, so no echo occurs today. BEFORE enabling it, the worker
+        // MUST back-populate `cash_legacy_id` onto the canonical row after the
+        // writeback allocates the legacy id (the same pattern payments use:
+        // `back_populate_legacy_ids` → `legacy_receipt_no`, which the HT_Receipt_H
+        // importer then dedups on — see `sync/mappers/payment.rs`). Without that
+        // back-population, our own cash write re-imports here as a phantom
+        // duplicate (`cash_source='legacy'`, app's original keeps `cash_legacy_id`
+        // NULL). Verify before flipping cash-outbound writeback.
         let res = sqlx::query(
             "INSERT INTO ht_cash_ledger ( \
                  cash_legacy_id, cash_kind, cash_legacy_type, cash_entry_date, \

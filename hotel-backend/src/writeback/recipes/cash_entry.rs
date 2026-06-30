@@ -94,6 +94,14 @@ pub struct CashEntryPayload {
 /// the other MAX+1 recipes use). The 10 VALUES are emitted in the exact legacy
 /// column order: `id, Pay_Date, Pay_Bill, Pay_Cust, Pay_Type, Pay_Total,
 /// Pay_Note, Pay_Program, Pay_Group, Pay_Account`.
+///
+/// ECHO-SAFETY (issue #202): when this dark path is wired, the worker MUST
+/// back-populate the allocated `legacy_id` onto the canonical `ht_cash_ledger`
+/// row's `cash_legacy_id` after the write (mirroring payments'
+/// `back_populate_legacy_ids` → `legacy_receipt_no`). The cash mirror importer
+/// (`bin/sync.rs::sync_cash_history`) dedups `ON CONFLICT (cash_legacy_id)`, so
+/// without that back-population our own cash write re-imports as a phantom
+/// duplicate. Do not enable cash-outbound writeback until that is in place.
 pub fn build_statements(payload: &CashEntryPayload, legacy_id: i32) -> WritebackResult<Vec<String>> {
     validate_finite(&[("amount", payload.amount)])?;
 
