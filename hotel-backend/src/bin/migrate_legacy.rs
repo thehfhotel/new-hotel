@@ -5,7 +5,8 @@
 //! Migration order (respects FK dependencies):
 //! 1. Extract distinct Room_Type values -> ht_room_types
 //! 2. Import HT_Rooms -> ht_rooms_new (link room_type_id)
-//! 3. Import View_Customers -> ht_customers (split Cust_name into first/last)
+//! 3. Import HT_Customers (base table) -> ht_customers (Cust_name verbatim
+//!    into cust_firstname — matches the steady-state CT mapper / reconcile hash)
 //! 4. Import View_Booking_Ds -> ht_bookings + ht_booking_rooms (group by Book_No)
 //! 5. Import View_CheckIn_Ds -> ht_checkins (link customer + room)
 //! 6. Bump PostgreSQL sequences past max imported IDs
@@ -302,11 +303,26 @@ async fn import_customers(
 ) -> Result<HashMap<String, i32>, Box<dyn std::error::Error + Send + Sync>> {
     let mut conn = legacy_pool.get().await?;
 
+    // Read the BASE table HT_Customers, NOT the View_Customers view.
+    //
+    // #204 bug #1 (origin-fix): the view concatenates
+    // `Cust_perfix + Cust_name + ' ' + Cust_name2` into its `Cust_name`
+    // column; the old migration then `split_name()`d that on the first
+    // space into firstname/lastname. That permanently diverges from the
+    // steady-state CT mapper (`sync::mappers::customer`) and the reconcile
+    // hash, both of which read the BASE column `HT_Customers.Cust_name`
+    // RAW into `cust_firstname`. We mirror the CT mapper's column choices
+    // exactly so a future re-migration is a hash no-op:
+    //   Cust_name      -> cust_firstname (verbatim, no prefix/name2, no split)
+    //   Cust_Type_Main -> cust_type      (Thai customer-category literal)
+    //   Cust_Add_no    -> cust_address   (door number; mapper's legacy mirror col)
+    //   Cust_Add_tel   -> cust_phone
+    //   Cust_IDcard    -> cust_idcard
     let rows = conn
         .simple_query(
             r#"
-            SELECT Cust_no, Cust_name, Cust_Type, Cust_Add_tel, Cust_IDcard, C_Address
-            FROM View_Customers
+            SELECT Cust_no, Cust_name, Cust_Type_Main, Cust_Add_tel, Cust_IDcard, Cust_Add_no
+            FROM HT_Customers
             "#,
         )
         .await?
@@ -335,14 +351,16 @@ async fn import_customers(
             continue;
         }
 
-        let full_name = row.get::<&str, _>("Cust_name").unwrap_or_default().to_string();
-        let cust_type = row.get::<&str, _>("Cust_Type").map(String::from);
+        // #204 bug #1: write the BASE `Cust_name` straight into
+        // `cust_firstname` (NO split, NO prefix/name2 concat) so this matches
+        // the CT mapper's `Cust_name -> cust_firstname` projection verbatim.
+        // `cust_lastname` is canonical-only and stays NULL on import.
+        let firstname = row.get::<&str, _>("Cust_name").unwrap_or_default().to_string();
+        let lastname: Option<String> = None;
+        let cust_type = row.get::<&str, _>("Cust_Type_Main").map(String::from);
         let phone = row.get::<&str, _>("Cust_Add_tel").map(String::from);
         let idcard = row.get::<&str, _>("Cust_IDcard").map(String::from);
-        let address = row.get::<&str, _>("C_Address").map(String::from);
-
-        // Split name: first word is firstname, rest is lastname
-        let (firstname, lastname) = split_name(&full_name);
+        let address = row.get::<&str, _>("Cust_Add_no").map(String::from);
 
         let cust_id: i32 = sqlx::query_scalar(
             r#"
@@ -370,19 +388,6 @@ async fn import_customers(
 
     tracing::info!("  {} customers imported, {} skipped", stats.customers, stats.customers_skipped);
     Ok(customer_map)
-}
-
-/// Split a Thai/English name into first and last name
-fn split_name(full_name: &str) -> (String, Option<String>) {
-    let trimmed = full_name.trim();
-    if trimmed.is_empty() {
-        return ("Unknown".to_string(), None);
-    }
-
-    match trimmed.split_once(' ') {
-        Some((first, rest)) => (first.to_string(), Some(rest.trim().to_string())),
-        None => (trimmed.to_string(), None),
-    }
 }
 
 // =============================================================================

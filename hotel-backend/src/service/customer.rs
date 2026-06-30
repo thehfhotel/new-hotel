@@ -135,6 +135,21 @@ pub struct CustomerService {
 /// Uses dynamic `sqlx::query` (not the compile-time macro) to keep the
 /// crate buildable without regenerating the `.sqlx/` cache — same
 /// convention as `routes::new_rooms::load_legacy_room_no`.
+/// Map canonical `cust_firstname` to the legacy `HT_Customers.Cust_name`
+/// writeback value.
+///
+/// INVARIANT (#204 bug #3): this is a **verbatim** copy — NO lastname join,
+/// NO prefix, NO transformation. The CT mapper projects legacy `Cust_name`
+/// straight into `cust_firstname`, and the reconcile sweep hashes the two
+/// directly (`scheduler::sync::CUSTOMERS_RECONCILE_PROJECTION`); any
+/// transform here would create permanent hash divergence AND, worse, would
+/// corrupt the legacy full name on write-back. Keeping the mapping in one
+/// named, pure function makes the invariant testable without a database (see
+/// `tests::firstname_maps_to_cust_name_verbatim`).
+fn firstname_to_legacy_cust_name(cust_firstname: &str) -> String {
+    cust_firstname.to_string()
+}
+
 async fn load_customer_resave(
     tx: &mut Transaction<'_, Postgres>,
     cust_id: i32,
@@ -176,7 +191,23 @@ async fn load_customer_resave(
 
     Ok(Some(CustomerResave {
         legacy_cust_no,
-        cust_name: row.try_get::<String, _>("cust_firstname").unwrap_or_default(),
+        // #204 bug #3 (writeback guard) — the legacy `Cust_name` is written
+        // from canonical `cust_firstname` VERBATIM via
+        // [`firstname_to_legacy_cust_name`]. INVARIANT: customer writeback
+        // must NOT be enabled until canonical `cust_firstname` equals the
+        // base legacy `HT_Customers.Cust_name` for every mirrored row. The
+        // CT mapper projects `Cust_name -> cust_firstname` raw, and the
+        // re-migration (`bin/migrate_legacy.rs`, fixed for #204 bug #1) now
+        // imports `Cust_name` raw too — but any historical row whose
+        // `cust_firstname` still carries a split/concatenated value (legacy
+        // pre-#204 import, or a hand-edit that added a lastname) would, once
+        // this verbatim write fires, OVERWRITE the legacy full name with the
+        // truncated/altered first token. Verify convergence (reconcile hash
+        // green on `cust_firstname` vs `Cust_name`) before flipping the
+        // writeback flag.
+        cust_name: firstname_to_legacy_cust_name(
+            &row.try_get::<String, _>("cust_firstname").unwrap_or_default(),
+        ),
         cust_name2: text("cust_name2"),
         cust_type: text("cust_price_tier"),
         cust_type_main: text("cust_type"),
@@ -440,6 +471,29 @@ mod tests {
     /// customer mid-flight (observed 2026-06-12: `NotFound("customer N
     /// does not exist")`). One lock keeps them deterministic.
     static UC_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// #204 bug #3 — DB-FREE guard on the firstname→`Cust_name` mapping.
+    /// The legacy `Cust_name` write-back value must be `cust_firstname`
+    /// VERBATIM: no lastname join, no prefix, no trimming, no transform.
+    /// Pure assertion — no PG, no fixtures.
+    #[test]
+    fn firstname_maps_to_cust_name_verbatim() {
+        // Plain ASCII.
+        assert_eq!(firstname_to_legacy_cust_name("Alice"), "Alice");
+        // Thai script preserved byte-for-byte.
+        assert_eq!(firstname_to_legacy_cust_name("สมชาย"), "สมชาย");
+        // A value that LOOKS like "first last" must NOT be split — the whole
+        // string is the legacy Cust_name (this is exactly the corruption the
+        // invariant guards against).
+        assert_eq!(
+            firstname_to_legacy_cust_name("สมชาย ใจดี"),
+            "สมชาย ใจดี"
+        );
+        // No trimming of surrounding whitespace — verbatim means verbatim.
+        assert_eq!(firstname_to_legacy_cust_name("  pad  "), "  pad  ");
+        // Empty stays empty (NULL-firstname fallback in load_customer_resave).
+        assert_eq!(firstname_to_legacy_cust_name(""), "");
+    }
 
     async fn try_pool() -> Option<PgPool> {
         let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
