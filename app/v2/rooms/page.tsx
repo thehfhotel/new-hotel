@@ -141,21 +141,27 @@ export default function V2Rooms() {
       setModal(a as ModalKind)
       return // keep `selected`; sheet is replaced by the modal overlay
     }
-    // Maintenance toggle only (clean/dirty is managed on /housekeeping, not in
-    // the room grid — matches iHOTEL). Routes through the housekeeping
-    // maintenance endpoint, which flips canonical `room_maintenance` AND mirrors
-    // to legacy HT_Rooms.Room_Manternace so iHOTEL stops renting an out-of-
-    // service room. The old PATCH /status path set only the canonical
-    // room_status string and never reached iHOTEL — a coexistence hazard.
-    // `a` is 'maintenance' or 'ready' here (modal actions returned above).
+    // Housekeeping actions (modal actions returned above). All route through the
+    // /api/housekeeping/* endpoints, which flip the canonical flag AND mirror to
+    // legacy HT_Rooms (Room_Manternace / Room_Clean) so iHOTEL stays in step —
+    // the old PATCH /status path only set the canonical string and never reached
+    // iHOTEL. `a` is 'maintenance' | 'ready' | 'clean' | 'dirty' here.
     setBusy(true)
     try {
-      const maintenance = a === 'maintenance'
-      await branchFetch(`/api/housekeeping/rooms/${selected.id}/maintenance`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ maintenance }),
-      })
+      if (a === 'clean' || a === 'dirty') {
+        await branchFetch(`/api/housekeeping/rooms/${selected.id}/${a}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        })
+      } else {
+        const maintenance = a === 'maintenance'
+        await branchFetch(`/api/housekeeping/rooms/${selected.id}/maintenance`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ maintenance }),
+        })
+      }
       await fetchRooms()
       setSelected(null)
     } catch {

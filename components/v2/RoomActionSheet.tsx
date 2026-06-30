@@ -9,6 +9,7 @@ import {
   Coffee,
   Wrench,
   CheckCircle2,
+  Sparkles,
   User,
   Loader2,
 } from 'lucide-react'
@@ -36,6 +37,8 @@ export type RoomAction =
   | 'pos'
   | 'maintenance'
   | 'ready'
+  | 'clean'
+  | 'dirty'
 
 function ActionButton({
   onClick,
@@ -153,14 +156,21 @@ export default function RoomActionSheet({
               <ActionButton variant="primary" icon={<LogOut size={17} />} label="เช็คเอาท์" onClick={() => onAction('checkout')} />
             )}
 
-            {/* Maintenance toggle. Clean/dirty housekeeping is managed on the
-                dedicated /housekeeping screen, not here (the old clean/dirty
-                actions wrote the stale room_status — broken/no-op — and iHOTEL
-                doesn't surface clean state in the room grid). */}
+            {/* Housekeeping. Clean/dirty routes through
+                /api/housekeeping/rooms/{id}/clean|dirty (flips canonical
+                room_clean AND mirrors to iHOTEL HT_Rooms.Room_Clean) — surfaced
+                here now that room_clean is trustworthy (the inversion fix). */}
             {room.status === 'maintenance' ? (
               <ActionButton icon={<CheckCircle2 size={17} />} label="พร้อมใช้งาน (เลิกแจ้งซ่อม)" onClick={() => onAction('ready')} />
             ) : (
-              <ActionButton icon={<Wrench size={17} />} label="แจ้งซ่อม" onClick={() => onAction('maintenance')} />
+              <>
+                {room.isClean ? (
+                  <ActionButton icon={<Sparkles size={17} />} label="แจ้งทำความสะอาด" onClick={() => onAction('dirty')} />
+                ) : (
+                  <ActionButton icon={<CheckCircle2 size={17} />} label="ทำความสะอาดแล้ว" onClick={() => onAction('clean')} />
+                )}
+                <ActionButton icon={<Wrench size={17} />} label="แจ้งซ่อม" onClick={() => onAction('maintenance')} />
+              </>
             )}
           </div>
           )}
