@@ -112,6 +112,15 @@ export default function RegistrationSlipTemplate({
           .registration-slip-print-root {
             display: block !important;
           }
+          /* The v2 layout's print CSS hides everything via a body-wide
+             visibility:hidden and only un-hides its own .v2-print-active region.
+             This portal isn't that, so make it visibility-robust too, or the
+             slip prints blank under /v2 even though display is block. No-op in
+             the classic app. */
+          .registration-slip-print-root,
+          .registration-slip-print-root * {
+            visibility: visible !important;
+          }
         }
       `}</style>
 

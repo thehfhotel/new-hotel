@@ -133,6 +133,14 @@ export default function BookingConfirmationSlip({
           .booking-confirmation-print-root {
             display: block !important;
           }
+          /* The v2 layout's print CSS hides everything via a body-wide
+             visibility:hidden and only un-hides .v2-print-active; make this
+             portal visibility-robust too or it prints blank under /v2. No-op in
+             the classic app. */
+          .booking-confirmation-print-root,
+          .booking-confirmation-print-root * {
+            visibility: visible !important;
+          }
         }
       `}</style>
 

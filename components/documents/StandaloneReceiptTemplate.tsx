@@ -76,7 +76,22 @@ export default function StandaloneReceiptTemplate({
             print-color-adjust: exact;
             -webkit-print-color-adjust: exact;
           }
+          /* Self-isolate against the v2 layout's body-wide visibility:hidden
+             print CSS (it only un-hides .v2-print-active) — without this the
+             receipt prints blank under /v2. Hide everything, show only the
+             receipt. Improves the classic app too (drops modal chrome). */
+          body * {
+            visibility: hidden !important;
+          }
+          .receipt-container,
+          .receipt-container * {
+            visibility: visible !important;
+          }
           .receipt-container {
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 100%;
             padding: 0;
             margin: 0;
             max-width: 100%;
