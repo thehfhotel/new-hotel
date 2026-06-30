@@ -74,13 +74,21 @@ impl Category {
 #[serde(rename_all = "camelCase")]
 pub struct Item {
     pub id: i32,
+    // The /inventory/items list UI reads itemCode/itemName/category/costPerUnit
+    // (see types/inventory.ts). Without these explicit renames the list showed
+    // blank code/name/category (only the already-matching minStock/currentStock/
+    // unit rendered).
+    #[serde(rename = "itemCode")]
     pub code: String,
+    #[serde(rename = "itemName")]
     pub name: String,
     pub category_id: Option<i32>,
+    #[serde(rename = "category")]
     pub category_name: Option<String>,
     pub unit: String,
     pub min_stock: i32,
     pub current_stock: i32,
+    #[serde(rename = "costPerUnit")]
     pub cost: Option<f64>,
     pub active: bool,
     pub created_at: Option<NaiveDateTime>,
@@ -194,6 +202,8 @@ pub struct ItemsQuery {
     pub low_stock: Option<bool>,
     pub search: Option<String>,
     pub active: Option<bool>,
+    /// Per-site read pool selector (`?branch=hfville`).
+    pub branch: Option<Branch>,
     #[serde(default = "default_page")]
     pub page: i32,
     #[serde(default = "default_limit")]
@@ -512,11 +522,23 @@ pub struct MutationResponse {
 // Category Endpoints
 // ============================================================================
 
+/// Branch selector for the inventory READ endpoints (list_categories, get_item)
+/// that don't already carry an ItemsQuery. Resolves the per-site read pool so
+/// HF Ville reads its own inventory.
+#[derive(Debug, Deserialize)]
+pub struct InvBranchQuery {
+    pub branch: Option<Branch>,
+}
+
 /// GET /api/new/inventory/categories - List all categories
 pub async fn list_categories(
     State(state): State<AppState>,
+    Query(bq): Query<InvBranchQuery>,
 ) -> ApiResult<Json<CategoriesResponse>> {
-    let rows = state.inventory.list_categories(&state.new_pool).await?;
+    let rows = state
+        .inventory
+        .list_categories(state.write_pool(bq.branch)?)
+        .await?;
     let categories: Vec<Category> = rows.into_iter().map(Category::from_row).collect();
     let total = categories.len() as i32;
 
@@ -569,9 +591,13 @@ pub async fn list_items(
     State(state): State<AppState>,
     Query(params): Query<ItemsQuery>,
 ) -> ApiResult<Json<ItemsResponse>> {
+    // Branch-aware read: HF Ville must list its own inventory, not HF Hotel's
+    // (the list previously always read state.new_pool, so switching branch never
+    // changed the items).
+    let pool = state.write_pool(params.branch)?;
     let (rows, total) = state
         .inventory
-        .list_items_with_count(&state.new_pool, &params)
+        .list_items_with_count(pool, &params)
         .await?;
     let items: Vec<Item> = rows.into_iter().map(Item::from_row).collect();
 
@@ -646,10 +672,11 @@ pub async fn create_item(
 pub async fn get_item(
     State(state): State<AppState>,
     Path(item_id): Path<i32>,
+    Query(bq): Query<InvBranchQuery>,
 ) -> ApiResult<Json<ItemResponse>> {
     let row = state
         .inventory
-        .get_item(&state.new_pool, item_id)
+        .get_item(state.write_pool(bq.branch)?, item_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Item not found".to_string()))?;
 
