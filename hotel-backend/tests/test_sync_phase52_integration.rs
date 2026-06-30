@@ -346,7 +346,7 @@ async fn room_master_clean_flip_emits_marked_clean_event() {
         .with("id", MockValue::I32(legacy_id))
         .with("Room_no", MockValue::Str(room_no.clone()))
         .with("Room_Type", MockValue::Str("Standard".into()))
-        .with("Room_Clean", MockValue::Str("yes".into()))
+        .with("Room_Clean", MockValue::Str("no".into()))
         .with("Room_Use", MockValue::Str("no".into()))
         // `Room_Manternace` (legacy typo) became required after v2.63.0
         // extended the room mapper to project the maintenance flag.
@@ -423,7 +423,7 @@ async fn room_master_unchanged_clean_skips_event() {
         .with("id", MockValue::I32(legacy_id))
         .with("Room_no", MockValue::Str(room_no.clone()))
         .with("Room_Type", MockValue::Str("Standard".into()))
-        .with("Room_Clean", MockValue::Str("yes".into())) // already true
+        .with("Room_Clean", MockValue::Str("no".into())) // legacy 'no' = clean → canonical true (already true, no flip)
         .with("Room_Use", MockValue::Str("no".into()))
         // `Room_Manternace` (legacy typo) became required after v2.63.0
         // extended the room mapper to project the maintenance flag.
@@ -567,7 +567,7 @@ async fn room_master_auto_creates_unknown_room() {
         .with("id", MockValue::I32(legacy_id))
         .with("Room_no", MockValue::Str(room_no.clone()))
         .with("Room_Type", MockValue::Str("Standard".into()))
-        .with("Room_Clean", MockValue::Str("yes".into()))
+        .with("Room_Clean", MockValue::Str("no".into()))
         .with("Room_Use", MockValue::Str("no".into()))
         .with("Room_Manternace", MockValue::Str("no".into()))
         .with("Room_Details", MockValue::Str("TEST_autocreate".into()))
