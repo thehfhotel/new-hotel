@@ -393,6 +393,16 @@ export default function CheckOutModal({ room, onClose, onSuccess }: CheckOutModa
                       {formatCurrency(folio.balance)}
                     </span>
                   </div>
+                  {folio.deposit > 0 && (
+                    // Deposit (มัดจำ) is HELD, not credited against the room
+                    // bill — it is returned separately via คืนเงินมัดจำ (#49),
+                    // matching iHOTEL. Shown here for visibility only; it does
+                    // NOT reduce the balance above.
+                    <div className="flex justify-between pt-2 border-t border-dashed border-gray-200 text-[13px]">
+                      <span className="text-gray-500">มัดจำที่รับไว้ (คืนแยกต่างหาก)</span>
+                      <span className="font-medium text-gray-700">{formatCurrency(folio.deposit)}</span>
+                    </div>
+                  )}
                 </div>
               )}
 
