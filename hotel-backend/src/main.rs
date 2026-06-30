@@ -545,6 +545,12 @@ fn build_new_routes(app_state: AppState) -> Router {
             "/api/checkins/{id}/room-change-receipt",
             get(routes::new_checkins::room_change_receipt),
         )
+        // #29: printable registration slip (ใบลงทะเบียนเข้าพัก) reprint for any
+        // check-in — iHOTEL FrmRegMain equivalent. Branch-aware read.
+        .route(
+            "/api/checkins/{id}/registration-slip",
+            get(routes::new_checkins::registration_slip),
+        )
         // Task #49 — deposit refund (คืนเงินมัดจำ / iHOTEL FormShowDEPBack).
         // GET lists per-room deposit lines (backs the folio refund button);
         // POST marks a room's deposit refunded. Both branch-aware.

@@ -1326,6 +1326,89 @@ pub async fn room_change_receipt(
     }))
 }
 
+/// Printable registration slip (ใบลงทะเบียนเข้าพัก) for a check-in. Field names
+/// are camelCased to match the frontend `RegistrationSlipData` shape so the v2
+/// page can pass the JSON straight to `RegistrationSlipTemplate`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegistrationSlip {
+    pub success: bool,
+    pub registration_no: String,
+    pub check_in_id: i32,
+    pub guest_name: String,
+    pub guest_id_card: Option<String>,
+    pub guest_contact: Option<String>,
+    pub room_number: String,
+    pub room_type: Option<String>,
+    pub check_in_date: Option<String>,
+    pub check_out_date: Option<String>,
+    pub nights: i32,
+    pub rate_per_night: Option<f64>,
+    pub deposit: Option<f64>,
+    pub adults: Option<i32>,
+    pub children: Option<i32>,
+}
+
+/// `GET /api/checkins/:id/registration-slip` — printable registration slip for
+/// ANY check-in, so reception can RE-print it after the fact. iHOTEL exposes
+/// this standalone (FrmRegMain / ใบลงทะเบียนผู้เข้าพัก); our check-in modal only
+/// rendered the slip once, in its post-check-in success panel, so an
+/// iHOTEL-created (or already-completed) stay had no reprint path. Branch-aware
+/// read; the guest ID-card / contact come from the joined customer row.
+pub async fn registration_slip(
+    State(state): State<AppState>,
+    Path(cin_id): Path<i32>,
+    Query(query): Query<BranchQuery>,
+) -> ApiResult<Json<RegistrationSlip>> {
+    let pool = checkin_pool_for(&state, query.branch)?;
+    let row = sqlx::query(
+        "SELECT \
+            COALESCE(NULLIF(ci.legacy_cin_no, ''), ci.cin_no) AS registration_no, \
+            ci.cin_id AS check_in_id, \
+            COALESCE(NULLIF(TRIM(CONCAT(COALESCE(c.cust_firstname, ''), ' ', COALESCE(c.cust_lastname, ''))), ''), c.cust_name2, '') AS guest_name, \
+            NULLIF(c.cust_idcard, '') AS guest_id_card, \
+            NULLIF(c.cust_phone, '') AS guest_contact, \
+            r.room_no AS room_number, \
+            rt.type_name AS room_type, \
+            to_char(ci.cin_checkin_time, 'YYYY-MM-DD\"T\"HH24:MI:SS') AS check_in_date, \
+            to_char(ci.cin_expected_checkout, 'YYYY-MM-DD') AS check_out_date, \
+            GREATEST(1, (ci.cin_expected_checkout - ci.cin_checkin_time::date))::int AS nights, \
+            ci.cin_rate_per_night::float8 AS rate_per_night, \
+            (SELECT COALESCE(SUM(cr.cr_dep_amount), 0)::float8 \
+               FROM ht_checkin_rooms cr WHERE cr.cr_cin_id = ci.cin_id) AS deposit, \
+            ci.cin_adults AS adults, \
+            ci.cin_children AS children \
+           FROM ht_checkins ci \
+           LEFT JOIN ht_customers c ON c.cust_id = ci.cin_cust_id \
+           LEFT JOIN ht_rooms_new r ON r.room_id = ci.cin_room_id \
+           LEFT JOIN ht_room_types rt ON rt.type_id = r.room_type_id \
+          WHERE ci.cin_id = $1",
+    )
+    .bind(cin_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ApiError::Database(e.to_string()))?
+    .ok_or_else(|| ApiError::NotFound(format!("check-in {cin_id} not found")))?;
+
+    Ok(Json(RegistrationSlip {
+        success: true,
+        registration_no: row.try_get("registration_no").unwrap_or_default(),
+        check_in_id: row.try_get("check_in_id").unwrap_or_default(),
+        guest_name: row.try_get("guest_name").unwrap_or_default(),
+        guest_id_card: row.try_get("guest_id_card").ok(),
+        guest_contact: row.try_get("guest_contact").ok(),
+        room_number: row.try_get("room_number").unwrap_or_default(),
+        room_type: row.try_get("room_type").ok(),
+        check_in_date: row.try_get("check_in_date").ok(),
+        check_out_date: row.try_get("check_out_date").ok(),
+        nights: row.try_get("nights").unwrap_or(1),
+        rate_per_night: row.try_get("rate_per_night").ok(),
+        deposit: row.try_get("deposit").ok(),
+        adults: row.try_get("adults").ok(),
+        children: row.try_get("children").ok(),
+    }))
+}
+
 // =============================================================================
 // Deposit refund — Task #49 (คืนเงินมัดจำ)
 // =============================================================================

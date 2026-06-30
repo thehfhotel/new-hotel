@@ -1,6 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import Link from 'next/link'
 import { Printer, LogIn, LogOut, Moon, CalendarClock, type LucideIcon } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { useLiveRefresh } from '@/lib/v2/use-live-refresh'
@@ -377,7 +378,7 @@ function StayRosterSection({
       ) : (
         <table className="w-full text-[13px] border-collapse">
           <thead>
-            <Th cols={['ห้อง', 'ชื่อแขก', 'โทร', 'ประเภท', 'เข้า', 'ออก', 'คืน', 'แขก', 'หมายเหตุ']} nums={[6, 7]} />
+            <Th cols={['ห้อง', 'ชื่อแขก', 'โทร', 'ประเภท', 'เข้า', 'ออก', 'คืน', 'แขก', 'หมายเหตุ', 'พิมพ์']} nums={[6, 7]} />
           </thead>
           <tbody>
             {rows.map((r) => (
@@ -394,6 +395,17 @@ function StayRosterSection({
                 <Td num>{r.nights ?? '—'}</Td>
                 <Td num>{guestCount(r.adults, r.children)}</Td>
                 <Td mut>{r.notes || '—'}</Td>
+                <Td>
+                  <Link
+                    href={`/v2/registration/${r.cinId}`}
+                    aria-label="พิมพ์ใบลงทะเบียน"
+                    title="พิมพ์ใบลงทะเบียน"
+                    className="inline-flex"
+                    style={{ color: 'var(--v2-ink-3)' }}
+                  >
+                    <Printer size={15} />
+                  </Link>
+                </Td>
               </tr>
             ))}
           </tbody>
