@@ -509,11 +509,24 @@ async fn apply_receipt_upsert(
         .naive_local();
     let pay_date = p.receipt_date.unwrap_or(now);
 
-    // Look up by (cin_id, receipt_no) — the receipt_no is unique
-    // within the legacy app. We probe pay_reference first.
+    // Look up by (cin_id, receipt_no). The receipt_no is unique within the
+    // legacy app. Two columns can carry it:
+    //   * `pay_reference`      — set when the payment ORIGINATED in iHOTEL and
+    //                            was first imported here (legacy-originated).
+    //   * `legacy_receipt_no`  — stamped by OUR writeback back-population when
+    //                            the payment originated in THIS app (the
+    //                            allocated Receipt_no; `pay_reference` then
+    //                            holds the operator note, not the receipt).
+    // Probing only `pay_reference` missed app-originated rows, so the CT
+    // re-import of our own write-back created a phantom duplicate
+    // (`pay_created_by='legacy_app'`) — the 2026-06-30 HF Ville e2e echo.
+    // Match either column, and ORDER so the canonical app row
+    // (`legacy_receipt_no` match) wins deterministically even if a prior
+    // orphan duplicate still exists.
     let existing_pay_id: Option<i32> = sqlx::query_scalar(
         "SELECT pay_id FROM ht_payments \
-          WHERE pay_cin_id = $1 AND pay_reference = $2 \
+          WHERE pay_cin_id = $1 AND (legacy_receipt_no = $2 OR pay_reference = $2) \
+          ORDER BY (legacy_receipt_no = $2) DESC NULLS LAST, pay_id ASC \
           LIMIT 1",
     )
     .bind(cin_id)
@@ -524,9 +537,14 @@ async fn apply_receipt_upsert(
     let pay_id = match existing_pay_id {
         Some(id) => {
             sqlx::query(
+                // `pay_date` is COALESCE'd so re-importing a receipt never
+                // rewrites the timestamp of an app-originated row (which holds
+                // the app's creation instant) — only fills it when absent.
+                // Receipts are append-only in legacy, so the date is immutable
+                // post-insert for legacy-originated rows too.
                 "UPDATE ht_payments \
                     SET pay_amount    = $1::float8, \
-                        pay_date      = $2, \
+                        pay_date      = COALESCE(pay_date, $2), \
                         pay_voided    = $3, \
                         pay_voided_at = CASE WHEN $3 THEN NOW() ELSE NULL END \
                   WHERE pay_id = $4",
