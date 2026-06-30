@@ -373,6 +373,12 @@ services:
       - LEGACY_SYNC_TABLE_ALLOWLIST=${LEGACY_SYNC_TABLE_ALLOWLIST:-}
       # Sub-second polling target per architecture §3.6d.
       - CT_POLL_INTERVAL_MS=${CT_POLL_INTERVAL_MS:-1000}
+      # CT keep-warm (2026-06-30): periodically run a read-only
+      # CHANGE_TRACKING_CURRENT_VERSION() so the CT machinery stays hot on
+      # a quiescent overnight iHOTEL and the watchdog stall probe stops
+      # timing out. 45s sits under the 60s pool idle_timeout / watchdog
+      # interval. 0 disables. See docs/runbook-sync.md §2.
+      - LEGACY_SYNC_CT_KEEPALIVE_SECS=${LEGACY_SYNC_CT_KEEPALIVE_SECS:-45}
       # Cold-replay refusal: if last_seen_version=0 the watcher refuses
       # to start unless explicitly overridden — protects against the
       # "process every CT row from time-zero" footgun. Operator flips
@@ -488,6 +494,11 @@ services:
       # debug a specific table.
       - LEGACY_SYNC_TABLE_ALLOWLIST=${HFVILLE_LEGACY_SYNC_TABLE_ALLOWLIST:-}
       - CT_POLL_INTERVAL_MS=${HFVILLE_CT_POLL_INTERVAL_MS:-1000}
+      # CT keep-warm: wired but default-OFF for Ville (its WG tunnel flaps
+      # ~2min every couple of days; the per-tick query is harmless during a
+      # flap but we enable site-by-site). Flip HFVILLE_LEGACY_SYNC_CT_KEEPALIVE_SECS=45
+      # in .env to enable — no code change. See docs/runbook-sync.md §2.
+      - LEGACY_SYNC_CT_KEEPALIVE_SECS=${HFVILLE_LEGACY_SYNC_CT_KEEPALIVE_SECS:-0}
       - LEGACY_SYNC_ALLOW_COLD_REPLAY=${HFVILLE_LEGACY_SYNC_ALLOW_COLD_REPLAY:-false}
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,sync=info}
     secrets:
