@@ -388,6 +388,23 @@ const DEFAULT_WATCHDOG_CT_PROBE_TIMEOUT_MS: u64 = 30_000;
 /// cycles. Override via `LEGACY_SYNC_PROBE_OUTAGE_ESCALATION_SECS`.
 const DEFAULT_PROBE_OUTAGE_ESCALATION_SECS: u64 = 3600;
 
+/// 2026-06-30 — CT-machinery keep-warm interval. The watcher's per-tick
+/// `SELECT 1` connectivity probe already keeps the bb8 pool + WireGuard
+/// tunnel warm, but it does NOT exercise Change Tracking. On a quiescent
+/// overnight iHOTEL the FIRST `CHANGE_TRACKING_CURRENT_VERSION()` after a
+/// lull hits a cold CT path and can answer slower than the 30s watchdog
+/// probe budget — the benign "CT watermark idle — probe timed out" pattern
+/// (the connection is fine; CT version computation is simply cold). When
+/// this is > 0 a sibling task issues a read-only
+/// `CHANGE_TRACKING_CURRENT_VERSION()` on this cadence to keep the CT
+/// version machinery hot, so the real watchdog probe returns fast — and a
+/// GENUINE backlog is classified correctly instead of masked as a timeout.
+/// 0 = OFF (default). Opt-in because it adds a trivial read-only query to
+/// the SHARED legacy server 24/7; flip it on per-site via env. Recommended
+/// value when enabling: 45 (comfortably under the 60s pool idle_timeout and
+/// the 60s watchdog interval). Override via `LEGACY_SYNC_CT_KEEPALIVE_SECS`.
+const DEFAULT_CT_KEEPALIVE_SECS: u64 = 0;
+
 /// Track D / T7 CRIT-3 — watermark-stall watchdog poll interval (60s).
 /// Reads `legacy_ct_state.last_seen_version` + `last_polled_at` once
 /// per interval and compares against the previous observation.
@@ -1030,6 +1047,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .await;
     });
+
+    // 2026-06-30 — CT keep-warm task. See `DEFAULT_CT_KEEPALIVE_SECS` for
+    // the full rationale. Opt-in (default OFF): when
+    // `LEGACY_SYNC_CT_KEEPALIVE_SECS` > 0, periodically run a read-only
+    // `CHANGE_TRACKING_CURRENT_VERSION()` so the CT version machinery stays
+    // hot on a quiescent legacy and the watchdog's stall probe stops timing
+    // out during overnight quiet windows. Read-only; no writeback. Logs at
+    // debug so a healthy ping is silent at the default info level.
+    let ct_keepalive_secs = env::var("LEGACY_SYNC_CT_KEEPALIVE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CT_KEEPALIVE_SECS);
+    if ct_keepalive_secs > 0 {
+        let keepalive_mssql = mssql.clone();
+        let keepalive_site_id = site.id.clone();
+        let keepalive_shutdown = shutdown.clone();
+        // Reuse the watchdog's probe budget so keep-warm and the real probe
+        // agree on what "too slow" means.
+        let keepalive_timeout = Duration::from_millis(
+            env::var("LEGACY_SYNC_PROBE_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_WATCHDOG_CT_PROBE_TIMEOUT_MS),
+        );
+        tracing::info!(
+            site = %site.id,
+            interval_secs = ct_keepalive_secs,
+            timeout_ms = keepalive_timeout.as_millis() as u64,
+            "[Sync] CT keep-warm ENABLED — periodic CHANGE_TRACKING_CURRENT_VERSION() keeps the CT machinery hot"
+        );
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(ct_keepalive_secs));
+            // Consume the immediate first tick — startup already touched legacy.
+            ticker.tick().await;
+            let notified = keepalive_shutdown.notified();
+            tokio::pin!(notified);
+            loop {
+                tokio::select! {
+                    _ = &mut notified => {
+                        tracing::info!(
+                            site = %keepalive_site_id,
+                            "[Sync] CT keep-warm task exiting (SIGTERM)"
+                        );
+                        break;
+                    }
+                    _ = ticker.tick() => {
+                        match probe_change_tracking_current_version(&keepalive_mssql, keepalive_timeout).await {
+                            Ok(v) => tracing::debug!(
+                                site = %keepalive_site_id,
+                                ct_current = v,
+                                "[Sync] CT keep-warm ping ok"
+                            ),
+                            Err(err) => tracing::debug!(
+                                site = %keepalive_site_id,
+                                error = %err,
+                                "[Sync] CT keep-warm ping failed (benign — warmer next tick)"
+                            ),
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // P1 (task #67) — per-site reconcile safety net. The backend's
     // `init_scheduler` runs the 15-min diff-only reconcile ONLY for the
@@ -2321,27 +2401,30 @@ async fn run_watermark_watchdog(
                         // bypass), so this doesn't reintroduce spam.
                         last_stall_alert = Some((now, false));
                         pending_stall_alert = Some((now, observation.last_seen_version));
-                    } else if stall_page_passes_cooldown(last_stall_alert, now, cooldown, false) {
-                        tracing::warn!(
+                    } else {
+                        // Probe TIMED OUT — formerly the "informational" page.
+                        // 2026-06-30 (operator request): we no longer Slack this
+                        // benign quiet-period pattern. It self-clears on the next
+                        // reachable probe, and the only actionable variant — a
+                        // SUSTAINED probe outage — still pages via the escalation
+                        // branch above. We deliberately do NOT arm
+                        // `pending_stall_alert` here, so the paired all-clear
+                        // ("CT watermark RECOVERED") is suppressed too: nothing was
+                        // announced to Slack, so there is nothing to clear. The
+                        // escalation path stays armed because `info_outage_since`
+                        // is anchored above, independently of this branch. The log
+                        // line preserves full forensics for the dashboard / tracing.
+                        tracing::info!(
                             site = %site_id,
                             version = observation.last_seen_version,
+                            stuck_secs = stuck_for.as_secs(),
+                            outage_secs = info_outage_since
+                                .map(|t| now.duration_since(t).as_secs())
+                                .unwrap_or_default(),
+                            escalation_secs = probe_outage_escalation.as_secs(),
                             reason,
-                            "[watchdog] Watermark idle, probe timed out — informational page"
+                            "[watchdog] Watermark idle, probe timed out — informational (Slack-suppressed); escalation still armed"
                         );
-                        if let Some(s) = slack.as_ref() {
-                            let payload = SlackMessage::with_site_text(
-                                &site_id,
-                                format_stall_alert_message(
-                                    observation.last_seen_version,
-                                    probe,
-                                    stuck_for,
-                                    stall_threshold,
-                                ),
-                            );
-                            let _ = s.send_message(&payload).await;
-                        }
-                        last_stall_alert = Some((now, false));
-                        pending_stall_alert = Some((now, observation.last_seen_version));
                     }
                 } else if let Some(ct_current) = probe {
                     // Probe SUCCEEDED and disagreed with the watermark (the

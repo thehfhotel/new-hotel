@@ -71,6 +71,7 @@ Every variable consumed by `bin/sync`. Defaults are what
 | `LEGACY_SYNC_ALLOW_LIVE_BOOTSTRAP` | `true` = allow `--bootstrap` to run while `LEGACY_SYNC_ENABLED=true` (i.e. against a live deployment). The bootstrap snapshot's `DELETE FROM legacy_mirror.<table>` races the watcher's `mirror_source='ct'` UPSERTs and can clobber real-time CT writes that landed during the snapshot window. | `false` | NEVER in production. Supported procedure: stop the watcher first (`LEGACY_SYNC_ENABLED=false` + redeploy), bootstrap, re-enable. |
 | `LEGACY_SYNC_RECONCILE_MODE` | Mode for the demoted `scheduler::sync::run_sync` job. `diff_only` = log drift to `ht_reconcile_log`; `upsert` = legacy 5-min-style UPSERT into `ht_*_legacy`. | `diff_only` | Flip to `upsert` ONLY if the CT watcher is operationally disabled and you need the legacy safety net to keep canonical state in sync. |
 | `CT_POLL_INTERVAL_MS` | How often the watcher polls MSSQL CT. Lower = lower latency, higher load. | `1000` (1s) | Increase only if MSSQL load is a concern. |
+| `LEGACY_SYNC_CT_KEEPALIVE_SECS` | `> 0` = a sibling task runs a read-only `CHANGE_TRACKING_CURRENT_VERSION()` on this cadence to keep the CT version machinery warm. The per-tick `SELECT 1` keeps the *connection* warm but not CT, so on a quiescent overnight iHOTEL the watchdog's first CT probe after a lull can answer slower than its 30s budget → the benign `:information_source: CT watermark idle — probe timed out`. Keeping CT hot makes that probe return fast (and classify a *real* backlog correctly instead of masking it as a timeout). | `0` (off) | Flip to `45` per-site (under the 60s pool idle_timeout) if probe-timeout pages are noisy / you want the real-backlog probe to be reliable. Read-only; no writeback; safe to enable without reception coordination. |
 | `SYNC_TEST_SKIP_MSSQL_PROBE` | Test-only. `true` = skip the bb8-tiberius probe in `tests/test_sync_phase54_integration.rs::mssql_stub`. | unset | Set when running pure-PG tests without legacy MSSQL access (saves 30s per process). |
 | `DATABASE_URL` | PG DSN for the watcher's writes. | (set in compose) | Standard PG creds — same as backend. |
 | `DB_SERVER` / `DB_NAME` / `DB_USER` / `DB_PASSWORD` | Legacy MSSQL connection. | (set in compose) | Match the legacy app. |
@@ -92,6 +93,22 @@ prefixed so they're triagable in one glance.
 | `:no_entry: Bootstrap REFUSED — live deployment` | Operator ran `--bootstrap` while `LEGACY_SYNC_ENABLED=true`. The snapshot would race the live CT watcher's UPSERTs and clobber `mirror_source='ct'` rows. | Stop the watcher first (set `LEGACY_SYNC_ENABLED=false` and redeploy), then run `--bootstrap`, then re-enable. Set `LEGACY_SYNC_ALLOW_LIVE_BOOTSTRAP=true` ONLY if you accept the race window. |
 | `:rotating_light: CT retention overflow` | A specific table's `MIN_VALID_VERSION` is higher than the watermark — CT history we needed has aged out (default retention 2 days). | Re-bootstrap (Section 1). The reconcile inside `--bootstrap` will catch us up via the canonical UPSERT path. |
 | Mapper consecutive-failure threshold (future) | Per-table `legacy_sync_status.consecutive_failures` exceeds N. | Inspect `legacy_sync_status.last_error` for that table; check mapper logs for the failing CT row payload. |
+
+**Watermark watchdog — what reaches Slack (2026-06-30).** The watchdog
+no longer Slacks the benign `:information_source: CT watermark idle —
+probe timed out (informational)` note or its paired `:white_check_mark:
+CT watermark RECOVERED` all-clear — that pattern self-clears within a tick
+and was pure overnight noise. It is still logged (`tracing::info`,
+`"informational (Slack-suppressed); escalation still armed"`) and visible
+on `/api/new/sync/status`. The watchdog STILL pages for the actionable
+cases, each of which keeps its all-clear: a **sustained** probe outage
+(`:rotating_light: legacy probe unreachable Nmin`, after
+`LEGACY_SYNC_PROBE_OUTAGE_ESCALATION_SECS`, default 1h), a **confirmed
+backlog** (`:rotating_light: CT watermark STUCK`, probe shows
+`ct_current > watermark`), and a **monotonicity violation**
+(`:rotating_light: CT watermark anomaly`, `ct_current < watermark`). To
+reduce the underlying probe timeouts, see `LEGACY_SYNC_CT_KEEPALIVE_SECS`
+in Section 2.
 
 ---
 
