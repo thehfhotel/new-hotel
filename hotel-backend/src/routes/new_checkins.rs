@@ -1335,15 +1335,24 @@ pub struct RegistrationSlip {
     pub success: bool,
     pub registration_no: String,
     pub check_in_id: i32,
+    /// Customer account no (ACC NO. on the iHOTEL card) — legacy `Cust_no`.
+    pub acc_no: Option<String>,
     pub guest_name: String,
     pub guest_id_card: Option<String>,
     pub guest_contact: Option<String>,
+    pub guest_address: Option<String>,
+    pub vehicle_plate: Option<String>,
     pub room_number: String,
     pub room_type: Option<String>,
     pub check_in_date: Option<String>,
     pub check_out_date: Option<String>,
     pub nights: i32,
     pub rate_per_night: Option<f64>,
+    pub total_amount: Option<f64>,
+    /// Amount already paid / prepaid (จ่ายล่วงหน้า on the card).
+    pub paid_amount: Option<f64>,
+    /// Originating booking number (จากการจองเลขที่ …), if this stay came from one.
+    pub booking_no: Option<String>,
     pub deposit: Option<f64>,
     pub adults: Option<i32>,
     pub children: Option<i32>,
@@ -1365,15 +1374,21 @@ pub async fn registration_slip(
         "SELECT \
             COALESCE(NULLIF(ci.legacy_cin_no, ''), ci.cin_no) AS registration_no, \
             ci.cin_id AS check_in_id, \
+            NULLIF(ci.legacy_cust_no, '') AS acc_no, \
             COALESCE(NULLIF(TRIM(CONCAT(COALESCE(c.cust_firstname, ''), ' ', COALESCE(c.cust_lastname, ''))), ''), c.cust_name2, '') AS guest_name, \
             NULLIF(c.cust_idcard, '') AS guest_id_card, \
             NULLIF(c.cust_phone, '') AS guest_contact, \
+            NULLIF(c.cust_address, '') AS guest_address, \
+            NULLIF(ci.cin_vehicle_plate, '') AS vehicle_plate, \
             r.room_no AS room_number, \
             rt.type_name AS room_type, \
             to_char(ci.cin_checkin_time, 'YYYY-MM-DD\"T\"HH24:MI:SS') AS check_in_date, \
-            to_char(ci.cin_expected_checkout, 'YYYY-MM-DD') AS check_out_date, \
+            to_char(COALESCE(ci.cin_checkout_time, ci.cin_expected_checkout::timestamp), 'YYYY-MM-DD\"T\"HH24:MI:SS') AS check_out_date, \
             GREATEST(1, (ci.cin_expected_checkout - ci.cin_checkin_time::date))::int AS nights, \
             ci.cin_rate_per_night::float8 AS rate_per_night, \
+            ci.cin_total_amount::float8 AS total_amount, \
+            ci.cin_paid_amount::float8 AS paid_amount, \
+            NULLIF(b.book_no, '') AS booking_no, \
             (SELECT COALESCE(SUM(cr.cr_dep_amount), 0)::float8 \
                FROM ht_checkin_rooms cr WHERE cr.cr_cin_id = ci.cin_id) AS deposit, \
             ci.cin_adults AS adults, \
@@ -1382,6 +1397,7 @@ pub async fn registration_slip(
            LEFT JOIN ht_customers c ON c.cust_id = ci.cin_cust_id \
            LEFT JOIN ht_rooms_new r ON r.room_id = ci.cin_room_id \
            LEFT JOIN ht_room_types rt ON rt.type_id = r.room_type_id \
+           LEFT JOIN ht_bookings b ON b.book_id = ci.cin_book_id \
           WHERE ci.cin_id = $1",
     )
     .bind(cin_id)
@@ -1394,15 +1410,21 @@ pub async fn registration_slip(
         success: true,
         registration_no: row.try_get("registration_no").unwrap_or_default(),
         check_in_id: row.try_get("check_in_id").unwrap_or_default(),
+        acc_no: row.try_get("acc_no").ok(),
         guest_name: row.try_get("guest_name").unwrap_or_default(),
         guest_id_card: row.try_get("guest_id_card").ok(),
         guest_contact: row.try_get("guest_contact").ok(),
+        guest_address: row.try_get("guest_address").ok(),
+        vehicle_plate: row.try_get("vehicle_plate").ok(),
         room_number: row.try_get("room_number").unwrap_or_default(),
         room_type: row.try_get("room_type").ok(),
         check_in_date: row.try_get("check_in_date").ok(),
         check_out_date: row.try_get("check_out_date").ok(),
         nights: row.try_get("nights").unwrap_or(1),
         rate_per_night: row.try_get("rate_per_night").ok(),
+        total_amount: row.try_get("total_amount").ok(),
+        paid_amount: row.try_get("paid_amount").ok(),
+        booking_no: row.try_get("booking_no").ok(),
         deposit: row.try_get("deposit").ok(),
         adults: row.try_get("adults").ok(),
         children: row.try_get("children").ok(),
