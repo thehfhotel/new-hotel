@@ -215,6 +215,14 @@ services:
       - CHECKOUT_SERVER_TOTAL_ENABLED=${CHECKOUT_SERVER_TOTAL_ENABLED:-false}
       - BOOKING_VALIDATION_ENABLED=${BOOKING_VALIDATION_ENABLED:-false}
       - HFVILLE_WRITES_ENABLED=${HFVILLE_WRITES_ENABLED:-false}
+      # Self-healing reconcile sweep (scheduler/sync.rs). When a diff-only
+      # reconcile row resists convergence past FORCE_CONVERGE_MIN_AGE_SECS (1h),
+      # re-project the legacy row through the CT mapper instead of leaving it
+      # logged-but-unrepaired. Default OFF — the CT watcher + writeback do the
+      # real reconciliation; this only catches durable lag. This backend runs
+      # HF Hotel's reconcile; sync-hfville runs Ville's (its own override below).
+      # Flip per-site: `gh variable set RECONCILE_FORCE_CONVERGE_ENABLED -b true`.
+      - RECONCILE_FORCE_CONVERGE_ENABLED=${RECONCILE_FORCE_CONVERGE_ENABLED:-false}
       # Tracing log level. Default `hotel_backend=info,tower_http=info`
       # matches `main.rs::tracing_subscriber::EnvFilter::try_from_default_env`'s
       # fallback. Override at deploy time to crank up debug logging
@@ -486,6 +494,11 @@ services:
       # hotelville pools, so it runs Ville's reconcile here. ON for sync-hfville
       # only; HF Hotel keeps its single backend-side reconcile (no double-run).
       - WORKER_RECONCILE_ENABLED=${HFVILLE_WORKER_RECONCILE_ENABLED:-true}
+      # Self-healing force-converge for Ville's reconcile (sibling of the
+      # backend's RECONCILE_FORCE_CONVERGE_ENABLED above). Separate HFVILLE_
+      # override so we can enable Ville-first and soak before HF Hotel — Ville
+      # carries the reconcile-drift history (#69). Default OFF.
+      - RECONCILE_FORCE_CONVERGE_ENABLED=${HFVILLE_RECONCILE_FORCE_CONVERGE_ENABLED:-false}
       # Phase 5.5b Ville cutover (#80, 2026-04-30): allowlist cleared
       # post-021. Empty = poll every CT-enabled table (all 16 now). The
       # explicit 11-table list was Phase 5 only; with mirror tables CT-
