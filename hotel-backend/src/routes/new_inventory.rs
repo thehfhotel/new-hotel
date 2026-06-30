@@ -611,8 +611,14 @@ pub async fn list_items(
 /// POST /api/new/inventory/items - Create item
 pub async fn create_item(
     State(state): State<AppState>,
+    Query(bq): Query<InvBranchQuery>,
     Json(body): Json<CreateUpdateItemRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
+    // Branch-aware write: the code-uniqueness check, category resolution AND the
+    // insert all run against the per-site pool, so a Ville item isn't rejected
+    // by an HF-Hotel code clash (and isn't inserted into HF Hotel). HF Ville
+    // mutations stay 403'd by ville_write_guard until HFVILLE_WRITES_ENABLED.
+    let pool = state.write_pool(bq.branch)?;
     let code = body.code.trim();
     let name = body.name.trim();
     let unit = body.unit.trim();
@@ -629,7 +635,7 @@ pub async fn create_item(
 
     if state
         .inventory
-        .find_item_id_by_code(&state.new_pool, code)
+        .find_item_id_by_code(pool, code)
         .await?
         .is_some()
     {
@@ -639,10 +645,9 @@ pub async fn create_item(
     let min_stock = body.min_stock.unwrap_or(0);
     let current_stock = body.current_stock.unwrap_or(0);
     let active = body.active.unwrap_or(true);
-    let category_id =
-        resolve_category_id(&state.new_pool, body.category_id, &body.category).await?;
+    let category_id = resolve_category_id(pool, body.category_id, &body.category).await?;
 
-    let mut tx = state.new_pool.begin().await?;
+    let mut tx = pool.begin().await?;
     let id = state
         .inventory
         .insert_item(
@@ -690,8 +695,12 @@ pub async fn get_item(
 pub async fn update_item(
     State(state): State<AppState>,
     Path(item_id): Path<i32>,
+    Query(bq): Query<InvBranchQuery>,
     Json(body): Json<CreateUpdateItemRequest>,
 ) -> ApiResult<Json<MutationResponse>> {
+    // Branch-aware write (see create_item): code check, category resolve + update
+    // all run on the per-site pool.
+    let pool = state.write_pool(bq.branch)?;
     let code = body.code.trim();
     let name = body.name.trim();
     let unit = body.unit.trim();
@@ -708,7 +717,7 @@ pub async fn update_item(
 
     if state
         .inventory
-        .find_item_id_by_code_excluding(&state.new_pool, code, item_id)
+        .find_item_id_by_code_excluding(pool, code, item_id)
         .await?
         .is_some()
     {
@@ -718,10 +727,9 @@ pub async fn update_item(
     let min_stock = body.min_stock.unwrap_or(0);
     let current_stock = body.current_stock.unwrap_or(0);
     let active = body.active.unwrap_or(true);
-    let category_id =
-        resolve_category_id(&state.new_pool, body.category_id, &body.category).await?;
+    let category_id = resolve_category_id(pool, body.category_id, &body.category).await?;
 
-    let mut tx = state.new_pool.begin().await?;
+    let mut tx = pool.begin().await?;
     let rows_affected = state
         .inventory
         .update_item(
