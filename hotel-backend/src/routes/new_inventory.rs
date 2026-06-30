@@ -220,18 +220,78 @@ pub struct ItemResponse {
     pub item: Item,
 }
 
-/// Request for creating/updating item
+/// A category reference accepted on the item create/update body: either a
+/// numeric category id or a category name (resolved to an id server-side).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum CategoryRef {
+    Id(i32),
+    Name(String),
+}
+
+/// Request for creating/updating item.
+///
+/// Field aliases accept the frontend's camelCase payload shape
+/// (`itemCode`/`itemName`/`costPerUnit`/`minStock`/`currentStock`) in addition
+/// to the canonical names, so the form can POST/PUT without a 422.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateUpdateItemRequest {
+    #[serde(alias = "itemCode")]
     pub code: String,
+    #[serde(alias = "itemName")]
     pub name: String,
     pub category_id: Option<i32>,
+    /// Optional category reference (id or name). When `category_id` is absent
+    /// and this carries a name, it is resolved against `ht_inventory_categories`.
+    pub category: Option<CategoryRef>,
     pub unit: String,
+    #[serde(alias = "minStock")]
     pub min_stock: Option<i32>,
+    #[serde(alias = "currentStock")]
     pub current_stock: Option<i32>,
+    #[serde(alias = "costPerUnit")]
     pub cost: Option<f64>,
     pub active: Option<bool>,
+}
+
+/// Resolve the effective category id for an item write.
+///
+/// Precedence: an explicit `category_id` wins. Otherwise, if a `category`
+/// reference was sent, a numeric id is taken as-is and a name is looked up in
+/// `ht_inventory_categories` (case-insensitive exact match). An unknown name is
+/// a clean 400 — categories are never auto-created here. A missing category is
+/// allowed (`None`), matching the previous nullable behavior.
+async fn resolve_category_id(
+    pool: &crate::db::PgPool,
+    category_id: Option<i32>,
+    category: &Option<CategoryRef>,
+) -> ApiResult<Option<i32>> {
+    if let Some(id) = category_id {
+        return Ok(Some(id));
+    }
+    match category {
+        None => Ok(None),
+        Some(CategoryRef::Id(id)) => Ok(Some(*id)),
+        Some(CategoryRef::Name(name)) => {
+            let name = name.trim();
+            if name.is_empty() {
+                return Ok(None);
+            }
+            let found: Option<i32> = sqlx::query_scalar(
+                "SELECT cat_id FROM ht_inventory_categories WHERE LOWER(cat_name) = LOWER($1) LIMIT 1",
+            )
+            .bind(name)
+            .fetch_optional(pool)
+            .await?;
+            match found {
+                Some(id) => Ok(Some(id)),
+                None => Err(ApiError::BadRequest(format!(
+                    "Unknown category '{name}'"
+                ))),
+            }
+        }
+    }
 }
 
 /// Aggregated room inventory item (shape used by RoomInventoryChecklist frontend)
@@ -553,6 +613,8 @@ pub async fn create_item(
     let min_stock = body.min_stock.unwrap_or(0);
     let current_stock = body.current_stock.unwrap_or(0);
     let active = body.active.unwrap_or(true);
+    let category_id =
+        resolve_category_id(&state.new_pool, body.category_id, &body.category).await?;
 
     let mut tx = state.new_pool.begin().await?;
     let id = state
@@ -562,7 +624,7 @@ pub async fn create_item(
             ItemWrite {
                 code,
                 name,
-                category_id: body.category_id,
+                category_id,
                 unit,
                 min_stock,
                 current_stock,
@@ -629,6 +691,8 @@ pub async fn update_item(
     let min_stock = body.min_stock.unwrap_or(0);
     let current_stock = body.current_stock.unwrap_or(0);
     let active = body.active.unwrap_or(true);
+    let category_id =
+        resolve_category_id(&state.new_pool, body.category_id, &body.category).await?;
 
     let mut tx = state.new_pool.begin().await?;
     let rows_affected = state
@@ -639,7 +703,7 @@ pub async fn update_item(
             ItemWrite {
                 code,
                 name,
-                category_id: body.category_id,
+                category_id,
                 unit,
                 min_stock,
                 current_stock,

@@ -177,9 +177,22 @@ function InventoryItemsContent() {
       }),
     })
 
-    const result = await response.json()
+    // A non-OK response may not be JSON (e.g. a serde 422 returns plain text),
+    // so read the body as text first and only parse it as JSON when it is.
+    if (!response.ok) {
+      const text = await response.text()
+      let message = text
+      try {
+        const parsed = JSON.parse(text)
+        message = parsed.message || text
+      } catch {
+        // body was not JSON — surface the raw text
+      }
+      throw new Error(message || 'Failed to save item')
+    }
 
-    if (!response.ok || !result.success) {
+    const result = await response.json()
+    if (!result.success) {
       throw new Error(result.message || 'Failed to save item')
     }
 
