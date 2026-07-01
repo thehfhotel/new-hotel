@@ -215,7 +215,13 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
       // the check-in via its provisional tmpNo. Best-effort — a photo is a
       // convenience and must never block the check-in.
       let photoTmpNo: string | undefined
-      if (prefill?.photoBase64) {
+      if (prefill?.docTmpNo) {
+        // The card reader already rendered AND stored the full Thai-ID card
+        // server-side; link that provisional doc straight through by its
+        // tmp_no. No image re-upload — the check-in linkage backfills
+        // ht_guest_documents.doc_cin_id by doc_legacy_tmp_no.
+        photoTmpNo = prefill.docTmpNo
+      } else if (prefill?.photoBase64) {
         try {
           const docType = prefill.docType ?? 'thai_id_card'
           const docRes = await branchFetch('/api/guest-documents', {

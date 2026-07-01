@@ -17,6 +17,7 @@ pub mod middleware;
 pub mod models;
 pub mod notifications;
 pub mod outbox;
+pub mod render;
 pub mod repository;
 pub mod routes;
 pub mod scheduler;

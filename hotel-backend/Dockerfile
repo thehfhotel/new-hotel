@@ -205,9 +205,14 @@ FROM debian:bookworm-slim@sha256:0104b334637a5f19aa9c983a91b54c89887c0984081f206
 LABEL org.opencontainers.image.source=https://github.com/thehfhotel/new-hotel
 LABEL org.opencontainers.image.licenses=Proprietary
 
-RUN apt-get update && apt-get install -y \
+# fonts-tlwg-loma-ttf: Debian DFSG TLWG "Loma" Thai TrueType face used to shape
+# the reconstructed Thai national-ID card (render/thai_id_card.rs). Installs
+# /usr/share/fonts/truetype/tlwg/Loma-Bold.ttf — the default THAI_ID_FONT_PATH.
+# Pure font data, no runtime library to link.
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    fonts-tlwg-loma-ttf \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

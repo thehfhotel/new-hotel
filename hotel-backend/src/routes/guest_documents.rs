@@ -31,12 +31,14 @@ use axum::{
 use base64::Engine as _;
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sqlx::Row as _;
 use uuid::Uuid;
 
 use super::mode::{AppState, Branch};
 use crate::error::{ApiError, ApiResult};
 use crate::outbox::{generate_idempotency_key, OutboxRepository, WritebackIntent};
+use crate::render::thai_id_card::{render_card, ThaiIdCardFields};
 
 /// The canonical `doc_type` values this endpoint accepts. Mirrored to the legacy
 /// `Tb_Save_Image.ttype` Thai literal by `writeback::recipes::save_image`.
@@ -317,6 +319,147 @@ pub async fn get_guest_document(
         .header(header::CACHE_CONTROL, "private, no-store")
         .body(Body::from(image))
         .map_err(|e| ApiError::Internal(format!("failed to build image response: {e}")))
+}
+
+/// Body for `POST /api/guest-documents/render-thai-id`.
+///
+/// A superset of the raw card fields plus the chip face photo (base64 JPEG) and
+/// the optional canonical linkage ids. All name/date/address fields are
+/// optional (default blank) — a partial chip read still composites a card with
+/// whatever it captured.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderThaiIdRequest {
+    pub cid: String,
+    #[serde(default)]
+    pub thai_title: String,
+    #[serde(default)]
+    pub thai_first_name: String,
+    #[serde(default)]
+    pub thai_last_name: String,
+    #[serde(default)]
+    pub english_title: String,
+    #[serde(default)]
+    pub english_first_name: String,
+    #[serde(default)]
+    pub english_last_name: String,
+    #[serde(default)]
+    pub date_of_birth: String,
+    #[serde(default)]
+    pub issue_date: String,
+    #[serde(default)]
+    pub address: String,
+    /// Base64-encoded chip face photo (JPEG; standard alphabet, padding
+    /// optional, whitespace tolerated).
+    pub photo_base64: String,
+    #[serde(default)]
+    pub cust_id: Option<i32>,
+    #[serde(default)]
+    pub cin_id: Option<i32>,
+}
+
+/// `POST /api/guest-documents/render-thai-id` — composite the reconstructed Thai
+/// national-ID card (template background + chip face photo + shaped text)
+/// server-side and store it in `ht_guest_documents` so a check-in captured via
+/// OUR card-reader gets the same style of card iHOTEL prints.
+///
+/// Storage reuses the [`create_guest_document`] path/columns exactly, with the
+/// values fixed for a rendered card (`doc_type='thai_id_card'`,
+/// `doc_source='chip'`, `doc_mime='image/png'`). PG-CANONICAL ONLY — no legacy
+/// `Tb_Save_Image` writeback is enqueued here (invariant #6: this endpoint is
+/// verification/shadow-only; the raw-photo `POST /api/guest-documents` path owns
+/// the dark legacy mirror).
+///
+/// Degradation contract: a *render* failure (template/font asset absent or
+/// unreadable, SVG parse/raster failure) returns **HTTP 200** with
+/// `{success:false, reason:'render_unavailable'}` — NOT a 5xx — so the frontend
+/// cleanly falls back to uploading the raw face photo. Genuine client errors
+/// (missing/invalid `photoBase64`) still return 4xx; a DB failure still 500s.
+pub async fn render_thai_id_card(
+    State(state): State<AppState>,
+    Query(query): Query<DocBranchQuery>,
+    Json(body): Json<RenderThaiIdRequest>,
+) -> ApiResult<Json<Value>> {
+    let pool = resolve_pool(&state, query.branch)?;
+
+    // Decode the chip face photo (JPEG). Strip whitespace like the raw-upload
+    // path so a client that pretty-prints its base64 still works.
+    let cleaned: String = body
+        .photo_base64
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if cleaned.is_empty() {
+        return Err(ApiError::BadRequest(
+            "photoBase64 must not be empty".to_string(),
+        ));
+    }
+    let face_jpeg = base64::engine::general_purpose::STANDARD
+        .decode(cleaned.as_bytes())
+        .map_err(|e| ApiError::BadRequest(format!("photoBase64 is not valid base64: {e}")))?;
+    if face_jpeg.is_empty() {
+        return Err(ApiError::BadRequest("decoded photo is empty".to_string()));
+    }
+
+    let fields = ThaiIdCardFields {
+        cid: body.cid.clone(),
+        thai_title: body.thai_title.clone(),
+        thai_first_name: body.thai_first_name.clone(),
+        thai_last_name: body.thai_last_name.clone(),
+        english_title: body.english_title.clone(),
+        english_first_name: body.english_first_name.clone(),
+        english_last_name: body.english_last_name.clone(),
+        date_of_birth: body.date_of_birth.clone(),
+        issue_date: body.issue_date.clone(),
+        address: body.address.clone(),
+    };
+
+    let template_path = crate::config::thai_id_template_path();
+    let font_path = crate::config::thai_id_font_path();
+
+    // Composite. Any render failure (missing assets etc.) degrades to
+    // success:false / HTTP 200 rather than erroring — the frontend then uploads
+    // the raw face photo instead.
+    let png = match render_card(&fields, &face_jpeg, &template_path, &font_path) {
+        Ok(png) => png,
+        Err(e) => {
+            tracing::warn!("thai-id card render unavailable: {e}");
+            return Ok(Json(json!({
+                "success": false,
+                "reason": "render_unavailable",
+            })));
+        }
+    };
+
+    // Store canonically — same columns as create_guest_document, fixed for a
+    // rendered card. Provisional Tb_Save_Image.tmp_no minted the same way.
+    let tmp_no = Uuid::new_v4().simple().to_string();
+    let row = sqlx::query(
+        "INSERT INTO ht_guest_documents ( \
+             doc_cust_id, doc_cin_id, doc_type, doc_mime, doc_image, doc_source, \
+             doc_legacy_tmp_no \
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         RETURNING doc_id",
+    )
+    .bind(body.cust_id)
+    .bind(body.cin_id)
+    .bind("thai_id_card")
+    .bind("image/png")
+    .bind(&png)
+    .bind("chip")
+    .bind(&tmp_no)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::Internal(format!("failed to store rendered card: {e}")))?;
+    let doc_id: i32 = row
+        .try_get("doc_id")
+        .map_err(|e| ApiError::Internal(format!("doc_id missing after insert: {e}")))?;
+
+    Ok(Json(json!({
+        "success": true,
+        "docId": doc_id,
+        "tmpNo": tmp_no,
+    })))
 }
 
 /// Map a row-decode failure to a 500 (schema drift, not a client bug).

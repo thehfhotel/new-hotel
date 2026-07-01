@@ -392,6 +392,28 @@ pub fn guest_document_storage_enabled() -> bool {
     flag_enabled("GUEST_DOCUMENT_STORAGE_ENABLED")
 }
 
+/// Filesystem path to the Thai national-ID card template background PNG
+/// (`THAI_ID_TEMPLATE_PATH`). Consumed by `render::thai_id_card::render_card`
+/// for `POST /api/guest-documents/render-thai-id`.
+///
+/// Defaults to the compose bind-mount target `/run/assets/thai_id_template.png`.
+/// The template is an out-of-band host asset (NOT in git); when it is absent the
+/// render endpoint degrades gracefully to `{success:false}` — so a missing file
+/// here is tolerated rather than fatal.
+pub fn thai_id_template_path() -> String {
+    std::env::var("THAI_ID_TEMPLATE_PATH")
+        .unwrap_or_else(|_| "/run/assets/thai_id_template.png".to_string())
+}
+
+/// Filesystem path to the Thai font used to shape the ID-card text
+/// (`THAI_ID_FONT_PATH`). Defaults to Loma Bold, which the backend image ships
+/// via `fonts-tlwg-loma-ttf` (see `hotel-backend/Dockerfile`). resvg/rustybuzz
+/// load this file for correct Thai complex-script shaping.
+pub fn thai_id_font_path() -> String {
+    std::env::var("THAI_ID_FONT_PATH")
+        .unwrap_or_else(|_| "/usr/share/fonts/truetype/tlwg/Loma-Bold.ttf".to_string())
+}
+
 /// Phase-4 TM.30 companion-guest writeback flag (`TM30_COMPANION_WRITEBACK_ENABLED`).
 ///
 /// Default `false` (ship DARK). When off, `POST /api/checkins/{id}/guests`

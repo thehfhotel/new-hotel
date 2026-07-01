@@ -684,6 +684,15 @@ fn build_new_routes(app_state: AppState) -> Router {
             "/api/guest-documents",
             post(routes::guest_documents::create_guest_document),
         )
+        // Server-side Thai national-ID card compositing (render/thai_id_card.rs):
+        // reconstruct the iHOTEL ReportReg card face from a chip capture + store
+        // the PNG canonically. Degrades to {success:false} when the template/font
+        // asset is absent (frontend then uploads the raw face photo). Static
+        // `render-thai-id` is matched ahead of the `{doc_id}` param below.
+        .route(
+            "/api/guest-documents/render-thai-id",
+            post(routes::guest_documents::render_thai_id_card),
+        )
         .route(
             "/api/guest-documents/{doc_id}",
             get(routes::guest_documents::get_guest_document),

@@ -53,6 +53,14 @@ export interface CheckInPrefill {
   addCode?: string
   /** Raw base64 JPEG (NO `data:` prefix) of the guest photo / document scan. */
   photoBase64?: string
+  /**
+   * Provisional guest-document `tmp_no` for a card the reader already rendered
+   * AND stored server-side (via `POST /api/guest-documents/render-thai-id`).
+   * When present the check-in links the stored doc by `photoTmpNo` instead of
+   * re-uploading an image — so the full rendered card is preserved rather than
+   * just the raw face crop. Mutually exclusive with `photoBase64` in practice.
+   */
+  docTmpNo?: string
   /** Source document type — drives guest-document storage + legacy `ttype`. */
   docType?: 'thai_id_card' | 'passport'
 }

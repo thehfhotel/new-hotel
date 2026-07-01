@@ -229,11 +229,25 @@ services:
       # (e.g. `hotel_backend::scheduler::sync=debug`) for diagnostic
       # windows. Set via GH variable `RUST_LOG`.
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,tower_http=info}
+      # Thai national-ID card server-side compositing (routes/guest_documents.rs
+      # → render/thai_id_card.rs). The font ships IN the image (Dockerfile:
+      # fonts-tlwg-loma-ttf); the template PNG is an out-of-band host asset
+      # bind-mounted read-only below (NOT in git). If either asset is absent the
+      # endpoint returns {success:false, reason:'render_unavailable'} (HTTP 200)
+      # and the client falls back to uploading the raw face photo — no 5xx.
+      - THAI_ID_TEMPLATE_PATH=${THAI_ID_TEMPLATE_PATH:-/run/assets/thai_id_template.png}
+      - THAI_ID_FONT_PATH=${THAI_ID_FONT_PATH:-/usr/share/fonts/truetype/tlwg/Loma-Bold.ttf}
     secrets:
       - db_password
       - postgres_password
       - ville_db_password
       - slack_webhook_url
+    volumes:
+      # Thai-ID card template background — out-of-band host asset (NOT in git),
+      # mounted read-only. Absence is tolerated: the render endpoint degrades to
+      # {success:false} (see THAI_ID_TEMPLATE_PATH above). Override the host path
+      # via ASSETS_DIR (default /home/deploy/assets on evergreen).
+      - ${ASSETS_DIR:-/home/deploy/assets}/thai_id_template.png:/run/assets/thai_id_template.png:ro
     depends_on:
       newdb:
         condition: service_healthy

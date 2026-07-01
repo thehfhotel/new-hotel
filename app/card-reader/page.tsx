@@ -4,7 +4,8 @@ import { useState, useCallback, useEffect, useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import { CreditCard, RefreshCw, CheckCircle2, XCircle, User, AlertCircle, Server, Terminal, Download } from 'lucide-react'
 import { formatStoredDayMonthYear } from '@/lib/format'
-import { setCheckInPrefill } from '@/lib/checkin-prefill'
+import { setCheckInPrefill, type CheckInPrefill } from '@/lib/checkin-prefill'
+import { useBranchFetch } from '@/lib/use-branch-fetch'
 
 type ConnectionStatus = 'disconnected' | 'connecting' | 'connected'
 type ReadStatus = 'idle' | 'reading' | 'success' | 'error'
@@ -74,10 +75,14 @@ function toGregorianIsoDate(raw: string | undefined): string | undefined {
 
 export default function CardReaderPage() {
   const router = useRouter()
+  const branchFetch = useBranchFetch()
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('disconnected')
   const [readStatus, setReadStatus] = useState<ReadStatus>('idle')
   const [cardData, setCardData] = useState<ThaiIdCardData | null>(null)
   const [errorMessage, setErrorMessage] = useState<string>('')
+  // True while we render+store the full card server-side on "use this data".
+  // Guards against a double-submit and gives the receptionist feedback.
+  const [savingCard, setSavingCard] = useState(false)
   const healthCheckRef = useRef<NodeJS.Timeout | null>(null)
 
   // Health check function
@@ -152,15 +157,16 @@ export default function CardReaderPage() {
     }
   }
 
-  const handleUseData = () => {
-    if (!cardData) return
+  const handleUseData = async () => {
+    if (!cardData || savingCard) return
+    setSavingCard(true)
     // Stash the parsed Thai-ID fields for the check-in form to consume, then
     // hand off to the rooms screen where the receptionist picks a room and
     // opens the check-in modal (which prefills from this slot). We now carry
     // the full card payload (name, English name, DOB, gender, address and the
     // chip photo) so the check-in can persist a richer customer record + a
     // guest-document image. Only non-empty fields are stashed.
-    setCheckInPrefill({
+    const prefill: CheckInPrefill = {
       docType: 'thai_id_card',
       firstName: cardData.thaiFirstName || undefined,
       lastName: cardData.thaiLastName || undefined,
@@ -172,8 +178,43 @@ export default function CardReaderPage() {
       sex: genderToThaiSex(cardData.gender),
       dob: toGregorianIsoDate(cardData.dateOfBirth),
       address: cardData.address || undefined,
-      photoBase64: cardData.photo || undefined,
-    })
+    }
+
+    // Ask the backend to render the full Thai-ID card server-side and store it.
+    // On success we hand off only the provisional tmp_no (docTmpNo) so the
+    // check-in links the stored, fully-rendered card without re-uploading an
+    // image. On any failure (render assets missing, network, non-ok) we fall
+    // back to shipping the raw chip face crop as photoBase64 — a missing
+    // template must never block the check-in flow.
+    try {
+      const res = await branchFetch('/api/guest-documents/render-thai-id', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cid: cardData.cid,
+          thaiTitle: cardData.thaiTitle,
+          thaiFirstName: cardData.thaiFirstName,
+          thaiLastName: cardData.thaiLastName,
+          englishTitle: cardData.englishTitle,
+          englishFirstName: cardData.englishFirstName,
+          englishLastName: cardData.englishLastName,
+          dateOfBirth: cardData.dateOfBirth,
+          issueDate: cardData.issueDate,
+          address: cardData.address,
+          photoBase64: cardData.photo,
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (res.ok && data.success && data.tmpNo) {
+        prefill.docTmpNo = data.tmpNo
+      } else {
+        prefill.photoBase64 = cardData.photo || undefined
+      }
+    } catch {
+      prefill.photoBase64 = cardData.photo || undefined
+    }
+
+    setCheckInPrefill(prefill)
     router.push('/rooms')
   }
 
@@ -389,10 +430,11 @@ export default function CardReaderPage() {
             <div className="border-t px-6 py-4 bg-gray-50 rounded-b-lg flex justify-end">
               <button
                 onClick={handleUseData}
-                className="bg-green-600 hover:bg-green-700 text-white px-6 py-2 rounded-lg transition-colors flex items-center gap-2"
+                disabled={savingCard}
+                className="bg-green-600 hover:bg-green-700 disabled:bg-green-400 disabled:cursor-not-allowed text-white px-6 py-2 rounded-lg transition-colors flex items-center gap-2"
               >
-                <CheckCircle2 size={20} />
-                ใช้ข้อมูลนี้
+                {savingCard ? <RefreshCw size={20} className="animate-spin" /> : <CheckCircle2 size={20} />}
+                {savingCard ? 'กำลังบันทึกบัตร...' : 'ใช้ข้อมูลนี้'}
               </button>
             </div>
           </div>
