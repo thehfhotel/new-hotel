@@ -2841,6 +2841,17 @@ async fn run_one_tick(
     // canonical write, mirroring the CT mappers.
     sync_round_bills(pg, mssql, shadow_mode, site_id).await;
 
+    // Guest-image sync-IN — read-only poll of the legacy `Tb_Save_Image`
+    // reconstructed Thai-ID card / face-photo blobs into canonical
+    // `ht_guest_documents` (doc_source='legacy'), so the registration form
+    // serves the SAME image iHOTEL prints without the API ever touching
+    // legacy. Same read-only per-tick poll spirit as `sync_round_bills`
+    // (NOT Change-Tracking — no legacy DDL): runs LAST, logs at WARN and
+    // returns on any error so an image failure never aborts the tick, and
+    // skips the canonical write in shadow mode. Read-only from legacy, so it
+    // defaults ENABLED (kill-switch `GUEST_DOC_SYNC_ENABLED=false`/`0`).
+    sync_guest_documents(pg, mssql, shadow_mode, site_id).await;
+
     // Cash in/out petty-cash ledger (รายรับ-รายจ่าย) sync — same read-only
     // per-tick poll pattern as `sync_round_bills` (low-volume legacy ledger
     // + config trees, NOT Change-Tracking, so no legacy DDL). Mirrors
@@ -3941,6 +3952,273 @@ async fn sync_round_bills(pg: &PgPool, mssql: &DbPool, shadow_mode: bool, site_i
             site = %site_id,
             upserted,
             "round-bill sync: upserted canonical shifts from HT_Round_Bill"
+        );
+    }
+}
+
+/// Guest-image sync-IN — read-only per-tick poll of the legacy `Tb_Save_Image`
+/// blobs into canonical `ht_guest_documents` (`doc_source='legacy'`).
+///
+/// iHOTEL stores a reconstructed Thai-ID card image (`ttype 'บัตรประชาชน'`) and a
+/// face photo (`'รูปลูกค้า'`) per check-in; the registration form must show the SAME
+/// image iHOTEL prints. The API is forbidden from touching legacy (architecture
+/// rule), so the sync worker mirrors the bytes into `ht_guest_documents` and the
+/// existing API/form path serves them from there.
+///
+/// **Resilience**: identical spirit to `sync_round_bills` — every error path logs
+/// at WARN and returns; shadow mode logs at INFO and skips the canonical write.
+/// NOT a Change-Tracking mapper (low-volume, no legacy DDL), so it runs LAST in
+/// the tick and a failure here never aborts the load-bearing CT sync.
+///
+/// **Idempotency**: the UPSERT conflict target is the partial UNIQUE index on
+/// `doc_legacy_id` (`= Tb_Save_Image.id`, migration 071), so a re-poll or
+/// crash-after-commit replay never lands the same legacy image twice.
+///
+/// Read-only from legacy, so it defaults ENABLED — kill-switch
+/// `GUEST_DOC_SYNC_ENABLED=false`/`0` disables it.
+async fn sync_guest_documents(pg: &PgPool, mssql: &DbPool, shadow_mode: bool, site_id: &str) {
+    // Kill-switch: DEFAULT ENABLED; only skip when explicitly "false"/"0".
+    let enabled = match std::env::var("GUEST_DOC_SYNC_ENABLED") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            v != "false" && v != "0"
+        }
+        Err(_) => true,
+    };
+    if !enabled {
+        return;
+    }
+
+    if shadow_mode {
+        tracing::info!(
+            event_name = "guest_doc_sync_shadow",
+            site = %site_id,
+            "guest-image sync (shadow): skipping legacy read + canonical write"
+        );
+        return;
+    }
+
+    // Bounded batch (newest first) of check-ins that still have NO image at all.
+    let batch: Vec<(i32, Option<i32>, String)> =
+        match sqlx::query_as::<_, (i32, Option<i32>, String)>(
+            "SELECT ci.cin_id, ci.cin_cust_id, ci.legacy_cin_no FROM ht_checkins ci \
+              WHERE ci.legacy_cin_no IS NOT NULL AND ci.legacy_cin_no <> '' \
+                AND NOT EXISTS ( \
+                    SELECT 1 FROM ht_guest_documents gd WHERE gd.doc_cin_id = ci.cin_id) \
+              ORDER BY ci.cin_id DESC LIMIT 20",
+        )
+        .fetch_all(pg)
+        .await
+        {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::warn!(
+                    event_name = "guest_doc_sync_query_fail",
+                    site = %site_id,
+                    error = %err,
+                    "guest-image sync: PG batch SELECT failed; skipping"
+                );
+                return;
+            }
+        };
+    if batch.is_empty() {
+        return;
+    }
+
+    // legacy_cin_no -> (cin_id, cin_cust_id)
+    let mut by_cin_no: HashMap<String, (i32, Option<i32>)> = HashMap::new();
+    for (cin_id, cust_id, legacy_cin_no) in &batch {
+        by_cin_no.insert(legacy_cin_no.clone(), (*cin_id, *cust_id));
+    }
+
+    // Safely single-quote the cin_nos for the IN list. These are our own
+    // CHyy-nnnnnn values (no MSSQL literal-encoding hazard — plain `'…'`, never
+    // `N'…'`), but escape doubled single-quotes defensively.
+    let in_list = by_cin_no
+        .keys()
+        .map(|k| format!("'{}'", k.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut conn = match mssql.get().await {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::warn!(
+                event_name = "guest_doc_sync_conn_fail",
+                site = %site_id,
+                error = %err,
+                "guest-image sync: could not acquire MSSQL connection; skipping"
+            );
+            return;
+        }
+    };
+
+    // Step 1 — metadata only (NO blob): pick which image to mirror per cin_no.
+    let meta_sql =
+        format!("SELECT id, cin_no, ttype FROM Tb_Save_Image WHERE cin_no IN ({in_list})");
+    let meta_rows =
+        match simple_query_with_timeout_pooled(&mut conn, &meta_sql, MssqlOpKind::Read).await {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::warn!(
+                    event_name = "guest_doc_sync_query_fail",
+                    site = %site_id,
+                    error = %err,
+                    "guest-image sync: Tb_Save_Image metadata SELECT failed; skipping"
+                );
+                return;
+            }
+        };
+
+    // Classify ttype IN RUST by substring (avoids Thai-literal encoding issues in
+    // SQL) and keep the lowest-rank per cin_no (prefer id card / passport over the
+    // face photo).
+    let mut chosen: HashMap<String, (i32, &'static str, i32)> = HashMap::new();
+    for row in &meta_rows {
+        let Some(legacy_id) = tiberius::Row::try_get::<i32, _>(row, "id").ok().flatten() else {
+            continue;
+        };
+        let Some(cin_no) = tiberius::Row::try_get::<&str, _>(row, "cin_no")
+            .ok()
+            .flatten()
+        else {
+            continue;
+        };
+        let ttype = tiberius::Row::try_get::<&str, _>(row, "ttype")
+            .ok()
+            .flatten()
+            .unwrap_or("");
+        let (doc_type, rank): (&'static str, i32) = if ttype.contains("บัตร") {
+            ("thai_id_card", 0)
+        } else if ttype.contains("ลูกค้า") {
+            ("face_photo", 1)
+        } else if ttype.contains("เดินทาง") {
+            ("passport", 0)
+        } else {
+            continue;
+        };
+        // Defensive: only mirror images that belong to a cin_no in our batch.
+        if !by_cin_no.contains_key(cin_no) {
+            continue;
+        }
+        let entry = chosen
+            .entry(cin_no.to_string())
+            .or_insert((legacy_id, doc_type, rank));
+        if rank < entry.2 {
+            *entry = (legacy_id, doc_type, rank);
+        }
+    }
+    if chosen.is_empty() {
+        return;
+    }
+
+    // Step 2 — pull the blobs for exactly the chosen ids.
+    let id_list = chosen
+        .values()
+        .map(|(id, _, _)| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let blob_sql = format!("SELECT id, pic FROM Tb_Save_Image WHERE id IN ({id_list})");
+    let blob_rows =
+        match simple_query_with_timeout_pooled(&mut conn, &blob_sql, MssqlOpKind::Read).await {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::warn!(
+                    event_name = "guest_doc_sync_blob_fail",
+                    site = %site_id,
+                    error = %err,
+                    "guest-image sync: Tb_Save_Image blob SELECT failed; skipping"
+                );
+                return;
+            }
+        };
+    drop(conn); // release the pooled MSSQL connection before PG work
+
+    let mut blobs: HashMap<i32, Vec<u8>> = HashMap::new();
+    for row in &blob_rows {
+        let Some(id) = tiberius::Row::try_get::<i32, _>(row, "id").ok().flatten() else {
+            continue;
+        };
+        if let Some(pic) = tiberius::Row::try_get::<&[u8], _>(row, "pic")
+            .ok()
+            .flatten()
+        {
+            blobs.insert(id, pic.to_vec());
+        }
+    }
+
+    let mut upserted = 0usize;
+    for (cin_no, &(legacy_id, doc_type, _rank)) in &chosen {
+        let Some(image) = blobs.get(&legacy_id) else {
+            tracing::warn!(
+                event_name = "guest_doc_sync_row_skip",
+                site = %site_id,
+                legacy_id,
+                "guest-image sync: no blob returned for chosen id; skipping"
+            );
+            continue;
+        };
+        // Detect mime from the blob magic bytes.
+        let mime = if image.len() >= 4
+            && image[0] == 0x89
+            && image[1] == b'P'
+            && image[2] == b'N'
+            && image[3] == b'G'
+        {
+            "image/png"
+        } else if image.len() >= 2 && image[0] == 0xFF && image[1] == 0xD8 {
+            "image/jpeg"
+        } else {
+            "image/jpeg"
+        };
+        let Some((cin_id, cust_id)) = by_cin_no.get(cin_no).copied() else {
+            continue;
+        };
+
+        // Runtime `sqlx::query` (not the `query!` macro) — adds nothing to the
+        // `.sqlx/` offline cache. Idempotent UPSERT keyed on the legacy id
+        // (migration 071 partial UNIQUE `ux_ht_guest_documents_legacy_id`).
+        let res = sqlx::query(
+            "INSERT INTO ht_guest_documents ( \
+                 doc_cust_id, doc_cin_id, doc_type, doc_mime, doc_image, doc_source, doc_legacy_id \
+             ) VALUES ($1, $2, $3, $4, $5, 'legacy', $6) \
+             ON CONFLICT (doc_legacy_id) DO UPDATE SET \
+                 doc_cust_id = EXCLUDED.doc_cust_id, \
+                 doc_cin_id  = EXCLUDED.doc_cin_id, \
+                 doc_type    = EXCLUDED.doc_type, \
+                 doc_mime    = EXCLUDED.doc_mime, \
+                 doc_image   = EXCLUDED.doc_image, \
+                 doc_source  = EXCLUDED.doc_source",
+        )
+        .bind(cust_id)
+        .bind(cin_id)
+        .bind(doc_type)
+        .bind(mime)
+        .bind(image)
+        .bind(legacy_id)
+        .execute(pg)
+        .await;
+
+        match res {
+            Ok(_) => upserted += 1,
+            Err(err) => {
+                tracing::warn!(
+                    event_name = "guest_doc_sync_upsert_fail",
+                    site = %site_id,
+                    legacy_id,
+                    error = %err,
+                    "guest-image sync: UPSERT into ht_guest_documents failed; continuing"
+                );
+            }
+        }
+    }
+
+    if upserted > 0 {
+        tracing::debug!(
+            event_name = "guest_doc_sync_ok",
+            site = %site_id,
+            upserted,
+            "guest-image sync: mirrored legacy Tb_Save_Image rows into ht_guest_documents"
         );
     }
 }

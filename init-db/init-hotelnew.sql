@@ -343,6 +343,12 @@ CREATE TABLE IF NOT EXISTS ht_guest_documents (
 );
 CREATE INDEX IF NOT EXISTS idx_ht_guest_documents_cin ON ht_guest_documents(doc_cin_id);
 CREATE INDEX IF NOT EXISTS idx_ht_guest_documents_cust ON ht_guest_documents(doc_cust_id);
+-- Migration 071 — partial UNIQUE on the legacy id, the UPSERT conflict target for
+-- the sync-worker read-in poll (bin/sync.rs::sync_guest_documents) that mirrors
+-- legacy Tb_Save_Image → ht_guest_documents (doc_source='legacy'). App-native docs
+-- (NULL doc_legacy_id) are exempt via the partial WHERE.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ht_guest_documents_legacy_id
+    ON ht_guest_documents (doc_legacy_id) WHERE doc_legacy_id IS NOT NULL;
 
 -- ht_checkin_rooms - Junction table (Track B1 / migration 043).
 -- Mirrors legacy HT_CheckIn_Ds cardinality: one row per room per check-in
@@ -2455,6 +2461,13 @@ ON CONFLICT (version) DO NOTHING;
 -- Tb_Save_Image is SHIPPED DARK behind GUEST_DOCUMENT_STORAGE_ENABLED (default off).
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('070', '070_ht_guest_documents.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 071 — partial UNIQUE index ux_ht_guest_documents_legacy_id (UPSERT
+-- conflict target for the legacy Tb_Save_Image sync-in poll). Index inlined above;
+-- this seed row records the migration as applied so the drift check sees zero pending.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('071', '071_ht_guest_documents_legacy_unique.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================

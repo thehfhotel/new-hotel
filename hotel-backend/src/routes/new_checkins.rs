@@ -1459,6 +1459,9 @@ pub async fn registration_slip(
                 ORDER BY gd.doc_created_at DESC, gd.doc_id DESC LIMIT 1), \
               (SELECT gd.doc_id FROM ht_guest_documents gd \
                 WHERE gd.doc_cust_id = ci.cin_cust_id AND gd.doc_type IN ('thai_id_card','passport') \
+                ORDER BY gd.doc_created_at DESC, gd.doc_id DESC LIMIT 1), \
+              (SELECT gd.doc_id FROM ht_guest_documents gd \
+                WHERE gd.doc_cin_id = ci.cin_id AND gd.doc_type = 'face_photo' \
                 ORDER BY gd.doc_created_at DESC, gd.doc_id DESC LIMIT 1) \
             ) AS guest_photo_doc_id, \
             ci.cin_adults AS adults, \

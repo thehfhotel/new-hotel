@@ -76,6 +76,10 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
   // After a successful check-in we switch the modal to a "print the
   // registration slip" panel instead of closing immediately.
   const [created, setCreated] = useState<{ cinNo: string; id: number } | null>(null)
+  // Branch-aware URL of the guest's captured ID/passport photo, resolved from
+  // the registration-slip endpoint once the check-in exists. Stays undefined
+  // when there is no photo — the slip then renders exactly as before.
+  const [photoUrl, setPhotoUrl] = useState<string | undefined>(undefined)
   // The full document prefill (card reader / passport scanner). Held so the
   // richer customer fields + photo flow through submit; null for a plain
   // walk-in (behaviour then identical to before this feature).
@@ -256,6 +260,20 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
       // the receptionist clicks "เสร็จสิ้น".
       onSuccess()
       setCreated({ cinNo: checkinData.cinNo || '', id: checkinData.id })
+
+      // Best-effort: resolve the captured ID/passport photo so it prints on the
+      // immediate slip (mirrors the /v2/registration/[id] reprint page). The
+      // registration-slip response is camelCase. A failure here must never block
+      // the slip — proceed without a photo on any error.
+      try {
+        const slipRes = await branchFetch(`/api/checkins/${checkinData.id}/registration-slip`)
+        const slip = await slipRes.json()
+        if (slip?.guestPhotoDocId) {
+          setPhotoUrl(`/api/guest-documents/${slip.guestPhotoDocId}?branch=${encodeURIComponent(branch)}`)
+        }
+      } catch {
+        // Swallow — the slip renders without a photo.
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'เกิดข้อผิดพลาด')
     } finally {
@@ -317,6 +335,7 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
                   deposit: parseFloat(deposit) > 0 ? parseFloat(deposit) : undefined,
                   adults,
                   children,
+                  guestPhotoUrl: photoUrl,
                 } satisfies RegistrationSlipData
               }
             />
