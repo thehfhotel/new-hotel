@@ -5,11 +5,14 @@ const nextConfig = {
   async headers() {
     const contentSecurityPolicy = [
       "default-src 'self'",
-      "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+      // static.cloudflareinsights.com serves the Web Analytics beacon that the
+      // Cloudflare proxy auto-injects into HTML; it POSTs RUM data back to
+      // cloudflareinsights.com/cdn-cgi/rum (hence the connect-src entry).
+      "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://static.cloudflareinsights.com",
       "style-src 'self' 'unsafe-inline'",
       "img-src 'self' data: blob:",
       "font-src 'self' data:",
-      "connect-src 'self'",
+      "connect-src 'self' https://cloudflareinsights.com",
       "frame-ancestors 'none'",
       "base-uri 'self'",
       "form-action 'self'",
