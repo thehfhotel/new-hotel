@@ -302,74 +302,87 @@ export default function VerificationResults() {
 
   const idx = buildSchemaIndex(forms)
 
-  // ── HUB section (always shown) — per-site re-verify status ─────────────────
-  // Pending = no non-misclick reverify submission for that site yet → shown
-  // OUTSTANDING (amber accent + primary CTA) so it's clear what we're waiting on.
-  const SITES: { id: string; label: string }[] = [
-    { id: 'hfhotel', label: 'HF Hotel' },
-    { id: 'hfville', label: 'HF Ville' },
-  ]
-  const latestReverify = (site: string): VerificationResponse | null => {
+  // ── HUB section (always shown) — DATA-DRIVEN per-form launcher ─────────────
+  // One launch card per ACTIVE form from /api/feedback/forms (archived forms are
+  // excluded server-side, so they vanish here; new named forms appear on their
+  // own). Pending = no non-misclick submission matching that form's kind (+ site
+  // when the form is site-scoped) yet → shown OUTSTANDING (amber + primary CTA).
+  const launchForms = [...forms].sort((a, b) => a.sort - b.sort || a.key.localeCompare(b.key))
+  const latestForForm = (form: FeedbackForm): VerificationResponse | null => {
     if (!responses) return null
+    const wantSite = form.site && form.site !== 'all' ? form.site : null
     const rows = responses
-      .filter((r) => isReverify(r) && !isMisclick(r) && rowSite(r) === site)
+      .filter(
+        (r) =>
+          asStr(r.answers?.kind) === form.kind &&
+          !isMisclick(r) &&
+          (wantSite ? rowSite(r) === wantSite : true),
+      )
       .sort((a, b) => (new Date(b.submittedAt).getTime() || 0) - (new Date(a.submittedAt).getTime() || 0))
     return rows[0] ?? null
   }
-  const pendingSites = responses ? SITES.filter((s) => !latestReverify(s.id)) : []
+  const formLabel = (f: FeedbackForm): string =>
+    f.site && f.site !== 'all' ? `${f.title} · ${siteLabel(f.site)}` : f.title
+  const pendingForms = responses ? launchForms.filter((f) => !latestForForm(f)) : []
 
   const hub = (
     <section className="v2-card p-4 lg:p-5 space-y-3">
       <div>
         <div className="v2-eyebrow">การตรวจสอบซ้ำ</div>
-        <h2 className="text-[16px] font-semibold mt-0.5">สถานะการตรวจซ้ำ แยกตามสาขา</h2>
+        <h2 className="text-[16px] font-semibold mt-0.5">แบบฟอร์มตรวจสอบที่เปิดใช้งาน</h2>
       </div>
 
-      {responses && pendingSites.length > 0 && (
+      {responses && pendingForms.length > 0 && (
         <div
           className="flex items-center gap-2 rounded-lg px-3 py-2 text-[13px] font-semibold"
           style={{ color: '#b45309', background: '#fdf0d9' }}
         >
-          <AlertTriangle size={15} /> ยังรอผลตรวจซ้ำ {pendingSites.length} สาขา:{' '}
-          {pendingSites.map((s) => s.label).join(', ')}
+          <AlertTriangle size={15} /> ยังรอผลตรวจ {pendingForms.length} แบบฟอร์ม:{' '}
+          {pendingForms.map((f) => formLabel(f)).join(', ')}
         </div>
       )}
 
       <div className="space-y-2">
-        {SITES.map((s) => {
-          const done = latestReverify(s.id)
-          const pending = responses != null && !done
-          return (
-            <div
-              key={s.id}
-              className="flex flex-wrap items-center justify-between gap-2.5 rounded-lg px-3 py-2.5"
-              style={{
-                border: '1px solid var(--v2-line)',
-                borderLeft: pending ? '3px solid #b45309' : '1px solid var(--v2-line)',
-                background: pending ? '#fffdf7' : 'var(--v2-surface)',
-              }}
-            >
-              <div className="flex items-center gap-2.5 min-w-0 flex-wrap">
-                <span className="text-[14px] font-semibold">{s.label}</span>
-                {responses == null ? (
-                  <Tag tone="mut">…</Tag>
-                ) : done ? (
-                  <Tag tone="ok">
-                    ✓ ได้รับแล้ว{done.inspector ? ` · ${done.inspector}` : ''} · {formatThai(done.submittedAt)}
-                  </Tag>
-                ) : (
-                  <Tag tone="warn">⏳ รอตรวจสอบ</Tag>
-                )}
-              </div>
-              <Link
-                href={`/v2/verification/reverify?site=${s.id}`}
-                className={`v2-btn ${pending ? 'v2-btn-primary' : 'v2-btn-soft'} v2-btn-sm`}
+        {launchForms.length === 0 ? (
+          <p className="text-[13px]" style={{ color: 'var(--v2-ink-3)' }}>
+            ยังไม่มีแบบฟอร์มที่เปิดใช้งาน
+          </p>
+        ) : (
+          launchForms.map((f) => {
+            const done = latestForForm(f)
+            const pending = responses != null && !done
+            return (
+              <div
+                key={f.key}
+                className="flex flex-wrap items-center justify-between gap-2.5 rounded-lg px-3 py-2.5"
+                style={{
+                  border: '1px solid var(--v2-line)',
+                  borderLeft: pending ? '3px solid #b45309' : '1px solid var(--v2-line)',
+                  background: pending ? '#fffdf7' : 'var(--v2-surface)',
+                }}
               >
-                <RefreshCcw size={15} /> {done ? 'ตรวจซ้ำอีกครั้ง' : 'เปิดฟอร์มตรวจซ้ำ'}
-              </Link>
-            </div>
-          )
-        })}
+                <div className="flex items-center gap-2.5 min-w-0 flex-wrap">
+                  <span className="text-[14px] font-semibold">{formLabel(f)}</span>
+                  {responses == null ? (
+                    <Tag tone="mut">…</Tag>
+                  ) : done ? (
+                    <Tag tone="ok">
+                      ✓ ได้รับแล้ว{done.inspector ? ` · ${done.inspector}` : ''} · {formatThai(done.submittedAt)}
+                    </Tag>
+                  ) : (
+                    <Tag tone="warn">⏳ รอตรวจสอบ</Tag>
+                  )}
+                </div>
+                <Link
+                  href={`/v2/verification/reverify?form=${encodeURIComponent(f.key)}`}
+                  className={`v2-btn ${pending ? 'v2-btn-primary' : 'v2-btn-soft'} v2-btn-sm`}
+                >
+                  <RefreshCcw size={15} /> {done ? 'ตรวจซ้ำอีกครั้ง' : 'เปิดฟอร์มตรวจซ้ำ'}
+                </Link>
+              </div>
+            )
+          })
+        )}
       </div>
 
       <div className="pt-1">

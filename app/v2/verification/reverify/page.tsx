@@ -151,6 +151,10 @@ function ReverifyInner() {
         : 'hfhotel'
   const siteLabel = site === 'hfhotel' ? 'HF Hotel' : 'HF Ville'
 
+  // Optional ?form=KEY selects a named form (multi-form support). When present it
+  // wins over the per-site reverify_{site} default; absent/empty ⇒ back-compat.
+  const formKey = searchParams?.get('form')?.trim() || ''
+
   const [formDef, setFormDef] = useState<FeedbackForm | null>(null)
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -165,7 +169,10 @@ function ReverifyInner() {
     setLoading(true)
     setLoadError(null)
     try {
-      const res = await fetch(`/api/feedback/forms/reverify_${site}`)
+      const endpoint = formKey
+        ? `/api/feedback/forms/${encodeURIComponent(formKey)}`
+        : `/api/feedback/forms/reverify_${site}`
+      const res = await fetch(endpoint)
       if (res.status === 404) {
         setFormDef(null)
         setLoadError('notfound')
@@ -183,7 +190,7 @@ function ReverifyInner() {
     } finally {
       setLoading(false)
     }
-  }, [site])
+  }, [site, formKey])
 
   useEffect(() => {
     loadForm()
