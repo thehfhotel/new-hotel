@@ -29,6 +29,7 @@
 //! **Shipped DARK** behind `GUEST_DOCUMENT_STORAGE_ENABLED` — the emitter (the
 //! `POST /api/guest-documents` route) is gated; this recipe is always compiled.
 
+use crate::db::mssql_timeout::{simple_query_with_timeout, MssqlOpKind};
 use crate::writeback::allocate::LegacyConn;
 use crate::writeback::dispatcher::LegacyIds;
 use crate::writeback::error::{WritebackError, WritebackResult};
@@ -136,6 +137,36 @@ pub async fn execute(
     let cust_no = cust_legacy_no.unwrap_or("");
     let cin_no = cin_legacy_no.unwrap_or("");
     let effective_tmp_no = if cin_no.is_empty() { tmp_no } else { "" };
+
+    // No multiple versions: iHOTEL keeps one card per (cust_no, ttype). If the
+    // customer already has a row of this ttype, UPDATE it in place (latest scan
+    // wins, no duplicate rows) rather than INSERTing another. Keyed on cust_no,
+    // so only when the customer is known. (iHOTEL itself SKIPs on an existing
+    // row; we UPDATE so our fresh capture is authoritative — identical committed
+    // row shape either way.)
+    if !cust_no.is_empty() {
+        let find_sql = format!(
+            "SELECT TOP 1 id FROM Tb_Save_Image WHERE cust_no = {cust_q} AND ttype = {ttype_q} \
+             ORDER BY id DESC",
+            cust_q = sql_quote(cust_no),
+            ttype_q = sql_quote(ttype),
+        );
+        let rows = simple_query_with_timeout(conn, &find_sql, MssqlOpKind::Read).await?;
+        if let Some(existing_id) = rows.first().and_then(|r| r.get::<i32, _>(0)) {
+            let update_sql = format!(
+                "UPDATE Tb_Save_Image SET pic = @P1, cin_no = {cin_q}, tmp_no = '', \
+                 pic_date = GETDATE() WHERE id = {existing_id}",
+                cin_q = sql_quote(cin_no),
+            );
+            let mut q = tiberius::Query::new(update_sql);
+            q.bind(mirror_bytes.as_slice());
+            q.execute(&mut **conn)
+                .await
+                .map_err(WritebackError::Tiberius)?;
+            return Ok(LegacyIds::new());
+        }
+    }
+
     let sql = build_insert_sql(ttype, cust_no, cin_no, effective_tmp_no);
 
     // The one place a recipe uses a bound parameter (varbinary pic). tiberius

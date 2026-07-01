@@ -171,6 +171,16 @@ pub async fn create_guest_document(
         .await
         .map_err(|e| ApiError::Internal(format!("failed to open tx: {e}")))?;
 
+    // No multiple versions: replace any prior document of this type for this
+    // check-in rather than piling up rows. Keyed on the check-in.
+    if let Some(cin_id) = body.cin_id {
+        sqlx::query("DELETE FROM ht_guest_documents WHERE doc_cin_id = $1 AND doc_type = $2")
+            .bind(cin_id)
+            .bind(doc_type)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ApiError::Internal(format!("failed to dedup guest documents: {e}")))?;
+    }
     // Dynamic sqlx — bytea bound via `.bind(Vec<u8>)`.
     let row = sqlx::query(
         "INSERT INTO ht_guest_documents ( \
@@ -451,6 +461,18 @@ pub async fn render_thai_id_card(
         .begin()
         .await
         .map_err(|e| ApiError::Internal(format!("failed to open tx: {e}")))?;
+    // No multiple versions: replace any prior card for this check-in rather than
+    // piling up rows (a re-scan otherwise leaves two thai_id_card docs on one
+    // stay). Keyed on the check-in.
+    if let Some(cin_id) = body.cin_id {
+        sqlx::query(
+            "DELETE FROM ht_guest_documents WHERE doc_cin_id = $1 AND doc_type = 'thai_id_card'",
+        )
+        .bind(cin_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to dedup guest documents: {e}")))?;
+    }
     let row = sqlx::query(
         "INSERT INTO ht_guest_documents ( \
              doc_cust_id, doc_cin_id, doc_type, doc_mime, doc_image, doc_source, \
