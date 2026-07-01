@@ -47,3 +47,8 @@ backups/*.sql
 *.tsbuildinfo
 .polish/
 .claude/
+
+# iHOTEL reverse-engineering artifacts — vendor DLL decompile + government-card
+# facsimile template. Kept OUT of this public repo (IP/EULA + SECURITY.md), like
+# the off-repo EVERGREEN_ARTIFACTS. Distributed with the middleware binary at runtime.
+thai-id-middleware-tauri/reference/
