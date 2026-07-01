@@ -2,7 +2,7 @@
 
 import { use, useCallback, useEffect, useState } from 'react'
 import Link from 'next/link'
-import { ArrowLeft, Printer, AlertCircle } from 'lucide-react'
+import { ArrowLeft, Printer, AlertCircle, ScanLine } from 'lucide-react'
 import { useBranch } from '@/contexts/BranchContext'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { hotelInfoForBranch } from '@/lib/hotel-info'
@@ -10,6 +10,7 @@ import RegistrationSlipTemplate, {
   type RegistrationSlipData,
 } from '@/components/documents/RegistrationSlipTemplate'
 import { V2PageHeader, V2Spinner } from '@/components/v2/primitives'
+import ScanRegistrationDocModal from '@/components/modals/ScanRegistrationDocModal'
 
 /**
  * v2 registration slip (ใบลงทะเบียนเข้าพัก) — #29 reprint path. iHOTEL exposes a
@@ -34,6 +35,7 @@ export default function V2RegistrationSlipPage({
   const [slip, setSlip] = useState<RegistrationSlipData | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [showScan, setShowScan] = useState(false)
 
   const fetchSlip = useCallback(async () => {
     setLoading(true)
@@ -97,7 +99,7 @@ export default function V2RegistrationSlipPage({
             {/* On-screen preview so reception can review the ID/passport before
                 printing. Also warms the image cache so the first print isn't
                 blank. Renders nothing when no photo was captured. */}
-            {photoUrl && (
+            {photoUrl ? (
               <div className="pt-2">
                 <div className="v2-eyebrow mb-1">รูปบัตร/พาสปอร์ต ID / PASSPORT</div>
                 {/* eslint-disable-next-line @next/next/no-img-element */}
@@ -108,16 +110,38 @@ export default function V2RegistrationSlipPage({
                   style={{ borderColor: 'var(--v2-line)' }}
                 />
               </div>
+            ) : (
+              <div className="pt-1 text-[12.5px]" style={{ color: 'var(--v2-ink-3)' }}>
+                ยังไม่มีรูปบัตรประชาชน/พาสปอร์ตสำหรับใบลงทะเบียนนี้ — สแกนเพื่อแนบเข้าเอกสาร
+              </div>
             )}
-            <button
-              onClick={() => window.print()}
-              className="v2-btn v2-btn-primary mt-3 inline-flex items-center gap-2"
-            >
-              <Printer size={16} /> พิมพ์ใบลงทะเบียน
-            </button>
+            <div className="flex flex-wrap items-center gap-2 mt-3">
+              <button
+                onClick={() => setShowScan(true)}
+                className={`v2-btn inline-flex items-center gap-2 ${
+                  photoUrl ? 'v2-btn-ghost' : 'v2-btn-primary'
+                }`}
+              >
+                <ScanLine size={16} /> {photoUrl ? 'สแกนใหม่' : 'สแกนบัตร/พาสปอร์ต'}
+              </button>
+              <button
+                onClick={() => window.print()}
+                className="v2-btn v2-btn-primary inline-flex items-center gap-2"
+              >
+                <Printer size={16} /> พิมพ์ใบลงทะเบียน
+              </button>
+            </div>
           </div>
           {/* Print-only portal — renders nothing on screen, everything on paper. */}
           <RegistrationSlipTemplate data={{ ...slip, guestPhotoUrl: photoUrl }} hotelInfo={hotelInfo} />
+
+          {showScan && (
+            <ScanRegistrationDocModal
+              checkInId={Number(id)}
+              onClose={() => setShowScan(false)}
+              onCaptured={fetchSlip}
+            />
+          )}
         </>
       ) : null}
     </div>
