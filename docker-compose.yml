@@ -215,6 +215,19 @@ services:
       - CHECKOUT_SERVER_TOTAL_ENABLED=${CHECKOUT_SERVER_TOTAL_ENABLED:-false}
       - BOOKING_VALIDATION_ENABLED=${BOOKING_VALIDATION_ENABLED:-false}
       - HFVILLE_WRITES_ENABLED=${HFVILLE_WRITES_ENABLED:-false}
+      # Check-in registration legacy mirrors (config.rs:392,425) — default false.
+      # Same flip mechanism as the flags above (`gh variable set <NAME> -b true` +
+      # redeploy, or a host .env line for a scoped test). These were shipped read
+      # by the backend but were previously NOT plumbed here, so they could not be
+      # turned on at all — this line is the missing plumbing.
+      #   - GUEST_DOCUMENT_STORAGE_ENABLED: mirror captured ID/passport image into
+      #     iHOTEL (INSERT Tb_Save_Image via writeback/recipes/save_image.rs).
+      #   - TM30_COMPANION_WRITEBACK_ENABLED: mirror an app-added companion into
+      #     iHOTEL (INSERT HT_CheckIn_Other_People via companion_people.rs).
+      # Reception-coordinated live test before flipping permanently:
+      # docs/coexistence/task8-writeback-test-runsheet.md (+ legacy-writeback-test-runbook.md).
+      - GUEST_DOCUMENT_STORAGE_ENABLED=${GUEST_DOCUMENT_STORAGE_ENABLED:-false}
+      - TM30_COMPANION_WRITEBACK_ENABLED=${TM30_COMPANION_WRITEBACK_ENABLED:-false}
       # Self-healing reconcile sweep (scheduler/sync.rs). When a diff-only
       # reconcile row resists convergence past FORCE_CONVERGE_MIN_AGE_SECS (1h),
       # re-project the legacy row through the CT mapper instead of leaving it
