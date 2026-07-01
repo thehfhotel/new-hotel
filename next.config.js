@@ -8,7 +8,7 @@ const nextConfig = {
       // static.cloudflareinsights.com serves the Web Analytics beacon that the
       // Cloudflare proxy auto-injects into HTML; it POSTs RUM data back to
       // cloudflareinsights.com/cdn-cgi/rum (hence the connect-src entry).
-      "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://static.cloudflareinsights.com",
+      "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://static.cloudflareinsights.com https://erp.thehfhotel.org",
       "style-src 'self' 'unsafe-inline'",
       "img-src 'self' data: blob:",
       "font-src 'self' data:",
