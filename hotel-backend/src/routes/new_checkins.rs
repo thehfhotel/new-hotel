@@ -1347,7 +1347,12 @@ pub struct RegistrationSlip {
     pub check_in_date: Option<String>,
     pub check_out_date: Option<String>,
     pub nights: i32,
+    /// RATE / OTHER / TOTAL come from the shared `folio_breakdown` so the card
+    /// matches the checkout folio and iHOTEL's Cin_room_Price /
+    /// total_price_product / total_price_net (with the #34 rate fallback handled
+    /// centrally, not re-derived in the template).
     pub rate_per_night: Option<f64>,
+    pub other_total: Option<f64>,
     pub total_amount: Option<f64>,
     /// Advance paid against the originating booking (จ่ายล่วงหน้า on the card) —
     /// legacy HT_Book_H.Book_Price_Pay, mirrored to ht_bookings.book_deposit_amount.
@@ -1387,8 +1392,6 @@ pub async fn registration_slip(
             to_char(ci.cin_checkin_time, 'YYYY-MM-DD\"T\"HH24:MI:SS') AS check_in_date, \
             to_char(COALESCE(ci.cin_checkout_time, ci.cin_expected_checkout::timestamp), 'YYYY-MM-DD\"T\"HH24:MI:SS') AS check_out_date, \
             GREATEST(1, (ci.cin_expected_checkout - ci.cin_checkin_time::date))::int AS nights, \
-            ci.cin_rate_per_night::float8 AS rate_per_night, \
-            ci.cin_total_amount::float8 AS total_amount, \
             b.book_deposit_amount::float8 AS booking_advance, \
             NULLIF(b.book_no, '') AS booking_no, \
             (SELECT COALESCE(SUM(cr.cr_dep_amount), 0)::float8 \
@@ -1408,6 +1411,10 @@ pub async fn registration_slip(
     .map_err(|e| ApiError::Database(e.to_string()))?
     .ok_or_else(|| ApiError::NotFound(format!("check-in {cin_id} not found")))?;
 
+    // RATE / OTHER / TOTAL from the shared folio breakdown (room rate w/ #34
+    // fallback, POS products, net) so the card agrees with the checkout folio.
+    let folio = folio_breakdown(&state, pool, cin_id).await.ok();
+
     Ok(Json(RegistrationSlip {
         success: true,
         registration_no: row.try_get("registration_no").unwrap_or_default(),
@@ -1423,8 +1430,9 @@ pub async fn registration_slip(
         check_in_date: row.try_get("check_in_date").ok(),
         check_out_date: row.try_get("check_out_date").ok(),
         nights: row.try_get("nights").unwrap_or(1),
-        rate_per_night: row.try_get("rate_per_night").ok(),
-        total_amount: row.try_get("total_amount").ok(),
+        rate_per_night: folio.as_ref().map(|f| f.rate_per_night),
+        other_total: folio.as_ref().map(|f| f.product_total),
+        total_amount: folio.as_ref().map(|f| f.net_total),
         booking_advance: row.try_get("booking_advance").ok(),
         booking_no: row.try_get("booking_no").ok(),
         deposit: row.try_get("deposit").ok(),

@@ -30,7 +30,10 @@ export interface RegistrationSlipData {
   /** ISO datetime string (actual checkout if known, else expected). */
   checkOutDate: string
   nights: number
+  /** RATE / OTHER / TOTAL — folio-authoritative from the server (room rate,
+   *  POS products, net); no client-side derivation. */
   ratePerNight?: number
+  otherTotal?: number
   totalAmount?: number
   /** Advance paid against the booking (จ่ายล่วงหน้า) — booking deposit, not the
    *  total paid at check-in. Undefined/0 for walk-ins. */
@@ -55,6 +58,20 @@ function formatCurrency(amount: number): string {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   }).format(amount)
+}
+
+/** Strip the embedded field labels iHOTEL's report removes from the stored
+ *  address (Print_Report.cs C_Address .Replace chain), so it reads cleanly. */
+function cleanAddress(addr?: string): string {
+  if (!addr) return ''
+  return addr
+    .replace(/หมู่ {2}/g, '')
+    .replace(/ซอย /g, '')
+    .replace(/ถนน /g, '')
+    .replace(/เขต\/อำเภอ /g, '')
+    .replace(/แขวง\/ตำบล /g, '')
+    .replace(/จังหวัด /g, '')
+    .trim()
 }
 
 /** "29/06/2026" — Gregorian DD/MM/YYYY (no time), stored value as-is. */
@@ -116,19 +133,11 @@ export default function RegistrationSlipTemplate({
   useEffect(() => setMounted(true), [])
   if (!mounted) return null
 
-  const nights = data.nights || 1
-  const total =
-    data.totalAmount != null && data.totalAmount > 0
-      ? data.totalAmount
-      : (data.ratePerNight ?? 0) * nights
-  // cin_rate_per_night is unreliable (often 0); derive from total when needed.
-  const rate =
-    data.ratePerNight != null && data.ratePerNight > 0
-      ? data.ratePerNight
-      : nights > 0
-        ? total / nights
-        : total
-  const other = Math.max(0, total - rate * nights)
+  // Folio-authoritative from the server (RATE = room rate incl. #34 fallback,
+  // OTHER = POS products, TOTAL = net) — no client derivation.
+  const rate = data.ratePerNight ?? 0
+  const other = data.otherTotal ?? 0
+  const total = data.totalAmount ?? 0
 
   return createPortal(
     <div className="registration-slip-print-root">
@@ -199,7 +208,7 @@ export default function RegistrationSlipTemplate({
             <Field thai="อาชีพ" eng="OCCUPATION" />
           </div>
           <div className="grid grid-cols-[3fr_1fr] gap-4">
-            <Field thai="ที่อยู่" eng="ADDRESS" value={data.guestAddress} />
+            <Field thai="ที่อยู่" eng="ADDRESS" value={cleanAddress(data.guestAddress)} />
             <Field thai="ประเทศ" eng="COUNTRY" />
           </div>
           <Field
