@@ -1383,8 +1383,24 @@ async fn resolve_legacy_ids(
         // Phase 4 — MirrorCompanion / MirrorCompanionList carry the legacy
         // `Cin_no` (+ name/country, or the full list) in their payload (resolved
         // by the route before enqueue); nothing to resolve from PG. Mirrors the
-        // `UpdateCustomer` payload-carries-key shape.
-        MirrorCompanion { .. } | MirrorCompanionList { .. } => {}
+        // `UpdateCustomer` payload-carries-key shape. CompanionDelete likewise
+        // carries the legacy `Cin_no` + the row's known legacy id directly.
+        MirrorCompanion { .. } | MirrorCompanionList { .. } | CompanionDelete { .. } => {}
+        // Convergent companion mirror — CompanionAdd carries the legacy
+        // `Cin_no` in its payload, but the dispatcher needs to know whether
+        // the canonical `ht_guest_registry` row still exists (the guest may
+        // have been deleted while the job sat queued). A vanished row ⇒ skip
+        // the legacy INSERT entirely: with nothing to stamp
+        // `guest_legacy_id` onto, the CT echo could never be adopted and
+        // the orphan legacy row would re-import as a duplicate.
+        CompanionAdd { guest_id, .. } => {
+            let exists: Option<i32> =
+                sqlx::query_scalar("SELECT 1 FROM ht_guest_registry WHERE guest_id = $1")
+                    .bind(*guest_id)
+                    .fetch_optional(pg)
+                    .await?;
+            resolved.companion_guest_exists = exists.is_some();
+        }
     }
     Ok(resolved)
 }
@@ -2253,8 +2269,34 @@ async fn back_populate_legacy_ids(
         MirrorGuestImage { .. } => {}
         // Phase 4 — MirrorCompanion / MirrorCompanionList write
         // `HT_CheckIn_Other_People` rows (IDENTITY ids) and carry no canonical
-        // back-pointer column. Nothing to back-populate.
-        MirrorCompanion { .. } | MirrorCompanionList { .. } => {}
+        // back-pointer column. Nothing to back-populate. CompanionDelete
+        // removes a legacy row and allocates nothing.
+        MirrorCompanion { .. } | MirrorCompanionList { .. } | CompanionDelete { .. } => {}
+        // Convergent companion mirror — stamp the captured
+        // `HT_CheckIn_Other_People.id` (recipe puts it in
+        // `legacy_ids.extra.other_people_id`) onto
+        // `ht_guest_registry.guest_legacy_id` so the CT echo of our own
+        // INSERT lands on the mapper's ON CONFLICT (guest_legacy_id) upsert
+        // with identical values instead of inserting a duplicate row.
+        // Guarded on IS NULL: if the mapper's echo-adoption already stamped
+        // it (CT won the race), this is a no-op.
+        CompanionAdd { guest_id, .. } => {
+            let other_people_id = legacy_ids
+                .get("extra")
+                .and_then(|v| v.get("other_people_id"))
+                .and_then(|v| v.as_i64())
+                .map(|n| n as i32);
+            if let Some(other_people_id) = other_people_id {
+                sqlx::query(
+                    "UPDATE ht_guest_registry SET guest_legacy_id = $1 \
+                     WHERE guest_id = $2 AND guest_legacy_id IS NULL",
+                )
+                .bind(other_people_id)
+                .bind(*guest_id)
+                .execute(pg)
+                .await?;
+            }
+        }
     }
     Ok(())
 }

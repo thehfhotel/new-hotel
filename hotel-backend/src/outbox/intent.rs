@@ -777,9 +777,37 @@ pub enum WritebackIntent {
     /// Replace the ENTIRE companion set for a folio (iHOTEL parity — on any
     /// add/delete, delete all HT_CheckIn_Other_People for the Cin_no and
     /// re-insert the current list). Carries the full current list.
+    ///
+    /// **DEPRECATED — nothing emits this anymore.** The replace-all shape
+    /// caused the 2026-07-01 production echo loop (delete+reinsert minted a
+    /// fresh IDENTITY per row per cycle → the CT mapper keyed on
+    /// `guest_legacy_id` inserted NEW registry rows every cycle → prefix
+    /// stacking + row multiplication). Kept only so historical
+    /// `writeback_jobs` rows still deserialize; the convergent delta pair
+    /// ([`Self::CompanionAdd`] / [`Self::CompanionDelete`]) replaces it.
     MirrorCompanionList {
         cin_legacy_no: String,
         companions: Vec<CompanionEntry>,
+    },
+
+    /// Delta ADD of one companion into legacy `HT_CheckIn_Other_People`.
+    /// VERBATIM content (no prefix — that's the primary row's shape). The
+    /// recipe captures the new IDENTITY id; the worker back-populates it onto
+    /// `ht_guest_registry.guest_legacy_id` so the CT echo is absorbed by the
+    /// mapper's ON CONFLICT (guest_legacy_id) upsert instead of duplicating.
+    CompanionAdd {
+        cin_legacy_no: String,
+        /// Canonical `ht_guest_registry.guest_id` — used by the resolver (skip
+        /// if the row was deleted before the job ran) and by back-population.
+        guest_id: i32,
+        name: String,
+        #[serde(default)]
+        country: String,
+    },
+    /// Delta DELETE of one companion's legacy row by its known legacy id.
+    CompanionDelete {
+        cin_legacy_no: String,
+        legacy_id: i64,
     },
 }
 
@@ -1111,6 +1139,8 @@ impl WritebackIntent {
             WritebackIntent::MirrorGuestImage { .. } => "mirror_guest_image",
             WritebackIntent::MirrorCompanion { .. } => "mirror_companion",
             WritebackIntent::MirrorCompanionList { .. } => "mirror_companion_list",
+            WritebackIntent::CompanionAdd { .. } => "companion_add",
+            WritebackIntent::CompanionDelete { .. } => "companion_delete",
         }
     }
 
@@ -1185,6 +1215,12 @@ impl WritebackIntent {
                 companion_aggregate(cin_legacy_no)
             }
             WritebackIntent::MirrorCompanionList { cin_legacy_no, .. } => {
+                companion_aggregate(cin_legacy_no)
+            }
+            WritebackIntent::CompanionAdd { cin_legacy_no, .. } => {
+                companion_aggregate(cin_legacy_no)
+            }
+            WritebackIntent::CompanionDelete { cin_legacy_no, .. } => {
                 companion_aggregate(cin_legacy_no)
             }
         }

@@ -30,7 +30,7 @@ use crate::domain::user::User;
 use crate::error::{ApiError, ApiResult};
 use crate::models::Pagination;
 use crate::outbox::event::EventSource;
-use crate::outbox::{generate_idempotency_key, CompanionEntry, OutboxRepository, WritebackIntent};
+use crate::outbox::{generate_idempotency_key, OutboxRepository, WritebackIntent};
 use crate::repository::checkin::{CheckInDetailRow, CheckInListRow, GuestInsert, GuestRow};
 use crate::service::{
     ChangeRoomCommand, ChangeRoomOutcome, CheckInService, CheckInToBookingCommand,
@@ -2053,109 +2053,6 @@ pub async fn list_guests(
     }))
 }
 
-/// Normalize one guest's name parts into a [`CompanionEntry`] — the walk-in
-/// recipe's pre-prefix name shape: trimmed `first [+ ' ' + last]`; country =
-/// trimmed nationality or `""`. PURE — unit-tested below. The recipe adds the
-/// country-derived prefix + trailing space (`build_insert_sql`), so no prefix
-/// here.
-fn companion_entry_from_parts(
-    first: &str,
-    last: Option<&str>,
-    nationality: Option<&str>,
-) -> CompanionEntry {
-    let name = match last.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(l) => format!("{} {}", first.trim(), l),
-        None => first.trim().to_string(),
-    };
-    let country = nationality
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_default()
-        .to_string();
-    CompanionEntry { name, country }
-}
-
-/// iHOTEL-parity replace-all of a folio's `HT_CheckIn_Other_People` set. The
-/// list is **primary guest + current non-primary companions** — the legacy set
-/// INCLUDES the primary's TM.30 row (walk-in recipe stmt N+1 /
-/// checkin_to_booking stmt 7, verified against captured legacy rows), so the
-/// replace-all must re-insert it or the DELETE would drop it. Enqueues one
-/// MirrorCompanionList (the recipe deletes all rows for the Cin_no and
-/// re-inserts the list). No-op (skip + log) if the check-in has no legacy
-/// Cin_no yet, or if the primary guest cannot be derived — enqueueing without
-/// the primary would destroy its legacy row; safer to leave legacy untouched.
-async fn enqueue_companion_replace_all(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    cin_id: i32,
-) -> ApiResult<()> {
-    let legacy_cin_no: Option<String> = sqlx::query_scalar(
-        "SELECT NULLIF(legacy_cin_no, '') FROM ht_checkins WHERE cin_id = $1",
-    )
-    .bind(cin_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .flatten();
-    let Some(cin_no) = legacy_cin_no else {
-        tracing::info!(cin_id, "TM30 companion replace-all skipped — folio has no legacy_cin_no yet");
-        return Ok(());
-    };
-    // The legacy Other_People set INCLUDES the primary guest (walk-in stmt N+1 /
-    // checkin_to_booking stmt 7 — verified against captured legacy rows), so the
-    // replace-all must re-insert it or the DELETE would drop the primary's TM.30
-    // row. Reconstruct it from the check-in's customer, same name shape as the
-    // walk-in recipe (first + ' ' + last; country = nationality, may be empty).
-    let primary: Option<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT c.cust_firstname, c.cust_lastname, c.cust_nationality \
-         FROM ht_checkins ci JOIN ht_customers c ON c.cust_id = ci.cin_cust_id \
-         WHERE ci.cin_id = $1",
-    )
-    .bind(cin_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    let primary_entry = primary.and_then(|(first, last, nat)| {
-        let entry = companion_entry_from_parts(
-            first.as_deref().unwrap_or(""),
-            last.as_deref(),
-            nat.as_deref(),
-        );
-        (!entry.name.is_empty()).then_some(entry)
-    });
-    let Some(primary_entry) = primary_entry else {
-        // Do NOT enqueue without the primary — the recipe's DELETE would remove
-        // the primary's legacy row and the list would never re-insert it.
-        tracing::warn!(
-            cin_id,
-            "TM30 companion replace-all skipped — cannot derive the primary guest \
-             (no customer row or empty name); enqueueing without it would delete \
-             the primary's HT_CheckIn_Other_People row"
-        );
-        return Ok(());
-    };
-    // Current non-primary companions, stable oldest-first order. Registry rows
-    // flagged is_primary are skipped — the check-in's customer IS the primary;
-    // including such a row would duplicate the entry prepended above.
-    let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
-        "SELECT guest_firstname, guest_lastname, guest_nationality \
-         FROM ht_guest_registry \
-         WHERE guest_cin_id = $1 AND COALESCE(guest_is_primary, false) = false \
-         ORDER BY guest_id",
-    )
-    .bind(cin_id)
-    .fetch_all(&mut **tx)
-    .await?;
-    let companions: Vec<CompanionEntry> = std::iter::once(primary_entry)
-        .chain(rows.into_iter().map(|(first, last, nat)| {
-            companion_entry_from_parts(&first, last.as_deref(), nat.as_deref())
-        }))
-        .collect();
-    let intent = WritebackIntent::MirrorCompanionList { cin_legacy_no: cin_no, companions };
-    let key = generate_idempotency_key(&intent, Uuid::new_v4());
-    OutboxRepository::enqueue(&mut *tx, &intent, key)
-        .await
-        .map_err(|e| ApiError::Internal(format!("failed to enqueue companion replace-all: {e}")))?;
-    Ok(())
-}
-
 /// POST /api/new/checkins/:id/guests - Add guest to check-in
 pub async fn create_guest(
     State(state): State<AppState>,
@@ -2214,15 +2111,62 @@ pub async fn create_guest(
         .await?;
 
     // Phase 4 (TM.30 companion writeback) — SHIPPED DARK behind
-    // TM30_COMPANION_WRITEBACK_ENABLED. When on, mirror the folio's ENTIRE
-    // guest set (primary + companions) into legacy `HT_CheckIn_Other_People`
-    // (iHOTEL parity: delete-all-for-Cin_no then re-insert the current list —
-    // FrmCheckIn.cs:9975), so re-adds never pile up duplicates. Enqueued in THIS
-    // tx so it commits atomically with the canonical guest insert. Requires the
-    // folio's legacy `Cin_no`; the helper skips + logs when the check-in hasn't
-    // been mirrored to MSSQL yet.
-    if crate::config::tm30_companion_writeback_enabled() {
-        enqueue_companion_replace_all(&mut tx, cin_id).await?;
+    // TM30_COMPANION_WRITEBACK_ENABLED. CONVERGENT delta mirror (2026-07-01
+    // echo-loop fix): one CompanionAdd INSERT per added companion, VERBATIM
+    // content, with the legacy IDENTITY back-populated onto
+    // `ht_guest_registry.guest_legacy_id` so the CT echo is absorbed
+    // idempotently. NEVER the replace-all shape (delete-all + re-insert
+    // minted fresh IDENTITYs every cycle → registry row multiplication +
+    // prefix stacking). Enqueued in THIS tx so it commits atomically with
+    // the canonical guest insert.
+    if crate::config::tm30_companion_writeback_enabled() && !is_primary {
+        // Delta companion mirror. Only when the folio is already mirrored
+        // (has a legacy Cin_no); the primary guest's legacy row is owned by
+        // the check-in writeback, so primary rows never enqueue.
+        let legacy_cin_no: Option<String> = sqlx::query_scalar(
+            "SELECT NULLIF(legacy_cin_no, '') FROM ht_checkins WHERE cin_id = $1",
+        )
+        .bind(cin_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+        match legacy_cin_no {
+            Some(cin_no) => {
+                let name = match body
+                    .last_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    Some(last) => format!("{first_name} {last}"),
+                    None => first_name.to_string(),
+                };
+                let country = body
+                    .nationality
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_default()
+                    .to_string();
+                let intent = WritebackIntent::CompanionAdd {
+                    cin_legacy_no: cin_no,
+                    guest_id,
+                    name,
+                    country,
+                };
+                let key = generate_idempotency_key(&intent, Uuid::new_v4());
+                OutboxRepository::enqueue(&mut tx, &intent, key)
+                    .await
+                    .map_err(|e| {
+                        ApiError::Internal(format!("failed to enqueue companion add: {e}"))
+                    })?;
+            }
+            None => tracing::info!(
+                cin_id,
+                guest_id,
+                "companion add mirror skipped — no legacy_cin_no yet"
+            ),
+        }
     }
 
     tx.commit().await?;
@@ -2275,17 +2219,43 @@ pub async fn delete_guest(
     }
 
     let mut tx = pool.begin().await?;
+
+    // Capture the companion's legacy linkage BEFORE deleting so the delta
+    // mirror can remove exactly that legacy row (never a Cin_no-wide delete
+    // — the replace-all shape caused the 2026-07-01 echo loop).
+    let legacy_link: Option<(Option<i32>, Option<String>)> = sqlx::query_as(
+        "SELECT g.guest_legacy_id, NULLIF(c.legacy_cin_no, '') \
+         FROM ht_guest_registry g JOIN ht_checkins c ON c.cin_id = g.guest_cin_id \
+         WHERE g.guest_id = $1 AND g.guest_cin_id = $2",
+    )
+    .bind(path.guest_id)
+    .bind(path.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
     state
         .checkins
         .delete_guest(&mut tx, path.id, path.guest_id)
         .await?;
 
-    // Phase 4 (TM.30 companion writeback) — replace-all so a delete propagates
-    // to legacy (iHOTEL parity: delete-all-for-Cin_no then re-insert the current
-    // list). Gated dark behind TM30_COMPANION_WRITEBACK_ENABLED; enqueued in THIS
-    // tx so it commits atomically with the canonical guest delete.
+    // Phase 4 (TM.30 companion writeback) — CONVERGENT delta mirror: delete
+    // exactly the linked legacy row by its known id. Gated dark behind
+    // TM30_COMPANION_WRITEBACK_ENABLED; enqueued in THIS tx so it commits
+    // atomically with the canonical guest delete.
     if crate::config::tm30_companion_writeback_enabled() {
-        enqueue_companion_replace_all(&mut tx, path.id).await?;
+        if let Some((Some(legacy_id), Some(cin_no))) = legacy_link {
+            let intent = WritebackIntent::CompanionDelete {
+                cin_legacy_no: cin_no,
+                legacy_id: legacy_id as i64,
+            };
+            let key = generate_idempotency_key(&intent, Uuid::new_v4());
+            OutboxRepository::enqueue(&mut tx, &intent, key)
+                .await
+                .map_err(|e| {
+                    ApiError::Internal(format!("failed to enqueue companion delete: {e}"))
+                })?;
+        }
+        // Unlinked row (guest_legacy_id NULL) → nothing exists in legacy; no-op.
     }
 
     tx.commit().await?;
@@ -2301,34 +2271,6 @@ pub async fn delete_guest(
 mod tests {
     use super::*;
     use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
-
-    /// The replace-all list entries share one normalization: trimmed
-    /// `first [+ ' ' + last]`, country = trimmed nationality or "". Used for
-    /// BOTH the prepended primary (from ht_customers) and the registry
-    /// companions, so the primary's re-inserted row keeps the walk-in recipe's
-    /// name shape.
-    #[test]
-    fn companion_entry_normalizes_name_and_country() {
-        // First + last, nationality present.
-        let e = companion_entry_from_parts(" Thomas ", Some(" Meininghaus "), Some(" DE "));
-        assert_eq!(e.name, "Thomas Meininghaus");
-        assert_eq!(e.country, "DE");
-
-        // No last name, no nationality → first only, empty country.
-        let e = companion_entry_from_parts("อุทัย", None, None);
-        assert_eq!(e.name, "อุทัย");
-        assert_eq!(e.country, "");
-
-        // Whitespace-only last / nationality collapse to absent.
-        let e = companion_entry_from_parts("A", Some("   "), Some(" "));
-        assert_eq!(e.name, "A");
-        assert_eq!(e.country, "");
-
-        // Empty first with no last → empty name (the helper skips the enqueue
-        // entirely in this case — see enqueue_companion_replace_all).
-        let e = companion_entry_from_parts("  ", None, Some("TH"));
-        assert!(e.name.is_empty());
-    }
 
     /// Build a minimal `CheckInDetailRow` fixture for the pure builder/
     /// validator tests. Real `get()` rows carry more fields populated;

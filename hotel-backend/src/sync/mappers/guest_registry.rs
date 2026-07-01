@@ -74,6 +74,29 @@ const TABLE: &str = "HT_CheckIn_Other_People";
 /// can pin every column against the baseline schema dump.
 const GUEST_REGISTRY_SELECT_COLS: &str = "t.id, t.Cin_no, t.Cin_name, t.Cin_contry";
 
+/// Echo-adoption UPDATE (convergent companion mirror, 2026-07-01 echo-loop
+/// fix). When OUR app added a companion, the delta writeback INSERTed the
+/// legacy row VERBATIM and the worker back-populates the captured IDENTITY
+/// onto `guest_legacy_id`. If the CT echo of that INSERT arrives BEFORE the
+/// back-population lands (the echo-before-stamp race), this UPDATE stamps the
+/// matching unstamped canonical row instead of letting the upsert below
+/// insert a duplicate. Match is exact-content: the writeback wrote
+/// `first [+ ' ' + last]` verbatim, so the comparison re-concatenates the
+/// split canonical columns into the same shape ($3 = imported `Cin_name`
+/// verbatim). Primary rows never match (`guest_is_primary = false`) — the
+/// primary's legacy row is owned by the check-in writeback and its canonical
+/// row must never be stamped with a companion id.
+const ADOPT_UNSTAMPED_COMPANION_SQL: &str = "UPDATE ht_guest_registry SET guest_legacy_id = $1 \
+     WHERE guest_id = ( \
+        SELECT guest_id FROM ht_guest_registry \
+        WHERE guest_cin_id = $2 AND guest_legacy_id IS NULL \
+          AND guest_is_primary = false \
+          AND TRIM(BOTH FROM guest_firstname || CASE \
+                WHEN COALESCE(guest_lastname, '') = '' THEN '' \
+                ELSE ' ' || guest_lastname END) = $3 \
+          AND COALESCE(guest_nationality, '') = COALESCE($4, '') \
+        ORDER BY guest_id LIMIT 1)";
+
 pub struct GuestRegistryMapper;
 
 #[async_trait]
@@ -170,6 +193,24 @@ impl MssqlChangeMapper for GuestRegistryMapper {
                 // shape rather than aborting the apply.
                 let firstname = cin_name.unwrap_or_default();
 
+                // Echo adoption: if OUR app created this companion (canonical row
+                // exists, not yet stamped with a legacy id) and this CT row is the
+                // writeback's own INSERT echoing back, stamp the existing row
+                // instead of inserting a duplicate. Exact-content match — the
+                // delta writeback writes name/country VERBATIM, so an echo always
+                // matches byte-for-byte. Back-population usually stamps first
+                // (making this a no-op); this closes the race when CT wins.
+                let adopted = sqlx::query(ADOPT_UNSTAMPED_COMPANION_SQL)
+                    .bind(legacy_id)
+                    .bind(cin_id)
+                    .bind(&firstname)
+                    .bind(&cin_country)
+                    .execute(&mut **tx)
+                    .await?;
+                if adopted.rows_affected() > 0 {
+                    return Ok(None);
+                }
+
                 sqlx::query(
                     "INSERT INTO ht_guest_registry \
                         (guest_cin_id, guest_firstname, guest_nationality, \
@@ -257,5 +298,32 @@ mod tests {
             GUEST_REGISTRY_SELECT_COLS,
             "HT_CheckIn_Other_People"
         );
+    }
+
+    /// Echo-adoption SQL shape (convergent companion mirror). Pins the
+    /// invariants that make the 2026-07-01 echo loop impossible to re-open:
+    /// only UNSTAMPED (`guest_legacy_id IS NULL`) NON-primary rows are
+    /// adoptable, and the name comparison re-concatenates the split canonical
+    /// columns (`first [+ ' ' + last]`) because the OUT-leg wrote that exact
+    /// verbatim shape into `Cin_name`.
+    #[test]
+    fn adoption_sql_targets_unstamped_non_primary_with_concat_name_match() {
+        let sql = ADOPT_UNSTAMPED_COMPANION_SQL;
+        assert!(sql.contains("SET guest_legacy_id = $1"), "{sql}");
+        assert!(sql.contains("guest_legacy_id IS NULL"), "{sql}");
+        assert!(sql.contains("guest_is_primary = false"), "{sql}");
+        // Name match must be against the concatenated first+last shape,
+        // never guest_firstname alone (the OUT-leg name was first + ' ' + last).
+        assert!(
+            sql.contains("guest_firstname || CASE"),
+            "concatenated name comparison: {sql}"
+        );
+        assert!(sql.contains("' ' || guest_lastname"), "{sql}");
+        assert!(
+            sql.contains("COALESCE(guest_nationality, '') = COALESCE($4, '')"),
+            "{sql}"
+        );
+        // Deterministic single-row adoption.
+        assert!(sql.contains("ORDER BY guest_id LIMIT 1"), "{sql}");
     }
 }

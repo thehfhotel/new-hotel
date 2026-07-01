@@ -142,7 +142,11 @@ impl LegacyIds {
 
 /// Pre-resolved legacy IDs that the worker fetches from `public.ht_*` before
 /// dispatching. Each field is `Some(_)` only when the intent actually needs it.
-#[derive(Debug, Default, Clone)]
+///
+/// `Default` is implemented manually (not derived) because
+/// [`ResolvedJob::companion_guest_exists`] must default to `true` — see the
+/// field doc.
+#[derive(Debug, Clone)]
 pub struct ResolvedJob {
     pub legacy_book_id: Option<String>,
     pub legacy_cin_no: Option<String>,
@@ -206,6 +210,39 @@ pub struct ResolvedJob {
     /// an empty `Tb_Save_Image.pic`). Keeps the recipe PG-pure — the bytes are
     /// bound as a varbinary parameter, never a hex literal in the payload.
     pub guest_document_image: Option<Vec<u8>>,
+    /// Convergent companion mirror — `false` only when a `CompanionAdd`
+    /// intent's canonical `ht_guest_registry` row no longer exists (deleted
+    /// while the job was queued); the dispatcher then skips the legacy INSERT
+    /// so no orphan row echoes back. Defaults to `true` (manual `Default`
+    /// impl) so every other intent — which never resolves this field — is
+    /// unaffected.
+    pub companion_guest_exists: bool,
+}
+
+impl Default for ResolvedJob {
+    fn default() -> Self {
+        Self {
+            legacy_book_id: None,
+            legacy_cin_no: None,
+            legacy_cust_no: None,
+            legacy_room_no: None,
+            legacy_room_id_int: None,
+            legacy_checkin_ds_id: None,
+            legacy_dep_ds_id: None,
+            legacy_original_pay_no: None,
+            room_change: None,
+            coupon: None,
+            pos_sale: None,
+            receipt: None,
+            pos_void: None,
+            note_legacy_id: None,
+            guest_document_image: None,
+            // True by default — only the CompanionAdd resolver arm ever
+            // flips it, and a missing resolution must NOT silently skip
+            // the write for unrelated intents.
+            companion_guest_exists: true,
+        }
+    }
 }
 
 /// Fully-hydrated `ht_coupons` row required by the
@@ -504,6 +541,14 @@ fn intent_facts(intent: &WritebackIntent) -> IntentFacts {
         // ledgered (same class as the absolute-SET / UPSERT recipes). No
         // cashier-round money row → no §1.9 warning.
         MirrorCompanionList { .. } => (false, false),
+        // Convergent companion mirror (delta) — CompanionAdd INSERTs into the
+        // IDENTITY-keyed HT_CheckIn_Other_People, so a crash-after-commit retry
+        // would re-INSERT a DUPLICATE row (same class as MirrorCompanion).
+        // MUST be ledgered. No cashier-round money row.
+        CompanionAdd { .. } => (true, false),
+        // CompanionDelete is a guarded `DELETE … WHERE id=… AND Cin_no=…` — a
+        // second apply matches 0 rows. Naturally idempotent, NOT ledgered.
+        CompanionDelete { .. } => (false, false),
         ModifyBooking { .. }
         | CancelBooking { .. }
         | CancelCheckIn { .. }
@@ -1387,6 +1432,46 @@ pub async fn dispatch(
             }
             recipes::companion_people::execute_replace_all(conn, cin_legacy_no, companions).await
         }
+        // Convergent companion mirror (delta) — one VERBATIM INSERT per added
+        // companion; the captured IDENTITY id is back-populated onto
+        // `ht_guest_registry.guest_legacy_id` by the worker so the CT echo is
+        // absorbed idempotently (2026-07-01 echo-loop fix).
+        WritebackIntent::CompanionAdd {
+            cin_legacy_no,
+            name,
+            country,
+            guest_id,
+        } => {
+            if cin_legacy_no.is_empty() {
+                return Err(WritebackError::Recipe(
+                    "CompanionAdd requires a non-empty cin_legacy_no".into(),
+                ));
+            }
+            // Resolver-guard: if the canonical guest row vanished before this job
+            // ran (deleted while queued), resolved.companion_guest_exists is false
+            // — skip the write (no orphan legacy row to echo back).
+            if !resolved.companion_guest_exists {
+                tracing::info!(
+                    guest_id,
+                    "CompanionAdd skipped — canonical guest row no longer exists"
+                );
+                return Ok(LegacyIds::new());
+            }
+            recipes::companion_people::execute_add(conn, cin_legacy_no, name, country).await
+        }
+        // Convergent companion mirror (delta) — guarded single-row DELETE by
+        // the known legacy id (+ Cin_no guard). Naturally idempotent.
+        WritebackIntent::CompanionDelete {
+            cin_legacy_no,
+            legacy_id,
+        } => {
+            if cin_legacy_no.is_empty() {
+                return Err(WritebackError::Recipe(
+                    "CompanionDelete requires a non-empty cin_legacy_no".into(),
+                ));
+            }
+            recipes::companion_people::execute_delete(conn, cin_legacy_no, *legacy_id).await
+        }
     };
 
     // Ledger RECORD — the LAST write before the worker's COMMIT, on the SAME
@@ -1687,6 +1772,10 @@ mod tests {
         assert!(r.coupon.is_none());
         // Track G6 — pos_sale is hydrated only for the RecordPosSale intent.
         assert!(r.pos_sale.is_none());
+        // Convergent companion mirror — defaults TRUE (manual Default impl):
+        // only the CompanionAdd resolver arm flips it, and other intents must
+        // never see a false that would skip their write.
+        assert!(r.companion_guest_exists);
     }
 
     /// Verifies all `WritebackIntent` variants have a matching `intent_name`
