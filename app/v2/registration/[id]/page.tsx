@@ -2,7 +2,7 @@
 
 import { use, useCallback, useEffect, useState } from 'react'
 import Link from 'next/link'
-import { ArrowLeft, Printer, AlertCircle, ScanLine } from 'lucide-react'
+import { ArrowLeft, Printer, AlertCircle, ScanLine, Users } from 'lucide-react'
 import { useBranch } from '@/contexts/BranchContext'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { hotelInfoForBranch } from '@/lib/hotel-info'
@@ -11,6 +11,7 @@ import RegistrationSlipTemplate, {
 } from '@/components/documents/RegistrationSlipTemplate'
 import { V2PageHeader, V2Spinner } from '@/components/v2/primitives'
 import ScanRegistrationDocModal from '@/components/modals/ScanRegistrationDocModal'
+import GuestRegistryModal from '@/components/modals/GuestRegistryModal'
 
 /**
  * v2 registration slip (ใบลงทะเบียนเข้าพัก) — #29 reprint path. iHOTEL exposes a
@@ -36,6 +37,7 @@ export default function V2RegistrationSlipPage({
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [showScan, setShowScan] = useState(false)
+  const [showGuests, setShowGuests] = useState(false)
 
   const fetchSlip = useCallback(async () => {
     setLoading(true)
@@ -125,6 +127,12 @@ export default function V2RegistrationSlipPage({
                 <ScanLine size={16} /> {photoUrl ? 'สแกนใหม่' : 'สแกนบัตร/พาสปอร์ต'}
               </button>
               <button
+                onClick={() => setShowGuests(true)}
+                className="v2-btn v2-btn-ghost inline-flex items-center gap-2"
+              >
+                <Users size={16} /> ผู้เข้าพักร่วม
+              </button>
+              <button
                 onClick={() => window.print()}
                 className="v2-btn v2-btn-primary inline-flex items-center gap-2"
               >
@@ -142,6 +150,17 @@ export default function V2RegistrationSlipPage({
               onCaptured={fetchSlip}
             />
           )}
+
+          <GuestRegistryModal
+            isOpen={showGuests}
+            onClose={() => setShowGuests(false)}
+            checkIn={{
+              id: Number(id),
+              checkInNo: slip.registrationNo || '',
+              roomNumber: slip.roomNumber || '',
+              customerName: slip.guestName || '',
+            }}
+          />
         </>
       ) : null}
     </div>
