@@ -199,6 +199,28 @@ pub async fn create_guest_document(
         // with empty cust_no/cin_no regardless (the check-in writeback stamps
         // them later by tmp_no), so a NULL here is harmless. Literal SQL bound
         // with `.bind()` (runtime `sqlx::query_scalar`, no `query!` macro).
+        // From the check-in (if provided): its legacy Cin_no AND its customer's
+        // legacy Cust_no. iHOTEL's registration report fetches the photo by
+        // cust_no, so when the document isn't linked to a customer (the reprint
+        // "สแกนบัตร" path on an existing stay) we MUST fall back to the check-in's
+        // customer — otherwise the mirrored row has cust_no='' and never shows.
+        let (cin_legacy_no, checkin_cust_no): (Option<String>, Option<String>) =
+            match body.cin_id {
+                Some(id) => sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                    "SELECT NULLIF(legacy_cin_no, ''), NULLIF(legacy_cust_no, '') \
+                     FROM ht_checkins WHERE cin_id = $1",
+                )
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| {
+                    ApiError::Internal(format!("failed to resolve legacy ids from checkin: {e}"))
+                })?
+                .unwrap_or((None, None)),
+                None => (None, None),
+            };
+        // Prefer the document's own customer (passport with custId); else the
+        // check-in's customer.
         let cust_legacy_no: Option<String> = match body.cust_id {
             Some(id) => sqlx::query_scalar(
                 "SELECT NULLIF(legacy_cust_no, '') FROM ht_customers WHERE cust_id = $1",
@@ -209,18 +231,8 @@ pub async fn create_guest_document(
             .map_err(|e| ApiError::Internal(format!("failed to resolve legacy cust_no: {e}")))?
             .flatten(),
             None => None,
-        };
-        let cin_legacy_no: Option<String> = match body.cin_id {
-            Some(id) => sqlx::query_scalar(
-                "SELECT NULLIF(legacy_cin_no, '') FROM ht_checkins WHERE cin_id = $1",
-            )
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| ApiError::Internal(format!("failed to resolve legacy cin_no: {e}")))?
-            .flatten(),
-            None => None,
-        };
+        }
+        .or(checkin_cust_no);
 
         let intent = WritebackIntent::MirrorGuestImage {
             doc_id: doc_id as i64,
@@ -465,6 +477,28 @@ pub async fn render_thai_id_card(
     // exactly like create_guest_document (the passport-upload path); without
     // this a chip scan stored the card canonically but never reached iHOTEL.
     if crate::config::guest_document_storage_enabled() {
+        // From the check-in (if provided): its legacy Cin_no AND its customer's
+        // legacy Cust_no. iHOTEL's registration report fetches the photo by
+        // cust_no, so when the document isn't linked to a customer (the reprint
+        // "สแกนบัตร" path on an existing stay) we MUST fall back to the check-in's
+        // customer — otherwise the mirrored row has cust_no='' and never shows.
+        let (cin_legacy_no, checkin_cust_no): (Option<String>, Option<String>) =
+            match body.cin_id {
+                Some(id) => sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                    "SELECT NULLIF(legacy_cin_no, ''), NULLIF(legacy_cust_no, '') \
+                     FROM ht_checkins WHERE cin_id = $1",
+                )
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| {
+                    ApiError::Internal(format!("failed to resolve legacy ids from checkin: {e}"))
+                })?
+                .unwrap_or((None, None)),
+                None => (None, None),
+            };
+        // Prefer the document's own customer (passport with custId); else the
+        // check-in's customer.
         let cust_legacy_no: Option<String> = match body.cust_id {
             Some(id) => sqlx::query_scalar(
                 "SELECT NULLIF(legacy_cust_no, '') FROM ht_customers WHERE cust_id = $1",
@@ -475,18 +509,8 @@ pub async fn render_thai_id_card(
             .map_err(|e| ApiError::Internal(format!("failed to resolve legacy cust_no: {e}")))?
             .flatten(),
             None => None,
-        };
-        let cin_legacy_no: Option<String> = match body.cin_id {
-            Some(id) => sqlx::query_scalar(
-                "SELECT NULLIF(legacy_cin_no, '') FROM ht_checkins WHERE cin_id = $1",
-            )
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| ApiError::Internal(format!("failed to resolve legacy cin_no: {e}")))?
-            .flatten(),
-            None => None,
-        };
+        }
+        .or(checkin_cust_no);
 
         let intent = WritebackIntent::MirrorGuestImage {
             doc_id: doc_id as i64,
