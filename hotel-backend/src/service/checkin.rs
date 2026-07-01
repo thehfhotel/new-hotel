@@ -343,6 +343,19 @@ impl CheckInService {
 
         self.repo.mark_room_occupied(&mut tx, cmd.room_id).await?;
 
+        // Link an uploaded guest ID/passport image (Phase 2) to this check-in now
+        // that cin_id exists, so the registration slip can show the photo.
+        if let Some(photo_tmp_no) = cmd.writeback_context.photo_tmp_no.as_deref() {
+            sqlx::query(
+                "UPDATE ht_guest_documents SET doc_cin_id = $1 \
+                   WHERE doc_legacy_tmp_no = $2 AND doc_cin_id IS NULL",
+            )
+            .bind(cin_id)
+            .bind(photo_tmp_no)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         self.persist_deposit_junction(&mut tx, cin_id, cmd.room_id, &cmd.writeback_context)
             .await?;
 
@@ -445,6 +458,19 @@ impl CheckInService {
         self.repo
             .set_booking_checkedin(&mut tx, cmd.booking_id)
             .await?;
+
+        // Link an uploaded guest ID/passport image (Phase 2) to this check-in now
+        // that cin_id exists, so the registration slip can show the photo.
+        if let Some(photo_tmp_no) = cmd.writeback_context.photo_tmp_no.as_deref() {
+            sqlx::query(
+                "UPDATE ht_guest_documents SET doc_cin_id = $1 \
+                   WHERE doc_legacy_tmp_no = $2 AND doc_cin_id IS NULL",
+            )
+            .bind(cin_id)
+            .bind(photo_tmp_no)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         self.persist_deposit_junction(&mut tx, cin_id, cmd.room_id, &cmd.writeback_context)
             .await?;

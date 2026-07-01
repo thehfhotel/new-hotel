@@ -1415,6 +1415,11 @@ pub struct RegistrationSlip {
     pub deposit: Option<f64>,
     pub adults: Option<i32>,
     pub children: Option<i32>,
+    /// Primary guest ID/passport document id (ht_guest_documents) for this stay,
+    /// if a photo was captured — the frontend builds /api/guest-documents/{id} to
+    /// print it on the card. Prefers a doc linked to THIS check-in (doc_cin_id),
+    /// else the customer's most recent id/passport image.
+    pub guest_photo_doc_id: Option<i32>,
 }
 
 /// `GET /api/checkins/:id/registration-slip` — printable registration slip for
@@ -1448,6 +1453,14 @@ pub async fn registration_slip(
             NULLIF(b.book_no, '') AS booking_no, \
             (SELECT COALESCE(SUM(cr.cr_dep_amount), 0)::float8 \
                FROM ht_checkin_rooms cr WHERE cr.cr_cin_id = ci.cin_id) AS deposit, \
+            COALESCE( \
+              (SELECT gd.doc_id FROM ht_guest_documents gd \
+                WHERE gd.doc_cin_id = ci.cin_id AND gd.doc_type IN ('thai_id_card','passport') \
+                ORDER BY gd.doc_created_at DESC, gd.doc_id DESC LIMIT 1), \
+              (SELECT gd.doc_id FROM ht_guest_documents gd \
+                WHERE gd.doc_cust_id = ci.cin_cust_id AND gd.doc_type IN ('thai_id_card','passport') \
+                ORDER BY gd.doc_created_at DESC, gd.doc_id DESC LIMIT 1) \
+            ) AS guest_photo_doc_id, \
             ci.cin_adults AS adults, \
             ci.cin_children AS children \
            FROM ht_checkins ci \
@@ -1490,6 +1503,7 @@ pub async fn registration_slip(
         deposit: row.try_get("deposit").ok(),
         adults: row.try_get("adults").ok(),
         children: row.try_get("children").ok(),
+        guest_photo_doc_id: row.try_get("guest_photo_doc_id").ok(),
     }))
 }
 

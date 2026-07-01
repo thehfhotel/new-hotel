@@ -57,6 +57,13 @@ export default function V2RegistrationSlipPage({
     fetchSlip()
   }, [fetchSlip])
 
+  // Branch-aware URL to the guest's captured ID/passport image, served at
+  // /api/guest-documents/{docId}. Undefined when no photo was captured, so the
+  // template and preview render nothing (no layout shift).
+  const photoUrl = slip?.guestPhotoDocId
+    ? `/api/guest-documents/${slip.guestPhotoDocId}?branch=${encodeURIComponent(branch)}`
+    : undefined
+
   if (loading) return <V2Spinner label="กำลังโหลดใบลงทะเบียน…" />
 
   return (
@@ -87,6 +94,21 @@ export default function V2RegistrationSlipPage({
               ห้อง {slip.roomNumber}
               {slip.roomType ? ` · ${slip.roomType}` : ''} · {slip.nights} คืน
             </div>
+            {/* On-screen preview so reception can review the ID/passport before
+                printing. Also warms the image cache so the first print isn't
+                blank. Renders nothing when no photo was captured. */}
+            {photoUrl && (
+              <div className="pt-2">
+                <div className="v2-eyebrow mb-1">รูปบัตร/พาสปอร์ต ID / PASSPORT</div>
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={photoUrl}
+                  alt="ID / Passport"
+                  className="h-40 w-auto rounded-md border object-contain"
+                  style={{ borderColor: 'var(--v2-line)' }}
+                />
+              </div>
+            )}
             <button
               onClick={() => window.print()}
               className="v2-btn v2-btn-primary mt-3 inline-flex items-center gap-2"
@@ -95,7 +117,7 @@ export default function V2RegistrationSlipPage({
             </button>
           </div>
           {/* Print-only portal — renders nothing on screen, everything on paper. */}
-          <RegistrationSlipTemplate data={slip} hotelInfo={hotelInfo} />
+          <RegistrationSlipTemplate data={{ ...slip, guestPhotoUrl: photoUrl }} hotelInfo={hotelInfo} />
         </>
       ) : null}
     </div>

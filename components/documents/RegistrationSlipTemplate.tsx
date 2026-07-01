@@ -18,6 +18,10 @@ export interface RegistrationSlipData {
   accNo?: string
   guestName: string
   guestIdCard?: string
+  /** ht_guest_documents doc_id of the guest's ID/passport image, if captured. */
+  guestPhotoDocId?: number
+  /** Fully-qualified/branch-aware URL to that image; set by the page. Printed on the card. */
+  guestPhotoUrl?: string
   guestContact?: string
   guestAddress?: string
   vehiclePlate?: string
@@ -216,6 +220,18 @@ export default function RegistrationSlipTemplate({
             eng="IDENTITY CARD / PASSPORT NO."
             value={data.guestIdCard}
           />
+          {data.guestPhotoUrl && (
+            <div className="flex items-center gap-2">
+              <span className="text-[9px] text-gray-500 whitespace-nowrap">
+                รูปบัตร/พาสปอร์ต ID/PASSPORT PHOTO
+              </span>
+              <img
+                src={data.guestPhotoUrl}
+                alt="ID / Passport"
+                className="h-24 w-auto border border-gray-500 object-contain"
+              />
+            </div>
+          )}
           <div className="grid grid-cols-2 gap-4">
             <Field thai="วันที่ออกบัตร" eng="DATE OF ISSUE" />
             <Field thai="สถานที่ออกบัตร" eng="PLACE OF ISSUE" />
