@@ -4005,6 +4005,8 @@ async fn sync_guest_documents(pg: &PgPool, mssql: &DbPool, shadow_mode: bool, si
               WHERE ci.legacy_cin_no IS NOT NULL AND ci.legacy_cin_no <> '' \
                 AND NOT EXISTS ( \
                     SELECT 1 FROM ht_guest_documents gd WHERE gd.doc_cin_id = ci.cin_id) \
+                AND NOT EXISTS ( \
+                    SELECT 1 FROM ht_guest_doc_backfill_skip s WHERE s.cin_id = ci.cin_id) \
               ORDER BY ci.cin_id DESC LIMIT 20",
         )
         .fetch_all(pg)
@@ -4109,6 +4111,11 @@ async fn sync_guest_documents(pg: &PgPool, mssql: &DbPool, shadow_mode: bool, si
         }
     }
     if chosen.is_empty() {
+        // No legacy image for ANY check-in in this batch — record them as
+        // attempted so the newest-first poll advances past them next tick
+        // instead of re-polling the same imageless check-ins forever.
+        drop(conn);
+        mark_backfill_skipped(pg, &batch, &chosen, site_id).await;
         return;
     }
 
@@ -4213,6 +4220,10 @@ async fn sync_guest_documents(pg: &PgPool, mssql: &DbPool, shadow_mode: bool, si
         }
     }
 
+    // Advance past check-ins that yielded no legacy image this batch, so the
+    // newest-first poll doesn't re-scan the same imageless check-ins forever.
+    mark_backfill_skipped(pg, &batch, &chosen, site_id).await;
+
     if upserted > 0 {
         tracing::debug!(
             event_name = "guest_doc_sync_ok",
@@ -4220,6 +4231,40 @@ async fn sync_guest_documents(pg: &PgPool, mssql: &DbPool, shadow_mode: bool, si
             upserted,
             "guest-image sync: mirrored legacy Tb_Save_Image rows into ht_guest_documents"
         );
+    }
+}
+
+/// Record check-ins that yielded no legacy image as attempted (idempotent), so
+/// `sync_guest_documents`' newest-first batch advances to older records instead
+/// of re-polling the same imageless newest check-ins every tick. Check-ins in
+/// `chosen` (they have an image — mirrored now, or retried next tick on a
+/// transient failure) are intentionally left out. PG-only, non-fatal.
+async fn mark_backfill_skipped(
+    pg: &PgPool,
+    batch: &[(i32, Option<i32>, String)],
+    chosen: &HashMap<String, (i32, &'static str, i32)>,
+    site_id: &str,
+) {
+    for (cin_id, _cust, legacy_cin_no) in batch {
+        if chosen.contains_key(legacy_cin_no) {
+            continue;
+        }
+        if let Err(err) = sqlx::query(
+            "INSERT INTO ht_guest_doc_backfill_skip (cin_id) VALUES ($1) \
+             ON CONFLICT (cin_id) DO NOTHING",
+        )
+        .bind(cin_id)
+        .execute(pg)
+        .await
+        {
+            tracing::warn!(
+                event_name = "guest_doc_sync_skip_fail",
+                site = %site_id,
+                cin_id,
+                error = %err,
+                "guest-image sync: could not record backfill-skip; will retry"
+            );
+        }
     }
 }
 

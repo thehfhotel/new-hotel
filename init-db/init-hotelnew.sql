@@ -350,6 +350,15 @@ CREATE INDEX IF NOT EXISTS idx_ht_guest_documents_cust ON ht_guest_documents(doc
 CREATE UNIQUE INDEX IF NOT EXISTS ux_ht_guest_documents_legacy_id
     ON ht_guest_documents (doc_legacy_id) WHERE doc_legacy_id IS NOT NULL;
 
+-- ht_guest_doc_backfill_skip - convergence backstop for the guest-image sync-in
+-- poll (bin/sync.rs::sync_guest_documents): records check-ins that have NO legacy
+-- image so the newest-first poll advances past them instead of re-polling the
+-- same imageless check-ins forever. DELETE a row to force a re-check.
+CREATE TABLE IF NOT EXISTS ht_guest_doc_backfill_skip (
+    cin_id       INTEGER PRIMARY KEY REFERENCES ht_checkins(cin_id) ON DELETE CASCADE,
+    attempted_at TIMESTAMP DEFAULT NOW()
+);
+
 -- ht_checkin_rooms - Junction table (Track B1 / migration 043).
 -- Mirrors legacy HT_CheckIn_Ds cardinality: one row per room per check-in
 -- folio. The existing ht_checkins.cin_room_id stays in place until the
@@ -2468,6 +2477,13 @@ ON CONFLICT (version) DO NOTHING;
 -- this seed row records the migration as applied so the drift check sees zero pending.
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('071', '071_ht_guest_documents_legacy_unique.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 072 — ht_guest_doc_backfill_skip (convergence backstop for the
+-- guest-image sync-in poll). Table inlined above; this seed row records the
+-- migration as applied so the drift check sees zero pending.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('072', '072_ht_guest_doc_backfill_skip.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================
