@@ -11,6 +11,13 @@ on:
         required: false
         type: string
 
+# Coalesce redundant runs: a newer push cancels an in-progress push build for the
+# same ref, but release dispatches (workflow_dispatch) are NEVER cancelled so a
+# publish always finishes. Keyed by ref + event so push and dispatch never collide.
+concurrency:
+  group: middleware-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
 jobs:
   build:
     permissions:
@@ -60,6 +67,9 @@ jobs:
         with:
           workspaces: thai-id-middleware-tauri/src-tauri -> target
           cache-on-failure: true
+          # Only master writes the cache, so feature-branch / PR builds can't
+          # evict it — keeps the master cache warm and cold builds rare.
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Install npm dependencies
         working-directory: thai-id-middleware-tauri

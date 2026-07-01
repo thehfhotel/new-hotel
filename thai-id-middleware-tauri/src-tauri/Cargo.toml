@@ -28,3 +28,13 @@ base64 = "0.22"
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 
+# Build-speed release profile. This is a PC/SC card-reader HTTP bridge, not a
+# CPU-bound workload, so we trade the default `opt-level = 3` + 16 codegen units
+# for a much faster compile with negligible runtime cost — it cuts cold-cache CI
+# builds and the always-recompiled workspace crate on every build.
+[profile.release]
+opt-level = 1        # 1 is plenty for a card bridge; far faster to compile than 3
+codegen-units = 256  # maximise codegen parallelism (default 16)
+lto = false          # LTO is a large build-time cost with no benefit here
+strip = true         # smaller binary/installer + faster artifact upload
+
