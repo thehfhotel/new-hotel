@@ -106,6 +106,7 @@ export default function ScanRegistrationDocModal({
           englishLastName: card.englishLastName,
           dateOfBirth: card.dateOfBirth,
           issueDate: card.issueDate,
+          expireDate: card.expireDate,
           address: card.address,
           photoBase64: card.photo,
           cinId: checkInId,

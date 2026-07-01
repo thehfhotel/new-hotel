@@ -205,10 +205,10 @@ FROM debian:bookworm-slim@sha256:0104b334637a5f19aa9c983a91b54c89887c0984081f206
 LABEL org.opencontainers.image.source=https://github.com/thehfhotel/new-hotel
 LABEL org.opencontainers.image.licenses=Proprietary
 
-# fonts-tlwg-loma-ttf: Debian DFSG TLWG "Loma" Thai TrueType face used to shape
-# the reconstructed Thai national-ID card (render/thai_id_card.rs). Installs
-# /usr/share/fonts/truetype/tlwg/Loma-Bold.ttf — the default THAI_ID_FONT_PATH.
-# Pure font data, no runtime library to link.
+# fonts-tlwg-loma-ttf: Debian DFSG TLWG "Loma" Thai TrueType face, kept as the
+# FALLBACK for the reconstructed Thai national-ID card (render/thai_id_card.rs).
+# Installs /usr/share/fonts/truetype/tlwg/Loma-Bold.ttf. Pure font data, no
+# runtime library to link.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
@@ -216,6 +216,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# Thai national-ID card assets, bundled in the image so the render endpoint is
+# self-contained (no host bind-mount required):
+#   - DilleniaUPC Bold — the EXACT face KPThaiNationalIDCard.exe draws with; the
+#     default THAI_ID_FONT_PATH (see config.rs). Sourced from the licensed Windows
+#     UPC font set (upcdb.ttf); metrics drive the baseline math in thai_id_card.rs.
+#   - thai_id_template.png — the authoritative blank card (504×322) extracted from
+#     the reference's `Untitled_1__Copy_` resource; the default THAI_ID_TEMPLATE_PATH.
+COPY assets/fonts/DilleniaUPC-Bold.ttf /usr/share/fonts/truetype/dillenia/DilleniaUPC-Bold.ttf
+COPY assets/thai_id_template.png /app/assets/thai_id_template.png
 
 COPY --from=builder /out/hotel-backend /app/hotel-backend
 COPY --from=builder /out/writeback /app/writeback

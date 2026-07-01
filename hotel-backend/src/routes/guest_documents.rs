@@ -370,6 +370,8 @@ pub struct RenderThaiIdRequest {
     #[serde(default)]
     pub issue_date: String,
     #[serde(default)]
+    pub expire_date: String,
+    #[serde(default)]
     pub address: String,
     /// Base64-encoded chip face photo (JPEG; standard alphabet, padding
     /// optional, whitespace tolerated).
@@ -433,6 +435,7 @@ pub async fn render_thai_id_card(
         english_last_name: body.english_last_name.clone(),
         date_of_birth: body.date_of_birth.clone(),
         issue_date: body.issue_date.clone(),
+        expire_date: body.expire_date.clone(),
         address: body.address.clone(),
     };
 

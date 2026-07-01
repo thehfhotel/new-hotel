@@ -200,6 +200,7 @@ export default function CardReaderPage() {
           englishLastName: cardData.englishLastName,
           dateOfBirth: cardData.dateOfBirth,
           issueDate: cardData.issueDate,
+          expireDate: cardData.expireDate,
           address: cardData.address,
           photoBase64: cardData.photo,
         }),
