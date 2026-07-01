@@ -12,7 +12,11 @@ const nextConfig = {
       "style-src 'self' 'unsafe-inline'",
       "img-src 'self' data: blob:",
       "font-src 'self' data:",
-      "connect-src 'self' https://cloudflareinsights.com",
+      // http://localhost:9898 / 127.0.0.1:9898 = the per-PC Thai-ID card-reader
+      // middleware (a local hardware bridge). http:// is fine from an https page
+      // because Chrome treats localhost/127.0.0.1 as a secure context (no
+      // mixed-content block); without these the fetch is refused by connect-src.
+      "connect-src 'self' https://cloudflareinsights.com http://localhost:9898 http://127.0.0.1:9898",
       "frame-ancestors 'none'",
       "base-uri 'self'",
       "form-action 'self'",

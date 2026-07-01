@@ -21,11 +21,13 @@ use crate::card_reader::{is_debug_mode, set_debug_mode, CardData, CardReader, Fu
 const SERVER_PORT: u16 = 9898;
 
 /// Default CORS allowlist when `CARD_READER_ALLOWED_ORIGINS` is unset.
-/// Mirrors the backend's `BACKEND_ALLOWED_ORIGINS` default — covers the
-/// Next.js dev server on the host (3003) plus the in-container `web`
-/// service. Production deployments MUST set the env var explicitly with
-/// the public hostname(s) of the frontend(s) allowed to read cards.
-const DEFAULT_ALLOWED_ORIGINS: &str = "http://localhost:3003,http://web:3003";
+/// Covers the production frontend (`https://hotel.thehfhotel.org`, both HF
+/// Hotel and HF Ville share this origin — branch is a header, not a host) plus
+/// the Next.js dev server on the host (3003) and the in-container `web`
+/// service. So a stock reception install reads cards from prod with no per-PC
+/// env config; `CARD_READER_ALLOWED_ORIGINS` still overrides for other hosts.
+const DEFAULT_ALLOWED_ORIGINS: &str =
+    "https://hotel.thehfhotel.org,http://localhost:3003,http://web:3003";
 
 /// Shared application state for Axum handlers
 #[derive(Clone)]
