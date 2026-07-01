@@ -20,5 +20,5 @@ pub mod queue;
 pub use bus::EventBus;
 pub use event::{DomainEvent, EventSource};
 pub use idempotency::{generate_idempotency_key, WRITEBACK_NAMESPACE};
-pub use intent::{NoteTargetKind, WritebackIntent};
+pub use intent::{CompanionEntry, NoteTargetKind, WritebackIntent};
 pub use queue::OutboxRepository;

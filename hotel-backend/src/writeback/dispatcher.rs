@@ -497,6 +497,13 @@ fn intent_facts(intent: &WritebackIntent) -> IntentFacts {
         // HT_CheckIn_Other_People, so a crash-after-commit retry would mint a
         // DUPLICATE companion row. Ledger it. No cashier-round money row.
         MirrorCompanion { .. } => (true, false),
+        // Phase 4 (replace-all) — MirrorCompanionList is a `DELETE … WHERE
+        // Cin_no=…` followed by N INSERTs of the CURRENT list (iHOTEL parity).
+        // The DELETE clears all prior rows first, so a crash-after-commit retry
+        // re-converges to the same set with no duplicates — idempotent, NOT
+        // ledgered (same class as the absolute-SET / UPSERT recipes). No
+        // cashier-round money row → no §1.9 warning.
+        MirrorCompanionList { .. } => (false, false),
         ModifyBooking { .. }
         | CancelBooking { .. }
         | CancelCheckIn { .. }
@@ -1364,6 +1371,21 @@ pub async fn dispatch(
                 ));
             }
             recipes::companion_people::execute(conn, cin_legacy_no, name, country).await
+        }
+        // Phase 4 (replace-all) — mirror the ENTIRE companion set for a folio
+        // into legacy `HT_CheckIn_Other_People` (DELETE all for the Cin_no, then
+        // re-insert the current list — iHOTEL parity). Same payload-carries-the-
+        // key shape as MirrorCompanion.
+        WritebackIntent::MirrorCompanionList {
+            cin_legacy_no,
+            companions,
+        } => {
+            if cin_legacy_no.is_empty() {
+                return Err(WritebackError::Recipe(
+                    "MirrorCompanionList requires a non-empty cin_legacy_no".into(),
+                ));
+            }
+            recipes::companion_people::execute_replace_all(conn, cin_legacy_no, companions).await
         }
     };
 

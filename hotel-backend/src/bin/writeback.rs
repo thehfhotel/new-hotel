@@ -1380,10 +1380,11 @@ async fn resolve_legacy_ids(
                 resolved.guest_document_image = row.try_get::<Vec<u8>, _>("doc_image").ok();
             }
         }
-        // Phase 4 — MirrorCompanion carries the legacy `Cin_no` + name + country
-        // in its payload (resolved by the route before enqueue); nothing to
-        // resolve from PG. Mirrors the `UpdateCustomer` payload-carries-key shape.
-        MirrorCompanion { .. } => {}
+        // Phase 4 — MirrorCompanion / MirrorCompanionList carry the legacy
+        // `Cin_no` (+ name/country, or the full list) in their payload (resolved
+        // by the route before enqueue); nothing to resolve from PG. Mirrors the
+        // `UpdateCustomer` payload-carries-key shape.
+        MirrorCompanion { .. } | MirrorCompanionList { .. } => {}
     }
     Ok(resolved)
 }
@@ -2250,10 +2251,10 @@ async fn back_populate_legacy_ids(
         // back-populate onto the canonical row today (doc_legacy_id capture is a
         // documented follow-up).
         MirrorGuestImage { .. } => {}
-        // Phase 4 — MirrorCompanion INSERTs a `HT_CheckIn_Other_People` row
-        // (IDENTITY id) and carries no canonical back-pointer column. Nothing to
-        // back-populate.
-        MirrorCompanion { .. } => {}
+        // Phase 4 — MirrorCompanion / MirrorCompanionList write
+        // `HT_CheckIn_Other_People` rows (IDENTITY ids) and carry no canonical
+        // back-pointer column. Nothing to back-populate.
+        MirrorCompanion { .. } | MirrorCompanionList { .. } => {}
     }
     Ok(())
 }

@@ -773,6 +773,22 @@ pub enum WritebackIntent {
         #[serde(default)]
         country: String,
     },
+
+    /// Replace the ENTIRE companion set for a folio (iHOTEL parity — on any
+    /// add/delete, delete all HT_CheckIn_Other_People for the Cin_no and
+    /// re-insert the current list). Carries the full current list.
+    MirrorCompanionList {
+        cin_legacy_no: String,
+        companions: Vec<CompanionEntry>,
+    },
+}
+
+/// One companion in a MirrorCompanionList replace-all payload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompanionEntry {
+    pub name: String,
+    #[serde(default)]
+    pub country: String,
 }
 
 /// Payload for [`WritebackIntent::UpsertRatePrice`].
@@ -1094,6 +1110,7 @@ impl WritebackIntent {
             WritebackIntent::UpsertRatePrice { .. } => "upsert_rate_price",
             WritebackIntent::MirrorGuestImage { .. } => "mirror_guest_image",
             WritebackIntent::MirrorCompanion { .. } => "mirror_companion",
+            WritebackIntent::MirrorCompanionList { .. } => "mirror_companion_list",
         }
     }
 
@@ -1165,6 +1182,9 @@ impl WritebackIntent {
             // across the two logical DBs, same rationale as `round_aggregate`.
             WritebackIntent::MirrorGuestImage { doc_id, .. } => guest_document_aggregate(*doc_id),
             WritebackIntent::MirrorCompanion { cin_legacy_no, .. } => {
+                companion_aggregate(cin_legacy_no)
+            }
+            WritebackIntent::MirrorCompanionList { cin_legacy_no, .. } => {
                 companion_aggregate(cin_legacy_no)
             }
         }
