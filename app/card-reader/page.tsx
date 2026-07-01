@@ -42,6 +42,36 @@ function formatThaiDate(dateStr: string): string {
   }
 }
 
+/**
+ * Map the middleware gender field ("Male"/"Female", also tolerating "M"/"F" or
+ * the raw "1"/"2" card codes) to the legacy Thai literal stored in
+ * `HT_Customers.Cust_sex` ("ชาย" / "หญิง"). Returns undefined when unknown so
+ * the prefill simply omits the field.
+ */
+function genderToThaiSex(gender: string | undefined): string | undefined {
+  if (!gender) return undefined
+  const g = gender.trim().toLowerCase()
+  if (g === 'male' || g === 'm' || g === '1') return 'ชาย'
+  if (g === 'female' || g === 'f' || g === '2') return 'หญิง'
+  return undefined
+}
+
+/**
+ * Thai-ID chips store the birth year in the Buddhist era (พ.ศ.). Normalise to a
+ * Gregorian ISO `YYYY-MM-DD` for the canonical `cust_dob` DATE column by
+ * subtracting 543 whenever the year is unambiguously Buddhist (> 2200). Returns
+ * undefined for anything that isn't a plain `YYYY-MM-DD` string.
+ */
+function toGregorianIsoDate(raw: string | undefined): string | undefined {
+  if (!raw) return undefined
+  const m = raw.trim().match(/^(\d{4})-(\d{2})-(\d{2})$/)
+  if (!m) return undefined
+  let year = parseInt(m[1], 10)
+  if (year > 2200) year -= 543
+  if (year < 1900 || year > 2100) return undefined
+  return `${year}-${m[2]}-${m[3]}`
+}
+
 export default function CardReaderPage() {
   const router = useRouter()
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('disconnected')
@@ -126,14 +156,23 @@ export default function CardReaderPage() {
     if (!cardData) return
     // Stash the parsed Thai-ID fields for the check-in form to consume, then
     // hand off to the rooms screen where the receptionist picks a room and
-    // opens the check-in modal (which prefills from this slot).
-    // NOTE: photo capture/persistence is intentionally out of scope
-    // (docs/architecture.md:1385) — only name + ID are carried over.
+    // opens the check-in modal (which prefills from this slot). We now carry
+    // the full card payload (name, English name, DOB, gender, address and the
+    // chip photo) so the check-in can persist a richer customer record + a
+    // guest-document image. Only non-empty fields are stashed.
     setCheckInPrefill({
-      firstName: cardData.thaiFirstName,
-      lastName: cardData.thaiLastName,
-      idCard: cardData.cid,
+      docType: 'thai_id_card',
+      firstName: cardData.thaiFirstName || undefined,
+      lastName: cardData.thaiLastName || undefined,
+      idCard: cardData.cid || undefined,
       nationality: 'ไทย',
+      title: cardData.thaiTitle || undefined,
+      englishFirstName: cardData.englishFirstName || undefined,
+      englishLastName: cardData.englishLastName || undefined,
+      sex: genderToThaiSex(cardData.gender),
+      dob: toGregorianIsoDate(cardData.dateOfBirth),
+      address: cardData.address || undefined,
+      photoBase64: cardData.photo || undefined,
     })
     router.push('/rooms')
   }

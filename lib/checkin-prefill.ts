@@ -23,6 +23,38 @@ export interface CheckInPrefill {
   idCard?: string
   /** ISO nationality hint (e.g. "ไทย"); not all forms use it. */
   nationality?: string
+
+  // --- Extended document fields (Thai-ID card reader / passport scanner) ---
+  // All optional and additive: consumers that ignore them keep their old
+  // behaviour, and a minimal prefill (name + id only) is unchanged.
+
+  /** Latin given name(s) — Thai-ID English first name or passport givenNames. */
+  englishFirstName?: string
+  /** Latin surname — Thai-ID English last name or passport surname. */
+  englishLastName?: string
+  /** Thai title / prefix (e.g. "นาย", "นาง", "น.ส."). */
+  title?: string
+  /** Passport / travel-document number (foreign guests). */
+  passport?: string
+  /** Gender as the legacy Thai literal ("ชาย" / "หญิง"). */
+  sex?: string
+  /** Date of birth, Gregorian ISO `YYYY-MM-DD`. */
+  dob?: string
+  /** Full single-line address (the Thai-ID chip returns it unsplit). */
+  address?: string
+  /** Structured Thai address parts (rarely populated; forwarded when present). */
+  addNo?: string
+  addMoo?: string
+  addSoi?: string
+  addRoad?: string
+  addTambon?: string
+  addAmpore?: string
+  addProvince?: string
+  addCode?: string
+  /** Raw base64 JPEG (NO `data:` prefix) of the guest photo / document scan. */
+  photoBase64?: string
+  /** Source document type — drives guest-document storage + legacy `ttype`. */
+  docType?: 'thai_id_card' | 'passport'
 }
 
 /** Stash a pending prefill (overwrites any previous one). */

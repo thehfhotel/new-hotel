@@ -52,6 +52,7 @@ pub mod cash_entry;
 pub mod checkin_cancel;
 pub mod checkin_to_booking;
 pub mod checkout;
+pub mod companion_people;
 pub mod coupon;
 pub mod deposit_refund;
 pub mod extend_stay;
@@ -60,12 +61,13 @@ pub mod mark_clean;
 pub mod mark_dirty;
 pub mod payment;
 pub mod pos_sale;
-pub mod rate_price;
 pub mod pos_void;
+pub mod rate_price;
 pub mod receipt;
 pub mod refund_payment;
-pub mod round_bill;
 pub mod room_change;
+pub mod round_bill;
+pub mod save_image;
 pub mod set_maintenance;
 pub mod sticky_note;
 pub mod update_customer;
@@ -192,8 +194,10 @@ mod tests {
             "INSERT INTO [HT_Book_Date](...) OUTPUT INSERTED.id VALUES(...)",
         ];
         for s in examples {
-            assert!(s.to_ascii_uppercase().contains("OUTPUT INSERTED."),
-                "example {s:?} must satisfy the helper precondition");
+            assert!(
+                s.to_ascii_uppercase().contains("OUTPUT INSERTED."),
+                "example {s:?} must satisfy the helper precondition"
+            );
         }
     }
 }

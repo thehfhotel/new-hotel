@@ -30,9 +30,8 @@ use crate::domain::user::User;
 use crate::error::{ApiError, ApiResult};
 use crate::models::Pagination;
 use crate::outbox::event::EventSource;
-use crate::repository::checkin::{
-    CheckInDetailRow, CheckInListRow, GuestInsert, GuestRow,
-};
+use crate::outbox::{generate_idempotency_key, OutboxRepository, WritebackIntent};
+use crate::repository::checkin::{CheckInDetailRow, CheckInListRow, GuestInsert, GuestRow};
 use crate::service::{
     ChangeRoomCommand, ChangeRoomOutcome, CheckInService, CheckInToBookingCommand,
     CheckInWritebackContext, CheckOutCommand, ExtendStayCommand, RefundDepositCommand,
@@ -166,8 +165,12 @@ pub struct NewCheckInsQuery {
     pub branch: Option<Branch>,
 }
 
-fn default_page() -> i32 { 1 }
-fn default_limit() -> i32 { 20 }
+fn default_page() -> i32 {
+    1
+}
+fn default_limit() -> i32 {
+    20
+}
 
 /// Response for check-ins list
 #[derive(Debug, Serialize)]
@@ -208,6 +211,14 @@ pub struct CreateCheckInRequest {
     /// Persists to `ht_checkin_rooms.cr_dep_amount` and is mirrored to legacy
     /// `HT_CheckIn_Ds.Cin_Room_Dep`. Omitted / `null` ⇒ no deposit.
     pub deposit_amount: Option<f64>,
+    /// Optional `Tb_Save_Image.tmp_no` linking a guest photo uploaded via
+    /// `POST /api/guest-documents` (Phase 2 check-in registration). Threaded
+    /// into [`CreateCheckInPayload::photo_tmp_no`] so the walk-in /
+    /// checkin-to-booking recipe fires the existing
+    /// `UPDATE Tb_Save_Image … WHERE tmp_no=<photoTmpNo>` link (no-op when
+    /// absent). Omitted / `null` ⇒ no photo link.
+    #[serde(default)]
+    pub photo_tmp_no: Option<String>,
 }
 
 /// Request body for checkout
@@ -292,10 +303,23 @@ pub async fn list_checkins(
     // (hotelville's canonical ht_checkins is populated), All unions both —
     // mirroring routes/rooms.rs::list_rooms.
     let (rows, total) = match params.branch.unwrap_or_default() {
-        Branch::Hfhotel => state.checkins.list_with_count(&state.new_pool, &params).await?,
-        Branch::Hfville => state.checkins.list_with_count(state.ville_pool()?, &params).await?,
+        Branch::Hfhotel => {
+            state
+                .checkins
+                .list_with_count(&state.new_pool, &params)
+                .await?
+        }
+        Branch::Hfville => {
+            state
+                .checkins
+                .list_with_count(state.ville_pool()?, &params)
+                .await?
+        }
         Branch::All => {
-            let (mut r, mut t) = state.checkins.list_with_count(&state.new_pool, &params).await?;
+            let (mut r, mut t) = state
+                .checkins
+                .list_with_count(&state.new_pool, &params)
+                .await?;
             if let Ok(vp) = state.ville_pool() {
                 let (vr, vt) = state.checkins.list_with_count(vp, &params).await?;
                 r.extend(vr);
@@ -344,15 +368,22 @@ pub async fn create_checkin(
     // or `checkin_to_booking`) which copies `guest_name_for_registry` into
     // both `HT_Customers.Cust_name` and `HT_CheckIn_Other_People.Cin_name`.
     let resolved_customer_id = match body.booking_id {
-        Some(booking_id) => state
-            .checkins
-            .get_booking_customer_id(pool, booking_id)
-            .await?,
+        Some(booking_id) => {
+            state
+                .checkins
+                .get_booking_customer_id(pool, booking_id)
+                .await?
+        }
         None => body.customer_id,
     };
-    let mut writeback_context =
-        build_check_in_writeback_context(&state, pool, &body, expected_checkout, resolved_customer_id)
-            .await?;
+    let mut writeback_context = build_check_in_writeback_context(
+        &state,
+        pool,
+        &body,
+        expected_checkout,
+        resolved_customer_id,
+    )
+    .await?;
     // Stamp the authenticated operator (if any) over the default empty
     // `created_by`. No body field carries this, so auth-off leaves it empty.
     if let Some(actor) = super::resolve_actor(actor.as_deref(), None) {
@@ -385,8 +416,7 @@ pub async fn create_checkin(
             let customer_id = body.customer_id.ok_or_else(|| {
                 ApiError::BadRequest("Customer ID is required for walk-ins".to_string())
             })?;
-            ws
-                .checkins
+            ws.checkins
                 .walk_in(WalkInCommand {
                     cin_no: cin_no.clone(),
                     customer_id,
@@ -589,10 +619,19 @@ pub async fn list_checkin_rooms(
         .map(|row| {
             let st: String = row.try_get("cr_room_status").unwrap_or_default();
             // 'เข้าพัก' = in-house; 'Check-Out' = already released.
-            let status = if st == "Check-Out" { "checked_out" } else { "active" }.to_string();
+            let status = if st == "Check-Out" {
+                "checked_out"
+            } else {
+                "active"
+            }
+            .to_string();
             let nights: f64 = row.try_get("nights").unwrap_or(1.0);
             let subtotal: f64 = row.try_get("subtotal").unwrap_or(0.0);
-            let rate_per_night = if nights > 0.0 { subtotal / nights } else { subtotal };
+            let rate_per_night = if nights > 0.0 {
+                subtotal / nights
+            } else {
+                subtotal
+            };
             CheckinRoomRow {
                 cr_id: row.try_get("cr_id").unwrap_or(0),
                 room_id: row.try_get("cr_room_id").unwrap_or(0),
@@ -606,7 +645,10 @@ pub async fn list_checkin_rooms(
         })
         .collect();
 
-    Ok(Json(CheckinRoomsResponse { success: true, data }))
+    Ok(Json(CheckinRoomsResponse {
+        success: true,
+        data,
+    }))
 }
 
 /// PUT /api/new/checkins/:id/checkout - Process check-out
@@ -657,7 +699,10 @@ pub async fn checkout(
     } else {
         billing.cin_total_amount.unwrap_or(0.0)
     };
-    let pay_total = body.total_amount.or(billing.cin_total_amount).unwrap_or(0.0);
+    let pay_total = body
+        .total_amount
+        .or(billing.cin_total_amount)
+        .unwrap_or(0.0);
     let net_total = room_price_total; // No product/extras plumbing yet.
     let balance = (net_total - pay_total).max(0.0);
 
@@ -692,7 +737,13 @@ pub async fn checkout(
     let (cmd_total_amount, cmd_product_total, cmd_net_total, cmd_pay_total, cmd_balance) =
         if server_total_on {
             let f = folio_breakdown(&state, pool, cin_id).await?;
-            (Some(f.net_total), f.product_total, f.net_total, f.pay_total, f.balance)
+            (
+                Some(f.net_total),
+                f.product_total,
+                f.net_total,
+                f.pay_total,
+                f.balance,
+            )
         } else {
             (body.total_amount, 0.0_f64, net_total, pay_total, balance)
         };
@@ -763,10 +814,7 @@ pub async fn extend(
         .await?
         .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
 
-    validate_new_checkout_after_existing(
-        body.new_checkout_date,
-        detail.cin_expected_checkout,
-    )?;
+    validate_new_checkout_after_existing(body.new_checkout_date, detail.cin_expected_checkout)?;
 
     let command = build_extend_stay_command(&detail, &body);
     checkin_service_for(&state, query.branch)?
@@ -933,8 +981,7 @@ async fn build_check_in_writeback_context(
         .or(default_weekday)
         .map(money_from_baht_f64)
         .unwrap_or(Money::ZERO);
-    let price_total =
-        Money::from_satang(price_per_night.as_satang().saturating_mul(nights as i64));
+    let price_total = Money::from_satang(price_per_night.as_satang().saturating_mul(nights as i64));
 
     // Customer lookup. The walkin recipe also INSERTs HT_Customers from this
     // value when legacy_cust_no is None, so an empty name here results in a
@@ -977,6 +1024,15 @@ async fn build_check_in_writeback_context(
             .filter(|d| *d > 0.0)
             .map(money_from_baht_f64)
             .unwrap_or(Money::ZERO),
+        // Phase 2 — the guest-photo linkage key. Trim + drop empties so a blank
+        // string never fires the legacy `WHERE tmp_no=''` no-op-poisoning UPDATE
+        // (the recipe also guards this — belt and suspenders).
+        photo_tmp_no: body
+            .photo_tmp_no
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
     })
 }
 
@@ -1077,9 +1133,7 @@ pub(crate) fn build_extend_stay_command(
     // `build_check_in_writeback_context`). The audit's BKK-midnight
     // theme will refactor both call sites in a single Track A wave.
     let midnight = NaiveTime::from_hms_opt(0, 0, 0).expect("hardcoded midnight is valid");
-    let stay_start = Utc.from_utc_datetime(
-        &detail.cin_checkin_time.date().and_time(midnight),
-    );
+    let stay_start = Utc.from_utc_datetime(&detail.cin_checkin_time.date().and_time(midnight));
     let new_end = Utc.from_utc_datetime(&body.new_checkout_date.and_time(midnight));
 
     let nights_new = (body.new_checkout_date - detail.cin_checkin_time.date())
@@ -1307,9 +1361,7 @@ pub async fn room_change_receipt(
     .fetch_optional(pool)
     .await
     .map_err(|e| ApiError::Database(e.to_string()))?
-    .ok_or_else(|| {
-        ApiError::NotFound(format!("no room change found for check-in {cin_id}"))
-    })?;
+    .ok_or_else(|| ApiError::NotFound(format!("no room change found for check-in {cin_id}")))?;
 
     Ok(Json(RoomChangeReceipt {
         success: true,
@@ -1585,7 +1637,10 @@ pub async fn list_deposits(
         })
         .collect();
 
-    Ok(Json(DepositsResponse { success: true, deposits }))
+    Ok(Json(DepositsResponse {
+        success: true,
+        deposits,
+    }))
 }
 
 /// `POST /api/checkins/{id}/deposit-refund` — mark a per-room deposit refunded
@@ -1782,11 +1837,15 @@ pub async fn list_pos_sales(
                     .try_get::<String, _>("prod_legacy_no")
                     .unwrap_or_default(),
                 product_name: row.try_get::<String, _>("prod_name").unwrap_or_default(),
-                product_unit: row.try_get::<Option<String>, _>("prod_unit").unwrap_or(None),
+                product_unit: row
+                    .try_get::<Option<String>, _>("prod_unit")
+                    .unwrap_or(None),
                 qty: row.try_get::<f64, _>("qty").unwrap_or(0.0),
                 unit_price_baht: row.try_get::<f64, _>("unit_price").unwrap_or(0.0),
                 total_baht: row.try_get::<f64, _>("total").unwrap_or(0.0),
-                note: row.try_get::<Option<String>, _>("sale_note").unwrap_or(None),
+                note: row
+                    .try_get::<Option<String>, _>("sale_note")
+                    .unwrap_or(None),
                 status: row.try_get::<String, _>("sale_status").unwrap_or_default(),
                 source: row.try_get::<String, _>("source").unwrap_or_default(),
                 sold_at: row
@@ -1990,7 +2049,9 @@ pub async fn create_guest(
 
     let first_name = body.first_name.trim();
     if first_name.is_empty() {
-        return Err(ApiError::BadRequest("Guest first name is required".to_string()));
+        return Err(ApiError::BadRequest(
+            "Guest first name is required".to_string(),
+        ));
     }
 
     let status_snap = state
@@ -2001,7 +2062,9 @@ pub async fn create_guest(
 
     let status = status_snap.cin_status.unwrap_or_default();
     if status != "active" {
-        return Err(ApiError::BadRequest("Cannot add guests to a non-active check-in".to_string()));
+        return Err(ApiError::BadRequest(
+            "Cannot add guests to a non-active check-in".to_string(),
+        ));
     }
 
     let is_primary = body.is_primary.unwrap_or(false);
@@ -2029,6 +2092,68 @@ pub async fn create_guest(
             },
         )
         .await?;
+
+    // Phase 4 (TM.30 companion writeback) — SHIPPED DARK behind
+    // TM30_COMPANION_WRITEBACK_ENABLED. When on, mirror the companion into the
+    // legacy `HT_CheckIn_Other_People` table (name + country only). Enqueued in
+    // THIS tx so it commits atomically with the canonical guest insert. Requires
+    // the folio's legacy `Cin_no`; if the check-in hasn't been mirrored to MSSQL
+    // yet (no `legacy_cin_no`), skip + log — the companion won't mirror for that
+    // folio (a later re-add or the check-in writeback landing first would).
+    if crate::config::tm30_companion_writeback_enabled() {
+        // Dynamic sqlx (no query! macro). NULLIF collapses the legacy empty-string
+        // sentinel to NULL so `.flatten()` treats "not yet mirrored" as absent.
+        let legacy_cin_no: Option<String> = sqlx::query_scalar(
+            "SELECT NULLIF(legacy_cin_no, '') FROM ht_checkins WHERE cin_id = $1",
+        )
+        .bind(cin_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+
+        match legacy_cin_no {
+            Some(cin_no) => {
+                let name = match body
+                    .last_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    Some(last) => format!("{first_name} {last}"),
+                    None => first_name.to_string(),
+                };
+                let country = body
+                    .nationality
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_default()
+                    .to_string();
+                let intent = WritebackIntent::MirrorCompanion {
+                    cin_legacy_no: cin_no,
+                    name,
+                    country,
+                };
+                // Per-companion discriminator (fresh UUID) so multiple companions
+                // on one folio each enqueue their own job — the aggregate id
+                // groups them but the idempotency_key must be unique.
+                let key = generate_idempotency_key(&intent, Uuid::new_v4());
+                OutboxRepository::enqueue(&mut tx, &intent, key)
+                    .await
+                    .map_err(|e| {
+                        ApiError::Internal(format!("failed to enqueue companion writeback: {e}"))
+                    })?;
+            }
+            None => {
+                tracing::info!(
+                    cin_id,
+                    guest_id,
+                    "TM30 companion writeback skipped — folio has no legacy_cin_no \
+                     yet (check-in not mirrored to MSSQL)"
+                );
+            }
+        }
+    }
 
     tx.commit().await?;
 
@@ -2064,7 +2189,9 @@ pub async fn delete_guest(
 
     let status = status_snap.cin_status.unwrap_or_default();
     if status != "active" {
-        return Err(ApiError::BadRequest("Cannot remove guests from a non-active check-in".to_string()));
+        return Err(ApiError::BadRequest(
+            "Cannot remove guests from a non-active check-in".to_string(),
+        ));
     }
 
     let exists = state
@@ -2072,7 +2199,9 @@ pub async fn delete_guest(
         .find_guest_in_checkin(pool, path.id, path.guest_id)
         .await?;
     if exists.is_none() {
-        return Err(ApiError::NotFound("Guest not found for this check-in".to_string()));
+        return Err(ApiError::NotFound(
+            "Guest not found for this check-in".to_string(),
+        ));
     }
 
     let mut tx = pool.begin().await?;
@@ -2351,14 +2480,7 @@ mod tests {
         let existing_checkout = NaiveDate::from_ymd_opt(2026, 5, 14).expect("valid date");
         let new_checkout = NaiveDate::from_ymd_opt(2026, 5, 16).expect("valid date");
 
-        let detail = detail_fixture(
-            7,
-            checkin,
-            existing_checkout,
-            None,
-            None,
-            None,
-        );
+        let detail = detail_fixture(7, checkin, existing_checkout, None, None, None);
         let body = ExtendStayRequest {
             new_checkout_date: new_checkout,
             reason: None,

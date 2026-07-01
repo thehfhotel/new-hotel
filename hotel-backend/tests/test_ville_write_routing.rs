@@ -30,7 +30,9 @@ async fn two_pools() -> Option<(PgPool, PgPool)> {
         "postgresql://postgres:REDACTED-pg-2026@localhost:5439/hotelnew".to_string()
     });
     let new_pool = PgPool::connect(&new_url).await.expect("connect hotelnew");
-    let ville_pool = PgPool::connect(&ville_url).await.expect("connect hotelville");
+    let ville_pool = PgPool::connect(&ville_url)
+        .await
+        .expect("connect hotelville");
     Some((new_pool, ville_pool))
 }
 
@@ -91,7 +93,10 @@ async fn ville_writes_route_to_hotelville_only() {
     let h_db = current_db(state.write_pool(Some(Branch::Hfhotel)).unwrap()).await;
     let n_db = current_db(state.write_pool(None).unwrap()).await;
     assert_ne!(v_db, h_db, "Hfville and Hfhotel must resolve different DBs");
-    assert_eq!(h_db, n_db, "unset ?branch must resolve the same DB as Hfhotel");
+    assert_eq!(
+        h_db, n_db,
+        "unset ?branch must resolve the same DB as Hfhotel"
+    );
     assert_eq!(
         v_db,
         current_db(&ville_pool).await,
@@ -101,16 +106,25 @@ async fn ville_writes_route_to_hotelville_only() {
     // ---- 2. site_id threading (the one non-mechanical change) ----
     let ws_v = state.resolve_write_services(Some(Branch::Hfville)).unwrap();
     let ws_h = state.resolve_write_services(Some(Branch::Hfhotel)).unwrap();
-    assert_eq!(ws_v.shifts.site_id(), "hfville", "Ville bundle must bind site_id=hfville");
-    assert_eq!(ws_h.shifts.site_id(), "hfhotel", "HF Hotel bundle keeps the binary SITE_ID");
+    assert_eq!(
+        ws_v.shifts.site_id(),
+        "hfville",
+        "Ville bundle must bind site_id=hfville"
+    );
+    assert_eq!(
+        ws_h.shifts.site_id(),
+        "hfhotel",
+        "HF Hotel bundle keeps the binary SITE_ID"
+    );
 
     // outbox baseline on the ville pool (only this test touches hotelville_test)
-    let ville_jobs_before: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM writeback_jobs").fetch_one(&ville_pool).await.unwrap();
+    let ville_jobs_before: i64 = sqlx::query_scalar("SELECT count(*) FROM writeback_jobs")
+        .fetch_one(&ville_pool)
+        .await
+        .unwrap();
 
     // ---- 3. a Ville round: canonical row + outbox land in hotelville only ----
-    ws_v
-        .shifts
+    ws_v.shifts
         .open_shift(OpenShiftCommand {
             opened_by: marker.clone(),
             opening_float: 100.0,
@@ -119,14 +133,26 @@ async fn ville_writes_route_to_hotelville_only() {
         .await
         .expect("open Ville round");
 
-    let v_shift = count(&ville_pool, "SELECT count(*) FROM ht_shifts WHERE shift_opened_by=$1 AND shift_site_id='hfville'", &marker).await;
-    let n_shift = count(&new_pool, "SELECT count(*) FROM ht_shifts WHERE shift_opened_by=$1", &marker).await;
-    assert_eq!(v_shift, 1, "Ville round must be in hotelville with shift_site_id=hfville");
+    let v_shift = count(
+        &ville_pool,
+        "SELECT count(*) FROM ht_shifts WHERE shift_opened_by=$1 AND shift_site_id='hfville'",
+        &marker,
+    )
+    .await;
+    let n_shift = count(
+        &new_pool,
+        "SELECT count(*) FROM ht_shifts WHERE shift_opened_by=$1",
+        &marker,
+    )
+    .await;
+    assert_eq!(
+        v_shift, 1,
+        "Ville round must be in hotelville with shift_site_id=hfville"
+    );
     assert_eq!(n_shift, 0, "Ville round must NOT leak into hotelnew");
 
     // ---- 4. a Ville customer create lands in hotelville only ----
-    ws_v
-        .customers
+    ws_v.customers
         .create(CreateCustomerCommand {
             first_name: marker.clone(),
             last_name: None,
@@ -136,19 +162,29 @@ async fn ville_writes_route_to_hotelville_only() {
             address: None,
             customer_type: None,
             notes: Some(marker.clone()),
+            enrichment: Default::default(),
             source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
         })
         .await
         .expect("create Ville customer");
 
-    let v_cust = count(&ville_pool, "SELECT count(*) FROM ht_customers WHERE cust_firstname=$1", &marker).await;
-    let n_cust = count(&new_pool, "SELECT count(*) FROM ht_customers WHERE cust_firstname=$1", &marker).await;
+    let v_cust = count(
+        &ville_pool,
+        "SELECT count(*) FROM ht_customers WHERE cust_firstname=$1",
+        &marker,
+    )
+    .await;
+    let n_cust = count(
+        &new_pool,
+        "SELECT count(*) FROM ht_customers WHERE cust_firstname=$1",
+        &marker,
+    )
+    .await;
     assert_eq!(v_cust, 1, "Ville customer must be in hotelville");
     assert_eq!(n_cust, 0, "Ville customer must NOT leak into hotelnew");
 
     // ---- 5. a Ville coupon issue lands in hotelville only ----
-    ws_v
-        .coupons
+    ws_v.coupons
         .issue_coupon(IssueCouponCommand {
             customer_id: None,
             value_baht: 0.0,
@@ -160,14 +196,26 @@ async fn ville_writes_route_to_hotelville_only() {
         .await
         .expect("issue Ville coupon");
 
-    let v_coupon = count(&ville_pool, "SELECT count(*) FROM ht_coupons WHERE coupon_issued_by=$1", &marker).await;
-    let n_coupon = count(&new_pool, "SELECT count(*) FROM ht_coupons WHERE coupon_issued_by=$1", &marker).await;
+    let v_coupon = count(
+        &ville_pool,
+        "SELECT count(*) FROM ht_coupons WHERE coupon_issued_by=$1",
+        &marker,
+    )
+    .await;
+    let n_coupon = count(
+        &new_pool,
+        "SELECT count(*) FROM ht_coupons WHERE coupon_issued_by=$1",
+        &marker,
+    )
+    .await;
     assert_eq!(v_coupon, 1, "Ville coupon must be in hotelville");
     assert_eq!(n_coupon, 0, "Ville coupon must NOT leak into hotelnew");
 
     // ---- 6. the writeback outbox rode the ville pool's tx (round + coupon) ----
-    let ville_jobs_after: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM writeback_jobs").fetch_one(&ville_pool).await.unwrap();
+    let ville_jobs_after: i64 = sqlx::query_scalar("SELECT count(*) FROM writeback_jobs")
+        .fetch_one(&ville_pool)
+        .await
+        .unwrap();
     assert!(
         ville_jobs_after - ville_jobs_before >= 2,
         "Ville round + coupon must enqueue their writeback jobs into hotelville's outbox \

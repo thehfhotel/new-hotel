@@ -40,7 +40,13 @@ pub struct CustomerRow {
 
 /// Field set used by `insert` / `update`. Mirrors the legacy column names so
 /// the writeback worker (Phase 4b) can serialize them straight onto MSSQL.
-#[derive(Debug, Clone)]
+///
+/// The first eight fields drive the byte-identical base `insert` / `update`
+/// `query!` macros. The trailing optional fields (check-in registration
+/// extras — Thai ID chip / passport MRZ) drive the SEPARATE, non-destructive
+/// [`CustomerRepository::enrich`] COALESCE UPDATE in the same transaction —
+/// `insert` / `update` ignore them, keeping their compile-time SQL unchanged.
+#[derive(Debug, Clone, Default)]
 pub struct CustomerWrite<'a> {
     pub first_name: &'a str,
     pub last_name: Option<&'a str>,
@@ -50,6 +56,59 @@ pub struct CustomerWrite<'a> {
     pub address: Option<&'a str>,
     pub customer_type: Option<&'a str>,
     pub notes: Option<&'a str>,
+    // ----- Enrichment fields (check-in registration; enrich() only) -----
+    /// `cust_title` (personal prefix / คำนำหน้า).
+    pub title: Option<&'a str>,
+    /// `cust_name2` — Latin / English name captured from ID chip / MRZ.
+    pub english_name: Option<&'a str>,
+    /// `cust_passport` — passport number (canonical-only; no legacy column).
+    pub passport: Option<&'a str>,
+    /// `cust_nationality` (also copied to `cust_contry` so it mirrors to the
+    /// legacy `Cust_Contry` via the existing `UpdateCustomer` re-save).
+    pub nationality: Option<&'a str>,
+    /// `cust_sex` — Thai gender literal.
+    pub sex: Option<&'a str>,
+    /// `cust_dob` — ISO `YYYY-MM-DD`; bound as text and cast `::date`
+    /// (canonical-only; legacy `HT_Customers` has no DOB column).
+    pub dob: Option<&'a str>,
+    /// `cust_add_no` (house number).
+    pub add_no: Option<&'a str>,
+    /// `cust_add_moo`.
+    pub add_moo: Option<&'a str>,
+    /// `cust_add_soi`.
+    pub add_soi: Option<&'a str>,
+    /// `cust_add_road`.
+    pub add_road: Option<&'a str>,
+    /// `cust_add_tambon`.
+    pub add_tambon: Option<&'a str>,
+    /// `cust_add_ampore`.
+    pub add_ampore: Option<&'a str>,
+    /// `cust_add_province`.
+    pub add_province: Option<&'a str>,
+    /// `cust_add_code` (postal code).
+    pub add_code: Option<&'a str>,
+}
+
+impl CustomerWrite<'_> {
+    /// True when at least one enrichment field carries a value — lets the
+    /// service skip the [`CustomerRepository::enrich`] UPDATE entirely for the
+    /// common case (a create/edit that supplies only the base eight fields).
+    pub fn has_enrichment(&self) -> bool {
+        self.title.is_some()
+            || self.english_name.is_some()
+            || self.passport.is_some()
+            || self.nationality.is_some()
+            || self.sex.is_some()
+            || self.dob.is_some()
+            || self.add_no.is_some()
+            || self.add_moo.is_some()
+            || self.add_soi.is_some()
+            || self.add_road.is_some()
+            || self.add_tambon.is_some()
+            || self.add_ampore.is_some()
+            || self.add_province.is_some()
+            || self.add_code.is_some()
+    }
 }
 
 /// PostgreSQL data operations for the customer aggregate.
@@ -67,11 +126,7 @@ pub trait CustomerRepository: Send + Sync {
     ) -> Result<(Vec<CustomerRow>, i32), sqlx::Error>;
 
     /// Fetch a single customer by id.
-    async fn get(
-        &self,
-        pool: &PgPool,
-        cust_id: i32,
-    ) -> Result<Option<CustomerRow>, sqlx::Error>;
+    async fn get(&self, pool: &PgPool, cust_id: i32) -> Result<Option<CustomerRow>, sqlx::Error>;
 
     /// Insert a new customer; returns its assigned `cust_id`.
     async fn insert(
@@ -87,6 +142,23 @@ pub trait CustomerRepository: Send + Sync {
         cust_id: i32,
         write: CustomerWrite<'_>,
     ) -> Result<u64, sqlx::Error>;
+
+    /// Non-destructive COALESCE enrichment of the check-in-registration extra
+    /// columns (`cust_passport`, `cust_nationality`, `cust_sex`, `cust_dob`,
+    /// `cust_name2`, `cust_title`, `cust_add_*`). Runs as a SECOND UPDATE in the
+    /// caller's transaction, AFTER the base `insert` / `update`, and only
+    /// overwrites a column when the matching `write` field is `Some(_)` (via
+    /// `COALESCE($n, col)`), so it never blanks a value the request omitted.
+    ///
+    /// Uses runtime `sqlx::query()` (not the `query!` macro) because `cust_dob`
+    /// is a new column outside the `.sqlx` offline cache. A no-op (returns
+    /// `Ok(())` without touching the DB) when `write.has_enrichment()` is false.
+    async fn enrich(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        cust_id: i32,
+        write: &CustomerWrite<'_>,
+    ) -> Result<(), sqlx::Error>;
 
     /// Soft-delete (set `cust_active=false`); returns rows affected.
     async fn soft_delete(
@@ -117,7 +189,13 @@ impl CustomerRepository for PgCustomerRepository {
         let sort_order = params
             .sort_order
             .as_ref()
-            .map(|s| if s.to_lowercase() == "desc" { "DESC" } else { "ASC" })
+            .map(|s| {
+                if s.to_lowercase() == "desc" {
+                    "DESC"
+                } else {
+                    "ASC"
+                }
+            })
             .unwrap_or("ASC");
 
         let order_by_column = match params.sort_by.as_deref() {
@@ -215,7 +293,9 @@ impl CustomerRepository for PgCustomerRepository {
             .iter()
             .map(|row| CustomerRow {
                 cust_id: row.try_get::<i32, _>("cust_id").unwrap_or(0),
-                cust_firstname: row.try_get::<String, _>("cust_firstname").unwrap_or_default(),
+                cust_firstname: row
+                    .try_get::<String, _>("cust_firstname")
+                    .unwrap_or_default(),
                 cust_lastname: row.try_get::<String, _>("cust_lastname").ok(),
                 cust_phone: row.try_get::<String, _>("cust_phone").ok(),
                 cust_email: row.try_get::<String, _>("cust_email").ok(),
@@ -232,11 +312,7 @@ impl CustomerRepository for PgCustomerRepository {
         Ok((customers, total))
     }
 
-    async fn get(
-        &self,
-        pool: &PgPool,
-        cust_id: i32,
-    ) -> Result<Option<CustomerRow>, sqlx::Error> {
+    async fn get(&self, pool: &PgPool, cust_id: i32) -> Result<Option<CustomerRow>, sqlx::Error> {
         let rec = sqlx::query!(
             r#"
             SELECT
@@ -345,6 +421,67 @@ impl CustomerRepository for PgCustomerRepository {
         .await?;
 
         Ok(result.rows_affected())
+    }
+
+    async fn enrich(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        cust_id: i32,
+        write: &CustomerWrite<'_>,
+    ) -> Result<(), sqlx::Error> {
+        // Fast path: nothing to enrich (the common create/edit that carries only
+        // the base eight columns). Avoids a needless second write.
+        if !write.has_enrichment() {
+            return Ok(());
+        }
+
+        // Runtime `sqlx::query()` (NOT `query!`) — `cust_dob` is outside the
+        // `.sqlx` offline cache. COALESCE keeps the existing value when the
+        // matching param is NULL, so an omitted field never blanks the column.
+        //
+        // `$4` (dob) is a text ISO date cast `::date`. `$3` (nationality) also
+        // feeds `cust_contry` so the value flows through the existing
+        // `load_customer_resave` → `Cust_Contry` legacy re-save (that reader
+        // sources `cust_contry`, not `cust_nationality`).
+        sqlx::query(
+            "UPDATE ht_customers SET \
+                 cust_passport    = COALESCE($1, cust_passport), \
+                 cust_nationality = COALESCE($2, cust_nationality), \
+                 cust_contry      = COALESCE($2, cust_contry), \
+                 cust_sex         = COALESCE($3, cust_sex), \
+                 cust_dob         = COALESCE($4::date, cust_dob), \
+                 cust_name2       = COALESCE($5, cust_name2), \
+                 cust_title       = COALESCE($6, cust_title), \
+                 cust_add_no      = COALESCE($7, cust_add_no), \
+                 cust_add_moo     = COALESCE($8, cust_add_moo), \
+                 cust_add_soi     = COALESCE($9, cust_add_soi), \
+                 cust_add_road    = COALESCE($10, cust_add_road), \
+                 cust_add_tambon  = COALESCE($11, cust_add_tambon), \
+                 cust_add_ampore  = COALESCE($12, cust_add_ampore), \
+                 cust_add_province= COALESCE($13, cust_add_province), \
+                 cust_add_code    = COALESCE($14, cust_add_code), \
+                 updated_at = NOW() \
+             WHERE cust_id = $15",
+        )
+        .bind(write.passport)
+        .bind(write.nationality)
+        .bind(write.sex)
+        .bind(write.dob)
+        .bind(write.english_name)
+        .bind(write.title)
+        .bind(write.add_no)
+        .bind(write.add_moo)
+        .bind(write.add_soi)
+        .bind(write.add_road)
+        .bind(write.add_tambon)
+        .bind(write.add_ampore)
+        .bind(write.add_province)
+        .bind(write.add_code)
+        .bind(cust_id)
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(())
     }
 
     async fn soft_delete(

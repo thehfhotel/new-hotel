@@ -7,7 +7,7 @@ use axum::{
     extract::{Query, State},
     http::{header::CONTENT_TYPE, HeaderValue, Method, StatusCode},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-use crate::card_reader::{CardData, CardReader, FullDebugInfo, set_debug_mode, is_debug_mode};
+use crate::card_reader::{is_debug_mode, set_debug_mode, CardData, CardReader, FullDebugInfo};
 
 /// Server port for the HTTP API
 const SERVER_PORT: u16 = 9898;
@@ -85,6 +85,42 @@ pub struct ReadParams {
     pub photo: Option<bool>,
 }
 
+/// Request body for the `/parse-mrz` endpoint.
+///
+/// The caller supplies the already-OCR'd 2-line TD3 MRZ string (client-side
+/// tesseract.js, a dedicated scanner, or manual paste) plus an optional base64
+/// image that is echoed back so the frontend can attach it to the check-in.
+#[derive(Debug, Deserialize)]
+pub struct ParseMrzRequest {
+    /// The two MRZ lines separated by a newline (`\n` or `\r\n`).
+    pub mrz: String,
+    /// Optional base64-encoded passport image, echoed back verbatim.
+    #[serde(default)]
+    pub image: Option<String>,
+}
+
+/// Successful MRZ parse response.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParseMrzResponse {
+    pub success: bool,
+    pub passport_number: String,
+    pub surname: String,
+    pub given_names: String,
+    pub nationality: String,
+    /// ISO 8601 (YYYY-MM-DD).
+    pub date_of_birth: String,
+    /// `M`, `F`, or `X`.
+    pub sex: String,
+    /// ISO 8601 (YYYY-MM-DD).
+    pub expiry_date: String,
+    /// True when all TD3 check digits validate.
+    pub checksum_valid: bool,
+    /// Echoed-back base64 image when one was supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+}
+
 /// Start the HTTP server - runs until the application exits
 ///
 /// # Arguments
@@ -106,10 +142,11 @@ pub async fn start_http_server(card_reader: Arc<Mutex<CardReader>>) -> Result<()
     // handler is a GET today) plus OPTIONS for the preflight; headers are
     // restricted to `Content-Type` since none of the endpoints inspect
     // anything else. No credentials/cookies are involved, so
-    // `allow_credentials` stays off.
+    // `allow_credentials` stays off. POST is allowed for `/parse-mrz`, which
+    // takes a JSON body (all other endpoints are GET).
     let cors = CorsLayer::new()
         .allow_origin(parse_allowed_origins())
-        .allow_methods([Method::GET, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([CONTENT_TYPE]);
 
     // Build the router with all endpoints
@@ -117,6 +154,7 @@ pub async fn start_http_server(card_reader: Arc<Mutex<CardReader>>) -> Result<()
         .route("/health", get(health_handler))
         .route("/status", get(status_handler))
         .route("/read", get(read_handler))
+        .route("/parse-mrz", post(parse_mrz_handler))
         .route("/debug", get(debug_info_handler))
         .route("/debug/enable", get(enable_debug_handler))
         .route("/debug/disable", get(disable_debug_handler))
@@ -216,7 +254,10 @@ async fn read_handler(
 ) -> Result<Json<ReadSuccessResponse>, (StatusCode, Json<ReadErrorResponse>)> {
     let include_photo = params.photo.unwrap_or(false);
 
-    println!("Read card request received (include_photo={})", include_photo);
+    println!(
+        "Read card request received (include_photo={})",
+        include_photo
+    );
 
     let mut reader = state.card_reader.lock().await;
 
@@ -241,6 +282,53 @@ async fn read_handler(
     }
 }
 
+/// POST /parse-mrz - Parse a TD3 passport MRZ string.
+///
+/// Body: `{ "mrz": "<line1>\n<line2>", "image": "<base64?>" }`. The MRZ must be
+/// supplied by the caller (no OCR happens here). Returns the extracted fields
+/// plus a `checksumValid` flag; the optional image is echoed back untouched.
+/// A malformed MRZ (wrong line count / length) returns 400 with the standard
+/// error shape.
+async fn parse_mrz_handler(
+    Json(payload): Json<ParseMrzRequest>,
+) -> Result<Json<ParseMrzResponse>, (StatusCode, Json<ReadErrorResponse>)> {
+    println!(
+        "Parse MRZ request received (image={})",
+        payload.image.is_some()
+    );
+
+    match crate::mrz::parse_td3(&payload.mrz) {
+        Ok(data) => {
+            println!(
+                "MRZ parsed (passport={}, checksumValid={})",
+                data.passport_number, data.checksum_valid
+            );
+            Ok(Json(ParseMrzResponse {
+                success: true,
+                passport_number: data.passport_number,
+                surname: data.surname,
+                given_names: data.given_names,
+                nationality: data.nationality,
+                date_of_birth: data.date_of_birth,
+                sex: data.sex,
+                expiry_date: data.expiry_date,
+                checksum_valid: data.checksum_valid,
+                image: payload.image,
+            }))
+        }
+        Err(e) => {
+            println!("Parse MRZ error: {}", e);
+            Err((
+                StatusCode::BAD_REQUEST,
+                Json(ReadErrorResponse {
+                    success: false,
+                    error: e,
+                }),
+            ))
+        }
+    }
+}
+
 /// GET /debug - Get full debug information about the card
 ///
 /// Returns comprehensive debug info including:
@@ -249,16 +337,16 @@ async fn read_handler(
 /// - Reader name
 /// - AID test results for known Thai ID card applications
 /// - Raw read result
-async fn debug_info_handler(
-    State(state): State<AppState>,
-) -> Json<FullDebugInfo> {
+async fn debug_info_handler(State(state): State<AppState>) -> Json<FullDebugInfo> {
     println!("Debug info request received");
 
     let reader = state.card_reader.lock().await;
     let debug_info = reader.get_debug_info().await;
 
-    println!("Debug info collected: ATR={:?}, Protocol={:?}",
-             debug_info.atr, debug_info.protocol);
+    println!(
+        "Debug info collected: ATR={:?}, Protocol={:?}",
+        debug_info.atr, debug_info.protocol
+    );
 
     Json(debug_info)
 }
@@ -292,6 +380,7 @@ async fn not_found_handler() -> impl IntoResponse {
                 "GET /status - Alias for /health".to_string(),
                 "GET /read - Read Thai ID card data".to_string(),
                 "GET /read?photo=true - Read card data with photo (~3 sec)".to_string(),
+                "POST /parse-mrz - Parse a TD3 passport MRZ string".to_string(),
                 "GET /debug - Get full debug info (ATR, protocol, AID tests)".to_string(),
                 "GET /debug/enable - Enable debug mode".to_string(),
                 "GET /debug/disable - Disable debug mode".to_string(),
@@ -394,6 +483,44 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"success\":false"));
         assert!(json.contains("\"error\":\"No card inserted\""));
+    }
+
+    #[test]
+    fn test_parse_mrz_response_serialization() {
+        let response = ParseMrzResponse {
+            success: true,
+            passport_number: "L898902C3".to_string(),
+            surname: "ERIKSSON".to_string(),
+            given_names: "ANNA MARIA".to_string(),
+            nationality: "UTO".to_string(),
+            date_of_birth: "1974-08-12".to_string(),
+            sex: "F".to_string(),
+            expiry_date: "2012-04-15".to_string(),
+            checksum_valid: true,
+            image: None,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"success\":true"));
+        assert!(json.contains("\"passportNumber\":\"L898902C3\""));
+        assert!(json.contains("\"givenNames\":\"ANNA MARIA\""));
+        assert!(json.contains("\"dateOfBirth\":\"1974-08-12\""));
+        assert!(json.contains("\"expiryDate\":\"2012-04-15\""));
+        assert!(json.contains("\"checksumValid\":true"));
+        // Image is omitted entirely when absent.
+        assert!(!json.contains("\"image\""));
+    }
+
+    #[test]
+    fn test_parse_mrz_request_deserialization() {
+        let req: ParseMrzRequest =
+            serde_json::from_str("{\"mrz\":\"L1\\nL2\",\"image\":\"AAAA\"}").unwrap();
+        assert_eq!(req.mrz, "L1\nL2");
+        assert_eq!(req.image, Some("AAAA".to_string()));
+
+        // image is optional.
+        let req2: ParseMrzRequest = serde_json::from_str("{\"mrz\":\"x\"}").unwrap();
+        assert_eq!(req2.image, None);
     }
 
     #[test]

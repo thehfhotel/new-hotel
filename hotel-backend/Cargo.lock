@@ -857,6 +857,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-extra",
+ "base64",
  "bb8",
  "bb8-tiberius",
  "chrono",

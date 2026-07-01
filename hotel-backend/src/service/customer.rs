@@ -40,9 +40,35 @@ pub struct CreateCustomerCommand {
     pub address: Option<String>,
     pub customer_type: Option<String>,
     pub notes: Option<String>,
+    /// Check-in registration extras (Thai ID chip / passport MRZ) — drive the
+    /// non-destructive [`CustomerRepository::enrich`] COALESCE UPDATE. All
+    /// optional; `None` leaves the column untouched.
+    pub enrichment: CustomerEnrichmentInput,
     /// Where this command originated. Routes populate from auth context;
     /// background jobs use `EventSource::System { reason: ... }`.
     pub source: EventSource,
+}
+
+/// Owned enrichment inputs shared by create + update commands. Borrowed as
+/// `Option<&str>` into a [`CustomerWrite`] at the repository boundary. Fields
+/// map 1:1 to the `CustomerWrite` enrichment columns (see its docs).
+#[derive(Debug, Clone, Default)]
+pub struct CustomerEnrichmentInput {
+    pub title: Option<String>,
+    pub english_name: Option<String>,
+    pub passport: Option<String>,
+    pub nationality: Option<String>,
+    pub sex: Option<String>,
+    /// ISO `YYYY-MM-DD` (canonical-only `cust_dob`; not mirrored to legacy).
+    pub dob: Option<String>,
+    pub add_no: Option<String>,
+    pub add_moo: Option<String>,
+    pub add_soi: Option<String>,
+    pub add_road: Option<String>,
+    pub add_tambon: Option<String>,
+    pub add_ampore: Option<String>,
+    pub add_province: Option<String>,
+    pub add_code: Option<String>,
 }
 
 /// Inbound command for [`CustomerService::update`].
@@ -57,6 +83,11 @@ pub struct UpdateCustomerCommand {
     pub address: Option<String>,
     pub customer_type: Option<String>,
     pub notes: Option<String>,
+    /// Check-in registration extras (Thai ID chip / passport MRZ) — drive the
+    /// non-destructive [`CustomerRepository::enrich`] COALESCE UPDATE, run in
+    /// the same transaction BEFORE `load_customer_resave` so the enriched
+    /// values flow into the legacy `UpdateCustomer` re-save.
+    pub enrichment: CustomerEnrichmentInput,
     /// Auth-residual (task #56) editing operator → `cust_updated_by`. The
     /// route resolves this from the authenticated `Extension<User>` (preferred)
     /// or the body `updatedBy` fallback. `None` (auth dark, no body) ⇒ the
@@ -206,7 +237,8 @@ async fn load_customer_resave(
         // green on `cust_firstname` vs `Cust_name`) before flipping the
         // writeback flag.
         cust_name: firstname_to_legacy_cust_name(
-            &row.try_get::<String, _>("cust_firstname").unwrap_or_default(),
+            &row.try_get::<String, _>("cust_firstname")
+                .unwrap_or_default(),
         ),
         cust_name2: text("cust_name2"),
         cust_type: text("cust_price_tier"),
@@ -249,7 +281,12 @@ impl CustomerService {
         events: Arc<EventBus>,
         pg: PgPool,
     ) -> Self {
-        Self { repo, outbox, events, pg }
+        Self {
+            repo,
+            outbox,
+            events,
+            pg,
+        }
     }
 
     /// Create a new customer — single transaction, atomic with event publish.
@@ -265,22 +302,29 @@ impl CustomerService {
 
         let mut tx = self.pg.begin().await?;
 
-        let customer_id = self
-            .repo
-            .insert(
-                &mut tx,
-                CustomerWrite {
-                    first_name: &cmd.first_name,
-                    last_name: cmd.last_name.as_deref(),
-                    phone: cmd.phone.as_deref(),
-                    email: cmd.email.as_deref(),
-                    id_card: cmd.id_card.as_deref(),
-                    address: cmd.address.as_deref(),
-                    customer_type: cmd.customer_type.as_deref(),
-                    notes: cmd.notes.as_deref(),
-                },
-            )
-            .await?;
+        let write = build_customer_write(
+            &cmd.first_name,
+            cmd.last_name.as_deref(),
+            cmd.phone.as_deref(),
+            cmd.email.as_deref(),
+            cmd.id_card.as_deref(),
+            cmd.address.as_deref(),
+            cmd.customer_type.as_deref(),
+            cmd.notes.as_deref(),
+            &cmd.enrichment,
+        );
+        let customer_id = self.repo.insert(&mut tx, write.clone()).await?;
+
+        // Non-destructive enrichment of the registration extras (passport,
+        // nationality, sex, dob, name2, title, address tuple) in the SAME tx.
+        // No-op when the create carried no enrichment fields.
+        //
+        // Create does NOT enqueue a standalone customer re-save today (per the
+        // method doc — the first booking / check-in writeback INSERTs the legacy
+        // `HT_Customers` row from the then-current canonical values, which now
+        // include these enriched columns). So the enriched fields reach legacy
+        // via that first check-in/booking writeback, NOT a new legacy write.
+        self.repo.enrich(&mut tx, customer_id, &write).await?;
 
         let aggregate_id = aggregate_uuid(AggregateKind::Customer, customer_id);
         let snapshot = build_customer_snapshot(aggregate_id, &cmd);
@@ -296,7 +340,10 @@ impl CustomerService {
 
         tx.commit().await?;
 
-        Ok(CustomerOutcome { customer_id, aggregate_id })
+        Ok(CustomerOutcome {
+            customer_id,
+            aggregate_id,
+        })
     }
 
     /// Update an existing customer — atomic with the
@@ -317,22 +364,20 @@ impl CustomerService {
 
         let mut tx = self.pg.begin().await?;
 
+        let write = build_customer_write(
+            &cmd.first_name,
+            cmd.last_name.as_deref(),
+            cmd.phone.as_deref(),
+            cmd.email.as_deref(),
+            cmd.id_card.as_deref(),
+            cmd.address.as_deref(),
+            cmd.customer_type.as_deref(),
+            cmd.notes.as_deref(),
+            &cmd.enrichment,
+        );
         let rows_affected = self
             .repo
-            .update(
-                &mut tx,
-                cmd.customer_id,
-                CustomerWrite {
-                    first_name: &cmd.first_name,
-                    last_name: cmd.last_name.as_deref(),
-                    phone: cmd.phone.as_deref(),
-                    email: cmd.email.as_deref(),
-                    id_card: cmd.id_card.as_deref(),
-                    address: cmd.address.as_deref(),
-                    customer_type: cmd.customer_type.as_deref(),
-                    notes: cmd.notes.as_deref(),
-                },
-            )
+            .update(&mut tx, cmd.customer_id, write.clone())
             .await?;
 
         if rows_affected == 0 {
@@ -341,6 +386,14 @@ impl CustomerService {
                 cmd.customer_id
             )));
         }
+
+        // Non-destructive enrichment of the registration extras, in the SAME tx
+        // and BEFORE `load_customer_resave` below — so the enriched columns
+        // (cust_sex / cust_name2 / cust_title / cust_add_* / cust_contry via
+        // nationality) are already committed when the re-save reads them, and
+        // thus flow into the legacy `UpdateCustomer` mirror. No-op when the edit
+        // carried no enrichment fields.
+        self.repo.enrich(&mut tx, cmd.customer_id, &write).await?;
 
         // Auth residual (task #56): stamp the editing operator into
         // `cust_updated_by`. Additive + conditional — only runs when an actor
@@ -427,10 +480,55 @@ fn validate_first_name(first_name: &str) -> ServiceResult<()> {
     }
 }
 
+/// Borrow a [`CustomerWrite`] from the base fields + an owned
+/// [`CustomerEnrichmentInput`]. Shared by `create` + `update` so both build the
+/// same shape (base eight columns drive the byte-identical `query!`; the
+/// enrichment fields drive `CustomerRepository::enrich`).
+#[allow(clippy::too_many_arguments)]
+fn build_customer_write<'a>(
+    first_name: &'a str,
+    last_name: Option<&'a str>,
+    phone: Option<&'a str>,
+    email: Option<&'a str>,
+    id_card: Option<&'a str>,
+    address: Option<&'a str>,
+    customer_type: Option<&'a str>,
+    notes: Option<&'a str>,
+    e: &'a CustomerEnrichmentInput,
+) -> CustomerWrite<'a> {
+    CustomerWrite {
+        first_name,
+        last_name,
+        phone,
+        email,
+        id_card,
+        address,
+        customer_type,
+        notes,
+        title: e.title.as_deref(),
+        english_name: e.english_name.as_deref(),
+        passport: e.passport.as_deref(),
+        nationality: e.nationality.as_deref(),
+        sex: e.sex.as_deref(),
+        dob: e.dob.as_deref(),
+        add_no: e.add_no.as_deref(),
+        add_moo: e.add_moo.as_deref(),
+        add_soi: e.add_soi.as_deref(),
+        add_road: e.add_road.as_deref(),
+        add_tambon: e.add_tambon.as_deref(),
+        add_ampore: e.add_ampore.as_deref(),
+        add_province: e.add_province.as_deref(),
+        add_code: e.add_code.as_deref(),
+    }
+}
+
 /// Build a [`CustomerSnapshot`] from a create command + the freshly-minted
 /// aggregate id. The snapshot intentionally carries only event-bus essentials
 /// (per architecture.md §10 — keep payloads small).
-fn build_customer_snapshot(aggregate_id: uuid::Uuid, cmd: &CreateCustomerCommand) -> CustomerSnapshot {
+fn build_customer_snapshot(
+    aggregate_id: uuid::Uuid,
+    cmd: &CreateCustomerCommand,
+) -> CustomerSnapshot {
     let full_name = match cmd.last_name.as_deref() {
         Some(last) if !last.is_empty() => format!("{} {}", cmd.first_name, last),
         _ => cmd.first_name.clone(),
@@ -485,10 +583,7 @@ mod tests {
         // A value that LOOKS like "first last" must NOT be split — the whole
         // string is the legacy Cust_name (this is exactly the corruption the
         // invariant guards against).
-        assert_eq!(
-            firstname_to_legacy_cust_name("สมชาย ใจดี"),
-            "สมชาย ใจดี"
-        );
+        assert_eq!(firstname_to_legacy_cust_name("สมชาย ใจดี"), "สมชาย ใจดี");
         // No trimming of surrounding whitespace — verbatim means verbatim.
         assert_eq!(firstname_to_legacy_cust_name("  pad  "), "  pad  ");
         // Empty stays empty (NULL-firstname fallback in load_customer_resave).
@@ -522,8 +617,11 @@ mod tests {
             address: Some("88/8".into()),
             customer_type: Some("บุคคลธรรมดา".into()),
             notes: None,
+            enrichment: CustomerEnrichmentInput::default(),
             updated_by: None,
-            source: EventSource::System { reason: "test".into() },
+            source: EventSource::System {
+                reason: "test".into(),
+            },
         }
     }
 
@@ -544,10 +642,12 @@ mod tests {
                 }
             }
         }
-        let _ = sqlx::query("DELETE FROM ht_customers WHERE legacy_cust_no = $1 OR cust_firstname LIKE 'TEST_UC_%'")
-            .bind(legacy_cust_no)
-            .execute(pool)
-            .await;
+        let _ = sqlx::query(
+            "DELETE FROM ht_customers WHERE legacy_cust_no = $1 OR cust_firstname LIKE 'TEST_UC_%'",
+        )
+        .bind(legacy_cust_no)
+        .execute(pool)
+        .await;
     }
 
     /// An edit of a legacy-mirrored customer must enqueue exactly one
@@ -603,7 +703,10 @@ mod tests {
         // (b) NO lastname join — `Cust_name` hashes against
         // `cust_firstname` in the reconcile sweep.
         assert!(
-            !resave["cust_name"].as_str().unwrap().contains("CanonicalOnlyLastName"),
+            !resave["cust_name"]
+                .as_str()
+                .unwrap()
+                .contains("CanonicalOnlyLastName"),
             "cust_name must be cust_firstname verbatim, got {:?}",
             resave["cust_name"]
         );
@@ -658,7 +761,10 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(count, 0, "never-mirrored customer must not enqueue a writeback");
+        assert_eq!(
+            count, 0,
+            "never-mirrored customer must not enqueue a writeback"
+        );
 
         let _ = sqlx::query("DELETE FROM ht_customers WHERE cust_id = $1")
             .bind(cust_id)
@@ -752,7 +858,9 @@ mod tests {
         // Auth on: the resolved actor lands in cust_updated_by.
         let mut cmd = update_cmd(cust_id, "TEST_UCBY_AUTH", "0900000001");
         cmd.updated_by = Some("alice".into());
-        svc.update(cmd).await.expect("update with actor must succeed");
+        svc.update(cmd)
+            .await
+            .expect("update with actor must succeed");
         let by: Option<String> =
             sqlx::query_scalar("SELECT cust_updated_by FROM ht_customers WHERE cust_id = $1")
                 .bind(cust_id)

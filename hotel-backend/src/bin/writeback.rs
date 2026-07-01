@@ -151,7 +151,9 @@ const QUEUE_DEPTH_ALERT_COOLDOWN_SECS: u64 = 1800;
 /// Caps at the last entry. Default schedule: 30s, 2min, 10min.
 fn backoff_secs(attempts_so_far: i32) -> i64 {
     const BACKOFFS: &[i64] = &[30, 120, 600];
-    let idx = (attempts_so_far as usize).saturating_sub(1).min(BACKOFFS.len() - 1);
+    let idx = (attempts_so_far as usize)
+        .saturating_sub(1)
+        .min(BACKOFFS.len() - 1);
     BACKOFFS[idx]
 }
 
@@ -177,10 +179,7 @@ fn init_site_id(id: &str) {
 
 /// Read the process-wide SITE_ID; defaults to `"hfhotel"` if uninit.
 fn current_site_id() -> &'static str {
-    SITE_ID
-        .get()
-        .map(String::as_str)
-        .unwrap_or("hfhotel")
+    SITE_ID.get().map(String::as_str).unwrap_or("hfhotel")
 }
 
 #[tokio::main]
@@ -486,8 +485,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let mssql_inner = mssql.clone();
                     let slack_inner = slack.clone();
                     let result = tokio::spawn(async move {
-                        process_job(&pg_inner, &mssql_inner, max_attempts, &slack_inner, job)
-                            .await;
+                        process_job(&pg_inner, &mssql_inner, max_attempts, &slack_inner, job).await;
                     })
                     .await;
                     if let Err(join_err) = result {
@@ -606,10 +604,7 @@ struct ClaimedJob {
 /// `exhausted` rows are never re-claimed — they require operator triage and
 /// a manual status reset. The Slack alert sent at the moment of exhaustion
 /// is the operator's notification path.
-async fn claim_next_job(
-    pg: &PgPool,
-    max_attempts: i32,
-) -> Result<Option<ClaimedJob>, sqlx::Error> {
+async fn claim_next_job(pg: &PgPool, max_attempts: i32) -> Result<Option<ClaimedJob>, sqlx::Error> {
     let row = sqlx::query(
         r#"
         UPDATE writeback_jobs
@@ -656,9 +651,7 @@ async fn claim_next_job(
     // separate `intent` column is what the dispatcher uses, but the JSON
     // includes both for round-trip safety.
     let intent: WritebackIntent = serde_json::from_value(payload).map_err(|e| {
-        sqlx::Error::Decode(
-            format!("payload deserialize for job {id} ({intent_name}): {e}").into(),
-        )
+        sqlx::Error::Decode(format!("payload deserialize for job {id} ({intent_name}): {e}").into())
     })?;
 
     Ok(Some(ClaimedJob {
@@ -882,8 +875,7 @@ async fn run_in_transaction(
             // connection was the exact symptom of the 2026-05-14
             // incident. We log + drop the conn; the timeout makes that
             // path reach the drop instead of hanging forever.
-            match simple_query_with_timeout_drop(conn, "ROLLBACK TRAN", MssqlOpKind::Write).await
-            {
+            match simple_query_with_timeout_drop(conn, "ROLLBACK TRAN", MssqlOpKind::Write).await {
                 Ok(()) => {}
                 Err(rb_err) => tracing::warn!(
                     rollback_error = %rb_err,
@@ -928,12 +920,11 @@ async fn resolve_legacy_ids(
     //      back-population failures without operator intervention.
     match &job.intent {
         ModifyBooking { booking_id, .. } | CancelBooking { booking_id } => {
-            if let Some(row) = sqlx::query(
-                "SELECT legacy_book_id FROM ht_bookings WHERE aggregate_id = $1",
-            )
-            .bind(booking_id)
-            .fetch_optional(pg)
-            .await?
+            if let Some(row) =
+                sqlx::query("SELECT legacy_book_id FROM ht_bookings WHERE aggregate_id = $1")
+                    .bind(booking_id)
+                    .fetch_optional(pg)
+                    .await?
             {
                 resolved.legacy_book_id = row.try_get("legacy_book_id").ok();
             }
@@ -986,7 +977,10 @@ async fn resolve_legacy_ids(
             // `ok_or_else` then EXHAUSTS the job (Recipe error is non-retryable
             // → dead-letter + Slack "manual intervention"), the correct
             // fail-loud, and never falls back to mis-writing the header's room.
-            if let CheckOut { cr_id: Some(cr_id), .. } = &job.intent {
+            if let CheckOut {
+                cr_id: Some(cr_id), ..
+            } = &job.intent
+            {
                 resolved.legacy_room_no = None;
                 resolved.legacy_checkin_ds_id = None;
                 if let Some(row) = sqlx::query(
@@ -1038,12 +1032,11 @@ async fn resolve_legacy_ids(
                 resolved.legacy_cust_no = resolved.legacy_cust_no.or(salvaged.cust_no);
             }
             if let Some(orig_aggregate) = original_payment_aggregate_id {
-                if let Some(row) = sqlx::query(
-                    "SELECT legacy_pay_no FROM ht_payments WHERE aggregate_id = $1",
-                )
-                .bind(orig_aggregate)
-                .fetch_optional(pg)
-                .await?
+                if let Some(row) =
+                    sqlx::query("SELECT legacy_pay_no FROM ht_payments WHERE aggregate_id = $1")
+                        .bind(orig_aggregate)
+                        .fetch_optional(pg)
+                        .await?
                 {
                     resolved.legacy_original_pay_no = row.try_get("legacy_pay_no").ok();
                 }
@@ -1084,9 +1077,7 @@ async fn resolve_legacy_ids(
                     reason: row.try_get("reason").unwrap_or_default(),
                     changed_at: row.try_get("rc_changed_at").unwrap_or_else(|_| Utc::now()),
                     changed_by: row.try_get("changed_by").unwrap_or_default(),
-                    room_before_price_baht: row
-                        .try_get("room_before_price_baht")
-                        .unwrap_or(0.0),
+                    room_before_price_baht: row.try_get("room_before_price_baht").unwrap_or(0.0),
                     to_price: row.try_get("to_price").unwrap_or_default(),
                 });
             }
@@ -1258,7 +1249,9 @@ async fn resolve_legacy_ids(
             {
                 resolved.pos_void = Some(ResolvedPosVoid {
                     sale_id: row.try_get("sale_id").unwrap_or(*sale_id),
-                    legacy_id: row.try_get::<Option<i32>, _>("sale_legacy_id").unwrap_or(None),
+                    legacy_id: row
+                        .try_get::<Option<i32>, _>("sale_legacy_id")
+                        .unwrap_or(None),
                     prod_legacy_no: row.try_get("prod_legacy_no").unwrap_or_default(),
                 });
             }
@@ -1277,12 +1270,11 @@ async fn resolve_legacy_ids(
                 payload.linked_booking_id,
                 payload.linked_legacy_book_id.as_deref(),
             ) {
-                if let Some(row) = sqlx::query(
-                    "SELECT legacy_book_id FROM ht_bookings WHERE aggregate_id = $1",
-                )
-                .bind(linked_booking_id)
-                .fetch_optional(pg)
-                .await?
+                if let Some(row) =
+                    sqlx::query("SELECT legacy_book_id FROM ht_bookings WHERE aggregate_id = $1")
+                        .bind(linked_booking_id)
+                        .fetch_optional(pg)
+                        .await?
                 {
                     resolved.legacy_book_id = row.try_get("legacy_book_id").ok();
                 }
@@ -1323,12 +1315,8 @@ async fn resolve_legacy_ids(
                 resolved.coupon = Some(ResolvedCoupon {
                     coupon_id: row.try_get("coupon_id").unwrap_or(*coupon_id),
                     legacy_cupon_no: row.try_get("legacy_cupon_no").ok(),
-                    coupon_for_cin_no: row
-                        .try_get("coupon_for_cin_no")
-                        .unwrap_or_default(),
-                    coupon_for_room_no: row
-                        .try_get("coupon_for_room_no")
-                        .unwrap_or_default(),
+                    coupon_for_cin_no: row.try_get("coupon_for_cin_no").unwrap_or_default(),
+                    coupon_for_room_no: row.try_get("coupon_for_room_no").unwrap_or_default(),
                     issued_at: row
                         .try_get("coupon_issued_at")
                         .unwrap_or_else(|_| Utc::now()),
@@ -1361,13 +1349,14 @@ async fn resolve_legacy_ids(
         // resolved here by the note's aggregate id. NULL ⇒ the dispatcher
         // defers (CreateNote back-population still pending).
         CreateNote { .. } => {}
-        MarkNoteRead { note_aggregate_id, .. } => {
-            if let Some(row) = sqlx::query(
-                "SELECT note_legacy_id FROM ht_notes WHERE aggregate_id = $1",
-            )
-            .bind(note_aggregate_id)
-            .fetch_optional(pg)
-            .await?
+        MarkNoteRead {
+            note_aggregate_id, ..
+        } => {
+            if let Some(row) =
+                sqlx::query("SELECT note_legacy_id FROM ht_notes WHERE aggregate_id = $1")
+                    .bind(note_aggregate_id)
+                    .fetch_optional(pg)
+                    .await?
             {
                 resolved.note_legacy_id = row.try_get("note_legacy_id").ok();
             }
@@ -1376,6 +1365,25 @@ async fn resolve_legacy_ids(
         // (composite key + prices) in its payload; nothing to resolve from PG.
         // Mirrors the `UpdateRoom` / `AdjustProductStock` resolution shape.
         UpsertRatePrice { .. } => {}
+        // Phase 2 — MirrorGuestImage needs the raw `doc_image` bytea, loaded
+        // from `ht_guest_documents` by `doc_id` so the recipe stays PG-pure and
+        // binds it as a varbinary param. Dynamic sqlx (bytea via
+        // `try_get::<Vec<u8>>`) — no `query!` macro / no `.sqlx` cache. NULL /
+        // missing ⇒ the dispatcher errors and the job retries.
+        MirrorGuestImage { doc_id, .. } => {
+            if let Some(row) =
+                sqlx::query("SELECT doc_image FROM ht_guest_documents WHERE doc_id = $1")
+                    .bind(doc_id)
+                    .fetch_optional(pg)
+                    .await?
+            {
+                resolved.guest_document_image = row.try_get::<Vec<u8>, _>("doc_image").ok();
+            }
+        }
+        // Phase 4 — MirrorCompanion carries the legacy `Cin_no` + name + country
+        // in its payload (resolved by the route before enqueue); nothing to
+        // resolve from PG. Mirrors the `UpdateCustomer` payload-carries-key shape.
+        MirrorCompanion { .. } => {}
     }
     Ok(resolved)
 }
@@ -1643,10 +1651,22 @@ async fn salvage_legacy_ids(
     if let Some(row) = row {
         let legacy: Option<serde_json::Value> = row.try_get("legacy_ids").ok();
         if let Some(json) = legacy {
-            out.book_id = json.get("book_id").and_then(|v| v.as_str()).map(String::from);
-            out.cust_no = json.get("cust_no").and_then(|v| v.as_str()).map(String::from);
-            out.cin_no = json.get("cin_no").and_then(|v| v.as_str()).map(String::from);
-            out.room_no = json.get("room_no").and_then(|v| v.as_str()).map(String::from);
+            out.book_id = json
+                .get("book_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            out.cust_no = json
+                .get("cust_no")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            out.cin_no = json
+                .get("cin_no")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            out.room_no = json
+                .get("room_no")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             out.checkin_ds_id = json
                 .get("checkin_ds_id")
                 .and_then(|v| v.as_i64())
@@ -1846,7 +1866,10 @@ async fn back_populate_legacy_ids(
     let room_no = legacy_ids.get("room_no").and_then(|v| v.as_str());
     let pay_no = legacy_ids.get("pay_no").and_then(|v| v.as_str());
     let receipt_no = legacy_ids.get("receipt_no").and_then(|v| v.as_str());
-    let checkin_ds_id = legacy_ids.get("checkin_ds_id").and_then(|v| v.as_i64()).map(|n| n as i32);
+    let checkin_ds_id = legacy_ids
+        .get("checkin_ds_id")
+        .and_then(|v| v.as_i64())
+        .map(|n| n as i32);
 
     use WritebackIntent::*;
     match intent {
@@ -1867,7 +1890,8 @@ async fn back_populate_legacy_ids(
             }
         }
         CreateCheckIn { .. } | CancelCheckIn { .. } | ExtendStay { .. } | CheckOut { .. } => {
-            if cin_no.is_some() || room_no.is_some() || cust_no.is_some() || checkin_ds_id.is_some() {
+            if cin_no.is_some() || room_no.is_some() || cust_no.is_some() || checkin_ds_id.is_some()
+            {
                 sqlx::query(
                     "UPDATE ht_checkins SET \
                        legacy_cin_no        = COALESCE($2, legacy_cin_no), \
@@ -1898,8 +1922,9 @@ async fn back_populate_legacy_ids(
             // part of an edit) is a no-op. Single-room folios surface
             // an empty array so the WHERE-NOT-NULL guard skips the
             // UPDATE entirely.
-            if let Some(pairs) =
-                legacy_ids.get("checkin_ds_ids_by_room").and_then(|v| v.as_array())
+            if let Some(pairs) = legacy_ids
+                .get("checkin_ds_ids_by_room")
+                .and_then(|v| v.as_array())
             {
                 for pair in pairs {
                     let arr = match pair.as_array() {
@@ -1937,7 +1962,10 @@ async fn back_populate_legacy_ids(
         // matters here. The aggregate_id passed in by the caller is the
         // check-in's; the new refund row's aggregate id lives in the
         // intent's `payment_aggregate_id`.
-        RefundPayment { payment_aggregate_id, .. } => {
+        RefundPayment {
+            payment_aggregate_id,
+            ..
+        } => {
             if cin_no.is_some() || room_no.is_some() || cust_no.is_some() {
                 sqlx::query(
                     "UPDATE ht_checkins SET \
@@ -1954,9 +1982,7 @@ async fn back_populate_legacy_ids(
                 .execute(pg)
                 .await?;
             }
-            if let (Some(refund_aggregate), true) =
-                (payment_aggregate_id, pay_no.is_some())
-            {
+            if let (Some(refund_aggregate), true) = (payment_aggregate_id, pay_no.is_some()) {
                 sqlx::query(
                     "UPDATE ht_payments SET legacy_pay_no = COALESCE($2, legacy_pay_no) \
                      WHERE aggregate_id = $1",
@@ -1967,14 +1993,18 @@ async fn back_populate_legacy_ids(
                 .await?;
             }
         }
-        RecordPayment { payment_aggregate_id, .. } => {
+        RecordPayment {
+            payment_aggregate_id,
+            ..
+        } => {
             // Payment back-population is split-target: ht_checkins keeps the
             // check-in identifiers (the aggregate_id passed in is the
             // check-in's), and ht_payments gets the freshly-allocated
             // legacy_pay_no / legacy_receipt_no keyed off the payment's own
             // aggregate_id (Wave 5a item 3). Both UPDATEs are independent —
             // either can land without the other.
-            if cin_no.is_some() || room_no.is_some() || cust_no.is_some() || checkin_ds_id.is_some() {
+            if cin_no.is_some() || room_no.is_some() || cust_no.is_some() || checkin_ds_id.is_some()
+            {
                 sqlx::query(
                     "UPDATE ht_checkins SET \
                        legacy_cin_no        = COALESCE($2, legacy_cin_no), \
@@ -1992,9 +2022,10 @@ async fn back_populate_legacy_ids(
                 .execute(pg)
                 .await?;
             }
-            if let (Some(pay_aggregate), true) =
-                (payment_aggregate_id, pay_no.is_some() || receipt_no.is_some())
-            {
+            if let (Some(pay_aggregate), true) = (
+                payment_aggregate_id,
+                pay_no.is_some() || receipt_no.is_some(),
+            ) {
                 sqlx::query(
                     "UPDATE ht_payments SET \
                        legacy_pay_no     = COALESCE($2, legacy_pay_no), \
@@ -2081,7 +2112,10 @@ async fn back_populate_legacy_ids(
         // new legacy IDs (it just flips `cupon_print`); the legacy
         // back-pointer is already set from the prior IssueCoupon.
         IssueCoupon { .. } | RedeemCoupon { .. } => {
-            let cupon_no = legacy_ids.get("cupon_no").and_then(|v| v.as_i64()).map(|n| n as i32);
+            let cupon_no = legacy_ids
+                .get("cupon_no")
+                .and_then(|v| v.as_i64())
+                .map(|n| n as i32);
             if let Some(cupon_no) = cupon_no {
                 sqlx::query(
                     "UPDATE ht_coupons SET \
@@ -2186,7 +2220,10 @@ async fn back_populate_legacy_ids(
         // `OUTPUT INSERTED.SMS_ID`) onto `ht_notes.note_legacy_id`, keyed by the
         // note's aggregate id. MarkNoteRead flips a flag and allocates nothing.
         CreateNote { .. } => {
-            let sms_id = legacy_ids.get("sms_id").and_then(|v| v.as_i64()).map(|n| n as i32);
+            let sms_id = legacy_ids
+                .get("sms_id")
+                .and_then(|v| v.as_i64())
+                .map(|n| n as i32);
             if let Some(sms_id) = sms_id {
                 sqlx::query(
                     "UPDATE ht_notes SET \
@@ -2207,6 +2244,16 @@ async fn back_populate_legacy_ids(
         // the 15-minute mirror poll, not by this writeback). Nothing to
         // back-populate here.
         UpsertRatePrice { .. } => {}
+        // Phase 2 — MirrorGuestImage writes a PROVISIONAL `Tb_Save_Image` row
+        // (IDENTITY id, not captured for the provisional shape); the check-in
+        // writeback later stamps `cin_no`/`cust_no` by `tmp_no`. Nothing to
+        // back-populate onto the canonical row today (doc_legacy_id capture is a
+        // documented follow-up).
+        MirrorGuestImage { .. } => {}
+        // Phase 4 — MirrorCompanion INSERTs a `HT_CheckIn_Other_People` row
+        // (IDENTITY id) and carries no canonical back-pointer column. Nothing to
+        // back-populate.
+        MirrorCompanion { .. } => {}
     }
     Ok(())
 }
@@ -2252,8 +2299,7 @@ async fn force_exhaust_job(
                 "Writeback job force-exhausted"
             );
             if let Some(slack) = slack {
-                send_exhausted_alert(slack, job_id, &intent, aggregate_id, attempts, err_msg)
-                    .await;
+                send_exhausted_alert(slack, job_id, &intent, aggregate_id, attempts, err_msg).await;
             }
         }
         Err(err) => {
@@ -2292,7 +2338,16 @@ async fn mark_failed_with_retryable(
         force_exhaust_job(pg, job_id, attempts, slack, err_msg).await;
         return;
     }
-    mark_failed(pg, job_id, attempts, claimed_at, max_attempts, slack, err_msg).await;
+    mark_failed(
+        pg,
+        job_id,
+        attempts,
+        claimed_at,
+        max_attempts,
+        slack,
+        err_msg,
+    )
+    .await;
 }
 
 /// See [`mark_failed_with_retryable`]. Convenience wrapper for callsites
@@ -2520,11 +2575,7 @@ async fn run_listener(pg: PgPool, wakeup: Arc<Notify>) -> Result<(), sqlx::Error
 /// operator under time pressure during the live test won't realize sync
 /// silently degraded. Persistent reconnect + Slack alert preserves both
 /// liveness AND visibility.
-async fn run_listener_supervised(
-    pg: PgPool,
-    wakeup: Arc<Notify>,
-    slack: Option<SlackClient>,
-) {
+async fn run_listener_supervised(pg: PgPool, wakeup: Arc<Notify>, slack: Option<SlackClient>) {
     let mut consecutive_failures: u32 = 0;
     loop {
         let pg_inner = pg.clone();
@@ -2696,7 +2747,9 @@ async fn run_queue_depth_janitor(
                     }
                     last_pruned = Some(Instant::now());
                 }
-                Err(e) => tracing::warn!(error = %e, "[janitor] ledger prune: no MSSQL conn this tick"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "[janitor] ledger prune: no MSSQL conn this tick")
+                }
             }
         }
 
@@ -2837,7 +2890,10 @@ mod tests {
     #[test]
     fn backoff_for_zero_attempts_does_not_panic() {
         let n = backoff_secs(0);
-        assert!(n > 0, "backoff_secs(0) should be safe and non-zero, got {n}");
+        assert!(
+            n > 0,
+            "backoff_secs(0) should be safe and non-zero, got {n}"
+        );
     }
 
     /// Anything past the schedule (would only happen if max_attempts is
@@ -2855,8 +2911,14 @@ mod tests {
     /// jobs sit for hours, OR letting a slow recipe get re-claimed mid-run.
     #[test]
     fn stuck_in_progress_timeout_is_in_safe_range() {
-        assert!(STUCK_IN_PROGRESS_TIMEOUT_SECS >= 60, "less than 1 min risks racing slow recipes");
-        assert!(STUCK_IN_PROGRESS_TIMEOUT_SECS <= 1800, "more than 30 min is too slow to recover");
+        assert!(
+            STUCK_IN_PROGRESS_TIMEOUT_SECS >= 60,
+            "less than 1 min risks racing slow recipes"
+        );
+        assert!(
+            STUCK_IN_PROGRESS_TIMEOUT_SECS <= 1800,
+            "more than 30 min is too slow to recover"
+        );
     }
 
     /// Track D regression (2026-05-13 production verification):
@@ -3034,7 +3096,10 @@ mod tests {
     #[test]
     fn listener_supervisor_constants_are_in_safe_range() {
         assert!(LISTENER_BACKOFF_SECS >= 1, "<1s would spin CPU");
-        assert!(LISTENER_BACKOFF_SECS <= 30, ">30s defeats the point of NOTIFY");
+        assert!(
+            LISTENER_BACKOFF_SECS <= 30,
+            ">30s defeats the point of NOTIFY"
+        );
         assert!(
             LISTENER_MAX_CONSECUTIVE_FAILURES >= 3,
             "<3 would page on every flap"
@@ -3076,10 +3141,9 @@ mod tests {
     /// anything about the recipe.
     #[test]
     fn claimed_job_carries_claimed_at_through_clone() {
-        let claimed_at: DateTime<Utc> =
-            DateTime::parse_from_rfc3339("2026-04-25T12:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc);
+        let claimed_at: DateTime<Utc> = DateTime::parse_from_rfc3339("2026-04-25T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
         let job = ClaimedJob {
             id: 42,
             intent: WritebackIntent::CheckOut {

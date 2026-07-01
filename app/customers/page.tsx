@@ -255,6 +255,23 @@ export default function CustomersPage() {
         address: data.address || null,
         customerType: data.customerType || null,
         notes: data.notes || null,
+        // Extended registration fields — enriched server-side with COALESCE,
+        // so `null` (a blank field or an edit that predates the scan) keeps the
+        // existing value rather than clobbering it.
+        title: data.title || null,
+        englishName: data.englishName || null,
+        passport: data.passport || null,
+        nationality: data.nationality || null,
+        sex: data.sex || null,
+        dob: data.dob || null,
+        addNo: data.addNo || null,
+        addMoo: data.addMoo || null,
+        addSoi: data.addSoi || null,
+        addRoad: data.addRoad || null,
+        addTambon: data.addTambon || null,
+        addAmpore: data.addAmpore || null,
+        addProvince: data.addProvince || null,
+        addCode: data.addCode || null,
       }),
     })
 

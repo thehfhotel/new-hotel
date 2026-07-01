@@ -2,20 +2,17 @@
 
 mod card_reader;
 mod commands;
+mod mrz;
 mod server;
 
 use std::env;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use card_reader::{CardReader, set_debug_mode};
+use card_reader::{set_debug_mode, CardReader};
 use commands::AppState;
 use server::start_http_server;
-use tauri::{
-    tray::TrayIconBuilder,
-    image::Image,
-    Manager,
-};
+use tauri::{image::Image, tray::TrayIconBuilder, Manager};
 
 fn main() {
     // Parse command-line arguments
@@ -41,7 +38,8 @@ fn main() {
         .setup(move |app| {
             // Create system tray icon
             let icon = Image::from_path("icons/32x32.png").unwrap_or_else(|_| {
-                Image::from_bytes(include_bytes!("../icons/32x32.png")).expect("Failed to load tray icon")
+                Image::from_bytes(include_bytes!("../icons/32x32.png"))
+                    .expect("Failed to load tray icon")
             });
 
             let _tray = TrayIconBuilder::new()

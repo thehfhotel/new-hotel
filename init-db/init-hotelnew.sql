@@ -86,7 +86,11 @@ CREATE TABLE IF NOT EXISTS ht_customers (
     -- Running debt balance. Mirrored read-only from legacy
     -- `Module1.UPDATE_MONEY` writes; our own writeback path stays
     -- deferred to Track G.
-    cust_price_over DOUBLE PRECISION
+    cust_price_over DOUBLE PRECISION,
+    -- Migration 069 — guest date of birth captured at check-in registration
+    -- (Thai ID chip / passport MRZ). PG-canonical-only: legacy HT_Customers
+    -- has no DOB column, so this is never mirrored to MSSQL.
+    cust_dob DATE
 );
 CREATE INDEX IF NOT EXISTS ix_ht_customers_name ON ht_customers(cust_firstname, cust_lastname);
 CREATE INDEX IF NOT EXISTS ix_ht_customers_phone ON ht_customers(cust_phone);
@@ -317,6 +321,28 @@ CREATE TABLE IF NOT EXISTS ht_guest_registry (
     CONSTRAINT uq_ht_guest_registry_legacy_id UNIQUE (guest_legacy_id)
 );
 CREATE INDEX IF NOT EXISTS ix_ht_guestreg_checkin ON ht_guest_registry(guest_cin_id);
+
+-- ht_guest_documents - Guest identity documents / photos captured at check-in
+-- registration (migration 070). Thai ID card chip image, passport page, webcam
+-- face photo. Canonical home for legacy Tb_Save_Image (1:N). doc_legacy_tmp_no is
+-- the provisional Tb_Save_Image.tmp_no minted here and echoed to the check-in
+-- POST as photoTmpNo; doc_legacy_id is back-populated after the legacy mirror
+-- runs. Legacy mirror (writeback/recipes/save_image.rs) is SHIPPED DARK behind
+-- GUEST_DOCUMENT_STORAGE_ENABLED (default off). Per-site (connection-level scoping).
+CREATE TABLE IF NOT EXISTS ht_guest_documents (
+    doc_id            SERIAL PRIMARY KEY,
+    doc_cust_id       INTEGER REFERENCES ht_customers(cust_id),
+    doc_cin_id        INTEGER REFERENCES ht_checkins(cin_id),
+    doc_type          VARCHAR(30) NOT NULL,   -- 'thai_id_card' | 'passport' | 'face_photo'
+    doc_mime          VARCHAR(50) NOT NULL DEFAULT 'image/jpeg',
+    doc_image         BYTEA NOT NULL,
+    doc_source        VARCHAR(20),            -- 'chip' | 'scanner' | 'webcam'
+    doc_legacy_tmp_no VARCHAR(50),            -- Tb_Save_Image.tmp_no linkage
+    doc_legacy_id     INTEGER,                -- Tb_Save_Image.id once mirrored
+    doc_created_at    TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ht_guest_documents_cin ON ht_guest_documents(doc_cin_id);
+CREATE INDEX IF NOT EXISTS idx_ht_guest_documents_cust ON ht_guest_documents(doc_cust_id);
 
 -- ht_checkin_rooms - Junction table (Track B1 / migration 043).
 -- Mirrors legacy HT_CheckIn_Ds cardinality: one row per room per check-in
@@ -2413,6 +2439,22 @@ ON CONFLICT (version) DO NOTHING;
 -- migration as already applied so the drift check sees zero pending migrations.
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('068', '068_ht_payments_legacy_receipt_unique.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 069 — guest date of birth (cust_dob DATE) captured at check-in
+-- registration. Inlined into the ht_customers CREATE TABLE above; this seed row
+-- records the migration as applied so the drift check sees zero pending. PG-
+-- canonical-only (legacy HT_Customers has no DOB column).
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('069', '069_ht_customers_dob.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 070 — ht_guest_documents (guest identity documents / photos captured
+-- at check-in registration). Table + indexes inlined above; this seed row records
+-- the migration as applied so the drift check sees zero pending. Legacy mirror to
+-- Tb_Save_Image is SHIPPED DARK behind GUEST_DOCUMENT_STORAGE_ENABLED (default off).
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('070', '070_ht_guest_documents.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================

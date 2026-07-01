@@ -100,9 +100,15 @@ pub struct NewCustomersQuery {
     pub branch: Option<Branch>,
 }
 
-fn default_page() -> i32 { 1 }
-fn default_limit() -> i32 { 20 }
-fn default_active_only() -> bool { true }
+fn default_page() -> i32 {
+    1
+}
+fn default_limit() -> i32 {
+    20
+}
+fn default_active_only() -> bool {
+    true
+}
 
 /// Response for customers list
 #[derive(Debug, Serialize)]
@@ -132,6 +138,71 @@ pub struct CreateUpdateCustomerRequest {
     /// ignores it (its actor is folded into the booking/check-in writeback).
     #[serde(default)]
     pub updated_by: Option<String>,
+
+    // ----- Check-in registration extras (Phase 1 — Thai ID chip / passport
+    // MRZ). All optional + serde-default so existing clients that omit them are
+    // unaffected. They drive the non-destructive `CustomerRepository::enrich`
+    // COALESCE UPDATE (canonical), and (for update) mirror to legacy via the
+    // existing `UpdateCustomer` re-save. `dob` is ISO `YYYY-MM-DD`. -----
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub english_name: Option<String>,
+    #[serde(default)]
+    pub passport: Option<String>,
+    #[serde(default)]
+    pub nationality: Option<String>,
+    #[serde(default)]
+    pub sex: Option<String>,
+    #[serde(default)]
+    pub dob: Option<String>,
+    #[serde(default)]
+    pub add_no: Option<String>,
+    #[serde(default)]
+    pub add_moo: Option<String>,
+    #[serde(default)]
+    pub add_soi: Option<String>,
+    #[serde(default)]
+    pub add_road: Option<String>,
+    #[serde(default)]
+    pub add_tambon: Option<String>,
+    #[serde(default)]
+    pub add_ampore: Option<String>,
+    #[serde(default)]
+    pub add_province: Option<String>,
+    #[serde(default)]
+    pub add_code: Option<String>,
+}
+
+impl CreateUpdateCustomerRequest {
+    /// Collect the optional registration-extra fields into a
+    /// [`CustomerEnrichmentInput`]. Blank / whitespace-only strings are
+    /// dropped to `None` so an empty form field never COALESCE-overwrites an
+    /// existing canonical value with `''`.
+    fn enrichment(&self) -> crate::service::CustomerEnrichmentInput {
+        fn clean(v: &Option<String>) -> Option<String> {
+            v.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        }
+        crate::service::CustomerEnrichmentInput {
+            title: clean(&self.title),
+            english_name: clean(&self.english_name),
+            passport: clean(&self.passport),
+            nationality: clean(&self.nationality),
+            sex: clean(&self.sex),
+            dob: clean(&self.dob),
+            add_no: clean(&self.add_no),
+            add_moo: clean(&self.add_moo),
+            add_soi: clean(&self.add_soi),
+            add_road: clean(&self.add_road),
+            add_tambon: clean(&self.add_tambon),
+            add_ampore: clean(&self.add_ampore),
+            add_province: clean(&self.add_province),
+            add_code: clean(&self.add_code),
+        }
+    }
 }
 
 /// Response for create/update/delete operations
@@ -184,10 +255,7 @@ pub async fn list_customers(
     // customer search/typeahead returns the selected site's guests. (Replaces a
     // stale hard-return-empty short-circuit — `hotelville` is a real pool now.)
     let pool = customer_pool_for(&state, params.branch)?;
-    let (rows, total) = state
-        .customers
-        .list_with_count(&pool, &params)
-        .await?;
+    let (rows, total) = state.customers.list_with_count(&pool, &params).await?;
 
     let customers: Vec<NewCustomer> = rows.into_iter().map(NewCustomer::from_row).collect();
 
@@ -209,6 +277,8 @@ pub async fn create_customer(
     // Ville customer's canonical INSERT (and any future standalone writeback)
     // lands in hotelville — mirrors update_customer/delete_customer.
     let pool = customer_pool_for(&state, query.branch)?;
+    // Collect registration extras before moving the base fields into the command.
+    let enrichment = body.enrichment();
     let outcome = customer_service_for(&state, pool)
         .create(CreateCustomerCommand {
             first_name: body.first_name,
@@ -219,6 +289,7 @@ pub async fn create_customer(
             address: body.address,
             customer_type: body.customer_type,
             notes: body.notes,
+            enrichment,
             // TODO: wire user_id from auth middleware
             source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
         })
@@ -279,6 +350,8 @@ pub async fn update_customer(
         .ok_or_else(|| ApiError::NotFound("Customer not found".to_string()))?;
 
     let updated_by = super::resolve_actor(actor.as_deref(), body.updated_by.as_deref());
+    // Collect registration extras before moving the base fields into the command.
+    let enrichment = body.enrichment();
 
     let outcome = customer_service_for(&state, pool)
         .update(UpdateCustomerCommand {
@@ -291,6 +364,7 @@ pub async fn update_customer(
             address: body.address,
             customer_type: body.customer_type,
             notes: body.notes,
+            enrichment,
             updated_by,
             // TODO: wire user_id from auth middleware
             source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),

@@ -106,6 +106,10 @@ chrono-tz = "0.9"
 # Already pulled in transitively by tiberius + tokio-cron-scheduler; declared
 # explicitly here so the `serde` feature is available for our domain types.
 uuid = { version = "1", features = ["serde", "v4", "v5"] }
+# base64 — decode the `imageBase64` payload on `POST /api/guest-documents`
+# into `bytea`. Promoted from transitive (already resolved at 0.22 in the dep
+# tree) to a direct dep; no new version pulled.
+base64 = "0.22"
 
 # Error handling (matches Tauri)
 thiserror = "2"

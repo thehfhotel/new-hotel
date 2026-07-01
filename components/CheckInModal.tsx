@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { X, User, Calendar, AlertCircle, Loader2, DollarSign, CheckCircle2 } from 'lucide-react'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { useBranch } from '@/contexts/BranchContext'
-import { consumeCheckInPrefill } from '@/lib/checkin-prefill'
+import { consumeCheckInPrefill, type CheckInPrefill } from '@/lib/checkin-prefill'
 import { hotelInfoForBranch } from '@/lib/hotel-info'
 import PrintButton from '@/components/ui/PrintButton'
 import RegistrationSlipTemplate, {
@@ -76,15 +76,23 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
   // After a successful check-in we switch the modal to a "print the
   // registration slip" panel instead of closing immediately.
   const [created, setCreated] = useState<{ cinNo: string; id: number } | null>(null)
+  // The full document prefill (card reader / passport scanner). Held so the
+  // richer customer fields + photo flow through submit; null for a plain
+  // walk-in (behaviour then identical to before this feature).
+  const [prefill, setPrefill] = useState<CheckInPrefill | null>(null)
 
-  // ID-card prefill hand-off: the card reader stashes the parsed Thai-ID
-  // fields and routes here; consume them once on open.
+  // ID-card / passport prefill hand-off: the reader/scanner stashes the parsed
+  // document fields and routes here; consume them once on open.
   useEffect(() => {
     const p = consumeCheckInPrefill()
     if (!p) return
+    setPrefill(p)
     if (p.firstName) setFirstName(p.firstName)
     if (p.lastName) setLastName(p.lastName)
-    if (p.idCard) setIdCard(p.idCard)
+    // The visible field is labelled "เลขบัตรประชาชน / Passport": show the Thai
+    // national id, or the passport number for a foreign guest.
+    const docNo = p.idCard || p.passport
+    if (docNo) setIdCard(docNo)
   }, [])
 
   // Type-ahead lookup for existing customers by phone — avoids creating a
@@ -127,6 +135,51 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
     setPickedCustomerId(null)
   }
 
+  // Build the POST /api/customers body. With no document prefill this is
+  // byte-identical to the original walk-in body (firstName/lastName/phone/
+  // idCard); a scanned Thai-ID card or passport adds the extended, only-when-
+  // present fields (undefined values are dropped by JSON.stringify, so a blank
+  // field never overwrites an existing value — the backend enriches with
+  // COALESCE).
+  const buildCustomerBody = (): Record<string, unknown> => {
+    const isPassport = prefill?.docType === 'passport'
+    const body: Record<string, unknown> = {
+      firstName: firstName.trim(),
+      lastName: lastName.trim() || undefined,
+      phone: phone.trim() || undefined,
+    }
+    if (isPassport) {
+      // Foreign guest: the visible number field carries the passport number.
+      body.passport = idCard.trim() || prefill?.passport || undefined
+    } else {
+      body.idCard = idCard.trim() || undefined
+      if (prefill?.passport) body.passport = prefill.passport
+    }
+    if (prefill) {
+      const englishName = [prefill.englishFirstName, prefill.englishLastName]
+        .filter(Boolean)
+        .join(' ')
+        .trim()
+      Object.assign(body, {
+        title: prefill.title,
+        englishName: englishName || undefined,
+        nationality: prefill.nationality,
+        sex: prefill.sex,
+        dob: prefill.dob,
+        address: prefill.address,
+        addNo: prefill.addNo,
+        addMoo: prefill.addMoo,
+        addSoi: prefill.addSoi,
+        addRoad: prefill.addRoad,
+        addTambon: prefill.addTambon,
+        addAmpore: prefill.addAmpore,
+        addProvince: prefill.addProvince,
+        addCode: prefill.addCode,
+      })
+    }
+    return body
+  }
+
   const submit = async (e: React.FormEvent) => {
     e.preventDefault()
     setError(null)
@@ -139,24 +192,43 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
     setSubmitting(true)
     try {
       // Step 1: ensure we have a customer_id. Reuse picked existing, or
-      // POST a new walk-in customer.
+      // POST a new walk-in customer (enriched with any scanned document fields).
       let customerId = pickedCustomerId
       if (customerId === null) {
         const custRes = await branchFetch('/api/customers', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            firstName: firstName.trim(),
-            lastName: lastName.trim() || undefined,
-            phone: phone.trim() || undefined,
-            idCard: idCard.trim() || undefined,
-          }),
+          body: JSON.stringify(buildCustomerBody()),
         })
         const custData = await custRes.json()
         if (!custRes.ok || !custData.success || !custData.id) {
           throw new Error(custData.message || 'สร้างข้อมูลลูกค้าไม่สำเร็จ')
         }
         customerId = custData.id
+      }
+
+      // Step 1b (optional): persist the scanned document image, then link it to
+      // the check-in via its provisional tmpNo. Best-effort — a photo is a
+      // convenience and must never block the check-in.
+      let photoTmpNo: string | undefined
+      if (prefill?.photoBase64) {
+        try {
+          const docType = prefill.docType ?? 'thai_id_card'
+          const docRes = await branchFetch('/api/guest-documents', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              docType,
+              mime: 'image/jpeg',
+              imageBase64: prefill.photoBase64,
+              source: docType === 'thai_id_card' ? 'chip' : 'scanner',
+            }),
+          })
+          const docData = await docRes.json().catch(() => ({}))
+          if (docRes.ok && docData.tmpNo) photoTmpNo = docData.tmpNo
+        } catch {
+          // Swallow — proceed with the check-in without the photo link.
+        }
       }
 
       // Step 2: create the check-in.
@@ -171,6 +243,7 @@ export default function CheckInModal({ room, onClose, onSuccess }: CheckInModalP
           adults,
           children,
           depositAmount: Number.isFinite(depositAmount) && depositAmount > 0 ? depositAmount : undefined,
+          photoTmpNo,
         }),
       })
       const checkinData = await checkinRes.json()

@@ -199,6 +199,13 @@ pub struct ResolvedJob {
     /// writeback back-populated it). `None` ⇒ the dispatcher defers the
     /// mark-read (same pattern as `RedeemCoupon` waiting on `IssueCoupon`).
     pub note_legacy_id: Option<i32>,
+    /// Phase 2 (check-in registration) — the raw `ht_guest_documents.doc_image`
+    /// bytea for a `MirrorGuestImage` intent, loaded by the writeback worker's
+    /// resolver keyed on the intent's `doc_id`. `None` for every other intent
+    /// (and ⇒ the dispatcher errors, so the job retries rather than INSERTing
+    /// an empty `Tb_Save_Image.pic`). Keeps the recipe PG-pure — the bytes are
+    /// bound as a varbinary parameter, never a hex literal in the payload.
+    pub guest_document_image: Option<Vec<u8>>,
 }
 
 /// Fully-hydrated `ht_coupons` row required by the
@@ -405,8 +412,7 @@ pub struct DispatchContext {
 /// round_end`); iHOTEL's own gate is
 /// `Module1.check_round_bill(): SELECT id FROM HT_Round_Bill WHERE
 /// round_end IS NULL`.
-const ROUND_BILL_GATE_SQL: &str =
-    "SELECT COUNT(*) FROM HT_Round_Bill WHERE round_end IS NULL";
+const ROUND_BILL_GATE_SQL: &str = "SELECT COUNT(*) FROM HT_Round_Bill WHERE round_end IS NULL";
 
 /// True for the intents whose recipes write money rows iHOTEL attributes
 /// to the open cashier round (`HT_CheckIn_Pay` tenders, `HT_CheckIn_H`
@@ -482,6 +488,15 @@ fn intent_facts(intent: &WritebackIntent) -> IntentFacts {
         // MarkNoteRead is an idempotent `UPDATE … SET SMS_Readed='yes' WHERE
         // SMS_ID=…` — a second apply is a no-op. No ledger, no open-round warning.
         MarkNoteRead { .. } => (false, false),
+        // Phase 2 — MirrorGuestImage INSERTs into the IDENTITY-keyed
+        // Tb_Save_Image, so a crash-after-commit retry would mint a DUPLICATE
+        // photo row. Ledger it (same class as CreateNote). It writes no
+        // cashier-round money row → no §1.9 open-round warning.
+        MirrorGuestImage { .. } => (true, false),
+        // Phase 4 — MirrorCompanion INSERTs into the IDENTITY-keyed
+        // HT_CheckIn_Other_People, so a crash-after-commit retry would mint a
+        // DUPLICATE companion row. Ledger it. No cashier-round money row.
+        MirrorCompanion { .. } => (true, false),
         ModifyBooking { .. }
         | CancelBooking { .. }
         | CancelCheckIn { .. }
@@ -505,7 +520,10 @@ fn intent_facts(intent: &WritebackIntent) -> IntentFacts {
         | UpsertRatePrice { .. }
         | RedeemCoupon { .. } => (false, false),
     };
-    IntentFacts { ledgered, requires_open_round }
+    IntentFacts {
+        ledgered,
+        requires_open_round,
+    }
 }
 
 /// Best-effort round-bill gate warning (cheatsheet §1.9). NEVER blocks or
@@ -802,26 +820,29 @@ pub async fn dispatch(
     }
 
     let result = match intent {
-        WritebackIntent::CreateBooking { booking_id: _, payload } => {
-            recipes::booking_create::execute(conn, payload).await
-        }
-        WritebackIntent::ModifyBooking { booking_id: _, changes } => {
+        WritebackIntent::CreateBooking {
+            booking_id: _,
+            payload,
+        } => recipes::booking_create::execute(conn, payload).await,
+        WritebackIntent::ModifyBooking {
+            booking_id: _,
+            changes,
+        } => {
             let book_id = nonempty(resolved.legacy_book_id.as_ref()).ok_or_else(|| {
-                WritebackError::Recipe(
-                    "ModifyBooking requires resolved legacy_book_id".into(),
-                )
+                WritebackError::Recipe("ModifyBooking requires resolved legacy_book_id".into())
             })?;
             recipes::booking_modify::execute(conn, book_id, changes).await
         }
         WritebackIntent::CancelBooking { booking_id: _ } => {
             let book_id = nonempty(resolved.legacy_book_id.as_ref()).ok_or_else(|| {
-                WritebackError::Recipe(
-                    "CancelBooking requires resolved legacy_book_id".into(),
-                )
+                WritebackError::Recipe("CancelBooking requires resolved legacy_book_id".into())
             })?;
             recipes::booking_cancel::execute(conn, book_id).await
         }
-        WritebackIntent::CreateCheckIn { check_in_id: _, payload } => {
+        WritebackIntent::CreateCheckIn {
+            check_in_id: _,
+            payload,
+        } => {
             if payload.linked_booking_id.is_some() {
                 let book_id = nonempty(payload.linked_legacy_book_id.as_ref())
                     .or(nonempty(resolved.legacy_book_id.as_ref()))
@@ -876,9 +897,7 @@ pub async fn dispatch(
                 WritebackError::Recipe("ExtendStay requires resolved legacy_room_no".into())
             })?;
             let ds_id = resolved.legacy_checkin_ds_id.ok_or_else(|| {
-                WritebackError::Recipe(
-                    "ExtendStay requires resolved legacy_checkin_ds_id".into(),
-                )
+                WritebackError::Recipe("ExtendStay requires resolved legacy_checkin_ds_id".into())
             })?;
             recipes::extend_stay::execute(
                 conn,
@@ -917,9 +936,7 @@ pub async fn dispatch(
                 WritebackError::Recipe("CheckOut requires resolved legacy_room_no".into())
             })?;
             let ds_id = resolved.legacy_checkin_ds_id.ok_or_else(|| {
-                WritebackError::Recipe(
-                    "CheckOut requires resolved legacy_checkin_ds_id".into(),
-                )
+                WritebackError::Recipe("CheckOut requires resolved legacy_checkin_ds_id".into())
             })?;
             // Audit H1: legacy events queued before the Wave 2 fix lack the
             // totals payload. Fall back to the prior all-zeros behavior so
@@ -1032,15 +1049,15 @@ pub async fn dispatch(
         // find the canonical `ht_room_changes` row — surface as a
         // recipe error so the job lands in the retry queue rather
         // than silently emitting an empty INSERT.
-        WritebackIntent::RoomChange { check_in_id: _, rc_id } => {
-            let resolved_rc = resolved
-                .room_change
-                .as_ref()
-                .ok_or_else(|| {
-                    WritebackError::Recipe(format!(
-                        "RoomChange requires resolved.room_change (rc_id={rc_id})"
-                    ))
-                })?;
+        WritebackIntent::RoomChange {
+            check_in_id: _,
+            rc_id,
+        } => {
+            let resolved_rc = resolved.room_change.as_ref().ok_or_else(|| {
+                WritebackError::Recipe(format!(
+                    "RoomChange requires resolved.room_change (rc_id={rc_id})"
+                ))
+            })?;
             if resolved_rc.legacy_cin_no.is_empty() {
                 return Err(WritebackError::Recipe(
                     "RoomChange requires legacy_cin_no on resolved.room_change".into(),
@@ -1060,8 +1077,7 @@ pub async fn dispatch(
             })?;
             let room_id_int = resolved.legacy_room_id_int.ok_or_else(|| {
                 WritebackError::Recipe(
-                    "MarkRoomClean requires resolved legacy_room_id_int (HT_Rooms.id)"
-                        .into(),
+                    "MarkRoomClean requires resolved legacy_room_id_int (HT_Rooms.id)".into(),
                 )
             })?;
             recipes::mark_clean::execute(conn, room_no, room_id_int, by).await
@@ -1076,8 +1092,7 @@ pub async fn dispatch(
             })?;
             let room_id_int = resolved.legacy_room_id_int.ok_or_else(|| {
                 WritebackError::Recipe(
-                    "MarkRoomDirty requires resolved legacy_room_id_int (HT_Rooms.id)"
-                        .into(),
+                    "MarkRoomDirty requires resolved legacy_room_id_int (HT_Rooms.id)".into(),
                 )
             })?;
             recipes::mark_dirty::execute(conn, room_no, room_id_int, by).await
@@ -1086,11 +1101,13 @@ pub async fn dispatch(
         // UPDATE is keyed by numeric `HT_Rooms.id` only (cheatsheet
         // §3.15/§3.16 `where id=<id>` form), so `legacy_room_no` is not
         // required here.
-        WritebackIntent::SetRoomMaintenance { room_id: _, maintenance } => {
+        WritebackIntent::SetRoomMaintenance {
+            room_id: _,
+            maintenance,
+        } => {
             let room_id_int = resolved.legacy_room_id_int.ok_or_else(|| {
                 WritebackError::Recipe(
-                    "SetRoomMaintenance requires resolved legacy_room_id_int (HT_Rooms.id)"
-                        .into(),
+                    "SetRoomMaintenance requires resolved legacy_room_id_int (HT_Rooms.id)".into(),
                 )
             })?;
             recipes::set_maintenance::execute(conn, room_id_int, *maintenance).await
@@ -1102,7 +1119,10 @@ pub async fn dispatch(
         // already exist on the legacy side), so no `ResolvedJob` lookup
         // is needed. Mirrors the `UpdateRoom` payload-carries-the-key
         // shape.
-        WritebackIntent::UpdateCustomer { customer_id: _, resave } => {
+        WritebackIntent::UpdateCustomer {
+            customer_id: _,
+            resave,
+        } => {
             if resave.legacy_cust_no.is_empty() {
                 return Err(WritebackError::Recipe(
                     "UpdateCustomer requires non-empty resave.legacy_cust_no".into(),
@@ -1117,7 +1137,10 @@ pub async fn dispatch(
         // is needed. The recipe emits one targeted UPDATE; columns
         // whose payload field is `None` are omitted from the SET list,
         // preserving any iHOTEL-side value the operator did not touch.
-        WritebackIntent::UpdateRoom { room_id: _, payload } => {
+        WritebackIntent::UpdateRoom {
+            room_id: _,
+            payload,
+        } => {
             if payload.room_no.is_empty() {
                 return Err(WritebackError::Recipe(
                     "UpdateRoom requires non-empty payload.room_no".into(),
@@ -1146,7 +1169,10 @@ pub async fn dispatch(
         // `resolved.coupon` from PG (canonical `ht_coupons` row keyed
         // on `coupon_id`) before this point. The recipe consumes it
         // as plain fields and never re-queries sqlx.
-        WritebackIntent::IssueCoupon { coupon_aggregate_id: _, coupon_id } => {
+        WritebackIntent::IssueCoupon {
+            coupon_aggregate_id: _,
+            coupon_id,
+        } => {
             let resolved_coupon = resolved.coupon.as_ref().ok_or_else(|| {
                 WritebackError::Recipe(format!(
                     "IssueCoupon requires resolved.coupon (coupon_id={coupon_id})"
@@ -1154,7 +1180,10 @@ pub async fn dispatch(
             })?;
             recipes::coupon::execute_issue(conn, resolved_coupon).await
         }
-        WritebackIntent::RedeemCoupon { coupon_aggregate_id: _, coupon_id } => {
+        WritebackIntent::RedeemCoupon {
+            coupon_aggregate_id: _,
+            coupon_id,
+        } => {
             let resolved_coupon = resolved.coupon.as_ref().ok_or_else(|| {
                 WritebackError::Recipe(format!(
                     "RedeemCoupon requires resolved.coupon (coupon_id={coupon_id})"
@@ -1167,15 +1196,15 @@ pub async fn dispatch(
         // consumes plain fields only. Missing hydration ⇒ recipe
         // error so the job lands in the retry queue rather than
         // silently emitting an empty INSERT.
-        WritebackIntent::RecordPosSale { check_in_id: _, sale_id } => {
-            let resolved_sale = resolved
-                .pos_sale
-                .as_ref()
-                .ok_or_else(|| {
-                    WritebackError::Recipe(format!(
-                        "RecordPosSale requires resolved.pos_sale (sale_id={sale_id})"
-                    ))
-                })?;
+        WritebackIntent::RecordPosSale {
+            check_in_id: _,
+            sale_id,
+        } => {
+            let resolved_sale = resolved.pos_sale.as_ref().ok_or_else(|| {
+                WritebackError::Recipe(format!(
+                    "RecordPosSale requires resolved.pos_sale (sale_id={sale_id})"
+                ))
+            })?;
             if resolved_sale.legacy_cin_no.is_empty() {
                 return Err(WritebackError::Recipe(
                     "RecordPosSale requires legacy_cin_no on resolved.pos_sale".into(),
@@ -1193,7 +1222,10 @@ pub async fn dispatch(
         // point; the recipe consumes plain fields only. Missing hydration
         // ⇒ recipe error so the job retries rather than emitting an empty
         // receipt.
-        WritebackIntent::RecordReceipt { receipt_aggregate_id: _, receipt_id } => {
+        WritebackIntent::RecordReceipt {
+            receipt_aggregate_id: _,
+            receipt_id,
+        } => {
             let resolved_receipt = resolved.receipt.as_ref().ok_or_else(|| {
                 WritebackError::Recipe(format!(
                     "RecordReceipt requires resolved.receipt (receipt_id={receipt_id})"
@@ -1211,7 +1243,10 @@ pub async fn dispatch(
         // unresolved (the original RecordPosSale writeback hasn't
         // back-populated it yet), DEFER with a recipe error so the job
         // retries — same pattern as RedeemCoupon waiting on IssueCoupon.
-        WritebackIntent::VoidPosSale { check_in_id: _, sale_id } => {
+        WritebackIntent::VoidPosSale {
+            check_in_id: _,
+            sale_id,
+        } => {
             let resolved_void = resolved.pos_void.as_ref().ok_or_else(|| {
                 WritebackError::Recipe(format!(
                     "VoidPosSale requires resolved.pos_void (sale_id={sale_id})"
@@ -1225,19 +1260,23 @@ pub async fn dispatch(
             })?;
             recipes::pos_void::execute(conn, legacy_id, &resolved_void.prod_legacy_no).await
         }
-        WritebackIntent::OpenRound { round_aggregate_id: _, payload } => {
-            recipes::round_bill::execute_open(conn, payload).await
-        }
-        WritebackIntent::CloseRound { round_aggregate_id: _, payload } => {
-            recipes::round_bill::execute_close(conn, payload).await
-        }
+        WritebackIntent::OpenRound {
+            round_aggregate_id: _,
+            payload,
+        } => recipes::round_bill::execute_open(conn, payload).await,
+        WritebackIntent::CloseRound {
+            round_aggregate_id: _,
+            payload,
+        } => recipes::round_bill::execute_close(conn, payload).await,
         // Task #49 — deposit refund. The resolver loaded the room's
         // `cr_legacy_ds_id` (== `HT_CheckIn_Ds.id`) from PG keyed on `cr_id`;
         // the recipe no-ops with a WARN if it's still unresolved (the
         // check-in's own writeback hasn't back-populated it yet).
-        WritebackIntent::RefundDeposit { check_in_id: _, cr_id: _, by } => {
-            recipes::deposit_refund::execute(conn, resolved.legacy_dep_ds_id, by).await
-        }
+        WritebackIntent::RefundDeposit {
+            check_in_id: _,
+            cr_id: _,
+            by,
+        } => recipes::deposit_refund::execute(conn, resolved.legacy_dep_ds_id, by).await,
         // Task #47 — sticky-note create. The intent carries the legacy target
         // key (room_no / username) directly, so no ResolvedJob lookup is
         // needed (UpdateRoom shape). The recipe INSERTs the SMS row and
@@ -1254,21 +1293,18 @@ pub async fn dispatch(
                     "CreateNote requires a non-empty target_key (room_no / username)".into(),
                 ));
             }
-            recipes::sticky_note::execute_create(
-                conn,
-                *target_kind,
-                target_key,
-                body,
-                created_by,
-            )
-            .await
+            recipes::sticky_note::execute_create(conn, *target_kind, target_key, body, created_by)
+                .await
         }
         // Task #47 — sticky-note mark-read. The legacy `SMS_ID` was resolved
         // from `ht_notes.note_legacy_id` by the writeback worker. If it's not
         // yet known (app-created note whose CreateNote back-population is
         // pending), defer with a recipe error so the job retries — same
         // pattern as RedeemCoupon waiting on IssueCoupon.
-        WritebackIntent::MarkNoteRead { note_aggregate_id, target_kind } => {
+        WritebackIntent::MarkNoteRead {
+            note_aggregate_id,
+            target_kind,
+        } => {
             let sms_id = resolved.note_legacy_id.ok_or_else(|| {
                 WritebackError::Recipe(format!(
                     "MarkNoteRead waiting on CreateNote back-population \
@@ -1280,8 +1316,45 @@ pub async fn dispatch(
         // Task #51 — rate-price matrix UPSERT. The intent carries the full
         // `HT_Rooms_Price` row in its payload (composite key + prices), so no
         // ResolvedJob lookup is needed (UpdateRoom / AdjustProductStock shape).
-        WritebackIntent::UpsertRatePrice { rate_aggregate_id: _, payload } => {
-            recipes::rate_price::execute(conn, payload).await
+        WritebackIntent::UpsertRatePrice {
+            rate_aggregate_id: _,
+            payload,
+        } => recipes::rate_price::execute(conn, payload).await,
+        // Phase 2 — mirror a captured guest document into legacy `Tb_Save_Image`.
+        // The resolver loaded the raw `doc_image` bytea from PG keyed on
+        // `doc_id`; the recipe binds it as a varbinary parameter. A missing
+        // blob ⇒ recipe error so the job retries rather than INSERTing an empty
+        // `pic`. `cust_legacy_no` / `cin_legacy_no` are diagnostic only — the
+        // provisional INSERT writes empty `cust_no` / `cin_no` (the check-in
+        // writeback stamps them later by `tmp_no`).
+        WritebackIntent::MirrorGuestImage {
+            doc_id,
+            doc_type,
+            cust_legacy_no: _,
+            cin_legacy_no: _,
+            tmp_no,
+        } => {
+            let image = resolved.guest_document_image.as_deref().ok_or_else(|| {
+                WritebackError::Recipe(format!(
+                    "MirrorGuestImage requires resolved guest_document_image (doc_id={doc_id})"
+                ))
+            })?;
+            recipes::save_image::execute(conn, image, doc_type, tmp_no).await
+        }
+        // Phase 4 — mirror a companion guest into legacy `HT_CheckIn_Other_People`.
+        // The intent carries the legacy `Cin_no` directly (resolved by the route
+        // before enqueue), so no ResolvedJob lookup — UpdateCustomer shape.
+        WritebackIntent::MirrorCompanion {
+            cin_legacy_no,
+            name,
+            country,
+        } => {
+            if cin_legacy_no.is_empty() {
+                return Err(WritebackError::Recipe(
+                    "MirrorCompanion requires a non-empty cin_legacy_no".into(),
+                ));
+            }
+            recipes::companion_people::execute(conn, cin_legacy_no, name, country).await
         }
     };
 
@@ -1341,11 +1414,15 @@ mod tests {
 
     #[test]
     fn is_ledger_missing_flags_only_the_ledger_table_error() {
-        assert!(is_ledger_missing("Invalid object name 'dbo.ht_writeback_ledger'."));
+        assert!(is_ledger_missing(
+            "Invalid object name 'dbo.ht_writeback_ledger'."
+        ));
         assert!(is_ledger_missing(
             "... ht_writeback_ledger ... (code: 208, state: 1, class: 16)"
         ));
-        assert!(!is_ledger_missing("Invalid object name 'dbo.ht_other_table'."));
+        assert!(!is_ledger_missing(
+            "Invalid object name 'dbo.ht_other_table'."
+        ));
         assert!(!is_ledger_missing("connection reset by peer"));
     }
 
@@ -1368,7 +1445,10 @@ mod tests {
         // which the SQL literal MUST double-escape — else the INSERT breaks /
         // is injectable. (LegacyIds can carry free-text fields.)
         let json = serde_json::to_string(&LegacyIds::new().with_room_no("4'02".into())).unwrap();
-        assert!(json.contains("4'02"), "fixture JSON must contain the raw quote");
+        assert!(
+            json.contains("4'02"),
+            "fixture JSON must contain the raw quote"
+        );
         let sql = build_ledger_insert_sql(k, "create_check_in", agg, &json);
 
         // Column order is load-bearing (matches migration 024 + the SELECT).
@@ -1380,9 +1460,18 @@ mod tests {
         assert!(sql.contains("'550e8400-e29b-41d4-a716-446655440000'"));
         assert!(sql.contains("'create_check_in'"));
         assert!(sql.contains("'11111111-2222-3333-4444-555555555555'"));
-        assert!(sql.contains("N'"), "legacy_ids literal must be NVARCHAR (N'')");
-        assert!(sql.contains("4''02"), "embedded single quote must be doubled");
-        assert!(!sql.contains("4'02'"), "raw unescaped quote must not survive");
+        assert!(
+            sql.contains("N'"),
+            "legacy_ids literal must be NVARCHAR (N'')"
+        );
+        assert!(
+            sql.contains("4''02"),
+            "embedded single quote must be doubled"
+        );
+        assert!(
+            !sql.contains("4'02'"),
+            "raw unescaped quote must not survive"
+        );
         assert!(sql.trim_end().ends_with("GETDATE())"));
     }
 
@@ -1398,7 +1487,9 @@ mod tests {
         // not the silent (false, false) default the old per-classifier
         // matches!() gave. Adding a `_ =>` here reintroduces that hazard.
         let src = include_str!("dispatcher.rs");
-        let start = src.find("fn intent_facts(").expect("intent_facts must exist");
+        let start = src
+            .find("fn intent_facts(")
+            .expect("intent_facts must exist");
         let rest = &src[start..];
         let body = &rest[..rest.find("\n}").map(|i| i + 2).unwrap_or(rest.len())];
         assert!(
@@ -1406,7 +1497,13 @@ mod tests {
             "intent_facts must have NO wildcard arm (it would reintroduce silent drift)"
         );
         // The 5 sequential-allocator CREATE intents must be classified in the table.
-        for v in ["CreateBooking", "CreateCheckIn", "RecordPayment", "IssueCoupon", "RecordPosSale"] {
+        for v in [
+            "CreateBooking",
+            "CreateCheckIn",
+            "RecordPayment",
+            "IssueCoupon",
+            "RecordPosSale",
+        ] {
             assert!(body.contains(v), "intent_facts must classify {v}");
         }
     }
@@ -1434,7 +1531,9 @@ mod tests {
             vat_percent: None,
         }));
         // mutate-only → NOT ledgered
-        assert!(!intent_is_ledgered(&WritebackIntent::CancelBooking { booking_id: id }));
+        assert!(!intent_is_ledgered(&WritebackIntent::CancelBooking {
+            booking_id: id
+        }));
         assert!(!intent_is_ledgered(&WritebackIntent::MarkRoomClean {
             room_id: id,
             by: "Admin".into(),
@@ -1478,8 +1577,14 @@ mod tests {
         let result_tail = src
             .find("\n    result\n}")
             .expect("dispatch() must end by returning `result`");
-        assert!(lookup < match_pos, "ledger_lookup must run before the recipe match");
-        assert!(match_pos < record, "ledger_record must run AFTER the recipe match");
+        assert!(
+            lookup < match_pos,
+            "ledger_lookup must run before the recipe match"
+        );
+        assert!(
+            match_pos < record,
+            "ledger_record must run AFTER the recipe match"
+        );
         assert!(
             record < result_tail,
             "ledger_record must be the last write before `result` is returned"
@@ -1657,7 +1762,10 @@ mod tests {
                 refund_reason: String::new(),
                 payment_aggregate_id: None,
             },
-            WritebackIntent::RecordPosSale { check_in_id: id, sale_id: 1 },
+            WritebackIntent::RecordPosSale {
+                check_in_id: id,
+                sale_id: 1,
+            },
         ];
         for intent in &gated {
             assert!(
@@ -1669,9 +1777,18 @@ mod tests {
 
         let ungated = [
             WritebackIntent::CancelBooking { booking_id: id },
-            WritebackIntent::MarkRoomClean { room_id: id, by: "Admin".into() },
-            WritebackIntent::MarkRoomDirty { room_id: id, by: "Admin".into() },
-            WritebackIntent::SetRoomMaintenance { room_id: id, maintenance: true },
+            WritebackIntent::MarkRoomClean {
+                room_id: id,
+                by: "Admin".into(),
+            },
+            WritebackIntent::MarkRoomDirty {
+                room_id: id,
+                by: "Admin".into(),
+            },
+            WritebackIntent::SetRoomMaintenance {
+                room_id: id,
+                maintenance: true,
+            },
             WritebackIntent::UpdateCustomer {
                 customer_id: id,
                 resave: crate::outbox::intent::CustomerResave::default(),

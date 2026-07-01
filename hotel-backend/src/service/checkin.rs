@@ -57,6 +57,11 @@ pub struct CheckInWritebackContext {
     /// `HT_CheckIn_Ds.Cin_Room_Dep` mirror stays consistent through the sync
     /// round-trip. `Money::ZERO` ⇒ no deposit (the common walk-in).
     pub deposit: Money,
+    /// Phase 2 — optional `Tb_Save_Image.tmp_no` linking a guest photo uploaded
+    /// before check-in. Threaded into [`CreateCheckInPayload::photo_tmp_no`] so
+    /// the walk-in / checkin-to-booking recipe fires the existing
+    /// `UPDATE Tb_Save_Image … WHERE tmp_no=<tmp_no>` link. `None` ⇒ no photo.
+    pub photo_tmp_no: Option<String>,
 }
 
 /// Command for [`CheckInService::walk_in`] — no prior booking exists.
@@ -278,7 +283,13 @@ impl CheckInService {
         events: Arc<EventBus>,
         pg: PgPool,
     ) -> Self {
-        Self { repo, outbox, events, pg, shifts: None }
+        Self {
+            repo,
+            outbox,
+            events,
+            pg,
+            shifts: None,
+        }
     }
 
     /// Builder-style attach for the round-bill shift gate.
@@ -346,7 +357,9 @@ impl CheckInService {
 
         let aggregate_id = aggregate_uuid(AggregateKind::CheckIn, cin_id);
         // Stamp UUID on the row for the writeback resolver (migration 014).
-        self.repo.set_aggregate_id(&mut tx, cin_id, aggregate_id).await?;
+        self.repo
+            .set_aggregate_id(&mut tx, cin_id, aggregate_id)
+            .await?;
         let snapshot = build_check_in_snapshot(
             aggregate_id,
             None,
@@ -365,7 +378,10 @@ impl CheckInService {
 
         tx.commit().await?;
 
-        Ok(CheckInOutcome { check_in_id: cin_id, aggregate_id })
+        Ok(CheckInOutcome {
+            check_in_id: cin_id,
+            aggregate_id,
+        })
     }
 
     /// Activate an existing booking — links the new `ht_checkins` row to the
@@ -444,7 +460,9 @@ impl CheckInService {
 
         let aggregate_id = aggregate_uuid(AggregateKind::CheckIn, cin_id);
         // Stamp UUID on the row for the writeback resolver (migration 014).
-        self.repo.set_aggregate_id(&mut tx, cin_id, aggregate_id).await?;
+        self.repo
+            .set_aggregate_id(&mut tx, cin_id, aggregate_id)
+            .await?;
         let snapshot = build_check_in_snapshot(
             aggregate_id,
             Some(cmd.booking_id),
@@ -463,7 +481,10 @@ impl CheckInService {
 
         tx.commit().await?;
 
-        Ok(CheckInOutcome { check_in_id: cin_id, aggregate_id })
+        Ok(CheckInOutcome {
+            check_in_id: cin_id,
+            aggregate_id,
+        })
     }
 
     /// Cancel an active check-in — emits the writeback + event but does NOT
@@ -476,13 +497,13 @@ impl CheckInService {
             .find_status(&self.pg, cmd.check_in_id)
             .await?
             .ok_or_else(|| {
-                ServiceError::not_found(format!(
-                    "check-in {} does not exist",
-                    cmd.check_in_id
-                ))
+                ServiceError::not_found(format!("check-in {} does not exist", cmd.check_in_id))
             })?;
 
-        if matches!(status.cin_status.as_deref(), Some("cancelled") | Some("checkedout")) {
+        if matches!(
+            status.cin_status.as_deref(),
+            Some("cancelled") | Some("checkedout")
+        ) {
             return Err(ServiceError::conflict(format!(
                 "check-in {} is already terminal ({:?})",
                 cmd.check_in_id, status.cin_status
@@ -556,10 +577,7 @@ impl CheckInService {
             .find_status(&self.pg, cmd.check_in_id)
             .await?
             .ok_or_else(|| {
-                ServiceError::not_found(format!(
-                    "check-in {} does not exist",
-                    cmd.check_in_id
-                ))
+                ServiceError::not_found(format!("check-in {} does not exist", cmd.check_in_id))
             })?;
 
         if !matches!(status.cin_status.as_deref(), Some("active")) {
@@ -658,10 +676,7 @@ impl CheckInService {
     ///
     /// Returns [`ChangeRoomOutcome::rc_id`] so the route can return the
     /// freshly-inserted audit row.
-    pub async fn change_room(
-        &self,
-        cmd: ChangeRoomCommand,
-    ) -> ServiceResult<ChangeRoomOutcome> {
+    pub async fn change_room(&self, cmd: ChangeRoomCommand) -> ServiceResult<ChangeRoomOutcome> {
         // 1. Source check-in must exist + be active. We reject any
         //    non-active state explicitly so receptionists get a clear
         //    409 wording instead of a silent no-op.
@@ -670,10 +685,7 @@ impl CheckInService {
             .find_status(&self.pg, cmd.check_in_id)
             .await?
             .ok_or_else(|| {
-                ServiceError::not_found(format!(
-                    "check-in {} does not exist",
-                    cmd.check_in_id
-                ))
+                ServiceError::not_found(format!("check-in {} does not exist", cmd.check_in_id))
             })?;
         if !matches!(status.cin_status.as_deref(), Some("active")) {
             return Err(ServiceError::conflict(format!(
@@ -825,7 +837,11 @@ impl CheckInService {
         .bind(cmd.from_room_id)
         .bind(cmd.to_room_id)
         .bind(reason_trimmed)
-        .bind(if cmd.actor.is_empty() { None } else { Some(cmd.actor.as_str()) })
+        .bind(if cmd.actor.is_empty() {
+            None
+        } else {
+            Some(cmd.actor.as_str())
+        })
         .bind(room_before_price)
         .bind(&to_price)
         .fetch_one(&mut *tx)
@@ -885,7 +901,9 @@ impl CheckInService {
         self.repo
             .mark_room_available_dirty(&mut tx, cmd.from_room_id)
             .await?;
-        self.repo.mark_room_occupied(&mut tx, cmd.to_room_id).await?;
+        self.repo
+            .mark_room_occupied(&mut tx, cmd.to_room_id)
+            .await?;
 
         // ht_checkins still carries the deprecated single-room column.
         // Update it as a fallback for legacy-reader code paths so the
@@ -1063,10 +1081,7 @@ impl CheckInService {
             .find_status(&self.pg, cmd.check_in_id)
             .await?
             .ok_or_else(|| {
-                ServiceError::not_found(format!(
-                    "check-in {} does not exist",
-                    cmd.check_in_id
-                ))
+                ServiceError::not_found(format!("check-in {} does not exist", cmd.check_in_id))
             })?;
 
         if !matches!(status.cin_status.as_deref(), Some("active")) {
@@ -1118,31 +1133,31 @@ impl CheckInService {
         // wrong room + never flip the remaining junction row → PG/legacy
         // divergence). A genuine single-room stay (≤1 junction row) keeps the
         // legacy whole-stay path below, byte-identical to before.
-        let effective_cr_ids: Option<Vec<i64>> =
-            match cmd.cr_ids.clone().filter(|v| !v.is_empty()) {
-                Some(ids) => Some(ids),
-                None => {
-                    let total: i64 = sqlx::query_scalar(
-                        "SELECT COUNT(*) FROM ht_checkin_rooms WHERE cr_cin_id = $1",
-                    )
-                    .bind(cmd.check_in_id)
-                    .fetch_one(&mut *tx)
-                    .await?;
-                    if total > 1 {
-                        let active: Vec<i64> = sqlx::query_scalar(
-                            "SELECT cr_id FROM ht_checkin_rooms \
+        let effective_cr_ids: Option<Vec<i64>> = match cmd.cr_ids.clone().filter(|v| !v.is_empty())
+        {
+            Some(ids) => Some(ids),
+            None => {
+                let total: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM ht_checkin_rooms WHERE cr_cin_id = $1",
+                )
+                .bind(cmd.check_in_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if total > 1 {
+                    let active: Vec<i64> = sqlx::query_scalar(
+                        "SELECT cr_id FROM ht_checkin_rooms \
                               WHERE cr_cin_id = $1 AND cr_room_status = 'เข้าพัก' \
                            ORDER BY cr_id",
-                        )
-                        .bind(cmd.check_in_id)
-                        .fetch_all(&mut *tx)
-                        .await?;
-                        (!active.is_empty()).then_some(active)
-                    } else {
-                        None
-                    }
+                    )
+                    .bind(cmd.check_in_id)
+                    .fetch_all(&mut *tx)
+                    .await?;
+                    (!active.is_empty()).then_some(active)
+                } else {
+                    None
                 }
-            };
+            }
+        };
 
         if let Some(cr_ids) = effective_cr_ids.as_ref() {
             let aggregate_id = aggregate_uuid(AggregateKind::CheckIn, cmd.check_in_id);
@@ -1201,7 +1216,9 @@ impl CheckInService {
             }
 
             for (_, room_id, _, _) in &selected {
-                self.repo.mark_room_available_dirty(&mut tx, *room_id).await?;
+                self.repo
+                    .mark_room_available_dirty(&mut tx, *room_id)
+                    .await?;
             }
 
             // Header completes ONLY when no room is still in-house.
@@ -1431,10 +1448,12 @@ impl CheckInService {
             // (+ `Cin_dep_status`) is written by the walkin/checkin_to_booking
             // recipes; `Money::ZERO` keeps the no-deposit byte-shape.
             deposit: ctx.deposit,
-            // photo plumbing arrives in a follow-up — see audit HIGH-3.
-            // TODO(out of scope): guest photo capture/persistence
-            // (`photo_tmp_no`, `Tb_Save_Image`) — see docs/architecture.md:1385.
-            photo_tmp_no: None,
+            // Phase 2 (check-in registration) — the guest-photo linkage key.
+            // The walk-in / checkin-to-booking recipe fires
+            // `UPDATE Tb_Save_Image … WHERE tmp_no=<photo_tmp_no>` (no-op when
+            // None), stamping the provisional photo row with this check-in's
+            // cin_no / cust_no. Sourced from the `photoTmpNo` request field.
+            photo_tmp_no: ctx.photo_tmp_no.clone(),
             // Track B4 — multi-room slice. Empty for now; populated by
             // the multi-room walk-in route (T4 HIGH-1) when it lands.
             // Today the create-check-in flow is single-room so the
@@ -1730,21 +1749,20 @@ mod tests {
         let repo: Arc<dyn CheckInRepository> = Arc::new(PgCheckInRepository::new());
         let outbox = Arc::new(OutboxRepository::new());
         let events = Arc::new(EventBus::new());
-        let svc = CheckInService::new(repo, outbox, events, pool.clone())
-            .with_shifts(shifts.clone());
+        let svc =
+            CheckInService::new(repo, outbox, events, pool.clone()).with_shifts(shifts.clone());
 
         let result = svc.check_out(sample_checkout(cin_id)).await;
 
         // Read back the stamped shift_id before cleaning up so the
         // assertion has access to the canonical state we wrote.
-        let stamped: Option<i64> = sqlx::query_scalar(
-            "SELECT cin_round_bill_shift_id FROM ht_checkins WHERE cin_id = $1",
-        )
-        .bind(cin_id)
-        .fetch_one(&pool)
-        .await
-        .ok()
-        .flatten();
+        let stamped: Option<i64> =
+            sqlx::query_scalar("SELECT cin_round_bill_shift_id FROM ht_checkins WHERE cin_id = $1")
+                .bind(cin_id)
+                .fetch_one(&pool)
+                .await
+                .ok()
+                .flatten();
 
         cleanup_checkin(&pool, cin_id).await;
         clear_shifts(&pool, site).await;
@@ -1805,8 +1823,8 @@ mod tests {
         let repo: Arc<dyn CheckInRepository> = Arc::new(PgCheckInRepository::new());
         let outbox = Arc::new(OutboxRepository::new());
         let events = Arc::new(EventBus::new());
-        let svc = CheckInService::new(repo, outbox, events, pool.clone())
-            .with_shifts(shifts.clone());
+        let svc =
+            CheckInService::new(repo, outbox, events, pool.clone()).with_shifts(shifts.clone());
 
         let err = svc
             .check_out(sample_checkout(cin_id))
@@ -1865,8 +1883,7 @@ mod tests {
         let outbox = Arc::new(OutboxRepository::new());
         let events = Arc::new(EventBus::new());
         let svc = Arc::new(
-            CheckInService::new(repo, outbox, events, pool.clone())
-                .with_shifts(shifts.clone()),
+            CheckInService::new(repo, outbox, events, pool.clone()).with_shifts(shifts.clone()),
         );
 
         let svc_a = svc.clone();
@@ -2028,11 +2045,11 @@ mod change_room_tests {
             eprintln!("skipping change_room_writes_audit_and_emits_intent — PG not reachable");
             return;
         };
-        let (cin_id, from_room_id, to_room_id) =
-            match seed_active_checkin(&pool, "G4_happy").await {
-                Some(ids) => ids,
-                None => return,
-            };
+        let (cin_id, from_room_id, to_room_id) = match seed_active_checkin(&pool, "G4_happy").await
+        {
+            Some(ids) => ids,
+            None => return,
+        };
 
         let svc = build_service(pool.clone());
         let outcome = svc
@@ -2068,13 +2085,12 @@ mod change_room_tests {
         assert_eq!(audit.4.as_deref(), Some("alice"));
 
         // 2. Junction flipped.
-        let junction: (i32,) = sqlx::query_as(
-            "SELECT cr_room_id FROM ht_checkin_rooms WHERE cr_cin_id = $1",
-        )
-        .bind(cin_id)
-        .fetch_one(&pool)
-        .await
-        .expect("junction row must exist");
+        let junction: (i32,) =
+            sqlx::query_as("SELECT cr_room_id FROM ht_checkin_rooms WHERE cr_cin_id = $1")
+                .bind(cin_id)
+                .fetch_one(&pool)
+                .await
+                .expect("junction row must exist");
         assert_eq!(
             junction.0, to_room_id,
             "junction must point to to_room_id after move"

@@ -59,11 +59,11 @@ pub use checkin::{
     RefundDepositCommand, RefundDepositOutcome, WalkInCommand,
 };
 pub use coupon::{
-    CouponService, IssueCouponCommand, IssueCouponOutcome, RedeemCouponCommand,
-    RedeemCouponOutcome,
+    CouponService, IssueCouponCommand, IssueCouponOutcome, RedeemCouponCommand, RedeemCouponOutcome,
 };
 pub use customer::{
-    CreateCustomerCommand, CustomerOutcome, CustomerService, UpdateCustomerCommand,
+    CreateCustomerCommand, CustomerEnrichmentInput, CustomerOutcome, CustomerService,
+    UpdateCustomerCommand,
 };
 pub use error::{ServiceError, ServiceResult};
 pub use housekeeping::{

@@ -199,7 +199,9 @@ impl SiteConfig {
                  Set SITE_ID=hfhotel or SITE_ID=hfville at deploy time."
             );
         }
-        Self { id: trimmed.to_string() }
+        Self {
+            id: trimmed.to_string(),
+        }
     }
 
     /// Convenience: the upper-cased site id used to suffix per-site
@@ -363,6 +365,42 @@ pub fn auth_enabled_from_env() -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Parse a boolean feature flag from `var_name`. Truthy = `true` / `1`
+/// (case-insensitive, trimmed); everything else (unset, empty, `0`, `false`,
+/// garbage) → `false`. The shared reader for the ship-dark coexistence flags
+/// below — same liberal-on-input policy as [`auth_enabled_from_env`].
+fn flag_enabled(var_name: &str) -> bool {
+    match std::env::var(var_name) {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            normalized == "true" || normalized == "1"
+        }
+        Err(_) => false,
+    }
+}
+
+/// Phase-2 guest-document mirror flag (`GUEST_DOCUMENT_STORAGE_ENABLED`).
+///
+/// Default `false` (ship DARK). When off, `POST /api/guest-documents` stores the
+/// image canonically in `ht_guest_documents` (bytea) but enqueues NO legacy
+/// `Tb_Save_Image` writeback. Flip only after a reception-coordinated live
+/// verification — a new write into the shared legacy DB (invariant #6). Mirrors
+/// the `NOTES_WRITEBACK_ENABLED` / `ROUND_WRITEBACK_ENABLED` precedent.
+pub fn guest_document_storage_enabled() -> bool {
+    flag_enabled("GUEST_DOCUMENT_STORAGE_ENABLED")
+}
+
+/// Phase-4 TM.30 companion-guest writeback flag (`TM30_COMPANION_WRITEBACK_ENABLED`).
+///
+/// Default `false` (ship DARK). When off, `POST /api/checkins/{id}/guests`
+/// writes the companion canonically only; when on it also enqueues a
+/// `MirrorCompanion` intent that INSERTs `HT_CheckIn_Other_People`. Same
+/// ship-dark policy / live-verification requirement as
+/// [`guest_document_storage_enabled`].
+pub fn tm30_companion_writeback_enabled() -> bool {
+    flag_enabled("TM30_COMPANION_WRITEBACK_ENABLED")
 }
 
 #[cfg(test)]

@@ -21,13 +21,11 @@ use crate::domain::user::User;
 /// extractor resolves to `None` when auth is off, so the handler never
 /// hard-requires a session) and pass `actor.as_deref()` here.
 pub fn resolve_actor(actor: Option<&User>, body: Option<&str>) -> Option<String> {
-    actor
-        .map(|u| u.username.clone())
-        .or_else(|| {
-            body.map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-        })
+    actor.map(|u| u.username.clone()).or_else(|| {
+        body.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    })
 }
 
 #[cfg(test)]
@@ -79,6 +77,7 @@ pub mod calendar;
 pub mod checkins;
 pub mod customers;
 pub mod events;
+pub mod guest_documents;
 pub mod health;
 pub mod housekeeping;
 pub mod legacy_mirror;
@@ -89,6 +88,7 @@ pub mod new_cash;
 pub mod new_checkins;
 pub mod new_coupons;
 pub mod new_customers;
+pub mod new_feedback;
 pub mod new_inventory;
 pub mod new_invoice;
 pub mod new_maintenance;
@@ -101,7 +101,6 @@ pub mod new_reports;
 pub mod new_room_types;
 pub mod new_rooms;
 pub mod new_rosters;
-pub mod new_feedback;
 pub mod new_shifts;
 pub mod new_sync;
 pub mod new_verification;

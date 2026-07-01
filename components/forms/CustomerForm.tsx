@@ -28,6 +28,30 @@ export interface CustomerFormData {
   /** Customer category / price tier — stored verbatim in `ht_customers.cust_type`. */
   customerType: string
   notes: string
+  // --- Extended registration fields (optional; from card reader / passport
+  // scanner or manual entry). Persisted via the backend COALESCE enrichment,
+  // so a blank value never clobbers an existing one. ---
+  /** Latin / secondary name → `Cust_name2`. */
+  englishName?: string
+  /** Thai title / prefix → `Cust_perfix`. */
+  title?: string
+  /** Passport / travel-document number (foreign guests). */
+  passport?: string
+  /** Nationality / country → `Cust_Contry`. */
+  nationality?: string
+  /** Gender as the legacy Thai literal ("ชาย" / "หญิง") → `Cust_sex`. */
+  sex?: string
+  /** Date of birth, Gregorian ISO `YYYY-MM-DD` (canonical `cust_dob`). */
+  dob?: string
+  /** Structured Thai address parts → `Cust_Add_*`. */
+  addNo?: string
+  addMoo?: string
+  addSoi?: string
+  addRoad?: string
+  addTambon?: string
+  addAmpore?: string
+  addProvince?: string
+  addCode?: string
 }
 
 /**
@@ -83,15 +107,38 @@ export default function CustomerForm({
       if (initialData) {
         setFormData(initialData)
       } else {
-        // Create mode: pull in any pending Thai-ID card-reader hand-off
-        // (single-use sessionStorage slot shared with the check-in forms).
-        // Empty when no card was scanned, so the form is otherwise blank.
+        // Create mode: pull in any pending card-reader / passport-scanner
+        // hand-off (single-use sessionStorage slot shared with the check-in
+        // forms). Empty when nothing was scanned, so the form is otherwise
+        // blank. The extended document fields flow through when present.
         const prefill = mode === 'create' ? consumeCheckInPrefill() : null
+        const englishName = prefill
+          ? [prefill.englishFirstName, prefill.englishLastName]
+              .filter(Boolean)
+              .join(' ')
+              .trim()
+          : ''
         setFormData({
           ...emptyFormData,
           firstName: prefill?.firstName ?? '',
           lastName: prefill?.lastName ?? '',
-          idCard: prefill?.idCard ?? '',
+          // Show the passport number in the ID field for a foreign guest.
+          idCard: prefill?.idCard ?? prefill?.passport ?? '',
+          address: prefill?.address ?? '',
+          englishName: englishName || undefined,
+          title: prefill?.title,
+          passport: prefill?.passport,
+          nationality: prefill?.nationality,
+          sex: prefill?.sex,
+          dob: prefill?.dob,
+          addNo: prefill?.addNo,
+          addMoo: prefill?.addMoo,
+          addSoi: prefill?.addSoi,
+          addRoad: prefill?.addRoad,
+          addTambon: prefill?.addTambon,
+          addAmpore: prefill?.addAmpore,
+          addProvince: prefill?.addProvince,
+          addCode: prefill?.addCode,
         })
       }
       setError(null)
@@ -269,6 +316,87 @@ export default function CustomerForm({
                   onChange={handleInputChange}
                   placeholder="กรอกเลขบัตรประชาชน"
                   className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors font-mono"
+                />
+              </div>
+
+              {/* English / secondary name (Cust_name2) */}
+              <div>
+                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                  <User className="w-4 h-4" />
+                  ชื่อภาษาอังกฤษ
+                </label>
+                <input
+                  type="text"
+                  name="englishName"
+                  value={formData.englishName ?? ''}
+                  onChange={handleInputChange}
+                  placeholder="Latin / passport name"
+                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
+                />
+              </div>
+
+              {/* Passport */}
+              <div>
+                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                  <CreditCard className="w-4 h-4" />
+                  เลขหนังสือเดินทาง (Passport)
+                </label>
+                <input
+                  type="text"
+                  name="passport"
+                  value={formData.passport ?? ''}
+                  onChange={handleInputChange}
+                  placeholder="สำหรับชาวต่างชาติ"
+                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors font-mono"
+                />
+              </div>
+
+              {/* Nationality + Gender + DOB */}
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                    <MapPin className="w-4 h-4" />
+                    สัญชาติ
+                  </label>
+                  <input
+                    type="text"
+                    name="nationality"
+                    value={formData.nationality ?? ''}
+                    onChange={handleInputChange}
+                    placeholder="เช่น ไทย"
+                    className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
+                  />
+                </div>
+                <div>
+                  <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                    <User className="w-4 h-4" />
+                    เพศ
+                  </label>
+                  <select
+                    name="sex"
+                    value={formData.sex ?? ''}
+                    onChange={handleInputChange}
+                    className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
+                  >
+                    <option value="">- ไม่ระบุ -</option>
+                    <option value="ชาย">ชาย</option>
+                    <option value="หญิง">หญิง</option>
+                  </select>
+                </div>
+              </div>
+
+              {/* Date of birth */}
+              <div>
+                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 mb-1">
+                  <FileText className="w-4 h-4" />
+                  วันเกิด
+                </label>
+                <input
+                  type="date"
+                  name="dob"
+                  value={formData.dob ?? ''}
+                  onChange={handleInputChange}
+                  className="w-full px-3 py-2 bg-gray-100 border border-gray-300 text-gray-800 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-hidden transition-colors"
                 />
               </div>
 
