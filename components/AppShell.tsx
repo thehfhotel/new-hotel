@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from 'react'
 import { usePathname } from 'next/navigation'
+import Script from 'next/script'
 import Sidebar, { SIDEBAR_WIDTH, SIDEBAR_COLLAPSED_WIDTH } from '@/components/Sidebar'
 import { BranchProvider } from '@/contexts/BranchContext'
 
@@ -20,6 +21,16 @@ const CHROMELESS_PATHS = new Set<string>(['/login'])
  *
  * For chromeless paths (e.g. /login), the sidebar + BranchProvider are
  * skipped entirely so the auth screen can occupy the full viewport.
+ *
+ * The HF One marquee band (hf-bar.js, see design/HF-ONE.md) is mounted here
+ * rather than in app/layout.tsx: the root layout is a Server Component that
+ * doesn't re-run on client-side navigation, so it can't gate by route. This
+ * component already does that via `usePathname()` for the chromeless check,
+ * so it's the natural (and only reactive) place to also gate the band.
+ * It's skipped on /v2/* — that experience has its own `fixed inset-y-0`
+ * desktop rail (components/v2/V2Shell.tsx) with the same viewport-locked
+ * overlap the classic Sidebar had, and isn't wired up to
+ * `--hf-band-offset` — and on /login, matching the existing chromeless set.
  */
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname()
@@ -34,7 +45,17 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     return <>{children}</>
   }
 
-  return <ChromedShell>{children}</ChromedShell>
+  return (
+    <>
+      <Script
+        src="https://erp.thehfhotel.org/shell/hf-bar.js"
+        data-app="Hotel PMS"
+        data-module="front-desk"
+        strategy="afterInteractive"
+      />
+      <ChromedShell>{children}</ChromedShell>
+    </>
+  )
 }
 
 function ChromedShell({ children }: { children: React.ReactNode }) {
@@ -60,10 +81,14 @@ function ChromedShell({ children }: { children: React.ReactNode }) {
 
   return (
     <BranchProvider>
-      <div className="min-h-screen bg-gray-50">
+      {/* min-h-screen would overshoot by --hf-band-offset once the (normal-
+          flow) hf-bar has already claimed that space above this div, leaving
+          a dead-scroll gap at the bottom. Sizing to the remainder keeps the
+          page exactly one viewport tall whether or not the band mounted. */}
+      <div className="min-h-[calc(100vh_-_var(--hf-band-offset))] bg-gray-50">
         <Sidebar />
         <main
-          className={`min-h-screen px-6 py-6 ${mounted ? 'transition-all duration-300' : ''}`}
+          className={`min-h-[calc(100vh_-_var(--hf-band-offset))] px-6 py-6 ${mounted ? 'transition-all duration-300' : ''}`}
           style={{ marginLeft: mounted ? (collapsed ? SIDEBAR_COLLAPSED_WIDTH : SIDEBAR_WIDTH) : SIDEBAR_WIDTH }}
         >
           {children}

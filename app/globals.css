@@ -67,6 +67,27 @@
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
+   HF One marquee band (hf-bar.js) — see design/HF-ONE.md.
+
+   hf-bar.js prepends a 44px band (+ 2px gold hairline) as the first child
+   of <body> in normal flow. Viewport-locked elements (fixed/h-screen), like
+   the sidebar, don't shift with normal-flow content, so they need to know
+   the band's height to avoid rendering underneath it.
+
+   --hf-band-offset defaults to 0px so the layout is untouched if the script
+   never loads (network hiccup, ad blocker, etc.) — the PMS must never show
+   a dead gap. It only becomes 46px once #hf-bar-host has actually mounted
+   as body's first child.
+   ─────────────────────────────────────────────────────────────────────── */
+body {
+  --hf-band-offset: 0px;
+}
+
+body:has(> #hf-bar-host) {
+  --hf-band-offset: 46px; /* 44px bar + 2px gold hairline */
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
    Skin tokens.
 
    Two skins are defined:

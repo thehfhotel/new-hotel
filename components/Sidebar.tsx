@@ -140,7 +140,7 @@ export default function Sidebar() {
 
   return (
     <aside
-      className={`fixed top-0 left-0 h-screen bg-panel border-r border-border z-40 flex flex-col transition-all duration-300 ${
+      className={`fixed left-0 top-[var(--hf-band-offset)] h-[calc(100vh_-_var(--hf-band-offset))] bg-panel border-r border-border z-40 flex flex-col transition-all duration-300 ${
         !mounted ? 'opacity-0' : 'opacity-100'
       }`}
       style={{ width }}
