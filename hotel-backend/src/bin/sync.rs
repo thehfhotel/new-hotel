@@ -4189,7 +4189,7 @@ async fn sync_guest_documents(pg: &PgPool, mssql: &DbPool, shadow_mode: bool, si
             "INSERT INTO ht_guest_documents ( \
                  doc_cust_id, doc_cin_id, doc_type, doc_mime, doc_image, doc_source, doc_legacy_id \
              ) VALUES ($1, $2, $3, $4, $5, 'legacy', $6) \
-             ON CONFLICT (doc_legacy_id) DO UPDATE SET \
+             ON CONFLICT (doc_legacy_id) WHERE doc_legacy_id IS NOT NULL DO UPDATE SET \
                  doc_cust_id = EXCLUDED.doc_cust_id, \
                  doc_cin_id  = EXCLUDED.doc_cin_id, \
                  doc_type    = EXCLUDED.doc_type, \
