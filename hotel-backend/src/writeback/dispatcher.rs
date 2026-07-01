@@ -1324,14 +1324,15 @@ pub async fn dispatch(
         // The resolver loaded the raw `doc_image` bytea from PG keyed on
         // `doc_id`; the recipe binds it as a varbinary parameter. A missing
         // blob ⇒ recipe error so the job retries rather than INSERTing an empty
-        // `pic`. `cust_legacy_no` / `cin_legacy_no` are diagnostic only — the
-        // provisional INSERT writes empty `cust_no` / `cin_no` (the check-in
-        // writeback stamps them later by `tmp_no`).
+        // `pic`. When `cin_legacy_no` is present (scan against an existing
+        // check-in) the recipe commits the row with that `cin_no` so iHOTEL's
+        // registration report shows it; otherwise it stays provisional (linked by
+        // `tmp_no`) for the check-in writeback to stamp later.
         WritebackIntent::MirrorGuestImage {
             doc_id,
             doc_type,
-            cust_legacy_no: _,
-            cin_legacy_no: _,
+            cust_legacy_no,
+            cin_legacy_no,
             tmp_no,
         } => {
             let image = resolved.guest_document_image.as_deref().ok_or_else(|| {
@@ -1339,7 +1340,15 @@ pub async fn dispatch(
                     "MirrorGuestImage requires resolved guest_document_image (doc_id={doc_id})"
                 ))
             })?;
-            recipes::save_image::execute(conn, image, doc_type, tmp_no).await
+            recipes::save_image::execute(
+                conn,
+                image,
+                doc_type,
+                cust_legacy_no.as_deref(),
+                cin_legacy_no.as_deref(),
+                tmp_no,
+            )
+            .await
         }
         // Phase 4 — mirror a companion guest into legacy `HT_CheckIn_Other_People`.
         // The intent carries the legacy `Cin_no` directly (resolved by the route
