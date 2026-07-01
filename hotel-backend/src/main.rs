@@ -267,6 +267,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/health", get(routes::health::health))
         .with_state(health_state);
 
+    // Public installer downloads (`/api/downloads/middleware/{platform}`).
+    // Stateless file serving from a bind-mounted assets dir — mounted PUBLIC
+    // (like /health, outside `require_auth`) so reception can fetch the
+    // card-reader middleware from our own origin without a GitHub login gate.
+    let downloads_routes = routes::downloads::router();
+
     // Phase 4 PR2: mount the public `/api/auth/*` endpoints. These are
     // ALWAYS reachable — they're how unauthenticated callers acquire a
     // session, and `/api/auth/me` is how the frontend probes whether
@@ -326,6 +332,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(auth_routes)
         .merge(admin_routes)
         .merge(health_routes)
+        .merge(downloads_routes)
         .layer(cors)
         .layer(TraceLayer::new_for_http());
 

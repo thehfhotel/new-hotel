@@ -279,20 +279,33 @@ export default function CardReaderPage() {
                 {/* Download Buttons */}
                 <div className="flex flex-wrap gap-3 mb-4">
                   <a
-                    href="https://github.com/thehfhotel/new-hotel/releases/download/middleware-v1.0.1/Thai.ID.Middleware_1.0.1_x64_en-US.msi"
+                    href="/api/downloads/middleware/win"
                     className="inline-flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg transition-colors"
                   >
                     <Download size={20} />
                     Windows (.msi)
                   </a>
                   <a
-                    href="https://github.com/thehfhotel/new-hotel/releases/download/middleware-v1.0.1/Thai.ID.Middleware_1.0.1_universal.dmg"
+                    href="/api/downloads/middleware/mac"
                     className="inline-flex items-center gap-2 bg-gray-600 hover:bg-gray-700 text-white px-4 py-2 rounded-lg transition-colors"
                   >
                     <Download size={20} />
                     macOS (.dmg)
                   </a>
                 </div>
+                {/* Self-hosted from our backend (no GitHub login gate). Fallback
+                    to the GitHub release if the server copy is ever unavailable. */}
+                <p className="text-xs text-yellow-700 mb-4">
+                  ดาวน์โหลดไม่ได้?{' '}
+                  <a
+                    href="https://github.com/thehfhotel/new-hotel/releases/latest"
+                    className="underline"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    ดาวน์โหลดจาก GitHub
+                  </a>
+                </p>
 
                 <div className="bg-yellow-100 rounded p-3 text-sm text-yellow-800">
                   <p className="mb-2 font-mono"># วิธีติดตั้ง</p>

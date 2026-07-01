@@ -76,6 +76,7 @@ pub mod bookings;
 pub mod calendar;
 pub mod checkins;
 pub mod customers;
+pub mod downloads;
 pub mod events;
 pub mod guest_documents;
 pub mod health;

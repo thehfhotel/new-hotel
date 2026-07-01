@@ -250,6 +250,9 @@ services:
       # and the client falls back to uploading the raw face photo — no 5xx.
       - THAI_ID_TEMPLATE_PATH=${THAI_ID_TEMPLATE_PATH:-/run/assets/thai_id_template.png}
       - THAI_ID_FONT_PATH=${THAI_ID_FONT_PATH:-/usr/share/fonts/truetype/tlwg/Loma-Bold.ttf}
+      # Dir holding the card-reader middleware installers, served by
+      # /api/downloads/middleware/{platform}. Bind-mounted read-only below.
+      - MIDDLEWARE_ASSETS_DIR=${MIDDLEWARE_ASSETS_DIR:-/run/assets/middleware}
     secrets:
       - db_password
       - postgres_password
@@ -261,6 +264,11 @@ services:
       # {success:false} (see THAI_ID_TEMPLATE_PATH above). Override the host path
       # via ASSETS_DIR (default /home/deploy/assets on evergreen).
       - ${ASSETS_DIR:-/home/deploy/assets}/thai_id_template.png:/run/assets/thai_id_template.png:ro
+      # Card-reader middleware installers (out-of-band host assets, NOT in git),
+      # served self-hosted by /api/downloads/middleware/{platform}. Absence just
+      # yields 404 from that endpoint. Populate ${ASSETS_DIR}/middleware/ on the
+      # host with the release .msi/.exe/.dmg.
+      - ${ASSETS_DIR:-/home/deploy/assets}/middleware:/run/assets/middleware:ro
     depends_on:
       newdb:
         condition: service_healthy
