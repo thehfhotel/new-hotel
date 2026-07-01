@@ -69,6 +69,36 @@ pub fn build_insert_sql(ttype: &str, cust_no: &str, cin_no: &str, tmp_no: &str) 
     )
 }
 
+/// iHOTEL's native Thai-ID card image is a **703×996 white portrait canvas**
+/// with the **446×273 landscape card composited at (121, 91)** — the exact shape
+/// its registration report (`ReportReg_1`) image box is built for. Our canonical
+/// render is the bare 446×273 card (correct for our own slip), so a raw mirror
+/// renders rotated/oversized in iHOTEL. Pad it onto the native canvas for the
+/// legacy mirror ONLY. Best-effort: on any decode/encode failure return the
+/// input unchanged (a wrong-sized mirror still beats no mirror). Verified against
+/// a live native row (id 23102): bbox (121,91)-(567,364) on a 703×996 canvas.
+fn pad_to_ihotel_card_canvas(png: &[u8]) -> Vec<u8> {
+    let Ok(dynimg) = image::load_from_memory(png) else {
+        return png.to_vec();
+    };
+    let mut card = dynimg.to_rgba8();
+    // iHOTEL's card slot is exactly 446×273; defend against an off-size render.
+    if card.dimensions() != (446, 273) {
+        card = image::imageops::resize(&card, 446, 273, image::imageops::FilterType::Lanczos3);
+    }
+    let mut canvas = image::RgbaImage::from_pixel(703, 996, image::Rgba([255, 255, 255, 255]));
+    image::imageops::overlay(&mut canvas, &card, 121, 91);
+    let mut out = Vec::new();
+    if image::DynamicImage::ImageRgba8(canvas)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .is_ok()
+    {
+        out
+    } else {
+        png.to_vec()
+    }
+}
+
 /// Execute the provisional-photo INSERT, binding `image` as a varbinary
 /// parameter. Returns an empty [`LegacyIds`] — `Tb_Save_Image.id` is IDENTITY;
 /// the ledger (keyed on the job's idempotency_key) guards the duplicate-on-retry
@@ -88,6 +118,16 @@ pub async fn execute(
     }
     let ttype = ttype_for_doc_type(doc_type)?;
 
+    // Thai-ID cards mirror in iHOTEL's native 703×996 canvas shape so its
+    // registration report renders them at the right size; our canonical copy
+    // stays the compact 446×273 card for our own slip. Other doc types pass
+    // through unchanged.
+    let mirror_bytes = if doc_type == "thai_id_card" {
+        pad_to_ihotel_card_canvas(image)
+    } else {
+        image.to_vec()
+    };
+
     // Committed vs provisional linkage. When the check-in is already known
     // (reprint "สแกนบัตร" on an existing stay) set cin_no directly so iHOTEL's
     // registration report (joins by cin_no) shows the photo, and CLEAR tmp_no so
@@ -102,7 +142,7 @@ pub async fn execute(
     // maps `&[u8]` to `ColumnData::Binary` (varbinary), so the blob round-trips
     // byte-exact. `conn` derefs to the tiberius `Client`.
     let mut query = tiberius::Query::new(sql);
-    query.bind(image);
+    query.bind(mirror_bytes.as_slice());
     query
         .execute(&mut **conn)
         .await
@@ -160,5 +200,22 @@ mod tests {
     fn tmp_no_quote_is_escaped() {
         let sql = build_insert_sql("รูปลูกค้า", "", "", "a'b");
         assert!(sql.contains("'a''b'"), "{sql}");
+    }
+
+    /// The Thai-ID pad puts our 446×273 card onto iHOTEL's 703×996 white canvas
+    /// at (121,91) — the shape ReportReg_1 expects.
+    #[test]
+    fn pad_places_card_on_703x996_canvas() {
+        let card = image::RgbaImage::from_pixel(446, 273, image::Rgba([10, 20, 30, 255]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(card)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let out = image::load_from_memory(&pad_to_ihotel_card_canvas(&png))
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(out.dimensions(), (703, 996));
+        assert_eq!(out.get_pixel(0, 0)[0], 255, "corner must be white canvas");
+        assert_eq!(out.get_pixel(200, 200)[0], 10, "(200,200) must be card");
     }
 }
