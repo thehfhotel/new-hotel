@@ -191,3 +191,8 @@ resvg = "0.44"
 usvg = "0.44"
 tiny-skia = "0.11"
 fontdb = "0.22"
+
+# Minimal PNG/JPEG decode+crop+encode for the guest-image sync-in: iHOTEL saves
+# the landscape Thai-ID card on a tall white canvas (703×996, card at the top),
+# so the sync worker trims the near-white border to just the card before storing.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

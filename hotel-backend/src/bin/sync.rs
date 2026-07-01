@@ -3956,6 +3956,51 @@ async fn sync_round_bills(pg: &PgPool, mssql: &DbPool, shadow_mode: bool, site_i
     }
 }
 
+/// Trim a near-white border from a mirrored ID-card image and return it as PNG.
+///
+/// iHOTEL saves the landscape Thai national-ID card on a tall white canvas
+/// (703×996 with the card at a fixed top rectangle, the rest white), so mirrored
+/// as-is the card prints as a tiny letterboxed sliver. Cropping to the bounding
+/// box of non-white pixels leaves just the card so the registration form renders
+/// it landscape at ~actual size.
+///
+/// Returns `None` (keep the original) when the image can't be decoded, is
+/// entirely white, or already spans the whole frame with no border to trim — so
+/// a non-bordered image (e.g. our own backend-rendered card) is left untouched.
+/// Never panics.
+fn trim_white_border(bytes: &[u8]) -> Option<Vec<u8>> {
+    let rgba = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let (w, h) = (rgba.width(), rgba.height());
+    let near_white = |p: &image::Rgba<u8>| p[0] >= 245 && p[1] >= 245 && p[2] >= 245;
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (w, h, 0u32, 0u32);
+    let mut found = false;
+    for y in 0..h {
+        for x in 0..w {
+            if !near_white(rgba.get_pixel(x, y)) {
+                found = true;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    if !found {
+        return None; // entirely white — nothing to keep
+    }
+    if min_x == 0 && min_y == 0 && max_x == w - 1 && max_y == h - 1 {
+        return None; // content already fills the frame — no border to trim
+    }
+    let cropped =
+        image::imageops::crop_imm(&rgba, min_x, min_y, max_x - min_x + 1, max_y - min_y + 1)
+            .to_image();
+    let mut out = Vec::new();
+    image::DynamicImage::ImageRgba8(cropped)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .ok()?;
+    Some(out)
+}
+
 /// Guest-image sync-IN — read-only per-tick poll of the legacy `Tb_Save_Image`
 /// blobs into canonical `ht_guest_documents` (`doc_source='legacy'`).
 ///
@@ -4165,18 +4210,28 @@ async fn sync_guest_documents(pg: &PgPool, mssql: &DbPool, shadow_mode: bool, si
             );
             continue;
         };
-        // Detect mime from the blob magic bytes.
-        let mime = if image.len() >= 4
-            && image[0] == 0x89
-            && image[1] == b'P'
-            && image[2] == b'N'
-            && image[3] == b'G'
-        {
-            "image/png"
-        } else if image.len() >= 2 && image[0] == 0xFF && image[1] == 0xD8 {
-            "image/jpeg"
-        } else {
-            "image/jpeg"
+        // iHOTEL saves the landscape Thai-ID card on a tall white canvas
+        // (703×996, card at the top + white padding); trim the near-white border
+        // so ht_guest_documents holds just the card and the registration form
+        // prints it landscape at ~actual size. A non-bordered image (e.g. our own
+        // rendered card) trims to None and is stored unchanged.
+        let (stored, mime): (std::borrow::Cow<[u8]>, &str) = match trim_white_border(image) {
+            Some(cropped) => (std::borrow::Cow::Owned(cropped), "image/png"),
+            None => {
+                let m = if image.len() >= 4
+                    && image[0] == 0x89
+                    && image[1] == b'P'
+                    && image[2] == b'N'
+                    && image[3] == b'G'
+                {
+                    "image/png"
+                } else if image.len() >= 2 && image[0] == 0xFF && image[1] == 0xD8 {
+                    "image/jpeg"
+                } else {
+                    "image/jpeg"
+                };
+                (std::borrow::Cow::Borrowed(image.as_slice()), m)
+            }
         };
         let Some((cin_id, cust_id)) = by_cin_no.get(cin_no).copied() else {
             continue;
@@ -4201,7 +4256,7 @@ async fn sync_guest_documents(pg: &PgPool, mssql: &DbPool, shadow_mode: bool, si
         .bind(cin_id)
         .bind(doc_type)
         .bind(mime)
-        .bind(image)
+        .bind(stored.as_ref())
         .bind(legacy_id)
         .execute(pg)
         .await;
