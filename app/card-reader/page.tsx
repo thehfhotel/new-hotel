@@ -279,14 +279,14 @@ export default function CardReaderPage() {
                 {/* Download Buttons */}
                 <div className="flex flex-wrap gap-3 mb-4">
                   <a
-                    href="https://github.com/nutphi/new-hotel/releases/download/middleware-v1.0.0/thai-id-middleware-1.0.0-win.exe"
+                    href="https://github.com/thehfhotel/new-hotel/releases/download/middleware-v1.0.1/Thai.ID.Middleware_1.0.1_x64_en-US.msi"
                     className="inline-flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg transition-colors"
                   >
                     <Download size={20} />
-                    Windows (.exe)
+                    Windows (.msi)
                   </a>
                   <a
-                    href="https://github.com/nutphi/new-hotel/releases/download/middleware-v1.0.0/thai-id-middleware-1.0.0-mac.dmg"
+                    href="https://github.com/thehfhotel/new-hotel/releases/download/middleware-v1.0.1/Thai.ID.Middleware_1.0.1_universal.dmg"
                     className="inline-flex items-center gap-2 bg-gray-600 hover:bg-gray-700 text-white px-4 py-2 rounded-lg transition-colors"
                   >
                     <Download size={20} />
@@ -297,7 +297,7 @@ export default function CardReaderPage() {
                 <div className="bg-yellow-100 rounded p-3 text-sm text-yellow-800">
                   <p className="mb-2 font-mono"># วิธีติดตั้ง</p>
                   <div className="space-y-2">
-                    <p><strong>Windows:</strong> ดาวน์โหลดและดับเบิ้ลคลิกไฟล์ .exe</p>
+                    <p><strong>Windows:</strong> ดาวน์โหลดและดับเบิ้ลคลิกไฟล์ .msi (ตัวติดตั้งจะถอนรุ่นเก่าออกให้อัตโนมัติ)</p>
                     <div>
                       <p><strong>macOS:</strong> เปิดไฟล์ .dmg แล้วลากไปที่ Applications</p>
                       <div className="ml-4 mt-1 text-xs text-yellow-700 bg-yellow-50 rounded p-2">
