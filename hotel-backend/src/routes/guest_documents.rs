@@ -432,8 +432,13 @@ pub async fn render_thai_id_card(
     };
 
     // Store canonically — same columns as create_guest_document, fixed for a
-    // rendered card. Provisional Tb_Save_Image.tmp_no minted the same way.
+    // rendered card. Provisional Tb_Save_Image.tmp_no minted the same way. In a
+    // tx so the legacy-mirror enqueue commits atomically with the doc insert.
     let tmp_no = Uuid::new_v4().simple().to_string();
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to open tx: {e}")))?;
     let row = sqlx::query(
         "INSERT INTO ht_guest_documents ( \
              doc_cust_id, doc_cin_id, doc_type, doc_mime, doc_image, doc_source, \
@@ -448,12 +453,57 @@ pub async fn render_thai_id_card(
     .bind(&png)
     .bind("chip")
     .bind(&tmp_no)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| ApiError::Internal(format!("failed to store rendered card: {e}")))?;
     let doc_id: i32 = row
         .try_get("doc_id")
         .map_err(|e| ApiError::Internal(format!("doc_id missing after insert: {e}")))?;
+
+    // Legacy mirror — SHIPPED DARK behind GUEST_DOCUMENT_STORAGE_ENABLED. The
+    // rendered-card (Thai-ID chip) path MUST enqueue the Tb_Save_Image mirror
+    // exactly like create_guest_document (the passport-upload path); without
+    // this a chip scan stored the card canonically but never reached iHOTEL.
+    if crate::config::guest_document_storage_enabled() {
+        let cust_legacy_no: Option<String> = match body.cust_id {
+            Some(id) => sqlx::query_scalar(
+                "SELECT NULLIF(legacy_cust_no, '') FROM ht_customers WHERE cust_id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| ApiError::Internal(format!("failed to resolve legacy cust_no: {e}")))?
+            .flatten(),
+            None => None,
+        };
+        let cin_legacy_no: Option<String> = match body.cin_id {
+            Some(id) => sqlx::query_scalar(
+                "SELECT NULLIF(legacy_cin_no, '') FROM ht_checkins WHERE cin_id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| ApiError::Internal(format!("failed to resolve legacy cin_no: {e}")))?
+            .flatten(),
+            None => None,
+        };
+
+        let intent = WritebackIntent::MirrorGuestImage {
+            doc_id: doc_id as i64,
+            doc_type: "thai_id_card".to_string(),
+            cust_legacy_no,
+            cin_legacy_no,
+            tmp_no: tmp_no.clone(),
+        };
+        let key = generate_idempotency_key(&intent, Uuid::new_v4());
+        OutboxRepository::enqueue(&mut tx, &intent, key)
+            .await
+            .map_err(|e| ApiError::Internal(format!("failed to enqueue image writeback: {e}")))?;
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to commit rendered card: {e}")))?;
 
     Ok(Json(json!({
         "success": true,
