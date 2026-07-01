@@ -220,18 +220,6 @@ export default function RegistrationSlipTemplate({
             eng="IDENTITY CARD / PASSPORT NO."
             value={data.guestIdCard}
           />
-          {data.guestPhotoUrl && (
-            <div className="flex items-center gap-2">
-              <span className="text-[9px] text-gray-500 whitespace-nowrap">
-                รูปบัตร/พาสปอร์ต ID/PASSPORT PHOTO
-              </span>
-              <img
-                src={data.guestPhotoUrl}
-                alt="ID / Passport"
-                className="h-24 w-auto border border-gray-500 object-contain"
-              />
-            </div>
-          )}
           <div className="grid grid-cols-2 gap-4">
             <Field thai="วันที่ออกบัตร" eng="DATE OF ISSUE" />
             <Field thai="สถานที่ออกบัตร" eng="PLACE OF ISSUE" />
@@ -323,6 +311,26 @@ export default function RegistrationSlipTemplate({
             <div className="text-[9px] text-gray-500">GUEST SIGNATURE</div>
           </div>
         </div>
+
+        {/* Guest ID / passport image, printed at near-actual card size (ISO/IEC
+            7810 ID-1 = 85.6 × 54 mm) in the lower area of the form — the Thai-ID
+            card (from the legacy Tb_Save_Image mirror or our backend renderer) or
+            a scanned passport page. Same-origin src; the portal's print CSS keeps
+            it visible; only renders when an image exists (no layout shift). */}
+        {data.guestPhotoUrl && (
+          <div className="mt-8">
+            <div className="text-[10px] text-gray-600 mb-1">
+              รูปบัตรประชาชน / หนังสือเดินทาง{' '}
+              <span className="text-gray-400">ID / PASSPORT</span>
+            </div>
+            <img
+              src={data.guestPhotoUrl}
+              alt="ID / Passport card"
+              style={{ width: '85.6mm', height: 'auto', maxHeight: '58mm' }}
+              className="border border-gray-400 object-contain"
+            />
+          </div>
+        )}
       </div>
     </div>,
     document.body,
