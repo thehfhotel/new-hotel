@@ -201,6 +201,13 @@ pub fn verify_token(
     validation.set_issuer(&[issuer]);
     validation.set_audience(&[audience]);
     validation.validate_nbf = true;
+    // Defense-in-depth vs GHSA-h395-gr6q-cpjc (jsonwebtoken type
+    // confusion: a WRONG-TYPED exp/nbf parses as "not present" and a
+    // non-required claim then skips its check entirely — fixed in
+    // 10.3.0, which we pin, but requiring the claims keeps the bypass
+    // closed even if the crate regresses). CF Access tokens always
+    // carry exp + nbf, so requiring them costs nothing.
+    validation.set_required_spec_claims(&["exp", "nbf", "iss", "aud"]);
 
     // Prefer the key whose kid matches the token header; fall back to
     // trying every RSA key in the set (CF keeps the outgoing key in the
