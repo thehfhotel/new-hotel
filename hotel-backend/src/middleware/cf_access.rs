@@ -76,6 +76,55 @@ pub fn expected_aud() -> String {
     }
 }
 
+/// Resolve a VERIFIED email through the alias spec: `from1=to1,from2=to2`,
+/// case-insensitive on the `from` side. Returns `None` when no alias
+/// matches (caller keeps the original email). Malformed entries (no `=`,
+/// empty side, blank segment) are silently skipped — a typo in one alias
+/// must not break the others or the passthrough path.
+///
+/// Applied AFTER JWT verification and BEFORE the `ht_users.email`
+/// lookup, so it only ever REMAPS an identity Cloudflare already proved
+/// — it can never mint a session for an unverified address. Exists
+/// because a person can legitimately hold several Google identities at
+/// the CF Access edge (live verification 2026-07-02: the owner signs in
+/// alternately as nut.winut@gmail.com and winut.hf@gmail.com) while
+/// `ht_users.email` stores exactly one canonical mailbox per user.
+pub fn resolve_email_alias(email: &str, spec: &str) -> Option<String> {
+    for entry in spec.split(',') {
+        let Some((from, to)) = entry.split_once('=') else {
+            continue; // malformed: no '=' — skip
+        };
+        let (from, to) = (from.trim(), to.trim());
+        if from.is_empty() || to.is_empty() {
+            continue; // malformed: empty side — skip
+        }
+        if from.eq_ignore_ascii_case(email) {
+            return Some(to.to_string());
+        }
+    }
+    None
+}
+
+/// Env-configured alias application: reads `CF_EMAIL_ALIASES`
+/// (`from1=to1,from2=to2`) and remaps `email` when an alias matches,
+/// else returns it unchanged. Unset/empty env = pure passthrough.
+pub fn apply_email_aliases(email: &str) -> String {
+    match std::env::var("CF_EMAIL_ALIASES") {
+        Ok(spec) => match resolve_email_alias(email, &spec) {
+            Some(mapped) => {
+                tracing::info!(
+                    from = %email,
+                    to = %mapped,
+                    "cf_access: applied CF_EMAIL_ALIASES mapping"
+                );
+                mapped
+            }
+            None => email.to_string(),
+        },
+        Err(_) => email.to_string(),
+    }
+}
+
 /// Errors from the CF Access verification path. Coarse on purpose — the
 /// route maps everything except `NoEmail`/`Invalid` details to a single
 /// 401 wire code; the detail lands in logs only.
@@ -480,6 +529,43 @@ qHreiO5t7e6J+dsQVkE3dg==
         let err = verify_token(&token, &empty, TEST_ISS, TEST_AUD)
             .expect_err("no-RSA JWKS must fail closed");
         assert!(matches!(err, CfAccessError::Jwks(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn email_alias_hit_is_case_insensitive_on_from_side() {
+        let spec = "nut.winut@gmail.com=winut.hf@gmail.com,other@x.com=y@x.com";
+        assert_eq!(
+            resolve_email_alias("Nut.Winut@GMAIL.com", spec).as_deref(),
+            Some("winut.hf@gmail.com"),
+        );
+        // Second entry resolves too.
+        assert_eq!(
+            resolve_email_alias("other@x.com", spec).as_deref(),
+            Some("y@x.com"),
+        );
+    }
+
+    #[test]
+    fn email_alias_miss_is_passthrough() {
+        let spec = "nut.winut@gmail.com=winut.hf@gmail.com";
+        assert_eq!(resolve_email_alias("winai.sdy@gmail.com", spec), None);
+        // Empty spec never matches.
+        assert_eq!(resolve_email_alias("anyone@x.com", ""), None);
+        // The TO side must not be treated as a FROM key (no reverse map).
+        assert_eq!(resolve_email_alias("winut.hf@gmail.com", spec), None);
+    }
+
+    #[test]
+    fn email_alias_ignores_malformed_entries() {
+        // Garbage segments (no '=', empty sides, blank) are skipped
+        // without breaking the valid entry around them.
+        let spec = "garbage, =nowhere,orphan=, ,nut.winut@gmail.com = winut.hf@gmail.com ,";
+        assert_eq!(
+            resolve_email_alias("nut.winut@gmail.com", spec).as_deref(),
+            Some("winut.hf@gmail.com"),
+        );
+        assert_eq!(resolve_email_alias("garbage", spec), None);
+        assert_eq!(resolve_email_alias("orphan", spec), None);
     }
 
     #[test]

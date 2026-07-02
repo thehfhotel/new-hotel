@@ -192,6 +192,14 @@ services:
       # (a public identifier) if the CF application is ever recreated.
       - CF_AUTO_LOGIN=${CF_AUTO_LOGIN:-true}
       - CF_ACCESS_AUD=${CF_ACCESS_AUD:-}
+      # Alias map for multi-identity users: `from1=to1,from2=to2`,
+      # case-insensitive on the `from` side, applied AFTER the CF JWT is
+      # verified and BEFORE the ht_users.email lookup (it can only remap
+      # an identity Cloudflare already proved). Default covers the owner's
+      # second Google account (live verification 2026-07-02: signs in
+      # alternately as nut.winut@gmail.com and winut.hf@gmail.com). Not a
+      # secret — plain emails. Malformed entries are ignored.
+      - CF_EMAIL_ALIASES=${CF_EMAIL_ALIASES:-nut.winut@gmail.com=winut.hf@gmail.com}
       # Round-bill writeback (Track J6). Defaults to `false` so iHOTEL stays
       # the sole opener of cashier rounds (`HT_Round_Bill`); our app only
       # MIRRORS rounds in via the read-only `sync_round_bills` poll. When

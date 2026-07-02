@@ -385,6 +385,13 @@ pub async fn cf_login(
         }
     };
 
+    // Alias step (CF_EMAIL_ALIASES): a person may hold several Google
+    // identities at the CF Access edge while ht_users.email stores one
+    // canonical mailbox per user. Applied AFTER verification (the JWT
+    // proved the `from` identity) and BEFORE the lookup; passthrough
+    // when no alias matches / env unset.
+    let email = crate::middleware::cf_access::apply_email_aliases(&email);
+
     let ip = client_ip(&headers);
     let user_agent = client_user_agent(&headers);
 
