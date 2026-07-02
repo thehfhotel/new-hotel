@@ -199,7 +199,7 @@ services:
       # second Google account (live verification 2026-07-02: signs in
       # alternately as nut.winut@gmail.com and winut.hf@gmail.com). Not a
       # secret — plain emails. Malformed entries are ignored.
-      - CF_EMAIL_ALIASES=${CF_EMAIL_ALIASES:-nut.winut@gmail.com=winut.hf@gmail.com}
+      - CF_EMAIL_ALIASES=${CF_EMAIL_ALIASES:-nut.winut@gmail.com=winut.hf@gmail.com,pahntaylor.december@gmail.com=treejutar.1659@gmail.com,winai_scm@msn.com=winai.sdy@gmail.com}
       # Round-bill writeback (Track J6). Defaults to `false` so iHOTEL stays
       # the sole opener of cashier rounds (`HT_Round_Bill`); our app only
       # MIRRORS rounds in via the read-only `sync_round_bills` poll. When
