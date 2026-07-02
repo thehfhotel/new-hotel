@@ -180,6 +180,18 @@ services:
       # Either way, `/api/auth/{login,logout,me}` and `/api/health`
       # remain public — that's how the frontend bootstraps.
       - AUTH_ENABLED=${AUTH_ENABLED:-false}
+      # Cloudflare Access auto-login (`POST /api/auth/cf-login`). Staff who
+      # already passed the CF Access edge check get an app session minted
+      # from the verified `Cf-Access-Jwt-Assertion` email claim (mapped via
+      # `ht_users.email`, migration 074) — no second password login.
+      # STRICTLY ADDITIVE: password login is untouched and remains the
+      # fallback for unmapped users. Default ON (read-only against PG; no
+      # legacy write, so no ship-dark treatment needed). Kill-switch:
+      # set `CF_AUTO_LOGIN=false` (route answers 404) + redeploy/restart.
+      # `CF_ACCESS_AUD` overrides the baked-in Access-application AUD tag
+      # (a public identifier) if the CF application is ever recreated.
+      - CF_AUTO_LOGIN=${CF_AUTO_LOGIN:-true}
+      - CF_ACCESS_AUD=${CF_ACCESS_AUD:-}
       # Round-bill writeback (Track J6). Defaults to `false` so iHOTEL stays
       # the sole opener of cashier rounds (`HT_Round_Bill`); our app only
       # MIRRORS rounds in via the read-only `sync_round_bills` poll. When

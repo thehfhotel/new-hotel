@@ -30,6 +30,18 @@ pub trait UserRepository: Send + Sync {
         username: &str,
     ) -> Result<Option<User>, sqlx::Error>;
 
+    /// Look up a user by their Cloudflare-Access email mapping key
+    /// (migration 074). Matching is case-insensitive (`lower(email)`),
+    /// mirroring the partial unique index `ux_ht_users_email_lower`.
+    /// Returns `None` for missing rows AND for users with NULL email —
+    /// callers map both to `AuthError::InvalidCredentials` so the
+    /// cf-login route can answer 401 without distinguishing the cases.
+    async fn get_by_email(
+        &self,
+        pool: &PgPool,
+        email: &str,
+    ) -> Result<Option<User>, sqlx::Error>;
+
     /// Look up a user by id. Used by `validate_session` to re-confirm
     /// the user is still active for every cookie-bound request.
     async fn get_by_id(
@@ -186,12 +198,32 @@ impl UserRepository for PgUserRepository {
         let row = sqlx::query(
             r#"
             SELECT user_id, username, password_hash, role, active,
-                   created_at, last_login_at
+                   created_at, last_login_at, email
             FROM ht_users
             WHERE username = $1
             "#,
         )
         .bind(username)
+        .fetch_optional(pool)
+        .await?;
+
+        row.map(map_user_row).transpose()
+    }
+
+    async fn get_by_email(
+        &self,
+        pool: &PgPool,
+        email: &str,
+    ) -> Result<Option<User>, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+            SELECT user_id, username, password_hash, role, active,
+                   created_at, last_login_at, email
+            FROM ht_users
+            WHERE email IS NOT NULL AND LOWER(email) = LOWER($1)
+            "#,
+        )
+        .bind(email)
         .fetch_optional(pool)
         .await?;
 
@@ -206,7 +238,7 @@ impl UserRepository for PgUserRepository {
         let row = sqlx::query(
             r#"
             SELECT user_id, username, password_hash, role, active,
-                   created_at, last_login_at
+                   created_at, last_login_at, email
             FROM ht_users
             WHERE user_id = $1
             "#,
@@ -264,7 +296,7 @@ impl UserRepository for PgUserRepository {
         let rows = sqlx::query(
             r#"
             SELECT user_id, username, password_hash, role, active,
-                   created_at, last_login_at
+                   created_at, last_login_at, email
             FROM ht_users
             ORDER BY username ASC
             "#,
@@ -349,5 +381,6 @@ fn map_user_row(row: sqlx::postgres::PgRow) -> Result<User, sqlx::Error> {
         active: row.try_get("active")?,
         created_at: row.try_get::<NaiveDateTime, _>("created_at")?,
         last_login_at: row.try_get::<Option<NaiveDateTime>, _>("last_login_at")?,
+        email: row.try_get::<Option<String>, _>("email")?,
     })
 }

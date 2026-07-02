@@ -46,6 +46,7 @@ mod actor_tests {
                 .and_hms_opt(0, 0, 0)
                 .unwrap(),
             last_login_at: None,
+            email: None,
         }
     }
 

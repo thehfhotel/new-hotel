@@ -1464,8 +1464,17 @@ CREATE TABLE IF NOT EXISTS ht_users (
     active         BOOLEAN      NOT NULL DEFAULT TRUE,
     created_at     TIMESTAMP    NOT NULL DEFAULT NOW(),
     last_login_at  TIMESTAMP,
-    display_name   VARCHAR(128)
+    display_name   VARCHAR(128),
+    -- Migration 074 (Cloudflare Access auto-login) — optional alternate
+    -- lookup key mapping a verified CF Access `email` claim to this row.
+    -- NULL = password-only user. Case-insensitive uniqueness enforced by
+    -- ux_ht_users_email_lower below.
+    email          VARCHAR(255)
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ht_users_email_lower
+    ON ht_users (LOWER(email))
+    WHERE email IS NOT NULL;
 
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('027', '027_create_ht_users.sql', 'init-script')
@@ -2503,6 +2512,15 @@ ON CONFLICT (version) DO NOTHING;
 -- seed row records the migration as applied so the drift check sees zero pending.
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('073', '073_writeback_test_form.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 074 — ht_users.email (Cloudflare Access auto-login lookup key).
+-- Column + partial functional UNIQUE index inlined into the ht_users block
+-- above; the backfill UPDATEs are production-data-only (the usernames don't
+-- exist in fresh seeds). This seed row records the migration as applied so
+-- the drift check sees zero pending.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('074', '074_ht_users_email.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================

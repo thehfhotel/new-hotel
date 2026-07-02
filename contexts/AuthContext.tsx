@@ -165,6 +165,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
+  /**
+   * One-shot guard for the Cloudflare Access auto-login attempt. The
+   * site sits behind CF Access, so an unauthenticated /api/auth/me can
+   * often be healed silently: POST /api/auth/cf-login lets the backend
+   * verify the CF edge JWT and mint a session for the mapped user. We
+   * try at most once per mount — a 401/404 from cf-login (no mapping,
+   * kill-switch off, token missing) means "use the password form", and
+   * retrying on every refresh would just spam the backend.
+   */
+  const cfLoginAttempted = useRef(false)
+
   const refresh = useCallback(async () => {
     try {
       const data = await apiFetch<MeResponse>('/api/auth/me')
@@ -174,6 +185,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     } catch (err) {
       // 401 simply means "no session" (or auth disabled) — not a UI error.
       if (err instanceof ApiError && err.status === 401) {
+        // Before concluding "logged out", attempt Cloudflare Access
+        // auto-login once. Any failure falls through to the normal
+        // logged-out state (password form) without surfacing an error.
+        if (!cfLoginAttempted.current) {
+          cfLoginAttempted.current = true
+          try {
+            await apiFetch('/api/auth/cf-login', { method: 'POST' })
+            const me = await apiFetch<MeResponse>('/api/auth/me')
+            setUser(me?.user ?? null)
+            setPermissions(me?.permissions ?? [])
+            setError(null)
+            return
+          } catch {
+            // cf-login unavailable / email not mapped — silent fallback.
+          }
+        }
         setUser(null)
         setPermissions([])
         setError(null)

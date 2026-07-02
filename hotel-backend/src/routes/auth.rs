@@ -307,9 +307,162 @@ pub async fn me(
     }
 }
 
+/// `POST /api/auth/cf-login` — Cloudflare Access auto-login.
+///
+/// The deployment sits behind Cloudflare Access, so every request that
+/// reaches us already passed the CF identity check and carries a signed
+/// RS256 assertion (`Cf-Access-Jwt-Assertion` header, `CF_Authorization`
+/// cookie fallback). This endpoint verifies that assertion
+/// (`middleware::cf_access`), maps the verified `email` claim to a
+/// `ht_users` row (`AuthService::login_via_email` → migration 074's
+/// `email` column), and mints a session through the EXACT same
+/// `create_and_touch_login` + `build_session_cookie` path as password
+/// [`login`] — the resulting session is indistinguishable.
+///
+/// STRICTLY ADDITIVE: password login is untouched and remains the
+/// fallback for users without an email mapping.
+///
+/// Responses:
+/// * 200 + [`LoginResponse`] + `Set-Cookie: session=…` — auto-login OK
+///   (or an already-valid session existed; idempotent, no new session).
+/// * 401 `{"error":"cf_token_missing"}` — no CF assertion on the request.
+/// * 401 `{"error":"cf_token_invalid"}` — assertion failed verification.
+/// * 401 `{"error":"cf_email_not_mapped"}` — verified email matches no
+///   active local user (frontend silently falls back to the password
+///   form). Deactivated users collapse into this code too.
+/// * 404 `{"error":"cf_login_disabled"}` — kill-switch `CF_AUTO_LOGIN`
+///   is off (`false`/`0`; default ON).
+pub async fn cf_login(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> Result<(CookieJar, Json<LoginResponse>), (StatusCode, Json<ErrorResponse>)> {
+    if !cf_auto_login_enabled() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new("cf_login_disabled")),
+        ));
+    }
+
+    // Idempotency: a valid app session already exists → return it as-is
+    // (no fresh session row, no Set-Cookie). Keeps a re-fired cf-login
+    // from stacking ht_sessions rows on every page load.
+    if let Some(token) = jar.get(SESSION_COOKIE_NAME).map(|c| c.value().to_string()) {
+        if let Ok(Some((user, _session))) = state
+            .auth_service
+            .validate_session(&state.new_pool, &token)
+            .await
+        {
+            let permissions = permissions_or_empty(&state, user.user_id, "auth/cf-login").await;
+            return Ok((
+                jar,
+                Json(LoginResponse {
+                    user: user.into(),
+                    permissions,
+                }),
+            ));
+        }
+        // Invalid/expired cookie — fall through and mint a fresh session
+        // from the CF assertion (same as having no cookie at all).
+    }
+
+    let cf_token = crate::middleware::cf_access::extract_token(&headers, &jar).ok_or((
+        StatusCode::UNAUTHORIZED,
+        Json(ErrorResponse::new("cf_token_missing")),
+    ))?;
+
+    let email = match crate::middleware::cf_access::verify_cf_access_token(&cf_token).await {
+        Ok(email) => email,
+        Err(err) => {
+            // Verification detail goes to logs only — the wire gets a
+            // stable machine code the frontend treats as "fall back to
+            // the password form".
+            tracing::warn!(error = %err, "auth/cf-login: CF Access token rejected");
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse::new("cf_token_invalid")),
+            ));
+        }
+    };
+
+    let ip = client_ip(&headers);
+    let user_agent = client_user_agent(&headers);
+
+    let result = state
+        .auth_service
+        .login_via_email(&state.new_pool, &email, ip.as_deref(), user_agent.as_deref())
+        .await;
+
+    let (user, session) = match result {
+        Ok(pair) => pair,
+        // Unknown email AND deactivated account share one wire code —
+        // both mean "no auto-login for you, use the password form".
+        Err(AuthError::InvalidCredentials) | Err(AuthError::UserDeactivated) => {
+            tracing::info!("auth/cf-login: verified CF email has no active local mapping");
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse::new("cf_email_not_mapped")),
+            ));
+        }
+        Err(AuthError::Db(err)) => {
+            tracing::error!(error = %err, "auth/cf-login: database error");
+            return Err(internal_error());
+        }
+        Err(other) => {
+            tracing::error!(error = %other, "auth/cf-login: unexpected service error");
+            return Err(internal_error());
+        }
+    };
+
+    let secure = is_https_request(&headers);
+    let cookie = build_session_cookie(session.id, secure);
+    let permissions = permissions_or_empty(&state, user.user_id, "auth/cf-login").await;
+
+    Ok((
+        jar.add(cookie),
+        Json(LoginResponse {
+            user: user.into(),
+            permissions,
+        }),
+    ))
+}
+
 // =============================================================================
 // Helpers
 // =============================================================================
+
+/// Kill-switch for the Cloudflare Access auto-login route. DEFAULT ON —
+/// explicitly set `CF_AUTO_LOGIN=false` (or `0`) to make
+/// `POST /api/auth/cf-login` answer 404 without touching anything else.
+/// (Opposite default polarity from the ship-dark writeback flags on
+/// purpose: this endpoint only READS the shared world — it never writes
+/// legacy — so on-by-default is safe and is the entire point of the
+/// feature.)
+fn cf_auto_login_enabled() -> bool {
+    match std::env::var("CF_AUTO_LOGIN") {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            !(normalized == "false" || normalized == "0")
+        }
+        Err(_) => true,
+    }
+}
+
+/// Permission lookup that degrades to an empty list (Track G7 pattern
+/// shared by [`login`] / [`me`] / [`cf_login`]) — a transient
+/// permission-table failure should under-grant, not 500.
+async fn permissions_or_empty(state: &AppState, user_id: i64, ctx: &'static str) -> Vec<String> {
+    crate::middleware::permissions_for_user(&state.new_pool, user_id)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(
+                error = %err,
+                user_id,
+                "{ctx}: permission lookup failed, returning empty list"
+            );
+            Vec::new()
+        })
+}
 
 /// Build the session cookie for a freshly minted session.
 ///
@@ -464,6 +617,7 @@ mod tests {
                     .and_hms_opt(19, 45, 0)
                     .unwrap(),
             ),
+            email: None,
         }
     }
 

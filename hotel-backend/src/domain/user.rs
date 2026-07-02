@@ -27,6 +27,13 @@ pub struct User {
     pub active: bool,
     pub created_at: NaiveDateTime,
     pub last_login_at: Option<NaiveDateTime>,
+    /// Optional Cloudflare-Access mapping key (migration 074). When set,
+    /// a verified `email` claim from the CF Access JWT resolves to this
+    /// user via `UserRepository::get_by_email` (case-insensitive) so
+    /// `POST /api/auth/cf-login` can mint a session without a password.
+    /// `None` = password-only user. NEVER a credential — no auth
+    /// decision is made from the email alone; the CF JWT signature is.
+    pub email: Option<String>,
 }
 
 /// Role assigned to a [`User`].

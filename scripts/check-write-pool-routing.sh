@@ -73,6 +73,9 @@ is_allowlisted() {
         # per-site. login/logout are not branch-routed.
         auth::login) return 0 ;;
         auth::logout) return 0 ;;
+        # (A) Cloudflare Access auto-login — same global users+sessions
+        # store as auth::login; sessions are never per-site.
+        auth::cf_login) return 0 ;;
         # (A) Legacy `/api/bookings/by-number/{book_no}/notes` path — HF-Hotel-
         # only legacy booking-notes surface; the by-number lookups read new_pool
         # and there is no Ville variant of this path. TODO(ville-bundle).

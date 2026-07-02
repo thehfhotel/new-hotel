@@ -8,8 +8,12 @@
 //!   (Phase 7 audit M-2).
 //! * `permissions` — role/permission grid layered on top of `auth`
 //!   for Track G features (refunds, room change, round-bill, etc.).
+//! * `cf_access` — Cloudflare Access JWT verification (JWKS + RS256)
+//!   backing the `POST /api/auth/cf-login` auto-login route. Not a
+//!   tower layer — a verification helper the route calls.
 
 pub mod auth;
+pub mod cf_access;
 pub mod permissions;
 pub mod rate_limit;
 

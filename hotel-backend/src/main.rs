@@ -301,6 +301,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .route("/api/auth/logout", post(routes::auth::logout))
                 .route("/api/auth/me", get(routes::auth::me))
+                // Cloudflare Access auto-login: verifies the CF edge
+                // JWT (Cf-Access-Jwt-Assertion / CF_Authorization) and
+                // mints a normal cookie session for the mapped user —
+                // no second password login. NOT behind the login rate
+                // limiter (verification is a signature check, not a
+                // guessable credential); kill-switch CF_AUTO_LOGIN
+                // (default on) makes it answer 404 when disabled.
+                .route("/api/auth/cf-login", post(routes::auth::cf_login))
                 .with_state(state.clone())
         }
         None => Router::new(),

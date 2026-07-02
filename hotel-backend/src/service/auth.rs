@@ -204,6 +204,55 @@ impl<U: UserRepository, S: SessionRepository> AuthService<U, S> {
             return Err(AuthError::UserDeactivated);
         }
 
+        self.mint_session_for(pool, user, ip, user_agent).await
+    }
+
+    /// Authenticate a user by their verified Cloudflare Access email
+    /// claim and mint a fresh session (Cloudflare Access auto-login).
+    ///
+    /// The caller (routes::auth::cf_login) is responsible for having
+    /// VERIFIED the CF Access JWT first (`middleware::cf_access`) — this
+    /// method trusts `email` as an identity assertion and performs NO
+    /// password check. Session minting reuses the exact same
+    /// `create_and_touch_login` path as password [`Self::login`], so the
+    /// resulting session is indistinguishable from a password one.
+    ///
+    /// Failure modes:
+    /// * No user carries this email → `AuthError::InvalidCredentials`
+    ///   (the route maps this to 401 so the frontend silently falls
+    ///   back to the password form)
+    /// * Mapped user is deactivated → `AuthError::UserDeactivated`
+    /// * sqlx failure → `AuthError::Db`
+    pub async fn login_via_email(
+        &self,
+        pool: &PgPool,
+        email: &str,
+        ip: Option<&str>,
+        user_agent: Option<&str>,
+    ) -> Result<(User, Session), AuthError> {
+        let user = self.users.get_by_email(pool, email).await?;
+        let user = match user {
+            Some(u) => u,
+            None => return Err(AuthError::InvalidCredentials),
+        };
+
+        if !user.active {
+            return Err(AuthError::UserDeactivated);
+        }
+
+        self.mint_session_for(pool, user, ip, user_agent).await
+    }
+
+    /// Shared session-mint tail used by [`Self::login`] (password) and
+    /// [`Self::login_via_email`] (Cloudflare Access). Assumes the caller
+    /// has already authenticated the user AND checked `active`.
+    async fn mint_session_for(
+        &self,
+        pool: &PgPool,
+        user: User,
+        ip: Option<&str>,
+        user_agent: Option<&str>,
+    ) -> Result<(User, Session), AuthError> {
         let now = Utc::now().naive_utc();
         let expires_at = now + self.session_ttl;
         let session_id = generate_session_id();
@@ -454,6 +503,27 @@ mod tests {
                 .cloned())
         }
 
+        async fn get_by_email(
+            &self,
+            _pool: &PgPool,
+            email: &str,
+        ) -> Result<Option<User>, sqlx::Error> {
+            // Case-insensitive, NULL-email rows never match — mirrors
+            // the PG impl's `email IS NOT NULL AND LOWER(email) = LOWER($1)`.
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .values()
+                .find(|u| {
+                    u.email
+                        .as_deref()
+                        .map(|e| e.eq_ignore_ascii_case(email))
+                        .unwrap_or(false)
+                })
+                .cloned())
+        }
+
         async fn get_by_id(
             &self,
             _pool: &PgPool,
@@ -483,6 +553,7 @@ mod tests {
                     active: true,
                     created_at: chrono::Utc::now().naive_utc(),
                     last_login_at: None,
+                    email: None,
                 },
             );
             Ok(id)
@@ -608,6 +679,7 @@ mod tests {
                     active: true,
                     created_at: chrono::Utc::now().naive_utc(),
                     last_login_at: None,
+                    email: None,
                 },
             );
             Ok(id)
@@ -803,6 +875,7 @@ mod tests {
                 .and_hms_opt(0, 0, 0)
                 .unwrap(),
             last_login_at: None,
+            email: None,
         }
     }
 
@@ -993,6 +1066,68 @@ mod tests {
         // logout requests as no-ops.
         let (svc, _users, _sessions) = build_service();
         svc.logout(&dummy_pool(), "no-such-session").await.unwrap();
+    }
+
+    // =========================================================================
+    // Cloudflare Access auto-login (login_via_email) tests.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn login_via_email_mints_session_for_mapped_active_user() {
+        let (svc, users, sessions) = build_service();
+        let mut user = fixed_user("winut", "hunter2");
+        user.email = Some("Winut.HF@gmail.com".to_string());
+        users.insert_direct(user);
+
+        // Lookup must be case-insensitive.
+        let (user, session) = svc
+            .login_via_email(&dummy_pool(), "winut.hf@GMAIL.com", Some("10.0.0.9"), Some("cf-ua"))
+            .await
+            .expect("mapped active user must auto-login");
+
+        assert_eq!(user.username, "winut");
+        assert!(user.last_login_at.is_some(), "last_login_at must be stamped");
+        assert_eq!(session.user_id, user.user_id);
+        assert_eq!(session.id.len(), 64, "same 64-hex token shape as password login");
+        assert_eq!(sessions.rows.lock().unwrap().len(), 1);
+        assert_eq!(*users.last_login_calls.lock().unwrap(), vec![user.user_id]);
+
+        // And the minted session validates through the normal path.
+        assert!(svc
+            .validate_session(&dummy_pool(), &session.id)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn login_via_email_rejects_unmapped_email() {
+        let (svc, users, sessions) = build_service();
+        // A user exists, but with NO email mapping — must not match.
+        users.insert_direct(fixed_user("alice", "hunter2"));
+
+        let err = svc
+            .login_via_email(&dummy_pool(), "stranger@example.com", None, None)
+            .await
+            .expect_err("unmapped email must be rejected");
+        assert!(matches!(err, AuthError::InvalidCredentials));
+        assert!(sessions.rows.lock().unwrap().is_empty(), "no session minted");
+    }
+
+    #[tokio::test]
+    async fn login_via_email_rejects_deactivated_user() {
+        let (svc, users, sessions) = build_service();
+        let mut user = fixed_user("winai", "hunter2");
+        user.email = Some("winai.sdy@gmail.com".to_string());
+        user.active = false;
+        users.insert_direct(user);
+
+        let err = svc
+            .login_via_email(&dummy_pool(), "winai.sdy@gmail.com", None, None)
+            .await
+            .expect_err("deactivated user must not auto-login");
+        assert!(matches!(err, AuthError::UserDeactivated));
+        assert!(sessions.rows.lock().unwrap().is_empty(), "no session minted");
     }
 
     // =========================================================================

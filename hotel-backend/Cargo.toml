@@ -151,6 +151,14 @@ futures-util = { version = "0.3", default-features = false }
 argon2 = "0.5"
 rpassword = "7"
 
+# Cloudflare Access auto-login (middleware/cf_access.rs) — RS256
+# VERIFICATION ONLY of the `Cf-Access-Jwt-Assertion` JWT against the team
+# JWKS (n/e components via `DecodingKey::from_rsa_components`; the `use_pem`
+# default feature additionally lets tests sign fixtures from a static PEM).
+# We never issue JWTs in production paths — sessions stay opaque ht_sessions
+# tokens. JWKS fetch rides the existing ureq dep (no reqwest, per policy).
+jsonwebtoken = "9"
+
 # Cookie extraction for the Phase 4 PR2 auth routes + middleware.
 # - axum-extra: `cookie` feature gives us `axum_extra::extract::cookie::CookieJar`,
 #   the canonical extractor + builder for `Cookie` request / `Set-Cookie`

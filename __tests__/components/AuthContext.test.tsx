@@ -83,6 +83,11 @@ describe('AuthContext', () => {
     fetchMock.mockResolvedValueOnce(
       makeFetchResponse(401, { error: 'unauthenticated' }),
     )
+    // CF Access auto-login attempt fires once on 401; reject it so the
+    // provider settles on the anonymous state.
+    fetchMock.mockResolvedValueOnce(
+      makeFetchResponse(401, { error: 'cf_email_not_mapped' }),
+    )
 
     render(
       <AuthProvider>
@@ -96,12 +101,55 @@ describe('AuthContext', () => {
 
     expect(screen.getByTestId('user')).toHaveTextContent('anon')
     expect(screen.getByTestId('error')).toHaveTextContent('no-error')
+    // The silent CF Access fallback must have been attempted exactly once.
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/auth/cf-login',
+      expect.objectContaining({ method: 'POST', credentials: 'include' }),
+    )
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  test('auto-logs-in via /api/auth/cf-login when CF Access maps the user', async () => {
+    // initial /me → 401 (no app session yet)
+    fetchMock.mockResolvedValueOnce(
+      makeFetchResponse(401, { error: 'unauthenticated' }),
+    )
+    // cf-login → 200 (backend verified the CF JWT and minted a session)
+    fetchMock.mockResolvedValueOnce(
+      makeFetchResponse(200, { user: SAMPLE_USER, permissions: [] }),
+    )
+    // re-fetched /me → 200 with the new session
+    fetchMock.mockResolvedValueOnce(
+      makeFetchResponse(200, { user: SAMPLE_USER, permissions: [] }),
+    )
+
+    render(
+      <AuthProvider>
+        <AuthConsumer />
+      </AuthProvider>,
+    )
+
+    await waitFor(() =>
+      expect(screen.getByTestId('loading')).toHaveTextContent('ready'),
+    )
+
+    expect(screen.getByTestId('user')).toHaveTextContent('admin')
+    expect(screen.getByTestId('error')).toHaveTextContent('no-error')
+    expect(fetchMock.mock.calls.map((c) => c[0])).toEqual([
+      '/api/auth/me',
+      '/api/auth/cf-login',
+      '/api/auth/me',
+    ])
   })
 
   test('login() POSTs credentials and stores returned user', async () => {
     // initial /me → 401 (no session)
     fetchMock.mockResolvedValueOnce(
       makeFetchResponse(401, { error: 'unauthenticated' }),
+    )
+    // cf-login auto-attempt → 401 (not mapped; silent fallback)
+    fetchMock.mockResolvedValueOnce(
+      makeFetchResponse(401, { error: 'cf_email_not_mapped' }),
     )
     // login → 200
     fetchMock.mockResolvedValueOnce(
@@ -126,7 +174,7 @@ describe('AuthContext', () => {
       expect(screen.getByTestId('user')).toHaveTextContent('admin'),
     )
 
-    const loginCall = fetchMock.mock.calls[1]
+    const loginCall = fetchMock.mock.calls[2]
     expect(loginCall[0]).toBe('/api/auth/login')
     expect(loginCall[1]).toMatchObject({
       method: 'POST',
@@ -144,6 +192,10 @@ describe('AuthContext', () => {
   test('login() with invalid credentials surfaces a Thai error message', async () => {
     fetchMock.mockResolvedValueOnce(
       makeFetchResponse(401, { error: 'unauthenticated' }),
+    )
+    // cf-login auto-attempt → 401 (not mapped; silent fallback)
+    fetchMock.mockResolvedValueOnce(
+      makeFetchResponse(401, { error: 'cf_email_not_mapped' }),
     )
     fetchMock.mockResolvedValueOnce(
       makeFetchResponse(401, { error: 'invalid_credentials' }),
