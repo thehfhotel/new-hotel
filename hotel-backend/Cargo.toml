@@ -199,7 +199,7 @@ rust_xlsxwriter = "0.95"
 # (0.x is semver-incompatible across minors — a 0.23 here would be a *different*
 # type and fail to compile). `base64` (already a dep) encodes the data-URLs.
 resvg = "0.44"
-usvg = "0.44"
+usvg = "0.47"
 tiny-skia = "0.11"
 fontdb = "0.22"
 
