@@ -182,7 +182,7 @@ cookie = "0.18"
 #   exports, no JNI/Excel binding required. Chosen over umya-spreadsheet
 #   which optimises for the read+modify workflow we don't need here.
 csv = "1.3"
-rust_xlsxwriter = "0.95"
+rust_xlsxwriter = "0.96"
 
 # Thai national-ID card server-side compositing (render/thai_id_card.rs) — a
 # clean reimplement of the iHOTEL ReportReg card face, NO vendor lib. resvg
