@@ -200,7 +200,7 @@ rust_xlsxwriter = "0.95"
 # type and fail to compile). `base64` (already a dep) encodes the data-URLs.
 resvg = "0.44"
 usvg = "0.44"
-tiny-skia = "0.11"
+tiny-skia = "0.12"
 fontdb = "0.22"
 
 # Minimal PNG/JPEG decode+crop+encode for the guest-image sync-in: iHOTEL saves
