@@ -185,6 +185,15 @@ struct ExistingCheckIn {
     cin_status: Option<String>,
     cin_total_amount: Option<f64>,
     cin_paid_amount: Option<f64>,
+    /// Stay range — compared by `existing_matches` since 2026-07-06
+    /// (CH26-006020/CH26-006039): an iHOTEL re-save that moves ONLY
+    /// `Cin_Date_in` (edit-date dialog / edit-checkin re-save) or ONLY
+    /// `Cin_Room_Out` (stay extension) changed no compared field, so
+    /// the apply idempotency-skipped it, the watermark advanced, and
+    /// the CT delta aged out — leaving the canonical row durably stale
+    /// on a reconcile-hash input until checkout forced a re-apply.
+    cin_checkin_time: Option<NaiveDateTime>,
+    cin_expected_checkout: Option<NaiveDate>,
     cin_checkout_time: Option<NaiveDateTime>,
     /// Denormalised customer pointer — compared by `existing_matches`
     /// since 2026-06-11 (audit P1 #6): iHOTEL's customer-delete cascade
@@ -1307,10 +1316,13 @@ async fn fetch_existing(
         Option<f64>,
         Option<f64>,
         Option<NaiveDateTime>,
+        Option<NaiveDate>,
+        Option<NaiveDateTime>,
         Option<String>,
     )>(
         "SELECT cin_id, aggregate_id, cin_status, \
-                cin_total_amount::float8, cin_paid_amount::float8, cin_checkout_time, \
+                cin_total_amount::float8, cin_paid_amount::float8, \
+                cin_checkin_time, cin_expected_checkout, cin_checkout_time, \
                 legacy_cust_no \
            FROM ht_checkins \
           WHERE legacy_cin_no = $1 \
@@ -1321,13 +1333,15 @@ async fn fetch_existing(
     .await?;
 
     Ok(row.map(
-        |(cin_id, aggregate_id, cin_status, total, paid, checkout, legacy_cust_no)| {
+        |(cin_id, aggregate_id, cin_status, total, paid, checkin, expected, checkout, legacy_cust_no)| {
             ExistingCheckIn {
                 cin_id,
                 aggregate_id,
                 cin_status,
                 cin_total_amount: total,
                 cin_paid_amount: paid,
+                cin_checkin_time: checkin,
+                cin_expected_checkout: expected,
                 cin_checkout_time: checkout,
                 legacy_cust_no,
             }
@@ -1343,9 +1357,16 @@ fn existing_matches(ex: &ExistingCheckIn, p: &CanonicalCheckIn) -> bool {
     // value would force a re-apply every tick without ever converging.
     // A Some projection (including the `'C0000'` delete-cascade sentinel)
     // MUST match, or the apply re-runs and re-points the FK.
+    // `cin_checkin_time` / `cin_expected_checkout` are compared
+    // unguarded: the projection carries them as non-optional (hard
+    // error on a NULL `Cin_Date_in`) and `update_existing` writes both
+    // through plainly ($5/$7, no COALESCE), so a mismatch always
+    // converges after one re-apply.
     ex.cin_status.as_deref() == Some(p.cin_status.as_str())
         && ex.cin_total_amount == p.total_amount
         && ex.cin_paid_amount == p.paid_amount
+        && ex.cin_checkin_time == Some(p.cin_checkin_time)
+        && ex.cin_expected_checkout == Some(p.cin_expected_checkout)
         && ex.cin_checkout_time == p.cin_checkout_time
         && (p.legacy_cust_no.is_none() || ex.legacy_cust_no == p.legacy_cust_no)
 }
@@ -2468,6 +2489,8 @@ mod tests {
             cin_status: Some(p.cin_status.clone()),
             cin_total_amount: p.total_amount,
             cin_paid_amount: p.paid_amount,
+            cin_checkin_time: Some(p.cin_checkin_time),
+            cin_expected_checkout: Some(p.cin_expected_checkout),
             cin_checkout_time: p.cin_checkout_time,
             legacy_cust_no: p.legacy_cust_no.clone(),
         }
@@ -2508,6 +2531,41 @@ mod tests {
         assert!(
             !existing_matches(&ex, &p),
             "a cust_no-only change MUST force a re-apply (C0000 cascade)"
+        );
+    }
+
+    /// Incident 2026-07-06 (CH26-006020 / CH26-006039) — an iHOTEL
+    /// re-save that moves ONLY `Cin_Date_in` changed no compared
+    /// field, so the apply idempotency-skipped it and the canonical
+    /// `cin_checkin_time` (a reconcile-hash input) stayed durably
+    /// stale until checkout forced a re-apply.
+    #[test]
+    fn existing_matches_is_false_when_only_checkin_time_differs() {
+        let p = sample_canonical();
+        let mut ex = make_existing(&p);
+        ex.cin_checkin_time = Some(
+            chrono::NaiveDate::from_ymd_opt(2026, 4, 26)
+                .unwrap()
+                .and_hms_opt(19, 55, 0)
+                .unwrap(),
+        );
+        assert!(
+            !existing_matches(&ex, &p),
+            "a Cin_Date_in-only edit MUST force a re-apply"
+        );
+    }
+
+    /// Sibling of the checkin-time gap: a stay extension in iHOTEL
+    /// rewrites ONLY `Cin_Room_Out` (→ `cin_expected_checkout`).
+    #[test]
+    fn existing_matches_is_false_when_only_expected_checkout_differs() {
+        let p = sample_canonical();
+        let mut ex = make_existing(&p);
+        ex.cin_expected_checkout =
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 4, 28).unwrap());
+        assert!(
+            !existing_matches(&ex, &p),
+            "a Cin_Room_Out-only extension MUST force a re-apply"
         );
     }
 
