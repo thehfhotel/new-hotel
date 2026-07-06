@@ -1173,7 +1173,10 @@ mod tests {
     #[tokio::test]
     async fn login_via_card_mints_session_for_active_user() {
         let (svc, users, sessions) = build_service();
-        users.insert_direct(fixed_user("card-B7", "unused"));
+        // card-login never checks a password (it logs in by user_id after a
+        // resolved tap), so the fixture password is irrelevant — empty avoids a
+        // hard-coded-credential scanner false positive.
+        users.insert_direct(fixed_user("card-B7", ""));
 
         let (user, session) = svc
             .login_via_card(&dummy_pool(), 1, Some("10.0.0.5"), Some("reader-ua"))
@@ -1208,7 +1211,7 @@ mod tests {
     #[tokio::test]
     async fn login_via_card_rejects_deactivated_user() {
         let (svc, users, sessions) = build_service();
-        let mut user = fixed_user("card-B9", "unused");
+        let mut user = fixed_user("card-B9", ""); // password irrelevant to card-login
         user.active = false;
         users.insert_direct(user);
 
