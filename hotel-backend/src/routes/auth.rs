@@ -106,8 +106,8 @@ pub struct LoginRequest {
 /// Request body for `POST /api/auth/card-login`.
 ///
 /// The `login_token` is the one-time value a paired login screen received
-/// from `GET /api/reader/wait` after a tap resolved through
-/// `POST /api/reader/scan`. It is consumed here (one-time, TTL-bounded).
+/// from `GET /api/reader/wait` after that route verified the central HF-ID
+/// tap assertion. It is consumed here (one-time, TTL-bounded).
 #[derive(Debug, Deserialize)]
 pub struct CardLoginRequest {
     pub login_token: String,
@@ -446,13 +446,13 @@ pub async fn cf_login(
 
 /// `POST /api/auth/card-login` — NFC staff-card session mint. PUBLIC.
 ///
-/// Consumes the one-time `login_token` stashed by `POST /api/reader/scan`
-/// (delivered to this browser via `GET /api/reader/wait`), loads the mapped
-/// user, and mints a session through the EXACT same
-/// `mint_session_for` + `build_session_cookie` path as password [`login`] /
-/// [`cf_login`] — the resulting session is indistinguishable. The identity
-/// was already established centrally (HF-ID resolve) at scan time, so no
-/// password is involved here.
+/// Consumes the one-time `login_token` stashed by `GET /api/reader/wait`
+/// (after it verified the central HF-ID tap assertion and delivered the token
+/// to this browser), loads the mapped user, and mints a session through the
+/// EXACT same `mint_session_for` + `build_session_cookie` path as password
+/// [`login`] / [`cf_login`] — the resulting session is indistinguishable. The
+/// identity was already established centrally (HF-ID assertion) during wait, so
+/// no password is involved here.
 ///
 /// Responses:
 /// * 200 + [`LoginResponse`] + `Set-Cookie: session=…` — card login OK.
@@ -486,7 +486,7 @@ pub async fn card_login(
 
     let (user, session) = match result {
         Ok(pair) => pair,
-        // Missing user (deleted between scan and card-login) or deactivated —
+        // Missing user (deleted between wait and card-login) or deactivated —
         // both collapse to the same wire code the frontend treats as "retry".
         Err(AuthError::InvalidCredentials) | Err(AuthError::UserDeactivated) => {
             tracing::info!("auth/card-login: pending login pointed at a missing/deactivated user");

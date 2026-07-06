@@ -247,9 +247,9 @@ impl<U: UserRepository, S: SessionRepository> AuthService<U, S> {
     /// fresh session (staff-card auto-login).
     ///
     /// The caller (routes::auth::card_login) has already consumed a one-time
-    /// pending-login that a prior `POST /api/reader/scan` created only AFTER
-    /// the central HF-ID resolve authorized the tap — so this method trusts
-    /// `user_id` as an identity assertion and performs NO password check,
+    /// pending-login that `GET /api/reader/wait` created only AFTER it verified
+    /// the central HF-ID tap assertion (RS256, iss/aud/exp/apps) — so this
+    /// method trusts `user_id` as an identity assertion and performs NO password check,
     /// exactly like [`Self::login_via_email`]. Session minting reuses the
     /// same `mint_session_for` tail as password login, so the resulting
     /// session is indistinguishable.

@@ -82,8 +82,7 @@ pub use pos::{
     WalkupSaleLineOutcome,
 };
 pub use reader::{
-    authorize, find_or_provision_user_by_badge, ReaderState, ReaderStore, ResolveClient,
-    ResolveResponse,
+    find_or_provision_user_by_badge, HfIdClient, ReaderState, ReaderStore, WaitOutcome,
 };
 pub use shifts::{
     CloseShiftCommand, OpenShiftCommand, OpenShiftOutcome, Shift, ShiftService, ShiftSummary,
