@@ -49,6 +49,10 @@ path = "src/bin/backfill_payment_ledger.rs"
 name = "create_user"
 path = "src/bin/create_user.rs"
 
+[[bin]]
+name = "set_user_card"
+path = "src/bin/set_user_card.rs"
+
 [dependencies]
 # Web framework (matches Tauri middleware).
 # 0.8 migration (2026-05-01): path param syntax changed from `/:id` to `/{id}`

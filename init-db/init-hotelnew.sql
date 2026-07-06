@@ -1469,12 +1469,22 @@ CREATE TABLE IF NOT EXISTS ht_users (
     -- lookup key mapping a verified CF Access `email` claim to this row.
     -- NULL = password-only user. Case-insensitive uniqueness enforced by
     -- ux_ht_users_email_lower below.
-    email          VARCHAR(255)
+    email          VARCHAR(255),
+    -- Migration 075 (NFC staff-card login) — optional alternate lookup key
+    -- mapping a resolved HF-ID card `badge` to this row. NULL = no card
+    -- (password / CF-Access only). One badge → one user via
+    -- ux_ht_users_badge below. Never a credential — the card→person
+    -- authority lives centrally in HF-ID; the PMS only trusts the resolve.
+    badge          VARCHAR(50)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_ht_users_email_lower
     ON ht_users (LOWER(email))
     WHERE email IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ht_users_badge
+    ON ht_users (badge)
+    WHERE badge IS NOT NULL;
 
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('027', '027_create_ht_users.sql', 'init-script')
@@ -2521,6 +2531,15 @@ ON CONFLICT (version) DO NOTHING;
 -- the drift check sees zero pending.
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('074', '074_ht_users_email.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 075 — ht_users.badge (NFC staff-card login lookup key).
+-- Column + partial UNIQUE index ux_ht_users_badge inlined into the ht_users
+-- block above; there is no backfill (card accounts are auto-provisioned on
+-- first tap, or linked via the set_user_card bin). This seed row records the
+-- migration as applied so the drift check sees zero pending.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('075', '075_ht_users_badge.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================

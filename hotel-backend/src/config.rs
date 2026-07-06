@@ -430,6 +430,62 @@ pub fn tm30_companion_writeback_enabled() -> bool {
     flag_enabled("TM30_COMPANION_WRITEBACK_ENABLED")
 }
 
+/// Read an optional secret/URL from `var_name`, treating unset OR empty as
+/// `None`. Empty-string is the failure mode of a botched CI `.env` rewrite
+/// (`VAR=''`); returning `None` lets the reader path fail closed (reject the
+/// tap) rather than run with a blank secret.
+fn optional_env(var_name: &str) -> Option<String> {
+    match std::env::var(var_name) {
+        Ok(value) if !value.trim().is_empty() => Some(value),
+        _ => None,
+    }
+}
+
+/// Configuration for the NFC staff-card login feature (`service::reader`,
+/// `routes::reader`, `routes::auth::card_login`).
+///
+/// Two DISTINCT secrets keep the blast radius small if the reader device is
+/// compromised:
+///   * `reader_secret` (`READER_SECRET`) — device ↔ PMS. Presented by the
+///     reader on `POST /api/reader/scan` in the `X-Reader-Secret` header and
+///     compared constant-time. `None` (unset/empty) ⇒ every scan is rejected
+///     (fail closed).
+///   * `resolve_secret` (`READER_RESOLVE_SECRET`) — PMS ↔ central HF-ID.
+///     Sent by the PMS to `{resolve_url}/api/private/reader/resolve` in the
+///     same header name. `None` (or a missing `resolve_url`) ⇒ the resolve
+///     client is the `NullResolveClient` and every scan is rejected.
+///
+/// `resolve_url` (`HFID_RESOLVE_URL`) is the central registry base URL (e.g.
+/// `http://192.168.1.250` or an internal URL). `required_app`
+/// (`READER_REQUIRED_APP`, default `"hotel"`) is the app grant a badge must
+/// carry in the resolve response's `apps` list to be authorized here.
+///
+/// Both secrets ALSO flow through the `/run/secrets` hydrator (see
+/// `secrets.rs` — files `reader_secret` / `reader_resolve_secret`), so a
+/// production deploy can mount them as Docker secrets; env vars still win.
+#[derive(Debug, Clone, Default)]
+pub struct ReaderConfig {
+    pub resolve_url: Option<String>,
+    pub resolve_secret: Option<String>,
+    pub reader_secret: Option<String>,
+    pub required_app: String,
+}
+
+impl ReaderConfig {
+    pub fn from_env() -> Self {
+        Self {
+            resolve_url: optional_env("HFID_RESOLVE_URL"),
+            resolve_secret: optional_env("READER_RESOLVE_SECRET"),
+            reader_secret: optional_env("READER_SECRET"),
+            required_app: std::env::var("READER_REQUIRED_APP")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "hotel".to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
