@@ -103,6 +103,16 @@ pub struct LoginRequest {
     pub password: String,
 }
 
+/// Request body for `POST /api/auth/card-login`.
+///
+/// The `login_token` is the one-time value a paired login screen received
+/// from `GET /api/reader/wait` after a tap resolved through
+/// `POST /api/reader/scan`. It is consumed here (one-time, TTL-bounded).
+#[derive(Debug, Deserialize)]
+pub struct CardLoginRequest {
+    pub login_token: String,
+}
+
 /// Success body for `POST /api/auth/login`.
 ///
 /// Track G7 added the `permissions` field so the frontend has the
@@ -424,6 +434,80 @@ pub async fn cf_login(
     let secure = is_https_request(&headers);
     let cookie = build_session_cookie(session.id, secure);
     let permissions = permissions_or_empty(&state, user.user_id, "auth/cf-login").await;
+
+    Ok((
+        jar.add(cookie),
+        Json(LoginResponse {
+            user: user.into(),
+            permissions,
+        }),
+    ))
+}
+
+/// `POST /api/auth/card-login` — NFC staff-card session mint. PUBLIC.
+///
+/// Consumes the one-time `login_token` stashed by `POST /api/reader/scan`
+/// (delivered to this browser via `GET /api/reader/wait`), loads the mapped
+/// user, and mints a session through the EXACT same
+/// `mint_session_for` + `build_session_cookie` path as password [`login`] /
+/// [`cf_login`] — the resulting session is indistinguishable. The identity
+/// was already established centrally (HF-ID resolve) at scan time, so no
+/// password is involved here.
+///
+/// Responses:
+/// * 200 + [`LoginResponse`] + `Set-Cookie: session=…` — card login OK.
+/// * 401 `{"error":"invalid_login_token"}` — token unknown / expired / already
+///   used, OR it pointed at a missing/deactivated user.
+pub async fn card_login(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Json(body): Json<CardLoginRequest>,
+) -> Result<(CookieJar, Json<LoginResponse>), (StatusCode, Json<ErrorResponse>)> {
+    // One-time consume: the store removes the pending login on read and
+    // enforces its TTL, so a replay after use / after expiry resolves to None.
+    let user_id = match state.reader.store.take_user_for_login_token(&body.login_token) {
+        Some(id) => id,
+        None => {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse::new("invalid_login_token")),
+            ));
+        }
+    };
+
+    let ip = client_ip(&headers);
+    let user_agent = client_user_agent(&headers);
+
+    let result = state
+        .auth_service
+        .login_via_card(&state.new_pool, user_id, ip.as_deref(), user_agent.as_deref())
+        .await;
+
+    let (user, session) = match result {
+        Ok(pair) => pair,
+        // Missing user (deleted between scan and card-login) or deactivated —
+        // both collapse to the same wire code the frontend treats as "retry".
+        Err(AuthError::InvalidCredentials) | Err(AuthError::UserDeactivated) => {
+            tracing::info!("auth/card-login: pending login pointed at a missing/deactivated user");
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse::new("invalid_login_token")),
+            ));
+        }
+        Err(AuthError::Db(err)) => {
+            tracing::error!(error = %err, "auth/card-login: database error");
+            return Err(internal_error());
+        }
+        Err(other) => {
+            tracing::error!(error = %other, "auth/card-login: unexpected service error");
+            return Err(internal_error());
+        }
+    };
+
+    let secure = is_https_request(&headers);
+    let cookie = build_session_cookie(session.id, secure);
+    let permissions = permissions_or_empty(&state, user.user_id, "auth/card-login").await;
 
     Ok((
         jar.add(cookie),

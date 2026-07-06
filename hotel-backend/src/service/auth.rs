@@ -243,6 +243,42 @@ impl<U: UserRepository, S: SessionRepository> AuthService<U, S> {
         self.mint_session_for(pool, user, ip, user_agent).await
     }
 
+    /// Authenticate a user by their resolved NFC-card identity and mint a
+    /// fresh session (staff-card auto-login).
+    ///
+    /// The caller (routes::auth::card_login) has already consumed a one-time
+    /// pending-login that a prior `POST /api/reader/scan` created only AFTER
+    /// the central HF-ID resolve authorized the tap — so this method trusts
+    /// `user_id` as an identity assertion and performs NO password check,
+    /// exactly like [`Self::login_via_email`]. Session minting reuses the
+    /// same `mint_session_for` tail as password login, so the resulting
+    /// session is indistinguishable.
+    ///
+    /// Failure modes:
+    /// * `user_id` no longer exists → `AuthError::InvalidCredentials` (route
+    ///   maps to 401 — the pending login pointed at a deleted user)
+    /// * Mapped user is deactivated → `AuthError::UserDeactivated`
+    /// * sqlx failure → `AuthError::Db`
+    pub async fn login_via_card(
+        &self,
+        pool: &PgPool,
+        user_id: i64,
+        ip: Option<&str>,
+        user_agent: Option<&str>,
+    ) -> Result<(User, Session), AuthError> {
+        let user = self.users.get_by_id(pool, user_id).await?;
+        let user = match user {
+            Some(u) => u,
+            None => return Err(AuthError::InvalidCredentials),
+        };
+
+        if !user.active {
+            return Err(AuthError::UserDeactivated);
+        }
+
+        self.mint_session_for(pool, user, ip, user_agent).await
+    }
+
     /// Shared session-mint tail used by [`Self::login`] (password) and
     /// [`Self::login_via_email`] (Cloudflare Access). Assumes the caller
     /// has already authenticated the user AND checked `active`.
@@ -879,6 +915,28 @@ mod tests {
         }
     }
 
+    /// Fixture user for tests that never exercise PASSWORD login — e.g. card
+    /// login, which authenticates by `user_id` after a resolved tap and never
+    /// checks a password. `password_hash` is derived from the username (a
+    /// non-constant) instead of hashing a hard-coded literal, so it can never
+    /// pass a password verify AND does not feed a hard-coded value into
+    /// `hash_password` the way `fixed_user(.., "literal")` would.
+    fn card_login_user(username: &str) -> User {
+        User {
+            user_id: 1,
+            username: username.to_string(),
+            password_hash: format!("no-password:{username}"),
+            role: Role::Admin,
+            active: true,
+            created_at: NaiveDate::from_ymd_opt(2026, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            last_login_at: None,
+            email: None,
+        }
+    }
+
     fn build_service() -> (
         AuthService<MockUserRepository, MockSessionRepository>,
         Arc<MockUserRepository>,
@@ -1126,6 +1184,60 @@ mod tests {
             .login_via_email(&dummy_pool(), "winai.sdy@gmail.com", None, None)
             .await
             .expect_err("deactivated user must not auto-login");
+        assert!(matches!(err, AuthError::UserDeactivated));
+        assert!(sessions.rows.lock().unwrap().is_empty(), "no session minted");
+    }
+
+    // =========================================================================
+    // NFC staff-card auto-login (login_via_card) tests.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn login_via_card_mints_session_for_active_user() {
+        let (svc, users, sessions) = build_service();
+        users.insert_direct(card_login_user("card-B7"));
+
+        let (user, session) = svc
+            .login_via_card(&dummy_pool(), 1, Some("10.0.0.5"), Some("reader-ua"))
+            .await
+            .expect("active user must card-login");
+
+        assert_eq!(user.username, "card-B7");
+        assert!(user.last_login_at.is_some(), "last_login_at must be stamped");
+        assert_eq!(session.user_id, 1);
+        assert_eq!(session.id.len(), 64, "same 64-hex token shape as password login");
+        assert_eq!(sessions.rows.lock().unwrap().len(), 1);
+
+        // And the minted session validates through the normal path.
+        assert!(svc
+            .validate_session(&dummy_pool(), &session.id)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn login_via_card_rejects_missing_user() {
+        let (svc, _users, sessions) = build_service();
+        let err = svc
+            .login_via_card(&dummy_pool(), 999, None, None)
+            .await
+            .expect_err("missing user must be rejected");
+        assert!(matches!(err, AuthError::InvalidCredentials));
+        assert!(sessions.rows.lock().unwrap().is_empty(), "no session minted");
+    }
+
+    #[tokio::test]
+    async fn login_via_card_rejects_deactivated_user() {
+        let (svc, users, sessions) = build_service();
+        let mut user = card_login_user("card-B9");
+        user.active = false;
+        users.insert_direct(user);
+
+        let err = svc
+            .login_via_card(&dummy_pool(), 1, None, None)
+            .await
+            .expect_err("deactivated user must not card-login");
         assert!(matches!(err, AuthError::UserDeactivated));
         assert!(sessions.rows.lock().unwrap().is_empty(), "no session minted");
     }

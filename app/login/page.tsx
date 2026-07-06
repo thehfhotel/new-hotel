@@ -2,8 +2,9 @@
 
 import { Suspense, useEffect, useState, type FormEvent } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
-import { Loader2, LogIn, AlertCircle } from 'lucide-react'
+import { Loader2, LogIn, AlertCircle, CreditCard, KeyRound } from 'lucide-react'
 import { useAuth } from '@/contexts/AuthContext'
+import CardTapLogin from './CardTapLogin'
 
 /**
  * /login — the only public page in the app.
@@ -33,6 +34,7 @@ function LoginPageInner() {
   const [password, setPassword] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [localError, setLocalError] = useState<string | null>(null)
+  const [mode, setMode] = useState<'password' | 'card'>('password')
 
   // Open-redirect guard: only same-origin paths are allowed. Reject
   // anything that doesn't start with `/`, AND reject `//evil.com` (which
@@ -71,6 +73,41 @@ function LoginPageInner() {
 
   return (
     <LoginShell>
+      {/* Mode switch — password form (default) vs. tap-your-card. */}
+      <div className="flex mb-3 border border-border" role="tablist">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={mode === 'password'}
+          onClick={() => setMode('password')}
+          className={`flex-1 h-8 flex items-center justify-center gap-1.5 text-[12px] font-medium transition-colors ${
+            mode === 'password'
+              ? 'bg-brand-600 text-white'
+              : 'bg-panel text-textMuted hover:text-text'
+          }`}
+        >
+          <KeyRound size={13} />
+          รหัสผ่าน
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={mode === 'card'}
+          onClick={() => setMode('card')}
+          className={`flex-1 h-8 flex items-center justify-center gap-1.5 text-[12px] font-medium transition-colors ${
+            mode === 'card'
+              ? 'bg-brand-600 text-white'
+              : 'bg-panel text-textMuted hover:text-text'
+          }`}
+        >
+          <CreditCard size={13} />
+          แตะบัตร
+        </button>
+      </div>
+
+      {mode === 'card' ? (
+        <CardTapLogin onLoggedIn={() => router.replace(redirectTarget)} />
+      ) : (
       <form onSubmit={handleSubmit} className="space-y-3" noValidate>
         <div className="space-y-1">
           <label
@@ -137,6 +174,7 @@ function LoginPageInner() {
           )}
         </button>
       </form>
+      )}
     </LoginShell>
   )
 }

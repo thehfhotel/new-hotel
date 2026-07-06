@@ -23,7 +23,7 @@ use crate::routes::auth::ProdAuthService;
 use crate::config::SiteConfig;
 use crate::service::{
     BookingService, CheckInService, CouponService, CustomerService, HousekeepingService,
-    PaymentService, PosService, ShiftService,
+    PaymentService, PosService, ReaderState, ShiftService,
 };
 
 /// Bundle of fully-wired Phase-2 services produced by `AppState::wire_services`.
@@ -169,6 +169,14 @@ pub struct AppState {
     /// `/api/mode` so the UI shows the open/close-round controls only when the
     /// `POST /api/shifts/open|close` routes are actually mounted. Default false.
     pub round_writeback_enabled: bool,
+
+    // ----- NFC staff-card login (service::reader) -----
+    /// Reader feature runtime state: the process-local pending-login / claim
+    /// store, the central HF-ID resolve client, and the reader secret +
+    /// required-app config. Built from env (`ReaderState::from_env`) at
+    /// startup. Cheap to clone (Arcs). Reached from the public
+    /// `/api/reader/*` handlers and `routes::auth::card_login`.
+    pub reader: ReaderState,
 }
 
 impl AppState {
@@ -239,6 +247,7 @@ impl AppState {
             auth_enabled: false,
             hfville_writes_enabled: false,
             round_writeback_enabled,
+            reader: ReaderState::from_env(),
         }
     }
 
@@ -290,6 +299,7 @@ impl AppState {
             auth_enabled: false,
             hfville_writes_enabled: false,
             round_writeback_enabled,
+            reader: ReaderState::from_env(),
         }
     }
 

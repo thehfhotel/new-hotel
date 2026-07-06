@@ -44,6 +44,7 @@ pub mod housekeeping;
 pub mod ids;
 pub mod payment;
 pub mod pos;
+pub mod reader;
 pub mod reports;
 pub mod shifts;
 
@@ -79,6 +80,10 @@ pub use pos::{
     PosService, RecordSaleCommand, RecordSaleOutcome, RecordWalkupSaleCommand,
     RecordWalkupSaleOutcome, VoidSaleCommand, VoidSaleOutcome, WalkupSaleLine,
     WalkupSaleLineOutcome,
+};
+pub use reader::{
+    authorize, find_or_provision_user_by_badge, ReaderState, ReaderStore, ResolveClient,
+    ResolveResponse,
 };
 pub use shifts::{
     CloseShiftCommand, OpenShiftCommand, OpenShiftOutcome, Shift, ShiftService, ShiftSummary,

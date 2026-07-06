@@ -309,8 +309,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // guessable credential); kill-switch CF_AUTO_LOGIN
                 // (default on) makes it answer 404 when disabled.
                 .route("/api/auth/cf-login", post(routes::auth::cf_login))
+                // NFC staff-card session mint: consumes the one-time
+                // login_token produced by POST /api/reader/scan (delivered
+                // via GET /api/reader/wait) and mints the same cookie session
+                // as password / CF login. PUBLIC — the login screen has no
+                // session yet. NOT behind the login rate limiter (the token
+                // is a 256-bit server-minted one-time value, not a guessable
+                // credential).
+                .route("/api/auth/card-login", post(routes::auth::card_login))
                 .with_state(state.clone())
         }
+        None => Router::new(),
+    };
+
+    // NFC staff-card login — PUBLIC reader endpoints (a reader device has no
+    // session cookie). Mounted OUTSIDE `require_auth`, alongside /api/auth/*.
+    // `scan` is device-authenticated by the `X-Reader-Secret` header; `claim`
+    // mints the `reader_claim` cookie; `wait` long-polls for the login_token.
+    // See `routes::reader`. The paired card-login mint is in the auth block above.
+    let reader_routes = match &final_app_state {
+        Some(state) => Router::new()
+            .route("/api/reader/scan", post(routes::reader::scan))
+            .route("/api/reader/claim", post(routes::reader::claim))
+            .route("/api/reader/wait", get(routes::reader::wait))
+            .with_state(state.clone()),
         None => Router::new(),
     };
 
@@ -338,6 +360,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .merge(new_routes)
         .merge(auth_routes)
+        .merge(reader_routes)
         .merge(admin_routes)
         .merge(health_routes)
         .merge(downloads_routes)

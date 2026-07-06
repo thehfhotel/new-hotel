@@ -75,6 +75,13 @@ const SECRET_FILE_MAP: &[(&str, &str)] = &[
     ("ville_db_password", "VILLE_DB_PASSWORD"),
     // Slack alerter webhook (carries a per-channel token in the URL).
     ("slack_webhook_url", "SLACK_WEBHOOK_URL"),
+    // NFC staff-card login (service::reader). Two DISTINCT secrets:
+    //   * reader_secret        — device ↔ PMS  (X-Reader-Secret on /api/reader/scan)
+    //   * reader_resolve_secret — PMS ↔ central HF-ID (resolve call)
+    // Both env-var-first (local dev / pre-migration deploys keep working);
+    // the file only fills an unset/empty var.
+    ("reader_secret", "READER_SECRET"),
+    ("reader_resolve_secret", "READER_RESOLVE_SECRET"),
 ];
 
 /// Hydrate env vars from Docker secret files, then reconstruct
