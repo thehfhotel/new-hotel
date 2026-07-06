@@ -915,6 +915,28 @@ mod tests {
         }
     }
 
+    /// Fixture user for tests that never exercise PASSWORD login — e.g. card
+    /// login, which authenticates by `user_id` after a resolved tap and never
+    /// checks a password. `password_hash` is derived from the username (a
+    /// non-constant) instead of hashing a hard-coded literal, so it can never
+    /// pass a password verify AND does not feed a hard-coded value into
+    /// `hash_password` the way `fixed_user(.., "literal")` would.
+    fn card_login_user(username: &str) -> User {
+        User {
+            user_id: 1,
+            username: username.to_string(),
+            password_hash: format!("no-password:{username}"),
+            role: Role::Admin,
+            active: true,
+            created_at: NaiveDate::from_ymd_opt(2026, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            last_login_at: None,
+            email: None,
+        }
+    }
+
     fn build_service() -> (
         AuthService<MockUserRepository, MockSessionRepository>,
         Arc<MockUserRepository>,
@@ -1173,10 +1195,7 @@ mod tests {
     #[tokio::test]
     async fn login_via_card_mints_session_for_active_user() {
         let (svc, users, sessions) = build_service();
-        // card-login never checks a password (it logs in by user_id after a
-        // resolved tap), so the fixture password is irrelevant — empty avoids a
-        // hard-coded-credential scanner false positive.
-        users.insert_direct(fixed_user("card-B7", ""));
+        users.insert_direct(card_login_user("card-B7"));
 
         let (user, session) = svc
             .login_via_card(&dummy_pool(), 1, Some("10.0.0.5"), Some("reader-ua"))
@@ -1211,7 +1230,7 @@ mod tests {
     #[tokio::test]
     async fn login_via_card_rejects_deactivated_user() {
         let (svc, users, sessions) = build_service();
-        let mut user = fixed_user("card-B9", ""); // password irrelevant to card-login
+        let mut user = card_login_user("card-B9");
         user.active = false;
         users.insert_direct(user);
 
