@@ -76,6 +76,12 @@ is_allowlisted() {
         # (A) Cloudflare Access auto-login — same global users+sessions
         # store as auth::login; sessions are never per-site.
         auth::cf_login) return 0 ;;
+        # (A) NFC staff-card login — mints the SAME global users+sessions store
+        # as auth::login/cf_login (sessions are never per-site); reader::scan
+        # auto-provisions into that same global ht_users table. HF-Hotel front-
+        # desk device only, no per-site Ville variant.
+        auth::card_login) return 0 ;;
+        reader::scan) return 0 ;;
         # (A) Legacy `/api/bookings/by-number/{book_no}/notes` path — HF-Hotel-
         # only legacy booking-notes surface; the by-number lookups read new_pool
         # and there is no Ville variant of this path. TODO(ville-bundle).
