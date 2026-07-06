@@ -172,10 +172,10 @@ pub struct AppState {
 
     // ----- NFC staff-card login (service::reader) -----
     /// Reader feature runtime state: the process-local pending-login / claim
-    /// store, the central HF-ID resolve client, and the reader secret +
-    /// required-app config. Built from env (`ReaderState::from_env`) at
-    /// startup. Cheap to clone (Arcs). Reached from the public
-    /// `/api/reader/*` handlers and `routes::auth::card_login`.
+    /// store, the central HF-ID pairing client (claim/wait), and the HF-ID
+    /// base URL. Built from env (`ReaderState::from_env`) at startup. Cheap to
+    /// clone (Arcs). Reached from the public `/api/reader/*` handlers and
+    /// `routes::auth::card_login`.
     pub reader: ReaderState,
 }
 

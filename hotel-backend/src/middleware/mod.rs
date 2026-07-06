@@ -11,9 +11,13 @@
 //! * `cf_access` — Cloudflare Access JWT verification (JWKS + RS256)
 //!   backing the `POST /api/auth/cf-login` auto-login route. Not a
 //!   tower layer — a verification helper the route calls.
+//! * `hfid_assertion` — HF-ID card-tap assertion verification (a SECOND
+//!   JWKS + RS256 source, same pattern as `cf_access`) backing the
+//!   central-pairing card login in `GET /api/reader/wait`.
 
 pub mod auth;
 pub mod cf_access;
+pub mod hfid_assertion;
 pub mod permissions;
 pub mod rate_limit;
 

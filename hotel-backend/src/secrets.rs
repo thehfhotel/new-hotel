@@ -75,12 +75,11 @@ const SECRET_FILE_MAP: &[(&str, &str)] = &[
     ("ville_db_password", "VILLE_DB_PASSWORD"),
     // Slack alerter webhook (carries a per-channel token in the URL).
     ("slack_webhook_url", "SLACK_WEBHOOK_URL"),
-    // NFC staff-card login (service::reader). Two DISTINCT secrets:
-    //   * reader_secret        — device ↔ PMS  (X-Reader-Secret on /api/reader/scan)
-    //   * reader_resolve_secret — PMS ↔ central HF-ID (resolve call)
-    // Both env-var-first (local dev / pre-migration deploys keep working);
-    // the file only fills an unset/empty var.
-    ("reader_secret", "READER_SECRET"),
+    // NFC staff-card login (service::reader). PMS ↔ central HF-ID shared
+    // secret, sent as X-Reader-Secret on the central claim/wait calls.
+    // Env-var-first (local dev keeps working); the file only fills an
+    // unset/empty var. (The old device↔PMS `reader_secret` was retired when
+    // the reader moved to posting taps to central HF-ID.)
     ("reader_resolve_secret", "READER_RESOLVE_SECRET"),
 ];
 

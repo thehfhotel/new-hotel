@@ -1,27 +1,34 @@
-//! NFC staff-card login — central resolve client + pending-login store +
+//! NFC staff-card login — central HF-ID pairing client + pending-login store +
 //! badge → user provisioning.
 //!
 //! ## Flow (see `routes::reader` + `routes::auth::card_login`)
 //!
+//! The physical reader now posts taps to the CENTRAL HF-ID service, NOT to this
+//! PMS. This PMS consumes HF-ID's pairing endpoints on behalf of the login
+//! screen:
+//!
 //! ```text
-//!   reader device ──POST /api/reader/scan (X-Reader-Secret)──▶ PMS
-//!        PMS ──POST {HFID_RESOLVE_URL}/api/private/reader/resolve──▶ HF-ID
-//!        PMS: authorize → find/provision ht_users by badge → stash pending
-//!             login keyed by reader_id (one-time login_token, ~30s TTL)
-//!   login screen ──POST /api/reader/claim {reader_id}──▶ Set-Cookie reader_claim
-//!   login screen ──GET  /api/reader/wait (reader_claim cookie)──▶ {login_token}
+//!   reader device ──tap──▶ HF-ID (central)            (no longer hits the PMS)
+//!   login screen ──POST /api/reader/claim {reader_id}──▶ PMS
+//!        PMS ──POST {HFID_BASE_URL}/api/private/reader/claim {reader_id,app}──▶ HF-ID
+//!        PMS: Set-Cookie reader_claim (maps this browser → central claim_token)
+//!   login screen ──GET  /api/reader/wait (reader_claim cookie)──▶ PMS
+//!        PMS ──POST {HFID_BASE_URL}/api/private/reader/wait {claim_token}──▶ HF-ID
+//!        HF-ID → 200 {assertion} | 403 not_authorized | 204 timeout
+//!        PMS (on 200): verify the RS256 assertion (middleware::hfid_assertion)
+//!             → sub=badge → find/provision ht_users → stash pending→delivered
+//!               login → return {login_token}
 //!   login screen ──POST /api/auth/card-login {login_token}──▶ Set-Cookie session
 //! ```
 //!
 //! ## Composition / testability
 //!
-//! The central resolve is behind a [`ResolveClient`] trait so unit tests
-//! inject a mock without the real HF-ID service. Production wires
-//! [`HttpResolveClient`] (blocking `ureq` dispatched via
-//! `spawn_blocking`, same policy as `notifications::slack` /
-//! `middleware::cf_access` — no `reqwest`). When the central URL / secret
-//! is unconfigured we wire [`NullResolveClient`] which always errors, so a
-//! misconfigured deploy fails CLOSED (every scan rejected).
+//! The central pairing is behind an [`HfIdClient`] trait so unit tests inject a
+//! mock without the real HF-ID service. Production wires [`HttpHfIdClient`]
+//! (blocking `ureq` dispatched via `spawn_blocking`, same policy as
+//! `notifications::slack` / `middleware::cf_access` — no `reqwest`). When the
+//! PMS↔central secret is unconfigured we wire [`NullHfIdClient`] which always
+//! errors, so a misconfigured deploy fails CLOSED (every claim/wait rejected).
 //!
 //! ## Why dynamic `sqlx::query()`
 //!
@@ -36,10 +43,10 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use rand::RngCore;
-use serde::Deserialize;
 use sqlx::{PgPool, Row};
 
 use crate::config::ReaderConfig;
+use crate::middleware::hfid_assertion::HFID_APP;
 
 /// Password-hash sentinel stored on auto-provisioned card-only accounts.
 ///
@@ -55,65 +62,75 @@ pub const CARD_ONLY_PASSWORD_SENTINEL: &str = "!card-only-no-password";
 /// keeps a stray login_token from lingering.
 const PENDING_TTL: Duration = Duration::from_secs(30);
 
-/// TTL for a reader_claim binding (browser ↔ reader_id). Generous — a
+/// TTL for a reader_claim binding (browser ↔ central claim_token). Generous — a
 /// terminal parked on the login screen keeps its pairing across taps.
 const CLAIM_TTL: Duration = Duration::from_secs(10 * 60);
 
 // =============================================================================
-// Central resolve client
+// Central HF-ID pairing client
 // =============================================================================
 
-/// Parsed response from `POST {HFID_RESOLVE_URL}/api/private/reader/resolve`.
-///
-/// `#[serde(default)]` on the non-`found` fields so a terse `{"found":false}`
-/// negative response deserializes without the caller having to send every key.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct ResolveResponse {
-    pub found: bool,
-    #[serde(default)]
-    pub badge: Option<String>,
-    #[serde(default)]
-    pub display_name: Option<String>,
-    #[serde(default)]
-    pub apps: Vec<String>,
-    #[serde(default)]
-    pub active: bool,
-    #[serde(default)]
-    pub pending: bool,
+/// Outcome of a `POST {HFID_BASE_URL}/api/private/reader/wait` call.
+#[derive(Debug, Clone)]
+pub enum WaitOutcome {
+    /// HF-ID delivered a signed RS256 assertion for a tapped, authorized badge
+    /// (central **200**). The inner string is the raw assertion (id_token),
+    /// still to be verified by `middleware::hfid_assertion`.
+    Authorized(String),
+    /// A tap landed but the badge is not authorized for this app (central
+    /// **403** `{"error":"not_authorized"}`).
+    NotAuthorized,
+    /// No tap within the central long-poll budget (central **204**). The login
+    /// screen re-polls.
+    Timeout,
 }
 
-/// Error from a central resolve attempt. Opaque string — the scan route maps
-/// any resolve failure to a single "not authorized" wire response so the
-/// reader double-beeps without leaking the central service's failure mode.
+/// Error from a central HF-ID claim/wait attempt. Opaque string — the routes
+/// map any transport/decoding failure to a single wire code so a browser never
+/// learns the central service's failure mode.
 #[derive(Debug, Clone)]
-pub struct ResolveError(pub String);
+pub struct HfIdError(pub String);
 
-impl std::fmt::Display for ResolveError {
+impl std::fmt::Display for HfIdError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "resolve error: {}", self.0)
+        write!(f, "hf-id error: {}", self.0)
     }
 }
 
-/// Central card→employee resolver. Behind a trait so tests inject a mock.
+/// Central HF-ID pairing client. Behind a trait so tests inject a mock.
 #[async_trait]
-pub trait ResolveClient: Send + Sync {
-    async fn resolve(&self, uid: &str) -> Result<ResolveResponse, ResolveError>;
+pub trait HfIdClient: Send + Sync {
+    /// Claim a pairing for `reader_id` (app = `hotel`). Returns the central
+    /// `claim_token` this browser will long-poll against.
+    async fn claim(&self, reader_id: &str) -> Result<String, HfIdError>;
+
+    /// Long-poll a pairing for the next tap. See [`WaitOutcome`].
+    async fn wait(&self, claim_token: &str) -> Result<WaitOutcome, HfIdError>;
 }
 
-/// Production resolver: blocking `ureq` POST dispatched onto a blocking task
-/// so the async runtime is never stalled (same pattern as
-/// `notifications::slack`).
-pub struct HttpResolveClient {
+/// Production client: blocking `ureq` dispatched onto a blocking task so the
+/// async runtime is never stalled (same pattern as `middleware::cf_access`).
+///
+/// The agent timeout is generous (`WAIT_TIMEOUT`) because the central `wait`
+/// call long-polls — it holds the connection until a tap lands or its own
+/// budget elapses (then returns 204). `claim` returns promptly and is bounded
+/// by the same ceiling.
+pub struct HttpHfIdClient {
     agent: ureq::Agent,
     base_url: String,
     secret: String,
 }
 
-impl HttpResolveClient {
+/// Upper bound on a single central call. Must exceed the central `wait`
+/// long-poll budget so our read doesn't abort mid-poll (the central side
+/// returns 204 well before this).
+const WAIT_TIMEOUT: Duration = Duration::from_secs(35);
+
+impl HttpHfIdClient {
     pub fn new(base_url: String, secret: String) -> Self {
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(3))
-            .timeout(Duration::from_secs(5))
+            .timeout(WAIT_TIMEOUT)
             .build();
         Self {
             agent,
@@ -121,18 +138,31 @@ impl HttpResolveClient {
             secret,
         }
     }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{}", self.base_url.trim_end_matches('/'), path)
+    }
+}
+
+/// `{ "claim_token": "..." }` — the central claim response.
+#[derive(serde::Deserialize)]
+struct ClaimResponse {
+    claim_token: String,
+}
+
+/// `{ "assertion": "<jwt>" }` — the central wait **200** response.
+#[derive(serde::Deserialize)]
+struct WaitAssertion {
+    assertion: String,
 }
 
 #[async_trait]
-impl ResolveClient for HttpResolveClient {
-    async fn resolve(&self, uid: &str) -> Result<ResolveResponse, ResolveError> {
-        let url = format!(
-            "{}/api/private/reader/resolve",
-            self.base_url.trim_end_matches('/')
-        );
+impl HfIdClient for HttpHfIdClient {
+    async fn claim(&self, reader_id: &str) -> Result<String, HfIdError> {
+        let url = self.url("/api/private/reader/claim");
         let agent = self.agent.clone();
         let secret = self.secret.clone();
-        let body = serde_json::json!({ "uid": uid });
+        let body = serde_json::json!({ "reader_id": reader_id, "app": HFID_APP });
 
         let joined = tokio::task::spawn_blocking(move || {
             agent
@@ -141,64 +171,75 @@ impl ResolveClient for HttpResolveClient {
                 .send_json(body)
         })
         .await
-        .map_err(|err| ResolveError(format!("join: {err}")))?;
+        .map_err(|err| HfIdError(format!("join: {err}")))?;
 
         match joined {
             Ok(response) => response
-                .into_json::<ResolveResponse>()
-                .map_err(|err| ResolveError(format!("decode: {err}"))),
+                .into_json::<ClaimResponse>()
+                .map(|c| c.claim_token)
+                .map_err(|err| HfIdError(format!("decode: {err}"))),
             Err(ureq::Error::Status(code, _)) => {
-                Err(ResolveError(format!("central returned status {code}")))
+                Err(HfIdError(format!("central claim status {code}")))
             }
-            Err(err) => Err(ResolveError(err.to_string())),
+            Err(err) => Err(HfIdError(err.to_string())),
+        }
+    }
+
+    async fn wait(&self, claim_token: &str) -> Result<WaitOutcome, HfIdError> {
+        let url = self.url("/api/private/reader/wait");
+        let agent = self.agent.clone();
+        let secret = self.secret.clone();
+        let body = serde_json::json!({ "claim_token": claim_token });
+
+        let joined = tokio::task::spawn_blocking(move || {
+            agent
+                .post(&url)
+                .set("X-Reader-Secret", &secret)
+                .send_json(body)
+        })
+        .await
+        .map_err(|err| HfIdError(format!("join: {err}")))?;
+
+        match joined {
+            Ok(response) => {
+                // 2xx: 204 = long-poll timeout (no tap), 200 = assertion body.
+                if response.status() == 204 {
+                    Ok(WaitOutcome::Timeout)
+                } else {
+                    response
+                        .into_json::<WaitAssertion>()
+                        .map(|w| WaitOutcome::Authorized(w.assertion))
+                        .map_err(|err| HfIdError(format!("decode: {err}")))
+                }
+            }
+            // 403 = a tap landed but the badge is not authorized for `hotel`.
+            Err(ureq::Error::Status(403, _)) => Ok(WaitOutcome::NotAuthorized),
+            Err(ureq::Error::Status(code, _)) => {
+                Err(HfIdError(format!("central wait status {code}")))
+            }
+            Err(err) => Err(HfIdError(err.to_string())),
         }
     }
 }
 
-/// Fail-closed resolver used when `HFID_RESOLVE_URL` / `READER_RESOLVE_SECRET`
-/// is unconfigured. Always errors so every scan is rejected rather than
-/// silently authorizing against a blank secret.
-pub struct NullResolveClient;
+/// Fail-closed client used when `READER_RESOLVE_SECRET` is unconfigured. Always
+/// errors so every claim/wait is rejected rather than talking to central with a
+/// blank secret.
+pub struct NullHfIdClient;
 
 #[async_trait]
-impl ResolveClient for NullResolveClient {
-    async fn resolve(&self, _uid: &str) -> Result<ResolveResponse, ResolveError> {
-        Err(ResolveError(
-            "HF-ID resolve not configured (set HFID_RESOLVE_URL + READER_RESOLVE_SECRET)".into(),
+impl HfIdClient for NullHfIdClient {
+    async fn claim(&self, _reader_id: &str) -> Result<String, HfIdError> {
+        Err(HfIdError(
+            "HF-ID pairing not configured (set HFID_BASE_URL + READER_RESOLVE_SECRET)".into(),
         ))
     }
-}
 
-/// Authorization decision for a resolved card. Pure so it is unit-testable
-/// without any I/O.
-///
-/// Authorized iff the badge was found, the employee is active, NOT pending
-/// (staged-rollout gate), and the required app grant is present.
-pub fn authorize(resp: &ResolveResponse, required_app: &str) -> bool {
-    resp.found
-        && resp.active
-        && !resp.pending
-        && resp.apps.iter().any(|app| app == required_app)
-}
-
-// =============================================================================
-// Constant-time secret compare
-// =============================================================================
-
-/// Constant-time byte-slice equality for the reader secret compare. Length is
-/// checked up front (leaking only the length of a shared secret, which is
-/// acceptable); the byte loop then runs in time independent of WHERE the
-/// mismatch is, so a timing side-channel can't be walked to recover the
-/// secret one byte at a time.
-pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
+    async fn wait(&self, _claim_token: &str) -> Result<WaitOutcome, HfIdError> {
+        Err(HfIdError(
+            "HF-ID pairing not configured (set HFID_BASE_URL + READER_RESOLVE_SECRET)".into(),
+        ))
     }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 // =============================================================================
@@ -213,27 +254,31 @@ struct PendingLogin {
 
 /// A login_token that `wait` has handed to a paired browser but `card-login`
 /// has not yet consumed. Split out from `pending` so the two consume points —
-/// `wait` (keyed by reader_id) and `card-login` (keyed by login_token) — never
-/// contend for the same map entry: `wait` MOVES the entry `pending → delivered`.
+/// `wait` (keyed by the pairing key) and `card-login` (keyed by login_token) —
+/// never contend for the same map entry: `wait` MOVES the entry
+/// `pending → delivered`.
 struct DeliveredLogin {
     user_id: i64,
     expires_at: Instant,
 }
 
+/// A browser ↔ central-pairing binding. The `reader_claim` cookie holds a local
+/// opaque token that maps HERE to the `central_claim_token` the PMS long-polls
+/// against — so the central token never leaves the server.
 struct Claim {
-    reader_id: String,
+    central_claim_token: String,
     expires_at: Instant,
 }
 
 #[derive(Default)]
 struct ReaderStoreInner {
-    /// reader_id → the one pending login for that reader (overwritten on each
-    /// new tap). Moved to `delivered` when `wait` hands out its token.
+    /// pairing key → the one pending login for that pairing (overwritten on
+    /// each new tap). Moved to `delivered` when `wait` hands out its token.
     pending: HashMap<String, PendingLogin>,
     /// login_token → a delivered-but-unconsumed login. `card-login` consumes
     /// from here (one-time). Keyed by token because that is all card-login has.
     delivered: HashMap<String, DeliveredLogin>,
-    /// claim_token → the reader_id a browser paired to.
+    /// local cookie claim_token → the central claim_token a browser paired to.
     claims: HashMap<String, Claim>,
 }
 
@@ -241,8 +286,9 @@ struct ReaderStoreInner {
 /// `Arc<RwLock<_>>` so a single instance shared via `AppState` is seen by
 /// every concurrent request (same style as `middleware::rate_limit`).
 ///
-/// Single-process only — fine while the backend runs as one container. Taps
-/// and the paired login screen always hit the same process.
+/// Single-process only — fine while the backend runs as one container. The
+/// paired login screen always hits the same process across its claim/wait/
+/// card-login sequence.
 #[derive(Clone, Default)]
 pub struct ReaderStore {
     inner: Arc<RwLock<ReaderStoreInner>>,
@@ -253,14 +299,20 @@ impl ReaderStore {
         Self::default()
     }
 
-    /// Stash a one-time pending login for `reader_id`, returning the fresh
-    /// `login_token`. Overwrites any existing pending login for that reader.
-    pub fn put_pending(&self, reader_id: &str, user_id: i64) -> String {
+    /// Stash a one-time pending login under `key`, returning the fresh
+    /// `login_token`. Overwrites any existing pending login for that key.
+    ///
+    /// In the central-pairing flow `GET /api/reader/wait` calls this with the
+    /// pairing's central claim_token as the key, then immediately
+    /// [`take_pending_login_token`](Self::take_pending_login_token) to move it
+    /// into `delivered` — the two-step keeps the `card-login` consume point
+    /// reading a separate map.
+    pub fn put_pending(&self, key: &str, user_id: i64) -> String {
         let login_token = random_token();
         let mut guard = self.inner.write().expect("reader store poisoned");
         prune_pending(&mut guard.pending);
         guard.pending.insert(
-            reader_id.to_string(),
+            key.to_string(),
             PendingLogin {
                 user_id,
                 login_token: login_token.clone(),
@@ -270,19 +322,20 @@ impl ReaderStore {
         login_token
     }
 
-    /// Deliver-once from `pending`: remove the pending login for `reader_id`
-    /// (if present and unexpired), MOVE it into `delivered` keyed by its
+    /// Deliver-once from `pending`: remove the pending login for `key` (if
+    /// present and unexpired), MOVE it into `delivered` keyed by its
     /// login_token, and return that token. Used by `GET /api/reader/wait`.
     ///
     /// Moving (rather than plain-removing) is what lets `card-login` later
-    /// resolve the same token to a user via [`take_user_for_login_token`] — the
-    /// two consume points read different maps, so `wait` and `card-login` never
-    /// race for one entry. The delivered copy carries a fresh `PENDING_TTL` so
-    /// the browser's immediate follow-up `card-login` always finds it.
-    pub fn take_pending_login_token(&self, reader_id: &str) -> Option<String> {
+    /// resolve the same token to a user via [`take_user_for_login_token`](Self::take_user_for_login_token)
+    /// — the two consume points read different maps, so `wait` and `card-login`
+    /// never race for one entry. The delivered copy carries a fresh
+    /// `PENDING_TTL` so the browser's immediate follow-up `card-login` always
+    /// finds it.
+    pub fn take_pending_login_token(&self, key: &str) -> Option<String> {
         let mut guard = self.inner.write().expect("reader store poisoned");
         let now = Instant::now();
-        let pending = match guard.pending.remove(reader_id) {
+        let pending = match guard.pending.remove(key) {
             Some(p) if p.expires_at > now => p,
             _ => return None,
         };
@@ -310,29 +363,32 @@ impl ReaderStore {
         }
     }
 
-    /// Bind a browser to `reader_id`, returning the fresh `claim_token` to set
-    /// as the `reader_claim` cookie. Used by `POST /api/reader/claim`.
-    pub fn put_claim(&self, reader_id: &str) -> String {
+    /// Bind a browser to a `central_claim_token`, returning the fresh LOCAL
+    /// claim_token to set as the `reader_claim` cookie. Used by
+    /// `POST /api/reader/claim`. Keeping the central token server-side (the
+    /// browser only holds the opaque local handle) is a small defence-in-depth
+    /// layer — a stolen cookie can't be replayed straight against HF-ID.
+    pub fn put_claim(&self, central_claim_token: &str) -> String {
         let claim_token = random_token();
         let mut guard = self.inner.write().expect("reader store poisoned");
         prune_claims(&mut guard.claims);
         guard.claims.insert(
             claim_token.clone(),
             Claim {
-                reader_id: reader_id.to_string(),
+                central_claim_token: central_claim_token.to_string(),
                 expires_at: Instant::now() + CLAIM_TTL,
             },
         );
         claim_token
     }
 
-    /// Resolve a `reader_claim` cookie value back to its reader_id (if the
-    /// claim exists and has not expired). Read-only — the claim persists for
+    /// Resolve a `reader_claim` cookie value back to its central claim_token (if
+    /// the claim exists and has not expired). Read-only — the claim persists for
     /// its whole TTL so the terminal can wait across multiple taps.
     pub fn resolve_claim(&self, claim_token: &str) -> Option<String> {
         let guard = self.inner.read().expect("reader store poisoned");
         match guard.claims.get(claim_token) {
-            Some(c) if c.expires_at > Instant::now() => Some(c.reader_id.clone()),
+            Some(c) if c.expires_at > Instant::now() => Some(c.central_claim_token.clone()),
             _ => None,
         }
     }
@@ -365,38 +421,38 @@ fn random_token() -> String {
 // Reader state carried by AppState
 // =============================================================================
 
-/// Cheap-to-clone bundle of the reader feature's runtime state: the pending
-/// store, the resolve client, and the two config knobs the scan route needs.
+/// Cheap-to-clone bundle of the reader feature's runtime state: the pending /
+/// claim store, the central HF-ID pairing client, and the HF-ID base URL (used
+/// to fetch the JWKS when verifying an assertion).
 #[derive(Clone)]
 pub struct ReaderState {
     pub store: ReaderStore,
-    pub resolve: Arc<dyn ResolveClient>,
-    /// Device ↔ PMS secret (`READER_SECRET`). `None` ⇒ scan fails closed.
-    pub reader_secret: Option<String>,
-    /// App grant a badge must carry to be authorized (`READER_REQUIRED_APP`).
-    pub required_app: String,
+    pub hfid: Arc<dyn HfIdClient>,
+    /// Central HF-ID base URL (`HFID_BASE_URL`). Drives both the claim/wait
+    /// endpoints (inside `hfid`) and the JWKS endpoint the `wait` route passes
+    /// to `middleware::hfid_assertion::verify_hfid_assertion`.
+    pub base_url: String,
 }
 
 impl ReaderState {
-    /// Build from a [`ReaderConfig`]. Wires [`HttpResolveClient`] only when
-    /// BOTH the central URL and its secret are present; otherwise
-    /// [`NullResolveClient`] (fail closed).
+    /// Build from a [`ReaderConfig`]. Wires [`HttpHfIdClient`] only when the
+    /// PMS↔central secret is present; otherwise [`NullHfIdClient`] (fail
+    /// closed). The base URL always has a value (config default).
     pub fn from_config(cfg: ReaderConfig) -> Self {
-        let resolve: Arc<dyn ResolveClient> = match (cfg.resolve_url, cfg.resolve_secret) {
-            (Some(url), Some(secret)) => Arc::new(HttpResolveClient::new(url, secret)),
-            _ => {
+        let hfid: Arc<dyn HfIdClient> = match cfg.resolve_secret {
+            Some(secret) => Arc::new(HttpHfIdClient::new(cfg.base_url.clone(), secret)),
+            None => {
                 tracing::info!(
-                    "reader: HF-ID resolve not configured — card scans will be rejected \
-                     (set HFID_RESOLVE_URL + READER_RESOLVE_SECRET to enable)"
+                    "reader: HF-ID pairing not configured — card taps will be rejected \
+                     (set READER_RESOLVE_SECRET, and HFID_BASE_URL if not the default, to enable)"
                 );
-                Arc::new(NullResolveClient)
+                Arc::new(NullHfIdClient)
             }
         };
         Self {
             store: ReaderStore::new(),
-            resolve,
-            reader_secret: cfg.reader_secret,
-            required_app: cfg.required_app,
+            hfid,
+            base_url: cfg.base_url,
         }
     }
 
@@ -495,65 +551,6 @@ fn is_unique_violation(err: &sqlx::Error) -> bool {
 mod tests {
     use super::*;
 
-    fn resp(found: bool, active: bool, pending: bool, apps: &[&str]) -> ResolveResponse {
-        ResolveResponse {
-            found,
-            badge: Some("B123".into()),
-            display_name: Some("Nok".into()),
-            apps: apps.iter().map(|s| s.to_string()).collect(),
-            active,
-            pending,
-        }
-    }
-
-    #[test]
-    fn authorize_true_only_for_found_active_nonpending_with_app() {
-        assert!(authorize(&resp(true, true, false, &["hotel"]), "hotel"));
-    }
-
-    #[test]
-    fn authorize_rejects_missing_app_grant() {
-        assert!(!authorize(&resp(true, true, false, &["payroll"]), "hotel"));
-        assert!(!authorize(&resp(true, true, false, &[]), "hotel"));
-    }
-
-    #[test]
-    fn authorize_rejects_not_found_inactive_or_pending() {
-        assert!(!authorize(&resp(false, true, false, &["hotel"]), "hotel"));
-        assert!(!authorize(&resp(true, false, false, &["hotel"]), "hotel"));
-        assert!(!authorize(&resp(true, true, true, &["hotel"]), "hotel"));
-    }
-
-    #[test]
-    fn resolve_response_deserializes_terse_negative() {
-        // A `{"found":false}` body must decode without the other keys.
-        let r: ResolveResponse = serde_json::from_str(r#"{"found":false}"#).unwrap();
-        assert!(!r.found);
-        assert!(!r.active);
-        assert!(!r.pending);
-        assert!(r.apps.is_empty());
-        assert!(r.badge.is_none());
-    }
-
-    #[test]
-    fn resolve_response_deserializes_full_positive() {
-        let r: ResolveResponse = serde_json::from_str(
-            r#"{"found":true,"badge":"B7","display_name":"Nok","apps":["hotel","payroll"],"active":true,"pending":false}"#,
-        )
-        .unwrap();
-        assert!(authorize(&r, "hotel"));
-        assert_eq!(r.badge.as_deref(), Some("B7"));
-        assert_eq!(r.display_name.as_deref(), Some("Nok"));
-    }
-
-    #[test]
-    fn ct_eq_matches_only_identical_slices() {
-        assert!(ct_eq(b"super-secret", b"super-secret"));
-        assert!(!ct_eq(b"super-secret", b"super-secreT"));
-        assert!(!ct_eq(b"short", b"longer-value"));
-        assert!(ct_eq(b"", b""));
-    }
-
     #[test]
     fn random_token_is_64_hex_chars_and_unique() {
         let a = random_token();
@@ -564,26 +561,26 @@ mod tests {
     }
 
     #[test]
-    fn pending_login_delivers_once_by_reader_id() {
+    fn pending_login_delivers_once_by_key() {
         let store = ReaderStore::new();
-        let token = store.put_pending("reader-1", 42);
+        let token = store.put_pending("pairing-1", 42);
         assert_eq!(token.len(), 64);
         // First take delivers, second is empty (deliver-once).
-        assert_eq!(store.take_pending_login_token("reader-1"), Some(token));
-        assert_eq!(store.take_pending_login_token("reader-1"), None);
+        assert_eq!(store.take_pending_login_token("pairing-1"), Some(token));
+        assert_eq!(store.take_pending_login_token("pairing-1"), None);
     }
 
     #[test]
-    fn pending_login_overwrites_previous_for_same_reader() {
+    fn pending_login_overwrites_previous_for_same_key() {
         let store = ReaderStore::new();
-        let first = store.put_pending("reader-1", 1);
-        let second = store.put_pending("reader-1", 2);
+        let first = store.put_pending("pairing-1", 1);
+        let second = store.put_pending("pairing-1", 2);
         assert_ne!(first, second);
         // The overwritten first token was never delivered → not redeemable.
         assert_eq!(store.take_user_for_login_token(&first), None);
         // Deliver the surviving pending, then redeem it → user 2.
         assert_eq!(
-            store.take_pending_login_token("reader-1").as_deref(),
+            store.take_pending_login_token("pairing-1").as_deref(),
             Some(second.as_str())
         );
         assert_eq!(store.take_user_for_login_token(&second), Some(2));
@@ -592,29 +589,28 @@ mod tests {
     #[test]
     fn take_user_for_login_token_is_one_time() {
         let store = ReaderStore::new();
-        let token = store.put_pending("reader-9", 7);
+        let token = store.put_pending("pairing-9", 7);
         // wait delivers the token (pending → delivered); card-login consumes it.
         assert_eq!(
-            store.take_pending_login_token("reader-9").as_deref(),
+            store.take_pending_login_token("pairing-9").as_deref(),
             Some(token.as_str())
         );
         assert_eq!(store.take_user_for_login_token(&token), Some(7));
         // Second use rejected — the token was consumed.
         assert_eq!(store.take_user_for_login_token(&token), None);
-        // And the reader-id path is also empty now.
-        assert_eq!(store.take_pending_login_token("reader-9"), None);
+        // And the pairing-key path is also empty now.
+        assert_eq!(store.take_pending_login_token("pairing-9"), None);
     }
 
     #[test]
-    fn scan_wait_card_login_round_trip() {
-        // The real end-to-end sequence, which the earlier single-map store
-        // silently broke: scan stashes a pending login, wait delivers the token
-        // to the paired browser, card-login redeems it. Regression guard —
+    fn wait_card_login_round_trip() {
+        // The real central-pairing sequence: `wait` stashes a pending login and
+        // moves it to delivered, `card-login` redeems it. Regression guard —
         // wait and card-login must NOT contend for the same entry.
         let store = ReaderStore::new();
-        store.put_pending("frontdesk-1", 99); // POST /api/reader/scan
+        store.put_pending("central-tok", 99); // wait: stash after verifying the assertion
         let token = store
-            .take_pending_login_token("frontdesk-1") // GET /api/reader/wait
+            .take_pending_login_token("central-tok") // wait: deliver to the paired browser
             .expect("wait must deliver the freshly-stashed login token");
         assert_eq!(
             store.take_user_for_login_token(&token), // POST /api/auth/card-login
@@ -632,35 +628,40 @@ mod tests {
     }
 
     #[test]
-    fn claim_round_trips_reader_id() {
+    fn claim_round_trips_central_claim_token() {
         let store = ReaderStore::new();
-        let claim = store.put_claim("reader-42");
-        assert_eq!(store.resolve_claim(&claim).as_deref(), Some("reader-42"));
-        // Unknown claim resolves to None.
+        // put_claim stores the CENTRAL claim_token and returns a LOCAL cookie
+        // token; resolve_claim maps the cookie back to the central token.
+        let cookie = store.put_claim("central-claim-abc");
+        assert_eq!(cookie.len(), 64);
+        assert_ne!(cookie, "central-claim-abc", "cookie must be a local handle");
+        assert_eq!(
+            store.resolve_claim(&cookie).as_deref(),
+            Some("central-claim-abc")
+        );
+        // Unknown cookie resolves to None.
         assert_eq!(store.resolve_claim("bogus"), None);
     }
 
     #[test]
-    fn null_resolve_client_always_errors() {
+    fn null_hfid_client_always_errors() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let client = NullResolveClient;
-        let result = rt.block_on(client.resolve("uid-123"));
-        assert!(result.is_err());
+        let client = NullHfIdClient;
+        assert!(rt.block_on(client.claim("reader-1")).is_err());
+        assert!(rt.block_on(client.wait("claim-1")).is_err());
     }
 
     #[test]
-    fn reader_state_without_config_uses_null_resolver_and_fails_closed() {
-        // No URL/secret → NullResolveClient → every resolve errors → the scan
-        // route rejects (fail closed). Also reader_secret stays None → the
-        // secret gate rejects too.
+    fn reader_state_without_secret_uses_null_client_and_fails_closed() {
+        // No secret → NullHfIdClient → every claim/wait errors (fail closed),
+        // even though base_url carries the config default.
         let state = ReaderState::from_config(ReaderConfig {
-            resolve_url: None,
+            base_url: "http://192.168.1.250".into(),
             resolve_secret: None,
-            reader_secret: None,
-            required_app: "hotel".into(),
         });
-        assert!(state.reader_secret.is_none());
+        assert_eq!(state.base_url, "http://192.168.1.250");
         let rt = tokio::runtime::Runtime::new().unwrap();
-        assert!(rt.block_on(state.resolve.resolve("x")).is_err());
+        assert!(rt.block_on(state.hfid.claim("r")).is_err());
+        assert!(rt.block_on(state.hfid.wait("c")).is_err());
     }
 }

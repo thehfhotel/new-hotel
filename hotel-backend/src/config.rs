@@ -441,47 +441,53 @@ fn optional_env(var_name: &str) -> Option<String> {
     }
 }
 
+/// Default central HF-ID base URL. Overridden with `HFID_BASE_URL` in any real
+/// deploy. This is the central HF-ID (fingerprint-time-logger) service's
+/// published port on the evergreen server LAN — verified reachable from inside
+/// the backend container (a container reaches the host's published `:5000` via
+/// this LAN IP). Note: this is the SERVER-side IP; the reader uses the WiFi-side
+/// alias `192.168.1.250:5000` instead.
+const DEFAULT_HFID_BASE_URL: &str = "http://192.168.100.228:5000";
+
 /// Configuration for the NFC staff-card login feature (`service::reader`,
 /// `routes::reader`, `routes::auth::card_login`).
 ///
-/// Two DISTINCT secrets keep the blast radius small if the reader device is
-/// compromised:
-///   * `reader_secret` (`READER_SECRET`) — device ↔ PMS. Presented by the
-///     reader on `POST /api/reader/scan` in the `X-Reader-Secret` header and
-///     compared constant-time. `None` (unset/empty) ⇒ every scan is rejected
-///     (fail closed).
-///   * `resolve_secret` (`READER_RESOLVE_SECRET`) — PMS ↔ central HF-ID.
-///     Sent by the PMS to `{resolve_url}/api/private/reader/resolve` in the
-///     same header name. `None` (or a missing `resolve_url`) ⇒ the resolve
-///     client is the `NullResolveClient` and every scan is rejected.
+/// The physical reader posts taps to the CENTRAL HF-ID service; this PMS
+/// consumes HF-ID's pairing endpoints (`/api/private/reader/claim|wait`) on
+/// behalf of the login screen and verifies the returned RS256 assertion.
 ///
-/// `resolve_url` (`HFID_RESOLVE_URL`) is the central registry base URL (e.g.
-/// `http://192.168.1.250` or an internal URL). `required_app`
-/// (`READER_REQUIRED_APP`, default `"hotel"`) is the app grant a badge must
-/// carry in the resolve response's `apps` list to be authorized here.
+///   * `base_url` (`HFID_BASE_URL`, default [`DEFAULT_HFID_BASE_URL`]) — the
+///     central HF-ID base URL. Drives the claim/wait endpoints and the JWKS
+///     endpoint (`{base_url}/oidc/jwks`) used to verify assertions.
+///   * `resolve_secret` (`READER_RESOLVE_SECRET`) — PMS ↔ central HF-ID shared
+///     secret, sent in the `X-Reader-Secret` header on the claim/wait calls.
+///     `None` (unset/empty) ⇒ the pairing client is `NullHfIdClient` and every
+///     claim/wait is rejected (fail closed).
 ///
-/// Both secrets ALSO flow through the `/run/secrets` hydrator (see
-/// `secrets.rs` — files `reader_secret` / `reader_resolve_secret`), so a
-/// production deploy can mount them as Docker secrets; env vars still win.
-#[derive(Debug, Clone, Default)]
+/// The secret ALSO flows through the `/run/secrets` hydrator (see `secrets.rs`
+/// — file `reader_resolve_secret`), so a production deploy can mount it as a
+/// Docker secret; env vars still win.
+#[derive(Debug, Clone)]
 pub struct ReaderConfig {
-    pub resolve_url: Option<String>,
+    pub base_url: String,
     pub resolve_secret: Option<String>,
-    pub reader_secret: Option<String>,
-    pub required_app: String,
+}
+
+impl Default for ReaderConfig {
+    fn default() -> Self {
+        Self {
+            base_url: DEFAULT_HFID_BASE_URL.to_string(),
+            resolve_secret: None,
+        }
+    }
 }
 
 impl ReaderConfig {
     pub fn from_env() -> Self {
         Self {
-            resolve_url: optional_env("HFID_RESOLVE_URL"),
+            base_url: optional_env("HFID_BASE_URL")
+                .unwrap_or_else(|| DEFAULT_HFID_BASE_URL.to_string()),
             resolve_secret: optional_env("READER_RESOLVE_SECRET"),
-            reader_secret: optional_env("READER_SECRET"),
-            required_app: std::env::var("READER_REQUIRED_APP")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "hotel".to_string()),
         }
     }
 }

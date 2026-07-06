@@ -77,11 +77,13 @@ is_allowlisted() {
         # store as auth::login; sessions are never per-site.
         auth::cf_login) return 0 ;;
         # (A) NFC staff-card login — mints the SAME global users+sessions store
-        # as auth::login/cf_login (sessions are never per-site); reader::scan
-        # auto-provisions into that same global ht_users table. HF-Hotel front-
-        # desk device only, no per-site Ville variant.
+        # as auth::login/cf_login (sessions are never per-site). HF-Hotel front-
+        # desk only, no per-site Ville variant. (The badge auto-provision into
+        # the global ht_users table now happens in reader::wait, a GET — out of
+        # this gate's post/put/patch/delete scope; reader::claim is a POST but
+        # only calls central HF-ID + the in-memory store, never new_pool, so it
+        # passes on its own merits without an allowlist entry.)
         auth::card_login) return 0 ;;
-        reader::scan) return 0 ;;
         # (A) Legacy `/api/bookings/by-number/{book_no}/notes` path — HF-Hotel-
         # only legacy booking-notes surface; the by-number lookups read new_pool
         # and there is no Ville variant of this path. TODO(ville-bundle).
