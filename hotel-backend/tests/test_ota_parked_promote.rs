@@ -256,7 +256,7 @@ async fn parked_roomless_booking_promotes_to_create_on_room_assign() {
         "(b) assigning the first room must enqueue exactly ONE write-back; got {jobs:?}"
     );
     assert_eq!(
-        jobs[0].0, "CreateBooking",
+        jobs[0].0, "create_booking",
         "(b) the promoted job must be a byte-parity CreateBooking, not a ModifyBooking"
     );
 
@@ -348,7 +348,7 @@ async fn already_mirrored_booking_takes_modify_path() {
 
     let jobs = writeback_intents(&pool, agg).await;
     assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].0, "CreateBooking", "create-with-room enqueues CreateBooking");
+    assert_eq!(jobs[0].0, "create_booking", "create-with-room enqueues CreateBooking");
 
     // Simulate worker back-population of the legacy id → booking is now mirrored.
     sqlx::query("UPDATE ht_bookings SET legacy_book_id = 'R999002' WHERE book_id = $1")
@@ -389,11 +389,11 @@ async fn already_mirrored_booking_takes_modify_path() {
         .map(|(i, _)| i)
         .collect();
     assert!(
-        intents.iter().any(|i| i == "ModifyBooking"),
+        intents.iter().any(|i| i == "modify_booking"),
         "(d) editing an already-mirrored booking must enqueue a ModifyBooking; got {intents:?}"
     );
     assert_eq!(
-        intents.iter().filter(|i| *i == "CreateBooking").count(),
+        intents.iter().filter(|i| *i == "create_booking").count(),
         1,
         "(d) must NOT enqueue a second CreateBooking; got {intents:?}"
     );
