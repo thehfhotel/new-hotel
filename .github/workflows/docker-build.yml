@@ -902,6 +902,8 @@ jobs:
           # so a future rotation only touches the GH secret + this line.
           VILLE_DB_PASSWORD:       ${{ secrets.POSTGRES_PASSWORD }}
           SLACK_WEBHOOK_URL:       ${{ secrets.SLACK_WEBHOOK }}
+          READER_RESOLVE_SECRET:   ${{ secrets.READER_RESOLVE_SECRET }}
+          CF_ACCESS_HK_AUD:        ${{ secrets.CF_ACCESS_HK_AUD }}
           LEGACY_SYNC_ENABLED:     ${{ secrets.LEGACY_SYNC_ENABLED }}
           LEGACY_SYNC_SHADOW_MODE: ${{ secrets.LEGACY_SYNC_SHADOW_MODE }}
           AUTH_ENABLED:            ${{ vars.AUTH_ENABLED || 'false' }}
@@ -1009,6 +1011,8 @@ jobs:
             --arg POSTGRES_PASSWORD   "$POSTGRES_PASSWORD" \
             --arg VILLE_DB_PASSWORD   "$VILLE_DB_PASSWORD" \
             --arg SLACK_WEBHOOK_URL   "$SLACK_WEBHOOK_URL" \
+            --arg READER_RESOLVE_SECRET "$READER_RESOLVE_SECRET" \
+            --arg CF_ACCESS_HK_AUD    "$CF_ACCESS_HK_AUD" \
             --arg LEGACY_SYNC_ENABLED "$LEGACY_SYNC_ENABLED" \
             --arg LEGACY_SYNC_SHADOW_MODE "$LEGACY_SYNC_SHADOW_MODE" \
             --arg AUTH_ENABLED        "$AUTH_ENABLED" \
@@ -1039,6 +1043,8 @@ jobs:
                 POSTGRES_USER:                $POSTGRES_USER,
                 POSTGRES_PASSWORD:            $POSTGRES_PASSWORD,
                 SLACK_WEBHOOK_URL:            $SLACK_WEBHOOK_URL,
+                READER_RESOLVE_SECRET:        $READER_RESOLVE_SECRET,
+                CF_ACCESS_HK_AUD:             $CF_ACCESS_HK_AUD,
                 LEGACY_SYNC_ENABLED:          $LEGACY_SYNC_ENABLED,
                 LEGACY_SYNC_SHADOW_MODE:      $LEGACY_SYNC_SHADOW_MODE,
                 AUTH_ENABLED:                 $AUTH_ENABLED,

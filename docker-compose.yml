@@ -192,6 +192,14 @@ services:
       # (a public identifier) if the CF application is ever recreated.
       - CF_AUTO_LOGIN=${CF_AUTO_LOGIN:-true}
       - CF_ACCESS_AUD=${CF_ACCESS_AUD:-}
+      # Central HF-ID card-login (PMS↔central, PR #222) — card login dark
+      # when unset. Delivered via the deploy payload like other secrets;
+      # do NOT hand-edit on the host (each deploy rewrites compose + .env).
+      - READER_RESOLVE_SECRET=${READER_RESOLVE_SECRET:-}
+      # Housekeeping maid surface (hotel.thehfhotel.org/hk*, PR #231) —
+      # AUD tag of its path-scoped CF Access app; every /api/hk 401s
+      # while unset (ships dark).
+      - CF_ACCESS_HK_AUD=${CF_ACCESS_HK_AUD:-}
       # Alias map for multi-identity users: `from1=to1,from2=to2`,
       # case-insensitive on the `from` side, applied AFTER the CF JWT is
       # verified and BEFORE the ht_users.email lookup (it can only remap
