@@ -155,7 +155,9 @@ pub async fn availability_by_type(
 
 /// Pick one free room of `type_id` for the stay window (lowest room number
 /// first — deterministic, matches the desk habit of filling low rooms first).
-/// `None` ⇒ the type is sold out for the window.
+/// `None` ⇒ the type is sold out for the window, or cannot sleep `guests`
+/// (the availability endpoint filters capacity, but a direct create must not
+/// trust the caller to have gone through it).
 ///
 /// NOTE: pick → create is not serialized against a concurrent pick of the
 /// same room (same race window the walk-in / booking form has today; the
@@ -165,6 +167,7 @@ pub async fn pick_free_room(
     type_id: i32,
     check_in: NaiveDate,
     check_out: NaiveDate,
+    guests: i32,
 ) -> Result<Option<PickedRoom>, sqlx::Error> {
     use sqlx::Row;
 
@@ -174,6 +177,7 @@ pub async fn pick_free_room(
           FROM ht_rooms_new r
           JOIN ht_room_types rt ON rt.type_id = r.room_type_id
          WHERE r.room_type_id = $3
+           AND (rt.type_max_guests IS NULL OR rt.type_max_guests >= $4)
            AND {FREE_ROOM_PREDICATE}
          ORDER BY r.room_no
          LIMIT 1
@@ -184,6 +188,7 @@ pub async fn pick_free_room(
         .bind(check_in)
         .bind(check_out)
         .bind(type_id)
+        .bind(guests)
         .fetch_optional(pool)
         .await?;
 
