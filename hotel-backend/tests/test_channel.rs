@@ -308,6 +308,15 @@ async fn loyalty_channel_end_to_end() {
         other => panic!("expected Conflict for sold-out window, got {other:?}"),
     }
 
+    // Party larger than the type sleeps ⇒ refuse even with rooms free
+    // elsewhere (a direct create must not trust the availability filter).
+    let mut oversized = hold_cmd(&format!("{BOOK_NO_PREFIX}-X2"), type_id, w2.0, w2.1);
+    oversized.guests = 3;
+    match svc.create_hold(oversized).await {
+        Err(ServiceError::Conflict(_)) => {}
+        other => panic!("expected Conflict for oversized party, got {other:?}"),
+    }
+
     // Free the seeded conflicts for the rest of the scenario.
     sqlx::query("DELETE FROM ht_checkins WHERE cin_notes = 'TEST_loyalty_channel'")
         .execute(&pool)

@@ -176,14 +176,20 @@ impl ChannelService {
                     ))
                 })?;
 
-        let room = channel_repo::pick_free_room(&self.pg, cmd.room_type_id, cmd.check_in, cmd.check_out)
-            .await?
-            .ok_or_else(|| {
-                ServiceError::conflict(format!(
-                    "no {type_name} room available for {} to {}",
-                    cmd.check_in, cmd.check_out
-                ))
-            })?;
+        let room = channel_repo::pick_free_room(
+            &self.pg,
+            cmd.room_type_id,
+            cmd.check_in,
+            cmd.check_out,
+            cmd.guests,
+        )
+        .await?
+        .ok_or_else(|| {
+            ServiceError::conflict(format!(
+                "no {type_name} room available for {} guest(s), {} to {}",
+                cmd.guests, cmd.check_in, cmd.check_out
+            ))
+        })?;
 
         // Guest: match (exact phone + case-insensitive name) or create.
         let customer_id = match self
