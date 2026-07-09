@@ -25,6 +25,8 @@ rides an intentionally-open PR so the list stays visible; strike items as they c
 | V9 | **Deposit refund on legacy-origin folios** — `cr_legacy_ds_id` backfill, then verify the WARN-no-op class is gone | deposit refunds for iHOTEL-created stays |
 | V10 | **Walk-up receipt VAT attribution scope** (finance decision + verify either app's tax report against `HT_Receipt_*`) — elevated: 4.3k receipts/yr | trusting tax reports |
 
+| V11 | **Layout-edit writeback echo round-trip** (#236) — move one tile in จัดผัง mode at night, verify `HT_Rooms.Room_X/Room_y` updated + iHOTEL board shows it + CT echo converges (no reconcile row survives a sweep tick), move it back, then flip `LAYOUT_WRITEBACK_ENABLED` | self-service — NO reception coordination needed (tile positions aren't guest-facing) | CONTEXT.md "Layout-edit drag"; issue #236 |
+
 ## Standing monitors (no action until they fire)
 
 - Reconcile sweep: rooms + future-entity projection changes still need manual ack (customers/
