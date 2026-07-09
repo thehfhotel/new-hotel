@@ -159,6 +159,29 @@ pub trait BookingRepository: Send + Sync {
         write: BookingWrite<'_>,
     ) -> Result<i32, sqlx::Error>;
 
+    /// Look up an existing booking by its OTA natural key (migration 076).
+    /// Returns `(book_id, book_no)` when a row with this
+    /// `(book_channel, book_ext_ref)` already exists — the caller-idempotency
+    /// backstop consulted before insert (and after a unique-violation race).
+    async fn find_by_channel_ext_ref(
+        &self,
+        pool: &PgPool,
+        channel: &str,
+        ext_ref: &str,
+    ) -> Result<Option<(i32, String)>, sqlx::Error>;
+
+    /// Stamp the OTA provenance / natural key onto a freshly-inserted booking
+    /// (migration 076). Only called when both `channel` and `ext_ref` are
+    /// present; the partial UNIQUE index `ux_ht_bookings_channel_ext_ref` is
+    /// the concurrent-race backstop and surfaces here as a 23505 error.
+    async fn set_booking_provenance(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        book_id: i32,
+        channel: &str,
+        ext_ref: &str,
+    ) -> Result<(), sqlx::Error>;
+
     /// Insert one row into `ht_booking_rooms`.
     async fn insert_booking_room(
         &self,
@@ -570,6 +593,51 @@ impl BookingRepository for PgBookingRepository {
         .await?;
 
         Ok(rec.book_id)
+    }
+
+    async fn find_by_channel_ext_ref(
+        &self,
+        pool: &PgPool,
+        channel: &str,
+        ext_ref: &str,
+    ) -> Result<Option<(i32, String)>, sqlx::Error> {
+        // Runtime query (not `query!`): `book_ext_ref` postdates the committed
+        // `.sqlx` offline snapshot, so a compile-time macro would fail the
+        // offline build. Same rationale as `insert_booking_product`. The
+        // partial UNIQUE index guarantees at most one row; `LIMIT 1` is
+        // belt-and-suspenders.
+        let row: Option<(i32, String)> = sqlx::query_as(
+            "SELECT book_id, book_no FROM ht_bookings \
+             WHERE book_channel = $1 AND book_ext_ref = $2 \
+             ORDER BY book_id LIMIT 1",
+        )
+        .bind(channel)
+        .bind(ext_ref)
+        .fetch_optional(pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn set_booking_provenance(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        book_id: i32,
+        channel: &str,
+        ext_ref: &str,
+    ) -> Result<(), sqlx::Error> {
+        // Runtime query (not `query!`): `book_ext_ref` postdates the committed
+        // `.sqlx` offline snapshot. A 23505 here means a concurrent create won
+        // the (book_channel, book_ext_ref) race — the caller rolls back and
+        // re-selects the winner's row.
+        sqlx::query(
+            "UPDATE ht_bookings SET book_channel = $1, book_ext_ref = $2 WHERE book_id = $3",
+        )
+        .bind(channel)
+        .bind(ext_ref)
+        .bind(book_id)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
     }
 
     async fn insert_booking_room(

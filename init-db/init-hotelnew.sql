@@ -180,6 +180,11 @@ CREATE TABLE IF NOT EXISTS ht_bookings (
     book_status VARCHAR(20) DEFAULT 'confirmed',
     book_source VARCHAR(50),
     book_channel VARCHAR(50),
+    -- Migration 076 — OTA Desk → PMS write-back Phase 0. `book_channel` (above,
+    -- previously unwired) + `book_ext_ref` form the caller-idempotency natural
+    -- key so a double-POST of one OTA reservation can't create two bookings.
+    -- PG-canonical only (not mirrored to legacy).
+    book_ext_ref TEXT,
     book_total_amount DECIMAL(12,2) DEFAULT 0,
     book_deposit_amount DECIMAL(12,2) DEFAULT 0,
     book_deposit_date TIMESTAMP,
@@ -216,6 +221,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_ht_bookings_aggregate_id
     ON ht_bookings (aggregate_id) WHERE aggregate_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS ix_ht_bookings_legacy_book_id
     ON ht_bookings (legacy_book_id) WHERE legacy_book_id IS NOT NULL;
+-- Migration 076 — OTA caller-idempotency natural key: at most one booking per
+-- (book_channel, book_ext_ref). Partial predicate exempts every existing
+-- (NULL ext_ref) row.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ht_bookings_channel_ext_ref
+    ON ht_bookings (book_channel, book_ext_ref) WHERE book_ext_ref IS NOT NULL;
 -- Migration 064 (task #53) — active-reminder lookup for the notification bell.
 CREATE INDEX IF NOT EXISTS ix_ht_bookings_active_reminders
     ON ht_bookings (book_checkin) WHERE book_notify_dismissed_at IS NULL;
@@ -2540,6 +2550,15 @@ ON CONFLICT (version) DO NOTHING;
 -- migration as applied so the drift check sees zero pending.
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('075', '075_ht_users_badge.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 076 — ht_bookings OTA provenance / caller-idempotency natural key.
+-- `book_ext_ref TEXT` column + partial UNIQUE index ux_ht_bookings_channel_ext_ref
+-- inlined into the ht_bookings block above (`book_channel` already existed).
+-- This seed row records the migration as applied so the drift check sees zero
+-- pending.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('076', '076_ht_bookings_ota_provenance.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================

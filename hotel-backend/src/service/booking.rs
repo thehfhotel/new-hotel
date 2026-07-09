@@ -79,6 +79,15 @@ pub struct CreateBookingCommand {
     /// layer; the service does not query for these.
     pub writeback_context: BookingWritebackContext,
 
+    /// OTA provenance / caller-idempotency natural key (migration 076).
+    /// `book_channel` = the source channel; `book_ext_ref` = that channel's
+    /// own booking id. Both-or-neither in practice; when both are set,
+    /// [`BookingService::create`] dedupes on `(channel, ext_ref)` so a
+    /// double-POST of one OTA reservation cannot create two bookings. Both
+    /// `None` for every existing (walk-in / manual) caller — unchanged path.
+    pub book_channel: Option<String>,
+    pub book_ext_ref: Option<String>,
+
     /// Where this command originated. Routes populate from auth context.
     pub source: EventSource,
 }
@@ -156,6 +165,11 @@ pub struct BookingWritebackContext {
 pub struct BookingOutcome {
     pub book_id: i32,
     pub aggregate_id: Uuid,
+    /// The EXISTING booking's number when `create` short-circuited on the OTA
+    /// caller-idempotency key (repeat create with the same `(channel,
+    /// ext_ref)`). `None` on the normal create path (the caller already holds
+    /// the freshly-generated number) and from `modify` / `cancel`.
+    pub book_no: Option<String>,
 }
 
 /// Service handle for the booking aggregate.
@@ -188,6 +202,31 @@ impl BookingService {
         validate_stay_range(cmd.check_in, cmd.check_out)?;
         validate_room_assignments(&cmd.rooms)?;
 
+        // Caller idempotency (migration 076 — OTA Desk Phase 0). When this
+        // create carries an OTA natural key (channel + external ref) and a
+        // booking with that pair already exists, a prior create already
+        // inserted the canonical row AND enqueued its byte-parity legacy
+        // write-back. Return that booking unchanged — do NOT insert, enqueue,
+        // or publish again — so a double-POST of one OTA reservation cannot
+        // mint a second ht_bookings row → a second real iHOTEL booking. Only
+        // both-present keys dedupe; every existing (walk-in / manual) caller
+        // passes neither and is unaffected.
+        if let (Some(channel), Some(ext_ref)) =
+            (cmd.book_channel.as_deref(), cmd.book_ext_ref.as_deref())
+        {
+            if let Some((existing_id, existing_no)) = self
+                .repo
+                .find_by_channel_ext_ref(&self.pg, channel, ext_ref)
+                .await?
+            {
+                return Ok(BookingOutcome {
+                    book_id: existing_id,
+                    aggregate_id: aggregate_uuid(AggregateKind::Booking, existing_id),
+                    book_no: Some(existing_no),
+                });
+            }
+        }
+
         let mut tx = self.pg.begin().await?;
 
         let book_id = self
@@ -209,6 +248,47 @@ impl BookingService {
                 },
             )
             .await?;
+
+        // Stamp the OTA provenance + enforce the (channel, ext_ref) natural key
+        // (migration 076). The pre-check above handles the common sequential
+        // double-POST; this UPDATE plus the partial UNIQUE index are the
+        // serializer-of-last-resort for a tight concurrent race that slips two
+        // creates past the SELECT. On the losing side we roll back this
+        // half-built row and return the winner's booking (idempotent — no
+        // duplicate committed either way).
+        if let (Some(channel), Some(ext_ref)) =
+            (cmd.book_channel.as_deref(), cmd.book_ext_ref.as_deref())
+        {
+            match self
+                .repo
+                .set_booking_provenance(&mut tx, book_id, channel, ext_ref)
+                .await
+            {
+                Ok(()) => {}
+                Err(err) if is_unique_violation(&err) => {
+                    // Concurrent create won the race; our tx is poisoned.
+                    // Dropping it rolls back this row, then return the row the
+                    // winner committed.
+                    drop(tx);
+                    let (existing_id, existing_no) = self
+                        .repo
+                        .find_by_channel_ext_ref(&self.pg, channel, ext_ref)
+                        .await?
+                        .ok_or_else(|| {
+                            ServiceError::internal(
+                                "unique violation on (book_channel, book_ext_ref) but no \
+                                 matching booking found on re-select",
+                            )
+                        })?;
+                    return Ok(BookingOutcome {
+                        book_id: existing_id,
+                        aggregate_id: aggregate_uuid(AggregateKind::Booking, existing_id),
+                        book_no: Some(existing_no),
+                    });
+                }
+                Err(err) => return Err(ServiceError::from(err)),
+            }
+        }
 
         for assignment in &cmd.rooms {
             self.repo
@@ -310,7 +390,11 @@ impl BookingService {
 
         tx.commit().await?;
 
-        Ok(BookingOutcome { book_id, aggregate_id })
+        Ok(BookingOutcome {
+            book_id,
+            aggregate_id,
+            book_no: None,
+        })
     }
 
     /// Modify a booking — replaces its rooms + enqueues the writeback diff.
@@ -404,6 +488,7 @@ impl BookingService {
         Ok(BookingOutcome {
             book_id: cmd.book_id,
             aggregate_id,
+            book_no: None,
         })
     }
 
@@ -445,7 +530,19 @@ impl BookingService {
         Ok(BookingOutcome {
             book_id: cmd.book_id,
             aggregate_id,
+            book_no: None,
         })
+    }
+}
+
+/// True when `err` is a PostgreSQL unique-constraint violation (SQLSTATE
+/// 23505). Mirrors the detection idiom in `service::shifts` and the
+/// `create_user` / `set_user_card` bins.
+fn is_unique_violation(err: &sqlx::Error) -> bool {
+    if let sqlx::Error::Database(db_err) = err {
+        db_err.code().as_deref() == Some("23505")
+    } else {
+        false
     }
 }
 
