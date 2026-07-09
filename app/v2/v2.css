@@ -46,6 +46,24 @@
   --v2-fix: #b1542e;       --v2-fix-bg: #f7e8e1;      /* maintenance / dirty */
   --v2-mut: #877e77;       --v2-mut-bg: #ede9e3;      /* neutral / unknown   */
 
+  /* iHOTEL room-state palette (ADR 0003 / #227). The HUE per state is legacy
+     vocabulary, extracted from the decompiled FormRoomMain.cs tile gradients;
+     rendered here as v2-quality shades (readable dark text + faint tint) of
+     the SAME hue. Room-state surfaces must use these — not the v2-native
+     tones above (those stay for bookings/check-ins, which aren't room state).
+       vac  ว่าง                LightGreen  #90EE90
+       stay เข้าพัก              MistyRose → OrangeRed #FF4500
+       res  จอง                 Yellow      #FFFF00
+       out  ยังไม่ได้ Check-Out   DeepSkyBlue #00BFFF
+       dirt รอ ทำความสะอาด       Moccasin    #FFE4B5
+       mtn  ซ่อม                DarkGray    #A9A9A9 */
+  --v2-vac:  #2a7a33;      --v2-vac-bg:  #e2f8e4;     /* ว่าง                */
+  --v2-stay: #c2410c;      --v2-stay-bg: #ffe9e3;     /* เข้าพัก              */
+  --v2-res:  #8f7a00;      --v2-res-bg:  #fdf8cd;     /* จอง                 */
+  --v2-out:  #007399;      --v2-out-bg:  #dcf2fb;     /* ยังไม่ได้ Check-Out   */
+  --v2-dirt: #9c670d;      --v2-dirt-bg: #fdf0da;     /* รอ ทำความสะอาด       */
+  --v2-mtn:  #676767;      --v2-mtn-bg:  #ececec;     /* ซ่อม                */
+
   --v2-radius:    14px;
   --v2-radius-sm: 10px;
   --v2-radius-xs: 8px;
@@ -142,6 +160,19 @@
 .v2 .d-dep  { background: var(--v2-dep); }
 .v2 .d-fix  { background: var(--v2-fix); }
 .v2 .d-mut  { background: var(--v2-mut); }
+/* iHOTEL room-state tones (see the palette block above) */
+.v2 .s-vac  { color: var(--v2-vac);  background: var(--v2-vac-bg); }
+.v2 .s-stay { color: var(--v2-stay); background: var(--v2-stay-bg); }
+.v2 .s-res  { color: var(--v2-res);  background: var(--v2-res-bg); }
+.v2 .s-out  { color: var(--v2-out);  background: var(--v2-out-bg); }
+.v2 .s-dirt { color: var(--v2-dirt); background: var(--v2-dirt-bg); }
+.v2 .s-mtn  { color: var(--v2-mtn);  background: var(--v2-mtn-bg); }
+.v2 .d-vac  { background: var(--v2-vac); }
+.v2 .d-stay { background: var(--v2-stay); }
+.v2 .d-res  { background: var(--v2-res); }
+.v2 .d-out  { background: var(--v2-out); }
+.v2 .d-dirt { background: var(--v2-dirt); }
+.v2 .d-mtn  { background: var(--v2-mtn); }
 
 /* ── Navigation (desktop rail + mobile tab bar) ───────────────────────── */
 .v2 .v2-rail-item {
