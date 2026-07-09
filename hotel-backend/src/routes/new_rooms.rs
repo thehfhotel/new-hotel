@@ -580,14 +580,11 @@ pub async fn update_room_layout(
         ));
     }
     for m in &body.moves {
-        if m.room_x < 0 || m.room_y < 0 {
-            return Err(ApiError::BadRequest(format!(
-                "coordinates must be non-negative (room {}: {}, {})",
-                m.id, m.room_x, m.room_y
-            )));
-        }
-        // (0,0) is the legacy "unplaced" sentinel (`isUnplaced`) — a drop
-        // must never write it, or the tile silently falls off both boards.
+        // Negative coords are LEGAL: iHOTEL's free-pixel WinForms canvas can
+        // persist them, and a verbatim swap with such a tile must round-trip
+        // the exact values (review finding 2026-07-10). Only the (0,0)
+        // unplaced sentinel is forbidden — a drop must never write it, or
+        // the tile silently falls off both boards.
         if m.room_x == 0 && m.room_y == 0 {
             return Err(ApiError::BadRequest(format!(
                 "(0,0) is the unplaced sentinel and cannot be written (room {})",
