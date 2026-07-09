@@ -37,8 +37,16 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // The new "/v2" front-desk experience ships its own shell (rail + bottom nav
   // + its own BranchProvider) and must render WITHOUT the classic sidebar.
   // Treat the whole /v2 subtree as chromeless, like /login.
+  // The "/hk" maid-facing housekeeping surface (employee-login plan Phase 4)
+  // is likewise chromeless: it ships its own minimal mobile shell
+  // (app/hk/layout.tsx) for LINE's in-app browser and must not load the
+  // desktop sidebar, BranchProvider, or the HF One band.
   const isChromeless = pathname
-    ? CHROMELESS_PATHS.has(pathname) || pathname === '/v2' || pathname.startsWith('/v2/')
+    ? CHROMELESS_PATHS.has(pathname) ||
+      pathname === '/v2' ||
+      pathname.startsWith('/v2/') ||
+      pathname === '/hk' ||
+      pathname.startsWith('/hk/')
     : false
 
   if (isChromeless) {

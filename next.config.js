@@ -43,6 +43,17 @@ const nextConfig = {
     const backendUrl = process.env.BACKEND_URL || 'http://backend:3003'
     return [
       {
+        // Maid-facing housekeeping surface: its API lives UNDER /hk so ONE
+        // path-scoped Cloudflare Access application (hotel.thehfhotel.org/hk)
+        // covers both the pages and their API calls — the edge then attaches
+        // the /hk app's Cf-Access-Jwt-Assertion (CF_ACCESS_HK_AUD) to every
+        // request the backend's hk_access middleware verifies. A plain
+        // /api/hk/* call from the browser would instead carry the MAIN app's
+        // assertion and fail the AUD check.
+        source: '/hk/api/:path*',
+        destination: `${backendUrl}/api/hk/:path*`,
+      },
+      {
         source: '/api/:path*',
         destination: `${backendUrl}/api/:path*`,
       },

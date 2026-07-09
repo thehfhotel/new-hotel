@@ -337,6 +337,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => Router::new(),
     };
 
+    // Maid-facing housekeeping surface (`/api/hk/*`, employee-login plan
+    // Phase 4). OWN edge gate instead of the cookie session: every request
+    // must carry a `Cf-Access-Jwt-Assertion` for the /hk Cloudflare Access
+    // application (env `CF_ACCESS_HK_AUD`; grant key `housekeeping`),
+    // verified by `middleware::hk_access` which injects the maid's
+    // `HkIdentity`. FAIL CLOSED — env unset ⇒ every request 401, so the
+    // surface ships dark until the Access wiring lands. Mounted OUTSIDE
+    // `require_auth` (maids have no PMS session) but WITH its own
+    // `ville_write_guard` layer so a `branch=hfville` mutation stays
+    // blocked until `HFVILLE_WRITES_ENABLED`, exactly like the main router.
+    // Body limit raised for the optional broken-item photo (base64 JSON,
+    // same transport as guest documents).
+    let hk_routes = match &final_app_state {
+        Some(state) => {
+            let hk_ville_guard =
+                axum_middleware::from_fn_with_state(state.clone(), ville_write_guard);
+            Router::new()
+                .route("/api/hk/me", get(routes::hk::me))
+                .route("/api/hk/rooms", get(routes::hk::list_rooms))
+                .route("/api/hk/rooms/{room_id}", get(routes::hk::room_detail))
+                .route(
+                    "/api/hk/rooms/{room_id}/cleaning",
+                    post(routes::hk::report_cleaning),
+                )
+                .route(
+                    "/api/hk/rooms/{room_id}/broken-items",
+                    post(routes::hk::report_broken_item),
+                )
+                .route(
+                    "/api/hk/broken-items/{report_id}/photo",
+                    get(routes::hk::broken_item_photo),
+                )
+                .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
+                .layer(axum_middleware::from_fn(
+                    app_middleware::hk_access::require_hk_access,
+                ))
+                .layer(hk_ville_guard)
+                .with_state(state.clone())
+        }
+        None => Router::new(),
+    };
+
     // Phase 4 PR4: mount the protected `/api/admin/*` endpoints. The
     // subrouter is wrapped with the same `require_auth` middleware
     // PR2 added to the canonical routes so an authenticated `User` extension
@@ -362,6 +404,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(new_routes)
         .merge(auth_routes)
         .merge(reader_routes)
+        .merge(hk_routes)
         .merge(admin_routes)
         .merge(health_routes)
         .merge(downloads_routes)

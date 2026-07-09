@@ -369,6 +369,46 @@ CREATE TABLE IF NOT EXISTS ht_guest_doc_backfill_skip (
     attempted_at TIMESTAMP DEFAULT NOW()
 );
 
+-- ht_hk_cleaning_events - Maid-reported room-cleaning progress (employee-login
+-- plan Phase 4, migration 077). Append-only event log; latest event per room per
+-- Thai day = current progress on the /hk maid surface. PG-CANONICAL ONLY (no
+-- legacy counterpart, no sync, no writeback — deliberately does NOT touch
+-- ht_rooms_new.room_clean). Identity = verified HF ID badge (Cloudflare Access
+-- claims), no FK to ht_users. Per-site (connection-level scoping).
+CREATE TABLE IF NOT EXISTS ht_hk_cleaning_events (
+    hkev_id         BIGSERIAL    PRIMARY KEY,
+    hkev_room_id    INTEGER      NOT NULL REFERENCES ht_rooms_new(room_id) ON DELETE CASCADE,
+    hkev_status     TEXT         NOT NULL CHECK (hkev_status IN ('started', 'done')),
+    hkev_badge      TEXT         NOT NULL,
+    hkev_name       TEXT,
+    hkev_created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS ix_ht_hk_cleaning_events_room_created
+    ON ht_hk_cleaning_events (hkev_room_id, hkev_created_at DESC);
+
+-- ht_hk_broken_reports - Maid-submitted broken-item reports (employee-login plan
+-- Phase 4, migration 077). A report, not a maintenance ticket — may be promoted
+-- to ht_maintenance_requests by staff later. Optional photo stored as BYTEA
+-- (same pattern as ht_guest_documents.doc_image). PG-CANONICAL ONLY (no legacy
+-- counterpart, no sync, no writeback). Per-site (connection-level scoping).
+CREATE TABLE IF NOT EXISTS ht_hk_broken_reports (
+    hkbr_id          BIGSERIAL    PRIMARY KEY,
+    hkbr_room_id     INTEGER      NOT NULL REFERENCES ht_rooms_new(room_id) ON DELETE CASCADE,
+    hkbr_description TEXT         NOT NULL,
+    hkbr_badge       TEXT         NOT NULL,
+    hkbr_name        TEXT,
+    hkbr_photo       BYTEA,
+    hkbr_photo_mime  TEXT,
+    hkbr_status      TEXT         NOT NULL DEFAULT 'open'
+                     CHECK (hkbr_status IN ('open', 'acknowledged', 'resolved')),
+    hkbr_created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    hkbr_updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS ix_ht_hk_broken_reports_room_created
+    ON ht_hk_broken_reports (hkbr_room_id, hkbr_created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_ht_hk_broken_reports_status
+    ON ht_hk_broken_reports (hkbr_status, hkbr_created_at DESC);
+
 -- ht_checkin_rooms - Junction table (Track B1 / migration 043).
 -- Mirrors legacy HT_CheckIn_Ds cardinality: one row per room per check-in
 -- folio. The existing ht_checkins.cin_room_id stays in place until the
@@ -2559,6 +2599,14 @@ ON CONFLICT (version) DO NOTHING;
 -- pending.
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('076', '076_ht_bookings_ota_provenance.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 077 — maid-facing housekeeping surface (/hk): ht_hk_cleaning_events
+-- + ht_hk_broken_reports (tables + indexes inlined above, after the guest-doc
+-- block). This seed row records the migration as applied so the drift check
+-- sees zero pending.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('077', '077_create_ht_housekeeping_reports.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================

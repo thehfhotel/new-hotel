@@ -353,6 +353,15 @@ pub async fn verify_cf_access_token(token: &str) -> Result<String, CfAccessError
     verify_token(token, &jwks, CF_ACCESS_TEAM_DOMAIN, &expected_aud())
 }
 
+/// The cached team JWKS, for sibling verifiers of OTHER Access
+/// applications on the same team domain (e.g. `middleware::hk_access`,
+/// which verifies the housekeeping app's AUD but signs against the SAME
+/// team keys). Sharing the single-slot cache keeps one fetch path — and
+/// one stale-if-error policy — for every CF Access verification.
+pub async fn team_jwks() -> Result<std::sync::Arc<JwkSet>, CfAccessError> {
+    cached_jwks().await
+}
+
 // =============================================================================
 // Tests — static JWKS + RSA key, NO network
 // =============================================================================

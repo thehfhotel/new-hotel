@@ -81,6 +81,7 @@ pub mod downloads;
 pub mod events;
 pub mod guest_documents;
 pub mod health;
+pub mod hk;
 pub mod housekeeping;
 pub mod legacy_mirror;
 pub mod mode;
