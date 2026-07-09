@@ -1,5 +1,19 @@
 # Claude Code Instructions
 
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues (thehfhotel/new-hotel) via the `gh` CLI; external PRs are NOT a triage/request surface. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Canonical defaults (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`); only `wontfix` pre-exists, others created on first use. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one root `CONTEXT.md` (lazy-created) + `docs/adr/`. See `docs/agents/domain.md`.
+
 ## Target Architecture (READ FIRST)
 
 **Source of truth:** [`docs/architecture.md`](docs/architecture.md). Read it before designing or implementing.
