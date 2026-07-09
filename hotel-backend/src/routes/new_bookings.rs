@@ -184,6 +184,9 @@ pub struct NewBookingDetail {
 pub struct NewBookingsQuery {
     pub search: Option<String>,
     pub status: Option<String>,
+    /// Filter by `book_source` (exact match). Backs the "New OTA bookings"
+    /// queue: `?source=ota&status=pending`. Absent ⇒ all sources.
+    pub source: Option<String>,
     pub start_date: Option<String>,
     pub end_date: Option<String>,
     pub customer_id: Option<i32>,
@@ -475,6 +478,17 @@ pub async fn update_booking(
 
     let snapshot = build_snapshot_inputs(&body, check_in_date, check_out_date);
 
+    // Promote-to-CreateBooking context (parked roomless booking getting its
+    // first room via the edit flow). Built with the SAME helper the create path
+    // uses so the legacy recipe output is byte-identical. Only built when rooms
+    // are present (the necessary condition for a promote); the service consumes
+    // it only when the booking isn't yet mirrored and goes 0 → ≥1 rooms.
+    let promote_context = if body.rooms.is_empty() {
+        None
+    } else {
+        Some(build_writeback_context(&state, pool, &body, check_in_date, check_out_date).await?)
+    };
+
     let cmd = ModifyBookingCommand {
         book_id,
         customer_id: body.customer_id,
@@ -507,6 +521,7 @@ pub async fn update_booking(
             new_customer_name: None,
             customer_resave: None,
         },
+        promote_context,
         // TODO: load prior snapshot from repo for richer event payload.
         before_snapshot: None,
         after_snapshot: snapshot,

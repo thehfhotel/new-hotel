@@ -182,6 +182,18 @@ pub trait BookingRepository: Send + Sync {
         ext_ref: &str,
     ) -> Result<(), sqlx::Error>;
 
+    /// Read the two facts the modify path needs to choose its legacy write-back
+    /// leg: whether the booking has already been mirrored to iHOTEL
+    /// (`legacy_book_id`) and how many rooms it has RIGHT NOW (before the modify
+    /// deletes/re-inserts them). Returns `None` when the booking doesn't exist.
+    /// Used to promote a parked (roomless, never-mirrored) booking to a real
+    /// `CreateBooking` when its first room is assigned.
+    async fn writeback_state(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        book_id: i32,
+    ) -> Result<Option<(Option<String>, i64)>, sqlx::Error>;
+
     /// Insert one row into `ht_booking_rooms`.
     async fn insert_booking_room(
         &self,
@@ -315,6 +327,14 @@ impl BookingRepository for PgBookingRepository {
             conditions.push(format!("b.book_status = ${}", next_idx));
         }
 
+        // Source filter (exact match) — backs the "New OTA bookings" queue
+        // (`?source=ota`). Appended right after `status` so the bind order in
+        // both queries below stays: search, status, source, dates, customer_id.
+        if params.source.is_some() {
+            next_idx += 1;
+            conditions.push(format!("b.book_source = ${}", next_idx));
+        }
+
         if params.start_date.is_some() {
             next_idx += 1;
             conditions.push(format!("b.book_checkout::date >= ${}::date", next_idx));
@@ -355,15 +375,18 @@ impl BookingRepository for PgBookingRepository {
         );
 
         // Bind in the SAME order the conditions were appended above: search,
-        // status, start_date, end_date, customer_id. sqlx binds positionally
-        // by call order, not by `$N` literal — so the order must match the
-        // `next_idx` increments above.
+        // status, source, start_date, end_date, customer_id. sqlx binds
+        // positionally by call order, not by `$N` literal — so the order must
+        // match the `next_idx` increments above.
         let mut count_q = sqlx::query(sqlx::AssertSqlSafe(&*count_query));
         if let Some(ref pattern) = search_pattern {
             count_q = count_q.bind(pattern);
         }
         if let Some(ref status) = params.status {
             count_q = count_q.bind(status);
+        }
+        if let Some(ref source) = params.source {
+            count_q = count_q.bind(source);
         }
         if let Some(ref start_date) = params.start_date {
             count_q = count_q.bind(start_date);
@@ -417,6 +440,9 @@ impl BookingRepository for PgBookingRepository {
         }
         if let Some(ref status) = params.status {
             data_q = data_q.bind(status);
+        }
+        if let Some(ref source) = params.source {
+            data_q = data_q.bind(source);
         }
         if let Some(ref start_date) = params.start_date {
             data_q = data_q.bind(start_date);
@@ -618,6 +644,25 @@ impl BookingRepository for PgBookingRepository {
         Ok(row)
     }
 
+    async fn writeback_state(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        book_id: i32,
+    ) -> Result<Option<(Option<String>, i64)>, sqlx::Error> {
+        // Runtime query (not `query!`) — keeps the crate buildable without a
+        // live PG. `legacy_book_id` is NULL until the create write-back
+        // back-populates it; the correlated COUNT is the current room count.
+        let row: Option<(Option<String>, i64)> = sqlx::query_as(
+            "SELECT b.legacy_book_id, \
+                    (SELECT COUNT(*) FROM ht_booking_rooms br WHERE br.br_book_id = b.book_id) \
+             FROM ht_bookings b WHERE b.book_id = $1",
+        )
+        .bind(book_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        Ok(row)
+    }
+
     async fn set_booking_provenance(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -639,6 +684,8 @@ impl BookingRepository for PgBookingRepository {
         .await?;
         Ok(())
     }
+
+
 
     async fn insert_booking_room(
         &self,

@@ -27,6 +27,12 @@ export default function V2Reservations() {
   const [loading, setLoading] = useState(true)
   const [status, setStatus] = useState('')
   const [search, setSearch] = useState('')
+  // "New OTA bookings" queue — `book_source` filter (backend NewBookingsQuery.source).
+  // The OTA chip sets source='ota' + status='pending'; a plain status chip clears it.
+  const [source, setSource] = useState('')
+  // Always-visible count of pending OTA bookings the front desk hasn't actioned
+  // yet, so they're aware of incoming OTA reservations even from another tab.
+  const [otaPending, setOtaPending] = useState(0)
   // Task #53 — balance-due filter (also the notification-bell deep-link target,
   // /v2/reservations?balanceDue=1). Initial value is read from the URL below.
   const [balanceDue, setBalanceDue] = useState(false)
@@ -45,6 +51,7 @@ export default function V2Reservations() {
     try {
       const params = new URLSearchParams({ page: String(page), limit: '20' })
       if (status) params.set('status', status)
+      if (source) params.set('source', source)
       if (search.trim()) params.set('search', search.trim())
       if (balanceDue) params.set('balanceDue', 'true')
       const res = await branchFetch(`/api/bookings?${params.toString()}`)
@@ -59,17 +66,41 @@ export default function V2Reservations() {
     } finally {
       setLoading(false)
     }
-  }, [branchFetch, page, status, search, balanceDue])
+  }, [branchFetch, page, status, source, search, balanceDue])
+
+  // Cheap standalone count for the "OTA ใหม่" badge (source=ota + status=pending).
+  // `limit=1` — we only read pagination.total.
+  const fetchOtaPending = useCallback(async () => {
+    try {
+      const res = await branchFetch('/api/bookings?source=ota&status=pending&limit=1')
+      if (res.ok) {
+        const data = await res.json()
+        setOtaPending(data.pagination?.total || 0)
+      }
+    } catch {
+      /* ignore — badge just stays at its last value */
+    }
+  }, [branchFetch])
 
   useEffect(() => {
     fetchBookings()
   }, [fetchBookings])
 
-  // Live-refresh when a booking/check-in changes in iHOTEL or the other app.
+  useEffect(() => {
+    fetchOtaPending()
+  }, [fetchOtaPending])
+
+  // Live-refresh when a booking/check-in changes in iHOTEL or the other app —
+  // refresh both the list and the OTA-pending badge so a newly-arrived OTA
+  // booking shows up live without a manual reload.
+  const refreshAll = useCallback(() => {
+    fetchBookings()
+    fetchOtaPending()
+  }, [fetchBookings, fetchOtaPending])
   useLiveRefresh(
     branch,
     ['BookingCreated', 'BookingModified', 'BookingCancelled', 'CheckInCreated', 'CheckOutCompleted', 'CheckInCancelled'],
-    fetchBookings,
+    refreshAll,
   )
 
   // Open the create form when arriving via "จองใหม่" (?new=1) or ⌘K command,
@@ -186,21 +217,42 @@ export default function V2Reservations() {
         />
       </div>
 
-      {/* Status chips + balance-due toggle */}
+      {/* Status chips + "New OTA" queue + balance-due toggle */}
       <div className="flex gap-2 overflow-x-auto pb-1 -mx-1 px-1">
         {STATUS_FILTERS.map((f) => (
           <button
             key={f.value || 'all'}
             className="v2-chip"
-            data-active={status === f.value}
+            // A plain status chip is a single-status, ALL-source view — not
+            // highlighted while the combined OTA filter is active.
+            data-active={status === f.value && !source}
             onClick={() => {
               setPage(1)
+              setSource('')
               setStatus(f.value)
             }}
           >
             {f.label}
           </button>
         ))}
+        {/* "New OTA bookings" queue = source=ota + status=pending. Toggles the
+            combined filter; the badge shows how many are awaiting the front desk. */}
+        <button
+          className="v2-chip whitespace-nowrap"
+          data-active={source === 'ota' && status === 'pending'}
+          onClick={() => {
+            setPage(1)
+            if (source === 'ota' && status === 'pending') {
+              setSource('')
+              setStatus('')
+            } else {
+              setSource('ota')
+              setStatus('pending')
+            }
+          }}
+        >
+          OTA ใหม่{otaPending > 0 ? ` · ${otaPending}` : ''}
+        </button>
         <button
           className="v2-chip whitespace-nowrap"
           data-active={balanceDue}
