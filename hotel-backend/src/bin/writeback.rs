@@ -1109,6 +1109,9 @@ async fn resolve_legacy_ids(
         // before enqueue), so no PG lookup or self-heal is required at
         // this layer. Mirrors the `AdjustProductStock` resolution shape.
         UpdateRoom { .. } => {}
+        // Board-move payloads carry `Room_no` business keys directly —
+        // nothing to resolve. Mirrors `UpdateRoom`.
+        MoveRoomTiles { .. } => {}
         // Audit 2026-06-11 P2 — standalone customer-edit re-save. The
         // payload's `resave.legacy_cust_no` carries the `Cust_no`
         // business key directly (hydrated by `service::customer::update`
@@ -2066,6 +2069,10 @@ async fn back_populate_legacy_ids(
             // column values. The canonical `ht_rooms_new.legacy_*`
             // back-link columns are populated by `backfill_rooms`, not
             // by recipe writebacks, so nothing to back-populate here.
+        }
+        MoveRoomTiles { .. } => {
+            // Board moves only SET Room_X/Room_y on existing rows —
+            // no legacy IDs allocated, nothing to back-populate.
         }
         UpdateCustomer { .. } => {
             // update_customer doesn't allocate any new legacy IDs — the

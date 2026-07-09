@@ -1,15 +1,15 @@
 'use client'
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Search } from 'lucide-react'
+import { AlertCircle, Search } from 'lucide-react'
 import { useBranch } from '@/contexts/BranchContext'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { useLiveRefresh } from '@/lib/v2/use-live-refresh'
 import { roomStatusView } from '@/lib/v2/status'
-import { type SpatialRoom } from '@/lib/v2/spatial-grid'
+import { deriveBoardPixels, type SpatialRoom } from '@/lib/v2/spatial-grid'
 import { V2Spinner, LiveDot, V2PageHeader, VilleNotice } from '@/components/v2/primitives'
 import RoomActionSheet, { type RoomItem, type RoomAction } from '@/components/v2/RoomActionSheet'
-import SpatialRoomGrid from '@/components/v2/SpatialRoomGrid'
+import SpatialRoomGrid, { type LayoutDropTarget } from '@/components/v2/SpatialRoomGrid'
 import GuestMoveConfirmModal from '@/components/v2/GuestMoveConfirmModal'
 import CheckInModal from '@/components/CheckInModal'
 import CheckOutModal from '@/components/CheckOutModal'
@@ -54,7 +54,7 @@ type RoomsViewMode = 'spatial' | 'floors'
 const VIEW_STORAGE_KEY = 'v2.roomsView'
 
 export default function V2Rooms() {
-  const { branch, canWrite } = useBranch()
+  const { branch, canWrite, layoutWritebackEnabled } = useBranch()
   const branchFetch = useBranchFetch()
   const [rooms, setRooms] = useState<SpatialRoom[]>([])
   const [loading, setLoading] = useState(true)
@@ -68,6 +68,11 @@ export default function V2Rooms() {
   const [viewMode, setViewMode] = useState<RoomsViewMode>('spatial')
   // Guest-move drag (#225): drop on an eligible target opens the confirm.
   const [moveReq, setMoveReq] = useState<{ from: SpatialRoom; to: SpatialRoom } | null>(null)
+  // Layout-edit mode (#236 จัดผัง): only reachable while the ship-dark
+  // LAYOUT_WRITEBACK_ENABLED flag is on — the board is SHARED with iHOTEL and
+  // a canonical-only rearrange would fork the two boards.
+  const [layoutMode, setLayoutMode] = useState(false)
+  const [layoutError, setLayoutError] = useState<string | null>(null)
 
   useEffect(() => {
     try {
@@ -80,6 +85,8 @@ export default function V2Rooms() {
 
   const changeViewMode = (mode: RoomsViewMode) => {
     setViewMode(mode)
+    // จัดผัง only exists on the spatial board — leaving it exits the mode.
+    if (mode !== 'spatial') setLayoutMode(false)
     try {
       window.localStorage.setItem(VIEW_STORAGE_KEY, mode)
     } catch {
@@ -185,6 +192,66 @@ export default function V2Rooms() {
     }
   }
 
+  /** จัดผัง drop (#236) — immediate per-drop write, no confirm (decision 4).
+   *  Optimistic apply + revert-and-inline-error on failure. Pixels for a
+   *  place are neighbor-derived from the UNFILTERED room list so they
+   *  round-trip through computeSpatialLayout into the intended cell; a swap
+   *  exchanges the two rooms' existing pairs verbatim (decision 2). */
+  const handleLayoutDrop = async (source: SpatialRoom, target: LayoutDropTarget) => {
+    let moves: { id: number; roomX: number; roomY: number }[]
+    if (target.type === 'swap') {
+      const other = target.room
+      // Both sides are placed (the grid guarantees it); coords are present.
+      if (source.roomX == null || source.roomY == null || other.roomX == null || other.roomY == null) return
+      moves = [
+        { id: source.id, roomX: other.roomX, roomY: other.roomY },
+        { id: other.id, roomX: source.roomX, roomY: source.roomY },
+      ]
+    } else {
+      const { x, y } = deriveBoardPixels(rooms, { col: target.col, row: target.row })
+      moves = [{ id: source.id, roomX: x, roomY: y }]
+    }
+
+    // Optimistic apply; remember only the touched rooms' prior coords so a
+    // revert can't clobber an interleaved drop on other tiles.
+    const prev = new Map(
+      moves.map((m) => {
+        const r = rooms.find((rr) => rr.id === m.id)
+        return [m.id, { roomX: r?.roomX ?? null, roomY: r?.roomY ?? null }] as const
+      }),
+    )
+    setRooms((rs) =>
+      rs.map((r) => {
+        const m = moves.find((mm) => mm.id === r.id)
+        return m ? { ...r, roomX: m.roomX, roomY: m.roomY } : r
+      }),
+    )
+    setLayoutError(null)
+
+    try {
+      const res = await branchFetch('/api/rooms/layout', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ moves }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error || data.message || 'บันทึกผังห้องไม่สำเร็จ')
+      }
+      // Success: the optimistic coords ARE what the server persisted — no
+      // refetch needed (and skipping it keeps rapid drops from racing).
+    } catch (err) {
+      setRooms((rs) =>
+        rs.map((r) => {
+          const p = prev.get(r.id)
+          return p ? { ...r, roomX: p.roomX, roomY: p.roomY } : r
+        }),
+      )
+      setLayoutError(err instanceof Error ? err.message : 'บันทึกผังห้องไม่สำเร็จ')
+      fetchRooms() // resync with server truth
+    }
+  }
+
   if (loading) return <V2Spinner label="กำลังโหลดผังห้องพัก…" />
 
   return (
@@ -244,8 +311,40 @@ export default function V2Rooms() {
           >
             แยกตามชั้น
           </button>
+          {/* จัดผัง (#236) — visible ONLY while LAYOUT_WRITEBACK_ENABLED is on
+              (the board is shared with iHOTEL; a canonical-only rearrange is
+              never allowed). Ungated by role, like iHOTEL FormRoomMain. */}
+          {layoutWritebackEnabled && viewMode === 'spatial' && (
+            <button
+              type="button"
+              className="v2-chip"
+              data-active={layoutMode}
+              onClick={() => {
+                setLayoutMode((v) => !v)
+                setLayoutError(null)
+              }}
+            >
+              จัดผัง
+            </button>
+          )}
         </div>
       </div>
+
+      {/* จัดผัง status / error strip */}
+      {layoutMode && (
+        <div className="space-y-2">
+          <div className="text-[12.5px]" style={{ color: 'var(--v2-ink-3)' }}>
+            โหมดจัดผัง: ลากห้องไปยังช่องว่างเพื่อย้าย / วางทับห้องอื่นเพื่อสลับตำแหน่ง —
+            บันทึกทันทีและมีผลกับ iHOTEL ด้วย
+          </div>
+          {layoutError && (
+            <div className="flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-[13px] text-red-700">
+              <AlertCircle size={16} className="mt-0.5 shrink-0" />
+              <span>{layoutError}</span>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Filter chips */}
       <div className="flex gap-2 overflow-x-auto pb-1 -mx-1 px-1">
@@ -260,10 +359,15 @@ export default function V2Rooms() {
       {/* Board — spatial (default) or floor-grouped */}
       {viewMode === 'spatial' ? (
         <SpatialRoomGrid
-          rooms={filtered}
+          // จัดผัง always works on the UNFILTERED set: bands computed from a
+          // filtered subset can differ, and pixels derived from them may land
+          // in the wrong cell once the filter clears (round-trip hazard).
+          rooms={layoutMode ? rooms : filtered}
           onSelect={(room) => setSelected(room)}
           onMoveRequest={(from, to) => setMoveReq({ from, to })}
           canDrag={canWrite}
+          mode={layoutMode ? 'layout' : 'guest'}
+          onLayoutDrop={handleLayoutDrop}
         />
       ) : groups.length === 0 ? (
         <div className="v2-card px-5 py-12 text-center text-[14px]" style={{ color: 'var(--v2-ink-3)' }}>

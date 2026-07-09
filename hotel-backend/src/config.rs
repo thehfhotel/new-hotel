@@ -430,6 +430,21 @@ pub fn tm30_companion_writeback_enabled() -> bool {
     flag_enabled("TM30_COMPANION_WRITEBACK_ENABLED")
 }
 
+/// Issue #236 layout-edit mode flag (`LAYOUT_WRITEBACK_ENABLED`).
+///
+/// Default `false` (ship DARK). Gates the WHOLE จัดผัง mode, not just the
+/// legacy mirror: when off, `PUT /api/rooms/layout` returns 409
+/// (`LAYOUT_WRITEBACK_DISABLED`) and `/api/mode` reports
+/// `layoutWritebackEnabled=false` so the frontend hides the toggle entirely.
+/// A canonical-only rearrange is never allowed — the board is SHARED with
+/// iHOTEL FormRoomMain and a one-sided move would fork the two boards.
+/// Flip only after a reception-coordinated live verification — a new write
+/// into the shared legacy DB (invariant #6). Mirrors the
+/// `ROUND_WRITEBACK_ENABLED` / `GUEST_DOCUMENT_STORAGE_ENABLED` precedent.
+pub fn layout_writeback_enabled() -> bool {
+    flag_enabled("LAYOUT_WRITEBACK_ENABLED")
+}
+
 /// Read an optional secret/URL from `var_name`, treating unset OR empty as
 /// `None`. Empty-string is the failure mode of a botched CI `.env` rewrite
 /// (`VAR=''`); returning `None` lets the reader path fail closed (reject the

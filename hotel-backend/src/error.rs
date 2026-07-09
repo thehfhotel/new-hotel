@@ -25,6 +25,13 @@ pub enum ApiError {
     #[error("Forbidden: {0}")]
     Forbidden(String),
 
+    /// 409 — the request is valid but the server-side state / configuration
+    /// refuses it (e.g. a ship-dark write flag is off). The message should
+    /// LEAD with a stable machine-checkable code (`SCREAMING_SNAKE`) so
+    /// clients can branch on it without a separate `code` field.
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
     #[error("Internal server error: {0}")]
     Internal(String),
 }
@@ -53,6 +60,7 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
+            ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
             ApiError::Database(msg) => {
                 tracing::error!("Database error: {}", msg);
                 (

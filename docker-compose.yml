@@ -256,6 +256,17 @@ services:
       # docs/coexistence/task8-writeback-test-runsheet.md (+ legacy-writeback-test-runbook.md).
       - GUEST_DOCUMENT_STORAGE_ENABLED=${GUEST_DOCUMENT_STORAGE_ENABLED:-false}
       - TM30_COMPANION_WRITEBACK_ENABLED=${TM30_COMPANION_WRITEBACK_ENABLED:-false}
+      # Layout-edit mode (จัดผัง, #236) — default false (ship-dark). Gates the
+      # WHOLE mode: PUT /api/rooms/layout 409s and the rooms-page toggle is
+      # hidden (a canonical-only rearrange would fork the shared board). Each
+      # drop writes ht_rooms_new.room_x/room_y AND mirrors HT_Rooms.Room_X/Room_y
+      # (FormRoomMain byte-shape, writeback/recipes/move_room_tiles.rs). Flip:
+      #   1. Reception-coordinated live test — drag one tile in our app, verify
+      #      iHOTEL FormRoomMain shows it in the same cell (and vice versa).
+      #   2. `gh variable set LAYOUT_WRITEBACK_ENABLED -b true` + redeploy.
+      #      Rollback = set back to false + redeploy (no state to undo — the
+      #      already-written coordinates are converged on both sides).
+      - LAYOUT_WRITEBACK_ENABLED=${LAYOUT_WRITEBACK_ENABLED:-false}
       # Self-healing reconcile sweep (scheduler/sync.rs). When a diff-only
       # reconcile row resists convergence past FORCE_CONVERGE_MIN_AGE_SECS (1h),
       # re-project the legacy row through the CT mapper instead of leaving it

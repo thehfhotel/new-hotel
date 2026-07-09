@@ -40,8 +40,15 @@ export interface SpatialLayout<T extends SpatialRoom = SpatialRoom> {
 }
 
 /** Cluster tolerance in legacy pixels — iHOTEL tiles are ~100px wide, so
- *  values within 40px of their sorted neighbour belong to the same band. */
-const CLUSTER_TOLERANCE = 40
+ *  values within 40px of their sorted neighbour belong to the same band.
+ *  Exported so `deriveBoardPixels` callers/tests share the same constant. */
+export const CLUSTER_TOLERANCE = 40
+
+/** Pixel pitch used when a layout-edit drop must SYNTHESIZE a coordinate
+ *  (new band beyond the board's extent, or an empty board). ~the iHOTEL tile
+ *  pitch; must be STRICTLY greater than CLUSTER_TOLERANCE so the synthesized
+ *  value forms its own band instead of merging into a neighbour. */
+const BOARD_PITCH = 110
 
 /** True when a room has no receptionist-arranged position. */
 export function isUnplaced(room: Pick<SpatialRoom, 'roomX' | 'roomY'>): boolean {
@@ -89,6 +96,93 @@ export function computeSpatialLayout<T extends SpatialRoom>(
     cols: placed.reduce((m, p) => Math.max(m, p.col), 0),
     rows: placed.reduce((m, p) => Math.max(m, p.row), 0),
   }
+}
+
+/** A 1-based board cell (same coordinate space as `PlacedRoom.col/row`). */
+export interface BoardCell {
+  col: number
+  row: number
+}
+
+/** Per-axis band table derived the same way `computeSpatialLayout` does:
+ *  band index (1-based) → the sorted raw pixel values in that band. */
+function bandValues(values: number[], tolerance: number): number[][] {
+  const bands = quantize(values, tolerance)
+  const byBand: number[][] = []
+  for (const [raw, band] of bands) {
+    ;(byBand[band - 1] ||= []).push(raw)
+  }
+  for (const list of byBand) list.sort((a, b) => a - b)
+  return byBand
+}
+
+/** Resolve ONE axis of a layout-edit drop (#236 จัดผัง).
+ *
+ *  - Band exists → reuse an existing raw value VERBATIM (exact-value reuse
+ *    maps to exactly that band via quantize's Set-dedup, so the round-trip is
+ *    tautological and can never chain-merge neighbouring bands — the
+ *    "neighbor-derived" rule from the governing decision. Never midpoint!).
+ *  - Band one-or-more beyond the extent → extrapolate outermost + n·pitch
+ *    (pitch > tolerance strictly, so the new value forms its own band).
+ *  - Empty axis (no placed tiles) → seed at 10 + (idx−1)·pitch, iHOTEL-like
+ *    origin, never 0 so a (1,1) seed can't produce the (0,0) sentinel.
+ */
+function axisValue(bands: number[][], index: number): number {
+  if (bands.length === 0) return 10 + (index - 1) * BOARD_PITCH
+  if (index <= bands.length) return bands[index - 1][0]
+  const outermost = bands[bands.length - 1]
+  return outermost[outermost.length - 1] + (index - bands.length) * BOARD_PITCH
+}
+
+/** True when nudging a 0-valued band member to 1 cannot merge band 1 into
+ *  band 2 (quantize merges on gap ≤ tolerance, so the next band's smallest
+ *  member must sit STRICTLY more than tolerance+1 away from 0). */
+function nudgeIsBandSafe(bands: number[][], tolerance: number): boolean {
+  if (bands.length < 2) return true
+  return bands[1][0] - 1 > tolerance
+}
+
+/** Derive the raw legacy pixel pair to WRITE so that a layout-edit drop
+ *  lands the room in `target` — and ONLY the moved room changes cell — when
+ *  the board is re-run through `computeSpatialLayout` (#236 decision 2).
+ *
+ *  MUST be fed the UNFILTERED room list: bands computed from a filtered
+ *  subset can differ, and pixels derived from them may land in the wrong
+ *  cell once the filter clears.
+ *
+ *  Swaps do NOT go through here — exchange the two rooms' existing pairs
+ *  verbatim (both values already band correctly by exact-value reuse).
+ */
+export function deriveBoardPixels<T extends SpatialRoom>(
+  rooms: T[],
+  target: BoardCell,
+  tolerance: number = CLUSTER_TOLERANCE,
+): { x: number; y: number } {
+  const placed = rooms.filter((r) => !isUnplaced(r))
+  const xBands = bandValues(placed.map((r) => r.roomX as number), tolerance)
+  const yBands = bandValues(placed.map((r) => r.roomY as number), tolerance)
+
+  let x = axisValue(xBands, target.col)
+  let y = axisValue(yBands, target.row)
+
+  // (0,0) is the legacy "unplaced" sentinel (`isUnplaced`) — a derived pair
+  // must never hit it. Only possible when both target bands contain a raw 0
+  // (a single-axis 0 is a real placement). Prefer another exemplar from the
+  // same band; as a last resort nudge one axis to 1 — inside the band
+  // (gap 1 ≤ tolerance) — picking the axis where the nudge provably cannot
+  // chain-merge band 1 into band 2.
+  if (x === 0 && y === 0) {
+    const altX = target.col <= xBands.length ? xBands[target.col - 1].find((v) => v !== 0) : undefined
+    const altY = target.row <= yBands.length ? yBands[target.row - 1].find((v) => v !== 0) : undefined
+    if (altX !== undefined) x = altX
+    else if (altY !== undefined) y = altY
+    else if (nudgeIsBandSafe(yBands, tolerance)) y = 1
+    else x = 1 // xBands nudge — see nudgeIsBandSafe; both-unsafe is unreachable
+    // with integer pixels unless band 2 starts at exactly tolerance+1 on BOTH
+    // axes while band 1 is exactly {0} on both; accept the x-nudge then.
+  }
+
+  return { x, y }
 }
 
 /** Guest-move drag eligibility (#225 decision comment):

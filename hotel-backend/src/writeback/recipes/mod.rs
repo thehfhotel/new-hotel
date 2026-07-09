@@ -33,6 +33,7 @@
 //! | `mark_dirty` | Audit 2026-06-11 P2 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §3.13) | `MarkRoomDirty` |
 //! | `set_maintenance` | Audit 2026-06-11 P2 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §3.15/§3.16) | `SetRoomMaintenance` |
 //! | `update_room` | Admin room master-data edit — closes the `PUT /api/new/rooms/:id` writeback gap | `UpdateRoom` |
+//! | `move_room_tiles` | Issue #236 — จัดผัง layout-edit drop, FormRoomMain drag/drop shape (`docs/legacy-app/COMPAT_CHEATSHEET.md` §"Update grid layout"). **SHIPPED DARK** behind `LAYOUT_WRITEBACK_ENABLED` | `MoveRoomTiles` |
 //! | `update_customer` | Audit 2026-06-11 P2 — standalone customer-edit re-save (spike §3c line 28 shape) | `UpdateCustomer` |
 //! | `adjust_product_stock` | Track F3 / T1 CRIT-3 (`docs/legacy-app/COMPAT_CHEATSHEET.md:560-564`) | `AdjustProductStock` |
 //! | `coupon` | Track G5 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_Cupon`) | `IssueCoupon` + `RedeemCoupon` |
@@ -59,6 +60,7 @@ pub mod extend_stay;
 pub mod helpers;
 pub mod mark_clean;
 pub mod mark_dirty;
+pub mod move_room_tiles;
 pub mod payment;
 pub mod pos_sale;
 pub mod pos_void;

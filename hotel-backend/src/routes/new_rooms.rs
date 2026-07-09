@@ -508,6 +508,157 @@ pub async fn update_room(
     }))
 }
 
+/// One tile move in a `PUT /api/rooms/layout` body (#236 จัดผัง).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomLayoutMove {
+    /// Canonical `ht_rooms_new.room_id`.
+    pub id: i32,
+    /// Legacy free-pixel board coordinates (see `RoomTileMove`). The
+    /// frontend derives these NEIGHBOR-style so they round-trip through
+    /// `computeSpatialLayout` into the intended cell (decision 2); a swap
+    /// carries the two rooms' existing pairs verbatim.
+    pub room_x: i32,
+    pub room_y: i32,
+}
+
+/// Request body for `PUT /api/rooms/layout`: 1 entry = move/place,
+/// 2 entries = swap.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomLayoutRequest {
+    pub moves: Vec<RoomLayoutMove>,
+}
+
+/// Response for `PUT /api/rooms/layout`. `ok` is the locked #236 wire
+/// contract; `success`/`message` follow the sibling `MutationResponse`
+/// style so generic clients keep working.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomLayoutResponse {
+    pub ok: bool,
+    pub success: bool,
+    pub message: String,
+}
+
+/// PUT /api/rooms/layout — layout-edit mode (จัดผัง) drop (#236).
+///
+/// Writes the SHARED board position: canonical `ht_rooms_new.room_x`/`room_y`
+/// UPDATE(s) + ONE `MoveRoomTiles` writeback intent enqueued in the SAME PG
+/// transaction (architecture.md §3.6c), mirroring iHOTEL FormRoomMain's
+/// `update HT_Rooms set Room_X=<x>,Room_y=<y> where Room_no='<room>'`
+/// byte-shape asynchronously via the writeback worker — never inline.
+///
+/// Shipped DARK behind `LAYOUT_WRITEBACK_ENABLED`: when the flag is off the
+/// endpoint 409s with the stable code `LAYOUT_WRITEBACK_DISABLED` and no
+/// write happens on EITHER side — a canonical-only rearrange would fork the
+/// two boards (governing decision 3).
+pub async fn update_room_layout(
+    State(state): State<AppState>,
+    Query(params): Query<NewRoomQuery>,
+    Json(body): Json<RoomLayoutRequest>,
+) -> ApiResult<Json<RoomLayoutResponse>> {
+    if !crate::config::layout_writeback_enabled() {
+        return Err(ApiError::Conflict(
+            "LAYOUT_WRITEBACK_DISABLED — จัดผัง layout writes are shipped dark \
+             (LAYOUT_WRITEBACK_ENABLED=false); flip the flag only after a \
+             reception-coordinated live verification"
+                .to_string(),
+        ));
+    }
+
+    // 1 = move/place, 2 = swap. Anything else is a client bug — the drop
+    // gesture can only ever touch one or two tiles.
+    if body.moves.is_empty() || body.moves.len() > 2 {
+        return Err(ApiError::BadRequest(
+            "moves must contain 1 (move/place) or 2 (swap) entries".to_string(),
+        ));
+    }
+    if body.moves.len() == 2 && body.moves[0].id == body.moves[1].id {
+        return Err(ApiError::BadRequest(
+            "swap entries must reference two different rooms".to_string(),
+        ));
+    }
+    for m in &body.moves {
+        // Negative coords are LEGAL: iHOTEL's free-pixel WinForms canvas can
+        // persist them, and a verbatim swap with such a tile must round-trip
+        // the exact values (review finding 2026-07-10). Only the (0,0)
+        // unplaced sentinel is forbidden — a drop must never write it, or
+        // the tile silently falls off both boards.
+        if m.room_x == 0 && m.room_y == 0 {
+            return Err(ApiError::BadRequest(format!(
+                "(0,0) is the unplaced sentinel and cannot be written (room {})",
+                m.id
+            )));
+        }
+    }
+
+    // Per-site pool via the unified write chokepoint (Ship-B). HF Ville
+    // mutations stay gated by `ville_write_guard` until HFVILLE_WRITES_ENABLED.
+    let pool = state.write_pool(params.branch)?;
+    let mut tx = pool.begin().await?;
+
+    let mut tile_moves: Vec<crate::outbox::intent::RoomTileMove> =
+        Vec::with_capacity(body.moves.len());
+    for m in &body.moves {
+        // Resolve the legacy `Room_no` business key inside the TX (the
+        // canonical `ht_rooms_new.room_no` mirrors `HT_Rooms.Room_no` 1:1).
+        // Reuses the `update_room` context loader; the maintenance flag it
+        // also returns is irrelevant here.
+        let (legacy_room_no, _) = load_room_writeback_context(&mut tx, m.id).await?;
+
+        // Absolute SET — deliberately NOT COALESCE'd: this endpoint owns the
+        // coordinate pair. The sync mapper's `room_x = COALESCE($9, room_x)`
+        // means the CT echo of our own legacy write converges to a no-op
+        // because both sides carry identical bytes (decision 2).
+        let rows_affected = sqlx::query(
+            "UPDATE ht_rooms_new SET room_x = $1, room_y = $2, updated_at = NOW() \
+             WHERE room_id = $3",
+        )
+        .bind(m.room_x)
+        .bind(m.room_y)
+        .bind(m.id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if rows_affected == 0 {
+            tx.rollback().await?;
+            return Err(ApiError::NotFound(format!("Room {} not found", m.id)));
+        }
+
+        tile_moves.push(crate::outbox::intent::RoomTileMove {
+            room_no: legacy_room_no,
+            room_x: m.room_x,
+            room_y: m.room_y,
+        });
+    }
+
+    // ONE intent carries the whole drop (both halves of a swap) so the
+    // legacy board can never persist half-swapped across a worker crash.
+    // Aggregate id = first moved room, matching the intent's contract.
+    let aggregate_id = aggregate_uuid(AggregateKind::Room, body.moves[0].id);
+    let intent = WritebackIntent::MoveRoomTiles {
+        room_id: aggregate_id,
+        moves: tile_moves,
+    };
+    // Per-event discriminator key: the same room is moved repeatedly over a
+    // จัดผัง session and completed jobs persist as status='done' rows — the
+    // deterministic (intent, aggregate) key would unique-violate the second
+    // move of the same room (same rationale as `update_room` above).
+    let idempotency_key = generate_idempotency_key(&intent, Uuid::new_v4());
+    OutboxRepository::enqueue(&mut tx, &intent, idempotency_key)
+        .await
+        .map_err(ApiError::from)?;
+
+    tx.commit().await?;
+
+    Ok(Json(RoomLayoutResponse {
+        ok: true,
+        success: true,
+        message: "Room layout updated".to_string(),
+    }))
+}
+
 /// Resolve the pre-UPDATE writeback context for `room_id` from PG:
 ///
 /// * the legacy `HT_Rooms.Room_no` business key — the canonical
