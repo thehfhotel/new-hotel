@@ -7,6 +7,91 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.74.0](https://github.com/thehfhotel/new-hotel/compare/v2.73.0...v2.74.0) (2026-07-09)
+
+
+### Added
+
+* add HF One marquee band with viewport-locked sidebar offset ([a6b7866](https://github.com/thehfhotel/new-hotel/commit/a6b78660c6ebe72e628f2a93cdff5fa577dec80c))
+* **auth:** alias saipahn's and winai's second identities in CF auto-login ([c9ee411](https://github.com/thehfhotel/new-hotel/commit/c9ee411a5be0d45d33b07a1971d648ac42b18e3b))
+* **auth:** CF email alias map for multi-identity users ([1b908a8](https://github.com/thehfhotel/new-hotel/commit/1b908a8350e783949e87c22c6ba413fb7bc426e0))
+* **auth:** Cloudflare Access auto-login with password fallback ([f2ffecb](https://github.com/thehfhotel/new-hotel/commit/f2ffecbc507e30942721416e1e9665f95fc16a60))
+* **auth:** migrate card-login to central HF-ID pairing ([#222](https://github.com/thehfhotel/new-hotel/issues/222)) ([d37e784](https://github.com/thehfhotel/new-hotel/commit/d37e784e30b96b7eb8253bba4b150d08394888ca))
+* **auth:** tap NFC staff card to log into the PMS ([#221](https://github.com/thehfhotel/new-hotel/issues/221)) ([e20ba3d](https://github.com/thehfhotel/new-hotel/commit/e20ba3d6b8f8bb661b93b1f87a8f711d370d64a5))
+* **booking:** New OTA bookings queue + promote parked booking to iHOTEL ([#224](https://github.com/thehfhotel/new-hotel/issues/224)) ([1016b72](https://github.com/thehfhotel/new-hotel/commit/1016b724f947086916649b7672f7ade739c7c30b))
+* **booking:** OTA caller-idempotency natural key (write-back Phase 0) ([#223](https://github.com/thehfhotel/new-hotel/issues/223)) ([78a6802](https://github.com/thehfhotel/new-hotel/commit/78a680291ebac46ad1d21a87c5ef936d16025243))
+* **card-reader:** self-host middleware installer from our backend ([6bc6301](https://github.com/thehfhotel/new-hotel/commit/6bc630105029631903dd19cc41321e9d0b658ef4))
+* **checkout:** per-room (partial) checkout for multi-room stays ([#75](https://github.com/thehfhotel/new-hotel/issues/75)) ([29257be](https://github.com/thehfhotel/new-hotel/commit/29257be01a41763f8fcc9d8959d005207573d0fc))
+* **db:** partial unique index ht_payments(pay_cin_id, legacy_receipt_no) ([f84b39b](https://github.com/thehfhotel/new-hotel/commit/f84b39b4fd828dc55b3f3fc9fa6a1bc73afd88f0))
+* **hk:** maid housekeeping surface — cleaning progress + broken-item reports ([#231](https://github.com/thehfhotel/new-hotel/issues/231)) ([beff331](https://github.com/thehfhotel/new-hotel/commit/beff331ed684b4fe569f1174ca479474643e2a79))
+* **sync:** flag-gated self-healing reconcile sweep for durable value drift ([2f756a4](https://github.com/thehfhotel/new-hotel/commit/2f756a487c321b3a622fede1234a6efcb1adcc6b))
+* **thai-id:** replicate iHOTEL card render (DilleniaUPC, bilingual dates, 14 fields) ([8492d76](https://github.com/thehfhotel/new-hotel/commit/8492d76a0c67d8138fb870920b1095f0cd98493d))
+* **v2/rooms:** spatial room grid + iHOTEL status colors + guest-move drag ([#232](https://github.com/thehfhotel/new-hotel/issues/232)) ([0f4e042](https://github.com/thehfhotel/new-hotel/commit/0f4e042ceac8ba487d31d6025f1222a7f73fb345))
+* **v2:** backend Thai-ID card generation for card-reader captures ([3fdaf05](https://github.com/thehfhotel/new-hotel/commit/3fdaf056a125166fe7152c59bce3fe9a2d4b360c))
+* **v2:** check-in registration — full Thai-ID capture, passport MRZ, document photos ([4616cd4](https://github.com/thehfhotel/new-hotel/commit/4616cd47769363051316b6889201f013a97bf1e3))
+* **v2:** companion management (ผู้เข้าพักร่วม) on the registration page ([d5aa187](https://github.com/thehfhotel/new-hotel/commit/d5aa18756ee614bf2e18ff76c28cfb3c8e988ef0))
+* **v2:** housekeeping mark-clean / mark-dirty on the room action sheet ([71f1aa0](https://github.com/thehfhotel/new-hotel/commit/71f1aa0d67121d1bc5f315e96e9f204a8c99c3cf))
+* **v2:** live-refresh reception screens on iHOTEL/cross-app changes ([a6cf983](https://github.com/thehfhotel/new-hotel/commit/a6cf9833ef7103ffe03f88a241392051baf2ffcf))
+* **v2:** match iHOTEL guest registration card layout (ReportReg_1) ([5bda93d](https://github.com/thehfhotel/new-hotel/commit/5bda93de484d4ebbfeecc73be4ea6645b5a722f6))
+* **v2:** reception walkthrough form for the Task [#8](https://github.com/thehfhotel/new-hotel/issues/8) legacy write-back test ([af45805](https://github.com/thehfhotel/new-hotel/commit/af458055b1d51238633c8c5e7755df254023c975))
+* **v2:** registration card — folio-exact RATE/OTHER/TOTAL + strip address prefixes ([7aa053d](https://github.com/thehfhotel/new-hotel/commit/7aa053d9415c170d08630ee044824f4eac81222f))
+* **v2:** registration card — show real booking advance (จ่ายล่วงหน้า) ([af41ae8](https://github.com/thehfhotel/new-hotel/commit/af41ae8673f029fe5a5eea1d917c7d66cd839a0b))
+* **v2:** registration review menu + ID/passport photo on the printed slip ([6087aa4](https://github.com/thehfhotel/new-hotel/commit/6087aa4cecef88034a34150c358105cd08225a05))
+* **v2:** reprint registration slip (ใบลงทะเบียนเข้าพัก) for any check-in ([93c2908](https://github.com/thehfhotel/new-hotel/commit/93c29085e9f450025b08cde8f3f094a0b9678107))
+* **v2:** scan ID/passport now on the registration reprint page ([868748c](https://github.com/thehfhotel/new-hotel/commit/868748c6fc37281c4a7f7c35806558cf543210e7))
+* **v2:** show iHOTEL's Thai-ID card image on the registration form (legacy sync-in) ([9bf85dc](https://github.com/thehfhotel/new-hotel/commit/9bf85dca0c5c83e93d5acbe6fe38744a950a95f2))
+
+
+### Fixed
+
+* allow erp.thehfhotel.org in script-src CSP for hf-bar.js ([20b9ec0](https://github.com/thehfhotel/new-hotel/commit/20b9ec06e3b291147b36499beea02ae40e5d21d7))
+* **card-reader:** middleware v1.0.1 installer replaces old install + fix dead links ([68397d0](https://github.com/thehfhotel/new-hotel/commit/68397d0fc27aea08b4f2db1b0eed034c8a6ce252))
+* **card-reader:** unblock Thai-ID reader from prod HTTPS (CSP + middleware CORS) ([c83086b](https://github.com/thehfhotel/new-hotel/commit/c83086bf2842a9a99f12976f6c559bae98ab34cc))
+* **checkin:** mirror resolves cust_no from the check-in so iHOTEL shows the photo ([8aa9aa2](https://github.com/thehfhotel/new-hotel/commit/8aa9aa2dfc92442a7ebb0ac9ea1ed7691c57f445))
+* **checkin:** no duplicate card images in either store (upsert + canonical dedup) ([eecf247](https://github.com/thehfhotel/new-hotel/commit/eecf247d3ad0fd91716f9e256e2d971f4bf8875d))
+* **checkins:** display the iHOTEL ref (legacy_cin_no) instead of our internal CIN- ([adf2765](https://github.com/thehfhotel/new-hotel/commit/adf27651d8e6fa30415cf9dfc4a293bb8a3286db))
+* **checkin:** Thai-ID chip scan enqueues the legacy image mirror ([c73e5ff](https://github.com/thehfhotel/new-hotel/commit/c73e5ff80d3585801dfdeb3cad2b707ab9d63574))
+* **checkout:** per-room writeback uses header nights, not stale cr_nights ([#75](https://github.com/thehfhotel/new-hotel/issues/75)) ([44bd1f5](https://github.com/thehfhotel/new-hotel/commit/44bd1f5e43fd4be2f9e78789c5c3fa944442e9f0))
+* **checkout:** show check-in & expected-checkout dates in the stay summary ([8a61c6e](https://github.com/thehfhotel/new-hotel/commit/8a61c6eef6773f33699ebc7cd7bc5762aff305a3))
+* **checkout:** show held deposit line on the checkout modal ([f6a88da](https://github.com/thehfhotel/new-hotel/commit/f6a88da9588159ec02fbbe218755255d34d6a21c))
+* **coexistence:** branch-route the flip-unsafe handlers (HFVILLE_WRITES pre-flip) ([55f4ec8](https://github.com/thehfhotel/new-hotel/commit/55f4ec88cb30526617b751bd6999fbf99981e58c))
+* **compose:** plumb check-in registration mirror flags into backend env ([9a12ca3](https://github.com/thehfhotel/new-hotel/commit/9a12ca3c7b41703b30a2ec5400aead3b41fe3af8))
+* **csp:** allow Cloudflare Web Analytics beacon origins ([8311ebd](https://github.com/thehfhotel/new-hotel/commit/8311ebd1b8e1ec7af1635f94dea6c1943041ba50))
+* **deps:** jsonwebtoken 9.3.1 -&gt; 10.4.0 (GHSA-h395-gr6q-cpjc) ([a5b2df8](https://github.com/thehfhotel/new-hotel/commit/a5b2df815c5df6ddd6652fcfcb1d89072a3b620f))
+* **deps:** override transitive ws to &gt;=8.21.0 (GHSA-96hv-2xvq-fx4p) ([580c381](https://github.com/thehfhotel/new-hotel/commit/580c381db1dfca763067718fff0b1adb3eba0abb))
+* **inventory:** accept camelCase payload + category-by-name in stock item create/update ([2ff3037](https://github.com/thehfhotel/new-hotel/commit/2ff30374b106c6170ac73206efa6e5deaffb527e))
+* **inventory:** branch-aware create/update (code check + insert on per-site pool) ([c2279a1](https://github.com/thehfhotel/new-hotel/commit/c2279a1c9a85e4d24f731f81c6c3c3b73c9394ac))
+* **inventory:** branch-aware item/category reads + correct list field names ([47b68bf](https://github.com/thehfhotel/new-hotel/commit/47b68bfb68fce1f2e53623d6c3a8a8aeab3ef18d))
+* **migrate:** import base Cust_name (not View concat+split) + customer-writeback guard ([a80785d](https://github.com/thehfhotel/new-hotel/commit/a80785d0d3abe7e512fc2a779c7f3f67c95710a9))
+* **payments:** COALESCE book_no in checkin detail query so walk-in payments don't 500 ([c9db31b](https://github.com/thehfhotel/new-hotel/commit/c9db31b79452586cd54e2ac981b1696e697be8a4))
+* **security:** resolve CodeQL alerts — auth test fixtures + prefill PII storage + dead code ([#230](https://github.com/thehfhotel/new-hotel/issues/230)) ([a6f214a](https://github.com/thehfhotel/new-hotel/commit/a6f214a233c906c7b51dd24d0c2a577bb3a4644e))
+* **sync:** align room drift-hash with the room_clean inversion ([0303c98](https://github.com/thehfhotel/new-hotel/commit/0303c9860ba944214a507c50106f5f103e05bf9d))
+* **sync:** compare cin_checkin_time + cin_expected_checkout in checkin idempotency gate ([d09e756](https://github.com/thehfhotel/new-hotel/commit/d09e756545fbab31c174177d3b338b0bb4368fcc))
+* **sync:** dedup payment re-import by legacy_receipt_no to stop writeback echo duplicates ([1aefda4](https://github.com/thehfhotel/new-hotel/commit/1aefda44b64d316640c74fda42eeca7838152375))
+* **sync:** escalate sustained probe outage at 20m; drop dead pool-breaker knobs ([72a5846](https://github.com/thehfhotel/new-hotel/commit/72a5846ae27cc0aa6eb712d5b9ee24ce1b138e93))
+* **sync:** invert room_clean mapping so checked-out rooms stay dirty ([c638d92](https://github.com/thehfhotel/new-hotel/commit/c638d92abdb8cc1757380b4e2995e956f8d552e9))
+* **sync:** silence benign CT probe-timeout pages; add opt-in CT keep-warm ([72f8ed2](https://github.com/thehfhotel/new-hotel/commit/72f8ed23f593c7bfe274ad9d7722617d4e2a03e5))
+* **v2:** converge guest-image sync-in backfill (skip imageless check-ins) ([a9616f6](https://github.com/thehfhotel/new-hotel/commit/a9616f617c6d180d5cd343a6bd5f5fa9853588db))
+* **v2:** drive the HF Ville view-only banner off canWrite, not branch ([25af6ac](https://github.com/thehfhotel/new-hotel/commit/25af6acc88c49602fc54102608c8cc6d505ade80))
+* **v2:** match partial unique index in guest-image sync-in ON CONFLICT ([e55a1c5](https://github.com/thehfhotel/new-hotel/commit/e55a1c52f2194517173164e1337f0dcd3fbf2466))
+* **v2:** print document templates blank under the v2 layout ([95c3eef](https://github.com/thehfhotel/new-hotel/commit/95c3eef1007b4f50d60cd824ce407de839f28359))
+* **v2:** print the ID/passport image at near-actual card size on the registration form ([ec8dc6d](https://github.com/thehfhotel/new-hotel/commit/ec8dc6d5b128bac12a75bb924df9f5571fbd6982))
+* **v2:** registration card — omit advance line for walk-ins (iHOTEL parity) ([455b255](https://github.com/thehfhotel/new-hotel/commit/455b255e33f3d7ab5f86d58ee4e25a92cd9e814d))
+* **v2:** registration card — payment blanks on baseline, drop assumed nationality ([1051ac2](https://github.com/thehfhotel/new-hotel/commit/1051ac2efeeefe884f0a509f5615e2f6de7249e6))
+* **v2:** registration card — prepayment amount stays 0.00 (no advance tracked) ([aa72f22](https://github.com/thehfhotel/new-hotel/commit/aa72f225095c0755875ce5f10eb3f03727eed239))
+* **v2:** registration card — show C-IN/C-OUT as date only (no time) ([6217aaa](https://github.com/thehfhotel/new-hotel/commit/6217aaa6e97cf8ef0e319bbd4e0fe6d2fc81b226))
+* **v2:** show 'รอทำความสะอาด' for dirty vacant rooms in the grid ([04647d6](https://github.com/thehfhotel/new-hotel/commit/04647d64dd8e4b1ccbb4e0124bea1d6e20516967))
+* **v2:** trim iHOTEL card image to the card (drop white canvas) in sync-in ([6f00912](https://github.com/thehfhotel/new-hotel/commit/6f00912c14d0403d524df10fb205ff552320a38b))
+* **writeback:** companion mirror is replace-all incl. primary (iHOTEL parity) ([11b7fc4](https://github.com/thehfhotel/new-hotel/commit/11b7fc44dfaee0ccd4594bdc9b96d9d0041685bb))
+* **writeback:** convergent delta companion mirror — kill the sync echo loop ([e23a5ad](https://github.com/thehfhotel/new-hotel/commit/e23a5adf63d5f8d49ff58d9d9f79f29ee3bc4596))
+* **writeback:** mirror stamps Tb_Save_Image.cin_no for known check-ins ([0f45451](https://github.com/thehfhotel/new-hotel/commit/0f454514d75b778fad5ca5644bbf1b04795f67d2))
+* **writeback:** mirror Thai-ID card in iHOTEL's native 703x996 canvas shape ([fcce41e](https://github.com/thehfhotel/new-hotel/commit/fcce41edf705dc6351e6e5fc300568d972dea27b))
+
+
+### Changed
+
+* **middleware-build:** faster CI builds (release profile + concurrency + cache) ([923c595](https://github.com/thehfhotel/new-hotel/commit/923c595d0a8140e162a802e452c249f8115220fd))
+
 ## [2.73.0](https://github.com/thehfhotel/new-hotel/compare/v2.72.0...v2.73.0) (2026-06-29)
 
 
