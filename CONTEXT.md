@@ -22,8 +22,14 @@ floor-grouped list is a secondary toggle view.
 _Avoid_: "room list", "floor view" (that's the toggle, not the anchor)
 
 **Layout-edit drag**:
-Dragging a room tile to rearrange the board itself (iHOTEL FormRoomMain semantics; persists
-`room_x`/`room_y`). Distinct gesture/mode from **guest-move drag**.
+Dragging a room tile to rearrange the board itself, inside the explicit จัดผัง mode (ungated,
+like iHOTEL). The board is SHARED: each drop immediately writes `HT_Rooms.Room_X/Room_y`
+(neighbor-derived pixels that round-trip into the same grid cell; drop-on-occupied swaps the
+two tiles), so iHOTEL's board rearranges too. Placing rooms from the unplaced row is part of
+the mode. Distinct gesture/mode from **guest-move drag**; while active, tap-select and
+guest-move are disabled.
+_Avoid_: "canonical-only layout" (forks the two boards), batch "save layout" (a step iHOTEL
+doesn't have)
 
 **Guest-move drag**:
 Dragging an occupied tile onto a vacant one to run the existing room-change flow (issue #225).
