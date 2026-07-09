@@ -531,6 +531,13 @@ pub struct ModeResponse {
     /// default false so booking acceptance is unchanged until validated. See
     /// docs/spikes/2026-06-27-frontend-backend-encapsulation.md.
     pub booking_validation_enabled: bool,
+    /// Issue #236 layout-edit mode (จัดผัง, ship-dark). When true the rooms
+    /// page shows the จัดผัง toggle and `PUT /api/rooms/layout` accepts drops
+    /// (each drop writes canonical `room_x`/`room_y` AND mirrors to legacy
+    /// `HT_Rooms.Room_X`/`Room_y` — the board is SHARED with iHOTEL). When
+    /// false the WHOLE mode is hidden: a canonical-only rearrange would fork
+    /// the two boards. Read from `LAYOUT_WRITEBACK_ENABLED`; default false.
+    pub layout_writeback_enabled: bool,
 }
 
 /// GET /api/mode - Returns current system mode
@@ -556,6 +563,9 @@ pub async fn get_mode(State(state): State<AppState>) -> ApiResult<Json<ModeRespo
         round_writeback_enabled: state.round_writeback_enabled,
         checkout_server_total_enabled,
         booking_validation_enabled,
+        // #236 จัดผัง — same request-time read pattern (config.rs shared
+        // flag reader). Default false → the toggle stays hidden.
+        layout_writeback_enabled: crate::config::layout_writeback_enabled(),
     }))
 }
 
@@ -633,6 +643,7 @@ mod tests {
             round_writeback_enabled: false,
             checkout_server_total_enabled: false,
             booking_validation_enabled: false,
+            layout_writeback_enabled: false,
         };
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(
@@ -658,6 +669,17 @@ mod tests {
             "frontend depends on camelCase `villeWritesEnabled`"
         );
         assert!(v.get("ville_writes_enabled").is_none(), "must be camelCase only");
+        // #236 จัดผัง flag must be camelCase and present (default false) —
+        // the rooms page hides the WHOLE layout-edit mode when it's false.
+        assert_eq!(
+            v.get("layoutWritebackEnabled").and_then(|x| x.as_bool()),
+            Some(false),
+            "frontend depends on camelCase `layoutWritebackEnabled`"
+        );
+        assert!(
+            v.get("layout_writeback_enabled").is_none(),
+            "must be camelCase only"
+        );
     }
 
     /// With no Ville pool (disabled, or startup connect failed), the probe must

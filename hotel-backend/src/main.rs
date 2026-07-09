@@ -622,6 +622,14 @@ fn build_new_routes(app_state: AppState) -> Router {
             "/api/rooms",
             get(routes::new_rooms::list_rooms).post(routes::new_rooms::create_room),
         )
+        // Layout-edit mode (จัดผัง, #236) — one drop = canonical room_x/room_y
+        // UPDATE + MoveRoomTiles writeback (shared board with iHOTEL
+        // FormRoomMain). 409s while LAYOUT_WRITEBACK_ENABLED is off (ship-dark).
+        // Static segment, so it never shadows the `{id}` capture below.
+        .route(
+            "/api/rooms/layout",
+            put(routes::new_rooms::update_room_layout),
+        )
         .route(
             "/api/rooms/{id}",
             get(routes::new_rooms::get_room).put(routes::new_rooms::update_room),
