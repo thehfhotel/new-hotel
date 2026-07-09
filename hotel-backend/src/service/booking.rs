@@ -112,6 +112,14 @@ pub struct ModifyBookingCommand {
     /// [`WritebackIntent::ModifyBooking`].
     pub changes: BookingChanges,
 
+    /// Write-back context for the promote-to-`CreateBooking` path — a parked
+    /// (roomless, never-mirrored) booking getting its FIRST room via the edit
+    /// flow, which must produce the real byte-parity iHOTEL booking. Built by
+    /// the route (same helper as create) when `rooms` is non-empty; consumed
+    /// only when [`modify_writeback_plan`] returns [`ModifyWriteback::Create`].
+    /// `None` for a roomless edit — there's nothing to mirror.
+    pub promote_context: Option<BookingWritebackContext>,
+
     /// Snapshot context (`before` / `after`) for [`DomainEvent::BookingModified`].
     pub before_snapshot: Option<BookingSnapshotInputs>,
     pub after_snapshot: BookingSnapshotInputs,
@@ -408,6 +416,19 @@ impl BookingService {
 
         let mut tx = self.pg.begin().await?;
 
+        // Capture the pre-modify write-back state BEFORE we touch the rooms:
+        // whether the booking is already mirrored to iHOTEL (`legacy_book_id`)
+        // and how many rooms it has right now. A parked (roomless, never
+        // mirrored) booking that gains its FIRST room here must produce the real
+        // byte-parity `CreateBooking`, not a `ModifyBooking` that has no legacy
+        // row to target. Missing row ⇒ `(None, 0)`; `update_booking` below
+        // still returns the not-found error.
+        let (prior_legacy_book_id, prior_room_count) = self
+            .repo
+            .writeback_state(&mut tx, cmd.book_id)
+            .await?
+            .unwrap_or((None, 0));
+
         let rows_affected = self
             .repo
             .update_booking(
@@ -451,21 +472,77 @@ impl BookingService {
         }
 
         let aggregate_id = aggregate_uuid(AggregateKind::Booking, cmd.book_id);
-        let intent = WritebackIntent::ModifyBooking {
-            booking_id: aggregate_id,
-            changes: cmd.changes,
-        };
-        // Repeatable-per-aggregate intent: the SECOND occurrence for the
-        // same aggregate would collide on the permanently-retained
-        // `writeback_jobs.idempotency_key` UNIQUE if we used the
-        // deterministic (intent, aggregate) key — completed jobs stay as
-        // status='done' rows. Per-event v4 discriminator instead (same
-        // precedent as payment/customer-update; see outbox/idempotency.rs
-        // "caller adds a discriminator"). 2026-06-12 audit follow-up.
-        let key = generate_idempotency_key(&intent, uuid::Uuid::new_v4());
-        OutboxRepository::enqueue(&mut tx, &intent, key)
-            .await
-            .map_err(ServiceError::from_enqueue_error)?;
+
+        // Choose the legacy write-back leg. `legacy_book_id` is treated as
+        // "mirrored" only when non-empty (matches the dispatcher's `nonempty`
+        // gate). See [`modify_writeback_plan`] for the full matrix.
+        let legacy = prior_legacy_book_id.as_deref().filter(|s| !s.is_empty());
+        match modify_writeback_plan(legacy, prior_room_count, cmd.rooms.len()) {
+            ModifyWriteback::Create => {
+                // Promote: a parked roomless booking got its first room → emit
+                // the SAME byte-parity CreateBooking an at-create-time room
+                // would have. The route builds `promote_context` (customer +
+                // first room) exactly like the create path's
+                // `build_writeback_context`, so the recipe output is identical.
+                let ctx = cmd.promote_context.as_ref().ok_or_else(|| {
+                    ServiceError::internal(
+                        "room-assign promote requires a write-back context but none was supplied",
+                    )
+                })?;
+                let nights = nights_between(cmd.check_in, cmd.check_out);
+                let payload = CreateBookingPayload {
+                    customer_id: ctx.customer_aggregate_id,
+                    legacy_cust_no: ctx.legacy_cust_no.clone(),
+                    customer_name: ctx.customer_name.clone(),
+                    customer_phone: ctx.customer_phone.clone(),
+                    stay: ctx.stay.clone(),
+                    room_no: ctx.room_no.clone(),
+                    room_type: ctx.room_type.clone(),
+                    price: ctx.price,
+                    nights,
+                    deposit: ctx.deposit,
+                    created_by: ctx.created_by.clone(),
+                    notes: ctx.notes.clone(),
+                };
+                let intent = WritebackIntent::CreateBooking {
+                    booking_id: aggregate_id,
+                    payload,
+                };
+                // Deterministic (intent, aggregate) key — IDENTICAL to what an
+                // at-create-time CreateBooking for this book_id would use, so a
+                // crash-after-commit retry or a duplicate promote maps to the
+                // same `dbo.ht_writeback_ledger` row (no double legacy write),
+                // and the worker back-populates `legacy_book_id` onto this row.
+                // The row's `aggregate_id` was stamped at create time.
+                let key = generate_idempotency_key(&intent, aggregate_id);
+                OutboxRepository::enqueue(&mut tx, &intent, key)
+                    .await
+                    .map_err(ServiceError::from_enqueue_error)?;
+            }
+            ModifyWriteback::Modify => {
+                let intent = WritebackIntent::ModifyBooking {
+                    booking_id: aggregate_id,
+                    changes: cmd.changes,
+                };
+                // Repeatable-per-aggregate intent: the SECOND occurrence for the
+                // same aggregate would collide on the permanently-retained
+                // `writeback_jobs.idempotency_key` UNIQUE if we used the
+                // deterministic (intent, aggregate) key — completed jobs stay as
+                // status='done' rows. Per-event v4 discriminator instead (same
+                // precedent as payment/customer-update; see outbox/idempotency.rs
+                // "caller adds a discriminator"). 2026-06-12 audit follow-up.
+                let key = generate_idempotency_key(&intent, uuid::Uuid::new_v4());
+                OutboxRepository::enqueue(&mut tx, &intent, key)
+                    .await
+                    .map_err(ServiceError::from_enqueue_error)?;
+            }
+            ModifyWriteback::Skip => {
+                // Roomless AND never mirrored → canonical-only, no legacy write
+                // (matches create's roomless behavior). Previously this enqueued
+                // a ModifyBooking that could never resolve its legacy id; now it
+                // is a clean no-op. The domain event below still fires.
+            }
+        }
 
         let after = build_snapshot(aggregate_id, cmd.customer_id, &cmd.after_snapshot);
         let before = cmd
@@ -546,6 +623,55 @@ fn is_unique_violation(err: &sqlx::Error) -> bool {
     }
 }
 
+/// Which legacy write-back leg a [`BookingService::modify`] should take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModifyWriteback {
+    /// Promote to a byte-parity `CreateBooking` — a parked (roomless, never
+    /// mirrored) booking is getting its FIRST room, so the real iHOTEL booking
+    /// must be created now (there is nothing to modify yet).
+    Create,
+    /// Normal targeted `ModifyBooking` against an existing legacy booking (or a
+    /// create still in flight whose `legacy_book_id` hasn't back-populated yet).
+    Modify,
+    /// No legacy write — the booking is roomless AND never mirrored, so there is
+    /// nothing in iHOTEL to create or modify (matches create's roomless rule).
+    Skip,
+}
+
+/// Decide the modify write-back leg from the pre-modify state. Pure — no I/O —
+/// so the full matrix is unit-tested without a database.
+///
+/// * `legacy_book_id` — the booking's mirrored legacy id, already normalised to
+///   `None` when NULL/empty (an empty string is "not mirrored", matching the
+///   dispatcher's `nonempty` gate).
+/// * `prior_room_count` — rooms the booking had BEFORE this modify replaced them.
+/// * `new_room_count` — rooms this modify assigns.
+///
+/// | legacy | prior rooms | new rooms | leg | why |
+/// |---|---|---|---|---|
+/// | none | 0 | ≥1 | **Create** | parked booking gets its first room → real iHOTEL create |
+/// | none | 0 | 0 | **Skip** | still roomless, nothing to mirror |
+/// | none | ≥1 | any | **Modify** | create write-back in flight; ModifyBooking resolves once it lands |
+/// | some | any | any | **Modify** | already mirrored → targeted modify |
+fn modify_writeback_plan(
+    legacy_book_id: Option<&str>,
+    prior_room_count: i64,
+    new_room_count: usize,
+) -> ModifyWriteback {
+    match legacy_book_id {
+        Some(_) => ModifyWriteback::Modify,
+        None => {
+            if prior_room_count == 0 && new_room_count > 0 {
+                ModifyWriteback::Create
+            } else if prior_room_count == 0 {
+                ModifyWriteback::Skip
+            } else {
+                ModifyWriteback::Modify
+            }
+        }
+    }
+}
+
 /// Reject empty room lists + non-positive prices. The legacy app permits
 /// "no-room bookings" (a placeholder), so we mirror that — empty `rooms` is
 /// allowed; only individually invalid rows are rejected.
@@ -616,4 +742,81 @@ fn build_snapshot(
 pub fn naive_date_to_utc(date: NaiveDate) -> chrono::DateTime<Utc> {
     let midnight = NaiveTime::from_hms_opt(0, 0, 0).expect("hardcoded midnight is valid");
     Utc.from_utc_datetime(&date.and_time(midnight))
+}
+
+#[cfg(test)]
+mod modify_writeback_plan_tests {
+    use super::*;
+
+    // (b) A parked (roomless, never-mirrored) booking that gains its FIRST room
+    // via the edit flow must PROMOTE to the byte-parity CreateBooking, so the
+    // front desk assigning the room in the PMS produces the real iHOTEL booking.
+    #[test]
+    fn parked_roomless_booking_gaining_first_room_promotes_to_create() {
+        assert_eq!(modify_writeback_plan(None, 0, 1), ModifyWriteback::Create);
+        assert_eq!(modify_writeback_plan(None, 0, 5), ModifyWriteback::Create);
+    }
+
+    // A still-roomless, never-mirrored booking has nothing to mirror — no doomed
+    // ModifyBooking (the previous behavior), just a clean skip.
+    #[test]
+    fn roomless_staying_roomless_and_unmirrored_skips_legacy() {
+        assert_eq!(modify_writeback_plan(None, 0, 0), ModifyWriteback::Skip);
+    }
+
+    // Had rooms at create (CreateBooking already queued) but legacy id not
+    // back-populated yet: keep ModifyBooking — it resolves once the in-flight
+    // create lands. Must NOT re-enqueue a second CreateBooking.
+    #[test]
+    fn unmirrored_with_rooms_still_modifies_create_in_flight() {
+        assert_eq!(modify_writeback_plan(None, 1, 1), ModifyWriteback::Modify);
+        assert_eq!(modify_writeback_plan(None, 2, 0), ModifyWriteback::Modify);
+        assert_eq!(modify_writeback_plan(None, 1, 2), ModifyWriteback::Modify);
+    }
+
+    // (d) An already-mirrored booking (resolved legacy_book_id) always takes the
+    // normal targeted ModifyBooking — regardless of the room delta, including a
+    // mirrored booking that is currently roomless re-gaining a room (the legacy
+    // HT_Book_H already exists; don't re-create it).
+    #[test]
+    fn already_mirrored_booking_always_modifies() {
+        assert_eq!(modify_writeback_plan(Some("R012345"), 1, 1), ModifyWriteback::Modify);
+        assert_eq!(modify_writeback_plan(Some("R012345"), 0, 1), ModifyWriteback::Modify);
+        assert_eq!(modify_writeback_plan(Some("R012345"), 1, 0), ModifyWriteback::Modify);
+        assert_eq!(modify_writeback_plan(Some("R012345"), 0, 0), ModifyWriteback::Modify);
+    }
+
+    // (c) Retry idempotency: the promoted CreateBooking's key depends ONLY on
+    // (intent variant, aggregate_id) — never the payload — so a crash-after-commit
+    // retry or a duplicate promote maps to the SAME writeback_jobs.idempotency_key
+    // / ledger row as a normal at-create-time CreateBooking → no double legacy write.
+    #[test]
+    fn promoted_create_key_is_deterministic_and_payload_independent() {
+        let agg = aggregate_uuid(AggregateKind::Booking, 4242);
+        let mk = |name: &str| WritebackIntent::CreateBooking {
+            booking_id: agg,
+            payload: CreateBookingPayload {
+                customer_id: Uuid::nil(),
+                legacy_cust_no: None,
+                customer_name: "T".into(),
+                customer_phone: None,
+                stay: DateRange::new(
+                    Utc.with_ymd_and_hms(2026, 7, 20, 0, 0, 0).unwrap(),
+                    Utc.with_ymd_and_hms(2026, 7, 22, 0, 0, 0).unwrap(),
+                ),
+                room_no: "402".into(),
+                room_type: "DLX".into(),
+                price: Money::from_baht(1200),
+                nights: 2,
+                deposit: Money::ZERO,
+                created_by: name.into(),
+                notes: None,
+            },
+        };
+        assert_eq!(
+            generate_idempotency_key(&mk("a"), agg),
+            generate_idempotency_key(&mk("b"), agg),
+            "same (CreateBooking, aggregate) must yield the same key regardless of payload"
+        );
+    }
 }
