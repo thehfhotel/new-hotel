@@ -558,6 +558,11 @@ fn intent_facts(intent: &WritebackIntent) -> IntentFacts {
         | MarkRoomDirty { .. }
         | SetRoomMaintenance { .. }
         | UpdateRoom { .. }
+        // MoveRoomTiles (#236 จัดผัง) is an idempotent absolute-SET
+        // coordinate UPDATE on existing `HT_Rooms` rows — a crash-after-
+        // commit retry re-applies the same pixel pair and converges (not
+        // ledgered). It writes no cashier-round money row → no §1.9 warning.
+        | MoveRoomTiles { .. }
         | UpdateCustomer { .. }
         | AdjustProductStock { .. }
         // RefundDeposit is an idempotent flag UPDATE on an existing
@@ -1199,6 +1204,24 @@ pub async fn dispatch(
                 ));
             }
             recipes::update_room::execute(conn, payload).await
+        }
+        // Issue #236 — จัดผัง layout-edit drop. Every move carries the
+        // legacy `Room_no` business key directly (`UpdateRoom` shape — the
+        // resolver no-ops); 1 move = place/move, 2 = swap, both inside this
+        // one recipe transaction so the legacy board never persists
+        // half-swapped.
+        WritebackIntent::MoveRoomTiles { room_id: _, moves } => {
+            if moves.is_empty() {
+                return Err(WritebackError::Recipe(
+                    "MoveRoomTiles requires at least one move".into(),
+                ));
+            }
+            if moves.iter().any(|m| m.room_no.is_empty()) {
+                return Err(WritebackError::Recipe(
+                    "MoveRoomTiles requires non-empty room_no on every move".into(),
+                ));
+            }
+            recipes::move_room_tiles::execute(conn, moves).await
         }
         // Track F3 — `audit-2026-05-13.md` T1 CRIT-3. The intent
         // already carries the legacy `Pro_no` business key directly

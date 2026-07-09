@@ -338,6 +338,33 @@ pub enum WritebackIntent {
         payload: UpdateRoomPayload,
     },
 
+    /// Issue #236 — layout-edit mode (จัดผัง) board rearrange. Mirrors a
+    /// canonical `ht_rooms_new.room_x`/`room_y` UPDATE → legacy
+    /// `HT_Rooms.Room_X`/`Room_y`, byte-parity with iHOTEL FormRoomMain's
+    /// drag/drop capture (`update HT_Rooms set Room_X=<x>,Room_y=<y> where
+    /// Room_no='<room>'` — COMPAT_CHEATSHEET.md §"Update grid layout"). The
+    /// board is SHARED with iHOTEL, so every drop must reach both sides.
+    ///
+    /// ONE intent carries every move of a single drop: 1 move = place/move,
+    /// 2 moves = swap (the two tiles exchange their existing pixel pairs
+    /// verbatim). Keeping the swap in one job means the legacy board can
+    /// never land half-swapped across a worker crash — both UPDATEs share
+    /// the recipe transaction.
+    ///
+    /// Payload carries the `Room_no` business keys directly
+    /// ([`Self::UpdateRoom`] payload-carries-the-key shape — the writeback
+    /// resolver no-ops). Emitted by `routes::new_rooms::update_room_layout`,
+    /// shipped DARK behind `LAYOUT_WRITEBACK_ENABLED` (default off).
+    MoveRoomTiles {
+        /// Canonical aggregate UUID derived from the FIRST moved room's
+        /// `room_id` via [`crate::service::ids::aggregate_uuid`]. Persisted
+        /// into `writeback_jobs.aggregate_id` so a room's layout jobs group
+        /// together in the index (a swap touches two rooms but one job).
+        room_id: Uuid,
+        /// One entry per moved tile (1 = move/place, 2 = swap).
+        moves: Vec<RoomTileMove>,
+    },
+
     /// Track G2 — `audit-2026-05-13.md` T4 CRIT-1. Refund / negative
     /// payment. The recipe inserts a `HT_CheckIn_Pay` row with a
     /// negative tender amount (per `docs/legacy-app/COMPAT_CHEATSHEET.md:513`
@@ -996,6 +1023,23 @@ pub struct UpdateRoomPayload {
     pub notes: Option<String>,
 }
 
+/// One tile move for [`WritebackIntent::MoveRoomTiles`] (#236 จัดผัง).
+///
+/// `room_x`/`room_y` are legacy free-pixel board coordinates (`HT_Rooms.Room_X`
+/// / `Room_y`, both `int NOT NULL`). The route writes the SAME values into
+/// canonical `ht_rooms_new.room_x`/`room_y` before enqueueing, so the sync
+/// mapper's echo of our own legacy write converges to a no-op (identical
+/// bytes on both sides — the decision-2 invariant).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomTileMove {
+    /// `HT_Rooms.Room_no` — business key the recipe's `WHERE` clause targets.
+    pub room_no: String,
+    /// → `HT_Rooms.Room_X`.
+    pub room_x: i32,
+    /// → `HT_Rooms.Room_y` (sic — lowercase `y` in the legacy schema).
+    pub room_y: i32,
+}
+
 /// Payload for [`WritebackIntent::CreateCheckIn`].
 ///
 /// Discriminates between walk-in and linked-to-booking via `linked_booking_id`
@@ -1123,6 +1167,7 @@ impl WritebackIntent {
             WritebackIntent::MarkRoomDirty { .. } => "mark_room_dirty",
             WritebackIntent::SetRoomMaintenance { .. } => "set_room_maintenance",
             WritebackIntent::UpdateRoom { .. } => "update_room",
+            WritebackIntent::MoveRoomTiles { .. } => "move_room_tiles",
             WritebackIntent::UpdateCustomer { .. } => "update_customer",
             WritebackIntent::AdjustProductStock { .. } => "adjust_product_stock",
             WritebackIntent::IssueCoupon { .. } => "issue_coupon",
@@ -1166,7 +1211,8 @@ impl WritebackIntent {
             WritebackIntent::MarkRoomClean { room_id, .. }
             | WritebackIntent::MarkRoomDirty { room_id, .. }
             | WritebackIntent::SetRoomMaintenance { room_id, .. }
-            | WritebackIntent::UpdateRoom { room_id, .. } => *room_id,
+            | WritebackIntent::UpdateRoom { room_id, .. }
+            | WritebackIntent::MoveRoomTiles { room_id, .. } => *room_id,
             WritebackIntent::UpdateCustomer { customer_id, .. } => *customer_id,
             // Track F3 — fall back to a deterministic v5 UUID derived
             // from the legacy `Pro_no` so the
@@ -1569,6 +1615,46 @@ mod tests {
                 assert_eq!(resave.cust_work_name, "");
             }
             other => panic!("expected UpdateCustomer, got {other:?}"),
+        }
+    }
+
+    /// `MoveRoomTiles` (#236 จัดผัง) must expose the snake_case discriminant
+    /// `"move_room_tiles"`, report the carried (first-moved-room) aggregate
+    /// id, and round-trip a two-move swap payload through serde with move
+    /// ORDER preserved (the recipe emits one legacy UPDATE per move in
+    /// payload order).
+    #[test]
+    fn move_room_tiles_intent_roundtrips_swap_payload() {
+        let room_id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let intent = WritebackIntent::MoveRoomTiles {
+            room_id,
+            moves: vec![
+                RoomTileMove {
+                    room_no: "306".into(),
+                    room_x: 120,
+                    room_y: 240,
+                },
+                RoomTileMove {
+                    room_no: "A2-1".into(),
+                    room_x: 10,
+                    room_y: 10,
+                },
+            ],
+        };
+        assert_eq!(intent.intent_name(), "move_room_tiles");
+        assert_eq!(intent.aggregate_id(), room_id);
+        let json = serde_json::to_string(&intent).expect("must serialize");
+        let parsed: WritebackIntent = serde_json::from_str(&json).expect("must round-trip");
+        match parsed {
+            WritebackIntent::MoveRoomTiles { room_id: r, moves } => {
+                assert_eq!(r, room_id);
+                assert_eq!(moves.len(), 2, "swap carries exactly two moves");
+                assert_eq!(moves[0].room_no, "306");
+                assert_eq!((moves[0].room_x, moves[0].room_y), (120, 240));
+                assert_eq!(moves[1].room_no, "A2-1");
+                assert_eq!((moves[1].room_x, moves[1].room_y), (10, 10));
+            }
+            other => panic!("expected MoveRoomTiles, got {other:?}"),
         }
     }
 
