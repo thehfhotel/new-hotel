@@ -29,6 +29,11 @@ interface BranchContextType {
    *  verdict (BOOKING_VALIDATION_ENABLED). Default false → current client-only
    *  validation. */
   bookingValidationEnabled: boolean
+  /** #236 จัดผัง (ship-dark): when true the rooms page shows the layout-edit
+   *  toggle and PUT /api/rooms/layout accepts drops (shared board — each drop
+   *  mirrors to iHOTEL HT_Rooms.Room_X/Room_y). When false the WHOLE mode is
+   *  hidden (LAYOUT_WRITEBACK_ENABLED). Default false. */
+  layoutWritebackEnabled: boolean
   /** True when the current branch is writable: HF Hotel always, HF Ville only
    *  when villeWritesEnabled. UIs gate mutating actions on this. */
   canWrite: boolean
@@ -42,6 +47,7 @@ const BranchContext = createContext<BranchContextType>({
   roundWritebackEnabled: false,
   checkoutServerTotalEnabled: false,
   bookingValidationEnabled: false,
+  layoutWritebackEnabled: false,
   canWrite: true,
 })
 
@@ -52,6 +58,7 @@ export function BranchProvider({ children }: { children: ReactNode }) {
   const [roundWritebackEnabled, setRoundWritebackEnabled] = useState(false)
   const [checkoutServerTotalEnabled, setCheckoutServerTotalEnabled] = useState(false)
   const [bookingValidationEnabled, setBookingValidationEnabled] = useState(false)
+  const [layoutWritebackEnabled, setLayoutWritebackEnabled] = useState(false)
   const [mounted, setMounted] = useState(false)
 
   useEffect(() => {
@@ -80,6 +87,9 @@ export function BranchProvider({ children }: { children: ReactNode }) {
         if (data.success && data.bookingValidationEnabled) {
           setBookingValidationEnabled(true)
         }
+        if (data.success && data.layoutWritebackEnabled) {
+          setLayoutWritebackEnabled(true)
+        }
       })
       .catch((err) => console.error('Failed to check ville availability:', err))
   }, [])
@@ -96,14 +106,14 @@ export function BranchProvider({ children }: { children: ReactNode }) {
 
   if (!mounted) {
     return (
-      <BranchContext.Provider value={{ branch, setBranch, villeAvailable, villeWritesEnabled, roundWritebackEnabled, checkoutServerTotalEnabled, bookingValidationEnabled, canWrite }}>
+      <BranchContext.Provider value={{ branch, setBranch, villeAvailable, villeWritesEnabled, roundWritebackEnabled, checkoutServerTotalEnabled, bookingValidationEnabled, layoutWritebackEnabled, canWrite }}>
         {children}
       </BranchContext.Provider>
     )
   }
 
   return (
-    <BranchContext.Provider value={{ branch, setBranch, villeAvailable, villeWritesEnabled, roundWritebackEnabled, checkoutServerTotalEnabled, bookingValidationEnabled, canWrite }}>
+    <BranchContext.Provider value={{ branch, setBranch, villeAvailable, villeWritesEnabled, roundWritebackEnabled, checkoutServerTotalEnabled, bookingValidationEnabled, layoutWritebackEnabled, canWrite }}>
       {children}
     </BranchContext.Provider>
   )

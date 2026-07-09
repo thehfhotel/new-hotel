@@ -11,6 +11,10 @@
  * - Guest-move drag: dragging an occupied tile onto a vacant tile fires
  *   `onMoveRequest`; a maintenance tile never does; `canDrag=false`
  *   (read-only branch) disables the gesture entirely.
+ * - Layout-edit mode (#236 จัดผัง, `mode='layout'`): EVERY tile drags (any
+ *   status, incl. the unplaced row), tap-select is suppressed, drop on a
+ *   placed tile fires a swap, drop on a synthetic empty lattice cell fires a
+ *   place, and guest-move defaults stay untouched when the prop is absent.
  */
 
 import { fireEvent, render, screen } from '@testing-library/react'
@@ -168,5 +172,91 @@ describe('SpatialRoomGrid — tap vs guest-move drag (#225)', () => {
     )
     dragTile(tile(1), tile(2))
     expect(onMoveRequest).not.toHaveBeenCalled()
+  })
+
+  it('renders NO synthetic lattice cells in guest mode (perf: 58-tile board stays 58 nodes)', () => {
+    render(
+      <SpatialRoomGrid rooms={ROOMS} onSelect={jest.fn()} onMoveRequest={jest.fn()} canDrag />,
+    )
+    expect(document.querySelectorAll('[data-cell]')).toHaveLength(0)
+  })
+})
+
+describe('SpatialRoomGrid — layout-edit mode (#236 จัดผัง)', () => {
+  function renderLayout(overrides: Partial<Parameters<typeof SpatialRoomGrid>[0]> = {}) {
+    const onSelect = jest.fn()
+    const onMoveRequest = jest.fn()
+    const onLayoutDrop = jest.fn()
+    render(
+      <SpatialRoomGrid
+        rooms={ROOMS}
+        onSelect={onSelect}
+        onMoveRequest={onMoveRequest}
+        canDrag
+        mode="layout"
+        onLayoutDrop={onLayoutDrop}
+        {...overrides}
+      />,
+    )
+    return { onSelect, onMoveRequest, onLayoutDrop }
+  }
+
+  function cell(col: number, row: number): HTMLElement {
+    const el = document.querySelector(`[data-cell][data-col="${col}"][data-row="${row}"]`)
+    if (!el) throw new Error(`cell (${col},${row}) not rendered`)
+    return el as HTMLElement
+  }
+
+  it('renders the empty-cell lattice with ONE extrapolation band beyond each edge', () => {
+    renderLayout()
+    // Base board is 3 cols × 2 rows → lattice (3+1) × (2+1) = 12 cells.
+    expect(document.querySelectorAll('[data-cell]')).toHaveLength(12)
+    expect(cell(4, 3)).toBeTruthy()
+  })
+
+  it('suppresses tap-select while the mode is active', () => {
+    const { onSelect } = renderLayout()
+    fireEvent.click(tile(2))
+    expect(onSelect).not.toHaveBeenCalled()
+  })
+
+  it('drops a VACANT tile onto another placed tile → swap callback (guest-move untouched)', () => {
+    const { onLayoutDrop, onMoveRequest } = renderLayout()
+    dragTile(tile(2), tile(4)) // vacant → vacant: undraggable in guest mode
+    expect(onLayoutDrop).toHaveBeenCalledTimes(1)
+    const [source, target] = onLayoutDrop.mock.calls[0]
+    expect(source.id).toBe(2)
+    expect(target).toMatchObject({ type: 'swap', room: expect.objectContaining({ id: 4 }) })
+    expect(onMoveRequest).not.toHaveBeenCalled()
+  })
+
+  it('drops a tile onto an empty lattice cell → place callback with the cell coords', () => {
+    const { onLayoutDrop } = renderLayout()
+    dragTile(tile(1), cell(2, 2))
+    expect(onLayoutDrop).toHaveBeenCalledTimes(1)
+    const [source, target] = onLayoutDrop.mock.calls[0]
+    expect(source.id).toBe(1)
+    expect(target).toEqual({ type: 'cell', col: 2, row: 2 })
+  })
+
+  it('drags an UNPLACED-row tile onto a cell → place (this is how it gets on the board)', () => {
+    const { onLayoutDrop } = renderLayout()
+    dragTile(tile(5), cell(4, 3)) // X99 into the extrapolation corner
+    expect(onLayoutDrop).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 5, roomNo: 'X99' }),
+      { type: 'cell', col: 4, row: 3 },
+    )
+  })
+
+  it('ignores a drop onto an UNPLACED tile (no pixel pair to swap with)', () => {
+    const { onLayoutDrop } = renderLayout()
+    dragTile(tile(1), tile(5))
+    expect(onLayoutDrop).not.toHaveBeenCalled()
+  })
+
+  it('never starts a layout drag when canDrag is false (read-only branch)', () => {
+    const { onLayoutDrop } = renderLayout({ canDrag: false })
+    dragTile(tile(2), tile(4))
+    expect(onLayoutDrop).not.toHaveBeenCalled()
   })
 })
