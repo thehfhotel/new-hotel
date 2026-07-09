@@ -7,6 +7,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.75.0](https://github.com/thehfhotel/new-hotel/compare/v2.74.1...v2.75.0) (2026-07-09)
+
+
+### Added
+
+* **v2/rooms:** จัดผัง layout-edit mode — shared-board rearrangement, ship dark ([#237](https://github.com/thehfhotel/new-hotel/issues/237)) ([ea2b729](https://github.com/thehfhotel/new-hotel/commit/ea2b7292852368941a0fb3941066b9741f6f1169))
+
+
+### Changed
+
+* **v2/rooms:** 1:1 drag tracking — imperative rAF ghost, no per-move re-render ([0021f77](https://github.com/thehfhotel/new-hotel/commit/0021f77bc4c4bd2ac5fd80418a7a6106e1c51db3))
+
 ## [2.74.1](https://github.com/thehfhotel/new-hotel/compare/v2.74.0...v2.74.1) (2026-07-09)
 
 
