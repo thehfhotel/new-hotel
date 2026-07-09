@@ -25,12 +25,18 @@ import {
 
 const DRAG_THRESHOLD_PX = 8
 
+/**
+ * Perf contract (2026-07-10, "drag isn't snappy" fix): React state changes at
+ * most a handful of times per drag — once at threshold-cross and once per
+ * hover-target CHANGE. The ghost's translate() is applied imperatively to the
+ * source DOM node inside requestAnimationFrame, so pointermove never triggers
+ * a 58-tile re-render, and `transition: none` on the source stops the
+ * `transition-transform` class from easing the ghost behind the pointer.
+ */
 interface DragState {
   source: SpatialRoom
   startX: number
   startY: number
-  dx: number
-  dy: number
   hoverId: number | null
 }
 
@@ -53,6 +59,17 @@ export default function SpatialRoomGrid({
   const pendingRef = useRef<{ room: SpatialRoom; x: number; y: number } | null>(null)
   // Suppresses the click that follows a completed drag.
   const justDraggedRef = useRef(false)
+  // Imperative ghost position — lives outside React state (see perf contract).
+  const sourceElRef = useRef<HTMLElement | null>(null)
+  const posRef = useRef({ dx: 0, dy: 0 })
+  const rafRef = useRef<number | null>(null)
+
+  const applyGhostTransform = () => {
+    rafRef.current = null
+    const el = sourceElRef.current
+    if (!el) return
+    el.style.transform = `translate(${posRef.current.dx}px, ${posRef.current.dy}px) scale(1.04)`
+  }
 
   const byId = useMemo(() => {
     const m = new Map<number, SpatialRoom>()
@@ -62,6 +79,13 @@ export default function SpatialRoomGrid({
 
   const endDrag = () => {
     pendingRef.current = null
+    if (rafRef.current != null) {
+      window.cancelAnimationFrame?.(rafRef.current)
+      rafRef.current = null
+    }
+    if (sourceElRef.current) sourceElRef.current.style.transform = ''
+    sourceElRef.current = null
+    posRef.current = { dx: 0, dy: 0 }
     setDrag(null)
     // The click that follows pointerup fires synchronously; clear the
     // suppression flag on the next tick so a later genuine tap still selects.
@@ -87,28 +111,34 @@ export default function SpatialRoomGrid({
         /* jsdom / older browsers */
       }
       justDraggedRef.current = true
+      sourceElRef.current = e.currentTarget
+      posRef.current = { dx: e.clientX - pending.x, dy: e.clientY - pending.y }
+      applyGhostTransform()
       setDrag({
         source: pending.room,
         startX: pending.x,
         startY: pending.y,
-        dx: e.clientX - pending.x,
-        dy: e.clientY - pending.y,
         hoverId: null,
       })
       return
     }
     if (!drag) return
-    // The dragged tile has pointer-events:none while dragging, so
-    // elementFromPoint hit-tests the tile UNDER the pointer.
+    // Ghost position: ref + rAF only — no setState, no re-render (perf contract).
+    posRef.current = { dx: e.clientX - drag.startX, dy: e.clientY - drag.startY }
+    if (rafRef.current == null) {
+      rafRef.current = window.requestAnimationFrame?.(applyGhostTransform) ?? null
+      // jsdom without rAF: apply synchronously so tests observe the transform.
+      if (rafRef.current == null) applyGhostTransform()
+    }
+    // Hover hit-test stays synchronous (drop correctness depends on it), but
+    // only a CHANGE of target commits state. The dragged tile has
+    // pointer-events:none while dragging, so elementFromPoint hit-tests the
+    // tile UNDER the pointer.
     const under = document.elementFromPoint?.(e.clientX, e.clientY)
     const targetEl = under?.closest?.('[data-room-id]') as HTMLElement | null
-    const hoverId = targetEl ? Number(targetEl.dataset.roomId) : null
-    setDrag({
-      ...drag,
-      dx: e.clientX - drag.startX,
-      dy: e.clientY - drag.startY,
-      hoverId: hoverId === drag.source.id ? null : hoverId,
-    })
+    const rawHoverId = targetEl ? Number(targetEl.dataset.roomId) : null
+    const hoverId = rawHoverId === drag.source.id ? null : rawHoverId
+    if (hoverId !== drag.hoverId) setDrag({ ...drag, hoverId })
   }
 
   const handlePointerUp = () => {
@@ -141,7 +171,11 @@ export default function SpatialRoomGrid({
 
     const dragStyle: React.CSSProperties | undefined = isSource
       ? {
-          transform: `translate(${drag!.dx}px, ${drag!.dy}px) scale(1.04)`,
+          // Re-renders during a drag (hover changes) must not reset the
+          // imperatively-applied position — re-emit the current ref value.
+          transform: `translate(${posRef.current.dx}px, ${posRef.current.dy}px) scale(1.04)`,
+          transition: 'none', // defeat .transition-transform easing — 1:1 tracking
+          willChange: 'transform',
           zIndex: 30,
           position: 'relative',
           pointerEvents: 'none',
