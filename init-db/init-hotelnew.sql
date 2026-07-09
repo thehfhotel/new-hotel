@@ -90,12 +90,18 @@ CREATE TABLE IF NOT EXISTS ht_customers (
     -- Migration 069 — guest date of birth captured at check-in registration
     -- (Thai ID chip / passport MRZ). PG-canonical-only: legacy HT_Customers
     -- has no DOB column, so this is never mirrored to MSSQL.
-    cust_dob DATE
+    cust_dob DATE,
+    -- Migration 078 — loyalty membership id (loyalty-app link). PG-canonical
+    -- only: legacy HT_Customers has no membership column, never mirrored.
+    cust_membership_id VARCHAR(64)
 );
 CREATE INDEX IF NOT EXISTS ix_ht_customers_name ON ht_customers(cust_firstname, cust_lastname);
 CREATE INDEX IF NOT EXISTS ix_ht_customers_phone ON ht_customers(cust_phone);
 CREATE INDEX IF NOT EXISTS ix_ht_customers_idcard ON ht_customers(cust_idcard);
 CREATE INDEX IF NOT EXISTS ix_ht_customers_passport ON ht_customers(cust_passport);
+-- Migration 078 — membership → guest lookup (checkout hook + desk member-QR).
+CREATE INDEX IF NOT EXISTS ix_ht_customers_membership_id
+    ON ht_customers (cust_membership_id) WHERE cust_membership_id IS NOT NULL;
 
 -- ht_room_types - Room type definitions
 CREATE TABLE IF NOT EXISTS ht_room_types (
@@ -199,6 +205,10 @@ CREATE TABLE IF NOT EXISTS ht_bookings (
     book_notify_dismissed_at TIMESTAMPTZ,
     book_cancelled_at TIMESTAMP,
     book_cancel_reason VARCHAR(500),
+    -- Migration 078 — payment-hold deadline for loyalty-channel TENTATIVE
+    -- bookings (book_channel='loyalty', book_status='pending'). PG-canonical
+    -- only; the scheduler sweep cancels holds past this instant.
+    book_hold_expires_at TIMESTAMPTZ,
     -- Writeback resolver back-populates these (migration 014).
     legacy_book_id VARCHAR(20),
     legacy_cust_no VARCHAR(20),
@@ -229,6 +239,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_ht_bookings_channel_ext_ref
 -- Migration 064 (task #53) — active-reminder lookup for the notification bell.
 CREATE INDEX IF NOT EXISTS ix_ht_bookings_active_reminders
     ON ht_bookings (book_checkin) WHERE book_notify_dismissed_at IS NULL;
+-- Migration 078 — expiry-sweep lookup: pending loyalty-channel holds only.
+CREATE INDEX IF NOT EXISTS ix_ht_bookings_hold_expiry
+    ON ht_bookings (book_hold_expires_at)
+    WHERE book_hold_expires_at IS NOT NULL AND book_status = 'pending';
 
 -- ht_booking_rooms - Junction table for booking-room assignments
 CREATE TABLE IF NOT EXISTS ht_booking_rooms (
@@ -2607,6 +2621,15 @@ ON CONFLICT (version) DO NOTHING;
 -- sees zero pending.
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('077', '077_create_ht_housekeeping_reports.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- Migration 078 — loyalty-app channel + membership link:
+-- `ht_customers.cust_membership_id` + `ht_bookings.book_hold_expires_at`
+-- (columns + partial indexes inlined above). Both PG-canonical only — no
+-- legacy counterpart, never written back. This seed row records the migration
+-- as applied so the drift check sees zero pending.
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('078', '078_loyalty_channel.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================
