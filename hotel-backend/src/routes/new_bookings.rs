@@ -274,6 +274,16 @@ pub struct CreateUpdateBookingRequest {
     /// Pre-ordered products. Optional; defaults to empty.
     #[serde(default)]
     pub products: Vec<BookingProductRequest>,
+    /// OTA provenance / caller-idempotency natural key (migration 076).
+    /// `bookChannel` = the source channel (e.g. `"bookingcom"`); `bookExtRef`
+    /// = that channel's own booking id. When BOTH are present, a repeat create
+    /// carrying the same pair is idempotent — the service returns the existing
+    /// booking instead of inserting a second one, so a double-POST of one OTA
+    /// reservation can't create two `ht_bookings` rows → two real iHOTEL
+    /// bookings. Absent for every existing caller (walk-in / manual), which
+    /// keeps their behavior unchanged.
+    pub book_channel: Option<String>,
+    pub book_ext_ref: Option<String>,
 }
 
 /// Response for create/update/cancel operations
@@ -415,17 +425,25 @@ pub async fn create_booking(
         rooms: body.rooms.iter().map(room_request_to_command).collect(),
         products: body.products.iter().map(product_request_to_command).collect(),
         writeback_context,
+        book_channel: body.book_channel.clone(),
+        book_ext_ref: body.book_ext_ref.clone(),
         // TODO: wire user_id from auth middleware
         source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
     };
 
     let outcome = ws.bookings.create(cmd).await?;
 
+    // On an idempotent hit (repeat OTA create with the same channel + ext_ref)
+    // the service returns the EXISTING booking's number so the caller gets a
+    // stable reference; on the normal create path it returns None and we use
+    // the number we just generated (which is what was inserted).
+    let effective_book_no = outcome.book_no.unwrap_or(book_no);
+
     Ok(Json(MutationResponse {
         success: true,
         message: "Booking created successfully".to_string(),
         id: Some(outcome.book_id),
-        book_no: Some(book_no),
+        book_no: Some(effective_book_no),
     }))
 }
 
