@@ -468,6 +468,55 @@ impl CustomerService {
             aggregate_id,
         })
     }
+
+    /// Set or clear the guest's loyalty membership link (migration 078 —
+    /// desk flow: staff type/scan the id from the member QR at check-in).
+    ///
+    /// **PG-CANONICAL ONLY, deliberately NO legacy writeback**: legacy
+    /// `HT_Customers` has no membership column, so unlike [`Self::update`]
+    /// this does NOT enqueue the 31-field `UpdateCustomer` re-save — there is
+    /// nothing legacy-side to keep consistent, and re-saving the whole row
+    /// for a PG-only field would be a gratuitous legacy write. The
+    /// `CustomerModified` event still fires (SSE cache invalidation).
+    ///
+    /// `membership_id = None` clears the link.
+    pub async fn set_membership(
+        &self,
+        customer_id: i32,
+        membership_id: Option<String>,
+        source: EventSource,
+    ) -> ServiceResult<CustomerOutcome> {
+        let mut tx = self.pg.begin().await?;
+
+        let rows_affected = self
+            .repo
+            .set_membership(&mut tx, customer_id, membership_id.as_deref())
+            .await?;
+
+        if rows_affected == 0 {
+            return Err(ServiceError::not_found(format!(
+                "customer {} does not exist",
+                customer_id
+            )));
+        }
+
+        let aggregate_id = aggregate_uuid(AggregateKind::Customer, customer_id);
+        let event = DomainEvent::CustomerModified {
+            id: aggregate_id,
+            source,
+            changed_fields: vec!["cust_membership_id".to_string()],
+        };
+        EventBus::publish(&mut tx, &event)
+            .await
+            .map_err(|err| ServiceError::outbox(err.to_string()))?;
+
+        tx.commit().await?;
+
+        Ok(CustomerOutcome {
+            customer_id,
+            aggregate_id,
+        })
+    }
 }
 
 /// Reject an empty / whitespace-only first name. Mirrors the prior route-side

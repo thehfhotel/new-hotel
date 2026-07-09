@@ -772,6 +772,27 @@ pub async fn checkout(
         .await
         .map_err(map_checkout_error)?;
 
+    // Loyalty stay hook (docs/loyalty-channel.md Piece 3). OFF unless both
+    // LOYALTY_APP_URL + LOYALTY_SERVICE_TOKEN are set (`from_env` → None).
+    // Fire-and-forget AFTER the checkout committed: the detached task
+    // re-reads the post-commit stay (so a per-room partial checkout that did
+    // NOT complete the stay is skipped), gates on the guest's membership
+    // link, and POSTs with bounded retries + a Slack page on persistent
+    // failure. Nothing here can block or fail the checkout response.
+    if let Some(client) = crate::service::LoyaltyClient::from_env() {
+        // Contract property literal for this branch: hf | hfville.
+        let property = match query.branch.unwrap_or_default() {
+            Branch::Hfville => "hfville",
+            Branch::Hfhotel | Branch::All => "hf",
+        };
+        tokio::spawn(crate::service::loyalty::run_checkout_stay_hook(
+            client,
+            pool.clone(),
+            property.to_string(),
+            cin_id,
+        ));
+    }
+
     Ok(Json(MutationResponse {
         success: true,
         message: "Check-out completed successfully".to_string(),

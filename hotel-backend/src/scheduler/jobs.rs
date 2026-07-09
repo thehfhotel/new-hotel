@@ -17,6 +17,11 @@ use crate::notifications::slack::{
     build_check_in_alert_message, build_check_out_alert_message, build_hourly_report_message,
     build_new_booking_alert_message, format_site_prefixed, SlackClient, SlackMessage,
 };
+use crate::outbox::{EventBus, OutboxRepository};
+use crate::repository::{
+    CustomerRepository, PgBookingRepository, PgCustomerRepository,
+};
+use crate::service::{BookingService, ChannelService, CustomerService};
 use super::notification_state::{
     load_watermark, now_thai_local, save_watermark, NotificationType,
 };
@@ -166,6 +171,55 @@ pub async fn init_scheduler(
             site = %site.id,
             ville_covered = ville_pg_pool.is_some(),
             "[Scheduler] - Stale-checkin tripwire: hourly (pure-PG dropped-checkout safety net)"
+        );
+
+        // Loyalty-channel hold expiry sweep (docs/loyalty-channel.md).
+        // Belt-and-braces behind the loyalty app's own `release` call: any
+        // `book_channel='loyalty'` hold still `pending` past its
+        // `book_hold_expires_at` is auto-cancelled through the SAME
+        // release path the API uses (status-guarded on 'pending', normal
+        // CancelBooking writeback → iHOTEL sees the room free again).
+        // Registered unconditionally (not gated on LOYALTY_CHANNEL_ENABLED):
+        // the query is a cheap partial-index scan that matches nothing while
+        // the channel is dark, and an operator turning the channel OFF with
+        // holds outstanding still wants those holds to expire. Every 5
+        // minutes; per-hold failures are logged and skipped inside
+        // `sweep_expired_holds` so one bad row can't wedge the tick. Covers
+        // both sites (same pattern as the stale-checkin tripwire above —
+        // the backend is where both canonical pools are co-resident).
+        let sweep_pg = pg.clone();
+        let sweep_ville = ville_pg_pool.clone();
+        let sweep_site = site.id.clone();
+        let sweep_job = Job::new_async("0 */5 * * * *", move |_uuid, _l| {
+            let pg = sweep_pg.clone();
+            let ville = sweep_ville.clone();
+            let site_id = sweep_site.clone();
+            Box::pin(async move {
+                let released = channel_service_for_pool(&pg)
+                    .sweep_expired_holds(&site_id)
+                    .await;
+                if released > 0 {
+                    tracing::info!(site = %site_id, released, "[Scheduler] loyalty hold sweep released expired holds");
+                }
+                // Guard against an unexpected hfville-primary config
+                // double-sweeping the same DB (mirrors the tripwire above).
+                if let Some(ref vp) = ville {
+                    if site_id != "hfville" {
+                        let released = channel_service_for_pool(vp)
+                            .sweep_expired_holds("hfville")
+                            .await;
+                        if released > 0 {
+                            tracing::info!(site = "hfville", released, "[Scheduler] loyalty hold sweep released expired holds");
+                        }
+                    }
+                }
+            })
+        })?;
+        scheduler.add(sweep_job).await?;
+        tracing::info!(
+            site = %site.id,
+            ville_covered = ville_pg_pool.is_some(),
+            "[Scheduler] - Loyalty hold expiry sweep: every 5 minutes"
         );
     }
 
@@ -348,6 +402,31 @@ pub async fn init_scheduler(
     }
 
     Ok(())
+}
+
+/// Build a per-site [`ChannelService`] from stateless parts + the site's
+/// canonical pool — the same construction shape as
+/// `AppState::resolve_write_services` (every collaborator is a stateless
+/// struct; the pool handle is the only real state), so the sweep's cancel
+/// path enqueues its writeback + event into the SAME site DB the hold lives
+/// in (the per-site writeback worker LISTENs there).
+fn channel_service_for_pool(pg: &PgPool) -> ChannelService {
+    let outbox = Arc::new(OutboxRepository::new());
+    let events = Arc::new(EventBus::new());
+    let customers_repo: Arc<dyn CustomerRepository> = Arc::new(PgCustomerRepository::new());
+    let bookings = Arc::new(BookingService::new(
+        Arc::new(PgBookingRepository::new()),
+        outbox.clone(),
+        events.clone(),
+        pg.clone(),
+    ));
+    let customers = Arc::new(CustomerService::new(
+        customers_repo.clone(),
+        outbox,
+        events,
+        pg.clone(),
+    ));
+    ChannelService::new(pg.clone(), bookings, customers, customers_repo)
 }
 
 /// Apply the task #69 site-id prefix to a Block-Kit Slack message in

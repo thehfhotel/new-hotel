@@ -81,6 +81,15 @@ const SECRET_FILE_MAP: &[(&str, &str)] = &[
     // unset/empty var. (The old device↔PMS `reader_secret` was retired when
     // the reader moved to posting taps to central HF-ID.)
     ("reader_resolve_secret", "READER_RESOLVE_SECRET"),
+    // Loyalty-app integration (docs/loyalty-channel.md). Inbound shared
+    // bearer for /api/channel/* (loyalty app → PMS) and outbound bearer for
+    // the checkout stay hook (PMS → loyalty app). Both fail closed when
+    // absent — the channel rejects every request, the hook stays off.
+    // NOTE: not yet declared in docker-compose.yml `secrets:` (the deploy
+    // payload doesn't carry them yet); env vars are the provisioning path
+    // until the coordinated go-live wires the secret files.
+    ("loyalty_channel_token", "LOYALTY_CHANNEL_TOKEN"),
+    ("loyalty_service_token", "LOYALTY_SERVICE_TOKEN"),
 ];
 
 /// Hydrate env vars from Docker secret files, then reconstruct

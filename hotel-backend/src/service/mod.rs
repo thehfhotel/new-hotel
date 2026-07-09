@@ -36,12 +36,14 @@
 
 pub mod auth;
 pub mod booking;
+pub mod channel;
 pub mod checkin;
 pub mod coupon;
 pub mod customer;
 pub mod error;
 pub mod housekeeping;
 pub mod ids;
+pub mod loyalty;
 pub mod payment;
 pub mod pos;
 pub mod reader;
@@ -53,6 +55,9 @@ pub use booking::{
     BookingOutcome, BookingProductCommand, BookingRoomCommand, BookingService,
     BookingSnapshotInputs, BookingWritebackContext, CancelBookingCommand, CreateBookingCommand,
     ModifyBookingCommand,
+};
+pub use channel::{
+    ChannelService, ConfirmOutcome, CreateHoldCommand, HoldOutcome, PaymentPlan, ReleaseOutcome,
 };
 pub use checkin::{
     CancelCheckInCommand, ChangeRoomCommand, ChangeRoomOutcome, CheckInOutcome, CheckInService,
@@ -72,6 +77,7 @@ pub use housekeeping::{
     MarkMaintenanceCommand,
 };
 pub use ids::{aggregate_uuid, AggregateKind};
+pub use loyalty::{LoyaltyClient, LoyaltyStayPayload};
 pub use payment::{
     GenerateReceiptCommand, GenerateReceiptOutcome, PaymentService, RecordPaymentCommand,
     RecordPaymentOutcome, RefundPaymentCommand, RefundPaymentOutcome,

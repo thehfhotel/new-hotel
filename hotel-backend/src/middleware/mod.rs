@@ -17,14 +17,19 @@
 //! * `hk_access` — Cloudflare Access gate for the maid-facing `/api/hk/*`
 //!   surface (a THIRD consumer of the team JWKS, different Access app AUD;
 //!   employee-login plan Phase 4). IS a tower layer, unlike `cf_access`.
+//! * `channel_token` — shared-bearer service-token gate for the loyalty-app
+//!   booking channel `/api/channel/*` (machine-to-machine; ships dark behind
+//!   `LOYALTY_CHANNEL_ENABLED`). IS a tower layer.
 
 pub mod auth;
 pub mod cf_access;
+pub mod channel_token;
 pub mod hfid_assertion;
 pub mod hk_access;
 pub mod permissions;
 pub mod rate_limit;
 
 pub use auth::require_auth;
+pub use channel_token::{require_channel_token, ChannelTokenState};
 pub use permissions::{permissions_for_user, require_permission};
 pub use rate_limit::{login_rate_limit, LoginRateLimitState};
