@@ -186,26 +186,26 @@ cookie = "0.18"
 #   exports, no JNI/Excel binding required. Chosen over umya-spreadsheet
 #   which optimises for the read+modify workflow we don't need here.
 csv = "1.3"
-rust_xlsxwriter = "0.95"
+rust_xlsxwriter = "0.96"
 
 # Thai national-ID card server-side compositing (render/thai_id_card.rs) — a
 # clean reimplement of the iHOTEL ReportReg card face, NO vendor lib. resvg
 # drives rustybuzz under the hood for correct Thai complex-script shaping (the
 # whole reason we render server-side instead of on a client <canvas>).
 #
-# Version set = the resvg 0.44 line, which co-resolves cleanly: resvg 0.44 →
-# usvg 0.44 (pins `fontdb ^0.22`, `tiny-skia-path ^0.11.4`, `rustybuzz ^0.18`)
-# and `tiny-skia ^0.11`. DEFAULT features are left ON so `text`
+# Version set = the resvg 0.47 line, which co-resolves cleanly: resvg 0.47 →
+# usvg 0.47 (pins `fontdb ^0.23`, `tiny-skia-path ^0.12`, `rustybuzz ^0.20`)
+# and `tiny-skia ^0.12`. DEFAULT features are left ON so `text`
 # (fontdb + rustybuzz) and `raster-images` (embedded PNG/JPEG `<image>` decode)
 # are wired without hand-picking the feature graph — all pure Rust, no C libs.
-# `fontdb` is declared at the SAME 0.22 line usvg pins so our
+# `fontdb` is declared at the SAME 0.23 line usvg pins so our
 # `fontdb::Database` unifies to the exact type `usvg::Options` expects
-# (0.x is semver-incompatible across minors — a 0.23 here would be a *different*
+# (0.x is semver-incompatible across minors — a 0.24 here would be a *different*
 # type and fail to compile). `base64` (already a dep) encodes the data-URLs.
-resvg = "0.44"
-usvg = "0.44"
-tiny-skia = "0.11"
-fontdb = "0.22"
+resvg = "0.47"
+usvg = "0.47"
+tiny-skia = "0.12"
+fontdb = "0.23"
 
 # Minimal PNG/JPEG decode+crop+encode for the guest-image sync-in: iHOTEL saves
 # the landscape Thai-ID card on a tall white canvas (703×996, card at the top),
