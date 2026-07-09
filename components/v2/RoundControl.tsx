@@ -47,7 +47,7 @@ function formatThai(iso: string): string {
 }
 
 export default function RoundControl({ onChanged }: { onChanged?: () => void }) {
-  const { branch, canWrite, roundWritebackEnabled } = useBranch()
+  const { canWrite, roundWritebackEnabled } = useBranch()
   const branchFetch = useBranchFetch()
   const { user } = useAuth()
 

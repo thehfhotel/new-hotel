@@ -5,17 +5,20 @@
  *
  * The Thai-ID card reader (`app/card-reader/page.tsx`) runs as its own page
  * (the read itself happens over the per-PC Tauri middleware). When the
- * receptionist clicks "use this data" we stash the parsed card fields in
- * `sessionStorage` and send them to the rooms screen; the next check-in modal
- * to mount (`CheckInModal` / `QuickCheckInModal`) consumes them to prefill the
- * guest fields, then clears the slot so a stale card can't leak into an
- * unrelated check-in.
+ * receptionist clicks "use this data" we stash the parsed card fields in an
+ * in-memory module slot and send them to the rooms screen; the next check-in
+ * modal to mount (`CheckInModal` / `QuickCheckInModal`) consumes them to
+ * prefill the guest fields, then clears the slot so a stale card can't leak
+ * into an unrelated check-in.
  *
- * sessionStorage (not localStorage) is deliberate: the hand-off is transient
- * and scoped to the tab, mirroring the throwaway nature of a card scan.
+ * In-memory (NOT sessionStorage/localStorage) is deliberate: the payload is
+ * guest PII (national-ID / passport number, DOB, address, document photo) and
+ * must never be persisted to browser storage, which can be written to disk by
+ * session restore and outlives the hand-off. The scanner pages navigate with
+ * a client-side `router.push`, so the module state survives the hop; a full
+ * reload drops any unconsumed prefill, which just means re-scanning the card
+ * — strictly safer than a stale scan resurfacing.
  */
-
-const KEY = 'checkin-prefill'
 
 export interface CheckInPrefill {
   firstName?: string
@@ -65,15 +68,29 @@ export interface CheckInPrefill {
   docType?: 'thai_id_card' | 'passport'
 }
 
+/**
+ * The pending hand-off. Module-level so it survives the client-side
+ * navigation from the scanner page to the check-in screen, and nothing more.
+ * Never touched during SSR (the `window` guards below), so the server-side
+ * module instance can't retain one request's PII into another.
+ */
+let pending: CheckInPrefill | null = null
+
+// One-time hygiene: older builds parked the hand-off in sessionStorage under
+// this key. A long-lived reception tab that picked up this build mid-session
+// could still hold pre-upgrade scan PII there — purge any residue on load.
+if (typeof window !== 'undefined') {
+  try {
+    window.sessionStorage.removeItem('checkin-prefill')
+  } catch {
+    // Private-mode storage access can throw; nothing to clean then.
+  }
+}
+
 /** Stash a pending prefill (overwrites any previous one). */
 export function setCheckInPrefill(data: CheckInPrefill): void {
   if (typeof window === 'undefined') return
-  try {
-    window.sessionStorage.setItem(KEY, JSON.stringify(data))
-  } catch {
-    // sessionStorage can throw in private mode / quota — prefill is a
-    // convenience, never block the flow.
-  }
+  pending = data
 }
 
 /**
@@ -82,13 +99,7 @@ export function setCheckInPrefill(data: CheckInPrefill): void {
  */
 export function consumeCheckInPrefill(): CheckInPrefill | null {
   if (typeof window === 'undefined') return null
-  try {
-    const raw = window.sessionStorage.getItem(KEY)
-    if (!raw) return null
-    window.sessionStorage.removeItem(KEY)
-    const parsed = JSON.parse(raw) as CheckInPrefill
-    return parsed && typeof parsed === 'object' ? parsed : null
-  } catch {
-    return null
-  }
+  const data = pending
+  pending = null
+  return data
 }
