@@ -915,13 +915,15 @@ mod tests {
         }
     }
 
-    /// Fixture user for tests that never exercise PASSWORD login — e.g. card
-    /// login, which authenticates by `user_id` after a resolved tap and never
-    /// checks a password. `password_hash` is derived from the username (a
-    /// non-constant) instead of hashing a hard-coded literal, so it can never
-    /// pass a password verify AND does not feed a hard-coded value into
-    /// `hash_password` the way `fixed_user(.., "literal")` would.
-    fn card_login_user(username: &str) -> User {
+    /// Fixture user for tests that never exercise PASSWORD login — card login
+    /// (authenticates by `user_id` after a resolved tap) and Cloudflare-Access
+    /// email auto-login (authenticates by mapped email). `password_hash` is
+    /// derived from the username (a non-constant) instead of hashing a
+    /// hard-coded literal, so it can never pass a password verify AND does not
+    /// feed a hard-coded value into `hash_password` the way
+    /// `fixed_user(.., "literal")` would (which trips CodeQL's
+    /// rust/hard-coded-cryptographic-value on every new test).
+    fn passwordless_user(username: &str) -> User {
         User {
             user_id: 1,
             username: username.to_string(),
@@ -1133,7 +1135,7 @@ mod tests {
     #[tokio::test]
     async fn login_via_email_mints_session_for_mapped_active_user() {
         let (svc, users, sessions) = build_service();
-        let mut user = fixed_user("winut", "hunter2");
+        let mut user = passwordless_user("winut");
         user.email = Some("Winut.HF@gmail.com".to_string());
         users.insert_direct(user);
 
@@ -1162,7 +1164,7 @@ mod tests {
     async fn login_via_email_rejects_unmapped_email() {
         let (svc, users, sessions) = build_service();
         // A user exists, but with NO email mapping — must not match.
-        users.insert_direct(fixed_user("alice", "hunter2"));
+        users.insert_direct(passwordless_user("alice"));
 
         let err = svc
             .login_via_email(&dummy_pool(), "stranger@example.com", None, None)
@@ -1175,7 +1177,7 @@ mod tests {
     #[tokio::test]
     async fn login_via_email_rejects_deactivated_user() {
         let (svc, users, sessions) = build_service();
-        let mut user = fixed_user("winai", "hunter2");
+        let mut user = passwordless_user("winai");
         user.email = Some("winai.sdy@gmail.com".to_string());
         user.active = false;
         users.insert_direct(user);
@@ -1195,7 +1197,7 @@ mod tests {
     #[tokio::test]
     async fn login_via_card_mints_session_for_active_user() {
         let (svc, users, sessions) = build_service();
-        users.insert_direct(card_login_user("card-B7"));
+        users.insert_direct(passwordless_user("card-B7"));
 
         let (user, session) = svc
             .login_via_card(&dummy_pool(), 1, Some("10.0.0.5"), Some("reader-ua"))
@@ -1230,7 +1232,7 @@ mod tests {
     #[tokio::test]
     async fn login_via_card_rejects_deactivated_user() {
         let (svc, users, sessions) = build_service();
-        let mut user = card_login_user("card-B9");
+        let mut user = passwordless_user("card-B9");
         user.active = false;
         users.insert_direct(user);
 

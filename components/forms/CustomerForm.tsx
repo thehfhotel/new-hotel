@@ -108,7 +108,7 @@ export default function CustomerForm({
         setFormData(initialData)
       } else {
         // Create mode: pull in any pending card-reader / passport-scanner
-        // hand-off (single-use sessionStorage slot shared with the check-in
+        // hand-off (single-use in-memory slot shared with the check-in
         // forms). Empty when nothing was scanned, so the form is otherwise
         // blank. The extended document fields flow through when present.
         const prefill = mode === 'create' ? consumeCheckInPrefill() : null

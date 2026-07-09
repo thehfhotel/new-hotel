@@ -13,8 +13,8 @@
  * TD3 parse + checksum validation via POST /parse-mrz.
  *
  * The passport image is optional and only used for the guest-document photo:
- * it's downscaled client-side (sessionStorage/base64 hand-off has a hard size
- * budget) and echoed by the middleware for the confirmation preview.
+ * it's downscaled client-side (the base64 hand-off and API bodies should stay
+ * small) and echoed by the middleware for the confirmation preview.
  */
 
 import { useState, useCallback, useEffect, useRef } from 'react'
@@ -65,9 +65,9 @@ function mrzSexToThaiSex(sex: string | undefined): string | undefined {
 
 /**
  * Downscale an uploaded/pasted image to a reasonable max dimension and re-encode
- * as JPEG. Keeps the base64 payload well under the sessionStorage budget used by
- * the prefill hand-off and the guest-document blob. Returns both the raw base64
- * (no data: prefix, for the API bodies) and a data URL (for preview).
+ * as JPEG. Keeps the base64 payload small for the in-memory prefill hand-off
+ * and the guest-document blob. Returns both the raw base64 (no data: prefix,
+ * for the API bodies) and a data URL (for preview).
  */
 function downscaleImage(file: File): Promise<{ raw: string; dataUrl: string }> {
   return new Promise((resolve, reject) => {
