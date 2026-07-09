@@ -14,10 +14,14 @@
 //! * `hfid_assertion` — HF-ID card-tap assertion verification (a SECOND
 //!   JWKS + RS256 source, same pattern as `cf_access`) backing the
 //!   central-pairing card login in `GET /api/reader/wait`.
+//! * `hk_access` — Cloudflare Access gate for the maid-facing `/api/hk/*`
+//!   surface (a THIRD consumer of the team JWKS, different Access app AUD;
+//!   employee-login plan Phase 4). IS a tower layer, unlike `cf_access`.
 
 pub mod auth;
 pub mod cf_access;
 pub mod hfid_assertion;
+pub mod hk_access;
 pub mod permissions;
 pub mod rate_limit;
 
