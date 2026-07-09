@@ -23,6 +23,13 @@ pub struct RoomRow {
     pub room_price_weekend: Option<f64>,
     pub room_price_special: Option<f64>,
     pub room_notes: Option<String>,
+    /// Receptionist-arranged board position, mirrored from legacy
+    /// `HT_Rooms.Room_X`/`Room_y` by the sync (migration 036). Populated by
+    /// the runtime `list_with_count` path only — the compile-time `get`
+    /// query leaves them `None` (adding columns there would require a
+    /// `.sqlx/` regen; the spatial grid consumes the LIST payload).
+    pub room_x: Option<i32>,
+    pub room_y: Option<i32>,
     pub created_at: Option<NaiveDateTime>,
     pub updated_at: Option<NaiveDateTime>,
 }
@@ -188,6 +195,8 @@ impl RoomRepository for PgRoomRepository {
             r.room_price_weekend::float8 as room_price_weekend,
             r.room_price_special::float8 as room_price_special,
             r.room_notes,
+            r.room_x,
+            r.room_y,
             r.created_at,
             r.updated_at
         FROM ht_rooms_new r
@@ -221,6 +230,8 @@ impl RoomRepository for PgRoomRepository {
                 room_price_weekend: row.try_get::<f64, _>("room_price_weekend").ok(),
                 room_price_special: row.try_get::<f64, _>("room_price_special").ok(),
                 room_notes: row.try_get::<String, _>("room_notes").ok(),
+                room_x: row.try_get::<i32, _>("room_x").ok(),
+                room_y: row.try_get::<i32, _>("room_y").ok(),
                 created_at: row.try_get::<NaiveDateTime, _>("created_at").ok(),
                 updated_at: row.try_get::<NaiveDateTime, _>("updated_at").ok(),
             })
@@ -263,6 +274,10 @@ impl RoomRepository for PgRoomRepository {
             room_price_weekend: r.room_price_weekend,
             room_price_special: r.room_price_special,
             room_notes: r.room_notes,
+            // Board coordinates ride the runtime LIST path only (see the
+            // RoomRow field comment) — not selected by this query! macro.
+            room_x: None,
+            room_y: None,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }))

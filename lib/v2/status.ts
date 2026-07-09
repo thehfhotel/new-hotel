@@ -1,7 +1,21 @@
 /** Maps backend status strings to the v2 visual language (label + tint class +
- *  dot class). Tints/dots are defined in app/v2/v2.css (.s-* and .d-*). */
+ *  dot class). Tints/dots are defined in app/v2/v2.css (.s-* and .d-*).
+ *
+ *  ROOM state uses the iHOTEL-anchored tones (ADR 0003 / #227): the hue that
+ *  means each room state is legacy vocabulary, extracted from the decompiled
+ *  FormRoomMain.cs palette and rendered in v2-quality shades — see the
+ *  "iHOTEL room-state palette" block in app/v2/v2.css. Booking / check-in
+ *  statuses (not room state) keep the original v2-native tones. */
 
-export type V2Tone = 'ok' | 'occ' | 'arr' | 'dep' | 'fix' | 'mut'
+export type V2Tone =
+  | 'ok' | 'occ' | 'arr' | 'dep' | 'fix' | 'mut'
+  // iHOTEL room-state tones (hue source: FormRoomMain.cs — see v2.css)
+  | 'vac'   // ว่าง — LightGreen #90EE90
+  | 'stay'  // เข้าพัก — MistyRose→OrangeRed #FF4500
+  | 'res'   // จอง — Yellow #FFFF00
+  | 'out'   // ยังไม่ได้ Check-Out — DeepSkyBlue #00BFFF
+  | 'dirt'  // รอ ทำความสะอาด — Moccasin #FFE4B5
+  | 'mtn'   // ซ่อม — DarkGray #A9A9A9
 
 export interface V2StatusView {
   label: string
@@ -16,19 +30,22 @@ function view(label: string, tone: V2Tone): V2StatusView {
   return { label, tone, cls: `s-${tone}`, dot: `d-${tone}` }
 }
 
-/** Room status from /api/rooms (`status` + isClean/isMaintenance). */
+/** Room status from /api/rooms (`status` + isClean/isMaintenance).
+ *
+ *  Tones are the iHOTEL room-state hues (#227) so the color language matches
+ *  what reception has read off FormRoomMain for years; Thai labels unchanged. */
 export function roomStatusView(
   status: string,
   opts?: { isClean?: boolean; isMaintenance?: boolean },
 ): V2StatusView {
-  if (opts?.isMaintenance || status === 'maintenance') return view('ซ่อมบำรุง', 'fix')
+  if (opts?.isMaintenance || status === 'maintenance') return view('ซ่อมบำรุง', 'mtn')
   switch (status) {
     case 'occupied':
-      return view('มีผู้เข้าพัก', 'occ')
+      return view('มีผู้เข้าพัก', 'stay')
     case 'booked':
-      return view('จองแล้ว', 'arr')
+      return view('จองแล้ว', 'res')
     case 'checkout_pending':
-      return view('รอเช็คเอาท์', 'dep')
+      return view('รอเช็คเอาท์', 'out')
     case 'available':
       // A vacant room that still needs housekeeping shows as "รอทำความสะอาด"
       // (matches iHOTEL marking the room dirty right after checkout). This was
@@ -37,7 +54,7 @@ export function roomStatusView(
       // true=clean), so every free room looked dirty. That inversion is fixed +
       // backfilled (2026-06-30), so isClean is now accurate and safe to surface.
       // isClean === false → needs cleaning; true/undefined → clean (ว่าง).
-      return opts?.isClean === false ? view('รอทำความสะอาด', 'dep') : view('ว่าง', 'ok')
+      return opts?.isClean === false ? view('รอทำความสะอาด', 'dirt') : view('ว่าง', 'vac')
     default:
       return view(status || 'ไม่ทราบ', 'mut')
   }

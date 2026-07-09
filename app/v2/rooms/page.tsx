@@ -6,8 +6,11 @@ import { useBranch } from '@/contexts/BranchContext'
 import { useBranchFetch } from '@/lib/use-branch-fetch'
 import { useLiveRefresh } from '@/lib/v2/use-live-refresh'
 import { roomStatusView } from '@/lib/v2/status'
+import { type SpatialRoom } from '@/lib/v2/spatial-grid'
 import { V2Spinner, LiveDot, V2PageHeader, VilleNotice } from '@/components/v2/primitives'
 import RoomActionSheet, { type RoomItem, type RoomAction } from '@/components/v2/RoomActionSheet'
+import SpatialRoomGrid from '@/components/v2/SpatialRoomGrid'
+import GuestMoveConfirmModal from '@/components/v2/GuestMoveConfirmModal'
 import CheckInModal from '@/components/CheckInModal'
 import CheckOutModal from '@/components/CheckOutModal'
 import ExtendStayModal from '@/components/ExtendStayModal'
@@ -41,19 +44,48 @@ const FILTERS: FilterOption[] = [
   { value: 'occupied', label: 'เข้าพัก', match: (r) => r.status === 'occupied' },
   { value: 'booked', label: 'จองแล้ว', match: (r) => r.status === 'booked' },
   { value: 'checkout_pending', label: 'รอเช็คเอาท์', match: (r) => r.status === 'checkout_pending' },
+  { value: 'dirty', label: 'รอทำความสะอาด', match: (r) => r.status === 'available' && r.isClean === false },
   { value: 'maintenance', label: 'ซ่อมบำรุง', match: (r) => r.status === 'maintenance' || r.isMaintenance },
 ]
+
+/** Spatial (iHOTEL board positions) is the DEFAULT view — ADR 0003 U1. The
+ *  floor-grouped list stays as a toggle, persisted per device. */
+type RoomsViewMode = 'spatial' | 'floors'
+const VIEW_STORAGE_KEY = 'v2.roomsView'
 
 export default function V2Rooms() {
   const { branch, canWrite } = useBranch()
   const branchFetch = useBranchFetch()
-  const [rooms, setRooms] = useState<RoomItem[]>([])
+  const [rooms, setRooms] = useState<SpatialRoom[]>([])
   const [loading, setLoading] = useState(true)
   const [filter, setFilter] = useState('all')
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState<RoomItem | null>(null)
   const [modal, setModal] = useState<ModalKind | null>(null)
   const [busy, setBusy] = useState(false)
+  // Spatial is the default (ADR 0003 U1); read the persisted choice after
+  // mount to avoid an SSR/client hydration mismatch.
+  const [viewMode, setViewMode] = useState<RoomsViewMode>('spatial')
+  // Guest-move drag (#225): drop on an eligible target opens the confirm.
+  const [moveReq, setMoveReq] = useState<{ from: SpatialRoom; to: SpatialRoom } | null>(null)
+
+  useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem(VIEW_STORAGE_KEY)
+      if (stored === 'floors' || stored === 'spatial') setViewMode(stored)
+    } catch {
+      /* private mode — keep default */
+    }
+  }, [])
+
+  const changeViewMode = (mode: RoomsViewMode) => {
+    setViewMode(mode)
+    try {
+      window.localStorage.setItem(VIEW_STORAGE_KEY, mode)
+    } catch {
+      /* private mode — non-persistent */
+    }
+  }
 
   // Latest-wins guard: branch can flip mid-flight (hfhotel default → stored hfville).
   const reqRef = useRef(0)
@@ -65,7 +97,7 @@ export default function V2Rooms() {
       if (token !== reqRef.current) return // superseded by a newer branch fetch
       if (res.ok) {
         const data = await res.json()
-        setRooms((data.data || data || []) as RoomItem[])
+        setRooms((data.data || data || []) as SpatialRoom[])
       }
     } catch {
       /* empty state */
@@ -178,19 +210,41 @@ export default function V2Rooms() {
 
       <VilleNotice branch={branch} />
 
-      {/* Search */}
-      <div
-        className="flex items-center gap-2 px-3 h-11 rounded-[12px] max-w-md"
-        style={{ background: 'var(--v2-surface)', border: '1px solid var(--v2-line)' }}
-      >
-        <Search size={17} style={{ color: 'var(--v2-ink-3)' }} />
-        <input
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="ค้นหาหมายเลขห้อง…"
-          inputMode="numeric"
-          className="flex-1 bg-transparent outline-none text-[14px]"
-        />
+      {/* Search + view toggle */}
+      <div className="flex flex-wrap items-center gap-3">
+        <div
+          className="flex items-center gap-2 px-3 h-11 rounded-[12px] max-w-md flex-1 min-w-[220px]"
+          style={{ background: 'var(--v2-surface)', border: '1px solid var(--v2-line)' }}
+        >
+          <Search size={17} style={{ color: 'var(--v2-ink-3)' }} />
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="ค้นหาหมายเลขห้อง…"
+            inputMode="numeric"
+            className="flex-1 bg-transparent outline-none text-[14px]"
+          />
+        </div>
+        {/* Spatial board (iHOTEL-arranged positions) is the default; the
+            floor-grouped list is the secondary toggle — ADR 0003 U1. */}
+        <div className="flex gap-2" role="group" aria-label="รูปแบบการแสดงผล">
+          <button
+            type="button"
+            className="v2-chip"
+            data-active={viewMode === 'spatial'}
+            onClick={() => changeViewMode('spatial')}
+          >
+            ผังห้อง
+          </button>
+          <button
+            type="button"
+            className="v2-chip"
+            data-active={viewMode === 'floors'}
+            onClick={() => changeViewMode('floors')}
+          >
+            แยกตามชั้น
+          </button>
+        </div>
       </div>
 
       {/* Filter chips */}
@@ -203,8 +257,15 @@ export default function V2Rooms() {
         ))}
       </div>
 
-      {/* Floors */}
-      {groups.length === 0 ? (
+      {/* Board — spatial (default) or floor-grouped */}
+      {viewMode === 'spatial' ? (
+        <SpatialRoomGrid
+          rooms={filtered}
+          onSelect={(room) => setSelected(room)}
+          onMoveRequest={(from, to) => setMoveReq({ from, to })}
+          canDrag={canWrite}
+        />
+      ) : groups.length === 0 ? (
         <div className="v2-card px-5 py-12 text-center text-[14px]" style={{ color: 'var(--v2-ink-3)' }}>
           ไม่พบห้องที่ตรงกับเงื่อนไข
         </div>
@@ -286,6 +347,18 @@ export default function V2Rooms() {
       {/* Walk-up sale — not room-bound, so it opens without a `selected` room. */}
       {modal === 'walkup' && (
         <WalkupPosModal onClose={() => setModal(null)} onSuccess={() => fetchRooms()} />
+      )}
+
+      {/* Guest-move drag confirm (#225) — additive alternate to the
+          RoomActionSheet → ChangeRoomModal path; same backend contract.
+          onSuccess refetches the grid; the modal stays open for slip print. */}
+      {moveReq && (
+        <GuestMoveConfirmModal
+          fromRoom={moveReq.from}
+          toRoom={moveReq.to}
+          onClose={() => setMoveReq(null)}
+          onSuccess={() => fetchRooms()}
+        />
       )}
     </div>
   )

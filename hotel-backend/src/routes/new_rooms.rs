@@ -43,6 +43,11 @@ pub struct NewRoom {
     pub price_weekend: Option<f64>,
     pub price_special: Option<f64>,
     pub notes: Option<String>,
+    /// Receptionist-arranged board position (iHOTEL `HT_Rooms.Room_X`/`Room_y`,
+    /// synced into `ht_rooms_new.room_x`/`room_y`). Serialized as `roomX`/`roomY`
+    /// for the v2 spatial room grid (ADR 0003 U1). `None`/0 = unplaced.
+    pub room_x: Option<i32>,
+    pub room_y: Option<i32>,
     pub created_at: Option<NaiveDateTime>,
     pub updated_at: Option<NaiveDateTime>,
 }
@@ -64,6 +69,8 @@ impl NewRoom {
             price_weekend: row.room_price_weekend,
             price_special: row.room_price_special,
             notes: row.room_notes,
+            room_x: row.room_x,
+            room_y: row.room_y,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
