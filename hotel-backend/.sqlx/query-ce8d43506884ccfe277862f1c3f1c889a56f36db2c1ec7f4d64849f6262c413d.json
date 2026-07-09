@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT cust_id\n            FROM ht_customers\n            WHERE cust_active = true\n              AND btrim(COALESCE(cust_phone, '')) = btrim($1)\n              AND btrim($1) <> ''\n              AND lower(btrim(cust_firstname)) = lower(btrim($2))\n              AND lower(btrim(COALESCE(cust_lastname, ''))) = lower(btrim(COALESCE($3, '')))\n            ORDER BY cust_id DESC\n            LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cust_id",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "ht_customers",
+            "name": "cust_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ce8d43506884ccfe277862f1c3f1c889a56f36db2c1ec7f4d64849f6262c413d"
+}

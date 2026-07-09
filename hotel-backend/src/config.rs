@@ -519,6 +519,54 @@ fn optional_env(var_name: &str) -> Option<String> {
     }
 }
 
+/// Loyalty-app integration config (booking channel + checkout stay hook).
+///
+/// Two independent halves, both fail-closed:
+///
+/// * **Inbound channel** (`/api/channel/*` — availability / hold-create /
+///   payment-verified / release): ships DARK behind `LOYALTY_CHANNEL_ENABLED`
+///   (default off, [`flag_enabled`] semantics) AND requires the shared bearer
+///   `LOYALTY_CHANNEL_TOKEN`. Channel holds ride the normal booking-create
+///   path — a roomed `pending` booking DOES write back to iHOTEL as `จอง` —
+///   so the flag flip is a coordinated go-live step (coexistence invariant
+///   #6), not "just config".
+/// * **Outbound stay hook** (`POST {LOYALTY_APP_URL}/api/loyalty/stays` on
+///   checkout of a membership-linked guest): active only when BOTH
+///   `LOYALTY_APP_URL` and `LOYALTY_SERVICE_TOKEN` are set (unset/empty ⇒
+///   hook silently off). Best-effort + retried; NEVER blocks a checkout.
+///
+/// Both tokens also flow through the `/run/secrets` hydrator (`secrets.rs` —
+/// files `loyalty_channel_token` / `loyalty_service_token`); env vars win.
+#[derive(Debug, Clone, Default)]
+pub struct LoyaltyConfig {
+    /// `LOYALTY_CHANNEL_ENABLED` — master switch for the inbound channel API.
+    pub channel_enabled: bool,
+    /// `LOYALTY_CHANNEL_TOKEN` — shared bearer the loyalty app presents on
+    /// every `/api/channel/*` request. `None` (unset/empty) ⇒ fail closed
+    /// (every channel request rejected) even if the flag is on.
+    pub channel_token: Option<String>,
+    /// `LOYALTY_APP_URL` — loyalty app base URL for the checkout stay hook.
+    pub app_url: Option<String>,
+    /// `LOYALTY_SERVICE_TOKEN` — bearer for the outbound stay hook.
+    pub service_token: Option<String>,
+}
+
+impl LoyaltyConfig {
+    pub fn from_env() -> Self {
+        Self {
+            channel_enabled: flag_enabled("LOYALTY_CHANNEL_ENABLED"),
+            channel_token: optional_env("LOYALTY_CHANNEL_TOKEN"),
+            app_url: optional_env("LOYALTY_APP_URL"),
+            service_token: optional_env("LOYALTY_SERVICE_TOKEN"),
+        }
+    }
+
+    /// The outbound checkout→loyalty stay hook is active (both halves set).
+    pub fn stay_hook_configured(&self) -> bool {
+        self.app_url.is_some() && self.service_token.is_some()
+    }
+}
+
 /// Default central HF-ID base URL. Overridden with `HFID_BASE_URL` in any real
 /// deploy. This is the central HF-ID (fingerprint-time-logger) service's
 /// published port on the evergreen server LAN — verified reachable from inside

@@ -173,6 +173,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(false);
     tracing::info!("HF Ville writes: enabled={}", hfville_writes);
 
+    // Loyalty-app integration (docs/loyalty-channel.md). Inbound channel
+    // ships DARK (flag + token both required); outbound stay hook is off
+    // unless LOYALTY_APP_URL + LOYALTY_SERVICE_TOKEN are set.
+    let loyalty_config = config::LoyaltyConfig::from_env();
+    tracing::info!(
+        "Loyalty channel: enabled={} (token set: {}); stay hook configured: {}",
+        loyalty_config.channel_enabled,
+        loyalty_config.channel_token.is_some(),
+        loyalty_config.stay_hook_configured()
+    );
+
     // Create AppState — canonical PG only. As of the 2026-06-11 coexistence
     // audit AppState carries no MSSQL handle: routes/repositories never touch
     // the legacy DB (docs/architecture.md "critical rule"); MSSQL is reserved
@@ -400,6 +411,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => Router::new(),
     };
 
+    // Loyalty-app booking channel (`/api/channel/*` — docs/loyalty-channel.md).
+    // Machine-to-machine surface for the loyalty app: availability quote,
+    // tentative hold create, payment-verified confirm, release. Mounted
+    // OUTSIDE `require_auth` (the caller is a service, not a session user)
+    // behind its OWN shared-bearer gate, which fails closed: the whole
+    // surface answers 503 until `LOYALTY_CHANNEL_ENABLED=true` AND
+    // `LOYALTY_CHANNEL_TOKEN` are provisioned (ship-dark — a channel hold
+    // writes back to iHOTEL as `จอง` via the normal booking-create recipe, so
+    // the flag flip is a coordinated go-live step, invariant #6). HF Ville
+    // channel mutations are additionally rejected until
+    // `HFVILLE_WRITES_ENABLED` (enforced in `routes::channel` — this router
+    // sits outside the main router's `ville_write_guard`, which keys on the
+    // `?branch=` query param the channel API doesn't use).
+    let channel_routes = match &final_app_state {
+        Some(state) => {
+            let channel_token_state = app_middleware::ChannelTokenState::new(&loyalty_config);
+            Router::new()
+                .route(
+                    "/api/channel/availability",
+                    get(routes::channel::availability),
+                )
+                .route(
+                    "/api/channel/bookings",
+                    post(routes::channel::create_booking),
+                )
+                .route(
+                    "/api/channel/bookings/{pms_booking_id}/payment-verified",
+                    post(routes::channel::payment_verified),
+                )
+                .route(
+                    "/api/channel/bookings/{pms_booking_id}/release",
+                    post(routes::channel::release),
+                )
+                .layer(axum_middleware::from_fn_with_state(
+                    channel_token_state,
+                    app_middleware::require_channel_token,
+                ))
+                .with_state(state.clone())
+        }
+        None => Router::new(),
+    };
+
     // Phase 4 PR4: mount the protected `/api/admin/*` endpoints. The
     // subrouter is wrapped with the same `require_auth` middleware
     // PR2 added to the canonical routes so an authenticated `User` extension
@@ -426,6 +479,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(auth_routes)
         .merge(reader_routes)
         .merge(hk_routes)
+        .merge(channel_routes)
         .merge(admin_routes)
         .merge(health_routes)
         .merge(downloads_routes)
@@ -639,6 +693,14 @@ fn build_new_routes(app_state: AppState) -> Router {
         .route(
             "/api/customers/{id}/stats",
             get(routes::customers::get_customer_stats),
+        )
+        // Loyalty membership link (migration 078) — desk set/clear. A
+        // dedicated PUT (not a field on the general customer update) so a
+        // stale edit form can never clobber a freshly-scanned link, and so
+        // clearing is expressible. PG-canonical only, no legacy writeback.
+        .route(
+            "/api/customers/{id}/membership",
+            put(routes::new_customers::set_membership),
         )
         // Branch-aware stats (HF Hotel + HF Ville) — the sole stats path.
         .route("/api/stats", get(routes::stats::get_stats))

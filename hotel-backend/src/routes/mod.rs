@@ -75,6 +75,7 @@ pub mod admin_users;
 pub mod auth;
 pub mod bookings;
 pub mod calendar;
+pub mod channel;
 pub mod checkins;
 pub mod customers;
 pub mod downloads;

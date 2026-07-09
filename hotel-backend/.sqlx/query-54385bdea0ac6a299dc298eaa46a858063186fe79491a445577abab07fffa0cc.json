@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE ht_bookings\n           SET book_status = 'confirmed',\n               book_deposit_amount = $2::float8,\n               book_deposit_date = NOW(),\n               updated_at = NOW()\n         WHERE book_id = $1\n           AND book_status = 'pending'\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "54385bdea0ac6a299dc298eaa46a858063186fe79491a445577abab07fffa0cc"
+}

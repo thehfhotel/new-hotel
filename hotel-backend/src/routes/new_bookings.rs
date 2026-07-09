@@ -430,6 +430,9 @@ pub async fn create_booking(
         writeback_context,
         book_channel: body.book_channel.clone(),
         book_ext_ref: body.book_ext_ref.clone(),
+        // Manual / OTA-desk creates are never payment-holds (migration 078);
+        // only the loyalty channel (`routes::channel`) sets a deadline.
+        hold_expires_at: None,
         // TODO: wire user_id from auth middleware
         source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
     };
@@ -766,7 +769,12 @@ pub async fn validate_booking(
 // ---------- helpers (presentation glue) ----------
 
 /// Generate `YYYYMMDD-NNNN` booking number from the latest sequence today.
-async fn generate_book_no(state: &AppState, pool: &crate::db::PgPool) -> ApiResult<String> {
+/// `pub(crate)` — the loyalty channel (`routes::channel`) mints its holds
+/// through the same allocator so both surfaces share one daily sequence.
+pub(crate) async fn generate_book_no(
+    state: &AppState,
+    pool: &crate::db::PgPool,
+) -> ApiResult<String> {
     let last_book_no = state.bookings.latest_book_no_today(pool).await?;
     let next_seq = last_book_no
         .as_deref()
