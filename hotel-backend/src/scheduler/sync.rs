@@ -56,6 +56,7 @@ use crate::db::{DbPool, PgPool};
 // mappers / row-abstraction / op-enum the watcher uses rather than writing
 // canonical fields by hand.
 use crate::notifications::slack::{SlackClient, SlackMessage};
+use crate::outbox::event::DomainEvent;
 use crate::sync::change_op::ChangeOp;
 use crate::sync::mapper::MssqlChangeMapper;
 use crate::sync::mappers::{CustomerMapper, RoomMasterMapper};
@@ -2380,9 +2381,23 @@ async fn fetch_legacy_room_base_row(
 /// The sweep is a silent backstop; a genuine subsequent CT edit re-emits the
 /// normal `CustomerModified` / room event.
 ///
-/// Returns `Ok(true)` when a re-projection was attempted and committed,
-/// `Ok(false)` when the legacy row no longer exists (or the table is outside
-/// the supported set) so there is nothing to project from.
+/// Returns a [`ForceConvergeOutcome`], NOT a bool — and that distinction is
+/// the whole point (2026-07-28). The mapper contract makes `Ok(None)`
+/// ambiguous: it is EITHER an idempotency-gate skip (the mapper decided
+/// nothing changed) OR a real write that produces no domain event. The
+/// previous bool collapsed both onto `Ok(true)` = "attempted and committed",
+/// so a gate skip — the very blind spot that let the divergence become
+/// invisible in the first place — was reported to the sweep as a successful
+/// repair. The sweep then logged "repaired" and, next tick, "still not
+/// converged", forever: one blind spot disabling detection AND self-heal at
+/// once while reporting success. [`ForceConvergeOutcome::MapperNoop`] keeps
+/// the ambiguity honest at this boundary; the sweep resolves it with
+/// evidence (did the canonical hash actually move?) via
+/// [`classify_force_converge`].
+///
+/// `SourceRowAbsent` / `UnsupportedTable` are the old `Ok(false)` cases (the
+/// legacy row no longer exists, or the table is outside the supported set)
+/// so there is nothing to project from.
 ///
 /// `op` is the `ChangeOp` handed to the mapper. The value-drift caller passes
 /// `ChangeOp::Update` (the canonical row exists, we're correcting its
@@ -2405,32 +2420,32 @@ async fn force_converge_reconcile_row(
     table_name: &str,
     legacy_pk: &str,
     op: ChangeOp,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ForceConvergeOutcome, Box<dyn std::error::Error + Send + Sync>> {
     match table_name {
         "customers" => {
             let Some(row) = fetch_legacy_customer_base_row(legacy_pool, legacy_pk).await? else {
-                return Ok(false);
+                return Ok(ForceConvergeOutcome::SourceRowAbsent);
             };
             let mut tx = pg_pool.begin().await?;
             // apply runs the full UPSERT + the mapper's idempotency check, so
             // it inserts when canonical is absent and updates in place when
             // it is not.
-            let _evt = CustomerMapper
+            let evt = CustomerMapper
                 .apply(&mut tx, op, Some(&row as &dyn MappableRow))
                 .await?;
             tx.commit().await?;
-            Ok(true)
+            Ok(ForceConvergeOutcome::from_mapper_event(evt.as_ref()))
         }
         "rooms" => {
             let Some(row) = fetch_legacy_room_base_row(legacy_pool, legacy_pk).await? else {
-                return Ok(false);
+                return Ok(ForceConvergeOutcome::SourceRowAbsent);
             };
             let mut tx = pg_pool.begin().await?;
-            let _evt = RoomMasterMapper
+            let evt = RoomMasterMapper
                 .apply(&mut tx, op, Some(&row as &dyn MappableRow))
                 .await?;
             tx.commit().await?;
-            Ok(true)
+            Ok(ForceConvergeOutcome::from_mapper_event(evt.as_ref()))
         }
         "bookings" => {
             // `ht_reconcile_log.legacy_pk` for bookings is the composite
@@ -2444,10 +2459,10 @@ async fn force_converge_reconcile_row(
             let aggregate =
                 crate::sync::parent_loader::load_booking_aggregate(legacy_pool, book_no).await?;
             if !aggregate.is_present() {
-                return Ok(false);
+                return Ok(ForceConvergeOutcome::SourceRowAbsent);
             }
             let mut tx = pg_pool.begin().await?;
-            let _evt = crate::sync::mappers::apply_booking_aggregate(
+            let evt = crate::sync::mappers::apply_booking_aggregate(
                 &mut tx,
                 Some(legacy_pool),
                 &aggregate,
@@ -2455,12 +2470,91 @@ async fn force_converge_reconcile_row(
             )
             .await?;
             tx.commit().await?;
-            Ok(true)
+            Ok(ForceConvergeOutcome::from_mapper_event(evt.as_ref()))
         }
         // checkins are multi-row aggregates whose self-heal is still out of
         // scope — leave them to the normal paths / operator review.
-        _ => Ok(false),
+        _ => Ok(ForceConvergeOutcome::UnsupportedTable),
     }
+}
+
+/// What one [`force_converge_reconcile_row`] attempt actually did.
+///
+/// The two "the mapper ran" variants are deliberately NOT collapsed:
+///
+/// * `Wrote` ⇔ the mapper returned `Ok(Some(event))` — canonical state
+///   definitely changed (the event itself is still dropped; see the
+///   `force_converge_reconcile_row` doc).
+/// * `MapperNoop` ⇔ `Ok(None)`, which
+///   [`crate::sync::mapper::MssqlChangeMapper::apply`] defines as "nothing to
+///   publish AND nothing left to do". That covers BOTH an idempotency-gate
+///   skip (`customer::apply_upsert` returns before the UPSERT when every
+///   compared column already matches) AND legitimate writes that produce no
+///   event (`room::apply_room_upsert` always UPSERTs but only emits on a
+///   `room_clean` flip; cancel / soft-delete paths). So `MapperNoop` on its
+///   own is NOT evidence of a gate skip — see [`classify_force_converge`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForceConvergeOutcome {
+    /// Mapper returned `Ok(Some(event))` — canonical was written.
+    Wrote,
+    /// Mapper returned `Ok(None)`. Ambiguous by the mapper contract.
+    MapperNoop,
+    /// The legacy row (or the booking aggregate header) no longer exists,
+    /// so there is nothing to re-project from.
+    SourceRowAbsent,
+    /// `table_name` is outside the set this self-heal supports.
+    UnsupportedTable,
+}
+
+impl ForceConvergeOutcome {
+    /// Classify what a mapper's `apply` returned. Kept as a constructor so
+    /// every arm of `force_converge_reconcile_row` maps `Ok(Some(_))` /
+    /// `Ok(None)` the same way.
+    fn from_mapper_event(evt: Option<&DomainEvent>) -> Self {
+        match evt {
+            Some(_) => Self::Wrote,
+            None => Self::MapperNoop,
+        }
+    }
+
+    /// True when the mapper actually ran to completion and the transaction
+    /// committed (whether or not it wrote). Both shapes get the convergence
+    /// re-test; only the absent/unsupported shapes skip it — matching the
+    /// pre-2026-07-28 `Ok(true)` / `Ok(false)` split exactly.
+    fn mapper_ran(self) -> bool {
+        matches!(self, Self::Wrote | Self::MapperNoop)
+    }
+}
+
+/// Pure tripwire decision for both self-heal arms: was this "successful
+/// repair" actually a MAPPER GATE SKIP that wrote nothing and fixed nothing?
+///
+/// Returns `true` ⇔ ALL THREE hold:
+/// 1. `outcome == MapperNoop` — the mapper returned `Ok(None)`;
+/// 2. `!pg_hash_moved` — the reprojected canonical hash is IDENTICAL to the
+///    one measured before the apply, i.e. nothing moved;
+/// 3. `!converged` — the row is still unconverged.
+///
+/// Condition 2 is what makes this correct rather than a naive
+/// "`Ok(None)` ⇒ gate-skipped" test. Legitimate event-less writes (rooms'
+/// non-clean-flip UPSERT, cancel paths) also return `Ok(None)`, but they
+/// move the canonical hash, so they never trip this. What remains is the
+/// pathological shape: the mapper decided "already identical" while the
+/// reconcile hash still says "different" — a **gate ⊂ hash violation**,
+/// where the mapper's idempotency comparison covers strictly fewer fields
+/// than the reconcile projection hashes. Such a row can never self-heal and
+/// can never be detected by the CT watcher either; the sweep would otherwise
+/// log a successful repair every tick forever.
+///
+/// (A `Wrote` that leaves the row unconverged is a DIFFERENT class — the
+/// mapper wrote but the two projections still disagree — and is left to the
+/// existing "still diverge, leaving row open for operator review" warn.)
+fn classify_force_converge(
+    outcome: ForceConvergeOutcome,
+    pg_hash_moved: bool,
+    converged: bool,
+) -> bool {
+    matches!(outcome, ForceConvergeOutcome::MapperNoop) && !pg_hash_moved && !converged
 }
 
 /// Tables the #204 value-drift force-converge arm will repair. Single-PK
@@ -2744,7 +2838,7 @@ async fn auto_resolve_reconcile_log(
                 )
                 .await
                 {
-                    Ok(true) => {
+                    Ok(outcome) if outcome.mapper_ran() => {
                         // The mapper re-projected the current legacy row into
                         // canonical. The legacy hash is unchanged (we projected
                         // FROM it), so only the canonical hash can have moved —
@@ -2765,12 +2859,20 @@ async fn auto_resolve_reconcile_log(
                                     continue;
                                 }
                             };
-                        if should_auto_resolve(
+                        // Did the apply actually move canonical? This is the
+                        // evidence that separates a mapper gate skip from a
+                        // legitimate event-less write — see
+                        // [`classify_force_converge`].
+                        let pg_hash_moved =
+                            reprojected_pg_hash.as_deref() != current_pg_hash.as_deref();
+                        let converged = should_auto_resolve(
                             &table_name,
                             current_legacy_hash.as_deref(),
                             reprojected_pg_hash.as_deref(),
                             recorded_mssql_hash.as_deref(),
-                        ) {
+                        );
+                        let gate_skip = classify_force_converge(outcome, pg_hash_moved, converged);
+                        if converged {
                             tracing::info!(
                                 site = %site_id,
                                 id,
@@ -2780,12 +2882,40 @@ async fn auto_resolve_reconcile_log(
                                  row into canonical; hashes now converge — marking resolved"
                             );
                             // Fall through (no `continue`) to the resolved UPDATE.
+                        } else if gate_skip {
+                            // Live tripwire for a gate ⊂ hash violation: the
+                            // mapper's idempotency check said "identical" while
+                            // the reconcile projection still says "different",
+                            // so this row can NEVER self-heal and the watcher
+                            // will never see a CT event for it either. Emitted
+                            // INSTEAD of the generic warn below (one line per
+                            // row per tick — no alert storm), with a stable
+                            // `event_name` for `/diagnose-alert` to grep.
+                            tracing::warn!(
+                                event_name = "force_converge_gate_skip",
+                                arm = "value_drift",
+                                site = %site_id,
+                                id,
+                                table_name = %table_name,
+                                legacy_pk = %legacy_pk,
+                                age_secs,
+                                current_legacy_hash = ?current_legacy_hash,
+                                current_pg_hash = ?current_pg_hash,
+                                "[Sync] Force-converge (#204): mapper skipped the write \
+                                 (Ok(None)) and canonical did not move, yet the row is \
+                                 still unconverged — the mapper's idempotency gate covers \
+                                 fewer fields than the reconcile hash; self-heal cannot \
+                                 repair this row"
+                            );
+                            continue;
                         } else {
                             tracing::warn!(
                                 site = %site_id,
                                 id,
                                 table_name = %table_name,
                                 legacy_pk = %legacy_pk,
+                                mapper_outcome = ?outcome,
+                                pg_hash_moved,
                                 current_legacy_hash = ?current_legacy_hash,
                                 reprojected_pg_hash = ?reprojected_pg_hash,
                                 "[Sync] Force-converge (#204): canonical re-projected but \
@@ -2794,7 +2924,7 @@ async fn auto_resolve_reconcile_log(
                             continue;
                         }
                     }
-                    Ok(false) => {
+                    Ok(_) => {
                         // Legacy row no longer exists (or unsupported table) —
                         // nothing to project from.
                         tracing::debug!(
@@ -2854,7 +2984,7 @@ async fn auto_resolve_reconcile_log(
                 )
                 .await
                 {
-                    Ok(true) => {
+                    Ok(outcome) if outcome.mapper_ran() => {
                         // Only the canonical side can have moved (we projected
                         // FROM the legacy row), so re-fetch it and re-test.
                         let reprojected_pg_hash =
@@ -2873,12 +3003,20 @@ async fn auto_resolve_reconcile_log(
                                     continue;
                                 }
                             };
-                        if should_auto_resolve(
+                        // `current_pg_hash` is `None` on this arm by
+                        // construction (that is what "missing_pg" means), so
+                        // "moved" here reads as "canonical now exists / has a
+                        // hash at all".
+                        let pg_hash_moved =
+                            reprojected_pg_hash.as_deref() != current_pg_hash.as_deref();
+                        let converged = should_auto_resolve(
                             &table_name,
                             current_legacy_hash.as_deref(),
                             reprojected_pg_hash.as_deref(),
                             recorded_mssql_hash.as_deref(),
-                        ) {
+                        );
+                        let gate_skip = classify_force_converge(outcome, pg_hash_moved, converged);
+                        if converged {
                             tracing::info!(
                                 site = %site_id,
                                 id,
@@ -2890,12 +3028,34 @@ async fn auto_resolve_reconcile_log(
                                  converge — marking resolved"
                             );
                             // Fall through (no `continue`) to the resolved UPDATE.
+                        } else if gate_skip {
+                            // Same tripwire as the value-drift arm, and a much
+                            // sharper signal here: the canonical row was ABSENT,
+                            // so a mapper that wrote nothing and moved nothing
+                            // means the re-ingest silently did not happen.
+                            tracing::warn!(
+                                event_name = "force_converge_gate_skip",
+                                arm = "missing_pg",
+                                site = %site_id,
+                                id,
+                                table_name = %table_name,
+                                legacy_pk = %legacy_pk,
+                                age_secs,
+                                current_legacy_hash = ?current_legacy_hash,
+                                current_pg_hash = ?current_pg_hash,
+                                "[Sync] Re-ingest (missing_pg): mapper returned Ok(None) and \
+                                 canonical did not move, yet the row is still unconverged — \
+                                 the re-ingest wrote nothing; self-heal cannot repair this row"
+                            );
+                            continue;
                         } else {
                             tracing::warn!(
                                 site = %site_id,
                                 id,
                                 table_name = %table_name,
                                 legacy_pk = %legacy_pk,
+                                mapper_outcome = ?outcome,
+                                pg_hash_moved,
                                 current_legacy_hash = ?current_legacy_hash,
                                 reprojected_pg_hash = ?reprojected_pg_hash,
                                 "[Sync] Re-ingest (missing_pg): canonical re-ingested but \
@@ -2905,7 +3065,7 @@ async fn auto_resolve_reconcile_log(
                             continue;
                         }
                     }
-                    Ok(false) => {
+                    Ok(_) => {
                         // The legacy row vanished between the hash probe and
                         // this re-fetch (or the aggregate header is gone).
                         // Distinct message on purpose — `/diagnose-alert`
@@ -6917,6 +7077,97 @@ mod tests {
             OLD_ENOUGH_SECS,
             true,
         ));
+    }
+
+    // -------------------------------------------------------------------
+    // Force-converge outcome classification — the gate ⊂ hash tripwire
+    // (2026-07-28). Pure, no DB.
+    // -------------------------------------------------------------------
+
+    /// The amplifier this fix exists for: the mapper's idempotency gate
+    /// decided "already identical" (`Ok(None)`), canonical did not move, and
+    /// the row is STILL unconverged. Pre-fix this was reported to the sweep
+    /// as a successful repair (`Ok(true)`), so every tick logged "repaired"
+    /// and then "still not converged", forever, while the underlying
+    /// divergence stayed invisible to both detection AND self-heal.
+    #[test]
+    fn gate_skip_flagged_when_mapper_noop_and_hash_static() {
+        assert!(classify_force_converge(
+            ForceConvergeOutcome::MapperNoop,
+            false, // canonical hash unchanged across the apply
+            false, // and the row is still unconverged
+        ));
+
+        // Converged is the dominant condition: if the row DID converge (a
+        // concurrent CT event landed between the probe and the apply), the
+        // sweep closes it and there is nothing to warn about.
+        assert!(
+            !classify_force_converge(ForceConvergeOutcome::MapperNoop, false, true),
+            "a converged row is a resolved row, never a tripwire"
+        );
+
+        // The non-mapper outcomes already have their own log lines
+        // (`legacy row absent` / unsupported table) and must never be
+        // reported as gate skips.
+        for outcome in [
+            ForceConvergeOutcome::SourceRowAbsent,
+            ForceConvergeOutcome::UnsupportedTable,
+        ] {
+            assert!(
+                !classify_force_converge(outcome, false, false),
+                "{outcome:?} is not a mapper gate skip"
+            );
+            assert!(
+                !outcome.mapper_ran(),
+                "{outcome:?} must skip the convergence re-test, as the old Ok(false) did"
+            );
+        }
+    }
+
+    /// A mapper that DID write (`Ok(Some(event))`) but left the row
+    /// unconverged is a different class — the two projections genuinely
+    /// disagree — and keeps the pre-existing "leaving row open for operator
+    /// review" warn. It must not be mislabelled as a gate skip, whether or
+    /// not the canonical hash moved.
+    #[test]
+    fn wrote_but_unconverged_stays_open_without_gate_skip_flag() {
+        for pg_hash_moved in [true, false] {
+            assert!(
+                !classify_force_converge(ForceConvergeOutcome::Wrote, pg_hash_moved, false),
+                "a real write is never a gate skip (pg_hash_moved={pg_hash_moved})"
+            );
+        }
+        // …and it still takes the convergence re-test path, so a successful
+        // re-ingest continues to close its ledger row.
+        assert!(ForceConvergeOutcome::Wrote.mapper_ran());
+        assert!(ForceConvergeOutcome::MapperNoop.mapper_ran());
+    }
+
+    /// The subtlety that makes a bare "`Ok(None)` ⇒ gate-skipped" test
+    /// wrong: several write paths legitimately return `Ok(None)` — the room
+    /// mapper always UPSERTs but only emits an event on a `room_clean` flip,
+    /// and the cancel / soft-delete paths write without an event. Those DO
+    /// move the canonical hash, which is exactly how they are told apart
+    /// from a gate skip.
+    #[test]
+    fn noop_with_hash_movement_is_not_a_gate_skip() {
+        assert!(
+            !classify_force_converge(ForceConvergeOutcome::MapperNoop, true, false),
+            "an event-less write that moved canonical is a legitimate repair, \
+             not a gate skip — it just hasn't converged yet"
+        );
+        assert!(!classify_force_converge(
+            ForceConvergeOutcome::MapperNoop,
+            true,
+            true
+        ));
+        // `from_mapper_event` is the single place `Ok(Some)`/`Ok(None)` is
+        // interpreted; pin the `None` half here (the `Some` half needs a
+        // real `DomainEvent`, which the mapper tests already cover).
+        assert_eq!(
+            ForceConvergeOutcome::from_mapper_event(None),
+            ForceConvergeOutcome::MapperNoop
+        );
     }
 
     // -------------------------------------------------------------------

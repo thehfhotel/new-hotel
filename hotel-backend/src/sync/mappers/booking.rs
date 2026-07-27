@@ -236,22 +236,33 @@ struct ExistingBooking {
     book_deposit_amount: Option<f64>,
     book_checkin: NaiveDate,
     book_checkout: NaiveDate,
-    /// Current `ht_booking_rooms` row count for this booking. Needed by
-    /// `existing_matches` so a header-unchanged + rooms-changed transition
-    /// (notably N→0 from iHOTEL's §3.7 delete-then-reinsert or §3.6
-    /// cancel-on-room flows) is NOT treated as idempotent. Without this
-    /// the early-return skips `replace_rooms` and leaves stale junction
-    /// rows behind — regression caught by
+    /// Current `ht_booking_rooms` CONTENT for this booking — the
+    /// `(br_room_id, br_price_per_night)` pair per junction row. Needed
+    /// by `existing_matches` so a header-unchanged + rooms-changed
+    /// transition (notably N→0 from iHOTEL's §3.7 delete-then-reinsert
+    /// or §3.6 cancel-on-room flows) is NOT treated as idempotent.
+    /// Without this the early-return skips `replace_rooms` and leaves
+    /// stale junction rows behind — regression caught by
     /// `re_apply_with_zero_rooms_clears_stale_booking_rooms` in CI on
     /// 2026-05-18.
     ///
-    /// Compared against the count of RESOLVABLE projection lines (not
-    /// raw `projection.rooms.len()`) since 2026-06-11: a line whose
-    /// room can't be found in `ht_rooms_new` is warn-skipped by
-    /// `replace_rooms`, so comparing against the raw count made
-    /// `existing_matches` permanently false and every CT touch on the
-    /// booking re-emitted `BookingModified` forever.
-    rooms_count: i64,
+    /// Was a bare `count(*)` until 2026-07-28. A count is blind to the
+    /// single most common iHOTEL room edit: `FrmAddBook2.SAVE_EDIT` is
+    /// field-agnostic (DELETE + re-INSERT of all four booking tables on
+    /// ANY edit), so a receptionist swapping room 402→403 re-writes an
+    /// otherwise byte-identical header at a CONSTANT room count. Every
+    /// gate term held, `apply_booking_aggregate` returned `Ok(None)`
+    /// before `replace_rooms` ever ran, and canonical kept the old room
+    /// permanently. The reconcile hash can't catch it either
+    /// (`booking_canonical_hash` hashes `book_id|checkin|checkout|
+    /// cust_no` only — no room data), so the class was silent in BOTH
+    /// detection paths. 1176 of 1178 live bookings carry room numbers.
+    ///
+    /// Compared against the RESOLVED projection lines (not raw
+    /// `projection.rooms`) since 2026-06-11 — see
+    /// [`booking_rooms_match`] for why that stays true of the set
+    /// comparison.
+    rooms: Vec<ExistingBookingRoom>,
     /// Denormalised customer pointer — compared by `existing_matches`
     /// since 2026-06-11 (audit P1 #6): iHOTEL's customer-delete cascade
     /// (`UPDATE HT_Book_H SET Book_Cust_ID='C0000'`, cheatsheet §3.24)
@@ -263,6 +274,20 @@ struct ExistingBooking {
     /// `COALESCE($7, book_notes)` write semantics) so a notes-only
     /// iHOTEL edit re-applies instead of silently skipping.
     book_notes: Option<String>,
+}
+
+/// One `ht_booking_rooms` row as it currently lives in PG. Deliberately
+/// the same shape as [`ResolvedRoomLine`] (the write side): the gate's
+/// job is to answer "would `replace_rooms` be a no-op?", so it compares
+/// the room identity + price EXACTLY as `replace_rooms` writes them
+/// (`br_room_id`, `br_price_per_night`). No `ht_rooms_new` join is
+/// needed — `room_no` is `NOT NULL UNIQUE` there, so `room_id` is a
+/// faithful stand-in for the legacy room identity, and keying on the FK
+/// removes any chance of the gate and the mutation disagreeing.
+#[derive(Debug, Clone, PartialEq)]
+struct ExistingBookingRoom {
+    room_id: i32,
+    price_per_night: Option<f64>,
 }
 
 /// In-memory projection of the legacy aggregate, in canonical PG shape.
@@ -367,16 +392,18 @@ pub async fn apply_booking_aggregate(
     let existing = fetch_existing(tx, book_id).await?;
 
     // Resolve the per-line room FKs BEFORE the idempotency check so the
-    // junction count comparison only counts RESOLVABLE lines (2026-06-11
-    // fix — see `ExistingBooking::rooms_count`). Unresolvable lines are
-    // warn-skipped, matching `replace_rooms`'s historical behaviour.
+    // junction comparison sees only RESOLVABLE lines (2026-06-11 fix —
+    // see `ExistingBooking::rooms`). Unresolvable lines are skipped,
+    // matching `replace_rooms`'s historical behaviour: the gate compares
+    // what will be WRITTEN against what is STORED, never the raw legacy
+    // line list.
     let resolved_rooms = resolve_room_lines(tx, book_id, &projection.rooms).await?;
 
-    // Idempotent skip — every projected field matches the canonical row.
+    // Idempotent skip — every projected field matches the canonical row,
+    // INCLUDING the per-room (room_id, price) set (2026-07-28: a bare
+    // room count let iHOTEL's constant-cardinality room swap through).
     if let Some(ex) = existing.as_ref() {
-        if existing_matches(ex, &projection, resolved_rooms.len() as i64)
-            && ex.aggregate_id.is_some()
-        {
+        if existing_matches(ex, &projection, &resolved_rooms) && ex.aggregate_id.is_some() {
             return Ok(None);
         }
     }
@@ -675,12 +702,24 @@ async fn fetch_existing(
         return Ok(None);
     };
 
-    let rooms_count: i64 = sqlx::query_scalar(
-        "SELECT count(*)::bigint FROM ht_booking_rooms WHERE br_book_id = $1",
+    // Room CONTENT, not a count (2026-07-28) — a count is blind to the
+    // constant-cardinality room swap that iHOTEL's field-agnostic
+    // `SAVE_EDIT` produces. `::float8` mirrors the header amounts'
+    // read-back cast; the column is `DECIMAL(10,2)`.
+    let rooms: Vec<ExistingBookingRoom> = sqlx::query_as::<_, (i32, Option<f64>)>(
+        "SELECT br_room_id, br_price_per_night::float8 \
+           FROM ht_booking_rooms \
+          WHERE br_book_id = $1",
     )
     .bind(book_id_serial)
-    .fetch_one(&mut **tx)
-    .await?;
+    .fetch_all(&mut **tx)
+    .await?
+    .into_iter()
+    .map(|(room_id, price_per_night)| ExistingBookingRoom {
+        room_id,
+        price_per_night,
+    })
+    .collect();
 
     Ok(Some(ExistingBooking {
         book_id_serial,
@@ -691,7 +730,7 @@ async fn fetch_existing(
         book_deposit_amount,
         book_checkin,
         book_checkout,
-        rooms_count,
+        rooms,
         legacy_cust_no,
         book_notes,
     }))
@@ -700,11 +739,12 @@ async fn fetch_existing(
 /// Compare the existing canonical row to the freshly projected legacy
 /// one. Skip publication when every mirrored field matches.
 ///
-/// `resolvable_rooms_count` is the number of projection lines whose room
-/// actually resolves in `ht_rooms_new` — NOT `p.rooms.len()`. Lines that
-/// don't resolve are warn-skipped by `replace_rooms`, so comparing
-/// against the raw count could never converge (every CT touch would
-/// re-emit `BookingModified`).
+/// `resolved` is the output of [`resolve_room_lines`] — the projection
+/// lines whose room actually resolves in `ht_rooms_new`, i.e. EXACTLY
+/// what `replace_rooms` is about to write. It is NOT `p.rooms`: lines
+/// that don't resolve never reach the junction, so comparing against the
+/// raw projection could never converge (every CT touch would re-emit
+/// `BookingModified`). See [`booking_rooms_match`].
 ///
 /// `legacy_cust_no` and `notes` comparisons are guarded on the
 /// projection carrying a value, mirroring their `COALESCE($n, existing)`
@@ -716,17 +756,107 @@ async fn fetch_existing(
 fn existing_matches(
     ex: &ExistingBooking,
     p: &CanonicalProjection,
-    resolvable_rooms_count: i64,
+    resolved: &[ResolvedRoomLine],
 ) -> bool {
     ex.book_status.as_deref() == Some(p.book_status.as_str())
         && ex.book_total_amount == p.total_amount
         && ex.book_deposit_amount == p.deposit_amount
         && ex.book_checkin == p.book_checkin
         && ex.book_checkout == p.book_checkout
-        && ex.rooms_count == resolvable_rooms_count
+        && booking_rooms_match(&ex.rooms, resolved)
         && (p.legacy_cust_no.is_none() || ex.legacy_cust_no == p.legacy_cust_no)
         && (p.notes.is_none() || ex.book_notes == p.notes)
 }
+
+/// True when `ht_booking_rooms` already holds exactly what
+/// [`replace_rooms`] would write. Ports the check-in mapper's proven
+/// `rooms_match` pattern (`sync::mappers::checkin::rooms_match`, Track
+/// B2 / T2 HIGH-2) from `(room, status)` pairs to `(room, price)` pairs:
+/// compares the SET, not the sequence, and not a count.
+///
+/// ## Why the SET (2026-07-28)
+///
+/// iHOTEL's `FrmAddBook2.SAVE_EDIT` is field-agnostic — it DELETEs and
+/// re-INSERTs all four booking tables on ANY edit. A receptionist
+/// swapping room 402→403 therefore re-writes a byte-identical header at
+/// an unchanged room count, and the old `rooms_count == count` term
+/// held, short-circuiting `apply_booking_aggregate` to `Ok(None)` before
+/// `replace_rooms` ever ran. Canonical kept the stale room forever, and
+/// the reconcile sweep was blind to it too (`booking_canonical_hash`
+/// carries no room data). Order-insensitivity matters because neither
+/// SELECT is ordered and iHOTEL re-inserts in edit-dialog order.
+///
+/// ## Unresolvable lines (intent preserved from the 2026-06-11 fix)
+///
+/// Both sides of this comparison are post-resolution, so an unresolvable
+/// line is invisible to BOTH: `resolve_room_lines` drops blank-`room_no`
+/// lines (observed on cancelled iHOTEL lines, e.g. R014826) before we
+/// ever get here, and `project_aggregate` projects `Book_room_type=1`
+/// (room-TYPE-code) bookings as header-only. A non-blank room that
+/// misses `ht_rooms_new` never reaches this function at all —
+/// `resolve_room_lines` errors and the watcher holds the watermark. So
+/// the gate compares "what will be written" against "what is stored",
+/// never "what legacy sent" — which is precisely what stopped the
+/// forever-re-emitting `BookingModified` loop, and it stays true term
+/// for term now that the comparison is content-aware.
+///
+/// ## Duplicate room lines
+///
+/// `replace_rooms` INSERTs with `ON CONFLICT (br_book_id, br_room_id) DO
+/// NOTHING`, so two resolved lines for the same room collapse to ONE
+/// junction row carrying the FIRST line's price. The fold below keeps
+/// the first occurrence per `room_id` for the same reason: a comparison
+/// that counted the duplicate would never converge (2 intended vs 1
+/// stored), reintroducing the exact loop this design avoids.
+fn booking_rooms_match(existing: &[ExistingBookingRoom], resolved: &[ResolvedRoomLine]) -> bool {
+    use std::collections::HashMap;
+
+    // Intended junction state = resolved lines deduped by room_id,
+    // first-wins (mirrors ON CONFLICT DO NOTHING).
+    let mut intended: HashMap<i32, Option<f64>> = HashMap::with_capacity(resolved.len());
+    for r in resolved {
+        intended.entry(r.room_id).or_insert(r.price_per_night);
+    }
+
+    // `uq_ht_br_bookroom UNIQUE (br_book_id, br_room_id)` guarantees the
+    // stored side is already unique per room, so a length check on the
+    // deduped map is exact.
+    if existing.len() != intended.len() {
+        return false;
+    }
+    existing.iter().all(|ex| match intended.get(&ex.room_id) {
+        Some(price) => prices_match(ex.price_per_night, *price),
+        None => false,
+    })
+}
+
+/// Compare two per-room prices at the resolution
+/// `ht_booking_rooms.br_price_per_night` can actually store
+/// (`DECIMAL(10,2)`).
+///
+/// Exact `f64` equality is wrong here: legacy `HT_Book_Ds.
+/// Book_Room_Price` is a SQL Server `float`, so a value with sub-satang
+/// precision is ROUNDED on the way into the column and can never read
+/// back equal to the projection. That would leave the gate permanently
+/// false and re-emit `BookingModified` on every CT touch — the same
+/// non-convergence failure mode the 2026-06-11 resolvable-count fix
+/// removed. Two prices are therefore "the same" iff they land on the
+/// same stored value: less than half a satang apart, with a hair of
+/// slack for the float noise in that boundary.
+///
+/// NULL is NOT a value: `replace_rooms` binds `None` as SQL NULL, so
+/// `NULL` vs `0.00` is a real difference and must re-apply.
+fn prices_match(a: Option<f64>, b: Option<f64>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => (a - b).abs() < PRICE_MATCH_EPSILON,
+        _ => false,
+    }
+}
+
+/// Half of the `DECIMAL(10,2)` storage resolution (0.005) plus float
+/// slack. Any genuine 1-satang change (0.01) is still a mismatch.
+const PRICE_MATCH_EPSILON: f64 = 0.005_000_1;
 
 async fn update_existing(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -822,10 +952,12 @@ struct ResolvedRoomLine {
 }
 
 /// Resolve every projection room line against `ht_rooms_new`. The
-/// RESOLVED set is what both `existing_matches` (count) and
-/// `replace_rooms` (content) operate on, so the idempotency comparison
-/// and the junction mutation can never disagree (2026-06-11 fix for the
-/// forever-re-emitting `BookingModified` loop on unresolvable lines).
+/// RESOLVED set is what both `existing_matches` (via
+/// [`booking_rooms_match`]) and `replace_rooms` operate on, so the
+/// idempotency comparison and the junction mutation can never disagree
+/// (2026-06-11 fix for the forever-re-emitting `BookingModified` loop on
+/// unresolvable lines; still the invariant now that the comparison is
+/// content-aware rather than a count — 2026-07-28).
 ///
 /// Miss handling (2026-06-12, audit follow-up — matches the checkin
 /// mapper's posture):
@@ -1318,8 +1450,36 @@ mod tests {
         }
     }
 
+    // Canonical `ht_rooms_new.room_id`s for the fixture rooms. Room
+    // numbers are the human handle in iHOTEL; the junction (and so the
+    // gate) keys on the resolved FK — see `ExistingBookingRoom`.
+    const ROOM_402: i32 = 4002;
+    const ROOM_403: i32 = 4003;
+    const ROOM_414: i32 = 4014;
+
+    fn resolved(room_id: i32, price: f64) -> ResolvedRoomLine {
+        ResolvedRoomLine {
+            room_id,
+            price_per_night: Some(price),
+        }
+    }
+
+    /// `ht_booking_rooms` content mirroring the given resolved lines —
+    /// i.e. what `replace_rooms` would have left behind.
+    fn stored(resolved: &[ResolvedRoomLine]) -> Vec<ExistingBookingRoom> {
+        resolved
+            .iter()
+            .map(|r| ExistingBookingRoom {
+                room_id: r.room_id,
+                price_per_night: r.price_per_night,
+            })
+            .collect()
+    }
+
     /// Existing canonical row that exactly mirrors `p` — tests mutate
-    /// one field at a time.
+    /// one field at a time. `p.rooms` is the pre-resolution projection,
+    /// so the junction starts empty; room-aware tests set `ex.rooms`
+    /// explicitly via [`stored`].
     fn make_existing(p: &CanonicalProjection) -> ExistingBooking {
         ExistingBooking {
             book_id_serial: 1,
@@ -1330,7 +1490,7 @@ mod tests {
             book_deposit_amount: p.deposit_amount,
             book_checkin: p.book_checkin,
             book_checkout: p.book_checkout,
-            rooms_count: p.rooms.len() as i64,
+            rooms: Vec::new(),
             legacy_cust_no: p.legacy_cust_no.clone(),
             book_notes: p.notes.clone(),
         }
@@ -1340,7 +1500,7 @@ mod tests {
     fn existing_matches_returns_true_for_unchanged_row() {
         let p = sample_projection();
         let ex = make_existing(&p);
-        assert!(existing_matches(&ex, &p, p.rooms.len() as i64));
+        assert!(existing_matches(&ex, &p, &[]));
     }
 
     #[test]
@@ -1348,7 +1508,7 @@ mod tests {
         let p = sample_projection();
         let mut ex = make_existing(&p);
         ex.book_status = Some("cancelled".into());
-        assert!(!existing_matches(&ex, &p, p.rooms.len() as i64));
+        assert!(!existing_matches(&ex, &p, &[]));
     }
 
     #[test]
@@ -1356,14 +1516,14 @@ mod tests {
         let p = sample_projection();
         let mut ex = make_existing(&p);
         ex.book_total_amount = Some(900.0);
-        assert!(!existing_matches(&ex, &p, p.rooms.len() as i64));
+        assert!(!existing_matches(&ex, &p, &[]));
     }
 
     #[test]
     fn existing_matches_returns_false_when_rooms_count_differs() {
         let p = sample_projection();
-        let ex = make_existing(&p);
-        assert!(!existing_matches(&ex, &p, (p.rooms.len() + 1) as i64));
+        let ex = make_existing(&p); // zero junction rows
+        assert!(!existing_matches(&ex, &p, &[resolved(ROOM_402, 890.0)]));
     }
 
     /// Audit 2026-06-11 P1 #6 — iHOTEL's customer-delete cascade
@@ -1378,7 +1538,7 @@ mod tests {
         let mut ex = make_existing(&p);
         ex.legacy_cust_no = Some("C0000".into()); // canonical lags the cascade
         assert!(
-            !existing_matches(&ex, &p, p.rooms.len() as i64),
+            !existing_matches(&ex, &p, &[]),
             "a cust_no-only change MUST force a re-apply (C0000 cascade)"
         );
     }
@@ -1390,7 +1550,7 @@ mod tests {
         p.notes = Some("late arrival".into());
         let mut ex = make_existing(&p);
         ex.book_notes = None;
-        assert!(!existing_matches(&ex, &p, p.rooms.len() as i64));
+        assert!(!existing_matches(&ex, &p, &[]));
     }
 
     /// …but a None-notes projection against a populated canonical value
@@ -1407,10 +1567,187 @@ mod tests {
         ex.book_notes = Some("kept".into());
         ex.legacy_cust_no = Some("C21610".into());
         assert!(
-            existing_matches(&ex, &p, p.rooms.len() as i64),
+            existing_matches(&ex, &p, &[]),
             "None projection vs Some canonical must stay idempotent \
              (COALESCE write semantics can never converge it)"
         );
+    }
+
+    // ----- booking_rooms_match (2026-07-28 constant-count room swap) ------
+    //
+    // iHOTEL's FrmAddBook2.SAVE_EDIT is field-agnostic: it DELETEs and
+    // re-INSERTs all four booking tables on ANY edit. Swapping a room
+    // therefore re-writes a byte-identical header, so the ONLY signal
+    // that anything changed lives in the per-room set. A count-based
+    // gate saw none of it and canonical kept the old room permanently —
+    // silent in the reconcile sweep too (`booking_canonical_hash`
+    // carries no room data).
+
+    /// THE BUG: room swapped 402→403 at a constant room count. Must NOT
+    /// match, or `apply_booking_aggregate` short-circuits before
+    /// `replace_rooms` and canonical keeps room 402 forever.
+    #[test]
+    fn booking_rooms_match_detects_pure_room_swap() {
+        let before = [resolved(ROOM_402, 890.0)];
+        let after = [resolved(ROOM_403, 890.0)];
+        assert!(
+            !booking_rooms_match(&stored(&before), &after),
+            "402→403 at constant count MUST re-apply"
+        );
+    }
+
+    /// Same rooms, different order — iHOTEL re-inserts in edit-dialog
+    /// order and neither SELECT is ordered, so a sequence comparison
+    /// would re-apply (and re-emit `BookingModified`) on every CT touch.
+    #[test]
+    fn booking_rooms_match_is_order_independent() {
+        let stored_rows = stored(&[resolved(ROOM_402, 890.0), resolved(ROOM_414, 1200.0)]);
+        let reordered = [resolved(ROOM_414, 1200.0), resolved(ROOM_402, 890.0)];
+        assert!(
+            booking_rooms_match(&stored_rows, &reordered),
+            "the SET is what matters, not the sequence"
+        );
+    }
+
+    /// A per-room price edit at an unchanged room set must re-apply —
+    /// `br_price_per_night` is mirrored state, and the header total can
+    /// stay put when one room's rate is corrected against another's.
+    #[test]
+    fn booking_rooms_match_detects_price_change_at_constant_rooms() {
+        let before = [resolved(ROOM_402, 890.0)];
+        let after = [resolved(ROOM_402, 950.0)];
+        assert!(!booking_rooms_match(&stored(&before), &after));
+    }
+
+    /// A 1-satang change is still a change (guards the epsilon from
+    /// being widened into a real-difference mask).
+    #[test]
+    fn booking_rooms_match_detects_one_satang_price_change() {
+        let before = [resolved(ROOM_402, 890.00)];
+        let after = [resolved(ROOM_402, 890.01)];
+        assert!(!booking_rooms_match(&stored(&before), &after));
+    }
+
+    /// …but sub-satang float noise must NOT: legacy `Book_Room_Price` is
+    /// a SQL Server `float` and our column is `DECIMAL(10,2)`, so the
+    /// stored value is rounded. Exact `f64` equality would leave the
+    /// gate permanently false and re-emit `BookingModified` on every CT
+    /// touch — the non-convergence failure mode this design avoids.
+    #[test]
+    fn booking_rooms_match_ignores_sub_satang_rounding() {
+        let stored_rows = vec![ExistingBookingRoom {
+            room_id: ROOM_402,
+            price_per_night: Some(890.33), // as DECIMAL(10,2) stored it
+        }];
+        let projected = [resolved(ROOM_402, 890.333_333_3)];
+        assert!(
+            booking_rooms_match(&stored_rows, &projected),
+            "a difference the column cannot store is not a difference"
+        );
+    }
+
+    /// NULL is not 0.00 — `replace_rooms` binds `None` as SQL NULL, so
+    /// the transition is real and must re-apply.
+    #[test]
+    fn booking_rooms_match_treats_null_price_as_distinct_from_zero() {
+        let stored_rows = vec![ExistingBookingRoom {
+            room_id: ROOM_402,
+            price_per_night: None,
+        }];
+        let projected = [resolved(ROOM_402, 0.0)];
+        assert!(!booking_rooms_match(&stored_rows, &projected));
+    }
+
+    /// The N→0 case the count-based gate was originally added for
+    /// (iHOTEL §3.7 delete-then-reinsert / §3.6 cancel-on-room) must
+    /// keep re-applying so `replace_rooms` drops the stale junction rows
+    /// — regression pinned by
+    /// `re_apply_with_zero_rooms_clears_stale_booking_rooms`.
+    #[test]
+    fn booking_rooms_match_detects_all_rooms_dropped() {
+        let stored_rows = stored(&[resolved(ROOM_402, 890.0)]);
+        assert!(!booking_rooms_match(&stored_rows, &[]));
+    }
+
+    /// Header-only booking on both sides — the steady state for
+    /// `Book_room_type=1` bookings and post-cancel headers. Must match,
+    /// or every CT touch on them re-emits forever.
+    #[test]
+    fn booking_rooms_match_true_when_both_sides_empty() {
+        assert!(booking_rooms_match(&[], &[]));
+    }
+
+    /// UNRESOLVABLE LINES — intent preserved from the 2026-06-11 fix.
+    ///
+    /// `resolve_room_lines` drops blank-`room_no` lines (observed on
+    /// cancelled iHOTEL lines, e.g. R014826) and `project_aggregate`
+    /// drops `Book_room_type=1` room-TYPE codes, so they are absent from
+    /// `resolved` — the ONLY room input the gate sees. They must
+    /// therefore be invisible on both sides: the projection carries two
+    /// lines, only one resolves, the junction holds that one, and the
+    /// gate MUST match. Comparing against `p.rooms` instead would make
+    /// the gate permanently false and re-apply on every tick — the exact
+    /// failure mode the count-based design was avoiding.
+    ///
+    /// (A non-blank room missing from `ht_rooms_new` never reaches here:
+    /// `resolve_room_lines` errors and the watcher holds the watermark.)
+    #[test]
+    fn existing_matches_ignores_unresolvable_projection_lines() {
+        let mut p = sample_projection();
+        p.rooms = vec![
+            RoomLine {
+                room_no: "402".into(),
+                price_per_night: Some(890.0),
+            },
+            RoomLine {
+                // Blank room_no — dropped by `resolve_room_lines`, so it
+                // reaches neither the junction nor this comparison.
+                room_no: String::new(),
+                price_per_night: Some(890.0),
+            },
+        ];
+        let resolved_rooms = [resolved(ROOM_402, 890.0)];
+        let mut ex = make_existing(&p);
+        ex.rooms = stored(&resolved_rooms);
+        assert!(
+            existing_matches(&ex, &p, &resolved_rooms),
+            "unresolvable lines must be invisible to BOTH sides of the \
+             gate — comparing against p.rooms could never converge"
+        );
+    }
+
+    /// Duplicate resolved lines for one room collapse to a single
+    /// junction row via `ON CONFLICT (br_book_id, br_room_id) DO
+    /// NOTHING`, so the gate must dedupe the same way — otherwise
+    /// 2-intended vs 1-stored never converges.
+    #[test]
+    fn booking_rooms_match_dedupes_duplicate_room_lines_like_replace_rooms() {
+        let stored_rows = stored(&[resolved(ROOM_402, 890.0)]);
+        let duplicated = [resolved(ROOM_402, 890.0), resolved(ROOM_402, 890.0)];
+        assert!(booking_rooms_match(&stored_rows, &duplicated));
+    }
+
+    /// End-to-end at the gate level: header byte-identical, room swapped
+    /// — `existing_matches` must be false so the caller falls through to
+    /// `replace_rooms`.
+    #[test]
+    fn existing_matches_returns_false_when_only_room_swapped() {
+        let p = sample_projection();
+        let mut ex = make_existing(&p);
+        ex.rooms = stored(&[resolved(ROOM_402, 890.0)]);
+        assert!(
+            !existing_matches(&ex, &p, &[resolved(ROOM_403, 890.0)]),
+            "a room-only SAVE_EDIT MUST force a re-apply"
+        );
+    }
+
+    /// …and the same gate with a per-room price edit only.
+    #[test]
+    fn existing_matches_returns_false_when_only_room_price_changed() {
+        let p = sample_projection();
+        let mut ex = make_existing(&p);
+        ex.rooms = stored(&[resolved(ROOM_402, 890.0)]);
+        assert!(!existing_matches(&ex, &p, &[resolved(ROOM_402, 950.0)]));
     }
 
     // ----- coalesce_key --------------------------------------------------

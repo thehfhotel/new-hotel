@@ -65,6 +65,12 @@
 //! `SYS_CHANGE_CONTEXT`, so there was never a SQL-layer filter — see
 //! `db/mssql_session.rs`.)
 //!
+//! The comparison must cover every reconcile-hash input, or a row can
+//! hash as unconverged while the gate reports "no change" — and since
+//! `force_converge_reconcile_row` repairs by re-driving this same gate,
+//! the self-heal path dies with it. `cust_address` was that gap until
+//! 2026-07-28; see the field doc on [`ExistingEqualityKeys`].
+//!
 //! ## Aggregate UUID
 //!
 //! `aggregate_id` is derived once via
@@ -333,6 +339,26 @@ struct ExistingEqualityKeys {
     cust_type: Option<String>,
     cust_email: Option<String>,
     cust_add_no: Option<String>,
+    /// Legacy single-line mirror of `cust_add_no`. Compared since
+    /// 2026-07-28 — same structural class as the d09e756 checkin-gate
+    /// gap: a reconcile-hash input invisible to the skip comparator.
+    ///
+    /// The UPSERT writes the two in lock-step (`cust_address = $9`, the
+    /// `cust_add_no` bind), so a mapper-written row can never diverge —
+    /// but other canonical writers break the invariant. The Thai-ID
+    /// check-in prefill (`repository::customer::update`) stores the full
+    /// unsplit address here and leaves `cust_add_no` alone; historical
+    /// backfills and pre-lock-step rows left their own residue. Because
+    /// `scheduler::sync::customer_canonical_hash` reads `cust_address`
+    /// on the canonical side and `Cust_Add_no` on the MSSQL side, such a
+    /// row hashes as unconverged while this gate reported "no change" —
+    /// and `force_converge_reconcile_row` repairs by re-driving this
+    /// same gate, so self-heal was disabled along with it.
+    ///
+    /// Compared UNGUARDED (contrast `legacy_id` on [`ExistingRow`]):
+    /// neither branch COALESCEs it, so one re-apply always converges and
+    /// a `None` projection must be allowed to blank a stale value.
+    cust_address: Option<String>,
     cust_add_moo: Option<String>,
     cust_add_soi: Option<String>,
     cust_add_road: Option<String>,
@@ -373,6 +399,9 @@ fn projection_equality_keys(p: &CustomerProjection) -> ExistingEqualityKeys {
         cust_type: p.cust_type.clone(),
         cust_email: p.cust_email.clone(),
         cust_add_no: p.cust_add_no.clone(),
+        // Same source value as `cust_add_no` — the UPSERT binds $9 to
+        // both columns, so the projected `cust_address` IS `Cust_Add_no`.
+        cust_address: p.cust_add_no.clone(),
         cust_add_moo: p.cust_add_moo.clone(),
         cust_add_soi: p.cust_add_soi.clone(),
         cust_add_road: p.cust_add_road.clone(),
@@ -408,12 +437,13 @@ async fn fetch_existing(
 
     // Dynamic query — keeps this file out of the `.sqlx` offline cache
     // (which would have to be regenerated for every column tweak). The
-    // 35 columns we read mirror everything the UPSERT writes, plus
+    // 37 identifiers we read mirror everything the UPSERT writes
+    // (including the `cust_address` lock-step mirror), plus
     // (cust_id, aggregate_id) for FK resolution.
     let opt = sqlx::query(
         "SELECT cust_id, aggregate_id, legacy_id, cust_firstname, cust_name2, \
                 cust_title, cust_sex, cust_idcard, cust_price_tier, \
-                cust_type, cust_email, cust_add_no, cust_add_moo, \
+                cust_type, cust_email, cust_add_no, cust_address, cust_add_moo, \
                 cust_add_soi, cust_add_road, cust_add_tambon, cust_add_ampore, \
                 cust_add_province, cust_add_code, cust_phone, cust_add_fax, \
                 cust_work_name, cust_work_no, cust_work_moo, cust_work_soi, \
@@ -446,6 +476,7 @@ async fn fetch_existing(
             cust_type: row.try_get("cust_type")?,
             cust_email: row.try_get("cust_email")?,
             cust_add_no: row.try_get("cust_add_no")?,
+            cust_address: row.try_get("cust_address")?,
             cust_add_moo: row.try_get("cust_add_moo")?,
             cust_add_soi: row.try_get("cust_add_soi")?,
             cust_add_road: row.try_get("cust_add_road")?,
@@ -481,6 +512,12 @@ async fn fetch_existing(
 /// projection (fixture / pre-widening load) must not force a re-apply,
 /// but a `Some` projection against a still-NULL stored value MUST
 /// mismatch once so the UPSERT backfills the column.
+///
+/// Everything inside `keys` — including the `cust_address` lock-step
+/// mirror added 2026-07-28 — is compared UNGUARDED, because the UPSERT
+/// writes those columns through plainly. A guard would be wrong for
+/// `cust_address`: the write carries no COALESCE, so a `None`
+/// `Cust_Add_no` has to be allowed to blank a stale stored value.
 fn matches(existing: &ExistingRow, projected: &CustomerProjection) -> bool {
     existing.keys == projection_equality_keys(projected)
         && (projected.legacy_id.is_none() || existing.legacy_id == projected.legacy_id)
@@ -1155,6 +1192,66 @@ mod tests {
         let mut ex = make_existing_matching(&p);
         ex.keys.cust_price_over = Some(0.0);
         assert!(!matches(&ex, &p));
+    }
+
+    // ----- cust_address lock-step mirror (2026-07-28 gate gap) ----------
+
+    /// The gate must see a canonical `cust_address` that drifted away
+    /// from the projected `Cust_Add_no`. This mapper writes the two in
+    /// lock-step, but other canonical writers do not: the Thai-ID
+    /// check-in prefill (`repository::customer::update`) stores the full
+    /// unsplit address in `cust_address` and leaves `cust_add_no` alone.
+    /// `cust_address` is a reconcile-hash input, so before this test the
+    /// row hashed as unconverged forever while the gate said "no change"
+    /// — and `force_converge_reconcile_row` re-drives this same gate, so
+    /// the self-heal path was dead too. Same class as d09e756.
+    #[test]
+    fn matches_returns_false_when_cust_address_drifted_from_add_no() {
+        let p = make_projection_all_set(); // cust_add_no = Some("123/4")
+        let mut ex = make_existing_matching(&p);
+        // What a check-in prefill leaves behind: the collapsed
+        // single-line address, while cust_add_no still holds the door no.
+        ex.keys.cust_address =
+            Some("123/4 ม.5 ซ.1 ถ.สุขุมวิท คลองตัน วัฒนา กรุงเทพ 10110".into());
+        assert_eq!(
+            ex.keys.cust_add_no, p.cust_add_no,
+            "only cust_address may differ in this fixture"
+        );
+        assert!(
+            !matches(&ex, &p),
+            "a cust_address diverged from cust_add_no MUST force a re-apply"
+        );
+    }
+
+    /// Steady state stays idempotent: `cust_address` mirroring
+    /// `cust_add_no` is exactly what the UPSERT leaves behind
+    /// (`cust_address = $9`, the `cust_add_no` bind), so the re-apply
+    /// converges in ONE pass instead of re-firing every tick.
+    #[test]
+    fn matches_returns_true_when_cust_address_mirrors_add_no() {
+        let p = make_projection_all_set();
+        let ex = make_existing_matching(&p);
+        assert_eq!(ex.keys.cust_address, p.cust_add_no);
+        assert!(
+            matches(&ex, &p),
+            "the lock-step steady state must not force a spurious re-apply"
+        );
+    }
+
+    /// Unguarded on purpose: a legacy row whose `Cust_Add_no` went NULL
+    /// must still defeat the gate so the UPSERT blanks the stale
+    /// canonical `cust_address`. A Some-only guard (the `legacy_id`
+    /// shape) would leave the stale value hashing as unconverged.
+    #[test]
+    fn matches_returns_false_when_add_no_null_but_address_still_stored() {
+        let mut p = make_projection_all_set();
+        p.cust_add_no = None;
+        let mut ex = make_existing_matching(&p); // both keys now None
+        ex.keys.cust_address = Some("123/4".into());
+        assert!(
+            !matches(&ex, &p),
+            "a NULL Cust_Add_no must re-apply so the stale mirror is blanked"
+        );
     }
 
     // ----- legacy_id (migration 055, customer hard-delete handling) ------

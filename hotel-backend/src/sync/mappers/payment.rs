@@ -450,6 +450,58 @@ fn project_receipt(row: &dyn MappableRow) -> Result<ReceiptProjection, SyncError
     })
 }
 
+/// The UPDATE arm of [`apply_receipt_upsert`]. Hoisted to a const so the
+/// regression tests execute the EXACT statement the mapper runs (against a
+/// shadowing TEMP TABLE) rather than a re-typed copy that could drift.
+///
+/// `pay_date` is COALESCE'd so re-importing a receipt never rewrites the
+/// timestamp of an app-originated row (which holds the app's creation
+/// instant) — only fills it when absent. Receipts are append-only in
+/// legacy, so the date is immutable post-insert for legacy-originated rows
+/// too.
+///
+/// ## `pay_voided` is MONOTONIC — false→true only. Do NOT "simplify".
+///
+/// Canonical payment void is PG-ONLY: `repository/payment.rs::void` flips
+/// the flag and there is NO writeback recipe carrying it to legacy
+/// (`writeback/recipes/pos_void.rs` is the POS void — a different flow).
+/// `HT_Receipt_H.status_name` therefore stays `'ปกติ'` forever after we
+/// void here, so every later CT event for that receipt arrives with
+/// `is_cancelled = false`. Because the probe above deliberately matches
+/// app-originated rows too (via `legacy_receipt_no`), a plain
+/// `pay_voided = $3` RESURRECTED a canonically voided payment and wiped
+/// `pay_voided_at`. iHOTEL's customer-delete cascade
+/// (`UPDATE HT_Receipt_H SET Receipt_c_no='C0000'` — COMPAT_CHEATSHEET
+/// §6.6) fires exactly such an event, on a column this mapper discards.
+/// `service/shifts.rs` sums `WHERE pay_voided = false`, so a resurrected
+/// payment silently INFLATES reported shift income.
+///
+/// The asymmetry is the whole point — only ONE direction is blocked:
+///   * legacy void → canonical  — PRESERVED. That is the `OR $3` half:
+///     `status_name='ยกเลิก'` in iHOTEL still voids our row, first time
+///     and every time.
+///   * canonical void → un-void — BLOCKED. Legacy cannot know we voided,
+///     so its "not cancelled" is absence of information, never a contrary
+///     fact, and must not overwrite a canonical decision.
+///
+/// `pay_voided_at` is COALESCE'd for the same reason: an already-voided
+/// row keeps its ORIGINAL void instant instead of being restamped to
+/// `NOW()` by every unrelated legacy touch of the receipt.
+///
+/// `COALESCE(…, false)` guards the nullable column (`pay_voided BOOLEAN
+/// DEFAULT false`): without it a NULL row would evaluate `NULL OR false`
+/// to NULL, and every `WHERE pay_voided = false` / `NOT pay_voided` reader
+/// (`service/shifts.rs`, `routes/new_checkins.rs`) would then drop the
+/// payment — the same over/under-count class, opposite sign.
+const RECEIPT_UPSERT_UPDATE_SQL: &str = "UPDATE ht_payments \
+        SET pay_amount    = $1::float8, \
+            pay_date      = COALESCE(pay_date, $2), \
+            pay_voided    = COALESCE(ht_payments.pay_voided, false) OR $3, \
+            pay_voided_at = CASE WHEN COALESCE(ht_payments.pay_voided, false) OR $3 \
+                                 THEN COALESCE(ht_payments.pay_voided_at, NOW()) \
+                                 ELSE NULL END \
+      WHERE pay_id = $4";
+
 async fn apply_receipt_upsert(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     row: &dyn MappableRow,
@@ -536,25 +588,16 @@ async fn apply_receipt_upsert(
 
     let pay_id = match existing_pay_id {
         Some(id) => {
-            sqlx::query(
-                // `pay_date` is COALESCE'd so re-importing a receipt never
-                // rewrites the timestamp of an app-originated row (which holds
-                // the app's creation instant) — only fills it when absent.
-                // Receipts are append-only in legacy, so the date is immutable
-                // post-insert for legacy-originated rows too.
-                "UPDATE ht_payments \
-                    SET pay_amount    = $1::float8, \
-                        pay_date      = COALESCE(pay_date, $2), \
-                        pay_voided    = $3, \
-                        pay_voided_at = CASE WHEN $3 THEN NOW() ELSE NULL END \
-                  WHERE pay_id = $4",
-            )
-            .bind(p.receipt_total)
-            .bind(pay_date)
-            .bind(is_cancelled)
-            .bind(id)
-            .execute(&mut **tx)
-            .await?;
+            // See [`RECEIPT_UPSERT_UPDATE_SQL`] — `pay_voided` folds in the
+            // existing value (monotonic) so this re-import cannot un-void a
+            // canonically voided payment.
+            sqlx::query(RECEIPT_UPSERT_UPDATE_SQL)
+                .bind(p.receipt_total)
+                .bind(pay_date)
+                .bind(is_cancelled)
+                .bind(id)
+                .execute(&mut **tx)
+                .await?;
             id
         }
         None => {
@@ -905,6 +948,216 @@ mod tests {
         );
         let p = project_receipt(&row).unwrap();
         assert_eq!(p.status_name.as_deref(), Some("ยกเลิก"));
+    }
+
+    // -------------------------------------------------------------------
+    // `pay_voided` monotonicity — a legacy CT re-import must never
+    // resurrect a canonically voided payment (which would inflate the
+    // `service/shifts.rs` income sum, `WHERE pay_voided = false`).
+    // -------------------------------------------------------------------
+
+    /// Shape guard — runs with NO database, so the invariant is still
+    /// pinned on a machine where the behavioural tests below skip. Locks
+    /// both halves: the old value must be folded in, and the void instant
+    /// must be COALESCE'd rather than restamped.
+    #[test]
+    fn receipt_update_sql_is_monotonic_in_pay_voided() {
+        let sql = RECEIPT_UPSERT_UPDATE_SQL;
+        assert!(
+            sql.contains("pay_voided    = COALESCE(ht_payments.pay_voided, false) OR $3"),
+            "pay_voided must fold in the existing value — a bare assignment lets a \
+             legacy re-import un-void a canonical void; got: {sql}"
+        );
+        assert!(
+            !sql.contains("pay_voided    = $3"),
+            "pay_voided must never be assigned straight from the legacy flag; got: {sql}"
+        );
+        assert!(
+            sql.contains("THEN COALESCE(ht_payments.pay_voided_at, NOW())"),
+            "pay_voided_at must keep the ORIGINAL void instant across re-imports; got: {sql}"
+        );
+        assert!(
+            !sql.contains("THEN NOW()"),
+            "pay_voided_at must not be restamped to NOW() on every re-import; got: {sql}"
+        );
+    }
+
+    /// Column subset the behavioural tests need. Deliberately NOT the full
+    /// `ht_payments` shape — a TEMP TABLE only has to satisfy the statement
+    /// under test. `ON COMMIT DROP` plus the enclosing rollback means no
+    /// real row is ever touched, even when `DATABASE_URL` points at a
+    /// populated database (CI does exactly that).
+    const VOID_PROBE_DDL: &str = "CREATE TEMP TABLE ht_payments ( \
+             pay_id        INTEGER PRIMARY KEY, \
+             pay_cin_id    INTEGER NOT NULL, \
+             pay_amount    DECIMAL(12,2) NOT NULL, \
+             pay_method    VARCHAR(50) NOT NULL, \
+             pay_reference VARCHAR(100), \
+             pay_date      TIMESTAMP DEFAULT NOW(), \
+             pay_voided    BOOLEAN DEFAULT false, \
+             pay_voided_at TIMESTAMP \
+         ) ON COMMIT DROP";
+
+    /// Seed one `ht_payments` row in a whatever-state we want to re-import over.
+    const VOID_PROBE_SEED: &str = "INSERT INTO ht_payments \
+             (pay_id, pay_cin_id, pay_amount, pay_method, pay_reference, \
+              pay_date, pay_voided, pay_voided_at) \
+         VALUES (1, 10, 890.00, 'cash', 'B2604-0265', $1, $2, $3)";
+
+    /// Open a live PG connection for the behavioural tests, or `None` when
+    /// none is configured — `cargo test --lib` must stay green on a machine
+    /// with no database. CI DOES set `DATABASE_URL`
+    /// (`.github/workflows/docker-build.yml`), so these run for real there.
+    /// A connect failure skips rather than panics: an unreachable URL is an
+    /// environment problem, and the shape guard above still holds the line.
+    async fn void_probe_conn() -> Option<sqlx::PgConnection> {
+        use sqlx::Connection;
+        let url = std::env::var("SYNC_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .ok()?;
+        match sqlx::PgConnection::connect(&url).await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("pay_voided probe SKIPPED — cannot connect to PG: {e}");
+                None
+            }
+        }
+    }
+
+    /// Set up the shadowing TEMP TABLE and seed a row in `(voided,
+    /// voided_at)`. Returns the open transaction; the caller rolls back.
+    async fn void_probe_tx(
+        conn: &mut sqlx::PgConnection,
+        voided: Option<bool>,
+        voided_at: Option<NaiveDateTime>,
+    ) -> sqlx::Transaction<'_, sqlx::Postgres> {
+        use sqlx::Connection;
+        let mut tx = conn.begin().await.expect("begin");
+        sqlx::query(VOID_PROBE_DDL)
+            .execute(&mut *tx)
+            .await
+            .expect("create temp ht_payments");
+        // `pg_temp` is searched first for relations anyway; pin it
+        // explicitly so the shadow is not implementation-dependent.
+        sqlx::query("SET LOCAL search_path = pg_temp, public")
+            .execute(&mut *tx)
+            .await
+            .expect("set search_path");
+        sqlx::query(VOID_PROBE_SEED)
+            .bind(probe_ts(2026, 4, 26, 15, 0, 0))
+            .bind(voided)
+            .bind(voided_at)
+            .execute(&mut *tx)
+            .await
+            .expect("seed ht_payments row");
+        tx
+    }
+
+    fn probe_ts(y: i32, m: u32, d: u32, hh: u32, mm: u32, ss: u32) -> NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(hh, mm, ss)
+            .unwrap()
+    }
+
+    /// Run the EXACT mapper UPDATE, then read back the void state.
+    async fn run_receipt_update(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        is_cancelled: bool,
+    ) -> (Option<bool>, Option<NaiveDateTime>) {
+        sqlx::query(RECEIPT_UPSERT_UPDATE_SQL)
+            .bind(890.0_f64)
+            .bind(probe_ts(2026, 4, 26, 15, 0, 0))
+            .bind(is_cancelled)
+            .bind(1_i32)
+            .execute(&mut **tx)
+            .await
+            .expect("receipt UPDATE must execute");
+        sqlx::query_as("SELECT pay_voided, pay_voided_at FROM ht_payments WHERE pay_id = 1")
+            .fetch_one(&mut **tx)
+            .await
+            .expect("read back")
+    }
+
+    /// THE BUG: iHOTEL's customer-delete cascade (`UPDATE HT_Receipt_H SET
+    /// Receipt_c_no='C0000'`, COMPAT_CHEATSHEET §6.6) re-fires CT for a
+    /// receipt whose `status_name` is still `'ปกติ'`. Canonical void is
+    /// PG-only, so the re-import reports not-cancelled — and used to
+    /// resurrect the payment into the shift income sum.
+    #[tokio::test]
+    async fn canonical_void_survives_legacy_reimport_reporting_not_voided() {
+        let Some(mut conn) = void_probe_conn().await else {
+            return;
+        };
+        let voided_at = probe_ts(2026, 7, 25, 9, 15, 0);
+        let mut tx = void_probe_tx(&mut conn, Some(true), Some(voided_at)).await;
+        let (voided, at) = run_receipt_update(&mut tx, false).await;
+        assert_eq!(
+            voided,
+            Some(true),
+            "a canonically voided payment must stay voided when legacy re-imports \
+             the receipt as not-cancelled"
+        );
+        assert_eq!(at, Some(voided_at), "pay_voided_at must not be wiped");
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// The direction we DO preserve: legacy voiding a payment
+    /// (`status_name='ยกเลิก'` → `is_cancelled = true`) must still void
+    /// the canonical row. Monotonicity blocks un-voiding only.
+    #[tokio::test]
+    async fn legacy_void_still_propagates_to_unvoided_payment() {
+        let Some(mut conn) = void_probe_conn().await else {
+            return;
+        };
+        let mut tx = void_probe_tx(&mut conn, Some(false), None).await;
+        let (voided, at) = run_receipt_update(&mut tx, true).await;
+        assert_eq!(
+            voided,
+            Some(true),
+            "a legacy cancel must still void the canonical payment — the OR half \
+             of the monotonic fold"
+        );
+        assert!(
+            at.is_some(),
+            "a freshly voided row must get a pay_voided_at stamp"
+        );
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// An already-voided row re-imported as cancelled keeps its ORIGINAL
+    /// void instant — the flag is monotonic AND the timestamp is stable,
+    /// so audit trails don't slide forward on unrelated legacy touches.
+    #[tokio::test]
+    async fn pay_voided_at_is_preserved_not_restamped_across_reimport() {
+        let Some(mut conn) = void_probe_conn().await else {
+            return;
+        };
+        let voided_at = probe_ts(2026, 7, 25, 9, 15, 0);
+        let mut tx = void_probe_tx(&mut conn, Some(true), Some(voided_at)).await;
+        let (voided, at) = run_receipt_update(&mut tx, true).await;
+        assert_eq!(voided, Some(true));
+        assert_eq!(
+            at,
+            Some(voided_at),
+            "pay_voided_at must keep the original void instant, not be restamped to NOW()"
+        );
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// A NULL `pay_voided` (the column is nullable, `DEFAULT false`) must
+    /// normalise to `false`, not to NULL — `NULL OR false` would otherwise
+    /// make every `WHERE pay_voided = false` reader drop the payment.
+    #[tokio::test]
+    async fn null_pay_voided_normalises_to_false_not_null() {
+        let Some(mut conn) = void_probe_conn().await else {
+            return;
+        };
+        let mut tx = void_probe_tx(&mut conn, None, None).await;
+        let (voided, at) = run_receipt_update(&mut tx, false).await;
+        assert_eq!(voided, Some(false), "NULL pay_voided must not stay NULL");
+        assert_eq!(at, None);
+        tx.rollback().await.expect("rollback");
     }
 
     // -------------------------------------------------------------------
