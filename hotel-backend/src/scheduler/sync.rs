@@ -4028,6 +4028,29 @@ async fn sync_rooms(
 /// `View_Booking_Ds` joins `HT_Book_H` (header) with `HT_Book_Ds`
 /// (per-room detail), so every column in this projection must exist on
 /// one of those two base tables.
+/// NOT a dual-source hash — checked on the live server 2026-07-28, closing a
+/// concern raised (plausibly, but wrongly) from the truncated view definition
+/// in `docs/legacy-spike/schema/01-baseline-schema.txt:682`.
+///
+/// The worry was that the bookings idempotency gate compares header-derived
+/// dates (`derive_stay_range` off `HT_Book_H`) while this reconcile hash reads
+/// dates off the representative `View_Booking_Ds` LINE — which would let
+/// iHOTEL's `SAVE_EDIT` move the hash without moving any gated field, i.e. a
+/// gate ⊂ hash violation invisible to `sync::gate_guard`'s name-level check.
+///
+/// `sys.sql_modules` says otherwise — the view takes these two columns from the
+/// JOINED HEADER, not from the detail rows:
+///
+/// ```text
+/// CREATE VIEW [View_Booking_Ds] AS SELECT HT_Book_Ds.Book_No, …,
+///   HT_Book_H.Book_Date_in, HT_Book_H.Book_Date_out, …
+/// FROM HT_Book_Ds INNER JOIN HT_Book_H ON HT_Book_Ds.Book_No = HT_Book_H.Book_ID
+/// ```
+///
+/// So gate and hash read the SAME source and no unification is needed.
+/// (`HT_Book_Ds` has no `Book_Date_in`/`Book_Date_out` columns at all — its
+/// per-line dates are `Book_Room_Start`/`Book_Room_End`, which this projection
+/// deliberately does not read.)
 const BOOKINGS_RECONCILE_PROJECTION: &[&str] = &[
     "Book_No",
     "Book_Date",
