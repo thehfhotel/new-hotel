@@ -845,59 +845,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .copied()
         .collect();
 
-    // Per-table watermark mode is NOT SAFE as shipped — refuse rather than
-    // let an operator discover it via a permanent page storm. Two
-    // prerequisites are missing (issue #259):
-    //
-    //   1. The global `legacy_ct_state` row FREEZES under per-table mode —
-    //      `run_one_tick`'s once-per-tick advance is gated on
-    //      `!per_table_watermark`, so nothing ever writes it.
-    //   2. `run_watermark_watchdog` has no per-table awareness; `read_ct_state`
-    //      reads only that global row.
-    //
-    // Together the watchdog reads a frozen row, probes
-    // CHANGE_TRACKING_CURRENT_VERSION(), sees ct_current > watermark, and fires
-    // `CT watermark STUCK` every 30min FOREVER — its recovery condition
-    // compares against the same frozen row, so no all-clear can ever fire.
-    // After ~2 days the frozen value falls below MIN_VALID_VERSION and the
-    // retention gate below refuses to start for real; recovery needs
-    // --bootstrap.
-    //
-    // Migration 078's reseed (the expensive prerequisite) IS done. The fix for
-    // the remaining two is to advance the global row to min(per-table) once per
-    // tick so it stays a conservative floor. Until then this stays off; the
-    // wedge risk it would mitigate is loud, bounded (~2 days) and rare —
-    // see docs/coexistence/RUNBOOK-reconcile-flag-flips.md §2.
-    if per_table_watermark {
-        let msg = "SYNC_PER_TABLE_WATERMARK=true but per-table mode is NOT SAFE \
-                   as shipped — refusing to start. Under per-table mode the \
-                   global legacy_ct_state row is never advanced, while \
-                   run_watermark_watchdog still reads only that row, so it \
-                   would page `CT watermark STUCK` every 30min forever with no \
-                   possible all-clear, and rollback hard-fails once the frozen \
-                   row ages past CT retention (~2 days). Set \
-                   SYNC_PER_TABLE_WATERMARK=false. Tracking: issue #259. \
-                   See docs/coexistence/RUNBOOK-reconcile-flag-flips.md §2.";
-        tracing::error!(site = %site.id, "{msg}");
-        if let Some(s) = &slack {
-            let payload = SlackMessage::with_site_text(
-                &site.id,
-                format!(
-                    ":no_entry: *CT watcher REFUSED TO START — per-table watermark not safe* :no_entry:\n{msg}"
-                ),
-            );
-            let _ = s.send_message(&payload).await;
-        }
-        // Match the sibling guards: sleep before exit so Docker's
-        // `restart: unless-stopped` can't turn this into an alert flood.
-        tokio::time::sleep(Duration::from_secs(60)).await;
-        return Err(msg.into());
-    }
-
     // Pre-flight watermark. Under `SYNC_PER_TABLE_WATERMARK=true` the
-    // global row is decorative — a table wedged at an ancient version
-    // is invisible in it — so both gates below must reason about the
-    // MINIMUM per-table watermark instead. See `preflight_watermark`.
+    // global row is only a conservative FLOOR (`run_one_tick` writes it
+    // from `global_floor_from_per_table` after each tick, issue #259) —
+    // it can never be MORE current than the tables, but it is written
+    // by whichever process last ticked and is not allowlist-aware. Both
+    // gates below therefore reason about the MINIMUM per-table watermark
+    // across the tables THIS process polls. See `preflight_watermark`.
     let global_watermark = hotel_backend::sync::watermark::read_last_seen(&pg)
         .await
         .map_err(|e| format!("Failed to read CT watermark: {e}"))?;
@@ -2273,6 +2227,16 @@ async fn run_watermark_watchdog(
         .map(|v| v == "true")
         .unwrap_or(false);
 
+    // Issue #259 — per-table context on the pages. Same strict `== "true"`
+    // idiom as `run()` and `scheduler::sync::per_table_watermark_enabled`
+    // so the three can never disagree about which watermark is
+    // authoritative. The stall logic itself still reads the GLOBAL row:
+    // under per-table mode `run_one_tick` keeps that row at the MIN across
+    // tables, so it is the conservative floor and stalls in it are real.
+    let per_table_watermark = env::var("SYNC_PER_TABLE_WATERMARK")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
     let probe_timeout_streak_threshold = env::var("LEGACY_SYNC_PROBE_TIMEOUT_STREAK")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -2307,6 +2271,16 @@ async fn run_watermark_watchdog(
         probe_outage_escalation_secs = probe_outage_escalation.as_secs(),
         "[watchdog] Watermark-stall watchdog starting"
     );
+
+    // Emitted only when the flag is ON so global-mode log output stays
+    // byte-identical (the line above is the pre-#259 startup record).
+    if per_table_watermark {
+        tracing::info!(
+            site = %site_id,
+            "[watchdog] Per-table watermark mode — legacy_ct_state is the MIN-across-tables \
+             floor; stall pages will name the stalest table"
+        );
+    }
 
     loop {
         tokio::select! {
@@ -2531,6 +2505,13 @@ async fn run_watermark_watchdog(
                         backlog_since = None;
                         if stall_page_passes_cooldown(last_stall_alert, now, cooldown, true) {
                             let stuck_for = now.duration_since(prior_obs.observed_at);
+                            let stalest = stalest_table_context(
+                                per_table_watermark,
+                                &pg,
+                                ct_current,
+                                &site_id,
+                            )
+                            .await;
                             tracing::error!(
                                 site = %site_id,
                                 version = observation.last_seen_version,
@@ -2538,14 +2519,22 @@ async fn run_watermark_watchdog(
                                 reason,
                                 "[watchdog] Watermark monotonicity violation — paging operator"
                             );
+                            log_stalest_table(stalest.as_ref(), &site_id);
                             if let Some(s) = slack.as_ref() {
+                                let note = stalest
+                                    .as_ref()
+                                    .map(format_stalest_table_note)
+                                    .unwrap_or_default();
                                 let payload = SlackMessage::with_site_text(
                                     &site_id,
-                                    format_stall_alert_message(
-                                        observation.last_seen_version,
-                                        probe,
-                                        stuck_for,
-                                        stall_threshold,
+                                    format!(
+                                        "{}{note}",
+                                        format_stall_alert_message(
+                                            observation.last_seen_version,
+                                            probe,
+                                            stuck_for,
+                                            stall_threshold,
+                                        )
                                     ),
                                 );
                                 let _ = s.send_message(&payload).await;
@@ -2580,6 +2569,13 @@ async fn run_watermark_watchdog(
                                 "[watchdog] backlog observed — suppressing critical page until it persists past the streak gate"
                             );
                         } else if stall_page_passes_cooldown(last_stall_alert, now, cooldown, true) {
+                            let stalest = stalest_table_context(
+                                per_table_watermark,
+                                &pg,
+                                ct_current,
+                                &site_id,
+                            )
+                            .await;
                             tracing::error!(
                                 site = %site_id,
                                 version = observation.last_seen_version,
@@ -2589,14 +2585,22 @@ async fn run_watermark_watchdog(
                                 reason,
                                 "[watchdog] Watermark stall detected (backlog persisted) — paging operator"
                             );
+                            log_stalest_table(stalest.as_ref(), &site_id);
                             if let Some(s) = slack.as_ref() {
+                                let note = stalest
+                                    .as_ref()
+                                    .map(format_stalest_table_note)
+                                    .unwrap_or_default();
                                 let payload = SlackMessage::with_site_text(
                                     &site_id,
-                                    format_stall_alert_message(
-                                        observation.last_seen_version,
-                                        probe,
-                                        backlog_for,
-                                        stall_threshold,
+                                    format!(
+                                        "{}{note}",
+                                        format_stall_alert_message(
+                                            observation.last_seen_version,
+                                            probe,
+                                            backlog_for,
+                                            stall_threshold,
+                                        )
                                     ),
                                 );
                                 let _ = s.send_message(&payload).await;
@@ -2704,6 +2708,169 @@ async fn read_ct_state(pg: &PgPool) -> Result<WatermarkObservation, sqlx::Error>
         last_polled_at: row.1,
         observed_at: Instant::now(),
     })
+}
+
+/// One `legacy_ct_state_per_table` row as the watchdog reads it.
+///
+/// Deliberately a local mirror of `scheduler::sync::PerTableWatermark`
+/// (the two sit on opposite sides of the bin/lib split). The ranking in
+/// [`stalest_per_table_watermark`] MUST stay semantically identical to
+/// its sibling `scheduler::sync::stalest_per_table_watermark`, or the
+/// reconcile-tick health log and the watchdog page would name different
+/// tables for the same state.
+#[derive(Debug, Clone)]
+struct PerTableWatermarkRow {
+    table_name: String,
+    last_seen_version: i64,
+    last_polled_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Read every `legacy_ct_state_per_table` row. Dynamic `query_as` (not
+/// the `sqlx::query!` macro) so this needs no `.sqlx/` cache entry.
+async fn read_ct_state_per_table(pg: &PgPool) -> Result<Vec<PerTableWatermarkRow>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, i64, Option<chrono::DateTime<chrono::Utc>>)>(
+        "SELECT table_name, last_seen_version, last_polled_at \
+           FROM legacy_ct_state_per_table",
+    )
+    .fetch_all(pg)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(table_name, last_seen_version, last_polled_at)| PerTableWatermarkRow {
+                table_name,
+                last_seen_version,
+                last_polled_at,
+            },
+        )
+        .collect())
+}
+
+/// Pure picker: given every per-table watermark row, the legacy CT
+/// current version and `now`, return the STALEST table with its
+/// `(version_lag, poll_age_seconds)`.
+///
+/// Ranking, in order: largest `version_lag` (i.e. smallest
+/// `last_seen_version` — the table holding the global floor down), then
+/// largest poll age (oldest `last_polled_at`), then `table_name` so the
+/// pick is deterministic on a full tie. A NULL `last_polled_at` counts as
+/// infinitely old (`i64::MAX`), matching the never-polled handling in the
+/// global path.
+///
+/// The `.max(0)` clamp is load-bearing: `saturating_sub` on a SIGNED i64
+/// saturates at `i64::MIN`, not at zero, so a watermark AHEAD of
+/// `current_version` (a CT anomaly — the version is monotonic) would
+/// otherwise be reported as a nonsensical negative lag AND win the
+/// ranking. Mirrors `scheduler::sync::stalest_per_table_watermark`.
+fn stalest_per_table_watermark(
+    rows: &[PerTableWatermarkRow],
+    current_version: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<(&PerTableWatermarkRow, i64, i64)> {
+    rows.iter()
+        .map(|w| {
+            let version_lag = current_version.saturating_sub(w.last_seen_version).max(0);
+            let poll_age_seconds = w
+                .last_polled_at
+                .map(|polled| now.signed_duration_since(polled).num_seconds().max(0))
+                .unwrap_or(i64::MAX);
+            (w, version_lag, poll_age_seconds)
+        })
+        .max_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| a.2.cmp(&b.2))
+                // `max_by` keeps the LAST maximum, so invert the name
+                // comparison to land on the alphabetically-first table.
+                .then_with(|| b.0.table_name.cmp(&a.0.table_name))
+        })
+}
+
+/// Per-table context attached to a watchdog stall page (issue #259).
+/// Built ONLY when `SYNC_PER_TABLE_WATERMARK=true` — in global mode the
+/// page must stay byte-identical to its pre-#259 wording.
+struct StalestTableContext {
+    table: String,
+    last_seen_version: i64,
+    version_lag: i64,
+    poll_age_seconds: i64,
+    tables_tracked: usize,
+}
+
+/// Resolve the table holding the global floor down, for the page about
+/// to fire. Returns `None` in global mode (no query issued at all), when
+/// the per-table rows can't be read, and when they haven't been seeded —
+/// in every one of those cases the page still goes out, just without the
+/// extra line.
+async fn stalest_table_context(
+    per_table_watermark: bool,
+    pg: &PgPool,
+    ct_current: i64,
+    site_id: &str,
+) -> Option<StalestTableContext> {
+    if !per_table_watermark {
+        return None;
+    }
+    let rows = match read_ct_state_per_table(pg).await {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!(
+                site = %site_id,
+                error = %err,
+                "[watchdog] Failed to read legacy_ct_state_per_table — \
+                 paging without per-table context"
+            );
+            return None;
+        }
+    };
+    let (stalest, version_lag, poll_age_seconds) =
+        stalest_per_table_watermark(&rows, ct_current, chrono::Utc::now())?;
+    Some(StalestTableContext {
+        table: stalest.table_name.clone(),
+        last_seen_version: stalest.last_seen_version,
+        version_lag,
+        poll_age_seconds,
+        tables_tracked: rows.len(),
+    })
+}
+
+/// Structured log companion to [`format_stalest_table_note`]. A SEPARATE
+/// line rather than extra fields on the existing page log, so global-mode
+/// log output stays byte-identical (`ctx` is always `None` there).
+fn log_stalest_table(ctx: Option<&StalestTableContext>, site_id: &str) {
+    if let Some(ctx) = ctx {
+        tracing::error!(
+            site = %site_id,
+            table = %ctx.table,
+            table_version = ctx.last_seen_version,
+            version_lag = ctx.version_lag,
+            poll_age_seconds = ctx.poll_age_seconds,
+            tables_tracked = ctx.tables_tracked,
+            "[watchdog] Stalest per-table watermark is holding the GLOBAL floor down"
+        );
+    }
+}
+
+/// Extra Slack line naming the table that is holding the global floor
+/// down. Appended to [`format_stall_alert_message`]'s output; global
+/// mode appends the empty string instead, so its page is unchanged.
+fn format_stalest_table_note(ctx: &StalestTableContext) -> String {
+    let StalestTableContext {
+        table,
+        last_seen_version,
+        version_lag,
+        poll_age_seconds,
+        tables_tracked,
+    } = ctx;
+    let polled = if *poll_age_seconds == i64::MAX {
+        "never polled".to_string()
+    } else {
+        format!("last polled {poll_age_seconds}s ago")
+    };
+    format!(
+        "\nPer-table mode: stalest table is `{table}` at v{last_seen_version} \
+         ({version_lag} versions behind, {polled}; {tables_tracked} tables tracked). \
+         The global row is the MIN across tables, so this table is what is holding it down."
+    )
 }
 
 /// Operator-facing refusal message for the N1 live-bootstrap guard.
@@ -3033,6 +3200,72 @@ async fn run_one_tick(
                 ceiling = ?tick_ct_ceiling,
                 "[CT] Tick had table failures — holding GLOBAL watermark for retry next tick"
             );
+        }
+    }
+
+    // THE once-per-tick GLOBAL FLOOR write (issue #259). Per-table mode
+    // advances each table's own row inside `poll_table`; before this it
+    // left `legacy_ct_state` FROZEN forever, which blinded everything that
+    // reads that row — `run_watermark_watchdog` (paged `CT watermark STUCK`
+    // every 30min with no possible all-clear), `routes/health.rs` and
+    // `scripts/sync-status.sh` — and made a rollback to global mode
+    // hard-fail once the frozen version aged past
+    // CHANGE_TRACKING_MIN_VALID_VERSION (~2 days).
+    //
+    // What we write is deliberately NOT this tick's ceiling but the MINIMUM
+    // per-table watermark across the tables THIS process polls — a true
+    // conservative floor. It can never exceed any table's real progress, so
+    // resuming from it can only ever RE-READ (idempotent across the mapper
+    // stack), never skip. A table that errored this tick held its own row
+    // back, so the post-loop re-read picks that up for free: no separate
+    // `any_table_errored` gate is needed here, unlike the shared-row global
+    // path above.
+    //
+    // Shadow mode is excluded exactly as on the global path: every mapper TX
+    // was rolled back, so no watermark of any kind may move.
+    if per_table_watermark && !shadow_mode {
+        match hotel_backend::sync::watermark::read_per_table(pg).await {
+            Ok(after_tick) => {
+                let polled: Vec<&str> = mappers.iter().map(|m| m.table()).collect();
+                if let Some(floor) = global_floor_from_per_table(&after_tick, &polled) {
+                    // `advance` is monotonic (`WHERE last_seen_version <= $1`),
+                    // so a floor below the row's current value is a harmless
+                    // no-op rather than a regression.
+                    match hotel_backend::sync::watermark::advance(pg, floor).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                site = %site_id,
+                                from = global_last_seen,
+                                floor,
+                                tables = polled.len(),
+                                "Wrote GLOBAL CT watermark FLOOR from the per-table minimum"
+                            );
+                        }
+                        Err(err) => {
+                            // Log-only, same as the global path: a tick-level
+                            // write has no `legacy_sync_status.table_name` to
+                            // attribute to. The next tick recomputes the floor.
+                            tracing::error!(
+                                event_name = EV_WATERMARK_ADVANCE_FAIL,
+                                site = %site_id,
+                                new_version = floor,
+                                error = %err,
+                                "Failed to write GLOBAL CT watermark floor"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                // The per-table rows — the real watermarks — are already
+                // committed; only the derived floor is missing this tick.
+                tracing::warn!(
+                    site = %site_id,
+                    error = %err,
+                    "Failed to re-read per-table CT watermarks for the GLOBAL floor \
+                     — global row not written this tick"
+                );
+            }
         }
     }
 
@@ -5457,6 +5690,35 @@ fn quiet_table_watermark_target(
     }
 }
 
+/// Conservative global floor for per-table mode: the minimum watermark
+/// across the tables this process polls. `None` when there is nothing
+/// safe to write (an empty table list — e.g. an allowlist that matched
+/// no mapper — must not turn an empty `min()` into a fabricated 0).
+///
+/// This is what keeps `legacy_ct_state` moving while
+/// `SYNC_PER_TABLE_WATERMARK=true` (issue #259). The MINIMUM is the only
+/// safe choice: it can never exceed any table's real progress, so a
+/// process resuming from the global row — the watchdog reading it, a
+/// rollback to global mode, `/health`, `scripts/sync-status.sh` — can
+/// only ever re-read CT rows that were already applied (idempotent
+/// across the mapper stack), never skip one. Writing the MAX, or this
+/// tick's ceiling, would recreate the mid-loop-arrival silent-drop class
+/// documented on [`global_watermark_target`].
+///
+/// A table with no row yet counts as `0` — same resume semantics as
+/// `run_one_tick`'s `unwrap_or(0)` and `preflight_watermark` — which
+/// drags the floor to 0. That is correct and harmless: [`advance`]'s
+/// monotonic `WHERE last_seen_version <= $1` turns a 0 floor into a
+/// no-op on an already-advanced row.
+///
+/// [`advance`]: hotel_backend::sync::watermark::advance
+fn global_floor_from_per_table(per_table: &HashMap<String, i64>, tables: &[&str]) -> Option<i64> {
+    tables
+        .iter()
+        .map(|t| per_table.get(*t).copied().unwrap_or(0))
+        .min()
+}
+
 /// The watermark the STARTUP gates (cold-replay refusal,
 /// retention-overflow refusal) must reason about.
 ///
@@ -5464,10 +5726,11 @@ fn quiet_table_watermark_target(
 ///
 /// Per-table mode: the MINIMUM `last_seen_version` across the tables
 /// this process will actually poll — the true floor of the replay. The
-/// global row is decorative once `SYNC_PER_TABLE_WATERMARK=true`, so
-/// pre-flighting on it hid exactly the failure the per-table split
-/// exists to expose: one table wedged at an ancient version while the
-/// global row looks current. A table with NO row yet defaults to `0`
+/// global row is a derived, allowlist-blind echo of that minimum once
+/// `SYNC_PER_TABLE_WATERMARK=true` (see [`global_floor_from_per_table`]),
+/// so pre-flighting on it would hide exactly the failure the per-table
+/// split exists to expose: one table wedged at an ancient version while
+/// the global row looks current. A table with NO row yet defaults to `0`
 /// (matching `run_one_tick`'s `unwrap_or(0)` resume semantics), which
 /// drags the floor to 0 and correctly trips the cold-replay refusal —
 /// the fix is to seed its row, the way migration 056 did for
@@ -6120,6 +6383,250 @@ mod tests {
     fn preflight_watermark_empty_table_list_falls_back_to_global() {
         let map = per_table_map(&[("HT_Customers", 30_788)]);
         assert_eq!(preflight_watermark(true, 30_788, &map, &[]), 30_788);
+    }
+
+    // ========================================================================
+    // Issue #259 — per-table mode must keep the GLOBAL row moving, as a
+    // conservative floor.
+    //
+    // Before this, `run_one_tick`'s advance was gated on
+    // `!per_table_watermark`, so `legacy_ct_state` froze the moment the flag
+    // went on. `run_watermark_watchdog` reads only that row: it saw
+    // ct_current > watermark forever, paged `CT watermark STUCK` every 30min,
+    // and its recovery condition compared against the SAME frozen row so no
+    // all-clear could ever fire. After ~2 days the frozen value fell below
+    // CHANGE_TRACKING_MIN_VALID_VERSION and rollback to global mode
+    // hard-failed, needing --bootstrap.
+    // ========================================================================
+
+    /// THE defining property: the floor is the MIN, never the MAX. Writing
+    /// the max would let the global row claim progress `HT_Customers` never
+    /// made — the same shape as the 2026-07-11 mid-loop-arrival loss, just
+    /// via the rollback/watchdog path instead of the resume path.
+    #[test]
+    fn global_floor_from_per_table_takes_the_minimum_not_the_maximum() {
+        let map = per_table_map(&[("HT_Customers", 30_788), ("HT_Book_Pro", 30_801)]);
+        assert_eq!(
+            global_floor_from_per_table(&map, &["HT_Customers", "HT_Book_Pro"]),
+            Some(30_788),
+            "the floor must be the laggard's watermark, not the leader's"
+        );
+    }
+
+    /// A table with no row yet resumes from 0, so the floor is 0. Harmless:
+    /// `watermark::advance` is monotonic (`WHERE last_seen_version <= $1`),
+    /// so a 0 floor is a no-op against an already-advanced row — and it is
+    /// the honest answer, since that table genuinely has no proven progress.
+    #[test]
+    fn global_floor_from_per_table_unseeded_table_drags_floor_to_zero() {
+        let map = per_table_map(&[("HT_Customers", 30_788), ("HT_Book_H", 30_788)]);
+        assert_eq!(
+            global_floor_from_per_table(&map, &["HT_Customers", "HT_Book_H", "HT_Book_Pro"]),
+            Some(0),
+            "unseeded HT_Book_Pro has no proven progress, so the floor is 0"
+        );
+    }
+
+    /// Nothing polled ⇒ nothing safe to write. Must NOT fabricate `Some(0)`
+    /// out of an empty `min()`.
+    #[test]
+    fn global_floor_from_per_table_empty_table_list_is_none() {
+        let map = per_table_map(&[("HT_Customers", 30_788)]);
+        assert_eq!(global_floor_from_per_table(&map, &[]), None);
+    }
+
+    /// Only the tables THIS process polls count. Under
+    /// `LEGACY_SYNC_TABLE_ALLOWLIST` a stale row for a table nobody polls
+    /// (retired mapper, or a table owned by the other site's worker) must
+    /// not drag the floor down and re-freeze the global row.
+    #[test]
+    fn global_floor_from_per_table_ignores_tables_this_process_does_not_poll() {
+        let map = per_table_map(&[
+            ("HT_Customers", 30_788),
+            ("HT_Book_Pro", 30_801),
+            // Not in the allowlist below — wedged at an ancient version.
+            ("HT_Room_Status", 12_000),
+        ]);
+        assert_eq!(
+            global_floor_from_per_table(&map, &["HT_Customers", "HT_Book_Pro"]),
+            Some(30_788),
+            "an allowlisted-out table's stale row must not hold the floor down"
+        );
+    }
+
+    // ========================================================================
+    // Issue #259 (task 2) — when the watchdog DOES page under per-table
+    // mode, it must name the table holding the floor down. Semantics mirror
+    // `scheduler::sync::stalest_per_table_watermark` so the reconcile-tick
+    // health log and the watcher page never disagree.
+    // ========================================================================
+
+    fn watermark_row(
+        table: &str,
+        version: i64,
+        polled_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> PerTableWatermarkRow {
+        PerTableWatermarkRow {
+            table_name: table.to_string(),
+            last_seen_version: version,
+            last_polled_at: polled_at,
+        }
+    }
+
+    /// Lowest `last_seen_version` (largest lag) wins — that is the table
+    /// pinning the global floor.
+    #[test]
+    fn stalest_per_table_watermark_picks_the_lowest_version() {
+        let now = chrono::Utc::now();
+        let rows = vec![
+            watermark_row("HT_Customers", 30_788, Some(now)),
+            watermark_row("HT_Book_Pro", 30_801, Some(now)),
+            watermark_row("HT_Book_H", 12_000, Some(now)),
+        ];
+        let (stalest, version_lag, _) =
+            stalest_per_table_watermark(&rows, 30_801, now).expect("non-empty input");
+        assert_eq!(stalest.table_name, "HT_Book_H");
+        assert_eq!(version_lag, 18_801);
+    }
+
+    /// Equal versions ⇒ the table that hasn't been polled for longest is
+    /// the more suspicious one.
+    #[test]
+    fn stalest_per_table_watermark_breaks_version_tie_on_oldest_poll() {
+        let now = chrono::Utc::now();
+        let rows = vec![
+            watermark_row(
+                "HT_Customers",
+                30_788,
+                Some(now - chrono::Duration::seconds(10)),
+            ),
+            watermark_row(
+                "HT_Book_H",
+                30_788,
+                Some(now - chrono::Duration::seconds(3_600)),
+            ),
+        ];
+        let (stalest, _, poll_age_seconds) =
+            stalest_per_table_watermark(&rows, 30_801, now).expect("non-empty input");
+        assert_eq!(stalest.table_name, "HT_Book_H");
+        assert_eq!(poll_age_seconds, 3_600);
+    }
+
+    /// A row that has NEVER been polled is infinitely old — it must beat
+    /// any finite poll age, same as the global path's never-polled handling.
+    #[test]
+    fn stalest_per_table_watermark_treats_never_polled_as_oldest() {
+        let now = chrono::Utc::now();
+        let rows = vec![
+            watermark_row(
+                "HT_Customers",
+                30_788,
+                Some(now - chrono::Duration::seconds(86_400)),
+            ),
+            watermark_row("HT_Book_H", 30_788, None),
+        ];
+        let (stalest, _, poll_age_seconds) =
+            stalest_per_table_watermark(&rows, 30_801, now).expect("non-empty input");
+        assert_eq!(stalest.table_name, "HT_Book_H");
+        assert_eq!(
+            poll_age_seconds,
+            i64::MAX,
+            "NULL last_polled_at is treated as infinitely old"
+        );
+    }
+
+    /// Everything equal ⇒ the pick must not depend on row order (PG returns
+    /// `legacy_ct_state_per_table` unordered). Alphabetically first wins.
+    #[test]
+    fn stalest_per_table_watermark_is_deterministic_on_a_full_tie() {
+        let now = chrono::Utc::now();
+        let rows = vec![
+            watermark_row("HT_Rooms", 30_788, Some(now)),
+            watermark_row("HT_Book_H", 30_788, Some(now)),
+            watermark_row("HT_Customers", 30_788, Some(now)),
+        ];
+        let (stalest, _, _) =
+            stalest_per_table_watermark(&rows, 30_801, now).expect("non-empty input");
+        assert_eq!(stalest.table_name, "HT_Book_H");
+
+        let reversed: Vec<PerTableWatermarkRow> = rows.into_iter().rev().collect();
+        let (stalest_reversed, _, _) =
+            stalest_per_table_watermark(&reversed, 30_801, now).expect("non-empty input");
+        assert_eq!(
+            stalest_reversed.table_name, "HT_Book_H",
+            "the pick must not depend on the order PG returned the rows in"
+        );
+    }
+
+    /// Per-table rows not seeded yet (pre-migration-050 / pre-bootstrap):
+    /// no context, and the page still goes out without the extra line.
+    #[test]
+    fn stalest_per_table_watermark_is_none_for_no_rows() {
+        assert!(stalest_per_table_watermark(&[], 30_801, chrono::Utc::now()).is_none());
+    }
+
+    /// A watermark AHEAD of the CT current version is a CT anomaly. The lag
+    /// must clamp at 0 — `saturating_sub` on a SIGNED i64 saturates at
+    /// `i64::MIN`, which would both print nonsense and lose the ranking.
+    #[test]
+    fn stalest_per_table_watermark_clamps_negative_lag_to_zero() {
+        let now = chrono::Utc::now();
+        let rows = vec![watermark_row("HT_Customers", 30_900, Some(now))];
+        let (_, version_lag, _) =
+            stalest_per_table_watermark(&rows, 30_801, now).expect("non-empty input");
+        assert_eq!(version_lag, 0, "negative lag clamps to 0, not i64::MIN");
+    }
+
+    /// The note is a suffix: it must start with a newline so appending it
+    /// to `format_stall_alert_message` can't mangle that message's last
+    /// line, and it must name the table + its version.
+    #[test]
+    fn format_stalest_table_note_names_the_table_and_appends_cleanly() {
+        let note = format_stalest_table_note(&StalestTableContext {
+            table: "HT_Book_H".to_string(),
+            last_seen_version: 12_000,
+            version_lag: 18_801,
+            poll_age_seconds: 3_600,
+            tables_tracked: 19,
+        });
+        assert!(note.starts_with('\n'), "note must append as its own line");
+        assert!(note.contains("HT_Book_H"), "must name the table; got: {note}");
+        assert!(note.contains("v12000"), "must give its version; got: {note}");
+        assert!(note.contains("18801 versions behind"), "got: {note}");
+        assert!(note.contains("last polled 3600s ago"), "got: {note}");
+    }
+
+    /// `i64::MAX` is the never-polled sentinel, not a poll age — printing
+    /// "last polled 9223372036854775807s ago" would be operator-hostile.
+    #[test]
+    fn format_stalest_table_note_renders_never_polled_sentinel() {
+        let note = format_stalest_table_note(&StalestTableContext {
+            table: "HT_Book_Pro".to_string(),
+            last_seen_version: 0,
+            version_lag: 30_801,
+            poll_age_seconds: i64::MAX,
+            tables_tracked: 19,
+        });
+        assert!(note.contains("never polled"), "got: {note}");
+        assert!(!note.contains("9223372036854775807"), "got: {note}");
+    }
+
+    /// Global mode contributes NO note, so the page must be byte-identical
+    /// to the pre-#259 message. (`stalest_table_context` returns `None`
+    /// without touching PG when the flag is off; this pins the
+    /// concatenation half of that contract.)
+    #[test]
+    fn stall_page_is_byte_identical_when_per_table_note_is_absent() {
+        let base = format_stall_alert_message(
+            17_209,
+            Some(17_250),
+            Duration::from_secs(1_800),
+            Duration::from_secs(1_800),
+        );
+        let note = None::<&StalestTableContext>
+            .map(format_stalest_table_note)
+            .unwrap_or_default();
+        assert_eq!(format!("{base}{note}"), base);
     }
 
     #[test]

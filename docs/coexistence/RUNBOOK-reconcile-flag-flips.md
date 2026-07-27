@@ -122,58 +122,65 @@ canonical write is correct and idempotent; only further healing stops.
 
 ---
 
-## 2. Flip B — per-table CT watermarks (**BLOCKED — DO NOT ENABLE**)
+## 2. Flip B — per-table CT watermarks (safe, but OFF by default)
 
-Flag: `SYNC_PER_TABLE_WATERMARK`. **Leave at `false` on both sites.**
+Flag: `SYNC_PER_TABLE_WATERMARK`. Currently `false` on both sites. It is now
+**safe to enable** — issue #259 closed the two defects that made it dangerous —
+but nobody has needed it yet, so it stays off.
 
-Turning this on today causes a permanent alert storm and a rollback cliff. Two
-prerequisites are missing:
+### What it buys
 
-1. **The global row freezes.** `bin/sync.rs` gates the once-per-tick global
-   advance on `!per_table_watermark`, so under per-table mode
-   `legacy_ct_state.last_seen_version` / `last_polled_at` are never written.
-2. **The watchdog is not per-table aware.** `run_watermark_watchdog` has zero
-   per-table handling, and `read_ct_state` reads only
-   `SELECT last_seen_version, last_polled_at FROM legacy_ct_state WHERE id = 1`.
+Each table advances its own `legacy_ct_state_per_table` row, so a row-lock wedge
+on one hot table no longer gates the others. That matters because the
+2026-07-27 correctness fix deliberately made one errored table hold the **whole**
+global advance — no data loss, but a full stall. Per-table decouples that.
 
-Together: the watchdog reads a frozen row, probes
-`CHANGE_TRACKING_CURRENT_VERSION()`, sees `ct_current > watermark`, and fires
-`:rotating_light: CT watermark STUCK` every 30 minutes **forever** — the
-recovery condition compares against that same frozen row, so no all-clear can
-ever fire. After ~2 days the frozen value falls below
-`CHANGE_TRACKING_MIN_VALID_VERSION`, at which point the startup gate legitimately
-refuses to start and recovery needs `--bootstrap`.
+Precedent: a 74-minute `HT_Book_H` row-lock on `Book_ID='R015142'`, 2026-05-14.
 
-### What IS already done
+### Why it's off anyway
 
-Migration 078's reseed — the expensive prerequisite — is complete and verified.
-All 19 `legacy_ct_state_per_table` rows on both sites were force-reset from the
-global watermark (hfville 9060 → 37989; hotelnew 17209 → 67695), clearing the
-retention-overflow storm stale rows would otherwise cause. That work does not
-expire; it simply isn't sufficient alone.
+The stall it prevents is loud (`CT watermark STUCK` within ~30 min), bounded
+(~2 days of CT retention before it turns destructive), and rare (that one
+instance in ~2.5 months, comfortably inside the budget). Turning per-table on
+trades a well-understood, detectable failure for a mode with no production
+hours. Enable it if a wedge actually happens, or when you want the extra
+headroom — not as routine hygiene.
 
-### Why the other two are not being fixed now (decision, 2026-07-27)
+### What was fixed (#259, 2026-07-27)
 
-Per-table watermarks mitigate one wedged table gating the others. After the
-2026-07-27 fix that scenario is **loud** (`CT watermark STUCK` within ~30 min),
-**bounded** (~2 days of CT retention before it turns destructive), and **rare**
-(one instance in ~2.5 months — a 74-minute `HT_Book_H` row-lock on 2026-05-14,
-comfortably inside the budget).
+1. **The global row no longer freezes.** `run_one_tick` now writes it as a
+   conservative floor under per-table mode: the **minimum** `last_seen_version`
+   across the tables this process polls (`global_floor_from_per_table`). Since
+   `watermark::advance` is monotonic (`WHERE last_seen_version <= $1`), a floor
+   below the current value is a harmless no-op. Because the floor never exceeds
+   any table's real progress, resuming from it can only re-read (idempotent),
+   never skip.
+   This one change also repairs `/health`, `scripts/sync-status.sh`, and the
+   watchdog — all three read that row, and it advances again.
+2. **The watchdog names the stalest table.** When it does fire under per-table
+   mode, the alert identifies the table holding the floor down (lowest version,
+   tie-break on oldest poll). Output is byte-identical when the flag is off.
 
-Before that fix, a wedged table caused *silent, unbounded* data loss. The change
-converted silent loss into a detectable, recoverable stall. Building the two
-prerequisites means adding fresh code to the most correctness-critical path in
-the system to mitigate a risk that just became materially safer. The owner
-accepted the residual exposure.
+The startup guard that used to refuse `SYNC_PER_TABLE_WATERMARK=true` is
+**removed** — it existed only because of those two defects.
 
-Revisit if a wedge actually occurs.
+Migration 078's reseed remains done: all 19 rows on both sites were force-reset
+from the global watermark (hfville 9060 → 37989; hotelnew 17209 → 67695).
 
-### Guard
+### If you do enable it
 
-A startup guard refuses to start when `SYNC_PER_TABLE_WATERMARK=true`, naming
-these prerequisites — joining the existing refuse-to-start guards (cold replay,
-retention overflow, live bootstrap, CT-enablement gap). The flag cannot be
-turned on by accident.
+Flip Ville first, per §0. Then watch for 24h:
+
+- Zero `:rotating_light: CT retention overflow` pages. Any at all ⇒ roll back;
+  the reseed didn't hold.
+- The **global** row still advancing — that's the floor write working, and it's
+  what keeps rollback cheap. If it stops, roll back within 2 days or the startup
+  gate will refuse on the next restart.
+- Per-table rows clustered, none drifting far behind.
+- Quiet tables (`HT_Cupon`, `HT_Deposit`, `HT_Bill_Debt_H/Ds`,
+  `HT_CheckIn_Product`, `HT_Receipt_H` — all zero-traffic on Ville) advancing to
+  the tick ceiling, not frozen. This is the part with the least production
+  evidence: a frozen quiet table sinks below retention and pages days later.
 
 ---
 
