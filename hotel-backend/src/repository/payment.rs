@@ -28,7 +28,22 @@ pub struct PaymentRow {
 /// Mirrors the columns the route reads via the `list_payments` SELECT.
 #[derive(Debug, Clone)]
 pub struct CheckInBillingRow {
+    /// `ht_checkins.cin_total_amount` — mirrors legacy
+    /// `HT_CheckIn_H.Total_Price_Net`, which is **Room + Product by
+    /// definition**. NOT a room-only basis; see [`Self::cin_room_amount`].
     pub cin_total_amount: Option<f64>,
+    /// `ht_checkins.cin_room_amount` (migration 079) — mirrors legacy
+    /// `HT_CheckIn_H.Total_Price_Room`, the ROOM-ONLY leg of the folio.
+    /// This is the room basis `routes::new_checkins::folio_breakdown`
+    /// uses so `net = room + product` counts each POS line exactly once.
+    ///
+    /// `None` means the sync has never projected this folio's
+    /// `Total_Price_Room` (a row predating migration 079 that has had no
+    /// CT event since, or an app-originated check-in before its first
+    /// read-back tick) — callers fall back to [`Self::cin_total_amount`].
+    /// `Some(0.0)` is a genuine zero room charge and must NOT be treated
+    /// as absent.
+    pub cin_room_amount: Option<f64>,
     pub cin_rate_per_night: Option<f64>,
     pub nights: Option<i32>,
 }
@@ -185,20 +200,27 @@ impl PaymentRepository for PgPaymentRepository {
         pool: &PgPool,
         cin_id: i32,
     ) -> Result<Option<CheckInBillingRow>, sqlx::Error> {
-        let rec = sqlx::query!(
-            r#"SELECT cin_id, cin_total_amount::float8 as cin_total_amount, cin_rate_per_night::float8 as cin_rate_per_night,
-            (COALESCE(cin_checkout_time, cin_expected_checkout)::date - cin_checkin_time::date) as nights
-        FROM ht_checkins WHERE cin_id = $1"#,
-            cin_id
+        // Dynamic `query_as` rather than the `query!` macro so adding
+        // `cin_room_amount` (migration 079) needs no `.sqlx/` regeneration.
+        let rec = sqlx::query_as::<_, (Option<f64>, Option<f64>, Option<f64>, Option<i32>)>(
+            "SELECT cin_total_amount::float8, cin_room_amount::float8, \
+                    cin_rate_per_night::float8, \
+                    (COALESCE(cin_checkout_time, cin_expected_checkout)::date \
+                     - cin_checkin_time::date) AS nights \
+               FROM ht_checkins WHERE cin_id = $1",
         )
+        .bind(cin_id)
         .fetch_optional(pool)
         .await?;
 
-        Ok(rec.map(|r| CheckInBillingRow {
-            cin_total_amount: r.cin_total_amount,
-            cin_rate_per_night: r.cin_rate_per_night,
-            nights: r.nights,
-        }))
+        Ok(
+            rec.map(|(total, room, rate, nights)| CheckInBillingRow {
+                cin_total_amount: total,
+                cin_room_amount: room,
+                cin_rate_per_night: rate,
+                nights,
+            }),
+        )
     }
 
     async fn list_for_checkin(

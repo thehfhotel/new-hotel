@@ -265,6 +265,14 @@ CREATE TABLE IF NOT EXISTS ht_checkins (
     cin_status VARCHAR(20) DEFAULT 'active',
     cin_rate_per_night DECIMAL(10,2) DEFAULT 0,
     cin_total_amount DECIMAL(12,2) DEFAULT 0,
+    -- Migration 079 — ROOM-ONLY folio total, mirrored from legacy
+    -- `HT_CheckIn_H.Total_Price_Room`. `cin_total_amount` above mirrors
+    -- `Total_Price_Net` = Room + Product, so it is NOT a usable room basis once
+    -- a POS line exists. Deliberately nullable with NO DEFAULT: NULL means
+    -- "never projected" and makes the folio read path fall back to
+    -- `cin_total_amount`, whereas 0 is a legitimate room charge on a
+    -- product-only folio. See migrations/pg/079_ht_checkins_room_amount.sql.
+    cin_room_amount DECIMAL(12,2),
     cin_paid_amount DECIMAL(12,2) DEFAULT 0,
     cin_payment_method VARCHAR(50),
     cin_payment_status VARCHAR(50),
@@ -2666,6 +2674,16 @@ ON CONFLICT (table_name) DO UPDATE
 
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('078', '078_reseed_ct_state_per_table.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- -----------------------------------------------------------------------------
+-- Migration 079 — `ht_checkins.cin_room_amount` (room-only folio total mirrored
+-- from legacy `HT_CheckIn_H.Total_Price_Room`). The column is declared inline in
+-- the `ht_checkins` CREATE TABLE above, so a fresh seed already has it; this row
+-- just tells scripts/migrate.sh not to re-apply the ALTER.
+-- -----------------------------------------------------------------------------
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('079', '079_ht_checkins_room_amount.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================

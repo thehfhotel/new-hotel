@@ -472,6 +472,166 @@ pub struct CheckoutQuote {
     pub balance: f64,
 }
 
+/// The ROOM leg of a folio: the room charge and the per-night rate to display
+/// alongside it. Output of [`room_basis`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RoomBasis {
+    /// Room-only charge for the whole stay. Never includes POS products.
+    room_total: f64,
+    /// Per-night rate to SHOW on the folio/receipt. Equals the stored
+    /// `cin_rate_per_night` when that is usable, otherwise it is derived
+    /// back out of `room_total` so the receipt still reads sensibly.
+    display_rate: f64,
+}
+
+/// Derive the room leg of a folio. Pure — no I/O — so the money rules below
+/// are unit-testable without a pool.
+///
+/// ## Why `cin_total_amount` is NOT the room basis
+///
+/// `cin_total_amount` mirrors legacy `HT_CheckIn_H.Total_Price_Net`
+/// (`sync/mappers/checkin.rs::project_aggregate`), and iHOTEL defines
+/// `Total_Price_Net = Total_Price_Room + Total_Price_Product`, rewriting the
+/// whole family on EVERY payment/sale change
+/// (`docs/legacy-app/COMPAT_CHEATSHEET.md` §359-362). Using it as the room
+/// basis and then adding `product_total` on top DOUBLE-COUNTS every POS line
+/// iHOTEL has already folded in — and, via `CheckOutCommand.room_price_total`
+/// → `writeback/recipes/checkout.rs`, stamps the inflated figure into the
+/// SHARED legacy DB as `Total_Price_Room`, which the next Change-Tracking tick
+/// reads straight back into `cin_total_amount`.
+///
+/// `cin_room_amount` (migration 079) mirrors `Total_Price_Room` directly, so
+/// `net = room_basis + product_total` is exact AND state-free: a line iHOTEL
+/// has already folded is excluded from the room leg by construction; a line we
+/// originated that iHOTEL has not folded yet arrives via `product_total`.
+/// Every line is counted exactly once regardless of originating app or how far
+/// the sync has progressed.
+///
+/// ## Precedence
+///
+/// 1. `rate > 0` → `rate * nights`. Unchanged by 079; a stored per-night rate
+///    is already room-only, so it never had the double-count problem.
+/// 2. `cin_room_amount` when present — the exact room leg.
+/// 3. `cin_total_amount` — the pre-079 behaviour, kept as the fallback for
+///    rows the sync has never projected `Total_Price_Room` for (rows older
+///    than 079 with no CT event since; app-originated check-ins before their
+///    first read-back tick; historical checked-out folios that may never get
+///    another CT event). It is EXACT whenever the folio has no POS line, and
+///    that is every live folio today — `ht_pos_sales` and `ht_products` are
+///    empty on both sites. Where POS lines do exist it degrades to the old
+///    over-count rather than to a wrong-by-construction zero.
+///
+/// NULL is deliberately NOT coerced to 0: that would zero out the room charge
+/// on every folio predating 079 — a catastrophic UNDERcharge. Conversely
+/// `Some(0.0)` is honoured as a real zero, because legacy `Total_Price_Room`
+/// is `float NOT NULL DEFAULT 0` and a product-only folio legitimately has a
+/// zero room leg.
+fn room_basis(
+    rate_per_night: Option<f64>,
+    nights: i32,
+    cin_room_amount: Option<f64>,
+    cin_total_amount: Option<f64>,
+) -> RoomBasis {
+    let nights = nights.max(1);
+    let rate = rate_per_night.unwrap_or(0.0);
+    // M1 task #34: `cin_rate_per_night` is 0/NULL for ~100% of live check-ins;
+    // the real stay revenue lives on the folio header. Fall back to it when the
+    // per-night rate is unusable so the folio room line is not silently zero.
+    // When the fallback fires, derive the displayed per-night rate from the
+    // resulting room total so the receipt still shows a sensible "x/night".
+    if rate > 0.0 {
+        return RoomBasis {
+            room_total: rate * nights as f64,
+            display_rate: rate,
+        };
+    }
+    let room_total = cin_room_amount.or(cin_total_amount).unwrap_or(0.0);
+    RoomBasis {
+        room_total,
+        display_rate: room_total / nights as f64,
+    }
+}
+
+/// The client-submitted / room-only money basis used when
+/// `CHECKOUT_SERVER_TOTAL_ENABLED` is OFF — i.e. today's pre-flag behaviour.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ClientCheckoutTotals {
+    room_price_total: f64,
+    total_amount: Option<f64>,
+    net_total: f64,
+    pay_total: f64,
+    balance: f64,
+}
+
+/// The money fields `check_out` threads into [`CheckOutCommand`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CheckoutCommandTotals {
+    /// **Reaches iHOTEL.** `writeback/recipes/checkout.rs` stamps this into
+    /// the shared legacy DB as `HT_CheckIn_H.Total_Price_Room`.
+    room_price_total: f64,
+    total_amount: Option<f64>,
+    /// **Reaches iHOTEL** as `Total_Price_Product`.
+    product_total: f64,
+    /// **Reaches iHOTEL** as `Total_Price_Net` (and drives
+    /// `Total_Price_Balance`).
+    net_total: f64,
+    pay_total: f64,
+    balance: f64,
+}
+
+/// Pick the money basis for `CheckOutCommand`: the full server folio when
+/// `CHECKOUT_SERVER_TOTAL_ENABLED` is on (`folio = Some(_)`), otherwise the
+/// pre-flag client basis. Pure so the legacy-corruption guard below is
+/// testable without an `AppState`.
+///
+/// ## Why `room_price_total` must come from the folio too
+///
+/// Four of these six fields are not just recorded totals — they are written
+/// into the SHARED legacy database by `writeback/recipes/checkout.rs`:
+///
+/// ```text
+/// UPDATE [HT_CheckIn_H] SET [Total_Price_Room]={room_price_total},
+///                           [Total_Price_Product]={product_total},
+///                           [Total_Price_Net]={net_total}, ...
+/// ```
+///
+/// The bug this helper exists to prevent: `room_price_total` used to be
+/// computed once from `cin_total_amount` BEFORE the flag was read and was
+/// never replaced on the flag-on path. Since `cin_total_amount` mirrors
+/// `Total_Price_Net` (= Room + Product — see [`room_basis`]), a folio with any
+/// POS line stamped iHOTEL with a product-INCLUSIVE `Total_Price_Room` while
+/// `Total_Price_Product` carried the products AGAIN. The next Change-Tracking
+/// tick reads those columns straight back into `cin_room_amount` /
+/// `cin_total_amount`, so the error is not merely displayed — it is persisted
+/// into the legacy source and compounds on every subsequent read.
+///
+/// Taking all six from one `folio_breakdown` result keeps
+/// `net = room + product` internally consistent on both sides of the boundary,
+/// which makes the legacy read-back a fixpoint.
+fn checkout_command_totals(
+    folio: Option<&CheckoutQuote>,
+    client: ClientCheckoutTotals,
+) -> CheckoutCommandTotals {
+    match folio {
+        Some(f) => CheckoutCommandTotals {
+            room_price_total: f.room_total,
+            total_amount: Some(f.net_total),
+            product_total: f.product_total,
+            net_total: f.net_total,
+            pay_total: f.pay_total,
+            balance: f.balance,
+        },
+        None => CheckoutCommandTotals {
+            room_price_total: client.room_price_total,
+            total_amount: client.total_amount,
+            product_total: 0.0,
+            net_total: client.net_total,
+            pay_total: client.pay_total,
+            balance: client.balance,
+        },
+    }
+}
+
 /// Compute the full server-authoritative checkout folio for a check-in — the
 /// single source for the quote endpoint AND the flag-on checkout path. Reuses
 /// `check_in_billing` (room) + per-cin sums of POS products (`ht_pos_sales`,
@@ -483,23 +643,14 @@ async fn folio_breakdown(state: &AppState, pool: &PgPool, cin_id: i32) -> ApiRes
         .await?
         .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
     let nights = billing.nights.unwrap_or(1).max(1);
-    let rate = billing.cin_rate_per_night.unwrap_or(0.0);
-    // M1 task #34: `cin_rate_per_night` is 0/NULL for ~100% of live check-ins;
-    // the real stay revenue lives in `cin_total_amount`. Fall back to it when
-    // the per-night rate is unusable so the folio room line is not silently
-    // zero. When the fallback fires, derive the displayed per-night rate from
-    // the resulting room total so the receipt still shows a sensible "x/night".
-    let rate_fallback_used = rate <= 0.0;
-    let room_total = if rate > 0.0 {
-        rate * nights as f64
-    } else {
-        billing.cin_total_amount.unwrap_or(0.0)
-    };
-    let display_rate = if rate_fallback_used {
-        room_total / nights as f64
-    } else {
-        rate
-    };
+    let basis = room_basis(
+        billing.cin_rate_per_night,
+        nights,
+        billing.cin_room_amount,
+        billing.cin_total_amount,
+    );
+    let room_total = basis.room_total;
+    let display_rate = basis.display_rate;
 
     let sums = sqlx::query(
         "SELECT \
@@ -687,23 +838,26 @@ pub async fn checkout(
         .check_in_billing(pool, cin_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Check-in not found".to_string()))?;
-    let nights = billing.nights.unwrap_or(1).max(1) as f64;
+    let nights_i32 = billing.nights.unwrap_or(1).max(1);
+    let nights = nights_i32 as f64;
     let rate = billing.cin_rate_per_night.unwrap_or(0.0);
-    // M1 task #34: same `cin_rate_per_night` 0/NULL fallback as
-    // `folio_breakdown` — use `cin_total_amount` for the room basis when the
-    // per-night rate is unusable so the writeback's `Total_Price_*` carries the
-    // real revenue (Audit H1) instead of zero (the flag-on path recomputes from
-    // the full folio below; this is the off-path / fallback basis).
-    let room_price_total = if rate > 0.0 {
-        rate * nights
-    } else {
-        billing.cin_total_amount.unwrap_or(0.0)
-    };
+    // M1 task #34 + migration 079: the SAME `room_basis` helper
+    // `folio_breakdown` uses, so the two can never drift. Gives the
+    // writeback's `Total_Price_*` the real revenue (Audit H1) instead of zero
+    // when `cin_rate_per_night` is unusable. This is the flag-OFF basis; the
+    // flag-ON path replaces it with the full folio's room leg below.
+    let fallback_room_price_total = room_basis(
+        billing.cin_rate_per_night,
+        nights_i32,
+        billing.cin_room_amount,
+        billing.cin_total_amount,
+    )
+    .room_total;
     let pay_total = body
         .total_amount
         .or(billing.cin_total_amount)
         .unwrap_or(0.0);
-    let net_total = room_price_total; // No product/extras plumbing yet.
+    let net_total = fallback_room_price_total; // No product/extras plumbing yet.
     let balance = (net_total - pay_total).max(0.0);
 
     // Spike Phase 2 SHADOW (CHECKOUT_SERVER_TOTAL_ENABLED ships dark): log when
@@ -712,7 +866,7 @@ pub async fn checkout(
     // sized on real folios before flipping the flag. The client value is still
     // what's charged here; this is observation only.
     if let Some(client_total) = body.total_amount {
-        if (client_total - room_price_total).abs() > 0.01 {
+        if (client_total - fallback_room_price_total).abs() > 0.01 {
             tracing::info!(
                 target: "shadow.checkout_total",
                 cin_id,
@@ -720,8 +874,8 @@ pub async fn checkout(
                 nights,
                 rate,
                 client_total,
-                server_room_total = room_price_total,
-                delta = client_total - room_price_total,
+                server_room_total = fallback_room_price_total,
+                delta = client_total - fallback_room_price_total,
                 "checkout-total shadow: client vs server-authoritative total diverge (charged client value — flag off)"
             );
         }
@@ -734,26 +888,28 @@ pub async fn checkout(
     let server_total_on = std::env::var("CHECKOUT_SERVER_TOTAL_ENABLED")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
-    let (cmd_total_amount, cmd_product_total, cmd_net_total, cmd_pay_total, cmd_balance) =
-        if server_total_on {
-            let f = folio_breakdown(&state, pool, cin_id).await?;
-            (
-                Some(f.net_total),
-                f.product_total,
-                f.net_total,
-                f.pay_total,
-                f.balance,
-            )
-        } else {
-            (body.total_amount, 0.0_f64, net_total, pay_total, balance)
-        };
+    let folio = if server_total_on {
+        Some(folio_breakdown(&state, pool, cin_id).await?)
+    } else {
+        None
+    };
+    let cmd = checkout_command_totals(
+        folio.as_ref(),
+        ClientCheckoutTotals {
+            room_price_total: fallback_room_price_total,
+            total_amount: body.total_amount,
+            net_total,
+            pay_total,
+            balance,
+        },
+    );
 
     let outcome = ws
         .checkins
         .check_out(CheckOutCommand {
             check_in_id: cin_id,
             check_out_time,
-            total_amount: cmd_total_amount,
+            total_amount: cmd.total_amount,
             payment_status: body
                 .payment_status
                 .clone()
@@ -762,11 +918,11 @@ pub async fn checkout(
             // TODO: wire user_id from auth middleware
             source: EventSource::our_app(Uuid::nil(), Uuid::new_v4()),
             nights,
-            room_price_total,
-            product_total: cmd_product_total,
-            net_total: cmd_net_total,
-            pay_total: cmd_pay_total,
-            balance: cmd_balance,
+            room_price_total: cmd.room_price_total,
+            product_total: cmd.product_total,
+            net_total: cmd.net_total,
+            pay_total: cmd.pay_total,
+            balance: cmd.balance,
             cr_ids: body.cr_ids.clone(),
         })
         .await
@@ -2307,6 +2463,198 @@ mod tests {
             created_at: None,
             updated_at: None,
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Folio room basis — migration 079 (`cin_room_amount`)
+    // ---------------------------------------------------------------------
+
+    /// A POS line iHOTEL has ALREADY folded into `Total_Price_Net` must not be
+    /// charged twice. Room 890 / Product 350 / Net 1240 in iHOTEL projects as
+    /// `cin_room_amount = 890`, `cin_total_amount = 1240`; the folio must bill
+    /// `890 + 350 = 1240`, not the pre-079 `1240 + 350 = 1590`.
+    #[test]
+    fn room_basis_excludes_products_ihotel_already_folded_in() {
+        let b = room_basis(Some(0.0), 1, Some(890.0), Some(1240.0));
+        assert_eq!(b.room_total, 890.0, "room basis must be the room leg only");
+        assert_eq!(b.display_rate, 890.0);
+        // The caller adds product_total on top; assert the full folio identity.
+        let product_total = 350.0;
+        assert_eq!(b.room_total + product_total, 1240.0, "no double-count");
+    }
+
+    /// No POS line: `Total_Price_Room == Total_Price_Net`, so 079 changes
+    /// nothing. This is every live folio today (`ht_pos_sales` + `ht_products`
+    /// are empty on both sites).
+    #[test]
+    fn room_basis_is_unchanged_when_no_pos_line_exists() {
+        let b = room_basis(Some(0.0), 2, Some(1780.0), Some(1780.0));
+        assert_eq!(b.room_total, 1780.0);
+        assert_eq!(b.display_rate, 890.0, "derived per-night rate");
+    }
+
+    /// NULL `cin_room_amount` (row predates 079, or an app-originated check-in
+    /// before its first CT read-back) MUST fall back to `cin_total_amount` —
+    /// exactly the pre-079 behaviour, which is correct whenever no POS line
+    /// exists. Treating NULL as 0 would zero the room charge on every
+    /// historical folio: a catastrophic UNDERcharge on a live money path.
+    #[test]
+    fn room_basis_falls_back_to_total_amount_when_room_amount_is_null() {
+        let b = room_basis(Some(0.0), 1, None, Some(890.0));
+        assert_eq!(b.room_total, 890.0, "NULL must fall back, never zero out");
+    }
+
+    /// `Some(0.0)` is a REAL zero room charge (product-only folio; legacy
+    /// `Total_Price_Room` is `float NOT NULL DEFAULT 0`) and must be honoured,
+    /// not confused with "never projected". Otherwise a product-only folio's
+    /// products get billed twice — once via the net-derived fallback and again
+    /// via `product_total`.
+    #[test]
+    fn room_basis_honours_a_genuine_zero_room_charge() {
+        let b = room_basis(Some(0.0), 1, Some(0.0), Some(350.0));
+        assert_eq!(b.room_total, 0.0, "Some(0.0) is not 'absent'");
+    }
+
+    /// Both amounts NULL → 0.0, same as before 079.
+    #[test]
+    fn room_basis_is_zero_when_nothing_is_known() {
+        let b = room_basis(None, 1, None, None);
+        assert_eq!(b.room_total, 0.0);
+        assert_eq!(b.display_rate, 0.0);
+    }
+
+    /// The `rate > 0` branch is UNTOUCHED by 079: a stored per-night rate is
+    /// already room-only, so it wins over both header amounts and the
+    /// displayed rate stays the stored rate (not a derived one).
+    #[test]
+    fn room_basis_rate_branch_is_unchanged_by_migration_079() {
+        let b = room_basis(Some(1200.0), 3, Some(890.0), Some(1240.0));
+        assert_eq!(b.room_total, 3600.0, "rate * nights wins");
+        assert_eq!(b.display_rate, 1200.0, "stored rate shown verbatim");
+    }
+
+    /// `nights` is floored at 1 so a same-day folio never divides by zero when
+    /// deriving the displayed rate.
+    #[test]
+    fn room_basis_floors_nights_at_one() {
+        let b = room_basis(Some(0.0), 0, Some(890.0), None);
+        assert_eq!(b.room_total, 890.0);
+        assert_eq!(b.display_rate, 890.0, "no divide-by-zero on a 0-night stay");
+    }
+
+    // ---------------------------------------------------------------------
+    // Checkout writeback basis — the anti-legacy-corruption guard
+    // ---------------------------------------------------------------------
+
+    fn folio_fixture() -> CheckoutQuote {
+        // Room 890 + Product 350 = Net 1240, 240 already paid.
+        CheckoutQuote {
+            success: true,
+            nights: 1,
+            rate_per_night: 890.0,
+            room_total: 890.0,
+            product_total: 350.0,
+            vat_percent: 0,
+            vat: 0.0,
+            deposit: 0.0,
+            net_total: 1240.0,
+            pay_total: 240.0,
+            balance: 1000.0,
+        }
+    }
+
+    /// **Anti-corruption guard.** With `CHECKOUT_SERVER_TOTAL_ENABLED` on,
+    /// `room_price_total` is stamped into the SHARED legacy DB as
+    /// `HT_CheckIn_H.Total_Price_Room` by `writeback/recipes/checkout.rs`. It
+    /// MUST be the folio's room leg (890), never the product-inclusive
+    /// `cin_total_amount` basis (1240) — otherwise iHOTEL is written
+    /// `Room=1240, Product=350, Net=1590` and the next CT tick reads that
+    /// corruption back into canonical PG.
+    #[test]
+    fn flag_on_checkout_sends_the_room_leg_not_the_product_inclusive_total() {
+        let f = folio_fixture();
+        // The pre-flag basis a real handler would carry: `cin_total_amount`,
+        // which is Net (= 1240) and therefore already includes the products.
+        let client = ClientCheckoutTotals {
+            room_price_total: 1240.0,
+            total_amount: Some(1240.0),
+            net_total: 1240.0,
+            pay_total: 240.0,
+            balance: 1000.0,
+        };
+
+        let cmd = checkout_command_totals(Some(&f), client);
+
+        assert_eq!(
+            cmd.room_price_total, 890.0,
+            "Total_Price_Room written to iHOTEL must be the ROOM LEG"
+        );
+        assert_ne!(
+            cmd.room_price_total, client.room_price_total,
+            "the pre-flag product-inclusive basis must NOT survive the flag-on path"
+        );
+        assert_eq!(cmd.product_total, 350.0);
+        assert_eq!(cmd.net_total, 1240.0);
+        assert_eq!(
+            cmd.room_price_total + cmd.product_total,
+            cmd.net_total,
+            "the three legacy Total_Price_* columns must stay internally consistent"
+        );
+        assert_eq!(cmd.total_amount, Some(1240.0));
+        assert_eq!(cmd.pay_total, 240.0);
+        assert_eq!(cmd.balance, 1000.0);
+    }
+
+    /// Flag OFF is byte-for-byte the pre-079 behaviour: the client basis is
+    /// passed through untouched and `product_total` stays 0.
+    #[test]
+    fn flag_off_checkout_passes_the_client_basis_through_unchanged() {
+        let client = ClientCheckoutTotals {
+            room_price_total: 890.0,
+            total_amount: Some(900.0),
+            net_total: 890.0,
+            pay_total: 900.0,
+            balance: 0.0,
+        };
+
+        let cmd = checkout_command_totals(None, client);
+
+        assert_eq!(cmd.room_price_total, 890.0);
+        assert_eq!(cmd.total_amount, Some(900.0));
+        assert_eq!(cmd.product_total, 0.0, "no product plumbing on the off path");
+        assert_eq!(cmd.net_total, 890.0);
+        assert_eq!(cmd.pay_total, 900.0);
+        assert_eq!(cmd.balance, 0.0);
+    }
+
+    /// Every money field on the flag-on path comes from ONE folio — none may
+    /// leak from the client basis. Pins the whole struct so a future field
+    /// added to `CheckOutCommand` can't quietly re-introduce a mixed basis.
+    #[test]
+    fn flag_on_checkout_takes_every_money_field_from_the_folio() {
+        let f = folio_fixture();
+        let client = ClientCheckoutTotals {
+            room_price_total: 1.0,
+            total_amount: Some(2.0),
+            net_total: 3.0,
+            pay_total: 4.0,
+            balance: 5.0,
+        };
+
+        let cmd = checkout_command_totals(Some(&f), client);
+
+        assert_eq!(
+            cmd,
+            CheckoutCommandTotals {
+                room_price_total: f.room_total,
+                total_amount: Some(f.net_total),
+                product_total: f.product_total,
+                net_total: f.net_total,
+                pay_total: f.pay_total,
+                balance: f.balance,
+            },
+            "no client-basis value may leak into the flag-on command"
+        );
     }
 
     /// Track G1 / T4 HIGH-2: shortening the stay is a different flow.

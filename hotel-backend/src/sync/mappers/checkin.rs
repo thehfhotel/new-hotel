@@ -184,6 +184,18 @@ struct ExistingCheckIn {
     aggregate_id: Option<Uuid>,
     cin_status: Option<String>,
     cin_total_amount: Option<f64>,
+    /// Room-only folio total (migration 079) — compared by
+    /// `existing_matches`. Safe to compare unguarded for exactly the same
+    /// reason `cin_total_amount` is: `update_existing` writes it plainly
+    /// ($9, no COALESCE), so any mismatch converges after ONE re-apply.
+    /// Comparing it matters on a live money path — iHOTEL can move
+    /// `Total_Price_Room` without moving `Total_Price_Net` (a discount
+    /// shifted between the room and product legs keeps the net fixed),
+    /// and a net-only comparison would idempotency-skip that edit, let
+    /// the CT delta age out inside the 2-day retention window, and leave
+    /// the folio's room basis durably stale — the CH26-006020 silent-stale
+    /// class, applied to a column that feeds the real charge.
+    cin_room_amount: Option<f64>,
     cin_paid_amount: Option<f64>,
     /// Stay range — compared by `existing_matches` since 2026-07-06
     /// (CH26-006020/CH26-006039): an iHOTEL re-save that moves ONLY
@@ -231,7 +243,15 @@ pub(crate) struct CanonicalCheckIn {
     /// `None` for active stays.
     pub(crate) cin_checkout_time: Option<NaiveDateTime>,
     pub(crate) cin_expected_checkout: NaiveDate,
+    /// `HT_CheckIn_H.Total_Price_Net` — Room + Product, NOT room-only.
     total_amount: Option<f64>,
+    /// `HT_CheckIn_H.Total_Price_Room` — the ROOM-ONLY half of the folio
+    /// (migration 079). Kept separate from [`Self::total_amount`] so the
+    /// checkout folio can compute `net = room + product` without
+    /// re-adding a POS line iHOTEL has already folded into
+    /// `Total_Price_Net`. Written with the SAME hard-overwrite semantics
+    /// as `total_amount` (no COALESCE) — see `update_existing`.
+    room_amount: Option<f64>,
     paid_amount: Option<f64>,
     /// `HT_CheckIn_Ds.id` for the first room — kept so the writeback
     /// resolver has a fast path back into MSSQL even when the next CT
@@ -961,6 +981,19 @@ pub(crate) fn project_aggregate(
     let total_amount = header
         .try_get_decimal("Total_Price_Net")?
         .or(header.try_get_decimal("Total_Price_Room").ok().flatten());
+    // Migration 079 — the ROOM-ONLY half of the folio, kept as its own
+    // canonical column. `total_amount` above is `Total_Price_Net`, which
+    // iHOTEL defines as Room + Product and rewrites on EVERY payment/sale
+    // change (COMPAT_CHEATSHEET §359-362), so it is not a usable room
+    // basis once a POS line exists. `routes::new_checkins::folio_breakdown`
+    // needs the split to compute `net = room + product` without
+    // double-counting a line iHOTEL already folded in.
+    // Read straight through with no `Total_Price_Net` fallback: legacy
+    // `Total_Price_Room` is `float NOT NULL DEFAULT 0`
+    // (COMPAT_CHEATSHEET §375), so a `None` here means the column was
+    // genuinely absent from the row, not "unset" — and a product-only
+    // folio legitimately carries 0.00.
+    let room_amount = header.try_get_decimal("Total_Price_Room")?;
     // `cin_paid_amount` mirrors `HT_CheckIn_H.Total_Price_Pay`, NOT the
     // sum of `HT_CheckIn_Pay.Cin_Pay_*` rows. The header is the legacy
     // app's source of truth (recipe `payment.rs::execute_all` keeps it
@@ -987,6 +1020,7 @@ pub(crate) fn project_aggregate(
         cin_checkout_time: room_state.checkout_time,
         cin_expected_checkout,
         total_amount,
+        room_amount,
         paid_amount,
         legacy_checkin_ds_id: room_state.first_ds_id,
         is_fully_checked_out: room_state.is_fully_checked_out,
@@ -1315,13 +1349,15 @@ async fn fetch_existing(
         Option<String>,
         Option<f64>,
         Option<f64>,
+        Option<f64>,
         Option<NaiveDateTime>,
         Option<NaiveDate>,
         Option<NaiveDateTime>,
         Option<String>,
     )>(
         "SELECT cin_id, aggregate_id, cin_status, \
-                cin_total_amount::float8, cin_paid_amount::float8, \
+                cin_total_amount::float8, cin_room_amount::float8, \
+                cin_paid_amount::float8, \
                 cin_checkin_time, cin_expected_checkout, cin_checkout_time, \
                 legacy_cust_no \
            FROM ht_checkins \
@@ -1333,12 +1369,13 @@ async fn fetch_existing(
     .await?;
 
     Ok(row.map(
-        |(cin_id, aggregate_id, cin_status, total, paid, checkin, expected, checkout, legacy_cust_no)| {
+        |(cin_id, aggregate_id, cin_status, total, room, paid, checkin, expected, checkout, legacy_cust_no)| {
             ExistingCheckIn {
                 cin_id,
                 aggregate_id,
                 cin_status,
                 cin_total_amount: total,
+                cin_room_amount: room,
                 cin_paid_amount: paid,
                 cin_checkin_time: checkin,
                 cin_expected_checkout: expected,
@@ -1351,7 +1388,7 @@ async fn fetch_existing(
 
 fn existing_matches(ex: &ExistingCheckIn, p: &CanonicalCheckIn) -> bool {
     // `legacy_cust_no` comparison is guarded on the projection carrying a
-    // value: `update_existing` writes it through `COALESCE($12,
+    // value: `update_existing` writes it through `COALESCE($13,
     // legacy_cust_no)`, so a transient NULL on the legacy side never
     // overwrites — comparing a None projection against a Some canonical
     // value would force a re-apply every tick without ever converging.
@@ -1362,8 +1399,16 @@ fn existing_matches(ex: &ExistingCheckIn, p: &CanonicalCheckIn) -> bool {
     // error on a NULL `Cin_Date_in`) and `update_existing` writes both
     // through plainly ($5/$7, no COALESCE), so a mismatch always
     // converges after one re-apply.
+    // `cin_room_amount` (migration 079) is compared on the same
+    // plain-write grounds as `cin_total_amount`. It is deliberately NOT a
+    // reconcile-hash input, so the repo's "gate ⊇ hash" invariant is
+    // unaffected — this only WIDENS the gate. Cost is bounded: it can
+    // only force a re-apply for a folio that already has a CT event this
+    // tick, so pre-079 rows (NULL column, non-NULL projection) backfill
+    // lazily on their next legacy touch rather than in a burst.
     ex.cin_status.as_deref() == Some(p.cin_status.as_str())
         && ex.cin_total_amount == p.total_amount
+        && ex.cin_room_amount == p.room_amount
         && ex.cin_paid_amount == p.paid_amount
         && ex.cin_checkin_time == Some(p.cin_checkin_time)
         && ex.cin_expected_checkout == Some(p.cin_expected_checkout)
@@ -1396,6 +1441,13 @@ async fn update_existing(
     //     upstream by the `resolve_room_id` defer at line ~332 — if no room
     //     can be resolved, apply returns Ok(None) and never reaches this
     //     UPDATE, so the guard here was load-bearing only on dead code.
+    //   * `cin_room_amount` ($9, migration 079) is a PLAIN write, exactly
+    //     mirroring its sibling `cin_total_amount` ($8). Both mirror
+    //     `HT_CheckIn_H.Total_Price_*`, which iHOTEL rewrites wholesale on
+    //     every payment/sale change — the legacy header IS the truth, so a
+    //     COALESCE guard would pin a stale room basis forever and would
+    //     also make the `existing_matches` comparison unable to converge
+    //     (a projected NULL could never overwrite a canonical Some).
     sqlx::query(
         "UPDATE ht_checkins \
             SET cin_cust_id            = $1, \
@@ -1406,14 +1458,15 @@ async fn update_existing(
                 cin_checkout_time      = $6, \
                 cin_expected_checkout  = $7, \
                 cin_total_amount       = $8::float8, \
-                cin_paid_amount        = $9::float8, \
-                legacy_cin_no          = COALESCE(legacy_cin_no, $10), \
-                legacy_room_no         = COALESCE($11, legacy_room_no), \
-                legacy_cust_no         = COALESCE($12, legacy_cust_no), \
-                legacy_checkin_ds_id   = COALESCE($13, legacy_checkin_ds_id), \
-                aggregate_id           = COALESCE(aggregate_id, $14), \
+                cin_room_amount        = $9::float8, \
+                cin_paid_amount        = $10::float8, \
+                legacy_cin_no          = COALESCE(legacy_cin_no, $11), \
+                legacy_room_no         = COALESCE($12, legacy_room_no), \
+                legacy_cust_no         = COALESCE($13, legacy_cust_no), \
+                legacy_checkin_ds_id   = COALESCE($14, legacy_checkin_ds_id), \
+                aggregate_id           = COALESCE(aggregate_id, $15), \
                 updated_at             = NOW() \
-          WHERE cin_id = $15",
+          WHERE cin_id = $16",
     )
     .bind(cust_id)
     .bind(room_id)
@@ -1423,6 +1476,7 @@ async fn update_existing(
     .bind(p.cin_checkout_time)
     .bind(p.cin_expected_checkout)
     .bind(p.total_amount)
+    .bind(p.room_amount)
     .bind(p.paid_amount)
     .bind(&p.legacy_cin_no)
     .bind(&p.legacy_room_no)
@@ -1449,11 +1503,11 @@ async fn insert_new(
         "INSERT INTO ht_checkins \
              (cin_no, cin_book_id, cin_cust_id, cin_room_id, \
               cin_checkin_time, cin_checkout_time, cin_expected_checkout, \
-              cin_status, cin_total_amount, cin_paid_amount, \
+              cin_status, cin_total_amount, cin_room_amount, cin_paid_amount, \
               legacy_cin_no, legacy_room_no, legacy_cust_no, legacy_checkin_ds_id, source) \
          VALUES \
-             ($1, $2, $3, $4, $5, $6, $7, $8, $9::float8, $10::float8, \
-              $11, $12, $13, $14, 'legacy_app') \
+             ($1, $2, $3, $4, $5, $6, $7, $8, $9::float8, $10::float8, $11::float8, \
+              $12, $13, $14, $15, 'legacy_app') \
          RETURNING cin_id",
     )
     .bind(&p.legacy_cin_no)
@@ -1465,6 +1519,7 @@ async fn insert_new(
     .bind(p.cin_expected_checkout)
     .bind(&p.cin_status)
     .bind(p.total_amount)
+    .bind(p.room_amount)
     .bind(p.paid_amount)
     .bind(&p.legacy_cin_no)
     .bind(&p.legacy_room_no)
@@ -2248,6 +2303,60 @@ mod tests {
         );
     }
 
+    // ----- cin_room_amount (migration 079) ------------------------------
+
+    /// Migration 079 headline contract: `cin_room_amount` comes from
+    /// `HT_CheckIn_H.Total_Price_Room` and is INDEPENDENT of
+    /// `cin_total_amount` (= `Total_Price_Net` = Room + Product).
+    ///
+    /// The fixture is a folio iHOTEL has already folded a 350.00 POS line
+    /// into: Room 890 / Product 350 / Net 1240. Before 079 the checkout
+    /// folio used Net as its "room" basis and then re-added the POS line,
+    /// billing 1590 for a 1240 stay — and stamped that 1590 back into the
+    /// shared legacy DB as `Total_Price_Room`.
+    #[test]
+    fn project_aggregate_carries_room_amount_from_total_price_room() {
+        let header = header_row("CH26-005400", "C21607", "ปกติ")
+            .with("Total_Price_Room", MockValue::Decimal(890.0))
+            .with("Total_Price_Net", MockValue::Decimal(1240.0));
+        let agg = CheckInAggregate {
+            header: Some(header),
+            rooms: vec![ds_row("CH26-005400", "402", "เข้าพัก")],
+            payments: vec![],
+        };
+        let p = project_aggregate(&agg, "CH26-005400").unwrap();
+        assert_eq!(
+            p.room_amount,
+            Some(890.0),
+            "cin_room_amount must mirror Total_Price_Room, not Total_Price_Net"
+        );
+        assert_eq!(
+            p.total_amount,
+            Some(1240.0),
+            "cin_total_amount keeps mirroring Total_Price_Net (Room + Product)"
+        );
+    }
+
+    /// `Total_Price_Room = 0` is a LEGITIMATE value (product-only folio;
+    /// the legacy column is `float NOT NULL DEFAULT 0`). It must project
+    /// as `Some(0.0)`, never `None` — the read path treats `None` as
+    /// "never projected" and falls back to `cin_total_amount`, so
+    /// collapsing the two would silently bill a product-only folio's
+    /// products twice.
+    #[test]
+    fn project_aggregate_keeps_zero_room_amount_distinct_from_absent() {
+        let header = header_row("CH26-005401", "C21607", "ปกติ")
+            .with("Total_Price_Room", MockValue::Decimal(0.0))
+            .with("Total_Price_Net", MockValue::Decimal(350.0));
+        let agg = CheckInAggregate {
+            header: Some(header),
+            rooms: vec![ds_row("CH26-005401", "402", "เข้าพัก")],
+            payments: vec![],
+        };
+        let p = project_aggregate(&agg, "CH26-005401").unwrap();
+        assert_eq!(p.room_amount, Some(0.0), "zero must survive as Some(0.0)");
+    }
+
     // ----- project_rooms (Track B2 / T2 CRIT-1) -------------------------
 
     /// Multi-room aggregate: projection MUST carry one `CanonicalRoom`
@@ -2473,6 +2582,7 @@ mod tests {
             cin_checkout_time: None,
             cin_expected_checkout: chrono::NaiveDate::from_ymd_opt(2026, 4, 27).unwrap(),
             total_amount: Some(890.0),
+            room_amount: Some(890.0),
             paid_amount: Some(0.0),
             legacy_checkin_ds_id: Some(25001),
             is_fully_checked_out: false,
@@ -2488,6 +2598,7 @@ mod tests {
             aggregate_id: Some(uuid::Uuid::nil()),
             cin_status: Some(p.cin_status.clone()),
             cin_total_amount: p.total_amount,
+            cin_room_amount: p.room_amount,
             cin_paid_amount: p.paid_amount,
             cin_checkin_time: Some(p.cin_checkin_time),
             cin_expected_checkout: Some(p.cin_expected_checkout),
@@ -2501,6 +2612,45 @@ mod tests {
         let p = sample_canonical();
         let ex = make_existing(&p);
         assert!(existing_matches(&ex, &p));
+    }
+
+    /// Migration 079 gate widening. A `Total_Price_Room`-only movement
+    /// (iHOTEL shifts a discount between the room and product legs, so the
+    /// NET is unchanged) must NOT be idempotency-skipped: skipping it
+    /// advances the watermark, the CT delta ages out inside the 2-day
+    /// retention window, and the canonical room basis — which feeds the
+    /// real charge via `folio_breakdown` — goes durably stale. This is the
+    /// CH26-006020 silent-stale class on a money column.
+    #[test]
+    fn existing_matches_is_false_when_only_room_amount_differs() {
+        let p = sample_canonical();
+        let mut ex = make_existing(&p);
+        ex.cin_room_amount = Some(790.0);
+        assert_eq!(
+            ex.cin_total_amount, p.total_amount,
+            "fixture must isolate the room leg — net is deliberately unchanged"
+        );
+        assert!(
+            !existing_matches(&ex, &p),
+            "a Total_Price_Room-only edit must re-apply, not skip"
+        );
+    }
+
+    /// A pre-079 row (column NULL) whose projection carries a value must
+    /// re-apply so it backfills on its next CT tick, and the plain (no
+    /// COALESCE) write means that ONE re-apply converges it — the
+    /// never-converges trap that guards `legacy_cust_no` does not apply
+    /// here.
+    #[test]
+    fn existing_matches_is_false_for_unbackfilled_room_amount() {
+        let p = sample_canonical();
+        let mut ex = make_existing(&p);
+        ex.cin_room_amount = None;
+        assert!(!existing_matches(&ex, &p), "NULL column must backfill");
+
+        // After the re-apply writes it through, the gate is satisfied.
+        ex.cin_room_amount = p.room_amount;
+        assert!(existing_matches(&ex, &p), "must converge in one apply");
     }
 
     #[test]

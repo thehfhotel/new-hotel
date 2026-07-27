@@ -38,6 +38,21 @@
 //! (pre-booked products attached to a booking) — see
 //! [`BookProMirrorMapper`] for the iHOTEL semantics and the
 //! booking→check-in conversion gap it surfaces.
+//!
+//! ## Echo-before-stamp adoption (2026-07-28)
+//!
+//! Two of the mappers here don't just mirror — they also reverse-sync into
+//! a CANONICAL table our own app writes (`HT_CheckIn_Product` →
+//! `ht_pos_sales`, `HT_Changed_Room` → `ht_room_changes`). Both canonical
+//! tables carry a legacy back-link that the writeback worker stamps
+//! **after** the MSSQL commit, on a separate PG connection. A CT tick that
+//! lands inside that window sees an unstamped canonical row, matches
+//! nothing on the back-link, and inserts a phantom duplicate.
+//! [`ADOPT_UNSTAMPED_POS_SALE_SQL`] and
+//! [`ADOPT_UNSTAMPED_ROOM_CHANGE_SQL`] close that window by claiming the
+//! matching unstamped app-originated row first — the same remedy
+//! `sync::mappers::guest_registry` already applies to
+//! `HT_CheckIn_Other_People`.
 
 use async_trait::async_trait;
 
@@ -256,6 +271,58 @@ impl MssqlChangeMapper for CheckinProductMirrorMapper {
     }
 }
 
+/// Echo-before-stamp adoption for `ht_pos_sales` (2026-07-28). Same defect
+/// and same remedy as `guest_registry::ADOPT_UNSTAMPED_COMPANION_SQL`.
+///
+/// When OUR app posts a POS line, `service::pos` commits the canonical row
+/// with `sale_legacy_id IS NULL` and enqueues
+/// `WritebackIntent::RecordPosSale`. The worker INSERTs
+/// `HT_CheckIn_Product` and only THEN stamps the captured IDENTITY onto
+/// `sale_legacy_id` — **after** the MSSQL commit, on a separate PG
+/// connection (`bin/writeback.rs::back_populate_legacy_ids`). A CT tick
+/// landing inside that window finds no row carrying this `sale_legacy_id`,
+/// so the dedup UPDATE below matches 0 rows and the legacy-origin INSERT
+/// creates a phantom canonical duplicate. This statement claims the
+/// matching unstamped row first, so the dedup UPDATE hits it and the
+/// INSERT never runs. Back-population usually wins the race (making this a
+/// no-op); its own `AND sale_legacy_id IS NULL` guard means a stamp that
+/// arrives after an adoption is a harmless 0-row UPDATE.
+///
+/// Natural key = every field `writeback/recipes/pos_sale.rs` puts on the
+/// wire, expressed in canonical space:
+///
+/// | canonical column  | legacy column     | why it round-trips exactly |
+/// |-------------------|-------------------|----------------------------|
+/// | `sale_cin_id` $2  | `Cin_No`          | resolved via `ht_checkins.legacy_cin_no` |
+/// | `sale_product_id` $3 | `Cin_Pro_id`   | resolved via `ht_products.prod_legacy_no` |
+/// | `sale_qty` $4     | `Cin_Pro_num`     | recipe formats `{:.3}` → `ROUND(…, 3)` |
+/// | `sale_unit_price` $5 | `Cin_Pro_price`| recipe formats `{:.2}` → `ROUND(…, 2)` |
+/// | `sale_note` $6    | `Cin_Pro_note`    | written verbatim, same varchar(500) width |
+/// | `sale_sold_at` $7 | `Cin_Ds_date`     | `format_legacy_datetime` = Bangkok wall-clock TRUNCATED to the second |
+///
+/// `sale_legacy_id IS NULL` + `source = 'canonical'` restrict adoption to
+/// app-originated rows — this mapper stamps `sale_legacy_id` on every row
+/// it creates, so an unstamped row can only be ours. The `NOT EXISTS`
+/// guard makes the statement idempotent: once any canonical row carries
+/// this legacy id (back-population won, or an earlier tick adopted), no
+/// second row can ever be claimed for it, so CT re-delivery and
+/// iHOTEL-side U-events fall straight through to the plain dedup path.
+/// `ORDER BY sale_id` (oldest first) matches the FIFO order the writeback
+/// queue drains in, which is the order MSSQL allocated the IDENTITYs.
+const ADOPT_UNSTAMPED_POS_SALE_SQL: &str = "UPDATE ht_pos_sales SET sale_legacy_id = $1 \
+     WHERE sale_id = ( \
+        SELECT sale_id FROM ht_pos_sales \
+        WHERE sale_legacy_id IS NULL \
+          AND source = 'canonical' \
+          AND sale_cin_id = $2 \
+          AND sale_product_id = $3 \
+          AND sale_qty = ROUND($4::numeric, 3) \
+          AND sale_unit_price = ROUND($5::numeric, 2) \
+          AND COALESCE(sale_note, '') = COALESCE($6, '') \
+          AND date_trunc('second', sale_sold_at AT TIME ZONE 'Asia/Bangkok') = $7::timestamp \
+        ORDER BY sale_id LIMIT 1) \
+       AND NOT EXISTS (SELECT 1 FROM ht_pos_sales x WHERE x.sale_legacy_id = $1)";
+
 /// Track G6 — UPSERT a canonical `ht_pos_sales` row from the legacy
 /// `HT_CheckIn_Product` projection. Resolves `Cin_No` →
 /// `ht_checkins.cin_id`, `Cin_Pro_id` → `ht_products.prod_id`.
@@ -334,6 +401,32 @@ async fn upsert_canonical_pos_sale(
     // canonical row exists yet for this legacy id.
     let qty = pro_num.unwrap_or(0.0);
     let unit_price = pro_price.unwrap_or(0.0);
+
+    // Echo-before-stamp adoption — see ADOPT_UNSTAMPED_POS_SALE_SQL. Runs
+    // BEFORE the dedup UPDATE so an adopted row is already stamped by the
+    // time that UPDATE runs; the whole apply then converges to exactly the
+    // state the non-racing order (back-populate first, echo second)
+    // produces, including `source = 'legacy'`.
+    let adopted = sqlx::query(ADOPT_UNSTAMPED_POS_SALE_SQL)
+        .bind(legacy_id)
+        .bind(cin_id)
+        .bind(prod_id)
+        .bind(qty)
+        .bind(unit_price)
+        .bind(pro_note)
+        .bind(ds_date)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+    if adopted > 0 {
+        tracing::info!(
+            legacy_id,
+            cin_id,
+            prod_id,
+            "adopted unstamped app-originated ht_pos_sales row (CT echo beat \
+             the writeback back-population) — no phantom duplicate inserted"
+        );
+    }
 
     let updated = sqlx::query(
         "UPDATE ht_pos_sales SET \
@@ -584,6 +677,52 @@ impl MssqlChangeMapper for ChangedRoomMirrorMapper {
     }
 }
 
+/// Echo-before-stamp adoption for `ht_room_changes` (2026-07-28) — the
+/// `HT_Changed_Room` twin of [`ADOPT_UNSTAMPED_POS_SALE_SQL`]; read that
+/// doc first for the race narrative.
+///
+/// `service::checkin::change_room` commits the canonical row with
+/// `rc_legacy_id IS NULL` and enqueues `WritebackIntent::RoomChange`; the
+/// worker INSERTs `HT_Changed_Room` and stamps `rc_legacy_id` only after
+/// the MSSQL commit, on a separate PG connection. A CT tick inside that
+/// window used to INSERT a phantom canonical duplicate.
+///
+/// Natural key = every field `writeback/recipes/room_change.rs` puts on
+/// the wire (its INSERT populates all 7 columns), in canonical space:
+///
+/// | canonical column       | legacy column       | note |
+/// |------------------------|---------------------|------|
+/// | `rc_cin_id` $2         | `cin_no`            | resolved via `ht_checkins.legacy_cin_no` |
+/// | `rc_from_room_id` $3   | `room_before`       | resolved via `ht_rooms_new.room_no` |
+/// | `rc_to_room_id` $4     | `room_after`        | resolved via `ht_rooms_new.room_no` |
+/// | `rc_room_before_price` $5 | `room_before_price` | recipe formats `{:.2}` → `ROUND(…, 2)` |
+/// | `rc_reason` $6         | `Note`              | written verbatim |
+/// | `rc_to_price` $7       | `ToPrice`           | written verbatim, varchar(20) both sides |
+/// | `rc_changed_at` $8     | `change_date`       | Bangkok wall-clock truncated to the second |
+///
+/// The structural half of that key — one folio moving from room X to room
+/// Y at one wall-clock second — is already unique by construction: a
+/// second move of the same folio between the same two rooms in the same
+/// second is not a thing a receptionist can produce. The content half is
+/// belt-and-braces, matching the exact-content style of the guest-registry
+/// adoption. `rc_legacy_id IS NULL` is the ownership guard (this mapper
+/// stamps `rc_legacy_id` on every row it inserts, so an unstamped row is
+/// necessarily app-originated — `ht_room_changes` has no `source` column),
+/// and `NOT EXISTS` keeps re-delivered CT rows on the plain dedup path.
+const ADOPT_UNSTAMPED_ROOM_CHANGE_SQL: &str = "UPDATE ht_room_changes SET rc_legacy_id = $1 \
+     WHERE rc_id = ( \
+        SELECT rc_id FROM ht_room_changes \
+        WHERE rc_legacy_id IS NULL \
+          AND rc_cin_id = $2 \
+          AND rc_from_room_id = $3 \
+          AND rc_to_room_id = $4 \
+          AND rc_room_before_price = ROUND(COALESCE($5::numeric, 0), 2) \
+          AND COALESCE(rc_reason, '') = COALESCE($6, '') \
+          AND COALESCE(rc_to_price, '') = COALESCE($7, '') \
+          AND date_trunc('second', rc_changed_at AT TIME ZONE 'Asia/Bangkok') = $8::timestamp \
+        ORDER BY rc_id LIMIT 1) \
+       AND NOT EXISTS (SELECT 1 FROM ht_room_changes x WHERE x.rc_legacy_id = $1)";
+
 /// Track G4 / T4 HIGH-3 — UPSERT a canonical `ht_room_changes` row from
 /// the legacy `HT_Changed_Room` projection. Resolves `cin_no` →
 /// `ht_checkins.cin_id`, `room_before` / `room_after` →
@@ -652,6 +791,34 @@ async fn upsert_canonical_room_change(
     // until the writeback worker's `mark_done` back-populates it;
     // this mapper only touches rows whose `rc_legacy_id` is already
     // set (legacy-origin) OR creates a fresh legacy-origin row.
+    //
+    // Echo-before-stamp adoption first — see
+    // ADOPT_UNSTAMPED_ROOM_CHANGE_SQL. Stamping ahead of the dedup UPDATE
+    // means an adopted row converges to exactly the state the non-racing
+    // order would have produced.
+    let adopted = sqlx::query(ADOPT_UNSTAMPED_ROOM_CHANGE_SQL)
+        .bind(legacy_id)
+        .bind(cin_id)
+        .bind(from_room_id)
+        .bind(to_room_id)
+        .bind(price)
+        .bind(note)
+        .bind(toprice)
+        .bind(change_date)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+    if adopted > 0 {
+        tracing::info!(
+            legacy_id,
+            cin_id,
+            from_room_id,
+            to_room_id,
+            "adopted unstamped app-originated ht_room_changes row (CT echo beat \
+             the writeback back-population) — no phantom duplicate inserted"
+        );
+    }
+
     let updated = sqlx::query(
         "UPDATE ht_room_changes SET \
              rc_cin_id            = $1, \
@@ -1246,6 +1413,154 @@ mod tests {
     #[test]
     fn book_pro_select_cols_are_subset_of_legacy_schema() {
         crate::assert_projection_subset!(BOOK_PRO_SELECT_COLS, "HT_Book_Pro");
+    }
+
+    // -------------------------------------------------------------------
+    // Echo-before-stamp adoption (2026-07-28).
+    //
+    // The four behaviours below are properties of the adoption SQL's WHERE
+    // clauses, so they're pinned the same way
+    // `guest_registry::adoption_sql_targets_unstamped_non_primary_with_concat_name_match`
+    // pins the identical fix: assert the clause that ENFORCES each
+    // behaviour. `src/` unit tests in this crate are pure by construction
+    // (no pool is reachable from a mapper unit test — see
+    // `sync::resolve::tests`); runtime coverage of the apply() path lives
+    // in `tests/test_sync_phase55c_mirror_apply.rs`.
+    // -------------------------------------------------------------------
+
+    /// Behaviour 1 — adoption CLAIMS an unstamped app-originated row
+    /// instead of letting the legacy-origin INSERT create a duplicate.
+    /// The statement stamps the legacy id ($1) onto a row selected by
+    /// `sale_legacy_id IS NULL` + `source = 'canonical'` (the two markers
+    /// of "our app wrote this, the writeback hasn't back-populated yet").
+    #[test]
+    fn pos_sale_adoption_claims_unstamped_app_originated_row() {
+        let sql = ADOPT_UNSTAMPED_POS_SALE_SQL;
+        assert!(sql.starts_with("UPDATE ht_pos_sales SET sale_legacy_id = $1"), "{sql}");
+        assert!(sql.contains("sale_legacy_id IS NULL"), "{sql}");
+        assert!(sql.contains("source = 'canonical'"), "{sql}");
+        // Deterministic single-row claim, oldest first — FIFO writeback
+        // drain order == MSSQL IDENTITY allocation order.
+        assert!(sql.contains("ORDER BY sale_id LIMIT 1"), "{sql}");
+    }
+
+    /// Behaviour 1, room-change twin. `ht_room_changes` has no `source`
+    /// column — `rc_legacy_id IS NULL` alone is the ownership marker,
+    /// because this mapper stamps `rc_legacy_id` on every row it inserts.
+    #[test]
+    fn room_change_adoption_claims_unstamped_app_originated_row() {
+        let sql = ADOPT_UNSTAMPED_ROOM_CHANGE_SQL;
+        assert!(sql.starts_with("UPDATE ht_room_changes SET rc_legacy_id = $1"), "{sql}");
+        assert!(sql.contains("rc_legacy_id IS NULL"), "{sql}");
+        assert!(sql.contains("ORDER BY rc_id LIMIT 1"), "{sql}");
+    }
+
+    /// Behaviour 2 — a genuinely new legacy row still INSERTs. Both
+    /// adoption statements are scoped UPDATEs whose target is a single
+    /// subselect row, so a legacy row that matches no unstamped canonical
+    /// row affects 0 rows and control falls through to the existing
+    /// legacy-origin INSERT. Guard: neither statement may grow an INSERT
+    /// or an unbounded (subselect-less) WHERE.
+    #[test]
+    fn adoption_statements_are_bounded_updates_never_inserts() {
+        for sql in [ADOPT_UNSTAMPED_POS_SALE_SQL, ADOPT_UNSTAMPED_ROOM_CHANGE_SQL] {
+            assert!(sql.starts_with("UPDATE "), "adoption must never INSERT: {sql}");
+            assert!(!sql.contains("INSERT"), "adoption must never INSERT: {sql}");
+            // The UPDATE is pinned to one row id chosen by a LIMIT 1
+            // subselect — no match ⇒ rows_affected() == 0 ⇒ INSERT path.
+            assert!(sql.contains("LIMIT 1)"), "{sql}");
+        }
+    }
+
+    /// Behaviour 3 — tightness. Adoption must not hijack a row belonging
+    /// to a DIFFERENT sale. Every field
+    /// `writeback/recipes/pos_sale.rs::build_insert_statement` puts on the
+    /// wire has to appear in the predicate, or a same-folio sale of a
+    /// different product / qty / price / note / minute could be claimed.
+    /// The two money columns are compared through `ROUND` at the recipe's
+    /// own precision (`{:.3}` qty, `{:.2}` price) so the float round-trip
+    /// through MSSQL can't produce a false miss.
+    #[test]
+    fn pos_sale_adoption_key_cannot_hijack_a_different_sale() {
+        let sql = ADOPT_UNSTAMPED_POS_SALE_SQL;
+        assert!(sql.contains("sale_cin_id = $2"), "{sql}");
+        assert!(sql.contains("sale_product_id = $3"), "{sql}");
+        assert!(sql.contains("sale_qty = ROUND($4::numeric, 3)"), "{sql}");
+        assert!(sql.contains("sale_unit_price = ROUND($5::numeric, 2)"), "{sql}");
+        assert!(sql.contains("COALESCE(sale_note, '') = COALESCE($6, '')"), "{sql}");
+        // `format_legacy_datetime` renders Bangkok wall-clock truncated to
+        // the second, so the canonical timestamptz must be compared in the
+        // same space — NOT as a raw equality (which never matches, the
+        // canonical column carries sub-second precision) and NOT in UTC.
+        assert!(
+            sql.contains(
+                "date_trunc('second', sale_sold_at AT TIME ZONE 'Asia/Bangkok') = $7::timestamp"
+            ),
+            "{sql}"
+        );
+    }
+
+    /// Behaviour 3, room-change twin. The structural triple (folio, from
+    /// room, to room) plus the wall-clock second is already unique by
+    /// construction; price / reason / to_price are pinned too so the key
+    /// stays exact-content like the guest-registry model.
+    #[test]
+    fn room_change_adoption_key_cannot_hijack_a_different_move() {
+        let sql = ADOPT_UNSTAMPED_ROOM_CHANGE_SQL;
+        assert!(sql.contains("rc_cin_id = $2"), "{sql}");
+        assert!(sql.contains("rc_from_room_id = $3"), "{sql}");
+        assert!(sql.contains("rc_to_room_id = $4"), "{sql}");
+        assert!(
+            sql.contains("rc_room_before_price = ROUND(COALESCE($5::numeric, 0), 2)"),
+            "{sql}"
+        );
+        assert!(sql.contains("COALESCE(rc_reason, '') = COALESCE($6, '')"), "{sql}");
+        assert!(sql.contains("COALESCE(rc_to_price, '') = COALESCE($7, '')"), "{sql}");
+        assert!(
+            sql.contains(
+                "date_trunc('second', rc_changed_at AT TIME ZONE 'Asia/Bangkok') = $8::timestamp"
+            ),
+            "{sql}"
+        );
+    }
+
+    /// Behaviour 4 — an already-stamped legacy id takes the plain dedup
+    /// path. The `NOT EXISTS` guard makes adoption a strict once-per-legacy-id
+    /// operation: CT re-delivery, iHOTEL-side U-events and post-crash
+    /// retries all find a canonical row already carrying the id and adopt
+    /// nothing, so a second unstamped row can never be swept up.
+    #[test]
+    fn adoption_never_reclaims_an_already_stamped_legacy_id() {
+        assert!(
+            ADOPT_UNSTAMPED_POS_SALE_SQL
+                .contains("NOT EXISTS (SELECT 1 FROM ht_pos_sales x WHERE x.sale_legacy_id = $1)"),
+            "{ADOPT_UNSTAMPED_POS_SALE_SQL}"
+        );
+        assert!(
+            ADOPT_UNSTAMPED_ROOM_CHANGE_SQL.contains(
+                "NOT EXISTS (SELECT 1 FROM ht_room_changes x WHERE x.rc_legacy_id = $1)"
+            ),
+            "{ADOPT_UNSTAMPED_ROOM_CHANGE_SQL}"
+        );
+    }
+
+    /// The FK-miss error path in `upsert_canonical_pos_sale` is the
+    /// watermark-holding guarantee (June-3 silent-drop class) and adoption
+    /// must stay orthogonal to it: adoption is expressed purely in
+    /// canonical id space (`sale_cin_id` / `sale_product_id`), so it can
+    /// only run AFTER the `ht_checkins`/`ht_products` join resolved. No
+    /// adoption clause may reference a legacy business key, which would be
+    /// a way to sneak past the unresolved-FK `Err`.
+    #[test]
+    fn adoption_never_bypasses_the_fk_resolution_error_path() {
+        for sql in [ADOPT_UNSTAMPED_POS_SALE_SQL, ADOPT_UNSTAMPED_ROOM_CHANGE_SQL] {
+            for legacy_key in &["legacy_cin_no", "prod_legacy_no", "room_no", "ht_products"] {
+                assert!(
+                    !sql.contains(legacy_key),
+                    "adoption must key on resolved canonical ids only, found {legacy_key}: {sql}"
+                );
+            }
+        }
     }
 
     /// Phase 5/E2 — lock the projection columns for `HT_Book_Pro` so a
