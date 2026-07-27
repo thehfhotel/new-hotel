@@ -77,6 +77,30 @@ just re-fired forever.
    freezing into retention overflow, `--bootstrap` stamps per-table rows, and the
    flag is plumbed per-site. Ships default-off; HF Ville canaries first.
 
+**Outcome (confirmed 2026-07-27 09:58:48Z).** The re-ingest arm healed all four
+rows on its first eligible sweep, 16.25 days after detection
+(`age_secs=1404437`). Canonical now carries customer `C2413`
+(สุภาวดี เมียนเมือง / 0828261756) and booking `R002066` (2026-11-27 → 11-29,
+`confirmed`, cust `C2413`) with all three room legs (110 @ 1150, 112 @ 1150,
+217 @ 1250) — byte-matching legacy. The FK ordering guarantee held: the
+customer closed at `…48.664`, the bookings at `…48.733/.749/.763`. The new
+all-clear fired for both tables and cleared the level-alert cooldown, and the
+digest now reports no rows older than 4h. **No write was made to iHOTEL** —
+unlike the 2026-06-03 heal, which needed touch-UPDATEs on the legacy rows.
+
+**Two mechanism bugs found while shipping this**, both the same shape as the
+incident itself — a control that looks like it works and doesn't:
+1. `HFVILLE_WORKER_RECONCILE_ENABLED` was in compose but no workflow, so
+   `run-deploy.sh`'s wholesale `.env` rewrite discarded any host-set value. It
+   was un-flippable and worked only because its default happened to be `true`.
+2. A flag flip via `gh variable set` + an **empty commit** produced a green CI
+   run that deployed nothing — an empty commit changes no paths, so the
+   `changes` filter is false and the deploy job's final disjunct never holds.
+   The flag read `false` in the container for an hour while CI showed success.
+Both are closed by ADR 0004 (flag state committed to compose defaults; the
+compose edit is itself the deploy trigger). See
+`docs/coexistence/RUNBOOK-reconcile-flag-flips.md` §0.
+
 **Rule of thumb for next time.** `missing_pg` with a *live* legacy row and
 `pg_hash IS NULL`, where sibling keys either side landed fine, means a **dropped
 CT event**, not a mapper bug — go straight to the watcher's advance log for that
