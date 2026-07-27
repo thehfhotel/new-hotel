@@ -32,6 +32,7 @@
 //! - Does not run the CT watcher (lives in future `bin/sync.rs`).
 //! - Does not auto-fix schema drift — fail loud, alert ops, wait for human.
 
+use std::collections::HashMap;
 use std::env;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -85,6 +86,28 @@ const SELF_HEAL_ALERT_THRESHOLD: u32 = 5;
 /// a real regression. After firing, the counter resets — back-to-back bursts
 /// produce back-to-back alerts (every 5 min, not every event).
 const SELF_HEAL_WINDOW_SECS: u64 = 300;
+
+/// Collapse window for the `Writeback EXHAUSTED retries` page.
+///
+/// The alert is per-JOB, and two classes of failure exhaust a job on its
+/// FIRST attempt without ever touching the retry budget:
+///
+/// * non-retryable errors (`Recipe` / `SchemaDrift` / `IntentMismatch` /
+///   `Serde` / `Config` / `Disabled`) — routed straight to
+///   `force_exhaust_job` by `mark_failed_with_retryable`;
+/// * panics — force-exhausted by the main loop's `JoinError` arm.
+///
+/// So one bad recipe or one vendor schema change pages once per affected
+/// row, at full drain speed, and every `await`ed Slack POST slows the drain
+/// further. We collapse repeats of the same `(intent, error-class)` inside
+/// this window into a single follow-up message carrying the suppressed
+/// count. Sized to match `SELF_HEAL_WINDOW_SECS` — long enough to absorb a
+/// full-queue drain of one bad class, short enough that a genuinely new
+/// burst pages within a coffee break.
+///
+/// The FIRST occurrence of a class is never suppressed: it is the
+/// actionable one, and it carries the full error text.
+const EXHAUSTED_ALERT_WINDOW_SECS: u64 = 300;
 
 /// Listener supervisor: max consecutive immediate failures before we slow
 /// down + page the operator (audit LOW-3). Matches the ~10 retries-in-50s
@@ -560,6 +583,89 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
+/// What the queue row looked like in the instant BEFORE this claim flipped
+/// it to `in_progress`.
+///
+/// **Why this has to be captured at claim time.** `mark_done` used to read
+/// the "prior" status itself, via a `WITH prev AS (SELECT status …)` CTE on
+/// its own UPDATE. That never worked: `claim_next_job` commits the flip to
+/// `in_progress` in an EARLIER statement, so by the time `mark_done` runs
+/// the pre-image is long gone and its CTE could only ever observe
+/// `in_progress` (and its UPDATE gate requires exactly that anyway). The
+/// `exhausted → done` branch was unreachable, which silently killed the
+/// `:white_check_mark:` closure alert for the single most actionable page
+/// in this binary. The claim statement is the last place the pre-image
+/// exists, so it is captured there and carried in memory.
+///
+/// **Why this is a classification, not a raw status string.** An
+/// `exhausted` row is terminal — `claim_next_job` deliberately never
+/// selects one (operator triage is the only way out). The documented
+/// recovery, printed in `send_exhausted_alert`'s own remediation text, is
+/// `UPDATE writeback_jobs SET status='pending', attempts=0,
+/// next_retry_at=NULL`. So even at claim time the literal status of a
+/// recovered job reads `pending`, never `exhausted`, and a naive
+/// `prior_status == "exhausted"` comparison would stay dead. We recognise
+/// the *shape* the operator's reset leaves behind instead — see
+/// [`classify_prior_disposition`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PriorDisposition {
+    /// Enqueued and never attempted: `pending` with no error residue.
+    Fresh,
+    /// A normal retry — either `failed` with a scheduled `next_retry_at`,
+    /// or a stale `in_progress` claim stolen back from a crashed worker.
+    /// No operator was ever paged for this row.
+    Retrying,
+    /// The row had reached the terminal `exhausted` state — meaning
+    /// `send_exhausted_alert` paged an operator for it — and was put back
+    /// into the queue by hand. Success on this attempt is the closure of
+    /// that page.
+    RecoveredFromExhausted,
+}
+
+/// Classify the claim-time pre-image of a queue row. Pure — the whole
+/// point is that the `exhausted → done` transition can be unit-tested
+/// without a database.
+///
+/// Recognised shapes:
+///
+/// * `exhausted` — a literal terminal pre-image. Unreachable while
+///   `claim_next_job` excludes the state, but classified correctly so the
+///   detection does not silently die again if that predicate is ever
+///   widened.
+/// * `pending` + carries a `last_error` + has NO scheduled retry — the
+///   fingerprint of an operator reset from `exhausted`, and it is
+///   unambiguous in this schema:
+///     - enqueue INSERTs `pending` with `last_error` NULL (migration 011
+///       default), so a fresh row never carries an error;
+///     - `mark_failed`'s non-terminal branch always writes
+///       `next_retry_at = NOW() + backoff`, so a retrying row always has
+///       one scheduled AND sits in `failed`, not `pending`;
+///     - only `mark_failed`'s terminal branch and `force_exhaust_job`
+///       produce (`last_error` set, `next_retry_at` NULL) — and both write
+///       `exhausted`;
+///     - nothing in this codebase writes `pending` after the initial
+///       INSERT.
+///
+///   Residual over-fire: an operator who hand-resets a merely `failed` row
+///   with the same SQL gets a closure alert without a preceding
+///   `:rotating_light:`. The statement it makes ("a job that was in an
+///   error state has now succeeded") is still true, so this is left as-is.
+/// * anything else — an ordinary retry.
+fn classify_prior_disposition(
+    prior_status: &str,
+    prior_had_error: bool,
+    prior_retry_scheduled: bool,
+) -> PriorDisposition {
+    match prior_status {
+        "exhausted" => PriorDisposition::RecoveredFromExhausted,
+        "pending" if prior_had_error && !prior_retry_scheduled => {
+            PriorDisposition::RecoveredFromExhausted
+        }
+        "pending" => PriorDisposition::Fresh,
+        _ => PriorDisposition::Retrying,
+    }
+}
+
 /// Claimed job — what we got from `writeback_jobs` after the atomic claim.
 ///
 /// `claimed_at` is the exact `NOW()` the claim UPDATE stamped onto the row.
@@ -585,6 +691,12 @@ struct ClaimedJob {
     idempotency_key: Uuid,
     attempts: i32,
     claimed_at: DateTime<Utc>,
+    /// The row's state in the instant before THIS claim flipped it to
+    /// `in_progress`, captured from the claim statement's own pre-image.
+    /// Threaded to `mark_done` so it can detect the `exhausted → done`
+    /// recovery and post the closure alert. See [`PriorDisposition`] for
+    /// why it cannot be re-read later.
+    prior: PriorDisposition,
 }
 
 /// Atomically claim the next pending / retry-eligible / stuck job.
@@ -604,28 +716,45 @@ struct ClaimedJob {
 /// `exhausted` rows are never re-claimed — they require operator triage and
 /// a manual status reset. The Slack alert sent at the moment of exhaustion
 /// is the operator's notification path.
+///
+/// **Pre-image capture.** The victim sub-select is a CTE rather than a bare
+/// scalar sub-query so it can also project the row's PRE-claim
+/// `status` / `last_error` / `next_retry_at`. Every CTE and the main query
+/// share one statement snapshot, so `victim` sees the row as it was BEFORE
+/// this UPDATE's own flip to `in_progress` — the last point at which that
+/// state is observable. `mark_done` cannot re-derive it (the flip has
+/// committed by then), so it is classified here and carried on
+/// `ClaimedJob`. See [`PriorDisposition`].
 async fn claim_next_job(pg: &PgPool, max_attempts: i32) -> Result<Option<ClaimedJob>, sqlx::Error> {
     let row = sqlx::query(
         r#"
-        UPDATE writeback_jobs
+        WITH victim AS (
+            SELECT id,
+                   status                      AS prior_status,
+                   (last_error IS NOT NULL)    AS prior_had_error,
+                   (next_retry_at IS NOT NULL) AS prior_retry_scheduled
+              FROM writeback_jobs
+             WHERE (status = 'pending')
+                OR (status = 'failed'
+                    AND attempts < $1
+                    AND (next_retry_at IS NULL OR next_retry_at <= NOW()))
+                OR (status = 'in_progress'
+                    AND attempts < $1
+                    AND claimed_at IS NOT NULL
+                    AND claimed_at < NOW() - make_interval(secs => $2))
+             ORDER BY created_at
+             FOR UPDATE SKIP LOCKED
+             LIMIT 1
+        )
+        UPDATE writeback_jobs wj
            SET status     = 'in_progress',
-               attempts   = attempts + 1,
+               attempts   = wj.attempts + 1,
                claimed_at = NOW()
-         WHERE id = (
-             SELECT id FROM writeback_jobs
-              WHERE (status = 'pending')
-                 OR (status = 'failed'
-                     AND attempts < $1
-                     AND (next_retry_at IS NULL OR next_retry_at <= NOW()))
-                 OR (status = 'in_progress'
-                     AND attempts < $1
-                     AND claimed_at IS NOT NULL
-                     AND claimed_at < NOW() - make_interval(secs => $2))
-              ORDER BY created_at
-              FOR UPDATE SKIP LOCKED
-              LIMIT 1
-         )
-        RETURNING id, intent, payload, aggregate_id, idempotency_key, attempts, claimed_at
+          FROM victim v
+         WHERE wj.id = v.id
+        RETURNING wj.id, wj.intent, wj.payload, wj.aggregate_id, wj.idempotency_key,
+                  wj.attempts, wj.claimed_at,
+                  v.prior_status, v.prior_had_error, v.prior_retry_scheduled
         "#,
     )
     .bind(max_attempts)
@@ -646,6 +775,23 @@ async fn claim_next_job(pg: &PgPool, max_attempts: i32) -> Result<Option<Claimed
     // against a parallel janitor steal (audit MED-2).
     let claimed_at: DateTime<Utc> = row.try_get("claimed_at")?;
 
+    // Pre-claim state, projected by the `victim` CTE from the same snapshot
+    // (i.e. before this statement's own flip). Classified here because this
+    // is the last place the information exists — `mark_done` runs after the
+    // flip has committed and can only ever see `in_progress`.
+    let prior_status: String = row.try_get("prior_status")?;
+    let prior_had_error: bool = row.try_get("prior_had_error")?;
+    let prior_retry_scheduled: bool = row.try_get("prior_retry_scheduled")?;
+    let prior = classify_prior_disposition(&prior_status, prior_had_error, prior_retry_scheduled);
+    if prior == PriorDisposition::RecoveredFromExhausted {
+        tracing::info!(
+            job_id = id,
+            prior_status = %prior_status,
+            "Claimed a job that was previously exhausted (operator reset) — \
+             a closure alert will fire if this attempt succeeds"
+        );
+    }
+
     // Deserialize payload into the matching variant. The JSON shape is
     // produced by `serde(tag = "intent", content = "payload")` — the queue's
     // separate `intent` column is what the dispatcher uses, but the JSON
@@ -661,6 +807,7 @@ async fn claim_next_job(pg: &PgPool, max_attempts: i32) -> Result<Option<Claimed
         idempotency_key,
         attempts,
         claimed_at,
+        prior,
     }))
 }
 
@@ -802,6 +949,7 @@ async fn process_job(
                 job.aggregate_id,
                 &job.intent,
                 slack,
+                job.prior,
                 legacy_ids.into_json(),
             )
             .await;
@@ -1719,11 +1867,19 @@ async fn salvage_legacy_ids(
 /// Without step 1, step 2 fails with "ModifyBooking requires resolved
 /// legacy_book_id".
 ///
-/// Audit LOW-2: the UPDATE captures the *prior* status via a CTE so we can
-/// detect the `exhausted → done` transition (operator manually fixed +
-/// reset the row to `pending`, the next attempt succeeded). On that
-/// transition we post a `:white_check_mark:` Slack so the operator sees
+/// Audit LOW-2: on an `exhausted → done` transition (operator manually
+/// fixed the cause + put the row back in the queue, and this attempt
+/// succeeded) we post a `:white_check_mark:` Slack so the operator sees
 /// closure, not just the original `:rotating_light:` alarm.
+///
+/// **The transition is detected from `prior`, not from PG.** This UPDATE
+/// used to carry a `WITH prev AS (SELECT status …)` CTE for that purpose,
+/// which was dead code from the day it was written: `claim_next_job`
+/// commits the flip to `in_progress` in an earlier statement, so the CTE
+/// read a post-claim snapshot and `prior_status` was invariably
+/// `in_progress` — doubly so, since the UPDATE's own gate below requires
+/// exactly that value. The pre-image is now captured by the claim
+/// statement and threaded in as [`PriorDisposition`].
 ///
 /// **Claim-gating (audit MED-2):** the UPDATE matches only when
 /// `status='in_progress' AND claimed_at = $X`. If a slow recipe ran past
@@ -1744,28 +1900,22 @@ async fn mark_done(
     aggregate_id: Uuid,
     intent: &WritebackIntent,
     slack: &Option<SlackClient>,
+    prior: PriorDisposition,
     legacy_ids: serde_json::Value,
 ) {
-    // CTE pattern keeps prior-status capture atomic with the status flip —
-    // no race between SELECT and UPDATE in case another worker / janitor
-    // touches the row mid-call. The MED-2 claim-gate (status + claimed_at)
-    // lives on the UPDATE, not on the prev SELECT — we still want to read
-    // the row's prior_status for the LOW-2 closure alert even if the gate
-    // would otherwise reject our update.
+    // No prior-status CTE here — see the doc comment. The pre-image is
+    // carried in `prior`; this statement only needs the MED-2 claim-gate
+    // (status + claimed_at) and the columns the closure alert reports.
     let row = sqlx::query(
         r#"
-        WITH prev AS (
-            SELECT id, status AS prior_status FROM writeback_jobs WHERE id = $1
-        )
         UPDATE writeback_jobs wj
            SET status       = 'done',
                completed_at = NOW(),
                legacy_ids   = $2
-          FROM prev
-         WHERE wj.id = prev.id
+         WHERE wj.id = $1
            AND wj.status = 'in_progress'
            AND wj.claimed_at = $3
-        RETURNING wj.attempts, wj.intent, wj.aggregate_id, prev.prior_status
+        RETURNING wj.attempts, wj.intent, wj.aggregate_id
         "#,
     )
     .bind(job_id)
@@ -1776,9 +1926,10 @@ async fn mark_done(
 
     match &row {
         Ok(Some(r)) => {
-            let prior_status: String = r.try_get("prior_status").unwrap_or_default();
-            // LOW-2: closure alert on operator-driven recovery.
-            if prior_status == "exhausted" {
+            // LOW-2: closure alert on operator-driven recovery. `prior` was
+            // classified from the claim statement's pre-image (the only
+            // place it is observable) and carried here on `ClaimedJob`.
+            if prior == PriorDisposition::RecoveredFromExhausted {
                 let attempts: i32 = r.try_get("attempts").unwrap_or(0);
                 let intent_name: String = r.try_get("intent").unwrap_or_default();
                 let agg: Option<Uuid> = r.try_get("aggregate_id").ok();
@@ -2510,9 +2661,158 @@ async fn mark_failed(
     }
 }
 
+/// Coarse failure class for an exhausted job, derived from the message text.
+///
+/// Deliberately string-based rather than typed: `send_exhausted_alert` is
+/// reached from four call sites (`mark_failed`'s terminal branch,
+/// `force_exhaust_job` via the non-retryable route, the panic arm of the
+/// main loop, and the resolver/pool/trancount pre-dispatch failures), and
+/// only one of them still holds a `WritebackError`. Classifying the
+/// rendered message keeps every path on the same key without threading a
+/// typed error through call sites that never had one.
+///
+/// The prefixes are the `#[error(...)]` Display forms in
+/// `writeback::error::WritebackError` plus the four messages this binary
+/// synthesises itself. Returns `&'static str` so the throttle map's key
+/// space stays bounded by construction (intents are a fixed enum, classes
+/// a fixed list) — no unbounded growth from attacker- or vendor-controlled
+/// error text.
+fn classify_error_kind(err_msg: &str) -> &'static str {
+    // Worker-synthesised prefixes first — these wrap an inner error whose
+    // own prefix would otherwise win the match.
+    const PREFIXES: &[(&str, &str)] = &[
+        ("PANIC:", "panic"),
+        ("resolve_legacy_ids:", "resolve_legacy_ids"),
+        ("mssql_acquire:", "mssql_acquire"),
+        ("trancount_reset:", "trancount_reset"),
+        ("legacy schema drift:", "schema_drift"),
+        ("writeback disabled by", "disabled"),
+        ("intent payload mismatch:", "intent_mismatch"),
+        ("recipe error:", "recipe"),
+        ("legacy connection pool:", "pool"),
+        ("payload deserialize:", "serde"),
+        ("tiberius:", "tiberius"),
+        ("sqlx:", "sqlx"),
+        ("config:", "config"),
+    ];
+    for (prefix, kind) in PREFIXES {
+        if err_msg.starts_with(prefix) {
+            return kind;
+        }
+    }
+    "other"
+}
+
+/// Throttle key: one collapse window per `(intent, error-class)` pair.
+/// Keeping the intent in the key means a recipe broken for `CreateBooking`
+/// does not mask an unrelated `CheckOut` failure that starts during the
+/// same window.
+type ExhaustedAlertKey = (String, &'static str);
+
+/// Open collapse window for one [`ExhaustedAlertKey`].
+#[derive(Debug)]
+struct ExhaustedAlertWindow {
+    /// When the alert that opened this window was SENT.
+    opened_at: Instant,
+    /// Alerts collapsed into this window since then (excludes the one that
+    /// opened it).
+    suppressed: u32,
+}
+
+/// Outcome of the throttle check — pure decision, split out from the Slack
+/// POST so the collapse rules are unit-testable without a webhook.
+#[derive(Debug, PartialEq, Eq)]
+enum ExhaustedAlertDecision {
+    /// Post to Slack. `collapsed` is how many alerts for this key were
+    /// suppressed since the previous send — 0 on a first occurrence, >0 on
+    /// the first send after a window that absorbed repeats.
+    Send { collapsed: u32 },
+    /// Do not post. `collapsed` is the running suppressed count inside the
+    /// currently-open window.
+    Suppress { collapsed: u32, window_secs: u64 },
+}
+
+/// Open collapse windows, keyed by `(intent, error-class)`.
+type ExhaustedAlertWindows = HashMap<ExhaustedAlertKey, ExhaustedAlertWindow>;
+
+/// Process-global collapse state. `OnceLock` + `Mutex` mirrors
+/// `SELF_HEAL_COUNTER` — keeps the call-site change to a single lookup
+/// instead of threading throttle state through `mark_failed` /
+/// `force_exhaust_job` / the panic arm.
+static EXHAUSTED_ALERT_WINDOWS: OnceLock<Arc<Mutex<ExhaustedAlertWindows>>> = OnceLock::new();
+
+/// Lazily get-or-init the process-global exhausted-alert collapse state.
+fn exhausted_alert_windows() -> &'static Arc<Mutex<ExhaustedAlertWindows>> {
+    EXHAUSTED_ALERT_WINDOWS.get_or_init(|| Arc::new(Mutex::new(ExhaustedAlertWindows::new())))
+}
+
+/// Pure collapse decision for the exhausted-job page.
+///
+/// Rules — chosen so the alert stays trustworthy under a bad-recipe drain
+/// while never hiding the actionable first signal:
+///
+///   - No open window for the key ⇒ **send immediately**, open a window.
+///     The first occurrence is the one an operator acts on and it carries
+///     the full error text.
+///   - Inside an open window ⇒ **suppress**, bump the count. This is the
+///     bad-recipe drain case: N identical pages become one line of context
+///     on the next send instead of N webhook round-trips in the hot path.
+///   - Window expired ⇒ **send**, reporting how many were collapsed while
+///     it was open, and reopen. A sustained outage therefore pages once per
+///     `window`, each time stating the true volume.
+///
+/// Expired windows that absorbed nothing are dropped, so the map stays at
+/// the size of the currently-failing key set rather than every pair ever
+/// seen. (Dropping them is behaviour-preserving: a fresh insert and an
+/// expired-with-zero window both yield `Send { collapsed: 0 }`.)
+fn decide_exhausted_alert(
+    windows: &mut ExhaustedAlertWindows,
+    key: ExhaustedAlertKey,
+    now: Instant,
+    window: Duration,
+) -> ExhaustedAlertDecision {
+    windows.retain(|k, w| {
+        k == &key || w.suppressed > 0 || now.duration_since(w.opened_at) < window
+    });
+
+    match windows.get_mut(&key) {
+        Some(open) if now.duration_since(open.opened_at) < window => {
+            open.suppressed = open.suppressed.saturating_add(1);
+            ExhaustedAlertDecision::Suppress {
+                collapsed: open.suppressed,
+                window_secs: window.as_secs(),
+            }
+        }
+        Some(expired) => {
+            let collapsed = expired.suppressed;
+            expired.opened_at = now;
+            expired.suppressed = 0;
+            ExhaustedAlertDecision::Send { collapsed }
+        }
+        None => {
+            windows.insert(
+                key,
+                ExhaustedAlertWindow {
+                    opened_at: now,
+                    suppressed: 0,
+                },
+            );
+            ExhaustedAlertDecision::Send { collapsed: 0 }
+        }
+    }
+}
+
 /// Post a Slack alert when a writeback job exhausts its retry budget.
 /// Best-effort — Slack failures are logged inside `send_message` but never
 /// propagated. Avoids blocking the writeback main loop on Slack timeouts.
+///
+/// Repeats of the same `(intent, error-class)` within
+/// `EXHAUSTED_ALERT_WINDOW_SECS` are collapsed (see
+/// [`decide_exhausted_alert`]). Suppression is never silent: every
+/// suppressed job logs at `warn` with its job_id, so a log grep still sees
+/// one line per affected row even though Slack sees one message per class
+/// per window. The unconditional per-job `tracing::error!` at both call
+/// sites is untouched.
 async fn send_exhausted_alert(
     slack: &SlackClient,
     job_id: i64,
@@ -2521,6 +2821,44 @@ async fn send_exhausted_alert(
     attempts: i32,
     err_msg: &str,
 ) {
+    let error_kind = classify_error_kind(err_msg);
+    let decision = {
+        // Short critical section, no awaits held across the lock. Poisoned
+        // lock ⇒ recover and continue: this is alert hygiene, not a
+        // correctness path.
+        let windows = exhausted_alert_windows();
+        let mut guard = match windows.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        decide_exhausted_alert(
+            &mut guard,
+            (intent.to_string(), error_kind),
+            Instant::now(),
+            Duration::from_secs(EXHAUSTED_ALERT_WINDOW_SECS),
+        )
+    };
+
+    let collapsed = match decision {
+        ExhaustedAlertDecision::Suppress {
+            collapsed,
+            window_secs,
+        } => {
+            tracing::warn!(
+                job_id,
+                intent,
+                error_kind,
+                collapsed,
+                window_secs,
+                "Writeback EXHAUSTED alert collapsed — same (intent, error class) \
+                 already paged inside the window; the job itself is still \
+                 exhausted and still needs triage"
+            );
+            return;
+        }
+        ExhaustedAlertDecision::Send { collapsed } => collapsed,
+    };
+
     let aggregate_id_str = aggregate_id
         .map(|u| u.to_string())
         .unwrap_or_else(|| "(unknown)".into());
@@ -2529,12 +2867,25 @@ async fn send_exhausted_alert(
     // pure head truncation would lose it. Slice on character boundaries
     // (Thai messages are multi-byte) by walking with `char_indices`.
     let truncated_err = truncate_head_tail(err_msg, 200, 300);
+    // Only present on a follow-up send, so the common single-failure page
+    // reads exactly as it always has.
+    let collapsed_line = if collapsed > 0 {
+        format!(
+            "*Also suppressed:* {collapsed} further `{intent}` / `{error_kind}` \
+             exhaustion(s) in the last {EXHAUSTED_ALERT_WINDOW_SECS}s — \
+             `SELECT * FROM writeback_jobs WHERE status='exhausted' AND intent='{intent}'`\n"
+        )
+    } else {
+        String::new()
+    };
     let text = format!(
         ":rotating_light: *Writeback EXHAUSTED retries* :rotating_light:\n\
          *Job ID:* `{job_id}`\n\
          *Intent:* `{intent}`\n\
          *Aggregate:* `{aggregate_id_str}`\n\
          *Attempts:* {attempts}\n\
+         *Error class:* `{error_kind}`\n\
+         {collapsed_line}\
          *Last error:*\n```\n{truncated_err}\n```\n\
          _Manual intervention required. Inspect_ \
          `SELECT * FROM writeback_jobs WHERE id = {job_id}` _and either fix \
@@ -3213,11 +3564,407 @@ mod tests {
             idempotency_key: Uuid::nil(),
             attempts: 1,
             claimed_at,
+            prior: PriorDisposition::RecoveredFromExhausted,
         };
         let cloned = job.clone();
         assert_eq!(cloned.claimed_at, claimed_at);
         assert_eq!(cloned.id, 42);
         assert_eq!(cloned.attempts, 1);
+        // The LOW-2 closure alert depends on this field surviving the copy
+        // from `claim_next_job` to `mark_done` — it is the ONLY carrier of
+        // the pre-claim status (see `PriorDisposition`).
+        assert_eq!(cloned.prior, PriorDisposition::RecoveredFromExhausted);
+    }
+
+    // -------------------------------------------------------------------
+    // Audit LOW-2 — `exhausted → done` detection
+    //
+    // Regression cover for the dead `:white_check_mark:` closure alert:
+    // `mark_done` read the "prior" status AFTER `claim_next_job` had
+    // already committed the flip to `in_progress`, so the transition test
+    // could never be true. The pre-image is now captured by the claim and
+    // classified by this pure helper.
+    // -------------------------------------------------------------------
+
+    /// THE regression test. The documented operator recovery — printed in
+    /// `send_exhausted_alert`'s own remediation text — is
+    /// `SET status='pending', attempts=0, next_retry_at=NULL`. That leaves
+    /// a `pending` row still carrying the `last_error` stamped when it
+    /// exhausted, and with no scheduled retry. That shape MUST classify as
+    /// a recovery, otherwise the closure alert stays dead exactly the way
+    /// it was before this fix (a literal `prior_status == "exhausted"`
+    /// comparison never matches, because a reset row no longer says
+    /// `exhausted` and `claim_next_job` refuses to claim one that does).
+    #[test]
+    fn prior_disposition_detects_operator_reset_from_exhausted() {
+        assert_eq!(
+            classify_prior_disposition("pending", true, false),
+            PriorDisposition::RecoveredFromExhausted,
+            "operator-reset-from-exhausted must be detected — this is the \
+             transition the RESOLVED alert exists for"
+        );
+    }
+
+    /// A literal `exhausted` pre-image also classifies as a recovery.
+    /// Unreachable today (the claim predicate excludes the state) but
+    /// pinned so widening that predicate can't silently kill detection a
+    /// second time.
+    #[test]
+    fn prior_disposition_detects_literal_exhausted_pre_image() {
+        assert_eq!(
+            classify_prior_disposition("exhausted", true, false),
+            PriorDisposition::RecoveredFromExhausted
+        );
+        // Residue flags must not override an explicit terminal status.
+        assert_eq!(
+            classify_prior_disposition("exhausted", false, true),
+            PriorDisposition::RecoveredFromExhausted
+        );
+    }
+
+    /// A never-attempted job is `pending` with no error residue — it must
+    /// NOT produce a closure alert, or every ordinary writeback would post
+    /// a `:white_check_mark:` and the signal would be worthless.
+    #[test]
+    fn prior_disposition_fresh_enqueue_is_not_a_recovery() {
+        assert_eq!(
+            classify_prior_disposition("pending", false, false),
+            PriorDisposition::Fresh
+        );
+    }
+
+    /// Ordinary retries must not produce a closure alert either. Covers
+    /// both retry shapes: `failed` with a scheduled backoff, and a stale
+    /// `in_progress` claim stolen back from a crashed worker.
+    #[test]
+    fn prior_disposition_ordinary_retries_are_not_recoveries() {
+        assert_eq!(
+            classify_prior_disposition("failed", true, true),
+            PriorDisposition::Retrying,
+            "a backoff retry never paged an operator — no closure to send"
+        );
+        assert_eq!(
+            classify_prior_disposition("in_progress", true, false),
+            PriorDisposition::Retrying,
+            "a janitor steal of a stuck claim is not an operator recovery"
+        );
+        assert_eq!(
+            classify_prior_disposition("done", false, false),
+            PriorDisposition::Retrying
+        );
+    }
+
+    /// Structural pin: `mark_done` must NOT reintroduce a post-claim read
+    /// of the row's status. The original bug was precisely a
+    /// `WITH prev AS (SELECT … status AS prior_status …)` CTE inside
+    /// `mark_done`, which ran after `claim_next_job` had committed the flip
+    /// and therefore could only ever observe `in_progress`. The pre-image
+    /// must come from the claim statement.
+    #[test]
+    fn mark_done_does_not_reread_prior_status_from_pg() {
+        let source = include_str!("writeback.rs");
+        let fn_start = source
+            .find("async fn mark_done(")
+            .expect("mark_done must exist");
+        let fn_body = &source[fn_start..];
+        let body_end = fn_body
+            .find("\n/// Write the recipe's allocated legacy identifiers")
+            .expect("mark_done must be followed by back_populate_legacy_ids' doc comment");
+        let body = &fn_body[..body_end];
+        assert!(
+            !body.contains("prior_status"),
+            "mark_done must not read prior_status from PG — by the time it \
+             runs, claim_next_job has already committed status='in_progress', \
+             so any such read is dead code. Use ClaimedJob.prior instead."
+        );
+        assert!(
+            body.contains("PriorDisposition::RecoveredFromExhausted"),
+            "mark_done must gate the closure alert on the carried \
+             PriorDisposition"
+        );
+    }
+
+    /// The claim statement is the only place the pre-image is observable,
+    /// so it must project all three inputs the classifier needs.
+    #[test]
+    fn claim_next_job_projects_the_pre_image() {
+        let source = include_str!("writeback.rs");
+        let fn_start = source
+            .find("async fn claim_next_job(")
+            .expect("claim_next_job must exist");
+        let body = &source[fn_start..fn_start + 3000];
+        for col in [
+            "prior_status",
+            "prior_had_error",
+            "prior_retry_scheduled",
+        ] {
+            assert!(
+                body.contains(col),
+                "claim_next_job must capture `{col}` — the pre-image cannot \
+                 be recovered after the claim commits"
+            );
+        }
+        assert!(
+            body.contains("FOR UPDATE SKIP LOCKED"),
+            "the pre-image CTE must keep the concurrent-claim guard"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // EXHAUSTED-alert collapse guard
+    //
+    // Non-retryable errors and panics bypass the retry budget and exhaust
+    // on the FIRST attempt, so one bad recipe paged once per affected row
+    // at full drain speed — each send `await`ed in the hot path.
+    // -------------------------------------------------------------------
+
+    /// First occurrence of a class is always immediate and un-collapsed —
+    /// it is the genuinely actionable page and carries the full error text.
+    #[test]
+    fn exhausted_alert_first_occurrence_sends_immediately() {
+        let mut windows = HashMap::new();
+        let now = Instant::now();
+        let decision = decide_exhausted_alert(
+            &mut windows,
+            ("create_booking".to_string(), "recipe"),
+            now,
+            Duration::from_secs(300),
+        );
+        assert_eq!(decision, ExhaustedAlertDecision::Send { collapsed: 0 });
+    }
+
+    /// An immediate repeat of the same `(intent, class)` is collapsed
+    /// rather than posted — this is the bad-recipe drain case.
+    #[test]
+    fn exhausted_alert_repeat_within_window_is_collapsed() {
+        let mut windows = HashMap::new();
+        let now = Instant::now();
+        let key = ("create_booking".to_string(), "recipe");
+        let window = Duration::from_secs(300);
+
+        let first = decide_exhausted_alert(&mut windows, key.clone(), now, window);
+        assert_eq!(first, ExhaustedAlertDecision::Send { collapsed: 0 });
+
+        // 50 more rows fail the same way while the window is open.
+        for expected in 1..=50u32 {
+            let d = decide_exhausted_alert(&mut windows, key.clone(), now, window);
+            assert_eq!(
+                d,
+                ExhaustedAlertDecision::Suppress {
+                    collapsed: expected,
+                    window_secs: 300,
+                },
+                "repeat #{expected} must be collapsed, not posted"
+            );
+        }
+    }
+
+    /// A DIFFERENT error class must not be collapsed behind an open window
+    /// — a schema drift starting during a recipe-failure drain is new
+    /// information and has to page.
+    #[test]
+    fn exhausted_alert_different_error_class_is_not_collapsed() {
+        let mut windows = HashMap::new();
+        let now = Instant::now();
+        let window = Duration::from_secs(300);
+
+        let _ = decide_exhausted_alert(
+            &mut windows,
+            ("create_booking".to_string(), "recipe"),
+            now,
+            window,
+        );
+        // Same intent, different class → sends.
+        let drift = decide_exhausted_alert(
+            &mut windows,
+            ("create_booking".to_string(), "schema_drift"),
+            now,
+            window,
+        );
+        assert_eq!(
+            drift,
+            ExhaustedAlertDecision::Send { collapsed: 0 },
+            "a new error class must page even mid-drain of another class"
+        );
+        // Same class, different intent → also sends.
+        let other_intent = decide_exhausted_alert(
+            &mut windows,
+            ("check_out".to_string(), "recipe"),
+            now,
+            window,
+        );
+        assert_eq!(
+            other_intent,
+            ExhaustedAlertDecision::Send { collapsed: 0 },
+            "a broken recipe for one intent must not mask another intent"
+        );
+    }
+
+    /// After the window expires the next occurrence sends AND reports how
+    /// many it absorbed, so nothing is silently dropped from Slack either.
+    #[test]
+    fn exhausted_alert_window_expiry_sends_with_collapsed_count() {
+        let mut windows = HashMap::new();
+        let t0 = Instant::now();
+        let key = ("create_booking".to_string(), "recipe");
+        let window = Duration::from_secs(60);
+
+        let _ = decide_exhausted_alert(&mut windows, key.clone(), t0, window);
+        for _ in 0..7 {
+            let _ = decide_exhausted_alert(&mut windows, key.clone(), t0, window);
+        }
+
+        let t1 = t0 + Duration::from_secs(61);
+        let d = decide_exhausted_alert(&mut windows, key.clone(), t1, window);
+        assert_eq!(
+            d,
+            ExhaustedAlertDecision::Send { collapsed: 7 },
+            "the follow-up page must state the true suppressed volume"
+        );
+
+        // And the counter resets for the new window.
+        let d2 = decide_exhausted_alert(&mut windows, key, t1, window);
+        assert_eq!(
+            d2,
+            ExhaustedAlertDecision::Suppress {
+                collapsed: 1,
+                window_secs: 60,
+            }
+        );
+    }
+
+    /// The key space must stay bounded — idle keys that absorbed nothing
+    /// are dropped so a long-lived worker doesn't accumulate one entry per
+    /// `(intent, class)` pair ever seen.
+    #[test]
+    fn exhausted_alert_windows_do_not_grow_unbounded() {
+        let mut windows = HashMap::new();
+        let t0 = Instant::now();
+        let window = Duration::from_secs(60);
+
+        for i in 0..25 {
+            let _ = decide_exhausted_alert(
+                &mut windows,
+                (format!("intent_{i}"), "recipe"),
+                t0,
+                window,
+            );
+        }
+        assert_eq!(windows.len(), 25);
+
+        // Long after everything expired, one new key prunes the idle ones.
+        let t1 = t0 + Duration::from_secs(600);
+        let _ = decide_exhausted_alert(&mut windows, ("fresh".to_string(), "panic"), t1, window);
+        assert_eq!(
+            windows.len(),
+            1,
+            "expired windows with nothing suppressed must be pruned"
+        );
+    }
+
+    /// A window that absorbed repeats must survive expiry until its count
+    /// has actually been reported — pruning it would silently discard the
+    /// suppressed volume.
+    #[test]
+    fn exhausted_alert_pending_counts_survive_pruning() {
+        let mut windows = HashMap::new();
+        let t0 = Instant::now();
+        let key = ("create_booking".to_string(), "recipe");
+        let window = Duration::from_secs(60);
+
+        let _ = decide_exhausted_alert(&mut windows, key.clone(), t0, window);
+        let _ = decide_exhausted_alert(&mut windows, key.clone(), t0, window);
+
+        // An unrelated key at a much later time triggers the prune.
+        let t1 = t0 + Duration::from_secs(600);
+        let _ = decide_exhausted_alert(&mut windows, ("other".to_string(), "panic"), t1, window);
+
+        let d = decide_exhausted_alert(&mut windows, key, t1, window);
+        assert_eq!(
+            d,
+            ExhaustedAlertDecision::Send { collapsed: 1 },
+            "the suppressed count must not be lost to pruning"
+        );
+    }
+
+    /// The collapse key depends on classifying the rendered error message,
+    /// so the prefixes must track `WritebackError`'s Display forms and the
+    /// messages this binary synthesises. A misclassification would collapse
+    /// two unrelated failure modes into one page.
+    #[test]
+    fn classify_error_kind_separates_the_non_retryable_classes() {
+        // These six bypass the retry budget entirely (is_retryable == false)
+        // and so exhaust on the FIRST attempt — the flood this guard exists
+        // for. Each must get its own key.
+        assert_eq!(
+            classify_error_kind("recipe error: no prior occupant for room 301"),
+            "recipe"
+        );
+        assert_eq!(
+            classify_error_kind("legacy schema drift: expected fingerprint a, got b"),
+            "schema_drift"
+        );
+        assert_eq!(
+            classify_error_kind("intent payload mismatch: CheckOut"),
+            "intent_mismatch"
+        );
+        assert_eq!(
+            classify_error_kind("payload deserialize: missing field `nights`"),
+            "serde"
+        );
+        assert_eq!(classify_error_kind("config: NEW_DB_NAME unset"), "config");
+        assert_eq!(
+            classify_error_kind("writeback disabled by WRITEBACK_ENABLED env var"),
+            "disabled"
+        );
+        // Panics skip the budget too (force_exhaust_job from the main loop).
+        assert_eq!(classify_error_kind("PANIC: index out of bounds"), "panic");
+    }
+
+    /// Retryable/wrapper classes must stay distinct from each other, and a
+    /// worker-synthesised wrapper must win over the inner error's prefix.
+    #[test]
+    fn classify_error_kind_wrapper_prefixes_win_over_inner() {
+        assert_eq!(classify_error_kind("tiberius: connection reset"), "tiberius");
+        assert_eq!(classify_error_kind("sqlx: pool timed out"), "sqlx");
+        assert_eq!(
+            classify_error_kind("legacy connection pool: timed out"),
+            "pool"
+        );
+        // The binary wraps these before they reach the alert — the wrapper
+        // is the useful class, not the inner driver error.
+        assert_eq!(
+            classify_error_kind("resolve_legacy_ids: sqlx: row not found"),
+            "resolve_legacy_ids"
+        );
+        assert_eq!(
+            classify_error_kind("mssql_acquire: legacy connection pool: timed out"),
+            "mssql_acquire"
+        );
+        assert_eq!(
+            classify_error_kind("trancount_reset: tiberius: broken pipe"),
+            "trancount_reset"
+        );
+        assert_eq!(classify_error_kind("something unexpected"), "other");
+        assert_eq!(classify_error_kind(""), "other");
+    }
+
+    /// The collapse window must be a real throttle but not a black hole.
+    /// Bound through a local (same idiom as
+    /// `queue_stuck_in_progress_age_mins_is_i32_for_make_interval`) so the
+    /// assertion isn't a compile-time constant, and so a type change at the
+    /// const site fails here rather than silently.
+    #[test]
+    fn exhausted_alert_window_is_in_safe_range() {
+        let window_secs: u64 = EXHAUSTED_ALERT_WINDOW_SECS;
+        assert!(
+            window_secs >= 60,
+            "<60s barely dents a full-speed queue drain"
+        );
+        assert!(
+            window_secs <= 3600,
+            ">1h would hide a genuinely new failure class for too long"
+        );
     }
 
     /// Wave 5a item 4 — the `Err(_)` arm of `mark_done`'s row-match
