@@ -70,6 +70,10 @@ Every variable consumed by `bin/sync`. Defaults are what
 | `LEGACY_SYNC_ALLOW_OVERFLOW` | `true` = start even when the watermark is already past CT retention on one or more tables (incremental rows since the watermark are silently skipped — DATA LOSS). | `false` | NEVER in production. Bootstrap is the supported path. See Section 4b for the shadow-mode trap that makes overflow a foreseeable scenario. |
 | `LEGACY_SYNC_ALLOW_LIVE_BOOTSTRAP` | `true` = allow `--bootstrap` to run while `LEGACY_SYNC_ENABLED=true` (i.e. against a live deployment). The bootstrap snapshot's `DELETE FROM legacy_mirror.<table>` races the watcher's `mirror_source='ct'` UPSERTs and can clobber real-time CT writes that landed during the snapshot window. | `false` | NEVER in production. Supported procedure: stop the watcher first (`LEGACY_SYNC_ENABLED=false` + redeploy), bootstrap, re-enable. |
 | `LEGACY_SYNC_RECONCILE_MODE` | Mode for the demoted `scheduler::sync::run_sync` job. `diff_only` = log drift to `ht_reconcile_log`; `upsert` = legacy 5-min-style UPSERT into `ht_*_legacy`. | `diff_only` | Flip to `upsert` ONLY if the CT watcher is operationally disabled and you need the legacy safety net to keep canonical state in sync. |
+| `SYNC_PER_TABLE_WATERMARK` | `false` = one shared `legacy_ct_state` row for all CT tables; `true` = one `legacy_ct_state_per_table` row each (R3). Per-table stops a wedge on one hot table gating every other table's advance. | `false` | Staged: HF Ville first (`HFVILLE_SYNC_PER_TABLE_WATERMARK=true`), soak 24h, then HF Hotel. Migration 078 must have run first — it reseeds the per-table rows from the global watermark. See Section 9b. |
+| `WORKER_RECONCILE_ENABLED` | Runs the reconcile sweep inside the `sync` worker instead of the backend cron. This is how HF Ville gets a reconcile backstop at all (the backend cron only ever covered HF Hotel). | `false` (HF Hotel, uses backend cron) / `true` (HF Ville) | Leave as-is. HF Ville's is load-bearing — turning it off leaves that site with no backstop, which is exactly the 2026-06-28 gap. |
+| `RECONCILE_FORCE_CONVERGE_ENABLED` | Auto-repairs **value** drift by re-running the mapper. **`customers` and `rooms` only** — bookings/checkins are multi-row aggregates and fall through untouched. | `false` in-repo | Already `true` in production on HF Ville via GH repo variable. Check `gh variable list`, never compose, for live state. |
+| `RECONCILE_REINGEST_MISSING_PG_ENABLED` | Auto-repairs **`missing_pg`** rows (legacy row exists, canonical PG has none) by re-running the mapper for that key. PG-write-only; never writes legacy. Customers are processed before bookings so FK-defer ordering holds. Rows whose legacy row has *vanished* are left open for operator review. | `false` | This is the self-heal for a dropped CT event whose delta has aged past retention. Flip HF Ville first (`HFVILLE_RECONCILE_REINGEST_MISSING_PG_ENABLED=true`). See Section 9b. |
 | `CT_POLL_INTERVAL_MS` | How often the watcher polls MSSQL CT. Lower = lower latency, higher load. | `1000` (1s) | Increase only if MSSQL load is a concern. |
 | `LEGACY_SYNC_CT_KEEPALIVE_SECS` | `> 0` = a sibling task runs a read-only `CHANGE_TRACKING_CURRENT_VERSION()` on this cadence to keep the CT version machinery warm. The per-tick `SELECT 1` keeps the *connection* warm but not CT, so on a quiescent overnight iHOTEL the watchdog's first CT probe after a lull can answer slower than its 30s budget → the benign `:information_source: CT watermark idle — probe timed out`. Keeping CT hot makes that probe return fast (and classify a *real* backlog correctly instead of masking it as a timeout). | `45` (HF Hotel) / `0` (HF Ville, off) | Enabled at 45s for HF Hotel (2026-06-30). Ville wired but off — flip `HFVILLE_LEGACY_SYNC_CT_KEEPALIVE_SECS=45` in `.env` to enable (no code change). 45 sits under the 60s pool idle_timeout. Read-only; no writeback; safe to enable without reception coordination. |
 | `SYNC_TEST_SKIP_MSSQL_PROBE` | Test-only. `true` = skip the bb8-tiberius probe in `tests/test_sync_phase54_integration.rs::mssql_stub`. | unset | Set when running pure-PG tests without legacy MSSQL access (saves 30s per process). |
@@ -92,6 +96,7 @@ prefixed so they're triagable in one glance.
 | `:no_entry: CT watcher REFUSED TO START` (retention overflow) | At startup, `MIN_VALID_VERSION` is higher than the watermark on at least one CT-tracked table. CT history we'd need to catch up has aged out. The pre-flight check refuses rather than silently skipping rows. | Run the bootstrap procedure (Section 1) — `--bootstrap` re-snapshots canonical PG and stamps the watermark to `CHANGE_TRACKING_CURRENT_VERSION()`. After bootstrap, restart the watcher. See Section 4b for the shadow-mode trap that triggers this. |
 | `:no_entry: Bootstrap REFUSED — live deployment` | Operator ran `--bootstrap` while `LEGACY_SYNC_ENABLED=true`. The snapshot would race the live CT watcher's UPSERTs and clobber `mirror_source='ct'` rows. | Stop the watcher first (set `LEGACY_SYNC_ENABLED=false` and redeploy), then run `--bootstrap`, then re-enable. Set `LEGACY_SYNC_ALLOW_LIVE_BOOTSTRAP=true` ONLY if you accept the race window. |
 | `:rotating_light: CT retention overflow` | A specific table's `MIN_VALID_VERSION` is higher than the watermark — CT history we needed has aged out (default retention 2 days). | Re-bootstrap (Section 1). The reconcile inside `--bootstrap` will catch us up via the canonical UPSERT path. |
+| `:warning: Sync lag unconverged >4h` (`level_drift_alert`) | At least one `ht_reconcile_log` row for that table has been unresolved for over 4 hours. Level-triggered, 24h per-table cooldown — catches a *single* stuck row, which the §9 rate alert structurally cannot. | Triage per Section 9b. Most actionable shape is `divergence_kind = missing_pg` with a still-live legacy row: a dropped CT event, healed by the re-ingest arm. Pairs with a `:white_check_mark:` all-clear that also clears the cooldown. |
 | Mapper consecutive-failure threshold (future) | Per-table `legacy_sync_status.consecutive_failures` exceeds N. | Inspect `legacy_sync_status.last_error` for that table; check mapper logs for the failing CT row payload. |
 
 **Watermark watchdog — what reaches Slack (2026-06-30).** The watchdog
@@ -569,9 +574,9 @@ SELECT detected_at, legacy_pk, pg_hash, mssql_hash,
 
 | Pattern | Likely cause | Action |
 |---|---|---|
-| `pg_hash IS NULL` on most rows. | Bulk PG-miss — canonical rows never landed. Most often: CT retention overflow (Section 4b) or watcher offline window. | Cross-check `legacy_sync_status.last_processed_at` — stale on the matching MSSQL table? Run `--bootstrap` (Section 1). After bootstrap, mark the rows resolved: `UPDATE ht_reconcile_log SET resolved_at = now() WHERE resolved_at IS NULL AND table_name = 'customers';` |
+| `pg_hash IS NULL` on most rows. | Bulk PG-miss — canonical rows never landed. Most often: CT retention overflow (Section 4b) or watcher offline window. | Cross-check `legacy_sync_status.last_processed_at` — stale on the matching MSSQL table? Run `--bootstrap` (Section 1). **Prefer the re-ingest arm over the blanket UPDATE below**: with `RECONCILE_REINGEST_MISSING_PG_ENABLED=true` the sweep re-runs the mapper per key and closes each row only once canonical actually converges. The manual fallback — `UPDATE ht_reconcile_log SET resolved_at = now() WHERE resolved_at IS NULL AND table_name = 'customers';` — closes rows *whether or not* canonical landed, so it hides any key the bootstrap missed. Use it only when the arm is off. |
 | `pg_hash` and `mssql_hash` both populated, both differ on every row. | Mapper-projection bug — the CT watcher is writing canonical state but with a different shape than reconcile expects. | Pick one row, compare `mssql_row_json` to the canonical PG row, identify the diverging column. Fix the mapper in `src/sync/mappers/`, ship via CI. Mark rows resolved AFTER the next reconcile tick goes clean. |
-| Single isolated row, no pattern across `table_name`. | One-off CT overflow or a hand-edit on the legacy DB after a watcher restart. | Re-fire the CT mapper for that PK by writing a no-op UPDATE on the source MSSQL row, OR resolve by hand if the canonical PG state matches business intent. |
+| Single isolated row, no pattern across `table_name`. | One-off CT overflow, a dropped CT event, or a hand-edit on the legacy DB after a watcher restart. | If `pg_hash IS NULL` and the legacy row still exists, this is a **dropped CT event** — see Section 9b, the re-ingest arm heals it with no legacy write. Only if that arm is off: re-fire the CT mapper for that PK by writing a no-op UPDATE on the source MSSQL row, OR resolve by hand if the canonical PG state matches business intent. |
 | Counts climb monotonically each tick on the same `table_name`. | The watcher is offline for that table, OR a mapper consistently rejects the CT row. | Check `legacy_sync_status` for the matching MSSQL table — `last_error` non-NULL or `consecutive_failures` climbing means a mapper crash; restart the watcher after fixing. If `last_processed_at` is recent and `last_error` is NULL, the watcher is processing but the mapper silently swallows the row — file a bug. |
 
 **Step 3 — resolve.** Once the underlying cause is fixed (or
@@ -617,6 +622,68 @@ control-flow critical to the diff-only path but observability still
 depends on them. Do not delete without first updating any dashboards
 that read `sync_status`. The doc-comments in those functions carry
 this contract.
+
+---
+
+## 9b. The >4h unconverged alert (`level_drift_alert`)
+
+Distinct from the §9 *rate* alert (50/hour/table). This one is
+**level-triggered**: any table with at least one `ht_reconcile_log` row
+still unresolved after **4 hours** fires it, on a **24h per-table
+cooldown** (`ht_level_drift_alert_cooldowns`, migration 053). It exists
+to catch the case a rate alert structurally cannot — a *single* stuck
+row. Message shape:
+
+```
+[site=hfville] :warning: Sync lag unconverged >4h :warning:
+• `bookings`: 3 unresolved row(s)
+• `customers`: 1 unresolved row(s)
+```
+
+It now pairs with a `:white_check_mark:` all-clear when the table's stale
+rows clear; the all-clear also drops the cooldown row, so a recurrence
+alerts immediately rather than being swallowed by a stale 24h window.
+
+### Triage order
+
+1. **Age.** Under one sweep interval (15 min) → noise, the sweep closes
+   it. Days → durable, keep going.
+2. **Shape.** Pull the rows:
+   ```sql
+   SELECT id, table_name, legacy_pk, detected_at, now()-detected_at AS age,
+          divergence_kind, legacy_row_count, pg_row_count
+     FROM ht_reconcile_log
+    WHERE resolved_at IS NULL ORDER BY detected_at;
+   ```
+   `divergence_kind = missing_pg` with `pg_row_count = 0` and a *live*
+   legacy row is a **dropped CT event** — the mapper never ran for that
+   key. Do NOT go hunting for a mapper bug.
+3. **Confirm it's a drop, not an outage.** Check whether keys either side
+   landed (`legacy_cust_no IN (...)`, `legacy_book_id IN (...)`). Sibling
+   keys present ⇒ per-key miss, not a window. Then read the watcher's
+   advance log for the detection window and look for **another table**
+   moving the watermark past it:
+   ```
+   docker logs new-hotel-production-sync-hfville-1 \
+     --since <local-ts> --until <local-ts> | grep -a 'Advanced CT watermark'
+   ```
+   Remember the host renders `--since/--until` in **Thai local time** while
+   log lines are stamped **UTC**.
+4. **Heal.** With `RECONCILE_REINGEST_MISSING_PG_ENABLED=true` the sweep
+   re-runs the mapper for the key and closes the row once the hashes
+   converge — no legacy write, no manual SQL. If the legacy row has
+   vanished, the arm deliberately leaves the row open: that is a genuine
+   anomaly needing a human.
+
+### Escalation
+
+Only page on rows that survive multiple sweep cycles. A row that clears
+inside one tick is the system working. If a `missing_pg` row is older
+than CT's 2-day retention, the watcher can **never** redeliver it — a
+re-ingest (or `--bootstrap`) is the only path, so re-firing the alert
+without acting just burns the cooldown.
+
+Worked example: 2026-07-27 in `docs/coexistence/sync-incident-log.md`.
 
 ---
 

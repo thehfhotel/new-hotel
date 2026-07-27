@@ -267,14 +267,27 @@ services:
       #      Rollback = set back to false + redeploy (no state to undo — the
       #      already-written coordinates are converged on both sides).
       - LAYOUT_WRITEBACK_ENABLED=${LAYOUT_WRITEBACK_ENABLED:-false}
-      # Self-healing reconcile sweep (scheduler/sync.rs). When a diff-only
-      # reconcile row resists convergence past FORCE_CONVERGE_MIN_AGE_SECS (1h),
-      # re-project the legacy row through the CT mapper instead of leaving it
+      # Self-healing reconcile sweep (scheduler/sync.rs). NARROW BY DESIGN —
+      # NOT a general-purpose repair arm. It fires only for
+      # `table_name IN ('customers','rooms')` (single-PK mappers that are safe
+      # to re-drive idempotently; bookings/checkins hit the `_ => Ok(false)`
+      # arm at scheduler/sync.rs:2033-2035) and only for VALUE DRIFT — rows
+      # where BOTH hashes are present. `missing_pg` / `missing_mssql` rows are
+      # left open for the normal paths / operator review. When such a row
+      # resists convergence past FORCE_CONVERGE_MIN_AGE_SECS (1h), the sweep
+      # re-projects the legacy row through the CT mapper instead of leaving it
       # logged-but-unrepaired. Default OFF — the CT watcher + writeback do the
       # real reconciliation; this only catches durable lag. This backend runs
       # HF Hotel's reconcile; sync-hfville runs Ville's (its own override below).
       # Flip per-site: `gh variable set RECONCILE_FORCE_CONVERGE_ENABLED -b true`.
       - RECONCILE_FORCE_CONVERGE_ENABLED=${RECONCILE_FORCE_CONVERGE_ENABLED:-false}
+      # Self-healing RE-INGEST arm for the reconcile sweep's `missing_pg`
+      # rows — the dropped-CT-event class the force-converge arm above
+      # deliberately skips. SHIPS DARK (default false); flip per-site so Ville
+      # canaries first: `gh variable set RECONCILE_REINGEST_MISSING_PG_ENABLED
+      # -b true`. This backend runs HF Hotel's reconcile; sync-hfville runs
+      # Ville's (its own HFVILLE_ override below).
+      - RECONCILE_REINGEST_MISSING_PG_ENABLED=${RECONCILE_REINGEST_MISSING_PG_ENABLED:-false}
       # Tracing log level. Default `hotel_backend=info,tower_http=info`
       # matches `main.rs::tracing_subscriber::EnvFilter::try_from_default_env`'s
       # fallback. Override at deploy time to crank up debug logging
@@ -469,6 +482,21 @@ services:
       # "process every CT row from time-zero" footgun. Operator flips
       # via `--bootstrap` (preferred) or this env var (escape hatch).
       - LEGACY_SYNC_ALLOW_COLD_REPLAY=${LEGACY_SYNC_ALLOW_COLD_REPLAY:-false}
+      # Per-table CT watermarks (Resilience PR R3, migration 050). OFF = the
+      # single-row `legacy_ct_state` gates every table, so a row-lock wedge on
+      # one hot table stalls all 19. ON = each table advances independently
+      # from `legacy_ct_state_per_table`. SHIPS DARK (default false) — migration
+      # 078 re-seeds the per-table rows from the global watermark, which is the
+      # prerequisite for the flip; without it every table trips the CT
+      # retention-overflow page on the first tick. Flip per-site:
+      # `gh variable set SYNC_PER_TABLE_WATERMARK -b true`.
+      - SYNC_PER_TABLE_WATERMARK=${SYNC_PER_TABLE_WATERMARK:-false}
+      # Self-healing re-ingest arm for the reconcile sweep's `missing_pg` rows
+      # (dropped CT events). Only active in a process that runs a reconcile —
+      # this HF Hotel sync worker leaves WORKER_RECONCILE_ENABLED at its
+      # default-false, so today the knob lives here for symmetry and takes
+      # effect on `backend` (HF Hotel) / `sync-hfville` (Ville). Ships dark.
+      - RECONCILE_REINGEST_MISSING_PG_ENABLED=${RECONCILE_REINGEST_MISSING_PG_ENABLED:-false}
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,sync=info}
     secrets:
       - db_password
@@ -590,6 +618,17 @@ services:
       # in .env to enable — no code change. See docs/runbook-sync.md §2.
       - LEGACY_SYNC_CT_KEEPALIVE_SECS=${HFVILLE_LEGACY_SYNC_CT_KEEPALIVE_SECS:-0}
       - LEGACY_SYNC_ALLOW_COLD_REPLAY=${HFVILLE_LEGACY_SYNC_ALLOW_COLD_REPLAY:-false}
+      # Per-table CT watermarks (Resilience PR R3, migration 050) — sibling of
+      # the sync service's SYNC_PER_TABLE_WATERMARK above. Separate HFVILLE_
+      # override so Ville can soak the per-table path first. Prerequisite:
+      # migration 078's per-table reseed (Ville's rows were pinned at 9060
+      # against a global of 37843). SHIPS DARK (default false).
+      - SYNC_PER_TABLE_WATERMARK=${HFVILLE_SYNC_PER_TABLE_WATERMARK:-false}
+      # Self-healing re-ingest arm for `missing_pg` reconcile rows (dropped CT
+      # events) — sibling of the backend's RECONCILE_REINGEST_MISSING_PG_ENABLED.
+      # This worker DOES run Ville's reconcile (WORKER_RECONCILE_ENABLED above),
+      # so the knob is live here. Per-site so Ville canaries first. Ships dark.
+      - RECONCILE_REINGEST_MISSING_PG_ENABLED=${HFVILLE_RECONCILE_REINGEST_MISSING_PG_ENABLED:-false}
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,sync=info}
     secrets:
       - db_password

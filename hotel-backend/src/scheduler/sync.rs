@@ -55,11 +55,11 @@ use crate::db::{DbPool, PgPool};
 // sweep re-drives the EXISTING CT upsert path, so it reaches for the same
 // mappers / row-abstraction / op-enum the watcher uses rather than writing
 // canonical fields by hand.
+use crate::notifications::slack::{SlackClient, SlackMessage};
 use crate::sync::change_op::ChangeOp;
 use crate::sync::mapper::MssqlChangeMapper;
 use crate::sync::mappers::{CustomerMapper, RoomMasterMapper};
 use crate::sync::row::MappableRow;
-use crate::notifications::slack::{SlackClient, SlackMessage};
 
 /// Default per-table drift-count threshold above which a Slack alert is
 /// fired on the next reconcile tick. 50 unresolved rows for a single
@@ -243,8 +243,10 @@ pub async fn run_sync(
 ///      all sites that don't have a per-site override.
 ///   3. [`DEFAULT_DRIFT_ALERT_THRESHOLD`] — compiled-in fallback (50).
 fn drift_alert_threshold_from_env(site_id: &str) -> i64 {
-    let per_site_var =
-        format!("LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_{}", site_id.to_uppercase());
+    let per_site_var = format!(
+        "LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_{}",
+        site_id.to_uppercase()
+    );
     parse_threshold_env(&per_site_var)
         .or_else(|| parse_threshold_env("LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD"))
         .unwrap_or(DEFAULT_DRIFT_ALERT_THRESHOLD)
@@ -277,10 +279,7 @@ fn parse_threshold_env(var_name: &str) -> Option<i64> {
 /// breached the threshold (count strictly greater than threshold).
 ///
 /// Pulled out for unit testing — no PG dependency.
-pub fn tables_breaching_threshold(
-    counts: &[(String, i64)],
-    threshold: i64,
-) -> Vec<(String, i64)> {
+pub fn tables_breaching_threshold(counts: &[(String, i64)], threshold: i64) -> Vec<(String, i64)> {
     counts
         .iter()
         .filter(|(_, n)| *n > threshold)
@@ -308,11 +307,7 @@ pub fn tables_breaching_threshold(
 /// edge-trigger loses no observability. The hourly alert is now scoped
 /// to kinds where re-detection actually means something changed:
 /// `value`, `missing_pg`, `missing_mssql`.
-async fn check_drift_and_alert(
-    pg_pool: &PgPool,
-    slack: Option<&SlackClient>,
-    site_id: &str,
-) {
+async fn check_drift_and_alert(pg_pool: &PgPool, slack: Option<&SlackClient>, site_id: &str) {
     let threshold = drift_alert_threshold_from_env(site_id);
 
     let rows = sqlx::query_as::<_, (String, i64)>(
@@ -461,11 +456,7 @@ async fn level_alert_eligible_pg(
 /// in `ht_level_drift_alert_cooldowns`. Best-effort: a PG failure logs
 /// a warning but doesn't block the alert from going out — the worst
 /// case is one extra refire in 15 minutes.
-async fn mark_level_alert_sent_pg(
-    pg_pool: &PgPool,
-    site_id: &str,
-    table_name: &str,
-) {
+async fn mark_level_alert_sent_pg(pg_pool: &PgPool, site_id: &str, table_name: &str) {
     let result = sqlx::query(
         "INSERT INTO ht_level_drift_alert_cooldowns \
             (site_id, table_name, last_alerted_at) \
@@ -489,6 +480,178 @@ async fn mark_level_alert_sent_pg(
     }
 }
 
+/// Read every cooldown key currently recorded for `site_id` in
+/// `ht_level_drift_alert_cooldowns`. This is the "we alerted about this
+/// at some point and never told anyone it cleared" set that the recovery
+/// notification (see [`check_level_drift_recovery_and_notify`]) diffs
+/// against the tables that are still unconverged.
+///
+/// Fail-soft in the same style as [`level_alert_eligible_pg`]: a PG error
+/// yields an empty set (no all-clear fired this tick) plus a warning, and
+/// never aborts the sweep.
+async fn level_alert_cooldown_keys_pg(pg_pool: &PgPool, site_id: &str) -> Vec<String> {
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT table_name FROM ht_level_drift_alert_cooldowns WHERE site_id = $1",
+    )
+    .bind(site_id)
+    .fetch_all(pg_pool)
+    .await;
+
+    match rows {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                site = %site_id,
+                error = %e,
+                "[Sync] Failed to read level-drift cooldown keys — \
+                 skipping the sync-lag all-clear this tick"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Drop the `(site_id, table_name)` cooldown row so a RECURRENCE alerts
+/// on the very next tick instead of being swallowed by a stale 24h
+/// window. Called only after the paired `:white_check_mark:` all-clear
+/// has been emitted for that table.
+///
+/// Best-effort: a PG failure logs a warning and leaves the row in place —
+/// the worst case is one duplicate all-clear on the next tick.
+async fn clear_level_alert_cooldown_pg(pg_pool: &PgPool, site_id: &str, table_name: &str) {
+    let result = sqlx::query(
+        "DELETE FROM ht_level_drift_alert_cooldowns \
+          WHERE site_id = $1 AND table_name = $2",
+    )
+    .bind(site_id)
+    .bind(table_name)
+    .execute(pg_pool)
+    .await;
+
+    if let Err(e) = result {
+        tracing::warn!(
+            site = %site_id,
+            table = %table_name,
+            error = %e,
+            "[Sync] Failed to clear level-drift cooldown after all-clear — \
+             a recurrence may stay suppressed until the 24h window lapses"
+        );
+    }
+}
+
+/// Cooldown keys that live in `ht_level_drift_alert_cooldowns` but are
+/// NOT `ht_reconcile_log` table names. The cooldown table is shared: the
+/// stale-checkin tripwire parks its own key there
+/// ([`STALE_CHECKIN_COOLDOWN_KEY`]) so it inherits the same 24h
+/// per-site window. Those keys have no unconverged-row count to compare
+/// against, so the sync-lag all-clear must never claim them recovered or
+/// clear their cooldown — doing so would let the stale-checkin alert
+/// refire every 15 minutes.
+const NON_RECONCILE_COOLDOWN_KEYS: &[&str] = &[STALE_CHECKIN_COOLDOWN_KEY];
+
+/// Pure decision helper for the sync-lag all-clear. Given the cooldown
+/// keys recorded for a site and the tables that STILL have unconverged
+/// `ht_reconcile_log` rows past the stale threshold, return the tables
+/// that have recovered — i.e. we alerted about them at some point and
+/// they now have zero stale rows.
+///
+/// Non-reconcile cooldown keys ([`NON_RECONCILE_COOLDOWN_KEYS`]) are
+/// excluded: they are parked in the same table by other tripwires and
+/// carry no reconcile-row semantics. Output is de-duplicated and sorted
+/// so the Slack body and the log lines are deterministic.
+///
+/// Kept free of PG so the state-transition tests are plain unit tests.
+fn tables_recovered(cooldown_keys: &[String], still_stale_tables: &[String]) -> Vec<String> {
+    let mut recovered: Vec<String> = cooldown_keys
+        .iter()
+        .filter(|k| !NON_RECONCILE_COOLDOWN_KEYS.contains(&k.as_str()))
+        .filter(|k| !still_stale_tables.iter().any(|s| s == *k))
+        .cloned()
+        .collect();
+    recovered.sort();
+    recovered.dedup();
+    recovered
+}
+
+/// Paired recovery notification for [`check_level_drift_and_alert`].
+///
+/// The level-triggered alert was fire-and-forget: an operator who fixed
+/// the lag got silence, and a recurrence inside the 24h cooldown was
+/// silent too. This closes both gaps — when a table that currently HAS a
+/// cooldown row no longer has any unconverged rows older than the stale
+/// threshold, emit ONE `:white_check_mark:` all-clear naming the site and
+/// the table(s), then drop those cooldown rows so a recurrence alerts
+/// immediately.
+///
+/// Matches the two recovery-notification precedents in this codebase:
+/// `bin/writeback.rs::send_resolved_alert` (exhausted job RESOLVED) and
+/// `bin/sync.rs::format_recovery_message` (CT watermark RECOVERED).
+///
+/// Alert hygiene only — reads and writes NOTHING but the cooldown table,
+/// and is deliberately NOT behind any data-write feature flag.
+/// Best-effort throughout: a PG or Slack failure logs and continues.
+async fn check_level_drift_recovery_and_notify(
+    pg_pool: &PgPool,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+    still_stale_tables: &[String],
+) {
+    let cooldown_keys = level_alert_cooldown_keys_pg(pg_pool, site_id).await;
+    let recovered = tables_recovered(&cooldown_keys, still_stale_tables);
+
+    if recovered.is_empty() {
+        tracing::debug!(
+            site = %site_id,
+            cooldown_keys = cooldown_keys.len(),
+            still_stale = still_stale_tables.len(),
+            "[Sync] Sync-lag all-clear: nothing recovered this tick"
+        );
+        return;
+    }
+
+    for table in &recovered {
+        tracing::info!(
+            site = %site_id,
+            table,
+            stale_hours = LEVEL_DRIFT_STALE_INTERVAL_HOURS,
+            "[Sync] Sync-lag all-clear: table has no unconverged rows past threshold — \
+             clearing level-alert cooldown"
+        );
+    }
+
+    if let Some(slack) = slack {
+        let body = recovered
+            .iter()
+            .map(|t| format!("• `{t}`"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let msg = SlackMessage::with_site_text(
+            site_id,
+            format!(
+                ":white_check_mark: *Sync lag CLEARED* :white_check_mark:\n\
+                 Every `ht_reconcile_log` row older than \
+                 {LEVEL_DRIFT_STALE_INTERVAL_HOURS}h has converged for:\n\
+                 {body}\n\
+                 _Closure of the_ `:warning:` _sync-lag alert sent earlier. The \
+                 per-table {LEVEL_DRIFT_COOLDOWN_HOURS}h cooldown is reset, so a \
+                 recurrence alerts on the next tick instead of waiting out a stale \
+                 window._"
+            ),
+        );
+        slack.send_message(&msg).await;
+    } else {
+        tracing::info!(
+            site = %site_id,
+            "[Sync] Slack not configured; sync-lag all-clear logged only ({} table(s))",
+            recovered.len()
+        );
+    }
+
+    for table in &recovered {
+        clear_level_alert_cooldown_pg(pg_pool, site_id, table).await;
+    }
+}
+
 /// Track D / T7 HIGH-1 — level-triggered drift digest. Complements the
 /// edge-triggered `check_drift_and_alert` above: that one fires on
 /// volume (50 rows/hr in a single table), this one fires on persistence
@@ -502,12 +665,13 @@ async fn mark_level_alert_sent_pg(
 /// - For each table with ≥1 such row, emits a Slack alert if the
 ///   per-table cooldown (`LEVEL_DRIFT_COOLDOWN_HOURS`, default 24h) has
 ///   elapsed since the last level alert for that table+site.
+/// - Fires the paired all-clear for any table that HAS a cooldown row but
+///   no longer has stale rows (see
+///   [`check_level_drift_recovery_and_notify`]) — the alert used to be
+///   fire-and-forget, so an operator who fixed the lag got silence and a
+///   recurrence inside the 24h window was silent too.
 /// - Best-effort: a failed PG query or Slack POST only logs a warning.
-async fn check_level_drift_and_alert(
-    pg_pool: &PgPool,
-    slack: Option<&SlackClient>,
-    site_id: &str,
-) {
+async fn check_level_drift_and_alert(pg_pool: &PgPool, slack: Option<&SlackClient>, site_id: &str) {
     let rows = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(format!(
         "SELECT table_name, count(*) \
            FROM ht_reconcile_log \
@@ -530,6 +694,12 @@ async fn check_level_drift_and_alert(
             return;
         }
     };
+
+    // Paired recovery notification — MUST run before the `counts.is_empty()`
+    // early return below, because "no table has stale rows any more" is
+    // exactly the everything-recovered case an operator needs to hear about.
+    let still_stale_tables: Vec<String> = counts.iter().map(|(t, _)| t.clone()).collect();
+    check_level_drift_recovery_and_notify(pg_pool, slack, site_id, &still_stale_tables).await;
 
     if counts.is_empty() {
         tracing::debug!(
@@ -782,11 +952,7 @@ fn ct_lag_thresholds_from_env(site_id: &str) -> CtLagThresholds {
 /// Inputs are kept explicit (no env reads, no clock) so the unit tests
 /// can drive the truth table without spinning a tokio runtime or mocking
 /// PG/MSSQL.
-fn ct_lag_is_warning(
-    version_lag: i64,
-    poll_age_seconds: i64,
-    thresholds: CtLagThresholds,
-) -> bool {
+fn ct_lag_is_warning(version_lag: i64, poll_age_seconds: i64, thresholds: CtLagThresholds) -> bool {
     version_lag > thresholds.version_lag || poll_age_seconds > thresholds.poll_age_seconds
 }
 
@@ -811,6 +977,99 @@ async fn read_pg_ct_watermark(pg_pool: &PgPool) -> Result<PgCtWatermark, sqlx::E
         last_seen_version: row.0,
         last_polled_at: row.1,
     })
+}
+
+/// Resilience PR R3 — is the CT watcher holding per-table watermarks?
+///
+/// Mirrors the exact idiom `bin/sync.rs` uses to read the same flag
+/// (strict `== "true"`, default OFF) so the reconcile-tick health check
+/// and the watcher binary can never disagree about which watermark table
+/// is authoritative. When this is on, the single-row `legacy_ct_state`
+/// stops advancing and `legacy_ct_state_per_table` carries the real
+/// progress — see `crate::sync::watermark` for the dual-mode contract.
+fn per_table_watermark_enabled() -> bool {
+    env::var("SYNC_PER_TABLE_WATERMARK")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+/// One row of `legacy_ct_state_per_table`, as read by the per-tick CT
+/// health check in per-table-watermark mode.
+#[derive(Debug, Clone)]
+struct PerTableWatermark {
+    table_name: String,
+    last_seen_version: i64,
+    last_polled_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Read every `legacy_ct_state_per_table` row. An empty result means the
+/// per-table watermarks haven't been seeded yet (pre-migration-050 or
+/// pre-bootstrap) — the caller logs and skips, exactly like the global
+/// path's `RowNotFound` branch.
+async fn read_pg_ct_watermarks_per_table(
+    pg_pool: &PgPool,
+) -> Result<Vec<PerTableWatermark>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, i64, Option<chrono::DateTime<chrono::Utc>>)>(
+        "SELECT table_name, last_seen_version, last_polled_at \
+           FROM legacy_ct_state_per_table",
+    )
+    .fetch_all(pg_pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(table_name, last_seen_version, last_polled_at)| PerTableWatermark {
+                table_name,
+                last_seen_version,
+                last_polled_at,
+            },
+        )
+        .collect())
+}
+
+/// Pure picker for the per-table CT health check: given every per-table
+/// watermark row, the current legacy CT version, and `now`, return the
+/// STALEST table together with its `(version_lag, poll_age_seconds)`.
+///
+/// Ranking, in order: largest `version_lag` (i.e. smallest
+/// `last_seen_version`) first, then largest poll age (i.e. oldest
+/// `last_polled_at`), then `table_name` so the pick is deterministic when
+/// every table is equally healthy. A `NULL` `last_polled_at` is treated as
+/// infinitely old (`i64::MAX`), matching the global path's never-polled
+/// handling.
+///
+/// Returns `None` only for an empty input (per-table watermarks not seeded
+/// yet). Kept free of PG / env / clock so the unit tests can drive the
+/// ranking directly.
+fn stalest_per_table_watermark(
+    rows: &[PerTableWatermark],
+    current_version: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<(&PerTableWatermark, i64, i64)> {
+    rows.iter()
+        .map(|w| {
+            // A watermark AHEAD of `current_version` is a CT anomaly (the
+            // version is monotonic). `saturating_sub` alone does not help
+            // here — on a signed `i64` it saturates at `i64::MIN`, not at
+            // zero — so clamp explicitly. Without the clamp the log line
+            // would report a nonsensical negative lag. (The global arm keeps
+            // its pre-existing unclamped form so its behaviour stays
+            // byte-identical; it is unreachable in practice for the same
+            // monotonicity reason.)
+            let version_lag = current_version.saturating_sub(w.last_seen_version).max(0);
+            let poll_age_seconds = w
+                .last_polled_at
+                .map(|polled| now.signed_duration_since(polled).num_seconds().max(0))
+                .unwrap_or(i64::MAX);
+            (w, version_lag, poll_age_seconds)
+        })
+        .max_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| a.2.cmp(&b.2))
+                // `max_by` keeps the LAST maximum, so invert the name
+                // comparison to land on the alphabetically-first table.
+                .then_with(|| b.0.table_name.cmp(&a.0.table_name))
+        })
 }
 
 /// Read `SELECT CHANGE_TRACKING_CURRENT_VERSION()` from legacy MSSQL.
@@ -853,20 +1112,27 @@ async fn read_mssql_ct_current_version(
 /// [`check_drift_and_alert`] / [`check_level_drift_and_alert`] —
 /// degraded observability must never take down the rest of the tick.
 ///
-/// **TODO (R3 per-table watermark cutover):** this check reads only the
-/// global `legacy_ct_state WHERE id = 1` row. When `SYNC_PER_TABLE_WATERMARK`
-/// is enabled (per-table mode, planned for R3), the global row stops
-/// advancing and per-table watermarks live in `legacy_ct_state_per_table`.
-/// In that mode this check will produce a stuck `version_lag` warning every
-/// tick (`last_seen_version` frozen at bootstrap value), masking the real
-/// per-table lag. When the per-table flag is flipped, fan this comparison
-/// out per tracked table. The watchdog in `bin/sync.rs::watermark_stall_alert_eligible`
-/// has the same gap — track both in one follow-up.
-async fn check_ct_watcher_lag(
-    legacy_pool: &DbPool,
-    pg_pool: &PgPool,
-    site_id: &str,
-) {
+/// **Per-table watermark mode (R3).** `SYNC_PER_TABLE_WATERMARK` selects
+/// which watermark table is authoritative. With the flag OFF (default)
+/// this reads the global `legacy_ct_state WHERE id = 1` row — behaviour
+/// unchanged. With the flag ON the global row stops advancing (it freezes
+/// at its bootstrap value), so reading it would emit a permanently-stuck
+/// `version_lag` warning every tick and mask the real per-table lag;
+/// instead we read every `legacy_ct_state_per_table` row and report the
+/// STALEST table by name (see [`stalest_per_table_watermark`]). The
+/// sibling gap in `bin/sync.rs::watermark_stall_alert_eligible` lives in
+/// the CT-watcher binary and is tracked with that file.
+async fn check_ct_watcher_lag(legacy_pool: &DbPool, pg_pool: &PgPool, site_id: &str) {
+    if per_table_watermark_enabled() {
+        check_ct_watcher_lag_per_table(legacy_pool, pg_pool, site_id).await;
+    } else {
+        check_ct_watcher_lag_global(legacy_pool, pg_pool, site_id).await;
+    }
+}
+
+/// Global-watermark arm of [`check_ct_watcher_lag`] — the default path,
+/// byte-identical to the pre-R3 behaviour.
+async fn check_ct_watcher_lag_global(legacy_pool: &DbPool, pg_pool: &PgPool, site_id: &str) {
     let watermark = match read_pg_ct_watermark(pg_pool).await {
         Ok(w) => w,
         Err(sqlx::Error::RowNotFound) => {
@@ -943,6 +1209,93 @@ async fn check_ct_watcher_lag(
     } else {
         tracing::debug!(
             site = %site_id,
+            current_version,
+            last_seen_version,
+            version_lag,
+            poll_age_seconds,
+            "[Sync] CT watcher healthy"
+        );
+    }
+}
+
+/// Per-table-watermark arm of [`check_ct_watcher_lag`]. Reads every
+/// `legacy_ct_state_per_table` row, ranks them with
+/// [`stalest_per_table_watermark`], and reports the worst one WITH ITS
+/// TABLE NAME so an operator can see which table is behind rather than a
+/// meaningless global figure. Same warn/debug message text as the global
+/// arm (plus a `table` field) so existing log greps keep working.
+async fn check_ct_watcher_lag_per_table(legacy_pool: &DbPool, pg_pool: &PgPool, site_id: &str) {
+    let watermarks = match read_pg_ct_watermarks_per_table(pg_pool).await {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(
+                site = %site_id,
+                error = %e,
+                "[Sync] CT watcher health: failed to read legacy_ct_state_per_table — \
+                 observability degraded for this tick"
+            );
+            return;
+        }
+    };
+
+    if watermarks.is_empty() {
+        tracing::debug!(
+            site = %site_id,
+            "[Sync] CT watcher health: legacy_ct_state_per_table has no rows yet — \
+             watcher pre-bootstrap, skipping lag check"
+        );
+        return;
+    }
+
+    let current_version = match read_mssql_ct_current_version(legacy_pool).await {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            tracing::warn!(
+                site = %site_id,
+                "[Sync] CT watcher health: CHANGE_TRACKING_CURRENT_VERSION() \
+                 returned NULL — CT not enabled on legacy DB?"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                site = %site_id,
+                error = %e,
+                "[Sync] CT watcher health: failed to probe \
+                 CHANGE_TRACKING_CURRENT_VERSION() on legacy MSSQL — \
+                 observability degraded for this tick"
+            );
+            return;
+        }
+    };
+
+    let Some((stalest, version_lag, poll_age_seconds)) =
+        stalest_per_table_watermark(&watermarks, current_version, chrono::Utc::now())
+    else {
+        // Unreachable — `watermarks` is non-empty by the guard above.
+        return;
+    };
+
+    let last_seen_version = stalest.last_seen_version;
+    let thresholds = ct_lag_thresholds_from_env(site_id);
+    if ct_lag_is_warning(version_lag, poll_age_seconds, thresholds) {
+        tracing::warn!(
+            site = %site_id,
+            table = %stalest.table_name,
+            tables_tracked = watermarks.len(),
+            current_version,
+            last_seen_version,
+            version_lag,
+            poll_age_seconds,
+            version_threshold = thresholds.version_lag,
+            seconds_threshold = thresholds.poll_age_seconds,
+            "[Sync] CT watcher lag detected"
+        );
+    } else {
+        tracing::debug!(
+            site = %site_id,
+            table = %stalest.table_name,
+            tables_tracked = watermarks.len(),
             current_version,
             last_seen_version,
             version_lag,
@@ -1569,7 +1922,11 @@ async fn record_divergence(
 ///    and a freshly-computed canonical PG hash are both present, non-empty,
 ///    and equal. A `None` on either side is normally an intentional skip
 ///    (missing-PG cases must persist until canonical actually catches up;
-///    missing-MSSQL cases need operator review).
+///    missing-MSSQL cases need operator review). This helper NEVER resolves
+///    a missing-PG row on its own — the 2026-07-27 re-ingest arm makes
+///    canonical appear FIRST (see [`reingest_missing_pg_eligible`]) and only
+///    then re-tests through this same function, so the convergence contract
+///    below stays the single place a row can be closed.
 ///
 /// 2. **Stale-ghost convergence (bookings only)** — the legacy composite
 ///    key has since *disappeared* (`current_legacy_hash == None`) yet
@@ -1764,8 +2121,7 @@ async fn compute_legacy_checkin_hash_via_mapper(
     legacy_pool: &DbPool,
     cin_no: &str,
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let aggregate =
-        crate::sync::parent_loader::load_checkin_aggregate(legacy_pool, cin_no).await?;
+    let aggregate = crate::sync::parent_loader::load_checkin_aggregate(legacy_pool, cin_no).await?;
     if !aggregate.is_present() {
         return Ok(None);
     }
@@ -1807,7 +2163,10 @@ async fn fetch_legacy_customer_hash(
     let Some(row) = rows.first() else {
         return Ok(None);
     };
-    let row_cust_no = row.get::<&str, _>("Cust_no").unwrap_or_default().to_string();
+    let row_cust_no = row
+        .get::<&str, _>("Cust_no")
+        .unwrap_or_default()
+        .to_string();
     let cust_name = row.get::<&str, _>("Cust_name").map(String::from);
     let cust_type = row.get::<&str, _>("Cust_Type_Main").map(String::from);
     let cust_phone = row.get::<&str, _>("Cust_Add_tel").map(String::from);
@@ -1844,7 +2203,10 @@ async fn fetch_legacy_booking_hash(
 
     let mut groups: BTreeMap<(String, String), Vec<BookingDetail>> = BTreeMap::new();
     for row in &rows {
-        let row_book_no = row.get::<&str, _>("Book_No").unwrap_or_default().to_string();
+        let row_book_no = row
+            .get::<&str, _>("Book_No")
+            .unwrap_or_default()
+            .to_string();
         let row_room_type = row.get::<&str, _>("Book_Room_Type").map(String::from);
         let detail = BookingDetail {
             book_date: row.try_get("Book_Date").unwrap_or(None),
@@ -1859,16 +2221,15 @@ async fn fetch_legacy_booking_hash(
         groups.entry((row_book_no, key)).or_default().push(detail);
     }
 
-    let Some(mut details) = groups.remove(&(book_no.to_string(), room_type_key.to_string()))
-    else {
+    let Some(mut details) = groups.remove(&(book_no.to_string(), room_type_key.to_string())) else {
         return Ok(None);
     };
     sort_booking_details(&mut details);
     let representative = details.first();
-    let book_checkin_date = representative
-        .and_then(|d| d.book_date_in.map(|dt| dt.date().to_string()));
-    let book_checkout_date = representative
-        .and_then(|d| d.book_date_out.map(|dt| dt.date().to_string()));
+    let book_checkin_date =
+        representative.and_then(|d| d.book_date_in.map(|dt| dt.date().to_string()));
+    let book_checkout_date =
+        representative.and_then(|d| d.book_date_out.map(|dt| dt.date().to_string()));
     let book_cust_id_owned = representative.and_then(|d| d.book_cust_id.clone());
     Ok(Some(booking_canonical_hash(
         book_no,
@@ -1900,7 +2261,10 @@ async fn fetch_legacy_room_hash(
     let Some(row) = rows.first() else {
         return Ok(None);
     };
-    let row_room_no = row.get::<&str, _>("Room_no").unwrap_or_default().to_string();
+    let row_room_no = row
+        .get::<&str, _>("Room_no")
+        .unwrap_or_default()
+        .to_string();
     let room_clean = row.get::<&str, _>("Room_Clean").map(String::from);
     let room_manternace = row.get::<&str, _>("Room_Manternace").map(String::from);
     let room_details = row.get::<&str, _>("Room_Details").map(String::from);
@@ -1922,6 +2286,25 @@ async fn fetch_legacy_room_hash(
 /// config").
 fn reconcile_force_converge_enabled() -> bool {
     env::var("RECONCILE_FORCE_CONVERGE_ENABLED")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+/// Is the `missing_pg` re-ingest arm of the auto-resolve sweep enabled?
+///
+/// Deliberately a SEPARATE flag from [`reconcile_force_converge_enabled`]:
+/// that one is already `true` in production on `sync-hfville`, so folding a
+/// brand-new canonical-write class into it would ship this ON with no
+/// coordinated flip. Re-ingesting a whole booking aggregate is materially
+/// more consequential than the customers/rooms value-converge that flag was
+/// scoped to, so it ships dark on its own switch.
+///
+/// Default **OFF**. The `== "true"` comparison is strict on purpose —
+/// `"TRUE"`, `"1"` and `" true"` all evaluate false, matching every other
+/// feature flag in the sync path. Flip to `"true"` only after
+/// reception-coordinated verification (a flag flip is never "just config").
+fn reconcile_reingest_missing_pg_enabled() -> bool {
+    env::var("RECONCILE_REINGEST_MISSING_PG_ENABLED")
         .map(|v| v == "true")
         .unwrap_or(false)
 }
@@ -1998,11 +2381,28 @@ async fn fetch_legacy_room_base_row(
 /// Returns `Ok(true)` when a re-projection was attempted and committed,
 /// `Ok(false)` when the legacy row no longer exists (or the table is outside
 /// the supported set) so there is nothing to project from.
+///
+/// `op` is the `ChangeOp` handed to the mapper. The value-drift caller passes
+/// `ChangeOp::Update` (the canonical row exists, we're correcting its
+/// fields); the `missing_pg` re-ingest caller passes `ChangeOp::Insert` (no
+/// canonical row at all). Both land in the same mapper UPSERT branch — the op
+/// only shapes the `DomainEvent`, which we drop — but the honest value keeps
+/// the intent readable at the call site.
+///
+/// **Bookings (2026-07-27, `missing_pg` re-ingest).** The bookings arm
+/// re-drives the CT watcher's own aggregate path: `load_booking_aggregate`
+/// re-reads `HT_Book_H` + `HT_Book_Ds` + `HT_Book_Date` for the `book_no`,
+/// then `apply_booking_aggregate` projects it into canonical in a fresh PG
+/// tx. The legacy pool is passed through so the mapper's customer
+/// eager-mirror fallback works (an unresolvable customer FK errors rather
+/// than silently skipping — the 2026-06-03 silent-drop class). Still a
+/// PG-write-only path: the legacy side is read exclusively.
 async fn force_converge_reconcile_row(
     legacy_pool: &DbPool,
     pg_pool: &PgPool,
     table_name: &str,
     legacy_pk: &str,
+    op: ChangeOp,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     match table_name {
         "customers" => {
@@ -2010,11 +2410,11 @@ async fn force_converge_reconcile_row(
                 return Ok(false);
             };
             let mut tx = pg_pool.begin().await?;
-            // `ChangeOp::Update`: the canonical row already exists (this is a
-            // value drift, not a miss). apply runs the full UPSERT + the
-            // mapper's idempotency check.
+            // apply runs the full UPSERT + the mapper's idempotency check, so
+            // it inserts when canonical is absent and updates in place when
+            // it is not.
             let _evt = CustomerMapper
-                .apply(&mut tx, ChangeOp::Update, Some(&row as &dyn MappableRow))
+                .apply(&mut tx, op, Some(&row as &dyn MappableRow))
                 .await?;
             tx.commit().await?;
             Ok(true)
@@ -2025,15 +2425,153 @@ async fn force_converge_reconcile_row(
             };
             let mut tx = pg_pool.begin().await?;
             let _evt = RoomMasterMapper
-                .apply(&mut tx, ChangeOp::Update, Some(&row as &dyn MappableRow))
+                .apply(&mut tx, op, Some(&row as &dyn MappableRow))
                 .await?;
             tx.commit().await?;
             Ok(true)
         }
-        // bookings / checkins are multi-row aggregates whose self-heal is out
-        // of scope for #204 — leave them to the normal paths / operator review.
+        "bookings" => {
+            // `ht_reconcile_log.legacy_pk` for bookings is the composite
+            // "{book_no}|{room_type}"; the aggregate is keyed on `book_no`
+            // alone, so several reconcile rows for one booking all re-drive
+            // the SAME aggregate. That is safe: `apply_booking_aggregate` is
+            // idempotent and returns `Ok(None)` once canonical already
+            // mirrors legacy, so the 2nd and 3rd row of a multi-room-type
+            // booking are no-ops that still get their convergence re-tested.
+            let (book_no, _room_type_key) = parse_booking_legacy_pk(legacy_pk);
+            let aggregate =
+                crate::sync::parent_loader::load_booking_aggregate(legacy_pool, book_no).await?;
+            if !aggregate.is_present() {
+                return Ok(false);
+            }
+            let mut tx = pg_pool.begin().await?;
+            let _evt = crate::sync::mappers::apply_booking_aggregate(
+                &mut tx,
+                Some(legacy_pool),
+                &aggregate,
+                book_no,
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(true)
+        }
+        // checkins are multi-row aggregates whose self-heal is still out of
+        // scope — leave them to the normal paths / operator review.
         _ => Ok(false),
     }
+}
+
+/// Tables the #204 value-drift force-converge arm will repair. Single-PK
+/// mappers whose `apply` is safe to re-drive idempotently.
+const FORCE_CONVERGE_VALUE_DRIFT_TABLES: &[&str] = &["customers", "rooms"];
+
+/// Tables the `missing_pg` re-ingest arm will repair. Customers first-class
+/// (flat single-PK mapper), bookings via the aggregate loader. `rooms` is
+/// excluded because a room absent from canonical is a provisioning gap, not
+/// a dropped CT event; `checkins` is excluded until its aggregate re-ingest
+/// has been verified the same way.
+const REINGEST_MISSING_PG_TABLES: &[&str] = &["customers", "bookings"];
+
+/// Pure gate for the #204 value-drift force-converge arm — BOTH hashes
+/// present (a genuine value drift, not a missing-side case), an eligible
+/// table, past the min-age threshold, flag on.
+///
+/// Extracted so the "value drift still routes to the existing arm,
+/// unchanged" invariant is pinned by a unit test rather than by reading the
+/// sweep's control flow.
+fn force_converge_value_drift_eligible(
+    table_name: &str,
+    current_legacy_hash: Option<&str>,
+    current_pg_hash: Option<&str>,
+    age_secs: f64,
+    enabled: bool,
+) -> bool {
+    enabled
+        && FORCE_CONVERGE_VALUE_DRIFT_TABLES.contains(&table_name)
+        && current_legacy_hash.is_some()
+        && current_pg_hash.is_some()
+        && age_secs >= FORCE_CONVERGE_MIN_AGE_SECS
+}
+
+/// Pure gate for the `missing_pg` re-ingest arm (2026-07-27).
+///
+/// Repairs a DROPPED INGEST: legacy still has the row, canonical never got
+/// it, and CT's 2-day retention has long since aged the event out so the
+/// watcher can never redeliver it. Live shape that motivated this: customer
+/// `C2413` + bookings `R002066|110` / `|112` / `|217`, unconverged for 16
+/// days after a 2026-07-11 cross-table watermark clobber on HF Ville.
+///
+/// Conditions, ALL required:
+/// * flag on (`RECONCILE_REINGEST_MISSING_PG_ENABLED`, default off);
+/// * `table_name` in [`REINGEST_MISSING_PG_TABLES`];
+/// * legacy hash PRESENT — a VANISHED legacy row must never trip this arm.
+///   That is the genuine-anomaly case [`should_auto_resolve`] deliberately
+///   protects and `rooms_dispatch_missing_legacy_row_does_not_auto_resolve`
+///   pins; re-ingesting nothing would be meaningless and closing the row
+///   would hide a real deletion;
+/// * canonical hash ABSENT — this arm only inserts what is missing; a value
+///   drift belongs to [`force_converge_value_drift_eligible`];
+/// * past [`FORCE_CONVERGE_MIN_AGE_SECS`] so an in-flight CT event isn't
+///   raced.
+fn reingest_missing_pg_eligible(
+    table_name: &str,
+    current_legacy_hash: Option<&str>,
+    current_pg_hash: Option<&str>,
+    age_secs: f64,
+    enabled: bool,
+) -> bool {
+    enabled
+        && REINGEST_MISSING_PG_TABLES.contains(&table_name)
+        && current_legacy_hash.is_some_and(|h| !h.is_empty())
+        && current_pg_hash.is_none()
+        && age_secs >= FORCE_CONVERGE_MIN_AGE_SECS
+}
+
+/// One unresolved `ht_reconcile_log` candidate as fetched by the
+/// auto-resolve sweep: `(id, table_name, legacy_pk, mssql_hash, age_secs)`.
+type ReconcileCandidate = (i64, String, String, Option<String>, f64);
+
+/// FK-dependency rank for the auto-resolve sweep's candidate ordering.
+/// Lower runs first, so a parent is always re-ingested before anything that
+/// points at it: customers → rooms → bookings → checkins.
+///
+/// **This ordering is load-bearing, not cosmetic.** `apply_booking_aggregate`
+/// needs the booking's customer to exist in canonical (it eager-mirrors on a
+/// miss and ERRORS if even that fails); check-ins point at rooms and
+/// bookings. Healing a dependent before its parent within one sweep pass
+/// turns a repairable row into an error.
+fn reconcile_table_fk_rank(table_name: &str) -> u8 {
+    match table_name {
+        "customers" => 0,
+        "rooms" => 1,
+        "bookings" => 2,
+        "checkins" => 3,
+        _ => 4,
+    }
+}
+
+/// Order the sweep's candidate batch: FK parents first, then oldest first,
+/// then `id` as a deterministic tie-break.
+///
+/// "Oldest first" is expressed as DESCENDING `age_secs` because `age_secs`
+/// is `NOW() - detected_at` — a larger age IS an earlier `detected_at`.
+///
+/// This deliberately does NOT mirror the SQL `ORDER BY` in
+/// [`auto_resolve_reconcile_log`], and the split is the point. SQL selects
+/// the batch purely by age, which is what fixes the unordered-`LIMIT 500`
+/// starvation hazard (with a backlog >500 rows PG returned an arbitrary
+/// subset, so a row could age past 4h forever without ever being retested).
+/// The FK-rank leg lives here, applied AFTER the fetch, so parents are
+/// processed before dependents within the batch without letting a large
+/// parent backlog starve `checkins` out of the selection entirely. Keeping
+/// FK rank out of the query is intentional — do not "restore" it there.
+fn sort_reconcile_candidates(rows: &mut [ReconcileCandidate]) {
+    rows.sort_by(|a, b| {
+        reconcile_table_fk_rank(&a.1)
+            .cmp(&reconcile_table_fk_rank(&b.1))
+            .then_with(|| b.4.total_cmp(&a.4))
+            .then_with(|| a.0.cmp(&b.0))
+    });
 }
 
 /// Track D / T7 follow-up — auto-resolve sweep. Walks unresolved
@@ -2065,6 +2603,18 @@ async fn force_converge_reconcile_row(
 /// path (`force_converge_reconcile_row`) before the convergence re-test.
 /// With the flag OFF the behaviour is identical to the pre-#204 sweep — no
 /// canonical writes.
+///
+/// **`missing_pg` re-ingest arm (2026-07-27, ship dark).** A second,
+/// separately-flagged arm (`RECONCILE_REINGEST_MISSING_PG_ENABLED`, default
+/// off) repairs the DROPPED-INGEST shape: legacy row present, canonical row
+/// absent, past the min-age threshold. Those rows have no automated path to
+/// closure — the observational test needs both hashes, and CT's 2-day
+/// retention means the watcher can never redeliver the event — so they sit
+/// unconverged forever while the >4h level alert refires every 24h. The arm
+/// re-runs the NORMAL mapper for the key and closes the row only if the two
+/// sides then converge. A VANISHED legacy row never trips it: that is the
+/// genuine anomaly `should_auto_resolve` protects. See
+/// [`reingest_missing_pg_eligible`].
 async fn auto_resolve_reconcile_log(
     legacy_pool: &DbPool,
     pg_pool: &PgPool,
@@ -2072,20 +2622,43 @@ async fn auto_resolve_reconcile_log(
 ) -> Result<usize, sqlx::Error> {
     // `age_secs` (issue #204 bug #2) gates the durable force-converge arm —
     // only rows that have resisted convergence for a while qualify.
-    let rows = sqlx::query_as::<_, (i64, String, String, Option<String>, f64)>(
+    //
+    // The `ORDER BY` is strictly age-based, and that is deliberate. Before
+    // this it was absent entirely, so `LIMIT 500` returned an arbitrary
+    // (heap-order, therefore stable) subset — rows outside it were never
+    // retested and could age past the 4h level alert forever. Oldest-first
+    // makes the cap a fair queue instead of a lottery.
+    //
+    // The FK guarantee (parents before dependents — a booking whose customer
+    // is still missing hits `Ok(None)` in the mapper) is supplied in Rust by
+    // [`sort_reconcile_candidates`] over the fetched batch, NOT here. Ranking
+    // by table in SQL would reintroduce starvation from the other side: with
+    // >500 unresolved `customers`+`rooms`+`bookings` rows, `checkins` would
+    // never be swept at all. Sorting after the fetch gets both properties —
+    // fair selection, correct ordering within the batch. Worst case, a
+    // dependent lands in a batch whose parent did not; it stays open and the
+    // next tick retries it, which is the same self-correcting path the
+    // FK-defer class already relies on.
+    let mut rows = sqlx::query_as::<_, ReconcileCandidate>(
         "SELECT id, table_name, legacy_pk, mssql_hash, \
                 EXTRACT(EPOCH FROM (NOW() - detected_at))::float8 AS age_secs \
            FROM ht_reconcile_log \
           WHERE resolved_at IS NULL \
             AND divergence_kind IS NOT NULL \
+          ORDER BY detected_at ASC, \
+                   id ASC \
           LIMIT 500",
     )
     .fetch_all(pg_pool)
     .await?;
+    // Belt-and-braces: re-apply the same order in Rust so the FK guarantee
+    // survives a future edit to the query above, and so it is unit-testable.
+    sort_reconcile_candidates(&mut rows);
 
-    // Read the #204 force-converge flag ONCE per sweep. Default OFF ⇒ the
-    // sweep stays observational-only and never writes canonical state.
+    // Read the self-heal flags ONCE per sweep. Both default OFF ⇒ the sweep
+    // stays observational-only and never writes canonical state.
     let force_converge_enabled = reconcile_force_converge_enabled();
+    let reingest_missing_pg_enabled = reconcile_reingest_missing_pg_enabled();
 
     let mut resolved = 0usize;
     for (id, table_name, legacy_pk, recorded_mssql_hash, age_secs) in rows {
@@ -2105,21 +2678,21 @@ async fn auto_resolve_reconcile_log(
                 }
             };
 
-        let current_pg_hash =
-            match compute_current_pg_hash(pg_pool, &table_name, &legacy_pk).await {
-                Ok(opt) => opt,
-                Err(e) => {
-                    tracing::warn!(
-                        site = %site_id,
-                        id,
-                        table_name = %table_name,
-                        legacy_pk = %legacy_pk,
-                        error = %e,
-                        "[Sync] Auto-resolve sweep: failed to re-fetch canonical hash, skipping row"
-                    );
-                    continue;
-                }
-            };
+        let current_pg_hash = match compute_current_pg_hash(pg_pool, &table_name, &legacy_pk).await
+        {
+            Ok(opt) => opt,
+            Err(e) => {
+                tracing::warn!(
+                    site = %site_id,
+                    id,
+                    table_name = %table_name,
+                    legacy_pk = %legacy_pk,
+                    error = %e,
+                    "[Sync] Auto-resolve sweep: failed to re-fetch canonical hash, skipping row"
+                );
+                continue;
+            }
+        };
 
         if !should_auto_resolve(
             &table_name,
@@ -2151,15 +2724,23 @@ async fn auto_resolve_reconcile_log(
             //   * BOTH hashes present — a genuine value drift, not a
             //     missing_pg / missing_mssql case (those stay open for the
             //     normal paths / operator review).
-            let is_value_drift = current_legacy_hash.is_some() && current_pg_hash.is_some();
-            let eligible_table = table_name == "customers" || table_name == "rooms";
-            if force_converge_enabled
-                && eligible_table
-                && is_value_drift
-                && age_secs >= FORCE_CONVERGE_MIN_AGE_SECS
-            {
-                match force_converge_reconcile_row(legacy_pool, pg_pool, &table_name, &legacy_pk)
-                    .await
+            if force_converge_value_drift_eligible(
+                &table_name,
+                current_legacy_hash.as_deref(),
+                current_pg_hash.as_deref(),
+                age_secs,
+                force_converge_enabled,
+            ) {
+                match force_converge_reconcile_row(
+                    legacy_pool,
+                    pg_pool,
+                    &table_name,
+                    &legacy_pk,
+                    // The canonical row already exists — this is a value
+                    // drift, not a miss.
+                    ChangeOp::Update,
+                )
+                .await
                 {
                     Ok(true) => {
                         // The mapper re-projected the current legacy row into
@@ -2237,6 +2818,120 @@ async fn auto_resolve_reconcile_log(
                         continue;
                     }
                 }
+            } else if reingest_missing_pg_eligible(
+                &table_name,
+                current_legacy_hash.as_deref(),
+                current_pg_hash.as_deref(),
+                age_secs,
+                reingest_missing_pg_enabled,
+            ) {
+                // ---------------------------------------------------------------
+                // `missing_pg` re-ingest arm (2026-07-27, ship dark behind
+                // RECONCILE_REINGEST_MISSING_PG_ENABLED).
+                //
+                // Legacy still has the row, canonical never got it: a DROPPED
+                // INGEST. CT's 2-day retention aged the event out, so the
+                // watcher can never redeliver it and no observational sweep
+                // can ever close the row — `should_auto_resolve` needs both
+                // hashes and `(Some(legacy), None)` falls to `_ => false`.
+                // Repair by re-running the NORMAL mapper for that key (the
+                // same `apply` the CT watcher uses), then re-hash and only
+                // close the row if the two sides actually converge.
+                //
+                // PG-write-only: legacy MSSQL is read, never written.
+                // FK ordering is guaranteed by the sweep's candidate sort —
+                // every `customers` row is healed before any `bookings` row
+                // in the same pass.
+                match force_converge_reconcile_row(
+                    legacy_pool,
+                    pg_pool,
+                    &table_name,
+                    &legacy_pk,
+                    // No canonical row exists — this is an insert-if-absent.
+                    ChangeOp::Insert,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        // Only the canonical side can have moved (we projected
+                        // FROM the legacy row), so re-fetch it and re-test.
+                        let reprojected_pg_hash =
+                            match compute_current_pg_hash(pg_pool, &table_name, &legacy_pk).await {
+                                Ok(opt) => opt,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        site = %site_id,
+                                        id,
+                                        table_name = %table_name,
+                                        legacy_pk = %legacy_pk,
+                                        error = %e,
+                                        "[Sync] Re-ingest (missing_pg): re-hash of canonical \
+                                         failed after re-ingest, leaving row open"
+                                    );
+                                    continue;
+                                }
+                            };
+                        if should_auto_resolve(
+                            &table_name,
+                            current_legacy_hash.as_deref(),
+                            reprojected_pg_hash.as_deref(),
+                            recorded_mssql_hash.as_deref(),
+                        ) {
+                            tracing::info!(
+                                site = %site_id,
+                                id,
+                                table_name = %table_name,
+                                legacy_pk = %legacy_pk,
+                                age_secs,
+                                "[Sync] Re-ingest (missing_pg): re-ran the mapper for a \
+                                 dropped ingest; canonical now present and hashes \
+                                 converge — marking resolved"
+                            );
+                            // Fall through (no `continue`) to the resolved UPDATE.
+                        } else {
+                            tracing::warn!(
+                                site = %site_id,
+                                id,
+                                table_name = %table_name,
+                                legacy_pk = %legacy_pk,
+                                current_legacy_hash = ?current_legacy_hash,
+                                reprojected_pg_hash = ?reprojected_pg_hash,
+                                "[Sync] Re-ingest (missing_pg): canonical re-ingested but \
+                                 hashes still unconverged — leaving row open for operator \
+                                 review"
+                            );
+                            continue;
+                        }
+                    }
+                    Ok(false) => {
+                        // The legacy row vanished between the hash probe and
+                        // this re-fetch (or the aggregate header is gone).
+                        // Distinct message on purpose — `/diagnose-alert`
+                        // greps this to tell "legacy row genuinely absent"
+                        // apart from "heal attempted and failed".
+                        tracing::warn!(
+                            site = %site_id,
+                            id,
+                            table_name = %table_name,
+                            legacy_pk = %legacy_pk,
+                            "[Sync] Re-ingest (missing_pg): legacy row absent at re-fetch \
+                             — nothing to project from, leaving row open"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            site = %site_id,
+                            id,
+                            table_name = %table_name,
+                            legacy_pk = %legacy_pk,
+                            error = %e,
+                            "[Sync] Re-ingest (missing_pg): re-ingest failed, leaving row \
+                             open"
+                        );
+                        continue;
+                    }
+                }
             } else {
                 // Observational-only behaviour (also the flag-OFF path).
                 //
@@ -2247,11 +2942,23 @@ async fn auto_resolve_reconcile_log(
                 // genuinely don't match. Kept at debug level so it doesn't
                 // flood at info; the same field-style as the converged-row
                 // debug! below for grep symmetry.
+                //
+                // `outcome` classifies the three shapes explicitly because
+                // `ht_reconcile_log` has no status column beyond
+                // `resolved_at` — any outcome distinction has to live in
+                // structured logs. `legacy_row_absent` in particular is the
+                // genuine-anomaly case that no self-heal arm will ever touch.
+                let outcome = match (current_legacy_hash.as_deref(), current_pg_hash.as_deref()) {
+                    (None, _) => "legacy_row_absent",
+                    (Some(_), None) => "canonical_row_absent",
+                    _ => "hashes_unconverged",
+                };
                 tracing::debug!(
                     site = %site_id,
                     id,
                     table_name = %table_name,
                     legacy_pk = %legacy_pk,
+                    outcome,
                     current_legacy_hash = ?current_legacy_hash,
                     current_pg_hash = ?current_pg_hash,
                     recorded_mssql_hash = ?recorded_mssql_hash,
@@ -2382,7 +3089,16 @@ async fn fetch_canonical_customer(
     pg_pool: &PgPool,
     legacy_cust_no: &str,
 ) -> Result<Option<CanonicalCustomerRow>, sqlx::Error> {
-    sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>, Option<String>)>(
+    sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ),
+    >(
         "SELECT cust_firstname, cust_type, cust_phone, cust_idcard, cust_address \
            FROM ht_customers \
           WHERE legacy_cust_no = $1 \
@@ -2392,13 +3108,15 @@ async fn fetch_canonical_customer(
     .fetch_optional(pg_pool)
     .await
     .map(|opt| {
-        opt.map(|(firstname, type_, phone, idcard, address)| CanonicalCustomerRow {
-            cust_firstname: firstname,
-            cust_type: type_,
-            cust_phone: phone,
-            cust_idcard: idcard,
-            cust_address: address,
-        })
+        opt.map(
+            |(firstname, type_, phone, idcard, address)| CanonicalCustomerRow {
+                cust_firstname: firstname,
+                cust_type: type_,
+                cust_phone: phone,
+                cust_idcard: idcard,
+                cust_address: address,
+            },
+        )
     })
 }
 
@@ -2559,7 +3277,10 @@ async fn sync_customers(
     let mut unchanged = 0i32;
 
     for row in &rows {
-        let cust_no = row.get::<&str, _>("Cust_no").unwrap_or_default().to_string();
+        let cust_no = row
+            .get::<&str, _>("Cust_no")
+            .unwrap_or_default()
+            .to_string();
         let cust_name = row.get::<&str, _>("Cust_name").map(String::from);
         // `Cust_Type_Main` (not `Cust_Type`) is the column the CT mapper
         // mirrors into PG `cust_type`. See doc on
@@ -2700,7 +3421,11 @@ async fn sync_customers(
     let duration_ms = start.elapsed().as_millis() as i32;
     tracing::info!(
         "[Sync] Customers ({:?}): {} added, {} updated, {} unchanged in {}ms",
-        mode, added, updated, unchanged, duration_ms
+        mode,
+        added,
+        updated,
+        unchanged,
+        duration_ms
     );
     record_success(pg_pool, "customers", added, updated, unchanged, duration_ms).await;
 
@@ -2915,7 +3640,10 @@ async fn sync_rooms(
     let mut unchanged = 0i32;
 
     for row in &rows {
-        let room_no = row.get::<&str, _>("Room_no").unwrap_or_default().to_string();
+        let room_no = row
+            .get::<&str, _>("Room_no")
+            .unwrap_or_default()
+            .to_string();
         // MSSQL projection captured even for fields excluded from the
         // canonical-shape hash — operators reading `ht_reconcile_log`
         // want the full row payload to investigate.
@@ -3059,7 +3787,11 @@ async fn sync_rooms(
     let duration_ms = start.elapsed().as_millis() as i32;
     tracing::info!(
         "[Sync] Rooms ({:?}): {} added, {} updated, {} unchanged in {}ms",
-        mode, added, updated, unchanged, duration_ms
+        mode,
+        added,
+        updated,
+        unchanged,
+        duration_ms
     );
     record_success(pg_pool, "rooms", added, updated, unchanged, duration_ms).await;
 
@@ -3120,7 +3852,10 @@ async fn sync_bookings(
     // record_divergence + one cache UPDATE per PK.
     let mut groups: BTreeMap<(String, String), Vec<BookingDetail>> = BTreeMap::new();
     for row in &rows {
-        let book_no = row.get::<&str, _>("Book_No").unwrap_or_default().to_string();
+        let book_no = row
+            .get::<&str, _>("Book_No")
+            .unwrap_or_default()
+            .to_string();
         let book_room_type = row.get::<&str, _>("Book_Room_Type").map(String::from);
         let detail = BookingDetail {
             book_date: row.try_get("Book_Date").unwrap_or(None),
@@ -3132,7 +3867,10 @@ async fn sync_bookings(
             book_room_type: book_room_type.clone(),
         };
         let room_type_key = book_room_type.unwrap_or_default();
-        groups.entry((book_no, room_type_key)).or_default().push(detail);
+        groups
+            .entry((book_no, room_type_key))
+            .or_default()
+            .push(detail);
     }
 
     for ((book_no, room_type_key), mut details) in groups {
@@ -3150,10 +3888,10 @@ async fn sync_bookings(
         // Drop the time component so both sides hash the same YYYY-MM-DD
         // string (legacy `Book_Date_in/out` are stored at midnight per
         // the booking-create recipe — see `sync::mappers::booking` docs).
-        let book_checkin_date = representative
-            .and_then(|d| d.book_date_in.map(|dt| dt.date().to_string()));
-        let book_checkout_date = representative
-            .and_then(|d| d.book_date_out.map(|dt| dt.date().to_string()));
+        let book_checkin_date =
+            representative.and_then(|d| d.book_date_in.map(|dt| dt.date().to_string()));
+        let book_checkout_date =
+            representative.and_then(|d| d.book_date_out.map(|dt| dt.date().to_string()));
         let book_cust_id_owned = representative.and_then(|d| d.book_cust_id.clone());
         let mssql_hash = booking_canonical_hash(
             &book_no,
@@ -3262,7 +4000,11 @@ async fn sync_bookings(
     let duration_ms = start.elapsed().as_millis() as i32;
     tracing::info!(
         "[Sync] Bookings ({:?}): {} added, {} updated, {} unchanged in {}ms",
-        mode, added, updated, unchanged, duration_ms
+        mode,
+        added,
+        updated,
+        unchanged,
+        duration_ms
     );
     record_success(pg_pool, "bookings", added, updated, unchanged, duration_ms).await;
 
@@ -3310,7 +4052,14 @@ async fn fetch_canonical_booking(
     pg_pool: &PgPool,
     legacy_book_id: &str,
 ) -> Result<Option<CanonicalBookingRow>, sqlx::Error> {
-    sqlx::query_as::<_, (Option<chrono::NaiveDate>, Option<chrono::NaiveDate>, Option<String>)>(
+    sqlx::query_as::<
+        _,
+        (
+            Option<chrono::NaiveDate>,
+            Option<chrono::NaiveDate>,
+            Option<String>,
+        ),
+    >(
         "SELECT book_checkin, book_checkout, legacy_cust_no \
            FROM ht_bookings \
           WHERE legacy_book_id = $1 \
@@ -3575,42 +4324,37 @@ async fn sync_checkins(
     //    within the 15-min cron cadence (steady-state ~63 q/s, well
     //    below same-LAN saturation).
     for cin_no in &cin_nos {
-        let aggregate = match crate::sync::parent_loader::load_checkin_aggregate(
-            legacy_pool,
-            cin_no,
-        )
-        .await
-        {
-            Ok(a) => a,
-            Err(e) => {
-                load_errors += 1;
-                tracing::warn!(
-                    cin_no = %cin_no,
-                    error = %e,
-                    "[Sync] sync_checkins: load_checkin_aggregate failed; skipping PK"
-                );
-                continue;
-            }
-        };
+        let aggregate =
+            match crate::sync::parent_loader::load_checkin_aggregate(legacy_pool, cin_no).await {
+                Ok(a) => a,
+                Err(e) => {
+                    load_errors += 1;
+                    tracing::warn!(
+                        cin_no = %cin_no,
+                        error = %e,
+                        "[Sync] sync_checkins: load_checkin_aggregate failed; skipping PK"
+                    );
+                    continue;
+                }
+            };
         // Cancelled / deleted folio — the CT watcher emits
         // `CheckInCancelled` on its own; nothing for the sweep to do.
         if !aggregate.is_present() {
             continue;
         }
-        let canonical_proj = match crate::sync::mappers::project_checkin_aggregate(
-            &aggregate, cin_no,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                project_errors += 1;
-                tracing::warn!(
-                    cin_no = %cin_no,
-                    error = %e,
-                    "[Sync] sync_checkins: project_checkin_aggregate failed; skipping PK"
-                );
-                continue;
-            }
-        };
+        let canonical_proj =
+            match crate::sync::mappers::project_checkin_aggregate(&aggregate, cin_no) {
+                Ok(p) => p,
+                Err(e) => {
+                    project_errors += 1;
+                    tracing::warn!(
+                        cin_no = %cin_no,
+                        error = %e,
+                        "[Sync] sync_checkins: project_checkin_aggregate failed; skipping PK"
+                    );
+                    continue;
+                }
+            };
 
         // Hash inputs are byte-identical to
         // `compute_legacy_checkin_hash_via_mapper` (auto-resolve sweep)
@@ -3654,8 +4398,7 @@ async fn sync_checkins(
                 let canonical = fetch_canonical_checkin(pg_pool, cin_no).await?;
                 let canonical_hash = canonical.as_ref().map(|c| {
                     let checkin_str = c.cin_checkin_time.map(|t| t.to_string());
-                    let effective_checkout_str =
-                        c.effective_checkout_date().map(|d| d.to_string());
+                    let effective_checkout_str = c.effective_checkout_date().map(|d| d.to_string());
                     checkin_canonical_hash(
                         cin_no,
                         c.legacy_room_no.as_deref(),
@@ -3684,8 +4427,7 @@ async fn sync_checkins(
                 // `UNIQUE (cr_cin_id, cr_room_id)`, so "distinct
                 // rooms" IS the canonical truth that `pg_row_count`
                 // already reflects.
-                let legacy_row_count: i32 =
-                    count_distinct_legacy_checkin_rooms(&aggregate.rooms);
+                let legacy_row_count: i32 = count_distinct_legacy_checkin_rooms(&aggregate.rooms);
                 let pg_row_count: i32 = if canonical.is_some() {
                     match count_canonical_checkin_rooms(pg_pool, cin_no).await {
                         Ok(n) => n,
@@ -3774,7 +4516,11 @@ async fn sync_checkins(
     let duration_ms = start.elapsed().as_millis() as i32;
     tracing::info!(
         "[Sync] Check-ins ({:?}): {} added, {} updated, {} unchanged in {}ms",
-        mode, added, updated, unchanged, duration_ms
+        mode,
+        added,
+        updated,
+        unchanged,
+        duration_ms
     );
     record_success(pg_pool, "checkins", added, updated, unchanged, duration_ms).await;
 
@@ -3859,14 +4605,17 @@ async fn fetch_canonical_checkin(
     pg_pool: &PgPool,
     legacy_cin_no: &str,
 ) -> Result<Option<CanonicalCheckinRow>, sqlx::Error> {
-    sqlx::query_as::<_, (
-        Option<String>,
-        Option<NaiveDateTime>,
-        Option<chrono::NaiveDate>,
-        Option<NaiveDateTime>,
-        Option<String>,
-        Option<String>,
-    )>(
+    sqlx::query_as::<
+        _,
+        (
+            Option<String>,
+            Option<NaiveDateTime>,
+            Option<chrono::NaiveDate>,
+            Option<NaiveDateTime>,
+            Option<String>,
+            Option<String>,
+        ),
+    >(
         "SELECT legacy_room_no, cin_checkin_time, cin_expected_checkout, \
                 cin_checkout_time, legacy_cust_no, cin_status \
            FROM ht_checkins \
@@ -4145,7 +4894,10 @@ mod tests {
         breaches.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
             breaches,
-            vec![("bookings".to_string(), 5_000), ("customers".to_string(), 51)]
+            vec![
+                ("bookings".to_string(), 5_000),
+                ("customers".to_string(), 51)
+            ]
         );
     }
 
@@ -4225,7 +4977,9 @@ mod tests {
 
     #[test]
     fn threshold_falls_back_on_garbage() {
-        let v = with_threshold_env(Some("not-a-number"), || drift_alert_threshold_from_env("hfhotel"));
+        let v = with_threshold_env(Some("not-a-number"), || {
+            drift_alert_threshold_from_env("hfhotel")
+        });
         assert_eq!(v, DEFAULT_DRIFT_ALERT_THRESHOLD);
     }
 
@@ -4282,7 +5036,10 @@ mod tests {
             Some(("LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_HFVILLE", "abc")),
             || drift_alert_threshold_from_env("hfville"),
         );
-        assert_eq!(v, 80, "invalid per-site value must fall through to the global");
+        assert_eq!(
+            v, 80,
+            "invalid per-site value must fall through to the global"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -4328,11 +5085,7 @@ mod tests {
     /// across both the bulk sweep and the auto-resolve sweep — what
     /// this test fixture pins is the cross-pipeline equality, not a
     /// new format.
-    fn projected_hash(
-        cin_no: &str,
-        legacy_room_no: &str,
-        cust_no: &str,
-    ) -> String {
+    fn projected_hash(cin_no: &str, legacy_room_no: &str, cust_no: &str) -> String {
         let checkin_dt = NaiveDate::from_ymd_opt(2026, 4, 1)
             .unwrap()
             .and_hms_opt(14, 0, 0)
@@ -4430,12 +5183,7 @@ mod tests {
         let mapper_hash = projected_hash("CIN-1", "203", "C001-NEW");
         let canonical_stale_hash = projected_hash("CIN-1", "203", "C001-OLD");
 
-        let drift = classify_checkin_drift(
-            Some(&canonical_stale_hash),
-            &mapper_hash,
-            3,
-            3,
-        );
+        let drift = classify_checkin_drift(Some(&canonical_stale_hash), &mapper_hash, 3, 3);
 
         assert_eq!(
             drift,
@@ -4472,10 +5220,10 @@ mod tests {
         let mapper_hash = projected_hash("CIN-1", "203", "C001");
 
         let drift = classify_checkin_drift(
-            None,           // canonical absent
+            None, // canonical absent
             &mapper_hash,
-            3,              // legacy rooms
-            0,              // no canonical rooms
+            3, // legacy rooms
+            0, // no canonical rooms
         );
 
         assert_eq!(
@@ -4635,23 +5383,11 @@ mod tests {
 
     #[test]
     fn customer_canonical_hash_diverges_on_phone_drift() {
-        let mssql = customer_canonical_hash(
-            "C001",
-            "Somchai",
-            None,
-            Some("0812345678"),
-            None,
-            None,
-        );
+        let mssql =
+            customer_canonical_hash("C001", "Somchai", None, Some("0812345678"), None, None);
         // CT mapper stored an older phone (drift the operator should fix).
-        let canonical = customer_canonical_hash(
-            "C001",
-            "Somchai",
-            None,
-            Some("0899999999"),
-            None,
-            None,
-        );
+        let canonical =
+            customer_canonical_hash("C001", "Somchai", None, Some("0899999999"), None, None);
         assert_ne!(mssql, canonical);
     }
 
@@ -4662,7 +5398,10 @@ mod tests {
         // empty string before hashing.
         let h1 = customer_canonical_hash("C001", "Anan", None, None, None, None);
         let h2 = customer_canonical_hash("C001", "Anan", Some(""), Some(""), Some(""), Some(""));
-        assert_eq!(h1, h2, "None and empty-string must canonicalise the same way");
+        assert_eq!(
+            h1, h2,
+            "None and empty-string must canonicalise the same way"
+        );
     }
 
     /// Locks the legacy `HT_Customers` projection used by the reconcile
@@ -4770,8 +5509,14 @@ mod tests {
         // The two halves of the room-status translation must be each
         // other's inverse for the canonical-hash to align with the
         // MSSQL projection.
-        assert_eq!(legacy_yesno_canonical(Some("yes")), bool_to_yesno(Some(true)));
-        assert_eq!(legacy_yesno_canonical(Some("no")), bool_to_yesno(Some(false)));
+        assert_eq!(
+            legacy_yesno_canonical(Some("yes")),
+            bool_to_yesno(Some(true))
+        );
+        assert_eq!(
+            legacy_yesno_canonical(Some("no")),
+            bool_to_yesno(Some(false))
+        );
         // NULL → "" on both sides, matching how nullable BOOLEAN
         // columns canonicalise.
         assert_eq!(legacy_yesno_canonical(None), bool_to_yesno(None));
@@ -5013,26 +5758,11 @@ mod tests {
 
     #[test]
     fn checkin_canonical_hash_diverges_on_room_drift() {
-        let mssql = checkin_canonical_hash(
-            "CIN001",
-            Some("101"),
-            None,
-            None,
-            None,
-            false,
-            false,
-        );
+        let mssql = checkin_canonical_hash("CIN001", Some("101"), None, None, None, false, false);
         // CT mapper resolved the wrong room — drift the operator
         // should investigate via `ht_reconcile_log`.
-        let canonical = checkin_canonical_hash(
-            "CIN001",
-            Some("102"),
-            None,
-            None,
-            None,
-            false,
-            false,
-        );
+        let canonical =
+            checkin_canonical_hash("CIN001", Some("102"), None, None, None, false, false);
         assert_ne!(mssql, canonical);
     }
 
@@ -5175,7 +5905,10 @@ mod tests {
             cin_checkin_time: None,
             cin_expected_checkout: Some(NaiveDate::from_ymd_opt(2026, 5, 8).unwrap()),
             cin_checkout_time: Some(
-                NaiveDate::from_ymd_opt(2026, 5, 10).unwrap().and_hms_opt(12, 8, 0).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 5, 10)
+                    .unwrap()
+                    .and_hms_opt(12, 8, 0)
+                    .unwrap(),
             ),
             legacy_cust_no: None,
             cin_status: None,
@@ -5281,9 +6014,8 @@ mod tests {
         assert_eq!(with_other_garbage, expected);
 
         // All-None on the ignored slots still produces the same hash.
-        let with_all_none = checkin_canonical_hash(
-            "CH26-005252", None, None, None, None, false, true,
-        );
+        let with_all_none =
+            checkin_canonical_hash("CH26-005252", None, None, None, None, false, true);
         assert_eq!(with_all_none, expected);
     }
 
@@ -5458,7 +6190,7 @@ mod tests {
     fn cooldown_elapsed_returns_true_after_window() {
         let now = chrono::Utc::now();
         let cooldown = std::time::Duration::from_secs(86_400); // 24h
-        // Fired 25 hours ago — window elapsed.
+                                                               // Fired 25 hours ago — window elapsed.
         let last = now - chrono::Duration::hours(25);
         assert!(cooldown_elapsed(Some(last), now, cooldown));
     }
@@ -5532,7 +6264,7 @@ mod tests {
         let current_pg_hash = recorded.clone();
         assert!(should_auto_resolve(
             "bookings",
-            None,                       // legacy room-type line is gone
+            None, // legacy room-type line is gone
             Some(current_pg_hash.as_str()),
             Some(recorded.as_str()),
         ));
@@ -5546,9 +6278,9 @@ mod tests {
     fn auto_resolve_sweep_keeps_open_persistent_missing_pg_booking() {
         assert!(!should_auto_resolve(
             "bookings",
-            None,            // legacy key gone
-            None,            // canonical still missing
-            Some("hash-X"),  // legacy recorded a hash at detection
+            None,           // legacy key gone
+            None,           // canonical still missing
+            Some("hash-X"), // legacy recorded a hash at detection
         ));
     }
 
@@ -5634,11 +6366,7 @@ mod tests {
     #[test]
     fn ct_lag_warns_when_only_version_lag_breaches() {
         let t = default_ct_thresholds();
-        assert!(ct_lag_is_warning(
-            DEFAULT_CT_LAG_WARN_VERSIONS + 1,
-            0,
-            t
-        ));
+        assert!(ct_lag_is_warning(DEFAULT_CT_LAG_WARN_VERSIONS + 1, 0, t));
     }
 
     /// Poll-age breaches alone are sufficient to warn — a watcher whose
@@ -5648,11 +6376,7 @@ mod tests {
     #[test]
     fn ct_lag_warns_when_only_poll_age_breaches() {
         let t = default_ct_thresholds();
-        assert!(ct_lag_is_warning(
-            0,
-            DEFAULT_CT_LAG_WARN_SECONDS + 1,
-            t
-        ));
+        assert!(ct_lag_is_warning(0, DEFAULT_CT_LAG_WARN_SECONDS + 1, t));
     }
 
     /// Both dimensions breached → warn. Defensive smoke test — if either
@@ -5814,7 +6538,9 @@ mod tests {
     // already collapses them; the cardinality check has to as well or
     // every such folio shows up as drift.
     // -------------------------------------------------------------------
-    use crate::sync::row::test_support::{HashMapRow as TestHashMapRow, MockValue as TestMockValue};
+    use crate::sync::row::test_support::{
+        HashMapRow as TestHashMapRow, MockValue as TestMockValue,
+    };
 
     fn ds_row_with_room(room_no: TestMockValue) -> TestHashMapRow {
         TestHashMapRow::new("HT_CheckIn_Ds").with("Cin_Room_No", room_no)
@@ -5855,5 +6581,505 @@ mod tests {
             ds_row_with_room(TestMockValue::Str("417".into())),
         ];
         assert_eq!(count_distinct_legacy_checkin_rooms(&rooms), 1);
+    }
+
+    // -------------------------------------------------------------------
+    // 2026-07-27 — `missing_pg` re-ingest arm of the auto-resolve sweep.
+    //
+    // Live shape that motivated the arm: a 2026-07-11 cross-table
+    // watermark clobber on HF Ville dropped a CT event, leaving customer
+    // `C2413` and bookings `R002066|110` / `|112` / `|217` unconverged for
+    // 16 days. Legacy still had every row; canonical had none. No existing
+    // path could ever close them — `should_auto_resolve` needs BOTH hashes,
+    // and CT's 2-day retention means the watcher can never redeliver.
+    // -------------------------------------------------------------------
+
+    /// Env-isolation helper for the two self-heal feature flags. Same
+    /// save/restore shape as `with_mode_env` / `with_threshold_envs` above;
+    /// one process-wide lock because `set_var` is process-wide.
+    /// Takes a SLICE of vars rather than one, so a test that needs two flags
+    /// set at once passes them together. **Do NOT nest calls** — the guard is
+    /// a plain non-reentrant `Mutex`, so a nested call self-deadlocks (the
+    /// test binary hangs forever rather than failing).
+    fn with_env_vars<T, F: FnOnce() -> T>(vars: &[(&str, Option<&str>)], f: F) -> T {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _g = LOCK.lock().unwrap();
+        let priors: Vec<(String, Option<String>)> = vars
+            .iter()
+            .map(|(name, _)| ((*name).to_string(), env::var(name).ok()))
+            .collect();
+        for (name, value) in vars {
+            match value {
+                Some(v) => env::set_var(name, v),
+                None => env::remove_var(name),
+            }
+        }
+        let out = f();
+        for (name, prior) in priors {
+            match prior {
+                Some(v) => env::set_var(&name, v),
+                None => env::remove_var(&name),
+            }
+        }
+        out
+    }
+
+    /// Single-var convenience wrapper over [`with_env_vars`].
+    fn with_self_heal_flag_env<T, F: FnOnce() -> T>(
+        var_name: &str,
+        value: Option<&str>,
+        f: F,
+    ) -> T {
+        with_env_vars(&[(var_name, value)], f)
+    }
+
+    const REINGEST_FLAG: &str = "RECONCILE_REINGEST_MISSING_PG_ENABLED";
+    const FORCE_CONVERGE_FLAG: &str = "RECONCILE_FORCE_CONVERGE_ENABLED";
+
+    #[test]
+    fn reingest_flag_defaults_off_when_env_unset() {
+        let on =
+            with_self_heal_flag_env(REINGEST_FLAG, None, reconcile_reingest_missing_pg_enabled);
+        assert!(
+            !on,
+            "the missing_pg re-ingest arm writes canonical state — it must ship dark"
+        );
+    }
+
+    #[test]
+    fn reingest_flag_on_for_exact_true_literal() {
+        let on = with_self_heal_flag_env(REINGEST_FLAG, Some("true"), {
+            reconcile_reingest_missing_pg_enabled
+        });
+        assert!(on);
+    }
+
+    /// The `== "true"` comparison is strict on purpose. An operator who
+    /// types `TRUE` / `1` / ` true` gets the SAFE (off) behaviour rather
+    /// than a silently-enabled canonical-write path.
+    #[test]
+    fn reingest_flag_is_strict_about_the_true_literal() {
+        for value in ["TRUE", "True", "1", "yes", " true", "true ", ""] {
+            let on = with_self_heal_flag_env(REINGEST_FLAG, Some(value), {
+                reconcile_reingest_missing_pg_enabled
+            });
+            assert!(!on, "{value:?} must NOT enable the re-ingest arm");
+        }
+    }
+
+    /// The re-ingest flag must be independent of the force-converge flag:
+    /// `RECONCILE_FORCE_CONVERGE_ENABLED` is already `true` in production
+    /// on `sync-hfville`, so sharing it would have shipped the new
+    /// canonical-write class ON with no coordinated flip.
+    #[test]
+    fn reingest_flag_is_independent_of_force_converge_flag() {
+        // Both vars go through ONE `with_env_vars` call — nesting two
+        // guarded calls would self-deadlock on the shared Mutex.
+        let on = with_env_vars(
+            &[(FORCE_CONVERGE_FLAG, Some("true")), (REINGEST_FLAG, None)],
+            reconcile_reingest_missing_pg_enabled,
+        );
+        assert!(
+            !on,
+            "force-converge being ON must never imply the missing_pg re-ingest arm is ON"
+        );
+    }
+
+    /// Pre-existing coverage gap: the force-converge flag reader had no
+    /// test at all. Pin its default and its strictness too.
+    #[test]
+    fn force_converge_flag_defaults_off_and_is_strict() {
+        let unset = with_self_heal_flag_env(FORCE_CONVERGE_FLAG, None, {
+            reconcile_force_converge_enabled
+        });
+        assert!(!unset);
+        let loose = with_self_heal_flag_env(FORCE_CONVERGE_FLAG, Some("TRUE"), {
+            reconcile_force_converge_enabled
+        });
+        assert!(!loose);
+        let exact = with_self_heal_flag_env(FORCE_CONVERGE_FLAG, Some("true"), {
+            reconcile_force_converge_enabled
+        });
+        assert!(exact);
+    }
+
+    const LEGACY_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const PG_HASH: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    /// Comfortably past `FORCE_CONVERGE_MIN_AGE_SECS` (3600s) — the live
+    /// rows had aged 16 days.
+    const OLD_ENOUGH_SECS: f64 = FORCE_CONVERGE_MIN_AGE_SECS + 1.0;
+
+    #[test]
+    fn reingest_arm_eligible_when_legacy_present_and_canonical_absent() {
+        // The exact live shape: customer C2413 / booking R002066|110.
+        for table in ["customers", "bookings"] {
+            assert!(
+                reingest_missing_pg_eligible(table, Some(LEGACY_HASH), None, OLD_ENOUGH_SECS, true,),
+                "{table}: legacy present + canonical absent + past min age must be eligible"
+            );
+        }
+    }
+
+    /// The genuine-anomaly guard. A VANISHED legacy row must never trip the
+    /// re-ingest arm — there is nothing to project from, and closing the
+    /// row would hide a real deletion. Same invariant
+    /// `rooms_dispatch_missing_legacy_row_does_not_auto_resolve` pins for
+    /// the observational path.
+    #[test]
+    fn reingest_arm_not_eligible_when_legacy_row_vanished() {
+        for table in ["customers", "bookings"] {
+            assert!(
+                !reingest_missing_pg_eligible(table, None, None, OLD_ENOUGH_SECS, true),
+                "{table}: a vanished legacy row must stay open for operator review"
+            );
+        }
+        // An empty-string legacy hash is treated the same as absent.
+        assert!(!reingest_missing_pg_eligible(
+            "customers",
+            Some(""),
+            None,
+            OLD_ENOUGH_SECS,
+            true,
+        ));
+        // …and the row must also stay open on the observational path.
+        assert!(!should_auto_resolve(
+            "customers",
+            None,
+            None,
+            Some(LEGACY_HASH)
+        ));
+    }
+
+    #[test]
+    fn reingest_arm_not_eligible_below_min_age() {
+        assert!(
+            !reingest_missing_pg_eligible(
+                "customers",
+                Some(LEGACY_HASH),
+                None,
+                FORCE_CONVERGE_MIN_AGE_SECS - 1.0,
+                true,
+            ),
+            "a fresh divergence is probably an in-flight CT event — don't race it"
+        );
+        // Exactly at the threshold IS eligible (`>=`).
+        assert!(reingest_missing_pg_eligible(
+            "customers",
+            Some(LEGACY_HASH),
+            None,
+            FORCE_CONVERGE_MIN_AGE_SECS,
+            true,
+        ));
+    }
+
+    #[test]
+    fn reingest_arm_not_eligible_when_flag_off() {
+        assert!(
+            !reingest_missing_pg_eligible(
+                "bookings",
+                Some(LEGACY_HASH),
+                None,
+                OLD_ENOUGH_SECS,
+                false,
+            ),
+            "flag OFF ⇒ zero canonical writes"
+        );
+    }
+
+    /// `rooms` / `checkins` are outside the arm: a room absent from
+    /// canonical is a provisioning gap rather than a dropped ingest, and
+    /// the check-in aggregate re-ingest hasn't been verified the same way.
+    #[test]
+    fn reingest_arm_not_eligible_for_unsupported_tables() {
+        for table in ["rooms", "checkins", "payments"] {
+            assert!(
+                !reingest_missing_pg_eligible(
+                    table,
+                    Some(LEGACY_HASH),
+                    None,
+                    OLD_ENOUGH_SECS,
+                    true,
+                ),
+                "{table} must not be re-ingested by this arm"
+            );
+        }
+    }
+
+    /// Value drift (BOTH hashes present) keeps routing to the pre-existing
+    /// force-converge arm, and must NOT be picked up by the new arm.
+    #[test]
+    fn value_drift_still_routes_to_force_converge_arm_unchanged() {
+        for table in ["customers", "rooms"] {
+            assert!(
+                force_converge_value_drift_eligible(
+                    table,
+                    Some(LEGACY_HASH),
+                    Some(PG_HASH),
+                    OLD_ENOUGH_SECS,
+                    true,
+                ),
+                "{table} value drift must still reach the force-converge arm"
+            );
+        }
+        assert!(
+            !reingest_missing_pg_eligible(
+                "customers",
+                Some(LEGACY_HASH),
+                Some(PG_HASH),
+                OLD_ENOUGH_SECS,
+                true,
+            ),
+            "a value drift is not a dropped ingest — the re-ingest arm must ignore it"
+        );
+    }
+
+    /// Symmetric guard: the force-converge arm keeps its "BOTH hashes
+    /// present" precondition, so the missing_pg shape never reaches it.
+    #[test]
+    fn force_converge_arm_ignores_the_missing_pg_shape() {
+        assert!(!force_converge_value_drift_eligible(
+            "customers",
+            Some(LEGACY_HASH),
+            None,
+            OLD_ENOUGH_SECS,
+            true,
+        ));
+        assert!(!force_converge_value_drift_eligible(
+            "bookings",
+            Some(LEGACY_HASH),
+            Some(PG_HASH),
+            OLD_ENOUGH_SECS,
+            true,
+        ));
+    }
+
+    // -------------------------------------------------------------------
+    // Auto-resolve sweep candidate ordering — the FK guarantee.
+    // -------------------------------------------------------------------
+
+    fn candidate(id: i64, table: &str, pk: &str, age_secs: f64) -> ReconcileCandidate {
+        (id, table.to_string(), pk.to_string(), None, age_secs)
+    }
+
+    #[test]
+    fn reconcile_fk_rank_orders_parents_before_dependents() {
+        assert!(reconcile_table_fk_rank("customers") < reconcile_table_fk_rank("bookings"));
+        assert!(reconcile_table_fk_rank("rooms") < reconcile_table_fk_rank("bookings"));
+        assert!(reconcile_table_fk_rank("bookings") < reconcile_table_fk_rank("checkins"));
+        assert!(reconcile_table_fk_rank("checkins") < reconcile_table_fk_rank("something_new"));
+    }
+
+    /// The live FK shape: booking `R002066` references customer `C2413`.
+    /// Every `customers` row must be healed before ANY `bookings` row in
+    /// the same sweep pass, regardless of insertion order or age.
+    #[test]
+    fn reconcile_candidates_sort_customers_before_bookings() {
+        let mut rows = vec![
+            candidate(11, "bookings", "R002066|217", 1_400_000.0),
+            candidate(12, "bookings", "R002066|110", 1_400_000.0),
+            // The customer row was detected LATER (smaller age) — it must
+            // still be processed first.
+            candidate(13, "customers", "C2413", 1_000.0),
+        ];
+        sort_reconcile_candidates(&mut rows);
+        let tables: Vec<&str> = rows.iter().map(|r| r.1.as_str()).collect();
+        assert_eq!(
+            tables,
+            vec!["customers", "bookings", "bookings"],
+            "FK parents must run first — a booking healed before its customer errors out"
+        );
+    }
+
+    /// `age_secs` is `NOW() - detected_at`, so oldest-first == largest age
+    /// first. This is what stops the `LIMIT 500` from starving old rows out
+    /// of an arbitrary subset once the backlog exceeds the cap.
+    #[test]
+    fn reconcile_candidates_sort_oldest_detected_at_first_within_a_table() {
+        let mut rows = vec![
+            candidate(1, "bookings", "R000001|110", 3_600.0),
+            candidate(2, "bookings", "R000002|110", 1_382_400.0), // 16 days
+            candidate(3, "bookings", "R000003|110", 86_400.0),    // 1 day
+        ];
+        sort_reconcile_candidates(&mut rows);
+        let ids: Vec<i64> = rows.iter().map(|r| r.0).collect();
+        assert_eq!(
+            ids,
+            vec![2, 3, 1],
+            "oldest detected_at (largest age_secs) must be retested first"
+        );
+    }
+
+    #[test]
+    fn reconcile_candidates_tie_break_on_id_is_deterministic() {
+        let mut rows = vec![
+            candidate(9, "customers", "C0009", 7_200.0),
+            candidate(4, "customers", "C0004", 7_200.0),
+            candidate(7, "customers", "C0007", 7_200.0),
+        ];
+        sort_reconcile_candidates(&mut rows);
+        assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), vec![4, 7, 9]);
+    }
+
+    // -------------------------------------------------------------------
+    // Level-drift recovery notification (paired all-clear).
+    // -------------------------------------------------------------------
+
+    fn owned(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| (*v).to_string()).collect()
+    }
+
+    #[test]
+    fn level_drift_recovery_fires_when_cooldown_table_has_no_stale_rows() {
+        // `bookings` alerted at some point (cooldown row exists) and now
+        // has zero unconverged rows past the threshold ⇒ all-clear.
+        let recovered = tables_recovered(&owned(&["bookings"]), &owned(&[]));
+        assert_eq!(recovered, owned(&["bookings"]));
+    }
+
+    #[test]
+    fn level_drift_recovery_suppressed_while_table_still_stale() {
+        let recovered = tables_recovered(&owned(&["bookings"]), &owned(&["bookings"]));
+        assert!(
+            recovered.is_empty(),
+            "a table that still has unconverged rows past the threshold has NOT recovered"
+        );
+    }
+
+    #[test]
+    fn level_drift_recovery_reports_only_the_converged_tables() {
+        let recovered = tables_recovered(
+            &owned(&["bookings", "customers", "checkins"]),
+            &owned(&["checkins"]),
+        );
+        assert_eq!(
+            recovered,
+            owned(&["bookings", "customers"]),
+            "output is sorted + deduped so the Slack body is deterministic"
+        );
+    }
+
+    /// The cooldown table is shared with the stale-checkin tripwire. Its
+    /// key has no unconverged-row count to compare against, so the sync-lag
+    /// all-clear must never claim it recovered or clear its cooldown —
+    /// doing so would let that alert refire every 15 minutes.
+    #[test]
+    fn level_drift_recovery_never_claims_non_reconcile_cooldown_keys() {
+        let recovered = tables_recovered(
+            &owned(&[STALE_CHECKIN_COOLDOWN_KEY, "customers"]),
+            &owned(&[]),
+        );
+        assert_eq!(recovered, owned(&["customers"]));
+    }
+
+    #[test]
+    fn level_drift_recovery_is_silent_without_cooldown_rows() {
+        // Never alerted ⇒ nothing to close, even with zero stale rows.
+        assert!(tables_recovered(&owned(&[]), &owned(&[])).is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // Per-table CT watermark health check (R3 TODO resolution).
+    // -------------------------------------------------------------------
+
+    /// `now` is threaded in explicitly (rather than each row reaching for
+    /// `Utc::now()`) so `poll_age_seconds` comes out as an exact integer —
+    /// otherwise sub-second construction skew truncates 4000s to 3999s and
+    /// the assertions flake.
+    fn per_table_at(
+        now: chrono::DateTime<chrono::Utc>,
+        name: &str,
+        version: i64,
+        polled_secs_ago: Option<i64>,
+    ) -> PerTableWatermark {
+        PerTableWatermark {
+            table_name: name.to_string(),
+            last_seen_version: version,
+            last_polled_at: polled_secs_ago.map(|s| now - chrono::Duration::seconds(s)),
+        }
+    }
+
+    #[test]
+    fn per_table_watermark_flag_defaults_off() {
+        let on = with_self_heal_flag_env("SYNC_PER_TABLE_WATERMARK", None, {
+            per_table_watermark_enabled
+        });
+        assert!(!on, "global-watermark mode stays the default");
+        let on = with_self_heal_flag_env("SYNC_PER_TABLE_WATERMARK", Some("true"), {
+            per_table_watermark_enabled
+        });
+        assert!(on);
+    }
+
+    #[test]
+    fn stalest_per_table_watermark_returns_none_for_empty_input() {
+        assert!(stalest_per_table_watermark(&[], 100, chrono::Utc::now()).is_none());
+    }
+
+    /// The point of the whole exercise: report WHICH table is behind, not a
+    /// global figure that is frozen at its bootstrap value in per-table mode.
+    #[test]
+    fn stalest_per_table_watermark_picks_largest_version_lag() {
+        let now = chrono::Utc::now();
+        let rows = vec![
+            per_table_at(now, "HT_Customers", 990, Some(10)),
+            per_table_at(now, "HT_Book_H", 500, Some(10)),
+            per_table_at(now, "HT_Rooms", 1_000, Some(10)),
+        ];
+        let (stalest, version_lag, _) = stalest_per_table_watermark(&rows, 1_000, now).unwrap();
+        assert_eq!(stalest.table_name, "HT_Book_H");
+        assert_eq!(version_lag, 500);
+    }
+
+    #[test]
+    fn stalest_per_table_watermark_breaks_version_ties_on_oldest_poll() {
+        let now = chrono::Utc::now();
+        let rows = vec![
+            per_table_at(now, "HT_Customers", 1_000, Some(30)),
+            per_table_at(now, "HT_CheckIn_H", 1_000, Some(4_000)),
+        ];
+        let (stalest, version_lag, poll_age) =
+            stalest_per_table_watermark(&rows, 1_000, now).unwrap();
+        assert_eq!(stalest.table_name, "HT_CheckIn_H");
+        assert_eq!(version_lag, 0);
+        assert_eq!(poll_age, 4_000);
+    }
+
+    /// A never-polled table is infinitely old — same convention the global
+    /// arm uses so the warn branch fires and the operator sees it.
+    #[test]
+    fn stalest_per_table_watermark_treats_never_polled_as_infinitely_old() {
+        let now = chrono::Utc::now();
+        let rows = vec![
+            per_table_at(now, "HT_Customers", 1_000, Some(10)),
+            per_table_at(now, "HT_Book_Pro", 1_000, None),
+        ];
+        let (stalest, _, poll_age) = stalest_per_table_watermark(&rows, 1_000, now).unwrap();
+        assert_eq!(stalest.table_name, "HT_Book_Pro");
+        assert_eq!(poll_age, i64::MAX);
+        assert!(ct_lag_is_warning(0, poll_age, default_ct_thresholds()));
+    }
+
+    /// A watermark ahead of `CHANGE_TRACKING_CURRENT_VERSION()` is a CT
+    /// anomaly; saturating-sub keeps it at zero lag rather than panicking.
+    #[test]
+    fn stalest_per_table_watermark_saturates_on_watermark_ahead_of_current() {
+        let now = chrono::Utc::now();
+        let rows = vec![per_table_at(now, "HT_Rooms", 5_000, Some(1))];
+        let (_, version_lag, _) = stalest_per_table_watermark(&rows, 1_000, now).unwrap();
+        assert_eq!(version_lag, 0);
+    }
+
+    /// Equally-healthy tables must produce a stable pick so the log line
+    /// doesn't flap between tables every tick.
+    #[test]
+    fn stalest_per_table_watermark_is_deterministic_on_a_full_tie() {
+        let now = chrono::Utc::now();
+        let rows = vec![
+            per_table_at(now, "HT_Rooms", 1_000, Some(5)),
+            per_table_at(now, "HT_Customers", 1_000, Some(5)),
+        ];
+        let (first, _, _) = stalest_per_table_watermark(&rows, 1_000, now).unwrap();
+        assert_eq!(first.table_name, "HT_Customers");
     }
 }

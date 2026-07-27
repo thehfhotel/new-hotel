@@ -125,6 +125,12 @@ pub const EV_WATERMARK_ADVANCE_FAIL: &str = "sync.watermark_advance_fail";
 /// flap or pool exhaustion. Short-circuits the entire tick.
 pub const EV_LEGACY_PROBE_FAIL: &str = "sync.legacy_probe_fail";
 
+/// Failed to sample `CHANGE_TRACKING_CURRENT_VERSION()` before the
+/// mapper loop. The tick still runs every mapper — only the end-of-tick
+/// GLOBAL watermark advance is skipped (no ceiling ⇒ nothing safe to
+/// write). Self-healing: the next tick re-samples.
+pub const EV_CT_CEILING_PROBE_FAIL: &str = "sync.ct_ceiling_probe_fail";
+
 /// CT retention guard failed — could not query `CHANGE_TRACKING_MIN_VALID_VERSION`
 /// for the table. NOT the same as a retention OVERFLOW (that's
 /// `EV_CT_RETENTION_OVERFLOW`); this is the round-trip itself failing.
@@ -195,6 +201,7 @@ const KNOWN_SYNC_EVENT_NAMES: &[&str] = &[
     EV_WATERMARK_READ_FAIL,
     EV_WATERMARK_ADVANCE_FAIL,
     EV_LEGACY_PROBE_FAIL,
+    EV_CT_CEILING_PROBE_FAIL,
     EV_RETENTION_CHECK_FAIL,
     EV_CT_RETENTION_OVERFLOW,
     EV_CT_COUNT_FAIL,
@@ -822,9 +829,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cold_replay_allowed = env::var("LEGACY_SYNC_ALLOW_COLD_REPLAY")
         .map(|v| v == "true")
         .unwrap_or(false);
-    let current_watermark = hotel_backend::sync::watermark::read_last_seen(&pg)
+
+    // The tables this process will actually poll. Hoisted above the
+    // pre-flight gates (it used to sit between them) because BOTH gates
+    // now pre-flight on the per-table floor, and an allowlisted-out
+    // table's stale row must not drag that floor down.
+    let allowed_tables: Vec<&'static str> = CT_ENABLED_TABLES
+        .iter()
+        .filter(|t| {
+            allowlist
+                .as_ref()
+                .map(|a| a.contains(**t))
+                .unwrap_or(true)
+        })
+        .copied()
+        .collect();
+
+    // Pre-flight watermark. Under `SYNC_PER_TABLE_WATERMARK=true` the
+    // global row is decorative — a table wedged at an ancient version
+    // is invisible in it — so both gates below must reason about the
+    // MINIMUM per-table watermark instead. See `preflight_watermark`.
+    let global_watermark = hotel_backend::sync::watermark::read_last_seen(&pg)
         .await
         .map_err(|e| format!("Failed to read CT watermark: {e}"))?;
+    let per_table_watermarks = if per_table_watermark {
+        hotel_backend::sync::watermark::read_per_table(&pg)
+            .await
+            .map_err(|e| format!("Failed to read per-table CT watermarks: {e}"))?
+    } else {
+        HashMap::new()
+    };
+    let current_watermark = preflight_watermark(
+        per_table_watermark,
+        global_watermark,
+        &per_table_watermarks,
+        &allowed_tables,
+    );
+    if per_table_watermark {
+        tracing::info!(
+            site = %site.id,
+            global_watermark,
+            preflight_watermark = current_watermark,
+            tables = allowed_tables.len(),
+            "Per-table watermark mode — pre-flighting gates on the MIN per-table watermark"
+        );
+    }
     if current_watermark == 0 && !cold_replay_allowed {
         let msg = "CT watermark is 0 (cold start) and \
                    LEGACY_SYNC_ALLOW_COLD_REPLAY != true — refusing to start. \
@@ -853,19 +902,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // shadow-mode 2-day trap (watermark frozen by TX rollback while
     // MIN_VALID_VERSION marches forward), but a long worker outage
     // hits the same wall. Force the operator to --bootstrap.
+    //
+    // In per-table mode `current_watermark` is the MIN across tables, so
+    // one aged-out table makes every table report overflow. That
+    // over-report is deliberate and harmless: the remedy (--bootstrap,
+    // which re-stamps ALL rows via `stamp_all_per_table`) is the same
+    // whether one table or eighteen fell behind.
     let allow_overflow = env::var("LEGACY_SYNC_ALLOW_OVERFLOW")
         .map(|v| v == "true")
         .unwrap_or(false);
-    let allowed_tables: Vec<&'static str> = CT_ENABLED_TABLES
-        .iter()
-        .filter(|t| {
-            allowlist
-                .as_ref()
-                .map(|a| a.contains(**t))
-                .unwrap_or(true)
-        })
-        .copied()
-        .collect();
     let mut overflowed: Vec<String> = Vec::new();
     for table in &allowed_tables {
         match check_retention(&mssql, table, current_watermark).await {
@@ -1326,7 +1371,9 @@ async fn run_bootstrap(
         tracing::info!(
             current_watermark,
             would_stamp_watermark = snapshot_version,
-            "[bootstrap:dry-run] watermark: a real bootstrap would overwrite the global watermark"
+            would_stamp_per_table_rows = CT_ENABLED_TABLES.len(),
+            "[bootstrap:dry-run] watermark: a real bootstrap would overwrite the global \
+             watermark AND force every per-table row to the same version"
         );
 
         // Per transactional mirror table: legacy source count vs current PG
@@ -1423,10 +1470,24 @@ async fn run_bootstrap(
     .bind(snapshot_version)
     .execute(&pg)
     .await?;
+
+    // …and the per-table sibling rows. Bootstrap must stamp BOTH shapes
+    // unconditionally (not gated on `SYNC_PER_TABLE_WATERMARK`): the flag
+    // is read by the watcher process, and the documented recovery is
+    // "bootstrap, then restart the watcher" — which may well restart it
+    // with the flag ON. Stamping only `legacy_ct_state` left all 18
+    // per-table rows at their pre-bootstrap versions, so the watcher came
+    // straight back up and re-tripped the retention-overflow refusal the
+    // bootstrap was run to clear. Same unguarded-overwrite semantics as
+    // the global UPDATE above.
+    hotel_backend::sync::watermark::stamp_all_per_table(&pg, CT_ENABLED_TABLES, snapshot_version)
+        .await?;
+
     tracing::info!(
         watermark = snapshot_version,
-        "[bootstrap] CT watermark stamped — bootstrap complete. \
-         Operator may now flip LEGACY_SYNC_ENABLED=true."
+        per_table_rows = CT_ENABLED_TABLES.len(),
+        "[bootstrap] CT watermark stamped (global + per-table) — bootstrap \
+         complete. Operator may now flip LEGACY_SYNC_ENABLED=true."
     );
 
     Ok(())
@@ -2694,6 +2755,22 @@ fn build_mappers(allowlist: &Option<HashSet<String>>) -> Vec<Box<dyn MssqlChange
 /// `legacy_ct_state_per_table` (true, Resilience PR R3). Per-table
 /// mode lets a row-lock wedge on one table freeze only that row
 /// rather than gating every CT-enabled table's advance.
+///
+/// ## Global-mode watermark: sampled ceiling, written once, here
+///
+/// The GLOBAL watermark advance belongs to the TICK, not to a table.
+/// This fn samples `CHANGE_TRACKING_CURRENT_VERSION()` ONCE before the
+/// mapper loop and — only if no table errored — writes that ceiling
+/// after the loop. `poll_table` no longer touches the global row.
+///
+/// Sampling before the loop is what makes it safe: every table is
+/// polled at or after that instant, so a save landing mid-loop carries
+/// a version strictly above the ceiling and survives to the next tick.
+/// Letting a late table (`HT_Book_Pro`, index 18) advance the shared
+/// watermark to its own `max_version` is exactly how customer C2413 /
+/// booking R002066 were lost on HF Ville 2026-07-11 — polled-first
+/// `HT_Customers` (index 0) had already run when they were written, and
+/// the 30788 → 30801 advance meant nothing ever re-read v30789.
 #[allow(clippy::too_many_arguments)]
 async fn run_one_tick(
     pg: &PgPool,
@@ -2756,6 +2833,30 @@ async fn run_one_tick(
         return;
     }
 
+    // Sample the tick's CT ceiling BEFORE any mapper runs — see the fn
+    // doc. A probe failure is NOT fatal to the tick: every mapper still
+    // polls and applies, we just have no safe value to write, so the
+    // end-of-tick advance is skipped and the next tick re-samples. The
+    // cost is one repeated read of the same CT range (idempotent).
+    let tick_ct_ceiling: Option<i64> = match read_change_tracking_current_version(mssql).await {
+        Ok(v) => Some(v),
+        Err(err) => {
+            tracing::warn!(
+                event_name = EV_CT_CEILING_PROBE_FAIL,
+                site = %site_id,
+                error = %err,
+                "CHANGE_TRACKING_CURRENT_VERSION() probe failed; \
+                 running mappers but skipping this tick's watermark advance"
+            );
+            None
+        }
+    };
+
+    // Any table failing anywhere in the tick holds the ENTIRE global
+    // advance (see `global_watermark_target`). Per-table mode is
+    // unaffected — each table owns its own row.
+    let mut any_table_errored = false;
+
     let now = Instant::now();
     for mapper in mappers {
         let table = mapper.table();
@@ -2786,7 +2887,7 @@ async fn run_one_tick(
 
         // Run each table inside its own future; panics are isolated
         // via `tokio::spawn` further down for the per-row dispatch.
-        if let Err(err) = poll_table(
+        match poll_table(
             pg,
             mssql,
             slack,
@@ -2795,6 +2896,7 @@ async fn run_one_tick(
             pk_cols,
             select_sql,
             table_last_seen,
+            tick_ct_ceiling,
             shadow_mode,
             per_table_watermark,
             should_check_retention,
@@ -2802,31 +2904,86 @@ async fn run_one_tick(
         )
         .await
         {
-            // Top-level fallback — `poll_table` already records granular
-            // event_names for failures it can attribute to a specific
-            // stage. A bubble-up to here is rare (only the panic-free
-            // `Result` shape escaped the inner fn) but we still attach
-            // an event_name so log filters never see a "naked" error.
-            tracing::error!(
-                event_name = EV_MAPPER_APPLY_FAIL,
-                site = %site_id,
-                table,
-                error = %err,
-                "poll_table failed"
-            );
-            let _ = record_table_error(pg, table, EV_MAPPER_APPLY_FAIL, &err.to_string()).await;
-            if per_table_watermark {
-                // R3 mirror: keep the per-table sibling row in sync so a
-                // per-table watchdog can age the `last_polled_at` on
-                // this specific table. Prefix with the R1 event_name so
-                // operators grepping per-table errors get the same
-                // taxonomy as `legacy_sync_status.last_error`.
-                let payload = format!("[{EV_MAPPER_APPLY_FAIL}] {err}");
-                let _ = hotel_backend::sync::watermark::record_per_table_error(
-                    pg, table, &payload,
-                )
-                .await;
+            Ok(outcome) => {
+                any_table_errored |= outcome.errored;
             }
+            Err(err) => {
+                // Top-level fallback — `poll_table` already records granular
+                // event_names for failures it can attribute to a specific
+                // stage. A bubble-up to here is rare (only the panic-free
+                // `Result` shape escaped the inner fn) but we still attach
+                // an event_name so log filters never see a "naked" error.
+                // It counts as an errored table for the global hold: we
+                // cannot prove this table read through the ceiling.
+                any_table_errored = true;
+                tracing::error!(
+                    event_name = EV_MAPPER_APPLY_FAIL,
+                    site = %site_id,
+                    table,
+                    error = %err,
+                    "poll_table failed"
+                );
+                let _ = record_table_error(pg, table, EV_MAPPER_APPLY_FAIL, &err.to_string()).await;
+                if per_table_watermark {
+                    // R3 mirror: keep the per-table sibling row in sync so a
+                    // per-table watchdog can age the `last_polled_at` on
+                    // this specific table. Prefix with the R1 event_name so
+                    // operators grepping per-table errors get the same
+                    // taxonomy as `legacy_sync_status.last_error`.
+                    let payload = format!("[{EV_MAPPER_APPLY_FAIL}] {err}");
+                    let _ = hotel_backend::sync::watermark::record_per_table_error(
+                        pg, table, &payload,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    // THE once-per-tick global advance. Per-table mode advanced each row
+    // inside `poll_table` and deliberately leaves `legacy_ct_state`
+    // alone (pre-R3 behaviour preserved on the global path only).
+    //
+    // Shadow mode is excluded: every mapper TX was rolled back, so
+    // advancing would march the watermark past changes that were never
+    // applied. That's unchanged from the pre-fix code (`poll_table`
+    // returned before its advance in shadow mode) and is why a long
+    // shadow soak still hits the documented 2-day retention trap.
+    if !per_table_watermark && !shadow_mode {
+        if let Some(target) =
+            global_watermark_target(tick_ct_ceiling, global_last_seen, any_table_errored)
+        {
+            match hotel_backend::sync::watermark::advance(pg, target).await {
+                Ok(()) => {
+                    tracing::info!(
+                        site = %site_id,
+                        from = global_last_seen,
+                        to = target,
+                        tables = mappers.len(),
+                        "Advanced GLOBAL CT watermark to this tick's sampled ceiling"
+                    );
+                }
+                Err(err) => {
+                    // No table-level attribution exists for a tick-level
+                    // write, so this is log-only — `record_table_error`
+                    // needs a `legacy_sync_status.table_name` row. The
+                    // next tick retries from the unchanged watermark.
+                    tracing::error!(
+                        event_name = EV_WATERMARK_ADVANCE_FAIL,
+                        site = %site_id,
+                        new_version = target,
+                        error = %err,
+                        "Failed to advance GLOBAL CT watermark"
+                    );
+                }
+            }
+        } else if any_table_errored {
+            tracing::warn!(
+                site = %site_id,
+                last_seen = global_last_seen,
+                ceiling = ?tick_ct_ceiling,
+                "[CT] Tick had table failures — holding GLOBAL watermark for retry next tick"
+            );
         }
     }
 
@@ -2871,9 +3028,43 @@ async fn run_one_tick(
     sync_sticky_notes(pg, mssql, shadow_mode, site_id).await;
 }
 
+/// What one table's poll told the tick. Currently just the error flag,
+/// which `run_one_tick` folds across every table to decide whether the
+/// GLOBAL watermark may advance — a table that failed cannot be proven
+/// to have read through the tick ceiling, so ONE failure holds the whole
+/// advance. Kept as a struct (not a bare `bool`) so a future signal
+/// (rows applied, ceiling overshoot) doesn't churn the signature again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PollOutcome {
+    errored: bool,
+}
+
+impl PollOutcome {
+    /// Table polled to completion with nothing failing.
+    const fn clean() -> Self {
+        Self { errored: false }
+    }
+
+    /// Table did not complete a full, trustworthy read of its CT range.
+    const fn failed() -> Self {
+        Self { errored: true }
+    }
+}
+
 /// Poll one table for CT changes since `last_seen`. Per the lifecycle:
 /// retention check → SELECT CT changes → for each row, dispatch to
-/// mapper → INSERT event_log → bump counters → advance watermark.
+/// mapper → INSERT event_log → bump counters → advance the PER-TABLE
+/// watermark.
+///
+/// Deliberately does NOT advance the GLOBAL watermark — that is a
+/// once-per-tick write owned by `run_one_tick` (see its doc comment for
+/// the 2026-07-11 HF Ville loss caused by advancing the shared row from
+/// here, per table, to that table's own `max_version`).
+///
+/// `tick_ct_ceiling` is the tick's `CHANGE_TRACKING_CURRENT_VERSION()`
+/// sample, taken before ANY table was polled (`None` when the probe
+/// failed). Used only on the per-table path, to move a table that found
+/// nothing forward — see `quiet_table_watermark_target`.
 ///
 /// `should_check_retention` is throttled by the caller to
 /// `LEGACY_SYNC_RETENTION_CHECK_INTERVAL_SECS` (default 300s) per
@@ -2891,11 +3082,12 @@ async fn poll_table(
     pk_cols: &[&str],
     select_sql: &str,
     last_seen: i64,
+    tick_ct_ceiling: Option<i64>,
     shadow_mode: bool,
     per_table_watermark: bool,
     should_check_retention: bool,
     site_id: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<PollOutcome, Box<dyn std::error::Error + Send + Sync>> {
     // 1. Retention guard (throttled — see fn doc comment).
     if should_check_retention {
         if let Err(err) = check_retention(mssql, table, last_seen).await {
@@ -2932,7 +3124,10 @@ async fn poll_table(
                     let _ = s.send_message(&msg).await;
                 }
             }
-            return Ok(()); // intentional skip — retention can't be repaired by retry
+            // Intentional skip — retention can't be repaired by retry.
+            // Still `failed()`: we did not read this table's CT range, so
+            // the tick must not advance the global watermark past it.
+            return Ok(PollOutcome::failed());
         }
     }
 
@@ -2949,7 +3144,7 @@ async fn poll_table(
                     "CT count query failed"
                 );
                 let _ = record_table_error(pg, table, EV_CT_COUNT_FAIL, &err).await;
-                return Ok(());
+                return Ok(PollOutcome::failed());
             }
         };
         if let Err(err) = bump_skipped(pg, table, row_count, false).await {
@@ -2966,7 +3161,10 @@ async fn poll_table(
                 "CT rows observed (NoopMapper — skipped, awaiting real mapper)"
             );
         }
-        return Ok(());
+        // No watermark movement of any kind on the noop path: the rows
+        // were counted, never applied, and per-table mode deliberately
+        // keeps them replayable for the day a real mapper ships.
+        return Ok(PollOutcome::clean());
     }
 
     // 3. Real-mapper path: fetch CT rows joined with the table.
@@ -2980,7 +3178,7 @@ async fn poll_table(
                 "CT fetch failed"
             );
             let _ = record_table_error(pg, table, EV_CT_FETCH_FAIL, &err).await;
-            return Ok(());
+            return Ok(PollOutcome::failed());
         }
     };
 
@@ -3001,12 +3199,30 @@ async fn poll_table(
         // (v2.58.3, fix/hfville-stuck-ct-tables).
         let _ = bump_skipped(pg, table, 0, false).await;
         if per_table_watermark {
-            // R3 — touch `last_polled_at` so the per-table watchdog
-            // can distinguish "healthy but quiet" from "wedged" by
-            // comparing now() - last_polled_at across rows.
-            let _ = hotel_backend::sync::watermark::touch_per_table(pg, table).await;
+            // R3 — this row must move forward, not just get touched.
+            // A permanently-quiet table (HF Ville's HT_Cupon,
+            // HT_Deposit, HT_Bill_Debt_*, HT_CheckIn_Product,
+            // HT_Receipt_H — all 0 rows ingested) that only ever
+            // touches `last_polled_at` keeps `last_seen_version`
+            // frozen while MSSQL's MIN_VALID_VERSION marches forward,
+            // so it eventually trips the retention-overflow refusal for
+            // no reason. Having polled and found nothing, it HAS read
+            // through the tick ceiling — advance it there. Falls back
+            // to a plain touch when there's no ceiling to advance to.
+            match quiet_table_watermark_target(tick_ct_ceiling, last_seen, shadow_mode) {
+                Some(target) => {
+                    let _ =
+                        hotel_backend::sync::watermark::advance_per_table(pg, table, target).await;
+                }
+                None => {
+                    // Touch only: the per-table watchdog still needs to
+                    // distinguish "healthy but quiet" from "wedged" by
+                    // comparing now() - last_polled_at across rows.
+                    let _ = hotel_backend::sync::watermark::touch_per_table(pg, table).await;
+                }
+            }
         }
-        return Ok(());
+        return Ok(PollOutcome::clean());
     }
 
     let row_count = rows.len() as i64;
@@ -3033,7 +3249,7 @@ async fn poll_table(
                 "Failed to begin PG TX"
             );
             let _ = record_table_error(pg, table, EV_PG_TX_BEGIN_FAIL, &err.to_string()).await;
-            return Ok(());
+            return Ok(PollOutcome::failed());
         }
     };
 
@@ -3414,7 +3630,10 @@ async fn poll_table(
         }
         // Bump skipped counter to mirror the noop path's behavior.
         let _ = bump_skipped(pg, table, row_count, errored).await;
-        return Ok(());
+        // Shadow mode applied nothing, so nothing advances anywhere —
+        // `run_one_tick` skips the global advance wholesale in shadow
+        // mode; report the raw per-key result for the tick's tally.
+        return Ok(PollOutcome { errored });
     }
 
     if let Err(err) = tx.commit().await {
@@ -3425,7 +3644,7 @@ async fn poll_table(
             "PG TX commit failed"
         );
         let _ = record_table_error(pg, table, EV_PG_TX_COMMIT_FAIL, &err.to_string()).await;
-        return Ok(());
+        return Ok(PollOutcome::failed());
     }
 
     // 6. Counters + watermark advance (live mode only).
@@ -3445,6 +3664,9 @@ async fn poll_table(
     // silent-drop bug where a transient per-key failure (deploy
     // mid-tick, MSSQL hiccup) advanced the watermark past the failed
     // key's CT version, losing the event after CT's 2-day retention.
+    //
+    // GLOBAL mode does nothing here beyond logging: `run_one_tick` owns
+    // that write and gets `errored` back via `PollOutcome`.
     if errored {
         tracing::warn!(
             table,
@@ -3460,18 +3682,32 @@ async fn poll_table(
         if per_table_watermark {
             let _ = hotel_backend::sync::watermark::touch_per_table(pg, table).await;
         }
-    } else if let Some(target_version) = next_watermark_after_tick(max_version, last_seen, errored)
-    {
-        // R3 — feature-flagged dual-write contract. Per-table mode
-        // advances ONLY the per-table row so a stuck sibling
-        // doesn't pin the global down; global mode advances ONLY
-        // the single-row state, preserving the pre-R3 behaviour.
-        let advance_result = if per_table_watermark {
-            hotel_backend::sync::watermark::advance_per_table(pg, table, target_version).await
-        } else {
-            hotel_backend::sync::watermark::advance(pg, target_version).await
-        };
-        match advance_result {
+        return Ok(PollOutcome::failed());
+    }
+
+    if !per_table_watermark {
+        // Global mode: observability only. Keeps the per-table
+        // from/to breadcrumb operators grep for, minus the write.
+        if let Some(applied_through) = next_watermark_after_tick(max_version, last_seen, errored) {
+            tracing::info!(
+                table,
+                from = last_seen,
+                applied_through,
+                ingested,
+                skipped,
+                "CT rows applied (global watermark advances once per tick in run_one_tick)"
+            );
+        }
+        return Ok(PollOutcome::clean());
+    }
+
+    // Per-table mode. Advance to this table's own `max_version` when it
+    // saw rows; otherwise to the tick ceiling, which it has provably
+    // read through (same anti-freeze rule as the empty-fetch branch).
+    let per_table_target = next_watermark_after_tick(max_version, last_seen, errored)
+        .or_else(|| quiet_table_watermark_target(tick_ct_ceiling, last_seen, shadow_mode));
+    if let Some(target_version) = per_table_target {
+        match hotel_backend::sync::watermark::advance_per_table(pg, table, target_version).await {
             Err(err) => {
                 // R1: structured event + persisted failure mode so the
                 // 2026-05-14 symptom (UPDATE failure post-commit, no
@@ -3480,7 +3716,7 @@ async fn poll_table(
                     event_name = EV_WATERMARK_ADVANCE_FAIL,
                     table,
                     new_version = target_version,
-                    per_table = per_table_watermark,
+                    per_table = true,
                     error = %err,
                     "Failed to advance CT watermark"
                 );
@@ -3494,16 +3730,14 @@ async fn poll_table(
                     &err.to_string(),
                 )
                 .await;
-                // R3 mirror: when per-table mode is active, also persist
-                // into the per-table row so a per-table watchdog can
-                // attribute the wedge to this specific table.
-                if per_table_watermark {
-                    let payload = format!("[{EV_WATERMARK_ADVANCE_FAIL}] {err}");
-                    let _ = hotel_backend::sync::watermark::record_per_table_error(
-                        pg, table, &payload,
-                    )
-                    .await;
-                }
+                // R3 mirror: also persist into the per-table row so a
+                // per-table watchdog can attribute the wedge to this
+                // specific table.
+                let payload = format!("[{EV_WATERMARK_ADVANCE_FAIL}] {err}");
+                let _ = hotel_backend::sync::watermark::record_per_table_error(
+                    pg, table, &payload,
+                )
+                .await;
             }
             Ok(()) => {
                 tracing::info!(
@@ -3512,19 +3746,19 @@ async fn poll_table(
                     to = target_version,
                     ingested,
                     skipped,
-                    per_table = per_table_watermark,
+                    per_table = true,
                     "Advanced CT watermark"
                 );
             }
         }
-    } else if per_table_watermark {
-        // Live tick with no new CT version (rows were all stale /
-        // coalesced away). Still touch `last_polled_at` so the
+    } else {
+        // Live tick with no new CT version AND no usable tick ceiling
+        // (the pre-loop probe failed). Touch `last_polled_at` so the
         // per-table watchdog doesn't flag the row as wedged.
         let _ = hotel_backend::sync::watermark::touch_per_table(pg, table).await;
     }
 
-    Ok(())
+    Ok(PollOutcome::clean())
 }
 
 /// One CT row returned by [`fetch_ct_rows`]: the version, the
@@ -5101,6 +5335,110 @@ fn next_watermark_after_tick(
     }
 }
 
+/// Global-mode watermark target for one completed tick.
+///
+/// `tick_ct_ceiling` is `CHANGE_TRACKING_CURRENT_VERSION()` sampled
+/// BEFORE the mapper loop (`None` when that probe failed). Returns
+/// `None` when any table errored (hold for retry) or when there is no
+/// forward progress.
+///
+/// ## Why the ceiling and not `max(SYS_CHANGE_VERSION)`
+///
+/// The global row is SHARED by all 18 CT tables, and `advance` is
+/// monotonic-max. Advancing it per table, to that table's own
+/// `max_version`, therefore ends every tick at the MAX across tables —
+/// so a table polled EARLY gets its resume point dragged past rows it
+/// never read. One iHOTEL save writes many CT tables in a single
+/// transaction, and `build_mappers` preserves `CT_ENABLED_TABLES` order
+/// with `HT_Customers` first and `HT_Book_Pro` last, which is precisely
+/// the window that lost customer C2413 + booking R002066 on HF Ville
+/// 2026-07-11: the save landed at v30789 after `HT_Customers` had
+/// already polled, `HT_Book_Pro` then advanced the shared watermark
+/// 30788 → 30801, and nothing ever re-read v30789. CT's 2-day retention
+/// aged it out. Nothing failed, so nothing was logged.
+///
+/// The sampled ceiling is immune by construction: every table is polled
+/// at or after the sample instant, so it has read through at least that
+/// version, and anything landing mid-loop carries a HIGHER version and
+/// is picked up next tick. It is deliberately conservative — a tick may
+/// re-read a few rows it already applied, which is safe because
+/// re-applying a CT row is idempotent across the mapper stack (the same
+/// assumption the per-table `errored` hold has always relied on).
+fn global_watermark_target(
+    tick_ct_ceiling: Option<i64>,
+    last_seen: i64,
+    any_table_errored: bool,
+) -> Option<i64> {
+    if any_table_errored {
+        return None;
+    }
+    match tick_ct_ceiling {
+        Some(ceiling) if ceiling > last_seen => Some(ceiling),
+        _ => None,
+    }
+}
+
+/// Per-table watermark target for a table that polled successfully but
+/// found NO new CT rows (or found rows that produced no version
+/// progress). Both call sites are structurally on the non-errored path.
+///
+/// Having queried `CHANGETABLE` after the ceiling was sampled and got
+/// nothing, the table has provably read through the ceiling — so it may
+/// move there. Without this, a permanently-quiet table only ever gets
+/// its `last_polled_at` touched: `last_seen_version` freezes while
+/// MSSQL's `CHANGE_TRACKING_MIN_VALID_VERSION` marches forward, and it
+/// eventually trips the retention-overflow refusal having done nothing
+/// wrong. On HF Ville that is `HT_Cupon`, `HT_Deposit`,
+/// `HT_Bill_Debt_H`, `HT_Bill_Debt_Ds`, `HT_CheckIn_Product` and
+/// `HT_Receipt_H` — all 0 rows ingested since CT was enabled.
+///
+/// Shadow mode never advances (nothing was applied), and a failed
+/// ceiling probe (`None`) simply defers to the next tick.
+fn quiet_table_watermark_target(
+    tick_ct_ceiling: Option<i64>,
+    last_seen: i64,
+    shadow_mode: bool,
+) -> Option<i64> {
+    if shadow_mode {
+        return None;
+    }
+    match tick_ct_ceiling {
+        Some(ceiling) if ceiling > last_seen => Some(ceiling),
+        _ => None,
+    }
+}
+
+/// The watermark the STARTUP gates (cold-replay refusal,
+/// retention-overflow refusal) must reason about.
+///
+/// Global mode: the single `legacy_ct_state` row, unchanged.
+///
+/// Per-table mode: the MINIMUM `last_seen_version` across the tables
+/// this process will actually poll — the true floor of the replay. The
+/// global row is decorative once `SYNC_PER_TABLE_WATERMARK=true`, so
+/// pre-flighting on it hid exactly the failure the per-table split
+/// exists to expose: one table wedged at an ancient version while the
+/// global row looks current. A table with NO row yet defaults to `0`
+/// (matching `run_one_tick`'s `unwrap_or(0)` resume semantics), which
+/// drags the floor to 0 and correctly trips the cold-replay refusal —
+/// the fix is to seed its row, the way migration 056 did for
+/// `HT_Book_Pro`.
+fn preflight_watermark(
+    per_table: bool,
+    global: i64,
+    per_table_map: &std::collections::HashMap<String, i64>,
+    tables: &[&str],
+) -> i64 {
+    if !per_table {
+        return global;
+    }
+    tables
+        .iter()
+        .map(|t| per_table_map.get(*t).copied().unwrap_or(0))
+        .min()
+        .unwrap_or(global)
+}
+
 /// Persist a per-table failure mode to `legacy_sync_status` for
 /// cross-restart visibility. Runs in its OWN sqlx auto-TX (the caller's
 /// failed-tick TX, if any, is rolled back independently — wrapping this
@@ -5537,6 +5875,202 @@ mod tests {
     #[test]
     fn next_watermark_after_tick_holds_on_error_with_no_progress() {
         assert_eq!(next_watermark_after_tick(90, 90, true), None);
+    }
+
+    // ========================================================================
+    // Mid-loop-arrival silent-drop fix — the GLOBAL watermark is the TICK's,
+    // written once from a ceiling sampled BEFORE the mapper loop.
+    //
+    // HF Ville 2026-07-11: the tick read global watermark 30788.
+    // `HT_Customers` (CT_ENABLED_TABLES index 0, polled FIRST) found
+    // nothing. iHOTEL then wrote customer C2413 + booking R002066 at
+    // v≈30789 while the loop was still running. `HT_Book_Pro` (index 18,
+    // polled LAST at 03:50:53) found its own rows and advanced the SHARED
+    // watermark 30788 → 30801. Every table resumed at 30801 next tick, so
+    // C2413's v30789 was never fetched and aged out of CT's 2-day
+    // retention. Nothing errored, so nothing was logged.
+    // ========================================================================
+
+    /// Happy path: no table errored and the pre-loop ceiling is ahead of
+    /// the watermark we resumed from — advance to the ceiling.
+    #[test]
+    fn global_watermark_target_advances_to_sampled_ceiling() {
+        assert_eq!(
+            global_watermark_target(Some(30801), 30788, false),
+            Some(30801),
+            "clean tick must advance the global watermark to the sampled CT ceiling"
+        );
+    }
+
+    /// THE regression test for the mid-loop-arrival class.
+    ///
+    /// Replays HF Ville 2026-07-11 with the fix in place: the ceiling is
+    /// sampled BEFORE the loop, when CT was still at 30788. Customer
+    /// C2413 / booking R002066 land at v30789 mid-loop and `HT_Book_Pro`
+    /// observes versions up to 30801 — but none of that can reach the
+    /// global advance any more, because the only input is the 30788
+    /// ceiling. No progress ⇒ no write ⇒ every table resumes at 30788
+    /// next tick and re-reads v30789. That is the whole fix.
+    #[test]
+    fn global_watermark_target_ignores_versions_that_landed_mid_loop() {
+        assert_eq!(
+            global_watermark_target(Some(30788), 30788, false),
+            None,
+            "ceiling sampled pre-loop equals last_seen ⇒ no advance, so C2413/R002066 \
+             at v30789 survive to the next tick instead of being skipped to 30801"
+        );
+    }
+
+    /// Any table failing anywhere in the tick holds the ENTIRE global
+    /// advance — we cannot prove that table read through the ceiling,
+    /// and a shared row has no way to hold just its slice.
+    #[test]
+    fn global_watermark_target_holds_when_any_table_errored() {
+        assert_eq!(
+            global_watermark_target(Some(30801), 30788, true),
+            None,
+            "one errored table MUST hold the whole global advance for retry next tick"
+        );
+    }
+
+    /// The pre-loop `CHANGE_TRACKING_CURRENT_VERSION()` probe failed, so
+    /// there is no version we can prove every table read through. Hold;
+    /// the mappers still ran and the next tick re-samples.
+    #[test]
+    fn global_watermark_target_holds_when_ceiling_probe_failed() {
+        assert_eq!(
+            global_watermark_target(None, 30788, false),
+            None,
+            "no ceiling ⇒ nothing safe to write ⇒ hold"
+        );
+    }
+
+    /// Defensive: a ceiling BELOW the watermark (clock/bootstrap skew,
+    /// or a re-pointed legacy server) must never roll the watermark
+    /// backward. `advance`'s SQL guard would reject it anyway; the
+    /// helper refuses first so the intent is explicit.
+    #[test]
+    fn global_watermark_target_never_regresses_the_watermark() {
+        assert_eq!(global_watermark_target(Some(30_000), 30_788, false), None);
+    }
+
+    // ========================================================================
+    // Quiet-table anti-freeze (per-table mode).
+    // ========================================================================
+
+    /// A permanently-quiet table (HF Ville's HT_Cupon, HT_Deposit,
+    /// HT_Bill_Debt_*, HT_CheckIn_Product, HT_Receipt_H — 0 rows
+    /// ingested since CT was enabled) polled and found nothing, so it
+    /// has read through the tick ceiling. It must MOVE there, not just
+    /// get its `last_polled_at` touched: a frozen `last_seen_version`
+    /// eventually falls below CHANGE_TRACKING_MIN_VALID_VERSION and
+    /// pages a retention overflow for a table that never had a row.
+    #[test]
+    fn quiet_table_advances_to_tick_ceiling() {
+        assert_eq!(
+            quiet_table_watermark_target(Some(30801), 30788, false),
+            Some(30801),
+            "a table that polled and found nothing must advance to the tick ceiling"
+        );
+    }
+
+    /// Ceiling already at the table's watermark — nothing to write.
+    #[test]
+    fn quiet_table_no_advance_without_progress() {
+        assert_eq!(
+            quiet_table_watermark_target(Some(30788), 30788, false),
+            None
+        );
+    }
+
+    /// Shadow mode applied nothing this tick, so no watermark of any
+    /// kind may move — otherwise a shadow soak would silently consume
+    /// the CT range it is supposed to be observing.
+    #[test]
+    fn quiet_table_never_advances_in_shadow_mode() {
+        assert_eq!(
+            quiet_table_watermark_target(Some(30801), 30788, true),
+            None,
+            "shadow mode rolls every TX back — advancing would consume unapplied changes"
+        );
+    }
+
+    /// Failed ceiling probe degrades to the old touch-only behaviour.
+    #[test]
+    fn quiet_table_holds_when_ceiling_probe_failed() {
+        assert_eq!(quiet_table_watermark_target(None, 30788, false), None);
+    }
+
+    // ========================================================================
+    // Startup gates must see the per-table floor, not the global row.
+    // ========================================================================
+
+    fn per_table_map(entries: &[(&str, i64)]) -> std::collections::HashMap<String, i64> {
+        entries
+            .iter()
+            .map(|(t, v)| ((*t).to_string(), *v))
+            .collect()
+    }
+
+    /// Global mode is untouched — the single row IS the watermark.
+    #[test]
+    fn preflight_watermark_uses_global_row_when_per_table_off() {
+        let map = per_table_map(&[("HT_Customers", 10), ("HT_Book_Pro", 20)]);
+        assert_eq!(
+            preflight_watermark(false, 30_788, &map, &["HT_Customers", "HT_Book_Pro"]),
+            30_788,
+            "global mode must ignore the per-table rows entirely"
+        );
+    }
+
+    /// Per-table mode pre-flights on the MINIMUM: one table wedged at an
+    /// ancient version is exactly what the gates exist to catch, and the
+    /// global row would have hidden it.
+    #[test]
+    fn preflight_watermark_uses_min_per_table_when_on() {
+        let map = per_table_map(&[
+            ("HT_Customers", 30_788),
+            ("HT_Book_H", 12_000),
+            ("HT_Book_Pro", 30_801),
+        ]);
+        assert_eq!(
+            preflight_watermark(
+                true,
+                30_801,
+                &map,
+                &["HT_Customers", "HT_Book_H", "HT_Book_Pro"]
+            ),
+            12_000,
+            "a table stuck at 12000 is the real replay floor, not the current-looking global row"
+        );
+    }
+
+    /// A table with no row yet resumes from 0 in `run_one_tick`
+    /// (`unwrap_or(0)`), so the gates must see 0 too — that trips the
+    /// cold-replay refusal, whose remedy is seeding the row the way
+    /// migration 056 did for HT_Book_Pro.
+    #[test]
+    fn preflight_watermark_unseeded_table_drags_floor_to_zero() {
+        let map = per_table_map(&[("HT_Customers", 30_788), ("HT_Book_H", 30_788)]);
+        assert_eq!(
+            preflight_watermark(
+                true,
+                30_788,
+                &map,
+                &["HT_Customers", "HT_Book_H", "HT_Book_Pro"]
+            ),
+            0,
+            "unseeded HT_Book_Pro resumes from 0, so the pre-flight floor is 0"
+        );
+    }
+
+    /// Allowlisted down to nothing (or an empty table list): fall back
+    /// to the global row rather than inventing a floor of 0 out of an
+    /// empty `min()`.
+    #[test]
+    fn preflight_watermark_empty_table_list_falls_back_to_global() {
+        let map = per_table_map(&[("HT_Customers", 30_788)]);
+        assert_eq!(preflight_watermark(true, 30_788, &map, &[]), 30_788);
     }
 
     #[test]

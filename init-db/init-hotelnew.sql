@@ -2610,5 +2610,64 @@ VALUES ('077', '077_create_ht_housekeeping_reports.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================
+-- Migration 078: re-seed legacy_ct_state_per_table from the global watermark
+-- Mirrors migrations/pg/078_reseed_ct_state_per_table.sql. No schema change —
+-- a DATA migration that force-sets every per-table CT watermark to the current
+-- global `legacy_ct_state.last_seen_version` so `SYNC_PER_TABLE_WATERMARK=true`
+-- can be flipped without a retention-overflow page storm + unbounded CT replay.
+--
+-- Unlike the 050 backfill and the 056 HT_Book_Pro seed above (both
+-- `ON CONFLICT DO NOTHING`, which is why the rows froze at their apply date),
+-- this one uses an explicit `DO UPDATE` with
+-- `GREATEST(existing, EXCLUDED)` — forward-only, so a table that has already
+-- advanced past the global row is never rolled backward. Full rationale in the
+-- migration file.
+--
+-- Placed LAST in this script on purpose: it must run after BOTH the 050
+-- backfill and the 056 HT_Book_Pro seed. On a fresh install the global
+-- watermark is 0, so this is a semantic no-op here — it exists for parity so
+-- a fresh DB and a migrated DB converge on the same statement history.
+--
+-- Table list MUST stay in lock-step with `CT_ENABLED_TABLES` in
+-- `hotel-backend/src/bin/sync.rs` (19 entries as of 2026-07-27).
+-- =============================================================================
+
+INSERT INTO legacy_ct_state_per_table (table_name, last_seen_version, last_polled_at)
+SELECT t.name,
+       COALESCE((SELECT last_seen_version FROM legacy_ct_state WHERE id = 1), 0),
+       now()
+FROM (VALUES
+    ('HT_Customers'),
+    ('HT_Rooms'),
+    ('HT_Room_Status'),
+    ('HT_Book_H'),
+    ('HT_Book_Ds'),
+    ('HT_Book_Date'),
+    ('HT_CheckIn_H'),
+    ('HT_CheckIn_Ds'),
+    ('HT_CheckIn_Pay'),
+    ('HT_Receipt_H'),
+    ('HT_Cupon'),
+    ('HT_CheckIn_Product'),
+    ('HT_Deposit'),
+    ('HT_Changed_Room'),
+    ('HT_Bill_Debt_H'),
+    ('HT_Bill_Debt_Ds'),
+    ('HT_CheckIn_Other_People'),
+    ('HT_Rooms_Cancel'),
+    ('HT_Book_Pro')
+) AS t(name)
+ON CONFLICT (table_name) DO UPDATE
+    SET last_seen_version = GREATEST(
+            legacy_ct_state_per_table.last_seen_version,
+            EXCLUDED.last_seen_version
+        ),
+        last_polled_at = now();
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('078', '078_reseed_ct_state_per_table.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- =============================================================================
 -- Initialization complete
 -- =============================================================================

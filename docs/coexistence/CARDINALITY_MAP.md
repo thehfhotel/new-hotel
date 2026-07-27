@@ -92,7 +92,8 @@ them).
 |---|---|
 | `schema_migrations` | Migration version tracking |
 | `sync_status` | Per-aggregate sync watermark (newer style) |
-| `legacy_ct_state` | MSSQL Change Tracking watermark |
+| `legacy_ct_state` | MSSQL Change Tracking watermark (single row, `id=1`). Operational while `SYNC_PER_TABLE_WATERMARK=false` — the shipped default |
+| `legacy_ct_state_per_table` | Per-table MSSQL Change Tracking watermark (migration 050, Resilience PR R3). One row per entry of `CT_ENABLED_TABLES` (19 as of 2026-07-27), so a row-lock wedge on one hot legacy table freezes only that row instead of gating every table's advance. Sibling of `legacy_ct_state`, consulted only when `SYNC_PER_TABLE_WATERMARK=true`. Rows are re-seeded from the current global watermark by migration 078 — a prerequisite for that flip, since the 050/056 `DO NOTHING` seeds left them pinned at their 2026-05-14 apply date and far outside the 2-day CT retention window |
 | `legacy_sync_status` | Per-entity sync health |
 | `writeback_jobs` | Outbox queue |
 | `event_log` | Event sourcing log |

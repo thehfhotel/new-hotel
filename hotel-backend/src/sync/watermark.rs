@@ -23,12 +23,35 @@
 //!
 //! ## Single-write-per-tick contract (global path)
 //!
-//! [`advance`] is called once per watcher tick AFTER all per-table
-//! mappers in that tick have committed. The advance writes the
-//! `min(per-table-max(SYS_CHANGE_VERSION))` so a partial tick failure
-//! leaves the watermark below the last fully-applied version — the
-//! retry will re-fetch the failed table's rows (idempotent UPSERTs in
-//! 5.2+ make the re-fetch safe).
+//! [`advance`] is called EXACTLY ONCE per watcher tick, from
+//! `run_one_tick` AFTER every per-table mapper in that tick has
+//! committed. It is NOT called from inside the per-table poll.
+//!
+//! The value written is the **tick CT ceiling**:
+//! `CHANGE_TRACKING_CURRENT_VERSION()` sampled ONCE from MSSQL *before*
+//! the mapper loop begins. Every table is polled at or after that
+//! instant, so every table has provably read through at least that
+//! version; anything an iHOTEL save lands mid-loop carries a version
+//! strictly ABOVE the ceiling and is therefore still picked up next
+//! tick.
+//!
+//! Writing per-table `max(SYS_CHANGE_VERSION)` here instead is the
+//! silent-drop bug fixed 2026-07-11 (HF Ville). `advance` is monotonic
+//! (`WHERE last_seen_version <= $1`), so a per-table call made the
+//! SHARED watermark end each tick at the MAX across tables. One iHOTEL
+//! save writes many CT tables in one transaction; `HT_Customers` is
+//! polled FIRST and `HT_Book_Pro` LAST, so a save landing mid-loop was
+//! seen only by the late table, which then dragged the shared watermark
+//! past the early table's unread rows (customer C2413 / booking R002066
+//! at v30789 lost behind a 30788 → 30801 advance). CT's 2-day retention
+//! aged them out permanently, with nothing logged.
+//!
+//! The whole advance is HELD (no write at all) when ANY table errored in
+//! the tick, so the next tick re-fetches the same CT range for every
+//! table — re-applying a CT row is idempotent across the mapper stack,
+//! which is the same assumption the per-table `errored` hold relies on.
+//! A conservative ceiling that occasionally re-reads a few rows is the
+//! deliberate trade against ever skipping one.
 //!
 //! ## Single-write-per-table-tick contract (per-table path)
 //!
@@ -63,8 +86,12 @@ pub async fn read_last_seen(pool: &PgPool) -> Result<i64, SyncError> {
 /// advancing past unprocessed rows would silently lose them on the
 /// next tick.
 ///
-/// `new_version` should be the minimum-of-per-table-max for this tick;
-/// see module docs for the rationale.
+/// `new_version` MUST be the tick's CT ceiling — the value of
+/// `CHANGE_TRACKING_CURRENT_VERSION()` sampled BEFORE the mapper loop
+/// started — and never a per-table `max(SYS_CHANGE_VERSION)`; see the
+/// module docs for the 2026-07-11 loss this distinction prevents.
+/// `bin/sync.rs::global_watermark_target` is the only sanctioned way to
+/// compute the argument.
 pub async fn advance(pool: &PgPool, new_version: i64) -> Result<(), SyncError> {
     sqlx::query(
         "UPDATE legacy_ct_state \
@@ -124,6 +151,48 @@ pub async fn advance_per_table(
     )
     .bind(table)
     .bind(new_version)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Force EVERY listed table's per-table watermark to `version` in one
+/// statement. Bootstrap-only override.
+///
+/// Unlike [`advance_per_table`] this deliberately has NO monotonic
+/// guard: `bin/sync --bootstrap` re-snapshots canonical PG and stamps
+/// the watermark to the CT version captured before the snapshot, which
+/// may be BEHIND a partially-advanced row. Matching the global path's
+/// unguarded `UPDATE legacy_ct_state` keeps the documented
+/// retention-overflow recovery ("bootstrap, then restart") correct under
+/// `SYNC_PER_TABLE_WATERMARK=true` — before this existed, bootstrap
+/// stamped only the global row and left all 18 per-table rows stale, so
+/// the watcher came back up and immediately re-tripped the overflow
+/// refusal.
+///
+/// Also clears `last_error` / `last_error_at`: a fresh cold-seed
+/// invalidates any pre-bootstrap failure recorded against the table.
+pub async fn stamp_all_per_table(
+    pool: &PgPool,
+    tables: &[&str],
+    version: i64,
+) -> Result<(), SyncError> {
+    if tables.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<String> = tables.iter().map(|t| (*t).to_string()).collect();
+    sqlx::query(
+        "INSERT INTO legacy_ct_state_per_table \
+             (table_name, last_seen_version, last_polled_at) \
+         SELECT t, $2::bigint, now() FROM UNNEST($1::text[]) AS t \
+         ON CONFLICT (table_name) DO UPDATE \
+             SET last_seen_version = EXCLUDED.last_seen_version, \
+                 last_polled_at    = EXCLUDED.last_polled_at, \
+                 last_error        = NULL, \
+                 last_error_at     = NULL",
+    )
+    .bind(&names)
+    .bind(version)
     .execute(pool)
     .await?;
     Ok(())
