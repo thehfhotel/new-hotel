@@ -3715,7 +3715,20 @@ async fn sync_rooms(
                 let canonical_hash = canonical.as_ref().map(|c| {
                     room_canonical_hash(
                         &room_no,
-                        bool_to_yesno(c.room_clean),
+                        // `room_clean` is INVERTED between the two sides —
+                        // legacy 'yes' means NEEDS cleaning, canonical `true`
+                        // means IS clean. Commit 0303c98 added
+                        // `clean_bool_to_legacy_yesno` for exactly this but
+                        // only applied it to `compute_current_pg_hash`'s copy
+                        // of this projection, leaving THIS one on the
+                        // uninverted `bool_to_yesno`. The two disagreed, so
+                        // every room with a non-NULL `Room_Clean` was detected
+                        // as `value` drift and then immediately closed by the
+                        // auto-resolve sweep (which uses the corrected
+                        // inverse) — pure churn, and a row that misses the
+                        // sweep's LIMIT 500 can age past the 4h level alert.
+                        // Maintenance is NOT inverted and keeps `bool_to_yesno`.
+                        clean_bool_to_legacy_yesno(c.room_clean),
                         bool_to_yesno(c.room_maintenance),
                         c.room_notes.as_deref(),
                     )
@@ -5526,6 +5539,48 @@ mod tests {
         // mapper's behaviour (`legacy_yesno_to_bool` returns None for
         // anything other than yes/no).
         assert_eq!(legacy_yesno_canonical(Some("maybe")), "");
+    }
+
+    /// Regression: the DETECTION projection (`sync_rooms`) and the
+    /// AUTO-RESOLVE projection (`compute_current_pg_hash`) must agree on
+    /// `room_clean`, which is INVERTED between the two sides — legacy 'yes'
+    /// means NEEDS cleaning, canonical `true` means IS clean.
+    ///
+    /// Commit 0303c98 introduced `clean_bool_to_legacy_yesno` for this but
+    /// applied it to only one of the two call sites. The result was a false
+    /// `value` divergence recorded for every room with a non-NULL
+    /// `Room_Clean`, immediately closed again by the sweep — churn that can
+    /// age past the 4h level alert if a row misses the sweep's LIMIT 500.
+    ///
+    /// The `bool_to_yesno` assertion at the bottom is the important half: it
+    /// fails if anyone "simplifies" the inverted helper back to the plain one.
+    #[test]
+    fn room_clean_projections_agree_across_detection_and_auto_resolve() {
+        // A dirty room: legacy says "needs cleaning", canonical says not clean.
+        let legacy_dirty = room_canonical_hash("512", legacy_yesno_canonical(Some("yes")), "no", None);
+        let canonical_dirty =
+            room_canonical_hash("512", clean_bool_to_legacy_yesno(Some(false)), "no", None);
+        assert_eq!(
+            legacy_dirty, canonical_dirty,
+            "canonical room_clean=false MUST hash like legacy Room_Clean='yes' (needs cleaning)"
+        );
+
+        // A clean room: legacy "no cleaning needed", canonical clean.
+        let legacy_clean = room_canonical_hash("512", legacy_yesno_canonical(Some("no")), "no", None);
+        let canonical_clean =
+            room_canonical_hash("512", clean_bool_to_legacy_yesno(Some(true)), "no", None);
+        assert_eq!(
+            legacy_clean, canonical_clean,
+            "canonical room_clean=true MUST hash like legacy Room_Clean='no'"
+        );
+
+        // And the uninverted helper must NOT agree — this is what the bug was.
+        let canonical_dirty_uninverted =
+            room_canonical_hash("512", bool_to_yesno(Some(false)), "no", None);
+        assert_ne!(
+            legacy_dirty, canonical_dirty_uninverted,
+            "bool_to_yesno on room_clean reintroduces the 0303c98 half-fix"
+        );
     }
 
     #[test]
