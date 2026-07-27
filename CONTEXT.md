@@ -69,3 +69,13 @@ _Avoid_: per-surface palettes, v2-native tones for room state
 A reconcile-log row observing two hashes not yet converged — normally self-heals within a tick.
 _Avoid_: "drift", "divergence" (imply durable states needing operator action; see CLAUDE.md
 vocabulary note)
+
+**Dropped legacy change**:
+A change made in iHOTEL that never reached canonical and never will — the event was consumed
+without being applied, and the legacy change history needed to redeliver it has since been
+discarded. Distinct from **sync lag**: no tick will fix it, and the affected record is simply
+absent from our app (a booking in this state is invisible to occupancy, arrivals and forecast
+even though reception can see it in iHOTEL). Repairable only by re-reading the legacy row and
+re-applying it.
+_Avoid_: "sync lag" (implies it self-heals — the 2026-07-27 alert used that word for 16 days
+and it is why nobody acted), "drift" (implies both sides exist and disagree)

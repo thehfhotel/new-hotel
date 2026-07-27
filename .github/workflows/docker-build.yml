@@ -920,24 +920,15 @@ jobs:
           TM30_COMPANION_WRITEBACK_ENABLED: ${{ vars.TM30_COMPANION_WRITEBACK_ENABLED || 'false' }}
           # Layout-edit mode (จัดผัง, #236) — shared-board room_x/room_y writeback.
           LAYOUT_WRITEBACK_ENABLED:         ${{ vars.LAYOUT_WRITEBACK_ENABLED || 'false' }}
-          # Self-healing reconcile sweep — per-site so Ville can soak first.
-          RECONCILE_FORCE_CONVERGE_ENABLED:         ${{ vars.RECONCILE_FORCE_CONVERGE_ENABLED || 'false' }}
-          HFVILLE_RECONCILE_FORCE_CONVERGE_ENABLED: ${{ vars.HFVILLE_RECONCILE_FORCE_CONVERGE_ENABLED || 'false' }}
-          # Self-healing re-ingest arm for the reconcile sweep's `missing_pg`
-          # rows (dropped CT events) — per-site so Ville canaries first.
-          RECONCILE_REINGEST_MISSING_PG_ENABLED:         ${{ vars.RECONCILE_REINGEST_MISSING_PG_ENABLED || 'false' }}
-          HFVILLE_RECONCILE_REINGEST_MISSING_PG_ENABLED: ${{ vars.HFVILLE_RECONCILE_REINGEST_MISSING_PG_ENABLED || 'false' }}
-          # Ville's reconcile backstop (#67) — the sync-hfville worker holds the
-          # only reconcile for HF Ville. It was previously absent from this
-          # payload, so run-deploy.sh's wholesale .env rewrite dropped any
-          # host-set value and it only worked via the compose default. Default
-          # MUST stay 'true' — flipping it to false takes Ville's drift
-          # backstop dark.
-          HFVILLE_WORKER_RECONCILE_ENABLED:         ${{ vars.HFVILLE_WORKER_RECONCILE_ENABLED || 'true' }}
-          # Per-table CT watermarks (Resilience PR R3, migration 050; reseed in
-          # migration 078) — per-site so Ville can soak first. Ships dark.
-          SYNC_PER_TABLE_WATERMARK:         ${{ vars.SYNC_PER_TABLE_WATERMARK || 'false' }}
-          HFVILLE_SYNC_PER_TABLE_WATERMARK: ${{ vars.HFVILLE_SYNC_PER_TABLE_WATERMARK || 'false' }}
+          # NOTE (ADR 0004): the reconcile / CT-watermark operational flags
+          # (RECONCILE_FORCE_CONVERGE_ENABLED, RECONCILE_REINGEST_MISSING_PG_ENABLED,
+          # WORKER_RECONCILE_ENABLED, SYNC_PER_TABLE_WATERMARK, and their
+          # HFVILLE_ siblings) are deliberately NOT listed here. Their state
+          # lives in docker-compose.yml defaults, which is the single source of
+          # truth. Adding any of them back would make those defaults
+          # unreachable — run-deploy.sh materialises .env wholesale from this
+          # payload, so a `vars.X || 'false'` here silently reverts the
+          # committed value on the next deploy. Do not "restore" them.
           # Per-job slack notification kill-switches (2026-05-15).
           # Default 'true' preserves prior behavior. Operators flip to
           # 'false' via `gh variable set HOURLY_REPORT_ENABLED -b false`
@@ -1040,13 +1031,6 @@ jobs:
             --arg GUEST_DOCUMENT_STORAGE_ENABLED   "${GUEST_DOCUMENT_STORAGE_ENABLED:-false}" \
             --arg TM30_COMPANION_WRITEBACK_ENABLED "${TM30_COMPANION_WRITEBACK_ENABLED:-false}" \
             --arg LAYOUT_WRITEBACK_ENABLED         "${LAYOUT_WRITEBACK_ENABLED:-false}" \
-            --arg RECONCILE_FORCE_CONVERGE_ENABLED         "${RECONCILE_FORCE_CONVERGE_ENABLED:-false}" \
-            --arg HFVILLE_RECONCILE_FORCE_CONVERGE_ENABLED "${HFVILLE_RECONCILE_FORCE_CONVERGE_ENABLED:-false}" \
-            --arg RECONCILE_REINGEST_MISSING_PG_ENABLED         "${RECONCILE_REINGEST_MISSING_PG_ENABLED:-false}" \
-            --arg HFVILLE_RECONCILE_REINGEST_MISSING_PG_ENABLED "${HFVILLE_RECONCILE_REINGEST_MISSING_PG_ENABLED:-false}" \
-            --arg HFVILLE_WORKER_RECONCILE_ENABLED         "${HFVILLE_WORKER_RECONCILE_ENABLED:-true}" \
-            --arg SYNC_PER_TABLE_WATERMARK         "${SYNC_PER_TABLE_WATERMARK:-false}" \
-            --arg HFVILLE_SYNC_PER_TABLE_WATERMARK "${HFVILLE_SYNC_PER_TABLE_WATERMARK:-false}" \
             --arg HOURLY_REPORT_ENABLED          "${HOURLY_REPORT_ENABLED:-true}" \
             --arg CHECKIN_NOTIFICATIONS_ENABLED  "${CHECKIN_NOTIFICATIONS_ENABLED:-true}" \
             --arg CHECKOUT_NOTIFICATIONS_ENABLED "${CHECKOUT_NOTIFICATIONS_ENABLED:-true}" \
@@ -1078,13 +1062,6 @@ jobs:
                 GUEST_DOCUMENT_STORAGE_ENABLED:   $GUEST_DOCUMENT_STORAGE_ENABLED,
                 TM30_COMPANION_WRITEBACK_ENABLED: $TM30_COMPANION_WRITEBACK_ENABLED,
                 LAYOUT_WRITEBACK_ENABLED:         $LAYOUT_WRITEBACK_ENABLED,
-                RECONCILE_FORCE_CONVERGE_ENABLED:         $RECONCILE_FORCE_CONVERGE_ENABLED,
-                HFVILLE_RECONCILE_FORCE_CONVERGE_ENABLED: $HFVILLE_RECONCILE_FORCE_CONVERGE_ENABLED,
-                RECONCILE_REINGEST_MISSING_PG_ENABLED:         $RECONCILE_REINGEST_MISSING_PG_ENABLED,
-                HFVILLE_RECONCILE_REINGEST_MISSING_PG_ENABLED: $HFVILLE_RECONCILE_REINGEST_MISSING_PG_ENABLED,
-                HFVILLE_WORKER_RECONCILE_ENABLED:         $HFVILLE_WORKER_RECONCILE_ENABLED,
-                SYNC_PER_TABLE_WATERMARK:         $SYNC_PER_TABLE_WATERMARK,
-                HFVILLE_SYNC_PER_TABLE_WATERMARK: $HFVILLE_SYNC_PER_TABLE_WATERMARK,
                 HOURLY_REPORT_ENABLED:          $HOURLY_REPORT_ENABLED,
                 CHECKIN_NOTIFICATIONS_ENABLED:  $CHECKIN_NOTIFICATIONS_ENABLED,
                 CHECKOUT_NOTIFICATIONS_ENABLED: $CHECKOUT_NOTIFICATIONS_ENABLED,

@@ -279,14 +279,26 @@ services:
       # logged-but-unrepaired. Default OFF — the CT watcher + writeback do the
       # real reconciliation; this only catches durable lag. This backend runs
       # HF Hotel's reconcile; sync-hfville runs Ville's (its own override below).
-      # Flip per-site: `gh variable set RECONCILE_FORCE_CONVERGE_ENABLED -b true`.
-      - RECONCILE_FORCE_CONVERGE_ENABLED=${RECONCILE_FORCE_CONVERGE_ENABLED:-false}
+      #
+      # ┌─ OPERATIONAL FLAG STATE — READ BEFORE EDITING (ADR 0004) ──────────┐
+      # │ The DEFAULT BELOW IS THE LIVE PRODUCTION VALUE. These flags are    │
+      # │ deliberately NOT passed through .github/workflows/docker-build.yml │
+      # │ and are NOT GitHub repo variables. Flip one by editing its default │
+      # │ here — docker-compose.yml is in the workflow's `deploy` paths       │
+      # │ filter, so the edit triggers its own deploy.                       │
+      # │                                                                     │
+      # │ DO NOT "restore" these keys to docker-build.yml. run-deploy.sh      │
+      # │ materialises .env wholesale from the workflow payload, and the      │
+      # │ workflow shipped `vars.X || 'false'` for every key — so any key it  │
+      # │ sets makes the `:-default` here UNREACHABLE, silently reverting     │
+      # │ every flag to false on the next deploy. That trap is what stranded  │
+      # │ a booking for 16 days; see docs/adr/0004-flag-state-in-compose.md.  │
+      # └─────────────────────────────────────────────────────────────────────┘
+      - RECONCILE_FORCE_CONVERGE_ENABLED=${RECONCILE_FORCE_CONVERGE_ENABLED:-true}
       # Self-healing RE-INGEST arm for the reconcile sweep's `missing_pg`
       # rows — the dropped-CT-event class the force-converge arm above
-      # deliberately skips. SHIPS DARK (default false); flip per-site so Ville
-      # canaries first: `gh variable set RECONCILE_REINGEST_MISSING_PG_ENABLED
-      # -b true`. This backend runs HF Hotel's reconcile; sync-hfville runs
-      # Ville's (its own HFVILLE_ override below).
+      # deliberately skips. SHIPS DARK; Ville canaries first via its own
+      # HFVILLE_ default below. This backend runs HF Hotel's reconcile.
       - RECONCILE_REINGEST_MISSING_PG_ENABLED=${RECONCILE_REINGEST_MISSING_PG_ENABLED:-false}
       # Tracing log level. Default `hotel_backend=info,tower_http=info`
       # matches `main.rs::tracing_subscriber::EnvFilter::try_from_default_env`'s
@@ -485,11 +497,14 @@ services:
       # Per-table CT watermarks (Resilience PR R3, migration 050). OFF = the
       # single-row `legacy_ct_state` gates every table, so a row-lock wedge on
       # one hot table stalls all 19. ON = each table advances independently
-      # from `legacy_ct_state_per_table`. SHIPS DARK (default false) — migration
-      # 078 re-seeds the per-table rows from the global watermark, which is the
-      # prerequisite for the flip; without it every table trips the CT
-      # retention-overflow page on the first tick. Flip per-site:
-      # `gh variable set SYNC_PER_TABLE_WATERMARK -b true`.
+      # from `legacy_ct_state_per_table`.
+      #
+      # *** DO NOT SET TRUE — NOT SAFE AS SHIPPED. *** The global row freezes
+      # under per-table mode and `run_watermark_watchdog` has no per-table
+      # awareness, so the watchdog pages forever with no all-clear and rollback
+      # hard-fails after ~2 days. Full rationale on the sync-hfville copy of
+      # this key and in docs/coexistence/RUNBOOK-reconcile-flag-flips.md §2.
+      # (Migration 078's reseed prerequisite IS satisfied; these two are not.)
       - SYNC_PER_TABLE_WATERMARK=${SYNC_PER_TABLE_WATERMARK:-false}
       # Self-healing re-ingest arm for the reconcile sweep's `missing_pg` rows
       # (dropped CT events). Only active in a process that runs a reconcile —
@@ -601,9 +616,10 @@ services:
       - WORKER_RECONCILE_ENABLED=${HFVILLE_WORKER_RECONCILE_ENABLED:-true}
       # Self-healing force-converge for Ville's reconcile (sibling of the
       # backend's RECONCILE_FORCE_CONVERGE_ENABLED above). Separate HFVILLE_
-      # override so we can enable Ville-first and soak before HF Hotel — Ville
-      # carries the reconcile-drift history (#69). Default OFF.
-      - RECONCILE_FORCE_CONVERGE_ENABLED=${HFVILLE_RECONCILE_FORCE_CONVERGE_ENABLED:-false}
+      # default so we can enable Ville-first and soak before HF Hotel — Ville
+      # carries the reconcile-drift history (#69).
+      # LIVE VALUE — see the flag-state block on the backend service (ADR 0004).
+      - RECONCILE_FORCE_CONVERGE_ENABLED=${HFVILLE_RECONCILE_FORCE_CONVERGE_ENABLED:-true}
       # Phase 5.5b Ville cutover (#80, 2026-04-30): allowlist cleared
       # post-021. Empty = poll every CT-enabled table (all 16 now). The
       # explicit 11-table list was Phase 5 only; with mirror tables CT-
@@ -619,10 +635,20 @@ services:
       - LEGACY_SYNC_CT_KEEPALIVE_SECS=${HFVILLE_LEGACY_SYNC_CT_KEEPALIVE_SECS:-0}
       - LEGACY_SYNC_ALLOW_COLD_REPLAY=${HFVILLE_LEGACY_SYNC_ALLOW_COLD_REPLAY:-false}
       # Per-table CT watermarks (Resilience PR R3, migration 050) — sibling of
-      # the sync service's SYNC_PER_TABLE_WATERMARK above. Separate HFVILLE_
-      # override so Ville can soak the per-table path first. Prerequisite:
-      # migration 078's per-table reseed (Ville's rows were pinned at 9060
-      # against a global of 37843). SHIPS DARK (default false).
+      # the sync service's SYNC_PER_TABLE_WATERMARK above.
+      #
+      # *** DO NOT SET TRUE — NOT SAFE AS SHIPPED. *** Two prerequisites are
+      # missing: (1) under per-table mode the global `legacy_ct_state` row is
+      # never written (bin/sync.rs gates the advance on !per_table_watermark),
+      # so it FREEZES; (2) `run_watermark_watchdog` reads only that global row
+      # and has no per-table awareness. Together they make the watchdog fire
+      # `:rotating_light: CT watermark STUCK` every 30min forever with no
+      # possible all-clear, and once the frozen row falls below
+      # CHANGE_TRACKING_MIN_VALID_VERSION (~2 days) the startup gate refuses to
+      # start and recovery needs --bootstrap.
+      # Migration 078's reseed IS done (Ville's rows were pinned at 9060 against
+      # a global of 37843) — that prerequisite is satisfied; the two above are
+      # not. See docs/coexistence/RUNBOOK-reconcile-flag-flips.md §2.
       - SYNC_PER_TABLE_WATERMARK=${HFVILLE_SYNC_PER_TABLE_WATERMARK:-false}
       # Self-healing re-ingest arm for `missing_pg` reconcile rows (dropped CT
       # events) — sibling of the backend's RECONCILE_REINGEST_MISSING_PG_ENABLED.
