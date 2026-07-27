@@ -48,6 +48,20 @@ ssh evergreen "docker inspect new-hotel-production-sync-hfville-1 \
 **Step 3 is not optional.** A green run is not proof a flag is live; "Up N
 hours" on the container means it never restarted and the old value still holds.
 
+### Redeploying with no file change
+
+A flag flip never needs this — the compose edit is its own trigger. But when
+you genuinely have no file change (rotating a secret in
+`/home/deploy/secrets`, restarting a wedged worker), use the `force_deploy`
+input (issue #260):
+
+```bash
+gh workflow run docker-build.yml --ref master -f force_deploy=true
+```
+
+It deploys the existing `:latest` images; it does **not** rebuild. An empty
+commit is not an alternative — it produces a green run that deploys nothing.
+
 ---
 
 ## 1. Flip A — `missing_pg` re-ingest self-heal (LIVE PROCEDURE)

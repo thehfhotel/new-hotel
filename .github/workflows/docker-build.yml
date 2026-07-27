@@ -6,6 +6,32 @@ on:
   pull_request:
     branches: [master]
   workflow_dispatch:
+    inputs:
+      # Issue #260. Without this there is NO sanctioned way to redeploy when
+      # no file changed — needed to rotate a secret in /home/deploy/secrets or
+      # restart a wedged worker, both of which CLAUDE.md forbids doing by hand.
+      #
+      # The two obvious workarounds don't work. An empty commit changes no
+      # paths, so the `changes` filter reports nothing, `build-*` skip, and the
+      # deploy job's final disjunct is false on every arm — the run goes GREEN
+      # WITHOUT DEPLOYING (this happened 2026-07-27). A bare workflow_dispatch
+      # has the same problem: `dorny/paths-filter` diffs against the previous
+      # commit, so whether deploy fires depends on whatever the LAST commit
+      # happened to touch — non-deterministic.
+      #
+      # Setting this true adds an explicit disjunct to the deploy job's `if`,
+      # so the deploy runs against the existing :latest images regardless of
+      # what changed. It does NOT rebuild — pair it with a real code push if
+      # you need new images.
+      #
+      # NOTE: flag flips do NOT need this. Since ADR 0004 flag state lives in
+      # docker-compose.yml, which is in the `deploy` paths filter, so editing a
+      # flag triggers its own deploy.
+      force_deploy:
+        description: 'Deploy even when no files changed (secret rotation, wedged worker)'
+        type: boolean
+        required: false
+        default: false
 
 env:
   REGISTRY: ghcr.io
@@ -815,6 +841,14 @@ jobs:
     # Track J8: `needs.should-deploy.outputs.skip != 'true'` short-circuits the
     # deploy step on release-please-only pushes. See the `should-deploy` job's
     # comment block for the matcher's behaviour and failure modes.
+    #
+    # `inputs.force_deploy` (issue #260) is the manual escape hatch in the last
+    # disjunct below: it lets a workflow_dispatch deploy the existing :latest
+    # images when NO file changed — secret rotation, restarting a wedged
+    # worker. It is false/null on push and pull_request events, so it cannot
+    # affect normal pushes. Read the input's own comment at the top of this
+    # file before using it; in particular, an empty commit is NOT an
+    # alternative — it produces a green run that deploys nothing.
     if: |
       always() &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
@@ -825,7 +859,7 @@ jobs:
       (needs.test-frontend.result == 'success' || needs.test-frontend.result == 'skipped') &&
       (needs.test-backend.result == 'success' || needs.test-backend.result == 'skipped') &&
       (needs.init-db-migrations-drift-check.result == 'success' || needs.init-db-migrations-drift-check.result == 'skipped') &&
-      (needs.build-frontend.result == 'success' || needs.build-backend.result == 'success' || (needs.changes.outputs.deploy == 'true' && needs.changes.outputs.frontend != 'true' && needs.changes.outputs.backend != 'true'))
+      (needs.build-frontend.result == 'success' || needs.build-backend.result == 'success' || inputs.force_deploy || (needs.changes.outputs.deploy == 'true' && needs.changes.outputs.frontend != 'true' && needs.changes.outputs.backend != 'true'))
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v5.0.0
