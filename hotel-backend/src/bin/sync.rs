@@ -310,6 +310,70 @@ const DEFAULT_CT_POLL_INTERVAL_MS: u64 = 1000;
 /// Override at runtime via `LEGACY_SYNC_RETENTION_CHECK_INTERVAL_SECS`.
 const DEFAULT_RETENTION_CHECK_INTERVAL_SECS: u64 = 300;
 
+/// How long to suppress repeat `CT retention overflow` pages for the same
+/// (site, table) once one has been sent.
+///
+/// The condition is NOT self-healing — it persists until an operator runs
+/// `--bootstrap` — and it hits every CT-tracked table simultaneously because
+/// they share one watermark. Without this, the retention-check gate above is
+/// the only throttle, giving ~19 pages every 5 minutes indefinitely, per
+/// site. One page per table per day is enough to keep the condition visible
+/// without burying every other alert in the channel.
+const RETENTION_ALERT_COOLDOWN_HOURS: i64 = 24;
+
+/// Cooldown key namespace for retention-overflow pages inside
+/// `ht_level_drift_alert_cooldowns` (migration 053). That table is keyed
+/// `(site_id, table_name)`, and the reconcile digest already stores real
+/// entity names (`bookings`, `customers`) plus the `stale_active_checkin`
+/// sentinel there — so CT table names are namespaced to guarantee they can
+/// never collide with a canonical entity name.
+fn retention_cooldown_key(table: &str) -> String {
+    format!("ct_retention_overflow:{table}")
+}
+
+/// Atomically claim the right to send ONE retention-overflow page for this
+/// (site, table). Returns `true` at most once per
+/// [`RETENTION_ALERT_COOLDOWN_HOURS`].
+///
+/// The claim is a single conditional UPSERT so two workers (or a restart
+/// loop) cannot both decide they're the one to alert. **Fails CLOSED on a PG
+/// error** — deliberately the opposite of the reconcile digest's fail-open
+/// eligibility check: this alert's failure mode is a page storm, so when in
+/// doubt, stay quiet. The condition still surfaces via the `ERROR`-level
+/// `EV_CT_RETENTION_OVERFLOW` log on every check.
+async fn claim_retention_alert_slot(pg: &PgPool, site_id: &str, table: &str) -> bool {
+    let key = retention_cooldown_key(table);
+    let claimed: Result<Option<(String,)>, sqlx::Error> = sqlx::query_as(
+        "INSERT INTO ht_level_drift_alert_cooldowns (site_id, table_name, last_alerted_at) \
+         VALUES ($1, $2, now()) \
+         ON CONFLICT (site_id, table_name) DO UPDATE \
+             SET last_alerted_at = now(), updated_at = now() \
+           WHERE ht_level_drift_alert_cooldowns.last_alerted_at \
+                 < now() - ($3 || ' hours')::interval \
+         RETURNING table_name",
+    )
+    .bind(site_id)
+    .bind(&key)
+    .bind(RETENTION_ALERT_COOLDOWN_HOURS.to_string())
+    .fetch_optional(pg)
+    .await;
+
+    match claimed {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(err) => {
+            tracing::warn!(
+                site = %site_id,
+                table,
+                error = %err,
+                "Retention-overflow alert cooldown claim failed — suppressing the page \
+                 (fail-closed); the EV_CT_RETENTION_OVERFLOW log still records it"
+            );
+            false
+        }
+    }
+}
+
 /// Mid-run pool-outage handling (v2.58.4). HF Ville's WG tunnel flaps
 /// for ~2 min every couple of days; when the legacy MSSQL is
 /// unreachable, every `mssql.get().await` blocks for the full
@@ -3392,7 +3456,21 @@ async fn poll_table(
             );
             let _ = record_table_error(pg, table, event_name, &err).await;
             if let Some(s) = slack {
-                if err.contains("retention") {
+                // Cooldown is REQUIRED here, not a nicety. Retention overflow
+                // is not self-healing — it persists until an operator runs
+                // `--bootstrap` — and it hits every CT table at once, since
+                // they share a watermark. Uncooled, that is one page per
+                // table per retention-check window: ~19 messages every 5
+                // minutes, forever, across both sites. The single loudest
+                // burst in this binary, arriving exactly when the operator
+                // most needs a readable channel.
+                //
+                // Persisted (not process-local) because the container
+                // restarts on failure, which would reset an in-memory
+                // cooldown and reinstate the storm.
+                if err.contains("retention")
+                    && claim_retention_alert_slot(pg, site_id, table).await
+                {
                     let msg = SlackMessage::with_site_text(
                         site_id,
                         format!(
@@ -3400,7 +3478,11 @@ async fn poll_table(
                              Table: `{table}`\n\
                              Watermark fell behind CT retention; \
                              row history beyond `MIN_VALID_VERSION` is gone.\n\
-                             _Recover with_ `bin/sync --bootstrap` _(Phase 5.5)_."
+                             _Recover with_ `bin/sync --bootstrap` _(Phase 5.5)_.\n\
+                             _This will NOT self-heal, and further overflow pages for \
+                             this table are suppressed for \
+                             {RETENTION_ALERT_COOLDOWN_HOURS}h — the condition persists \
+                             until you bootstrap._"
                         ),
                     );
                     let _ = s.send_message(&msg).await;
@@ -6398,6 +6480,29 @@ mod tests {
     // CHANGE_TRACKING_MIN_VALID_VERSION and rollback to global mode
     // hard-failed, needing --bootstrap.
     // ========================================================================
+
+    /// Retention-overflow cooldown rows share `ht_level_drift_alert_cooldowns`
+    /// with the reconcile digest, which keys on canonical entity names
+    /// (`bookings`, `customers`, `rooms`, `checkins`) plus the
+    /// `stale_active_checkin` sentinel. A CT table name must never be able to
+    /// collide with one of those, or suppressing a retention page would also
+    /// suppress an unrelated sync-lag digest — silently.
+    #[test]
+    fn retention_cooldown_key_is_namespaced_away_from_entity_keys() {
+        for entity in ["bookings", "customers", "rooms", "checkins", "stale_active_checkin"] {
+            assert_ne!(retention_cooldown_key("HT_Book_H"), entity);
+            assert_ne!(retention_cooldown_key(entity), entity);
+        }
+        assert_eq!(
+            retention_cooldown_key("HT_Customers"),
+            "ct_retention_overflow:HT_Customers"
+        );
+        // Distinct tables must not share a slot, or one page would mute the rest.
+        assert_ne!(
+            retention_cooldown_key("HT_Customers"),
+            retention_cooldown_key("HT_Book_H")
+        );
+    }
 
     /// THE defining property: the floor is the MIN, never the MAX. Writing
     /// the max would let the global row claim progress `HT_Customers` never

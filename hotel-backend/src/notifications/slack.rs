@@ -88,10 +88,26 @@ pub fn format_site_prefixed(site_id: &str, text: &str) -> String {
 pub struct SlackClient {
     config: SlackConfig,
     agent: ureq::Agent,
+    /// Consecutive fully-failed sends (all retries exhausted). Reset to 0
+    /// on the next success. See [`EV_SLACK_DELIVERY_FAILED`].
+    consecutive_failures: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Maximum number of retry attempts for a Slack webhook POST.
 const SLACK_MAX_RETRIES: u32 = 3;
+
+/// A message was DROPPED after exhausting every retry — i.e. an alert
+/// nobody will ever see. Greppable because Slack is itself the alerting
+/// channel, so a dead webhook cannot be announced via Slack; the only
+/// signal available is a distinctive, counted log line.
+pub const EV_SLACK_DELIVERY_FAILED: &str = "slack.delivery_failed";
+
+/// Deliveries resumed after ≥1 consecutive total failure.
+pub const EV_SLACK_DELIVERY_RECOVERED: &str = "slack.delivery_recovered";
+
+/// How much of the dropped message to echo into the failure log. Enough
+/// to identify WHICH alert was lost without dumping a whole payload.
+const DROPPED_MESSAGE_PREVIEW_CHARS: usize = 160;
 
 impl SlackClient {
     /// Create a new Slack client
@@ -100,7 +116,23 @@ impl SlackClient {
             .timeout_connect(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(10))
             .build();
-        Self { config, agent }
+        Self {
+            config,
+            agent,
+            consecutive_failures: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// First line of a message, truncated on a char boundary — the alert's
+    /// identity for the drop log. Thai text is common in these payloads, so
+    /// slicing by byte index would panic.
+    fn preview(text: &str) -> String {
+        let first_line = text.lines().next().unwrap_or("").trim();
+        if first_line.chars().count() <= DROPPED_MESSAGE_PREVIEW_CHARS {
+            return first_line.to_string();
+        }
+        let truncated: String = first_line.chars().take(DROPPED_MESSAGE_PREVIEW_CHARS).collect();
+        format!("{truncated}…")
     }
 
     /// Send a message to Slack via webhook.
@@ -148,6 +180,20 @@ impl SlackClient {
                     let status = response.status();
                     if (200..300).contains(&status) {
                         tracing::info!("[Slack] Message sent successfully");
+                        // Announce recovery so a resolved outage is visible
+                        // in logs — the failures below are only interpretable
+                        // if you can also see when they stopped.
+                        let prior = self
+                            .consecutive_failures
+                            .swap(0, std::sync::atomic::Ordering::Relaxed);
+                        if prior > 0 {
+                            tracing::warn!(
+                                event_name = EV_SLACK_DELIVERY_RECOVERED,
+                                dropped_while_down = prior,
+                                "[Slack] Delivery recovered — {prior} message(s) were dropped \
+                                 while the webhook was failing and are NOT retried"
+                            );
+                        }
                         return true;
                     }
 
@@ -194,7 +240,21 @@ impl SlackClient {
             }
         }
 
-        tracing::error!("[Slack] All retry attempts failed");
+        // Every retry exhausted: this alert is GONE. Nothing re-queues it.
+        // Callers all discard the returned bool (by design — notifications
+        // are best-effort and must never break the caller), so this line is
+        // the only record that a page was lost, and the only way to tell a
+        // dead webhook from a genuinely quiet system.
+        let consecutive = self
+            .consecutive_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        tracing::error!(
+            event_name = EV_SLACK_DELIVERY_FAILED,
+            consecutive_failures = consecutive,
+            dropped_alert = %Self::preview(&message.text),
+            "[Slack] All retry attempts failed — message DROPPED, not retried"
+        );
         false
     }
 }
@@ -418,6 +478,33 @@ pub fn build_new_booking_alert_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The drop log must name WHICH alert was lost — "all retries failed"
+    /// alone tells an operator nothing about what they missed.
+    #[test]
+    fn preview_takes_the_first_line_only() {
+        let msg = ":rotating_light: *Writeback EXHAUSTED retries*\nbody line\nmore body";
+        assert_eq!(
+            SlackClient::preview(msg),
+            ":rotating_light: *Writeback EXHAUSTED retries*"
+        );
+    }
+
+    /// These payloads routinely carry Thai guest names, so truncation MUST
+    /// be char-wise — a byte-index slice would panic mid-codepoint.
+    #[test]
+    fn preview_truncates_multibyte_text_without_panicking() {
+        let thai = "สุภาวดี เมียนเมือง ".repeat(40);
+        let out = SlackClient::preview(&thai);
+        assert!(out.chars().count() <= DROPPED_MESSAGE_PREVIEW_CHARS + 1);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn preview_leaves_short_lines_untouched() {
+        assert_eq!(SlackClient::preview("short"), "short");
+        assert_eq!(SlackClient::preview("  padded  \nrest"), "padded");
+    }
 
     /// Task #69 contract: the site prefix must show up at the START of
     /// the Slack message text so an operator sees `[site=hfvilel]` in

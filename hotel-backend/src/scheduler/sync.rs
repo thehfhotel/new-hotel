@@ -628,11 +628,11 @@ async fn check_level_drift_recovery_and_notify(
         let msg = SlackMessage::with_site_text(
             site_id,
             format!(
-                ":white_check_mark: *Sync lag CLEARED* :white_check_mark:\n\
+                ":white_check_mark: *Reconcile rows CONVERGED* :white_check_mark:\n\
                  Every `ht_reconcile_log` row older than \
                  {LEVEL_DRIFT_STALE_INTERVAL_HOURS}h has converged for:\n\
                  {body}\n\
-                 _Closure of the_ `:warning:` _sync-lag alert sent earlier. The \
+                 _Closure of the_ `:warning:` _unconverged alert sent earlier. The \
                  per-table {LEVEL_DRIFT_COOLDOWN_HOURS}h cooldown is reset, so a \
                  recurrence alerts on the next tick instead of waiting out a stale \
                  window._"
