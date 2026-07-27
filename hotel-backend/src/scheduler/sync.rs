@@ -756,15 +756,17 @@ async fn check_level_drift_and_alert(pg_pool: &PgPool, slack: Option<&SlackClien
     let msg = SlackMessage::with_site_text(
         site_id,
         format!(
-            ":warning: *Sync lag unconverged >{LEVEL_DRIFT_STALE_INTERVAL_HOURS}h* :warning:\n\
-             One or more tables have `ht_reconcile_log` row(s) the auto-resolve \
-             sweep has failed to converge for over {LEVEL_DRIFT_STALE_INTERVAL_HOURS} hours \
-             — past this threshold the lag is no longer a transient and likely \
-             indicates real divergence:\n\
+            ":warning: *Reconcile rows unconverged >{LEVEL_DRIFT_STALE_INTERVAL_HOURS}h* :warning:\n\
+             `ht_reconcile_log` row(s) the auto-resolve sweep has not closed in \
+             over {LEVEL_DRIFT_STALE_INTERVAL_HOURS} hours. This is NOT sync lag — \
+             past this threshold it will not clear on its own:\n\
              {body}\n\
-             _Single-row lag doesn't trip the burst threshold but still represents \
-             stuck canonical state. Investigate + set `resolved_at = now()` after \
-             fixing. Per-table cooldown {LEVEL_DRIFT_COOLDOWN_HOURS}h._"
+             _Check `divergence_kind` first. `missing_pg` with a live legacy row is a \
+             *dropped legacy change*: the record is absent from our app entirely and \
+             no tick will fix it. Do NOT blanket-set `resolved_at` — that closes rows \
+             whether or not canonical landed. Triage: docs/runbook-sync.md §9b. \
+             Per-table cooldown {LEVEL_DRIFT_COOLDOWN_HOURS}h; an all-clear fires \
+             when the table clears._"
         ),
     );
     slack.send_message(&msg).await;

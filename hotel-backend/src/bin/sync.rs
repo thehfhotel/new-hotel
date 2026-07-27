@@ -845,6 +845,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .copied()
         .collect();
 
+    // Per-table watermark mode is NOT SAFE as shipped — refuse rather than
+    // let an operator discover it via a permanent page storm. Two
+    // prerequisites are missing (issue #259):
+    //
+    //   1. The global `legacy_ct_state` row FREEZES under per-table mode —
+    //      `run_one_tick`'s once-per-tick advance is gated on
+    //      `!per_table_watermark`, so nothing ever writes it.
+    //   2. `run_watermark_watchdog` has no per-table awareness; `read_ct_state`
+    //      reads only that global row.
+    //
+    // Together the watchdog reads a frozen row, probes
+    // CHANGE_TRACKING_CURRENT_VERSION(), sees ct_current > watermark, and fires
+    // `CT watermark STUCK` every 30min FOREVER — its recovery condition
+    // compares against the same frozen row, so no all-clear can ever fire.
+    // After ~2 days the frozen value falls below MIN_VALID_VERSION and the
+    // retention gate below refuses to start for real; recovery needs
+    // --bootstrap.
+    //
+    // Migration 078's reseed (the expensive prerequisite) IS done. The fix for
+    // the remaining two is to advance the global row to min(per-table) once per
+    // tick so it stays a conservative floor. Until then this stays off; the
+    // wedge risk it would mitigate is loud, bounded (~2 days) and rare —
+    // see docs/coexistence/RUNBOOK-reconcile-flag-flips.md §2.
+    if per_table_watermark {
+        let msg = "SYNC_PER_TABLE_WATERMARK=true but per-table mode is NOT SAFE \
+                   as shipped — refusing to start. Under per-table mode the \
+                   global legacy_ct_state row is never advanced, while \
+                   run_watermark_watchdog still reads only that row, so it \
+                   would page `CT watermark STUCK` every 30min forever with no \
+                   possible all-clear, and rollback hard-fails once the frozen \
+                   row ages past CT retention (~2 days). Set \
+                   SYNC_PER_TABLE_WATERMARK=false. Tracking: issue #259. \
+                   See docs/coexistence/RUNBOOK-reconcile-flag-flips.md §2.";
+        tracing::error!(site = %site.id, "{msg}");
+        if let Some(s) = &slack {
+            let payload = SlackMessage::with_site_text(
+                &site.id,
+                format!(
+                    ":no_entry: *CT watcher REFUSED TO START — per-table watermark not safe* :no_entry:\n{msg}"
+                ),
+            );
+            let _ = s.send_message(&payload).await;
+        }
+        // Match the sibling guards: sleep before exit so Docker's
+        // `restart: unless-stopped` can't turn this into an alert flood.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        return Err(msg.into());
+    }
+
     // Pre-flight watermark. Under `SYNC_PER_TABLE_WATERMARK=true` the
     // global row is decorative — a table wedged at an ancient version
     // is invisible in it — so both gates below must reason about the
