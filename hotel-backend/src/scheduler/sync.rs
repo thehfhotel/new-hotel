@@ -5585,11 +5585,14 @@ mod tests {
 
     #[test]
     fn room_canonical_hash_matches_when_canonical_mirrors_legacy() {
-        // Legacy "yes" → canonical true → reverse to "yes". Hashes align.
-        let mssql = room_canonical_hash("101", "yes", "no", Some("ocean view"));
+        // room_clean is INVERTED: legacy "no" = no cleaning needed = canonical
+        // true (IS clean). room_maintenance is NOT inverted. Pairing canonical
+        // `true` with legacy "yes" — as this test did before 20edf18 — encodes
+        // the very polarity bug that fix removed.
+        let mssql = room_canonical_hash("101", "no", "no", Some("ocean view"));
         let canonical = room_canonical_hash(
             "101",
-            bool_to_yesno(Some(true)),
+            clean_bool_to_legacy_yesno(Some(true)),
             bool_to_yesno(Some(false)),
             Some("ocean view"),
         );
@@ -5598,13 +5601,13 @@ mod tests {
 
     #[test]
     fn room_canonical_hash_diverges_when_canonical_clean_lags_behind() {
-        // Operator marked the room dirty in legacy ("no") but the CT
-        // mapper hasn't yet flipped canonical.room_clean to false →
-        // drift fires.
-        let mssql = room_canonical_hash("101", "no", "no", None);
+        // Legacy says the room NEEDS cleaning ("yes" = dirty) but the CT
+        // mapper hasn't yet flipped canonical.room_clean to false, so
+        // canonical still claims clean → divergence fires.
+        let mssql = room_canonical_hash("101", "yes", "no", None);
         let canonical = room_canonical_hash(
             "101",
-            bool_to_yesno(Some(true)),
+            clean_bool_to_legacy_yesno(Some(true)),
             bool_to_yesno(Some(false)),
             None,
         );
@@ -5633,7 +5636,8 @@ mod tests {
     #[test]
     fn rooms_pg_dispatch_composition_converges_with_legacy_projection() {
         // A canonical row the CT mapper would have written after the
-        // legacy state converged (clean=yes, maintenance=no, no notes).
+        // legacy state converged: legacy Room_Clean="no" (no cleaning
+        // needed) → canonical room_clean=true; maintenance "no" → false.
         let canonical_row = CanonicalRoomRow {
             room_clean: Some(true),
             room_maintenance: Some(false),
@@ -5641,7 +5645,7 @@ mod tests {
         };
         let pg_hash = room_canonical_hash(
             "A2-1",
-            bool_to_yesno(canonical_row.room_clean),
+            clean_bool_to_legacy_yesno(canonical_row.room_clean),
             bool_to_yesno(canonical_row.room_maintenance),
             canonical_row.room_notes.as_deref(),
         );
@@ -5651,7 +5655,7 @@ mod tests {
         // collapse to the same `'yes' | 'no' | ""` tokens used above.
         let legacy_hash = room_canonical_hash(
             "A2-1",
-            legacy_yesno_canonical(Some("yes")),
+            legacy_yesno_canonical(Some("no")),
             legacy_yesno_canonical(Some("no")),
             None,
         );
@@ -5663,11 +5667,15 @@ mod tests {
         );
     }
 
-    /// Round-trips every legal `(canonical bool, legacy literal)` pair.
-    /// Lock test that catches a future regression in either
-    /// `bool_to_yesno` or `legacy_yesno_canonical` — both arms of the
-    /// auto-resolve sweep depend on these being exact inverses for
-    /// the rooms arm to ever converge.
+    /// Round-trips every legal `(canonical bool, legacy literal)` pair for
+    /// the NON-inverted fields. Lock test for `bool_to_yesno` ↔
+    /// `legacy_yesno_canonical`.
+    ///
+    /// This pairing is correct for `room_maintenance` and WRONG for
+    /// `room_clean`, which is inverted (legacy "yes" = needs cleaning =
+    /// canonical false) and uses `clean_bool_to_legacy_yesno` — see
+    /// `room_clean_projections_agree_across_detection_and_auto_resolve`.
+    /// Do not cite this test as licence to use `bool_to_yesno` on clean.
     #[test]
     fn rooms_dispatch_yesno_round_trip_is_total() {
         for (canonical, legacy_literal) in [
@@ -5699,7 +5707,7 @@ mod tests {
         };
         let pg_hash = room_canonical_hash(
             "A2-1",
-            bool_to_yesno(canonical_row.room_clean),
+            clean_bool_to_legacy_yesno(canonical_row.room_clean),
             bool_to_yesno(canonical_row.room_maintenance),
             canonical_row.room_notes.as_deref(),
         );
