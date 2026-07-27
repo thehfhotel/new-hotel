@@ -654,7 +654,7 @@ services:
       # events) — sibling of the backend's RECONCILE_REINGEST_MISSING_PG_ENABLED.
       # This worker DOES run Ville's reconcile (WORKER_RECONCILE_ENABLED above),
       # so the knob is live here. Per-site so Ville canaries first. Ships dark.
-      - RECONCILE_REINGEST_MISSING_PG_ENABLED=${HFVILLE_RECONCILE_REINGEST_MISSING_PG_ENABLED:-false}
+      - RECONCILE_REINGEST_MISSING_PG_ENABLED=${HFVILLE_RECONCILE_REINGEST_MISSING_PG_ENABLED:-true}
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,sync=info}
     secrets:
       - db_password
