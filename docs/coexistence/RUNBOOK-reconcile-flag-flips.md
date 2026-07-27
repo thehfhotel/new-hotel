@@ -59,8 +59,24 @@ input (issue #260):
 gh workflow run docker-build.yml --ref master -f force_deploy=true
 ```
 
-It deploys the existing `:latest` images; it does **not** rebuild. An empty
-commit is not an alternative — it produces a green run that deploys nothing.
+**Verified working 2026-07-28** (run 30307168866): `deploy` ran and all five
+containers restarted.
+
+Two things about it that are easy to get wrong:
+
+- **It DOES rebuild.** `dorny/paths-filter` has no base commit to diff against
+  on a `workflow_dispatch`, so it reports every filter as changed and the full
+  test + build matrix runs (~10 min), not the quick re-roll of existing
+  `:latest` images you might expect. Budget for that.
+- **A bare dispatch without the flag would probably also deploy**, for the same
+  reason — the builds succeed, which satisfies the deploy condition on its own.
+  `force_deploy` is therefore belt-and-braces rather than the only route: it
+  makes the intent explicit and guarantees the deploy even if the build jobs are
+  skipped, instead of relying on undocumented paths-filter behaviour that could
+  change on an action bump.
+
+An empty commit is **not** an alternative — it produces a green run that deploys
+nothing.
 
 ---
 
