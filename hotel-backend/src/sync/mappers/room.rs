@@ -39,6 +39,7 @@ use uuid::Uuid;
 use crate::outbox::event::{DomainEvent, EventSource};
 use crate::service::ids::{aggregate_uuid, AggregateKind};
 use crate::sync::change_op::ChangeOp;
+use crate::sync::gate_guard::{self, HashInput, HashInputContract};
 use crate::sync::mapper::MssqlChangeMapper;
 use crate::sync::row::MappableRow;
 use crate::sync::SyncError;
@@ -210,6 +211,94 @@ fn legacy_yesno_to_bool(s: &Option<String>) -> Option<bool> {
         Some("no") => Some(false),
         _ => None,
     }
+}
+
+// =============================================================================
+// Reconcile-hash contract — see `crate::sync::gate_guard`
+// =============================================================================
+
+/// Re-render a legacy yes/no literal into the token
+/// `scheduler::sync::room_canonical_hash` hashes.
+///
+/// Derived from [`legacy_yesno_to_bool`] rather than re-listing the
+/// literals, so the mapper and the hash can never disagree on what an
+/// unrecognised value collapses to. Mirrors
+/// `scheduler::sync::legacy_yesno_canonical`.
+fn legacy_yesno_segment(s: &Option<String>) -> String {
+    match legacy_yesno_to_bool(s) {
+        Some(true) => "yes".to_string(),
+        Some(false) => "no".to_string(),
+        None => String::new(),
+    }
+}
+
+/// The inputs `scheduler::sync::room_canonical_hash` consumes.
+///
+/// **`HT_Rooms` has NO idempotency gate**: [`apply_room_upsert`] UPSERTs
+/// on every CT row, gating only the *event* (a clean/dirty flip), never
+/// the write. An always-writing mapper can never idempotency-skip a
+/// hashed change, so the gate ⊇ hash invariant is trivially satisfied —
+/// which is why the contract declares `always_writes: true` and every
+/// `gated_by` here is empty. If a gate is ever added, flip that flag and
+/// the name-level check starts enforcing these names for real.
+///
+/// Segments render the LEGACY side of the hash (the mapper projects
+/// legacy literals). The canonical side re-derives them from the stored
+/// booleans, with `room_clean` inverted — legacy `Room_Clean='yes'`
+/// means NEEDS cleaning, canonical `room_clean=true` means IS clean.
+const HASH_INPUTS: [HashInput<RoomProjection>; 4] = [
+    HashInput {
+        name: "room_no",
+        gated_by: &[],
+        segmented: true,
+        lookup_key: true,
+        segment: |p| p.room_no.clone(),
+        mutate: |p| p.room_no = "999".into(),
+    },
+    HashInput {
+        name: "room_clean",
+        gated_by: &[],
+        segmented: true,
+        lookup_key: false,
+        segment: |p| legacy_yesno_segment(&p.room_clean_legacy),
+        mutate: |p| p.room_clean_legacy = Some("yes".into()),
+    },
+    HashInput {
+        name: "room_maintenance",
+        gated_by: &[],
+        segmented: true,
+        lookup_key: false,
+        segment: |p| legacy_yesno_segment(&p.room_manternace_legacy),
+        mutate: |p| p.room_manternace_legacy = Some("yes".into()),
+    },
+    HashInput {
+        name: "room_notes",
+        gated_by: &[],
+        segmented: true,
+        lookup_key: false,
+        segment: |p| p.room_details.clone().unwrap_or_default(),
+        mutate: |p| p.room_details = Some("ซ่อมแอร์".into()),
+    },
+];
+
+/// Name-level hash contract, for
+/// [`crate::sync::gate_guard::reconcile_entity_contracts`].
+pub(crate) fn hash_input_contract() -> Vec<HashInputContract> {
+    gate_guard::hash_input_contracts(&HASH_INPUTS)
+}
+
+/// No gate exists — see [`HASH_INPUTS`]. Returns empty, and the contract
+/// declares `always_writes: true` so that emptiness is a stated fact
+/// rather than a silently vacuous check.
+pub(crate) fn gate_field_names() -> Vec<&'static str> {
+    Vec::new()
+}
+
+/// Render the `rooms` reconcile-hash body from [`HASH_INPUTS`].
+/// Test-only — see the customer mapper's equivalent.
+#[cfg(test)]
+fn hash_body(p: &RoomProjection) -> String {
+    gate_guard::hash_body(&HASH_INPUTS, p)
 }
 
 struct ExistingRoom {
@@ -566,6 +655,56 @@ mod tests {
             None => r.with("Room_Manternace", MockValue::Null),
         };
         r
+    }
+
+    // ----- reconcile-hash contract (see `crate::sync::gate_guard`) -------
+
+    /// Byte-parity pin — `ht_reconcile_log.mssql_hash` and
+    /// `ht_rooms_legacy.sync_hash` are stored SHA256s of this exact body.
+    ///
+    /// No behavioural mutation test here on purpose: `apply_room_upsert`
+    /// has no idempotency gate to defeat (`always_writes: true`), so
+    /// there is nothing a mutation could prove. The golden vector is
+    /// what keeps the descriptor table honest for rooms.
+    #[test]
+    fn rooms_hash_bytes_unchanged_for_golden_inputs() {
+        use crate::scheduler::sync::{room_canonical_hash, sha256};
+
+        let p = project_room(&make_room_row_with_maintenance(
+            7,
+            "402",
+            Some("no"),
+            Some("yes"),
+        ))
+        .expect("fixture must project");
+
+        // Literal body under the format string this table replaced:
+        //   format!("{}|{}|{}|{}", room_no, clean, maintenance, notes)
+        //   with `.unwrap_or("")` on notes. `Room_Details` is NULL in
+        //   the fixture, hence the trailing empty segment.
+        let expected = sha256("402|no|yes|");
+
+        assert_eq!(
+            room_canonical_hash("402", "no", "yes", None),
+            expected,
+            "production room hash changed bytes"
+        );
+        assert_eq!(
+            sha256(&hash_body(&p)),
+            expected,
+            "HASH_INPUTS join no longer reproduces the production hash body"
+        );
+    }
+
+    /// The legacy-literal collapse must match
+    /// `scheduler::sync::legacy_yesno_canonical` exactly, or the two
+    /// sides of the room hash diverge on every unrecognised value.
+    #[test]
+    fn legacy_yesno_segment_collapses_unknown_literals_to_empty() {
+        assert_eq!(legacy_yesno_segment(&Some("yes".into())), "yes");
+        assert_eq!(legacy_yesno_segment(&Some("no".into())), "no");
+        assert_eq!(legacy_yesno_segment(&Some("YES".into())), "");
+        assert_eq!(legacy_yesno_segment(&None), "");
     }
 
     #[test]

@@ -58,6 +58,9 @@ use crate::db::{DbPool, PgPool};
 use crate::notifications::slack::{SlackClient, SlackMessage};
 use crate::outbox::event::DomainEvent;
 use crate::sync::change_op::ChangeOp;
+// Single-sourced `|` separator, shared with the mapper-side descriptor
+// tables that pin the gate ⊇ reconcile-hash invariant.
+use crate::sync::gate_guard::join_hash_segments;
 use crate::sync::mapper::MssqlChangeMapper;
 use crate::sync::mappers::{CustomerMapper, RoomMasterMapper};
 use crate::sync::row::MappableRow;
@@ -1309,7 +1312,7 @@ async fn check_ct_watcher_lag_per_table(legacy_pool: &DbPool, pg_pool: &PgPool, 
 }
 
 /// Compute SHA256 hash of a string
-fn sha256(input: &str) -> String {
+pub(crate) fn sha256(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     format!("{:x}", hasher.finalize())
@@ -1619,7 +1622,14 @@ fn legacy_yesno_canonical(s: Option<&str>) -> &'static str {
 /// Hash inputs for the canonical-shape customer projection. Single-row
 /// per PK on both sides. Order + separator must stay byte-identical
 /// between the MSSQL and PG paths or the hashes won't line up.
-fn customer_canonical_hash(
+///
+/// Segments are joined by [`join_hash_segments`] rather than a
+/// `format!` template so the separator is single-sourced with the
+/// mapper-side descriptor table (`sync::mappers::customer::HASH_INPUTS`)
+/// that pins the gate ⊇ hash invariant. Byte-identical to the template
+/// it replaced — pinned by
+/// `customers_hash_bytes_unchanged_for_golden_inputs`.
+pub(crate) fn customer_canonical_hash(
     legacy_cust_no: &str,
     cust_firstname: &str,
     cust_type: Option<&str>,
@@ -1627,34 +1637,32 @@ fn customer_canonical_hash(
     cust_idcard: Option<&str>,
     cust_address: Option<&str>,
 ) -> String {
-    sha256(&format!(
-        "{}|{}|{}|{}|{}|{}",
-        legacy_cust_no,
-        cust_firstname,
-        cust_type.unwrap_or(""),
-        cust_phone.unwrap_or(""),
-        cust_idcard.unwrap_or(""),
-        cust_address.unwrap_or(""),
-    ))
+    sha256(&join_hash_segments(&[
+        legacy_cust_no.to_string(),
+        cust_firstname.to_string(),
+        cust_type.unwrap_or("").to_string(),
+        cust_phone.unwrap_or("").to_string(),
+        cust_idcard.unwrap_or("").to_string(),
+        cust_address.unwrap_or("").to_string(),
+    ]))
 }
 
 /// Hash inputs for the canonical-shape room projection. Narrowed to
 /// fields the CT room mapper actually writes back (room_clean,
 /// room_maintenance, room_notes) — prices and other legacy-only
 /// columns are excluded because canonical doesn't mirror them.
-fn room_canonical_hash(
+pub(crate) fn room_canonical_hash(
     room_no: &str,
     room_clean_yesno: &str,
     room_maintenance_yesno: &str,
     room_notes: Option<&str>,
 ) -> String {
-    sha256(&format!(
-        "{}|{}|{}|{}",
-        room_no,
-        room_clean_yesno,
-        room_maintenance_yesno,
-        room_notes.unwrap_or(""),
-    ))
+    sha256(&join_hash_segments(&[
+        room_no.to_string(),
+        room_clean_yesno.to_string(),
+        room_maintenance_yesno.to_string(),
+        room_notes.unwrap_or("").to_string(),
+    ]))
 }
 
 /// Hash inputs for one canonical-shape booking row. Single-row per
@@ -1664,19 +1672,18 @@ fn room_canonical_hash(
 /// is an integer ledger code while canonical `ht_bookings.book_status` is a
 /// translated English literal sourced from `HT_Book_H.Book_Status` — different
 /// fields. Status changes are surfaced by the CT watcher's domain events.
-fn booking_canonical_hash(
+pub(crate) fn booking_canonical_hash(
     legacy_book_id: &str,
     book_checkin_date: Option<&str>,
     book_checkout_date: Option<&str>,
     legacy_cust_no: Option<&str>,
 ) -> String {
-    sha256(&format!(
-        "{}|{}|{}|{}",
-        legacy_book_id,
-        book_checkin_date.unwrap_or(""),
-        book_checkout_date.unwrap_or(""),
-        legacy_cust_no.unwrap_or(""),
-    ))
+    sha256(&join_hash_segments(&[
+        legacy_book_id.to_string(),
+        book_checkin_date.unwrap_or("").to_string(),
+        book_checkout_date.unwrap_or("").to_string(),
+        legacy_cust_no.unwrap_or("").to_string(),
+    ]))
 }
 
 /// Hash inputs for one canonical-shape check-in row. The CT checkin
@@ -1723,7 +1730,7 @@ fn booking_canonical_hash(
 /// the sentinel collapses the parity gap deterministically. When
 /// `cancelled = false`, the active-stay 5-field shape is unchanged
 /// — pre-2026-05-19 hash bytes are preserved bit-for-bit.
-fn checkin_canonical_hash(
+pub(crate) fn checkin_canonical_hash(
     legacy_cin_no: &str,
     legacy_room_no: Option<&str>,
     cin_checkin_time: Option<&str>,
@@ -1732,18 +1739,21 @@ fn checkin_canonical_hash(
     checked_out: bool,
     cancelled: bool,
 ) -> String {
+    // Shape selector — stays a pre-join early return so the sentinel
+    // never picks up segment bytes.
     if cancelled {
         return sha256(&format!("CANCELLED|{}", legacy_cin_no));
     }
-    sha256(&format!(
-        "{}|{}|{}|{}|{}|co={}",
-        legacy_cin_no,
-        legacy_room_no.unwrap_or(""),
-        cin_checkin_time.unwrap_or(""),
-        cin_checkout_time.unwrap_or(""),
-        legacy_cust_no.unwrap_or(""),
-        checked_out,
-    ))
+    // The `co=` prefix belongs to the checked-out SEGMENT, not to the
+    // separator — see `sync::mappers::checkin::HASH_INPUTS`.
+    sha256(&join_hash_segments(&[
+        legacy_cin_no.to_string(),
+        legacy_room_no.unwrap_or("").to_string(),
+        cin_checkin_time.unwrap_or("").to_string(),
+        cin_checkout_time.unwrap_or("").to_string(),
+        legacy_cust_no.unwrap_or("").to_string(),
+        format!("co={}", checked_out),
+    ]))
 }
 
 /// Track D / T7 CRIT-1 — discriminator for `ht_reconcile_log.divergence_kind`.
@@ -1980,6 +1990,21 @@ fn parse_booking_legacy_pk(legacy_pk: &str) -> (&str, &str) {
     legacy_pk.split_once('|').unwrap_or((legacy_pk, ""))
 }
 
+/// Every `ht_reconcile_log.table_name` that BOTH resolve dispatches
+/// below must handle.
+///
+/// A detected entity with no resolve arm is undetectably broken: the
+/// sweep falls through to `_ => Ok(None)`, `current_legacy_hash` and
+/// `current_pg_hash` both come back `None`, and every row for that
+/// entity sits open forever. That is exactly what happened to `rooms`
+/// (live evidence 2026-05-18). The `debug_assert!` in each wildcard arm
+/// turns "someone added detection without a resolve arm" into a test
+/// failure instead of a silent backlog, and
+/// `gate_guard::tests::resolvable_tables_const_covers_every_contract_entity`
+/// pins this list against the entity registry.
+pub(crate) const RECONCILE_RESOLVABLE_TABLES: &[&str] =
+    &["customers", "bookings", "checkins", "rooms"];
+
 /// Re-compute the canonical PG hash for a single `ht_reconcile_log`
 /// row's `(table_name, legacy_pk)` pair. Returns `Ok(None)` if no
 /// canonical row exists today (still drifted), or `Ok(Some(hash))`
@@ -1987,8 +2012,9 @@ fn parse_booking_legacy_pk(legacy_pk: &str) -> (&str, &str) {
 ///
 /// Dispatches on the same table-name vocabulary the reconcile loop
 /// writes into `ht_reconcile_log.table_name` ("customers", "bookings",
-/// "checkins", "rooms"). Other table names return `Ok(None)` so the
-/// row stays in the queue for operator review.
+/// "checkins", "rooms" — see [`RECONCILE_RESOLVABLE_TABLES`]). Other
+/// table names return `Ok(None)` so the row stays in the queue for
+/// operator review.
 async fn compute_current_pg_hash(
     pg_pool: &PgPool,
     table_name: &str,
@@ -2060,7 +2086,16 @@ async fn compute_current_pg_hash(
                 )
             }))
         }
-        _ => Ok(None),
+        _ => {
+            debug_assert!(
+                !RECONCILE_RESOLVABLE_TABLES.contains(&table_name),
+                "resolve arm missing for {table_name} in compute_current_pg_hash \
+                 — the entity is listed as resolvable but falls through to the \
+                 wildcard, so every reconcile row for it stays open forever \
+                 (2026-05-18, rooms)"
+            );
+            Ok(None)
+        }
     }
 }
 
@@ -2103,7 +2138,16 @@ async fn compute_current_legacy_hash(
         }
         "checkins" => compute_legacy_checkin_hash_via_mapper(legacy_pool, legacy_pk).await,
         "rooms" => fetch_legacy_room_hash(legacy_pool, legacy_pk).await,
-        _ => Ok(None),
+        _ => {
+            debug_assert!(
+                !RECONCILE_RESOLVABLE_TABLES.contains(&table_name),
+                "resolve arm missing for {table_name} in \
+                 compute_current_legacy_hash — the entity is listed as \
+                 resolvable but falls through to the wildcard, so every \
+                 reconcile row for it stays open forever (2026-05-18, rooms)"
+            );
+            Ok(None)
+        }
     }
 }
 

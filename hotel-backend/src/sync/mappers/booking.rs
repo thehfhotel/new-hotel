@@ -58,6 +58,7 @@ use crate::db::DbPool;
 use crate::outbox::event::{BookingSnapshot, DomainEvent, EventSource};
 use crate::service::ids::{aggregate_uuid, AggregateKind};
 use crate::sync::change_op::ChangeOp;
+use crate::sync::gate_guard::{self, GateField, HashInput, HashInputContract};
 use crate::sync::mapper::MssqlChangeMapper;
 use crate::sync::mappers::checkin::resolve_customer_or_eager_mirror;
 use crate::sync::parent_loader::BookingAggregate;
@@ -758,14 +759,178 @@ fn existing_matches(
     p: &CanonicalProjection,
     resolved: &[ResolvedRoomLine],
 ) -> bool {
-    ex.book_status.as_deref() == Some(p.book_status.as_str())
-        && ex.book_total_amount == p.total_amount
-        && ex.book_deposit_amount == p.deposit_amount
-        && ex.book_checkin == p.book_checkin
-        && ex.book_checkout == p.book_checkout
+    // Two stages, deliberately NOT flattened into one table: the header
+    // terms compare `ExistingBooking` against the projection, while the
+    // room stage compares two SLICES. Both are pure, so evaluating the
+    // header block first is behaviour-identical to the previous
+    // hand-written `&&` chain.
+    HEADER_GATE_FIELDS.iter().all(|f| (f.matches)(ex, p))
         && booking_rooms_match(&ex.rooms, resolved)
-        && (p.legacy_cust_no.is_none() || ex.legacy_cust_no == p.legacy_cust_no)
-        && (p.notes.is_none() || ex.book_notes == p.notes)
+}
+
+/// The header half of the idempotency gate, as NAMED comparators.
+///
+/// [`existing_matches`] is `.all()` over this table, so removing a name
+/// removes the comparison. Names are the canonical (PG) column, which is
+/// also what `scheduler::sync::booking_canonical_hash` reads, so
+/// [`HASH_INPUTS`] cites them directly. See [`crate::sync::gate_guard`].
+const HEADER_GATE_FIELDS: [GateField<ExistingBooking, CanonicalProjection>; 7] = [
+    GateField {
+        name: "book_status",
+        guarded: false,
+        matches: |ex, p| ex.book_status.as_deref() == Some(p.book_status.as_str()),
+    },
+    GateField {
+        name: "book_total_amount",
+        guarded: false,
+        matches: |ex, p| ex.book_total_amount == p.total_amount,
+    },
+    GateField {
+        name: "book_deposit_amount",
+        guarded: false,
+        matches: |ex, p| ex.book_deposit_amount == p.deposit_amount,
+    },
+    GateField {
+        name: "book_checkin",
+        guarded: false,
+        matches: |ex, p| ex.book_checkin == p.book_checkin,
+    },
+    GateField {
+        name: "book_checkout",
+        guarded: false,
+        matches: |ex, p| ex.book_checkout == p.book_checkout,
+    },
+    // Guarded — `COALESCE($9, legacy_cust_no)` write semantics: a
+    // transient NULL never overwrites, so treating it as a mismatch
+    // would re-emit `BookingModified` every tick without converging. A
+    // Some→Some move (including the `'C0000'` delete cascade) still
+    // mismatches, which is what the reconcile hash needs.
+    GateField {
+        name: "legacy_cust_no",
+        guarded: true,
+        matches: |ex, p| p.legacy_cust_no.is_none() || ex.legacy_cust_no == p.legacy_cust_no,
+    },
+    // Guarded — `COALESCE($7, book_notes)`, same rationale.
+    GateField {
+        name: "book_notes",
+        guarded: true,
+        matches: |ex, p| p.notes.is_none() || ex.book_notes == p.notes,
+    },
+];
+
+/// The second gate stage: the `ht_booking_rooms` SET comparison.
+///
+/// Modelled as ONE named term (`rooms`) covering both the room identity
+/// and its per-room price, because that is the granularity the stage
+/// actually decides at. Shipped 2026-07-28 after a bare room COUNT let
+/// iHOTEL's constant-cardinality 402→403 swap through the gate.
+const ROOM_SET_GATE_FIELD: GateField<[ExistingBookingRoom], [ResolvedRoomLine]> = GateField {
+    name: "rooms",
+    guarded: false,
+    matches: |existing, resolved| {
+        use std::collections::HashMap;
+
+        // Intended junction state = resolved lines deduped by room_id,
+        // first-wins (mirrors ON CONFLICT DO NOTHING).
+        let mut intended: HashMap<i32, Option<f64>> = HashMap::with_capacity(resolved.len());
+        for r in resolved {
+            intended.entry(r.room_id).or_insert(r.price_per_night);
+        }
+
+        // `uq_ht_br_bookroom UNIQUE (br_book_id, br_room_id)` guarantees
+        // the stored side is already unique per room, so a length check
+        // on the deduped map is exact.
+        if existing.len() != intended.len() {
+            return false;
+        }
+        existing.iter().all(|ex| match intended.get(&ex.room_id) {
+            Some(price) => prices_match(ex.price_per_night, *price),
+            None => false,
+        })
+    },
+};
+
+/// Gate term names (both stages), for
+/// [`crate::sync::gate_guard::reconcile_entity_contracts`].
+pub(crate) fn gate_field_names() -> Vec<&'static str> {
+    let mut names = gate_guard::gate_field_names(&HEADER_GATE_FIELDS);
+    names.push(ROOM_SET_GATE_FIELD.name);
+    names
+}
+
+/// The inputs `scheduler::sync::booking_canonical_hash` consumes, as a
+/// descriptor table over the SAME projection the gate compares.
+///
+/// Order IS the hash-body order; byte parity is pinned by
+/// `bookings_hash_bytes_unchanged_for_golden_inputs`.
+///
+/// `book_status` is deliberately absent — legacy `View_Booking_Ds.
+/// Book_Status` is an integer ledger code while canonical
+/// `ht_bookings.book_status` is a translated literal, so it is not a
+/// hash input (the gate compares it anyway; the invariant only requires
+/// gate ⊇ hash).
+const HASH_INPUTS: [HashInput<CanonicalProjection>; 4] = [
+    HashInput {
+        name: "legacy_book_id",
+        // Row identity: `fetch_existing` SELECTs `WHERE legacy_book_id =
+        // $1`.
+        gated_by: &[],
+        segmented: true,
+        lookup_key: true,
+        segment: |p| p.legacy_book_id.clone(),
+        mutate: |p| p.legacy_book_id = "R999999".into(),
+    },
+    HashInput {
+        name: "book_checkin",
+        gated_by: &["book_checkin"],
+        segmented: true,
+        lookup_key: false,
+        segment: |p| p.book_checkin.to_string(),
+        mutate: |p| {
+            p.book_checkin = p
+                .book_checkin
+                .succ_opt()
+                .expect("fixture date has a successor")
+        },
+    },
+    HashInput {
+        name: "book_checkout",
+        gated_by: &["book_checkout"],
+        segmented: true,
+        lookup_key: false,
+        segment: |p| p.book_checkout.to_string(),
+        mutate: |p| {
+            p.book_checkout = p
+                .book_checkout
+                .succ_opt()
+                .expect("fixture date has a successor")
+        },
+    },
+    HashInput {
+        name: "legacy_cust_no",
+        gated_by: &["legacy_cust_no"],
+        segmented: true,
+        lookup_key: false,
+        segment: |p| p.legacy_cust_no.clone().unwrap_or_default(),
+        // Some→Some, mirroring iHOTEL's customer-delete cascade
+        // (cheatsheet §3.24). The gate term is guarded, so a Some→None
+        // mutation would NOT defeat it — and must not, since the
+        // COALESCE write could never converge that transition.
+        mutate: |p| p.legacy_cust_no = Some("C0000".into()),
+    },
+];
+
+/// Name-level hash contract, for
+/// [`crate::sync::gate_guard::reconcile_entity_contracts`].
+pub(crate) fn hash_input_contract() -> Vec<HashInputContract> {
+    gate_guard::hash_input_contracts(&HASH_INPUTS)
+}
+
+/// Render the `bookings` reconcile-hash body from [`HASH_INPUTS`].
+/// Test-only — see the customer mapper's equivalent for why.
+#[cfg(test)]
+fn hash_body(p: &CanonicalProjection) -> String {
+    gate_guard::hash_body(&HASH_INPUTS, p)
 }
 
 /// True when `ht_booking_rooms` already holds exactly what
@@ -808,26 +973,12 @@ fn existing_matches(
 /// the first occurrence per `room_id` for the same reason: a comparison
 /// that counted the duplicate would never converge (2 intended vs 1
 /// stored), reintroducing the exact loop this design avoids.
+///
+/// The comparison itself lives in [`ROOM_SET_GATE_FIELD`] so the gate
+/// stage carries a name the contract registry can see; this stays as the
+/// call site + documentation anchor.
 fn booking_rooms_match(existing: &[ExistingBookingRoom], resolved: &[ResolvedRoomLine]) -> bool {
-    use std::collections::HashMap;
-
-    // Intended junction state = resolved lines deduped by room_id,
-    // first-wins (mirrors ON CONFLICT DO NOTHING).
-    let mut intended: HashMap<i32, Option<f64>> = HashMap::with_capacity(resolved.len());
-    for r in resolved {
-        intended.entry(r.room_id).or_insert(r.price_per_night);
-    }
-
-    // `uq_ht_br_bookroom UNIQUE (br_book_id, br_room_id)` guarantees the
-    // stored side is already unique per room, so a length check on the
-    // deduped map is exact.
-    if existing.len() != intended.len() {
-        return false;
-    }
-    existing.iter().all(|ex| match intended.get(&ex.room_id) {
-        Some(price) => prices_match(ex.price_per_night, *price),
-        None => false,
-    })
+    (ROOM_SET_GATE_FIELD.matches)(existing, resolved)
 }
 
 /// Compare two per-room prices at the resolution
@@ -1748,6 +1899,129 @@ mod tests {
         let mut ex = make_existing(&p);
         ex.rooms = stored(&[resolved(ROOM_402, 890.0)]);
         assert!(!existing_matches(&ex, &p, &[resolved(ROOM_402, 950.0)]));
+    }
+
+    // ----- gate ⊇ reconcile-hash (see `crate::sync::gate_guard`) ---------
+
+    /// Behavioural half of the gate/hash invariant, for bookings.
+    ///
+    /// Executes the PRODUCTION gate against a genuinely mutated
+    /// projection, so it cannot be satisfied by editing a list. Each
+    /// mutator must also move its own hashed segment, which is what
+    /// stops a no-op mutator from faking a pass.
+    #[test]
+    fn bookings_hash_mutations_all_defeat_the_idempotency_gate() {
+        let base = sample_projection();
+        let ex = make_existing(&base);
+        assert!(
+            existing_matches(&ex, &base, &[]),
+            "fixture must start converged, else the test proves nothing"
+        );
+
+        for input in HASH_INPUTS.iter() {
+            if input.lookup_key {
+                // Identity — `fetch_existing` resolves BY it.
+                continue;
+            }
+            let before = (input.segment)(&base);
+            let mut mutated = base.clone();
+            (input.mutate)(&mut mutated);
+            let after = (input.segment)(&mutated);
+            assert_ne!(
+                before, after,
+                "hash input `{}`: mutator did not move the hashed segment",
+                input.name,
+            );
+            assert!(
+                !existing_matches(&ex, &mutated, &[]),
+                "GATE/HASH INVARIANT VIOLATED — bookings: a legacy edit that \
+                 moves reconcile-hash input `{}` is idempotency-SKIPPED. The CT \
+                 delta ages out inside the 2-day retention window and the \
+                 reconcile sweep flags a row it can never close \
+                 (force_converge re-drives this same gate). Widen \
+                 HEADER_GATE_FIELDS. Mechanism: d09e756.",
+                input.name,
+            );
+        }
+    }
+
+    /// Byte-parity pin — see the customer mapper's equivalent for why a
+    /// single byte of drift invalidates every stored hash.
+    #[test]
+    fn bookings_hash_bytes_unchanged_for_golden_inputs() {
+        use crate::scheduler::sync::{booking_canonical_hash, sha256};
+
+        let p = sample_projection();
+        // Literal body under the format string this table replaced:
+        //   format!("{}|{}|{}|{}", book_id, checkin, checkout, cust_no)
+        //   with `.unwrap_or("")` per Option.
+        let expected = sha256("R014810|2026-04-25|2026-04-26|C21610");
+
+        assert_eq!(
+            booking_canonical_hash(
+                &p.legacy_book_id,
+                Some(p.book_checkin.to_string()).as_deref(),
+                Some(p.book_checkout.to_string()).as_deref(),
+                p.legacy_cust_no.as_deref(),
+            ),
+            expected,
+            "production booking hash changed bytes"
+        );
+        assert_eq!(
+            sha256(&hash_body(&p)),
+            expected,
+            "HASH_INPUTS join no longer reproduces the production hash body"
+        );
+    }
+
+    /// The gate table must expose exactly the terms the contract
+    /// registry advertises — including the `rooms` set-comparison stage,
+    /// which is a separate function and would otherwise be invisible to
+    /// the name-level check.
+    #[test]
+    fn gate_field_names_include_the_room_set_stage() {
+        let names = gate_field_names();
+        assert!(names.contains(&"rooms"), "room stage missing: {names:?}");
+        assert!(names.contains(&"book_checkin"));
+        assert!(names.contains(&"book_checkout"));
+        assert!(names.contains(&"legacy_cust_no"));
+    }
+
+    /// Documents the ONE booking hash input that rests on a guarded
+    /// (Some-only) gate term, and its residual weakness.
+    ///
+    /// `legacy_cust_no` is written `COALESCE($9, legacy_cust_no)`, so a
+    /// legacy `Book_Cust_ID` going NULL cannot converge and is
+    /// deliberately not treated as a mismatch — while the reconcile hash
+    /// WOULD move (`Some("C21610")` → `""`). Every observed iHOTEL edit
+    /// is Some→Some (the `'C0000'` cascade included), so this is an
+    /// accepted, recorded gap rather than an unnoticed one. Removing the
+    /// guard would trade it for a permanent re-emit loop.
+    #[test]
+    fn guarded_gate_terms_are_recorded_with_their_residual_weakness() {
+        use std::collections::HashSet;
+
+        let guarded: HashSet<&str> = gate_guard::guarded_gate_field_names(&HEADER_GATE_FIELDS)
+            .into_iter()
+            .collect();
+        assert_eq!(
+            guarded,
+            ["legacy_cust_no", "book_notes"]
+                .into_iter()
+                .collect::<HashSet<&str>>(),
+        );
+
+        let hash_inputs_on_guarded_terms: Vec<&str> = HASH_INPUTS
+            .iter()
+            .filter(|i| i.gated_by.iter().any(|n| guarded.contains(n)))
+            .map(|i| i.name)
+            .collect();
+        assert_eq!(
+            hash_inputs_on_guarded_terms,
+            vec!["legacy_cust_no"],
+            "a new hash input landed on a guarded gate term — decide \
+             explicitly whether Some→None invisibility is acceptable for it"
+        );
     }
 
     // ----- coalesce_key --------------------------------------------------
