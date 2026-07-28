@@ -179,6 +179,11 @@ jobs:
           # The forced command ignores this string as a command and hands it to
           # the script in $SSH_ORIGINAL_COMMAND, which allowlists exactly
           # `--check` and `--dry-run`. Nothing else is reachable over this key.
+          # NB the `--` before the destination below is load-bearing: OpenSSH
+          # runs a SECOND option pass after the hostname (to support
+          # `ssh host -l user`), so a bare `--dry-run` argument is parsed as an
+          # unknown SSH OPTION -> usage -> exit 255, which this step would then
+          # misreport as "could not reach". Found on the first live dispatch.
           REMOTE_ARG='--check'
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             REMOTE_ARG='--dry-run'
@@ -192,7 +197,7 @@ jobs:
               -o UserKnownHostsFile=~/.ssh/known_hosts \
               -o ConnectTimeout=30 \
               -o ProxyCommand="cloudflared --edge-ip-version 4 access ssh --hostname %h" \
-              "deploy@${EVERGREEN_HOST}" "$REMOTE_ARG" \
+              -- "deploy@${EVERGREEN_HOST}" "$REMOTE_ARG" \
               > /tmp/liveness.out 2>&1 || rc=$?
 
           cat /tmp/liveness.out
