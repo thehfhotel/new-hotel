@@ -30,7 +30,7 @@
 //! | `room_change` | Track G4 / T4 HIGH-3 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_Changed_Room`, §3.17) | `RoomChange` |
 //! | `deposit_refund` | Task #49 — deposit refund (`docs/legacy-app/COMPAT_CHEATSHEET.md` §`HT_CheckIn_Ds` "Refund deposit", FormShowDEPBack.cs:536) | `RefundDeposit` |
 //! | `mark_clean` | §3j | `MarkRoomClean` |
-//! | `mark_dirty` | Audit 2026-06-11 P2 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §3.13) | `MarkRoomDirty` |
+//! | `mark_dirty` | Audit 2026-06-11 P2; flag literal per `docs/legacy-spike/findings.md` §3e/§3i (`Room_Clean='yes'`) | `MarkRoomDirty` |
 //! | `set_maintenance` | Audit 2026-06-11 P2 (`docs/legacy-app/COMPAT_CHEATSHEET.md` §3.15/§3.16) | `SetRoomMaintenance` |
 //! | `update_room` | Admin room master-data edit — closes the `PUT /api/new/rooms/:id` writeback gap | `UpdateRoom` |
 //! | `move_room_tiles` | Issue #236 — จัดผัง layout-edit drop, FormRoomMain drag/drop shape (`docs/legacy-app/COMPAT_CHEATSHEET.md` §"Update grid layout"). **SHIPPED DARK** behind `LAYOUT_WRITEBACK_ENABLED` | `MoveRoomTiles` |

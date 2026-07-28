@@ -261,7 +261,21 @@ either never reads them, or reads them only from one DEAD form):
   Room_Clean_Time varchar(30)
   ```
 - **Status-flag enumeration**:
-  - `Room_Clean`: `'yes'` (clean, ready), `'no'` (dirty / freshly checked-out), default `'no'`.
+  - `Room_Clean`: **NEEDS-CLEANING flag** — `'yes'` = needs cleaning (DIRTY),
+    `'no'` = no cleaning needed (CLEAN / ready), default `'no'`.
+    > **Polarity correction (2026-07-28).** This section previously read
+    > `'yes'` (clean) / `'no'` (dirty), and that inversion propagated into our
+    > `mark_dirty` writeback (it wrote `'no'`, so iHOTEL's board kept showing the
+    > room clean and the CT echo flipped canonical back). Authority is
+    > `docs/legacy-spike/findings.md` — §3e check-out Phase 2
+    > (`Room_Clean='yes'` when the room is released), §3i cancel check-in
+    > ("now empty AND needs cleaning" → `'yes'`), §3j mark-clean
+    > (`Room_Clean='no'` = "no clean needed") — plus the CT room mapper
+    > (`hotel-backend/src/sync/mappers/room.rs`, settled + backfilled
+    > 2026-06-30) which inverts on read: canonical `room_clean = true` means IS
+    > clean. Live confirmation 2026-07-28: all 58 `HT_Rooms` rows on HF Hotel
+    > carry `Room_Clean='no'` including 41 unoccupied, rentable rooms.
+    > **findings.md + the mapper beat this decompile prose.**
   - `Room_Use`: `'yes'` (currently occupied), `'no'` (free or booked-but-not-checked-in),
     default `'no'`.
   - `Room_Manternace`: `'yes'` (under repair, not rentable), `'no'` (default).
@@ -273,12 +287,18 @@ either never reads them, or reads them only from one DEAD form):
   - `Room_Book_Time`: copy of booking start datetime as string (display only). `''` when free.
   - `Room_Book_ds`: legacy free-text booking description; cleared with `''`.
   - `Room_Clean_Time`: OADate string of when housekeeping last marked the room clean. `''` to clear.
-- **Operations the old app performs**:
-  - **Mark clean** (ClickAvliable / ClickCleanOK):
-    `update HT_Rooms set Room_Clean='yes' where id=<id>`
-    `update HT_Rooms set Room_Clean='no',Room_Clean_Time='' where id=<id>` (variant)
-  - **Mark dirty** (ClickClean.ButtonX3):
-    `update HT_Rooms set Room_Clean='no',Room_Clean_Time='' where id=<id>` + INSERT HT_Housewife row.
+- **Operations the old app performs** (statement ↔ meaning corrected 2026-07-28 —
+  the form-name attributions below come from the decompile and are unverified; the
+  *statements* are what findings.md captured live):
+  - **Mark clean** (ClickClean / ClickCleanOK — the housekeeping buttons):
+    `update HT_Rooms set Room_Clean='no',Room_Clean_Time='' where id=<id>`
+    + INSERT HT_Housewife row. This is byte-identical to the findings.md §3j
+    mark-clean capture, and to check-out Phase 3 (`WHERE id=15`).
+  - **Mark dirty** (check-out / cancel-check-in — findings.md §3e, §3i):
+    `update HT_Rooms set Room_Clean='yes' … where room_no='<room>'`, bundled into the
+    room-release UPDATE. A standalone dirty flip is just
+    `update HT_Rooms set Room_Clean='yes' where id=<id>` (what our `mark_dirty`
+    writeback recipe emits — companions deliberately omitted, see the recipe doc).
   - **Send to maintenance** (ClickAvliable.ButtonX6 / ClickClean.ButtonX6):
     `update HT_Rooms set Room_Manternace='yes' where id=<id>` + INSERT HT_Rooms_Repair.
   - **Return from maintenance** (ClickManternance.ButtonX...):
@@ -287,9 +307,9 @@ either never reads them, or reads them only from one DEAD form):
     `update HT_Rooms set room_use='yes' where room_no='<room>'`.
   - **Mark free** (FrmCheckOut, room is now dirty):
     `update HT_Rooms set room_use='no',Room_Clean='yes',Room_Use_Count=Room_Use_Count+<nights> where room_no='<room>'`.
-    NB: setting `Room_Clean='yes'` here means "ready" but at the same time `frmMain1` startup
-    queries treat `Room_Use='no'` as the canonical "this room is free/dirty"; reading is
-    the AND of conditions.
+    NB: `Room_Clean='yes'` here means **"needs cleaning"** — the just-vacated room is
+    dirty until housekeeping flips it back to `'no'` (findings.md §3e Phase 2 → Phase 3).
+    An earlier revision of this line claimed `'yes'` meant "ready"; that was wrong.
   - **Reverse a check-out** (FrmCheckOut, mode 2):
     `update HT_Rooms set room_use='yes',Room_Clean='no',Room_Use_Count=Room_Use_Count-<nights> where room_no='<room>'`.
   - **Set booking pointers** (FrmAddBook2, FormRoomMain):
@@ -308,7 +328,10 @@ either never reads them, or reads them only from one DEAD form):
     `Cin_Room_Status<>'Check-Out'`. `frmMain1` startup *fixes* the inverse via:
     `update HT_Room_Status set room_status='Check-Out' WHERE room_no IN (SELECT Room_no FROM HT_Rooms WHERE Room_Use='no') AND room_status='เข้าพัก'`.
   - `Room_Book<>''` ⇒ a row exists in `HT_Book_Date` with that `id`.
-  - `Room_Clean='yes' AND Room_Use='no' AND Room_Manternace='no'` ⇒ rentable.
+  - `Room_Clean='no' AND Room_Use='no' AND Room_Manternace='no'` ⇒ rentable
+    (clean, empty, not under repair). Corrected 2026-07-28 — the previous
+    `Room_Clean='yes'` form is inconsistent with live data, where every rentable
+    room carries `'no'`.
   - The grid in `FormRoomMain` resolves color/state by reading these three flags only.
 - **Cleanup/reset operations**:
   - "Factory reset" button (frmMain1.cs:7553): `update HT_Rooms set room_book_ds='',Room_Book='',Room_Book_Name='',Room_Book_Time='',Room_Use_Count=0,Room_Manternace='no',Room_Use='no',Room_Clean='no'`.
@@ -1338,9 +1361,17 @@ Step 2: INV_NO = get_id("HT_INVOICE","INV_NO")
 Step 3: Print_Report.print_inv_booking
 ```
 
-### 3.13 Mark Room Dirty (housewife start cleaning)
+### 3.13 Mark Room CLEAN (housewife cleaning action)
 
 Source: `ClickClean.cs:493-540`.
+
+> **Retitled 2026-07-28 — this section used to be called "Mark Room Dirty
+> (housewife start cleaning)" and that mislabel is what broke our `mark_dirty`
+> writeback for six weeks.** The statement below writes `Room_Clean='no'`, which
+> is the CLEAN pole (see the `HT_Rooms` status-flag enumeration above), and it is
+> byte-identical to the findings.md §3j mark-clean capture. iHOTEL raises the
+> dirty flag from check-out / cancel (`Room_Clean='yes'`, findings.md §3e/§3i),
+> not from here. Do not use this section as the model for a mark-dirty write.
 
 ```
 For each affected room:
@@ -1361,9 +1392,10 @@ For each affected room:
     UPDATE HT_Rooms SET Room_Clean_Time=<now.ToOADate()> WHERE Room_no=<r>
     INSERT HT_Housewife (...)
 ```
-(Note: the WHERE id=<roomid> is the structural mark; Room_Clean is set to 'no' but
-Room_Clean_Time is set to NOW. The naming is confusing but `Room_Clean='no'` here means
-"awaiting verification" (visual: red→green pending).)
+(Note: `Room_Clean='no'` here means **clean / no cleaning needed** — same pole as
+§3.13 and findings.md §3j. `Room_Clean_Time` additionally stamps *when* the clean
+finished. A previous revision of this note guessed "awaiting verification"; that
+reading has no capture behind it and is withdrawn — 2026-07-28.)
 
 ### 3.15 Send Room to Maintenance (ClickClean.ButtonX6)
 
@@ -1827,7 +1859,7 @@ written exactly as shown.
 
 | Column | Literal | Meaning |
 |---|---|---|
-| `HT_Rooms.Room_Clean` | `'yes'` / `'no'` | clean / dirty (default `'no'`) |
+| `HT_Rooms.Room_Clean` | `'yes'` / `'no'` | needs cleaning (dirty) / no cleaning needed (clean, default `'no'`) — polarity per findings.md §3e/§3i/§3j, corrected 2026-07-28 |
 | `HT_Rooms.Room_Use` | `'yes'` / `'no'` | occupied / free |
 | `HT_Rooms.Room_Manternace` | `'yes'` / `'no'` | repair / not |
 | `HT_Rooms.Room_Power_STATUS` | `'on'` / `'off'` | electricity (lowercase) |
