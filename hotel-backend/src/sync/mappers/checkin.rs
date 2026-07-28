@@ -215,6 +215,19 @@ struct ExistingCheckIn {
     /// skipped the re-point and the canonical row kept referencing the
     /// deleted customer forever.
     legacy_cust_no: Option<String>,
+    /// Denormalised FIRST-room pointer — `derive_room_state`'s
+    /// `first_room_no` (lowest `HT_CheckIn_Ds.id`; the aggregate loader
+    /// pins `ORDER BY id ASC`). Compared by `existing_matches` since
+    /// issue #264, because it is a reconcile-hash input in its own right
+    /// (`scheduler::sync::checkin_canonical_hash` reads exactly this
+    /// column on the PG side) while stage 2 compares only the room SET.
+    /// On a MULTI-room folio (iHOTEL-created only) iHOTEL's
+    /// delete-then-reinsert of the `Ds` rows can REORDER them at a
+    /// constant set — new IDENTITY ids, so a different row is "first" —
+    /// which moves the hashed value while every set term still holds.
+    /// Guarded (Some-only), mirroring the `COALESCE($12, legacy_room_no)`
+    /// write in `update_existing`.
+    legacy_room_no: Option<String>,
 }
 
 /// Canonical PG-shape projection of the legacy aggregate. This is what
@@ -1355,12 +1368,13 @@ async fn fetch_existing(
         Option<NaiveDate>,
         Option<NaiveDateTime>,
         Option<String>,
+        Option<String>,
     )>(
         "SELECT cin_id, aggregate_id, cin_status, \
                 cin_total_amount::float8, cin_room_amount::float8, \
                 cin_paid_amount::float8, \
                 cin_checkin_time, cin_expected_checkout, cin_checkout_time, \
-                legacy_cust_no \
+                legacy_cust_no, legacy_room_no \
            FROM ht_checkins \
           WHERE legacy_cin_no = $1 \
           LIMIT 1",
@@ -1370,7 +1384,7 @@ async fn fetch_existing(
     .await?;
 
     Ok(row.map(
-        |(cin_id, aggregate_id, cin_status, total, room, paid, checkin, expected, checkout, legacy_cust_no)| {
+        |(cin_id, aggregate_id, cin_status, total, room, paid, checkin, expected, checkout, legacy_cust_no, legacy_room_no)| {
             ExistingCheckIn {
                 cin_id,
                 aggregate_id,
@@ -1382,6 +1396,7 @@ async fn fetch_existing(
                 cin_expected_checkout: expected,
                 cin_checkout_time: checkout,
                 legacy_cust_no,
+                legacy_room_no,
             }
         },
     ))
@@ -1395,6 +1410,9 @@ fn existing_matches(ex: &ExistingCheckIn, p: &CanonicalCheckIn) -> bool {
     // value would force a re-apply every tick without ever converging.
     // A Some projection (including the `'C0000'` delete-cascade sentinel)
     // MUST match, or the apply re-runs and re-points the FK.
+    // `legacy_room_no` (issue #264) is guarded on the same grounds —
+    // `COALESCE($12, legacy_room_no)` — and compares the PROJECTED first
+    // room, which is the value the reconcile hash consumes.
     // `cin_checkin_time` / `cin_expected_checkout` are compared
     // unguarded: the projection carries them as non-optional (hard
     // error on a NULL `Cin_Date_in`) and `update_existing` writes both
@@ -1422,7 +1440,7 @@ fn existing_matches(ex: &ExistingCheckIn, p: &CanonicalCheckIn) -> bool {
 /// Names are the canonical (PG) column, which is also what
 /// `scheduler::sync::checkin_canonical_hash` reads, so [`HASH_INPUTS`]
 /// cites them directly.
-const HEADER_GATE_FIELDS: [GateField<ExistingCheckIn, CanonicalCheckIn>; 8] = [
+const HEADER_GATE_FIELDS: [GateField<ExistingCheckIn, CanonicalCheckIn>; 9] = [
     GateField {
         name: "cin_status",
         guarded: false,
@@ -1465,6 +1483,41 @@ const HEADER_GATE_FIELDS: [GateField<ExistingCheckIn, CanonicalCheckIn>; 8] = [
         name: "legacy_cust_no",
         guarded: true,
         matches: |ex, p| p.legacy_cust_no.is_none() || ex.legacy_cust_no == p.legacy_cust_no,
+    },
+    // Issue #264 — the ORDERED first-room term. `p.legacy_room_no` IS
+    // `derive_room_state`'s `first_room_no`, i.e. the exact value the
+    // reconcile hash consumes on the legacy side, and `ex.legacy_room_no`
+    // is the exact column it consumes on the PG side
+    // (`checkin_canonical_hash`). The stage-2 `rooms` term compares the
+    // room SET, which is blind to a `Ds` delete-then-reinsert that only
+    // REORDERS the rows of a multi-room folio (iHOTEL-created only) —
+    // the hashed first room moves, every set term holds, the apply is
+    // idempotency-skipped, the CT delta ages out inside the 2-day
+    // retention window, and the reconcile sweep flags a row it can never
+    // close (`force_converge_reconcile_row` re-drives this same gate).
+    // This term is what makes that movement visible; the set term keeps
+    // its own coverage of genuine add/remove/swap.
+    //
+    // Guarded — `update_existing` writes `COALESCE($12, legacy_room_no)`
+    // (write-THROUGH since 88fa62d, 2026-05-15: the original
+    // `COALESCE(legacy_room_no, $11)` was write-ONCE and pinned the
+    // pointer to the first room forever). A Some projection therefore
+    // converges in ONE re-apply, but a None projection (every `Ds` row
+    // deleted — the cancel cascade) can never overwrite, so comparing it
+    // unguarded would re-apply every tick without ever converging: the
+    // documented never-converges trap that also guards `legacy_cust_no`.
+    // Cancelled folios are additionally the case
+    // `checkin_canonical_hash` collapses to its sentinel, so the
+    // Some→None invisibility costs no hash coverage there.
+    //
+    // Cost is bounded exactly as the `cin_room_amount` widening was: the
+    // term can only force a re-apply for a folio that already has a CT
+    // event this tick, so any pre-88fa62d stale-pointer residue heals
+    // lazily on its next legacy touch rather than as a burst.
+    GateField {
+        name: "legacy_room_no",
+        guarded: true,
+        matches: |ex, p| p.legacy_room_no.is_none() || ex.legacy_room_no == p.legacy_room_no,
     },
 ];
 
@@ -1525,22 +1578,27 @@ const HASH_INPUTS: [HashInput<CanonicalCheckIn>; 7] = [
     },
     HashInput {
         name: "legacy_room_no",
-        // Covered by the stage-2 room SET comparison, not by a
-        // header-level term: `legacy_room_no` is DERIVED from the room
-        // slice (`derive_room_state` takes the first Ds row), so a room
-        // change is what moves it. Residual gap: on a MULTI-room folio a
-        // Ds-row reorder can change which room is "first" while leaving
-        // the (room, status) set identical — see the mutation test.
-        gated_by: &["rooms"],
+        // The header-level ORDERED first-room term (issue #264), NOT the
+        // stage-2 `rooms` SET comparison. `legacy_room_no` is DERIVED
+        // from the room slice (`derive_room_state` takes the lowest-id Ds
+        // row), so a genuine room add/remove/swap moves it AND the set —
+        // but a Ds delete-then-reinsert that only REORDERS a multi-room
+        // folio moves it at a CONSTANT set, which the set stage cannot
+        // see. Citing the set stage here was the alias that let that case
+        // through the behavioural test below.
+        gated_by: &["legacy_room_no"],
         segmented: true,
         lookup_key: false,
         segment: |p| p.legacy_room_no.clone().unwrap_or_default(),
-        mutate: |p| {
-            p.legacy_room_no = Some(MUTATED_ROOM_NO.into());
-            if let Some(first) = p.rooms.first_mut() {
-                first.legacy_room_no = MUTATED_ROOM_NO.into();
-            }
-        },
+        // Moves ONLY the header value, leaving the room slice untouched:
+        // that is precisely the shape a reorder projects onto the gate
+        // (hashed first room moves, `(room, status)` set identical), so
+        // the mutation is caught by the first-room term ALONE and cannot
+        // borrow the set stage's coverage. The realistic two-room
+        // reinsert that produces this shape is exercised end-to-end by
+        // `multi_room_first_room_reorder_defeats_the_gate`. Some→Some, as
+        // a guarded term requires.
+        mutate: |p| p.legacy_room_no = Some(MUTATED_ROOM_NO.into()),
     },
     HashInput {
         name: "cin_checkin_time",
@@ -2810,6 +2868,7 @@ mod tests {
             cin_expected_checkout: Some(p.cin_expected_checkout),
             cin_checkout_time: p.cin_checkout_time,
             legacy_cust_no: p.legacy_cust_no.clone(),
+            legacy_room_no: p.legacy_room_no.clone(),
         }
     }
 
@@ -2938,6 +2997,44 @@ mod tests {
         assert!(existing_matches(&ex, &p));
     }
 
+    /// Issue #264 — the first-room term at the header level. A projected
+    /// first room that disagrees with the denormalised canonical column
+    /// MUST force a re-apply: that column is what
+    /// `checkin_canonical_hash` reads on the PG side, so a skip here
+    /// leaves a hash input durably stale.
+    #[test]
+    fn existing_matches_is_false_when_only_first_room_differs() {
+        let p = sample_canonical(); // legacy_room_no = Some("402")
+        let mut ex = make_existing(&p);
+        ex.legacy_room_no = Some("403".into());
+        assert!(
+            !existing_matches(&ex, &p),
+            "a first-room-only movement MUST force a re-apply"
+        );
+
+        // `COALESCE($12, legacy_room_no)` is write-THROUGH (88fa62d,
+        // 2026-05-15), so ONE re-apply converges it — the term does not
+        // need the never-converges guard for the Some→Some direction.
+        ex.legacy_room_no = p.legacy_room_no.clone();
+        assert!(existing_matches(&ex, &p), "must converge in one apply");
+    }
+
+    /// Sibling guard of `existing_matches_guards_none_cust_no_projection`:
+    /// iHOTEL's cancel cascade deletes every `HT_CheckIn_Ds` row, so
+    /// `derive_room_state` projects `first_room_no=None` while canonical
+    /// keeps the last known room (deliberately — operators still need to
+    /// see WHICH room was cancelled). `COALESCE($12, legacy_room_no)`
+    /// could never overwrite that, so an unguarded compare would re-apply
+    /// every tick forever.
+    #[test]
+    fn existing_matches_guards_none_room_no_projection() {
+        let mut p = sample_canonical();
+        p.legacy_room_no = None;
+        let mut ex = make_existing(&p);
+        ex.legacy_room_no = Some("402".into());
+        assert!(existing_matches(&ex, &p));
+    }
+
     // ----- gate ⊇ reconcile-hash (see `crate::sync::gate_guard`) ---------
 
     fn canonical_room(room_no: &str, status: &str) -> CanonicalRoom {
@@ -3027,20 +3124,22 @@ mod tests {
         }
     }
 
-    /// Known residual gap, pinned so it stays visible rather than being
-    /// rediscovered as an incident.
+    /// Issue #264, closed — the case the two-stage gate used to be blind
+    /// to, now asserted from the other side.
     ///
     /// `legacy_room_no` is the FIRST `HT_CheckIn_Ds` row
-    /// (`derive_room_state`), while the stage-2 gate compares the room
-    /// SET. On a MULTI-room folio, iHOTEL's delete-then-reinsert can
-    /// re-order the Ds rows without changing the set, which moves the
-    /// hashed `legacy_room_no` while every gate term still holds. The
-    /// set comparison is the right granularity for the junction, so
-    /// closing this needs an ordered/first-room term — out of scope
-    /// here; single-room folios (every stay our app creates) are
-    /// unaffected because set change ⟺ room change.
+    /// (`derive_room_state`, lowest `id`), while stage 2 compares the
+    /// room SET. iHOTEL's edit path is delete-then-reinsert of a folio's
+    /// `Ds` rows, and the reinsert allocates fresh IDENTITY ids — so it
+    /// can REORDER a multi-room folio at a constant set, moving the
+    /// hashed value while every set term holds. Pre-fix the gate skipped
+    /// that write, the CT delta aged out inside the 2-day retention
+    /// window, and the reconcile sweep flagged a row it could never close.
+    /// Multi-room folios are iHOTEL-created only (this app rejects
+    /// multi-room check-in), which is why the gap was narrow — not why it
+    /// was harmless.
     #[test]
-    fn multi_room_first_room_reorder_is_a_known_gate_blind_spot() {
+    fn multi_room_first_room_reorder_defeats_the_gate() {
         let mut base = sample_canonical();
         base.legacy_room_no = Some("402".into());
         base.rooms = vec![
@@ -3062,13 +3161,63 @@ mod tests {
         assert_ne!(
             (room_segment.segment)(&base),
             (room_segment.segment)(&reordered),
-            "the hashed segment does move"
+            "the hashed segment moves — that is the whole premise"
         );
         assert!(
-            existing_matches(&ex, &reordered) && rooms_match(&ex_rooms, &reordered.rooms),
-            "documenting the CURRENT behaviour: the two-stage gate does not \
-             see a first-room reorder at a constant room set. If this test \
-             starts failing the gap has been closed — delete it."
+            rooms_match(&ex_rooms, &reordered.rooms),
+            "the SET stage still reports a match (unchanged coverage) — so \
+             the header term is the ONLY thing that can catch this"
+        );
+        assert!(
+            !existing_matches(&ex, &reordered),
+            "GATE/HASH INVARIANT — a Ds reorder that moves the hashed \
+             first room MUST force a re-apply, not be idempotency-skipped"
+        );
+    }
+
+    /// The other half of the #264 term: a multi-room folio re-projected
+    /// in the SAME order must still idempotency-skip. Without this, the
+    /// new term would re-apply (and re-emit an event) on every CT tick
+    /// for every multi-room folio.
+    #[test]
+    fn multi_room_identical_order_still_idempotency_skips() {
+        let mut base = sample_canonical();
+        base.legacy_room_no = Some("402".into());
+        base.rooms = vec![
+            canonical_room("402", "เข้าพัก"),
+            canonical_room("403", "เข้าพัก"),
+        ];
+        let ex = make_existing(&base);
+        let ex_rooms = existing_room_set(&base);
+
+        let same = base.clone();
+        assert!(
+            existing_matches(&ex, &same) && rooms_match(&ex_rooms, &same.rooms),
+            "an unchanged multi-room folio must still skip"
+        );
+    }
+
+    /// Single-room folios — every stay THIS app creates — are unaffected:
+    /// unchanged still skips, and a genuine room change is caught (it was
+    /// already caught by the SET stage; now the header term sees it too).
+    #[test]
+    fn single_room_folio_gate_behaviour_is_unchanged() {
+        let base = sample_canonical_with_room();
+        let ex = make_existing(&base);
+        let ex_rooms = existing_room_set(&base);
+        assert!(
+            existing_matches(&ex, &base) && rooms_match(&ex_rooms, &base.rooms),
+            "unchanged single-room folio must skip"
+        );
+
+        // Room change (iHOTEL rewrites `Cin_Room_No` on the Ds row).
+        let mut moved = base.clone();
+        moved.legacy_room_no = Some("403".into());
+        moved.rooms = vec![canonical_room("403", "เข้าพัก")];
+        assert!(!rooms_match(&ex_rooms, &moved.rooms), "SET stage still sees it");
+        assert!(
+            !existing_matches(&ex, &moved),
+            "and so does the header first-room term"
         );
     }
 
@@ -3134,14 +3283,25 @@ mod tests {
         assert!(names.contains(&"cin_checkin_time"));
         assert!(names.contains(&"cin_expected_checkout"));
         assert!(names.contains(&"cin_checkout_time"));
+        // Issue #264 — the ordered first-room term is DISTINCT from the
+        // `rooms` SET stage; both must exist.
+        assert!(
+            names.contains(&"legacy_room_no"),
+            "first-room term missing: {names:?}"
+        );
     }
 
-    /// Documents the ONE check-in hash input that rests on a guarded
-    /// (Some-only) gate term. `legacy_cust_no` is written
-    /// `COALESCE($13, legacy_cust_no)`, so a legacy NULL cannot converge
-    /// and is deliberately not a mismatch — while the hash would move.
-    /// Every observed iHOTEL edit is Some→Some (`'C0000'` cascade
-    /// included), so this is an accepted, recorded gap.
+    /// Documents the check-in hash inputs that rest on a guarded
+    /// (Some-only) gate term — the residual Some→None weakness of each.
+    ///
+    /// * `legacy_cust_no` — `COALESCE($13, legacy_cust_no)`. Every
+    ///   observed iHOTEL edit is Some→Some (`'C0000'` cascade included).
+    /// * `legacy_room_no` — `COALESCE($12, legacy_room_no)` (issue #264).
+    ///   Some→None means "every `HT_CheckIn_Ds` row deleted", which is
+    ///   the cancel cascade — and cancelled folios hash to the
+    ///   `CANCELLED|{cin_no}` sentinel, which ignores the room segment
+    ///   entirely. So the guard costs no hash coverage in the only state
+    ///   that can reach it.
     #[test]
     fn guarded_gate_terms_are_recorded_with_their_residual_weakness() {
         use std::collections::HashSet;
@@ -3151,7 +3311,9 @@ mod tests {
             .collect();
         assert_eq!(
             guarded,
-            ["legacy_cust_no"].into_iter().collect::<HashSet<&str>>(),
+            ["legacy_cust_no", "legacy_room_no"]
+                .into_iter()
+                .collect::<HashSet<&str>>(),
         );
 
         let hash_inputs_on_guarded_terms: Vec<&str> = HASH_INPUTS
@@ -3161,7 +3323,7 @@ mod tests {
             .collect();
         assert_eq!(
             hash_inputs_on_guarded_terms,
-            vec!["legacy_cust_no"],
+            vec!["legacy_room_no", "legacy_cust_no"],
             "a new hash input landed on a guarded gate term — decide \
              explicitly whether Some→None invisibility is acceptable for it"
         );

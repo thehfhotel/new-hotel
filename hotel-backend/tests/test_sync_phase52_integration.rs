@@ -633,3 +633,146 @@ async fn room_master_auto_creates_unknown_room() {
         .await
         .ok();
 }
+
+/// #268 — a NULL legacy `Room_Clean` / `Room_Manternace` must CLEAR the
+/// canonical column, not preserve the stale value.
+///
+/// Pre-fix the mapper wrote `room_clean = COALESCE($1, room_clean)`, so a
+/// NULL-ward legacy change could never converge: canonical kept the old
+/// boolean and, because `HT_Rooms` is `always_writes` (no idempotency gate to
+/// blind), the reconcile sweep re-flagged the row on every tick forever.
+/// `room_notes` had the identical bug until 2026-06-11 (audit P2).
+///
+/// The seeded values are deliberately the NON-default ones (`room_clean =
+/// false`, `room_maintenance = true`) so a regression cannot pass by
+/// coincidence with the column DEFAULTs (`true` / `false`).
+#[tokio::test]
+async fn room_master_null_legacy_flags_clear_canonical() {
+    let pool = common::create_test_pool().await;
+    let mapper = RoomMasterMapper;
+
+    let room_no = format!("N{:06}", unique_residue() % 1_000_000);
+    let room_id: i32 = sqlx::query_scalar(
+        "INSERT INTO ht_rooms_new (room_no, room_clean, room_maintenance, room_notes) \
+         VALUES ($1, false, true, 'TEST_phase52_null_clear') \
+         ON CONFLICT (room_no) DO UPDATE \
+            SET room_clean = EXCLUDED.room_clean, \
+                room_maintenance = EXCLUDED.room_maintenance \
+         RETURNING room_id",
+    )
+    .bind(&room_no)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let legacy_id: i32 = (rand::random::<u32>() % 1_000_000) as i32 + 300_000;
+    sqlx::query("UPDATE ht_rooms_new SET legacy_room_id_int = $1 WHERE room_id = $2")
+        .bind(legacy_id)
+        .bind(room_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Sanity: the pre-state is genuinely non-NULL, so the assertions below
+    // observe a real transition rather than an already-NULL column.
+    let (seed_clean, seed_maint): (Option<bool>, Option<bool>) = sqlx::query_as(
+        "SELECT room_clean, room_maintenance FROM ht_rooms_new WHERE room_id = $1",
+    )
+    .bind(room_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(seed_clean, Some(false), "seed must start non-NULL");
+    assert_eq!(seed_maint, Some(true), "seed must start non-NULL");
+
+    // Legacy row with both yes/no flags NULL — a genuine "cleared" state,
+    // not a transient miss: the CT projection always carries the current
+    // value of every column in `ROOMS_SELECT_COLS`.
+    let row = HashMapRow::new("HT_Rooms")
+        .with("id", MockValue::I32(legacy_id))
+        .with("Room_no", MockValue::Str(room_no.clone()))
+        .with("Room_Type", MockValue::Str("Standard".into()))
+        .with("Room_Clean", MockValue::Null)
+        .with("Room_Use", MockValue::Str("no".into()))
+        .with("Room_Manternace", MockValue::Null)
+        .with("Room_Details", MockValue::Null)
+        .with("Room_Use_Count", MockValue::Null)
+        .with("Room_X", MockValue::Null)
+        .with("Room_Y", MockValue::Null)
+        .with("Room_Group", MockValue::Null)
+        .with("Room_Power_OPEN", MockValue::Null)
+        .with("Room_Power_CLOSE", MockValue::Null)
+        .with("Room_Power_STATUS", MockValue::Null)
+        .with("Room_Polity", MockValue::Null);
+
+    let mut tx = pool.begin().await.unwrap();
+    let event = mapper
+        .apply(&mut tx, ChangeOp::Update, Some(&row))
+        .await
+        .expect("upsert must succeed");
+    tx.commit().await.unwrap();
+
+    // No clean/dirty event: the vocabulary has no "unknown" variant, so a
+    // Some(_) → None transition writes canonical but stays event-silent.
+    assert!(
+        event.is_none(),
+        "a NULL Room_Clean has no clean/dirty flip to emit"
+    );
+
+    let (clean, maintenance, notes): (Option<bool>, Option<bool>, Option<String>) =
+        sqlx::query_as(
+            "SELECT room_clean, room_maintenance, room_notes \
+               FROM ht_rooms_new WHERE room_id = $1",
+        )
+        .bind(room_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        clean, None,
+        "pre-#268 COALESCE kept the stale `false` here, so the reconcile \
+         sweep re-flagged this room forever"
+    );
+    assert_eq!(
+        maintenance, None,
+        "pre-#268 COALESCE kept the stale `true` here"
+    );
+    assert_eq!(
+        notes, None,
+        "room_notes was already write-through (audit P2) — unchanged by #268"
+    );
+
+    // Convergence is symmetric: a subsequent non-NULL legacy value must
+    // repopulate the columns (i.e. we cleared, we didn't pin to NULL).
+    let restored = row
+        .with("Room_Clean", MockValue::Str("yes".into())) // 'yes' = NEEDS cleaning
+        .with("Room_Manternace", MockValue::Str("yes".into()));
+    let mut tx = pool.begin().await.unwrap();
+    let event = mapper
+        .apply(&mut tx, ChangeOp::Update, Some(&restored))
+        .await
+        .expect("re-apply must succeed");
+    tx.commit().await.unwrap();
+    assert!(
+        event.is_none(),
+        "prior_clean was NULL, so there is no old→new flip to eventize"
+    );
+
+    let (clean, maintenance): (Option<bool>, Option<bool>) = sqlx::query_as(
+        "SELECT room_clean, room_maintenance FROM ht_rooms_new WHERE room_id = $1",
+    )
+    .bind(room_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    // Polarity is INVERTED for clean (legacy 'yes' = needs cleaning =>
+    // canonical false) and NOT inverted for maintenance — 20edf18.
+    assert_eq!(clean, Some(false), "legacy 'yes' = dirty => canonical false");
+    assert_eq!(maintenance, Some(true), "maintenance is not inverted");
+
+    sqlx::query("DELETE FROM ht_rooms_new WHERE room_id = $1")
+        .bind(room_id)
+        .execute(&pool)
+        .await
+        .ok();
+}

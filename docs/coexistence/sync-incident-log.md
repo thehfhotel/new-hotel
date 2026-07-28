@@ -121,7 +121,7 @@ Two residual gaps reported rather than papered over (filed as issues, not fixed
 here): a multi-room-checkin gate blind spot (`legacy_room_no` hashes the FIRST
 `HT_CheckIn_Ds` row; the gate compares the room SET; a delete-then-reinsert reorder
 moves neither) pinned by
-`multi_room_first_room_reorder_is_a_known_gate_blind_spot`; and a guarded-term
+`multi_room_first_room_reorder_is_a_known_gate_blind_spot` (closed 2026-07-28 by #264 — the pin test is now `multi_room_first_room_reorder_defeats_the_gate`); and a guarded-term
 Some→None weakness (`legacy_cust_no` is COALESCE'd, so a legacy NULL is
 deliberately not treated as a mismatch) recorded per entity.
 

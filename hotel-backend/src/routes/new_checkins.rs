@@ -2257,7 +2257,18 @@ pub async fn create_guest(
                 cin_id,
                 cust_id: body.cust_id,
                 first_name,
-                last_name: body.last_name.as_deref(),
+                // Trim EXACTLY like the companion writeback below does
+                // (`.map(str::trim).filter(|s| !s.is_empty())`). An
+                // untrimmed surname here renders "First␣␣Last" while the
+                // legacy write holds "First Last" — the echo-adoption
+                // match then misses, a duplicate registry row lands, and
+                // back-population dies on uq_ht_guest_registry_legacy_id,
+                // FAILING the writeback job (#271 residual).
+                last_name: body
+                    .last_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
                 id_card: body.id_card.as_deref(),
                 passport: body.passport.as_deref(),
                 nationality: body.nationality.as_deref(),

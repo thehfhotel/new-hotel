@@ -51,6 +51,33 @@
 //! into first/last is unreliable on a free-text source and would
 //! introduce loss-on-roundtrip.
 //!
+//! ## Name authority (issue #271)
+//!
+//! Companions OUR app authored are the one case where canonical holds
+//! MORE name structure than legacy: the check-in UI captures two boxes, so
+//! the canonical row carries a SPLIT name (`guest_firstname` +
+//! `guest_lastname`) while the OUT-leg concatenates them into the single
+//! `Cin_name`. The CT echo of that INSERT therefore carries a LOSSY
+//! DERIVATIVE of two canonical columns — our own concat coming back — and
+//! must never be allowed to overwrite the authored state with it (the same
+//! lesson as the payment un-void arm). The rule this mapper applies:
+//!
+//! * incoming `Cin_name` == what the canonical row already RENDERS
+//!   (via [`canonical_companion_name_sql!`]) → the echo carries no new name
+//!   information; the authored split is left ALONE and only the non-name
+//!   mirrored columns are refreshed
+//!   ([`PRESERVE_AUTHORED_COMPANION_NAME_SQL`]);
+//! * otherwise → the legacy free text is authoritative: it replaces
+//!   `guest_firstname` and `guest_lastname` is CLEARED to NULL, which is
+//!   exactly the shape a legacy-originated row has
+//!   ([`UPSERT_COMPANION_SQL`]).
+//!
+//! Both branches leave canonical rendering the legacy bytes, which is what
+//! keeps the Phase 6-B folio hash convergeable. The pre-#271 behaviour —
+//! take `Cin_name` into `guest_firstname` and leave `guest_lastname` alone
+//! — satisfied neither: it rendered `First Last Last`, doubling the surname
+//! on every re-import.
+//!
 //! Per the user's standing constraint legacy literals are passed
 //! through unchanged — the deliberate typo `Cin_contry` (sic — kept
 //! by iHOTEL since the original schema) is preserved in the SELECT
@@ -132,6 +159,85 @@ const ADOPT_UNSTAMPED_COMPANION_SQL: &str = concat!(
           AND COALESCE(guest_nationality, '') = COALESCE($4, '') \
         ORDER BY guest_id LIMIT 1)"
 );
+
+/// Echo-preserve UPDATE (issue #271 — the `First Last Last` class). Runs
+/// after [`ADOPT_UNSTAMPED_COMPANION_SQL`], on the row this CT event is
+/// ALREADY stamped onto, and fires only when that row RENDERS exactly the
+/// incoming `Cin_name`.
+///
+/// **Why the upsert cannot be left to handle this.** For an app-authored
+/// companion the incoming name is our OWN concat echoing back (see the
+/// module doc's "Name authority"). Feeding it into `guest_firstname` while
+/// `guest_lastname` keeps its value makes the row render `First Last Last`:
+/// the surname doubles on every re-import, the reconcile arm's canonical
+/// projection (which re-concatenates with these exact bytes) stops matching
+/// `Cin_name`, and the `guest_registry` folio drifts permanently on a table
+/// TM.30 depends on.
+///
+/// **The discriminator is the render, not a marker column.** Matching on
+/// "`guest_lastname` IS NOT NULL" would also protect the authored split, but
+/// it would pin the name against ANY legacy change forever. Comparing the
+/// render instead distinguishes the two cases exactly:
+///
+/// * echo of what we wrote → the renders are equal → preserve;
+/// * genuinely changed in iHOTEL → the renders differ → this UPDATE matches
+///   0 rows and the change propagates through [`UPSERT_COMPANION_SQL`].
+///
+/// The realistic iHOTEL rename never even reaches here — iHOTEL edits
+/// companions by DELETE-then-REINSERT (`FrmCheckIn.cs:9975`), which arrives
+/// as a CT delete plus a fresh IDENTITY — but an in-place UPDATE (a DBA fix,
+/// another legacy tool) still converges, and it converges on the legacy
+/// bytes.
+///
+/// Equality is the SAME expression against the SAME raw `$3` bind as the
+/// adoption match above, so the two arms are provably one predicate rather
+/// than two hand-rolled string shapes. A near-miss (say a legacy name padded
+/// with a trailing space, which our OUT-leg never writes — it concatenates
+/// pre-trimmed parts) simply falls through to the legacy-authoritative
+/// branch; safety does not depend on this comparison being generous, because
+/// that branch is convergent too.
+///
+/// Binds are positionally identical to [`ADOPT_UNSTAMPED_COMPANION_SQL`]:
+/// `$1` legacy id, `$2` canonical `cin_id`, `$3` `Cin_name`, `$4`
+/// `Cin_contry`.
+const PRESERVE_AUTHORED_COMPANION_NAME_SQL: &str = concat!(
+    "UPDATE ht_guest_registry \
+        SET guest_cin_id = $2, guest_nationality = $4 \
+      WHERE guest_legacy_id = $1 \
+        AND ",
+    canonical_companion_name_sql!(),
+    " = $3"
+);
+
+/// The mirror UPSERT. The conflict target is the UNIQUE `guest_legacy_id`
+/// (migration 034), so a re-import of a row we already mirrored updates in
+/// place instead of duplicating.
+///
+/// The conflict arm is reached ONLY when
+/// [`PRESERVE_AUTHORED_COMPANION_NAME_SQL`] did not fire — i.e. the incoming
+/// `Cin_name` is NOT what the existing canonical row renders, so the legacy
+/// side genuinely holds a different name and its free text is authoritative.
+/// Canonical then adopts the legacy shape WHOLE: the free text into
+/// `guest_firstname`, `guest_lastname` back to NULL.
+///
+/// **Clearing the surname is load-bearing, not tidiness.** Keeping a stale
+/// `guest_lastname` beside a freshly-taken full name is precisely the
+/// `First Last Last` render this pair of statements exists to prevent, and
+/// it would leave the folio hash unconvergeable — canonical would render
+/// bytes that exist nowhere in legacy.
+///
+/// Columns the legacy table does not carry (`guest_idcard`,
+/// `guest_passport`, `guest_cust_id`) are untouched in both arms: legacy is
+/// authoritative for the NAME, never for the TM.30 identity capture.
+const UPSERT_COMPANION_SQL: &str = "INSERT INTO ht_guest_registry \
+        (guest_cin_id, guest_firstname, guest_nationality, \
+         guest_is_primary, guest_legacy_id) \
+     VALUES ($1, $2, $3, false, $4) \
+     ON CONFLICT (guest_legacy_id) DO UPDATE SET \
+        guest_cin_id     = EXCLUDED.guest_cin_id, \
+        guest_firstname  = EXCLUDED.guest_firstname, \
+        guest_lastname   = NULL, \
+        guest_nationality = EXCLUDED.guest_nationality";
 
 // =============================================================================
 // Reconcile-hash contract — see `crate::sync::gate_guard` (Phase 6-B)
@@ -252,12 +358,20 @@ impl RegistryFolioProjection {
 /// The inputs `scheduler::sync::guest_registry_canonical_hash` consumes.
 ///
 /// **`HT_CheckIn_Other_People` has NO idempotency gate**: the mapper's I/U
-/// branch runs `ADOPT_UNSTAMPED_COMPANION_SQL` and then an
-/// `INSERT … ON CONFLICT (guest_legacy_id) DO UPDATE` that rewrites every
-/// mirrored column unconditionally — there is no `existing_matches` chain
-/// that could skip a hashed change. The contract therefore declares
-/// `always_writes: true` and every `gated_by` is empty, exactly like
-/// `rooms` and `payments`.
+/// branch runs `ADOPT_UNSTAMPED_COMPANION_SQL`, then
+/// [`PRESERVE_AUTHORED_COMPANION_NAME_SQL`], then an
+/// `INSERT … ON CONFLICT (guest_legacy_id) DO UPDATE` — there is no
+/// `existing_matches` chain that could skip a hashed change. The contract
+/// therefore declares `always_writes: true` and every `gated_by` is empty,
+/// exactly like `rooms` and `payments`.
+///
+/// The preserve arm added for issue #271 is conditional, but it is NOT a
+/// gate in that sense and does not weaken the flag: its condition is that
+/// the canonical row already RENDERS the incoming `Cin_name`, i.e. the
+/// hashed `companions` segment is byte-identical either way. It can only
+/// skip re-writing a name that would hash the same; a name that would move
+/// the hash falls through to the upsert. (It still writes the country
+/// unconditionally, so the other hashed field cannot be skipped at all.)
 ///
 /// The `id` columns on both sides are excluded ON PURPOSE — see
 /// [`CompanionEntry`].
@@ -418,22 +532,36 @@ impl MssqlChangeMapper for GuestRegistryMapper {
                     return Ok(None);
                 }
 
-                sqlx::query(
-                    "INSERT INTO ht_guest_registry \
-                        (guest_cin_id, guest_firstname, guest_nationality, \
-                         guest_is_primary, guest_legacy_id) \
-                     VALUES ($1, $2, $3, false, $4) \
-                     ON CONFLICT (guest_legacy_id) DO UPDATE SET \
-                        guest_cin_id     = EXCLUDED.guest_cin_id, \
-                        guest_firstname  = EXCLUDED.guest_firstname, \
-                        guest_nationality = EXCLUDED.guest_nationality",
-                )
-                .bind(cin_id)
-                .bind(firstname)
-                .bind(cin_country)
-                .bind(legacy_id)
-                .execute(&mut **tx)
-                .await?;
+                // Echo preserve (issue #271): this CT row is the echo of a
+                // companion canonical ALREADY owns and already renders
+                // identically, so the legacy name carries no new information
+                // — for an app-authored row it is our own `first + ' ' + last`
+                // concat coming back. Leave the authored split alone and
+                // refresh only the non-name mirrored columns. Letting the
+                // upsert below run instead would write the concat into
+                // `guest_firstname` beside an untouched `guest_lastname` and
+                // render `First Last Last`, doubling the surname on every
+                // re-import. A row whose legacy name GENUINELY differs matches
+                // 0 rows here and falls through, so real changes still
+                // propagate.
+                let preserved = sqlx::query(PRESERVE_AUTHORED_COMPANION_NAME_SQL)
+                    .bind(legacy_id)
+                    .bind(cin_id)
+                    .bind(firstname)
+                    .bind(cin_country)
+                    .execute(&mut **tx)
+                    .await?;
+                if preserved.rows_affected() > 0 {
+                    return Ok(None);
+                }
+
+                sqlx::query(UPSERT_COMPANION_SQL)
+                    .bind(cin_id)
+                    .bind(firstname)
+                    .bind(cin_country)
+                    .bind(legacy_id)
+                    .execute(&mut **tx)
+                    .await?;
                 Ok(None)
             }
         }
@@ -564,6 +692,242 @@ mod tests {
             "TRIM(BOTH FROM guest_firstname || CASE WHEN COALESCE(guest_lastname, '') = '' \
              THEN '' ELSE ' ' || guest_lastname END)"
         );
+    }
+
+    // ----- issue #271: the "First Last Last" class -----------------------
+
+    /// Collapse runs of spaces so an assertion reads like the SQL rather
+    /// than like its line-continuation whitespace.
+    fn squash(sql: &str) -> String {
+        sql.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Rust model of [`canonical_companion_name_sql!`]: what a stored row
+    /// RENDERS. That render is both the preserve arm's comparison value and
+    /// the value the Phase 6-B reconcile arm hashes on the canonical side,
+    /// which is why these tests can reason about folio convergence.
+    ///
+    /// Checked against live PostgreSQL 17 (the production major, PG
+    /// 17-alpine) while developing the fix: split, un-split, empty-string
+    /// surname and padded cases all agree with the SQL expression.
+    fn canonical_render(firstname: &str, lastname: Option<&str>) -> String {
+        let joined = match lastname.unwrap_or_default() {
+            // `COALESCE(guest_lastname, '') = ''` — NULL and '' alike.
+            "" => firstname.to_string(),
+            last => format!("{firstname} {last}"),
+        };
+        // `TRIM(BOTH FROM …)` — SPACES only, as `push_companion` documents.
+        joined.trim_matches(' ').to_string()
+    }
+
+    /// The bytes the OUT-leg puts in `Cin_name` for an app-authored
+    /// companion: `routes::new_checkins::create_guest` builds
+    /// `first [+ ' ' + last]` and
+    /// `writeback::recipes::companion_people::build_add_sql` writes it
+    /// VERBATIM (no country prefix, no trailing space — unlike the
+    /// primary-row shape).
+    fn out_leg_cin_name(first: &str, last: Option<&str>) -> String {
+        match last.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(last) => format!("{first} {last}"),
+            None => first.to_string(),
+        }
+    }
+
+    /// The preserve arm keys on the row this CT event is already stamped
+    /// onto and discriminates on the SHARED render expression — not on a
+    /// marker column, so a genuine legacy rename is not pinned out.
+    #[test]
+    fn preserve_sql_is_keyed_on_the_stamped_row_and_the_shared_name_expression() {
+        let sql = squash(PRESERVE_AUTHORED_COMPANION_NAME_SQL);
+        assert!(sql.contains("UPDATE ht_guest_registry"), "{sql}");
+        assert!(sql.contains("WHERE guest_legacy_id = $1"), "{sql}");
+        assert!(
+            PRESERVE_AUTHORED_COMPANION_NAME_SQL.contains(CANONICAL_COMPANION_NAME_SQL),
+            "preserve arm must reuse the shared render expression verbatim, \
+             else it could preserve a name the reconcile arm hashes \
+             differently:\n{sql}"
+        );
+        assert!(sql.ends_with("= $3"), "compared against the raw Cin_name: {sql}");
+    }
+
+    /// The whole point of the arm: on an echo it must not touch EITHER name
+    /// column. Writing `guest_firstname` here would reintroduce
+    /// `First Last Last` by another route.
+    #[test]
+    fn preserve_sql_never_writes_either_name_column() {
+        let sql = squash(PRESERVE_AUTHORED_COMPANION_NAME_SQL);
+        let set = sql
+            .split_once("SET ")
+            .expect("preserve arm is an UPDATE … SET")
+            .1
+            .split_once(" WHERE ")
+            .expect("… WHERE")
+            .0
+            .to_string();
+        assert_eq!(
+            set, "guest_cin_id = $2, guest_nationality = $4",
+            "the echo path may refresh ONLY the non-name mirrored columns"
+        );
+    }
+
+    /// Both echo arms take the same four binds in the same order, so the two
+    /// `sqlx::query` call sites cannot drift into passing the name where the
+    /// country belongs.
+    #[test]
+    fn preserve_sql_binds_positionally_like_the_adoption_sql() {
+        let adopt = squash(ADOPT_UNSTAMPED_COMPANION_SQL);
+        let preserve = squash(PRESERVE_AUTHORED_COMPANION_NAME_SQL);
+        // $1 = legacy id, $2 = canonical cin_id, $3 = Cin_name, $4 = Cin_contry.
+        assert!(adopt.contains("SET guest_legacy_id = $1"), "{adopt}");
+        assert!(preserve.contains("guest_legacy_id = $1"), "{preserve}");
+        assert!(adopt.contains("guest_cin_id = $2"), "{adopt}");
+        assert!(preserve.contains("guest_cin_id = $2"), "{preserve}");
+        // Raw consts here, not `squash`ed: the shared expression contains a
+        // quoted space (`' '`) that whitespace normalisation must not touch.
+        for sql in [
+            ADOPT_UNSTAMPED_COMPANION_SQL,
+            PRESERVE_AUTHORED_COMPANION_NAME_SQL,
+        ] {
+            assert!(
+                sql.contains(&format!("{CANONICAL_COMPANION_NAME_SQL} = $3")),
+                "$3 must be the name, compared via the shared expression, on \
+                 both echo arms: {sql}"
+            );
+        }
+        assert!(adopt.contains("COALESCE($4, '')"), "{adopt}");
+        assert!(preserve.contains("guest_nationality = $4"), "{preserve}");
+    }
+
+    /// Fall-through means the legacy name genuinely differs, so canonical
+    /// takes the legacy free text WHOLE — surname cleared. Leaving a stale
+    /// `guest_lastname` beside a freshly-taken full name is the
+    /// `First Last Last` render itself.
+    #[test]
+    fn upsert_conflict_arm_clears_the_lastname_when_it_takes_the_legacy_name() {
+        let sql = squash(UPSERT_COMPANION_SQL);
+        assert!(sql.contains("ON CONFLICT (guest_legacy_id) DO UPDATE SET"), "{sql}");
+        assert!(sql.contains("guest_firstname = EXCLUDED.guest_firstname"), "{sql}");
+        assert!(
+            sql.contains("guest_lastname = NULL"),
+            "taking the legacy name without clearing the surname renders \
+             `First Last Last` and makes the folio hash unconvergeable: {sql}"
+        );
+        assert!(sql.contains("guest_nationality = EXCLUDED.guest_nationality"), "{sql}");
+        // Identity capture is canonical-only — legacy owns the NAME, not TM.30 docs.
+        for col in ["guest_idcard", "guest_passport", "guest_cust_id"] {
+            assert!(!sql.contains(col), "conflict arm must not touch {col}: {sql}");
+        }
+    }
+
+    /// Regression guard for the whole class, stated structurally: no
+    /// statement in this mapper may adopt the legacy name without also
+    /// dropping the authored surname.
+    #[test]
+    fn no_statement_takes_the_legacy_name_without_clearing_the_lastname() {
+        for sql in [
+            ADOPT_UNSTAMPED_COMPANION_SQL,
+            PRESERVE_AUTHORED_COMPANION_NAME_SQL,
+            UPSERT_COMPANION_SQL,
+        ] {
+            let s = squash(sql);
+            if s.contains("guest_firstname = EXCLUDED.guest_firstname") {
+                assert!(
+                    s.contains("guest_lastname = NULL"),
+                    "statement takes the legacy name but keeps the authored \
+                     surname — that is the #271 `First Last Last` render: {s}"
+                );
+            }
+        }
+    }
+
+    /// Echo re-import of an app-authored row: the split survives and the
+    /// folio stays converged.
+    #[test]
+    fn echo_reimport_of_an_authored_row_preserves_the_split_and_stays_converged() {
+        use crate::scheduler::sync::guest_registry_canonical_hash;
+
+        // Two boxes in our check-in UI …
+        let (first, last) = ("Somchai", Some("Jaidee"));
+        // … one field in legacy, written VERBATIM by the delta writeback.
+        let cin_name = out_leg_cin_name(first, last);
+        assert_eq!(cin_name, "Somchai Jaidee");
+        let legacy_folio = folio("CH26-005228", &[(cin_name.as_str(), Some("TH"))]);
+
+        // The stamped row already renders those exact bytes, so the preserve
+        // arm's predicate holds: no name write, no surname doubling.
+        let preserved = canonical_render(first, last);
+        assert_eq!(preserved, cin_name, "no `Last Last`");
+        assert_eq!(
+            guest_registry_canonical_hash(&folio(
+                "CH26-005228",
+                &[(preserved.as_str(), Some("TH"))]
+            )),
+            guest_registry_canonical_hash(&legacy_folio),
+            "the preserved split must hash exactly like the legacy Cin_name"
+        );
+
+        // Pre-#271: the conflict arm wrote `Cin_name` into `guest_firstname`
+        // and left `guest_lastname` alone.
+        let doubled = canonical_render(&cin_name, last);
+        assert_eq!(doubled, "Somchai Jaidee Jaidee", "the reported symptom");
+        assert_ne!(
+            guest_registry_canonical_hash(&folio(
+                "CH26-005228",
+                &[(doubled.as_str(), Some("TH"))]
+            )),
+            guest_registry_canonical_hash(&legacy_folio),
+            "canonical would render bytes that exist nowhere in legacy — \
+             permanent folio sync lag on a TM.30 table"
+        );
+        // It is stable-but-wrong rather than compounding: `Cin_name` stays
+        // constant, so a further echo re-derives the same doubled render. It
+        // only STACKED under the retired replace-all shape, which wrote the
+        // canonical render back to legacy (the 2026-07-01 echo loop).
+        assert_eq!(canonical_render(&cin_name, last), doubled);
+    }
+
+    /// A genuine legacy-side rename still propagates — the discriminator is
+    /// the render, not a marker column.
+    #[test]
+    fn a_genuine_legacy_rename_propagates_and_converges_on_the_legacy_bytes() {
+        use crate::scheduler::sync::guest_registry_canonical_hash;
+
+        // A receptionist typo-fix in iHOTEL normally arrives as
+        // DELETE+REINSERT (`FrmCheckIn.cs:9975`) — a fresh IDENTITY, so the
+        // mapper inserts a fresh row and neither echo arm is involved. This
+        // pins the in-place UPDATE case (a DBA fix, another legacy tool).
+        let renamed = "Somchai Jaidii";
+        let legacy_folio = folio("CH26-005228", &[(renamed, Some("TH"))]);
+
+        // The preserve arm cannot fire: the stored row renders the OLD name.
+        assert_ne!(canonical_render("Somchai", Some("Jaidee")), renamed);
+
+        // So the conflict arm takes the free text and clears the surname —
+        // canonical lands in the legacy-originated shape and converges.
+        let after = canonical_render(renamed, None);
+        assert_eq!(after, renamed);
+        assert_eq!(
+            guest_registry_canonical_hash(&folio("CH26-005228", &[(after.as_str(), Some("TH"))])),
+            guest_registry_canonical_hash(&legacy_folio),
+        );
+
+        // Keeping the authored surname (option (a): "preserve whenever a
+        // split exists") would NOT converge here.
+        assert_ne!(canonical_render(renamed, Some("Jaidee")), renamed);
+    }
+
+    /// Legacy-originated companions have no authored split, so their render
+    /// IS the stored free text: the preserve arm fires on every re-import and
+    /// the name column is never rewritten. Prefixes and Thai full names
+    /// survive verbatim, exactly as the module doc promises — this fix does
+    /// not sneak a name split in through the back door.
+    #[test]
+    fn legacy_originated_rows_keep_their_free_text_name_verbatim() {
+        for name in ["Mr. John Smith", "สมชาย ใจดี", "นาย สมชาย ใจดี", ""] {
+            assert_eq!(canonical_render(name, None), name);
+            // Blank surnames are the same state as NULL (`COALESCE`).
+            assert_eq!(canonical_render(name, Some("")), name);
+        }
     }
 
     /// Byte-parity pin for the NEW `guest_registry` descriptor (Phase 6-B).

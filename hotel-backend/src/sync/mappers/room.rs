@@ -133,11 +133,15 @@ struct RoomProjection {
     legacy_id: i32,
     room_no: String,
     room_type: Option<String>,
-    /// Legacy literal `'yes'` / `'no'` / NULL. Translated to `bool`
-    /// at the boundary (NULL → keep existing value).
+    /// Legacy literal `'yes'` / `'no'` / NULL. Translated to
+    /// `Option<bool>` at the boundary and written THROUGH to canonical
+    /// — a NULL/unrecognised literal clears `room_clean` to NULL rather
+    /// than preserving the stale canonical value (#268; see
+    /// [`ROOM_UPDATE_SQL`]).
     room_clean_legacy: Option<String>,
     /// Legacy `Room_Manternace` (sic — typo in legacy schema). Same
-    /// `'yes'` / `'no'` / NULL semantics as `room_clean_legacy`.
+    /// `'yes'` / `'no'` / NULL semantics as `room_clean_legacy`, same
+    /// write-through treatment.
     room_manternace_legacy: Option<String>,
     room_use_legacy: Option<String>,
     room_details: Option<String>,
@@ -203,8 +207,11 @@ fn project_room(row: &dyn MappableRow) -> Result<RoomProjection, SyncError> {
 }
 
 /// Translate the legacy `'yes'` / `'no'` / NULL literal into our PG
-/// `BOOLEAN`. Unknown / NULL values fall back to `None` so the UPSERT
-/// can preserve whatever the canonical row already had.
+/// `BOOLEAN`. Unknown / NULL values collapse to `None`, which the UPSERT
+/// writes through as a genuine SQL NULL — `None` means "legacy has no
+/// value here", not "no signal, keep the old one" (#268). The reconcile
+/// hash renders the same collapse via [`legacy_yesno_segment`], so the
+/// two sides agree on what an unrecognised literal means.
 fn legacy_yesno_to_bool(s: &Option<String>) -> Option<bool> {
     match s.as_deref() {
         Some("yes") => Some(true),
@@ -335,6 +342,80 @@ async fn fetch_existing_room(
     }))
 }
 
+/// The existing-row UPDATE. Hoisted to a const so
+/// [`tests::room_update_writes_clean_and_maintenance_through`] can pin the
+/// assignment shape without a live PG — the integration suite that exercises
+/// the runtime behaviour is skipped whenever `DATABASE_URL` is unreachable,
+/// so a re-introduced `COALESCE` would otherwise slip through `cargo test`.
+///
+/// **Assignment semantics, per column.**
+///
+/// `room_clean` ($1), `room_maintenance` ($2) and `room_notes` ($3) are
+/// WRITE-THROUGH: the bound value lands verbatim, NULL included. The CT
+/// projection always carries the row's *current* `Room_Clean` /
+/// `Room_Manternace` / `Room_Details`, so a NULL there is a genuine "legacy
+/// cleared this" transition, never a transient miss — and
+/// [`legacy_yesno_to_bool`] additionally collapses unrecognised literals to
+/// `None`, which must reach canonical for the same reason.
+///
+/// `room_notes` was flipped off `COALESCE` on 2026-06-11 (audit P2) for
+/// exactly this reason; `room_clean` / `room_maintenance` followed on
+/// 2026-07-28 (#268). Under the old `COALESCE($1, room_clean)` a NULL-ward
+/// legacy change could NEVER converge: canonical kept the stale boolean, the
+/// reconcile hash kept disagreeing (legacy segment `""` vs canonical
+/// `"yes"`/`"no"`), and because `HT_Rooms` is `always_writes` there was no
+/// idempotency gate to blind — the row simply sat unconverged forever.
+/// Writing NULL through is what makes the two hash sides meet:
+/// `scheduler::sync::clean_bool_to_legacy_yesno(None)` and
+/// `bool_to_yesno(None)` both render `""`, matching
+/// `legacy_yesno_canonical(NULL)`.
+///
+/// Safe against the schema: `ht_rooms_new.room_clean BOOLEAN DEFAULT true`
+/// and `room_maintenance BOOLEAN DEFAULT false` are both NULLABLE
+/// (`init-db/init-hotelnew.sql`), and every canonical reader is NULL-tolerant
+/// (`repository::room::RoomRow` holds `Option<bool>`; `routes::hk` applies
+/// `COALESCE(r.room_clean, true)`; `routes::new_rooms` uses
+/// `unwrap_or(true)` / `unwrap_or(false)`).
+///
+/// (The comment this doc replaced claimed `room_use_count` was also a raw
+/// assignment "so a legacy 0 truly resets PG to 0". The conclusion holds but
+/// the mechanism named was wrong — the column is and always was
+/// `COALESCE($8, room_use_count)`. A legacy 0 resets PG because 0 is not
+/// NULL, and legacy declares `Room_Use_Count int NOT NULL DEFAULT 0`, so the
+/// NULL branch is unreachable in practice.)
+///
+/// The remaining `COALESCE($N, existing)` columns are the Track E2 (T1
+/// HIGH-3) mirror columns, where legacy declares NOT NULL DEFAULT and a NULL
+/// really does mean "not projected"; argument order follows the Bug A
+/// rationale in `sync::mappers::checkin::update_existing` and
+/// `sync::mappers::booking::update_existing`:
+///
+///   * `legacy_room_no` / `legacy_room_id_int` are denormalised legacy
+///     pointers — they must track the current MSSQL key. If the legacy app
+///     renumbered a room (rare but possible vendor maintenance), the pre-fix
+///     `COALESCE(existing, new)` would freeze the canonical denormalised
+///     values forever while the writeback path silently used the new legacy
+///     key. Flipped to `COALESCE($N, existing)` so a non-NULL new value
+///     overwrites; a transient NULL keeps the existing value.
+///   * `aggregate_id` stays write-once.
+const ROOM_UPDATE_SQL: &str = "UPDATE ht_rooms_new \
+        SET room_clean         = $1, \
+            room_maintenance   = $2::bool, \
+            room_notes         = $3, \
+            room_use_count     = COALESCE($8, room_use_count), \
+            room_x             = COALESCE($9, room_x), \
+            room_y             = COALESCE($10, room_y), \
+            room_group         = COALESCE($11, room_group), \
+            room_power_open    = COALESCE($12, room_power_open), \
+            room_power_close   = COALESCE($13, room_power_close), \
+            room_power_status  = COALESCE($14, room_power_status), \
+            room_polity        = COALESCE($15, room_polity), \
+            legacy_room_no     = COALESCE($4, legacy_room_no), \
+            legacy_room_id_int = COALESCE($5, legacy_room_id_int), \
+            aggregate_id       = COALESCE(aggregate_id, $6), \
+            updated_at         = NOW() \
+      WHERE room_id = $7";
+
 async fn apply_room_upsert(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     row: &dyn MappableRow,
@@ -361,53 +442,9 @@ async fn apply_room_upsert(
             let agg_id = ex
                 .aggregate_id
                 .unwrap_or_else(|| aggregate_uuid(AggregateKind::Room, ex.room_id));
-            // Track E2 (T1 HIGH-3) — write the newly-captured legacy
-            // columns. `COALESCE(new, old)` preserves PG-side state
-            // when the legacy column is NULL so we never blank a
-            // populated row, but accepts the new value when present.
-            // `room_use_count` uses raw assignment (not COALESCE) so a
-            // legacy 0 truly resets PG to 0; the running counter is
-            // the legacy app's authoritative state.
-            // `room_notes` ($3) also uses raw assignment (2026-06-11,
-            // audit P2): the CT projection always carries the current
-            // `Room_Details` value, so a legacy NULL is a genuine
-            // "notes cleared" transition — the old COALESCE could
-            // never converge it and the reconcile sweep flagged the
-            // row forever.
-            // COALESCE argument order: see Bug A rationale in
-            // `sync::mappers::checkin::update_existing` and
-            // `sync::mappers::booking::update_existing`.
-            //   * `legacy_room_no` and `legacy_room_id_int` are denormalised
-            //     legacy pointers — must track the current MSSQL key. If
-            //     the legacy app renumbered a room (rare but possible
-            //     vendor maintenance), the pre-fix `COALESCE(existing, new)`
-            //     would freeze the canonical denormalised values forever
-            //     while the writeback path silently used the new legacy
-            //     key. Flipped to `COALESCE($N, existing)` so a non-NULL
-            //     new value overwrites; a transient NULL keeps the
-            //     existing value (the projection-builder upstream never
-            //     emits NULL for these unless the legacy column is
-            //     genuinely missing).
-            //   * `aggregate_id` stays write-once.
-            sqlx::query(
-                "UPDATE ht_rooms_new \
-                    SET room_clean         = COALESCE($1, room_clean), \
-                        room_maintenance   = COALESCE($2::bool, room_maintenance), \
-                        room_notes         = $3, \
-                        room_use_count     = COALESCE($8, room_use_count), \
-                        room_x             = COALESCE($9, room_x), \
-                        room_y             = COALESCE($10, room_y), \
-                        room_group         = COALESCE($11, room_group), \
-                        room_power_open    = COALESCE($12, room_power_open), \
-                        room_power_close   = COALESCE($13, room_power_close), \
-                        room_power_status  = COALESCE($14, room_power_status), \
-                        room_polity        = COALESCE($15, room_polity), \
-                        legacy_room_no     = COALESCE($4, legacy_room_no), \
-                        legacy_room_id_int = COALESCE($5, legacy_room_id_int), \
-                        aggregate_id       = COALESCE(aggregate_id, $6), \
-                        updated_at         = NOW() \
-                  WHERE room_id = $7",
-            )
+            // Per-column assignment semantics (write-through vs COALESCE)
+            // and the #268 / audit-P2 rationale live on [`ROOM_UPDATE_SQL`].
+            sqlx::query(ROOM_UPDATE_SQL)
             .bind(new_clean)
             .bind(new_maintenance)
             .bind(&projected.room_details)
@@ -510,8 +547,14 @@ async fn apply_room_upsert(
     // edits silently UPSERT.
     let event = match (prior_clean, new_clean) {
         (Some(old), Some(new)) if old != new => Some(build_clean_event(agg_id, new)),
-        // Either the legacy column was NULL (no signal to act on) or
-        // the value didn't change. Idempotent skip.
+        // Either the legacy column was NULL/unrecognised, or the value
+        // didn't change. Event-skip only — the UPSERT above still WROTE
+        // `new_clean`, so a Some(_) → None transition clears canonical to
+        // NULL silently (#268). That asymmetry is deliberate: the
+        // clean/dirty event vocabulary has no "unknown" variant, and
+        // synthesising Dirty would be a lie the writeback path could echo.
+        // Nothing downstream depends on the event for correctness — it only
+        // drives the SSE room-status refresh.
         _ => None,
     };
 
@@ -779,6 +822,76 @@ mod tests {
         assert_eq!(legacy_yesno_to_bool(&None), None);
         assert_eq!(legacy_yesno_to_bool(&Some("maybe".to_string())), None);
         assert_eq!(legacy_yesno_to_bool(&Some(String::new())), None);
+    }
+
+    /// #268 regression pin — `room_clean` / `room_maintenance` must be
+    /// WRITE-THROUGH, never `COALESCE`d against the existing canonical value.
+    ///
+    /// With `COALESCE($1, room_clean)` a legacy NULL (or an unrecognised
+    /// literal, which [`legacy_yesno_to_bool`] collapses to `None`) left the
+    /// stale canonical boolean in place. `HT_Rooms` is `always_writes` — no
+    /// idempotency gate to blind — so the row never converged and the
+    /// reconcile sweep flagged it forever. `room_notes` had the identical bug
+    /// until 2026-06-11 (audit P2); all three now share one rule.
+    ///
+    /// Asserted on the SQL text because the runtime behaviour lives in
+    /// `tests/test_sync_phase52_integration.rs`, which is skipped whenever
+    /// `DATABASE_URL` is unreachable.
+    #[test]
+    fn room_update_writes_clean_and_maintenance_through() {
+        assert!(
+            ROOM_UPDATE_SQL.contains("room_clean         = $1,"),
+            "room_clean must be a plain write-through assignment (#268)"
+        );
+        assert!(
+            ROOM_UPDATE_SQL.contains("room_maintenance   = $2::bool,"),
+            "room_maintenance must be a plain write-through assignment (#268)"
+        );
+        assert!(
+            ROOM_UPDATE_SQL.contains("room_notes         = $3,"),
+            "room_notes must stay a plain write-through assignment (audit P2)"
+        );
+        // Belt-and-braces: no COALESCE may mention these three columns at
+        // all, in either argument position.
+        for col in ["room_clean", "room_maintenance", "room_notes"] {
+            assert!(
+                !ROOM_UPDATE_SQL.contains(&format!("COALESCE({col}")),
+                "COALESCE({col}, …) reintroduces the #268 non-convergence"
+            );
+            assert!(
+                !ROOM_UPDATE_SQL.contains(&format!(", {col})")),
+                "COALESCE(…, {col}) reintroduces the #268 non-convergence"
+            );
+        }
+    }
+
+    /// The write-through columns must not collide with the Track E2 mirror
+    /// columns, which legitimately keep `COALESCE($N, existing)` because
+    /// legacy declares them NOT NULL DEFAULT — a NULL there means "not
+    /// projected", not "cleared".
+    #[test]
+    fn room_update_keeps_coalesce_on_track_e2_mirror_columns() {
+        for col in [
+            "room_use_count",
+            "room_x",
+            "room_y",
+            "room_group",
+            "room_power_open",
+            "room_power_close",
+            "room_power_status",
+            "room_polity",
+            "legacy_room_no",
+            "legacy_room_id_int",
+        ] {
+            assert!(
+                ROOM_UPDATE_SQL.contains(&format!(", {col})")),
+                "{col} must keep COALESCE(new, existing)"
+            );
+        }
+        assert!(
+            ROOM_UPDATE_SQL.contains("aggregate_id       = COALESCE(aggregate_id, $6)"),
+            "aggregate_id must stay write-once"
+        );
     }
 
     #[test]

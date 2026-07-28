@@ -170,9 +170,17 @@ pub(crate) struct HashInput<S> {
     ///   with `cust_add_no` by the UPSERT, so it is gated by both;
     /// * a derived value — check-ins' effective checkout is
     ///   `cin_checkout_time` when set, else `cin_expected_checkout`, so
-    ///   BOTH terms must exist;
-    /// * a stage — check-ins' `legacy_room_no` is covered by the
-    ///   `rooms` set-comparison stage.
+    ///   BOTH terms must exist.
+    ///
+    /// What an alias must NOT be is a term of COARSER granularity than
+    /// the input. Check-ins' `legacy_room_no` used to cite the `rooms`
+    /// SET-comparison stage, but the input is the FIRST `HT_CheckIn_Ds`
+    /// row while the stage compares an unordered set: a delete-then-
+    /// reinsert that reorders a multi-room folio moved the hash at a
+    /// constant set, and the gate reported "matches" (issue #264, closed
+    /// by adding a header-level first-room comparator). When in doubt,
+    /// the alias must compare the SAME VALUE the `segment` closure
+    /// renders — that is the test a name has to pass here.
     ///
     /// Every such alias is an explicit, reviewable declaration. Silence
     /// is not an option: the enforcement test rejects an empty
@@ -322,9 +330,12 @@ pub fn reconcile_entity_contracts() -> Vec<EntityContract> {
         EntityContract {
             entity: "guest_registry",
             hash_inputs: guest_registry::hash_input_contract,
-            // The companion mapper adopts-or-UPSERTs unconditionally
-            // (`ON CONFLICT (guest_legacy_id) DO UPDATE` rewriting every
-            // mirrored column) — no `existing_matches` chain.
+            // The companion mapper adopts-or-UPSERTs with no
+            // `existing_matches` chain. Its preserve arm (#271) can skip
+            // the name write, but ONLY when the canonical render is
+            // byte-identical to the incoming `Cin_name` — i.e. it can
+            // never skip a write whose hashed segment differs, so
+            // `always_writes` stays honest for the invariant.
             gate_field_names: guest_registry::gate_field_names,
             always_writes: true,
         },
