@@ -985,7 +985,12 @@ INSERT INTO sync_status (entity_type) VALUES
     -- RECONCILE_MIRROR_PROBE_ENABLED). Same reason again: `record_error`
     -- UPDATEs by entity_type, so without this row a probe failure updates
     -- zero rows and leaves only a log line.
-    ('mirror_probe')
+    ('mirror_probe'),
+    -- Migration 083 — Phase 6-D payment-ledger per-folio probe (ships DARK
+    -- behind RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED). Same reason again:
+    -- without this row a probe failure updates zero rows and leaves only a
+    -- log line, and the success path has no consecutive_failures to reset.
+    ('payment_ledger_probe')
 ON CONFLICT (entity_type) DO NOTHING;
 
 -- Add source column to existing tables
@@ -2782,6 +2787,23 @@ ON CONFLICT (version) DO NOTHING;
 
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('082', '082_sync_status_mirror_probe.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- -----------------------------------------------------------------------------
+-- Migration 083 — `sync_status` row for the Phase 6-D payment-ledger probe
+-- (`entity_type = 'payment_ledger_probe'`). The row itself rides the
+-- `sync_status` INSERT above; this block only records the migration as applied.
+--
+-- No table, no index: like 082 the probe is detection-only and keeps no ack
+-- cache — it re-derives the MIN(ledger_legacy_id) coverage floor and both
+-- sides' per-folio aggregates live every tick. The row exists purely so
+-- `record_error` / `record_success`'s `UPDATE … WHERE entity_type =
+-- 'payment_ledger_probe'` matches something. See
+-- migrations/pg/083_sync_status_payment_ledger_probe.sql.
+-- -----------------------------------------------------------------------------
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('083', '083_sync_status_payment_ledger_probe.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================

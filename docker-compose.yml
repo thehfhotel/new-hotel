@@ -403,6 +403,39 @@ services:
       # calendar a business-key arm and a remediation path; only then does
       # it start recording.
       - RECONCILE_MIRROR_PROBE_ENABLED=${RECONCILE_MIRROR_PROBE_ENABLED:-false}
+      # Phase 6-D — payment-ledger probe: legacy HT_CheckIn_Pay vs canonical
+      # ht_payment_ledger, compared per FOLIO (Cin_No) on line count +
+      # itemized amount + receipt-deduped ACTIVE tender. The folio is the
+      # unit because the CT mapper DELETEs a Cin_No's lines and re-INSERTs
+      # the whole current set; the tender dedupe is the house convention
+      # (task #63) because iHOTEL replicates the tender split onto every
+      # line of a multi-line receipt. DETECTION ONLY: it records into
+      # ht_reconcile_log and writes nothing else — no ack cache, no new PG
+      # table, and the key is in neither FORCE_CONVERGE_VALUE_DRIFT_TABLES
+      # nor REINGEST_MISSING_PG_TABLES.
+      #
+      # SHIPS DARK. With this false, run_sync never calls the probe, so it
+      # issues zero MSSQL and zero PG queries. Enable HF VILLE FIRST, soak
+      # 48h, then HF Hotel — in an announced window.
+      #
+      # SCOPE: the legacy scan is floored at MIN(ledger_legacy_id) — the
+      # canonical mirror's own coverage boundary, derived, never configured
+      # — as a HAVING over the per-folio MIN, so a folio straddling the
+      # boundary is excluded whole rather than compared on a partial line
+      # set. Unfloored the first tick would weigh ~20k legacy folios against
+      # ~1.3k canonical ones.
+      #
+      # EXPECT AT HF HOTEL: exactly 19 rows on the first tick (2026-07-28
+      # read-only), all missing_pg, contiguous at the era boundary
+      # (CH26-004952…CH26-004971 minus CH26-004960) — folios whose payments
+      # the Track J7e backfill never reached, i.e. money the round report
+      # under-counts today. They are CLOSEABLE: re-drive with
+      # `docker compose run --rm backend backfill_payment_ledger` (bin
+      # `backfill_payment_ledger`) and the next auto-resolve sweep resolves
+      # them. Nothing closes them on its own, and the >72h escalation tier
+      # WILL fire if they are left, so pre-set
+      # LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_<SITE> or flip in a window.
+      - RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED=${RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED:-false}
       # Tracing log level. Default `hotel_backend=info,tower_http=info`
       # matches `main.rs::tracing_subscriber::EnvFilter::try_from_default_env`'s
       # fallback. Override at deploy time to crank up debug logging
@@ -641,6 +674,13 @@ services:
       # never read differently. Ships DARK; see the backend service for the
       # rollout and for what the first enabled tick is expected to say.
       - RECONCILE_MIRROR_PROBE_ENABLED=${RECONCILE_MIRROR_PROBE_ENABLED:-false}
+      # Phase 6-D payment-ledger probe — INERT in this process for the same
+      # reason as the knobs above (only a process that runs a reconcile reads
+      # it, and this HF Hotel sync worker leaves WORKER_RECONCILE_ENABLED at
+      # its default-false). Carried here so the two HF Hotel processes never
+      # read differently. Ships DARK; see the backend service for the rollout
+      # and for what the first enabled tick is expected to open.
+      - RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED=${RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED:-false}
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,sync=info}
     secrets:
       - db_password
@@ -822,6 +862,19 @@ services:
       # close such a row and a hand-resolved one re-mints itself. It starts
       # recording only when plan 6-D gives it a closure path.
       - RECONCILE_MIRROR_PROBE_ENABLED=${HFVILLE_RECONCILE_MIRROR_PROBE_ENABLED:-false}
+      # Phase 6-D — payment-ledger per-folio probe (HT_CheckIn_Pay ↔
+      # ht_payment_ledger). DETECTION ONLY; writes nothing but
+      # ht_reconcile_log — no ack cache and no new PG table. This worker runs
+      # Ville's reconcile, so the knob is LIVE here — and Ville is the canary:
+      # enable HERE first, soak 48h, then flip the backend (HF Hotel).
+      # Ships DARK. Ville is EXACTLY converged today (2026-07-28, read-only:
+      # 1016 in-era folios, identical line counts, itemized amounts AND
+      # receipt-deduped tenders on both sides), so a green soak here is a
+      # clean baseline rather than proof the detector fires — HF Hotel is
+      # where the 19 known missing_pg folios live. Watch for a QUIET ledger;
+      # anything new here is a genuine mirror gap in the money the round
+      # report reads, remediable with the backfill_payment_ledger bin.
+      - RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED=${HFVILLE_RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED:-false}
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,sync=info}
     secrets:
       - db_password

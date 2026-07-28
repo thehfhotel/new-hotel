@@ -41,6 +41,11 @@
 //!    money total) with a per-PK diff only on mismatch — Phase 6-C, see
 //!    [`crate::scheduler::mirror_probe`]. Also **DARK by default**:
 //!    `RECONCILE_MIRROR_PROBE_ENABLED=true`.
+//! 8. Payment ledger: `HT_CheckIn_Pay` vs canonical `ht_payment_ledger`,
+//!    compared per FOLIO (`Cin_No`) on line count + itemized amount +
+//!    receipt-deduped active tender — Phase 6-D, see
+//!    [`crate::scheduler::payment_ledger_probe`]. Also **DARK by default**:
+//!    `RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED=true`.
 //!
 //! Pre-v2.63.0 this job compared MSSQL hashes against `ht_*_legacy.sync_hash`
 //! (the demoted mirror tables). After the 2026-04-28 cutover those mirrors
@@ -71,6 +76,10 @@ use crate::db::{DbPool, PgPool};
 // canonical fields by hand.
 use crate::notifications::slack::{SlackClient, SlackMessage};
 use crate::outbox::event::DomainEvent;
+// Phase 6-D: one literal for the probe's `ht_reconcile_log.table_name`, its
+// `sync_status.entity_type` and its `RECONCILE_RESOLVABLE_TABLES` entry, so
+// the three can never drift apart.
+use crate::scheduler::payment_ledger_probe::PAYMENT_LEDGER_PROBE_KEY;
 use crate::sync::change_op::ChangeOp;
 // Single-sourced `|` separator, shared with the mapper-side descriptor
 // tables that pin the gate ⊇ reconcile-hash invariant.
@@ -326,6 +335,52 @@ pub async fn run_sync(
             Err(e) => {
                 tracing::error!(site = %site_id, "[Sync] Mirror probe failed: {}", e);
                 record_error(pg_pool, "mirror_probe", &e.to_string()).await;
+            }
+        }
+    }
+
+    // Phase 6-D: per-FOLIO payment-ledger probe (`HT_CheckIn_Pay` ↔
+    // `ht_payment_ledger`). SHIPPED DARK —
+    // `RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED` defaults false on every
+    // service, and the check lives HERE (not inside the probe) so a disabled
+    // probe issues literally zero MSSQL/PG queries. Runs AFTER the 6-A
+    // `payments` arm on purpose: that arm reconciles the RECEIPT artefact
+    // (`ht_payments`), this one the per-line tender ledger underneath it, so
+    // an operator reading a tick's log sees the receipt-level answer before
+    // the line-level one.
+    //
+    // Same `sync_status` requirement as 6-C: `record_error` is an
+    // `UPDATE … WHERE entity_type = $2`, so without the
+    // `entity_type = 'payment_ledger_probe'` row (migration 083, and
+    // `init-db/init-hotelnew.sql` for a fresh database) a probe failure
+    // updates zero rows and leaves only a log line. BOTH outcomes are
+    // written, because `record_success` is the ONLY thing that zeroes
+    // `consecutive_failures`, clears `last_error`/`last_error_at` and stamps
+    // `last_sync_at`.
+    if reconcile_payment_ledger_probe_enabled() {
+        match crate::scheduler::payment_ledger_probe::run_payment_ledger_probe(
+            legacy_pool,
+            pg_pool,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                // added=0 (the probe writes no canonical rows),
+                // updated=`recorded` (divergence rows written this tick),
+                // unchanged=`converged` (folios that agreed).
+                record_success(
+                    pg_pool,
+                    PAYMENT_LEDGER_PROBE_KEY,
+                    0,
+                    outcome.recorded as i32,
+                    outcome.converged as i32,
+                    outcome.duration_ms,
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::error!(site = %site_id, "[Sync] Payment-ledger probe failed: {}", e);
+                record_error(pg_pool, PAYMENT_LEDGER_PROBE_KEY, &e.to_string()).await;
             }
         }
     }
@@ -2942,8 +2997,10 @@ fn parse_booking_legacy_pk(legacy_pk: &str) -> (&str, &str) {
 /// `debug_assert!` — the assert only fires for listed-but-undispatched
 /// names — and that is precisely why it was not done: the rows would sit
 /// open forever and, being selected by age alone, would eventually own the
-/// sweep's whole 500-row batch.
-/// `gate_guard::tests::every_resolvable_table_is_a_contract_entity_or_a_mirror_probe`
+/// sweep's whole 500-row batch. Phase 6-D appends the payment-ledger probe
+/// key on exactly the same terms (`payment_ledger_probe::is_payment_ledger_probe`
+/// backs both dispatch arms).
+/// `gate_guard::tests::every_resolvable_table_is_a_contract_entity_or_a_probe`
 /// keeps the two populations explicit.
 pub(crate) const RECONCILE_RESOLVABLE_TABLES: &[&str] = &[
     "customers",
@@ -2967,6 +3024,14 @@ pub(crate) const RECONCILE_RESOLVABLE_TABLES: &[&str] = &[
     // dispatched so an aggregate row written by an older binary still has a
     // way to converge instead of sitting open and unrecognised.
     "mirror_ht_room_calendar",
+    // Phase 6-D payment-ledger probe. Same population as the 6-C probes (not
+    // an entity contract — `mirror_payment_ledger` DELETEs the folio and
+    // re-INSERTs it unconditionally, so there is no idempotency gate for a
+    // hash to be a superset of), and resolvable for the same reason: its rows
+    // ARE closeable (re-drive with the `backfill_payment_ledger` bin, then the
+    // sweep sees equal hashes), so they must never be left un-dispatched.
+    // Pinned against `PAYMENT_LEDGER_PROBE_KEY` by a unit test below.
+    "payment_ledger_probe",
 ];
 
 /// Re-compute the canonical PG hash for a single `ht_reconcile_log`
@@ -3085,6 +3150,12 @@ async fn compute_current_pg_hash(
                 .expect("guard just matched");
             crate::scheduler::mirror_probe::resolve_pg_hash(pg_pool, probe, legacy_pk).await
         }
+        // Phase 6-D. `legacy_pk` is either a `Cin_No` or the `<aggregate>`
+        // sentinel. Never `Ok(None)`: an absent folio hashes to
+        // `folio_absent_hash` so a folio deleted on both sides converges.
+        t if crate::scheduler::payment_ledger_probe::is_payment_ledger_probe(t) => {
+            crate::scheduler::payment_ledger_probe::resolve_pg_hash(pg_pool, legacy_pk).await
+        }
         _ => {
             debug_assert!(
                 !RECONCILE_RESOLVABLE_TABLES.contains(&table_name),
@@ -3156,6 +3227,18 @@ async fn compute_current_legacy_hash(
                 legacy_pool,
                 pg_pool,
                 probe,
+                legacy_pk,
+            )
+            .await
+        }
+        // Phase 6-D — payment-ledger probe. Sibling of the
+        // `compute_current_pg_hash` arm; same absent-is-a-real-hash contract,
+        // and it reads `pg_pool` for the same reason (the `<aggregate>` row's
+        // coverage floor is a `MIN` over the CANONICAL side).
+        t if crate::scheduler::payment_ledger_probe::is_payment_ledger_probe(t) => {
+            crate::scheduler::payment_ledger_probe::resolve_legacy_hash(
+                legacy_pool,
+                pg_pool,
                 legacy_pk,
             )
             .await
@@ -3535,6 +3618,45 @@ fn reconcile_mirror_probe_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Phase 6-D — is the per-folio payment-ledger probe enabled?
+///
+/// Default **OFF** (ship dark). When unset / not `"true"`, [`run_sync`]
+/// never calls
+/// [`crate::scheduler::payment_ledger_probe::run_payment_ledger_probe`], so
+/// the probe issues ZERO MSSQL and ZERO PG queries and `ht_reconcile_log`
+/// can never gain a `payment_ledger_probe` row — behaviour is byte-for-byte
+/// identical to before the probe existed. The resolve dispatches are inert
+/// without detection, and the probe has no ack table of its own (nothing to
+/// seed).
+///
+/// Rollout is Ville-first → 48h soak → HF Hotel, in an announced window.
+/// Live read-only counts 2026-07-28 say what to expect, once the
+/// `MIN(ledger_legacy_id)` coverage floor is applied: **HF Ville is EXACTLY
+/// converged** (1,016 in-era folios, identical line counts, itemized amounts
+/// AND receipt-deduped tenders on both sides), and **HF Hotel opens exactly
+/// 19 rows**, all `missing_pg`, all contiguous at the era boundary
+/// (`CH26-004952`…`CH26-004971`, minus `CH26-004960`) — folios whose
+/// payments the Track J7e backfill never reached, i.e. money
+/// `round_report` under-counts today. Zero `value` and zero
+/// `missing_mssql` at either site.
+///
+/// Those 19 are CLOSEABLE, which is why this arm records rather than merely
+/// observes (contrast `mirror_ht_room_calendar`): re-drive them with
+/// `cargo run --release --bin backfill_payment_ledger` and the next
+/// auto-resolve sweep sees equal hashes. But be honest about the interim —
+/// `payment_ledger_probe` is in NEITHER self-heal list, so nothing closes
+/// them on its own and the >72h `:bangbang:` escalation tier WILL fire if
+/// they are left. Pre-set `LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_<SITE>`
+/// or flip in an announced window.
+///
+/// The `== "true"` comparison is strict on purpose, matching every other
+/// feature flag in the sync path. A flag flip is never "just config".
+fn reconcile_payment_ledger_probe_enabled() -> bool {
+    env::var("RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
 /// Issue #204 (bug #2) — minimum age (seconds) an unresolved
 /// `ht_reconcile_log` row must have before the force-converge arm will touch
 /// it. A younger row is likely just waiting on an in-flight CT event, so we
@@ -3894,6 +4016,11 @@ fn reconcile_table_fk_rank(table_name: &str) -> u8 {
         // ordering. Last, so no probe row can delay a repairable entity
         // row's turn in the 500-row batch.
         t if crate::scheduler::mirror_probe::probe_for_table(t).is_some() => 6,
+        // Phase 6-D payment-ledger probe. OBSERVED, never healed (it is in
+        // neither self-heal list), so its rank only decides sweep ordering —
+        // last, alongside the 6-C probes, so no probe row can delay a
+        // repairable entity row's turn in the 500-row batch.
+        t if crate::scheduler::payment_ledger_probe::is_payment_ledger_probe(t) => 6,
         other => {
             // A resolvable entity that falls through here is unranked, so
             // it sorts after everything and its FK parents lose their
@@ -10523,6 +10650,49 @@ mod tests {
                 true
             ));
         }
+    }
+
+    /// Phase 6-D. The payment-ledger probe registers through the SAME three
+    /// mechanisms 6-C chose — resolvable, ranked, dispatched — because a
+    /// probe row that nothing can close sits open forever and, being
+    /// selected by age alone, eventually owns the sweep's whole 500-row
+    /// batch (the 2026-05-18 `rooms` failure mode). Note the wildcard
+    /// `debug_assert!` would NOT have caught an omission here: it only fires
+    /// for listed-but-undispatched names.
+    #[test]
+    fn payment_ledger_probe_is_resolvable_ranked_last_and_never_self_healed() {
+        assert!(
+            RECONCILE_RESOLVABLE_TABLES.contains(&PAYMENT_LEDGER_PROBE_KEY),
+            "the payment-ledger probe is not in RECONCILE_RESOLVABLE_TABLES"
+        );
+        assert!(
+            reconcile_table_fk_rank("guest_registry")
+                < reconcile_table_fk_rank(PAYMENT_LEDGER_PROBE_KEY),
+            "the probe must sort after every healable entity"
+        );
+        assert!(
+            reconcile_table_fk_rank(PAYMENT_LEDGER_PROBE_KEY)
+                < reconcile_table_fk_rank("something_new"),
+            "the probe must still be ranked ahead of the unranked wildcard"
+        );
+        // DETECTION ONLY. Per-arm self-heal extensions come after this arm's
+        // detection has soaked in production, never in the same change.
+        assert!(!FORCE_CONVERGE_VALUE_DRIFT_TABLES.contains(&PAYMENT_LEDGER_PROBE_KEY));
+        assert!(!REINGEST_MISSING_PG_TABLES.contains(&PAYMENT_LEDGER_PROBE_KEY));
+        assert!(!force_converge_value_drift_eligible(
+            PAYMENT_LEDGER_PROBE_KEY,
+            Some("a"),
+            Some("b"),
+            f64::MAX,
+            true
+        ));
+        assert!(!reingest_missing_pg_eligible(
+            PAYMENT_LEDGER_PROBE_KEY,
+            Some("a"),
+            None,
+            f64::MAX,
+            true
+        ));
     }
 
     /// The live FK shape: booking `R002066` references customer `C2413`.

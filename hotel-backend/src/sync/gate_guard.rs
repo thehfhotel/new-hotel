@@ -536,39 +536,45 @@ mod tests {
     ///
     /// * **entity arms** — a CT mapper projects them, so they owe the
     ///   gate ⊇ hash invariant and must carry an [`EntityContract`];
-    /// * **mirror probes** — `scheduler::mirror_probe` compares opaque
-    ///   pass-through mirrors by aggregate. Their mappers DELETE+INSERT
+    /// * **probes** — `scheduler::mirror_probe` (Phase 6-C) compares opaque
+    ///   pass-through mirrors by aggregate, and
+    ///   `scheduler::payment_ledger_probe` (Phase 6-D) compares
+    ///   `ht_payment_ledger` per folio. Their mappers DELETE+INSERT
     ///   unconditionally, so there is no idempotency gate for a hash to be
     ///   a superset of, and a contract would be vacuous. They are still
     ///   RESOLVABLE (both `compute_current_*_hash` dispatches reach
-    ///   `mirror_probe::probe_for_table`), which is what keeps their rows
-    ///   closeable.
+    ///   `mirror_probe::probe_for_table` /
+    ///   `payment_ledger_probe::is_payment_ledger_probe`), which is what
+    ///   keeps their rows closeable.
     ///
     /// Anything in neither population is a name someone added to the list
     /// without deciding which it is — the failure this test exists to
     /// prevent. Note the omission it CANNOT catch is already covered
     /// elsewhere: a probe missing from the list is caught by
-    /// `scheduler::sync::tests::resolvable_tables_lists_every_mirror_probe_key`.
+    /// `scheduler::sync::tests::resolvable_tables_lists_every_mirror_probe_key`
+    /// and its 6-D sibling
+    /// `payment_ledger_probe_is_resolvable_ranked_last_and_never_self_healed`.
     #[test]
-    fn every_resolvable_table_is_a_contract_entity_or_a_mirror_probe() {
+    fn every_resolvable_table_is_a_contract_entity_or_a_probe() {
         let entities: HashSet<&str> = reconcile_entity_contracts()
             .iter()
             .map(|c| c.entity)
             .collect();
-        let probes: HashSet<&str> = crate::scheduler::mirror_probe::mirror_probe_keys()
+        let mut probes: HashSet<&str> = crate::scheduler::mirror_probe::mirror_probe_keys()
             .into_iter()
             .collect();
+        probes.insert(crate::scheduler::payment_ledger_probe::PAYMENT_LEDGER_PROBE_KEY);
         for table in crate::scheduler::sync::RECONCILE_RESOLVABLE_TABLES {
             let is_entity = entities.contains(table);
             let is_probe = probes.contains(table);
             assert!(
                 is_entity ^ is_probe,
                 "`{table}` is listed as resolvable but is neither a registered \
-                 EntityContract nor a registered mirror probe (or claims to be \
-                 both). Every resolvable table must be exactly one: an entity \
-                 arm owes the gate ⊇ hash invariant, a mirror probe owes an \
-                 aggregate comparison — and nothing may be resolvable without \
-                 owing either."
+                 EntityContract nor a registered probe (or claims to be both). \
+                 Every resolvable table must be exactly one: an entity arm owes \
+                 the gate ⊇ hash invariant, a probe owes an aggregate \
+                 comparison — and nothing may be resolvable without owing \
+                 either."
             );
         }
     }
