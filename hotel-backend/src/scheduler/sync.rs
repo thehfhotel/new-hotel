@@ -71,7 +71,30 @@ use crate::sync::row::MappableRow;
 /// floor (which should be 0) and below the noise level a genuine bulk
 /// catch-up scenario would produce. Override at deploy time with
 /// `LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD`.
+///
+/// **This is a blast-radius dial, not a target** (2026-07-28 alert
+/// inventory). 21 days of production data peak at 33 unresolved rows/hr
+/// for a single table, so the burst alert has never fired — that is the
+/// designed state. Do NOT "tune it down until it fires": the level
+/// digest below already covers the single-row / slow-burn case, and this
+/// threshold exists purely to catch a bulk regression (mapper crash,
+/// schema break, retention overflow) before it floods the log. Lowering
+/// it converts a silent-by-design tripwire into a recurring digest.
 pub const DEFAULT_DRIFT_ALERT_THRESHOLD: i64 = 50;
+
+/// Default cooldown for the edge-triggered burst alert
+/// ([`check_drift_and_alert`]), per `(site, table)`.
+///
+/// 2026-07-28 alert inventory, defect C5: the burst alert had NO cooldown
+/// at all. Above threshold it re-fired on every 15-min reconcile tick,
+/// and HF Ville runs a second independent emitter (the worker reconcile
+/// behind `WORKER_RECONCILE_ENABLED`), so a sustained burst could produce
+/// ~8 identical messages/hour/table. One hour matches the alert's own
+/// rolling observation window, so each surviving message covers a
+/// distinct hour of observations instead of restating the same window
+/// four times. Override with `LEGACY_RECONCILE_BURST_COOLDOWN_HOURS`
+/// (per-site: `..._<SITE_ID_UPPER>`).
+pub const DEFAULT_BURST_ALERT_COOLDOWN_HOURS: i64 = 1;
 
 /// Track D / T7 HIGH-1 — level-triggered drift digest cooldown (per
 /// table). The edge-triggered alert above fires on a rolling-window
@@ -81,8 +104,30 @@ pub const DEFAULT_DRIFT_ALERT_THRESHOLD: i64 = 50;
 /// `LEVEL_DRIFT_COOLDOWN`. The two are complementary: the edge alert
 /// catches bulk regressions, the level alert catches single-row
 /// divergences that never trip 50/hr but still represent stuck state.
-pub const LEVEL_DRIFT_STALE_INTERVAL_HOURS: i64 = 4;
-pub const LEVEL_DRIFT_COOLDOWN_HOURS: i64 = 24;
+///
+/// **Env-overridable since 2026-07-28** (alert inventory, defect A2):
+/// these were compiled-in `const`s, so retuning the ONE alert this
+/// channel actually receives required a full backend deploy. Resolved
+/// per tick by [`level_drift_thresholds_from_env`] with the standard
+/// per-site → global → default chain. Defaults are unchanged.
+pub const DEFAULT_LEVEL_DRIFT_STALE_INTERVAL_HOURS: i64 = 4;
+pub const DEFAULT_LEVEL_DRIFT_COOLDOWN_HOURS: i64 = 24;
+
+/// Second, higher staleness threshold at which the level digest changes
+/// its title and tone from "unconverged" to "will not self-heal".
+///
+/// 2026-07-28 alert inventory, defect A1: day 1 and day 16 of the
+/// 16-day incident produced byte-identical Slack text on a fixed 24h
+/// rhythm — the fastest way to train an operator to dismiss an alert.
+/// Past this threshold the digest escalates under its own cooldown key
+/// ([`escalated_cooldown_key`]) so the transition is announced
+/// immediately instead of waiting out the primary 24h window.
+///
+/// 72h = three consecutive daily digests ignored. By then the
+/// auto-resolve sweep has had ~288 chances to close the row; it is not
+/// going to, and the fix is a re-ingest / `--bootstrap`, not patience.
+/// Override with `LEVEL_DRIFT_ESCALATE_HOURS` (per-site: `..._<SITE>`).
+pub const DEFAULT_LEVEL_DRIFT_ESCALATE_HOURS: i64 = 72;
 
 /// Default per-tick CT watcher lag thresholds. Resolved at runtime via
 /// [`ct_lag_thresholds_from_env`]. The version threshold catches a
@@ -247,13 +292,22 @@ pub async fn run_sync(
 ///      all sites that don't have a per-site override.
 ///   3. [`DEFAULT_DRIFT_ALERT_THRESHOLD`] — compiled-in fallback (50).
 fn drift_alert_threshold_from_env(site_id: &str) -> i64 {
-    let per_site_var = format!(
-        "LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_{}",
-        site_id.to_uppercase()
-    );
-    parse_threshold_env(&per_site_var)
-        .or_else(|| parse_threshold_env("LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD"))
-        .unwrap_or(DEFAULT_DRIFT_ALERT_THRESHOLD)
+    threshold_from_env(
+        "LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD",
+        site_id,
+        DEFAULT_DRIFT_ALERT_THRESHOLD,
+    )
+}
+
+/// Per-`(site, table)` cooldown for the edge-triggered burst alert.
+/// Same resolution chain as [`drift_alert_threshold_from_env`], default
+/// [`DEFAULT_BURST_ALERT_COOLDOWN_HOURS`].
+fn burst_cooldown_hours_from_env(site_id: &str) -> i64 {
+    threshold_from_env(
+        "LEGACY_RECONCILE_BURST_COOLDOWN_HOURS",
+        site_id,
+        DEFAULT_BURST_ALERT_COOLDOWN_HOURS,
+    )
 }
 
 /// Inner helper: parse a single env var into a positive `i64` threshold.
@@ -275,6 +329,187 @@ fn parse_threshold_env(var_name: &str) -> Option<i64> {
             }
         },
         Err(_) => None,
+    }
+}
+
+/// Generalisation of the resolution order baked into
+/// [`drift_alert_threshold_from_env`]: per-site override, then global,
+/// then the compiled-in default. Kept as one helper so every knob in
+/// this module resolves identically instead of each one re-spelling the
+/// `or_else` chain.
+fn threshold_from_env(base_var: &str, site_id: &str, default: i64) -> i64 {
+    let per_site_var = format!("{base_var}_{}", site_id.to_uppercase());
+    parse_threshold_env(&per_site_var)
+        .or_else(|| parse_threshold_env(base_var))
+        .unwrap_or(default)
+}
+
+/// Resolved level-drift digest thresholds for one reconcile tick.
+/// Produced by [`level_drift_thresholds_from_env`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LevelDriftThresholds {
+    /// A row unresolved for longer than this is "stale" and eligible for
+    /// the `:warning:` digest. `LEVEL_DRIFT_STALE_INTERVAL_HOURS`.
+    pub stale_hours: i64,
+    /// One digest per `(site, table)` per this many hours.
+    /// `LEVEL_DRIFT_COOLDOWN_HOURS`.
+    pub cooldown_hours: i64,
+    /// Oldest-row age at which the digest escalates to
+    /// "will not self-heal". `LEVEL_DRIFT_ESCALATE_HOURS`.
+    pub escalate_hours: i64,
+}
+
+impl LevelDriftThresholds {
+    /// Cooldown as a `Duration`, for [`cooldown_elapsed`].
+    fn cooldown(&self) -> std::time::Duration {
+        std::time::Duration::from_secs((self.cooldown_hours * 3600) as u64)
+    }
+}
+
+/// Resolve the level-drift digest thresholds from env (defect A2 of the
+/// 2026-07-28 alert inventory: these used to be compiled-in `const`s, so
+/// retuning the only alert this channel actually receives cost a deploy).
+///
+/// Same per-site → global → default chain as
+/// [`drift_alert_threshold_from_env`], via [`threshold_from_env`]:
+///   1. `LEVEL_DRIFT_STALE_INTERVAL_HOURS_<SITE_ID_UPPER>` etc.
+///   2. `LEVEL_DRIFT_STALE_INTERVAL_HOURS` etc.
+///   3. the `DEFAULT_LEVEL_DRIFT_*` constants.
+///
+/// Non-numeric / non-positive values are ignored with a warning by
+/// [`parse_threshold_env`], so an operator typo degrades to the previous
+/// tier rather than to zero.
+pub fn level_drift_thresholds_from_env(site_id: &str) -> LevelDriftThresholds {
+    let stale_hours = threshold_from_env(
+        "LEVEL_DRIFT_STALE_INTERVAL_HOURS",
+        site_id,
+        DEFAULT_LEVEL_DRIFT_STALE_INTERVAL_HOURS,
+    );
+    let cooldown_hours = threshold_from_env(
+        "LEVEL_DRIFT_COOLDOWN_HOURS",
+        site_id,
+        DEFAULT_LEVEL_DRIFT_COOLDOWN_HOURS,
+    );
+    let mut escalate_hours = threshold_from_env(
+        "LEVEL_DRIFT_ESCALATE_HOURS",
+        site_id,
+        DEFAULT_LEVEL_DRIFT_ESCALATE_HOURS,
+    );
+    // An escalation threshold at or below the stale threshold would make
+    // EVERY stale table escalate on its first digest, collapsing the two
+    // tiers back into one voice — the exact defect this is fixing. Clamp
+    // loudly rather than silently degrade.
+    if escalate_hours <= stale_hours {
+        tracing::warn!(
+            site = %site_id,
+            escalate_hours,
+            stale_hours,
+            "[Sync] LEVEL_DRIFT_ESCALATE_HOURS must exceed the stale interval; \
+             clamping to stale + 1h"
+        );
+        escalate_hours = stale_hours + 1;
+    }
+    LevelDriftThresholds {
+        stale_hours,
+        cooldown_hours,
+        escalate_hours,
+    }
+}
+
+/// Severity tier of one table's level-drift digest, decided purely from
+/// the age of its OLDEST unresolved `ht_reconcile_log` row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LevelDriftSeverity {
+    /// Past the stale interval, below the escalation threshold. The
+    /// familiar `:warning:` digest — "the sweep has not closed this yet".
+    Stale,
+    /// At or past the escalation threshold. Re-titled and re-toned: the
+    /// row is not going to converge on its own and needs a re-ingest or
+    /// `--bootstrap`. Rides its own cooldown key so the transition is
+    /// announced immediately rather than waiting out the primary window.
+    Escalated,
+}
+
+/// Pure classifier for [`LevelDriftSeverity`].
+///
+/// Boundary is inclusive (`>=`): an oldest-row age of exactly
+/// `escalate_hours` escalates. The caller floors the age to whole hours
+/// in SQL, so `>= 72` means "at least 72h old" with no rounding-up risk.
+pub fn level_drift_severity(oldest_age_hours: i64, escalate_hours: i64) -> LevelDriftSeverity {
+    if oldest_age_hours >= escalate_hours {
+        LevelDriftSeverity::Escalated
+    } else {
+        LevelDriftSeverity::Stale
+    }
+}
+
+/// Namespace separator for cooldown keys in
+/// `ht_level_drift_alert_cooldowns` that are NOT canonical entity names.
+///
+/// The cooldown table is keyed `(site_id, table_name)` and is shared by
+/// four emitters: the reconcile digest (real entity names — `bookings`,
+/// `customers`), the stale-checkin tripwire (the bare
+/// [`STALE_CHECKIN_COOLDOWN_KEY`] sentinel), `bin/sync.rs`'s
+/// retention-overflow pages (`ct_retention_overflow:<table>`), and now
+/// the burst alert and escalation tier here. Anything carrying this
+/// separator is by construction not an entity name, which is what makes
+/// the collision impossible rather than merely unlikely.
+const COOLDOWN_KEY_NAMESPACE_SEP: char = ':';
+
+/// Cooldown key for the ESCALATED tier of the level digest. Mirrors the
+/// `ct_retention_overflow:<table>` shape in `bin/sync.rs` so escalation
+/// keys can never collide with a canonical entity name — critically,
+/// `escalated:bookings` must never be mistaken for the table `bookings`
+/// by the all-clear path.
+pub fn escalated_cooldown_key(table: &str) -> String {
+    format!("escalated{COOLDOWN_KEY_NAMESPACE_SEP}{table}")
+}
+
+/// Cooldown key for the edge-triggered burst alert
+/// ([`check_drift_and_alert`]). Same namespacing rationale as
+/// [`escalated_cooldown_key`].
+pub fn burst_cooldown_key(table: &str) -> String {
+    format!("burst{COOLDOWN_KEY_NAMESPACE_SEP}{table}")
+}
+
+/// How an alert actually reached (or failed to reach) an operator on a
+/// given tick. Feeds [`cooldown_should_be_marked`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertDelivery {
+    /// Slack accepted the POST.
+    Sent,
+    /// Slack is not configured for this deployment; the `tracing` line IS
+    /// the delivery channel, so the cooldown still applies (otherwise the
+    /// log repeats every 15 minutes).
+    LoggedOnly,
+    /// Slack was configured and the POST failed.
+    Failed,
+}
+
+impl AlertDelivery {
+    /// Classify a `SlackClient::send_message` outcome. `None` = no client
+    /// configured.
+    fn from_send(result: Option<bool>) -> Self {
+        match result {
+            None => AlertDelivery::LoggedOnly,
+            Some(true) => AlertDelivery::Sent,
+            Some(false) => AlertDelivery::Failed,
+        }
+    }
+}
+
+/// Pure decision function: should this tick burn the cooldown?
+///
+/// 2026-07-28 alert inventory, defect A3: every cooldown in this module
+/// was marked BEFORE the Slack POST (and before the `slack.is_some()`
+/// check), so a webhook outage silenced the table for a full 24h anyway
+/// — and the paired all-clear could later fire as the closure of an
+/// alert nobody ever received. A failed send must leave the cooldown
+/// untouched so the next 15-min tick retries.
+pub fn cooldown_should_be_marked(delivery: AlertDelivery) -> bool {
+    match delivery {
+        AlertDelivery::Sent | AlertDelivery::LoggedOnly => true,
+        AlertDelivery::Failed => false,
     }
 }
 
@@ -311,6 +546,18 @@ pub fn tables_breaching_threshold(counts: &[(String, i64)], threshold: i64) -> V
 /// edge-trigger loses no observability. The hourly alert is now scoped
 /// to kinds where re-detection actually means something changed:
 /// `value`, `missing_pg`, `missing_mssql`.
+///
+/// **Per-table cooldown** (2026-07-28 alert inventory, defect C5): this
+/// alert previously had none, so while a table stayed above threshold it
+/// re-fired every 15-min tick — doubled on HF Ville, whose worker
+/// reconcile is a second independent emitter of the same message. The
+/// cooldown reuses the durable `ht_level_drift_alert_cooldowns` table
+/// under the namespaced [`burst_cooldown_key`], defaulting to
+/// [`DEFAULT_BURST_ALERT_COOLDOWN_HOURS`]. Note the eligibility read and
+/// the mark are not one atomic claim (unlike `bin/sync.rs`'s retention
+/// pages): the two emitters tick independently minutes apart, so the
+/// residual race is a single duplicate message — cheaper than trading
+/// away the mark-on-successful-send property below.
 async fn check_drift_and_alert(pg_pool: &PgPool, slack: Option<&SlackClient>, site_id: &str) {
     let threshold = drift_alert_threshold_from_env(site_id);
 
@@ -349,7 +596,8 @@ async fn check_drift_and_alert(pg_pool: &PgPool, slack: Option<&SlackClient>, si
         return;
     }
 
-    // Always log; Slack is opportunistic.
+    // Always log every breach; the cooldown below throttles Slack only.
+    // An operator grepping the logs during an incident wants each tick.
     for (table, count) in &breaches {
         tracing::warn!(
             site = %site_id,
@@ -360,33 +608,71 @@ async fn check_drift_and_alert(pg_pool: &PgPool, slack: Option<&SlackClient>, si
         );
     }
 
-    let Some(slack) = slack else {
+    // Defect C5 — per-table cooldown so a sustained burst doesn't restate
+    // the same rolling window every 15 minutes (x2 emitters on HF Ville).
+    let cooldown_hours = burst_cooldown_hours_from_env(site_id);
+    let cooldown = std::time::Duration::from_secs((cooldown_hours * 3600) as u64);
+    let mut to_alert: Vec<(String, i64)> = Vec::new();
+    for (table, count) in &breaches {
+        if level_alert_eligible_pg(pg_pool, site_id, &burst_cooldown_key(table), cooldown).await {
+            to_alert.push((table.clone(), *count));
+        } else {
+            tracing::debug!(
+                site = %site_id,
+                table,
+                count,
+                cooldown_hours,
+                "[Sync] Drift burst alert suppressed by cooldown"
+            );
+        }
+    }
+    if to_alert.is_empty() {
+        return;
+    }
+
+    let delivery = if let Some(slack) = slack {
+        let body = to_alert
+            .iter()
+            .map(|(t, n)| format!("• `{t}`: {n} unresolved rows in last hour"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let msg = SlackMessage::with_site_text(
+            site_id,
+            format!(
+                ":rotating_light: *Sync lag burst — threshold exceeded* :rotating_light:\n\
+                 The reconcile sweep observed more than {threshold} unconverged \
+                 `ht_reconcile_log` row(s) for the following table(s) in the last hour. \
+                 Most clear on their own as the CT watcher / writeback catch up; this \
+                 alert surfaces a burst that may indicate a real backlog:\n\
+                 {body}\n\
+                 _Investigate via `docs/runbook-sync.md` §9 (Phase 6 drift alert). \
+                 Per-table cooldown {cooldown_hours}h — the log line still fires every \
+                 tick._"
+            ),
+        );
+        AlertDelivery::from_send(Some(slack.send_message(&msg).await))
+    } else {
         tracing::info!(
             site = %site_id,
             "[Sync] Slack not configured; drift alert logged only ({} table(s) breaching)",
-            breaches.len()
+            to_alert.len()
         );
-        return;
+        AlertDelivery::LoggedOnly
     };
 
-    let body = breaches
-        .iter()
-        .map(|(t, n)| format!("• `{t}`: {n} unresolved rows in last hour"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let msg = SlackMessage::with_site_text(
-        site_id,
-        format!(
-            ":rotating_light: *Sync lag burst — threshold exceeded* :rotating_light:\n\
-             The reconcile sweep observed more than {threshold} unconverged \
-             `ht_reconcile_log` row(s) for the following table(s) in the last hour. \
-             Most clear on their own as the CT watcher / writeback catch up; this \
-             alert surfaces a burst that may indicate a real backlog:\n\
-             {body}\n\
-             _Investigate via `docs/runbook-sync.md` §9 (Phase 6 drift alert)._"
-        ),
-    );
-    slack.send_message(&msg).await;
+    // Defect A3 — burn the cooldown only if the alert actually landed.
+    if cooldown_should_be_marked(delivery) {
+        for (table, _) in &to_alert {
+            mark_level_alert_sent_pg(pg_pool, site_id, &burst_cooldown_key(table)).await;
+        }
+    } else {
+        tracing::warn!(
+            site = %site_id,
+            tables = to_alert.len(),
+            "[Sync] Drift burst alert POST failed — leaving cooldown unset so the \
+             next tick retries"
+        );
+    }
 }
 
 /// Track D / T7 HIGH-1 — pure decision function for the level-triggered
@@ -515,6 +801,43 @@ async fn level_alert_cooldown_keys_pg(pg_pool: &PgPool, site_id: &str) -> Vec<St
     }
 }
 
+/// Does a cooldown row exist for this exact `(site_id, key)`? i.e. "did
+/// we alert about this at some point and never announce that it
+/// cleared?" — the precondition for firing a paired all-clear.
+///
+/// Used by the tripwires that own a single sentinel key rather than a set
+/// of entity names (currently the stale-checkin tripwire), where the
+/// bulk [`level_alert_cooldown_keys_pg`] read would be wasteful.
+///
+/// **Fails CLOSED** (`false` on PG error), the opposite of
+/// [`level_alert_eligible_pg`]: failing open there avoids silencing a
+/// real alert, whereas failing open here would invent an all-clear for a
+/// condition we cannot confirm ever alerted.
+async fn cooldown_row_exists_pg(pg_pool: &PgPool, site_id: &str, key: &str) -> bool {
+    let found = sqlx::query_scalar::<_, i32>(
+        "SELECT 1 FROM ht_level_drift_alert_cooldowns \
+          WHERE site_id = $1 AND table_name = $2",
+    )
+    .bind(site_id)
+    .bind(key)
+    .fetch_optional(pg_pool)
+    .await;
+
+    match found {
+        Ok(opt) => opt.is_some(),
+        Err(e) => {
+            tracing::warn!(
+                site = %site_id,
+                key = %key,
+                error = %e,
+                "[Sync] Failed to read cooldown row — skipping the paired all-clear \
+                 this tick"
+            );
+            false
+        }
+    }
+}
+
 /// Drop the `(site_id, table_name)` cooldown row so a RECURRENCE alerts
 /// on the very next tick instead of being swallowed by a stale 24h
 /// window. Called only after the paired `:white_check_mark:` all-clear
@@ -551,7 +874,34 @@ async fn clear_level_alert_cooldown_pg(pg_pool: &PgPool, site_id: &str, table_na
 /// against, so the sync-lag all-clear must never claim them recovered or
 /// clear their cooldown — doing so would let the stale-checkin alert
 /// refire every 15 minutes.
+///
+/// This list holds only the BARE sentinels. Namespaced keys (anything
+/// containing [`COOLDOWN_KEY_NAMESPACE_SEP`] — `escalated:…`, `burst:…`,
+/// and `bin/sync.rs`'s `ct_retention_overflow:…`) are excluded
+/// structurally by [`is_reconcile_table_key`] and don't need enumerating
+/// here; that is the whole point of the namespace.
+///
+/// The stale-checkin key stays here even though it now HAS its own
+/// all-clear (2026-07-28, defect C8): the closure is owned by
+/// [`check_stale_active_checkins_and_alert`], which is the only caller
+/// that can evaluate the condition. The reconcile sweep must keep its
+/// hands off it.
 const NON_RECONCILE_COOLDOWN_KEYS: &[&str] = &[STALE_CHECKIN_COOLDOWN_KEY];
+
+/// Is this cooldown key a canonical `ht_reconcile_log` table name — i.e.
+/// something the sync-lag all-clear is entitled to declare recovered?
+///
+/// Two exclusions: the bare sentinels in [`NON_RECONCILE_COOLDOWN_KEYS`],
+/// and anything namespaced with [`COOLDOWN_KEY_NAMESPACE_SEP`]. The
+/// second was a latent bug before 2026-07-28 — `bin/sync.rs` has parked
+/// `ct_retention_overflow:<table>` rows in this shared table since the
+/// retention-page work, and the all-clear would happily list one as a
+/// "converged" reconcile table and DELETE its cooldown, un-throttling
+/// the retention pages. Adding `escalated:` / `burst:` keys here makes
+/// that structural rather than a list to remember to update.
+fn is_reconcile_table_key(key: &str) -> bool {
+    !NON_RECONCILE_COOLDOWN_KEYS.contains(&key) && !key.contains(COOLDOWN_KEY_NAMESPACE_SEP)
+}
 
 /// Pure decision helper for the sync-lag all-clear. Given the cooldown
 /// keys recorded for a site and the tables that STILL have unconverged
@@ -559,7 +909,7 @@ const NON_RECONCILE_COOLDOWN_KEYS: &[&str] = &[STALE_CHECKIN_COOLDOWN_KEY];
 /// that have recovered — i.e. we alerted about them at some point and
 /// they now have zero stale rows.
 ///
-/// Non-reconcile cooldown keys ([`NON_RECONCILE_COOLDOWN_KEYS`]) are
+/// Non-reconcile cooldown keys (see [`is_reconcile_table_key`]) are
 /// excluded: they are parked in the same table by other tripwires and
 /// carry no reconcile-row semantics. Output is de-duplicated and sorted
 /// so the Slack body and the log lines are deterministic.
@@ -568,7 +918,7 @@ const NON_RECONCILE_COOLDOWN_KEYS: &[&str] = &[STALE_CHECKIN_COOLDOWN_KEY];
 fn tables_recovered(cooldown_keys: &[String], still_stale_tables: &[String]) -> Vec<String> {
     let mut recovered: Vec<String> = cooldown_keys
         .iter()
-        .filter(|k| !NON_RECONCILE_COOLDOWN_KEYS.contains(&k.as_str()))
+        .filter(|k| is_reconcile_table_key(k))
         .filter(|k| !still_stale_tables.iter().any(|s| s == *k))
         .cloned()
         .collect();
@@ -599,6 +949,7 @@ async fn check_level_drift_recovery_and_notify(
     slack: Option<&SlackClient>,
     site_id: &str,
     still_stale_tables: &[String],
+    thresholds: LevelDriftThresholds,
 ) {
     let cooldown_keys = level_alert_cooldown_keys_pg(pg_pool, site_id).await;
     let recovered = tables_recovered(&cooldown_keys, still_stale_tables);
@@ -613,17 +964,20 @@ async fn check_level_drift_recovery_and_notify(
         return;
     }
 
+    let stale_hours = thresholds.stale_hours;
+    let cooldown_hours = thresholds.cooldown_hours;
+
     for table in &recovered {
         tracing::info!(
             site = %site_id,
             table,
-            stale_hours = LEVEL_DRIFT_STALE_INTERVAL_HOURS,
+            stale_hours,
             "[Sync] Sync-lag all-clear: table has no unconverged rows past threshold — \
              clearing level-alert cooldown"
         );
     }
 
-    if let Some(slack) = slack {
+    let delivery = if let Some(slack) = slack {
         let body = recovered
             .iter()
             .map(|t| format!("• `{t}`"))
@@ -634,26 +988,96 @@ async fn check_level_drift_recovery_and_notify(
             format!(
                 ":white_check_mark: *Reconcile rows CONVERGED* :white_check_mark:\n\
                  Every `ht_reconcile_log` row older than \
-                 {LEVEL_DRIFT_STALE_INTERVAL_HOURS}h has converged for:\n\
+                 {stale_hours}h has converged for:\n\
                  {body}\n\
                  _Closure of the_ `:warning:` _unconverged alert sent earlier. The \
-                 per-table {LEVEL_DRIFT_COOLDOWN_HOURS}h cooldown is reset, so a \
+                 per-table {cooldown_hours}h cooldown is reset, so a \
                  recurrence alerts on the next tick instead of waiting out a stale \
                  window._"
             ),
         );
-        slack.send_message(&msg).await;
+        AlertDelivery::from_send(Some(slack.send_message(&msg).await))
     } else {
         tracing::info!(
             site = %site_id,
             "[Sync] Slack not configured; sync-lag all-clear logged only ({} table(s))",
             recovered.len()
         );
+        AlertDelivery::LoggedOnly
+    };
+
+    // Defect A3, all-clear side: clearing the cooldown is the act that
+    // ERASES the record that we ever alerted. Doing it after a failed
+    // POST loses the closure permanently — the operator never hears the
+    // `:warning:` was resolved and nothing will ever say so again. Keep
+    // the rows; the next tick re-detects recovery and retries.
+    if !cooldown_should_be_marked(delivery) {
+        tracing::warn!(
+            site = %site_id,
+            tables = recovered.len(),
+            "[Sync] Sync-lag all-clear POST failed — keeping cooldown rows so the \
+             next tick retries the closure"
+        );
+        return;
     }
 
     for table in &recovered {
         clear_level_alert_cooldown_pg(pg_pool, site_id, table).await;
+        // The escalated tier parks its own namespaced key
+        // ([`escalated_cooldown_key`]); it is invisible to
+        // `tables_recovered` by construction, so clear it alongside its
+        // parent table or a recurrence would stay escalation-suppressed
+        // for up to a full cooldown window. Unconditional DELETE — a
+        // missing row is a no-op.
+        clear_level_alert_cooldown_pg(pg_pool, site_id, &escalated_cooldown_key(table)).await;
     }
+}
+
+/// One row of the level-drift digest query: a table, how many of its
+/// `ht_reconcile_log` rows are still unresolved past the stale interval,
+/// and the whole-hour age of the OLDEST of them.
+///
+/// The age is what makes day 1 distinguishable from day 16 — see
+/// [`level_drift_severity`] and [`humanize_hours`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleTable {
+    pub table: String,
+    pub count: i64,
+    pub oldest_age_hours: i64,
+}
+
+/// Render an hour count for an operator. Under two days, plain hours
+/// (`7h`) — the familiar shape. Past that, lead with days because "388h"
+/// does not read as "this has been broken for sixteen days".
+pub fn humanize_hours(hours: i64) -> String {
+    if hours < 48 {
+        return format!("{hours}h");
+    }
+    let days = hours / 24;
+    let rem = hours % 24;
+    if rem == 0 {
+        format!("{days}d ({hours}h)")
+    } else {
+        format!("{days}d {rem}h ({hours}h)")
+    }
+}
+
+/// Split the digest rows into the `:warning:` tier and the escalated
+/// tier, preserving input order within each. Pure — the PG-free half of
+/// [`check_level_drift_and_alert`]'s decision.
+pub fn partition_level_drift(
+    rows: &[StaleTable],
+    escalate_hours: i64,
+) -> (Vec<StaleTable>, Vec<StaleTable>) {
+    let mut stale = Vec::new();
+    let mut escalated = Vec::new();
+    for row in rows {
+        match level_drift_severity(row.oldest_age_hours, escalate_hours) {
+            LevelDriftSeverity::Stale => stale.push(row.clone()),
+            LevelDriftSeverity::Escalated => escalated.push(row.clone()),
+        }
+    }
+    (stale, escalated)
 }
 
 /// Track D / T7 HIGH-1 — level-triggered drift digest. Complements the
@@ -664,31 +1088,55 @@ async fn check_level_drift_recovery_and_notify(
 /// divergences that never trip the volume threshold.
 ///
 /// Behaviour:
-/// - Counts unresolved rows per `table_name` where `detected_at` is
-///   older than `LEVEL_DRIFT_STALE_INTERVAL_HOURS` (default 4h).
-/// - For each table with ≥1 such row, emits a Slack alert if the
+/// - Counts unresolved rows per `table_name` where `detected_at` is older
+///   than the stale interval (`LEVEL_DRIFT_STALE_INTERVAL_HOURS`,
+///   default 4h), along with the age of the oldest such row.
+/// - Below the escalation threshold, emits the `:warning:` digest if the
 ///   per-table cooldown (`LEVEL_DRIFT_COOLDOWN_HOURS`, default 24h) has
-///   elapsed since the last level alert for that table+site.
+///   elapsed since the last level alert for that table+site. The body
+///   now carries the oldest-row age, so consecutive digests are visibly
+///   different messages rather than the same text on a 24h metronome.
+/// - At or past `LEVEL_DRIFT_ESCALATE_HOURS` (default 72h) the table
+///   moves to the escalated tier: different title, different ask ("this
+///   will not self-heal — re-ingest or bootstrap"), and its OWN cooldown
+///   key ([`escalated_cooldown_key`]) so the transition is announced on
+///   the next tick instead of waiting out the primary window. An
+///   escalated table does NOT also get the `:warning:` digest — one
+///   voice per table per tick.
 /// - Fires the paired all-clear for any table that HAS a cooldown row but
 ///   no longer has stale rows (see
 ///   [`check_level_drift_recovery_and_notify`]) — the alert used to be
 ///   fire-and-forget, so an operator who fixed the lag got silence and a
 ///   recurrence inside the 24h window was silent too.
-/// - Best-effort: a failed PG query or Slack POST only logs a warning.
+/// - Best-effort: a failed PG query or Slack POST only logs a warning,
+///   and a failed POST leaves the cooldown UNSET so the next tick retries.
 async fn check_level_drift_and_alert(pg_pool: &PgPool, slack: Option<&SlackClient>, site_id: &str) {
-    let rows = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(format!(
-        "SELECT table_name, count(*) \
+    let thresholds = level_drift_thresholds_from_env(site_id);
+    let stale_hours = thresholds.stale_hours;
+
+    // `stale_hours` is an i64 validated `> 0` by `parse_threshold_env`,
+    // so the interpolation cannot carry operator input into the SQL.
+    let rows = sqlx::query_as::<_, (String, i64, i64)>(sqlx::AssertSqlSafe(format!(
+        "SELECT table_name, count(*), \
+                floor(extract(epoch from (now() - min(detected_at))) / 3600)::bigint \
            FROM ht_reconcile_log \
           WHERE resolved_at IS NULL \
             AND divergence_kind IS NOT NULL \
-            AND detected_at < now() - interval '{LEVEL_DRIFT_STALE_INTERVAL_HOURS} hours' \
+            AND detected_at < now() - interval '{stale_hours} hours' \
           GROUP BY table_name"
     )))
     .fetch_all(pg_pool)
     .await;
 
-    let counts = match rows {
-        Ok(r) => r,
+    let counts: Vec<StaleTable> = match rows {
+        Ok(r) => r
+            .into_iter()
+            .map(|(table, count, oldest_age_hours)| StaleTable {
+                table,
+                count,
+                oldest_age_hours,
+            })
+            .collect(),
         Err(e) => {
             tracing::warn!(
                 site = %site_id,
@@ -702,78 +1150,249 @@ async fn check_level_drift_and_alert(pg_pool: &PgPool, slack: Option<&SlackClien
     // Paired recovery notification — MUST run before the `counts.is_empty()`
     // early return below, because "no table has stale rows any more" is
     // exactly the everything-recovered case an operator needs to hear about.
-    let still_stale_tables: Vec<String> = counts.iter().map(|(t, _)| t.clone()).collect();
-    check_level_drift_recovery_and_notify(pg_pool, slack, site_id, &still_stale_tables).await;
+    let still_stale_tables: Vec<String> = counts.iter().map(|r| r.table.clone()).collect();
+    check_level_drift_recovery_and_notify(
+        pg_pool,
+        slack,
+        site_id,
+        &still_stale_tables,
+        thresholds,
+    )
+    .await;
 
     if counts.is_empty() {
         tracing::debug!(
             site = %site_id,
-            "[Sync] Level drift digest: no tables with unresolved rows older than 4h"
+            stale_hours,
+            "[Sync] Level drift digest: no tables with unresolved rows past the stale interval"
         );
         return;
     }
 
-    let cooldown = std::time::Duration::from_secs((LEVEL_DRIFT_COOLDOWN_HOURS * 3600) as u64);
-    let mut to_alert: Vec<(String, i64)> = Vec::new();
-    for (table, count) in &counts {
-        if level_alert_eligible_pg(pg_pool, site_id, table, cooldown).await {
-            to_alert.push((table.clone(), *count));
-            mark_level_alert_sent_pg(pg_pool, site_id, table).await;
+    let (stale_tier, escalated_tier) = partition_level_drift(&counts, thresholds.escalate_hours);
+
+    // Escalated tier first: it rides its own cooldown key, so a table
+    // crossing the threshold is announced even if its primary 24h window
+    // is still open.
+    send_escalated_level_digest(pg_pool, slack, site_id, &escalated_tier, thresholds).await;
+    send_stale_level_digest(pg_pool, slack, site_id, &stale_tier, thresholds).await;
+}
+
+/// The familiar `:warning:` tier of [`check_level_drift_and_alert`].
+/// Cooldown-gated per table on the bare entity name (the key the
+/// all-clear diffs against).
+async fn send_stale_level_digest(
+    pg_pool: &PgPool,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+    tables: &[StaleTable],
+    thresholds: LevelDriftThresholds,
+) {
+    let stale_hours = thresholds.stale_hours;
+    let cooldown_hours = thresholds.cooldown_hours;
+    let escalate_hours = thresholds.escalate_hours;
+    let cooldown = thresholds.cooldown();
+
+    let mut to_alert: Vec<&StaleTable> = Vec::new();
+    for row in tables {
+        if level_alert_eligible_pg(pg_pool, site_id, &row.table, cooldown).await {
+            to_alert.push(row);
         } else {
             tracing::debug!(
                 site = %site_id,
-                table,
-                count,
+                table = %row.table,
+                count = row.count,
+                oldest_age_hours = row.oldest_age_hours,
                 "[Sync] Level drift alert suppressed by cooldown"
             );
         }
-    }
-
-    for (table, count) in &to_alert {
-        tracing::warn!(
-            site = %site_id,
-            table,
-            count,
-            stale_hours = LEVEL_DRIFT_STALE_INTERVAL_HOURS,
-            "[Sync] Level drift alert: table has unresolved divergence older than threshold"
-        );
     }
 
     if to_alert.is_empty() {
         return;
     }
 
-    let Some(slack) = slack else {
+    for row in &to_alert {
+        tracing::warn!(
+            site = %site_id,
+            table = %row.table,
+            count = row.count,
+            oldest_age_hours = row.oldest_age_hours,
+            stale_hours,
+            "[Sync] Level drift alert: table has unresolved divergence older than threshold"
+        );
+    }
+
+    let delivery = if let Some(slack) = slack {
+        let body = to_alert
+            .iter()
+            .map(|r| {
+                format!(
+                    "• `{}`: {} unresolved row(s), oldest {}",
+                    r.table,
+                    r.count,
+                    humanize_hours(r.oldest_age_hours)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let msg = SlackMessage::with_site_text(
+            site_id,
+            format!(
+                ":warning: *Reconcile rows unconverged >{stale_hours}h* :warning:\n\
+                 `ht_reconcile_log` row(s) the auto-resolve sweep has not closed in \
+                 over {stale_hours} hours. This is NOT sync lag — \
+                 past this threshold it will not clear on its own:\n\
+                 {body}\n\
+                 _Check `divergence_kind` first. `missing_pg` with a live legacy row is a \
+                 *dropped legacy change*: the record is absent from our app entirely and \
+                 no tick will fix it. Do NOT blanket-set `resolved_at` — that closes rows \
+                 whether or not canonical landed. Triage: docs/runbook-sync.md §9b. \
+                 Per-table cooldown {cooldown_hours}h; an all-clear fires \
+                 when the table clears. Past {escalate_hours}h this escalates._"
+            ),
+        );
+        AlertDelivery::from_send(Some(slack.send_message(&msg).await))
+    } else {
         tracing::info!(
             site = %site_id,
             "[Sync] Slack not configured; level drift digest logged only ({} table(s))",
             to_alert.len()
         );
-        return;
+        AlertDelivery::LoggedOnly
     };
 
-    let body = to_alert
-        .iter()
-        .map(|(t, n)| format!("• `{t}`: {n} unresolved row(s)"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let msg = SlackMessage::with_site_text(
-        site_id,
-        format!(
-            ":warning: *Reconcile rows unconverged >{LEVEL_DRIFT_STALE_INTERVAL_HOURS}h* :warning:\n\
-             `ht_reconcile_log` row(s) the auto-resolve sweep has not closed in \
-             over {LEVEL_DRIFT_STALE_INTERVAL_HOURS} hours. This is NOT sync lag — \
-             past this threshold it will not clear on its own:\n\
-             {body}\n\
-             _Check `divergence_kind` first. `missing_pg` with a live legacy row is a \
-             *dropped legacy change*: the record is absent from our app entirely and \
-             no tick will fix it. Do NOT blanket-set `resolved_at` — that closes rows \
-             whether or not canonical landed. Triage: docs/runbook-sync.md §9b. \
-             Per-table cooldown {LEVEL_DRIFT_COOLDOWN_HOURS}h; an all-clear fires \
-             when the table clears._"
-        ),
-    );
-    slack.send_message(&msg).await;
+    // Defect A3 — mark AFTER a confirmed delivery. Marking first meant a
+    // webhook outage silenced the table for a full cooldown window and
+    // let the all-clear later close an alert nobody ever saw.
+    if cooldown_should_be_marked(delivery) {
+        for row in &to_alert {
+            mark_level_alert_sent_pg(pg_pool, site_id, &row.table).await;
+        }
+    } else {
+        tracing::warn!(
+            site = %site_id,
+            tables = to_alert.len(),
+            "[Sync] Level drift digest POST failed — leaving cooldown unset so the \
+             next tick retries"
+        );
+    }
+}
+
+/// The escalated tier of [`check_level_drift_and_alert`] (defect A1).
+///
+/// Fires for tables whose oldest unresolved row has passed
+/// `LEVEL_DRIFT_ESCALATE_HOURS`. Two things change versus the
+/// `:warning:` digest: the copy stops implying the sweep might still get
+/// there, and the cooldown lives under [`escalated_cooldown_key`] so
+/// crossing the threshold is not swallowed by a primary window that was
+/// refreshed hours earlier.
+///
+/// On a successful send this marks BOTH the escalation key and the bare
+/// table key. The bare key is what [`tables_recovered`] diffs against —
+/// a table that escalated on its very first digest (e.g. after a long
+/// worker outage) would otherwise never have a primary cooldown row and
+/// so would never get an all-clear.
+async fn send_escalated_level_digest(
+    pg_pool: &PgPool,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+    tables: &[StaleTable],
+    thresholds: LevelDriftThresholds,
+) {
+    if tables.is_empty() {
+        return;
+    }
+
+    let escalate_hours = thresholds.escalate_hours;
+    let cooldown = thresholds.cooldown();
+
+    let mut to_alert: Vec<&StaleTable> = Vec::new();
+    for row in tables {
+        let key = escalated_cooldown_key(&row.table);
+        if level_alert_eligible_pg(pg_pool, site_id, &key, cooldown).await {
+            to_alert.push(row);
+        } else {
+            tracing::debug!(
+                site = %site_id,
+                table = %row.table,
+                count = row.count,
+                oldest_age_hours = row.oldest_age_hours,
+                "[Sync] Escalated level drift alert suppressed by cooldown"
+            );
+        }
+    }
+
+    if to_alert.is_empty() {
+        return;
+    }
+
+    for row in &to_alert {
+        tracing::error!(
+            site = %site_id,
+            table = %row.table,
+            count = row.count,
+            oldest_age_hours = row.oldest_age_hours,
+            escalate_hours,
+            "[Sync] Level drift ESCALATED: unresolved divergence will not self-heal"
+        );
+    }
+
+    let delivery = if let Some(slack) = slack {
+        let body = to_alert
+            .iter()
+            .map(|r| {
+                format!(
+                    "• `{}`: {} unresolved row(s), oldest *{}*",
+                    r.table,
+                    r.count,
+                    humanize_hours(r.oldest_age_hours)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let msg = SlackMessage::with_site_text(
+            site_id,
+            format!(
+                ":bangbang: *Reconcile rows STUCK >{escalate_hours}h — will not self-heal* \
+                 :bangbang:\n\
+                 These `ht_reconcile_log` row(s) have survived every auto-resolve sweep \
+                 for more than {escalate_hours} hours (a sweep runs every reconcile \
+                 tick). Waiting is no longer a strategy — nothing in the pipeline is \
+                 going to close them:\n\
+                 {body}\n\
+                 _The fix is re-ingest, not patience: for `missing_pg` re-drive the \
+                 record through the CT path or run `sync --bootstrap` for the table; \
+                 for `value` divergence re-apply from legacy. If the legacy change is \
+                 past the 2-day CT retention window, bootstrap is the ONLY path. Do NOT \
+                 blanket-set `resolved_at` — that hides the gap without landing the \
+                 data. Triage: docs/runbook-sync.md §9b._"
+            ),
+        );
+        AlertDelivery::from_send(Some(slack.send_message(&msg).await))
+    } else {
+        tracing::info!(
+            site = %site_id,
+            "[Sync] Slack not configured; escalated level drift digest logged only ({} table(s))",
+            to_alert.len()
+        );
+        AlertDelivery::LoggedOnly
+    };
+
+    if cooldown_should_be_marked(delivery) {
+        for row in &to_alert {
+            mark_level_alert_sent_pg(pg_pool, site_id, &escalated_cooldown_key(&row.table)).await;
+            // Keep the all-clear reachable — see the fn docstring.
+            mark_level_alert_sent_pg(pg_pool, site_id, &row.table).await;
+        }
+    } else {
+        tracing::warn!(
+            site = %site_id,
+            tables = to_alert.len(),
+            "[Sync] Escalated level drift digest POST failed — leaving cooldown unset \
+             so the next tick retries"
+        );
+    }
 }
 
 /// Default days-past-expected-checkout before an `active` check-in is
@@ -784,6 +1403,11 @@ const STALE_CHECKIN_ALERT_DAYS_DEFAULT: i32 = 2;
 /// column) for the stale-checkin tripwire — reuses the level-drift cooldown
 /// table so the alert fires at most once per `LEVEL_DRIFT_COOLDOWN_HOURS`
 /// (default 24h) per site, even while a backlog persists.
+///
+/// A bare sentinel, not namespaced with [`COOLDOWN_KEY_NAMESPACE_SEP`],
+/// because it predates the namespace and is already enumerated in
+/// [`NON_RECONCILE_COOLDOWN_KEYS`]. Renaming it would strand every live
+/// cooldown row and re-fire the alert on both sites once.
 const STALE_CHECKIN_COOLDOWN_KEY: &str = "stale_active_checkin";
 
 /// Resolve the stale-checkin threshold (days) from `STALE_CHECKIN_ALERT_DAYS`,
@@ -811,6 +1435,24 @@ fn stale_checkin_alert_days() -> i32 {
 /// than `STALE_CHECKIN_ALERT_DAYS` (default 2) days in the past, fires ONE
 /// Slack alert per site gated by the shared 24h level-drift cooldown, and is
 /// best-effort throughout (a PG or Slack failure only logs a warning).
+///
+/// **Paired all-clear** (2026-07-28 alert inventory, defect C8): this was
+/// the one actionable alert in the channel with no closure signal — it
+/// is deliberately excluded from the reconcile sweep's all-clear via
+/// [`NON_RECONCILE_COOLDOWN_KEYS`], and nothing else told the operator
+/// their manual reconcile had taken. It now owns its closure: when the
+/// query comes back empty and a [`STALE_CHECKIN_COOLDOWN_KEY`] cooldown
+/// row exists, emit `:white_check_mark:` and drop the row.
+///
+/// That is the right half of the "give it one / say it has none" choice
+/// because recovery here is *directly observable from the same pure-PG
+/// query that raises the alert* — an empty result set IS the recovered
+/// state, no MSSQL round-trip, no hash comparison, no ambiguity. The
+/// alternative (documenting "no all-clear will come, check PG yourself")
+/// would write down a gap we can close in a dozen lines, on precisely
+/// the alert whose remedy is a hand-edited row an operator most needs
+/// confirmed. It also matches the three existing recovery-notification
+/// precedents in this codebase.
 pub async fn check_stale_active_checkins_and_alert(
     pg_pool: &PgPool,
     slack: Option<&SlackClient>,
@@ -843,12 +1485,19 @@ pub async fn check_stale_active_checkins_and_alert(
         }
     };
 
+    let cooldown_hours = level_drift_thresholds_from_env(site_id).cooldown_hours;
+    let cooldown = std::time::Duration::from_secs((cooldown_hours * 3600) as u64);
+
     if stale.is_empty() {
         tracing::debug!(
             site = %site_id,
             threshold_days = days,
             "[Sync] Stale-checkin tripwire: no active check-ins past expected checkout"
         );
+        // Defect C8 — paired all-clear. Fires only if we actually alerted
+        // at some point (a cooldown row exists), so a site that has never
+        // had a stale check-in stays silent forever.
+        notify_stale_checkin_all_clear(pg_pool, slack, site_id, days).await;
         return;
     }
 
@@ -860,9 +1509,7 @@ pub async fn check_stale_active_checkins_and_alert(
     );
 
     // Cooldown-gate the Slack alert (reuse the level-drift cooldown table so
-    // a persistent backlog doesn't refire every tick). Check eligibility AND
-    // mark in the same branch — if we're going to alert, we mark.
-    let cooldown = std::time::Duration::from_secs((LEVEL_DRIFT_COOLDOWN_HOURS * 3600) as u64);
+    // a persistent backlog doesn't refire every tick).
     if !level_alert_eligible_pg(pg_pool, site_id, STALE_CHECKIN_COOLDOWN_KEY, cooldown).await {
         tracing::debug!(
             site = %site_id,
@@ -871,49 +1518,117 @@ pub async fn check_stale_active_checkins_and_alert(
         return;
     }
 
-    let Some(slack) = slack else {
+    let delivery = if let Some(slack) = slack {
+        let now = chrono::Utc::now();
+        let shown = stale.len().min(15);
+        let body = stale
+            .iter()
+            .take(shown)
+            .map(|(cin_no, exp)| {
+                let overdue_days = (now - *exp).num_days();
+                format!("• `{cin_no}` — {overdue_days}d past expected checkout")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let more = if stale.len() > shown {
+            format!("\n…and {} more", stale.len() - shown)
+        } else {
+            String::new()
+        };
+
+        let msg = SlackMessage::with_site_text(
+            site_id,
+            format!(
+                ":hourglass_flowing_sand: *Stale active check-in(s) — likely dropped checkout* :hourglass_flowing_sand:\n\
+                 {count} canonical check-in(s) are still `active` more than {days} day(s) past their \
+                 expected checkout. This usually means a checkout CT event was dropped (past MSSQL \
+                 retention, so it won't self-heal) — the room shows occupied in the new app while \
+                 iHOTEL has it checked out:\n\
+                 {body}{more}\n\
+                 _Reconcile the row(s) to match iHOTEL (see the 2026-06-28 cin 19906 / room 114 \
+                 playbook). Pure-PG tripwire; per-site cooldown {cooldown_h}h. A \
+                 `:white_check_mark:` all-clear fires once no check-in is past threshold._",
+                count = stale.len(),
+                cooldown_h = cooldown_hours,
+            ),
+        );
+        AlertDelivery::from_send(Some(slack.send_message(&msg).await))
+    } else {
         tracing::info!(
             site = %site_id,
             "[Sync] Slack not configured; stale-checkin tripwire logged only ({} row(s))",
             stale.len()
         );
-        return;
+        AlertDelivery::LoggedOnly
     };
 
-    let now = chrono::Utc::now();
-    let shown = stale.len().min(15);
-    let body = stale
-        .iter()
-        .take(shown)
-        .map(|(cin_no, exp)| {
-            let overdue_days = (now - *exp).num_days();
-            format!("• `{cin_no}` — {overdue_days}d past expected checkout")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let more = if stale.len() > shown {
-        format!("\n…and {} more", stale.len() - shown)
+    // Defect A3 — mark only on a confirmed delivery, so a webhook outage
+    // doesn't silence a dropped-checkout backlog for a full day.
+    if cooldown_should_be_marked(delivery) {
+        mark_level_alert_sent_pg(pg_pool, site_id, STALE_CHECKIN_COOLDOWN_KEY).await;
     } else {
-        String::new()
+        tracing::warn!(
+            site = %site_id,
+            "[Sync] Stale-checkin alert POST failed — leaving cooldown unset so the \
+             next tick retries"
+        );
+    }
+}
+
+/// Paired all-clear for [`check_stale_active_checkins_and_alert`]
+/// (defect C8). Called on the tick where the tripwire query comes back
+/// empty; emits nothing unless a cooldown row proves we alerted earlier.
+///
+/// Clearing the cooldown row is what erases the "we alerted" record, so
+/// — as in [`check_level_drift_recovery_and_notify`] — it happens only
+/// after the closure has actually been delivered.
+async fn notify_stale_checkin_all_clear(
+    pg_pool: &PgPool,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+    days: i32,
+) {
+    if !cooldown_row_exists_pg(pg_pool, site_id, STALE_CHECKIN_COOLDOWN_KEY).await {
+        return;
+    }
+
+    tracing::info!(
+        site = %site_id,
+        threshold_days = days,
+        "[Sync] Stale-checkin all-clear: no active check-ins past expected checkout — \
+         clearing tripwire cooldown"
+    );
+
+    let delivery = if let Some(slack) = slack {
+        let msg = SlackMessage::with_site_text(
+            site_id,
+            format!(
+                ":white_check_mark: *Stale active check-in(s) CLEARED* :white_check_mark:\n\
+                 No canonical check-in is `active` more than {days} day(s) past its \
+                 expected checkout any more.\n\
+                 _Closure of the_ `:hourglass_flowing_sand:` _dropped-checkout alert sent \
+                 earlier. The per-site cooldown is reset, so a recurrence alerts on the \
+                 next tick instead of waiting out a stale window._"
+            ),
+        );
+        AlertDelivery::from_send(Some(slack.send_message(&msg).await))
+    } else {
+        tracing::info!(
+            site = %site_id,
+            "[Sync] Slack not configured; stale-checkin all-clear logged only"
+        );
+        AlertDelivery::LoggedOnly
     };
 
-    let msg = SlackMessage::with_site_text(
-        site_id,
-        format!(
-            ":hourglass_flowing_sand: *Stale active check-in(s) — likely dropped checkout* :hourglass_flowing_sand:\n\
-             {count} canonical check-in(s) are still `active` more than {days} day(s) past their \
-             expected checkout. This usually means a checkout CT event was dropped (past MSSQL \
-             retention, so it won't self-heal) — the room shows occupied in the new app while \
-             iHOTEL has it checked out:\n\
-             {body}{more}\n\
-             _Reconcile the row(s) to match iHOTEL (see the 2026-06-28 cin 19906 / room 114 \
-             playbook). Pure-PG tripwire; per-site cooldown {cooldown_h}h._",
-            count = stale.len(),
-            cooldown_h = LEVEL_DRIFT_COOLDOWN_HOURS,
-        ),
-    );
-    slack.send_message(&msg).await;
-    mark_level_alert_sent_pg(pg_pool, site_id, STALE_CHECKIN_COOLDOWN_KEY).await;
+    if cooldown_should_be_marked(delivery) {
+        clear_level_alert_cooldown_pg(pg_pool, site_id, STALE_CHECKIN_COOLDOWN_KEY).await;
+    } else {
+        tracing::warn!(
+            site = %site_id,
+            "[Sync] Stale-checkin all-clear POST failed — keeping the cooldown row so \
+             the next tick retries the closure"
+        );
+    }
 }
 
 /// Resolved CT-lag thresholds (versions + seconds) for a reconcile tick.
@@ -7359,6 +8074,370 @@ mod tests {
     fn level_drift_recovery_is_silent_without_cooldown_rows() {
         // Never alerted ⇒ nothing to close, even with zero stale rows.
         assert!(tables_recovered(&owned(&[]), &owned(&[])).is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // 2026-07-28 alert inventory — escalation tier, env-tunable
+    // thresholds, cooldown-on-successful-send, namespaced cooldown keys.
+    // -------------------------------------------------------------------
+
+    /// Defect A1. Below the escalation threshold the digest keeps its
+    /// familiar `:warning:` voice; at or past it, the tone changes.
+    /// Pinned at the boundary because an off-by-one here either fires the
+    /// "will not self-heal" copy a day early (crying wolf) or never
+    /// (the defect).
+    #[test]
+    fn escalation_does_not_fire_below_the_second_threshold() {
+        for age in [0_i64, 4, 24, 48, 71] {
+            assert_eq!(
+                level_drift_severity(age, DEFAULT_LEVEL_DRIFT_ESCALATE_HOURS),
+                LevelDriftSeverity::Stale,
+                "age {age}h is below the {DEFAULT_LEVEL_DRIFT_ESCALATE_HOURS}h escalation \
+                 threshold and must stay in the :warning: tier"
+            );
+        }
+    }
+
+    #[test]
+    fn escalation_fires_at_and_past_the_second_threshold() {
+        for age in [72_i64, 73, 388] {
+            assert_eq!(
+                level_drift_severity(age, DEFAULT_LEVEL_DRIFT_ESCALATE_HOURS),
+                LevelDriftSeverity::Escalated,
+                "age {age}h has passed the escalation threshold"
+            );
+        }
+    }
+
+    /// The escalation threshold is env-tunable, so the classifier must
+    /// track the passed-in value, not the compiled-in default.
+    #[test]
+    fn escalation_boundary_tracks_the_configured_threshold() {
+        assert_eq!(level_drift_severity(11, 12), LevelDriftSeverity::Stale);
+        assert_eq!(level_drift_severity(12, 12), LevelDriftSeverity::Escalated);
+    }
+
+    fn stale_row(table: &str, count: i64, oldest_age_hours: i64) -> StaleTable {
+        StaleTable {
+            table: table.to_string(),
+            count,
+            oldest_age_hours,
+        }
+    }
+
+    /// A table lands in exactly ONE tier — an escalated table must not
+    /// also get the `:warning:` digest, or the channel gets two messages
+    /// per table per day about the same rows.
+    #[test]
+    fn partition_level_drift_splits_tiers_without_overlap() {
+        let rows = vec![
+            stale_row("bookings", 3, 388),
+            stale_row("customers", 1, 6),
+            stale_row("checkins", 9, 72),
+        ];
+        let (stale, escalated) = partition_level_drift(&rows, 72);
+        assert_eq!(stale, vec![stale_row("customers", 1, 6)]);
+        assert_eq!(
+            escalated,
+            vec![stale_row("bookings", 3, 388), stale_row("checkins", 9, 72)],
+            "input order is preserved within a tier"
+        );
+    }
+
+    /// Day 1 and day 16 must not render identically — the whole point of
+    /// carrying the oldest-row age in the body.
+    #[test]
+    fn humanize_hours_distinguishes_day_one_from_day_sixteen() {
+        assert_eq!(humanize_hours(7), "7h");
+        assert_eq!(humanize_hours(47), "47h");
+        assert_eq!(humanize_hours(48), "2d (48h)");
+        assert_eq!(humanize_hours(388), "16d 4h (388h)");
+        assert_ne!(humanize_hours(7), humanize_hours(388));
+    }
+
+    // --- Cooldown key namespacing ---------------------------------------
+
+    /// The escalation key must be structurally incapable of colliding
+    /// with a canonical entity name in the shared
+    /// `ht_level_drift_alert_cooldowns` table — the same guarantee
+    /// `bin/sync.rs` gets from `ct_retention_overflow:<table>`.
+    #[test]
+    fn escalated_cooldown_key_cannot_collide_with_an_entity_name() {
+        for table in ["bookings", "customers", "checkins", "rooms"] {
+            let key = escalated_cooldown_key(table);
+            assert_ne!(key, table, "escalation key must not equal the entity name");
+            assert!(
+                key.contains(COOLDOWN_KEY_NAMESPACE_SEP),
+                "escalation key must carry the namespace separator: {key}"
+            );
+            assert!(
+                !is_reconcile_table_key(&key),
+                "{key} must not be treated as a reconcile table name"
+            );
+            assert!(
+                is_reconcile_table_key(table),
+                "the bare entity name {table} IS a reconcile table name"
+            );
+        }
+        assert_eq!(escalated_cooldown_key("bookings"), "escalated:bookings");
+    }
+
+    #[test]
+    fn burst_cooldown_key_cannot_collide_with_an_entity_name() {
+        let key = burst_cooldown_key("bookings");
+        assert_eq!(key, "burst:bookings");
+        assert!(!is_reconcile_table_key(&key));
+    }
+
+    /// The all-clear diffs cooldown keys against still-stale table names.
+    /// A namespaced key never matches a table name, so without this
+    /// filter it would be reported "converged" and its cooldown DELETED
+    /// — silently un-throttling the alert it belongs to.
+    ///
+    /// The `bin/sync.rs` literals below are the other half of a
+    /// cross-file contract (its `*_KEY_PREFIX` / `*_COOLDOWN_KEY`
+    /// constants, private to that binary, hence literals here). They have
+    /// shared this table since the retention-page work and the all-clear
+    /// has been eligible to delete them the whole time.
+    #[test]
+    fn all_clear_never_claims_namespaced_cooldown_keys() {
+        let recovered = tables_recovered(
+            &owned(&[
+                "customers",
+                "escalated:bookings",
+                "burst:checkins",
+                // Parked by bin/sync.rs in the same shared table.
+                "ct_retention_overflow:HT_Customers",
+                "ct_watcher_lag:global",
+                "shadow_mode:ceiling",
+                "boot_refusal:ct_gap",
+                STALE_CHECKIN_COOLDOWN_KEY,
+            ]),
+            &owned(&["bookings"]),
+        );
+        assert_eq!(
+            recovered,
+            owned(&["customers"]),
+            "only bare reconcile table names may be declared converged"
+        );
+    }
+
+    // --- Env-overridable level-drift thresholds (defect A2) --------------
+
+    const LEVEL_DRIFT_ENV_VARS: &[&str] = &[
+        "LEVEL_DRIFT_STALE_INTERVAL_HOURS",
+        "LEVEL_DRIFT_COOLDOWN_HOURS",
+        "LEVEL_DRIFT_ESCALATE_HOURS",
+        "LEVEL_DRIFT_STALE_INTERVAL_HOURS_HFHOTEL",
+        "LEVEL_DRIFT_COOLDOWN_HOURS_HFHOTEL",
+        "LEVEL_DRIFT_ESCALATE_HOURS_HFHOTEL",
+        "LEVEL_DRIFT_STALE_INTERVAL_HOURS_HFVILLE",
+        "LEVEL_DRIFT_COOLDOWN_HOURS_HFVILLE",
+        "LEVEL_DRIFT_ESCALATE_HOURS_HFVILLE",
+    ];
+
+    /// Env-isolation helper in the `with_mode_env` / `with_threshold_envs`
+    /// idiom. Clears the whole level-drift var family first so an ambient
+    /// value can't flip an assertion, sets the requested ones, then
+    /// restores every prior value.
+    fn with_level_drift_env<T, F: FnOnce() -> T>(set: &[(&str, &str)], f: F) -> T {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _g = LOCK.lock().unwrap();
+        let prior: Vec<(&str, Option<String>)> = LEVEL_DRIFT_ENV_VARS
+            .iter()
+            .map(|name| (*name, env::var(name).ok()))
+            .collect();
+        for name in LEVEL_DRIFT_ENV_VARS {
+            env::remove_var(name);
+        }
+        for (name, value) in set {
+            env::set_var(name, value);
+        }
+        let out = f();
+        for (name, value) in prior {
+            match value {
+                Some(v) => env::set_var(name, v),
+                None => env::remove_var(name),
+            }
+        }
+        out
+    }
+
+    /// Defaults are explicitly unchanged by the env work — a deploy with
+    /// no new vars set must behave exactly as it did before.
+    #[test]
+    fn level_drift_thresholds_default_when_env_unset() {
+        let t = with_level_drift_env(&[], || level_drift_thresholds_from_env("hfhotel"));
+        assert_eq!(t.stale_hours, 4);
+        assert_eq!(t.cooldown_hours, 24);
+        assert_eq!(t.escalate_hours, 72);
+        assert_eq!(t.stale_hours, DEFAULT_LEVEL_DRIFT_STALE_INTERVAL_HOURS);
+        assert_eq!(t.cooldown_hours, DEFAULT_LEVEL_DRIFT_COOLDOWN_HOURS);
+        assert_eq!(t.escalate_hours, DEFAULT_LEVEL_DRIFT_ESCALATE_HOURS);
+    }
+
+    #[test]
+    fn level_drift_thresholds_read_the_global_env_vars() {
+        let t = with_level_drift_env(
+            &[
+                ("LEVEL_DRIFT_STALE_INTERVAL_HOURS", "8"),
+                ("LEVEL_DRIFT_COOLDOWN_HOURS", "12"),
+                ("LEVEL_DRIFT_ESCALATE_HOURS", "96"),
+            ],
+            || level_drift_thresholds_from_env("hfhotel"),
+        );
+        assert_eq!((t.stale_hours, t.cooldown_hours, t.escalate_hours), (8, 12, 96));
+    }
+
+    /// Per-site override wins over the global, and does not leak to the
+    /// other site — same contract as the drift-alert threshold (#69).
+    #[test]
+    fn level_drift_thresholds_per_site_override_wins_and_does_not_leak() {
+        let set = [
+            ("LEVEL_DRIFT_COOLDOWN_HOURS", "24"),
+            ("LEVEL_DRIFT_COOLDOWN_HOURS_HFVILLE", "6"),
+        ];
+        let ville = with_level_drift_env(&set, || level_drift_thresholds_from_env("hfville"));
+        assert_eq!(ville.cooldown_hours, 6, "per-site override must win");
+        let hotel = with_level_drift_env(&set, || level_drift_thresholds_from_env("hfhotel"));
+        assert_eq!(
+            hotel.cooldown_hours, 24,
+            "HF Hotel must not pick up HF Ville's override"
+        );
+    }
+
+    /// Operator typos degrade to the next tier down, never to zero — a
+    /// zero cooldown would turn the digest into a 15-minute metronome.
+    #[test]
+    fn level_drift_thresholds_fall_back_on_invalid_values() {
+        let t = with_level_drift_env(
+            &[
+                ("LEVEL_DRIFT_STALE_INTERVAL_HOURS", "not-a-number"),
+                ("LEVEL_DRIFT_COOLDOWN_HOURS", "0"),
+                ("LEVEL_DRIFT_ESCALATE_HOURS", "-5"),
+            ],
+            || level_drift_thresholds_from_env("hfhotel"),
+        );
+        assert_eq!(t.stale_hours, DEFAULT_LEVEL_DRIFT_STALE_INTERVAL_HOURS);
+        assert_eq!(t.cooldown_hours, DEFAULT_LEVEL_DRIFT_COOLDOWN_HOURS);
+        assert_eq!(t.escalate_hours, DEFAULT_LEVEL_DRIFT_ESCALATE_HOURS);
+    }
+
+    #[test]
+    fn level_drift_thresholds_per_site_garbage_falls_through_to_global() {
+        let t = with_level_drift_env(
+            &[
+                ("LEVEL_DRIFT_ESCALATE_HOURS", "96"),
+                ("LEVEL_DRIFT_ESCALATE_HOURS_HFVILLE", "abc"),
+            ],
+            || level_drift_thresholds_from_env("hfville"),
+        );
+        assert_eq!(t.escalate_hours, 96);
+    }
+
+    /// An escalation threshold at or below the stale interval would
+    /// escalate every table on its first digest, collapsing the two tiers
+    /// back into the single unchanging voice this work removes.
+    #[test]
+    fn level_drift_escalate_threshold_is_clamped_above_the_stale_interval() {
+        let t = with_level_drift_env(
+            &[
+                ("LEVEL_DRIFT_STALE_INTERVAL_HOURS", "10"),
+                ("LEVEL_DRIFT_ESCALATE_HOURS", "4"),
+            ],
+            || level_drift_thresholds_from_env("hfhotel"),
+        );
+        assert_eq!(t.stale_hours, 10);
+        assert_eq!(t.escalate_hours, 11, "clamped to stale + 1h");
+        assert_eq!(
+            level_drift_severity(t.stale_hours, t.escalate_hours),
+            LevelDriftSeverity::Stale,
+            "a row that only just crossed the stale interval must not escalate"
+        );
+    }
+
+    #[test]
+    fn level_drift_cooldown_duration_matches_the_configured_hours() {
+        let t = with_level_drift_env(&[("LEVEL_DRIFT_COOLDOWN_HOURS", "6")], || {
+            level_drift_thresholds_from_env("hfhotel")
+        });
+        assert_eq!(t.cooldown(), std::time::Duration::from_secs(6 * 3600));
+    }
+
+    // --- Cooldown burns only on a successful send (defect A3) ------------
+
+    /// A failed webhook must NOT silence the table: the cooldown stays
+    /// unset so the next 15-minute tick retries. Pre-fix the mark ran
+    /// before the POST, so an outage bought 24h of silence and the
+    /// all-clear could later close an alert nobody received.
+    #[test]
+    fn cooldown_is_not_marked_when_the_send_fails() {
+        assert_eq!(AlertDelivery::from_send(Some(false)), AlertDelivery::Failed);
+        assert!(!cooldown_should_be_marked(AlertDelivery::Failed));
+    }
+
+    #[test]
+    fn cooldown_is_marked_when_the_send_succeeds() {
+        assert_eq!(AlertDelivery::from_send(Some(true)), AlertDelivery::Sent);
+        assert!(cooldown_should_be_marked(AlertDelivery::Sent));
+    }
+
+    /// No Slack client configured is not a failure — the `tracing` line
+    /// IS the delivery, so the cooldown still throttles it. Otherwise a
+    /// log-only deployment repeats the warning every 15 minutes.
+    #[test]
+    fn cooldown_is_marked_in_log_only_deployments() {
+        assert_eq!(AlertDelivery::from_send(None), AlertDelivery::LoggedOnly);
+        assert!(cooldown_should_be_marked(AlertDelivery::LoggedOnly));
+    }
+
+    // --- Burst-alert cooldown (defect C5) --------------------------------
+
+    /// The burst threshold is a blast-radius dial, not a target: 21 days
+    /// of production peak at 33 rows/hr, so it has never fired and should
+    /// not be "tuned down until it does". Pinned so a drive-by change has
+    /// to argue with a test.
+    #[test]
+    fn burst_alert_threshold_default_is_unchanged() {
+        assert_eq!(DEFAULT_DRIFT_ALERT_THRESHOLD, 50);
+        // 33 is the observed 21-day production peak. It must stay BELOW
+        // the threshold: the alert is designed never to fire in normal
+        // operation, and the level digest already covers the slow-burn
+        // case this would otherwise duplicate.
+        assert!(
+            tables_breaching_threshold(&counts(&[("checkins", 33)]), DEFAULT_DRIFT_ALERT_THRESHOLD)
+                .is_empty(),
+            "the observed production peak must not trip the burst alert"
+        );
+    }
+
+    #[test]
+    fn burst_cooldown_hours_defaults_and_honours_per_site_override() {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _g = LOCK.lock().unwrap();
+        let global = "LEGACY_RECONCILE_BURST_COOLDOWN_HOURS";
+        let per_site = "LEGACY_RECONCILE_BURST_COOLDOWN_HOURS_HFVILLE";
+        let prior = (env::var(global).ok(), env::var(per_site).ok());
+        env::remove_var(global);
+        env::remove_var(per_site);
+        assert_eq!(
+            burst_cooldown_hours_from_env("hfhotel"),
+            DEFAULT_BURST_ALERT_COOLDOWN_HOURS
+        );
+        env::set_var(global, "3");
+        env::set_var(per_site, "12");
+        assert_eq!(burst_cooldown_hours_from_env("hfhotel"), 3);
+        assert_eq!(burst_cooldown_hours_from_env("hfville"), 12);
+        match prior.0 {
+            Some(v) => env::set_var(global, v),
+            None => env::remove_var(global),
+        }
+        match prior.1 {
+            Some(v) => env::set_var(per_site, v),
+            None => env::remove_var(per_site),
+        }
     }
 
     // -------------------------------------------------------------------

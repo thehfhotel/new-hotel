@@ -48,6 +48,33 @@ impl Default for SchedulerState {
     }
 }
 
+/// Read one of the four per-job Slack notification kill-switches.
+///
+/// FAIL-CLOSED (2026-07-28): an absent — or unrecognised — value means
+/// DISABLED. These four jobs are purely informational and POST to Slack
+/// once PER ROW, on the same webhook that carries every
+/// `:rotating_light:` page; there is no severity routing. The previous
+/// `.map(|v| v != "false").unwrap_or(true)` shape meant any environment
+/// that had not explicitly opted out — a fresh stack, a fork, a cleared
+/// GitHub variable — turned the alerting channel into a booking feed and
+/// buried the real pages under it.
+///
+/// This is a no-op for production. Unlike the ADR-0004 compose-owned
+/// flags, these four ARE injected by `docker-build.yml`
+/// (`vars.X || 'true'`) into the deploy payload → `.env` → compose, so
+/// the process always sees an explicit value and never reaches the
+/// fallback. All four GitHub repo variables have been `false` since
+/// 2026-05-19. The default only governs environments outside that
+/// pipeline — which is exactly the case this guards.
+///
+/// Strict comparison matches the idiom `routes/mode.rs` uses for the
+/// dark-shipped writeback flags.
+fn notification_flag_enabled(var: &str) -> bool {
+    std::env::var(var)
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+}
+
 /// Initialize the cron job scheduler.
 ///
 /// `site` is plumbed through so every Slack message and tracing span
@@ -214,10 +241,9 @@ pub async fn init_scheduler(
     // CT-watcher backfill window (`backfill_legacy_checkins` +
     // `backfill_legacy_bookings`) to suppress the hourly occupancy
     // summary while we're churning canonical state and the numbers
-    // would mislead the receptionist channel. Default: enabled.
-    let hourly_enabled = std::env::var("HOURLY_REPORT_ENABLED")
-        .map(|v| v != "false")
-        .unwrap_or(true);
+    // would mislead the receptionist channel. Default: DISABLED — see
+    // `notification_flag_enabled`.
+    let hourly_enabled = notification_flag_enabled("HOURLY_REPORT_ENABLED");
     if hourly_enabled {
         let hourly_job = Job::new_async("0 0 * * * *", move |_uuid, _l| {
             let pool = pool_hourly.clone();
@@ -232,7 +258,7 @@ pub async fn init_scheduler(
         scheduler.add(hourly_job).await?;
     } else {
         tracing::info!(
-            "[Scheduler] - Hourly report: DISABLED (HOURLY_REPORT_ENABLED=false)"
+            "[Scheduler] - Hourly report: DISABLED (HOURLY_REPORT_ENABLED != true)"
         );
     }
 
@@ -244,10 +270,8 @@ pub async fn init_scheduler(
     // backfill binaries deliberately do not publish DomainEvents, but
     // operators may still want a hard kill-switch on the poll-based
     // alert path while batch-importing historical state. Default:
-    // enabled.
-    let checkin_notifications_enabled = std::env::var("CHECKIN_NOTIFICATIONS_ENABLED")
-        .map(|v| v != "false")
-        .unwrap_or(true);
+    // DISABLED — see `notification_flag_enabled`.
+    let checkin_notifications_enabled = notification_flag_enabled("CHECKIN_NOTIFICATIONS_ENABLED");
     if checkin_notifications_enabled {
         let checkin_job = Job::new_async("0 */2 * * * *", move |_uuid, _l| {
             let pool = pool_checkins.clone();
@@ -265,7 +289,7 @@ pub async fn init_scheduler(
         scheduler.add(checkin_job).await?;
     } else {
         tracing::info!(
-            "[Scheduler] - Check-in polling: DISABLED (CHECKIN_NOTIFICATIONS_ENABLED=false)"
+            "[Scheduler] - Check-in polling: DISABLED (CHECKIN_NOTIFICATIONS_ENABLED != true)"
         );
     }
 
@@ -274,10 +298,10 @@ pub async fn init_scheduler(
     // Feature flag: `CHECKOUT_NOTIFICATIONS_ENABLED=false` skips
     // registration entirely so the checkout Slack alert doesn't fire.
     // Same shape as `CHECKIN_NOTIFICATIONS_ENABLED` /
-    // `BOOKING_NOTIFICATIONS_ENABLED`. Default: enabled.
-    let checkout_notifications_enabled = std::env::var("CHECKOUT_NOTIFICATIONS_ENABLED")
-        .map(|v| v != "false")
-        .unwrap_or(true);
+    // `BOOKING_NOTIFICATIONS_ENABLED`. Default: DISABLED — see
+    // `notification_flag_enabled`.
+    let checkout_notifications_enabled =
+        notification_flag_enabled("CHECKOUT_NOTIFICATIONS_ENABLED");
     if checkout_notifications_enabled {
         let checkout_job = Job::new_async("0 */2 * * * *", move |_uuid, _l| {
             let pool = pool_checkouts.clone();
@@ -295,7 +319,7 @@ pub async fn init_scheduler(
         scheduler.add(checkout_job).await?;
     } else {
         tracing::info!(
-            "[Scheduler] - Checkout polling: DISABLED (CHECKOUT_NOTIFICATIONS_ENABLED=false)"
+            "[Scheduler] - Checkout polling: DISABLED (CHECKOUT_NOTIFICATIONS_ENABLED != true)"
         );
     }
 
@@ -305,10 +329,9 @@ pub async fn init_scheduler(
     // registration entirely so the new-booking Slack alert
     // (`จองใหม่` template) doesn't fire. Same shape and rationale as
     // `CHECKIN_NOTIFICATIONS_ENABLED` above — operators may want a
-    // hard kill-switch during noisy windows. Default: enabled.
-    let booking_notifications_enabled = std::env::var("BOOKING_NOTIFICATIONS_ENABLED")
-        .map(|v| v != "false")
-        .unwrap_or(true);
+    // hard kill-switch during noisy windows. Default: DISABLED — see
+    // `notification_flag_enabled`.
+    let booking_notifications_enabled = notification_flag_enabled("BOOKING_NOTIFICATIONS_ENABLED");
     if booking_notifications_enabled {
         let booking_job = Job::new_async("0 */2 * * * *", move |_uuid, _l| {
             let pool = pool_bookings.clone();
@@ -327,7 +350,7 @@ pub async fn init_scheduler(
         scheduler.add(booking_job).await?;
     } else {
         tracing::info!(
-            "[Scheduler] - Booking polling: DISABLED (BOOKING_NOTIFICATIONS_ENABLED=false)"
+            "[Scheduler] - Booking polling: DISABLED (BOOKING_NOTIFICATIONS_ENABLED != true)"
         );
     }
 
@@ -762,5 +785,100 @@ async fn persist_watermark(
              will retry on next advance",
             label_for_log, advanced_to, e
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pure unit tests for the per-job notification kill-switches. The
+    //! job bodies themselves need live MSSQL/PG pools and are covered by
+    //! the integration suite.
+    use super::*;
+
+    /// The four informational Slack jobs registered by
+    /// `init_scheduler`, in registration order.
+    const NOTIFICATION_FLAGS: [&str; 4] = [
+        "HOURLY_REPORT_ENABLED",
+        "CHECKIN_NOTIFICATIONS_ENABLED",
+        "CHECKOUT_NOTIFICATIONS_ENABLED",
+        "BOOKING_NOTIFICATIONS_ENABLED",
+    ];
+
+    /// Env-var manipulation across parallel cargo tests would race; we
+    /// serialise these tests behind a Mutex and restore the prior value.
+    /// The lock is process-wide because `set_var` is too. Same shape as
+    /// `scheduler::sync::tests::with_mode_env`.
+    fn with_flag_env<F: FnOnce() -> bool>(var: &str, value: Option<&str>, f: F) -> bool {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _g = LOCK.lock().unwrap();
+        let prior = std::env::var(var).ok();
+        match value {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
+        let out = f();
+        match prior {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
+        out
+    }
+
+    #[test]
+    fn every_notification_flag_defaults_to_disabled_when_unset() {
+        for var in NOTIFICATION_FLAGS {
+            assert!(
+                !with_flag_env(var, None, || notification_flag_enabled(var)),
+                "{var} must default to DISABLED — these jobs POST to Slack once \
+                 per row on the same webhook as every page, so absence of config \
+                 must mean quiet, not a booking feed"
+            );
+        }
+    }
+
+    #[test]
+    fn every_notification_flag_enables_on_explicit_true() {
+        for var in NOTIFICATION_FLAGS {
+            assert!(
+                with_flag_env(var, Some("true"), || notification_flag_enabled(var)),
+                "{var}=true must still enable the job — the opt-in path is unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn every_notification_flag_enables_on_explicit_one() {
+        for var in NOTIFICATION_FLAGS {
+            assert!(
+                with_flag_env(var, Some("1"), || notification_flag_enabled(var)),
+                "{var}=1 must enable the job (repo idiom accepts \"true\" or \"1\")"
+            );
+        }
+    }
+
+    #[test]
+    fn every_notification_flag_stays_disabled_on_explicit_false() {
+        // This is the live production value for all four (GitHub repo
+        // variables, set 2026-05-19) — pinning it proves the
+        // default flip is a production no-op.
+        for var in NOTIFICATION_FLAGS {
+            assert!(
+                !with_flag_env(var, Some("false"), || notification_flag_enabled(var)),
+                "{var}=false must remain DISABLED"
+            );
+        }
+    }
+
+    #[test]
+    fn unrecognised_notification_flag_value_is_disabled() {
+        for var in NOTIFICATION_FLAGS {
+            for value in ["TRUE", "yes", "on", ""] {
+                assert!(
+                    !with_flag_env(var, Some(value), || notification_flag_enabled(var)),
+                    "{var}={value:?} is not a recognised opt-in and must stay DISABLED"
+                );
+            }
+        }
     }
 }

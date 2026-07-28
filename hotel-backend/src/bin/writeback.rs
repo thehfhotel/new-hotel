@@ -34,6 +34,7 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -80,11 +81,20 @@ const STUCK_IN_PROGRESS_TIMEOUT_SECS: i64 = 300;
 /// migration drift, etc.) and needs investigation.
 const SELF_HEAL_ALERT_THRESHOLD: u32 = 5;
 
-/// Self-heal alert window (audit MED-4). Sized to be longer than the
-/// "expected" salvages (a handful per hour from CreateBooking↔CheckIn races)
-/// but short enough that an operator gets the page within one coffee break of
-/// a real regression. After firing, the counter resets — back-to-back bursts
-/// produce back-to-back alerts (every 5 min, not every event).
+/// Self-heal alert window (audit MED-4). Two jobs, both measured in TIME:
+///
+/// * the burst window — `SELF_HEAL_ALERT_THRESHOLD` events must land inside
+///   it before anything fires, so a handful of expected salvages per hour
+///   (CreateBooking↔CheckIn races) never pages;
+/// * the minimum gap between two self-heal pages, so a sustained salvage
+///   rate cannot page faster than once per window.
+///
+/// The second job used to be missing. `should_alert` zeroed the counter when
+/// it fired and nothing else gated the next send, so the real meaning was
+/// "one alert per {SELF_HEAL_ALERT_THRESHOLD} events" — at 5 salvages/second
+/// (a broken back-population during a queue drain) that is one Slack POST
+/// per second, with no floor on the interval at all. The floor is now
+/// explicit: see `SelfHealCounter::last_alert_at`.
 const SELF_HEAL_WINDOW_SECS: u64 = 300;
 
 /// Collapse window for the `Writeback EXHAUSTED retries` page.
@@ -109,11 +119,51 @@ const SELF_HEAL_WINDOW_SECS: u64 = 300;
 /// actionable one, and it carries the full error text.
 const EXHAUSTED_ALERT_WINDOW_SECS: u64 = 300;
 
-/// Listener supervisor: max consecutive immediate failures before we slow
-/// down + page the operator (audit LOW-3). Matches the ~10 retries-in-50s
-/// budget below; past this point the listener is broken in a way that
-/// reconnecting won't fix (PG down, network partition, auth revoked).
-const LISTENER_MAX_CONSECUTIVE_FAILURES: u32 = 10;
+/// Listener supervisor: how long the NOTIFY listener has to be
+/// **continuously** down before the operator is paged (audit LOW-3, recalibrated).
+///
+/// This alert used to fire on a COUNT — 10 consecutive respawn failures —
+/// with the counter zeroed on every send and no cooldown timestamp. At a 5s
+/// backoff that is one page per ~105s (10×5s of retries + the 60s post-alert
+/// backoff) for the entire duration of an outage, for a condition that is
+/// self-recovering by design: the supervisor reconnects forever, and the
+/// worker keeps draining the queue on its 30s poll the whole time. Nothing
+/// is lost, nothing is stuck; only NOTIFY latency degrades (sub-second ⇒
+/// ≤30s). That is a log line, not a page.
+///
+/// **Why 10 minutes.** Two independent grounds:
+///
+/// * *Every self-recovering cause clears well inside it.* The routine PG
+///   interruptions here are a deploy (`run-deploy.sh` recreating containers
+///   and running migrations), a `newdb` restart, a brief WireGuard blip, or
+///   a `max_connections` spike — all seconds-to-low-minutes. Ten minutes is
+///   past all of them, so a page at this point means reconnection is NOT
+///   happening on its own.
+/// * *It outlives every other self-healing mechanism in this binary.* It is
+///   2× `STUCK_IN_PROGRESS_TIMEOUT_SECS` (the janitor's claim-steal window),
+///   so an operator paged here is looking at something that already survived
+///   the worker's own recovery paths. At `LISTENER_BACKOFF_SECS` that is
+///   ~120 failed reconnects in a row — unambiguous.
+///
+/// Cost of waiting: the queue is drained on the 30s poll throughout, so the
+/// whole delay buys at most ~20 extra polls of added latency and zero
+/// durability risk. Bulk symptoms have their own faster page — the
+/// queue-depth janitor fires on `pending > 500` regardless of this alert.
+const LISTENER_SUSTAINED_OUTAGE_SECS: u64 = 600;
+
+/// Listener supervisor: minimum gap between two pages inside ONE sustained
+/// outage. Matches `QUEUE_DEPTH_ALERT_COOLDOWN_SECS` — the operator is
+/// already engaged after the first page; re-stating it every 105s only
+/// trains them to mute the channel.
+const LISTENER_REPAGE_COOLDOWN_SECS: u64 = 1800;
+
+/// Listener supervisor: how long a subscription must survive before the
+/// session counts as HEALTHY and clears the outage clock. One poll interval
+/// (30s) — long enough that a connect-then-instantly-drop flap keeps
+/// accumulating toward the sustained threshold instead of resetting it on
+/// every attempt, short enough that a genuinely recovered listener closes
+/// the incident on its first good session.
+const LISTENER_HEALTHY_SESSION_SECS: u64 = 30;
 
 /// Listener supervisor: base sleep between respawn attempts. Short enough
 /// that a transient PG conn drop is invisible to the operator (5s gap in
@@ -128,12 +178,14 @@ const LISTENER_BACKOFF_SECS: u64 = 5;
 /// `process_job` for the full rationale.
 const RESET_TRANCOUNT_SQL: &str = "IF @@TRANCOUNT > 0 ROLLBACK";
 
-/// Listener supervisor: extended backoff after exceeding
-/// `LISTENER_MAX_CONSECUTIVE_FAILURES`. We don't give up — exiting would
+/// Listener supervisor: extended backoff once an outage has passed
+/// `LISTENER_SUSTAINED_OUTAGE_SECS`. We don't give up — exiting would
 /// leave the worker with no NOTIFY signal source, relying solely on the
 /// 30s poll. We keep retrying but at a sustainable cadence so the operator
-/// has time to investigate.
-const LISTENER_BACKOFF_AFTER_ALERT_SECS: u64 = 60;
+/// has time to investigate. Tied to the outage duration, NOT to whether a
+/// page was sent: the cadence should slow because the outage is long, not
+/// because Slack was told about it.
+const LISTENER_BACKOFF_SUSTAINED_SECS: u64 = 60;
 
 /// Track D / T7 HIGH-2 — queue-depth janitor poll interval (60s).
 /// Reads `writeback_jobs` grouped by status and pages when any
@@ -203,6 +255,294 @@ fn init_site_id(id: &str) {
 /// Read the process-wide SITE_ID; defaults to `"hfhotel"` if uninit.
 fn current_site_id() -> &'static str {
     SITE_ID.get().map(String::as_str).unwrap_or("hfhotel")
+}
+
+// -----------------------------------------------------------------------
+// Startup probes (collation / schema fingerprint / idempotency ledger)
+//
+// All three refuse to start the worker, and all three used to conflate two
+// completely different situations:
+//
+//   * the probe's read came back and the ANSWER is bad — a real, permanent
+//     configuration problem the operator has to fix;
+//   * the probe never got an answer — legacy MSSQL slow or unreachable
+//     (HF Ville over WireGuard at a quiet hour is the everyday case).
+//
+// The fingerprint probe was hardened for this in incident 2026-06-28: a
+// timed-out catalog read that mis-reported as "schema drift" could lead an
+// operator to re-baseline against a bad read. The collation and ledger
+// probes still mapped ANY failure — including a bb8 pool timeout — onto
+// "collation is case-sensitive" / "`dbo.ht_writeback_ledger` is missing",
+// and they run FIRST, so on a tunnel blip they shadowed the hardened path
+// entirely and sent the operator to re-collate a database or re-apply an
+// already-applied migration. That is how "REFUSED TO START" gets learned as
+// "probably the tunnel again" — including on the day it is real.
+// -----------------------------------------------------------------------
+
+/// Why a startup probe refused to let the worker boot. The distinction is
+/// the whole point: it decides which of two mutually-exclusive stories the
+/// Slack alert tells, and therefore whether the operator touches the legacy
+/// database at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeFailureKind {
+    /// The read COMPLETED and the value it returned is the bad one. Only
+    /// here may the alert name the permanent cause and hand out a
+    /// remediation that mutates legacy state.
+    Confirmed,
+    /// The read never completed, after every retry — timeout, pool
+    /// exhaustion, dead tunnel. Nothing is known about the thing being
+    /// probed, so the alert must say exactly that and tell the operator
+    /// NOT to act on the permanent cause.
+    Unreachable,
+}
+
+/// A startup probe's terminal failure, after retries.
+struct ProbeFailure {
+    kind: ProbeFailureKind,
+    err: WritebackError,
+    /// Attempts actually made — 1 for a confirmed failure (no point
+    /// retrying a definite answer), `attempts` for an unreachable one.
+    attempts: u32,
+}
+
+/// Default attempts per startup probe before refusing to start. Four
+/// attempts with the 6/12/18s backoff below spans ~36s — longer than any
+/// WireGuard re-handshake or `newdb`/legacy restart blip.
+const DEFAULT_STARTUP_PROBE_ATTEMPTS: u32 = 4;
+
+/// Attempt budget shared by all three startup probes.
+/// `WRITEBACK_FINGERPRINT_ATTEMPTS` is still honoured — it was the
+/// fingerprint probe's own knob before the other two got the same
+/// treatment, and it may be set in a live `.env`.
+fn startup_probe_attempts() -> u32 {
+    parse_probe_attempts(
+        env::var("WRITEBACK_STARTUP_PROBE_ATTEMPTS").ok().as_deref(),
+        env::var("WRITEBACK_FINGERPRINT_ATTEMPTS").ok().as_deref(),
+    )
+}
+
+/// Pure half of [`startup_probe_attempts`] — new name wins, old name is the
+/// fallback, anything unparseable or `< 1` falls back to the default (a
+/// zero would skip the probe entirely, which is not a thing we let an env
+/// typo do).
+fn parse_probe_attempts(primary: Option<&str>, legacy: Option<&str>) -> u32 {
+    primary
+        .or(legacy)
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(DEFAULT_STARTUP_PROBE_ATTEMPTS)
+}
+
+/// Fingerprint probe: only a hash mismatch is a confirmed answer. Every
+/// other failure means the catalog read itself did not land, and re-running
+/// `writeback-fingerprint.sh` against a bad read is how you corrupt the
+/// baseline (incident 2026-06-28).
+fn fingerprint_failure_is_confirmed(err: &WritebackError) -> bool {
+    matches!(err, WritebackError::SchemaDrift { .. })
+}
+
+/// Catalog probes (collation + idempotency ledger): both issue one tiny
+/// `SELECT` and turn its ANSWER into `WritebackError::Config`. Every
+/// transport failure — `pool.get()`, the per-op timeout, a driver error —
+/// arrives as `Pool` / `Tiberius` / `Sqlx` instead, and means the answer
+/// was never seen.
+///
+/// Written as an exhaustive match, not a `matches!`, so a new
+/// `WritebackError` variant fails the build here and forces someone to
+/// decide which side of this line it falls on.
+fn catalog_probe_failure_is_confirmed(err: &WritebackError) -> bool {
+    match err {
+        // The SELECT came back; `Config` carries what it said (a `_CS_`
+        // collation name, a NULL `OBJECT_ID`, an unreadable result shape).
+        WritebackError::Config(_) => true,
+        // The read never completed. Retry, then report connectivity.
+        WritebackError::Tiberius(_) | WritebackError::Pool(_) | WritebackError::Sqlx(_) => false,
+        // Not producible by either probe today. Fail loud rather than
+        // retry-then-blame-the-network on something deterministic.
+        WritebackError::SchemaDrift { .. }
+        | WritebackError::Disabled
+        | WritebackError::IntentMismatch(_)
+        | WritebackError::Recipe(_)
+        | WritebackError::Serde(_) => true,
+    }
+}
+
+/// Run one startup probe, retrying transient failures with a 6/12/18s
+/// backoff, and classify the terminal failure.
+///
+/// `is_confirmed` decides what "transient" means for this probe — it is
+/// per-probe on purpose: a `Config` error is a definite answer from the
+/// collation/ledger probes but merely a malformed catalog read from the
+/// fingerprint probe, which retries it.
+///
+/// A confirmed failure short-circuits: re-asking a question that already
+/// has a definite answer only delays the page.
+async fn run_startup_probe<F, Fut>(
+    site_id: &str,
+    label: &str,
+    attempts: u32,
+    is_confirmed: fn(&WritebackError) -> bool,
+    mut probe: F,
+) -> Result<(), ProbeFailure>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), WritebackError>>,
+{
+    let attempts = attempts.max(1);
+    // Overwritten on the first failing attempt; `attempts >= 1` makes the
+    // sentinel unreachable, but it keeps this function panic-free.
+    let mut last = WritebackError::Config(format!("{label}: probe never ran"));
+    for attempt in 1..=attempts {
+        match probe().await {
+            Ok(()) => return Ok(()),
+            Err(e) if is_confirmed(&e) => {
+                return Err(ProbeFailure {
+                    kind: ProbeFailureKind::Confirmed,
+                    err: e,
+                    attempts: attempt,
+                });
+            }
+            Err(e) => {
+                if attempt < attempts {
+                    let backoff = Duration::from_secs((attempt as u64) * 6);
+                    tracing::warn!(
+                        site = %site_id,
+                        probe = label,
+                        attempt,
+                        attempts,
+                        backoff_secs = backoff.as_secs(),
+                        error = %e,
+                        "Startup probe read failed (transient) — retrying before refusing"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+                last = e;
+            }
+        }
+    }
+    Err(ProbeFailure {
+        kind: ProbeFailureKind::Unreachable,
+        err: last,
+        attempts,
+    })
+}
+
+/// Slack body for the collation probe (W1).
+///
+/// The `Confirmed` branch deliberately does not assert *which* bad answer
+/// came back — `verify_legacy_collation_safety` also fails when the probe
+/// returns no rows or an unreadable column, and the error text says which.
+/// What it does assert, and what the old unconditional message could not,
+/// is that an answer WAS received: the operator is looking at a real
+/// configuration problem, not at the tunnel.
+fn collation_probe_alert_body(kind: ProbeFailureKind, attempts: u32, err: &str) -> String {
+    match kind {
+        ProbeFailureKind::Confirmed => format!(
+            ":warning: *Writeback worker REFUSED TO START* :warning:\n\
+             Legacy MSSQL collation check FAILED — the probe read succeeded, so this \
+             is a real configuration problem, not connectivity.\n\
+             *Error:* `{err}`\n\
+             _Recipes pin every string literal to the case iHOTEL emits, so a \
+             case-sensitive (`_CS_`) collation silently forks our SQL filters. \
+             Expected `Thai_CI_AS` (or any `_CI_` collation) — restore the legacy DB \
+             with a case-insensitive collation before retrying._"
+        ),
+        ProbeFailureKind::Unreachable => format!(
+            ":warning: *Writeback worker could not start* :warning:\n\
+             Could NOT read the legacy server collation after {attempts} attempts \
+             (legacy MSSQL slow/unreachable — e.g. HF Ville over WireGuard).\n\
+             *Error:* `{err}`\n\
+             _This is a connectivity/timeout problem, NOT a collation problem — the \
+             collation was never read, so nothing is known about it. Do NOT re-collate \
+             or restore the legacy DB. The worker retries on restart; check the site \
+             server / WireGuard if it persists._"
+        ),
+    }
+}
+
+/// Slack body for the schema-fingerprint probe (W3). Both texts are the
+/// ones this probe already sent — it was the one guard that got this right,
+/// and the other two are now modelled on it.
+fn fingerprint_probe_alert_body(kind: ProbeFailureKind, attempts: u32, err: &str) -> String {
+    match kind {
+        ProbeFailureKind::Confirmed => format!(
+            ":warning: *Writeback worker REFUSED TO START* :warning:\n\
+             Legacy MSSQL schema fingerprint MISMATCH (real drift).\n\
+             *Error:* `{err}`\n\
+             _The legacy DB columns drifted from the captured baseline. \
+             Run_ `./scripts/writeback-fingerprint.sh` _and follow the \
+             README to update the baseline before restarting the worker._"
+        ),
+        ProbeFailureKind::Unreachable => format!(
+            ":warning: *Writeback worker could not start* :warning:\n\
+             Could NOT read the legacy schema after {attempts} attempts \
+             (legacy MSSQL slow/unreachable — e.g. HF Ville over WireGuard).\n\
+             *Error:* `{err}`\n\
+             _This is a connectivity/timeout problem, NOT confirmed schema \
+             drift — do NOT run `writeback-fingerprint.sh`. The worker retries \
+             on restart; check the site server / WireGuard if it persists._"
+        ),
+    }
+}
+
+/// Slack body for the idempotency-ledger probe (W4).
+fn ledger_probe_alert_body(kind: ProbeFailureKind, attempts: u32, err: &str) -> String {
+    match kind {
+        ProbeFailureKind::Confirmed => format!(
+            ":warning: *Writeback worker REFUSED TO START* :warning:\n\
+             Legacy idempotency ledger `dbo.ht_writeback_ledger` is MISSING — the probe \
+             read succeeded and `OBJECT_ID` came back NULL.\n\
+             *Error:* `{err}`\n\
+             _Apply_ `migrations/legacy-mssql/024_writeback_ledger.sql` _(the deploy runs_ \
+             `scripts/migrate-legacy-mssql.sh` _automatically — check its output / \
+             `dbo.ht_legacy_migrations`). It is the crash-after-commit duplicate guard for \
+             create recipes; the worker will not run without it._"
+        ),
+        ProbeFailureKind::Unreachable => format!(
+            ":warning: *Writeback worker could not start* :warning:\n\
+             Could NOT probe for `dbo.ht_writeback_ledger` after {attempts} attempts \
+             (legacy MSSQL slow/unreachable — e.g. HF Ville over WireGuard).\n\
+             *Error:* `{err}`\n\
+             _This is a connectivity/timeout problem, NOT a missing table — the probe \
+             never got an answer, so the ledger's presence is UNKNOWN. Do NOT re-apply_ \
+             `024_writeback_ledger.sql` _chasing this; it is almost certainly already \
+             applied (check `dbo.ht_legacy_migrations`). The worker retries on restart; \
+             check the site server / WireGuard if it persists._"
+        ),
+    }
+}
+
+/// Shared fail-loud envelope for a startup probe that refused the boot:
+/// log, post `body` to Slack, then sleep before exiting so Docker's
+/// `restart: unless-stopped` backs off instead of re-paging 6×/min.
+/// Returns the string `main` bubbles up as its error.
+async fn refuse_to_start(
+    slack: &Option<SlackClient>,
+    site_id: &str,
+    what: &str,
+    failure: &ProbeFailure,
+    body: String,
+) -> String {
+    tracing::error!(
+        site = %site_id,
+        probe = what,
+        error = %failure.err,
+        confirmed = failure.kind == ProbeFailureKind::Confirmed,
+        attempts = failure.attempts,
+        "Startup probe failed — refusing to start"
+    );
+    if let Some(slack) = slack {
+        let _ = slack
+            .send_message(&SlackMessage::with_site_text(site_id, body))
+            .await;
+    }
+    tracing::warn!(
+        site = %site_id,
+        "Sleeping 60s before exit to throttle Docker restart cadence \
+         and avoid Slack alert flood"
+    );
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    format!("{what} failed: {}", failure.err)
 }
 
 #[tokio::main]
@@ -280,38 +620,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
+    // 4b0. All three startup probes share one retry + classification
+    //      envelope (see `run_startup_probe`). Each retries a read that did
+    //      not land, and only names its permanent cause when the read
+    //      actually came back with a bad answer.
+    let probe_attempts = startup_probe_attempts();
+    let mssql_probe = &mssql;
+
     // 4b1. Wave 6 LOW item 8 — Ville cutover safety: refuse to start on a
     //      case-sensitive collation. Recipes pin every string literal to
     //      the case the .NET app emits; a `_CS_` collation would silently
     //      fork our SQL filters on a fresh Ville cutover. Cheap one-row
     //      SELECT — runs before the fingerprint check so a misconfigured
     //      Ville fails fast at startup.
-    if let Err(e) = verify_legacy_collation_safety(&mssql).await {
-        tracing::error!(
-            site = %site.id,
-            error = %e,
-            "Legacy MSSQL collation check failed — refusing to start"
-        );
-        if let Some(slack) = &slack {
-            let msg = SlackMessage::with_site_text(
-                &site.id,
-                format!(
-                    ":warning: *Writeback worker REFUSED TO START* :warning:\n\
-                     Legacy MSSQL collation is case-sensitive.\n\
-                     *Error:* `{e}`\n\
-                     _Recipes assume `Thai_CI_AS` (or any `_CI_` collation). \
-                     Restore the legacy DB with a case-insensitive collation \
-                     before retrying._"
-                ),
-            );
-            let _ = slack.send_message(&msg).await;
-        }
-        tracing::warn!(
-            site = %site.id,
-            "Sleeping 60s before exit to throttle Docker restart cadence"
-        );
-        tokio::time::sleep(Duration::from_secs(60)).await;
-        return Err(format!("Legacy collation check failed: {e}").into());
+    //
+    //      Because it runs FIRST, an unclassified failure here shadows the
+    //      fingerprint probe's careful transient/permanent split: a pool
+    //      timeout on the very first legacy round-trip of the process used
+    //      to be reported as "collation is case-sensitive".
+    if let Err(f) = run_startup_probe(
+        &site.id,
+        "legacy collation",
+        probe_attempts,
+        catalog_probe_failure_is_confirmed,
+        || verify_legacy_collation_safety(mssql_probe),
+    )
+    .await
+    {
+        let body = collation_probe_alert_body(f.kind, f.attempts, &f.err.to_string());
+        return Err(refuse_to_start(&slack, &site.id, "Legacy collation check", &f, body)
+            .await
+            .into());
     }
 
     // 4b. Schema fingerprint guard — refuse to start on drift, but post
@@ -326,81 +665,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // `SchemaDrift` (read succeeded, hash differs) should tell the operator to
     // run `writeback-fingerprint.sh`. Mis-firing that on a timeout could lead to
     // updating the baseline against a bad read and corrupting it (incident
-    // 2026-06-28). Attempts tunable via WRITEBACK_FINGERPRINT_ATTEMPTS.
-    let fp_attempts: u32 = std::env::var("WRITEBACK_FINGERPRINT_ATTEMPTS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n| *n >= 1)
-        .unwrap_or(4);
-    let mut fp_outcome: Result<(), WritebackError> = Ok(());
-    for attempt in 1..=fp_attempts {
-        match verify_schema_fingerprint(&mssql).await {
-            Ok(()) => {
-                fp_outcome = Ok(());
-                break;
-            }
-            // Real drift — the read succeeded but the hash differs. Don't retry.
-            Err(e @ WritebackError::SchemaDrift { .. }) => {
-                fp_outcome = Err(e);
-                break;
-            }
-            // Transient (timeout / I/O / pool) — retry with backoff.
-            Err(e) => {
-                fp_outcome = Err(e);
-                if attempt < fp_attempts {
-                    let backoff = Duration::from_secs((attempt as u64) * 6);
-                    tracing::warn!(
-                        site = %site.id,
-                        attempt,
-                        attempts = fp_attempts,
-                        backoff_secs = backoff.as_secs(),
-                        "Schema fingerprint read failed (transient) — retrying before refusing"
-                    );
-                    tokio::time::sleep(backoff).await;
-                }
-            }
-        }
-    }
-    if let Err(e) = fp_outcome {
-        let is_drift = matches!(e, WritebackError::SchemaDrift { .. });
-        tracing::error!(
-            site = %site.id,
-            error = %e,
-            is_drift,
-            "Schema fingerprint check failed — refusing to start"
+    // 2026-06-28).
+    if let Err(f) = run_startup_probe(
+        &site.id,
+        "schema fingerprint",
+        probe_attempts,
+        fingerprint_failure_is_confirmed,
+        || verify_schema_fingerprint(mssql_probe),
+    )
+    .await
+    {
+        let body = fingerprint_probe_alert_body(f.kind, f.attempts, &f.err.to_string());
+        return Err(
+            refuse_to_start(&slack, &site.id, "Schema fingerprint check", &f, body)
+                .await
+                .into(),
         );
-        if let Some(slack) = &slack {
-            let body = if is_drift {
-                format!(
-                    ":warning: *Writeback worker REFUSED TO START* :warning:\n\
-                     Legacy MSSQL schema fingerprint MISMATCH (real drift).\n\
-                     *Error:* `{e}`\n\
-                     _The legacy DB columns drifted from the captured baseline. \
-                     Run_ `./scripts/writeback-fingerprint.sh` _and follow the \
-                     README to update the baseline before restarting the worker._"
-                )
-            } else {
-                format!(
-                    ":warning: *Writeback worker could not start* :warning:\n\
-                     Could NOT read the legacy schema after {fp_attempts} attempts \
-                     (legacy MSSQL slow/unreachable — e.g. HF Ville over WireGuard).\n\
-                     *Error:* `{e}`\n\
-                     _This is a connectivity/timeout problem, NOT confirmed schema \
-                     drift — do NOT run `writeback-fingerprint.sh`. The worker retries \
-                     on restart; check the site server / WireGuard if it persists._"
-                )
-            };
-            let _ = slack
-                .send_message(&SlackMessage::with_site_text(&site.id, body))
-                .await;
-        }
-        tracing::warn!(
-            site = %site.id,
-            "Sleeping 60s before exit to throttle Docker restart cadence \
-             and avoid Slack alert flood"
-        );
-        tokio::time::sleep(Duration::from_secs(60)).await;
-        return Err(format!("Schema fingerprint check failed: {e}").into());
     }
 
     // 4c. Idempotency-ledger guard — refuse to start if dbo.ht_writeback_ledger
@@ -408,34 +688,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     //     the create recipes is silently gone (a missing table reads as a
     //     retryable Tiberius error -> retry-storm with zero protection). Same
     //     fail-loud + Slack + throttle-sleep envelope as the fingerprint guard.
-    if let Err(e) = verify_writeback_ledger_exists(&mssql).await {
-        tracing::error!(
-            site = %site.id,
-            error = %e,
-            "Writeback idempotency ledger missing — refusing to start"
+    if let Err(f) = run_startup_probe(
+        &site.id,
+        "writeback ledger",
+        probe_attempts,
+        catalog_probe_failure_is_confirmed,
+        || verify_writeback_ledger_exists(mssql_probe),
+    )
+    .await
+    {
+        let body = ledger_probe_alert_body(f.kind, f.attempts, &f.err.to_string());
+        return Err(
+            refuse_to_start(&slack, &site.id, "Writeback ledger check", &f, body)
+                .await
+                .into(),
         );
-        if let Some(slack) = &slack {
-            let msg = SlackMessage::with_site_text(
-                &site.id,
-                format!(
-                    ":warning: *Writeback worker REFUSED TO START* :warning:\n\
-                     Legacy idempotency ledger `dbo.ht_writeback_ledger` is missing.\n\
-                     *Error:* `{e}`\n\
-                     _Apply_ `migrations/legacy-mssql/024_writeback_ledger.sql` _(the deploy runs_ \
-                     `scripts/migrate-legacy-mssql.sh` _automatically — check its output / \
-                     `dbo.ht_legacy_migrations`). It is the crash-after-commit duplicate guard for \
-                     create recipes; the worker will not run without it._"
-                ),
-            );
-            let _ = slack.send_message(&msg).await;
-        }
-        tracing::warn!(
-            site = %site.id,
-            "Sleeping 60s before exit to throttle Docker restart cadence \
-             and avoid Slack alert flood"
-        );
-        tokio::time::sleep(Duration::from_secs(60)).await;
-        return Err(format!("Writeback idempotency ledger missing: {e}").into());
     }
 
     // 5. NOTIFY listener + poll fallback. The listener is wrapped in a
@@ -1585,6 +1852,12 @@ struct SelfHealCounter {
     /// `SELF_HEAL_ALERT_THRESHOLD * 2` so Slack body stays small even if
     /// the threshold is bumped in env config later.
     aggregates: Vec<Uuid>,
+    /// When the last self-heal alert was SENT. This is what makes the
+    /// throttle a time window rather than a counter: without it, zeroing
+    /// `count` on fire is the only thing standing between a sustained
+    /// salvage rate and one Slack POST per `SELF_HEAL_ALERT_THRESHOLD`
+    /// events, however fast those arrive.
+    last_alert_at: Option<Instant>,
 }
 
 impl SelfHealCounter {
@@ -1593,6 +1866,7 @@ impl SelfHealCounter {
             window_start: None,
             count: 0,
             aggregates: Vec::new(),
+            last_alert_at: None,
         }
     }
 }
@@ -1624,14 +1898,26 @@ fn self_heal_counter() -> &'static Arc<Mutex<SelfHealCounter>> {
 /// Pure throttle decision — extracted from the IO path so the threshold and
 /// window logic can be unit-tested without spinning up Slack or PG.
 ///
-/// Rules:
-///   - First event in a new window opens the window at `now` and counts 1.
-///   - Subsequent events inside the same window bump the count.
-///   - When count reaches `threshold`, return `fire=true` AND reset the
-///     window so the next event opens a fresh one (no spam — exactly one
-///     alert per `window_secs` per burst).
-///   - When an event arrives after the window has expired, the window
-///     resets to `now` with count=1 (no spurious alert from a stale count).
+/// `window` does two things, and both are measured in TIME:
+///
+///   - **Burst window.** `threshold` events have to land inside it before
+///     anything fires. Events arriving after it lapses open a fresh window
+///     at count=1, so a stale partial burst from an hour ago never
+///     contributes to a page now.
+///   - **Alert floor.** Two alerts are never less than `window` apart, no
+///     matter the event rate — `last_alert_at` gates the send.
+///
+/// **The floor is the fix.** The original implementation only zeroed the
+/// counter on fire, which reads as a throttle but isn't one: the meaning was
+/// "one alert per `threshold` events", so at a sustained salvage rate (a
+/// broken back-population while the queue drains) the interval between
+/// pages collapsed to whatever `threshold` events cost — potentially
+/// sub-second, with nothing bounding it. The counter still resets on fire
+/// so the next page reports only what happened since the last one; the
+/// floor is what stops the storm.
+///
+/// Events that arrive while the floor is closed are still counted (and
+/// still logged at warn by the caller) — suppression here is never silent.
 fn should_alert(
     state: &mut SelfHealCounter,
     now: Instant,
@@ -1652,7 +1938,14 @@ fn should_alert(
 
     state.count = state.count.saturating_add(1);
 
-    let fire = state.count >= threshold;
+    // Time floor: an alert may only go out if we haven't sent one inside
+    // `window`. First ever alert (None) is always allowed through.
+    let floor_clear = state
+        .last_alert_at
+        .map(|sent| now.duration_since(sent) >= window)
+        .unwrap_or(true);
+
+    let fire = state.count >= threshold && floor_clear;
     let decision = AlertDecision {
         fire,
         count: state.count,
@@ -1660,9 +1953,10 @@ fn should_alert(
     };
 
     if fire {
-        // Reset for the next window so we don't re-fire on every event past
-        // the threshold (audit-mandated throttle).
-        state.window_start = None;
+        // Open the floor's cooldown and start counting again from zero, so
+        // the next page reports the volume accumulated since THIS one.
+        state.last_alert_at = Some(now);
+        state.window_start = Some(now);
         state.count = 0;
         state.aggregates.clear();
     }
@@ -1705,12 +1999,15 @@ async fn record_self_heal(slack: &Option<SlackClient>, aggregate_id: Uuid) {
     };
 
     // Per-event log (warn) so a log-grep alert can catch sustained drift
-    // even if Slack is offline.
+    // even if Slack is offline. `page_held` marks the events that WOULD
+    // have paged but for the time floor — suppression by the throttle is
+    // never invisible, it just isn't a Slack message.
     tracing::warn!(
         %aggregate_id,
         count = decision.count,
         window_secs = decision.window_secs,
         threshold = SELF_HEAL_ALERT_THRESHOLD,
+        page_held = !decision.fire && decision.count >= SELF_HEAL_ALERT_THRESHOLD,
         "Self-heal event recorded"
     );
 
@@ -2946,9 +3243,21 @@ fn truncate_head_tail(s: &str, head_chars: usize, tail_chars: usize) -> String {
 }
 
 /// Long-lived PG LISTEN connection; signals the main loop on every NOTIFY.
-async fn run_listener(pg: PgPool, wakeup: Arc<Notify>) -> Result<(), sqlx::Error> {
+///
+/// `subscribed` is set the moment the `LISTEN` lands, so the supervisor can
+/// tell "never got a connection" apart from "was live and then dropped".
+/// Without that distinction there is no way to know whether an outage is
+/// still going: a listener that reconnects cleanly and runs for hours, then
+/// hits one `recv()` error, is indistinguishable from one that has never
+/// come up.
+async fn run_listener(
+    pg: PgPool,
+    wakeup: Arc<Notify>,
+    subscribed: &AtomicBool,
+) -> Result<(), sqlx::Error> {
     let mut listener = PgListener::connect_with(&pg).await?;
     listener.listen(WRITEBACK_CHANNEL).await?;
+    subscribed.store(true, Ordering::Relaxed);
     tracing::info!(channel = WRITEBACK_CHANNEL, "PgListener subscribed");
     loop {
         match listener.recv().await {
@@ -2964,85 +3273,272 @@ async fn run_listener(pg: PgPool, wakeup: Arc<Notify>) -> Result<(), sqlx::Error
     }
 }
 
-/// Supervisor for `run_listener` (audit LOW-3). Respawns the listener on
-/// every error with a 5s backoff; if `LISTENER_MAX_CONSECUTIVE_FAILURES`
-/// happen back-to-back, fires a Slack alert and slows the retry cadence
-/// to `LISTENER_BACKOFF_AFTER_ALERT_SECS` (one alert per burst — same
-/// throttle pattern as MED-4) but never gives up.
+/// Rolling health of the NOTIFY listener, as seen by its supervisor.
+///
+/// The old version of this was a bare `consecutive_failures` counter that
+/// paged at 10 and zeroed itself on every send. Two things were wrong with
+/// it, and both made the page less trustworthy the longer an outage ran:
+/// the counter had no notion of "the listener has been fine for six hours"
+/// (nothing reset it on a healthy session, so ten unrelated `recv()` errors
+/// spread over days added up to a page), and zeroing on fire with no
+/// timestamp made re-firing a function of the retry cadence — ~105s during
+/// a sustained outage.
+#[derive(Debug, Default)]
+struct ListenerHealth {
+    /// Start of the current uninterrupted outage. `None` = no outage in
+    /// progress (only true before the first failure).
+    outage_started: Option<Instant>,
+    /// Failed sessions since the last healthy one. Reported for context;
+    /// it is no longer what decides the page.
+    consecutive_failures: u32,
+    /// When the last page for this outage went out — the re-page floor.
+    last_paged_at: Option<Instant>,
+    /// Whether this outage has already paged, i.e. whether recovery owes
+    /// the operator an all-clear.
+    paged_this_outage: bool,
+}
+
+/// What the supervisor should do after one listener session ended.
+#[derive(Debug, PartialEq, Eq)]
+enum ListenerAction {
+    /// Log it and reconnect. The overwhelming majority — a reconnect loop
+    /// doing its job is not news.
+    LogOnly,
+    /// The listener has been continuously down for
+    /// `LISTENER_SUSTAINED_OUTAGE_SECS`. Reconnection is not happening on
+    /// its own; page.
+    Page { outage_secs: u64, consecutive_failures: u32 },
+    /// A healthy session closed an outage we had paged for — post the
+    /// all-clear so the channel doesn't keep a stale alarm open.
+    Recovered { outage_secs: u64 },
+}
+
+/// Action + how long to wait before respawning.
+#[derive(Debug, PartialEq, Eq)]
+struct ListenerDecision {
+    action: ListenerAction,
+    backoff_secs: u64,
+}
+
+/// Pure supervisor policy — called once per ended listener session.
+///
+/// `healthy_session` means the subscription actually came up AND survived
+/// `LISTENER_HEALTHY_SESSION_SECS`; a connect-then-instantly-drop flap is
+/// NOT healthy and keeps accumulating toward the sustained threshold.
+///
+/// The page is gated on elapsed outage TIME, not on a failure count, and
+/// re-pages inside one outage are floored at `repage_cooldown`. Backoff
+/// tracks the outage duration rather than the alert: the retry cadence
+/// should slow because the outage is long, not because Slack was told.
+fn decide_listener_action(
+    state: &mut ListenerHealth,
+    now: Instant,
+    healthy_session: bool,
+    sustained: Duration,
+    repage_cooldown: Duration,
+) -> ListenerDecision {
+    if healthy_session {
+        // The listener was live for a meaningful stretch, so whatever
+        // outage preceded it is over — even though this session has just
+        // ended and a new one may be starting.
+        let recovered = state.paged_this_outage.then(|| {
+            state
+                .outage_started
+                .map(|start| now.duration_since(start).as_secs())
+                .unwrap_or(0)
+        });
+        // This session ended with an error too, so a fresh outage clock
+        // starts now; if the next session is healthy it clears silently.
+        *state = ListenerHealth {
+            outage_started: Some(now),
+            consecutive_failures: 1,
+            last_paged_at: None,
+            paged_this_outage: false,
+        };
+        return ListenerDecision {
+            action: recovered
+                .map(|outage_secs| ListenerAction::Recovered { outage_secs })
+                .unwrap_or(ListenerAction::LogOnly),
+            backoff_secs: LISTENER_BACKOFF_SECS,
+        };
+    }
+
+    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+    let started = *state.outage_started.get_or_insert(now);
+    let outage = now.duration_since(started);
+    let is_sustained = outage >= sustained;
+
+    let backoff_secs = if is_sustained {
+        LISTENER_BACKOFF_SUSTAINED_SECS
+    } else {
+        LISTENER_BACKOFF_SECS
+    };
+
+    let repage_clear = state
+        .last_paged_at
+        .map(|sent| now.duration_since(sent) >= repage_cooldown)
+        .unwrap_or(true);
+
+    if is_sustained && repage_clear {
+        state.last_paged_at = Some(now);
+        state.paged_this_outage = true;
+        return ListenerDecision {
+            action: ListenerAction::Page {
+                outage_secs: outage.as_secs(),
+                consecutive_failures: state.consecutive_failures,
+            },
+            backoff_secs,
+        };
+    }
+
+    ListenerDecision {
+        action: ListenerAction::LogOnly,
+        backoff_secs,
+    }
+}
+
+/// Supervisor for `run_listener` (audit LOW-3, recalibrated). Respawns the
+/// listener forever with a 5s backoff, and pages only once the listener has
+/// been continuously down for `LISTENER_SUSTAINED_OUTAGE_SECS` — see that
+/// constant for why a reconnect loop below that bar is a log line, not a
+/// page.
 ///
 /// Why we keep retrying instead of exiting: the worker has two signal
 /// sources — NOTIFY and the 30s poll. If we exit the listener task entirely
 /// the worker still functions (it just sees jobs ~30s late). But an
 /// operator under time pressure during the live test won't realize sync
-/// silently degraded. Persistent reconnect + Slack alert preserves both
-/// liveness AND visibility.
+/// silently degraded. Persistent reconnect + a *sustained* Slack alert
+/// preserves both liveness AND visibility, without spending the operator's
+/// attention on a condition that fixes itself.
 async fn run_listener_supervised(pg: PgPool, wakeup: Arc<Notify>, slack: Option<SlackClient>) {
-    let mut consecutive_failures: u32 = 0;
+    let mut health = ListenerHealth::default();
+    let subscribed = AtomicBool::new(false);
+    let sustained = Duration::from_secs(LISTENER_SUSTAINED_OUTAGE_SECS);
+    let repage_cooldown = Duration::from_secs(LISTENER_REPAGE_COOLDOWN_SECS);
+
     loop {
         let pg_inner = pg.clone();
         let wakeup_inner = wakeup.clone();
-        match run_listener(pg_inner, wakeup_inner).await {
+        subscribed.store(false, Ordering::Relaxed);
+        let session_started = Instant::now();
+        let outcome = run_listener(pg_inner, wakeup_inner, &subscribed).await;
+        // "Healthy" = the LISTEN actually landed and the subscription then
+        // held for at least one poll interval. A connect that fails, or one
+        // that drops immediately, does not clear the outage clock.
+        let healthy_session = subscribed.load(Ordering::Relaxed)
+            && session_started.elapsed() >= Duration::from_secs(LISTENER_HEALTHY_SESSION_SECS);
+
+        match &outcome {
             Ok(()) => {
                 // Listener returned Ok — the only path is `loop {}` exit,
-                // which currently can't happen. Treated as success: reset
-                // the failure counter and respawn after the standard backoff.
+                // which currently can't happen.
                 tracing::warn!("PgListener returned Ok unexpectedly — respawning");
-                consecutive_failures = 0;
             }
             Err(err) => {
-                consecutive_failures = consecutive_failures.saturating_add(1);
-                tracing::error!(
+                tracing::warn!(
                     error = %err,
-                    consecutive_failures,
+                    healthy_session,
+                    session_secs = session_started.elapsed().as_secs(),
                     "PgListener task ended; will respawn after backoff"
                 );
             }
         }
 
-        let sleep_secs = if consecutive_failures >= LISTENER_MAX_CONSECUTIVE_FAILURES {
-            // First time we cross the threshold (or every threshold-th
-            // failure after that): page the operator, then back off.
-            // Counter is reset post-alert so we get one alert per burst,
-            // not one per attempt past the threshold.
-            tracing::error!(
-                consecutive_failures,
-                threshold = LISTENER_MAX_CONSECUTIVE_FAILURES,
-                "PgListener supervisor: alert threshold breached — paging operator + slowing respawn"
-            );
-            if let Some(slack) = &slack {
-                send_listener_alert(slack, consecutive_failures).await;
-            }
-            consecutive_failures = 0;
-            LISTENER_BACKOFF_AFTER_ALERT_SECS
-        } else {
-            LISTENER_BACKOFF_SECS
-        };
+        let decision = decide_listener_action(
+            &mut health,
+            Instant::now(),
+            healthy_session,
+            sustained,
+            repage_cooldown,
+        );
 
-        tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+        match decision.action {
+            ListenerAction::LogOnly => {
+                // The demotion. A reconnect loop that is doing its job is a
+                // log line: the queue keeps draining on the 30s poll, so
+                // nothing is stuck and nothing is lost.
+                tracing::info!(
+                    consecutive_failures = health.consecutive_failures,
+                    outage_secs = health
+                        .outage_started
+                        .map(|s| s.elapsed().as_secs())
+                        .unwrap_or(0),
+                    sustained_threshold_secs = LISTENER_SUSTAINED_OUTAGE_SECS,
+                    backoff_secs = decision.backoff_secs,
+                    "PgListener down — reconnecting (worker still drains via the 30s poll; \
+                     no page until the outage is sustained)"
+                );
+            }
+            ListenerAction::Page {
+                outage_secs,
+                consecutive_failures,
+            } => {
+                tracing::error!(
+                    outage_secs,
+                    consecutive_failures,
+                    sustained_threshold_secs = LISTENER_SUSTAINED_OUTAGE_SECS,
+                    "PgListener supervisor: SUSTAINED outage — paging operator"
+                );
+                if let Some(slack) = &slack {
+                    send_listener_alert(slack, outage_secs, consecutive_failures).await;
+                }
+            }
+            ListenerAction::Recovered { outage_secs } => {
+                tracing::info!(
+                    outage_secs,
+                    "PgListener recovered after a paged outage — posting all-clear"
+                );
+                if let Some(slack) = &slack {
+                    send_listener_recovered_alert(slack, outage_secs).await;
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(decision.backoff_secs)).await;
     }
 }
 
-/// Post a Slack alert when the PG NOTIFY listener has failed to stay up
-/// across `LISTENER_MAX_CONSECUTIVE_FAILURES` consecutive respawn attempts
-/// (audit LOW-3). The worker is still functional via the 30s poll fallback,
-/// but sync latency has degraded from sub-second to ~30s — the operator
-/// needs to know.
-async fn send_listener_alert(slack: &SlackClient, consecutive_failures: u32) {
+/// Post a Slack alert when the PG NOTIFY listener has been continuously
+/// down for `LISTENER_SUSTAINED_OUTAGE_SECS` (audit LOW-3, recalibrated).
+/// The worker is still functional via the 30s poll fallback — this is a
+/// latency-degradation page, which is exactly why it waits for the outage
+/// to prove it is not self-recovering before spending the operator's
+/// attention.
+async fn send_listener_alert(slack: &SlackClient, outage_secs: u64, consecutive_failures: u32) {
+    let outage_mins = outage_secs / 60;
     let text = format!(
         ":warning: *Writeback PG NOTIFY listener UNHEALTHY* :warning:\n\
-         *Consecutive failures:* {consecutive_failures} \
-         (threshold: {LISTENER_MAX_CONSECUTIVE_FAILURES})\n\
-         _The worker is still draining the queue via 30s poll fallback, but \
-         sync latency has degraded from sub-second to ~30s. Likely causes: \
-         PG down, network partition, role missing LISTEN privilege, or \
-         max_connections exhausted. Inspect:_\n\
+         *Down for:* {outage_mins}m ({outage_secs}s continuous, \
+         {consecutive_failures} failed reconnects)\n\
+         _Past the {LISTENER_SUSTAINED_OUTAGE_SECS}s sustained threshold, so this is NOT \
+         a self-recovering blip. The worker is still draining the queue via the 30s poll \
+         fallback — nothing is lost — but sync latency has degraded from sub-second to \
+         ~30s. Likely causes: PG down, network partition, role missing LISTEN privilege, \
+         or max_connections exhausted. Inspect:_\n\
          ```\n\
          SELECT * FROM pg_stat_activity WHERE query LIKE '%LISTEN%';\n\
          SELECT count(*) FROM pg_stat_activity;\n\
          ```\n\
-         _The supervisor will keep retrying every \
-         {LISTENER_BACKOFF_AFTER_ALERT_SECS}s — fix the underlying issue and \
-         the next reconnect will succeed automatically._"
+         _The supervisor keeps retrying every {LISTENER_BACKOFF_SUSTAINED_SECS}s and will \
+         post an all-clear when it reconnects; you will not be re-paged for this outage \
+         more than once per {LISTENER_REPAGE_COOLDOWN_SECS}s._"
+    );
+    let msg = SlackMessage::with_site_text(current_site_id(), text);
+    let _ = slack.send_message(&msg).await;
+}
+
+/// All-clear for a listener outage that was paged. Same pairing rule as the
+/// exhausted-job `:white_check_mark:`: a failure alert that never closes
+/// trains the operator to ignore the channel.
+async fn send_listener_recovered_alert(slack: &SlackClient, outage_secs: u64) {
+    let outage_mins = outage_secs / 60;
+    let text = format!(
+        ":white_check_mark: *Writeback PG NOTIFY listener RECOVERED* \
+         :white_check_mark:\n\
+         *Outage duration:* {outage_mins}m ({outage_secs}s)\n\
+         _The listener reconnected and held the subscription for at least \
+         {LISTENER_HEALTHY_SESSION_SECS}s. NOTIFY-driven wakeups are back to sub-second; \
+         closure of the_ `:warning:` _sent earlier for this outage._"
     );
     let msg = SlackMessage::with_site_text(current_site_id(), text);
     let _ = slack.send_message(&msg).await;
@@ -3407,6 +3903,8 @@ mod tests {
 
     /// MED-4 throttle: the Nth event inside the window fires exactly once,
     /// then resets the counter so the next event opens a fresh window.
+    /// (The time floor added later is what keeps the *next* burst from
+    /// paging immediately — see `should_alert_enforces_time_floor_*`.)
     #[test]
     fn should_alert_at_threshold_fires_once_then_resets() {
         let mut state = SelfHealCounter::new();
@@ -3455,18 +3953,97 @@ mod tests {
         assert_eq!(decision.count, 1, "counter must reset after window expiry");
     }
 
-    /// MED-4 throttle: threshold of 1 fires immediately on every event —
-    /// edge case but the math should still be safe (no off-by-one panic).
+    /// MED-4 throttle, recalibrated: even at `threshold = 1` — the
+    /// degenerate config where every single event is alert-worthy — the
+    /// time floor still holds. This test previously asserted the opposite
+    /// ("threshold=1 must fire every event"), which is exactly the
+    /// counter-reset semantics the floor replaces: with no `last_alert_at`,
+    /// "one alert per 1 event" meant one Slack POST per salvage.
     #[test]
-    fn should_alert_threshold_of_one_fires_every_event() {
+    fn should_alert_threshold_of_one_still_honours_the_time_floor() {
         let mut state = SelfHealCounter::new();
-        let now = Instant::now();
+        let t0 = Instant::now();
         let window = Duration::from_secs(60);
 
-        for _ in 0..3 {
-            let d = should_alert(&mut state, now, 1, window);
-            assert!(d.fire, "threshold=1 must fire every event");
-            assert_eq!(d.count, 1, "counter resets after each fire");
+        let first = should_alert(&mut state, t0, 1, window);
+        assert!(first.fire, "the first event must always page");
+
+        // Same instant, and every second after it inside the window: the
+        // floor holds them all.
+        for offset in [0, 1, 5, 30, 59] {
+            let d = should_alert(&mut state, t0 + Duration::from_secs(offset), 1, window);
+            assert!(
+                !d.fire,
+                "event at +{offset}s must be held by the {}s floor",
+                window.as_secs()
+            );
+        }
+
+        // Once the floor lapses, the next event pages again.
+        let after = should_alert(&mut state, t0 + Duration::from_secs(60), 1, window);
+        assert!(after.fire, "the floor must open again after the window");
+    }
+
+    /// THE W5 regression test. Under a sustained salvage rate the old
+    /// implementation paged once per `SELF_HEAL_ALERT_THRESHOLD` events —
+    /// counter semantics wearing a window's name — so an hour of one
+    /// salvage per second produced ~720 Slack messages. The floor makes the
+    /// interval a genuine function of time.
+    #[test]
+    fn should_alert_enforces_time_floor_under_sustained_rate() {
+        let mut state = SelfHealCounter::new();
+        let t0 = Instant::now();
+        let window = Duration::from_secs(300);
+
+        // One self-heal every second for an hour.
+        let mut fire_times: Vec<u64> = Vec::new();
+        for sec in 0..3600u64 {
+            let d = should_alert(&mut state, t0 + Duration::from_secs(sec), 5, window);
+            if d.fire {
+                fire_times.push(sec);
+            }
+        }
+
+        // Old behaviour: 3600 events / 5 per alert = 720 pages.
+        assert!(
+            fire_times.len() <= 13,
+            "3600 events in 1h must not produce {} pages — the window is a \
+             time window, not an event counter",
+            fire_times.len()
+        );
+        assert!(
+            !fire_times.is_empty(),
+            "a sustained salvage rate must still page at least once"
+        );
+        for pair in fire_times.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= window.as_secs(),
+                "pages at {}s and {}s are closer than the {}s floor",
+                pair[0],
+                pair[1],
+                window.as_secs()
+            );
+        }
+    }
+
+    /// Suppression by the floor must not be a black hole: events keep being
+    /// counted while it is closed, so the caller's per-event warn log (and
+    /// the next page) still reflect the real volume.
+    #[test]
+    fn should_alert_keeps_counting_while_the_floor_is_closed() {
+        let mut state = SelfHealCounter::new();
+        let t0 = Instant::now();
+        let window = Duration::from_secs(300);
+
+        for _ in 0..5 {
+            let _ = should_alert(&mut state, t0, 5, window);
+        }
+        // The 5th fired and zeroed the count; the next three are held by
+        // the floor but still counted.
+        for expected in 1..=3 {
+            let d = should_alert(&mut state, t0 + Duration::from_secs(1), 5, window);
+            assert!(!d.fire, "floor must hold this page");
+            assert_eq!(d.count, expected, "held events must still be counted");
         }
     }
 
@@ -3491,23 +4068,47 @@ mod tests {
     }
 
     /// LOW-3 listener constants must form a usable supervisor: backoff
-    /// short enough to be invisible normally, long enough not to spin;
-    /// alert threshold high enough to absorb transient flaps but low
-    /// enough to page within a minute on a real outage.
+    /// short enough to be invisible normally, long enough not to spin; and
+    /// a sustained-outage threshold that is unambiguously past the
+    /// self-recovering blips this alert used to fire on.
     #[test]
     fn listener_supervisor_constants_are_in_safe_range() {
-        assert!(LISTENER_BACKOFF_SECS >= 1, "<1s would spin CPU");
+        // Bound through locals — same idiom as
+        // `queue_stuck_in_progress_age_mins_is_i32_for_make_interval`, so
+        // the assertions aren't compile-time constants and a type change
+        // at the const site fails here rather than silently.
+        let backoff: u64 = LISTENER_BACKOFF_SECS;
+        let backoff_sustained: u64 = LISTENER_BACKOFF_SUSTAINED_SECS;
+        let sustained: u64 = LISTENER_SUSTAINED_OUTAGE_SECS;
+        let repage: u64 = LISTENER_REPAGE_COOLDOWN_SECS;
+        let healthy: u64 = LISTENER_HEALTHY_SESSION_SECS;
+        let stuck_claim: u64 = STUCK_IN_PROGRESS_TIMEOUT_SECS as u64;
+
+        assert!(backoff >= 1, "<1s would spin CPU");
+        assert!(backoff <= 30, ">30s defeats the point of NOTIFY");
         assert!(
-            LISTENER_BACKOFF_SECS <= 30,
-            ">30s defeats the point of NOTIFY"
+            backoff_sustained > backoff,
+            "sustained-outage backoff must be longer than normal backoff"
+        );
+        // The demotion's load-bearing number. Below ~5 min we are back to
+        // paging on deploys and tunnel re-handshakes; the justification in
+        // the constant's doc leans on it being 2x the janitor's
+        // claim-steal window.
+        assert!(
+            sustained >= 2 * stuck_claim,
+            "a page must outlive every other self-healing mechanism here"
         );
         assert!(
-            LISTENER_MAX_CONSECUTIVE_FAILURES >= 3,
-            "<3 would page on every flap"
+            sustained <= 3600,
+            ">1h of degraded NOTIFY latency should not pass unreported"
         );
         assert!(
-            LISTENER_BACKOFF_AFTER_ALERT_SECS > LISTENER_BACKOFF_SECS,
-            "post-alert backoff must be longer than normal backoff"
+            repage >= sustained,
+            "re-paging faster than the outage threshold rebuilds the storm"
+        );
+        assert!(
+            healthy < sustained,
+            "a session can never prove itself healthy otherwise"
         );
     }
 
@@ -4085,6 +4686,426 @@ mod tests {
             breaches.len(),
             3,
             "all three conditions must produce one reason each"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // W1 / W4 — startup probes must not name a permanent cause on a
+    // transient read
+    //
+    // The collation probe runs FIRST, before the hardened fingerprint
+    // guard, and mapped ANY failure (including a bb8 pool timeout on the
+    // very first legacy round-trip of the process) onto "Legacy MSSQL
+    // collation is case-sensitive". The ledger probe did the same with
+    // "`dbo.ht_writeback_ledger` is missing", sending the operator to
+    // re-apply a migration that was already applied.
+    // -------------------------------------------------------------------
+
+    /// A pool-get timeout / driver error means the read never landed. It
+    /// must be retried, and it must never be reported as a bad value.
+    #[test]
+    fn catalog_probe_transport_failures_are_not_confirmed() {
+        assert!(
+            !catalog_probe_failure_is_confirmed(&WritebackError::Pool(bb8::RunError::TimedOut)),
+            "a bb8 acquire timeout is the tunnel, not the collation"
+        );
+        assert!(
+            !catalog_probe_failure_is_confirmed(&WritebackError::Sqlx(sqlx::Error::PoolTimedOut)),
+            "wire-level failures are transient"
+        );
+    }
+
+    /// `Config` is the only thing the two catalog probes synthesise from an
+    /// answer they actually received — a `_CS_` collation name, a NULL
+    /// `OBJECT_ID`, an unreadable result shape. That, and only that, may
+    /// refuse the boot on the first try.
+    #[test]
+    fn catalog_probe_bad_answer_is_confirmed() {
+        assert!(catalog_probe_failure_is_confirmed(&WritebackError::Config(
+            "Legacy server collation is case-sensitive (Thai_CS_AS)".into()
+        )));
+        assert!(catalog_probe_failure_is_confirmed(&WritebackError::Config(
+            "dbo.ht_writeback_ledger missing".into()
+        )));
+    }
+
+    /// The fingerprint probe keeps its own, narrower rule (W3, incident
+    /// 2026-06-28): only a hash mismatch is confirmed. A malformed catalog
+    /// read is retried, because re-baselining against a bad read corrupts
+    /// the baseline.
+    #[test]
+    fn fingerprint_probe_confirms_only_a_hash_mismatch() {
+        assert!(fingerprint_failure_is_confirmed(
+            &WritebackError::SchemaDrift {
+                expected: "a".into(),
+                actual: "b".into(),
+            }
+        ));
+        assert!(!fingerprint_failure_is_confirmed(&WritebackError::Pool(
+            bb8::RunError::TimedOut
+        )));
+        assert!(
+            !fingerprint_failure_is_confirmed(&WritebackError::Config(
+                "TABLE_NAME column missing".into()
+            )),
+            "a malformed catalog read is not drift — this is the 2026-06-28 rule"
+        );
+    }
+
+    /// A transient collation probe must produce the connectivity message
+    /// and must NOT tell the operator to touch the database's collation.
+    #[test]
+    fn collation_alert_on_transient_does_not_blame_the_collation() {
+        let body = collation_probe_alert_body(
+            ProbeFailureKind::Unreachable,
+            4,
+            "legacy connection pool: Timed out in bb8",
+        );
+        assert!(
+            body.contains("could not start"),
+            "must not shout REFUSED TO START for a read that never landed"
+        );
+        assert!(!body.contains("REFUSED TO START"));
+        assert!(body.contains("connectivity/timeout problem"));
+        assert!(body.contains("NOT a collation problem"));
+        assert!(
+            body.contains("Do NOT re-collate"),
+            "the remediation must be explicitly negated"
+        );
+        assert!(
+            !body.contains("Thai_CI_AS"),
+            "naming the expected collation invites a restore that fixes nothing"
+        );
+        assert!(body.contains("4 attempts"), "must state the retry budget");
+    }
+
+    /// A confirmed collation failure still says everything it used to.
+    #[test]
+    fn collation_alert_on_confirmed_names_the_configuration_problem() {
+        let body = collation_probe_alert_body(
+            ProbeFailureKind::Confirmed,
+            1,
+            "config: Legacy server collation is case-sensitive (Thai_CS_AS)",
+        );
+        assert!(body.contains("REFUSED TO START"));
+        assert!(body.contains("the probe read succeeded"));
+        assert!(body.contains("Thai_CI_AS"));
+        assert!(body.contains("case-insensitive"));
+        assert!(body.contains("Thai_CS_AS"), "error text must be carried");
+    }
+
+    /// A transient ledger probe must not claim the table is missing — the
+    /// probe never got an answer, so its presence is unknown.
+    #[test]
+    fn ledger_alert_on_transient_does_not_claim_the_table_is_missing() {
+        let body = ledger_probe_alert_body(
+            ProbeFailureKind::Unreachable,
+            4,
+            "tiberius: connection reset by peer",
+        );
+        assert!(body.contains("could not start"));
+        assert!(!body.contains("REFUSED TO START"));
+        assert!(
+            !body.contains("is MISSING"),
+            "the claim the operator acts on must not be made on a timeout"
+        );
+        assert!(body.contains("UNKNOWN"));
+        assert!(
+            body.contains("Do NOT re-apply"),
+            "re-applying an already-applied migration is the wrong action"
+        );
+        assert!(body.contains("connectivity/timeout problem"));
+    }
+
+    /// A confirmed missing ledger still routes to the migration.
+    #[test]
+    fn ledger_alert_on_confirmed_routes_to_the_migration() {
+        let body = ledger_probe_alert_body(
+            ProbeFailureKind::Confirmed,
+            1,
+            "config: dbo.ht_writeback_ledger missing",
+        );
+        assert!(body.contains("REFUSED TO START"));
+        assert!(body.contains("is MISSING"));
+        assert!(body.contains("024_writeback_ledger.sql"));
+        assert!(body.contains("OBJECT_ID"));
+        assert!(!body.contains("Do NOT re-apply"));
+    }
+
+    /// W3's two messages are the model the other two now follow — pin them
+    /// so a future edit can't quietly re-merge the two stories.
+    #[test]
+    fn fingerprint_alert_keeps_its_transient_and_drift_split() {
+        let drift = fingerprint_probe_alert_body(ProbeFailureKind::Confirmed, 1, "hash a != b");
+        assert!(drift.contains("REFUSED TO START"));
+        assert!(drift.contains("real drift"));
+        assert!(drift.contains("writeback-fingerprint.sh"));
+
+        let transient =
+            fingerprint_probe_alert_body(ProbeFailureKind::Unreachable, 4, "tiberius: timeout");
+        assert!(transient.contains("could not start"));
+        assert!(transient.contains("NOT confirmed schema"));
+        assert!(transient.contains("do NOT run `writeback-fingerprint.sh`"));
+    }
+
+    /// End-to-end on the retry envelope: a read that fails transiently and
+    /// then lands must NOT refuse the boot. `start_paused` auto-advances
+    /// the 6s/12s backoff sleeps.
+    #[tokio::test(start_paused = true)]
+    async fn startup_probe_retries_a_transient_read_then_succeeds() {
+        let calls = std::cell::Cell::new(0u32);
+        let calls_ref = &calls;
+        let out = run_startup_probe(
+            "hfhotel",
+            "test probe",
+            4,
+            catalog_probe_failure_is_confirmed,
+            move || async move {
+                calls_ref.set(calls_ref.get() + 1);
+                if calls_ref.get() < 3 {
+                    Err(WritebackError::Pool(bb8::RunError::TimedOut))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await;
+        assert!(out.is_ok(), "a recovered transient must not refuse the boot");
+        assert_eq!(calls.get(), 3);
+    }
+
+    /// A read that never lands exhausts the budget and reports
+    /// `Unreachable` — the branch that must not name a permanent cause.
+    #[tokio::test(start_paused = true)]
+    async fn startup_probe_exhausts_transients_as_unreachable() {
+        let calls = std::cell::Cell::new(0u32);
+        let calls_ref = &calls;
+        let out = run_startup_probe(
+            "hfhotel",
+            "test probe",
+            3,
+            catalog_probe_failure_is_confirmed,
+            move || async move {
+                calls_ref.set(calls_ref.get() + 1);
+                Err(WritebackError::Pool(bb8::RunError::TimedOut))
+            },
+        )
+        .await;
+        let failure = out.expect_err("must fail");
+        assert_eq!(failure.kind, ProbeFailureKind::Unreachable);
+        assert_eq!(failure.attempts, 3);
+        assert_eq!(calls.get(), 3, "every attempt must be made");
+        // And the message the operator gets is the connectivity one.
+        let body = collation_probe_alert_body(failure.kind, failure.attempts, "…");
+        assert!(body.contains("NOT a collation problem"));
+    }
+
+    /// A definite bad answer short-circuits: re-asking a question that is
+    /// already answered only delays the page.
+    #[tokio::test(start_paused = true)]
+    async fn startup_probe_short_circuits_a_confirmed_failure() {
+        let calls = std::cell::Cell::new(0u32);
+        let calls_ref = &calls;
+        let out = run_startup_probe(
+            "hfhotel",
+            "test probe",
+            4,
+            catalog_probe_failure_is_confirmed,
+            move || async move {
+                calls_ref.set(calls_ref.get() + 1);
+                Err(WritebackError::Config("dbo.ht_writeback_ledger missing".into()))
+            },
+        )
+        .await;
+        let failure = out.expect_err("must fail");
+        assert_eq!(failure.kind, ProbeFailureKind::Confirmed);
+        assert_eq!(failure.attempts, 1);
+        assert_eq!(calls.get(), 1, "a definite answer must not be retried");
+    }
+
+    /// The attempt budget: new env var wins, the fingerprint probe's
+    /// original name still works, garbage and zero fall back to the
+    /// default (a `0` would skip the probe entirely).
+    #[test]
+    fn probe_attempts_parse_precedence_and_floor() {
+        assert_eq!(parse_probe_attempts(Some("7"), Some("2")), 7);
+        assert_eq!(parse_probe_attempts(None, Some("2")), 2);
+        assert_eq!(parse_probe_attempts(Some(" 3 "), None), 3);
+        assert_eq!(
+            parse_probe_attempts(None, None),
+            DEFAULT_STARTUP_PROBE_ATTEMPTS
+        );
+        assert_eq!(
+            parse_probe_attempts(Some("0"), None),
+            DEFAULT_STARTUP_PROBE_ATTEMPTS,
+            "0 attempts would disable the probe"
+        );
+        assert_eq!(
+            parse_probe_attempts(Some("nope"), None),
+            DEFAULT_STARTUP_PROBE_ATTEMPTS
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // W8 — listener UNHEALTHY is a log line until the outage is sustained
+    //
+    // The supervisor reconnects forever and the worker keeps draining on
+    // the 30s poll, so a reconnect loop is self-recovering by design. The
+    // old alert fired on 10 consecutive failures, zeroed its counter on
+    // fire, and had no cooldown timestamp — one page per ~105s for the
+    // whole duration of an outage.
+    // -------------------------------------------------------------------
+
+    /// Helper: one failed listener session at `t`.
+    fn listener_fail(state: &mut ListenerHealth, t: Instant) -> ListenerDecision {
+        decide_listener_action(
+            state,
+            t,
+            false,
+            Duration::from_secs(600),
+            Duration::from_secs(1800),
+        )
+    }
+
+    /// Nine minutes of failed reconnects at the 5s cadence — 108 sessions,
+    /// which under the old rule would have been ~10 pages — must produce
+    /// no Slack traffic at all.
+    #[test]
+    fn listener_does_not_page_below_the_sustained_threshold() {
+        let mut state = ListenerHealth::default();
+        let t0 = Instant::now();
+        for sec in (0..540).step_by(5) {
+            let d = listener_fail(&mut state, t0 + Duration::from_secs(sec));
+            assert_eq!(
+                d.action,
+                ListenerAction::LogOnly,
+                "a reconnect loop at +{sec}s is a log line, not a page"
+            );
+            assert_eq!(
+                d.backoff_secs, LISTENER_BACKOFF_SECS,
+                "cadence stays fast while the outage may still self-recover"
+            );
+        }
+        assert!(state.consecutive_failures > 100, "sanity: many failures");
+    }
+
+    /// Past the threshold it pages exactly once, then holds the re-page
+    /// floor for the whole cooldown.
+    #[test]
+    fn listener_pages_once_when_sustained_then_holds_the_floor() {
+        let mut state = ListenerHealth::default();
+        let t0 = Instant::now();
+        let _ = listener_fail(&mut state, t0);
+
+        // Just before the threshold: still silent.
+        let before = listener_fail(&mut state, t0 + Duration::from_secs(599));
+        assert_eq!(before.action, ListenerAction::LogOnly);
+
+        // At the threshold: one page.
+        let at = listener_fail(&mut state, t0 + Duration::from_secs(600));
+        match at.action {
+            ListenerAction::Page { outage_secs, .. } => assert_eq!(outage_secs, 600),
+            other => panic!("expected a page at the sustained threshold, got {other:?}"),
+        }
+        assert_eq!(
+            at.backoff_secs, LISTENER_BACKOFF_SUSTAINED_SECS,
+            "cadence slows once the outage is sustained"
+        );
+
+        // Every 60s for the next half hour: silent.
+        for sec in (660..2400).step_by(60) {
+            let d = listener_fail(&mut state, t0 + Duration::from_secs(sec));
+            assert_eq!(
+                d.action,
+                ListenerAction::LogOnly,
+                "re-page floor must hold at +{sec}s"
+            );
+        }
+
+        // Past the cooldown, one more page restates the outage.
+        let repage = listener_fail(&mut state, t0 + Duration::from_secs(2400));
+        assert!(
+            matches!(repage.action, ListenerAction::Page { .. }),
+            "a still-broken listener restates itself once per cooldown"
+        );
+    }
+
+    /// A healthy session clears the outage clock with no Slack traffic when
+    /// nothing was ever paged — the ordinary "PG restarted during a deploy"
+    /// case.
+    #[test]
+    fn listener_healthy_session_clears_the_outage_silently() {
+        let mut state = ListenerHealth::default();
+        let t0 = Instant::now();
+        for sec in (0..120).step_by(5) {
+            let _ = listener_fail(&mut state, t0 + Duration::from_secs(sec));
+        }
+        let recovered = decide_listener_action(
+            &mut state,
+            t0 + Duration::from_secs(300),
+            true,
+            Duration::from_secs(600),
+            Duration::from_secs(1800),
+        );
+        assert_eq!(
+            recovered.action,
+            ListenerAction::LogOnly,
+            "an outage nobody was paged for needs no all-clear"
+        );
+        assert!(!state.paged_this_outage);
+
+        // And the clock restarted: the next page is 600s away from the
+        // recovery, not from the original failure.
+        let d = listener_fail(&mut state, t0 + Duration::from_secs(899));
+        assert_eq!(d.action, ListenerAction::LogOnly);
+    }
+
+    /// If the outage DID page, recovery closes it — same pairing rule as
+    /// the exhausted-job `:white_check_mark:`.
+    #[test]
+    fn listener_recovery_posts_an_all_clear_only_after_a_page() {
+        let mut state = ListenerHealth::default();
+        let t0 = Instant::now();
+        let _ = listener_fail(&mut state, t0);
+        let paged = listener_fail(&mut state, t0 + Duration::from_secs(700));
+        assert!(matches!(paged.action, ListenerAction::Page { .. }));
+
+        let recovered = decide_listener_action(
+            &mut state,
+            t0 + Duration::from_secs(900),
+            true,
+            Duration::from_secs(600),
+            Duration::from_secs(1800),
+        );
+        assert_eq!(
+            recovered.action,
+            ListenerAction::Recovered { outage_secs: 900 }
+        );
+        // The incident is closed; a later short outage starts from scratch.
+        assert!(!state.paged_this_outage);
+        assert!(state.last_paged_at.is_none());
+    }
+
+    /// A connect-then-instantly-drop flap is NOT a healthy session (the
+    /// supervisor gates that on `LISTENER_HEALTHY_SESSION_SECS`), so it
+    /// keeps accumulating toward the threshold instead of resetting the
+    /// clock on every attempt — otherwise a flapping listener could never
+    /// page at all.
+    #[test]
+    fn listener_flapping_still_reaches_the_sustained_threshold() {
+        let mut state = ListenerHealth::default();
+        let t0 = Instant::now();
+        let mut paged = false;
+        for sec in (0..700).step_by(7) {
+            // healthy_session=false — the session came up but died in <30s.
+            let action = listener_fail(&mut state, t0 + Duration::from_secs(sec)).action;
+            if matches!(action, ListenerAction::Page { .. }) {
+                paged = true;
+            }
+        }
+        assert!(
+            paged,
+            "a listener that flaps for 11 minutes is still an outage"
         );
     }
 }

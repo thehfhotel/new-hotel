@@ -138,14 +138,27 @@ services:
       # SLACK_WEBHOOK_URL — sourced from /run/secrets/slack_webhook_url
       - SLACK_NOTIFICATIONS_ENABLED=true
       # Per-job slack notification kill-switches (2026-05-15).
-      # Default `true` preserves prior behavior — only set `false` when
-      # actively running a CT-watcher backfill window and the operator
-      # wants to silence the cron-driven noise. Registered in
-      # `scheduler::jobs::init_scheduler`.
-      - HOURLY_REPORT_ENABLED=${HOURLY_REPORT_ENABLED:-true}
-      - CHECKIN_NOTIFICATIONS_ENABLED=${CHECKIN_NOTIFICATIONS_ENABLED:-true}
-      - CHECKOUT_NOTIFICATIONS_ENABLED=${CHECKOUT_NOTIFICATIONS_ENABLED:-true}
-      - BOOKING_NOTIFICATIONS_ENABLED=${BOOKING_NOTIFICATIONS_ENABLED:-true}
+      # Registered in `scheduler::jobs::init_scheduler`.
+      #
+      # DEFAULT FLIPPED true -> false (2026-07-28) — fail CLOSED. All four
+      # jobs are purely informational and POST to Slack once PER ROW, on the
+      # same webhook that carries every `:rotating_light:` page; there is no
+      # severity routing. A `true` default meant any environment that had not
+      # explicitly opted out — a fresh stack, a fork, a cleared variable —
+      # drowned the alert channel in a booking feed. Absence of config must
+      # mean quiet. Matching fail-closed default in
+      # `scheduler::jobs::notification_flag_enabled` (strict `true`/`1`).
+      #
+      # NOT part of the ADR-0004 compose-owned set below: unlike the
+      # reconcile / watermark flags, these four ARE injected by
+      # docker-build.yml (`vars.X || 'true'`), so in production the GitHub
+      # repo variables win and the defaults here are unreachable. All four
+      # have been `false` there since 2026-05-19 — this flip is a no-op for
+      # production and only fixes the fallback for everyone else.
+      - HOURLY_REPORT_ENABLED=${HOURLY_REPORT_ENABLED:-false}
+      - CHECKIN_NOTIFICATIONS_ENABLED=${CHECKIN_NOTIFICATIONS_ENABLED:-false}
+      - CHECKOUT_NOTIFICATIONS_ENABLED=${CHECKOUT_NOTIFICATIONS_ENABLED:-false}
+      - BOOKING_NOTIFICATIONS_ENABLED=${BOOKING_NOTIFICATIONS_ENABLED:-false}
       - HOST=0.0.0.0
       - PORT=3003
       # HF Ville — Phase 5 Ville cutover (#76, 2026-04-30): ville_pool
@@ -466,8 +479,13 @@ services:
       - POSTGRES_DB=${POSTGRES_DB}
       - NEW_DB_SERVER=newdb
       - NEW_DB_PORT=${PGPORT:-5439}
-      # Slack notifier — schema fingerprint drift, CT retention overflow,
-      # mapper consecutive-failure threshold all alert here.
+      # Slack notifier — schema fingerprint drift and CT retention overflow
+      # alert here. (Removed 2026-07-28: a "mapper consecutive-failure
+      # threshold" claim describing a breaker that does not exist. The
+      # nearest real knobs, LEGACY_SYNC_OUTAGE_ALERT_THRESHOLD /
+      # _COOLDOWN_SECS, were deleted 2026-06-30 as parsed-but-dead; a
+      # sustained unreachable legacy is paged by the watchdog's probe-outage
+      # escalation instead.)
       # SLACK_WEBHOOK_URL — sourced from /run/secrets/slack_webhook_url
       - SLACK_NOTIFICATIONS_ENABLED=true
       # Phase 5.5 watcher knobs (per docs/architecture.md §3.6d, §7).

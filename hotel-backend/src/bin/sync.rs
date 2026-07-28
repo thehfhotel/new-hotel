@@ -328,33 +328,73 @@ const RETENTION_ALERT_COOLDOWN_HOURS: i64 = 24;
 /// sentinel there — so CT table names are namespaced to guarantee they can
 /// never collide with a canonical entity name.
 fn retention_cooldown_key(table: &str) -> String {
-    format!("ct_retention_overflow:{table}")
+    format!("{CT_RETENTION_KEY_PREFIX}{table}")
 }
 
-/// Atomically claim the right to send ONE retention-overflow page for this
-/// (site, table). Returns `true` at most once per
-/// [`RETENTION_ALERT_COOLDOWN_HOURS`].
+/// Namespace prefixes this binary parks in the SHARED
+/// `ht_level_drift_alert_cooldowns` table. Every key this file writes MUST
+/// start with one of these, and no two may be a prefix of one another —
+/// see `cooldown_key_namespaces_cannot_collide` in `mod tests`.
 ///
-/// The claim is a single conditional UPSERT so two workers (or a restart
-/// loop) cannot both decide they're the one to alert. **Fails CLOSED on a PG
-/// error** — deliberately the opposite of the reconcile digest's fail-open
-/// eligibility check: this alert's failure mode is a page storm, so when in
-/// doubt, stay quiet. The condition still surfaces via the `ERROR`-level
-/// `EV_CT_RETENTION_OVERFLOW` log on every check.
-async fn claim_retention_alert_slot(pg: &PgPool, site_id: &str, table: &str) -> bool {
-    let key = retention_cooldown_key(table);
+/// The table is keyed `(site_id, table_name)` and is shared with
+/// `scheduler::sync` (reconcile entity names + the `stale_active_checkin`
+/// sentinel). Prefixing is the only thing keeping a CT table name
+/// (`HT_Customers`) from colliding with a canonical entity name
+/// (`customers`), or one watcher tripwire from stealing another's slot.
+const CT_RETENTION_KEY_PREFIX: &str = "ct_retention_overflow:";
+/// Durable slot for the level-triggered CT-lag page (one per site).
+const CT_LAG_COOLDOWN_KEY: &str = "ct_watcher_lag:global";
+/// Durable slot for the shadow-mode-ceiling page (one per site).
+const SHADOW_CEILING_COOLDOWN_KEY: &str = "shadow_mode:ceiling";
+/// Namespace prefix for the refuse-to-start pages; one slot per reason
+/// (see [`BootRefusal::cooldown_key`]).
+const BOOT_REFUSAL_KEY_PREFIX: &str = "boot_refusal:";
+
+/// What a PG failure means for an [`claim_alert_slot`] call.
+///
+/// The right answer is per-alert, not global:
+/// * [`ClaimFallback::Suppress`] — the alert's failure mode is a page
+///   STORM (fires every tick while the condition holds). When we cannot
+///   prove the cooldown has elapsed, stay quiet. Retention overflow.
+/// * [`ClaimFallback::Send`] — the alert fires at most a handful of times
+///   and its failure mode is SILENCE (the process is about to die). A
+///   duplicate page beats a missing one. Refuse-to-start guards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimFallback {
+    Suppress,
+    Send,
+}
+
+/// Atomically claim the right to send ONE page for `(site_id, key)`,
+/// returning `true` at most once per `cooldown_mins`.
+///
+/// The claim is a single conditional UPSERT against
+/// `ht_level_drift_alert_cooldowns` (migration 053) so two workers — or a
+/// Docker restart loop, which is the whole point for the boot guards —
+/// cannot both decide they're the one to alert. Durable by construction:
+/// the window survives process restarts, unlike a process-local `Instant`.
+///
+/// `key` must be namespaced with one of the `*_KEY_PREFIX` constants
+/// above; the table is shared with the reconcile digest.
+async fn claim_alert_slot(
+    pg: &PgPool,
+    site_id: &str,
+    key: &str,
+    cooldown_mins: i64,
+    fallback: ClaimFallback,
+) -> bool {
     let claimed: Result<Option<(String,)>, sqlx::Error> = sqlx::query_as(
         "INSERT INTO ht_level_drift_alert_cooldowns (site_id, table_name, last_alerted_at) \
          VALUES ($1, $2, now()) \
          ON CONFLICT (site_id, table_name) DO UPDATE \
              SET last_alerted_at = now(), updated_at = now() \
            WHERE ht_level_drift_alert_cooldowns.last_alerted_at \
-                 < now() - ($3 || ' hours')::interval \
+                 < now() - ($3 || ' minutes')::interval \
          RETURNING table_name",
     )
     .bind(site_id)
-    .bind(&key)
-    .bind(RETENTION_ALERT_COOLDOWN_HOURS.to_string())
+    .bind(key)
+    .bind(cooldown_mins.to_string())
     .fetch_optional(pg)
     .await;
 
@@ -362,16 +402,65 @@ async fn claim_retention_alert_slot(pg: &PgPool, site_id: &str, table: &str) -> 
         Ok(Some(_)) => true,
         Ok(None) => false,
         Err(err) => {
+            let send = fallback == ClaimFallback::Send;
             tracing::warn!(
                 site = %site_id,
-                table,
+                key,
                 error = %err,
-                "Retention-overflow alert cooldown claim failed — suppressing the page \
-                 (fail-closed); the EV_CT_RETENTION_OVERFLOW log still records it"
+                fallback = if send { "send" } else { "suppress" },
+                "Alert cooldown claim failed — falling back per this alert's policy"
             );
-            false
+            send
         }
     }
+}
+
+/// Drop the `(site_id, key)` cooldown row so a RECURRENCE pages on the
+/// very next observation instead of being swallowed by a stale window.
+/// Called only after the paired all-clear has been emitted.
+///
+/// Best-effort: a PG failure logs and leaves the row in place, so the
+/// worst case is that a recurrence stays suppressed until the window
+/// lapses on its own. Mirrors
+/// `scheduler::sync::clear_level_alert_cooldown_pg`.
+async fn release_alert_slot(pg: &PgPool, site_id: &str, key: &str) {
+    let result = sqlx::query(
+        "DELETE FROM ht_level_drift_alert_cooldowns WHERE site_id = $1 AND table_name = $2",
+    )
+    .bind(site_id)
+    .bind(key)
+    .execute(pg)
+    .await;
+
+    if let Err(err) = result {
+        tracing::warn!(
+            site = %site_id,
+            key,
+            error = %err,
+            "Failed to release alert cooldown slot after all-clear — a recurrence may \
+             stay suppressed until the window lapses"
+        );
+    }
+}
+
+/// Atomically claim the right to send ONE retention-overflow page for this
+/// (site, table). Returns `true` at most once per
+/// [`RETENTION_ALERT_COOLDOWN_HOURS`].
+///
+/// **Fails CLOSED on a PG error** — deliberately the opposite of the
+/// reconcile digest's fail-open eligibility check: this alert's failure
+/// mode is a page storm, so when in doubt, stay quiet. The condition still
+/// surfaces via the `ERROR`-level `EV_CT_RETENTION_OVERFLOW` log on every
+/// check.
+async fn claim_retention_alert_slot(pg: &PgPool, site_id: &str, table: &str) -> bool {
+    claim_alert_slot(
+        pg,
+        site_id,
+        &retention_cooldown_key(table),
+        RETENTION_ALERT_COOLDOWN_HOURS * 60,
+        ClaimFallback::Suppress,
+    )
+    .await
 }
 
 /// Mid-run pool-outage handling (v2.58.4). HF Ville's WG tunnel flaps
@@ -414,6 +503,219 @@ async fn claim_retention_alert_slot(pg: &PgPool, site_id: &str, table: &str) -> 
 const DEFAULT_INIT_RETRY_INITIAL_SECS: u64 = 5;
 const DEFAULT_INIT_RETRY_MAX_SECS: u64 = 60;
 const DEFAULT_INIT_RETRY_ALERT_AFTER_SECS: u64 = 300;
+
+// =============================================================================
+// Refuse-to-start pages — per-reason durable dedup (2026-07-28 alert audit)
+// =============================================================================
+//
+// Five startup guards below refuse to start and fire a Slack page: the
+// live-bootstrap refusal, the schema-fingerprint mismatch, the cold-replay
+// refusal, the retention-overflow refusal and the CT-not-enabled refusal.
+// Each used to send a BARE POST with no dedup at all. Compose runs these
+// workers with `restart: on-failure:5`, and every guard sleeps 60s before
+// exiting to throttle the loop — so one bad deploy produced up to SIX
+// identical pages per service, times two sites, and THEN the container gave
+// up permanently with no further message. Both halves are wrong: a storm
+// followed by silence that reads exactly like recovery.
+//
+// The fix is the durable cooldown already used by the retention-overflow
+// page (`claim_alert_slot` over `ht_level_drift_alert_cooldowns`), keyed per
+// REASON so a different failure on the next attempt still pages
+// immediately. Fail-OPEN on a PG error (`ClaimFallback::Send`): the failure
+// mode of these guards is silence, and a duplicate page beats none.
+//
+// What we CANNOT do from here: emit a "gave up after 5 restarts" alert. By
+// definition that message would have to come from a process that no longer
+// runs. Every page therefore states the restart-cap contract in its body so
+// an operator reads continued silence as "gave up", not "recovered". An
+// external liveness monitor is the real backstop and is tracked separately.
+
+/// How long to suppress a repeat refuse-to-start page for the SAME reason.
+///
+/// Sizing: the restart burst is 5 attempts × (60s guard sleep + startup),
+/// i.e. ~6-10 minutes. 30 minutes squashes the burst with margin while
+/// staying short enough that a fix-and-redeploy cycle which fails for a
+/// DIFFERENT reason pages instantly (different key) and one that fails the
+/// same way again pages within the hour. Override via
+/// `LEGACY_SYNC_BOOT_ALERT_COOLDOWN_MINS`.
+const DEFAULT_BOOT_REFUSAL_COOLDOWN_MINS: i64 = 30;
+
+/// Docker's `restart: on-failure:<N>` cap for the sync/writeback workers in
+/// `docker-compose.yml`. Quoted in the page body — the number itself is the
+/// operationally load-bearing part ("after this many, silence means dead").
+const COMPOSE_RESTART_CAP: u32 = 5;
+
+/// The distinct refuse-to-start reasons. Each gets its OWN durable cooldown
+/// slot so a deploy that fixes the fingerprint but trips the CT gate still
+/// pages immediately instead of being swallowed by the previous reason's
+/// window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootRefusal {
+    /// `--bootstrap` requested against a live watcher (audit finding N1).
+    LiveBootstrap,
+    /// `verify_ct_schema_fingerprint` mismatch.
+    SchemaFingerprint,
+    /// Watermark at 0 without `LEGACY_SYNC_ALLOW_COLD_REPLAY`.
+    ColdReplay,
+    /// `MIN_VALID_VERSION > watermark` on at least one tracked table.
+    RetentionOverflow,
+    /// A `CT_ENABLED_TABLES` entry whose legacy CT subscription is missing.
+    CtNotEnabled,
+}
+
+impl BootRefusal {
+    /// Stable, greppable slug. Changing one resets that reason's dedup
+    /// window exactly once (the old row simply ages out), so renames are
+    /// safe but pointless.
+    fn slug(self) -> &'static str {
+        match self {
+            BootRefusal::LiveBootstrap => "live_bootstrap",
+            BootRefusal::SchemaFingerprint => "schema_fingerprint",
+            BootRefusal::ColdReplay => "cold_replay",
+            BootRefusal::RetentionOverflow => "retention_overflow",
+            BootRefusal::CtNotEnabled => "ct_not_enabled",
+        }
+    }
+
+    /// Durable cooldown key, namespaced under [`BOOT_REFUSAL_KEY_PREFIX`].
+    fn cooldown_key(self) -> String {
+        format!("{BOOT_REFUSAL_KEY_PREFIX}{}", self.slug())
+    }
+}
+
+/// Resolve the refuse-to-start dedup window.
+fn boot_refusal_cooldown_mins() -> i64 {
+    env::var("LEGACY_SYNC_BOOT_ALERT_COOLDOWN_MINS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|m| *m > 0)
+        .unwrap_or(DEFAULT_BOOT_REFUSAL_COOLDOWN_MINS)
+}
+
+/// The restart-cap contract, appended to every refuse-to-start page.
+///
+/// This is the half of the fix that dedup alone does not buy. Without it an
+/// operator sees one page, then nothing, and reasonably concludes the next
+/// restart succeeded — when in fact Docker exhausted its retries and the
+/// worker is DEAD. The process cannot announce its own give-up, so the
+/// warning has to ride along with the last message it can still send.
+fn format_restart_cap_note(cooldown_mins: i64) -> String {
+    format!(
+        "\n\n:hourglass: *Silence after this page does NOT mean recovered.* Compose \
+         restarts this worker at most {COMPOSE_RESTART_CAP}× (`restart: \
+         on-failure:{COMPOSE_RESTART_CAP}`); after that the container stays down and \
+         cannot page again — a dead worker is quiet. Confirm with `docker compose ps` \
+         / the container logs before assuming it recovered. Repeat pages for THIS \
+         reason are suppressed for {cooldown_mins}min (a different failure reason \
+         still pages immediately)."
+    )
+}
+
+/// Pure dedup verdict for a refuse-to-start page.
+///
+/// * `dedup_available` — was there a usable PG pool to claim a slot with?
+/// * `claimed` — did [`claim_alert_slot`] hand us the slot?
+///
+/// With no dedup backend we FAIL OPEN. These guards fire a handful of times
+/// and their failure mode is silence about a process that will not run, so a
+/// duplicate page beats a missing one — the opposite trade from the
+/// retention-overflow page, whose failure mode is a storm.
+fn boot_refusal_should_send(dedup_available: bool, claimed: bool) -> bool {
+    !dedup_available || claimed
+}
+
+/// Send ONE deduplicated refuse-to-start page.
+///
+/// `pg` is `Option` on purpose: the live-bootstrap guard runs before the
+/// watcher's pool exists, and PG itself may be the thing that is down. With
+/// no pool we cannot dedup, so we **send** and say so in the log — silence
+/// is the worse failure for a guard whose whole job is announcing that the
+/// process refuses to run.
+async fn send_boot_refusal_alert(
+    pg: Option<&PgPool>,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+    reason: BootRefusal,
+    headline: &str,
+    body: &str,
+) {
+    let Some(slack) = slack else {
+        tracing::warn!(
+            site = %site_id,
+            reason = ?reason,
+            "Refusing to start but Slack is not configured — refusal is log-only"
+        );
+        return;
+    };
+
+    let cooldown_mins = boot_refusal_cooldown_mins();
+    let claimed = match pg {
+        Some(pg) => {
+            claim_alert_slot(
+                pg,
+                site_id,
+                &reason.cooldown_key(),
+                cooldown_mins,
+                ClaimFallback::Send,
+            )
+            .await
+        }
+        None => {
+            tracing::warn!(
+                site = %site_id,
+                reason = ?reason,
+                "No PG pool available for refuse-to-start dedup — paging unconditionally \
+                 (fail-open); a restart loop may repeat this page"
+            );
+            false
+        }
+    };
+
+    if !boot_refusal_should_send(pg.is_some(), claimed) {
+        tracing::warn!(
+            site = %site_id,
+            reason = ?reason,
+            cooldown_mins,
+            "Refuse-to-start page suppressed — same reason already paged inside the \
+             dedup window (this is the Docker restart loop, not a new failure)"
+        );
+        return;
+    }
+
+    let payload = SlackMessage::with_site_text(
+        site_id,
+        format!("{headline}\n{body}{}", format_restart_cap_note(cooldown_mins)),
+    );
+    let _ = slack.send_message(&payload).await;
+}
+
+/// Best-effort throwaway PG pool used ONLY to dedup the live-bootstrap
+/// refusal, which fires before the bootstrap path builds its own pool.
+///
+/// One connection, short acquire budget, and every failure returns `None`
+/// so the caller falls open to sending the page. Deliberately NOT reused
+/// for anything else — the guard exits within 60s of this call.
+async fn boot_dedup_pool() -> Option<PgPool> {
+    let url = env::var("DATABASE_URL")
+        .or_else(|_| env::var("NEW_DATABASE_URL"))
+        .ok()?;
+    match PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(&url)
+        .await
+    {
+        Ok(pool) => Some(pool),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "Could not reach PG for refuse-to-start dedup — page will be sent \
+                 unconditionally"
+            );
+            None
+        }
+    }
+}
 
 /// Quiet-aware watchdog probe budget. The stall watchdog fires its
 /// `CHANGE_TRACKING_CURRENT_VERSION()` probe inside the alert path, so
@@ -535,6 +837,85 @@ const DEFAULT_PROBE_TIMEOUT_STREAK_THRESHOLD: u32 = 3;
 /// fires on first observation. Override via
 /// `LEGACY_SYNC_BACKLOG_PERSIST_STREAK` (1 reproduces the old hair-trigger).
 const DEFAULT_BACKLOG_PERSIST_STREAK_THRESHOLD: u32 = 2;
+
+// =============================================================================
+// CT-lag pager (2026-07-28 alert audit) — a paging path for the detector of
+// the 2026-05-18 lost-UPDATE class.
+// =============================================================================
+//
+// `scheduler::sync::check_ct_watcher_lag` observes CT lag on every reconcile
+// tick and logs `[Sync] CT watcher lag detected` at WARN. It fires ~170×/day
+// across both sites and has NO Slack path — the single loudest instance of
+// "the channel is quiet because the detectors are mute". It is also the
+// second line of defence for exactly the silent-loss family this workstream
+// exists to catch, so leaving it log-only is the wrong trade.
+//
+// This is the paging half. It deliberately does NOT re-emit that observation
+// (no second WARN, no competing log line); it consumes the SAME state
+// (`legacy_ct_state` vs `CHANGE_TRACKING_CURRENT_VERSION()`) with the SAME
+// thresholds — `DEFAULT_CT_LAG_WARN_VERSIONS` / `..._SECONDS` are imported
+// from that module rather than re-declared — and adds the three things a
+// pager needs that a log line does not: persistence, a durable cooldown, and
+// an all-clear.
+//
+// ## Why only the VERSION arm pages
+//
+// `ct_lag_is_warning` breaches on `version_lag > N` **or**
+// `poll_age_seconds > M`. The poll-age arm is a structural false positive:
+// `legacy_ct_state.last_polled_at` is written only by
+// `sync::watermark::advance`, and `global_watermark_target` returns `None`
+// when the sampled ceiling equals the watermark — i.e. a perfectly healthy
+// watcher that is caught up on a QUIET legacy never touches the row. Poll
+// age therefore grows without bound every quiet night, which is a large part
+// of that ~170/day. Shadow mode freezes the row outright, for the same
+// reason. Paging on it would manufacture nightly noise, so the page keys on
+// the probe-confirmed version arm only; poll age still rides along in the
+// message as context. The "watcher is not ticking at all" case it might
+// otherwise have covered is already owned by the watermark-stall watchdog
+// and the probe-outage escalation in this same task.
+//
+// ## Why it cannot double-report against the stall watchdog
+//
+// The stall page requires the watermark to be FROZEN (30min) with a backlog
+// persisting two ticks. This one fires while the watermark is still moving
+// but falling steadily behind — the shape that silently walks toward the
+// 2-day CT retention cliff without ever tripping "stuck". Where the two do
+// overlap (frozen AND far behind), the lag page defers: it is skipped
+// entirely while a stall alert is open.
+
+/// How long the version-lag breach must hold CONTINUOUSLY before it pages.
+///
+/// Level-triggered, not edge-triggered: a single reconcile tick observing
+/// >100 versions of lag is routine (one iHOTEL batch save, a slow poll
+/// cycle, a redeploy gap) and drains within seconds. 30 minutes of
+/// UNBROKEN lag is not routine, and still leaves ~47h of the 2-day CT
+/// retention window to act in. Any healthy observation resets the timer.
+/// Override via `LEGACY_SYNC_CT_LAG_PERSIST_SECS`.
+const DEFAULT_CT_LAG_PERSIST_SECS: u64 = 1800;
+
+/// Durable cooldown between CT-lag pages for a site, in hours. Matches the
+/// reconcile digest's 24h window (`scheduler::sync`'s level-drift cooldown),
+/// and like that digest the slot is RELEASED by the all-clear — so a
+/// genuine recurrence after a recovery pages immediately rather than
+/// waiting out the window.
+const CT_LAG_ALERT_COOLDOWN_HOURS: i64 = 24;
+
+/// Minimum spacing between CT probes issued SOLELY for the lag check.
+///
+/// The watchdog already probes `CHANGE_TRACKING_CURRENT_VERSION()` inside
+/// the stall and recovery branches; those results are reused for free. This
+/// only bounds the extra probes on otherwise-healthy ticks. 300s matches the
+/// reconcile-tick lag observation's own cadence order and adds ~288
+/// read-only scalar queries/day to the SHARED legacy server. Override via
+/// `LEGACY_SYNC_CT_LAG_PROBE_INTERVAL_SECS`.
+const DEFAULT_CT_LAG_PROBE_INTERVAL_SECS: u64 = 300;
+
+/// How stale a cached probe may be and still drive a lag decision,
+/// expressed as a multiple of the probe interval. One missed probe is
+/// tolerated; beyond that the lag state machine holds its current state
+/// rather than guessing — the same "never declare recovery on uncertainty"
+/// posture as [`recovery_alert_eligible`].
+const CT_LAG_PROBE_STALENESS_FACTOR: u32 = 2;
 
 /// All CT-enabled MSSQL tables — must stay in sync with the seeds in
 /// migrations 017 (canonical sync, 10 tables) + 022 (legacy_mirror, 6
@@ -741,15 +1122,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 };
                 let msg = build_live_bootstrap_refusal_message();
                 tracing::error!(site = %site.id, "{msg}");
-                if let Some(s) = &slack {
-                    let payload = SlackMessage::with_site_text(
-                        &site.id,
-                        format!(
-                            ":no_entry: *Bootstrap REFUSED — live deployment* :no_entry:\n{msg}"
-                        ),
-                    );
-                    let _ = s.send_message(&payload).await;
-                }
+                // This guard runs before the bootstrap path opens its own
+                // pool, so borrow a throwaway one purely for dedup. `None`
+                // (PG unreachable / no DATABASE_URL) falls open to sending.
+                let dedup_pg = boot_dedup_pool().await;
+                send_boot_refusal_alert(
+                    dedup_pg.as_ref(),
+                    slack.as_ref(),
+                    &site.id,
+                    BootRefusal::LiveBootstrap,
+                    ":no_entry: *Bootstrap REFUSED — live deployment* :no_entry:",
+                    msg,
+                )
+                .await;
                 // Sleep before exit so Docker `restart: unless-stopped`
                 // doesn't turn this into a tight loop + alert flood.
                 tracing::warn!(
@@ -863,20 +1248,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             error = %e,
             "Schema fingerprint check failed — refusing to start"
         );
-        if let Some(slack) = &slack {
-            let msg = SlackMessage::with_site_text(
-                &site.id,
-                format!(
-                    ":warning: *CT watcher REFUSED TO START* :warning:\n\
-                     Legacy MSSQL schema fingerprint mismatch.\n\
-                     *Error:* `{e}`\n\
-                     _The legacy DB columns drifted from the captured baseline. \
-                     Run_ `./scripts/writeback-fingerprint.sh` _and follow the \
-                     README to update the baseline before restarting._"
-                ),
-            );
-            let _ = slack.send_message(&msg).await;
-        }
+        send_boot_refusal_alert(
+            Some(&pg),
+            slack.as_ref(),
+            &site.id,
+            BootRefusal::SchemaFingerprint,
+            ":warning: *CT watcher REFUSED TO START* :warning:",
+            &format!(
+                "Legacy MSSQL schema fingerprint mismatch.\n\
+                 *Error:* `{e}`\n\
+                 _The legacy DB columns drifted from the captured baseline. \
+                 Run_ `./scripts/writeback-fingerprint.sh` _and follow the \
+                 README to update the baseline before restarting._"
+            ),
+        )
+        .await;
         tracing::warn!(site = %site.id, "Sleeping 60s before exit to throttle Docker restart cadence");
         tokio::time::sleep(Duration::from_secs(60)).await;
         return Err(format!("Schema fingerprint check failed: {e}").into());
@@ -949,13 +1335,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                    to override (will replay all CT history). \
                    See docs/runbook-sync.md for the full cutover procedure.";
         tracing::error!(site = %site.id, "{msg}");
-        if let Some(s) = &slack {
-            let payload = SlackMessage::with_site_text(
-                &site.id,
-                format!(":no_entry: *CT watcher REFUSED TO START* :no_entry:\n{msg}"),
-            );
-            let _ = s.send_message(&payload).await;
-        }
+        send_boot_refusal_alert(
+            Some(&pg),
+            slack.as_ref(),
+            &site.id,
+            BootRefusal::ColdReplay,
+            ":no_entry: *CT watcher REFUSED TO START* :no_entry:",
+            msg,
+        )
+        .await;
         // Sleep before exit so Docker `restart: unless-stopped` doesn't
         // turn this into a tight loop + alert flood.
         tokio::time::sleep(Duration::from_secs(60)).await;
@@ -1013,15 +1401,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             overflowed.join("\n    - "),
         );
         tracing::error!(site = %site.id, "{msg}");
-        if let Some(s) = &slack {
-            let payload = SlackMessage::with_site_text(
-                &site.id,
-                format!(
-                    ":no_entry: *CT watcher REFUSED TO START — retention overflow* :no_entry:\n{msg}"
-                ),
-            );
-            let _ = s.send_message(&payload).await;
-        }
+        send_boot_refusal_alert(
+            Some(&pg),
+            slack.as_ref(),
+            &site.id,
+            BootRefusal::RetentionOverflow,
+            ":no_entry: *CT watcher REFUSED TO START — retention overflow* :no_entry:",
+            &msg,
+        )
+        .await;
         // Sleep before exit so Docker `restart: unless-stopped` doesn't
         // turn this into a tight loop + alert flood.
         tokio::time::sleep(Duration::from_secs(60)).await;
@@ -1075,15 +1463,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             ct_missing.join("\n    - "),
         );
         tracing::error!(site = %site.id, "{msg}");
-        if let Some(s) = &slack {
-            let payload = SlackMessage::with_site_text(
-                &site.id,
-                format!(
-                    ":no_entry: *CT watcher REFUSED TO START — Change Tracking not enabled* :no_entry:\n{msg}"
-                ),
-            );
-            let _ = s.send_message(&payload).await;
-        }
+        send_boot_refusal_alert(
+            Some(&pg),
+            slack.as_ref(),
+            &site.id,
+            BootRefusal::CtNotEnabled,
+            ":no_entry: *CT watcher REFUSED TO START — Change Tracking not enabled* :no_entry:",
+            &msg,
+        )
+        .await;
         // Sleep before exit so Docker `restart: unless-stopped` doesn't
         // turn this into a tight loop + alert flood.
         tokio::time::sleep(Duration::from_secs(60)).await;
@@ -2201,32 +2589,255 @@ fn format_recovery_message(decision: &RecoveryDecision, now: Instant) -> String 
 }
 
 /// Pure decision function for the shadow-mode-too-long alert. Returns
-/// `Some(reason)` when shadow mode has been running for longer than
-/// the hardcoded ceiling ([`SHADOW_MODE_MAX_DURATION_SECS`], 36h).
+/// `Some(reason)` when the CT watermark has been frozen by shadow mode for
+/// longer than the hardcoded ceiling ([`SHADOW_MODE_MAX_DURATION_SECS`],
+/// 36h).
 ///
 /// The MSSQL CT retention default is 2 days; staying in shadow mode
 /// past 36h leaves <12h before the retention cliff silently drops
 /// changes the next tick would have replayed.
+///
+/// ## S11 fix (2026-07-28 alert audit) — the clock is now durable
+///
+/// This used to measure `now - started_at` where `started_at` was an
+/// `Instant` captured when the watchdog task spawned, i.e. PROCESS UPTIME.
+/// The clock reset on every restart, and with a normal deploy cadence
+/// (~6 restarts/day) it could never reach 36h. The guard was unfireable —
+/// worse than absent, because it read as coverage in the alert inventory.
+///
+/// The replacement anchor needs no new state and no migration, because PG
+/// already holds it: `legacy_ct_state.last_polled_at` is written ONLY by
+/// `sync::watermark::advance`, and `run_one_tick` skips every watermark
+/// write in shadow mode (`if !per_table_watermark && !shadow_mode`, and the
+/// per-table floor's `if per_table_watermark && !shadow_mode`). So in
+/// shadow mode that column freezes at the last live tick — which is exactly
+/// "when the shadow soak began" — and it survives restarts, redeploys and
+/// container replacement. It is also strictly closer to the hazard than
+/// process uptime ever was: the thing that ages toward
+/// `MIN_VALID_VERSION` is the frozen watermark, not the process.
+///
+/// `frozen_since` is `None` only if the single `legacy_ct_state` row is
+/// missing (pre-bootstrap); treat that as "unknown" and stay silent.
+/// Clock skew (`now < frozen_since`) is likewise treated as not-yet-due.
 fn shadow_mode_pager_eligible(
     shadow_mode: bool,
-    started_at: Instant,
-    now: Instant,
+    frozen_since: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Option<String> {
     if !shadow_mode {
         return None;
     }
-    let duration = now.duration_since(started_at);
-    let max = Duration::from_secs(SHADOW_MODE_MAX_DURATION_SECS);
-    if duration < max {
+    let frozen_since = frozen_since?;
+    let frozen_secs = now.signed_duration_since(frozen_since).num_seconds();
+    if frozen_secs < SHADOW_MODE_MAX_DURATION_SECS as i64 {
         return None;
     }
     Some(format!(
-        "Shadow mode has been running for {}s (ceiling {}s, ≈36h). \
-         MSSQL CT retention is 2 days; staying in shadow much longer \
+        "Shadow mode has held the CT watermark frozen since {} — {}s (ceiling {}s, \
+         ≈36h). MSSQL CT retention is 2 days; staying in shadow much longer \
          risks the watermark dropping behind MIN_VALID_VERSION.",
-        duration.as_secs(),
-        max.as_secs(),
+        frozen_since.to_rfc3339(),
+        frozen_secs,
+        SHADOW_MODE_MAX_DURATION_SECS,
     ))
+}
+
+// -----------------------------------------------------------------------------
+// CT-lag pager — thresholds, level-trigger state machine, message bodies.
+// See the block comment above `DEFAULT_CT_LAG_PERSIST_SECS`.
+// -----------------------------------------------------------------------------
+
+/// CT-lag thresholds, resolved exactly as
+/// `scheduler::sync::ct_lag_thresholds_from_env` resolves them.
+///
+/// The struct and resolver are private over there, so the shape is
+/// re-declared here — but the NUMBERS are imported
+/// (`DEFAULT_CT_LAG_WARN_VERSIONS` / `DEFAULT_CT_LAG_WARN_SECONDS` are
+/// `pub`), which is the part that must never drift between the observation
+/// and the page. `ct_lag_env_contract_matches_scheduler` in `mod tests`
+/// locks the env-var names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CtLagThresholds {
+    version_lag: i64,
+    poll_age_seconds: i64,
+}
+
+/// Positive-integer env threshold, mirroring
+/// `scheduler::sync::parse_threshold_env` (invalid / non-positive values
+/// are ignored so a typo can't silently disable the pager).
+fn parse_ct_lag_threshold_env(var_name: &str) -> Option<i64> {
+    match env::var(var_name) {
+        Ok(raw) => match raw.trim().parse::<i64>() {
+            Ok(n) if n > 0 => Some(n),
+            _ => {
+                tracing::warn!(
+                    var = var_name,
+                    value = %raw,
+                    "[watchdog] Invalid CT-lag threshold env var; ignoring"
+                );
+                None
+            }
+        },
+        Err(_) => None,
+    }
+}
+
+/// Per-site override first (`LEGACY_CT_LAG_WARN_VERSIONS_<SITE>`), then the
+/// global var, then the shared default — identical precedence to the
+/// reconcile-tick observation so the two can never disagree about what
+/// "lagging" means.
+fn ct_lag_thresholds_from_env(site_id: &str) -> CtLagThresholds {
+    let site_upper = site_id.to_uppercase();
+    let per_site_version = format!("LEGACY_CT_LAG_WARN_VERSIONS_{site_upper}");
+    let per_site_seconds = format!("LEGACY_CT_LAG_WARN_SECONDS_{site_upper}");
+    CtLagThresholds {
+        version_lag: parse_ct_lag_threshold_env(&per_site_version)
+            .or_else(|| parse_ct_lag_threshold_env("LEGACY_CT_LAG_WARN_VERSIONS"))
+            .unwrap_or(hotel_backend::scheduler::sync::DEFAULT_CT_LAG_WARN_VERSIONS),
+        poll_age_seconds: parse_ct_lag_threshold_env(&per_site_seconds)
+            .or_else(|| parse_ct_lag_threshold_env("LEGACY_CT_LAG_WARN_SECONDS"))
+            .unwrap_or(hotel_backend::scheduler::sync::DEFAULT_CT_LAG_WARN_SECONDS),
+    }
+}
+
+/// Is this observation page-worthy? Strictly the VERSION arm — see the
+/// "Why only the VERSION arm pages" note above
+/// [`DEFAULT_CT_LAG_PERSIST_SECS`]. Strictly-greater-than, matching
+/// `scheduler::sync::ct_lag_is_warning`.
+fn ct_lag_is_pageable(version_lag: i64, thresholds: CtLagThresholds) -> bool {
+    version_lag > thresholds.version_lag
+}
+
+/// What the CT-lag state machine wants the watchdog to do this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CtLagAction {
+    /// Not lagging and nothing outstanding.
+    Quiet,
+    /// Lagging, but it has not persisted past the threshold yet.
+    Building,
+    /// Lagging past the threshold and we have not paged this episode.
+    Page,
+    /// Lagging past the threshold but already paged this episode.
+    Holding,
+    /// Lag cleared after we paged — fire the all-clear.
+    Recovered,
+}
+
+/// Pure level-trigger for the CT-lag pager. No clock reads, no env, no PG,
+/// so the truth table is a plain unit test.
+///
+/// * `lagging` — [`ct_lag_is_pageable`] on a FRESH probe. Callers must not
+///   pass a value derived from a stale/absent probe; hold state instead.
+/// * `lag_since` — when the current unbroken lag episode began. The caller
+///   anchors it on the first breach and clears it on any healthy
+///   observation; `None` alongside `lagging == true` is the defensive
+///   "just started" reading and yields `Building`.
+/// * `paged` — whether this episode has already been announced.
+fn ct_lag_next_action(
+    lagging: bool,
+    lag_since: Option<Instant>,
+    paged: bool,
+    now: Instant,
+    persist_threshold: Duration,
+) -> CtLagAction {
+    if !lagging {
+        return if paged {
+            CtLagAction::Recovered
+        } else {
+            CtLagAction::Quiet
+        };
+    }
+    if paged {
+        return CtLagAction::Holding;
+    }
+    match lag_since {
+        // First breach of this episode — the caller anchors the timer now,
+        // so by definition it has not persisted yet.
+        None => CtLagAction::Building,
+        Some(since) if now.duration_since(since) >= persist_threshold => CtLagAction::Page,
+        Some(_) => CtLagAction::Building,
+    }
+}
+
+/// Everything the CT-lag messages need, captured at decision time.
+#[derive(Debug, Clone)]
+struct CtLagSnapshot {
+    watermark: i64,
+    ct_current: i64,
+    version_lag: i64,
+    /// `i64::MAX` for a never-polled row, matching the reconcile-tick
+    /// observation's sentinel.
+    poll_age_seconds: i64,
+    /// Stalest table, in per-table watermark mode only.
+    table: Option<String>,
+}
+
+impl CtLagSnapshot {
+    /// Human-readable poll age, collapsing the never-polled sentinel.
+    fn poll_age_text(&self) -> String {
+        if self.poll_age_seconds == i64::MAX {
+            "never".to_string()
+        } else {
+            format!("{}s ago", self.poll_age_seconds)
+        }
+    }
+}
+
+/// Slack body for the level-triggered CT-lag page.
+fn format_ct_lag_alert_message(
+    snap: &CtLagSnapshot,
+    thresholds: CtLagThresholds,
+    lagging_for: Duration,
+    persist_threshold: Duration,
+) -> String {
+    let CtLagSnapshot {
+        watermark,
+        ct_current,
+        version_lag,
+        ..
+    } = snap;
+    let for_mins = lagging_for.as_secs() / 60;
+    let persist_mins = persist_threshold.as_secs() / 60;
+    let version_threshold = thresholds.version_lag;
+    let poll_age = snap.poll_age_text();
+    let table_note = match &snap.table {
+        Some(t) => format!(
+            "\nPer-table mode: stalest table is `{t}` — it is holding the global floor down."
+        ),
+        None => String::new(),
+    };
+    format!(
+        ":warning: *CT watcher LAG sustained {for_mins}min* :warning:\n\
+         Canonical watermark is v{watermark} while legacy CT current is v{ct_current} \
+         — {version_lag} versions behind (page threshold {version_threshold}), and it \
+         has stayed behind for {for_mins}min without a break (persistence gate \
+         {persist_mins}min). Watermark last written {poll_age}.{table_note}\n\
+         This is the 2026-05-18 lost-UPDATE shape: the watcher is still running and \
+         still advancing, just never catching up. MSSQL CT retention is 2 days — \
+         anything still unread when a version ages out is lost SILENTLY.\n\
+         _Check `legacy_sync_status.last_error` for a table stuck in a retry loop, then \
+         the dashboard at `/api/new/sync/status`. Grep the worker logs for \
+         `[Sync] CT watcher lag detected` for the per-tick history._"
+    )
+}
+
+/// Slack body for the paired CT-lag all-clear.
+fn format_ct_lag_recovery_message(snap: &CtLagSnapshot, lagged_for: Duration) -> String {
+    let CtLagSnapshot {
+        watermark,
+        ct_current,
+        version_lag,
+        ..
+    } = snap;
+    let duration = format_alert_duration(lagged_for);
+    format!(
+        ":white_check_mark: *CT watcher lag RECOVERED*\n\
+         Watermark v{watermark} is back within threshold of legacy CT current \
+         v{ct_current} ({version_lag} versions behind). The lag alert raised \
+         {duration} is cleared, and its cooldown slot is released so a recurrence \
+         pages immediately.\n\
+         _Dashboard: `/api/new/sync/status`._"
+    )
 }
 
 /// Track D / T7 CRIT-3 — spawn the watermark-stall watchdog. Runs as a
@@ -2251,7 +2862,6 @@ async fn run_watermark_watchdog(
     stall_alert_secs: u64,
     shutdown: Arc<Notify>,
 ) {
-    let started_at = Instant::now();
     let stall_threshold = Duration::from_secs(stall_alert_secs);
     let cooldown = Duration::from_secs(WATCHDOG_ALERT_COOLDOWN_SECS);
     let mut prior: Option<WatermarkObservation> = None;
@@ -2259,7 +2869,6 @@ async fn run_watermark_watchdog(
     // a confirmed-backlog page can bypass the cooldown left by a mere
     // probe-timeout informational note (see `stall_page_passes_cooldown`).
     let mut last_stall_alert: Option<(Instant, bool)> = None;
-    let mut last_shadow_alert: Option<Instant> = None;
     // Open-alert tracking for the recovery notification (PR D,
     // 2026-05-19). Parallel to `last_stall_alert` — that one encodes
     // cooldown, this one encodes "we paged and haven't yet declared
@@ -2286,6 +2895,19 @@ async fn run_watermark_watchdog(
     // probe success, or a no-stall tick (same lifecycle as the streak).
     let mut info_outage_since: Option<Instant> = None;
     let mut info_outage_escalated: bool = false;
+    // 2026-07-28 — CT-lag pager state. `ct_lag_since` anchors the current
+    // unbroken lag episode (cleared by any healthy observation);
+    // `ct_lag_paged` latches once the episode has been announced so the
+    // page is once-per-episode even before the durable cooldown is
+    // consulted; `ct_lag_paged_at` is the "raised N ago" figure for the
+    // all-clear. `ct_lag_probe` caches the most recent successful CT probe
+    // — the stall/recovery branches donate theirs for free, and a dedicated
+    // probe only runs when none was taken this tick and the interval has
+    // elapsed.
+    let mut ct_lag_since: Option<Instant> = None;
+    let mut ct_lag_paged: bool = false;
+    let mut ct_lag_paged_at: Option<Instant> = None;
+    let mut ct_lag_probe: Option<(Instant, i64)> = None;
 
     let shadow_mode = env::var("LEGACY_SYNC_SHADOW_MODE")
         .map(|v| v == "true")
@@ -2325,6 +2947,29 @@ async fn run_watermark_watchdog(
             .unwrap_or(DEFAULT_PROBE_OUTAGE_ESCALATION_SECS),
     );
 
+    // CT-lag pager (2026-07-28). Default ON — the whole point is that this
+    // detector had no paging path. `LEGACY_SYNC_CT_LAG_PAGER_ENABLED=false`
+    // is the kill switch if it ever proves noisy in production.
+    let ct_lag_pager_enabled = env::var("LEGACY_SYNC_CT_LAG_PAGER_ENABLED")
+        .map(|v| v != "false")
+        .unwrap_or(true);
+    let ct_lag_thresholds = ct_lag_thresholds_from_env(&site_id);
+    let ct_lag_persist = Duration::from_secs(
+        env::var("LEGACY_SYNC_CT_LAG_PERSIST_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|s: &u64| *s > 0)
+            .unwrap_or(DEFAULT_CT_LAG_PERSIST_SECS),
+    );
+    let ct_lag_probe_interval = Duration::from_secs(
+        env::var("LEGACY_SYNC_CT_LAG_PROBE_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|s: &u64| *s > 0)
+            .unwrap_or(DEFAULT_CT_LAG_PROBE_INTERVAL_SECS),
+    );
+    let ct_lag_probe_staleness = ct_lag_probe_interval * CT_LAG_PROBE_STALENESS_FACTOR;
+
     tracing::info!(
         site = %site_id,
         stall_alert_secs,
@@ -2334,6 +2979,18 @@ async fn run_watermark_watchdog(
         probe_timeout_ms = probe_timeout.as_millis() as u64,
         probe_outage_escalation_secs = probe_outage_escalation.as_secs(),
         "[watchdog] Watermark-stall watchdog starting"
+    );
+
+    tracing::info!(
+        site = %site_id,
+        enabled = ct_lag_pager_enabled,
+        version_threshold = ct_lag_thresholds.version_lag,
+        poll_age_threshold_secs = ct_lag_thresholds.poll_age_seconds,
+        persist_secs = ct_lag_persist.as_secs(),
+        probe_interval_secs = ct_lag_probe_interval.as_secs(),
+        cooldown_hours = CT_LAG_ALERT_COOLDOWN_HOURS,
+        "[watchdog] CT-lag pager configured (pages on the version arm only; \
+         the reconcile tick keeps logging both arms)"
     );
 
     // Emitted only when the flag is ON so global-mode log output stays
@@ -2356,6 +3013,9 @@ async fn run_watermark_watchdog(
         }
 
         let now = Instant::now();
+        // Any successful CT probe taken anywhere in THIS iteration, donated
+        // to the CT-lag pager so it does not pay for a second round-trip.
+        let mut tick_ct_current: Option<i64> = None;
 
         // Read both watermark + last_polled_at in one round-trip.
         let observation = match read_ct_state(&pg).await {
@@ -2387,7 +3047,10 @@ async fn run_watermark_watchdog(
                 // failure we DON'T declare recovery (uncertainty
                 // holds the open alert).
                 recovery_probe = match probe_change_tracking_current_version(&mssql, probe_timeout).await {
-                    Ok(v) => Some(v),
+                    Ok(v) => {
+                        tick_ct_current = Some(v);
+                        Some(v)
+                    }
                     Err(err) => {
                         tracing::warn!(
                             site = %site_id,
@@ -2447,6 +3110,7 @@ async fn run_watermark_watchdog(
                         // outage is over; clear the escalation anchor.
                         info_outage_since = None;
                         info_outage_escalated = false;
+                        tick_ct_current = Some(v);
                         Some(v)
                     }
                     Err(err) => {
@@ -2728,13 +3392,225 @@ async fn run_watermark_watchdog(
         };
         prior = Some(new_prior);
 
-        // Shadow-mode-too-long check.
-        if let Some(reason) = shadow_mode_pager_eligible(shadow_mode, started_at, now) {
-            let cooldown_elapsed = match last_shadow_alert {
-                Some(t) => now.duration_since(t) >= cooldown,
-                None => true,
+        // ------------------------------------------------------------------
+        // CT-lag pager (2026-07-28). Level-triggered, durably cooled, paired
+        // with an all-clear. Skipped in shadow mode (the watermark is frozen
+        // BY DESIGN there — that is the shadow-ceiling guard's job) and while
+        // a stall alert is open (the stall page already owns that operator's
+        // attention; see "Why it cannot double-report" above
+        // `DEFAULT_CT_LAG_PERSIST_SECS`).
+        // ------------------------------------------------------------------
+        if ct_lag_pager_enabled && !shadow_mode && pending_stall_alert.is_none() {
+            // Reuse any probe this iteration already took; otherwise take one
+            // at most every `ct_lag_probe_interval`.
+            if let Some(v) = tick_ct_current {
+                ct_lag_probe = Some((now, v));
+            } else if ct_lag_probe
+                .map(|(t, _)| now.duration_since(t) >= ct_lag_probe_interval)
+                .unwrap_or(true)
+            {
+                match probe_change_tracking_current_version(&mssql, probe_timeout).await {
+                    Ok(v) => ct_lag_probe = Some((now, v)),
+                    Err(err) => tracing::debug!(
+                        site = %site_id,
+                        error = %err,
+                        "[watchdog] CT-lag probe failed — holding lag state (uncertainty \
+                         never advances or clears the episode)"
+                    ),
+                }
+            }
+
+            // A stale probe must not drive a decision in EITHER direction:
+            // it could invent a lag that has already drained, or declare an
+            // all-clear for a lag we simply cannot see.
+            let fresh_ct_current = match ct_lag_probe {
+                Some((t, v)) if now.duration_since(t) <= ct_lag_probe_staleness => Some(v),
+                _ => None,
             };
-            if cooldown_elapsed {
+
+            if let Some(ct_current) = fresh_ct_current {
+                let watermark = observation.last_seen_version;
+                let version_lag = ct_current.saturating_sub(watermark).max(0);
+                let poll_age_seconds = observation
+                    .last_polled_at
+                    .map(|p| {
+                        chrono::Utc::now()
+                            .signed_duration_since(p)
+                            .num_seconds()
+                            .max(0)
+                    })
+                    .unwrap_or(i64::MAX);
+                let lagging = ct_lag_is_pageable(version_lag, ct_lag_thresholds);
+                if lagging && ct_lag_since.is_none() {
+                    ct_lag_since = Some(now);
+                }
+                let action = ct_lag_next_action(
+                    lagging,
+                    ct_lag_since,
+                    ct_lag_paged,
+                    now,
+                    ct_lag_persist,
+                );
+                let lagging_for = ct_lag_since
+                    .map(|t| now.duration_since(t))
+                    .unwrap_or_default();
+
+                match action {
+                    CtLagAction::Quiet => {
+                        ct_lag_since = None;
+                    }
+                    CtLagAction::Building => {
+                        tracing::info!(
+                            site = %site_id,
+                            watermark,
+                            ct_current,
+                            version_lag,
+                            threshold = ct_lag_thresholds.version_lag,
+                            lagging_secs = lagging_for.as_secs(),
+                            persist_secs = ct_lag_persist.as_secs(),
+                            "[watchdog] CT lag observed — holding the page until it \
+                             persists past the gate"
+                        );
+                    }
+                    CtLagAction::Holding => {
+                        // INFO, not WARN: the page already went out, and a
+                        // 60s cadence of WARN for the whole life of an open
+                        // episode is exactly the undifferentiated log noise
+                        // this audit exists to reduce.
+                        tracing::info!(
+                            site = %site_id,
+                            watermark,
+                            ct_current,
+                            version_lag,
+                            lagging_secs = lagging_for.as_secs(),
+                            "[watchdog] CT lag still open — already paged this episode"
+                        );
+                    }
+                    CtLagAction::Page => {
+                        let claimed = claim_alert_slot(
+                            &pg,
+                            &site_id,
+                            CT_LAG_COOLDOWN_KEY,
+                            CT_LAG_ALERT_COOLDOWN_HOURS * 60,
+                            ClaimFallback::Suppress,
+                        )
+                        .await;
+                        if !claimed {
+                            // Deliberately do NOT latch `ct_lag_paged` here.
+                            // The usual reason we are here is a restart
+                            // inside an open episode (the pre-restart page's
+                            // 24h row is still held), and re-attempting the
+                            // claim each tick means (a) a transient PG error
+                            // self-heals within 60s instead of swallowing the
+                            // whole episode, and (b) an episode that outlives
+                            // the 24h window pages again, which is correct.
+                            // INFO, not WARN — this is the cooldown working.
+                            tracing::info!(
+                                site = %site_id,
+                                watermark,
+                                ct_current,
+                                version_lag,
+                                lagging_secs = lagging_for.as_secs(),
+                                cooldown_hours = CT_LAG_ALERT_COOLDOWN_HOURS,
+                                "[watchdog] CT lag past the persistence gate but the \
+                                 durable cooldown slot is held — page suppressed"
+                            );
+                        } else {
+                            let table = stalest_table_context(
+                                per_table_watermark,
+                                &pg,
+                                ct_current,
+                                &site_id,
+                            )
+                            .await
+                            .map(|ctx| ctx.table);
+                            let snap = CtLagSnapshot {
+                                watermark,
+                                ct_current,
+                                version_lag,
+                                poll_age_seconds,
+                                table,
+                            };
+                            tracing::error!(
+                                site = %site_id,
+                                watermark,
+                                ct_current,
+                                version_lag,
+                                poll_age_seconds,
+                                lagging_secs = lagging_for.as_secs(),
+                                threshold = ct_lag_thresholds.version_lag,
+                                "[watchdog] CT watcher lag sustained past the \
+                                 persistence gate — paging operator"
+                            );
+                            if let Some(s) = slack.as_ref() {
+                                let payload = SlackMessage::with_site_text(
+                                    &site_id,
+                                    format_ct_lag_alert_message(
+                                        &snap,
+                                        ct_lag_thresholds,
+                                        lagging_for,
+                                        ct_lag_persist,
+                                    ),
+                                );
+                                let _ = s.send_message(&payload).await;
+                            }
+                            ct_lag_paged = true;
+                            ct_lag_paged_at = Some(now);
+                        }
+                    }
+                    CtLagAction::Recovered => {
+                        let lagged_for = ct_lag_paged_at
+                            .map(|t| now.duration_since(t))
+                            .unwrap_or_default();
+                        let snap = CtLagSnapshot {
+                            watermark,
+                            ct_current,
+                            version_lag,
+                            poll_age_seconds,
+                            table: None,
+                        };
+                        tracing::info!(
+                            site = %site_id,
+                            watermark,
+                            ct_current,
+                            version_lag,
+                            lagged_secs = lagged_for.as_secs(),
+                            "[watchdog] CT watcher lag recovered — firing all-clear"
+                        );
+                        if let Some(s) = slack.as_ref() {
+                            let payload = SlackMessage::with_site_text(
+                                &site_id,
+                                format_ct_lag_recovery_message(&snap, lagged_for),
+                            );
+                            let _ = s.send_message(&payload).await;
+                        }
+                        // Release the slot so a RECURRENCE pages on the next
+                        // breach instead of waiting out the 24h window.
+                        release_alert_slot(&pg, &site_id, CT_LAG_COOLDOWN_KEY).await;
+                        ct_lag_since = None;
+                        ct_lag_paged = false;
+                        ct_lag_paged_at = None;
+                    }
+                }
+            }
+        }
+
+        // Shadow-mode-too-long check. The clock is `legacy_ct_state`'s frozen
+        // `last_polled_at`, not process uptime — see
+        // `shadow_mode_pager_eligible` for why the old anchor could never
+        // reach the 36h ceiling. The cooldown is durable for the same reason.
+        if let Some(reason) =
+            shadow_mode_pager_eligible(shadow_mode, observation.last_polled_at, chrono::Utc::now())
+        {
+            let claimed = claim_alert_slot(
+                &pg,
+                &site_id,
+                SHADOW_CEILING_COOLDOWN_KEY,
+                (WATCHDOG_ALERT_COOLDOWN_SECS / 60) as i64,
+                ClaimFallback::Suppress,
+            )
+            .await;
+            if claimed {
                 tracing::error!(
                     site = %site_id,
                     reason,
@@ -2753,7 +3629,6 @@ async fn run_watermark_watchdog(
                     );
                     let _ = s.send_message(&payload).await;
                 }
-                last_shadow_alert = Some(now);
             }
         }
     }
@@ -7927,12 +8802,19 @@ mod tests {
         assert!(result.is_none(), "below threshold must not alert");
     }
 
+    /// Wall-clock helper for the shadow-ceiling tests. The anchor is now
+    /// `legacy_ct_state.last_polled_at`, a PG `TIMESTAMPTZ`, not a
+    /// process-local `Instant` (S11 fix, 2026-07-28).
+    fn shadow_frozen(secs_ago: i64) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
+        let now = chrono::Utc::now();
+        (now - chrono::Duration::seconds(secs_ago), now)
+    }
+
     /// Track D / T7 CRIT-3 — shadow mode older than the ceiling fires.
     #[test]
     fn shadow_mode_pager_fires_past_ceiling() {
-        let started_at = Instant::now();
-        let now = started_at + Duration::from_secs(SHADOW_MODE_MAX_DURATION_SECS + 1);
-        let result = shadow_mode_pager_eligible(true, started_at, now);
+        let (frozen_since, now) = shadow_frozen(SHADOW_MODE_MAX_DURATION_SECS as i64 + 1);
+        let result = shadow_mode_pager_eligible(true, Some(frozen_since), now);
         assert!(result.is_some(), "shadow > ceiling must page");
     }
 
@@ -7940,9 +8822,8 @@ mod tests {
     /// not fire (12h is below the 36h threshold).
     #[test]
     fn shadow_mode_pager_silent_inside_ceiling() {
-        let started_at = Instant::now();
-        let now = started_at + Duration::from_secs(12 * 3600);
-        let result = shadow_mode_pager_eligible(true, started_at, now);
+        let (frozen_since, now) = shadow_frozen(12 * 3600);
+        let result = shadow_mode_pager_eligible(true, Some(frozen_since), now);
         assert!(result.is_none(), "12h shadow run must NOT page");
     }
 
@@ -7950,10 +8831,64 @@ mod tests {
     /// shadow-too-long alert regardless of elapsed time.
     #[test]
     fn shadow_mode_pager_silent_in_live_mode() {
-        let started_at = Instant::now();
-        let now = started_at + Duration::from_secs(SHADOW_MODE_MAX_DURATION_SECS + 10_000);
-        let result = shadow_mode_pager_eligible(false, started_at, now);
+        let (frozen_since, now) = shadow_frozen(SHADOW_MODE_MAX_DURATION_SECS as i64 + 10_000);
+        let result = shadow_mode_pager_eligible(false, Some(frozen_since), now);
         assert!(result.is_none(), "live mode must never fire the shadow pager");
+    }
+
+    // -------------------------------------------------------------------
+    // S11 (2026-07-28 alert audit) — the shadow ceiling is now reachable.
+    //
+    // The guard used to measure `now - Instant::now()@watchdog-spawn`, i.e.
+    // PROCESS UPTIME. Deploys restart these workers several times a day, so
+    // the clock reset long before 36h and the guard could never fire. These
+    // tests pin the durable replacement: the anchor is
+    // `legacy_ct_state.last_polled_at`, which shadow mode freezes (no
+    // watermark write happens at all in shadow mode) and which survives
+    // restarts because it lives in PG.
+    // -------------------------------------------------------------------
+
+    /// The regression that motivated S11: a worker that has been up for only
+    /// a few minutes must STILL page when PG says the watermark has been
+    /// frozen past the ceiling. Under the old process-uptime anchor this
+    /// case was silent forever.
+    #[test]
+    fn shadow_ceiling_fires_after_a_restart_when_pg_says_frozen_past_ceiling() {
+        let (frozen_since, now) = shadow_frozen(40 * 3600);
+        let result = shadow_mode_pager_eligible(true, Some(frozen_since), now);
+        assert!(
+            result.is_some(),
+            "a fresh process must still page on a 40h-old PG freeze — that is the \
+             whole point of moving the anchor off process uptime"
+        );
+        let msg = result.unwrap();
+        assert!(
+            msg.contains(&frozen_since.to_rfc3339()),
+            "the page must name the freeze instant so an operator can date the \
+             soak; got: {msg}"
+        );
+    }
+
+    /// A missing `legacy_ct_state` row (pre-bootstrap) is UNKNOWN, not
+    /// "frozen since the epoch". Stay silent.
+    #[test]
+    fn shadow_ceiling_silent_when_freeze_anchor_is_unknown() {
+        let now = chrono::Utc::now();
+        assert!(
+            shadow_mode_pager_eligible(true, None, now).is_none(),
+            "no watermark row yet must not be read as an infinite freeze"
+        );
+    }
+
+    /// Clock skew (`last_polled_at` in the future) must not fire, and must
+    /// not panic on the negative duration.
+    #[test]
+    fn shadow_ceiling_silent_on_clock_skew() {
+        let (frozen_since, now) = shadow_frozen(-600);
+        assert!(
+            shadow_mode_pager_eligible(true, Some(frozen_since), now).is_none(),
+            "a future-dated freeze anchor is skew, not a 36h soak"
+        );
     }
 
     /// Track D / T7 CRIT-3 — the ceiling sits below the 48h MSSQL CT
@@ -7971,6 +8906,460 @@ mod tests {
         assert!(
             CT_RETENTION_CLIFF_SECS - SHADOW_MODE_MAX_DURATION_SECS >= 12 * 3600,
             "must leave >=12h cushion before the cliff"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // CT-lag pager (2026-07-28 alert audit).
+    //
+    // `[Sync] CT watcher lag detected` fired ~170×/day at WARN with no
+    // Slack path, while being the second line of defence for the
+    // 2026-05-18 lost-UPDATE class. These tests pin the three properties
+    // that make a page out of an observation without making noise:
+    // persistence, a namespaced durable cooldown, and an all-clear.
+    // -------------------------------------------------------------------
+
+    /// Only the VERSION arm is page-worthy, and strictly-greater-than —
+    /// same comparison as `scheduler::sync::ct_lag_is_warning`.
+    #[test]
+    fn ct_lag_pages_on_the_version_arm_strictly_above_threshold() {
+        let t = CtLagThresholds {
+            version_lag: 100,
+            poll_age_seconds: 300,
+        };
+        assert!(!ct_lag_is_pageable(100, t), "at threshold must not page");
+        assert!(ct_lag_is_pageable(101, t), "one past threshold must page");
+        assert!(!ct_lag_is_pageable(0, t));
+    }
+
+    /// The poll-age arm must NEVER page on its own.
+    ///
+    /// `legacy_ct_state.last_polled_at` is written only by
+    /// `sync::watermark::advance`, and `global_watermark_target` returns
+    /// `None` once the sampled ceiling equals the watermark — so a healthy,
+    /// caught-up watcher on a quiet legacy stops touching the row and its
+    /// poll age grows without bound overnight. Paging on that would
+    /// manufacture nightly noise; it is a large part of why the reconcile
+    /// tick's WARN fires ~170×/day.
+    #[test]
+    fn ct_lag_never_pages_on_poll_age_alone() {
+        let t = CtLagThresholds {
+            version_lag: 100,
+            poll_age_seconds: 300,
+        };
+        // A full quiet night: nothing to sync, so nothing advanced.
+        assert!(
+            !ct_lag_is_pageable(0, t),
+            "a caught-up watermark must never page no matter how old the last write is"
+        );
+    }
+
+    /// First breach starts the timer; it must not page on the spot. A
+    /// single tick of >100 versions is routine (one iHOTEL batch save).
+    #[test]
+    fn ct_lag_first_breach_only_starts_the_timer() {
+        let now = Instant::now();
+        assert_eq!(
+            ct_lag_next_action(true, None, false, now, Duration::from_secs(1800)),
+            CtLagAction::Building
+        );
+    }
+
+    /// The core level-trigger contract: silent below the persistence
+    /// threshold, pages at or past it.
+    #[test]
+    fn ct_lag_pager_fires_only_past_the_persistence_threshold() {
+        let persist = Duration::from_secs(1800);
+        let anchor = Instant::now();
+
+        let just_under = anchor + Duration::from_secs(1799);
+        assert_eq!(
+            ct_lag_next_action(true, Some(anchor), false, just_under, persist),
+            CtLagAction::Building,
+            "29min59s of lag must stay silent"
+        );
+
+        let exactly = anchor + persist;
+        assert_eq!(
+            ct_lag_next_action(true, Some(anchor), false, exactly, persist),
+            CtLagAction::Page,
+            "the gate is >=, so the threshold instant itself pages"
+        );
+
+        let well_past = anchor + Duration::from_secs(7200);
+        assert_eq!(
+            ct_lag_next_action(true, Some(anchor), false, well_past, persist),
+            CtLagAction::Page
+        );
+    }
+
+    /// Once paged, a still-open episode must not page again — the durable
+    /// cooldown is the cross-restart backstop, this latch is the
+    /// within-process one.
+    #[test]
+    fn ct_lag_pager_pages_once_per_episode() {
+        let anchor = Instant::now();
+        let now = anchor + Duration::from_secs(7200);
+        assert_eq!(
+            ct_lag_next_action(true, Some(anchor), true, now, Duration::from_secs(1800)),
+            CtLagAction::Holding
+        );
+    }
+
+    /// The all-clear fires exactly when a paged episode stops lagging.
+    #[test]
+    fn ct_lag_all_clear_fires_on_recovery() {
+        let anchor = Instant::now();
+        let now = anchor + Duration::from_secs(3600);
+        assert_eq!(
+            ct_lag_next_action(false, Some(anchor), true, now, Duration::from_secs(1800)),
+            CtLagAction::Recovered,
+            "recovery after a page must produce the paired all-clear"
+        );
+    }
+
+    /// No page, no all-clear. A lag episode that drained before crossing
+    /// the persistence gate must leave the channel completely silent —
+    /// that is the whole point of the gate.
+    #[test]
+    fn ct_lag_building_episode_that_drains_emits_nothing() {
+        let anchor = Instant::now();
+        let now = anchor + Duration::from_secs(600);
+        assert_eq!(
+            ct_lag_next_action(false, Some(anchor), false, now, Duration::from_secs(1800)),
+            CtLagAction::Quiet,
+            "a sub-threshold episode must not announce its own recovery"
+        );
+        assert_eq!(
+            ct_lag_next_action(false, None, false, now, Duration::from_secs(1800)),
+            CtLagAction::Quiet
+        );
+    }
+
+    /// Namespacing lock. `ht_level_drift_alert_cooldowns` is keyed
+    /// `(site_id, table_name)` and is SHARED with `scheduler::sync`, which
+    /// parks bare reconcile entity names (`bookings`, `customers`) and the
+    /// `stale_active_checkin` sentinel there. Every key this binary writes
+    /// must be namespaced, unique, and non-prefixing so no two tripwires
+    /// can ever steal each other's cooldown slot.
+    #[test]
+    fn cooldown_key_namespaces_cannot_collide() {
+        let mut keys: Vec<String> = vec![
+            retention_cooldown_key("HT_Customers"),
+            retention_cooldown_key("HT_Book_H"),
+            CT_LAG_COOLDOWN_KEY.to_string(),
+            SHADOW_CEILING_COOLDOWN_KEY.to_string(),
+        ];
+        for reason in [
+            BootRefusal::LiveBootstrap,
+            BootRefusal::SchemaFingerprint,
+            BootRefusal::ColdReplay,
+            BootRefusal::RetentionOverflow,
+            BootRefusal::CtNotEnabled,
+        ] {
+            keys.push(reason.cooldown_key());
+        }
+
+        // 1. Every key is namespaced.
+        for k in &keys {
+            assert!(
+                k.contains(':'),
+                "`{k}` is not namespaced — it could collide with a reconcile entity name"
+            );
+        }
+
+        // 2. No key collides with a name the reconcile digest owns.
+        for reserved in [
+            "bookings",
+            "customers",
+            "checkins",
+            "rooms",
+            "stale_active_checkin",
+        ] {
+            assert!(
+                !keys.iter().any(|k| k == reserved),
+                "`{reserved}` is owned by scheduler::sync; a watcher key must never equal it"
+            );
+        }
+
+        // 3. Keys are pairwise distinct.
+        let unique: std::collections::HashSet<&String> = keys.iter().collect();
+        assert_eq!(
+            unique.len(),
+            keys.len(),
+            "duplicate cooldown key — two tripwires would share one slot: {keys:?}"
+        );
+
+        // 4. Namespace prefixes are pairwise non-prefixing, so no key can
+        //    ever be mistaken for one in another namespace.
+        let prefixes = [
+            CT_RETENTION_KEY_PREFIX,
+            BOOT_REFUSAL_KEY_PREFIX,
+            CT_LAG_COOLDOWN_KEY,
+            SHADOW_CEILING_COOLDOWN_KEY,
+        ];
+        for (i, a) in prefixes.iter().enumerate() {
+            for (j, b) in prefixes.iter().enumerate() {
+                if i != j {
+                    assert!(
+                        !a.starts_with(b),
+                        "namespace `{a}` starts with `{b}` — ambiguous key space"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The page body has to carry the diagnosis, because the operator's
+    /// next move differs from the STUCK page's.
+    #[test]
+    fn ct_lag_alert_message_names_the_gap_and_the_retention_hazard() {
+        let snap = CtLagSnapshot {
+            watermark: 30_700,
+            ct_current: 31_200,
+            version_lag: 500,
+            poll_age_seconds: 42,
+            table: None,
+        };
+        let t = CtLagThresholds {
+            version_lag: 100,
+            poll_age_seconds: 300,
+        };
+        let msg = format_ct_lag_alert_message(
+            &snap,
+            t,
+            Duration::from_secs(2700),
+            Duration::from_secs(1800),
+        );
+        assert!(msg.contains("v30700"), "{msg}");
+        assert!(msg.contains("v31200"), "{msg}");
+        assert!(msg.contains("500 versions behind"), "{msg}");
+        assert!(msg.contains("45min"), "sustained duration must be stated: {msg}");
+        assert!(
+            msg.contains("retention"),
+            "the operator must be told why this is urgent: {msg}"
+        );
+        assert!(
+            msg.contains("CT watcher lag detected"),
+            "must point at the greppable per-tick log line: {msg}"
+        );
+        assert!(
+            !msg.contains("Per-table mode"),
+            "global mode must not claim a stalest table: {msg}"
+        );
+    }
+
+    /// Per-table mode names the table holding the global floor down.
+    #[test]
+    fn ct_lag_alert_message_names_the_stalest_table_in_per_table_mode() {
+        let snap = CtLagSnapshot {
+            watermark: 10,
+            ct_current: 500,
+            version_lag: 490,
+            poll_age_seconds: i64::MAX,
+            table: Some("HT_CheckIn_Ds".to_string()),
+        };
+        let t = CtLagThresholds {
+            version_lag: 100,
+            poll_age_seconds: 300,
+        };
+        let msg = format_ct_lag_alert_message(
+            &snap,
+            t,
+            Duration::from_secs(3600),
+            Duration::from_secs(1800),
+        );
+        assert!(msg.contains("HT_CheckIn_Ds"), "{msg}");
+        // The never-polled sentinel must not leak as a raw i64::MAX.
+        assert!(msg.contains("never"), "{msg}");
+        assert!(!msg.contains(&i64::MAX.to_string()), "{msg}");
+    }
+
+    /// The all-clear must read as a resolution and must say the cooldown
+    /// was released, so an operator knows a recurrence will page again.
+    #[test]
+    fn ct_lag_recovery_message_is_an_all_clear() {
+        let snap = CtLagSnapshot {
+            watermark: 31_200,
+            ct_current: 31_205,
+            version_lag: 5,
+            poll_age_seconds: 3,
+            table: None,
+        };
+        let msg = format_ct_lag_recovery_message(&snap, Duration::from_secs(5400));
+        assert!(msg.contains(":white_check_mark:"), "{msg}");
+        assert!(msg.contains("RECOVERED"), "{msg}");
+        assert!(msg.contains("1h30min ago"), "{msg}");
+        assert!(msg.contains("released"), "{msg}");
+    }
+
+    /// The pager must resolve its thresholds from the SAME env contract as
+    /// the reconcile-tick observation, and default to the SAME numbers.
+    /// Source-text assertion (the file's existing idiom) so it stays
+    /// non-flaky under parallel tests that would otherwise race on env.
+    #[test]
+    fn ct_lag_env_contract_matches_the_reconcile_observation() {
+        let source = include_str!("sync.rs");
+        for var in [
+            "LEGACY_CT_LAG_WARN_VERSIONS_{site_upper}",
+            "LEGACY_CT_LAG_WARN_SECONDS_{site_upper}",
+            "\"LEGACY_CT_LAG_WARN_VERSIONS\"",
+            "\"LEGACY_CT_LAG_WARN_SECONDS\"",
+        ] {
+            assert!(
+                source.contains(var),
+                "the pager must read `{var}` exactly as scheduler::sync does — \
+                 divergent thresholds would page on a condition the logs call healthy"
+            );
+        }
+        // The default NUMBERS are imported, never re-declared, so they can
+        // never drift from the observation's.
+        assert!(
+            source.contains("hotel_backend::scheduler::sync::DEFAULT_CT_LAG_WARN_VERSIONS")
+                && source.contains("hotel_backend::scheduler::sync::DEFAULT_CT_LAG_WARN_SECONDS"),
+            "CT-lag defaults must be imported from scheduler::sync, not copied"
+        );
+    }
+
+    /// The persistence gate must leave meaningful room before the 2-day CT
+    /// retention cliff — a pager that only fires with an hour to spare is
+    /// not a pager.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn ct_lag_persistence_gate_leaves_retention_headroom() {
+        const CT_RETENTION_CLIFF_SECS: u64 = 48 * 3600;
+        assert!(
+            DEFAULT_CT_LAG_PERSIST_SECS < CT_RETENTION_CLIFF_SECS / 24,
+            "the gate must burn well under an hour of the 48h retention window"
+        );
+        assert!(
+            DEFAULT_CT_LAG_PERSIST_SECS >= 10 * WATERMARK_WATCHDOG_POLL_INTERVAL_SECS,
+            "the gate must span enough watchdog ticks to be a real persistence test"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Refuse-to-start pages — per-reason durable dedup (2026-07-28).
+    //
+    // Five guards each fired a bare Slack POST with no dedup. With
+    // `restart: on-failure:5` and a 60s pre-exit sleep, one failed deploy
+    // produced up to six identical pages per service per site — and then
+    // the container gave up with NO message at all.
+    // -------------------------------------------------------------------
+
+    /// First page of a reason always goes out.
+    #[test]
+    fn boot_refusal_first_page_always_sends() {
+        assert!(
+            boot_refusal_should_send(true, true),
+            "a claimed slot is the first page in the window and must send"
+        );
+    }
+
+    /// Repeats inside the window are the Docker restart loop, not new
+    /// information. Suppress them.
+    #[test]
+    fn boot_refusal_repeat_inside_window_is_suppressed() {
+        assert!(
+            !boot_refusal_should_send(true, false),
+            "an unclaimed slot means we already paged this reason — stay quiet"
+        );
+    }
+
+    /// With no dedup backend (PG down, or the live-bootstrap guard running
+    /// before any pool exists) we FAIL OPEN. The failure mode of these
+    /// guards is silence about a process that will not run; a duplicate
+    /// page is strictly better than none.
+    #[test]
+    fn boot_refusal_falls_open_without_a_dedup_backend() {
+        assert!(
+            boot_refusal_should_send(false, false),
+            "no PG must never be allowed to silence a refuse-to-start page"
+        );
+        assert!(boot_refusal_should_send(false, true));
+    }
+
+    /// Each reason owns its own slot, so a deploy that fixes the
+    /// fingerprint but then trips the CT gate still pages immediately.
+    #[test]
+    fn boot_refusal_reasons_have_distinct_namespaced_keys() {
+        let reasons = [
+            BootRefusal::LiveBootstrap,
+            BootRefusal::SchemaFingerprint,
+            BootRefusal::ColdReplay,
+            BootRefusal::RetentionOverflow,
+            BootRefusal::CtNotEnabled,
+        ];
+        let keys: Vec<String> = reasons.iter().map(|r| r.cooldown_key()).collect();
+        let unique: std::collections::HashSet<&String> = keys.iter().collect();
+        assert_eq!(
+            unique.len(),
+            reasons.len(),
+            "two refusal reasons share a dedup slot: {keys:?}"
+        );
+        for k in &keys {
+            assert!(
+                k.starts_with(BOOT_REFUSAL_KEY_PREFIX),
+                "`{k}` escapes the boot-refusal namespace"
+            );
+        }
+    }
+
+    /// The default window has to outlast the whole restart burst, or the
+    /// dedup buys nothing: 5 attempts × (60s guard sleep + startup).
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn boot_refusal_window_outlasts_the_restart_burst() {
+        let burst_secs = COMPOSE_RESTART_CAP as i64 * (60 + 60);
+        assert!(
+            DEFAULT_BOOT_REFUSAL_COOLDOWN_MINS * 60 > burst_secs,
+            "a {DEFAULT_BOOT_REFUSAL_COOLDOWN_MINS}min window does not cover a \
+             {burst_secs}s restart burst"
+        );
+    }
+
+    /// The half of the fix that dedup alone cannot buy: because this
+    /// process cannot page after Docker gives up on it, the last message it
+    /// CAN send must warn that the following silence may mean "dead", not
+    /// "recovered".
+    #[test]
+    fn restart_cap_note_states_the_give_up_contract() {
+        let note = format_restart_cap_note(30);
+        assert!(
+            note.contains(&COMPOSE_RESTART_CAP.to_string()),
+            "the restart cap must be stated: {note}"
+        );
+        assert!(
+            note.contains("does NOT mean recovered"),
+            "silence-is-not-recovery is the load-bearing sentence: {note}"
+        );
+        assert!(note.contains("30min"), "{note}");
+    }
+
+    /// Regression lock: no refuse-to-start guard may go back to a bare
+    /// Slack POST. Scoped to `main`, which is where all five live.
+    #[test]
+    fn every_refuse_to_start_guard_routes_through_the_dedup_helper() {
+        let source = include_str!("sync.rs");
+        let start = source
+            .find("async fn main(")
+            .expect("main must exist");
+        let end = source[start..]
+            .find("async fn run_bootstrap(")
+            .map(|i| start + i)
+            .expect("run_bootstrap must follow main");
+        let region = &source[start..end];
+
+        assert_eq!(
+            region.matches("send_boot_refusal_alert(").count(),
+            5,
+            "all five refuse-to-start guards must page through the dedup helper"
+        );
+        assert_eq!(
+            region.matches("send_message(").count(),
+            0,
+            "a bare Slack POST in a startup guard reintroduces the restart-loop \
+             page storm this dedup exists to stop"
         );
     }
 

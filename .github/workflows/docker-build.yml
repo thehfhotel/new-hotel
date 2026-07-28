@@ -964,13 +964,26 @@ jobs:
           # payload, so a `vars.X || 'false'` here silently reverts the
           # committed value on the next deploy. Do not "restore" them.
           # Per-job slack notification kill-switches (2026-05-15).
-          # Default 'true' preserves prior behavior. Operators flip to
-          # 'false' via `gh variable set HOURLY_REPORT_ENABLED -b false`
-          # during a CT-watcher backfill window to silence the cron noise.
-          HOURLY_REPORT_ENABLED:          ${{ vars.HOURLY_REPORT_ENABLED || 'true' }}
-          CHECKIN_NOTIFICATIONS_ENABLED:  ${{ vars.CHECKIN_NOTIFICATIONS_ENABLED || 'true' }}
-          CHECKOUT_NOTIFICATIONS_ENABLED: ${{ vars.CHECKOUT_NOTIFICATIONS_ENABLED || 'true' }}
-          BOOKING_NOTIFICATIONS_ENABLED:  ${{ vars.BOOKING_NOTIFICATIONS_ENABLED || 'true' }}
+          #
+          # Fallback flipped 'true' -> 'false' 2026-07-28. These four are purely
+          # informational and POST to Slack once PER ROW on the same webhook that
+          # carries every `:rotating_light:` page — there is no severity routing.
+          # A 'true' fallback meant a fork, a fresh environment, or an
+          # accidentally-deleted repo variable would drown the alert channel in a
+          # booking feed. Absence of config must mean quiet.
+          #
+          # Production no-op: all four repo variables have been explicitly
+          # 'false' since 2026-05-19, so `vars.X` supplies the value and this
+          # fallback is unreachable there. Matching fail-closed defaults in
+          # docker-compose.yml and `scheduler::jobs::notification_flag_enabled`.
+          #
+          # These are NOT the ADR-0004 compose-owned set (see the NOTE above) —
+          # those keys are deliberately absent from this workflow. Keeping these
+          # four here is correct; only their fallback changed.
+          HOURLY_REPORT_ENABLED:          ${{ vars.HOURLY_REPORT_ENABLED || 'false' }}
+          CHECKIN_NOTIFICATIONS_ENABLED:  ${{ vars.CHECKIN_NOTIFICATIONS_ENABLED || 'false' }}
+          CHECKOUT_NOTIFICATIONS_ENABLED: ${{ vars.CHECKOUT_NOTIFICATIONS_ENABLED || 'false' }}
+          BOOKING_NOTIFICATIONS_ENABLED:  ${{ vars.BOOKING_NOTIFICATIONS_ENABLED || 'false' }}
           # Tracing log level. Pinned to debug for scheduler::sync +
           # scheduler::jobs until Track B junction-table migration ships
           # and reconcile noise drops to a steady-state baseline (incident
@@ -1065,10 +1078,10 @@ jobs:
             --arg GUEST_DOCUMENT_STORAGE_ENABLED   "${GUEST_DOCUMENT_STORAGE_ENABLED:-false}" \
             --arg TM30_COMPANION_WRITEBACK_ENABLED "${TM30_COMPANION_WRITEBACK_ENABLED:-false}" \
             --arg LAYOUT_WRITEBACK_ENABLED         "${LAYOUT_WRITEBACK_ENABLED:-false}" \
-            --arg HOURLY_REPORT_ENABLED          "${HOURLY_REPORT_ENABLED:-true}" \
-            --arg CHECKIN_NOTIFICATIONS_ENABLED  "${CHECKIN_NOTIFICATIONS_ENABLED:-true}" \
-            --arg CHECKOUT_NOTIFICATIONS_ENABLED "${CHECKOUT_NOTIFICATIONS_ENABLED:-true}" \
-            --arg BOOKING_NOTIFICATIONS_ENABLED  "${BOOKING_NOTIFICATIONS_ENABLED:-true}" \
+            --arg HOURLY_REPORT_ENABLED          "${HOURLY_REPORT_ENABLED:-false}" \
+            --arg CHECKIN_NOTIFICATIONS_ENABLED  "${CHECKIN_NOTIFICATIONS_ENABLED:-false}" \
+            --arg CHECKOUT_NOTIFICATIONS_ENABLED "${CHECKOUT_NOTIFICATIONS_ENABLED:-false}" \
+            --arg BOOKING_NOTIFICATIONS_ENABLED  "${BOOKING_NOTIFICATIONS_ENABLED:-false}" \
             --arg RUST_LOG                      "${RUST_LOG:-hotel_backend::scheduler::sync=debug,hotel_backend::scheduler::jobs=debug,hotel_backend=info,writeback=info,sync=info,tower_http=info}" \
             '{
               commit_sha: $commit_sha,
