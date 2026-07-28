@@ -368,6 +368,41 @@ services:
       # sit. This backend runs HF Hotel's reconcile; sync-hfville runs
       # Ville's (its own HFVILLE_ override below).
       - RECONCILE_GUEST_REGISTRY_ARM_ENABLED=${RECONCILE_GUEST_REGISTRY_ARM_ENABLED:-false}
+      # Phase 6-C — generic mirror-table probe: the 8 CT-mirrored
+      # legacy_mirror.* tables (cupon / checkin_product / deposit /
+      # changed_room / bill_debt_h / bill_debt_ds / rooms_cancel / book_pro)
+      # plus canonical ht_room_calendar. Compares ONE UNION-ALL aggregate
+      # batch per side (COUNT, MAX(pk), SUM of the money total on the 5
+      # tables that carry one) and only pays for a per-key diff when that
+      # aggregate disagrees. DETECTION ONLY: it records into
+      # ht_reconcile_log and writes nothing else — no ack cache, no new PG
+      # table, and no probe key is in FORCE_CONVERGE_VALUE_DRIFT_TABLES /
+      # REINGEST_MISSING_PG_TABLES.
+      #
+      # SHIPS DARK. With this false, run_sync never calls run_mirror_probe,
+      # so the probe issues zero MSSQL and zero PG queries. Enable HF VILLE
+      # FIRST, soak 48h, then HF Hotel — in an announced window.
+      #
+      # SCOPE: the legacy scan is floored at MIN(mirror pk) — the mirror's
+      # own coverage boundary, derived, never configured. HT_Rooms_Cancel is
+      # why: it is the one CT-mirrored table missing from the --bootstrap
+      # snapshot set, so 315 of its HF Hotel rows (36 at Ville) predate the
+      # mirror and can never converge. Floored, 8 of the 9 probes are
+      # EXACTLY converged at both sites today (2026-07-28, read-only).
+      #
+      # EXPECT A QUIET LEDGER PLUS ONE RECURRING LOG LINE:
+      # mirror_ht_room_calendar has a genuine structural gap (1507 in-era
+      # legacy rows vs 1298 canonical at HF Hotel; 1302 vs 1071 at Ville),
+      # and NOTHING can close it today — the CT mapper permanently NULLs
+      # rcal_legacy_id when iHOTEL's MAX+1 allocator rebinds an id, the gap
+      # persists even on the business key, no self-heal touches probe keys,
+      # and a hand-resolved row is re-minted on the next tick. So that probe
+      # is observe_only: it LOGS both counts every tick and records no
+      # ht_reconcile_log row (which would otherwise pin the 4h digest and
+      # the >72h escalation tier at both sites forever). Plan 6-D gives the
+      # calendar a business-key arm and a remediation path; only then does
+      # it start recording.
+      - RECONCILE_MIRROR_PROBE_ENABLED=${RECONCILE_MIRROR_PROBE_ENABLED:-false}
       # Tracing log level. Default `hotel_backend=info,tower_http=info`
       # matches `main.rs::tracing_subscriber::EnvFilter::try_from_default_env`'s
       # fallback. Override at deploy time to crank up debug logging
@@ -599,6 +634,13 @@ services:
       # so the two HF Hotel processes never read differently. Ships DARK; see
       # the backend service for the rollout.
       - RECONCILE_GUEST_REGISTRY_ARM_ENABLED=${RECONCILE_GUEST_REGISTRY_ARM_ENABLED:-false}
+      # Phase 6-C mirror-table probe — INERT in this process for the same
+      # reason as the knobs above (only a process that runs a reconcile
+      # reads it, and this HF Hotel sync worker leaves WORKER_RECONCILE_ENABLED
+      # at its default-false). Carried here so the two HF Hotel processes
+      # never read differently. Ships DARK; see the backend service for the
+      # rollout and for what the first enabled tick is expected to say.
+      - RECONCILE_MIRROR_PROBE_ENABLED=${RECONCILE_MIRROR_PROBE_ENABLED:-false}
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,sync=info}
     secrets:
       - db_password
@@ -765,6 +807,21 @@ services:
       # nothing here auto-closes, and a TM.30 under-count is the exact class
       # this arm exists to surface.
       - RECONCILE_GUEST_REGISTRY_ARM_ENABLED=${HFVILLE_RECONCILE_GUEST_REGISTRY_ARM_ENABLED:-false}
+      # Phase 6-C — generic mirror-table probe (8 legacy_mirror.* tables +
+      # ht_room_calendar). DETECTION ONLY; writes nothing but
+      # ht_reconcile_log — no ack cache and no new PG table. This worker runs
+      # Ville's reconcile, so the knob is LIVE here — and Ville is the canary:
+      # enable HERE first, soak 48h, then flip the backend (HF Hotel).
+      # Ships DARK. The canary is REPRESENTATIVE for the 8 mirror tables
+      # (Ville is exactly converged on all of them once floored, same as HF
+      # Hotel) and for the calendar gap, which Ville has in a WORSE ratio
+      # (1302 in-era legacy rows vs 1071 canonical, against 1507 vs 1298).
+      # So a green 48h soak here really does predict HF Hotel. The calendar
+      # gap is observe_only — logged with both counts each tick, never
+      # recorded into ht_reconcile_log, because no sweep or self-heal can
+      # close such a row and a hand-resolved one re-mints itself. It starts
+      # recording only when plan 6-D gives it a closure path.
+      - RECONCILE_MIRROR_PROBE_ENABLED=${HFVILLE_RECONCILE_MIRROR_PROBE_ENABLED:-false}
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,sync=info}
     secrets:
       - db_password

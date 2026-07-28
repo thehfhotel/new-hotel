@@ -980,7 +980,12 @@ INSERT INTO sync_status (entity_type) VALUES
     -- Migration 081 — Phase 6-B guest-registry (companion folio) reconcile
     -- arm (ships DARK behind RECONCILE_GUEST_REGISTRY_ARM_ENABLED). Same
     -- reason: `record_success` UPDATEs by entity_type.
-    ('guest_registry')
+    ('guest_registry'),
+    -- Migration 082 — Phase 6-C generic mirror probe (ships DARK behind
+    -- RECONCILE_MIRROR_PROBE_ENABLED). Same reason again: `record_error`
+    -- UPDATEs by entity_type, so without this row a probe failure updates
+    -- zero rows and leaves only a log line.
+    ('mirror_probe')
 ON CONFLICT (entity_type) DO NOTHING;
 
 -- Add source column to existing tables
@@ -2759,6 +2764,24 @@ CREATE TABLE IF NOT EXISTS ht_reconcile_era_floor (
 
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('081', '081_ht_guest_registry_legacy.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- -----------------------------------------------------------------------------
+-- Migration 082 — `sync_status` row for the Phase 6-C mirror probe
+-- (`entity_type = 'mirror_probe'`). The row itself rides the `sync_status`
+-- INSERT above; this block only records the migration as applied.
+--
+-- No table, no index: the probe is detection-only and keeps no ack cache — it
+-- compares live aggregates on both sides every tick. The row exists purely so
+-- `record_error` / `record_success`'s `UPDATE … WHERE entity_type =
+-- 'mirror_probe'` matches something; without it a probe failure updates zero
+-- rows and leaves only a log line, and the success path has no
+-- `consecutive_failures` to reset. See
+-- migrations/pg/082_sync_status_mirror_probe.sql.
+-- -----------------------------------------------------------------------------
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('082', '082_sync_status_mirror_probe.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================

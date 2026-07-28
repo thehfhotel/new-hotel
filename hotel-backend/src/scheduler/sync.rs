@@ -36,6 +36,11 @@
 //!    one check-in), not per row: legacy edits are DELETE+reinsert with id
 //!    churn. Also **DARK by default**:
 //!    `RECONCILE_GUEST_REGISTRY_ARM_ENABLED=true`.
+//! 7. Mirror tables: the 8 CT-mirrored `legacy_mirror.*` tables plus
+//!    `ht_room_calendar`, compared by aggregate (COUNT / MAX(pk) / SUM of the
+//!    money total) with a per-PK diff only on mismatch — Phase 6-C, see
+//!    [`crate::scheduler::mirror_probe`]. Also **DARK by default**:
+//!    `RECONCILE_MIRROR_PROBE_ENABLED=true`.
 //!
 //! Pre-v2.63.0 this job compared MSSQL hashes against `ht_*_legacy.sync_hash`
 //! (the demoted mirror tables). After the 2026-04-28 cutover those mirrors
@@ -273,6 +278,55 @@ pub async fn run_sync(
         if let Err(e) = sync_guest_registry(legacy_pool, pg_pool, slack, site_id).await {
             tracing::error!(site = %site_id, "[Sync] Guest-registry sync failed: {}", e);
             record_error(pg_pool, "guest_registry", &e.to_string()).await;
+        }
+    }
+
+    // Phase 6-C: generic mirror-table probe (the 8 CT-mirrored
+    // `legacy_mirror.*` tables + `ht_room_calendar`). SHIPPED DARK —
+    // `RECONCILE_MIRROR_PROBE_ENABLED` defaults false on every service, and
+    // the check lives HERE (not inside `run_mirror_probe`) so a disabled
+    // probe issues literally zero MSSQL/PG queries. Runs BEFORE
+    // `reload_mirror_dimensions` on purpose: the probe set and the reload
+    // set are disjoint (the reload owns the 4 wholesale dimension mirrors),
+    // so ordering carries no data dependency, and keeping the probe next to
+    // the other reconcile arms is what makes the "one aggregate batch per
+    // side" cost visible in one place.
+    //
+    // The `record_error` counter needs `sync_status.entity_type =
+    // 'mirror_probe'` to EXIST — it is an `UPDATE … WHERE entity_type = $2`
+    // and would otherwise update zero rows, leaving only the log line.
+    // Migration 082 seeds it (and `init-db/init-hotelnew.sql` for a fresh
+    // database), exactly as 080/081 did for the payments and guest-registry
+    // arms.
+    //
+    // BOTH outcomes are written, as `payments` and `guest_registry` do:
+    // `record_success` is the ONLY thing that zeroes `consecutive_failures`,
+    // clears `last_error`/`last_error_at` and stamps `last_sync_at`. With
+    // only the error arm wired, `consecutive_failures` for `mirror_probe`
+    // would be a monotonic LIFETIME failure count (unique among the
+    // entity_types), one transient MSSQL blip would leave a permanent error
+    // string, and `last_sync_at` would stay NULL forever — a reading that is
+    // actively misleading rather than merely absent.
+    if reconcile_mirror_probe_enabled() {
+        match crate::scheduler::mirror_probe::run_mirror_probe(legacy_pool, pg_pool).await {
+            Ok(outcome) => {
+                // added=0 (the probe writes no canonical rows),
+                // updated=`recorded` (divergence rows written this tick),
+                // unchanged=`converged` (probes whose aggregates agreed).
+                record_success(
+                    pg_pool,
+                    "mirror_probe",
+                    0,
+                    outcome.recorded as i32,
+                    outcome.converged as i32,
+                    outcome.duration_ms,
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::error!(site = %site_id, "[Sync] Mirror probe failed: {}", e);
+                record_error(pg_pool, "mirror_probe", &e.to_string()).await;
+            }
         }
     }
 
@@ -2752,7 +2806,7 @@ pub fn classify_divergence(
 /// Cardinality is real drift but it doesn't get materially more drifted
 /// with every re-detection — one row per (PK, hash) is enough.
 #[allow(clippy::too_many_arguments)]
-async fn record_divergence(
+pub(crate) async fn record_divergence(
     pg_pool: &PgPool,
     table_name: &str,
     legacy_pk: &str,
@@ -2879,6 +2933,18 @@ fn parse_booking_legacy_pk(legacy_pk: &str) -> (&str, &str) {
 /// failure instead of a silent backlog, and
 /// `gate_guard::tests::resolvable_tables_const_covers_every_contract_entity`
 /// pins this list against the entity registry.
+///
+/// Phase 6-C appends the mirror-probe keys. They are NOT entity contracts
+/// (no CT mapper idempotency gate to be a superset of — the mirror mappers
+/// DELETE+INSERT unconditionally); they are resolvable because
+/// [`crate::scheduler::mirror_probe::probe_for_table`] backs both dispatch
+/// arms below. Leaving them OUT of this list would not trip any
+/// `debug_assert!` — the assert only fires for listed-but-undispatched
+/// names — and that is precisely why it was not done: the rows would sit
+/// open forever and, being selected by age alone, would eventually own the
+/// sweep's whole 500-row batch.
+/// `gate_guard::tests::every_resolvable_table_is_a_contract_entity_or_a_mirror_probe`
+/// keeps the two populations explicit.
 pub(crate) const RECONCILE_RESOLVABLE_TABLES: &[&str] = &[
     "customers",
     "bookings",
@@ -2886,6 +2952,21 @@ pub(crate) const RECONCILE_RESOLVABLE_TABLES: &[&str] = &[
     "rooms",
     "payments",
     "guest_registry",
+    // Phase 6-C mirror probes — pinned against
+    // `mirror_probe::mirror_probe_keys()` by a unit test below.
+    "mirror_ht_cupon",
+    "mirror_ht_checkin_product",
+    "mirror_ht_deposit",
+    "mirror_ht_changed_room",
+    "mirror_ht_bill_debt_h",
+    "mirror_ht_bill_debt_ds",
+    "mirror_ht_rooms_cancel",
+    "mirror_ht_book_pro",
+    // `observe_only` — it records nothing today (its gap has no closure
+    // path, see the `mirror_probe` module docs), but it stays listed and
+    // dispatched so an aggregate row written by an older binary still has a
+    // way to converge instead of sitting open and unrecognised.
+    "mirror_ht_room_calendar",
 ];
 
 /// Re-compute the canonical PG hash for a single `ht_reconcile_log`
@@ -2995,6 +3076,15 @@ async fn compute_current_pg_hash(
                 .as_ref()
                 .map(guest_registry_canonical_hash))
         }
+        // Phase 6-C. `legacy_pk` is either a real mirrored key or the
+        // `<aggregate>` sentinel. Never `Ok(None)` for a registered probe:
+        // an ABSENT key hashes to `mirror_absent_hash` so a row deleted on
+        // both sides converges instead of sitting open forever.
+        t if crate::scheduler::mirror_probe::probe_for_table(t).is_some() => {
+            let probe = crate::scheduler::mirror_probe::probe_for_table(t)
+                .expect("guard just matched");
+            crate::scheduler::mirror_probe::resolve_pg_hash(pg_pool, probe, legacy_pk).await
+        }
         _ => {
             debug_assert!(
                 !RECONCILE_RESOLVABLE_TABLES.contains(&table_name),
@@ -3034,8 +3124,16 @@ async fn compute_current_pg_hash(
 /// projections (`fetch_legacy_customer_hash`, `fetch_legacy_booking_hash`,
 /// `fetch_legacy_room_hash`) — the same unification is a follow-on for
 /// those entities.
+///
+/// **Why this takes `pg_pool`** (Phase 6-C): a mirror probe's `<aggregate>`
+/// row is only comparable inside the mirror's own coverage floor, and that
+/// floor is a `MIN(pk)` over the MIRROR side. Re-deriving it here each sweep
+/// — rather than freezing it onto the reconcile row — means a floor that
+/// MOVES because the mirror finally received its missing history is picked
+/// up on the next tick. No other arm reads the pool.
 async fn compute_current_legacy_hash(
     legacy_pool: &DbPool,
+    pg_pool: &PgPool,
     table_name: &str,
     legacy_pk: &str,
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
@@ -3049,6 +3147,19 @@ async fn compute_current_legacy_hash(
         "rooms" => fetch_legacy_room_hash(legacy_pool, legacy_pk).await,
         "payments" => fetch_legacy_payment_hash(legacy_pool, legacy_pk).await,
         "guest_registry" => fetch_legacy_registry_folio_hash(legacy_pool, legacy_pk).await,
+        // Phase 6-C — mirror probes. Sibling of the `compute_current_pg_hash`
+        // arm; same absent-is-a-real-hash contract.
+        t if crate::scheduler::mirror_probe::probe_for_table(t).is_some() => {
+            let probe = crate::scheduler::mirror_probe::probe_for_table(t)
+                .expect("guard just matched");
+            crate::scheduler::mirror_probe::resolve_legacy_hash(
+                legacy_pool,
+                pg_pool,
+                probe,
+                legacy_pk,
+            )
+            .await
+        }
         _ => {
             debug_assert!(
                 !RECONCILE_RESOLVABLE_TABLES.contains(&table_name),
@@ -3390,6 +3501,36 @@ fn reconcile_payments_arm_enabled() -> bool {
 /// feature flag in the sync path. A flag flip is never "just config".
 fn reconcile_guest_registry_arm_enabled() -> bool {
     env::var("RECONCILE_GUEST_REGISTRY_ARM_ENABLED")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+/// Phase 6-C — is the generic mirror-table probe enabled?
+///
+/// Default **OFF** (ship dark). When unset / not `"true"`, [`run_sync`]
+/// never calls [`crate::scheduler::mirror_probe::run_mirror_probe`], so the
+/// probe issues ZERO MSSQL and ZERO PG queries and `ht_reconcile_log` can
+/// never gain a `mirror_*` row — behaviour is byte-for-byte identical to
+/// before the probe existed. The resolve dispatches are inert without
+/// detection, and the probe has no ack table of its own (nothing to seed).
+///
+/// Rollout is Ville-first → 48h soak → HF Hotel, in an announced window.
+/// Live read-only counts 2026-07-28 say the first enabled tick is quiet on
+/// 8 of the 9 probes at BOTH sites once the `MIN(mirror pk)` coverage floor
+/// is applied — including `HT_Rooms_Cancel`, whose mirror was never
+/// bootstrap-snapshotted (315 legacy rows → 13 in-era, matching the 13
+/// mirrored). The 9th, `ht_room_calendar`, has a genuine structural gap
+/// (1507 in-era legacy rows vs 1298 canonical at HF Hotel; 1302 vs 1071 at
+/// Ville) that NOTHING can currently close, so that probe is
+/// `observe_only`: it logs both counts each tick and records no reconcile
+/// row (see the `mirror_probe` module docs). The expectation to set before
+/// the flip is therefore a QUIET ledger plus one recurring warn line per
+/// tick per site — not a page nobody can action.
+///
+/// The `== "true"` comparison is strict on purpose, matching every other
+/// feature flag in the sync path. A flag flip is never "just config".
+fn reconcile_mirror_probe_enabled() -> bool {
+    env::var("RECONCILE_MIRROR_PROBE_ENABLED")
         .map(|v| v == "true")
         .unwrap_or(false)
 }
@@ -3748,6 +3889,11 @@ fn reconcile_table_fk_rank(table_name: &str) -> u8 {
         // unresolvable parent), so it must never be healed before check-ins.
         // Sibling of `payments`; the two do not depend on each other.
         "guest_registry" => 5,
+        // Phase 6-C mirror probes. They are OBSERVED, never healed — no
+        // self-heal list contains them — so their rank only decides sweep
+        // ordering. Last, so no probe row can delay a repairable entity
+        // row's turn in the 500-row batch.
+        t if crate::scheduler::mirror_probe::probe_for_table(t).is_some() => 6,
         other => {
             // A resolvable entity that falls through here is unranked, so
             // it sorts after everything and its FK parents lose their
@@ -3759,7 +3905,7 @@ fn reconcile_table_fk_rank(table_name: &str) -> u8 {
                  the entity is listed as resolvable but falls through to the \
                  wildcard, so the sweep may heal it before its parents"
             );
-            6
+            7
         }
     }
 }
@@ -3886,7 +4032,7 @@ async fn auto_resolve_reconcile_log(
     let mut resolved = 0usize;
     for (id, table_name, legacy_pk, recorded_mssql_hash, age_secs) in rows {
         let current_legacy_hash =
-            match compute_current_legacy_hash(legacy_pool, &table_name, &legacy_pk).await {
+            match compute_current_legacy_hash(legacy_pool, pg_pool, &table_name, &legacy_pk).await {
                 Ok(opt) => opt,
                 Err(e) => {
                     tracing::warn!(
@@ -10321,6 +10467,62 @@ mod tests {
         assert!(reconcile_table_fk_rank("rooms") < reconcile_table_fk_rank("bookings"));
         assert!(reconcile_table_fk_rank("bookings") < reconcile_table_fk_rank("checkins"));
         assert!(reconcile_table_fk_rank("checkins") < reconcile_table_fk_rank("something_new"));
+    }
+
+    /// Phase 6-C. Every mirror probe key must be RESOLVABLE — listed here
+    /// AND dispatched by both `compute_current_*_hash` — or its rows sit
+    /// open forever and, being selected by age alone, eventually own the
+    /// sweep's whole 500-row batch (the 2026-05-18 `rooms` failure mode).
+    #[test]
+    fn resolvable_tables_lists_every_mirror_probe_key() {
+        for key in crate::scheduler::mirror_probe::mirror_probe_keys() {
+            assert!(
+                RECONCILE_RESOLVABLE_TABLES.contains(&key),
+                "mirror probe `{key}` is not in RECONCILE_RESOLVABLE_TABLES"
+            );
+        }
+    }
+
+    /// A probe is ranked LAST but still ranked: falling through to the
+    /// wildcard would fire the `debug_assert!` for a listed-but-unranked
+    /// table, which is a test failure, not a silent demotion.
+    #[test]
+    fn reconcile_fk_rank_ranks_mirror_probes_after_every_entity() {
+        for key in crate::scheduler::mirror_probe::mirror_probe_keys() {
+            assert!(
+                reconcile_table_fk_rank("guest_registry") < reconcile_table_fk_rank(key),
+                "{key} must sort after every healable entity"
+            );
+            assert!(
+                reconcile_table_fk_rank(key) < reconcile_table_fk_rank("something_new"),
+                "{key} must still be ranked ahead of the unranked wildcard"
+            );
+        }
+    }
+
+    /// The probe writes nothing but `ht_reconcile_log`: no probe key may
+    /// appear in either self-heal list, or the sweep would start re-driving
+    /// opaque mirror rows (plan 6-D, a separate coordinated decision).
+    #[test]
+    fn mirror_probes_are_in_neither_self_heal_list() {
+        for key in crate::scheduler::mirror_probe::mirror_probe_keys() {
+            assert!(!FORCE_CONVERGE_VALUE_DRIFT_TABLES.contains(&key));
+            assert!(!REINGEST_MISSING_PG_TABLES.contains(&key));
+            assert!(!force_converge_value_drift_eligible(
+                key,
+                Some("a"),
+                Some("b"),
+                f64::MAX,
+                true
+            ));
+            assert!(!reingest_missing_pg_eligible(
+                key,
+                Some("a"),
+                None,
+                f64::MAX,
+                true
+            ));
+        }
     }
 
     /// The live FK shape: booking `R002066` references customer `C2413`.

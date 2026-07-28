@@ -529,6 +529,50 @@ mod tests {
         }
     }
 
+    /// The converse of the test above, and the visible half of the Phase
+    /// 6-C decision.
+    ///
+    /// `RECONCILE_RESOLVABLE_TABLES` holds two DIFFERENT populations:
+    ///
+    /// * **entity arms** — a CT mapper projects them, so they owe the
+    ///   gate ⊇ hash invariant and must carry an [`EntityContract`];
+    /// * **mirror probes** — `scheduler::mirror_probe` compares opaque
+    ///   pass-through mirrors by aggregate. Their mappers DELETE+INSERT
+    ///   unconditionally, so there is no idempotency gate for a hash to be
+    ///   a superset of, and a contract would be vacuous. They are still
+    ///   RESOLVABLE (both `compute_current_*_hash` dispatches reach
+    ///   `mirror_probe::probe_for_table`), which is what keeps their rows
+    ///   closeable.
+    ///
+    /// Anything in neither population is a name someone added to the list
+    /// without deciding which it is — the failure this test exists to
+    /// prevent. Note the omission it CANNOT catch is already covered
+    /// elsewhere: a probe missing from the list is caught by
+    /// `scheduler::sync::tests::resolvable_tables_lists_every_mirror_probe_key`.
+    #[test]
+    fn every_resolvable_table_is_a_contract_entity_or_a_mirror_probe() {
+        let entities: HashSet<&str> = reconcile_entity_contracts()
+            .iter()
+            .map(|c| c.entity)
+            .collect();
+        let probes: HashSet<&str> = crate::scheduler::mirror_probe::mirror_probe_keys()
+            .into_iter()
+            .collect();
+        for table in crate::scheduler::sync::RECONCILE_RESOLVABLE_TABLES {
+            let is_entity = entities.contains(table);
+            let is_probe = probes.contains(table);
+            assert!(
+                is_entity ^ is_probe,
+                "`{table}` is listed as resolvable but is neither a registered \
+                 EntityContract nor a registered mirror probe (or claims to be \
+                 both). Every resolvable table must be exactly one: an entity \
+                 arm owes the gate ⊇ hash invariant, a mirror probe owes an \
+                 aggregate comparison — and nothing may be resolvable without \
+                 owing either."
+            );
+        }
+    }
+
     /// Sanity: the descriptor tables are non-empty and every entity is
     /// registered exactly once.
     #[test]

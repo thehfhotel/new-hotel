@@ -1,0 +1,64 @@
+-- Migration: 082_sync_status_mirror_probe
+-- Version: vNext
+-- Date: 2026-07-28
+-- Description: `sync_status` row for the Phase 6-C mirror probe
+--              (`entity_type = 'mirror_probe'`), so the probe's failure
+--              counter is not a silent no-op.
+--
+-- ## Why a migration exists for ONE row
+--
+-- `scheduler/sync.rs::record_error` is an `UPDATE sync_status … WHERE
+-- entity_type = $2` wrapped in `let _ =`: with no matching row it updates ZERO
+-- rows and discards the result, so a probe failure leaves nothing behind but a
+-- `tracing::error!` line — invisible to the dashboard that reads
+-- `sync_status.consecutive_failures` / `last_error`. `run_sync` calls
+-- `record_error(pg_pool, "mirror_probe", …)` when
+-- `mirror_probe::run_mirror_probe` returns `Err` (a legacy-pool acquire, an
+-- MSSQL aggregate batch failure, a PG aggregate/key scan failure), which is
+-- precisely the class of failure an operator must see: with the probe dark it
+-- would otherwise be indistinguishable from "the probe found nothing".
+--
+-- The SUCCESS side updates the same row and matters just as much: `run_sync`
+-- calls `record_success(pg_pool, "mirror_probe", 0, recorded, converged,
+-- duration_ms)` on `Ok`, and that is the ONLY statement that zeroes
+-- `consecutive_failures`, clears `last_error`/`last_error_at` and stamps
+-- `last_sync_at`. Without it the counter would be a monotonic LIFETIME failure
+-- count instead of a "currently broken" signal, and one transient MSSQL blip
+-- would leave a permanent error string on the row.
+--
+-- Migrations 080 (`payments`) and 081 (`guest_registry`) added their rows for
+-- the same reason and left the same note in `init-db/init-hotelnew.sql`; 6-C
+-- shipped without one. This closes that gap.
+--
+-- Unlike its two siblings this migration adds NO table and NO index — the probe
+-- is detection-only and keeps no ack cache of its own (it compares live
+-- aggregates on both sides every tick, and re-deriving the `MIN(mirror pk)`
+-- coverage floor each time is deliberate). So there is no `CARDINALITY_MAP.md`
+-- entry: no new `ht_*` table exists to describe.
+--
+-- The probe writes NOTHING while `RECONCILE_MIRROR_PROBE_ENABLED` is false
+-- (compose default on every service, ADR 0004), so this row simply sits at
+-- `consecutive_failures = 0` until the flag is flipped.
+--
+-- STRICTLY ADDITIVE — no legacy DDL, no legacy write, no canonical data
+-- touched. Applies to both `hotelnew` and `hotelville` via
+-- `scripts/migrate.sh --site`.
+
+-- =============================================================================
+-- UP MIGRATION
+-- =============================================================================
+
+-- Both `record_error` and `record_success` UPDATE this row by entity_type;
+-- without it the probe's failure counter silently no-ops and its success
+-- counter has nothing to reset.
+INSERT INTO sync_status (entity_type) VALUES ('mirror_probe')
+ON CONFLICT (entity_type) DO NOTHING;
+
+-- Schema-migrations row is inserted by scripts/migrate.sh (same TX, includes
+-- the file checksum). Do NOT INSERT here.
+
+-- =============================================================================
+-- DOWN MIGRATION (commented for reference)
+-- =============================================================================
+-- DELETE FROM sync_status WHERE entity_type = 'mirror_probe';
+-- DELETE FROM schema_migrations WHERE version = '082';
