@@ -972,7 +972,11 @@ INSERT INTO sync_status (entity_type) VALUES
     ('customers'),
     ('rooms'),
     ('bookings'),
-    ('checkins')
+    ('checkins'),
+    -- Migration 080 — Phase 6-A payments reconcile arm (ships DARK behind
+    -- RECONCILE_PAYMENTS_ARM_ENABLED). `record_success` UPDATEs by
+    -- entity_type, so the row must exist or the counters silently no-op.
+    ('payments')
 ON CONFLICT (entity_type) DO NOTHING;
 
 -- Add source column to existing tables
@@ -2684,6 +2688,32 @@ ON CONFLICT (version) DO NOTHING;
 -- -----------------------------------------------------------------------------
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('079', '079_ht_checkins_room_amount.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- -----------------------------------------------------------------------------
+-- Migration 080 — `ht_receipts_legacy`, the per-PK ack cache for the Phase 6-A
+-- `payments` reconcile arm (legacy `HT_Receipt_H` ↔ canonical `ht_payments`),
+-- plus the `ht_payments.pay_reference` index its canonical probe needs. The
+-- `sync_status` seed row rides the `sync_status` INSERT above.
+--
+-- The arm SHIPS DARK (`RECONCILE_PAYMENTS_ARM_ENABLED`, compose default false);
+-- with the flag off this table simply stays empty. Cache ONLY — never canonical
+-- state. See migrations/pg/080_ht_receipts_legacy.sql for the full rationale.
+-- -----------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS ht_receipts_legacy (
+    id          SERIAL PRIMARY KEY,
+    receipt_no  VARCHAR(50) NOT NULL UNIQUE,
+    sync_hash   VARCHAR(64),
+    synced_at   TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS ix_receipts_legacy_synced ON ht_receipts_legacy(synced_at);
+
+CREATE INDEX IF NOT EXISTS ix_ht_payments_pay_reference
+    ON ht_payments (pay_reference) WHERE pay_reference IS NOT NULL;
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('080', '080_ht_receipts_legacy.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================

@@ -68,7 +68,7 @@
 //! the `|` separator, and each entity pins its bytes with a golden
 //! vector built from the literal format string it replaced.
 
-use crate::sync::mappers::{booking, checkin, customer, room};
+use crate::sync::mappers::{booking, checkin, customer, payment, room};
 
 /// The separator between hashed field segments.
 ///
@@ -311,6 +311,14 @@ pub fn reconcile_entity_contracts() -> Vec<EntityContract> {
             gate_field_names: room::gate_field_names,
             always_writes: true,
         },
+        EntityContract {
+            entity: "payments",
+            hash_inputs: payment::hash_input_contract,
+            // `apply_receipt_upsert` is a lookup-then-unconditional
+            // UPDATE — no `existing_matches` chain — see `always_writes`.
+            gate_field_names: payment::gate_field_names,
+            always_writes: true,
+        },
     ]
 }
 
@@ -424,6 +432,37 @@ mod tests {
         assert!(
             !(rooms.hash_inputs)().is_empty(),
             "rooms is still hashed by the reconcile sweep — its descriptor \
+             table must stay populated so the golden-vector pin holds"
+        );
+    }
+
+    /// `HT_Receipt_H` likewise has no `fetch_existing` +
+    /// `existing_matches` pair: `apply_receipt_upsert` resolves the
+    /// canonical row by `(pay_cin_id, receipt_no)` and then runs its
+    /// UPDATE unconditionally. Stated explicitly, same as rooms, so the
+    /// superset check is knowingly skipped rather than silently vacuous —
+    /// and so ADDING a gate to that mapper (a plausible future
+    /// optimisation) forces this flag, and therefore the real enforcement,
+    /// to be revisited.
+    #[test]
+    fn payments_contract_declares_always_writes() {
+        let contracts = reconcile_entity_contracts();
+        let payments = contracts
+            .iter()
+            .find(|c| c.entity == "payments")
+            .expect("payments contract must be registered");
+        assert!(
+            payments.always_writes,
+            "payment::apply_receipt_upsert is a lookup-then-unconditional \
+             UPDATE — the contract must declare always_writes"
+        );
+        assert!(
+            (payments.gate_field_names)().is_empty(),
+            "always_writes entities must expose no gate terms"
+        );
+        assert!(
+            !(payments.hash_inputs)().is_empty(),
+            "payments is hashed by the reconcile sweep — its descriptor \
              table must stay populated so the golden-vector pin holds"
         );
     }

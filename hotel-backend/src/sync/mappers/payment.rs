@@ -34,6 +34,7 @@ use crate::db::DbPool;
 use crate::outbox::event::{DomainEvent, EventSource};
 use crate::service::ids::{aggregate_uuid, AggregateKind};
 use crate::sync::change_op::ChangeOp;
+use crate::sync::gate_guard::{self, HashInput, HashInputContract};
 use crate::sync::mapper::MssqlChangeMapper;
 use crate::sync::mappers::checkin::apply_checkin_aggregate;
 use crate::sync::parent_loader::load_checkin_aggregate;
@@ -450,6 +451,114 @@ fn project_receipt(row: &dyn MappableRow) -> Result<ReceiptProjection, SyncError
     })
 }
 
+// =============================================================================
+// Reconcile-hash contract — see `crate::sync::gate_guard` (Phase 6-A)
+// =============================================================================
+
+/// The legacy cancel literal on `HT_Receipt_H.status_name`. `'ปกติ'` is
+/// the normal counterpart.
+const RECEIPT_CANCELLED_STATUS: &str = "ยกเลิก";
+
+/// `true` when a legacy receipt carries the cancel marker.
+///
+/// Single-sources the Thai literal for BOTH the mapper's void decision
+/// ([`apply_receipt_upsert`]) and the legacy side of the `payments`
+/// reconcile hash (`scheduler::sync::sync_payments`), so detection and
+/// application can never disagree on what "cancelled" means — the
+/// `legacy_yesno_to_bool` / `legacy_yesno_canonical` split on rooms is
+/// the cautionary sibling (a duplicated literal that had to be pinned by
+/// a round-trip test).
+pub(crate) fn receipt_status_is_cancelled(status_name: Option<&str>) -> bool {
+    status_name == Some(RECEIPT_CANCELLED_STATUS)
+}
+
+/// The inputs `scheduler::sync::payment_canonical_hash` consumes, as a
+/// descriptor table over the mapper's own legacy projection.
+///
+/// **`HT_Receipt_H` has NO idempotency gate**: [`apply_receipt_upsert`]
+/// resolves the canonical row by `(pay_cin_id, receipt_no)` and then runs
+/// [`RECEIPT_UPSERT_UPDATE_SQL`] unconditionally — there is no
+/// `existing_matches` chain that could skip a hashed change. The contract
+/// therefore declares `always_writes: true` and every `gated_by` here is
+/// empty, exactly like `rooms`. (The ONE early return —
+/// `Receipt_ref` absent — is excluded from the reconcile scan by
+/// construction: `PAYMENTS_RECONCILE_PROJECTION`'s filter is
+/// `Receipt_ref IS NOT NULL AND <> ''`, because a no-check-in receipt is
+/// a deliberate mapper skip, not sync lag.)
+///
+/// Segments render the LEGACY side of the hash. The canonical side
+/// re-derives them from `ht_payments` (`pay_amount`, `pay_voided`) joined
+/// to `ht_checkins.legacy_cin_no`.
+///
+/// **Excluded on purpose** (both would be permanent false sync lag):
+/// * `pay_date` — [`RECEIPT_UPSERT_UPDATE_SQL`] COALESCEs it, so an
+///   app-originated row keeps its own creation instant forever and can
+///   never converge on `Receipt_Date`;
+/// * `pay_method` — the receipt header does not carry the tender, so the
+///   INSERT defaults to `'cash'`; it is never mirrored either way.
+const HASH_INPUTS: [HashInput<ReceiptProjection>; 4] = [
+    HashInput {
+        name: "receipt_no",
+        // Row identity: the canonical probe SELECTs
+        // `WHERE legacy_receipt_no = $1 OR pay_reference = $1`, so a
+        // changed `Receipt_no` resolves a different row (or none →
+        // missing_pg) instead of reaching any comparison.
+        gated_by: &[],
+        segmented: true,
+        lookup_key: true,
+        segment: |p| p.receipt_no.clone(),
+        mutate: |p| p.receipt_no = "B9999-9999".into(),
+    },
+    HashInput {
+        name: "pay_amount",
+        gated_by: &[],
+        segmented: true,
+        lookup_key: false,
+        segment: |p| crate::scheduler::sync::money_hash_segment(p.receipt_total),
+        mutate: |p| p.receipt_total += 100.0,
+    },
+    HashInput {
+        name: "pay_voided",
+        gated_by: &[],
+        segmented: true,
+        lookup_key: false,
+        segment: |p| {
+            crate::scheduler::sync::voided_hash_segment(receipt_status_is_cancelled(
+                p.status_name.as_deref(),
+            ))
+        },
+        mutate: |p| p.status_name = Some(RECEIPT_CANCELLED_STATUS.into()),
+    },
+    HashInput {
+        name: "legacy_cin_no",
+        gated_by: &[],
+        segmented: true,
+        lookup_key: false,
+        segment: |p| p.legacy_cin_no.clone().unwrap_or_default(),
+        mutate: |p| p.legacy_cin_no = Some("CH26-009999".into()),
+    },
+];
+
+/// Name-level hash contract, for
+/// [`crate::sync::gate_guard::reconcile_entity_contracts`].
+pub(crate) fn hash_input_contract() -> Vec<HashInputContract> {
+    gate_guard::hash_input_contracts(&HASH_INPUTS)
+}
+
+/// No gate exists — see [`HASH_INPUTS`]. Returns empty, and the contract
+/// declares `always_writes: true` so that emptiness is a stated fact
+/// rather than a silently vacuous check.
+pub(crate) fn gate_field_names() -> Vec<&'static str> {
+    Vec::new()
+}
+
+/// Render the `payments` reconcile-hash body from [`HASH_INPUTS`].
+/// Test-only — see the room mapper's equivalent.
+#[cfg(test)]
+fn hash_body(p: &ReceiptProjection) -> String {
+    gate_guard::hash_body(&HASH_INPUTS, p)
+}
+
 /// The UPDATE arm of [`apply_receipt_upsert`]. Hoisted to a const so the
 /// regression tests execute the EXACT statement the mapper runs (against a
 /// shadowing TEMP TABLE) rather than a re-typed copy that could drift.
@@ -547,7 +656,7 @@ async fn apply_receipt_upsert(
         };
 
     // Cancel path — UPSERT with pay_voided=true and emit no event.
-    let is_cancelled = p.status_name.as_deref() == Some("ยกเลิก");
+    let is_cancelled = receipt_status_is_cancelled(p.status_name.as_deref());
 
     // UPSERT on (pay_cin_id, pay_reference) — pay_reference carries the
     // legacy Receipt_no and is unique per legacy receipt sequence.
@@ -1158,6 +1267,92 @@ mod tests {
         assert_eq!(voided, Some(false), "NULL pay_voided must not stay NULL");
         assert_eq!(at, None);
         tx.rollback().await.expect("rollback");
+    }
+
+    // ----- reconcile-hash contract (see `crate::sync::gate_guard`) -------
+
+    /// Byte-parity pin for the NEW `payments` descriptor (Phase 6-A).
+    /// `ht_reconcile_log.mssql_hash` and `ht_receipts_legacy.sync_hash`
+    /// are stored SHA256s of this exact body — one byte of drift
+    /// invalidates every ack and triggers a full re-diff storm.
+    ///
+    /// No behavioural mutation test here, same reason as rooms:
+    /// `apply_receipt_upsert` has no idempotency gate to defeat
+    /// (`always_writes: true`). The golden vector plus
+    /// `payments_hash_mutators_all_move_their_segment` below are what keep
+    /// the descriptor honest.
+    #[test]
+    fn payments_hash_bytes_unchanged_for_golden_inputs() {
+        use crate::scheduler::sync::{payment_canonical_hash, sha256};
+
+        let p = project_receipt(&receipt_row(20663, "B2604-0265", "CH26-005228", 890.0))
+            .expect("fixture must project");
+
+        // Body shape: receipt_no | {:.2} amount | voided=<bool> | cin_no
+        let expected = sha256("B2604-0265|890.00|voided=false|CH26-005228");
+
+        assert_eq!(
+            payment_canonical_hash("B2604-0265", 890.0, false, Some("CH26-005228")),
+            expected,
+            "production payment hash changed bytes"
+        );
+        assert_eq!(
+            sha256(&hash_body(&p)),
+            expected,
+            "HASH_INPUTS join no longer reproduces the production hash body"
+        );
+    }
+
+    /// The cancelled receipt projects the `voided=true` segment — the
+    /// legacy `status_name='ยกเลิก'` literal is the ONLY source of that
+    /// bit on the MSSQL side.
+    #[test]
+    fn payments_hash_body_carries_the_cancelled_bit() {
+        use crate::scheduler::sync::{payment_canonical_hash, sha256};
+
+        let mut row = receipt_row(20663, "B2604-0265", "CH26-005228", 890.0);
+        row.cells.insert(
+            "status_name".into(),
+            MockValue::Str(RECEIPT_CANCELLED_STATUS.into()),
+        );
+        let p = project_receipt(&row).expect("fixture must project");
+
+        let expected = sha256("B2604-0265|890.00|voided=true|CH26-005228");
+        assert_eq!(sha256(&hash_body(&p)), expected);
+        assert_eq!(
+            payment_canonical_hash("B2604-0265", 890.0, true, Some("CH26-005228")),
+            expected,
+            "canonical pay_voided=true must hash like legacy status_name='ยกเลิก'"
+        );
+    }
+
+    /// Self-validating mutators: each descriptor entry must actually move
+    /// its own segment, else a future behavioural test built on this table
+    /// would pass vacuously.
+    #[test]
+    fn payments_hash_mutators_all_move_their_segment() {
+        let base = project_receipt(&receipt_row(20663, "B2604-0265", "CH26-005228", 890.0))
+            .expect("fixture must project");
+        for input in HASH_INPUTS.iter() {
+            let before = (input.segment)(&base);
+            let mut mutated = base.clone();
+            (input.mutate)(&mut mutated);
+            let after = (input.segment)(&mutated);
+            assert_ne!(
+                before, after,
+                "hash input `{}`: mutator did not move the hashed segment",
+                input.name,
+            );
+        }
+    }
+
+    /// The cancel literal is single-sourced: the mapper's void decision
+    /// and the reconcile hash's `voided` segment read the SAME helper.
+    #[test]
+    fn receipt_status_is_cancelled_matches_the_legacy_literal() {
+        assert!(receipt_status_is_cancelled(Some("ยกเลิก")));
+        assert!(!receipt_status_is_cancelled(Some("ปกติ")));
+        assert!(!receipt_status_is_cancelled(None));
     }
 
     // -------------------------------------------------------------------

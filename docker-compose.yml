@@ -314,6 +314,32 @@ services:
       # ENABLED after the HF Ville canary healed C2413 / R002066 on
       # 2026-07-27 (16 days stranded) with correct data and no legacy write.
       - RECONCILE_REINGEST_MISSING_PG_ENABLED=${RECONCILE_REINGEST_MISSING_PG_ENABLED:-true}
+      # Phase 6-A — `payments` reconcile arm (legacy HT_Receipt_H ↔ canonical
+      # ht_payments, keyed on Receipt_no). DETECTION ONLY: it records
+      # divergence into ht_reconcile_log and writes nothing but its own ack
+      # cache (ht_receipts_legacy, migration 080); it is deliberately NOT in
+      # FORCE_CONVERGE_VALUE_DRIFT_TABLES / REINGEST_MISSING_PG_TABLES.
+      #
+      # SHIPS DARK. With this false, run_sync never calls sync_payments, so the
+      # arm issues zero MSSQL and zero PG queries. Enable HF VILLE FIRST, soak
+      # 48h, then HF Hotel — pre-set LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_<SITE>
+      # or enable in an announced window.
+      #
+      # SCOPE: the scan is floored at the canonical mirror's own coverage era
+      # (PAYMENTS_ERA_FLOOR_SQL — derived from MIN(ht_payments.pay_date), never
+      # configured). Receipts older than that were never imported and never can
+      # be, so hashing them would build a PERMANENT missing_pg backlog: >20k
+      # rows at HF Hotel on 2026-07-28 (21,566 ref-carrying legacy receipts vs
+      # 1,154 canonical payments, all 2026-04-27+). Those rows are unclosable —
+      # missing_pg is never acked and `payments` is in neither self-heal list —
+      # and would have starved every other entity out of the 500-row auto-resolve
+      # batch. Floored, the same data yields ~13 first-enable finds.
+      #
+      # So do NOT expect a big transient backlog here: what lands is small and
+      # each row needs OPERATOR ACTION (nothing auto-closes it), and the >72h
+      # escalation tier will fire on any that sit. This backend runs HF Hotel's
+      # reconcile; sync-hfville runs Ville's (its own HFVILLE_ override below).
+      - RECONCILE_PAYMENTS_ARM_ENABLED=${RECONCILE_PAYMENTS_ARM_ENABLED:-false}
       # Tracing log level. Default `hotel_backend=info,tower_http=info`
       # matches `main.rs::tracing_subscriber::EnvFilter::try_from_default_env`'s
       # fallback. Override at deploy time to crank up debug logging
@@ -534,6 +560,12 @@ services:
       # if WORKER_RECONCILE_ENABLED is ever turned on here, this is already
       # correct rather than silently stale.
       - RECONCILE_REINGEST_MISSING_PG_ENABLED=${RECONCILE_REINGEST_MISSING_PG_ENABLED:-true}
+      # Phase 6-A `payments` reconcile arm — INERT in this process for the same
+      # reason as the re-ingest knob above (only a process that runs a reconcile
+      # reads it, and this HF Hotel sync worker leaves WORKER_RECONCILE_ENABLED
+      # at its default-false). Carried here so the two HF Hotel processes never
+      # read differently. Ships DARK; see the backend service for the rollout.
+      - RECONCILE_PAYMENTS_ARM_ENABLED=${RECONCILE_PAYMENTS_ARM_ENABLED:-false}
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,sync=info}
     secrets:
       - db_password
@@ -676,6 +708,17 @@ services:
       # This worker DOES run Ville's reconcile (WORKER_RECONCILE_ENABLED above),
       # so the knob is live here. Per-site so Ville canaries first. Ships dark.
       - RECONCILE_REINGEST_MISSING_PG_ENABLED=${HFVILLE_RECONCILE_REINGEST_MISSING_PG_ENABLED:-true}
+      # Phase 6-A — `payments` reconcile arm (legacy HT_Receipt_H ↔ canonical
+      # ht_payments, keyed on Receipt_no). DETECTION ONLY; writes nothing but
+      # its own ack cache (ht_receipts_legacy, migration 080). This worker runs
+      # Ville's reconcile, so the knob is LIVE here — and Ville is the canary
+      # for it: enable HERE first, soak 48h, then flip the backend (HF Hotel).
+      # Ships DARK. NOTE the canary is WEAK by construction: Ville has 105
+      # ref-carrying legacy receipts vs 4 canonical payments, so a green Ville
+      # soak says nothing about HF Hotel's 21.5k-receipt history — that is what
+      # the canonical era floor (PAYMENTS_ERA_FLOOR_SQL) exists to bound, not
+      # this soak. Findings need operator action; nothing here auto-closes.
+      - RECONCILE_PAYMENTS_ARM_ENABLED=${HFVILLE_RECONCILE_PAYMENTS_ARM_ENABLED:-false}
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,sync=info}
     secrets:
       - db_password

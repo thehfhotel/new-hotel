@@ -27,6 +27,9 @@
 //! 2. Rooms:     `HT_Rooms`        vs canonical `ht_rooms_new`   (JOIN `legacy_room_no` / `room_no`)
 //! 3. Bookings:  `View_Booking_Ds` vs canonical `ht_bookings`    (JOIN `legacy_book_id`)
 //! 4. Check-ins: `View_CheckIn_Ds` vs canonical `ht_checkins`    (JOIN `legacy_cin_no`)
+//! 5. Payments: `HT_Receipt_H`    vs canonical `ht_payments`    (JOIN `legacy_receipt_no`
+//!    / `pay_reference`) — Phase 6-A, keyed on `Receipt_no`, and **DARK by
+//!    default**: it runs only when `RECONCILE_PAYMENTS_ARM_ENABLED=true`.
 //!
 //! Pre-v2.63.0 this job compared MSSQL hashes against `ht_*_legacy.sync_hash`
 //! (the demoted mirror tables). After the 2026-04-28 cutover those mirrors
@@ -231,6 +234,19 @@ pub async fn run_sync(
     if let Err(e) = sync_checkins(legacy_pool, pg_pool).await {
         tracing::error!(site = %site_id, "[Sync] Check-in sync failed: {}", e);
         record_error(pg_pool, "checkins", &e.to_string()).await;
+    }
+
+    // Phase 6-A: payments (`HT_Receipt_H` ↔ `ht_payments`). SHIPPED DARK —
+    // `RECONCILE_PAYMENTS_ARM_ENABLED` defaults false on every service, and
+    // the check lives HERE (not inside `sync_payments`) so a disabled arm
+    // issues literally zero MSSQL/PG queries. Runs AFTER check-ins: a
+    // payment's canonical parent is `ht_checkins`, so any parent repair a
+    // tick performs lands first. See `reconcile_payments_arm_enabled`.
+    if reconcile_payments_arm_enabled() {
+        if let Err(e) = sync_payments(legacy_pool, pg_pool).await {
+            tracing::error!(site = %site_id, "[Sync] Payment sync failed: {}", e);
+            record_error(pg_pool, "payments", &e.to_string()).await;
+        }
     }
 
     // Phase 5.5a: full-table reload of legacy-only dimension tables into
@@ -2471,6 +2487,84 @@ pub(crate) fn checkin_canonical_hash(
     ]))
 }
 
+/// Render a money value into its reconcile-hash segment.
+///
+/// Two decimals on BOTH sides: canonical `ht_payments.pay_amount` is
+/// `DECIMAL(12,2)` while legacy `HT_Receipt_H.Receipt_Total` is a bare
+/// `float`, so the fixed precision is what makes the two comparable at
+/// all (a float `890.0000000001` must hash like `890.00`).
+///
+/// The `-0.0` normalisation is not cosmetic: IEEE `-0.0` renders as
+/// `"-0.00"` while `0.0` renders as `"0.00"`, and `-0.0 == 0.0` is true —
+/// so a zero-total receipt could otherwise hash differently on the two
+/// sides forever with nothing observable to fix.
+pub(crate) fn money_hash_segment(amount: f64) -> String {
+    let normalised = if amount == 0.0 { 0.0 } else { amount };
+    format!("{:.2}", normalised)
+}
+
+/// Render the void bit into its reconcile-hash segment. The `voided=`
+/// prefix belongs to the SEGMENT, not the separator — same convention as
+/// the check-in hash's `co=`.
+pub(crate) fn voided_hash_segment(voided: bool) -> String {
+    format!("voided={}", voided)
+}
+
+/// Hash inputs for one canonical-shape payment (legacy `HT_Receipt_H`)
+/// row. Phase 6-A; keyed on `Receipt_no`.
+///
+/// **Why `Receipt_no` and NOT `Pay_No`:** `Pay_No` is a pointer into the
+/// per-line `HT_CheckIn_Pay` ledger (many lines share one), whereas
+/// `Receipt_no` is the receipt artefact's own unique business key — and
+/// it is what `apply_receipt_upsert` resolves canonical rows by
+/// (`legacy_receipt_no` / `pay_reference`).
+///
+/// **Deliberately excluded** (each would be permanent, unfixable sync
+/// lag rather than signal):
+/// * `pay_date` — `RECEIPT_UPSERT_UPDATE_SQL` COALESCEs it, so an
+///   app-originated payment keeps its own creation instant and can never
+///   converge on legacy `Receipt_Date`;
+/// * `pay_method` — `HT_Receipt_H` doesn't carry the tender (that lives
+///   in the matching `HT_CheckIn_Pay` line), so the mapper defaults the
+///   column to `'cash'` and never mirrors it in either direction.
+///
+/// **Known one-way asymmetry, deliberately hashed:** canonical void is
+/// PG-only (`repository/payment.rs::void`, no writeback recipe) and the
+/// mapper's `pay_voided` fold is MONOTONIC, so a canonically-voided
+/// payment whose legacy `status_name` is still `'ปกติ'` diverges here and
+/// CANNOT self-heal. That is a genuine cross-app money-reporting
+/// disagreement (iHOTEL's shift report still counts the receipt, ours
+/// doesn't), so it is signal — but expect such rows to need operator
+/// action, not patience. This is one reason `payments` is deliberately
+/// absent from [`FORCE_CONVERGE_VALUE_DRIFT_TABLES`].
+///
+/// **That shape needs an explicit carve-out to stay OBSERVABLE, and has
+/// one** (2026-07-28 review). A PG-only void never moves the LEGACY hash,
+/// and `sync_payments` short-circuits on `acked == mssql_hash` *before* it
+/// fetches the canonical row — so without help, only the canonical-only
+/// voids that already existed at first-enable would ever be reported, and
+/// a void performed in our app after a receipt was acked as converged
+/// would be invisible to the arm forever.
+/// [`load_canonically_voided_receipt_keys`] closes that: it lifts the
+/// currently-voided canonical receipt keys in ONE batched read per tick,
+/// and [`payment_ack_short_circuit_bypassed`] re-opens the comparison for
+/// exactly the asymmetric pair (canonical voided ∧ legacy not cancelled).
+/// Do not "simplify" that bypass back into a plain ack short-circuit — the
+/// money path is only continuously monitored because of it.
+pub(crate) fn payment_canonical_hash(
+    receipt_no: &str,
+    amount: f64,
+    voided: bool,
+    legacy_cin_no: Option<&str>,
+) -> String {
+    sha256(&join_hash_segments(&[
+        receipt_no.to_string(),
+        money_hash_segment(amount),
+        voided_hash_segment(voided),
+        legacy_cin_no.unwrap_or("").to_string(),
+    ]))
+}
+
 /// Track D / T7 CRIT-1 — discriminator for `ht_reconcile_log.divergence_kind`.
 /// Pure enum so the reconcile loop and the (never-silenced) ack guard
 /// agree on the same vocabulary.
@@ -2718,7 +2812,7 @@ fn parse_booking_legacy_pk(legacy_pk: &str) -> (&str, &str) {
 /// `gate_guard::tests::resolvable_tables_const_covers_every_contract_entity`
 /// pins this list against the entity registry.
 pub(crate) const RECONCILE_RESOLVABLE_TABLES: &[&str] =
-    &["customers", "bookings", "checkins", "rooms"];
+    &["customers", "bookings", "checkins", "rooms", "payments"];
 
 /// Re-compute the canonical PG hash for a single `ht_reconcile_log`
 /// row's `(table_name, legacy_pk)` pair. Returns `Ok(None)` if no
@@ -2801,6 +2895,21 @@ async fn compute_current_pg_hash(
                 )
             }))
         }
+        "payments" => {
+            // Phase 6-A. `legacy_pk` is the receipt's `Receipt_no`; the
+            // canonical probe mirrors `apply_receipt_upsert`'s own
+            // `(legacy_receipt_no = $1 OR pay_reference = $1)` shape so
+            // the sweep resolves the SAME row the mapper would write.
+            let canonical = fetch_canonical_payment(pg_pool, legacy_pk).await?;
+            Ok(canonical.map(|c| {
+                payment_canonical_hash(
+                    legacy_pk,
+                    c.pay_amount,
+                    c.is_voided(),
+                    c.legacy_cin_no.as_deref(),
+                )
+            }))
+        }
         _ => {
             debug_assert!(
                 !RECONCILE_RESOLVABLE_TABLES.contains(&table_name),
@@ -2853,6 +2962,7 @@ async fn compute_current_legacy_hash(
         }
         "checkins" => compute_legacy_checkin_hash_via_mapper(legacy_pool, legacy_pk).await,
         "rooms" => fetch_legacy_room_hash(legacy_pool, legacy_pk).await,
+        "payments" => fetch_legacy_payment_hash(legacy_pool, legacy_pk).await,
         _ => {
             debug_assert!(
                 !RECONCILE_RESOLVABLE_TABLES.contains(&table_name),
@@ -3038,6 +3148,39 @@ async fn fetch_legacy_room_hash(
     )))
 }
 
+/// Single-PK MSSQL re-projection for payments (Phase 6-A). Mirrors
+/// `sync_payments`' per-row hash construction so the auto-resolve sweep
+/// compares like-for-like under the CURRENT projection. `Ok(None)` when
+/// the receipt no longer exists on the legacy side, or when it has lost
+/// its `Receipt_ref` (the bulk scan excludes those rows too — a
+/// no-check-in receipt is a deliberate mapper skip, not sync lag).
+///
+/// The canonical-era floor ([`PAYMENTS_ERA_FLOOR_SQL`]) is deliberately NOT
+/// applied here: this path re-projects a receipt the scan ALREADY admitted
+/// and logged, so it must reproduce that row's hash unconditionally. Adding
+/// the floor would make an in-flight row un-re-projectable if the floor ever
+/// moved forward.
+async fn fetch_legacy_payment_hash(
+    legacy_pool: &DbPool,
+    receipt_no: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut conn = legacy_pool.get().await?;
+    let sql = format!(
+        "SELECT {projection} FROM HT_Receipt_H WHERE Receipt_no = @P1",
+        projection = PAYMENTS_RECONCILE_PROJECTION.join(", "),
+    );
+    let mut q = Query::new(sql);
+    q.bind(receipt_no);
+    let rows = q.query(&mut conn).await?.into_first_result().await?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let Some(projected) = project_legacy_receipt_row(row) else {
+        return Ok(None);
+    };
+    Ok(Some(projected.hash()))
+}
+
 /// Issue #204 (bug #2) — is the durable self-healing arm of the
 /// auto-resolve sweep enabled?
 ///
@@ -3067,6 +3210,35 @@ fn reconcile_force_converge_enabled() -> bool {
 /// reception-coordinated verification (a flag flip is never "just config").
 fn reconcile_reingest_missing_pg_enabled() -> bool {
     env::var("RECONCILE_REINGEST_MISSING_PG_ENABLED")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+/// Phase 6-A — is the `payments` reconcile arm enabled?
+///
+/// Default **OFF** (ship dark). When unset / not `"true"`, [`run_sync`]
+/// never calls `sync_payments`, so the arm issues ZERO MSSQL and ZERO PG
+/// queries and `ht_reconcile_log` can never gain a `payments` row —
+/// behaviour is byte-for-byte identical to before the arm existed. The
+/// resolve dispatches and the ack table are inert without detection.
+///
+/// Rollout is Ville-first → 48h soak → HF Hotel, in an announced window.
+/// The first enabled tick re-hashes every IN-ERA receipt with a
+/// `Receipt_ref`, so a one-time find is expected — but only a small one:
+/// [`PAYMENTS_ERA_FLOOR_SQL`] keeps the pre-mirror history (>20k receipts
+/// at HF Hotel) out of scope entirely, because those rows could never
+/// converge and would jam the whole sweep. Pre-set
+/// `LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_<SITE>` accordingly.
+///
+/// Be honest about what lands: `payments` is in NEITHER self-heal list, so
+/// a `missing_pg` find here does NOT age out on its own — it stays open
+/// until an operator acts, and the >72h escalation tier will eventually
+/// fire on it. Treat every one as a real dropped receipt ingest.
+///
+/// The `== "true"` comparison is strict on purpose, matching every other
+/// feature flag in the sync path. A flag flip is never "just config".
+fn reconcile_payments_arm_enabled() -> bool {
+    env::var("RECONCILE_PAYMENTS_ARM_ENABLED")
         .map(|v| v == "true")
         .unwrap_or(false)
 }
@@ -3318,6 +3490,15 @@ fn classify_force_converge(
 
 /// Tables the #204 value-drift force-converge arm will repair. Single-PK
 /// mappers whose `apply` is safe to re-drive idempotently.
+///
+/// **`payments` is deliberately absent** (Phase 6-A): detection ships
+/// first and must soak before any self-heal is wired. `payments` also has
+/// nothing to gain from the gate-skip machinery — `apply_receipt_upsert`
+/// is a lookup-then-unconditional UPDATE, so it cannot be gate-blinded —
+/// and one of its divergence shapes (canonical-only void, see
+/// [`payment_canonical_hash`]) is a genuine cross-app disagreement that
+/// re-driving the legacy row would silently ERASE rather than repair.
+/// Adding it here is a separate, coordinated decision (plan 6-D).
 const FORCE_CONVERGE_VALUE_DRIFT_TABLES: &[&str] = &["customers", "rooms"];
 
 /// Tables the `missing_pg` re-ingest arm will repair. Customers first-class
@@ -3388,20 +3569,35 @@ type ReconcileCandidate = (i64, String, String, Option<String>, f64);
 
 /// FK-dependency rank for the auto-resolve sweep's candidate ordering.
 /// Lower runs first, so a parent is always re-ingested before anything that
-/// points at it: customers → rooms → bookings → checkins.
+/// points at it: customers → rooms → bookings → checkins → payments.
 ///
 /// **This ordering is load-bearing, not cosmetic.** `apply_booking_aggregate`
 /// needs the booking's customer to exist in canonical (it eager-mirrors on a
 /// miss and ERRORS if even that fails); check-ins point at rooms and
-/// bookings. Healing a dependent before its parent within one sweep pass
-/// turns a repairable row into an error.
+/// bookings; a payment points at its check-in (`ht_payments.pay_cin_id`, and
+/// `apply_receipt_upsert` ERRORS on an unresolvable parent). Healing a
+/// dependent before its parent within one sweep pass turns a repairable row
+/// into an error.
 fn reconcile_table_fk_rank(table_name: &str) -> u8 {
     match table_name {
         "customers" => 0,
         "rooms" => 1,
         "bookings" => 2,
         "checkins" => 3,
-        _ => 4,
+        "payments" => 4,
+        other => {
+            // A resolvable entity that falls through here is unranked, so
+            // it sorts after everything and its FK parents lose their
+            // guaranteed head start. Same class of omission the two
+            // resolve dispatches guard.
+            debug_assert!(
+                !RECONCILE_RESOLVABLE_TABLES.contains(&other),
+                "FK rank missing for {other} in reconcile_table_fk_rank — \
+                 the entity is listed as resolvable but falls through to the \
+                 wildcard, so the sweep may heal it before its parents"
+            );
+            5
+        }
     }
 }
 
@@ -3447,6 +3643,15 @@ fn sort_reconcile_candidates(rows: &mut [ReconcileCandidate]) {
 /// Bounded to 500 rows per tick so a backlog can't stall the
 /// reconcile loop. Best-effort per row — a single MSSQL or PG
 /// failure logs and continues to the next.
+///
+/// **No per-table fairness — a known, load-bearing property.** The batch is
+/// selected by `detected_at` alone. An entity that accumulates a large
+/// backlog of rows that can NEVER close (a divergence kind with no self-heal
+/// arm) would therefore occupy every subsequent 500-row batch and starve all
+/// other tables out of the sweep completely. That is why a new reconcile arm
+/// must not be able to manufacture permanently-unresolvable rows in bulk —
+/// see [`PAYMENTS_ERA_FLOOR_SQL`] for the payments case that made this
+/// concrete, and the live numbers behind it.
 ///
 /// **Issue #204 (bug #2) — durable self-healing arm (ship dark).** By
 /// default this sweep is observational-only: it resolves a row ONLY when
@@ -5759,6 +5964,543 @@ async fn upsert_checkin_mirror(
     Ok(())
 }
 
+// =============================================================================
+// Payment (receipt) Sync — Phase 6-A, DARK behind RECONCILE_PAYMENTS_ARM_ENABLED
+// =============================================================================
+
+/// Legacy `HT_Receipt_H` projection for the payment reconcile hash.
+///
+/// Held as a slice const so Track J1's projection-lock test can pin every
+/// column against the authoritative schema dump, and so the bulk scan and
+/// the per-PK auto-resolve re-fetch cannot drift apart.
+///
+/// `Receipt_Date` and the VAT columns are deliberately NOT here — see
+/// [`payment_canonical_hash`] for why `pay_date` / `pay_method` are
+/// excluded from the hash. (`Receipt_Date` IS used in the scan's WHERE
+/// clause as the canonical-era floor — see [`PAYMENTS_ERA_FLOOR_SQL`] —
+/// which is a scope filter, not a hash input.)
+const PAYMENTS_RECONCILE_PROJECTION: &[&str] = &[
+    "Receipt_no",
+    "Receipt_Total",
+    "Receipt_ref",
+    "status_name",
+];
+
+/// The scan filter for the bulk payments sweep.
+///
+/// A receipt with no `Receipt_ref` carries no `Cin_no`, and
+/// `payment::apply_receipt_upsert` skips it deliberately (canonical
+/// `ht_payments.pay_cin_id` is NOT NULL — there is nowhere to land it).
+/// Including those rows would manufacture a permanent `missing_pg` row per
+/// no-check-in sale: a deliberate design skip reported as sync lag, which
+/// is exactly the false-positive class the arm exists to avoid.
+const PAYMENTS_RECONCILE_SCAN_FILTER: &str = "Receipt_ref IS NOT NULL AND Receipt_ref <> ''";
+
+/// Derive the canonical-coverage floor for the payments scan, in
+/// LEGACY-LOCAL time (Thai / GMT+7, stored naive) — the era boundary below
+/// which a legacy receipt provably has no canonical counterpart and never
+/// will. `NULL` when `ht_payments` is empty (no coverage at all).
+///
+/// **Why this exists — 2026-07-28 review, BLOCKING find.** `ht_payments` is
+/// populated by the CT watcher, which only ever saw receipts from the day CT
+/// was enabled on `HT_Receipt_H`; there is no historical backfill. Live
+/// read-only counts that day: HF Hotel legacy `HT_Receipt_H` had 21,566 rows
+/// passing [`PAYMENTS_RECONCILE_SCAN_FILTER`] (2021 → 2026) against 1,154
+/// canonical payments, ALL dated 2026-04-27 or later. Unfloored, the first
+/// enabled tick would classify >20,400 pre-era receipts as
+/// [`DivergenceKind::MissingPg`] — a kind that is NOT `is_silenceable()`, so
+/// it is never acked, while `payments` is deliberately absent from
+/// [`REINGEST_MISSING_PG_TABLES`], so [`should_auto_resolve`] can never close
+/// it either. That backlog is PERMANENT, not transient. It would:
+///
+/// * re-issue ~20.4k [`CANONICAL_PAYMENT_PROBE_SQL`] probes plus ~20.4k
+///   dedupe INSERTs every tick, forever — not the advertised one-MSSQL-query
+///   + a-few-batched-PG-reads steady state;
+/// * pin the 4h `check_level_drift_and_alert` digest and the >72h escalation
+///   tier on `payments` permanently;
+/// * starve every OTHER entity out of [`auto_resolve_reconcile_log`], whose
+///   500-row batch is selected by `detected_at` alone with no per-table
+///   fairness — once the payments rows own the oldest band, customers /
+///   rooms / bookings / checkins stop being swept at all.
+///
+/// The prescribed Ville-first canary could NOT have surfaced this: HF Ville
+/// has 105 ref-carrying legacy receipts against 4 canonical payments, so its
+/// 48h soak lands ~101 rows and stays green by construction.
+///
+/// Pre-era receipts are out of the mirror's scope in exactly the same sense
+/// as a receipt with no `Receipt_ref`: a deliberate design skip, not sync
+/// lag. With the floor applied the same live data yields 1,167 in-era legacy
+/// receipts against 1,154 canonical rows — a ~13-row first-enable find an
+/// operator can actually act on.
+///
+/// The floor is DERIVED, never configured. `MIN(pay_date)` is by
+/// construction the oldest receipt the mirror has ever landed
+/// (`apply_receipt_upsert` seeds `pay_date` from `Receipt_Date` and COALESCEs
+/// it forever after), so nothing that could still converge sorts below it.
+/// `date_trunc('day', …)` widens to the start of that day so the boundary
+/// includes the whole first day rather than cutting mid-afternoon.
+///
+/// **NO timezone shift is applied, and adding one would be a bug** (2026-07-28
+/// review, second pass). `ht_payments.pay_date` is a bare `TIMESTAMP` carrying
+/// the legacy value VERBATIM: `project_receipt` reads `Receipt_Date` with a
+/// plain `try_get_datetime` and no conversion, and `apply_receipt_upsert`'s own
+/// fallback is explicitly Bangkok wall-clock ("a `naive_utc()` fallback here
+/// landed 7h early — 2026-06-11 audit"). So both sides of this comparison are
+/// already the same naive Thai basis. (`naive_thai_to_utc` belongs to a
+/// DIFFERENT column with a different convention: `Cin_Pay_Date` →
+/// `ht_payment_ledger.ledger_pay_date`, which is `TIMESTAMPTZ`. Conflating the
+/// two conventions is what put a spurious `+ INTERVAL '7 hours'` here.)
+/// Verified live read-only: hotelnew `MIN(pay_date)` = `2026-04-27 16:39:21`
+/// (`pay_reference` `B2604-0285`) and legacy `HT_Receipt_H.Receipt_Date` for
+/// that receipt = `2026-04-27T16:39:21`, byte-identical.
+///
+/// A shift here would move the floor in the NARROWING direction and silently
+/// drop the mirror's whole first day of coverage — precisely the
+/// partial-ingest boundary where the genuine `missing_pg` finds live. It was
+/// masked at both sites only because `date_trunc('day')` happened to absorb it
+/// (HF Hotel 16:39 + 7h = 23:39, same day, 21 minutes of margin); any site
+/// whose oldest mirrored receipt lands at or after 17:00 Thai loses a full day.
+/// Unshifted is also the safe direction if an APP-created row ever became the
+/// `MIN`: `repository/payment.rs` omits `pay_date` on INSERT so the column
+/// `DEFAULT NOW()` applies on a UTC-basis server clock, which errs wide (floor
+/// too early → extra rows scanned) rather than narrow (rows silently dropped).
+const PAYMENTS_ERA_FLOOR_SQL: &str = "SELECT date_trunc('day', MIN(pay_date)) FROM ht_payments";
+
+async fn payments_reconcile_era_floor(
+    pg_pool: &PgPool,
+) -> Result<Option<NaiveDateTime>, sqlx::Error> {
+    sqlx::query_scalar::<_, Option<NaiveDateTime>>(PAYMENTS_ERA_FLOOR_SQL)
+        .fetch_one(pg_pool)
+        .await
+}
+
+/// Compose the bulk scan's `WHERE` clause for a given canonical era floor.
+///
+/// Rows with a NULL `Receipt_Date` are deliberately KEPT: such a receipt
+/// cannot be placed inside or outside the era, it is vanishingly rare (0 of
+/// 21,566 at HF Hotel and 0 of 105 at HF Ville, verified 2026-07-28), and the
+/// mapper WOULD land it (`p.receipt_date.unwrap_or(now)`) — so dropping it
+/// would re-create the silent-skip class the floor exists to remove.
+///
+/// The literal is rendered `YYYY-MM-DDTHH:MM:SS`, the language-independent
+/// ODBC/ISO form, so the comparison can't be re-read under a different server
+/// `DATEFORMAT`. No injection surface: the value is a `NaiveDateTime`
+/// PostgreSQL itself produced, formatted here.
+fn payments_reconcile_scan_filter(era_floor: NaiveDateTime) -> String {
+    format!(
+        "{base} AND (Receipt_Date IS NULL OR Receipt_Date >= '{floor}')",
+        base = PAYMENTS_RECONCILE_SCAN_FILTER,
+        floor = era_floor.format("%Y-%m-%dT%H:%M:%S"),
+    )
+}
+
+/// One legacy receipt as projected for reconciliation. Mirrors the CT
+/// mapper's `ReceiptProjection` field-for-field on the hashed subset, so
+/// the descriptor table in `sync::mappers::payment` and this loop cannot
+/// disagree about the body.
+struct LegacyReceiptRow {
+    receipt_no: String,
+    receipt_total: f64,
+    legacy_cin_no: Option<String>,
+    status_name: Option<String>,
+}
+
+impl LegacyReceiptRow {
+    fn voided(&self) -> bool {
+        // Single-sourced with the mapper's own void decision so detection
+        // and application can never disagree on the cancel literal.
+        crate::sync::mappers::payment::receipt_status_is_cancelled(self.status_name.as_deref())
+    }
+
+    fn hash(&self) -> String {
+        payment_canonical_hash(
+            &self.receipt_no,
+            self.receipt_total,
+            self.voided(),
+            self.legacy_cin_no.as_deref(),
+        )
+    }
+
+    fn json(&self) -> serde_json::Value {
+        json!({
+            "Receipt_no": self.receipt_no,
+            "Receipt_Total": self.receipt_total,
+            "Receipt_ref": self.legacy_cin_no,
+            "status_name": self.status_name,
+        })
+    }
+}
+
+/// Project one `HT_Receipt_H` row under [`PAYMENTS_RECONCILE_PROJECTION`].
+/// Returns `None` for a row that is not reconcilable — no `Receipt_no`
+/// (the business key), or an empty/absent `Receipt_ref` (the deliberate
+/// mapper skip). Shared by the bulk scan and the per-PK re-fetch so the
+/// two apply IDENTICAL admission rules.
+fn project_legacy_receipt_row(row: &tiberius::Row) -> Option<LegacyReceiptRow> {
+    let receipt_no = row.get::<&str, _>("Receipt_no")?.to_string();
+    if receipt_no.is_empty() {
+        return None;
+    }
+    let legacy_cin_no = row
+        .get::<&str, _>("Receipt_ref")
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())?;
+    Some(LegacyReceiptRow {
+        receipt_no,
+        // `Receipt_Total` is `float NOT NULL DEFAULT 0` in the live
+        // schema; a NULL would only appear via a hand-edit, and 0.0 is
+        // the honest projection of "no total recorded".
+        receipt_total: row.get::<f64, _>("Receipt_Total").unwrap_or(0.0),
+        legacy_cin_no: Some(legacy_cin_no),
+        status_name: row.get::<&str, _>("status_name").map(str::to_string),
+    })
+}
+
+/// Canonical-side projection of a payment row for hashing. Resolved by
+/// `Receipt_no` through the SAME two columns `apply_receipt_upsert`
+/// probes.
+struct CanonicalPaymentRow {
+    pay_amount: f64,
+    pay_voided: Option<bool>,
+    /// From the parent check-in (`ht_checkins.legacy_cin_no`), which is
+    /// what legacy `Receipt_ref` holds. LEFT-joined: a payment whose
+    /// parent row has vanished still projects (with `None`) and lands as
+    /// value drift rather than being misreported as `missing_pg`.
+    legacy_cin_no: Option<String>,
+}
+
+impl CanonicalPaymentRow {
+    /// `pay_voided` is nullable (`BOOLEAN DEFAULT false`); NULL means
+    /// "never voided", matching the `COALESCE(pay_voided, false)` the
+    /// mapper's UPDATE and every `WHERE pay_voided = false` reader use.
+    fn is_voided(&self) -> bool {
+        self.pay_voided.unwrap_or(false)
+    }
+}
+
+/// Resolve the canonical payment for a legacy `Receipt_no`.
+///
+/// The predicate + ORDER BY mirror
+/// `payment::apply_receipt_upsert`'s existing-row probe exactly, minus its
+/// `pay_cin_id` term (which the sweep does not have, and does not need —
+/// `Receipt_no` is unique within the legacy app):
+///
+/// * `legacy_receipt_no` — stamped by OUR writeback back-population when
+///   the payment originated in THIS app;
+/// * `pay_reference` — set when the payment originated in iHOTEL and was
+///   first imported here.
+///
+/// Probing only one column would report the other origin's rows as
+/// `missing_pg` forever — the same defect that produced the 2026-06-30
+/// HF Ville phantom-duplicate echo, in detection form. The `ORDER BY`
+/// makes the app-originated row win deterministically if a legacy orphan
+/// duplicate still exists.
+///
+/// Hoisted to a const so the shape guard executes the EXACT statement the
+/// sweep runs, rather than a re-typed copy that could drift (same reason
+/// `payment::RECEIPT_UPSERT_UPDATE_SQL` is a const).
+const CANONICAL_PAYMENT_PROBE_SQL: &str =
+    "SELECT p.pay_amount::float8, p.pay_voided, c.legacy_cin_no \
+       FROM ht_payments p \
+       LEFT JOIN ht_checkins c ON c.cin_id = p.pay_cin_id \
+      WHERE p.legacy_receipt_no = $1 OR p.pay_reference = $1 \
+      ORDER BY (p.legacy_receipt_no = $1) DESC NULLS LAST, p.pay_id ASC \
+      LIMIT 1";
+
+async fn fetch_canonical_payment(
+    pg_pool: &PgPool,
+    receipt_no: &str,
+) -> Result<Option<CanonicalPaymentRow>, sqlx::Error> {
+    sqlx::query_as::<_, (f64, Option<bool>, Option<String>)>(CANONICAL_PAYMENT_PROBE_SQL)
+        .bind(receipt_no)
+    .fetch_optional(pg_pool)
+    .await
+    .map(|opt| {
+        opt.map(|(amount, voided, cin_no)| CanonicalPaymentRow {
+            pay_amount: amount,
+            pay_voided: voided,
+            legacy_cin_no: cin_no,
+        })
+    })
+}
+
+/// Best-effort ack: record the `mssql_hash` we last reconciled for this
+/// receipt so the next tick short-circuits before the per-PK canonical
+/// fetch. Cache-only — never mutates canonical state; a failed write just
+/// re-fires the same comparison next tick.
+async fn ack_receipt_mirror(pg_pool: &PgPool, receipt_no: &str, mssql_hash: &str) {
+    let updated = sqlx::query(
+        "UPDATE ht_receipts_legacy SET sync_hash = $1, synced_at = NOW() \
+         WHERE receipt_no = $2",
+    )
+    .bind(mssql_hash)
+    .bind(receipt_no)
+    .execute(pg_pool)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+
+    if updated == 0 {
+        let _ = sqlx::query(
+            "INSERT INTO ht_receipts_legacy (receipt_no, sync_hash, synced_at) \
+             VALUES ($1, $2, NOW()) \
+             ON CONFLICT (receipt_no) DO UPDATE SET sync_hash = EXCLUDED.sync_hash, \
+                                                    synced_at = EXCLUDED.synced_at",
+        )
+        .bind(receipt_no)
+        .bind(mssql_hash)
+        .execute(pg_pool)
+        .await;
+    }
+}
+
+/// Read the WHOLE ack cache in ONE query.
+///
+/// The efficiency contract for this arm is: one bulk MSSQL SELECT + one
+/// batched ack read + a per-PK canonical fetch ONLY for keys whose hash
+/// moved. Per-PK ack SELECTs (what `sync_customers` / `sync_checkins` do)
+/// would add one PG round-trip per receipt — tens of thousands per tick
+/// for a table that is append-only and therefore almost entirely acked in
+/// steady state.
+async fn load_receipt_ack_cache(
+    pg_pool: &PgPool,
+) -> Result<std::collections::HashMap<String, String>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT receipt_no, sync_hash FROM ht_receipts_legacy WHERE sync_hash IS NOT NULL",
+    )
+    .fetch_all(pg_pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(k, v)| v.map(|hash| (k, hash)))
+        .collect())
+}
+
+/// Receipt keys whose CANONICAL payment currently carries the void bit,
+/// read in ONE batched query per tick.
+///
+/// This is what keeps the canonical-only void shape observable past the
+/// first enabled tick — see [`payment_canonical_hash`] for the full
+/// argument and [`payment_ack_short_circuit_bypassed`] for the rule.
+///
+/// BOTH lookup columns are unioned because [`CANONICAL_PAYMENT_PROBE_SQL`]
+/// resolves on either (`legacy_receipt_no = $1 OR pay_reference = $1`) and
+/// one row can carry two different values. Over-inclusion is harmless: the
+/// worst case is one extra canonical probe for a receipt that then agrees.
+///
+/// Voided payments are a small minority of a small table, so this stays
+/// well inside the arm's efficiency contract (one bulk MSSQL SELECT + a
+/// couple of batched PG reads per tick).
+async fn load_canonically_voided_receipt_keys(
+    pg_pool: &PgPool,
+) -> Result<std::collections::HashSet<String>, sqlx::Error> {
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT legacy_receipt_no FROM ht_payments \
+          WHERE COALESCE(pay_voided, false) AND legacy_receipt_no IS NOT NULL \
+         UNION \
+         SELECT pay_reference FROM ht_payments \
+          WHERE COALESCE(pay_voided, false) AND pay_reference IS NOT NULL",
+    )
+    .fetch_all(pg_pool)
+    .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Must the ack short-circuit be BYPASSED for this receipt?
+///
+/// True for exactly one divergence shape: canonical says voided, legacy
+/// still says normal. That shape cannot move the legacy hash, so an acked
+/// receipt would otherwise never be re-compared and the divergence would be
+/// invisible forever (see [`payment_canonical_hash`]).
+///
+/// Deliberately NOT `canonical_voided != legacy_voided`: when legacy is the
+/// one carrying the cancel literal, the legacy hash HAS moved, so the plain
+/// ack comparison already re-opens the receipt on its own.
+fn payment_ack_short_circuit_bypassed(canonical_voided: bool, legacy_voided: bool) -> bool {
+    canonical_voided && !legacy_voided
+}
+
+/// Phase 6-A payments reconcile arm. Compares legacy `HT_Receipt_H`
+/// against canonical `ht_payments`, keyed on `Receipt_no`.
+///
+/// Only ever called when [`reconcile_payments_arm_enabled`] is true — with
+/// the flag off (the shipped default on every service) this function is
+/// never entered, so the arm issues no queries at all.
+///
+/// Shape (see [`load_receipt_ack_cache`] for the efficiency contract):
+/// 0. ONE PG read for the canonical era floor ([`PAYMENTS_ERA_FLOOR_SQL`]) —
+///    receipts older than the mirror's own coverage are out of scope, exactly
+///    like ref-less ones, and scanning them would build a permanently
+///    unresolvable `missing_pg` backlog;
+/// 1. ONE bulk MSSQL SELECT over the filtered receipt set;
+/// 2. ONE batched read of the `ht_receipts_legacy` ack cache, plus ONE
+///    batched read of the canonically-voided receipt keys
+///    ([`load_canonically_voided_receipt_keys`]);
+/// 3. per-PK canonical fetch ONLY for receipts whose legacy hash differs
+///    from the acked one, or which hit the canonical-only-void carve-out.
+///
+/// `ReconcileMode::Upsert` is not honoured here: that pre-5.5 escape hatch
+/// mirrored data columns into `ht_*_legacy`, and `ht_receipts_legacy` is a
+/// pure ack cache with no data columns to mirror. The arm is diff-only by
+/// construction.
+async fn sync_payments(
+    legacy_pool: &DbPool,
+    pg_pool: &PgPool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let start = Instant::now();
+    tracing::info!("[Sync] Syncing payments (receipts)...");
+
+    // Canonical coverage floor FIRST. With `ht_payments` empty the arm has
+    // no coverage at all, and scanning legacy would classify the ENTIRE
+    // receipt history as `missing_pg` — permanently unresolvable, since
+    // `payments` is in neither self-heal list. Report a clean zero tick
+    // instead of manufacturing a backlog. See `PAYMENTS_ERA_FLOOR_SQL`.
+    let Some(era_floor) = payments_reconcile_era_floor(pg_pool).await? else {
+        tracing::warn!(
+            "[Sync] sync_payments: ht_payments is empty — no canonical coverage \
+             to reconcile against; skipping the legacy scan this tick"
+        );
+        let duration_ms = start.elapsed().as_millis() as i32;
+        record_success(pg_pool, "payments", 0, 0, 0, duration_ms).await;
+        return Ok(());
+    };
+
+    let mut conn = legacy_pool.get().await?;
+    let select_sql = format!(
+        "SELECT {projection} FROM HT_Receipt_H WHERE {filter} ORDER BY Receipt_no",
+        projection = PAYMENTS_RECONCILE_PROJECTION.join(", "),
+        filter = payments_reconcile_scan_filter(era_floor),
+    );
+    let rows = conn
+        .simple_query(&select_sql)
+        .await?
+        .into_first_result()
+        .await?;
+    // Free the pool slot — nothing below touches MSSQL again.
+    drop(conn);
+
+    let acked = load_receipt_ack_cache(pg_pool).await?;
+    let canonically_voided = load_canonically_voided_receipt_keys(pg_pool).await?;
+
+    let mut added = 0i32;
+    let mut updated = 0i32;
+    let mut unchanged = 0i32;
+    let mut skipped = 0i32;
+
+    for row in &rows {
+        let Some(legacy) = project_legacy_receipt_row(row) else {
+            // Not reconcilable (no business key / no `Receipt_ref`). The
+            // filter above already excludes the ref-less case; this is the
+            // belt-and-braces arm.
+            skipped += 1;
+            continue;
+        };
+        let mssql_hash = legacy.hash();
+
+        // Dedupe: identical hash as last acknowledged means the drift (if
+        // any) is already in `ht_reconcile_log`. This is what keeps the
+        // steady-state cost at one MSSQL query + a few batched PG reads.
+        //
+        // ONE carve-out: a canonical-only void never moves the LEGACY hash,
+        // so an acked receipt would never be re-compared and the money-path
+        // divergence would go unseen forever. Re-open exactly that pair.
+        let void_carve_out = payment_ack_short_circuit_bypassed(
+            canonically_voided.contains(&legacy.receipt_no),
+            legacy.voided(),
+        );
+        if !void_carve_out && acked.get(&legacy.receipt_no) == Some(&mssql_hash) {
+            unchanged += 1;
+            continue;
+        }
+
+        let canonical = fetch_canonical_payment(pg_pool, &legacy.receipt_no).await?;
+        let canonical_hash = canonical.as_ref().map(|c| {
+            payment_canonical_hash(
+                &legacy.receipt_no,
+                c.pay_amount,
+                c.is_voided(),
+                c.legacy_cin_no.as_deref(),
+            )
+        });
+
+        if canonical_hash.as_deref() == Some(mssql_hash.as_str()) {
+            ack_receipt_mirror(pg_pool, &legacy.receipt_no, &mssql_hash).await;
+            unchanged += 1;
+            continue;
+        }
+
+        // Receipts are 1:1 on both sides (`Receipt_no` is unique in the
+        // legacy app, and the canonical probe resolves at most one row),
+        // so the counts are 0/1 by construction and `Cardinality` is not
+        // reachable — the `pg_row_count == 0` case IS the `missing_pg`
+        // path.
+        let legacy_row_count: i32 = 1;
+        let pg_row_count: i32 = if canonical.is_some() { 1 } else { 0 };
+        let kind = classify_divergence(
+            canonical_hash.as_deref(),
+            Some(&mssql_hash),
+            legacy_row_count,
+            pg_row_count,
+        );
+        let pg_json = canonical.as_ref().map(|c| {
+            json!({
+                "pay_amount": c.pay_amount,
+                "pay_voided": c.is_voided(),
+                "legacy_cin_no": c.legacy_cin_no,
+            })
+        });
+        record_divergence(
+            pg_pool,
+            "payments",
+            &legacy.receipt_no,
+            canonical_hash.as_deref(),
+            Some(&mssql_hash),
+            legacy.json(),
+            pg_json,
+            kind,
+            legacy_row_count,
+            pg_row_count,
+        )
+        .await;
+        // Track D / T7 CRIT-1: value drift acks (one row per distinct
+        // legacy state); `missing_pg` never does, so it re-fires every
+        // tick until canonical actually catches up.
+        if kind.is_silenceable() {
+            ack_receipt_mirror(pg_pool, &legacy.receipt_no, &mssql_hash).await;
+        }
+        if canonical.is_none() {
+            added += 1;
+        } else {
+            updated += 1;
+        }
+    }
+
+    if skipped > 0 {
+        tracing::warn!(
+            skipped,
+            "[Sync] sync_payments: {} receipts were not reconcilable \
+             (missing Receipt_no / Receipt_ref despite the scan filter)",
+            skipped,
+        );
+    }
+
+    let duration_ms = start.elapsed().as_millis() as i32;
+    tracing::info!(
+        era_floor = %era_floor,
+        scanned = rows.len(),
+        "[Sync] Payments: {} missing-canonical, {} drifted, {} unchanged in {}ms \
+         (in-era scan from {})",
+        added,
+        updated,
+        unchanged,
+        duration_ms,
+        era_floor,
+    );
+    record_success(pg_pool, "payments", added, updated, unchanged, duration_ms).await;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     //! Pure unit tests for the Phase 5.5 mode-parsing logic. The
@@ -7859,6 +8601,288 @@ mod tests {
             OLD_ENOUGH_SECS,
             true,
         ));
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 6-A — payments reconcile arm (DARK). Pure tests only; the
+    // MSSQL/PG halves are pinned by shape guards + the descriptor-table
+    // golden vector in `sync::mappers::payment`.
+    // -------------------------------------------------------------------
+
+    /// Ships DARK. The default MUST be off on every service, and the
+    /// literal comparison is strict — `"TRUE"` / `"1"` / `" true"` are all
+    /// off, matching every other flag in the sync path.
+    #[test]
+    fn payments_arm_flag_defaults_off_and_is_strict() {
+        assert!(
+            !with_env_vars(&[("RECONCILE_PAYMENTS_ARM_ENABLED", None)], || {
+                reconcile_payments_arm_enabled()
+            }),
+            "the payments arm must default OFF — enabling is a coordinated action"
+        );
+        assert!(with_env_vars(
+            &[("RECONCILE_PAYMENTS_ARM_ENABLED", Some("true"))],
+            || { reconcile_payments_arm_enabled() }
+        ));
+        for sloppy in ["TRUE", "1", "yes", " true", "True"] {
+            assert!(
+                !with_env_vars(
+                    &[("RECONCILE_PAYMENTS_ARM_ENABLED", Some(sloppy))],
+                    || { reconcile_payments_arm_enabled() }
+                ),
+                "`{sloppy}` must NOT enable the arm"
+            );
+        }
+    }
+
+    /// The arm ships detection-only. Wiring it into either self-heal list
+    /// is a separate, coordinated decision (plan 6-D) — and one of its
+    /// divergence shapes (canonical-only void) would be ERASED rather than
+    /// repaired by re-driving the legacy row.
+    #[test]
+    fn payments_is_not_wired_into_either_self_heal_arm() {
+        assert!(
+            !FORCE_CONVERGE_VALUE_DRIFT_TABLES.contains(&"payments"),
+            "payments detection must soak before any force-converge is wired"
+        );
+        assert!(
+            !REINGEST_MISSING_PG_TABLES.contains(&"payments"),
+            "payments must not be re-ingested by the missing_pg arm"
+        );
+        // …and the pure gates agree, even with the self-heal flags ON.
+        assert!(!force_converge_value_drift_eligible(
+            "payments",
+            Some(LEGACY_HASH),
+            Some(PG_HASH),
+            OLD_ENOUGH_SECS,
+            true,
+        ));
+        assert!(!reingest_missing_pg_eligible(
+            "payments",
+            Some(LEGACY_HASH),
+            None,
+            OLD_ENOUGH_SECS,
+            true,
+        ));
+    }
+
+    /// A payment's canonical parent is its check-in, so the sweep must
+    /// heal check-ins BEFORE payments within a batch (`apply_receipt_upsert`
+    /// ERRORS on an unresolvable parent).
+    #[test]
+    fn payments_rank_after_their_parent_checkin() {
+        assert!(reconcile_table_fk_rank("checkins") < reconcile_table_fk_rank("payments"));
+        assert!(reconcile_table_fk_rank("payments") < reconcile_table_fk_rank("something_new"));
+    }
+
+    /// Hash-body pin at the scheduler boundary (the mapper-side descriptor
+    /// carries the byte-for-byte golden vector). Both sides of the arm call
+    /// THIS function, so a converged receipt must hash identically whether
+    /// projected from `HT_Receipt_H` or from `ht_payments`.
+    #[test]
+    fn payment_canonical_hash_matches_when_canonical_mirrors_legacy() {
+        let legacy = LegacyReceiptRow {
+            receipt_no: "B2604-0265".into(),
+            receipt_total: 890.0,
+            legacy_cin_no: Some("CH26-005228".into()),
+            status_name: Some("ปกติ".into()),
+        };
+        let canonical = CanonicalPaymentRow {
+            pay_amount: 890.0,
+            pay_voided: Some(false),
+            legacy_cin_no: Some("CH26-005228".into()),
+        };
+        assert_eq!(
+            legacy.hash(),
+            payment_canonical_hash(
+                &legacy.receipt_no,
+                canonical.pay_amount,
+                canonical.is_voided(),
+                canonical.legacy_cin_no.as_deref(),
+            ),
+        );
+    }
+
+    /// NULL `pay_voided` (the column is nullable, `DEFAULT false`) must
+    /// read as NOT voided — the same `COALESCE(pay_voided, false)` the
+    /// mapper's UPDATE and every money reader use. Treating NULL as
+    /// "unknown" here would manufacture drift on every pre-void row.
+    #[test]
+    fn canonical_null_pay_voided_hashes_as_not_voided() {
+        let null_voided = CanonicalPaymentRow {
+            pay_amount: 500.0,
+            pay_voided: None,
+            legacy_cin_no: Some("CH26-000001".into()),
+        };
+        let explicit_false = CanonicalPaymentRow {
+            pay_amount: 500.0,
+            pay_voided: Some(false),
+            legacy_cin_no: Some("CH26-000001".into()),
+        };
+        assert_eq!(null_voided.is_voided(), explicit_false.is_voided());
+    }
+
+    /// The void bit is a real hash input: a legacy cancel that canonical
+    /// hasn't applied MUST diverge, and vice versa. This is the arm's whole
+    /// reason for existing on the money path.
+    #[test]
+    fn payment_canonical_hash_diverges_on_void_state() {
+        let normal = payment_canonical_hash("B1", 890.0, false, Some("CH1"));
+        let voided = payment_canonical_hash("B1", 890.0, true, Some("CH1"));
+        assert_ne!(normal, voided);
+    }
+
+    /// Amount drift is hashed at 2dp — legacy `Receipt_Total` is a bare
+    /// `float`, canonical `pay_amount` a `DECIMAL(12,2)`, so float noise
+    /// below the satang must NOT diverge while a real satang difference
+    /// must.
+    #[test]
+    fn payment_amount_segment_is_two_decimals_and_zero_is_signless() {
+        assert_eq!(
+            payment_canonical_hash("B1", 890.0, false, None),
+            payment_canonical_hash("B1", 890.000000001, false, None),
+            "float noise below 2dp must not manufacture drift"
+        );
+        assert_ne!(
+            payment_canonical_hash("B1", 890.00, false, None),
+            payment_canonical_hash("B1", 890.01, false, None),
+            "a one-satang difference is real drift"
+        );
+        // IEEE -0.0 renders as "-0.00" without normalisation, which would
+        // make a zero-total receipt permanently unconvergeable.
+        assert_eq!(money_hash_segment(-0.0), "0.00");
+        assert_eq!(money_hash_segment(0.0), "0.00");
+    }
+
+    /// `Receipt_ref` carries the parent `Cin_no`; a re-pointed receipt is
+    /// real drift (iHOTEL's customer-delete cascade touches this family).
+    #[test]
+    fn payment_canonical_hash_diverges_on_parent_checkin() {
+        assert_ne!(
+            payment_canonical_hash("B1", 890.0, false, Some("CH26-000001")),
+            payment_canonical_hash("B1", 890.0, false, Some("CH26-000002")),
+        );
+        // A canonical payment whose parent check-in row has vanished
+        // (LEFT JOIN → None) must not hash like one that is correctly
+        // parented.
+        assert_ne!(
+            payment_canonical_hash("B1", 890.0, false, Some("CH26-000001")),
+            payment_canonical_hash("B1", 890.0, false, None),
+        );
+    }
+
+    /// SQL-shape pin for the canonical probe. It MUST mirror
+    /// `payment::apply_receipt_upsert`'s existing-row lookup: probing only
+    /// `pay_reference` would report every app-originated payment as
+    /// `missing_pg` forever (the detection-side form of the 2026-06-30
+    /// HF Ville phantom-duplicate echo).
+    #[test]
+    fn canonical_payment_probe_matches_the_mapper_lookup_shape() {
+        // Pins the EXACT statement `fetch_canonical_payment` executes.
+        let sql = CANONICAL_PAYMENT_PROBE_SQL;
+        assert!(sql.contains("p.legacy_receipt_no = $1 OR p.pay_reference = $1"));
+        assert!(sql.contains("ORDER BY (p.legacy_receipt_no = $1) DESC NULLS LAST"));
+        assert!(
+            sql.contains("LEFT JOIN ht_checkins"),
+            "an INNER JOIN would misreport a parentless payment as missing_pg"
+        );
+    }
+
+    /// Scan-filter pin: no-check-in receipts are a DELIBERATE mapper skip
+    /// (`ht_payments.pay_cin_id` is NOT NULL), so including them would
+    /// manufacture one permanent `missing_pg` row per counter sale.
+    #[test]
+    fn payments_scan_filter_excludes_receipts_without_a_checkin_ref() {
+        assert_eq!(
+            PAYMENTS_RECONCILE_SCAN_FILTER,
+            "Receipt_ref IS NOT NULL AND Receipt_ref <> ''"
+        );
+    }
+
+    /// The BLOCKING find of the 2026-07-28 review: without a canonical-era
+    /// floor the arm hashes 21,566 HF Hotel receipts against 1,154 canonical
+    /// payments, manufacturing >20k `missing_pg` rows that can NEVER close
+    /// (not silenceable, not re-ingestable) and starving the auto-resolve
+    /// sweep. The composed filter must carry the floor.
+    #[test]
+    fn payments_scan_filter_is_floored_at_the_canonical_era() {
+        let floor = chrono::NaiveDate::from_ymd_opt(2026, 4, 27)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let filter = payments_reconcile_scan_filter(floor);
+        assert!(
+            filter.starts_with(PAYMENTS_RECONCILE_SCAN_FILTER),
+            "the era floor must NARROW the ref filter, not replace it: {filter}"
+        );
+        assert!(
+            filter.contains("Receipt_Date >= '2026-04-27T00:00:00'"),
+            "floor literal must be the language-independent ODBC/ISO form: {filter}"
+        );
+        assert!(
+            filter.contains("Receipt_Date IS NULL OR"),
+            "a dateless receipt cannot be placed in or out of the era and the \
+             mapper would still land it — dropping it re-creates a silent skip"
+        );
+    }
+
+    /// The floor is DERIVED from canonical coverage and compared against
+    /// `Receipt_Date` with NO timezone shift, because `ht_payments.pay_date`
+    /// already holds the legacy value verbatim (`project_receipt` does a plain
+    /// `try_get_datetime("Receipt_Date")`; the upsert's fallback is Bangkok
+    /// wall-clock on purpose). `naive_thai_to_utc` applies to a different
+    /// column (`Cin_Pay_Date` → `ledger_pay_date`, TIMESTAMPTZ) — conflating
+    /// them once put a `+ INTERVAL '7 hours'` here, which moved the floor in
+    /// the NARROWING direction and could drop the mirror's entire first day.
+    /// The day truncation IS load-bearing: without it the floor cuts
+    /// mid-afternoon on the mirror's very first day.
+    #[test]
+    fn payments_era_floor_sql_is_canonical_derived_and_unshifted() {
+        assert!(PAYMENTS_ERA_FLOOR_SQL.contains("MIN(pay_date)"));
+        assert!(PAYMENTS_ERA_FLOOR_SQL.contains("FROM ht_payments"));
+        assert!(
+            !PAYMENTS_ERA_FLOOR_SQL.contains("INTERVAL"),
+            "pay_date is already the legacy naive-Thai value verbatim — any \
+             offset here narrows the floor and silently drops in-era receipts"
+        );
+        assert!(
+            PAYMENTS_ERA_FLOOR_SQL.contains("date_trunc('day'"),
+            "widen to the start of the day so the mirror's first day is fully covered"
+        );
+    }
+
+    /// A canonical-only void never moves the LEGACY hash, so the ack
+    /// short-circuit would hide it forever once a receipt is acked. The
+    /// carve-out re-opens exactly that pair — and nothing else, because every
+    /// other transition does move the legacy hash.
+    #[test]
+    fn ack_short_circuit_bypassed_only_for_canonical_only_void() {
+        assert!(
+            payment_ack_short_circuit_bypassed(true, false),
+            "canonical voided + legacy normal is the one shape the legacy hash \
+             cannot express — it must bypass the ack"
+        );
+        assert!(
+            !payment_ack_short_circuit_bypassed(false, true),
+            "a legacy cancel already moves the legacy hash; no bypass needed"
+        );
+        assert!(!payment_ack_short_circuit_bypassed(false, false));
+        assert!(
+            !payment_ack_short_circuit_bypassed(true, true),
+            "both sides voided means the hashes agree — bypassing would only \
+             buy a wasted canonical probe every tick"
+        );
+    }
+
+    /// Track J1 — projection lock. `Receipt_Date` / VAT columns must stay
+    /// OUT (see `payment_canonical_hash` on why `pay_date` is excluded).
+    #[test]
+    fn payments_reconcile_projection_is_subset_of_legacy_schema() {
+        crate::assert_projection_slice_subset!(PAYMENTS_RECONCILE_PROJECTION, "HT_Receipt_H");
+        assert!(
+            !PAYMENTS_RECONCILE_PROJECTION.contains(&"Receipt_Date"),
+            "pay_date is COALESCE-preserved for app rows — hashing it is permanent false drift"
+        );
     }
 
     // -------------------------------------------------------------------
