@@ -68,7 +68,7 @@
 //! the `|` separator, and each entity pins its bytes with a golden
 //! vector built from the literal format string it replaced.
 
-use crate::sync::mappers::{booking, checkin, customer, payment, room};
+use crate::sync::mappers::{booking, checkin, customer, guest_registry, payment, room};
 
 /// The separator between hashed field segments.
 ///
@@ -319,6 +319,15 @@ pub fn reconcile_entity_contracts() -> Vec<EntityContract> {
             gate_field_names: payment::gate_field_names,
             always_writes: true,
         },
+        EntityContract {
+            entity: "guest_registry",
+            hash_inputs: guest_registry::hash_input_contract,
+            // The companion mapper adopts-or-UPSERTs unconditionally
+            // (`ON CONFLICT (guest_legacy_id) DO UPDATE` rewriting every
+            // mirrored column) — no `existing_matches` chain.
+            gate_field_names: guest_registry::gate_field_names,
+            always_writes: true,
+        },
     ]
 }
 
@@ -463,6 +472,35 @@ mod tests {
         assert!(
             !(payments.hash_inputs)().is_empty(),
             "payments is hashed by the reconcile sweep — its descriptor \
+             table must stay populated so the golden-vector pin holds"
+        );
+    }
+
+    /// `HT_CheckIn_Other_People` is the third gate-less mapper: the
+    /// companion apply runs its echo-adoption UPDATE and then an
+    /// `INSERT … ON CONFLICT (guest_legacy_id) DO UPDATE` that rewrites
+    /// every mirrored column unconditionally. Stated explicitly, same as
+    /// rooms and payments, so adding a gate there forces this flag — and
+    /// therefore the real enforcement — to be revisited.
+    #[test]
+    fn guest_registry_contract_declares_always_writes() {
+        let contracts = reconcile_entity_contracts();
+        let registry = contracts
+            .iter()
+            .find(|c| c.entity == "guest_registry")
+            .expect("guest_registry contract must be registered");
+        assert!(
+            registry.always_writes,
+            "the companion mapper UPSERTs unconditionally — the contract must \
+             declare always_writes"
+        );
+        assert!(
+            (registry.gate_field_names)().is_empty(),
+            "always_writes entities must expose no gate terms"
+        );
+        assert!(
+            !(registry.hash_inputs)().is_empty(),
+            "guest_registry is hashed by the reconcile sweep — its descriptor \
              table must stay populated so the golden-vector pin holds"
         );
     }

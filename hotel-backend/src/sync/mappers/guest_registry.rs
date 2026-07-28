@@ -60,6 +60,7 @@ use async_trait::async_trait;
 
 use crate::outbox::event::DomainEvent;
 use crate::sync::change_op::ChangeOp;
+use crate::sync::gate_guard::{self, HashInput, HashInputContract};
 use crate::sync::mapper::MssqlChangeMapper;
 use crate::sync::row::MappableRow;
 use crate::sync::SyncError;
@@ -74,6 +75,39 @@ const TABLE: &str = "HT_CheckIn_Other_People";
 /// can pin every column against the baseline schema dump.
 const GUEST_REGISTRY_SELECT_COLS: &str = "t.id, t.Cin_no, t.Cin_name, t.Cin_contry";
 
+/// The canonical re-concatenation of a companion's display name:
+/// `first [+ ' ' + last]`, space-trimmed.
+///
+/// Canonical `ht_guest_registry` splits the name across two columns while
+/// legacy `HT_CheckIn_Other_People.Cin_name` is ONE free-text field, so
+/// every canonical-vs-legacy name comparison has to rebuild the legacy
+/// shape. Kept as a macro (expanding to a string literal) so BOTH readers
+/// are the SAME BYTES at compile time rather than by convention:
+///
+/// * [`ADOPT_UNSTAMPED_COMPANION_SQL`] — the echo-adoption match below;
+/// * `scheduler::sync::canonical_registry_folio_sql` — the Phase 6-B
+///   `guest_registry` reconcile arm's canonical projection.
+///
+/// If those two ever disagreed, a companion our app created and the
+/// writeback echoed back would be adopted by the mapper (no duplicate) but
+/// hash differently in the reconcile arm — permanent, unfixable sync lag on
+/// a legally-load-bearing table (TM.30).
+///
+/// `TRIM(BOTH FROM …)` is PostgreSQL's default trim: SPACES only, not the
+/// broader Unicode-whitespace set. The reconcile arm's legacy side matches
+/// that exactly (`trim_matches(' ')`).
+macro_rules! canonical_companion_name_sql {
+    () => {
+        "TRIM(BOTH FROM guest_firstname || CASE \
+         WHEN COALESCE(guest_lastname, '') = '' THEN '' \
+         ELSE ' ' || guest_lastname END)"
+    };
+}
+
+/// Non-macro handle on [`canonical_companion_name_sql!`] for callers that
+/// just need to interpolate the expression into a larger statement.
+pub(crate) const CANONICAL_COMPANION_NAME_SQL: &str = canonical_companion_name_sql!();
+
 /// Echo-adoption UPDATE (convergent companion mirror, 2026-07-01 echo-loop
 /// fix). When OUR app added a companion, the delta writeback INSERTed the
 /// legacy row VERBATIM and the worker back-populates the captured IDENTITY
@@ -86,16 +120,189 @@ const GUEST_REGISTRY_SELECT_COLS: &str = "t.id, t.Cin_no, t.Cin_name, t.Cin_cont
 /// verbatim). Primary rows never match (`guest_is_primary = false`) — the
 /// primary's legacy row is owned by the check-in writeback and its canonical
 /// row must never be stamped with a companion id.
-const ADOPT_UNSTAMPED_COMPANION_SQL: &str = "UPDATE ht_guest_registry SET guest_legacy_id = $1 \
+const ADOPT_UNSTAMPED_COMPANION_SQL: &str = concat!(
+    "UPDATE ht_guest_registry SET guest_legacy_id = $1 \
      WHERE guest_id = ( \
         SELECT guest_id FROM ht_guest_registry \
         WHERE guest_cin_id = $2 AND guest_legacy_id IS NULL \
           AND guest_is_primary = false \
-          AND TRIM(BOTH FROM guest_firstname || CASE \
-                WHEN COALESCE(guest_lastname, '') = '' THEN '' \
-                ELSE ' ' || guest_lastname END) = $3 \
+          AND ",
+    canonical_companion_name_sql!(),
+    " = $3 \
           AND COALESCE(guest_nationality, '') = COALESCE($4, '') \
-        ORDER BY guest_id LIMIT 1)";
+        ORDER BY guest_id LIMIT 1)"
+);
+
+// =============================================================================
+// Reconcile-hash contract — see `crate::sync::gate_guard` (Phase 6-B)
+// =============================================================================
+
+/// One companion as hashed by the `guest_registry` reconcile arm: the
+/// display name and the country, and NOTHING else.
+///
+/// **Ids are deliberately absent.** iHOTEL edits companions by
+/// DELETE-then-REINSERT (`FrmCheckIn.cs:9975`), so every edit mints a fresh
+/// `HT_CheckIn_Other_People.id` — and the canonical mirror faithfully
+/// follows, minting a fresh `guest_id` too. Hashing either id would report
+/// a divergence on every companion edit that both sides had already applied
+/// correctly: a false positive per edit, forever.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CompanionEntry {
+    /// Legacy `Cin_name` / canonical `first [+ ' ' + last]`, space-trimmed
+    /// on BOTH sides — see [`canonical_companion_name_sql!`].
+    pub(crate) name: String,
+    /// Legacy `Cin_contry` (sic) / canonical `guest_nationality`, with NULL
+    /// collapsed to the empty string exactly as
+    /// [`ADOPT_UNSTAMPED_COMPANION_SQL`] collapses it. NOT trimmed —
+    /// that matches the adoption match, which COALESCEs but never trims.
+    pub(crate) country: String,
+}
+
+impl CompanionEntry {
+    /// This companion's hashed line: `"{name}|{country}"`.
+    fn line(&self) -> String {
+        format!("{}|{}", self.name, self.country)
+    }
+}
+
+/// One check-in's companion FOLIO — the unit of reconciliation for Phase
+/// 6-B.
+///
+/// **Why the folio and not the row.** The obvious per-row arm (key on
+/// `HT_CheckIn_Other_People.id`) would fire on every legacy edit: the
+/// DELETE+REINSERT pattern retires the old id and the reconcile row keyed
+/// on it can never converge, while the reinserted id shows up as a brand
+/// new `missing_pg`. Reconciling the SET of companions attached to a
+/// `Cin_no` is invariant under that churn — it changes only when the
+/// companion CONTENT changes, which is the thing we actually care about
+/// (TM.30 immigration reporting under-counting).
+///
+/// Built by both sides of the arm — legacy rows grouped by `Cin_no`,
+/// canonical rows grouped by `ht_checkins.legacy_cin_no` — so the two
+/// projections are literally the same type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RegistryFolioProjection {
+    /// Legacy `Cin_no`, i.e. `ht_reconcile_log.legacy_pk` for this entity.
+    pub(crate) legacy_cin_no: String,
+    /// Unordered; [`Self::companion_lines`] imposes the canonical order.
+    pub(crate) companions: Vec<CompanionEntry>,
+}
+
+impl RegistryFolioProjection {
+    /// An empty folio — a check-in with no companions. A legitimate state
+    /// on BOTH sides (and the state most check-ins are in), NOT an "absent
+    /// row": empty-vs-empty is convergence, and the arm relies on that to
+    /// let a folio whose companions were legitimately deleted everywhere
+    /// auto-resolve instead of sitting open forever.
+    pub(crate) fn empty(legacy_cin_no: impl Into<String>) -> Self {
+        Self {
+            legacy_cin_no: legacy_cin_no.into(),
+            companions: Vec::new(),
+        }
+    }
+
+    /// Add one companion, normalising both fields the way the canonical
+    /// SQL projection does (space-trim the name, NULL country → `""`).
+    /// Applying it on the legacy side too is what keeps the comparison
+    /// SYMMETRIC — canonical is trimmed by `TRIM(BOTH FROM …)`, so an
+    /// untrimmed legacy `Cin_name` would otherwise diverge permanently.
+    pub(crate) fn push_companion(&mut self, name: &str, country: Option<&str>) {
+        self.companions.push(CompanionEntry {
+            // PostgreSQL's `TRIM(BOTH FROM …)` trims SPACES only — `.trim()`
+            // would also eat tabs/newlines and the two sides would disagree.
+            name: name.trim_matches(' ').to_string(),
+            country: country.unwrap_or_default().to_string(),
+        });
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.companions.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.companions.len()
+    }
+
+    /// The hashed lines in canonical order: `"{name}|{country}"`, sorted.
+    ///
+    /// Sorting happens HERE, in Rust, on the UTF-8 bytes — never via a SQL
+    /// `ORDER BY`, whose result depends on the server's collation and would
+    /// therefore differ between the PG and MSSQL sides (and between the two
+    /// sites). Legacy stores no ordering for companions anyway, so the set —
+    /// not the sequence — is the meaningful comparison.
+    pub(crate) fn companion_lines(&self) -> Vec<String> {
+        let mut lines: Vec<String> = self.companions.iter().map(CompanionEntry::line).collect();
+        lines.sort();
+        lines
+    }
+
+    /// The folio's contribution to the reconcile hash: sorted companion
+    /// lines joined by `\n`.
+    ///
+    /// A newline (not the `|` of [`gate_guard::join_hash_segments`])
+    /// because each LINE already contains a `|` separating name from
+    /// country; reusing `|` at both levels would make `("a|b", "c")` and
+    /// `("a", "b|c")` hash alike. Neither field can contain a newline —
+    /// both are single-line form inputs in iHOTEL and in our check-in UI.
+    pub(crate) fn companions_segment(&self) -> String {
+        self.companion_lines().join("\n")
+    }
+}
+
+/// The inputs `scheduler::sync::guest_registry_canonical_hash` consumes.
+///
+/// **`HT_CheckIn_Other_People` has NO idempotency gate**: the mapper's I/U
+/// branch runs `ADOPT_UNSTAMPED_COMPANION_SQL` and then an
+/// `INSERT … ON CONFLICT (guest_legacy_id) DO UPDATE` that rewrites every
+/// mirrored column unconditionally — there is no `existing_matches` chain
+/// that could skip a hashed change. The contract therefore declares
+/// `always_writes: true` and every `gated_by` is empty, exactly like
+/// `rooms` and `payments`.
+///
+/// The `id` columns on both sides are excluded ON PURPOSE — see
+/// [`CompanionEntry`].
+const HASH_INPUTS: [HashInput<RegistryFolioProjection>; 2] = [
+    HashInput {
+        name: "legacy_cin_no",
+        // Row identity: the folio IS the check-in, and both sides resolve
+        // their companion set BY this value. A different `Cin_no` is a
+        // different folio, never a comparison.
+        gated_by: &[],
+        segmented: true,
+        lookup_key: true,
+        segment: |f| f.legacy_cin_no.clone(),
+        mutate: |f| f.legacy_cin_no = "CH26-009999".into(),
+    },
+    HashInput {
+        name: "companions",
+        gated_by: &[],
+        segmented: true,
+        lookup_key: false,
+        segment: |f| f.companions_segment(),
+        mutate: |f| f.push_companion("Somsak Extra", Some("TH")),
+    },
+];
+
+/// Name-level hash contract, for
+/// [`crate::sync::gate_guard::reconcile_entity_contracts`].
+pub(crate) fn hash_input_contract() -> Vec<HashInputContract> {
+    gate_guard::hash_input_contracts(&HASH_INPUTS)
+}
+
+/// No gate exists — see [`HASH_INPUTS`]. Returns empty, and the contract
+/// declares `always_writes: true` so that emptiness is a stated fact rather
+/// than a silently vacuous check.
+pub(crate) fn gate_field_names() -> Vec<&'static str> {
+    Vec::new()
+}
+
+/// Render the `guest_registry` reconcile-hash body from [`HASH_INPUTS`].
+/// Test-only — the production hash is
+/// `scheduler::sync::guest_registry_canonical_hash`.
+#[cfg(test)]
+fn hash_body(f: &RegistryFolioProjection) -> String {
+    gate_guard::hash_body(&HASH_INPUTS, f)
+}
 
 pub struct GuestRegistryMapper;
 
@@ -325,5 +532,183 @@ mod tests {
         );
         // Deterministic single-row adoption.
         assert!(sql.contains("ORDER BY guest_id LIMIT 1"), "{sql}");
+    }
+
+    // ----- reconcile-hash contract (see `crate::sync::gate_guard`) -------
+
+    fn folio(cin_no: &str, companions: &[(&str, Option<&str>)]) -> RegistryFolioProjection {
+        let mut f = RegistryFolioProjection::empty(cin_no);
+        for (name, country) in companions {
+            f.push_companion(name, *country);
+        }
+        f
+    }
+
+    /// The adoption match and the reconcile arm's canonical projection MUST
+    /// rebuild the legacy name the same way. Compile-time single-sourced via
+    /// `canonical_companion_name_sql!`; this pins that the adoption SQL still
+    /// carries those exact bytes, so a "tidy-up" of either cannot silently
+    /// split them.
+    #[test]
+    fn adoption_sql_uses_the_shared_canonical_name_expression() {
+        assert!(
+            ADOPT_UNSTAMPED_COMPANION_SQL.contains(CANONICAL_COMPANION_NAME_SQL),
+            "adoption SQL no longer contains the shared name expression:\n{}\n{}",
+            ADOPT_UNSTAMPED_COMPANION_SQL,
+            CANONICAL_COMPANION_NAME_SQL,
+        );
+        // The bytes themselves, so a reformat of the macro is a visible
+        // decision (the reconcile arm interpolates this into its SELECT).
+        assert_eq!(
+            CANONICAL_COMPANION_NAME_SQL,
+            "TRIM(BOTH FROM guest_firstname || CASE WHEN COALESCE(guest_lastname, '') = '' \
+             THEN '' ELSE ' ' || guest_lastname END)"
+        );
+    }
+
+    /// Byte-parity pin for the NEW `guest_registry` descriptor (Phase 6-B).
+    /// `ht_reconcile_log.mssql_hash` and `ht_guest_registry_legacy.sync_hash`
+    /// are stored SHA256s of this exact body — one byte of drift invalidates
+    /// every ack and triggers a full re-diff storm.
+    ///
+    /// No behavioural gate-mutation test, same reason as rooms/payments:
+    /// this mapper has no idempotency gate to defeat (`always_writes: true`).
+    #[test]
+    fn guest_registry_hash_bytes_unchanged_for_golden_inputs() {
+        use crate::scheduler::sync::{guest_registry_canonical_hash, sha256};
+
+        let f = folio(
+            "CH26-005228",
+            &[("Somchai Jaidee", Some("TH")), ("Somsri Kaew", None)],
+        );
+
+        // Body shape: cin_no | sorted "name|country" lines joined by \n.
+        let expected = sha256("CH26-005228|Somchai Jaidee|TH\nSomsri Kaew|");
+
+        assert_eq!(
+            guest_registry_canonical_hash(&f),
+            expected,
+            "production guest-registry folio hash changed bytes"
+        );
+        assert_eq!(
+            sha256(&hash_body(&f)),
+            expected,
+            "HASH_INPUTS join no longer reproduces the production hash body"
+        );
+    }
+
+    /// An empty folio is a real, hashable state — a check-in with no
+    /// companions. Both sides must produce the SAME bytes for it, or a
+    /// folio whose companions were legitimately deleted everywhere could
+    /// never converge.
+    #[test]
+    fn empty_folio_hashes_to_a_stable_value_on_both_sides() {
+        use crate::scheduler::sync::{guest_registry_canonical_hash, sha256};
+
+        let empty = RegistryFolioProjection::empty("CH26-005228");
+        assert!(empty.is_empty());
+        assert_eq!(
+            guest_registry_canonical_hash(&empty),
+            sha256("CH26-005228|"),
+            "the empty folio's body is the key plus an empty companion segment"
+        );
+        assert_ne!(
+            guest_registry_canonical_hash(&empty),
+            guest_registry_canonical_hash(&folio("CH26-005228", &[("Somchai", None)])),
+            "an empty folio must not hash like a populated one"
+        );
+    }
+
+    /// Legacy stores no ordering for companions and iHOTEL rewrites the
+    /// whole set on edit, so the SAME set inserted in a different order
+    /// MUST hash identically — otherwise every DELETE+reinsert edit is a
+    /// false positive.
+    #[test]
+    fn companion_order_does_not_affect_the_folio_hash() {
+        use crate::scheduler::sync::guest_registry_canonical_hash;
+
+        let a = folio(
+            "CH26-005228",
+            &[("Somchai", Some("TH")), ("Anong", Some("LA"))],
+        );
+        let b = folio(
+            "CH26-005228",
+            &[("Anong", Some("LA")), ("Somchai", Some("TH"))],
+        );
+        assert_eq!(
+            guest_registry_canonical_hash(&a),
+            guest_registry_canonical_hash(&b)
+        );
+    }
+
+    /// Duplicate companions are NOT collapsed: two guests with the same
+    /// name in one room is a real (if uncommon) folio, and iHOTEL stores
+    /// two rows for it. Collapsing them would hide a dropped CT delete.
+    #[test]
+    fn duplicate_companions_are_kept_distinct() {
+        use crate::scheduler::sync::guest_registry_canonical_hash;
+
+        let one = folio("CH26-005228", &[("Somchai", Some("TH"))]);
+        let two = folio(
+            "CH26-005228",
+            &[("Somchai", Some("TH")), ("Somchai", Some("TH"))],
+        );
+        assert_eq!(two.len(), 2);
+        assert_ne!(
+            guest_registry_canonical_hash(&one),
+            guest_registry_canonical_hash(&two)
+        );
+    }
+
+    /// The canonical side is trimmed by `TRIM(BOTH FROM …)` (SPACES only),
+    /// so the legacy side must normalise identically — otherwise a padded
+    /// `Cin_name` diverges permanently with nothing to fix. A tab is NOT
+    /// trimmed, because PostgreSQL's default `TRIM` does not trim it either.
+    #[test]
+    fn companion_name_is_space_trimmed_exactly_like_postgres_trim() {
+        use crate::scheduler::sync::guest_registry_canonical_hash;
+
+        assert_eq!(
+            guest_registry_canonical_hash(&folio("CH1", &[("  Somchai  ", None)])),
+            guest_registry_canonical_hash(&folio("CH1", &[("Somchai", None)])),
+        );
+        assert_ne!(
+            guest_registry_canonical_hash(&folio("CH1", &[("\tSomchai", None)])),
+            guest_registry_canonical_hash(&folio("CH1", &[("Somchai", None)])),
+            "PostgreSQL TRIM(BOTH FROM …) leaves a tab in place — so must we"
+        );
+    }
+
+    /// NULL country and empty-string country are the SAME state: the
+    /// adoption match COALESCEs both sides to `''` and the canonical
+    /// projection does too. Live evidence 2026-07-28: 20,423 of 20,434
+    /// legacy companion rows carry an empty `Cin_contry`.
+    #[test]
+    fn null_and_empty_country_are_the_same_folio() {
+        use crate::scheduler::sync::guest_registry_canonical_hash;
+
+        assert_eq!(
+            guest_registry_canonical_hash(&folio("CH1", &[("Somchai", None)])),
+            guest_registry_canonical_hash(&folio("CH1", &[("Somchai", Some(""))])),
+        );
+    }
+
+    /// Self-validating mutators: each descriptor entry must actually move
+    /// its own segment, else a future behavioural test built on this table
+    /// would pass vacuously.
+    #[test]
+    fn guest_registry_hash_mutators_all_move_their_segment() {
+        let base = folio("CH26-005228", &[("Somchai Jaidee", Some("TH"))]);
+        for input in HASH_INPUTS.iter() {
+            let before = (input.segment)(&base);
+            let mut mutated = base.clone();
+            (input.mutate)(&mut mutated);
+            let after = (input.segment)(&mutated);
+            assert_ne!(
+                before, after,
+                "hash input `{}`: mutator did not move the hashed segment",
+                input.name,
+            );
+        }
     }
 }

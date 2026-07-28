@@ -30,6 +30,12 @@
 //! 5. Payments: `HT_Receipt_H`    vs canonical `ht_payments`    (JOIN `legacy_receipt_no`
 //!    / `pay_reference`) — Phase 6-A, keyed on `Receipt_no`, and **DARK by
 //!    default**: it runs only when `RECONCILE_PAYMENTS_ARM_ENABLED=true`.
+//! 6. Guest registry: `HT_CheckIn_Other_People` vs canonical
+//!    `ht_guest_registry` (JOIN `ht_checkins.legacy_cin_no`) — Phase 6-B,
+//!    keyed on `Cin_no` and reconciled per FOLIO (the whole companion set of
+//!    one check-in), not per row: legacy edits are DELETE+reinsert with id
+//!    churn. Also **DARK by default**:
+//!    `RECONCILE_GUEST_REGISTRY_ARM_ENABLED=true`.
 //!
 //! Pre-v2.63.0 this job compared MSSQL hashes against `ht_*_legacy.sync_hash`
 //! (the demoted mirror tables). After the 2026-04-28 cutover those mirrors
@@ -65,6 +71,13 @@ use crate::sync::change_op::ChangeOp;
 // tables that pin the gate ⊇ reconcile-hash invariant.
 use crate::sync::gate_guard::join_hash_segments;
 use crate::sync::mapper::MssqlChangeMapper;
+// Phase 6-B: the companion-folio projection is shared with the CT mapper so
+// the reconcile arm and the mapper cannot disagree about what a folio is,
+// and the canonical name re-concatenation is the SAME bytes the mapper's
+// echo-adoption match uses.
+use crate::sync::mappers::guest_registry::{
+    RegistryFolioProjection, CANONICAL_COMPANION_NAME_SQL,
+};
 use crate::sync::mappers::{CustomerMapper, RoomMasterMapper};
 use crate::sync::row::MappableRow;
 
@@ -246,6 +259,20 @@ pub async fn run_sync(
         if let Err(e) = sync_payments(legacy_pool, pg_pool).await {
             tracing::error!(site = %site_id, "[Sync] Payment sync failed: {}", e);
             record_error(pg_pool, "payments", &e.to_string()).await;
+        }
+    }
+
+    // Phase 6-B: guest registry / companion folios (`HT_CheckIn_Other_People`
+    // ↔ `ht_guest_registry`). SHIPPED DARK —
+    // `RECONCILE_GUEST_REGISTRY_ARM_ENABLED` defaults false on every service,
+    // and the check lives HERE (not inside `sync_guest_registry`) so a
+    // disabled arm issues literally zero MSSQL/PG queries. Runs AFTER
+    // check-ins for the same reason payments does: the parent is
+    // `ht_checkins`. See `reconcile_guest_registry_arm_enabled`.
+    if reconcile_guest_registry_arm_enabled() {
+        if let Err(e) = sync_guest_registry(legacy_pool, pg_pool, slack, site_id).await {
+            tracing::error!(site = %site_id, "[Sync] Guest-registry sync failed: {}", e);
+            record_error(pg_pool, "guest_registry", &e.to_string()).await;
         }
     }
 
@@ -486,6 +513,20 @@ pub fn escalated_cooldown_key(table: &str) -> String {
 /// [`escalated_cooldown_key`].
 pub fn burst_cooldown_key(table: &str) -> String {
     format!("burst{COOLDOWN_KEY_NAMESPACE_SEP}{table}")
+}
+
+/// Cooldown key for the per-tick divergence-cap page — the "this arm was
+/// about to enqueue an implausible number of findings, so it wrote nothing"
+/// alert (see [`divergence_cap_exceeded`]).
+///
+/// Namespaced like its siblings so the sync-lag all-clear can never mistake
+/// `reconcile_cap:guest_registry` for the table `guest_registry` and delete
+/// its cooldown, which would un-throttle the page to once per tick. The
+/// `reconcile_cap` family is new and shares no prefix with
+/// `ct_retention_overflow:` / `escalated:` / `burst:` / `ct_watcher_lag:` /
+/// `shadow_mode:` / `boot_refusal:`.
+pub fn reconcile_cap_cooldown_key(table: &str) -> String {
+    format!("reconcile_cap{COOLDOWN_KEY_NAMESPACE_SEP}{table}")
 }
 
 /// How an alert actually reached (or failed to reach) an operator on a
@@ -2565,6 +2606,33 @@ pub(crate) fn payment_canonical_hash(
     ]))
 }
 
+/// Hash inputs for one canonical-shape companion FOLIO (legacy
+/// `HT_CheckIn_Other_People` rows sharing a `Cin_no`). Phase 6-B; keyed on
+/// `Cin_no`.
+///
+/// **Why the folio is the unit.** iHOTEL edits companions by
+/// DELETE-then-REINSERT (`FrmCheckIn.cs:9975`), minting a new IDENTITY per
+/// edit, and the CT mapper mirrors that faithfully. A per-ROW arm keyed on
+/// that id would therefore report two divergences on every correctly-applied
+/// edit — one for the retired id (which can never converge) and one for the
+/// new one — while a folio hash is invariant under the churn and moves only
+/// when the companion CONTENT does. See
+/// [`crate::sync::mappers::guest_registry::RegistryFolioProjection`].
+///
+/// The body is `cin_no | <sorted "{name}|{country}" lines joined by \n>`,
+/// with ids on both sides excluded. An EMPTY folio (a check-in with no
+/// companions) is a real, hashable state, not an absent row — that is what
+/// lets a folio whose companions were legitimately deleted on both sides
+/// auto-resolve rather than sit open forever.
+pub(crate) fn guest_registry_canonical_hash(
+    folio: &crate::sync::mappers::guest_registry::RegistryFolioProjection,
+) -> String {
+    sha256(&join_hash_segments(&[
+        folio.legacy_cin_no.clone(),
+        folio.companions_segment(),
+    ]))
+}
+
 /// Track D / T7 CRIT-1 — discriminator for `ht_reconcile_log.divergence_kind`.
 /// Pure enum so the reconcile loop and the (never-silenced) ack guard
 /// agree on the same vocabulary.
@@ -2811,8 +2879,14 @@ fn parse_booking_legacy_pk(legacy_pk: &str) -> (&str, &str) {
 /// failure instead of a silent backlog, and
 /// `gate_guard::tests::resolvable_tables_const_covers_every_contract_entity`
 /// pins this list against the entity registry.
-pub(crate) const RECONCILE_RESOLVABLE_TABLES: &[&str] =
-    &["customers", "bookings", "checkins", "rooms", "payments"];
+pub(crate) const RECONCILE_RESOLVABLE_TABLES: &[&str] = &[
+    "customers",
+    "bookings",
+    "checkins",
+    "rooms",
+    "payments",
+    "guest_registry",
+];
 
 /// Re-compute the canonical PG hash for a single `ht_reconcile_log`
 /// row's `(table_name, legacy_pk)` pair. Returns `Ok(None)` if no
@@ -2910,6 +2984,17 @@ async fn compute_current_pg_hash(
                 )
             }))
         }
+        "guest_registry" => {
+            // Phase 6-B. `legacy_pk` is the folio's `Cin_no`. `Ok(None)`
+            // ONLY when the parent check-in is absent from canonical — a
+            // folio that exists but holds no companions hashes as the
+            // EMPTY folio, so a companion set deleted on both sides
+            // converges instead of sitting open forever.
+            Ok(fetch_canonical_registry_folio(pg_pool, legacy_pk)
+                .await?
+                .as_ref()
+                .map(guest_registry_canonical_hash))
+        }
         _ => {
             debug_assert!(
                 !RECONCILE_RESOLVABLE_TABLES.contains(&table_name),
@@ -2963,6 +3048,7 @@ async fn compute_current_legacy_hash(
         "checkins" => compute_legacy_checkin_hash_via_mapper(legacy_pool, legacy_pk).await,
         "rooms" => fetch_legacy_room_hash(legacy_pool, legacy_pk).await,
         "payments" => fetch_legacy_payment_hash(legacy_pool, legacy_pk).await,
+        "guest_registry" => fetch_legacy_registry_folio_hash(legacy_pool, legacy_pk).await,
         _ => {
             debug_assert!(
                 !RECONCILE_RESOLVABLE_TABLES.contains(&table_name),
@@ -3181,6 +3267,41 @@ async fn fetch_legacy_payment_hash(
     Ok(Some(projected.hash()))
 }
 
+/// Single-PK MSSQL re-projection for a companion FOLIO (Phase 6-B).
+/// Mirrors `sync_guest_registry`'s per-folio hash construction so the
+/// auto-resolve sweep compares like-for-like under the CURRENT projection.
+///
+/// Deliberately returns `Ok(Some(<empty-folio hash>))` — never `Ok(None)` —
+/// when the `Cin_no` has no companion rows left. Unlike the flat entities,
+/// "no rows" here is a legitimate FOLIO STATE (most check-ins have no
+/// companions), not a vanished row: iHOTEL's DELETE+reinsert edit passes
+/// through it, and a companion set deleted on BOTH sides has genuinely
+/// converged. Returning `None` would make that convergence unrepresentable
+/// and every such row would sit open forever. The scope gate stays honest
+/// because the CANONICAL arm still returns `None` when the parent check-in
+/// is absent, so a bogus `legacy_pk` can never "converge" as empty/empty.
+///
+/// The canonical-era floor is deliberately NOT applied here, same as
+/// payments: this path re-projects a folio the scan ALREADY admitted.
+async fn fetch_legacy_registry_folio_hash(
+    legacy_pool: &DbPool,
+    cin_no: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut conn = legacy_pool.get().await?;
+    let sql = format!(
+        "SELECT {projection} FROM HT_CheckIn_Other_People WHERE Cin_no = @P1",
+        projection = GUEST_REGISTRY_RECONCILE_PROJECTION.join(", "),
+    );
+    let mut q = Query::new(sql);
+    q.bind(cin_no);
+    let rows = q.query(&mut conn).await?.into_first_result().await?;
+    let mut folio = RegistryFolioProjection::empty(cin_no);
+    for row in &rows {
+        push_legacy_companion(&mut folio, row);
+    }
+    Ok(Some(guest_registry_canonical_hash(&folio)))
+}
+
 /// Issue #204 (bug #2) — is the durable self-healing arm of the
 /// auto-resolve sweep enabled?
 ///
@@ -3239,6 +3360,36 @@ fn reconcile_reingest_missing_pg_enabled() -> bool {
 /// feature flag in the sync path. A flag flip is never "just config".
 fn reconcile_payments_arm_enabled() -> bool {
     env::var("RECONCILE_PAYMENTS_ARM_ENABLED")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+/// Phase 6-B — is the `guest_registry` (companion folio) reconcile arm
+/// enabled?
+///
+/// Default **OFF** (ship dark). When unset / not `"true"`, [`run_sync`]
+/// never calls `sync_guest_registry`, so the arm issues ZERO MSSQL and ZERO
+/// PG queries and `ht_reconcile_log` can never gain a `guest_registry` row —
+/// behaviour is byte-for-byte identical to before the arm existed. The
+/// resolve dispatches and the ack table are inert without detection.
+///
+/// Rollout is Ville-first → 48h soak → HF Hotel, in an announced window.
+/// The first enabled tick hashes every IN-ERA folio, so a one-time find is
+/// expected — a small one, because [`GUEST_REGISTRY_ERA_FLOOR_SQL`] keeps
+/// the pre-mirror history out of scope. Live 2026-07-28: HF Hotel 830 in-era
+/// legacy folios vs 818 canonical (≈12 finds); HF Ville 574 vs 545 (≈29).
+/// Unfloored those would have been ~19.6k and ~1.6k folios that can never
+/// converge.
+///
+/// Be honest about what lands: `guest_registry` is in NEITHER self-heal
+/// list, so a find does NOT age out on its own — it stays open until an
+/// operator acts, and the >72h escalation tier will eventually fire on it.
+/// Every one is a real TM.30 companion-registry disagreement.
+///
+/// The `== "true"` comparison is strict on purpose, matching every other
+/// feature flag in the sync path. A flag flip is never "just config".
+fn reconcile_guest_registry_arm_enabled() -> bool {
+    env::var("RECONCILE_GUEST_REGISTRY_ARM_ENABLED")
         .map(|v| v == "true")
         .unwrap_or(false)
 }
@@ -3499,6 +3650,12 @@ fn classify_force_converge(
 /// [`payment_canonical_hash`]) is a genuine cross-app disagreement that
 /// re-driving the legacy row would silently ERASE rather than repair.
 /// Adding it here is a separate, coordinated decision (plan 6-D).
+///
+/// **`guest_registry` is deliberately absent too** (Phase 6-B), and its
+/// self-heal would be a bigger step than payments': the folio arm's repair
+/// is not a single-row re-drive at all — it would have to DELETE canonical
+/// companion rows that legacy no longer has, i.e. destroy TM.30 registry
+/// state from a sweep. Detection soaks first; plan 6-D decides the rest.
 const FORCE_CONVERGE_VALUE_DRIFT_TABLES: &[&str] = &["customers", "rooms"];
 
 /// Tables the `missing_pg` re-ingest arm will repair. Customers first-class
@@ -3569,7 +3726,8 @@ type ReconcileCandidate = (i64, String, String, Option<String>, f64);
 
 /// FK-dependency rank for the auto-resolve sweep's candidate ordering.
 /// Lower runs first, so a parent is always re-ingested before anything that
-/// points at it: customers → rooms → bookings → checkins → payments.
+/// points at it: customers → rooms → bookings → checkins →
+/// payments / guest_registry.
 ///
 /// **This ordering is load-bearing, not cosmetic.** `apply_booking_aggregate`
 /// needs the booking's customer to exist in canonical (it eager-mirrors on a
@@ -3585,6 +3743,11 @@ fn reconcile_table_fk_rank(table_name: &str) -> u8 {
         "bookings" => 2,
         "checkins" => 3,
         "payments" => 4,
+        // Phase 6-B. A companion folio hangs off its check-in
+        // (`ht_guest_registry.guest_cin_id`, and the CT mapper ERRORS on an
+        // unresolvable parent), so it must never be healed before check-ins.
+        // Sibling of `payments`; the two do not depend on each other.
+        "guest_registry" => 5,
         other => {
             // A resolvable entity that falls through here is unranked, so
             // it sorts after everything and its FK parents lose their
@@ -3596,7 +3759,7 @@ fn reconcile_table_fk_rank(table_name: &str) -> u8 {
                  the entity is listed as resolvable but falls through to the \
                  wildcard, so the sweep may heal it before its parents"
             );
-            5
+            6
         }
     }
 }
@@ -6501,6 +6664,801 @@ async fn sync_payments(
     Ok(())
 }
 
+// =============================================================================
+// Guest-registry (companion folio) Sync — Phase 6-B, DARK behind
+// RECONCILE_GUEST_REGISTRY_ARM_ENABLED
+// =============================================================================
+
+/// Legacy `HT_CheckIn_Other_People` projection for the folio reconcile
+/// hash. Same three columns the CT mapper reads, minus the IDENTITY `id`
+/// (excluded from the hash on purpose — see
+/// [`guest_registry_canonical_hash`]).
+///
+/// Held as a slice const so Track J1's projection-lock test can pin every
+/// column against the authoritative schema dump, and so the bulk scan and
+/// the per-PK auto-resolve re-fetch cannot drift apart. The iHOTEL typo
+/// `Cin_contry` (sic) is preserved verbatim, and `Cin_no` is LOWERCASE-n
+/// here (`HT_CheckIn_Ds` is the one with `Cin_No`).
+const GUEST_REGISTRY_RECONCILE_PROJECTION: &[&str] = &["Cin_no", "Cin_name", "Cin_contry"];
+
+/// Canonical-side companion filter: mirrored companions only.
+///
+/// `HT_CheckIn_Other_People` holds ONLY companions — the primary guest
+/// lives on the check-in header — and the CT mapper inserts
+/// `guest_is_primary = false` for every row it lands. The check-in
+/// registration feature (migration 070, Thai-ID capture) writes PRIMARY
+/// rows into the same canonical table, so without this filter every
+/// registered primary guest would look like an extra companion the legacy
+/// side is missing. `COALESCE` because the column is nullable
+/// (`BOOLEAN DEFAULT false`) and a bare `= false` would silently drop a
+/// NULL row out of the canonical folio, reporting it as a legacy-only
+/// companion forever.
+const CANONICAL_COMPANION_PRIMARY_FILTER: &str = "COALESCE(guest_is_primary, false) = false";
+
+/// The two canonical companion fields, projected into the shape the legacy
+/// side produces: the re-concatenated display name and the COALESCEd
+/// country.
+///
+/// The name expression is single-sourced from
+/// [`crate::sync::mappers::guest_registry::CANONICAL_COMPANION_NAME_SQL`] —
+/// the SAME bytes the mapper's echo-adoption match uses. If the two ever
+/// diverged, a companion our app created and the writeback echoed back
+/// would be adopted correctly by the mapper yet hash differently here:
+/// permanent, unfixable sync lag on a legally load-bearing table.
+fn canonical_companion_projection() -> String {
+    format!(
+        "{name} AS companion_name, COALESCE(guest_nationality, '') AS companion_country",
+        name = CANONICAL_COMPANION_NAME_SQL,
+    )
+}
+
+/// Derive the canonical-coverage floor for the guest-registry scan, as a
+/// check-in timestamp. `NULL` when canonical holds no mirrored companion at
+/// all (no coverage).
+///
+/// **Why this exists** — the same BLOCKING class the payments arm hit.
+/// `ht_guest_registry` is CT-populated with no historical backfill (Track
+/// E1 enabled CT on `HT_CheckIn_Other_People` in May 2026), while
+/// `ht_checkins` IS fully backfilled to 2021. So every pre-CT folio has a
+/// canonical parent check-in but no canonical companions, and would be
+/// reported as a divergence that can NEVER close. Live counts 2026-07-28:
+/// HF Hotel 20,434 legacy companion rows across 20,423 folios vs 819
+/// canonical companions (oldest parent check-in 2026-05-13); HF Ville 2,185
+/// / 2,184 vs 545 (oldest 2026-05-13). Unfloored, the first enabled tick
+/// would manufacture ~19.6k + ~1.6k permanently-open rows, re-log them on
+/// every tick, pin the 4h digest and the >72h escalation tier on
+/// `guest_registry`, and starve every other entity out of
+/// [`auto_resolve_reconcile_log`]'s age-only 500-row batch. Floored, the
+/// same live data yields 830 in-era legacy folios vs 818 canonical at HF
+/// Hotel (≈12 actionable finds) and 574 vs 545 at Ville (≈29).
+///
+/// The floor is DERIVED, never configured: `MIN(cin_checkin_time)` over the
+/// check-ins that actually carry a MIRRORED companion IS the oldest folio
+/// the mirror has ever landed, so nothing that could still converge sorts
+/// below it. `date_trunc('day', …)` widens to the start of that day so the
+/// boundary includes the mirror's whole first day rather than cutting
+/// mid-afternoon.
+///
+/// **`guest_legacy_id IS NOT NULL` is load-bearing, not decoration.**
+/// "Mirrored" means *stamped with a legacy IDENTITY by the CT mapper*.
+/// Canonical holds non-primary companions with NO legacy counterpart —
+/// `POST /api/checkins/{id}/guests` and the migration-070 registration
+/// capture both write them, and `TM30_COMPANION_WRITEBACK_ENABLED` is
+/// compose-default false, so nothing pushes them to legacy. Counting those
+/// as "coverage" would claim an era the mirror never actually covered.
+///
+/// **The result is CLAMPED to a persisted, non-decreasing watermark** — see
+/// [`clamped_era_floor`] and [`RECONCILE_ERA_FLOOR_UPSERT_SQL`]. A raw
+/// `MIN()` is a low-water mark on the PARENT's check-in time, and it can be
+/// dragged backwards by ONE row: iHOTEL's DELETE+REINSERT companion edit
+/// (`FrmCheckIn.cs:9975`) applied to any historical folio makes the CT
+/// mapper mirror one companion whose parent check-in is e.g. 2023 (the
+/// mapper resolves the parent by `legacy_cin_no` with no era restriction,
+/// and `ht_checkins` is backfilled to 2021). That single row would move the
+/// floor to 2023, admit ~all 20,423 legacy folios instead of 830, and make
+/// the next tick enqueue ~19.6k permanently-open rows — the exact flood
+/// this floor exists to prevent. The persisted watermark makes the scope
+/// monotonically NARROWING; [`divergence_cap_exceeded`] is the second belt,
+/// for the case where the very first (bootstrap) reading is already wrong.
+///
+/// **No timezone shift, by construction** — unlike the payments floor this
+/// one never crosses a DB boundary: it is derived from
+/// `ht_checkins.cin_checkin_time` and compared against that same column, so
+/// both sides are the same naive Thai basis whatever that basis is. The
+/// legacy side is filtered by KEY membership (`Cin_no` ∈ the in-era
+/// canonical set), never by a legacy date, so there is no second clock.
+fn guest_registry_era_floor_sql() -> String {
+    format!(
+        "SELECT date_trunc('day', MIN(ht_checkins.cin_checkin_time)) \
+           FROM ht_guest_registry \
+           JOIN ht_checkins ON ht_checkins.cin_id = ht_guest_registry.guest_cin_id \
+          WHERE {primary} \
+            AND ht_guest_registry.guest_legacy_id IS NOT NULL",
+        primary = CANONICAL_COMPANION_PRIMARY_FILTER,
+    )
+}
+
+/// `ht_reconcile_era_floor` key for this arm. Same literal as the
+/// `ht_reconcile_log.table_name` / `sync_status.entity_type` the arm reports
+/// under, so one operator query joins all three.
+const GUEST_REGISTRY_ERA_FLOOR_KEY: &str = "guest_registry";
+
+/// Persist-and-clamp in ONE statement: the durable floor only ever moves
+/// FORWARD.
+///
+/// `GREATEST` lives in SQL rather than in Rust on purpose — the backend
+/// scheduler and `bin/sync` can both run a tick against the same database,
+/// so the monotonic guarantee has to hold under concurrency, not just
+/// within one process. `RETURNING` hands back the post-clamp value, so the
+/// read and the write are the same round trip.
+///
+/// An operator CAN still move the floor forward by hand
+/// (`UPDATE ht_reconcile_era_floor SET era_floor = … WHERE table_name =
+/// 'guest_registry'`) — that is the documented remedy when a bootstrap
+/// reading came out too low — and `GREATEST` makes the edit stick.
+const RECONCILE_ERA_FLOOR_UPSERT_SQL: &str =
+    "INSERT INTO ht_reconcile_era_floor (table_name, era_floor) VALUES ($1, $2) \
+     ON CONFLICT (table_name) DO UPDATE \
+        SET era_floor = GREATEST(ht_reconcile_era_floor.era_floor, EXCLUDED.era_floor), \
+            updated_at = NOW() \
+     RETURNING era_floor";
+
+/// Read the durable floor without writing — used only when the derived
+/// floor is NULL (nothing to clamp with).
+const RECONCILE_ERA_FLOOR_SELECT_SQL: &str =
+    "SELECT era_floor FROM ht_reconcile_era_floor WHERE table_name = $1";
+
+/// The clamp semantics, as a pure function (the SQL above enforces the same
+/// rule atomically; this is the spec the tests pin).
+///
+/// * both present → the LATER one. A derived floor that dropped below the
+///   watermark is exactly the one-old-companion drag described on
+///   [`guest_registry_era_floor_sql`]; ignore it.
+/// * persisted only (derived went NULL — every mirrored companion deleted,
+///   or the table truncated) → KEEP the watermark. Widening back to "no
+///   coverage" would be the same flood by another route; the in-era folios
+///   then all read as divergent and [`divergence_cap_exceeded`] raises a
+///   page, which is the correct response to a mirror that vanished.
+/// * neither → `None`: no coverage was ever established, and the arm skips
+///   the legacy scan entirely.
+fn clamped_era_floor(
+    persisted: Option<NaiveDateTime>,
+    derived: Option<NaiveDateTime>,
+) -> Option<NaiveDateTime> {
+    match (persisted, derived) {
+        (Some(p), Some(d)) => Some(p.max(d)),
+        (Some(p), None) => Some(p),
+        (None, d) => d,
+    }
+}
+
+async fn guest_registry_era_floor(
+    pg_pool: &PgPool,
+) -> Result<Option<NaiveDateTime>, sqlx::Error> {
+    // `AssertSqlSafe`: the statement is assembled from compile-time consts
+    // only (no runtime value reaches it) — same audit note as the sibling
+    // canonical-folio statements below.
+    let derived = sqlx::query_scalar::<_, Option<NaiveDateTime>>(sqlx::AssertSqlSafe(
+        guest_registry_era_floor_sql(),
+    ))
+    .fetch_one(pg_pool)
+    .await?;
+
+    let persisted = match derived {
+        Some(d) => {
+            sqlx::query_scalar::<_, NaiveDateTime>(RECONCILE_ERA_FLOOR_UPSERT_SQL)
+                .bind(GUEST_REGISTRY_ERA_FLOOR_KEY)
+                .bind(d)
+                .fetch_optional(pg_pool)
+                .await?
+        }
+        None => {
+            sqlx::query_scalar::<_, NaiveDateTime>(RECONCILE_ERA_FLOOR_SELECT_SQL)
+                .bind(GUEST_REGISTRY_ERA_FLOOR_KEY)
+                .fetch_optional(pg_pool)
+                .await?
+        }
+    };
+
+    let effective = clamped_era_floor(persisted, derived);
+
+    // Say it out loud when the watermark is HOLDING the scope forward: that
+    // means a historical folio just gained a mirrored companion, which is a
+    // legitimate iHOTEL edit but would otherwise silently widen the scan by
+    // years.
+    match (effective, derived) {
+        (Some(e), Some(d)) if e > d => tracing::info!(
+            derived_floor = %d,
+            effective_floor = %e,
+            "[Sync] sync_guest_registry: derived coverage floor sits BEHIND the \
+             persisted watermark (a pre-era folio gained a mirrored companion) — \
+             holding the watermark; scope stays monotonically narrowing"
+        ),
+        (Some(e), None) => tracing::warn!(
+            effective_floor = %e,
+            "[Sync] sync_guest_registry: canonical now holds NO mirrored companion \
+             at all, but a coverage watermark exists — keeping it. Expect a \
+             divergence-cap page if the mirror really was lost"
+        ),
+        _ => {}
+    }
+
+    Ok(effective)
+}
+
+/// The in-era folio KEY set: every canonical check-in from the coverage
+/// floor onward.
+///
+/// This is the arm's scope gate, and it does double duty:
+///
+/// * it drops pre-coverage folios (see [`guest_registry_era_floor_sql`]);
+/// * it drops folios whose parent check-in is absent from canonical
+///   entirely. Those are a CHECK-INS problem — `sync_checkins` already
+///   reports them as `missing_pg` — and the companion mapper could not land
+///   them anyway (it ERRORS on an unresolvable parent FK). Reporting them
+///   here too would double-count one root cause and manufacture rows this
+///   arm can never close.
+///
+/// `cin_checkin_time` is `NOT NULL` in the canonical schema, so there is no
+/// NULL arm to reason about (verified live 2026-07-28: 0 NULLs at HF Hotel).
+const IN_ERA_CHECKIN_KEYS_SQL: &str = "SELECT legacy_cin_no FROM ht_checkins \
+      WHERE legacy_cin_no IS NOT NULL AND cin_checkin_time >= $1";
+
+async fn load_in_era_checkin_keys(
+    pg_pool: &PgPool,
+    era_floor: NaiveDateTime,
+) -> Result<std::collections::HashSet<String>, sqlx::Error> {
+    let rows = sqlx::query_scalar::<_, String>(IN_ERA_CHECKIN_KEYS_SQL)
+        .bind(era_floor)
+        .fetch_all(pg_pool)
+        .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Every canonical companion folio in the coverage era, in ONE query.
+///
+/// Joins companion → check-in (never the reverse), so a duplicate
+/// `legacy_cin_no` on `ht_checkins` cannot duplicate companion lines.
+fn canonical_registry_folios_sql() -> String {
+    format!(
+        "SELECT ht_checkins.legacy_cin_no, {projection} \
+           FROM ht_guest_registry \
+           JOIN ht_checkins ON ht_checkins.cin_id = ht_guest_registry.guest_cin_id \
+          WHERE {primary} \
+            AND ht_checkins.legacy_cin_no IS NOT NULL \
+            AND ht_checkins.cin_checkin_time >= $1",
+        projection = canonical_companion_projection(),
+        primary = CANONICAL_COMPANION_PRIMARY_FILTER,
+    )
+}
+
+async fn load_canonical_registry_folios(
+    pg_pool: &PgPool,
+    era_floor: NaiveDateTime,
+) -> Result<BTreeMap<String, RegistryFolioProjection>, sqlx::Error> {
+    // `AssertSqlSafe`: built purely from compile-time consts
+    // (`canonical_companion_projection` / `CANONICAL_COMPANION_PRIMARY_FILTER`);
+    // the only runtime value is the era floor, which is BOUND as `$1`.
+    let rows = sqlx::query_as::<_, (String, Option<String>, String)>(sqlx::AssertSqlSafe(
+        canonical_registry_folios_sql(),
+    ))
+    .bind(era_floor)
+    .fetch_all(pg_pool)
+    .await?;
+    let mut folios: BTreeMap<String, RegistryFolioProjection> = BTreeMap::new();
+    for (cin_no, name, country) in rows {
+        folios
+            .entry(cin_no.clone())
+            .or_insert_with(|| RegistryFolioProjection::empty(cin_no))
+            .push_companion(name.as_deref().unwrap_or_default(), Some(country.as_str()));
+    }
+    Ok(folios)
+}
+
+/// Resolve the canonical check-in id for a legacy `Cin_no`.
+///
+/// Byte-identical to the companion mapper's own parent lookup
+/// (`guest_registry.rs`), so the sweep resolves the SAME folio the mapper
+/// would write into.
+const CANONICAL_CHECKIN_ID_PROBE_SQL: &str =
+    "SELECT cin_id FROM ht_checkins WHERE legacy_cin_no = $1 LIMIT 1";
+
+/// Per-PK canonical folio for the auto-resolve sweep.
+///
+/// `Ok(None)` ⇔ the parent check-in is absent from canonical: the folio is
+/// out of this arm's scope (see [`IN_ERA_CHECKIN_KEYS_SQL`]) and the row
+/// stays open for operator review. A folio that EXISTS but holds no
+/// companions returns `Ok(Some(<empty folio>))`, which is what lets a
+/// companion set deleted on both sides converge.
+async fn fetch_canonical_registry_folio(
+    pg_pool: &PgPool,
+    cin_no: &str,
+) -> Result<Option<RegistryFolioProjection>, sqlx::Error> {
+    let cin_id: Option<i32> = sqlx::query_scalar(CANONICAL_CHECKIN_ID_PROBE_SQL)
+        .bind(cin_no)
+        .fetch_optional(pg_pool)
+        .await?;
+    let Some(cin_id) = cin_id else {
+        return Ok(None);
+    };
+    let sql = format!(
+        "SELECT {projection} FROM ht_guest_registry \
+          WHERE guest_cin_id = $1 AND {primary}",
+        projection = canonical_companion_projection(),
+        primary = CANONICAL_COMPANION_PRIMARY_FILTER,
+    );
+    // `AssertSqlSafe`: consts only; `cin_id` is bound as `$1`.
+    let rows = sqlx::query_as::<_, (Option<String>, String)>(sqlx::AssertSqlSafe(sql))
+        .bind(cin_id)
+        .fetch_all(pg_pool)
+        .await?;
+    let mut folio = RegistryFolioProjection::empty(cin_no);
+    for (name, country) in rows {
+        folio.push_companion(name.as_deref().unwrap_or_default(), Some(country.as_str()));
+    }
+    Ok(Some(folio))
+}
+
+/// Project one legacy companion row into a folio. Shared by the bulk scan
+/// and the per-PK re-fetch so the two apply IDENTICAL admission rules.
+/// A NULL `Cin_name` lands as the empty string — exactly what the CT mapper
+/// stores (`cin_name.unwrap_or_default()`), so a blank "Other People" row
+/// saved by a receptionist tabbing through hashes the same on both sides.
+fn push_legacy_companion(folio: &mut RegistryFolioProjection, row: &tiberius::Row) {
+    folio.push_companion(
+        row.get::<&str, _>("Cin_name").unwrap_or_default(),
+        row.get::<&str, _>("Cin_contry"),
+    );
+}
+
+fn registry_folio_json(folio: &RegistryFolioProjection) -> serde_json::Value {
+    json!({
+        "Cin_no": folio.legacy_cin_no,
+        "companions": folio.companion_lines(),
+        "companion_count": folio.len(),
+    })
+}
+
+/// Best-effort ack: record the `mssql_hash` this arm last reconciled for a
+/// folio. Cache-only — never mutates canonical state; a failed write just
+/// re-runs the (already in-memory) comparison next tick.
+async fn ack_guest_registry_mirror(pg_pool: &PgPool, cin_no: &str, mssql_hash: &str) {
+    let updated = sqlx::query(
+        "UPDATE ht_guest_registry_legacy SET sync_hash = $1, synced_at = NOW() \
+         WHERE cin_no = $2",
+    )
+    .bind(mssql_hash)
+    .bind(cin_no)
+    .execute(pg_pool)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+
+    if updated == 0 {
+        let _ = sqlx::query(
+            "INSERT INTO ht_guest_registry_legacy (cin_no, sync_hash, synced_at) \
+             VALUES ($1, $2, NOW()) \
+             ON CONFLICT (cin_no) DO UPDATE SET sync_hash = EXCLUDED.sync_hash, \
+                                                synced_at = EXCLUDED.synced_at",
+        )
+        .bind(cin_no)
+        .bind(mssql_hash)
+        .execute(pg_pool)
+        .await;
+    }
+}
+
+/// Read the WHOLE ack cache in ONE query, same efficiency contract as the
+/// payments arm's.
+async fn load_guest_registry_ack_cache(
+    pg_pool: &PgPool,
+) -> Result<std::collections::HashMap<String, String>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT cin_no, sync_hash FROM ht_guest_registry_legacy WHERE sync_hash IS NOT NULL",
+    )
+    .fetch_all(pg_pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(k, v)| v.map(|hash| (k, hash)))
+        .collect())
+}
+
+/// Should this folio's ack row be (re)written?
+///
+/// **The ack cache in this arm suppresses WRITES; it never gates
+/// DETECTION** — and that difference is deliberate. Its siblings ack to
+/// skip a per-PK canonical fetch, which is why the payments arm needed an
+/// explicit carve-out to keep canonical-only voids observable
+/// ([`payment_ack_short_circuit_bypassed`]). Here BOTH sides are already
+/// resident in memory (two batched reads), so gating the comparison on the
+/// ack would buy nothing and would re-create that blind spot in a worse
+/// form: any canonical-side change that leaves the LEGACY hash untouched —
+/// a companion deleted from `ht_guest_registry`, a primary-flag flip, a
+/// dropped CT delete — would become invisible forever on a table that
+/// exists to satisfy a legal reporting obligation. So the loop compares
+/// every in-scope folio on every tick and the ack row is written only when
+/// the legacy hash has actually moved, which keeps the steady state at ~0
+/// writes without costing a single observation.
+fn guest_registry_ack_needs_write(acked: Option<&String>, mssql_hash: &str) -> bool {
+    acked.map(String::as_str) != Some(mssql_hash)
+}
+
+/// Ceiling on how many divergences ONE `guest_registry` tick may enqueue.
+///
+/// 500 is not a round number picked for looks: it is
+/// [`auto_resolve_reconcile_log`]'s per-tick `LIMIT 500`. Enqueuing more
+/// findings in a tick than the sweep can even LOOK at in a tick is the
+/// mechanism behind every flood incident this module has had — the backlog
+/// never drains, the age-ordered batch fills with one entity, and every
+/// other entity is starved out of both the sweep and the digest.
+///
+/// Steady-state expectation is 1–2 orders of magnitude below it: live
+/// 2026-07-28, floored, HF Hotel has ~12 findings across 830 in-era folios
+/// and HF Ville ~29 across 574.
+const GUEST_REGISTRY_DIVERGENCE_CAP_DEFAULT: i64 = 500;
+
+/// Resolve the per-tick divergence cap. Same per-site → global → default
+/// chain as every other knob here ([`threshold_from_env`]), so a site
+/// working through a genuine one-time backlog can be raised on its own:
+/// `RECONCILE_GUEST_REGISTRY_MAX_DIVERGENCES_HFVILLE=…`.
+fn guest_registry_divergence_cap(site_id: &str) -> i64 {
+    threshold_from_env(
+        "RECONCILE_GUEST_REGISTRY_MAX_DIVERGENCES",
+        site_id,
+        GUEST_REGISTRY_DIVERGENCE_CAP_DEFAULT,
+    )
+}
+
+/// Would this tick enqueue more findings than the cap allows?
+///
+/// The arm compares BOTH sides in memory before it writes anything, so a
+/// breach aborts the whole tick — no `record_divergence`, no ack writes —
+/// instead of truncating the batch. Truncating would be worse than useless:
+/// it would write an arbitrary 500 of the findings, leave the rest
+/// invisible, and still pin the digest on `guest_registry`.
+///
+/// What a breach actually means, in order of likelihood: the coverage floor
+/// has been dragged backwards (see [`guest_registry_era_floor_sql`] — the
+/// persisted watermark should now prevent this), the companion mirror has
+/// stopped ingesting, or the legacy table was bulk-edited. None of those are
+/// fixed by writing 19.6k rows.
+fn divergence_cap_exceeded(divergent: usize, cap: i64) -> bool {
+    divergent as i64 > cap
+}
+
+/// Page an operator that a `guest_registry` tick was ABORTED by the
+/// divergence cap, and say exactly which knob unblocks it.
+///
+/// Cooldown-gated through the shared `ht_level_drift_alert_cooldowns` table
+/// under [`reconcile_cap_cooldown_key`] with the same per-site
+/// `LEVEL_DRIFT_COOLDOWN_HOURS` window as the other reconcile pages, and —
+/// like them — the cooldown is burned only on a confirmed delivery, so a
+/// webhook outage cannot silence a stuck arm for a day.
+async fn alert_guest_registry_divergence_cap(
+    pg_pool: &PgPool,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+    divergent: usize,
+    in_scope: usize,
+    cap: i64,
+    era_floor: NaiveDateTime,
+) {
+    let key = reconcile_cap_cooldown_key("guest_registry");
+    let cooldown_hours = level_drift_thresholds_from_env(site_id).cooldown_hours;
+    let cooldown = std::time::Duration::from_secs((cooldown_hours * 3600) as u64);
+
+    if !level_alert_eligible_pg(pg_pool, site_id, &key, cooldown).await {
+        tracing::debug!(
+            site = %site_id,
+            "[Sync] Guest-registry divergence-cap page suppressed by cooldown"
+        );
+        return;
+    }
+
+    let delivery = if let Some(slack) = slack {
+        let msg = SlackMessage::with_site_text(
+            site_id,
+            format!(
+                ":octagonal_sign: *Guest-registry reconcile ABORTED — divergence cap* \
+                 :octagonal_sign:\n\
+                 The companion-folio arm found *{divergent}* diverging folios out of \
+                 {in_scope} in scope this tick, above the per-tick cap of {cap}. \
+                 *Nothing was written* — no `ht_reconcile_log` rows, no ack rows — \
+                 because a batch that size can never drain (the auto-resolve sweep \
+                 looks at 500 rows per tick) and would starve every other entity out \
+                 of the sweep and the digest.\n\
+                 Coverage floor in force: `{era_floor}`.\n\
+                 _Likely causes, in order: the coverage floor was dragged backwards by \
+                 a companion edit on a pre-era folio (check \
+                 `ht_reconcile_era_floor` where `table_name='guest_registry'` and move \
+                 it FORWARD by hand — the upsert clamps with GREATEST, so the edit \
+                 sticks); the companion CT mapper has stopped ingesting; or \
+                 `HT_CheckIn_Other_People` was bulk-edited. Raise \
+                 `RECONCILE_GUEST_REGISTRY_MAX_DIVERGENCES` only once you know the \
+                 backlog is real, or set `RECONCILE_GUEST_REGISTRY_ARM_ENABLED=false` \
+                 to stand the arm down. Per-site cooldown {cooldown_h}h._",
+                cooldown_h = cooldown_hours,
+            ),
+        );
+        AlertDelivery::from_send(Some(slack.send_message(&msg).await))
+    } else {
+        tracing::info!(
+            site = %site_id,
+            "[Sync] Slack not configured; guest-registry divergence-cap abort logged only"
+        );
+        AlertDelivery::LoggedOnly
+    };
+
+    if cooldown_should_be_marked(delivery) {
+        mark_level_alert_sent_pg(pg_pool, site_id, &key).await;
+    } else {
+        tracing::warn!(
+            site = %site_id,
+            "[Sync] Guest-registry divergence-cap page POST failed — leaving the \
+             cooldown unset so the next tick retries"
+        );
+    }
+}
+
+/// Phase 6-B guest-registry reconcile arm. Compares legacy
+/// `HT_CheckIn_Other_People` against canonical `ht_guest_registry` per
+/// FOLIO (all companions sharing one `Cin_no`), keyed on `Cin_no`.
+///
+/// Only ever called when [`reconcile_guest_registry_arm_enabled`] is true —
+/// with the flag off (the shipped default on every service) this function
+/// is never entered, so the arm issues no queries at all.
+///
+/// Shape — 1 MSSQL query + 5 PG queries per tick, plus one ack write per
+/// folio whose legacy state actually moved:
+/// 0. the canonical coverage floor ([`guest_registry_era_floor_sql`]),
+///    clamped against its durable watermark in a second, combined
+///    read-write statement ([`RECONCILE_ERA_FLOOR_UPSERT_SQL`]);
+/// 1. the in-era folio key set ([`IN_ERA_CHECKIN_KEYS_SQL`]) — the scope gate;
+/// 2. every canonical companion in the era, grouped into folios;
+/// 3. ONE bulk MSSQL scan of `HT_CheckIn_Other_People`, grouped into folios
+///    and filtered against the key set;
+/// 4. the ack cache.
+///
+/// The comparison runs over the UNION of both key sets, so a folio that
+/// exists ONLY canonically (legacy companions all deleted, our CT delete
+/// dropped or a companion we created that never reached legacy) is caught
+/// too — a legacy-only scan would be blind to it.
+///
+/// **Compare-all-then-write, never write-as-you-go.** Both sides are
+/// already in memory, so the tick decides its ENTIRE output before the
+/// first row is enqueued. That is what lets [`divergence_cap_exceeded`]
+/// abort a pathological tick outright instead of truncating it halfway
+/// through a flood of `record_divergence` INSERTs and per-folio ack
+/// round-trips.
+///
+/// `ReconcileMode::Upsert` is not honoured here, same as payments:
+/// `ht_guest_registry_legacy` is a pure ack cache with no data columns to
+/// mirror. The arm is diff-only by construction.
+async fn sync_guest_registry(
+    legacy_pool: &DbPool,
+    pg_pool: &PgPool,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let start = Instant::now();
+    tracing::info!("[Sync] Syncing guest registry (companion folios)...");
+
+    // Canonical coverage floor FIRST. With no mirrored companion at all the
+    // arm has no coverage, and scanning legacy would classify the ENTIRE
+    // companion history as divergent — permanently unresolvable, since
+    // `guest_registry` is in neither self-heal list. Report a clean zero
+    // tick instead of manufacturing a backlog.
+    let Some(era_floor) = guest_registry_era_floor(pg_pool).await? else {
+        tracing::warn!(
+            "[Sync] sync_guest_registry: ht_guest_registry holds no mirrored \
+             companion — no canonical coverage to reconcile against; skipping \
+             the legacy scan this tick"
+        );
+        let duration_ms = start.elapsed().as_millis() as i32;
+        record_success(pg_pool, "guest_registry", 0, 0, 0, duration_ms).await;
+        return Ok(());
+    };
+
+    let in_era_keys = load_in_era_checkin_keys(pg_pool, era_floor).await?;
+    let mut canonical = load_canonical_registry_folios(pg_pool, era_floor).await?;
+
+    // ONE bulk legacy scan. `HT_CheckIn_Other_People` carries no date
+    // column, so the era filter cannot be pushed into this WHERE — the
+    // folios are filtered by KEY membership below instead. The table is
+    // narrow and small (20,434 rows at HF Hotel, 2,185 at Ville on
+    // 2026-07-28), so one full scan per 15-min tick is far cheaper than the
+    // per-PK loads `sync_checkins` already runs.
+    let mut conn = legacy_pool.get().await?;
+    let select_sql = format!(
+        "SELECT {projection} FROM HT_CheckIn_Other_People",
+        projection = GUEST_REGISTRY_RECONCILE_PROJECTION.join(", "),
+    );
+    let rows = conn
+        .simple_query(&select_sql)
+        .await?
+        .into_first_result()
+        .await?;
+    // Free the pool slot — nothing below touches MSSQL again.
+    drop(conn);
+
+    let mut legacy: BTreeMap<String, RegistryFolioProjection> = BTreeMap::new();
+    let mut skipped = 0i32;
+    let mut out_of_era = 0i32;
+    for row in &rows {
+        // A NULL/empty `Cin_no` is an orphan companion row the CT mapper
+        // skips with a warning — there is no folio to attach it to.
+        let Some(cin_no) = row.get::<&str, _>("Cin_no").filter(|s| !s.is_empty()) else {
+            skipped += 1;
+            continue;
+        };
+        if !in_era_keys.contains(cin_no) {
+            out_of_era += 1;
+            continue;
+        }
+        push_legacy_companion(
+            legacy
+                .entry(cin_no.to_string())
+                .or_insert_with(|| RegistryFolioProjection::empty(cin_no)),
+            row,
+        );
+    }
+
+    let acked = load_guest_registry_ack_cache(pg_pool).await?;
+
+    let mut added = 0i32;
+    let mut updated = 0i32;
+    let mut unchanged = 0i32;
+
+    // Union of both key sets — see the doc comment on why a legacy-only
+    // walk would be blind to a canonical-only folio. `BTreeSet` keys are
+    // sorted, so the merged iteration order is deterministic.
+    let keys: std::collections::BTreeSet<String> =
+        legacy.keys().chain(canonical.keys()).cloned().collect();
+
+    // Materialise the union on BOTH sides: a key present on one side only
+    // gets an explicit EMPTY folio on the other. Empty is a real hashable
+    // state, not an absent row (that is what lets a companion set deleted
+    // everywhere converge), so this changes no hash — it just means the
+    // comparison below never has to synthesise a temporary.
+    for cin_no in &keys {
+        legacy
+            .entry(cin_no.clone())
+            .or_insert_with(|| RegistryFolioProjection::empty(cin_no.as_str()));
+        canonical
+            .entry(cin_no.clone())
+            .or_insert_with(|| RegistryFolioProjection::empty(cin_no.as_str()));
+    }
+
+    // PASS 1 — pure comparison, ZERO writes, so the tick's whole output is
+    // known before any of it is committed. See `divergence_cap_exceeded`.
+    let mut comparisons: Vec<(&str, String, String)> = Vec::with_capacity(keys.len());
+    let mut divergent = 0usize;
+    for cin_no in &keys {
+        let mssql_hash = guest_registry_canonical_hash(&legacy[cin_no.as_str()]);
+        let pg_hash = guest_registry_canonical_hash(&canonical[cin_no.as_str()]);
+        if pg_hash != mssql_hash {
+            divergent += 1;
+        }
+        comparisons.push((cin_no.as_str(), pg_hash, mssql_hash));
+    }
+
+    // The circuit breaker. A tick this loud is a SCOPE bug (floor dragged
+    // backwards) or a dead mirror, never a backlog worth writing down —
+    // abort before the first INSERT and page instead.
+    let cap = guest_registry_divergence_cap(site_id);
+    if divergence_cap_exceeded(divergent, cap) {
+        let detail = format!(
+            "guest-registry reconcile aborted: {divergent} diverging folios of \
+             {in_scope} in scope exceeds the per-tick cap of {cap} (coverage floor \
+             {era_floor}); nothing written",
+            in_scope = comparisons.len(),
+        );
+        tracing::error!(
+            site = %site_id,
+            divergent,
+            in_scope = comparisons.len(),
+            cap,
+            era_floor = %era_floor,
+            "[Sync] {}",
+            detail,
+        );
+        alert_guest_registry_divergence_cap(
+            pg_pool,
+            slack,
+            site_id,
+            divergent,
+            comparisons.len(),
+            cap,
+            era_floor,
+        )
+        .await;
+        record_error(pg_pool, "guest_registry", &detail).await;
+        return Ok(());
+    }
+
+    // PASS 2 — the writes, now known to be bounded.
+    for (cin_no, pg_hash, mssql_hash) in &comparisons {
+        let cin_no = *cin_no;
+        let legacy_folio = &legacy[cin_no];
+        let canonical_folio = &canonical[cin_no];
+
+        if guest_registry_ack_needs_write(acked.get(cin_no), mssql_hash) {
+            ack_guest_registry_mirror(pg_pool, cin_no, mssql_hash).await;
+        }
+
+        if pg_hash == mssql_hash {
+            unchanged += 1;
+            continue;
+        }
+
+        // The FOLIO is the row: it exists on both sides by construction
+        // (the key set is canonical check-ins, and an absent companion set
+        // is the empty folio, not a missing row), so the counts are 1/1 and
+        // [`classify_divergence`] yields `Value`. The per-side companion
+        // counts an operator actually needs are in the JSON payloads.
+        // `Cardinality` / `MissingPg` are unreachable here by design —
+        // `missing_pg` would be a never-silenced, never-closing row for the
+        // ordinary "iHOTEL added a companion we haven't ingested yet" case.
+        let kind = classify_divergence(Some(&pg_hash), Some(&mssql_hash), 1, 1);
+        record_divergence(
+            pg_pool,
+            "guest_registry",
+            cin_no,
+            Some(&pg_hash),
+            Some(&mssql_hash),
+            registry_folio_json(legacy_folio),
+            Some(registry_folio_json(canonical_folio)),
+            kind,
+            1,
+            1,
+        )
+        .await;
+
+        if canonical_folio.is_empty() {
+            // Legacy has companions, canonical has none: the TM.30
+            // under-count shape Track E1 exists to prevent.
+            added += 1;
+        } else {
+            updated += 1;
+        }
+    }
+
+    if skipped > 0 {
+        tracing::warn!(
+            skipped,
+            "[Sync] sync_guest_registry: {} companion rows have a NULL/empty \
+             Cin_no and belong to no folio",
+            skipped,
+        );
+    }
+
+    let duration_ms = start.elapsed().as_millis() as i32;
+    tracing::info!(
+        era_floor = %era_floor,
+        scanned = rows.len(),
+        out_of_era,
+        "[Sync] Guest registry: {} folios missing every canonical companion, \
+         {} drifted, {} unchanged in {}ms (in-era folios from {})",
+        added,
+        updated,
+        unchanged,
+        duration_ms,
+        era_floor,
+    );
+    record_success(
+        pg_pool,
+        "guest_registry",
+        added,
+        updated,
+        unchanged,
+        duration_ms,
+    )
+    .await;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     //! Pure unit tests for the Phase 5.5 mode-parsing logic. The
@@ -8886,6 +9844,379 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    // Phase 6-B — guest-registry (companion folio) reconcile arm (DARK).
+    // Pure tests only; the byte-parity golden vector for the folio hash
+    // lives with the descriptor table in `sync::mappers::guest_registry`.
+    // -------------------------------------------------------------------
+
+    fn test_folio(cin_no: &str, companions: &[(&str, Option<&str>)]) -> RegistryFolioProjection {
+        let mut f = RegistryFolioProjection::empty(cin_no);
+        for (name, country) in companions {
+            f.push_companion(name, *country);
+        }
+        f
+    }
+
+    /// Ships DARK. The default MUST be off on every service, and the
+    /// literal comparison is strict — `"TRUE"` / `"1"` / `" true"` are all
+    /// off, matching every other flag in the sync path.
+    #[test]
+    fn guest_registry_arm_flag_defaults_off_and_is_strict() {
+        assert!(
+            !with_env_vars(&[("RECONCILE_GUEST_REGISTRY_ARM_ENABLED", None)], || {
+                reconcile_guest_registry_arm_enabled()
+            }),
+            "the guest-registry arm must default OFF — enabling is a coordinated action"
+        );
+        assert!(with_env_vars(
+            &[("RECONCILE_GUEST_REGISTRY_ARM_ENABLED", Some("true"))],
+            || { reconcile_guest_registry_arm_enabled() }
+        ));
+        for sloppy in ["TRUE", "1", "yes", " true", "True"] {
+            assert!(
+                !with_env_vars(
+                    &[("RECONCILE_GUEST_REGISTRY_ARM_ENABLED", Some(sloppy))],
+                    || { reconcile_guest_registry_arm_enabled() }
+                ),
+                "`{sloppy}` must NOT enable the arm"
+            );
+        }
+    }
+
+    /// The arm ships detection-only. Wiring the folio into a self-heal arm
+    /// is a bigger step than for the flat entities: repairing a folio means
+    /// DELETING canonical companion rows legacy no longer has, i.e. a sweep
+    /// destroying TM.30 registry state.
+    #[test]
+    fn guest_registry_is_not_wired_into_either_self_heal_arm() {
+        assert!(!FORCE_CONVERGE_VALUE_DRIFT_TABLES.contains(&"guest_registry"));
+        assert!(!REINGEST_MISSING_PG_TABLES.contains(&"guest_registry"));
+        assert!(!force_converge_value_drift_eligible(
+            "guest_registry",
+            Some(LEGACY_HASH),
+            Some(PG_HASH),
+            OLD_ENOUGH_SECS,
+            true,
+        ));
+        assert!(!reingest_missing_pg_eligible(
+            "guest_registry",
+            Some(LEGACY_HASH),
+            None,
+            OLD_ENOUGH_SECS,
+            true,
+        ));
+    }
+
+    /// A companion folio hangs off its check-in, so the sweep must heal
+    /// check-ins BEFORE it (the CT mapper ERRORS on an unresolvable parent).
+    #[test]
+    fn guest_registry_ranks_after_its_parent_checkin() {
+        assert!(
+            reconcile_table_fk_rank("checkins") < reconcile_table_fk_rank("guest_registry")
+        );
+        assert!(
+            reconcile_table_fk_rank("guest_registry") < reconcile_table_fk_rank("something_new"),
+            "the wildcard must stay strictly after every ranked entity"
+        );
+    }
+
+    /// The whole point of the folio unit: iHOTEL's DELETE+reinsert edit
+    /// churns ids, so a per-row arm would false-positive on every edit.
+    /// Hashing the folio must be invariant under that churn — the hash is
+    /// built from names + countries only.
+    #[test]
+    fn folio_hash_is_invariant_under_legacy_id_churn() {
+        // Same companion content, re-saved in iHOTEL (new IDENTITY, new
+        // canonical guest_id): nothing in the hash body can express an id.
+        let before = test_folio("CH26-005228", &[("Somchai Jaidee", Some("TH"))]);
+        let after_reinsert = test_folio("CH26-005228", &[("Somchai Jaidee", Some("TH"))]);
+        assert_eq!(
+            guest_registry_canonical_hash(&before),
+            guest_registry_canonical_hash(&after_reinsert),
+        );
+        // …and a genuine content edit DOES move it.
+        let edited = test_folio("CH26-005228", &[("Somchai Jaidee-Suk", Some("TH"))]);
+        assert_ne!(
+            guest_registry_canonical_hash(&before),
+            guest_registry_canonical_hash(&edited),
+        );
+    }
+
+    /// A folio is one row on each side by construction, so the arm records
+    /// `value` drift — never `cardinality` (never silenced, never closed)
+    /// and never `missing_pg` for the ordinary "canonical hasn't ingested
+    /// the new companion yet" case, which WOULD be a permanently open row.
+    #[test]
+    fn folio_divergence_always_classifies_as_value_drift() {
+        let legacy = test_folio("CH26-005228", &[("Somchai", None)]);
+        let canonical = RegistryFolioProjection::empty("CH26-005228");
+        let mssql_hash = guest_registry_canonical_hash(&legacy);
+        let pg_hash = guest_registry_canonical_hash(&canonical);
+        assert_ne!(mssql_hash, pg_hash);
+        let kind = classify_divergence(Some(&pg_hash), Some(&mssql_hash), 1, 1);
+        assert_eq!(kind, DivergenceKind::Value);
+        assert!(
+            kind.is_silenceable(),
+            "folio drift must be ackable — the arm re-compares it on every \
+             tick regardless, and the log row stays unresolved either way"
+        );
+    }
+
+    /// The ack cache suppresses WRITES; it must never gate detection. If it
+    /// did, a canonical-side change that leaves the legacy hash untouched
+    /// (a companion deleted from `ht_guest_registry`, a dropped CT delete)
+    /// would be invisible forever — the payments arm needed an explicit
+    /// carve-out for exactly that shape, and this arm avoids needing one by
+    /// keeping both sides in memory.
+    #[test]
+    fn ack_is_written_only_when_the_legacy_hash_moves() {
+        let hash = guest_registry_canonical_hash(&test_folio("CH1", &[("A", None)]));
+        assert!(
+            guest_registry_ack_needs_write(None, &hash),
+            "an unseen folio must be acked"
+        );
+        assert!(
+            !guest_registry_ack_needs_write(Some(&hash), &hash),
+            "a stable folio must not re-write its ack row every tick"
+        );
+        let moved = guest_registry_canonical_hash(&test_folio("CH1", &[("B", None)]));
+        assert!(guest_registry_ack_needs_write(Some(&hash), &moved));
+    }
+
+    /// SQL-shape pins for the canonical side. The name expression MUST be
+    /// the mapper's own (single-sourced), the primary-guest filter MUST be
+    /// present and NULL-safe, and the era floor MUST be canonical-derived
+    /// with no timezone shift and a day truncation.
+    #[test]
+    fn canonical_registry_sql_shapes_are_pinned() {
+        let folios = canonical_registry_folios_sql();
+        assert!(
+            folios.contains(CANONICAL_COMPANION_NAME_SQL),
+            "the canonical projection must reuse the mapper's name expression \
+             verbatim, else an app-created companion hashes differently on the \
+             two sides forever: {folios}"
+        );
+        assert!(
+            folios.contains(CANONICAL_COMPANION_PRIMARY_FILTER),
+            "a registered PRIMARY guest is not a companion: {folios}"
+        );
+        assert_eq!(
+            CANONICAL_COMPANION_PRIMARY_FILTER,
+            "COALESCE(guest_is_primary, false) = false",
+            "the column is nullable; a bare `= false` drops NULL rows out of \
+             the canonical folio and reports them as legacy-only forever"
+        );
+        assert!(
+            folios.contains("JOIN ht_checkins ON ht_checkins.cin_id = ht_guest_registry.guest_cin_id"),
+            "join companion → check-in, never the reverse: a duplicate \
+             legacy_cin_no would otherwise duplicate companion lines: {folios}"
+        );
+        assert!(folios.contains("ht_checkins.cin_checkin_time >= $1"), "{folios}");
+
+        let floor = guest_registry_era_floor_sql();
+        assert!(floor.contains("MIN(ht_checkins.cin_checkin_time)"), "{floor}");
+        assert!(floor.contains("FROM ht_guest_registry"), "{floor}");
+        assert!(
+            floor.contains("date_trunc('day'"),
+            "widen to the start of the day so the mirror's first day is fully \
+             covered: {floor}"
+        );
+        assert!(
+            !floor.contains("INTERVAL"),
+            "the floor is derived from and compared against the SAME canonical \
+             column — any offset here narrows it and silently drops in-era \
+             folios: {floor}"
+        );
+        assert!(
+            floor.contains(CANONICAL_COMPANION_PRIMARY_FILTER),
+            "coverage is measured over companions, not registered primaries: {floor}"
+        );
+        assert!(
+            floor.contains("ht_guest_registry.guest_legacy_id IS NOT NULL"),
+            "\"mirrored\" means STAMPED BY THE CT MAPPER. App-authored companions \
+             (POST /api/checkins/{{id}}/guests, the migration-070 registration \
+             capture) have no legacy counterpart at all while \
+             TM30_COMPANION_WRITEBACK_ENABLED is false, so counting them as \
+             coverage claims an era the mirror never covered: {floor}"
+        );
+    }
+
+    /// The floor is a low-water mark on the PARENT's check-in time, so ONE
+    /// pre-era folio gaining a mirrored companion (iHOTEL's DELETE+REINSERT
+    /// edit on a 2023 folio — the mapper resolves the parent by
+    /// `legacy_cin_no` with no era restriction) would drag it back years and
+    /// admit ~all 20,423 legacy folios instead of 830. The persisted
+    /// watermark is what makes scope monotonically NARROWING.
+    #[test]
+    fn era_floor_is_clamped_to_a_non_decreasing_watermark() {
+        let old = chrono::NaiveDate::from_ymd_opt(2023, 4, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let era = chrono::NaiveDate::from_ymd_opt(2026, 5, 13)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+
+        assert_eq!(
+            clamped_era_floor(Some(era), Some(old)),
+            Some(era),
+            "a derived floor BELOW the watermark is the one-old-companion drag; \
+             it must not widen the scan"
+        );
+        assert_eq!(
+            clamped_era_floor(Some(old), Some(era)),
+            Some(era),
+            "a derived floor ABOVE the watermark is genuine narrowing and wins"
+        );
+        assert_eq!(
+            clamped_era_floor(None, Some(era)),
+            Some(era),
+            "first tick: the derived value seeds the watermark"
+        );
+        assert_eq!(
+            clamped_era_floor(Some(era), None),
+            Some(era),
+            "every mirrored companion vanishing must NOT reopen the whole history \
+             — hold the watermark and let the divergence cap page"
+        );
+        assert_eq!(
+            clamped_era_floor(None, None),
+            None,
+            "no coverage was ever established ⇒ the arm skips the legacy scan"
+        );
+    }
+
+    /// The clamp has to hold across PROCESSES (the backend scheduler and
+    /// `bin/sync` can tick the same database), so `GREATEST` lives in SQL
+    /// and the read is the same round trip as the write. A hand-edited
+    /// floor moved FORWARD is the documented remedy for a bad bootstrap
+    /// reading, and `GREATEST` is what makes that edit stick.
+    #[test]
+    fn era_floor_watermark_sql_is_monotonic_and_single_round_trip() {
+        assert!(
+            RECONCILE_ERA_FLOOR_UPSERT_SQL.contains(
+                "GREATEST(ht_reconcile_era_floor.era_floor, EXCLUDED.era_floor)"
+            ),
+            "without GREATEST the upsert would happily write a LOWER floor: \
+             {RECONCILE_ERA_FLOOR_UPSERT_SQL}"
+        );
+        assert!(
+            RECONCILE_ERA_FLOOR_UPSERT_SQL.ends_with("RETURNING era_floor"),
+            "the post-clamp value must come back from the same statement, else a \
+             concurrent tick's value is silently ignored: \
+             {RECONCILE_ERA_FLOOR_UPSERT_SQL}"
+        );
+        assert!(RECONCILE_ERA_FLOOR_SELECT_SQL.contains("FROM ht_reconcile_era_floor"));
+        assert_eq!(
+            GUEST_REGISTRY_ERA_FLOOR_KEY, "guest_registry",
+            "same literal as ht_reconcile_log.table_name / sync_status.entity_type, \
+             so one operator query joins all three"
+        );
+    }
+
+    /// The circuit breaker. Anything past the cap is a scope bug or a dead
+    /// mirror, not a backlog: the tick must abort whole, never truncate.
+    #[test]
+    fn divergence_cap_trips_only_strictly_above_the_cap() {
+        assert!(!divergence_cap_exceeded(0, 500));
+        assert!(!divergence_cap_exceeded(499, 500));
+        assert!(
+            !divergence_cap_exceeded(500, 500),
+            "the cap is a ceiling the tick may reach, not one it may not touch"
+        );
+        assert!(divergence_cap_exceeded(501, 500));
+        // The flood this exists for: floor dragged to 2023 at HF Hotel.
+        assert!(divergence_cap_exceeded(19_600, 500));
+    }
+
+    /// The default is not a taste call: enqueuing more findings per tick
+    /// than `auto_resolve_reconcile_log` can even LOOK at per tick is the
+    /// mechanism behind every flood incident here — the backlog never
+    /// drains and the age-ordered batch starves every other entity. 500 is
+    /// that sweep's own `LIMIT`; if it ever moves, move this with it.
+    #[test]
+    fn divergence_cap_default_matches_the_auto_resolve_batch() {
+        assert_eq!(GUEST_REGISTRY_DIVERGENCE_CAP_DEFAULT, 500);
+        // …and it must dwarf the steady state: 830 in-era folios at HF
+        // Hotel with ~12 findings, 574 with ~29 at Ville (live 2026-07-28).
+        assert!(GUEST_REGISTRY_DIVERGENCE_CAP_DEFAULT > 29 * 10);
+    }
+
+    /// Resolution chain + strict positivity: a zero or negative cap would
+    /// make `divergence_cap_exceeded` trip on a perfectly healthy tick and
+    /// wedge the arm shut.
+    #[test]
+    fn divergence_cap_resolves_per_site_and_stays_positive() {
+        assert!(guest_registry_divergence_cap("hfhotel") > 0);
+        assert_eq!(
+            guest_registry_divergence_cap("hfville"),
+            GUEST_REGISTRY_DIVERGENCE_CAP_DEFAULT,
+            "unset ⇒ the compiled-in default on every site"
+        );
+    }
+
+    /// A cap breach is announced under its own namespaced key, so the
+    /// sync-lag all-clear can never mistake it for the table
+    /// `guest_registry`, delete its cooldown and un-throttle the page to
+    /// once per tick.
+    #[test]
+    fn reconcile_cap_cooldown_key_is_namespaced_and_unique() {
+        let key = reconcile_cap_cooldown_key("guest_registry");
+        assert_eq!(key, "reconcile_cap:guest_registry");
+        assert!(!is_reconcile_table_key(&key));
+        for other in [
+            "ct_retention_overflow:",
+            "escalated:",
+            "burst:",
+            "ct_watcher_lag:",
+            "shadow_mode:",
+            "boot_refusal:",
+        ] {
+            assert!(
+                !key.starts_with(other) && !other.starts_with("reconcile_cap:"),
+                "the reconcile_cap family must not prefix-collide with {other}"
+            );
+        }
+    }
+
+    /// The scope gate. Pre-coverage folios and folios with no canonical
+    /// parent are BOTH out of scope: the first can never converge (no
+    /// historical backfill of `ht_guest_registry`), the second is a
+    /// check-ins problem `sync_checkins` already reports.
+    #[test]
+    fn in_era_key_set_sql_is_the_scope_gate() {
+        assert!(IN_ERA_CHECKIN_KEYS_SQL.contains("FROM ht_checkins"));
+        assert!(IN_ERA_CHECKIN_KEYS_SQL.contains("legacy_cin_no IS NOT NULL"));
+        assert!(IN_ERA_CHECKIN_KEYS_SQL.contains("cin_checkin_time >= $1"));
+        // The per-PK canonical probe resolves its parent the same way the
+        // CT mapper does, so the sweep lands on the same folio.
+        assert_eq!(
+            CANONICAL_CHECKIN_ID_PROBE_SQL,
+            "SELECT cin_id FROM ht_checkins WHERE legacy_cin_no = $1 LIMIT 1"
+        );
+    }
+
+    /// Track J1 — projection lock. The IDENTITY `id` must stay OUT (it is
+    /// the very thing the folio unit exists to ignore), the iHOTEL typo
+    /// `Cin_contry` stays verbatim, and `Cin_no` is the lowercase-n variant.
+    #[test]
+    fn guest_registry_reconcile_projection_is_subset_of_legacy_schema() {
+        crate::assert_projection_slice_subset!(
+            GUEST_REGISTRY_RECONCILE_PROJECTION,
+            "HT_CheckIn_Other_People"
+        );
+        assert!(
+            !GUEST_REGISTRY_RECONCILE_PROJECTION.contains(&"id"),
+            "hashing the legacy IDENTITY re-creates the DELETE+reinsert false \
+             positive the folio unit exists to remove"
+        );
+        assert!(GUEST_REGISTRY_RECONCILE_PROJECTION.contains(&"Cin_contry"));
+        assert!(!GUEST_REGISTRY_RECONCILE_PROJECTION.contains(&"Cin_country"));
+        assert!(!GUEST_REGISTRY_RECONCILE_PROJECTION.contains(&"Cin_No"));
+    }
+
+    // -------------------------------------------------------------------
     // Force-converge outcome classification — the gate ⊂ hash tripwire
     // (2026-07-28). Pure, no DB.
     // -------------------------------------------------------------------
@@ -9187,7 +10518,10 @@ mod tests {
     /// `bin/sync.rs` gets from `ct_retention_overflow:<table>`.
     #[test]
     fn escalated_cooldown_key_cannot_collide_with_an_entity_name() {
-        for table in ["bookings", "customers", "checkins", "rooms"] {
+        // `guest_registry` (Phase 6-B) is the first entity name carrying an
+        // underscore — it must still read as a bare reconcile table key
+        // (no `:`), and must not collide with any namespaced family.
+        for table in ["bookings", "customers", "checkins", "rooms", "guest_registry"] {
             let key = escalated_cooldown_key(table);
             assert_ne!(key, table, "escalation key must not equal the entity name");
             assert!(
@@ -9230,6 +10564,7 @@ mod tests {
                 "customers",
                 "escalated:bookings",
                 "burst:checkins",
+                "reconcile_cap:guest_registry",
                 // Parked by bin/sync.rs in the same shared table.
                 "ct_retention_overflow:HT_Customers",
                 "ct_watcher_lag:global",

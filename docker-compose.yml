@@ -340,6 +340,34 @@ services:
       # escalation tier will fire on any that sit. This backend runs HF Hotel's
       # reconcile; sync-hfville runs Ville's (its own HFVILLE_ override below).
       - RECONCILE_PAYMENTS_ARM_ENABLED=${RECONCILE_PAYMENTS_ARM_ENABLED:-false}
+      # Phase 6-B — `guest_registry` reconcile arm (legacy
+      # HT_CheckIn_Other_People ↔ canonical ht_guest_registry). Reconciles per
+      # FOLIO (the whole companion set of one Cin_no), NOT per row: iHOTEL
+      # edits companions by DELETE+REINSERT, so per-row keying would report a
+      # divergence on every correctly-applied edit. DETECTION ONLY: it records
+      # into ht_reconcile_log and writes nothing but its own ack cache
+      # (ht_guest_registry_legacy, migration 081); it is deliberately NOT in
+      # FORCE_CONVERGE_VALUE_DRIFT_TABLES / REINGEST_MISSING_PG_TABLES —
+      # "repairing" a folio would mean DELETING canonical companion rows,
+      # i.e. a sweep destroying TM.30 immigration-registry state.
+      #
+      # SHIPS DARK. With this false, run_sync never calls sync_guest_registry,
+      # so the arm issues zero MSSQL and zero PG queries. Enable HF VILLE
+      # FIRST, soak 48h, then HF Hotel — in an announced window.
+      #
+      # SCOPE: folios are admitted only when their parent check-in exists in
+      # canonical AND is at/after the mirror's own coverage era (derived from
+      # MIN(ht_checkins.cin_checkin_time) over check-ins carrying a mirrored
+      # companion; never configured). ht_guest_registry is CT-populated with
+      # no historical backfill while ht_checkins IS backfilled to 2021, so
+      # unfloored the first tick would open ~19.6k rows here (HF Hotel) that
+      # can NEVER close and would starve the 500-row auto-resolve batch.
+      # Floored, live 2026-07-28: 830 in-era legacy folios vs 818 canonical
+      # (~12 first-enable finds). Each needs OPERATOR ACTION — nothing
+      # auto-closes it, and the >72h escalation tier will fire on any that
+      # sit. This backend runs HF Hotel's reconcile; sync-hfville runs
+      # Ville's (its own HFVILLE_ override below).
+      - RECONCILE_GUEST_REGISTRY_ARM_ENABLED=${RECONCILE_GUEST_REGISTRY_ARM_ENABLED:-false}
       # Tracing log level. Default `hotel_backend=info,tower_http=info`
       # matches `main.rs::tracing_subscriber::EnvFilter::try_from_default_env`'s
       # fallback. Override at deploy time to crank up debug logging
@@ -566,6 +594,11 @@ services:
       # at its default-false). Carried here so the two HF Hotel processes never
       # read differently. Ships DARK; see the backend service for the rollout.
       - RECONCILE_PAYMENTS_ARM_ENABLED=${RECONCILE_PAYMENTS_ARM_ENABLED:-false}
+      # Phase 6-B `guest_registry` (companion folio) reconcile arm — INERT in
+      # this process for the same reason as the two knobs above. Carried here
+      # so the two HF Hotel processes never read differently. Ships DARK; see
+      # the backend service for the rollout.
+      - RECONCILE_GUEST_REGISTRY_ARM_ENABLED=${RECONCILE_GUEST_REGISTRY_ARM_ENABLED:-false}
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,sync=info}
     secrets:
       - db_password
@@ -719,6 +752,19 @@ services:
       # the canonical era floor (PAYMENTS_ERA_FLOOR_SQL) exists to bound, not
       # this soak. Findings need operator action; nothing here auto-closes.
       - RECONCILE_PAYMENTS_ARM_ENABLED=${HFVILLE_RECONCILE_PAYMENTS_ARM_ENABLED:-false}
+      # Phase 6-B — `guest_registry` (companion folio) reconcile arm (legacy
+      # HT_CheckIn_Other_People ↔ canonical ht_guest_registry, keyed on Cin_no,
+      # compared per FOLIO). DETECTION ONLY; writes nothing but its own ack
+      # cache (ht_guest_registry_legacy, migration 081). This worker runs
+      # Ville's reconcile, so the knob is LIVE here — and Ville is the canary:
+      # enable HERE first, soak 48h, then flip the backend (HF Hotel).
+      # Ships DARK. Unlike the payments canary this one is REPRESENTATIVE:
+      # Ville has 2,184 legacy companion folios and 545 canonical ones, the
+      # same shape and era boundary as HF Hotel, so the ~29 first-enable finds
+      # here really do predict HF Hotel's ~12. Findings need operator action;
+      # nothing here auto-closes, and a TM.30 under-count is the exact class
+      # this arm exists to surface.
+      - RECONCILE_GUEST_REGISTRY_ARM_ENABLED=${HFVILLE_RECONCILE_GUEST_REGISTRY_ARM_ENABLED:-false}
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,sync=info}
     secrets:
       - db_password

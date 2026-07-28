@@ -976,7 +976,11 @@ INSERT INTO sync_status (entity_type) VALUES
     -- Migration 080 — Phase 6-A payments reconcile arm (ships DARK behind
     -- RECONCILE_PAYMENTS_ARM_ENABLED). `record_success` UPDATEs by
     -- entity_type, so the row must exist or the counters silently no-op.
-    ('payments')
+    ('payments'),
+    -- Migration 081 — Phase 6-B guest-registry (companion folio) reconcile
+    -- arm (ships DARK behind RECONCILE_GUEST_REGISTRY_ARM_ENABLED). Same
+    -- reason: `record_success` UPDATEs by entity_type.
+    ('guest_registry')
 ON CONFLICT (entity_type) DO NOTHING;
 
 -- Add source column to existing tables
@@ -2714,6 +2718,47 @@ CREATE INDEX IF NOT EXISTS ix_ht_payments_pay_reference
 
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('080', '080_ht_receipts_legacy.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- -----------------------------------------------------------------------------
+-- Migration 081 — `ht_guest_registry_legacy`, the per-FOLIO ack cache for the
+-- Phase 6-B `guest_registry` reconcile arm (legacy `HT_CheckIn_Other_People` ↔
+-- canonical `ht_guest_registry`). The `sync_status` seed row rides the
+-- `sync_status` INSERT above.
+--
+-- The unit of reconciliation is the FOLIO (every companion sharing one
+-- `Cin_no`), not the row: iHOTEL edits companions by DELETE+REINSERT, so a
+-- per-row arm would false-positive on every edit. The arm SHIPS DARK
+-- (`RECONCILE_GUEST_REGISTRY_ARM_ENABLED`, compose default false); with the
+-- flag off this table simply stays empty. Cache ONLY — never canonical state.
+-- No new index (every lookup is covered by ix_ht_guestreg_checkin /
+-- ix_ht_checkins_legacy_cin_no / ix_ht_checkins_checkin). See
+-- migrations/pg/081_ht_guest_registry_legacy.sql for the full rationale.
+-- -----------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS ht_guest_registry_legacy (
+    id         SERIAL PRIMARY KEY,
+    cin_no     VARCHAR(50) NOT NULL UNIQUE,
+    sync_hash  VARCHAR(64),
+    synced_at  TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS ix_guest_registry_legacy_synced
+    ON ht_guest_registry_legacy(synced_at);
+
+-- ht_reconcile_era_floor — durable, non-decreasing scope watermark per
+-- reconcile arm. Seeded lazily by the arm on its first tick and thereafter
+-- moved only FORWARD (GREATEST clamp in the upsert), so one historical row
+-- gaining a mirrored counterpart cannot drag a derived MIN() floor backwards
+-- and expand the scan by years (~19.6k permanently-open rows at HF Hotel).
+-- Operators may move a floor forward by hand; the clamp makes that stick.
+CREATE TABLE IF NOT EXISTS ht_reconcile_era_floor (
+    table_name  VARCHAR(50)  PRIMARY KEY,
+    era_floor   TIMESTAMP    NOT NULL,
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('081', '081_ht_guest_registry_legacy.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================
