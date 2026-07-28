@@ -60,7 +60,7 @@
 //! instead of re-firing it. The mirror's data columns are intentionally
 //! left stale — the CT watcher owns canonical state.
 
-use chrono::NaiveDateTime;
+use chrono::{NaiveDate, NaiveDateTime};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -94,6 +94,54 @@ use crate::sync::mappers::guest_registry::{
 };
 use crate::sync::mappers::{CustomerMapper, RoomMasterMapper};
 use crate::sync::row::MappableRow;
+
+// =============================================================================
+// Scheduler-side structured-event registry (issue #267)
+// =============================================================================
+//
+// `bin/sync.rs` owns `KNOWN_SYNC_EVENT_NAMES`, the registry for the CT
+// watcher's `sync.*` failure taxonomy. That registry is BINARY-local and
+// unreachable from here — a library module cannot depend on a `bin` target —
+// so the scheduler keeps its own list rather than one merged cross-binary
+// registry. Issue #267 asked for that call to be made explicitly: it stays
+// SPLIT, and not only because the merge is mechanically impossible. The two
+// populations have different contracts:
+//
+//   * watcher names are dot-namespaced (`sync.…`) and are additionally
+//     PERSISTED, prefixed, into `legacy_sync_status.last_error`, so an
+//     operator triaging a stalled table still sees the failure MODE after the
+//     log line has aged out;
+//   * scheduler names are log-only tripwires consumed by `/diagnose-alert`
+//     greps and dashboards. They are deliberately UNPREFIXED — renaming the
+//     live `force_converge_gate_skip` to fit someone else's namespace would
+//     break the exact grep contract this registry exists to protect.
+//
+// The two namespaces stay disjoint (no dots here — pinned below), so a Loki
+// filter of `^sync\.` still means "the CT watcher" and nothing else.
+//
+// Adding a new scheduler event: declare an `EV_…` const HERE, hand that const
+// (never a bare string literal) to the `tracing::…!` call site, and add it to
+// `KNOWN_SCHEDULER_EVENT_NAMES`. All three steps are mechanically enforced by
+// the registry lock tests at the bottom of this file — a raw literal at a
+// call site, or a const missing from the registry, fails the test gate.
+
+/// The auto-resolve sweep re-drove a row through the CT mapper, the mapper
+/// reported "nothing to do" AND canonical did not move, yet the row is still
+/// unconverged — i.e. the mapper's idempotency gate covers FEWER fields than
+/// the reconcile hash (a gate ⊄ hash violation). Such a row can never
+/// self-heal, and the watcher will never see a CT event for it either.
+/// Emitted by BOTH self-heal arms; the `arm` field discriminates
+/// (`value_drift` / `missing_pg`).
+pub(crate) const EV_FORCE_CONVERGE_GATE_SKIP: &str = "force_converge_gate_skip";
+
+/// Registry of every structured event this module emits. Membership-tested,
+/// not pattern-matched — order is not significant.
+///
+/// `#[allow(dead_code)]`: the array itself is referenced only by the registry
+/// lock tests (the `EV_*` constants it holds are used at their call sites).
+/// Same shape as `bin/sync.rs`'s `KNOWN_SYNC_EVENT_NAMES`.
+#[allow(dead_code)]
+const KNOWN_SCHEDULER_EVENT_NAMES: &[&str] = &[EV_FORCE_CONVERGE_GATE_SKIP];
 
 /// Default per-table drift-count threshold above which a Slack alert is
 /// fired on the next reconcile tick. 50 unresolved rows for a single
@@ -3018,10 +3066,15 @@ pub(crate) const RECONCILE_RESOLVABLE_TABLES: &[&str] = &[
     "mirror_ht_bill_debt_ds",
     "mirror_ht_rooms_cancel",
     "mirror_ht_book_pro",
-    // `observe_only` — it records nothing today (its gap has no closure
-    // path, see the `mirror_probe` module docs), but it stays listed and
-    // dispatched so an aggregate row written by an older binary still has a
-    // way to converge instead of sitting open and unrecognised.
+    // DETECTION is still `observe_only` (see the `mirror_probe` module
+    // docs) — the probe records nothing today. RESOLUTION is not: since
+    // issue #273 the calendar's `<aggregate>` row resolves on the BUSINESS
+    // key `(room, night)` rather than on `rcal_legacy_id`, so a row written
+    // by an older binary — or by the day detection is re-keyed and flipped
+    // — measures a gap a re-drive can actually close, instead of an
+    // id-binding artefact that nothing can. Pinned by
+    // `ROOM_CALENDAR_PROBE_KEY`; see the closure-arm section for what
+    // remains deferred.
     "mirror_ht_room_calendar",
     // Phase 6-D payment-ledger probe. Same population as the 6-C probes (not
     // an entity contract — `mirror_payment_ledger` DELETEs the folio and
@@ -3140,6 +3193,21 @@ async fn compute_current_pg_hash(
                 .as_ref()
                 .map(guest_registry_canonical_hash))
         }
+        // Issue #273 — the calendar's `<aggregate>` row resolves on the
+        // BUSINESS key `(room, night)`. Deliberately AHEAD of the generic
+        // probe arm below: that arm recomputes the `rcal_legacy_id`-keyed
+        // aggregate, which is never-equal by construction (the mapper NULLs
+        // the id on an allocator rebind and nothing restores it), so a
+        // calendar row dispatched there could never converge. Per-PK calendar
+        // rows — which the probe cannot produce, it is `per_pk: false` — fall
+        // through to the generic arm unchanged.
+        t if t == ROOM_CALENDAR_PROBE_KEY
+            && legacy_pk == crate::scheduler::mirror_probe::MIRROR_AGGREGATE_PK =>
+        {
+            Ok(Some(
+                compute_room_calendar_business_key_pg_hash(pg_pool).await?,
+            ))
+        }
         // Phase 6-C. `legacy_pk` is either a real mirrored key or the
         // `<aggregate>` sentinel. Never `Ok(None)` for a registered probe:
         // an ABSENT key hashes to `mirror_absent_hash` so a row deleted on
@@ -3217,6 +3285,18 @@ async fn compute_current_legacy_hash(
         "rooms" => fetch_legacy_room_hash(legacy_pool, legacy_pk).await,
         "payments" => fetch_legacy_payment_hash(legacy_pool, legacy_pk).await,
         "guest_registry" => fetch_legacy_registry_folio_hash(legacy_pool, legacy_pk).await,
+        // Issue #273 — calendar business-key arm. Sibling of the
+        // `compute_current_pg_hash` arm and ordered ahead of the generic
+        // probe arm for the same reason (the id-keyed aggregate is
+        // never-equal by construction). Reads `pg_pool` for the era floor:
+        // the coverage boundary is a `MIN(rcal_date)` over the MIRROR.
+        t if t == ROOM_CALENDAR_PROBE_KEY
+            && legacy_pk == crate::scheduler::mirror_probe::MIRROR_AGGREGATE_PK =>
+        {
+            Ok(Some(
+                compute_room_calendar_business_key_legacy_hash(legacy_pool, pg_pool).await?,
+            ))
+        }
         // Phase 6-C — mirror probes. Sibling of the `compute_current_pg_hash`
         // arm; same absent-is-a-real-hash contract.
         t if crate::scheduler::mirror_probe::probe_for_table(t).is_some() => {
@@ -3493,6 +3573,215 @@ async fn fetch_legacy_registry_folio_hash(
         push_legacy_companion(&mut folio, row);
     }
     Ok(Some(guest_registry_canonical_hash(&folio)))
+}
+
+// =============================================================================
+// Calendar closure arm (issue #273) — business-key resolve for
+// `mirror_ht_room_calendar`
+// =============================================================================
+//
+// ## What was broken
+//
+// Phase 6-C shipped the generic mirror probe over `ht_room_calendar` and
+// dispatched its resolve through `mirror_probe::resolve_{pg,legacy}_hash`,
+// like every sibling. For this ONE table that dispatch can never converge:
+// the generic resolve is keyed on `rcal_legacy_id`, and `RoomCalendarMapper`
+// deliberately NULLs that column whenever iHOTEL's `MAX(id)+1` allocator
+// rebinds an id onto a different `(room, night)` slot. Nothing restores it,
+// so the mirror's non-NULL id population is STRUCTURALLY below the legacy row
+// count and the two aggregates are never-equal by construction. A calendar
+// row reaching that arm would sit open forever no matter what an operator
+// did — detection with no possible closure, which is why the probe shipped
+// `observe_only`.
+//
+// ## What this arm changes
+//
+// The `<aggregate>` row now resolves on the BUSINESS key `(room, night)` —
+// the same key the mapper UPSERTs on — so the comparison measures the gap
+// that a re-drive can actually close, instead of an id-binding artefact that
+// nothing can. Canonical is UNIQUE on `(rcal_room_id, rcal_date)`, so its
+// `COUNT(*)` IS a distinct-night count; the legacy side must therefore count
+// DISTINCT `(room_no, night)` pairs, because `HT_Room_Status` carries no such
+// constraint and the app-side allocator can and does duplicate them.
+//
+// Canonical-only tiles (`rcal_legacy_id IS NULL`) are COUNTED here, unlike in
+// the id-keyed probe which filters them out. That reversal is the point: a
+// row whose id the mapper NULLed still occupies a real `(room, night)` slot
+// that legacy also has, and excluding it would re-introduce exactly the
+// structural undercount the business key exists to dodge. Note that
+// `rcal_legacy_id IS NULL` cannot distinguish "app-authored tile" from
+// "rebind-NULLed tile" — that indistinguishability IS the id key's defect,
+// and the business key is deliberately blind to it.
+//
+// ## Known limitation of the aggregate shape
+//
+// Counts + boundaries are a NET comparison: equal-and-opposite gaps (N nights
+// only in legacy, N only in canonical) would cancel and read as converged.
+// That is the same trade every sibling probe makes, and the directional
+// answer belongs to DETECTION (`mirror_probe::diff_mirror_rows`), not to a
+// resolve arm — so it lands with the detection re-key below, not here. The
+// `MIN`/`MAX` night boundaries already catch the common one-sided case where
+// the missing nights sit at an edge of the window.
+//
+// ## What is still deferred (issue #273, deliverables 2 and 3)
+//
+// This is the CLOSURE half only. Detection stays `observe_only` in
+// `scheduler::mirror_probe` and MUST stay there until:
+//
+//   1. a remediation path exists — a re-drive/backfill that actually closes a
+//      genuine night gap (the live deficit survives a business-key comparison
+//      today: 1546 legacy nights vs 1420 canonical at HF Hotel), and
+//   2. the probe's DETECTION aggregate is re-keyed onto the business key too.
+//
+// (2) is not cosmetic: flipping `observe_only` while detection still counts
+// id-keyed rows would record a row on the never-equal id gap that THIS arm
+// then closes on the business key the very next tick — a record/resolve churn
+// loop. Detection and resolution must agree on the key before the flag moves.
+
+/// `ht_reconcile_log.table_name` of the Phase 6-C calendar mirror probe.
+///
+/// One literal shared by the resolve dispatches and the tests so they cannot
+/// drift from the probe registry; pinned against
+/// `mirror_probe::probe_for_table` by
+/// `room_calendar_probe_key_matches_the_registered_mirror_probe`.
+pub(crate) const ROOM_CALENDAR_PROBE_KEY: &str = "mirror_ht_room_calendar";
+
+/// Canonical side of the calendar business-key comparison: the distinct
+/// night count plus the coverage boundaries.
+///
+/// `MIN(rcal_date)` rides along because it IS the era floor pushed into the
+/// legacy scan — the same lesson as [`PAYMENTS_ERA_FLOOR_SQL`] and the mirror
+/// probe's `MIN(pk)`. A mirror that was never backfilled cannot be held
+/// responsible for legacy history predating it, and reporting that history
+/// builds a permanently unresolvable backlog that starves every other entity
+/// out of `auto_resolve_reconcile_log`'s age-ordered 500-row batch. The floor
+/// is DERIVED, never configured, and re-derived on every sweep so a floor
+/// that MOVES (because the mirror finally received its missing history) is
+/// picked up on the next tick instead of pinning the row to a stale boundary.
+///
+/// The canonical side needs no `WHERE` of its own: every canonical row is by
+/// construction at or after its own `MIN(rcal_date)`.
+const ROOM_CALENDAR_BUSINESS_KEY_PG_SQL: &str = "SELECT COUNT(*)::bigint AS night_count, \
+     MIN(rcal_date) AS min_date, \
+     MAX(rcal_date) AS max_date \
+       FROM ht_room_calendar";
+
+/// Legacy side of the same comparison, floored at the canonical `MIN`.
+///
+/// `floored = false` (an EMPTY canonical calendar) scans the whole legacy
+/// table on purpose — with no coverage at all, "legacy has N nights and we
+/// have none" IS the finding, and it lands as one bounded aggregate row.
+/// Same contract as `mirror_probe::legacy_floor_filter`.
+///
+/// `CAST(room_date AS DATE)` normalises the legacy `datetime` (naive local
+/// Thai) down to the night, which is what the canonical `DATE` column holds.
+/// The boundaries come back as ISO `varchar(10)` (style 23) rather than a
+/// driver-mapped date so both sides hash byte-identical `YYYY-MM-DD` text.
+pub(crate) fn room_calendar_business_key_legacy_sql(floored: bool) -> String {
+    let floor = if floored {
+        " AND CAST(room_date AS DATE) >= CAST(@P1 AS DATE)"
+    } else {
+        ""
+    };
+    format!(
+        "SELECT COUNT_BIG(*) AS night_count, \
+         CONVERT(varchar(10), MIN(night_date), 23) AS min_date, \
+         CONVERT(varchar(10), MAX(night_date), 23) AS max_date \
+           FROM (SELECT DISTINCT room_no, CAST(room_date AS DATE) AS night_date \
+                   FROM HT_Room_Status \
+                  WHERE room_no IS NOT NULL AND room_date IS NOT NULL{floor}) AS nights"
+    )
+}
+
+/// Hash of one side's in-era calendar business-key aggregate.
+///
+/// The `business_key` discriminator makes this provably incapable of
+/// colliding with `mirror_probe::mirror_aggregate_hash` for the same probe
+/// key — the two comparisons measure different things and must never be
+/// mistaken for one another mid-migration.
+///
+/// Absent boundaries hash as the empty segment, so an EMPTY calendar on both
+/// sides produces equal non-empty hashes and `should_auto_resolve` closes the
+/// row. Absent-on-both is a real converged state for a mirror, exactly as in
+/// `mirror_probe::mirror_absent_hash`; returning "no hash" instead would
+/// leave such a row open forever.
+pub(crate) fn room_calendar_business_key_hash(
+    night_count: i64,
+    min_date: Option<&str>,
+    max_date: Option<&str>,
+) -> String {
+    sha256(&join_hash_segments(&[
+        ROOM_CALENDAR_PROBE_KEY.to_string(),
+        crate::scheduler::mirror_probe::MIRROR_AGGREGATE_PK.to_string(),
+        "business_key".to_string(),
+        night_count.to_string(),
+        min_date.unwrap_or_default().to_string(),
+        max_date.unwrap_or_default().to_string(),
+    ]))
+}
+
+/// One PG round-trip: `(distinct night count, MIN(night), MAX(night))`.
+/// Shared by both resolve halves — the legacy half needs the `MIN` as its
+/// coverage floor.
+async fn fetch_calendar_business_key_pg(
+    pg_pool: &PgPool,
+) -> Result<(i64, Option<NaiveDate>, Option<NaiveDate>), sqlx::Error> {
+    sqlx::query_as::<_, (i64, Option<NaiveDate>, Option<NaiveDate>)>(
+        ROOM_CALENDAR_BUSINESS_KEY_PG_SQL,
+    )
+    .fetch_one(pg_pool)
+    .await
+}
+
+/// Canonical-side business-key hash. Never `None`: an empty calendar is a
+/// real, hashable state (see [`room_calendar_business_key_hash`]).
+async fn compute_room_calendar_business_key_pg_hash(
+    pg_pool: &PgPool,
+) -> Result<String, sqlx::Error> {
+    let (night_count, min_date, max_date) = fetch_calendar_business_key_pg(pg_pool).await?;
+    Ok(room_calendar_business_key_hash(
+        night_count,
+        min_date.map(|d| d.to_string()).as_deref(),
+        max_date.map(|d| d.to_string()).as_deref(),
+    ))
+}
+
+/// Legacy-side business-key hash, floored at the canonical coverage
+/// boundary.
+///
+/// Cost: ONE PG aggregate + ONE MSSQL aggregate per sweep, and only when an
+/// open calendar aggregate row exists — `record_divergence`'s dedupe allows
+/// at most one per site, so this cannot grow with table size.
+///
+/// Errors propagate to `auto_resolve_reconcile_log`, which already logs and
+/// `continue`s per row: one arm's failure costs one row this tick, never the
+/// cycle (the sibling error-isolation contract).
+async fn compute_room_calendar_business_key_legacy_hash(
+    legacy_pool: &DbPool,
+    pg_pool: &PgPool,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let (_, floor, _) = fetch_calendar_business_key_pg(pg_pool).await?;
+    let floor_text = floor.map(|d| d.to_string());
+    let sql = room_calendar_business_key_legacy_sql(floor_text.is_some());
+
+    let mut conn = legacy_pool.get().await?;
+    let mut q = Query::new(sql);
+    if let Some(f) = floor_text.as_deref() {
+        q.bind(f);
+    }
+    let rows = q.query(&mut conn).await?.into_first_result().await?;
+    drop(conn);
+
+    // An aggregate SELECT always returns exactly one row; treat a missing
+    // one as "no legacy nights in era" rather than erroring the sweep row.
+    let Some(row) = rows.first() else {
+        return Ok(room_calendar_business_key_hash(0, None, None));
+    };
+    Ok(room_calendar_business_key_hash(
+        row.try_get::<i64, _>("night_count").ok().flatten().unwrap_or(0),
+        row.try_get::<&str, _>("min_date").ok().flatten(),
+        row.try_get::<&str, _>("max_date").ok().flatten(),
+    ))
 }
 
 /// Issue #204 (bug #2) — is the durable self-healing arm of the
@@ -4289,9 +4578,11 @@ async fn auto_resolve_reconcile_log(
                             // will never see a CT event for it either. Emitted
                             // INSTEAD of the generic warn below (one line per
                             // row per tick — no alert storm), with a stable
-                            // `event_name` for `/diagnose-alert` to grep.
+                            // event name for `/diagnose-alert` to grep —
+                            // [`EV_FORCE_CONVERGE_GATE_SKIP`], registered in
+                            // [`KNOWN_SCHEDULER_EVENT_NAMES`] (issue #267).
                             tracing::warn!(
-                                event_name = "force_converge_gate_skip",
+                                event_name = EV_FORCE_CONVERGE_GATE_SKIP,
                                 arm = "value_drift",
                                 site = %site_id,
                                 id,
@@ -4433,7 +4724,7 @@ async fn auto_resolve_reconcile_log(
                             // so a mapper that wrote nothing and moved nothing
                             // means the re-ingest silently did not happen.
                             tracing::warn!(
-                                event_name = "force_converge_gate_skip",
+                                event_name = EV_FORCE_CONVERGE_GATE_SKIP,
                                 arm = "missing_pg",
                                 site = %site_id,
                                 id,
@@ -10649,6 +10940,339 @@ mod tests {
                 true
             ));
         }
+    }
+
+    // =====================================================================
+    // Issue #273 — calendar closure arm (business-key resolve)
+    // =====================================================================
+
+    /// The key literal this module dispatches on must still be the one the
+    /// probe registry uses. A rename on either side would silently route
+    /// calendar rows back to the never-equal id-keyed arm.
+    #[test]
+    fn room_calendar_probe_key_matches_the_registered_mirror_probe() {
+        let probe = crate::scheduler::mirror_probe::probe_for_table(ROOM_CALENDAR_PROBE_KEY)
+            .expect("the calendar probe must still be registered under this key");
+        assert_eq!(probe.mirror_table, "ht_room_calendar");
+        assert_eq!(probe.legacy_table, "HT_Room_Status");
+        assert!(
+            RECONCILE_RESOLVABLE_TABLES.contains(&ROOM_CALENDAR_PROBE_KEY),
+            "a dispatched-but-unlisted probe key is invisible to the \
+             resolvable-list guards"
+        );
+    }
+
+    /// The closure arm introduces NO new `ht_reconcile_log.table_name` and
+    /// no new hashed entity: it RE-KEYS the existing probe's resolve. So
+    /// there is nothing to register with `gate_guard` (whose contract binds
+    /// CT-mapper idempotency gates to reconcile hashes — no probe has one)
+    /// and `RECONCILE_RESOLVABLE_TABLES` needs no new entry. This pins that
+    /// the mirror population did not grow.
+    #[test]
+    fn calendar_closure_arm_adds_no_new_resolvable_table() {
+        let listed = RECONCILE_RESOLVABLE_TABLES
+            .iter()
+            .filter(|t| t.starts_with("mirror_"))
+            .count();
+        assert_eq!(
+            listed,
+            crate::scheduler::mirror_probe::mirror_probe_keys().len(),
+            "the closure arm must re-key an EXISTING probe, not register a \
+             new reconcile entity"
+        );
+    }
+
+    /// Converged: both sides agree on the in-era night set, so the two
+    /// recomputed hashes are equal and `should_auto_resolve` CLOSES the row.
+    /// This is the property the id-keyed arm could never have.
+    #[test]
+    fn room_calendar_business_key_row_closes_when_both_sides_agree() {
+        let legacy = room_calendar_business_key_hash(1546, Some("2025-11-02"), Some("2026-08-14"));
+        let pg = room_calendar_business_key_hash(1546, Some("2025-11-02"), Some("2026-08-14"));
+        assert_eq!(legacy, pg);
+        assert!(should_auto_resolve(
+            ROOM_CALENDAR_PROBE_KEY,
+            Some(&legacy),
+            Some(&pg),
+            None
+        ));
+    }
+
+    /// Still divergent: the LIVE deficit (1546 legacy nights vs 1420
+    /// canonical at HF Hotel, 2026-07-28) must keep the row OPEN. The arm
+    /// makes the gap closeable in principle — it does not pretend it is
+    /// closed today.
+    #[test]
+    fn room_calendar_business_key_row_stays_open_while_the_night_deficit_survives() {
+        let legacy = room_calendar_business_key_hash(1546, Some("2025-11-02"), Some("2026-08-14"));
+        let pg = room_calendar_business_key_hash(1420, Some("2025-11-02"), Some("2026-08-14"));
+        assert_ne!(legacy, pg);
+        assert!(!should_auto_resolve(
+            ROOM_CALENDAR_PROBE_KEY,
+            Some(&legacy),
+            Some(&pg),
+            None
+        ));
+    }
+
+    /// Equal counts with different coverage boundaries is still a
+    /// divergence — a night shifted off one end of the window is exactly
+    /// the shape a count-only comparison would miss.
+    #[test]
+    fn room_calendar_business_key_hash_covers_both_coverage_boundaries() {
+        let base = room_calendar_business_key_hash(1546, Some("2025-11-02"), Some("2026-08-14"));
+        assert_ne!(
+            base,
+            room_calendar_business_key_hash(1546, Some("2025-11-03"), Some("2026-08-14"))
+        );
+        assert_ne!(
+            base,
+            room_calendar_business_key_hash(1546, Some("2025-11-02"), Some("2026-08-15"))
+        );
+    }
+
+    /// ABSENT-SIDE semantics: an empty calendar on BOTH sides is a real
+    /// converged state, so it must hash to something equal and non-empty and
+    /// close the row — the same contract as `mirror_absent_hash`. Returning
+    /// "no hash" here would leave such a row open forever.
+    #[test]
+    fn room_calendar_business_key_absent_on_both_sides_converges() {
+        let empty = room_calendar_business_key_hash(0, None, None);
+        assert!(!empty.is_empty());
+        assert!(should_auto_resolve(
+            ROOM_CALENDAR_PROBE_KEY,
+            Some(&empty),
+            Some(&empty),
+            None
+        ));
+        // Absent on ONE side only is NOT converged.
+        let populated =
+            room_calendar_business_key_hash(1546, Some("2025-11-02"), Some("2026-08-14"));
+        assert_ne!(empty, populated);
+        assert!(!should_auto_resolve(
+            ROOM_CALENDAR_PROBE_KEY,
+            Some(&populated),
+            Some(&empty),
+            None
+        ));
+    }
+
+    /// The business-key hash must never collide with the id-keyed aggregate
+    /// hash the generic probe computes for the same key and the same counts.
+    /// They measure different things; a collision would let a mixed-binary
+    /// fleet close a row on the wrong comparison.
+    #[test]
+    fn room_calendar_business_key_hash_is_distinct_from_the_id_keyed_aggregate() {
+        assert_ne!(
+            room_calendar_business_key_hash(1546, None, None),
+            crate::scheduler::mirror_probe::mirror_aggregate_hash(
+                ROOM_CALENDAR_PROBE_KEY,
+                1546,
+                None,
+                None
+            )
+        );
+    }
+
+    /// The era floor is DERIVED from the mirror (`MIN(rcal_date)`), never
+    /// configured and never a rolling window — the `PAYMENTS_ERA_FLOOR_SQL`
+    /// lesson. And the canonical side must NOT filter on `rcal_legacy_id`:
+    /// that filter is precisely the structural undercount the business key
+    /// exists to dodge.
+    #[test]
+    fn room_calendar_era_floor_is_derived_from_the_mirror() {
+        assert!(ROOM_CALENDAR_BUSINESS_KEY_PG_SQL.contains("MIN(rcal_date)"));
+        assert!(ROOM_CALENDAR_BUSINESS_KEY_PG_SQL.contains("MAX(rcal_date)"));
+        assert!(ROOM_CALENDAR_BUSINESS_KEY_PG_SQL.contains("FROM ht_room_calendar"));
+        assert!(
+            !ROOM_CALENDAR_BUSINESS_KEY_PG_SQL.contains("INTERVAL"),
+            "the floor must be the mirror's own coverage boundary, not a \
+             rolling window"
+        );
+        assert!(
+            !ROOM_CALENDAR_BUSINESS_KEY_PG_SQL.contains("rcal_legacy_id"),
+            "filtering on the legacy id re-introduces the structural \
+             undercount the business key exists to dodge"
+        );
+    }
+
+    /// The legacy side must count DISTINCT `(room_no, night)` pairs:
+    /// canonical is UNIQUE on `(rcal_room_id, rcal_date)` while
+    /// `HT_Room_Status` is not, so a raw `COUNT(*)` would report the legacy
+    /// allocator's duplicates as a permanent deficit. The floor is pushed
+    /// into the scan as a BOUND parameter, and an empty mirror scans the
+    /// whole table (that IS the finding).
+    #[test]
+    fn room_calendar_legacy_sql_counts_distinct_nights_and_pushes_the_floor() {
+        let floored = room_calendar_business_key_legacy_sql(true);
+        assert!(floored.contains("SELECT DISTINCT room_no, CAST(room_date AS DATE) AS night_date"));
+        assert!(floored.contains("COUNT_BIG(*)"));
+        assert!(floored.contains("CAST(room_date AS DATE) >= CAST(@P1 AS DATE)"));
+        assert!(
+            floored.contains("CONVERT(varchar(10), MIN(night_date), 23)"),
+            "boundaries must come back as ISO text so both sides hash \
+             byte-identical YYYY-MM-DD"
+        );
+        assert!(
+            !floored.contains("N'"),
+            "no `N'…'` literals against the legacy DB — TIS-620 corruption"
+        );
+
+        let unfloored = room_calendar_business_key_legacy_sql(false);
+        assert!(
+            !unfloored.contains("@P1"),
+            "an empty mirror binds no floor — it scans the whole table on \
+             purpose"
+        );
+        assert!(unfloored.contains("SELECT DISTINCT room_no"));
+    }
+
+    /// ORDER IS LOAD-BEARING. The calendar arm must precede the generic
+    /// `probe_for_table` arm in BOTH resolve dispatches — Rust match arms
+    /// are tried top-down, so a calendar row would otherwise be swallowed by
+    /// the generic id-keyed arm and could never converge. It must also be
+    /// scoped to the `<aggregate>` PK so a per-PK row still falls through.
+    #[test]
+    fn room_calendar_arm_precedes_the_generic_probe_arm_in_both_dispatches() {
+        let src = scheduler_source_before_tests();
+        for func in [
+            "async fn compute_current_pg_hash(",
+            "async fn compute_current_legacy_hash(",
+        ] {
+            let start = src.find(func).unwrap_or_else(|| panic!("{func} must exist"));
+            let rest = &src[start..];
+            let body = &rest[..rest.find("\n}\n").map(|i| i + 3).unwrap_or(rest.len())];
+
+            let calendar_at = body
+                .find("ROOM_CALENDAR_PROBE_KEY")
+                .unwrap_or_else(|| panic!("{func} must dispatch the calendar closure arm"));
+            let generic_at = body
+                .find("mirror_probe::probe_for_table(t).is_some()")
+                .unwrap_or_else(|| panic!("{func} must still dispatch the generic probe arm"));
+            assert!(
+                calendar_at < generic_at,
+                "{func}: the calendar business-key arm must come BEFORE the \
+                 generic probe arm, or the never-equal id-keyed aggregate \
+                 wins and the row can never close"
+            );
+            assert!(
+                body[calendar_at..generic_at].contains("MIRROR_AGGREGATE_PK"),
+                "{func}: the calendar arm must be scoped to the `<aggregate>` \
+                 PK so a per-PK row still falls through to the generic arm"
+            );
+        }
+    }
+
+    // =====================================================================
+    // Issue #267 — scheduler-side event_name registry
+    // =====================================================================
+
+    /// Source of THIS module up to the test module. Scanning further would
+    /// match the very literals these registry tests are built from (the
+    /// `include_str!` self-reference trap, same as `scheduler::mirror`).
+    fn scheduler_source_before_tests() -> &'static str {
+        let full = include_str!("sync.rs");
+        let cut = full
+            .find("#[cfg(test)]")
+            .expect("test module marker must exist");
+        &full[..cut]
+    }
+
+    /// Shape lock. Names must be greppable from any locale, and the
+    /// scheduler namespace must stay DISJOINT from the watcher's dotted
+    /// `sync.…` taxonomy so a Loki filter of `^sync\.` still means "the CT
+    /// watcher" and nothing else.
+    #[test]
+    fn known_scheduler_event_names_are_unique_and_greppable() {
+        let unique: std::collections::HashSet<&str> =
+            KNOWN_SCHEDULER_EVENT_NAMES.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            KNOWN_SCHEDULER_EVENT_NAMES.len(),
+            "KNOWN_SCHEDULER_EVENT_NAMES has duplicate entries — each name \
+             must appear exactly once"
+        );
+        assert!(
+            !KNOWN_SCHEDULER_EVENT_NAMES.is_empty(),
+            "registry emptied — a refactor deleted the array contents"
+        );
+        for name in KNOWN_SCHEDULER_EVENT_NAMES {
+            assert!(!name.is_empty(), "empty event name in the registry");
+            assert!(
+                name.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "event name `{name}` must be lowercase snake_case ASCII"
+            );
+            assert!(
+                !name.contains('.'),
+                "event name `{name}` uses a dot — dots are reserved for the \
+                 watcher's `sync.…` namespace in bin/sync.rs, and the two \
+                 registries must stay disjoint"
+            );
+        }
+    }
+
+    /// THE LOCK (issue #267), half one: every `EV_…` constant declared in
+    /// this module must be registered, and the registry must hold nothing
+    /// else. Adding a new event constant without registering it fails here.
+    #[test]
+    fn every_scheduler_event_name_constant_is_registered() {
+        let src = scheduler_source_before_tests();
+        let mut declared: Vec<String> = Vec::new();
+        for (i, _) in src.match_indices("const EV_") {
+            let after = &src[i..];
+            let eq = after
+                .find(" = \"")
+                .expect("an EV_ constant must bind a plain string literal");
+            let value = &after[eq + 4..];
+            let end = value.find('"').expect("unterminated EV_ literal");
+            declared.push(value[..end].to_string());
+        }
+        assert!(
+            !declared.is_empty(),
+            "no EV_ constants found — the scan or the constants moved"
+        );
+        for name in &declared {
+            assert!(
+                KNOWN_SCHEDULER_EVENT_NAMES.contains(&name.as_str()),
+                "event name `{name}` is declared but NOT in \
+                 KNOWN_SCHEDULER_EVENT_NAMES — a grep-based consumer \
+                 (/diagnose-alert, dashboards) would have no registry entry \
+                 to check against"
+            );
+        }
+        assert_eq!(
+            declared.len(),
+            KNOWN_SCHEDULER_EVENT_NAMES.len(),
+            "registry size {} does not match the {} declared EV_ constants — \
+             it holds a name nothing emits, or lost one that something does",
+            KNOWN_SCHEDULER_EVENT_NAMES.len(),
+            declared.len()
+        );
+    }
+
+    /// THE LOCK, half two: no emission site may name its event with a raw
+    /// string literal. Together with the half above this is what makes an
+    /// UNREGISTERED addition fail — a literal trips this test, a new
+    /// constant trips the other one.
+    #[test]
+    fn every_scheduler_event_emission_uses_a_registered_constant() {
+        let src = scheduler_source_before_tests();
+        let attr = "event_name";
+        let all = src.matches(&format!("{attr} = ")).count();
+        let via_const = src.matches(&format!("{attr} = EV_")).count();
+        assert!(
+            all >= 2,
+            "expected ≥2 structured event emissions in this module; found \
+             {all} — the region may have been refactored away"
+        );
+        assert_eq!(
+            all, via_const,
+            "{} emission site(s) name their event with a raw string literal \
+             instead of a registered EV_ constant. A typo or rename there is \
+             invisible to the registry and silently breaks the \
+             /diagnose-alert grep contract (issue #267).",
+            all - via_const
+        );
     }
 
     /// Phase 6-D. The payment-ledger probe registers through the SAME three
