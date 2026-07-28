@@ -399,9 +399,9 @@ services:
       # and a hand-resolved row is re-minted on the next tick. So that probe
       # is observe_only: it LOGS both counts every tick and records no
       # ht_reconcile_log row (which would otherwise pin the 4h digest and
-      # the >72h escalation tier at both sites forever). Plan 6-D gives the
-      # calendar a business-key arm and a remediation path; only then does
-      # it start recording.
+      # the >72h escalation tier at both sites forever). Issue #273 tracks
+      # the calendar business-key arm + remediation path (deferred past 6-D);
+      # only when that lands does it start recording.
       - RECONCILE_MIRROR_PROBE_ENABLED=${RECONCILE_MIRROR_PROBE_ENABLED:-false}
       # Phase 6-D — payment-ledger probe: legacy HT_CheckIn_Pay vs canonical
       # ht_payment_ledger, compared per FOLIO (Cin_No) on line count +
@@ -860,7 +860,8 @@ services:
       # gap is observe_only — logged with both counts each tick, never
       # recorded into ht_reconcile_log, because no sweep or self-heal can
       # close such a row and a hand-resolved one re-mints itself. It starts
-      # recording only when plan 6-D gives it a closure path.
+      # recording only when a closure path lands (issue #273; deferred
+      # past 6-D).
       - RECONCILE_MIRROR_PROBE_ENABLED=${HFVILLE_RECONCILE_MIRROR_PROBE_ENABLED:-false}
       # Phase 6-D — payment-ledger per-folio probe (HT_CheckIn_Pay ↔
       # ht_payment_ledger). DETECTION ONLY; writes nothing but

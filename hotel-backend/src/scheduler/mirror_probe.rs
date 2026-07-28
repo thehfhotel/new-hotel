@@ -91,8 +91,9 @@
 //! The gap is real and worth knowing about; the honest way to carry it until
 //! there is a re-drive path is one log line per tick, not a page nobody can
 //! close. Flipping `observe_only` to `false` belongs in the SAME change that
-//! gives the calendar a business-key arm and a remediation procedure (plan
-//! 6-D) — `room_calendar_is_observe_only_until_it_can_be_closed` pins that
+//! gives the calendar a business-key arm and a remediation procedure (issue
+//! #273 — deferred past 6-D, which shipped only the payment-ledger probe) —
+//! `room_calendar_is_observe_only_until_it_can_be_closed` pins that
 //! pairing. Its key stays in `RECONCILE_RESOLVABLE_TABLES` and both resolve
 //! dispatches so that an aggregate row recorded by an older binary still has
 //! a way to converge rather than sitting open unrecognised.
@@ -374,8 +375,9 @@ pub(crate) const MIRROR_PROBES: &[MirrorProbe] = &[
         // the business key does not converge either (1546 vs 1420), no
         // self-heal touches probe keys, and a hand-resolved row re-mints
         // itself next tick — so a recorded row would page forever with no
-        // remediation. It is LOGGED instead, until 6-D gives the calendar a
-        // business-key arm that can actually be acted on.
+        // remediation. It is LOGGED instead, until issue #273 gives the
+        // calendar a business-key arm that can actually be acted on (deferred
+        // past 6-D, which shipped only the payment-ledger probe).
         observe_only: true,
     },
 ];
@@ -498,7 +500,8 @@ fn money_opt_segment(v: Option<f64>) -> String {
 /// Direction of a whole-table divergence.
 ///
 /// NEVER `Cardinality`, even though the counts differ — see the module
-/// docs: that kind is filtered out of both alert queries.
+/// docs: the hourly drift digest filters that kind out (`divergence_kind
+/// <> 'cardinality'`), so it would go unpaged by the primary alert.
 pub(crate) fn aggregate_divergence_kind(
     legacy: &MirrorAggregate,
     mirror: &MirrorAggregate,
@@ -678,10 +681,11 @@ pub(crate) fn diff_mirror_rows(
 /// `record_success` / `record_error` live in [`crate::scheduler::sync`]
 /// next to `run_sync`, which is where every other arm's status write is
 /// made. A tick that returns `Ok` MUST reach `record_success`: it is the
-/// only thing that clears `consecutive_failures`, clears `last_error`, and
-/// stamps `last_sync_at`, so without it the counter migration 082 seeds
-/// would be a monotonic lifetime failure count and one transient blip
-/// would leave a permanent error string on the row.
+/// only thing that zeroes `consecutive_failures` and stamps `last_sync_at`
+/// (`last_error`/`last_error_at` are left as a record of the most recent
+/// failure), so without it the counter migration 082 seeds would be a
+/// monotonic lifetime failure count and `last_sync_at` would stay NULL
+/// forever.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MirrorProbeOutcome {
     /// Probes whose two aggregates agreed (or disagreed only by read skew).
@@ -1278,8 +1282,9 @@ mod tests {
         }
     }
 
-    /// `cardinality` is filtered out of BOTH alert queries, so a probe must
-    /// never emit it — a count mismatch is reported by DIRECTION instead.
+    /// `cardinality` is filtered out of the hourly drift digest (and carries
+    /// no direction an operator can act on), so a probe must never emit it —
+    /// a count mismatch is reported by DIRECTION instead.
     #[test]
     fn aggregate_kind_is_never_cardinality() {
         let a = MirrorAggregate {
@@ -1317,8 +1322,8 @@ mod tests {
                 assert_ne!(
                     aggregate_divergence_kind(legacy, mirror),
                     DivergenceKind::Cardinality,
-                    "a probe must never emit `cardinality` — it is excluded from \
-                     both alert queries and would be alert-invisible"
+                    "a probe must never emit `cardinality` — the hourly drift \
+                     digest excludes it and it would go unpaged"
                 );
             }
         }
@@ -1486,7 +1491,8 @@ mod tests {
     /// would therefore fire the 4h digest and the >72h `:bangbang:` tier at
     /// both sites forever, and resolving it by hand only re-mints it —
     /// detection with no remediation. Flip this to `false` in the SAME change
-    /// that gives the calendar a closure path (plan 6-D), never on its own.
+    /// that gives the calendar a closure path (issue #273; deferred past 6-D),
+    /// never on its own.
     #[test]
     fn room_calendar_is_observe_only_until_it_can_be_closed() {
         assert!(probe("mirror_ht_room_calendar").observe_only);
@@ -1535,10 +1541,11 @@ mod tests {
     }
 
     /// BOTH outcomes must reach `sync_status`. `record_success` is the only
-    /// statement that zeroes `consecutive_failures`, clears `last_error` and
-    /// stamps `last_sync_at`; wiring only `record_error` (as 6-C originally
-    /// shipped) turns the counter migration 082 seeds into a monotonic
-    /// LIFETIME failure count and makes one transient blip permanent.
+    /// statement that zeroes `consecutive_failures` and stamps `last_sync_at`
+    /// (`last_error`/`last_error_at` keep the most recent failure for
+    /// forensics); wiring only `record_error` (as 6-C originally shipped)
+    /// turns the counter migration 082 seeds into a monotonic LIFETIME
+    /// failure count and leaves `last_sync_at` NULL forever.
     #[test]
     fn run_sync_reports_both_probe_outcomes_to_sync_status() {
         let src = include_str!("sync.rs");

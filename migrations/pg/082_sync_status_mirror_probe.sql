@@ -21,10 +21,10 @@
 -- The SUCCESS side updates the same row and matters just as much: `run_sync`
 -- calls `record_success(pg_pool, "mirror_probe", 0, recorded, converged,
 -- duration_ms)` on `Ok`, and that is the ONLY statement that zeroes
--- `consecutive_failures`, clears `last_error`/`last_error_at` and stamps
--- `last_sync_at`. Without it the counter would be a monotonic LIFETIME failure
--- count instead of a "currently broken" signal, and one transient MSSQL blip
--- would leave a permanent error string on the row.
+-- `consecutive_failures` and stamps `last_sync_at` (`last_error`/
+-- `last_error_at` are left in place as a record of the most recent failure).
+-- Without it the counter would be a monotonic LIFETIME failure count instead
+-- of a "currently broken" signal, and `last_sync_at` would stay NULL forever.
 --
 -- Migrations 080 (`payments`) and 081 (`guest_registry`) added their rows for
 -- the same reason and left the same note in `init-db/init-hotelnew.sql`; 6-C

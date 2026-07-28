@@ -309,13 +309,12 @@ pub async fn run_sync(
     // arms.
     //
     // BOTH outcomes are written, as `payments` and `guest_registry` do:
-    // `record_success` is the ONLY thing that zeroes `consecutive_failures`,
-    // clears `last_error`/`last_error_at` and stamps `last_sync_at`. With
-    // only the error arm wired, `consecutive_failures` for `mirror_probe`
-    // would be a monotonic LIFETIME failure count (unique among the
-    // entity_types), one transient MSSQL blip would leave a permanent error
-    // string, and `last_sync_at` would stay NULL forever — a reading that is
-    // actively misleading rather than merely absent.
+    // `record_success` is the ONLY thing that zeroes `consecutive_failures`
+    // and stamps `last_sync_at` (`last_error`/`last_error_at` keep the most
+    // recent failure). With only the error arm wired, `consecutive_failures`
+    // for `mirror_probe` would be a monotonic LIFETIME failure count (unique
+    // among the entity_types) and `last_sync_at` would stay NULL forever — a
+    // reading that is actively misleading rather than merely absent.
     if reconcile_mirror_probe_enabled() {
         match crate::scheduler::mirror_probe::run_mirror_probe(legacy_pool, pg_pool).await {
             Ok(outcome) => {
@@ -355,8 +354,8 @@ pub async fn run_sync(
     // `init-db/init-hotelnew.sql` for a fresh database) a probe failure
     // updates zero rows and leaves only a log line. BOTH outcomes are
     // written, because `record_success` is the ONLY thing that zeroes
-    // `consecutive_failures`, clears `last_error`/`last_error_at` and stamps
-    // `last_sync_at`.
+    // `consecutive_failures` and stamps `last_sync_at` (`last_error`/
+    // `last_error_at` keep the most recent failure).
     if reconcile_payment_ledger_probe_enabled() {
         match crate::scheduler::payment_ledger_probe::run_payment_ledger_probe(
             legacy_pool,
