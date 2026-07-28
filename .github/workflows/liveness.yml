@@ -1,0 +1,241 @@
+# ============================================================================
+# Container liveness monitor — the external observer for issue #262.
+#
+# WHY THIS EXISTS
+#   `sync` / `writeback` (both sites) run under `restart: on-failure:5`. When
+#   those 5 attempts are exhausted the container stops and STAYS stopped. Every
+#   alerting path we have lives inside those processes — the CT-lag watchdog,
+#   stall detection, the boot-refusal page whose body now warns "silence ≠
+#   recovery" — so all of them die with the host process. Nothing external
+#   notices. This workflow is the thing that notices.
+#
+# HOW IT WORKS
+#   GH-hosted runner -> cloudflared (asgard tunnel) -> ssh deploy@evergreen ->
+#   forced-command /srv/liveness-check.sh -> `docker inspect` the watched
+#   containers -> Slack POST FROM THE HOST.
+#
+#   Everything that could leak stays on the host: the Slack webhook is read from
+#   /home/deploy/secrets/slack_webhook_url and is deliberately NOT imported into
+#   GitHub Secrets. The runner sees only the script's stdout.
+#
+# PREREQUISITE — THIS WORKFLOW IS INERT UNTIL AN OPERATOR ARMS IT
+#   The existing EVERGREEN_DEPLOY_SSH_KEY is forced-command-pinned to
+#   /srv/run-deploy.sh. It CANNOT run `docker inspect`; anything sent over it
+#   takes the deploy flock and runs the deploy script. So this monitor needs its
+#   own least-privilege key. Two one-time host steps, then it self-arms:
+#
+#     1. Install scripts/liveness-check.sh at /srv/liveness-check.sh
+#        (root:root, mode 755). It is NOT in the deploy tarball on purpose —
+#        that would mean editing run-deploy.sh.
+#     2. Generate a dedicated ed25519 keypair. Append ONE line to
+#        /home/deploy/.ssh/authorized_keys (leave the deploy entry untouched):
+#
+#          command="/srv/liveness-check.sh",restrict ssh-ed25519 AAAA... liveness@github-actions
+#
+#        Store the PRIVATE half as repo secret EVERGREEN_LIVENESS_SSH_KEY.
+#        `restrict` = no pty / no agent, port, X11 forwarding / no user-rc.
+#
+#   Until EVERGREEN_LIVENESS_SSH_KEY exists, scheduled runs exit GREEN with a
+#   loud warning + job summary rather than turning red 96×/day. Manual
+#   workflow_dispatch runs fail hard, so a test tells you the truth immediately.
+#
+# ALERT POLARITY (read before changing anything here)
+#   * dead container  -> Slack pages FROM THE HOST, state-change-only (one page,
+#     one all-clear; markers at /home/deploy/.liveness-alerted-<container>).
+#     The workflow run stays GREEN with a ::warning:: — a red run every 15
+#     minutes for a known-dead worker is just a second alert-fatigue channel.
+#   * SSH / cloudflared / script failure -> NO Slack (the runner has no webhook,
+#     by design) -> the RUN FAILS. A red scheduled run is the signal for "the
+#     monitor cannot see the host". GitHub also emails the repo actor when a
+#     scheduled workflow fails, which is the out-of-band path when Slack itself
+#     is the thing that is down.
+#
+# COST
+#   Cron minutes are billed. */15 × ~30s/run ≈ 96 runs/day; GitHub rounds each
+#   run UP to the whole minute, so the budget ceiling is ~96 min/day ≈ 2,880
+#   min/month on a standard ubuntu-latest runner. This repo is public, where
+#   standard-runner minutes are free — but if it ever goes private, that number
+#   is the bill. Halve it by moving to `*/30`, quarter it with `0 * * * *`.
+#   Nothing else about the design changes with the cadence; only detection
+#   latency does.
+#
+# LATENCY EXPECTATIONS
+#   GitHub's scheduler is best-effort and routinely runs cron late under load.
+#   Combined with the host script's two-observation grace window (it will not
+#   page until a container has been continuously dead across two ticks, which is
+#   what makes deploy-window container recreation safe), realistic
+#   time-to-page is ~15-45 minutes. This is a backstop for "dead and nobody
+#   knows", not a sub-second health probe.
+#
+#   Also note: GitHub disables scheduled workflows in repos with no activity for
+#   60 days. If pushes ever stop, re-enable it from the Actions tab.
+# ============================================================================
+name: Liveness monitor
+
+on:
+  schedule:
+    # Every 15 minutes. Scheduled workflows only ever run from the DEFAULT
+    # BRANCH, so edits to this file take effect once merged to master — a
+    # branch cannot be used to test the cron path.
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run: classify containers but post nothing to Slack and touch no dedup markers'
+        type: boolean
+        default: true
+
+# Least privilege: nothing here reads code or packages. The repo is not even
+# checked out — the probe logic lives on the host.
+permissions:
+  contents: read
+
+concurrency:
+  # Never let a slow run overlap the next tick. cancel-in-progress is OFF: an
+  # in-flight run may be mid-Slack-POST, and killing it between the POST and the
+  # marker write would re-page on the following tick.
+  group: liveness-monitor-evergreen
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    env:
+      EVERGREEN_HOST: evergreen.thehfhotel.org
+      # Bump in lockstep with SCRIPT_VERSION in scripts/liveness-check.sh so a
+      # stale /srv/liveness-check.sh on the host shows up as a warning instead
+      # of silently running old logic.
+      EXPECTED_SCRIPT_VERSION: '1'
+
+    steps:
+      - name: Check the monitor is armed
+        id: armed
+        # Split polarity on purpose. A missing key on the SCHEDULED path must not
+        # produce 96 red runs a day before anyone has had a chance to install it;
+        # on the MANUAL path it must fail, because the operator is asking a direct
+        # question and a green "did nothing" is a lie.
+        env:
+          LIVENESS_KEY: ${{ secrets.EVERGREEN_LIVENESS_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "${LIVENESS_KEY:-}" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "ready=false" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Liveness monitor NOT ARMED"
+            echo
+            echo 'Repo secret `EVERGREEN_LIVENESS_SSH_KEY` is not set, so no liveness check ran.'
+            echo 'See the header of `.github/workflows/liveness.yml` for the two one-time host steps.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "::error::EVERGREEN_LIVENESS_SSH_KEY is not set — nothing was checked."
+            exit 1
+          fi
+          echo "::warning::EVERGREEN_LIVENESS_SSH_KEY is not set — the liveness monitor is inert. No containers were checked."
+
+      - name: Cache cloudflared binary
+        if: steps.armed.outputs.ready == 'true'
+        id: cf-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: /usr/local/bin/cloudflared
+          # Identical key to the deploy job in docker-build.yml so both
+          # workflows share one cache entry. Bump BOTH together — never key on
+          # `latest`, Cloudflare re-cuts that tag silently.
+          key: cloudflared-2026.3.0-linux-amd64
+
+      - name: Install cloudflared
+        if: steps.armed.outputs.ready == 'true' && steps.cf-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/download/2026.3.0/cloudflared-linux-amd64 \
+            -o /tmp/cloudflared
+          sudo install -m 755 /tmp/cloudflared /usr/local/bin/cloudflared
+
+      - name: Install SSH key + known_hosts
+        if: steps.armed.outputs.ready == 'true'
+        # EVERGREEN_HOST_KEY is the SAME pinned host key the deploy job uses —
+        # same host, same pin, one place to rotate. Only the client key differs,
+        # and it is forced-command-pinned to /srv/liveness-check.sh.
+        env:
+          SSH_KEY:  ${{ secrets.EVERGREEN_LIVENESS_SSH_KEY }}
+          HOST_KEY: ${{ secrets.EVERGREEN_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY"  > ~/.ssh/liveness_key && chmod 600 ~/.ssh/liveness_key
+          printf '%s\n' "$HOST_KEY" > ~/.ssh/known_hosts  && chmod 600 ~/.ssh/known_hosts
+
+      - name: Probe container liveness on evergreen
+        if: steps.armed.outputs.ready == 'true'
+        id: probe
+        run: |
+          set -euo pipefail
+
+          # The forced command ignores this string as a command and hands it to
+          # the script in $SSH_ORIGINAL_COMMAND, which allowlists exactly
+          # `--check` and `--dry-run`. Nothing else is reachable over this key.
+          REMOTE_ARG='--check'
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            REMOTE_ARG='--dry-run'
+          fi
+          echo "remote arg: $REMOTE_ARG"
+
+          rc=0
+          ssh -i ~/.ssh/liveness_key \
+              -o BatchMode=yes \
+              -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile=~/.ssh/known_hosts \
+              -o ConnectTimeout=30 \
+              -o ProxyCommand="cloudflared --edge-ip-version 4 access ssh --hostname %h" \
+              "deploy@${EVERGREEN_HOST}" "$REMOTE_ARG" \
+              > /tmp/liveness.out 2>&1 || rc=$?
+
+          cat /tmp/liveness.out
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Liveness probe (\`$REMOTE_ARG\`, exit $rc)"
+            echo
+            echo '```'
+            cat /tmp/liveness.out
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Host script version drift check — a hand-installed /srv/liveness-check.sh
+          # can fall behind the repo copy, and there is no deploy step to catch it.
+          got_version=$(grep -m1 '^LIVENESS_SCRIPT_VERSION:' /tmp/liveness.out | awk '{print $2}' || true)
+          if [ -n "$got_version" ] && [ "$got_version" != "$EXPECTED_SCRIPT_VERSION" ]; then
+            echo "::warning::/srv/liveness-check.sh on evergreen reports version ${got_version}, this workflow expects ${EXPECTED_SCRIPT_VERSION}. Reinstall scripts/liveness-check.sh on the host."
+          fi
+
+          case "$rc" in
+            0)
+              echo "All watched containers are alive (or intentionally stopped-clean)."
+              ;;
+            10)
+              # Deliberately NOT a failure. The host already paged Slack, deduped.
+              # Failing here would add a second, undeduped 96×/day channel.
+              echo "::warning::One or more watched containers are DOWN on evergreen. Slack has been paged from the host (state-change-only). See the job summary."
+              ;;
+            255)
+              echo "::error::SSH/cloudflared could not reach ${EVERGREEN_HOST}. NOTHING was checked and NO Slack alert was sent (the runner holds no webhook, by design). A red scheduled run IS the alert here — GitHub also emails on scheduled-workflow failure."
+              exit 1
+              ;;
+            2)
+              echo "::error::/srv/liveness-check.sh rejected the argument '${REMOTE_ARG}'. The host copy is likely older than this workflow — reinstall scripts/liveness-check.sh."
+              exit 1
+              ;;
+            3)
+              echo "::error::The liveness script failed on the host (docker/jq/curl unavailable, webhook unreadable, or the Slack POST failed). The monitor itself is broken — container state is UNKNOWN."
+              exit 1
+              ;;
+            *)
+              echo "::error::Unexpected exit code ${rc} from the liveness probe. Treating as a monitor failure."
+              exit 1
+              ;;
+          esac
