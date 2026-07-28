@@ -344,6 +344,21 @@ fn retention_cooldown_key(table: &str) -> String {
 const CT_RETENTION_KEY_PREFIX: &str = "ct_retention_overflow:";
 /// Durable slot for the level-triggered CT-lag page (one per site).
 const CT_LAG_COOLDOWN_KEY: &str = "ct_watcher_lag:global";
+/// Durable slot for the watermark-STALL page (one per site).
+///
+/// Unlike its siblings this key is NOT a cooldown — the stall page's
+/// cooldown is [`stall_page_passes_cooldown`], which stays process-local
+/// because it carries severity (a confirmed-backlog critical must be able
+/// to bypass the window left by a probe-outage escalation, and losing that
+/// window on restart fails LOUD, which is the safe direction).
+///
+/// What this row records is the OPEN-EPISODE latch: "we paged a stall and
+/// have not yet announced the all-clear". Written by [`hold_alert_slot`]
+/// after every stall page, deleted by [`release_alert_slot`] after the
+/// paired `CT watermark RECOVERED`. Exactly the semantics
+/// `scheduler::sync::cooldown_row_exists_pg` already reads out of this
+/// table for the stale-checkin tripwire. Issue #265.
+const CT_STALL_COOLDOWN_KEY: &str = "ct_watermark_stall:global";
 /// Durable slot for the shadow-mode-ceiling page (one per site).
 const SHADOW_CEILING_COOLDOWN_KEY: &str = "shadow_mode:ceiling";
 /// Namespace prefix for the refuse-to-start pages; one slot per reason
@@ -441,6 +456,92 @@ async fn release_alert_slot(pg: &PgPool, site_id: &str, key: &str) {
              stay suppressed until the window lapses"
         );
     }
+}
+
+/// Mark `(site_id, key)` as an OPEN alert episode — "we paged and have
+/// not yet announced the all-clear" — without consulting any cooldown
+/// window. The unconditional sibling of [`claim_alert_slot`], mirroring
+/// `scheduler::sync::mark_level_alert_sent_pg`.
+///
+/// Used by the pages whose de-dup gate is NOT the cooldown row (currently
+/// the watermark stall, which needs severity-aware cooldown logic the row
+/// cannot express) but which still need the episode itself to survive a
+/// restart so the paired all-clear can fire. Paired 1:1 with
+/// [`release_alert_slot`].
+///
+/// Best-effort: a PG failure logs and leaves the row absent, which
+/// degrades to the pre-#265 behaviour (a restart mid-episode loses the
+/// all-clear) rather than breaking the page that just went out.
+async fn hold_alert_slot(pg: &PgPool, site_id: &str, key: &str) {
+    let result = sqlx::query(
+        "INSERT INTO ht_level_drift_alert_cooldowns (site_id, table_name, last_alerted_at) \
+         VALUES ($1, $2, now()) \
+         ON CONFLICT (site_id, table_name) DO UPDATE \
+             SET last_alerted_at = now(), updated_at = now()",
+    )
+    .bind(site_id)
+    .bind(key)
+    .execute(pg)
+    .await;
+
+    if let Err(err) = result {
+        tracing::warn!(
+            site = %site_id,
+            key,
+            error = %err,
+            "Failed to record the open alert episode — a restart before the all-clear \
+             would lose it (issue #265 degradation, not a page failure)"
+        );
+    }
+}
+
+/// The two watchdog episodes that must survive a process restart, as read
+/// back from their durable rows. `None` = slot released (or never
+/// claimed) = no episode open. `Some(t)` = `last_alerted_at`, i.e. when
+/// the page fired.
+#[derive(Debug, Clone, Copy, Default)]
+struct OpenAlertEpisodes {
+    ct_lag: Option<chrono::DateTime<chrono::Utc>>,
+    stall: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Read both watchdog episode slots in one round-trip (issue #265).
+///
+/// A live row for either key means the same thing it means everywhere
+/// else in this table: an alert was announced and its all-clear was not.
+/// The cooldown WINDOW is irrelevant to this read — a row inside its
+/// window whose condition has since gone healthy is precisely the
+/// un-all-cleared episode we are hunting for, and a row outside its
+/// window is one that has been open even longer.
+///
+/// Errors propagate so the caller can retry on the next tick instead of
+/// silently deciding "no episode open" — the fail-closed reading is what
+/// loses the all-clear in the first place.
+async fn read_open_alert_episodes(
+    pg: &PgPool,
+    site_id: &str,
+) -> Result<OpenAlertEpisodes, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, chrono::DateTime<chrono::Utc>)>(
+        "SELECT table_name, last_alerted_at FROM ht_level_drift_alert_cooldowns \
+          WHERE site_id = $1 AND table_name = ANY($2)",
+    )
+    .bind(site_id)
+    .bind(vec![
+        CT_LAG_COOLDOWN_KEY.to_string(),
+        CT_STALL_COOLDOWN_KEY.to_string(),
+    ])
+    .fetch_all(pg)
+    .await?;
+
+    let mut open = OpenAlertEpisodes::default();
+    for (key, last_alerted_at) in rows {
+        if key == CT_LAG_COOLDOWN_KEY {
+            open.ct_lag = Some(last_alerted_at);
+        } else if key == CT_STALL_COOLDOWN_KEY {
+            open.stall = Some(last_alerted_at);
+        }
+    }
+    Ok(open)
 }
 
 /// Atomically claim the right to send ONE retention-overflow page for this
@@ -2840,6 +2941,121 @@ fn format_ct_lag_recovery_message(snap: &CtLagSnapshot, lagged_for: Duration) ->
     )
 }
 
+// =============================================================================
+// Cross-restart episode state (issue #265)
+// =============================================================================
+//
+// The watchdog's alert episodes used to live entirely in `let mut` bindings
+// inside the loop, so a restart mid-episode lost them. The failure was
+// asymmetric and nasty: the durable cooldown row correctly suppressed a
+// RE-page after the restart, but the in-process `paged` latch that owns the
+// ALL-CLEAR was gone — operator sees a page, then eternal silence.
+//
+// The fix needs no new state, because the durable row IS the latch: it is
+// written when we page and DELETED by the all-clear (`release_alert_slot`),
+// so "row exists" == "announced, not yet cleared". On boot we read it back
+// ([`read_open_alert_episodes`]) and rebuild the episode. The only piece
+// that cannot be recovered from a `(site_id, table_name, last_alerted_at)`
+// row is a monotonic `Instant`, so the two helpers below convert the
+// durable wall clock into one; every reconstruction is a LOWER bound on the
+// real episode age, never an over-claim.
+//
+// Same idea as the S11 shadow-ceiling fix above: prefer a durable anchor PG
+// already holds over process uptime, which resets ~6x/day on this deploy
+// cadence.
+
+/// Wall-clock age of a durable timestamp, clamped at zero.
+///
+/// Clock skew between the PG server and this container (or an NTP step)
+/// can put `at` in the future; a negative age would backdate an episode
+/// into the future and is never what we want. Zero degrades to "as if it
+/// had just happened", which is the pre-#265 behaviour.
+fn durable_age(
+    at: chrono::DateTime<chrono::Utc>,
+    now_utc: chrono::DateTime<chrono::Utc>,
+) -> Duration {
+    now_utc
+        .signed_duration_since(at)
+        .to_std()
+        .unwrap_or(Duration::ZERO)
+}
+
+/// Project a wall-clock age onto the monotonic clock: `anchor - age`.
+///
+/// `Instant` in a container counts from HOST boot, so subtracting a
+/// multi-hour age moments after a fresh host boot can underflow.
+/// `checked_sub` returning `None` degrades to `anchor` — the episode is
+/// then reported as younger than it is, which only understates a duration
+/// in a Slack message and never invents or suppresses one.
+fn backdated_instant(anchor: Instant, age: Duration) -> Instant {
+    anchor.checked_sub(age).unwrap_or(anchor)
+}
+
+/// A watchdog alert episode rebuilt from its durable slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResumedEpisode {
+    /// Monotonic reconstruction of when the page fired — feeds the
+    /// "raised N ago" figure in the all-clear.
+    paged_at: Instant,
+    /// How long ago that was, for the resume log line.
+    paged_ago: Duration,
+}
+
+/// Pure rebuild of an open episode from `last_alerted_at`.
+///
+/// `None` in ⇒ `None` out: a released (or never-claimed) slot must NOT
+/// resurrect a latch, or the next healthy tick would invent an all-clear
+/// for an episode nobody was ever told about.
+fn resume_episode(
+    slot_held_since: Option<chrono::DateTime<chrono::Utc>>,
+    now_utc: chrono::DateTime<chrono::Utc>,
+    now: Instant,
+) -> Option<ResumedEpisode> {
+    let paged_ago = durable_age(slot_held_since?, now_utc);
+    Some(ResumedEpisode {
+        paged_at: backdated_instant(now, paged_ago),
+        paged_ago,
+    })
+}
+
+/// How far to backdate the FIRST watermark observation after a restart,
+/// so the stall detector doesn't re-serve its full 30-minute threshold
+/// from process start (~31min blind window after every deploy, 6x/day).
+///
+/// The anchor is `legacy_ct_state.last_polled_at`, and it is only valid in
+/// GLOBAL watermark mode. There, `run_one_tick` writes that row via
+/// `sync::watermark::advance` **only when `global_watermark_target` yields
+/// a ceiling strictly greater than the current watermark** — so the column
+/// moves if and only if the version moves, making it a durable "last
+/// advance" clock. Under `SYNC_PER_TABLE_WATERMARK=true` the post-loop
+/// FLOOR write calls `advance` on every tick regardless of progress
+/// (`WHERE last_seen_version <= $1` makes an equal floor a real write), so
+/// the column degenerates to "last tick" and carries no freeze
+/// information; return `ZERO` and keep the pre-#265 process-anchored
+/// behaviour there.
+///
+/// `ZERO` also for a missing row (pre-bootstrap) — unknown, so claim
+/// nothing.
+///
+/// Backdating can only ever bring the stall check FORWARD to the true
+/// freeze duration; it cannot manufacture a stall, because the page still
+/// requires the version to be observed frozen AND a probe to confirm a
+/// backlog for [`DEFAULT_BACKLOG_PERSIST_STREAK_THRESHOLD`] consecutive
+/// ticks.
+fn stall_anchor_age(
+    last_polled_at: Option<chrono::DateTime<chrono::Utc>>,
+    per_table_watermark: bool,
+    now_utc: chrono::DateTime<chrono::Utc>,
+) -> Duration {
+    if per_table_watermark {
+        return Duration::ZERO;
+    }
+    match last_polled_at {
+        Some(t) => durable_age(t, now_utc),
+        None => Duration::ZERO,
+    }
+}
+
 /// Track D / T7 CRIT-3 — spawn the watermark-stall watchdog. Runs as a
 /// detached background task; reads `legacy_ct_state` every 60s and
 /// fires Slack alerts on either (a) version stuck >= `stall_alert_secs`
@@ -2908,6 +3124,11 @@ async fn run_watermark_watchdog(
     let mut ct_lag_paged: bool = false;
     let mut ct_lag_paged_at: Option<Instant> = None;
     let mut ct_lag_probe: Option<(Instant, i64)> = None;
+    // 2026-07-28 / issue #265 — one-shot rebuild of any episode that was
+    // still open when the previous process died. Stays `true` until the
+    // durable read SUCCEEDS, so a PG blip at boot costs one tick instead of
+    // the whole episode; cleared for good after the first clean read.
+    let mut episode_resume_pending: bool = true;
 
     let shadow_mode = env::var("LEGACY_SYNC_SHADOW_MODE")
         .map(|v| v == "true")
@@ -3030,6 +3251,68 @@ async fn run_watermark_watchdog(
             }
         };
 
+        // ------------------------------------------------------------------
+        // Episode resume (issue #265). Rebuild any alert episode that was
+        // open when the previous process died, BEFORE anything else in this
+        // tick reads that state: the stall recovery check below consumes
+        // `pending_stall_alert`, and the CT-lag block at the bottom is gated
+        // on it. Runs once per process (retried while PG is unhappy).
+        // ------------------------------------------------------------------
+        if episode_resume_pending {
+            match read_open_alert_episodes(&pg, &site_id).await {
+                Ok(open) => {
+                    episode_resume_pending = false;
+                    let now_utc = chrono::Utc::now();
+                    if let Some(resumed) = resume_episode(open.ct_lag, now_utc, now) {
+                        // The durable slot IS the paged latch. Re-arming it
+                        // means (a) no double page while the lag persists —
+                        // the state machine answers `Holding` — and (b) the
+                        // all-clear can still fire, which is the whole bug.
+                        ct_lag_paged = true;
+                        ct_lag_paged_at = Some(resumed.paged_at);
+                        // The episode necessarily predates its page by at
+                        // least the persistence gate (that is what the gate
+                        // means), so this is a lower bound on the true start.
+                        // Only feeds the "lagging_for" figure in the log —
+                        // with `paged` latched the state machine ignores it.
+                        ct_lag_since =
+                            Some(backdated_instant(resumed.paged_at, ct_lag_persist));
+                        tracing::warn!(
+                            site = %site_id,
+                            paged_secs_ago = resumed.paged_ago.as_secs(),
+                            "[watchdog] Resumed an OPEN CT-lag episode from its durable \
+                             slot — the previous process died before the all-clear"
+                        );
+                    }
+                    if let Some(resumed) = resume_episode(open.stall, now_utc, now) {
+                        // `paged_version` is the one field the row cannot
+                        // carry. Seeding it with the CURRENT watermark is the
+                        // conservative choice: recovery then needs either a
+                        // fresh advance past it or a probe confirming legacy
+                        // is idle at it, so the worst case is the all-clear
+                        // arriving one tick late — never a false all-clear.
+                        pending_stall_alert =
+                            Some((resumed.paged_at, observation.last_seen_version));
+                        tracing::warn!(
+                            site = %site_id,
+                            paged_secs_ago = resumed.paged_ago.as_secs(),
+                            watermark = observation.last_seen_version,
+                            "[watchdog] Resumed an OPEN watermark-stall episode from its \
+                             durable slot — the previous process died before the all-clear"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        site = %site_id,
+                        error = %err,
+                        "[watchdog] Could not read the durable alert-episode slots — \
+                         retrying next tick (an all-clear may be delayed)"
+                    );
+                }
+            }
+        }
+
         // Recovery check (PR D, 2026-05-19). If we have an open stall
         // alert, decide whether to fire the all-clear THIS iteration.
         // Recovery short-circuits on the cheap "watermark advanced"
@@ -3082,6 +3365,10 @@ async fn run_watermark_watchdog(
                     let _ = s.send_message(&payload).await;
                 }
                 pending_stall_alert = None;
+                // The episode is closed on BOTH clocks — drop the durable
+                // latch too, or the next restart would resume a phantom
+                // episode (issue #265).
+                release_alert_slot(&pg, &site_id, CT_STALL_COOLDOWN_KEY).await;
                 // Outage is over — reset the escalation anchor so the
                 // next unrecovered run starts fresh.
                 info_outage_since = None;
@@ -3195,6 +3482,7 @@ async fn run_watermark_watchdog(
                         // bypass), so this doesn't reintroduce spam.
                         last_stall_alert = Some((now, false));
                         pending_stall_alert = Some((now, observation.last_seen_version));
+                        hold_alert_slot(&pg, &site_id, CT_STALL_COOLDOWN_KEY).await;
                     } else {
                         // Probe TIMED OUT — formerly the "informational" page.
                         // 2026-06-30 (operator request): we no longer Slack this
@@ -3269,6 +3557,7 @@ async fn run_watermark_watchdog(
                             }
                             last_stall_alert = Some((now, true));
                             pending_stall_alert = Some((now, observation.last_seen_version));
+                            hold_alert_slot(&pg, &site_id, CT_STALL_COOLDOWN_KEY).await;
                         }
                     } else {
                         // `ct_current > watermark` — confirmed backlog.
@@ -3336,7 +3625,10 @@ async fn run_watermark_watchdog(
                             last_stall_alert = Some((now, true));
                             // Open-alert state for the recovery notification
                             // (PR D, 2026-05-19). Always set after a page.
+                            // Durably too, since #265 — a restart before the
+                            // all-clear used to bury it.
                             pending_stall_alert = Some((now, observation.last_seen_version));
+                            hold_alert_slot(&pg, &site_id, CT_STALL_COOLDOWN_KEY).await;
                         }
                     }
                 }
@@ -3384,9 +3676,30 @@ async fn run_watermark_watchdog(
                 }
             }
         } else {
-            // First observation — anchor the stuck-timer here.
+            // First observation. Anchoring the stuck-timer at `now` would
+            // re-serve the full 30-min stall threshold from process start —
+            // the ~31-min post-deploy blind window in issue #265. Backdate
+            // it to the durable last-ADVANCE moment instead, when the
+            // watermark mode makes that column trustworthy
+            // ([`stall_anchor_age`]). A freeze that began 25min before the
+            // deploy then pages 5min after boot, not 31.
+            let anchor_age = stall_anchor_age(
+                observation.last_polled_at,
+                per_table_watermark,
+                chrono::Utc::now(),
+            );
+            if anchor_age > Duration::from_secs(WATERMARK_WATCHDOG_POLL_INTERVAL_SECS) {
+                tracing::info!(
+                    site = %site_id,
+                    version = observation.last_seen_version,
+                    frozen_secs = anchor_age.as_secs(),
+                    stall_threshold_secs = stall_threshold.as_secs(),
+                    "[watchdog] First observation backdated to the durable last-advance \
+                     moment — the stall timer resumes instead of restarting"
+                );
+            }
             WatermarkObservation {
-                observed_at: now,
+                observed_at: backdated_instant(now, anchor_age),
                 ..observation
             }
         };
@@ -4792,7 +5105,10 @@ async fn poll_table(
             // For Delete, the joined row is NULL but the PK columns are
             // still in the projection (CT carries them). Pass `Some(&row)`
             // either way and let the mapper decide.
-            let result = mapper.apply(&mut tx, op, Some(row)).await;
+            // `apply_with_legacy`: identical to `apply` for every mapper
+            // except CheckinProductMirrorMapper, whose override uses the
+            // pool for the #263 eager product mirror (read-only).
+            let result = mapper.apply_with_legacy(&mut tx, mssql, op, Some(row)).await;
 
             match result {
                 Ok(Some(event)) => {
@@ -9036,6 +9352,214 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------
+    // Cross-restart episode state (issue #265).
+    //
+    // The watchdog's episode latches were process-local, so a restart
+    // mid-episode kept the durable cooldown (no re-page) but lost the
+    // latch that owns the ALL-CLEAR: a page followed by eternal silence.
+    // These pin the rebuild — a live slot resumes the episode, a released
+    // slot must never resurrect one, and neither may invent a page.
+    // -------------------------------------------------------------------
+
+    /// A live slot IS the paged latch: rebuild the episode and take the
+    /// "raised N ago" figure from the wall clock the row carries.
+    #[test]
+    fn resume_episode_rebuilds_the_paged_latch_from_a_live_slot() {
+        let now = Instant::now();
+        let now_utc = chrono::Utc::now();
+        let resumed = resume_episode(
+            Some(now_utc - chrono::Duration::seconds(900)),
+            now_utc,
+            now,
+        )
+        .expect("a live cooldown row means an episode nobody has all-cleared");
+        assert_eq!(resumed.paged_ago, Duration::from_secs(900));
+        assert!(
+            resumed.paged_at <= now,
+            "the reconstructed page instant can never be in the future"
+        );
+    }
+
+    /// The all-clear DELETES the row, so no row = no episode. Resurrecting
+    /// a latch here would make the next healthy tick announce a recovery
+    /// for something nobody was ever paged about.
+    #[test]
+    fn resume_episode_ignores_a_released_slot() {
+        assert_eq!(
+            resume_episode(None, chrono::Utc::now(), Instant::now()),
+            None
+        );
+    }
+
+    /// Restart inside an OPEN, still-lagging episode: the rebuilt latch
+    /// must answer `Holding`, not `Page`. (The durable cooldown would also
+    /// swallow the claim, but that path re-attempts a PG write every tick
+    /// and reads as a suppressed page in the logs.)
+    #[test]
+    fn restart_inside_an_open_ct_lag_episode_holds_instead_of_double_paging() {
+        let now = Instant::now();
+        let now_utc = chrono::Utc::now();
+        let persist = Duration::from_secs(1800);
+        let resumed = resume_episode(
+            Some(now_utc - chrono::Duration::minutes(45)),
+            now_utc,
+            now,
+        )
+        .expect("slot held");
+        let since = backdated_instant(resumed.paged_at, persist);
+        assert_eq!(
+            ct_lag_next_action(true, Some(since), true, now, persist),
+            CtLagAction::Holding,
+            "a resumed episode must not page again while the lag persists"
+        );
+    }
+
+    /// THE issue #265 regression: the lag drained while we were down (or
+    /// right after the restart), and the episode's all-clear must still
+    /// fire. Pre-fix `paged` came back as `false`, so the state machine
+    /// said `Quiet` and the operator never heard anything again.
+    #[test]
+    fn restart_inside_an_open_ct_lag_episode_still_fires_the_all_clear() {
+        let now = Instant::now();
+        let now_utc = chrono::Utc::now();
+        let persist = Duration::from_secs(1800);
+        let resumed = resume_episode(
+            Some(now_utc - chrono::Duration::minutes(45)),
+            now_utc,
+            now,
+        )
+        .expect("slot held");
+        let since = backdated_instant(resumed.paged_at, persist);
+        assert_eq!(
+            ct_lag_next_action(false, Some(since), true, now, persist),
+            CtLagAction::Recovered,
+            "the durable slot is what lets the lost all-clear fire after a restart"
+        );
+    }
+
+    /// The slot-released path is unchanged: a restart with no open episode
+    /// starts quiet and stays quiet on a healthy observation.
+    #[test]
+    fn restart_with_no_open_episode_stays_silent() {
+        let now = Instant::now();
+        let paged = resume_episode(None, chrono::Utc::now(), now).is_some();
+        assert!(!paged);
+        assert_eq!(
+            ct_lag_next_action(false, None, paged, now, Duration::from_secs(1800)),
+            CtLagAction::Quiet,
+            "no episode was open, so there is nothing to all-clear"
+        );
+    }
+
+    /// The stall slot cannot carry `paged_version`, so the resume seeds it
+    /// with the boot watermark. That is deliberately conservative: recovery
+    /// still needs real evidence (an advance PAST it, or a probe confirming
+    /// legacy is idle at it), so the worst case is an all-clear one tick
+    /// late — never a false one while the stall is real.
+    #[test]
+    fn resumed_stall_episode_needs_evidence_before_the_all_clear() {
+        let now = Instant::now();
+        let now_utc = chrono::Utc::now();
+        let resumed = resume_episode(
+            Some(now_utc - chrono::Duration::minutes(20)),
+            now_utc,
+            now,
+        )
+        .expect("slot held");
+        let boot_watermark = 30_788;
+        let pending = Some((resumed.paged_at, boot_watermark));
+
+        assert_eq!(
+            recovery_alert_eligible(pending, boot_watermark, Some(31_200)),
+            None,
+            "legacy still ahead of us ⇒ the resumed episode stays open"
+        );
+        assert_eq!(
+            recovery_alert_eligible(pending, boot_watermark, Some(boot_watermark))
+                .map(|d| d.reason),
+            Some(RecoveryReason::ProbeConfirmsQuiet),
+            "probe proves there is no backlog ⇒ the lost all-clear fires"
+        );
+        assert_eq!(
+            recovery_alert_eligible(pending, boot_watermark + 1, None).map(|d| d.reason),
+            Some(RecoveryReason::WatermarkAdvanced),
+            "one fresh advance past the seeded version also closes it"
+        );
+    }
+
+    /// Clock skew between PG and the container must not backdate an
+    /// episode into the future (nor panic on the negative duration).
+    #[test]
+    fn durable_age_clamps_a_future_timestamp_to_zero() {
+        let now_utc = chrono::Utc::now();
+        assert_eq!(
+            durable_age(now_utc + chrono::Duration::seconds(600), now_utc),
+            Duration::ZERO
+        );
+        assert_eq!(
+            durable_age(now_utc - chrono::Duration::seconds(600), now_utc),
+            Duration::from_secs(600)
+        );
+    }
+
+    /// The wall-clock → monotonic projection is exact, and degrades to
+    /// `now` rather than panicking when the monotonic clock is younger
+    /// than the age (fresh host boot).
+    #[test]
+    fn backdated_instant_is_exact_and_falls_back_on_underflow() {
+        let now = Instant::now();
+        assert_eq!(
+            now.duration_since(backdated_instant(now, Duration::from_secs(5))),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            backdated_instant(now, Duration::MAX),
+            now,
+            "an unrepresentable backdate must degrade, not panic"
+        );
+    }
+
+    /// Global mode: `legacy_ct_state.last_polled_at` moves if and only if
+    /// the version moves, so it is a durable "frozen since" clock. The
+    /// first post-restart observation resumes that timer instead of
+    /// re-serving the full 30-min threshold from process start.
+    #[test]
+    fn stall_anchor_resumes_the_freeze_timer_in_global_mode() {
+        let now_utc = chrono::Utc::now();
+        assert_eq!(
+            stall_anchor_age(
+                Some(now_utc - chrono::Duration::minutes(25)),
+                false,
+                now_utc
+            ),
+            Duration::from_secs(1500),
+            "a 25-min-old advance must page 5min after boot, not 31"
+        );
+    }
+
+    /// Per-table mode writes the global FLOOR row every tick regardless of
+    /// progress, so `last_polled_at` means "last tick" there and carries no
+    /// freeze information. Fall back to the process-anchored behaviour.
+    #[test]
+    fn stall_anchor_ignores_last_polled_at_in_per_table_mode() {
+        let now_utc = chrono::Utc::now();
+        assert_eq!(
+            stall_anchor_age(Some(now_utc - chrono::Duration::hours(3)), true, now_utc),
+            Duration::ZERO,
+            "SYNC_PER_TABLE_WATERMARK=true ⇒ the column is not a freeze anchor"
+        );
+    }
+
+    /// Pre-bootstrap (no `legacy_ct_state` row) is unknown, not stale.
+    #[test]
+    fn stall_anchor_claims_nothing_without_a_watermark_row() {
+        assert_eq!(
+            stall_anchor_age(None, false, chrono::Utc::now()),
+            Duration::ZERO
+        );
+    }
+
     /// Namespacing lock. `ht_level_drift_alert_cooldowns` is keyed
     /// `(site_id, table_name)` and is SHARED with `scheduler::sync`, which
     /// parks bare reconcile entity names (`bookings`, `customers`) and the
@@ -9048,6 +9572,7 @@ mod tests {
             retention_cooldown_key("HT_Customers"),
             retention_cooldown_key("HT_Book_H"),
             CT_LAG_COOLDOWN_KEY.to_string(),
+            CT_STALL_COOLDOWN_KEY.to_string(),
             SHADOW_CEILING_COOLDOWN_KEY.to_string(),
         ];
         for reason in [
@@ -9096,6 +9621,7 @@ mod tests {
             CT_RETENTION_KEY_PREFIX,
             BOOT_REFUSAL_KEY_PREFIX,
             CT_LAG_COOLDOWN_KEY,
+            CT_STALL_COOLDOWN_KEY,
             SHADOW_CEILING_COOLDOWN_KEY,
         ];
         for (i, a) in prefixes.iter().enumerate() {

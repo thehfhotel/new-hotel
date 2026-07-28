@@ -53,12 +53,53 @@
 //! matching unstamped app-originated row first — the same remedy
 //! `sync::mappers::guest_registry` already applies to
 //! `HT_CheckIn_Other_People`.
+//!
+//! ## Eager product mirror on a POS-sale FK miss (#263)
+//!
+//! [`upsert_canonical_pos_sale`] resolves `Cin_Pro_id` through an INNER
+//! JOIN on `ht_products` and returns `Err` on a miss, which holds the
+//! GLOBAL watermark (see [`FkMissStage`] — that `Err` is the June-3
+//! silent-drop guarantee and must never soften into a skip). Before #263
+//! the only thing that could clear such a miss was the next
+//! `products::poll_products_once` tick inside
+//! `scheduler::mirror::reload_mirror_dimensions` — a ≤15-minute stall of
+//! that site's entire CT sync. [`resolve_pos_sale_fks_or_eager_mirror`]
+//! closes it the way `checkin::resolve_customer_or_eager_mirror` closes
+//! the customer equivalent: fetch the one `HT_Products` row inline from
+//! MSSQL, UPSERT it through `products::upsert_product` (so the
+//! `Pro_Name` char-clamp and the canonical column set stay in ONE
+//! place), and retry the resolve exactly once.
+//!
+//! **The eager path is present but NOT yet armed in production.**
+//! [`MssqlChangeMapper::apply`] carries `(tx, op, row)` and no legacy
+//! pool, and `CheckinProductMirrorMapper` is dispatched on the flat
+//! per-row path (`bin/sync.rs::poll_table`), not the coalesced aggregate
+//! path that hands `mssql` to `apply_*_aggregate`. So this module passes
+//! `mssql = None` and every miss still takes the (unchanged)
+//! watermark-holding `Err`. Arming it is a two-line change in files this
+//! module does not own:
+//!
+//! 1. `sync/mapper.rs` — add a defaulted trait method
+//!    `apply_with_legacy(&self, tx, mssql: &DbPool, op, row)` whose
+//!    default body is `self.apply(tx, op, row).await`, and override it
+//!    for `CheckinProductMirrorMapper`.
+//! 2. `bin/sync.rs::poll_table` — swap the single
+//!    `mapper.apply(&mut tx, op, Some(row))` call site for
+//!    `mapper.apply_with_legacy(&mut tx, mssql, op, Some(row))`. The
+//!    pool is already in scope there.
+//!
+//! That keeps the other 18 mappers, `build_mappers`, and every
+//! integration test that calls `.apply(…)` directly untouched.
 
 use async_trait::async_trait;
 
+use crate::db::mssql_timeout::{simple_query_with_timeout_pooled, MssqlOpKind};
+use crate::db::DbPool;
 use crate::outbox::event::DomainEvent;
 use crate::sync::change_op::ChangeOp;
 use crate::sync::mapper::MssqlChangeMapper;
+use crate::sync::mappers::products;
+use crate::sync::row::test_support::HashMapRow;
 use crate::sync::row::MappableRow;
 use crate::sync::SyncError;
 
@@ -158,23 +199,15 @@ const CHECKIN_PRODUCT_SELECT_COLS: &str =
      t.Cin_Pro_name, t.Cin_Pro_Unit, t.Cin_Pro_num, t.Cin_Pro_price, \
      t.Cin_Pro_priceTotal, t.Cin_Pro_pay, t.Cin_Pro_note";
 
-#[async_trait]
-impl MssqlChangeMapper for CheckinProductMirrorMapper {
-    fn table(&self) -> &'static str {
-        "HT_CheckIn_Product"
-    }
-
-    fn primary_key_cols(&self) -> &'static [&'static str] {
-        &["id"]
-    }
-
-    fn select_sql(&self) -> &'static str {
-        CHECKIN_PRODUCT_SELECT_COLS
-    }
-
-    async fn apply(
+impl CheckinProductMirrorMapper {
+    /// Shared body for [`MssqlChangeMapper::apply`] /
+    /// [`MssqlChangeMapper::apply_with_legacy`] — identical except for
+    /// whether the legacy pool is in reach for the eager product
+    /// mirror (#263).
+    async fn apply_impl(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        mssql: Option<&DbPool>,
         op: ChangeOp,
         row: Option<&dyn MappableRow>,
     ) -> Result<Option<DomainEvent>, SyncError> {
@@ -261,13 +294,58 @@ impl MssqlChangeMapper for CheckinProductMirrorMapper {
                 // both writes idempotently). Pre-2026-06-11 misses
                 // were silently skipped under the false "next CT tick
                 // re-fires" belief — the June-3 silent-drop class.
+                //
+                // `mssql` flows through from the dispatch path: the
+                // watcher's flat per-row loop calls `apply_with_legacy`
+                // (pool present → eager product mirror ARMED, #263);
+                // direct `apply` callers — tests, any legacy code path —
+                // get `None` and byte-identical pre-#263 behaviour.
                 upsert_canonical_pos_sale(
-                    tx, id, cin_no, pro_id, pro_num, pro_price, pro_note, ds_date,
+                    tx, mssql, id, cin_no, pro_id, pro_num, pro_price, pro_note, ds_date,
                 )
                 .await?;
             }
         }
         Ok(None)
+    }
+}
+
+#[async_trait]
+impl MssqlChangeMapper for CheckinProductMirrorMapper {
+    fn table(&self) -> &'static str {
+        "HT_CheckIn_Product"
+    }
+
+    fn primary_key_cols(&self) -> &'static [&'static str] {
+        &["id"]
+    }
+
+    fn select_sql(&self) -> &'static str {
+        CHECKIN_PRODUCT_SELECT_COLS
+    }
+
+    async fn apply(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        op: ChangeOp,
+        row: Option<&dyn MappableRow>,
+    ) -> Result<Option<DomainEvent>, SyncError> {
+        self.apply_impl(tx, None, op, row).await
+    }
+
+    /// Arms the eager product mirror (#263): the watcher's per-row
+    /// dispatch hands the legacy pool down so a missing `ht_products`
+    /// row is mirrored on the spot instead of holding the watermark for
+    /// up to one dimension-reload interval. Legacy is READ here, never
+    /// written.
+    async fn apply_with_legacy(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        mssql: &DbPool,
+        op: ChangeOp,
+        row: Option<&dyn MappableRow>,
+    ) -> Result<Option<DomainEvent>, SyncError> {
+        self.apply_impl(tx, Some(mssql), op, row).await
     }
 }
 
@@ -336,9 +414,16 @@ const ADOPT_UNSTAMPED_POS_SALE_SQL: &str = "UPDATE ht_pos_sales SET sale_legacy_
 /// watermark; the mirror-table UPSERT above still commits (per-row
 /// errors don't roll back the tick TX) so `legacy_mirror` readers see
 /// the row immediately, and the retried apply is idempotent.
+///
+/// `mssql` (#263) is the optional legacy pool used to eager-mirror a
+/// not-yet-known product before giving up — see
+/// [`resolve_pos_sale_fks_or_eager_mirror`]. `None` reproduces the
+/// pre-#263 behaviour exactly (miss → `Err`), which is what the trait
+/// dispatch path passes today.
 #[allow(clippy::too_many_arguments)]
 async fn upsert_canonical_pos_sale(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    mssql: Option<&DbPool>,
     legacy_id: i32,
     cin_no: Option<&str>,
     pro_id: Option<&str>,
@@ -362,30 +447,11 @@ async fn upsert_canonical_pos_sale(
         return Ok(());
     }
 
-    // Resolve cin_id + prod_id in one round trip. Any NULL means the
-    // parent rows aren't yet mirrored — error so the watermark holds
-    // and the retry runs against mirrored parents.
-    let resolved: Option<(i32, i64)> = sqlx::query_as(
-        "SELECT c.cin_id, p.prod_id \
-           FROM ht_checkins c \
-           JOIN ht_products p ON p.prod_legacy_no = $2 \
-          WHERE c.legacy_cin_no = $1 \
-          LIMIT 1",
-    )
-    .bind(cin_no)
-    .bind(pro_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    let Some((cin_id, prod_id)) = resolved else {
-        return Err(SyncError::Mapper {
-            table: "HT_CheckIn_Product",
-            message: format!(
-                "canonical pos-sale FK unresolvable for legacy id={legacy_id} \
-                 cin_no={cin_no} pro_id={pro_id} — parent checkin/product not \
-                 yet mirrored; holding watermark for loud retry"
-            ),
-        });
-    };
+    // Resolve cin_id + prod_id in one round trip; on a miss, try the
+    // eager product mirror once (#263) and otherwise error so the
+    // watermark holds and the retry runs against mirrored parents.
+    let (cin_id, prod_id) =
+        resolve_pos_sale_fks_or_eager_mirror(tx, mssql, legacy_id, cin_no, pro_id).await?;
 
     // Two-step UPSERT keyed on `sale_legacy_id`. The partial UNIQUE
     // index `WHERE sale_legacy_id IS NOT NULL` means standard
@@ -485,6 +551,412 @@ async fn upsert_canonical_pos_sale(
         .await?;
     }
     Ok(())
+}
+
+// ─── POS-sale FK resolution with eager product mirror (#263) ─────────
+
+/// The combined FK resolve for one `HT_CheckIn_Product` line. Hoisted to
+/// a const so the shape test below can pin that it stays an INNER JOIN —
+/// softening it to a LEFT JOIN would resolve `cin_id` with a NULL
+/// `prod_id` and turn the watermark-holding `Err` into a silent skip.
+/// `&'static str` also keeps it on sqlx's `SqlSafeStr` fast path.
+const POS_SALE_FK_RESOLVE_SQL: &str = "SELECT c.cin_id, p.prod_id \
+       FROM ht_checkins c \
+       JOIN ht_products p ON p.prod_legacy_no = $2 \
+      WHERE c.legacy_cin_no = $1 \
+      LIMIT 1";
+
+/// Which side of [`POS_SALE_FK_RESOLVE_SQL`] missed. Answering that
+/// costs one indexed lookup and decides whether an MSSQL round trip can
+/// possibly help — the product is the only side with an eager path
+/// (a missing check-in is driven by its own CT table).
+const CANONICAL_PRODUCT_PROBE_SQL: &str =
+    "SELECT 1 FROM ht_products WHERE prod_legacy_no = $1 LIMIT 1";
+
+/// Strategy for sourcing a `HT_Products` row when the canonical
+/// `prod_legacy_no` lookup misses. The production strategy hits MSSQL
+/// via tiberius; tests inject a closure that returns a synthesised
+/// `HashMapRow` so the eager-mirror path is exercised without a live
+/// legacy connection.
+///
+/// Deliberately the same shape as `checkin::CustomerSource` — that is
+/// the established eager-mirror idiom in this crate and the two should
+/// stay recognisably identical. Kept `#[doc(hidden)] pub` for the same
+/// reason: the integration suite is a separate crate compiled without
+/// the lib's `test` cfg, so a `#[cfg(test)]` gate would put the stub out
+/// of its reach.
+#[doc(hidden)]
+pub enum ProductSource<'a> {
+    /// Production: borrow a live MSSQL pool and `SELECT` one row by
+    /// `Pro_no`.
+    Mssql(&'a DbPool),
+    /// Test injection: deterministic stub returning the row a real MSSQL
+    /// fetch would have returned.
+    Stub(ProductRowSupplier<'a>),
+}
+
+/// Injected row supplier behind [`ProductSource::Stub`]. Aliased rather
+/// than written inline so the variant stays under clippy's
+/// `type_complexity` threshold.
+#[doc(hidden)]
+pub type ProductRowSupplier<'a> = Box<dyn Fn(&str) -> Option<HashMapRow> + Send + Sync + 'a>;
+
+/// Why a POS-sale FK resolution gave up. EVERY variant ends in the
+/// watermark-holding `Err` — the enum exists to make the reason
+/// greppable in production logs, never to introduce a skip. Adding a
+/// variant that maps to `Ok(())` would re-open the June-3 silent-drop
+/// class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FkMissStage {
+    /// No legacy pool reached this mapper, so no eager fetch was even
+    /// attempted. The pre-#263 behaviour, and what the trait dispatch
+    /// path still produces today.
+    NoEagerAttempt,
+    /// The product IS canonical — the parent `ht_checkins` row is what's
+    /// missing. No eager path exists for it here (`HT_CheckIn_H` drives
+    /// its own aggregate mapper), so hold and retry.
+    CheckinNotMirrored,
+    /// The eager fetch ran and `HT_Products` has no usable row for this
+    /// `Cin_Pro_id` at all.
+    ProductAbsentInLegacy,
+    /// The product was eagerly mirrored, but the retried join still
+    /// misses — i.e. the check-in side is missing too.
+    StillUnresolvedAfterEagerMirror,
+}
+
+impl FkMissStage {
+    /// Distinct, greppable tail for the log/error line.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::NoEagerAttempt => {
+                "product not yet mirrored and no legacy pool wired into this \
+                 mapper (eager product mirror unarmed — see module docstring)"
+            }
+            Self::CheckinNotMirrored => {
+                "product resolves; the parent check-in is not yet mirrored"
+            }
+            Self::ProductAbsentInLegacy => {
+                "eager product mirror found no usable HT_Products row for this \
+                 Cin_Pro_id either"
+            }
+            Self::StillUnresolvedAfterEagerMirror => {
+                "product eagerly mirrored from MSSQL but the join still misses \
+                 — the parent check-in is not yet mirrored"
+            }
+        }
+    }
+}
+
+/// Build the watermark-holding error for a FK miss. Keeps the
+/// pre-#263 `canonical pos-sale FK unresolvable for legacy id=…` prefix
+/// (operators grep for it) and appends the stage-specific reason.
+fn pos_sale_fk_error(
+    stage: FkMissStage,
+    legacy_id: i32,
+    cin_no: &str,
+    pro_id: &str,
+) -> SyncError {
+    SyncError::Mapper {
+        table: "HT_CheckIn_Product",
+        message: format!(
+            "canonical pos-sale FK unresolvable for legacy id={legacy_id} \
+             cin_no={cin_no} pro_id={pro_id} — {}; holding watermark for \
+             loud retry",
+            stage.reason()
+        ),
+    }
+}
+
+/// What to do after the combined resolve missed. PURE branch table so
+/// the recovery's control flow is testable without PG or MSSQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FkMissAction {
+    /// Give up now with this stage — no MSSQL round trip can help.
+    HoldWatermark(FkMissStage),
+    /// The product side is the missing one and a pool is available.
+    EagerMirrorProduct,
+}
+
+/// PURE. See [`FkMissAction`].
+fn classify_fk_miss(product_in_canonical: bool, have_mssql: bool) -> FkMissAction {
+    if product_in_canonical {
+        // The join can only have missed on the check-in side.
+        FkMissAction::HoldWatermark(FkMissStage::CheckinNotMirrored)
+    } else if have_mssql {
+        FkMissAction::EagerMirrorProduct
+    } else {
+        FkMissAction::HoldWatermark(FkMissStage::NoEagerAttempt)
+    }
+}
+
+/// PURE. Outcome of one eager attempt: `None` means the sale resolved
+/// (the only non-error exit), `Some(stage)` is the reason to hold the
+/// watermark. A legacy row that exists but fails to upsert never reaches
+/// here — `products::upsert_product`'s error propagates out of
+/// [`eager_mirror_product`] as a `SyncError`, which is also a hold.
+fn classify_eager_outcome(mirrored: bool, resolved: bool) -> Option<FkMissStage> {
+    match (mirrored, resolved) {
+        (_, true) => None,
+        (false, false) => Some(FkMissStage::ProductAbsentInLegacy),
+        (true, false) => Some(FkMissStage::StillUnresolvedAfterEagerMirror),
+    }
+}
+
+/// Resolve `(cin_id, prod_id)` for one folio line; on a product miss,
+/// eagerly mirror the referenced `HT_Products` row from MSSQL into
+/// `ht_products` and retry the resolve ONCE.
+///
+/// Returns the resolved pair or a `SyncError` — deliberately NOT an
+/// `Option`, so no future edit can turn a miss into a skip (June-3
+/// silent-drop class; `sync::resolve` module doc).
+///
+/// ## Why eager-mirror instead of waiting for the poll
+///
+/// `products::poll_products_once` (wired first in
+/// `scheduler::mirror::reload_mirror_dimensions`, `7b57edc`) bounds the
+/// stall at the 15-minute reload cadence, but the CT watcher's GLOBAL
+/// watermark gates on `!errored` — so for those minutes the miss freezes
+/// EVERY CT table for that site, not just POS lines. A product named by
+/// a `HT_CheckIn_Product` row must exist in `HT_Products` (iHOTEL
+/// inserts the SKU before it can be rung up), so a synchronous
+/// single-row fetch is always safe — the same argument
+/// `checkin::resolve_customer_or_eager_mirror` makes for `HT_Customers`.
+///
+/// The eager UPSERT runs in the CT tick's own transaction, so the
+/// product and the sale it unblocks commit atomically.
+async fn resolve_pos_sale_fks_or_eager_mirror(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    mssql: Option<&DbPool>,
+    legacy_id: i32,
+    cin_no: &str,
+    pro_id: &str,
+) -> Result<(i32, i64), SyncError> {
+    // Fast path — both parents already canonical.
+    if let Some(hit) = resolve_pos_sale_fks(tx, cin_no, pro_id).await? {
+        return Ok(hit);
+    }
+
+    let product_in_canonical = canonical_product_exists(tx, pro_id).await?;
+    let pool = match classify_fk_miss(product_in_canonical, mssql.is_some()) {
+        FkMissAction::HoldWatermark(stage) => {
+            return Err(pos_sale_fk_error(stage, legacy_id, cin_no, pro_id));
+        }
+        FkMissAction::EagerMirrorProduct => match mssql {
+            Some(pool) => pool,
+            // Unreachable by construction — `classify_fk_miss` only
+            // returns `EagerMirrorProduct` when `have_mssql`. Kept as a
+            // hold rather than a panic so a future refactor of the
+            // branch table can't take down the watcher.
+            None => {
+                return Err(pos_sale_fk_error(
+                    FkMissStage::NoEagerAttempt,
+                    legacy_id,
+                    cin_no,
+                    pro_id,
+                ));
+            }
+        },
+    };
+
+    // A failure INSIDE the eager mirror (MSSQL read error, malformed
+    // legacy row, PG upsert rejection) propagates as `Err` — the legacy
+    // row existed, so this must hold the watermark, never skip.
+    let mirrored = eager_mirror_product(tx, ProductSource::Mssql(pool), pro_id)
+        .await?
+        .is_some();
+    let resolved = if mirrored {
+        resolve_pos_sale_fks(tx, cin_no, pro_id).await?
+    } else {
+        None
+    };
+
+    match (classify_eager_outcome(mirrored, resolved.is_some()), resolved) {
+        (None, Some((cin_id, prod_id))) => {
+            tracing::info!(
+                legacy_id,
+                cin_no,
+                pro_id,
+                cin_id,
+                prod_id,
+                "pos-sale eager product mirror: resolved on retry — closed the \
+                 ≤15-min products-poll race without holding the watermark"
+            );
+            Ok((cin_id, prod_id))
+        }
+        (stage, _) => Err(pos_sale_fk_error(
+            stage.unwrap_or(FkMissStage::StillUnresolvedAfterEagerMirror),
+            legacy_id,
+            cin_no,
+            pro_id,
+        )),
+    }
+}
+
+/// The plain combined resolve — one round trip, no recovery.
+async fn resolve_pos_sale_fks(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    cin_no: &str,
+    pro_id: &str,
+) -> Result<Option<(i32, i64)>, SyncError> {
+    let resolved: Option<(i32, i64)> = sqlx::query_as(POS_SALE_FK_RESOLVE_SQL)
+        .bind(cin_no)
+        .bind(pro_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    Ok(resolved)
+}
+
+/// Is this `Cin_Pro_id` already a canonical product? Discriminates the
+/// two sides of the combined-resolve miss.
+async fn canonical_product_exists(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    pro_id: &str,
+) -> Result<bool, SyncError> {
+    let hit: Option<i32> = sqlx::query_scalar(CANONICAL_PRODUCT_PROBE_SQL)
+        .bind(pro_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    Ok(hit.is_some())
+}
+
+/// Fetch one `HT_Products` row through [`ProductSource`] and UPSERT it
+/// into canonical `ht_products`, returning the new `prod_id`.
+///
+/// `Ok(None)` means "no usable legacy row" (genuinely absent, or a blank
+/// business key that could never satisfy the join) — the caller turns
+/// that into the watermark-holding `Err`. It is NOT a skip.
+///
+/// The write goes through `products::upsert_product` on purpose: that is
+/// where the `Pro_Name` → `prod_name` char-clamp lives
+/// (`PROD_NAME_MAX_CHARS`; legacy `varchar(500)` counts TIS-620 BYTES,
+/// canonical `VARCHAR(250)` counts CHARACTERS, so a long Thai name
+/// really does overflow) and where `prod_active` is deliberately left
+/// alone. A hand-rolled INSERT here would silently drift from the poll.
+async fn eager_mirror_product(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    source: ProductSource<'_>,
+    pro_id: &str,
+) -> Result<Option<i64>, SyncError> {
+    if pro_id.trim().is_empty() {
+        // Can never satisfy `p.prod_legacy_no = $2`; don't spend an
+        // MSSQL round trip per tick on it.
+        tracing::warn!(
+            pro_id,
+            "pos-sale eager product mirror: blank Cin_Pro_id — no eager fetch \
+             possible; caller will error to hold the watermark"
+        );
+        return Ok(None);
+    }
+
+    let projected = match &source {
+        ProductSource::Mssql(pool) => fetch_product_projection_from_mssql(pool, pro_id).await?,
+        ProductSource::Stub(f) => match f(pro_id) {
+            // Same projection function the poll uses, so the eager path
+            // can never disagree with it about column → field mapping.
+            Some(row) => Some(products::project(&row)?),
+            None => None,
+        },
+    };
+
+    let Some(projection) = projected else {
+        tracing::warn!(
+            pro_id,
+            "pos-sale eager product mirror: HT_Products has no row for this \
+             Cin_Pro_id — caller will error to hold the watermark"
+        );
+        return Ok(None);
+    };
+
+    if !products::is_acceptable_projection(&projection) {
+        tracing::warn!(
+            pro_id,
+            "pos-sale eager product mirror: legacy row has a blank Pro_no — \
+             unusable as an FK target; caller will error to hold the watermark"
+        );
+        return Ok(None);
+    }
+
+    let prod_id = products::upsert_product(tx, &projection).await?;
+    tracing::info!(
+        pro_id,
+        prod_id,
+        "pos-sale eager product mirror: eagerly mirrored referenced product \
+         from MSSQL"
+    );
+    Ok(Some(prod_id))
+}
+
+/// Pull one `HT_Products` row by `Pro_no` and project it. Mirrors
+/// `checkin::fetch_customer_row_from_mssql` — a single-table `SELECT`
+/// via `simple_query` with an inline-quoted WHERE value, wrapped in the
+/// per-op read timeout so one stuck row-lock can't serialize-block the
+/// watcher tick (R2, 2026-05-14).
+///
+/// Returns `Ok(None)` when the row genuinely doesn't exist in MSSQL.
+async fn fetch_product_projection_from_mssql(
+    pool: &DbPool,
+    pro_no: &str,
+) -> Result<Option<products::ProductProjection>, SyncError> {
+    let mut conn = pool.get().await?;
+    let sql = product_eager_fetch_sql(pro_no);
+    let raw_rows = simple_query_with_timeout_pooled(&mut conn, &sql, MssqlOpKind::Read).await?;
+    let Some(raw) = raw_rows.first() else {
+        return Ok(None);
+    };
+    // `tiberius::Row` implements `MappableRow`, so the poll and this
+    // eager fetch share ONE projection path.
+    Ok(Some(products::project(raw)?))
+}
+
+/// Compose the single-row eager fetch from the products poll's own
+/// SELECT, so the column list stays in lockstep with `POLL_COLUMNS`
+/// (and inherits its Track-J1 projection-lock tests). PURE — no I/O.
+///
+/// Plain `'…'` literal, never `N'…'`: the legacy DB stores Thai as
+/// TIS-620 and an `N` prefix corrupts it (findings.md).
+fn product_eager_fetch_sql(pro_no: &str) -> String {
+    format!(
+        "{} WHERE Pro_no = {}",
+        products::poll_select_sql(),
+        sql_quote_inline(pro_no)
+    )
+}
+
+/// SQL-quote a value for inline interpolation. Same semantics as
+/// `checkin::sql_quote_inline` / `parent_loader::sql_quote_inline` —
+/// duplicated (as those two already are of each other) so this module
+/// stays self-contained for the eager-fetch path.
+fn sql_quote_inline(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Test seam for the integration suite: exercises the eager-mirror path
+/// without a live MSSQL connection by injecting a stub row-supplier.
+/// Mirrors `checkin::resolve_customer_via_eager_mirror_for_test`.
+///
+/// Returns the mirrored `prod_id`, or `Ok(None)` when the stub supplies
+/// no row (product truly missing in MSSQL) — which the production
+/// caller converts into the watermark-holding `Err`.
+#[doc(hidden)]
+pub async fn eager_mirror_product_for_test<F>(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    pro_id: &str,
+    supplier: F,
+) -> Result<Option<i64>, SyncError>
+where
+    F: Fn(&str) -> Option<HashMapRow> + Send + Sync + 'static,
+{
+    eager_mirror_product(tx, ProductSource::Stub(Box::new(supplier)), pro_id).await
 }
 
 // ─── HT_Deposit ──────────────────────────────────────────────────────
@@ -1561,6 +2033,204 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ─── Eager product mirror (#263) ─────────────────────────────────
+
+    /// The FK resolve must stay an INNER JOIN. A LEFT JOIN would return
+    /// `cin_id` with a NULL `prod_id`, which decodes as a resolved row
+    /// and turns the watermark-holding `Err` into a silent skip — the
+    /// exact June-3 class the eager mirror is layered ON TOP of, not a
+    /// replacement for.
+    #[test]
+    fn pos_sale_fk_resolve_stays_an_inner_join_on_the_legacy_business_key() {
+        let sql = POS_SALE_FK_RESOLVE_SQL;
+        assert!(sql.contains("JOIN ht_products p ON p.prod_legacy_no = $2"), "{sql}");
+        assert!(!sql.contains("LEFT JOIN"), "{sql}");
+        assert!(sql.contains("WHERE c.legacy_cin_no = $1"), "{sql}");
+        // The probe that discriminates the two sides of a miss keys on
+        // the same legacy business key.
+        assert!(
+            CANONICAL_PRODUCT_PROBE_SQL.contains("prod_legacy_no = $1"),
+            "{CANONICAL_PRODUCT_PROBE_SQL}"
+        );
+    }
+
+    /// Branch table for a combined-resolve miss. Only a product miss
+    /// with a live pool may spend an MSSQL round trip; a check-in miss
+    /// has no eager path here and an unarmed mapper must behave exactly
+    /// as it did pre-#263.
+    #[test]
+    fn fk_miss_only_takes_the_eager_path_for_a_missing_product_with_a_pool() {
+        assert_eq!(
+            classify_fk_miss(false, true),
+            FkMissAction::EagerMirrorProduct
+        );
+        assert_eq!(
+            classify_fk_miss(false, false),
+            FkMissAction::HoldWatermark(FkMissStage::NoEagerAttempt)
+        );
+        // Product already canonical → the check-in is the missing side;
+        // an MSSQL product fetch cannot help, so don't make one.
+        assert_eq!(
+            classify_fk_miss(true, true),
+            FkMissAction::HoldWatermark(FkMissStage::CheckinNotMirrored)
+        );
+        assert_eq!(
+            classify_fk_miss(true, false),
+            FkMissAction::HoldWatermark(FkMissStage::CheckinNotMirrored)
+        );
+    }
+
+    /// Eager hit: the product was mirrored and the retried resolve
+    /// landed → no error, the sale applies in this same tick instead of
+    /// waiting up to 15 minutes for `poll_products_once`.
+    #[test]
+    fn eager_hit_resolves_the_sale_without_an_error() {
+        assert_eq!(classify_eager_outcome(true, true), None);
+    }
+
+    /// Genuine absence still errs. `HT_Products` has no row for this
+    /// `Cin_Pro_id`, so nothing can resolve it — hold the watermark for
+    /// a loud retry rather than dropping the canonical sale.
+    #[test]
+    fn genuine_product_absence_still_holds_the_watermark() {
+        assert_eq!(
+            classify_eager_outcome(false, false),
+            Some(FkMissStage::ProductAbsentInLegacy)
+        );
+        // Mirrored, but the join still misses → the check-in side is
+        // missing too. Also a hold, with its own reason.
+        assert_eq!(
+            classify_eager_outcome(true, false),
+            Some(FkMissStage::StillUnresolvedAfterEagerMirror)
+        );
+    }
+
+    /// Every give-up stage must produce a `SyncError::Mapper` on
+    /// `HT_CheckIn_Product` (which is what makes the watcher set
+    /// `errored=true` and hold the watermark), keep the pre-#263
+    /// greppable prefix, and carry a REASON distinct from every other
+    /// stage so a production log line identifies the branch taken.
+    #[test]
+    fn every_fk_miss_stage_errors_with_a_distinct_greppable_reason() {
+        let stages = [
+            FkMissStage::NoEagerAttempt,
+            FkMissStage::CheckinNotMirrored,
+            FkMissStage::ProductAbsentInLegacy,
+            FkMissStage::StillUnresolvedAfterEagerMirror,
+        ];
+        let mut reasons: Vec<&str> = Vec::new();
+        for stage in stages {
+            let err = pos_sale_fk_error(stage, 4242, "CH26-001061", "B-001");
+            match &err {
+                SyncError::Mapper { table, message } => {
+                    assert_eq!(*table, "HT_CheckIn_Product");
+                    assert!(
+                        message.starts_with(
+                            "canonical pos-sale FK unresolvable for legacy id=4242"
+                        ),
+                        "{message}"
+                    );
+                    assert!(message.contains("cin_no=CH26-001061"), "{message}");
+                    assert!(message.contains("pro_id=B-001"), "{message}");
+                    assert!(
+                        message.contains("holding watermark for loud retry"),
+                        "{message}"
+                    );
+                }
+                other => panic!("expected SyncError::Mapper, got {other:?}"),
+            }
+            reasons.push(stage.reason());
+        }
+        let unique: std::collections::HashSet<&str> = reasons.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            reasons.len(),
+            "each stage needs its own reason text: {reasons:?}"
+        );
+    }
+
+    /// The eager fetch is composed from the products poll's own SELECT,
+    /// so adding a column to `products::POLL_COLUMNS` reaches both paths
+    /// at once. Plain `'…'` literal — `N'…'` corrupts TIS-620 in the
+    /// legacy DB.
+    #[test]
+    fn eager_product_fetch_sql_reuses_the_products_poll_projection() {
+        let sql = product_eager_fetch_sql("B-001");
+        assert!(
+            sql.starts_with(&crate::sync::mappers::products::poll_select_sql()),
+            "{sql}"
+        );
+        assert!(sql.ends_with(" WHERE Pro_no = 'B-001'"), "{sql}");
+        for col in crate::sync::mappers::products::POLL_COLUMNS {
+            assert!(sql.contains(col), "eager fetch must select `{col}`: {sql}");
+        }
+        assert!(!sql.contains("N'"), "N'…' corrupts TIS-620: {sql}");
+    }
+
+    /// Inline-quoted WHERE value — an embedded apostrophe must double,
+    /// not terminate the literal.
+    #[test]
+    fn eager_product_fetch_sql_doubles_embedded_quotes() {
+        assert_eq!(sql_quote_inline("O'Brien"), "'O''Brien'");
+        let sql = product_eager_fetch_sql("O'Brien");
+        assert!(sql.ends_with(" WHERE Pro_no = 'O''Brien'"), "{sql}");
+    }
+
+    /// The `Pro_Name` clamp is load-bearing on the eager path too:
+    /// legacy `varchar(500)` counts TIS-620 BYTES while canonical
+    /// `VARCHAR(250)` counts CHARACTERS, so a long Thai name overflows
+    /// and would abort the tick transaction. The eager path gets the
+    /// clamp for free by projecting with `products::project` and writing
+    /// with `products::upsert_product` — this pins both halves: the
+    /// projection carries the over-long name through unchanged, and the
+    /// module never hand-rolls an `ht_products` INSERT that would bypass
+    /// `PROD_NAME_MAX_CHARS`.
+    #[test]
+    fn eager_path_applies_the_pro_name_char_clamp_via_products_upsert() {
+        use crate::sync::mappers::products::{
+            clamp_chars, project, PROD_NAME_MAX_CHARS, TABLE as HT_PRODUCTS,
+        };
+        use crate::sync::row::test_support::MockValue;
+
+        // Exactly the row a stubbed eager fetch supplies.
+        let row = crate::sync::row::test_support::HashMapRow::new(HT_PRODUCTS)
+            .with("Pro_no", MockValue::Str("B-001".into()))
+            .with("Pro_Name", MockValue::Str("ก".repeat(400)))
+            .with("Pro_Unit", MockValue::Str("ขวด".into()))
+            .with("Pro_PriceA", MockValue::Decimal(25.0))
+            .with("Pro_Amt", MockValue::Decimal(12.0))
+            .with("Pro_Type", MockValue::Str("B".into()));
+
+        let p = project(&row).expect("eager row must project");
+        assert_eq!(p.prod_legacy_no, "B-001");
+        assert_eq!(p.prod_name.chars().count(), 400);
+        // …and the write path clamps it on a char boundary.
+        let clamped = clamp_chars(&p.prod_name, PROD_NAME_MAX_CHARS);
+        assert_eq!(clamped.chars().count(), PROD_NAME_MAX_CHARS);
+        assert!(clamped.chars().all(|c| c == 'ก'));
+
+        // Source pin: the canonical product write must stay delegated to
+        // `products::upsert_product`, which owns the clamp AND leaves
+        // operator-owned `prod_active` alone.
+        // Slice off the test module. The marker is the full `mod tests`
+        // header, not a bare `#[cfg(test)]` — the docs above legitimately
+        // name that attribute in prose.
+        let src = include_str!("mirror.rs");
+        let marker = src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("test module marker");
+        let code = &src[..marker];
+        assert!(
+            code.contains("products::upsert_product(tx, &projection)"),
+            "the eager mirror must write through products::upsert_product"
+        );
+        assert!(
+            !code.contains("INSERT INTO ht_products"),
+            "a hand-rolled ht_products INSERT here would bypass the \
+             Pro_Name char-clamp and drift from the poll's column set"
+        );
     }
 
     /// Phase 5/E2 — lock the projection columns for `HT_Book_Pro` so a

@@ -29,6 +29,7 @@
 
 use async_trait::async_trait;
 
+use crate::db::DbPool;
 use crate::outbox::event::DomainEvent;
 use crate::sync::change_op::ChangeOp;
 use crate::sync::row::MappableRow;
@@ -84,6 +85,24 @@ pub trait MssqlChangeMapper: Send + Sync {
         op: ChangeOp,
         row: Option<&dyn MappableRow>,
     ) -> Result<Option<DomainEvent>, SyncError>;
+
+    /// Like [`Self::apply`], but with the legacy MSSQL pool in reach for
+    /// mappers that need an EAGER legacy read to resolve a canonical FK
+    /// (issue #263 — `CheckinProductMirrorMapper` mirrors a missing
+    /// product on the spot instead of erroring for up to one reload
+    /// interval). The default delegates straight to [`Self::apply`], so
+    /// the other mappers are byte-identical; the watcher's flat per-row
+    /// dispatch calls THIS method. Read-only against legacy — a mapper
+    /// override must never WRITE through this pool.
+    async fn apply_with_legacy(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        _mssql: &DbPool,
+        op: ChangeOp,
+        row: Option<&dyn MappableRow>,
+    ) -> Result<Option<DomainEvent>, SyncError> {
+        self.apply(tx, op, row).await
+    }
 
     /// Optional **aggregate root key** for this row.
     ///
