@@ -6,6 +6,67 @@ and prior entries instead of re-explaining. Vocabulary: "sync lag / unconverged"
 for transients, "durable divergence" only for rows that resist multiple sweep cycles
 (see CLAUDE.md "Vocabulary note").
 
+## 2026-07-29 — mark_dirty polarity fix: live-verified PASS (room 302, HF Hotel)
+
+**Not an incident** — a live verification entry for a fix shipped and confirmed
+the same day. Merge commit `6848a22` (fix commit `5ce6be1`, branch
+`phase3-mark-dirty`), deployed via CI: deploy job ran, all five containers
+restarted, backend healthy. Runsheet: `docs/coexistence/phase3-mark-dirty-runsheet.md`.
+
+**The bug (live until today).** Marking a room dirty in our app reused
+`mark_clean`'s statement builder, so it wrote the CLEAN value to legacy
+`HT_Rooms.Room_Clean`. Two consequences: iHOTEL was told the room was clean —
+the opposite of the receptionist's intent — and the CT watcher then read that
+back and reverted canonical to clean within a tick, silently undoing the
+receptionist's action.
+
+**Fix.** `mark_dirty` now owns its own `build_statements` and writes
+`Room_Clean='yes'` (needs cleaning), leaving `Room_Use` / `Room_Use_Count` /
+`Room_Clean_Time` untouched.
+
+**Live verification, room 302 (legacy `HT_Rooms.id=2`), HF Hotel, all
+timestamps UTC.**
+- Baseline pre-test: canonical `room_clean=true`, available; legacy
+  `Room_Clean='no'`, `Room_Use='no'`, `Room_Use_Count=355`, `Room_Clean_Time`
+  blank.
+- 10:22:31 reception marked 302 dirty in our app. Writeback job #40
+  `mark_room_dirty` → done, 1 attempt, no error, ~65ms.
+- Canonical flipped to `room_clean=false` at 10:22:33.
+- Legacy row: `Room_Clean` `'no'` → `'yes'`. Companion columns PROVABLY
+  untouched: `Room_Use='no'`, `Room_Use_Count=355`, `Room_Clean_Time` still
+  zero-length.
+- Exactly one `HT_Housewife` audit row minted: `h_name=winut`, `h_room=302`,
+  `h_cin=CH26-006285`, `h_note=''` (17:22:31 Thai local).
+- Reception confirmed iHOTEL's own room grid displayed 302 as needing
+  cleaning — the cross-app assertion that only a live window can make.
+- Echo test (the point of the window): 4 minutes untouched. Canonical stayed
+  `room_clean=false` with `updated_at` frozen at 10:22:33 (nothing rewrote
+  it). Crucially the watcher was demonstrably awake and DID see the change —
+  sync-1 logged `CT rows applied table="HT_Rooms" from=69696
+  applied_through=69697 ingested=0 skipped=1` and advanced the global
+  watermark 69696→69697. `ingested=0/skipped=1` is the echo-before-stamp
+  adoption correctly declining to re-apply our own write. Under the old bug
+  this would have ingested the row and inverted canonical back to clean.
+- 10:27:32 reception marked 302 clean again. Writeback job #41
+  `mark_room_clean` → done, 1 attempt, no error. Both sides converged back to
+  the exact baseline (canonical `room_clean=true`; legacy `Room_Clean='no'`,
+  `Room_Use='no'`, `Room_Use_Count=355`, `Room_Clean_Time` zero-length).
+  `ht_reconcile_log`: 0 unresolved rows throughout.
+
+**Not run.** Runsheet step 12, the inbound-direction spot check (reception
+marking a DIFFERENT room in iHOTEL and our app following) — the window ended
+after the outbound path passed. The inbound path is long-standing shipped
+behaviour and was not modified by this change, but it was not re-exercised
+today.
+
+**Known follow-up carried forward (not a gate).** Our mark-dirty
+`HT_Housewife` row has `h_note=''`, which `FrmReportHousewife` counts as a
+cleaning by that operator. New evidence from today's read: iHOTEL's OWN rows
+for room 302 (`h_name=Admin`, dated 2026-07-26, 2026-07-05, 2026-06-11) also
+carry `h_note=''`, so an empty note does not discriminate even within
+iHOTEL's own data; any fix needs a discriminator that appears in no existing
+capture. Being filed as its own issue.
+
 ## 2026-07-29 — /v2 slow tabs + 500s + SSE 524: PG pool exhausted by per-tab LISTEN connections
 
 **Symptom.** Long loads switching /v2 tabs; console 500s on
