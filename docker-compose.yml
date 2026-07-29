@@ -126,6 +126,8 @@ services:
       - NEW_DB_PORT=${PGPORT:-5439}
       - NEW_DB_NAME=${POSTGRES_DB}
       - NEW_DB_USER=${POSTGRES_USER}
+      # Headroom over the code default of 10 (config.rs) after the 2026-07-29 SSE pool-exhaustion incident.
+      - NEW_DB_POOL_MAX=${NEW_DB_POOL_MAX:-20}
       # NEW_DB_PASSWORD — sourced from /run/secrets/postgres_password.
       # config.rs::NewDbConfig::from_env still reads `NEW_DB_PASSWORD`;
       # the hydrator copies POSTGRES_PASSWORD → NEW_DB_PASSWORD when only
@@ -171,6 +173,8 @@ services:
       - VILLE_DB_PORT=${VILLE_DB_PORT:-5439}
       - VILLE_DB_NAME=${VILLE_DB_NAME:-hotelville}
       - VILLE_DB_USER=${VILLE_DB_USER:-${POSTGRES_USER}}
+      # Headroom over the code default of 5 (config.rs) after the 2026-07-29 SSE pool-exhaustion incident.
+      - VILLE_DB_POOL_MAX=${VILLE_DB_POOL_MAX:-10}
       # VILLE_DB_PASSWORD — sourced from /run/secrets/ville_db_password
       # CORS allowlist (Phase 3 hardening). Comma-separated absolute
       # origins. Default (when unset) covers the Next.js dev server on

@@ -20,6 +20,7 @@ use crate::repository::{
     PgInventoryRepository, PgPaymentRepository, PgRoomRepository, RoomRepository,
 };
 use crate::routes::auth::ProdAuthService;
+use crate::routes::events::EventFanout;
 use crate::config::SiteConfig;
 use crate::service::{
     BookingService, CheckInService, CouponService, CustomerService, HousekeepingService,
@@ -105,6 +106,13 @@ pub struct AppState {
     pub ville_pool: Option<crate::db::PgPool>,
     /// Current system operating mode
     pub mode: Arc<std::sync::RwLock<SystemMode>>,
+    /// Broadcast fan-out of the per-site `domain_events` LISTEN stream
+    /// (`routes::events`). The SSE handler `subscribe()`s to this instead of
+    /// borrowing a `PgListener` from a pool — before the 2026-07-29 fix every
+    /// open browser tab held 1–2 real pool slots for the life of its stream
+    /// and tab churn exhausted the pool. Cheap to clone (one `Arc` bump per
+    /// site sender); the publishing tasks are spawned in `main.rs`.
+    pub event_fanout: EventFanout,
 
     // ----- Repository handles (per architecture.md §1, §6) -----
     pub customers: Arc<dyn CustomerRepository>,
@@ -227,6 +235,7 @@ impl AppState {
             new_pool,
             ville_pool: None,
             mode: Arc::new(std::sync::RwLock::new(SystemMode::Legacy)),
+            event_fanout: EventFanout::new(),
             customers,
             bookings,
             checkins,
@@ -279,6 +288,7 @@ impl AppState {
             new_pool,
             ville_pool: None,
             mode: Arc::new(std::sync::RwLock::new(mode)),
+            event_fanout: EventFanout::new(),
             customers,
             bookings,
             checkins,
@@ -410,6 +420,11 @@ impl AppState {
     /// Create new AppState with ville pool
     pub fn with_ville(mut self, ville_pool: crate::db::PgPool) -> Self {
         self.ville_pool = Some(ville_pool);
+        // Keep the Ville event fan-out in lockstep with the Ville pool: the
+        // SSE `branch=hfville|all` contract is "degrade to hfhotel with a
+        // warning when Ville is unavailable", and `EventFanout` decides that
+        // from whether its Ville channel exists.
+        self.event_fanout.enable_hfville();
         self
     }
 

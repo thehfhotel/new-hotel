@@ -27,7 +27,8 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::{auth_enabled_from_env, AppConfig};
-use crate::db::{create_pg_pool, create_pool};
+use crate::db::{create_pg_pool, create_pool, pg_pool_options};
+use crate::routes::events::{spawn_domain_event_listener, EventSite};
 use crate::routes::mode::{AppState, SystemMode};
 use crate::scheduler::init_scheduler;
 
@@ -130,8 +131,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // _NAME / _USER / _PASSWORD env vars drive the connection.
     let ville_pool = if config.ville_db.enabled {
         let ville_conn = config.ville_db.connection_string();
-        match sqlx::postgres::PgPoolOptions::new()
-            .max_connections(config.ville_db.pool_max)
+        // `pg_pool_options` (not a bare `PgPoolOptions::new()`) so this pool
+        // carries the same explicit acquire bound as the HotelNew one — see
+        // `db::PG_ACQUIRE_TIMEOUT` and the 2026-07-29 SSE incident.
+        match pg_pool_options(config.ville_db.pool_max)
             .connect(&ville_conn)
             .await
         {
@@ -196,6 +199,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("No database connections available".into());
         }
     };
+
+    // Shared `domain_events` LISTEN fan-out — ONE dedicated connection per
+    // canonical database, forwarding into the per-site broadcast channels the
+    // `/api/events` SSE handler subscribes to (`routes::events`).
+    //
+    // These are STANDALONE connections (`PgListener::connect(dsn)`), NOT pool
+    // checkouts: before 2026-07-29 the SSE handler opened a listener per
+    // client with `connect_with(pool)`, so every open /v2 tab held 1–2 real
+    // pool slots for its whole lifetime and tab churn exhausted the pool (30s
+    // acquire hangs → 500s on /api/stats|checkins|bookings, ~90s zero-byte SSE
+    // setup → Cloudflare 524 → EventSource reconnect spiral). Post-fix
+    // invariant: `pg_stat_activity` shows exactly two `LISTEN "domain_events"`
+    // connections total, no matter how many browser tabs are open.
+    //
+    // The DSNs are the same `connection_string()`s the pools above were built
+    // from, so the listener can never drift onto a different database.
+    if let Some(ref state) = final_app_state {
+        spawn_domain_event_listener(
+            config.new_db.connection_string(),
+            EventSite::Hfhotel,
+            state.event_fanout.hfhotel_sender(),
+        );
+        // `hfville_sender()` is Some exactly when `ville_pool` is (AppState::
+        // with_ville), so a disabled/unreachable Ville DB spawns no task and
+        // `branch=hfville|all` degrades to hfhotel-only as before.
+        match state.event_fanout.hfville_sender() {
+            Some(ville_tx) => {
+                spawn_domain_event_listener(
+                    config.ville_db.connection_string(),
+                    EventSite::Hfville,
+                    ville_tx,
+                );
+            }
+            None => tracing::info!(
+                "HF Ville domain-event listener not started (Ville pool unavailable)"
+            ),
+        }
+    }
 
     // Initialize scheduler for background jobs (only if legacy pool is available)
     // Pass PgPool if available for legacy-to-PG sync job
@@ -409,7 +450,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(health_routes)
         .merge(downloads_routes)
         .layer(cors)
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http())
+        // Outermost: measures the full round trip, including the layers above.
+        .layer(axum_middleware::from_fn(access_log));
 
     // Log database availability status
     match (legacy_available, new_available) {
@@ -428,6 +471,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+/// SSE endpoint path, excluded from the access log below.
+const SSE_PATH: &str = "/api/events";
+
+/// Request-level access log for `/api/*`: method, path, status, latency — at
+/// INFO, one line per request.
+///
+/// The backend had **no** request logging: `tower_http`'s `TraceLayer` emits
+/// at DEBUG and the deployed filter is `hotel_backend=info,tower_http=info`,
+/// so the 2026-07-29 500-burst was completely invisible and the diagnosis had
+/// to be reconstructed from `pg_stat_activity` and the browser console. One
+/// INFO line per request makes the next occurrence a grep.
+///
+/// A hand-rolled middleware rather than reconfiguring `TraceLayer` because
+/// `DefaultMakeSpan` records the **full URI including the query string**, and
+/// our query strings carry guest-identifying parameters (`?q=`, `?book_no=`,
+/// customer ids). This logs `uri().path()` only — never a query string, never
+/// a header, never a body, never a token.
+///
+/// `/api/events` is excluded outright: an SSE stream stays open for hours, so
+/// its "latency" is a disconnect timestamp, not a service time — logging it
+/// would bury the data-endpoint lines this exists to surface. Non-`/api`
+/// paths (`/health` polls, installer downloads) are skipped as noise.
+async fn access_log(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = req.uri().path().to_string();
+    if !path.starts_with("/api/") || path == SSE_PATH {
+        return next.run(req).await;
+    }
+
+    let method = req.method().clone();
+    let started = std::time::Instant::now();
+    let response = next.run(req).await;
+
+    tracing::info!(
+        method = %method,
+        path = %path,
+        status = response.status().as_u16(),
+        latency_ms = started.elapsed().as_millis() as u64,
+        "api request",
+    );
+
+    response
 }
 
 /// Default CORS allowlist when `BACKEND_ALLOWED_ORIGINS` is unset.
@@ -1052,7 +1141,10 @@ fn build_new_routes(app_state: AppState) -> Router {
         // Sync status
         .route("/api/sync/status", get(routes::new_sync::get_sync_status))
         // Real-time domain-event stream (Phase 4a per architecture.md §3.6e).
-        // Long-lived SSE connection; one PgListener per client.
+        // Long-lived SSE connection, but POOL-FREE after auth: it subscribes
+        // to the per-site broadcast fan-out fed by the startup listener tasks
+        // above (was one PgListener — i.e. one pool slot — per client until
+        // the 2026-07-29 exhaustion incident).
         .route("/api/events", get(routes::events::stream))
         .with_state(app_state)
         // Phase 4 PR2: gate every route above behind the cookie-session
