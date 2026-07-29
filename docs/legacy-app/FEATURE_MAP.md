@@ -219,12 +219,25 @@ These are pseudo-modal forms shown when the user clicks a room cell on `FormRoom
 
 | Form | Purpose |
 |---|---|
-| `ClickAvliable.cs` | "Mark room available" — flips Room_Clean='yes', clears flags. |
+| `ClickAvliable.cs` | "Mark room available" — clears the room's booking/use flags. (An earlier revision said it "flips Room_Clean='yes'"; `'yes'` is the NEEDS-CLEANING pole — see the polarity note below — so that attribution is unverified and should not be copied into a recipe.) |
 | `ClickAvliable_book.cs` | Same in booking-mode context. |
 | `ClickBook.cs` | "Book this room" → opens `FrmAddBook`/`FrmAddBook2`/`FrmAddBook3`/`FrmAddBook4`. |
 | `ClickBook_book.cs` | Same, booking-grid context. |
-| `ClickClean.cs` | "Mark dirty" → write to `HT_Housewife`, update `HT_Rooms.Room_Clean`. |
-| `ClickCleanOK.cs` | "Mark clean done" → write `HT_Housewife` with cleaner emp_id. |
+| `ClickClean.cs` | Housekeeping action → write to `HT_Housewife`, set `HT_Rooms.Room_Clean='no'`. **`'no'` is the CLEAN pole**, so this is a mark-CLEAN, not a mark-dirty (corrected 2026-07-28 — see polarity note below). |
+| `ClickCleanOK.cs` | "Mark clean done" → write `HT_Housewife` with cleaner emp_id, plus `Room_Clean_Time`. |
+
+> **`HT_Rooms.Room_Clean` polarity (settled 2026-07-28).** `'yes'` = **needs
+> cleaning (dirty)**, `'no'` = **clean / no cleaning needed** (column default).
+> Authority: `docs/legacy-spike/findings.md` §3e (check-out sets `'yes'`), §3i
+> (cancel check-in sets `'yes'` — "now empty AND needs cleaning"), §3j
+> (mark-clean sets `'no'` = "no clean needed"), plus the CT room mapper
+> `hotel-backend/src/sync/mappers/room.rs` which inverts on read (canonical
+> `room_clean = true` ⇒ IS clean). Live check 2026-07-28: all 58 HF Hotel
+> `HT_Rooms` rows are `'no'`, including 41 free rentable rooms. Several lines in
+> this file and in `COMPAT_CHEATSHEET.md` previously stated the inverse; that
+> decompile prose is self-contradictory and **loses to findings.md + the mapper**.
+> The inversion is what made our `mark_dirty` writeback emit `Room_Clean='no'`
+> (fixed in `writeback/recipes/mark_dirty.rs`).
 | `ClickManternance.cs` | "Send to maintenance" → `HT_Rooms.Room_Manternace='yes'`. |
 | `ClickUSE.cs` (1900 lines) | The big one — "currently in use" room dialog: edit checkin, sell to room (`FrmAddSale`), payment (`FrmPayAddPro`/`FrmPayAdd`), pay deposit, change date (`FrmEditDate`), folio (`FormFolio`), VAT (`FormShowVAT`), notes (`Room_Note`/`EMP_Note`), checkout (`FrmCheckOut`), invoice (`INV_Note`). |
 | `ClickUSE2.cs` | In-use variant 2 (smaller scope, possibly housewife). |
@@ -655,7 +668,9 @@ FormRoomMain → click occupied room → ClickUSE
        └─ commit:
             UPDATE HT_CheckIn_H SET checkout_date, total
             INSERT HT_CheckIn_Pay (final)
-            UPDATE HT_Rooms SET Room_Use='no', Room_Clean='no' (now dirty)
+            UPDATE HT_Rooms SET Room_Use='no', Room_Clean='yes' (now dirty),
+                                Room_Use_Count=Room_Use_Count+<nights>
+                                -- findings.md §3e; 'yes' = needs cleaning
             UPDATE HT_Room_Status SET room_status='Check-Out'
             Print_Report → sale_vat / sale_vat0 / Folio
        └─ optionally FormSMS_DEBT (send debt SMS if outstanding)
@@ -722,8 +737,13 @@ frmMain1 → ButtonItem32_Click_2 → FrmReceiptInvoice
 ```
 login → if loginMode='housewife' or HouseWifeMode set → FormRoomMainClean (instead of frmMain1)
   └─ shows only dirty/checkout rooms
-       ├─ click → ClickClean (mark started cleaning) → INSERT HT_Housewife
+       ├─ click → ClickClean → INSERT HT_Housewife + HT_Rooms.Room_Clean='no'
+       │             ('no' = CLEAN — this clears the needs-cleaning flag; the
+       │              old "mark started cleaning / mark dirty" reading was wrong)
        └─ click again when done → ClickCleanOK → INSERT HT_Housewife (with finish_emp)
+                     + HT_Rooms.Room_Clean_Time = <OADate now>
+       (the dirty flag itself, Room_Clean='yes', is raised by check-out /
+        cancel-check-in — findings.md §3e / §3i — not by these forms)
        reports: FrmReportHousewife (counts by employee) + ReportCleanRoom
 ```
 

@@ -361,11 +361,14 @@ struct RoomLine {
 /// 2. **FrmAddBook2.SAVE_EDIT delete-then-reinsert** (cheatsheet §3.7)
 ///    transiently deletes every `HT_Book_Ds` before re-inserting the
 ///    edited set. CT can surface a snapshot mid-edit.
-/// 3. **Pre-bootstrap / pre-CT data**: bookings that completed before
-///    Phase 5.x CT bootstrap may have lost their Ds rows to the
-///    `frmMain1` 60-day startup prune (cheatsheet §3.7 "Startup prune")
-///    while the legacy app retains the header for receipt / audit
-///    lookups via `HT_CheckIn_H.Cin_Book_no`.
+/// 3. **Pre-bootstrap / pre-CT data**: historical bookings can simply
+///    have no surviving Ds rows — the header is retained for receipt /
+///    audit lookups via `HT_CheckIn_H.Cin_Book_no` long after an edit or
+///    a cancel-on-room left the detail set empty. (NB: `frmMain1`'s
+///    60-day startup prune — cheatsheet §3.7 / §6.7 — deletes
+///    `HT_Book_Date` NIGHT rows only, never `HT_Book_Ds`; that prune is
+///    why `BookingAggregate::nights` may be empty, see
+///    `sync/parent_loader.rs`.)
 ///
 /// We MUST mirror these faithfully so downstream FKs that point at the
 /// header (most importantly `HT_CheckIn_H.Cin_Book_no` →

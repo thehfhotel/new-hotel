@@ -247,14 +247,16 @@ pub enum WritebackIntent {
     MarkRoomClean { room_id: Uuid, by: String },
 
     /// Coexistence audit 2026-06-11 P2 — standalone mark-dirty writeback
-    /// (`docs/legacy-app/COMPAT_CHEATSHEET.md` §3.13, ClickClean.cs:493-540).
+    /// (`docs/legacy-spike/findings.md` §3e check-out Phase 2 / §3i cancel:
+    /// DIRTY is `Room_Clean='yes'`).
     ///
-    /// Mirrors [`Self::MarkRoomClean`]: `UPDATE HT_Rooms` (by numeric `id`,
-    /// not `room_no` — same critical finding as spike §3j) + an
-    /// `INSERT HT_Housewife` "start cleaning" audit row referencing the
-    /// prior checked-out occupant. Before this intent existed,
-    /// `service::housekeeping::mark_dirty` was PG-only and iHOTEL's room
-    /// grid kept showing the room clean.
+    /// Mirrors [`Self::MarkRoomClean`]'s shape: `UPDATE HT_Rooms` (by
+    /// numeric `id`, not `room_no` — same critical finding as spike §3j) +
+    /// an `INSERT HT_Housewife` audit row referencing the prior
+    /// checked-out occupant — but the flag literal is the OPPOSITE pole
+    /// and the two recipes are not interchangeable. Before this intent
+    /// existed, `service::housekeeping::mark_dirty` was PG-only and
+    /// iHOTEL's room grid kept showing the room clean.
     MarkRoomDirty { room_id: Uuid, by: String },
 
     /// Coexistence audit 2026-06-11 P2 — room maintenance flag writeback

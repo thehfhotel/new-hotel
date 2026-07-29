@@ -20,7 +20,11 @@
 //! Spike §3j critical findings:
 //! - `HT_Rooms` is updated by **`id` (numeric)**, not `room_no`. Per spike §4e,
 //!   different statements pick different lookup keys — be precise.
-//! - `Room_Clean='no'` means "no cleaning needed" (already cleaned).
+//! - `Room_Clean='no'` means "no cleaning needed" (already cleaned). The
+//!   opposite pole is `'yes'` = "needs cleaning" (DIRTY) — findings.md §3e
+//!   check-out Phase 2 and §3i cancel-check-in both set `'yes'` when the
+//!   room is released. `mark_dirty` writes that literal; the two recipes
+//!   are deliberately NOT interchangeable.
 //! - The recipe issues a **lookup query** before the INSERT to find the prior
 //!   occupant — see [`fetch_prior_occupant`].
 //! - If no prior occupant exists (brand-new room), `h_cin` and `h_cin_name`
@@ -56,6 +60,53 @@ pub fn build_statements(
     prior: Option<&PriorOccupant>,
     now: DateTime<Utc>,
 ) -> Vec<String> {
+    vec![
+        // 1. Clear the cleaning flag — by HT_Rooms.id (numeric).
+        //    `Room_Clean='no'` = "no cleaning needed" (spike §3j capture);
+        //    the DIRTY literal is `'yes'` — see `mark_dirty`.
+        format!(
+            "update HT_Rooms set Room_Clean='no',Room_Clean_Time='' where id={room_id}"
+        ),
+        // 2. Audit row in HT_Housewife — shared with `mark_dirty` via
+        //    [`build_housewife_audit_insert`] so the literal stays in
+        //    lock-step across both housekeeping recipes (`helpers` charter).
+        build_housewife_audit_insert(room_no, by, prior, now),
+    ]
+}
+
+/// Build the `HT_Housewife` audit-row INSERT. PURE — no I/O.
+///
+/// Shared by [`build_statements`] and
+/// [`super::mark_dirty::build_statements`]: iHOTEL logs every housekeeping
+/// action (clean / dirty / repair) into the same table with the same
+/// column set (`COMPAT_CHEATSHEET.md` §`HT_Housewife`), so the literal
+/// lives in one place.
+///
+/// Track C T5 HIGH-3 dedup guard (`docs/coexistence/audit-2026-05-13.md`):
+///
+/// HT_Housewife has no UNIQUE constraint we control (the legacy schema is
+/// read-only — we cannot add one without breaking the legacy app's INSERT
+/// path). Without a guard, two concurrent mark-clean events (housekeeper
+/// marks clean in iHOTEL at T0, our mobile app fires the same intent at
+/// T0+50ms) both succeed and the audit log over-counts.
+///
+/// The `WHERE NOT EXISTS` guard skips the INSERT when a matching audit row
+/// was written for the same (room, prior cin) pair in the last 5 minutes.
+/// The window matches realistic concurrent housekeeping scenarios:
+/// - A receptionist marks the room clean in iHOTEL and a housekeeper marks
+///   it clean on the mobile app within minutes of each other — coexistence
+///   path.
+/// - The writeback worker retries after a transient network failure on
+///   COMMIT — idempotency path.
+///
+/// Anything beyond 5 minutes is treated as a legitimate re-clean (e.g. the
+/// room was re-occupied and freshly cleaned again the same shift).
+pub(super) fn build_housewife_audit_insert(
+    room_no: &str,
+    by: &str,
+    prior: Option<&PriorOccupant>,
+    now: DateTime<Utc>,
+) -> String {
     let now_str = format_legacy_datetime(now);
     let now_q = sql_quote(&now_str);
     let by_q = sql_quote(by);
@@ -65,43 +116,15 @@ pub fn build_statements(
         None => ("''".to_string(), "''".to_string()),
     };
 
-    vec![
-        // 1. Clear the cleaning flag — by HT_Rooms.id (numeric)
-        format!(
-            "update HT_Rooms set Room_Clean='no',Room_Clean_Time='' where id={room_id}"
-        ),
-        // 2. Audit row in HT_Housewife — Track C T5 HIGH-3 dedup guard
-        //    (`docs/coexistence/audit-2026-05-13.md`).
-        //
-        //    HT_Housewife has no UNIQUE constraint we control (the legacy
-        //    schema is read-only — we cannot add one without breaking the
-        //    legacy app's INSERT path). Without a guard, two concurrent
-        //    mark-clean events (housekeeper marks clean in iHOTEL at T0,
-        //    our mobile app fires the same intent at T0+50ms) both succeed
-        //    and the audit log over-counts.
-        //
-        //    The `WHERE NOT EXISTS` guard skips the INSERT when a matching
-        //    audit row was written for the same (room, prior cin) pair in
-        //    the last 5 minutes. The window matches realistic concurrent
-        //    housekeeping scenarios:
-        //    - A receptionist marks the room clean in iHOTEL and a
-        //      housekeeper marks it clean on the mobile app within minutes
-        //      of each other — coexistence path.
-        //    - The writeback worker retries after a transient network
-        //      failure on COMMIT — idempotency path.
-        //    Anything beyond 5 minutes is treated as a legitimate
-        //    re-clean (e.g. the room was re-occupied and freshly cleaned
-        //    again the same shift).
-        format!(
-            "INSERT INTO HT_Housewife ([h_name],[h_room],[h_date],[h_note],[h_cin],[h_cin_name]) \
-             SELECT {by_q}, {room_no_q}, {now_q}, '',{h_cin_q},{h_name_q} \
-             WHERE NOT EXISTS (\
-                 SELECT 1 FROM HT_Housewife \
-                  WHERE h_room={room_no_q} AND h_cin={h_cin_q} \
-                    AND h_date > DATEADD(minute, -5, GETDATE())\
-             )"
-        ),
-    ]
+    format!(
+        "INSERT INTO HT_Housewife ([h_name],[h_room],[h_date],[h_note],[h_cin],[h_cin_name]) \
+         SELECT {by_q}, {room_no_q}, {now_q}, '',{h_cin_q},{h_name_q} \
+         WHERE NOT EXISTS (\
+             SELECT 1 FROM HT_Housewife \
+              WHERE h_room={room_no_q} AND h_cin={h_cin_q} \
+                AND h_date > DATEADD(minute, -5, GETDATE())\
+         )"
+    )
 }
 
 /// SELECT the prior occupant of `room_no` whose per-room check-out
