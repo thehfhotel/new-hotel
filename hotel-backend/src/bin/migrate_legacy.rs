@@ -105,7 +105,7 @@ fn print_stats(stats: &MigrationStats) {
 }
 
 async fn run_migration(
-    legacy_pool: &bb8::Pool<bb8_tiberius::ConnectionManager>,
+    legacy_pool: &hotel_backend::db::DbPool,
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     _dry_run: bool,
 ) -> Result<MigrationStats, Box<dyn std::error::Error + Send + Sync>> {
@@ -148,7 +148,7 @@ async fn run_migration(
 
 /// Returns map of legacy room_type string -> new type_id
 async fn import_room_types(
-    legacy_pool: &bb8::Pool<bb8_tiberius::ConnectionManager>,
+    legacy_pool: &hotel_backend::db::DbPool,
     tx: &mut sqlx::PgConnection,
     stats: &mut MigrationStats,
 ) -> Result<HashMap<String, i32>, Box<dyn std::error::Error + Send + Sync>> {
@@ -208,7 +208,7 @@ async fn import_room_types(
 
 /// Returns map of legacy room_no -> new room_id
 async fn import_rooms(
-    legacy_pool: &bb8::Pool<bb8_tiberius::ConnectionManager>,
+    legacy_pool: &hotel_backend::db::DbPool,
     tx: &mut sqlx::PgConnection,
     room_type_map: &HashMap<String, i32>,
     stats: &mut MigrationStats,
@@ -297,7 +297,7 @@ async fn import_rooms(
 
 /// Returns map of legacy cust_no -> new cust_id
 async fn import_customers(
-    legacy_pool: &bb8::Pool<bb8_tiberius::ConnectionManager>,
+    legacy_pool: &hotel_backend::db::DbPool,
     tx: &mut sqlx::PgConnection,
     stats: &mut MigrationStats,
 ) -> Result<HashMap<String, i32>, Box<dyn std::error::Error + Send + Sync>> {
@@ -406,7 +406,7 @@ fn map_book_status(code: Option<i32>) -> &'static str {
 }
 
 async fn import_bookings(
-    legacy_pool: &bb8::Pool<bb8_tiberius::ConnectionManager>,
+    legacy_pool: &hotel_backend::db::DbPool,
     tx: &mut sqlx::PgConnection,
     customer_map: &HashMap<String, i32>,
     room_type_map: &HashMap<String, i32>,
@@ -549,7 +549,7 @@ async fn import_bookings(
 // =============================================================================
 
 async fn import_checkins(
-    legacy_pool: &bb8::Pool<bb8_tiberius::ConnectionManager>,
+    legacy_pool: &hotel_backend::db::DbPool,
     tx: &mut sqlx::PgConnection,
     customer_map: &HashMap<String, i32>,
     room_map: &HashMap<String, i32>,
@@ -723,7 +723,7 @@ async fn bump_sequences(
 // Database Connection Helpers
 // =============================================================================
 
-async fn create_legacy_pool() -> Result<bb8::Pool<bb8_tiberius::ConnectionManager>, Box<dyn std::error::Error>> {
+async fn create_legacy_pool() -> Result<hotel_backend::db::DbPool, Box<dyn std::error::Error>> {
     // Use the centralised DbConfig + create_pool to inherit MSSQL_PORT env
     // handling, the require_secret check for DB_PASSWORD, and the bb8
     // circuit-breaker timeouts. Same pattern as backfill_rooms.rs.

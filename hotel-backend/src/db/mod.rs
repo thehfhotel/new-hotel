@@ -9,4 +9,4 @@ mod pg_pool;
 mod pool;
 
 pub use pg_pool::{create_pg_pool, pg_pool_options, PgPool, PG_ACQUIRE_TIMEOUT};
-pub use pool::{create_pool, DbPool};
+pub use pool::{create_pool, DbPool, PoisonAwareManager};

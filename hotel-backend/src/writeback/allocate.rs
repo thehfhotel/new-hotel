@@ -28,10 +28,10 @@
 //! `ROLLBACK` closes the transaction.
 
 use bb8::PooledConnection;
-use bb8_tiberius::ConnectionManager;
 use chrono::{DateTime, Datelike, Utc};
 
 use crate::db::mssql_timeout::{simple_query_with_timeout, MssqlOpKind};
+use crate::db::PoisonAwareManager;
 use crate::writeback::error::{WritebackError, WritebackResult};
 use crate::writeback::format::bangkok_date;
 
@@ -88,7 +88,7 @@ fn validate_allocator_prefix(prefix: &str) -> WritebackResult<()> {
 }
 
 /// Convenience alias — the type bb8 hands out for our legacy connection.
-pub type LegacyConn<'a> = PooledConnection<'a, ConnectionManager>;
+pub type LegacyConn<'a> = PooledConnection<'a, PoisonAwareManager>;
 
 /// Approaching-wrap threshold for i32 allocators (audit Wave 6 LOW item 7).
 ///

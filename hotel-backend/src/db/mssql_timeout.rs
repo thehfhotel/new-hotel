@@ -51,14 +51,29 @@
 //! is co-located here because `bin/*` is a crate-binary target and
 //! the timeout helper is in a library module that cannot import from
 //! it.
+//!
+//! ## Poisoned-connection follow-up (issue #274)
+//!
+//! Dropping the in-flight future on timeout leaves the TDS stream
+//! mid-frame — the connection is desynced, not just slow. Every
+//! timeout branch below calls `conn.mark_poisoned()`
+//! (`db::pool::PoisonableConnection`) before returning the synthetic
+//! error, so `PoisonAwareManager::has_broken` tells bb8 to close the
+//! connection on release instead of returning a desynced connection
+//! to the idle queue (previously: `bb8-tiberius`'s `has_broken`
+//! hardcodes `false`, so the connection went back to the pool looking
+//! healthy and every subsequent checkout burned bb8's 5s
+//! `connection_timeout` until the 10-minute `max_lifetime` reaper
+//! finally rotated it out).
 
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use bb8::PooledConnection;
-use bb8_tiberius::ConnectionManager;
 use tiberius::error::IoErrorKind;
 use tiberius::Row;
+
+use crate::db::PoisonAwareManager;
 
 /// Stable `event_name` attached to every tiberius-timeout error log.
 /// Matches R1's `sync.<snake_case>` taxonomy convention so dashboard
@@ -71,7 +86,7 @@ pub const EV_TIBERIUS_TIMEOUT: &str = "sync.tiberius_timeout";
 /// `writeback` module (which would create a layering inversion —
 /// `writeback` legitimately depends on `db`, not the other way
 /// around).
-type LegacyConn<'a> = PooledConnection<'a, ConnectionManager>;
+type LegacyConn<'a> = PooledConnection<'a, PoisonAwareManager>;
 
 /// Default read budget — covers the per-table CT poll, `parent_loader`
 /// aggregate fetches, eager-fetch fallbacks, fingerprint reads. 10s is
@@ -238,6 +253,14 @@ pub async fn simple_query_with_timeout(
     match tokio::time::timeout(budget, fut).await {
         Ok(result) => result,
         Err(_elapsed) => {
+            // Issue #274: `fut` (and its borrow of `conn`) is fully
+            // dropped by the time `tokio::time::timeout` resolves, so
+            // `conn` is available here. The dropped future may have
+            // left unread TDS bytes on the wire — mark the connection
+            // so `PoisonAwareManager::has_broken` tells bb8 to close
+            // it on release instead of silently reusing a desynced
+            // connection (see `db::pool::PoisonableConnection` docs).
+            conn.mark_poisoned();
             tracing::error!(
                 event_name = EV_TIBERIUS_TIMEOUT,
                 op_kind = kind.as_static_str(),
@@ -262,7 +285,7 @@ pub async fn simple_query_with_timeout(
 /// Floor is still [`MIN_BUDGET_MS`] — a 0ms / 5ms budget would fail
 /// every call.
 pub async fn simple_query_with_explicit_timeout(
-    conn: &mut PooledConnection<'_, ConnectionManager>,
+    conn: &mut PooledConnection<'_, PoisonAwareManager>,
     sql: &str,
     budget: Duration,
 ) -> Result<Vec<Row>, tiberius::error::Error> {
@@ -278,6 +301,9 @@ pub async fn simple_query_with_explicit_timeout(
     match tokio::time::timeout(budget, fut).await {
         Ok(result) => result,
         Err(_elapsed) => {
+            // Issue #274 — see the matching comment in
+            // `simple_query_with_timeout` above.
+            conn.mark_poisoned();
             tracing::error!(
                 event_name = EV_TIBERIUS_TIMEOUT,
                 op_kind = "explicit",
@@ -312,11 +338,11 @@ pub async fn simple_query_with_timeout_drop(
 /// (rather than the `writeback::allocate::LegacyConn` re-alias of the
 /// same type). Functionally identical to
 /// [`simple_query_with_timeout`] — `LegacyConn` is just a type alias
-/// over `bb8::PooledConnection<'_, ConnectionManager>`, so this just
+/// over `bb8::PooledConnection<'_, PoisonAwareManager>`, so this just
 /// re-points at the same implementation for readability at the
 /// call site.
 pub async fn simple_query_with_timeout_pooled(
-    conn: &mut PooledConnection<'_, ConnectionManager>,
+    conn: &mut PooledConnection<'_, PoisonAwareManager>,
     sql: &str,
     kind: MssqlOpKind,
 ) -> Result<Vec<Row>, tiberius::error::Error> {
@@ -334,6 +360,14 @@ mod tests {
     //! The OnceLock-backed budgets are exercised through pure
     //! [`parse_budget_ms`] tests so concurrent test cases can't race
     //! on real env mutation.
+    //!
+    //! Same constraint blocks a direct test of the `conn.mark_poisoned()`
+    //! calls added for issue #274 — `LegacyConn` wraps a live
+    //! `tiberius::Client`. The borrow-checker shape (mutably-borrowing
+    //! future under `tokio::time::timeout`, `mark_poisoned()` called
+    //! on `conn` only after the future — and its borrow — has been
+    //! dropped) is instead proven against a generic stand-in in
+    //! `db::pool::tests::timeout_elapsing_then_marking_poisons_the_connection`.
     use super::*;
     use std::future::pending;
 
