@@ -6,6 +6,51 @@ and prior entries instead of re-explaining. Vocabulary: "sync lag / unconverged"
 for transients, "durable divergence" only for rows that resist multiple sweep cycles
 (see CLAUDE.md "Vocabulary note").
 
+## 2026-07-29 — /v2 slow tabs + 500s + SSE 524: PG pool exhausted by per-tab LISTEN connections
+
+**Symptom.** Long loads switching /v2 tabs; console 500s on
+`/api/stats|checkins|bookings` and a Cloudflare 524 on `/api/events?branch=all`.
+
+**Evidence.** Origin answered unauthenticated probes in <5ms; backend logged
+NOTHING at the failure instant (it had no request-level access logging); web
+container: `Failed to proxy … socket hang up` for exactly the three endpoints in
+one 60ms burst; PG "idle"; Ville pool held residual `UNLISTEN *` connections —
+released per-client PgListeners. Legacy MSSQL was ruled out with measurements
+(reads <100ms, zero blocking; the `Timed out in bb8` noise is the separate,
+sync-only #274).
+
+**Cause.** Every /v2 tab's SSE stream held 1-2 REAL pool slots for its lifetime
+(`PgListener::connect_with(pool)`, two acquires — serial — for `branch=all`)
+against pools of max 10/5 with sqlx's 30s default acquire timeout never
+overridden, while `AUTH_ENABLED=true` added a session-validate acquire in front
+of every request and the in-process reconcile parked ~9 more. Saturation ⇒ data
+endpoints hang 30s → 500; SSE spends ~90s in serial acquires emitting zero
+bytes → CF 524 at ~100s → EventSource reconnects onto the starved pool. NOT a
+regression — no route/pool file had changed in 3+ weeks; a concurrency
+threshold was crossed.
+
+**Fix (`517b907`).** One standalone listener connection per database
+(zero pool slots) fanning out via per-site broadcast channels; handler is
+pool-free after auth; immediate hello frame (CF gets bytes in ms); 5s
+`acquire_timeout` on both PG pools; pool headroom 10→20 / 5→10 (compose
+defaults, ADR 0004); request-level access log (path+status+latency ONLY — the
+existing TraceLayer stays at DEBUG because it records query strings carrying
+guest-identifying params). Verified live: exactly 2 `LISTEN "domain_events"`
+connections regardless of tab count.
+
+**Planning premise falsified during implementation, repaired not shipped:** the
+planned synthetic `refresh` event would have been silently dropped by ALL 11
+subscribing pages — both consumers filter strictly by event name with no
+`onmessage`. Resync is instead a burst under every subscribed name, debounced
+client-side to one refetch, with a compile-time exhaustiveness guard on the
+name list.
+
+**Rules of thumb.** (1) A pool can be exhausted while `pg_stat_activity` looks
+idle — LISTEN connections ARE idle; count them, don't eyeball state. (2) An SSE
+handler must emit first bytes before any slow work or the CDN's timeout becomes
+your failure mode. (3) "socket hang up" with a silent backend means you lack
+access logging, and that absence is itself the first finding.
+
 ## 2026-07-28 — Sync/alert hardening wave (Phases 2–5): armed product-stall, checkout double-count, gate_guard contract, bookings-hash disproof, alert-surface calibration
 
 **Context.** Not a single live incident — five investigations run the day after the
