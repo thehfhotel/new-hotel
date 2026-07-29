@@ -837,7 +837,9 @@ services:
       # soak says nothing about HF Hotel's 21.5k-receipt history — that is what
       # the canonical era floor (PAYMENTS_ERA_FLOOR_SQL) exists to bound, not
       # this soak. Findings need operator action; nothing here auto-closes.
-      - RECONCILE_PAYMENTS_ARM_ENABLED=${HFVILLE_RECONCILE_PAYMENTS_ARM_ENABLED:-false}
+      # ENABLED 2026-07-29 (T2 rollout step 1 of 8): Ville canary live, 48h
+      # soak before flipping the backend (HF Hotel) default above.
+      - RECONCILE_PAYMENTS_ARM_ENABLED=${HFVILLE_RECONCILE_PAYMENTS_ARM_ENABLED:-true}
       # Phase 6-B — `guest_registry` (companion folio) reconcile arm (legacy
       # HT_CheckIn_Other_People ↔ canonical ht_guest_registry, keyed on Cin_no,
       # compared per FOLIO). DETECTION ONLY; writes nothing but its own ack
