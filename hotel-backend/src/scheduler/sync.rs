@@ -739,6 +739,24 @@ pub fn tables_breaching_threshold(counts: &[(String, i64)], threshold: i64) -> V
         .collect()
 }
 
+/// Slack body for the edge-triggered sync-lag burst page. Pure — pulled
+/// out of [`check_drift_and_alert`] so the composition is unit-testable
+/// without a PG pool. Pager tier (issue #261): the caller wraps this in
+/// [`SlackMessage::with_site_text_paged`], not `with_site_text`.
+fn format_burst_alert_message(threshold: i64, body: &str, cooldown_hours: i64) -> String {
+    format!(
+        ":rotating_light: *Sync lag burst — threshold exceeded* :rotating_light:\n\
+         The reconcile sweep observed more than {threshold} unconverged \
+         `ht_reconcile_log` row(s) for the following table(s) in the last hour. \
+         Most clear on their own as the CT watcher / writeback catch up; this \
+         alert surfaces a burst that may indicate a real backlog:\n\
+         {body}\n\
+         _Investigate via `docs/runbook-sync.md` §9 (Phase 6 drift alert). \
+         Per-table cooldown {cooldown_hours}h — the log line still fires every \
+         tick._"
+    )
+}
+
 /// Phase 6 alerting: count unresolved `ht_reconcile_log` rows added in
 /// the last hour, grouped by `table_name`. If any table breaches the
 /// configured threshold, emit ONE Slack message listing the offenders.
@@ -849,19 +867,9 @@ async fn check_drift_and_alert(pg_pool: &PgPool, slack: Option<&SlackClient>, si
             .map(|(t, n)| format!("• `{t}`: {n} unresolved rows in last hour"))
             .collect::<Vec<_>>()
             .join("\n");
-        let msg = SlackMessage::with_site_text(
+        let msg = SlackMessage::with_site_text_paged(
             site_id,
-            format!(
-                ":rotating_light: *Sync lag burst — threshold exceeded* :rotating_light:\n\
-                 The reconcile sweep observed more than {threshold} unconverged \
-                 `ht_reconcile_log` row(s) for the following table(s) in the last hour. \
-                 Most clear on their own as the CT watcher / writeback catch up; this \
-                 alert surfaces a burst that may indicate a real backlog:\n\
-                 {body}\n\
-                 _Investigate via `docs/runbook-sync.md` §9 (Phase 6 drift alert). \
-                 Per-table cooldown {cooldown_hours}h — the log line still fires every \
-                 tick._"
-            ),
+            format_burst_alert_message(threshold, &body, cooldown_hours),
         );
         AlertDelivery::from_send(Some(slack.send_message(&msg).await))
     } else {
@@ -1140,6 +1148,22 @@ fn tables_recovered(cooldown_keys: &[String], still_stale_tables: &[String]) -> 
     recovered
 }
 
+/// Slack body for the level-drift all-clear. Pure — unit-testable
+/// without a PG pool. All-clear tier (issue #261) — stays on
+/// `with_site_text`, never the pager mention.
+fn format_level_drift_all_clear_message(stale_hours: i64, body: &str, cooldown_hours: i64) -> String {
+    format!(
+        ":white_check_mark: *Reconcile rows CONVERGED* :white_check_mark:\n\
+         Every `ht_reconcile_log` row older than \
+         {stale_hours}h has converged for:\n\
+         {body}\n\
+         _Closure of the_ `:warning:` _unconverged alert sent earlier. The \
+         per-table {cooldown_hours}h cooldown is reset, so a \
+         recurrence alerts on the next tick instead of waiting out a stale \
+         window._"
+    )
+}
+
 /// Paired recovery notification for [`check_level_drift_and_alert`].
 ///
 /// The level-triggered alert was fire-and-forget: an operator who fixed
@@ -1198,16 +1222,7 @@ async fn check_level_drift_recovery_and_notify(
             .join("\n");
         let msg = SlackMessage::with_site_text(
             site_id,
-            format!(
-                ":white_check_mark: *Reconcile rows CONVERGED* :white_check_mark:\n\
-                 Every `ht_reconcile_log` row older than \
-                 {stale_hours}h has converged for:\n\
-                 {body}\n\
-                 _Closure of the_ `:warning:` _unconverged alert sent earlier. The \
-                 per-table {cooldown_hours}h cooldown is reset, so a \
-                 recurrence alerts on the next tick instead of waiting out a stale \
-                 window._"
-            ),
+            format_level_drift_all_clear_message(stale_hours, &body, cooldown_hours),
         );
         AlertDelivery::from_send(Some(slack.send_message(&msg).await))
     } else {
@@ -1391,6 +1406,32 @@ async fn check_level_drift_and_alert(pg_pool: &PgPool, slack: Option<&SlackClien
     send_stale_level_digest(pg_pool, slack, site_id, &stale_tier, thresholds).await;
 }
 
+/// Slack body for the routine `:warning:` level-drift digest. Pure —
+/// unit-testable without a PG pool. Routine tier (issue #261): stays on
+/// `with_site_text`, never the pager mention — this is the alert the
+/// escalated `:bangbang:` tier exists precisely to distinguish itself
+/// from.
+fn format_stale_level_digest_message(
+    stale_hours: i64,
+    body: &str,
+    cooldown_hours: i64,
+    escalate_hours: i64,
+) -> String {
+    format!(
+        ":warning: *Reconcile rows unconverged >{stale_hours}h* :warning:\n\
+         `ht_reconcile_log` row(s) the auto-resolve sweep has not closed in \
+         over {stale_hours} hours. This is NOT sync lag — \
+         past this threshold it will not clear on its own:\n\
+         {body}\n\
+         _Check `divergence_kind` first. `missing_pg` with a live legacy row is a \
+         *dropped legacy change*: the record is absent from our app entirely and \
+         no tick will fix it. Do NOT blanket-set `resolved_at` — that closes rows \
+         whether or not canonical landed. Triage: docs/runbook-sync.md §9b. \
+         Per-table cooldown {cooldown_hours}h; an all-clear fires \
+         when the table clears. Past {escalate_hours}h this escalates._"
+    )
+}
+
 /// The familiar `:warning:` tier of [`check_level_drift_and_alert`].
 /// Cooldown-gated per table on the bare entity name (the key the
 /// all-clear diffs against).
@@ -1451,19 +1492,7 @@ async fn send_stale_level_digest(
             .join("\n");
         let msg = SlackMessage::with_site_text(
             site_id,
-            format!(
-                ":warning: *Reconcile rows unconverged >{stale_hours}h* :warning:\n\
-                 `ht_reconcile_log` row(s) the auto-resolve sweep has not closed in \
-                 over {stale_hours} hours. This is NOT sync lag — \
-                 past this threshold it will not clear on its own:\n\
-                 {body}\n\
-                 _Check `divergence_kind` first. `missing_pg` with a live legacy row is a \
-                 *dropped legacy change*: the record is absent from our app entirely and \
-                 no tick will fix it. Do NOT blanket-set `resolved_at` — that closes rows \
-                 whether or not canonical landed. Triage: docs/runbook-sync.md §9b. \
-                 Per-table cooldown {cooldown_hours}h; an all-clear fires \
-                 when the table clears. Past {escalate_hours}h this escalates._"
-            ),
+            format_stale_level_digest_message(stale_hours, &body, cooldown_hours, escalate_hours),
         );
         AlertDelivery::from_send(Some(slack.send_message(&msg).await))
     } else {
@@ -1490,6 +1519,29 @@ async fn send_stale_level_digest(
              next tick retries"
         );
     }
+}
+
+/// Slack body for the escalated `:bangbang:` digest. Pure — pulled out
+/// of [`send_escalated_level_digest`] so it's unit-testable without a PG
+/// pool. Pager tier (issue #261, re-scoped 2026-07-29): the caller wraps
+/// this in [`SlackMessage::with_site_text_paged`], the same condition
+/// that picks this `:bangbang:` framing over the `:warning:` digest.
+fn format_escalated_level_digest_message(escalate_hours: i64, body: &str) -> String {
+    format!(
+        ":bangbang: *Reconcile rows STUCK >{escalate_hours}h — will not self-heal* \
+         :bangbang:\n\
+         These `ht_reconcile_log` row(s) have survived every auto-resolve sweep \
+         for more than {escalate_hours} hours (a sweep runs every reconcile \
+         tick). Waiting is no longer a strategy — nothing in the pipeline is \
+         going to close them:\n\
+         {body}\n\
+         _The fix is re-ingest, not patience: for `missing_pg` re-drive the \
+         record through the CT path or run `sync --bootstrap` for the table; \
+         for `value` divergence re-apply from legacy. If the legacy change is \
+         past the 2-day CT retention window, bootstrap is the ONLY path. Do NOT \
+         blanket-set `resolved_at` — that hides the gap without landing the \
+         data. Triage: docs/runbook-sync.md §9b._"
+    )
 }
 
 /// The escalated tier of [`check_level_drift_and_alert`] (defect A1).
@@ -1564,23 +1616,9 @@ async fn send_escalated_level_digest(
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let msg = SlackMessage::with_site_text(
+        let msg = SlackMessage::with_site_text_paged(
             site_id,
-            format!(
-                ":bangbang: *Reconcile rows STUCK >{escalate_hours}h — will not self-heal* \
-                 :bangbang:\n\
-                 These `ht_reconcile_log` row(s) have survived every auto-resolve sweep \
-                 for more than {escalate_hours} hours (a sweep runs every reconcile \
-                 tick). Waiting is no longer a strategy — nothing in the pipeline is \
-                 going to close them:\n\
-                 {body}\n\
-                 _The fix is re-ingest, not patience: for `missing_pg` re-drive the \
-                 record through the CT path or run `sync --bootstrap` for the table; \
-                 for `value` divergence re-apply from legacy. If the legacy change is \
-                 past the 2-day CT retention window, bootstrap is the ONLY path. Do NOT \
-                 blanket-set `resolved_at` — that hides the gap without landing the \
-                 data. Triage: docs/runbook-sync.md §9b._"
-            ),
+            format_escalated_level_digest_message(escalate_hours, &body),
         );
         AlertDelivery::from_send(Some(slack.send_message(&msg).await))
     } else {
@@ -11915,6 +11953,69 @@ mod tests {
             vec![stale_row("bookings", 3, 388), stale_row("checkins", 9, 72)],
             "input order is preserved within a tier"
         );
+    }
+
+    // --- Issue #261 (re-scoped 2026-07-29) — pager-tier `<!channel>` mention ---
+    //
+    // No second webhook: on the shared Slack webhook, ONLY the pager tier
+    // (>72h escalated digest, sync-lag burst, CT-lag pager, boot-refusal)
+    // leads with `<!channel> ` so it breaks through mentions-only
+    // notification prefs. Routine digests and all-clears must stay quiet.
+    // These pin the ACTUAL composition each send site produces, using the
+    // same `format_*` + `with_site_text[_paged]` calls as the real code.
+
+    /// The >72h escalated digest (`:bangbang:`) is the pager tier's
+    /// namesake in the issue — must lead with the exact mention.
+    #[test]
+    fn escalated_level_digest_composition_leads_with_channel_mention() {
+        let body = format_escalated_level_digest_message(72, "• `bookings`: 3 unresolved row(s), oldest *388h*");
+        let msg = SlackMessage::with_site_text_paged("hfhotel", body);
+        assert!(
+            msg.text.starts_with("<!channel> "),
+            "escalated digest must lead with `<!channel> `; got {:?}",
+            msg.text
+        );
+        assert!(msg.text.contains(":bangbang:"));
+    }
+
+    /// The routine `:warning:` digest is the alert the escalated tier
+    /// exists to distinguish itself from — it must NEVER carry the
+    /// mention, or the re-scope's whole "most sends stay quiet" premise
+    /// breaks.
+    #[test]
+    fn stale_level_digest_composition_has_no_channel_mention() {
+        let body = format_stale_level_digest_message(4, "• `customers`: 1 unresolved row(s), oldest 6h", 24, 72);
+        let msg = SlackMessage::with_site_text("hfhotel", body);
+        assert!(
+            !msg.text.contains("<!channel>"),
+            "routine :warning: digest must stay unmentioned; got {:?}",
+            msg.text
+        );
+        assert!(msg.text.contains(":warning:"));
+    }
+
+    /// The reconcile all-clear (`:white_check_mark:`) must stay
+    /// unmentioned — all-clears are explicitly excluded by the re-scope.
+    #[test]
+    fn level_drift_all_clear_composition_has_no_channel_mention() {
+        let body = format_level_drift_all_clear_message(4, "• `customers`", 24);
+        let msg = SlackMessage::with_site_text("hfhotel", body);
+        assert!(!msg.text.contains("<!channel>"), "got {:?}", msg.text);
+        assert!(msg.text.contains(":white_check_mark:"));
+    }
+
+    /// `:rotating_light:` sync-lag burst pages are named explicitly in
+    /// the re-scope.
+    #[test]
+    fn burst_alert_composition_leads_with_channel_mention() {
+        let body = format_burst_alert_message(50, "• `bookings`: 73 unresolved rows in last hour", 1);
+        let msg = SlackMessage::with_site_text_paged("hfville", body);
+        assert!(
+            msg.text.starts_with("<!channel> "),
+            "burst page must lead with `<!channel> `; got {:?}",
+            msg.text
+        );
+        assert!(msg.text.contains(":rotating_light:"));
     }
 
     /// Day 1 and day 16 must not render identically — the whole point of

@@ -69,7 +69,32 @@ impl SlackMessage {
             blocks: None,
         }
     }
+
+    /// Like [`Self::with_site_text`], but for the pager tier only (issue
+    /// #261, re-scoped 2026-07-29): leads the message with
+    /// [`PAGER_MENTION`] so it breaks through Slack's "mentions only"
+    /// notification preference on the single shared webhook. No second
+    /// webhook/channel — this is deliberately just text.
+    ///
+    /// Reserved for: the >72h escalated reconcile digest (`:bangbang:`),
+    /// sync-lag burst pages (`:rotating_light:`), the CT-lag pager, and
+    /// boot-refusal warnings. Routine digests, all-clears, and every
+    /// other send must keep using [`Self::with_site_text`] — do not widen
+    /// this without updating the pager-tier list in the issue.
+    pub fn with_site_text_paged(site_id: &str, text: impl Into<String>) -> Self {
+        Self {
+            text: format!("{PAGER_MENTION}{}", format_site_prefixed(site_id, &text.into())),
+            blocks: None,
+        }
+    }
 }
+
+/// Slack's channel-mention markup (mrkdwn). Renders as `@channel` in the
+/// client and — unlike a plain-text mention — breaks through Slack's
+/// "mentions only" per-user notification preference, which is what makes
+/// it worth reserving for the pager tier. Prepended verbatim, including
+/// the trailing space, by [`SlackMessage::with_site_text_paged`].
+pub const PAGER_MENTION: &str = "<!channel> ";
 
 /// Prepend the site-id prefix to a Slack message body. Pulled out as a
 /// pure helper so the prefix shape (`[site=<id>] ...`) is unit-testable
@@ -525,5 +550,36 @@ mod tests {
         );
         assert!(msg.text.contains("schema fingerprint mismatch"));
         assert!(msg.blocks.is_none());
+    }
+
+    /// Issue #261 (re-scoped 2026-07-29): the pager-tier constructor must
+    /// lead the message with the exact `<!channel> ` mention — Slack's
+    /// channel-mention markup, not a plain-text lookalike — so it renders
+    /// as `@channel` and breaks through mentions-only notification prefs.
+    #[test]
+    fn with_site_text_paged_leads_with_the_exact_channel_mention() {
+        let msg = SlackMessage::with_site_text_paged("hfville", ":bangbang: STUCK :bangbang:");
+        assert!(
+            msg.text.starts_with("<!channel> "),
+            "pager tier must lead with `<!channel> `; got {:?}",
+            msg.text
+        );
+        assert_eq!(
+            msg.text,
+            "<!channel> [site=hfville] :bangbang: STUCK :bangbang:"
+        );
+        assert!(msg.blocks.is_none());
+    }
+
+    /// Routine sends must never pick up the mention — the whole point of
+    /// the re-scope is that MOST sends stay quiet on mentions-only prefs.
+    #[test]
+    fn with_site_text_never_carries_the_channel_mention() {
+        let msg = SlackMessage::with_site_text("hfhotel", "Reconcile rows unconverged >4h");
+        assert!(
+            !msg.text.contains("<!channel>"),
+            "routine constructor must never emit the pager mention; got {:?}",
+            msg.text
+        );
     }
 }

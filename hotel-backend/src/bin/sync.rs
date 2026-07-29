@@ -712,6 +712,17 @@ fn format_restart_cap_note(cooldown_mins: i64) -> String {
     )
 }
 
+/// Full body of a refuse-to-start page — pure, so the composition is
+/// unit-testable without a PG pool or a live Slack webhook. Pager tier
+/// (issue #261, re-scoped 2026-07-29): [`send_boot_refusal_alert`] wraps
+/// this in [`SlackMessage::with_site_text_paged`], not `with_site_text`.
+/// All five refuse-to-start reasons (live-bootstrap, schema-fingerprint,
+/// cold-replay, retention-overflow, CT-not-enabled) route through this
+/// one function, so there is a single place to get the mention right.
+fn format_boot_refusal_message(headline: &str, body: &str, cooldown_mins: i64) -> String {
+    format!("{headline}\n{body}{}", format_restart_cap_note(cooldown_mins))
+}
+
 /// Pure dedup verdict for a refuse-to-start page.
 ///
 /// * `dedup_available` — was there a usable PG pool to claim a slot with?
@@ -783,9 +794,9 @@ async fn send_boot_refusal_alert(
         return;
     }
 
-    let payload = SlackMessage::with_site_text(
+    let payload = SlackMessage::with_site_text_paged(
         site_id,
-        format!("{headline}\n{body}{}", format_restart_cap_note(cooldown_mins)),
+        format_boot_refusal_message(headline, body, cooldown_mins),
     );
     let _ = slack.send_message(&payload).await;
 }
@@ -3856,7 +3867,7 @@ async fn run_watermark_watchdog(
                                  persistence gate — paging operator"
                             );
                             if let Some(s) = slack.as_ref() {
-                                let payload = SlackMessage::with_site_text(
+                                let payload = SlackMessage::with_site_text_paged(
                                     &site_id,
                                     format_ct_lag_alert_message(
                                         &snap,
@@ -9717,6 +9728,74 @@ mod tests {
         assert!(msg.contains("RECOVERED"), "{msg}");
         assert!(msg.contains("1h30min ago"), "{msg}");
         assert!(msg.contains("released"), "{msg}");
+    }
+
+    // --- Issue #261 (re-scoped 2026-07-29) — pager-tier `<!channel>` mention ---
+    //
+    // No second webhook: on the shared Slack webhook, ONLY the pager tier
+    // (>72h escalated digest, sync-lag burst, CT-lag pager, boot-refusal)
+    // leads with `<!channel> `. These pin the ACTUAL composition each real
+    // call site produces — same `format_*` + `with_site_text[_paged]` pairing
+    // as `main`'s CT-lag watchdog loop and `send_boot_refusal_alert`.
+
+    /// The CT-lag pager page — named explicitly in the re-scope — must
+    /// lead with the exact mention.
+    #[test]
+    fn ct_lag_pager_composition_leads_with_channel_mention() {
+        let snap = CtLagSnapshot {
+            watermark: 30_700,
+            ct_current: 31_200,
+            version_lag: 500,
+            poll_age_seconds: 42,
+            table: None,
+        };
+        let t = CtLagThresholds { version_lag: 100, poll_age_seconds: 300 };
+        let body = format_ct_lag_alert_message(&snap, t, Duration::from_secs(2700), Duration::from_secs(1800));
+        let payload = SlackMessage::with_site_text_paged("hfhotel", body);
+        assert!(
+            payload.text.starts_with("<!channel> "),
+            "CT-lag pager must lead with `<!channel> `; got {:?}",
+            payload.text
+        );
+    }
+
+    /// The paired CT-lag all-clear must stay unmentioned — all-clears are
+    /// explicitly excluded from the re-scope.
+    #[test]
+    fn ct_lag_recovery_composition_has_no_channel_mention() {
+        let snap = CtLagSnapshot {
+            watermark: 31_200,
+            ct_current: 31_205,
+            version_lag: 5,
+            poll_age_seconds: 3,
+            table: None,
+        };
+        let body = format_ct_lag_recovery_message(&snap, Duration::from_secs(5400));
+        let payload = SlackMessage::with_site_text("hfhotel", body);
+        assert!(
+            !payload.text.contains("<!channel>"),
+            "CT-lag all-clear must stay unmentioned; got {:?}",
+            payload.text
+        );
+    }
+
+    /// Boot-refusal warnings — named explicitly in the re-scope — must
+    /// lead with the exact mention. All five refuse-to-start reasons route
+    /// through this one composer, so a single test covers all of them.
+    #[test]
+    fn boot_refusal_composition_leads_with_channel_mention() {
+        let body = format_boot_refusal_message(
+            ":warning: *CT watcher REFUSED TO START — schema drift* :warning:",
+            "Legacy MSSQL columns drifted from the captured baseline.",
+            30,
+        );
+        let payload = SlackMessage::with_site_text_paged("hfville", body);
+        assert!(
+            payload.text.starts_with("<!channel> "),
+            "boot-refusal page must lead with `<!channel> `; got {:?}",
+            payload.text
+        );
+        assert!(payload.text.contains("does NOT mean recovered"));
     }
 
     /// The pager must resolve its thresholds from the SAME env contract as
