@@ -55,15 +55,21 @@
 //! was enabled. Unfloored it would open 302 (HF Hotel) + 36 (Ville) rows
 //! that can NEVER close. Floored it is exactly converged.
 //!
-//! ## `ht_room_calendar` is OBSERVE-ONLY (a known, not-yet-closeable gap)
+//! ## `ht_room_calendar` — business-key DETECTION (issue #273 remainder)
 //!
 //! It is in the probe set (it is a mirror in every sense that matters —
-//! `HT_Room_Status` copied per night) but carries `observe_only: true`: a
-//! mismatch is LOGGED with both live counts and nothing at all is written to
-//! `ht_reconcile_log`.
+//! `HT_Room_Status` copied per night) but its `MirrorProbe` entry's id-keyed
+//! shape (`rcal_legacy_id` vs `HT_Room_Status.id`) is NOT how it is detected:
+//! `run_mirror_probe` excludes `ht_room_calendar` from the generic id-keyed
+//! UNION-ALL batch and dispatches it to
+//! [`super::sync::probe_room_calendar_business_key`] instead, which compares
+//! the BUSINESS key `(room, night)` — the same key
+//! [`super::sync::compute_room_calendar_business_key_pg_hash`] /
+//! [`super::sync::compute_room_calendar_business_key_legacy_hash`] resolve
+//! on. `observe_only: false` on the registry entry — a genuine business-key
+//! divergence IS recorded.
 //!
-//! That is not squeamishness about noise — it is the alert contract. A
-//! recorded row must be CLOSEABLE, and this one provably is not:
+//! ### Why detection could not stay id-keyed once resolution moved
 //!
 //! * `RoomCalendarMapper` UPSERTs on the BUSINESS key `(rcal_room_id,
 //!   rcal_date)` and explicitly documents `rcal_legacy_id` as "captured but
@@ -72,31 +78,48 @@
 //!   `rcal_legacy_id` on purpose and NOTHING ever restores it. The mirror's
 //!   non-NULL id population is therefore structurally below the legacy row
 //!   count — an id-keyed diff reports every one of those as `missing_pg`
-//!   forever, and the aggregate counts can never be made equal either.
-//! * The deficit is live at BOTH sites today (1507 in-era legacy rows vs 1298
-//!   canonical at HF Hotel; 1302 vs 1071 at Ville) and it SURVIVES a
-//!   business-key comparison as well (1546 vs 1420), so re-keying this
-//!   generic probe onto `(rcal_room_id, rcal_date)` would not close it.
-//! * [`resolve_pg_hash`] / [`resolve_legacy_hash`] recompute those same live
-//!   aggregates on every sweep, so `should_auto_resolve` could never close
-//!   the row; probe keys are in neither self-heal list, so nothing repairs
-//!   it; and clearing `resolved_at` by hand does not silence it either,
-//!   because `record_divergence`'s `NOT EXISTS (… resolved_at IS NULL)`
-//!   dedupe mints a FRESH row with a new `detected_at` on the next tick.
-//! * `check_level_drift_and_alert` and `send_stale_level_digest` carry NO
-//!   minimum-count threshold, so that single row would fire the 4h digest
-//!   and, past 72h, the `:bangbang:` escalation tier — every 24h, at both
-//!   sites, indefinitely, with no operator action able to stop it.
+//!   FOREVER, no matter what the business-key state is.
+//! * The closure arm (issue #273, first half) re-keyed RESOLUTION onto the
+//!   business key so a genuine gap could actually converge. Leaving
+//!   DETECTION on the old id key after that would have been worse than
+//!   useless: detection would open a row on the never-equal id gap, the
+//!   business-key resolve arm would close that SAME row the moment the
+//!   unrelated business-key counts happened to agree, and detection would
+//!   re-open it the very next tick — a record/resolve churn loop, forever.
+//!   [`resolve_pg_hash`] / [`resolve_legacy_hash`] (the GENERIC, id-keyed
+//!   resolve arms below) are therefore never reached for this probe's
+//!   `<aggregate>` row today: `compute_current_pg_hash` /
+//!   `compute_current_legacy_hash` in `scheduler::sync` dispatch the
+//!   business-key arm FIRST, ahead of the generic `probe_for_table` arm,
+//!   for exactly this key. They remain registered as a safety net for a
+//!   per-PK row a pre-#273 binary might have written (this probe is
+//!   `per_pk: false`, so detection itself can never produce one).
 //!
-//! The gap is real and worth knowing about; the honest way to carry it until
-//! there is a re-drive path is one log line per tick, not a page nobody can
-//! close. Flipping `observe_only` to `false` belongs in the SAME change that
-//! gives the calendar a business-key arm and a remediation procedure (issue
-//! #273 — deferred past 6-D, which shipped only the payment-ledger probe) —
-//! `room_calendar_is_observe_only_until_it_can_be_closed` pins that
-//! pairing. Its key stays in `RECONCILE_RESOLVABLE_TABLES` and both resolve
-//! dispatches so that an aggregate row recorded by an older binary still has
-//! a way to converge rather than sitting open unrecognised.
+//! ### What "recorded" means here, honestly
+//!
+//! This change re-keys DETECTION and flips the flag; it does NOT ship a
+//! remediation/re-drive path for the underlying night gap (that remains a
+//! separate follow-on). A recorded calendar divergence behaves exactly like
+//! `guest_registry` or `payment_ledger_probe`'s `missing_pg` rows: real,
+//! actionable sync lag that no self-heal list touches (probe keys are in
+//! neither `FORCE_CONVERGE_VALUE_DRIFT_TABLES` nor
+//! `REINGEST_MISSING_PG_TABLES`), so it stays open, and `check_level_drift_and_alert`
+//! / `send_stale_level_digest` carry NO minimum-count threshold — past 72h
+//! the `:bangbang:` escalation tier WILL fire on it, same as any other
+//! genuine unremediated gap. That is the intended, honest outcome of
+//! detecting a real gap with no closure path yet — not a defect to route
+//! around with `observe_only` again. It will converge on its own the moment
+//! the business-key counts actually agree (a re-drive, or the gap closing by
+//! whatever means), exactly as `should_auto_resolve` already knows how to
+//! recognise (`room_calendar_business_key_row_closes_when_both_sides_agree`).
+//!
+//! Live counts, 2026-07-28 — the numbers this arm will act on the first time
+//! it is enabled: id-keyed HF Hotel 1507 in-era legacy rows vs 1298 canonical
+//! (1302 vs 1071 at Ville); business-key HF Hotel 1546 legacy nights vs 1420
+//! canonical (a DIFFERENT, not-directly-comparable pair of numbers — see
+//! `room_calendar_detection_and_resolution_share_one_definition_of_converged`).
+//! Ville's business-key gap has not been independently measured; do not
+//! assume it equals the id-keyed 1302/1071 pair above.
 //!
 //! ## What gets recorded
 //!
@@ -370,15 +393,28 @@ pub(crate) const MIRROR_PROBES: &[MirrorProbe] = &[
         // Aggregate-only — see the module docs. The legacy id is NOT the
         // mapper's conflict target and is deliberately NULLed on rebind.
         per_pk: false,
-        // OBSERVE-ONLY. The gap this measures is real, structural and today
-        // has no closure path: nothing restores a NULLed `rcal_legacy_id`,
-        // the business key does not converge either (1546 vs 1420), no
-        // self-heal touches probe keys, and a hand-resolved row re-mints
-        // itself next tick — so a recorded row would page forever with no
-        // remediation. It is LOGGED instead, until issue #273 gives the
-        // calendar a business-key arm that can actually be acted on (deferred
-        // past 6-D, which shipped only the payment-ledger probe).
-        observe_only: true,
+        // Issue #273 (remainder): DETECTION is re-keyed off this id-keyed
+        // shape entirely — `run_mirror_probe` skips `ht_room_calendar` in
+        // the generic UNION-ALL batch below and dispatches it to
+        // `sync::probe_room_calendar_business_key` instead, which compares
+        // the same `(room, night)` business key the closure arm
+        // (`sync::compute_room_calendar_business_key_{pg,legacy}_hash`)
+        // resolves on. `observe_only: false` — a genuine business-key
+        // divergence now IS recorded.
+        //
+        // The id-keyed fields above (`legacy_pk_col`, `mirror_pk_col`,
+        // `mirror_filter`) stay as documentation of the shape this probe
+        // WOULD have used and as the target for a per-PK row a pre-#273
+        // binary might have recorded (the generic resolve arm below still
+        // answers for it) — they are otherwise unused: the id-keyed
+        // aggregate is never-equal by construction (nothing restores a
+        // `rcal_legacy_id` NULLed on an allocator rebind), which is exactly
+        // why detection had to move off it. `observe_only` was `true` while
+        // that gap made every recorded row unclosable; the flip is safe now
+        // because DETECTION and the closure arm's RESOLUTION agree on one
+        // definition of "converged" (issue #273; the pairing is pinned by
+        // `room_calendar_detection_is_no_longer_observe_only`).
+        observe_only: false,
     },
 ];
 
@@ -702,6 +738,14 @@ pub(crate) struct MirrorProbeOutcome {
 /// `RECONCILE_MIRROR_PROBE_ENABLED` is true — with the flag off (the
 /// shipped default on every service) this is never entered and the arm
 /// issues zero MSSQL and zero PG queries.
+///
+/// `ht_room_calendar` is deliberately EXCLUDED from the generic id-keyed
+/// UNION-ALL batch below (issue #273): it is dispatched to
+/// [`super::sync::probe_room_calendar_business_key`] instead, which compares
+/// the `(room, night)` business key rather than `rcal_legacy_id`. See that
+/// function's docs and the `MirrorProbe` entry's `observe_only` comment for
+/// why detection cannot share the generic batch's shape and why it must
+/// agree with the closure arm's resolve on one definition of "converged".
 pub(crate) async fn run_mirror_probe(
     legacy_pool: &DbPool,
     pg_pool: &PgPool,
@@ -709,7 +753,10 @@ pub(crate) async fn run_mirror_probe(
     let start = Instant::now();
     tracing::info!("[Sync] Probing legacy mirror tables...");
 
-    let probes: Vec<&MirrorProbe> = MIRROR_PROBES.iter().collect();
+    let probes: Vec<&MirrorProbe> = MIRROR_PROBES
+        .iter()
+        .filter(|p| p.key != super::sync::ROOM_CALENDAR_PROBE_KEY)
+        .collect();
 
     // ── ONE PG aggregate batch ────────────────────────────────────────
     let pg_sql = pg_aggregate_sql(&probes);
@@ -898,9 +945,30 @@ pub(crate) async fn run_mirror_probe(
         );
     }
 
+    // ── `ht_room_calendar`, business-key detection (issue #273) ───────
+    // Excluded from the batch above; runs its own two-query comparison
+    // (see `super::sync::probe_room_calendar_business_key`). A failure here
+    // is scoped to this ONE probe, same isolation contract as a per-key scan
+    // failure above: collected into `failed` and the tick still fails at the
+    // end so `record_error` fires, but every other probe was still measured.
+    match super::sync::probe_room_calendar_business_key(legacy_pool, pg_pool).await {
+        Ok(super::sync::RoomCalendarProbeOutcome::Converged) => converged += 1,
+        Ok(super::sync::RoomCalendarProbeOutcome::Diverged) => recorded += 1,
+        Err(e) => {
+            tracing::warn!(
+                probe = super::sync::ROOM_CALENDAR_PROBE_KEY,
+                error = %e,
+                "[Sync] Mirror probe: calendar business-key probe failed — this \
+                 probe is unmeasured this tick, the remaining probes still ran"
+            );
+            failed.push(super::sync::ROOM_CALENDAR_PROBE_KEY);
+        }
+    }
+
     let duration_ms = start.elapsed().as_millis() as i32;
     tracing::info!(
-        probes = probes.len(),
+        // +1: the calendar business-key probe runs outside `probes` above.
+        probes = probes.len() + 1,
         converged,
         recorded,
         observed,
@@ -1482,34 +1550,36 @@ mod tests {
         assert_eq!(p.mirror_pk_col, "rcal_legacy_id");
     }
 
-    /// …and it must stay OBSERVE-ONLY until something can close its row.
-    ///
-    /// The gap is structural: nothing restores a `rcal_legacy_id` the mapper
-    /// NULLed on rebind, the business key does not converge either (1546 vs
-    /// 1420), no self-heal list contains a probe key, and `resolve_*_hash`
-    /// recompute the same never-equal aggregates every sweep. A recorded row
-    /// would therefore fire the 4h digest and the >72h `:bangbang:` tier at
-    /// both sites forever, and resolving it by hand only re-mints it —
-    /// detection with no remediation. Flip this to `false` in the SAME change
-    /// that gives the calendar a closure path (issue #273; deferred past 6-D),
-    /// never on its own.
+    /// Issue #273 (remainder): the flip. `observe_only` must now be
+    /// `false` — detection was re-keyed onto the business key in the SAME
+    /// change (this test's sibling
+    /// `room_calendar_detection_and_resolution_share_one_definition_of_converged`
+    /// pins that pairing), so a genuine gap is no longer unclosable and no
+    /// longer merely logged.
     #[test]
-    fn room_calendar_is_observe_only_until_it_can_be_closed() {
-        assert!(probe("mirror_ht_room_calendar").observe_only);
+    fn room_calendar_detection_is_no_longer_observe_only() {
+        assert!(!probe("mirror_ht_room_calendar").observe_only);
     }
 
-    /// Observe-only is a deliberate exception, not a default: every other
-    /// probe MUST record, or the arm silently stops reporting. And an
-    /// observe-only probe never pays for the two per-key scans whose output
-    /// it would throw away.
+    /// The `observe_only` escape hatch is unused today (no probe sets it),
+    /// but the invariant it exists to protect stays pinned for whichever
+    /// probe needs it next: an observe-only probe must never also be
+    /// `per_pk`, or its per-key scans would be run and their output thrown
+    /// away.
     #[test]
-    fn only_the_room_calendar_is_observe_only_and_it_implies_aggregate_only() {
+    fn no_probe_is_observe_only_and_the_aggregate_only_invariant_still_holds() {
         let observe_only: Vec<&str> = MIRROR_PROBES
             .iter()
             .filter(|p| p.observe_only)
             .map(|p| p.key)
             .collect();
-        assert_eq!(observe_only, vec!["mirror_ht_room_calendar"]);
+        assert_eq!(
+            observe_only,
+            Vec::<&str>::new(),
+            "issue #273 flipped the last observe-only probe (mirror_ht_room_calendar); \
+             if this fails, a NEW probe just set observe_only — apply the same rigor \
+             `mirror_ht_room_calendar` got before recording anything for it"
+        );
         for p in MIRROR_PROBES {
             assert!(
                 !(p.observe_only && p.per_pk),
@@ -1517,6 +1587,33 @@ mod tests {
                 p.key
             );
         }
+    }
+
+    /// Issue #273 (remainder) — the re-key itself: `ht_room_calendar` must
+    /// be excluded from the generic id-keyed UNION-ALL batch and dispatched
+    /// to the dedicated business-key probe instead. Without this,
+    /// `observe_only: false` alone would make `run_mirror_probe` record the
+    /// never-equal ID-KEYED aggregate — exactly the churn-loop hazard the
+    /// business-key closure arm was built to avoid, just moved from
+    /// "unsafe to flip" to "flipped unsafely".
+    #[test]
+    fn room_calendar_detection_and_resolution_share_one_definition_of_converged() {
+        let src = include_str!("mirror_probe.rs");
+        let start = src
+            .find("pub(crate) async fn run_mirror_probe(")
+            .expect("run_mirror_probe must exist");
+        let body = &src[start..];
+
+        assert!(
+            body.contains(".filter(|p| p.key != super::sync::ROOM_CALENDAR_PROBE_KEY)"),
+            "run_mirror_probe must exclude the calendar probe from the generic \
+             id-keyed batch — it is detected on the business key instead"
+        );
+        assert!(
+            body.contains("super::sync::probe_room_calendar_business_key(legacy_pool, pg_pool)"),
+            "run_mirror_probe must dispatch ht_room_calendar to the dedicated \
+             business-key probe — the one the closure arm's resolve already uses"
+        );
     }
 
     /// Exactly the tables that carry a charge total get a SUM. The plan
