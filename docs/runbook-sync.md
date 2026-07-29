@@ -117,7 +117,24 @@ Four new arms/probes, each dark behind its own flag, each `RECONCILE_REINGEST_MI
 
 ---
 
-## 3. Slack alert meanings
+### 2c. SSE pool-exhaustion fix (2026-07-29, `517b907`)
+
+These are **backend** (`main.rs` / `db::pg_pool`) knobs, not `bin/sync` ones — included
+here because they were born from the same incident class as the rest of Section 2 and
+operators tuning pool/alerting behaviour need them in one place. Root cause: every open
+/v2 tab's SSE stream held 1-2 real PG pool slots for its lifetime
+(`PgListener::connect_with(pool)`), so tab churn exhausted the 10/5-slot pools and
+sqlx's un-overridden 30s acquire timeout turned that into 500s + a Cloudflare 524.
+Full writeup: `docs/coexistence/sync-incident-log.md` § 2026-07-29.
+
+| Var | Meaning | Default | When to flip |
+|---|---|---|---|
+| `NEW_DB_POOL_MAX` | Max connections in the HotelNew (`hotelnew`) PG pool (`config.rs::NewDbConfig`). Raised as belt-and-braces headroom alongside the fix — the actual fix is the shared LISTEN fan-out (`routes::events`), which removed the per-tab pool consumption entirely; this is not itself what closed the incident. | `20` (compose default, `docker-compose.yml`; code default in `config.rs` remains `10`) | Raise only with evidence of genuine saturation (e.g. many concurrent reconcile/API bursts). Pool size was not the root cause on 2026-07-29 — don't reach for this knob first. |
+| `VILLE_DB_POOL_MAX` | Same, for the `hotelville` pool (`config.rs::VilleDbConfig`). | `10` (compose default; code default in `config.rs` remains `5`) | Same caveat as `NEW_DB_POOL_MAX`. |
+| `PG_ACQUIRE_TIMEOUT` (compiled-in constant, **not** an env var) | How long a caller waits for a free pool connection before failing, for BOTH canonical pools — set via the shared `db::pg_pool_options()` builder (`hotel-backend/src/db/pg_pool.rs`) so it can't be applied to one pool and forgotten on the other. sqlx's default is 30s and was never overridden before this fix, which is what let the 2026-07-29 saturation hang requests into Cloudflare's own timeout window instead of failing fast. | `5s` (hardcoded `PG_ACQUIRE_TIMEOUT` constant) | Code change + redeploy only — deliberately not env-tunable; a pool-acquire ceiling is a safety property, not a per-environment tuning knob. |
+| `access_log` middleware (no env toggle) | Request-level INFO log line per `/api/*` request — method, path, status, `latency_ms` ONLY. Excludes `/api/events` (an hour-long SSE stream's "latency" is a disconnect timestamp, not a service time) and any non-`/api` path. Deliberately omits query strings, headers, and body: query strings carry guest-identifying params (`?q=`, `book_no`, customer ids), which is why the existing `TraceLayer` (which does log full URIs) stays at DEBUG rather than being reconfigured. Added because the 2026-07-29T04:23Z 500-burst was undiagnosable — the backend logged nothing per-request, so the incident had to be reconstructed from `pg_stat_activity` and the browser console. | Always on (outermost layer in `main.rs`, wraps `TraceLayer`) | N/A — unconditional, no flag. Would need a code change to disable. |
+
+
 
 The watcher surfaces three categories of alerts to Slack. All are
 prefixed so they're triagable in one glance.
