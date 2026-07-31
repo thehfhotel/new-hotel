@@ -857,7 +857,14 @@ services:
       # here really do predict HF Hotel's ~12. Findings need operator action;
       # nothing here auto-closes, and a TM.30 under-count is the exact class
       # this arm exists to surface.
-      - RECONCILE_GUEST_REGISTRY_ARM_ENABLED=${HFVILLE_RECONCILE_GUEST_REGISTRY_ARM_ENABLED:-false}
+      # ENABLED 2026-07-31 (T2 rollout step 3 of 8). Ville is the canary and
+      # this arm is the REPRESENTATIVE one — 2,184 legacy companion folios vs
+      # 545 canonical here, the same shape and era boundary as HF Hotel, so
+      # the ~29 first-enable finds really do predict HF Hotel's ~12. Soak 48h
+      # before flipping the backend (step 4). Findings need operator triage;
+      # nothing auto-closes, and a TM.30 under-count is exactly the class
+      # this arm exists to surface.
+      - RECONCILE_GUEST_REGISTRY_ARM_ENABLED=${HFVILLE_RECONCILE_GUEST_REGISTRY_ARM_ENABLED:-true}
       # Phase 6-C — generic mirror-table probe (8 legacy_mirror.* tables +
       # ht_room_calendar). DETECTION ONLY; writes nothing but
       # ht_reconcile_log — no ack cache and no new PG table. This worker runs
