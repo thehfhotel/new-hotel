@@ -1498,10 +1498,17 @@ async fn resolve_legacy_ids(
             }
         }
         // MarkRoomDirty (audit 2026-06-11 P2) and SetRoomMaintenance share
-        // MarkRoomClean's resolution: both recipes key `HT_Rooms` by the
-        // numeric internal `id` (spike §3j critical finding), and the
-        // housekeeping recipes additionally need the display `room_no`
-        // for the `HT_Housewife` audit row + prior-occupant lookup.
+        // MarkRoomClean's resolution query: all three key `HT_Rooms` by
+        // the numeric internal `id` (spike §3j critical finding), fetched
+        // here as `legacy_room_id_int`. Only `MarkRoomClean` still needs
+        // the display `room_no` too, for its `HT_Housewife` audit row +
+        // prior-occupant lookup (mark_clean.rs). Since issue #276,
+        // `MarkRoomDirty` no longer writes an `HT_Housewife` row or does
+        // a prior-occupant lookup — iHOTEL itself never inserts one on a
+        // standalone dirty flip (mark_dirty.rs module doc) — so its
+        // `room_no` is resolved here (cheap, shared query) but unused by
+        // the recipe; `SetRoomMaintenance` never needed `room_no` at all
+        // (set_maintenance.rs keys by `id` only).
         MarkRoomClean { room_id, .. }
         | MarkRoomDirty { room_id, .. }
         | SetRoomMaintenance { room_id, .. } => {
