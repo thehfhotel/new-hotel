@@ -46,6 +46,10 @@ name = "backfill_payment_ledger"
 path = "src/bin/backfill_payment_ledger.rs"
 
 [[bin]]
+name = "backfill_receipt_payments"
+path = "src/bin/backfill_receipt_payments.rs"
+
+[[bin]]
 name = "create_user"
 path = "src/bin/create_user.rs"
 

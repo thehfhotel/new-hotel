@@ -611,7 +611,17 @@ const RECEIPT_UPSERT_UPDATE_SQL: &str = "UPDATE ht_payments \
                                  ELSE NULL END \
       WHERE pay_id = $4";
 
-async fn apply_receipt_upsert(
+/// `pub` (not `pub(crate)`) so the one-shot `backfill_receipt_payments` bin
+/// (issue #278) can re-drive the EXACT same projection + UPSERT the live CT
+/// mapper uses — `pub(crate)` is invisible from `bin/*.rs`, which compiles
+/// as a separate crate depending on this one externally; same reason
+/// `mirror_payment_ledger` above, and `apply_checkin_aggregate` /
+/// `apply_booking_aggregate` in the sibling mappers, are `pub` rather than
+/// `pub(crate)`. Do not hand-write a bespoke INSERT against `ht_payments`
+/// in a bin — that divergence-from-the-mapper is the exact bug class this
+/// repo keeps hitting (see the receipt-status / void-monotonicity history
+/// above).
+pub async fn apply_receipt_upsert(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     row: &dyn MappableRow,
 ) -> Result<Option<DomainEvent>, SyncError> {
