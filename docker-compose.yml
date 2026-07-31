@@ -445,6 +445,24 @@ services:
       # WILL fire if they are left, so pre-set
       # LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_<SITE> or flip in a window.
       - RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED=${RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED:-false}
+      # ADR 0005 NULL-clear sentinel tripwire (docs/adr/0005-null-clear-sentinel-semantics.md).
+      # Two read-only SELECT COUNT(*)s per reconcile tick (HT_Book_H.Book_Cust_ID,
+      # HT_CheckIn_H.Cin_cust_no IS NULL) guarding the ADR's one accepted gap: a
+      # guarded reconcile-gate term cannot represent a legacy Some->None clear, so
+      # a genuine one produces an ht_reconcile_log row that can NEVER auto-close.
+      # The owner accepted the gap because the ADR's pre-flight audit found zero
+      # rows on both columns at both sites (2026-07-31) and iHOTEL has no code
+      # path that writes a literal NULL there (its customer-delete cascade writes
+      # the 'C0000' sentinel instead) — so the only live trigger is a legacy
+      # hand-edit outside iHOTEL.
+      #
+      # UNLIKE every Phase 6 reconcile arm above, this defaults ON: it is
+      # read-only and writes nothing to legacy or canonical, so it carries none
+      # of the "ship dark" risk that gate exists to manage (same posture as
+      # CF_AUTO_LOGIN). This backend runs HF Hotel's reconcile; sync-hfville runs
+      # Ville's (its own HFVILLE_ override below). Silence with
+      # NULL_SENTINEL_TRIPWIRE_ENABLED=false if it ever proves noisy.
+      - NULL_SENTINEL_TRIPWIRE_ENABLED=${NULL_SENTINEL_TRIPWIRE_ENABLED:-true}
       # Tracing log level. Default `hotel_backend=info,tower_http=info`
       # matches `main.rs::tracing_subscriber::EnvFilter::try_from_default_env`'s
       # fallback. Override at deploy time to crank up debug logging
@@ -880,7 +898,16 @@ services:
       # close such a row and a hand-resolved one re-mints itself. It starts
       # recording only when a closure path lands (issue #273; deferred
       # past 6-D).
-      - RECONCILE_MIRROR_PROBE_ENABLED=${HFVILLE_RECONCILE_MIRROR_PROBE_ENABLED:-false}
+      # ENABLED 2026-07-31 — PULLED FORWARD out of rollout order (was step 7/8).
+      # It was scheduled last for exactly one reason: the calendar gap would
+      # open a durable row no sweep could ever close. That reason is gone —
+      # backfill_room_calendar closed the deficit on both sites the same day
+      # (HF Hotel +3,137 nights, Ville +513, surplus rows untouched), and the
+      # 8 legacy_mirror.* tables were already exactly converged once floored.
+      # So this arm should now find NOTHING, and that silence is the proof
+      # issue #273 needs before it can close. If it does fire, that is a real
+      # finding worth having today rather than a week from now.
+      - RECONCILE_MIRROR_PROBE_ENABLED=${HFVILLE_RECONCILE_MIRROR_PROBE_ENABLED:-true}
       # Phase 6-D — payment-ledger per-folio probe (HT_CheckIn_Pay ↔
       # ht_payment_ledger). DETECTION ONLY; writes nothing but
       # ht_reconcile_log — no ack cache and no new PG table. This worker runs
@@ -894,6 +921,12 @@ services:
       # anything new here is a genuine mirror gap in the money the round
       # report reads, remediable with the backfill_payment_ledger bin.
       - RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED=${HFVILLE_RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED:-false}
+      # ADR 0005 NULL-clear sentinel tripwire — see the backend service's
+      # comment for the full rationale. This worker runs Ville's reconcile,
+      # so the knob is LIVE here (not the inert-carried-for-parity pattern
+      # the other RECONCILE_* arms use). Read-only, writes nothing, so —
+      # unlike those — it defaults ON rather than shipping dark.
+      - NULL_SENTINEL_TRIPWIRE_ENABLED=${HFVILLE_NULL_SENTINEL_TRIPWIRE_ENABLED:-true}
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,sync=info}
     secrets:
       - db_password
