@@ -50,6 +50,10 @@ name = "backfill_receipt_payments"
 path = "src/bin/backfill_receipt_payments.rs"
 
 [[bin]]
+name = "backfill_room_calendar"
+path = "src/bin/backfill_room_calendar.rs"
+
+[[bin]]
 name = "create_user"
 path = "src/bin/create_user.rs"
 
