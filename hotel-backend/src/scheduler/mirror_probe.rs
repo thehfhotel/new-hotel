@@ -181,6 +181,7 @@ use std::time::Instant;
 
 use serde_json::json;
 
+use crate::db::mssql_timeout::{simple_query_with_timeout_pooled, MssqlOpKind};
 use crate::db::{DbPool, PgPool};
 use crate::sync::gate_guard::join_hash_segments;
 
@@ -790,11 +791,7 @@ pub(crate) async fn run_mirror_probe(
         .collect();
     let legacy_sql = legacy_aggregate_sql(&floored);
     let mut conn = legacy_pool.get().await?;
-    let rows = conn
-        .simple_query(&legacy_sql)
-        .await?
-        .into_first_result()
-        .await?;
+    let rows = simple_query_with_timeout_pooled(&mut conn, &legacy_sql, MssqlOpKind::Read).await?;
     drop(conn);
 
     let mut legacy_aggregates: BTreeMap<String, MirrorAggregate> = BTreeMap::new();
@@ -1122,7 +1119,7 @@ async fn load_legacy_keys(
         filter = legacy_floor_filter(probe, floor),
     );
     let mut conn = legacy_pool.get().await?;
-    let rows = conn.simple_query(&sql).await?.into_first_result().await?;
+    let rows = simple_query_with_timeout_pooled(&mut conn, &sql, MssqlOpKind::Read).await?;
     drop(conn);
 
     let mut out = BTreeMap::new();
@@ -1228,7 +1225,7 @@ pub(crate) async fn resolve_legacy_hash(
         .await?;
         let sql = legacy_aggregate_sql(&[(probe, mirror.4)]);
         let mut conn = legacy_pool.get().await?;
-        let rows = conn.simple_query(&sql).await?.into_first_result().await?;
+        let rows = simple_query_with_timeout_pooled(&mut conn, &sql, MssqlOpKind::Read).await?;
         drop(conn);
         let Some(r) = rows.first() else {
             return Ok(None);

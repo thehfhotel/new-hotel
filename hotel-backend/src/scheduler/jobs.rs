@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 use tokio_cron_scheduler::{Job, JobScheduler};
 
 use crate::config::{SiteConfig, SlackConfig};
+use crate::db::mssql_timeout::{simple_query_with_timeout_pooled, MssqlOpKind};
 use crate::db::{DbPool, PgPool};
 use crate::notifications::slack::{
     build_check_in_alert_message, build_check_out_alert_message, build_hourly_report_message,
@@ -393,43 +394,42 @@ async fn send_hourly_report(
     let mut conn = pool.get().await?;
 
     // Get occupied rooms count
-    let occupied_rows = conn
-        .simple_query(
-            r#"
-            SELECT COUNT(*) as count FROM HT_Rooms
-            WHERE Room_Use = 'yes' OR Room_Book = 'yes'
-            "#,
-        )
-        .await?
-        .into_first_result()
-        .await?;
+    let occupied_rows = simple_query_with_timeout_pooled(
+        &mut conn,
+        r#"
+        SELECT COUNT(*) as count FROM HT_Rooms
+        WHERE Room_Use = 'yes' OR Room_Book = 'yes'
+        "#,
+        MssqlOpKind::Read,
+    )
+    .await?;
     let occupied_rooms: i32 = occupied_rows
         .first()
         .and_then(|r| r.get::<i32, _>("count"))
         .unwrap_or(0);
 
     // Get total rooms count
-    let total_rows = conn
-        .simple_query("SELECT COUNT(*) as count FROM HT_Rooms")
-        .await?
-        .into_first_result()
-        .await?;
+    let total_rows = simple_query_with_timeout_pooled(
+        &mut conn,
+        "SELECT COUNT(*) as count FROM HT_Rooms",
+        MssqlOpKind::Read,
+    )
+    .await?;
     let total_rooms: i32 = total_rows
         .first()
         .and_then(|r| r.get::<i32, _>("count"))
         .unwrap_or(0);
 
     // Get today's new bookings count
-    let bookings_rows = conn
-        .simple_query(
-            r#"
-            SELECT COUNT(*) as count FROM View_Booking_Ds
-            WHERE CAST(Book_Date AS DATE) = CAST(GETDATE() AS DATE)
-            "#,
-        )
-        .await?
-        .into_first_result()
-        .await?;
+    let bookings_rows = simple_query_with_timeout_pooled(
+        &mut conn,
+        r#"
+        SELECT COUNT(*) as count FROM View_Booking_Ds
+        WHERE CAST(Book_Date AS DATE) = CAST(GETDATE() AS DATE)
+        "#,
+        MssqlOpKind::Read,
+    )
+    .await?;
     let today_bookings: i32 = bookings_rows
         .first()
         .and_then(|r| r.get::<i32, _>("count"))

@@ -69,6 +69,7 @@ use std::time::Instant;
 
 use tiberius::Query;
 
+use crate::db::mssql_timeout::{simple_query_with_timeout_pooled, MssqlOpKind};
 use crate::db::{DbPool, PgPool};
 // Issue #204 (bug #2): the durable self-healing arm of the auto-resolve
 // sweep re-drives the EXISTING CT upsert path, so it reaches for the same
@@ -5377,11 +5378,7 @@ async fn sync_customers(
         "SELECT {projection} FROM HT_Customers",
         projection = CUSTOMERS_RECONCILE_PROJECTION,
     );
-    let rows = conn
-        .simple_query(&select_sql)
-        .await?
-        .into_first_result()
-        .await?;
+    let rows = simple_query_with_timeout_pooled(&mut conn, &select_sql, MssqlOpKind::Read).await?;
 
     let mut added = 0i32;
     let mut updated = 0i32;
@@ -5740,11 +5737,8 @@ async fn sync_rooms(
         "SELECT {projection} FROM HT_Rooms ORDER BY Room_no",
         projection = ROOMS_RECONCILE_PROJECTION.join(", "),
     );
-    let rows = conn
-        .simple_query(&rooms_select_sql)
-        .await?
-        .into_first_result()
-        .await?;
+    let rows =
+        simple_query_with_timeout_pooled(&mut conn, &rooms_select_sql, MssqlOpKind::Read).await?;
 
     let mut added = 0i32;
     let mut updated = 0i32;
@@ -5981,10 +5975,7 @@ async fn sync_bookings(
         "SELECT {projection} FROM View_Booking_Ds",
         projection = BOOKINGS_RECONCILE_PROJECTION.join(", "),
     );
-    let rows = conn
-        .simple_query(&bookings_select_sql)
-        .await?
-        .into_first_result()
+    let rows = simple_query_with_timeout_pooled(&mut conn, &bookings_select_sql, MssqlOpKind::Read)
         .await?;
 
     let mut added = 0i32;
@@ -6435,17 +6426,16 @@ async fn sync_checkins(
     // ghost as `missing_pg`, producing 200+ false-positive drift rows
     // per tick.
     let mut conn = legacy_pool.get().await?;
-    let pk_rows = conn
-        .simple_query(
-            "SELECT DISTINCT h.Cin_no FROM HT_CheckIn_H h \
-              WHERE EXISTS ( \
-                  SELECT 1 FROM HT_CheckIn_Ds d WHERE d.Cin_No = h.Cin_no \
-              ) \
-              ORDER BY h.Cin_no",
-        )
-        .await?
-        .into_first_result()
-        .await?;
+    let pk_rows = simple_query_with_timeout_pooled(
+        &mut conn,
+        "SELECT DISTINCT h.Cin_no FROM HT_CheckIn_H h \
+          WHERE EXISTS ( \
+              SELECT 1 FROM HT_CheckIn_Ds d WHERE d.Cin_No = h.Cin_no \
+          ) \
+          ORDER BY h.Cin_no",
+        MssqlOpKind::Read,
+    )
+    .await?;
     let cin_nos: Vec<String> = pk_rows
         .iter()
         .filter_map(|r| r.get::<&str, _>("Cin_no").map(String::from))
@@ -7356,11 +7346,7 @@ async fn sync_payments(
         projection = PAYMENTS_RECONCILE_PROJECTION.join(", "),
         filter = payments_reconcile_scan_filter(era_floor),
     );
-    let rows = conn
-        .simple_query(&select_sql)
-        .await?
-        .into_first_result()
-        .await?;
+    let rows = simple_query_with_timeout_pooled(&mut conn, &select_sql, MssqlOpKind::Read).await?;
     // Free the pool slot — nothing below touches MSSQL again.
     drop(conn);
 
@@ -8096,11 +8082,7 @@ async fn sync_guest_registry(
         "SELECT {projection} FROM HT_CheckIn_Other_People",
         projection = GUEST_REGISTRY_RECONCILE_PROJECTION.join(", "),
     );
-    let rows = conn
-        .simple_query(&select_sql)
-        .await?
-        .into_first_result()
-        .await?;
+    let rows = simple_query_with_timeout_pooled(&mut conn, &select_sql, MssqlOpKind::Read).await?;
     // Free the pool slot — nothing below touches MSSQL again.
     drop(conn);
 
