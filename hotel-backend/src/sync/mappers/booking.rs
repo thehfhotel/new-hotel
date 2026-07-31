@@ -271,9 +271,12 @@ struct ExistingBooking {
     /// silently skipped the re-point.
     legacy_cust_no: Option<String>,
     /// Booking notes — included in the idempotency comparison (guarded
-    /// on the projection carrying a value, mirroring the
-    /// `COALESCE($7, book_notes)` write semantics) so a notes-only
-    /// iHOTEL edit re-applies instead of silently skipping.
+    /// on the projection, mirroring the `COALESCE($7, book_notes)` write
+    /// semantics) so a notes-only iHOTEL edit re-applies instead of
+    /// silently skipping. Since ADR 0005 / issue #269, the gate also
+    /// recognises a genuine legacy clear (`LegacyNotes::Cleared`) as a
+    /// mismatch against any non-empty value here — see
+    /// `HEADER_GATE_FIELDS`'s `book_notes` term.
     book_notes: Option<String>,
 }
 
@@ -302,7 +305,12 @@ struct CanonicalProjection {
     book_checkout: NaiveDate,
     total_amount: Option<f64>,
     deposit_amount: Option<f64>,
-    notes: Option<String>,
+    /// Classified from the raw `Book_room_note` column — see
+    /// [`LegacyNotes`]. NOT a plain `Option<String>`: that representation
+    /// is exactly what let a genuine legacy clear (raw empty string)
+    /// collapse onto "never observed" (raw NULL), the issue #269 /
+    /// ADR 0005 §3b silent-clear gap.
+    notes: LegacyNotes,
     /// One per `HT_Book_Ds` row — the room number (legacy stores it in
     /// the misleading `Book_Room_Type` column per cheatsheet §3.4) +
     /// optional per-room price.
@@ -313,6 +321,71 @@ struct CanonicalProjection {
 struct RoomLine {
     room_no: String,
     price_per_night: Option<f64>,
+}
+
+/// Tri-state classification of the raw legacy `Book_room_note` column
+/// (ADR 0005 §4 — `book_notes` half of issue #269).
+///
+/// `Option<String>` cannot represent "legacy explicitly cleared the note"
+/// separately from "legacy never populated / we haven't observed it" —
+/// both a raw SQL NULL and a raw empty string collapsed onto `None`
+/// before this fix (`project_aggregate`'s old
+/// `.filter(|s| !s.is_empty())`), so a receptionist's ordinary
+/// "select-all, delete, save" edit (which writes an empty string, not
+/// NULL) was indistinguishable from "nothing changed" and silently
+/// skipped by the guarded gate term — no reconcile signal either, since
+/// `book_notes` is not a reconcile-hash input (§2/§3b of the ADR).
+///
+/// Unlike `legacy_cust_no` (ADR 0005 §4, "Unset vs. Cleared cannot be
+/// read off the raw column alone"), classification here needs no context
+/// from `fetch_existing` / INSERT-vs-UPDATE: `Book_room_note` is a plain
+/// nullable column (`docs/legacy-app/SCHEMA.sql:133`, `text`), so raw
+/// NULL vs. raw `""` vs. raw non-empty is a real, always-available
+/// distinction straight off the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LegacyNotes {
+    /// Raw SQL NULL. No opinion — the gate treats this as "nothing to
+    /// check" and the write preserves whatever canonical already has
+    /// (`COALESCE($n, book_notes)` with a NULL `$n`), same as the old
+    /// `None` behaviour.
+    Unset,
+    /// Raw empty string — an explicit legacy clear. Must defeat the gate
+    /// and bind a real (non-NULL) value so `COALESCE` actually applies
+    /// it.
+    Cleared,
+    /// Raw non-empty string — the current legacy note text.
+    Value(String),
+}
+
+/// Classify a raw `try_get_str("Book_room_note")` result into
+/// [`LegacyNotes`]. See that type's doc comment for the NULL/""/value
+/// distinction this exists to preserve.
+fn classify_legacy_notes(raw: Option<&str>) -> LegacyNotes {
+    match raw {
+        None => LegacyNotes::Unset,
+        Some("") => LegacyNotes::Cleared,
+        Some(s) => LegacyNotes::Value(s.to_string()),
+    }
+}
+
+/// What to bind for `book_notes`'s `COALESCE($n, book_notes)` write
+/// parameter, kept in lock-step with the [`LegacyNotes`] gate term below
+/// (ADR 0005 §4's "the write must change in lock-step with the gate, or
+/// a `Cleared` mismatch just spins"):
+///
+/// * `Unset` binds SQL NULL — `COALESCE` preserves the existing value,
+///   today's (pre-fix) behaviour, unchanged.
+/// * `Cleared` binds `Some("")` — a real, non-NULL bind so `COALESCE`
+///   actually applies it. This mirrors the raw legacy byte content (an
+///   explicit empty string, not a magic sentinel) rather than inventing
+///   new plumbing; the SQL text itself does not change.
+/// * `Value(x)` binds `Some(x)`, unchanged.
+fn notes_bind(notes: &LegacyNotes) -> Option<&str> {
+    match notes {
+        LegacyNotes::Unset => None,
+        LegacyNotes::Cleared => Some(""),
+        LegacyNotes::Value(v) => Some(v.as_str()),
+    }
 }
 
 /// Re-sync one booking aggregate. Idempotent — safe to call any number
@@ -564,10 +637,11 @@ fn project_aggregate(
 
     let total_amount = header.try_get_decimal("Book_Price_Total")?;
     let deposit_amount = header.try_get_decimal("Book_Price_Pay")?;
-    let notes = header
-        .try_get_str("Book_room_note")?
-        .map(str::to_string)
-        .filter(|s| !s.is_empty());
+    // Classify NULL vs "" vs a real value (ADR 0005 §4 / issue #269) —
+    // do NOT collapse the raw empty-string clear onto `None` here as the
+    // old code did; that collapse is exactly what made a genuine legacy
+    // clear indistinguishable from "never observed".
+    let notes = classify_legacy_notes(header.try_get_str("Book_room_note")?);
 
     // `HT_Book_H.Book_room_type` disambiguates what `HT_Book_Ds.
     // Book_Room_Type` holds (cheatsheet §1.5 / §3.3 / §3.4):
@@ -750,13 +824,22 @@ async fn fetch_existing(
 /// raw projection could never converge (every CT touch would re-emit
 /// `BookingModified`). See [`booking_rooms_match`].
 ///
-/// `legacy_cust_no` and `notes` comparisons are guarded on the
-/// projection carrying a value, mirroring their `COALESCE($n, existing)`
-/// write-semantics: a transient NULL on the legacy side never overwrites
-/// the canonical value, so treating it as a mismatch would also force a
-/// non-converging re-apply every tick. A Some-valued change — including
-/// the `'C0000'` customer-delete-cascade re-point (cheatsheet §3.24) and
-/// a notes-only edit — MUST mismatch so the apply re-runs.
+/// `legacy_cust_no` is guarded on the projection carrying a value,
+/// mirroring its `COALESCE($n, existing)` write-semantics: a transient
+/// NULL on the legacy side never overwrites the canonical value, so
+/// treating it as a mismatch would also force a non-converging re-apply
+/// every tick. A Some-valued change — including the `'C0000'`
+/// customer-delete-cascade re-point (cheatsheet §3.24) — MUST mismatch
+/// so the apply re-runs. `legacy_cust_no` still cannot represent a
+/// genuine legacy NULL-clear (ADR 0005 §3a — no known live trigger,
+/// deliberately not fixed here).
+///
+/// `notes` is guarded the same way on [`LegacyNotes::Unset`] (no
+/// opinion), but — unlike `legacy_cust_no` — it ALSO catches a genuine
+/// clear: `LegacyNotes::Cleared` (raw legacy empty string) mismatches
+/// against any non-empty canonical value, so a notes-only edit AND a
+/// notes-clear both re-run the apply (ADR 0005 §4 / issue #269
+/// `book_notes` fix).
 fn existing_matches(
     ex: &ExistingBooking,
     p: &CanonicalProjection,
@@ -813,11 +896,20 @@ const HEADER_GATE_FIELDS: [GateField<ExistingBooking, CanonicalProjection>; 7] =
         guarded: true,
         matches: |ex, p| p.legacy_cust_no.is_none() || ex.legacy_cust_no == p.legacy_cust_no,
     },
-    // Guarded — `COALESCE($7, book_notes)`, same rationale.
+    // Guarded — `COALESCE($7, book_notes)` — but now tri-state-aware
+    // (ADR 0005 §4 / issue #269): `Unset` still short-circuits to "no
+    // opinion" (same as the old `None` behaviour), while `Cleared` is a
+    // genuine legacy empty-string clear and MUST mismatch against a
+    // populated canonical value so the apply re-runs and the write
+    // actually converges instead of silently freezing forever.
     GateField {
         name: "book_notes",
         guarded: true,
-        matches: |ex, p| p.notes.is_none() || ex.book_notes == p.notes,
+        matches: |ex, p| match &p.notes {
+            LegacyNotes::Unset => true,
+            LegacyNotes::Cleared => matches!(ex.book_notes.as_deref(), None | Some("")),
+            LegacyNotes::Value(v) => ex.book_notes.as_deref() == Some(v.as_str()),
+        },
     },
 ];
 
@@ -1053,7 +1145,7 @@ async fn update_existing(
     .bind(&p.book_status)
     .bind(p.total_amount)
     .bind(p.deposit_amount)
-    .bind(&p.notes)
+    .bind(notes_bind(&p.notes))
     .bind(&p.legacy_book_id)
     .bind(&p.legacy_cust_no)
     .bind(agg_id)
@@ -1088,7 +1180,7 @@ async fn insert_new(
     .bind(&p.book_status)
     .bind(p.total_amount)
     .bind(p.deposit_amount)
-    .bind(&p.notes)
+    .bind(notes_bind(&p.notes))
     .bind(&p.legacy_book_id)
     .bind(&p.legacy_cust_no)
     .fetch_one(&mut **tx)
@@ -1426,8 +1518,14 @@ mod tests {
         assert!(err.to_string().contains("Book_Date_in"));
     }
 
+    /// ADR 0005 §4 / issue #269: a raw empty string on `Book_room_note`
+    /// (an ordinary "select-all, delete, save" clear in iHOTEL's notes
+    /// box) must classify as `Cleared` — NOT collapse onto `Unset` the
+    /// way the pre-fix code's `.filter(|s| !s.is_empty())` did. Renamed
+    /// from `project_aggregate_drops_empty_notes`, which pinned the old
+    /// (buggy) collapsing behaviour this fix removes.
     #[test]
-    fn project_aggregate_drops_empty_notes() {
+    fn project_aggregate_classifies_empty_note_as_cleared() {
         let mut header = header_row("R014810", "C21610", "จอง");
         header
             .cells
@@ -1438,7 +1536,40 @@ mod tests {
             nights: vec![],
         };
         let p = project_aggregate(&agg, "R014810").unwrap();
-        assert!(p.notes.is_none());
+        assert_eq!(p.notes, LegacyNotes::Cleared);
+    }
+
+    /// Raw SQL NULL (the `header_row` fixture default) classifies as
+    /// `Unset` — distinct from `Cleared` — so an unpopulated/never-
+    /// observed note still behaves like the old `None` (no opinion,
+    /// gate always matches, write preserves canonical).
+    #[test]
+    fn project_aggregate_classifies_null_note_as_unset() {
+        let agg = BookingAggregate {
+            header: Some(header_row("R014810", "C21610", "จอง")), // Book_room_note = Null
+            rooms: vec![],
+            nights: vec![],
+        };
+        let p = project_aggregate(&agg, "R014810").unwrap();
+        assert_eq!(p.notes, LegacyNotes::Unset);
+    }
+
+    /// A non-empty raw value classifies as `Value(x)`, unchanged from the
+    /// pre-fix behaviour (both old and new code preserve real note text).
+    #[test]
+    fn project_aggregate_classifies_nonempty_note_as_value() {
+        let mut header = header_row("R014810", "C21610", "จอง");
+        header.cells.insert(
+            "Book_room_note".into(),
+            MockValue::Str("late arrival".into()),
+        );
+        let agg = BookingAggregate {
+            header: Some(header),
+            rooms: vec![],
+            nights: vec![],
+        };
+        let p = project_aggregate(&agg, "R014810").unwrap();
+        assert_eq!(p.notes, LegacyNotes::Value("late arrival".into()));
     }
 
     // ----- Book_room_type=1 (room-TYPE-code Ds lines, cheatsheet §3.3) ----
@@ -1599,7 +1730,7 @@ mod tests {
             book_checkout: chrono::NaiveDate::from_ymd_opt(2026, 4, 26).unwrap(),
             total_amount: Some(890.0),
             deposit_amount: Some(0.0),
-            notes: None,
+            notes: LegacyNotes::Unset,
             rooms: vec![],
         }
     }
@@ -1634,6 +1765,13 @@ mod tests {
     /// one field at a time. `p.rooms` is the pre-resolution projection,
     /// so the junction starts empty; room-aware tests set `ex.rooms`
     /// explicitly via [`stored`].
+    ///
+    /// `book_notes` is derived via the SAME [`notes_bind`] helper the
+    /// production write path uses, not a hand-rolled mapping — so
+    /// "existing exactly mirrors p" means "what `update_existing`/
+    /// `insert_new` would actually have persisted for p", which is also
+    /// what makes the convergence tests below meaningful (they reuse
+    /// this same function to simulate a write, not a fresh assumption).
     fn make_existing(p: &CanonicalProjection) -> ExistingBooking {
         ExistingBooking {
             book_id_serial: 1,
@@ -1646,7 +1784,7 @@ mod tests {
             book_checkout: p.book_checkout,
             rooms: Vec::new(),
             legacy_cust_no: p.legacy_cust_no.clone(),
-            book_notes: p.notes.clone(),
+            book_notes: notes_bind(&p.notes).map(str::to_string),
         }
     }
 
@@ -1701,21 +1839,24 @@ mod tests {
     #[test]
     fn existing_matches_returns_false_when_only_notes_changed() {
         let mut p = sample_projection();
-        p.notes = Some("late arrival".into());
+        p.notes = LegacyNotes::Value("late arrival".into());
         let mut ex = make_existing(&p);
         ex.book_notes = None;
         assert!(!existing_matches(&ex, &p, &[]));
     }
 
-    /// …but a None-notes projection against a populated canonical value
-    /// must NOT mismatch: `update_existing` writes notes through
-    /// `COALESCE($7, book_notes)`, so the canonical value would never
-    /// converge to NULL and the mismatch would re-emit BookingModified
-    /// every tick forever. Same guard pattern for legacy_cust_no.
+    /// …but an `Unset` (raw NULL) notes projection against a populated
+    /// canonical value must NOT mismatch: `update_existing` writes notes
+    /// through `COALESCE($7, book_notes)` with a NULL `$7`, so the
+    /// canonical value would never converge to NULL and the mismatch
+    /// would re-emit BookingModified every tick forever. Same guard
+    /// pattern for legacy_cust_no. Distinct from `Cleared` — see
+    /// [`existing_matches_returns_false_when_notes_cleared`] below, the
+    /// case `Unset` deliberately does NOT cover.
     #[test]
     fn existing_matches_guards_none_projection_against_populated_canonical() {
         let mut p = sample_projection();
-        p.notes = None;
+        p.notes = LegacyNotes::Unset;
         p.legacy_cust_no = None;
         let mut ex = make_existing(&p);
         ex.book_notes = Some("kept".into());
@@ -1724,6 +1865,107 @@ mod tests {
             existing_matches(&ex, &p, &[]),
             "None projection vs Some canonical must stay idempotent \
              (COALESCE write semantics can never converge it)"
+        );
+    }
+
+    // ----- book_notes silent-clear fix (ADR 0005 §4 / issue #269) --------
+
+    /// THE BUG this fix closes. Pre-fix, `project_aggregate` collapsed a
+    /// raw legacy empty string onto `None`, and the gate's `book_notes`
+    /// term was `p.notes.is_none() || ...` — a genuine legacy clear was
+    /// therefore indistinguishable from "nothing to check" and
+    /// `existing_matches` returned `true` (idempotent skip): no write,
+    /// no domain event, and — because `book_notes` is not a
+    /// reconcile-hash input (`HASH_INPUTS` above has no `book_notes`
+    /// entry) — no reconcile-log row either. Canonical froze on the
+    /// stale note forever with zero operational signal (ADR 0005 §3b).
+    ///
+    /// Red-capable: reverting `classify_legacy_notes`/the gate term back
+    /// to the old `Option<String>` + `.is_none()` shape makes this
+    /// assertion fail (`existing_matches` would return `true`, so `!` is
+    /// `false`) — verified by hand against the pre-fix code during
+    /// development of this test.
+    #[test]
+    fn existing_matches_returns_false_when_notes_cleared() {
+        let mut p = sample_projection();
+        p.notes = LegacyNotes::Value("late arrival".into());
+        let ex = make_existing(&p); // canonical converged on "late arrival"
+
+        // Legacy now genuinely clears the notes box (raw "", not raw
+        // NULL) — reception selected-all + deleted the text.
+        p.notes = LegacyNotes::Cleared;
+
+        assert!(
+            !existing_matches(&ex, &p, &[]),
+            "a legacy Some->Cleared notes edit MUST force a re-apply — \
+             pre-fix this collapsed to Unset and matched, so canonical \
+             kept the stale note forever with no reconcile signal"
+        );
+    }
+
+    /// Write-converges + no-infinite-loop, in one pure test (this file
+    /// has no DB-backed test harness, so this simulates the write via
+    /// the SAME [`notes_bind`] function `update_existing`/`insert_new`
+    /// actually call — not a duplicated assumption about what the SQL
+    /// does).
+    ///
+    /// Tick 1: legacy clears the note; canonical still holds the old
+    /// value → gate must mismatch (detects, per the test above). Apply
+    /// `notes_bind` the way the UPDATE's `COALESCE($7, book_notes)`
+    /// would (bind `Some("")`, which overwrites). Tick 2: same `Cleared`
+    /// projection again (the watcher re-observes an unchanged row, or a
+    /// retry) — canonical has now caught up, so the gate must report a
+    /// match instead of re-emitting `BookingModified` forever.
+    #[test]
+    fn book_notes_cleared_converges_after_one_apply_no_infinite_loop() {
+        let mut p = sample_projection();
+        p.notes = LegacyNotes::Value("late arrival".into());
+        let mut ex = make_existing(&p);
+
+        p.notes = LegacyNotes::Cleared;
+        assert!(
+            !existing_matches(&ex, &p, &[]),
+            "tick 1 must detect the clear"
+        );
+
+        // Simulate what `update_existing` persists for `$7`.
+        ex.book_notes = notes_bind(&p.notes).map(str::to_string);
+        assert_eq!(
+            ex.book_notes.as_deref(),
+            Some(""),
+            "the write must actually clear canonical (empty string, not \
+             a frozen stale value) — proves the fix HEALS, not just \
+             DETECTS"
+        );
+
+        assert!(
+            existing_matches(&ex, &p, &[]),
+            "tick 2 (same Cleared projection, now-converged canonical) \
+             must match — otherwise the fix trades a permanent silent \
+             freeze for a permanent re-emit loop"
+        );
+    }
+
+    /// Direct unit coverage of the write-bind contract each `LegacyNotes`
+    /// state maps to, independent of the gate — pins the exact values
+    /// `update_existing`/`insert_new` bind for `$7`/`$8` respectively.
+    #[test]
+    fn notes_bind_maps_each_state_to_the_coalesce_contract() {
+        assert_eq!(
+            notes_bind(&LegacyNotes::Unset),
+            None,
+            "Unset must bind NULL so COALESCE preserves the existing value"
+        );
+        assert_eq!(
+            notes_bind(&LegacyNotes::Cleared),
+            Some(""),
+            "Cleared must bind a real (non-NULL) empty string so \
+             COALESCE actually applies the clear"
+        );
+        assert_eq!(
+            notes_bind(&LegacyNotes::Value("late arrival".into())),
+            Some("late arrival"),
+            "Value(x) must bind Some(x), unchanged from pre-fix behaviour"
         );
     }
 
