@@ -71,6 +71,7 @@ use std::time::Duration;
 
 use bb8::PooledConnection;
 use tiberius::error::IoErrorKind;
+use tiberius::Query;
 use tiberius::Row;
 
 use crate::db::PoisonAwareManager;
@@ -349,6 +350,110 @@ pub async fn simple_query_with_timeout_pooled(
     simple_query_with_timeout(conn, sql, kind).await
 }
 
+/// Sibling of [`simple_query_with_timeout`] for the bound-parameter
+/// `tiberius::Query` API (`Query::new(sql)` + `.bind(..)` + `.query(..)`) —
+/// issue #279. `Client::simple_query` has no bind support, so callers that
+/// need parameters (varbinary blobs, business keys re-projected by PK) build
+/// a `Query` instead; until this helper existed those call sites had zero
+/// timeout and zero poisoning, the exact gap #275 closed for the
+/// `simple_query` shape.
+///
+/// `Query` holds its SQL privately with no accessor, so it can't be
+/// recovered from the value after construction for the timeout-error /
+/// log preview. Callers pass `sql` alongside the already-built `query` —
+/// build the `Query` from a borrow (`Query::new(sql_string.as_str())`)
+/// rather than moving the owned `String` into it so both remain available.
+///
+/// Same wire-level reasoning as `simple_query_with_timeout` applies to why
+/// both `query.query(..)` AND `into_first_result()` sit inside the timeout:
+/// a server holding a lock can block either the initial response or a
+/// subsequent row fetch, so the bound must cover the full round-trip.
+pub async fn query_with_timeout(
+    conn: &mut LegacyConn<'_>,
+    sql: &str,
+    query: Query<'_>,
+    kind: MssqlOpKind,
+) -> Result<Vec<Row>, tiberius::error::Error> {
+    let budget = kind.budget();
+    let fut = async {
+        let stream = query.query(&mut **conn).await?;
+        stream.into_first_result().await
+    };
+    match tokio::time::timeout(budget, fut).await {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            // Issue #274 — see the matching comment in
+            // `simple_query_with_timeout` above; same drop-then-poison
+            // shape applies here since `fut` (and its borrow of `conn`)
+            // is fully dropped by the time `tokio::time::timeout` resolves.
+            conn.mark_poisoned();
+            tracing::error!(
+                event_name = EV_TIBERIUS_TIMEOUT,
+                op_kind = kind.as_static_str(),
+                budget_ms = budget.as_millis() as u64,
+                sql_kind = sql.split_whitespace().next().unwrap_or("<empty>"),
+                sql_len = sql.len(),
+                "MSSQL query exceeded per-op timeout — likely legacy row lock held by iHOTEL"
+            );
+            Err(timeout_error(sql, kind, budget))
+        }
+    }
+}
+
+/// Alias re-export mirroring [`simple_query_with_timeout_pooled`] — same
+/// underlying type (`LegacyConn` is just `PooledConnection<'_,
+/// PoisonAwareManager>`), kept distinct for readability at call sites that
+/// hold a bb8 `PooledConnection` straight from `pool.get()`.
+pub async fn query_with_timeout_pooled(
+    conn: &mut PooledConnection<'_, PoisonAwareManager>,
+    sql: &str,
+    query: Query<'_>,
+    kind: MssqlOpKind,
+) -> Result<Vec<Row>, tiberius::error::Error> {
+    query_with_timeout(conn, sql, query, kind).await
+}
+
+/// Same wire-level guarantees as [`query_with_timeout`] but for a
+/// parameterised statement that doesn't need rows back — `Query::execute`
+/// instead of `Query::query`, mirroring how [`simple_query_with_timeout_drop`]
+/// relates to [`simple_query_with_timeout`]. Not implemented by delegating
+/// to `query_with_timeout` and discarding the rows: `execute` and `query`
+/// parse the wire response differently (`ExecuteResult` DONE-token
+/// accounting vs. a `QueryStream` expecting result-set metadata), so
+/// swapping the call shape out from under a writeback recipe would be an
+/// unreviewed behavioural change — not worth it for statements that were
+/// already using `execute`.
+///
+/// Sole caller today is `writeback/recipes/save_image.rs`'s bound
+/// varbinary `pic` INSERT/UPDATE, which runs inside a writeback
+/// `BEGIN TRAN` (`MssqlOpKind::Write`).
+pub async fn query_execute_with_timeout(
+    conn: &mut LegacyConn<'_>,
+    sql: &str,
+    query: Query<'_>,
+    kind: MssqlOpKind,
+) -> Result<(), tiberius::error::Error> {
+    let budget = kind.budget();
+    let fut = async { query.execute(&mut **conn).await };
+    match tokio::time::timeout(budget, fut).await {
+        Ok(result) => result.map(|_| ()),
+        Err(_elapsed) => {
+            // Issue #274 — see the matching comment in
+            // `simple_query_with_timeout` above.
+            conn.mark_poisoned();
+            tracing::error!(
+                event_name = EV_TIBERIUS_TIMEOUT,
+                op_kind = kind.as_static_str(),
+                budget_ms = budget.as_millis() as u64,
+                sql_kind = sql.split_whitespace().next().unwrap_or("<empty>"),
+                sql_len = sql.len(),
+                "MSSQL query exceeded per-op timeout — likely legacy row lock held by iHOTEL"
+            );
+            Err(timeout_error(sql, kind, budget))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Unit tests for the timeout helper. The integration-grade test —
@@ -368,6 +473,20 @@ mod tests {
     //! on `conn` only after the future — and its borrow — has been
     //! dropped) is instead proven against a generic stand-in in
     //! `db::pool::tests::timeout_elapsing_then_marking_poisons_the_connection`.
+    //!
+    //! [`query_with_timeout`] / [`query_with_timeout_pooled`] /
+    //! [`query_execute_with_timeout`] (issue #279) share the identical
+    //! wrapping shape and the same untestable-without-a-live-`Client`
+    //! constraint — they reuse [`timeout_error`] and the same budget /
+    //! `mark_poisoned()` machinery already covered below, so no separate
+    //! tests are added for them; the source-scan pins in
+    //! `scheduler::mod::tests` guard the 13 scheduler Read call sites from
+    //! regressing, and a sibling pin in `writeback::recipes::mod::tests`
+    //! (`save_image_recipe_has_no_raw_mssql_bypass_calls`) covers the 2
+    //! bound-`Query` Write call sites in `writeback/recipes/save_image.rs`
+    //! — the highest-stakes callers, since an unbounded hang there holds a
+    //! legacy row lock under a writeback transaction rather than just a
+    //! read-only scheduler poll.
     use super::*;
     use std::future::pending;
 

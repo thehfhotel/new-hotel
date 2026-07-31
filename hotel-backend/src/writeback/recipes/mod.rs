@@ -202,4 +202,45 @@ mod tests {
             );
         }
     }
+
+    /// Issue #274/#279 sibling, scoped to `save_image.rs`: it is the one
+    /// writeback RECIPE (not a scheduler poll) that reaches legacy MSSQL
+    /// through a bound `tiberius::Query` — its two Write call sites
+    /// (provisional INSERT, existing-row UPDATE) run inside the writeback
+    /// transaction, so an unbounded hang there holds a legacy row lock
+    /// against the live iHOTEL app, not just a read-only scheduler poll.
+    /// Neither `scheduler::mod::tests` (`SCHEDULER_SOURCES` is scoped to
+    /// `scheduler/*.rs`) nor `writeback::dispatcher`'s own `include_str!`
+    /// tests (pin unrelated invariants — ledger-write ordering,
+    /// `intent_facts` exhaustiveness) cover this file, so it gets its own
+    /// pin here rather than joining `SCHEDULER_SOURCES` — this file talks
+    /// to `&mut LegacyConn` directly (no pool), so it can't satisfy that
+    /// array's companion "must import `simple_query_with_timeout_pooled`"
+    /// test, and folding it in would misname a scheduler-scoped constant.
+    ///
+    /// Fails loudly if a future edit reverts either bound-Query site back
+    /// to a raw `Query::new(sql).execute(&mut **conn)` / `.query(&mut`
+    /// call, or reaches for `.simple_query(` directly, bypassing
+    /// `query_execute_with_timeout` / `simple_query_with_timeout`
+    /// (`db::mssql_timeout`). Scanning from here (not from inside
+    /// `save_image.rs` via `include_str!` of itself) sidesteps the
+    /// self-reference trap `scheduler::mod::tests` also avoids: this
+    /// assertion's own needle strings live in `recipes/mod.rs`, a
+    /// different file from the one being scanned, so they can't trip the
+    /// scan on themselves.
+    #[test]
+    fn save_image_recipe_has_no_raw_mssql_bypass_calls() {
+        let src = include_str!("save_image.rs");
+        for needle in [".simple_query(", ".query(&mut", ".execute(&mut"] {
+            assert!(
+                !src.contains(needle),
+                "writeback/recipes/save_image.rs calls `{needle}` directly — \
+                 route it through query_execute_with_timeout / \
+                 simple_query_with_timeout (db::mssql_timeout) so the \
+                 bound-parameter call gets a per-op timeout and poisons the \
+                 connection on timeout instead of hanging unbounded and \
+                 holding a legacy row lock against iHOTEL (issue #279 / #274)"
+            );
+        }
+    }
 }

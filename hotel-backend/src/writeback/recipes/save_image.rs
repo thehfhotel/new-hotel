@@ -29,7 +29,9 @@
 //! **Shipped DARK** behind `GUEST_DOCUMENT_STORAGE_ENABLED` — the emitter (the
 //! `POST /api/guest-documents` route) is gated; this recipe is always compiled.
 
-use crate::db::mssql_timeout::{simple_query_with_timeout, MssqlOpKind};
+use crate::db::mssql_timeout::{
+    query_execute_with_timeout, simple_query_with_timeout, MssqlOpKind,
+};
 use crate::writeback::allocate::LegacyConn;
 use crate::writeback::dispatcher::LegacyIds;
 use crate::writeback::error::{WritebackError, WritebackResult};
@@ -158,9 +160,9 @@ pub async fn execute(
                  pic_date = GETDATE() WHERE id = {existing_id}",
                 cin_q = sql_quote(cin_no),
             );
-            let mut q = tiberius::Query::new(update_sql);
+            let mut q = tiberius::Query::new(update_sql.as_str());
             q.bind(mirror_bytes.as_slice());
-            q.execute(&mut **conn)
+            query_execute_with_timeout(conn, &update_sql, q, MssqlOpKind::Write)
                 .await
                 .map_err(WritebackError::Tiberius)?;
             return Ok(LegacyIds::new());
@@ -171,11 +173,12 @@ pub async fn execute(
 
     // The one place a recipe uses a bound parameter (varbinary pic). tiberius
     // maps `&[u8]` to `ColumnData::Binary` (varbinary), so the blob round-trips
-    // byte-exact. `conn` derefs to the tiberius `Client`.
-    let mut query = tiberius::Query::new(sql);
+    // byte-exact. `query_execute_with_timeout` (issue #279) wraps the wire
+    // call in the same per-op timeout + poison-on-elapse the rest of this
+    // recipe already gets via `simple_query_with_timeout` above.
+    let mut query = tiberius::Query::new(sql.as_str());
     query.bind(mirror_bytes.as_slice());
-    query
-        .execute(&mut **conn)
+    query_execute_with_timeout(conn, &sql, query, MssqlOpKind::Write)
         .await
         .map_err(WritebackError::Tiberius)?;
 

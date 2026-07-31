@@ -32,6 +32,17 @@ mod tests {
     //! tools are operator-invoked with no scheduled exposure (tracked as
     //! remaining in issue #275) and `bin/sync.rs` still has one raw call in
     //! its `--bootstrap --dry-run` preview path for exactly that reason.
+    //!
+    //! Issue #279 (sibling of #275): the same legacy-pool files can also
+    //! reach MSSQL through a different tiberius API shape —
+    //! `tiberius::Query::new(sql)` + optional `.bind(..)` + `.query(&mut
+    //! conn)` — used wherever a statement needs a bound parameter
+    //! (`Client::simple_query` has no bind support). That shape had no
+    //! wrapper at all until `db::mssql_timeout::query_with_timeout_pooled`
+    //! (plus its `&mut LegacyConn` / execute-shape siblings
+    //! `query_with_timeout` / `query_execute_with_timeout`), so it gets the
+    //! same pin below: a direct `.query(&mut` call bypasses the timeout and
+    //! poisoning exactly like a direct `.simple_query(` call does.
 
     /// Every scheduler file that owns a `legacy_pool: &DbPool` connection.
     /// Add new files here as they start touching the legacy pool.
@@ -73,6 +84,32 @@ mod tests {
                 "{name} no longer uses simple_query_with_timeout_pooled — if it \
                  stopped touching the legacy MSSQL pool entirely, remove it from \
                  SCHEDULER_SOURCES instead of leaving a stale entry"
+            );
+        }
+    }
+
+    /// Issue #279 sibling of the pin above: bans a direct `.query(&mut`
+    /// call on a `tiberius::Query` — the bound-parameter API shape
+    /// `Client::simple_query` can't express. Not paired with a "must
+    /// import `query_with_timeout_pooled`" companion test the way
+    /// `scheduler_files_import_the_timeout_wrapper` pairs with the
+    /// `.simple_query(` pin above: unlike the `simple_query` shape, not
+    /// every file in `SCHEDULER_SOURCES` has a bound-parameter statement
+    /// to make (`mirror.rs` and `jobs.rs` currently don't), so requiring
+    /// the import universally would be a false-positive trap rather than
+    /// a real invariant.
+    #[test]
+    fn scheduler_files_contain_no_raw_query_bind_calls() {
+        for (name, src) in SCHEDULER_SOURCES {
+            assert!(
+                !src.contains(".query(&mut"),
+                "{name} calls `.query(&mut` directly on a tiberius::Query — route \
+                 it through `query_with_timeout_pooled` (or the `&mut LegacyConn` \
+                 / execute-shape siblings `query_with_timeout` / \
+                 `query_execute_with_timeout`) in db::mssql_timeout so the \
+                 bound-parameter call gets a per-op timeout and poisons the \
+                 connection on timeout instead of hanging unbounded and desyncing \
+                 the pool (issue #279, sibling of #275 / #274)"
             );
         }
     }

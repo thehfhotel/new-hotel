@@ -181,7 +181,9 @@ use std::time::Instant;
 
 use serde_json::json;
 
-use crate::db::mssql_timeout::{simple_query_with_timeout_pooled, MssqlOpKind};
+use crate::db::mssql_timeout::{
+    query_with_timeout_pooled, simple_query_with_timeout_pooled, MssqlOpKind,
+};
 use crate::db::{DbPool, PgPool};
 use crate::sync::gate_guard::join_hash_segments;
 
@@ -1248,9 +1250,9 @@ pub(crate) async fn resolve_legacy_hash(
         pk = probe.legacy_pk_col,
     );
     let mut conn = legacy_pool.get().await?;
-    let mut q = tiberius::Query::new(sql);
+    let mut q = tiberius::Query::new(sql.as_str());
     q.bind(legacy_pk);
-    let rows = q.query(&mut conn).await?.into_first_result().await?;
+    let rows = query_with_timeout_pooled(&mut conn, &sql, q, MssqlOpKind::Read).await?;
     drop(conn);
     Ok(Some(match rows.first() {
         Some(r) => mirror_row_hash(

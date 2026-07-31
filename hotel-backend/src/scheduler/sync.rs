@@ -69,7 +69,9 @@ use std::time::Instant;
 
 use tiberius::Query;
 
-use crate::db::mssql_timeout::{simple_query_with_timeout_pooled, MssqlOpKind};
+use crate::db::mssql_timeout::{
+    query_with_timeout_pooled, simple_query_with_timeout_pooled, MssqlOpKind,
+};
 use crate::db::{DbPool, PgPool};
 // Issue #204 (bug #2): the durable self-healing arm of the auto-resolve
 // sweep re-drives the EXISTING CT upsert path, so it reaches for the same
@@ -2054,11 +2056,9 @@ async fn read_mssql_ct_current_version(
     legacy_pool: &DbPool,
 ) -> Result<Option<i64>, Box<dyn std::error::Error + Send + Sync>> {
     let mut conn = legacy_pool.get().await?;
-    let rows = Query::new("SELECT CHANGE_TRACKING_CURRENT_VERSION() AS v")
-        .query(&mut conn)
-        .await?
-        .into_first_result()
-        .await?;
+    let sql = "SELECT CHANGE_TRACKING_CURRENT_VERSION() AS v";
+    let rows =
+        query_with_timeout_pooled(&mut conn, sql, Query::new(sql), MssqlOpKind::Read).await?;
     let Some(row) = rows.first() else {
         return Ok(None);
     };
@@ -3429,9 +3429,9 @@ async fn fetch_legacy_customer_hash(
         "SELECT {projection} FROM HT_Customers WHERE Cust_no = @P1",
         projection = CUSTOMERS_RECONCILE_PROJECTION,
     );
-    let mut q = Query::new(sql);
+    let mut q = Query::new(sql.as_str());
     q.bind(cust_no);
-    let rows = q.query(&mut conn).await?.into_first_result().await?;
+    let rows = query_with_timeout_pooled(&mut conn, &sql, q, MssqlOpKind::Read).await?;
     let Some(row) = rows.first() else {
         return Ok(None);
     };
@@ -3469,9 +3469,9 @@ async fn fetch_legacy_booking_hash(
         "SELECT {projection} FROM View_Booking_Ds WHERE Book_No = @P1",
         projection = BOOKINGS_RECONCILE_PROJECTION.join(", "),
     );
-    let mut q = Query::new(sql);
+    let mut q = Query::new(sql.as_str());
     q.bind(book_no);
-    let rows = q.query(&mut conn).await?.into_first_result().await?;
+    let rows = query_with_timeout_pooled(&mut conn, &sql, q, MssqlOpKind::Read).await?;
 
     let mut groups: BTreeMap<(String, String), Vec<BookingDetail>> = BTreeMap::new();
     for row in &rows {
@@ -3527,9 +3527,9 @@ async fn fetch_legacy_room_hash(
         "SELECT {projection} FROM HT_Rooms WHERE Room_no = @P1",
         projection = ROOMS_RECONCILE_PROJECTION.join(", "),
     );
-    let mut q = Query::new(sql);
+    let mut q = Query::new(sql.as_str());
     q.bind(room_no);
-    let rows = q.query(&mut conn).await?.into_first_result().await?;
+    let rows = query_with_timeout_pooled(&mut conn, &sql, q, MssqlOpKind::Read).await?;
     let Some(row) = rows.first() else {
         return Ok(None);
     };
@@ -3569,9 +3569,9 @@ async fn fetch_legacy_payment_hash(
         "SELECT {projection} FROM HT_Receipt_H WHERE Receipt_no = @P1",
         projection = PAYMENTS_RECONCILE_PROJECTION.join(", "),
     );
-    let mut q = Query::new(sql);
+    let mut q = Query::new(sql.as_str());
     q.bind(receipt_no);
-    let rows = q.query(&mut conn).await?.into_first_result().await?;
+    let rows = query_with_timeout_pooled(&mut conn, &sql, q, MssqlOpKind::Read).await?;
     let Some(row) = rows.first() else {
         return Ok(None);
     };
@@ -3606,9 +3606,9 @@ async fn fetch_legacy_registry_folio_hash(
         "SELECT {projection} FROM HT_CheckIn_Other_People WHERE Cin_no = @P1",
         projection = GUEST_REGISTRY_RECONCILE_PROJECTION.join(", "),
     );
-    let mut q = Query::new(sql);
+    let mut q = Query::new(sql.as_str());
     q.bind(cin_no);
-    let rows = q.query(&mut conn).await?.into_first_result().await?;
+    let rows = query_with_timeout_pooled(&mut conn, &sql, q, MssqlOpKind::Read).await?;
     let mut folio = RegistryFolioProjection::empty(cin_no);
     for row in &rows {
         push_legacy_companion(&mut folio, row);
@@ -3804,11 +3804,11 @@ async fn fetch_room_calendar_business_key_legacy_raw(
     let sql = room_calendar_business_key_legacy_sql(floor_text.is_some());
 
     let mut conn = legacy_pool.get().await?;
-    let mut q = Query::new(sql);
+    let mut q = Query::new(sql.as_str());
     if let Some(f) = floor_text.as_deref() {
         q.bind(f);
     }
-    let rows = q.query(&mut conn).await?.into_first_result().await?;
+    let rows = query_with_timeout_pooled(&mut conn, &sql, q, MssqlOpKind::Read).await?;
     drop(conn);
 
     // An aggregate SELECT always returns exactly one row; treat a missing
@@ -4228,9 +4228,9 @@ async fn fetch_legacy_customer_base_row(
         "SELECT {projection} FROM HT_Customers WHERE Cust_no = @P1",
         projection = crate::sync::mappers::customer::EAGER_FETCH_COLUMNS.join(", "),
     );
-    let mut q = Query::new(sql);
+    let mut q = Query::new(sql.as_str());
     q.bind(cust_no);
-    let rows = q.query(&mut conn).await?.into_first_result().await?;
+    let rows = query_with_timeout_pooled(&mut conn, &sql, q, MssqlOpKind::Read).await?;
     Ok(rows.into_iter().next())
 }
 
@@ -4250,9 +4250,9 @@ async fn fetch_legacy_room_base_row(
                Room_Group, Room_Power_OPEN, Room_Power_CLOSE, Room_Power_STATUS, \
                Room_Polity FROM HT_Rooms WHERE Room_no = @P1"
         .to_string();
-    let mut q = Query::new(sql);
+    let mut q = Query::new(sql.as_str());
     q.bind(room_no);
-    let rows = q.query(&mut conn).await?.into_first_result().await?;
+    let rows = query_with_timeout_pooled(&mut conn, &sql, q, MssqlOpKind::Read).await?;
     Ok(rows.into_iter().next())
 }
 
