@@ -3,7 +3,20 @@
 Fix commit: branch `phase3-mark-dirty` (own `build_statements` writing
 `Room_Clean='yes'`; polarity evidence findings.md §3e/§3i + live all-58-rooms
 read). Ship ONLY with this window. Rollback = one revert; blast radius = one
-room's clean flag + one `HT_Housewife` audit row.
+room's clean flag (no `HT_Housewife` row — removed post-#276, see note below).
+
+> **Update 2026-07-31 (post-#276, `ccf88c3`).** The verification run recorded
+> below (`docs/coexistence/sync-incident-log.md`, 2026-07-29 entry) was
+> executed against the OLD writeback build, which still emitted an
+> `HT_Housewife` audit row alongside the `Room_Clean` flip — that run
+> legitimately observed exactly one new row and its PASS result stands; this
+> note does not rewrite that history. #276 then established that iHOTEL
+> itself never writes `HT_Housewife` on a bare dirty flip (findings.md
+> §3e/§3i; a live scan of all ~31,922 rows found no dirty-flip note pattern),
+> so `mark_dirty` was changed to stop writing that row at all. Step 6 and the
+> blast-radius note below have been rewritten to reflect the CURRENT expected
+> behaviour for any future re-run of this runsheet. `mark_clean` is
+> unchanged and still writes its own `HT_Housewife` row.
 
 ## Pre-flight (before the window; no reception time needed)
 
@@ -41,10 +54,18 @@ room's clean flag + one `HT_Housewife` audit row.
 5. Reception refreshes / reopens the iHOTEL room grid: room `<R>` must read as
    NEEDS-CLEANING. Have reception say it in their own words — don't infer from
    colour.
-6. Audit-row sanity (read-only):
-   `SELECT TOP 3 h_date, h_name, h_room, h_note, h_cin FROM HT_Housewife WHERE
-   h_room=<R> ORDER BY h_date DESC` — expect exactly ONE new row, `h_name` =
-   the operator who clicked.
+6. Audit-row ABSENCE check (read-only) — as of #276/`ccf88c3`, `mark_dirty`
+   no longer writes `HT_Housewife` at all (iHOTEL itself never does on a bare
+   dirty flip — findings.md §3e/§3i):
+   ```
+   SELECT TOP 3 h_date, h_name, h_room, h_note, h_cin FROM HT_Housewife
+   WHERE h_room='<R>' ORDER BY h_date DESC;
+   ```
+   (`h_room` is varchar, e.g. `'A2-3'` — quote the literal or sqlcmd throws
+   an int-conversion error.) **PASS** = no row with `h_date` newer than the
+   step-1 timestamp. If a fresh row DID appear, the deployed backend is still
+   running a pre-#276 build — treat that as a deploy-verification FAIL, not a
+   writeback bug, and check the container image tag before going further.
 
 ## T+6 .. T+10 — THE ECHO TEST (the whole point of the window)
 
@@ -78,10 +99,11 @@ room's clean flag + one `HT_Housewife` audit row.
   flag, no `.sqlx` change, no data backfill.
 - Restore the test room by clicking mark-clean in iHOTEL's own housekeeping
   flow — never by a direct UPDATE on the shared legacy DB.
-- Blast radius: the `Room_Clean` varchar on ONE `HT_Rooms` row, plus one
-  `HT_Housewife` audit row. No money, occupancy, booking or check-in data is
-  touched. `Room_Use` / `Room_Use_Count` / `Room_Clean_Time` are provably
-  untouched (unit test `statement_one_touches_only_the_clean_flag`).
+- Blast radius: strictly the `Room_Clean` varchar on ONE `HT_Rooms` row — no
+  `HT_Housewife` row is written (removed post-#276/`ccf88c3`; see the update
+  note at the top of this file). No money, occupancy, booking or check-in
+  data is touched. `Room_Use` / `Room_Use_Count` / `Room_Clean_Time` are
+  provably untouched (unit test `statement_one_touches_only_the_clean_flag`).
 - Worst case if the fix were wrong and left in: one room reads needs-cleaning
   in iHOTEL while actually clean → a housekeeper re-cleans a clean room.
 
@@ -90,9 +112,22 @@ room's clean flag + one `HT_Housewife` audit row.
 Step 5 (iHOTEL's board) is only observable on reception's screen, and steps
 1/11 mutate a room in their live shift loop.
 
-## Known follow-up (not a gate)
+## Known follow-up — RESOLVED (#276, `ccf88c3`, 2026-07-31)
 
-Our mark-dirty `HT_Housewife` row has `h_note=''`, which is also iHOTEL's
-start-cleaning note value, so `FrmReportHousewife` will count it as a cleaning
-by that operator. Fixing it means minting a Thai discriminator literal that
-appears in no capture — needs its own evidence pass.
+Was: our mark-dirty `HT_Housewife` row had `h_note=''`, which is also
+iHOTEL's start-cleaning note value, so `FrmReportHousewife` would count it as
+a cleaning by that operator. Fixing it looked like it needed a Thai
+discriminator literal that appears in no capture.
+
+Resolution — re-scoped, not patched: a live scan of all ~31,922
+`HT_Housewife` rows found only two non-empty `h_note` patterns
+(`ปิดโดยโปรแกรม` system auto-close, `เปลี่ยนสถานะเป็นซ่อม :` send-to-maintenance),
+neither for dirtying, and both housewife-writing handlers in the decompile
+(`ClickClean`, `ClickCleanOK`) are clean-side. findings.md §3e (check-out)
+and §3i (cancel-check-in) both set `Room_Clean='yes'` with zero
+`HT_Housewife` touches. So iHOTEL itself never writes `HT_Housewife` on a
+dirty flip — our audit row had no legacy analog and was inventing a record
+`FrmReportHousewife` then miscounted. `mark_dirty` now emits only the
+`Room_Clean='yes'` UPDATE (see Step 6 above for the current, absence-based
+verification). `mark_clean` is unchanged and still writes its own
+`HT_Housewife` row.

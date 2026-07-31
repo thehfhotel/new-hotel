@@ -67,6 +67,20 @@ carry `h_note=''`, so an empty note does not discriminate even within
 iHOTEL's own data; any fix needs a discriminator that appears in no existing
 capture. Being filed as its own issue.
 
+> **Resolved 2026-07-31 (#276, `ccf88c3`).** Not fixed by a discriminator
+> note — re-scoped instead. A live scan of all ~31,922 `HT_Housewife` rows
+> found no dirty-flip note pattern at all (only `ปิดโดยโปรแกรม` system
+> auto-close and `เปลี่ยนสถานะเป็นซ่อม :` send-to-maintenance are non-empty),
+> and both housewife-writing decompile handlers (`ClickClean`,
+> `ClickCleanOK`) are clean-side; findings.md §3e/§3i show check-out /
+> cancel-check-in raise `Room_Clean='yes'` with zero `HT_Housewife` touches.
+> iHOTEL itself never writes `HT_Housewife` on a dirty flip, so this audit
+> row had no legacy analog — `mark_dirty` now writes no `HT_Housewife` row at
+> all. `mark_clean` is unchanged. The room-302 row described above (minted
+> under the pre-#276 build) is historical and stands as recorded; a repeat of
+> this runsheet today would see no such row — see
+> `docs/coexistence/phase3-mark-dirty-runsheet.md` Step 6.
+
 ## 2026-07-29 — /v2 slow tabs + 500s + SSE 524: PG pool exhausted by per-tab LISTEN connections
 
 **Symptom.** Long loads switching /v2 tabs; console 500s on

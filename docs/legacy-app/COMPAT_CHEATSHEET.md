@@ -879,13 +879,20 @@ either never reads them, or reads them only from one DEAD form):
 
 ### Table: `HT_Housewife` (A)
 
-- **Purpose**: Housekeeping log — every clean / dirty / repair action.
+- **Purpose**: Housekeeping log — every clean / repair action. **NOT** a bare
+  dirty flip (corrected 2026-07-31, #276/`ccf88c3`): findings.md §3e
+  (check-out) and §3i (cancel-check-in) both raise `Room_Clean='yes'` with
+  zero `HT_Housewife` touches, and the only two housewife-writing decompile
+  handlers, `ClickClean`/`ClickCleanOK` (§3.13/§3.14 below), are clean-side.
+  A live scan of all ~31,922 rows found only two non-empty `h_note` patterns
+  (system auto-close, send-to-maintenance) — neither for dirtying.
 - **PK**: `id int IDENTITY`. INSERTs omit [id].
 - **Schema**: `id, h_name varchar(150), h_room varchar(50), h_date datetime, h_note text,
   h_cin varchar(50), h_cin_name varchar(250)`.
 - **Operations** (ClickClean.cs:511 etc.):
-  - INSERT on every clean/dirty/repair action. h_cin = the most recent checkout's Cin_no
-    in that room (lookup `View_CheckIn_Ds where Cin_room_status='Check-Out' and cin_room_no=...
+  - INSERT on every clean/repair action (not on a standalone dirty flip — see
+    Purpose above). h_cin = the most recent checkout's Cin_no in that room
+    (lookup `View_CheckIn_Ds where Cin_room_status='Check-Out' and cin_room_no=...
     order by cin_room_out desc`).
   - h_note distinguishes: plain note (start cleaning), `'เปลี่ยนสถานะเป็นซ่อม : <note>'`
     (sent to repair), or end-cleaning note.
@@ -1601,7 +1608,9 @@ The DB has **zero triggers**. The new app must replicate the following "in-app t
 - Update `HT_Products.Pro_Amt -= num` (insert) / `+= num` (delete/refund).
 
 ### 6.4 On every state change of HT_Rooms (clean/dirty/repair/check-in/out)
-- `HT_Housewife` log row inserted (for clean/dirty/repair).
+- `HT_Housewife` log row inserted for clean/repair — **not** for a standalone
+  dirty flip (settled 2026-07-31, #276/`ccf88c3`; see the `HT_Housewife`
+  table note above).
 - `HT_POWER_LOG` row started/closed if power state changes.
 - `HT_Rooms_Repair` row inserted (for repair).
 - `HT_Rooms_Cancel` row inserted on room-cancel (Module1.SaveCancel).
