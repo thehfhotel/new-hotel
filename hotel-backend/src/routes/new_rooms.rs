@@ -28,7 +28,7 @@ use crate::repository::room::{RoomRow, RoomWrite};
 use crate::service::ids::{aggregate_uuid, AggregateKind};
 
 /// Room from HT_Rooms_New table
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NewRoom {
     pub id: i32,
@@ -97,6 +97,32 @@ pub struct NewRoomsQuery {
 fn default_page() -> i32 { 1 }
 fn default_limit() -> i32 { 50 }
 
+impl NewRoomsQuery {
+    /// Requested page, clamped to the first page.
+    ///
+    /// Both list paths MUST use this. `?page=0` used to mean `OFFSET -50` (a
+    /// hard PG error) on the SQL path while the derived path silently served
+    /// page 1 — and the response echoed the raw `"page": 0` alongside page-1
+    /// data either way. `list_rooms` reports THIS value.
+    pub fn clamped_page(&self) -> i32 {
+        self.page.max(1)
+    }
+
+    /// Requested page size, clamped to non-negative. A negative `?limit=` was
+    /// `LIMIT -20` (a PG error) on the SQL path and an empty page on the
+    /// derived path; both now return an empty page. `0` is left as `0` on
+    /// purpose — `LIMIT 0` and `take(0)` already agree.
+    pub fn clamped_limit(&self) -> i32 {
+        self.limit.max(0)
+    }
+
+    /// Row offset for the requested page, computed in `i64` so a large
+    /// `page`x`limit` saturates instead of overflowing the `i32` multiply.
+    pub fn clamped_offset(&self) -> i64 {
+        (self.clamped_page() as i64 - 1).saturating_mul(self.clamped_limit() as i64)
+    }
+}
+
 /// Response for rooms list
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -140,15 +166,23 @@ pub struct MutationResponse {
     pub id: Option<i32>,
 }
 
-/// Live occupancy/booking/checkout flags per `room_id`, derived from active
-/// check-ins + bookings the SAME way the legacy `/api/rooms/board`
-/// (`routes/rooms.rs`) does. The stored `ht_rooms_new.room_status` column is NOT
-/// kept in sync with check-in/out, so reading it produced statuses that didn't
-/// match iHOTEL or the classic grid (2026-06-27 fix). Tuple = (occupied,
-/// booked, checkout_due).
-async fn live_room_flags(pool: &crate::db::PgPool) -> ApiResult<HashMap<i32, (bool, bool, bool)>> {
-    let rows = sqlx::query(
-        "SELECT r.room_id, \
+/// Flags scan feeding [`live_room_flags`].
+///
+/// Deliberately has NO `room_active` predicate: it must cover EVERY room
+/// `repository::room`'s list queries can return, and neither `ROOM_SELECT_SQL`
+/// nor `non_status_conditions` filters on `room_active`. It used to end
+/// `WHERE r.room_active`, so an inactive room (or one with a NULL flag — the
+/// column is `BOOLEAN DEFAULT true` with no NOT NULL) was listed but absent
+/// from the map, defaulted to `(false, false, false)` and derived to
+/// `available` — harmless while the derived status was display-only, but a
+/// real mislabel now that `?status=available` filters on it.
+///
+/// The symmetric alternative — adding `COALESCE(r.room_active, true)` to the
+/// LIST queries (the `hk.rs`/`inventory.rs` idiom) — was rejected: that would
+/// DROP rooms from the unfiltered path, which three live callers consume
+/// (`app/page.tsx`, `app/housekeeping/page.tsx`). Widening the flags scan
+/// cannot change the returned row set, only make a row's flags truthful.
+const LIVE_ROOM_FLAGS_SQL: &str = "SELECT r.room_id, \
             EXISTS(SELECT 1 FROM ht_checkins c \
                     WHERE c.cin_status='active' AND c.cin_checkout_time IS NULL \
                       AND (c.cin_room_id=r.room_id OR EXISTS( \
@@ -166,11 +200,19 @@ async fn live_room_flags(pool: &crate::db::PgPool) -> ApiResult<HashMap<i32, (bo
                       AND (c.cin_room_id=r.room_id OR EXISTS( \
                           SELECT 1 FROM ht_checkin_rooms cr \
                            WHERE cr.cr_cin_id=c.cin_id AND cr.cr_room_id=r.room_id))) AS checkout_due \
-           FROM ht_rooms_new r WHERE r.room_active",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| ApiError::Internal(format!("failed to derive live room status: {e}")))?;
+           FROM ht_rooms_new r";
+
+/// Live occupancy/booking/checkout flags per `room_id`, derived from active
+/// check-ins + bookings the SAME way the legacy `/api/rooms/board`
+/// (`routes/rooms.rs`) does. The stored `ht_rooms_new.room_status` column is NOT
+/// kept in sync with check-in/out, so reading it produced statuses that didn't
+/// match iHOTEL or the classic grid (2026-06-27 fix). Tuple = (occupied,
+/// booked, checkout_due).
+async fn live_room_flags(pool: &crate::db::PgPool) -> ApiResult<HashMap<i32, (bool, bool, bool)>> {
+    let rows = sqlx::query(LIVE_ROOM_FLAGS_SQL)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to derive live room status: {e}")))?;
 
     let mut map = HashMap::with_capacity(rows.len());
     for row in &rows {
@@ -189,43 +231,122 @@ async fn live_room_flags(pool: &crate::db::PgPool) -> ApiResult<HashMap<i32, (bo
     Ok(map)
 }
 
+/// Overlay the live derived status onto rows already mapped to [`NewRoom`].
+///
+/// iHOTEL/classic precedence, load-bearing:
+/// `checkout_pending > maintenance > occupied > booked > available`.
+/// `is_clean` / `is_maintenance` stay as independent flags.
+///
+/// Housekeeping cleanliness is deliberately NOT a derived-status tier:
+/// iHOTEL doesn't gate check-in on the housekeeping clean flag, so neither do
+/// we (`components/v2/RoomActionSheet.tsx`). A vacant room is `available`
+/// whether or not a maid is in it; the frontend renders "รอทำความสะอาด" from
+/// the separate `is_clean` flag.
+fn overlay_live_status(rooms: &mut [NewRoom], live: &HashMap<i32, (bool, bool, bool)>) {
+    for nr in rooms.iter_mut() {
+        // `from_row` set status from the stored column; capture the
+        // maintenance flag it carried so the v2 maintenance toggle (which
+        // PATCHes room_status) keeps working alongside the synced
+        // `room_maintenance` column (which the classic grid uses).
+        let stored_maintenance = nr.status == "maintenance";
+        let (occupied, booked, checkout_due) =
+            live.get(&nr.id).copied().unwrap_or((false, false, false));
+        nr.status = if checkout_due {
+            "checkout_pending"
+        } else if nr.is_maintenance || stored_maintenance {
+            "maintenance"
+        } else if occupied {
+            "occupied"
+        } else if booked {
+            "booked"
+        } else {
+            "available"
+        }
+        .to_string();
+    }
+}
+
+/// True when the request selects or orders by `status` and therefore cannot be
+/// served by the SQL pagination path.
+///
+/// The stored `ht_rooms_new.room_status` column is a bypassed denormalization
+/// (issue #200): filtering on it selects the WRONG SET of rooms and then
+/// [`overlay_live_status`] relabels them with the RIGHT status — so a room
+/// stored `occupied` with no active check-in was silently missing from
+/// `GET /api/rooms?status=available`, i.e. from the room-change picker
+/// (`components/ChangeRoomModal.tsx`). Such requests take the derived path:
+/// scan (unpaginated, unfiltered-by-status) → overlay → filter/sort/paginate
+/// in memory.
+fn needs_derived_status_pass(params: &NewRoomsQuery) -> bool {
+    params.status.is_some() || params.sort_by.as_deref() == Some("status")
+}
+
+/// Filter / sort / paginate rooms on their already-overlaid DERIVED status.
+/// Returns `(page_of_rooms, total_matching)` — the total counts the FILTERED
+/// set, not the scanned set, so `Pagination` stays truthful.
+fn filter_sort_paginate(mut rooms: Vec<NewRoom>, params: &NewRoomsQuery) -> (Vec<NewRoom>, i32) {
+    if let Some(wanted) = params.status.as_deref() {
+        let wanted = wanted.trim();
+        // Case-insensitive: the derived literals are ASCII lowercase and
+        // `PATCH /rooms/:id/status` lowercases its input, so a mixed-case
+        // query silently returning an empty picker would be a repeat of the
+        // very bug this path fixes.
+        rooms.retain(|r| r.status.eq_ignore_ascii_case(wanted));
+    }
+
+    if params.sort_by.as_deref() == Some("status") {
+        let desc = params
+            .sort_order
+            .as_ref()
+            .map(|s| s.to_lowercase() == "desc")
+            .unwrap_or(false);
+        // Tie-break on room_no ASC so the page is deterministic (the SQL sort
+        // on the stored column had no tie-break at all).
+        rooms.sort_by(|a, b| {
+            let primary = if desc {
+                b.status.cmp(&a.status)
+            } else {
+                a.status.cmp(&b.status)
+            };
+            primary.then_with(|| a.room_no.cmp(&b.room_no))
+        });
+    }
+
+    let total = rooms.len() as i32;
+    // Same clamp as the SQL path (`repository::room::list_with_count_sql`) and
+    // as the `Pagination` the response reports — see `NewRoomsQuery`.
+    let limit = params.clamped_limit();
+    let offset = params.clamped_offset() as usize;
+
+    let page_rooms = rooms.into_iter().skip(offset).take(limit as usize).collect();
+    (page_rooms, total)
+}
+
 /// List one pool's rooms with the LIVE display status overlaid (matching iHOTEL
 /// and the classic grid) instead of the stale stored `room_status` column.
+///
+/// Two paths, deliberately:
+/// * no `status` filter/sort → unchanged SQL pagination + overlay (the three
+///   unfiltered callers: dashboard, housekeeping, v2 grid);
+/// * `status` filter and/or `sortBy=status` → derived path (see
+///   [`needs_derived_status_pass`]). `total` is the filtered count in both.
 async fn list_rooms_live(
     repo: &dyn crate::repository::room::RoomRepository,
     pool: &crate::db::PgPool,
     params: &NewRoomsQuery,
 ) -> ApiResult<(Vec<NewRoom>, i32)> {
+    if needs_derived_status_pass(params) {
+        let rows = repo.list_for_derived_status(pool, params).await?;
+        let live = live_room_flags(pool).await?;
+        let mut rooms: Vec<NewRoom> = rows.into_iter().map(NewRoom::from_row).collect();
+        overlay_live_status(&mut rooms, &live);
+        return Ok(filter_sort_paginate(rooms, params));
+    }
+
     let (rows, total) = repo.list_with_count(pool, params).await?;
     let live = live_room_flags(pool).await?;
-    let rooms = rows
-        .into_iter()
-        .map(|row| {
-            let mut nr = NewRoom::from_row(row);
-            // `from_row` set status from the stored column; capture the
-            // maintenance flag it carried so the v2 maintenance toggle (which
-            // PATCHes room_status) keeps working alongside the synced
-            // `room_maintenance` column (which the classic grid uses).
-            let stored_maintenance = nr.status == "maintenance";
-            let (occupied, booked, checkout_due) =
-                live.get(&nr.id).copied().unwrap_or((false, false, false));
-            // iHOTEL/classic precedence: checkout > maintenance > occupied >
-            // booked > available. `is_clean` / `is_maintenance` stay as flags.
-            nr.status = if checkout_due {
-                "checkout_pending"
-            } else if nr.is_maintenance || stored_maintenance {
-                "maintenance"
-            } else if occupied {
-                "occupied"
-            } else if booked {
-                "booked"
-            } else {
-                "available"
-            }
-            .to_string();
-            nr
-        })
-        .collect();
+    let mut rooms: Vec<NewRoom> = rows.into_iter().map(NewRoom::from_row).collect();
+    overlay_live_status(&mut rooms, &live);
     Ok((rooms, total))
 }
 
@@ -237,6 +358,12 @@ pub async fn list_rooms(
     // Branch-aware: HF Hotel reads new_pool, HF Ville reads ville_pool
     // (hotelville's canonical ht_rooms_new is populated), All unions both —
     // mirroring routes/rooms.rs::list_rooms. Status is derived live per pool.
+    //
+    // `All` composes per-pool pages: each pool independently returns ITS page
+    // `params.page` and ITS own total, concatenated / summed. That shape is
+    // unchanged by the derived-status path — the only difference is that each
+    // pool's total now counts its FILTERED rooms, so the summed total still
+    // equals the number of rooms the union would yield across all pages.
     let repo = state.rooms.as_ref();
     let (rooms, total) = match params.branch.unwrap_or_default() {
         Branch::Hfhotel => list_rooms_live(repo, &state.new_pool, &params).await?,
@@ -255,7 +382,9 @@ pub async fn list_rooms(
     Ok(Json(NewRoomsResponse {
         success: true,
         data: rooms,
-        pagination: Pagination::new(params.page, params.limit, total),
+        // Report the CLAMPED page/limit — the raw values would claim
+        // `"page": 0` next to page-1 data on the derived path.
+        pagination: Pagination::new(params.clamped_page(), params.clamped_limit(), total),
     }))
 }
 
@@ -789,4 +918,333 @@ pub async fn update_room_status(
         message: format!("Room status updated to '{}'", status),
         id: Some(room_id),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A room as the repository would hand it over: `stored_status` is the
+    /// (drift-prone) `ht_rooms_new.room_status` column.
+    fn room(id: i32, room_no: &str, stored_status: &str) -> NewRoom {
+        NewRoom {
+            id,
+            room_no: room_no.to_string(),
+            room_type_id: None,
+            room_type_name: None,
+            floor: None,
+            status: stored_status.to_string(),
+            is_clean: true,
+            is_maintenance: false,
+            price_weekday: None,
+            price_weekend: None,
+            price_special: None,
+            notes: None,
+            room_x: None,
+            room_y: None,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    fn query(status: Option<&str>) -> NewRoomsQuery {
+        NewRoomsQuery {
+            status: status.map(|s| s.to_string()),
+            room_type_id: None,
+            floor: None,
+            page: default_page(),
+            limit: default_limit(),
+            sort_by: None,
+            sort_order: None,
+            branch: None,
+        }
+    }
+
+    /// Derived-status overlay: the live flags win over the stored column.
+    fn overlaid(rooms: &mut [NewRoom], live: &[(i32, (bool, bool, bool))]) {
+        let map: HashMap<i32, (bool, bool, bool)> = live.iter().copied().collect();
+        overlay_live_status(rooms, &map);
+    }
+
+    /// Issue #200, the user-facing half: HF Ville rooms stored `occupied` with
+    /// no active check-in were silently missing from the room-change picker
+    /// (`/api/rooms?status=available`). They must now come back.
+    #[test]
+    fn stale_occupied_room_with_no_checkin_is_returned_as_available() {
+        let mut rooms = vec![room(1, "109", "occupied"), room(2, "112", "occupied")];
+        // No live flags at all → nobody is actually checked in.
+        overlaid(&mut rooms, &[]);
+
+        let (page, total) = filter_sort_paginate(rooms, &query(Some("available")));
+
+        assert_eq!(total, 2, "both stale-occupied rooms are really available");
+        let nos: Vec<&str> = page.iter().map(|r| r.room_no.as_str()).collect();
+        assert_eq!(nos, vec!["109", "112"]);
+        assert!(page.iter().all(|r| r.status == "available"));
+    }
+
+    /// The other half of the same drift: a room stored `available` that IS
+    /// occupied must never be offered as a move-to target.
+    #[test]
+    fn stale_available_room_with_active_checkin_is_not_returned() {
+        let mut rooms = vec![room(3, "201", "available"), room(4, "203", "available")];
+        // Room 201 has an active check-in; 203 does not.
+        overlaid(&mut rooms, &[(3, (true, false, false))]);
+
+        let (page, total) = filter_sort_paginate(rooms, &query(Some("available")));
+
+        assert_eq!(total, 1);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].room_no, "203");
+    }
+
+    /// Requests with no `status` filter/sort keep the SQL pagination path —
+    /// the three unfiltered callers (dashboard, housekeeping, v2 grid) must
+    /// not change shape.
+    #[test]
+    fn unfiltered_requests_do_not_take_the_derived_path() {
+        assert!(!needs_derived_status_pass(&query(None)));
+
+        let mut q = query(None);
+        q.room_type_id = Some(3);
+        q.floor = Some(2);
+        q.sort_by = Some("roomNo".to_string());
+        assert!(
+            !needs_derived_status_pass(&q),
+            "non-status filters/sorts stay in SQL"
+        );
+
+        assert!(needs_derived_status_pass(&query(Some("available"))));
+        let mut sorted = query(None);
+        sorted.sort_by = Some("status".to_string());
+        assert!(needs_derived_status_pass(&sorted));
+    }
+
+    /// The unfiltered overlay itself is unchanged: every scanned room is
+    /// returned, relabelled, in the SQL order.
+    #[test]
+    fn overlay_relabels_without_dropping_rooms() {
+        let mut rooms = vec![
+            room(1, "101", "available"),
+            room(2, "102", "occupied"),
+            room(3, "103", "available"),
+        ];
+        overlaid(
+            &mut rooms,
+            &[(1, (true, false, false)), (3, (false, true, false))],
+        );
+
+        let statuses: Vec<&str> = rooms.iter().map(|r| r.status.as_str()).collect();
+        assert_eq!(statuses, vec!["occupied", "available", "booked"]);
+    }
+
+    /// `total` counts the FILTERED set, not the scanned set, and not the page.
+    #[test]
+    fn reported_total_matches_filtered_count_not_page_size() {
+        let mut rooms: Vec<NewRoom> = (1..=10)
+            .map(|i| room(i, &format!("1{:02}", i), "occupied"))
+            .collect();
+        // Rooms 1..=4 are genuinely occupied; 5..=10 are free.
+        let live: Vec<(i32, (bool, bool, bool))> =
+            (1..=4).map(|i| (i, (true, false, false))).collect();
+        overlaid(&mut rooms, &live);
+
+        let mut q = query(Some("available"));
+        q.limit = 2;
+        q.page = 1;
+        let (page, total) = filter_sort_paginate(rooms.clone(), &q);
+        assert_eq!(total, 6, "6 rooms are derived-available");
+        assert_eq!(page.len(), 2, "page is capped by limit");
+        assert_eq!(page[0].room_no, "105");
+
+        // Page 3 of 6 rooms at limit 2 → the last two.
+        q.page = 3;
+        let (page3, total3) = filter_sort_paginate(rooms, &q);
+        assert_eq!(total3, 6);
+        let nos: Vec<&str> = page3.iter().map(|r| r.room_no.as_str()).collect();
+        assert_eq!(nos, vec!["109", "110"]);
+    }
+
+    /// `Branch::All` concatenates per-pool pages and SUMS per-pool totals; the
+    /// filtered totals must still add up to the union's filtered size.
+    #[test]
+    fn branch_all_sums_filtered_totals_per_pool() {
+        let mut hotel = vec![room(1, "101", "occupied"), room(2, "102", "available")];
+        overlaid(&mut hotel, &[(2, (true, false, false))]);
+        let mut ville = vec![room(1, "201", "occupied"), room(2, "203", "occupied")];
+        overlaid(&mut ville, &[]);
+
+        let q = query(Some("available"));
+        let (mut page, mut total) = filter_sort_paginate(hotel, &q);
+        let (vpage, vtotal) = filter_sort_paginate(ville, &q);
+        page.extend(vpage);
+        total += vtotal;
+
+        assert_eq!(total, 3, "1 at HF Hotel + 2 at HF Ville");
+        assert_eq!(page.len() as i32, total, "one page holds all of them");
+    }
+
+    /// Precedence is pinned: checkout_pending > maintenance > occupied >
+    /// booked > available (iHOTEL/classic grid order).
+    #[test]
+    fn derived_status_precedence_is_unchanged() {
+        let mut rooms = vec![
+            room(1, "101", "available"),
+            room(2, "102", "maintenance"),
+            room(3, "103", "available"),
+            room(4, "104", "available"),
+            room(5, "105", "occupied"),
+        ];
+        rooms[2].is_maintenance = true;
+        overlaid(
+            &mut rooms,
+            &[
+                // checkout_due beats everything, including the stored flag.
+                (1, (true, true, true)),
+                (2, (true, true, false)),
+                (3, (true, true, false)),
+                (4, (false, true, false)),
+            ],
+        );
+
+        let statuses: Vec<&str> = rooms.iter().map(|r| r.status.as_str()).collect();
+        assert_eq!(
+            statuses,
+            vec![
+                "checkout_pending",
+                "maintenance",
+                "maintenance",
+                "booked",
+                "available"
+            ]
+        );
+    }
+
+    /// `sortBy=status` orders on the DERIVED value (the stored column is not
+    /// what the client sees), with room_no as a deterministic tie-break.
+    #[test]
+    fn status_sort_orders_on_derived_value() {
+        let mut rooms = vec![
+            room(1, "101", "available"),
+            room(2, "102", "occupied"),
+            room(3, "103", "available"),
+        ];
+        // 101 is really occupied, 102 is really free, 103 is booked.
+        overlaid(
+            &mut rooms,
+            &[(1, (true, false, false)), (3, (false, true, false))],
+        );
+
+        let mut q = query(None);
+        q.sort_by = Some("status".to_string());
+        let (asc, total) = filter_sort_paginate(rooms.clone(), &q);
+        assert_eq!(total, 3);
+        let nos: Vec<&str> = asc.iter().map(|r| r.room_no.as_str()).collect();
+        // available(102) < booked(103) < occupied(101)
+        assert_eq!(nos, vec!["102", "103", "101"]);
+
+        q.sort_order = Some("desc".to_string());
+        let (desc, _) = filter_sort_paginate(rooms, &q);
+        let nos: Vec<&str> = desc.iter().map(|r| r.room_no.as_str()).collect();
+        assert_eq!(nos, vec!["101", "103", "102"]);
+    }
+
+    /// A mixed-case / padded `?status=` must not silently empty the picker.
+    #[test]
+    fn status_filter_is_case_insensitive_and_trimmed() {
+        let mut rooms = vec![room(1, "101", "occupied")];
+        overlaid(&mut rooms, &[]);
+        let (page, total) = filter_sort_paginate(rooms, &query(Some(" Available ")));
+        assert_eq!(total, 1);
+        assert_eq!(page.len(), 1);
+    }
+
+    /// A vacant room stored `cleaning` is genuinely free and MUST still be
+    /// offered as a move-to target: iHOTEL doesn't gate check-in on the
+    /// housekeeping clean flag, so neither do we (the principle recorded at
+    /// `components/v2/RoomActionSheet.tsx`). Housekeeping progress rides the
+    /// separate `is_clean` flag, never the derived status.
+    #[test]
+    fn room_stored_cleaning_is_still_derived_available() {
+        let mut rooms = vec![room(1, "101", "cleaning"), room(2, "102", "available")];
+        rooms[0].is_clean = false; // housekeeper is in there, room still dirty
+        overlaid(&mut rooms, &[]);
+
+        assert_eq!(rooms[0].status, "available", "stored literal is not a tier");
+        assert!(!rooms[0].is_clean, "cleanliness stays an independent flag");
+
+        let (page, total) = filter_sort_paginate(rooms.clone(), &query(Some("available")));
+        assert_eq!(total, 2, "both vacant rooms are pickable");
+        let nos: Vec<&str> = page.iter().map(|r| r.room_no.as_str()).collect();
+        assert_eq!(nos, vec!["101", "102"]);
+
+        // ...and `cleaning` is never emitted, so it matches nothing.
+        let (page, total) = filter_sort_paginate(rooms, &query(Some("cleaning")));
+        assert_eq!(total, 0);
+        assert!(page.is_empty());
+    }
+
+    /// Review finding 2: the flags scan must cover EVERY room the list queries
+    /// return. It used to end `WHERE r.room_active`, so an inactive room (or one
+    /// with a NULL flag) was listed, missed the map, defaulted to no live flags
+    /// and derived to `available` — i.e. it showed up in `?status=available`.
+    /// Aligning the other way (filtering the LIST) would drop rooms from the
+    /// unfiltered path that `app/page.tsx` + `app/housekeeping/page.tsx` consume.
+    #[test]
+    fn live_flags_scan_does_not_filter_rooms_the_list_keeps() {
+        assert!(
+            !LIVE_ROOM_FLAGS_SQL.contains("room_active"),
+            "flags scan must not narrow the room set: {LIVE_ROOM_FLAGS_SQL}"
+        );
+        assert!(
+            LIVE_ROOM_FLAGS_SQL.trim_end().ends_with("FROM ht_rooms_new r"),
+            "no trailing predicate: {LIVE_ROOM_FLAGS_SQL}"
+        );
+    }
+
+    /// Review finding 3: `?page=0` served page-1 data on the derived path while
+    /// the SQL path built `OFFSET -50`. Both clamp now, and the response reports
+    /// the clamped value instead of echoing `"page": 0`.
+    #[test]
+    fn out_of_range_pagination_is_clamped_on_the_derived_path() {
+        let mut q = query(Some("available"));
+        q.page = 0;
+        q.limit = 2;
+        assert_eq!(q.clamped_page(), 1);
+        assert_eq!(q.clamped_limit(), 2);
+        assert_eq!(q.clamped_offset(), 0);
+
+        let mut rooms: Vec<NewRoom> = (1..=4)
+            .map(|i| room(i, &format!("10{i}"), "occupied"))
+            .collect();
+        overlaid(&mut rooms, &[]);
+        let (page, total) = filter_sort_paginate(rooms, &q);
+        assert_eq!(total, 4);
+        let nos: Vec<&str> = page.iter().map(|r| r.room_no.as_str()).collect();
+        assert_eq!(nos, vec!["101", "102"], "page 0 serves page 1");
+
+        // A negative limit was `LIMIT -20` (PG error) on the SQL path; both
+        // paths now return an empty page with a truthful total.
+        let mut q = query(Some("available"));
+        q.limit = -20;
+        assert_eq!(q.clamped_limit(), 0);
+        assert_eq!(q.clamped_offset(), 0);
+        let mut rooms = vec![room(1, "101", "occupied")];
+        overlaid(&mut rooms, &[]);
+        let (page, total) = filter_sort_paginate(rooms, &q);
+        assert!(page.is_empty());
+        assert_eq!(total, 1);
+    }
+
+    /// A huge `?page=` must saturate rather than overflow the `i32` multiply
+    /// the SQL path used to do (`(page - 1) * limit`).
+    #[test]
+    fn absurd_page_saturates_instead_of_overflowing() {
+        let mut q = query(None);
+        q.page = i32::MAX;
+        q.limit = i32::MAX;
+        let offset = q.clamped_offset();
+        assert!(offset > 0, "no wraparound: {offset}");
+        assert_eq!(offset, (i32::MAX as i64 - 1) * i32::MAX as i64);
+    }
 }
