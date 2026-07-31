@@ -343,7 +343,12 @@ services:
       # each row needs OPERATOR ACTION (nothing auto-closes it), and the >72h
       # escalation tier will fire on any that sit. This backend runs HF Hotel's
       # reconcile; sync-hfville runs Ville's (its own HFVILLE_ override below).
-      - RECONCILE_PAYMENTS_ARM_ENABLED=${RECONCILE_PAYMENTS_ARM_ENABLED:-false}
+      # ENABLED 2026-07-31 (T2 rollout step 2 of 8) after a clean 46h Ville
+      # soak: 165 consecutive ticks, 0 findings, 0 alerts. Runs on backend-1's
+      # own MSSQL pool, architecturally isolated from sync-1's CT watcher —
+      # see #275, which gates the REMAINING arms on Ville (shared pool) but
+      # not this one.
+      - RECONCILE_PAYMENTS_ARM_ENABLED=${RECONCILE_PAYMENTS_ARM_ENABLED:-true}
       # Phase 6-B — `guest_registry` reconcile arm (legacy
       # HT_CheckIn_Other_People ↔ canonical ht_guest_registry). Reconciles per
       # FOLIO (the whole companion set of one Cin_no), NOT per row: iHOTEL
