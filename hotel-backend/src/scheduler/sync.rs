@@ -479,6 +479,16 @@ pub async fn run_sync(
     // without aborting the reconcile loop.
     check_ct_watcher_lag(legacy_pool, pg_pool, site_id).await;
 
+    // ADR 0005 — periodic tripwire for the one condition the ADR accepts as
+    // a known gap: a hand-edited NULL clearing `HT_Book_H.Book_Cust_ID` /
+    // `HT_CheckIn_H.Cin_cust_no` (iHOTEL itself has no code path that writes
+    // one — ADR §3a). Default ON: read-only, zero-expected-noise (both
+    // counts were zero at both sites 2026-07-31); silence with
+    // `NULL_SENTINEL_TRIPWIRE_ENABLED=false` if that ever changes.
+    if null_sentinel_tripwire_enabled() {
+        check_null_sentinel_and_alert(legacy_pool, pg_pool, slack, site_id).await;
+    }
+
     tracing::info!(site = %site_id, "[Sync] Sync cycle complete");
 }
 
@@ -2275,6 +2285,290 @@ async fn check_ct_watcher_lag_per_table(legacy_pool: &DbPool, pg_pool: &PgPool, 
             poll_age_seconds,
             "[Sync] CT watcher healthy"
         );
+    }
+}
+
+// =============================================================================
+// ADR 0005 — NULL-clear sentinel tripwire (2026-07-31)
+// =============================================================================
+//
+// `docs/adr/0005-null-clear-sentinel-semantics.md` designs (but does not
+// build — that migration is deliberately not scheduled, ADR §7) a fix for
+// one specific gap: a `guarded: true` reconcile-gate term (`gate_guard.rs`)
+// cannot represent a legacy value going Some→None, because it treats every
+// `None` projection as "nothing to check" to avoid a COALESCE-vs-gate
+// infinite loop (ADR §4). For `legacy_cust_no` on bookings/checkins
+// (`HT_Book_H.Book_Cust_ID` / `HT_CheckIn_H.Cin_cust_no`) a genuine
+// Some→None clear produces an `ht_reconcile_log` row that can NEVER
+// auto-close (ADR §3a) — the guarded gate re-drives on every force-converge
+// attempt and always reports "already matches".
+//
+// The owner accepted that gap rather than build the tri-state migration
+// (ADR §5 — "the single most dangerous piece of machinery in this
+// codebase", two-site blast radius) because the ADR's §5 "Pre-flight audit"
+// SELECTs came back zero on both columns at both sites (2026-07-31) AND the
+// decompile (`docs/legacy-app/COMPAT_CHEATSHEET.md`) shows iHOTEL has no
+// code path that ever writes literal NULL there — every clear-like mutation
+// is the customer-delete cascade, which writes the reserved `'C0000'`
+// sentinel (Some→Some, already handled correctly by the guarded term). That
+// narrows the accepted risk to exactly one trigger: someone hand-edits
+// legacy MSSQL directly and introduces a NULL outside any iHOTEL code path.
+//
+// This tripwire does NOT implement the ADR's tri-state fix (no hash bytes,
+// no gate logic, no migration touched here). It only DETECTS the trigger
+// condition — a permanently-unfixable reconcile row is too weak a signal on
+// its own: `check_level_drift_and_alert` won't page for hours
+// (`LEVEL_DRIFT_STALE_INTERVAL_HOURS`, default 4h), and by the time the
+// row escalates the hand-edit that caused it is long gone from memory.
+//
+// VALUES only. A schema change on either column is already caught at
+// process startup by `writeback::fingerprint`'s column-shape hash — this
+// does not duplicate that.
+
+/// One guarded-term probe from ADR 0005 §2's enumeration. Both entries are
+/// the "In scope" rows of that table — `book_notes` (also guarded) is
+/// excluded because ADR §3b shows it is a *different*, already-silent class
+/// with its own small fix that never touches a hash, not a target for a
+/// reconcile-adjacent tripwire.
+struct NullSentinelProbe {
+    /// Short canonical entity name — the same literal
+    /// `ht_reconcile_log.table_name` / [`RECONCILE_RESOLVABLE_TABLES`] use,
+    /// reused here for the cooldown key so an operator can cross-reference
+    /// the two without a lookup table.
+    table_name: &'static str,
+    legacy_table: &'static str,
+    legacy_column: &'static str,
+}
+
+/// The two `legacy_cust_no` sites ADR 0005 §2 marks "In scope" for the
+/// Some→None gap (`booking.rs:806-813`, `checkin.rs:1481-1486`).
+const NULL_SENTINEL_PROBES: &[NullSentinelProbe] = &[
+    NullSentinelProbe {
+        table_name: "bookings",
+        legacy_table: "HT_Book_H",
+        legacy_column: "Book_Cust_ID",
+    },
+    NullSentinelProbe {
+        table_name: "checkins",
+        legacy_table: "HT_CheckIn_H",
+        legacy_column: "Cin_cust_no",
+    },
+];
+
+/// Is the periodic NULL-sentinel tripwire enabled? Default **ON** — unlike
+/// the Phase 6 reconcile arms above, this issues two read-only
+/// `SELECT COUNT(*)` probes and writes nothing to legacy or canonical, so it
+/// carries none of the risk the "ship dark" convention exists to manage
+/// (same posture as `CF_AUTO_LOGIN`, `config.rs`). Silence with
+/// `NULL_SENTINEL_TRIPWIRE_ENABLED=false` if it ever proves noisy — it
+/// shouldn't: the ADR's pre-flight audit found zero rows on both columns at
+/// both sites, and iHOTEL itself has no code path that writes a literal
+/// NULL there (ADR §3a).
+///
+/// The `== "true"` comparison is strict on purpose, matching every other
+/// feature flag in the sync path.
+fn null_sentinel_tripwire_enabled() -> bool {
+    env::var("NULL_SENTINEL_TRIPWIRE_ENABLED")
+        .map(|v| v == "true")
+        .unwrap_or(true)
+}
+
+/// Namespaced cooldown key for a [`NullSentinelProbe`] page. `null_sentinel:`
+/// is a new family and shares no prefix with `ct_retention_overflow:` /
+/// `escalated:` / `burst:` / `ct_watcher_lag:` / `shadow_mode:` /
+/// `boot_refusal:` / `reconcile_cap:` (pinned by
+/// [`null_sentinel_cooldown_key_is_namespaced_and_unique`]).
+fn null_sentinel_cooldown_key(table_name: &str) -> String {
+    format!("null_sentinel{COOLDOWN_KEY_NAMESPACE_SEP}{table_name}")
+}
+
+/// Pure decision: does this probe's NULL count warrant a page? There is no
+/// volume threshold to tune — per ADR §3a there is no known live path to a
+/// NULL at all, so ANY count above zero is already the out-of-band event
+/// this tripwire exists to catch; one hand-edited row is exactly as
+/// actionable as a thousand.
+fn null_sentinel_alert_needed(null_count: i64) -> bool {
+    null_count > 0
+}
+
+/// Slack body for a NULL-sentinel page. Pure — pulled out of
+/// [`alert_null_sentinel_probe`] so composition is unit-testable without a
+/// PG pool or a live MSSQL connection.
+///
+/// Not pager-tier: [`alert_null_sentinel_probe`] wraps this in
+/// `SlackMessage::with_site_text`, not `_paged`. This finding is rare and
+/// actionable, but per `SlackMessage::with_site_text_paged`'s own doc
+/// comment the pager tier is reserved for things closer to an outage (the
+/// >72h escalated digest, sync-lag bursts, CT-lag, boot refusals) — nothing
+/// here is down, no data has stopped flowing, and an operator has hours
+/// (not minutes) before the row this produces even reaches the >72h
+/// escalation tier. A routine unmentioned Slack post is the right weight.
+fn format_null_sentinel_message(
+    probe: &NullSentinelProbe,
+    null_count: i64,
+    cooldown_hours: i64,
+) -> String {
+    format!(
+        ":warning: *Legacy NULL-clear sentinel tripped — `{legacy_table}.{legacy_column}`* \
+         :warning:\n\
+         *{null_count}* row(s) in legacy `{legacy_table}` now have \
+         `{legacy_column} IS NULL`. This column feeds the `{table_name}` reconcile \
+         hash's `legacy_cust_no` gate term, which is *guarded* — it can only \
+         represent a legacy value staying the same or going from unset to set, \
+         never a genuine clear. A cleared row now produces (or will produce) an \
+         `ht_reconcile_log` divergence our sync CANNOT auto-converge: it will sit \
+         unresolved and, left alone, eventually hit the >72h `:bangbang:` \
+         escalation tier — permanently, until an operator intervenes by hand.\n\
+         iHOTEL itself has no known code path that writes a literal NULL to this \
+         column — every customer-delete cascade writes the reserved `'C0000'` \
+         sentinel instead (a value-to-value change the gate already handles \
+         correctly). This almost certainly means legacy MSSQL was edited by hand, \
+         outside iHOTEL.\n\
+         *Next steps:* identify the affected `{legacy_table}` row(s) (query the \
+         table directly — this alert doesn't carry row PKs) and, if the NULL was \
+         unintended, correct it by hand; separately check `ht_reconcile_log` for a \
+         stuck `{table_name}` row on the same legacy PK. See \
+         `docs/adr/0005-null-clear-sentinel-semantics.md` for the designed (but \
+         deliberately not yet built) fix — a versioned reconcile-hash migration. \
+         Per-table cooldown {cooldown_hours}h.",
+        legacy_table = probe.legacy_table,
+        legacy_column = probe.legacy_column,
+        table_name = probe.table_name,
+    )
+}
+
+/// Read `SELECT COUNT(*) FROM <legacy_table> WHERE <legacy_column> IS NULL`
+/// from legacy MSSQL. `probe` is always one of the two hardcoded
+/// [`NULL_SENTINEL_PROBES`] entries — never user input — so building the SQL
+/// with `format!` here is not an injection surface.
+async fn read_null_sentinel_count(
+    legacy_pool: &DbPool,
+    probe: &NullSentinelProbe,
+) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+    let mut conn = legacy_pool.get().await?;
+    let sql = format!(
+        "SELECT COUNT(*) FROM {} WHERE {} IS NULL",
+        probe.legacy_table, probe.legacy_column
+    );
+    let rows = simple_query_with_timeout_pooled(&mut conn, &sql, MssqlOpKind::Read).await?;
+    let n: i32 = rows.first().and_then(|r| r.get(0)).unwrap_or(0);
+    Ok(n as i64)
+}
+
+/// Page (or log) a single [`NullSentinelProbe`] breach. Cooldown-gated
+/// through the shared `ht_level_drift_alert_cooldowns` table under
+/// [`null_sentinel_cooldown_key`], reusing the same
+/// `LEVEL_DRIFT_COOLDOWN_HOURS` window (default 24h, per-site overridable)
+/// as [`alert_guest_registry_divergence_cap`] rather than inventing a new
+/// knob: a hand-edited NULL doesn't change between ticks (the write already
+/// happened), so re-paging every 15 minutes gains nothing, and 24h matches
+/// every other "stuck state, not a burst" page in this module.
+///
+/// Eligibility is read via [`level_alert_eligible_pg`], which FAILS OPEN on
+/// a PG error (defaults to "eligible") — the same polarity `bin/sync.rs`'s
+/// `boot_refusal_should_send` chooses for a guard whose failure mode is
+/// silence about a real problem: "with no dedup backend we FAIL OPEN...
+/// their failure mode is silence... so a duplicate page beats a missing
+/// one." A stuck, unfixable reconcile row is exactly that shape of failure
+/// mode, so this reuses the fail-open helper rather than adding a
+/// fail-closed guard of its own. The cooldown is burned only on confirmed
+/// delivery ([`cooldown_should_be_marked`]), so a webhook outage cannot
+/// silence the probe for a full cycle either.
+async fn alert_null_sentinel_probe(
+    pg_pool: &PgPool,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+    probe: &NullSentinelProbe,
+    null_count: i64,
+) {
+    let key = null_sentinel_cooldown_key(probe.table_name);
+    let cooldown_hours = level_drift_thresholds_from_env(site_id).cooldown_hours;
+    let cooldown = std::time::Duration::from_secs((cooldown_hours * 3600) as u64);
+
+    if !level_alert_eligible_pg(pg_pool, site_id, &key, cooldown).await {
+        tracing::debug!(
+            site = %site_id,
+            table = probe.table_name,
+            "[Sync] NULL-sentinel page suppressed by cooldown"
+        );
+        return;
+    }
+
+    let delivery = if let Some(slack) = slack {
+        let msg = SlackMessage::with_site_text(
+            site_id,
+            format_null_sentinel_message(probe, null_count, cooldown_hours),
+        );
+        AlertDelivery::from_send(Some(slack.send_message(&msg).await))
+    } else {
+        tracing::warn!(
+            site = %site_id,
+            table = probe.table_name,
+            legacy_table = probe.legacy_table,
+            legacy_column = probe.legacy_column,
+            null_count,
+            "[Sync] Slack not configured; NULL-sentinel finding logged only — \
+             ADR 0005's accepted gap has been triggered"
+        );
+        AlertDelivery::LoggedOnly
+    };
+
+    if cooldown_should_be_marked(delivery) {
+        mark_level_alert_sent_pg(pg_pool, site_id, &key).await;
+    } else {
+        tracing::warn!(
+            site = %site_id,
+            table = probe.table_name,
+            "[Sync] NULL-sentinel page POST failed — leaving the cooldown unset \
+             so the next tick retries"
+        );
+    }
+}
+
+/// ADR 0005's periodic tripwire, wired into [`run_sync`] (behind
+/// [`null_sentinel_tripwire_enabled`]). Runs both [`NULL_SENTINEL_PROBES`]
+/// every tick — two cheap `SELECT COUNT(*)`s, both measured fast against
+/// live production 2026-07-31. Zero on both is the steady state and logs at
+/// debug; any non-zero pages via [`alert_null_sentinel_probe`].
+///
+/// Best-effort, same posture as every sibling check in this module: a
+/// failed MSSQL query logs a warning for THAT probe and moves on — it never
+/// aborts the reconcile loop, and it never treats "can't reach legacy" as
+/// "assume a NULL and page" (a connectivity failure is a different problem
+/// with its own alerting path — the watchdog's probe-outage escalation).
+async fn check_null_sentinel_and_alert(
+    legacy_pool: &DbPool,
+    pg_pool: &PgPool,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+) {
+    for probe in NULL_SENTINEL_PROBES {
+        let null_count = match read_null_sentinel_count(legacy_pool, probe).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(
+                    site = %site_id,
+                    table = probe.table_name,
+                    legacy_table = probe.legacy_table,
+                    error = %e,
+                    "[Sync] NULL-sentinel probe query failed — observability \
+                     degraded for this tick"
+                );
+                continue;
+            }
+        };
+
+        if null_sentinel_alert_needed(null_count) {
+            alert_null_sentinel_probe(pg_pool, slack, site_id, probe, null_count).await;
+        } else {
+            tracing::debug!(
+                site = %site_id,
+                table = probe.table_name,
+                legacy_table = probe.legacy_table,
+                legacy_column = probe.legacy_column,
+                "[Sync] NULL-sentinel probe clean"
+            );
+        }
     }
 }
 
@@ -10982,6 +11276,146 @@ mod tests {
                 "the reconcile_cap family must not prefix-collide with {other}"
             );
         }
+    }
+
+    // -------------------------------------------------------------------
+    // ADR 0005 — NULL-clear sentinel tripwire
+    // -------------------------------------------------------------------
+
+    /// Namespacing pin, same shape as
+    /// [`reconcile_cap_cooldown_key_is_namespaced_and_unique`]: the new
+    /// `null_sentinel:` family must not collide with any existing family
+    /// (including `reconcile_cap:`, the newest one before this task) and
+    /// must read as NOT a bare reconcile-table key.
+    #[test]
+    fn null_sentinel_cooldown_key_is_namespaced_and_unique() {
+        let key = null_sentinel_cooldown_key("bookings");
+        assert_eq!(key, "null_sentinel:bookings");
+        assert!(!is_reconcile_table_key(&key));
+        for other in [
+            "ct_retention_overflow:",
+            "escalated:",
+            "burst:",
+            "ct_watcher_lag:",
+            "shadow_mode:",
+            "boot_refusal:",
+            "reconcile_cap:",
+        ] {
+            assert!(
+                !key.starts_with(other) && !other.starts_with("null_sentinel:"),
+                "the null_sentinel family must not prefix-collide with {other}"
+            );
+        }
+    }
+
+    /// The pure decision this tripwire is built on: zero is quiet, anything
+    /// above zero pages. No volume threshold — one hand-edited row is
+    /// exactly as actionable as a thousand (ADR §3a: no known live path to
+    /// a NULL at all, so any count is already out-of-band).
+    #[test]
+    fn null_sentinel_alert_needed_zero_vs_nonzero() {
+        assert!(!null_sentinel_alert_needed(0));
+        assert!(null_sentinel_alert_needed(1));
+        assert!(null_sentinel_alert_needed(1_000));
+    }
+
+    /// Cooldown suppression, exercised through the same generic
+    /// [`cooldown_elapsed`] machinery every other family in this module
+    /// relies on (this tripwire adds no bespoke cooldown logic — see
+    /// [`alert_null_sentinel_probe`]'s doc comment for why reusing
+    /// [`level_alert_eligible_pg`] was the deliberate choice). A page just
+    /// sent is still inside a 24h window; one from >24h ago is eligible
+    /// again.
+    #[test]
+    fn null_sentinel_cooldown_suppresses_repeat_alert_inside_window() {
+        let now = chrono::Utc::now();
+        let cooldown = std::time::Duration::from_secs(24 * 3600);
+        assert!(
+            !cooldown_elapsed(Some(now), now, cooldown),
+            "a page sent moments ago must not be eligible again immediately"
+        );
+        let just_outside = now - chrono::Duration::hours(24) - chrono::Duration::minutes(1);
+        assert!(
+            cooldown_elapsed(Some(just_outside), now, cooldown),
+            "a page from just past the 24h window must be eligible again"
+        );
+    }
+
+    /// Composition pin: the message names the exact table/column, states
+    /// the count, explains that our sync cannot converge the resulting
+    /// reconcile row, calls out the likely manual-edit cause, and points at
+    /// the ADR for the designed fix. All five are load-bearing for an
+    /// operator with zero context (the task's own bar).
+    #[test]
+    fn null_sentinel_message_is_actionable_to_a_cold_operator() {
+        let probe = &NULL_SENTINEL_PROBES[0];
+        assert_eq!(probe.table_name, "bookings");
+        let body = format_null_sentinel_message(probe, 3, 24);
+        assert!(body.contains("HT_Book_H"), "must name the legacy table: {body:?}");
+        assert!(body.contains("Book_Cust_ID"), "must name the legacy column: {body:?}");
+        assert!(body.contains("*3*"), "must state the count: {body:?}");
+        assert!(
+            body.to_lowercase().contains("cannot"),
+            "must say our sync cannot converge the row: {body:?}"
+        );
+        assert!(
+            body.to_lowercase().contains("hand") || body.to_lowercase().contains("manual"),
+            "must call out a likely manual DB edit: {body:?}"
+        );
+        assert!(
+            body.contains("docs/adr/0005-null-clear-sentinel-semantics.md"),
+            "must point at the ADR for the designed fix: {body:?}"
+        );
+        assert!(body.contains("24h"), "must state the cooldown: {body:?}");
+    }
+
+    /// Second probe sanity: the checkins entry names the right legacy
+    /// table/column pair, distinct from the bookings entry above.
+    #[test]
+    fn null_sentinel_checkins_probe_names_the_right_column() {
+        let probe = &NULL_SENTINEL_PROBES[1];
+        assert_eq!(probe.table_name, "checkins");
+        assert_eq!(probe.legacy_table, "HT_CheckIn_H");
+        assert_eq!(probe.legacy_column, "Cin_cust_no");
+    }
+
+    /// Pager-tier decision, pinned the same way the burst / escalated /
+    /// boot-refusal pager sends are pinned (`with_site_text_paged` leads
+    /// with `<!channel> `). This finding is deliberately NOT pager-tier —
+    /// rare and actionable, but not an outage (see
+    /// [`format_null_sentinel_message`]'s doc comment) — so it must render
+    /// through `with_site_text`, never carrying the mention.
+    #[test]
+    fn null_sentinel_message_composition_has_no_channel_mention() {
+        let body = format_null_sentinel_message(&NULL_SENTINEL_PROBES[0], 1, 24);
+        let msg = SlackMessage::with_site_text("hfhotel", body);
+        assert!(
+            !msg.text.contains("<!channel>"),
+            "NULL-sentinel page is not pager-tier and must stay unmentioned: {:?}",
+            msg.text
+        );
+        assert!(msg.text.contains(":warning:"));
+    }
+
+    /// Default-enabled flag, per the task's explicit call: this is a
+    /// read-only, zero-expected-noise probe, so unlike every Phase 6
+    /// reconcile arm it ships ON by default (opt OUT via
+    /// `NULL_SENTINEL_TRIPWIRE_ENABLED=false`, not opt in). Uses
+    /// [`with_env_vars`] (the same lock-guarded helper the other flag
+    /// tests in this module use) so this doesn't race a parallel test
+    /// mutating the same process-wide env var.
+    #[test]
+    fn null_sentinel_tripwire_defaults_enabled() {
+        assert!(
+            with_env_vars(&[("NULL_SENTINEL_TRIPWIRE_ENABLED", None)], || {
+                null_sentinel_tripwire_enabled()
+            }),
+            "the tripwire must default ON — it is read-only and writes nothing"
+        );
+        assert!(!with_env_vars(
+            &[("NULL_SENTINEL_TRIPWIRE_ENABLED", Some("false"))],
+            || { null_sentinel_tripwire_enabled() }
+        ));
     }
 
     /// The scope gate. Pre-coverage folios and folios with no canonical
