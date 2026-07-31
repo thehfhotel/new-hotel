@@ -898,16 +898,22 @@ services:
       # close such a row and a hand-resolved one re-mints itself. It starts
       # recording only when a closure path lands (issue #273; deferred
       # past 6-D).
-      # ENABLED 2026-07-31 — PULLED FORWARD out of rollout order (was step 7/8).
-      # It was scheduled last for exactly one reason: the calendar gap would
-      # open a durable row no sweep could ever close. That reason is gone —
-      # backfill_room_calendar closed the deficit on both sites the same day
-      # (HF Hotel +3,137 nights, Ville +513, surplus rows untouched), and the
-      # 8 legacy_mirror.* tables were already exactly converged once floored.
-      # So this arm should now find NOTHING, and that silence is the proof
-      # issue #273 needs before it can close. If it does fire, that is a real
-      # finding worth having today rather than a week from now.
-      - RECONCILE_MIRROR_PROBE_ENABLED=${HFVILLE_RECONCILE_MIRROR_PROBE_ENABLED:-true}
+      # REVERTED TO false 2026-07-31, same day it was pulled forward. It WAS
+      # enabled on the reasoning that backfill_room_calendar had closed the
+      # night deficit, so the arm should be silent. It was not: the first tick
+      # opened `mirror_ht_room_calendar` as missing_mssql, legacy 1637 vs pg
+      # 1676 — a difference of exactly 39, which is precisely the count of
+      # app-authored rows (`rcal_legacy_id IS NULL`) the backfill correctly
+      # left alone because they have no legacy counterpart by design.
+      #
+      # So the probe compares RAW counts and books legitimate app-authored
+      # rows as divergence, producing a row no sweep or operator can ever
+      # close. That is the exact failure #273 was filed to prevent
+      # ("detection with no remediation"). The business-key re-key fixed the
+      # KEYING; it did not teach the comparison to exclude rows that
+      # structurally cannot have a legacy counterpart. Fix that first — see
+      # #273 — then re-enable.
+      - RECONCILE_MIRROR_PROBE_ENABLED=${HFVILLE_RECONCILE_MIRROR_PROBE_ENABLED:-false}
       # Phase 6-D — payment-ledger per-folio probe (HT_CheckIn_Pay ↔
       # ht_payment_ledger). DETECTION ONLY; writes nothing but
       # ht_reconcile_log — no ack cache and no new PG table. This worker runs
