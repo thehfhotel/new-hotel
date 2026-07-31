@@ -6130,6 +6130,88 @@ async fn mark_backfill_skipped(
 /// just wider because cash entries can be back-dated a little).
 const CASH_WINDOW_DAYS: i64 = 120;
 
+/// The `sync_cash_history` per-row UPSERT into canonical `ht_cash_ledger`.
+/// Hoisted to a const (mirrors `sync/mappers/payment.rs::RECEIPT_UPSERT_UPDATE_SQL`)
+/// so a DB-independent shape-guard test can pin the echo-safety property
+/// without needing a live database — see `cash_sync_tests` below.
+///
+/// Conflict target is the `ht_cash_ledger_legacy_id_key` UNIQUE constraint on
+/// `cash_legacy_id` (migration 059) — `TB_Pay_History.id`.
+///
+/// TWO columns in the `DO UPDATE` are provenance-conditional; the rest are
+/// plain `EXCLUDED.*` on purpose. The shared premise: once a future writeback
+/// back-populates `cash_legacy_id` onto an app-originated row, the very next
+/// re-import lands on THAT row, so anything the app knows better than legacy
+/// must survive it — while a genuinely legacy-originated row must still take
+/// every edit iHOTEL makes. Hence `CASE WHEN ht_cash_ledger.cash_source =
+/// 'app'` (the pre-UPDATE value of the existing row) rather than a blanket
+/// `COALESCE`, which would also freeze legacy-originated rows.
+///
+/// 1. **`cash_source`** — never flips `'app'` → `'legacy'`. Losing it would
+///    silently rewrite the row's provenance on every tick. Same class as
+///    `sync/mappers/payment.rs`'s `pay_voided` guard: a legacy re-import must
+///    not undo a canonical-only fact.
+/// 2. **`cash_entry_date`** — an app row keeps its own instant (filled only
+///    when NULL, exactly as `payment.rs` does with
+///    `pay_date = COALESCE(pay_date, $2)`). `POST /api/cash/{income,expense}`
+///    stores a full instant (`routes/new_cash.rs` — `body.entry_date`, or
+///    `Utc::now()` when the client omits it), but the writeback recipe emits a
+///    **date-only** OADate (`writeback/recipes/cash_entry.rs` —
+///    `date_to_ole_serial(bangkok_date(..))`), which `ole_serial_to_utc` below
+///    reads back as naive **midnight Bangkok**. So an unguarded re-import
+///    replaces e.g. 14:32 Bangkok with 00:00 Bangkok: time-of-day is gone and
+///    `ORDER BY cash_entry_date DESC` (the list endpoint) collapses every
+///    re-imported app row into a midnight tie. The Bangkok *calendar day*
+///    survives — `/v2/cash` sends Bangkok-day bounds, so its own buckets do
+///    not move — but the UTC instant shifts 7h+ earlier, into the previous UTC
+///    day, which any UTC-day-bucketed reader of `ix_ht_cash_ledger_entry_date`
+///    would misfile.
+///
+/// Deliberately NOT guarded — a legacy edit must still land, and there is no
+/// better app-side fact to protect:
+/// * `cash_kind` / `cash_legacy_type` / `cash_amount` round-trip faithfully
+///   (Thai `Pay_Type` marker verbatim, 2dp money both sides).
+/// * `cash_bill_no` / `cash_payee` / `cash_note` / `cash_group` /
+///   `cash_account` round-trip a canonical NULL as `''` (the recipe's
+///   `sql_quote_or_empty` — the legacy blank convention, spike §3k). Accepted:
+///   NULL and `''` are both "blank" to every reader (`routes/new_cash.rs`
+///   passes them straight through to the DTO; nothing filters on `IS NULL`),
+///   and a guard here would block a receptionist's genuine iHOTEL edit that
+///   *clears* one of these fields.
+/// * `cash_program_date` round-trips a canonical NULL as the entry date's
+///   midnight (the recipe defaults `Pay_Program` to `Pay_Date`). Accepted: the
+///   app cannot author this column at all — it is absent from the create
+///   INSERT in `routes/new_cash.rs`, so it is always NULL on an app row and
+///   there is no app-authored value to lose. The column's contract is "mirror
+///   of `Pay_Program`", and post-writeback legacy really does hold that value.
+/// * `cash_created_by` needs no guard: it is deliberately absent from the SET
+///   list, so it is already preserved as-is.
+/// * There is no voided / deleted column on `ht_cash_ledger` (migration 059),
+///   so the `pay_voided` monotonicity half of the `payment.rs` precedent has
+///   no analogue here.
+const CASH_HISTORY_UPSERT_SQL: &str = "INSERT INTO ht_cash_ledger ( \
+         cash_legacy_id, cash_kind, cash_legacy_type, cash_entry_date, \
+         cash_bill_no, cash_payee, cash_amount, cash_note, \
+         cash_program_date, cash_group, cash_account, cash_source \
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7::numeric, $8, $9, $10, $11, 'legacy') \
+     ON CONFLICT (cash_legacy_id) DO UPDATE SET \
+         cash_kind         = EXCLUDED.cash_kind, \
+         cash_legacy_type  = EXCLUDED.cash_legacy_type, \
+         cash_entry_date   = CASE WHEN ht_cash_ledger.cash_source = 'app' \
+                                   THEN COALESCE(ht_cash_ledger.cash_entry_date, \
+                                                 EXCLUDED.cash_entry_date) \
+                                   ELSE EXCLUDED.cash_entry_date END, \
+         cash_bill_no      = EXCLUDED.cash_bill_no, \
+         cash_payee        = EXCLUDED.cash_payee, \
+         cash_amount       = EXCLUDED.cash_amount, \
+         cash_note         = EXCLUDED.cash_note, \
+         cash_program_date = EXCLUDED.cash_program_date, \
+         cash_group        = EXCLUDED.cash_group, \
+         cash_account      = EXCLUDED.cash_account, \
+         cash_source       = CASE WHEN ht_cash_ledger.cash_source = 'app' \
+                                   THEN 'app' ELSE 'legacy' END, \
+         cash_synced_at    = NOW()";
+
 /// Convert a legacy OLE-Automation date serial (`TB_Pay_History.Pay_Date` /
 /// `Pay_Program` are `float` OADates — `DateTime.ToOADate()`, days since
 /// 1899-12-30 with the fractional part = fraction of a 24h day) into a true UTC
@@ -6296,6 +6378,52 @@ async fn sync_cash_categories(pg: &PgPool, mssql: &DbPool, shadow_mode: bool, si
 ///
 /// **Resilience**: identical to `sync_round_bills` — every error path logs at
 /// WARN and returns/continues; shadow mode skips the canonical write.
+///
+/// ## ECHO-SAFETY (issue #202) — verified alignment + the provenance-clobber fix
+///
+/// This UPSERT dedups `ON CONFLICT (cash_legacy_id)`, i.e. on
+/// `TB_Pay_History.id`. That is ALREADY the same column
+/// `writeback/recipes/cash_entry.rs::build_statements`'s `legacy_id` parameter
+/// writes into `TB_Pay_History.id` (see that module's doc comment) — so once a
+/// future `WritebackIntent::CreateCashEntry` back-populates the allocated id
+/// onto this row's `cash_legacy_id` (mirroring `back_populate_legacy_ids` →
+/// `legacy_receipt_no` for payments), a re-import of that same legacy row
+/// UPDATEs the matched app row instead of inserting a second one. No column
+/// rename was needed here — unlike the payment bug (which read the WRONG
+/// column, `pay_reference`, for app-originated rows), this importer already
+/// targeted the right one.
+///
+/// What WAS wrong, and is fixed below — TWO instances of the same "legacy
+/// re-import clobbers an app-authoritative fact" class that
+/// `sync/mappers/payment.rs` guards against (`pay_voided` and `pay_date`
+/// respectively):
+///
+/// 1. the `DO UPDATE` unconditionally set `cash_source = 'legacy'`, silently
+///    stripping an app-originated row's `'app'` provenance on every
+///    re-import;
+/// 2. it also unconditionally set `cash_entry_date = EXCLUDED.cash_entry_date`,
+///    replacing the app's full instant with the **midnight-Bangkok** value the
+///    date-only writeback OADate round-trips back as.
+///
+/// Both are now provenance-conditional in [`CASH_HISTORY_UPSERT_SQL`]; that
+/// const's doc comment is the authoritative per-column ledger of what is
+/// guarded, what is deliberately left on `EXCLUDED.*`, and why (the string
+/// columns' NULL → `''` and `cash_program_date`'s NULL → entry-date round
+/// trips are named there as accepted). A legacy-originated row still takes
+/// every column from `EXCLUDED`, unchanged.
+///
+/// **Still open** (out of scope here — requires `dispatcher.rs` /
+/// `bin/writeback.rs`, not owned by this fix): `ht_cash_ledger` has no
+/// `aggregate_id` column and there is no `WritebackIntent::CreateCashEntry` /
+/// `back_populate_legacy_ids` arm at all, so nothing actually stamps
+/// `cash_legacy_id` onto an app row today. Cash-outbound writeback MUST NOT
+/// be enabled until that back-population step exists — without it, an
+/// app-originated entry's `cash_legacy_id` stays NULL forever, this UPSERT's
+/// `ON CONFLICT` never fires for it, and every re-import tick inserts a
+/// genuine duplicate row (the scenario
+/// [`cash_sync_tests::reimport_without_backpopulation_still_duplicates`]
+/// pins as a known, accepted gap — not something this importer can close
+/// alone).
 async fn sync_cash_history(pg: &PgPool, mssql: &DbPool, shadow_mode: bool, site_id: &str) {
     // Pre-compute the OADate cutoff serial for (today − CASH_WINDOW_DAYS) in
     // Bangkok local time, so the legacy comparison stays a cheap float >=.
@@ -6412,43 +6540,11 @@ async fn sync_cash_history(pg: &PgPool, mssql: &DbPool, shadow_mode: bool, site_
         }
 
         // Runtime `sqlx::query` (NOT the `query!` macro) so this adds nothing
-        // to the `.sqlx/` offline cache. `$6::numeric` mirrors the f64→NUMERIC
+        // to the `.sqlx/` offline cache. `$7::numeric` mirrors the f64→NUMERIC
         // convention used by sync_round_bills. Idempotent UPSERT keyed on
-        // cash_legacy_id; cash_source is forced to 'legacy' (this is the
-        // legacy mirror path).
-        //
-        // ECHO-SAFETY (issue #202): this UPSERT dedups on `cash_legacy_id`, so it
-        // is echo-safe ONLY if an app-originated cash entry already carries its
-        // allocated legacy id in `cash_legacy_id` by the time this mirror re-reads
-        // it. Cash-OUTBOUND writeback (`writeback/recipes/cash_entry.rs`) is
-        // currently DARK, so no echo occurs today. BEFORE enabling it, the worker
-        // MUST back-populate `cash_legacy_id` onto the canonical row after the
-        // writeback allocates the legacy id (the same pattern payments use:
-        // `back_populate_legacy_ids` → `legacy_receipt_no`, which the HT_Receipt_H
-        // importer then dedups on — see `sync/mappers/payment.rs`). Without that
-        // back-population, our own cash write re-imports here as a phantom
-        // duplicate (`cash_source='legacy'`, app's original keeps `cash_legacy_id`
-        // NULL). Verify before flipping cash-outbound writeback.
-        let res = sqlx::query(
-            "INSERT INTO ht_cash_ledger ( \
-                 cash_legacy_id, cash_kind, cash_legacy_type, cash_entry_date, \
-                 cash_bill_no, cash_payee, cash_amount, cash_note, \
-                 cash_program_date, cash_group, cash_account, cash_source \
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7::numeric, $8, $9, $10, $11, 'legacy') \
-             ON CONFLICT (cash_legacy_id) DO UPDATE SET \
-                 cash_kind         = EXCLUDED.cash_kind, \
-                 cash_legacy_type  = EXCLUDED.cash_legacy_type, \
-                 cash_entry_date   = EXCLUDED.cash_entry_date, \
-                 cash_bill_no      = EXCLUDED.cash_bill_no, \
-                 cash_payee        = EXCLUDED.cash_payee, \
-                 cash_amount       = EXCLUDED.cash_amount, \
-                 cash_note         = EXCLUDED.cash_note, \
-                 cash_program_date = EXCLUDED.cash_program_date, \
-                 cash_group        = EXCLUDED.cash_group, \
-                 cash_account      = EXCLUDED.cash_account, \
-                 cash_source       = 'legacy', \
-                 cash_synced_at    = NOW()",
-        )
+        // cash_legacy_id — see [`CASH_HISTORY_UPSERT_SQL`] and this function's
+        // doc comment for the echo-safety analysis (issue #202).
+        let res = sqlx::query(CASH_HISTORY_UPSERT_SQL)
         .bind(legacy_id)
         .bind(kind)
         .bind(&pay_type)
@@ -6665,7 +6761,7 @@ mod sticky_note_sync_tests {
 
 #[cfg(test)]
 mod cash_sync_tests {
-    use super::{cash_kind_from_pay_type, ole_serial_to_utc};
+    use super::{cash_kind_from_pay_type, ole_serial_to_utc, CASH_HISTORY_UPSERT_SQL};
     use chrono::{TimeZone, Utc};
 
     #[test]
@@ -6701,6 +6797,472 @@ mod cash_sync_tests {
         assert_eq!(cash_kind_from_pay_type("จ่ายค่าน้ำ"), "expense");
         assert_eq!(cash_kind_from_pay_type(""), "unknown");
         assert_eq!(cash_kind_from_pay_type("misc"), "unknown");
+    }
+
+    // -----------------------------------------------------------------
+    // Echo-safety (issue #202) — dedup column alignment + the
+    // provenance-clobber fix. See `sync_cash_history`'s doc comment for
+    // the full analysis.
+    // -----------------------------------------------------------------
+
+    /// Shape guard — runs with NO database, so the invariant is pinned even
+    /// on a machine where the behavioural tests below skip. Locks both
+    /// halves: the conflict target is `cash_legacy_id` (the column
+    /// `writeback/recipes/cash_entry.rs` documents it will stamp the
+    /// legacy id into), and `cash_source` must fold in the existing value
+    /// rather than being assigned unconditionally.
+    #[test]
+    fn cash_history_upsert_dedups_on_legacy_id_and_preserves_app_source() {
+        let sql = CASH_HISTORY_UPSERT_SQL;
+        assert!(
+            sql.contains("ON CONFLICT (cash_legacy_id) DO UPDATE"),
+            "conflict target must be cash_legacy_id — the column the (dark) \
+             cash-outbound writeback documents it will stamp TB_Pay_History.id \
+             into; got: {sql}"
+        );
+        assert!(
+            sql.contains(
+                "cash_source       = CASE WHEN ht_cash_ledger.cash_source = 'app' \
+                                   THEN 'app' ELSE 'legacy' END"
+            ),
+            "cash_source must fold in the existing value — a bare \
+             `cash_source = 'legacy'` lets a legacy re-import silently strip an \
+             app-originated row's provenance the moment cash_legacy_id is ever \
+             back-populated; got: {sql}"
+        );
+        assert!(
+            !sql.contains("cash_source       = 'legacy',"),
+            "cash_source must never be assigned unconditionally in the DO \
+             UPDATE branch; got: {sql}"
+        );
+    }
+
+    /// Shape guard for the SECOND provenance-conditional column, `cash_entry_date`
+    /// — the analogue of `sync/mappers/payment.rs`'s
+    /// `pay_date = COALESCE(pay_date, $2)`. Also DB-independent. The `CASE`
+    /// (not a bare `COALESCE`) is load-bearing in BOTH directions: it keeps an
+    /// app row's precise instant, and it leaves a legacy-originated row free
+    /// to take an iHOTEL date edit.
+    #[test]
+    fn cash_history_upsert_never_downgrades_an_app_entry_date() {
+        let sql = CASH_HISTORY_UPSERT_SQL;
+        assert!(
+            sql.contains(
+                "cash_entry_date   = CASE WHEN ht_cash_ledger.cash_source = 'app' \
+                                   THEN COALESCE(ht_cash_ledger.cash_entry_date, \
+                                                 EXCLUDED.cash_entry_date) \
+                                   ELSE EXCLUDED.cash_entry_date END"
+            ),
+            "cash_entry_date must keep an app row's own instant (fill-when-NULL \
+             only) while still letting a legacy-originated row take an iHOTEL \
+             edit — the writeback emits a DATE-ONLY OADate, so a bare \
+             `EXCLUDED.cash_entry_date` re-import truncates the app's \
+             timestamp to midnight Bangkok; got: {sql}"
+        );
+        assert!(
+            !sql.contains("cash_entry_date   = EXCLUDED.cash_entry_date,"),
+            "cash_entry_date must never be assigned unconditionally in the DO \
+             UPDATE branch; got: {sql}"
+        );
+    }
+
+    /// Column subset the behavioural tests need — mirrors migration 059
+    /// closely enough to satisfy [`CASH_HISTORY_UPSERT_SQL`]. `ON COMMIT
+    /// DROP` plus the enclosing rollback means no real row is ever touched,
+    /// even when `DATABASE_URL` points at a populated database (CI does).
+    const CASH_PROBE_DDL: &str = "CREATE TEMP TABLE ht_cash_ledger ( \
+             cash_id           BIGSERIAL PRIMARY KEY, \
+             cash_legacy_id    INTEGER, \
+             cash_kind         VARCHAR(20)  NOT NULL DEFAULT 'unknown', \
+             cash_legacy_type  VARCHAR(50), \
+             cash_entry_date   TIMESTAMPTZ, \
+             cash_bill_no      VARCHAR(255), \
+             cash_payee        VARCHAR(500), \
+             cash_amount       NUMERIC(14,2) NOT NULL DEFAULT 0, \
+             cash_note         VARCHAR(500), \
+             cash_program_date TIMESTAMPTZ, \
+             cash_group        VARCHAR(50), \
+             cash_account      VARCHAR(50), \
+             cash_source       VARCHAR(20)  NOT NULL DEFAULT 'legacy', \
+             cash_created_by   VARCHAR(100), \
+             cash_synced_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(), \
+             CONSTRAINT ht_cash_ledger_legacy_id_key UNIQUE (cash_legacy_id) \
+         ) ON COMMIT DROP";
+
+    /// Open a live PG connection for the behavioural tests, or `None` when
+    /// none is configured — `cargo test --lib` (and `--bins`) must stay
+    /// green on a machine with no database. CI sets `DATABASE_URL`
+    /// (`.github/workflows/docker-build.yml`), so these run for real there.
+    /// Mirrors `sync::mappers::payment::tests::void_probe_conn`.
+    async fn cash_probe_conn() -> Option<sqlx::PgConnection> {
+        use sqlx::Connection;
+        let url = std::env::var("SYNC_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .ok()?;
+        match sqlx::PgConnection::connect(&url).await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("cash echo-safety probe SKIPPED — cannot connect to PG: {e}");
+                None
+            }
+        }
+    }
+
+    async fn cash_probe_tx(conn: &mut sqlx::PgConnection) -> sqlx::Transaction<'_, sqlx::Postgres> {
+        use sqlx::Connection;
+        let mut tx = conn.begin().await.expect("begin");
+        sqlx::query(CASH_PROBE_DDL)
+            .execute(&mut *tx)
+            .await
+            .expect("create temp ht_cash_ledger");
+        // `pg_temp` is searched first for relations anyway; pin it
+        // explicitly so the shadow is not implementation-dependent.
+        sqlx::query("SET LOCAL search_path = pg_temp, public")
+            .execute(&mut *tx)
+            .await
+            .expect("set search_path");
+        tx
+    }
+
+    /// Run the EXACT importer UPSERT for a re-import of `legacy_id` with a
+    /// fixed, arbitrary payload (content doesn't matter for these tests —
+    /// only the conflict/no-conflict behaviour does).
+    async fn run_cash_upsert(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, legacy_id: i32) {
+        let entry_date = Utc.with_ymd_and_hms(2026, 7, 31, 7, 0, 0).unwrap();
+        run_cash_upsert_at(tx, legacy_id, entry_date).await;
+    }
+
+    /// [`run_cash_upsert`] with the incoming `cash_entry_date` under the
+    /// caller's control — the date-guard tests need to feed the
+    /// **midnight-Bangkok** instant a date-only legacy OADate round-trips
+    /// back as (`ole_serial_to_utc` of `date_to_ole_serial(bangkok_date(..))`).
+    async fn run_cash_upsert_at(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        legacy_id: i32,
+        entry_date: chrono::DateTime<Utc>,
+    ) {
+        sqlx::query(CASH_HISTORY_UPSERT_SQL)
+            .bind(legacy_id)
+            .bind("income")
+            .bind("รายรับ")
+            .bind(entry_date)
+            .bind("B-100")
+            .bind("ลูกค้า")
+            .bind(500.0_f64)
+            .bind("re-imported")
+            .bind(None::<chrono::DateTime<Utc>>)
+            .bind(None::<String>)
+            .bind(None::<String>)
+            .execute(&mut **tx)
+            .await
+            .expect("cash UPSERT must execute");
+    }
+
+    /// The exact instant a date-only writeback OADate round-trips back as for
+    /// a 2026-04-24 Bangkok entry: `bangkok_date` → 2026-04-24,
+    /// `date_to_ole_serial` → a whole-day serial (no time fraction),
+    /// `ole_serial_to_utc` → 2026-04-24 00:00 **Bangkok** = 17:00Z the day
+    /// before. Sanity-checked against the real converter in
+    /// [`midnight_bangkok_fixture_matches_ole_round_trip`].
+    fn midnight_bkk_2026_04_24() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 4, 23, 17, 0, 0).unwrap()
+    }
+
+    /// The app-authored instant that must survive: 2026-04-24 14:32 Bangkok.
+    fn app_instant_2026_04_24_1432() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 4, 24, 7, 32, 0).unwrap()
+    }
+
+    /// Pins the premise of the date guard with the REAL converter rather than
+    /// a hand-computed constant: the writeback recipe's date-only OADate for
+    /// 2026-04-24 Bangkok (46136 — the same serial
+    /// `writeback::recipes::cash_entry`'s own tests assert) reads back through
+    /// [`ole_serial_to_utc`] as midnight Bangkok, i.e. 14h32m EARLIER than the
+    /// app instant and on the previous UTC day. If this ever goes green-by-
+    /// accident (e.g. the recipe starts emitting a time fraction), the guard
+    /// below can be revisited. No DB needed.
+    #[test]
+    fn midnight_bangkok_fixture_matches_ole_round_trip() {
+        let round_tripped = ole_serial_to_utc(46136.0).expect("46136 is a valid OADate");
+        assert_eq!(round_tripped, midnight_bkk_2026_04_24());
+        let app = app_instant_2026_04_24_1432();
+        assert!(
+            round_tripped < app,
+            "the round trip must move the instant BACKWARDS ({round_tripped} vs {app})"
+        );
+        assert_eq!(
+            (app - round_tripped).num_minutes(),
+            14 * 60 + 32,
+            "date-only round trip loses exactly the app entry's time-of-day"
+        );
+        assert_ne!(
+            round_tripped.date_naive(),
+            app.date_naive(),
+            "…and lands on the previous UTC day"
+        );
+    }
+
+    /// THE BUG this fix closes: once `cash_legacy_id` is back-populated onto
+    /// an app-originated row (the precondition `writeback/recipes/cash_entry.rs`
+    /// documents), the poll's next re-import of that same legacy row must
+    /// UPDATE it in place — WITHOUT silently downgrading `cash_source` from
+    /// `'app'` to `'legacy'`. Red on the pre-fix SQL (`cash_source` was
+    /// assigned unconditionally); green once the `CASE` folds in the
+    /// existing value.
+    #[tokio::test]
+    async fn reimporting_a_backpopulated_app_row_preserves_app_provenance() {
+        let Some(mut conn) = cash_probe_conn().await else {
+            return;
+        };
+        let mut tx = cash_probe_tx(&mut conn).await;
+        sqlx::query(
+            "INSERT INTO ht_cash_ledger \
+                 (cash_legacy_id, cash_kind, cash_amount, cash_source, cash_created_by) \
+             VALUES (500, 'income', 500.00, 'app', 'reception_alice')",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("seed app-originated row");
+
+        run_cash_upsert(&mut tx, 500).await;
+
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT cash_source, cash_created_by FROM ht_cash_ledger WHERE cash_legacy_id = 500",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .expect("read back");
+        assert_eq!(
+            rows.len(),
+            1,
+            "re-importing a back-populated row must UPDATE it, not insert a \
+             second row: {rows:?}"
+        );
+        assert_eq!(
+            rows[0].0, "app",
+            "cash_source must stay 'app' — a legacy re-import must never \
+             strip an app-originated row's provenance"
+        );
+        assert_eq!(
+            rows[0].1,
+            Some("reception_alice".to_string()),
+            "cash_created_by must be untouched by a re-import"
+        );
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// The direction that must keep working unchanged: a legacy-originated
+    /// row (never touched by our app) re-imports normally — content
+    /// refreshes, `cash_source` stays `'legacy'`. Regression guard for the
+    /// `CASE` added above.
+    #[tokio::test]
+    async fn legacy_originated_reimport_still_updates_and_stays_legacy() {
+        let Some(mut conn) = cash_probe_conn().await else {
+            return;
+        };
+        let mut tx = cash_probe_tx(&mut conn).await;
+        sqlx::query(
+            "INSERT INTO ht_cash_ledger (cash_legacy_id, cash_kind, cash_amount, cash_source) \
+             VALUES (600, 'expense', 100.00, 'legacy')",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("seed legacy-originated row");
+
+        run_cash_upsert(&mut tx, 600).await;
+
+        let rows: Vec<(String, f64)> = sqlx::query_as(
+            "SELECT cash_source, cash_amount::float8 FROM ht_cash_ledger WHERE cash_legacy_id = 600",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .expect("read back");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "legacy");
+        assert_eq!(
+            rows[0].1, 500.0,
+            "a legacy-originated row must still pick up refreshed content"
+        );
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// THE SECOND HALF of the same bug class (the one the const's doc comment
+    /// used to claim was covered): a back-populated app row's PRECISE
+    /// `cash_entry_date` must survive a re-import that carries the
+    /// midnight-truncated date the date-only writeback OADate round-trips
+    /// back as. Also asserts the guard is SURGICAL — the unguarded columns
+    /// (`cash_amount`, `cash_note`) still refresh from `EXCLUDED`, so this is
+    /// not a blanket freeze of the app row.
+    #[tokio::test]
+    async fn reimporting_a_backpopulated_app_row_preserves_its_precise_entry_date() {
+        let Some(mut conn) = cash_probe_conn().await else {
+            return;
+        };
+        let mut tx = cash_probe_tx(&mut conn).await;
+        let app_instant = app_instant_2026_04_24_1432();
+        sqlx::query(
+            "INSERT INTO ht_cash_ledger \
+                 (cash_legacy_id, cash_kind, cash_entry_date, cash_amount, cash_note, cash_source) \
+             VALUES (700, 'income', $1, 111.00, 'app note', 'app')",
+        )
+        .bind(app_instant)
+        .execute(&mut *tx)
+        .await
+        .expect("seed app-originated row with a precise instant");
+
+        // The legacy mirror of our own write: Pay_Date is a whole-day OADate,
+        // so it reads back as midnight Bangkok (17:00Z the previous day).
+        run_cash_upsert_at(&mut tx, 700, midnight_bkk_2026_04_24()).await;
+
+        let rows: Vec<(chrono::DateTime<Utc>, f64, Option<String>)> = sqlx::query_as(
+            "SELECT cash_entry_date, cash_amount::float8, cash_note \
+               FROM ht_cash_ledger WHERE cash_legacy_id = 700",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .expect("read back");
+        assert_eq!(rows.len(), 1, "must UPDATE in place, not insert: {rows:?}");
+        assert_eq!(
+            rows[0].0, app_instant,
+            "cash_entry_date must keep the app's 14:32 Bangkok instant — a \
+             date-only legacy re-import must not truncate it to midnight"
+        );
+        assert_eq!(
+            rows[0].1, 500.0,
+            "the guard is scoped to cash_entry_date: cash_amount must still \
+             refresh from the legacy row"
+        );
+        assert_eq!(
+            rows[0].2.as_deref(),
+            Some("re-imported"),
+            "the guard is scoped to cash_entry_date: cash_note must still \
+             refresh from the legacy row"
+        );
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// The direction that must keep working: a legacy-originated entry keeps
+    /// tracking the legacy row's `Pay_Date` on every re-import. This is why
+    /// the guard is a provenance `CASE` rather than the bare
+    /// `COALESCE(cash_entry_date, $2)` `sync/mappers/payment.rs` uses — the
+    /// `CASE` is a strict superset of it: same fill-when-absent behaviour on
+    /// app rows, but legacy rows stay legacy-authoritative.
+    ///
+    /// That matters because `TB_Pay_History.Pay_Date` is not derived from the
+    /// insert; it is whatever the operator picked in the entry form
+    /// (`DateTimePicker1.Value.ToOADate()` —
+    /// `docs/legacy-app/COMPAT_CHEATSHEET.md:85`), so we hold nothing that
+    /// could reconstruct it. Combined with the importer's 120-day rescan
+    /// window ([`CASH_WINDOW_DAYS`]), a blanket COALESCE would permanently
+    /// freeze whatever value the FIRST poll to see the row happened to
+    /// observe, for every row, forever.
+    #[tokio::test]
+    async fn legacy_originated_reimport_still_updates_its_entry_date() {
+        let Some(mut conn) = cash_probe_conn().await else {
+            return;
+        };
+        let mut tx = cash_probe_tx(&mut conn).await;
+        sqlx::query(
+            "INSERT INTO ht_cash_ledger \
+                 (cash_legacy_id, cash_kind, cash_entry_date, cash_amount, cash_source) \
+             VALUES (800, 'expense', $1, 100.00, 'legacy')",
+        )
+        .bind(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap())
+        .execute(&mut *tx)
+        .await
+        .expect("seed legacy-originated row");
+
+        run_cash_upsert_at(&mut tx, 800, midnight_bkk_2026_04_24()).await;
+
+        let date: chrono::DateTime<Utc> = sqlx::query_scalar(
+            "SELECT cash_entry_date FROM ht_cash_ledger WHERE cash_legacy_id = 800",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("read back");
+        assert_eq!(
+            date,
+            midnight_bkk_2026_04_24(),
+            "a legacy-originated row's date must stay legacy-authoritative"
+        );
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// The `COALESCE` half of the guard: an app row with NO date yet (the
+    /// column is nullable) must still be FILLED by the re-import rather than
+    /// left blank — same fill-when-absent semantics as
+    /// `sync/mappers/payment.rs`'s `pay_date = COALESCE(pay_date, $2)`.
+    #[tokio::test]
+    async fn reimport_fills_a_null_entry_date_on_an_app_row() {
+        let Some(mut conn) = cash_probe_conn().await else {
+            return;
+        };
+        let mut tx = cash_probe_tx(&mut conn).await;
+        sqlx::query(
+            "INSERT INTO ht_cash_ledger \
+                 (cash_legacy_id, cash_kind, cash_entry_date, cash_amount, cash_source) \
+             VALUES (900, 'income', NULL, 100.00, 'app')",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("seed app row with no date");
+
+        run_cash_upsert_at(&mut tx, 900, midnight_bkk_2026_04_24()).await;
+
+        let date: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT cash_entry_date FROM ht_cash_ledger WHERE cash_legacy_id = 900",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("read back");
+        assert_eq!(
+            date,
+            Some(midnight_bkk_2026_04_24()),
+            "guarding must not mean 'never write' — a NULL app date is filled"
+        );
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// PINS THE KNOWN, ACCEPTED GAP (issue #202, "still open" in
+    /// `sync_cash_history`'s doc comment) — NOT something this importer can
+    /// fix alone. An app row whose `cash_legacy_id` was never back-populated
+    /// (because no `WritebackIntent::CreateCashEntry` /
+    /// `back_populate_legacy_ids` arm exists yet) has no way to be found by
+    /// `ON CONFLICT (cash_legacy_id)`, so the "same" transaction re-imported
+    /// under a legacy id lands as a genuine second row. This test exists so
+    /// nobody mistakes the provenance fix above for having closed this —
+    /// closing it requires wiring back-population (`dispatcher.rs` /
+    /// `bin/writeback.rs`, out of scope for this importer).
+    #[tokio::test]
+    async fn reimport_without_backpopulation_still_duplicates() {
+        let Some(mut conn) = cash_probe_conn().await else {
+            return;
+        };
+        let mut tx = cash_probe_tx(&mut conn).await;
+        sqlx::query(
+            "INSERT INTO ht_cash_ledger (cash_legacy_id, cash_kind, cash_amount, cash_source) \
+             VALUES (NULL, 'income', 500.00, 'app')",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("seed un-backpopulated app row");
+
+        // The legacy mirror of that same transaction arrives as a NEW
+        // legacy id (500) because nothing stamped it onto the app row above.
+        run_cash_upsert(&mut tx, 500).await;
+
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ht_cash_ledger")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("count");
+        assert_eq!(
+            total, 2,
+            "documented gap: without back-population this importer cannot \
+             avoid a duplicate — if this now reads 1, back-population has \
+             been wired and this test (and the doc comment pointing at it) \
+             should be updated, not deleted"
+        );
+        tx.rollback().await.expect("rollback");
     }
 }
 
