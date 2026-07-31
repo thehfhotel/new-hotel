@@ -66,99 +66,114 @@
 //!   PG housekeeping flag-flip is unsafe (a mobile-app mark-dirty must
 //!   not cut power to a room a guest just left their luggage in); power
 //!   is owned by the dedicated power-control flow.
-//! * **The `HT_Housewife` INSERT is retained**, shared byte-for-byte with
-//!   `mark_clean` via [`super::mark_clean::build_housewife_audit_insert`].
-//!   `HT_Housewife` is iHOTEL's general housekeeping log — "every clean /
-//!   dirty / repair action" (`COMPAT_CHEATSHEET.md` §`HT_Housewife`), with
-//!   §3.15 send-to-maintenance writing one too — so a row here is in
-//!   keeping with the table's contract, and it is the only trace of *who*
-//!   flagged the room that reaches iHOTEL. It carries the Track C T5
-//!   HIGH-3 dedup guard (5-minute `WHERE NOT EXISTS` window on
-//!   `(h_room, h_cin)`) instead of the legacy bare `VALUES` — same
-//!   retry/concurrency rationale as `mark_clean`. Known artifact: a
-//!   dirty→clean (or clean→dirty) pair on the same room within 5 minutes
-//!   logs only ONE audit row, because both flows guard on the same
-//!   `(h_room, h_cin)` key. The `HT_Rooms` flag statement always runs, so
-//!   grid state stays correct; only the audit log under-counts in that
-//!   window.
-//! * `h_note` is `''` — iHOTEL lets the housekeeper type a free-text
-//!   note; our mark-dirty command has no note field today. (iHOTEL's own
-//!   `h_note` is the discriminator between start-cleaning / end-cleaning /
-//!   sent-to-repair rows, so an empty note is indistinguishable from a
-//!   clean row in `FrmReportHousewife`. Filed as a follow-up rather than
-//!   inventing a Thai literal that appears in no capture.)
+//! * **The `HT_Housewife` INSERT is NOT emitted — removed 2026-07-31,
+//!   issue #276.** It was carried over from `mark_clean` on the theory
+//!   that `HT_Housewife` is a general "every clean / dirty / repair
+//!   action" log (`COMPAT_CHEATSHEET.md` §`HT_Housewife` prose) and that
+//!   the row was "the only trace of *who* flagged the room" reaching
+//!   iHOTEL. Both premises were wrong:
+//!
+//!   1. **iHOTEL itself never inserts an `HT_Housewife` row on a
+//!      standalone dirty flip.** The two live-captured dirty writes
+//!      (findings.md §3e Phase 2, §3i) touch only `HT_Rooms` — no
+//!      `HT_Housewife` INSERT anywhere in either capture. The decompile
+//!      confirms this structurally: `COMPAT_CHEATSHEET.md`'s "Mark dirty"
+//!      bullet (check-out / cancel-check-in) has no `HT_Housewife`
+//!      step, and `FEATURE_MAP.md` §J7 says it outright — "the dirty
+//!      flag itself, `Room_Clean='yes'`, is raised by check-out /
+//!      cancel-check-in ... not by these forms" (the housewife-writing
+//!      forms are `ClickClean`/`ClickCleanOK`, both mark-CLEAN). So there
+//!      was never an iHOTEL "trace of who dirtied the room" to begin
+//!      with — `HT_Housewife` is scoped to cleaning/repair completion,
+//!      not to dirtying. Suppressing our INSERT does not remove
+//!      anything iHOTEL itself provides; it removes a row our own
+//!      recipe invented that has no legacy analog.
+//!   2. **`h_note` does not discriminate a dirty-flag row from a real
+//!      cleaning even if we kept writing it.** Live distribution query
+//!      2026-07-31 (`HT_Housewife`, `db`, HF Hotel): 31,802 of ~31,922
+//!      rows carry `h_note=''`, the rest are `'ปิดโดยโปรแกรม'` (62,
+//!      unrelated system-close note) and `'เปลี่ยนสถานะเป็นซ่อม : '`
+//!      (58, the §3.15 send-to-maintenance discriminator). There is no
+//!      note pattern anywhere in the real data for a bare dirty flip,
+//!      confirming there is nothing to mirror.
+//!
+//!   `FrmReportHousewife` (รายงานแม่บ้าน) reads `HT_Housewife(R)` +
+//!   `TB_MRP_EMPLOYEE(R)` and counts/groups by `h_name`/date
+//!   (`REPORTS_INVENTORY.md` §3.10, `FEATURE_MAP.md` §J7 "counts by
+//!   employee") with no `h_note` filter documented anywhere in the
+//!   decompile. Every row it counts is a real housekeeping action in
+//!   iHOTEL's own world; a dirty-flag row from our app inflates that
+//!   count with a phantom cleaning. Byte-parity to legacy now means
+//!   emitting *nothing* to `HT_Housewife` here, matching iHOTEL exactly
+//!   — see issue #276 for the full evidence pass and the two other
+//!   options considered (and rejected: inventing a Thai discriminator
+//!   literal that appears in no capture, or accepting the phantom count).
+//!   `fetch_prior_occupant` / `PriorOccupant` existed solely to populate
+//!   that INSERT's `h_cin`/`h_cin_name` — with the INSERT gone, this
+//!   recipe no longer performs a prior-occupant lookup (one fewer legacy
+//!   MSSQL round trip per dirty flip) and no longer imports them from
+//!   `mark_clean`.
 
-use chrono::{DateTime, Utc};
-
-use super::mark_clean::{build_housewife_audit_insert, fetch_prior_occupant, PriorOccupant};
 use crate::writeback::allocate::LegacyConn;
 use crate::writeback::dispatcher::LegacyIds;
 use crate::writeback::error::WritebackResult;
 
-/// Build the 2 statements that mark a room dirty. PURE — no I/O.
+/// Build the single statement that marks a room dirty. PURE — no I/O.
 ///
 /// `room_id` is `HT_Rooms.id` (numeric internal PK — spike §3j critical
-/// finding: NOT `room_no`). Statement 1 is this recipe's OWN flag write
-/// (`Room_Clean='yes'`, findings.md §3e/§3i); statement 2 is the audit row
-/// shared with `mark_clean`. The two recipes must never delegate to each
-/// other's flag statement — that was the 2026-06-11 → 2026-07-28 bug.
-pub fn build_statements(
-    room_id: i32,
-    room_no: &str,
-    by: &str,
-    prior: Option<&PriorOccupant>,
-    now: DateTime<Utc>,
-) -> Vec<String> {
+/// finding: NOT `room_no`). This is this recipe's OWN flag write
+/// (`Room_Clean='yes'`, findings.md §3e/§3i). It must never delegate to
+/// `mark_clean`'s flag statement — that was the 2026-06-11 → 2026-07-28
+/// bug — and, since issue #276, it must never emit an `HT_Housewife`
+/// audit row either (see module doc).
+pub fn build_statements(room_id: i32) -> Vec<String> {
     vec![
-        // 1. Raise the needs-cleaning flag — by HT_Rooms.id (numeric).
-        //    findings.md §3e Phase 2 / §3i: DIRTY is `Room_Clean='yes'`.
+        // Raise the needs-cleaning flag — by HT_Rooms.id (numeric).
+        // findings.md §3e Phase 2 / §3i: DIRTY is `Room_Clean='yes'`.
         format!("update HT_Rooms set Room_Clean='yes' where id={room_id}"),
-        // 2. Audit row in HT_Housewife — shared literal (see module doc).
-        build_housewife_audit_insert(room_no, by, prior, now),
     ]
 }
 
 /// Execute the mark-dirty recipe.
+///
+/// `room_no` and `by` are accepted to match the dispatcher's uniform
+/// `MarkRoomClean`/`MarkRoomDirty` call shape, but are unused here: the
+/// sole statement is keyed by `room_id` alone, and — since issue #276 —
+/// this recipe no longer writes an `HT_Housewife` audit row, so there is
+/// no `h_room`/`h_name` to populate and no prior-occupant lookup to run.
 pub async fn execute(
     conn: &mut LegacyConn<'_>,
-    room_no: &str,
+    _room_no: &str,
     room_id_int: i32,
-    by: &str,
+    _by: &str,
 ) -> WritebackResult<LegacyIds> {
-    let prior = fetch_prior_occupant(conn, room_no).await?;
-    // Capture `Utc::now()` once so the `h_date` stamp is deterministic
-    // relative to the rest of the recipe (T6 HIGH-1 convention).
-    let now = Utc::now();
-    let statements = build_statements(room_id_int, room_no, by, prior.as_ref(), now);
+    let statements = build_statements(room_id_int);
     super::execute_all(conn, &statements).await?;
 
     let mut ids = LegacyIds::new();
     ids.extra
         .insert("room_id".into(), serde_json::Value::from(room_id_int));
-    if let Some(p) = prior {
-        ids.extra
-            .insert("prior_cin_no".into(), serde_json::Value::from(p.cin_no));
-    }
     Ok(ids)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{DateTime, TimeZone, Utc};
 
     fn pinned_now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 6, 11, 9, 30, 0).unwrap()
     }
 
-    /// Byte-pin statement 1 against the findings.md §3e check-out capture
-    /// (`Room_Clean='yes'` = NEEDS cleaning) rendered in the housekeeping
-    /// family's lowercase, `where id=` form (§3e Phase 3 / §3j). Keyed by
-    /// numeric `HT_Rooms.id`, never `room_no` (spike §3j critical finding).
+    /// Byte-pin the (sole) statement against the findings.md §3e check-out
+    /// capture (`Room_Clean='yes'` = NEEDS cleaning) rendered in the
+    /// housekeeping family's lowercase, `where id=` form (§3e Phase 3 /
+    /// §3j). Keyed by numeric `HT_Rooms.id`, never `room_no` (spike §3j
+    /// critical finding).
     #[test]
     fn statement_one_raises_needs_cleaning_flag_by_numeric_id() {
-        let statements = build_statements(6, "306", "Admin", None, pinned_now());
-        assert_eq!(statements.len(), 2);
+        let statements = build_statements(6);
+        assert_eq!(statements.len(), 1, "mark-dirty must be single-statement — see issue #276");
         assert_eq!(
             statements[0],
             "update HT_Rooms set Room_Clean='yes' where id=6"
@@ -174,9 +189,14 @@ mod tests {
     /// ever equals mark-clean's again, this fails.
     #[test]
     fn statement_one_is_not_the_mark_clean_flag_write() {
-        let dirty = build_statements(6, "306", "Admin", None, pinned_now());
-        let clean =
-            crate::writeback::recipes::mark_clean::build_statements(6, "306", "Admin", None, pinned_now());
+        let dirty = build_statements(6);
+        let clean = crate::writeback::recipes::mark_clean::build_statements(
+            6,
+            "306",
+            "Admin",
+            None,
+            pinned_now(),
+        );
         assert_ne!(
             dirty[0], clean[0],
             "mark_dirty must NOT reuse mark_clean's flag statement"
@@ -199,70 +219,41 @@ mod tests {
     /// A standalone housekeeping flag-flip must touch `Room_Clean` only.
     #[test]
     fn statement_one_touches_only_the_clean_flag() {
-        let stmt = &build_statements(6, "306", "Admin", None, pinned_now())[0];
+        let stmt = &build_statements(6)[0];
         assert!(!stmt.to_lowercase().contains("room_use"));
         assert!(!stmt.contains("Room_Use_Count"));
         assert!(!stmt.contains("Room_Manternace"));
         assert!(!stmt.contains("N'"), "must not emit N'…' literals");
     }
 
-    /// Housekeeping audit row: h_name=<by>, h_room, h_date, h_note='',
-    /// h_cin/h_cin_name = latest checked-out occupant.
+    /// Issue #276 regression guard: mark-dirty must NOT insert an
+    /// `HT_Housewife` audit row. Evidence pass (2026-07-31): iHOTEL's own
+    /// dirty-flip writes (findings.md §3e Phase 2, §3i) never touch
+    /// `HT_Housewife` — that table is written only by the cleaning/repair
+    /// actions (`ClickClean`/`ClickCleanOK`/send-to-maintenance —
+    /// cheatsheet §3.13-§3.15, `FEATURE_MAP.md` §J7). A standalone dirty
+    /// flip must mirror that and emit exactly the flag UPDATE, nothing
+    /// else — replaces the old `statement_two_inserts_housewife_audit_row`
+    /// / `housewife_insert_keeps_5_minute_dedup_guard` /
+    /// `housewife_audit_row_stays_in_lockstep_with_mark_clean` tests,
+    /// which asserted the shape of a statement that no longer exists.
     #[test]
-    fn statement_two_inserts_housewife_audit_row() {
-        let prior = PriorOccupant {
-            cin_no: "CH26-005159".into(),
-            customer_full_name: "Jane Doe".into(),
-        };
-        let statements = build_statements(6, "306", "Admin", Some(&prior), pinned_now());
-        let insert = &statements[1];
-        assert!(insert.starts_with("INSERT INTO HT_Housewife"));
-        assert!(insert.contains("'Admin'"));
-        assert!(insert.contains("'306'"));
-        assert!(insert.contains("'CH26-005159'"));
-        assert!(insert.contains("'Jane Doe'"));
+    fn mark_dirty_emits_no_housewife_audit_row() {
+        let statements = build_statements(6);
+        assert_eq!(statements.len(), 1);
+        assert!(
+            !statements.iter().any(|s| s.contains("HT_Housewife")),
+            "mark-dirty must not touch HT_Housewife — see issue #276; got: {statements:?}"
+        );
     }
 
-    /// The Track C dedup guard must carry over (retry / concurrent-event
-    /// idempotency — see module doc for the accepted dirty↔clean
-    /// cross-suppression artifact inside the 5-minute window).
-    #[test]
-    fn housewife_insert_keeps_5_minute_dedup_guard() {
-        let statements = build_statements(6, "306", "Admin", None, pinned_now());
-        let insert = &statements[1];
-        assert!(insert.contains("WHERE NOT EXISTS"));
-        assert!(insert.contains("h_date > DATEADD(minute, -5, GETDATE())"));
-        assert!(insert.contains("h_cin=''"), "no prior occupant ⇒ h_cin=''");
-    }
-
-    /// PURE — repeated calls with the same inputs produce byte-identical
-    /// output (T6 HIGH-1 convention).
+    /// PURE — repeated calls with the same input produce byte-identical
+    /// output (T6 HIGH-1 convention). No longer time-threaded: with the
+    /// `HT_Housewife` INSERT gone, the sole statement has no `now` input.
     #[test]
     fn build_statements_is_pure_with_fixed_instant() {
-        let first = build_statements(6, "306", "Admin", None, pinned_now());
-        let second = build_statements(6, "306", "Admin", None, pinned_now());
+        let first = build_statements(6);
+        let second = build_statements(6);
         assert_eq!(first, second);
-    }
-
-    /// The AUDIT row (statement 2) — and only the audit row — stays
-    /// byte-identical to `mark_clean`'s, because both call
-    /// `mark_clean::build_housewife_audit_insert`. If that shared literal
-    /// ever diverges between the two recipes, this forces a deliberate
-    /// decision here instead of silent drift.
-    #[test]
-    fn housewife_audit_row_stays_in_lockstep_with_mark_clean() {
-        let prior = PriorOccupant {
-            cin_no: "CH26-005159".into(),
-            customer_full_name: "Jane Doe".into(),
-        };
-        let dirty = build_statements(6, "306", "Admin", Some(&prior), pinned_now());
-        let clean = crate::writeback::recipes::mark_clean::build_statements(
-            6,
-            "306",
-            "Admin",
-            Some(&prior),
-            pinned_now(),
-        );
-        assert_eq!(dirty[1], clean[1]);
     }
 }

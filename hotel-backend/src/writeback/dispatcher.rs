@@ -1139,14 +1139,17 @@ pub async fn dispatch(
             })?;
             recipes::mark_clean::execute(conn, room_no, room_id_int, by).await
         }
-        // Audit 2026-06-11 P2 — standalone mark-dirty. Same resolution
-        // contract as MarkRoomClean: the recipe needs both the display
-        // `room_no` (HT_Housewife.h_room + prior-occupant lookup) and
-        // the numeric `HT_Rooms.id` (the flag UPDATE's key — spike §3j).
+        // Audit 2026-06-11 P2 — standalone mark-dirty. Since issue #276
+        // removed the `HT_Housewife` INSERT and its prior-occupant lookup,
+        // the recipe's sole statement is keyed by the numeric
+        // `HT_Rooms.id` alone (spike §3j) — `room_no` is accepted only to
+        // match the dispatcher's uniform `MarkRoomClean`/`MarkRoomDirty`
+        // call shape (`mark_dirty::execute`'s `_room_no` parameter) and is
+        // never read by the recipe, so its absence must not hard-fail the
+        // job the way it legitimately does for `MarkRoomClean` (which
+        // still needs it for its own `HT_Housewife` insert, below).
         WritebackIntent::MarkRoomDirty { room_id: _, by } => {
-            let room_no = nonempty(resolved.legacy_room_no.as_ref()).ok_or_else(|| {
-                WritebackError::Recipe("MarkRoomDirty requires resolved legacy_room_no".into())
-            })?;
+            let room_no = nonempty(resolved.legacy_room_no.as_ref()).unwrap_or("");
             let room_id_int = resolved.legacy_room_id_int.ok_or_else(|| {
                 WritebackError::Recipe(
                     "MarkRoomDirty requires resolved legacy_room_id_int (HT_Rooms.id)".into(),
