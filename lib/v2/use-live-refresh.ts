@@ -13,6 +13,15 @@ import { useEffect, useRef, useState } from 'react'
  * EventSource, and reception staff toggle between iHOTEL and this app, so a
  * change made while our tab was hidden is picked up the moment they switch back.
  *
+ * Always ALSO listens for the canonical `refresh` event
+ * (`hotel-backend/src/routes/events.rs::RESYNC_EVENT`) regardless of the
+ * `events` subset a caller passes in. That's the signal the backend emits
+ * after a listener reconnect or a lagged subscriber — "you may have missed
+ * something" — so every page must refetch on it, not just the ones that
+ * happen to list a matching domain-event name. This is what lets the backend
+ * keep that resync burst down to one event name instead of replaying it under
+ * every `DomainEvent` variant for back-compat.
+ *
  * Encapsulates the EventSource + debounce + cleanup that the rooms/dashboard
  * pages hand-rolled, so the other reception screens can subscribe in one line.
  * `onRefresh` is held in a ref so a new closure each render doesn't tear down +
@@ -45,7 +54,10 @@ export function useLiveRefresh(
     es.onopen = () => setLive(true)
     es.onerror = () => setLive(false)
     const evs = eventKey ? eventKey.split(',') : []
-    evs.forEach((e) => es.addEventListener(e, schedule))
+    // De-duped: the canonical resync signal always gets a listener, even if
+    // a caller's `events` list happens to include it already.
+    const withResync = evs.includes('refresh') ? evs : [...evs, 'refresh']
+    withResync.forEach((e) => es.addEventListener(e, schedule))
     const onVis = () => {
       if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
         onRefreshRef.current()

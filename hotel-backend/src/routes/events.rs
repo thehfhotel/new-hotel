@@ -132,39 +132,23 @@ const HELLO_COMMENT: &str = "connected";
 /// event.
 pub const RESYNC_EVENT: &str = "refresh";
 
-/// Event names a resync burst is replayed under.
+/// Event name(s) a resync burst is replayed under.
 ///
-/// **Why a burst and not a single `refresh` frame:** both browser consumers
+/// **Formerly a 12-name compat tail** (one frame per [`DomainEvent::type_name`]
+/// variant, [`RESYNC_EVENT`] leading): both browser consumers
 /// (`lib/v2/use-live-refresh.ts` and the classic dashboard in `app/page.tsx`)
-/// subscribe with `EventSource.addEventListener(<name>, …)` — there is no
-/// wildcard/`onmessage` listener anywhere, so a lone `refresh` frame would be
-/// silently dropped by every page. Replaying the resync under each
-/// [`DomainEvent::type_name`] guarantees it reaches whatever subset a page
-/// listens for, with **zero frontend change**. The pages debounce 500ms, so
-/// the burst collapses into exactly one refetch.
+/// used to subscribe only with `EventSource.addEventListener(<domain-event
+/// name>, …)` — no wildcard/`onmessage` listener anywhere — so a lone
+/// `refresh` frame would have been silently dropped by every page. Replaying
+/// the resync under every domain-event name guaranteed it reached whatever
+/// subset a page listened for, with zero frontend change.
 ///
-/// [`RESYNC_EVENT`] leads the list: it is the self-documenting name for
-/// operators (`curl -N /api/events` shows `event: refresh`) and the name a
-/// future frontend should key on so the compat tail can be deleted.
-///
-/// Kept in sync with `outbox::event::DomainEvent` — the exhaustive match in
-/// `tests::resync_burst_covers_every_domain_event_name` fails to compile if a
-/// variant is added without updating this list.
-const RESYNC_FANOUT_EVENTS: &[&str] = &[
-    RESYNC_EVENT,
-    "BookingCreated",
-    "BookingModified",
-    "BookingCancelled",
-    "CheckInCreated",
-    "CheckOutCompleted",
-    "CheckInCancelled",
-    "CustomerCreated",
-    "CustomerModified",
-    "PaymentReceived",
-    "PaymentRefunded",
-    "RoomMarkedClean",
-    "RoomMarkedDirty",
-];
+/// Both consumers now ALSO listen for [`RESYNC_EVENT`] unconditionally, on
+/// top of whatever domain-event subset each page cares about (see the
+/// `useLiveRefresh` doc comment and the SSE effect in `app/page.tsx`), so the
+/// tail collapsed to this one canonical name — also the self-documenting name
+/// for operators (`curl -N /api/events` shows `event: refresh`).
+const RESYNC_FANOUT_EVENTS: &[&str] = &[RESYNC_EVENT];
 
 /// Which canonical database an event came from. Carried on every broadcast
 /// item so a `branch=all` stream stays attributable in logs, and so the two
@@ -433,10 +417,9 @@ fn frame_stream(
 /// JSON body carried by every frame of a resync burst.
 ///
 /// Deliberately NOT shaped like a real [`DomainEvent`]: the burst is replayed
-/// under domain-event *names* for browser compatibility (see
-/// [`RESYNC_FANOUT_EVENTS`]), so anything that does parse the body must see
-/// immediately that this is a refetch marker and not a booking/check-in that
-/// actually happened.
+/// under the canonical resync name(s) (see [`RESYNC_FANOUT_EVENTS`]), so
+/// anything that does parse the body must see immediately that this is a
+/// refetch marker and not a booking/check-in that actually happened.
 fn resync_payload(site: Option<EventSite>, reason: &str) -> String {
     serde_json::json!({
         "type": "Resync",
@@ -608,59 +591,21 @@ mod tests {
         stream.as_mut().poll_next(&mut cx)
     }
 
-    /// Compile-time coverage guard for [`RESYNC_FANOUT_EVENTS`].
-    ///
-    /// This never runs — it exists so that adding a `DomainEvent` variant
-    /// makes the exhaustive match below fail to compile, pointing the
-    /// maintainer at the list the new name must be added to.
-    #[allow(dead_code)]
-    fn every_domain_event_name(event: &DomainEvent) -> &'static str {
-        match event {
-            DomainEvent::BookingCreated { .. } => "BookingCreated",
-            DomainEvent::BookingModified { .. } => "BookingModified",
-            DomainEvent::BookingCancelled { .. } => "BookingCancelled",
-            DomainEvent::CheckInCreated { .. } => "CheckInCreated",
-            DomainEvent::CheckOutCompleted { .. } => "CheckOutCompleted",
-            DomainEvent::CheckInCancelled { .. } => "CheckInCancelled",
-            DomainEvent::CustomerCreated { .. } => "CustomerCreated",
-            DomainEvent::CustomerModified { .. } => "CustomerModified",
-            DomainEvent::PaymentReceived { .. } => "PaymentReceived",
-            DomainEvent::PaymentRefunded { .. } => "PaymentRefunded",
-            DomainEvent::RoomMarkedClean { .. } => "RoomMarkedClean",
-            DomainEvent::RoomMarkedDirty { .. } => "RoomMarkedDirty",
-        }
-    }
-
-    /// The resync burst must reach every page: each browser consumer filters
-    /// by `addEventListener(<DomainEvent name>)`, so a name missing from the
-    /// burst means that page silently never refetches after a listener
-    /// reconnect.
+    /// The resync burst is down to the one canonical name: both browser
+    /// consumers (`lib/v2/use-live-refresh.ts`, `app/page.tsx`) now listen
+    /// for [`RESYNC_EVENT`] unconditionally, on top of whatever domain-event
+    /// subset each page cares about — see the doc comment on
+    /// [`RESYNC_FANOUT_EVENTS`] for the history of the 12-name compat tail
+    /// this replaced. If this test starts failing because someone widened the
+    /// list again, confirm the widening is actually needed (a frontend
+    /// consumer that doesn't listen for `refresh`) before accepting it.
     #[test]
-    fn resync_burst_covers_every_domain_event_name() {
-        for name in [
-            "BookingCreated",
-            "BookingModified",
-            "BookingCancelled",
-            "CheckInCreated",
-            "CheckOutCompleted",
-            "CheckInCancelled",
-            "CustomerCreated",
-            "CustomerModified",
-            "PaymentReceived",
-            "PaymentRefunded",
-            "RoomMarkedClean",
-            "RoomMarkedDirty",
-        ] {
-            assert!(
-                RESYNC_FANOUT_EVENTS.contains(&name),
-                "{name} missing from RESYNC_FANOUT_EVENTS — pages listening only for it \
-                 would never refetch after a listener reconnect",
-            );
-        }
+    fn resync_burst_is_the_single_canonical_event() {
         assert_eq!(
-            RESYNC_FANOUT_EVENTS.first(),
-            Some(&RESYNC_EVENT),
-            "the canonical `refresh` name must lead the burst",
+            RESYNC_FANOUT_EVENTS,
+            &[RESYNC_EVENT],
+            "resync burst should be exactly one frame now that every frontend \
+             consumer listens for the canonical `refresh` event",
         );
     }
 
