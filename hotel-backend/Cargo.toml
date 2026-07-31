@@ -54,6 +54,10 @@ name = "backfill_room_calendar"
 path = "src/bin/backfill_room_calendar.rs"
 
 [[bin]]
+name = "backfill_guest_registry_companions"
+path = "src/bin/backfill_guest_registry_companions.rs"
+
+[[bin]]
 name = "create_user"
 path = "src/bin/create_user.rs"
 

@@ -177,6 +177,7 @@ RUN --mount=type=cache,target=/sccache,id=sccache-backend \
         --bin backfill_payment_ledger \
         --bin backfill_receipt_payments \
         --bin backfill_room_calendar \
+        --bin backfill_guest_registry_companions \
         --bin migrate_legacy \
         --bin create_user; \
     sccache --show-stats; \
@@ -191,6 +192,7 @@ RUN --mount=type=cache,target=/sccache,id=sccache-backend \
     cp target/release/backfill_payment_ledger /out/; \
     cp target/release/backfill_receipt_payments /out/; \
     cp target/release/backfill_room_calendar /out/; \
+    cp target/release/backfill_guest_registry_companions /out/; \
     cp target/release/migrate_legacy /out/; \
     cp target/release/create_user /out/; \
     rm -rf target
@@ -241,6 +243,7 @@ COPY --from=builder /out/backfill_legacy_bookings /app/backfill_legacy_bookings
 COPY --from=builder /out/backfill_payment_ledger /app/backfill_payment_ledger
 COPY --from=builder /out/backfill_receipt_payments /app/backfill_receipt_payments
 COPY --from=builder /out/backfill_room_calendar /app/backfill_room_calendar
+COPY --from=builder /out/backfill_guest_registry_companions /app/backfill_guest_registry_companions
 COPY --from=builder /out/migrate_legacy /app/migrate_legacy
 COPY --from=builder /out/create_user /app/create_user
 
