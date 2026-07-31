@@ -1,8 +1,49 @@
 # ADR 0005 — NULL-clear sentinel semantics for guarded reconcile-gate terms
 
-**Status:** Proposed (design only — NOT implemented). Written 2026-07-31 in response to
-issue #269 / plan-item T4, which is explicitly flagged "do NOT attempt as a side task."
-This document makes it safe to attempt later; it does not attempt it.
+**Status:** **ACCEPTED 2026-07-31 — the `legacy_cust_no` gap is knowingly accepted, not
+fixed.** The `book_notes` half was implemented the same day (`4bbaf4c`). The
+`legacy_cust_no` half remains designed-and-unbuilt by deliberate decision (owner call,
+2026-07-31), guarded instead by a runtime tripwire — see "Acceptance" below.
+Written 2026-07-31 in response to issue #269 / plan-item T4, which is explicitly flagged
+"do NOT attempt as a side task." This document makes it safe to attempt later; it does not
+attempt it.
+
+## Acceptance (2026-07-31)
+
+**The pre-flight audit in §5 was run against production, both sites:**
+
+```
+HF Hotel  HT_Book_H.Book_Cust_ID    IS NULL → 0
+HF Hotel  HT_CheckIn_H.Cin_cust_no  IS NULL → 0
+HF Ville  HT_Book_H.Book_Cust_ID    IS NULL → 0
+HF Ville  HT_CheckIn_H.Cin_cust_no  IS NULL → 0
+```
+
+That converts §3a's "no known live path" from an inference into a verified fact: the gap is
+real in the type system and has **zero occurrences in production**. Combined with the
+decompile evidence that iHOTEL's only clear-like mutation writes the `'C0000'` sentinel
+(Some→Some, already handled correctly), there is no reachable trigger.
+
+**Decision:** accept the gap. Building the versioned-hash migration (§5, 3-5 focused days
+plus a coordinated two-site rollout) means touching the most dangerous machinery in this
+codebase — pinned hash bytes, both sites — for a failure mode that has never occurred and
+that the vendor app cannot cause. That contradicts the project's own alerting principle
+(page on confirmed failures, not theoretical ones).
+
+**The residual risk is therefore narrow and specific:** somebody hand-edits legacy MSSQL
+and introduces a NULL, silently activating the gap. Two guards cover the ways that could
+happen:
+
+| Vector | Guard | Status |
+|---|---|---|
+| iHOTEL **schema** change (column renamed/retyped/dropped) | `writeback/fingerprint.rs` hashes column shapes on startup and **refuses to boot** on mismatch. Both `HT_Book_H` and `HT_CheckIn_H` are in the fingerprinted set. | Pre-existing |
+| A **value** hand-written to NULL | Per-tick NULL-count tripwire on both columns, Slack alert on any non-zero. Expected to never fire — if it does, someone edited the DB directly. | Added 2026-07-31 |
+
+**Revisit this decision if** the tripwire fires, the audit ever returns non-zero, or a
+concrete incident makes the trigger real (the most plausible being guest-document
+misattribution via `checkins.legacy_cust_no`, which feeds
+`routes/guest_documents.rs` — see §7). Until then the design below is complete and ready to
+build, and deliberately unscheduled.
 **Scope:** `hotel-backend/src/sync/gate_guard.rs` and the `guarded: true` gate terms in
 `sync/mappers/booking.rs`, `sync/mappers/checkin.rs`, plus the related (but structurally
 different) residuals in `sync/mappers/room.rs` and `sync/mappers/customer.rs`.

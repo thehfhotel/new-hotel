@@ -182,6 +182,25 @@ allocates ids app-side (MAX+1, race-prone) — a duplicate-id race that used to 
 silently now hard-fails iHOTEL's INSERT on the PK. If a receptionist reports a save
 error in iHOTEL, check for a concurrent same-table save first.
 
+**Before hand-editing ANY legacy value (not just schema) — read this.** Two guards
+exist, and one accepted gap sits between them:
+
+1. **Schema is guarded automatically.** `hotel-backend/src/writeback/fingerprint.rs`
+   hashes the column shapes of every legacy table we touch on startup and **refuses to
+   boot** on a mismatch. A hand-applied `ALTER` will stop the workers, not corrupt data.
+   Re-capture via `scripts/writeback-fingerprint.sh` if a change is ever legitimate.
+2. **NEVER hand-write SQL `NULL` into `HT_Book_H.Book_Cust_ID` or
+   `HT_CheckIn_H.Cin_cust_no`.** Our sync cannot represent a legacy value being
+   *cleared* (it is indistinguishable from "not observed"), so canonical would keep the
+   stale customer id **forever** and the resulting reconcile row **can never
+   auto-close** — a permanent, unfixable page. iHOTEL itself never does this: its
+   customer-delete cascade writes the reserved sentinel `'C0000'` instead, which is
+   Some→Some and handled correctly. Audited 2026-07-31: zero NULLs on both columns at
+   both sites. A per-tick tripwire alerts if that ever changes. If you genuinely must
+   clear a customer link, **write `'C0000'`, never NULL.**
+   Full analysis and the designed (deliberately unbuilt) fix:
+   `docs/adr/0005-null-clear-sentinel-semantics.md`.
+
 ### HotelNew Tables (owned by this app, PostgreSQL - all lowercase)
 
 All tables in the HotelNew database are owned by this application:
