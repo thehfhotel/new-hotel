@@ -921,9 +921,18 @@ services:
       # close. That is the exact failure #273 was filed to prevent
       # ("detection with no remediation"). The business-key re-key fixed the
       # KEYING; it did not teach the comparison to exclude rows that
-      # structurally cannot have a legacy counterpart. Fix that first — see
-      # #273 — then re-enable.
-      - RECONCILE_MIRROR_PROBE_ENABLED=${HFVILLE_RECONCILE_MIRROR_PROBE_ENABLED:-false}
+      # structurally cannot have a legacy counterpart.
+      #
+      # RE-ENABLED 2026-08-01 with that fix in place: the canonical side of
+      # the business-key comparison now counts MIRRORED rows only
+      # (rcal_legacy_id IS NOT NULL), in the one fetch shared by detection
+      # and closure, so the count identity holds (Ville 1,637 vs 1,637) and
+      # a recorded row can actually close. NB the excluded rows are DETACHED
+      # formerly-mirrored tiles (mapper id-reuse pre-clear), a genuine
+      # surplus class deliberately out of scope here and tracked as #281 —
+      # probe silence means "mirrored state matches legacy", not "canonical
+      # is clean".
+      - RECONCILE_MIRROR_PROBE_ENABLED=${HFVILLE_RECONCILE_MIRROR_PROBE_ENABLED:-true}
       # Phase 6-D — payment-ledger per-folio probe (HT_CheckIn_Pay ↔
       # ht_payment_ledger). DETECTION ONLY; writes nothing but
       # ht_reconcile_log — no ack cache and no new PG table. This worker runs
