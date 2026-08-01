@@ -437,23 +437,50 @@ services:
       # issues zero MSSQL and zero PG queries. Enable HF VILLE FIRST, soak
       # 48h, then HF Hotel — in an announced window.
       #
-      # SCOPE: the legacy scan is floored at MIN(ledger_legacy_id) — the
-      # canonical mirror's own coverage boundary, derived, never configured
-      # — as a HAVING over the per-folio MIN, so a folio straddling the
-      # boundary is excluded whole rather than compared on a partial line
-      # set. Unfloored the first tick would weigh ~20k legacy folios against
-      # ~1.3k canonical ones.
+      # SCOPE: the legacy scan is floored at GREATEST(persisted watermark,
+      # MIN(ledger_legacy_id)) — the canonical mirror's own coverage
+      # boundary, derived, never configured, but CLAMPED to a non-decreasing
+      # watermark in ht_reconcile_era_floor.era_floor_id (migration 084).
+      # It is applied as a HAVING over the per-folio MIN, so a folio
+      # straddling the boundary is excluded whole rather than compared on a
+      # partial line set.
       #
-      # EXPECT AT HF HOTEL: exactly 19 rows on the first tick (2026-07-28
-      # read-only), all missing_pg, contiguous at the era boundary
-      # (CH26-004952…CH26-004971 minus CH26-004960) — folios whose payments
-      # the Track J7e backfill never reached, i.e. money the round report
-      # under-counts today. They are CLOSEABLE: re-drive with
-      # `docker compose run --rm backend backfill_payment_ledger` (bin
-      # `backfill_payment_ledger`) and the next auto-resolve sweep resolves
-      # them. Nothing closes them on its own, and the >72h escalation tier
-      # WILL fire if they are left, so pre-set
-      # LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_<SITE> or flip in a window.
+      # The clamp is not theory: a raw MIN is only a valid boundary while
+      # coverage is an id-contiguous SUFFIX, and the mirror writes WHOLE
+      # folios. On 2026-07-30 a `backfill_payment_ledger --days=212` run
+      # mirrored a monthly-billed Ville long-stay carrying a 2025-08 line,
+      # dragging the floor back ~7 months and sweeping 404 never-mirrored
+      # folios into the scan as missing_pg (zero genuine). The ratchet makes
+      # that unrepeatable; the tick log and the aggregate row now print
+      # BOTH the derived and the effective floor, so a future drag attempt
+      # is visible rather than silent.
+      #
+      # ENABLE-ORDER CONSTRAINT — do NOT turn this on at a site until that
+      # site's `backfill_payment_ledger --all` has COMPLETED. The first
+      # enabled tick seeds ht_reconcile_era_floor.era_floor_id from whatever
+      # coverage exists at that moment and the ratchet then holds it, so a
+      # floor seeded from a narrow date-windowed coverage window would keep
+      # excluding the older folios a later `--all` lands — forever. If a
+      # watermark was seeded before a coverage-widening backfill, fix it
+      # with `DELETE FROM ht_reconcile_era_floor WHERE
+      # table_name='payment_ledger_probe'` on that site's canonical DB and
+      # let the next tick re-derive. A watermark that holds for ~1h raises
+      # the `era_floor_held:` Slack alert naming both floors.
+      #
+      # HF HOTEL STATUS 2026-08-01: the `--all` backfill has NOT run yet —
+      # it is scheduled for tonight. Until it completes, this flag stays
+      # false. EXPECT ON THE FIRST TICK AFTER IT: the 19 missing_pg folios
+      # measured 2026-07-28 (CH26-004952…CH26-004971 minus CH26-004960 —
+      # folios the Track J7e backfill never reached) should already be
+      # CLOSED by that run, which also lowers the derived floor to the
+      # absolute legacy minimum, making the in-era set the whole legacy
+      # table. If they are still open, they are real: money the round
+      # report under-counts, CLOSEABLE by re-driving with
+      # `docker compose run --rm backend backfill_payment_ledger`, after
+      # which the next auto-resolve sweep resolves them. Nothing closes
+      # such a row on its own, and the >72h escalation tier WILL fire if it
+      # is left, so flip in a window (or pre-set
+      # LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_<SITE>).
       - RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED=${RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED:-false}
       # ADR 0005 NULL-clear sentinel tripwire (docs/adr/0005-null-clear-sentinel-semantics.md).
       # Two read-only SELECT COUNT(*)s per reconcile tick (HT_Book_H.Book_Cust_ID,
@@ -938,22 +965,45 @@ services:
       # ht_reconcile_log — no ack cache and no new PG table. This worker runs
       # Ville's reconcile, so the knob is LIVE here — and Ville is the canary:
       # enable HERE first, soak 48h, then flip the backend (HF Hotel).
-      # Ships DARK. Ville is EXACTLY converged today (2026-07-28, read-only:
-      # 1016 in-era folios, identical line counts, itemized amounts AND
-      # receipt-deduped tenders on both sides), so a green soak here is a
-      # clean baseline rather than proof the detector fires — HF Hotel is
-      # where the 19 known missing_pg folios live. Watch for a QUIET ledger;
-      # anything new here is a genuine mirror gap in the money the round
-      # report reads, remediable with the backfill_payment_ledger bin.
+      # Ships DARK. Ville measured EXACTLY converged on 2026-07-28
+      # (read-only: 1016 in-era folios, identical line counts, itemized
+      # amounts AND receipt-deduped tenders on both sides), so a green soak
+      # here is a clean baseline rather than proof the detector fires. Watch
+      # for a QUIET ledger; anything new here is a genuine mirror gap in the
+      # money the round report reads, remediable with the
+      # backfill_payment_ledger bin.
       #
       # ENABLED 2026-08-01 (T2 rollout step 5 of 8). This canary is about
-      # BEHAVIOUR, not data: Ville measured exactly converged on 2026-07-28,
-      # so silence here proves the arm runs cleanly, not that the detector
-      # works. That distinction matters — the mirror probe was enabled on
-      # 2026-07-31 predicting silence and instead minted an unclosable row
-      # (it counts app-authored rows as divergence, see #273), so an arm
-      # misbehaving in an unforeseen way is a live risk, which is exactly
-      # what a canary is for. NB the converged measurement is 4 days old.
+      # BEHAVIOUR, not data: silence here proves the arm runs cleanly, not
+      # that the detector works. That distinction matters — the mirror probe
+      # was enabled on 2026-07-31 predicting silence and instead minted an
+      # unclosable row (it counts app-authored rows as divergence, see
+      # #273), so an arm misbehaving in an unforeseen way is a live risk,
+      # which is exactly what a canary is for.
+      #
+      # AND IT FIRED. On 2026-07-30 a `backfill_payment_ledger --days=212`
+      # mirrored a monthly-billed long-stay (CH25-000076) WHOLE, its 2025-08
+      # line dragged MIN(ledger_legacy_id) from ~40470 to 39113, and the
+      # probe reported 404 never-mirrored pre-coverage folios as missing_pg
+      # — zero genuine. A date-windowed backfill and an id-derived floor are
+      # NOT interchangeable definitions of coverage when the mirror writes
+      # whole folios. Remediated HERE 2026-08-01 by Ville's `--all` backfill
+      # (Ville coverage is now COMPLETE: its floor is 39014, the absolute
+      # legacy minimum, so the in-era set is the whole legacy table and the
+      # baseline is no longer "1016 in-era folios"); the CLASS is closed by
+      # the migration-084 era-floor ratchet, which lets the floor move only
+      # FORWARD.
+      #
+      # ENABLE-ORDER CONSTRAINT (satisfied here, NOT yet at HF Hotel): do
+      # not enable this probe at a site until that site's
+      # `backfill_payment_ledger --all` has completed. The first enabled
+      # tick seeds ht_reconcile_era_floor.era_floor_id and the ratchet holds
+      # it, so a floor seeded before a coverage-widening backfill would
+      # permanently exclude the folios that backfill lands. If that happens,
+      # `DELETE FROM ht_reconcile_era_floor WHERE
+      # table_name='payment_ledger_probe'` on that site's canonical DB and
+      # let the next tick re-derive. A watermark holding for ~1h raises the
+      # `era_floor_held:` Slack alert naming both floors.
       - RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED=${HFVILLE_RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED:-true}
       # ADR 0005 NULL-clear sentinel tripwire — see the backend service's
       # comment for the full rationale. This worker runs Ville's reconcile,

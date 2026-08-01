@@ -2760,11 +2760,28 @@ CREATE INDEX IF NOT EXISTS ix_guest_registry_legacy_synced
 -- moved only FORWARD (GREATEST clamp in the upsert), so one historical row
 -- gaining a mirrored counterpart cannot drag a derived MIN() floor backwards
 -- and expand the scan by years (~19.6k permanently-open rows at HF Hotel).
--- Operators may move a floor forward by hand; the clamp makes that stick.
+-- Operators may move a floor forward by hand; the clamp makes that stick. The
+-- ONLY way to lower one is to DELETE the row and let the next tick re-derive —
+-- which is the documented remedy when a watermark was seeded before a
+-- coverage-widening backfill (do not enable an arm at a site until that site's
+-- `--all` backfill has completed; a sustained hold raises the
+-- `era_floor_held:` Slack alert).
+--
+-- TWO bases, exactly one per arm (migration 084): `era_floor` (TIMESTAMP —
+-- oldest parent time; arm `guest_registry`) and `era_floor_id` (BIGINT —
+-- lowest legacy IDENTITY; arm `payment_ledger_probe`, whose mirror is keyed on
+-- an integer id and whose date column would have to cross the naive-Thai /
+-- TIMESTAMPTZ boundary). The row key is the arm's own
+-- ht_reconcile_log.table_name / sync_status.entity_type literal, so the two
+-- arms cannot collide on the PK. `era_floor` is NULLABLE because an ID-basis
+-- arm has no honest timestamp to write; the CHECK forbids a row with neither.
 CREATE TABLE IF NOT EXISTS ht_reconcile_era_floor (
-    table_name  VARCHAR(50)  PRIMARY KEY,
-    era_floor   TIMESTAMP    NOT NULL,
-    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    table_name   VARCHAR(50)  PRIMARY KEY,
+    era_floor    TIMESTAMP,
+    era_floor_id BIGINT,
+    updated_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_ht_reconcile_era_floor_basis
+        CHECK (era_floor IS NOT NULL OR era_floor_id IS NOT NULL)
 );
 
 INSERT INTO schema_migrations (version, filename, applied_by)
@@ -2804,6 +2821,27 @@ ON CONFLICT (version) DO NOTHING;
 
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('083', '083_sync_status_payment_ledger_probe.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+-- -----------------------------------------------------------------------------
+-- Migration 084 — `ht_reconcile_era_floor.era_floor_id` (BIGINT), the ID basis
+-- the Phase 6-D payment-ledger probe clamps its coverage floor to, plus the
+-- `era_floor` NOT NULL drop and the one-basis-minimum CHECK. All three are
+-- declared inline in the `ht_reconcile_era_floor` CREATE TABLE above, so a
+-- fresh seed already has them; this row just tells scripts/migrate.sh not to
+-- re-apply the ALTERs.
+--
+-- Why: the probe's floor was a raw `MIN(ledger_legacy_id)`, which is only a
+-- valid coverage boundary while coverage is an id-contiguous SUFFIX. A
+-- date-windowed `backfill_payment_ledger --days=212` mirrors folios WHOLE, and
+-- on 2026-07-30 one 2025-08 line on a monthly-billed long-stay dragged the
+-- floor back ~7 months, sweeping 404 never-mirrored folios into the scan as
+-- `missing_pg`. A persisted floor that only ratchets FORWARD removes the class.
+-- See migrations/pg/084_reconcile_era_floor_id.sql.
+-- -----------------------------------------------------------------------------
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('084', '084_reconcile_era_floor_id.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 -- =============================================================================

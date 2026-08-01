@@ -82,7 +82,7 @@ use crate::outbox::event::DomainEvent;
 // Phase 6-D: one literal for the probe's `ht_reconcile_log.table_name`, its
 // `sync_status.entity_type` and its `RECONCILE_RESOLVABLE_TABLES` entry, so
 // the three can never drift apart.
-use crate::scheduler::payment_ledger_probe::PAYMENT_LEDGER_PROBE_KEY;
+use crate::scheduler::payment_ledger_probe::{LedgerEraFloor, PAYMENT_LEDGER_PROBE_KEY};
 use crate::sync::change_op::ChangeOp;
 // Single-sourced `|` separator, shared with the mapper-side descriptor
 // tables that pin the gate ⊇ reconcile-hash invariant.
@@ -427,6 +427,11 @@ pub async fn run_sync(
                     outcome.duration_ms,
                 )
                 .await;
+                // Held-watermark tripwire. Called on EVERY successful tick,
+                // holding or not — a non-holding tick is what resets the
+                // streak, so this must not be inside a conditional.
+                note_payment_ledger_era_floor_hold(pg_pool, slack, site_id, outcome.era_floor)
+                    .await;
             }
             Err(e) => {
                 tracing::error!(site = %site_id, "[Sync] Payment-ledger probe failed: {}", e);
@@ -696,6 +701,22 @@ pub fn burst_cooldown_key(table: &str) -> String {
 /// `shadow_mode:` / `boot_refusal:`.
 pub fn reconcile_cap_cooldown_key(table: &str) -> String {
     format!("reconcile_cap{COOLDOWN_KEY_NAMESPACE_SEP}{table}")
+}
+
+/// Cooldown key for the HELD-WATERMARK alert — "this arm's persisted
+/// `ht_reconcile_era_floor` row has been holding its scan forward for an
+/// hour, so either a pre-coverage row really was mirrored whole or the
+/// watermark is STALE" (see [`note_payment_ledger_era_floor_hold`]).
+///
+/// Namespaced like its siblings so the sync-lag all-clear can never mistake
+/// `era_floor_held:payment_ledger_probe` for the table
+/// `payment_ledger_probe` and delete its cooldown. The `era_floor_held`
+/// family is new and shares no prefix with `ct_retention_overflow:` /
+/// `escalated:` / `burst:` / `ct_watcher_lag:` / `shadow_mode:` /
+/// `boot_refusal:` / `null_sentinel:` / `reconcile_cap:` (pinned by
+/// [`era_floor_held_cooldown_key_is_namespaced_and_unique`]).
+pub fn era_floor_held_cooldown_key(table: &str) -> String {
+    format!("era_floor_held{COOLDOWN_KEY_NAMESPACE_SEP}{table}")
 }
 
 /// How an alert actually reached (or failed to reach) an operator on a
@@ -4574,12 +4595,203 @@ fn reconcile_mirror_probe_enabled() -> bool {
 /// they are left. Pre-set `LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_<SITE>`
 /// or flip in an announced window.
 ///
+/// **Enable-order constraint (migration 084's ratchet).** Do NOT turn this
+/// flag on at a site before that site's `backfill_payment_ledger --all` has
+/// COMPLETED. The first enabled tick SEEDS
+/// `ht_reconcile_era_floor.era_floor_id` from whatever coverage exists at
+/// that moment and the ratchet then holds it, so a floor seeded from a
+/// narrow, date-windowed coverage window would keep excluding the older
+/// folios a later `--all` backfill lands — forever, and invisibly. As of
+/// 2026-08-01 Ville's `--all` HAS run; HF Hotel's is scheduled for that
+/// night and has NOT, which is why HF Hotel stays dark. If a watermark was
+/// seeded before a coverage-widening backfill, the remedy is
+/// `DELETE FROM ht_reconcile_era_floor WHERE table_name =
+/// 'payment_ledger_probe'` on that site's canonical database — the next tick
+/// re-derives it, and only a DELETE can lower a floor.
+/// [`note_payment_ledger_era_floor_hold`] is the tripwire that says this has
+/// happened.
+///
 /// The `== "true"` comparison is strict on purpose, matching every other
 /// feature flag in the sync path. A flag flip is never "just config".
 fn reconcile_payment_ledger_probe_enabled() -> bool {
     env::var("RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED")
         .map(|v| v == "true")
         .unwrap_or(false)
+}
+
+/// How many CONSECUTIVE probe ticks the coverage floor must be observed
+/// HELD (`effective > derived`) before that is worth an operator's
+/// attention.
+///
+/// **4.** A hold lasting ONE tick is the ratchet doing its job — a folio was
+/// mirrored whole, the scan did not widen, nothing to do — and paging on it
+/// would train operators to ignore the alert. At the 15-minute reconcile
+/// cadence (`jobs.rs`'s `0 */15 * * * *` cron and the 900s default of
+/// `WORKER_RECONCILE_INTERVAL_SECS`) four ticks is ~1 hour, which is long
+/// enough that the two remaining explanations are both worth acting on: a
+/// genuine pre-coverage mirror (understand what wrote it) or a STALE
+/// watermark left behind by a coverage-widening backfill (delete the row).
+/// It is the same "has resisted several sweeps" arithmetic
+/// [`FORCE_CONVERGE_MIN_AGE_SECS`] uses for the same cadence.
+pub(crate) const ERA_FLOOR_HELD_ALERT_TICKS: u32 = 4;
+
+/// Consecutive ticks, per site, that the payment-ledger coverage floor has
+/// been observed HELD.
+///
+/// Process-local on purpose, and the weaker half of the guard: the DEDUPE
+/// that matters is the shared `ht_level_drift_alert_cooldowns` row (which is
+/// exactly why migration 053 moved cooldowns out of a process-local map), so
+/// two processes ticking the same site cannot double-page. All this counter
+/// decides is WHEN the first page becomes eligible, and its failure mode on
+/// restart is a page delayed by up to [`ERA_FLOOR_HELD_ALERT_TICKS`] ticks —
+/// never a missed one, because a genuine hold persists until coverage or the
+/// floor row changes. Keyed by site anyway so a process that ever ticks two
+/// sites cannot conflate their streaks.
+static ERA_FLOOR_HOLD_STREAKS: std::sync::Mutex<BTreeMap<String, u32>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Record this tick's observation and return the CURRENT consecutive-hold
+/// streak. A non-holding tick clears the site's streak — the condition has
+/// to be unbroken, or an intermittent hold would eventually add up to a
+/// page.
+fn note_era_floor_hold_streak(site_id: &str, holding: bool) -> u32 {
+    let mut streaks = ERA_FLOOR_HOLD_STREAKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !holding {
+        streaks.remove(site_id);
+        return 0;
+    }
+    let streak = streaks.entry(site_id.to_string()).or_insert(0);
+    *streak = streak.saturating_add(1);
+    *streak
+}
+
+/// `>=`, not `==`: past the threshold every tick stays eligible and the
+/// per-site cooldown does the throttling. Pinning it to the exact tick would
+/// mean a hold that outlives one cooldown window is never re-announced.
+fn era_floor_hold_is_alertable(streak: u32) -> bool {
+    streak >= ERA_FLOOR_HELD_ALERT_TICKS
+}
+
+/// The held-watermark alert body. Pure so the composition is unit-testable
+/// (both floors, the site, and the escape hatch must all be in it) — same
+/// idiom as [`format_null_sentinel_message`].
+///
+/// Deliberately NOT pager-tier: nothing is broken or unrecoverable, the
+/// probe keeps working, and the two explanations are both "look at this
+/// today", not "wake someone up". It renders through
+/// `SlackMessage::with_site_text`, never `with_site_text_paged`.
+fn format_era_floor_held_message(
+    site_id: &str,
+    derived: i64,
+    effective: i64,
+    ticks: u32,
+    cooldown_hours: i64,
+) -> String {
+    format!(
+        ":warning: *Payment-ledger coverage floor is being HELD by its watermark* \
+         :warning:\n\
+         At *{site_id}*, the `{probe}` probe has scanned for *{ticks}* consecutive \
+         ticks (~{minutes} min) with a persisted watermark ABOVE the floor its own \
+         mirror implies:\n\
+         • effective floor (what BOTH scans use): `{effective}`\n\
+         • derived floor (`MIN(ledger_legacy_id)` over `ht_payment_ledger`): \
+         `{derived}`\n\
+         The ratchet is doing what it was built to do — the scan did not widen — \
+         but a hold this long has exactly two explanations and they need \
+         different responses.\n\
+         *1. A pre-coverage folio really was mirrored whole* (an iHOTEL edit on an \
+         old folio, or a date-windowed `backfill_payment_ledger --days=N` run). \
+         Nothing to fix; the derived floor stays low until coverage genuinely \
+         widens. This is the 2026-07-30 incident shape.\n\
+         *2. The watermark is STALE* — it was seeded BEFORE a coverage-widening \
+         `--all` backfill, so the probe is now excluding folios the mirror \
+         actually holds, and they can never be reconciled. Escape hatch, on this \
+         site's canonical database: `DELETE FROM ht_reconcile_era_floor WHERE \
+         table_name = '{probe}';` — the next tick re-derives the floor from live \
+         data. (Moving it FORWARD by hand also sticks; the upsert clamps with \
+         GREATEST. Only a DELETE can lower it.)\n\
+         _Tell them apart with `ht_reconcile_era_floor.updated_at` for this row \
+         against when that site's last `--all` backfill ran. Per-site cooldown \
+         {cooldown_hours}h._",
+        probe = PAYMENT_LEDGER_PROBE_KEY,
+        minutes = u64::from(ticks) * 15,
+    )
+}
+
+/// Observe one payment-ledger probe tick's coverage floor and, once a hold
+/// has PERSISTED across [`ERA_FLOOR_HELD_ALERT_TICKS`] ticks, say so in
+/// Slack.
+///
+/// Called from [`run_sync`] on every successful probe tick — including the
+/// non-holding ones, which is what resets the streak. A `tracing::info!`
+/// line for the same condition is emitted per-tick inside
+/// `payment_ledger_era_floor`; this is the escalation of that line from
+/// "visible if you go looking" to "an operator is told".
+///
+/// Cooldown-gated through the shared `ht_level_drift_alert_cooldowns` table
+/// under [`era_floor_held_cooldown_key`], with the same per-site
+/// `LEVEL_DRIFT_COOLDOWN_HOURS` window (default 24h) as the other reconcile
+/// pages, and — like them — the cooldown is burned only on a confirmed
+/// delivery, so a webhook outage cannot silence it for a day.
+pub(crate) async fn note_payment_ledger_era_floor_hold(
+    pg_pool: &PgPool,
+    slack: Option<&SlackClient>,
+    site_id: &str,
+    era_floor: LedgerEraFloor,
+) {
+    let streak = note_era_floor_hold_streak(site_id, era_floor.watermark_holding());
+    if !era_floor_hold_is_alertable(streak) {
+        return;
+    }
+    // `watermark_holding()` implies both halves are `Some`; destructure
+    // rather than unwrap so a future change to that predicate degrades to
+    // silence instead of a panic inside the reconcile tick.
+    let (Some(derived), Some(effective)) = (era_floor.derived, era_floor.effective) else {
+        return;
+    };
+
+    let key = era_floor_held_cooldown_key(PAYMENT_LEDGER_PROBE_KEY);
+    let cooldown_hours = level_drift_thresholds_from_env(site_id).cooldown_hours;
+    let cooldown = std::time::Duration::from_secs((cooldown_hours * 3600) as u64);
+
+    if !level_alert_eligible_pg(pg_pool, site_id, &key, cooldown).await {
+        tracing::debug!(
+            site = %site_id,
+            "[Sync] Payment-ledger held-watermark alert suppressed by cooldown"
+        );
+        return;
+    }
+
+    let delivery = if let Some(slack) = slack {
+        let msg = SlackMessage::with_site_text(
+            site_id,
+            format_era_floor_held_message(site_id, derived, effective, streak, cooldown_hours),
+        );
+        AlertDelivery::from_send(Some(slack.send_message(&msg).await))
+    } else {
+        tracing::warn!(
+            site = %site_id,
+            derived_floor = derived,
+            effective_floor = effective,
+            ticks = streak,
+            "[Sync] Slack not configured; payment-ledger held-watermark finding \
+             logged only — if the watermark is stale, DELETE FROM \
+             ht_reconcile_era_floor WHERE table_name = 'payment_ledger_probe'"
+        );
+        AlertDelivery::LoggedOnly
+    };
+
+    if cooldown_should_be_marked(delivery) {
+        mark_level_alert_sent_pg(pg_pool, site_id, &key).await;
+    } else {
+        tracing::warn!(
+            site = %site_id,
+            "[Sync] Payment-ledger held-watermark alert POST failed — leaving the \
+             cooldown unset so the next tick retries"
+        );
+    }
 }
 
 /// Issue #204 (bug #2) — minimum age (seconds) an unresolved
@@ -7966,7 +8178,12 @@ fn guest_registry_era_floor_sql() -> String {
 /// `ht_reconcile_era_floor` key for this arm. Same literal as the
 /// `ht_reconcile_log.table_name` / `sync_status.entity_type` the arm reports
 /// under, so one operator query joins all three.
-const GUEST_REGISTRY_ERA_FLOOR_KEY: &str = "guest_registry";
+///
+/// `pub(crate)` only so the sibling
+/// [`crate::scheduler::payment_ledger_probe`] arm — which owns the OTHER row
+/// in the same table — can pin by test that the two keys cannot collide on
+/// the primary key.
+pub(crate) const GUEST_REGISTRY_ERA_FLOOR_KEY: &str = "guest_registry";
 
 /// Persist-and-clamp in ONE statement: the durable floor only ever moves
 /// FORWARD.
@@ -7996,8 +8213,8 @@ const RECONCILE_ERA_FLOOR_SELECT_SQL: &str =
 /// The clamp semantics, as a pure function (the SQL above enforces the same
 /// rule atomically; this is the spec the tests pin).
 ///
-/// * both present → the LATER one. A derived floor that dropped below the
-///   watermark is exactly the one-old-companion drag described on
+/// * both present → the HIGHER one. A derived floor that dropped below the
+///   watermark is exactly the one-old-row drag described on
 ///   [`guest_registry_era_floor_sql`]; ignore it.
 /// * persisted only (derived went NULL — every mirrored companion deleted,
 ///   or the table truncated) → KEEP the watermark. Widening back to "no
@@ -8006,10 +8223,15 @@ const RECONCILE_ERA_FLOOR_SELECT_SQL: &str =
 ///   page, which is the correct response to a mirror that vanished.
 /// * neither → `None`: no coverage was ever established, and the arm skips
 ///   the legacy scan entirely.
-fn clamped_era_floor(
-    persisted: Option<NaiveDateTime>,
-    derived: Option<NaiveDateTime>,
-) -> Option<NaiveDateTime> {
+///
+/// Generic over the floor's BASIS, and `pub(crate)`, because
+/// `ht_reconcile_era_floor` now carries two of them (migration 084):
+/// `era_floor` (`NaiveDateTime`, this arm) and `era_floor_id` (`i64`, the
+/// sibling [`crate::scheduler::payment_ledger_probe`] arm, whose mirror is
+/// keyed on a legacy IDENTITY and whose date column would have to cross the
+/// naive-Thai/`TIMESTAMPTZ` boundary). One rule, single-sourced — a second
+/// hand-written copy is exactly how the two arms would drift apart.
+pub(crate) fn clamped_era_floor<T: Ord>(persisted: Option<T>, derived: Option<T>) -> Option<T> {
     match (persisted, derived) {
         (Some(p), Some(d)) => Some(p.max(d)),
         (Some(p), None) => Some(p),
@@ -8029,19 +8251,28 @@ async fn guest_registry_era_floor(
     .fetch_one(pg_pool)
     .await?;
 
+    // `Option<NaiveDateTime>` INSIDE the row, not just around it: migration
+    // 084 dropped the `NOT NULL` on `era_floor` so the sibling ID-basis arm
+    // can own a row without inventing a fake timestamp. Decoding a
+    // non-Option here would turn any NULL row — an ID-basis row that somehow
+    // acquired this key, or a hand-edit — into a `ColumnDecode` error that
+    // fails the whole guest-registry tick. A NULL reads as "nothing
+    // persisted", which is exactly what `clamped_era_floor` already handles.
     let persisted = match derived {
         Some(d) => {
-            sqlx::query_scalar::<_, NaiveDateTime>(RECONCILE_ERA_FLOOR_UPSERT_SQL)
+            sqlx::query_scalar::<_, Option<NaiveDateTime>>(RECONCILE_ERA_FLOOR_UPSERT_SQL)
                 .bind(GUEST_REGISTRY_ERA_FLOOR_KEY)
                 .bind(d)
                 .fetch_optional(pg_pool)
                 .await?
+                .flatten()
         }
         None => {
-            sqlx::query_scalar::<_, NaiveDateTime>(RECONCILE_ERA_FLOOR_SELECT_SQL)
+            sqlx::query_scalar::<_, Option<NaiveDateTime>>(RECONCILE_ERA_FLOOR_SELECT_SQL)
                 .bind(GUEST_REGISTRY_ERA_FLOOR_KEY)
                 .fetch_optional(pg_pool)
                 .await?
+                .flatten()
         }
     };
 
@@ -11261,8 +11492,11 @@ mod tests {
             "every mirrored companion vanishing must NOT reopen the whole history \
              — hold the watermark and let the divergence cap page"
         );
+        // Explicit `None::<NaiveDateTime>`: the clamp is generic over the
+        // floor basis (migration 084 added an ID basis for the
+        // payment-ledger arm), so a bare `None` has nothing to infer from.
         assert_eq!(
-            clamped_era_floor(None, None),
+            clamped_era_floor(None, None::<NaiveDateTime>),
             None,
             "no coverage was ever established ⇒ the arm skips the legacy scan"
         );
@@ -11389,6 +11623,150 @@ mod tests {
                 "the null_sentinel family must not prefix-collide with {other}"
             );
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 6-D — payment-ledger coverage floor HELD by its watermark
+    // -------------------------------------------------------------------
+
+    /// Namespacing pin, same shape as its two predecessors: the new
+    /// `era_floor_held:` family must not collide with any existing family
+    /// and must read as NOT a bare reconcile-table key — otherwise the
+    /// sync-lag all-clear would mistake
+    /// `era_floor_held:payment_ledger_probe` for the entity
+    /// `payment_ledger_probe`, clear its cooldown, and un-throttle the page
+    /// to once per tick.
+    #[test]
+    fn era_floor_held_cooldown_key_is_namespaced_and_unique() {
+        let key = era_floor_held_cooldown_key(PAYMENT_LEDGER_PROBE_KEY);
+        assert_eq!(key, "era_floor_held:payment_ledger_probe");
+        assert!(!is_reconcile_table_key(&key));
+        for other in [
+            "ct_retention_overflow:",
+            "escalated:",
+            "burst:",
+            "ct_watcher_lag:",
+            "shadow_mode:",
+            "boot_refusal:",
+            "null_sentinel:",
+            "reconcile_cap:",
+        ] {
+            assert!(
+                !key.starts_with(other) && !other.starts_with("era_floor_held:"),
+                "the era_floor_held family must not prefix-collide with {other}"
+            );
+        }
+    }
+
+    /// The hold must be CONSECUTIVE, and only the sustained one alerts. One
+    /// held tick is the ratchet working as designed; an hour of it is either
+    /// a real pre-coverage mirror or a stale watermark.
+    #[test]
+    fn only_a_sustained_era_floor_hold_becomes_alertable() {
+        // Unique site key per test: the streak map is a process-global
+        // static shared with every other test in this binary.
+        let site = "test-site-sustained-hold";
+        for tick in 1..ERA_FLOOR_HELD_ALERT_TICKS {
+            let streak = note_era_floor_hold_streak(site, true);
+            assert_eq!(streak, tick);
+            assert!(
+                !era_floor_hold_is_alertable(streak),
+                "a hold of {tick} tick(s) is the ratchet working, not a page"
+            );
+        }
+        let streak = note_era_floor_hold_streak(site, true);
+        assert_eq!(streak, ERA_FLOOR_HELD_ALERT_TICKS);
+        assert!(era_floor_hold_is_alertable(streak));
+        // Still eligible past the threshold — the per-site cooldown does the
+        // throttling, so a hold that outlives one window is re-announced.
+        assert!(era_floor_hold_is_alertable(note_era_floor_hold_streak(
+            site, true
+        )));
+
+        // One non-holding tick resets it: an intermittent hold must never
+        // accumulate into a page.
+        assert_eq!(note_era_floor_hold_streak(site, false), 0);
+        assert_eq!(note_era_floor_hold_streak(site, true), 1);
+        assert!(!era_floor_hold_is_alertable(1));
+    }
+
+    /// Two sites ticking in one process must not share a streak.
+    #[test]
+    fn era_floor_hold_streaks_are_per_site() {
+        let a = "test-site-hold-a";
+        let b = "test-site-hold-b";
+        assert_eq!(note_era_floor_hold_streak(a, true), 1);
+        assert_eq!(note_era_floor_hold_streak(a, true), 2);
+        assert_eq!(
+            note_era_floor_hold_streak(b, true),
+            1,
+            "site B's first hold must not inherit site A's streak"
+        );
+        assert_eq!(note_era_floor_hold_streak(b, false), 0);
+        assert_eq!(
+            note_era_floor_hold_streak(a, true),
+            3,
+            "site B clearing must not clear site A"
+        );
+    }
+
+    /// The alert has to be actionable on its own: BOTH floors (so the reader
+    /// can see the size of the gap), the site, and the one escape hatch that
+    /// can actually lower a watermark — a DELETE of the row.
+    #[test]
+    fn era_floor_held_message_names_both_floors_and_the_escape_hatch() {
+        let body = format_era_floor_held_message("hfhotel", 39113, 40470, 4, 24);
+        assert!(body.contains("39113"), "derived floor missing: {body:?}");
+        assert!(body.contains("40470"), "effective floor missing: {body:?}");
+        assert!(body.contains("hfhotel"), "site missing: {body:?}");
+        assert!(
+            body.contains("DELETE FROM ht_reconcile_era_floor WHERE table_name = \
+                           'payment_ledger_probe';"),
+            "the delete-row escape hatch must be spelled out: {body:?}"
+        );
+        assert!(
+            body.contains("--all"),
+            "must name the coverage-widening backfill that makes a watermark \
+             stale: {body:?}"
+        );
+        assert!(body.contains("24h"), "must state the cooldown: {body:?}");
+    }
+
+    /// Pager-tier decision, pinned like the NULL-sentinel one: a held
+    /// watermark is a "look at this today" finding, not an outage — the
+    /// probe keeps working and the scan does not widen. It must render
+    /// through `with_site_text`, never carrying the `<!channel>` mention.
+    #[test]
+    fn era_floor_held_message_is_not_pager_tier() {
+        let body = format_era_floor_held_message("hfville", 39113, 40470, 4, 24);
+        let msg = SlackMessage::with_site_text("hfville", body);
+        assert!(
+            !msg.text.contains("<!channel>"),
+            "held-watermark alert is not pager-tier: {:?}",
+            msg.text
+        );
+        assert!(msg.text.contains(":warning:"));
+    }
+
+    /// The tripwire only works if it is fed on EVERY successful probe tick:
+    /// a non-holding tick is what clears the streak, so a call site that
+    /// only fired it when something looked wrong would let an intermittent
+    /// hold accumulate into a page.
+    #[test]
+    fn run_sync_feeds_the_era_floor_tripwire_on_every_probe_tick() {
+        let src = include_str!("sync.rs");
+        let at = src
+            .find("payment_ledger_probe::run_payment_ledger_probe(")
+            .expect("run_sync must call the probe");
+        let call_site = &src[at..(at + 1600).min(src.len())];
+        assert!(
+            call_site.contains("note_payment_ledger_era_floor_hold(pg_pool, slack, site_id"),
+            "the probe call site must feed the held-watermark tripwire"
+        );
+        assert!(
+            call_site.contains("outcome.era_floor"),
+            "the tripwire must be fed the tick's OWN floor, both halves"
+        );
     }
 
     /// The pure decision this tripwire is built on: zero is quiet, anything

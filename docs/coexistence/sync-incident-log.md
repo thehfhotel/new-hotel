@@ -6,6 +6,131 @@ and prior entries instead of re-explaining. Vocabulary: "sync lag / unconverged"
 for transients, "durable divergence" only for rows that resist multiple sweep cycles
 (see CLAUDE.md "Vocabulary note").
 
+## 2026-08-01 — payment-ledger probe: 404 false `missing_pg` folios from a backfill dragging its coverage floor
+
+**Symptom.** The Phase 6-D payment-ledger probe (`payment_ledger_probe`, enabled
+on HF Ville 2026-08-01 as T2 rollout step 5) reported **404 `missing_pg` folios**
+at HF Ville, all of them pre-coverage. Zero were genuine mirror gaps — the money
+in every one of them was never in scope for the mirror in the first place.
+
+**Evidence.** The probe floors its legacy scan at
+`PG_FLOOR_SQL = SELECT MIN(ledger_legacy_id) FROM ht_payment_ledger` and applies
+it as `HAVING MIN(id) >= floor` over legacy `HT_CheckIn_Pay`. That floor had
+moved from ~40470 to **39113** — about seven months backwards — between the
+2026-07-28 read-only baseline (1,016 in-era folios, exactly converged) and the
+first enabled tick. The single row responsible was a payment line dated 2025-08
+belonging to `CH25-000076`, a monthly-billed long-stay, mirrored by the
+`backfill_payment_ledger --days=212` run of 2026-07-30.
+
+**Cause.** A raw `MIN(ledger_legacy_id)` is a valid coverage boundary **only if
+coverage is an id-contiguous SUFFIX** of the legacy table. Mirroring does not
+preserve that property: `sync/mappers/payment.rs::mirror_payment_ledger` DELETEs
+a `Cin_No`'s lines and re-INSERTs the loader's whole current set, so the folio —
+not the line — is the atomic unit, and anything that selects folios by DATE
+lands whole folios with their old line ids attached. A date-windowed backfill and
+an id-derived floor are therefore **not interchangeable definitions of coverage**.
+One long-stay whose folio spans a monthly billing boundary is enough to collapse
+the floor by the length of that stay, and every never-mirrored folio between the
+old and new floor is then swept into the scan and reported as `missing_pg`. The
+same shape reaches the probe with no backfill at all: iHOTEL editing a payment on
+a pre-era folio makes the CT tick mirror that folio whole. The module docs named
+this risk and consciously did not fix it — the reasoning was that
+`PAYMENT_LEDGER_MAX_FOLIO_FINDINGS` (50) bounds the blast radius to one aggregate
+row, and that a clamped floor needed a schema change because
+`ht_reconcile_era_floor.era_floor` is a `TIMESTAMP` and cannot hold an id. The
+cap did contain it. It did not prevent it, and 404 folios is well past the point
+where an operator has to reason about whether the money is real.
+
+**Fix — two parts.**
+
+1. *Remediation — DONE at Ville, PENDING at HF Hotel.* Ville's
+   `backfill_payment_ledger --all` ran the same day (2026-08-01), making its
+   canonical coverage genuinely complete rather than merely date-windowed:
+   Ville's derived floor is now 39014, the absolute legacy minimum, so the in-era
+   set is the whole legacy table and the boundary can no longer move at all.
+   **HF Hotel's `--all` has NOT run** — it is scheduled for the night of
+   2026-08-01. Until it completes, HF Hotel's canonical coverage is still the
+   Track J7e window, its derived floor is that window's boundary, and the 19
+   `missing_pg` folios from the 2026-07-28 baseline
+   (`CH26-004952`…`CH26-004971` minus `CH26-004960`) are still uncovered. The
+   probe therefore stays DARK at HF Hotel until the run completes — see the
+   enable-order constraint below, which is not a preference but a correctness
+   requirement of the new ratchet.
+
+2. *Class fix — migration 084 + the era-floor ratchet.*
+   `ht_reconcile_era_floor` gains `era_floor_id BIGINT` (with `era_floor` going
+   nullable and a `CHECK` that a row carries a floor in at least one basis), and
+   `scheduler/payment_ledger_probe.rs::payment_ledger_era_floor` now computes
+   `effective = GREATEST(persisted era_floor_id, MIN(ledger_legacy_id))`,
+   persisting the max back through the same `GREATEST` upsert the Phase 6-B
+   `guest_registry` arm uses. The floor can only ratchet FORWARD; a later
+   poisoning row moves the derived value and leaves the effective one alone.
+   `clamped_era_floor` was generalized over the floor basis so both arms share
+   ONE rule rather than two copies, and the arms key their own rows
+   (`payment_ledger_probe` vs `guest_registry`) so they cannot collide — per-site
+   separation is free, each site's probe running against its own logical PG
+   database.
+
+**Enable-order constraint the ratchet creates — read before flipping the flag at
+any site.** The ratchet makes the floor monotonic, which means the FIRST enabled
+tick's reading is durable. Seeding it from narrow coverage is therefore its own
+failure mode, and it is the mirror image of the incident above:
+
+* **Do not enable the probe at a site until that site's
+  `backfill_payment_ledger --all` has completed.** A floor seeded from a
+  date-windowed coverage window would keep holding after a later `--all` widens
+  coverage, permanently excluding the folios that backfill lands — they would
+  never be compared, and a real gap in them would be invisible.
+* **If a watermark was seeded before a coverage-widening backfill**, the only
+  way down is to delete the row:
+  `DELETE FROM ht_reconcile_era_floor WHERE table_name = 'payment_ledger_probe';`
+  on that site's canonical database (`hotelnew` / `hotelville`). The next tick
+  re-derives from live data. A hand `UPDATE` can only move a floor FORWARD — the
+  upsert clamps with `GREATEST`.
+* **The tripwire that says this happened.** `effective > derived` sustained
+  across 4 consecutive ticks (~1h at the 15-min cadence) raises a Slack alert
+  under the cooldown key `era_floor_held:payment_ledger_probe`, naming both
+  floors, the site, and the DELETE. It is deliberately not pager-tier: the scan
+  never widens, so nothing is broken — but the two explanations (a genuine
+  pre-coverage mirror, or a stale watermark) need different responses. A hold
+  lasting a single tick is the ratchet working and is logged, not alerted.
+
+**Also fixed here — the resolve path no longer writes the watermark.** The
+auto-resolve sweep dispatches on `ht_reconcile_log.table_name` and is NOT gated
+on `RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED`, so the first version of the ratchet
+let a sweep at a DARK site persist a floor from that site's pre-backfill
+coverage — exactly the stale-watermark state above, arrived at without anyone
+enabling anything. Both `<aggregate>` resolve arms now go through
+`payment_ledger_era_floor_readonly` (same derived `MIN`, same clamp, plain
+`SELECT` of the persisted row). The probe's own tick is the single writer.
+
+**And both scans are floored, not just the legacy one.** The first version
+floored only `HT_CheckIn_Pay`. Whenever the watermark holds, every canonical
+folio below it then has no legacy counterpart in scope and reads as
+`missing_mssql`: per-tick row churn while the count is small (the probe re-mints
+what the sweep just closed through the unfloored single-folio projection) and, once
+past `PAYMENT_LEDGER_MAX_FOLIO_FINDINGS`, ONE `<aggregate>` row that can never
+resolve, because resolution would compare unfloored-canonical totals against
+floored-legacy ones — paging every 72h forever. Both scans now carry the same
+whole-folio `HAVING MIN(id) >= floor`, and both are pinned to the EFFECTIVE
+value by test.
+
+**Deliberately NOT done: switching the floor to a date basis.** The obvious
+"floor on `ledger_pay_date` instead" is worse, not simpler: that column is
+`TIMESTAMPTZ` while the legacy side stores naive local Thai time, so it
+reintroduces exactly the Thai→UTC boundary reasoning the integer IDENTITY basis
+was chosen to avoid.
+
+**Made visible, not just fixed.** `payment_ledger_era_floor` logs whenever the
+persisted watermark is holding the scan forward, the tick's summary lines carry
+`derived_floor` alongside `floor`, an `<aggregate>` divergence row records both in
+its JSON, and a hold that PERSISTS raises the Slack alert described above. A
+future drag attempt now shows up as a log line naming both numbers instead of
+silently widening the scan — and a hold that is really a stale watermark now
+reaches an operator instead of sitting in a log. Detection and the auto-resolve
+sweep both go through the clamped helper (test-pinned), or a row written from one
+folio set could be re-projected from another and never close.
+
 ## 2026-07-29 — mark_dirty polarity fix: live-verified PASS (room 302, HF Hotel)
 
 **Not an incident** — a live verification entry for a fix shipped and confirmed

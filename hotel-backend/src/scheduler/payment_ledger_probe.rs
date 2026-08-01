@@ -58,7 +58,8 @@
 //! so a last-ULP difference between MSSQL's and PostgreSQL's summation
 //! order can never masquerade as drift.
 //!
-//! ## Scope floor — `MIN(ledger_legacy_id)`, derived, never configured
+//! ## Scope floor — derived `MIN(ledger_legacy_id)`, CLAMPED to a persisted
+//! watermark
 //!
 //! Identical reasoning to Phase 6-C's `MIN(mirror pk)` and 6-A's
 //! `PAYMENTS_ERA_FLOOR_SQL`: `ht_payment_ledger` was born with the Track
@@ -80,37 +81,102 @@
 //! report under-counts today. Zero `value` and zero `missing_mssql` at
 //! either site.
 //!
+//! Coverage state as of 2026-08-01, and it differs per site:
+//!
+//! * **HF Ville** — the `--all` backfill HAS run. Canonical coverage is
+//!   complete, the derived floor is 39014 (the absolute legacy minimum) and
+//!   the in-era set is the whole legacy table.
+//! * **HF Hotel** — the `--all` backfill has **NOT** run; it is scheduled
+//!   for the night of 2026-08-01. Until it completes, canonical coverage is
+//!   still the Track J7e window, the derived floor is still that window's
+//!   boundary, and the 19 `missing_pg` folios above are still uncovered.
+//!
+//! That asymmetry is an ENABLE-ORDER constraint, not trivia: do not turn
+//! this probe on at a site before that site's `--all` backfill has
+//! completed. The ratchet below persists whatever floor the first enabled
+//! tick sees, and a floor seeded from the narrow pre-backfill window would
+//! then HOLD after the backfill widens coverage — permanently excluding the
+//! folios the backfill just landed. If that happens, the fix is to
+//! `DELETE FROM ht_reconcile_era_floor WHERE table_name =
+//! 'payment_ledger_probe'` at that site and let the next tick re-derive.
+//!
 //! **In-era means the WHOLE folio is in era** (`HAVING MIN(id) >= floor`,
 //! not `WHERE id >= floor`). One HF Hotel folio straddles the boundary;
 //! admitting it on a filtered line subset would manufacture a permanent
 //! `value` finding out of a folio the mirror never claimed to cover.
 //!
-//! The floor is a low-water mark and could in principle be dragged
-//! backwards, exactly as `guest_registry_era_floor_sql` documents: if
-//! iHOTEL edits a payment on a pre-era folio, the CT tick mirrors that
-//! folio (all of its lines, old ids included) and `MIN(ledger_legacy_id)`
-//! collapses to that era. Unlike 6-B this arm does NOT persist a clamped
-//! watermark, because the consequence is already bounded by
-//! [`PAYMENT_LEDGER_MAX_FOLIO_FINDINGS`]: the next tick's diff exceeds the
-//! cap and lands ONE self-describing aggregate row ("legacy 20,281 folios
-//! vs canonical 1,300"), not a flood. If that ever fires, the fix is to
-//! give this arm a clamped floor of its own —
-//! `ht_reconcile_era_floor.era_floor` is a `TIMESTAMP` and cannot hold an
-//! id, so it is a schema change, deliberately not made on speculation.
+//! **BOTH scans carry the floor**, on the same whole-folio `HAVING` rule —
+//! `MIN(ledger_legacy_id)` canonically, `MIN(id)` on legacy. Flooring only
+//! the legacy side is a defect, not an economy: whenever the ratchet holds
+//! (`effective > derived`) every canonical folio under the watermark would
+//! have no legacy counterpart in scope and would be reported as
+//! `missing_mssql`. Small-N that churns per tick (the probe re-mints the row
+//! each tick, the sweep closes it again through the UNfloored single-folio
+//! projection); large-N it collapses into one `<aggregate>` row that can
+//! NEVER resolve, because resolution would be comparing an unfloored
+//! canonical total against a floored legacy one. Both scans are pinned to
+//! [`LedgerEraFloor::effective`] by test.
+//!
+//! ### The floor RATCHETS (migration 084) — it happened, it is not theory
+//!
+//! A raw `MIN(ledger_legacy_id)` is a LOW-water mark, and it is only a valid
+//! coverage boundary while coverage is an **id-contiguous suffix** of the
+//! legacy table. Mirroring does not preserve that:
+//! `mirror_payment_ledger` DELETEs a `Cin_No`'s lines and re-INSERTs the
+//! whole current set, so anything that selects folios by DATE lands WHOLE
+//! folios, old line ids included.
+//!
+//! Live, 2026-07-30 → 2026-08-01. A `backfill_payment_ledger --days=212`
+//! run mirrored whole folios, and ONE monthly-billed long-stay at HF Ville
+//! (`CH25-000076`) carried a payment line from 2025-08. That dragged
+//! `MIN(ledger_legacy_id)` from ~40470 back to 39113 — about seven months —
+//! and the next tick's `HAVING MIN(id) >= floor` admitted **404 legacy
+//! folios the mirror had never covered**, reporting every one as
+//! `missing_pg`. Zero were genuine gaps. Remediated the same day at the
+//! affected site by a Ville `--all` backfill (Ville's floor is now 39014,
+//! the absolute legacy minimum); HF Hotel's `--all` is scheduled for the
+//! night of 2026-08-01 and has not run yet, which is why the probe stays
+//! dark there until it has. The same shape reaches here without any
+//! backfill at all: iHOTEL editing a payment on a pre-era folio makes the
+//! CT tick mirror that folio whole.
+//!
+//! So the derived value is now CLAMPED to a persisted, non-decreasing
+//! watermark — the same machinery as the 6-B `guest_registry` arm
+//! (`RECONCILE_ERA_FLOOR_UPSERT_SQL`, `clamped_era_floor`), on the ID basis
+//! `ht_reconcile_era_floor.era_floor_id` that migration 084 adds. The floor
+//! can only ratchet FORWARD; a poisoning row can never LOWER it again.
+//!
+//! **Not a date basis, deliberately.** The obvious alternative — floor on
+//! `ledger_pay_date` instead — is worse: that column is `TIMESTAMPTZ`
+//! against a legacy side storing naive local Thai time, so it reintroduces
+//! exactly the timezone reasoning the integer IDENTITY basis avoids.
+//!
+//! [`PAYMENT_LEDGER_MAX_FOLIO_FINDINGS`] remains the second belt, for the
+//! case where the very FIRST (bootstrap) reading is already poisoned:
+//! the diff exceeds the cap and lands ONE self-describing aggregate row
+//! ("legacy 20,281 folios vs canonical 1,300"), not a flood. The 404-folio
+//! episode above is precisely what that looks like from the outside —
+//! which is why [`payment_ledger_era_floor`] LOGS the derived and effective
+//! floors whenever they differ, and why a hold that PERSISTS raises a Slack
+//! alert (`scheduler::sync::note_payment_ledger_era_floor_hold`), so the
+//! next attempt to drag the floor — or a stale watermark left behind by a
+//! coverage-widening backfill — is visible rather than silent.
 //!
 //! ## Cost contract
 //!
-//! Per tick: TWO PostgreSQL reads (a scalar floor + one grouped scan) and
-//! ONE MSSQL grouped scan. There is no cheap "aggregate first, diff only
+//! Per tick: THREE PostgreSQL round trips (the derived `MIN`, the
+//! clamp-and-persist upsert that returns the watermark, one grouped scan)
+//! and ONE MSSQL grouped scan. There is no cheap "aggregate first, diff only
 //! on mismatch" gate as in 6-C, and there deliberately shouldn't be: with
 //! a single table the totals cannot be computed without the same GROUP BY
 //! the diff needs, so a gate would double the scans it was meant to
 //! avoid. What crosses the wire is ~1.3k rows per side.
 //!
-//! The legacy scan is NOT floored in its `WHERE` clause — the floor is a
-//! `HAVING` over the unfiltered per-folio `MIN(id)`, which is what makes
-//! the straddling-folio rule above expressible. It is one hash-aggregate
-//! pass over a 28k-row table on a shared server, growing ~10k rows/year.
+//! Neither scan is floored in its `WHERE` clause — on both sides the floor
+//! is a `HAVING` over the unfiltered per-folio `MIN(id)`, which is what
+//! makes the straddling-folio rule above expressible. The legacy half is one
+//! hash-aggregate pass over a 28k-row table on a shared server, growing ~10k
+//! rows/year.
 //!
 //! ## What gets recorded
 //!
@@ -144,6 +210,18 @@
 //!
 //! Both resolve arms hash an ABSENT folio ([`folio_absent_hash`]) rather
 //! than returning `None`, so a folio deleted on both sides converges.
+//!
+//! **The resolve path NEVER writes the watermark.** Both `<aggregate>` arms
+//! go through [`payment_ledger_era_floor_readonly`] — the same derived `MIN`
+//! and the same clamp as detection, but a plain `SELECT` of the persisted
+//! floor instead of the ratchet upsert. The reason is that the auto-resolve
+//! dispatch in `scheduler::sync` is NOT gated on
+//! `RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED` (it dispatches on
+//! `ht_reconcile_log.table_name`), so a sweep at a site where this probe is
+//! still DARK could otherwise bake in a watermark before that site's `--all`
+//! backfill has widened coverage — persisting exactly the stale floor the
+//! enable-order constraint above exists to avoid. The probe's own tick is
+//! the single writer.
 //!
 //! And these rows really are closeable, which is why — unlike 6-C's
 //! `ht_room_calendar` — this arm records rather than merely observes: the
@@ -200,11 +278,15 @@ pub(crate) const PAYMENT_LEDGER_AGGREGATE_PK: &str = "<aggregate>";
 /// other entity out of the sweep. Past the cap the probe records ONE
 /// aggregate row instead and logs the true finding count.
 ///
-/// 50, against the 19 findings HF Hotel actually has today (Ville has 0):
-/// comfortably above the live number so the arm reports actionable
-/// per-folio detail rather than an opaque total, and far enough below 500
-/// that it can never own the sweep. It is also the bound on the
-/// dragged-floor failure mode described in the module docs.
+/// 50, chosen against the 19 findings HF Hotel had on 2026-07-28 (Ville had
+/// 0) — findings the HF Hotel `--all` backfill scheduled for the night of
+/// 2026-08-01 is expected to close, and which are still open until it runs:
+/// comfortably above the live number so the arm reports actionable per-folio
+/// detail rather than an opaque total, and far enough below 500 that it can
+/// never own the sweep. It stays the SECOND belt on the dragged-floor failure
+/// mode — the first is now the persisted ratchet
+/// ([`payment_ledger_era_floor`]), which bounds the case the cap only
+/// contains.
 pub(crate) const PAYMENT_LEDGER_MAX_FOLIO_FINDINGS: usize = 50;
 
 /// Is this `ht_reconcile_log.table_name` this probe's?
@@ -340,16 +422,250 @@ pub(crate) fn aggregate_sentinel() -> String {
 // SQL
 // =============================================================================
 
-/// The mirror's own coverage boundary. A `MIN` over an integer IDENTITY
-/// column: no date column, no timezone reasoning, no configuration.
+/// The mirror's own coverage boundary, DERIVED. A `MIN` over an integer
+/// IDENTITY column: no date column, no timezone reasoning, no
+/// configuration.
+///
+/// This value is an input to [`payment_ledger_era_floor`], not the floor
+/// itself — see the module docs on the ratchet. It is a LOW-water mark and
+/// one whole-folio mirror of a pre-coverage row drags it backwards.
 pub(crate) const PG_FLOOR_SQL: &str =
     "SELECT MIN(ledger_legacy_id)::bigint FROM ht_payment_ledger";
 
-/// Canonical per-folio aggregate.
+/// `ht_reconcile_era_floor.table_name` for this arm.
+///
+/// The row identity is [`PAYMENT_LEDGER_PROBE_KEY`] itself — the SAME
+/// literal this arm already uses for `ht_reconcile_log.table_name` and
+/// `sync_status.entity_type`, so one operator query joins all four and the
+/// key cannot drift between them. It is a different literal from the 6-B
+/// arm's `guest_registry` row in the same table (pinned by test below), so
+/// the two arms share the table without colliding on its primary key.
+///
+/// The table lives in the CANONICAL database, and each site runs this probe
+/// against its own logical PG database (`hotelnew` / `hotelville`, see the
+/// canonical-PG split — site scoping is connection-level). One row per site
+/// per arm therefore falls out for free: HF Hotel's watermark cannot clamp
+/// Ville's, and the two sites' legacy IDENTITY ranges (which overlap and
+/// mean nothing to each other) never meet.
+const PAYMENT_LEDGER_ERA_FLOOR_KEY: &str = PAYMENT_LEDGER_PROBE_KEY;
+
+/// Persist-and-clamp in ONE statement, ID basis: the durable floor only
+/// ever moves FORWARD.
+///
+/// Sibling of `scheduler::sync::RECONCILE_ERA_FLOOR_UPSERT_SQL` — same
+/// table, same idiom, the other column (`era_floor_id BIGINT`, migration
+/// 084). `GREATEST` lives in SQL rather than Rust for the same reason it
+/// does there: the backend scheduler and `bin/sync` can both tick the same
+/// database, so the monotonic guarantee has to hold under concurrency, not
+/// just within one process. `RETURNING` hands back the post-clamp value, so
+/// the read and the write are the same round trip.
+///
+/// PostgreSQL's `GREATEST` ignores NULL inputs, so a row that somehow
+/// exists with a NULL `era_floor_id` is seeded by the first upsert rather
+/// than swallowing it.
+///
+/// An operator CAN still move the floor forward by hand
+/// (`UPDATE ht_reconcile_era_floor SET era_floor_id = … WHERE table_name =
+/// 'payment_ledger_probe'`) — that is the documented remedy when a
+/// bootstrap reading came out too low — and `GREATEST` makes the edit
+/// stick.
+const ERA_FLOOR_ID_UPSERT_SQL: &str =
+    "INSERT INTO ht_reconcile_era_floor (table_name, era_floor_id) VALUES ($1, $2) \
+     ON CONFLICT (table_name) DO UPDATE \
+        SET era_floor_id = GREATEST(ht_reconcile_era_floor.era_floor_id, EXCLUDED.era_floor_id), \
+            updated_at = NOW() \
+     RETURNING era_floor_id";
+
+/// Read the durable floor without writing. Two callers, via
+/// [`persisted_floor`]: the whole read-only resolve path, and the detection
+/// path when the derived floor is NULL (nothing to clamp with, and an INSERT
+/// would violate the migration-084 CHECK that a row carry a floor in at
+/// least one basis).
+const ERA_FLOOR_ID_SELECT_SQL: &str =
+    "SELECT era_floor_id FROM ht_reconcile_era_floor WHERE table_name = $1";
+
+/// One tick's coverage boundary, in both the form the mirror currently
+/// implies and the form the scan actually uses.
+///
+/// Carrying both is what makes a drag attempt VISIBLE: `effective >
+/// derived` means the persisted watermark is holding the scan forward, i.e.
+/// something just mirrored a pre-coverage folio whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LedgerEraFloor {
+    /// `MIN(ledger_legacy_id)` — what the mirror's CURRENT content implies.
+    pub(crate) derived: Option<i64>,
+    /// Post-clamp `GREATEST(persisted watermark, derived)`. What the legacy
+    /// scan is floored at, and what gets written into an aggregate row.
+    pub(crate) effective: Option<i64>,
+}
+
+impl LedgerEraFloor {
+    /// No coverage boundary in either form — the only value the two
+    /// SINGLE-folio projections are ever built with, since those drop the
+    /// floor by construction (an already-admitted row must stay
+    /// re-projectable if the floor later moves forward). Naming it, rather
+    /// than passing a hand-built `LedgerEraFloor { derived: None, effective:
+    /// None }`, keeps "this call is deliberately unfloored" readable at the
+    /// call site.
+    pub(crate) const UNFLOORED: Self = Self {
+        derived: None,
+        effective: None,
+    };
+
+    /// Is the persisted watermark HOLDING the scope forward against a
+    /// derived value that dropped below it? (The 2026-07-30 shape.)
+    ///
+    /// `pub(crate)` because the ALERT for a hold that persists lives in
+    /// [`crate::scheduler::sync`], next to every other Slack send in this
+    /// subsystem — the same split the outcome counts already use
+    /// (`record_success` / `record_error` are made at the call site, not
+    /// here).
+    pub(crate) fn watermark_holding(&self) -> bool {
+        matches!((self.effective, self.derived), (Some(e), Some(d)) if e > d)
+    }
+}
+
+/// Effective coverage floor = `GREATEST(persisted era_floor_id,
+/// MIN(ledger_legacy_id))`, persisting the max back through the ratchet.
+///
+/// First enabled tick at a site: nothing persisted, so the derived `MIN`
+/// seeds the watermark — the honest absolute legacy minimum ONLY IF that
+/// site's `--all` backfill has already made coverage complete (true at Ville
+/// since 2026-08-01, not yet at HF Hotel). That is the whole enable-order
+/// constraint in the module docs: this seeding is durable, and a floor
+/// seeded from a narrower coverage window keeps holding afterwards. From
+/// then on a whole-folio mirror of a pre-coverage row moves `derived` but
+/// not `effective`.
+///
+/// **Empty-ledger contract, preserved.** With NO canonical rows at all and
+/// nothing ever persisted, both are `None` and the caller's existing
+/// behaviour stands: an unfloored `legacy_folio_sql` emits no `HAVING`, admits
+/// the WHOLE legacy table, and the cap lands the "legacy has 20k folios and
+/// we have none" finding as ONE bounded aggregate row. Nothing is written
+/// to `ht_reconcile_era_floor` in that state (an INSERT with neither basis
+/// would violate the migration-084 CHECK anyway). If a watermark DOES exist
+/// and the mirror has since been emptied, the watermark is KEPT — same rule
+/// as the 6-B arm: re-widening to "no coverage" is the same flood by
+/// another route, and the aggregate row plus the warning below is the
+/// correct way to say a mirror vanished.
+pub(crate) async fn payment_ledger_era_floor(
+    pg_pool: &PgPool,
+) -> Result<LedgerEraFloor, sqlx::Error> {
+    let derived = derived_floor(pg_pool).await?;
+
+    let persisted: Option<i64> = match derived {
+        Some(d) => sqlx::query_scalar::<_, Option<i64>>(ERA_FLOOR_ID_UPSERT_SQL)
+            .bind(PAYMENT_LEDGER_ERA_FLOOR_KEY)
+            .bind(d)
+            .fetch_optional(pg_pool)
+            .await?
+            .flatten(),
+        None => persisted_floor(pg_pool).await?,
+    };
+
+    let floor = LedgerEraFloor {
+        derived,
+        effective: crate::scheduler::sync::clamped_era_floor(persisted, derived),
+    };
+
+    // Say it out loud when the watermark is holding: that is a
+    // pre-coverage folio having been mirrored whole (the 2026-07-30
+    // `--days=212` shape, or an iHOTEL edit on an old folio), which would
+    // otherwise silently widen the scan by months.
+    if floor.watermark_holding() {
+        tracing::info!(
+            derived_floor = ?floor.derived,
+            effective_floor = ?floor.effective,
+            "[Sync] Payment-ledger probe: derived coverage floor sits BELOW the \
+             persisted watermark (a pre-coverage folio was mirrored whole) — \
+             holding the watermark; scope stays monotonically narrowing"
+        );
+    } else if floor.derived.is_none() && floor.effective.is_some() {
+        tracing::warn!(
+            effective_floor = ?floor.effective,
+            "[Sync] Payment-ledger probe: ht_payment_ledger is now EMPTY but a \
+             coverage watermark exists — keeping it. Expect one aggregate \
+             divergence row if the mirror really was lost"
+        );
+    }
+
+    Ok(floor)
+}
+
+/// The SAME floor [`payment_ledger_era_floor`] computes, WITHOUT the
+/// ratchet write. Used by both auto-resolve arms.
+///
+/// The sweep must floor its re-projection exactly the way detection floored
+/// the scan that wrote the row, or an `<aggregate>` row is compared against a
+/// different folio set every time and can never close. It must NOT, however,
+/// persist anything: `auto_resolve_reconcile_log` dispatches on
+/// `ht_reconcile_log.table_name` and is not gated on
+/// `RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED`, so a sweep at a DARK site would
+/// otherwise seed the watermark from whatever coverage that site happens to
+/// have — which, before its `--all` backfill, is precisely the stale narrow
+/// floor the ratchet would then hold forever. Detection is the single writer.
+///
+/// Two reads, both trivial: the derived `MIN` and the persisted row. They are
+/// paid only when an `<aggregate>` row is actually being resolved.
+pub(crate) async fn payment_ledger_era_floor_readonly(
+    pg_pool: &PgPool,
+) -> Result<LedgerEraFloor, sqlx::Error> {
+    let derived = derived_floor(pg_pool).await?;
+    let persisted = persisted_floor(pg_pool).await?;
+    Ok(LedgerEraFloor {
+        derived,
+        effective: crate::scheduler::sync::clamped_era_floor(persisted, derived),
+    })
+}
+
+/// The derived half of the floor — the ONLY reader of [`PG_FLOOR_SQL`], so
+/// nothing can reach the raw `MIN` and skip the clamp.
+///
+/// `AssertSqlSafe`: the statement is a compile-time const; no runtime value
+/// reaches the text.
+async fn derived_floor(pg_pool: &PgPool) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar::<_, Option<i64>>(sqlx::AssertSqlSafe(PG_FLOOR_SQL))
+        .fetch_one(pg_pool)
+        .await
+}
+
+/// The persisted half, READ-ONLY. Used by the resolve path always, and by
+/// the detection path when there is nothing to clamp with (a derived `NULL`
+/// would otherwise INSERT a row carrying neither basis, violating the
+/// migration-084 CHECK).
+async fn persisted_floor(pg_pool: &PgPool) -> Result<Option<i64>, sqlx::Error> {
+    Ok(
+        sqlx::query_scalar::<_, Option<i64>>(ERA_FLOOR_ID_SELECT_SQL)
+            .bind(PAYMENT_LEDGER_ERA_FLOOR_KEY)
+            .fetch_optional(pg_pool)
+            .await?
+            .flatten(),
+    )
+}
+
+/// Canonical per-folio aggregate, floored at the SAME coverage boundary as
+/// the legacy scan.
+///
+/// Takes the whole [`LedgerEraFloor`] and reads
+/// [`LedgerEraFloor::effective`] itself, rather than an `Option<i64>` the
+/// caller extracts: the one mistake this builder has to be immune to is
+/// being fed the DERIVED value, and a caller that cannot pass a bare integer
+/// cannot make it. The remaining way to get it wrong — reading `.derived`
+/// HERE — is a behavioural change the floor tests catch.
 ///
 /// `single = true` narrows it to one `Cin_No` (bound as `$1`) for the
-/// auto-resolve sweep; the projection is otherwise IDENTICAL, so a row's
-/// resolve hash is computed exactly the way detection computed it.
+/// auto-resolve sweep and DROPS the floor, mirroring
+/// [`legacy_folio_sql`]: that path re-projects a folio the scan already
+/// admitted and logged, so it must reproduce that row's hash even if the
+/// floor has since moved forward. The projection is otherwise IDENTICAL, so
+/// a row's resolve hash is computed exactly the way detection computed it.
+///
+/// The floor is a `HAVING` over the per-folio `MIN(ledger_legacy_id)` — the
+/// whole-folio rule, identical to the legacy side, so the two scans admit
+/// the same era. Flooring only legacy would turn every canonical folio under
+/// a HELD watermark into a phantom `missing_mssql` (module docs).
+/// `ledger_legacy_id` is `NOT NULL`, so the `MIN` cannot go NULL and quietly
+/// drop a folio from the canonical side alone.
 ///
 /// The inner `ROW_NUMBER()` is the receipt dedupe; `rn = 1` picks the
 /// lowest-id line of each receipt, matching the legacy side and
@@ -357,13 +673,13 @@ pub(crate) const PG_FLOOR_SQL: &str =
 /// `numeric(19,4)` before summing keeps the addition exact and
 /// order-independent, so it cannot disagree with MSSQL's DECIMAL sum for
 /// arithmetic reasons.
-pub(crate) fn pg_folio_sql(single: bool) -> String {
+pub(crate) fn pg_folio_sql(floor: LedgerEraFloor, single: bool) -> String {
     format!(
         "SELECT btrim(ledger_cin_no) AS folio, COUNT(*)::bigint AS line_count, \
                 COALESCE(SUM(amt), 0)::float8 AS amount_sum, \
                 COALESCE(SUM(CASE WHEN rn = 1 AND st = '1' THEN tender ELSE 0 END), 0)::float8 \
                     AS tender_sum \
-           FROM (SELECT ledger_cin_no, \
+           FROM (SELECT ledger_cin_no, ledger_legacy_id, \
                         COALESCE(ledger_status, '1') AS st, \
                         COALESCE(ledger_amount, 0)::numeric(19,4) AS amt, \
                         (COALESCE(ledger_cash, 0) + COALESCE(ledger_credit, 0) \
@@ -375,16 +691,24 @@ pub(crate) fn pg_folio_sql(single: bool) -> String {
                             ORDER BY ledger_legacy_id) AS rn \
                    FROM ht_payment_ledger \
                   WHERE ledger_cin_no IS NOT NULL{single_filter}) t \
-          GROUP BY 1",
+          GROUP BY 1{having}",
         single_filter = if single {
             " AND btrim(ledger_cin_no) = $1"
         } else {
             ""
         },
+        having = match floor.effective {
+            Some(f) if !single => format!(" HAVING MIN(ledger_legacy_id) >= {f}"),
+            _ => String::new(),
+        },
     )
 }
 
 /// Legacy per-folio aggregate, floored at the mirror's coverage.
+///
+/// Takes the whole [`LedgerEraFloor`] and reads
+/// [`LedgerEraFloor::effective`] itself — same reasoning as
+/// [`pg_folio_sql`]: the caller cannot hand it the derived value by mistake.
 ///
 /// The floor is a `HAVING` over the UNFILTERED per-folio `MIN(id)`, so a
 /// folio that straddles the boundary is excluded whole rather than
@@ -392,17 +716,17 @@ pub(crate) fn pg_folio_sql(single: bool) -> String {
 /// PostgreSQL itself produced and Rust formats as a bare number, so there
 /// is no injection surface and no locale-dependent literal.
 ///
-/// `floor = None` (an empty canonical ledger) deliberately admits the
-/// WHOLE legacy table: with no coverage at all, "legacy has 20k folios and
-/// we have none" IS the finding, and the cap lands it as one bounded
-/// aggregate row.
+/// An effective floor of `None` (an empty canonical ledger that never had a
+/// watermark) deliberately admits the WHOLE legacy table: with no coverage
+/// at all, "legacy has 20k folios and we have none" IS the finding, and the
+/// cap lands it as one bounded aggregate row.
 ///
 /// `single` narrows to one `Cin_No` (bound as `@P1`) for the auto-resolve
 /// sweep and drops the floor — same rule as `fetch_legacy_payment_hash`:
 /// this path re-projects a folio the scan ALREADY admitted and logged, so
 /// it must reproduce that row's hash unconditionally, or a floor that
 /// moved forward would make an open row un-re-projectable.
-pub(crate) fn legacy_folio_sql(floor: Option<i64>, single: bool) -> String {
+pub(crate) fn legacy_folio_sql(floor: LedgerEraFloor, single: bool) -> String {
     let tender = "COALESCE(Cin_Pay_Cash, 0) + COALESCE(Cin_Pay_Credit, 0) \
                   + COALESCE(Cin_Pay_Free, 0) + COALESCE(Cin_Pay_Tran, 0) \
                   + COALESCE(Cin_Pay_web, 0)";
@@ -427,7 +751,7 @@ pub(crate) fn legacy_folio_sql(floor: Option<i64>, single: bool) -> String {
         } else {
             ""
         },
-        having = match floor {
+        having = match floor.effective {
             Some(f) if !single => format!(" HAVING MIN(CAST(t.id AS BIGINT)) >= {f}"),
             _ => String::new(),
         },
@@ -553,6 +877,14 @@ pub(crate) struct PaymentLedgerProbeOutcome {
     pub(crate) recorded: usize,
     /// Wall time of the whole tick.
     pub(crate) duration_ms: i32,
+    /// The coverage floor this tick actually scanned with, BOTH halves.
+    ///
+    /// Returned rather than alerted on here for the same reason the counts
+    /// are: the Slack send lives at the `run_sync` call site next to every
+    /// other alert in the subsystem. `effective > derived` sustained across
+    /// [`crate::scheduler::sync::ERA_FLOOR_HELD_ALERT_TICKS`] ticks is what
+    /// raises the held-watermark alert.
+    pub(crate) era_floor: LedgerEraFloor,
 }
 
 /// Run the probe. Called ONLY when
@@ -566,13 +898,14 @@ pub(crate) async fn run_payment_ledger_probe(
     let start = Instant::now();
     tracing::info!("[Sync] Probing the payment ledger per folio...");
 
-    // ── Coverage floor, derived from the mirror itself ────────────────
-    let floor: Option<i64> = sqlx::query_scalar::<_, Option<i64>>(sqlx::AssertSqlSafe(PG_FLOOR_SQL))
-        .fetch_one(pg_pool)
-        .await?;
+    // ── Coverage floor: derived from the mirror, clamped to the ratchet ─
+    // Passed to BOTH scans whole; neither side may be built from the raw
+    // derived value (module docs — an unfloored canonical side turns every
+    // pre-watermark folio into a phantom `missing_mssql`).
+    let era_floor = payment_ledger_era_floor(pg_pool).await?;
 
-    // ── ONE canonical grouped read ────────────────────────────────────
-    let pg_sql = pg_folio_sql(false);
+    // ── ONE canonical grouped read, floored ───────────────────────────
+    let pg_sql = pg_folio_sql(era_floor, false);
     let pg_rows = sqlx::query_as::<_, (String, i64, f64, f64)>(sqlx::AssertSqlSafe(&*pg_sql))
         .fetch_all(pg_pool)
         .await?;
@@ -590,8 +923,8 @@ pub(crate) async fn run_payment_ledger_probe(
         })
         .collect();
 
-    // ── ONE legacy grouped read, floored ──────────────────────────────
-    let legacy_sql = legacy_folio_sql(floor, false);
+    // ── ONE legacy grouped read, floored the SAME way ─────────────────
+    let legacy_sql = legacy_folio_sql(era_floor, false);
     let mut conn = legacy_pool.get().await?;
     let rows =
         simple_query_with_timeout_pooled(&mut conn, &legacy_sql, MssqlOpKind::Read).await?;
@@ -620,7 +953,8 @@ pub(crate) async fn run_payment_ledger_probe(
     if findings.is_empty() {
         tracing::info!(
             folios = compared,
-            floor,
+            floor = ?era_floor.effective,
+            derived_floor = ?era_floor.derived,
             duration_ms = duration_ms_of(start),
             "[Sync] Payment-ledger probe: converged"
         );
@@ -628,6 +962,7 @@ pub(crate) async fn run_payment_ledger_probe(
             converged,
             recorded: 0,
             duration_ms: duration_ms_of(start),
+            era_floor,
         });
     }
 
@@ -637,7 +972,7 @@ pub(crate) async fn run_payment_ledger_probe(
             &LedgerTotals::of(&legacy_folios),
             &LedgerTotals::of(&pg_folios),
             findings.len(),
-            floor,
+            era_floor,
         )
         .await;
         1
@@ -649,7 +984,8 @@ pub(crate) async fn run_payment_ledger_probe(
             findings = findings.len(),
             legacy_folios = legacy_folios.len(),
             pg_folios = pg_folios.len(),
-            floor,
+            floor = ?era_floor.effective,
+            derived_floor = ?era_floor.derived,
             "[Sync] Payment-ledger probe: per-folio divergences recorded (a \
              missing_pg folio is money the round report under-counts; re-drive \
              it with the backfill_payment_ledger bin)"
@@ -661,6 +997,7 @@ pub(crate) async fn run_payment_ledger_probe(
         converged,
         recorded,
         duration_ms: duration_ms_of(start),
+        era_floor,
     })
 }
 
@@ -671,8 +1008,9 @@ async fn record_aggregate_divergence(
     legacy: &LedgerTotals,
     pg: &LedgerTotals,
     findings: usize,
-    floor: Option<i64>,
+    era_floor: LedgerEraFloor,
 ) {
+    let floor = era_floor.effective;
     let kind = aggregate_divergence_kind(legacy, pg);
     // STABLE sentinel, not the live aggregate hash — see the module docs.
     // Placed on the side(s) that actually HAVE folios so the row still
@@ -690,9 +1028,11 @@ async fn record_aggregate_divergence(
         pg_folios = pg.folio_count,
         kind = kind.as_str(),
         floor,
+        derived_floor = ?era_floor.derived,
         "[Sync] Payment-ledger probe: whole-ledger divergence recorded as ONE \
-         aggregate row (too large to enumerate per folio — check whether the \
-         coverage floor collapsed onto a pre-era folio)"
+         aggregate row (too large to enumerate per folio — the persisted \
+         era-floor ratchet rules out a COLLAPSED floor, so compare \
+         derived_floor against floor and then look at the mirror itself)"
     );
 
     record_divergence(
@@ -704,7 +1044,11 @@ async fn record_aggregate_divergence(
         json!({
             "scope": "aggregate",
             "legacy_table": "HT_CheckIn_Pay",
+            // Both, always: an operator reading this row must be able to see
+            // whether the ratchet was holding the scan forward at the moment
+            // it was written.
             "coverage_floor_legacy_id": floor,
+            "derived_floor_legacy_id": era_floor.derived,
             "per_folio_findings": findings,
             "totals": legacy.json(),
         }),
@@ -775,12 +1119,18 @@ async fn record_folio_divergence(pg_pool: &PgPool, finding: &LedgerFinding) {
 ///
 /// Never returns `Ok(None)`: an absent folio hashes to
 /// [`folio_absent_hash`] so absent-on-both converges (module docs).
+///
+/// The `<aggregate>` arm floors the canonical scan exactly as detection did
+/// — through [`payment_ledger_era_floor_readonly`], so the totals it hashes
+/// are over the same in-era folio set the row was written from, and so
+/// nothing on the resolve path writes the watermark.
 pub(crate) async fn resolve_pg_hash(
     pg_pool: &PgPool,
     legacy_pk: &str,
 ) -> Result<Option<String>, sqlx::Error> {
     if legacy_pk == PAYMENT_LEDGER_AGGREGATE_PK {
-        let sql = pg_folio_sql(false);
+        let era_floor = payment_ledger_era_floor_readonly(pg_pool).await?;
+        let sql = pg_folio_sql(era_floor, false);
         let rows = sqlx::query_as::<_, (String, i64, f64, f64)>(sqlx::AssertSqlSafe(&*sql))
             .fetch_all(pg_pool)
             .await?;
@@ -800,7 +1150,7 @@ pub(crate) async fn resolve_pg_hash(
         return Ok(Some(aggregate_hash(&LedgerTotals::of(&folios))));
     }
 
-    let sql = pg_folio_sql(true);
+    let sql = pg_folio_sql(LedgerEraFloor::UNFLOORED, true);
     let found = sqlx::query_as::<_, (String, i64, f64, f64)>(sqlx::AssertSqlSafe(&*sql))
         .bind(legacy_pk)
         .fetch_optional(pg_pool)
@@ -822,21 +1172,26 @@ pub(crate) async fn resolve_pg_hash(
 ///
 /// Takes `pg_pool` for the same reason 6-C's `resolve_legacy_hash` does:
 /// the `<aggregate>` comparison is only meaningful inside the mirror's own
-/// coverage floor, and that floor is a `MIN` over the CANONICAL side.
+/// coverage floor, and that floor is derived from the CANONICAL side.
 /// Re-deriving it here (rather than freezing it onto the row) means a
 /// floor that MOVES because the mirror finally received its missing
 /// history is picked up on the next sweep.
+///
+/// It goes through [`payment_ledger_era_floor_readonly`] — the SAME clamped
+/// floor detection used, not the raw `MIN` — or a resolve could re-project a
+/// WIDER folio set than the row was written from and never reproduce its
+/// hash. It is the READ-ONLY variant on purpose: the sweep that calls this
+/// is not gated on the probe's own flag, so re-running the ratchet upsert
+/// from here would let a DARK site persist a watermark from pre-backfill
+/// coverage (module docs, "The resolve path NEVER writes the watermark").
 pub(crate) async fn resolve_legacy_hash(
     legacy_pool: &DbPool,
     pg_pool: &PgPool,
     legacy_pk: &str,
 ) -> Result<Option<String>, AnyError> {
     if legacy_pk == PAYMENT_LEDGER_AGGREGATE_PK {
-        let floor: Option<i64> =
-            sqlx::query_scalar::<_, Option<i64>>(sqlx::AssertSqlSafe(PG_FLOOR_SQL))
-                .fetch_one(pg_pool)
-                .await?;
-        let sql = legacy_folio_sql(floor, false);
+        let era_floor = payment_ledger_era_floor_readonly(pg_pool).await?;
+        let sql = legacy_folio_sql(era_floor, false);
         let mut conn = legacy_pool.get().await?;
         let rows = simple_query_with_timeout_pooled(&mut conn, &sql, MssqlOpKind::Read).await?;
         drop(conn);
@@ -857,7 +1212,7 @@ pub(crate) async fn resolve_legacy_hash(
         return Ok(Some(aggregate_hash(&LedgerTotals::of(&folios))));
     }
 
-    let sql = legacy_folio_sql(None, true);
+    let sql = legacy_folio_sql(LedgerEraFloor::UNFLOORED, true);
     let mut conn = legacy_pool.get().await?;
     let mut q = tiberius::Query::new(sql.as_str());
     q.bind(legacy_pk);
@@ -1069,9 +1424,17 @@ mod tests {
     /// `MIN(id)`. A `WHERE id >= floor` would admit the one HF Hotel folio
     /// that straddles the boundary on a PARTIAL line set and manufacture a
     /// permanent `value` finding.
+    /// A floor in both halves, as one tick sees it.
+    fn floor_at(derived: i64, effective: i64) -> LedgerEraFloor {
+        LedgerEraFloor {
+            derived: Some(derived),
+            effective: Some(effective),
+        }
+    }
+
     #[test]
     fn legacy_sql_floors_whole_folios_not_lines() {
-        let sql = legacy_folio_sql(Some(56353), false);
+        let sql = legacy_folio_sql(floor_at(56353, 56353), false);
         assert!(
             sql.contains("HAVING MIN(CAST(t.id AS BIGINT)) >= 56353"),
             "got: {sql}"
@@ -1082,8 +1445,321 @@ mod tests {
         );
         // No canonical coverage at all ⇒ no floor: "legacy has folios and
         // we have none" is the finding, and the cap lands it as ONE row.
-        let unfloored = legacy_folio_sql(None, false);
+        let unfloored = legacy_folio_sql(LedgerEraFloor::UNFLOORED, false);
         assert!(!unfloored.contains("HAVING"));
+    }
+
+    /// The canonical scan carries the floor too, on the same whole-folio
+    /// `HAVING MIN(id)` rule.
+    ///
+    /// RED before the fix (the builder took no floor at all): an unfloored
+    /// canonical side reports every folio below a HELD watermark as
+    /// `missing_mssql` — churning per tick while the count is small, and
+    /// landing ONE never-resolvable `<aggregate>` row once it is large
+    /// (unfloored-pg totals versus floored-legacy totals can never be equal).
+    #[test]
+    fn pg_sql_floors_whole_folios_not_lines() {
+        let sql = pg_folio_sql(floor_at(56353, 56353), false);
+        assert!(sql.contains("HAVING MIN(ledger_legacy_id) >= 56353"), "got: {sql}");
+        assert!(
+            !sql.contains("ledger_cin_no IS NOT NULL AND ledger_legacy_id >="),
+            "the floor must not filter LINES: {sql}"
+        );
+        // The outer HAVING can only see the id if the inner projection
+        // carries it.
+        assert!(
+            sql.contains("SELECT ledger_cin_no, ledger_legacy_id,"),
+            "the id must be projected out of the dedupe subquery: {sql}"
+        );
+        assert!(!pg_folio_sql(LedgerEraFloor::UNFLOORED, false).contains("HAVING"));
+    }
+
+    /// D1 — the exact pin the review asked for: with the 2026-07-30 numbers
+    /// persisted 40470 / derived 39113, BOTH bulk statements carry
+    /// `>= 40470`, and neither carries the dragged value.
+    ///
+    /// This is also the mutation guard for `.effective` → `.derived` INSIDE
+    /// either builder, which is the only place that mistake can still be
+    /// written now that the builders take the whole [`LedgerEraFloor`].
+    #[test]
+    fn both_scans_are_floored_at_the_effective_watermark() {
+        let held = floor_at(39113, 40470);
+
+        let legacy = legacy_folio_sql(held, false);
+        let pg = pg_folio_sql(held, false);
+        assert!(
+            legacy.contains("HAVING MIN(CAST(t.id AS BIGINT)) >= 40470"),
+            "legacy scan must floor at the WATERMARK: {legacy}"
+        );
+        assert!(
+            pg.contains("HAVING MIN(ledger_legacy_id) >= 40470"),
+            "canonical scan must floor at the WATERMARK too, or every folio \
+             below it reads as a phantom missing_mssql: {pg}"
+        );
+        assert!(!legacy.contains("39113"), "dragged floor reached legacy: {legacy}");
+        assert!(!pg.contains("39113"), "dragged floor reached canonical: {pg}");
+
+        // Both SINGLE forms drop the floor — an already-admitted row must
+        // stay re-projectable after the floor moves forward.
+        assert!(!legacy_folio_sql(held, true).contains("HAVING"));
+        assert!(!pg_folio_sql(held, true).contains("HAVING"));
+    }
+
+    // ── Era-floor ratchet (migration 084) ─────────────────────────────
+    //
+    // Clamp-case idiom borrowed from the 6-B arm's
+    // `era_floor_is_clamped_to_a_non_decreasing_watermark`; the rule
+    // itself is single-sourced (`scheduler::sync::clamped_era_floor`), so
+    // these pin the ID-BASIS behaviour and this arm's numbers, not a
+    // second copy of the logic.
+
+    use crate::scheduler::sync::clamped_era_floor;
+
+    /// THE 2026-07-30 SCENARIO, with its live numbers. A
+    /// `backfill_payment_ledger --days=212` mirrored a monthly-billed
+    /// long-stay (`CH25-000076`) WHOLE, and its 2025-08 line dragged
+    /// `MIN(ledger_legacy_id)` from ~40470 back to 39113 — sweeping 404
+    /// never-mirrored folios into the scan as `missing_pg`, none of them a
+    /// genuine gap. A derived floor BELOW the persisted watermark must not
+    /// widen the scan.
+    ///
+    /// RED without the clamp: `effective` would be the derived 39113 and
+    /// the `HAVING MIN(id) >= 39113` scan would re-admit those folios.
+    #[test]
+    fn a_dragged_derived_floor_does_not_widen_the_scan() {
+        let persisted = 40470_i64; // watermark before the backfill
+        let derived = 39113_i64; // poisoned by one 2025-08 line
+
+        let effective = clamped_era_floor(Some(persisted), Some(derived));
+        assert_eq!(
+            effective,
+            Some(persisted),
+            "a derived MIN below the watermark is the whole-folio drag; the \
+             effective floor must stay at the watermark"
+        );
+
+        // And the scans really are floored at the watermark, not the drag —
+        // BOTH of them (see `both_scans_are_floored_at_the_effective_watermark`
+        // for the full pin).
+        let floor = LedgerEraFloor {
+            derived: Some(derived),
+            effective,
+        };
+        for sql in [legacy_folio_sql(floor, false), pg_folio_sql(floor, false)] {
+            assert!(sql.contains(">= 40470"), "got: {sql}");
+            assert!(
+                !sql.contains(">= 39113"),
+                "the poisoned derived floor must never reach a scan: {sql}"
+            );
+        }
+    }
+
+    /// The ratchet still moves FORWARD: real coverage growth (a `--all`
+    /// backfill completing, or history the mirror finally received) is
+    /// genuine narrowing and wins — and, at the other end, the first tick
+    /// after deploy seeds the watermark from the derived value.
+    #[test]
+    fn the_era_floor_ratchets_forward_and_seeds_from_derived() {
+        assert_eq!(
+            clamped_era_floor(Some(39014_i64), Some(40470_i64)),
+            Some(40470),
+            "a derived floor ABOVE the watermark is genuine narrowing"
+        );
+        assert_eq!(
+            clamped_era_floor(None, Some(39014_i64)),
+            Some(39014),
+            "first tick after deploy: the derived MIN (Ville's absolute legacy \
+             minimum after the --all backfill) becomes the baseline"
+        );
+    }
+
+    /// The empty-`ht_payment_ledger` contract, unchanged by the ratchet:
+    /// with no coverage AND no watermark the floor is `None`, the legacy
+    /// scan emits no `HAVING` and admits the whole table, and the cap lands
+    /// "legacy has folios, we have none" as ONE aggregate row. With a
+    /// watermark and an emptied mirror the watermark is KEPT — re-widening
+    /// to no-coverage is the same flood by another route (the 6-B rule).
+    #[test]
+    fn empty_ledger_contract_is_preserved() {
+        assert_eq!(
+            clamped_era_floor(None, None::<i64>),
+            None,
+            "no coverage was ever established ⇒ the scan stays unfloored"
+        );
+        assert!(!legacy_folio_sql(LedgerEraFloor::UNFLOORED, false).contains("HAVING"));
+        assert!(!pg_folio_sql(LedgerEraFloor::UNFLOORED, false).contains("HAVING"));
+
+        assert_eq!(
+            clamped_era_floor(Some(40470_i64), None),
+            Some(40470),
+            "the mirror vanishing must NOT reopen the whole legacy history"
+        );
+    }
+
+    /// The ratchet has to hold across PROCESSES (the backend scheduler and
+    /// `bin/sync` can tick the same database), so `GREATEST` lives in SQL
+    /// and the post-clamp read is the same round trip as the write. The
+    /// statement must touch the ID column, never the sibling arm's
+    /// TIMESTAMP one.
+    #[test]
+    fn era_floor_id_sql_is_monotonic_and_single_round_trip() {
+        assert!(
+            ERA_FLOOR_ID_UPSERT_SQL.contains(
+                "GREATEST(ht_reconcile_era_floor.era_floor_id, EXCLUDED.era_floor_id)"
+            ),
+            "without GREATEST the upsert would happily write a LOWER floor and \
+             the 2026-07-30 drag would land again: {ERA_FLOOR_ID_UPSERT_SQL}"
+        );
+        assert!(
+            ERA_FLOOR_ID_UPSERT_SQL.ends_with("RETURNING era_floor_id"),
+            "the post-clamp value must come back from the same statement, else a \
+             concurrent tick's value is silently ignored: {ERA_FLOOR_ID_UPSERT_SQL}"
+        );
+        assert!(ERA_FLOOR_ID_SELECT_SQL.contains("FROM ht_reconcile_era_floor"));
+        assert!(ERA_FLOOR_ID_SELECT_SQL.contains("table_name = $1"));
+        // The ID basis, never the 6-B arm's TIMESTAMP column: a date basis
+        // here would have to cross the naive-Thai/TIMESTAMPTZ boundary the
+        // integer IDENTITY floor exists to avoid. (The table NAME also ends
+        // in `era_floor`, so mask it before counting columns.)
+        for sql in [ERA_FLOOR_ID_UPSERT_SQL, ERA_FLOOR_ID_SELECT_SQL] {
+            let cols = sql.replace("ht_reconcile_era_floor", "<tbl>");
+            assert_eq!(
+                cols.matches("era_floor").count(),
+                cols.matches("era_floor_id").count(),
+                "every era_floor reference must be the ID column — writing the \
+                 6-B arm's TIMESTAMP column from here would corrupt its \
+                 watermark: {sql}"
+            );
+        }
+        // The derived half stays an integer MIN over the IDENTITY column.
+        assert!(PG_FLOOR_SQL.contains("MIN(ledger_legacy_id)"), "{PG_FLOOR_SQL}");
+        assert!(
+            !PG_FLOOR_SQL.contains("ledger_pay_date"),
+            "a date basis reintroduces the Thai→UTC reasoning the id basis \
+             avoids: {PG_FLOOR_SQL}"
+        );
+    }
+
+    /// `ht_reconcile_era_floor` is keyed on `table_name`, and this arm now
+    /// shares it with the 6-B `guest_registry` arm. The two row identities
+    /// must differ, or one arm's floor would clobber the other's — across
+    /// two INCOMPATIBLE bases (a TIMESTAMP and a legacy IDENTITY).
+    #[test]
+    fn era_floor_row_identity_does_not_collide_with_guest_registry() {
+        assert_eq!(
+            PAYMENT_LEDGER_ERA_FLOOR_KEY, PAYMENT_LEDGER_PROBE_KEY,
+            "one literal for ht_reconcile_era_floor.table_name, \
+             ht_reconcile_log.table_name and sync_status.entity_type, so one \
+             operator query joins them"
+        );
+        assert_ne!(
+            PAYMENT_LEDGER_ERA_FLOOR_KEY,
+            crate::scheduler::sync::GUEST_REGISTRY_ERA_FLOOR_KEY,
+            "both arms upsert into ht_reconcile_era_floor; a shared key would \
+             mean one arm's watermark overwrites the other's"
+        );
+        assert!(
+            PAYMENT_LEDGER_ERA_FLOOR_KEY.len() <= 50,
+            "table_name is VARCHAR(50)"
+        );
+    }
+
+    /// The tick and the auto-resolve sweep must floor BOTH scans the SAME
+    /// way, or an `<aggregate>` row is written from one folio set and
+    /// re-projected from another and can never close. Everything goes
+    /// through the clamped helpers; nothing may reach for the raw `MIN`
+    /// again.
+    #[test]
+    fn detection_and_resolve_share_the_clamped_floor() {
+        let body = module_body();
+        assert_eq!(
+            body.matches("payment_ledger_era_floor(pg_pool)").count(),
+            1,
+            "exactly ONE caller of the RATCHETING floor — the probe's own \
+             tick. The resolve arms must use the read-only variant"
+        );
+        assert_eq!(
+            body.matches("payment_ledger_era_floor_readonly(pg_pool)")
+                .count(),
+            2,
+            "both <aggregate> resolve arms (pg + legacy) must re-derive the \
+             clamped floor, read-only"
+        );
+        assert_eq!(
+            body.matches("AssertSqlSafe(PG_FLOOR_SQL)").count(),
+            1,
+            "the raw derived MIN may be read in ONE place only (inside \
+             `derived_floor`); anything else bypasses the ratchet"
+        );
+    }
+
+    /// D5 — the auto-resolve sweep is dispatched on
+    /// `ht_reconcile_log.table_name` and is NOT gated on
+    /// `RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED`, so it runs at sites where
+    /// this probe is still dark. It must therefore never PERSIST a
+    /// watermark: doing so would let a site bake in a floor derived from
+    /// pre-`--all`-backfill coverage, which the ratchet would then hold
+    /// forever, permanently excluding the folios that backfill lands.
+    ///
+    /// RED before the fix: `resolve_legacy_hash` called the ratcheting
+    /// `payment_ledger_era_floor`, whose upsert writes.
+    #[test]
+    fn the_resolve_path_never_writes_the_watermark() {
+        let body = module_body();
+        // Both resolve fns live at the end of the module body, in this
+        // order; slicing from the first covers both.
+        let resolve = &body[body
+            .find("pub(crate) async fn resolve_pg_hash")
+            .expect("resolve_pg_hash is part of the module body")..];
+        assert!(
+            resolve.contains("fn resolve_legacy_hash"),
+            "the slice must cover BOTH resolve arms"
+        );
+        assert!(
+            !resolve.contains("ERA_FLOOR_ID_UPSERT_SQL"),
+            "the resolve path must not issue the ratchet upsert"
+        );
+        assert!(
+            !resolve.contains("payment_ledger_era_floor(pg_pool)"),
+            "the resolve path must not call the WRITING floor helper"
+        );
+        assert_eq!(
+            body.matches("ERA_FLOOR_ID_UPSERT_SQL)").count(),
+            1,
+            "the watermark is written from exactly one statement, in the \
+             probe's own tick"
+        );
+    }
+
+    /// The module body with its tests stripped — every source-scan pin
+    /// reads this, so a pin can never match itself.
+    fn module_body() -> &'static str {
+        include_str!("payment_ledger_probe.rs")
+            .split("mod tests")
+            .next()
+            .expect("the module body precedes its tests")
+    }
+
+    /// A drag attempt must be VISIBLE. `watermark_holding` is what the log
+    /// line keys on, and it is true exactly when the persisted floor is
+    /// pulling the scan forward.
+    #[test]
+    fn watermark_holding_flags_exactly_the_drag_case() {
+        let dragged = LedgerEraFloor {
+            derived: Some(39113),
+            effective: Some(40470),
+        };
+        let quiet = LedgerEraFloor {
+            derived: Some(39014),
+            effective: Some(39014),
+        };
+        let empty = LedgerEraFloor {
+            derived: None,
+            effective: None,
+        };
+        assert!(dragged.watermark_holding());
+        assert!(!quiet.watermark_holding());
+        assert!(!empty.watermark_holding());
     }
 
     /// The single-folio resolve projection must be IDENTICAL to the bulk
@@ -1093,17 +1769,20 @@ mod tests {
     /// re-projectable if the floor moves forward.
     #[test]
     fn single_folio_sql_matches_the_bulk_projection() {
-        let bulk = legacy_folio_sql(Some(1), false);
-        let single = legacy_folio_sql(Some(1), true);
+        let floor = floor_at(1, 1);
+        let bulk = legacy_folio_sql(floor, false);
+        let single = legacy_folio_sql(floor, true);
         assert!(single.contains("AND LTRIM(RTRIM(Cin_No)) = @P1"));
         assert!(!single.contains("HAVING"), "got: {single}");
         assert!(bulk.contains("HAVING"));
         let projection = |s: &str| s.split(" FROM (SELECT").next().unwrap().to_string();
         assert_eq!(projection(&bulk), projection(&single));
 
-        let pg_bulk = pg_folio_sql(false);
-        let pg_single = pg_folio_sql(true);
+        let pg_bulk = pg_folio_sql(floor, false);
+        let pg_single = pg_folio_sql(floor, true);
         assert!(pg_single.contains("AND btrim(ledger_cin_no) = $1"));
+        assert!(!pg_single.contains("HAVING"), "got: {pg_single}");
+        assert!(pg_bulk.contains("HAVING"));
         assert_eq!(projection(&pg_bulk), projection(&pg_single));
     }
 
@@ -1115,8 +1794,8 @@ mod tests {
     /// iHOTEL 11,005).
     #[test]
     fn tenders_are_deduped_per_receipt_and_amounts_are_not() {
-        let pg = pg_folio_sql(false);
-        let legacy = legacy_folio_sql(None, false);
+        let pg = pg_folio_sql(LedgerEraFloor::UNFLOORED, false);
+        let legacy = legacy_folio_sql(LedgerEraFloor::UNFLOORED, false);
         // Dedupe key: blank/NULL pay_no falls back to the LINE id, so such
         // lines stay separate receipts instead of collapsing into one.
         assert!(
@@ -1148,7 +1827,9 @@ mod tests {
     /// line reads as `value` drift forever.
     #[test]
     fn legacy_amount_uses_the_mappers_null_fallback() {
-        assert!(legacy_folio_sql(None, false).contains(LEGACY_AMOUNT_FALLBACK));
+        assert!(
+            legacy_folio_sql(LedgerEraFloor::UNFLOORED, false).contains(LEGACY_AMOUNT_FALLBACK)
+        );
         let mapper = include_str!("../sync/mappers/payment.rs");
         assert!(
             mapper.contains("None => cash + credit + free + tran + web,"),
@@ -1167,7 +1848,10 @@ mod tests {
         let at = src
             .find("payment_ledger_probe::run_payment_ledger_probe(")
             .expect("run_sync must call the probe");
-        let call_site = &src[at..(at + 1200).min(src.len())];
+        // Wide enough to span the whole `match`, which now also feeds the
+        // held-watermark tripwire on the Ok arm
+        // (`scheduler::sync::note_payment_ledger_era_floor_hold`).
+        let call_site = &src[at..(at + 1600).min(src.len())];
         assert!(
             call_site.contains("record_success("),
             "the payment-ledger probe call site records failures but not \
