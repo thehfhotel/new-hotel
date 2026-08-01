@@ -936,7 +936,16 @@ services:
       # where the 19 known missing_pg folios live. Watch for a QUIET ledger;
       # anything new here is a genuine mirror gap in the money the round
       # report reads, remediable with the backfill_payment_ledger bin.
-      - RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED=${HFVILLE_RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED:-false}
+      #
+      # ENABLED 2026-08-01 (T2 rollout step 5 of 8). This canary is about
+      # BEHAVIOUR, not data: Ville measured exactly converged on 2026-07-28,
+      # so silence here proves the arm runs cleanly, not that the detector
+      # works. That distinction matters — the mirror probe was enabled on
+      # 2026-07-31 predicting silence and instead minted an unclosable row
+      # (it counts app-authored rows as divergence, see #273), so an arm
+      # misbehaving in an unforeseen way is a live risk, which is exactly
+      # what a canary is for. NB the converged measurement is 4 days old.
+      - RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED=${HFVILLE_RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED:-true}
       # ADR 0005 NULL-clear sentinel tripwire — see the backend service's
       # comment for the full rationale. This worker runs Ville's reconcile,
       # so the knob is LIVE here (not the inert-carried-for-parity pattern
