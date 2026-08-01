@@ -37,7 +37,17 @@
 //!
 //! 1. Determines the legacy scan floor: the canonical `MIN(rcal_date)`
 //!    (auto-derived, same "never configured" contract as
-//!    `scheduler::sync::room_calendar_business_key_legacy_sql`'s era floor),
+//!    `scheduler::sync::room_calendar_business_key_legacy_sql`'s era floor —
+//!    though not the same SQL: [`CANONICAL_FLOOR_SQL`] is unfiltered, while
+//!    the probe's floor (issue #273, 2026-07-31) is `MIN` over MIRRORED rows
+//!    only, `WHERE rcal_legacy_id IS NOT NULL`. A detached formerly-mirrored
+//!    tile can predate the mirrored floor, so this bin's floor can only be
+//!    EARLIER, never later — it scans a wider legacy window, never a
+//!    narrower one. Safe in that direction: anything this bin inserts is
+//!    stamped with a fresh `rcal_legacy_id` through the same mapper the CT
+//!    watcher uses, which only ever pulls the probe's mirrored-only floor
+//!    DOWN toward this one, never leaves a gap the probe's narrower floor
+//!    would have skipped),
 //!    overridden by `--since=YYYY-MM-DD`, or disabled entirely by `--all`
 //!    (unfloored — expensive, scans all `HT_Room_Status` history).
 //! 2. Reads the legacy work-list: one row per **business key**

@@ -121,6 +121,45 @@
 //! Ville's business-key gap has not been independently measured; do not
 //! assume it equals the id-keyed 1302/1071 pair above.
 //!
+//! ### Canonical side counts MIRRORED rows only (issue #273, 2026-07-31)
+//!
+//! The first live tick with the calendar arm enabled on Ville opened
+//! `missing_mssql` at legacy=1637 vs pg=1676 — a delta of exactly 39, the
+//! whole `rcal_legacy_id IS NULL` population. Those are DETACHED
+//! formerly-mirrored tiles, not rows a source never held: the mapper's
+//! id-reuse pre-clear (`sync/mappers/room_calendar.rs:185-192`) NULLs a
+//! row's `rcal_legacy_id` when iHOTEL's `MAX(id)+1` allocator rebinds the id
+//! onto a different `(room, night)` slot, so the OLD tile is left pointing
+//! at nothing while the legacy row it used to mirror moves away with the id.
+//! Genuine canonical surplus, and unclosable as detected, so the arm was
+//! reverted the same day. The canonical side of the business-key comparison
+//! is now scoped to `rcal_legacy_id IS NOT NULL` in the ONE shared fetch both
+//! detection and closure read (`sync::fetch_calendar_business_key_pg` /
+//! `sync::ROOM_CALENDAR_BUSINESS_KEY_PG_SQL`), which converges both sites
+//! (Ville 1637/1637, HF Hotel 4,542/4,542). This is a deliberate stop-gap,
+//! not a permanent classification: nothing reads `ht_room_calendar` yet, and
+//! the excluded detached-tile surplus is tracked as issue #281 rather than
+//! silently dropped. Full reasoning, including why a NULL-id row cannot in
+//! practice shadow a live legacy night, is in that module's "Calendar
+//! closure arm" section header.
+//!
+//! ### The 8 `legacy_mirror.*` probes carry no equivalent exposure
+//!
+//! Audited alongside that fix. Every `legacy_mirror.*` table has exactly two
+//! writers — `scheduler::mirror`'s wholesale reload (DELETE-all + INSERT from
+//! a legacy `SELECT`) and `sync::mappers::mirror`'s CT mapper
+//! (DELETE-by-legacy-PK + INSERT of the legacy row) — and both write only
+//! rows that exist on the legacy side, keyed on the legacy PK, with no
+//! id-reuse pre-clear that can NULL a pointer the way the calendar mapper's
+//! does. A canonical row here can never detach from its legacy counterpart.
+//! No route, service, or writeback path writes into that schema at all,
+//! which is why all 8 carry `mirror_filter: None` and need none. A surplus
+//! row there (legacy row deleted, `D` event never applied) is genuine
+//! `missing_mssql`, not a structural artefact — it is exactly what the probe
+//! should report. The forward-looking rule this leaves behind: any probed
+//! mirror whose canonical row can LOSE its legacy pointer (detach) needs
+//! mirrored-rows-only scoping before `observe_only` comes off.
+//!
 //! ## What gets recorded
 //!
 //! Only [`DivergenceKind::MissingPg`], [`DivergenceKind::MissingMssql`] and

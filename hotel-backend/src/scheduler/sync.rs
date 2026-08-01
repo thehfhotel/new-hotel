@@ -3939,14 +3939,68 @@ async fn fetch_legacy_registry_folio_hash(
 // DISTINCT `(room_no, night)` pairs, because `HT_Room_Status` carries no such
 // constraint and the app-side allocator can and does duplicate them.
 //
-// Canonical-only tiles (`rcal_legacy_id IS NULL`) are COUNTED here, unlike in
-// the id-keyed probe which filters them out. That reversal is the point: a
-// row whose id the mapper NULLed still occupies a real `(room, night)` slot
-// that legacy also has, and excluding it would re-introduce exactly the
-// structural undercount the business key exists to dodge. Note that
-// `rcal_legacy_id IS NULL` cannot distinguish "app-authored tile" from
-// "rebind-NULLed tile" — that indistinguishability IS the id key's defect,
-// and the business key is deliberately blind to it.
+// ## The canonical side counts MIRRORED rows only (issue #273, 2026-07-31)
+//
+// The first cut of this arm counted EVERY canonical row, reasoning that a
+// tile whose id the mapper NULLed still occupies a `(room, night)` slot
+// legacy also has, so excluding it would re-introduce the structural
+// undercount the business key exists to dodge. Live evidence inverted that.
+// The first tick after detection was enabled on HF Ville opened
+// `mirror_ht_room_calendar` as `missing_mssql` with legacy=1637 vs pg=1676 —
+// a gap of exactly 39, which is Ville's ENTIRE `rcal_legacy_id IS NULL`
+// population (nights 2026-05-18 → 2026-07-27) and precisely the set
+// `backfill_room_calendar` deliberately leaves alone because it has no
+// legacy counterpart. That row was unclosable by construction: no re-drive
+// can conjure legacy nights that were never there. Detection with no
+// possible remediation is the exact defect this issue exists to prevent, so
+// the arm was reverted the same day (`66bac3a`).
+//
+// A mirror probe compares MIRRORED state against its source. These NULL-id
+// rows are not local-only state a source never held — the source DID hold
+// them; the mapper's id-reuse pre-clear (`sync/mappers/room_calendar.rs:185-
+// 192`) detaches the pointer when iHOTEL moves or re-dates the row, and the
+// legacy row leaves with it. Excluding them from the comparison is a
+// deliberate stop-gap, not a claim that they are clean: nothing reads
+// `ht_room_calendar` yet, and the excluded detached-tile surplus is tracked
+// as issue #281 rather than silently dropped. So the canonical side is now
+// `WHERE rcal_legacy_id IS NOT NULL`, and the count identity closes at both
+// sites — the coherent instant from
+// `docs/coexistence/room-calendar-deficit-design.md` (`66bac3a`): Ville 1637
+// legacy vs 1637 mirrored (1676 − 39), HF Hotel 4,542 legacy vs 4,542
+// mirrored (4,666 − 124). Counts drift with live traffic, not just at this
+// snapshot: each iHOTEL room-move detaches one more tile (mirrored −1,
+// surplus +1) while legacy loses that same slot, so the identity is
+// preserved through the move, not coincidental to one measurement instant.
+// Probe silence therefore means "mirrored state matches legacy", not
+// "canonical is clean" — the detached-tile surplus keeps accumulating
+// outside the comparison until #281 lands.
+//
+// Why the original worry does not bite: a NULL-id row whose `(room, night)`
+// legacy STILL holds is arithmetically excluded by the live numbers — if any
+// of Ville's 39 had a legacy counterpart, legacy's in-era distinct-night
+// count would have to be at least 1676, not 1637. In practice a NULL id
+// marks a tile legacy no longer has: the `MAX(id)+1` allocator rebound the
+// id onto a different slot (the pre-clear above NULLs the old row) and the
+// legacy row behind the old slot is gone, or its `D` event arrived after
+// that pre-clear had already erased the pointer `RoomCalendarMapper`'s
+// delete-by-`rcal_legacy_id` needs.
+//
+// Residual, recorded honestly: if such a row ever DID coincide with a live
+// legacy night it reads as a one-night `missing_pg` that
+// `backfill_room_calendar` cannot repair — its canonical-key set is
+// deliberately unfiltered, so it sees the slot as already present. The
+// closure path in that case is the mapper itself: any subsequent genuine
+// `HT_Room_Status` edit to that night re-stamps `rcal_legacy_id` through
+// `ON CONFLICT (rcal_room_id, rcal_date) DO UPDATE`. A bounded, self-healing
+// one-row gap — versus the pre-fix alternative of a permanent unclosable row
+// at both sites.
+//
+// The exclusion is a table-level `WHERE`, never a `FILTER` clause on the
+// count alone: `MIN`/`MAX(rcal_date)` must move with it. `MIN` IS the era
+// floor pushed into the legacy scan, so a local-only tile earlier than any
+// mirrored night would drag legacy history into a window the mirror never
+// covered; a local-only tile beyond the mirrored `MAX` would likewise shift
+// a boundary the source cannot match.
 //
 // ## Known limitation of the aggregate shape
 //
@@ -3994,12 +4048,25 @@ pub(crate) const ROOM_CALENDAR_PROBE_KEY: &str = "mirror_ht_room_calendar";
 /// that MOVES (because the mirror finally received its missing history) is
 /// picked up on the next tick instead of pinning the row to a stale boundary.
 ///
-/// The canonical side needs no `WHERE` of its own: every canonical row is by
-/// construction at or after its own `MIN(rcal_date)`.
+/// `WHERE rcal_legacy_id IS NOT NULL` scopes all three aggregates to the
+/// MIRRORED population (issue #273, 2026-07-31 — see the section header). A
+/// canonical tile carrying no legacy id has no counterpart to diverge FROM,
+/// and counting it books legitimate local-only state as `missing_mssql`
+/// forever: live first tick on HF Ville read legacy=1637 vs pg=1676, the 39
+/// being exactly its NULL-id population. The filter is table-level rather
+/// than a `FILTER` clause on `COUNT` so the boundaries move with it — `MIN`
+/// is the era floor pushed into the legacy scan, and `MAX` is compared
+/// against the legacy `MAX`; both must describe the mirrored set, not the
+/// canonical one.
+///
+/// Canonical is UNIQUE on `(rcal_room_id, rcal_date)`, so this `COUNT(*)` IS
+/// a distinct-night count and needs no `DISTINCT` of its own (the legacy side
+/// does — `HT_Room_Status` carries no such constraint).
 const ROOM_CALENDAR_BUSINESS_KEY_PG_SQL: &str = "SELECT COUNT(*)::bigint AS night_count, \
      MIN(rcal_date) AS min_date, \
      MAX(rcal_date) AS max_date \
-       FROM ht_room_calendar";
+       FROM ht_room_calendar \
+      WHERE rcal_legacy_id IS NOT NULL";
 
 /// Legacy side of the same comparison, floored at the canonical `MIN`.
 ///
@@ -4055,9 +4122,16 @@ pub(crate) fn room_calendar_business_key_hash(
     ]))
 }
 
-/// One PG round-trip: `(distinct night count, MIN(night), MAX(night))`.
+/// One PG round-trip: `(distinct night count, MIN(night), MAX(night))` over
+/// the MIRRORED population only (`rcal_legacy_id IS NOT NULL` — see
+/// [`ROOM_CALENDAR_BUSINESS_KEY_PG_SQL`]).
+///
 /// Shared by both resolve halves AND the detection probe below — the legacy
-/// half needs the `MIN` as its coverage floor.
+/// half needs the `MIN` as its coverage floor. The exclusion lives HERE, in
+/// the one shared fetch, precisely so detection and closure move together: a
+/// canonical-side change applied to only one of them would open rows the
+/// other could never close, which is the bug class issue #273 exists to kill
+/// (pinned by `detection_and_resolution_agree_on_convergence_for_every_hash_pair`).
 async fn fetch_calendar_business_key_pg(
     pg_pool: &PgPool,
 ) -> Result<(i64, Option<NaiveDate>, Option<NaiveDate>), sqlx::Error> {
@@ -4137,6 +4211,15 @@ async fn compute_room_calendar_business_key_legacy_hash(
     legacy_pool: &DbPool,
     pg_pool: &PgPool,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    // Degenerate case, newly reachable in principle since the mirrored-rows-
+    // only scoping: if ZERO canonical rows carry a legacy id, this MIN comes
+    // back NULL and the legacy scan below runs UNFLOORED over the entire
+    // `HT_Room_Status` history, once per sweep for as long as the aggregate
+    // row stays open. Practically unreachable today (4,542 mirrored rows on
+    // HF Hotel, 1,637 on Ville) and consistent with the existing "no
+    // coverage ⇒ that IS the finding" contract on an empty calendar, but
+    // worth flagging now that a NULL floor can also mean "every row
+    // detached" rather than only "table truly empty".
     let (_, floor, _) = fetch_calendar_business_key_pg(pg_pool).await?;
     let (night_count, min_date, max_date) =
         fetch_room_calendar_business_key_legacy_raw(legacy_pool, floor).await?;
@@ -11751,9 +11834,7 @@ mod tests {
 
     /// The era floor is DERIVED from the mirror (`MIN(rcal_date)`), never
     /// configured and never a rolling window — the `PAYMENTS_ERA_FLOOR_SQL`
-    /// lesson. And the canonical side must NOT filter on `rcal_legacy_id`:
-    /// that filter is precisely the structural undercount the business key
-    /// exists to dodge.
+    /// lesson.
     #[test]
     fn room_calendar_era_floor_is_derived_from_the_mirror() {
         assert!(ROOM_CALENDAR_BUSINESS_KEY_PG_SQL.contains("MIN(rcal_date)"));
@@ -11764,11 +11845,204 @@ mod tests {
             "the floor must be the mirror's own coverage boundary, not a \
              rolling window"
         );
+    }
+
+    /// Issue #273 (2026-07-31) — THE fix. The canonical side of a MIRROR
+    /// comparison must see only MIRRORED rows: a tile with no
+    /// `rcal_legacy_id` has no legacy counterpart to diverge FROM, so
+    /// counting it books local-only state as `missing_mssql` and mints a row
+    /// nothing can ever close.
+    ///
+    /// Two shape properties, both load-bearing:
+    ///
+    /// * the exclusion is a table-level `WHERE`, NOT a `FILTER` clause on
+    ///   `COUNT` — `MIN(rcal_date)` IS the era floor pushed into the legacy
+    ///   scan and `MAX(rcal_date)` is compared against the legacy `MAX`, so a
+    ///   local-only tile outside the mirrored window must not move either
+    ///   boundary;
+    /// * it lives in the ONE shared fetch, so DETECTION and the closure arm
+    ///   move together (see
+    ///   `room_calendar_detection_and_closure_read_the_same_canonical_sql`).
+    #[test]
+    fn room_calendar_pg_side_counts_only_mirrored_rows() {
+        let sql: String = ROOM_CALENDAR_BUSINESS_KEY_PG_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(
-            !ROOM_CALENDAR_BUSINESS_KEY_PG_SQL.contains("rcal_legacy_id"),
-            "filtering on the legacy id re-introduces the structural \
-             undercount the business key exists to dodge"
+            sql.contains("FROM ht_room_calendar WHERE rcal_legacy_id IS NOT NULL"),
+            "the canonical side must count MIRRORED rows only — a detached \
+             formerly-mirrored tile (rcal_legacy_id NULLed by the mapper's \
+             id-reuse pre-clear) has no legacy counterpart to diverge from \
+             and opens an unclosable row (live 2026-07-31, HF Ville: legacy \
+             1637 vs pg 1676, delta 39 = the whole NULL-id population): {sql}"
         );
+        assert!(
+            !sql.contains("FILTER"),
+            "the exclusion must scope the whole aggregate, not just the \
+             count — MIN is the era floor and MAX is a compared boundary, and \
+             both must describe the mirrored set: {sql}"
+        );
+        assert_eq!(
+            sql.matches("rcal_legacy_id").count(),
+            1,
+            "exactly one exclusion, applied once to the whole aggregate: {sql}"
+        );
+    }
+
+    /// The exclusion must sit in the SHARED fetch both halves call, never in
+    /// one dispatch arm. Detection (`probe_room_calendar_business_key`) and
+    /// closure (`compute_room_calendar_business_key_pg_hash`) both read the
+    /// canonical side exclusively through `fetch_calendar_business_key_pg`;
+    /// if either grew its own canonical query, a row one opened could become
+    /// one the other can never close — the exact failure this issue exists to
+    /// kill.
+    #[test]
+    fn room_calendar_detection_and_closure_read_the_same_canonical_sql() {
+        let src = scheduler_source_before_tests();
+        for func in [
+            // closure, canonical half
+            "async fn compute_room_calendar_business_key_pg_hash(",
+            // closure, legacy half — reads the canonical MIN as its era floor
+            "async fn compute_room_calendar_business_key_legacy_hash(",
+            // detection
+            "pub(crate) async fn probe_room_calendar_business_key(",
+        ] {
+            let start = src.find(func).unwrap_or_else(|| panic!("{func} must exist"));
+            let rest = &src[start..];
+            let body = &rest[..rest.find("\n}\n").map(|i| i + 3).unwrap_or(rest.len())];
+            assert!(
+                body.contains("fetch_calendar_business_key_pg(pg_pool)"),
+                "{func} must read the canonical side through the SHARED fetch, \
+                 so the mirrored-rows-only exclusion applies to detection and \
+                 closure identically"
+            );
+            assert!(
+                !body.contains("FROM ht_room_calendar"),
+                "{func} must not carry its own canonical query — one shared \
+                 definition of the canonical business key, or detection and \
+                 closure can disagree about `converged` and a recorded row \
+                 becomes unclosable"
+            );
+        }
+    }
+
+    /// Issue #273, the live Ville tick that forced the revert. Detached
+    /// formerly-mirrored tiles present canonically must NOT read as
+    /// divergence; the SAME numbers WITHOUT the exclusion must — that second
+    /// assertion is what makes this test red if the `WHERE` is ever dropped,
+    /// because the unfiltered canonical count is exactly what the pre-fix
+    /// code fed in.
+    #[test]
+    fn room_calendar_detached_tiles_do_not_read_as_divergence() {
+        // HF Ville, 2026-07-31: 1637 in-era legacy nights; 1676 canonical
+        // rows of which 39 carry no `rcal_legacy_id` (detached formerly-
+        // mirrored tiles — see the "Calendar closure arm" module docs).
+        const LEGACY_NIGHTS: i64 = 1637;
+        const PG_TOTAL: i64 = 1676;
+        const PG_DETACHED: i64 = 39;
+        const PG_MIRRORED: i64 = PG_TOTAL - PG_DETACHED;
+
+        let legacy = room_calendar_business_key_hash(
+            LEGACY_NIGHTS,
+            Some("2025-11-02"),
+            Some("2026-08-14"),
+        );
+
+        // FIXED: canonical counts mirrored rows only → converged, silent.
+        let pg_mirrored =
+            room_calendar_business_key_hash(PG_MIRRORED, Some("2025-11-02"), Some("2026-08-14"));
+        assert_eq!(
+            room_calendar_business_key_divergence(
+                &legacy,
+                &pg_mirrored,
+                LEGACY_NIGHTS,
+                PG_MIRRORED
+            ),
+            None,
+            "detached formerly-mirrored tiles must not manufacture a divergence"
+        );
+        assert!(should_auto_resolve(
+            ROOM_CALENDAR_PROBE_KEY,
+            Some(&legacy),
+            Some(&pg_mirrored),
+            None
+        ));
+
+        // PRE-FIX: canonical counted every row → `missing_mssql`, and no
+        // re-drive or operator action could ever close it.
+        let pg_unfiltered =
+            room_calendar_business_key_hash(PG_TOTAL, Some("2025-11-02"), Some("2026-08-14"));
+        assert_eq!(
+            room_calendar_business_key_divergence(
+                &legacy,
+                &pg_unfiltered,
+                LEGACY_NIGHTS,
+                PG_TOTAL
+            ),
+            Some(DivergenceKind::MissingMssql),
+            "the unfiltered canonical count is the unclosable row the live \
+             tick minted — this pins WHY the exclusion exists"
+        );
+    }
+
+    /// The exclusion must not blind the probe: a mirrored night that is
+    /// genuinely absent from canonical is still `missing_pg` and still keeps
+    /// the row open. Same Ville baseline, one mirrored night short.
+    #[test]
+    fn room_calendar_missing_mirrored_night_still_diverges() {
+        let legacy = room_calendar_business_key_hash(1637, Some("2025-11-02"), Some("2026-08-14"));
+        let pg = room_calendar_business_key_hash(1636, Some("2025-11-02"), Some("2026-08-14"));
+        assert_eq!(
+            room_calendar_business_key_divergence(&legacy, &pg, 1637, 1636),
+            Some(DivergenceKind::MissingPg),
+            "a real mirrored-night deficit must survive the mirrored-only \
+             scoping — the fix narrows WHAT is compared, not WHETHER gaps are \
+             reported"
+        );
+        assert!(!should_auto_resolve(
+            ROOM_CALENDAR_PROBE_KEY,
+            Some(&legacy),
+            Some(&pg),
+            None
+        ));
+
+        // …and a mirrored night present only in canonical is still
+        // `missing_mssql` — the exclusion removes local-only tiles from the
+        // comparison, not surplus MIRRORED rows (a legacy row deleted
+        // whose `D` event never applied is real divergence).
+        let pg_surplus =
+            room_calendar_business_key_hash(1638, Some("2025-11-02"), Some("2026-08-14"));
+        assert_eq!(
+            room_calendar_business_key_divergence(&legacy, &pg_surplus, 1637, 1638),
+            Some(DivergenceKind::MissingMssql)
+        );
+    }
+
+    /// Boundary half of the same fix: because the exclusion is table-level,
+    /// a local-only tile beyond the mirrored coverage window cannot shift
+    /// `MAX(rcal_date)` (nor `MIN`, the era floor). This pins that such a
+    /// shift WOULD have been a divergence, so scoping the boundaries is not
+    /// cosmetic.
+    #[test]
+    fn room_calendar_detached_tiles_must_not_move_the_coverage_boundaries() {
+        let legacy = room_calendar_business_key_hash(1637, Some("2025-11-02"), Some("2026-08-14"));
+        let mirrored_window =
+            room_calendar_business_key_hash(1637, Some("2025-11-02"), Some("2026-08-14"));
+        assert_eq!(legacy, mirrored_window);
+
+        // Same night COUNT, but a boundary dragged out by a local-only tile.
+        for stretched in [
+            room_calendar_business_key_hash(1637, Some("2025-10-01"), Some("2026-08-14")),
+            room_calendar_business_key_hash(1637, Some("2025-11-02"), Some("2026-09-30")),
+        ] {
+            assert_eq!(
+                room_calendar_business_key_divergence(&legacy, &stretched, 1637, 1637),
+                Some(DivergenceKind::Value),
+                "an unscoped MIN/MAX would diverge on boundaries alone — the \
+                 `WHERE` must cover them, not just the count"
+            );
+        }
     }
 
     /// The legacy side must count DISTINCT `(room_no, night)` pairs:
@@ -11874,6 +12148,27 @@ mod tests {
             ),
             // Converged: absent on both sides (an empty calendar).
             (0, None, None, 0, None, None),
+            // Converged: HF Ville after the mirrored-rows-only scoping
+            // (2026-07-31) — 1637 legacy nights vs 1676 − 39 detached tiles.
+            (
+                1637,
+                Some("2025-11-02"),
+                Some("2026-08-14"),
+                1637,
+                Some("2025-11-02"),
+                Some("2026-08-14"),
+            ),
+            // Diverged: the SAME live tick BEFORE that scoping — canonical
+            // counted all 1676 rows. Both halves must still answer alike,
+            // even for the pair that used to mint an unclosable row.
+            (
+                1637,
+                Some("2025-11-02"),
+                Some("2026-08-14"),
+                1676,
+                Some("2025-11-02"),
+                Some("2026-08-14"),
+            ),
             // Diverged: same count, boundary shifted by a day.
             (
                 1420,
