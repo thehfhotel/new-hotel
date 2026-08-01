@@ -376,7 +376,17 @@ services:
       # auto-closes it, and the >72h escalation tier will fire on any that
       # sit. This backend runs HF Hotel's reconcile; sync-hfville runs
       # Ville's (its own HFVILLE_ override below).
-      - RECONCILE_GUEST_REGISTRY_ARM_ENABLED=${RECONCILE_GUEST_REGISTRY_ARM_ENABLED:-false}
+      #
+      # ENABLED 2026-08-01 (T2 rollout step 4 of 8), after a ~20h Ville soak
+      # rather than the nominal 48h — recorded deliberately, not skipped. What
+      # the soak showed: 0 new findings since the first scan, the companion
+      # mirror provably keeping pace with legacy (max guest_legacy_id 24918 →
+      # 24926, no divergence), a full night cycle covered, and Ville's own 30
+      # finds already backfilled and swept closed. The arm is detection-only,
+      # and the remedy for whatever lands here is already built and proven:
+      # backfill_guest_registry_companions, made site-parameterized for
+      # exactly this step.
+      - RECONCILE_GUEST_REGISTRY_ARM_ENABLED=${RECONCILE_GUEST_REGISTRY_ARM_ENABLED:-true}
       # Phase 6-C — generic mirror-table probe: the 8 CT-mirrored
       # legacy_mirror.* tables (cupon / checkin_product / deposit /
       # changed_room / bill_debt_h / bill_debt_ds / rooms_cancel / book_pro)
