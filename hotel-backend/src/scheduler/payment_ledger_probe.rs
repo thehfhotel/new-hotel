@@ -56,7 +56,11 @@
 //!
 //! Money is compared through [`money_hash_segment`] (2 dp) on both sides,
 //! so a last-ULP difference between MSSQL's and PostgreSQL's summation
-//! order can never masquerade as drift.
+//! order can never masquerade as drift. That guards the SUM, not its
+//! INPUTS: legacy `float` lines carry sub-satang values `numeric(14,2)`
+//! structurally cannot store, so each side is also reduced to 2 dp PER
+//! LINE before it is summed — see [`pg_folio_sql`] for the invariant and
+//! the live folio `CH26-004002` that forced it.
 //!
 //! ## Scope floor — derived `MIN(ledger_legacy_id)`, CLAMPED to a persisted
 //! watermark
@@ -671,8 +675,36 @@ async fn persisted_floor(pg_pool: &PgPool) -> Result<Option<i64>, sqlx::Error> {
 /// lowest-id line of each receipt, matching the legacy side and
 /// `ROUND_INCOME_BY_TENDER_SQL`'s `DISTINCT ON … ORDER BY … ledger_id`.
 /// `numeric(19,4)` before summing keeps the addition exact and
-/// order-independent, so it cannot disagree with MSSQL's DECIMAL sum for
-/// arithmetic reasons.
+/// order-independent — but that rules out ACCUMULATION error only, and on
+/// its own it does NOT make the two sides comparable.
+///
+/// ## The comparable-precision invariant (live case: folio `CH26-004002`)
+///
+/// `ledger_amount` and the five tender columns are `numeric(14,2)`:
+/// canonical stores money at 2 dp and structurally cannot hold anything
+/// finer — it rounds on write. `HT_CheckIn_Pay` holds the same values as
+/// `float`, and iHOTEL derives a line total as `Cin_Pay_Ds_PriceOne *
+/// Cin_Pay_Ds_Num` in float, so legacy routinely carries SUB-SATANG line
+/// values canonical has already rounded away.
+///
+/// Line 55149 of folio `CH26-004002` (HF Hotel, found 2026-08-04) is the
+/// live case: legacy `Cin_Pay_Ds_Price = 2552.2649999999999`, canonical
+/// `ledger_amount = 2552.27`, and the money actually taken — the tender —
+/// is 2552.27 on BOTH sides. Summed as-is the folio read legacy 6380.665
+/// against canonical 6380.67 and landed a `value` finding that NO backfill
+/// could ever close: re-mirroring the folio re-derives exactly the 2 dp
+/// value canonical already holds. Same unfixable family as the mirror
+/// arm's app-authored rows (#273 / #281) — detection with no possible
+/// remediation, aging into the >72h escalation tier over half a satang.
+///
+/// The real invariant is therefore: **each side must be reduced to the
+/// precision canonical can store BEFORE the `SUM`.** The canonical side
+/// needs no rounding — `numeric(14,2)` storage already did it, per line —
+/// which is precisely why [`legacy_folio_sql`] rounds the legacy side per
+/// LINE and not per folio. Rounding the folio total instead would let many
+/// lines' sub-satang residue accumulate past a satang and disagree anyway,
+/// and would mask genuine per-line drift behind a total that happens to
+/// match.
 pub(crate) fn pg_folio_sql(floor: LedgerEraFloor, single: bool) -> String {
     format!(
         "SELECT btrim(ledger_cin_no) AS folio, COUNT(*)::bigint AS line_count, \
@@ -704,6 +736,18 @@ pub(crate) fn pg_folio_sql(floor: LedgerEraFloor, single: bool) -> String {
     )
 }
 
+/// The five legacy tender columns, in the order both the raw sum and the
+/// per-column-rounded sum add them. ONE list, so those two forms of the
+/// same expression can never drift apart about WHICH columns are tender —
+/// and so the rounding test can iterate the real list instead of a copy.
+const LEGACY_TENDER_COLUMNS: [&str; 5] = [
+    "Cin_Pay_Cash",
+    "Cin_Pay_Credit",
+    "Cin_Pay_Free",
+    "Cin_Pay_Tran",
+    "Cin_Pay_web",
+];
+
 /// Legacy per-folio aggregate, floored at the mirror's coverage.
 ///
 /// Takes the whole [`LedgerEraFloor`] and reads
@@ -726,18 +770,75 @@ pub(crate) fn pg_folio_sql(floor: LedgerEraFloor, single: bool) -> String {
 /// this path re-projects a folio the scan ALREADY admitted and logged, so
 /// it must reproduce that row's hash unconditionally, or a floor that
 /// moved forward would make an open row un-re-projectable.
+///
+/// ## Money is rounded to 2 dp per LINE, before the `SUM`
+///
+/// Canonical stores every line at `numeric(14,2)`, so the legacy scan has
+/// to be reduced to that same precision or the comparison is asking
+/// canonical for a value it cannot hold — see [`pg_folio_sql`] for the
+/// invariant and the `CH26-004002` case that proved it.
+///
+/// The ORDER `ROUND(CAST(<float> AS DECIMAL(19,4)), 2)` is load-bearing.
+/// Read-only against the live HF Hotel server on that folio's line
+/// (2026-08-04):
+///
+/// | expression                                  | result        |
+/// |---------------------------------------------|---------------|
+/// | `ROUND(<float>, 2)`                         | `2552.26`   ✗ |
+/// | `CAST(<float> AS DECIMAL(19,2))`            | `2552.26`   ✗ |
+/// | `ROUND(CAST(<float> AS DECIMAL(19,4)), 2)`  | `2552.2700` ✓ |
+///
+/// `ROUND` on an APPROXIMATE type rounds the binary value, and
+/// 2552.2649999999999 sits just below the midpoint, so it goes DOWN; a
+/// direct `DECIMAL(19,2)` cast rounds that same binary value and goes down
+/// too. Only once the value is an EXACT numeric does T-SQL `ROUND` use
+/// half-away-from-zero (verified: `2552.2650 → 2552.2700`, `-2552.2650 →
+/// -2552.2700`) — the same mode PostgreSQL `numeric` uses
+/// (`round(2552.265::numeric, 2) = 2552.27`) and, crucially, the same mode
+/// the mirror itself lands on, because PG converts a float through its
+/// shortest round-trip decimal first
+/// (`2552.2649999999999::float8::numeric(14,2) = 2552.27`). Cast-then-round
+/// is the EXACT analogue of the mapper's storage conversion, not merely a
+/// close one.
+///
+/// The tenders get the same round PER COLUMN rather than on their sum:
+/// canonical holds five separate `numeric(14,2)` columns and
+/// [`pg_folio_sql`] adds five already-rounded values, so rounding their raw
+/// float sum once could disagree whenever two components each carry
+/// sub-satang residue. They are the same `float` type as
+/// `Cin_Pay_Ds_Price` and demonstrably carry residue (`Cin_Pay_web =
+/// 1248.4000000000001` on line 55121 of the very same folio), so leaving
+/// them raw would only be waiting for the identical unfixable finding on
+/// the money-TAKEN half.
+///
+/// The `Cin_Pay_Ds_Price IS NULL` fallback deliberately keeps summing the
+/// RAW tenders and rounds ONCE, at the end: `project_payment_line` adds the
+/// five in `f64` and stores a single `numeric(14,2)`, so rounding each
+/// column there would model a conversion the mapper never performs.
 pub(crate) fn legacy_folio_sql(floor: LedgerEraFloor, single: bool) -> String {
-    let tender = "COALESCE(Cin_Pay_Cash, 0) + COALESCE(Cin_Pay_Credit, 0) \
-                  + COALESCE(Cin_Pay_Free, 0) + COALESCE(Cin_Pay_Tran, 0) \
-                  + COALESCE(Cin_Pay_web, 0)";
+    // Raw f64 sum — ONLY for the NULL-price fallback, which the mapper
+    // computes in f64 and stores as one numeric(14,2) (rounded once, below).
+    let tender_raw = LEGACY_TENDER_COLUMNS
+        .iter()
+        .map(|c| format!("COALESCE({c}, 0)"))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    // Per-column satang round — the exact analogue of canonical's five
+    // independent numeric(14,2) tender columns.
+    let tender_2dp = LEGACY_TENDER_COLUMNS
+        .iter()
+        .map(|c| format!("ROUND(CAST(COALESCE({c}, 0) AS DECIMAL(19,4)), 2)"))
+        .collect::<Vec<_>>()
+        .join(" + ");
     format!(
         "SELECT LTRIM(RTRIM(t.Cin_No)) AS folio, COUNT_BIG(*) AS line_count, \
                 CAST(SUM(t.amt) AS FLOAT) AS amount_sum, \
                 CAST(SUM(CASE WHEN t.rn = 1 AND t.st = '1' THEN t.tender ELSE 0 END) AS FLOAT) \
                     AS tender_sum \
            FROM (SELECT Cin_No, id, \
-                        CAST(COALESCE(Cin_Pay_Ds_Price, {tender}) AS DECIMAL(19,4)) AS amt, \
-                        CAST({tender} AS DECIMAL(19,4)) AS tender, \
+                        ROUND(CAST(COALESCE(Cin_Pay_Ds_Price, {tender_raw}) \
+                                   AS DECIMAL(19,4)), 2) AS amt, \
+                        CAST({tender_2dp} AS DECIMAL(19,4)) AS tender, \
                         COALESCE(Cin_Status, '1') AS st, \
                         ROW_NUMBER() OVER (PARTITION BY Cin_No, \
                             COALESCE(NULLIF(Pay_No, ''), \
@@ -1836,6 +1937,237 @@ mod tests {
             "the ledger mapper no longer falls back to the tender sum for a \
              NULL Cin_Pay_Ds_Price — re-derive this probe's amount basis"
         );
+    }
+
+    // ── Comparable precision (folio CH26-004002, HF Hotel 2026-08-04) ──
+
+    /// SQL SHAPE: the legacy money must be reduced to canonical's
+    /// `numeric(14,2)` storage precision PER LINE, inside the dedupe
+    /// subquery, before the aggregate sees it — and the `DECIMAL(19,4)`
+    /// cast must happen BEFORE the `ROUND`.
+    ///
+    /// Cast-then-round is not stylistic. Verified read-only against the
+    /// live server on line 55149 of `CH26-004002`
+    /// (`Cin_Pay_Ds_Price = 2552.2649999999999`):
+    ///
+    /// * `ROUND(<float>, 2)` → `2552.26` — `ROUND` on an APPROXIMATE type
+    ///   rounds the binary value, which sits below the midpoint.
+    /// * `CAST(<float> AS DECIMAL(19,2))` → `2552.26` — same trap by
+    ///   another spelling.
+    /// * `ROUND(CAST(<float> AS DECIMAL(19,4)), 2)` → `2552.2700` — the
+    ///   only form that reproduces what the mirror stored (`2552.27`).
+    #[test]
+    fn legacy_money_is_rounded_to_canonical_storage_precision_per_line() {
+        let sql = legacy_folio_sql(LedgerEraFloor::UNFLOORED, false);
+
+        let raw_tender = LEGACY_TENDER_COLUMNS
+            .iter()
+            .map(|c| format!("COALESCE({c}, 0)"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        assert!(
+            sql.contains(&format!(
+                "ROUND(CAST(COALESCE(Cin_Pay_Ds_Price, {raw_tender}) AS DECIMAL(19,4)), 2) AS amt,"
+            )),
+            "the line total must be CAST to an exact numeric and THEN rounded \
+             to 2 dp — canonical's numeric(14,2) cannot hold anything finer: \
+             {sql}"
+        );
+        // The mapper's NULL fallback adds the five tenders in f64 and
+        // stores ONE numeric(14,2), so the fallback rounds once, at the
+        // end — per-column rounding there would model a conversion
+        // `project_payment_line` never performs.
+        assert!(
+            sql.contains(&format!("COALESCE(Cin_Pay_Ds_Price, {raw_tender})")),
+            "the NULL-price fallback must sum the RAW tenders: {sql}"
+        );
+
+        // Tenders: rounded PER COLUMN, mirroring canonical's five separate
+        // numeric(14,2) columns that `pg_folio_sql` adds already-rounded.
+        for col in LEGACY_TENDER_COLUMNS {
+            assert!(
+                sql.contains(&format!(
+                    "ROUND(CAST(COALESCE({col}, 0) AS DECIMAL(19,4)), 2)"
+                )),
+                "tender column {col} is the same legacy `float` type as \
+                 Cin_Pay_Ds_Price and can carry sub-satang residue too \
+                 (Cin_Pay_web = 1248.4000000000001 on line 55121): {sql}"
+            );
+        }
+
+        // The two spellings that silently round the FLOAT must not appear.
+        assert!(
+            !sql.contains("ROUND(Cin_Pay"),
+            "rounding a `float` rounds its binary value, not its decimal \
+             one — 2552.2649999999999 would go DOWN to 2552.26: {sql}"
+        );
+        assert!(
+            !sql.contains("DECIMAL(19,2)"),
+            "a direct DECIMAL(19,2) cast is the same trap as ROUND(<float>) \
+             — it rounds the binary value and yields 2552.26: {sql}"
+        );
+
+        // Rounding is per LINE, never on the folio total: rounding the sum
+        // hides per-line drift and still disagrees once enough lines each
+        // carry sub-satang residue.
+        assert!(
+            !sql.contains("ROUND(SUM("),
+            "the round belongs on the LINE, before the aggregate: {sql}"
+        );
+        assert!(sql.contains("CAST(SUM(t.amt) AS FLOAT)"), "got: {sql}");
+
+        // The canonical side needs no round at all — `numeric(14,2)`
+        // storage already applied it, per line. That asymmetry IS the
+        // invariant; a `round()` appearing here would mean canonical had
+        // started holding sub-satang money.
+        let pg = pg_folio_sql(LedgerEraFloor::UNFLOORED, false);
+        assert!(
+            pg.contains("COALESCE(ledger_amount, 0)::numeric(19,4) AS amt"),
+            "got: {pg}"
+        );
+        assert!(
+            !pg.contains("round("),
+            "canonical money is already stored at 2 dp; rounding it again \
+             would be modelling a conversion that does not happen: {pg}"
+        );
+    }
+
+    /// Reproduce ONE legacy line the way [`legacy_folio_sql`] now reads it:
+    /// `ROUND(CAST(<float> AS DECIMAL(19,4)), 2)`.
+    ///
+    /// `{:.4}` is the float→`DECIMAL(19,4)` step — SQL Server converts the
+    /// float through its decimal rendering, so 2552.2649999999999 becomes
+    /// the exact 2552.2650, not the binary value just below it. The
+    /// integer arithmetic is the `ROUND(…, 2)` step: half AWAY from zero,
+    /// the mode T-SQL uses on exact numerics and PostgreSQL `numeric` uses
+    /// on storage.
+    fn round_line_to_satang(v: f64) -> f64 {
+        let dec4 = (format!("{v:.4}")
+            .parse::<f64>()
+            .expect("a 4 dp rendering always parses")
+            * 10_000.0)
+            .round() as i64;
+        let satang = (dec4.abs() + 50) / 100;
+        satang as f64 / 100.0 * if dec4 < 0 { -1.0 } else { 1.0 }
+    }
+
+    /// Add a folio's lines the way MSSQL/PostgreSQL do — EXACT decimal
+    /// addition at `dp` places — then hand the total over as the
+    /// `FLOAT` / `float8` the probe actually reads back. Rust `f64`
+    /// addition would introduce accumulation error neither engine has.
+    fn sum_decimal(lines: &[f64], dp: usize) -> f64 {
+        let scale = 10f64.powi(dp as i32);
+        let units: i64 = lines
+            .iter()
+            .map(|v| (format!("{v:.dp$}").parse::<f64>().unwrap() * scale).round() as i64)
+            .sum();
+        units as f64 / scale
+    }
+
+    /// THE LIVE CASE. HF Hotel folio `CH26-004002`, the single `value`
+    /// finding out of 20,389 in-era folios on 2026-08-04.
+    ///
+    /// iHOTEL derived line 55149's total as `Cin_Pay_Ds_PriceOne *
+    /// Cin_Pay_Ds_Num` in float and got 2552.2649999999999; the mirror
+    /// stored 2552.27 because `numeric(14,2)` cannot hold the rest; the
+    /// money actually taken was 2552.27 on both sides. The folio still
+    /// read legacy 6380.665 vs canonical 6380.67 — a `value` row NO
+    /// backfill could close, headed for the >72h page over half a satang.
+    ///
+    /// The second half is the one that matters: the fix must NOT be a
+    /// tolerance. A real one-satang difference has to keep diverging.
+    #[test]
+    fn sub_satang_legacy_line_converges_but_a_genuine_satang_still_diverges() {
+        // Read back from HT_CheckIn_Pay / ht_payment_ledger, ids 55121 /
+        // 55127 / 55149, three distinct Pay_No values (so all three lines
+        // survive the receipt dedupe).
+        const LEGACY_LINES: [f64; 3] = [1248.4000000000001, 2580.0, 2552.2649999999999];
+        const LEGACY_TENDERS: [f64; 3] = [1248.4000000000001, 2580.0, 2552.27];
+        const CANONICAL_LINES: [f64; 3] = [1248.40, 2580.00, 2552.27];
+
+        // Per line, the legacy round lands exactly on what canonical
+        // stored — it is the same conversion, not an approximation of it.
+        for (raw, stored) in LEGACY_LINES.iter().zip(CANONICAL_LINES) {
+            assert_eq!(
+                money_hash_segment(round_line_to_satang(*raw)),
+                money_hash_segment(stored),
+                "rounding legacy {raw} must reproduce the mirrored {stored}"
+            );
+        }
+        // Half away from zero, both signs — NOT half-to-even, and not the
+        // binary-value rounding a `float` ROUND would do.
+        assert_eq!(round_line_to_satang(2552.265), 2552.27);
+        assert_eq!(round_line_to_satang(-2552.265), -2552.27);
+        assert_eq!(round_line_to_satang(2552.255), 2552.26);
+
+        let canonical = sum_decimal(&CANONICAL_LINES, 2);
+        // Each line of this folio carries its whole total in ONE tender
+        // column, so the deduped tender sum equals the itemized one.
+        let canonical_tender = canonical;
+        let legacy_before = sum_decimal(&LEGACY_LINES, 4);
+        let legacy_after = sum_decimal(&LEGACY_LINES.map(round_line_to_satang), 2);
+        let legacy_tender = sum_decimal(&LEGACY_TENDERS.map(round_line_to_satang), 2);
+
+        // The bug, pinned to the numbers the live reconcile row recorded.
+        assert_eq!(legacy_before, 6380.665);
+        assert_eq!(money_hash_segment(legacy_before), "6380.66");
+        assert_eq!(money_hash_segment(canonical), "6380.67");
+
+        let folio = "CH26-004002".to_string();
+        let pg: BTreeMap<String, FolioSums> =
+            [(folio.clone(), sums(3, canonical, canonical_tender))]
+                .into_iter()
+                .collect();
+
+        let before: BTreeMap<String, FolioSums> =
+            [(folio.clone(), sums(3, legacy_before, legacy_tender))]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            diff_folios(&before, &pg).len(),
+            1,
+            "RED: un-rounded, the folio reports drift canonical is incapable \
+             of ever converging on"
+        );
+
+        // GREEN: rounded per line, the two sides agree.
+        let after: BTreeMap<String, FolioSums> =
+            [(folio.clone(), sums(3, legacy_after, legacy_tender))]
+                .into_iter()
+                .collect();
+        assert_eq!(money_hash_segment(legacy_after), "6380.67");
+        assert!(
+            diff_folios(&after, &pg).is_empty(),
+            "legacy {legacy_after} vs canonical {canonical} is the SAME money \
+             at the precision canonical can store"
+        );
+
+        // ...and this is NOT a tolerance. One satang of real difference —
+        // canonical short by 0.01 on that same line — still diverges.
+        let canonical_one_satang_low = sum_decimal(&[1248.40, 2580.00, 2552.26], 2);
+        assert_eq!(money_hash_segment(canonical_one_satang_low), "6380.66");
+        let short: BTreeMap<String, FolioSums> = [(
+            folio.clone(),
+            sums(3, canonical_one_satang_low, canonical_tender),
+        )]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            diff_folios(&after, &short),
+            vec![LedgerFinding::Value {
+                folio: folio.clone(),
+                legacy: sums(3, legacy_after, legacy_tender),
+                pg: sums(3, canonical_one_satang_low, canonical_tender),
+            }],
+            "a genuine one-satang difference MUST still be reported"
+        );
+        // The same must hold on the tender half, where the money actually
+        // taken lives.
+        let tender_short: BTreeMap<String, FolioSums> =
+            [(folio, sums(3, canonical, canonical_tender - 0.01))]
+                .into_iter()
+                .collect();
+        assert_eq!(diff_folios(&after, &tender_short).len(), 1);
     }
 
     /// BOTH outcomes must reach `sync_status`. `record_success` is the only
