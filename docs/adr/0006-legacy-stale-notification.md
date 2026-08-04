@@ -66,7 +66,7 @@ fired from the writeback worker at commit — same shape as the existing
 which already establishes "trigger-fired NOTIFY inside the committing transaction, no
 durable row" as the pattern for exactly this kind of internal wake-up signal.
 
-Name it `legacy_stale_signal` — explicitly **not** `refresh`. That name is already taken:
+Name it `legacy_stale` — explicitly **not** `refresh`. That name is already taken:
 `routes/events.rs:133` defines `pub const RESYNC_EVENT: &str = "refresh"`, which means
 "refetch our own UI's data" and fires on SSE listener-reconnect resyncs that have nothing
 to do with a writeback landing in legacy. Reusing the string would make two structurally

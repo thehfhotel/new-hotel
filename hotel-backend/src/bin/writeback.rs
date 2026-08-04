@@ -49,6 +49,7 @@ use hotel_backend::db::mssql_timeout::{simple_query_with_timeout_drop, MssqlOpKi
 use hotel_backend::db::{create_pool, DbPool};
 use hotel_backend::notifications::slack::{SlackClient, SlackMessage};
 use hotel_backend::outbox::intent::WritebackIntent;
+use hotel_backend::outbox::legacy_stale::{self, StaleNote};
 use hotel_backend::writeback::{
     dispatch, verify_legacy_collation_safety, verify_schema_fingerprint,
     verify_writeback_ledger_exists, DispatchContext, ResolvedJob, WritebackError,
@@ -220,6 +221,29 @@ const QUEUE_STUCK_IN_PROGRESS_AGE_MINS: i32 = 10;
 /// Track D / T7 HIGH-2 — minimum gap between queue-depth Slack pages
 /// per condition. 30 min — operator gets one ping per breach window.
 const QUEUE_DEPTH_ALERT_COOLDOWN_SECS: u64 = 1800;
+
+/// Env var gating the `legacy_stale` reception hint (ADR 0006). Ships DARK —
+/// see [`legacy_stale_notify_enabled`]. Per-site: the `writeback-hfville`
+/// compose service maps it from `HFVILLE_LEGACY_STALE_NOTIFY_ENABLED`, so the
+/// two-service topology gives the canary rollout for free.
+const LEGACY_STALE_NOTIFY_FLAG: &str = "LEGACY_STALE_NOTIFY_ENABLED";
+
+/// Parse [`LEGACY_STALE_NOTIFY_FLAG`]. Truthy = `true` / `1` (trimmed,
+/// case-insensitive); unset, empty, `false`, `0` or garbage ⇒ `false`.
+///
+/// Same liberal-on-input, default-OFF policy as `config::flag_enabled` (the
+/// reader for every other ship-dark coexistence flag). Duplicated rather than
+/// imported because that helper is private to `config.rs` and this binary
+/// already parses its own env directly (`WRITEBACK_*` above).
+fn legacy_stale_notify_enabled(raw: Option<String>) -> bool {
+    match raw {
+        Some(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            normalized == "true" || normalized == "1"
+        }
+        None => false,
+    }
+}
 
 /// Exponential backoff (in seconds) between retry attempts. Indexed by
 /// `attempts` (0-based: backoff_secs(1) is the wait before attempt #2).
@@ -582,9 +606,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_MAX_ATTEMPTS);
 
+    // ADR 0006 — ship DARK. When off, nothing is built and nothing is
+    // notified; the drain loop behaves exactly as before. Read once here so
+    // the hot path never touches the environment.
+    let stale_notify = legacy_stale_notify_enabled(env::var(LEGACY_STALE_NOTIFY_FLAG).ok());
+
     tracing::info!(
         poll_interval_secs = poll_interval,
         max_attempts,
+        legacy_stale_notify = stale_notify,
         "Starting writeback worker"
     );
 
@@ -756,6 +786,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // 6. Main loop — process jobs whenever NOTIFY wakes us OR every poll_interval
     loop {
+        // ADR 0006 — one `legacy_stale` hint per DRAIN TICK, not per job.
+        // No timer is needed because the inner loop already runs to queue
+        // exhaustion: a booking that emits 3 intents enqueues all 3 rows in
+        // one PG transaction, the notify trigger wakes us once, and all 3
+        // drain here ⇒ one signal with `count: 3`. A slow trickle produces
+        // one signal each, which is correct — those ARE separate events, and
+        // suppressing them into one toast is the middleware latch's job.
+        //
+        // Stays empty whenever `LEGACY_STALE_NOTIFY_ENABLED` is off:
+        // `process_job` doesn't even build a note then.
+        let mut stale_notes: Vec<StaleNote> = Vec::new();
+
         // Drain all pending jobs in this tick
         loop {
             match claim_next_job(&pg, max_attempts).await {
@@ -775,9 +817,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let mssql_inner = mssql.clone();
                     let slack_inner = slack.clone();
                     let result = tokio::spawn(async move {
-                        process_job(&pg_inner, &mssql_inner, max_attempts, &slack_inner, job).await;
+                        process_job(
+                            &pg_inner,
+                            &mssql_inner,
+                            max_attempts,
+                            &slack_inner,
+                            job,
+                            stale_notify,
+                        )
+                        .await
                     })
                     .await;
+                    // The spawn wrapper's `Ok` value used to be discarded; it
+                    // now carries the reception hint for jobs that landed.
+                    // Borrowed so the panic-recovery arm below is untouched.
+                    if let Ok(Some(note)) = &result {
+                        stale_notes.push(note.clone());
+                    }
                     if let Err(join_err) = result {
                         let panic_msg = if join_err.is_panic() {
                             // Try to recover the panic payload as a string —
@@ -827,6 +883,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     break;
                 }
+            }
+        }
+
+        // The queue is drained (or the claim query broke — the jobs that DID
+        // land are still worth announcing). One coalesced hint, then back to
+        // waiting. A failure here must never fail or retry a job whose MSSQL
+        // transaction already committed: log a warn and carry on.
+        if !stale_notes.is_empty() {
+            let signal = legacy_stale::coalesce(current_site_id(), &stale_notes);
+            tracing::debug!(
+                count = signal.count(),
+                summary = signal.summary(),
+                "Publishing legacy_stale hint for this drain tick"
+            );
+            if let Err(err) = legacy_stale::publish(&pg, &signal).await {
+                tracing::warn!(
+                    error = %err,
+                    count = signal.count(),
+                    "legacy_stale notify failed; the legacy writes are committed \
+                     and unaffected — reception just won't be told this time"
+                );
             }
         }
 
@@ -1079,13 +1156,23 @@ async fn claim_next_job(pg: &PgPool, max_attempts: i32) -> Result<Option<Claimed
 }
 
 /// Process one claimed job: open MSSQL conn, dispatch, persist outcome.
+///
+/// Returns `Some(note)` exactly when a row landed in legacy MSSQL **and** this
+/// worker owned the completion (see [`mark_done`]'s return contract) — the
+/// drain loop accumulates those and publishes one coalesced `legacy_stale`
+/// signal per tick (ADR 0006). Every failure path returns `None`.
+///
+/// `stale_notify` is the `LEGACY_STALE_NOTIFY_ENABLED` flag, read once at
+/// startup and threaded in so that when the feature is dark we don't even
+/// build the label.
 async fn process_job(
     pg: &PgPool,
     mssql: &DbPool,
     max_attempts: i32,
     slack: &Option<SlackClient>,
     job: ClaimedJob,
-) {
+    stale_notify: bool,
+) -> Option<StaleNote> {
     let job_id = job.id;
     let intent_name = job.intent.intent_name();
     tracing::info!(
@@ -1112,7 +1199,7 @@ async fn process_job(
                 &format!("resolve_legacy_ids: {err}"),
             )
             .await;
-            return;
+            return None;
         }
     };
 
@@ -1142,7 +1229,7 @@ async fn process_job(
                 &format!("mssql_acquire: {err}"),
             )
             .await;
-            return;
+            return None;
         }
     };
 
@@ -1194,7 +1281,7 @@ async fn process_job(
             &format!("trancount_reset: {err}"),
         )
         .await;
-        return;
+        return None;
     }
 
     let ctx = DispatchContext {
@@ -1209,7 +1296,18 @@ async fn process_job(
     match outcome {
         Ok(legacy_ids) => {
             tracing::info!(job_id, intent = intent_name, "Writeback succeeded");
-            mark_done(
+            // Built BEFORE `into_json()` consumes `legacy_ids`. The room number
+            // is whatever we already have in hand — the recipe-minted one wins
+            // (walk-in / checkin-to-booking allocate it), falling back to the
+            // one the resolver read from PG before dispatch. No extra query.
+            let note = stale_notify.then(|| {
+                let room_no = legacy_ids
+                    .room_no
+                    .as_deref()
+                    .or(resolved.legacy_room_no.as_deref());
+                StaleNote::for_intent(&job.intent, room_no)
+            });
+            let landed = mark_done(
                 pg,
                 job_id,
                 job.claimed_at,
@@ -1220,6 +1318,13 @@ async fn process_job(
                 legacy_ids.into_json(),
             )
             .await;
+            // A stolen claim means the OTHER worker owns this job's completion
+            // and will emit its own hint — see `mark_done`'s return contract.
+            if landed {
+                note
+            } else {
+                None
+            }
         }
         Err(err) => {
             let retryable = err.is_retryable();
@@ -1240,6 +1345,7 @@ async fn process_job(
                 retryable,
             )
             .await;
+            None
         }
     }
 }
@@ -2196,6 +2302,14 @@ async fn salvage_legacy_ids(
 /// warning and skip back-population so we don't race the new claim's
 /// `mark_done` to write possibly-different `legacy_*` values into the
 /// canonical row.
+///
+/// **Returns `true` only when this worker's claim-gated UPDATE actually
+/// matched a row**, i.e. when THIS worker is the one that terminated the job.
+/// The stolen-claim (`Ok(None)`) and error paths return `false`. The caller
+/// uses that to decide whether to emit a `legacy_stale` hint: if another
+/// worker stole the claim, IT will re-run the recipe and notify, and a
+/// duplicate signal from here would inflate reception's toast count for a
+/// single real change.
 #[allow(clippy::too_many_arguments)]
 async fn mark_done(
     pg: &PgPool,
@@ -2206,7 +2320,7 @@ async fn mark_done(
     slack: &Option<SlackClient>,
     prior: PriorDisposition,
     legacy_ids: serde_json::Value,
-) {
+) -> bool {
     // No prior-status CTE here — see the doc comment. The pre-image is
     // carried in `prior`; this statement only needs the MED-2 claim-gate
     // (status + claimed_at) and the columns the closure alert reports.
@@ -2261,7 +2375,7 @@ async fn mark_done(
                 job_id,
                 "Job {job_id} was re-claimed by another worker before mark_done; discarding result"
             );
-            return;
+            return false;
         }
         Err(err) => {
             // Wave 5a item 4: when the `mark_done` UPDATE itself errors we
@@ -2281,7 +2395,7 @@ async fn mark_done(
                  clobbering a stolen-claim winner. Resolver self-heal will \
                  recover legacy_ids from writeback_jobs at next intent."
             );
-            return;
+            return false;
         }
     }
 
@@ -2323,6 +2437,11 @@ async fn mark_done(
              from writeback_jobs.legacy_ids at next intent"
         );
     }
+
+    // The status flip landed and it was OURS — back-population is a
+    // best-effort follow-up (self-healing at the next intent), so its
+    // outcome does not change who owns the completion.
+    true
 }
 
 /// Write the recipe's allocated legacy identifiers (book_id, cin_no, etc.)
@@ -4583,6 +4702,12 @@ mod tests {
     /// `return` BEFORE the back_populate_legacy_ids retry loop.
     /// A regression that drops the `return` would silently let a
     /// stale `legacy_ids` clobber a stolen-claim winner's row.
+    ///
+    /// ADR 0006 tightened the literal from `return;` to `return false;`
+    /// when `mark_done` gained its bool return — which also pins the
+    /// second half of the contract: an errored status-flip must not
+    /// claim the completion, or the drain loop would announce a
+    /// `legacy_stale` hint for a job it may not own.
     #[test]
     fn mark_done_err_arm_returns_before_back_population() {
         let source = include_str!("writeback.rs");
@@ -4607,8 +4732,8 @@ mod tests {
         // we can assert the early-return sits inside the arm.
         let from_err = &source[fn_start + err_arm_pos..];
         let return_pos = from_err
-            .find("return;")
-            .expect("Err arm must contain `return;` per Wave 5a item 4");
+            .find("return false;")
+            .expect("Err arm must contain `return false;` per Wave 5a item 4 + ADR 0006");
         // The back-pop loop is far below the Err arm (after the closing
         // `}` of the match). We need the `return;` to come BEFORE the
         // back-pop call to guarantee the Err path skips it.
@@ -5114,5 +5239,123 @@ mod tests {
             paged,
             "a listener that flaps for 11 minutes is still an outage"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // ADR 0006 — legacy_stale emission
+    // -------------------------------------------------------------------
+
+    /// Ships DARK: unset, empty, `false`, `0` and garbage are all off. Only
+    /// an explicit truthy value arms the reception hint.
+    #[test]
+    fn legacy_stale_flag_defaults_off_and_only_accepts_truthy() {
+        assert!(!legacy_stale_notify_enabled(None));
+        for off in ["", "  ", "false", "FALSE", "0", "no", "yes please"] {
+            assert!(
+                !legacy_stale_notify_enabled(Some(off.to_string())),
+                "{off:?} must not arm the flag",
+            );
+        }
+        for on in ["true", "TRUE", " True ", "1"] {
+            assert!(
+                legacy_stale_notify_enabled(Some(on.to_string())),
+                "{on:?} must arm the flag",
+            );
+        }
+    }
+
+    /// The flag name is the one `docker-compose.yml` sets (and the only place
+    /// flags live — ADR 0004). A rename here silently disables the feature.
+    #[test]
+    fn legacy_stale_flag_name_matches_compose() {
+        assert_eq!(LEGACY_STALE_NOTIFY_FLAG, "LEGACY_STALE_NOTIFY_ENABLED");
+    }
+
+    /// `mark_done` must report FALSE when its claim-gated UPDATE matches no
+    /// row — the stolen-claim case. That return value is what stops two
+    /// workers emitting two `legacy_stale` hints for one real change (the
+    /// stealer re-runs the recipe and notifies from its own `mark_done`).
+    ///
+    /// Needs PG; skipped when `DATABASE_URL` is unset (same convention as
+    /// `tests/test_permissions_g7.rs`).
+    #[tokio::test]
+    async fn mark_done_reports_false_when_the_claim_was_stolen() {
+        let Ok(url) = env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL unset");
+            return;
+        };
+        let pg = PgPool::connect(&url).await.expect("connect");
+
+        let aggregate_id = Uuid::new_v4();
+        let intent = WritebackIntent::MarkRoomDirty {
+            room_id: aggregate_id,
+            by: "TEST_mark_done_stolen_claim".into(),
+        };
+        let our_claim = Utc::now();
+        let their_claim = our_claim + chrono::Duration::seconds(30);
+
+        // The row as the JANITOR left it: still in_progress, but re-claimed
+        // (claimed_at bumped) by another worker while our recipe ran.
+        let job_id: i64 = sqlx::query_scalar(
+            "INSERT INTO writeback_jobs \
+                 (intent, payload, aggregate_id, idempotency_key, status, claimed_at) \
+             VALUES ($1, $2, $3, $4, 'in_progress', $5) \
+             RETURNING id",
+        )
+        .bind(intent.intent_name())
+        .bind(serde_json::to_value(&intent).unwrap())
+        .bind(aggregate_id)
+        .bind(Uuid::new_v4())
+        .bind(their_claim)
+        .fetch_one(&pg)
+        .await
+        .expect("insert fixture job");
+
+        let landed = mark_done(
+            &pg,
+            job_id,
+            our_claim,
+            aggregate_id,
+            &intent,
+            &None,
+            PriorDisposition::Fresh,
+            serde_json::json!({}),
+        )
+        .await;
+
+        assert!(
+            !landed,
+            "a stolen claim must not report the completion as ours"
+        );
+
+        let status: String = sqlx::query_scalar("SELECT status FROM writeback_jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&pg)
+            .await
+            .expect("re-read fixture job");
+        assert_eq!(
+            status, "in_progress",
+            "the stealer's claim must be left alone for it to finish"
+        );
+
+        // Same call, matching claim → this worker owns the completion.
+        let landed = mark_done(
+            &pg,
+            job_id,
+            their_claim,
+            aggregate_id,
+            &intent,
+            &None,
+            PriorDisposition::Fresh,
+            serde_json::json!({}),
+        )
+        .await;
+        assert!(landed, "the claim holder's mark_done must report true");
+
+        sqlx::query("DELETE FROM writeback_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pg)
+            .await
+            .ok();
     }
 }

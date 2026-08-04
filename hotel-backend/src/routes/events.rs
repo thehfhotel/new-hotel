@@ -46,8 +46,23 @@
 //!   `broadcast::Receiver`.
 //!
 //! Live invariant to check after deploy: `pg_stat_activity` shows exactly
-//! **two** `LISTEN "domain_events"` connections total (one per site),
-//! regardless of how many browser tabs are open.
+//! **two connections, two channels each** (one connection per site, each
+//! `LISTEN`ing on `domain_events` + `legacy_stale`), regardless of how many
+//! browser tabs are open.
+//!
+//! ## Second channel: `legacy_stale`
+//!
+//! Per `docs/adr/0006-legacy-stale-notification.md`, `bin/writeback.rs`
+//! publishes an ephemeral "iHOTEL's room grid is now stale" hint on its own
+//! channel after a legacy MSSQL commit. It rides the SAME listener connection
+//! — a second `listen()` call, not a second task — precisely to keep the
+//! two-connection invariant above intact. [`classify_notification`] is the
+//! branch point; everything downstream (fan-out, `branch=` routing, lag
+//! handling) is shared unchanged.
+//!
+//! The `legacy_stale` event name is deliberately absent from
+//! [`RESYNC_FANOUT_EVENTS`]: a lagged subscriber or a listener reconnect must
+//! never fabricate a "go refresh iHOTEL" toast out of a local hiccup.
 //!
 //! ## Branch routing
 //!
@@ -100,6 +115,7 @@ use sqlx::postgres::PgListener;
 use tokio::sync::broadcast;
 
 use crate::outbox::event::DomainEvent;
+use crate::outbox::legacy_stale::{LegacyStaleSignal, LEGACY_STALE_CHANNEL, LEGACY_STALE_EVENT};
 use crate::routes::mode::{AppState, Branch};
 
 /// SSE channel name. Must match the literal used by
@@ -492,7 +508,7 @@ async fn run_domain_event_listener(
                 backoff = LISTENER_BACKOFF_MIN;
                 tracing::info!(
                     site = site.as_str(),
-                    channel = DOMAIN_EVENTS_CHANNEL,
+                    channels = %format_args!("{DOMAIN_EVENTS_CHANNEL},{LEGACY_STALE_CHANNEL}"),
                     "domain-event listener connected; publishing resync to attached clients",
                 );
                 // Every (re)connect, INCLUDING the first: whatever was
@@ -503,28 +519,17 @@ async fn run_domain_event_listener(
                 loop {
                     match listener.recv().await {
                         Ok(notification) => {
-                            let payload = notification.payload();
-                            match serde_json::from_str::<DomainEvent>(payload) {
-                                Ok(event) => {
-                                    // Err == nobody subscribed right now.
-                                    let _ = tx.send(BroadcastEvent {
-                                        site,
-                                        name: event.type_name(),
-                                        payload: Arc::from(payload),
-                                    });
-                                }
-                                Err(parse_err) => {
-                                    // One bad payload shouldn't sever every
-                                    // browser. Log and skip; the canonical
-                                    // record is still in event_log for any
-                                    // subscriber that needs to reconcile.
-                                    tracing::warn!(
-                                        site = site.as_str(),
-                                        error = %parse_err,
-                                        payload = %payload,
-                                        "Skipping malformed domain_events payload",
-                                    );
-                                }
+                            // One bad payload must not sever every browser —
+                            // `classify_notification` logs and returns None,
+                            // and the canonical record is still in event_log
+                            // for any subscriber that needs to reconcile.
+                            if let Some(event) = classify_notification(
+                                notification.channel(),
+                                notification.payload(),
+                                site,
+                            ) {
+                                // Err == nobody subscribed right now.
+                                let _ = tx.send(event);
                             }
                         }
                         Err(recv_err) => {
@@ -554,11 +559,79 @@ async fn run_domain_event_listener(
 }
 
 /// Open a standalone `PgListener` (its own connection, outside every pool)
-/// and subscribe to the domain-events channel.
+/// and subscribe to BOTH channels this module fans out.
+///
+/// Two `listen()` calls on ONE connection, not two listeners: the 2026-07-29
+/// pool-exhaustion incident's fix is "one standalone connection per site", and
+/// a second task would quietly double that count (see the module preamble's
+/// live invariant).
 async fn open_domain_events_listener(dsn: &str) -> Result<PgListener, sqlx::Error> {
     let mut listener = PgListener::connect(dsn).await?;
     listener.listen(DOMAIN_EVENTS_CHANNEL).await?;
+    listener.listen(LEGACY_STALE_CHANNEL).await?;
     Ok(listener)
+}
+
+/// Turn one raw PG notification into the broadcast item it should fan out as,
+/// or `None` if it must be dropped.
+///
+/// Extracted from the listener's recv loop for the same reason [`Frame`] is a
+/// type of its own: it makes the fan-in decision assertable without a browser,
+/// a database, or an HTTP server. The only side effect is a `tracing` line on
+/// the reject paths, so it stays callable from a plain `#[test]`.
+///
+/// `site` is the database the notification arrived on — NOT anything read out
+/// of the payload. A `legacy_stale` signal carries its own `site` string for
+/// diagnostics, but trusting it would let a mis-targeted writeback worker
+/// deliver Ville toasts to HF Hotel's reception.
+fn classify_notification(channel: &str, payload: &str, site: EventSite) -> Option<BroadcastEvent> {
+    match channel {
+        DOMAIN_EVENTS_CHANNEL => match serde_json::from_str::<DomainEvent>(payload) {
+            Ok(event) => Some(BroadcastEvent {
+                site,
+                name: event.type_name(),
+                payload: Arc::from(payload),
+            }),
+            Err(parse_err) => {
+                tracing::warn!(
+                    site = site.as_str(),
+                    error = %parse_err,
+                    payload = %payload,
+                    "Skipping malformed domain_events payload",
+                );
+                None
+            }
+        },
+        // Validated, then forwarded VERBATIM: the browser bridge and the
+        // Tauri middleware downstream parse the same JSON, so re-serializing
+        // here would be a second place for the wire shape to drift.
+        LEGACY_STALE_CHANNEL => match serde_json::from_str::<LegacyStaleSignal>(payload) {
+            Ok(_) => Some(BroadcastEvent {
+                site,
+                name: LEGACY_STALE_EVENT,
+                payload: Arc::from(payload),
+            }),
+            Err(parse_err) => {
+                tracing::warn!(
+                    site = site.as_str(),
+                    error = %parse_err,
+                    payload = %payload,
+                    "Skipping malformed legacy_stale payload",
+                );
+                None
+            }
+        },
+        other => {
+            // Unreachable unless someone adds a `listen()` without a branch
+            // here — in which case dropping is right and the log says why.
+            tracing::warn!(
+                site = site.as_str(),
+                channel = %other,
+                "Notification on an unhandled channel; dropping",
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -866,5 +939,136 @@ mod tests {
     fn site_tags_match_branch_vocabulary() {
         assert_eq!(EventSite::Hfhotel.as_str(), "hfhotel");
         assert_eq!(EventSite::Hfville.as_str(), "hfville");
+    }
+
+    /// A real `DomainEvent` payload, serialized the way `EventBus::publish`
+    /// puts it on the wire.
+    fn domain_event_payload() -> String {
+        let event = DomainEvent::RoomMarkedDirty {
+            room_id: uuid::Uuid::nil(),
+            source: crate::outbox::event::EventSource::System {
+                reason: "test".into(),
+            },
+        };
+        serde_json::to_string(&event).expect("serialize domain event")
+    }
+
+    /// A real `legacy_stale` payload, built through the publisher's own
+    /// constructor so a wire-shape change breaks this test too.
+    fn legacy_stale_payload() -> String {
+        let signal = crate::outbox::legacy_stale::LegacyStaleSignal::new(
+            "hfhotel",
+            3,
+            "เช็คอิน ห้อง 302",
+            vec!["เช็คอิน ห้อง 302".to_string()],
+        );
+        serde_json::to_string(&signal).expect("serialize legacy stale signal")
+    }
+
+    /// `domain_events` keeps its existing behaviour: the SSE `event:` name is
+    /// the variant discriminant and the payload is forwarded verbatim.
+    #[test]
+    fn classify_forwards_domain_events_under_their_variant_name() {
+        let payload = domain_event_payload();
+        let event = classify_notification(DOMAIN_EVENTS_CHANNEL, &payload, EventSite::Hfhotel)
+            .expect("valid domain event must classify");
+
+        assert_eq!(event.name, "RoomMarkedDirty");
+        assert_eq!(event.site, EventSite::Hfhotel);
+        assert_eq!(&*event.payload, payload.as_str());
+    }
+
+    /// `legacy_stale` fans out under its own name, tagged with the database
+    /// it arrived on — NOT with the `site` string inside the payload.
+    #[test]
+    fn classify_forwards_legacy_stale_under_its_own_name() {
+        let payload = legacy_stale_payload();
+        let event = classify_notification(LEGACY_STALE_CHANNEL, &payload, EventSite::Hfville)
+            .expect("valid legacy_stale signal must classify");
+
+        assert_eq!(event.name, LEGACY_STALE_EVENT);
+        assert_eq!(event.name, "legacy_stale");
+        assert_eq!(
+            event.site,
+            EventSite::Hfville,
+            "the listener's database decides the site, never the payload's own field",
+        );
+        assert_eq!(&*event.payload, payload.as_str());
+    }
+
+    /// Garbage on either channel is dropped, not forwarded and not panicked
+    /// on — one bad payload must never sever every attached browser.
+    #[test]
+    fn classify_drops_malformed_payloads_without_panicking() {
+        for channel in [DOMAIN_EVENTS_CHANNEL, LEGACY_STALE_CHANNEL] {
+            for payload in ["", "not json at all", "{}", r#"{"type":"NopeNotAVariant"}"#] {
+                assert!(
+                    classify_notification(channel, payload, EventSite::Hfhotel).is_none(),
+                    "channel {channel} must drop payload {payload:?}",
+                );
+            }
+        }
+        // …and a payload that is valid for the OTHER channel is still garbage
+        // for this one.
+        assert!(
+            classify_notification(DOMAIN_EVENTS_CHANNEL, &legacy_stale_payload(), EventSite::Hfhotel)
+                .is_none(),
+        );
+        assert!(
+            classify_notification(LEGACY_STALE_CHANNEL, &domain_event_payload(), EventSite::Hfhotel)
+                .is_none(),
+        );
+    }
+
+    /// A channel nobody wired a branch for is dropped rather than guessed at.
+    #[test]
+    fn classify_drops_unknown_channels() {
+        assert!(
+            classify_notification("some_future_channel", "{}", EventSite::Hfhotel).is_none(),
+        );
+    }
+
+    /// A classified `legacy_stale` item survives the shared fan-out path and
+    /// comes out of the stream as an SSE frame under its own event name —
+    /// the half of the chain the DB-backed test in `tests/test_legacy_stale.rs`
+    /// hands off to.
+    #[tokio::test]
+    async fn legacy_stale_reaches_a_subscriber_as_its_own_frame() {
+        let fanout = EventFanout::new();
+        let (rx, _) = fanout.receivers_for(Branch::Hfhotel);
+        let payload = legacy_stale_payload();
+
+        let event = classify_notification(LEGACY_STALE_CHANNEL, &payload, EventSite::Hfhotel)
+            .expect("classify");
+        fanout.hfhotel_sender().send(event).expect("subscriber attached");
+
+        let mut stream = pin!(frame_stream(rx, None));
+        assert_eq!(next_frame(&mut stream).await, Frame::Comment(HELLO_COMMENT));
+        match next_frame(&mut stream).await {
+            Frame::Message { name, data } => {
+                assert_eq!(name, LEGACY_STALE_EVENT);
+                assert_eq!(&*data, payload.as_str());
+            }
+            other => panic!("expected a legacy_stale frame, got {other:?}"),
+        }
+    }
+
+    /// `legacy_stale` must NOT be replayed by a resync burst. A lagged
+    /// subscriber or a listener reconnect is a local hiccup in OUR stream —
+    /// it says nothing about whether iHOTEL's grid is stale, and fabricating
+    /// a toast from it is exactly the alarm-fatigue failure ADR 0006 §5 is
+    /// built to avoid.
+    #[test]
+    fn resync_burst_never_fabricates_a_legacy_stale_signal() {
+        assert!(
+            !RESYNC_FANOUT_EVENTS.contains(&LEGACY_STALE_EVENT),
+            "legacy_stale must not ride the resync burst",
+        );
+        for frame in resync_frames(None, "subscriber-lagged") {
+            match frame {
+                Frame::Message { name, .. } => assert_ne!(name, LEGACY_STALE_EVENT),
+                Frame::Comment(_) => {}
+            }
+        }
     }
 }
