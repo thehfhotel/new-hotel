@@ -63,6 +63,30 @@ Room-state hues are legacy vocabulary, not design assets: the hue that means eac
 rendered in v2-quality shades — one color language across every surface that shows room state.
 _Avoid_: per-surface palettes, v2-native tones for room state
 
+### Coexistence
+
+**Legacy-stale signal**:
+The `pg_notify('legacy_stale_signal', ...)` fired when a writeback commits into legacy
+MSSQL at a moment iHOTEL's room grid cannot pick up on its own (ADR 0006) — an ephemeral
+wake-up hint, not a durable domain event. Distinct from `RESYNC_EVENT`/`"refresh"`
+(`routes/events.rs`), which means "refetch our own UI's data," not "iHOTEL is stale."
+_Avoid_: "refresh event" (collides with the existing `RESYNC_EVENT` name/meaning)
+
+**Grid staleness latch**:
+The one-toast-per-stale-episode state machine gating reception's notification (ADR 0006
+§5): opens on the first writeback while iHOTEL can't auto-refresh, absorbs further
+writebacks in the same episode as a silent counter (no repeat toast), closes on a
+reception-invoked refresh or ~65s of iHOTEL continuously holding foreground. Exists to
+prevent alarm fatigue, not to surface every individual write.
+_Avoid_: "alert on every writeback" (defeats the latch; retrains reception to ignore toasts)
+
+**Reception-invoked refresh**:
+The receptionist clicking "Refresh iHOTEL now" on the toast (ADR 0006) — the only refresh
+path this system ever triggers. iHOTEL's own Refresh button (`ButtonX3`) is what actually
+runs; our app never calls it, drives it, or automates it on her behalf.
+_Avoid_: "auto-refresh iHOTEL", "push to iHOTEL" (both imply we drive the vendor app
+unasked — exactly what ADR 0006 rules out)
+
 ### Sync (established elsewhere, recorded for vocabulary)
 
 **Sync lag / unconverged**:

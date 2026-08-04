@@ -207,7 +207,7 @@ Pure UI theme switching — `Office2007Blue/Silver/Black`, `VistaGlass`, `Office
 | Form | Purpose |
 |---|---|
 | `frmMain1.cs` (8548 lines) | MDI parent, ribbon, notifications timer, license check, idle logout, serial-port power relay, online version check. |
-| `FormRoomMain.cs` | The main room-status grid (matrix of room buttons by floor/zone). Hub for all room actions; routes clicks to ClickAvliable/ClickBook/ClickClean/ClickUSE/ClickManternance handlers. Used by `frmMain1.ButtonItem9_Click`. |
+| `FormRoomMain.cs` | The main room-status grid (matrix of room buttons by floor/zone). Hub for all room actions; routes clicks to ClickAvliable/ClickBook/ClickClean/ClickUSE/ClickManternance handlers. Used by `frmMain1.ButtonItem9_Click`. Refresh timer/focus-gate/manual-refresh mechanics extracted separately in [`ROOM_GRID_REFRESH.md`](ROOM_GRID_REFRESH.md). |
 | `FormRoomMain_ViewBook.cs` | Booking calendar/grid overlay (room × date). |
 | `FormRoomMainClean.cs` | Housewife-mode-only shell — limited-permission view of dirty rooms. Used as alternate main form when `HouseWifeMode=true`. |
 | `FormRoomMainKichen.cs` | Kitchen-mode-only shell (similar restrictive UI). |
