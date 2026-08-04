@@ -481,7 +481,17 @@ services:
       # such a row on its own, and the >72h escalation tier WILL fire if it
       # is left, so flip in a window (or pre-set
       # LEGACY_RECONCILE_DRIFT_ALERT_THRESHOLD_<SITE>).
-      - RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED=${RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED:-false}
+      #
+      # ENABLED 2026-08-04 (T2 rollout step 6 of 8), AFTER the prerequisite
+      # `--all` backfill ran on this site the same evening: 20,389 folios /
+      # 28,744 lines mirrored, 0 errors, and MIN(ledger_legacy_id) fell
+      # 52805 -> 15806, the absolute legacy minimum. That ORDER is
+      # load-bearing: the era-floor ratchet (migration 084) makes the first
+      # ENABLED tick durable, so flipping before the backfill would have
+      # frozen the artifact floor 52805 and permanently hidden everything
+      # below it. Coverage is now complete, so the derived floor cannot be
+      # dragged again — there is no older row left to reach.
+      - RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED=${RECONCILE_PAYMENT_LEDGER_PROBE_ENABLED:-true}
       # ADR 0005 NULL-clear sentinel tripwire (docs/adr/0005-null-clear-sentinel-semantics.md).
       # Two read-only SELECT COUNT(*)s per reconcile tick (HT_Book_H.Book_Cust_ID,
       # HT_CheckIn_H.Cin_cust_no IS NULL) guarding the ADR's one accepted gap: a
