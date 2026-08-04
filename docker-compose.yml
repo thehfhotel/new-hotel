@@ -409,19 +409,31 @@ services:
       # mirror and can never converge. Floored, 8 of the 9 probes are
       # EXACTLY converged at both sites today (2026-07-28, read-only).
       #
-      # EXPECT A QUIET LEDGER: probes=9 converged=9 recorded=0 observed=0.
-      # The calendar gap this comment used to describe as unclosable (1507
-      # in-era legacy vs 1298 canonical at HF Hotel; 1302 vs 1071 at Ville)
-      # is CLOSED — the backfill_room_calendar bin re-drove 3,650 missing
-      # nights across both sites, and the business-key comparison is now
-      # scoped to `rcal_legacy_id IS NOT NULL` on the canonical side so the
-      # CT mapper's id-reuse pre-clear can no longer masquerade as canonical
-      # surplus. Both sites converged on the business key at that point
-      # (Ville 1637/1637, HF Hotel 4,542/4,542) and Ville has held 9/9 since.
-      # The excluded detached-tile population is tracked as issue #281, not
-      # silently dropped — nothing reads ht_room_calendar yet, so scoping it
-      # out is a deliberate stop-gap rather than a permanent classification.
-      - RECONCILE_MIRROR_PROBE_ENABLED=${RECONCILE_MIRROR_PROBE_ENABLED:-true}
+      # STAYS FALSE AT HF HOTEL: the calendar business-key arm reports false
+      # `missing_pg`. Enabled 2026-08-04, fired on the first tick (legacy
+      # 4509 vs pg 4506), reverted the same day — see issue #282.
+      #
+      # The canonical side counts `WHERE rcal_legacy_id IS NOT NULL`, which
+      # was added to stop the CT mapper's id-reuse pre-clear presenting
+      # detached tiles as canonical SURPLUS (the same-day revert at Ville).
+      # That assumed every NULL-id tile has no legacy counterpart. It does
+      # not. The population splits two ways:
+      #   A. legacy row genuinely gone  -> real surplus, correctly excluded
+      #   B. legacy row still there under a REBOUND id -> excluding it
+      #      manufactures a false deficit
+      # The live case was room 405, nights 2026-05-11..13: present in
+      # canonical (rcal_id 48/49/50, status เข้าพัก, cin_id 222), present in
+      # legacy, missing ONLY the back-pointer. Set-diffed to exactly those
+      # 3 pairs with nothing in the other direction — zero genuine gaps.
+      #
+      # A COUNT + min/max hash cannot separate A from B, and the population
+      # DRIFTS as iHOTEL's MAX+1 allocator rebinds ids — which is why both
+      # sites read converged when the scoping landed (Ville 1637/1637, HF
+      # Hotel 4,542/4,542) and HF Hotel does not now. The arm needs a real
+      # set-diff on (room, night) that classifies both populations before it
+      # can be trusted at either site; Ville reads 9/9 today only because it
+      # currently happens to hold no class-B tiles.
+      - RECONCILE_MIRROR_PROBE_ENABLED=${RECONCILE_MIRROR_PROBE_ENABLED:-false}
       # Phase 6-D — payment-ledger probe: legacy HT_CheckIn_Pay vs canonical
       # ht_payment_ledger, compared per FOLIO (Cin_No) on line count +
       # itemized amount + receipt-deduped ACTIVE tender. The folio is the
