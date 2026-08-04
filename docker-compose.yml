@@ -409,19 +409,19 @@ services:
       # mirror and can never converge. Floored, 8 of the 9 probes are
       # EXACTLY converged at both sites today (2026-07-28, read-only).
       #
-      # EXPECT A QUIET LEDGER PLUS ONE RECURRING LOG LINE:
-      # mirror_ht_room_calendar has a genuine structural gap (1507 in-era
-      # legacy rows vs 1298 canonical at HF Hotel; 1302 vs 1071 at Ville),
-      # and NOTHING can close it today — the CT mapper permanently NULLs
-      # rcal_legacy_id when iHOTEL's MAX+1 allocator rebinds an id, the gap
-      # persists even on the business key, no self-heal touches probe keys,
-      # and a hand-resolved row is re-minted on the next tick. So that probe
-      # is observe_only: it LOGS both counts every tick and records no
-      # ht_reconcile_log row (which would otherwise pin the 4h digest and
-      # the >72h escalation tier at both sites forever). Issue #273 tracks
-      # the calendar business-key arm + remediation path (deferred past 6-D);
-      # only when that lands does it start recording.
-      - RECONCILE_MIRROR_PROBE_ENABLED=${RECONCILE_MIRROR_PROBE_ENABLED:-false}
+      # EXPECT A QUIET LEDGER: probes=9 converged=9 recorded=0 observed=0.
+      # The calendar gap this comment used to describe as unclosable (1507
+      # in-era legacy vs 1298 canonical at HF Hotel; 1302 vs 1071 at Ville)
+      # is CLOSED — the backfill_room_calendar bin re-drove 3,650 missing
+      # nights across both sites, and the business-key comparison is now
+      # scoped to `rcal_legacy_id IS NOT NULL` on the canonical side so the
+      # CT mapper's id-reuse pre-clear can no longer masquerade as canonical
+      # surplus. Both sites converged on the business key at that point
+      # (Ville 1637/1637, HF Hotel 4,542/4,542) and Ville has held 9/9 since.
+      # The excluded detached-tile population is tracked as issue #281, not
+      # silently dropped — nothing reads ht_room_calendar yet, so scoping it
+      # out is a deliberate stop-gap rather than a permanent classification.
+      - RECONCILE_MIRROR_PROBE_ENABLED=${RECONCILE_MIRROR_PROBE_ENABLED:-true}
       # Phase 6-D — payment-ledger probe: legacy HT_CheckIn_Pay vs canonical
       # ht_payment_ledger, compared per FOLIO (Cin_No) on line count +
       # itemized amount + receipt-deduped ACTIVE tender. The folio is the
