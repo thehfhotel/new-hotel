@@ -2,17 +2,16 @@
 //!
 //! ## What this pins
 //!
-//! The launch environment is deliberately asymmetric:
+//! Ville coequal writes are LIVE (`HFVILLE_WRITES_ENABLED=true` since
+//! 2026-06-29), so in production this gate admits everything and the exemption
+//! is inert. These tests pin the DISABLED posture — the one an operator can
+//! return to — because that is where the exemption has teeth:
 //!
-//! - `HFVILLE_WRITES_ENABLED` stays **UNSET** — general Ville mutations must
-//!   NOT be admitted.
-//! - `HFVILLE_WRITEBACK_INTENTS=mark_room_clean` — only the housekeeping
-//!   intent may reach Ville's iHOTEL.
-//!
-//! Those two settings must describe the SAME set of flows. If a general Ville
-//! mutation were admitted while its writeback intent parked as `'skipped'`,
-//! canonical PG would silently diverge from Ville's iHOTEL. So exactly one
-//! route is exempt from the gate, and this test proves the boundary.
+//! - the maid's cleaning route must still be admitted, so a housekeeping
+//!   report is not collateral damage of a front-desk write-policy toggle;
+//! - nothing else may be, so an admitted mutation can never outrun a narrowed
+//!   `HFVILLE_WRITEBACK_INTENTS`, which would leave canonical PG ahead of
+//!   Ville's iHOTEL.
 //!
 //! ## How the layer is identified without a valid Access assertion
 //!
@@ -64,8 +63,8 @@ async fn probe(pool: PgPool, method: &str, uri: &str, hfville_writes: bool) -> S
     app.oneshot(req).await.expect("router responds").status()
 }
 
-/// LAUNCH CONFIG, the admitted flow: with Ville writes DISABLED, the maid's
-/// cleaning report for `branch=hfville` must pass the Ville guard. It then
+/// The admitted flow: with Ville writes DISABLED, the maid's cleaning report
+/// for `branch=hfville` must pass the Ville guard. It then
 /// stops at the Access gate (401), which is exactly how we know the guard let
 /// it through rather than short-circuiting with 403.
 #[tokio::test]

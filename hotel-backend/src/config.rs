@@ -452,24 +452,32 @@ pub fn layout_writeback_enabled() -> bool {
 /// `mark_room_clean`. **Unset or empty ⇒ `None` ⇒ current behavior unchanged**
 /// (every intent dispatches), so this is inert until an operator sets it.
 ///
-/// ## Why this exists
+/// ## What this is (and is NOT)
 ///
-/// `HFVILLE_WRITES_ENABLED` is a single all-or-nothing gate, and it lives at
-/// the HTTP layer only (`main.rs::ville_write_guard` 403s `?branch=hfville`
-/// mutations). The writeback worker never reads it. So enabling the maid
-/// surface's cleaning writeback at Ville by flipping that flag would ALSO
-/// admit every other Ville mutation — bookings, check-ins, payments, POS —
-/// each of which then mirrors into Ville's iHOTEL. That is the wholesale flip
-/// the housekeeping-ops plan explicitly forbids as a side effect.
+/// It is a **break-glass restriction tool**, not a launch posture. Ville
+/// coequal writes have been live since 2026-06-29
+/// (`HFVILLE_WRITES_ENABLED=true`), so the steady state is UNSET — every
+/// intent dispatches, exactly as before this existed.
 ///
-/// This allowlist is the narrow path: set it to `mark_room_clean` on the Ville
-/// worker so ONLY the housekeeping intent reaches Ville's iHOTEL, while the
-/// coequal-writes program (`docs/coexistence/ville-coequal-writes-plan.md`)
-/// launches the rest on its own schedule.
+/// SETTING it narrows the live Ville worker: any intent not listed is parked
+/// `'skipped'` (terminal, no retry) instead of reaching Ville's iHOTEL. On a
+/// live system that means canonical PG moves while legacy does not — real
+/// divergence, deliberately accepted for the duration. Reach for it when you
+/// must stop ONE class of Ville legacy write while leaving the rest flowing
+/// (e.g. a recipe implicated in an incident). To stop Ville legacy writes
+/// entirely, use `HFVILLE_WRITEBACK_ENABLED=false` instead — that is the kill
+/// switch; this is a scalpel.
 ///
-/// Enforced in `bin/writeback.rs` and scoped there to `SITE_ID=hfville`; a
-/// non-allowlisted job is parked as `status='skipped'` (terminal, no retry)
-/// rather than left `pending`, so it can never fire later unnoticed.
+/// `HFVILLE_WRITES_ENABLED` is not the same axis: it gates HTTP ADMISSION of
+/// `?branch=hfville` mutations and the writeback worker never reads it. This
+/// allowlist gates legacy DELIVERY. Both must be considered together — an
+/// admitted mutation whose intent is not allowlisted is precisely the
+/// divergence case above.
+///
+/// Enforced in `bin/writeback.rs`, scoped to `SITE_ID=hfville`. Entries are
+/// VALIDATED at worker startup against `ALL_INTENT_NAMES` and an unknown entry
+/// PANICS the worker rather than silently parking every job it was meant to
+/// admit.
 pub fn hfville_writeback_intents() -> Option<std::collections::HashSet<String>> {
     parse_csv_allowlist(std::env::var("HFVILLE_WRITEBACK_INTENTS").ok())
 }
@@ -483,7 +491,14 @@ pub fn parse_csv_allowlist(raw: Option<String>) -> Option<std::collections::Hash
     let raw = raw?;
     let set: std::collections::HashSet<String> = raw
         .split(',')
-        .map(|s| s.trim().to_string())
+        // Trim whitespace AND surrounding quotes. The deploy shim materializes
+        // `.env` with `@sh` quoting (`VAR='value'`) and Compose's dotenv parser
+        // strips those quotes — but if it ever did not, an empty value would
+        // arrive as the two-character string `''`, which would parse as a
+        // bogus entry and PANIC the live HF Ville worker at boot. Trimming
+        // quotes makes that failure impossible, and also tolerates an operator
+        // hand-quoting the value.
+        .map(|s| s.trim().trim_matches(['\'', '"']).trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
     if set.is_empty() {
@@ -572,6 +587,32 @@ mod tests {
         assert!(parse_csv_allowlist(Some(",,".into())).is_none(), "separators only");
     }
 
+    /// The deploy payload writes `HFVILLE_WRITEBACK_INTENTS=''` for the inert
+    /// (unset) case. Compose strips those quotes — but if it ever did not, a
+    /// literal `''` parsed as a real entry would fail startup validation and
+    /// PANIC the LIVE HF Ville writeback worker. Empty must stay empty however
+    /// it arrives.
+    #[test]
+    fn csv_allowlist_quoted_empty_value_is_still_no_allowlist() {
+        for quoted_empty in ["''", "\"\"", " '' ", "'',''"] {
+            assert!(
+                parse_csv_allowlist(Some(quoted_empty.into())).is_none(),
+                "{quoted_empty:?} must parse as NO allowlist, never as an entry"
+            );
+        }
+    }
+
+    /// A quoted real value must still yield the bare intent name — otherwise
+    /// it would fail validation as an unknown intent.
+    #[test]
+    fn csv_allowlist_strips_quotes_around_real_entries() {
+        let parsed = parse_csv_allowlist(Some("'mark_room_clean'".into())).expect("parses");
+        assert!(
+            parsed.contains("mark_room_clean"),
+            "quotes must be stripped, got {parsed:?}"
+        );
+    }
+
     #[test]
     fn csv_allowlist_trims_entries_and_drops_blanks() {
         let parsed = parse_csv_allowlist(Some(" mark_room_clean , ,mark_room_dirty ".into()))
@@ -581,9 +622,9 @@ mod tests {
         assert!(parsed.contains("mark_room_dirty"));
     }
 
-    /// The launch value from the housekeeping-ops plan.
+    /// The narrowest useful restriction: a single intent.
     #[test]
-    fn csv_allowlist_parses_the_single_intent_launch_value() {
+    fn csv_allowlist_parses_a_single_intent_value() {
         let parsed =
             parse_csv_allowlist(Some("mark_room_clean".into())).expect("parses to Some");
         assert_eq!(parsed.len(), 1);
