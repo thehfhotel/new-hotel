@@ -1212,6 +1212,52 @@ pub struct RoomLine {
     pub legacy_ds_id: Option<i32>,
 }
 
+/// Every discriminant [`WritebackIntent::intent_name`] can return.
+///
+/// Exists so operator-supplied intent lists (today: `HFVILLE_WRITEBACK_INTENTS`)
+/// can be VALIDATED at startup instead of silently never matching. A typo like
+/// `mark_clean` for `mark_room_clean` would otherwise fail closed and silent —
+/// canonical PG flips, the job parks `'skipped'` forever, and PG diverges from
+/// legacy with no signal. Kept in lock-step with `intent_name` by
+/// `all_intent_names_matches_intent_name_arms`, which reads this file's own
+/// source, so a new variant cannot drift out of this list unnoticed.
+pub const ALL_INTENT_NAMES: &[&str] = &[
+    "adjust_product_stock",
+    "cancel_booking",
+    "cancel_check_in",
+    "check_out",
+    "close_round",
+    "companion_add",
+    "companion_delete",
+    "create_booking",
+    "create_cash_entry",
+    "create_check_in",
+    "create_note",
+    "extend_stay",
+    "issue_coupon",
+    "mark_note_read",
+    "mark_room_clean",
+    "mark_room_dirty",
+    "mirror_companion",
+    "mirror_companion_list",
+    "mirror_guest_image",
+    "modify_booking",
+    "move_room_tiles",
+    "open_round",
+    "record_payment",
+    "record_pos_sale",
+    "record_receipt",
+    "redeem_coupon",
+    "refund_deposit",
+    "refund_payment",
+    "room_change",
+    "set_room_maintenance",
+    "update_customer",
+    "update_room",
+    "upsert_rate_price",
+    "void_pos_sale",
+];
+
 impl WritebackIntent {
     /// Stable string identifier for this variant — matches the `intent` discriminant
     /// produced by `serde(tag = "intent", rename_all = "snake_case")`.
@@ -1389,6 +1435,59 @@ fn default_extend_stay_start() -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Drift guard for [`ALL_INTENT_NAMES`].
+    ///
+    /// Rust cannot enumerate enum variants at runtime, so instead of
+    /// hand-constructing all 34 variants (which would itself rot) this reads
+    /// THIS FILE's source and extracts every string literal the `intent_name`
+    /// match returns. Adding a variant without adding it to
+    /// `ALL_INTENT_NAMES` fails here — which matters because that constant is
+    /// what makes a misconfigured `HFVILLE_WRITEBACK_INTENTS` fail loud at
+    /// boot instead of silently parking jobs forever.
+    #[test]
+    fn all_intent_names_matches_intent_name_arms() {
+        let src = include_str!("intent.rs");
+        let start = src
+            .find("pub fn intent_name(&self) -> &'static str {")
+            .expect("intent_name fn must exist");
+        let body = &src[start..];
+        // The match arms end at the fn's closing brace (4-space indent).
+        let end = body.find("\n    }\n").expect("intent_name fn must close");
+        let body = &body[..end];
+
+        let mut from_source: Vec<String> = body
+            .lines()
+            .filter_map(|line| line.split_once("=> \""))
+            .filter_map(|(_, rest)| rest.split('"').next())
+            .map(str::to_string)
+            .collect();
+        from_source.sort();
+        from_source.dedup();
+
+        let mut declared: Vec<String> =
+            ALL_INTENT_NAMES.iter().map(|s| (*s).to_string()).collect();
+        declared.sort();
+
+        assert_eq!(
+            from_source, declared,
+            "ALL_INTENT_NAMES is out of sync with intent_name's match arms.\n\
+             In source but not declared: {:?}\n\
+             Declared but not in source: {:?}",
+            from_source
+                .iter()
+                .filter(|n| !declared.contains(n))
+                .collect::<Vec<_>>(),
+            declared
+                .iter()
+                .filter(|n| !from_source.contains(n))
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            declared.contains(&"mark_room_clean".to_string()),
+            "the housekeeping-ops launch intent must be a valid allowlist entry"
+        );
+    }
 
     /// Audit H1 back-compat: in-flight CheckOut events queued before the
     /// Wave 2 deploy carry only `check_in_id` — the new totals fields must

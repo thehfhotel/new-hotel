@@ -48,7 +48,7 @@ use hotel_backend::config::{DbConfig, SiteConfig, SlackConfig};
 use hotel_backend::db::mssql_timeout::{simple_query_with_timeout_drop, MssqlOpKind};
 use hotel_backend::db::{create_pool, DbPool};
 use hotel_backend::notifications::slack::{SlackClient, SlackMessage};
-use hotel_backend::outbox::intent::WritebackIntent;
+use hotel_backend::outbox::intent::{WritebackIntent, ALL_INTENT_NAMES};
 use hotel_backend::outbox::legacy_stale::{self, StaleNote};
 use hotel_backend::writeback::{
     dispatch, verify_legacy_collation_safety, verify_schema_fingerprint,
@@ -293,11 +293,79 @@ static VILLE_SKIPPED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// behavior). See `config::hfville_writeback_intents` for the rationale.
 static VILLE_INTENT_ALLOWLIST: OnceLock<Option<HashSet<String>>> = OnceLock::new();
 
+/// Parse, VALIDATE and install the HF Ville intent allowlist. Call once at
+/// startup, after `init_site_id`.
+///
+/// Panics on an unknown entry, matching `SiteConfig::from_env`'s stance
+/// ("panic on a typo so a misconfigured deploy fails loud"). This is the whole
+/// point of validating: a typo such as `mark_clean` for `mark_room_clean`
+/// would otherwise fail closed AND SILENT — the maid taps done, canonical PG
+/// flips, and the job parks `'skipped'` forever while nothing reaches Ville's
+/// iHOTEL. A crash-looping container is loud; a silently diverging database is
+/// not. Failing to start is also the SAFE direction: nothing wrong is written
+/// to legacy.
+///
+/// Validation is enforced only where the variable actually governs dispatch
+/// (`SITE_ID=hfville`). On the HF Hotel worker the variable has no effect, so
+/// a stray value there is a WARN rather than a reason to refuse to boot the
+/// long-lived production path.
+fn init_ville_intent_allowlist() {
+    let allowlist = hotel_backend::config::hfville_writeback_intents();
+    let site = current_site_id();
+
+    match (&allowlist, site == VILLE_SITE_ID) {
+        (Some(names), true) => {
+            let mut unknown: Vec<&str> = names
+                .iter()
+                .map(String::as_str)
+                .filter(|name| !ALL_INTENT_NAMES.contains(name))
+                .collect();
+            if !unknown.is_empty() {
+                unknown.sort_unstable();
+                let mut valid: Vec<&str> = ALL_INTENT_NAMES.to_vec();
+                valid.sort_unstable();
+                panic!(
+                    "Invalid HFVILLE_WRITEBACK_INTENTS entr{}: {unknown:?}. \
+                     No such writeback intent — the job would park as 'skipped' forever \
+                     and canonical PG would silently diverge from Ville's iHOTEL. \
+                     Valid intents: {valid:?}."
+                    , if unknown.len() == 1 { "y" } else { "ies" }
+                );
+            }
+            let mut active: Vec<&str> = names.iter().map(String::as_str).collect();
+            active.sort_unstable();
+            tracing::info!(
+                site = site,
+                allowlist = ?active,
+                "HF Ville writeback intent allowlist ACTIVE — every other intent will park as 'skipped'"
+            );
+        }
+        (None, true) => {
+            tracing::info!(
+                site = site,
+                "HFVILLE_WRITEBACK_INTENTS unset — every intent dispatches (default behavior)"
+            );
+        }
+        (Some(_), false) => {
+            tracing::warn!(
+                site = site,
+                "HFVILLE_WRITEBACK_INTENTS is set but this worker is not the HF Ville site — ignoring it"
+            );
+        }
+        (None, false) => {}
+    }
+
+    let _ = VILLE_INTENT_ALLOWLIST.set(allowlist);
+}
+
 /// Whether this worker may dispatch `intent_name` to its legacy MSSQL.
+///
+/// Reads the allowlist installed by [`init_ville_intent_allowlist`]. If that
+/// was never called (unit tests constructing no worker), the `OnceLock` is
+/// empty and this degrades to "no allowlist" — the unchanged default.
 fn ville_intent_allowed(intent_name: &str) -> bool {
-    let allowlist =
-        VILLE_INTENT_ALLOWLIST.get_or_init(hotel_backend::config::hfville_writeback_intents);
-    intent_allowed_for_site(current_site_id(), allowlist.as_ref(), intent_name)
+    let allowlist = VILLE_INTENT_ALLOWLIST.get().and_then(Option::as_ref);
+    intent_allowed_for_site(current_site_id(), allowlist, intent_name)
 }
 
 /// PURE allowlist decision — split out so the matrix is unit-testable without
@@ -627,6 +695,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let site = SiteConfig::from_env();
     init_site_id(&site.id);
     tracing::info!(site = %site.id, "Writeback worker: site identity resolved");
+
+    // Same stance, one line later: parse + validate HFVILLE_WRITEBACK_INTENTS
+    // now and log what is actually active, rather than resolving it lazily on
+    // the first job. A typo must stop the worker at boot, not quietly park
+    // every job it was meant to admit.
+    init_ville_intent_allowlist();
 
     // 1. WRITEBACK_ENABLED — graceful no-op for State C
     let enabled = env::var("WRITEBACK_ENABLED")
@@ -4132,6 +4206,61 @@ mod tests {
             Some(&parsed),
             "create_booking"
         ));
+    }
+
+    // ---- allowlist entry validation (fail loud, not closed-and-silent) --
+
+    /// The exact typo class this validation exists for. `mark_clean` looks
+    /// plausible but matches no intent, so without startup validation the
+    /// maid taps done, PG flips, and the job parks `'skipped'` forever while
+    /// nothing reaches Ville's iHOTEL — silent divergence.
+    #[test]
+    fn a_typo_is_not_a_valid_intent_name() {
+        for typo in [
+            "mark_clean",
+            "mark_room_cleaned",
+            "markroomclean",
+            "MarkRoomClean",
+            "mark_room_clean ", // untrimmed (the parser trims, so this is post-trim only)
+        ] {
+            assert!(
+                !ALL_INTENT_NAMES.contains(&typo),
+                "{typo:?} must not be accepted as a valid intent"
+            );
+        }
+        assert!(ALL_INTENT_NAMES.contains(&"mark_room_clean"));
+    }
+
+    /// Every entry an operator could legitimately set must validate — the
+    /// parser trims, so the realistic `" mark_room_clean , "` form is clean.
+    #[test]
+    fn launch_allowlist_entries_are_all_known_intents() {
+        let parsed = hotel_backend::config::parse_csv_allowlist(Some(
+            " mark_room_clean , mark_room_dirty ".to_string(),
+        ))
+        .expect("parses");
+        let unknown: Vec<&String> = parsed
+            .iter()
+            .filter(|n| !ALL_INTENT_NAMES.contains(&n.as_str()))
+            .collect();
+        assert!(unknown.is_empty(), "unexpected unknown entries: {unknown:?}");
+    }
+
+    /// The validation predicate used by `init_ville_intent_allowlist`, applied
+    /// to a mixed list: exactly the bogus entries are reported.
+    #[test]
+    fn unknown_entries_are_identified_precisely() {
+        let parsed = hotel_backend::config::parse_csv_allowlist(Some(
+            "mark_room_clean,mark_clean,check_out,bogus_intent".to_string(),
+        ))
+        .expect("parses");
+        let mut unknown: Vec<&str> = parsed
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !ALL_INTENT_NAMES.contains(name))
+            .collect();
+        unknown.sort_unstable();
+        assert_eq!(unknown, vec!["bogus_intent", "mark_clean"]);
     }
 
     /// Backoff schedule: 30s, 2min, 10min — matches the constants and

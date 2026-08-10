@@ -5,7 +5,7 @@
 //!
 //! - `GET  /api/hk/me`                          — the verified maid identity.
 //! - `GET  /api/hk/rooms`                       — room list + today's progress.
-//! - `GET  /api/hk/rooms/{id}`                  — one room + events + reports.
+//! - `GET  /api/hk/rooms/{id}`                  — one room + today's events.
 //! - `POST /api/hk/rooms/{id}/cleaning`         — report progress (`started`/`done`).
 //! - `POST /api/hk/rooms/{id}/broken-items`     — RETIRED, answers `410 Gone`.
 //! - `GET  /api/hk/broken-items/{id}/photo`     — stream a report's photo.
@@ -114,6 +114,16 @@ fn service_for(state: &AppState, branch: Option<Branch>) -> ApiResult<Housekeepi
     ))
 }
 
+/// Max chars kept from a maid's display name for `HT_Housewife.h_name`.
+///
+/// `h_name` is `varchar(150)` in the legacy schema. Thai is single-byte under
+/// the DB's TIS-620 collation but 3 bytes as UTF-8, and we cannot be certain
+/// which budget a given driver/collation path spends, so bound BOTH: at most
+/// [`MAX_H_NAME_CHARS`] characters AND at most [`MAX_H_NAME_BYTES`] UTF-8
+/// bytes. That is comfortably inside 150 under either reading.
+const MAX_H_NAME_CHARS: usize = 45;
+const MAX_H_NAME_BYTES: usize = 140;
+
 /// The label recorded as the housekeeper in `HT_Housewife.h_name`.
 ///
 /// Prefers the verified HF ID display name so iHOTEL's housekeeping log names
@@ -122,14 +132,34 @@ fn service_for(state: &AppState, branch: Option<Branch>) -> ApiResult<Housekeepi
 /// `["apps", "badge"]`, so this resolves to the badge in production — adding
 /// `name` to the forwarded claims upgrades the audit row with no code change
 /// here. Never client-supplied: both fields come from the verified assertion.
+///
+/// The name is IdP-supplied and therefore unbounded, while `h_name` is
+/// `varchar(150)`. An over-long name would make the legacy INSERT fail with
+/// MSSQL 8152 (string truncation) and the writeback job would retry to
+/// `exhausted` — a stuck queue caused purely by someone's long display name.
+/// Truncation on a CHAR boundary avoids that and never splits a UTF-8
+/// sequence (a byte-sliced Thai name would corrupt the literal).
 fn maid_label(identity: &HkIdentity) -> String {
-    identity
+    let raw = identity
         .display_name
         .as_deref()
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .unwrap_or(&identity.badge)
-        .to_string()
+        .unwrap_or(&identity.badge);
+    truncate_h_name(raw)
+}
+
+/// Clamp to [`MAX_H_NAME_CHARS`] chars and [`MAX_H_NAME_BYTES`] UTF-8 bytes,
+/// always on a char boundary. PURE — unit-tested below.
+fn truncate_h_name(raw: &str) -> String {
+    let mut out = String::new();
+    for (index, ch) in raw.chars().enumerate() {
+        if index >= MAX_H_NAME_CHARS || out.len() + ch.len_utf8() > MAX_H_NAME_BYTES {
+            break;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// `EventSource` for a maid-originated cleaning event. Mirrors
@@ -223,8 +253,6 @@ pub struct HkRoom {
     pub room_clean: bool,
     /// Today's latest maid-reported progress; `None` = nothing reported yet.
     pub cleaning: Option<CleaningProgress>,
-    /// Open (untriaged) broken-item reports on this room.
-    pub open_reports: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -245,19 +273,6 @@ pub struct CleaningEvent {
     pub at: DateTime<Utc>,
 }
 
-/// One broken-item report (metadata only — the photo streams separately).
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BrokenReport {
-    pub report_id: i64,
-    pub description: String,
-    pub badge: String,
-    pub name: Option<String>,
-    pub status: String,
-    pub has_photo: bool,
-    pub at: DateTime<Utc>,
-}
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RoomDetailResponse {
@@ -265,8 +280,6 @@ pub struct RoomDetailResponse {
     pub room: HkRoom,
     /// Today's cleaning events, recent first.
     pub events: Vec<CleaningEvent>,
-    /// Recent broken-item reports on this room, recent first.
-    pub reports: Vec<BrokenReport>,
 }
 
 /// Body for `POST /api/hk/rooms/{id}/cleaning`.
@@ -286,6 +299,12 @@ pub struct ReportCleaningResponse {
     /// `true` when this call performed the dirty→clean transition and so
     /// enqueued the `MarkRoomClean` writeback. `false` for `started`, and for
     /// a repeat `done` on an already-clean room (idempotent no-op).
+    ///
+    /// ENQUEUED, NOT DELIVERED. This says a `writeback_jobs` row was committed
+    /// alongside the canonical flip — nothing about iHOTEL having been written.
+    /// The worker drains asynchronously and may retry, park (`'skipped'`, if
+    /// the HF Ville allowlist excludes the intent) or exhaust. Callers must not
+    /// render this as "the front desk can see it now".
     pub writeback_enqueued: bool,
 }
 
@@ -325,7 +344,7 @@ fn parse_cleaning_status(raw: &str) -> Result<&'static str, ApiError> {
 const TODAY_BKK: &str =
     "(hkev_created_at AT TIME ZONE 'Asia/Bangkok')::date = (NOW() AT TIME ZONE 'Asia/Bangkok')::date";
 
-/// Fetch the active-room list with today's latest progress + open reports.
+/// Fetch the active-room list with today's latest cleaning progress.
 async fn fetch_rooms(pool: &PgPool) -> Result<Vec<HkRoom>, sqlx::Error> {
     let sql = format!(
         r#"
@@ -338,8 +357,7 @@ async fn fetch_rooms(pool: &PgPool) -> Result<Vec<HkRoom>, sqlx::Error> {
             ev.hkev_status,
             ev.hkev_badge,
             ev.hkev_name,
-            ev.hkev_created_at,
-            COALESCE(br.open_reports, 0) AS open_reports
+            ev.hkev_created_at
         FROM ht_rooms_new r
         LEFT JOIN LATERAL (
             SELECT e.hkev_status, e.hkev_badge, e.hkev_name, e.hkev_created_at
@@ -348,11 +366,6 @@ async fn fetch_rooms(pool: &PgPool) -> Result<Vec<HkRoom>, sqlx::Error> {
             ORDER BY e.hkev_created_at DESC, e.hkev_id DESC
             LIMIT 1
         ) ev ON TRUE
-        LEFT JOIN LATERAL (
-            SELECT COUNT(*) AS open_reports
-            FROM ht_hk_broken_reports b
-            WHERE b.hkbr_room_id = r.room_id AND b.hkbr_status = 'open'
-        ) br ON TRUE
         WHERE COALESCE(r.room_active, true) = true
         ORDER BY r.room_no
         "#
@@ -376,8 +389,7 @@ async fn fetch_room(pool: &PgPool, room_id: i32) -> Result<Option<HkRoom>, sqlx:
             ev.hkev_status,
             ev.hkev_badge,
             ev.hkev_name,
-            ev.hkev_created_at,
-            COALESCE(br.open_reports, 0) AS open_reports
+            ev.hkev_created_at
         FROM ht_rooms_new r
         LEFT JOIN LATERAL (
             SELECT e.hkev_status, e.hkev_badge, e.hkev_name, e.hkev_created_at
@@ -386,11 +398,6 @@ async fn fetch_room(pool: &PgPool, room_id: i32) -> Result<Option<HkRoom>, sqlx:
             ORDER BY e.hkev_created_at DESC, e.hkev_id DESC
             LIMIT 1
         ) ev ON TRUE
-        LEFT JOIN LATERAL (
-            SELECT COUNT(*) AS open_reports
-            FROM ht_hk_broken_reports b
-            WHERE b.hkbr_room_id = r.room_id AND b.hkbr_status = 'open'
-        ) br ON TRUE
         WHERE r.room_id = $1 AND COALESCE(r.room_active, true) = true
         "#
     );
@@ -420,7 +427,6 @@ fn room_from_row(row: &sqlx::postgres::PgRow) -> HkRoom {
         building: row.try_get::<String, _>("room_building").ok(),
         room_clean: row.try_get::<bool, _>("room_clean").unwrap_or(true),
         cleaning,
-        open_reports: row.try_get::<i64, _>("open_reports").unwrap_or(0),
     }
 }
 
@@ -475,39 +481,6 @@ async fn fetch_today_events(
         .collect())
 }
 
-/// Recent broken-item reports for one room (metadata only), recent first.
-async fn fetch_room_reports(pool: &PgPool, room_id: i32) -> Result<Vec<BrokenReport>, sqlx::Error> {
-    let rows = sqlx::query(
-        "SELECT hkbr_id, hkbr_description, hkbr_badge, hkbr_name, hkbr_status, \
-                (hkbr_photo IS NOT NULL) AS has_photo, hkbr_created_at \
-           FROM ht_hk_broken_reports \
-          WHERE hkbr_room_id = $1 \
-          ORDER BY hkbr_created_at DESC, hkbr_id DESC \
-          LIMIT 10",
-    )
-    .bind(room_id)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows
-        .iter()
-        .map(|row| BrokenReport {
-            report_id: row.try_get::<i64, _>("hkbr_id").unwrap_or(0),
-            description: row
-                .try_get::<String, _>("hkbr_description")
-                .unwrap_or_default(),
-            badge: row.try_get::<String, _>("hkbr_badge").unwrap_or_default(),
-            name: row.try_get::<String, _>("hkbr_name").ok(),
-            status: row
-                .try_get::<String, _>("hkbr_status")
-                .unwrap_or_else(|_| "open".to_string()),
-            has_photo: row.try_get::<bool, _>("has_photo").unwrap_or(false),
-            at: row
-                .try_get::<DateTime<Utc>, _>("hkbr_created_at")
-                .unwrap_or_else(|_| Utc::now()),
-        })
-        .collect())
-}
-
 /// 404-checking room existence probe (active rooms only).
 async fn require_room(pool: &PgPool, room_id: i32) -> ApiResult<()> {
     let exists = sqlx::query(
@@ -548,7 +521,7 @@ pub async fn list_rooms(
     }))
 }
 
-/// GET /api/hk/rooms/{id} — one room with today's events + recent reports.
+/// GET /api/hk/rooms/{id} — one room with today's cleaning events.
 pub async fn room_detail(
     State(state): State<AppState>,
     Path(room_id): Path<i32>,
@@ -559,12 +532,10 @@ pub async fn room_detail(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("room {room_id} not found")))?;
     let events = fetch_today_events(pool, room_id).await?;
-    let reports = fetch_room_reports(pool, room_id).await?;
     Ok(Json(RoomDetailResponse {
         success: true,
         room,
         events,
-        reports,
     }))
 }
 
@@ -580,6 +551,14 @@ pub async fn room_detail(
 /// writeback leg is unavailable (e.g. the Ville pool is down). The
 /// `writeback_enqueued` flag reports whether this call was the one that
 /// performed the dirty→clean transition — `false` on a repeat tap.
+///
+/// Consequence, accepted by design: because the event insert is a separate
+/// statement from the service transaction, a client retry after a 5xx can
+/// append a SECOND `ht_hk_cleaning_events` row for the same tap. That log is
+/// append-only by nature (`started`/`done` may legitimately repeat in a day)
+/// and the room's "current progress" reads only the LATEST row, so a duplicate
+/// is cosmetic. The thing that must not double — the legacy write — is guarded
+/// separately by `mark_clean_if_dirty`'s conditional UPDATE.
 pub async fn report_cleaning(
     State(state): State<AppState>,
     Path(room_id): Path<i32>,
@@ -729,6 +708,56 @@ mod tests {
         assert_eq!(maid_label(&blank_name), "Q1001");
     }
 
+    /// `h_name` is `varchar(150)`. An unbounded IdP display name would make
+    /// the legacy INSERT fail with MSSQL 8152 and the writeback job retry to
+    /// `exhausted` — a queue stuck on somebody's long name. The clamp must
+    /// hold under BOTH byte budgets and never split a UTF-8 sequence.
+    #[test]
+    fn maid_label_is_clamped_for_ht_housewife_varchar_150() {
+        // Thai is the realistic worst case: 3 UTF-8 bytes per char.
+        let long_thai = "น".repeat(500);
+        let clamped = maid_label(&HkIdentity {
+            badge: "Q1001".into(),
+            display_name: Some(long_thai),
+            email: None,
+        });
+        assert_eq!(clamped.chars().count(), MAX_H_NAME_CHARS);
+        assert!(
+            clamped.len() <= MAX_H_NAME_BYTES,
+            "{} bytes exceeds the byte budget",
+            clamped.len()
+        );
+        assert!(clamped.len() < 150, "must fit varchar(150) as raw bytes too");
+        // Truncation landed on a char boundary — the string is still valid
+        // UTF-8 and contains only whole Thai characters.
+        assert!(clamped.chars().all(|c| c == 'น'));
+
+        // ASCII hits the char cap before the byte cap.
+        let long_ascii = "a".repeat(500);
+        let clamped_ascii = maid_label(&HkIdentity {
+            badge: "Q1001".into(),
+            display_name: Some(long_ascii),
+            email: None,
+        });
+        assert_eq!(clamped_ascii.len(), MAX_H_NAME_CHARS);
+
+        // Normal names are untouched.
+        assert_eq!(
+            maid_label(&HkIdentity {
+                badge: "Q1001".into(),
+                display_name: Some("นก สมใจ".into()),
+                email: None,
+            }),
+            "นก สมใจ"
+        );
+
+        // 4-byte chars must not overflow the byte budget either.
+        let emoji_ish = "𝔘".repeat(100); // 4 bytes each
+        let clamped_wide = truncate_h_name(&emoji_ish);
+        assert!(clamped_wide.len() <= MAX_H_NAME_BYTES);
+        assert!(clamped_wide.chars().count() <= MAX_H_NAME_CHARS);
+    }
+
     /// The retired broken-item intake answers 410 (permanently gone), not 404
     /// (transient/unknown) — so stale cached clients stop retrying.
     #[tokio::test]
@@ -791,13 +820,12 @@ mod tests {
         let progress = room.cleaning.as_ref().expect("today's progress present");
         assert_eq!(progress.status, "done");
         assert_eq!(progress.badge, "Q1001");
-        assert_eq!(room.open_reports, 0);
 
-        // Historical broken-item report → open_reports increments and the
-        // detail queries still return it. The INSERT is raw SQL because the
-        // intake helper is gone (the endpoint is 410 and the Housekeeping ops
-        // app owns new reports); the READ path must keep working for the rows
-        // already in the table.
+        // Historical broken-item rows must stay READABLE by the surviving
+        // photo route even though the list read path and its `reports` /
+        // `openReports` response fields are gone (intake retired, 410; the
+        // Housekeeping ops app owns new reports). Seeded via raw SQL because
+        // no intake helper remains.
         let report_row = sqlx::query(
             "INSERT INTO ht_hk_broken_reports \
                  (hkbr_room_id, hkbr_description, hkbr_badge, hkbr_name, hkbr_photo, hkbr_photo_mime) \
@@ -811,21 +839,17 @@ mod tests {
         let report_id: i64 = report_row.try_get("hkbr_id").unwrap();
         assert!(report_id > 0);
 
-        let room = fetch_room(&pool, room_id)
-            .await
-            .expect("room fetch must succeed")
-            .expect("room must exist");
-        assert_eq!(room.open_reports, 1);
+        let stored: Vec<u8> =
+            sqlx::query_scalar("SELECT hkbr_photo FROM ht_hk_broken_reports WHERE hkbr_id = $1")
+                .bind(report_id)
+                .fetch_one(&pool)
+                .await
+                .expect("the photo route's row must still be readable");
+        assert_eq!(stored, b"fakejpeg", "history rows survive the retirement");
 
         let events = fetch_today_events(&pool, room_id).await.unwrap();
         assert_eq!(events.len(), 2, "both events land in today's log");
         assert_eq!(events[0].status, "done", "recent-first ordering");
-
-        let reports = fetch_room_reports(&pool, room_id).await.unwrap();
-        assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0].description, "ก๊อกน้ำรั่ว");
-        assert!(reports[0].has_photo);
-        assert_eq!(reports[0].status, "open");
 
         // CHECK constraint rejects an invalid status at the DB layer too.
         let bad = insert_cleaning_event(&pool, room_id, "finished", "Q1001", None).await;

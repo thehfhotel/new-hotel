@@ -32,7 +32,6 @@ export interface HkRoom {
   building: string | null
   roomClean: boolean
   cleaning: HkCleaningProgress | null
-  openReports: number
 }
 
 export interface HkCleaningEvent {
