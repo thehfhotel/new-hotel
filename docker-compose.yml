@@ -1115,7 +1115,11 @@ services:
       # falls out of the two-service topology for free: HF Ville is the pilot
       # terminal (DESKTOP-0BE5LED — lower volume, and it matches the flag
       # rollout order used for every other coexistence flag), FRONT2 second.
-      - LEGACY_STALE_NOTIFY_ENABLED=${HFVILLE_LEGACY_STALE_NOTIFY_ENABLED:-false}
+      # FLIPPED 2026-08-10: middleware v1.1.0 installed on the pilot via SSH,
+      # serving in the console session, autostart registered. The HF Hotel
+      # sibling stays false until the pilot's one-shift soak passes
+      # (<=1 toast/30min + the receptionist actually uses it).
+      - LEGACY_STALE_NOTIFY_ENABLED=${HFVILLE_LEGACY_STALE_NOTIFY_ENABLED:-true}
       - RUST_LOG=${RUST_LOG:-hotel_backend=info,writeback=info}
     secrets:
       - db_password
