@@ -78,6 +78,16 @@ pub struct LegacyIds {
     /// `back_populate_legacy_ids` step. `None` for every non-note intent.
     #[serde(default)]
     pub sms_id: Option<i32>,
+    /// Issue #202 — `TB_Pay_History.id` minted by the `CreateCashEntry`
+    /// recipe via [`crate::writeback::allocate::allocate_pay_history_id`]
+    /// (TABLOCKX MAX+1). Stamped onto canonical `ht_cash_ledger.cash_legacy_id`
+    /// by the worker's `back_populate_legacy_ids` step — the SAME column the
+    /// inbound `sync_cash_history` importer's `ON CONFLICT (cash_legacy_id)`
+    /// dedups on (`bin/sync.rs::CASH_HISTORY_UPSERT_SQL`), so once this lands
+    /// a re-import of our own writeback UPDATEs the existing row instead of
+    /// inserting a duplicate. `None` for every non-cash intent.
+    #[serde(default)]
+    pub cash_legacy_id: Option<i32>,
     /// Free-form extras (e.g. `HT_Rooms_Cancel.id`).
     #[serde(default)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -132,6 +142,11 @@ impl LegacyIds {
     /// Task #47 — record the freshly-allocated `HT_Room_SMS`/`HT_EMP_SMS.SMS_ID`.
     pub fn with_sms_id(mut self, sms_id: i32) -> Self {
         self.sms_id = Some(sms_id);
+        self
+    }
+    /// Issue #202 — record the freshly-allocated `TB_Pay_History.id`.
+    pub fn with_cash_legacy_id(mut self, cash_legacy_id: i32) -> Self {
+        self.cash_legacy_id = Some(cash_legacy_id);
         self
     }
 
@@ -493,6 +508,15 @@ fn intent_facts(intent: &WritebackIntent) -> IntentFacts {
         RecordPayment { .. } => (true, true),
         IssueCoupon { .. } => (true, false),
         RecordPosSale { .. } => (true, true),
+        // Issue #202 — CreateCashEntry INSERTs `TB_Pay_History` with a
+        // sequential app-allocated id (MAX+1 TABLOCKX, not IDENTITY), so a
+        // crash-after-commit retry would allocate a FRESH id and duplicate
+        // the row — ledger it (same class as RecordPayment / IssueCoupon).
+        // `TB_Pay_History` is the petty-cash ledger, deliberately separate
+        // from the cashier round's `HT_CheckIn_Pay` (migration 059's own
+        // doc comment: "cannot be derived from it") — no §1.9 open-round
+        // warning applies.
+        CreateCashEntry { .. } => (true, false),
         // Task #45 — RecordReceipt allocates a sequential `HT_Receipt_H.id`
         // (TABLOCKX MAX+1) + `Receipt_no`, so a crash-after-commit retry
         // would mint a DUPLICATE receipt → ledger it (same class as
@@ -1498,6 +1522,15 @@ pub async fn dispatch(
             }
             recipes::companion_people::execute_delete(conn, cin_legacy_no, *legacy_id).await
         }
+        // Issue #202 — CreateCashEntry is standalone (no legacy FK to
+        // resolve, no `ResolvedJob` hydration needed — same shape as
+        // MirrorCompanion). The recipe allocates `TB_Pay_History.id` itself
+        // and returns it via `LegacyIds::cash_legacy_id` for `mark_done` to
+        // back-populate onto `ht_cash_ledger.cash_legacy_id`.
+        WritebackIntent::CreateCashEntry {
+            cash_aggregate_id: _,
+            payload,
+        } => recipes::cash_entry::execute(conn, payload).await,
     };
 
     // Ledger RECORD — the LAST write before the worker's COMMIT, on the SAME
@@ -1534,6 +1567,21 @@ mod tests {
         assert_eq!(json["book_id"], "R014810");
         assert_eq!(json["cust_no"], "C21610");
         assert!(json["cin_no"].is_null());
+    }
+
+    /// Issue #202 — "id surfaced from the recipe": the allocated
+    /// `TB_Pay_History.id` a `CreateCashEntry` recipe run returns must reach
+    /// `mark_done` as `legacy_ids.cash_legacy_id` — the exact field
+    /// `back_populate_legacy_ids` reads. Same JSON round-trip contract as
+    /// every other allocator id (`book_id`, `cupon_no`, `sms_id`, ...).
+    #[test]
+    fn legacy_ids_surfaces_cash_legacy_id() {
+        let ids = LegacyIds::new().with_cash_legacy_id(42);
+        assert_eq!(ids.cash_legacy_id, Some(42));
+        let json = ids.into_json();
+        assert_eq!(json["cash_legacy_id"], 42);
+        // Untouched fields stay absent — mirrors legacy_ids_round_trips_to_json.
+        assert!(json["book_id"].is_null());
     }
 
     // ── Idempotency ledger (dbo.ht_writeback_ledger) ─────────────────────────
@@ -1638,13 +1686,14 @@ mod tests {
             !body.contains("_ =>"),
             "intent_facts must have NO wildcard arm (it would reintroduce silent drift)"
         );
-        // The 5 sequential-allocator CREATE intents must be classified in the table.
+        // The 6 sequential-allocator CREATE intents must be classified in the table.
         for v in [
             "CreateBooking",
             "CreateCheckIn",
             "RecordPayment",
             "IssueCoupon",
             "RecordPosSale",
+            "CreateCashEntry",
         ] {
             assert!(body.contains(v), "intent_facts must classify {v}");
         }
@@ -1671,6 +1720,23 @@ mod tests {
             nights: None,
             payment_aggregate_id: None,
             vat_percent: None,
+        }));
+        // Issue #202 — CreateCashEntry allocates a sequential
+        // TB_Pay_History.id (MAX+1), so it must be ledgered too.
+        assert!(intent_is_ledgered(&WritebackIntent::CreateCashEntry {
+            cash_aggregate_id: id,
+            payload: crate::outbox::intent::CreateCashEntryPayload {
+                site_id: "hfhotel".into(),
+                entry_date: chrono::Utc::now(),
+                program_date: None,
+                amount: 100.0,
+                legacy_pay_type: "รายจ่าย".into(),
+                bill_no: None,
+                payee: None,
+                note: None,
+                group: None,
+                account: None,
+            },
         }));
         // mutate-only → NOT ledgered
         assert!(!intent_is_ledgered(&WritebackIntent::CancelBooking {

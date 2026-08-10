@@ -307,6 +307,20 @@ pub async fn allocate_receipt_h_id(conn: &mut LegacyConn<'_>) -> WritebackResult
     .await
 }
 
+/// Allocate the next `TB_Pay_History.id` (issue #202 — `CreateCashEntry`).
+///
+/// Per `docs/legacy-app/COMPAT_CHEATSHEET.md` §1051 / `SCHEMA.sql:777` and the
+/// `cash_entry` recipe module doc: `TB_Pay_History.id` is `int NOT NULL`, NOT
+/// IDENTITY — allocated app-side via `get_id` (MAX+1), same convention as
+/// every other legacy sequential id here.
+pub async fn allocate_pay_history_id(conn: &mut LegacyConn<'_>) -> WritebackResult<i32> {
+    select_next_int_with_lock(
+        conn,
+        "SELECT ISNULL(MAX(id), 0) + 1 FROM TB_Pay_History WITH (TABLOCKX, HOLDLOCK)",
+    )
+    .await
+}
+
 /// Format a `Pay_No` for `HT_CheckIn_Pay`. Per `findings.md` §2 line 129 and
 /// live capture `docs/legacy-spike/raw/invoice-20260424-100827/07-events.txt:154`
 /// the legacy app emits `R{yyMM}-{4digit}` (e.g. `R2604-0241`). The `R` prefix

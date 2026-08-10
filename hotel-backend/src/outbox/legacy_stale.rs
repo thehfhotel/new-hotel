@@ -391,6 +391,13 @@ pub fn stale_label(intent: &WritebackIntent, room_no: Option<&str>) -> String {
             NoteTargetKind::Staff => "ข้อความถึงพนักงาน".to_string(),
         },
         MarkNoteRead { .. } => "อ่านข้อความแล้ว".to_string(),
+
+        // --- Petty cash ---
+        // Issue #202. "รายรับ-รายจ่าย" is the feature's own Thai gloss
+        // (migration 059's doc comment / the `/v2/cash` page title) — no
+        // room to attach (TB_Pay_History is a standalone ledger, not a
+        // folio line).
+        CreateCashEntry { .. } => "บันทึกรายรับ-รายจ่าย".to_string(),
     }
 }
 
@@ -433,8 +440,8 @@ mod tests {
     use crate::domain::payment::PaymentMethod;
     use crate::domain::shared::{DateRange, Money};
     use crate::outbox::intent::{
-        BookingChanges, CreateBookingPayload, CreateCheckInPayload, RecordPaymentReceipt,
-        UpdateRoomPayload,
+        BookingChanges, CreateBookingPayload, CreateCashEntryPayload, CreateCheckInPayload,
+        RecordPaymentReceipt, UpdateRoomPayload,
     };
     use chrono::TimeZone;
 
@@ -668,6 +675,21 @@ mod tests {
             CompanionDelete {
                 cin_legacy_no: "CH26-000001".into(),
                 legacy_id: 1,
+            },
+            CreateCashEntry {
+                cash_aggregate_id: agg(),
+                payload: CreateCashEntryPayload {
+                    site_id: "hfhotel".into(),
+                    entry_date: stay().start,
+                    program_date: None,
+                    amount: 100.0,
+                    legacy_pay_type: "รายจ่าย".into(),
+                    bill_no: None,
+                    payee: None,
+                    note: None,
+                    group: None,
+                    account: None,
+                },
             },
         ]
     }

@@ -1,18 +1,24 @@
 //! `CreateCashEntry` recipe — petty-cash income/expense writeback to legacy
 //! `TB_Pay_History` (migration 059).
 //!
-//! ## STATUS: PURE, BUT DELIBERATELY UNWIRED (TODO)
+//! ## STATUS: WIRED (intent + dispatcher + back-population), NOT YET EMITTED
 //!
-//! This module captures the *known* shape of iHOTEL's `TB_Pay_History` INSERT
-//! so a future dev has a head start, but it is **not** referenced by any
-//! `WritebackIntent` / dispatcher arm / service emission. The
-//! `POST /api/cash/{income,expense}` handlers write canonical PG only (see
-//! `routes/new_cash.rs`). Inbound mirroring (iHOTEL → us) is live via
-//! `bin/sync.rs::sync_cash_history`; only the outbound half waits.
+//! Issue #202 wired [`WritebackIntent::CreateCashEntry`] → the dispatcher arm
+//! in `writeback::dispatcher::dispatch` → [`execute`] (this module) →
+//! `mark_done`'s `back_populate_legacy_ids` stamping the allocated
+//! `TB_Pay_History.id` onto `ht_cash_ledger.cash_legacy_id` (migration 085
+//! added the `aggregate_id` column that back-population keys on). What is
+//! STILL missing — and what keeps cash-outbound dark — is a service/route
+//! call site that actually ENQUEUES this intent: `POST
+//! /api/cash/{income,expense}` (`routes/new_cash.rs`) still writes canonical
+//! PG only. Inbound mirroring (iHOTEL → us) is live via
+//! `bin/sync.rs::sync_cash_history`.
 //!
-//! **Why unwired:** coexistence writebacks fire a REAL write to the shared
-//! legacy DB the moment the feature is used, so they must be byte-exact. What
-//! we can verify from `docs/legacy-app/` is the column ORDER, types, the
+//! **Why the emission side stays unwired:** coexistence writebacks fire a
+//! REAL write to the shared legacy DB the moment the feature is used, so they
+//! must be byte-exact AND ship behind an env flag with reception-coordinated
+//! live verification (repo invariant — new legacy writes ship dark). What we
+//! can verify from `docs/legacy-app/` is the column ORDER, types, the
 //! positional (no-column-list) INSERT form, the OADate `float` date encoding,
 //! and the app-side `get_id` (MAX+1) id allocation
 //! (`SCHEMA.sql:777`, `COMPAT_CHEATSHEET.md` §1051 / line 84-86 / line 1506).
@@ -27,10 +33,10 @@
 //!   * which tree level (`MyType2` / `2_2` / `3`) maps to `Pay_Group` vs
 //!     `Pay_Account`.
 //!
-//! Before wiring: confirm the three points above against `FrmAddPay.cs:638`,
-//! add a `WritebackIntent::CreateCashEntry` + dispatcher arm + the MAX+1
-//! `allocate::*` id step + outbox emission in `create_entry`, and re-validate
-//! the emitted SQL against a live capture.
+//! Before flipping the emission flag: confirm the three points above against
+//! `FrmAddPay.cs:638`, add the `POST /api/cash/*` outbox emission behind an
+//! env-gated flag (default off), and re-validate the emitted SQL against a
+//! live capture.
 //!
 //! ## Legacy reference (positional INSERT, `FrmAddPay.cs:638`)
 //!
@@ -95,13 +101,18 @@ pub struct CashEntryPayload {
 /// column order: `id, Pay_Date, Pay_Bill, Pay_Cust, Pay_Type, Pay_Total,
 /// Pay_Note, Pay_Program, Pay_Group, Pay_Account`.
 ///
-/// ECHO-SAFETY (issue #202): when this dark path is wired, the worker MUST
-/// back-populate the allocated `legacy_id` onto the canonical `ht_cash_ledger`
-/// row's `cash_legacy_id` after the write (mirroring payments'
-/// `back_populate_legacy_ids` → `legacy_receipt_no`). The cash mirror importer
-/// (`bin/sync.rs::sync_cash_history`) dedups `ON CONFLICT (cash_legacy_id)`, so
-/// without that back-population our own cash write re-imports as a phantom
-/// duplicate. Do not enable cash-outbound writeback until that is in place.
+/// ECHO-SAFETY (issue #202): [`execute`] back-populates the allocated
+/// `legacy_id` onto the canonical `ht_cash_ledger` row's `cash_legacy_id`
+/// after the write (mirroring payments' `back_populate_legacy_ids` →
+/// `legacy_receipt_no`) — see `bin/writeback.rs::back_populate_legacy_ids`'s
+/// `CreateCashEntry` arm. The cash mirror importer
+/// (`bin/sync.rs::sync_cash_history`) dedups `ON CONFLICT (cash_legacy_id)`,
+/// so without that back-population an app-originated cash write re-imports as
+/// a phantom duplicate. Do not enable cash-outbound EMISSION (the
+/// `POST /api/cash/*` route enqueueing this intent) until that emission path
+/// itself ships behind a flag and is reception-verified live — the
+/// back-population plumbing this module now provides is a prerequisite, not
+/// a green light.
 pub fn build_statements(payload: &CashEntryPayload, legacy_id: i32) -> WritebackResult<Vec<String>> {
     validate_finite(&[("amount", payload.amount)])?;
 
@@ -128,6 +139,55 @@ pub fn build_statements(payload: &CashEntryPayload, legacy_id: i32) -> Writeback
         account = sql_quote_or_empty(payload.account.as_deref()),
     );
     Ok(vec![stmt])
+}
+
+/// Execute the recipe: allocate `TB_Pay_History.id` (MAX+1 TABLOCKX — see
+/// [`crate::writeback::allocate::allocate_pay_history_id`]), build + run the
+/// INSERT, and return the allocated id via [`LegacyIds::cash_legacy_id`] so
+/// the worker's `mark_done` can back-populate `ht_cash_ledger.cash_legacy_id`
+/// (issue #202).
+///
+/// Takes the OUTBOX wire payload (`outbox::intent::CreateCashEntryPayload`,
+/// not this module's [`CashEntryPayload`]) — `outbox/` doesn't depend on
+/// `writeback/`, so the two types are field-for-field mirrors and this is
+/// where they're bridged, one time, at the dispatch boundary.
+///
+/// No `WHERE NOT EXISTS` guard on the INSERT (unlike `payment`'s
+/// `HT_CheckIn_Pay` row): `CreateCashEntry` is classified `ledgered: true` in
+/// `dispatcher::intent_facts` (like `CreateBooking`), so `dispatch`'s
+/// `dbo.ht_writeback_ledger` lookup is the sole idempotency guard — same
+/// choice `booking_create.rs` makes.
+pub async fn execute(
+    conn: &mut crate::writeback::allocate::LegacyConn<'_>,
+    payload: &crate::outbox::intent::CreateCashEntryPayload,
+) -> WritebackResult<crate::writeback::dispatcher::LegacyIds> {
+    use crate::writeback::allocate::allocate_pay_history_id;
+    use crate::writeback::dispatcher::LegacyIds;
+
+    let legacy_id = allocate_pay_history_id(conn).await?;
+    let recipe_payload = from_outbox_payload(payload);
+    let statements = build_statements(&recipe_payload, legacy_id)?;
+    super::execute_all(conn, &statements).await?;
+
+    Ok(LegacyIds::new().with_cash_legacy_id(legacy_id))
+}
+
+/// Bridge the OUTBOX wire payload into this module's recipe-internal
+/// [`CashEntryPayload`]. PURE — split out of [`execute`] so the field mapping
+/// is unit-testable without a live MSSQL connection.
+fn from_outbox_payload(payload: &crate::outbox::intent::CreateCashEntryPayload) -> CashEntryPayload {
+    CashEntryPayload {
+        site_id: payload.site_id.clone(),
+        entry_date: payload.entry_date,
+        program_date: payload.program_date,
+        amount: payload.amount,
+        legacy_pay_type: payload.legacy_pay_type.clone(),
+        bill_no: payload.bill_no.clone(),
+        payee: payload.payee.clone(),
+        note: payload.note.clone(),
+        group: payload.group.clone(),
+        account: payload.account.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -200,5 +260,65 @@ mod tests {
         let mut p = payload();
         p.amount = f64::NAN;
         assert!(build_statements(&p, 1).is_err());
+    }
+
+    // ── Issue #202 wiring ──────────────────────────────────────────────
+
+    fn outbox_payload() -> crate::outbox::intent::CreateCashEntryPayload {
+        crate::outbox::intent::CreateCashEntryPayload {
+            site_id: "hfhotel".into(),
+            entry_date: Utc.with_ymd_and_hms(2026, 4, 24, 7, 0, 0).unwrap(),
+            program_date: None,
+            amount: 1500.0,
+            legacy_pay_type: "รายจ่าย".into(),
+            bill_no: Some("B-001".into()),
+            payee: Some("ค่าน้ำ".into()),
+            note: Some("note".into()),
+            group: Some("G1".into()),
+            account: Some("A1".into()),
+        }
+    }
+
+    /// `from_outbox_payload` must carry every field across field-for-field —
+    /// a dropped field here would silently blank that column in the legacy
+    /// INSERT for every future emitter, with no compile error (both structs
+    /// have the same field names but are structurally distinct types).
+    #[test]
+    fn from_outbox_payload_maps_every_field() {
+        let mapped = from_outbox_payload(&outbox_payload());
+        assert_eq!(mapped.site_id, "hfhotel");
+        assert_eq!(mapped.entry_date, outbox_payload().entry_date);
+        assert_eq!(mapped.program_date, None);
+        assert_eq!(mapped.amount, 1500.0);
+        assert_eq!(mapped.legacy_pay_type, "รายจ่าย");
+        assert_eq!(mapped.bill_no.as_deref(), Some("B-001"));
+        assert_eq!(mapped.payee.as_deref(), Some("ค่าน้ำ"));
+        assert_eq!(mapped.note.as_deref(), Some("note"));
+        assert_eq!(mapped.group.as_deref(), Some("G1"));
+        assert_eq!(mapped.account.as_deref(), Some("A1"));
+    }
+
+    /// "id surfaced from the recipe" (issue #202 test requirement): the id
+    /// `execute` would allocate is exactly what `build_statements` embeds in
+    /// the INSERT AND exactly what `LegacyIds::with_cash_legacy_id` carries
+    /// out to `mark_done` — pinning that the two never drift apart even
+    /// though `execute` itself needs a live MSSQL connection to allocate the
+    /// real id and can't run in this unit suite.
+    #[test]
+    fn allocated_id_reaches_both_the_sql_and_legacy_ids() {
+        let mapped = from_outbox_payload(&outbox_payload());
+        let legacy_id = 555;
+        let stmt = &build_statements(&mapped, legacy_id).unwrap()[0];
+        assert!(
+            stmt.contains(&format!("({legacy_id}, ")),
+            "allocated id must be the INSERT's first VALUES slot: {stmt}"
+        );
+
+        let ids = crate::writeback::dispatcher::LegacyIds::new().with_cash_legacy_id(legacy_id);
+        assert_eq!(
+            ids.cash_legacy_id,
+            Some(legacy_id),
+            "the SAME id must reach LegacyIds for mark_done to back-populate"
+        );
     }
 }

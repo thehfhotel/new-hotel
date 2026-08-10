@@ -838,6 +838,71 @@ pub enum WritebackIntent {
         cin_legacy_no: String,
         legacy_id: i64,
     },
+
+    /// Issue #202 — mirror one app-originated `ht_cash_ledger` row (petty-cash
+    /// income/expense, migration 059) into legacy `TB_Pay_History`. Positional
+    /// INSERT, `TB_Pay_History.id` allocated app-side (MAX+1 TABLOCKX — see
+    /// `writeback::allocate::allocate_pay_history_id`); the worker
+    /// back-populates the allocated id onto `ht_cash_ledger.cash_legacy_id`
+    /// (`cash_aggregate_id` addresses the row — same role as
+    /// `note_aggregate_id` / `rate_aggregate_id`; migration 085 adds the
+    /// column). That column is the SAME one the inbound `sync_cash_history`
+    /// importer's `ON CONFLICT (cash_legacy_id)` dedups on
+    /// (`bin/sync.rs::CASH_HISTORY_UPSERT_SQL`), so once back-population
+    /// lands a re-import of our own write UPDATEs the existing row instead
+    /// of inserting a duplicate — closing the echo gap this issue names.
+    ///
+    /// **UNWIRED**: no service/route call site emits this intent yet (`POST
+    /// /api/cash/{income,expense}` still writes canonical-only — see
+    /// `writeback::recipes::cash_entry`'s module doc). This variant + its
+    /// dispatcher arm + back-population exist so cash-outbound emission has
+    /// something correct to call; the emission itself, its env flag, and
+    /// reception-coordinated live verification are separate, later work —
+    /// the writeback stays dark until then.
+    CreateCashEntry {
+        cash_aggregate_id: Uuid,
+        payload: CreateCashEntryPayload,
+    },
+}
+
+/// Payload for [`WritebackIntent::CreateCashEntry`] (issue #202).
+///
+/// Field-for-field mirror of `writeback::recipes::cash_entry::CashEntryPayload`
+/// — kept as a separate type so `outbox/` (the emit-side wire contract) never
+/// depends on `writeback/` (the dispatch-side adapter); the dispatcher builds
+/// one from the other before calling the recipe. See that module's doc
+/// comment for the legacy `TB_Pay_History` column mapping and what remains
+/// byte-shape-unverified (`Pay_Type` / `Pay_Group` / `Pay_Account` /
+/// `Pay_Program`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateCashEntryPayload {
+    /// Which site this entry belongs to ("hfhotel" | "hfville").
+    pub site_id: String,
+    /// `Pay_Date` — the entry date (rendered as a Bangkok-calendar OADate).
+    pub entry_date: DateTime<Utc>,
+    /// `Pay_Program` — a second legacy OADate of uncertain semantics; `None`
+    /// defaults it to the entry date (see the recipe module's TODO).
+    #[serde(default)]
+    pub program_date: Option<DateTime<Utc>>,
+    /// `Pay_Total` — amount in baht (must be finite; sign per iHOTEL convention).
+    pub amount: f64,
+    /// `Pay_Type` — raw legacy income/expense marker (verbatim).
+    pub legacy_pay_type: String,
+    /// `Pay_Bill`.
+    #[serde(default)]
+    pub bill_no: Option<String>,
+    /// `Pay_Cust`.
+    #[serde(default)]
+    pub payee: Option<String>,
+    /// `Pay_Note`.
+    #[serde(default)]
+    pub note: Option<String>,
+    /// `Pay_Group` — account-tree id_full.
+    #[serde(default)]
+    pub group: Option<String>,
+    /// `Pay_Account` — account-tree id_full.
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 /// One companion in a MirrorCompanionList replace-all payload.
@@ -1188,6 +1253,7 @@ impl WritebackIntent {
             WritebackIntent::MirrorCompanionList { .. } => "mirror_companion_list",
             WritebackIntent::CompanionAdd { .. } => "companion_add",
             WritebackIntent::CompanionDelete { .. } => "companion_delete",
+            WritebackIntent::CreateCashEntry { .. } => "create_cash_entry",
         }
     }
 
@@ -1271,6 +1337,9 @@ impl WritebackIntent {
             WritebackIntent::CompanionDelete { cin_legacy_no, .. } => {
                 companion_aggregate(cin_legacy_no)
             }
+            WritebackIntent::CreateCashEntry {
+                cash_aggregate_id, ..
+            } => *cash_aggregate_id,
         }
     }
 }

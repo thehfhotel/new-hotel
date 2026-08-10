@@ -2349,13 +2349,22 @@ CREATE TABLE IF NOT EXISTS ht_cash_ledger (
                      CHECK (cash_source IN ('legacy', 'app')),
     cash_created_by  VARCHAR(100),
     cash_synced_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    -- Writeback correlation id (v4, minted at INSERT for app rows). Added by
+    -- migration 085 (issue #202) — inlined here for fresh installs.
+    aggregate_id     UUID,
     CONSTRAINT ht_cash_ledger_legacy_id_key UNIQUE (cash_legacy_id)
 );
 CREATE INDEX IF NOT EXISTS ix_ht_cash_ledger_entry_date
     ON ht_cash_ledger (cash_entry_date);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_ht_cash_ledger_aggregate_id
+    ON ht_cash_ledger (aggregate_id) WHERE aggregate_id IS NOT NULL;
 
 INSERT INTO schema_migrations (version, filename, applied_by)
 VALUES ('059', '059_create_ht_cash_ledger.sql', 'init-script')
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO schema_migrations (version, filename, applied_by)
+VALUES ('085', '085_ht_cash_ledger_aggregate_id.sql', 'init-script')
 ON CONFLICT (version) DO NOTHING;
 
 INSERT INTO schema_migrations (version, filename, applied_by)

@@ -1932,6 +1932,10 @@ async fn resolve_legacy_ids(
                     .await?;
             resolved.companion_guest_exists = exists.is_some();
         }
+        // Issue #202 — CreateCashEntry is standalone: the payload carries
+        // everything the recipe needs directly, no legacy FK to resolve from
+        // PG (same shape as CreateBooking / MirrorCompanion).
+        CreateCashEntry { .. } => {}
     }
     Ok(resolved)
 }
@@ -2464,6 +2468,11 @@ async fn back_populate_legacy_ids(
         .get("checkin_ds_id")
         .and_then(|v| v.as_i64())
         .map(|n| n as i32);
+    // Issue #202 — see the `CreateCashEntry` arm below.
+    let cash_legacy_id = legacy_ids
+        .get("cash_legacy_id")
+        .and_then(|v| v.as_i64())
+        .map(|n| n as i32);
 
     use WritebackIntent::*;
     match intent {
@@ -2874,6 +2883,29 @@ async fn back_populate_legacy_ids(
                 )
                 .bind(other_people_id)
                 .bind(*guest_id)
+                .execute(pg)
+                .await?;
+            }
+        }
+        // Issue #202 — CreateCashEntry back-populates the freshly-allocated
+        // `TB_Pay_History.id` onto `ht_cash_ledger.cash_legacy_id`, keyed by
+        // the row's `aggregate_id` (migration 085). This is the SAME column
+        // `sync_cash_history`'s `ON CONFLICT (cash_legacy_id)` UPSERT dedups
+        // on (`bin/sync.rs::CASH_HISTORY_UPSERT_SQL`, consumed at
+        // `bin/sync.rs::sync_cash_history`) — closing the echo gap this
+        // issue named: without this stamp, an app-originated cash entry's
+        // `cash_legacy_id` stays NULL forever and every re-import tick
+        // inserts a genuine duplicate row (pinned by
+        // `bin/sync.rs::cash_sync_tests::reimport_without_backpopulation_still_duplicates`).
+        CreateCashEntry { .. } => {
+            if let Some(cash_legacy_id) = cash_legacy_id {
+                sqlx::query(
+                    "UPDATE ht_cash_ledger SET \
+                       cash_legacy_id = COALESCE($2, cash_legacy_id) \
+                     WHERE aggregate_id = $1",
+                )
+                .bind(aggregate_id)
+                .bind(cash_legacy_id)
                 .execute(pg)
                 .await?;
             }
@@ -5354,6 +5386,270 @@ mod tests {
 
         sqlx::query("DELETE FROM writeback_jobs WHERE id = $1")
             .bind(job_id)
+            .execute(&pg)
+            .await
+            .ok();
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #202 — CreateCashEntry back-population
+    // -------------------------------------------------------------------
+
+    fn cash_entry_intent(cash_aggregate_id: Uuid, amount: f64) -> WritebackIntent {
+        WritebackIntent::CreateCashEntry {
+            cash_aggregate_id,
+            payload: hotel_backend::outbox::intent::CreateCashEntryPayload {
+                site_id: "hfhotel".into(),
+                entry_date: Utc::now(),
+                program_date: None,
+                amount,
+                legacy_pay_type: "รายจ่าย".into(),
+                bill_no: None,
+                payee: None,
+                note: None,
+                group: None,
+                account: None,
+            },
+        }
+    }
+
+    /// "mark_done stamps the right row": `back_populate_legacy_ids` must
+    /// stamp `cash_legacy_id` on the `ht_cash_ledger` row whose `aggregate_id`
+    /// matches the intent — and leave an unrelated row (decoy) untouched.
+    ///
+    /// Needs PG; skipped when `DATABASE_URL` is unset (same convention as
+    /// `mark_done_reports_false_when_the_claim_was_stolen`).
+    #[tokio::test]
+    async fn back_populate_stamps_cash_legacy_id_on_the_matching_row_only() {
+        let Ok(url) = env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL unset");
+            return;
+        };
+        let pg = PgPool::connect(&url).await.expect("connect");
+
+        let target_agg = Uuid::new_v4();
+        let decoy_agg = Uuid::new_v4();
+
+        let target_row: i64 = sqlx::query_scalar(
+            "INSERT INTO ht_cash_ledger (cash_kind, cash_amount, cash_source, aggregate_id) \
+             VALUES ('expense', 100.00, 'app', $1) RETURNING cash_id",
+        )
+        .bind(target_agg)
+        .fetch_one(&pg)
+        .await
+        .expect("insert target fixture row");
+
+        let decoy_row: i64 = sqlx::query_scalar(
+            "INSERT INTO ht_cash_ledger (cash_kind, cash_amount, cash_source, aggregate_id) \
+             VALUES ('expense', 200.00, 'app', $1) RETURNING cash_id",
+        )
+        .bind(decoy_agg)
+        .fetch_one(&pg)
+        .await
+        .expect("insert decoy fixture row");
+
+        let intent = cash_entry_intent(target_agg, 100.0);
+        back_populate_legacy_ids(
+            &pg,
+            target_agg,
+            &intent,
+            &serde_json::json!({"cash_legacy_id": 900_100_001}),
+        )
+        .await
+        .expect("back-populate must succeed");
+
+        let target_legacy: Option<i32> =
+            sqlx::query_scalar("SELECT cash_legacy_id FROM ht_cash_ledger WHERE cash_id = $1")
+                .bind(target_row)
+                .fetch_one(&pg)
+                .await
+                .expect("re-read target row");
+        assert_eq!(
+            target_legacy,
+            Some(900_100_001),
+            "the aggregate_id-matched row must be stamped"
+        );
+
+        let decoy_legacy: Option<i32> =
+            sqlx::query_scalar("SELECT cash_legacy_id FROM ht_cash_ledger WHERE cash_id = $1")
+                .bind(decoy_row)
+                .fetch_one(&pg)
+                .await
+                .expect("re-read decoy row");
+        assert_eq!(
+            decoy_legacy, None,
+            "an unrelated row (different aggregate_id) must NOT be stamped"
+        );
+
+        sqlx::query("DELETE FROM ht_cash_ledger WHERE cash_id = $1")
+            .bind(target_row)
+            .execute(&pg)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM ht_cash_ledger WHERE cash_id = $1")
+            .bind(decoy_row)
+            .execute(&pg)
+            .await
+            .ok();
+    }
+
+    /// "stolen-claim path does not stamp": mirrors
+    /// `mark_done_reports_false_when_the_claim_was_stolen`'s stolen-claim
+    /// setup, but asserts the CONCRETE side effect on `ht_cash_ledger`
+    /// rather than only the boolean — a stolen claim must leave
+    /// `cash_legacy_id` NULL; the re-claimant's own `mark_done` owns the
+    /// stamp.
+    ///
+    /// Needs PG; skipped when `DATABASE_URL` is unset.
+    #[tokio::test]
+    async fn mark_done_stolen_claim_does_not_stamp_cash_legacy_id() {
+        let Ok(url) = env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL unset");
+            return;
+        };
+        let pg = PgPool::connect(&url).await.expect("connect");
+
+        let aggregate_id = Uuid::new_v4();
+        let row_id: i64 = sqlx::query_scalar(
+            "INSERT INTO ht_cash_ledger (cash_kind, cash_amount, cash_source, aggregate_id) \
+             VALUES ('income', 300.00, 'app', $1) RETURNING cash_id",
+        )
+        .bind(aggregate_id)
+        .fetch_one(&pg)
+        .await
+        .expect("insert fixture row");
+
+        let intent = cash_entry_intent(aggregate_id, 300.0);
+        let our_claim = Utc::now();
+        let their_claim = our_claim + chrono::Duration::seconds(30);
+
+        let job_id: i64 = sqlx::query_scalar(
+            "INSERT INTO writeback_jobs \
+                 (intent, payload, aggregate_id, idempotency_key, status, claimed_at) \
+             VALUES ($1, $2, $3, $4, 'in_progress', $5) \
+             RETURNING id",
+        )
+        .bind(intent.intent_name())
+        .bind(serde_json::to_value(&intent).unwrap())
+        .bind(aggregate_id)
+        .bind(Uuid::new_v4())
+        .bind(their_claim)
+        .fetch_one(&pg)
+        .await
+        .expect("insert fixture job");
+
+        let landed = mark_done(
+            &pg,
+            job_id,
+            our_claim,
+            aggregate_id,
+            &intent,
+            &None,
+            PriorDisposition::Fresh,
+            serde_json::json!({"cash_legacy_id": 900_100_002}),
+        )
+        .await;
+
+        assert!(
+            !landed,
+            "a stolen claim must not report the completion as ours"
+        );
+
+        let legacy: Option<i32> =
+            sqlx::query_scalar("SELECT cash_legacy_id FROM ht_cash_ledger WHERE cash_id = $1")
+                .bind(row_id)
+                .fetch_one(&pg)
+                .await
+                .expect("re-read fixture row");
+        assert_eq!(
+            legacy, None,
+            "a stolen claim's mark_done must not stamp cash_legacy_id — the \
+             re-claimant's own mark_done owns that"
+        );
+
+        sqlx::query("DELETE FROM ht_cash_ledger WHERE cash_id = $1")
+            .bind(row_id)
+            .execute(&pg)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM writeback_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pg)
+            .await
+            .ok();
+    }
+
+    /// "echo-recognition": once back-population has stamped `cash_legacy_id`,
+    /// a legacy-side re-import of THAT SAME id must UPDATE the existing row,
+    /// not insert a duplicate. This reproduces the exact `ON CONFLICT
+    /// (cash_legacy_id)` target `sync_cash_history`'s
+    /// `CASH_HISTORY_UPSERT_SQL` upserts on (`hotel-backend/src/bin/sync.rs`,
+    /// the `const` at line 6192 / `ON CONFLICT` at line 6197, consumed by
+    /// `sync_cash_history` at line 6547) against the real `ht_cash_ledger`
+    /// UNIQUE constraint — it does NOT call or modify `bin/sync.rs` (out of
+    /// this task's ownership; the dedup itself is proven correct there by
+    /// `cash_sync_tests::reimport_without_backpopulation_still_duplicates`,
+    /// which pins the CONVERSE case — no back-population ⇒ a real duplicate).
+    ///
+    /// Needs PG; skipped when `DATABASE_URL` is unset.
+    #[tokio::test]
+    async fn backpopulated_row_absorbs_a_legacy_reimport_instead_of_duplicating() {
+        let Ok(url) = env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL unset");
+            return;
+        };
+        let pg = PgPool::connect(&url).await.expect("connect");
+
+        let aggregate_id = Uuid::new_v4();
+        let legacy_id = 900_100_003;
+
+        let row_id: i64 = sqlx::query_scalar(
+            "INSERT INTO ht_cash_ledger (cash_kind, cash_amount, cash_source, aggregate_id) \
+             VALUES ('expense', 250.00, 'app', $1) RETURNING cash_id",
+        )
+        .bind(aggregate_id)
+        .fetch_one(&pg)
+        .await
+        .expect("insert app-originated fixture row");
+
+        let intent = cash_entry_intent(aggregate_id, 250.0);
+        back_populate_legacy_ids(
+            &pg,
+            aggregate_id,
+            &intent,
+            &serde_json::json!({"cash_legacy_id": legacy_id}),
+        )
+        .await
+        .expect("back-populate must succeed");
+
+        // Simulate the mirror poll re-importing the SAME legacy row under the
+        // SAME `ON CONFLICT (cash_legacy_id)` target `CASH_HISTORY_UPSERT_SQL`
+        // uses — not the importer function itself.
+        sqlx::query(
+            "INSERT INTO ht_cash_ledger (cash_legacy_id, cash_kind, cash_amount, cash_source) \
+             VALUES ($1, 'expense', 250.00, 'legacy') \
+             ON CONFLICT (cash_legacy_id) DO UPDATE SET cash_synced_at = NOW()",
+        )
+        .bind(legacy_id)
+        .execute(&pg)
+        .await
+        .expect("simulated re-import upsert");
+
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ht_cash_ledger WHERE cash_legacy_id = $1")
+                .bind(legacy_id)
+                .fetch_one(&pg)
+                .await
+                .expect("count rows for this legacy id");
+        assert_eq!(
+            total, 1,
+            "back-population must make ON CONFLICT (cash_legacy_id) target the \
+             SAME row — otherwise the re-import lands as a duplicate (the gap \
+             bin/sync.rs::cash_sync_tests::reimport_without_backpopulation_still_duplicates pins)"
+        );
+
+        sqlx::query("DELETE FROM ht_cash_ledger WHERE cash_id = $1")
+            .bind(row_id)
             .execute(&pg)
             .await
             .ok();
