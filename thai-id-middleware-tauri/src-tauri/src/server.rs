@@ -815,6 +815,7 @@ mod tests {
     fn test_health_response_serialization() {
         let response = HealthResponse {
             status: "ok".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             timestamp: "2024-01-01T00:00:00.000Z".to_string(),
             reader_connected: true,
             card_inserted: false,
