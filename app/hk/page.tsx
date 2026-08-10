@@ -3,15 +3,16 @@
 // Maid room list (/hk) — employee-login plan Phase 4.
 //
 // Shows every active room of the property with today's maid-reported cleaning
-// progress; tapping a room opens /hk/rooms/[id] to report progress or a
-// broken item. Identity is resolved server-side from the Cloudflare Access
+// progress; tapping a room opens /hk/rooms/[id] to report progress.
+// แจ้งซ่อม / เบิกของ deep-link to the separate Housekeeping ops app via
+// HkOpsLinks. Identity is resolved server-side from the Cloudflare Access
 // assertion (silent HF ID); a 401/403 renders the fail-closed notice — there
 // is deliberately NO login UI. v1 pins the primary property (HF Hotel); the
 // backend is already branch-aware for a later property switch.
 
 import { useCallback, useEffect, useState } from 'react'
 import Link from 'next/link'
-import { AlertCircle, Loader2, RefreshCw, Sparkles, Wrench } from 'lucide-react'
+import { AlertCircle, Loader2, RefreshCw, Sparkles } from 'lucide-react'
 import {
   groupRoomsByFloor,
   hkFetch,
@@ -20,6 +21,7 @@ import {
   type HkMe,
   type HkRoom,
 } from './hk-lib'
+import HkOpsLinks from './HkOpsLinks'
 
 export default function HkRoomListPage() {
   const [me, setMe] = useState<HkMe | null>(null)
@@ -108,6 +110,8 @@ export default function HkRoomListPage() {
         </div>
       )}
 
+      <HkOpsLinks />
+
       {/* Room list grouped by floor */}
       {loading && rooms.length === 0 && !error ? (
         <div className="flex items-center justify-center py-16 text-gray-500">
@@ -137,12 +141,6 @@ export default function HkRoomListPage() {
                               title="ห้องยังไม่สะอาด"
                               className="inline-block h-2.5 w-2.5 rounded-full bg-red-500"
                             />
-                          )}
-                          {room.openReports > 0 && (
-                            <span className="flex items-center gap-0.5 text-xs text-orange-600">
-                              <Wrench className="h-3.5 w-3.5" />
-                              {room.openReports}
-                            </span>
                           )}
                         </span>
                       </div>

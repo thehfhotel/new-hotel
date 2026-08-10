@@ -43,21 +43,10 @@ export interface HkCleaningEvent {
   at: string
 }
 
-export interface HkBrokenReport {
-  reportId: number
-  description: string
-  badge: string
-  name: string | null
-  status: 'open' | 'acknowledged' | 'resolved'
-  hasPhoto: boolean
-  at: string
-}
-
 export interface HkRoomDetail {
   success: boolean
   room: HkRoom
   events: HkCleaningEvent[]
-  reports: HkBrokenReport[]
 }
 
 // ---------------------------------------------------------------------------
@@ -66,6 +55,15 @@ export interface HkRoomDetail {
 
 /** Base path of the maid API as seen from the browser (Access-scoped). */
 export const HK_API_BASE = '/hk/api'
+
+/**
+ * Base URL of the Housekeeping ops app (แจ้งซ่อม / เบิกของ). Build-time
+ * `NEXT_PUBLIC_*` because the /hk pages are client components — same idiom as
+ * `NEXT_PUBLIC_CARD_READER_URL`. Trailing slash trimmed so path joins are safe.
+ */
+export const HOUSEKEEPING_URL = (
+  process.env.NEXT_PUBLIC_HOUSEKEEPING_URL || 'https://housekeeping.thehfhotel.org'
+).replace(/\/+$/, '')
 
 /**
  * fetch() against the /hk API. Throws with a Thai message on 401/403 (the
@@ -145,51 +143,4 @@ export function timeLabel(iso: string): string {
   const date = new Date(iso)
   if (Number.isNaN(date.getTime())) return ''
   return date.toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' })
-}
-
-// ---------------------------------------------------------------------------
-// Photo downscale (browser-only)
-// ---------------------------------------------------------------------------
-
-/** Longest edge after downscale — keeps uploads well under the body limit. */
-const MAX_PHOTO_EDGE = 1600
-
-/**
- * Downscale a picked photo to a JPEG data payload for the broken-item POST.
- * Returns base64 (no data: prefix) + mime. Falls back to the original bytes
- * when the image APIs are unavailable (very old WebViews).
- */
-export async function preparePhoto(
-  file: File
-): Promise<{ photoBase64: string; photoMime: string }> {
-  try {
-    const bitmap = await createImageBitmap(file)
-    const scale = Math.min(1, MAX_PHOTO_EDGE / Math.max(bitmap.width, bitmap.height))
-    const width = Math.max(1, Math.round(bitmap.width * scale))
-    const height = Math.max(1, Math.round(bitmap.height * scale))
-    const canvas = document.createElement('canvas')
-    canvas.width = width
-    canvas.height = height
-    const ctx = canvas.getContext('2d')
-    if (!ctx) throw new Error('no 2d context')
-    ctx.drawImage(bitmap, 0, 0, width, height)
-    bitmap.close()
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.8)
-    const base64 = dataUrl.split(',')[1] ?? ''
-    if (!base64) throw new Error('empty canvas encode')
-    return { photoBase64: base64, photoMime: 'image/jpeg' }
-  } catch {
-    // Fallback: ship the original file (server caps at 5 MB decoded).
-    const buffer = await file.arrayBuffer()
-    let binary = ''
-    const bytes = new Uint8Array(buffer)
-    const chunk = 0x8000
-    for (let i = 0; i < bytes.length; i += chunk) {
-      binary += String.fromCharCode(...bytes.subarray(i, i + chunk))
-    }
-    return {
-      photoBase64: btoa(binary),
-      photoMime: file.type || 'image/jpeg',
-    }
-  }
 }
