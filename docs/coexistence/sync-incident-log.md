@@ -693,3 +693,23 @@ that single check separates the #282 false-positive class (tile present,
 `rcal_legacy_id` NULL) from a genuine drop, and the two demand opposite
 responses. Then check `ct_min` against the event's version: below it, CT can
 never redeliver and only a backfill will close the gap.
+
+**Correction (2026-08-10, same day, issue #283 audit).** The "cause" paragraph
+above is WRONG and is retained only as a record of the misdiagnosis. The
+connection-failure hypothesis was falsified by bucketing all 11 bb8/transport
+failure windows over 240h against the six CT events for the dropped rows —
+none coincide; the watcher was healthy at every drop, and during the real
+outages the 2026-05-18 `!errored` gating held the watermark correctly. The
+actual mechanism is the **unverified tick ceiling**: the watcher sampled
+`CHANGE_TRACKING_CURRENT_VERSION()` and advanced the watermark to it in the
+same tick, but without snapshot isolation a transaction can commit with a
+version at-or-below the sampled ceiling while remaining invisible to the
+`CHANGETABLE` read taken moments later — and the skipped range is never
+re-read. Production proof: tick `2026-08-05T07:20:06Z` applied row 4798
+(room 105) but not its sibling 4799 (room 107) — both written by the same
+iHOTEL check-in `CH26-001753` — then advanced 41503→41516 over it. Fix: the
+CT ceiling settle gate in `bin/sync.rs` (a sampled ceiling only becomes an
+advance target on a later tick, once every CHANGETABLE read provably
+post-dates it), plus hard-error handling of CT control columns and gating of
+three un-gated per-key skips. The `MAX+1`-style "hole below a current max"
+diagnostic in the rule-of-thumb above still stands — that part was right.

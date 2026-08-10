@@ -297,6 +297,90 @@ fn format_last_error(event_name: &str, raw: &str) -> String {
 
 const DEFAULT_CT_POLL_INTERVAL_MS: u64 = 1000;
 
+/// How long a sampled `CHANGE_TRACKING_CURRENT_VERSION()` must SETTLE
+/// before it may be used as a watermark advance target — issue #283.
+///
+/// ## Why a settle window exists at all
+///
+/// `CHANGE_TRACKING_CURRENT_VERSION()` and `CHANGETABLE(CHANGES …)` are
+/// separate statements on separate pooled connections, and the legacy
+/// databases run with `ALLOW_SNAPSHOT_ISOLATION OFF` (verified on HF
+/// Ville's `HOTEL` DB, 2026-08-10: `snapshot_isolation_state_desc =
+/// OFF`, `is_read_committed_snapshot_on = 0`). Microsoft's guidance for
+/// "obtain the next sync version, then enumerate changes" is to put BOTH
+/// inside ONE snapshot transaction, precisely because outside one there
+/// is no ordering guarantee between the version counter a probe reads
+/// and what a subsequent `CHANGETABLE` read can see: a transaction whose
+/// commit is already in flight has contributed to the counter but its
+/// `sys.syscommittab` row is not yet visible to a READ COMMITTED reader.
+///
+/// The pre-#283 code assumed the opposite — that sampling the ceiling
+/// BEFORE the mapper loop made it "immune by construction" because every
+/// table is polled at or after the sample instant. Production falsified
+/// that on HF Ville: at `2026-08-05T07:20:06Z` the tick sampled ceiling
+/// v41516, `HT_Room_Status` read 40ms later returned nothing above
+/// v41510, and the watermark still advanced to v41516 — stranding
+/// `HT_Room_Status.id=4799` (room 107, night 2026-08-05) forever once CT
+/// retention aged the range out. Same shape lost ids 4692 / 4815 / 4832.
+///
+/// ## What the window buys
+///
+/// Enabling snapshot isolation would be DDL on the shared legacy server
+/// (see CLAUDE.md — prohibited outside the CT-prerequisite carve-out), so
+/// instead we only ever advance to a ceiling that was sampled at least
+/// this long BEFORE the current tick's reads began. A commit that was
+/// in flight at sample time is visible microseconds-to-milliseconds
+/// later; 2s is four orders of magnitude of margin.
+///
+/// Data application latency is UNCHANGED — `CHANGETABLE(CHANGES t, @v)`
+/// has no upper bound, so rows are still applied on the tick they first
+/// become visible. Only the resume point trails, which costs one extra
+/// idempotent re-read of a ~2s version range per tick.
+///
+/// Override via `LEGACY_SYNC_CT_CEILING_SETTLE_MS`.
+const DEFAULT_CT_CEILING_SETTLE_MS: u64 = 2000;
+
+/// Cross-tick holder for the CT ceiling settle window (issue #283).
+///
+/// Holds at most ONE un-consumed `CHANGE_TRACKING_CURRENT_VERSION()`
+/// sample together with the `Instant` it was taken. [`take_settled`]
+/// releases it only once it is old enough; [`record`] deliberately does
+/// NOT overwrite a sample that is still maturing, so a poll cadence
+/// faster than the settle window can never starve the watermark by
+/// endlessly replacing the pending sample with a fresher one.
+///
+/// [`take_settled`]: CeilingGate::take_settled
+/// [`record`]: CeilingGate::record
+#[derive(Debug, Default, Clone, Copy)]
+struct CeilingGate {
+    pending: Option<(i64, Instant)>,
+}
+
+impl CeilingGate {
+    /// Release the pending ceiling iff it has settled for `settle` as of
+    /// `now`. MUST be called BEFORE the tick polls any table: that is
+    /// what makes "every `CHANGETABLE` read in this tick happened at
+    /// least `settle` after the sample instant" true by construction.
+    fn take_settled(&mut self, now: Instant, settle: Duration) -> Option<i64> {
+        let (version, sampled_at) = self.pending?;
+        if now.duration_since(sampled_at) >= settle {
+            self.pending = None;
+            Some(version)
+        } else {
+            None
+        }
+    }
+
+    /// Record a fresh sample. No-op when one is still pending — keeping
+    /// the OLDER sample is what guarantees forward progress under a tick
+    /// interval shorter than the settle window.
+    fn record(&mut self, version: i64, sampled_at: Instant) {
+        if self.pending.is_none() {
+            self.pending = Some((version, sampled_at));
+        }
+    }
+}
+
 /// How often to verify each table's CT retention window
 /// (`MIN_VALID_VERSION(<table>) <= last_seen_version`).
 ///
@@ -1285,6 +1369,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .unwrap_or(DEFAULT_RETENTION_CHECK_INTERVAL_SECS),
     );
 
+    // Issue #283 — CT ceiling settle window. See
+    // `DEFAULT_CT_CEILING_SETTLE_MS`. Floored at one poll interval: a
+    // window shorter than the tick cadence would release a ceiling
+    // sampled inside the SAME tick's read window and reinstate the bug.
+    let ceiling_settle = Duration::from_millis(
+        env::var("LEGACY_SYNC_CT_CEILING_SETTLE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_CT_CEILING_SETTLE_MS)
+            .max(poll_interval_ms),
+    );
+
     let shadow_mode = env::var("LEGACY_SYNC_SHADOW_MODE")
         .map(|v| v == "true")
         .unwrap_or(false);
@@ -1784,6 +1880,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // needed and the map dies cleanly with the worker on SIGTERM.
     let mut retention_last_checked: HashMap<String, Instant> = HashMap::new();
 
+    // Issue #283 — the CT ceiling settle gate. Process-local like
+    // `retention_last_checked`: it starts empty, so the FIRST tick after
+    // a restart advances no watermark (nothing has settled yet) and the
+    // second one does. That is the correct posture — a fresh process has
+    // no proof about what any pre-restart read covered.
+    let mut ceiling_gate = CeilingGate::default();
+
     // Task #69: wrap the main loop in a tracing span so every log line
     // emitted from inside the watcher (mapper warnings, watermark
     // advances, retention probes) carries `site=<id>`. With both HF
@@ -1802,6 +1905,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             per_table_watermark,
             &mut retention_last_checked,
             retention_check_interval,
+            &mut ceiling_gate,
+            ceiling_settle,
             &site.id,
         )
         .await;
@@ -4235,21 +4340,26 @@ fn build_mappers(allowlist: &Option<HashSet<String>>) -> Vec<Box<dyn MssqlChange
 /// mode lets a row-lock wedge on one table freeze only that row
 /// rather than gating every CT-enabled table's advance.
 ///
-/// ## Global-mode watermark: sampled ceiling, written once, here
+/// ## Global-mode watermark: SETTLED ceiling, written once, here
 ///
 /// The GLOBAL watermark advance belongs to the TICK, not to a table.
 /// This fn samples `CHANGE_TRACKING_CURRENT_VERSION()` ONCE before the
-/// mapper loop and — only if no table errored — writes that ceiling
-/// after the loop. `poll_table` no longer touches the global row.
+/// mapper loop and — only if no table errored — writes a ceiling after
+/// the loop. `poll_table` no longer touches the global row.
 ///
-/// Sampling before the loop is what makes it safe: every table is
-/// polled at or after that instant, so a save landing mid-loop carries
-/// a version strictly above the ceiling and survives to the next tick.
 /// Letting a late table (`HT_Book_Pro`, index 18) advance the shared
 /// watermark to its own `max_version` is exactly how customer C2413 /
 /// booking R002066 were lost on HF Ville 2026-07-11 — polled-first
 /// `HT_Customers` (index 0) had already run when they were written, and
 /// the 30788 → 30801 advance meant nothing ever re-read v30789.
+///
+/// The ceiling written is NOT this tick's sample. Issue #283 proved that
+/// "sampled before the loop, therefore already read through by every
+/// table" is FALSE outside a snapshot transaction — see
+/// [`DEFAULT_CT_CEILING_SETTLE_MS`]. The sample is parked in
+/// [`CeilingGate`] and only becomes an advance target on a LATER tick,
+/// once every `CHANGETABLE` read provably post-dates it by the settle
+/// window.
 #[allow(clippy::too_many_arguments)]
 async fn run_one_tick(
     pg: &PgPool,
@@ -4260,6 +4370,8 @@ async fn run_one_tick(
     per_table_watermark: bool,
     retention_last_checked: &mut HashMap<String, Instant>,
     retention_check_interval: Duration,
+    ceiling_gate: &mut CeilingGate,
+    ceiling_settle: Duration,
     site_id: &str,
 ) {
     // Two paths converge on a `HashMap<&str, i64>` of per-table
@@ -4312,31 +4424,38 @@ async fn run_one_tick(
         return;
     }
 
-    // Sample the tick's CT ceiling BEFORE any mapper runs — see the fn
-    // doc. A probe failure is NOT fatal to the tick: every mapper still
-    // polls and applies, we just have no safe value to write, so the
-    // end-of-tick advance is skipped and the next tick re-samples. The
-    // cost is one repeated read of the same CT range (idempotent).
-    let tick_ct_ceiling: Option<i64> = match read_change_tracking_current_version(mssql).await {
-        Ok(v) => Some(v),
+    // Release a ceiling sampled on an EARLIER tick, if it has settled.
+    // This MUST happen before the mapper loop: the whole guarantee is
+    // "every `CHANGETABLE` read below happened at least `ceiling_settle`
+    // after this value was sampled", which is only true if we decide it
+    // here (issue #283 — see `DEFAULT_CT_CEILING_SETTLE_MS`).
+    let now = Instant::now();
+    let settled_ct_ceiling: Option<i64> = ceiling_gate.take_settled(now, ceiling_settle);
+
+    // Sample THIS tick's CT ceiling BEFORE any mapper runs. It is parked
+    // in the gate, not used now. A probe failure is NOT fatal to the
+    // tick: every mapper still polls and applies, we just have no fresh
+    // value to park; a previously-parked one is unaffected and the next
+    // tick re-samples. The cost is one repeated read of the same CT
+    // range (idempotent).
+    match read_change_tracking_current_version(mssql).await {
+        Ok(v) => ceiling_gate.record(v, Instant::now()),
         Err(err) => {
             tracing::warn!(
                 event_name = EV_CT_CEILING_PROBE_FAIL,
                 site = %site_id,
                 error = %err,
                 "CHANGE_TRACKING_CURRENT_VERSION() probe failed; \
-                 running mappers but skipping this tick's watermark advance"
+                 running mappers but parking no fresh ceiling this tick"
             );
-            None
         }
-    };
+    }
 
     // Any table failing anywhere in the tick holds the ENTIRE global
     // advance (see `global_watermark_target`). Per-table mode is
     // unaffected — each table owns its own row.
     let mut any_table_errored = false;
 
-    let now = Instant::now();
     for mapper in mappers {
         let table = mapper.table();
         let pk_cols = mapper.primary_key_cols();
@@ -4375,7 +4494,7 @@ async fn run_one_tick(
             pk_cols,
             select_sql,
             table_last_seen,
-            tick_ct_ceiling,
+            settled_ct_ceiling,
             shadow_mode,
             per_table_watermark,
             should_check_retention,
@@ -4430,7 +4549,7 @@ async fn run_one_tick(
     // shadow soak still hits the documented 2-day retention trap.
     if !per_table_watermark && !shadow_mode {
         if let Some(target) =
-            global_watermark_target(tick_ct_ceiling, global_last_seen, any_table_errored)
+            global_watermark_target(settled_ct_ceiling, global_last_seen, any_table_errored)
         {
             match hotel_backend::sync::watermark::advance(pg, target).await {
                 Ok(()) => {
@@ -4460,7 +4579,7 @@ async fn run_one_tick(
             tracing::warn!(
                 site = %site_id,
                 last_seen = global_last_seen,
-                ceiling = ?tick_ct_ceiling,
+                ceiling = ?settled_ct_ceiling,
                 "[CT] Tick had table failures — holding GLOBAL watermark for retry next tick"
             );
         }
@@ -4606,10 +4725,12 @@ impl PollOutcome {
 /// the 2026-07-11 HF Ville loss caused by advancing the shared row from
 /// here, per table, to that table's own `max_version`).
 ///
-/// `tick_ct_ceiling` is the tick's `CHANGE_TRACKING_CURRENT_VERSION()`
-/// sample, taken before ANY table was polled (`None` when the probe
-/// failed). Used only on the per-table path, to move a table that found
-/// nothing forward — see `quiet_table_watermark_target`.
+/// `settled_ct_ceiling` is a `CHANGE_TRACKING_CURRENT_VERSION()` sample
+/// taken on an EARLIER tick and held until it settled (`None` when
+/// nothing has settled yet). Used only on the per-table path, and it is
+/// the ONLY value a per-table watermark may advance to — see
+/// `settled_ceiling_target` and issue #283 for why this table's own
+/// `max_version` is not a safe target either.
 ///
 /// `should_check_retention` is throttled by the caller to
 /// `LEGACY_SYNC_RETENTION_CHECK_INTERVAL_SECS` (default 300s) per
@@ -4627,7 +4748,7 @@ async fn poll_table(
     pk_cols: &[&str],
     select_sql: &str,
     last_seen: i64,
-    tick_ct_ceiling: Option<i64>,
+    settled_ct_ceiling: Option<i64>,
     shadow_mode: bool,
     per_table_watermark: bool,
     should_check_retention: bool,
@@ -4772,7 +4893,7 @@ async fn poll_table(
             // no reason. Having polled and found nothing, it HAS read
             // through the tick ceiling — advance it there. Falls back
             // to a plain touch when there's no ceiling to advance to.
-            match quiet_table_watermark_target(tick_ct_ceiling, last_seen, shadow_mode) {
+            match settled_ceiling_target(settled_ct_ceiling, last_seen, shadow_mode) {
                 Some(target) => {
                     let _ =
                         hotel_backend::sync::watermark::advance_per_table(pg, table, target).await;
@@ -4850,13 +4971,21 @@ async fn poll_table(
             // path — the parent re-load supersedes per-row I/U/D
             // semantics.
             if let Err(err) = ChangeOp::try_from(op_char.as_str()) {
+                // Issue #283 audit: an op code we cannot parse means the
+                // change was NOT applied. Treating it as a plain skip let
+                // the watermark march past it — the silent-drop class the
+                // per-key `errored` gating exists to prevent. CT only ever
+                // emits I/U/D, so this is unreachable in practice; if it
+                // ever fires it is a driver/projection bug worth wedging
+                // the watermark until the stall watchdog pages.
                 tracing::warn!(
                     event_name = EV_UNKNOWN_CT_OP,
                     table,
                     sys_change_operation = %op_char,
                     error = %err,
-                    "Unknown CT operation code — skipping row"
+                    "Unknown CT operation code — holding watermark for retry"
                 );
+                errored = true;
                 skipped += 1;
                 continue;
             }
@@ -5024,12 +5153,21 @@ async fn poll_table(
                 }
                 "HT_CheckIn_Pay" => apply_payment_aggregate(&mut tx, mssql, key).await,
                 other => {
+                    // Issue #283 audit: a mapper that opted into
+                    // coalescing but has no applier wired here means the
+                    // key's change was never applied. Holding is the only
+                    // correct answer — the alternative advanced past it
+                    // and lost it to CT retention. This is a wiring bug
+                    // (new coalescing mapper, missing `match` arm), so it
+                    // will not self-heal; the watermark-stall watchdog is
+                    // the intended escalation.
                     tracing::warn!(
                         event_name = EV_AGGREGATE_APPLY_FAIL,
                         table = other,
                         reason = "unknown_aggregate_table",
-                        "Unknown coalesced aggregate table — skipping"
+                        "Unknown coalesced aggregate table — holding watermark for retry"
                     );
+                    errored = true;
                     skipped += 1;
                     continue;
                 }
@@ -5101,13 +5239,17 @@ async fn poll_table(
             let op = match ChangeOp::try_from(op_char.as_str()) {
                 Ok(o) => o,
                 Err(err) => {
+                    // See the sibling aggregate-path branch: an
+                    // undispatchable row is an UNAPPLIED change and must
+                    // hold the watermark (issue #283 audit).
                     tracing::warn!(
                         event_name = EV_UNKNOWN_CT_OP,
                         table,
                         sys_change_operation = %op_char,
                         error = %err,
-                        "Unknown CT operation code — skipping row"
+                        "Unknown CT operation code — holding watermark for retry"
                     );
+                    errored = true;
                     skipped += 1;
                     continue;
                 }
@@ -5267,11 +5409,20 @@ async fn poll_table(
         return Ok(PollOutcome::clean());
     }
 
-    // Per-table mode. Advance to this table's own `max_version` when it
-    // saw rows; otherwise to the tick ceiling, which it has provably
-    // read through (same anti-freeze rule as the empty-fetch branch).
-    let per_table_target = next_watermark_after_tick(max_version, last_seen, errored)
-        .or_else(|| quiet_table_watermark_target(tick_ct_ceiling, last_seen, shadow_mode));
+    // Per-table mode. The ONLY safe target is the settled ceiling —
+    // identical rule to the empty-fetch branch above.
+    //
+    // Issue #283: this used to prefer this table's own `max_version`.
+    // That is the same unsound assumption as the old global ceiling,
+    // one level down: `max_version` is the highest version this read
+    // HAPPENED to see, and outside a snapshot transaction a lower
+    // version whose commit was still in flight can be invisible to the
+    // very same read (commit_ts is assigned in commit order; visibility
+    // to a READ COMMITTED `CHANGETABLE` reader is not). Advancing to
+    // `max_version` therefore strands the in-flight one exactly as
+    // v41511..41516 was stranded on HF Ville. `errored` is already
+    // handled by the early return above, so this is on the clean path.
+    let per_table_target = settled_ceiling_target(settled_ct_ceiling, last_seen, shadow_mode);
     if let Some(target_version) = per_table_target {
         match hotel_backend::sync::watermark::advance_per_table(pg, table, target_version).await {
             Err(err) => {
@@ -5439,12 +5590,21 @@ async fn fetch_ct_rows(
 
     let mut out: Vec<CtRow> = Vec::with_capacity(rows.len());
     for r in rows {
-        let version: i64 = r.get("sys_change_version").unwrap_or(0);
+        // Issue #283 audit: the two CT control columns used to be read
+        // with `.unwrap_or(0)` / `.unwrap_or("?")`. Both defaults are
+        // silent corruption — a 0 version drops the row out of
+        // `max_version`, and a "?" op falls through to the unknown-op
+        // branch. Neither is a state we can apply, and a batch we cannot
+        // fully trust must fail the whole fetch so `poll_table` returns
+        // `PollOutcome::failed()` and the watermark holds.
+        let version: i64 = tiberius::Row::try_get::<i64, _>(&r, "sys_change_version")
+            .map_err(|e| format!("{table}: unreadable SYS_CHANGE_VERSION: {e}"))?
+            .ok_or_else(|| format!("{table}: NULL SYS_CHANGE_VERSION in CT projection"))?;
         // SYS_CHANGE_OPERATION is always one of 'I' / 'U' / 'D' (single
         // char); tiberius surfaces it as `&str`.
-        let op_char: String = r
-            .get::<&str, _>("sys_change_operation")
-            .unwrap_or("?")
+        let op_char: String = tiberius::Row::try_get::<&str, _>(&r, "sys_change_operation")
+            .map_err(|e| format!("{table}: unreadable SYS_CHANGE_OPERATION: {e}"))?
+            .ok_or_else(|| format!("{table}: NULL SYS_CHANGE_OPERATION in CT projection"))?
             .to_string();
         out.push((version, op_char, materialise_row(&r, pk_cols, select_sql)));
     }
@@ -7423,8 +7583,16 @@ async fn bump_counters(
     Ok(())
 }
 
-/// Decide whether (and to what version) the CT watermark should advance
-/// at the end of a per-table tick.
+/// How far this table's CT read reached, for OBSERVABILITY only.
+///
+/// Issue #283 removed its last decision-making call site: `max_version`
+/// is the highest version a read HAPPENED to return and is NOT a safe
+/// watermark target (a lower version whose commit was in flight can be
+/// invisible to that same read). Watermark advances — global and
+/// per-table — now come exclusively from [`settled_ceiling_target`] /
+/// [`global_watermark_target`]. What remains here is the `from → applied_through`
+/// breadcrumb operators grep for, plus the `errored` short-circuit that
+/// suppresses it on a held tick.
 ///
 /// Returns `Some(target_version)` when the caller should advance, or
 /// `None` when the watermark must stay pinned at `last_seen` so the
@@ -7485,52 +7653,74 @@ fn next_watermark_after_tick(
 /// 30788 → 30801, and nothing ever re-read v30789. CT's 2-day retention
 /// aged it out. Nothing failed, so nothing was logged.
 ///
-/// The sampled ceiling is immune by construction: every table is polled
-/// at or after the sample instant, so it has read through at least that
-/// version, and anything landing mid-loop carries a HIGHER version and
-/// is picked up next tick. It is deliberately conservative — a tick may
-/// re-read a few rows it already applied, which is safe because
+/// ## The ceiling must be SETTLED, not merely sampled-first (issue #283)
+///
+/// This fn's contract changed on 2026-08-10. It used to claim the
+/// sampled ceiling was "immune by construction: every table is polled at
+/// or after the sample instant, so it has read through at least that
+/// version". That is FALSE outside a snapshot transaction and HF Ville
+/// proved it: tick `2026-08-05T07:20:06Z` sampled v41516, read
+/// `HT_Room_Status` 40ms later and saw nothing above v41510, and
+/// advanced 41503 → 41516 — permanently stranding `HT_Room_Status.id
+/// =4799`, whose commit was in flight across that window. `commit_ts` is
+/// assigned in commit order; visibility to a READ COMMITTED
+/// `CHANGETABLE` reader is not, so "polled later" implies nothing about
+/// "saw everything at or below".
+///
+/// `settled_ct_ceiling` is therefore NOT this tick's sample. It is one
+/// parked by [`CeilingGate`] on an earlier tick and released only after
+/// [`DEFAULT_CT_CEILING_SETTLE_MS`], so every read in this tick provably
+/// post-dates it by that margin. It stays deliberately conservative — a
+/// tick may re-read rows it already applied, which is safe because
 /// re-applying a CT row is idempotent across the mapper stack (the same
 /// assumption the per-table `errored` hold has always relied on).
 fn global_watermark_target(
-    tick_ct_ceiling: Option<i64>,
+    settled_ct_ceiling: Option<i64>,
     last_seen: i64,
     any_table_errored: bool,
 ) -> Option<i64> {
     if any_table_errored {
         return None;
     }
-    match tick_ct_ceiling {
+    match settled_ct_ceiling {
         Some(ceiling) if ceiling > last_seen => Some(ceiling),
         _ => None,
     }
 }
 
-/// Per-table watermark target for a table that polled successfully but
-/// found NO new CT rows (or found rows that produced no version
-/// progress). Both call sites are structurally on the non-errored path.
+/// The ONLY watermark target a per-table advance may use: a ceiling that
+/// has settled (see [`CeilingGate`]). Both call sites — the empty-fetch
+/// branch and the end-of-poll advance — are structurally on the
+/// non-errored path.
 ///
-/// Having queried `CHANGETABLE` after the ceiling was sampled and got
-/// nothing, the table has provably read through the ceiling — so it may
-/// move there. Without this, a permanently-quiet table only ever gets
-/// its `last_polled_at` touched: `last_seen_version` freezes while
-/// MSSQL's `CHANGE_TRACKING_MIN_VALID_VERSION` marches forward, and it
+/// Renamed from `quiet_table_watermark_target` by issue #283. It used to
+/// serve only the "polled and found nothing" case, with a table that DID
+/// see rows advancing to its own `max_version` instead. That second path
+/// is gone: `max_version` is the highest version a read HAPPENED to
+/// return, which says nothing about a lower version whose commit was
+/// still in flight during that same read — the exact skew that stranded
+/// four HF Ville calendar nights. See [`global_watermark_target`].
+///
+/// It also remains the anti-freeze rule it always was: without it a
+/// permanently-quiet table only ever gets its `last_polled_at` touched,
+/// `last_seen_version` freezes while MSSQL's
+/// `CHANGE_TRACKING_MIN_VALID_VERSION` marches forward, and it
 /// eventually trips the retention-overflow refusal having done nothing
 /// wrong. On HF Ville that is `HT_Cupon`, `HT_Deposit`,
 /// `HT_Bill_Debt_H`, `HT_Bill_Debt_Ds`, `HT_CheckIn_Product` and
 /// `HT_Receipt_H` — all 0 rows ingested since CT was enabled.
 ///
-/// Shadow mode never advances (nothing was applied), and a failed
-/// ceiling probe (`None`) simply defers to the next tick.
-fn quiet_table_watermark_target(
-    tick_ct_ceiling: Option<i64>,
+/// Shadow mode never advances (nothing was applied), and no settled
+/// ceiling yet (`None`) simply defers to the next tick.
+fn settled_ceiling_target(
+    settled_ct_ceiling: Option<i64>,
     last_seen: i64,
     shadow_mode: bool,
 ) -> Option<i64> {
     if shadow_mode {
         return None;
     }
-    match tick_ct_ceiling {
+    match settled_ct_ceiling {
         Some(ceiling) if ceiling > last_seen => Some(ceiling),
         _ => None,
     }
@@ -8126,7 +8316,7 @@ mod tests {
     #[test]
     fn quiet_table_advances_to_tick_ceiling() {
         assert_eq!(
-            quiet_table_watermark_target(Some(30801), 30788, false),
+            settled_ceiling_target(Some(30801), 30788, false),
             Some(30801),
             "a table that polled and found nothing must advance to the tick ceiling"
         );
@@ -8136,7 +8326,7 @@ mod tests {
     #[test]
     fn quiet_table_no_advance_without_progress() {
         assert_eq!(
-            quiet_table_watermark_target(Some(30788), 30788, false),
+            settled_ceiling_target(Some(30788), 30788, false),
             None
         );
     }
@@ -8147,7 +8337,7 @@ mod tests {
     #[test]
     fn quiet_table_never_advances_in_shadow_mode() {
         assert_eq!(
-            quiet_table_watermark_target(Some(30801), 30788, true),
+            settled_ceiling_target(Some(30801), 30788, true),
             None,
             "shadow mode rolls every TX back — advancing would consume unapplied changes"
         );
@@ -8156,7 +8346,250 @@ mod tests {
     /// Failed ceiling probe degrades to the old touch-only behaviour.
     #[test]
     fn quiet_table_holds_when_ceiling_probe_failed() {
-        assert_eq!(quiet_table_watermark_target(None, 30788, false), None);
+        assert_eq!(settled_ceiling_target(None, 30788, false), None);
+    }
+
+    // ========================================================================
+    // Issue #283 — CT ceiling settle gate.
+    //
+    // HF Ville lost four `HT_Room_Status` rows (ids 4692 / 4799 / 4815 /
+    // 4832, room 107) with the watermark CURRENT throughout and ZERO
+    // errors logged. The container logs rule out the connection-failure
+    // hypothesis outright: none of the six CT events for those rows is
+    // within 85 minutes of any `sync.ct_fetch_fail` /
+    // `sync.legacy_probe_fail` burst — during the real outages the
+    // `!errored` gating held the watermark exactly as designed and
+    // nothing was lost.
+    //
+    // What DID happen, from the tick at `2026-08-05T07:20:06Z`:
+    //
+    //   ceiling sampled  = 41516      (pre-loop, ~07:20:06.83)
+    //   HT_Room_Status   from=41503 applied_through=41510   (07:20:06.87)
+    //   watermark        41503 -> 41516                     (07:20:07.33)
+    //
+    // Legacy row 4798 (room 105) and 4799 (room 107) were written by ONE
+    // iHOTEL check-in save. 4798 reached canonical in that tick; 4799
+    // never did, and the range (41510, 41516] was never re-read, so it
+    // aged out of CT's 2-day retention. 4799's version therefore sat at
+    // or below the sampled ceiling while being INVISIBLE to a
+    // `CHANGETABLE` read taken 40ms later — the legacy DBs run
+    // `ALLOW_SNAPSHOT_ISOLATION OFF`, so nothing orders the version
+    // counter a probe reads against what a later READ COMMITTED reader
+    // can see.
+    //
+    // The gate makes the ceiling usable only after it has settled, so
+    // every read in the advancing tick provably post-dates it.
+    // ========================================================================
+
+    /// Baseline: a freshly-recorded ceiling is NOT an advance target.
+    /// This is the assertion that fails against the pre-fix code path,
+    /// where `run_one_tick` fed its own just-taken sample straight into
+    /// `global_watermark_target`.
+    #[test]
+    fn ceiling_gate_withholds_a_sample_younger_than_the_settle_window() {
+        let settle = Duration::from_millis(2000);
+        let t0 = Instant::now();
+        let mut gate = CeilingGate::default();
+        gate.record(41516, t0);
+        assert_eq!(
+            gate.take_settled(t0 + Duration::from_millis(40), settle),
+            None,
+            "a ceiling sampled 40ms ago cannot prove this tick's reads covered it"
+        );
+    }
+
+    /// Once the window has elapsed, the sample is released exactly once.
+    #[test]
+    fn ceiling_gate_releases_a_settled_sample_exactly_once() {
+        let settle = Duration::from_millis(2000);
+        let t0 = Instant::now();
+        let mut gate = CeilingGate::default();
+        gate.record(41516, t0);
+        assert_eq!(
+            gate.take_settled(t0 + Duration::from_millis(2000), settle),
+            Some(41516),
+            "settle window elapsed ⇒ every read in this tick post-dates the sample"
+        );
+        assert_eq!(
+            gate.take_settled(t0 + Duration::from_millis(9000), settle),
+            None,
+            "a consumed sample must not be handed out twice"
+        );
+    }
+
+    /// Anti-starvation: with a 1s poll interval and a 2s window the gate
+    /// is asked for a ceiling more often than one can mature. Recording
+    /// must NOT replace the maturing sample, or the watermark would
+    /// freeze forever and page a false `CT watermark STUCK`.
+    #[test]
+    fn ceiling_gate_keeps_the_older_sample_when_ticks_outpace_the_window() {
+        let settle = Duration::from_millis(2000);
+        let t0 = Instant::now();
+        let mut gate = CeilingGate::default();
+        gate.record(41500, t0);
+        for tick in 1..=3 {
+            let now = t0 + Duration::from_millis(500 * tick);
+            assert_eq!(gate.take_settled(now, settle), None);
+            gate.record(41500 + tick as i64, now);
+        }
+        assert_eq!(
+            gate.take_settled(t0 + Duration::from_millis(2000), settle),
+            Some(41500),
+            "the ORIGINAL sample must survive three fresher ones and then mature"
+        );
+    }
+
+    /// A failed `CHANGE_TRACKING_CURRENT_VERSION()` probe records
+    /// nothing, which must not disturb a sample already maturing.
+    #[test]
+    fn ceiling_gate_probe_failure_leaves_the_pending_sample_intact() {
+        let settle = Duration::from_millis(2000);
+        let t0 = Instant::now();
+        let mut gate = CeilingGate::default();
+        gate.record(41516, t0);
+        // (probe failure = no `record` call at all this tick)
+        assert_eq!(
+            gate.take_settled(t0 + Duration::from_millis(3000), settle),
+            Some(41516)
+        );
+    }
+
+    /// A fresh process has no proof about anything a pre-restart read
+    /// covered, so the first tick must advance nothing.
+    #[test]
+    fn ceiling_gate_advances_nothing_on_the_first_tick_after_restart() {
+        let mut gate = CeilingGate::default();
+        assert_eq!(
+            gate.take_settled(Instant::now(), Duration::from_millis(2000)),
+            None
+        );
+    }
+
+    /// THE regression test for issue #283 — replays the HF Ville tick
+    /// that stranded `HT_Room_Status.id=4799` (room 107, night
+    /// 2026-08-05), with the real version numbers from the container
+    /// log.
+    ///
+    /// Pre-fix, `global_watermark_target` received the ceiling sampled
+    /// 40ms earlier in the SAME tick and advanced 41503 → 41516,
+    /// consuming a range no `HT_Room_Status` read had covered (that read
+    /// topped out at 41510). Post-fix the same tick can only offer an
+    /// unsettled sample, so nothing advances and the next tick re-reads
+    /// from 41503 — by which time 4799's commit is long visible.
+    #[test]
+    fn issue_283_unsettled_ceiling_cannot_strand_hfville_room_107() {
+        const LAST_SEEN: i64 = 41503;
+        const CEILING: i64 = 41516;
+        const ROOM_STATUS_READ_MAX: i64 = 41510;
+        let settle = Duration::from_millis(2000);
+        let t_sample = Instant::now();
+        // Read happened 40ms after the sample, per the log timestamps.
+        let t_read = t_sample + Duration::from_millis(40);
+
+        // Pre-fix semantics, stated explicitly so the bug is legible:
+        // the sample alone was enough to consume 41511..=41516.
+        assert_eq!(
+            global_watermark_target(Some(CEILING), LAST_SEEN, false),
+            Some(CEILING),
+            "documents the pre-fix behaviour this test exists to prevent"
+        );
+        assert!(
+            ROOM_STATUS_READ_MAX < CEILING,
+            "the stranded range is (41510, 41516] — everything id=4799 could have been"
+        );
+
+        // Post-fix: the tick that took the sample cannot use it.
+        let mut gate = CeilingGate::default();
+        gate.record(CEILING, t_sample);
+        let settled = gate.take_settled(t_read, settle);
+        assert_eq!(settled, None, "same-tick sample must never be an advance target");
+        assert_eq!(
+            global_watermark_target(settled, LAST_SEEN, false),
+            None,
+            "no settled ceiling ⇒ watermark holds at 41503 ⇒ next tick re-reads \
+             (41503, ∞) and picks up id=4799 once its commit is visible"
+        );
+
+        // And the per-table path must reach the same verdict — it used
+        // to advance to the table's own `max_version` (41510), which
+        // strands exactly the same range.
+        assert_eq!(
+            settled_ceiling_target(settled, LAST_SEEN, false),
+            None,
+            "per-table advance must also hold, not jump to max_version=41510"
+        );
+    }
+
+    /// The healthy steady state must still make progress: a ceiling
+    /// carried over from an earlier tick advances both watermark paths.
+    #[test]
+    fn issue_283_settled_ceiling_still_advances_a_healthy_tick() {
+        let settle = Duration::from_millis(2000);
+        let t_sample = Instant::now();
+        let mut gate = CeilingGate::default();
+        gate.record(41516, t_sample);
+        let settled = gate.take_settled(t_sample + Duration::from_millis(2500), settle);
+        assert_eq!(settled, Some(41516));
+        assert_eq!(
+            global_watermark_target(settled, 41503, false),
+            Some(41516),
+            "the fix must not wedge a healthy watcher — progress is still made, one \
+             settle window behind"
+        );
+        assert_eq!(settled_ceiling_target(settled, 41503, false), Some(41516));
+    }
+
+    /// The settle gate is orthogonal to the `errored` hold: a settled
+    /// ceiling still must not be written when a table failed.
+    #[test]
+    fn issue_283_settled_ceiling_is_still_subject_to_the_errored_hold() {
+        assert_eq!(
+            global_watermark_target(Some(41516), 41503, true),
+            None,
+            "settle gate must not weaken the 2026-05-18 per-key failure hold"
+        );
+    }
+
+    /// Every un-dispatchable CT row in the tick path must hold the
+    /// watermark. The three sites that used to `skipped += 1; continue;`
+    /// without setting `errored` (two unknown-CT-op branches and the
+    /// unknown-aggregate-table arm) are the audit findings from #283.
+    ///
+    /// Source-scan, in the same spirit as
+    /// `every_tick_path_tracing_error_references_an_event_name`: the
+    /// branches live inside `poll_table`'s row loops and have no pure
+    /// seam of their own, so the invariant is asserted against the text.
+    #[test]
+    fn undispatchable_ct_rows_set_errored_in_the_tick_path() {
+        let source = include_str!("sync.rs");
+        let start = source
+            .find("async fn poll_table(")
+            .expect("poll_table must exist");
+        let end = source[start..]
+            .find("/// Build the CT polling query.")
+            .map(|i| start + i)
+            .unwrap_or(source.len());
+        let region = &source[start..end];
+
+        for marker in [
+            "\"Unknown CT operation code — holding watermark for retry\"",
+            "\"Unknown coalesced aggregate table — holding watermark for retry\"",
+        ] {
+            let mut searched = region;
+            let mut seen = 0usize;
+            while let Some(idx) = searched.find(marker) {
+                seen += 1;
+                let tail = &searched[idx + marker.len()..];
+                let window_end = tail.len().min(200);
+                assert!(
+                    tail[..window_end].contains("errored = true"),
+                    "un-dispatchable CT row at {marker} must set `errored = true` \
+                     so the watermark holds (issue #283 audit)"
+                );
+                searched = &searched[idx + marker.len()..];
+            }
+            assert!(seen > 0, "expected at least one occurrence of {marker}");
+        }
     }
 
     // ========================================================================
