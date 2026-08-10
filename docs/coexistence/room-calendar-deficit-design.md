@@ -1,5 +1,19 @@
 # `ht_room_calendar` night-deficit remediation design (issue #273 remainder)
 
+> **SUPERSEDED IN PART (2026-08-10, #282).** The count-based business-key
+> comparison this doc describes (`ROOM_CALENDAR_BUSINESS_KEY_PG_SQL`,
+> `fetch_calendar_business_key_pg`, the `WHERE rcal_legacy_id IS NOT NULL`
+> canonical scope) was replaced by a `(room_no, night)` **set-diff** that
+> classifies three populations — genuine `missing_pg` (records), class-A
+> surplus (#281, logged only), class-B stale back-pointer (converged +
+> healed behind `RECONCILE_CALENDAR_RESTAMP_ENABLED`). A COUNT plus a
+> min/max hash failed live in both directions: phantom surplus (Ville,
+> 2026-07-31) and phantom deficit (HF Hotel, 2026-08-04). The deficit
+> *measurement* below and the backfill bin remain valid; the detection
+> design does not. Current source of truth: the "Calendar closure arm"
+> section docs in `hotel-backend/src/scheduler/sync.rs` and
+> `scheduler/mirror_probe.rs`.
+
 Status: **design only, no code written**. Companion to the closure/detection work
 shipped in `60deef0` (business-key resolve + detection re-key, `observe_only: false`
 now sitting behind the still-`false` `RECONCILE_MIRROR_PROBE_ENABLED` flag).

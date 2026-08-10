@@ -37,7 +37,7 @@
 //!
 //! 1. Determines the legacy scan floor: the canonical `MIN(rcal_date)`
 //!    (auto-derived, same "never configured" contract as
-//!    `scheduler::sync::room_calendar_business_key_legacy_sql`'s era floor —
+//!    `scheduler::sync::room_calendar_pairs_legacy_sql`'s era floor —
 //!    though not the same SQL: [`CANONICAL_FLOOR_SQL`] is unfiltered, while
 //!    the probe's floor (issue #273, 2026-07-31) is `MIN` over MIRRORED rows
 //!    only, `WHERE rcal_legacy_id IS NOT NULL`. A detached formerly-mirrored
@@ -172,7 +172,7 @@ const CANONICAL_KEYS_SQL: &str = "SELECT r.room_no, c.rcal_date \
      JOIN ht_rooms_new r ON r.room_id = c.rcal_room_id";
 
 /// Auto-derived era floor — the same "never configured" contract as
-/// `scheduler::sync::room_calendar_business_key_legacy_sql`'s floor. `None`
+/// `scheduler::sync::room_calendar_pairs_legacy_sql`'s floor. `None`
 /// means the canonical calendar is currently empty (unfloored is then the
 /// correct behaviour — see `dedup_worklist_sql`'s doc).
 const CANONICAL_FLOOR_SQL: &str = "SELECT MIN(rcal_date) FROM ht_room_calendar";
@@ -357,7 +357,7 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Args {
 /// `floored = false` scans the whole legacy table on purpose — with an
 /// EMPTY canonical calendar, "legacy has N nights and we have none" IS the
 /// finding (same contract as
-/// `scheduler::sync::room_calendar_business_key_legacy_sql`).
+/// `scheduler::sync::room_calendar_pairs_legacy_sql`).
 fn dedup_worklist_sql(floored: bool) -> String {
     let floor_clause =
         if floored { " AND CAST(room_date AS DATE) >= CAST(@P1 AS DATE)" } else { "" };

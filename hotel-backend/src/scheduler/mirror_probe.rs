@@ -55,93 +55,95 @@
 //! was enabled. Unfloored it would open 302 (HF Hotel) + 36 (Ville) rows
 //! that can NEVER close. Floored it is exactly converged.
 //!
-//! ## `ht_room_calendar` — business-key DETECTION (issue #273 remainder)
+//! ## `ht_room_calendar` — `(room, night)` SET-DIFF detection (issues
+//! #273 / #282 / #281)
 //!
 //! It is in the probe set (it is a mirror in every sense that matters —
 //! `HT_Room_Status` copied per night) but its `MirrorProbe` entry's id-keyed
 //! shape (`rcal_legacy_id` vs `HT_Room_Status.id`) is NOT how it is detected:
 //! `run_mirror_probe` excludes `ht_room_calendar` from the generic id-keyed
 //! UNION-ALL batch and dispatches it to
-//! [`super::sync::probe_room_calendar_business_key`] instead, which compares
-//! the BUSINESS key `(room, night)` — the same key
-//! [`super::sync::compute_room_calendar_business_key_pg_hash`] /
-//! [`super::sync::compute_room_calendar_business_key_legacy_hash`] resolve
-//! on. `observe_only: false` on the registry entry — a genuine business-key
-//! divergence IS recorded.
+//! [`super::sync::probe_room_calendar_business_key`] instead, which set-diffs
+//! the BUSINESS key `(room_no, night)` — the same comparison
+//! [`super::sync::compute_room_calendar_deficit_hash`] resolves on.
+//! `observe_only: false` on the registry entry — a genuine deficit IS
+//! recorded.
 //!
-//! ### Why detection could not stay id-keyed once resolution moved
+//! ### Why detection could not stay id-keyed
 //!
-//! * `RoomCalendarMapper` UPSERTs on the BUSINESS key `(rcal_room_id,
-//!   rcal_date)` and explicitly documents `rcal_legacy_id` as "captured but
-//!   not the conflict target"; when iHOTEL's `MAX(id)+1` allocator rebinds an
-//!   id to a different (room, date) slot the mapper NULLs the old row's
-//!   `rcal_legacy_id` on purpose and NOTHING ever restores it. The mirror's
-//!   non-NULL id population is therefore structurally below the legacy row
-//!   count — an id-keyed diff reports every one of those as `missing_pg`
-//!   FOREVER, no matter what the business-key state is.
-//! * The closure arm (issue #273, first half) re-keyed RESOLUTION onto the
-//!   business key so a genuine gap could actually converge. Leaving
-//!   DETECTION on the old id key after that would have been worse than
-//!   useless: detection would open a row on the never-equal id gap, the
-//!   business-key resolve arm would close that SAME row the moment the
-//!   unrelated business-key counts happened to agree, and detection would
-//!   re-open it the very next tick — a record/resolve churn loop, forever.
-//!   [`resolve_pg_hash`] / [`resolve_legacy_hash`] (the GENERIC, id-keyed
-//!   resolve arms below) are therefore never reached for this probe's
-//!   `<aggregate>` row today: `compute_current_pg_hash` /
-//!   `compute_current_legacy_hash` in `scheduler::sync` dispatch the
-//!   business-key arm FIRST, ahead of the generic `probe_for_table` arm,
-//!   for exactly this key. They remain registered as a safety net for a
-//!   per-PK row a pre-#273 binary might have written (this probe is
-//!   `per_pk: false`, so detection itself can never produce one).
+//! `RoomCalendarMapper` UPSERTs on the BUSINESS key `(rcal_room_id,
+//! rcal_date)` and explicitly documents `rcal_legacy_id` as "captured but not
+//! the conflict target"; when iHOTEL's `MAX(id)+1` allocator rebinds an id to
+//! a different (room, date) slot the mapper NULLs the old row's
+//! `rcal_legacy_id` on purpose and NOTHING ever restores it. The mirror's
+//! non-NULL id population is therefore structurally below the legacy row
+//! count — an id-keyed diff reports every one of those as `missing_pg`
+//! FOREVER, no matter what the real state is. [`resolve_pg_hash`] /
+//! [`resolve_legacy_hash`] (the GENERIC, id-keyed resolve arms below) are
+//! never reached for this probe's `<aggregate>` row: `compute_current_pg_hash`
+//! / `compute_current_legacy_hash` in `scheduler::sync` dispatch the calendar
+//! arm FIRST, ahead of the generic `probe_for_table` arm, for exactly this
+//! key. They remain registered as a safety net for a per-PK row a pre-#273
+//! binary might have written (this probe is `per_pk: false`, so detection
+//! itself can never produce one).
+//!
+//! ### Why a COUNT could not work either (issue #282, 2026-08-04)
+//!
+//! The first fix scoped the canonical side of the count to
+//! `rcal_legacy_id IS NOT NULL` (2026-07-31), which stopped detached tiles
+//! reading as surplus. Enabling the arm at HF Hotel then fired `missing_pg`
+//! at legacy 4509 vs pg 4506 — and the three "missing" nights (room 405,
+//! 2026-05-11..13) were present on BOTH sides, correct status, correct
+//! check-in, carrying only a NULL back-pointer the count could not see.
+//! Reverted same day. The NULL-`rcal_legacy_id` population is TWO classes and
+//! drifts as the allocator rebinds ids:
+//!
+//! | class | legacy holds the slot? | this arm                       |
+//! |-------|------------------------|--------------------------------|
+//! | **A** | no — genuine surplus   | logged, NEVER recorded (#281)  |
+//! | **B** | yes, under another id  | converged, back-pointer healed |
+//!
+//! Room 405's week held both at once (`05-11..13` B, `05-14`/`05-15` A), so a
+//! COUNT plus min/max boundaries is structurally incapable of separating
+//! them. Detection therefore fetches BOTH pair sets (~4.7k pairs at HF Hotel,
+//! ~1.7k at Ville — the payment-ledger probe's order of magnitude) and diffs
+//! them in Rust. Live 2026-08-10: HF Hotel 3 class B / 137 class A, HF Ville
+//! 0 / 75, deficit ZERO at both sites.
 //!
 //! ### What "recorded" means here, honestly
 //!
-//! This change re-keys DETECTION and flips the flag; it does NOT ship a
-//! remediation/re-drive path for the underlying night gap (that remains a
-//! separate follow-on). A recorded calendar divergence behaves exactly like
-//! `guest_registry` or `payment_ledger_probe`'s `missing_pg` rows: real,
-//! actionable sync lag that no self-heal list touches (probe keys are in
-//! neither `FORCE_CONVERGE_VALUE_DRIFT_TABLES` nor
-//! `REINGEST_MISSING_PG_TABLES`), so it stays open, and `check_level_drift_and_alert`
-//! / `send_stale_level_digest` carry NO minimum-count threshold — past 72h
-//! the `:bangbang:` escalation tier WILL fire on it, same as any other
-//! genuine unremediated gap. That is the intended, honest outcome of
-//! detecting a real gap with no closure path yet — not a defect to route
-//! around with `observe_only` again. It will converge on its own the moment
-//! the business-key counts actually agree (a re-drive, or the gap closing by
-//! whatever means), exactly as `should_auto_resolve` already knows how to
-//! recognise (`room_calendar_business_key_row_closes_when_both_sides_agree`).
+//! ONLY a legacy-only pair records — a night iHOTEL has and canonical does
+//! not, the 2026-08-10 Ville class (4 `(107, night)` slots silently dropped,
+//! CT aged out past redelivery; `docs/coexistence/sync-incident-log.md`). It
+//! behaves exactly like `guest_registry` or `payment_ledger_probe`'s
+//! `missing_pg` rows: real, actionable sync lag that no self-heal list
+//! touches (probe keys are in neither `FORCE_CONVERGE_VALUE_DRIFT_TABLES` nor
+//! `REINGEST_MISSING_PG_TABLES`), so it stays open, and
+//! `check_level_drift_and_alert` / `send_stale_level_digest` carry NO
+//! minimum-count threshold — past 72h the `:bangbang:` escalation tier WILL
+//! fire on it. It converges on its own the moment canonical holds the missing
+//! nights again (a backfill, or a later CT event), which the sweep recognises
+//! by re-running the SAME classification.
 //!
-//! Live counts, 2026-07-28 — the numbers this arm will act on the first time
-//! it is enabled: id-keyed HF Hotel 1507 in-era legacy rows vs 1298 canonical
-//! (1302 vs 1071 at Ville); business-key HF Hotel 1546 legacy nights vs 1420
-//! canonical (a DIFFERENT, not-directly-comparable pair of numbers — see
-//! `room_calendar_detection_and_resolution_share_one_definition_of_converged`).
-//! Ville's business-key gap has not been independently measured; do not
-//! assume it equals the id-keyed 1302/1071 pair above.
+//! Canonical-only pairs are the deliberate blind spot: LOGGED with a count
+//! and a bounded sample, never recorded, because no re-drive can conjure a
+//! legacy night that is not there and the row would pin the digest and the
+//! escalation tier at both sites forever (that is what forced the 2026-07-31
+//! revert). Tracked as issue #281. Silence from this probe therefore means
+//! "no legacy night is missing", NOT "canonical is clean".
 //!
-//! ### Canonical side counts MIRRORED rows only (issue #273, 2026-07-31)
+//! ### The class-B heal arm (dark by default)
 //!
-//! The first live tick with the calendar arm enabled on Ville opened
-//! `missing_mssql` at legacy=1637 vs pg=1676 — a delta of exactly 39, the
-//! whole `rcal_legacy_id IS NULL` population. Those are DETACHED
-//! formerly-mirrored tiles, not rows a source never held: the mapper's
-//! id-reuse pre-clear (`sync/mappers/room_calendar.rs:185-192`) NULLs a
-//! row's `rcal_legacy_id` when iHOTEL's `MAX(id)+1` allocator rebinds the id
-//! onto a different `(room, night)` slot, so the OLD tile is left pointing
-//! at nothing while the legacy row it used to mirror moves away with the id.
-//! Genuine canonical surplus, and unclosable as detected, so the arm was
-//! reverted the same day. The canonical side of the business-key comparison
-//! is now scoped to `rcal_legacy_id IS NOT NULL` in the ONE shared fetch both
-//! detection and closure read (`sync::fetch_calendar_business_key_pg` /
-//! `sync::ROOM_CALENDAR_BUSINESS_KEY_PG_SQL`), which converges both sites
-//! (Ville 1637/1637, HF Hotel 4,542/4,542). This is a deliberate stop-gap,
-//! not a permanent classification: nothing reads `ht_room_calendar` yet, and
-//! the excluded detached-tile surplus is tracked as issue #281 rather than
-//! silently dropped. Full reasoning, including why a NULL-id row cannot in
-//! practice shadow a live legacy night, is in that module's "Calendar
-//! closure arm" section header.
+//! A class-B tile is converged but its back-pointer is stale, so
+//! `run_mirror_probe` follows detection with
+//! [`super::sync::restamp_room_calendar_backpointers`], which re-stamps
+//! `rcal_legacy_id` from the legacy `MIN(id)` on that slot — exactly what the
+//! mapper's `ON CONFLICT … DO UPDATE` would write on the next genuine edit —
+//! guarded so it can never violate `ux_ht_room_calendar_legacy_id`. It is a
+//! canonical-only write, dark behind `RECONCILE_CALENDAR_RESTAMP_ENABLED`,
+//! and it lives in the ORCHESTRATOR rather than inside the probe (detection
+//! stays a read-only auditor) or inside the auto-resolve sweep (which never
+//! sees these tiles — they open no reconcile row).
 //!
 //! ### The 8 `legacy_mirror.*` probes carry no equivalent exposure
 //!
@@ -157,8 +159,11 @@
 //! row there (legacy row deleted, `D` event never applied) is genuine
 //! `missing_mssql`, not a structural artefact — it is exactly what the probe
 //! should report. The forward-looking rule this leaves behind: any probed
-//! mirror whose canonical row can LOSE its legacy pointer (detach) needs
-//! mirrored-rows-only scoping before `observe_only` comes off.
+//! mirror whose canonical row can LOSE its legacy pointer (detach) must be
+//! compared on its BUSINESS key as a set-diff, never as a count over the
+//! bound population — a count cannot tell "detached and gone" from "detached
+//! but still there", and both readings of it have now failed live (surplus at
+//! Ville 2026-07-31, deficit at HF Hotel 2026-08-04).
 //!
 //! ## What gets recorded
 //!
@@ -427,22 +432,24 @@ pub(crate) const MIRROR_PROBES: &[MirrorProbe] = &[
         legacy_pk_col: "id",
         mirror_pk_col: "rcal_legacy_id",
         sum_col: None,
-        // App-authored calendar tiles have no legacy counterpart at all
-        // (122 of 1420 rows at HF Hotel on 2026-07-28); counting them would
-        // manufacture permanent `missing_mssql`.
+        // NOT "app-authored" tiles — no app path writes `ht_room_calendar` at
+        // all (issue #281 verified: the CT mapper and `backfill_room_calendar`
+        // are its only writers, both stamping legacy ids). Every NULL-id tile
+        // is a DETACHED formerly-mirrored one, and counting them on the
+        // canonical side of an id-keyed aggregate would manufacture permanent
+        // `missing_mssql`.
         mirror_filter: Some("rcal_legacy_id IS NOT NULL"),
         numeric_pk: true,
         // Aggregate-only — see the module docs. The legacy id is NOT the
         // mapper's conflict target and is deliberately NULLed on rebind.
         per_pk: false,
-        // Issue #273 (remainder): DETECTION is re-keyed off this id-keyed
-        // shape entirely — `run_mirror_probe` skips `ht_room_calendar` in
-        // the generic UNION-ALL batch below and dispatches it to
-        // `sync::probe_room_calendar_business_key` instead, which compares
-        // the same `(room, night)` business key the closure arm
-        // (`sync::compute_room_calendar_business_key_{pg,legacy}_hash`)
-        // resolves on. `observe_only: false` — a genuine business-key
-        // divergence now IS recorded.
+        // Issues #273/#282: DETECTION is re-keyed off this id-keyed shape
+        // entirely — `run_mirror_probe` skips `ht_room_calendar` in the
+        // generic UNION-ALL batch below and dispatches it to
+        // `sync::probe_room_calendar_business_key` instead, which SET-DIFFS
+        // the `(room_no, night)` business key the closure arm
+        // (`sync::compute_room_calendar_deficit_hash`) resolves on.
+        // `observe_only: false` — a genuine deficit IS recorded.
         //
         // The id-keyed fields above (`legacy_pk_col`, `mirror_pk_col`,
         // `mirror_filter`) stay as documentation of the shape this probe
@@ -452,10 +459,10 @@ pub(crate) const MIRROR_PROBES: &[MirrorProbe] = &[
         // aggregate is never-equal by construction (nothing restores a
         // `rcal_legacy_id` NULLed on an allocator rebind), which is exactly
         // why detection had to move off it. `observe_only` was `true` while
-        // that gap made every recorded row unclosable; the flip is safe now
-        // because DETECTION and the closure arm's RESOLUTION agree on one
-        // definition of "converged" (issue #273; the pairing is pinned by
-        // `room_calendar_detection_is_no_longer_observe_only`).
+        // that gap made every recorded row unclosable; it is safe off because
+        // DETECTION and RESOLUTION now run the same classification (pinned by
+        // `room_calendar_detection_is_no_longer_observe_only` and by
+        // `room_calendar_detection_and_resolution_share_one_definition_of_converged`).
         observe_only: false,
     },
 ];
@@ -772,6 +779,10 @@ pub(crate) struct MirrorProbeOutcome {
     pub(crate) recorded: usize,
     /// Observe-only probes that mismatched and were logged, not recorded.
     pub(crate) observed: usize,
+    /// Calendar back-pointers re-stamped by the class-B heal arm — the ONLY
+    /// canonical rows this tick wrote, and 0 while
+    /// `RECONCILE_CALENDAR_RESTAMP_ENABLED` is off (the shipped default).
+    pub(crate) restamped: usize,
     /// Wall time of the whole tick.
     pub(crate) duration_ms: i32,
 }
@@ -983,20 +994,36 @@ pub(crate) async fn run_mirror_probe(
         );
     }
 
-    // ── `ht_room_calendar`, business-key detection (issue #273) ───────
-    // Excluded from the batch above; runs its own two-query comparison
-    // (see `super::sync::probe_room_calendar_business_key`). A failure here
-    // is scoped to this ONE probe, same isolation contract as a per-key scan
+    // ── `ht_room_calendar`, `(room, night)` set-diff (issues #273/#282) ─
+    // Excluded from the batch above; runs its own comparison (see
+    // `super::sync::probe_room_calendar_business_key`). A failure here is
+    // scoped to this ONE probe, same isolation contract as a per-key scan
     // failure above: collected into `failed` and the tick still fails at the
     // end so `record_error` fires, but every other probe was still measured.
+    let mut restamped = 0usize;
     match super::sync::probe_room_calendar_business_key(legacy_pool, pg_pool).await {
-        Ok(super::sync::RoomCalendarProbeOutcome::Converged) => converged += 1,
-        Ok(super::sync::RoomCalendarProbeOutcome::Diverged) => recorded += 1,
+        Ok(report) => {
+            match report.outcome {
+                super::sync::RoomCalendarProbeOutcome::Converged => converged += 1,
+                super::sync::RoomCalendarProbeOutcome::Diverged => recorded += 1,
+            }
+            // The class-B HEAL arm, invoked HERE rather than inside the probe:
+            // detection stays a read-only auditor, and a class-B tile is
+            // CONVERGED (it opens no `ht_reconcile_log` row), so the
+            // auto-resolve sweep — where every other self-heal lives — can
+            // never see it. Dark by default behind
+            // `RECONCILE_CALENDAR_RESTAMP_ENABLED`; a failed re-stamp is
+            // per-candidate and never fails the tick.
+            restamped =
+                super::sync::restamp_room_calendar_backpointers(pg_pool, &report.restamp)
+                    .await
+                    .restamped;
+        }
         Err(e) => {
             tracing::warn!(
                 probe = super::sync::ROOM_CALENDAR_PROBE_KEY,
                 error = %e,
-                "[Sync] Mirror probe: calendar business-key probe failed — this \
+                "[Sync] Mirror probe: calendar set-diff probe failed — this \
                  probe is unmeasured this tick, the remaining probes still ran"
             );
             failed.push(super::sync::ROOM_CALENDAR_PROBE_KEY);
@@ -1005,11 +1032,12 @@ pub(crate) async fn run_mirror_probe(
 
     let duration_ms = start.elapsed().as_millis() as i32;
     tracing::info!(
-        // +1: the calendar business-key probe runs outside `probes` above.
+        // +1: the calendar set-diff probe runs outside `probes` above.
         probes = probes.len() + 1,
         converged,
         recorded,
         observed,
+        restamped,
         failed = failed.len(),
         duration_ms,
         "[Sync] Mirror probe complete"
@@ -1033,6 +1061,7 @@ pub(crate) async fn run_mirror_probe(
         converged,
         recorded,
         observed,
+        restamped,
         duration_ms,
     })
 }
@@ -1650,8 +1679,47 @@ mod tests {
         assert!(
             body.contains("super::sync::probe_room_calendar_business_key(legacy_pool, pg_pool)"),
             "run_mirror_probe must dispatch ht_room_calendar to the dedicated \
-             business-key probe — the one the closure arm's resolve already uses"
+             set-diff probe — the one the closure arm's resolve already uses"
         );
+    }
+
+    /// Issue #282 — WHERE the class-B heal lives. Detection must stay a
+    /// read-only auditor, and a class-B tile opens no `ht_reconcile_log` row
+    /// (it is converged), so the auto-resolve sweep can never reach it: the
+    /// re-stamp therefore runs from the ORCHESTRATOR, after the probe returns
+    /// its candidates. If it ever migrates into the probe, the probe stops
+    /// being safe to call from the resolve path.
+    #[test]
+    fn the_class_b_heal_runs_from_the_orchestrator_not_from_detection() {
+        let src = include_str!("mirror_probe.rs");
+        let start = src
+            .find("pub(crate) async fn run_mirror_probe(")
+            .expect("run_mirror_probe must exist");
+        let body = &src[start..];
+        assert!(
+            body.contains("super::sync::restamp_room_calendar_backpointers(pg_pool, &report.restamp)"),
+            "run_mirror_probe must invoke the class-B heal arm with the \
+             candidates detection observed"
+        );
+
+        let sync_src = include_str!("sync.rs");
+        let probe_at = sync_src
+            .find("pub(crate) async fn probe_room_calendar_business_key(")
+            .expect("the calendar probe must exist");
+        let rest = &sync_src[probe_at..];
+        let probe_body = &rest[..rest.find("\n}\n").map(|i| i + 3).unwrap_or(rest.len())];
+        assert!(
+            !probe_body.contains("restamp_room_calendar_backpointers("),
+            "detection must not call the heal arm — it is a read-only auditor \
+             and is re-run by the auto-resolve sweep's resolve path"
+        );
+        for write in ["UPDATE ", "INSERT ", "DELETE "] {
+            assert!(
+                !probe_body.contains(write),
+                "detection must issue no canonical write (`{write}` found in \
+                 probe_room_calendar_business_key)"
+            );
+        }
     }
 
     /// Exactly the tables that carry a charge total get a SUM. The plan

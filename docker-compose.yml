@@ -409,31 +409,30 @@ services:
       # mirror and can never converge. Floored, 8 of the 9 probes are
       # EXACTLY converged at both sites today (2026-07-28, read-only).
       #
-      # STAYS FALSE AT HF HOTEL: the calendar business-key arm reports false
-      # `missing_pg`. Enabled 2026-08-04, fired on the first tick (legacy
-      # 4509 vs pg 4506), reverted the same day — see issue #282.
+      # FALSE PENDING DEPLOY-THEN-FLIP (#282, fixed in code 2026-08-10): the
+      # calendar arm is now a real (room, night) SET-DIFF that classifies
+      # genuine missing_pg (records) vs class-A surplus (#281, logged only)
+      # vs class-B stale back-pointer (converged + healable). The old COUNT
+      # comparison failed live in both directions (phantom surplus at Ville
+      # 2026-07-31; phantom deficit at HF Hotel 2026-08-04 — room 405 nights
+      # 05-11..13, present both sides, only the back-pointer NULL).
       #
-      # The canonical side counts `WHERE rcal_legacy_id IS NOT NULL`, which
-      # was added to stop the CT mapper's id-reuse pre-clear presenting
-      # detached tiles as canonical SURPLUS (the same-day revert at Ville).
-      # That assumed every NULL-id tile has no legacy counterpart. It does
-      # not. The population splits two ways:
-      #   A. legacy row genuinely gone  -> real surplus, correctly excluded
-      #   B. legacy row still there under a REBOUND id -> excluding it
-      #      manufactures a false deficit
-      # The live case was room 405, nights 2026-05-11..13: present in
-      # canonical (rcal_id 48/49/50, status เข้าพัก, cin_id 222), present in
-      # legacy, missing ONLY the back-pointer. Set-diffed to exactly those
-      # 3 pairs with nothing in the other direction — zero genuine gaps.
-      #
-      # A COUNT + min/max hash cannot separate A from B, and the population
-      # DRIFTS as iHOTEL's MAX+1 allocator rebinds ids — which is why both
-      # sites read converged when the scoping landed (Ville 1637/1637, HF
-      # Hotel 4,542/4,542) and HF Hotel does not now. The arm needs a real
-      # set-diff on (room, night) that classifies both populations before it
-      # can be trusted at either site; Ville reads 9/9 today only because it
-      # currently happens to hold no class-B tiles.
+      # FLIP CHECKLIST (in order — flipping early re-mints the 08-04 false
+      # positive from the old binary still running):
+      #   1. this image deployed AND backend-1 restarted on it
+      #   2. re-run the classification read-only (drifts with room-move
+      #      traffic; 2026-08-10 reading: 0 deficit both sites, 3 class-B
+      #      at HF Hotel, 137/75 class-A)
+      #   3. flip here to :-true, expect probes=9 converged=9
       - RECONCILE_MIRROR_PROBE_ENABLED=${RECONCILE_MIRROR_PROBE_ENABLED:-false}
+      # #282 class-B heal: re-stamps rcal_legacy_id on tiles whose (room,
+      # night) still exists in legacy under a rebound id. Canonical-only
+      # UPDATE, per-tick cap 100, cannot violate the partial unique index.
+      # First live test belongs at HF HOTEL (3 fully-predicted writes:
+      # rcal_id 48/49/50 <- legacy 50980/50981/50982), not Ville (0
+      # candidates = proves nothing). No reception coordination needed —
+      # no legacy traffic.
+      - RECONCILE_CALENDAR_RESTAMP_ENABLED=${RECONCILE_CALENDAR_RESTAMP_ENABLED:-false}
       # Phase 6-D — payment-ledger probe: legacy HT_CheckIn_Pay vs canonical
       # ht_payment_ledger, compared per FOLIO (Cin_No) on line count +
       # itemized amount + receipt-deduped ACTIVE tender. The folio is the
@@ -778,6 +777,7 @@ services:
       # never read differently. Ships DARK; see the backend service for the
       # rollout and for what the first enabled tick is expected to say.
       - RECONCILE_MIRROR_PROBE_ENABLED=${RECONCILE_MIRROR_PROBE_ENABLED:-false}
+      - RECONCILE_CALENDAR_RESTAMP_ENABLED=${RECONCILE_CALENDAR_RESTAMP_ENABLED:-false}
       # Phase 6-D payment-ledger probe — INERT in this process for the same
       # reason as the knobs above (only a process that runs a reconcile reads
       # it, and this HF Hotel sync worker leaves WORKER_RECONCILE_ENABLED at
@@ -1000,6 +1000,9 @@ services:
       # probe silence means "mirrored state matches legacy", not "canonical
       # is clean".
       - RECONCILE_MIRROR_PROBE_ENABLED=${HFVILLE_RECONCILE_MIRROR_PROBE_ENABLED:-true}
+      # #282 class-B heal — dark. Ville has 0 candidates today; first live
+      # test belongs at HF Hotel (see the backend block's checklist).
+      - RECONCILE_CALENDAR_RESTAMP_ENABLED=${HFVILLE_RECONCILE_CALENDAR_RESTAMP_ENABLED:-false}
       # Phase 6-D — payment-ledger per-folio probe (HT_CheckIn_Pay ↔
       # ht_payment_ledger). DETECTION ONLY; writes nothing but
       # ht_reconcile_log — no ack cache and no new PG table. This worker runs

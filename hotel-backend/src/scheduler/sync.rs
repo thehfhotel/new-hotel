@@ -63,7 +63,7 @@
 use chrono::{NaiveDate, NaiveDateTime};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::time::Instant;
 
@@ -369,13 +369,14 @@ pub async fn run_sync(
     if reconcile_mirror_probe_enabled() {
         match crate::scheduler::mirror_probe::run_mirror_probe(legacy_pool, pg_pool).await {
             Ok(outcome) => {
-                // added=0 (the probe writes no canonical rows),
+                // added=`restamped` (the calendar class-B heal arm is the only
+                //   canonical write the probe makes; 0 while its flag is off),
                 // updated=`recorded` (divergence rows written this tick),
                 // unchanged=`converged` (probes whose aggregates agreed).
                 record_success(
                     pg_pool,
                     "mirror_probe",
-                    0,
+                    outcome.restamped as i32,
                     outcome.recorded as i32,
                     outcome.converged as i32,
                     outcome.duration_ms,
@@ -3420,17 +3421,19 @@ pub(crate) const RECONCILE_RESOLVABLE_TABLES: &[&str] = &[
     "mirror_ht_bill_debt_ds",
     "mirror_ht_rooms_cancel",
     "mirror_ht_book_pro",
-    // Issue #273 (remainder): DETECTION is re-keyed off `rcal_legacy_id`
-    // onto the BUSINESS key `(room, night)` — see
-    // `probe_room_calendar_business_key` — the SAME key RESOLUTION
-    // (`compute_room_calendar_business_key_{pg,legacy}_hash`) already
-    // resolves on since the closure arm. The two can no longer disagree
-    // about "converged", which is what makes recording safe: a row this
-    // arm opens measures a gap a re-drive CAN close, not an id-binding
-    // artefact that nothing can. No remediation/re-drive path ships in
-    // this change — a recorded row stays open (real sync lag, same as
-    // `guest_registry` / `payment_ledger_probe`) until one does. Pinned by
-    // `ROOM_CALENDAR_PROBE_KEY`; see the closure-arm section.
+    // Issues #273/#282: DETECTION is keyed off `rcal_legacy_id` entirely
+    // and SET-DIFFS the business key `(room_no, night)` — see
+    // `probe_room_calendar_business_key` — running the SAME
+    // `compare_room_calendar_pairs` classification RESOLUTION uses
+    // (`compute_room_calendar_deficit_hash` / `room_calendar_converged_hash`).
+    // The two can no longer disagree about "converged", which is what makes
+    // recording safe: a row this arm opens measures a night a re-drive CAN
+    // land, not an id-binding artefact that nothing can. Canonical surplus
+    // is deliberately NOT recorded (issue #281 owns it). No remediation
+    // ships here — a recorded row stays open (real sync lag, same as
+    // `guest_registry` / `payment_ledger_probe`) until a backfill lands the
+    // nights. Pinned by `ROOM_CALENDAR_PROBE_KEY`; see the calendar-arm
+    // section.
     "mirror_ht_room_calendar",
     // Phase 6-D payment-ledger probe. Same population as the 6-C probes (not
     // an entity contract — `mirror_payment_ledger` DELETEs the folio and
@@ -3549,20 +3552,23 @@ async fn compute_current_pg_hash(
                 .as_ref()
                 .map(guest_registry_canonical_hash))
         }
-        // Issue #273 — the calendar's `<aggregate>` row resolves on the
-        // BUSINESS key `(room, night)`. Deliberately AHEAD of the generic
-        // probe arm below: that arm recomputes the `rcal_legacy_id`-keyed
+        // Issues #273/#282 — the calendar's `<aggregate>` row resolves on a
+        // `(room, night)` SET-DIFF. Deliberately AHEAD of the generic probe
+        // arm below: that arm recomputes the `rcal_legacy_id`-keyed
         // aggregate, which is never-equal by construction (the mapper NULLs
         // the id on an allocator rebind and nothing restores it), so a
         // calendar row dispatched there could never converge. Per-PK calendar
         // rows — which the probe cannot produce, it is `per_pk: false` — fall
         // through to the generic arm unchanged.
+        //
+        // No query: the canonical side's contribution to a set-diff is "no
+        // legacy night is missing from canonical" (`room_calendar_converged_hash`)
+        // and the comparison that can decide that lives in the LEGACY arm,
+        // which holds both pools. See the calendar-arm section docs.
         t if t == ROOM_CALENDAR_PROBE_KEY
             && legacy_pk == crate::scheduler::mirror_probe::MIRROR_AGGREGATE_PK =>
         {
-            Ok(Some(
-                compute_room_calendar_business_key_pg_hash(pg_pool).await?,
-            ))
+            Ok(Some(room_calendar_converged_hash()))
         }
         // Phase 6-C. `legacy_pk` is either a real mirrored key or the
         // `<aggregate>` sentinel. Never `Ok(None)` for a registered probe:
@@ -3641,16 +3647,17 @@ async fn compute_current_legacy_hash(
         "rooms" => fetch_legacy_room_hash(legacy_pool, legacy_pk).await,
         "payments" => fetch_legacy_payment_hash(legacy_pool, legacy_pk).await,
         "guest_registry" => fetch_legacy_registry_folio_hash(legacy_pool, legacy_pk).await,
-        // Issue #273 — calendar business-key arm. Sibling of the
+        // Issues #273/#282 — calendar set-diff arm. Sibling of the
         // `compute_current_pg_hash` arm and ordered ahead of the generic
         // probe arm for the same reason (the id-keyed aggregate is
-        // never-equal by construction). Reads `pg_pool` for the era floor:
-        // the coverage boundary is a `MIN(rcal_date)` over the MIRROR.
+        // never-equal by construction). This is the side that runs the whole
+        // comparison: it reads `pg_pool` for the era floor AND for the
+        // canonical pair set, and hashes what is still missing.
         t if t == ROOM_CALENDAR_PROBE_KEY
             && legacy_pk == crate::scheduler::mirror_probe::MIRROR_AGGREGATE_PK =>
         {
             Ok(Some(
-                compute_room_calendar_business_key_legacy_hash(legacy_pool, pg_pool).await?,
+                compute_room_calendar_deficit_hash(legacy_pool, pg_pool).await?,
             ))
         }
         // Phase 6-C — mirror probes. Sibling of the `compute_current_pg_hash`
@@ -3932,121 +3939,124 @@ async fn fetch_legacy_registry_folio_hash(
 }
 
 // =============================================================================
-// Calendar closure arm (issue #273) — business-key resolve for
+// Calendar arm (issues #273 / #282 / #281) — `(room, night)` SET-DIFF for
 // `mirror_ht_room_calendar`
 // =============================================================================
 //
-// ## What was broken
+// ## Why this cannot be a count comparison
 //
-// Phase 6-C shipped the generic mirror probe over `ht_room_calendar` and
-// dispatched its resolve through `mirror_probe::resolve_{pg,legacy}_hash`,
-// like every sibling. For this ONE table that dispatch can never converge:
-// the generic resolve is keyed on `rcal_legacy_id`, and `RoomCalendarMapper`
-// deliberately NULLs that column whenever iHOTEL's `MAX(id)+1` allocator
-// rebinds an id onto a different `(room, night)` slot. Nothing restores it,
-// so the mirror's non-NULL id population is STRUCTURALLY below the legacy row
-// count and the two aggregates are never-equal by construction. A calendar
-// row reaching that arm would sit open forever no matter what an operator
-// did — detection with no possible closure, which is why the probe shipped
-// `observe_only`.
+// `HT_Room_Status` is mirrored into `ht_room_calendar` one row per night. The
+// mapper UPSERTs on the BUSINESS key `(rcal_room_id, rcal_date)` and captures
+// `HT_Room_Status.id` in `rcal_legacy_id` as a back-pointer that is
+// deliberately NOT the conflict target: when iHOTEL's `MAX(id)+1` allocator
+// rebinds an id onto a different slot, the mapper's id-reuse pre-clear
+// (`sync/mappers/room_calendar.rs:185-192`) NULLs the pointer on whichever
+// canonical row still held it, and nothing restores it.
 //
-// ## What this arm changes
+// Two live ticks proved that COUNTing that population cannot decide
+// convergence:
 //
-// The `<aggregate>` row now resolves on the BUSINESS key `(room, night)` —
-// the same key the mapper UPSERTs on — so the comparison measures the gap
-// that a re-drive can actually close, instead of an id-binding artefact that
-// nothing can. Canonical is UNIQUE on `(rcal_room_id, rcal_date)`, so its
-// `COUNT(*)` IS a distinct-night count; the legacy side must therefore count
-// DISTINCT `(room_no, night)` pairs, because `HT_Room_Status` carries no such
-// constraint and the app-side allocator can and does duplicate them.
+// * **2026-08-04, HF Hotel — issue #282, a FALSE positive.** The arm was
+//   enabled (`6add0e9`) and fired on the first tick: `missing_pg`, legacy
+//   4509 vs pg 4506, window 2025-04-13 .. 2026-08-05. Set-diffing the pairs
+//   resolved the delta to exactly three slots — room 405, nights 2026-05-11,
+//   -12, -13 — present on BOTH sides with the right status and the right
+//   check-in (222), carrying only `rcal_legacy_id IS NULL`. The canonical
+//   count said `WHERE rcal_legacy_id IS NOT NULL`, so it could not see them.
+//   Zero genuine gaps; reverted the same day (`36827dd`).
+// * **2026-08-10, HF Ville — a TRUE positive.** `missing_pg`, legacy 1663 vs
+//   pg 1659. Four `(107, night)` slots (2026-07-28, 08-05, 08-06, 08-08) were
+//   absent from `ht_room_calendar` ENTIRELY — a selective silent drop whose CT
+//   versions had already aged past `CHANGE_TRACKING_MIN_VALID_VERSION`, so no
+//   tick could ever redeliver them
+//   (`docs/coexistence/sync-incident-log.md`). THIS class must keep firing.
 //
-// ## The canonical side counts MIRRORED rows only (issue #273, 2026-07-31)
+// One number cannot separate those, because the NULL-`rcal_legacy_id`
+// population splits in two and DRIFTS as the allocator rebinds ids:
 //
-// The first cut of this arm counted EVERY canonical row, reasoning that a
-// tile whose id the mapper NULLed still occupies a `(room, night)` slot
-// legacy also has, so excluding it would re-introduce the structural
-// undercount the business key exists to dodge. Live evidence inverted that.
-// The first tick after detection was enabled on HF Ville opened
-// `mirror_ht_room_calendar` as `missing_mssql` with legacy=1637 vs pg=1676 —
-// a gap of exactly 39, which is Ville's ENTIRE `rcal_legacy_id IS NULL`
-// population (nights 2026-05-18 → 2026-07-27) and precisely the set
-// `backfill_room_calendar` deliberately leaves alone because it has no
-// legacy counterpart. That row was unclosable by construction: no re-drive
-// can conjure legacy nights that were never there. Detection with no
-// possible remediation is the exact defect this issue exists to prevent, so
-// the arm was reverted the same day (`66bac3a`).
+// | class | does legacy hold the slot? | what it means                       | this arm                |
+// |-------|----------------------------|-------------------------------------|-------------------------|
+// | **A** | no                         | genuine canonical surplus (#281)    | logged, NEVER recorded  |
+// | **B** | yes, under a rebound id    | only the back-pointer is stale      | converged + re-stamped  |
 //
-// A mirror probe compares MIRRORED state against its source. These NULL-id
-// rows are not local-only state a source never held — the source DID hold
-// them; the mapper's id-reuse pre-clear (`sync/mappers/room_calendar.rs:185-
-// 192`) detaches the pointer when iHOTEL moves or re-dates the row, and the
-// legacy row leaves with it. Excluding them from the comparison is a
-// deliberate stop-gap, not a claim that they are clean: nothing reads
-// `ht_room_calendar` yet, and the excluded detached-tile surplus is tracked
-// as issue #281 rather than silently dropped. So the canonical side is now
-// `WHERE rcal_legacy_id IS NOT NULL`, and the count identity closes at both
-// sites — the coherent instant from
-// `docs/coexistence/room-calendar-deficit-design.md` (`66bac3a`): Ville 1637
-// legacy vs 1637 mirrored (1676 − 39), HF Hotel 4,542 legacy vs 4,542
-// mirrored (4,666 − 124). Counts drift with live traffic, not just at this
-// snapshot: each iHOTEL room-move detaches one more tile (mirrored −1,
-// surplus +1) while legacy loses that same slot, so the identity is
-// preserved through the move, not coincidental to one measurement instant.
-// Probe silence therefore means "mirrored state matches legacy", not
-// "canonical is clean" — the detached-tile surplus keeps accumulating
-// outside the comparison until #281 lands.
+// Room 405's week carried both at once on 2026-08-04 (`05-11..13` class B,
+// `05-14`/`05-15` class A), which is why the unit fixture is modelled on it.
+// Live re-measurement 2026-08-10: HF Hotel 3 class B / 137 class A, HF Ville
+// 0 class B / 75 class A, deficit ZERO at both sites.
 //
-// Why the original worry does not bite: a NULL-id row whose `(room, night)`
-// legacy STILL holds is arithmetically excluded by the live numbers — if any
-// of Ville's 39 had a legacy counterpart, legacy's in-era distinct-night
-// count would have to be at least 1676, not 1637. In practice a NULL id
-// marks a tile legacy no longer has: the `MAX(id)+1` allocator rebound the
-// id onto a different slot (the pre-clear above NULLs the old row) and the
-// legacy row behind the old slot is gone, or its `D` event arrived after
-// that pre-clear had already erased the pointer `RoomCalendarMapper`'s
-// delete-by-`rcal_legacy_id` needs.
+// ## What this arm compares
 //
-// Residual, recorded honestly: if such a row ever DID coincide with a live
-// legacy night it reads as a one-night `missing_pg` that
-// `backfill_room_calendar` cannot repair — its canonical-key set is
-// deliberately unfiltered, so it sees the slot as already present. The
-// closure path in that case is the mapper itself: any subsequent genuine
-// `HT_Room_Status` edit to that night re-stamps `rcal_legacy_id` through
-// `ON CONFLICT (rcal_room_id, rcal_date) DO UPDATE`. A bounded, self-healing
-// one-row gap — versus the pre-fix alternative of a permanent unclosable row
-// at both sites.
+// The full `(room_no, night)` SET on each side, inside the mirror's own era:
 //
-// The exclusion is a table-level `WHERE`, never a `FILTER` clause on the
-// count alone: `MIN`/`MAX(rcal_date)` must move with it. `MIN` IS the era
-// floor pushed into the legacy scan, so a local-only tile earlier than any
-// mirrored night would drag legacy history into a window the mirror never
-// covered; a local-only tile beyond the mirrored `MAX` would likewise shift
-// a boundary the source cannot match.
+// * canonical — EVERY tile, joined to `ht_rooms_new` for its `room_no`, with
+//   NO `rcal_legacy_id` filter (that filter IS the #282 bug), carrying the
+//   back-pointer's nullability per pair. `room_no` matching is EXACT, the
+//   same rule `sync::resolve::resolve_room_id` uses (`room_no = $1`) — a
+//   `TRIM`/`LOWER` here would make the classifier disagree with the mapper
+//   about which slot a legacy row belongs to;
+// * legacy — `HT_Room_Status` GROUPed into distinct `(room_no, night)` pairs
+//   with the DETERMINISTIC `MIN(id)` per pair. Legacy permits duplicate rows
+//   for one slot (live: ids 4223/4224/4225 all on room 201, night
+//   2026-06-30; 20 such slots at HF Hotel, 6 at Ville) while canonical is
+//   UNIQUE on `(rcal_room_id, rcal_date)`, so the pair set — not the row
+//   count — is the only comparable thing, and the re-stamp below needs one
+//   reproducible id out of the duplicates.
 //
-// ## Known limitation of the aggregate shape
+// Classification, and what each class costs:
 //
-// Counts + boundaries are a NET comparison: equal-and-opposite gaps (N nights
-// only in legacy, N only in canonical) would cancel and read as converged.
-// That is the same trade every sibling probe makes, and the directional
-// answer belongs to DETECTION (`mirror_probe::diff_mirror_rows`), not to a
-// resolve arm — so it lands with the detection re-key below, not here. The
-// `MIN`/`MAX` night boundaries already catch the common one-sided case where
-// the missing nights sit at an edge of the window.
+// * **legacy-only pair** → genuine `missing_pg`. ONE aggregate reconcile row,
+//   the same row shape and STABLE dedupe sentinel as before, with a bounded
+//   sample of the missing pairs in the JSON snapshots for triage.
+// * **canonical-only pair** → class A. LOGGED with a count and a bounded
+//   sample (at INFO — the population is durable and carries no operator
+//   action, and this arm runs every 15 minutes), NEVER recorded (issue
+//   #281): no re-drive can conjure a legacy
+//   night that is not there, so such a row is unclosable by construction and
+//   would pin the 4h digest and the >72h `:bangbang:` escalation tier at both
+//   sites forever — which is exactly what forced the 2026-07-31 Ville revert.
+// * **pair on both sides with `rcal_legacy_id` NULL** → class B. CONVERGED —
+//   the night IS mirrored, only the pointer is stale — and queued for the
+//   heal arm, which re-stamps the back-pointer so the class shrinks instead
+//   of being tolerated forever.
 //
-// ## What is still deferred (issue #273, deliverables 2 and 3)
+// Cost: one era-floor aggregate plus two full key scans per tick (~4.7k pairs
+// at HF Hotel, ~1.7k at Ville) — the same order as the payment-ledger probe's
+// 20k folios — diffed in Rust over two `BTreeMap`s.
 //
-// This is the CLOSURE half only. Detection stays `observe_only` in
-// `scheduler::mirror_probe` and MUST stay there until:
+// ## Deliberately blind to surplus, and saying so
 //
-//   1. a remediation path exists — a re-drive/backfill that actually closes a
-//      genuine night gap (the live deficit survives a business-key comparison
-//      today: 1546 legacy nights vs 1420 canonical at HF Hotel), and
-//   2. the probe's DETECTION aggregate is re-keyed onto the business key too.
+// "Converged" here means "canonical holds every in-era legacy night", NOT
+// "the two sides are equal". A canonical-only pair never opens a row — not
+// even when it still carries a legacy id (which would be a lost `D` event
+// rather than a #281 orphan; zero of those at either site on 2026-08-10).
+// That case is logged separately and loudly and stays out of the ledger until
+// #281 ships a surplus-side sweep that can actually close it. Silence from
+// this arm therefore means "no legacy night is missing", NOT "canonical is
+// clean".
 //
-// (2) is not cosmetic: flipping `observe_only` while detection still counts
-// id-keyed rows would record a row on the never-equal id gap that THIS arm
-// then closes on the business key the very next tick — a record/resolve churn
-// loop. Detection and resolution must agree on the key before the flag moves.
+// ## Era floor
+//
+// Still `MIN(rcal_date)` over MIRRORED rows only, derived every tick, never
+// configured (the `PAYMENTS_ERA_FLOOR_SQL` lesson), and it bounds BOTH scans.
+// Deriving it from the mirrored population rather than from every tile is
+// load-bearing: a class-A tile older than the mirror's first mirrored night
+// would otherwise drag legacy history into a window the mirror never covered,
+// and every night in that window would read as a genuine deficit.
+//
+// ## Closure — one definition of "converged"
+//
+// Detection and closure must answer "converged?" identically or a recorded
+// row churns (open → close → re-open, forever). Both now run the SAME
+// [`compare_room_calendar_pairs`] classification, and the convergence channel
+// is the DEFICIT hash: the legacy-side resolve arm re-runs the comparison and
+// hashes the legacy-only pair set, while the canonical side contributes the
+// hash of the EMPTY deficit ([`room_calendar_converged_hash`]). They are
+// equal exactly when nothing is missing — which is what lets the sweep
+// self-close the row once the missing nights are backfilled, and what keeps
+// it closed while class A grows and class B churns underneath. The canonical
+// arm needs no query at all for the same reason it needs no count: canonical
+// contributes the pair SET, and the comparison that reads it lives on the
+// side that holds both pools.
 
 /// `ht_reconcile_log.table_name` of the Phase 6-C calendar mirror probe.
 ///
@@ -4056,141 +4066,390 @@ async fn fetch_legacy_registry_folio_hash(
 /// `room_calendar_probe_key_matches_the_registered_mirror_probe`.
 pub(crate) const ROOM_CALENDAR_PROBE_KEY: &str = "mirror_ht_room_calendar";
 
-/// Canonical side of the calendar business-key comparison: the distinct
-/// night count plus the coverage boundaries.
+/// Most `(room, night)` pairs quoted in one log line or JSON snapshot.
 ///
-/// `MIN(rcal_date)` rides along because it IS the era floor pushed into the
-/// legacy scan — the same lesson as [`PAYMENTS_ERA_FLOOR_SQL`] and the mirror
-/// probe's `MIN(pk)`. A mirror that was never backfilled cannot be held
-/// responsible for legacy history predating it, and reporting that history
-/// builds a permanently unresolvable backlog that starves every other entity
-/// out of `auto_resolve_reconcile_log`'s age-ordered 500-row batch. The floor
-/// is DERIVED, never configured, and re-derived on every sweep so a floor
-/// that MOVES (because the mirror finally received its missing history) is
-/// picked up on the next tick instead of pinning the row to a stale boundary.
-///
-/// `WHERE rcal_legacy_id IS NOT NULL` scopes all three aggregates to the
-/// MIRRORED population (issue #273, 2026-07-31 — see the section header). A
-/// canonical tile carrying no legacy id has no counterpart to diverge FROM,
-/// and counting it books legitimate local-only state as `missing_mssql`
-/// forever: live first tick on HF Ville read legacy=1637 vs pg=1676, the 39
-/// being exactly its NULL-id population. The filter is table-level rather
-/// than a `FILTER` clause on `COUNT` so the boundaries move with it — `MIN`
-/// is the era floor pushed into the legacy scan, and `MAX` is compared
-/// against the legacy `MAX`; both must describe the mirrored set, not the
-/// canonical one.
-///
-/// Canonical is UNIQUE on `(rcal_room_id, rcal_date)`, so this `COUNT(*)` IS
-/// a distinct-night count and needs no `DISTINCT` of its own (the legacy side
-/// does — `HT_Room_Status` carries no such constraint).
-const ROOM_CALENDAR_BUSINESS_KEY_PG_SQL: &str = "SELECT COUNT(*)::bigint AS night_count, \
-     MIN(rcal_date) AS min_date, \
-     MAX(rcal_date) AS max_date \
-       FROM ht_room_calendar \
-      WHERE rcal_legacy_id IS NOT NULL";
+/// The samples exist for triage, not enumeration — the counts alongside them
+/// are always the true totals. Same order of magnitude as
+/// `mirror_probe::MIRROR_PROBE_MAX_PK_FINDINGS`, and bounded for the same
+/// reason: an unbounded array would put thousands of pairs into
+/// `ht_reconcile_log.mssql_row_json` on a site whose mirror is empty.
+pub(crate) const ROOM_CALENDAR_MAX_SAMPLE: usize = 20;
 
-/// Legacy side of the same comparison, floored at the canonical `MIN`.
+/// Most class-B back-pointers the heal arm re-stamps in ONE tick.
 ///
-/// `floored = false` (an EMPTY canonical calendar) scans the whole legacy
-/// table on purpose — with no coverage at all, "legacy has N nights and we
-/// have none" IS the finding, and it lands as one bounded aggregate row.
-/// Same contract as `mirror_probe::legacy_floor_filter`.
+/// Not a starvation risk: a re-stamped pair stops being a candidate, so the
+/// next tick reaches the next slice. The cap only bounds how much canonical
+/// write traffic one tick can issue when the arm is first enabled on a site
+/// with a long-accumulated class B.
+const ROOM_CALENDAR_RESTAMP_MAX_PER_TICK: usize = 100;
+
+/// Era floor for BOTH sides of the comparison: the first night the mirror
+/// actually mirrors.
+///
+/// `WHERE rcal_legacy_id IS NOT NULL` belongs HERE and nowhere else. As a
+/// FLOOR it is right — the mirrored population defines the coverage boundary,
+/// so legacy history predating it is out of scope and cannot build a
+/// permanently unresolvable backlog. As a comparison SCOPE it was issue
+/// #282 — it hid class-B tiles from the canonical side and manufactured a
+/// deficit that did not exist.
+const ROOM_CALENDAR_ERA_FLOOR_SQL: &str =
+    "SELECT MIN(rcal_date) FROM ht_room_calendar WHERE rcal_legacy_id IS NOT NULL";
+
+/// Canonical `(room_no, night)` pair scan — EVERY in-era tile, mirrored or
+/// detached, with its `rcal_id` (the re-stamp target) and the nullability of
+/// its back-pointer.
+///
+/// The join to `ht_rooms_new` resolves `room_no`, which is the half of the
+/// business key legacy speaks; it is an inner join because `rcal_room_id` is
+/// FK-constrained to that table. `room_no` is `UNIQUE` and canonical is
+/// `UNIQUE (rcal_room_id, rcal_date)`, so `(room_no, night)` identifies at
+/// most one row and the map below cannot silently collapse two tiles.
+///
+/// The floor is a BOUND parameter and `NULL` means "no mirrored coverage at
+/// all" — then every tile is in scope, matching the unfloored legacy scan.
+const ROOM_CALENDAR_PAIRS_PG_SQL: &str = "SELECT r.room_no, c.rcal_date, c.rcal_id, c.rcal_legacy_id \
+       FROM ht_room_calendar c \
+       JOIN ht_rooms_new r ON r.room_id = c.rcal_room_id \
+      WHERE $1::date IS NULL OR c.rcal_date >= $1::date";
+
+/// Re-stamp ONE class-B back-pointer (the heal arm's only statement).
+///
+/// Three guards, all load-bearing:
+///
+/// * `rcal_id = $2` — the exact tile the classifier resolved, never a
+///   business-key re-lookup that could have moved since;
+/// * `rcal_legacy_id IS NULL` — idempotent, and it cannot clobber a pointer
+///   the CT mapper stamped between the scan and this write;
+/// * `NOT EXISTS (… other.rcal_legacy_id = $1)` — the partial unique index
+///   `ux_ht_room_calendar_legacy_id` would otherwise raise on an id that has
+///   already been rebound onto another slot. Losing that race costs zero rows
+///   (`rows_affected = 0`, logged as skipped); the CT path owns rebinds.
+const ROOM_CALENDAR_RESTAMP_SQL: &str = "UPDATE ht_room_calendar \
+        SET rcal_legacy_id = $1, rcal_updated_at = NOW() \
+      WHERE rcal_id = $2 \
+        AND rcal_legacy_id IS NULL \
+        AND NOT EXISTS (SELECT 1 FROM ht_room_calendar other \
+                         WHERE other.rcal_legacy_id = $1)";
+
+/// Legacy `(room_no, night)` pair scan, floored at the mirror's coverage.
+///
+/// `GROUP BY` rather than `SELECT DISTINCT` because the re-stamp needs one
+/// deterministic id per slot: `HT_Room_Status` permits duplicate rows for one
+/// `(room, night)` (ids 4223/4224/4225 on room 201, night 2026-06-30) and
+/// `MIN(id)` picks the same one on every tick, so a heal that is retried
+/// after a crash re-stamps the same value. `row_count` rides along so the log
+/// can say the slot was ambiguous.
+///
+/// `MIN` here vs `MAX` in `bin/backfill_room_calendar`'s `dedup_worklist_sql`
+/// is deliberate, not drift. That bin re-PROJECTS the tile's data and wants
+/// the row CT would have delivered last, which is the newest id. This arm
+/// only re-binds a POINTER, and the newest id is precisely the one iHOTEL's
+/// `MAX(id)+1` allocator can rebind next (it reuses an id after the top row
+/// is deleted), so the oldest id is the more stable pointer. Neither choice
+/// can conflict: the pointer is nobody's conflict target, and a later
+/// backfill's `ON CONFLICT … DO UPDATE` simply overwrites it.
+///
+/// `floored = false` (an EMPTY mirror) scans the whole legacy table on
+/// purpose — with no coverage at all, "legacy has N nights and we have none"
+/// IS the finding, and it lands as one bounded aggregate row. Same contract
+/// as `mirror_probe::legacy_floor_filter`.
 ///
 /// `CAST(room_date AS DATE)` normalises the legacy `datetime` (naive local
-/// Thai) down to the night, which is what the canonical `DATE` column holds.
-/// The boundaries come back as ISO `varchar(10)` (style 23) rather than a
-/// driver-mapped date so both sides hash byte-identical `YYYY-MM-DD` text.
-pub(crate) fn room_calendar_business_key_legacy_sql(floored: bool) -> String {
+/// Thai) down to the night, which is what the canonical `DATE` column holds;
+/// style 23 returns ISO `varchar(10)` so both sides key on byte-identical
+/// `YYYY-MM-DD` text. Plain `'…'` literals only — never `N'…'`.
+pub(crate) fn room_calendar_pairs_legacy_sql(floored: bool) -> String {
     let floor = if floored {
         " AND CAST(room_date AS DATE) >= CAST(@P1 AS DATE)"
     } else {
         ""
     };
     format!(
-        "SELECT COUNT_BIG(*) AS night_count, \
-         CONVERT(varchar(10), MIN(night_date), 23) AS min_date, \
-         CONVERT(varchar(10), MAX(night_date), 23) AS max_date \
-           FROM (SELECT DISTINCT room_no, CAST(room_date AS DATE) AS night_date \
-                   FROM HT_Room_Status \
-                  WHERE room_no IS NOT NULL AND room_date IS NOT NULL{floor}) AS nights"
+        "SELECT room_no, CONVERT(varchar(10), CAST(room_date AS DATE), 23) AS night, \
+         MIN(CAST(id AS BIGINT)) AS legacy_id, COUNT_BIG(*) AS row_count \
+           FROM HT_Room_Status \
+          WHERE room_no IS NOT NULL AND room_date IS NOT NULL{floor} \
+          GROUP BY room_no, CAST(room_date AS DATE)"
     )
 }
 
-/// Hash of one side's in-era calendar business-key aggregate.
+/// The business key both sides share: `(room_no, ISO night)`.
 ///
-/// The `business_key` discriminator makes this provably incapable of
+/// A tuple so `BTreeMap`/`BTreeSet` order it lexicographically for free —
+/// which is what makes every sample, log line and hash below deterministic
+/// tick over tick, and therefore dedupe-friendly.
+pub(crate) type RoomCalendarPair = (String, String);
+
+/// Canonical side of one slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CanonicalCalendarTile {
+    /// The tile's own PK — the re-stamp target.
+    pub(crate) rcal_id: i64,
+    /// `None` is the detached state the mapper's pre-clear leaves behind; it
+    /// says NOTHING about whether legacy still holds the slot (that is
+    /// precisely the class A / class B question).
+    pub(crate) legacy_id: Option<i64>,
+}
+
+/// Legacy side of one slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LegacyCalendarNight {
+    /// `MIN(id)` over the rows on this slot — deterministic under duplicates.
+    pub(crate) legacy_id: i64,
+    /// How many legacy rows share the slot (`> 1` is legal in iHOTEL).
+    pub(crate) row_count: i64,
+}
+
+/// One night legacy has and canonical does not — the only class this arm
+/// records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RoomCalendarMissingNight {
+    pub(crate) room_no: String,
+    pub(crate) night: String,
+    pub(crate) legacy_id: i64,
+}
+
+/// One class-B back-pointer the heal arm can re-stamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RoomCalendarRestamp {
+    pub(crate) rcal_id: i64,
+    pub(crate) legacy_id: i64,
+    pub(crate) room_no: String,
+    pub(crate) night: String,
+    /// `> 1` when legacy holds duplicates for the slot — the id chosen is
+    /// `MIN`, and this is what says so in the log.
+    pub(crate) legacy_rows: i64,
+}
+
+/// Everything one comparison of the two pair sets found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RoomCalendarClassification {
+    /// Distinct in-era legacy `(room, night)` pairs.
+    pub(crate) legacy_pairs: usize,
+    /// In-era canonical tiles (mirrored AND detached).
+    pub(crate) canonical_pairs: usize,
+    /// Pairs on both sides whose canonical tile carries a legacy id. The id
+    /// need not be the legacy `MIN` — under duplicates the mapper may hold
+    /// any of them, and the slot is mirrored either way.
+    pub(crate) matched_bound: usize,
+    /// Legacy-only pairs → genuine `missing_pg`, sorted.
+    pub(crate) missing_pg: Vec<RoomCalendarMissingNight>,
+    /// Class A: canonical-only, back-pointer already NULL (issue #281).
+    pub(crate) surplus_detached: Vec<RoomCalendarPair>,
+    /// Canonical-only while STILL carrying a legacy id — a lost `D` event
+    /// rather than a #281 orphan. Logged apart because the two need different
+    /// remediations; neither is recorded.
+    pub(crate) surplus_bound: Vec<RoomCalendarPair>,
+    /// Class B: on both sides, back-pointer NULL, id free to re-stamp.
+    pub(crate) restamp: Vec<RoomCalendarRestamp>,
+    /// Class B whose legacy id is already bound to a DIFFERENT canonical row
+    /// — re-stamping would violate `ux_ht_room_calendar_legacy_id`, so the CT
+    /// path keeps ownership of the rebind. Converged all the same.
+    pub(crate) restamp_conflicts: Vec<RoomCalendarPair>,
+    /// The floor both scans ran under, echoed for the log/JSON.
+    pub(crate) era_floor: Option<NaiveDate>,
+}
+
+impl RoomCalendarClassification {
+    /// The ONE convergence question this arm asks: does canonical hold every
+    /// in-era legacy night? Surplus of either kind is deliberately not part
+    /// of it — see the section docs.
+    pub(crate) fn is_converged(&self) -> bool {
+        self.missing_pg.is_empty()
+    }
+
+    /// `None` when converged. Never `Cardinality` (the hourly drift digest
+    /// filters that kind out, so it would go unpaged) and never
+    /// `MissingMssql`: a surplus pair is never recorded, so there is no
+    /// direction to report it in.
+    pub(crate) fn divergence_kind(&self) -> Option<DivergenceKind> {
+        (!self.is_converged()).then_some(DivergenceKind::MissingPg)
+    }
+
+    /// Legacy pairs canonical DOES hold — the honest "pg count" for a row
+    /// whose delta must equal the deficit.
+    pub(crate) fn covered_pairs(&self) -> usize {
+        self.legacy_pairs.saturating_sub(self.missing_pg.len())
+    }
+
+    /// The convergence channel — see [`room_calendar_deficit_hash`].
+    pub(crate) fn deficit_hash(&self) -> String {
+        room_calendar_deficit_hash(&self.missing_pg)
+    }
+
+    fn missing_sample(&self) -> Vec<serde_json::Value> {
+        self.missing_pg
+            .iter()
+            .take(ROOM_CALENDAR_MAX_SAMPLE)
+            .map(|m| json!({ "room_no": m.room_no, "night": m.night, "legacy_id": m.legacy_id }))
+            .collect()
+    }
+
+    fn missing_pair_sample(&self) -> Vec<String> {
+        self.missing_pg
+            .iter()
+            .take(ROOM_CALENDAR_MAX_SAMPLE)
+            .map(|m| format!("{}@{}", m.room_no, m.night))
+            .collect()
+    }
+
+    fn pair_sample(pairs: &[RoomCalendarPair]) -> Vec<String> {
+        pairs
+            .iter()
+            .take(ROOM_CALENDAR_MAX_SAMPLE)
+            .map(|(room, night)| format!("{room}@{night}"))
+            .collect()
+    }
+}
+
+/// Hash of the DEFICIT — the sorted set of in-era legacy `(room, night)`
+/// pairs canonical does not hold.
+///
+/// This is the whole convergence channel between detection and the
+/// auto-resolve sweep. It is content-addressed rather than a count so that a
+/// deficit which merely CHANGES (one night backfilled, another dropped) can
+/// never be mistaken for the one that was recorded; and it hashes the EMPTY
+/// set to a real, non-empty value ([`room_calendar_converged_hash`]) because
+/// `should_auto_resolve` closes a row only on two equal non-empty hashes.
+///
+/// The `"pair_deficit"` discriminator makes it provably incapable of
 /// colliding with `mirror_probe::mirror_aggregate_hash` for the same probe
-/// key — the two comparisons measure different things and must never be
-/// mistaken for one another mid-migration.
-///
-/// Absent boundaries hash as the empty segment, so an EMPTY calendar on both
-/// sides produces equal non-empty hashes and `should_auto_resolve` closes the
-/// row. Absent-on-both is a real converged state for a mirror, exactly as in
-/// `mirror_probe::mirror_absent_hash`; returning "no hash" instead would
-/// leave such a row open forever.
-pub(crate) fn room_calendar_business_key_hash(
-    night_count: i64,
-    min_date: Option<&str>,
-    max_date: Option<&str>,
-) -> String {
-    sha256(&join_hash_segments(&[
-        ROOM_CALENDAR_PROBE_KEY.to_string(),
-        crate::scheduler::mirror_probe::MIRROR_AGGREGATE_PK.to_string(),
-        "business_key".to_string(),
-        night_count.to_string(),
-        min_date.unwrap_or_default().to_string(),
-        max_date.unwrap_or_default().to_string(),
-    ]))
+/// key — that one measures the id-keyed aggregate, which is never-equal by
+/// construction, and mistaking the two mid-migration would close a row on the
+/// wrong comparison.
+pub(crate) fn room_calendar_deficit_hash(missing: &[RoomCalendarMissingNight]) -> String {
+    let mut segments = Vec::with_capacity(missing.len() + 4);
+    segments.push(ROOM_CALENDAR_PROBE_KEY.to_string());
+    segments.push(crate::scheduler::mirror_probe::MIRROR_AGGREGATE_PK.to_string());
+    segments.push("pair_deficit".to_string());
+    segments.push(missing.len().to_string());
+    for m in missing {
+        segments.push(format!("{}@{}", m.room_no, m.night));
+    }
+    sha256(&join_hash_segments(&segments))
 }
 
-/// One PG round-trip: `(distinct night count, MIN(night), MAX(night))` over
-/// the MIRRORED population only (`rcal_legacy_id IS NOT NULL` — see
-/// [`ROOM_CALENDAR_BUSINESS_KEY_PG_SQL`]).
+/// The canonical side's contribution to the comparison: "no legacy night is
+/// missing from canonical".
 ///
-/// Shared by both resolve halves AND the detection probe below — the legacy
-/// half needs the `MIN` as its coverage floor. The exclusion lives HERE, in
-/// the one shared fetch, precisely so detection and closure move together: a
-/// canonical-side change applied to only one of them would open rows the
-/// other could never close, which is the bug class issue #273 exists to kill
-/// (pinned by `detection_and_resolution_agree_on_convergence_for_every_hash_pair`).
-async fn fetch_calendar_business_key_pg(
+/// Constant on purpose. The classification is inherently two-sided, and the
+/// resolve dispatch that holds BOTH pools is the legacy one
+/// ([`compute_room_calendar_deficit_hash`]); the canonical arm therefore
+/// states the target rather than re-deriving it from a query that could not
+/// answer the question alone. Equality with the live deficit hash IS
+/// convergence.
+pub(crate) fn room_calendar_converged_hash() -> String {
+    room_calendar_deficit_hash(&[])
+}
+
+/// Pure classifier — no I/O, so the fixtures below can drive every class.
+///
+/// Iteration is over two `BTreeMap`s, so every output vector is sorted and
+/// stable: the samples in a recorded row do not churn between ticks (which is
+/// what lets `record_divergence`'s dedupe suppress the repeat) and the deficit
+/// hash is reproducible.
+pub(crate) fn classify_room_calendar_pairs(
+    legacy: &BTreeMap<RoomCalendarPair, LegacyCalendarNight>,
+    canonical: &BTreeMap<RoomCalendarPair, CanonicalCalendarTile>,
+) -> RoomCalendarClassification {
+    // Every legacy id canonical already points at. A re-stamp onto a second
+    // row would trip `ux_ht_room_calendar_legacy_id`; catching it here keeps
+    // the heal arm's failure mode "skipped and logged" instead of "UPDATE
+    // raises". The statement itself re-checks under the same predicate, for
+    // the race between this scan and the write.
+    let bound: BTreeSet<i64> = canonical.values().filter_map(|t| t.legacy_id).collect();
+
+    let mut out = RoomCalendarClassification {
+        legacy_pairs: legacy.len(),
+        canonical_pairs: canonical.len(),
+        ..Default::default()
+    };
+
+    for (pair, night) in legacy {
+        match canonical.get(pair) {
+            // Legacy holds the night, canonical does not — the 2026-08-10
+            // Ville class, and the only one worth an `ht_reconcile_log` row.
+            None => out.missing_pg.push(RoomCalendarMissingNight {
+                room_no: pair.0.clone(),
+                night: pair.1.clone(),
+                legacy_id: night.legacy_id,
+            }),
+            // Mirrored and bound. Note the ids need not match: under legacy
+            // duplicates the tile may point at any of them.
+            Some(tile) if tile.legacy_id.is_some() => out.matched_bound += 1,
+            // CLASS B — the night is mirrored, only the pointer is stale.
+            Some(tile) => {
+                if bound.contains(&night.legacy_id) {
+                    out.restamp_conflicts.push(pair.clone());
+                } else {
+                    out.restamp.push(RoomCalendarRestamp {
+                        rcal_id: tile.rcal_id,
+                        legacy_id: night.legacy_id,
+                        room_no: pair.0.clone(),
+                        night: pair.1.clone(),
+                        legacy_rows: night.row_count,
+                    });
+                }
+            }
+        }
+    }
+
+    for (pair, tile) in canonical {
+        if legacy.contains_key(pair) {
+            continue;
+        }
+        if tile.legacy_id.is_some() {
+            out.surplus_bound.push(pair.clone());
+        } else {
+            // CLASS A — issue #281. Never recorded.
+            out.surplus_detached.push(pair.clone());
+        }
+    }
+
+    out
+}
+
+/// The mirror's own coverage boundary, re-derived every tick so a floor that
+/// MOVES (because the mirror finally received its missing history) is picked
+/// up instead of pinning the comparison to a stale boundary.
+async fn fetch_room_calendar_era_floor(pg_pool: &PgPool) -> Result<Option<NaiveDate>, sqlx::Error> {
+    let (floor,) = sqlx::query_as::<_, (Option<NaiveDate>,)>(ROOM_CALENDAR_ERA_FLOOR_SQL)
+        .fetch_one(pg_pool)
+        .await?;
+    Ok(floor)
+}
+
+/// Canonical pair set, floored. See [`ROOM_CALENDAR_PAIRS_PG_SQL`].
+async fn fetch_room_calendar_pairs_pg(
     pg_pool: &PgPool,
-) -> Result<(i64, Option<NaiveDate>, Option<NaiveDate>), sqlx::Error> {
-    sqlx::query_as::<_, (i64, Option<NaiveDate>, Option<NaiveDate>)>(
-        ROOM_CALENDAR_BUSINESS_KEY_PG_SQL,
-    )
-    .fetch_one(pg_pool)
-    .await
+    floor: Option<NaiveDate>,
+) -> Result<BTreeMap<RoomCalendarPair, CanonicalCalendarTile>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, NaiveDate, i64, Option<i32>)>(ROOM_CALENDAR_PAIRS_PG_SQL)
+        .bind(floor)
+        .fetch_all(pg_pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(room_no, night, rcal_id, legacy_id)| {
+            (
+                (room_no, night.to_string()),
+                CanonicalCalendarTile {
+                    rcal_id,
+                    legacy_id: legacy_id.map(i64::from),
+                },
+            )
+        })
+        .collect())
 }
 
-/// Canonical-side business-key hash. Never `None`: an empty calendar is a
-/// real, hashable state (see [`room_calendar_business_key_hash`]).
-async fn compute_room_calendar_business_key_pg_hash(
-    pg_pool: &PgPool,
-) -> Result<String, sqlx::Error> {
-    let (night_count, min_date, max_date) = fetch_calendar_business_key_pg(pg_pool).await?;
-    Ok(room_calendar_business_key_hash(
-        night_count,
-        min_date.map(|d| d.to_string()).as_deref(),
-        max_date.map(|d| d.to_string()).as_deref(),
-    ))
-}
-
-/// Raw legacy-side business-key aggregate — `(night_count, min_date,
-/// max_date)` as ISO `YYYY-MM-DD` text, floored at `floor` (the canonical
-/// `MIN(rcal_date)`, or `None` to scan the whole legacy table).
-///
-/// Extracted so the RESOLVE hash below and the DETECTION probe (issue #273,
-/// [`probe_room_calendar_business_key`]) run the identical query and share
-/// one interpretation of the result — the two can therefore never disagree
-/// about what "converged" means, which is the property that makes flipping
-/// detection safe (see the module-level "Calendar closure arm" docs).
-async fn fetch_room_calendar_business_key_legacy_raw(
+/// Legacy pair set, floored. See [`room_calendar_pairs_legacy_sql`].
+async fn fetch_room_calendar_pairs_legacy(
     legacy_pool: &DbPool,
     floor: Option<NaiveDate>,
-) -> Result<(i64, Option<String>, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<BTreeMap<RoomCalendarPair, LegacyCalendarNight>, Box<dyn std::error::Error + Send + Sync>>
+{
     let floor_text = floor.map(|d| d.to_string());
-    let sql = room_calendar_business_key_legacy_sql(floor_text.is_some());
+    let sql = room_calendar_pairs_legacy_sql(floor_text.is_some());
 
     let mut conn = legacy_pool.get().await?;
     let mut q = Query::new(sql.as_str());
@@ -4200,202 +4459,192 @@ async fn fetch_room_calendar_business_key_legacy_raw(
     let rows = query_with_timeout_pooled(&mut conn, &sql, q, MssqlOpKind::Read).await?;
     drop(conn);
 
-    // An aggregate SELECT always returns exactly one row; treat a missing
-    // one as "no legacy nights in era" rather than erroring the sweep row.
-    let Some(row) = rows.first() else {
-        return Ok((0, None, None));
-    };
-    Ok((
-        row.try_get::<i64, _>("night_count").ok().flatten().unwrap_or(0),
-        row.try_get::<&str, _>("min_date")
-            .ok()
-            .flatten()
-            .map(str::to_string),
-        row.try_get::<&str, _>("max_date")
-            .ok()
-            .flatten()
-            .map(str::to_string),
-    ))
+    let mut out = BTreeMap::new();
+    for r in &rows {
+        let (Some(room_no), Some(night)) = (r.get::<&str, _>("room_no"), r.get::<&str, _>("night"))
+        else {
+            continue;
+        };
+        let Some(legacy_id) = r.try_get::<i64, _>("legacy_id").ok().flatten() else {
+            continue;
+        };
+        out.insert(
+            (room_no.to_string(), night.to_string()),
+            LegacyCalendarNight {
+                legacy_id,
+                row_count: r.try_get::<i64, _>("row_count").ok().flatten().unwrap_or(1),
+            },
+        );
+    }
+    Ok(out)
 }
 
-/// Legacy-side business-key hash, floored at the canonical coverage
-/// boundary.
+/// ONE comparison of the two pair sets — the single definition of "converged"
+/// that detection and closure both read.
 ///
-/// Cost: ONE PG aggregate + ONE MSSQL aggregate per sweep, and only when an
+/// Scan ORDER is deliberate: legacy first, canonical second. A tile written
+/// between the two reads then shows up on the canonical side (at worst a
+/// class-A surplus, which is only logged) instead of as a legacy-only pair
+/// that would record a divergence and be closed again next tick. The skew
+/// window biases toward SILENCE.
+pub(crate) async fn compare_room_calendar_pairs(
+    legacy_pool: &DbPool,
+    pg_pool: &PgPool,
+) -> Result<RoomCalendarClassification, Box<dyn std::error::Error + Send + Sync>> {
+    let floor = fetch_room_calendar_era_floor(pg_pool).await?;
+    let legacy = fetch_room_calendar_pairs_legacy(legacy_pool, floor).await?;
+    let canonical = fetch_room_calendar_pairs_pg(pg_pool, floor).await?;
+
+    let mut classification = classify_room_calendar_pairs(&legacy, &canonical);
+    classification.era_floor = floor;
+    Ok(classification)
+}
+
+/// Legacy-side resolve arm for the calendar's `<aggregate>` row: re-run the
+/// comparison and hash what is still missing.
+///
+/// Cost: one floor aggregate + two key scans per sweep, and only while an
 /// open calendar aggregate row exists — `record_divergence`'s dedupe allows
 /// at most one per site, so this cannot grow with table size.
 ///
 /// Errors propagate to `auto_resolve_reconcile_log`, which already logs and
 /// `continue`s per row: one arm's failure costs one row this tick, never the
 /// cycle (the sibling error-isolation contract).
-async fn compute_room_calendar_business_key_legacy_hash(
+async fn compute_room_calendar_deficit_hash(
     legacy_pool: &DbPool,
     pg_pool: &PgPool,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    // Degenerate case, newly reachable in principle since the mirrored-rows-
-    // only scoping: if ZERO canonical rows carry a legacy id, this MIN comes
-    // back NULL and the legacy scan below runs UNFLOORED over the entire
-    // `HT_Room_Status` history, once per sweep for as long as the aggregate
-    // row stays open. Practically unreachable today (4,542 mirrored rows on
-    // HF Hotel, 1,637 on Ville) and consistent with the existing "no
-    // coverage ⇒ that IS the finding" contract on an empty calendar, but
-    // worth flagging now that a NULL floor can also mean "every row
-    // detached" rather than only "table truly empty".
-    let (_, floor, _) = fetch_calendar_business_key_pg(pg_pool).await?;
-    let (night_count, min_date, max_date) =
-        fetch_room_calendar_business_key_legacy_raw(legacy_pool, floor).await?;
-    Ok(room_calendar_business_key_hash(
-        night_count,
-        min_date.as_deref(),
-        max_date.as_deref(),
-    ))
+    Ok(compare_room_calendar_pairs(legacy_pool, pg_pool)
+        .await?
+        .deficit_hash())
 }
 
 // =============================================================================
-// Calendar DETECTION (issue #273 remainder) — business-key probe, re-keyed
-// off `rcal_legacy_id`
+// Calendar DETECTION + the class-B heal arm
 // =============================================================================
-//
-// The closure arm above made the calendar's `<aggregate>` row CLOSEABLE, but
-// left DETECTION untouched: until now, `mirror_probe::run_mirror_probe` kept
-// measuring `ht_room_calendar` inside the generic id-keyed UNION-ALL batch
-// (`rcal_legacy_id` vs `HT_Room_Status.id`) and, because that probe entry
-// carried `observe_only: true`, logged the mismatch without ever calling
-// `record_divergence`.
-//
-// Flipping `observe_only` on its own — while detection stayed id-keyed —
-// would have opened a record/resolve CHURN LOOP: detection would open a row
-// on the never-equal id-keyed gap (structural: `RoomCalendarMapper` NULLs
-// `rcal_legacy_id` on every allocator rebind and nothing restores it), and
-// the business-key resolve arm above would close that SAME row the moment
-// the unrelated business-key counts happened to agree, only for detection to
-// re-open it the very next tick. Two arms measuring two different things can
-// never stay in agreement about "converged".
-//
-// So detection is re-keyed here too, and it deliberately goes through the
-// SAME raw fetches the resolve arm uses
-// ([`fetch_calendar_business_key_pg`], [`fetch_room_calendar_business_key_legacy_raw`])
-// and the SAME [`room_calendar_business_key_hash`] — "converged" can now only
-// mean one thing for this table, so a row this function opens is EXACTLY the
-// row the sweep above can close, and nothing else can re-open it once it
-// does. `probe_room_calendar_business_key` is called directly by
-// `mirror_probe::run_mirror_probe`, in place of folding `ht_room_calendar`
-// into the generic per-probe loop — the generic aggregate shape (integer
-// `MAX`/`MIN` on one PK column) has no way to express "distinct
-// `(room, night)` pairs, floored at a date", so this table gets its own
-// tiny two-query pass instead of a UNION-ALL arm.
-//
-// Remediation (a re-drive/backfill that actually closes a genuine gap) is
-// still NOT part of this change — a recorded row is real, honest sync-lag
-// (see the "Vocabulary note" in CLAUDE.md) that will sit open, visible, and
-// escalating until an operator or a future re-drive path closes it. That is
-// the intended behaviour: detection catching a genuine gap and saying so is
-// the whole point of re-keying it.
 
-/// Outcome of one calendar business-key probe tick, folded into
+/// Outcome of one calendar probe tick, folded into
 /// [`crate::scheduler::mirror_probe::MirrorProbeOutcome`] by the caller
 /// exactly like a generic probe's per-key result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RoomCalendarProbeOutcome {
-    /// Both sides agree on the in-era business key — no row written.
+    /// Canonical holds every in-era legacy night — no row written. Class A
+    /// and class B do not affect this verdict; both are logged.
     Converged,
-    /// The business key disagreed; a divergence was written (or an
-    /// already-open one deduped, per `record_divergence`'s NOT EXISTS
+    /// Legacy nights are missing from canonical; a divergence was written (or
+    /// an already-open one deduped, per `record_divergence`'s NOT EXISTS
     /// guard) — never a per-PK row, always the `<aggregate>` sentinel.
     Diverged,
 }
 
-/// Pure decision: has the calendar business-key comparison converged, and if
-/// not, which direction? `None` means converged (the two hashes are equal —
-/// BYTE-IDENTICAL to `should_auto_resolve`'s primary-convergence test, see
-/// `detection_and_resolution_agree_on_convergence_for_every_hash_pair`).
+/// What one detection pass produced: the verdict, plus the class-B repairs it
+/// merely OBSERVED.
 ///
-/// Extracted into a free function purely so it is unit-testable without a
-/// live DB — the same treatment `mirror_probe::aggregate_divergence_kind`
-/// gets. `legacy_count`/`pg_count` are needed only to pick the DIRECTION once
-/// the hashes have already told us there IS a divergence; they play no part
-/// in the converged/diverged decision itself, which is `legacy_hash ==
-/// pg_hash` and nothing else.
-///
-/// Never returns `Cardinality` — same reasoning as
-/// `mirror_probe::aggregate_divergence_kind`: the hourly drift digest
-/// filters that kind out, so a count mismatch must be classified by
-/// direction to stay alert-visible.
-fn room_calendar_business_key_divergence(
-    legacy_hash: &str,
-    pg_hash: &str,
-    legacy_count: i64,
-    pg_count: i64,
-) -> Option<DivergenceKind> {
-    if legacy_hash == pg_hash {
-        return None;
-    }
-    Some(if legacy_count > pg_count {
-        DivergenceKind::MissingPg
-    } else if pg_count > legacy_count {
-        DivergenceKind::MissingMssql
-    } else {
-        // Counts agree but a boundary moved — money-shaped tables call
-        // this `Value`; the calendar has no money column, so this reads as
-        // "the same number of nights, different nights".
-        DivergenceKind::Value
-    })
+/// Detection stays an auditor — it issues no canonical write. The candidates
+/// travel to `mirror_probe::run_mirror_probe`, which invokes the heal arm as
+/// its own separately-flagged step. (A class-B tile never opens an
+/// `ht_reconcile_log` row — it is converged — so the auto-resolve sweep can
+/// never see it, which is why the heal cannot live there.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RoomCalendarProbeReport {
+    pub(crate) outcome: RoomCalendarProbeOutcome,
+    pub(crate) restamp: Vec<RoomCalendarRestamp>,
 }
 
-/// Issue #273 — calendar DETECTION, re-keyed onto the business key the
-/// closure arm above resolves on. See the section docs for why this can't
-/// share the generic id-keyed UNION-ALL batch and why the churn-loop hazard
-/// requires this to ship in the SAME change as the closure arm's flip.
+/// Issue #282 — calendar DETECTION as a `(room, night)` set-diff.
 ///
 /// Recording uses the same STABLE SENTINEL convention as every other
 /// aggregate probe row
 /// ([`crate::scheduler::mirror_probe::mirror_aggregate_sentinel`]), not the
-/// live business-key hash: `should_auto_resolve` never reads the stored
-/// hash for this row (closure re-runs this exact comparison fresh — see
-/// `compute_current_pg_hash` / `compute_current_legacy_hash` above), so the
-/// stored hash only gates `record_divergence`'s dedupe. A LIVE hash would
-/// move every time the legacy table grew and mint a fresh row every tick for
-/// a table with a known backlog — precisely the failure mode the sentinel
-/// convention exists to avoid.
+/// live deficit hash: `should_auto_resolve` never reads the stored hash for
+/// this row (closure re-runs the comparison fresh — see
+/// [`compute_room_calendar_deficit_hash`]), so the stored hash only gates
+/// `record_divergence`'s dedupe. A LIVE hash would move as soon as the
+/// deficit changed by one night and mint a fresh row — precisely the failure
+/// mode the sentinel convention exists to avoid.
 pub(crate) async fn probe_room_calendar_business_key(
     legacy_pool: &DbPool,
     pg_pool: &PgPool,
-) -> Result<RoomCalendarProbeOutcome, Box<dyn std::error::Error + Send + Sync>> {
-    let (pg_count, pg_min, pg_max) = fetch_calendar_business_key_pg(pg_pool).await?;
-    let pg_min_s = pg_min.map(|d| d.to_string());
-    let pg_max_s = pg_max.map(|d| d.to_string());
-    let pg_hash = room_calendar_business_key_hash(pg_count, pg_min_s.as_deref(), pg_max_s.as_deref());
+) -> Result<RoomCalendarProbeReport, Box<dyn std::error::Error + Send + Sync>> {
+    let classification = compare_room_calendar_pairs(legacy_pool, pg_pool).await?;
 
-    let (legacy_count, legacy_min, legacy_max) =
-        fetch_room_calendar_business_key_legacy_raw(legacy_pool, pg_min).await?;
-    let legacy_hash =
-        room_calendar_business_key_hash(legacy_count, legacy_min.as_deref(), legacy_max.as_deref());
+    // CLASS A — issue #281. Logged with a count and a bounded sample, never
+    // recorded: no re-drive can conjure a legacy night that is not there, so
+    // an `ht_reconcile_log` row here would be unclosable and would pin the 4h
+    // digest and the >72h escalation tier forever.
+    //
+    // INFO, not WARN, on purpose: the sweep runs every 15 minutes and this
+    // population is durable (137 tiles at HF Hotel, 75 at Ville on
+    // 2026-08-10) with no operator action attached, so warning about it four
+    // times an hour would erode WARN for the classes that DO need attention.
+    if !classification.surplus_detached.is_empty() {
+        tracing::info!(
+            probe = ROOM_CALENDAR_PROBE_KEY,
+            surplus = classification.surplus_detached.len(),
+            sample = ?RoomCalendarClassification::pair_sample(&classification.surplus_detached),
+            "[Sync] Mirror probe: canonical-only calendar tiles (detached, no legacy \
+             counterpart) — LOGGED, NOT recorded: unclosable by construction, tracked \
+             as issue #281"
+        );
+    }
+    // The same direction but the tile still carries a legacy id — a lost `D`
+    // event, not a #281 orphan. Zero of these at either site on 2026-08-10;
+    // if it ever fires, it needs a different remediation (delete the tile),
+    // so it gets its own line rather than being folded into the count above.
+    if !classification.surplus_bound.is_empty() {
+        tracing::warn!(
+            probe = ROOM_CALENDAR_PROBE_KEY,
+            surplus_bound = classification.surplus_bound.len(),
+            sample = ?RoomCalendarClassification::pair_sample(&classification.surplus_bound),
+            "[Sync] Mirror probe: canonical calendar tiles STILL BOUND to a legacy id \
+             legacy no longer holds (lost D event) — LOGGED, NOT recorded (issue #281 \
+             owns the surplus side)"
+        );
+    }
+    if !classification.restamp_conflicts.is_empty() {
+        tracing::info!(
+            probe = ROOM_CALENDAR_PROBE_KEY,
+            conflicts = classification.restamp_conflicts.len(),
+            sample = ?RoomCalendarClassification::pair_sample(&classification.restamp_conflicts),
+            "[Sync] Mirror probe: class-B tiles whose legacy id is already bound \
+             elsewhere — converged, re-stamp left to the CT path"
+        );
+    }
 
-    let Some(kind) = room_calendar_business_key_divergence(
-        &legacy_hash,
-        &pg_hash,
-        legacy_count,
-        pg_count,
-    ) else {
-        return Ok(RoomCalendarProbeOutcome::Converged);
+    let Some(kind) = classification.divergence_kind() else {
+        tracing::info!(
+            probe = ROOM_CALENDAR_PROBE_KEY,
+            legacy_pairs = classification.legacy_pairs,
+            canonical_pairs = classification.canonical_pairs,
+            matched = classification.matched_bound,
+            class_b = classification.restamp.len(),
+            class_a = classification.surplus_detached.len(),
+            floor = ?classification.era_floor,
+            "[Sync] Mirror probe: calendar converged — canonical holds every in-era \
+             legacy night"
+        );
+        return Ok(RoomCalendarProbeReport {
+            outcome: RoomCalendarProbeOutcome::Converged,
+            restamp: classification.restamp,
+        });
     };
 
-    let sentinel = crate::scheduler::mirror_probe::mirror_aggregate_sentinel(ROOM_CALENDAR_PROBE_KEY);
-    let (mssql_hash, pg_row_hash) = match kind {
-        DivergenceKind::MissingPg => (Some(sentinel.clone()), None),
-        DivergenceKind::MissingMssql => (None, Some(sentinel.clone())),
-        _ => (Some(sentinel.clone()), Some(sentinel.clone())),
-    };
+    let sentinel =
+        crate::scheduler::mirror_probe::mirror_aggregate_sentinel(ROOM_CALENDAR_PROBE_KEY);
+    // Always `missing_pg` — surplus is never recorded — so the sentinel sits
+    // on the legacy side, the one that actually has the rows.
+    let (mssql_hash, pg_row_hash) = (Some(sentinel.clone()), None::<String>);
 
     tracing::warn!(
         probe = ROOM_CALENDAR_PROBE_KEY,
-        legacy_nights = legacy_count,
-        pg_nights = pg_count,
-        delta = legacy_count - pg_count,
-        floor = ?pg_min_s,
+        legacy_pairs = classification.legacy_pairs,
+        covered = classification.covered_pairs(),
+        missing = classification.missing_pg.len(),
+        sample = ?classification.missing_pair_sample(),
+        floor = ?classification.era_floor,
         kind = kind.as_str(),
-        "[Sync] Mirror probe: calendar business-key divergence recorded \
-         (re-keyed off rcal_legacy_id — issue #273)"
+        "[Sync] Mirror probe: calendar nights present in iHOTEL and ABSENT from \
+         canonical (set-diff on (room, night) — issue #282)"
     );
 
     record_divergence(
@@ -4406,27 +4655,165 @@ pub(crate) async fn probe_room_calendar_business_key(
         mssql_hash.as_deref(),
         json!({
             "scope": "aggregate",
-            "key_kind": "business_key",
+            "key_kind": "pair_set",
             "legacy_table": "HT_Room_Status",
-            "night_count": legacy_count,
-            "min_date": legacy_min,
-            "max_date": legacy_max,
+            "pair_count": classification.legacy_pairs,
+            "missing_from_pg": classification.missing_pg.len(),
+            "missing_sample": classification.missing_sample(),
+            "era_floor": classification.era_floor.map(|d| d.to_string()),
         }),
         Some(json!({
             "scope": "aggregate",
-            "key_kind": "business_key",
+            "key_kind": "pair_set",
             "mirror_table": "ht_room_calendar",
-            "night_count": pg_count,
-            "min_date": pg_min_s,
-            "max_date": pg_max_s,
+            "pair_count": classification.canonical_pairs,
+            "covered_legacy_pairs": classification.covered_pairs(),
+            "matched_bound": classification.matched_bound,
+            "detached_but_present": classification.restamp.len()
+                + classification.restamp_conflicts.len(),
+            "surplus_detached": classification.surplus_detached.len(),
+            "surplus_bound": classification.surplus_bound.len(),
         })),
         kind,
-        legacy_count.min(i32::MAX as i64) as i32,
-        pg_count.min(i32::MAX as i64) as i32,
+        classification.legacy_pairs.min(i32::MAX as usize) as i32,
+        classification.covered_pairs().min(i32::MAX as usize) as i32,
     )
     .await;
 
-    Ok(RoomCalendarProbeOutcome::Diverged)
+    Ok(RoomCalendarProbeReport {
+        outcome: RoomCalendarProbeOutcome::Diverged,
+        restamp: classification.restamp,
+    })
+}
+
+/// Issue #282 — is the class-B back-pointer heal enabled?
+///
+/// Default **OFF** (ship dark). When unset / not `"true"` the arm issues ZERO
+/// canonical writes and only logs how many candidates it saw, so detection
+/// behaviour is byte-for-byte what it would be without the heal.
+///
+/// Deliberately a SEPARATE flag from [`reconcile_force_converge_enabled`]:
+/// that one is already `true` in production at both sites, so folding a new
+/// canonical-write class into it would ship this ON with no coordinated flip
+/// — the same reasoning that gave [`reconcile_reingest_missing_pg_enabled`]
+/// its own switch.
+///
+/// The `== "true"` comparison is strict on purpose — `"TRUE"`, `"1"` and
+/// `" true"` all evaluate false, matching every other feature flag in the
+/// sync path.
+fn room_calendar_restamp_enabled() -> bool {
+    env::var("RECONCILE_CALENDAR_RESTAMP_ENABLED")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+/// What one heal pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RoomCalendarRestampOutcome {
+    /// Back-pointers actually re-stamped (canonical rows written).
+    pub(crate) restamped: usize,
+    /// Candidates that did not take: the id was rebound between the scan and
+    /// the write, the CT path stamped the tile first, or the UPDATE failed.
+    pub(crate) skipped: usize,
+}
+
+/// Class-B heal: bind a detached tile back to the legacy row that occupies
+/// the same `(room, night)`.
+///
+/// This is a canonical-only write — nothing is sent to the legacy database —
+/// and it writes exactly what the CT mapper's `ON CONFLICT … DO UPDATE` would
+/// write on the next genuine edit to that night. Without it the class is
+/// merely tolerated and grows with ordinary iHOTEL room-move traffic; with
+/// it the population shrinks every tick.
+///
+/// Failures are per-candidate and NEVER fail the tick: a skipped re-stamp
+/// loses nothing (the tile stays class B, converged, and is re-offered next
+/// tick), whereas failing the probe on it would mask the detection result
+/// this arm exists to serve.
+pub(crate) async fn restamp_room_calendar_backpointers(
+    pg_pool: &PgPool,
+    candidates: &[RoomCalendarRestamp],
+) -> RoomCalendarRestampOutcome {
+    let mut outcome = RoomCalendarRestampOutcome::default();
+    if candidates.is_empty() {
+        return outcome;
+    }
+    if !room_calendar_restamp_enabled() {
+        tracing::info!(
+            probe = ROOM_CALENDAR_PROBE_KEY,
+            candidates = candidates.len(),
+            "[Sync] Calendar back-pointer heal is DARK \
+             (RECONCILE_CALENDAR_RESTAMP_ENABLED) — class-B tiles left detached"
+        );
+        return outcome;
+    }
+
+    for candidate in candidates.iter().take(ROOM_CALENDAR_RESTAMP_MAX_PER_TICK) {
+        // `rcal_legacy_id` is INTEGER; a legacy id beyond `i32` would be a
+        // corrupt read, not a tile to heal.
+        let Ok(legacy_id) = i32::try_from(candidate.legacy_id) else {
+            outcome.skipped += 1;
+            tracing::warn!(
+                probe = ROOM_CALENDAR_PROBE_KEY,
+                rcal_id = candidate.rcal_id,
+                legacy_id = candidate.legacy_id,
+                "[Sync] Calendar back-pointer heal: legacy id does not fit INTEGER — skipped"
+            );
+            continue;
+        };
+        match sqlx::query(ROOM_CALENDAR_RESTAMP_SQL)
+            .bind(legacy_id)
+            .bind(candidate.rcal_id)
+            .execute(pg_pool)
+            .await
+        {
+            Ok(result) if result.rows_affected() == 1 => {
+                outcome.restamped += 1;
+                tracing::info!(
+                    probe = ROOM_CALENDAR_PROBE_KEY,
+                    rcal_id = candidate.rcal_id,
+                    legacy_id = candidate.legacy_id,
+                    room_no = %candidate.room_no,
+                    night = %candidate.night,
+                    legacy_rows = candidate.legacy_rows,
+                    "[Sync] Calendar back-pointer re-stamped (class B, issue #282)"
+                );
+            }
+            Ok(_) => {
+                outcome.skipped += 1;
+                tracing::info!(
+                    probe = ROOM_CALENDAR_PROBE_KEY,
+                    rcal_id = candidate.rcal_id,
+                    legacy_id = candidate.legacy_id,
+                    "[Sync] Calendar back-pointer heal: id already bound elsewhere or \
+                     tile re-stamped by the CT path — skipped"
+                );
+            }
+            Err(e) => {
+                outcome.skipped += 1;
+                tracing::warn!(
+                    probe = ROOM_CALENDAR_PROBE_KEY,
+                    rcal_id = candidate.rcal_id,
+                    legacy_id = candidate.legacy_id,
+                    error = %e,
+                    "[Sync] Calendar back-pointer heal: UPDATE failed — skipped, the \
+                     tile stays converged and is re-offered next tick"
+                );
+            }
+        }
+    }
+
+    if candidates.len() > ROOM_CALENDAR_RESTAMP_MAX_PER_TICK {
+        tracing::info!(
+            probe = ROOM_CALENDAR_PROBE_KEY,
+            candidates = candidates.len(),
+            cap = ROOM_CALENDAR_RESTAMP_MAX_PER_TICK,
+            "[Sync] Calendar back-pointer heal: candidate list exceeds the per-tick \
+             cap — the remainder is re-offered next tick"
+        );
+    }
+
+    outcome
 }
 
 /// Issue #204 (bug #2) — is the durable self-healing arm of the
@@ -12079,7 +12466,7 @@ mod tests {
     }
 
     // =====================================================================
-    // Issue #273 — calendar closure arm (business-key resolve)
+    // Issues #273 / #282 / #281 — calendar `(room, night)` set-diff arm
     // =====================================================================
 
     /// The key literal this module dispatches on must still be the one the
@@ -12098,12 +12485,12 @@ mod tests {
         );
     }
 
-    /// The closure arm introduces NO new `ht_reconcile_log.table_name` and
-    /// no new hashed entity: it RE-KEYS the existing probe's resolve. So
-    /// there is nothing to register with `gate_guard` (whose contract binds
-    /// CT-mapper idempotency gates to reconcile hashes — no probe has one)
-    /// and `RECONCILE_RESOLVABLE_TABLES` needs no new entry. This pins that
-    /// the mirror population did not grow.
+    /// The calendar arm introduces NO new `ht_reconcile_log.table_name` and
+    /// no new hashed entity: it RE-KEYS the existing probe. So there is
+    /// nothing to register with `gate_guard` (whose contract binds CT-mapper
+    /// idempotency gates to reconcile hashes — no probe has one) and
+    /// `RECONCILE_RESOLVABLE_TABLES` needs no new entry. This pins that the
+    /// mirror population did not grow.
     #[test]
     fn calendar_closure_arm_adds_no_new_resolvable_table() {
         let listed = RECONCILE_RESOLVABLE_TABLES
@@ -12113,331 +12500,518 @@ mod tests {
         assert_eq!(
             listed,
             crate::scheduler::mirror_probe::mirror_probe_keys().len(),
-            "the closure arm must re-key an EXISTING probe, not register a \
+            "the calendar arm must re-key an EXISTING probe, not register a \
              new reconcile entity"
         );
     }
 
-    /// Converged: both sides agree on the in-era night set, so the two
-    /// recomputed hashes are equal and `should_auto_resolve` CLOSES the row.
-    /// This is the property the id-keyed arm could never have.
-    #[test]
-    fn room_calendar_business_key_row_closes_when_both_sides_agree() {
-        let legacy = room_calendar_business_key_hash(1546, Some("2025-11-02"), Some("2026-08-14"));
-        let pg = room_calendar_business_key_hash(1546, Some("2025-11-02"), Some("2026-08-14"));
-        assert_eq!(legacy, pg);
-        assert!(should_auto_resolve(
-            ROOM_CALENDAR_PROBE_KEY,
-            Some(&legacy),
-            Some(&pg),
-            None
-        ));
+    // ── fixtures ─────────────────────────────────────────────────────────
+
+    fn legacy_pairs(
+        rows: &[(&str, &str, i64, i64)],
+    ) -> BTreeMap<RoomCalendarPair, LegacyCalendarNight> {
+        rows.iter()
+            .map(|(room, night, legacy_id, row_count)| {
+                (
+                    (room.to_string(), night.to_string()),
+                    LegacyCalendarNight {
+                        legacy_id: *legacy_id,
+                        row_count: *row_count,
+                    },
+                )
+            })
+            .collect()
     }
 
-    /// Still divergent: the LIVE deficit (1546 legacy nights vs 1420
-    /// canonical at HF Hotel, 2026-07-28) must keep the row OPEN. The arm
-    /// makes the gap closeable in principle — it does not pretend it is
-    /// closed today.
+    fn canonical_pairs(
+        rows: &[(&str, &str, i64, Option<i64>)],
+    ) -> BTreeMap<RoomCalendarPair, CanonicalCalendarTile> {
+        rows.iter()
+            .map(|(room, night, rcal_id, legacy_id)| {
+                (
+                    (room.to_string(), night.to_string()),
+                    CanonicalCalendarTile {
+                        rcal_id: *rcal_id,
+                        legacy_id: *legacy_id,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// HF Ville, 2026-08-10 (`docs/coexistence/sync-incident-log.md`): four
+    /// `(107, night)` slots present in `HT_Room_Status` and absent from
+    /// `ht_room_calendar` entirely, CT aged out past redelivery.
+    fn ville_dropped_nights() -> [(&'static str, &'static str, i64, i64); 4] {
+        [
+            ("107", "2026-07-28", 4692, 1),
+            ("107", "2026-08-05", 4799, 1),
+            ("107", "2026-08-06", 4815, 1),
+            ("107", "2026-08-08", 4832, 1),
+        ]
+    }
+
+    // ── the classifier ───────────────────────────────────────────────────
+
+    /// THE class the arm exists for (2026-08-10, HF Ville): nights legacy has
+    /// and canonical does not. Must be `missing_pg`, must NOT be silenced by
+    /// anything the #282 fix introduced.
     #[test]
-    fn room_calendar_business_key_row_stays_open_while_the_night_deficit_survives() {
-        let legacy = room_calendar_business_key_hash(1546, Some("2025-11-02"), Some("2026-08-14"));
-        let pg = room_calendar_business_key_hash(1420, Some("2025-11-02"), Some("2026-08-14"));
-        assert_ne!(legacy, pg);
+    fn room_calendar_genuine_missing_night_is_missing_pg() {
+        let mut legacy_rows = vec![("107", "2026-07-27", 4648, 1)];
+        legacy_rows.extend(ville_dropped_nights());
+        let legacy = legacy_pairs(&legacy_rows);
+        // Canonical holds only the night that DID sync.
+        let canonical = canonical_pairs(&[("107", "2026-07-27", 900, Some(4648))]);
+
+        let c = classify_room_calendar_pairs(&legacy, &canonical);
+        assert!(!c.is_converged());
+        assert_eq!(c.divergence_kind(), Some(DivergenceKind::MissingPg));
+        assert_eq!(c.missing_pg.len(), 4);
+        assert_eq!(c.covered_pairs(), 1);
+        assert_eq!(
+            c.missing_pg
+                .iter()
+                .map(|m| (m.night.as_str(), m.legacy_id))
+                .collect::<Vec<_>>(),
+            vec![
+                ("2026-07-28", 4692),
+                ("2026-08-05", 4799),
+                ("2026-08-06", 4815),
+                ("2026-08-08", 4832),
+            ],
+            "the missing set carries the legacy ids the operator needs, in a \
+             stable order"
+        );
+        assert!(c.restamp.is_empty());
+        assert!(c.surplus_detached.is_empty());
+        assert_ne!(c.deficit_hash(), room_calendar_converged_hash());
+    }
+
+    /// Issue #282, the false positive. A pair present on BOTH sides whose
+    /// canonical tile merely lost its back-pointer is CONVERGED — and it is
+    /// queued for the heal arm rather than tolerated.
+    #[test]
+    fn room_calendar_class_b_pair_is_converged_and_queues_a_restamp() {
+        let legacy = legacy_pairs(&[("405", "2026-05-11", 50980, 1)]);
+        let canonical = canonical_pairs(&[("405", "2026-05-11", 48, None)]);
+
+        let c = classify_room_calendar_pairs(&legacy, &canonical);
+        assert!(
+            c.is_converged(),
+            "the night IS mirrored — only the id back-pointer is stale (#282)"
+        );
+        assert_eq!(c.divergence_kind(), None);
+        assert_eq!(c.deficit_hash(), room_calendar_converged_hash());
+        assert_eq!(
+            c.restamp,
+            vec![RoomCalendarRestamp {
+                rcal_id: 48,
+                legacy_id: 50980,
+                room_no: "405".to_string(),
+                night: "2026-05-11".to_string(),
+                legacy_rows: 1,
+            }]
+        );
+        assert!(c.restamp_conflicts.is_empty());
+        assert_eq!(c.matched_bound, 0);
+    }
+
+    /// Legacy permits duplicate rows for one slot (live: ids 4223/4224/4225
+    /// all on room 201, night 2026-06-30). The re-stamp must pick the SAME
+    /// one every tick, or a retried heal writes a different id than the one
+    /// it reported.
+    #[test]
+    fn room_calendar_restamp_picks_the_min_legacy_id_when_the_slot_is_duplicated() {
+        // `MIN(id)` is applied by the SQL; the classifier must carry it
+        // through untouched and report the ambiguity.
+        let legacy = legacy_pairs(&[("201", "2026-06-30", 4223, 3)]);
+        let canonical = canonical_pairs(&[("201", "2026-06-30", 700, None)]);
+
+        let c = classify_room_calendar_pairs(&legacy, &canonical);
+        assert!(c.is_converged());
+        assert_eq!(c.restamp.len(), 1);
+        assert_eq!(c.restamp[0].legacy_id, 4223);
+        assert_eq!(c.restamp[0].legacy_rows, 3);
+        assert!(
+            room_calendar_pairs_legacy_sql(true).contains("MIN(CAST(id AS BIGINT))"),
+            "the legacy scan must be the one that picks MIN — a Rust-side \
+             pick over an unaggregated scan would depend on row order"
+        );
+    }
+
+    /// The partial unique index `ux_ht_room_calendar_legacy_id` allows one
+    /// canonical row per legacy id. A class-B tile whose legacy id is already
+    /// bound elsewhere must be left to the CT path — still converged, never a
+    /// re-stamp candidate.
+    #[test]
+    fn room_calendar_restamp_is_skipped_when_the_legacy_id_is_bound_elsewhere() {
+        let legacy = legacy_pairs(&[
+            ("405", "2026-05-11", 50980, 1),
+            ("406", "2026-05-11", 50981, 1),
+        ]);
+        // 50980 already points at room 406's tile (the allocator rebound it).
+        let canonical = canonical_pairs(&[
+            ("405", "2026-05-11", 48, None),
+            ("406", "2026-05-11", 49, Some(50980)),
+        ]);
+
+        let c = classify_room_calendar_pairs(&legacy, &canonical);
+        assert!(c.is_converged(), "both nights are mirrored");
+        assert!(
+            c.restamp.is_empty(),
+            "re-stamping a bound id would violate ux_ht_room_calendar_legacy_id"
+        );
+        assert_eq!(
+            c.restamp_conflicts,
+            vec![("405".to_string(), "2026-05-11".to_string())]
+        );
+    }
+
+    /// Class A (issue #281): a canonical tile with no legacy counterpart at
+    /// all. It is REPORTED in the classification (so the probe can log it)
+    /// and it must NOT make the comparison diverge — a row for it could never
+    /// be closed, which is what forced the 2026-07-31 Ville revert.
+    #[test]
+    fn room_calendar_class_a_surplus_is_classified_but_never_diverges() {
+        let legacy = legacy_pairs(&[("303", "2026-05-13", 50000, 1)]);
+        let canonical = canonical_pairs(&[
+            ("303", "2026-05-13", 86, Some(50000)),
+            ("303", "2026-05-14", 87, None),
+            ("303", "2026-05-15", 88, None),
+        ]);
+
+        let c = classify_room_calendar_pairs(&legacy, &canonical);
+        assert!(c.is_converged());
+        assert_eq!(c.divergence_kind(), None);
+        assert_eq!(c.deficit_hash(), room_calendar_converged_hash());
+        assert_eq!(
+            c.surplus_detached,
+            vec![
+                ("303".to_string(), "2026-05-14".to_string()),
+                ("303".to_string(), "2026-05-15".to_string()),
+            ]
+        );
+        assert!(c.surplus_bound.is_empty());
+        assert_eq!(c.matched_bound, 1);
+    }
+
+    /// A canonical-only pair that STILL carries a legacy id is a different
+    /// animal (a lost `D` event, not a #281 orphan) and is reported apart —
+    /// but it is still not recorded: the surplus side has no closure path
+    /// until #281 ships one.
+    #[test]
+    fn room_calendar_bound_surplus_is_reported_apart_and_still_not_a_divergence() {
+        let legacy = legacy_pairs(&[]);
+        let canonical = canonical_pairs(&[("311", "2026-05-30", 1571, Some(41000))]);
+
+        let c = classify_room_calendar_pairs(&legacy, &canonical);
+        assert!(c.is_converged());
+        assert_eq!(
+            c.surplus_bound,
+            vec![("311".to_string(), "2026-05-30".to_string())]
+        );
+        assert!(c.surplus_detached.is_empty());
+    }
+
+    /// THE #282 fixture: room 405's week as it stood live on 2026-08-04 —
+    /// `05-11..13` class B, `05-14`/`05-15` class A, in one comparison. A
+    /// correct implementation stays SILENT on B, LOGS A, and records nothing.
+    /// The pre-fix count comparison (mirrored-rows-only) is asserted red in
+    /// the same test so the regression cannot come back unnoticed.
+    #[test]
+    fn room_calendar_405_week_is_silent_on_class_b_and_records_nothing() {
+        let legacy = legacy_pairs(&[
+            ("405", "2026-05-11", 50980, 1),
+            ("405", "2026-05-12", 50981, 1),
+            ("405", "2026-05-13", 50982, 1),
+        ]);
+        let canonical = canonical_pairs(&[
+            ("405", "2026-05-11", 48, None),
+            ("405", "2026-05-12", 49, None),
+            ("405", "2026-05-13", 50, None),
+            ("405", "2026-05-14", 51, None),
+            ("405", "2026-05-15", 52, None),
+        ]);
+
+        let c = classify_room_calendar_pairs(&legacy, &canonical);
+        assert!(
+            c.is_converged(),
+            "every legacy night is mirrored — the 2026-08-04 `missing_pg` was \
+             an artefact of counting only bound tiles (#282)"
+        );
+        assert_eq!(c.restamp.len(), 3, "class B: 05-11..13");
+        assert_eq!(c.surplus_detached.len(), 2, "class A: 05-14, 05-15");
+        assert!(c.missing_pg.is_empty());
+        assert_eq!(c.deficit_hash(), room_calendar_converged_hash());
+
+        // PRE-FIX: the canonical side counted `rcal_legacy_id IS NOT NULL`
+        // only — 3 legacy nights vs 0 mirrored — and fabricated a deficit.
+        let bound_only = canonical
+            .values()
+            .filter(|t| t.legacy_id.is_some())
+            .count();
+        assert_eq!(bound_only, 0);
+        assert!(
+            legacy.len() > bound_only,
+            "this inequality IS the false missing_pg the count comparison \
+             reported live on 2026-08-04"
+        );
+    }
+
+    /// Sweep-closure invariant: the deficit the probe records must be the
+    /// same thing the auto-resolve sweep re-measures, so backfilling the
+    /// missing nights CLOSES the row. Both landing shapes are covered — with
+    /// the legacy id stamped (a `backfill_room_calendar` re-drive) and
+    /// without it (a tile that lands detached) — because either one means the
+    /// night is mirrored.
+    #[test]
+    fn room_calendar_row_closes_once_the_missing_nights_land() {
+        let legacy = legacy_pairs(&ville_dropped_nights());
+        let converged_hash = room_calendar_converged_hash();
+
+        let before = classify_room_calendar_pairs(&legacy, &canonical_pairs(&[]));
+        assert_eq!(before.missing_pg.len(), 4);
         assert!(!should_auto_resolve(
             ROOM_CALENDAR_PROBE_KEY,
-            Some(&legacy),
-            Some(&pg),
+            Some(&before.deficit_hash()),
+            Some(&converged_hash),
             None
         ));
+
+        for landed_id in [Some(4692), None] {
+            let after = classify_room_calendar_pairs(
+                &legacy,
+                &canonical_pairs(&[
+                    ("107", "2026-07-28", 1001, landed_id),
+                    ("107", "2026-08-05", 1002, Some(4799)),
+                    ("107", "2026-08-06", 1003, Some(4815)),
+                    ("107", "2026-08-08", 1004, Some(4832)),
+                ]),
+            );
+            assert!(after.is_converged());
+            assert_eq!(after.deficit_hash(), converged_hash);
+            assert!(
+                should_auto_resolve(
+                    ROOM_CALENDAR_PROBE_KEY,
+                    Some(&after.deficit_hash()),
+                    Some(&converged_hash),
+                    None
+                ),
+                "a backfilled night must close the row whether or not it \
+                 landed with its legacy id stamped"
+            );
+        }
     }
 
-    /// Equal counts with different coverage boundaries is still a
-    /// divergence — a night shifted off one end of the window is exactly
-    /// the shape a count-only comparison would miss.
+    /// THE property that eliminates the record/resolve churn loop: for every
+    /// fixture, detection's "converged?" answer (`is_converged`) and
+    /// `should_auto_resolve`'s verdict on the very hashes the two resolve
+    /// arms produce must agree. Before the arm shared one classification the
+    /// two asked different questions, so resolve could close a row detection
+    /// immediately re-opened.
     #[test]
-    fn room_calendar_business_key_hash_covers_both_coverage_boundaries() {
-        let base = room_calendar_business_key_hash(1546, Some("2025-11-02"), Some("2026-08-14"));
+    fn detection_and_resolution_agree_on_convergence_for_every_fixture() {
+        let converged_hash = room_calendar_converged_hash();
+        let cases: Vec<(&str, RoomCalendarClassification)> = vec![
+            (
+                "empty on both sides",
+                classify_room_calendar_pairs(&legacy_pairs(&[]), &canonical_pairs(&[])),
+            ),
+            (
+                "fully mirrored",
+                classify_room_calendar_pairs(
+                    &legacy_pairs(&[("301", "2025-04-13", 39707, 1)]),
+                    &canonical_pairs(&[("301", "2025-04-13", 6425, Some(39707))]),
+                ),
+            ),
+            (
+                "class B only (#282, HF Hotel 2026-08-04)",
+                classify_room_calendar_pairs(
+                    &legacy_pairs(&[("405", "2026-05-11", 50980, 1)]),
+                    &canonical_pairs(&[("405", "2026-05-11", 48, None)]),
+                ),
+            ),
+            (
+                "class A only (#281, both sites)",
+                classify_room_calendar_pairs(
+                    &legacy_pairs(&[]),
+                    &canonical_pairs(&[("303", "2026-05-14", 87, None)]),
+                ),
+            ),
+            (
+                "genuine deficit (HF Ville 2026-08-10)",
+                classify_room_calendar_pairs(
+                    &legacy_pairs(&ville_dropped_nights()),
+                    &canonical_pairs(&[]),
+                ),
+            ),
+            (
+                "deficit alongside both surplus classes",
+                classify_room_calendar_pairs(
+                    &legacy_pairs(&[("107", "2026-08-05", 4799, 1), ("405", "2026-05-11", 50980, 1)]),
+                    &canonical_pairs(&[
+                        ("405", "2026-05-11", 48, None),
+                        ("303", "2026-05-14", 87, None),
+                    ]),
+                ),
+            ),
+        ];
+
+        for (name, c) in cases {
+            let resolution_says_converged = should_auto_resolve(
+                ROOM_CALENDAR_PROBE_KEY,
+                Some(&c.deficit_hash()),
+                Some(&converged_hash),
+                None,
+            );
+            assert_eq!(
+                resolution_says_converged,
+                c.is_converged(),
+                "detection and resolution disagree for `{name}` — this IS the \
+                 churn-loop hazard the shared classification exists to close"
+            );
+        }
+    }
+
+    /// The convergence channel: content-addressed, empty-set-is-a-real-hash,
+    /// and incapable of colliding with the id-keyed aggregate hash the
+    /// generic probe computes for the same key (they measure different
+    /// things; a collision would let a mixed-binary fleet close a row on the
+    /// wrong comparison).
+    #[test]
+    fn room_calendar_deficit_hash_is_content_addressed_and_collision_free() {
+        let one = |room: &str, night: &str, id: i64| RoomCalendarMissingNight {
+            room_no: room.to_string(),
+            night: night.to_string(),
+            legacy_id: id,
+        };
+        let converged = room_calendar_converged_hash();
+        assert!(!converged.is_empty(), "an empty deficit is a REAL hash");
+        assert_eq!(converged, room_calendar_deficit_hash(&[]));
+
+        let a = room_calendar_deficit_hash(&[one("107", "2026-08-05", 4799)]);
+        let b = room_calendar_deficit_hash(&[one("107", "2026-08-06", 4815)]);
+        assert_ne!(a, converged);
         assert_ne!(
-            base,
-            room_calendar_business_key_hash(1546, Some("2025-11-03"), Some("2026-08-14"))
+            a, b,
+            "same-sized but DIFFERENT deficits must not hash alike — one \
+             night backfilled while another drops is not convergence"
         );
         assert_ne!(
-            base,
-            room_calendar_business_key_hash(1546, Some("2025-11-02"), Some("2026-08-15"))
+            a,
+            room_calendar_deficit_hash(&[
+                one("107", "2026-08-05", 4799),
+                one("107", "2026-08-06", 4815)
+            ])
         );
-    }
-
-    /// ABSENT-SIDE semantics: an empty calendar on BOTH sides is a real
-    /// converged state, so it must hash to something equal and non-empty and
-    /// close the row — the same contract as `mirror_absent_hash`. Returning
-    /// "no hash" here would leave such a row open forever.
-    #[test]
-    fn room_calendar_business_key_absent_on_both_sides_converges() {
-        let empty = room_calendar_business_key_hash(0, None, None);
-        assert!(!empty.is_empty());
-        assert!(should_auto_resolve(
-            ROOM_CALENDAR_PROBE_KEY,
-            Some(&empty),
-            Some(&empty),
-            None
-        ));
-        // Absent on ONE side only is NOT converged.
-        let populated =
-            room_calendar_business_key_hash(1546, Some("2025-11-02"), Some("2026-08-14"));
-        assert_ne!(empty, populated);
-        assert!(!should_auto_resolve(
-            ROOM_CALENDAR_PROBE_KEY,
-            Some(&populated),
-            Some(&empty),
-            None
-        ));
-    }
-
-    /// The business-key hash must never collide with the id-keyed aggregate
-    /// hash the generic probe computes for the same key and the same counts.
-    /// They measure different things; a collision would let a mixed-binary
-    /// fleet close a row on the wrong comparison.
-    #[test]
-    fn room_calendar_business_key_hash_is_distinct_from_the_id_keyed_aggregate() {
         assert_ne!(
-            room_calendar_business_key_hash(1546, None, None),
+            converged,
             crate::scheduler::mirror_probe::mirror_aggregate_hash(
                 ROOM_CALENDAR_PROBE_KEY,
-                1546,
+                0,
                 None,
                 None
             )
         );
     }
 
-    /// The era floor is DERIVED from the mirror (`MIN(rcal_date)`), never
-    /// configured and never a rolling window — the `PAYMENTS_ERA_FLOOR_SQL`
-    /// lesson.
+    /// Never `Cardinality` (the hourly drift digest filters that kind out, so
+    /// it would go unpaged) and never `MissingMssql` (surplus is deliberately
+    /// not recorded — issue #281 owns that side).
     #[test]
-    fn room_calendar_era_floor_is_derived_from_the_mirror() {
-        assert!(ROOM_CALENDAR_BUSINESS_KEY_PG_SQL.contains("MIN(rcal_date)"));
-        assert!(ROOM_CALENDAR_BUSINESS_KEY_PG_SQL.contains("MAX(rcal_date)"));
-        assert!(ROOM_CALENDAR_BUSINESS_KEY_PG_SQL.contains("FROM ht_room_calendar"));
+    fn room_calendar_divergence_is_missing_pg_or_nothing() {
+        for c in [
+            classify_room_calendar_pairs(&legacy_pairs(&ville_dropped_nights()), &canonical_pairs(&[])),
+            classify_room_calendar_pairs(
+                &legacy_pairs(&[]),
+                &canonical_pairs(&[("303", "2026-05-14", 87, None)]),
+            ),
+            classify_room_calendar_pairs(&legacy_pairs(&[]), &canonical_pairs(&[])),
+        ] {
+            match c.divergence_kind() {
+                None => assert!(c.is_converged()),
+                Some(kind) => assert_eq!(kind, DivergenceKind::MissingPg),
+            }
+        }
+    }
+
+    // ── SQL shape ────────────────────────────────────────────────────────
+
+    /// The era floor is DERIVED from the MIRRORED population (`MIN(rcal_date)`
+    /// where the back-pointer survives), never configured and never a rolling
+    /// window — the `PAYMENTS_ERA_FLOOR_SQL` lesson. Scoping the FLOOR to
+    /// mirrored rows is right (a detached tile older than the mirror's first
+    /// mirrored night would drag legacy history into a window the mirror
+    /// never covered); scoping the COMPARISON to them was issue #282.
+    #[test]
+    fn room_calendar_era_floor_is_derived_from_the_mirrored_population() {
+        assert!(ROOM_CALENDAR_ERA_FLOOR_SQL.contains("MIN(rcal_date)"));
+        assert!(ROOM_CALENDAR_ERA_FLOOR_SQL.contains("FROM ht_room_calendar"));
+        assert!(ROOM_CALENDAR_ERA_FLOOR_SQL.contains("WHERE rcal_legacy_id IS NOT NULL"));
         assert!(
-            !ROOM_CALENDAR_BUSINESS_KEY_PG_SQL.contains("INTERVAL"),
+            !ROOM_CALENDAR_ERA_FLOOR_SQL.contains("INTERVAL"),
             "the floor must be the mirror's own coverage boundary, not a \
              rolling window"
         );
     }
 
-    /// Issue #273 (2026-07-31) — THE fix. The canonical side of a MIRROR
-    /// comparison must see only MIRRORED rows: a tile with no
-    /// `rcal_legacy_id` has no legacy counterpart to diverge FROM, so
-    /// counting it books local-only state as `missing_mssql` and mints a row
-    /// nothing can ever close.
-    ///
-    /// Two shape properties, both load-bearing:
-    ///
-    /// * the exclusion is a table-level `WHERE`, NOT a `FILTER` clause on
-    ///   `COUNT` — `MIN(rcal_date)` IS the era floor pushed into the legacy
-    ///   scan and `MAX(rcal_date)` is compared against the legacy `MAX`, so a
-    ///   local-only tile outside the mirrored window must not move either
-    ///   boundary;
-    /// * it lives in the ONE shared fetch, so DETECTION and the closure arm
-    ///   move together (see
-    ///   `room_calendar_detection_and_closure_read_the_same_canonical_sql`).
+    /// Issue #282 — THE fix. The canonical PAIR scan must see EVERY in-era
+    /// tile, detached ones included: a tile with a NULL back-pointer may well
+    /// be a night legacy still holds (class B), and filtering it out is what
+    /// fabricated the 2026-08-04 `missing_pg`.
     #[test]
-    fn room_calendar_pg_side_counts_only_mirrored_rows() {
-        let sql: String = ROOM_CALENDAR_BUSINESS_KEY_PG_SQL
+    fn room_calendar_pair_scan_sees_detached_tiles_too() {
+        let sql: String = ROOM_CALENDAR_PAIRS_PG_SQL
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
         assert!(
-            sql.contains("FROM ht_room_calendar WHERE rcal_legacy_id IS NOT NULL"),
-            "the canonical side must count MIRRORED rows only — a detached \
-             formerly-mirrored tile (rcal_legacy_id NULLed by the mapper's \
-             id-reuse pre-clear) has no legacy counterpart to diverge from \
-             and opens an unclosable row (live 2026-07-31, HF Ville: legacy \
-             1637 vs pg 1676, delta 39 = the whole NULL-id population): {sql}"
+            !sql.contains("rcal_legacy_id IS NOT NULL"),
+            "the pair scan must NOT be scoped to bound tiles — that filter \
+             hid class-B nights and fabricated a deficit (#282): {sql}"
         );
         assert!(
-            !sql.contains("FILTER"),
-            "the exclusion must scope the whole aggregate, not just the \
-             count — MIN is the era floor and MAX is a compared boundary, and \
-             both must describe the mirrored set: {sql}"
+            sql.contains("c.rcal_legacy_id"),
+            "the scan must carry the back-pointer's nullability per pair so \
+             class A and class B can be told apart: {sql}"
         );
-        assert_eq!(
-            sql.matches("rcal_legacy_id").count(),
-            1,
-            "exactly one exclusion, applied once to the whole aggregate: {sql}"
+        assert!(
+            sql.contains("c.rcal_id"),
+            "the re-stamp needs the tile's own PK as its target: {sql}"
         );
-    }
-
-    /// The exclusion must sit in the SHARED fetch both halves call, never in
-    /// one dispatch arm. Detection (`probe_room_calendar_business_key`) and
-    /// closure (`compute_room_calendar_business_key_pg_hash`) both read the
-    /// canonical side exclusively through `fetch_calendar_business_key_pg`;
-    /// if either grew its own canonical query, a row one opened could become
-    /// one the other can never close — the exact failure this issue exists to
-    /// kill.
-    #[test]
-    fn room_calendar_detection_and_closure_read_the_same_canonical_sql() {
-        let src = scheduler_source_before_tests();
-        for func in [
-            // closure, canonical half
-            "async fn compute_room_calendar_business_key_pg_hash(",
-            // closure, legacy half — reads the canonical MIN as its era floor
-            "async fn compute_room_calendar_business_key_legacy_hash(",
-            // detection
-            "pub(crate) async fn probe_room_calendar_business_key(",
-        ] {
-            let start = src.find(func).unwrap_or_else(|| panic!("{func} must exist"));
-            let rest = &src[start..];
-            let body = &rest[..rest.find("\n}\n").map(|i| i + 3).unwrap_or(rest.len())];
-            assert!(
-                body.contains("fetch_calendar_business_key_pg(pg_pool)"),
-                "{func} must read the canonical side through the SHARED fetch, \
-                 so the mirrored-rows-only exclusion applies to detection and \
-                 closure identically"
-            );
-            assert!(
-                !body.contains("FROM ht_room_calendar"),
-                "{func} must not carry its own canonical query — one shared \
-                 definition of the canonical business key, or detection and \
-                 closure can disagree about `converged` and a recorded row \
-                 becomes unclosable"
-            );
-        }
-    }
-
-    /// Issue #273, the live Ville tick that forced the revert. Detached
-    /// formerly-mirrored tiles present canonically must NOT read as
-    /// divergence; the SAME numbers WITHOUT the exclusion must — that second
-    /// assertion is what makes this test red if the `WHERE` is ever dropped,
-    /// because the unfiltered canonical count is exactly what the pre-fix
-    /// code fed in.
-    #[test]
-    fn room_calendar_detached_tiles_do_not_read_as_divergence() {
-        // HF Ville, 2026-07-31: 1637 in-era legacy nights; 1676 canonical
-        // rows of which 39 carry no `rcal_legacy_id` (detached formerly-
-        // mirrored tiles — see the "Calendar closure arm" module docs).
-        const LEGACY_NIGHTS: i64 = 1637;
-        const PG_TOTAL: i64 = 1676;
-        const PG_DETACHED: i64 = 39;
-        const PG_MIRRORED: i64 = PG_TOTAL - PG_DETACHED;
-
-        let legacy = room_calendar_business_key_hash(
-            LEGACY_NIGHTS,
-            Some("2025-11-02"),
-            Some("2026-08-14"),
+        assert!(
+            sql.contains("JOIN ht_rooms_new r ON r.room_id = c.rcal_room_id"),
+            "room_no is the half of the business key legacy speaks: {sql}"
         );
-
-        // FIXED: canonical counts mirrored rows only → converged, silent.
-        let pg_mirrored =
-            room_calendar_business_key_hash(PG_MIRRORED, Some("2025-11-02"), Some("2026-08-14"));
-        assert_eq!(
-            room_calendar_business_key_divergence(
-                &legacy,
-                &pg_mirrored,
-                LEGACY_NIGHTS,
-                PG_MIRRORED
-            ),
-            None,
-            "detached formerly-mirrored tiles must not manufacture a divergence"
+        assert!(
+            !sql.contains("TRIM(") && !sql.contains("LOWER("),
+            "room_no matching must stay EXACT — `resolve::resolve_room_id` \
+             uses `room_no = $1`, and a normalisation here would disagree \
+             with the mapper about which slot a legacy row belongs to: {sql}"
         );
-        assert!(should_auto_resolve(
-            ROOM_CALENDAR_PROBE_KEY,
-            Some(&legacy),
-            Some(&pg_mirrored),
-            None
-        ));
-
-        // PRE-FIX: canonical counted every row → `missing_mssql`, and no
-        // re-drive or operator action could ever close it.
-        let pg_unfiltered =
-            room_calendar_business_key_hash(PG_TOTAL, Some("2025-11-02"), Some("2026-08-14"));
-        assert_eq!(
-            room_calendar_business_key_divergence(
-                &legacy,
-                &pg_unfiltered,
-                LEGACY_NIGHTS,
-                PG_TOTAL
-            ),
-            Some(DivergenceKind::MissingMssql),
-            "the unfiltered canonical count is the unclosable row the live \
-             tick minted — this pins WHY the exclusion exists"
+        assert!(
+            sql.contains("$1::date IS NULL OR c.rcal_date >= $1::date"),
+            "the floor is a BOUND parameter and NULL means `no mirrored \
+             coverage — compare everything`: {sql}"
         );
     }
 
-    /// The exclusion must not blind the probe: a mirrored night that is
-    /// genuinely absent from canonical is still `missing_pg` and still keeps
-    /// the row open. Same Ville baseline, one mirrored night short.
-    #[test]
-    fn room_calendar_missing_mirrored_night_still_diverges() {
-        let legacy = room_calendar_business_key_hash(1637, Some("2025-11-02"), Some("2026-08-14"));
-        let pg = room_calendar_business_key_hash(1636, Some("2025-11-02"), Some("2026-08-14"));
-        assert_eq!(
-            room_calendar_business_key_divergence(&legacy, &pg, 1637, 1636),
-            Some(DivergenceKind::MissingPg),
-            "a real mirrored-night deficit must survive the mirrored-only \
-             scoping — the fix narrows WHAT is compared, not WHETHER gaps are \
-             reported"
-        );
-        assert!(!should_auto_resolve(
-            ROOM_CALENDAR_PROBE_KEY,
-            Some(&legacy),
-            Some(&pg),
-            None
-        ));
-
-        // …and a mirrored night present only in canonical is still
-        // `missing_mssql` — the exclusion removes local-only tiles from the
-        // comparison, not surplus MIRRORED rows (a legacy row deleted
-        // whose `D` event never applied is real divergence).
-        let pg_surplus =
-            room_calendar_business_key_hash(1638, Some("2025-11-02"), Some("2026-08-14"));
-        assert_eq!(
-            room_calendar_business_key_divergence(&legacy, &pg_surplus, 1637, 1638),
-            Some(DivergenceKind::MissingMssql)
-        );
-    }
-
-    /// Boundary half of the same fix: because the exclusion is table-level,
-    /// a local-only tile beyond the mirrored coverage window cannot shift
-    /// `MAX(rcal_date)` (nor `MIN`, the era floor). This pins that such a
-    /// shift WOULD have been a divergence, so scoping the boundaries is not
-    /// cosmetic.
-    #[test]
-    fn room_calendar_detached_tiles_must_not_move_the_coverage_boundaries() {
-        let legacy = room_calendar_business_key_hash(1637, Some("2025-11-02"), Some("2026-08-14"));
-        let mirrored_window =
-            room_calendar_business_key_hash(1637, Some("2025-11-02"), Some("2026-08-14"));
-        assert_eq!(legacy, mirrored_window);
-
-        // Same night COUNT, but a boundary dragged out by a local-only tile.
-        for stretched in [
-            room_calendar_business_key_hash(1637, Some("2025-10-01"), Some("2026-08-14")),
-            room_calendar_business_key_hash(1637, Some("2025-11-02"), Some("2026-09-30")),
-        ] {
-            assert_eq!(
-                room_calendar_business_key_divergence(&legacy, &stretched, 1637, 1637),
-                Some(DivergenceKind::Value),
-                "an unscoped MIN/MAX would diverge on boundaries alone — the \
-                 `WHERE` must cover them, not just the count"
-            );
-        }
-    }
-
-    /// The legacy side must count DISTINCT `(room_no, night)` pairs:
+    /// The legacy side must collapse to distinct `(room_no, night)` pairs:
     /// canonical is UNIQUE on `(rcal_room_id, rcal_date)` while
-    /// `HT_Room_Status` is not, so a raw `COUNT(*)` would report the legacy
-    /// allocator's duplicates as a permanent deficit. The floor is pushed
-    /// into the scan as a BOUND parameter, and an empty mirror scans the
-    /// whole table (that IS the finding).
+    /// `HT_Room_Status` is not, so a raw row scan would report the legacy
+    /// allocator's duplicates as a permanent deficit. `GROUP BY` (not
+    /// `DISTINCT`) because the re-stamp needs one deterministic id per slot.
     #[test]
-    fn room_calendar_legacy_sql_counts_distinct_nights_and_pushes_the_floor() {
-        let floored = room_calendar_business_key_legacy_sql(true);
-        assert!(floored.contains("SELECT DISTINCT room_no, CAST(room_date AS DATE) AS night_date"));
-        assert!(floored.contains("COUNT_BIG(*)"));
+    fn room_calendar_legacy_sql_groups_pairs_and_pushes_the_floor() {
+        let floored = room_calendar_pairs_legacy_sql(true);
+        assert!(floored.contains("GROUP BY room_no, CAST(room_date AS DATE)"));
+        assert!(floored.contains("MIN(CAST(id AS BIGINT)) AS legacy_id"));
+        assert!(floored.contains("COUNT_BIG(*) AS row_count"));
         assert!(floored.contains("CAST(room_date AS DATE) >= CAST(@P1 AS DATE)"));
         assert!(
-            floored.contains("CONVERT(varchar(10), MIN(night_date), 23)"),
-            "boundaries must come back as ISO text so both sides hash \
+            floored.contains("CONVERT(varchar(10), CAST(room_date AS DATE), 23)"),
+            "the night must come back as ISO text so both sides key on \
              byte-identical YYYY-MM-DD"
         );
         assert!(
@@ -12445,13 +13019,110 @@ mod tests {
             "no `N'…'` literals against the legacy DB — TIS-620 corruption"
         );
 
-        let unfloored = room_calendar_business_key_legacy_sql(false);
+        let unfloored = room_calendar_pairs_legacy_sql(false);
         assert!(
             !unfloored.contains("@P1"),
             "an empty mirror binds no floor — it scans the whole table on \
              purpose"
         );
-        assert!(unfloored.contains("SELECT DISTINCT room_no"));
+        assert!(unfloored.contains("GROUP BY room_no, CAST(room_date AS DATE)"));
+    }
+
+    /// The heal arm's single statement must be incapable of violating
+    /// `ux_ht_room_calendar_legacy_id` and incapable of clobbering a pointer
+    /// the CT mapper stamped between the scan and the write.
+    #[test]
+    fn room_calendar_restamp_sql_cannot_break_the_partial_unique_index() {
+        let sql: String = ROOM_CALENDAR_RESTAMP_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(sql.starts_with("UPDATE ht_room_calendar SET rcal_legacy_id = $1"));
+        assert!(
+            sql.contains("rcal_updated_at = NOW()"),
+            "a healed tile must look edited: {sql}"
+        );
+        assert!(
+            sql.contains("WHERE rcal_id = $2"),
+            "the target is the exact tile the classifier resolved: {sql}"
+        );
+        assert!(
+            sql.contains("AND rcal_legacy_id IS NULL"),
+            "idempotent, and it must not overwrite a pointer the CT path \
+             stamped in the meantime: {sql}"
+        );
+        assert!(
+            sql.contains("NOT EXISTS (SELECT 1 FROM ht_room_calendar other WHERE other.rcal_legacy_id = $1)"),
+            "the id must not already be bound to another row — the partial \
+             unique index would raise: {sql}"
+        );
+    }
+
+    /// The heal writes canonical state, so it ships DARK on its own switch —
+    /// NOT folded into `RECONCILE_FORCE_CONVERGE_ENABLED`, which is already
+    /// `true` in production at both sites and would have shipped this on with
+    /// no coordinated flip (the `reconcile_reingest_missing_pg_enabled`
+    /// precedent).
+    #[test]
+    fn calendar_restamp_flag_defaults_off_and_is_strict() {
+        const FLAG: &str = "RECONCILE_CALENDAR_RESTAMP_ENABLED";
+        assert!(!with_self_heal_flag_env(FLAG, None, {
+            room_calendar_restamp_enabled
+        }));
+        assert!(!with_self_heal_flag_env(FLAG, Some("TRUE"), {
+            room_calendar_restamp_enabled
+        }));
+        assert!(!with_self_heal_flag_env(FLAG, Some("1"), {
+            room_calendar_restamp_enabled
+        }));
+        assert!(with_self_heal_flag_env(FLAG, Some("true"), {
+            room_calendar_restamp_enabled
+        }));
+        assert_ne!(
+            FLAG, FORCE_CONVERGE_FLAG,
+            "a brand-new canonical-write class must not ride an already-live \
+             flag"
+        );
+    }
+
+    // ── wiring ───────────────────────────────────────────────────────────
+
+    /// Detection and closure must read ONE comparison. If either grew its own
+    /// query, a row one opened could become one the other can never close —
+    /// the exact failure this arm exists to kill.
+    #[test]
+    fn room_calendar_detection_and_closure_share_one_comparison() {
+        let src = scheduler_source_before_tests();
+        for func in [
+            "async fn compute_room_calendar_deficit_hash(",
+            "pub(crate) async fn probe_room_calendar_business_key(",
+        ] {
+            let start = src.find(func).unwrap_or_else(|| panic!("{func} must exist"));
+            let rest = &src[start..];
+            let body = &rest[..rest.find("\n}\n").map(|i| i + 3).unwrap_or(rest.len())];
+            assert!(
+                body.contains("compare_room_calendar_pairs(legacy_pool, pg_pool)"),
+                "{func} must go through the SHARED comparison, so detection \
+                 and closure cannot disagree about `converged`"
+            );
+            assert!(
+                !body.contains("FROM ht_room_calendar"),
+                "{func} must not carry its own query — one shared definition \
+                 of the pair sets, or a recorded row becomes unclosable"
+            );
+        }
+        // The canonical resolve arm answers with the target of that same
+        // comparison rather than a query of its own.
+        let pg_arm_at = src
+            .find("async fn compute_current_pg_hash(")
+            .expect("the canonical dispatch must exist");
+        let rest = &src[pg_arm_at..];
+        let pg_arm = &rest[..rest.find("\n}\n").map(|i| i + 3).unwrap_or(rest.len())];
+        assert!(
+            pg_arm.contains("Ok(Some(room_calendar_converged_hash()))"),
+            "the canonical side of a set-diff contributes the EMPTY deficit; \
+             the comparison itself lives in the arm that holds both pools"
+        );
     }
 
     /// ORDER IS LOAD-BEARING. The calendar arm must precede the generic
@@ -12472,15 +13143,15 @@ mod tests {
 
             let calendar_at = body
                 .find("ROOM_CALENDAR_PROBE_KEY")
-                .unwrap_or_else(|| panic!("{func} must dispatch the calendar closure arm"));
+                .unwrap_or_else(|| panic!("{func} must dispatch the calendar arm"));
             let generic_at = body
                 .find("mirror_probe::probe_for_table(t).is_some()")
                 .unwrap_or_else(|| panic!("{func} must still dispatch the generic probe arm"));
             assert!(
                 calendar_at < generic_at,
-                "{func}: the calendar business-key arm must come BEFORE the \
-                 generic probe arm, or the never-equal id-keyed aggregate \
-                 wins and the row can never close"
+                "{func}: the calendar arm must come BEFORE the generic probe \
+                 arm, or the never-equal id-keyed aggregate wins and the row \
+                 can never close"
             );
             assert!(
                 body[calendar_at..generic_at].contains("MIRROR_AGGREGATE_PK"),
@@ -12490,189 +13161,15 @@ mod tests {
         }
     }
 
-    // =====================================================================
-    // Issue #273 (remainder) — calendar DETECTION re-keyed to the business
-    // key, `observe_only` flipped
-    // =====================================================================
-
-    /// THE property that eliminates the record/resolve churn loop: for the
-    /// SAME pair of hashes, detection's "converged?" question
-    /// (`room_calendar_business_key_divergence` returning `None`) and
-    /// `should_auto_resolve`'s primary-convergence arm must agree, because
-    /// both are now `legacy_hash == pg_hash` and nothing else. Before this
-    /// change detection asked a DIFFERENT question (the id-keyed aggregate),
-    /// so the two could disagree — resolve closing a row detection would
-    /// immediately re-open. If this test ever fails, that hazard is back.
-    #[test]
-    fn detection_and_resolution_agree_on_convergence_for_every_hash_pair() {
-        let cases: &[(i64, Option<&str>, Option<&str>, i64, Option<&str>, Option<&str>)] = &[
-            // Converged: identical counts and boundaries.
-            (
-                1420,
-                Some("2025-11-02"),
-                Some("2026-08-14"),
-                1420,
-                Some("2025-11-02"),
-                Some("2026-08-14"),
-            ),
-            // Diverged: the live HF Hotel deficit (2026-07-28).
-            (
-                1546,
-                Some("2025-11-02"),
-                Some("2026-08-14"),
-                1420,
-                Some("2025-11-02"),
-                Some("2026-08-14"),
-            ),
-            // Converged: absent on both sides (an empty calendar).
-            (0, None, None, 0, None, None),
-            // Converged: HF Ville after the mirrored-rows-only scoping
-            // (2026-07-31) — 1637 legacy nights vs 1676 − 39 detached tiles.
-            (
-                1637,
-                Some("2025-11-02"),
-                Some("2026-08-14"),
-                1637,
-                Some("2025-11-02"),
-                Some("2026-08-14"),
-            ),
-            // Diverged: the SAME live tick BEFORE that scoping — canonical
-            // counted all 1676 rows. Both halves must still answer alike,
-            // even for the pair that used to mint an unclosable row.
-            (
-                1637,
-                Some("2025-11-02"),
-                Some("2026-08-14"),
-                1676,
-                Some("2025-11-02"),
-                Some("2026-08-14"),
-            ),
-            // Diverged: same count, boundary shifted by a day.
-            (
-                1420,
-                Some("2025-11-02"),
-                Some("2026-08-14"),
-                1420,
-                Some("2025-11-03"),
-                Some("2026-08-14"),
-            ),
-        ];
-
-        for (legacy_count, legacy_min, legacy_max, pg_count, pg_min, pg_max) in cases.iter().copied()
-        {
-            let legacy_hash = room_calendar_business_key_hash(legacy_count, legacy_min, legacy_max);
-            let pg_hash = room_calendar_business_key_hash(pg_count, pg_min, pg_max);
-
-            let resolution_says_converged = should_auto_resolve(
-                ROOM_CALENDAR_PROBE_KEY,
-                Some(&legacy_hash),
-                Some(&pg_hash),
-                None,
-            );
-            let detection_says_converged = room_calendar_business_key_divergence(
-                &legacy_hash,
-                &pg_hash,
-                legacy_count,
-                pg_count,
-            )
-            .is_none();
-
-            assert_eq!(
-                resolution_says_converged, detection_says_converged,
-                "detection and resolution disagree for legacy=({legacy_count}, {legacy_min:?}, \
-                 {legacy_max:?}) pg=({pg_count}, {pg_min:?}, {pg_max:?}) — this IS the \
-                 churn-loop hazard issue #273 (remainder) exists to close"
-            );
-        }
-    }
-
-    /// Business-key detection correctness: converges only when the hashes
-    /// agree, regardless of the raw counts passed alongside them (the counts
-    /// are only consulted once a divergence is already known to exist, to
-    /// pick a direction).
-    #[test]
-    fn room_calendar_business_key_divergence_converges_when_hashes_agree() {
-        let h = room_calendar_business_key_hash(1420, Some("2025-11-02"), Some("2026-08-14"));
-        assert_eq!(
-            room_calendar_business_key_divergence(&h, &h, 1420, 1420),
-            None
-        );
-    }
-
-    /// Business-key detection correctness: direction follows which side has
-    /// more nights, exactly like `mirror_probe::aggregate_divergence_kind`,
-    /// and a count-equal-but-boundary-shifted pair reads as `Value` — never
-    /// `Cardinality` (the hourly drift digest excludes it).
-    #[test]
-    fn room_calendar_business_key_divergence_classifies_by_direction() {
-        let legacy = room_calendar_business_key_hash(1546, Some("2025-11-02"), Some("2026-08-14"));
-        let pg = room_calendar_business_key_hash(1420, Some("2025-11-02"), Some("2026-08-14"));
-
-        assert_eq!(
-            room_calendar_business_key_divergence(&legacy, &pg, 1546, 1420),
-            Some(DivergenceKind::MissingPg)
-        );
-        assert_eq!(
-            room_calendar_business_key_divergence(&pg, &legacy, 1420, 1546),
-            Some(DivergenceKind::MissingMssql)
-        );
-
-        let shifted = room_calendar_business_key_hash(1420, Some("2025-11-03"), Some("2026-08-14"));
-        assert_eq!(
-            room_calendar_business_key_divergence(&pg, &shifted, 1420, 1420),
-            Some(DivergenceKind::Value)
-        );
-
-        for (l_hash, p_hash, lc, pc) in [(&legacy, &pg, 1546, 1420), (&pg, &legacy, 1420, 1546)] {
-            assert_ne!(
-                room_calendar_business_key_divergence(l_hash, p_hash, lc, pc),
-                Some(DivergenceKind::Cardinality),
-                "a probe must never emit `cardinality` — the hourly drift digest \
-                 excludes it and it would go unpaged"
-            );
-        }
-    }
-
-    /// "Recording resumes when counts change again": the divergence check
-    /// has no memory between calls — a converged pair sandwiched between two
-    /// DIFFERENT diverged pairs reports exactly what each call's own inputs
-    /// say, never something left over from the call before. This is what
-    /// makes a recorded row's eventual convergence (a re-drive, or the gap
-    /// closing) followed by a LATER new gap behave as "detect it again", not
-    /// "stay silent because this table already had a row once".
-    #[test]
-    fn room_calendar_business_key_divergence_recomputes_fresh_every_call() {
-        let legacy = room_calendar_business_key_hash(1546, Some("2025-11-02"), Some("2026-08-14"));
-        let pg = room_calendar_business_key_hash(1420, Some("2025-11-02"), Some("2026-08-14"));
-        assert!(room_calendar_business_key_divergence(&legacy, &pg, 1546, 1420).is_some());
-
-        let converged = room_calendar_business_key_hash(1546, Some("2025-11-02"), Some("2026-08-14"));
-        assert!(
-            room_calendar_business_key_divergence(&converged, &converged, 1546, 1546).is_none()
-        );
-
-        // A brand-new gap, evaluated right after a converged call — nothing
-        // about the converged call above leaks into this one.
-        let legacy2 = room_calendar_business_key_hash(1550, Some("2025-11-02"), Some("2026-08-14"));
-        assert_eq!(
-            room_calendar_business_key_divergence(&legacy2, &converged, 1550, 1546),
-            Some(DivergenceKind::MissingPg)
-        );
-    }
-
-    /// "No re-mint of a resolved row when counts unchanged": what actually
-    /// prevents `record_divergence` from inserting a second row for an
-    /// UNCHANGED, still-open mismatch is that the stored `mssql_hash` /
-    /// `pg_hash` are the STABLE sentinel
-    /// (`mirror_probe::mirror_aggregate_sentinel`), never the live
-    /// business-key hash — `record_divergence`'s `NOT EXISTS (…) AND
-    /// mssql_hash IS NOT DISTINCT FROM $4` dedupe then matches the row
-    /// already open from the previous tick and skips the insert. A live hash
-    /// would differ from tick to tick as the legacy table merely grew and
-    /// defeat that dedupe, minting a fresh row every tick for a table with a
-    /// known backlog. Source-scanned because this is a property of what gets
-    /// PASSED to `record_divergence`, not of any pure function's return
-    /// value.
+    /// "No re-mint of a still-open row": what prevents `record_divergence`
+    /// from inserting a second row for an UNCHANGED mismatch is that the
+    /// stored `mssql_hash` / `pg_hash` are the STABLE sentinel
+    /// (`mirror_probe::mirror_aggregate_sentinel`), never the live deficit
+    /// hash — `record_divergence`'s `NOT EXISTS (…) AND mssql_hash IS NOT
+    /// DISTINCT FROM $4` dedupe then matches the row already open from the
+    /// previous tick. A live hash would move the moment one more night went
+    /// missing and mint a fresh row. Source-scanned because this is a
+    /// property of what gets PASSED to `record_divergence`.
     #[test]
     fn calendar_detection_records_the_stable_sentinel_not_the_live_hash() {
         let src = scheduler_source_before_tests();
@@ -12684,32 +13181,24 @@ mod tests {
 
         assert!(
             body.contains("mirror_aggregate_sentinel(ROOM_CALENDAR_PROBE_KEY)"),
-            "detection must record the STABLE sentinel, not `legacy_hash`/`pg_hash` \
-             directly, or a merely-unchanged divergence mints a fresh row every tick"
+            "detection must record the STABLE sentinel, or a merely-changed \
+             deficit mints a fresh row"
         );
         let record_at = body
             .find("record_divergence(")
             .expect("detection must call record_divergence");
         let call = &body[record_at..(record_at + 400).min(body.len())];
-        // Positive check: the two hash arguments must be the
-        // sentinel-derived locals…
         assert!(
             call.contains("pg_row_hash.as_deref()") && call.contains("mssql_hash.as_deref()"),
             "record_divergence must be called with the sentinel-derived \
              `pg_row_hash` / `mssql_hash` locals: {call}"
         );
-        // …and NOT the live comparison hashes (`legacy_hash` / `pg_hash`,
-        // the `let`-bound results of `room_calendar_business_key_hash`
-        // above) — a bare-word check, not a substring one, since
-        // `pg_row_hash` and `mssql_hash` themselves must not trip it.
         let words: std::collections::HashSet<&str> = call
             .split(|c: char| !c.is_alphanumeric() && c != '_')
             .collect();
         assert!(
-            !words.contains("legacy_hash") && !words.contains("pg_hash"),
-            "record_divergence must not be called with the live comparison \
-             hashes `legacy_hash` / `pg_hash` — a moving hash would mint a \
-             fresh row every tick a diverged count merely changed: {call}"
+            !words.contains("deficit_hash"),
+            "record_divergence must not be called with the live deficit hash: {call}"
         );
     }
 
