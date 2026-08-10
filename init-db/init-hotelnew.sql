@@ -379,10 +379,16 @@ CREATE TABLE IF NOT EXISTS ht_guest_doc_backfill_skip (
 
 -- ht_hk_cleaning_events - Maid-reported room-cleaning progress (employee-login
 -- plan Phase 4, migration 077). Append-only event log; latest event per room per
--- Thai day = current progress on the /hk maid surface. PG-CANONICAL ONLY (no
--- legacy counterpart, no sync, no writeback — deliberately does NOT touch
--- ht_rooms_new.room_clean). Identity = verified HF ID badge (Cloudflare Access
--- claims), no FK to ht_users. Per-site (connection-level scoping).
+-- Thai day = current progress on the /hk maid surface. The TABLE is
+-- PG-canonical only (no legacy counterpart, no sync mapper).
+-- CHANGED 2026-08-11 (housekeeping-ops): the `done` phase is no longer
+-- legacy-inert — routes/hk.rs delegates it to
+-- service::housekeeping::mark_clean_if_dirty, which flips
+-- ht_rooms_new.room_clean and enqueues the MarkRoomClean writeback in one
+-- transaction so reception sees the finished room in iHOTEL. `started` stays
+-- PG-only (iHOTEL's Room_Clean_Time drives its room-power countdown).
+-- Identity = verified HF ID badge (Cloudflare Access claims), no FK to
+-- ht_users. Per-site (connection-level scoping).
 CREATE TABLE IF NOT EXISTS ht_hk_cleaning_events (
     hkev_id         BIGSERIAL    PRIMARY KEY,
     hkev_room_id    INTEGER      NOT NULL REFERENCES ht_rooms_new(room_id) ON DELETE CASCADE,
