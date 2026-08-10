@@ -14,23 +14,33 @@
 //! [`is_ville_exempt_path`] admits exactly ONE route regardless of the flag:
 //! `POST /api/hk/rooms/{id}/cleaning`, the maid's cleaning report.
 //!
-//! Why an exemption is the SAFE choice here, and blanket-enabling is not:
+//! ### Current production state
 //!
-//! - Launch intent is `HFVILLE_WRITES_ENABLED` UNSET (general Ville mutations
-//!   stay inadmissible) + `HFVILLE_WRITEBACK_INTENTS=mark_room_clean` (only the
-//!   housekeeping intent reaches Ville's iHOTEL).
-//! - Those two must agree. If we instead flipped `HFVILLE_WRITES_ENABLED` on to
-//!   let maids through, every other Ville mutation would be admitted, write
-//!   canonical PG, and then have its writeback intent PARKED as `'skipped'` by
-//!   the allowlist. Canonical PG and Ville's iHOTEL would silently diverge —
-//!   precisely the failure this project must not create.
-//! - So the admitted set (this route) is kept identical to the allowlisted
-//!   writeback set (`mark_room_clean`), and divergence stays impossible.
+//! `HFVILLE_WRITES_ENABLED=true` has been set since 2026-06-29 — Ville coequal
+//! writes are LIVE — so this gate admits everything and the exemption is
+//! **inert in production today**. It exists for the case where an operator
+//! turns Ville writes back off: the maid surface is a different concern from
+//! front-desk write policy, and a housekeeping report should not be collateral
+//! damage of that toggle.
+//!
+//! The exemption does NOT punch a hole in the real kill switch for Ville legacy
+//! writes. This gate is HTTP ADMISSION only; legacy delivery is stopped by
+//! `HFVILLE_WRITEBACK_ENABLED=false` on the Ville worker (or narrowed by
+//! `HFVILLE_WRITEBACK_INTENTS`). With writes disabled, an admitted cleaning
+//! report flips canonical PG and its writeback waits in the durable outbox.
+//!
+//! ### Why an exemption rather than flipping the flag
+//!
+//! If Ville writes were ever disabled and we re-enabled them wholesale just to
+//! let maids through, every other Ville mutation would be admitted too. Should
+//! `HFVILLE_WRITEBACK_INTENTS` be narrow at that moment, those mutations would
+//! write canonical PG while their intents parked as `'skipped'` — canonical PG
+//! and Ville's iHOTEL silently diverging. Keeping the admitted set narrow keeps
+//! admission and delivery consistent under every combination of the two knobs.
 //!
 //! The exemption is deliberately NARROW: exact segment match, POST only,
 //! numeric room id. It does NOT cover `/broken-items` (retired, 410) or any
-//! other hk or non-hk mutation — those stay blocked until the coequal-writes
-//! program flips the flag on its own schedule.
+//! other hk or non-hk mutation.
 
 use axum::extract::State;
 use axum::http::Method;
@@ -179,12 +189,13 @@ mod tests {
         assert!(!targets_ville(Some("branch=hfvillex")));
     }
 
-    // ---- the launch matrix ----------------------------------------------
+    // ---- the admission matrix -------------------------------------------
 
-    /// LAUNCH CONFIG (`HFVILLE_WRITES_ENABLED` unset): the maid's cleaning
-    /// report is admitted for `branch=hfville`, and NOTHING else is. This is
-    /// the invariant that keeps the admitted set identical to the allowlisted
-    /// writeback set, so canonical PG cannot diverge from Ville's iHOTEL.
+    /// With Ville writes DISABLED (not the current production state, but the
+    /// posture an operator can return to): the maid's cleaning report is
+    /// admitted for `branch=hfville`, and NOTHING else is. Keeping the
+    /// admitted set this narrow is what stops an admitted mutation from
+    /// outrunning a narrowed writeback allowlist.
     #[test]
     fn writes_disabled_admits_only_hfville_cleaning() {
         // Admitted.

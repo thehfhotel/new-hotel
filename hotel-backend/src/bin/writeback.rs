@@ -1302,13 +1302,14 @@ async fn process_job(
     // connection — so a non-allowlisted intent costs nothing and, crucially,
     // never opens a transaction against Ville's iHOTEL.
     if !ville_intent_allowed(intent_name) {
-        // WARN, not INFO/DEBUG: at launch the ONLY intent that should ever be
-        // enqueued for Ville is `mark_room_clean` (the admission gate in
-        // `middleware::ville_guard` admits exactly that one flow), so a park
-        // here means something enqueued a Ville intent nobody expected —
-        // visible in deploy logs at the default RUST_LOG. `skipped_total` is
-        // the running count for this worker process, so a burst is obvious
-        // without grepping every line.
+        // WARN, not INFO/DEBUG. Ville coequal writes are live, so setting the
+        // allowlist NARROWS a running system: every park here is a real legacy
+        // write that did NOT happen, leaving canonical PG ahead of Ville's
+        // iHOTEL. That is the accepted cost of a deliberate restriction, but it
+        // must never be quiet — an operator has to be able to see, in ordinary
+        // deploy logs, exactly what the restriction is holding back.
+        // `skipped_total` is this process's running count, so a burst is
+        // obvious without grepping every line.
         tracing::warn!(
             job_id,
             intent = intent_name,
@@ -4150,9 +4151,9 @@ mod tests {
         }
     }
 
-    /// The launch configuration: ONLY `mark_room_clean` reaches Ville's
-    /// iHOTEL. Every other intent — the coequal-writes program's territory —
-    /// is held back until it launches on its own schedule.
+    /// A maximally narrow restriction: ONLY `mark_room_clean` reaches Ville's
+    /// iHOTEL and every other intent is held back. This is the shape an
+    /// operator would use to isolate housekeeping during an incident.
     #[test]
     fn ville_allowlist_admits_only_the_listed_intents() {
         let only_clean = allowlist(&["mark_room_clean"]);
@@ -4170,7 +4171,7 @@ mod tests {
         ] {
             assert!(
                 !intent_allowed_for_site("hfville", Some(&only_clean), blocked),
-                "{blocked} must NOT reach Ville's iHOTEL under the launch allowlist"
+                "{blocked} must NOT reach Ville's iHOTEL under a mark_room_clean-only allowlist"
             );
         }
     }
@@ -4189,10 +4190,10 @@ mod tests {
     }
 
     /// The allowlist string an operator would actually set must round-trip
-    /// through the config parser into a working decision — this is the
-    /// end-to-end contract for `HFVILLE_WRITEBACK_INTENTS=mark_room_clean`.
+    /// through the config parser into a working decision — the end-to-end
+    /// contract for `HFVILLE_WRITEBACK_INTENTS=mark_room_clean`.
     #[test]
-    fn launch_allowlist_string_parses_and_gates_correctly() {
+    fn allowlist_string_parses_and_gates_correctly() {
         let parsed =
             hotel_backend::config::parse_csv_allowlist(Some(" mark_room_clean , ".to_string()))
                 .expect("a non-empty list must parse to Some");
@@ -4234,7 +4235,7 @@ mod tests {
     /// Every entry an operator could legitimately set must validate — the
     /// parser trims, so the realistic `" mark_room_clean , "` form is clean.
     #[test]
-    fn launch_allowlist_entries_are_all_known_intents() {
+    fn realistic_allowlist_entries_are_all_known_intents() {
         let parsed = hotel_backend::config::parse_csv_allowlist(Some(
             " mark_room_clean , mark_room_dirty ".to_string(),
         ))

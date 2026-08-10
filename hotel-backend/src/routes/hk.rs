@@ -42,22 +42,19 @@
 //! Branch-aware via `?branch=` resolved through the unified
 //! [`AppState::write_pool`] chokepoint (Ship-B gate).
 //!
-//! ## HF Ville admission (housekeeping-ops launch)
+//! ## HF Ville admission
 //!
-//! The launch environment leaves `HFVILLE_WRITES_ENABLED` UNSET — general
-//! Ville mutations must stay inadmissible — and sets
-//! `HFVILLE_WRITEBACK_INTENTS=mark_room_clean` on the Ville writeback worker.
-//! For the maid surface to work at Ville under that env, `ville_write_guard`
-//! grants ONE narrow exemption: `POST /api/hk/rooms/{id}/cleaning` is admitted
-//! for `branch=hfville` regardless of the flag
-//! ([`crate::middleware::ville_guard::is_ville_exempt_path`]).
+//! `HFVILLE_WRITES_ENABLED=true` since 2026-06-29 (Ville coequal writes are
+//! LIVE), so `ville_write_guard` currently admits every branch and this surface
+//! behaves identically at both properties.
 //!
-//! That keeps the ADMITTED set identical to the ALLOWLISTED writeback set. The
-//! alternative — flipping `HFVILLE_WRITES_ENABLED` on — would admit every other
-//! Ville mutation, each writing canonical PG while its writeback intent parked
-//! as `'skipped'`, silently diverging PG from Ville's iHOTEL. `broken-items`
-//! and every non-hk mutation stay blocked. Pinned by
-//! `tests/test_hk_ville_guard.rs`.
+//! `ville_write_guard` additionally grants ONE narrow exemption —
+//! `POST /api/hk/rooms/{id}/cleaning` for `branch=hfville`, regardless of the
+//! flag ([`crate::middleware::ville_guard::is_ville_exempt_path`]). That is
+//! inert today and matters only if Ville writes are ever turned back off: a
+//! maid's cleaning report should not be collateral damage of a front-desk write
+//! policy toggle. `broken-items` and every non-hk mutation are NOT exempt.
+//! Pinned by `tests/test_hk_ville_guard.rs`.
 //!
 //! All SQL is RUNTIME `sqlx::query` (no compile-time macro), so this module
 //! needs no `.sqlx/` cache regeneration — same policy as

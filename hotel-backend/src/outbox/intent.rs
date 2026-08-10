@@ -1485,7 +1485,7 @@ mod tests {
         );
         assert!(
             declared.contains(&"mark_room_clean".to_string()),
-            "the housekeeping-ops launch intent must be a valid allowlist entry"
+            "the housekeeping intent must be a valid allowlist entry"
         );
     }
 
