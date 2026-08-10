@@ -32,7 +32,7 @@
 //! - Does not run the CT watcher (lives in future `bin/sync.rs`).
 //! - Does not auto-fix schema drift — fail loud, alert ops, wait for human.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -279,6 +279,43 @@ fn init_site_id(id: &str) {
 /// Read the process-wide SITE_ID; defaults to `"hfhotel"` if uninit.
 fn current_site_id() -> &'static str {
     SITE_ID.get().map(String::as_str).unwrap_or("hfhotel")
+}
+
+/// The site id whose writeback worker honors [`HFVILLE_WRITEBACK_INTENTS`].
+const VILLE_SITE_ID: &str = "hfville";
+
+/// Process-global HF Ville intent allowlist, resolved once on first use from
+/// `HFVILLE_WRITEBACK_INTENTS`. `None` = unset ⇒ allow every intent (current
+/// behavior). See `config::hfville_writeback_intents` for the rationale.
+static VILLE_INTENT_ALLOWLIST: OnceLock<Option<HashSet<String>>> = OnceLock::new();
+
+/// Whether this worker may dispatch `intent_name` to its legacy MSSQL.
+fn ville_intent_allowed(intent_name: &str) -> bool {
+    let allowlist =
+        VILLE_INTENT_ALLOWLIST.get_or_init(hotel_backend::config::hfville_writeback_intents);
+    intent_allowed_for_site(current_site_id(), allowlist.as_ref(), intent_name)
+}
+
+/// PURE allowlist decision — split out so the matrix is unit-testable without
+/// touching process-global state or the environment.
+///
+/// The allowlist is deliberately scoped to the HF Ville worker: the HF Hotel
+/// worker is the long-live production path and must stay unaffected no matter
+/// what the env says (the var name says `HFVILLE_`, so honoring it at HF Hotel
+/// would be a surprising blast radius). Unset ⇒ allow everything, so this is
+/// inert until an operator opts in.
+fn intent_allowed_for_site(
+    site_id: &str,
+    allowlist: Option<&HashSet<String>>,
+    intent_name: &str,
+) -> bool {
+    if site_id != VILLE_SITE_ID {
+        return true;
+    }
+    match allowlist {
+        None => true,
+        Some(allowed) => allowed.contains(intent_name),
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -1181,6 +1218,30 @@ async fn process_job(
         attempt = job.attempts,
         "Processing writeback job"
     );
+
+    // HF Ville per-intent allowlist (housekeeping-ops, 2026-08-11). Checked
+    // FIRST — before resolving legacy IDs and before acquiring an MSSQL
+    // connection — so a non-allowlisted intent costs nothing and, crucially,
+    // never opens a transaction against Ville's iHOTEL.
+    if !ville_intent_allowed(intent_name) {
+        tracing::warn!(
+            job_id,
+            intent = intent_name,
+            "Skipping job: intent is not in HFVILLE_WRITEBACK_INTENTS"
+        );
+        mark_skipped(
+            pg,
+            job_id,
+            job.claimed_at,
+            &format!(
+                "intent '{intent_name}' not in HFVILLE_WRITEBACK_INTENTS allowlist for site \
+                 '{}'",
+                current_site_id()
+            ),
+        )
+        .await;
+        return None;
+    }
 
     // Resolve legacy IDs from PG canonical tables. `slack` is plumbed in
     // for the MED-4 throttled self-heal alert, which fires from inside
@@ -2314,6 +2375,44 @@ async fn salvage_legacy_ids(
 /// worker stole the claim, IT will re-run the recipe and notify, and a
 /// duplicate signal from here would inflate reception's toast count for a
 /// single real change.
+/// Park a job the HF Ville allowlist refused, as a TERMINAL `skipped` row.
+///
+/// Deliberately terminal rather than left `pending`: a parked-pending job is
+/// an invisible backlog that would suddenly flush into Ville's iHOTEL the day
+/// the allowlist widens — months of stale bookings/payments replayed at once.
+/// `skipped` is inert, never retried, and shows up in the
+/// `/api/sync/status` `(intent, status)` breakdown so operators can see what
+/// the allowlist is holding back. Re-queue by hand (`status='pending'`) if a
+/// skipped job is later wanted.
+///
+/// Claim-gated on `(status='in_progress', claimed_at)` exactly like
+/// [`mark_done`] so a janitor re-claim can't be clobbered.
+async fn mark_skipped(pg: &PgPool, job_id: i64, claimed_at: DateTime<Utc>, reason: &str) {
+    let result = sqlx::query(
+        "UPDATE writeback_jobs \
+            SET status = 'skipped', completed_at = NOW(), last_error = $2, next_retry_at = NULL \
+          WHERE id = $1 AND status = 'in_progress' AND claimed_at = $3",
+    )
+    .bind(job_id)
+    .bind(reason)
+    .bind(claimed_at)
+    .execute(pg)
+    .await;
+
+    match result {
+        Ok(res) if res.rows_affected() == 0 => {
+            tracing::warn!(
+                job_id,
+                "mark_skipped matched no row (claim stolen by the stuck-job janitor?)"
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::error!(job_id, error = %err, "Failed to mark job skipped");
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn mark_done(
     pg: &PgPool,
@@ -3927,6 +4026,99 @@ fn _suppress_unused_writeback_error_import(_: WritebackError) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- HF Ville per-intent writeback allowlist (housekeeping-ops) -----
+
+    fn allowlist(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// Unset allowlist ⇒ every intent dispatches, at BOTH sites. This is the
+    /// "current behavior unchanged" contract — the feature must be inert
+    /// until an operator sets the env var.
+    #[test]
+    fn absent_allowlist_permits_every_intent_at_every_site() {
+        for site in ["hfhotel", "hfville"] {
+            for intent in ["mark_room_clean", "create_booking", "check_out"] {
+                assert!(
+                    intent_allowed_for_site(site, None, intent),
+                    "{site}/{intent} must be allowed when no allowlist is set"
+                );
+            }
+        }
+    }
+
+    /// The allowlist is scoped to HF Ville — the HF Hotel worker is the
+    /// long-lived production path and must be unaffected even if the var
+    /// leaks into its environment.
+    #[test]
+    fn allowlist_never_constrains_the_hf_hotel_worker() {
+        let only_clean = allowlist(&["mark_room_clean"]);
+        for intent in ["create_booking", "check_out", "record_payment"] {
+            assert!(
+                intent_allowed_for_site("hfhotel", Some(&only_clean), intent),
+                "HF Hotel must dispatch {intent} regardless of HFVILLE_WRITEBACK_INTENTS"
+            );
+        }
+    }
+
+    /// The launch configuration: ONLY `mark_room_clean` reaches Ville's
+    /// iHOTEL. Every other intent — the coequal-writes program's territory —
+    /// is held back until it launches on its own schedule.
+    #[test]
+    fn ville_allowlist_admits_only_the_listed_intents() {
+        let only_clean = allowlist(&["mark_room_clean"]);
+        assert!(intent_allowed_for_site(
+            "hfville",
+            Some(&only_clean),
+            "mark_room_clean"
+        ));
+        for blocked in [
+            "create_booking",
+            "check_out",
+            "record_payment",
+            "mark_room_dirty",
+            "create_check_in",
+        ] {
+            assert!(
+                !intent_allowed_for_site("hfville", Some(&only_clean), blocked),
+                "{blocked} must NOT reach Ville's iHOTEL under the launch allowlist"
+            );
+        }
+    }
+
+    /// Multi-entry allowlists work, and matching is exact — no prefix or
+    /// substring matching that could admit a neighbouring intent.
+    #[test]
+    fn ville_allowlist_matches_intent_names_exactly() {
+        let two = allowlist(&["mark_room_clean", "mark_room_dirty"]);
+        assert!(intent_allowed_for_site("hfville", Some(&two), "mark_room_clean"));
+        assert!(intent_allowed_for_site("hfville", Some(&two), "mark_room_dirty"));
+        // `mark_room` is a prefix of both but is not itself listed.
+        assert!(!intent_allowed_for_site("hfville", Some(&two), "mark_room"));
+        // Case matters — discriminants are snake_case by construction.
+        assert!(!intent_allowed_for_site("hfville", Some(&two), "MARK_ROOM_CLEAN"));
+    }
+
+    /// The allowlist string an operator would actually set must round-trip
+    /// through the config parser into a working decision — this is the
+    /// end-to-end contract for `HFVILLE_WRITEBACK_INTENTS=mark_room_clean`.
+    #[test]
+    fn launch_allowlist_string_parses_and_gates_correctly() {
+        let parsed =
+            hotel_backend::config::parse_csv_allowlist(Some(" mark_room_clean , ".to_string()))
+                .expect("a non-empty list must parse to Some");
+        assert!(intent_allowed_for_site(
+            "hfville",
+            Some(&parsed),
+            "mark_room_clean"
+        ));
+        assert!(!intent_allowed_for_site(
+            "hfville",
+            Some(&parsed),
+            "create_booking"
+        ));
+    }
 
     /// Backoff schedule: 30s, 2min, 10min — matches the constants and
     /// guards against an accidental edit that could collapse the schedule

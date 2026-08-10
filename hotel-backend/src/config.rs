@@ -445,6 +445,54 @@ pub fn layout_writeback_enabled() -> bool {
     flag_enabled("LAYOUT_WRITEBACK_ENABLED")
 }
 
+/// Per-intent allowlist for HF Ville's legacy writeback worker
+/// (`HFVILLE_WRITEBACK_INTENTS`) — housekeeping-ops, 2026-08-11.
+///
+/// Comma-separated [`WritebackIntent::intent_name`] discriminants, e.g.
+/// `mark_room_clean`. **Unset or empty ⇒ `None` ⇒ current behavior unchanged**
+/// (every intent dispatches), so this is inert until an operator sets it.
+///
+/// ## Why this exists
+///
+/// `HFVILLE_WRITES_ENABLED` is a single all-or-nothing gate, and it lives at
+/// the HTTP layer only (`main.rs::ville_write_guard` 403s `?branch=hfville`
+/// mutations). The writeback worker never reads it. So enabling the maid
+/// surface's cleaning writeback at Ville by flipping that flag would ALSO
+/// admit every other Ville mutation — bookings, check-ins, payments, POS —
+/// each of which then mirrors into Ville's iHOTEL. That is the wholesale flip
+/// the housekeeping-ops plan explicitly forbids as a side effect.
+///
+/// This allowlist is the narrow path: set it to `mark_room_clean` on the Ville
+/// worker so ONLY the housekeeping intent reaches Ville's iHOTEL, while the
+/// coequal-writes program (`docs/coexistence/ville-coequal-writes-plan.md`)
+/// launches the rest on its own schedule.
+///
+/// Enforced in `bin/writeback.rs` and scoped there to `SITE_ID=hfville`; a
+/// non-allowlisted job is parked as `status='skipped'` (terminal, no retry)
+/// rather than left `pending`, so it can never fire later unnoticed.
+pub fn hfville_writeback_intents() -> Option<std::collections::HashSet<String>> {
+    parse_csv_allowlist(std::env::var("HFVILLE_WRITEBACK_INTENTS").ok())
+}
+
+/// Parse a comma-separated allowlist. `None` = "no allowlist, allow
+/// everything"; blank entries are dropped. Mirrors `bin/sync.rs::parse_allowlist`.
+///
+/// Public so the writeback worker's tests can drive the real parser instead of
+/// hand-rolling a `HashSet`, keeping the env-string → decision path covered.
+pub fn parse_csv_allowlist(raw: Option<String>) -> Option<std::collections::HashSet<String>> {
+    let raw = raw?;
+    let set: std::collections::HashSet<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if set.is_empty() {
+        None
+    } else {
+        Some(set)
+    }
+}
+
 /// Read an optional secret/URL from `var_name`, treating unset OR empty as
 /// `None`. Empty-string is the failure mode of a botched CI `.env` rewrite
 /// (`VAR=''`); returning `None` lets the reader path fail closed (reject the
@@ -511,6 +559,36 @@ impl ReaderConfig {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    /// `HFVILLE_WRITEBACK_INTENTS` parsing. The `None` cases matter most:
+    /// they are the "current behavior unchanged" contract — an unset, blank,
+    /// or all-separators value must NOT be read as "allow nothing", which
+    /// would silently stop every Ville writeback.
+    #[test]
+    fn csv_allowlist_treats_absent_and_blank_as_no_allowlist() {
+        assert!(parse_csv_allowlist(None).is_none(), "unset ⇒ no allowlist");
+        assert!(parse_csv_allowlist(Some(String::new())).is_none(), "empty");
+        assert!(parse_csv_allowlist(Some("   ".into())).is_none(), "blank");
+        assert!(parse_csv_allowlist(Some(",,".into())).is_none(), "separators only");
+    }
+
+    #[test]
+    fn csv_allowlist_trims_entries_and_drops_blanks() {
+        let parsed = parse_csv_allowlist(Some(" mark_room_clean , ,mark_room_dirty ".into()))
+            .expect("non-empty list parses");
+        assert_eq!(parsed.len(), 2, "blank entry dropped: {parsed:?}");
+        assert!(parsed.contains("mark_room_clean"));
+        assert!(parsed.contains("mark_room_dirty"));
+    }
+
+    /// The launch value from the housekeeping-ops plan.
+    #[test]
+    fn csv_allowlist_parses_the_single_intent_launch_value() {
+        let parsed =
+            parse_csv_allowlist(Some("mark_room_clean".into())).expect("parses to Some");
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed.contains("mark_room_clean"));
+    }
 
     /// Serialise env-mutating tests. `std::env::set_var` mutates
     /// process-wide state — running these in parallel under
